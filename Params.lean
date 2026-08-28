@@ -9,6 +9,7 @@ import Params.Decomp.Basic
 import Params.Decomp.Rank
 import Params.Decomp.Identifiability
 import Params.Decomp.Attribution
+import Params.Decomp.Layerwise
 import Params.Interp.Superposition
 import Params.Interp.Spark
 import Params.Interp.Absorption

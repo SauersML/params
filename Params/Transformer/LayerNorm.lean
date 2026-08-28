@@ -30,6 +30,8 @@ namespace Params
 
 open Finset
 
+noncomputable section
+
 section Stats
 
 variable {ι : Type*} [Fintype ι] [Nonempty ι]
@@ -38,19 +40,19 @@ lemma card_pos : (0 : ℝ) < Fintype.card ι := by
   exact_mod_cast (Fintype.card_pos : 0 < Fintype.card ι)
 
 /-- Mean of a finite family of reals. -/
-noncomputable def mean (v : ι → ℝ) : ℝ := (∑ i, v i) / Fintype.card ι
+def mean (v : ι → ℝ) : ℝ := (∑ i, v i) / Fintype.card ι
 
 /-- (Population) variance of a finite family of reals. -/
-noncomputable def variance (v : ι → ℝ) : ℝ :=
+def variance (v : ι → ℝ) : ℝ :=
   (∑ i, (v i - mean v) ^ 2) / Fintype.card ι
 
 /-- Layer normalisation with scalar targets: mean `σ₁`, standard deviation `σ₂`. -/
-noncomputable def layerNorm (σ₁ σ₂ : ℝ) (v : ι → ℝ) : ι → ℝ :=
+def layerNorm (σ₁ σ₂ : ℝ) (v : ι → ℝ) : ι → ℝ :=
   fun i => σ₂ * (v i - mean v) / Real.sqrt (variance v) + σ₁
 
 /-- Layer normalisation with per-coordinate affine parameters `γ`, `β`
 (Ba–Kiros–Hinton 2016). -/
-noncomputable def layerNormAffine (γ β : ι → ℝ) (v : ι → ℝ) : ι → ℝ :=
+def layerNormAffine (γ β : ι → ℝ) (v : ι → ℝ) : ι → ℝ :=
   fun i => γ i * ((v i - mean v) / Real.sqrt (variance v)) + β i
 
 /-- Squared Euclidean distance. -/
@@ -161,11 +163,11 @@ lemma sqDist_layerNorm (σ₁ σ₂ : ℝ) (v : ι → ℝ) (hv : variance v ≠
   rw [hA, hB, hC, mul_zero, add_zero]
   have hkey : (σ₂ / Real.sqrt (variance v) - 1) ^ 2 * variance v
       = (σ₂ - Real.sqrt (variance v)) ^ 2 := by
-    rw [← hr2]
-    have : σ₂ / Real.sqrt (variance v) - 1
-        = (σ₂ - Real.sqrt (variance v)) / Real.sqrt (variance v) := by
-      field_simp
-    rw [this, div_pow, div_mul_cancel₀ _ (pow_ne_zero 2 hr)]
+    calc (σ₂ / Real.sqrt (variance v) - 1) ^ 2 * variance v
+        = (σ₂ / Real.sqrt (variance v) - 1) ^ 2 * Real.sqrt (variance v) ^ 2 := by rw [hr2]
+      _ = ((σ₂ / Real.sqrt (variance v) - 1) * Real.sqrt (variance v)) ^ 2 := by rw [mul_pow]
+      _ = (σ₂ - Real.sqrt (variance v)) ^ 2 := by
+          rw [sub_mul, div_mul_cancel₀ _ hr, one_mul]
   calc (σ₂ / Real.sqrt (variance v) - 1) ^ 2 * ((Fintype.card ι : ℝ) * variance v)
         + (Fintype.card ι : ℝ) * (σ₁ - mean v) ^ 2
       = (Fintype.card ι : ℝ) * ((σ₂ / Real.sqrt (variance v) - 1) ^ 2 * variance v)
@@ -190,7 +192,8 @@ lemma sqDist_of_mem (σ₁ σ₂ : ℝ) (v u : ι → ℝ) (hu₁ : mean u = σ�
     rwa [hu₁] at this
   have hz2 : ∑ i, (u i - σ₁) ^ 2 = (Fintype.card ι : ℝ) * σ₂ ^ 2 := by
     have := card_mul_variance u
-    rwa [hu₂, hu₁] at this
+    rw [hu₂, hu₁] at this
+    exact this.symm
   have hw0 : ∑ i, (-(v i - mean v)) = 0 := by
     rw [Finset.sum_neg_distrib, sum_sub_mean, neg_zero]
   have hw2 : ∑ i, (-(v i - mean v)) ^ 2 = (Fintype.card ι : ℝ) * variance v := by
@@ -227,17 +230,20 @@ theorem layerNorm_sqDist_le (σ₁ σ₂ : ℝ) (v u : ι → ℝ) (hv : varianc
       (fun i => v i - mean v)
     have hz2 : ∑ i, (u i - σ₁) ^ 2 = (Fintype.card ι : ℝ) * σ₂ ^ 2 := by
       have := card_mul_variance u
-      rwa [hu₂, hu₁] at this
+      rw [hu₂, hu₁] at this
+      exact this.symm
     have hw2 : ∑ i, (v i - mean v) ^ 2 = (Fintype.card ι : ℝ) * variance v :=
       (card_mul_variance v).symm
     rw [hz2, hw2, ← hr2] at h
-    refine le_of_sq_le_sq' ?_ (by positivity)
+    refine le_of_sq_le_sq' ?_ (mul_nonneg (mul_nonneg hn.le hσ) hr0)
     calc (∑ i, (u i - σ₁) * (v i - mean v)) ^ 2
         ≤ (Fintype.card ι : ℝ) * σ₂ ^ 2
             * ((Fintype.card ι : ℝ) * Real.sqrt (variance v) ^ 2) := h
       _ = ((Fintype.card ι : ℝ) * σ₂ * Real.sqrt (variance v)) ^ 2 := by ring
-  rw [sqDist_layerNorm σ₁ σ₂ v hv, sqDist_of_mem σ₁ σ₂ v u hu₁ hu₂, ← hr2]
-  nlinarith [hcs, hn]
+  have hnr : (Fintype.card ι : ℝ) * Real.sqrt (variance v) ^ 2
+      = (Fintype.card ι : ℝ) * variance v := by rw [hr2]
+  rw [sqDist_layerNorm σ₁ σ₂ v hv, sqDist_of_mem σ₁ σ₂ v u hu₁ hu₂]
+  nlinarith [hcs, hnr, hn]
 
 /-! ### Scale invariance -/
 
@@ -269,7 +275,7 @@ theorem layerNorm_smul (σ₁ σ₂ c : ℝ) (hc : 0 < c) (v : ι → ℝ) :
 /-! ### ReLU is the projection onto the non-negative orthant -/
 
 /-- Rectified linear unit. -/
-noncomputable def relu (x : ℝ) : ℝ := max x 0
+def relu (x : ℝ) : ℝ := max x 0
 
 lemma relu_nonneg (x : ℝ) : 0 ≤ relu x := le_max_right x 0
 
@@ -300,5 +306,7 @@ theorem relu_mem_nonnegSet (v : ι → ℝ) : (fun i => relu (v i)) ∈ NonnegSe
   fun i => relu_nonneg (v i)
 
 end Stats
+
+end
 
 end Params

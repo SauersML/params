@@ -96,12 +96,12 @@ theorem attention_perm_equivariant (s : ℝ) (Q K V : Matrix n d ℝ) (σ : Equi
     attention s (Q.submatrix σ id) (K.submatrix σ id) (V.submatrix σ id)
       = (attention s Q K V).submatrix σ id := by
   ext i k
-  rw [Matrix.submatrix_apply, attention_apply, attention_apply]
+  rw [Matrix.submatrix_apply, id_eq, attention_apply, attention_apply]
   calc ∑ j, attnWeights s (Q.submatrix σ id) (K.submatrix σ id) i j * V.submatrix σ id j k
       = ∑ j, attnWeights s Q K (σ i) (σ j) * V (σ j) k := by
         refine Finset.sum_congr rfl ?_
         intro j _
-        rw [attnWeights_submatrix, Matrix.submatrix_apply, id]
+        rw [attnWeights_submatrix, Matrix.submatrix_apply, id_eq]
     _ = ∑ j, attnWeights s Q K (σ i) j * V j k :=
         Equiv.sum_comp σ (fun j => attnWeights s Q K (σ i) j * V j k)
 

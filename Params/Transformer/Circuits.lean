@@ -40,14 +40,14 @@ theorem attnWeights_congr_qk (s : ℝ) (WQ WK WQ' WK' : Matrix d e ℝ)
   rw [score_eq_qk, score_eq_qk, h]
 
 /-- The gauge freedom of the QK circuit: `(W^Q R, W^K R⁻ᵀ)` has the same circuit. -/
-theorem qk_gauge [DecidableEq e] (WQ WK : Matrix d e ℝ) (R : Matrix e e ℝ) (hR : IsUnit R) :
+theorem qk_gauge [DecidableEq e] (WQ WK : Matrix d e ℝ) (R : Matrix e e ℝ) (hR : IsUnit R.det) :
     (WQ * R) * (WK * R⁻¹ᵀ)ᵀ = WQ * WKᵀ := by
   rw [Matrix.transpose_mul, Matrix.transpose_transpose, Matrix.mul_assoc,
     ← Matrix.mul_assoc R, Matrix.mul_nonsing_inv R hR, Matrix.one_mul]
 
 /-- Consequently the attention pattern is invariant under that gauge. -/
 theorem attnWeights_gauge [DecidableEq e] (s : ℝ) (WQ WK : Matrix d e ℝ) (R : Matrix e e ℝ)
-    (hR : IsUnit R) (u : Matrix n d ℝ) :
+    (hR : IsUnit R.det) (u : Matrix n d ℝ) :
     attnWeights s (u * (WQ * R)) (u * (WK * R⁻¹ᵀ)) = attnWeights s (u * WQ) (u * WK) :=
   attnWeights_congr_qk s _ _ _ _ (qk_gauge WQ WK R hR) u
 

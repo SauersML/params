@@ -1,6 +1,7 @@
 import Params.Transformer.Softmax
 import Params.Transformer.LayerNorm
 import Params.Transformer.Attention
+import Params.Transformer.Circuits
 import Params.Transformer.Encoder
 import Params.Transformer.Causal
 import Params.Transformer.LanguageModel

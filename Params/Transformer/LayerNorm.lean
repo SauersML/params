@@ -285,7 +285,7 @@ lemma relu_of_nonpos {x : ℝ} (hx : x ≤ 0) : relu x = 0 := max_eq_right hx
 
 /-- Pointwise: `relu x` is the closest non-negative real to `x`. -/
 lemma relu_sub_sq_le (x y : ℝ) (hy : 0 ≤ y) : (relu x - x) ^ 2 ≤ (y - x) ^ 2 := by
-  rcases le_or_lt 0 x with hx | hx
+  rcases le_or_gt 0 x with hx | hx
   · rw [relu_of_nonneg hx, sub_self, zero_pow two_ne_zero]
     exact sq_nonneg _
   · rw [relu_of_nonpos hx.le]

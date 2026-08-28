@@ -42,7 +42,7 @@ structure AlmostOrthogonal (v : N → d → ℝ) (ε : ℝ) : Prop where
 lemma ip_superpose (v : N → d → ℝ) (s : N → ℝ) (i : N) :
     ip (v i) (superpose v s) = ∑ j, s j * ip (v i) (v j) := by
   unfold ip superpose
-  simp only [Finset.mul_sum, Finset.sum_mul]
+  simp only [Finset.mul_sum]
   rw [Finset.sum_comm]
   refine Finset.sum_congr rfl ?_
   intro k _
@@ -60,7 +60,7 @@ theorem readout_eq (v : N → d → ℝ) (s : N → ℝ) (ε : ℝ) (hv : Almost
 
 /-- **Interference bound.** If at most `k` features are active (`s j = 0` outside a
 set `S` of size `k`) then the read-out error is at most `ε (k − 1) ‖s‖_∞`. -/
-theorem readout_error_le (v : N → d → ℝ) (s : N → ℝ) (ε : ℝ) (hε : 0 ≤ ε)
+theorem readout_error_le (v : N → d → ℝ) (s : N → ℝ) (ε : ℝ)
     (hv : AlmostOrthogonal v ε) (S : Finset N) (hS : ∀ j, j ∉ S → s j = 0)
     (B : ℝ) (hB : ∀ j, |s j| ≤ B) (i : N) (hi : i ∈ S) :
     |readout v i (superpose v s) - s i| ≤ ε * (S.card - 1) * B := by

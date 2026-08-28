@@ -48,7 +48,7 @@ lemma support_sub_subset (s s' : N → ℝ) : support (s - s') ⊆ support s ∪
   rw [mem_support] at hj
   rw [Finset.mem_union, mem_support, mem_support]
   by_contra h
-  push_neg at h
+  simp only [not_or, not_not] at h
   apply hj
   simp [h.1, h.2]
 

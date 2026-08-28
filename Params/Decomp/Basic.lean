@@ -71,9 +71,7 @@ end Outer
 
 section Subcomponents
 
-open Matrix
-
-variable {m n C : Type*} [Fintype m] [Fintype n] [Fintype C]
+variable {m n C : Type*} [Fintype m] [Fintype n] [Fintype C] [DecidableEq C]
 
 /-- The SPD parametrisation of one weight matrix: `W ≈ U V`, `U : m × C`, `V : C × n`.
 (The code names these `B` and `A`: `weight = einsum(A, B, "d_in C, C d_out -> d_out d_in")`.) -/
@@ -111,10 +109,10 @@ theorem masked_eq_sum (D : Subcomponents m n C) (mask : C → ℝ) :
 
 /-- Masks identically one recover the reconstructed weight. -/
 theorem masked_one (D : Subcomponents m n C) : D.masked (fun _ => 1) = D.weight := by
-  simp [Subcomponents.masked, Subcomponents.weight, Matrix.diagonal_one]
+  rw [Subcomponents.masked, Subcomponents.weight, Matrix.diagonal_one, Matrix.mul_one]
 
 /-- Ablating subcomponent `c` (setting its mask to `0`) subtracts `mask c • component c`. -/
-theorem masked_update_zero [DecidableEq C] (D : Subcomponents m n C) (mask : C → ℝ) (c : C) :
+theorem masked_update_zero (D : Subcomponents m n C) (mask : C → ℝ) (c : C) :
     D.masked (Function.update mask c 0) = D.masked mask - mask c • D.component c := by
   rw [masked_eq_sum, masked_eq_sum]
   have h : ∀ c', Function.update mask c 0 c' • D.component c'
@@ -123,7 +121,7 @@ theorem masked_update_zero [DecidableEq C] (D : Subcomponents m n C) (mask : C �
     by_cases hc : c' = c
     · subst hc
       simp
-    · simp [Function.update_of_ne hc, hc]
+    · simp [hc]
   simp only [h]
   rw [Finset.sum_sub_distrib, Finset.sum_ite_eq' Finset.univ c, if_pos (Finset.mem_univ c)]
 
@@ -145,7 +143,7 @@ end Subcomponents
 
 section Faithfulness
 
-variable {m n C : Type*} [Fintype m] [Fintype n] [Fintype C]
+variable {m n C : Type*} [Fintype m] [Fintype n] [Fintype C] [DecidableEq C]
 
 /-- Faithfulness loss `‖W − U V‖_F²` (the code divides by the total parameter count;
 that constant does not affect any statement here). -/
@@ -154,7 +152,7 @@ def faithfulnessLoss (W : Matrix m n ℝ) (D : Subcomponents m n C) : ℝ :=
 
 theorem faithfulnessLoss_nonneg (W : Matrix m n ℝ) (D : Subcomponents m n C) :
     0 ≤ faithfulnessLoss W D :=
-  Finset.sum_nonneg (fun i _ => Finset.sum_nonneg (fun j _ => sq_nonneg _))
+  Finset.sum_nonneg (fun _ _ => Finset.sum_nonneg (fun _ _ => sq_nonneg _))
 
 /-- Zero faithfulness loss is exact reconstruction. -/
 theorem faithfulnessLoss_eq_zero_iff (W : Matrix m n ℝ) (D : Subcomponents m n C) :
@@ -226,8 +224,8 @@ theorem lowerLeaky_le_one (α x : ℝ) (hα : 0 ≤ α) : lowerLeaky α x ≤ 1 
   unfold lowerLeaky
   split_ifs with h
   · exact min_le_left 1 x
-  · push_neg at h
-    nlinarith
+  · have h' : x ≤ 0 := not_lt.mp h
+    nlinarith [hα, h']
 
 theorem upperLeaky_nonneg (α x : ℝ) (hα : 0 ≤ α) : 0 ≤ upperLeaky α x := by
   unfold upperLeaky
@@ -259,7 +257,7 @@ variable {C : Type*} [Fintype C]
 def importanceLoss (p : ℝ) (g : C → ℝ) : ℝ := ∑ c, |g c| ^ p
 
 theorem importanceLoss_nonneg (p : ℝ) (g : C → ℝ) : 0 ≤ importanceLoss p g :=
-  Finset.sum_nonneg (fun c _ => Real.rpow_nonneg (abs_nonneg _) p)
+  Finset.sum_nonneg (fun _ _ => Real.rpow_nonneg (abs_nonneg _) p)
 
 /-- Two fully-important subcomponents cost `2`, one costs `1`, for every exponent `p`:
 splitting a subcomponent that must stay important can never lower the penalty. -/

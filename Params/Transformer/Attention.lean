@@ -27,7 +27,7 @@ namespace Params
 
 noncomputable section
 
-open Finset
+open Finset Matrix
 
 section Attention
 

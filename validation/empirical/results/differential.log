@@ -1,0 +1,11 @@
+reference                                          max |lean - ref|  verdict
+torch.softmax                                             3.331e-16  PASS
+F.layer_norm                                              1.776e-15  PASS
+F.scaled_dot_product_attention                            6.661e-16  PASS
+F.scaled_dot_product_attention(is_causal)                 6.106e-16  PASS
+nn.MultiheadAttention                                     8.882e-16  PASS
+nn.TransformerEncoderLayer(post-norm)                     1.776e-15  PASS
+spd LinearComponent.forward/weight                        3.553e-15  PASS
+spd calc_stochastic_masks/leaky relus                     0.000e+00  PASS
+
+wrote /projects/standard/hsiehph/sauer354/params/validation/empirical/results/differential.json

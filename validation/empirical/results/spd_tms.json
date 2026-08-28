@@ -1,0 +1,144 @@
+{
+ "_provenance": {
+  "generator": "spd_tms.py",
+  "revision": "6a86f2910a37e170adb731891e584df78df2696c",
+  "revisionShort": "6a86f29",
+  "workingTreeClean": false,
+  "workingTreeDirtyPaths": [
+   "?? lake-manifest.json",
+   "?? validation/code/results/build-20260827T210824.log",
+   "?? validation/code/results/build-20260827T211214.log",
+   "?? validation/code/results/build-latest.log",
+   "?? validation/code/results/kick.log",
+   "?? validation/code/results/last_compile_epoch",
+   "?? validation/empirical/results/"
+  ],
+  "runAt": "2026-08-28T02:31:09Z",
+  "host": "acn112",
+  "python": "3.12.4",
+  "numpy": "2.5.2",
+  "torch": "2.13.0+cpu",
+  "seed": 0,
+  "replicates": 3,
+  "argv": [
+   "validation/empirical/spd_tms.py",
+   "--spd-repo",
+   "/projects/standard/hsiehph/sauer354/param-decomp",
+   "--steps",
+   "4000",
+   "--seeds",
+   "3",
+   "--threads",
+   "8"
+  ],
+  "config": {
+   "spd_repo": "/projects/standard/hsiehph/sauer354/param-decomp",
+   "steps": 4000,
+   "seeds": 3,
+   "threads": 8,
+   "n_features": 5,
+   "n_hidden": 2,
+   "C": 20,
+   "output": "/projects/standard/hsiehph/sauer354/params/validation/empirical/results/spd_tms.json"
+  }
+ },
+ "cells": [
+  {
+   "metric": "faith",
+   "n": 3,
+   "n_dropped": 0,
+   "mean": 0.002225425598832468,
+   "sd": 0.002094777197590256,
+   "se": 0.0012094201789210244,
+   "min": 0.0006871330551803112,
+   "max": 0.0046111526899039745
+  },
+  {
+   "metric": "sep_frac",
+   "n": 3,
+   "n_dropped": 0,
+   "mean": 0.4000000000000001,
+   "sd": 0.3464101615137755,
+   "se": 0.20000000000000004,
+   "min": 0.2,
+   "max": 0.8
+  },
+  {
+   "metric": "mmcs",
+   "n": 3,
+   "n_dropped": 0,
+   "mean": 0.9957744280497233,
+   "sd": 0.0025867020972154212,
+   "se": 0.001493433152140693,
+   "min": 0.993582832813263,
+   "max": 0.9986276984214782
+  },
+  {
+   "metric": "ml2r",
+   "n": 3,
+   "n_dropped": 0,
+   "mean": 43.70537168573646,
+   "sd": 47.59825381659752,
+   "se": 27.480864653968712,
+   "min": 1.3520217299461366,
+   "max": 95.21748925198044
+  },
+  {
+   "metric": "n_alive",
+   "n": 3,
+   "n_dropped": 0,
+   "mean": 4.0,
+   "sd": 3.0,
+   "se": 1.7320508075688774,
+   "min": 1.0,
+   "max": 7.0
+  }
+ ],
+ "records": [
+  {
+   "seed": 0,
+   "faith": 0.0013779910514131188,
+   "sep_frac": 0.8,
+   "mmcs": 0.9986276984214782,
+   "ml2r": 34.546604075282815,
+   "n_important_per_feature": [
+    1,
+    1,
+    1,
+    1,
+    0
+   ],
+   "n_alive": 4
+  },
+  {
+   "seed": 1,
+   "faith": 0.0006871330551803112,
+   "sep_frac": 0.2,
+   "mmcs": 0.9951127529144287,
+   "ml2r": 1.3520217299461366,
+   "n_important_per_feature": [
+    0,
+    0,
+    0,
+    0,
+    1
+   ],
+   "n_alive": 1
+  },
+  {
+   "seed": 2,
+   "faith": 0.0046111526899039745,
+   "sep_frac": 0.2,
+   "mmcs": 0.993582832813263,
+   "ml2r": 95.21748925198044,
+   "n_important_per_feature": [
+    2,
+    1,
+    2,
+    3,
+    3
+   ],
+   "n_alive": 7
+  }
+ ]
+}

@@ -1,0 +1,25 @@
+theorem                                           max violation  mean witness  verdict
+sum_softmax                                           4.441e-16     3.401e+02  PASS
+softmax_add_const                                     3.331e-16     2.001e-01  PASS
+softmax_comp_perm                                     2.220e-16     2.999e-01  PASS
+layerNorm_mean/layerNorm_variance                     3.553e-15     1.156e+00  PASS
+layerNorm_sqDist_le                                   0.000e+00     1.595e+01  PASS
+layerNorm_smul                                        1.776e-15     2.707e-16  PASS
+relu_isProj                                           0.000e+00     1.407e+01  PASS
+attention_le/le_attention                             0.000e+00     2.372e+00  PASS
+attention_perm_equivariant                            8.882e-16     9.594e-01  PASS
+multiHeadAttention_eq_sum_heads                       7.105e-15     9.891e+00  PASS
+splitStep_eq_encoderBlock                             1.776e-15     1.097e+00  PASS
+nextTokenDist_prefix                                  0.000e+00     5.812e-02  PASS
+logitsPre_eq_sum_contributions                        1.066e-14     1.526e+01  PASS
+masked_one/masked_update_zero/masked_eq_sum           1.776e-15     3.259e+00  PASS
+masked_mulVec                                         5.329e-15     4.085e+00  PASS
+spdMask_mem_Icc                                       0.000e+00     6.201e-01  PASS
+lowerLeaky/upperLeaky/hardSigmoid                     0.000e+00     7.155e+00  PASS
+colComp_faithful/colComp_outer                        0.000e+00     2.000e+00  PASS
+rank_sum_le                                           0.000e+00     3.000e+00  PASS
+onehot_identifiability (perturbation)                 0.000e+00     4.000e+00  PASS
+readout_error_le                                      0.000e+00     1.895e+00  PASS
+expectedCost_split_sub_absorbed                       2.220e-16     3.369e-01  PASS
+
+wrote /projects/standard/hsiehph/sauer354/params/validation/empirical/results/battery.json

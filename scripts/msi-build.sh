@@ -42,7 +42,7 @@ LOG=$ROOT/validation/code/results/build-$(date +%Y%m%dT%H%M%S).log
 {
   echo "== commit $(git rev-parse HEAD)  node $(hostname)  jobs $JOBS"
   echo "== lake build"
-  /usr/bin/time -v lake build -j "$JOBS" Params 2>&1
+  /usr/bin/time -v taskset -c 64-$((64 + JOBS - 1)) lake build Params 2>&1
   echo "== exit $?"
   echo "== axiom scan"
   lake env lean validation/code/Check.lean 2>&1 | grep -E "AXIOM_SCAN|error|sorryAx" | head -100

@@ -158,11 +158,11 @@ theorem faithfulnessLoss_nonneg (W : Matrix m n ℝ) (D : Subcomponents m n C) :
 theorem faithfulnessLoss_eq_zero_iff (W : Matrix m n ℝ) (D : Subcomponents m n C) :
     faithfulnessLoss W D = 0 ↔ D.weight = W := by
   unfold faithfulnessLoss
-  rw [Finset.sum_eq_zero_iff_of_nonneg (fun i _ => Finset.sum_nonneg (fun j _ => sq_nonneg _))]
+  rw [Finset.sum_eq_zero_iff_of_nonneg (fun _ _ => Finset.sum_nonneg (fun _ _ => sq_nonneg _))]
   constructor
   · intro h
     ext i j
-    have hij := (Finset.sum_eq_zero_iff_of_nonneg (fun j _ => sq_nonneg _)).mp
+    have hij := (Finset.sum_eq_zero_iff_of_nonneg (fun _ _ => sq_nonneg _)).mp
       (h i (Finset.mem_univ i)) j (Finset.mem_univ j)
     have hsub := (pow_eq_zero_iff two_ne_zero).mp hij
     linarith

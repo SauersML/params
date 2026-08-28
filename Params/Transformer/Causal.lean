@@ -42,7 +42,7 @@ lemma maskedSoftmax_nonneg (mask : ι → Prop) [DecidablePred mask] (a : ι →
     0 ≤ maskedSoftmax mask a i := by
   unfold maskedSoftmax
   split_ifs
-  · exact div_nonneg (Real.exp_pos _).le (Finset.sum_nonneg (fun j _ => (Real.exp_pos _).le))
+  · exact div_nonneg (Real.exp_pos _).le (Finset.sum_nonneg (fun _ _ => (Real.exp_pos _).le))
   · exact le_rfl
 
 /-- Masked softmax weights sum to one as soon as some position is unmasked. -/

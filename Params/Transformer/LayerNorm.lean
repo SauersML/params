@@ -75,7 +75,7 @@ lemma card_mul_variance (v : ι → ℝ) :
 lemma variance_nonneg (v : ι → ℝ) : 0 ≤ variance v := by
   unfold variance
   apply div_nonneg
-  · exact Finset.sum_nonneg (fun i _ => sq_nonneg _)
+  · exact Finset.sum_nonneg (fun _ _ => sq_nonneg _)
   · exact (card_pos (ι := ι)).le
 
 /-- Centred values sum to zero. -/

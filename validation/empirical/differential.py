@@ -68,7 +68,8 @@ def diff_mha(rng):
     with torch.no_grad():
         mha.in_proj_weight.copy_(t(np.concatenate([Wq.T, Wk.T, Wv.T], axis=0)))
         mha.out_proj.weight.copy_(t(Wo.T))
-    ref = mha(t(u)[None], t(u)[None], t(u)[None], need_weights=False)[0][0].numpy()
+    with torch.no_grad():
+        ref = mha(t(u)[None], t(u)[None], t(u)[None], need_weights=False)[0][0].numpy()
     WQs = [Wq[:, p * dk:(p + 1) * dk] for p in range(h)]; WKs = [Wk[:, p * dk:(p + 1) * dk] for p in range(h)]
     WVs = [Wv[:, p * dk:(p + 1) * dk] for p in range(h)]
     ours = L.multi_head_attention(1 / np.sqrt(dk), WQs, WKs, WVs, Wo, u)

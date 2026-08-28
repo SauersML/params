@@ -1,5 +1,8 @@
 import Mathlib
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Sparsity is not the same as feature recovery: the absorption threshold
 

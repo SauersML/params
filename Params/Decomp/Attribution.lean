@@ -1,6 +1,9 @@
 import Mathlib
 import Params.Decomp.Identifiability
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Ablation invariance, attributions and the rank surrogate of APD
 

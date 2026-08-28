@@ -1,6 +1,9 @@
 import Mathlib
 import Params.Transformer.Attention
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # QK and OV circuits: what the attention weights actually depend on
 

@@ -1,5 +1,8 @@
 import Mathlib
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Linear parameter decomposition: subcomponents, masks, losses
 

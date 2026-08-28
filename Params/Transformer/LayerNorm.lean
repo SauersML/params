@@ -1,5 +1,8 @@
 import Mathlib
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Layer normalization as a Euclidean projection
 

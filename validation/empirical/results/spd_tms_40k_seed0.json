@@ -1,0 +1,119 @@
+{
+ "_provenance": {
+  "generator": "spd_tms.py",
+  "revision": "4e0812146cdc887efaf737a4db068bf9845cbc81",
+  "revisionShort": "4e08121",
+  "workingTreeClean": false,
+  "workingTreeDirtyPaths": [
+   "?? lake-manifest.json",
+   "?? validation/code/results/build-20260827T210824.log",
+   "?? validation/code/results/build-20260827T211214.log",
+   "?? validation/code/results/build-latest.log",
+   "?? validation/code/results/kick.log",
+   "?? validation/code/results/last_compile_epoch",
+   "?? validation/empirical/results/"
+  ],
+  "runAt": "2026-08-28T02:45:59Z",
+  "host": "acn112",
+  "python": "3.12.4",
+  "numpy": "2.5.2",
+  "torch": "2.13.0+cpu",
+  "seed": 0,
+  "replicates": 1,
+  "argv": [
+   "validation/empirical/spd_tms.py",
+   "--spd-repo",
+   "/projects/standard/hsiehph/sauer354/param-decomp",
+   "--steps",
+   "40000",
+   "--seeds",
+   "1",
+   "--first-seed",
+   "0",
+   "--threads",
+   "8",
+   "--output",
+   "validation/empirical/results/spd_tms_40k_seed0.json"
+  ],
+  "config": {
+   "spd_repo": "/projects/standard/hsiehph/sauer354/param-decomp",
+   "steps": 40000,
+   "seeds": 1,
+   "first_seed": 0,
+   "threads": 8,
+   "n_features": 5,
+   "n_hidden": 2,
+   "C": 20,
+   "output": "validation/empirical/results/spd_tms_40k_seed0.json"
+  }
+ },
+ "cells": [
+  {
+   "metric": "faith",
+   "n": 1,
+   "n_dropped": 0,
+   "mean": 0.00019499285554047674,
+   "sd": null,
+   "se": null,
+   "min": 0.00019499285554047674,
+   "max": 0.00019499285554047674
+  },
+  {
+   "metric": "sep_frac",
+   "n": 1,
+   "n_dropped": 0,
+   "mean": 0.8,
+   "sd": null,
+   "se": null,
+   "min": 0.8,
+   "max": 0.8
+  },
+  {
+   "metric": "mmcs",
+   "n": 1,
+   "n_dropped": 0,
+   "mean": 0.9999790668487549,
+   "sd": null,
+   "se": null,
+   "min": 0.9999790668487549,
+   "max": 0.9999790668487549
+  },
+  {
+   "metric": "ml2r",
+   "n": 1,
+   "n_dropped": 0,
+   "mean": 1.028694558609277,
+   "sd": null,
+   "se": null,
+   "min": 1.028694558609277,
+   "max": 1.028694558609277
+  },
+  {
+   "metric": "n_alive",
+   "n": 1,
+   "n_dropped": 0,
+   "mean": 4.0,
+   "sd": null,
+   "se": null,
+   "min": 4.0,
+   "max": 4.0
+  }
+ ],
+ "records": [
+  {
+   "seed": 0,
+   "faith": 0.00019499285554047674,
+   "sep_frac": 0.8,
+   "mmcs": 0.9999790668487549,
+   "ml2r": 1.028694558609277,
+   "n_important_per_feature": [
+    1,
+    1,
+    1,
+    1,
+    0
+   ],
+   "n_alive": 4
+  }
+ ]
+}

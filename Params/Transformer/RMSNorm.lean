@@ -1,6 +1,9 @@
 import Mathlib
 import Params.Transformer.LayerNorm
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # RMS normalisation as a Euclidean projection
 

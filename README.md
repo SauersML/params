@@ -53,6 +53,26 @@ python3 validation/empirical/run.py --spd-repo PATH        # NumPy transcription
 Results land in `validation/empirical/results/*.json` with revision, seed,
 replicate count and per-cell error bars, and in `validation/code/results/`.
 
+## Empirical bridge to `onehot_identifiability`
+
+`validation/empirical/spd_tms.py` runs the unmodified SPD reference optimiser on a
+TMS 5-2 target (3 seeds, 40k steps) and `spd_tms_analyze.py` measures, per feature
+`j` on the one-hot input `e_j`, how far the learned decomposition is from the
+theorem's hypotheses and conclusion (`validation/empirical/results/spd_tms_analysis_40k.json`):
+
+| feature rows (3 seeds × 5 features) | active_cos | active_l2r | inactive_ratio |
+|---|---|---|---|
+| exactly one important subcomponent (12 rows) | 1.000 | 1.03 – 1.10 | 0.03 – 0.10 |
+| no important subcomponent (8 rows) | −0.99 … 1.00 | 0.01 – 3.04 | ≈ 1.0 |
+
+Where the causal-separation hypothesis holds (one important subcomponent, the others
+nearly ablatable), the important subcomponent's column is the column of `W` to within
+a few percent — the theorem's conclusion.  Where it fails (the gate never marks a
+subcomponent important for the feature) the decomposition is not the column one for
+that feature, and faithfulness alone (`‖W − ΣP_c‖/‖W‖ ≈ 3·10⁻⁴` in every run) does not
+rescue it.  One of three seeds collapsed to a single alive subcomponent; the paper
+also reports seed sensitivity.  Numbers are measured, not fitted.
+
 ## Sources formalised
 
 * Tai, Liu, Li, Chan — *A Mathematical Explanation of Transformers* (arXiv:2510.03989)

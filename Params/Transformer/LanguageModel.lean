@@ -2,6 +2,9 @@ import Mathlib
 import Params.Transformer.Encoder
 import Params.Transformer.Causal
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # A decoder-only language model, and what its predictions can depend on
 

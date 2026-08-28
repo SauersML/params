@@ -1,6 +1,9 @@
 import Mathlib
 import Params.Transformer.Softmax
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Scaled dot-product attention
 

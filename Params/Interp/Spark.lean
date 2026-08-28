@@ -1,5 +1,8 @@
 import Mathlib
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # When can a sparse dictionary be recovered?  The spark bound
 

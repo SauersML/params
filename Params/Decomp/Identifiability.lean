@@ -1,6 +1,9 @@
 import Mathlib
 import Params.Decomp.Basic
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Identifiability of rank-one parameter decompositions on one-hot inputs
 

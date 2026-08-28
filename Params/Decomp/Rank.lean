@@ -1,6 +1,9 @@
 import Mathlib
 import Params.Decomp.Basic
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Rank bounds for parameter decompositions
 

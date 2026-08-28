@@ -1,6 +1,9 @@
 import Mathlib
 import Params.Transformer.Attention
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Causal (masked) attention and prefix dependence
 

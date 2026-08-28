@@ -1,6 +1,9 @@
 import Mathlib
 import Params.Decomp.Basic
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # Targeted parameter decomposition: the catch-all component
 

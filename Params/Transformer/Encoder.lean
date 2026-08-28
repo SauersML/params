@@ -2,6 +2,9 @@ import Mathlib
 import Params.Transformer.Attention
 import Params.Transformer.LayerNorm
 
+set_option linter.unusedSectionVars false
+set_option linter.unusedSimpArgs false
+
 /-!
 # The Transformer encoder block and its operator-splitting form
 

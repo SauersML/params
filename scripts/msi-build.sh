@@ -13,6 +13,7 @@ JOBS=${JOBS:-16}
 FORCE=${FORCE:-0}
 
 cd "$ROOT" || exit 2
+mkdir -p "$ROOT/validation/code/results"
 git fetch -q origin && git reset -q --hard origin/main
 now=$(date +%s)
 if [ "$FORCE" != "1" ] && [ -r "$STAMP" ]; then

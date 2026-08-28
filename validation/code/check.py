@@ -33,7 +33,7 @@ def lean_files() -> list[Path]:
 
 
 def strip_comments(text: str) -> str:
-    text = re.sub(r"/-.*?-/", "", text, flags=re.S)
+    text = re.sub(r"/-.*?-/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
     return "\n".join(line.split("--", 1)[0] for line in text.splitlines())
 
 

@@ -60,10 +60,12 @@ theorem ffn_prefixDependent (φ : FFNParams d f) :
   simp only [ffn, reluM, broadcast, Matrix.add_apply, Matrix.mul_apply, Matrix.of_apply,
     h i le_rfl]
 
+/-- Row-wise layer normalisation is prefix dependent. -/
 theorem lnRows_prefixDependent (σ₁ σ₂ : ℝ) :
     PrefixDependent (fun u : Matrix (Fin N) d ℝ => lnRows σ₁ σ₂ u) :=
   prefixDependent_rowwise (layerNorm σ₁ σ₂)
 
+/-- A causal decoder block is prefix dependent. -/
 theorem decoderBlock_prefixDependent (s : ℝ) (θ : DecoderParams d f) :
     PrefixDependent (fun u : Matrix (Fin N) d ℝ => decoderBlock s θ u) := by
   have h1 : PrefixDependent (fun u : Matrix (Fin N) d ℝ => u + causalSelfAttention s θ.attn u) :=
@@ -74,6 +76,7 @@ theorem decoderBlock_prefixDependent (s : ℝ) (θ : DecoderParams d f) :
     prefixDependent_add _ _ prefixDependent_id (ffn_prefixDependent θ.ffn)
   exact prefixDependent_comp _ _ (prefixDependent_comp _ _ (prefixDependent_comp _ _ h1 h2) h3) h2
 
+/-- A stack of causal decoder blocks is prefix dependent. -/
 theorem decoderStack_prefixDependent (s : ℝ) (θs : List (DecoderParams d f)) :
     PrefixDependent (fun u : Matrix (Fin N) d ℝ => decoderStack s θs u) := by
   induction θs with
@@ -107,16 +110,19 @@ def logits (s : ℝ) (θ : LMParams V d f N) (t : Fin N → V) : Matrix (Fin N) 
 def nextTokenDist (s : ℝ) (θ : LMParams V d f N) (t : Fin N → V) (i : Fin N) : V → ℝ :=
   softmax (logits s θ t i)
 
+/-- The next-token distribution is a probability vector. -/
 theorem sum_nextTokenDist [Nonempty V] (s : ℝ) (θ : LMParams V d f N) (t : Fin N → V) (i : Fin N) :
     ∑ v, nextTokenDist s θ t i v = 1 :=
   sum_softmax _
 
+/-- Embeddings of two sequences agree on every position up to `i` where the tokens agree. -/
 theorem embedTokens_prefix (θ : LMParams V d f N) (t t' : Fin N → V) (i : Fin N)
     (h : ∀ j, j ≤ i → t j = t' j) :
     ∀ j, j ≤ i → ∀ l, embedTokens θ t j l = embedTokens θ t' j l := by
   intro j hj l
   simp only [embedTokens, Matrix.of_apply, h j hj]
 
+/-- Logits at position `i` depend only on tokens at positions `≤ i`. -/
 theorem logits_prefix (s : ℝ) (θ : LMParams V d f N) (t t' : Fin N → V) (i : Fin N)
     (h : ∀ j, j ≤ i → t j = t' j) : logits s θ t i = logits s θ t' i := by
   funext v

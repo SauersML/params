@@ -99,6 +99,7 @@ lemma le_of_sq_le_sq' {a b : ℝ} (h : a ^ 2 ≤ b ^ 2) (hb : 0 ≤ b) : a ≤ b
 
 /-! ### Mean and variance of the normalised vector -/
 
+/-- The normalised vector has mean `σ₁`. -/
 theorem layerNorm_mean (σ₁ σ₂ : ℝ) (v : ι → ℝ) : mean (layerNorm σ₁ σ₂ v) = σ₁ := by
   rw [mean]
   simp only [layerNorm]
@@ -106,6 +107,7 @@ theorem layerNorm_mean (σ₁ σ₂ : ℝ) (v : ι → ℝ) : mean (layerNorm σ
     ← Finset.sum_div, ← Finset.mul_sum, sum_sub_mean, mul_zero, zero_div, zero_add]
   exact mul_div_cancel_left₀ _ (card_pos (ι := ι)).ne'
 
+/-- The normalised vector has variance `σ₂²` (when `v` is not constant). -/
 theorem layerNorm_variance (σ₁ σ₂ : ℝ) (v : ι → ℝ) (hv : variance v ≠ 0) :
     variance (layerNorm σ₁ σ₂ v) = σ₂ ^ 2 := by
   have hβ : 0 < variance v := lt_of_le_of_ne (variance_nonneg v) (Ne.symm hv)
@@ -124,6 +126,7 @@ theorem layerNorm_variance (σ₁ σ₂ : ℝ) (v : ι → ℝ) (hv : variance v
     div_mul_eq_mul_div, div_div, mul_div_assoc,
     div_self (mul_ne_zero hv (card_pos (ι := ι)).ne'), mul_one]
 
+/-- Layer normalisation lands in the constraint set. -/
 theorem layerNorm_mem_meanVarSet (σ₁ σ₂ : ℝ) (v : ι → ℝ) (hv : variance v ≠ 0) :
     layerNorm σ₁ σ₂ v ∈ MeanVarSet σ₁ σ₂ :=
   ⟨layerNorm_mean σ₁ σ₂ v, layerNorm_variance σ₁ σ₂ v hv⟩
@@ -302,6 +305,7 @@ theorem relu_isProj (v u : ι → ℝ) (hu : u ∈ NonnegSet) :
   intro i _
   exact relu_sub_sq_le (v i) (u i) (hu i)
 
+/-- Entry-wise ReLU lands in the non-negative orthant. -/
 theorem relu_mem_nonnegSet (v : ι → ℝ) : (fun i => relu (v i)) ∈ NonnegSet :=
   fun i => relu_nonneg (v i)
 

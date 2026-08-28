@@ -64,11 +64,13 @@ variable {m n C : Type*} [Fintype m] [Fintype n] [Fintype C]
 gradient `grad = ∇_θ f_o(x, θ*)` (one output coordinate). -/
 def attribution (grad P : Matrix m n ℝ) : ℝ := ∑ i, ∑ j, grad i j * P i j
 
+/-- Attribution is additive in the parameter direction. -/
 theorem attribution_add (grad P Q : Matrix m n ℝ) :
     attribution grad (P + Q) = attribution grad P + attribution grad Q := by
   unfold attribution
   simp only [Matrix.add_apply, mul_add, Finset.sum_add_distrib]
 
+/-- Attribution is homogeneous in the parameter direction. -/
 theorem attribution_smul (grad P : Matrix m n ℝ) (a : ℝ) :
     attribution grad (a • P) = a * attribution grad P := by
   unfold attribution

@@ -82,10 +82,11 @@ def guard_closure() -> list[str]:
 def guard_docstrings() -> list[str]:
     out = []
     for f in lean_files():
-        lines = f.read_text().splitlines()
+        lines = strip_comments(f.read_text()).splitlines()
+        raw = f.read_text().splitlines()
         for i, line in enumerate(lines):
             if re.match(r"^theorem\s", line):
-                prev = lines[i - 1].strip() if i > 0 else ""
+                prev = raw[i - 1].strip() if i > 0 else ""
                 if not (prev.endswith("-/") or prev.startswith("--") or prev.startswith("@[")):
                     out.append(f"{f.relative_to(REPO)}:{i + 1}: theorem without docstring")
     return out

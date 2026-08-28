@@ -126,6 +126,7 @@ lemma submatrix_mul_left (u : Matrix n d ℝ) (W : Matrix d d ℝ) (σ : Equiv.P
   ext i k
   simp [Matrix.mul_apply]
 
+/-- Self-attention is permutation equivariant. -/
 theorem selfAttention_perm_equivariant (s : ℝ) (θ : AttnParams d) (u : Matrix n d ℝ)
     (σ : Equiv.Perm n) :
     selfAttention s θ (u.submatrix σ id) = (selfAttention s θ u).submatrix σ id := by

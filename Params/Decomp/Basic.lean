@@ -91,12 +91,14 @@ def Subcomponents.weight (D : Subcomponents m n C) : Matrix m n ℝ := D.U * D.V
 def Subcomponents.masked (D : Subcomponents m n C) (mask : C → ℝ) : Matrix m n ℝ :=
   D.U * Matrix.diagonal mask * D.V
 
+/-- The reconstructed weight is the sum of the rank-one subcomponents. -/
 theorem weight_eq_sum_components (D : Subcomponents m n C) :
     D.weight = ∑ c, D.component c := by
   ext i j
   rw [Subcomponents.weight, Matrix.mul_apply, Matrix.sum_apply]
   simp only [Subcomponents.component, outer_apply]
 
+/-- The masked weight is the mask-weighted sum of subcomponents. -/
 theorem masked_eq_sum (D : Subcomponents m n C) (mask : C → ℝ) :
     D.masked mask = ∑ c, mask c • D.component c := by
   ext i j
@@ -150,6 +152,7 @@ that constant does not affect any statement here). -/
 def faithfulnessLoss (W : Matrix m n ℝ) (D : Subcomponents m n C) : ℝ :=
   ∑ i, ∑ j, (W i j - D.weight i j) ^ 2
 
+/-- The faithfulness loss is a sum of squares. -/
 theorem faithfulnessLoss_nonneg (W : Matrix m n ℝ) (D : Subcomponents m n C) :
     0 ≤ faithfulnessLoss W D :=
   Finset.sum_nonneg (fun _ _ => Finset.sum_nonneg (fun _ _ => sq_nonneg _))
@@ -197,10 +200,12 @@ theorem spdMask_mem_Icc (g r : C → ℝ) (c : C) (hg : g c ∈ Set.Icc (0 : ℝ
   · nlinarith
   · nlinarith
 
+/-- At `r = 0` the mask is the causal importance itself. -/
 theorem spdMask_r_zero (g : C → ℝ) : spdMask g (fun _ => 0) = g := by
   funext c
   simp [spdMask]
 
+/-- At `r = 1` every subcomponent is fully on. -/
 theorem spdMask_r_one (g : C → ℝ) : spdMask g (fun _ => 1) = fun _ => 1 := by
   funext c
   simp [spdMask]
@@ -214,12 +219,14 @@ def lowerLeaky (α x : ℝ) : ℝ := if 0 < x then min 1 x else α * x
 /-- The penalty activation of the code: `where(x > 1, 1 + α (x − 1), relu x)`. -/
 def upperLeaky (α x : ℝ) : ℝ := if 1 < x then 1 + α * (x - 1) else max 0 x
 
+/-- The hard sigmoid takes values in `[0, 1]`. -/
 theorem hardSigmoid_mem_Icc (x : ℝ) : hardSigmoid x ∈ Set.Icc (0 : ℝ) 1 := by
   unfold hardSigmoid
   constructor
   · exact le_max_left 0 _
   · exact max_le zero_le_one (min_le_left 1 x)
 
+/-- The mask activation never exceeds `1`. -/
 theorem lowerLeaky_le_one (α x : ℝ) (hα : 0 ≤ α) : lowerLeaky α x ≤ 1 := by
   unfold lowerLeaky
   split_ifs with h
@@ -227,6 +234,7 @@ theorem lowerLeaky_le_one (α x : ℝ) (hα : 0 ≤ α) : lowerLeaky α x ≤ 1 
   · have h' : x ≤ 0 := not_lt.mp h
     nlinarith [hα, h']
 
+/-- The penalty activation is never negative. -/
 theorem upperLeaky_nonneg (α x : ℝ) (hα : 0 ≤ α) : 0 ≤ upperLeaky α x := by
   unfold upperLeaky
   split_ifs with h
@@ -239,10 +247,12 @@ theorem lowerLeaky_of_mem_Icc (α x : ℝ) (hx : x ∈ Set.Icc (0 : ℝ) 1) (hx0
   unfold lowerLeaky
   rw [if_pos hx0, min_eq_right hx.2]
 
+/-- On `[0, 1]` the penalty activation is the identity. -/
 theorem upperLeaky_of_mem_Icc (α x : ℝ) (hx : x ∈ Set.Icc (0 : ℝ) 1) : upperLeaky α x = x := by
   unfold upperLeaky
   rw [if_neg (not_lt.mpr hx.2), max_eq_right hx.1]
 
+/-- On `[0, 1]` the hard sigmoid is the identity. -/
 theorem hardSigmoid_of_mem_Icc (x : ℝ) (hx : x ∈ Set.Icc (0 : ℝ) 1) : hardSigmoid x = x := by
   unfold hardSigmoid
   rw [min_eq_right hx.2, max_eq_right hx.1]
@@ -256,6 +266,7 @@ variable {C : Type*} [Fintype C]
 /-- Importance-minimality penalty `Σ_c |g c|^p`. -/
 def importanceLoss (p : ℝ) (g : C → ℝ) : ℝ := ∑ c, |g c| ^ p
 
+/-- The importance penalty is non-negative. -/
 theorem importanceLoss_nonneg (p : ℝ) (g : C → ℝ) : 0 ≤ importanceLoss p g :=
   Finset.sum_nonneg (fun _ _ => Real.rpow_nonneg (abs_nonneg _) p)
 

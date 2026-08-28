@@ -33,6 +33,8 @@ numerically with provenance-stamped results.
 | `Params/Decomp/Basic.lean` | SPD subcomponents `U diag(m) V`, masks `g + (1−g) r`, hard/leaky sigmoids as in the reference code, faithfulness and importance losses, ablation identity |
 | `Params/Decomp/Rank.lean` | rank subadditivity; a faithful rank-one decomposition of `W` needs `≥ rank W` pieces; a hidden identity needs `≥ k` |
 | `Params/Decomp/Attribution.lean` | ablation invariance of the column decomposition (APD's ablation-curve criterion, exact for linear maps); attributions are additive; APD's rank surrogate `= ‖U‖‖V‖` |
+| `Params/Decomp/Targeted.lean` | targeted PD (arXiv:2607.13047): catch-all reconstruction identities, existence of adversarial masks, underdetermination off the target subspace, merging of co-active subcomponents, non-uniqueness of rank-one splittings |
+| `Params/Decomp/L3D.lean` | L3D (arXiv:2504.00194): top-k projection, exact recovery under `V^in V^out = I`, scale invariance of the normalised loss, sign ambiguity, impact = directional derivative |
 | `Params/Decomp/Identifiability.lean` | **`onehot_identifiability`**: with rank-one subcomponents, exact faithfulness and exact one-hot causal separation, a matrix with non-zero pairwise-independent columns has *only* the column decomposition (the TMS ground truth of APD/SPD); hypotheses shown satisfiable |
 | `Params/Interp/Superposition.lean` | interference bound for almost-orthogonal features: read-out error ≤ `ε (k−1) ‖s‖∞`; orthonormal ⇒ exact and `N ≤ d` |
 | `Params/Interp/Spark.lean` | uniqueness of sparse codes below the spark bound (when SDL *can* recover true features) |
@@ -56,4 +58,6 @@ replicate count and per-cell error bars, and in `validation/code/results/`.
 * Tai, Liu, Li, Chan — *A Mathematical Explanation of Transformers* (arXiv:2510.03989)
 * Bushnaq, Braun, Sharkey — *Stochastic Parameter Decomposition* (arXiv:2506.20790); code `goodfire-ai/param-decomp@spd-paper`
 * Braun et al. — *Interpretability in Parameter Space* (APD, arXiv:2501.14926)
+* Vigouroux, Sharkey — *Targeted Recovery of Weight-Space Mechanisms* (tPD, arXiv:2607.13047)
+* Chrisman, Bushnaq, Sharkey — *Local Loss Landscape Decomposition* (L3D, arXiv:2504.00194)
 * Sharkey et al. — *Open Problems in Mechanistic Interpretability* (arXiv:2501.16496), Q3/Q4 mathematical cores

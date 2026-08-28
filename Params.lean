@@ -11,6 +11,8 @@ import Params.Decomp.Rank
 import Params.Decomp.Identifiability
 import Params.Decomp.Attribution
 import Params.Decomp.Layerwise
+import Params.Decomp.Targeted
+import Params.Decomp.L3D
 import Params.Interp.Superposition
 import Params.Interp.Spark
 import Params.Interp.Absorption

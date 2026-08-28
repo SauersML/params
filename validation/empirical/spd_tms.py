@@ -118,6 +118,7 @@ def main():
     ap.add_argument("--spd-repo", required=True)
     ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--first-seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--n-features", type=int, default=5)
     ap.add_argument("--n-hidden", type=int, default=2)
@@ -125,12 +126,12 @@ def main():
     ap.add_argument("--output", default=str(Path(__file__).resolve().parent / "results" / "spd_tms.json"))
     args = ap.parse_args()
     records = [run_one(Path(args.spd_repo), s, args.steps, args.n_features, args.n_hidden, args.C, args.threads)
-               for s in range(args.seeds)]
+               for s in range(args.first_seed, args.first_seed + args.seeds)]
     cells = [{"metric": k, **provenance.summarize([r[k] for r in records])}
              for k in ("faith", "sep_frac", "mmcs", "ml2r", "n_alive")]
     for c in cells:
         print(f"{c['metric']:<10} mean={c['mean']:.4f} sd={c['sd']} min={c['min']:.4f} max={c['max']:.4f}")
-    provenance.write(args.output, "spd_tms.py", vars(args), 0, args.seeds, cells, records)
+    provenance.write(args.output, "spd_tms.py", vars(args), args.first_seed, args.seeds, cells, records)
     print("wrote", args.output)
 
 

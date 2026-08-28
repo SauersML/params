@@ -12,3 +12,4 @@ import Params.Decomp.Attribution
 import Params.Interp.Superposition
 import Params.Interp.Spark
 import Params.Interp.Absorption
+import Params.Interp.IntegratedGradients

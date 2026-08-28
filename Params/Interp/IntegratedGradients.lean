@@ -47,18 +47,18 @@ def pathDeriv (F : (ι → ℝ) → ℝ) (x x' : ι → ℝ) (t : ℝ) : ℝ :=
 
 lemma hasDerivAt_comp_path (F : (ι → ℝ) → ℝ) (hF : ContDiff ℝ 1 F) (x x' : ι → ℝ) (t : ℝ) :
     HasDerivAt (fun t => F (path x x' t)) (pathDeriv F x x' t) t :=
-  ((hF.differentiable le_rfl) (path x x' t)).hasFDerivAt.comp_hasDerivAt t (hasDerivAt_path x x' t)
+  ((hF.differentiable one_ne_zero) (path x x' t)).hasFDerivAt.comp_hasDerivAt t (hasDerivAt_path x x' t)
 
 lemma continuous_pathDeriv (F : (ι → ℝ) → ℝ) (hF : ContDiff ℝ 1 F) (x x' : ι → ℝ) :
     Continuous (pathDeriv F x x') :=
-  ((hF.continuous_fderiv le_rfl).comp (continuous_path x x')).clm_apply continuous_const
+  ((hF.continuous_fderiv one_ne_zero).comp (continuous_path x x')).clm_apply continuous_const
 
 /-- **Completeness of the path integral of the gradient** (fundamental theorem of calculus). -/
 theorem path_integral_complete (F : (ι → ℝ) → ℝ) (hF : ContDiff ℝ 1 F) (x x' : ι → ℝ) :
     ∫ t in (0 : ℝ)..1, pathDeriv F x x' t = F x - F x' := by
   have h := intervalIntegral.integral_eq_sub_of_hasDerivAt
     (fun t _ => hasDerivAt_comp_path F hF x x' t)
-    (continuous_pathDeriv F hF x x').intervalIntegrable
+    ((continuous_pathDeriv F hF x x').intervalIntegrable 0 1)
   rw [h]
   simp [path]
 
@@ -68,7 +68,7 @@ def integratedGradient (F : (ι → ℝ) → ℝ) (x x' : ι → ℝ) (i : ι) :
 
 lemma continuous_coord_deriv (F : (ι → ℝ) → ℝ) (hF : ContDiff ℝ 1 F) (x x' : ι → ℝ) (i : ι) :
     Continuous (fun t => fderiv ℝ F (path x x' t) (Pi.single i 1)) :=
-  ((hF.continuous_fderiv le_rfl).comp (continuous_path x x')).clm_apply continuous_const
+  ((hF.continuous_fderiv one_ne_zero).comp (continuous_path x x')).clm_apply continuous_const
 
 /-- The directional derivative along the path is the weighted sum of coordinate derivatives. -/
 lemma pathDeriv_eq_sum (F : (ι → ℝ) → ℝ) (x x' : ι → ℝ) (t : ℝ) :
@@ -91,8 +91,11 @@ theorem integratedGradients_complete (F : (ι → ℝ) → ℝ) (hF : ContDiff �
     ∑ i, integratedGradient F x x' i = F x - F x' := by
   rw [← path_integral_complete F hF x x']
   have hint : ∀ i ∈ (Finset.univ : Finset ι), IntervalIntegrable
-      (fun t => (x i - x' i) * fderiv ℝ F (path x x' t) (Pi.single i 1)) MeasureTheory.volume 0 1 :=
-    fun i _ => (continuous_const.mul (continuous_coord_deriv F hF x x' i)).intervalIntegrable
+      (fun t => (x i - x' i) * fderiv ℝ F (path x x' t) (Pi.single i 1)) MeasureTheory.volume 0 1 := by
+    intro i _
+    have hci : Continuous (fun t => (x i - x' i) * fderiv ℝ F (path x x' t) (Pi.single i 1)) :=
+      continuous_const.mul (continuous_coord_deriv F hF x x' i)
+    exact hci.intervalIntegrable 0 1
   calc ∑ i, integratedGradient F x x' i
       = ∑ i, ∫ t in (0 : ℝ)..1, (x i - x' i) * fderiv ℝ F (path x x' t) (Pi.single i 1) := by
         refine Finset.sum_congr rfl ?_
@@ -100,7 +103,7 @@ theorem integratedGradients_complete (F : (ι → ℝ) → ℝ) (hF : ContDiff �
         unfold integratedGradient
         rw [intervalIntegral.integral_const_mul]
     _ = ∫ t in (0 : ℝ)..1, ∑ i, (x i - x' i) * fderiv ℝ F (path x x' t) (Pi.single i 1) :=
-        (intervalIntegral.integral_finset_sum hint).symm
+        (intervalIntegral.integral_finsetSum hint).symm
     _ = ∫ t in (0 : ℝ)..1, pathDeriv F x x' t := by
         refine intervalIntegral.integral_congr ?_
         intro t _

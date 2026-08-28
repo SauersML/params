@@ -157,7 +157,7 @@ theorem causalSelfAttention_prefixDependent (s : ℝ) (θ : AttnParams d) :
   intro j _
   by_cases hj : j ≤ i
   · simp only [Matrix.mul_apply, h j hj]
-  · rw [maskedSoftmax_of_not _ _ hj, zero_mul, zero_mul]
+  · rw [maskedSoftmax_of_not (fun j => j ≤ i) _ hj, zero_mul, zero_mul]
 
 end Causal
 

@@ -77,7 +77,7 @@ end Block
 
 section Splitting
 
-variable {n d : Type*} [Fintype n] [Fintype d] [Nonempty d]
+variable {n d : Type*} [Fintype n] [Fintype d] [Nonempty d] [DecidableEq d]
 
 /-- Time-discretised control variables `θⁿ` of one splitting step (paper, Section 3.1). -/
 structure SplitParams (d : Type*) where

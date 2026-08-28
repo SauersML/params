@@ -59,7 +59,7 @@ theorem card_ge_rank_of_faithful {C : Type*} [Fintype C] [DecidableEq C] (W : Ma
 theorem card_ge_rank_of_faithful_outer {C : Type*} [Fintype C] [DecidableEq C]
     (W : Matrix m n ℝ) (u : C → m → ℝ) (v : C → n → ℝ)
     (hfaith : ∑ c, outer (u c) (v c) = W) : W.rank ≤ Fintype.card C :=
-  card_ge_rank_of_faithful W (fun c => outer (u c) (v c)) hfaith (fun c => rank_outer_le _ _)
+  card_ge_rank_of_faithful W (fun c => outer (u c) (v c)) hfaith (fun _ => rank_outer_le _ _)
 
 end RankAdd
 

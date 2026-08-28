@@ -71,6 +71,11 @@ theorem tpdMasked_eq (W : Matrix m n ℝ) (D : Subcomponents m n C) (mask : C �
   simp only [sub_smul, Finset.sum_sub_distrib, one_smul]
   abel
 
+lemma smul_mulVec' (a : ℝ) (M : Matrix m n ℝ) (x : n → ℝ) :
+    (a • M).mulVec x = a • M.mulVec x := by
+  ext i
+  simp [Matrix.mulVec, dotProduct, Finset.mul_sum, mul_assoc]
+
 /-- Ablating the catch-all on an input where the subcomponents alone reproduce `W x`
 changes nothing — the situation tPD aims for on target data. -/
 theorem tpdMasked_mulVec_of_faithful_on (W : Matrix m n ℝ) (D : Subcomponents m n C)
@@ -78,7 +83,7 @@ theorem tpdMasked_mulVec_of_faithful_on (W : Matrix m n ℝ) (D : Subcomponents 
     (hΔ : (W - D.weight).mulVec x = 0) :
     (tpdMasked W D mask mΔ).mulVec x = W.mulVec x := by
   unfold tpdMasked
-  rw [Matrix.add_mulVec, Matrix.smul_mulVec_assoc, hΔ, smul_zero, add_zero, h]
+  rw [Matrix.add_mulVec, smul_mulVec', hΔ, smul_zero, add_zero, h]
 
 /-- The adversarial masks of eq. (2) exist: a continuous loss attains a maximum on the
 compact box `[μ, 1]`. -/

@@ -129,7 +129,7 @@ theorem intervention_hasDerivAt (F : (nw → ℝ) → ℝ) (hF : ContDiff ℝ 1 
     HasDerivAt (fun δ : ℝ => F (W + δ • v)) (fderiv ℝ F W v) 0 := by
   have hγ : HasDerivAt (fun δ : ℝ => W + δ • v) v 0 := by
     simpa using ((hasDerivAt_id (0 : ℝ)).smul_const v).const_add W
-  have h := ((hF.differentiable le_rfl) (W + (0 : ℝ) • v)).hasFDerivAt.comp_hasDerivAt (0 : ℝ) hγ
+  have h := ((hF.differentiable one_ne_zero) (W + (0 : ℝ) • v)).hasFDerivAt.comp_hasDerivAt (0 : ℝ) hγ
   simpa using h
 
 end Intervention

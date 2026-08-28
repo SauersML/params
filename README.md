@@ -24,6 +24,7 @@ numerically with provenance-stamped results.
 |---|---|
 | `Params/Transformer/Softmax.lean` | softmax: positivity, normalisation, shift invariance, permutation covariance |
 | `Params/Transformer/LayerNorm.lean` | **layer normalisation is the Euclidean projection onto `{mean = σ₁, var = σ₂²}`** (finite form of Tai–Liu–Li–Chan Thm 3.1); scale invariance; ReLU is the projection onto the non-negative orthant |
+| `Params/Transformer/RMSNorm.lean` | RMSNorm (Llama) is the projection onto the unit-RMS sphere; scale invariance |
 | `Params/Transformer/Attention.lean` | scaled dot-product attention; outputs lie in the convex hull of `V`; **permutation equivariance**; multi-head = Σ heads · `W^O` blocks |
 | `Params/Transformer/Circuits.lean` | QK/OV circuits: attention pattern depends on `W^Q W^Kᵀ` only (gauge freedom `R, R⁻ᵀ`), head output on `W^V W^O` only |
 | `Params/Transformer/Encoder.lean` | post-norm encoder block; the six operator-splitting substeps of arXiv:2510.03989; **`splitStep = encoderBlock` exactly** (with `W_j ↦ I + W_j`), and for stacks |

@@ -76,6 +76,18 @@ def chk_layerNorm_smul(rng):
         np.abs(L.layer_norm(s1, s2, v + c) - L.layer_norm(s1, s2, v)).max()
 
 
+def chk_rmsNorm_sqDist_le(rng):
+    """`rmsNorm_sqDist_le` / `rmsNorm_mem` / `rmsNorm_smul`."""
+    v = rng.normal(size=9); star = L.rms_norm(v)
+    v_mem = abs(L.mean_sq(star) - 1)
+    worst = 0.0
+    for _ in range(20):
+        u = L.rms_norm(rng.normal(size=9))
+        worst = max(worst, L.sq_dist(star, v) - L.sq_dist(u, v))
+    v_smul = np.abs(L.rms_norm((abs(rng.normal()) + 0.1) * v) - star).max()
+    return max(worst, v_mem, v_smul, 0.0), L.sq_dist(u, v) - L.sq_dist(star, v)
+
+
 def chk_relu_isProj(rng):
     v = rng.normal(size=9); u = np.abs(rng.normal(size=9))
     return max(L.sq_dist(L.relu(v), v) - L.sq_dist(u, v), 0.0), L.sq_dist(u, v) - L.sq_dist(L.relu(v), v)
@@ -217,6 +229,7 @@ CHECKS = {
     "softmax_comp_perm": chk_softmax_comp_perm,
     "layerNorm_mean/layerNorm_variance": chk_layerNorm_mean_variance,
     "layerNorm_sqDist_le": chk_layerNorm_sqDist_le, "layerNorm_smul": chk_layerNorm_smul,
+    "rmsNorm_sqDist_le/rmsNorm_mem/rmsNorm_smul": chk_rmsNorm_sqDist_le,
     "relu_isProj": chk_relu_isProj, "attention_le/le_attention": chk_attention_bounds,
     "attention_perm_equivariant": chk_attention_perm_equivariant,
     "multiHeadAttention_eq_sum_heads": chk_multiHead_eq_sum_heads,

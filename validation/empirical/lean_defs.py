@@ -42,6 +42,17 @@ def layer_norm(s1, s2, v):
     return (np.divide(num, r, out=np.zeros_like(num), where=r != 0)) + s1
 
 
+def mean_sq(v):
+    """`Params.meanSq v = mean (fun j => v j ^ 2)`."""
+    return mean(v ** 2)
+
+
+def rms_norm(v):
+    """`Params.rmsNorm v i = v i / sqrt (meanSq v)`."""
+    r = np.sqrt(mean_sq(v))
+    return np.divide(v, r, out=np.zeros_like(v), where=r != 0)
+
+
 def sq_dist(u, v):
     """`Params.sqDist u v = Σ_i (u i - v i)^2`."""
     return ((u - v) ** 2).sum()

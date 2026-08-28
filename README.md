@@ -25,14 +25,17 @@ numerically with provenance-stamped results.
 | `Params/Transformer/Softmax.lean` | softmax: positivity, normalisation, shift invariance, permutation covariance |
 | `Params/Transformer/LayerNorm.lean` | **layer normalisation is the Euclidean projection onto `{mean = σ₁, var = σ₂²}`** (finite form of Tai–Liu–Li–Chan Thm 3.1); scale invariance; ReLU is the projection onto the non-negative orthant |
 | `Params/Transformer/Attention.lean` | scaled dot-product attention; outputs lie in the convex hull of `V`; **permutation equivariance**; multi-head = Σ heads · `W^O` blocks |
+| `Params/Transformer/Circuits.lean` | QK/OV circuits: attention pattern depends on `W^Q W^Kᵀ` only (gauge freedom `R, R⁻ᵀ`), head output on `W^V W^O` only |
 | `Params/Transformer/Encoder.lean` | post-norm encoder block; the six operator-splitting substeps of arXiv:2510.03989; **`splitStep = encoderBlock` exactly** (with `W_j ↦ I + W_j`), and for stacks |
 | `Params/Transformer/Causal.lean` | masked softmax, causal attention, `PrefixDependent` and its closure properties |
 | `Params/Transformer/LanguageModel.lean` | decoder-only LM; **`nextTokenDist_prefix`: predictions at position `i` depend only on tokens `≤ i`**; exact direct-logit-attribution identity for pre-norm residual streams |
 | `Params/Decomp/Basic.lean` | SPD subcomponents `U diag(m) V`, masks `g + (1−g) r`, hard/leaky sigmoids as in the reference code, faithfulness and importance losses, ablation identity |
 | `Params/Decomp/Rank.lean` | rank subadditivity; a faithful rank-one decomposition of `W` needs `≥ rank W` pieces; a hidden identity needs `≥ k` |
+| `Params/Decomp/Attribution.lean` | ablation invariance of the column decomposition (APD's ablation-curve criterion, exact for linear maps); attributions are additive; APD's rank surrogate `= ‖U‖‖V‖` |
 | `Params/Decomp/Identifiability.lean` | **`onehot_identifiability`**: with rank-one subcomponents, exact faithfulness and exact one-hot causal separation, a matrix with non-zero pairwise-independent columns has *only* the column decomposition (the TMS ground truth of APD/SPD); hypotheses shown satisfiable |
 | `Params/Interp/Superposition.lean` | interference bound for almost-orthogonal features: read-out error ≤ `ε (k−1) ‖s‖∞`; orthonormal ⇒ exact and `N ≤ d` |
 | `Params/Interp/Spark.lean` | uniqueness of sparse codes below the spark bound (when SDL *can* recover true features) |
+| `Params/Interp/IntegratedGradients.lean` | completeness of integrated gradients for `C¹` read-outs (FTC along the straight path) |
 | `Params/Interp/Absorption.lean` | `L¹` strictly prefers the absorbed dictionary once features co-occur (sparsity ≠ recovery) |
 
 ## Validation

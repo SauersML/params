@@ -1,13 +1,15 @@
 """An explainer of unit circuits (#2951 graph oracle): LoRA SFT of a base model on measured circuits (units.dataset rows
 from carry.py explain), its answers to held-out questions sampled with vLLM, and every answer scored by the carry test
-(units.score) beside the copy and all baselines on the same questions. Each stage is its own process (the GPU freed
-between them).
+(units.score_many: one prepared task per question, all its answers measured together) beside the teacher's (the measured
+circuits) and the copy and all baselines on the same questions. Each stage is its own process (the GPU freed between
+them).
 
   units_sft.py sft ROWS.jsonl OUT_DIR [--val ROWS.jsonl] [--base Qwen/Qwen3-4B] [--epochs 3] [--lr 1e-4] [--rank 32] [--batch 8]
-  units_sft.py questions EXPLAIN.jsonl OUT.jsonl [--k 8]     each task's question, positions from units.sensitive
+  units_sft.py questions EXPLAIN.jsonl OUT.jsonl [--k 8] [--events EVENTS.jsonl]   each task's question, positions from
+                                                  units.sensitive; with units.py events output, the measured evidence
   units_sft.py sample QUESTIONS.jsonl ADAPTER OUT.jsonl [--n 4] [--max-tokens 1536]
-  units_sft.py score QUESTIONS.jsonl OUT.jsonl [--answers ANSWERS.jsonl] [--teacher DIR] [--k 8]   (without answers: the baselines only;
-                                                  DIR: units.py targets' answers, the measured circuits, scored as "teacher")
+  units_sft.py score QUESTIONS.jsonl OUT.jsonl [--answers ANSWERS.jsonl] [--teacher DIR] [--k 8]   the copy and all baselines, DIR's
+                                                  units.py targets answers ("teacher") and the answers, one score_many per question
   units_sft.py report SCORES.jsonl
 """
 
@@ -121,14 +123,21 @@ def questions(a) -> None:
     import units
 
     nat = native.Native()
+    evs = {json.loads(x)["task"]: json.loads(x)["events"] for x in open(a.events)} if a.events else None
+    skipped = 0
     with open(a.out, "w") as f:
         for line in open(a.explain):
             r = json.loads(line)
+            if evs is not None and r["task"] not in evs:  # as units.dataset: with evidence, only texts that have it
+                skipped += 1
+                continue
             task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
             p = task["prompts"][0]
             positions = units.sensitive(nat, p["token_ids"], p["target_positions"], a.k)
             f.write(json.dumps({"task": r["task"], "positions": positions, "explain_positions": [x["position"] for x in r["positions"]],
-                                "question": units.question(task, positions)}) + "\n")
+                                "question": units.question(task, positions, evs[r["task"]] if evs else None)}) + "\n")
+    if skipped:
+        print(f"questions: {skipped} texts without events left out", flush=True)
 
 
 def sample(a) -> None:
@@ -151,11 +160,19 @@ def sample(a) -> None:
     print(f"sample: {len(qs)} questions x {a.n} in {time.time() - t0:.0f} s", flush=True)
 
 
+def reads(units_at_p, p: int, t: int, layers: int) -> bool:
+    """Whether a line's units hold a same-layer read from the position into the target: the value matrix at the position
+    and the output matrix at the target in one layer (the attention path every measured circuit has)."""
+    have = {(u[0], u[-1]) for u in units_at_p}
+    return any((f"h.{l}.attn.v_proj", p) in have and (f"h.{l}.attn.o_proj", t) in have for l in range(layers))
+
+
 def score(a) -> None:
     import native
     import units
 
     nat = native.Native()
+    layers = nat.target.n_layer
     qs = {q["task"]: q for q in (json.loads(line) for line in open(a.questions))}
     answers = [json.loads(line) for line in open(a.answers)] if a.answers else []
     t0 = time.time()
@@ -167,49 +184,85 @@ def score(a) -> None:
             if a.teacher and (a.teacher / f"{tid}.txt").exists():
                 items.append(("teacher", None, (a.teacher / f"{tid}.txt").read_text(), None, None))
             items += [("explainer", x["sample"], x["text"], x["tokens"], x["finish"]) for x in answers if x["task"] == tid]
-            for kind, j, text, tokens, finish in items:
+            scores = units.score_many(nat, task, [text for _, _, text, _, _ in items], a.k) if q["positions"] else [None] * len(items)
+            for (kind, j, text, tokens, finish), s in zip(items, scores):
                 _, circuits = units.parse(text)
-                s = units.score(nat, task, text, a.k)
-                f.write(json.dumps({"task": tid, "kind": kind, "sample": j, "tokens": tokens, "finish": finish,
-                                    "lines": sum(p in circuits for p in q["positions"]), "positions": len(q["positions"]),
-                                    "uncarried": s["uncarried"], "units": s["units"], "outside": sum(r["outside"] for r in s["positions"]),
-                                    "unknown": sum(r.get("unknown", 0) for r in s["positions"]),
-                                    "per_position": s["positions"]}) + "\n")
-                f.flush()
-            print(f"score: {tid} done, {time.time() - t0:.0f} s", flush=True)
+                rec = {"task": tid, "kind": kind, "sample": j, "tokens": tokens, "finish": finish,
+                       "lines": sum(p in circuits for p in q["positions"]), "positions": len(q["positions"]),
+                       "none": [p for p in q["positions"] if p in circuits and not circuits[p]],  # lines stating no units
+                       "reads": [p for p in q["positions"] if reads(circuits.get(p, []), p, max(targets), layers)]}
+                if s is None:
+                    rec.update(uncarried=0.0, rest_carried=0.0, units=0, heads=0, unknown=0, outside=0, per_position=[])
+                else:
+                    rec.update(uncarried=s["uncarried"], rest_carried=s["rest_carried"], units=s["units"], heads=s["heads"], unknown=s["unknown"],
+                               outside=sum(r["outside"] for r in s["positions"]), per_position=s["positions"])
+                f.write(json.dumps(rec) + "\n")
+            f.flush()
+            print(f"score: {tid} ({len(items)} answers) done, {time.time() - t0:.0f} s", flush=True)
 
 
 def report(a) -> None:
+    """Per question: uncarried share / rest_carried (what every other unit carries with the answer held: its necessity,
+    when units.score reports it) / units, for the explainer's best and median answer, the teacher and the baselines."""
     rows = [json.loads(line) for line in open(a.scores)]
     tasks = sorted({r["task"] for r in rows}, key=lambda t: int("".join(ch for ch in t if ch.isdigit()) or 0))
-    print(f"{'task':10s} {'expl best':>14s} {'expl median':>14s} {'parse':>6s} {'teacher':>14s} {'copy':>14s} {'all':>14s}   (uncarried share / units)")
+    empty = [t for t in tasks if all(r["positions"] == 0 for r in rows if r["task"] == t)]
+    tasks = [t for t in tasks if t not in empty]  # a text whose question lists no positions has nothing to measure
+    rest = lambda r: r.get("rest_carried")  # noqa: E731
+
+    def cell(u, rc, n):
+        return f"{u:.3f} {'  -  ' if rc is None else f'{rc:.3f}'} {n:4.0f}"
+
+    print(f"{'task':10s} {'explainer best':>16s} {'explainer median':>16s} {'parse':>6s} {'teacher':>16s} {'copy':>16s} {'all':>16s}")
+    print(f"{'':10s} {'(uncarried, rest_carried, units)':>50s}")
     agg = {k: [] for k in ("best", "median", "teacher", "copy", "all", "parse")}
     for t in tasks:
         ex = [r for r in rows if r["task"] == t and r["kind"] == "explainer"]
         base = {r["kind"]: r for r in rows if r["task"] == t and r["kind"] in ("teacher", "copy", "all")}
-        cell = lambda u, n: f"{u:.3f} / {n:4.0f}"  # noqa: E731
         line = f"{t:10s}"
         if ex:
             best = min(ex, key=lambda r: (r["uncarried"], r["units"]))
-            med_u, med_n = statistics.median(r["uncarried"] for r in ex), statistics.median(r["units"] for r in ex)
+            med = (statistics.median(r["uncarried"] for r in ex), None if rest(ex[0]) is None else statistics.median(rest(r) for r in ex),
+                   statistics.median(r["units"] for r in ex))
             parse = sum(r["finish"] == "stop" and r["lines"] == r["positions"] for r in ex) / len(ex)
-            line += f" {cell(best['uncarried'], best['units']):>14s} {cell(med_u, med_n):>14s} {parse:6.2f}"
-            agg["best"].append((best["uncarried"], best["units"]))
-            agg["median"].append((med_u, med_n))
+            line += f" {cell(best['uncarried'], rest(best), best['units']):>16s} {cell(*med):>16s} {parse:6.2f}"
+            agg["best"].append((best["uncarried"], rest(best), best["units"]))
+            agg["median"].append(med)
             agg["parse"].append(parse)
         for k in ("teacher", "copy", "all"):
             if k in base:
-                line += f" {cell(base[k]['uncarried'], base[k]['units']):>14s}"
-                agg[k].append((base[k]["uncarried"], base[k]["units"]))
+                line += f" {cell(base[k]['uncarried'], rest(base[k]), base[k]['units']):>16s}"
+                agg[k].append((base[k]["uncarried"], rest(base[k]), base[k]["units"]))
             else:
-                line += f" {'-':>14s}"
+                line += f" {'-':>16s}"
         print(line)
-    print("mean over questions:")
+    print(f"mean over the {len(tasks)} questions" + (f" (left out, no positions: {', '.join(empty)})" if empty else "") + ":")
     for k in ("best", "median", "teacher", "copy", "all"):
         if agg[k]:
-            print(f"  {k:7s} uncarried {statistics.mean(u for u, _ in agg[k]):.3f}, units {statistics.mean(n for _, n in agg[k]):.1f}")
+            rcs = [rc for _, rc, _ in agg[k] if rc is not None]
+            print(f"  {k:7s} uncarried {statistics.mean(u for u, _, _ in agg[k]):.3f}, rest_carried "
+                  f"{statistics.mean(rcs) if rcs else float('nan'):.3f}, units {statistics.mean(n for _, _, n in agg[k]):.1f}")
+    def read_rate(kind):
+        rs = [r for r in rows if r["kind"] == kind and r["task"] in tasks and "reads" in r]
+        return sum(len(r["reads"]) for r in rs) / max(1, sum(r["positions"] for r in rs)), len(rs)
+
+    if any("reads" in r for r in rows):
+        (re, ne), (rt, nt) = read_rate("explainer"), read_rate("teacher")
+        print(f"  lines with a same-layer read (v at the position, o at the target): explainer {re:.2f} ({ne} answers), teacher {rt:.2f}")
+    if any(r.get("none") for r in rows if r["kind"] == "teacher"):
+        hit = miss = false = 0
+        for t in tasks:
+            teach = next((r for r in rows if r["task"] == t and r["kind"] == "teacher"), None)
+            if teach is None:
+                continue
+            tn = set(teach["none"])
+            for r in (r for r in rows if r["task"] == t and r["kind"] == "explainer"):
+                en = set(r.get("none", []))
+                hit, miss, false = hit + len(en & tn), miss + len(tn - en), false + len(en - tn)
+        print(f"  'none' lines: the explainer says none at {hit / max(1, hit + miss):.2f} of the positions where the teacher does "
+              f"({hit + miss} teacher none lines over the answers), and at {false} positions where the teacher names units")
     if agg["parse"]:
-        ex = [r for r in rows if r["kind"] == "explainer"]
+        ex = [r for r in rows if r["kind"] == "explainer" and r["task"] in tasks]
         print(f"  answers that parse (ended, a line for every listed position): {statistics.mean(agg['parse']):.2f}; "
               f"hit the token cap {sum(r['finish'] == 'length' for r in ex) / len(ex):.2f}; mean tokens {statistics.mean(r['tokens'] for r in ex):.0f}; "
               f"units outside the position and targets {statistics.mean(r['outside'] for r in ex):.1f} and unknown units "
@@ -234,6 +287,7 @@ def main():
     q.add_argument("explain", type=Path)
     q.add_argument("out", type=Path)
     q.add_argument("--k", type=int, default=8)
+    q.add_argument("--events", type=Path, help="units.py events output: the question shows the measured evidence")
     m = sub.add_parser("sample")
     m.add_argument("questions", type=Path)
     m.add_argument("adapter", type=Path)
@@ -241,7 +295,7 @@ def main():
     m.add_argument("--base", default="Qwen/Qwen3-4B")
     m.add_argument("--n", type=int, default=4)
     m.add_argument("--max-tokens", type=int, default=1536)
-    m.add_argument("--max-model-len", type=int, default=4096)
+    m.add_argument("--max-model-len", type=int, default=8192)  # a question numbers every token: up to 3.8k tokens
     m.add_argument("--seed", type=int, default=0)
     c = sub.add_parser("score")
     c.add_argument("questions", type=Path)

@@ -310,11 +310,35 @@ def wiring(conn, nodes: list, targets: list[int], k: int) -> list[tuple]:
     return sorted(((w, r, c) for (w, r), c in best.items()), key=lambda x: -abs(x[2]))[:k]
 
 
-def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None) -> dict:
+def facts(atlas, nd) -> str:
+    """A subcomponent's atlas facts in a few words (method/vpd/atlas.py, measured on Pile text): the tokens its write
+    raises most (its lens, for the sites that write the residual stream or feed one that does) and the tokens it is
+    most often active on (the tokens at its top contexts)."""
+    from collections import Counter
+
+    e = atlas.entry(nd[0], nd[2])
+    out = []
+    if e["lens"]:
+        out.append("raises " + " ".join(repr(t) for t, _ in e["lens"]["raised"][:3]))
+    on = Counter(c["token"] for c in e["contexts"]).most_common(2)
+    if on:
+        out.append("active on " + " ".join(repr(t) for t, _ in on))
+    return "; ".join(out)
+
+
+def _atlas():
+    """The component atlas, or None while it is not built."""
+    sys.path.insert(0, str(HERE.parents[1]))
+    from method.vpd import atlas
+
+    return atlas.Atlas() if (atlas.DEFAULT / "atlas.safetensors").exists() else None
+
+
+def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=None) -> dict:
     """One text's question data: F2's positions (goal_eval.Text with the text's own seed), the measured evidence there
     (units.events at those positions; its other events are the English reader's), VPD's top active subcomponents per
-    position, their strongest wiring, the intervention questions, and the count of VPD-active subcomponents at F2's
-    positions and the targets (the size term's scale)."""
+    position with their atlas facts (facts(); none without an atlas), their strongest wiring, the intervention
+    questions, and the count of VPD-active subcomponents at F2's positions and the targets (the size term's scale)."""
     import native
     import units
 
@@ -339,7 +363,8 @@ def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None) -> dict
     active = int(sum(int((tx.ci[n][where] > 0).sum()) for n in nat.names))
     qa = qa_questions(nat, task, tx.ci, positions, native.task_seed(task["id"]) if qa_seed is None else qa_seed)
     return {"task": task["id"], "positions": positions, "listed": listed, "events": events,
-            "components": {str(p): [[list(nd), float(tx.ci[nd[0]][nd[1], nd[2]])] for nd in comps[p]] for p in where},
+            "components": {str(p): [[list(nd), float(tx.ci[nd[0]][nd[1], nd[2]]), facts(atlas, nd) if atlas else ""] for nd in comps[p]]
+                           for p in where},
             "wiring": {str(p): wires[p] for p in where}, "qa": qa, "active": active}
 
 
@@ -362,11 +387,12 @@ def question(task: dict, ev: dict) -> str:
              + ", ".join(f"{q} ({strings[q]!r})" for q in ev["positions"])]
     if ev["events"]:
         lines += ["measured at those positions (log2 change of the top token's probability):"] + units.evidence(ev["events"], ev["listed"], strings)
-    lines.append("VPD's active subcomponents (causal importance in parentheses), most important first, and the strongest "
-                 "weight-level connections among them (cosine; a static coupling, not a measured effect):")
+    lines.append("VPD's active subcomponents (causal importance, and on Pile text the tokens its write raises and the "
+                 "tokens it is active on), most important first, and the strongest weight-level connections among them "
+                 "(cosine; a static coupling, not a measured effect):")
     for q in sorted(ev["components"], key=int):
         cs = ev["components"][q]
-        lines.append(f"{q} ({strings[int(q)]!r}): " + ", ".join(f"{node_text(tuple(nd))} ({c:.2f})" for nd, c in cs))
+        lines.append(f"{q} ({strings[int(q)]!r}): " + ", ".join(f"{node_text(tuple(nd))} ({c:.2f}{'; ' + f if f else ''})" for nd, c, f in cs))
         if ev["wiring"].get(q):
             lines.append(f"  wiring: " + ", ".join(f"{node_text(tuple(w))} -> {node_text(tuple(r))} ({c:+.2f})" for w, r, c in ev["wiring"][q]))
     if ev["qa"]:
@@ -474,7 +500,7 @@ def main():
     ge = goal_eval.GoalEval()
     nat = ge.nat
     if args.cmd == "questions":
-        conn = _connectome()
+        conn, atlas = _connectome(), _atlas()
         done = set()
         if args.out.exists():
             done = {json.loads(x)["task"] for x in args.out.read_text().splitlines() if x.strip()}
@@ -483,7 +509,7 @@ def main():
                 if p.stem in done:
                     continue
                 task = json.loads(p.read_text())
-                ev = evidence(nat, ge, task, conn)
+                ev = evidence(nat, ge, task, conn, atlas=atlas)
                 f.write(json.dumps({**ev, "prompt": question(task, ev)}) + "\n")
                 f.flush()
                 print(p.stem, len(ev["positions"]), "positions", ev["active"], "active", flush=True)

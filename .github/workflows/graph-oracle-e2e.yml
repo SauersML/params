@@ -2,7 +2,9 @@ name: Graph Oracle E2E
 
 # The graph oracle's checks (#2951) on a CPU runner: the Rust checker (crates/mpd/examples/
 # mpd_graph_2951.rs) builds, and the graph oracle's tests run: mech (the loader of graph answers),
-# edits, reader, part tokens, and the RL scorer and trainer on a tiny random policy.
+# edits, reader, part tokens, and the RL scorer and trainer (scripts) on a tiny random Qwen3.
+# test_mech's sandbox test tokenizes with vpd4l's tokenizer, a file under the Mac's mpd-data, and is
+# left out here.
 # The Rust workspace depends on gam's crates by path (../gam/crates/...): this repository is checked
 # out at params/ and github.com/SauersML/gam's main at gam/ beside it (root files and crates/ only).
 
@@ -77,5 +79,7 @@ jobs:
           MPD_MEM_GIB: "1"
         run: |
           python -m pytest oracle/graph/test_mech.py oracle/graph/test_edits.py oracle/graph/test_reader.py \
-            oracle/graph/test_part_tokens.py oracle/graph/rl/test_scorer.py oracle/graph/rl/test_train.py \
+            oracle/graph/test_part_tokens.py --deselect oracle/graph/test_mech.py::test_the_sandbox_limits_and_the_server \
             -p no:cacheprovider -v --tb=short
+          python -B oracle/graph/rl/test_scorer.py
+          python -B oracle/graph/rl/test_train.py

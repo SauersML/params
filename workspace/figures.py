@@ -16,9 +16,11 @@ import numpy as np  # noqa: E402
 from matplotlib.colors import to_rgb  # noqa: E402
 
 BLUE, RED, GREEN, AMBER, PURPLE, TEAL, SOFT, INK = "#2F6DB5", "#D1495B", "#2E8B57", "#E09F3E", "#7B5EA7", "#2A9D8F", "#9DB9DD", "#222222"
-COLORS = {"operand": BLUE, "digit": SOFT, "remaining": TEAL, "I": RED, "J": PURPLE, "answer": AMBER}
+COLORS = {"operand": BLUE, "digit": SOFT, "remaining": TEAL, "I": RED, "I digit": "#EBA3AC", "J": PURPLE,
+          "answer": AMBER, "answer digit": "#F3CF97"}
 LABELS = {"operand": "an operand of the first step", "digit": "one digit of an operand", "remaining": "the other operand",
-          "I": "the intermediate result", "J": "the second product", "answer": "the final answer"}
+          "I": "the intermediate result", "I digit": "one digit of the intermediate", "J": "the second product",
+          "answer": "the final answer", "answer digit": "one digit of the final answer"}
 EXPR = {"subsub": "(a − b) − c", "subsubx": "c − (a − b)", "addmul": "(a + b) × c", "addmulx": "c + (a × b)",
         "muladd": "(a × b) + c", "sign": "(a − b) × c", "signpair": "(a − b) × c", "absval": "|a − b| × c",
         "mulmid": "(a × b) + (c × d)", "mulmul": "(a × b) + (c × d)"}
@@ -86,7 +88,8 @@ def causal_map(fam, f, out):
     save(fig, out / f"fig_map_{fam}.png")
 
 
-HELD = [("I", "the intermediate result"), ("answer", "the final answer"), ("J", "the second product"), ("operand", "only operands or digits"),
+HELD = [("I", "the intermediate result"), ("I digit", "one digit of the intermediate"), ("answer", "the final answer or one of its digits"),
+        ("J", "the second product"), ("operand", "only operands or their digits"),
         ("none (expr)", "nothing, inside the expression"), ("none (after)", "nothing, after the expression"),
         ("none (before)", "nothing, before the numbers")]
 
@@ -96,7 +99,7 @@ def reader_fig(s, out, reader="lens", fname="fig_lens_by_held.png", title=None):
     tot = defaultdict(lambda: np.zeros(3))
     for f in s["arith"].values():
         for k, v in f[reader]["by_held"].items():
-            g = "operand" if k in ("operand", "remaining", "digit") else k
+            g = "operand" if k in ("operand", "remaining", "digit") else "answer" if k == "answer digit" else k
             tot[g] += [v["cells"], v["named"] * v["cells"], v["donor_named"] * v["cells"]]
     rows = [(lab, tot[k]) for k, lab in HELD if tot[k][0] > 0]
     fig, ax = plt.subplots(figsize=(12, 0.9 * len(rows) + 2))
@@ -132,9 +135,40 @@ def hop_fig(s, out):
     ax.set_xlabel("layer (−1 = token embedding)")
     ax.set_ylabel(f"share of {len(rows)} two-hop prompts")
     ax.set_ylim(-0.02, 1.02)
-    ax.set_title("At the last prompt token of a two-hop fact")
+    on = int(layers[np.argmax(carry > 0)])
+    ax.set_title(f"At a two-hop fact's last token, the bridge entity starts to matter at layer {on},\n"
+                 f"and the logit lens names it from the same layer")
     clean(ax)
     save(fig, out / "fig_multihop_last_token.png")
+
+
+HOP_HELD = [("carries (after)", "carries it, after the subject"), ("carries (slot)", "carries it, at the subject"),
+            ("does not carry (slot)", "does not carry it, at the subject"), ("does not carry (after)", "does not carry it, after the subject"),
+            ("does not carry (before)", "does not carry it, before the subject")]
+
+
+def hop_reader_fig(s, out):
+    """How often the logit lens names the bridge entity, by whether patching the cell moves the answer."""
+    rows = [(lab, s["multihop_by_held"][k]) for k, lab in HOP_HELD if k in s["multihop_by_held"]]
+    fig, ax = plt.subplots(figsize=(12, 0.95 * len(rows) + 2))
+    y = np.arange(len(rows))[::-1]
+    own = [v["named"] for _, v in rows]
+    don = [v["donor_named"] for _, v in rows]
+    ax.barh(y + 0.18, own, 0.36, color=RED)
+    ax.barh(y - 0.18, don, 0.36, color=SOFT)
+    for yi, a, b in zip(y, own, don):
+        ax.text(a + 0.01, yi + 0.18, f"{a:.1%} this prompt's bridge", va="center", fontsize=14, color=RED)
+        ax.text(b + 0.01, yi - 0.18, f"{b:.1%} another prompt's", va="center", fontsize=14, color="#5A7FB0")
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"cell {lab}\n({v['cells']:,} cells)" for lab, v in rows])
+    ax.set_xlabel("share of cells where the logit lens's top 10 tokens include the bridge word")
+    ax.set_xlim(0, 1.25)
+    ax.set_xticks(np.linspace(0, 1, 6))
+    n_named = sum(v["named"] * v["cells"] for _, v in rows)
+    n_causal = sum(v["named"] * v["cells"] for k, v in s["multihop_by_held"].items() if k.startswith("carries"))
+    ax.set_title(f"Only {n_causal / n_named:.0%} of the cells where the logit lens names the bridge entity\nare cells whose content the answer depends on")
+    clean(ax)
+    save(fig, out / "fig_multihop_lens_by_held.png")
 
 
 def main():
@@ -144,9 +178,11 @@ def main():
     setup()
     for fam, f in s["arith"].items():
         causal_map(fam, f, out)
-    reader_fig(s, out)
+    if s["arith"]:
+        reader_fig(s, out)
     if s["multihop"]:
         hop_fig(s, out)
+        hop_reader_fig(s, out)
 
 
 if __name__ == "__main__":

@@ -275,7 +275,7 @@ def patch(args):
             base_ids = ids_of(tok, data.chat(tok, it.prompt))
             cfs = [{k: int(v) for k, v in c.items()} for c in rec["cfs"]]
             cf_ids = [ids_of(tok, data.chat(tok, data.ARITH_PROMPT.format(expr=data.FAMILIES[key].pattern.format(**c)))) for c in cfs]
-            hyps = data.hypotheses(it)
+            hyps = [h for h in data.hypotheses(it) if all(data.predict(it, c, h) is not None for c in cfs)]
             answers, hyp_answer = [], []
             for c in cfs:
                 preds = [data.num(data.predict(it, c, h)) for h in hyps]
@@ -302,6 +302,40 @@ def patch(args):
         print(f"{name}: {len(base_ids)} tokens, {len(cf_ids)} counterfactuals, {time.time() - t0:.0f} s", flush=True)
 
 
+def joint(args):
+    """Does an operand live jointly in its digit cells? For each saved arithmetic item and layer, patch
+    all digit cells of each multi-digit operand at once from each counterfactual and report the
+    posterior over hypotheses, beside the single-cell posteriors already saved."""
+    from interchange import HookPatcher
+    tok, model = load(args.model, args.device, args.dtype)
+    H = HookPatcher(model)
+    d = out_dir(args.model)
+    end = tok.convert_tokens_to_ids("<|im_end|>")
+    out = {}
+    for f in sorted((d / "patch").glob("*.pt")):
+        r = torch.load(f, weights_only=False)
+        if r["kind"] != "arith" or (args.only and r["name"] not in args.only):
+            continue
+        cf_states = [H.states(c) for c in r["cf_ids"]]
+        res = {}
+        for k in r["ops"]:
+            cells = [p for p, ro in enumerate(r["roles"]) if ro.startswith(k + ":")]
+            if len(cells) < 2:
+                continue
+            lp = [torch.empty(len(cf_states[0]), len(a)) for a in r["answer_strings"]]
+            for l1 in range(len(cf_states[0])):
+                for j, (hc, strings) in enumerate(zip(cf_states, r["answer_strings"])):
+                    ans = [answer_ids(tok, s_, end) for s_ in strings]
+                    lp[j][l1] = torch.tensor(H.score(r["ids"], ans, cells=[(l1 - 1, p, hc[l1, p]) for p in cells]))
+            ll = sum(lp[j][:, r["hyp_answer"][j]] for j in range(len(lp)))
+            post = torch.softmax(ll, -1)
+            res[k] = [{"layer": l1 - 1, "best": r["hyps"][int(post[l1].argmax())], "post": round(float(post[l1].max()), 3)}
+                      for l1 in range(post.shape[0])]
+            print(r["name"], k, " ".join(f"L{x['layer']}:{x['best']}" for x in res[k][::3]), flush=True)
+        out[r["name"]] = res
+    (d / "joint.json").write_text(json.dumps(out, indent=1))
+
+
 def olens(args):
     """Stage 2: the oracle lens at layers 20-60 step 4, every position from the first changed one, on
     every item patched for this model; 10 samples per cell (WorkspaceBench's arithmetic sampling)."""
@@ -326,7 +360,7 @@ def olens(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["gate", "patch", "summary", "olens"])
+    ap.add_argument("cmd", choices=["gate", "patch", "summary", "olens", "joint"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--device", default="mps")
     ap.add_argument("--dtype", default="float16")

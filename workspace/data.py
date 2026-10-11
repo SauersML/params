@@ -129,18 +129,35 @@ def generate_arith(family, n, rng):
     return out
 
 
-def hypotheses(item):
+def hypotheses(item, parts=True):
     """Names of the variables a cell may hold: none, each operand, each digit of a multi-digit
-    operand (families with digits=True), each intermediate, the answer."""
+    operand (families with digits=True), each intermediate, the answer, and (parts=True) each digit
+    of a multi-digit intermediate ('I:0' its leading digit) and of the answer ('answer:0'), which
+    the cells that write the answer one digit at a time hold."""
     f = FAMILIES[item.family]
     hs = ["none"] + list(item.ops)
     if f.digits:
         hs += [f"{k}.{d}" for k, v in item.ops.items() if len(str(v)) > 1 for d in range(len(str(v)))]
-    return hs + list(item.inter) + ["answer"]
+    hs += list(item.inter) + ["answer"]
+    if parts:
+        hs += [f"{k}:{d}" for k, v in item.inter.items() if len(str(abs(int(v)))) > 1 for d in range(len(str(abs(int(v)))))]
+        a = len(str(abs(int(evaluate(item.family, item.ops)))))
+        hs += [f"answer:{d}" for d in range(a)] if a > 1 else []
+    return hs
+
+
+def _swap_digit(v, w, d):
+    """v with its d-th digit (from the left, sign kept) taken from w; None when their lengths differ."""
+    sv, sw = str(abs(int(v))), str(abs(int(w)))
+    if len(sv) != len(sw):
+        return None
+    out = int(sv[:d] + sw[d] + sv[d + 1:])
+    return -out if v < 0 else out
 
 
 def predict(item, cf_ops, h):
-    """The answer the base item gives when variable h takes the counterfactual's value."""
+    """The answer the base item gives when variable h takes the counterfactual's value (None when
+    the variable has no counterpart in this counterfactual: digit positions that do not line up)."""
     fam = item.family
     if h == "none":
         return evaluate(fam, item.ops)
@@ -148,6 +165,12 @@ def predict(item, cf_ops, h):
         return evaluate(fam, cf_ops)
     if h in item.inter:
         return evaluate(fam, item.ops, {h: FAMILIES[fam].inter(cf_ops)[h]})
+    if ":" in h:
+        k, d = h.split(":")
+        if k == "answer":
+            return _swap_digit(evaluate(fam, item.ops), evaluate(fam, cf_ops), int(d))
+        v = _swap_digit(item.inter[k], FAMILIES[fam].inter(cf_ops)[k], int(d))
+        return None if v is None else evaluate(fam, item.ops, {k: v})
     if "." in h:
         k, d = h.split(".")
         digits = list(str(item.ops[k]))
@@ -165,7 +188,7 @@ def arith_cfs(item, rng, n, tries=20000):
     the same digit counts, the same signs of the intermediates and answer as the base, inside the
     family, and every hypothesis predicting a different integer answer."""
     f = FAMILIES[item.family]
-    hs = hypotheses(item)
+    hs = hypotheses(item, parts=False)
     out, seen = [], set()
     for _ in range(tries):
         if len(out) == n:

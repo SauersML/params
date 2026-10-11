@@ -12,7 +12,7 @@ exactly what a cell holding their result predicts, so `I` reads "the intermediat
 operands together".
 """
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +20,7 @@ import torch
 
 import readers
 
-GROUPS = ["none", "operand", "digit", "remaining", "I", "J", "answer"]
+GROUPS = ["none", "operand", "digit", "remaining", "I", "I digit", "J", "answer", "answer digit"]
 
 
 def group(item, h):
@@ -28,6 +28,10 @@ def group(item, h):
     the first operation does not use, the intermediate, the answer, nothing."""
     if h in ("none", "answer", "I"):
         return h
+    if h.startswith("answer:"):
+        return "answer digit"
+    if h.startswith(("I:", "J:")):
+        return "I digit" if h.startswith("I") else "J"
     if h == "J":                      # mulmul / mulmid: the second product
         return "J"
     if "." in h:
@@ -58,12 +62,12 @@ def reader_rates(cells_of, named_of, cross_of):
     for key, n, c in zip(cells_of, named_of, cross_of):
         cells[key] += [1, n, c]
     rates = {k: {"cells": int(v[0]), "named": v[1] / v[0], "donor_named": v[2] / v[0]} for k, v in cells.items()}
-    held = cells.get("I", np.zeros(3))
+    held = cells.get("I", np.zeros(3)) + cells.get("I digit", np.zeros(3))      # the intermediate or one of its digits
     total = sum(v[1] for v in cells.values())
     return rates, (held[1] / held[0] if held[0] else None), (held[1] / total if total else None)
 
 
-def arith_summary(recs, tok):
+def arith_summary(recs, tok, d=None):
     fams = defaultdict(list)
     for r in recs:
         if r["kind"] == "arith":
@@ -74,6 +78,9 @@ def arith_summary(recs, tok):
         digit = {r["name"]: tok(str(int(r["inter"]["I"])), add_special_tokens=False)["input_ids"][0] for r in rs}
         readers_of["lens_words"] = {k: v - {digit[k]} for k, v in readers_of["lens"].items()}
         keys, named_by, cross_by, maps = [], defaultdict(list), defaultdict(list), []
+        ol = {r["name"]: d / "olens" / f"{r['name']}.pt" for r in rs} if d is not None else {}
+        has_olens = bool(ol) and all(f.exists() for f in ol.values())
+        okeys, onamed, ocross = [], [], []
         for r in rs:
             post, mass, expl = posterior(r)
             g_of = [group(r, h) for h in r["hyps"]]
@@ -91,16 +98,34 @@ def arith_summary(recs, tok):
                 cross_by[rd] += cross.reshape(-1).tolist()
                 if rd == "lens":
                     m_named, m_cross = named, cross
+            if has_olens:                              # oracle lens: cells it read (layers 20-60 step 4)
+                texts = torch.load(ol[r["name"]], weights_only=False)["texts"]
+                others = [x["inter"]["I"] for x in rs if x["name"] != r["name"] and x["inter"]["I"] != r["inter"]["I"]]
+                for (L, p_), samples in texts.items():
+                    g = g_of[assign[L + 1, p_]]
+                    okeys.append(g if g != "none" else f"none ({seg[p_]})")
+                    onamed.append(readers.names_number(samples, r["inter"]["I"]))
+                    ocross.append(np.mean([readers.names_number(samples, v) for v in others]) if others else 0.0)
             maps.append({"name": r["name"], "roles": r["roles"], "tokens": [tok.decode([i]) for i in r["ids"]],
                          "assign": [[g_of[a] for a in row] for row in assign.tolist()],
                          "post_max": post.max(-1).values.numpy().round(3).tolist(),
                          "mass": torch.gather(mass, -1, assign[..., None])[..., 0].numpy().round(3).tolist(),
                          "explained": expl.numpy().round(3).tolist(), "named": m_named.astype(int).tolist(),
                          "cross": np.round(m_cross, 3).tolist()})
-        out[fam] = {"items": len(rs), "maps": maps}
+        firsts = []
+        for m in maps:                                 # where each problem first holds the intermediate
+            cells = [(l - 1, m["roles"][p_]) for l, row in enumerate(m["assign"]) for p_, g in enumerate(row) if g == "I"]
+            last = [l - 1 for l, row in enumerate(m["assign"]) if row[-1] in ("I", "answer")]
+            firsts.append({"name": m["name"], "first_I": cells[0] if cells else None, "I_cells": len(cells),
+                           "last_token_I_or_answer_from": last[0] if last else None,
+                           "I_roles": sorted({ro for _, ro in cells})})
+        out[fam] = {"items": len(rs), "maps": maps, "where_I": firsts}
         for rd in readers_of:
             rates, recall, precision = reader_rates(keys, named_by[rd], cross_by[rd])
             out[fam][rd] = {"by_held": rates, "recall": recall, "precision": precision}
+        if has_olens:
+            rates, recall, precision = reader_rates(okeys, onamed, ocross)
+            out[fam]["olens"] = {"by_held": rates, "recall": recall, "precision": precision}
     return out
 
 
@@ -136,10 +161,15 @@ def main(d, model):
     tok = AutoTokenizer.from_pretrained(model)
     recs = load_all(d)
     hop_rows, hop_held = hop_summary(recs, tok)
-    s = {"arith": arith_summary(recs, tok), "multihop": hop_rows, "multihop_by_held": hop_held}
+    s = {"arith": arith_summary(recs, tok, d), "multihop": hop_rows, "multihop_by_held": hop_held}
     (d / "summary.json").write_text(json.dumps(s))
     for fam, f in s["arith"].items():
-        for rd in ("lens", "lens_words"):
+        w = f["where_I"]
+        held = [x for x in w if x["first_I"]]
+        print(f"\n{fam}: {len(held)}/{len(w)} problems have a cell holding the intermediate; first layers "
+              f"{sorted(x['first_I'][0] for x in held)}; positions {Counter(ro for x in held for ro in x['I_roles']).most_common(6)}")
+        print(f"  last token holds the intermediate or answer from layers {sorted(x['last_token_I_or_answer_from'] for x in w if x['last_token_I_or_answer_from'] is not None)}")
+        for rd in [x for x in ("lens", "lens_words", "olens") if x in f]:
             g = f[rd]
             print(f"\n{fam} {rd}: {f['items']} items; names the intermediate at recall {g['recall']} precision {g['precision']}")
             for k, v in sorted(g["by_held"].items()):

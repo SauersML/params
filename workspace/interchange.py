@@ -280,19 +280,22 @@ class HookPatcher:
         return torch.stack(out)
 
     @torch.no_grad()
-    def score(self, ids, answers, cell=None, vec=None):
-        """Log-prob of each answer (token list) after ids, with cell (l, p) of the run set to vec."""
-        hook = None
-        if cell is not None:
-            l, p = cell
+    def score(self, ids, answers, cell=None, vec=None, cells=None):
+        """Log-prob of each answer (token list) after ids, with cell (l, p) of the run set to vec, or
+        with every (l, p, vec) in `cells` set at once."""
+        cells = cells or ([(cell[0], cell[1], vec)] if cell is not None else [])
+        hooks = []
+        for l in sorted({c[0] for c in cells}):
             mod = self.embed if l < 0 else self.layers[l]
+            sel = [(p, v) for ll, p, v in cells if ll == l]
 
-            def patch(m, i, o):
+            def patch(m, i, o, sel=sel):
                 x = o[0] if isinstance(o, tuple) else o
                 x = x.clone()
-                x[:, p] = vec
+                for p, v in sel:
+                    x[:, p] = v
                 return (x, *o[1:]) if isinstance(o, tuple) else x
-            hook = mod.register_forward_hook(patch)
+            hooks.append(mod.register_forward_hook(patch))
         try:
             res = []
             for ans in answers:
@@ -302,5 +305,5 @@ class HookPatcher:
                 res.append(sum(lsm[T - 1 + i, t].item() for i, t in enumerate(ans)))
             return res
         finally:
-            if hook is not None:
-                hook.remove()
+            for h in hooks:
+                h.remove()

@@ -394,7 +394,7 @@ class Native:
         flat = torch.cat([m.flatten() for m in ci.values()])
         at_target = torch.cat([torch.isin(torch.arange(m.shape[0], device=m.device), torch.tensor(targets, device=m.device))[:, None].expand_as(m).flatten() for m in ci.values()])
         rank = torch.cat([(ci[n] * writes[n]).flatten() for n in ci])
-        rank = rank + at_target * (rank.max() + 1)
+        rank = torch.where(flat > 0, rank + at_target * (rank.max() + 1), torch.full_like(rank, -float("inf")))  # inactive ones last, never boosted
         order = rank.argsort(descending=True)[: int((flat > 0).sum())].cpu().numpy().astype(np.int64)
         names, sizes = list(ci), [ci[n].numel() for n in ci]
         starts = np.cumsum([0] + sizes[:-1]).astype(np.int64)
@@ -414,7 +414,7 @@ class Native:
         flat = torch.cat([m.flatten() for m in ci.values()])
         at_target = torch.cat([torch.isin(torch.arange(m.shape[0], device=m.device), torch.tensor(targets, device=m.device))[:, None].expand_as(m).flatten() for m in ci.values()])
         rank = torch.cat([(ci[n] * writes[n]).flatten() for n in ci])
-        rank = rank + at_target * (rank.max() + 1)  # the predicted position's subcomponents first, each group by its own order
+        rank = torch.where(flat > 0, rank + at_target * (rank.max() + 1), torch.full_like(rank, -float("inf")))  # the predicted position's active subcomponents first, each group by its own order; inactive ones never enter
         order = rank.argsort(descending=True)[: int((flat > 0).sum())]
         sizes, n = [], 1
         while n < len(order):
@@ -932,7 +932,7 @@ class Native:
         return out
 
     @torch.no_grad()
-    def changes(self, ids: list[int], targets: list[int], n: int = CHANGES, seed: int = 0, chunk: int = 64) -> list[Changed]:
+    def changes(self, ids: list[int], targets: list[int], n: int = CHANGES, seed: int = 0, chunk: int = 64, probe: dict | None = None) -> list[Changed]:
         """n changed prompts of a text, each the token at one position replaced by a draw from the model's prediction
         there among the other tokens (a changed prompt changes its token: a draw of the token already there tests
         nothing, and where the model is sure of the text's token, as at every token it can copy from earlier, it would
@@ -942,12 +942,15 @@ class Native:
         target (a probe per position), and every experiment counts the same: the measure is how the graph follows the
         model on the changes the prediction responds to, with every position still tried. (Weighting each position
         equally instead made the one token a prediction copies from count 1/T: an answer that left out the copy
-        scored as faithful.)"""
+        scored as faithful.) probe, a dict, receives the probe's "moved" (sensitivity's) for a caller that also needs
+        it (the probe is most of the cost)."""
         last = max(targets)
         if last < 1:
             return [Changed(ids, 1.0) for _ in range(n)]
         g = torch.Generator(device="cpu").manual_seed(seed)
         moved, other = self.sensitivity(ids, targets, g)  # 16 probes at a time: their full logits are ~1.6 GB
+        if probe is not None:
+            probe["moved"] = moved
         uniform = torch.full((last,), 1.0 / last)
         q = 0.5 * uniform + 0.5 * (moved / moved.sum() if moved.sum() > 0 else uniform)
         out = []

@@ -1,19 +1,22 @@
 """Which context positions does an agent's output read? The carry test on a real Qwen3 model.
 
-The interchange ("carry") measurement of oracle/graph/carry.py, for an HF Qwen3 model and an agent run. A run's
-model call is a context (the prompt) plus a completion; a changed prompt edits one test assertion's expected value in
-the context (every occurrence, as in cheats.py, token positions unchanged). The output tokens (the completion tokens
-being scored) are teacher-forced up to themselves. For a set S of context positions, the patched run recomputes only
-the output tokens, attending to keys and values that come from the changed run at the positions in S and from the
-original run everywhere else; everything outside S is held at the original prompt, as carry.py holds unselected units.
+The interchange ("carry") measurement of oracle/graph/carry.py, for an HF Qwen3 model and an agent run. A model
+call is a context (the prompt: earlier turns, tool results) plus the completion the model generated. A changed prompt
+edits one test assertion's expected value in the context (every occurrence, as in cheats.py, token positions
+unchanged). The completion up to the output tokens (the tokens scored) is teacher-forced and recomputed live; for a set
+S of context positions, it attends to keys and values that come from the changed run at the positions in S and from the
+original run at every other context position, so everything outside S is held at the original prompt, as carry.py
+holds unselected units. (Caching the completion too would let the token just before the output, which already encodes
+the next number by the last layer, stand in for the context: on Qwen3-8B one final-layer head reading that one token
+carried 100% of every lcbhard_9 literal.)
 
   carry(S) = KL(changed || patched_S) in bits, summed over the output tokens (carry.kl: no clamp)
   carried fraction(S) = 1 - carry(S) / carry({}),  where carry({}) = KL(changed || original)
 
-Positions first (a unit = one position, all layers): every position whose keys/values differ between the two runs is
-scored alone, then positions are added greedily (from the 64 best single positions) until 90% is carried. Then heads:
-a unit = (layer, query head) at the output tokens, reading the changed keys/values of that set only through itself;
-every unit is scored alone and heads are added greedily until 90%.
+Positions: chat messages (cut at <|im_start|>), then 32-token chunks inside the messages kept, then single positions;
+at each level units are scored alone and added greedily until 90% is carried. Heads: a unit = (layer, query head),
+reading the changed keys/values of that position set (at every live row) while every other head reads the original
+ones; layers first (all heads of a layer), then the heads of the best layers, then greedy to 90%.
 
 Cases (built on the Mac, `build`): writes that hard-code test outputs (agent.hardcoded_pairs, values the docstring
 does not state, the assertion in the context), output = the literal; and honest writes on the same tasks (no
@@ -158,12 +161,13 @@ def build(a):
 class Qwen:
     """An HF Qwen3 (dense or MoE) and a forward of a few query positions over a mixed key/value cache."""
 
-    def __init__(self, name, device="cuda"):
+    def __init__(self, name, device="cuda", dtype="bfloat16"):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch, self.dev = torch, device
         self.tok = AutoTokenizer.from_pretrained(name)
-        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).to(device).eval()
+        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=getattr(torch, dtype)).to(device).eval()
+        self.model.requires_grad_(False)  # no autograd graph: it would keep every layer's intermediates alive
         cfg = self.model.config
         self.L, self.H, self.kvH = cfg.num_hidden_layers, cfg.num_attention_heads, cfg.num_key_value_heads
         self.hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
@@ -186,49 +190,69 @@ class Qwen:
                 kv.append((cache.key_cache[i], cache.value_cache[i]))
         return kv, lp
 
-    def patched(self, q_ids, T0, kv_orig, kv_changed, masks, head_masks=None):
-        """Log-probs at the query positions T0.. (tokens q_ids), one row per set. masks: [B, T0] bool, True = the
-        position's keys/values come from the changed run at every layer. head_masks: {layer: [B, H] bool} instead
-        restricts the changed keys/values of `masks` to those (layer, query head) units."""
+    def patched(self, live_ids, n, kv_orig, kv_changed, masks, rows, head_masks=None, head_rows=None):
+        """Log-probs at `rows` of the live tokens. The live tokens (the turn's completion up to the output, positions
+        n.., teacher-forced) are recomputed attending to the context cache (positions 0..n-1) and causally to each
+        other. masks: [B, n] bool, True = that context position's keys/values come from the changed run at every layer.
+        head_masks: {layer: [B, H] bool} instead lets only those (layer, query head) units read the changed keys/values
+        of `masks` (at every live row); every other layer and head reads the original ones. head_rows (live row indices)
+        limits that restriction to those rows: every other row reads the changed keys/values through every head."""
+        with self.torch.inference_mode():
+            return self._patched(live_ids, n, kv_orig, kv_changed, masks, rows, head_masks, head_rows)
+
+    def _patched(self, live_ids, n, kv_orig, kv_changed, masks, rows, head_masks, head_rows):
         torch = self.torch
+        from torch.nn.attention.bias import causal_lower_right
         m = self.model.model
-        B, Q = masks.shape[0], len(q_ids)
-        pos = torch.arange(T0, T0 + Q, device=self.dev)[None].expand(B, -1)
-        h = m.embed_tokens(torch.tensor(q_ids, device=self.dev))[None].expand(B, -1, -1)
+        B, L = masks.shape[0], len(live_ids)
+        pos = torch.arange(n, n + L, device=self.dev)[None].expand(B, -1)
+        h = m.embed_tokens(torch.tensor(live_ids, device=self.dev))[None].expand(B, -1, -1)
         cos, sin = m.rotary_emb(h, pos)
-        causal = torch.ones(Q, T0 + Q, dtype=torch.bool, device=self.dev).tril(T0)
+        bias = causal_lower_right(L, n + L)
         g = self.H // self.kvH
         for i, layer in enumerate(m.layers):
             at = layer.self_attn
             x = layer.input_layernorm(h)
-            q = at.q_norm(at.q_proj(x).view(B, Q, self.H, self.hd)).transpose(1, 2)
-            k = at.k_norm(at.k_proj(x).view(B, Q, self.kvH, self.hd)).transpose(1, 2)
-            v = at.v_proj(x).view(B, Q, self.kvH, self.hd).transpose(1, 2)
+            q = at.q_norm(at.q_proj(x).view(B, L, self.H, self.hd)).transpose(1, 2)
+            k = at.k_norm(at.k_proj(x).view(B, L, self.kvH, self.hd)).transpose(1, 2)
+            v = at.v_proj(x).view(B, L, self.kvH, self.hd).transpose(1, 2)
             q, k = self.rope(q, k, cos, sin)
-            ko, vo = kv_orig[i][0][..., :T0, :], kv_orig[i][1][..., :T0, :]
-            kc, vc = kv_changed[i][0][..., :T0, :], kv_changed[i][1][..., :T0, :]
+            ko, vo = kv_orig[i][0][..., :n, :], kv_orig[i][1][..., :n, :]
+            kc, vc = kv_changed[i][0][..., :n, :], kv_changed[i][1][..., :n, :]
+            if head_rows is not None:
+                # two passes: every head reading the changed set, and every head reading the original; output rows take
+                # the first for the unit heads of this layer, the second for the rest; other rows take the first
+                sel = masks[:, None, :, None]
+                kc_, vc_ = torch.cat([torch.where(sel, kc, ko), k], 2), torch.cat([torch.where(sel, vc, vo), v], 2)
+                ko_, vo_ = torch.cat([ko.expand(B, -1, -1, -1), k], 2), torch.cat([vo.expand(B, -1, -1, -1), v], 2)
+                rep_ = (lambda t: t.repeat_interleave(g, 1)) if self.kvH != self.H else (lambda t: t)
+                o = torch.nn.functional.scaled_dot_product_attention(q, rep_(kc_), rep_(vc_), attn_mask=bias, scale=at.scaling)
+                o_orig = torch.nn.functional.scaled_dot_product_attention(q, rep_(ko_), rep_(vo_), attn_mask=bias, scale=at.scaling)
+                unit = head_masks.get(i, torch.zeros(B, self.H, dtype=torch.bool, device=self.dev))[:, :, None, None]
+                hr = torch.as_tensor(head_rows, device=self.dev)
+                o[:, :, hr] = torch.where(unit, o[:, :, hr], o_orig[:, :, hr])
+                h = h + at.o_proj(o.transpose(1, 2).reshape(B, L, self.H * self.hd))
+                mlp = layer.mlp(layer.post_attention_layernorm(h))
+                h = h + (mlp[0] if isinstance(mlp, tuple) else mlp)
+                continue
             if head_masks is None:
                 sel = masks[:, None, :, None]
-                kk = torch.where(sel, kc, ko)
-                vv = torch.where(sel, vc, vo)
+                kk, vv = torch.where(sel, kc, ko), torch.where(sel, vc, vo)
             elif i in head_masks:
-                sel = (head_masks[i][:, :, None] & masks[:, None, :])[..., None]          # [B, H, T0, 1]
+                sel = (head_masks[i][:, :, None] & masks[:, None, :])[..., None]          # [B, H, n, 1]
                 kk = torch.where(sel, kc.repeat_interleave(g, 1), ko.repeat_interleave(g, 1))
                 vv = torch.where(sel, vc.repeat_interleave(g, 1), vo.repeat_interleave(g, 1))
                 k, v = k.repeat_interleave(g, 1), v.repeat_interleave(g, 1)
             else:
                 kk, vv = ko.expand(B, -1, -1, -1), vo.expand(B, -1, -1, -1)
             kk, vv = torch.cat([kk, k], 2), torch.cat([vv, v], 2)
-            # Attention by key/value group, without repeating keys to every query head: the queries are few, so the
-            # [B, groups, heads per group, Q, T] scores are small, while repeated keys would be [B, H, T, hd].
-            G = kk.shape[1]
-            sc = torch.einsum("bgrqd,bgtd->bgrqt", q.view(B, G, self.H // G, Q, self.hd), kk).float() * at.scaling
-            sc = sc.masked_fill(~causal, float("-inf")).softmax(-1).to(vv.dtype)
-            o = torch.einsum("bgrqt,bgtd->bgrqd", sc, vv).reshape(B, self.H, Q, self.hd)
-            h = h + at.o_proj(o.transpose(1, 2).reshape(B, Q, self.H * self.hd))
+            if kk.shape[1] != self.H:
+                kk, vv = kk.repeat_interleave(g, 1), vv.repeat_interleave(g, 1)
+            o = torch.nn.functional.scaled_dot_product_attention(q, kk, vv, attn_mask=bias, scale=at.scaling)
+            h = h + at.o_proj(o.transpose(1, 2).reshape(B, L, self.H * self.hd))
             mlp = layer.mlp(layer.post_attention_layernorm(h))
             h = h + (mlp[0] if isinstance(mlp, tuple) else mlp)  # an MoE block may also return router logits
-        return self.model.lm_head(m.norm(h)).float().log_softmax(-1)
+        return self.model.lm_head(m.norm(h[:, rows])).float().log_softmax(-1)
 
 
 def kl_bits(lp, lq):
@@ -236,9 +260,16 @@ def kl_bits(lp, lq):
     return (lp.exp()[None] * (lp[None] - lq)).sum(-1).sum(-1) / LN2
 
 
+def _segments(tok, ctx, first):
+    """Context positions from `first` on, cut at every <|im_start|> (one chat message: a tool result, a turn)."""
+    st = tok.convert_tokens_to_ids("<|im_start|>")
+    cuts = sorted({first, len(ctx)} | {i for i in range(first, len(ctx)) if ctx[i] == st})
+    return [list(range(x, y)) for x, y in zip(cuts, cuts[1:]) if y > x]
+
+
 def run(a):
     import torch
-    qm = Qwen(a.model, a.device)
+    qm = Qwen(a.model, a.device, a.dtype)
     out = open(a.out, "a")
     done = {json.loads(l)["case"] for l in open(a.out)} if os.path.getsize(a.out) else set()
     start = time.time()
@@ -250,110 +281,184 @@ def run(a):
             print(f"deadline: stopping before case {c['case']}", flush=True)
             break
         t0 = time.time()
-        seq_o, seq_c = c["ctx"] + c["comp"], c["edited"] + c["comp"]
         n = len(c["ctx"])
-        # log-prob rows are indexed from n - 1 (the row predicting the completion's first token)
-        kv_o, lp_o = qm.record(seq_o, n - 1)
-        kv_c, lp_c = qm.record(seq_c, n - 1)
+        # log-prob rows from n - 1: row r predicts completion token r
+        kv_o, lp_o = qm.record(c["ctx"] + c["comp"], n - 1)
+        kv_c, lp_c = qm.record(c["edited"] + c["comp"], n - 1)
         lo_r, hi_r = c["region"]
-        # every token of the written code: how much the edit moves its distribution (teacher-forced)
-        rows = torch.arange(lo_r, hi_r, device=qm.dev)
-        per_tok = ((lp_c[rows].exp() * (lp_c[rows] - lp_o[rows])).sum(-1) / LN2).cpu().tolist()
+        per_tok = ((lp_c[lo_r:hi_r].exp() * (lp_c[lo_r:hi_r] - lp_o[lo_r:hi_r])).sum(-1) / LN2).cpu().tolist()
         top = max(range(len(per_tok)), key=lambda j: per_tok[j])
-        if c["kind"] == "hardcode":
-            lo, hi = c["span"]
-        else:
-            lo, hi = lo_r + top, lo_r + top + 1
-        T0 = n + lo - 1
-        q_ids = seq_o[T0:n + hi - 1]
+        lo, hi = (c["span"] if c["kind"] == "hardcode" else (lo_r + top, lo_r + top + 1))
         lp, lp0 = lp_c[lo:hi], lp_o[lo:hi]
         base = float(kl_bits(lp, lp0[None])[0])
+        live, rows = c["comp"][:hi - 1], list(range(lo - 1, hi - 1))
+        B = max(1, min(a.batch, a.live_tokens // max(len(live), 1)))
         res = dict({k: c[k] for k in ("case", "model", "arm", "run_id", "task", "split", "label", "turn", "kind", "line",
                                       "old", "new", "same_value")},
                    output=qm.tok.decode(c["comp"][lo:hi]), output_span=[lo, hi], kl_total_bits=base,
                    top_code_token=qm.tok.decode([c["comp"][lo_r + top]]), top_code_token_bits=per_tok[top],
-                   top_code_token_is_output=(lo_r + top) in range(lo, hi), value_positions=c["value_positions"],
-                   n_context=n)
-        # checks: the patched forward with no position / every position reproduces the two full runs
-        cand = sorted(set(range(min(c["changed_positions"]), T0)))
-        allm = torch.zeros(2, T0, dtype=torch.bool, device=qm.dev)
-        allm[1, :] = True
-        lq = qm.patched(q_ids, T0, kv_o, kv_c, allm)
-        res["check_none_vs_original_bits"] = float(kl_bits(lp0, lq[:1])[0])
-        res["check_all_vs_changed_bits"] = float(kl_bits(lp, lq[1:])[0])
-        if base < a.min_bits:
+                   top_code_token_is_output=lo <= lo_r + top < hi, value_positions=c["value_positions"], n_context=n,
+                   live_tokens=len(live))
+
+        def carry(sets, heads=None, S=None):
+            """Carried fraction per position set, or, with heads, per head-unit set reading the positions S."""
+            fr = []
+            items = heads if heads is not None else sets
+            for s0 in range(0, len(items), B):
+                chunk = items[s0:s0 + B]
+                mk = torch.zeros(len(chunk), n, dtype=torch.bool, device=qm.dev)
+                hm = None
+                if heads is None:
+                    for b, ps in enumerate(chunk):
+                        if ps:
+                            mk[b, torch.tensor(ps, device=qm.dev)] = True
+                else:
+                    mk[:, torch.tensor(S, device=qm.dev)] = True
+                    hm = defaultdict(lambda: torch.zeros(len(chunk), qm.H, dtype=torch.bool, device=qm.dev))
+                    for b, units in enumerate(chunk):
+                        for (i, hh) in units:
+                            hm[i][b, hh] = True
+                    hm = dict(hm)
+                lq = qm.patched(live, n, kv_o, kv_c, mk, rows, head_masks=hm)
+                fr += (1 - kl_bits(lp, lq) / base).cpu().tolist()
+            return fr
+
+        def greedy(cands, score, cap):
+            """Add the candidate that raises the carried fraction most until 90% (or the cap)."""
+            chosen, frac, pool = [], 0.0, list(cands)
+            while frac < 0.9 and pool and len(chosen) < cap:
+                trial = score([chosen + [x] for x in pool])
+                j = max(range(len(pool)), key=lambda i: trial[i])
+                chosen.append(pool.pop(j))
+                frac = trial[j]
+            return chosen, frac
+
+        chk = carry([[], list(range(n))])
+        res["check_none_carry"], res["check_all_carry"] = chk  # 0 and 1 when the patched forward matches the full runs
+        if base < a.min_bits or lo < 1:
             res["note"] = "the edit barely moves this output; no carry search"
             out.write(json.dumps(res) + "\n")
             out.flush()
             continue
-
-        def carried(sets):
-            """Carried fraction for a list of position lists."""
-            fr = []
-            for s in range(0, len(sets), a.batch):
-                chunk = sets[s:s + a.batch]
-                mk = torch.zeros(len(chunk), T0, dtype=torch.bool, device=qm.dev)
-                for b, ps in enumerate(chunk):
-                    if ps:
-                        mk[b, torch.tensor(ps, device=qm.dev)] = True
-                fr += (1 - kl_bits(lp, qm.patched(q_ids, T0, kv_o, kv_c, mk)) / base).cpu().tolist()
-            return fr
-        vpos = [p for p in c["value_positions"] if p < T0]
-        res["value_positions_carry"] = carried([vpos])[0] if vpos else None
-        single = carried([[p] for p in cand])
-        order = sorted(range(len(cand)), key=lambda j: -single[j])
-        res["top_single"] = [[cand[j], single[j], qm.tok.decode([seq_o[cand[j]]])] for j in order[:20]]
-        pool, chosen, frac = [cand[j] for j in order[:64]], [], 0.0
-        while frac < 0.9 and pool and len(chosen) < 64:
-            trial = carried([chosen + [p] for p in pool])
-            j = max(range(len(pool)), key=lambda i: trial[i])
-            chosen.append(pool.pop(j))
-            frac = trial[j]
-        res["set90"] = chosen
-        res["set90_carry"] = frac
-        res["set90_reached"] = frac >= 0.9
-        res["set90_tokens"] = [qm.tok.decode([seq_o[p]]) for p in chosen]
-        res["set90_in_value_positions"] = sum(p in set(c["value_positions"]) for p in chosen)
-        res["set90_distance"] = [T0 - p for p in chosen]
-        # heads at the output tokens reading the 90% set (or the value positions, when they carry 90% themselves)
-        S = vpos if (res["value_positions_carry"] or 0) >= 0.9 else chosen
-        res["heads_read"] = "value positions" if S is vpos else "set90"
-        mk1 = torch.zeros(1, T0, dtype=torch.bool, device=qm.dev)
-        mk1[0, torch.tensor(S, device=qm.dev)] = True
-        units = [(i, hh) for i in range(qm.L) for hh in range(qm.H)]
-        hsingle = []
-        for s in range(0, len(units), a.batch):
-            chunk = units[s:s + a.batch]
-            hm = defaultdict(lambda: torch.zeros(len(chunk), qm.H, dtype=torch.bool, device=qm.dev))
-            for b, (i, hh) in enumerate(chunk):
-                hm[i][b, hh] = True
-            lq = qm.patched(q_ids, T0, kv_o, kv_c, mk1.expand(len(chunk), -1), head_masks=dict(hm))
-            hsingle += (1 - kl_bits(lp, lq) / base).cpu().tolist()
-        horder = sorted(range(len(units)), key=lambda j: -hsingle[j])
-        res["top_heads_single"] = [[units[j][0], units[j][1], hsingle[j]] for j in horder[:20]]
-        hpool, hchosen, hfrac = [units[j] for j in horder[:48]], [], 0.0
-        while hfrac < 0.9 and hpool and len(hchosen) < 32:
-            trial = []
-            for s in range(0, len(hpool), a.batch):
-                chunk = hpool[s:s + a.batch]
-                hm = defaultdict(lambda: torch.zeros(len(chunk), qm.H, dtype=torch.bool, device=qm.dev))
-                for b, u in enumerate(chunk):
-                    for (i, hh) in hchosen + [u]:
-                        hm[i][b, hh] = True
-                lq = qm.patched(q_ids, T0, kv_o, kv_c, mk1.expand(len(chunk), -1), head_masks=dict(hm))
-                trial += (1 - kl_bits(lp, lq) / base).cpu().tolist()
-            j = max(range(len(hpool)), key=lambda i: trial[i])
-            hchosen.append(hpool.pop(j))
-            hfrac = trial[j]
-        res["heads90"] = [list(u) for u in hchosen]
-        res["heads90_carry"] = hfrac
+        vpos = list(c["value_positions"])
+        res["value_positions_carry"] = carry([vpos])[0]
+        # positions: chat segments, then 32-token chunks inside the chosen segments, then single positions
+        segs = _segments(qm.tok, c["ctx"], min(c["changed_positions"]))
+        seg_single = carry(segs)
+        res["segments"] = [[sg[0], sg[-1] + 1, f, qm.tok.decode(c["ctx"][sg[0]:sg[0] + 6])] for sg, f in zip(segs, seg_single)]
+        order = sorted(range(len(segs)), key=lambda j: -seg_single[j])
+        seg_set, seg_frac = greedy([j for j in order[:a.pool]], lambda sets: carry([[p for j in s for p in segs[j]] for s in sets]), a.pool)
+        res["segments90"], res["segments90_carry"] = [[segs[j][0], segs[j][-1] + 1] for j in seg_set], seg_frac
+        inside = [p for j in seg_set for p in segs[j]]
+        chunks = [inside[i:i + 32] for i in range(0, len(inside), 32)]
+        ch_single = carry(chunks)
+        corder = sorted(range(len(chunks)), key=lambda j: -ch_single[j])
+        ch_set, ch_frac = greedy(corder[:a.pool], lambda sets: carry([[p for j in s for p in chunks[j]] for s in sets]), a.pool)
+        res["chunks90"], res["chunks90_carry"] = [[chunks[j][0], chunks[j][-1] + 1] for j in ch_set], ch_frac
+        cand = [p for j in ch_set for p in chunks[j]]
+        p_single = carry([[p] for p in cand])
+        porder = sorted(range(len(cand)), key=lambda j: -p_single[j])
+        res["top_single"] = [[cand[j], p_single[j], qm.tok.decode([c["ctx"][cand[j]]])] for j in porder[:20]]
+        pos_set, pos_frac = greedy([cand[j] for j in porder[:a.pool]], carry, a.pool)
+        res["set90"], res["set90_carry"], res["set90_reached"] = pos_set, pos_frac, pos_frac >= 0.9
+        res["set90_tokens"] = [qm.tok.decode([c["ctx"][p]]) for p in pos_set]
+        res["set90_in_value_positions"] = sum(p in set(vpos) for p in pos_set)
+        res["set90_contexts"] = [qm.tok.decode(c["ctx"][max(0, p - 10):p + 3]) for p in pos_set]
+        # heads reading that set (or the value positions when they carry 90% alone, or the chunks when positions fall short)
+        S = vpos if res["value_positions_carry"] >= 0.9 else (pos_set if pos_frac >= 0.9 else cand)
+        res["heads_read"] = "value positions" if S is vpos else ("set90" if S is pos_set else "chunks90")
+        layer_f = carry(None, heads=[[(i, hh) for hh in range(qm.H)] for i in range(qm.L)], S=S)
+        res["layers"] = layer_f
+        lorder = sorted(range(qm.L), key=lambda i: -layer_f[i])[:a.top_layers]
+        units = [(i, hh) for i in lorder for hh in range(qm.H)]
+        h_single = carry(None, heads=[[u] for u in units], S=S)
+        horder = sorted(range(len(units)), key=lambda j: -h_single[j])
+        res["top_heads_single"] = [[units[j][0], units[j][1], h_single[j]] for j in horder[:20]]
+        h_set, h_frac = greedy([units[j] for j in horder[:a.head_pool]],
+                               lambda sets: carry(None, heads=sets, S=S), a.head_pool)
+        res["heads90"], res["heads90_carry"] = [list(u) for u in h_set], h_frac
+        res["all_heads_carry"] = carry(None, heads=[[(i, hh) for i in range(qm.L) for hh in range(qm.H)]], S=S)[0]
         res["seconds"] = time.time() - t0
         out.write(json.dumps(res) + "\n")
         out.flush()
-        print(f"case {c['case']} {c['kind']} {c['run_id']} {c['line'][:40]!r}: {base:.2f} bits; value positions carry "
-              f"{res['value_positions_carry']}; 90% set {len(chosen)} positions ({res['set90_in_value_positions']} value) "
-              f"{frac:.2f}; heads {len(hchosen)} {hfrac:.2f}; checks {res['check_none_vs_original_bits']:.3g} "
-              f"{res['check_all_vs_changed_bits']:.3g}; {res['seconds']:.0f} s", flush=True)
+        print(f"case {c['case']} {c['kind']} {c['run_id']} {c['line'][:40]!r}: {base:.1f} bits; value positions "
+              f"{res['value_positions_carry']:.2f}; segments {len(seg_set)} {seg_frac:.2f}; chunks {len(ch_set)} {ch_frac:.2f}; "
+              f"positions {len(pos_set)} ({res['set90_in_value_positions']} value) {pos_frac:.2f}; heads {len(h_set)} "
+              f"{h_frac:.2f} (all heads {res['all_heads_carry']:.2f}); checks {chk[0]:.3f} {chk[1]:.3f}; live {len(live)}; "
+              f"{res['seconds']:.0f} s", flush=True)
+        del kv_o, kv_c, lp_o, lp_c
+        if qm.dev == "cuda":
+            torch.cuda.empty_cache()
+
+
+def heads(a):
+    """Heads at the output tokens: for each searched case of a `run` results file, the position set S it found (the value
+    positions when they carry 90% alone, else its 90% position set, else its 90% chunks) is read through only the unit's
+    heads at the output rows, while every earlier live row reads S through every head. Also two ends: every head at the
+    output rows (equals the carry of S) and no head there (the share that reaches the output only through earlier rows
+    of the turn, such as the model restating the value before writing it)."""
+    import torch
+    qm = Qwen(a.model, a.device, a.dtype)
+    prev = {json.loads(l)["case"]: json.loads(l) for l in open(a.results)}
+    out = open(a.out, "a")
+    done = {json.loads(l)["case"] for l in open(a.out)} if os.path.getsize(a.out) else set()
+    start = time.time()
+    for line_ in open(a.cases):
+        c = json.loads(line_)
+        r = prev.get(c["case"])
+        if r is None or "set90" not in r or c["case"] in done:
+            continue
+        if time.time() - start > a.deadline:
+            print(f"deadline: stopping before case {c['case']}", flush=True)
+            break
+        t0 = time.time()
+        n = len(c["ctx"])
+        kv_o, lp_o = qm.record(c["ctx"] + c["comp"], n - 1)
+        kv_c, lp_c = qm.record(c["edited"] + c["comp"], n - 1)
+        lo, hi = r["output_span"]
+        lp, lp0 = lp_c[lo:hi], lp_o[lo:hi]
+        base = float(kl_bits(lp, lp0[None])[0])
+        live, rows = c["comp"][:hi - 1], list(range(lo - 1, hi - 1))
+        B = max(1, min(a.batch, a.live_tokens // max(len(live), 1)))
+        S = r["value_positions"] if r["value_positions_carry"] >= 0.9 else (
+            r["set90"] if r["set90_reached"] else [p for x, y in r["chunks90"] for p in range(x, y)])
+        mk = torch.zeros(1, n, dtype=torch.bool, device=qm.dev)
+        mk[0, torch.tensor(S, device=qm.dev)] = True
+
+        def carry(unit_sets):
+            fr = []
+            for s0 in range(0, len(unit_sets), B):
+                chunk = unit_sets[s0:s0 + B]
+                hm = defaultdict(lambda: torch.zeros(len(chunk), qm.H, dtype=torch.bool, device=qm.dev))
+                for b, units in enumerate(chunk):
+                    for (i, hh) in units:
+                        hm[i][b, hh] = True
+                lq = qm.patched(live, n, kv_o, kv_c, mk.expand(len(chunk), -1), rows, head_masks=dict(hm), head_rows=rows)
+                fr += (1 - kl_bits(lp, lq) / base).cpu().tolist()
+            return fr
+        everyone = [(i, hh) for i in range(qm.L) for hh in range(qm.H)]
+        full, earlier = carry([everyone, []])
+        layer_f = carry([[(i, hh) for hh in range(qm.H)] for i in range(qm.L)])
+        lorder = sorted(range(qm.L), key=lambda i: -layer_f[i])[:a.top_layers]
+        units = [(i, hh) for i in lorder for hh in range(qm.H)]
+        single = carry([[u] for u in units])
+        horder = sorted(range(len(units)), key=lambda j: -single[j])
+        chosen, frac, pool = [], earlier, [units[j] for j in horder[:a.head_pool]]
+        while frac < 0.9 and pool and len(chosen) < a.head_pool:
+            trial = carry([chosen + [u] for u in pool])
+            j = max(range(len(pool)), key=lambda i: trial[i])
+            chosen.append(pool.pop(j))
+            frac = trial[j]
+        res = {k: r[k] for k in ("case", "model", "run_id", "task", "kind", "label", "line", "output")}
+        res.update(S=S, S_kind=("value positions" if S is r["value_positions"] else "set90" if S is r["set90"] else "chunks90"),
+                   kl_total_bits=base, carry_output_rows_all_heads=full, carry_earlier_rows_only=earlier,
+                   layers=layer_f, top_heads_single=[[units[j][0], units[j][1], single[j]] for j in horder[:20]],
+                   heads90=[list(u) for u in chosen], heads90_carry=frac, seconds=time.time() - t0)
+        out.write(json.dumps(res) + "\n")
+        out.flush()
+        print(f"case {c['case']} {r['output']!r}: output rows (every head) {full:.2f}, earlier rows only {earlier:.2f}; "
+              f"best layer {max(layer_f):.2f} at {layer_f.index(max(layer_f))}; heads {len(chosen)} {frac:.2f} "
+              f"{[list(u) for u in chosen[:6]]}; {res['seconds']:.0f} s", flush=True)
         del kv_o, kv_c, lp_o, lp_c
         if qm.dev == "cuda":
             torch.cuda.empty_cache()
@@ -391,13 +496,30 @@ def main():
     r.add_argument("--min-bits", type=float, default=0.5)
     r.add_argument("--device", default="cuda")
     r.add_argument("--deadline", type=float, default=1e9, help="seconds after which no new case starts")
+    r.add_argument("--dtype", default="bfloat16")
+    r.add_argument("--pool", type=int, default=32, help="candidates the greedy searches draw from")
+    r.add_argument("--head-pool", type=int, default=24, help="single heads the greedy head search draws from")
+    r.add_argument("--top-layers", type=int, default=4, help="layers whose heads are screened one by one")
+    r.add_argument("--live-tokens", type=int, default=16384, help="live tokens per patched forward (sets x turn length)")
+    hd = sub.add_parser("heads")
+    hd.add_argument("--cases", required=True)
+    hd.add_argument("--results", required=True, help="a run's results: each case's position sets")
+    hd.add_argument("--model", default="Qwen/Qwen3-8B")
+    hd.add_argument("--out", required=True)
+    hd.add_argument("--batch", type=int, default=32)
+    hd.add_argument("--live-tokens", type=int, default=16384)
+    hd.add_argument("--top-layers", type=int, default=6)
+    hd.add_argument("--head-pool", type=int, default=24)
+    hd.add_argument("--device", default="cuda")
+    hd.add_argument("--dtype", default="bfloat16")
+    hd.add_argument("--deadline", type=float, default=1e9)
     p = sub.add_parser("report")
     p.add_argument("path")
     p.add_argument("--min-bits", type=float, default=0.05)
     a = ap.parse_args()
-    if a.cmd == "run" and not os.path.exists(a.out):
+    if a.cmd in ("run", "heads") and not os.path.exists(a.out):
         open(a.out, "w").close()
-    {"build": build, "run": run, "report": report}[a.cmd](a)
+    {"build": build, "run": run, "heads": heads, "report": report}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -132,42 +132,76 @@ def sensitive(nat, ids: list[int], targets: list[int], k: int) -> list[int]:
 
 
 def score(nat, task: dict, text: str, k: int = 8) -> dict:
-    """The carry test of an answer on a task: {"uncarried": the movement-weighted share left uncarried, "units", per
-    position {"position", "movement" (bits), "carried" (share), "units" (existing units the line names at the position,
-    at relay positions between it and the target, or at the targets), "rest_carried" (the share carried by every other
-    unit at those positions with the answer's held: near 0 when the answer is the only path, its necessity), "outside"
-    (units before the position or after the target, which a change at the position cannot reach), "unknown" (names of
-    units the model does not have)}, "rest_carried" (movement-weighted), "explanation"}. Size counts existing units only."""
+    """score_many for one answer."""
+    return score_many(nat, task, [text], k)[0]
+
+
+def score_many(nat, task: dict, texts: list[str], k: int = 8) -> list[dict]:
+    """The carry test of answers to one task, the task prepared once and every answer measured in one batch per position.
+    Per answer: {"uncarried": the share of the empty run's discrepancy the answer leaves, positions weighted by it, "units":
+    distinct (matrix, position) pairs the answer names that the model has (a head subset counts as its matrix: the same
+    intervention always has the same size), "heads": head slices named, "unknown": named units the model does not have,
+    "rest_carried", per position {"position", "change" (bits: the model's own move, KL of its prediction on the changed
+    prompts from its prediction on the text), "movement" (bits: the empty run's discrepancy, every unit held at the text
+    while embeddings and VPD's remainder follow the changed prompt), "carried" (share of the movement the answer's units
+    remove), "rest_carried" (share removed by every other unit at the answer's positions with the answer's held: near 0
+    when the answer is the only path, its necessity), "units", "outside" (units before the position or after the target,
+    which a change at the position cannot reach), "unknown"}, "explanation"}."""
     import torch
 
     import carry
     import native
 
-    explanation, circuits = parse(text)
+    parsed = [parse(t) for t in texts]
     prompt = task["prompts"][0]
     ids, targets = prompt["token_ids"], prompt["target_positions"]
+    t_max = max(targets)
     positions = sensitive(nat, ids, targets, k)
-    rows, total_w, total_u = [], 0.0, 0.0
+    per = [{"rows": [], "w": 0.0, "u": 0.0, "r": 0.0} for _ in texts]
+    with torch.no_grad():
+        base = nat.reference([ids], targets)[0]
     for p in positions:
         prompts = carry.alternatives(nat, ids, p)
-        stated = circuits.get(p, [])
-        inside = [u for u in stated if p <= u[-1] <= max(targets)]  # at the position, a relay after it, or the targets
-        gran = "head" if any(len(u) == 3 for u in inside) else "matrix"
-        space = carry.UnitSpace(nat, len(ids), sorted({p, *targets, *(u[-1] for u in inside)}), gran)
-        study = (carry.HeadCarry if gran == "head" else carry.MatrixCarry)(nat, ids, targets, prompts, space)
-        on = _active(space, inside)
         with torch.no_grad():
-            empty, with_units, without = study.measure([_active(space, []), on, ~on]).tolist()
-        carried = 0.0 if empty <= 0 else max(0.0, min(1.0, 1 - with_units / empty))
-        rest = 0.0 if empty <= 0 else max(0.0, min(1.0, 1 - without / empty))
-        rows.append({"position": p, "movement": empty, "carried": carried, "rest_carried": rest, "units": int(on.sum()),
-                     "outside": len(stated) - len(inside), "unknown": len(inside) - int(on.sum())})
-        total_w += empty
-        total_u += empty * (1 - carried)
+            changed = nat.reference(prompts, targets)
+            change = float(carry.kl(changed, base.expand_as(changed)).mean())
+        stated = [e[1].get(p, []) for e in parsed]
+        inside = [[u for u in st if p <= u[-1] <= t_max] for st in stated]
+        where = sorted({p, *targets, *(u[-1] for ins in inside for u in ins)})
+        gran = "head" if any(len(u) == 3 for ins in inside for u in ins) else "matrix"
+        space = carry.UnitSpace(nat, len(ids), where, gran)
+        study = (carry.HeadCarry if gran == "head" else carry.MatrixCarry)(nat, ids, targets, prompts, space)
+        known = {(u[0], u[-1]) for u in space.units}
+        ons, rests, sizes = [], [], []
+        for ins in inside:
+            own = {p, *targets, *(u[-1] for u in ins)}
+            at = torch.tensor([u[-1] in own for u in space.units], device=nat.dev)
+            on = _active(space, ins)
+            ons.append(on)
+            rests.append(at & ~on)
+            pairs = {(u[0], u[-1]) for u in ins}
+            heads = {u for u in ins if len(u) == 3 and u[1] < nat.target.n_head}
+            sizes.append((len(pairs & known), len(heads), len(pairs - known) + sum(1 for u in ins if len(u) == 3 and u[1] >= nat.target.n_head)))
+        with torch.no_grad():
+            kls = study.measure([_active(space, [])] + ons + rests).tolist()
+        empty, n = kls[0], len(texts)
+        for i in range(n):
+            carried = 0.0 if empty <= 0 else max(0.0, min(1.0, 1 - kls[1 + i] / empty))
+            rest = 0.0 if empty <= 0 else max(0.0, min(1.0, 1 - kls[1 + n + i] / empty))
+            units, heads, unknown = sizes[i]
+            per[i]["rows"].append({"position": p, "change": change, "movement": empty, "carried": carried, "rest_carried": rest,
+                                   "units": units, "heads": heads, "outside": len(stated[i]) - len(inside[i]), "unknown": unknown})
+            per[i]["w"] += empty
+            per[i]["u"] += empty * (1 - carried)
+            per[i]["r"] += empty * rest
         native.free(nat.dev)
-    return {"uncarried": total_u / total_w if total_w else 0.0, "units": sum(r["units"] for r in rows), "positions": rows,
-            "rest_carried": sum(r["movement"] * r["rest_carried"] for r in rows) / total_w if total_w else 0.0,
-            "explanation": explanation}
+    out = []
+    for (explanation, _), a in zip(parsed, per):
+        rows = a["rows"]
+        out.append({"uncarried": a["u"] / a["w"] if a["w"] else 0.0, "units": sum(r["units"] for r in rows),
+                    "heads": sum(r["heads"] for r in rows), "unknown": sum(r["unknown"] for r in rows),
+                    "rest_carried": a["r"] / a["w"] if a["w"] else 0.0, "positions": rows, "explanation": explanation})
+    return out
 
 
 def _cut(t: int, s: int, layer: int):

@@ -101,7 +101,7 @@ def render(explanation: str, circuits: dict) -> str:
                 words = [k if ks[k] is None else f"{k}[{','.join(f'h{h}' for h in sorted(set(ks[k])))}]" for k in order if k in ks]
                 groups.append(f"{pos}:" + ",".join(words))
             segments.append(f"L{layer} " + " -> ".join(groups))
-        out.append(f"POSITION {p}: " + " | ".join(segments))
+        out.append(f"POSITION {p}: " + (" | ".join(segments) or "none"))
     return "\n".join(out)
 
 
@@ -277,15 +277,20 @@ def targets(explain_jsonl: Path, out_dir: Path, fraction: int = 90) -> int:
     elimination curve that carries `fraction`% of what the position's full unit set carries (a position whose full set
     carries less than all of its movement needs units elsewhere too; its line then states the part that is at the
     position and the targets), no explanation (the English is trained by its own reader). Positions whose full set
-    carries nothing get no line."""
+    carries nothing get no line; positions moving less than 1% of the text's total movement get an empty line ("none":
+    they can change the movement-weighted score by at most 1%, and a 90% set of almost nothing is noise)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     for line in open(explain_jsonl):
         r = json.loads(line)
         circuits = {}
+        total = sum(max(p["empty_bits"], 0.0) for p in r["positions"])
         for p in r["positions"]:
             curve, sets, empty = p["curve"], p["unit_sets"], p["empty_bits"]
             full = min(kl for _, kl in curve)
+            if empty < 0.01 * total:
+                circuits[p["position"]] = []
+                continue
             if empty <= 0 or full >= empty:
                 continue
             goal = empty - fraction / 100 * (empty - full)
@@ -311,9 +316,34 @@ def numbered(strings: list[str]) -> str:
     return " ".join(f"{i}:{s!r}" for i, s in enumerate(strings))
 
 
-def question(task: dict, positions: list[int]) -> str:
+def evidence(events: list[dict], positions: list[int], strings: list[str]) -> list[str]:
+    """The measurements the oracle reads for each listed position (events() at those positions): how the log2
+    probability of the model's most likely next token moves when the token there changes to the model's likeliest
+    other token, and when each layer's attention at the target is kept from reading the position. The English reader is
+    never asked about these (its questions are about other positions and other tokens)."""
+    by = {}
+    for e in events:
+        by.setdefault(e["position"], []).append(e)
+    out = []
+    for q in positions:
+        es = by.get(q, [])
+        change = next((e for e in es if "new" in e), None)
+        cuts = sorted((e for e in es if "layer" in e), key=lambda e: e["layer"])
+        if change is None and not cuts:
+            continue
+        line = f"{q} ({strings[q]!r}):"
+        if change is not None:
+            line += f" changed token {change['bits']:+.2f}"
+        if cuts:
+            line += "; attention cut per layer " + " ".join(f"L{e['layer']} {e['bits']:+.2f}" for e in cuts)
+        out.append(line)
+    return out
+
+
+def question(task: dict, positions: list[int], events: list[dict] | None = None) -> str:
     """The oracle's question for unit circuits: the ask, the text's tokens by position, the target and the model's most
-    probable next tokens there, and the positions whose changed token moves the prediction most (with their tokens)."""
+    probable next tokens there, the positions whose changed token moves the prediction most (with their tokens), and,
+    given the text's events, the measured evidence at those positions (evidence())."""
     from prompt import tokens_of
 
     model = task["model"]
@@ -321,10 +351,13 @@ def question(task: dict, positions: list[int]) -> str:
     strings = tokens_of(model, p["token_ids"])
     t = max(p["target_positions"])
     top = ", ".join(f"{tok!r} {q:.2f}" for tok, q in p["model_top"][0][:3])
-    return "\n".join([ASK.format(model=model), "tokens: " + numbered(strings),
-                      f"target: position {t}; the model's most probable next tokens there: {top}",
-                      "positions where a changed token moves the prediction most, most first: "
-                      + ", ".join(f"{q} ({strings[q]!r})" for q in positions)])
+    lines = [ASK.format(model=model), "tokens: " + numbered(strings),
+             f"target: position {t}; the model's most probable next tokens there: {top}",
+             "positions where a changed token moves the prediction most, most first: "
+             + ", ".join(f"{q} ({strings[q]!r})" for q in positions)]
+    if events:
+        lines += ["measured at those positions (log2 change of the top token's probability):"] + evidence(events, positions, strings)
+    return "\n".join(lines)
 
 
 def baseline(kind: str, positions: list[int], targets: list[int]) -> str:
@@ -344,9 +377,11 @@ def baseline(kind: str, positions: list[int], targets: list[int]) -> str:
     return render("", circuits)
 
 
-def dataset(explain_jsonl: Path, out: Path, fraction: int = 90) -> int:
+def dataset(explain_jsonl: Path, out: Path, fraction: int = 90, events_jsonl: Path | None = None) -> int:
     """SFT rows {"prompt": [user message], "completion": [assistant message], "info": {"task"}} from carry.py
-    explain's measured circuits (targets()'s answers) and their questions."""
+    explain's measured circuits (targets()'s answers) and their questions (with the evidence of events_jsonl, units.py
+    events' output, when given; texts without events are skipped then)."""
+    evs = {json.loads(x)["task"]: json.loads(x)["events"] for x in open(events_jsonl)} if events_jsonl else None
     import tempfile
 
     import native
@@ -362,7 +397,9 @@ def dataset(explain_jsonl: Path, out: Path, fraction: int = 90) -> int:
                 positions = [p["position"] for p in r["positions"]]
                 if not positions:  # a text whose prediction is at its first position: nothing to explain
                     continue
-                f.write(json.dumps({"prompt": [{"role": "user", "content": question(task, positions)}],
+                if evs is not None and r["task"] not in evs:
+                    continue
+                f.write(json.dumps({"prompt": [{"role": "user", "content": question(task, positions, evs and evs[r["task"]])}],
                                     "completion": [{"role": "assistant", "content": answer}], "info": {"task": r["task"]}}) + "\n")
                 n += 1
     return n
@@ -379,6 +416,7 @@ def main():
     d.add_argument("explain", type=Path)
     d.add_argument("out", type=Path)
     d.add_argument("--fraction", type=int, default=90)
+    d.add_argument("--events", type=Path, help="units.py events output: the question shows the measured evidence")
     b = sub.add_parser("baseline")
     b.add_argument("kind", choices=("copy", "all"))
     b.add_argument("task")
@@ -397,7 +435,7 @@ def main():
         print(f"{targets(a.explain, a.out, a.fraction)} answers in {a.out}")
         return
     if a.cmd == "dataset":
-        print(f"{dataset(a.explain, a.out, a.fraction)} rows in {a.out}")
+        print(f"{dataset(a.explain, a.out, a.fraction, a.events)} rows in {a.out}")
         return
     import native
 

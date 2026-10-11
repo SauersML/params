@@ -36,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vpd"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "method" / "vpd"))
 from vpd_model import VPD_PTH, load_target, val_tokens  # noqa: E402
 
 DEV, SITE, COMP, O_TOK, SIDE = "mps", "h.2.mlp.down_proj", 2359, 80, 20

@@ -4,13 +4,15 @@ name: Graph Oracle E2E
 # part tokens, copycheck, prompted, score, the frozen reader of the RL loop, and the RL scorer and
 # trainer (scripts) on a tiny random Qwen3. test_mech's sandbox test tokenizes with vpd4l's
 # tokenizer, a file under the Mac's mpd-data, and is left out here. No test runs the Rust checker
-# (crates/mpd/examples/mpd_graph_2951.rs), so nothing here compiles.
+# (method/crates/mpd/examples/mpd_graph_2951.rs), so nothing here compiles.
 
 on:
   push:
     branches: [main]
     paths:
-      - "oracle/graph/**"
+      - "method/oracle/**"
+      - "method/vpd/vpd_model.py"
+      - "experiments/oracle/**"
       - ".github/workflows/graph-oracle-e2e.yml"
   workflow_dispatch:
 
@@ -45,10 +47,10 @@ jobs:
           MEM_LEASE_GIB: "1"
           MPD_MEM_GIB: "1"
         run: |
-          python -m pytest oracle/graph/test_mech.py oracle/graph/test_edits.py oracle/graph/test_reader.py \
-            oracle/graph/test_part_tokens.py oracle/graph/test_copycheck.py oracle/graph/test_prompted.py \
-            oracle/graph/test_score.py oracle/graph/rl/test_reader_frozen.py \
-            --deselect oracle/graph/test_mech.py::test_the_sandbox_limits_and_the_server \
+          python -m pytest method/oracle/test_mech.py method/oracle/test_edits.py method/oracle/test_reader.py \
+            method/oracle/test_part_tokens.py experiments/oracle/test_copycheck.py experiments/oracle/test_prompted.py \
+            method/oracle/test_score.py method/oracle/rl/test_reader_frozen.py \
+            --deselect method/oracle/test_mech.py::test_the_sandbox_limits_and_the_server \
             -p no:cacheprovider -v --tb=short
-          python -B oracle/graph/rl/test_scorer.py
-          python -B oracle/graph/rl/test_train.py
+          python -B method/oracle/rl/test_scorer.py
+          python -B method/oracle/rl/test_train.py

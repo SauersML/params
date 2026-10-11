@@ -1,7 +1,7 @@
 name: gha-run
 
 # CPU work for #2951 on a free runner of this public repository (4 CPUs, 16 GB RAM, 14 GB SSD, at
-# most 6 h), dispatched by infra/runpod/gha-run:
+# most 6 h), dispatched by experiments/infra/runpod/gha-run:
 #
 #  - binaries: the named examples and test binaries built at a commit on ubuntu-22.04, the release
 #    the GPU pods' image runs (runpod/pytorch:...-ubuntu22.04, same glibc). The CUDA code compiles at
@@ -98,12 +98,12 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.9
         if: runner.os == 'macOS'
 
-      - name: Toolchain (rust-toolchain.toml's)
-        run: rustup toolchain install "$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)" --profile minimal
+      - name: Toolchain (method/rust-toolchain.toml's)
+        run: rustup toolchain install "$(sed -nE 's/^channel = "([^"]+)"/\1/p' method/rust-toolchain.toml)" --profile minimal
 
       # One entry per lock file, toolchain and kind of build (release binaries; fastcheck's check,
       # clippy and test builds): the dependencies, which cost the build most, come from it; the
-      # workspace's own crates rebuild from the commit. An entry per commit would evict the other
+      # workspace's own crates (method/) rebuild from the commit. An entry per commit would evict the other
       # workflows' caches from the repository's 10 GB.
       # Saved (below) only when missing, and for check, clippy and test only by a run named
       # cache-KIND that builds the whole workspace's dependencies, so a narrow check never stores a
@@ -114,19 +114,21 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
+            method/target
+          key: gha-run-${{ hashFiles('method/Cargo.lock', 'method/rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
 
       - name: Build
         run: |
           set -euo pipefail
           mkdir -p bin
+          # The Rust workspace is method/; rustup takes the toolchain from its rust-toolchain.toml there.
+          cd method
           for pkg in $(for w in $EXAMPLES; do echo "${w%%:*}"; done | sort -u); do
             flags=()
             for w in $EXAMPLES; do [ "${w%%:*}" = "$pkg" ] && flags+=(--example "${w#*:}"); done
             cargo build --release -p "$pkg" "${flags[@]}"
           done
-          for w in $EXAMPLES; do cp "target/release/examples/${w#*:}" bin/; done
+          for w in $EXAMPLES; do cp "target/release/examples/${w#*:}" ../bin/; done
           for w in $TESTS; do
             pkg=${w%%:*} name=${w#*:}
             # TEST lib is the package's library unit tests (cargo's target name: the package's, - as _).
@@ -134,9 +136,9 @@ jobs:
             exe=$(cargo test -p "$pkg" "${sel[@]}" --no-run --message-format=json |
               jq -r --arg n "$target" 'select(.reason == "compiler-artifact" and .executable != null and .target.name == $n) | .executable' | tail -n 1)
             [ -n "$exe" ] || { echo "no test executable for $w"; exit 1; }
-            cp "$exe" "bin/test-$name"
+            cp "$exe" "../bin/test-$name"
           done
-          ls -la bin
+          ls -la ../bin
 
       - name: Publish binaries (assets KEY.NAME of the prerelease rp-run-bin)
         if: inputs.key != '' && (inputs.examples != '' || inputs.tests != '')
@@ -230,8 +232,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
+            method/target
+          key: gha-run-${{ hashFiles('method/Cargo.lock', 'method/rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
 
       - uses: actions/upload-artifact@v4
         if: always() && inputs.command != ''

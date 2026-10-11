@@ -7,7 +7,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vpd"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "method" / "vpd"))
 from vpd_model import VAL_PARQUET  # noqa: E402
 
 VD = Path.home() / "mpd-data/vpd"

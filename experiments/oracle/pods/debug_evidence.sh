@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Which vLLM setting breaks the evidence oracle's sampling (prompts as embeddings + LoRA): the held-out evaluation of
+# a fresh adapter on 2 questions, once per variant, each its own process (a CUDA error ends the process): as trained
+# (compiled kernels, CUDA graphs, chunked prefill), --no-chunked-prefill, --enforce-eager, and text only. With SFT_STEPS the adapter is first trained that
+# many steps on the search's programs: a fresh adapter writes no subcomponent tokens and did not crash.
+# One pod, minutes.
+#   experiments/oracle/pods/debug_evidence.sh   (env: RUN, SFT_STEPS or INIT, QUESTIONS, SAMPLES, VARIANTS, GPU, PRICE)
+cd /Users/user/params
+RUN=${RUN:-dbg1}
+S=/Users/user/mpd-data/scratch/glead/v5/src_debug_$RUN
+git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive origin/main method/oracle experiments/oracle method/vpd/vpd_model.py | tar -x -C "$S"
+COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
+G=$S/method/oracle E=$S/experiments/oracle
+N=oracle-graph-$RUN
+O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
+T=/Users/user/mpd-data/graph_oracle/texts-$RUN.tar
+COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/search texts/search_heldout
+PT="~/mpd-data/graph_oracle/texts"
+BASE="--base Qwen/Qwen3-4B --model vpd4l --behaviors $PT --search $PT/search --search-heldout $PT/search_heldout --part-tokens /root/reg.safetensors --scorer native --score-workers 4 --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors ${QUESTIONS:-2} --samples ${SAMPLES:-2} --no-baselines"
+EV="--evidence --max-tokens 1024 --max-model-len 26624"
+RUNS=""; INIT=${INIT:+--init $INIT}  # INIT: an adapter directory (outside runpod/, which rp-run never uploads)
+if [ -n "$SFT_STEPS" ]; then
+  RUNS="mkdir -p $O/sft; python rl/train.py --mode sft $BASE $EV --sft-steps $SFT_STEPS --batch 8 --out $O/sft --run-name dbg_sft > $O/sft/log 2>&1; echo \"sft exit \$?\" >> $O/variants.txt;"
+  INIT="--init $O/sft/adapter"
+fi
+for v in ${VARIANTS:-compiled nochunk eager text}; do  # nosleep: vLLM never sleeps (its own share of the GPU beside the trainer's)
+  case $v in
+    compiled) args="$BASE $EV";; nochunk) args="$BASE $EV --no-chunked-prefill";; eager) args="$BASE $EV --enforce-eager";;
+    text) args="$BASE --max-tokens 1024 --max-model-len 14336";; nosleep) args="${BASE/--share-gpu --gpu-memory 0.5/--gpu-memory 0.6} $EV";;
+  esac
+  RUNS="$RUNS mkdir -p $O/$v; python rl/train.py --mode eval $args $INIT --out $O/$v --run-name dbg_$v > $O/$v/log 2>&1; echo \"$v exit \$?\" >> $O/variants.txt;"
+done
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S ~/mpd-data/graph_oracle; tar -xf $T -C ~/mpd-data/graph_oracle; tar -xf $S.tar -C $S; ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; cd $G; python part_tokens.py build --vpd /Users/user/mpd-data/oracle/vpd/uv.safetensors --out /root/reg.safetensors; $RUNS cat $O/variants.txt"
+RP_OWNER=lead RP_PARALLEL=1 RP_PYENV=oracle RP_HF_MODELS="Qwen/Qwen3-4B" RP_MAX_PRICE=${PRICE:-1.80} RP_MIN_VRAM_GB=78 RP_MIN_RAM_GB=96 \
+  experiments/infra/runpod/rp-run $N "${GPU:-NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB}" 1.0 -- bash -c "$CMD" > /Users/user/mpd-data/scratch/glead/v5/rp_$N.log 2>&1
+echo "$N exit $?"

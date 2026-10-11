@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The investigator's command line over the measured-intervention server (#2951).
 
-Every number it prints is measured by the Rust server (crates/mpd/src/oracle.rs) on the native
+Every number it prints is measured by the Rust server (method/crates/mpd/src/oracle.rs) on the native
 models; this file only turns text into token ids, sends one request, and prints the answer in
 words. The session (socket, tokenizer, models, corpus) is the JSON file named by ORACLE_SESSION.
 

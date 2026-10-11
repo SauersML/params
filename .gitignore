@@ -1,8 +1,0 @@
-.lake/
-lake-manifest.json.bak
-*.olean
-__pycache__/
-*.pyc
-validation/**/results/*.json.tmp
-/target
-/.cargo/

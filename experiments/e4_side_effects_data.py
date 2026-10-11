@@ -16,7 +16,7 @@ Stages (each resumable; outputs in ~/mpd-data/frontier/e4_side/):
              probability, and log-probabilities of the contrast token (is/are, was/were, has/have, a/an, ...).
   summarize  mine the capability battery from the token text, break damage down along unchosen axes, cluster-
              bootstrap by document, pick worst non-emoticon contexts; writes e4_side_effects.json for
-             figures/e4_side_effects_fig.py.
+             experiments/figures/e4_side_effects_fig.py.
 
 usage: mem-lease 2 venv/python e4_side_effects_data.py lora [NAMES...] | eval;   MPD_MEM_GIB=4 ... summarize
 """

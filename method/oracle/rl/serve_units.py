@@ -91,8 +91,8 @@ class Pool:
     """The scoring processes and the futures of the requests in flight; a process that dies is started again and its
     requests in flight fail with an error instead of waiting forever."""
 
-    def __init__(self, workers: int, args: tuple):
-        self.ctx, self.args = mp.get_context("spawn"), args  # spawn: CUDA in each process
+    def __init__(self, workers: int, args: tuple, target=None):
+        self.ctx, self.args, self.target = mp.get_context("spawn"), args, target or work  # spawn: CUDA in each process
         self.out = self.ctx.Queue()
         self.inboxes = [self.ctx.Queue() for _ in range(workers)]
         self.procs = [self.start(q) for q in self.inboxes]
@@ -101,7 +101,7 @@ class Pool:
         threading.Thread(target=self.watch, daemon=True).start()
 
     def start(self, inbox):
-        p = self.ctx.Process(target=work, args=(*self.args, inbox, self.out), daemon=True)
+        p = self.ctx.Process(target=self.target, args=(*self.args, inbox, self.out), daemon=True)
         p.start()
         return p
 
@@ -131,7 +131,7 @@ class Pool:
                         self.owner.pop(rid, None)
                 for fut in futs:
                     fut.set_exception(RuntimeError(f"scoring process {i} died (exit code {p.exitcode})"))
-                print(f"serve_units: scoring process {i} died (exit code {p.exitcode}); starting it again", flush=True)
+                print(f"scoring process {i} died (exit code {p.exitcode}); starting it again", flush=True)
                 self.procs[i] = self.start(self.inboxes[i])
 
     def submit(self, req: dict) -> Future:
@@ -143,16 +143,8 @@ class Pool:
         return fut
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--port", type=int, default=8766)
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--workers", type=int, default=2)
-    ap.add_argument("--device")
-    ap.add_argument("--k", type=int, default=8)
-    ap.add_argument("--size-weight", type=float, default=0.5)
-    a = ap.parse_args()
-    pool = Pool(a.workers, (a.device, a.k, a.size_weight))
+def serve(pool: Pool, host: str, port: int, name: str) -> None:
+    """POST /score and GET /health over a Pool, until killed."""
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self, code: int, body: dict) -> None:
@@ -181,8 +173,20 @@ def main():
         def log_message(self, *args):
             pass
 
-    print(f"serve_units: {a.workers} scoring processes, http://{a.host}:{a.port}", flush=True)
-    ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
+    print(f"{name}: {len(pool.procs)} scoring processes, http://{host}:{port}", flush=True)
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--port", type=int, default=8766)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--device")
+    ap.add_argument("--k", type=int, default=8)
+    ap.add_argument("--size-weight", type=float, default=0.5)
+    a = ap.parse_args()
+    serve(Pool(a.workers, (a.device, a.k, a.size_weight)), a.host, a.port, "serve_units")
 
 
 if __name__ == "__main__":

@@ -45,9 +45,7 @@
 # Source: `git archive` of github.com/SauersML/params's origin/main, or of RP_REF=<commit> when it is
 # published: the Rust workspace (crates/, the manifests, the toolchain pin), infra/runpod/ and every
 # /Users/user/params/... path COMMAND names, unpacked at WS/src (WS=/workspace/runs/NAME, the run's
-# own directory on the pod), the command's working directory. The workspace depends on gam's crates
-# by path (../gam/crates/...): when the pod compiles, github.com/SauersML/gam's root manifests and
-# crates/ at gam's origin/main (or RP_GAM_REF=<a commit on gam's main>) are unpacked at WS/gam.
+# own directory on the pod), the command's working directory.
 #
 # Paths are translated as mats-run translates them:
 #   target/release/examples/X, /Users/user/params/target/release/examples/X and
@@ -135,7 +133,7 @@
 # Binaries: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as $MPD_BIN/test-TEST;
 # TEST lib is the package's library unit tests, so one package's per run) a
 # run needs come from the prerelease rp-run-bin (assets KEY.NAME, KEY the hash of the commit's Rust
-# sources and gam's), which the pod downloads itself; what it lacks is built first on GitHub Actions
+# sources), which the pod downloads itself; what it lacks is built first on GitHub Actions
 # (gha-run bins, before any pod exists). Only when that fails does the run's first GPU pod build
 # them, once per set of sources (other runs wait), and the Mac caches them in _bin. A command that
 # compiles (cargo ...) is refused: a GPU pod does not compile.
@@ -161,7 +159,7 @@
 set -Eeuo pipefail
 REST=https://rest.runpod.io/v1 GRAPHQL=https://api.runpod.io/graphql
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
-MAC_REPO=/Users/user/params MAC_GAM=/Users/user/gam MAC_DATA=/Users/user/mpd-data HF_HUB=/Users/user/.cache/huggingface/hub
+MAC_REPO=/Users/user/params MAC_DATA=/Users/user/mpd-data HF_HUB=/Users/user/.cache/huggingface/hub
 # test_ownership.sh runs the runner against a mock API in a scratch data directory.
 if [ -n "${RP_TEST_ROOT:-}" ]; then
     MAC_DATA=$RP_TEST_ROOT REST=$RP_TEST_API/v1 GRAPHQL=$RP_TEST_API/graphql
@@ -1352,15 +1350,12 @@ if [ "$MODE" = run ] && [ ${#live[@]} -gt 0 ] && [ -z "${RP_PARALLEL:-}" ] && [ 
     exit 2
 fi
 
-# The commit, and gam's (G) for the workspace's path dependencies.
-C="" G=""
+# The commit.
+C=""
 if :; then
     git -C "$MAC_REPO" fetch -q origin main
     C=$(git -C "$MAC_REPO" rev-parse "${RP_REF:-origin/main}^{commit}")
     git -C "$MAC_REPO" merge-base --is-ancestor "$C" origin/main || { echo "rp-run: ${C:0:12} is not on origin/main; push it or set RP_REF to a published commit" >&2; exit 2; }
-    git -C "$MAC_GAM" fetch -q origin main
-    G=$(git -C "$MAC_GAM" rev-parse "${RP_GAM_REF:-origin/main}^{commit}")
-    git -C "$MAC_GAM" merge-base --is-ancestor "$G" origin/main || { echo "rp-run: gam ${G:0:12} is not on gam's origin/main; set RP_GAM_REF to a published gam commit" >&2; exit 2; }
 fi
 
 # `cargo run [...] --example X [...] -- ARGS` -> X ARGS
@@ -1559,10 +1554,8 @@ if [ ${#pile[@]} -gt 0 ]; then
 fi
 KEY="" CACHE="" CHANNEL=""
 if [ -n "$C" ]; then
-    # Binaries built from the same Rust sources (this workspace's and the gam crates it depends on)
-    # in the same image are the same binaries.
-    KEY=$( { git -C "$MAC_REPO" rev-parse "$C:crates" "$C:Cargo.lock" "$C:Cargo.toml" "$C:rust-toolchain.toml";
-             git -C "$MAC_GAM" rev-parse "$G:crates" "$G:Cargo.lock" "$G:Cargo.toml" "$G:rust-toolchain.toml"; echo "$IMAGE"; } | shasum | cut -c1-16)
+    # Binaries built from the same Rust sources in the same image are the same binaries.
+    KEY=$( { git -C "$MAC_REPO" rev-parse "$C:crates" "$C:Cargo.lock" "$C:Cargo.toml" "$C:rust-toolchain.toml"; echo "$IMAGE"; } | shasum | cut -c1-16)
     CACHE=$RP/_bin/$KEY
     CHANNEL=$(git -C "$MAC_REPO" show "$C:rust-toolchain.toml" | sed -nE 's/^channel = "([^"]+)"/\1/p')
 fi
@@ -1630,7 +1623,7 @@ if [ ${#fw_publish[@]} -gt 0 ] && [ -z "${RP_DRY:-}" ] && [ -z "${RP_ESTIMATE_ON
         touch "$m"
         lines=$(tr ';' '\n' <<< "$sums" | sed '/^$/d' | sed "s/.*/'&'/" | tr '\n' ' ')
         cmd="python3 -m pip install -q --user --upgrade pip && python3 -m pip install -q --user 'numpy>=2' pyarrow huggingface_hub tokenizers && python3 experiments/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out \$OUT/shard --workers 4 && cd \$OUT/shard && printf '%s\\n' $lines| sha256sum -c --quiet && mkdir -p \$OUT/rp-run-data && for f in *; do mv \"\$f\" \"\$OUT/rp-run-data/\$(sha256sum \"\$f\" | cut -c1-64)\"; done"
-        ( GHA_REF=$C GHA_GAM_REF=$G "${SELF%/*}/gha-run" "fineweb-publish-$d" -- "$cmd" >> "$RP/fineweb_publish/dispatch.log" 2>&1 & )
+        ( GHA_REF=$C "${SELF%/*}/gha-run" "fineweb-publish-$d" -- "$cmd" >> "$RP/fineweb_publish/dispatch.log" 2>&1 & )
     done
 fi
 hf_kb=0
@@ -1703,7 +1696,7 @@ fi
 [ -n "${RP_BATCH:-}" ] || budget "$ESTIMATE" "this $MODE's estimate for $HOURS h"
 echo "rp-run: $MODE $NAME; offers $(awk -F'|' '{ printf "%s%s %s $%s/h", (NR > 1 ? ", " : ""), $3, $1, $2 }' <<< "$OFFERS"); estimate \$$ESTIMATE for $HOURS h" >&2
 if [ -n "${RP_DRY:-}" ]; then
-    echo "commit:   ${C:-none} (gam ${G:-none})"
+    echo "commit:   ${C:-none}"
     echo "uploads:  ${uploads[*]:-none}: ${#fetched[@]} files published (the pod downloads them), ${#files[@]} files ($(( unpublished_kb / 1024 )) MB) from the Mac"
     echo "hf:       ${hf[*]:-none}"
     built=$( for e in "${fw_plan[@]}"; do IFS='|' read -r d k n ts _ <<< "$e"; printf 'qwen3_fineweb/%s (FineWeb file %s, %s documents, contexts %s) ' "$d" "$k" "$n" "$ts"; done
@@ -1711,7 +1704,7 @@ if [ -n "${RP_DRY:-}" ]; then
     echo "built:    ${built:-none}"
     echo "publish:  $( for e in "${fw_publish[@]}"; do printf 'qwen3_fineweb/%s ' "${e%%|*}"; done )(tokenized whole on GitHub Actions and published to rp-run-data, once per 6 h)"
     if (( NEED_RUST )); then
-        echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml ${srcpaths[*]:-} (from GitHub), and gam ${G:0:12}'s crates and manifests at WS/gam"
+        echo "source:   crates Cargo.toml Cargo.lock rust-toolchain.toml ${srcpaths[*]:-} (from GitHub)"
     else
         echo "source:   ${srcpaths[*]:-none} (from the Mac; the whole commit from GitHub only if the pod must compile)"
     fi
@@ -2787,7 +2780,7 @@ build_binaries() {
         case $x in test:*) ts+=("${x#test:}") ;; *) ex+=("${package_of[$x]}:$x") ;; esac
     done
     say "building $(echo $need) on GitHub Actions"
-    if "${SELF%/*}/gha-run" bins "$KEY" "$C" "$G" "${ex[@]}" -- "${ts[@]}" 2>> "$OUT/rp-run.log" && [ -z "$(unbuilt)" ]; then
+    if "${SELF%/*}/gha-run" bins "$KEY" "$C" "${ex[@]}" -- "${ts[@]}" 2>> "$OUT/rp-run.log" && [ -z "$(unbuilt)" ]; then
         say "built on GitHub Actions"
         rm -rf "$CACHE.lock"
     else
@@ -2873,8 +2866,7 @@ setup() {
     if [ -n "$EARLY_BINS" ]; then jobs+=("$EARLY_BINS"); elif [ ${#BIN_ASSETS[@]} -gt 0 ]; then fetch_binaries & jobs+=($!); fi
     # The source. A run that compiles nothing needs only the paths COMMAND, the data builds and the
     # Python environment name (srcpaths: about 0.2 MB), sent from the Mac; a compile takes the
-    # workspace from GitHub at datacenter speed, and gam's crates and manifests at G into WS/gam (the
-    # path dependencies' ../gam), the Mac's archives if that fails.
+    # workspace from GitHub at datacenter speed, the Mac's archive if that fails.
     local members slim=""
     if (( ! NEED_RUST )) && [ ${#build[@]} -eq 0 ]; then
         slim=1
@@ -2892,16 +2884,12 @@ setup() {
         fi
     else
     members=$(printf "params-$C/%s " crates Cargo.toml Cargo.lock rust-toolchain.toml "${srcpaths[@]}")
-    gam_members=$(printf "gam-$G/%s " crates Cargo.toml Cargo.lock rust-toolchain.toml)
-    if on_pod "mkdir -p $WS/src $WS/gam $WS/bin $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/params/tar.gz/$C |
-            tar -xz --strip-components=1 -C $WS/src $members && curl -fsSL --retry 3 https://codeload.github.com/SauersML/gam/tar.gz/$G |
-            tar -xz --strip-components=1 -C $WS/gam $gam_members" < /dev/null 2> /dev/null; then
-        say "source ${C:0:12} and gam ${G:0:12} from GitHub"
+    if on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/params/tar.gz/$C |
+            tar -xz --strip-components=1 -C $WS/src $members" < /dev/null 2> /dev/null; then
+        say "source ${C:0:12} from GitHub"
     else
     git -C "$MAC_REPO" archive "$C" crates Cargo.toml Cargo.lock rust-toolchain.toml "${srcpaths[@]}" |
-        gzip -1 | on_pod "mkdir -p $WS/src $WS/gam $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
-    git -C "$MAC_GAM" archive "$G" crates Cargo.toml Cargo.lock rust-toolchain.toml |
-        gzip -1 | on_pod "gzip -dc | tar -x -C $WS/gam" || return 1
+        gzip -1 | on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
     fi
     fi
     # Inputs, data, models and rsync (for syncing outputs) arrive while the toolchain and builds do.

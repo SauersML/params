@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
 # Login-node half of mats-run (#2951): never builds or computes here, only fetches and submits.
 #
-#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN] [NEEDBIN] [POOL] [SWAP] [AFTEROK] [WANT_GAM]
+#   remote_submit.sh NAME CPUS MEM_GB MINUTES WANT_COMMIT GPUS QOS CMD_B64 [ARRAY] [CHAIN] [NEEDBIN] [POOL] [SWAP] [AFTEROK]
 #
-# Requires github.com/SauersML/params's origin/main to contain WANT_COMMIT and snapshots that exact
-# commit's source into ~/params-src/C (the job's working directory). The Rust workspace depends on
-# gam's crates by path (../gam/crates/...): the clones are ~/params-cluster/params and, beside it,
-# ~/params-cluster/gam (github.com/SauersML/gam, its root files and crates/ checked out), at
-# WANT_GAM (default gam's origin/main), which must be on gam's main. Binaries come from
-# ~/params-bin/B, a directory of binaries built from commit pairs whose Rust sources (crates/,
-# Cargo.*, rust-toolchain.toml, in both) equal C's and G's, when it holds (or a queued build will
-# install) every example the command names; only otherwise is a build submitted, and it compiles
-# just those examples. Builds run in the debug QOS as one Slurm singleton (mpd-build, shared with
-# gam's builds); they neither wait behind day-long jobs nor hold CPUs while queued.
+# Requires github.com/SauersML/params's origin/main (clone ~/params-cluster/params) to contain
+# WANT_COMMIT and snapshots that exact commit's source into ~/params-src/C (the job's working
+# directory). Binaries come from ~/params-bin/B, a directory of binaries built from commits whose
+# Rust sources (crates/, Cargo.*, rust-toolchain.toml) equal C's, when it holds (or a queued build
+# will install) every example the command names; only otherwise is a build submitted, and it
+# compiles just those examples. Builds run in the debug QOS as one Slurm singleton (mpd-build,
+# shared with gam's builds); they neither wait behind day-long jobs nor hold CPUs while queued.
 # MATS_CHAIN's segments are copies of the run job, each after the last (afterany). Prints the job id.
 set -Eeuo pipefail
-NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-} CHAIN=${10:-1} NEEDBIN=${11:-auto} POOL=${12:-0} SWAP=${13:-} AFTEROK=${14:-} WANT_GAM=${15:-}
+NAME=$1 CPUS=$2 MEM=$3 MINUTES=$4 WANT=$5 GPUS=$6 QOS=$7 CMD_B64=$8 ARRAY=${9:-} CHAIN=${10:-1} NEEDBIN=${11:-auto} POOL=${12:-0} SWAP=${13:-} AFTEROK=${14:-}
 if [ -n "$AFTEROK" ]; then
     [[ $AFTEROK =~ ^[0-9]+(:[0-9]+)*$ && $POOL = 0 && -z $SWAP ]] || { echo "mats-run: invalid afterok job IDs or unsupported pool/swap dependency" >&2; exit 2; }
 fi
 HERE_WORKER=$HOME/mpd-data/cluster/_build/pool_worker.sh
-REPO=$HOME/params-cluster/params GAMREPO=$HOME/params-cluster/gam BIN=$HOME/params-bin SRC=$HOME/params-src CL=$HOME/mpd-data/cluster
+REPO=$HOME/params-cluster/params BIN=$HOME/params-bin SRC=$HOME/params-src CL=$HOME/mpd-data/cluster
 OUT=$CL/$NAME
 mkdir -p "$OUT" "$BIN" "$SRC" "$CL/_build"
 
@@ -28,20 +25,17 @@ mkdir -p "$OUT" "$BIN" "$SRC" "$CL/_build"
 # place would change the lines a running build executes next.
 cat > "$CL/_build/params-build.sh.$$" <<'BUILD'
 #!/usr/bin/env bash
-# Build job: params-build.sh COMMIT GAM_COMMIT DEST [EXAMPLE...] compiles the named examples (every
-# mpd example when none is named) at COMMIT, with gam's crates at GAM_COMMIT beside it, and installs
-# them in ~/params-bin/DEST/, a directory whose binaries all come from commit pairs with these Rust
-# sources. Linking one example with thin LTO takes about a minute; linking all 59 took 15, and every
-# queued run waited on it.
+# Build job: params-build.sh COMMIT DEST [EXAMPLE...] compiles the named examples (every mpd
+# example when none is named) at COMMIT and installs them in ~/params-bin/DEST/, a directory whose
+# binaries all come from commits with COMMIT's Rust sources. Linking one example with thin LTO takes
+# about a minute; linking all 59 took 15, and every queued run waited on it.
 set -Eeuo pipefail
-C=$1 C12=${1:0:12} G=$2 D=${3:-${1:0:12}}
-shift $(( $# < 3 ? $# : 3 ))
-trap 'echo "${SLURM_JOB_ID:-?} $C $G" > "$HOME/params-bin/$C12.failed"' ERR
+C=$1 C12=${1:0:12} D=${2:-${1:0:12}}
+shift $(( $# < 2 ? $# : 2 ))
+trap 'echo "${SLURM_JOB_ID:-?} $C" > "$HOME/params-bin/$C12.failed"' ERR
 source "$HOME/.cargo/env"
 exec 9> "$HOME/params-cluster/.build.lock"
 flock 9
-git -C "$HOME/params-cluster/gam" fetch -q origin main
-git -C "$HOME/params-cluster/gam" checkout -q -f --detach "$G"
 cd "$HOME/params-cluster/params"
 git fetch -q origin main
 # -f: a build can leave Cargo.lock rewritten in this clone; it must never block the next checkout
@@ -64,11 +58,11 @@ if [ $# -gt 0 ]; then
     done
     packages=($(printf '%s\n' "${packages[@]}" | paste - - | sort -u | tr '\t' '\n'))
 fi
-echo "== $(date '+%F %T') building ${*:-every example} at $C (gam $G) with $CARGO_BUILD_JOBS jobs"
+echo "== $(date '+%F %T') building ${*:-every example} at $C with $CARGO_BUILD_JOBS jobs"
 time cargo build --release "${packages[@]}" "${which[@]}" 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading)' | tail -n 40
 dest=$HOME/params-bin/$D
 mkdir -p "$dest"
-[ -f "$dest/COMMIT" ] || echo "$C $G" > "$dest/COMMIT"
+[ -f "$dest/COMMIT" ] || echo "$C" > "$dest/COMMIT"
 # Each binary lands by rename, so a job never runs a half-copied file; same-source binaries replace
 # each other harmlessly.
 n=0
@@ -87,28 +81,16 @@ mv "$CL/_build/params-build.sh.$$" "$CL/_build/params-build.sh"
 
 exec 9> "$CL/_build/params-submit.lock"
 flock 9
-# The clones, made once: params whole; gam without blobs outside its root files and crates/.
+# The clone, made once.
 if [ ! -d "$REPO/.git" ]; then
+    mkdir -p "${REPO%/*}"
     git clone -q https://github.com/SauersML/params.git "$REPO.tmp" && mv "$REPO.tmp" "$REPO"
 fi
-if [ ! -d "$GAMREPO/.git" ]; then
-    git clone -q --filter=blob:none --no-checkout https://github.com/SauersML/gam.git "$GAMREPO.tmp"
-    git -C "$GAMREPO.tmp" sparse-checkout set crates
-    mv "$GAMREPO.tmp" "$GAMREPO"
-fi
 git -C "$REPO" fetch -q origin main
-git -C "$GAMREPO" fetch -q origin main
 if git -C "$REPO" cat-file -e "$WANT^{commit}" 2> /dev/null && git -C "$REPO" merge-base --is-ancestor "$WANT" origin/main; then
     C=$(git -C "$REPO" rev-parse "$WANT")
 else
     echo "mats-run: requested commit ${WANT:0:12} is not on origin/main; push it or set MATS_REF to a published commit. No job submitted." >&2
-    exit 2
-fi
-WANT_GAM=${WANT_GAM:-$(git -C "$GAMREPO" rev-parse origin/main)}
-if git -C "$GAMREPO" cat-file -e "$WANT_GAM^{commit}" 2> /dev/null && git -C "$GAMREPO" merge-base --is-ancestor "$WANT_GAM" origin/main; then
-    G=$(git -C "$GAMREPO" rev-parse "$WANT_GAM")
-else
-    echo "mats-run: gam commit ${WANT_GAM:0:12} is not on gam's origin/main; set MATS_GAM_REF to a published gam commit. No job submitted." >&2
     exit 2
 fi
 C12=${C:0:12}
@@ -119,11 +101,7 @@ if [ ! -d "$SRC/$C12" ]; then
 fi
 find "$SRC" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +
 
-# same_rust C1 G1 C2 G2: the two commit pairs build the same binaries.
-same_rust() {
-    git -C "$REPO" diff --quiet "$1" "$3" -- crates Cargo.toml Cargo.lock rust-toolchain.toml .cargo 2> /dev/null &&
-        git -C "$GAMREPO" diff --quiet "$2" "$4" -- crates Cargo.toml Cargo.lock rust-toolchain.toml .cargo 2> /dev/null
-}
+same_rust() { git -C "$REPO" diff --quiet "$1" "$2" -- crates Cargo.toml Cargo.lock rust-toolchain.toml .cargo 2> /dev/null; }
 alive() { squeue -h -j "$1" -o %T 2> /dev/null | grep -qE 'PENDING|RUNNING|CONFIGURING|COMPLETING'; }
 # A command that names no binary (only @@BIN@@/src, say a Python script) neither builds nor waits
 # for a build; it gets a ready build of the same Rust sources on its PATH when there is one.
@@ -132,10 +110,10 @@ probe=${cmd//@@BIN@@\/src/}
 case $NEEDBIN in 1) need=1 ;; 0) need=0 ;; *) [[ $probe == *@@BIN@@* ]] && need=1 || need=0 ;; esac
 B="" dep=()
 [ $need = 1 ] && for f in $(ls -1t "$BIN"/*.failed 2> /dev/null); do
-    read -r fj fc fg < "$f" || true
-    if [ -n "${fg:-}" ] && same_rust "$fc" "$fg" "$C" "$G"; then
+    read -r fj fc < "$f" || true
+    if [ -n "${fc:-}" ] && same_rust "$fc" "$C"; then
         log=$(ls "$CL"/_build/build-"${fc:0:12}"-"$fj".log 2> /dev/null || true)
-        echo "mats-run: $C12 with gam ${G:0:12} does not build (same Rust sources as ${fc:0:12} with gam ${fg:0:12}, build job $fj); not submitting." >&2
+        echo "mats-run: $C12 does not build (same Rust sources as ${fc:0:12}, build job $fj); not submitting." >&2
         [ -n "$log" ] && grep -E -A6 '^error' "$log" | head -n 30 >&2
         echo "mats-run: pin a commit that builds with MATS_REF=<commit>" >&2
         exit 3
@@ -147,7 +125,7 @@ has() { local d=$1 n; [ -z "$names" ] && { [ -f "$d/READY" ]; return; }; for n i
 same=""
 for d in $(ls -1dt "$BIN"/*/ 2> /dev/null); do
     d=${d%/}
-    [ -f "$d/COMMIT" ] && read -r dc dg < "$d/COMMIT" && [ -n "${dg:-}" ] && same_rust "$dc" "$dg" "$C" "$G" || continue
+    [ -f "$d/COMMIT" ] && same_rust "$(cat "$d/COMMIT")" "$C" || continue
     [ -n "$same" ] || same=$(basename "$d")
     has "$d" && { B=$(basename "$d"); break; }
 done
@@ -158,8 +136,8 @@ if [ $need = 0 ]; then
 elif [ -z "$B" ]; then
     # A queued build of the same sources that installs every example this command names.
     for f in $(ls -1t "$BIN"/*.buildjob 2> /dev/null); do
-        read -r bj bc bg bd bn < "$f" || true
-        [ -n "${bd:-}" ] && alive "$bj" && same_rust "$bc" "$bg" "$C" "$G" || continue
+        read -r bj bc bd bn < "$f" || true
+        [ -n "${bc:-}" ] && alive "$bj" && same_rust "$bc" "$C" || continue
         bd=${bd:-${bc:0:12}} bn=${bn:-}
         if [ -z "$bn" ] || { [ -n "$names" ] && [ -z "$(comm -23 <(tr ' ' '\n' <<< "$names" | sed '/^$/d') <(tr ' ' '\n' <<< "$bn" | sed '/^$/d' | sort -u))" ]; }; then
             B=$bd
@@ -170,9 +148,9 @@ elif [ -z "$B" ]; then
         B=${same:-$C12}
         # 32 compile and link jobs; the measured peak of 8-job builds was 3.7 GB.
         bj=$(sbatch --parsable -J mpd-build --dependency=singleton -p compute --qos=debug -c 32 --mem=24G \
-            -t 00:30:00 -o "$CL/_build/build-$C12-%j.log" "$CL/_build/params-build.sh" "$C" "$G" "$B" $names)
-        echo "$bj $C $G $B $names" > "$BIN/$C12-$bj.buildjob"
-        echo "mats-run: building ${names:-every example} at $C12 (gam ${G:0:12}) into $B in job $bj (log ~/mpd-data/cluster/_build/build-$C12-$bj.log)" >&2
+            -t 00:30:00 -o "$CL/_build/build-$C12-%j.log" "$CL/_build/params-build.sh" "$C" "$B" $names)
+        echo "$bj $C $B $names" > "$BIN/$C12-$bj.buildjob"
+        echo "mats-run: building ${names:-every example} at $C12 into $B in job $bj (log ~/mpd-data/cluster/_build/build-$C12-$bj.log)" >&2
     else
         echo "mats-run: waiting on build job $bj into $B (same Rust sources as $C12)" >&2
     fi
@@ -230,7 +208,7 @@ cd $SRC/$C12
 # skips at once, and one stopped by its time limit (SIGTERM, 143) resumes from its checkpoint.
 mark=$OUT/.chain-$stamp-\${SLURM_ARRAY_TASK_ID:-0}
 if [ $chained = 1 ] && [ -e "\$mark" ]; then echo "== chain segment \$SLURM_JOB_ID skipped: \$(cat "\$mark")"; exit 0; fi
-echo "== \$(date '+%F %T') job \$SLURM_JOB_ID\${SLURM_ARRAY_TASK_ID:+ (task \$SLURM_ARRAY_TASK_ID of \$SLURM_ARRAY_JOB_ID)} on \$(hostname): source $C (gam $G), binaries $B, cpus \$SLURM_CPUS_PER_TASK, mem ${MEM}G, gpus ${GPUS}"
+echo "== \$(date '+%F %T') job \$SLURM_JOB_ID\${SLURM_ARRAY_TASK_ID:+ (task \$SLURM_ARRAY_TASK_ID of \$SLURM_ARRAY_JOB_ID)} on \$(hostname): source $C, binaries $B, cpus \$SLURM_CPUS_PER_TASK, mem ${MEM}G, gpus ${GPUS}"
 echo "== $cmd"
 start=\$(date +%s)
 # mats-swap JOBID -- COMMAND writes the next command to \$next and stops this one (its process

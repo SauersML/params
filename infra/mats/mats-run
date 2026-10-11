@@ -5,9 +5,8 @@
 #
 # Submits COMMAND as Slurm job NAME (CPUS cores, RAYON_NUM_THREADS=CPUS, MEM_GB, HOURS wall, may be
 # fractional) built from the published commit of ~/params's HEAD (unpushed commits are rejected),
-# with gam's crates (the workspace's path dependencies, ../gam/crates/...) at gam's origin/main (or
-# MATS_GAM_REF=<a commit on gam's main>), and prints the job id. Binaries are built once per pair of
-# Rust sources in their own build job; the run waits on it.
+# and prints the job id. Binaries are built once per commit in their own build job; the run waits
+# on it.
 #
 # Paths are translated: /Users/user/mpd-data/... -> the cluster's ~/mpd-data/...;
 # /Users/user/params/target/release/examples/X, target/release/examples/X and
@@ -91,7 +90,7 @@ if [ "$QOS" = debug ] && [ -n "$ARRAY" ] && [[ $ARRAY != *%* ]]; then
 fi
 # The node has 458 GB for 252 CPUs, so memory runs out before CPUs do.
 
-MAC_DATA=/Users/user/mpd-data MAC_REPO=/Users/user/params MAC_GAM=/Users/user/gam CL_DATA=/mnt/nw/home/s.sauers/mpd-data
+MAC_DATA=/Users/user/mpd-data MAC_REPO=/Users/user/params CL_DATA=/mnt/nw/home/s.sauers/mpd-data
 
 # `cargo run [...] --example X [...] -- ARGS` -> X ARGS
 if [ "$1" = cargo ]; then
@@ -173,11 +172,8 @@ COPYFILE_DISABLE=1 tar --no-mac-metadata -C "$here" -cf - pool_worker.sh cluster
 # (MATS_MEM_EXACT=1 keeps MEM_GB); `auto` asks exactly that, or 2 GB per CPU (at least 8) unmeasured.
 [ -n "${MATS_MEM_EXACT:-}" ] && (( MEM > 0 )) && MEM="=$MEM"
 want=$(git -C "$MAC_REPO" rev-parse "${MATS_REF:-HEAD}")
-# gam's commit: MATS_GAM_REF, or gam's main now (the cluster side checks it is on gam's main).
-git -C "$MAC_GAM" fetch -q origin main
-want_gam=$(git -C "$MAC_GAM" rev-parse "${MATS_GAM_REF:-origin/main}^{commit}")
 b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
 rc=0
-ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_BUILD:-auto}" "${MATS_POOL:-0}" "'${MATS_SWAP:-}'" "'$AFTEROK'" "$want_gam" < "$here/remote_submit.sh" || rc=$?
+ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_BUILD:-auto}" "${MATS_POOL:-0}" "'${MATS_SWAP:-}'" "'$AFTEROK'" < "$here/remote_submit.sh" || rc=$?
 (( rc == 0 )) || echo "mats-run: nothing submitted (cluster side exited $rc)" >&2
 exit $rc

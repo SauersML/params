@@ -6,7 +6,7 @@ name: gha-run
 #  - binaries: the named examples and test binaries built at a commit on ubuntu-22.04, the release
 #    the GPU pods' image runs (runpod/pytorch:...-ubuntu22.04, same glibc). The CUDA code compiles at
 #    run time through NVRTC, so the build needs no CUDA toolkit and no GPU. With a KEY (rp-run's hash
-#    of the commit's Rust sources and gam's) they are published as assets KEY.NAME of the prerelease
+#    of the commit's Rust sources) they are published as assets KEY.NAME of the prerelease
 #    rp-run-bin, which pods download without credentials.
 #  - command: COMMAND run at the commit after the build, with MPD_BIN the directory of the built
 #    binaries and OUT a directory uploaded as artifact NAME (7 days), which the Mac fetches with
@@ -16,11 +16,6 @@ name: gha-run
 #    as that end. A command that exits 75 (unfinished; its state is saved under $OUT), or that the
 #    link's time stops, has OUT uploaded and the next link dispatched, which downloads OUT before
 #    running COMMAND again, so a command that resumes from its own state under $OUT continues.
-#
-# The Rust workspace depends on gam's crates by path (../gam/crates/...): this repository is checked
-# out at params/ and github.com/SauersML/gam at gam/ beside it, at GAM_SHA (default: gam's main when
-# the job starts; a chain's links all use the first link's), with only gam's root files and crates/.
-# Commands run in params/.
 #
 # The repository is public, and so are this workflow's logs and artifacts: commands and inputs come
 # only from public sources (the commit, public datasets, our own public exports), never keys,
@@ -36,9 +31,6 @@ on:
       sha:
         description: "Commit to build and run at (40 hex)"
         required: true
-      gam_sha:
-        description: "Commit of SauersML/gam checked out beside it for the path dependencies (empty: gam's main)"
-        default: ""
       key:
         description: "rp-run's source hash: publish the binaries as rp-run-bin assets KEY.NAME (empty: no release)"
         default: ""
@@ -81,9 +73,6 @@ jobs:
   run:
     runs-on: ${{ inputs.os != '' && inputs.os || 'ubuntu-22.04' }}
     timeout-minutes: 355
-    defaults:
-      run:
-        working-directory: params
     env:
       NAME: ${{ inputs.name }}
       SHA: ${{ inputs.sha }}
@@ -96,37 +85,13 @@ jobs:
       LINK_MINUTES: ${{ inputs.link_minutes }}
     steps:
       - name: Start
-        working-directory: .
         run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha }}
-          path: params
           # The command gets no credentials: the token stays with the publish step.
           persist-credentials: false
-
-      - name: gam's commit
-        id: gam
-        env:
-          GAM_SHA: ${{ inputs.gam_sha }}
-        run: |
-          set -euo pipefail
-          sha=${GAM_SHA:-$(git ls-remote https://github.com/SauersML/gam.git refs/heads/main | cut -f1)}
-          [[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "no gam commit ($sha)"; exit 1; }
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "gam at $sha"
-
-      # gam's root files (Cargo.toml, Cargo.lock, rust-toolchain.toml) and crates/, blobs fetched only
-      # for those paths.
-      - uses: actions/checkout@v4
-        with:
-          repository: SauersML/gam
-          ref: ${{ steps.gam.outputs.sha }}
-          path: gam
-          persist-credentials: false
-          filter: blob:none
-          sparse-checkout: crates
 
       # On macOS (fastcheck's release builds) sccache keeps every unchanged crate's objects across
       # commits, so a build recompiles only what the commit changed; the command sets RUSTC_WRAPPER.
@@ -134,15 +99,12 @@ jobs:
         if: runner.os == 'macOS'
 
       - name: Toolchain (rust-toolchain.toml's)
-        run: |
-          f=rust-toolchain.toml
-          [ -f "$f" ] || f=../gam/rust-toolchain.toml
-          rustup toolchain install "$(sed -nE 's/^channel = "([^"]+)"/\1/p' "$f")" --profile minimal
+        run: rustup toolchain install "$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)" --profile minimal
 
       # One entry per lock file, toolchain and kind of build (release binaries; fastcheck's check,
       # clippy and test builds): the dependencies, which cost the build most, come from it; the
-      # workspace's own crates and gam's rebuild from the commits. An entry per commit would evict
-      # the other workflows' caches from the repository's 10 GB.
+      # workspace's own crates rebuild from the commit. An entry per commit would evict the other
+      # workflows' caches from the repository's 10 GB.
       # Saved (below) only when missing, and for check, clippy and test only by a run named
       # cache-KIND that builds the whole workspace's dependencies, so a narrow check never stores a
       # partial cache that every later check would then rebuild around.
@@ -152,8 +114,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            params/target
-          key: gha-run-${{ hashFiles('params/Cargo.lock', 'params/rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
+            target
+          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
 
       - name: Build
         run: |
@@ -194,7 +156,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.name }}
-          path: params/out
+          path: out
           run-id: ${{ inputs.resume_run }}
           github-token: ${{ github.token }}
 
@@ -268,14 +230,14 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            params/target
-          key: gha-run-${{ hashFiles('params/Cargo.lock', 'params/rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
+            target
+          key: gha-run-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}${{ inputs.cache != '' && format('-{0}', inputs.cache) || '' }}${{ runner.os == 'macOS' && '-macos' || '' }}
 
       - uses: actions/upload-artifact@v4
         if: always() && inputs.command != ''
         with:
           name: ${{ inputs.name }}
-          path: params/out/
+          path: out/
           retention-days: 7
           if-no-files-found: ignore
 
@@ -283,10 +245,9 @@ jobs:
         if: steps.command.outputs.more == '1'
         env:
           GH_TOKEN: ${{ github.token }}
-          GAM_SHA: ${{ steps.gam.outputs.sha }}
         run: |
           (( LINK < LINKS )) || { echo "the command is unfinished after $LINKS links"; exit 1; }
-          gh workflow run gha-run.yml -R "$GITHUB_REPOSITORY" --ref main -f name="$NAME" -f sha="$SHA" -f gam_sha="$GAM_SHA" -f key="" \
+          gh workflow run gha-run.yml -R "$GITHUB_REPOSITORY" --ref main -f name="$NAME" -f sha="$SHA" -f key="" \
             -f examples="$EXAMPLES" -f tests="$TESTS" -f command="$COMMAND" -f links="$LINKS" \
             -f link="$(( LINK + 1 ))" -f link_minutes="$LINK_MINUTES" -f resume_run="$GITHUB_RUN_ID"
           echo "dispatched link $(( LINK + 1 ))"

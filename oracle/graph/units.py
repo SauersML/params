@@ -4,10 +4,11 @@ An answer is plain text (nothing in it is executed): an English explanation, the
 text, the units through which a change of that position's token reaches the prediction:
 
   EXPLANATION: the model copies the digits after the earlier "327" ...
-  POSITION 322: L0.fc@322 L0.down@322 L2.v@322[h3,h4] L2.o@332[h3,h4]
+  POSITION 322: L0 322:fc,down | L2 322:v[h3,h4] -> 332:o[h3,h4]
 
-A unit is a weight matrix of a layer at a position (L<layer>.<q|k|v|o|fc|down>@<position>), for attention optionally
-some of its heads ([h<i>,...]: the head's slice of the activation, carry.UnitSpace). An answer is measured by the
+A unit is a weight matrix (q, k, v, o, fc, down) of a layer at a position, for attention optionally some of its heads
+([h<i>,...]: the head's slice of the activation, carry.UnitSpace). A line is the path layer by layer: in each layer the
+positions holding its units, joined by "->" from the positions an attention layer reads to the one it writes at. An answer is measured by the
 carry test (carry.py): for each of the text's K positions where a changed token moves the prediction most
 (Native.sensitivity), the prompts changing that token to the model's 3 likeliest others there (carry.alternatives),
 every unit outside the answer's line for that position held at its value on the text and the line's units computing
@@ -39,13 +40,17 @@ sys.path.insert(0, str(HERE))
 
 KINDS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj", "fc": "c_fc", "down": "down_proj"}
 CODES = {v: k for k, v in KINDS.items()}
-UNIT = re.compile(r"L(\d+)\.(q|k|v|o|fc|down)@(\d+)(?:\[([h\d,\s]+)\])?")
 LINE = re.compile(r"^\s*POSITION\s+(\d+)\s*:(.*)$", re.M)
+LAYER = re.compile(r"L(\d+)\s+(.*)")
+GROUP = re.compile(r"(\d+)\s*:\s*((?:(?:q|k|v|o|fc|down)(?:\[[h\d,\s]+\])?\s*,?\s*)+)")
+KIND = re.compile(r"(q|k|v|o|fc|down)(?:\[([h\d,\s]+)\])?")
 
 
 def parse(text: str) -> tuple[str, dict]:
     """(the explanation, {position: [unit, ...]}) of an answer; a unit is (matrix name, position) or (matrix name,
-    head, position). Lines that name no unit are kept empty; text that is not a unit is ignored."""
+    head, position). A line is layer segments separated by "|": "L<layer> <position>:<kinds>", where "->" joins the
+    positions an attention layer reads from to the one it writes at. Lines that name no unit are kept empty; text that
+    is not a unit is ignored."""
     import native
 
     m = re.search(r"EXPLANATION:\s*(.*?)(?=^\s*POSITION\s|\Z)", text, re.S | re.M)
@@ -53,32 +58,50 @@ def parse(text: str) -> tuple[str, dict]:
     circuits = {}
     for line in LINE.finditer(text):
         units = []
-        for u in UNIT.finditer(line[2]):
-            name = native.site_name(int(u[1]), KINDS[u[2]])
-            heads = [int(h) for h in re.findall(r"\d+", u[4])] if u[4] else None
-            units += [(name, h, int(u[3])) for h in heads] if heads and ".attn." in name else [(name, int(u[3]))]
+        for segment in line[2].split("|"):
+            seg = LAYER.match(segment.strip())
+            if not seg:
+                continue
+            layer = int(seg[1])
+            for group in seg[2].split("->"):
+                g = GROUP.search(group)
+                if not g:
+                    continue
+                pos = int(g[1])
+                for k in KIND.finditer(g[2]):
+                    name = native.site_name(layer, KINDS[k[1]])
+                    heads = [int(h) for h in re.findall(r"\d+", k[2])] if k[2] else None
+                    units += [(name, h, pos) for h in heads] if heads and ".attn." in name else [(name, pos)]
         circuits.setdefault(int(line[1]), []).extend(units)
     return explanation, circuits
 
 
 def render(explanation: str, circuits: dict) -> str:
-    """The answer text of circuits {position: [unit, ...]} (heads of one matrix and position written together)."""
+    """The answer text of circuits {position: [unit, ...]}: per line, one segment per layer, its units grouped by position
+    (earliest first, joined by "->": an attention layer reads the earlier positions and writes at the later), the kinds
+    of one position in the order q, k, v, o, fc, down, a matrix's heads written together."""
+    order = list(KINDS)
     out = [f"EXPLANATION: {explanation}".rstrip()]
     for p in circuits:  # in the order given (importance: a cut-off answer loses the least important lines)
-        whole, heads = [], {}
+        by = {}  # layer -> position -> kind -> heads (None: the whole matrix)
         for u in circuits[p]:
+            name, pos = u[0], u[-1]
+            kinds = by.setdefault(int(name.split(".")[1]), {}).setdefault(pos, {})
+            kind = CODES[name.split(".")[-1]]
             if len(u) == 3:
-                heads.setdefault((u[0], u[2]), []).append(u[1])
+                if kinds.get(kind, []) is not None:
+                    kinds.setdefault(kind, []).append(u[1])
             else:
-                whole.append(u)
-        words = []
-        for name, pos in sorted(whole, key=lambda u: (int(u[0].split(".")[1]), u[1], u[0])):
-            layer = int(name.split(".")[1])
-            words.append(f"L{layer}.{CODES[name.split('.')[-1]]}@{pos}")
-        for (name, pos), hs in sorted(heads.items(), key=lambda kv: (int(kv[0][0].split(".")[1]), kv[0][1], kv[0][0])):
-            layer = int(name.split(".")[1])
-            words.append(f"L{layer}.{CODES[name.split('.')[-1]]}@{pos}[{','.join(f'h{h}' for h in sorted(hs))}]")
-        out.append(f"POSITION {p}: " + " ".join(words))
+                kinds[kind] = None
+        segments = []
+        for layer in sorted(by):
+            groups = []
+            for pos in sorted(by[layer]):
+                ks = by[layer][pos]
+                words = [k if ks[k] is None else f"{k}[{','.join(f'h{h}' for h in sorted(set(ks[k])))}]" for k in order if k in ks]
+                groups.append(f"{pos}:" + ",".join(words))
+            segments.append(f"L{layer} " + " -> ".join(groups))
+        out.append(f"POSITION {p}: " + " | ".join(segments))
     return "\n".join(out)
 
 
@@ -241,11 +264,12 @@ def targets(explain_jsonl: Path, out_dir: Path, fraction: int = 90) -> int:
 
 
 ASK = ("How does {model} compute its prediction of the next token after the target of this text? For each listed input "
-       "position, name the units through which a change of the token there reaches the prediction: a unit is a weight "
-       "matrix of a layer at a position, L<layer>.<q|k|v|o|fc|down>@<position>, an attention matrix optionally by its "
-       "heads, L<layer>.<q|k|v|o>@<position>[h<i>,...]. Answer with a line EXPLANATION: (in plain English, what the model "
-       "does), then one line POSITION <p>: <units> per listed position. Fewer units are better, as long as they carry "
-       "the change.")
+       "position, give the path by which a change of the token there reaches the prediction, as units: a unit is a weight "
+       "matrix (q, k, v, o, fc, down) of a layer at a position, an attention matrix optionally by its heads (v[h3,h4]). "
+       "Write a path layer by layer, separated by \" | \": L<layer> <position>:<kinds>, and for an attention layer that "
+       "reads one position and writes at a later one, L<layer> <position>:<kinds> -> <later position>:<kinds>. Answer "
+       "with a line EXPLANATION: (in plain English, what the model does), then one line POSITION <p>: <path> per listed "
+       "position. Fewer units are better, as long as they carry the change.")
 
 
 def numbered(strings: list[str]) -> str:

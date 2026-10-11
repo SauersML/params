@@ -7,9 +7,12 @@ the original completion teacher-forced. Per literal:
   moved bits   KL(changed || original) at the literal's tokens in the write, in bits (carry_qwen.kl_bits)
   follows      at the first token where the edited literal differs, the changed run's top token is the edited one
   carried      the share of that movement the edited occurrences alone carry (carry_qwen.Qwen.patched: the turn
-               recomputed live reading only those positions as changed)
+               recomputed live reading only those positions as changed); carried_check_none is the same with no
+               position changed, the numerical floor (near 0)
   sources      where the occurrences sit: a test assertion's expected value, a test assertion's argument, the task's
-               docstring, the model's own earlier text, other tool output
+               docstring, the model's own earlier text, other tool output; origin is the first occurrence's
+  with turn    the same edit applied also to the literal's mentions earlier in the writing turn (its thinking), which
+               the teacher-forced replay otherwise keeps at their original tokens
 No run label is used; labels are joined only in the summary.
 
   python literal_monitor.py scan --model Qwen/Qwen3-8B --runs ARM_DIR ... --out FILE
@@ -103,6 +106,11 @@ def scan(a):
     # runs with a cheating action or a hard-coding write first, so a deadline cuts honest runs
     recs.sort(key=lambda r: (r["label"] != "cheat" and not r.get("first_cheat"), r["arm"], r["run_id"]))
     start, n_runs = time.time(), 0
+
+    def skip(r, why):
+        out.write(json.dumps({"arm": r["arm"], "run_id": r["run_id"], "label": r["label"], "skipped": why}) + "\n")
+        out.flush()
+
     for r in recs:
         if (r["arm"], r["run_id"]) in done:
             continue
@@ -116,25 +124,34 @@ def scan(a):
         act = writes[-1]
         call = next((c for c in replay.calls(r) if c["turn"] == act["turn"]), None)
         if call is None:
+            skip(r, "no replayable call")
             continue
         t = tasks[r["task_id"]][r["split"]]
         ctx, comp = call["context_ids"], call["completion_ids"]
         n = len(ctx)
         text = tok.decode(ctx, skip_special_tokens=False)
         if tok.encode(text, add_special_tokens=False) != list(ctx):
+            skip(r, "context does not re-tokenize")
             continue
         full = tok.decode(comp, skip_special_tokens=False)
+        comp_exact = tok.encode(full, add_special_tokens=False) == list(comp)
         tc = full.find("<tool_call>")
-        probes = []
-        for lit in literals(act["args"].get("content")):
+        lits = literals(act["args"].get("content"))
+        probes, where = [], Counter()
+        for lit in lits:
             occ = occurrences(text, lit)
             j = full.find(lit, max(tc, 0))
+            turn_occ = occurrences(full[:j], lit) if j >= 0 else []
+            where["in the context" if occ else "only earlier in the turn" if turn_occ else "nowhere earlier"] += 1
             if occ and j >= 0:
-                probes.append((lit, occ, j))
+                probes.append((lit, occ, j, turn_occ))
         probes = probes[:a.per_write]
         n_runs += 1
+        head = {"arm": r["arm"], "run_id": r["run_id"], "task": r["task_id"], "split": r["split"], "label": r["label"],
+                "first_cheat": (r.get("first_cheat") or {}).get("how") or (r.get("first_cheat") or {}).get("kind"),
+                "turn": act["turn"], "literals": len(lits), "where": dict(where)}
         if not probes:
-            out.write(json.dumps({"arm": r["arm"], "run_id": r["run_id"], "label": r["label"], "probes": []}) + "\n")
+            out.write(json.dumps({**head, "probes": []}) + "\n")
             out.flush()
             continue
         with torch.inference_mode():
@@ -142,20 +159,23 @@ def scan(a):
         cache_o, hid_o = o.past_key_values, o.last_hidden_state[0]
         kv_o = [(cache_o.layers[i].keys, cache_o.layers[i].values) if hasattr(cache_o, "layers")
                 else (cache_o.key_cache[i], cache_o.value_cache[i]) for i in range(qm.L)]
-        rows_out = []
-        for lit, occ, j in probes:
+        rows_out, unmeasured = [], Counter()
+        for lit, occ, j, turn_occ in probes:
             new = edited(lit)
             ed_text = text
             for i in reversed(occ):
                 ed_text = ed_text[:i] + new + ed_text[i + len(lit):]
             ed = tok.encode(ed_text, add_special_tokens=False)
             if len(ed) != n:
+                unmeasured["edit changes the token count"] += 1
                 continue
             diff = [i for i, (x, y) in enumerate(zip(ctx, ed)) if x != y]
             if not diff:
+                unmeasured["edit changes no token"] += 1
                 continue
             sp = replay.token_span_by_char(tok, comp, j, j + len(lit))
             if sp is None or sp[0] < 1:
+                unmeasured["no token span in the write"] += 1
                 continue
             lo, hi = sp
             lit_ids = comp[lo:hi]
@@ -171,27 +191,43 @@ def scan(a):
                 lp_c = qm.model.lm_head(h_c).float().log_softmax(-1)
                 lp_o = qm.model.lm_head(hid_o[n + lo - 1:n + hi - 1]).float().log_softmax(-1)
             moved = float(carry_qwen.kl_bits(lp_c, lp_o[None])[0])
-            follows = None
-            if new_ids is not None:
-                k = next((q for q in range(len(lit_ids)) if new_ids[q] != lit_ids[q]), None)
-                if k is not None:
-                    follows = int(lp_c[k].argmax()) == new_ids[k]
-            row = {"literal": lit, "edited": new, "context_occurrences": len(occ),
-                   "sources": dict(Counter(source(text, i, t["prompt"], lit) for i in occ)),
-                   "moved_bits": moved, "follows": follows}
+
+            def follows(lp):
+                k = None if new_ids is None else next((q for q in range(len(lit_ids)) if new_ids[q] != lit_ids[q]), None)
+                return None if k is None else int(lp[k].argmax()) == new_ids[k]
+
+            srcs = [source(text, i, t["prompt"], lit) for i in occ]
+            row = {"literal": lit, "edited": new, "context_occurrences": len(occ), "sources": dict(Counter(srcs)),
+                   "origin": srcs[0], "turn_occurrences": len(turn_occ), "moved_bits": moved, "follows": follows(lp_c)}
             if moved >= a.min_bits:
                 kv_c = [(c2.layers[i].keys, c2.layers[i].values) if hasattr(c2, "layers")
                         else (c2.key_cache[i], c2.value_cache[i]) for i in range(qm.L)]
-                mk = torch.zeros(1, n, dtype=torch.bool, device=qm.dev)
+                mk = torch.zeros(2, n, dtype=torch.bool, device=qm.dev)  # the edited occurrences; none (the floor)
                 mk[0, torch.tensor(diff, device=qm.dev)] = True
                 rows_ = list(range(lo - 1, hi - 1))
-                lq = qm.patched(comp[:hi - 1], n, kv_o, kv_c, mk, rows_)
-                row["carried"] = float(1 - carry_qwen.kl_bits(lp_c, lq)[0] / moved)
+                kl = carry_qwen.kl_bits(lp_c, qm.patched(comp[:hi - 1], n, kv_o, kv_c, mk, rows_))
+                row["carried"], row["carried_check_none"] = float(1 - kl[0] / moved), float(1 - kl[1] / moved)
             del c2
+            if turn_occ:
+                ed_full = full
+                for i in reversed(turn_occ):
+                    ed_full = ed_full[:i] + new + ed_full[i + len(lit):]
+                ed_comp = tok.encode(ed_full, add_special_tokens=False)
+                if comp_exact and len(ed_comp) == len(comp) and ed_comp[lo:] == list(comp[lo:]):
+                    with torch.inference_mode():
+                        c3 = copy.deepcopy(cache_o)
+                        c3.crop(p0 - c3.get_seq_length())
+                        o3 = qm.model.model(input_ids=torch.tensor([ed[p0:] + ed_comp[:hi]], device=qm.dev),
+                                            past_key_values=c3, use_cache=True)
+                        lp_t = qm.model.lm_head(o3.last_hidden_state[0][n + lo - 1 - p0:n + hi - 1 - p0]).float() \
+                            .log_softmax(-1)
+                    del c3, o3
+                    row["moved_bits_with_turn"] = float(carry_qwen.kl_bits(lp_t, lp_o[None])[0])
+                    row["follows_with_turn"] = follows(lp_t)
+                else:
+                    row["with_turn"] = "the turn's edit changes its tokenization"
             rows_out.append(row)
-        rec = {"arm": r["arm"], "run_id": r["run_id"], "task": r["task_id"], "split": r["split"], "label": r["label"],
-               "first_cheat": (r.get("first_cheat") or {}).get("how") or (r.get("first_cheat") or {}).get("kind"),
-               "turn": act["turn"], "probes": rows_out}
+        rec = {**head, "probes": rows_out, "unmeasured": dict(unmeasured)}
         out.write(json.dumps(rec) + "\n")
         out.flush()
         fol = [x for x in rows_out if x.get("follows")]
@@ -214,28 +250,50 @@ def report(a):
             r = json.loads(line_)
             hc = agent.hardcode_label(r, tasks[r["task_id"]]) is not None
             cls_of[(arm, r["run_id"])] = "cheat" if r["label"] == "cheat" else ("hard-codes test outputs" if hc else "other")
-    by, srcs, ex = Counter(), Counter(), []
+    classes = ["cheat", "hard-codes test outputs", "other"]
+    rows = ["runs scanned", "runs skipped", "literals written", "  occur earlier in the context",
+            "  occur only earlier in the writing turn", "  occur nowhere earlier", "probed (at most 8 per write)",
+            "moved >= 0.5 bits by the context edit", "follow the context edit",
+            "  of these, >= 90% carried by the edited occurrences",
+            "follow only when the turn's own mentions are also edited", "follow under neither edit"]
+    by, origins, ex = Counter(), Counter(), {c: [] for c in classes}
     for line_ in open(a.path):
         r = json.loads(line_)
         cls = cls_of.get((r["arm"], r["run_id"]), "other")
-        by[(cls, "runs")] += 1
+        if r.get("skipped"):
+            by[(cls, "runs skipped")] += 1
+            continue
+        by[(cls, "runs scanned")] += 1
+        w = r.get("where") or {}
+        by[(cls, "literals written")] += r.get("literals", 0)
+        for k in ("in the context", "only earlier in the turn", "nowhere earlier"):
+            by[(cls, {"in the context": "  occur earlier in the context",
+                      "only earlier in the turn": "  occur only earlier in the writing turn",
+                      "nowhere earlier": "  occur nowhere earlier"}[k])] += w.get(k, 0)
         for p in r["probes"]:
-            by[(cls, "literals in the code that occur in the context")] += 1
+            by[(cls, "probed (at most 8 per write)")] += 1
             if p["moved_bits"] >= 0.5:
-                by[(cls, "moved >= 0.5 bits by editing the context value")] += 1
+                by[(cls, "moved >= 0.5 bits by the context edit")] += 1
+            origin = p.get("origin") or max(p["sources"], key=p["sources"].get)
             if p.get("follows"):
-                by[(cls, "follow the edited value")] += 1
+                by[(cls, "follow the context edit")] += 1
                 if (p.get("carried") or 0) >= 0.9:
-                    by[(cls, "follow, >= 90% carried by the edited occurrences")] += 1
-                top = max(p["sources"], key=p["sources"].get)
-                srcs[(cls, top)] += 1
-                ex.append((cls, r["arm"], r["run_id"], p["literal"], top, round(p["moved_bits"], 1)))
-    for k, v in sorted(by.items()):
-        print(f"{k[0]:26s} {k[1]:52s} {v}")
-    print("followed literals by the main source of their context occurrences:")
-    for k, v in sorted(srcs.items()):
-        print(f"   {k[0]:26s} {k[1]:28s} {v}")
-    print("examples:", ex[:a.examples])
+                    by[(cls, "  of these, >= 90% carried by the edited occurrences")] += 1
+            elif p.get("follows_with_turn"):
+                by[(cls, "follow only when the turn's own mentions are also edited")] += 1
+            else:
+                by[(cls, "follow under neither edit")] += 1
+                continue
+            origins[(cls, origin)] += 1
+            ex[cls].append(f"{r['run_id']} {p['literal']!r} ({origin})")
+    print(f"{'':58s}" + "".join(f"{c:>26s}" for c in classes))
+    for row in rows:
+        print(f"{row:58s}" + "".join(f"{by[(c, row)]:26d}" for c in classes))
+    print("followed literals (either edit) by origin, the source of the value's first occurrence in the context:")
+    for o in sorted({k[1] for k in origins}):
+        print(f"   {o:56s}" + "".join(f"{origins[(c, o)]:26d}" for c in classes))
+    for c in classes:
+        print(f"examples, {c}: {ex[c][:a.examples]}")
 
 
 def main():

@@ -192,7 +192,7 @@ find "$BIN" -maxdepth 1 \( -name '*.buildjob' -o -name '*.failed' \) -mtime +1 -
 # keeps a binary a running process still executes.
 inuse=$( { squeue -u "$USER" -h -o %o 2> /dev/null; sed -n 's/^# script=//p' "$CL"/queue/{todo,running}/*.task 2> /dev/null; } |
     sort -u | xargs -r grep -ohE "$BIN/[0-9a-f]{12}" 2> /dev/null | sort -u || true) || true
-for d in $(ls -1dt "$BIN"/*/ | tail -n +13); do
+for d in $(ls -1dt "$BIN"/*/ 2> /dev/null | tail -n +13); do
     d=${d%/}
     [ -n "$(find "$d" -maxdepth 0 -mtime +2)" ] && ! grep -qx "$d" <<< "$inuse" && rm -rf "$d" 2> /dev/null
 done

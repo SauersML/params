@@ -992,3 +992,23 @@ def test_restricted_subcomponent_products_against_native(case, size):
     loss = carry.kl(study.lp[0], study.mixed(prompts[0], space.coefficients(a))).sum()
     grad, = torch.autograd.grad(loss, a)
     assert torch.isfinite(grad).all()
+
+
+@pytest.mark.parametrize("edit", ["mlp:L1", "heads:L2:3", "edge:L2:all"])
+def test_restricted_subcomponents_preserve_model_edits(case, edit):
+    nat, ids, targets, prompts, *_ = case
+    fc, down = native.site_name(0, "c_fc"), native.site_name(1, "down_proj")
+    with carry.model_edit(nat, edit):
+        selected = {(fc, 322): range(nat.C[fc]), (down, 332): range(100)}
+        space = carry.UnitSpace(nat, len(ids), [322, 332], candidates=selected)
+        active = torch.ones(space.size, dtype=torch.bool, device=nat.dev)
+        study = carry.Carry(nat, ids, targets, prompts, space=space, chunk_size=2)
+        dense = carry.Carry(nat, ids, targets, prompts, chunk_size=1)
+        actual = study.measure([active, ~active])
+        expected = dense.measure([space.expand(active), set()])
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-5)
+        if edit == "mlp:L1":
+            a = active.float().requires_grad_(True)
+            loss = carry.kl(study.lp[0], study.mixed(prompts[0], space.coefficients(a))).sum()
+            grad, = torch.autograd.grad(loss, a)
+            assert not grad[space.offsets[down]].any()

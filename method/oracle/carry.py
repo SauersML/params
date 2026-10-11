@@ -799,7 +799,12 @@ def _prepare_unit_prompts(study):
     study.batch_lp = torch.cat(study.lp)[:, None]
     study.windows, study.indices = {}, {}
     study.sparse = {}
+    study.zero_writes = set()
     if study.space.granularity == "subcomponent":
+        # Sparse copies of U do not have the tensor identities intercepted by
+        # _ModelEdit. Preserve a removed MLP write explicitly in this path.
+        study.zero_writes = {native.site_name(int(part.split(":")[1][1:]), "down_proj")
+                             for part in (study.edit or "").split(";") if part.startswith("mlp:")}
         with torch.no_grad():
             for n, cs in study.space.columns.items():
                 if cs.numel() < study.nat.C[n]:
@@ -859,7 +864,7 @@ def _run_units(study, coefficients, embeddings, *, compact=False, activation_gra
 
     def projection(n, inp):
         st = tg.site(n)
-        if n in study.sparse and study.space.columns[n].numel() == 0:
+        if n in study.zero_writes or (n in study.sparse and study.space.columns[n].numel() == 0):
             return study.writes[n][:, s:].expand(B, -1, -1)
         selected = selected_rows(inp, offsets)
         a = coefficients[n] if compact else selected_rows(coefficients[n], study.space.positions)

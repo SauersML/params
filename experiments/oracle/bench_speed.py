@@ -7,8 +7,9 @@
 carry    MatrixCarry.measure: unit sets per second, batches of 64 random sets (each unit on with probability 1/2) over
          the 3 changed prompts of the text's most sensitive position, units at that position and the target; matrix
          granularity, and subcomponent granularity (every subcomponent at the two positions) where the code has it
-score    units.score_many seconds per question: K=8 positions, 8 answers (the copy and all baselines, 4 copies each)
-events   units.events seconds per text, K=8
+score    units.score_many seconds per question: K=8 positions, 8 answers (the copy and all baselines, 4 copies each);
+         seconds_first with the model object's per-text caches dropped (a text's first call), seconds with them kept
+events   units.events seconds per text, K=8; seconds_first and seconds as for score
 sample   the explainer's vLLM sampling (units_sft.py sample's settings): generated tokens per second
 Texts are the split's first n, fixed; every timing is after one untimed warm-up on the same inputs (MPS compiles a
 graph per shape) and ends with a device synchronize. Each result carries a fingerprint of what it computed (sums of
@@ -67,14 +68,21 @@ class Utilization:
         return {"mean_percent": sum(s) / len(s), "min_percent": min(s), "max_percent": max(s), "samples": len(s)} if s else None
 
 
-def timed(fn, sync):
-    """(seconds, result) of fn() after one untimed warm-up call."""
+def timed(fn, sync, reset=None):
+    """(seconds, result) of fn() after one untimed warm-up call; reset() (untimed) runs before the timed call."""
     fn()
     sync()
+    if reset is not None:
+        reset()
     t0 = time.perf_counter()
     out = fn()
     sync()
     return time.perf_counter() - t0, out
+
+
+def forget(nat):
+    """Drop what a model object keeps between calls for a text (units.sensitive's orders), for a first-call time."""
+    nat.__dict__.pop("_sensitive_orders", None)
 
 
 def bench_carry(nat, texts, granularity, batch=64, reps=4):
@@ -120,9 +128,11 @@ def bench_score(nat, texts, k=8):
         positions = units.sensitive(nat, ids, targets, k)
         answers = [units.baseline("copy", positions, targets), units.baseline("all", positions, targets)] * 4
         util = Utilization(nat.dev)
-        seconds, out = timed(lambda: units.score_many(nat, task, answers, k), lambda: carry.synchronize(nat.dev))
-        rows.append({"task": path.stem, "T": len(ids), "answers": len(answers), "seconds": seconds, "gpu": util.finish(),
-                     "fingerprint": sum(r["uncarried"] + r["rest_carried"] for r in out)})
+        sync = lambda: carry.synchronize(nat.dev)
+        first, _ = timed(lambda: units.score_many(nat, task, answers, k), sync, lambda: forget(nat))
+        seconds, out = timed(lambda: units.score_many(nat, task, answers, k), sync)
+        rows.append({"task": path.stem, "T": len(ids), "answers": len(answers), "seconds_first": first, "seconds": seconds,
+                     "gpu": util.finish(), "fingerprint": sum(r["uncarried"] + r["rest_carried"] for r in out)})
     return rows
 
 
@@ -134,8 +144,10 @@ def bench_events(nat, texts, k=8):
     for path in texts:
         task = json.loads(path.read_text())
         util = Utilization(nat.dev)
-        seconds, out = timed(lambda: units.events(nat, task, k), lambda: carry.synchronize(nat.dev))
-        rows.append({"task": path.stem, "events": len(out), "seconds": seconds, "gpu": util.finish(),
+        sync = lambda: carry.synchronize(nat.dev)
+        first, _ = timed(lambda: units.events(nat, task, k), sync, lambda: forget(nat))
+        seconds, out = timed(lambda: units.events(nat, task, k), sync)
+        rows.append({"task": path.stem, "events": len(out), "seconds_first": first, "seconds": seconds, "gpu": util.finish(),
                      "fingerprint": sum(e.get("bits", 0.0) + e.get("kl", 0.0) for e in out)})
     return rows
 

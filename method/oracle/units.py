@@ -139,18 +139,30 @@ def _active(space, units):
     return torch.tensor(on, dtype=torch.bool, device=space.nat.dev)
 
 
+_ORDERS_MAX = 4096  # texts whose sensitive() order a model object keeps
+
+
 def sensitive(nat, ids: list[int], targets: list[int], k: int) -> list[int]:
     """The k positions (not the targets) whose changed token moves the prediction most, most first: carry.explain's
-    choice (Native.sensitivity under the text's seed)."""
+    choice (Native.sensitivity under the text's seed). The order is a function of the model, its edit, the text and
+    the targets, so a model object computes it once per text (score_many, events and the RL server ask again)."""
     import torch
 
     import native
 
     if max(targets) < 1:
         return []
-    with torch.no_grad():
-        moved, _ = nat.sensitivity(ids, targets, torch.Generator(device="cpu").manual_seed(native.task_seed(str(ids[:8]))))
-    return [p for p in (moved.argsort(descending=True, stable=True) + 1).tolist() if p not in targets][:k]
+    orders = nat.__dict__.setdefault("_sensitive_orders", {})
+    key = (getattr(nat, "_graph_edit", None), tuple(ids), tuple(targets))
+    order = orders.get(key)
+    if order is None:
+        with torch.no_grad():
+            moved, _ = nat.sensitivity(ids, targets, torch.Generator(device="cpu").manual_seed(native.task_seed(str(ids[:8]))))
+        order = (moved.argsort(descending=True, stable=True) + 1).tolist()
+        if len(orders) >= _ORDERS_MAX:
+            orders.clear()
+        orders[key] = order
+    return [p for p in order if p not in targets][:k]
 
 
 def score(nat, task: dict, text: str, k: int = 8, edit=None, ranks=(0, 1, 2)) -> dict:

@@ -40,6 +40,8 @@ DIR holds one answer per text, <task>.json (Circuit's JSON) or <task>.py (a trac
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import math
 import sys
@@ -48,6 +50,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.overrides import TorchFunctionMode
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -61,7 +64,8 @@ SHARE_FLOOR = 0.01  # F2's positions: those moving the prediction by at least th
 RANDOM_PAIRS = 32  # F3's unstated pairs per answer
 MAX_EDGES = 64  # F3's stated edges per answer (a uniform draw when an answer states more)
 UNIT_LIMIT = 20_000  # F2 computes at most this many subcomponents through carry's unit path; larger sets take masks
-CHUNK = 16  # answers (F1, F2) or cuts (F3) per batch
+CHUNK = 16  # answers per batch (F1)
+CUT_CHUNK = 32  # cuts per batch (F3)
 
 
 # ---- answers
@@ -118,8 +122,35 @@ def to_json(g: native.Graph, explanation: str = "") -> dict:
 
 
 def _pairs(g: native.Graph) -> list[tuple]:
-    """A graph's stated edges, (writer, reader), reader None for the prediction."""
-    return [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
+    """A graph's stated edges, (writer, reader), reader None for the prediction, in a fixed order (a graph's nodes are
+    a set, whose order changes from process to process)."""
+    return sorted([(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out],
+                  key=lambda e: (e[0], e[1] or ("", -1, -1)))
+
+
+class _Held(TorchFunctionMode):
+    """Every remainder product (W - V U applied to its input) at its value in the model on the text (values: carry's
+    capture), at the positions a run computes: the last L when Native.run reuses an earlier run's states."""
+
+    def __init__(self, nat: native.Native, values: dict):
+        self.by_id = {id(nat.target.site(n).delta_T): values[n] for n in nat.names}
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func.__name__ in ("matmul", "__matmul__") and len(args) > 1 and id(args[1]) in self.by_id:
+            v = self.by_id[id(args[1])]
+            return v[:, v.shape[1] - args[0].shape[1]:].expand(args[0].shape[0], -1, -1)
+        return func(*args, **kwargs)
+
+
+def _from(ids: list[int], p: int) -> tuple | None:
+    """A base for Native.run(reuse=) on ids itself whose states hold up to position p: ids with a token that differs
+    at p (the run recomputes from there; None from position 0)."""
+    if p <= 0:
+        return None
+    base = list(ids)
+    base[p] = -1
+    return base
 
 
 # ---- one text
@@ -133,7 +164,7 @@ class Text:
         nat = ge.nat
         t0 = time.perf_counter()
         self.ids, self.targets, self.T, self.seed, self.task = list(ids), list(targets), len(ids), seed, task
-        self.rec = nat._model_record(self.ids)[0]
+        self.rec, self.states = nat._model_record(self.ids)
         self.ref = nat.reference([self.ids], self.targets)
         cap = carry._Remainders(nat)
         with torch.no_grad(), cap:
@@ -151,6 +182,8 @@ class Text:
                 p = j + 1
                 self.f2.append((p, carry.alternatives(nat, self.ids, p, ranks=ge.ranks)))
         self.ci = nat.importance(self.ids) if nat.has_importance else None
+        self.cut_cache: dict = {}  # (writer, reader) -> F3's KL of its cut: answers on a text share edges
+        self._flow = None
         self.seconds = time.perf_counter() - t0
 
 
@@ -162,10 +195,11 @@ class GoalEval:
     English reader's bits ("E1") and question answering ("E2"); unset, their columns are None."""
 
     def __init__(self, nat: native.Native | None = None, *, changes: int = native.CHANGES, ranks=HELD_OUT_RANKS,
-                 share_floor: float = SHARE_FLOOR, random_pairs: int = RANDOM_PAIRS, max_edges: int = MAX_EDGES, chunk: int = CHUNK):
+                 share_floor: float = SHARE_FLOOR, random_pairs: int = RANDOM_PAIRS, max_edges: int = MAX_EDGES, chunk: int = CHUNK,
+                 cut_chunk: int = CUT_CHUNK):
         self.nat = nat or native.Native()
         self.changes, self.ranks, self.share_floor = changes, tuple(ranks), share_floor
-        self.random_pairs, self.max_edges, self.chunk = random_pairs, max_edges, chunk
+        self.random_pairs, self.max_edges, self.chunk, self.cut_chunk = random_pairs, max_edges, chunk, cut_chunk
         self.hooks: dict = {"E1": None, "E2": None}
 
     def text(self, ids: list[int], targets: list[int], seed: int | None = None, task: dict | None = None) -> Text:
@@ -176,7 +210,8 @@ class GoalEval:
     @torch.no_grad()
     def sufficiency(self, tx: Text, graphs: list[native.Graph]) -> dict:
         """Per graph, F1 in bits: on the text and averaged over the changed prompts, remainders held at their values
-        on the text ("held") and ablated ("ablated")."""
+        on the text ("held") and ablated ("ablated"). A changed prompt reuses the graph's own run on the text before
+        its changed position (Native.run's reuse)."""
         nat = self.nat
         zu, zr = nat._zero()
         one_r = nat._one()[1]
@@ -184,17 +219,16 @@ class GoalEval:
         weights = [getattr(x, "weight", 1.0) for x in tx.prompts]
         for s0 in range(0, len(graphs), self.chunk):
             part = graphs[s0:s0 + self.chunk]
+            B = len(part)
             plan = nat._plan(part, tx.T)
-            for i, (x, logp) in enumerate([(tx.ids, tx.ref)] + list(zip(tx.prompts, tx.prompt_refs))):
-                with carry._Remainders(nat, tx.rem):
-                    held = carry.kl(logp, nat.run(x, tx.targets, plan, zu, one_r))
-                ablated = carry.kl(logp, nat.run(x, tx.targets, plan, zu, zr))
-                if i == 0:
-                    out["text_held"][s0:s0 + len(part)] = held
-                    out["text_ablated"][s0:s0 + len(part)] = ablated
-                else:
-                    out["changed_held"][s0:s0 + len(part)] += weights[i - 1] * held / len(tx.prompts)
-                    out["changed_ablated"][s0:s0 + len(part)] += weights[i - 1] * ablated / len(tx.prompts)
+            for key, ur, mode in (("held", one_r, _Held(nat, tx.rem)), ("ablated", zr, None)):
+                states = {}
+                with mode or contextlib.nullcontext():
+                    out[f"text_{key}"][s0:s0 + B] = carry.kl(tx.ref, nat.run(tx.ids, tx.targets, plan, zu, ur, fill=states))
+                    for x, logp, w in zip(tx.prompts, tx.prompt_refs, weights):
+                        lq = nat.run(x, tx.targets, plan, zu, ur, reuse=(states, tx.ids) if states else None)
+                        out[f"changed_{key}"][s0:s0 + B] += w * carry.kl(logp, lq) / len(tx.prompts)
+                del states
             native.free(nat.dev)
         return {k: v.tolist() for k, v in out.items()}
 
@@ -220,7 +254,7 @@ class GoalEval:
             live = [self._live(g, p, hi) for g in graphs]
             small = [b for b, nodes in enumerate(live) if len(nodes) <= UNIT_LIMIT]
             big = [b for b in range(len(graphs)) if b not in small]
-            union = list(dict.fromkeys(nd for b in small for nd in live[b]))
+            union = sorted({nd for b in small for nd in live[b]})
             kls = [None] * len(graphs)
             if union:
                 cand = {}
@@ -258,90 +292,139 @@ class GoalEval:
 
     # ---- F3
 
-    def _ones_u(self) -> dict:
-        nat = self.nat
-        return nat._const("goal_ones_u", lambda: {n: torch.ones(1, 1, nat.C[n], device=nat.dev) for n in nat.names})
-
-    def _held_all(self, T: int) -> dict:
-        nat = self.nat
-        return nat._const(("goal_held_all", T), lambda: {n: torch.ones(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
-
-    def _none_plan(self, T: int, B: int) -> dict:
-        """Native's plan of B copies of the whole model with no node held at 1: every subcomponent at its u."""
-        nat = self.nat
-        none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
-        return {**nat._full_plan(T, B), "G": none, "none": True}
-
     @torch.no_grad()
     def cuts(self, tx: Text, pairs: list[tuple]) -> list[float]:
         """The KL in bits of the model on the text from the model with one connection cut, per (writer, reader) pair
-        (reader None: the prediction). A reader's new activation is computed with the writer's output removed from
-        its input alone: every other activation and every remainder held at its value in the model, the writer at
-        mask 0; the model then runs with that one activation replaced (path patching of the connection). Into the
-        prediction: the final residual stream without the writer's output."""
+        (reader None: the prediction). The reader's new activation is its input in the model without the writer's
+        output alone (every other output and every remainder as in the model; _cut_activations); the model then runs
+        with that one activation replaced (path patching of the connection). Into the prediction: the final residual
+        stream without the writer's output."""
+        nat, T = self.nat, tx.T
+        todo = [e for e in dict.fromkeys(pairs) if e not in tx.cut_cache]
+        if todo:
+            for e, k in zip(todo, self._cuts(tx, todo)):
+                tx.cut_cache[e] = k
+        return [tx.cut_cache[e] for e in pairs]
+
+    def _cuts(self, tx: Text, pairs: list[tuple]) -> list[float]:
+        """cuts() of distinct pairs. The runs with a reader's new activation are batched by the reader's position and
+        reuse the model's states before the batch's first reader (nothing earlier changes); a cut into the prediction
+        needs no run (flow's final residual stream)."""
         nat, T = self.nat, tx.T
         res = [0.0] * len(pairs)
-        inner = [j for j, (_, r) in enumerate(pairs) if r is not None]
-        final = [j for j, (_, r) in enumerate(pairs) if r is None]
+        inner = sorted((j for j, (_, r) in enumerate(pairs) if r is not None), key=lambda j: (pairs[j][1][1], pairs[j][0][1]))
+        final = sorted((j for j, (_, r) in enumerate(pairs) if r is None), key=lambda j: pairs[j][0][1])
         one_u, one_r = nat._one()
 
-        def removed(js):  # u with each row's writer at 0
-            u = dict(self._ones_u())
-            by = {}
-            for b, j in enumerate(js):
-                w = pairs[j][0]
-                by.setdefault(w[0], []).append((b, w[1], w[2]))
-            for n, lst in by.items():
-                m = torch.ones(len(js), T, nat.C[n], device=nat.dev)
-                bi, ti, ci = nat._ints([[e[0] for e in lst], [e[1] for e in lst], [e[2] for e in lst]])
-                m[bi, ti, ci] = 0.0
-                u[n] = m
-            return u
-
-        for s0 in range(0, len(inner), self.chunk):
-            js = inner[s0:s0 + self.chunk]
+        new = self._cut_activations(tx, [pairs[j] for j in inner]) if inner else None
+        at = {j: i for i, j in enumerate(inner)}
+        for s0 in range(0, len(inner), self.cut_chunk):
+            js = inner[s0:s0 + self.cut_chunk]
             B = len(js)
             by = {}
             for b, j in enumerate(js):
                 r = pairs[j][1]
-                by.setdefault(r[0], []).append((b, r[1], r[2]))
-            held = self._held_all(T)
-            patch = {n: (held[n], tx.rec[n]) for n in nat.names}
-            idx = {}
-            for n, lst in by.items():
-                m = torch.ones(B, T, nat.C[n], dtype=torch.bool, device=nat.dev)
-                idx[n] = tuple(nat._ints([[e[0] for e in lst], [e[1] for e in lst], [e[2] for e in lst]]))
-                m[idx[n]] = False
-                patch[n] = (m, tx.rec[n])
-            rec = {}
-            with carry._Remainders(nat, tx.rem):
-                nat.run(tx.ids, tx.targets, self._none_plan(T, B), removed(js), one_r, patch=patch, record=rec, keep=set(by))
+                by.setdefault(r[0], []).append((b, r[1], r[2], at[j]))
             patch2 = {}
-            for n in by:
+            for n, lst in by.items():
+                bi, ti, ci, ki = nat._ints([[e[k] for e in lst] for k in range(4)])
                 m = torch.zeros(B, T, nat.C[n], dtype=torch.bool, device=nat.dev)
-                m[idx[n]] = True
+                m[bi, ti, ci] = True
                 v = tx.rec[n].expand(B, -1, -1).clone()
-                v[idx[n]] = rec[n][idx[n]]
+                v[bi, ti, ci] = new[ki]
                 patch2[n] = (m, v)
-            lq = nat.run(tx.ids, tx.targets, nat._full_plan(T, B), one_u, one_r, patch=patch2)
+            base = _from(tx.ids, min(pairs[j][1][1] for j in js))
+            lq = nat.run(tx.ids, tx.targets, nat._full_plan(T, B), one_u, one_r, patch=patch2,
+                         reuse=None if base is None else (nat._model_states(tx.ids, B), base))
             for b, k in enumerate(carry.kl(tx.ref, lq).tolist()):
                 res[js[b]] = k
             native.free(nat.dev)
-        for s0 in range(0, len(final), self.chunk):
-            js = final[s0:s0 + self.chunk]
-            held = self._held_all(T)
-            patch = {n: (held[n], tx.rec[n]) for n in nat.names}
-            with carry._Remainders(nat, tx.rem):
-                lq = nat.run(tx.ids, tx.targets, self._none_plan(T, len(js)), removed(js), one_r, patch=patch)
+        if final:
+            import vpd_model
+
+            tg, fl = nat.target, self.flow(tx)
+            t, c = nat._ints([[pairs[j][0][1] for j in final], [pairs[j][0][2] for j in final]])
+            x = fl["final"][tx.targets].expand(len(final), -1, -1).clone()
+            row = torch.tensor([tx.targets.index(p) for p in t.tolist()], device=nat.dev)
+            for wn in {pairs[j][0][0] for j in final}:
+                sel = torch.tensor([b for b, j in enumerate(final) if pairs[j][0][0] == wn], device=nat.dev)
+                x[sel, row[sel]] -= tx.rec[wn][0, t[sel], c[sel]][:, None] * tg.site(wn).U[c[sel]]
+            lq = torch.log_softmax((vpd_model.rms(x, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
             for b, k in enumerate(carry.kl(tx.ref, lq).tolist()):
-                res[js[b]] = k
+                res[final[b]] = k
+        nat._drop_states()
         return res
+
+    def flow(self, tx: Text) -> dict:
+        """The model's run on the text as the cuts read it, kept on tx: per layer the residual stream before each norm
+        ("attn", "mlp" [T, d]; "final", after the last layer), the attention pattern ("P" [H, T, T]) and output before its output matrix ("att"
+        [T, d]), and the MLP's pre-activation ("pre" [T, d_mlp]); built from Native's own record of the run (every
+        activation, the queries, keys and values, the remainders' values) the way Native.run adds them up."""
+        if tx._flow is None:
+            import vpd_model
+
+            nat, tg, T = self.nat, self.nat.target, tx.T
+            H, hd = tg.n_head, tg.hd
+            x = tg.wte[torch.tensor(tx.ids, device=nat.dev)][None]
+            causal = torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril()
+            fl = {"attn": [], "mlp": [], "P": [], "att": [], "pre": []}
+            for i in range(tg.n_layer):
+                nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
+                heads = lambda y: y.view(1, T, H, hd).transpose(1, 2)  # noqa: E731
+                q, k = tg._rope(heads(tx.states[("qv", i)]), T), tg._rope(heads(tx.states[("kv", i)]), T)
+                P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
+                fl["attn"].append(x[0])
+                fl["P"].append(P[0])
+                fl["att"].append((P @ heads(tx.states[("vs", i)])).transpose(1, 2).reshape(T, -1))
+                x = (x + tx.rec[nm["o_proj"]] @ tg.site(nm["o_proj"]).U) + tx.rem[nm["o_proj"]]
+                fl["mlp"].append(x[0])
+                fl["pre"].append((tx.rec[nm["c_fc"]] @ tg.site(nm["c_fc"]).U + tx.rem[nm["c_fc"]])[0])
+                x = (x + tx.rec[nm["down_proj"]] @ tg.site(nm["down_proj"]).U) + tx.rem[nm["down_proj"]]
+            fl["final"] = x[0]
+            tx._flow = fl
+        return tx._flow
+
+    def _cut_activations(self, tx: Text, pairs: list[tuple]) -> torch.Tensor:
+        """Each pair's reader activation with that one connection cut [len(pairs)]: a query, key, value or MLP input
+        reads the residual stream at its position without the writer's output (then its norm); an attention output
+        reads its layer's attention output without the writer value's share, the pattern's weight from the reader's
+        position to the writer's in each head times the value's output; an MLP output its MLP's pre-activation without
+        the input's output (then the nonlinearity)."""
+        import vpd_model
+
+        nat, tg = self.nat, self.nat.target
+        fl = self.flow(tx)
+        n = len(pairs)
+        writes = [None] * n
+        for wn in {w[0] for w, _ in pairs}:
+            js = [j for j, (w, _) in enumerate(pairs) if w[0] == wn]
+            t, c = nat._ints([[pairs[j][0][1] for j in js], [pairs[j][0][2] for j in js]])
+            wv = tx.rec[wn][0, t, c][:, None] * tg.site(wn).U[c]
+            for k, j in enumerate(js):
+                writes[j] = wv[k]
+        out = torch.empty(n, device=nat.dev)
+        for rn in {r[0] for _, r in pairs}:
+            js = [j for j, (_, r) in enumerate(pairs) if r[0] == rn]
+            layer, kind = native._name_layer_kind(rn)
+            t, c, tw = nat._ints([[pairs[j][1][1] for j in js], [pairs[j][1][2] for j in js], [pairs[j][0][1] for j in js]])
+            wv = torch.stack([writes[j] for j in js])
+            V = tg.site(rn).V
+            if kind in ("q_proj", "k_proj", "v_proj"):
+                inp = vpd_model.rms(fl["attn"][layer][t] - wv, tg.norms[2 * layer], tg.eps)
+            elif kind == "c_fc":
+                inp = vpd_model.rms(fl["mlp"][layer][t] - wv, tg.norms[2 * layer + 1], tg.eps)
+            elif kind == "o_proj":
+                inp = fl["att"][layer][t] - fl["P"][layer][:, t, tw].T.repeat_interleave(tg.hd, dim=1) * wv
+            else:
+                inp = vpd_model.gelu_tanh(fl["pre"][layer][t] - wv)
+            out[torch.tensor(js, device=nat.dev)] = (inp * V.T[c]).sum(-1)
+        return out
 
     def edges(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
         """Per graph, F3: the cuts of its stated edges (at most max_edges, a uniform draw beyond) and of random
         unstated pairs of its nodes that the model connects (random_pairs); a complete graph states every connection
-        among its nodes, so it has no unstated pair (its stated edges are drawn from them)."""
-        rng = np.random.default_rng(tx.seed)
+        among its nodes, so it has no unstated pair (its stated edges are drawn from them). The draws depend on the
+        text's seed and the answer's own edges, not on the other answers scored with it."""
         plans, flat = [], []
         for g in graphs:
             nodes = g.node_set()
@@ -356,6 +439,7 @@ class GoalEval:
                 par, out = native.all_edges(nodes, tx.targets)
                 have = set(stated)
                 unstated = [e for e in _pairs(native.Graph(nodes, par, out)) if e not in have]
+            rng = np.random.default_rng([tx.seed, int(hashlib.sha256(repr(stated).encode()).hexdigest()[:15], 16)])
             if len(stated) > self.max_edges:
                 stated = [stated[i] for i in sorted(rng.choice(len(stated), self.max_edges, replace=False))]
             if len(unstated) > self.random_pairs:

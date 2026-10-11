@@ -843,7 +843,8 @@ def _run_units(study, coefficients, embeddings, *, compact=False, activation_gra
     s = max(0, min(study.first_change, min(study.space.positions), T - -(-64 // B), min(study.targets)))
     if s not in study.mask_windows:
         study.mask_windows[s] = ~study.causal[s:]
-    x = embeddings[:, s:].expand(B, -1, -1).clone()
+    # A [P, B/P, T, d] view (one prompt's embedding per batch row, unexpanded) is copied only from s on.
+    x = (embeddings[:, :, s:].reshape(B, T-s, -1) if embeddings.dim() == 4 else embeddings[:, s:].expand(B, -1, -1)).clone()
     L, H, hd = T-s, tg.n_head, tg.hd
     offsets = [p-s for p in study.space.positions]
 
@@ -905,15 +906,29 @@ def _run_units(study, coefficients, embeddings, *, compact=False, activation_gra
         rotate = torch.cat([-w[..., half:], w[..., :half]], -1)
         return w * tg.cos[s:T] + rotate * tg.sin[s:T]
 
+    def prefixed(key, prefix, w, dim):
+        # The original prefix before s, then w. Without gradients the result is a buffer kept for the next call of
+        # the same shape: its prefix written once, only the window copied in (the same numbers as torch.cat).
+        if torch.is_grad_enabled():
+            return torch.cat([prefix, w], dim)
+        key = (*key, s, B)
+        buf = study.prefix_buffers.get(key)
+        if buf is None:
+            buf = study.prefix_buffers[key] = torch.cat([prefix, w], dim)
+        else:
+            buf.narrow(dim, s, L).copy_(w)
+        return buf
+
+    if not hasattr(study, "prefix_buffers"):
+        study.prefix_buffers = {}
     for i in range(tg.n_layer):
         names = {kind: native.site_name(i, kind) for kind in vpd_model.KINDS}
         z = norm(x, tg.norms[2*i])
         qkv = [projection(names[kind], z) + z @ tg.site(names[kind]).delta_T for kind in ("q_proj", "k_proj", "v_proj")]
         q, k, v = qkv
         q, k = rope_window(heads(q)), rope_window(heads(k))
-        k = torch.cat([study.rope_keys[i][:, :, :s].expand(B, -1, -1, -1), k], 2) if s else k
-        prefix_v = study.states[("vs", i)][:, :s].expand(B, -1, -1)
-        v = torch.cat([prefix_v, v], 1).view(B, T, H, hd).transpose(1, 2) if s else heads(v)
+        k = prefixed(("k", i), study.rope_keys[i][:, :, :s].expand(B, -1, -1, -1), k, 2) if s else k
+        v = prefixed(("v", i), study.states[("vs", i)][:, :s].expand(B, -1, -1), v, 1).view(B, T, H, hd).transpose(1, 2) if s else heads(v)
         if torch.is_grad_enabled() or study.edit:
             pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(study.mask_windows[s], float("-inf")).softmax(-1)
             attention = pattern @ v
@@ -961,7 +976,7 @@ def _measure_units(study, sets):
                           study.space.compact(a) if study.direct else study.space.coefficients(a))
             coeff = {n: v.repeat(len(study.prompts), 1, 1) for n, v in base_coeff.items()}
             if study.direct:
-                emb = study.embeddings[:, None].expand(-1, B, -1, -1).reshape(-1, study.T, study.embeddings.shape[-1])
+                emb = study.embeddings[:, None].expand(-1, B, -1, -1)
                 lq = _run_units(study, coeff, emb, compact=True)
                 scores = kl(study.batch_lp, lq.reshape(len(study.prompts), B, *lq.shape[1:])).mean(0)
                 out.append(scores[:valid])

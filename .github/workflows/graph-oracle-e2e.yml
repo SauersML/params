@@ -1,0 +1,81 @@
+name: Graph Oracle E2E
+
+# The graph oracle's checks (#2951) on a CPU runner: the Rust checker (crates/mpd/examples/
+# mpd_graph_2951.rs) builds, and the graph oracle's tests run: mech (the loader of graph answers),
+# edits, reader, part tokens, and the RL scorer and trainer on a tiny random policy.
+# The Rust workspace depends on gam's crates by path (../gam/crates/...): this repository is checked
+# out at params/ and github.com/SauersML/gam's main at gam/ beside it (root files and crates/ only).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "oracle/graph/**"
+      - "crates/mpd/src/graph*.rs"
+      - "crates/mpd/examples/mpd_graph_2951.rs"
+      - ".github/workflows/graph-oracle-e2e.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: graph-oracle-e2e-${{ github.ref }}
+  cancel-in-progress: false  # pushes come every few minutes: finish the running check, keep only the newest pending one
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: graph oracle checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: params
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: params
+
+      - name: Checkout gam's crates (path dependencies)
+        uses: actions/checkout@v4
+        with:
+          repository: SauersML/gam
+          path: gam
+          persist-credentials: false
+          filter: blob:none
+          sparse-checkout: crates
+
+      - name: Toolchain (rust-toolchain.toml's)
+        run: rustup toolchain install "$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml)" --profile minimal
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: params
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU torch and the test dependencies
+        run: |
+          python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -q 'pytest>=8' numpy safetensors transformers peft tokenizers huggingface_hub
+
+      - name: Build the checker
+        run: cargo build -p mpd --example mpd_graph_2951
+
+      - name: Run the graph oracle's tests
+        env:
+          MEM_LEASE_GIB: "1"
+          MPD_MEM_GIB: "1"
+        run: |
+          python -m pytest oracle/graph/test_mech.py oracle/graph/test_edits.py oracle/graph/test_reader.py \
+            oracle/graph/test_part_tokens.py oracle/graph/rl/test_scorer.py oracle/graph/rl/test_train.py \
+            -p no:cacheprovider -v --tb=short

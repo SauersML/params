@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Run a command on the MATS Slurm cluster (#2951).
+#
+#   mats-run NAME CPUS MEM_GB HOURS -- COMMAND...
+#
+# Submits COMMAND as Slurm job NAME (CPUS cores, RAYON_NUM_THREADS=CPUS, MEM_GB, HOURS wall, may be
+# fractional) built from the published commit of ~/params's HEAD (unpushed commits are rejected),
+# with gam's crates (the workspace's path dependencies, ../gam/crates/...) at gam's origin/main (or
+# MATS_GAM_REF=<a commit on gam's main>), and prints the job id. Binaries are built once per pair of
+# Rust sources in their own build job; the run waits on it.
+#
+# Paths are translated: /Users/user/mpd-data/... -> the cluster's ~/mpd-data/...;
+# /Users/user/params/target/release/examples/X, target/release/examples/X and
+# `cargo run ... --example X -- ARGS` -> that commit's X; /Users/user/params/... -> a snapshot of the
+# source at that commit (also the job's working directory); python/python3 or the Mac venv's
+# python -> the cluster venv (numpy, scipy). Every existing /Users/user/mpd-data input the command
+# names (outside mpd-data/cluster/) is rsynced up first, absolute symlinks as the files they name
+# (MATS_NO_UPLOAD=1 skips that). Write outputs under /Users/user/mpd-data/cluster/NAME/ so
+# `mats-pull NAME` brings them back; the Slurm log is ~/mpd-data/cluster/NAME/slurm-JOBID.log there.
+#
+# Throughput: MATS_QOS=debug runs in the debug QOS (priority far above normal, no per-user CPU cap,
+# at most 2 h, so HOURS is cut to 2). MATS_CHAIN=K submits K segments of the same job, each starting
+# after the last ends (--dependency=afterany), for commands that resume from their own checkpoint:
+# a segment cut off by its time limit resumes, a
+# task that ended (exit 0, or a real error) skips its later segments. Chain only work that resumes
+# exactly (an unfinished stage restarts, so not stages longer than 2 h) and
+# keep debug arrays small (default %8): debug outranks the team's normal-QOS priority order.
+# Example, 8 x 2 h in debug:
+#   MATS_QOS=debug MATS_CHAIN=8 mats-run NAME 16 12 2 -- ...
+#
+# Memory: RAM, not CPUs, fills the node. MEM_GB is cut to 2 x the measured peak + 4 of earlier runs
+# of the same command (program, script and bare arguments; ~/mpd-data/cluster/_peaks.tsv), and
+# MEM_GB=auto asks exactly that (2 GB per CPU, at least 8, when nothing is measured yet).
+# MATS_MEM_EXACT=1 keeps MEM_GB as given.
+#
+# Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH),
+# MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set), MATS_DRY=1
+# (print the translated command and the uploads, submit nothing), MATS_REF=<commit> (run that pushed
+# commit instead of HEAD; a commit that failed to build is refused with its compiler errors),
+# MATS_BUILD=0|1 (whether the job needs the commit's Rust binaries; by default only a command that
+# names one does, so a Python script under /Users/user/params starts without waiting for a build;
+# set 1 when a script calls a binary itself, through $MPD_BIN).
+# MATS_AFTEROK=ID:ID adds required successful jobs atomically at submission, alongside any build
+# dependency. Applies to ordinary jobs/arrays/chains, not pool tasks or in-place swaps.
+#
+# Pool: MATS_POOL=1 queues the job (each array index a task) for long-lived pool workers instead of
+# submitting it; a worker (normal QOS) packs tasks into its CPUs/GPUs/memory as job steps, takes the
+# next task when one ends, and exits after 10 idle minutes. One is started when none has room.
+# Prints the queue stamp. `mats-pool` lists, cancels and starts workers; `mats-swap JOBID -- CMD`
+# runs CMD in place of what a running mats-run job runs, inside its allocation.
+#
+# Job arrays: MATS_ARRAY=0-31%24 submits one task per index (at most 24 at once), each with CPUS,
+# MEM_GB and HOURS of its own; `{task}` anywhere in COMMAND becomes the task's index (say an eval row
+# or an output name like /Users/user/mpd-data/cluster/NAME/row{task}.json). Task logs are
+# slurm-JOBID_TASK.log; `mats-pull NAME` brings back every task's outputs.
+set -Eeuo pipefail
+here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+usage() { sed -n '2,/^set -Eeuo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 6 ] && [ "$5" = -- ] || usage
+NAME=$1 CPUS=$2 MEM=$3 HOURS=$4
+shift 5
+AFTEROK=${MATS_AFTEROK:-}
+if [ -n "$AFTEROK" ]; then
+    [[ $AFTEROK =~ ^[0-9]+(:[0-9]+)*$ ]] || { echo "mats-run: MATS_AFTEROK must be colon-separated job IDs" >&2; exit 2; }
+    [[ ${MATS_POOL:-0} = 0 && -z ${MATS_SWAP:-} ]] || { echo "mats-run: MATS_AFTEROK does not apply to pool tasks or swaps" >&2; exit 2; }
+fi
+[[ $NAME =~ ^[A-Za-z0-9._-]+$ ]] || { echo "mats-run: NAME must be [A-Za-z0-9._-]+" >&2; exit 2; }
+[[ $CPUS =~ ^[0-9]+$ ]] && (( CPUS >= 1 && CPUS <= 124 )) || { echo "mats-run: CPUS must be 1..124" >&2; exit 2; }
+# Room on the shared node is mats:~/budget.sh's: it holds what would make other users wait.
+if [ "$MEM" = auto ]; then
+    MEM=0
+else
+    [[ $MEM =~ ^[0-9]+$ ]] && (( MEM >= 1 && MEM <= 384 )) || { echo "mats-run: MEM_GB must be 1..384 or auto" >&2; exit 2; }
+fi
+MINUTES=$(awk -v h="$HOURS" 'BEGIN { m = int(h * 60 + 0.999); if (m < 1) m = 1; print m }')
+QOS=${MATS_QOS:-}
+(( MINUTES <= 1440 )) || { echo "mats-run: HOURS exceeds the 24-hour limit" >&2; exit 2; }
+CHAIN=${MATS_CHAIN:-1}
+[[ $CHAIN =~ ^[0-9]+$ ]] && (( CHAIN >= 1 && CHAIN <= 48 )) || { echo "mats-run: MATS_CHAIN must be 1..48" >&2; exit 2; }
+if [ "$QOS" = debug ] && (( MINUTES > 120 )); then
+    (( CHAIN == 1 )) && echo "mats-run: the debug QOS stops jobs at 2 h; HOURS=$HOURS runs 2 h (MATS_CHAIN=K resumes it K times)" >&2
+    MINUTES=120
+fi
+GPUS=${MATS_GPUS:-0}
+ARRAY=${MATS_ARRAY:-}
+[[ -z $ARRAY || $ARRAY =~ ^[0-9][0-9,:%-]*$ ]] || { echo "mats-run: MATS_ARRAY is a Slurm --array spec like 0-31%24" >&2; exit 2; }
+# Debug jobs outrank every normal job, so a debug array runs at most 8 tasks at once unless it says.
+if [ "$QOS" = debug ] && [ -n "$ARRAY" ] && [[ $ARRAY != *%* ]]; then
+    ARRAY=$ARRAY%8
+    echo "mats-run: debug array limited to 8 tasks at once ($ARRAY)" >&2
+fi
+# The node has 458 GB for 252 CPUs, so memory runs out before CPUs do.
+
+MAC_DATA=/Users/user/mpd-data MAC_REPO=/Users/user/params MAC_GAM=/Users/user/gam CL_DATA=/mnt/nw/home/s.sauers/mpd-data
+
+# `cargo run [...] --example X [...] -- ARGS` -> X ARGS
+if [ "$1" = cargo ]; then
+    ex="" rest=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --example) ex=$2; shift 2 ;;
+            --example=*) ex=${1#--example=}; shift ;;
+            --) shift; rest=("$@"); break ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$ex" ] || { echo "mats-run: only 'cargo run --example X' is translated" >&2; exit 2; }
+    set -- "$ex" "${rest[@]}"
+fi
+
+uploads=()
+words=()
+first=1
+for a in "$@"; do
+    if [ $first = 1 ]; then
+        case $a in
+            "$MAC_REPO"/target/*/examples/*|target/*/examples/*|./target/*/examples/*) a="@@BIN@@/${a##*/}" ;;
+            python|python3|"$MAC_DATA"/venv/bin/python*) a=python ;;
+            /*)
+                # A Mac binary (say a pinned copy in engine/bin/) runs as the
+                # same example built at the chosen commit.
+                if [ -f "$a" ] && file -b "$a" | grep -q Mach-O; then
+                    ex=${a##*/}
+                    [[ $ex =~ _2951$ ]] || ex=$(sed -E 's/_[0-9a-f]{4,}$//' <<< "$ex")_2951
+                    echo "mats-run: Mac binary ${a##*/} runs as the commit's $ex" >&2
+                    a="@@BIN@@/$ex"
+                fi ;;
+        esac
+        first=0
+    fi
+    while read -r p; do
+        [ -n "$p" ] || continue
+        case $p in "$MAC_DATA"/cluster/*|"$MAC_DATA"/venv*) continue ;; esac
+        [ -e "$p" ] && uploads+=("$p")
+    done < <(grep -oE "$MAC_DATA/[^ :,;=\"']+" <<< "$a" || true)
+    a=${a//$MAC_REPO\/target\/release\/examples\//@@BIN@@/}
+    a=${a//$MAC_REPO\//@@BIN@@/src/}
+    a=${a//$MAC_DATA/$CL_DATA}
+    words+=("$a")
+done
+envp=()
+[ -n "${RUST_LOG:-}" ] && envp+=("RUST_LOG=$RUST_LOG")
+[ -n "${MATS_ENV:-}" ] && read -r -a extra <<< "$MATS_ENV" && envp+=("${extra[@]}")
+cmd=$(printf '%q ' "${words[@]}")
+cmd=${cmd//\\\{task\\\}/'"${SLURM_ARRAY_TASK_ID}"'}
+cmd=${cmd//\\@\\@BIN\\@\\@/@@BIN@@}
+[ ${#envp[@]} -gt 0 ] && cmd="env $(printf '%q ' "${envp[@]}")$cmd"
+
+if [ -n "${MATS_DRY:-}" ]; then
+    echo "uploads: ${uploads[*]:-none}"
+    echo "command: $cmd"
+    exit 0
+fi
+if [ ${#uploads[@]} -gt 0 ] && [ -z "${MATS_NO_UPLOAD:-}" ]; then
+    rel=()
+    for p in "${uploads[@]}"; do rel+=("${p#"$MAC_DATA"/}"); done
+    kb=$(du -sk "${uploads[@]}" | awk '{ s += $1 } END { print s }')
+    if (( kb > 40 * 1024 * 1024 )) && [ -z "${MATS_UPLOAD_BIG:-}" ]; then
+        echo "mats-run: inputs are $((kb / 1024 / 1024)) GB; set MATS_UPLOAD_BIG=1 to send them" >&2; exit 2
+    fi
+    echo "mats-run: syncing $((kb / 1024)) MB of inputs: ${uploads[*]#"$MAC_DATA"/}" >&2
+    # macOS's openrsync ignores the `/./` marker, so --relative gets paths relative to mpd-data.
+    (cd "$MAC_DATA" && rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/)
+fi
+
+if [ "${MATS_POOL:-0}" = 1 ]; then
+    (( CHAIN == 1 )) || { echo "mats-run: MATS_POOL and MATS_CHAIN do not combine (a pool worker is long-lived)" >&2; exit 2; }
+fi
+# The cluster-side helpers the submission uses go up with it.
+COPYFILE_DISABLE=1 tar --no-mac-metadata -C "$here" -cf - pool_worker.sh cluster_peaks.sh |
+    ssh mats 'mkdir -p mpd-data/cluster/_build && tar -xf - -C mpd-data/cluster/_build 2> /dev/null'
+# The memory ask: MEM_GB, cut to 2 x the measured peak + 4 for this command when that is lower
+# (MATS_MEM_EXACT=1 keeps MEM_GB); `auto` asks exactly that, or 2 GB per CPU (at least 8) unmeasured.
+[ -n "${MATS_MEM_EXACT:-}" ] && (( MEM > 0 )) && MEM="=$MEM"
+want=$(git -C "$MAC_REPO" rev-parse "${MATS_REF:-HEAD}")
+# gam's commit: MATS_GAM_REF, or gam's main now (the cluster side checks it is on gam's main).
+git -C "$MAC_GAM" fetch -q origin main
+want_gam=$(git -C "$MAC_GAM" rev-parse "${MATS_GAM_REF:-origin/main}^{commit}")
+b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
+rc=0
+ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_BUILD:-auto}" "${MATS_POOL:-0}" "'${MATS_SWAP:-}'" "'$AFTEROK'" "$want_gam" < "$here/remote_submit.sh" || rc=$?
+(( rc == 0 )) || echo "mats-run: nothing submitted (cluster side exited $rc)" >&2
+exit $rc

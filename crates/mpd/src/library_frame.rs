@@ -7,7 +7,7 @@
 //! map `W` reading the space is exactly `Σ_i (W f_i) g_iᵀ`: slice `i` reads `g_iᵀ x`, `x`'s
 //! coefficient on atom `i`, and writes `W f_i`. All components on is `M`, whatever the frame.
 //!
-//! The toy gate (`bench/toys_2951`) found that neuron and head starts cannot recover features held
+//! The toy gate (`toys`) found that neuron and head starts cannot recover features held
 //! in superposition (TMS: 10 hidden units, 40 features; the fitter cannot split a component), so a
 //! map whose read is not followed by an elementwise nonlinearity on the sliced axis (attention's q,
 //! k and v reading the stream, o reading the heads' outputs, an MLP with the identity law) is cut

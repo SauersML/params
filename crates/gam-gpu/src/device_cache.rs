@@ -1,0 +1,240 @@
+//! Shared host-side scaffolding for every cudarc-backed module under
+//! `src/gpu/*` and `src/solver/gpu/*`.
+//!
+//! Before this module existed, each device backend (`bms_flex`,
+//! `survival_flex`, `polya_gamma`, ...) carried its own
+//! near-identical `OnceLock<Result<{module: Arc<CudaModule>}, GpuError>>` that
+//! NVRTC-compiled one source string the first time the backend dispatched and
+//! cached the resulting module for the process lifetime. That cache is now
+//! provided here so every cudarc backend points at the same implementation: no
+//! per-backend ad-hoc OnceLock, no transitional shim.
+
+#[cfg(target_os = "linux")]
+pub use linux::{KeyedPtxModuleCache, PtxModuleCache, compile_ptx_arch, nvrtc_compile_options};
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::super::gpu_error::GpuError;
+    use crate::driver::{CudarcLibrary, require_cudarc_library};
+    use crate::gpu_error::GpuResultExt;
+    use cudarc::driver::{CudaContext, CudaModule};
+    use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    /// Process-wide NVRTC module cache for a single PTX source string.
+    ///
+    /// The first call to [`PtxModuleCache::get_or_compile`] compiles the
+    /// source with the shared device-keyed NVRTC options (see
+    /// [`compile_ptx_arch`]), loads the module on the supplied context, and
+    /// stores the resulting `Arc<CudaModule>`. Subsequent calls return the
+    /// cached module without recompiling.
+    ///
+    /// The `label` is woven into the error message so the originating
+    /// backend stays identifiable in logs.
+    #[derive(Default)]
+    pub struct PtxModuleCache {
+        module: std::sync::OnceLock<Arc<CudaModule>>,
+    }
+
+    impl PtxModuleCache {
+        pub const fn new() -> Self {
+            Self {
+                module: std::sync::OnceLock::new(),
+            }
+        }
+
+        pub fn get(&self) -> Option<&Arc<CudaModule>> {
+            self.module.get()
+        }
+
+        /// Compile `source` and load it on `ctx` the first time; return
+        /// the cached `Arc<CudaModule>` on every subsequent call.
+        pub fn get_or_compile(
+            &self,
+            ctx: &Arc<CudaContext>,
+            label: &'static str,
+            source: &str,
+        ) -> Result<&Arc<CudaModule>, GpuError> {
+            if let Some(existing) = self.module.get() {
+                return Ok(existing);
+            }
+            let ptx =
+                compile_with_shared_options(source, || format!("{label} NVRTC compile failed"))?;
+            let module = ctx
+                .load_module(ptx)
+                .gpu_ctx_with(|err| format!("{label} module load failed: {err}"))?;
+            if self.module.set(module).is_err() {
+                // A concurrent compile of the same label won the race; its
+                // module is already in the slot and is the one we return.
+                log::trace!("{label} module slot already populated by a concurrent compile");
+            }
+            Ok(self
+                .module
+                .get()
+                .expect("module slot populated immediately after set"))
+        }
+
+    }
+
+    /// A per-key family of compiled modules: one [`CudaModule`] per value of a
+    /// kernel-shape parameter that is baked into the source (a row width `P`,
+    /// say), each compiled with the shared device-keyed NVRTC options on first
+    /// use and shared thereafter. The keyed twin of [`PtxModuleCache`].
+    pub struct KeyedPtxModuleCache<K> {
+        modules: Mutex<HashMap<K, Arc<CudaModule>>>,
+    }
+
+    impl<K: Eq + std::hash::Hash + Copy + std::fmt::Display> KeyedPtxModuleCache<K> {
+        pub fn new() -> Self {
+            Self {
+                modules: Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// The module for `key`, compiling `source(key)` and loading it on
+        /// `ctx` the first time that key is seen.
+        pub fn get_or_compile<S>(
+            &self,
+            ctx: &Arc<CudaContext>,
+            key: K,
+            label: &'static str,
+            source: S,
+        ) -> Result<Arc<CudaModule>, GpuError>
+        where
+            S: FnOnce(K) -> String,
+        {
+            if let Some(module) = self.lock_modules().get(&key) {
+                return Ok(Arc::clone(module));
+            }
+            let ptx = compile_with_shared_options(&source(key), || {
+                format!("{label} NVRTC compile failed (key={key})")
+            })?;
+            let module = ctx
+                .load_module(ptx)
+                .gpu_ctx_with(|err| format!("{label} module load failed (key={key}): {err}"))?;
+            // A concurrent compile of the same key may have won the race;
+            // its module is the one every later caller sees.
+            Ok(Arc::clone(self.lock_modules().entry(key).or_insert(module)))
+        }
+
+        /// The module map. A panic elsewhere while the lock was held cannot
+        /// leave it inconsistent (the guarded sections only read or insert an
+        /// `Arc`), so a poisoned lock is recovered rather than bypassed.
+        fn lock_modules(&self) -> MutexGuard<'_, HashMap<K, Arc<CudaModule>>> {
+            self.modules.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::KeyedPtxModuleCache;
+
+        #[test]
+        fn poisoned_keyed_module_map_remains_accessible() {
+            let cache = KeyedPtxModuleCache::<u32>::new();
+            assert!(cache.lock_modules().is_empty());
+            let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let entries = cache.lock_modules();
+                assert!(entries.is_empty());
+                panic!("injected lock-holder failure");
+            }));
+            assert!(refusal.is_err());
+            assert!(cache.modules.is_poisoned());
+            let recovered = cache.lock_modules();
+            assert!(recovered.is_empty());
+            drop(recovered);
+            assert!(cache.lock_modules().is_empty());
+        }
+    }
+
+    impl<K: Eq + std::hash::Hash + Copy + std::fmt::Display> Default for KeyedPtxModuleCache<K> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Compile a kernel source string to PTX with the SAME device-keyed NVRTC
+    /// options [`PtxModuleCache::get_or_compile`] uses — crucially the
+    /// `--gpu-architecture` pin (#1551), without which NVRTC defaults below
+    /// `sm_60` and rejects `atomicAdd(double*, double)`. Call sites that compile
+    /// via the bare `cudarc::nvrtc::compile_ptx` (no options) MUST route through
+    /// this instead when their kernel uses double atomics, or the device path
+    /// silently falls back to the CPU.
+    pub fn compile_ptx_arch<S: AsRef<str>>(source: S) -> Result<cudarc::nvrtc::Ptx, GpuError> {
+        compile_with_shared_options(source.as_ref(), || "NVRTC compile failed".to_string())
+    }
+
+    /// The one shared-options NVRTC compile behind every entry in this module.
+    /// An absent libnvrtc keeps its typed [`GpuError`]; a compile failure is
+    /// reported as `"{context()}: {err}"`.
+    fn compile_with_shared_options(
+        source: &str,
+        context: impl FnOnce() -> String,
+    ) -> Result<cudarc::nvrtc::Ptx, GpuError> {
+        // cudarc's NVRTC loader panics when libnvrtc is missing (#2972).
+        require_cudarc_library(CudarcLibrary::Nvrtc)?;
+        compile_ptx_with_opts(source, nvrtc_compile_options()?)
+            .gpu_ctx_with(|err| format!("{}: {err}", context()))
+    }
+
+    pub fn nvrtc_compile_options() -> Result<CompileOptions, GpuError> {
+        let mut opts = CompileOptions::default();
+        opts.include_paths = nvrtc_include_paths();
+        // GPU↔CPU PARITY: disable FMA contraction. NVRTC's default is
+        // `--fmad=true`, which fuses `a*b + c` into a single fused multiply-add
+        // (ONE rounding). The CPU oracle computes `a*b` then `+ c` as two
+        // SEPARATELY-rounded f64 ops. For shallow kernels the gap is ~1 ULP;
+        // for deep derivative towers (the survival/SAE seeded jets, whose
+        // Hessian + contracted third/fourth channels chain dozens of mul/add
+        // steps) the per-op FMA divergence accumulates to ~5e-8 — enough to
+        // blow a 1e-9 parity gate on a real device (measured on a V100,
+        // compute 7.0: survival_rowjet device-vs-CPU max abs diff 5.09e-8).
+        // `--use_fast_math` was already off, but that does NOT imply fmad off
+        // (use_fast_math only ADDS fmad=true; the converse default is still
+        // on). Pinning fmad=false makes every shared-options kernel
+        // bit-comparable to the separately-rounded CPU path. `Option::None`
+        // would defer to NVRTC's `true` default, so we set it explicitly.
+        opts.fmad = Some(false);
+        // #1551: pin the NVRTC virtual arch to the selected device's compute
+        // capability. Without it NVRTC defaults below sm_60, where the
+        // `atomicAdd(double*, double)` overload is absent — so kernels using
+        // double atomics (the SAE arrow/Schur PCG kernels) fail to compile and
+        // the device path silently falls back to the CPU (SAE ran at 0% GPU).
+        // `arch` is `Option<&'static str>`; `nvrtc_arch()` returns a static
+        // `compute_NN` for the device's real capability.
+        if let Some(runtime) = crate::device_runtime::GpuRuntime::resolve(crate::global_policy())? {
+            opts.arch = Some(runtime.selected_device().capability.nvrtc_arch());
+        }
+        Ok(opts)
+    }
+
+    fn nvrtc_include_paths() -> Vec<String> {
+        let mut paths = Vec::new();
+        push_existing_include_path(&mut paths, Path::new("/usr/local/cuda/include"));
+        push_existing_include_path(&mut paths, Path::new("/usr/include"));
+        push_existing_include_path(&mut paths, Path::new("/usr/include/x86_64-linux-gnu"));
+        push_gcc_include_paths(&mut paths, Path::new("/usr/lib/gcc/x86_64-linux-gnu"));
+        paths
+    }
+
+    fn push_gcc_include_paths(paths: &mut Vec<String>, root: &Path) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            push_existing_include_path(paths, &entry.path().join("include"));
+        }
+    }
+
+    fn push_existing_include_path(paths: &mut Vec<String>, path: &Path) {
+        if !path.is_dir() {
+            return;
+        }
+        let display = path.to_string_lossy().into_owned();
+        if !paths.iter().any(|existing| existing == &display) {
+            paths.push(display);
+        }
+    }
+}

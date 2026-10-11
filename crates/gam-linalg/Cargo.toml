@@ -1,0 +1,28 @@
+[package]
+name = "gam-linalg"
+version = "0.3.157"
+edition = "2024"
+rust-version = "1.97"
+description = "Dense/sparse linear-algebra and ridge-solver foundation for the gam penalized-likelihood engine"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/params"
+publish = false
+
+[lints.rust]
+warnings = "deny"
+
+[dependencies]
+dyn-stack = "0.13.2"
+faer = "0.24.4"
+gam-math = { path = "../gam-math", version = "=0.3.157" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
+log = "0.4.29"
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+rand = "0.10.1"
+rand_distr = "0.6.0"
+rayon = "1.12.0"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+proptest = "1.11.0"

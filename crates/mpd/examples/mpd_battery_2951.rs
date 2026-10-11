@@ -38,7 +38,7 @@
 //! `ARTIFACT` is a `library_mdl` posterior-mean `artifact.bin`, or a fit's `checkpoint.bin`, whose
 //! posterior mean is scored (with its `KL(q ‖ p)` and description reported). Without it `P` is the
 //! library's starting point, which computes `M` exactly: every divergence must vanish to rounding.
-//! `DECOMPOSITION` is VPD's exported decomposition (`bench/vpd_2951/vpd_export.py`), scored by
+//! `DECOMPOSITION` is VPD's exported decomposition (`vpd/vpd_export.py`), scored by
 //! `explanation_battery::{vpd_protocols, vpd_cancellation, vpd_interchange_atomic, vpd_interchange}`
 //! (the interchange families at one position as asked of a library explanation, then at every
 //! position). An empty source range
@@ -221,7 +221,7 @@ fn checkpoint_mean(path: &Path, explanation: &library_mdl::Explanation) -> Resul
 }
 
 /// The circuit curves (`explanation_battery::circuit_curve`) on each task of `pairs`
-/// (`bench/vpd_2951/sva_export.py`) of `M`'s MLP neurons and, with `decomposition`, of VPD's
+/// (`vpd/sva_export.py`) of `M`'s MLP neurons and, with `decomposition`, of VPD's
 /// subcomponents (all sites, and the MLP sites alone), and their means over the tasks.
 fn circuits(device: &Device, export: &Path, layers: &[mpd::run_check::LayerNodes], pairs: &Path, decomposition: Option<&Path>, settings: &Settings) -> Result<Value, String> {
     #[derive(Deserialize)]

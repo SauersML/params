@@ -541,7 +541,7 @@ pub fn draw_site_ops(rng: &mut impl RngExt, family: Family, length: usize, share
     }
     let k = (1usize << rng.random_range(0..=4)).min(sites.len());
     let chosen = hybrid_of(rng, sites.len(), k);
-    // A one-token sequence (a real-valued toy's input, `bench/toys_2951`) is edited at its
+    // A one-token sequence (a real-valued toy's input, `toys`) is edited at its
     // token; the draw is made all the same, so longer sequences draw as before.
     let (position, onward) = match rng.random_range(0..3) {
         _ if length == 1 => (0, true),

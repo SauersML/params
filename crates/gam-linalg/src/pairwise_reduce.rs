@@ -1,0 +1,791 @@
+//! Deterministic, bit-reproducible pairwise-tree reduction.
+//!
+//! This module provides a fixed-shape chunked pairwise (a.k.a. cascade /
+//! divide-and-conquer) reduction primitive. Unlike a naive sequential fold,
+//! whose floating-point rounding error grows with the number of terms and
+//! whose result depends on the *order* in which terms are visited, a pairwise
+//! tree reduces error to `O(log n)` and — crucially for this codebase — has a
+//! reduction structure that is a **pure function of the input length**, not of
+//! the values, of any thread scheduling, or of the platform.
+//!
+//! It is the load-bearing accumulation primitive for streaming Fisher-mass
+//! accumulation (#973): the streaming driver feeds successive fixed-size chunks
+//! into a running pairwise tree and is guaranteed a bit-identical result no
+//! matter how the stream is sliced into chunks, as long as the underlying
+//! sequence of summands (in order) is the same.
+//!
+//! # Determinism contract
+//!
+//! For a fixed combine operation `combine` and identity `identity` (and for
+//! [`pairwise_sum`], for ordinary IEEE-754 `f64` addition):
+//!
+//! 1. **Pure function of (ordered) input.** The result is a deterministic
+//!    function of the ordered sequence of inputs alone. Reducing the same slice
+//!    in the same order twice yields a **bit-identical** result
+//!    (`to_bits()` equality). No clocks, randomness, thread counts, global
+//!    state, or memory addresses participate.
+//!
+//! 2. **Association order is a pure function of length.** The shape of the
+//!    reduction tree — i.e. *which* elements are combined with *which*, and in
+//!    *what association order* — depends only on the number of elements
+//!    `n`, never on the element values. Two inputs of equal length are
+//!    associated identically.
+//!
+//! Note that the contract is about *reproducibility and order-independence of
+//! the association tree*, not about commutativity of `combine`. The *order* of
+//! the summands still matters (floating-point addition is not associative);
+//! what is guaranteed is that a given ordered input always associates the same
+//! way.
+//!
+//! # Tree shape
+//!
+//! The base case is a contiguous run of at most [`BASE_CHUNK`] elements, summed
+//! left-to-right (sequential within the small block, which bounds per-block
+//! error to `O(BASE_CHUNK)`). Above the base case the range `[lo, hi)` is split
+//! at a deterministic midpoint and the two halves are reduced recursively, then
+//! combined. The split point is chosen so that the *left* subtree always holds
+//! a number of elements that is the largest power-of-two multiple of
+//! [`BASE_CHUNK`] strictly less than the length. This makes the tree shape a
+//! pure, stable function of length and keeps it balanced.
+
+/// Base-case block size for the pairwise tree.
+///
+/// Runs of at most this many elements are summed sequentially (left to right);
+/// larger ranges are split into a balanced binary tree of such blocks. The
+/// value is a fixed compile-time constant so that the tree shape — and hence
+/// the exact floating-point result — never depends on tuning, platform, or
+/// runtime conditions. 128 keeps the base block in cache while bounding the
+/// sequential portion of the error to a small constant.
+pub const BASE_CHUNK: usize = 128;
+
+/// Largest power-of-two multiple of [`BASE_CHUNK`] that is strictly less than
+/// `len`, for `len > BASE_CHUNK`. This is the size of the left subtree.
+///
+/// The split is a pure function of `len`: it does not look at any value. By
+/// pinning the left subtree to a power-of-two block count we obtain a stable,
+/// balanced, length-only tree shape.
+#[inline]
+const fn left_split(len: usize) -> usize {
+    left_split_over_leaves(len, BASE_CHUNK)
+}
+
+/// Largest power-of-two multiple of `leaf` that is strictly less than `len`, for
+/// `len > leaf`: the size of the left subtree of a tree whose leaves hold at most
+/// `leaf` indices. A pure function of `(len, leaf)`.
+#[inline]
+const fn left_split_over_leaves(len: usize, leaf: usize) -> usize {
+    assert!(
+        leaf >= 1 && len > leaf,
+        "left_split_over_leaves: caller must guarantee len > leaf >= 1"
+    );
+    // We want the largest `k = leaf * 2^p` with `k < len`. Double while the
+    // doubled span still leaves at least one element for the right subtree
+    // (i.e. stays strictly below `len`).
+    let mut k = leaf;
+    while k.saturating_mul(2) < len {
+        k = k.saturating_mul(2);
+    }
+    k
+}
+
+/// Number of indices a deterministic block-fold leaf holds when each index carries
+/// `rows_per_index` rows of work: at most [`BASE_CHUNK`] rows, and never less than
+/// one index. A pure function of `rows_per_index`.
+///
+/// A fold over coarse indices (row chunks, tiles, span directions) splits on the
+/// work it declares, not on how many indices it has. With every index worth one
+/// row the leaf is [`BASE_CHUNK`] indices, which is the tree the unweighted folds
+/// build.
+#[inline]
+const fn leaf_indices_for_work(rows_per_index: usize) -> usize {
+    if rows_per_index >= BASE_CHUNK {
+        1
+    } else if rows_per_index == 0 {
+        BASE_CHUNK
+    } else {
+        BASE_CHUNK / rows_per_index
+    }
+}
+
+/// Reduce a contiguous run sequentially, left to right, starting from `acc`.
+#[inline]
+fn reduce_block<T, F>(acc: T, items: &[T], combine: &F) -> T
+where
+    T: Copy,
+    F: Fn(T, T) -> T,
+{
+    let mut out = acc;
+    for &x in items {
+        out = combine(out, x);
+    }
+    out
+}
+
+/// Recursively reduce `items` over a deterministic, length-only pairwise tree.
+///
+/// `combine` must be a deterministic binary operation; `identity` is its
+/// neutral element, returned for an empty slice. The association order is fixed
+/// by `left_split` / [`BASE_CHUNK`] and never depends on the values.
+///
+/// This is the generic, monoid-style core. See [`pairwise_sum`] for the `f64`
+/// addition specialization.
+pub fn pairwise_reduce<T, F>(items: &[T], combine: F, identity: T) -> T
+where
+    T: Copy,
+    F: Fn(T, T) -> T,
+{
+    reduce_range(items, &combine, identity)
+}
+
+/// Internal recursion: reduce `items` (a contiguous range) using `combine`.
+fn reduce_range<T, F>(items: &[T], combine: &F, identity: T) -> T
+where
+    T: Copy,
+    F: Fn(T, T) -> T,
+{
+    let len = items.len();
+    if len == 0 {
+        return identity;
+    }
+    if len <= BASE_CHUNK {
+        // Sequential base block, seeded from the first element so that the
+        // identity does not perturb the floating-point result.
+        return reduce_block(items[0], &items[1..], combine);
+    }
+    let mid = left_split(len);
+    let left = reduce_range(&items[..mid], combine, identity);
+    let right = reduce_range(&items[mid..], combine, identity);
+    combine(left, right)
+}
+
+/// Deterministic, bit-reproducible pairwise sum of `f64` values.
+///
+/// Equivalent to `pairwise_reduce(xs, |a, b| a + b, 0.0)` but specialized to
+/// IEEE-754 addition. Compared with a naive sequential fold this both reduces
+/// rounding error from `O(n)` to `O(log n)` *and* makes the result independent
+/// of the association order (a pure function of the ordered input). An empty
+/// slice sums to `+0.0`.
+pub fn pairwise_sum(xs: &[f64]) -> f64 {
+    pairwise_reduce(xs, |a, b| a + b, 0.0)
+}
+
+/// The largest number of floating-point additions any one summand passes through in
+/// [`pairwise_sum`] of `len` values (#2933 F08).
+///
+/// It follows the tree the reduction actually builds: a leaf block of at most
+/// [`BASE_CHUNK`] values is folded from its first element, so it takes `len − 1`
+/// additions, and an internal node adds one to the deeper of its two subtrees, split
+/// where the reduction splits them. [`par_pairwise_map_reduce`] and the deterministic
+/// block folds use the same split, so this is their depth too wherever their base folds
+/// sequentially. Higham's per-summand bound then gives `|ŝ − s| ≤ γ_d·Σ|xᵢ|`, with `d`
+/// this depth and `γ_d = d·u/(1 − d·u)`.
+pub fn pairwise_sum_max_depth(len: usize) -> usize {
+    if len <= BASE_CHUNK {
+        return len.saturating_sub(1);
+    }
+    let mid = left_split(len);
+    pairwise_sum_max_depth(mid).max(pairwise_sum_max_depth(len - mid)) + 1
+}
+
+/// Parallel, bit-reproducible pairwise map-reduce over the index range
+/// `0..n`.
+///
+/// Semantically identical — **bit-identical**, per the module determinism
+/// contract — to
+/// `pairwise_reduce(&(0..n).map(map).collect::<Vec<_>>(), combine, identity)`,
+/// but evaluated in parallel without materializing the mapped values. The
+/// recursion mirrors `reduce_range` exactly (same `left_split` tree, same
+/// base-block seeding from the first element), except that the two subtrees of
+/// every internal node are evaluated via `rayon::join`. Because the
+/// association order is fixed by the code structure — never by which thread
+/// ran what — the result is a pure function of `n` and the mapped values:
+/// independent of thread count, work stealing, and run-to-run scheduling.
+///
+/// This is the drop-in replacement for the nondeterministic
+/// `(0..n).into_par_iter().map(f).sum()` / `.reduce(..)` pattern, whose
+/// grouping depends on rayon's demand-driven splitting.
+pub fn par_pairwise_map_reduce<T, M, F>(n: usize, map: M, combine: F, identity: T) -> T
+where
+    T: Copy + Send + Sync,
+    M: Fn(usize) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    par_reduce_index_range(0, n, &map, &combine, identity)
+}
+
+fn par_reduce_index_range<T, M, F>(lo: usize, hi: usize, map: &M, combine: &F, identity: T) -> T
+where
+    T: Copy + Send + Sync,
+    M: Fn(usize) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    let len = hi - lo;
+    if len == 0 {
+        return identity;
+    }
+    if len <= BASE_CHUNK {
+        return reduce_index_block(lo, hi, map, combine);
+    }
+    let mid = lo + left_split(len);
+    // The subtrees are nested work, whoever runs them.
+    let (left, right) = gam_runtime::parallel::fan_out(|| {
+        rayon::join(
+            move || par_reduce_index_range(lo, mid, map, combine, identity),
+            move || par_reduce_index_range(mid, hi, map, combine, identity),
+        )
+    });
+    combine_pair(combine, left, right)
+}
+
+/// Sequential base block of [`par_reduce_index_range`], seeded from the first
+/// element: the same identity-free seeding as `reduce_range`. Out of line for the
+/// reason [`fold_leaf`] gives.
+#[inline(never)]
+fn reduce_index_block<T, M, F>(lo: usize, hi: usize, map: &M, combine: &F) -> T
+where
+    M: Fn(usize) -> T,
+    F: Fn(T, T) -> T,
+{
+    let mut acc = map(lo);
+    for i in (lo + 1)..hi {
+        acc = combine(acc, map(i));
+    }
+    acc
+}
+
+/// A block-fold leaf, `base(range)`, evaluated out of line (gam#2967).
+///
+/// Every recursion level of the parallel folds here waits at a `rayon::join`, and a
+/// worker that steals while it waits stacks one recursion frame per nesting level. A
+/// leaf body inlined into the recursion puts its whole frame (32 KiB for one caller's
+/// base closure in gnomon's release build) into every level. Called through this
+/// owner, the leaf's frame is live at most once per stack, and a recursion frame
+/// holds the range, the references and the two subtree results.
+#[inline(never)]
+fn fold_leaf<R, B>(base: &B, range: core::ops::Range<usize>) -> R
+where
+    B: Fn(core::ops::Range<usize>) -> R,
+{
+    base(range)
+}
+
+/// An internal node's merge of its two subtree results, out of line for the reason
+/// [`fold_leaf`] gives: it runs in the recursion frame that the join keeps live.
+#[inline(never)]
+fn combine_pair<T, R, F>(combine: &F, left: T, right: T) -> R
+where
+    F: Fn(T, T) -> R,
+{
+    combine(left, right)
+}
+
+/// Parallel, bit-reproducible pairwise sum of `f(0), f(1), …, f(n-1)`.
+///
+/// Bit-identical to `pairwise_sum(&(0..n).map(f).collect::<Vec<_>>())` and to
+/// itself across any thread count. See [`par_pairwise_map_reduce`].
+pub fn par_pairwise_sum<M>(n: usize, f: M) -> f64
+where
+    M: Fn(usize) -> f64 + Sync,
+{
+    par_pairwise_map_reduce(n, f, |a, b| a + b, 0.0)
+}
+
+/// Parallel, deterministic block fold for non-`Copy` accumulators (matrix /
+/// vector partials).
+///
+/// The index range `0..n` is split over the same length-only `left_split`
+/// tree as [`par_pairwise_map_reduce`]; each base block `lo..hi` (at most
+/// [`BASE_CHUNK`] indices) is folded sequentially by `base`, and internal
+/// nodes merge their two subtree partials with `combine`. The association
+/// order is a pure function of `n`, so the result never depends on thread
+/// count or scheduling. Returns `None` for `n == 0`.
+///
+/// This replaces the nondeterministic
+/// `into_par_iter().fold(zero_acc, ..).reduce(zero_acc, ..)` pattern for
+/// heavyweight accumulators, whose partial grouping depends on rayon's
+/// demand-driven splits.
+pub fn par_deterministic_block_fold<T, B, F>(n: usize, base: B, combine: F) -> Option<T>
+where
+    T: Send,
+    B: Fn(core::ops::Range<usize>) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    if n == 0 {
+        return None;
+    }
+    Some(par_block_fold_range(0, n, BASE_CHUNK, &base, &combine))
+}
+
+/// Fallible variant of [`par_deterministic_block_fold`]: `base` and `combine`
+/// may fail, and the first error (in tree order) is returned. The association
+/// tree is identical, so a fully-successful run is bit-identical to the
+/// infallible version. Returns `Ok(None)` for `n == 0`.
+///
+/// This replaces the nondeterministic rayon
+/// `try_fold(zero, ..).try_reduce(zero, ..)` pattern.
+pub fn par_deterministic_try_block_fold<T, E, B, F>(
+    n: usize,
+    base: B,
+    combine: F,
+) -> Result<Option<T>, E>
+where
+    T: Send,
+    E: Send,
+    B: Fn(core::ops::Range<usize>) -> Result<T, E> + Sync,
+    F: Fn(T, T) -> Result<T, E> + Sync,
+{
+    if n == 0 {
+        return Ok(None);
+    }
+    par_try_block_fold_range(0, n, BASE_CHUNK, &base, &combine).map(Some)
+}
+
+/// [`par_deterministic_block_fold`] over indices that each carry `rows_per_index`
+/// rows of work, such as row chunks or tiles.
+///
+/// The leaves hold at most [`BASE_CHUNK`] rows of work
+/// (`leaf_indices_for_work`), so a fold over a few heavy indices still fans across
+/// workers. Folding coarse indices through the unweighted fold keeps every fold of
+/// at most [`BASE_CHUNK`] indices in one sequential base block, whatever each index
+/// costs (#979). The association order is a pure function of `(n, rows_per_index)`,
+/// so the result never depends on thread count or scheduling, and at one row per
+/// index the tree is [`par_deterministic_block_fold`]'s.
+pub fn par_deterministic_block_fold_by_work<T, B, F>(
+    n: usize,
+    rows_per_index: usize,
+    base: B,
+    combine: F,
+) -> Option<T>
+where
+    T: Send,
+    B: Fn(core::ops::Range<usize>) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    if n == 0 {
+        return None;
+    }
+    let leaf = leaf_indices_for_work(rows_per_index);
+    Some(par_block_fold_range(0, n, leaf, &base, &combine))
+}
+
+/// Fallible variant of [`par_deterministic_block_fold_by_work`], on the same tree as
+/// its infallible twin, returning the first error in tree order.
+pub fn par_deterministic_try_block_fold_by_work<T, E, B, F>(
+    n: usize,
+    rows_per_index: usize,
+    base: B,
+    combine: F,
+) -> Result<Option<T>, E>
+where
+    T: Send,
+    E: Send,
+    B: Fn(core::ops::Range<usize>) -> Result<T, E> + Sync,
+    F: Fn(T, T) -> Result<T, E> + Sync,
+{
+    if n == 0 {
+        return Ok(None);
+    }
+    let leaf = leaf_indices_for_work(rows_per_index);
+    par_try_block_fold_range(0, n, leaf, &base, &combine).map(Some)
+}
+
+fn par_try_block_fold_range<T, E, B, F>(
+    lo: usize,
+    hi: usize,
+    leaf: usize,
+    base: &B,
+    combine: &F,
+) -> Result<T, E>
+where
+    T: Send,
+    E: Send,
+    B: Fn(core::ops::Range<usize>) -> Result<T, E> + Sync,
+    F: Fn(T, T) -> Result<T, E> + Sync,
+{
+    let len = hi - lo;
+    if len <= leaf {
+        return fold_leaf(base, lo..hi);
+    }
+    let mid = lo + left_split_over_leaves(len, leaf);
+    let (left, right) = gam_runtime::parallel::fan_out(|| {
+        rayon::join(
+            || par_try_block_fold_range(lo, mid, leaf, base, combine),
+            || par_try_block_fold_range(mid, hi, leaf, base, combine),
+        )
+    });
+    combine_pair(combine, left?, right?)
+}
+
+fn par_block_fold_range<T, B, F>(lo: usize, hi: usize, leaf: usize, base: &B, combine: &F) -> T
+where
+    T: Send,
+    B: Fn(core::ops::Range<usize>) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    let len = hi - lo;
+    if len <= leaf {
+        return fold_leaf(base, lo..hi);
+    }
+    let mid = lo + left_split_over_leaves(len, leaf);
+    let (left, right) = gam_runtime::parallel::fan_out(|| {
+        rayon::join(
+            || par_block_fold_range(lo, mid, leaf, base, combine),
+            || par_block_fold_range(mid, hi, leaf, base, combine),
+        )
+    });
+    combine_pair(combine, left, right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── left_split ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn left_split_minimal_case() {
+        assert_eq!(super::left_split(BASE_CHUNK + 1), BASE_CHUNK);
+    }
+
+    #[test]
+    fn left_split_at_two_blocks() {
+        assert_eq!(super::left_split(2 * BASE_CHUNK), BASE_CHUNK);
+    }
+
+    #[test]
+    fn left_split_just_above_two_blocks() {
+        assert_eq!(super::left_split(2 * BASE_CHUNK + 1), 2 * BASE_CHUNK);
+    }
+
+    #[test]
+    fn left_split_at_four_blocks() {
+        assert_eq!(super::left_split(4 * BASE_CHUNK), 2 * BASE_CHUNK);
+    }
+
+    // ── pairwise_reduce ───────────────────────────────────────────────────────
+
+    #[test]
+    fn pairwise_reduce_empty_returns_identity() {
+        let result = pairwise_reduce::<u64, _>(&[], |a, b| a + b, 99);
+        assert_eq!(result, 99);
+    }
+
+    #[test]
+    fn pairwise_reduce_single_element() {
+        assert_eq!(pairwise_reduce(&[42u64], |a, b| a + b, 0), 42);
+    }
+
+    #[test]
+    fn pairwise_reduce_small_sum() {
+        let xs = [1u64, 2, 3, 4, 5];
+        assert_eq!(pairwise_reduce(&xs, |a, b| a + b, 0), 15);
+    }
+
+    #[test]
+    fn pairwise_reduce_product() {
+        let xs = [2u64, 3, 4, 5];
+        assert_eq!(pairwise_reduce(&xs, |a, b| a * b, 1), 120);
+    }
+
+    // ── pairwise_sum ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn pairwise_sum_empty_is_zero() {
+        assert_eq!(pairwise_sum(&[]), 0.0);
+    }
+
+    #[test]
+    fn pairwise_sum_single_element() {
+        assert_eq!(pairwise_sum(&[3.5f64]), 3.5);
+    }
+
+    #[test]
+    fn pairwise_sum_small_slice_exact() {
+        assert_eq!(pairwise_sum(&[1.0f64, 2.0, 3.0, 4.0, 5.0]), 15.0);
+    }
+
+    #[test]
+    fn pairwise_sum_exactly_base_chunk_elements() {
+        let xs: Vec<f64> = (1..=BASE_CHUNK as u64).map(|x| x as f64).collect();
+        let naive: f64 = (1..=BASE_CHUNK as u64).map(|x| x as f64).sum();
+        assert_eq!(pairwise_sum(&xs), naive);
+    }
+
+    #[test]
+    fn pairwise_sum_one_above_base_chunk_triggers_split() {
+        let xs = vec![1.0f64; BASE_CHUNK + 1];
+        assert_eq!(pairwise_sum(&xs), (BASE_CHUNK + 1) as f64);
+    }
+
+    #[test]
+    fn pairwise_sum_two_base_chunks() {
+        let xs = vec![1.0f64; 2 * BASE_CHUNK];
+        assert_eq!(pairwise_sum(&xs), (2 * BASE_CHUNK) as f64);
+    }
+
+    // ── pairwise_sum_max_depth ───────────────────────────────────────────────
+
+    /// #2933 F08 — the depth owner equals the depth the reductions really accumulate, at
+    /// the leaf boundary, around the tree's power-of-two levels, and at one large count.
+    /// Every `combine` is one floating-point addition and a leaf block is folded from its
+    /// first element, so tracing `max(a, b) + 1` over zeros through the real recursion
+    /// measures the deepest summand's addition count. The block folds are traced with a
+    /// sequential base, as the data fit folds its rows.
+    #[test]
+    fn pairwise_sum_max_depth_equals_the_traced_reduction_depth_2933_f08() {
+        for n in [
+            1usize,
+            2,
+            BASE_CHUNK - 1,
+            BASE_CHUNK,
+            BASE_CHUNK + 1,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            1023,
+            1024,
+            1025,
+            1_000_003,
+        ] {
+            let owner = pairwise_sum_max_depth(n);
+            let sequential = pairwise_reduce(&vec![0usize; n], |a, b| a.max(b) + 1, 0);
+            let block_fold = par_deterministic_block_fold(
+                n,
+                |range: core::ops::Range<usize>| range.len() - 1,
+                |a: usize, b: usize| a.max(b) + 1,
+            )
+            .expect("n > 0");
+            let try_block_fold = par_deterministic_try_block_fold(
+                n,
+                |range: core::ops::Range<usize>| Ok::<usize, String>(range.len() - 1),
+                |a: usize, b: usize| Ok(a.max(b) + 1),
+            )
+            .expect("no error")
+            .expect("n > 0");
+            assert_eq!(sequential, owner, "pairwise_reduce trace at n={n}");
+            assert_eq!(block_fold, owner, "par_deterministic_block_fold trace at n={n}");
+            assert_eq!(try_block_fold, owner, "par_deterministic_try_block_fold trace at n={n}");
+        }
+    }
+
+    // ── parallel deterministic reductions ────────────────────────────────────
+
+    #[test]
+    fn par_pairwise_sum_bit_identical_to_sequential() {
+        for n in [
+            0usize,
+            1,
+            5,
+            BASE_CHUNK,
+            BASE_CHUNK + 1,
+            3 * BASE_CHUNK + 17,
+            5000,
+        ] {
+            let f = |i: usize| ((i as f64) * 0.7318 - 41.0).sin() * 1e6 / ((i + 1) as f64);
+            let xs: Vec<f64> = (0..n).map(f).collect();
+            let expected = pairwise_sum(&xs);
+            let got = par_pairwise_sum(n, f);
+            assert_eq!(got.to_bits(), expected.to_bits(), "n={n}");
+        }
+    }
+
+    #[test]
+    fn par_pairwise_sum_bit_stable_across_thread_counts() {
+        let n = 7 * BASE_CHUNK + 13;
+        let f = |i: usize| (1.0 / ((i + 1) as f64)).ln_1p() * if i % 3 == 0 { -1.0 } else { 1.0 };
+        let reference = par_pairwise_sum(n, f);
+        for threads in [1usize, 2, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let got = pool.install(|| par_pairwise_sum(n, f));
+            assert_eq!(got.to_bits(), reference.to_bits(), "threads={threads}");
+        }
+    }
+
+    #[test]
+    fn par_pairwise_map_reduce_tuple_accumulators() {
+        let n = 4 * BASE_CHUNK + 3;
+        let map = |i: usize| {
+            let x = (i as f64).sqrt() * 0.911;
+            (x, x * x)
+        };
+        let seq: (f64, f64) = {
+            let xs: Vec<(f64, f64)> = (0..n).map(map).collect();
+            pairwise_reduce(&xs, |a, b| (a.0 + b.0, a.1 + b.1), (0.0, 0.0))
+        };
+        let par = par_pairwise_map_reduce(n, map, |a, b| (a.0 + b.0, a.1 + b.1), (0.0, 0.0));
+        assert_eq!(par.0.to_bits(), seq.0.to_bits());
+        assert_eq!(par.1.to_bits(), seq.1.to_bits());
+    }
+
+    #[test]
+    fn par_deterministic_block_fold_vec_accumulator_thread_invariant() {
+        let n = 6 * BASE_CHUNK + 41;
+        let dim = 7usize;
+        let run = || {
+            par_deterministic_block_fold(
+                n,
+                |range: core::ops::Range<usize>| {
+                    let mut acc = vec![0.0f64; dim];
+                    for i in range {
+                        for (d, slot) in acc.iter_mut().enumerate() {
+                            *slot += ((i * dim + d) as f64).cos() / ((i + 1) as f64);
+                        }
+                    }
+                    acc
+                },
+                |mut a: Vec<f64>, b: Vec<f64>| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += *y;
+                    }
+                    a
+                },
+            )
+            .expect("n > 0")
+        };
+        let reference = run();
+        for threads in [1usize, 2, 5] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let got = pool.install(run);
+            for (g, r) in got.iter().zip(&reference) {
+                assert_eq!(g.to_bits(), r.to_bits(), "threads={threads}");
+            }
+        }
+        assert!(par_deterministic_block_fold(0, |_| vec![0.0f64; 1], |a, _| a).is_none());
+    }
+
+    #[test]
+    fn par_deterministic_try_block_fold_matches_infallible_and_propagates_errors() {
+        let n = 5 * BASE_CHUNK + 7;
+        let base = |range: core::ops::Range<usize>| -> f64 {
+            range.map(|i| ((i as f64) * 0.317).sin()).sum()
+        };
+        let infallible = par_deterministic_block_fold(n, base, |a, b| a + b).expect("n > 0");
+        let fallible = par_deterministic_try_block_fold(
+            n,
+            |range| Ok::<f64, String>(base(range)),
+            |a, b| Ok(a + b),
+        )
+        .expect("no error")
+        .expect("n > 0");
+        assert_eq!(fallible.to_bits(), infallible.to_bits());
+
+        let err = par_deterministic_try_block_fold(
+            n,
+            |range| {
+                if range.contains(&(3 * BASE_CHUNK)) {
+                    Err("boom".to_string())
+                } else {
+                    Ok(0.0f64)
+                }
+            },
+            |a, b| Ok(a + b),
+        )
+        .unwrap_err();
+        assert_eq!(err, "boom");
+        assert!(
+            par_deterministic_try_block_fold(0, |_| Ok::<f64, String>(0.0), |a, b| Ok(a + b))
+                .expect("no error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn leaf_indices_for_work_keeps_the_row_tree_and_bounds_coarse_leaves_979() {
+        assert_eq!(leaf_indices_for_work(1), BASE_CHUNK);
+        assert_eq!(leaf_indices_for_work(64), BASE_CHUNK / 64);
+        assert_eq!(leaf_indices_for_work(BASE_CHUNK), 1);
+        assert_eq!(leaf_indices_for_work(8192), 1);
+        assert_eq!(left_split_over_leaves(33, 2), 32);
+        assert_eq!(left_split_over_leaves(BASE_CHUNK + 1, BASE_CHUNK), left_split(BASE_CHUNK + 1));
+    }
+
+    /// The by-work fold at one row per index builds the unweighted fold's tree, so every
+    /// row-indexed consumer keeps its bits.
+    #[test]
+    fn the_by_work_fold_at_one_row_per_index_is_the_unweighted_fold_979() {
+        let n = 5 * BASE_CHUNK + 7;
+        let base = |range: core::ops::Range<usize>| -> f64 {
+            range.map(|i| ((i as f64) * 0.317).sin() / (1.0 + i as f64)).sum()
+        };
+        let unweighted = par_deterministic_block_fold(n, base, |a, b| a + b).expect("n > 0");
+        let by_work =
+            par_deterministic_block_fold_by_work(n, 1, base, |a, b| a + b).expect("n > 0");
+        assert_eq!(by_work.to_bits(), unweighted.to_bits());
+        let fallible = par_deterministic_try_block_fold_by_work(
+            n,
+            1,
+            |range| Ok::<f64, String>(base(range)),
+            |a, b| Ok(a + b),
+        )
+        .expect("no error")
+        .expect("n > 0");
+        assert_eq!(fallible.to_bits(), unweighted.to_bits());
+    }
+
+    /// A fold over a few heavy indices splits on the work it declares, and its result is
+    /// bit-identical across 1, 4 and 24 worker threads because the tree is a pure function
+    /// of `(n, rows_per_index)`.
+    #[test]
+    fn a_coarse_fold_splits_on_declared_work_and_is_bitwise_thread_invariant_979() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = 32usize;
+        let rows_per_index = 64usize;
+        let base_calls = AtomicUsize::new(0);
+        let run = |rows: usize| {
+            base_calls.store(0, Ordering::Relaxed);
+            let value = par_deterministic_try_block_fold_by_work(
+                n,
+                rows,
+                |range: core::ops::Range<usize>| -> Result<Vec<f64>, String> {
+                    base_calls.fetch_add(1, Ordering::Relaxed);
+                    let mut acc = vec![0.0f64; 3];
+                    for chunk in range {
+                        for row in 0..rows_per_index {
+                            let i = chunk * rows_per_index + row;
+                            for (d, slot) in acc.iter_mut().enumerate() {
+                                *slot += ((i * 3 + d) as f64).cos() / ((i + 1) as f64);
+                            }
+                        }
+                    }
+                    Ok(acc)
+                },
+                |mut a: Vec<f64>, b: Vec<f64>| -> Result<Vec<f64>, String> {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += *y;
+                    }
+                    Ok(a)
+                },
+            )
+            .expect("no error")
+            .expect("n > 0");
+            (value, base_calls.load(Ordering::Relaxed))
+        };
+        let (_, unweighted_calls) = run(1);
+        assert_eq!(unweighted_calls, 1, "32 indices at one row each fit one leaf");
+        let (reference, coarse_calls) = run(rows_per_index);
+        assert_eq!(
+            coarse_calls,
+            n / leaf_indices_for_work(rows_per_index),
+            "at 64 rows per index a leaf holds two indices"
+        );
+        for threads in [1usize, 4, 24] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let (got, _) = pool.install(|| run(rows_per_index));
+            for (g, r) in got.iter().zip(&reference) {
+                assert_eq!(g.to_bits(), r.to_bits(), "threads={threads}");
+            }
+        }
+    }
+}

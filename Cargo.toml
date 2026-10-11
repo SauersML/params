@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mpd", "crates/mpd-tensor"]
+members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
@@ -10,15 +10,14 @@ repository = "https://github.com/SauersML/params"
 publish = false
 
 [workspace.dependencies]
-# The gam crates are path dependencies on a checkout of github.com/SauersML/gam next to this one (../gam).
-gam-gpu = { path = "../gam/crates/gam-gpu" }
-gam-linalg = { path = "../gam/crates/gam-linalg" }
-gam-math = { path = "../gam/crates/gam-math" }
-gam-problem = { path = "../gam/crates/gam-problem" }
-gam-runtime = { path = "../gam/crates/gam-runtime" }
-gam-solve = { path = "../gam/crates/gam-solve" }
+# gam-gpu, gam-linalg, gam-math and gam-runtime are copies of github.com/SauersML/gam's crates
+# (gam 0d59e5ae32), the whole closure of gam crates mpd needs; gam keeps its own.
+gam-gpu = { path = "crates/gam-gpu" }
+gam-linalg = { path = "crates/gam-linalg" }
+gam-math = { path = "crates/gam-math" }
+gam-runtime = { path = "crates/gam-runtime" }
 mpd-tensor = { path = "crates/mpd-tensor" }
-# gam's own pin, so the CUDA types mpd-tensor passes to gam-gpu are the same crate.
+# gam's pin; gam-gpu reads it through `cudarc.workspace = true`.
 cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12000"] }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -52,12 +51,4 @@ opt-level = 2
 codegen-units = 16
 
 [profile.release.package.mpd]
-codegen-units = 16
-
-# gam's own test-profile overrides for the gam crates mpd's tests build (gam's Cargo.toml has the
-# measurements: compile time several times shorter, runtime unchanged).
-[profile.test.package.gam-solve]
-codegen-units = 16
-
-[profile.test.package.gam-terms]
 codegen-units = 16

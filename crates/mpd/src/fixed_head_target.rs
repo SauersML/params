@@ -27,7 +27,7 @@ pub(crate) struct Head {
 /// output's predictive distribution is `N(y, 1)`. An exporter divides the table and the bias by
 /// the model's task residual `σ` (its root mean squared error against its training target), so
 /// the unit is `σ` and `KL(M ‖ P) = ‖y_M − y_P‖² / 2` nats per row. A real-valued toy is a
-/// language model whose tokens index its inputs (`bench/toys_2951`).
+/// language model whose tokens index its inputs (`toys`).
 pub const GAUSSIAN_HEAD: &str = "gaussian_head";
 
 /// A Gaussian head's bias `b` (one per output) and whether a ReLU follows it.

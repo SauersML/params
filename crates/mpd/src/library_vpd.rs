@@ -1950,7 +1950,7 @@ fn set_gate(part: &mut Dumped, read: String, (on, tau, g): StageGate) {
     part.on = on;
 }
 
-/// One arm's parts, in the layout of the toy gate's harness (`bench/toys_2951/score_toys.py`), at
+/// One arm's parts, in the layout of the toy gate's harness (`toys/score_toys.py`), at
 /// `artifact`'s values (a checkpoint's posterior mean, or the start's): a part per gate with its
 /// member components (each component of an unshared stage; components that share a gate, gate
 /// sharing, one part of their summed rank), per part its slices' writes `U` and reads `V` on each of `M`'s operators it

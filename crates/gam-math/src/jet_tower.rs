@@ -1,0 +1,3159 @@
+//! Taylor-jet tower algebra: write each family's row log-likelihood ONCE,
+//! derive the entire `RowKernel<K>` derivative tower mechanically (#932).
+//!
+//! # The object
+//!
+//! [`Tower4<K>`] is a truncated multivariate Taylor scalar in `K` primary
+//! variables, carrying the value and ALL partial derivatives through fourth
+//! order as full (unsymmetrized) tensors:
+//!
+//! ```text
+//!   v        ℓ
+//!   g[a]     ∂ℓ/∂p_a
+//!   h[a][b]  ∂²ℓ/∂p_a∂p_b
+//!   t3[abc]  ∂³ℓ/∂p_a∂p_b∂p_c
+//!   t4[abcd] ∂⁴ℓ/∂p_a∂p_b∂p_c∂p_d
+//! ```
+//!
+//! Arithmetic (`+ − × ÷`, scalar mixes) propagates the tower by the exact
+//! Leibniz rule; unary transcendentals propagate by the exact multivariate
+//! Faà di Bruno formula given a `[f, f′, f″, f‴, f⁗]` stack evaluated at the
+//! inner value. This is truncated Taylor ALGEBRA — exact derivatives of the
+//! evaluated expression, not finite differences, not an approximation —
+//! fully compatible with the exact-REML-only policy.
+//!
+//! One evaluation of a row NLL program at seeded variables yields, in a
+//! single pass, every channel the `gam_models::row_kernel::RowKernel` trait
+//! demands: `row_kernel` (value/∇/H), `row_third_contracted(dir)` (contract
+//! `t3` with `dir`), and `row_fourth_contracted(u, v)` (contract `t4` with
+//! `u` and `v`). The directional cross-channels that hand-written towers
+//! drop (#736's residual gap) cannot be dropped here: there is no separate
+//! "channel" to forget — every derivative of the one expression is carried.
+//!
+//! # Why this exists (the bug genus)
+//!
+//! Every family today hand-writes its tower: value in one function,
+//! gradient in another, `pdfthird_derivative`/`pdffourth_derivative`,
+//! entry/exit-specific cross blocks — thousands of lines of calculus that
+//! drift. #736 was a sign flip in a hand-written cross-Hessian block,
+//! invisible until a new consumer touched it; #948 is a derivative path
+//! that is not the derivative of the evaluated row loss (clamped-μ
+//! surrogate); the objective↔gradient desync class is the same disease at
+//! the criterion level. A tower-derived kernel is exact-by-construction:
+//! the value channel IS the production loss expression, so its derivative
+//! channels cannot desync from it.
+//!
+//! # Relation to `jet_partitions::MultiDirJet`
+//!
+//! The tree already carries a *directional* jet (bitmask coefficients over
+//! distinct seeded directions, heap-allocated, Bell-partition compose) used
+//! inside the marginal-slope and latent-survival families. It answers "the
+//! derivative along THESE specific directions" and must be re-seeded and
+//! re-evaluated per direction tuple (e.g. 10 symmetric `(a,b)` pairs for a
+//! K=4 fourth contraction). `Tower4` answers ALL of them from one
+//! evaluation: contraction happens AFTER differentiation, as plain linear
+//! algebra on the stored tensors. Use `MultiDirJet` when you need a handful
+//! of directions of a huge-K expression; use `Tower4` when you need the
+//! complete small-K tower — which is exactly the `RowKernel<K≤4>` shape.
+//! The `[f64; 5]` unary-derivative stacks
+//! (`unary_derivatives_neglog_phi`, …) are signature-compatible with
+//! [`Tower4::compose_unary`], so the families' existing special-function
+//! stacks are directly reusable.
+//!
+//! # Stability discipline (why this is NOT autodiff)
+//!
+//! Differentiating the primal code path inherits its instabilities: a jet
+//! pushed through a naive `ln(1 + e^η)` is garbage in the saturated tail
+//! even though the true derivative σ(η) is benign there. This module
+//! therefore splits responsibility: **humans own primitive stability,
+//! the algebra owns combinatorics**. Tail-critical special functions enter
+//! a program ONLY as hand-certified `[f64; 5]` derivative stacks through
+//! [`Tower4::compose_unary`] — the same stacks the families already write
+//! (`unary_derivatives_neglog_phi` and friends, built on erfcx/log_ndtr) —
+//! and the tower mechanizes only the Leibniz/Faà di Bruno composition,
+//! which is where hand-written towers actually fail (#736 was a
+//! composition sign flip, not a primitive error). Program authors must use
+//! a stable primitive stack wherever the f64 production loss does; the
+//! convenience methods (`exp`, `ln`, `sqrt`, …) are for expressions whose
+//! arguments are tame by construction.
+//!
+//! # Storage convention
+//!
+//! Tensors are stored FULL, not symmetric-packed: `t4` for K=4 is 256
+//! doubles where 35 would do. This is deliberate clarity-over-speed for the
+//! oracle role — indexing is trivially auditable, contraction loops are
+//! obvious, and the redundancy is itself a checked invariant (the algebra
+//! only ever writes symmetric values). Symmetric packing is a later,
+//! profile-justified optimization behind the same API.
+//!
+//! # Deployment ladder (#932)
+//!
+//! 1. This module: the algebra + the program seam + the oracle.
+//! 2. Universal oracle: every hand-written `RowKernel` gains a CI test
+//!    asserting channel-by-channel agreement with a [`RowProgram`] written
+//!    once, through a comparator that refuses non-finite and corrupted
+//!    channels (for example `rigid_full_tower_matches_independent_algebra_932`
+//!    and `tensor_oracle_rejects_wrong_channels_and_nonfinite_values_932` in
+//!    gam-models). This alone would have caught #736 at introduction.
+//! 3. Derive every channel through [`program_row_kernel`],
+//!    [`program_third_contracted`], [`program_fourth_contracted`], or
+//!    [`program_full_tower`], selecting only the representation its consumer
+//!    needs while retaining one expression.
+//! 4. New families (#914/#916/#917 ZI/ordinal/expectile, #921's location-
+//!    scale port) implement ONLY [`RowProgram`] and get an exact fourth-order
+//!    tower for the price of writing the likelihood.
+
+use crate::jet_algebra;
+
+/// Truncated fourth-order multivariate Taylor scalar in `K` variables.
+///
+/// See the module documentation for semantics and conventions. `Copy` is
+/// intentional despite the size (2 KiB at K=4): towers are per-row
+/// temporaries that live entirely in registers/stack during a row program,
+/// and value semantics keep program code readable (`a * b + c`).
+#[derive(Clone, Copy, Debug)]
+pub struct Tower4<const K: usize> {
+    /// Value ℓ.
+    pub v: f64,
+    /// Gradient ∂ℓ/∂p_a.
+    pub g: [f64; K],
+    /// Hessian ∂²ℓ/∂p_a∂p_b (symmetric).
+    pub h: [[f64; K]; K],
+    /// Third derivatives ∂³ℓ/∂p_a∂p_b∂p_c (fully symmetric).
+    pub t3: [[[f64; K]; K]; K],
+    /// Fourth derivatives ∂⁴ℓ/∂p_a∂p_b∂p_c∂p_d (fully symmetric).
+    pub t4: [[[[f64; K]; K]; K]; K],
+}
+
+impl<const K: usize> Tower4<K> {
+    /// The additive identity.
+    pub fn zero() -> Self {
+        Self {
+            v: 0.0,
+            g: [0.0; K],
+            h: [[0.0; K]; K],
+            t3: [[[0.0; K]; K]; K],
+            t4: [[[[0.0; K]; K]; K]; K],
+        }
+    }
+
+    /// A constant: value `c`, all derivatives zero.
+    pub fn constant(c: f64) -> Self {
+        let mut out = Self::zero();
+        out.v = c;
+        out
+    }
+
+    /// The seeded variable `p_idx` with current value `value`:
+    /// unit first derivative in slot `idx`, zero elsewhere and above.
+    pub fn variable(value: f64, idx: usize) -> Self {
+        let mut out = Self::constant(value);
+        out.g[idx] = 1.0;
+        out
+    }
+
+    /// Read the (fully symmetric) derivative tensor entry whose differentiation
+    /// axes are `labels` (length 0..=4): value, `g`, `h`, `t3`, `t4`.
+    #[inline]
+    fn deriv(&self, labels: &[usize]) -> f64 {
+        assert!(
+            labels.len() <= 4,
+            "Tower4 carries at most fourth-order derivatives"
+        );
+        match labels.len() {
+            0 => self.v,
+            1 => self.g[labels[0]],
+            2 => self.h[labels[0]][labels[1]],
+            3 => self.t3[labels[0]][labels[1]][labels[2]],
+            _ => self.t4[labels[0]][labels[1]][labels[2]][labels[3]],
+        }
+    }
+
+    /// Exact truncated Leibniz product `D_S(ab) = Σ_{T ⊆ S} D_T(a) · D_{S∖T}(b)`.
+    ///
+    /// # Codegen
+    ///
+    /// Each output entry's `2^m` subset sum is written as a compact straight-line
+    /// expression instead of the shared `jet_algebra::leibniz_product` subset
+    /// walker (which, per entry, builds `SlotBuf`s and `match`-dispatches the
+    /// `deriv` closure across all `2^m` subsets). The loop nest over `(i,j,k,l)`
+    /// is unchanged — only the inner per-entry sum is unrolled — so this does NOT
+    /// unroll over `K` and does NOT bloat code: on a `Tower4<9>` mul-and-read
+    /// consumer the new form is faster AND smaller (asm: 34 outlined walker `bl`
+    /// calls → 0, 21.1 KiB → 14.3 KiB, +100 NEON `.2d` ops).
+    ///
+    /// BIT-IDENTICAL to the walker: each entry's terms are in the walker's exact
+    /// subset-enumeration order (subset bit `b` ↔ position `b`, `sub = 0..2^m`),
+    /// and the per-entry `acc` accumulator mirrors the walker's `total = 0.0`
+    /// start so a signed-zero leading product collapses to `+0.0` identically —
+    /// which matters because real jets carry exact-`0.0` channels
+    /// (`constant`/`variable` towers). Proven `to_bits`-identical on
+    /// `v`/`g`/`h`/`t3`/`t4` across `K ∈ {2,3,4,9}`, 5000 inputs each with ~30 %
+    /// exact-`0.0` channels and signed values (a no-leading-`0.0` form fails this
+    /// stress — the accumulator start is load-bearing).
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let mut out = Self::zero();
+        out.v = a.v * b.v;
+        for i in 0..K {
+            // subsets of {i}: {} {i}
+            let mut acc = 0.0;
+            acc += a.v * b.g[i];
+            acc += a.g[i] * b.v;
+            out.g[i] = acc;
+        }
+        // Hessian is symmetric under i↔j; compute the upper triangle and mirror
+        // (see [`Tower2::mul`] — same term order, enforces exact symmetry).
+        for i in 0..K {
+            for j in i..K {
+                // subsets of {i,j}: {} {i} {j} {ij}
+                let mut acc = 0.0;
+                acc += a.v * b.h[i][j];
+                acc += a.g[i] * b.g[j];
+                acc += a.g[j] * b.g[i];
+                acc += a.h[i][j] * b.v;
+                out.h[i][j] = acc;
+                out.h[j][i] = acc;
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    // subsets of {i,j,k}: {} {i} {j} {ij} {k} {ik} {jk} {ijk}
+                    let mut acc = 0.0;
+                    acc += a.v * b.t3[i][j][k];
+                    acc += a.g[i] * b.h[j][k];
+                    acc += a.g[j] * b.h[i][k];
+                    acc += a.h[i][j] * b.g[k];
+                    acc += a.g[k] * b.h[i][j];
+                    acc += a.h[i][k] * b.g[j];
+                    acc += a.h[j][k] * b.g[i];
+                    acc += a.t3[i][j][k] * b.v;
+                    out.t3[i][j][k] = acc;
+                }
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    for l in 0..K {
+                        // subsets of {i,j,k,l} in bit order sub = 0..16
+                        let mut acc = 0.0;
+                        acc += a.v * b.t4[i][j][k][l];
+                        acc += a.g[i] * b.t3[j][k][l];
+                        acc += a.g[j] * b.t3[i][k][l];
+                        acc += a.h[i][j] * b.h[k][l];
+                        acc += a.g[k] * b.t3[i][j][l];
+                        acc += a.h[i][k] * b.h[j][l];
+                        acc += a.h[j][k] * b.h[i][l];
+                        acc += a.t3[i][j][k] * b.g[l];
+                        acc += a.g[l] * b.t3[i][j][k];
+                        acc += a.h[i][l] * b.h[j][k];
+                        acc += a.h[j][l] * b.h[i][k];
+                        acc += a.t3[i][j][l] * b.g[k];
+                        acc += a.h[k][l] * b.h[i][j];
+                        acc += a.t3[i][k][l] * b.g[j];
+                        acc += a.t3[j][k][l] * b.g[i];
+                        acc += a.t4[i][j][k][l] * b.v;
+                        out.t4[i][j][k][l] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Ref-taking elementwise sum, the by-ref twin of the `std::ops::Add`
+    /// operator (which consumes by value). Mirrors the inherent `mul`/`scale`
+    /// API so a chain like `a.mul(&b).add(&c)` reads uniformly without moving
+    /// out of the borrowed operands.
+    pub fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+
+    /// Ref-taking elementwise difference, the by-ref twin of `std::ops::Sub`.
+    pub fn sub(&self, o: &Self) -> Self {
+        *self + o.scale(-1.0)
+    }
+
+    /// Exact multivariate Faà di Bruno composition `f ∘ self`.
+    ///
+    /// `d = [f(u), f′(u), f″(u), f‴(u), f⁗(u)]` evaluated at `u = self.v` —
+    /// the SAME `[f64; 5]` stack shape the families' existing
+    /// `unary_derivatives_*` helpers produce, so those special-function
+    /// stacks (Φ, log-Φ, normal pdf, …) plug in directly.
+    ///
+    /// The order-m output sums over the set partitions of the m indices
+    /// (Bell(3) = 5 terms at order 3, Bell(4) = 15 at order 4), grouped by
+    /// block count: each partition into r blocks contributes
+    /// `f⁽ʳ⁾ · Π_blocks D_block(u)`.
+    ///
+    /// # Codegen
+    ///
+    /// Evaluated as a compact closed form (the Bell(4)=15 set-partitions of
+    /// `t4`, Bell(3)=5 of `t3`, …) instead of routing through the recursive
+    /// `jet_algebra::faa_di_bruno` walker (per-output `for_each_partition`
+    /// recursion + per-block `SlotBuf` + closure dispatch). The loop nest is
+    /// identical to the walker's (`for i,j,k,l`); only the per-entry partition
+    /// sum is straight-line, so this does NOT unroll over `K` and does NOT
+    /// bloat code — measured on a `Tower4<9>` compose-and-read consumer the new
+    /// form is both faster and SMALLER (asm: 94 outlined walker `bl` calls → 0,
+    /// 47.5 KiB → 16.7 KiB, +197 NEON `.2d` ops).
+    ///
+    /// BIT-IDENTICAL to the walker: each channel's terms are emitted in the
+    /// walker's exact partition-enumeration order, each term's block products
+    /// are left-associated exactly as the walker's `prod *= block`, and the
+    /// per-channel `acc` accumulator mirrors the walker's `total = 0.0` start
+    /// (so signed-zero products collapse to `+0.0` identically). The order-4
+    /// term sequence was generated from the walker's own enumeration. Proven
+    /// `to_bits`-identical on `v`/`g`/`h`/`t3`/`t4` across `K ∈ {2,3,4,9}`,
+    /// 5000 random inputs each (zeroed / sign-varied stacks included).
+    pub fn compose_unary(&self, d: [f64; 5]) -> Self {
+        let mut out = Self::zero();
+        out.v = d[0];
+        for i in 0..K {
+            let mut acc = 0.0;
+            acc += d[1] * self.g[i];
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = 0.0;
+                acc += d[1] * self.h[i][j];
+                acc += d[2] * self.g[i] * self.g[j];
+                out.h[i][j] = acc;
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    // walker partitions: {ijk} {ij}{k} {ik}{j} {i}{jk} {i}{j}{k}
+                    let mut acc = 0.0;
+                    acc += d[1] * self.t3[i][j][k];
+                    acc += d[2] * self.h[i][j] * self.g[k];
+                    acc += d[2] * self.h[i][k] * self.g[j];
+                    acc += d[2] * self.g[i] * self.h[j][k];
+                    acc += d[3] * self.g[i] * self.g[j] * self.g[k];
+                    out.t3[i][j][k] = acc;
+                }
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    for l in 0..K {
+                        // Bell(4)=15 partitions, walker enumeration order.
+                        let mut acc = 0.0;
+                        acc += d[1] * self.t4[i][j][k][l];
+                        acc += d[2] * self.t3[i][j][k] * self.g[l];
+                        acc += d[2] * self.t3[i][j][l] * self.g[k];
+                        acc += d[2] * self.h[i][j] * self.h[k][l];
+                        acc += d[3] * self.h[i][j] * self.g[k] * self.g[l];
+                        acc += d[2] * self.t3[i][k][l] * self.g[j];
+                        acc += d[2] * self.h[i][k] * self.h[j][l];
+                        acc += d[3] * self.h[i][k] * self.g[j] * self.g[l];
+                        acc += d[2] * self.h[i][l] * self.h[j][k];
+                        acc += d[2] * self.g[i] * self.t3[j][k][l];
+                        acc += d[3] * self.g[i] * self.h[j][k] * self.g[l];
+                        acc += d[3] * self.h[i][l] * self.g[j] * self.g[k];
+                        acc += d[3] * self.g[i] * self.h[j][l] * self.g[k];
+                        acc += d[3] * self.g[i] * self.g[j] * self.h[k][l];
+                        acc += d[4] * self.g[i] * self.g[j] * self.g[k] * self.g[l];
+                        out.t4[i][j][k][l] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Multiply every channel by a plain scalar.
+    pub fn scale(&self, s: f64) -> Self {
+        let mut out = *self;
+        out.v *= s;
+        for i in 0..K {
+            out.g[i] *= s;
+            for j in 0..K {
+                out.h[i][j] *= s;
+                for k in 0..K {
+                    out.t3[i][j][k] *= s;
+                    for l in 0..K {
+                        out.t4[i][j][k][l] *= s;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// e^self.
+    pub fn exp(&self) -> Self {
+        let e = self.v.exp();
+        self.compose_unary([e, e, e, e, e])
+    }
+
+    /// ln(self). Caller guarantees positivity (likelihood programs do).
+    pub fn ln(&self) -> Self {
+        let u = self.v;
+        let r = 1.0 / u;
+        self.compose_unary([u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r])
+    }
+
+    /// 1/self.
+    pub fn recip(&self) -> Self {
+        let r = 1.0 / self.v;
+        let r2 = r * r;
+        self.compose_unary([r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
+    }
+
+    /// √self. Caller guarantees positivity.
+    pub fn sqrt(&self) -> Self {
+        self.compose_unary(sqrt_derivative_stack(self.v))
+    }
+
+    /// self^a for real exponent `a`. Caller guarantees a positive base.
+    pub fn powf(&self, a: f64) -> Self {
+        self.compose_unary(power_derivative_stack(self.v, a))
+    }
+
+    /// ln Γ(self). Caller guarantees positivity.
+    pub fn ln_gamma(&self) -> Self {
+        self.compose_unary(ln_gamma_derivative_stack(self.v))
+    }
+}
+
+impl<const K: usize> jet_algebra::JetAlgebra<5> for Tower4<K> {
+    #[inline]
+    fn derivative(&self, labels: &[usize]) -> f64 {
+        self.deriv(labels)
+    }
+
+    fn map_derivatives<F>(&self, mut f: F) -> Self
+    where
+        F: FnMut(&[usize]) -> f64,
+    {
+        let mut out = Self::zero();
+        out.v = f(&[]);
+        for i in 0..K {
+            let labels = [i];
+            out.g[i] = f(&labels);
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let labels = [i, j];
+                out.h[i][j] = f(&labels);
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    let labels = [i, j, k];
+                    out.t3[i][j][k] = f(&labels);
+                }
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    for l in 0..K {
+                        let labels = [i, j, k, l];
+                        out.t4[i][j][k][l] = f(&labels);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Truncated SECOND-order multivariate Taylor scalar in `K` variables.
+///
+/// This is the value/gradient/Hessian-only sibling of [`Tower4`]. Every
+/// channel it carries (`v`, `g`, `h`) is computed by the SAME formulas
+/// [`Tower4`] uses for those orders, so for any program written over both
+/// towers the order-≤2 outputs are *bit-identical*: the order-2 Leibniz and
+/// Faà-di-Bruno terms read only the order-≤2 channels of their inputs (see
+/// [`Tower4::mul`] / [`Tower4::compose_unary`] — `out.h` never touches `t3`
+/// or `t4`), so dropping the third/fourth tensors cannot perturb the value,
+/// gradient, or Hessian.
+///
+/// It exists purely for performance: an inner Newton step and a value-only
+/// outer-objective probe need at most curvature, never the outer-κ/ψ
+/// third/fourth derivatives. Evaluating a row likelihood over
+/// `Tower2` skips the `K⁴` fourth-tensor product/composition arithmetic that
+/// dominates the cold marginal-slope fit, while returning the exact same
+/// `(v, g, h)`.
+#[derive(Clone, Copy, Debug)]
+pub struct Tower2<const K: usize> {
+    /// Value ℓ.
+    pub v: f64,
+    /// Gradient ∂ℓ/∂p_a.
+    pub g: [f64; K],
+    /// Hessian ∂²ℓ/∂p_a∂p_b (symmetric).
+    pub h: [[f64; K]; K],
+}
+
+impl<const K: usize> Tower2<K> {
+    /// The additive identity.
+    pub fn zero() -> Self {
+        Self {
+            v: 0.0,
+            g: [0.0; K],
+            h: [[0.0; K]; K],
+        }
+    }
+
+    /// A constant: value `c`, all derivatives zero.
+    pub fn constant(c: f64) -> Self {
+        let mut out = Self::zero();
+        out.v = c;
+        out
+    }
+
+    /// The seeded variable `p_idx` with current value `value`:
+    /// unit first derivative in slot `idx`, zero elsewhere and above.
+    pub fn variable(value: f64, idx: usize) -> Self {
+        let mut out = Self::constant(value);
+        out.g[idx] = 1.0;
+        out
+    }
+
+    /// Read the derivative tensor entry whose differentiation axes are
+    /// `labels` (length 0..=2): value, `g`, `h`.
+    #[inline]
+    fn deriv(&self, labels: &[usize]) -> f64 {
+        assert!(
+            labels.len() <= 2,
+            "Tower2 carries at most second-order derivatives"
+        );
+        match labels.len() {
+            0 => self.v,
+            1 => self.g[labels[0]],
+            _ => self.h[labels[0]][labels[1]],
+        }
+    }
+
+    /// Exact truncated (order ≤ 2) Leibniz product. The `v`/`g`/`h` upper
+    /// triangle matches [`Tower4::mul`] term-for-term.
+    ///
+    /// # Symmetry fast path
+    ///
+    /// The order-≤2 Leibniz Hessian
+    /// `h[i][j] = a.v·b.h[i][j] + a.g[i]·b.g[j] + a.g[j]·b.g[i] + a.h[i][j]·b.v`
+    /// is symmetric under `i ↔ j` whenever the operand Hessians are — which they
+    /// always are: `constant`/`variable` seed a symmetric (zero) `h`, and
+    /// `mul`/`compose_unary`/`add`/`scale` each preserve symmetry, so the
+    /// invariant holds for every tower a row program can build. We therefore
+    /// compute only the upper triangle `j ≥ i` and mirror it into the lower
+    /// triangle. At the `K = 9` survival width that is `K(K+1)/2 = 45` four-product
+    /// entry evaluations instead of `K² = 81`, and the win is larger in wall-clock
+    /// because the `648`-entry `h` spills at `K = 9` — halving the expensive
+    /// stores/reloads roughly halves the kernel (measured ≈2× on a `Tower2<9>`
+    /// mul-and-read throughput microbench; the dominant `mul` under every packed
+    /// scalar bottoms out here).
+    ///
+    /// The upper-triangle entries are BIT-IDENTICAL to the old rectangular form
+    /// (same term/accumulation order). The lower triangle now equals its mirror
+    /// exactly, where the rectangular form rounded `h[i][j]` and `h[j][i]`
+    /// independently (the two cross products accumulate in opposite order) and
+    /// left a ≤1-ulp asymmetry; mirroring removes it, so the result is exactly
+    /// symmetric — strictly closer to the true symmetric Hessian, not merely a
+    /// reordering. Dense-`h` consumers are all tolerance-gated (rel-tol ≥ 1e-11 ≫
+    /// 1e-16).
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let mut out = Self::zero();
+        out.v = a.v * b.v;
+        for i in 0..K {
+            out.g[i] = a.v * b.g[i] + a.g[i] * b.v;
+        }
+        for i in 0..K {
+            for j in i..K {
+                let hij = a.v * b.h[i][j] + a.g[i] * b.g[j] + a.g[j] * b.g[i] + a.h[i][j] * b.v;
+                out.h[i][j] = hij;
+                out.h[j][i] = hij;
+            }
+        }
+        out
+    }
+
+    /// Exact (order ≤ 2) multivariate Faà di Bruno composition `f ∘ self`.
+    ///
+    /// `d = [f(u), f′(u), f″(u)]` evaluated at `u = self.v`. The `v`/`g`/`h`
+    /// channels match [`Tower4::compose_unary`] term-for-term (which uses only
+    /// `d[0..=2]` for those orders), so this is a strict truncation, not an
+    /// approximation. The full-order `[f64; 5]` derivative stacks the families
+    /// already produce can be passed by slicing their first three entries.
+    ///
+    /// # Codegen
+    ///
+    /// Order-≤2 Faà di Bruno is a tiny closed form, so this evaluates it
+    /// directly instead of routing through the generic
+    /// `jet_algebra::faa_di_bruno` set-partition walker (recursion + per-block
+    /// closure dispatch). That matters because this is the kernel under EVERY
+    /// packed scalar — [`crate::jet_scalar::Order2`] / `OneSeed` / `TwoSeed`
+    /// composition all bottom out here — so the straight-line form (whose inner
+    /// loops auto-vectorise to NEON/SSE 2-wide and which emits zero outlined
+    /// walker calls) lifts all of them at once.
+    ///
+    /// The term and accumulation order is BIT-IDENTICAL to the walker it
+    /// replaces: each output channel mirrors the walker's `total = 0.0` start
+    /// (the explicit `acc` accumulator), so a signed-zero product collapses to
+    /// `+0.0` exactly as `total += prod` does. Proven `to_bits`-identical on
+    /// `v`/`g`/`h` across `K ∈ {2,3,4,9}`, 5000 random inputs each (incl.
+    /// zeroed / sign-varied stacks). The order-≤2 walker partitions are:
+    ///   `g[i]`   = `f′·u_i`                   (single block `{i}`)
+    ///   `h[i][j]` = `f′·u_ij + (f″·u_i)·u_j`  (blocks `{ij}` then `{i}{j}`),
+    /// with `f′ = d[1]`, `f″ = d[2]`, `u_* = self.{g,h}`.
+    pub fn compose_unary(&self, d: [f64; 3]) -> Self {
+        let mut out = Self::zero();
+        out.v = d[0];
+        for i in 0..K {
+            let mut acc = 0.0;
+            acc += d[1] * self.g[i];
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = 0.0;
+                acc += d[1] * self.h[i][j];
+                acc += d[2] * self.g[i] * self.g[j];
+                out.h[i][j] = acc;
+            }
+        }
+        out
+    }
+
+    /// Multiply every channel by a plain scalar.
+    pub fn scale(&self, s: f64) -> Self {
+        let mut out = *self;
+        out.v *= s;
+        for i in 0..K {
+            out.g[i] *= s;
+            for j in 0..K {
+                out.h[i][j] *= s;
+            }
+        }
+        out
+    }
+
+    /// e^self.
+    pub fn exp(&self) -> Self {
+        let e = self.v.exp();
+        self.compose_unary([e, e, e])
+    }
+
+    /// √self. Caller guarantees positivity.
+    pub fn sqrt(&self) -> Self {
+        self.compose_unary(sqrt_derivative_stack(self.v))
+    }
+}
+
+impl<const K: usize> jet_algebra::JetAlgebra<3> for Tower2<K> {
+    #[inline]
+    fn derivative(&self, labels: &[usize]) -> f64 {
+        self.deriv(labels)
+    }
+
+    fn map_derivatives<F>(&self, mut f: F) -> Self
+    where
+        F: FnMut(&[usize]) -> f64,
+    {
+        let mut out = Self::zero();
+        out.v = f(&[]);
+        for i in 0..K {
+            let labels = [i];
+            out.g[i] = f(&labels);
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let labels = [i, j];
+                out.h[i][j] = f(&labels);
+            }
+        }
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Add for Tower2<K> {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        let mut out = self;
+        out.v += o.v;
+        for i in 0..K {
+            out.g[i] += o.g[i];
+            for j in 0..K {
+                out.h[i][j] += o.h[i][j];
+            }
+        }
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Mul for Tower2<K> {
+    type Output = Self;
+    fn mul(self, o: Self) -> Self {
+        Tower2::mul(&self, &o)
+    }
+}
+
+impl<const K: usize> std::ops::Add<f64> for Tower2<K> {
+    type Output = Self;
+    fn add(self, c: f64) -> Self {
+        let mut out = self;
+        out.v += c;
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Mul<f64> for Tower2<K> {
+    type Output = Self;
+    fn mul(self, c: f64) -> Self {
+        self.scale(c)
+    }
+}
+
+/// Truncated THIRD-order multivariate Taylor scalar in `K` variables.
+///
+/// The value/gradient/Hessian/third-derivative sibling of [`Tower4`], standing
+/// between [`Tower2`] and [`Tower4`]. Every channel it carries (`v`, `g`, `h`,
+/// `t3`) is computed by the SAME shared Leibniz / Faà-di-Bruno kernels
+/// [`Tower4`] uses for those orders, and the order-≤3 terms of those kernels
+/// read only the order-≤3 channels of their inputs (the order-3 Faà-di-Bruno
+/// partitions never reach the f⁗ stack slot or the inner `t4` tensor — see
+/// [`Tower4::compose_unary`]). So for any program written over both towers the
+/// order-≤3 outputs are *bit-identical*: dropping the fourth tensor cannot
+/// perturb the value, gradient, Hessian, or third derivatives.
+///
+/// It exists purely for performance, exactly like [`Tower2`]: a consumer that
+/// needs up to third derivatives (the survival location-scale row kernel reads
+/// `g`, the diagonal `h`, and the diagonal `t3`, but never `t4`) pays the
+/// `K³` third-tensor arithmetic but skips the `K⁴` fourth-tensor
+/// product/composition that otherwise dominates the per-row cost.
+#[derive(Clone, Copy, Debug)]
+pub struct Tower3<const K: usize> {
+    /// Value ℓ.
+    pub v: f64,
+    /// Gradient ∂ℓ/∂p_a.
+    pub g: [f64; K],
+    /// Hessian ∂²ℓ/∂p_a∂p_b (symmetric).
+    pub h: [[f64; K]; K],
+    /// Third derivatives ∂³ℓ/∂p_a∂p_b∂p_c (fully symmetric).
+    pub t3: [[[f64; K]; K]; K],
+}
+
+impl<const K: usize> Tower3<K> {
+    /// The additive identity.
+    pub fn zero() -> Self {
+        Self {
+            v: 0.0,
+            g: [0.0; K],
+            h: [[0.0; K]; K],
+            t3: [[[0.0; K]; K]; K],
+        }
+    }
+
+    /// A constant: value `c`, all derivatives zero.
+    pub fn constant(c: f64) -> Self {
+        let mut out = Self::zero();
+        out.v = c;
+        out
+    }
+
+    /// The seeded variable `p_idx` with current value `value`:
+    /// unit first derivative in slot `idx`, zero elsewhere and above.
+    pub fn variable(value: f64, idx: usize) -> Self {
+        let mut out = Self::constant(value);
+        out.g[idx] = 1.0;
+        out
+    }
+
+    /// Read the (fully symmetric) derivative tensor entry whose differentiation
+    /// axes are `labels` (length 0..=3): value, `g`, `h`, `t3`.
+    #[inline]
+    fn deriv(&self, labels: &[usize]) -> f64 {
+        assert!(
+            labels.len() <= 3,
+            "Tower3 carries at most third-order derivatives"
+        );
+        match labels.len() {
+            0 => self.v,
+            1 => self.g[labels[0]],
+            2 => self.h[labels[0]][labels[1]],
+            _ => self.t3[labels[0]][labels[1]][labels[2]],
+        }
+    }
+
+    /// Exact truncated (order ≤ 3) Leibniz product. The `v`/`g`/`h`/`t3`
+    /// channels match [`Tower4::mul`] term-for-term.
+    ///
+    /// # Codegen
+    ///
+    /// Straight-line per-entry subset sums instead of the
+    /// `jet_algebra::leibniz_product` walker — the order-≤3 sibling of
+    /// [`Tower4::mul`] (no `t4`). Loop nest unchanged, no unroll over `K`, no
+    /// code bloat; auto-vectorises. BIT-IDENTICAL: terms in the walker's exact
+    /// subset order with an `acc = 0.0` accumulator start (load-bearing for the
+    /// signed-zero leading product on exact-`0.0` jet channels). Proven
+    /// `to_bits`-identical on `v`/`g`/`h`/`t3` across `K ∈ {2,3,4,9}`, 5000
+    /// zero/sign-stressed inputs each (these channel formulas are exactly the
+    /// `g`/`h`/`t3` of the [`Tower4::mul`] oracle, which passes that stress).
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let mut out = Self::zero();
+        out.v = a.v * b.v;
+        for i in 0..K {
+            let mut acc = 0.0;
+            acc += a.v * b.g[i];
+            acc += a.g[i] * b.v;
+            out.g[i] = acc;
+        }
+        // Hessian is symmetric under i↔j; upper triangle + mirror (see Tower2::mul).
+        for i in 0..K {
+            for j in i..K {
+                let mut acc = 0.0;
+                acc += a.v * b.h[i][j];
+                acc += a.g[i] * b.g[j];
+                acc += a.g[j] * b.g[i];
+                acc += a.h[i][j] * b.v;
+                out.h[i][j] = acc;
+                out.h[j][i] = acc;
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    // subsets of {i,j,k}: {} {i} {j} {ij} {k} {ik} {jk} {ijk}
+                    let mut acc = 0.0;
+                    acc += a.v * b.t3[i][j][k];
+                    acc += a.g[i] * b.h[j][k];
+                    acc += a.g[j] * b.h[i][k];
+                    acc += a.h[i][j] * b.g[k];
+                    acc += a.g[k] * b.h[i][j];
+                    acc += a.h[i][k] * b.g[j];
+                    acc += a.h[j][k] * b.g[i];
+                    acc += a.t3[i][j][k] * b.v;
+                    out.t3[i][j][k] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    /// Ref-taking elementwise sum, the by-ref twin of the `std::ops::Add`
+    /// operator (which consumes by value). Mirrors the inherent `mul`/`scale`
+    /// API so a chain like `a.mul(&b).add(&c)` reads uniformly without moving
+    /// out of the borrowed operands.
+    pub fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+
+    /// Ref-taking elementwise difference, the by-ref twin of `std::ops::Sub`.
+    pub fn sub(&self, o: &Self) -> Self {
+        *self + o.scale(-1.0)
+    }
+
+    /// Exact (order ≤ 3) multivariate Faà di Bruno composition `f ∘ self`.
+    ///
+    /// `d = [f(u), f′(u), f″(u), f‴(u)]` evaluated at `u = self.v`. The
+    /// `v`/`g`/`h`/`t3` channels match [`Tower4::compose_unary`] term-for-term
+    /// (which uses only `d[0..=3]` for those orders), so this is a strict
+    /// truncation, not an approximation. The full-order `[f64; 5]` derivative
+    /// stacks the families already produce can be passed by slicing their first
+    /// four entries.
+    ///
+    /// # Codegen
+    ///
+    /// Order-≤3 Faà di Bruno written as a compact closed form instead of the
+    /// recursive `jet_algebra::faa_di_bruno` walker — the order-≤2 sibling of
+    /// [`Tower4::compose_unary`], one tensor order shallower. The loop nest is
+    /// unchanged (no unroll over `K`, no code bloat: measured on a `Tower3<9>`
+    /// compose-and-read consumer the new form is faster and SMALLER — asm: 71
+    /// walker `bl` calls → 0, 39.5 KiB → 13.9 KiB, +197 NEON `.2d` ops).
+    /// BIT-IDENTICAL: terms in the walker's exact partition order, left-
+    /// associated block products, `acc = 0.0` accumulator start. Proven
+    /// `to_bits`-identical on `v`/`g`/`h`/`t3` across `K ∈ {2,3,4,9}`, 5000
+    /// random inputs each.
+    pub fn compose_unary(&self, d: [f64; 4]) -> Self {
+        let mut out = Self::zero();
+        out.v = d[0];
+        for i in 0..K {
+            let mut acc = 0.0;
+            acc += d[1] * self.g[i];
+            out.g[i] = acc;
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = 0.0;
+                acc += d[1] * self.h[i][j];
+                acc += d[2] * self.g[i] * self.g[j];
+                out.h[i][j] = acc;
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    // walker partitions: {ijk} {ij}{k} {ik}{j} {i}{jk} {i}{j}{k}
+                    let mut acc = 0.0;
+                    acc += d[1] * self.t3[i][j][k];
+                    acc += d[2] * self.h[i][j] * self.g[k];
+                    acc += d[2] * self.h[i][k] * self.g[j];
+                    acc += d[2] * self.g[i] * self.h[j][k];
+                    acc += d[3] * self.g[i] * self.g[j] * self.g[k];
+                    out.t3[i][j][k] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    /// Compose with a unary special-function whose `[f64; 4]` derivative stack is
+    /// built from the base value through `stack_fn`. Evaluates `stack_fn(self.v)`
+    /// once and forwards to [`Self::compose_unary`], so it is bit-identical to the
+    /// explicit form. `Tower4` has no such helper;
+    /// build its five-entry stack and call `Tower4::compose_unary`.
+    #[inline]
+    pub fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 4]) -> Self {
+        self.compose_unary(stack_fn(self.v))
+    }
+
+    /// Multiply every channel by a plain scalar.
+    pub fn scale(&self, s: f64) -> Self {
+        let mut out = *self;
+        out.v *= s;
+        for i in 0..K {
+            out.g[i] *= s;
+            for j in 0..K {
+                out.h[i][j] *= s;
+                for k in 0..K {
+                    out.t3[i][j][k] *= s;
+                }
+            }
+        }
+        out
+    }
+}
+
+impl<const K: usize> jet_algebra::JetAlgebra<4> for Tower3<K> {
+    #[inline]
+    fn derivative(&self, labels: &[usize]) -> f64 {
+        self.deriv(labels)
+    }
+
+    fn map_derivatives<F>(&self, mut f: F) -> Self
+    where
+        F: FnMut(&[usize]) -> f64,
+    {
+        let mut out = Self::zero();
+        out.v = f(&[]);
+        for i in 0..K {
+            let labels = [i];
+            out.g[i] = f(&labels);
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let labels = [i, j];
+                out.h[i][j] = f(&labels);
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    let labels = [i, j, k];
+                    out.t3[i][j][k] = f(&labels);
+                }
+            }
+        }
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Add for Tower3<K> {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        let mut out = self;
+        out.v += o.v;
+        for i in 0..K {
+            out.g[i] += o.g[i];
+            for j in 0..K {
+                out.h[i][j] += o.h[i][j];
+                for k in 0..K {
+                    out.t3[i][j][k] += o.t3[i][j][k];
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Derivatives of `u^a` for a positive base. For a nonnegative integer
+/// exponent, derivatives above the polynomial degree are identically zero;
+/// do not evaluate their negative powers and turn `0 * infinity` into NaN.
+#[inline]
+pub(crate) fn power_derivative_stack<const N: usize>(u: f64, a: f64) -> [f64; N] {
+    let mut derivatives = [0.0; N];
+    derivatives[0] = u.powf(a);
+    let mut coefficient = 1.0;
+    for (order, derivative) in derivatives.iter_mut().enumerate().skip(1) {
+        let factor = a - (order - 1) as f64;
+        if factor == 0.0 {
+            break;
+        }
+        coefficient *= factor;
+        *derivative = coefficient * u.powf(a - order as f64);
+    }
+    derivatives
+}
+
+/// Square-root derivatives, dividing successively instead of forming a
+/// denominator that can overflow while its reciprocal is still subnormal.
+#[inline]
+pub(crate) fn sqrt_derivative_stack<const N: usize>(u: f64) -> [f64; N] {
+    let root = u.sqrt();
+    let mut derivatives = [0.0; N];
+    derivatives[0] = root;
+    let mut coefficient = 0.5;
+    for (order, derivative) in derivatives.iter_mut().enumerate().skip(1) {
+        if order > 1 {
+            coefficient *= 1.5 - order as f64;
+        }
+        let mut value = coefficient / root;
+        for _ in 1..order {
+            value /= u;
+        }
+        *derivative = value;
+    }
+    derivatives
+}
+
+pub(crate) fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
+    let [digamma, trigamma, tetragamma, pentagamma, _] = polygamma_positive_stack(x, 4);
+    [
+        statrs::function::gamma::ln_gamma(x),
+        digamma,
+        trigamma,
+        tetragamma,
+        pentagamma,
+    ]
+}
+
+pub(crate) fn digamma_derivative_stack(x: f64) -> [f64; 5] {
+    polygamma_positive_stack(x, POLYGAMMA_STACK_ORDERS)
+}
+
+pub(crate) fn digamma_positive(x: f64) -> f64 {
+    polygamma_positive_stack(x, 1)[0]
+}
+
+pub(crate) fn polygamma_positive<const ORDER: usize>(x: f64) -> f64 {
+    polygamma_positive_stack(x, ORDER + 1)[ORDER]
+}
+
+/// Derivative orders the polygamma kernel carries: `ψ` through `ψ₄`.
+pub(crate) const POLYGAMMA_STACK_ORDERS: usize = 5;
+
+/// `[ψ(x), ψ₁(x), …]` through the first `orders` entries (at most five) from one
+/// walk of the recurrence, for `x > 0`; those entries are `NaN` otherwise, and the
+/// entries past `orders` are zero.
+///
+/// Every order reads the same reciprocal of each shifted argument, so a step of
+/// the recurrence costs one division whatever the number of orders, and the
+/// asymptotic tail is one division and a Horner polynomial in `x⁻²`. The
+/// arithmetic of entry `k` does not depend on `orders`, so the scalar
+/// [`digamma_positive`] and [`polygamma_positive`] are this kernel's entries,
+/// bit for bit, and so is every stack.
+#[inline(always)]
+pub(crate) fn polygamma_positive_stack(mut x: f64, orders: usize) -> [f64; POLYGAMMA_STACK_ORDERS] {
+    let orders = orders.min(POLYGAMMA_STACK_ORDERS);
+    let mut out = [0.0; POLYGAMMA_STACK_ORDERS];
+    if !(x.is_finite() && x > 0.0) {
+        out[..orders].fill(f64::NAN);
+        return out;
+    }
+    // ψ_k(x) = ψ_k(x + 1) − (−1)^k k! x^{−(k+1)}.
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        let inverse = 1.0 / x;
+        let mut power = inverse;
+        for (entry, coefficient) in out[..orders].iter_mut().zip(POLYGAMMA_RECURRENCE) {
+            *entry += coefficient * power;
+            power *= inverse;
+        }
+        x += 1.0;
+    }
+    let inverse = 1.0 / x;
+    let inverse_squared = inverse * inverse;
+    let mut power = 1.0;
+    for (order, entry) in out[..orders].iter_mut().enumerate() {
+        let mut tail = 0.0;
+        for coefficient in POLYGAMMA_ASYMPTOTIC_TAIL[order].iter().rev() {
+            tail = tail * inverse_squared + coefficient;
+        }
+        let series = if order == 0 {
+            x.ln() - 0.5 * inverse + inverse_squared * tail
+        } else {
+            let [leading, half_term] = POLYGAMMA_ASYMPTOTIC_LEADING[order];
+            power *= inverse;
+            power * (leading + half_term * inverse + inverse_squared * tail)
+        };
+        *entry += series;
+    }
+    out
+}
+
+/// `[ψ(x + ½) − ψ(x), ψ₁(x + ½) − ψ₁(x), …]`: [`polygamma_shift_gap_stack`] at
+/// the half shift the Student-t ν-score reads.
+pub(crate) fn polygamma_half_shift_gap_stack(
+    x: f64,
+    orders: usize,
+) -> [f64; POLYGAMMA_STACK_ORDERS] {
+    polygamma_shift_gap_stack(x, 0.5, orders)
+}
+
+/// `[ψ(x + s) − ψ(x), ψ₁(x + s) − ψ₁(x), …]` through the first `orders` entries
+/// (at most five), for `x > 0` and finite `s ≥ 0`; those entries are `NaN`
+/// otherwise, and the entries past `orders` are zero.
+///
+/// For `s ≪ x` the gap is `O(s·x^{−(k+1)})` while `ψ(x)` is `O(ln x)` and
+/// `ψ_k(x)` is `O(x^{−k})`, so subtracting two [`polygamma_positive_stack`]
+/// values loses about `log₂(x·ln x / s)` bits for `ψ` and `log₂(x/s)` bits for
+/// `ψ_k`: at `x = 2.5·10⁷, s = ½` the digamma difference keeps about seven
+/// significant digits. Here every term of the recurrence and of the asymptotic
+/// series is differenced in closed form instead,
+/// `c·[(x+s)^{−m} − x^{−m}] = c·x^{−m}·δ_m` with `δ_m = (1 + s/x)^{−m} − 1`, and
+/// the logarithm as `ln(1 + s/x)`. Every `δ_m` has the sign of
+/// `δ₁ = −s/(x + s)` and follows from `δ_m = ρ·δ_{m−1} + δ₁`, `ρ = x/(x + s)`, a
+/// sum of like-signed terms. The recurrence terms and the two leading asymptotic
+/// terms of one order share the gap's sign, and the alternating Bernoulli tail
+/// is below `x⁻² ≤ 1/400` of them, so the result is correct to a few ulps
+/// relative at every `x` and every shift. The two fractions use a bounded
+/// smaller-to-larger ratio, so `x+s` need not be representable. The half-shift
+/// kernel reads this same implementation at `s = ½`.
+pub(crate) fn polygamma_shift_gap_stack(
+    mut x: f64,
+    shift: f64,
+    orders: usize,
+) -> [f64; POLYGAMMA_STACK_ORDERS] {
+    const DELTA_ORDERS: usize = POLYGAMMA_STACK_ORDERS + 2 * BERNOULLI_EVEN.len();
+    let orders = orders.min(POLYGAMMA_STACK_ORDERS);
+    let mut out = [0.0; POLYGAMMA_STACK_ORDERS];
+    if !(x.is_finite() && x > 0.0 && shift.is_finite() && shift >= 0.0) {
+        out[..orders].fill(f64::NAN);
+        return out;
+    }
+    if shift == 0.0 {
+        return out;
+    }
+    // `δ[m] = (1 + s/x)^{−m} − 1` for `m = 0, …, DELTA_ORDERS`.
+    let deltas = |x: f64, top: usize| {
+        let mut delta = [0.0; DELTA_ORDERS + 1];
+        let (ratio, first) = positive_shift_fractions(x, shift);
+        for m in 1..=top {
+            delta[m] = ratio * delta[m - 1] + first;
+        }
+        delta
+    };
+    // gap_k(x) = gap_k(x + 1) + (−1)^{k+1} k! x^{−(k+1)} δ_{k+1}.
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        let delta = deltas(x, orders);
+        let inverse = 1.0 / x;
+        let mut power = inverse;
+        for (order, (entry, coefficient)) in
+            out[..orders].iter_mut().zip(POLYGAMMA_RECURRENCE).enumerate()
+        {
+            *entry += coefficient * power * delta[order + 1];
+            power *= inverse;
+        }
+        x += 1.0;
+    }
+    let delta = deltas(x, orders + 2 * BERNOULLI_EVEN.len());
+    let inverse = 1.0 / x;
+    let inverse_squared = inverse * inverse;
+    let mut power = 1.0;
+    for (order, entry) in out[..orders].iter_mut().enumerate() {
+        // The Bernoulli tail `x^{−k} Σ_j c_j x^{−2j}`, term by term against
+        // `δ_{k+2j}`, summed from the smallest term up.
+        let mut tail = 0.0;
+        for (index, coefficient) in POLYGAMMA_ASYMPTOTIC_TAIL[order].iter().enumerate().rev() {
+            tail = tail * inverse_squared + coefficient * delta[order + 2 * (index + 1)];
+        }
+        let series = if order == 0 {
+            (shift * inverse).ln_1p() - 0.5 * inverse * delta[1] + inverse_squared * tail
+        } else {
+            let [leading, half_term] = POLYGAMMA_ASYMPTOTIC_LEADING[order];
+            power *= inverse;
+            power
+                * (leading * delta[order]
+                    + half_term * inverse * delta[order + 1]
+                    + inverse_squared * tail)
+        };
+        *entry += series;
+    }
+    out
+}
+
+/// `ln Γ(x + s) − ln Γ(x)` for `x > 0` and finite `s ≥ 0`, `NaN` otherwise: the
+/// value slot above [`polygamma_shift_gap_stack`]'s digamma gap.
+///
+/// Two separate `ln Γ` values of size `x ln x` leave an absolute error of about
+/// `x ln x · ε` on an `s ln x` difference (`2·10⁻⁸` at `x = 10⁸, s = 3`). Here
+/// at `x ≥ 20` Stirling's series is differenced in closed form,
+/// `s ln x + (x + s − ½) ln(1 + s/x) − s + Σ_j B_{2j}/(2j(2j−1)) x^{1−2j} δ_{2j−1}`
+/// with the same `δ_m = (1 + s/x)^{−m} − 1`, which is within a few ulps of
+/// `max(|gap|, 1)`. Below 20 the recurrence removes `ln(1 + s/x_k)` per unit
+/// step: steps with `s/x_k < 1` are multiplied together as `Π(1 + t_k) − 1`
+/// and taken through one `ln_1p`, the rest are summed as `ln_1p(t_k)` (or
+/// `ln s − ln x_k` once `s/x_k` overflows). That subtraction can cancel against
+/// the Stirling part, so there the error is about `10⁻¹⁴ · max(|gap|, 1)`.
+pub(crate) fn ln_gamma_shift_gap(x: f64, shift: f64) -> f64 {
+    ln_gamma_shift_gap_with_error(x, shift).0
+}
+
+/// The same live evaluator with a first-omitted Stirling remainder and an
+/// arithmetic allowance based on the uncancelled terms. This is used when a
+/// root residual must account for its normalization rather than treating a
+/// log-gamma difference as one correctly rounded logarithm. The analytic
+/// remainder is the sum of the first omitted alternating Stirling terms,
+/// bounded at the smaller argument x. The arithmetic allowance uses the
+/// uncancelled magnitude and 256 roundings: at most 20 recurrence steps
+/// (five operations each), 20 two-operation delta updates, 10 three-operation
+/// tail updates, logarithms, products and compensated final assembly. libm 0.2.16
+/// log.rs and log1p.rs document errors below one ulp; two unit roundoffs per
+/// logarithm are included. This is a floating-point allowance, not interval
+/// arithmetic with directed rounding of the allowance itself.
+pub(crate) fn ln_gamma_shift_gap_with_error(mut x: f64, shift: f64) -> (f64, f64) {
+    if !(x.is_finite() && x > 0.0 && shift.is_finite() && shift >= 0.0) {
+        return (f64::NAN, f64::NAN);
+    }
+    if shift == 0.0 {
+        return (0.0, 0.0);
+    }
+    let mut recurrence = 0.0;
+    let mut small_product_minus_one: f64 = 0.0;
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        let t = shift / x;
+        if t < 1.0 {
+            small_product_minus_one += (1.0 + small_product_minus_one) * t;
+        } else if t.is_finite() {
+            recurrence += libm::log1p(t);
+        } else {
+            recurrence += libm::log(shift) - libm::log(x);
+        }
+        x += 1.0;
+    }
+    recurrence += libm::log1p(small_product_minus_one);
+    let mut delta = [0.0; 2 * BERNOULLI_EVEN.len()];
+    let (ratio, first) = positive_shift_fractions(x, shift);
+    for m in 1..delta.len() {
+        delta[m] = ratio * delta[m - 1] + first;
+    }
+    let inverse = 1.0 / x;
+    let inverse_squared = inverse * inverse;
+    let mut tail = 0.0;
+    for &(power, bernoulli) in BERNOULLI_EVEN.iter().rev() {
+        let coefficient = bernoulli / (power * (power - 1)) as f64;
+        tail = tail * inverse_squared + coefficient * delta[power - 1];
+    }
+    let terms = [
+        shift * libm::log(x),
+        // x+shift can overflow although the gap is finite (MAX, 1e292).
+        (x - 0.5) * libm::log1p(shift * inverse),
+        shift * libm::log1p(shift * inverse),
+        -shift,
+        inverse * tail,
+        -recurrence,
+    ];
+    let mut sum = crate::sparse_grid::CompensatedSum::default();
+    for term in terms {
+        sum.add(term);
+    }
+    let magnitude = terms.iter().map(|x| x.abs()).sum::<f64>();
+    let remainder = 2.0 * (854513.0 / 63756.0) * inverse.powi(21);
+    (
+        sum.value(),
+        remainder
+            + crate::roundoff::accumulation_growth(256) * magnitude
+            + 256.0 * crate::double_double::SMALLEST_SUBNORMAL,
+    )
+}
+
+// `(x/(x+s), -s/(x+s))` without forming a possibly overflowing sum.
+// The smaller-to-larger ratio is at most one, so both fractions stay resolved.
+#[inline]
+fn positive_shift_fractions(x: f64, shift: f64) -> (f64, f64) {
+    if shift <= x {
+        let ratio = shift / x;
+        let denominator = 1.0 + ratio;
+        (1.0 / denominator, -ratio / denominator)
+    } else {
+        let ratio = x / shift;
+        let denominator = 1.0 + ratio;
+        (ratio / denominator, -1.0 / denominator)
+    }
+}
+
+/// Binet's remainder `r(x) = lnΓ(x) − (x − ½) ln x + x − ½ ln 2π` of Stirling's
+/// formula, for `x > 0`; `NaN` otherwise.
+///
+/// `r` is positive and decreasing. Below the asymptotic switch it walks
+/// `r(x) = r(x + 1) + t(x)` with `t(x) = (x + ½) ln(1 + 1/x) − 1`, which is
+/// `atanh(u)/u − 1 = Σ_{k≥1} u^{2k}/(2k + 1)` for `u = 1/(2x + 1)`: a sum of
+/// positive terms, summed until the next one no longer changes it. That series
+/// converges at least as fast as `9^{−k}` for `x ≥ 1`. For `x < 1` the closed
+/// form `(x + ½)(ln(1 + x) − ln x) − 1` is used instead (finite down to the
+/// smallest subnormal `x`), and there `t > t(1) = 0.0397` against a minuend of
+/// `1 + t`, a loss under five bits. From the switch
+/// on it is the Bernoulli series `Σ_j B_{2j}/(2j(2j − 1)) x^{1−2j}` through `B₂₀`.
+/// Every piece is positive, so `r` is correct to a few ulps relative.
+pub(crate) fn ln_gamma_binet_remainder(mut x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return f64::NAN;
+    }
+    let mut remainder = 0.0;
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        remainder += binet_recurrence_step(x);
+        x += 1.0;
+    }
+    let inverse = 1.0 / x;
+    let inverse_squared = inverse * inverse;
+    let mut tail = 0.0;
+    for coefficient in BINET_ASYMPTOTIC_TAIL.iter().rev() {
+        tail = tail * inverse_squared + coefficient;
+    }
+    remainder + inverse * tail
+}
+
+/// `t(x) = r(x) − r(x + 1) = (x + ½) ln(1 + 1/x) − 1`; see
+/// [`ln_gamma_binet_remainder`].
+#[inline]
+fn binet_recurrence_step(x: f64) -> f64 {
+    if x < 1.0 {
+        return (x + 0.5) * (x.ln_1p() - x.ln()) - 1.0;
+    }
+    let u = 1.0 / (2.0 * x + 1.0);
+    let u_squared = u * u;
+    let mut power = u_squared;
+    let mut denominator = 3.0;
+    let mut sum = power / denominator;
+    loop {
+        power *= u_squared;
+        denominator += 2.0;
+        let next = sum + power / denominator;
+        if next == sum {
+            return next;
+        }
+        sum = next;
+    }
+}
+
+/// The Stirling gap `g(x) = x ln x − x − lnΓ(x) = ½ ln x − ½ ln 2π − r(x)`, for
+/// `x > 0`; `NaN` otherwise.
+///
+/// `g` is `O(ln x)`, while `x ln x − x` and `lnΓ(x)` are `O(x ln x)`: forming it
+/// from `lnΓ` keeps only about `log₂(1/(x·ε))` bits at large `x`. Here the three
+/// terms are each correct to a few ulps relative ([`ln_gamma_binet_remainder`]
+/// for `r`), so `g` is correct to a few ulps of `½|ln x| + ½ ln 2π + r(x)`; they
+/// cancel only where `g` crosses zero, near `x = 2π`.
+pub(crate) fn stirling_gap(x: f64) -> f64 {
+    0.5 * x.ln() - HALF_LN_TWO_PI - ln_gamma_binet_remainder(x)
+}
+
+/// `[g′(x), g″(x), …]` through the first `orders` entries (at most five) of the
+/// Stirling gap `g(x) = x ln x − x − lnΓ(x)`, for `x > 0`; those entries are
+/// `NaN` otherwise, and the entries past `orders` are zero. Entry `m` is
+/// `g⁽ᵐ⁺¹⁾(x) = D^m ln x − ψ_m(x)`, laid out as [`polygamma_positive_stack`]
+/// lays out `ψ_m`.
+///
+/// `g⁽ᵐ⁺¹⁾` is `O(x^{−m−1})`, while `D^m ln x` and `ψ_m` are `O(x^{−m})`: their
+/// difference keeps only about `log₂(1/(x·ε))` bits at large `x`. Here it is
+/// differenced in closed form:
+/// - `g′` walks `g′(x) = g′(x + 1) + (1/x − ln(1 + 1/x))`, the bracket from
+///   [`crate::special::log1p_minus_x`], up to the switch, then adds
+///   `ln x − ψ(x) = 1/(2x) − x^{−2}·Σ_j c_{0j} x^{−2j}`;
+/// - `g⁽ᵐ⁺¹⁾`, `m ≥ 1`, walks `g⁽ᵐ⁺¹⁾(x) = g⁽ᵐ⁺¹⁾(x + 1) + (−1)^m (m − 1)!
+///   x^{−m} e_m` with `e_m = (1 + v)^{−m} − 1 + m v`, `v = 1/x`, formed from
+///   `e_m = q (e_{m−1} + m v²)`, `q = x/(x + 1)`, a sum of positive terms, then
+///   adds the asymptotic `D^m ln x − ψ_m(x) = −x^{−m}·((−1)^{m+1} m!/(2x) +
+///   x^{−2}·Σ_j c_{mj} x^{−2j})`, whose leading `(−1)^{m+1}(m − 1)! x^{−m}`
+///   cancelled analytically.
+///
+/// Within one order the recurrence terms and the leading asymptotic term share
+/// the sign `(−1)^m`, and the alternating Bernoulli tail is below `x^{−2} ≤
+/// 1/400` of that leading term, so each entry is correct to a few ulps
+/// relative. The entry of order `m` does not depend on `orders`.
+pub(crate) fn stirling_gap_derivative_stack(
+    x: f64,
+    orders: usize,
+) -> [f64; POLYGAMMA_STACK_ORDERS] {
+    let orders = orders.min(POLYGAMMA_STACK_ORDERS);
+    let mut out = [0.0; POLYGAMMA_STACK_ORDERS];
+    if !(x.is_finite() && x > 0.0) {
+        out[..orders].fill(f64::NAN);
+        return out;
+    }
+    if orders == 0 {
+        return out;
+    }
+    let mut shifted = x;
+    while shifted < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        let v = 1.0 / shifted;
+        out[0] -= crate::special::log1p_minus_x(v);
+        let q = shifted / (shifted + 1.0);
+        let v_squared = v * v;
+        let mut e = 0.0;
+        let mut power = 1.0;
+        for m in 1..orders {
+            e = q * (e + m as f64 * v_squared);
+            power *= v;
+            out[m] += STIRLING_GAP_RECURRENCE[m] * power * e;
+        }
+        shifted += 1.0;
+    }
+    let inverse = 1.0 / shifted;
+    let inverse_squared = inverse * inverse;
+    let mut power = 1.0;
+    for m in 0..orders {
+        let mut tail = 0.0;
+        for coefficient in POLYGAMMA_ASYMPTOTIC_TAIL[m].iter().rev() {
+            tail = tail * inverse_squared + coefficient;
+        }
+        out[m] += if m == 0 {
+            0.5 * inverse - inverse_squared * tail
+        } else {
+            let [_, half_term] = POLYGAMMA_ASYMPTOTIC_LEADING[m];
+            power *= inverse;
+            -power * (half_term * inverse + inverse_squared * tail)
+        };
+    }
+    out
+}
+
+/// `½ ln 2π`, the constant of Stirling's formula.
+const HALF_LN_TWO_PI: f64 = 0.918_938_533_204_672_8;
+
+/// `(−1)^m (m − 1)!`: the coefficient of `x^{−m} e_m` in one recurrence step of
+/// `g⁽ᵐ⁺¹⁾`, `m ≥ 1`; see [`stirling_gap_derivative_stack`]. The `m = 0` entry is
+/// unread.
+const STIRLING_GAP_RECURRENCE: [f64; POLYGAMMA_STACK_ORDERS] = {
+    let mut coefficients = [0.0; POLYGAMMA_STACK_ORDERS];
+    let mut m = 1;
+    while m < POLYGAMMA_STACK_ORDERS {
+        coefficients[m] = -polygamma_sign(m) * factorial(m - 1);
+        m += 1;
+    }
+    coefficients
+};
+
+/// `B_{2j}/(2j(2j − 1))`, `j = 1, …, 10`: Binet's remainder is
+/// `x^{−1} Σ_j b_j x^{−2(j−1)}` from the asymptotic switch on.
+const BINET_ASYMPTOTIC_TAIL: [f64; BERNOULLI_EVEN.len()] = {
+    let mut coefficients = [0.0; BERNOULLI_EVEN.len()];
+    let mut index = 0;
+    while index < BERNOULLI_EVEN.len() {
+        let (power, bernoulli) = BERNOULLI_EVEN[index];
+        coefficients[index] = bernoulli / (power as f64 * (power - 1) as f64);
+        index += 1;
+    }
+    coefficients
+};
+
+const POLYGAMMA_ASYMPTOTIC_MIN_X: f64 = 20.0;
+const BERNOULLI_EVEN: [(usize, f64); 10] = [
+    (2, 1.0 / 6.0),
+    (4, -1.0 / 30.0),
+    (6, 1.0 / 42.0),
+    (8, -1.0 / 30.0),
+    (10, 5.0 / 66.0),
+    (12, -691.0 / 2730.0),
+    (14, 7.0 / 6.0),
+    (16, -3617.0 / 510.0),
+    (18, 43867.0 / 798.0),
+    (20, -174611.0 / 330.0),
+];
+
+// The series' factorial products are built once at compile time, including in dev
+// builds: #2668's NB profile spent 13.53% of cycles in factorial alone.
+
+/// `(−1)^{k+1} k!`: the recurrence coefficient of `x^{−(k+1)}` in `ψ_k`.
+const POLYGAMMA_RECURRENCE: [f64; POLYGAMMA_STACK_ORDERS] = {
+    let mut coefficients = [0.0; POLYGAMMA_STACK_ORDERS];
+    let mut order = 0;
+    while order < POLYGAMMA_STACK_ORDERS {
+        coefficients[order] = polygamma_sign(order) * factorial(order);
+        order += 1;
+    }
+    coefficients
+};
+
+/// `[(−1)^{k+1} (k − 1)!, (−1)^{k+1} k!/2]`: the coefficients of `x^{−k}` and
+/// `x^{−(k+1)}` in the asymptotic `ψ_k`, `k ≥ 1`. `ψ` itself leads with
+/// `ln x − 1/(2x)`, so its row is unread.
+const POLYGAMMA_ASYMPTOTIC_LEADING: [[f64; 2]; POLYGAMMA_STACK_ORDERS] = {
+    let mut coefficients = [[0.0; 2]; POLYGAMMA_STACK_ORDERS];
+    let mut order = 1;
+    while order < POLYGAMMA_STACK_ORDERS {
+        let sign = polygamma_sign(order);
+        coefficients[order] = [sign * factorial(order - 1), sign * factorial(order) / 2.0];
+        order += 1;
+    }
+    coefficients
+};
+
+/// `(−1)^{k+1} B_{2j} (2j)(2j+1)⋯(2j+k−1)/(2j)`, `j = 1, …, 10`: the Bernoulli
+/// tail of the asymptotic `ψ_k` is `x^{−k} Σ_j c_j x^{−2j}`.
+const POLYGAMMA_ASYMPTOTIC_TAIL: [[f64; BERNOULLI_EVEN.len()]; POLYGAMMA_STACK_ORDERS] = {
+    let mut coefficients = [[0.0; BERNOULLI_EVEN.len()]; POLYGAMMA_STACK_ORDERS];
+    let mut order = 0;
+    while order < POLYGAMMA_STACK_ORDERS {
+        let mut index = 0;
+        while index < BERNOULLI_EVEN.len() {
+            let (power, bernoulli) = BERNOULLI_EVEN[index];
+            coefficients[order][index] = polygamma_sign(order) * bernoulli
+                * rising_factorial(power, order)
+                / power as f64;
+            index += 1;
+        }
+        order += 1;
+    }
+    coefficients
+};
+
+const fn polygamma_sign(order: usize) -> f64 {
+    if order % 2 == 1 { 1.0 } else { -1.0 }
+}
+
+const fn factorial(n: usize) -> f64 {
+    rising_factorial(1, n)
+}
+
+const fn rising_factorial(start: usize, len: usize) -> f64 {
+    let mut product = 1.0;
+    let mut offset = 0;
+    while offset < len {
+        product *= (start + offset) as f64;
+        offset += 1;
+    }
+    product
+}
+
+impl<const K: usize> std::ops::Add for Tower4<K> {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        let mut out = self;
+        out.v += o.v;
+        for i in 0..K {
+            out.g[i] += o.g[i];
+            for j in 0..K {
+                out.h[i][j] += o.h[i][j];
+                for k in 0..K {
+                    out.t3[i][j][k] += o.t3[i][j][k];
+                    for l in 0..K {
+                        out.t4[i][j][k][l] += o.t4[i][j][k][l];
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Sub for Tower4<K> {
+    type Output = Self;
+    fn sub(self, o: Self) -> Self {
+        self + o.scale(-1.0)
+    }
+}
+
+impl<const K: usize> std::ops::Neg for Tower4<K> {
+    type Output = Self;
+    fn neg(self) -> Self {
+        self.scale(-1.0)
+    }
+}
+
+impl<const K: usize> std::ops::Mul for Tower4<K> {
+    type Output = Self;
+    fn mul(self, o: Self) -> Self {
+        Tower4::mul(&self, &o)
+    }
+}
+
+impl<const K: usize> std::ops::Div for Tower4<K> {
+    type Output = Self;
+    fn div(self, o: Self) -> Self {
+        Tower4::mul(&self, &o.recip())
+    }
+}
+
+impl<const K: usize> std::ops::Add<f64> for Tower4<K> {
+    type Output = Self;
+    fn add(self, c: f64) -> Self {
+        let mut out = self;
+        out.v += c;
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Sub<f64> for Tower4<K> {
+    type Output = Self;
+    fn sub(self, c: f64) -> Self {
+        self + (-c)
+    }
+}
+
+impl<const K: usize> std::ops::Mul<f64> for Tower4<K> {
+    type Output = Self;
+    fn mul(self, c: f64) -> Self {
+        self.scale(c)
+    }
+}
+
+// ── Implicit-function and moving-boundary seams (#932 flex) ──────────
+//
+// The flexible survival marginal-slope row loss is NOT a free composition
+// of the primaries: it threads an IMPLICIT calibration intercept `a(θ)`
+// solving a constraint `F(a, θ) = 0`, and integrates a density over cells
+// whose edges `z_L(θ), z_R(θ)` MOVE with θ through that intercept. Plain
+// `Tower4` Faà di Bruno cannot express either — so the flex tower was the
+// last hand-written one in the codebase, and the genus of #736-class
+// drift bugs (the (g,w0) deviation-cross third was 3× short for exactly
+// this reason). These two combinators close that gap: once the constraint
+// `F` and the integrand/boundaries are themselves towers, the intercept's
+// derivative tower and the integral's derivative tower come out EXACTLY at
+// every order — there is no order left to hand-code and forget.
+
+// ── The program seam ─────────────────────────────────────────────────
+
+// ── The canonical single-source seam (#932 consolidation) ────────────
+//
+// `RowProgram<K>` is the ONE row-program interface #932 converges every family
+// onto. Its generic `eval<S: JetScalar<K>>` body is the go-forward derivation
+// surface for every calculus channel; `program_*` selects only the derivative
+// representation each consumer needs.
+
+/// The single source of truth #932 asks for: a family's row negative
+/// log-likelihood written ONCE over the generic [`crate::jet_scalar::JetScalar`]
+/// interface, from which every `RowKernel` (gam-models) derivative channel is
+/// mechanically derived. A family implements ONLY this (plus its linear Jacobian
+/// wiring, which is family data, not calculus) — it cannot author an independent
+/// derivative tower, because there is no other channel to author.
+///
+/// Because a body uses only `add`/`sub`/`mul`/`scale`/`exp`/`ln`/… — all provided
+/// by [`crate::jet_scalar::JetScalar`] — the SAME body re-instantiates at
+/// [`crate::jet_scalar::Order2`] (value/grad/Hessian), [`crate::jet_scalar::OneSeed`]
+/// (contracted third), [`crate::jet_scalar::TwoSeed`] (contracted fourth), and the
+/// full [`Tower4`] (every channel), with the contraction folded into the
+/// differentiation so no dense `t3`/`t4` is ever materialised.
+pub trait RowProgram<const K: usize>: Send + Sync {
+    /// Number of observations the program covers.
+    fn n_rows(&self) -> usize;
+
+    /// Current primary-scalar values for `row` (where to seed the scalar).
+    fn primaries(&self, row: usize) -> Result<[f64; K], String>;
+
+    /// The row NLL evaluated on a generic jet scalar. `p[a]` arrives pre-seeded
+    /// (base value + per-scalar nilpotent directions) by the caller; the body
+    /// uses ONLY [`crate::jet_scalar::JetScalar`] ops and per-row data (response,
+    /// censoring, offsets) entering as constants.
+    fn eval<S: crate::jet_scalar::JetScalar<K>>(&self, row: usize, p: &[S; K])
+        -> Result<S, String>;
+}
+
+/// Maximum size of one canonical dense-jet storage object kept on the call
+/// stack. Small fixed-width programs stay allocation-free; wider derivative
+/// representations use exact-length heap storage instead of making the thread
+/// stack scale as `K * size_of::<S>()`. A full dense result larger than this
+/// boundary is rejected in favor of the bounded directional APIs.
+///
+/// This is a storage-policy boundary, not a calculus fallback: both branches
+/// invoke the same [`RowProgram::eval`] expression with the same scalar type.
+const PROGRAM_DENSE_JET_STACK_BUDGET_BYTES: usize = 64 * 1024;
+
+#[inline]
+fn program_primary_jets_fit_stack<S, const K: usize>() -> bool {
+    std::mem::size_of::<S>()
+        .checked_mul(K)
+        .is_some_and(|bytes| bytes <= PROGRAM_DENSE_JET_STACK_BUDGET_BYTES)
+}
+
+fn evaluate_program_with_stack_primaries<const K: usize, P, S>(
+    prog: &P,
+    row: usize,
+    mut seed: impl FnMut(usize) -> S,
+) -> Result<S, String>
+where
+    P: RowProgram<K> + ?Sized,
+    S: crate::jet_scalar::JetScalar<K>,
+{
+    let vars: [S; K] = std::array::from_fn(&mut seed);
+    prog.eval(row, &vars)
+}
+
+#[inline(never)]
+fn evaluate_program_with_heap_primaries<const K: usize, P, S>(
+    prog: &P,
+    row: usize,
+    seed: impl FnMut(usize) -> S,
+) -> Result<S, String>
+where
+    P: RowProgram<K> + ?Sized,
+    S: crate::jet_scalar::JetScalar<K>,
+{
+    // The exact-size range builds precisely K initialized Copy scalars in
+    // heap-backed storage. Converting the boxed slice to a boxed array changes
+    // only its type; it never materializes `[S; K]` on the stack.
+    let vars: Box<[S]> = (0..K).map(seed).collect();
+    let vars: Box<[S; K]> = vars.try_into().map_err(|vars: Box<[S]>| {
+        format!(
+            "canonical row program seeded {} primary jets; expected exactly {K}",
+            vars.len()
+        )
+    })?;
+    prog.eval(row, &vars)
+}
+
+#[inline]
+fn evaluate_program_with_seeded_primaries<const K: usize, P, S>(
+    prog: &P,
+    row: usize,
+    seed: impl FnMut(usize) -> S,
+) -> Result<S, String>
+where
+    P: RowProgram<K> + ?Sized,
+    S: crate::jet_scalar::JetScalar<K>,
+{
+    if program_primary_jets_fit_stack::<S, K>() {
+        evaluate_program_with_stack_primaries(prog, row, seed)
+    } else {
+        evaluate_program_with_heap_primaries(prog, row, seed)
+    }
+}
+
+/// Derive the `row_kernel` channel `(nll, ∇, H)` from a [`RowProgram`] at the
+/// value/gradient/Hessian scalar [`crate::jet_scalar::Order2`], WITHOUT
+/// materialising any third / fourth tensor.
+pub fn program_row_kernel<const K: usize, P: RowProgram<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+) -> Result<(f64, [f64; K], [[f64; K]; K]), String> {
+    let base = prog.primaries(row)?;
+    let s = evaluate_program_with_seeded_primaries(prog, row, |a| {
+        <crate::jet_scalar::Order2<K> as crate::jet_scalar::JetScalar<K>>::variable(base[a], a)
+    })?;
+    Ok(s.into_channels())
+}
+
+/// Derive the `row_third_contracted(dir)` channel `Σ_c ℓ_{abc} dir_c` from a
+/// [`RowProgram`] at the one-seed scalar [`crate::jet_scalar::OneSeed`], WITHOUT
+/// materialising the dense `t3`.
+pub fn program_third_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+    dir: &[f64; K],
+) -> Result<[[f64; K]; K], String> {
+    let base = prog.primaries(row)?;
+    let s = evaluate_program_with_seeded_primaries(prog, row, |a| {
+        crate::jet_scalar::OneSeed::seed_direction(base[a], a, dir[a])
+    })?;
+    Ok(s.contracted_third())
+}
+
+/// Derive the `row_fourth_contracted(u, v)` channel `Σ_{cd} ℓ_{abcd} u_c v_d`
+/// from a [`RowProgram`] at the two-seed scalar [`crate::jet_scalar::TwoSeed`],
+/// WITHOUT materialising the dense `t4`.
+pub fn program_fourth_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+    dir_u: &[f64; K],
+    dir_v: &[f64; K],
+) -> Result<[[f64; K]; K], String> {
+    let base = prog.primaries(row)?;
+    let s = evaluate_program_with_seeded_primaries(prog, row, |a| {
+        crate::jet_scalar::TwoSeed::seed(base[a], a, dir_u[a], dir_v[a])
+    })?;
+    Ok(s.contracted_fourth())
+}
+
+/// Derive every channel `(v, g, h, t3, t4)` in one pass from a [`RowProgram`] at
+/// the full dense [`Tower4`] scalar.
+///
+/// The result is boxed so the return slot itself remains bounded independently
+/// of `K`. Dense towers above the canonical storage budget are rejected before
+/// the program is touched; consumers at those widths must request only the
+/// channels they need through [`program_row_kernel`],
+/// [`program_third_contracted`], and [`program_fourth_contracted`].
+pub fn program_full_tower<const K: usize, P: RowProgram<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+) -> Result<Box<Tower4<K>>, String> {
+    let tower_bytes = std::mem::size_of::<Tower4<K>>();
+    if tower_bytes > PROGRAM_DENSE_JET_STACK_BUDGET_BYTES {
+        return Err(format!(
+            "canonical dense Tower4<{K}> requires {tower_bytes} bytes, exceeding the {}-byte \
+             storage budget; use the bounded row-kernel and directional channel APIs",
+            PROGRAM_DENSE_JET_STACK_BUDGET_BYTES
+        ));
+    }
+    let base = prog.primaries(row)?;
+    evaluate_program_with_seeded_primaries(prog, row, |a| Tower4::variable(base[a], a))
+        .map(Box::new)
+}
+
+// ── The oracle ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl<const K: usize> Tower4<K> {
+        /// Contract `t3` with one primary-space direction:
+        /// `out[a][b] = Σ_c t3[a][b][c] · dir[c]` — exactly the
+        /// `row_third_contracted` shape.
+        ///
+        /// The output is symmetric in `(a, b)`: `t3` is fully index-symmetric, so
+        /// `t3[a][b][c] == t3[b][a][c]` and the `Σ_c` contraction gives
+        /// `out[a][b] == out[b][a]` term-for-term, in the same `c` order. We compute
+        /// only the upper triangle `a ≤ b` (the inner contraction is unchanged and
+        /// stays contiguous/vectorisable) and mirror into the lower triangle — this
+        /// is BIT-IDENTICAL to the full `a, b ∈ 0..K` nest while doing ~2× fewer
+        /// inner contractions, with no dense scatter (the mirror is a `K × K` copy).
+        pub fn third_contracted(&self, dir: &[f64; K]) -> [[f64; K]; K] {
+            let mut out = [[0.0; K]; K];
+            for a in 0..K {
+                for b in a..K {
+                    let mut acc = 0.0;
+                    for c in 0..K {
+                        acc += self.t3[a][b][c] * dir[c];
+                    }
+                    out[a][b] = acc;
+                    out[b][a] = acc;
+                }
+            }
+            out
+        }
+
+        /// Contract `t4` with two primary-space directions:
+        /// `out[a][b] = Σ_{c,d} t4[a][b][c][d] · u[c] · v[d]` — exactly the
+        /// `row_fourth_contracted` shape.
+        ///
+        /// As in [`Self::third_contracted`], the output is symmetric in `(i, j)`
+        /// (`t4[j][i][k][l] == t4[i][j][k][l]`, contracted in the same `(k, l)`
+        /// order), so the upper triangle `i ≤ j` is computed and mirrored —
+        /// BIT-IDENTICAL to the full nest, ~2× fewer inner `Σ_{k,l}` contractions,
+        /// and the inner double loop stays the original contiguous/vectorisable form.
+        pub fn fourth_contracted(&self, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
+            let mut out = [[0.0; K]; K];
+            for i in 0..K {
+                for j in i..K {
+                    let mut acc = 0.0;
+                    for k in 0..K {
+                        for l in 0..K {
+                            acc += self.t4[i][j][k][l] * u[k] * w[l];
+                        }
+                    }
+                    out[i][j] = acc;
+                    out[j][i] = acc;
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Tower3<K>` must be bit-identical to `Tower4<K>` on every channel it
+    /// carries (value, gradient, Hessian, third derivatives). The order-≤3
+    /// Leibniz / Faà-di-Bruno terms read only order-≤3 inner channels, so
+    /// dropping the fourth tensor cannot perturb them. Exercises products
+    /// (Leibniz cross-terms), unary composition, scaling, and addition — the
+    /// same operations the survival location-scale `nll_index_tower` composes —
+    /// across all mixed partials, not just the diagonal entries that kernel reads.
+    #[test]
+    fn tower3_matches_tower4_through_third_order() {
+        let s_a: [f64; 5] = [
+            0.3_f64.sin(),
+            0.3_f64.cos(),
+            -0.3_f64.sin(),
+            -0.3_f64.cos(),
+            0.3_f64.sin(),
+        ];
+        let s_b: [f64; 5] = [1.1, -0.4, 0.8, -0.2, 0.05];
+        let s4 = |s: [f64; 5]| [s[0], s[1], s[2], s[3]];
+
+        let a4 = Tower4::<3>::variable(0.4, 0);
+        let b4 = Tower4::<3>::variable(-0.7, 1);
+        let c4 = Tower4::<3>::variable(0.9, 2);
+        let prog4 = (a4.mul(&b4) + c4).compose_unary(s_a).scale(1.3)
+            + a4.mul(&c4).scale(-0.7)
+            + b4.compose_unary(s_b).scale(0.25);
+
+        let a3 = Tower3::<3>::variable(0.4, 0);
+        let b3 = Tower3::<3>::variable(-0.7, 1);
+        let c3 = Tower3::<3>::variable(0.9, 2);
+        let prog3 = (a3.mul(&b3) + c3).compose_unary(s4(s_a)).scale(1.3)
+            + a3.mul(&c3).scale(-0.7)
+            + b3.compose_unary(s4(s_b)).scale(0.25);
+
+        assert_eq!(prog3.v.to_bits(), prog4.v.to_bits(), "value mismatch");
+        for i in 0..3 {
+            assert_eq!(
+                prog3.g[i].to_bits(),
+                prog4.g[i].to_bits(),
+                "g[{i}] mismatch"
+            );
+            for j in 0..3 {
+                assert_eq!(
+                    prog3.h[i][j].to_bits(),
+                    prog4.h[i][j].to_bits(),
+                    "h[{i}][{j}] mismatch"
+                );
+                for k in 0..3 {
+                    assert_eq!(
+                        prog3.t3[i][j][k].to_bits(),
+                        prog4.t3[i][j][k].to_bits(),
+                        "t3[{i}][{j}][{k}] mismatch"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Binomial-logit row NLL, K=1: ℓ(η) = ln(1 + e^η) − y·η.
+    /// The entire tower has textbook closed forms in μ = σ(η); this test
+    /// pins the algebra (exp, ln, scalar mixes, Leibniz/Faà di Bruno) to
+    /// analytic truth at near-machine precision.
+    struct LogitProgram {
+        eta: Vec<f64>,
+        y: Vec<f64>,
+    }
+
+    impl RowProgram<1> for LogitProgram {
+        fn n_rows(&self) -> usize {
+            self.eta.len()
+        }
+        fn primaries(&self, row: usize) -> Result<[f64; 1], String> {
+            Ok([self.eta[row]])
+        }
+        fn eval<S: crate::jet_scalar::JetScalar<1>>(
+            &self,
+            row: usize,
+            p: &[S; 1],
+        ) -> Result<S, String> {
+            let eta = p[0];
+            Ok(eta
+                .exp()
+                .add(&S::constant(1.0))
+                .ln()
+                .sub(&eta.scale(self.y[row])))
+        }
+    }
+
+    #[test]
+    fn logit_tower_matches_closed_forms() {
+        let prog = LogitProgram {
+            eta: vec![-2.3, -0.4, 0.0, 0.9, 3.1],
+            y: vec![1.0, 0.0, 1.0, 0.0, 1.0],
+        };
+        for row in 0..prog.n_rows() {
+            let t = program_full_tower(&prog, row).expect("logit program");
+            let eta = prog.eta[row];
+            let y = prog.y[row];
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            let w = mu * (1.0 - mu);
+            let expect = [
+                (t.v, (1.0 + eta.exp()).ln() - y * eta, "value"),
+                (t.g[0], mu - y, "grad"),
+                (t.h[0][0], w, "hess"),
+                (t.t3[0][0][0], w * (1.0 - 2.0 * mu), "third"),
+                (
+                    t.t4[0][0][0][0],
+                    w * (1.0 - 6.0 * mu + 6.0 * mu * mu),
+                    "fourth",
+                ),
+            ];
+            for (got, want, label) in expect {
+                assert!(
+                    (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+                    "row {row} {label}: got {got:+.15e} want {want:+.15e}"
+                );
+            }
+        }
+    }
+
+    struct OversizedDenseProgram;
+
+    impl RowProgram<10> for OversizedDenseProgram {
+        fn n_rows(&self) -> usize {
+            1
+        }
+
+        fn primaries(&self, row: usize) -> Result<[f64; 10], String> {
+            Err(format!(
+                "dense-tower storage check reached program primaries at row {row}"
+            ))
+        }
+
+        fn eval<S: crate::jet_scalar::JetScalar<10>>(
+            &self,
+            row: usize,
+            primaries: &[S; 10],
+        ) -> Result<S, String> {
+            Err(format!(
+                "dense-tower storage check reached program evaluation at row {row} with {} primaries",
+                primaries.len()
+            ))
+        }
+    }
+
+    struct LargestBudgetedDenseProgram;
+
+    impl RowProgram<9> for LargestBudgetedDenseProgram {
+        fn n_rows(&self) -> usize {
+            1
+        }
+
+        fn primaries(&self, row: usize) -> Result<[f64; 9], String> {
+            if row == 0 {
+                Ok([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+            } else {
+                Err(format!("largest budgeted dense program has no row {row}"))
+            }
+        }
+
+        fn eval<S: crate::jet_scalar::JetScalar<9>>(
+            &self,
+            row: usize,
+            primaries: &[S; 9],
+        ) -> Result<S, String> {
+            if row != 0 {
+                return Err(format!("largest budgeted dense program has no row {row}"));
+            }
+            let linear =
+                S::linear_combination(primaries, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+            let quartic = primaries[0]
+                .mul(&primaries[1])
+                .mul(&primaries[2])
+                .mul(&primaries[3]);
+            Ok(linear.add(&quartic))
+        }
+    }
+
+    #[test]
+    fn full_tower_accepts_largest_width_inside_storage_budget_932() {
+        assert_eq!(std::mem::size_of::<Tower4<9>>(), 59_048);
+        assert!(
+            !program_primary_jets_fit_stack::<Tower4<9>, 9>(),
+            "nine full-width primary towers must use exact-length heap storage"
+        );
+
+        let tower = program_full_tower(&LargestBudgetedDenseProgram, 0)
+            .expect("Tower4<9> must remain inside the canonical dense storage budget");
+        assert_eq!(tower.v, 309.0);
+        assert_eq!(tower.g, [25.0, 14.0, 11.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        // `t4` stores derivatives, not Taylor coefficients: the distinct-axis
+        // derivative of p0*p1*p2*p3 is 1, with no 4! normalization.
+        assert_eq!(tower.t4[0][1][2][3], 1.0);
+    }
+
+    #[test]
+    fn full_tower_refuses_oversized_result_before_touching_program() {
+        let tower_bytes = std::mem::size_of::<Tower4<10>>();
+        assert!(tower_bytes > PROGRAM_DENSE_JET_STACK_BUDGET_BYTES);
+        assert!(
+            std::mem::size_of::<Result<Box<Tower4<32>>, String>>()
+                <= 4 * std::mem::size_of::<usize>(),
+            "boxed full-tower API must keep its return slot independent of dense tower width"
+        );
+
+        let error = program_full_tower(&OversizedDenseProgram, 0)
+            .expect_err("Tower4<10> must exceed the canonical dense storage budget");
+        assert_eq!(
+            error,
+            format!(
+                "canonical dense Tower4<10> requires {tower_bytes} bytes, exceeding the {}-byte \
+                 storage budget; use the bounded row-kernel and directional channel APIs",
+                PROGRAM_DENSE_JET_STACK_BUDGET_BYTES
+            )
+        );
+    }
+
+    /// Gaussian location-scale row NLL, K=2 primaries (η, s = log σ):
+    /// ℓ = s + ½ e^{−2s} (y − η)². Mixed cross blocks — the #736 fragility
+    /// shape — all have one-line closed forms here.
+    struct LocScaleProgram {
+        eta: Vec<f64>,
+        s: Vec<f64>,
+        y: Vec<f64>,
+    }
+
+    impl RowProgram<2> for LocScaleProgram {
+        fn n_rows(&self) -> usize {
+            self.eta.len()
+        }
+        fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+            Ok([self.eta[row], self.s[row]])
+        }
+        fn eval<S: crate::jet_scalar::JetScalar<2>>(
+            &self,
+            row: usize,
+            p: &[S; 2],
+        ) -> Result<S, String> {
+            let r = S::constant(self.y[row]).sub(&p[0]);
+            Ok(p[1].add(&p[1].scale(-2.0).exp().mul(&r).mul(&r).scale(0.5)))
+        }
+    }
+
+    #[test]
+    fn locscale_tower_matches_closed_forms_including_cross_blocks() {
+        let prog = LocScaleProgram {
+            eta: vec![0.3, -1.1, 2.0],
+            s: vec![-0.5, 0.2, 0.8],
+            y: vec![1.0, -2.0, 2.5],
+        };
+        let tol = 1e-12;
+        for row in 0..prog.n_rows() {
+            let t = program_full_tower(&prog, row).expect("locscale program");
+            let r = prog.y[row] - prog.eta[row];
+            let w = (-2.0 * prog.s[row]).exp();
+            // (η, s) = indices (0, 1).
+            let truth_g = [-w * r, 1.0 - w * r * r];
+            let truth_h = [[w, 2.0 * w * r], [2.0 * w * r, 2.0 * w * r * r]];
+            // Third tensor: distinct-entry closed forms.
+            // ∂ηηη = 0, ∂ηηs = −2w, ∂ηss = −4wr, ∂sss = −4wr².
+            let t3_truth = |a: usize, b: usize, c: usize| -> f64 {
+                match a + b + c {
+                    0 => 0.0,
+                    1 => -2.0 * w,
+                    2 => -4.0 * w * r,
+                    _ => -4.0 * w * r * r,
+                }
+            };
+            // Fourth tensor: ∂ηηηη = 0, ∂ηηηs = 0? No: d/ds(∂ηηη)=0 ✓;
+            // ∂ηηss = 4w, ∂ηsss = 8wr, ∂ssss = 8wr².
+            let t4_truth = |a: usize, b: usize, c: usize, d: usize| -> f64 {
+                match a + b + c + d {
+                    0 | 1 => 0.0,
+                    2 => 4.0 * w,
+                    3 => 8.0 * w * r,
+                    _ => 8.0 * w * r * r,
+                }
+            };
+            for a in 0..2 {
+                assert!(
+                    (t.g[a] - truth_g[a]).abs() <= tol * truth_g[a].abs().max(1.0),
+                    "row {row} grad[{a}]"
+                );
+                for b in 0..2 {
+                    assert!(
+                        (t.h[a][b] - truth_h[a][b]).abs() <= tol * w.max(1.0) * (1.0 + r.abs()),
+                        "row {row} hess[{a}][{b}]: got {} want {}",
+                        t.h[a][b],
+                        truth_h[a][b]
+                    );
+                    for c in 0..2 {
+                        assert!(
+                            (t.t3[a][b][c] - t3_truth(a, b, c)).abs()
+                                <= tol * 8.0 * w.max(1.0) * (1.0 + r.abs() + r * r),
+                            "row {row} t3[{a}][{b}][{c}]: got {} want {}",
+                            t.t3[a][b][c],
+                            t3_truth(a, b, c)
+                        );
+                        for d in 0..2 {
+                            assert!(
+                                (t.t4[a][b][c][d] - t4_truth(a, b, c, d)).abs()
+                                    <= tol * 16.0 * w.max(1.0) * (1.0 + r.abs() + r * r),
+                                "row {row} t4[{a}][{b}][{c}][{d}]: got {} want {}",
+                                t.t4[a][b][c][d],
+                                t4_truth(a, b, c, d)
+                            );
+                        }
+                    }
+                }
+            }
+            // The canonical trait-surface helpers agree with direct contraction.
+            let dir = [0.7, -1.3];
+            let third = program_third_contracted(&prog, row, &dir).expect("third");
+            for a in 0..2 {
+                for b in 0..2 {
+                    let want = t.t3[a][b][0] * dir[0] + t.t3[a][b][1] * dir[1];
+                    assert!((third[a][b] - want).abs() <= 1e-13 * want.abs().max(1.0));
+                }
+            }
+        }
+    }
+
+    /// FD cross-check on a deliberately gnarly composition (div, sqrt,
+    /// powf, nested exp/ln) in K=3, where no closed form is consulted:
+    /// every tower channel is checked against central finite differences
+    /// of the channel one order below — value→grad, grad→hess, hess→t3,
+    /// t3→t4 — so each order is independently anchored.
+    ///
+    /// The program carries a per-row primary fixture plus a per-row offset
+    /// `tau[row]` that enters the loss as a constant, so `row` genuinely
+    /// drives both the seed point and the evaluated expression.
+    struct GnarlyProgram {
+        primaries: Vec<[f64; 3]>,
+        tau: Vec<f64>,
+    }
+
+    impl GnarlyProgram {
+        fn fixture() -> Self {
+            Self {
+                primaries: vec![[0.4, -0.7, 1.2], [-0.9, 0.6, 0.3], [1.1, -0.2, -0.8]],
+                tau: vec![0.15, -0.35, 0.5],
+            }
+        }
+    }
+
+    impl RowProgram<3> for GnarlyProgram {
+        fn n_rows(&self) -> usize {
+            self.primaries.len()
+        }
+        fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
+            self.primaries
+                .get(row)
+                .copied()
+                .ok_or_else(|| format!("gnarly: row {row} out of range"))
+        }
+        fn eval<S: crate::jet_scalar::JetScalar<3>>(
+            &self,
+            row: usize,
+            p: &[S; 3],
+        ) -> Result<S, String> {
+            let tau = *self
+                .tau
+                .get(row)
+                .ok_or_else(|| format!("gnarly: tau row {row} out of range"))?;
+            let a = p[0].mul(&p[1]).exp();
+            let b = p[2].mul(&p[2]).add(&S::constant(1.0)).sqrt();
+            let c = a.add(&b).add(&S::constant(tau)).ln();
+            let d = p[1].scale(0.5).add(&S::constant(2.0)).powf(1.7);
+            let delta = p[0].sub(&p[2]);
+            Ok(c.mul(&d.recip()).add(&delta.mul(&delta).scale(0.25)))
+        }
+    }
+
+    /// Evaluate the gnarly program's tower at an ARBITRARY seed point for
+    /// `row` (used to drive central differences off the fixture grid),
+    /// while keeping `row`'s per-row data (`tau`) in the loss.
+    fn gnarly_tower_at(prog: &GnarlyProgram, row: usize, p: [f64; 3]) -> Tower4<3> {
+        struct At<'a> {
+            base: &'a GnarlyProgram,
+            row: usize,
+            p: [f64; 3],
+        }
+        impl RowProgram<3> for At<'_> {
+            fn n_rows(&self) -> usize {
+                1
+            }
+            fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
+                if row != 0 {
+                    return Err(format!("gnarly-at: row {row} out of range"));
+                }
+                Ok(self.p)
+            }
+            fn eval<S: crate::jet_scalar::JetScalar<3>>(
+                &self,
+                eval_row: usize,
+                vars: &[S; 3],
+            ) -> Result<S, String> {
+                if eval_row != 0 {
+                    return Err(format!("gnarly-at: eval row {eval_row} out of range"));
+                }
+                self.base.eval(self.row, vars)
+            }
+        }
+        *program_full_tower(&At { base: prog, row, p }, 0).expect("gnarly tower")
+    }
+
+    #[test]
+    fn gnarly_tower_is_fd_consistent_order_by_order() {
+        let prog = GnarlyProgram::fixture();
+        for row in 0..prog.n_rows() {
+            let base = prog.primaries(row).expect("primaries");
+            let t = gnarly_tower_at(&prog, row, base);
+            let h_step = 1e-5;
+            let tol = 1e-6;
+            for c in 0..3 {
+                let mut up = base;
+                let mut dn = base;
+                up[c] += h_step;
+                dn[c] -= h_step;
+                let t_up = gnarly_tower_at(&prog, row, up);
+                let t_dn = gnarly_tower_at(&prog, row, dn);
+                // value → gradient.
+                let fd_g = (t_up.v - t_dn.v) / (2.0 * h_step);
+                assert!(
+                    (t.g[c] - fd_g).abs() <= tol * fd_g.abs().max(1.0),
+                    "grad[{c}]: analytic {} fd {}",
+                    t.g[c],
+                    fd_g
+                );
+                for a in 0..3 {
+                    // gradient → Hessian.
+                    let fd_h = (t_up.g[a] - t_dn.g[a]) / (2.0 * h_step);
+                    assert!(
+                        (t.h[a][c] - fd_h).abs() <= tol * fd_h.abs().max(1.0),
+                        "hess[{a}][{c}]: analytic {} fd {}",
+                        t.h[a][c],
+                        fd_h
+                    );
+                    for b in 0..3 {
+                        // Hessian → third.
+                        let fd_t3 = (t_up.h[a][b] - t_dn.h[a][b]) / (2.0 * h_step);
+                        assert!(
+                            (t.t3[a][b][c] - fd_t3).abs() <= tol * fd_t3.abs().max(1.0),
+                            "t3[{a}][{b}][{c}]: analytic {} fd {}",
+                            t.t3[a][b][c],
+                            fd_t3
+                        );
+                        for d in 0..3 {
+                            // third → fourth.
+                            let fd_t4 = (t_up.t3[a][b][d] - t_dn.t3[a][b][d]) / (2.0 * h_step);
+                            assert!(
+                                (t.t4[a][b][d][c] - fd_t4).abs() <= tol * fd_t4.abs().max(1.0),
+                                "t4[{a}][{b}][{d}][{c}]: analytic {} fd {}",
+                                t.t4[a][b][d][c],
+                                fd_t4
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The survival crossing-edge position tower `z_edge = (τ − a(θ)) / b`,
+    /// `b = exp(g)`, built from the intercept tower `a(θ)` (here a stand-in)
+    /// and the seeded slope `g`, reproduces taylor-jet's exact hand-path
+    /// boundary-velocity formulas:
+    ///   z_u   = −(a_u + [u==g]·z) / b
+    ///   z_uv  = −(a_uv + [u==g]·z_v + [v==g]·z_u) / b
+    /// A hand-coded boundary jet once dropped `z_uv`; that channel is exactly
+    /// `∂²` of this tower. The live moving-edge witness in gam-models is
+    /// `moving_edge_leibniz_tracks_boundary_flux_932`. K=3 reduced frame:
+    /// slot 0 = a-axis carrier (an arbitrary smooth
+    /// a(θ) with nonzero a_u/a_uv), slot 1 = g (the slope), slot 2 unused.
+    #[test]
+    fn crossing_edge_tower_matches_handpath_velocity_formulas() {
+        const TAU: f64 = 1.3; // the link-knot crossing threshold τ
+        let g_idx = 1usize;
+        let g0 = 0.85_f64; // the slope value b (the g-primary IS the slope)
+                           // Stand-in intercept tower a(θ): nonzero value, gradient, Hessian in the
+                           // two live axes so a_u and a_uv are both exercised. (In production this
+                           // comes from `filtered_implicit_solve_scalar`; here we plant known derivatives.)
+        let mut a = Tower4::<3>::constant(0.45);
+        a.g[0] = 0.7;
+        a.g[1] = -0.3;
+        a.h[0][0] = 0.25;
+        a.h[0][1] = 0.11;
+        a.h[1][0] = 0.11;
+        a.h[1][1] = -0.08;
+
+        // In the survival flex frame the slope `b` IS the g-primary directly
+        // (the directional code passes `g` as `b`, and ∂z/∂g uses ∂b/∂g = 1):
+        // z_edge = (τ − a) / b with b seeded as the g-axis variable.
+        let b = Tower4::<3>::variable(g0, g_idx);
+        let z_edge = (Tower4::<3>::constant(TAU) - a) / b;
+
+        let bv = g0;
+        let z0 = z_edge.v;
+        assert!((z0 - (TAU - 0.45) / bv).abs() < 1e-12);
+
+        // z_u = −(a_u + [u==g]·z) / b.
+        for u in 0..2 {
+            let direct = if u == g_idx { z0 } else { 0.0 };
+            let want = -(a.g[u] + direct) / bv;
+            assert!(
+                (z_edge.g[u] - want).abs() < 1e-10,
+                "z_u[{u}] {:+.8e} vs hand formula {:+.8e}",
+                z_edge.g[u],
+                want
+            );
+        }
+        // z_uv = −(a_uv + [u==g]·z_v + [v==g]·z_u) / b, using the tower's own
+        // first-order z_v/z_u (already verified above).
+        for u in 0..2 {
+            for v in 0..2 {
+                let cross = if u == g_idx { z_edge.g[v] } else { 0.0 }
+                    + if v == g_idx { z_edge.g[u] } else { 0.0 };
+                let want = -(a.h[u][v] + cross) / bv;
+                assert!(
+                    (z_edge.h[u][v] - want).abs() < 1e-10,
+                    "z_uv[{u}][{v}] {:+.8e} vs hand formula {:+.8e}",
+                    z_edge.h[u][v],
+                    want
+                );
+            }
+        }
+    }
+
+    /// The crossing-edge tower in the CONSTRAINT frame (intercept `a` and
+    /// slope `b` BOTH independent — slots 0 and 1) reproduces taylor-jet's
+    /// FD-certified bare boundary-velocity constants exactly:
+    ///   z_a  = ∂z/∂a   = −1/b
+    ///   z_ab = ∂²z/∂a∂b = +1/b²
+    ///   z_aa = ∂²z/∂a²  = 0
+    ///   z_bb = ∂²z/∂b²  = +2(τ−a)/b³
+    /// These are the `f_a`/`f_au`/`f_aa` constraint-jet boundary motions the
+    /// production base path drops (and only adds in the dir twins, causing the
+    /// #932 desync). Here `a` is independent (NOT yet substituted with a(θ)),
+    /// so `z_aa = 0` and there is no `a_uv` chain — the implicit intercept solve
+    /// (`filtered_implicit_solve_scalar`) introduces that later. Pins the
+    /// constant before the constraint-tower wiring.
+    #[test]
+    fn crossing_edge_constraint_frame_matches_bare_velocity_constants() {
+        const TAU: f64 = 1.3;
+        let a0 = 0.45_f64;
+        let b0 = 0.85_f64;
+        // Slot 0 = a, slot 1 = b, both seeded independent.
+        let a = Tower4::<2>::variable(a0, 0);
+        let b = Tower4::<2>::variable(b0, 1);
+        let z = (Tower4::<2>::constant(TAU) - a) / b;
+
+        assert!((z.v - (TAU - a0) / b0).abs() < 1e-12);
+        assert!((z.g[0] - (-1.0 / b0)).abs() < 1e-12, "z_a {:+.10e}", z.g[0]);
+        assert!(
+            (z.h[0][1] - 1.0 / (b0 * b0)).abs() < 1e-12,
+            "z_ab {:+.10e} vs +1/b² {:+.10e}",
+            z.h[0][1],
+            1.0 / (b0 * b0)
+        );
+        assert!(
+            z.h[0][0].abs() < 1e-12,
+            "z_aa must vanish, got {:+.10e}",
+            z.h[0][0]
+        );
+        let want_zbb = 2.0 * (TAU - a0) / (b0 * b0 * b0);
+        assert!(
+            (z.h[1][1] - want_zbb).abs() < 1e-12,
+            "z_bb {:+.10e} vs 2(τ−a)/b³ {:+.10e}",
+            z.h[1][1],
+            want_zbb
+        );
+    }
+
+    /// The third- and fourth-order tensors must be FULLY symmetric under
+    /// index permutation (mixed partials commute). The tower stores them
+    /// unsymmetrized, so equal-by-construction is a real invariant of the
+    /// Leibniz/Faà di Bruno writes — a cheap typo tripwire. Asserted on a
+    /// nontrivial K=3 tower with all of div/sqrt/powf/exp/ln exercised, so
+    /// every composition path contributes. Lives in a test (not the hot
+    /// per-op path) on purpose.
+    #[test]
+    fn t3_t4_are_fully_index_symmetric() {
+        let prog = GnarlyProgram::fixture();
+        // 3! = 6 permutations of three indices.
+        let perms3: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        // 4! = 24 permutations of four indices.
+        let perms4: [[usize; 4]; 24] = [
+            [0, 1, 2, 3],
+            [0, 1, 3, 2],
+            [0, 2, 1, 3],
+            [0, 2, 3, 1],
+            [0, 3, 1, 2],
+            [0, 3, 2, 1],
+            [1, 0, 2, 3],
+            [1, 0, 3, 2],
+            [1, 2, 0, 3],
+            [1, 2, 3, 0],
+            [1, 3, 0, 2],
+            [1, 3, 2, 0],
+            [2, 0, 1, 3],
+            [2, 0, 3, 1],
+            [2, 1, 0, 3],
+            [2, 1, 3, 0],
+            [2, 3, 0, 1],
+            [2, 3, 1, 0],
+            [3, 0, 1, 2],
+            [3, 0, 2, 1],
+            [3, 1, 0, 2],
+            [3, 1, 2, 0],
+            [3, 2, 0, 1],
+            [3, 2, 1, 0],
+        ];
+        for row in 0..prog.n_rows() {
+            let t = program_full_tower(&prog, row).expect("gnarly tower");
+            let scale_t3 =
+                t.t3.iter()
+                    .flatten()
+                    .flatten()
+                    .fold(0.0_f64, |m, x| m.max(x.abs()))
+                    .max(1.0);
+            let scale_t4 =
+                t.t4.iter()
+                    .flatten()
+                    .flatten()
+                    .flatten()
+                    .fold(0.0_f64, |m, x| m.max(x.abs()))
+                    .max(1.0);
+            for i in 0..3 {
+                for j in 0..3 {
+                    for k in 0..3 {
+                        let base = t.t3[i][j][k];
+                        let idx = [i, j, k];
+                        for p in &perms3 {
+                            let permed = t.t3[idx[p[0]]][idx[p[1]]][idx[p[2]]];
+                            assert!(
+                                (base - permed).abs() <= 1e-12 * scale_t3,
+                                "row {row}: t3[{i}][{j}][{k}]={base:+.15e} != \
+                                 permuted {permed:+.15e} under {p:?}"
+                            );
+                        }
+                        for l in 0..3 {
+                            let base4 = t.t4[i][j][k][l];
+                            let idx4 = [i, j, k, l];
+                            for p in &perms4 {
+                                let permed = t.t4[idx4[p[0]]][idx4[p[1]]][idx4[p[2]]][idx4[p[3]]];
+                                assert!(
+                                    (base4 - permed).abs() <= 1e-12 * scale_t4,
+                                    "row {row}: t4[{i}][{j}][{k}][{l}]={base4:+.15e} != \
+                                     permuted {permed:+.15e} under {p:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod derivative_stack_tests {
+    use super::*;
+
+    // ── power_derivative_stack / sqrt_derivative_stack (#932) ──
+
+    /// Every jet's `sqrt` and `powf` composition reads these stacks (scalar, tower and
+    /// SIMD lanes), and no test pinned them. The references are the closed forms
+    /// `d^k u^a / du^k = a(a−1)…(a−k+1) u^{a−k}`. The square-root stack divides
+    /// successively instead of forming `u^{k−1/2}`, so the closed form through `powf` is
+    /// an independent check, including where that denominator overflows while the
+    /// derivative is still subnormal. The power stack stops at the first zero falling
+    /// factor, so an integer exponent yields exact zeros above its degree instead of
+    /// `0·∞ = NaN`.
+    #[test]
+    fn sqrt_and_power_derivative_stacks_match_closed_forms_932() {
+        fn closed_form(u: f64, a: f64, order: usize) -> f64 {
+            let mut coefficient = 1.0;
+            for k in 0..order {
+                coefficient *= a - k as f64;
+            }
+            if coefficient == 0.0 {
+                0.0
+            } else {
+                coefficient * u.powf(a - order as f64)
+            }
+        }
+        for u in [1.0e-40_f64, 3.0e-3, 0.37, 1.0, 7.5, 2.0e12] {
+            let stack: [f64; 5] = sqrt_derivative_stack(u);
+            for (order, &value) in stack.iter().enumerate() {
+                let reference = closed_form(u, 0.5, order);
+                assert!(
+                    (value - reference).abs() <= 1.0e-12 * reference.abs(),
+                    "sqrt u={u:e} order={order}: stack={value:+.17e} closed form={reference:+.17e}"
+                );
+            }
+        }
+        // At u = 1e90 the fourth derivative −(15/16) u^{−7/2} ≈ −9.4e-316 is subnormal while
+        // u^{7/2} = 1e315 overflows; successive division keeps it representable.
+        let u = 1.0e90_f64;
+        let stack: [f64; 5] = sqrt_derivative_stack(u);
+        let reference = closed_form(u, 0.5, 4);
+        assert!(
+            stack[4] < 0.0 && stack[4].is_subnormal(),
+            "sqrt fourth derivative at u=1e90 must stay a negative subnormal, got {:e}",
+            stack[4]
+        );
+        assert!(
+            (stack[4] - reference).abs() <= 1.0e-6 * reference.abs() + 4.0 * f64::from_bits(1),
+            "sqrt fourth derivative at u=1e90: stack={:e} closed form={reference:e}",
+            stack[4]
+        );
+        for a in [-2.5_f64, -1.0, 0.3, 1.7, 3.0, 4.0] {
+            for u in [0.2_f64, 1.0, 3.5, 40.0] {
+                let stack: [f64; 5] = power_derivative_stack(u, a);
+                for (order, &value) in stack.iter().enumerate() {
+                    let reference = closed_form(u, a, order);
+                    assert!(
+                        (value - reference).abs() <= 1.0e-12 * reference.abs(),
+                        "power a={a} u={u} order={order}: stack={value:+.17e} closed form={reference:+.17e}"
+                    );
+                }
+            }
+        }
+        // An integer exponent above its degree: exact zeros, and no NaN at u = 0.
+        let quadratic: [f64; 5] = power_derivative_stack(0.0, 2.0);
+        assert_eq!(quadratic, [0.0, 0.0, 2.0, 0.0, 0.0]);
+        let cubic: [f64; 5] = power_derivative_stack(0.0, 3.0);
+        assert_eq!(cubic, [0.0, 0.0, 0.0, 6.0, 0.0]);
+    }
+
+    // ── ln_gamma_derivative_stack / digamma_derivative_stack ──
+
+    #[test]
+    fn ln_gamma_derivative_stack_known_values_at_1() {
+        let s = ln_gamma_derivative_stack(1.0);
+        // ln Γ(1) = 0; statrs uses Lanczos so the result is within ULP noise
+        assert!(s[0].abs() < 1e-14, "ln_gamma(1) must be ~0, got {}", s[0]);
+        // ψ₀(1) = -γ  (Euler–Mascheroni)
+        let euler_mascheroni = 0.577_215_664_901_532_9_f64;
+        assert!(
+            (s[1] + euler_mascheroni).abs() < 1e-10,
+            "digamma(1) ≈ -{euler_mascheroni:.6}, got {}",
+            s[1]
+        );
+        // ψ₁(1) = π²/6
+        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+        assert!(
+            (s[2] - pi2_6).abs() < 1e-10,
+            "trigamma(1) ≈ {pi2_6:.6}, got {}",
+            s[2]
+        );
+    }
+
+    #[test]
+    fn ln_gamma_derivative_stack_known_values_at_2() {
+        let s = ln_gamma_derivative_stack(2.0);
+        // ln Γ(2) = ln(1) = 0 exactly
+        assert!(s[0].abs() < 1e-14, "ln_gamma(2) must be 0, got {}", s[0]);
+        // ψ₀(2) = 1 − γ (recurrence: ψ₀(x+1) = ψ₀(x) + 1/x)
+        let euler_mascheroni = 0.577_215_664_901_532_9_f64;
+        let digamma_2 = 1.0 - euler_mascheroni;
+        assert!(
+            (s[1] - digamma_2).abs() < 1e-10,
+            "digamma(2) ≈ {digamma_2:.6}, got {}",
+            s[1]
+        );
+    }
+
+    #[test]
+    fn digamma_derivative_stack_overlaps_ln_gamma_stack() {
+        // The two stacks share a run of four polygamma values:
+        // ln_gamma_stack[1..5] == digamma_stack[0..4]
+        for &x in &[0.5_f64, 1.0, 2.0, 7.0] {
+            let lg = ln_gamma_derivative_stack(x);
+            let dg = digamma_derivative_stack(x);
+            for i in 0..4 {
+                assert_eq!(
+                    lg[i + 1],
+                    dg[i],
+                    "ln_gamma_stack[{}] != digamma_stack[{}] at x={x}",
+                    i + 1,
+                    i
+                );
+            }
+        }
+    }
+
+    /// `ψ_k(x+½) − ψ_k(x)` against 400-digit `mpmath` values at the binary `x`
+    /// on both sides of the recurrence/asymptotic switch and deep in the
+    /// Student-t Gaussian limit (`x = ν/2` with `ln ν = 17.70` is `2.43·10⁷`).
+    /// There the difference of two digammas keeps seven digits; the gap kernel
+    /// must keep all of them.
+    #[test]
+    fn polygamma_half_shift_gap_matches_high_precision_references() {
+        const REFERENCES: [(f64, [f64; 5]); 12] = [
+            (0.03, [3.203962927515465354e1, -1.108216193141883652e3, 7.4062072095399956908e4, -7.4073358559239705465e6, 9.8765376546290203606e8]),
+            (0.5, [1.3862943611198906188, -3.2898681336964528729, 1.4424682837915131425e1, -9.0915151631735608087e1, 7.4658798370322634696e2]),
+            (1.0, [6.1370563888010938117e-1, -7.1013186630354712706e-1, 1.5753171620848685752, -5.0848483682643919127, 2.1412016296773653041e1]),
+            (3.7, [1.4418535192508819002e-1, -4.1372916938637520346e-2, 2.3630458175422828735e-2, -2.0153376495578495503e-2, 2.281893286763947146e-2]),
+            (19.75, [2.5636814596444142669e-2, -1.3142768926585609018e-3, 1.347313104225428014e-4, -2.0714308420636192681e-5, 4.245611132991352318e-6]),
+            (20.0, [2.5312402465497531231e-2, -1.2812305052421270327e-3, 1.296826299469204848e-4, -1.9686040254261824038e-5, 3.9838645959225312368e-6]),
+            (20.5, [2.4687597534502468769e-2, -1.2187694947578729673e-3, 1.203173700530795152e-4, -1.7813959745738175962e-5, 3.5161354040774687632e-6]),
+            (137.25, [3.6496228835637444387e-3, -2.6639405679585358511e-5, 3.8889254842790333176e-7, -8.5157817978979074043e-9, 2.4863182550889251633e-10]),
+            (2.5e7, [2.00000002e-8, -8.00000016e-16, 6.400000192e-23, -7.6800003072e-30, 1.22880006144e-36]),
+            (2.4411730862068e7, [2.0481956316231987033e-8, -8.3902106908007068881e-16, 6.8739171541185058233e-23, -8.4474762523231734664e-30, 1.3841667166599221186e-36]),
+            (1.0e12, [5.00000000000125e-13, -5.0000000000025e-25, 1.00000000000075e-36, -3.000000000003e-48, 1.2000000000015e-59]),
+            (1.0e100, [4.9999999999999999205e-101, -4.999999999999999841e-201, 9.9999999999999995229e-301, 0.0, 0.0]),
+        ];
+        let mut worst = 0.0_f64;
+        for (x, reference) in REFERENCES {
+            let gaps = polygamma_half_shift_gap_stack(x, POLYGAMMA_STACK_ORDERS);
+            for order in 0..POLYGAMMA_STACK_ORDERS {
+                if reference[order] == 0.0 {
+                    // Below the f64 range: the gap underflows with its reference.
+                    assert_eq!(gaps[order], 0.0, "x={x:e} order={order}");
+                    continue;
+                }
+                let relative = (gaps[order] - reference[order]).abs() / reference[order].abs();
+                worst = worst.max(relative);
+                assert!(
+                    relative <= 8.0 * f64::EPSILON,
+                    "x={x:e} order={order}: gap={:+.17e} reference={:+.17e} relative error {relative:e}",
+                    gaps[order],
+                    reference[order]
+                );
+            }
+            // Each entry is independent of how many orders are requested.
+            assert_eq!(polygamma_half_shift_gap_stack(x, 1)[0], gaps[0]);
+        }
+        eprintln!("half-shift polygamma gap: worst relative error {worst:e}");
+        // The cancelling difference this kernel replaces, at the Student-t limit.
+        let x = 2.4411730862068e7;
+        let naive = polygamma_positive_stack(x + 0.5, 1)[0] - polygamma_positive_stack(x, 1)[0];
+        let reference = 2.0481956316231987033e-8;
+        assert!(
+            ((naive - reference) / reference).abs() > 1.0e-9,
+            "the direct digamma difference was expected to cancel at x={x:e}: {naive:e}"
+        );
+        assert!(polygamma_half_shift_gap_stack(0.0, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(polygamma_half_shift_gap_stack(f64::INFINITY, 2)[..2].iter().all(|g| g.is_nan()));
+    }
+
+    /// `ψ_k(x+s) − ψ_k(x)` against 60-digit `mpmath` values across the
+    /// recurrence/asymptotic switch, for shifts below, near and far above `x`,
+    /// and deep in the negative-binomial Poisson limit (`x = θ = 10⁸` with a
+    /// count `s = y = 3`), where the difference of two digammas keeps about
+    /// eight digits.
+    #[test]
+    fn polygamma_shift_gap_matches_high_precision_references() {
+        const REFERENCES: [(f64, f64, [f64; 5]); 8] = [
+            (0.03, 1.0, [3.3333333333333334567e1, -1.1111111111111111933e3, 7.4074074074074082298e4, -7.4074074074074085039e6, 9.8765432098765450374e8]),
+            (1.0, 3.0, [1.8333333333333333333, -1.3611111111111111111, 2.3240740740740740741, -6.4490740740740740741, 2.4848765432098765432e1]),
+            (3.7, 17.0, [1.8386311354792204527, -2.6054300883356516719e-1, 9.2946067996035776598e-2, -5.803686711730261023e-2, 5.3002647722389986814e-2]),
+            (19.75, 2.0, [9.8825682476742412689e-2, -4.8862349008584845848e-3, 4.8347393507043446939e-4, -7.1800332361523576081e-5, 1.4225936548352248144e-5]),
+            (137.25, 40.0, [2.5658096912712086343e-1, -1.6548881373862945753e-3, 2.1464201686552508135e-5, -4.1985640675823273367e-7, 1.1008708911580509542e-8]),
+            (5.0, 1.0e6, [1.2309397389522390328e1, -2.2132195574161530519e-1, 4.8789732244114505725e-2, -2.1427828192755073022e-2, 1.4063191342112799854e-2]),
+            (1.0e8, 3.0, [2.9999999700000005e-8, -2.9999999400000015e-16, 5.999999820000006e-24, -1.799999928000003e-31, 7.199999640000018e-39]),
+            (1.0e12, 250.0, [2.4999999996887500001e-10, -2.4999999993775000002e-22, 4.9999999981325000006e-34, -1.4999999992530000003e-45, 5.9999999962650000019e-57]),
+        ];
+        let mut worst = 0.0_f64;
+        for (x, shift, reference) in REFERENCES {
+            let gaps = polygamma_shift_gap_stack(x, shift, POLYGAMMA_STACK_ORDERS);
+            for order in 0..POLYGAMMA_STACK_ORDERS {
+                let relative = (gaps[order] - reference[order]).abs() / reference[order].abs();
+                worst = worst.max(relative);
+                assert!(
+                    relative <= 8.0 * f64::EPSILON,
+                    "x={x:e} s={shift:e} order={order}: gap={:+.17e} reference={:+.17e} relative error {relative:e}",
+                    gaps[order],
+                    reference[order]
+                );
+            }
+            assert_eq!(polygamma_shift_gap_stack(x, shift, 1)[0], gaps[0]);
+        }
+        eprintln!("shift polygamma gap: worst relative error {worst:e}");
+        // A zero count is an exact zero gap at every order.
+        assert!(polygamma_shift_gap_stack(7.0, 0.0, POLYGAMMA_STACK_ORDERS).iter().all(|&g| g == 0.0));
+        // The half-shift kernel is this kernel at `s = ½`, bit for bit.
+        for x in [0.03, 1.0, 19.75, 20.0, 2.4411730862068e7] {
+            assert_eq!(
+                polygamma_shift_gap_stack(x, 0.5, POLYGAMMA_STACK_ORDERS),
+                polygamma_half_shift_gap_stack(x, POLYGAMMA_STACK_ORDERS)
+            );
+        }
+        // The cancelling difference this kernel replaces, at the NB Poisson limit.
+        let naive = polygamma_positive_stack(1.0e8 + 3.0, 1)[0] - polygamma_positive_stack(1.0e8, 1)[0];
+        assert!(
+            ((naive - 2.9999999700000005e-8) / 2.9999999700000005e-8).abs() > 1.0e-10,
+            "the direct digamma difference was expected to cancel: {naive:e}"
+        );
+        assert!(polygamma_shift_gap_stack(1.0, -1.0, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(polygamma_shift_gap_stack(1.0, f64::NAN, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(polygamma_shift_gap_stack(0.0, 1.0, 2)[..2].iter().all(|g| g.is_nan()));
+    }
+
+    /// `ln Γ(x + s) − ln Γ(x)` against 50-digit references (mpmath `loggamma`),
+    /// to a few ulps of `max(|gap|, 1)`, including the NB Poisson limit where two
+    /// separate `ln Γ` values of size `x ln x` would leave a `10⁻⁸`–`10⁻³` error.
+    #[test]
+    fn ln_gamma_shift_gap_preserves_finite_results_when_argument_sum_overflows() {
+        // mpmath at 400 digits and exact binary64 input arguments.
+        for (x, shift, expected) in [
+            (f64::MAX, 1.0e292, 7.09782712893384e294),
+            (f64::MAX, 0.5, 354.891356446692),
+            (f64::MAX, 1.0, 709.782712893384),
+            (1.0e300, 1.0e285, 6.907755278982137e287),
+        ] {
+            let (value, error) = ln_gamma_shift_gap_with_error(x, shift);
+            assert!((value-expected).abs() <= 8.0 * f64::EPSILON * expected.abs(),
+                "x={x}, shift={shift}: {value} vs {expected}");
+            assert!((value-expected).abs() <= error);
+            assert_eq!(ln_gamma_shift_gap(x, shift), value);
+        }
+    }
+
+    #[test]
+    fn ln_gamma_shift_gap_matches_high_precision_references() {
+        const REFERENCES: [(f64, f64, f64); 10] = [
+            (0.03, 1.0, -3.5065578973199817136),
+            (1.0, 3.0, 1.7917594692280550008),
+            (3.7, 17.0, 40.00359240394925555),
+            (19.75, 2.0, 6.01569973802383818),
+            (137.25, 40.0, 202.07709097510874743),
+            (5.0, 1.0e6, 12815570.468656571118),
+            (1.0e8, 3.0, 55.262042261857096166),
+            (1.0e12, 250.0, 6907.7552790132620521),
+            (1.0, 1.0, 0.0),
+            // `s/x` overflows on the first recurrence step.
+            (1.0e-300, 1.0e10, 220258508598.03505357),
+        ];
+        for (x, shift, reference) in REFERENCES {
+            let gap = ln_gamma_shift_gap(x, shift);
+            let error = (gap - reference).abs() / reference.abs().max(1.0);
+            assert!(
+                error <= 8.0 * f64::EPSILON,
+                "x={x:e} s={shift:e}: gap={gap:+.17e} reference={reference:+.17e} error {error:e}"
+            );
+        }
+        assert_eq!(ln_gamma_shift_gap(7.0, 0.0), 0.0);
+        assert!(ln_gamma_shift_gap(1.0, -1.0).is_nan());
+        assert!(ln_gamma_shift_gap(0.0, 1.0).is_nan());
+        assert!(ln_gamma_shift_gap(1.0, f64::INFINITY).is_nan());
+    }
+
+    /// `g(x) = x ln x − x − lnΓ(x)` and `g⁽ᵐ⁺¹⁾ = D^m ln x − ψ_m` against
+    /// 450-digit `mpmath` values, on both sides of the recurrence/asymptotic
+    /// switch and at the large shapes of the Gamma/Beta σ → 0 limit (#4252).
+    /// `g` itself is the sum `½ ln x − ½ ln 2π − r(x)`, which crosses zero near
+    /// `x = 2π`, so its error is bounded against the magnitudes of those three
+    /// terms; every derivative and Binet's remainder `r` are bounded relative.
+    #[test]
+    fn stirling_gap_matches_high_precision_references() {
+        const REFERENCES: [(f64, f64, [f64; 5], f64); 12] = [
+            (0.03, -3.6251677803620114007, [3.0355696523298783357e1, -1.079353402693146266e3, 7.2965182931559237228e4, -7.3333391325171916858e6, 9.802469351093043739e8], 9.5295029849734780211e-1),
+            (0.5, -1.4189385332046727418, [1.27036284546147817, -2.9348022005446793094, 1.2828796644234319996e1, -8.1409091034002437236e1, 6.7547424982666722519e2], 1.5342640972002734529e-1),
+            (1.0, -1.0, [5.7721566490153286061e-1, -6.4493406684822643647e-1, 1.4041138063191885708, -4.4939394022668291491, 1.8886266123440878232e1], 8.106146679532725822e-2),
+            (3.7, -2.872408939597264835e-1, [1.4117928028866736741e-1, -3.9767587399768044864e-2, 2.2349289736589102586e-2, -1.8794883366312302016e-2, 2.1024285764506951045e-2], 2.2468770580143145898e-2),
+            (19.75, 5.6841916349807022895e-1, [2.5530041968267203351e-2, -1.3034693146732710269e-3, 1.3309063195433357712e-4, -2.0382266546174915078e-5, 4.1616249281983902554e-6], 4.219048970822466934e-3),
+            (20.0, 5.7476128388032583248e-1, [2.5208281311841942558e-2, -1.2708229352031198315e-3, 1.2812240231465459343e-4, -1.9374221339638914594e-5, 3.9059777263966684707e-6], 4.1663196919969224575e-3),
+            (20.5, 5.8720919142863302644e-1, [2.4588491436715912341e-2, -1.2091046250829440184e-3, 1.1890378188587807055e-4, -1.753832835543991611e-5, 3.4489639504833312174e-6], 4.0647184388754790051e-3),
+            (137.25, 1.5413563435229264444, [3.6474110114281494126e-3, -2.6607174691048028222e-5, 3.8818805467203232613e-7, -8.4952504216075415771e-9, 2.4788388398388202731e-10], 6.0716346722082022302e-4),
+            (2.5e7, 7.5982546548782313515, [2.0000000133333333333e-8, -8.0000001066666666667e-16, 6.400000128e-23, -7.6800002048e-30, 1.22880004096e-36], 3.3333333333333331556e-9),
+            (1.0e10, 1.0593986931757222345e1, [5.0000000000833333333e-11, -5.0000000001666666667e-21, 1.00000000005e-30, -3.0000000002e-40, 1.2000000001e-49], 8.3333333333333333333e-12),
+            (1.0e12, 1.2896572024759518029e1, [5.0000000000008333333e-13, -5.0000000000016666667e-25, 1.0000000000005e-36, -3.000000000002e-48, 1.200000000001e-59], 8.3333333333333333333e-14),
+            (1.0e100, 1.1421031611649761147e2, [4.9999999999999999205e-101, -4.999999999999999841e-201, 9.9999999999999995229e-301, 0.0, 0.0], 8.3333333333333332008e-102),
+        ];
+        let mut worst = 0.0_f64;
+        for (x, gap, derivatives, binet) in REFERENCES {
+            let remainder = ln_gamma_binet_remainder(x);
+            let relative = ((remainder - binet) / binet).abs();
+            worst = worst.max(relative);
+            assert!(
+                relative <= 8.0 * f64::EPSILON,
+                "x={x:e}: Binet remainder {remainder:+.17e} reference {binet:+.17e}"
+            );
+            let value = stirling_gap(x);
+            let magnitude = 0.5 * x.ln().abs() + HALF_LN_TWO_PI + binet;
+            assert!(
+                (value - gap).abs() <= 8.0 * f64::EPSILON * magnitude,
+                "x={x:e}: g={value:+.17e} reference={gap:+.17e}"
+            );
+            let stack = stirling_gap_derivative_stack(x, POLYGAMMA_STACK_ORDERS);
+            for order in 0..POLYGAMMA_STACK_ORDERS {
+                if derivatives[order] == 0.0 {
+                    // Below the f64 range: the entry underflows with its reference.
+                    assert_eq!(stack[order], 0.0, "x={x:e} order={order}");
+                    continue;
+                }
+                let relative =
+                    (stack[order] - derivatives[order]).abs() / derivatives[order].abs();
+                worst = worst.max(relative);
+                assert!(
+                    relative <= 8.0 * f64::EPSILON,
+                    "x={x:e} order={order}: g={:+.17e} reference={:+.17e} relative error {relative:e}",
+                    stack[order],
+                    derivatives[order]
+                );
+            }
+            for orders in 1..POLYGAMMA_STACK_ORDERS {
+                let partial = stirling_gap_derivative_stack(x, orders);
+                assert_eq!(partial[..orders], stack[..orders], "x={x:e} orders={orders}");
+                assert!(partial[orders..].iter().all(|&entry| entry == 0.0));
+            }
+        }
+        eprintln!("Stirling gap: worst relative error {worst:e}");
+        // The cancelling forms this kernel replaces, at a Gamma shape of 1e10.
+        let x = 1.0e10_f64;
+        let naive_first = x.ln() - digamma_positive(x);
+        assert!(
+            ((naive_first - 5.0000000000833333333e-11) / 5.0000000000833333333e-11).abs() > 1.0e-9,
+            "ln x − ψ(x) was expected to cancel at x={x:e}: {naive_first:e}"
+        );
+        assert!(stirling_gap_derivative_stack(0.0, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(stirling_gap_derivative_stack(f64::INFINITY, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(stirling_gap(0.0).is_nan());
+        assert!(ln_gamma_binet_remainder(-1.0).is_nan());
+    }
+}
+
+// ── Contraction-symmetry optimization gate ────────────────────────────────────
+//
+// `Tower4::third_contracted` / `fourth_contracted` contract the (fully
+// index-symmetric) `t3`/`t4` tensors against directions, leaving the output
+// indices `(a, b)` / `(i, j)` free. Those free indices inherit the tensor's
+// symmetry — `out[a][b] == out[b][a]` term-for-term — so only the upper triangle
+// need be summed and the lower triangle mirrored. Unlike the dense symmetric
+// FILL (which needs a K⁴ scatter and loses inner-loop vectorisation, and was
+// measured SLOWER), the mirror here is a tiny K×K copy and the inner contraction
+// is untouched (contiguous, vectorisable). This is BIT-IDENTICAL to the full
+// nest, so it needs no fingerprint re-baseline; the gate is (1) bit-identity vs
+// the full reference and (2) a measured wall-clock that is not slower.
+#[cfg(test)]
+mod contraction_symmetry_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn u(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn s(&mut self) -> f64 {
+            (self.u() - 0.5) * 4.0
+        }
+    }
+
+    /// Random VALID fully-symmetric `Tower4<K>` (symmetric `h`/`t3`/`t4`).
+    fn rand_sym4<const K: usize>(r: &mut Rng) -> Tower4<K> {
+        let mut t = Tower4::<K>::zero();
+        t.v = r.s();
+        for i in 0..K {
+            t.g[i] = r.s();
+        }
+        for a in 0..K {
+            for b in a..K {
+                let v2 = r.s();
+                t.h[a][b] = v2;
+                t.h[b][a] = v2;
+                for c in b..K {
+                    let v3 = r.s();
+                    for p in perms3([a, b, c]) {
+                        t.t3[p[0]][p[1]][p[2]] = v3;
+                    }
+                    for d in c..K {
+                        let v4 = r.s();
+                        for p in perms4([a, b, c, d]) {
+                            t.t4[p[0]][p[1]][p[2]][p[3]] = v4;
+                        }
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    fn perms3(idx: [usize; 3]) -> [[usize; 3]; 6] {
+        let [a, b, c] = idx;
+        [
+            [a, b, c],
+            [a, c, b],
+            [b, a, c],
+            [b, c, a],
+            [c, a, b],
+            [c, b, a],
+        ]
+    }
+    fn perms4(idx: [usize; 4]) -> [[usize; 4]; 24] {
+        let [a, b, c, d] = idx;
+        [
+            [a, b, c, d],
+            [a, b, d, c],
+            [a, c, b, d],
+            [a, c, d, b],
+            [a, d, b, c],
+            [a, d, c, b],
+            [b, a, c, d],
+            [b, a, d, c],
+            [b, c, a, d],
+            [b, c, d, a],
+            [b, d, a, c],
+            [b, d, c, a],
+            [c, a, b, d],
+            [c, a, d, b],
+            [c, b, a, d],
+            [c, b, d, a],
+            [c, d, a, b],
+            [c, d, b, a],
+            [d, a, b, c],
+            [d, a, c, b],
+            [d, b, a, c],
+            [d, b, c, a],
+            [d, c, a, b],
+            [d, c, b, a],
+        ]
+    }
+
+    /// Full-nest reference (the pre-opt `a, b ∈ 0..K` form).
+    fn third_full<const K: usize>(t: &Tower4<K>, dir: &[f64; K]) -> [[f64; K]; K] {
+        let mut out = [[0.0; K]; K];
+        for a in 0..K {
+            for b in 0..K {
+                let mut acc = 0.0;
+                for c in 0..K {
+                    acc += t.t3[a][b][c] * dir[c];
+                }
+                out[a][b] = acc;
+            }
+        }
+        out
+    }
+    fn fourth_full<const K: usize>(t: &Tower4<K>, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
+        let mut out = [[0.0; K]; K];
+        for i in 0..K {
+            for j in 0..K {
+                let mut acc = 0.0;
+                for k in 0..K {
+                    for l in 0..K {
+                        acc += t.t4[i][j][k][l] * u[k] * w[l];
+                    }
+                }
+                out[i][j] = acc;
+            }
+        }
+        out
+    }
+
+    /// Returns the number of bit-equality comparisons performed (`n·K·K·2`), so
+    /// the caller can assert the intended workload actually ran: a generic
+    /// (turbofish) helper call hides its internal assertions, so the count is
+    /// surfaced and checked at the call site.
+    fn check_bit_identical<const K: usize>(seed: u64, n: usize) -> usize {
+        let mut r = Rng(seed);
+        let mut checks = 0usize;
+        for _ in 0..n {
+            let t = rand_sym4::<K>(&mut r);
+            let dir: [f64; K] = std::array::from_fn(|_| r.s());
+            let u: [f64; K] = std::array::from_fn(|_| r.s());
+            let w: [f64; K] = std::array::from_fn(|_| r.s());
+            let t3_sym = t.third_contracted(&dir);
+            let t3_full = third_full(&t, &dir);
+            let t4_sym = t.fourth_contracted(&u, &w);
+            let t4_full = fourth_full(&t, &u, &w);
+            for a in 0..K {
+                for b in 0..K {
+                    assert_eq!(
+                        t3_sym[a][b].to_bits(),
+                        t3_full[a][b].to_bits(),
+                        "third K={K} [{a}][{b}]"
+                    );
+                    assert_eq!(
+                        t4_sym[a][b].to_bits(),
+                        t4_full[a][b].to_bits(),
+                        "fourth K={K} [{a}][{b}]"
+                    );
+                    checks += 2;
+                }
+            }
+        }
+        checks
+    }
+
+    /// The output-symmetric contraction is BIT-IDENTICAL to the full nest across
+    /// `K ∈ {2,3,4,9}` (so no fingerprint re-baseline is owed — accuracy and bits
+    /// are unchanged; this is a pure speed-only optimization).
+    #[test]
+    fn contraction_symmetry_is_bit_identical_to_full_nest() {
+        let checks = check_bit_identical::<2>(0x0000_0002_C0FF_EE01, 1000)
+            + check_bit_identical::<3>(0x0000_0003_C0FF_EE01, 800)
+            + check_bit_identical::<4>(0x0000_0004_C0FF_EE01, 600)
+            + check_bit_identical::<9>(0x0000_0009_C0FF_EE01, 300);
+        // Guards against the loops silently not running (e.g. a zeroed count):
+        // 1000·2²·2 + 800·3²·2 + 600·4²·2 + 300·9²·2.
+        assert_eq!(checks, 8000 + 14400 + 19200 + 48600);
+    }
+
+    /// The output-symmetric contraction at `K = 9` does strictly fewer inner
+    /// contractions than the full nest (~2x), so it must be the faster arm.
+    /// The bit-identity test above is the correctness gate; this is the speed
+    /// contract, and it opens only in the release profile (`SpeedGate::open`
+    /// documents why -- this gate once PASSED on a quiet node and FAILED at
+    /// 1.62x on a loaded one, because its two arms were timed in separate
+    /// windows in a fixed order; the paired harness times them adjacent, in a
+    /// randomised order, and reports its own resolution).
+    #[test]
+    fn contraction_symmetry_speedup_is_reported() {
+        use crate::paired_timing::{paired_interleaved, SpeedGate};
+
+        const K: usize = 9;
+        let mut r = Rng(0xC0FF_EE99_1234_5678);
+        let towers: Vec<Tower4<K>> = (0..512).map(|_| rand_sym4::<K>(&mut r)).collect();
+        let dir: [f64; K] = std::array::from_fn(|_| r.s());
+        let u: [f64; K] = std::array::from_fn(|_| r.s());
+        let w: [f64; K] = std::array::from_fn(|_| r.s());
+
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let mut gate = SpeedGate::open("CONTRACTION-SYMMETRY-932");
+        // One arm call contracts every tower once; the nudge perturbs both
+        // directions so neither contraction is loop-invariant across calls.
+        let timing = paired_interleaved(
+            15,
+            20,
+            0x9320_5E11,
+            |nudge| {
+                let mut dir = dir;
+                dir[0] += nudge;
+                let mut u = u;
+                u[0] += nudge;
+                let mut sink = 0.0f64;
+                for t in &towers {
+                    let o3 = t.third_contracted(&dir);
+                    let o4 = t.fourth_contracted(&u, &w);
+                    sink += o3[0][K - 1] + o4[0][K - 1];
+                }
+                sink
+            },
+            |nudge| {
+                let mut dir = dir;
+                dir[0] += nudge;
+                let mut u = u;
+                u[0] += nudge;
+                let mut sink = 0.0f64;
+                for t in &towers {
+                    let o3 = third_full(t, &dir);
+                    let o4 = fourth_full(t, &u, &w);
+                    sink += o3[0][K - 1] + o4[0][K - 1];
+                }
+                sink
+            },
+        );
+        gate.faster(
+            &format!("K={K} towers={}", towers.len()),
+            &timing,
+            "symmetric",
+            "full_nest",
+        );
+        gate.finish();
+    }
+}
+
+#[cfg(test)]
+mod shift_gap_extreme_tests {
+    use super::*;
+
+    #[test]
+    fn finite_arguments_keep_the_gap_when_their_sum_overflows() {
+        let gap = polygamma_shift_gap_stack(1.0e308, 1.0e308, 2);
+        assert!((gap[0] - 2.0_f64.ln()).abs() < 1.0e-14);
+        // At this scale the asymptotic remainder is unrepresentably small:
+        // psi_1(2x)-psi_1(x) = -1/(2x) to f64 rounding.
+        assert!((gap[1] / -5.0e-309 - 1.0).abs() < 1.0e-14, "{gap:?}");
+    }
+
+    #[test]
+    fn zero_shift_is_exact_even_at_subnormal_arguments() {
+        for x in [f64::from_bits(1), f64::MIN_POSITIVE, 1.0, 1.0e308] {
+            assert_eq!(polygamma_shift_gap_stack(x, 0.0, 5), [0.0; 5]);
+            assert_eq!(ln_gamma_shift_gap(x, 0.0), 0.0);
+        }
+    }
+}

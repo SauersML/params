@@ -7,7 +7,7 @@
 //! `MODEL` is an engine export (`export.json` and its token rows), or a Hugging Face checkpoint
 //! directory (`config.json` and its safetensors, one file or sharded) whose token rows come from
 //! the settings' `windows` (files of rows of `context` little-endian u32, as
-//! `bench/mpd_qwen3_fineweb_2951.py` writes them): its `held_out` file's rows and its `training`
+//! `experiments/mpd_qwen3_fineweb_2951.py` writes them): its `held_out` file's rows and its `training`
 //! file's rows are the two sets. `export_sha256` is `export.json`'s SHA-256, or for a checkpoint
 //! the fingerprint of `config.json`'s and every safetensors file's SHA-256 (a mismatch names it).
 //!
@@ -243,7 +243,7 @@ struct EditSettings {
     name: String,
     /// When set, nothing is scored: the explanation's parts (its transcoder features at the
     /// scored posterior mean) are written to `OUT/{functions}` in the oracle's names
-    /// (`bench/oracle`): per layer `l` with parts, `h.{l}.mlp.function.U` [C, d] (the writes),
+    /// (`oracle`): per layer `l` with parts, `h.{l}.mlp.function.U` [C, d] (the writes),
     /// `.V` [d, C] (the reads), `.bias` [C] and `.index` [C] (each part's row in the layer's
     /// operators, its transcoder feature through the kept file), in float32.
     #[serde(default)]

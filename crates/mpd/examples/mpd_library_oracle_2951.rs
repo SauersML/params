@@ -1,5 +1,5 @@
 //! The oracle's label table for a library explanation (`library_mdl`, #2951): the measured behaviour
-//! of each of its functions, in the schema and file names `bench/oracle/vpd_labels.py` and
+//! of each of its functions, in the schema and file names `oracle/vpd_labels.py` and
 //! `vpd_relations.py` write for VPD's subcomponents, so the oracle reads our graph in place of VPD's.
 //!
 //! A component is one function of the library: an MLP function `h_i u_i`, `h_i = φ(g_i·x̂ + c_i)`

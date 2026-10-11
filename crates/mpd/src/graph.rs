@@ -28,7 +28,7 @@
 //! Execution error `N · mean KL(M_e ‖ P_e)` over the experiments' target tokens (full vocabulary,
 //! log base 2); code `python_tokens · log2(token_types)`; opaque numbers (every weight a declared
 //! node reads and every stand-in average) at `½ log2 N` each. The reader term is added by
-//! `bench/oracle/graph/score.py`.
+//! `oracle/graph/score.py`.
 //!
 //! Every run is the host's float64 execution of the blocks `Library` holds for the start library
 //! (`library_mdl::explanation`), which equals `M`.
@@ -5602,7 +5602,7 @@ impl Checker {
     /// ([`Checker::necessity_runs`]: the program's nodes taken out, at their counterfactual values,
     /// every other piece computing on the prompt). The ground truth of the reader's question whether
     /// switching an explanation's parts to their counterfactual values moves `M` to the
-    /// counterfactual's answer (bench/oracle/graph/reader_questions.py).
+    /// counterfactual's answer (oracle/graph/reader_questions.py).
     pub fn complement_tokens(&mut self, program: &Program) -> Result<Vec<ComplementToken>, String> {
         let program = self.with_base(program);
         let graph = Graph::parse(&program, &self.weights)?;

@@ -26,7 +26,7 @@
 //! stochastic masks keep the remainder (`δ = 0` otherwise, as in VPD's evaluation); a layer run as
 //! `M`'s has `m = 1`, `δ = 1`, which is `M`'s map.
 //!
-//! The decomposition is read from its one-time export (`bench/vpd_2951/vpd_export.py`): per site
+//! The decomposition is read from its one-time export (`vpd/vpd_export.py`): per site
 //! `{site}.U` (`C × d_out`) and `{site}.V` (`d_in × C`), and the network's weights; `M`'s from its
 //! engine export. Both run as operator programs ([`Model`]): `M`'s forward with each site's masks as
 //! raw slots, and `M`'s forward followed by the causal-importance network.
@@ -1638,7 +1638,7 @@ pub fn vpd_cancellation(vpd: &Vpd, bases: &[Vec<u32>], batch: usize, seed: u64) 
 
 /// A pair of a prompt and its counterfactual of equal token count, with the prompt's next token
 /// (`target`) and the counterfactual's (`foil`): the subject-verb agreement pairs of Marks et al.
-/// (2025), tokenized once (`bench/vpd_2951/sva_export.py`).
+/// (2025), tokenized once (`vpd/sva_export.py`).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct Pair {
     pub clean: Vec<u32>,

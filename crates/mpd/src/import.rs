@@ -1,5 +1,5 @@
 //! Import a language-model export (`export.json` plus raw little-endian float64 `<name>.f64`
-//! tensors, the layout `bench/mpd_engine_export_hf_2951.py` and `bench/vpd_2951/vpd_engine_export.py`
+//! tensors, the layout `experiments/mpd_engine_export_hf_2951.py` and `vpd/vpd_engine_export.py`
 //! write) or a Hugging Face checkpoint into an operator program ([`import_language_model`],
 //! [`hugging_face_language_model`]). Every tensor enters as its own operator at the finest lattice
 //! that holds it exactly; tied uses reference one operator.
@@ -221,7 +221,7 @@ pub fn import_language_model(dir: &Path, sequences: usize, context: usize) -> Re
 }
 
 /// The Hugging Face Qwen2, Qwen3 or Llama tensor stored under export name `name` (the names
-/// `bench/mpd_engine_export_hf_2951.py` writes), or `None` for a name such a checkpoint never holds.
+/// `experiments/mpd_engine_export_hf_2951.py` writes), or `None` for a name such a checkpoint never holds.
 fn hugging_face_name(name: &str) -> Option<String> {
     let fixed = match name {
         "wte" => Some("model.embed_tokens.weight"),
@@ -371,7 +371,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
     refuse_unsupported(&record["config"])?;
     let flag = |key: &str| record["config"][key].as_bool().unwrap_or(false);
     let (parallel, qk_norm, gated) = (flag("parallel_residual"), flag("qk_norm"), flag("mlp_gated"));
-    // `none`: no norm anywhere (a real-valued toy's residual MLP, `bench/toys_2951`).
+    // `none`: no norm anywhere (a real-valued toy's residual MLP, `toys`).
     let (layer_norm, no_norm) = match record["config"]["norm"].as_str() {
         None | Some("rms") => (false, false),
         Some("layer") => (true, false),

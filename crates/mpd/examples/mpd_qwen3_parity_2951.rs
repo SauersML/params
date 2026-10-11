@@ -4,11 +4,11 @@
 //! `mpd_qwen3_parity_2951 MODEL_DIR WINDOWS OUT [KEY=VALUE ...]`
 //!
 //! `MODEL_DIR` holds `config.json` and `model.safetensors`; `WINDOWS` is a file of rows of `context`
-//! little-endian u32 tokens (`bench/mpd_qwen3_fineweb_2951.py`). The first `sequences` rows (4) of
+//! little-endian u32 tokens (`experiments/mpd_qwen3_fineweb_2951.py`). The first `sequences` rows (4) of
 //! `context` tokens (128), each its own sequence from position 0, run through the whole program on
 //! `device` (`host`, the CPU lowering in f64; `cuda`, with `storage` `f64` or `f32` and `arithmetic`
 //! `f64`, `f32` or `tf32`). Each `reference=PATH` (repeatable) is the logits of
-//! `bench/mpd_qwen3_reference_2951.py` on the same rows; per reference the report gives the largest
+//! `experiments/mpd_qwen3_reference_2951.py` on the same rows; per reference the report gives the largest
 //! absolute logit difference and `KL(p_ref ‖ p_ours)` per token in nats (mean and largest) with the
 //! top-1 agreement. The device's resident bytes after compiling and after the forward are reported
 //! with the program's trace bytes per row. One JSON object goes to `OUT/parity.json` and stdout.

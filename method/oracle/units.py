@@ -45,7 +45,8 @@ KIND = re.compile(r"(q|k|v|o|fc|down)(?:#(\d+)|\[([h\d,\s]+)\])?")
 
 def parse(text: str) -> tuple[str, dict]:
     """(the explanation, {position: [unit, ...]}) of an answer; a unit is (matrix name, position) or (matrix name,
-    head, position). A line is layer segments separated by "|": "L<layer> <position>:<kinds>", where "->" joins the
+    head, position); kind#index gives a carry.Subcomponent (matrix, position, index).
+    A line is layer segments separated by "|": "L<layer> <position>:<kinds>", where "->" joins the
     positions an attention layer reads from to the one it writes at. Lines that name no unit are kept empty; text that
     is not a unit is ignored."""
     import native
@@ -77,15 +78,20 @@ def parse(text: str) -> tuple[str, dict]:
     return explanation, circuits
 
 
-def render(explanation: str, circuits: dict) -> str:
+def render(explanation: str, circuits: dict, granularity=None) -> str:
     """The answer text of circuits {position: [unit, ...]}: per line, one segment per layer, its units grouped by position
     (earliest first, joined by "->": an attention layer reads the earlier positions and writes at the later), the kinds
-    of one position in the order q, k, v, o, fc, down, a matrix's heads written together."""
+    of one position in the order q, k, v, o, fc, down, a matrix's heads written together.
+    Parsed subcomponent triples retain their type. Set granularity="subcomponent"
+    when rendering plain triples loaded from JSON; legacy plain triples are heads.
+    """
     from carry import Subcomponent
 
     order = list(KINDS)
     out = [f"EXPLANATION: {explanation}".rstrip()]
     for p, units in circuits.items():
+        if granularity == "subcomponent":
+            units = [Subcomponent(*u) if len(u) == 3 else u for u in units]
         by = {}
         for u in units:
             name, pos = u[0], _position(u)
@@ -166,7 +172,8 @@ def score_many(nat, task: dict, texts: list[str], k: int = 8, edit=None, ranks=(
 def _score_many(nat, task: dict, texts: list[str], k: int = 8, ranks=(0, 1, 2)) -> list[dict]:
     """The carry test of answers to one task, the task prepared once and every answer measured in one batch per position.
     Per answer: {"uncarried": the share of the empty run's discrepancy the answer leaves, positions weighted by it, "units":
-    distinct (matrix, position) pairs the answer names that the model has (a head subset counts as its matrix: the same
+    named subcomponents, or for legacy answers distinct (matrix, position) pairs
+    the model has (a head subset counts as its matrix: the same
     intervention always has the same size), "heads": head slices named, "unknown": named units the model does not have,
     "rest_carried", per position {"position", "change" (bits: the model's own move, KL of its prediction on the changed
     prompts from its prediction on the text), "movement" (bits: the empty run's discrepancy, every unit held at the text
@@ -366,14 +373,15 @@ def targets(explain_jsonl: Path, out_dir: Path, fraction: int = 90) -> int:
             fits = [i for i, (_, kl) in enumerate(curve) if kl <= goal]
             best = sets[max(fits, key=lambda i: -curve[i][0])]  # the fewest units within the goal
             circuits[p["position"]] = [tuple(u) for u in best]
-        (out_dir / f"{r['task']}.txt").write_text(render("", circuits))
+        (out_dir / f"{r['task']}.txt").write_text(render("", circuits, granularity=r.get("units")))
         n += 1
     return n
 
 
 ASK = ("How does {model} compute its prediction of the next token after the target of this text? For each listed input "
-       "position, give the path by which a change of the token there reaches the prediction, as units: a unit is a weight "
-       "matrix (q, k, v, o, fc, down) of a layer at a position, an attention matrix optionally by its heads (v[h3,h4]). "
+       "position, give the path by which a change of the token there reaches the prediction, as VPD subcomponents: "
+       "a unit is one rank-one slice of a matrix (q, k, v, o, fc, down) at a position, written kind#index "
+       "(for example fc#12,v#1514). "
        "Write a path layer by layer, separated by \" | \": L<layer> <position>:<kinds>, and for an attention layer that "
        "reads one position and writes at a later one, L<layer> <position>:<kinds> -> <later position>:<kinds>. Answer "
        "with a line EXPLANATION: (in plain English, what the model does), then one line POSITION <p>: <path> per listed "

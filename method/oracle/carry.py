@@ -283,7 +283,11 @@ class _Remainders(TorchFunctionMode):
 
 
 class Carry:
-    """Cache the original record and changed-prompt references for a study."""
+    """Cache the original record and changed-prompt references for a study.
+
+    Without ``space``, measure node triples or dense masks, as before. With a
+    UnitSpace, measure boolean vectors over its units using the batched evaluator.
+    """
     def __init__(self, nat, ids, targets, prompts, chunk_size=None, *, space=None):
         if not prompts or not targets:
             raise ValueError("need at least one prompt and target")
@@ -551,6 +555,9 @@ class Subcomponent(tuple):
     """
     def __new__(cls, name, position, index):
         return super().__new__(cls, (name, position, index))
+
+    def __getnewargs__(self):
+        return tuple(self)
 
 
 class UnitSpace:
@@ -985,7 +992,10 @@ def _measure_units(study, sets):
 
 
 class MatrixCarry(Carry):
-    """A whole matrix needs a broadcast [B,T,1] mask, not [B,T,C]."""
+    """Batched matrix or subcomponent interventions at a UnitSpace's positions.
+
+    Matrix coefficients broadcast [B,T,1]; subcomponents select rank-one slices.
+    """
     unit_vectors = True
 
     def __init__(self, nat, ids, targets, prompts, space, chunk_size=None):

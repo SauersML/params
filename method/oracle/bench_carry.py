@@ -52,13 +52,15 @@ def benchmark(nat, ids, targets, position=322, seconds=5):
     rows = []
     for size in (10, 100, 1000):
         selected = {}
-        for j in range(size):
+        for j in range(2*size):
             n, p = pairs[j % len(pairs)]
             selected.setdefault((n, p), []).append(j // len(pairs))
         space = carry.UnitSpace(nat, len(ids), positions, candidates=selected)
         study = carry.Carry(nat, ids, targets, prompts, chunk_size=64, space=space)
         generator = torch.Generator(device="cpu").manual_seed(2951)
-        sets = list((torch.rand(64, size, generator=generator) > .5).to(nat.dev).unbind())
+        order = torch.rand(64, space.size, generator=generator).argsort(dim=1)[:, :size]
+        active = torch.zeros(64, space.size, dtype=torch.bool).scatter_(1, order, True)
+        sets = list(active.to(nat.dev).unbind())
         study.measure(sets)
         carry.synchronize(nat.dev)
         util = Utilization(nat.dev)
@@ -68,7 +70,8 @@ def benchmark(nat, ids, targets, position=322, seconds=5):
             carry.synchronize(nat.dev)
             iterations += 1
         elapsed = time.perf_counter() - start
-        row = {"device": str(nat.dev), "units": size, "sets_per_batch": 64, "prompts": len(prompts),
+        row = {"device": str(nat.dev), "units": size, "candidate_units": space.size,
+               "sets_per_batch": 64, "prompts": len(prompts),
                "T": len(ids), "position": position, "unit_positions": positions, "chunk_size": study.chunk_size,
                "iterations": iterations, "seconds": elapsed, "sets_per_second": 64*iterations/elapsed,
                "gpu_utilization": util.finish(), "mean_kl_bits": float(scores.mean())}

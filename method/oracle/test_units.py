@@ -69,3 +69,17 @@ def test_mixed_batch_preserves_legacy_sizes():
     assert [r["units"] for r in batch] == [1, 1]
     for a, b in zip(batch, separate):
         assert a["uncarried"] == pytest.approx(b["uncarried"], abs=2e-5)
+
+
+def test_subcomponents_from_plain_triples_and_targets(tmp_path):
+    n = native.site_name(0, "c_fc")
+    text = units.render("", {322: [(n, 322, 12)]}, granularity="subcomponent")
+    assert "fc#12" in text
+    assert units.parse(text)[1][322] == [(n, 322, 12)]
+    source = tmp_path / "circuits.jsonl"
+    source.write_text(json.dumps({"task": "test", "units": "subcomponent", "positions": [
+        {"position": 322, "empty_bits": 1., "curve": [[1, .05]], "unit_sets": [[(n, 322, 12)]]}
+    ]}) + "\n")
+    out = tmp_path / "answers"
+    assert units.targets(source, out) == 1
+    assert "fc#12" in (out / "test.txt").read_text()

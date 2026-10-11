@@ -7,9 +7,9 @@ plain text (nothing in it is executed):
   EXPLANATION: the model copies the digits after the earlier "327" ...
   CIRCUIT:
   out <- L3.down#120@332, L2.o#77@332
-  L2.o#77@332 <- L2.v#1514@322
-  L2.v#1514@322 <- L0.down#77@322
-  L0.down#77@322 <- L0.fc#12@322
+  L2.o#77@332 <- L2.v#902,1514@322
+  L2.v#902,1514@322 <- L0.down#77@322
+  L0.down#77@322 <- L0.fc#12,40@322
   L2.k#9@322
   ANSWER 1: the change at 322 removes the copied digit ...
   FINAL 1: falls=yes top=' 7'
@@ -17,9 +17,13 @@ plain text (nothing in it is executed):
 A subcomponent is L<layer>.<kind>#<index>@<position> (kind q, k, v, o, fc, down). A circuit line "reader <- writer,
 writer" states one edge per writer: an attention or MLP output (o, down) into a later query, key, value or MLP input
 (q, k, v, fc) at its position, a value (v) into its layer's attention output (o) at that or a later position (attention
-between positions), an MLP input (fc) into its MLP's output (down); "out" is the prediction at the target. A line
-without "<-" states a node with no stated input. parse() gives goal_eval's circuit JSON, and goal_eval.circuit checks
-every edge against the model (mech.connects).
+between positions), an MLP input (fc) into its MLP's output (down); "out" is the prediction at the target. Subcomponents
+of one matrix at one position may be written together (L2.v#902,1514@322, indices sorted): a line with groups states
+an edge from every writer to every reader. A line without "<-" states nodes with no stated input. parse() gives
+goal_eval's circuit JSON, and goal_eval.circuit checks every edge against the model (mech.connects); render() writes
+the lines backward from "out", grouping readers that share their writers. Token strings are shown as Python reprs of
+the target's tokens (special tokens included) and escaped (escape()): no question or answer holds a literal special or
+added token of the explainer's tokenizer.
 
 The question (question()) holds the text's tokens, the model's top next tokens, the positions F2 measures (those whose
 changed token moves the prediction by at least 1% of the text's total, goal_eval's SHARE_FLOOR), with the measured
@@ -52,7 +56,6 @@ text, or a connection the model does not have), or a question has no FINAL line.
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import math
 import random
@@ -66,8 +69,10 @@ sys.path.insert(0, str(HERE.parent / "vpd"))
 
 KINDS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj", "fc": "c_fc", "down": "down_proj"}
 CODES = {v: k for k, v in KINDS.items()}
-NODE = r"L(\d+)\.(q|k|v|o|fc|down)#(\d+)@(\d+)"
-NODE_RE = re.compile(rf"^{NODE}$")
+GROUP_RE = re.compile(r"L(\d+)\.(q|k|v|o|fc|down)#(\d+(?:,\d+)*)@(\d+)")
+_G = r"L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*@\d+"
+WRITERS_RE = re.compile(rf"\s*{_G}(?:\s*,\s*{_G})*\s*")
+ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response)>)")  # Qwen's added tokens: <|...|>, <think>, <tool_call>, ...
 FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s*(.+?)\s*$", re.M | re.I)
 SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+)\s*:", re.M | re.I)
 
@@ -82,20 +87,41 @@ QA_RANKS = 8  # token-change questions draw the new token from the model's alter
 # ---- the answer's text
 
 
+def escape(text: str) -> str:
+    """Text with every Qwen added-token string broken by a backslash after its "<" ("<|endoftext|>" -> "<\\|endoftext|>",
+    "<think>" -> "<\\think>"), so the explainer's tokenizer reads the vpd4l token strings a question lists (the Pile's
+    "<|endoftext|>" among them) as text, never as its own special or added tokens. Applied to every question and
+    answer text; idempotent."""
+    return ADDED.sub(r"<\\", text)
+
+
 def node_text(nd) -> str:
     """A subcomponent (matrix name, position, index) as L<layer>.<kind>#<index>@<position>."""
-    name, t, c = nd
-    return f"L{name.split('.')[1]}.{CODES[name.split('.')[-1]]}#{c}@{t}"
+    return group_text([nd])
+
+
+def group_text(nds) -> str:
+    """Subcomponents of one matrix at one position as L<layer>.<kind>#<index>,<index>,...@<position>, indices sorted."""
+    name, t = nds[0][0], nds[0][1]
+    return f"L{name.split('.')[1]}.{CODES[name.split('.')[-1]]}#{','.join(str(c) for c in sorted({nd[2] for nd in nds}))}@{t}"
+
+
+def group_of(text: str):
+    """The subcomponents [(matrix name, position, index), ...] of L<layer>.<kind>#<index>[,<index>...]@<position>, or
+    None."""
+    import native
+
+    m = GROUP_RE.fullmatch(text.strip())
+    if not m:
+        return None
+    name = native.site_name(int(m[1]), KINDS[m[2]])
+    return [(name, int(m[4]), int(c)) for c in m[3].split(",")]
 
 
 def node_of(text: str):
     """(matrix name, position, index) of L<layer>.<kind>#<index>@<position>, or None."""
-    import native
-
-    m = NODE_RE.match(text.strip())
-    if not m:
-        return None
-    return native.site_name(int(m[1]), KINDS[m[2]]), int(m[4]), int(m[3])
+    g = group_of(text)
+    return g[0] if g is not None and len(g) == 1 else None
 
 
 def _sections(text: str) -> dict:
@@ -111,7 +137,8 @@ def _sections(text: str) -> dict:
 def parse(text: str) -> dict:
     """An answer's parts: "explanation", "answer" (goal_eval's circuit JSON: nodes [matrix, index, position], edges
     [upstream, downstream | "out"]), "malformed" (circuit lines that do not parse), "circuit" (whether a CIRCUIT
-    section exists) and "finals" (question number -> (falls, top token string))."""
+    section exists) and "finals" (question number -> (falls, the top token as written)). A circuit line's reader may be
+    a group, and so may each writer: the line states an edge from every writer to every reader."""
     sec = _sections(text)
     nodes, at, edges, malformed = [], {}, [], 0
 
@@ -125,33 +152,43 @@ def parse(text: str) -> dict:
         line = line.strip()
         if not line:
             continue
-        reader, _, writers = line.partition("<-")
+        reader, arrow, writers = line.partition("<-")
         reader = reader.strip()
-        r = "out" if reader == "out" else node_of(reader)
-        ws = [node_of(w) for w in writers.split(",")] if writers.strip() else []
-        if r is None or any(w is None for w in ws) or (r == "out" and not ws):
+        rs = ["out"] if reader == "out" else group_of(reader)
+        ws = [] if not writers.strip() else ([nd for g in GROUP_RE.finditer(writers) for nd in group_of(g[0])]
+                                             if WRITERS_RE.fullmatch(writers) else None)
+        if rs is None or ws is None or (reader == "out" and not ws) or (arrow and not ws):
             malformed += 1
             continue
-        if r != "out":
-            index(r)
+        for r in rs:
+            if r != "out":
+                index(r)
         for w in ws:
-            edges.append([index(w), "out" if r == "out" else at[r]])
+            i = index(w)
+            edges += [[i, "out" if r == "out" else at[r]] for r in rs]
     finals = {}
     for m in FINAL_RE.finditer(text):
-        top = m[3].strip()
-        try:
-            top = ast.literal_eval(top) if top[:1] in "'\"" else top
-        except (ValueError, SyntaxError):
-            pass
-        finals.setdefault(int(m[1]), (m[2].lower() == "yes", str(top)))
+        finals.setdefault(int(m[1]), (m[2].lower() == "yes", m[3].strip()))
     explanation = sec.get("EXPLANATION", "")
     return {"explanation": explanation, "answer": {"nodes": nodes, "edges": edges, "explanation": explanation},
             "malformed": malformed, "circuit": "CIRCUIT" in sec, "finals": finals}
 
 
+def _grouped(nds) -> list[str]:
+    """Groups of subcomponents by matrix and position, latest position first, then by layer and kind."""
+    by = {}
+    for nd in nds:
+        by.setdefault((nd[0], nd[1]), []).append(nd)
+    order = list(KINDS.values())
+    key = lambda k: (-k[1], -int(k[0].split(".")[1]), order.index(k[0].split(".")[-1]))  # noqa: E731
+    return [group_text(by[k]) for k in sorted(by, key=key)]
+
+
 def render(answer: dict, finals: dict | None = None, reasons: dict | None = None) -> str:
-    """The text of a circuit in goal_eval's JSON (to_json's), lines from the prediction backward: "out" first, then each
-    reader the first time it is reached through its writers, then readers not reached, then nodes named nowhere else."""
+    """The text of a circuit in goal_eval's JSON (to_json's), lines from the prediction backward: "out" first, then
+    each group of readers (one matrix at one position, the same writers) the first time one of them is reached
+    through its writers, then groups not reached, then nodes named nowhere else; writers grouped by matrix and
+    position. finals: question number -> (falls, the top token as written)."""
     import goal_eval
 
     nodes = [(goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
@@ -160,31 +197,49 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
         if r == "out":
             out.append(nodes[w])
         else:
-            parents.setdefault(nodes[r], []).append(nodes[w])
+            parents.setdefault(nodes[r], set()).add(nodes[w])
+    groups = {}
+    for r, ws in parents.items():
+        groups.setdefault((r[0], r[1], frozenset(ws)), []).append(r)
+    group_of_reader = {r: k for k, rs in groups.items() for r in rs}
     lines, named, done = [], set(), set()
     if out:
-        lines.append("out <- " + ", ".join(node_text(w) for w in out))
+        lines.append("out <- " + ", ".join(_grouped(set(out))))
         named.update(out)
-    queue = list(out)
+    queue = sorted(set(out), key=lambda nd: (-nd[1], nd[0], nd[2]))
     while queue:
-        r = queue.pop(0)
-        if r in done or r not in parents:
+        k = group_of_reader.get(queue.pop(0))
+        if k is None or k in done:
             continue
-        done.add(r)
-        lines.append(f"{node_text(r)} <- " + ", ".join(node_text(w) for w in parents[r]))
-        named.add(r)
-        named.update(parents[r])
-        queue += parents[r]
-    for r in sorted(set(parents) - done, key=lambda nd: (-nd[1], nd[0], nd[2])):
-        lines.append(f"{node_text(r)} <- " + ", ".join(node_text(w) for w in parents[r]))
-        named.add(r)
-        named.update(parents[r])
-    lines += [node_text(nd) for nd in sorted(set(nodes) - named, key=lambda nd: (-nd[1], nd[0], nd[2]))]
+        done.add(k)
+        lines.append(f"{group_text(groups[k])} <- " + ", ".join(_grouped(k[2])))
+        named.update(groups[k])
+        named.update(k[2])
+        queue += sorted(k[2], key=lambda nd: (-nd[1], nd[0], nd[2]))
+    for k in sorted(set(groups) - done, key=lambda k: (-k[1], k[0], sorted(c for _, _, c in groups[k]))):
+        lines.append(f"{group_text(groups[k])} <- " + ", ".join(_grouped(k[2])))
+        named.update(groups[k])
+        named.update(k[2])
+    lines += _grouped(set(nodes) - named)
     text = [f"EXPLANATION: {answer.get('explanation', '')}".rstrip(), "CIRCUIT:"] + lines
     for k in sorted(finals or {}):
         falls, top = finals[k]
-        text += [f"ANSWER {k}: {(reasons or {}).get(k, '')}".rstrip(), f"FINAL {k}: falls={'yes' if falls else 'no'} top={top!r}"]
-    return "\n".join(text)
+        text += [f"ANSWER {k}: {(reasons or {}).get(k, '')}".rstrip(), f"FINAL {k}: falls={'yes' if falls else 'no'} top={top}"]
+    return escape("\n".join(text))
+
+
+def token_strings(model: str, ids: list[int]) -> list[str]:
+    """The target model's token strings, its special tokens included (the Pile's "<|endoftext|>" shows as itself, not
+    as an empty string; escape() keeps it text for the explainer)."""
+    import mech
+
+    tk = mech.tokenizer(model)
+    return [tk.decode([int(i)], skip_special_tokens=False) for i in ids]
+
+
+def shown(token: str) -> str:
+    """A token string as questions list it and FINAL lines give it: its Python repr, escaped."""
+    return escape(repr(token))
 
 
 # ---- intervention questions (E2)
@@ -259,7 +314,7 @@ def qa_text(q: dict, n: int, strings: list[str], top: str, tokens_of) -> str:
 
 def qa_score(questions: list[dict], finals: dict, tokens_of) -> float | None:
     """The share of questions answered right: half for whether the top token's probability falls below half, half for
-    the most likely next token after the intervention (its string, exactly)."""
+    the most likely next token after the intervention (as shown() writes it, exactly)."""
     if not questions:
         return None
     right = 0.0
@@ -267,7 +322,7 @@ def qa_score(questions: list[dict], finals: dict, tokens_of) -> float | None:
         if n not in finals:
             continue
         falls, top = finals[n]
-        right += 0.5 * (falls == q["falls"]) + 0.5 * (top == tokens_of([q["top"]])[0])
+        right += 0.5 * (falls == q["falls"]) + 0.5 * (top == shown(tokens_of([q["top"]])[0]))
     return right / len(questions)
 
 
@@ -283,7 +338,8 @@ ASK = ("How does {model} compute its prediction of the next token after the targ
        "prediction. The circuit must carry the change of each listed position's token to the prediction; fewer "
        "subcomponents and edges are better. Answer with a line EXPLANATION: (in plain English, what the model does), "
        "then CIRCUIT: and its lines, then for each question ANSWER <n>: (your reasoning in plain English) and "
-       "FINAL <n>: falls=yes or no top=<the token, quoted>.")
+       "FINAL <n>: falls=yes or no top=<the token, quoted as the tokens are>. Subcomponents of one matrix at one position "
+       "may be written together, L2.v#902,1514@322; a line with groups states an edge from every writer to every reader.")
 
 
 def wiring(conn, nodes: list, targets: list[int], k: int) -> list[tuple]:
@@ -372,13 +428,11 @@ def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=N
 
 def question(task: dict, ev: dict) -> str:
     """The oracle's question for one text from its evidence()."""
-    import native
     import units
-    from prompt import tokens_of
 
     model = task["model"]
     p = task["prompts"][0]
-    strings = tokens_of(model, p["token_ids"])
+    strings = token_strings(model, p["token_ids"])
     targets = p["target_positions"]
     t = max(targets)
     top_tok = p["model_top"][0][0][0]
@@ -396,11 +450,11 @@ def question(task: dict, ev: dict) -> str:
         cs = ev["components"][q]
         lines.append(f"{q} ({strings[int(q)]!r}): " + ", ".join(f"{node_text(tuple(nd))} ({c:.2f}{'; ' + f if f else ''})" for nd, c, f in cs))
         if ev["wiring"].get(q):
-            lines.append(f"  wiring: " + ", ".join(f"{node_text(tuple(w))} -> {node_text(tuple(r))} ({c:+.2f})" for w, r, c in ev["wiring"][q]))
+            lines.append("  wiring: " + ", ".join(f"{node_text(tuple(w))} -> {node_text(tuple(r))} ({c:+.2f})" for w, r, c in ev["wiring"][q]))
     if ev["qa"]:
-        tok = lambda ids: tokens_of(model, ids)  # noqa: E731
+        tok = lambda ids: token_strings(model, ids)  # noqa: E731
         lines += [qa_text(q, n, strings, repr(top_tok), tok) for n, q in enumerate(ev["qa"], 1)]
-    return "\n".join(lines)
+    return escape("\n".join(lines))
 
 
 def _connectome():
@@ -453,7 +507,6 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
     import goal_eval
     import native
     import units
-    from prompt import tokens_of
 
     nat = ge.nat
     prompt = task["prompts"][0]
@@ -465,7 +518,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
         tx = ge.text(ids, targets, task=task)
         if cache is not None:
             cache[key] = tx
-    tok = lambda xs: tokens_of(task["model"], xs)  # noqa: E731
+    tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
     parsed = [parse(x) for x in texts]
     graphs, defects = [], []
     for p in parsed:
@@ -476,7 +529,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
     if reader is not None:
         evs = units.reader_events(ev["events"])
         uniq = list(dict.fromkeys(texts))
-        for x, b in zip(uniq, reader.bits(task, [english(x) for x in uniq], evs)):
+        for x, b in zip(uniq, reader.bits(task, [escape(english(x)) for x in uniq], evs)):
             e1[x] = b
     ge.hooks = {"E1": (lambda task, g, x: e1.get(x)) if reader is not None else None,
                 "E2": lambda task, g, x: qa_score(ev["qa"], parse(x)["finals"], tok)}
@@ -509,10 +562,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
 def target(teacher: str, ev: dict, model: str) -> str:
     """The supervised answer to a question: the teacher's explanation and circuit, and for each question the model's
     measured answer (no reasoning: the teacher has none to give)."""
-    from prompt import tokens_of
-
     p = parse(teacher)
-    finals = {n: (q["falls"], tokens_of(model, [q["top"]])[0]) for n, q in enumerate(ev["qa"], 1)}
+    finals = {n: (q["falls"], shown(token_strings(model, [q["top"]])[0])) for n, q in enumerate(ev["qa"], 1)}
     return render(p["answer"], finals)
 
 

@@ -20,7 +20,7 @@ from test_goal_eval import tiny_native  # noqa: E402
 
 ANSWER = """EXPLANATION: the value at 3 is copied to the last position.
 CIRCUIT:
-out <- L1.down#2@5, L1.o#1@5
+out <- L1.o#1@5, L1.down#2@5
 L1.o#1@5 <- L1.v#4@3
 L1.v#4@3 <- L0.down#0@3
 L0.down#0@3 <- L0.fc#5@3
@@ -34,11 +34,43 @@ def test_parse_render_round_trip():
     p = components.parse(ANSWER)
     assert p["malformed"] == 0 and p["circuit"]
     assert p["explanation"] == "the value at 3 is copied to the last position."
-    assert p["finals"] == {1: (True, " the")}
+    assert p["finals"] == {1: (True, "' the'")}
     assert len(p["answer"]["nodes"]) == 6 and len(p["answer"]["edges"]) == 5
     text = components.render(p["answer"], p["finals"], {1: "the copied value is gone."})
     assert text.strip() == ANSWER.strip()
     assert components.parse(text)["answer"] == p["answer"]
+
+
+def test_groups():
+    text = "EXPLANATION: x\nCIRCUIT:\nout <- L1.down#2,9@5\nL1.down#2,9@5 <- L1.fc#1,7@5, L0.down#3@5\nL1.k#4,6@3\n"
+    p = components.parse(text)
+    assert p["malformed"] == 0
+    assert len(p["answer"]["nodes"]) == 7
+    assert len(p["answer"]["edges"]) == 2 + 2 * 3  # two into the prediction, every writer into both readers
+    again = components.parse(components.render(p["answer"]))
+    edges = lambda q: {(tuple(q["answer"]["nodes"][w]), "out" if r == "out" else tuple(q["answer"]["nodes"][r])) for w, r in q["answer"]["edges"]}  # noqa: E731
+    assert edges(again) == edges(p)
+    assert "L1.down#2,9@5 <- L1.fc#1,7@5, L0.down#3@5" in components.render(p["answer"])
+    assert components.parse("CIRCUIT:\nL1.down#2, 9@5 <- L1.fc#1@5\n")["malformed"] == 1
+
+
+def test_escape_keeps_special_strings_text():
+    tk = pytest.importorskip("transformers").AutoTokenizer
+    try:
+        tok = tk.from_pretrained("Qwen/Qwen3-8B")
+    except OSError:
+        pytest.skip("Qwen3's tokenizer is not in the Hugging Face cache")
+    added = set(tok.get_added_vocab().values())
+    raw = "tokens: 0:'<|endoftext|>' 1:'<|im_start|>' 2:'<think>' 3:'</tool_call>' 4:'<|fim_pad|>'"
+    for s in tok.get_added_vocab():
+        assert not set(tok(components.escape(s), add_special_tokens=False)["input_ids"]) & added, s
+    chat = lambda q, a: tok.apply_chat_template([{"role": "user", "content": q}, {"role": "assistant", "content": a}],  # noqa: E731
+                                                tokenize=True, enable_thinking=False)
+    plain = [i for i in chat("x", "y") if i in added]
+    escaped = [i for i in chat(components.escape(raw), components.render({"nodes": [], "edges": []}, {1: (True, components.shown("<|endoftext|>"))}))
+               if i in added]
+    assert escaped == plain  # only the chat template's own special tokens
+    assert components.escape(components.escape(raw)) == components.escape(raw)
 
 
 def test_malformed_lines_and_dropped_edges():
@@ -54,8 +86,8 @@ def test_malformed_lines_and_dropped_edges():
 def test_qa_score():
     qs = [{"falls": True, "top": 0}, {"falls": False, "top": 1}]
     tok = lambda ids: [f"t{i}" for i in ids]  # noqa: E731
-    assert components.qa_score(qs, {1: (True, "t0"), 2: (False, "t1")}, tok) == 1.0
-    assert components.qa_score(qs, {1: (False, "t0")}, tok) == 0.25
+    assert components.qa_score(qs, {1: (True, "'t0'"), 2: (False, "'t1'")}, tok) == 1.0
+    assert components.qa_score(qs, {1: (False, "'t0'")}, tok) == 0.25
     assert components.qa_score([], {}, tok) is None
 
 
@@ -83,7 +115,7 @@ def test_reward_on_tiny_model(tiny):
     order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
     at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:3]
     g = native.Graph(at_t, {}, at_t)
-    finals = {n: (q["falls"], "x") for n, q in enumerate(ev["qa"], 1)}
+    finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
     good = components.render(goal_eval.to_json(g, "writes at the target"), finals)
     bad = good.replace("out <- ", "out <- L0.v#0@7, ")  # a value never writes the residual stream
     missing = components.render(goal_eval.to_json(g, "writes at the target"))

@@ -16,11 +16,11 @@ import numpy as np  # noqa: E402
 from matplotlib.colors import to_rgb  # noqa: E402
 
 BLUE, RED, GREEN, AMBER, PURPLE, TEAL, SOFT, INK = "#2F6DB5", "#D1495B", "#2E8B57", "#E09F3E", "#7B5EA7", "#2A9D8F", "#9DB9DD", "#222222"
-COLORS = {"operand": BLUE, "digit": SOFT, "remaining": TEAL, "I": RED, "I digit": "#EBA3AC", "J": PURPLE,
-          "answer": AMBER, "answer digit": "#F3CF97"}
+COLORS = {"operand": BLUE, "digit": SOFT, "remaining": TEAL, "I": RED, "result digit": "#E8A06A", "J": PURPLE,
+          "answer": AMBER}
 LABELS = {"operand": "an operand of the first step", "digit": "one digit of an operand", "remaining": "the other operand",
-          "I": "the intermediate result", "I digit": "one digit of the intermediate", "J": "the second product",
-          "answer": "the final answer", "answer digit": "one digit of the final answer"}
+          "I": "the intermediate result", "result digit": "one digit of the intermediate or the answer",
+          "J": "the second product", "answer": "the final answer"}
 EXPR = {"subsub": "(a − b) − c", "subsubx": "c − (a − b)", "addmul": "(a + b) × c", "addmulx": "c + (a × b)",
         "muladd": "(a × b) + c", "sign": "(a − b) × c", "signpair": "(a − b) × c", "absval": "|a − b| × c",
         "mulmid": "(a × b) + (c × d)", "mulmul": "(a × b) + (c × d)"}
@@ -88,8 +88,8 @@ def causal_map(fam, f, out):
     save(fig, out / f"fig_map_{fam}.png")
 
 
-HELD = [("I", "the intermediate result"), ("I digit", "one digit of the intermediate"), ("answer", "the final answer or one of its digits"),
-        ("J", "the second product"), ("operand", "only operands or their digits"),
+HELD = [("I", "the intermediate result"), ("result digit", "one digit of the intermediate or the answer"),
+        ("answer", "the final answer"), ("J", "the second product"), ("operand", "only operands or their digits"),
         ("none (expr)", "nothing, inside the expression"), ("none (after)", "nothing, after the expression"),
         ("none (before)", "nothing, before the numbers")]
 
@@ -99,7 +99,7 @@ def reader_fig(s, out, reader="lens", fname="fig_lens_by_held.png", title=None):
     tot = defaultdict(lambda: np.zeros(3))
     for f in s["arith"].values():
         for k, v in f[reader]["by_held"].items():
-            g = "operand" if k in ("operand", "remaining", "digit") else "answer" if k == "answer digit" else k
+            g = "operand" if k in ("operand", "remaining", "digit") else k
             tot[g] += [v["cells"], v["named"] * v["cells"], v["donor_named"] * v["cells"]]
     rows = [(lab, tot[k]) for k, lab in HELD if tot[k][0] > 0]
     fig, ax = plt.subplots(figsize=(12, 0.9 * len(rows) + 2))

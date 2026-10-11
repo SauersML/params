@@ -4,14 +4,14 @@
 # released oracle lens (agu18dec/olens_and_ar, olens_s3d_rl600) read at every cell of layers 20-60 step 4.
 # Each stage resumes from its outputs, so a replaced pod continues. The code and the WorkspaceBench data
 # (MIT, evaluation only) go up as one tar file; results come back to ~/mpd-data/runpod/NAME.
-#   workspace/pod_stage2.sh NAME HOURS     (env: GPU, PER_FAMILY)
+#   experiments/workspace/pod_stage2.sh NAME HOURS     (env: GPU, PER_FAMILY)
 # Before the first run: check readers.OLENS_PROMPT's line breaks against the source renderer.
 cd /Users/user/params
 N=$1 H=$2 M=Qwen/Qwen3.6-27B
 IN=/Users/user/mpd-data/workspace-bench/pod_in_$N.tar
 S=/Users/user/mpd-data/scratch/workspace/stage_$N
-rm -rf "$S" && mkdir -p "$S/code" && cp workspace/data.py workspace/interchange.py workspace/readers.py workspace/run.py \
-     workspace/summary.py "$S/code/" && cp -R /Users/user/mpd-data/workspace-bench/hf "$S/hf" && rm -rf "$S/hf/.cache" \
+rm -rf "$S" && mkdir -p "$S/code" && cp experiments/workspace/data.py experiments/workspace/interchange.py experiments/workspace/readers.py experiments/workspace/run.py \
+     experiments/workspace/summary.py "$S/code/" && cp -R /Users/user/mpd-data/workspace-bench/hf "$S/hf" && rm -rf "$S/hf/.cache" \
   && COPYFILE_DISABLE=1 tar -cf "$IN" -C "$S" . && rm -rf "$S"
 O=/Users/user/mpd-data/runpod/$N
 X=/Users/user/mpd-data/workspace-bench/pod_src_$N
@@ -24,4 +24,4 @@ python run.py summary --model $M;
 echo all stages done"
 RP_ALLOW_OVER=1 RP_OWNER=lead RP_PARALLEL=1 RP_PYENV=oracle RP_DISK_GB=${DISK:-160} RP_MIN_VRAM_GB=78 \
   RP_HF_MODELS="$M" \
-  infra/runpod/rp-run $N "${GPU:-NVIDIA H100 80GB HBM3,NVIDIA A100-SXM4-80GB,NVIDIA A100 80GB PCIe}" $H -- bash -c "$CMD"
+  experiments/infra/runpod/rp-run $N "${GPU:-NVIDIA H100 80GB HBM3,NVIDIA A100-SXM4-80GB,NVIDIA A100 80GB PCIe}" $H -- bash -c "$CMD"

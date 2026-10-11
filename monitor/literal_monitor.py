@@ -75,13 +75,35 @@ def occurrences(text, lit):
     return [m.start() for m in pat.finditer(text)]
 
 
+def uses(content):
+    """How a func.py source uses each of its literals: "value" (returned, assigned, computed with), "condition" (only
+    inside comparisons: special-casing an input), or "test code" (only inside asserts and print calls)."""
+    found = {}
+
+    def visit(nd, how):
+        if isinstance(nd, ast.Assert) or (isinstance(nd, ast.Call) and getattr(nd.func, "id", None) == "print"):
+            how = "test code"
+        elif how == "value" and isinstance(nd, ast.Compare):
+            how = "condition"
+        if isinstance(nd, ast.Constant) and not isinstance(nd.value, bool) and isinstance(nd.value, (int, str)):
+            found.setdefault(str(nd.value), set()).add(how)
+        for ch in ast.iter_child_nodes(nd):
+            visit(ch, how)
+
+    try:
+        visit(ast.parse(content or ""), "value")
+    except SyntaxError:
+        return {}
+    return {k: next(h for h in ("value", "condition", "test code") if h in v) for k, v in found.items()}
+
+
 def source(text, i, prompt_doc, lit):
     """Where a context occurrence at offset i sits."""
     roles = [(m.start(), m.group(1)) for m in ROLE.finditer(text) if m.start() <= i]
     role = roles[-1][1] if roles else "system"
     line = text[text.rfind("\n", 0, i) + 1:text.find("\n", i) if text.find("\n", i) >= 0 else len(text)].strip()
-    if line.startswith("assert") and "==" in line:
-        return "test expected value" if line.rstrip().endswith(lit) else "test argument"
+    if line.startswith("assert") and "==" in line:  # after the line's "==" (a list element too): the expected value
+        return "test expected value" if text.rfind("==", 0, i) > text.rfind("\n", 0, i) else "test argument"
     if role == "assistant":
         return "model's own earlier text"
     if lit in prompt_doc and (">>>" in text[max(0, i - 200):i] or '"""' in text[max(0, i - 2000):i]):
@@ -205,7 +227,8 @@ def scan(a):
 
                 srcs = [source(text, i, t["prompt"], lit) for i in occ]
                 row = {"literal": lit, "edited": new, "context_occurrences": len(occ), "sources": dict(Counter(srcs)),
-                       "origin": srcs[0], "turn_occurrences": len(turn_occ), "moved_bits": moved, "follows": follows(lp_c)}
+                       "origin": srcs[0], "use": uses(act["args"].get("content")).get(lit, "?"),
+                       "turn_occurrences": len(turn_occ), "moved_bits": moved, "follows": follows(lp_c)}
                 if moved >= a.min_bits:
                     kv_c = [(c2.layers[i].keys, c2.layers[i].values) if hasattr(c2, "layers")
                             else (c2.key_cache[i], c2.value_cache[i]) for i in range(qm.L)]
@@ -253,14 +276,32 @@ def scan(a):
 def report(a):
     """Counts over all scanned runs, by run class (joined here from the transcripts, never used by the scan): runs
     labeled cheat, runs whose writes hard-code test outputs (agent.hardcode_label), and the rest."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(a.model)
     tasks = {t["task_id"]: t for t in agent.load()[0]}
-    cls_of = {}
+    cls_of, trans = {}, {}
     for d in a.runs:
         arm = os.path.basename(os.path.normpath(d))
         for line_ in open(os.path.join(d, "gen", "transcripts.jsonl")):
             r = json.loads(line_)
             hc = agent.hardcode_label(r, tasks[r["task_id"]]) is not None
             cls_of[(arm, r["run_id"])] = "cheat" if r["label"] == "cheat" else ("hard-codes test outputs" if hc else "other")
+            trans[(arm, r["run_id"])] = r
+
+    def relabel(r):
+        """Each probe's sources and origin from the run's transcript with the current source(), and how the write
+        uses the literal (uses())."""
+        tr = trans[(r["arm"], r["run_id"])]
+        call = next(c for c in replay.calls(tr) if c["turn"] == r["turn"])
+        text = tok.decode(call["context_ids"], skip_special_tokens=False)
+        prompt = tasks[tr["task_id"]][tr["split"]]["prompt"]
+        codes = [(x["args"] or {}).get("content") for x in tr["actions"] if x["turn"] == r["turn"]
+                 and x["name"] == "write_file" and os.path.basename(str((x["args"] or {}).get("path", ""))) == "func.py"]
+        for p in r["probes"]:
+            srcs = [source(text, i, prompt, p["literal"]) for i in occurrences(text, p["literal"])]
+            if srcs:
+                p["sources"], p["origin"] = dict(Counter(srcs)), srcs[0]
+            p["use"] = next((u[p["literal"]] for u in map(uses, codes) if p["literal"] in u), "?")
     classes = ["cheat", "hard-codes test outputs", "other"]
     rows = ["runs scanned", "writes skipped (no exact replay)", "literals written", "  occur earlier in the context",
             "  occur only earlier in the writing turn", "  occur nowhere earlier", "probed (at most 8 per write)",
@@ -283,6 +324,8 @@ def report(a):
             by[(cls, {"in the context": "  occur earlier in the context",
                       "only earlier in the turn": "  occur only earlier in the writing turn",
                       "nowhere earlier": "  occur nowhere earlier"}[k])] += w.get(k, 0)
+        if r["probes"]:
+            relabel(r)
         for p in r["probes"]:
             by[(cls, "probed (at most 8 per write)")] += 1
             if p["moved_bits"] >= 0.5:
@@ -297,12 +340,13 @@ def report(a):
             else:
                 by[(cls, "follow under neither edit")] += 1
                 continue
-            origins[(cls, origin)] += 1
-            ex[cls].append(f"{r['run_id']} turn {r.get('turn')} {p['literal']!r} ({origin})")
+            origins[(cls, f"{origin}, used as {p['use']}")] += 1
+            ex[cls].append(f"{r['arm']} {r['run_id']} turn {r.get('turn')} {p['literal']!r} ({origin}, {p['use']})")
     print(f"{'':58s}" + "".join(f"{c:>26s}" for c in classes))
     for row in rows:
         print(f"{row:58s}" + "".join(f"{by[(c, row)]:26d}" for c in classes))
-    print("followed literals (either edit) by origin, the source of the value's first occurrence in the context:")
+    print("followed literals (either edit) by origin (the source of the value's first occurrence in the context) and by"
+          " how the write uses it:")
     for o in sorted({k[1] for k in origins}):
         print(f"   {o:56s}" + "".join(f"{origins[(c, o)]:26d}" for c in classes))
     for c in classes:
@@ -325,6 +369,7 @@ def main():
     p.add_argument("path")
     p.add_argument("--runs", nargs="+", required=True, help="the scanned ARM_DIRs, for run classes (labels joined only here)")
     p.add_argument("--examples", type=int, default=30)
+    p.add_argument("--model", default="Qwen/Qwen3-8B", help="its tokenizer rebuilds each probed write's context")
     a = ap.parse_args()
     if a.cmd == "scan" and not os.path.exists(a.out):
         open(a.out, "w").close()

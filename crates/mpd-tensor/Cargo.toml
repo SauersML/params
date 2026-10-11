@@ -1,0 +1,36 @@
+[package]
+name = "mpd-tensor"
+version = "0.1.0"
+description = "Device-resident tensors (CUDA, Apple GPU, host) for parameter decomposition"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+gam-gpu.workspace = true
+gam-linalg.workspace = true
+libm = "0.2.16"
+log = "0.4.29"
+ndarray.workspace = true
+rayon = "1.12.0"
+serde.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cudarc.workspace = true
+
+# The same objc2 binding gam-gpu's Metal runtime uses, so its context's handles are these types.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError", "NSArray", "NSObject"] }
+objc2-metal = "0.3.2"
+objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = ["std", "MPSCore", "MPSCoreTypes", "MPSKernel", "MPSMatrix", "MPSMatrixMultiplication"] }
+
+# Its own main reads `--require` (tests/cuda_device.rs).
+[[test]]
+name = "cuda_device"
+harness = false
+
+[lints]
+workspace = true

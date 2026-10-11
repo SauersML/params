@@ -4,3 +4,5 @@ lake-manifest.json.bak
 __pycache__/
 *.pyc
 validation/**/results/*.json.tmp
+/target
+/.cargo/

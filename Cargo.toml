@@ -1,0 +1,63 @@
+[workspace]
+members = ["crates/mpd", "crates/mpd-tensor"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/params"
+publish = false
+
+[workspace.dependencies]
+# The gam crates are path dependencies on a checkout of github.com/SauersML/gam next to this one (../gam).
+gam-gpu = { path = "../gam/crates/gam-gpu" }
+gam-linalg = { path = "../gam/crates/gam-linalg" }
+gam-math = { path = "../gam/crates/gam-math" }
+gam-problem = { path = "../gam/crates/gam-problem" }
+gam-runtime = { path = "../gam/crates/gam-runtime" }
+gam-solve = { path = "../gam/crates/gam-solve" }
+mpd-tensor = { path = "crates/mpd-tensor" }
+# gam's own pin, so the CUDA types mpd-tensor passes to gam-gpu are the same crate.
+cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12000"] }
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+[workspace.lints.rust]
+warnings = "deny"
+
+# Profiles follow gam's: test builds optimized with line tables only, dependencies at opt-level 2.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.test]
+debug = "line-tables-only"
+opt-level = 2
+codegen-units = 1
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 2
+
+# mpd is one ~50k-line crate whose experiment binaries are rebuilt many times an hour; at
+# codegen-units = 1 a release or test build of it took 30+ min on a loaded machine. Its hot loops
+# live in faer/ndarray kernels, so parallel codegen costs little runtime and buys the iteration.
+[profile.test.package.mpd]
+codegen-units = 16
+
+[profile.release.package.mpd]
+codegen-units = 16
+
+# gam's own test-profile overrides for the gam crates mpd's tests build (gam's Cargo.toml has the
+# measurements: compile time several times shorter, runtime unchanged).
+[profile.test.package.gam-solve]
+codegen-units = 16
+
+[profile.test.package.gam-terms]
+codegen-units = 16

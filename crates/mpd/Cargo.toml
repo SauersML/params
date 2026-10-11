@@ -1,0 +1,40 @@
+[package]
+name = "mpd"
+version = "0.1.0"
+description = "Mechanistic parameter decomposition"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mpd"
+
+[dependencies]
+faer = "0.24.4"
+gam-gpu.workspace = true
+gam-linalg.workspace = true
+gam-math.workspace = true
+gam-runtime.workspace = true
+libc = "0.2"
+log = "0.4.29"
+memmap2 = "0.9.10"
+mpd-tensor.workspace = true
+ndarray.workspace = true
+rand = "0.10.1"
+rayon = "1.12.0"
+serde.workspace = true
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+statrs = "0.19.0"
+
+[dev-dependencies]
+gam-problem.workspace = true
+gam-solve.workspace = true
+npyz = "0.9.1"
+num-bigint = "0.4.8"
+num-rational = "0.4.2"
+qd = "0.8.0"
+
+[lints]
+workspace = true

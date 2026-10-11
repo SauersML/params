@@ -51,7 +51,7 @@ def role_label(role, token):
     if ":" in role and not role.startswith("op"):
         k, place = role.split(":")
         return f"{names.get(k, k)} {['units', 'tens', 'hundreds', 'thousands'][int(place)]}"
-    return token.replace("\n", "\\n").strip() or "␣"
+    return token.replace("\n", "\\n").strip() or "space"
 
 
 def causal_map(fam, f, out):
@@ -83,7 +83,7 @@ def causal_map(fam, f, out):
     ax.set_title(f"What each cell of Qwen3-8B holds while computing {EXPR[fam]} ({f['items']} problems)")
     present = {g for m in f["maps"] for row in m["assign"] for g in row}
     for k, g in enumerate([g for g in COLORS if g in present]):
-        ax.text(1.02, 0.97 - 0.07 * k, "■ " + LABELS[g], color=COLORS[g], transform=ax.transAxes, fontsize=16, va="top")
+        ax.text(1.02, 0.97 - 0.07 * k, LABELS[g], color=COLORS[g], transform=ax.transAxes, fontsize=17, va="top", fontweight="bold")
     clean(ax)
     save(fig, out / f"fig_map_{fam}.png")
 
@@ -142,6 +142,28 @@ def hop_fig(s, out):
     save(fig, out / "fig_multihop_last_token.png")
 
 
+def arith_last_fig(s, out):
+    """At the last prompt token, layer by layer over all arithmetic problems: the share whose cell holds
+    the intermediate, the answer or one of their digits; the share where the logit lens names the
+    intermediate; and where it names another problem's intermediate."""
+    maps = [m for f in s["arith"].values() for m in f["maps"]]
+    held = np.mean([[row[-1] in ("I", "result digit", "answer") for row in m["assign"]] for m in maps], 0)
+    named = np.mean([np.array(m["named_words"])[:, -1] for m in maps], 0)
+    cross = np.mean([np.array(m["cross_words"])[:, -1] for m in maps], 0)
+    layers = np.arange(len(held)) - 1
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    for y, col, lab in ((held, BLUE, "cell holds a result\n(patching moves the answer)"), (named, RED, "logit lens names the\nintermediate as a word"),
+                        (cross, SOFT, "logit lens names another\nproblem's intermediate as a word")):
+        ax.plot(layers, y, color=col, lw=3)
+        ax.text(layers[-1] + 0.6, y[-1], lab, color=col, va="center", fontsize=15)
+    ax.set_xlabel("layer (−1 = token embedding)")
+    ax.set_ylabel(f"share of {len(maps)} arithmetic problems")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_title("At the last prompt token of an arithmetic problem")
+    clean(ax)
+    save(fig, out / "fig_arith_last_token.png")
+
+
 HOP_HELD = [("carries (after)", "carries it, after the subject"), ("carries (slot)", "carries it, at the subject"),
             ("does not carry (slot)", "does not carry it, at the subject"), ("does not carry (after)", "does not carry it, after the subject"),
             ("does not carry (before)", "does not carry it, before the subject")]
@@ -180,6 +202,7 @@ def main():
         causal_map(fam, f, out)
     if s["arith"]:
         reader_fig(s, out)
+        arith_last_fig(s, out)
     if s["multihop"]:
         hop_fig(s, out)
         hop_reader_fig(s, out)

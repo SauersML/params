@@ -98,6 +98,8 @@ def arith_summary(recs, tok, d=None):
                 cross_by[rd] += cross.reshape(-1).tolist()
                 if rd == "lens":
                     m_named, m_cross = named, cross
+                else:
+                    w_named, w_cross = named, cross
             if has_olens:                              # oracle lens: cells it read (layers 20-60 step 4)
                 texts = torch.load(ol[r["name"]], weights_only=False)["texts"]
                 others = [x["inter"]["I"] for x in rs if x["name"] != r["name"] and x["inter"]["I"] != r["inter"]["I"]]
@@ -111,7 +113,8 @@ def arith_summary(recs, tok, d=None):
                          "post_max": post.max(-1).values.numpy().round(3).tolist(),
                          "mass": torch.gather(mass, -1, assign[..., None])[..., 0].numpy().round(3).tolist(),
                          "explained": expl.numpy().round(3).tolist(), "named": m_named.astype(int).tolist(),
-                         "cross": np.round(m_cross, 3).tolist()})
+                         "cross": np.round(m_cross, 3).tolist(), "named_words": w_named.astype(int).tolist(),
+                         "cross_words": np.round(w_cross, 3).tolist()})
         firsts = []
         for m in maps:                                 # where each problem first holds the intermediate
             cells = [(l - 1, m["roles"][p_]) for l, row in enumerate(m["assign"]) for p_, g in enumerate(row) if g == "I"]
@@ -119,7 +122,15 @@ def arith_summary(recs, tok, d=None):
             firsts.append({"name": m["name"], "first_I": cells[0] if cells else None, "I_cells": len(cells),
                            "last_token_I_or_answer_from": last[0] if last else None,
                            "I_roles": sorted({ro for _, ro in cells})})
-        out[fam] = {"items": len(rs), "maps": maps, "where_I": firsts}
+        conf = defaultdict(list)                       # per group: posterior of the assigned variable, its answer's mass
+        for m in maps:
+            for l, row in enumerate(m["assign"]):
+                for p_, g in enumerate(row):
+                    if not m["roles"][p_].startswith("start"):
+                        conf[g].append((m["post_max"][l][p_], m["mass"][l][p_], m["explained"][l][p_]))
+        confidence = {g: {"cells": len(v), "posterior": float(np.mean([x[0] for x in v])), "mass": float(np.mean([x[1] for x in v])),
+                          "explained": float(np.mean([x[2] for x in v]))} for g, v in conf.items()}
+        out[fam] = {"items": len(rs), "maps": maps, "where_I": firsts, "confidence": confidence}
         for rd in readers_of:
             rates, recall, precision = reader_rates(keys, named_by[rd], cross_by[rd])
             out[fam][rd] = {"by_held": rates, "recall": recall, "precision": precision}
@@ -169,6 +180,8 @@ def main(d, model):
         print(f"\n{fam}: {len(held)}/{len(w)} problems have a cell holding the intermediate; first layers "
               f"{sorted(x['first_I'][0] for x in held)}; positions {Counter(ro for x in held for ro in x['I_roles']).most_common(6)}")
         print(f"  last token holds the intermediate, the answer or one of their digits from layers {sorted(x['last_token_I_or_answer_from'] for x in w if x['last_token_I_or_answer_from'] is not None)}")
+        for g, c in sorted(f["confidence"].items()):
+            print(f"  {g:14s} {c['cells']:6d} cells  posterior {c['posterior']:.2f}  answer mass {c['mass']:.2f}  all hypotheses' mass {c['explained']:.2f}")
         for rd in [x for x in ("lens", "lens_words", "olens") if x in f]:
             g = f[rd]
             print(f"\n{fam} {rd}: {f['items']} items; names the intermediate at recall {g['recall']} precision {g['precision']}")

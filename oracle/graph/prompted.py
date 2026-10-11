@@ -9,8 +9,8 @@ Each round samples --samples answers per question from the best answer so far (t
 of the model's own tokenizer (a subcomponent written out costs several tokens there), its output to --max-tokens.
 
 The model samples with vLLM on a CUDA GPU or with MLX on a Mac (--backend mlx, an MLX checkpoint as --base); either
-way it leaves the accelerator's memory while the verifier scores. Only the text after the model's reasoning (after
-</think>) is its answer: a reply cut off while reasoning has none.
+way it leaves the accelerator's memory while the verifier scores. Reasoning markers delimit the final answer when present; ordinary final replies need no marker.
+A reply explicitly cut off while reasoning has no answer.
 
   prompted.py --base Qwen/Qwen3-32B-FP8 --rounds 3 --samples 2 --questions 50 --out DIR
   prompted.py --backend mlx --base mlx-community/Qwen3-30B-A3B-Thinking-2507-4bit --out DIR
@@ -167,12 +167,11 @@ def score_all(sc, jobs: list, seed: int, workers: int) -> list:
 
 
 def final(text: str) -> str:
-    """The answer part of a reasoning model's reply: after Qwen's </think> or in gpt-oss's final channel; "" for a reply
-    cut off while reasoning."""
+    """Extract a marked final answer or an ordinary reply; explicit unfinished reasoning has no answer."""
     for mark in ("</think>", "<|channel|>final<|message|>"):
         if mark in text:
             return text.split(mark)[-1]
-    return ""
+    return "" if "<think>" in text or "<|channel|>analysis" in text else text
 
 
 class Vllm:

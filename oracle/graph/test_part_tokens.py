@@ -16,6 +16,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import part_tokens as PT  # noqa: E402
+from part_tokens import PartTokens, build, canonical_activations  # noqa: E402
 
 ADDRESSES = ["PD[2].v_proj[559]", "PD[0].c_fc[7]", "PD[3].down_proj[1200]", "L[2].head[6]", "L[5].mlp", "L[0].attn",
              "PD[1].q_proj[3]", "PD[1].o_proj[44]", "PD[2].k_proj[9]", "L[11].head[2]"]
@@ -108,3 +109,31 @@ def test_tables_move_with_the_weights():
     m.to("cpu")
     assert all(f.device.type == "cpu" for f in m.feats.values()) and all(rows.device.type == "cpu" for _, rows, _ in m.ev.values())
     assert torch.allclose(m.input_rows(), on_dev, atol=1e-5)
+
+
+def test_rank_one_features_and_evidence_are_scale_invariant(tmp_path):
+    from types import SimpleNamespace
+    from safetensors.torch import save_file
+    U = torch.tensor([[2., -3.], [4., 1.], [0., 0.], [1e-30, 0.]])
+    V = torch.tensor([[-4., 2., 1., 1e-30], [1., -3., 2., 0.]])
+    name = "h.0.attn.v_proj"
+    def registry(u, v, filename):
+        path = tmp_path / filename
+        save_file({name + ".U": u, name + ".V": v}, str(path))
+        return build(str(path))
+    reg = registry(U, V, "first.safetensors")
+    c = torch.tensor([-7., 0.2, 3., 2.])
+    other = registry(U * c[:, None], V / c, "scaled.safetensors")
+    assert torch.isfinite(reg.features["pd.v"]).all()
+    assert torch.allclose(reg.features["pd.v"], other.features["pd.v"], atol=1e-5)
+    x = torch.tensor([[1., 3.], [-2., 1.]])
+    def evidence(u, v):
+        target = SimpleNamespace(site=lambda _: SimpleNamespace(V=v))
+        acts = {name: (x @ v) * u.double().norm(dim=1).float()}
+        return canonical_activations(acts, target)
+    a, b = evidence(U, V), evidence(U * c[:, None], V / c)
+    assert torch.allclose(a[name], b[name], atol=1e-5)
+    first = PartTokens(reg, hidden=8, emb_rms=1., base_vocab=10)
+    second = PartTokens(other, hidden=8, emb_rms=1., base_vocab=10)
+    second.load_state_dict(first.state_dict())
+    assert torch.allclose(first.evidence(a), second.evidence(b), atol=1e-5)

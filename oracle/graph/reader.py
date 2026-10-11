@@ -31,14 +31,14 @@ CUT = ("A language model reads this text (its tokens, by position) and predicts 
        "most likely next token is {top}.\ntokens = {tokens}\n\n{english}"
        "Question: if layer {layer}'s attention at the last position were kept from reading position {position}, {old} (its "
        "weight there set to zero), would the probability the model gives {top} {move}? Answer Yes or No.")
-HOLD = ", while the subcomponents of step {k} of the explanation kept their values on the original text"
+HOLD = ", while these subcomponents (matrix, position, index) kept their values on the original text: {nodes}"
 MOVE = {False: "go down", True: "fall below half of what it is"}  # an event's "half": its label is a fall below half
 
 
 def english(score: dict) -> str:
     """An answer's English: its docstring, then its comment lines numbered as steps."""
-    notes = [n for n in score.get("notes") or [] if n]
-    parts = [score.get("explanation") or ""] + [f"Step {k}: {n}" for k, n in enumerate(notes, 1)]
+    notes = score.get("notes") or []
+    parts = [score.get("explanation") or ""] + [f"Step {k}: {n}" for k, n in enumerate(notes, 1) if n]
     return "\n".join(p for p in parts if p.strip())
 
 
@@ -65,6 +65,8 @@ class Reader:
         top = repr(prompt["model_top"][0][0][0])
 
         def ask(eng: str, e: dict) -> str:
+            if e.get("hold") and not e.get("held_nodes"):
+                raise ValueError("a hold event must list its held_nodes to define the intervention")
             head = f"An explanation of how the model computes this prediction:\n{eng}\n\n" if eng else ""
             tokens = " ".join(f"{i}:{x!r}" for i, x in enumerate(strings))  # by position: no counting
             move = MOVE[bool(e.get("half"))]
@@ -72,7 +74,7 @@ class Reader:
                 return CUT.format(top=top, tokens=tokens, english=head, layer=e["layer"], position=e["position"],
                                   old=repr(strings[e["position"]]), move=move)
             return ASK.format(top=top, tokens=tokens, english=head, position=e["position"], old=repr(strings[e["position"]]),
-                              new=repr(self.tokens_of([e["new"]])[0]), hold=HOLD.format(k=e["hold"]) if e.get("hold") else "", move=move)
+                              new=repr(self.tokens_of([e["new"]])[0]), hold=HOLD.format(nodes=e["held_nodes"]) if e.get("hold") else "", move=move)
 
         def loss(ps: list[float], evs: list[dict]) -> float:  # the events' mean, by their importance weights
             return sum(e.get("weight", 1.0) * -math.log2(max(p if e["down"] else 1 - p, 1e-12)) for p, e in zip(ps, evs)) / max(sum(e.get("weight", 1.0) for e in evs), 1e-9)
@@ -86,3 +88,4 @@ class Reader:
         for (s0, n), evs in zip(spans, per):
             out.append(None if not n else loss(ps[s0:s0 + n], evs) - loss(ps[s0 + n:s0 + 2 * n], evs))
         return out
+

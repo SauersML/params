@@ -44,13 +44,21 @@ def copy_source(nat, ids: list[int], targets: list[int]) -> tuple[int, int, floa
 
 
 def reads(g, s: int, targets: list[int]) -> bool:
-    """Whether the graph connects a subcomponent at position s into an attention output at a target."""
-    tset = set(targets)
-    if g.complete:
-        nodes = g.node_set()
-        values = {native._layer_kind(nd)[0] for nd in nodes if nd[1] == s and native._layer_kind(nd)[1] == "v_proj"}
-        return any(nd[1] in tset and native._layer_kind(nd)[1] == "o_proj" and native._layer_kind(nd)[0] in values for nd in nodes)
-    return any(r[1] in tset and any(w[1] == s for w in ws) for r, ws in g.parents.items())
+    """Whether connections carry a source-position subcomponent to a target, possibly through relays."""
+    nodes = g.node_set()
+    reached = {nd for nd in nodes if nd[1] == s}
+    pending = list(reached)
+    while pending:
+        w = pending.pop()
+        readers = (r for r in nodes if native.connects(w, r, targets)) if g.complete else (
+            r for r, ws in g.parents.items() if w in ws)
+        for r in readers:
+            if r[1] in targets:
+                return True
+            if r not in reached:
+                reached.add(r)
+                pending.append(r)
+    return False
 
 
 def main():

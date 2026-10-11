@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -326,6 +327,16 @@ class PartTokens(nn.Module):
         return emb.shape[0]
 
 
+def canonical_activations(acts: dict, target) -> dict:
+    """Native amplitudes already include |u|; align their sign with the canonical read direction."""
+    out = {}
+    for name, a in acts.items():
+        V = target.site(name).V
+        sign = V.gather(0, V.abs().argmax(0, keepdim=True)).squeeze(0).sign()
+        out[name] = a * torch.where(sign == 0, 1, sign).to(a.device)
+    return out
+
+
 def build(vpd: str) -> Registry:
     """The registry of a VPD decomposition's subcomponents (UV.safetensors: per site its U and V)."""
     from safetensors.torch import load_file
@@ -336,11 +347,16 @@ def build(vpd: str) -> Registry:
         layer, site = int(name.split(".")[1]), name.split(".")[3]
         U, V = uv[f"{name}.U"].float(), uv[f"{name}.V"].float()  # [C, d_out], [d_in, C]
         tiny = torch.finfo(torch.float32).tiny
-        nu, nv = U.norm(dim=1).clamp_min(tiny), V.norm(dim=0).clamp_min(tiny)
-        vt, ut = (V / nv).T, U / nu[:, None]  # [C, d_in], [C, d_out]: the read and write directions
+        nu, nv = U.double().norm(dim=1), V.double().norm(dim=0)
+        safe_u, safe_v = nu.masked_fill(nu == 0, 1), nv.masked_fill(nv == 0, 1)
+        vt, ut = (V / safe_v).T, U / safe_u[:, None]  # [C, d_in], [C, d_out]: the read and write directions
         sign = torch.sign(vt.gather(1, vt.abs().argmax(1, keepdim=True)))  # u v^T = (-u)(-v)^T: the largest read entry positive
         sign[sign == 0] = 1
-        f = torch.cat([vt * sign * V.shape[0] ** 0.5, ut * sign * U.shape[1] ** 0.5, (nu * nv).log()[:, None]], dim=1)
+        zero = (nu == 0) | (nv == 0)
+        log_scale = safe_u.log() + safe_v.log()
+        log_scale[zero] = math.log(tiny)  # exact zero has a finite floor and no directions
+        vt[zero], ut[zero] = 0, 0
+        f = torch.cat([vt * sign * V.shape[0] ** 0.5, ut * sign * U.shape[1] ** 0.5, log_scale[:, None]], dim=1).float()
         features.setdefault(f"pd.{SITES[site]}", []).append(f)
         addresses += [f"PD[{layer}].{site}[{c}]" for c in range(U.shape[0])]
     return Registry(addresses, {k: torch.cat(v) for k, v in features.items()})

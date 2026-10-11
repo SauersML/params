@@ -405,8 +405,8 @@ class VllmSampler:
         self.llm.apply_model(put)
         self.llm.reset_prefix_cache()
 
-    def push_weights(self):
-        """Copies the policy's linear maps with its adapter merged (the base weight plus the "default" adapter's delta)
+    def push_weights(self, base: bool = False):
+        """Copies base linear maps when base=True, otherwise the policy's linear maps with its adapter merged (the base weight plus the "default" adapter's delta)
         into vLLM's model in place, one matrix at a time through vLLM's own loader (which fills its fused q/k/v and
         gate/up matrices). vLLM serves no adapter: with prompts given as embeddings (--evidence), loading the second
         adapter version (rl2's first update) crashed decoding with an illegal memory access (r15, A100), and the
@@ -421,7 +421,7 @@ class VllmSampler:
                     if isinstance(m, LoraLayer) and "default" in m.lora_A:
                         w = m.base_layer.weight
                         sent.append(name)
-                        yield name.removeprefix("base_model.model.") + ".weight", (w.float() + m.get_delta_weight("default").float()).to(w.dtype)
+                        yield name.removeprefix("base_model.model.") + ".weight", w if base else (w.float() + m.get_delta_weight("default").float()).to(w.dtype)
 
         loaded = self.llm.apply_model(lambda model: len(model.load_weights(merged())))[0]
         if sent and not loaded:
@@ -824,10 +824,15 @@ def make_reader(args, pol, sampler):
             if not sampler.ready:
                 sampler.acquire()
             try:
+                # Share the engine: restore frozen base matrices for the reader, then re-push the policy.
+                sampler.push_weights(base=True)
                 outs = sampler.llm.generate([chat(q) for q in prompts], SamplingParams(max_tokens=1, temperature=0.0, logprobs=20), use_tqdm=False)
             finally:
-                if not sampler.held:
-                    sampler.release()
+                try:
+                    sampler.push_weights()
+                finally:
+                    if not sampler.held:
+                        sampler.release()
             return [{d.decoded_token: d.logprob for d in o.outputs[0].logprobs[0].values()} for o in outs]
     else:
         def generate(prompts):
@@ -1449,7 +1454,9 @@ def main():
         import native
 
         nat = native.Native(str(dev) if dev.type != "cuda" else "cuda")
-        pol.acts_fn = nat.activations
+        from part_tokens import canonical_activations
+
+        pol.acts_fn = lambda ids: canonical_activations(nat.activations(ids), nat.target)
         if args.evidence_positions:  # the positions where the prediction responds most to a changed token (the verifier's probe)
 
             def positions(b: dict) -> list[int]:

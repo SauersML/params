@@ -9,6 +9,7 @@ sys.path.insert(0, str(HERE))
 
 import prompt  # noqa: E402
 import reader  # noqa: E402
+from reader import Reader, english  # noqa: E402
 
 SOURCE = '''def graph(tokens, targets):
     """The last position reads "princess"."""
@@ -41,6 +42,22 @@ def test_reader_bits():
     good, empty = r.bits(task, ["position 3 decides the prediction", ""], events)
     assert abs(good - (1 - math.log2(1 / 0.9)) / 2) < 1e-9 and empty == 0.0
     assert r.bits(task, ["x"], [[]]) == [None]
-    held = r.bits(task, ["position 3 decides"], [[{**events[0], "hold": 2}]])[0]
+    held = r.bits(task, ["position 3 decides"], [[{**events[0], "hold": 2, "held_nodes": [("h.0.mlp.c_fc", 3, 0)]}]])[0]
     assert abs(held - (1 - math.log2(1 / 0.9))) < 1e-9  # one event, its own list
     assert reader.english({"explanation": "A.", "notes": ["b", ""]}) == "A.\nStep 1: b"
+
+
+def test_hold_question_has_same_neutral_specification():
+    captured = []
+    def generate(prompts):
+        captured.extend(prompts)
+        return [{"Yes": math.log(0.5), "No": math.log(0.5)} for _ in prompts]
+    task = {"prompts": [{"token_ids": [1, 2], "model_top": [[["next", 0.5]]]}]}
+    nodes = [("h.0.attn.v_proj", 0, 7), ("h.1.attn.o_proj", 1, 8)]
+    event = {"position": 0, "new": 3, "down": True, "hold": 3, "held_nodes": nodes}
+    text = english({"notes": ["first", "", "relay"]})
+    assert text == "Step 1: first\nStep 3: relay"
+    assert Reader(generate, lambda ids: list(map(str, ids))).bits(task, [text], [[event]]) == [0.0]
+    assert captured[0].split("Question:")[1] == captured[1].split("Question:")[1]
+    assert str(nodes) in captured[0]
+    assert "step" not in captured[0].lower()

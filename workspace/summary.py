@@ -20,7 +20,7 @@ import torch
 
 import readers
 
-GROUPS = ["none", "operand", "digit", "remaining", "I", "answer"]
+GROUPS = ["none", "operand", "digit", "remaining", "I", "J", "answer"]
 
 
 def group(item, h):
@@ -29,7 +29,7 @@ def group(item, h):
     if h in ("none", "answer", "I"):
         return h
     if h == "J":                      # mulmul / mulmid: the second product
-        return "remaining"
+        return "J"
     if "." in h:
         return "digit"
     first = {"a", "b"} if "a" in item["ops"] else {"x", "y"}
@@ -52,6 +52,17 @@ def load_all(d):
     return [torch.load(p, weights_only=False) for p in sorted((d / "patch").glob("*.pt"))]
 
 
+def reader_rates(cells_of, named_of, cross_of):
+    """Naming rates by what the cells hold: {group: cells, named, donor_named}, recall, precision."""
+    cells = defaultdict(lambda: np.zeros(3))
+    for key, n, c in zip(cells_of, named_of, cross_of):
+        cells[key] += [1, n, c]
+    rates = {k: {"cells": int(v[0]), "named": v[1] / v[0], "donor_named": v[2] / v[0]} for k, v in cells.items()}
+    held = cells.get("I", np.zeros(3))
+    total = sum(v[1] for v in cells.values())
+    return rates, (held[1] / held[0] if held[0] else None), (held[1] / total if total else None)
+
+
 def arith_summary(recs, tok):
     fams = defaultdict(list)
     for r in recs:
@@ -59,69 +70,82 @@ def arith_summary(recs, tok):
             fams[r["family"]].append(r)
     out = {}
     for fam, rs in fams.items():
-        names = {r["name"]: readers.number_names(tok, r["inter"]["I"]) for r in rs}
-        cells = defaultdict(lambda: np.zeros(4))      # group -> [n, named, donor-named rate sum, posterior-weighted n]
-        maps = []
+        readers_of = {"lens": {r["name"]: readers.number_names(tok, r["inter"]["I"]) for r in rs}}
+        digit = {r["name"]: tok(str(int(r["inter"]["I"])), add_special_tokens=False)["input_ids"][0] for r in rs}
+        readers_of["lens_words"] = {k: v - {digit[k]} for k, v in readers_of["lens"].items()}
+        keys, named_by, cross_by, maps = [], defaultdict(list), defaultdict(list), []
         for r in rs:
             post, mass, expl = posterior(r)
-            hyps = r["hyps"]
-            g_of = [group(r, h) for h in hyps]
+            g_of = [group(r, h) for h in r["hyps"]]
             assign = post.argmax(-1)                  # [L+1, T]
             lens = r["lens"].numpy()
-            own = names[r["name"]]
-            donors = [v for k, v in names.items() if k != r["name"] and not (v & own)]
-            named = np.isin(lens, list(own)).any(-1)
-            cross = np.mean([np.isin(lens, list(v)).any(-1) for v in donors], 0) if donors else np.zeros(named.shape)
+            seg = ["expr" if not ro.startswith(("start", "end")) else ("before" if ro.startswith("start") else "after") for ro in r["roles"]]
             Lp1, T = assign.shape
-            seg = np.array(["expr" if not ro.startswith(("start", "end")) else ("before" if ro.startswith("start") else "after") for ro in r["roles"]])
-            for l in range(Lp1):
-                for p in range(T):
-                    g = g_of[assign[l, p]]
-                    key = g if g != "none" else f"none ({seg[p]})"
-                    cells[key] += [1, named[l, p], cross[l, p], 0]
-            maps.append({"name": r["name"], "roles": r["roles"], "tokens": [tok.decode([i]) for i in r["ids"]], "assign": [[g_of[a] for a in row] for row in assign.tolist()],
+            keys += [g_of[assign[l, p]] if g_of[assign[l, p]] != "none" else f"none ({seg[p]})" for l in range(Lp1) for p in range(T)]
+            for rd, names in readers_of.items():
+                own = names[r["name"]]
+                donors = [v for k, v in names.items() if k != r["name"] and v and not (v & own)]
+                named = np.isin(lens, list(own)).any(-1) if own else np.zeros(lens.shape[:2], bool)
+                cross = np.mean([np.isin(lens, list(v)).any(-1) for v in donors], 0) if donors else np.zeros(named.shape)
+                named_by[rd] += named.reshape(-1).tolist()
+                cross_by[rd] += cross.reshape(-1).tolist()
+                if rd == "lens":
+                    m_named, m_cross = named, cross
+            maps.append({"name": r["name"], "roles": r["roles"], "tokens": [tok.decode([i]) for i in r["ids"]],
+                         "assign": [[g_of[a] for a in row] for row in assign.tolist()],
                          "post_max": post.max(-1).values.numpy().round(3).tolist(),
                          "mass": torch.gather(mass, -1, assign[..., None])[..., 0].numpy().round(3).tolist(),
-                         "explained": expl.numpy().round(3).tolist(), "named": named.astype(int).tolist(),
-                         "cross": np.round(cross, 3).tolist()})
-        rates = {k: {"cells": int(v[0]), "named": v[1] / v[0], "donor_named": v[2] / v[0]} for k, v in cells.items()}
-        heldI = cells.get("I", np.zeros(4))
-        named_total = sum(v[1] for v in cells.values())
-        out[fam] = {"items": len(rs), "by_held": rates,
-                    "recall": heldI[1] / heldI[0] if heldI[0] else None,
-                    "precision": heldI[1] / named_total if named_total else None,
-                    "maps": maps}
+                         "explained": expl.numpy().round(3).tolist(), "named": m_named.astype(int).tolist(),
+                         "cross": np.round(m_cross, 3).tolist()})
+        out[fam] = {"items": len(rs), "maps": maps}
+        for rd in readers_of:
+            rates, recall, precision = reader_rates(keys, named_by[rd], cross_by[rd])
+            out[fam][rd] = {"by_held": rates, "recall": recall, "precision": precision}
     return out
 
 
 def hop_summary(recs, tok):
     rows = []
-    for r in recs:
-        if r["kind"] != "hop":
-            continue
+    hops = [r for r in recs if r["kind"] == "hop"]
+    names = {r["name"]: readers.word_names(tok, r["bridge"]) for r in hops}
+    cells = defaultdict(lambda: np.zeros(3))
+    for r in hops:
         post, mass, expl = posterior(r)
         lens = r["lens"].numpy()
-        own = readers.word_names(tok, r["bridge"])
+        own = names[r["name"]]
         named = np.isin(lens, list(own)).any(-1) if own else np.zeros(lens.shape[:2], bool)
+        donors = [v for k, v in names.items() if v and k != r["name"] and not (v & own)]
+        cross = np.mean([np.isin(lens, list(v)).any(-1) for v in donors], 0)
+        if own:
+            seg = ["slot" if ro == "slot" else "before" if ro.startswith("start") else "after" for ro in r["roles"]]
+            for l in range(post.shape[0]):
+                for p_, sg in enumerate(seg):
+                    held = "carries" if post[l, p_, 1] > post[l, p_, 0] else "does not carry"
+                    cells[f"{held} ({sg})"] += [1, named[l, p_], cross[l, p_]]
         rows.append({"name": r["name"], "bridge": r["bridge"], "answer": r["answer"], "roles": r["roles"],
                      "tokens": [tok.decode([i]) for i in r["ids"]],
                      "carry_post": post[..., 1].numpy().round(3).tolist(), "carry_mass": mass[..., 1].numpy().round(3).tolist(),
                      "none_mass": mass[..., 0].numpy().round(3).tolist(), "named": named.astype(int).tolist(),
                      "bridge_one_token": bool(own)})
-    return rows
+    by_held = {k: {"cells": int(v[0]), "named": v[1] / v[0], "donor_named": v[2] / v[0]} for k, v in cells.items()}
+    return rows, by_held
 
 
 def main(d, model):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model)
     recs = load_all(d)
-    s = {"arith": arith_summary(recs, tok), "multihop": hop_summary(recs, tok)}
+    hop_rows, hop_held = hop_summary(recs, tok)
+    s = {"arith": arith_summary(recs, tok), "multihop": hop_rows, "multihop_by_held": hop_held}
     (d / "summary.json").write_text(json.dumps(s))
     for fam, f in s["arith"].items():
-        print(f"\n{fam}: {f['items']} items; logit lens names the intermediate at "
-              f"recall {f['recall']} precision {f['precision']}")
-        for k, v in sorted(f["by_held"].items()):
-            print(f"  cells holding {k:16s} {v['cells']:6d}  named {v['named']:.3f}  donor named {v['donor_named']:.3f}")
+        for rd in ("lens", "lens_words"):
+            g = f[rd]
+            print(f"\n{fam} {rd}: {f['items']} items; names the intermediate at recall {g['recall']} precision {g['precision']}")
+            for k, v in sorted(g["by_held"].items()):
+                print(f"  cells holding {k:16s} {v['cells']:6d}  named {v['named']:.3f}  donor named {v['donor_named']:.3f}")
+    for k, v in sorted(hop_held.items()):
+        print(f"multihop cells that {k:28s} {v['cells']:6d}  lens names the bridge {v['named']:.3f}  another prompt's bridge {v['donor_named']:.3f}")
     for h in s["multihop"]:
         last = np.array(h["carry_post"])[:, -1]
         nm = np.array(h["named"])[:, -1]

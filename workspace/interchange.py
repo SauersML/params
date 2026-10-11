@@ -160,41 +160,49 @@ class Qwen3Patcher:
         return torch.stack(hs), lp
 
     @torch.no_grad()
-    def patch_position(self, base, cfs, p, tries, states):
+    def patch_position(self, base, cfs, p, tries, states, N=None):
         """Log-probs of every answer when cell (l, p) of the base run takes counterfactual j's vector,
         for l = -1..L-1: a list over j of [L+1, n_answers_j] (row l+1 is layer l).
-        tries[j], states[j] = the answers scored for counterfactual j and their base-run states."""
+        tries[j], states[j] = the answers scored for counterfactual j and their base-run states.
+
+        Shapes stay fixed across the positions of a prompt (the Mac GPU compiles a kernel per new
+        shape): new tokens padded to N, the prefix to P = T rounded up to 16 with the keys from p on
+        masked, and the elements patched at or above the current layer run in buckets of 4 layers with
+        their outputs discarded."""
         T, J, L = base.ids.shape[0], len(cfs), self.L
         n_tail = T - p
-        N = n_tail + max(len(t.tok) for t in tries)
+        N = N or n_tail + max(len(t.tok) for t in tries)
+        assert N >= n_tail + max(len(t.tok) for t in tries)
+        P = -(-T // 16) * 16
         E = J * (L + 1)                                   # element e = (l + 1) * J + j, ordered by layer
         d = base.h.shape[-1]
-        h0 = torch.empty(E, N, d, dtype=base.h.dtype, device=self.device)
-        pos = torch.full((E, N), T, dtype=torch.long, device=self.device)
-        masks = torch.empty(E, 1, N, p + N, dtype=torch.bool, device=self.device)
+        h0 = torch.zeros(L + 1, J, N, d, dtype=base.h.dtype, device=self.device)
+        pos = torch.full((J, N), T, dtype=torch.long)
+        masks = torch.empty(J, 1, N, P + N, dtype=torch.bool)
+        h0[:, :, :n_tail] = base.h[:, None, p:]
         for j, (cf, trie, st) in enumerate(zip(cfs, tries, states)):
             n = len(trie.tok)
-            m = self._tree_mask(trie, n_tail, p, N).to(self.device)
-            ppos = torch.cat([torch.arange(p, T), torch.tensor([T + x for x in trie.dep], dtype=torch.long)]).to(self.device)
-            for l1 in range(L + 1):
-                e = l1 * J + j
-                h0[e, :n_tail] = base.h[l1, p:]
-                h0[e, 0] = cf.h[l1, p]
-                h0[e, n_tail:n_tail + n] = st[l1]
-                h0[e, n_tail + n:] = 0
-                pos[e, :n_tail + n] = ppos
-                masks[e, 0] = m
-        cos, sin = self._cos_sin(h0, pos)
-        h = h0
+            h0[:, j, 0] = cf.h[:, p]
+            h0[:, j, n_tail:n_tail + n] = st
+            pos[j, :n_tail + n] = torch.cat([torch.arange(p, T), torch.tensor([T + x for x in trie.dep], dtype=torch.long)])
+            m = self._tree_mask(trie, n_tail, P, N)
+            m[:, p:P] = False
+            masks[j, 0] = m
+        h = h0.reshape(E, N, d)
+        pos = pos.to(self.device).repeat(L + 1, 1)
+        masks = masks.to(self.device).repeat(L + 1, 1, 1, 1)
+        cos, sin = self._cos_sin(h, pos)
+        pad = torch.zeros(1, self.kv, P - T, self.hd, dtype=base.k.dtype, device=self.device)
         for i in range(L):                                # elements patched at layer l < i run layer i
             a = (i + 1) * J
-            out, _, _ = self._layer(i, h[:a], cos[:a], sin[:a], base.k[i][None, :, :p], base.v[i][None, :, :p], masks[:a])
-            h = torch.cat([out, h[a:]])
+            b = min(E, -(-(i + 1) // 4) * 4 * J)
+            kp, vp = torch.cat([base.k[i][None], pad], 2), torch.cat([base.v[i][None], pad], 2)
+            out, _, _ = self._layer(i, h[:b], cos[:b], sin[:b], kp, vp, masks[:b])
+            h = torch.cat([out[:a], h[a:]])
         res = []
         for j, trie in enumerate(tries):
             idx = torch.arange(L + 1, device=self.device) * J + j
-            n = len(trie.tok)
-            res.append(self._scores(h[idx][:, :n_tail + n], n_tail, trie))
+            res.append(self._scores(h[idx], n_tail, trie))
         return res
 
 

@@ -69,3 +69,22 @@ def test_batch_hooks_match_fast_path(setup):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q", "-p", "no:cacheprovider", *sys.argv[1:]]))
+
+
+def test_run_engines_agree(setup, tmp_path):
+    """run.py's two patch engines save the same log-probs for a multihop item."""
+    import data
+    import run
+    tok, model, _, _, _ = setup
+    h = [x for x in data.load_multihop() if x.name == "atomic-26-symbol"][0]
+    tpl = data.TEMPLATES[h.template]
+    base = run.ids_of(tok, h.prompt)
+    cfs = [run.ids_of(tok, tpl.prefix + s + tpl.suffix) for s in ("29", "47")]
+    answers = [[run.hop_forms(tok, h.prompt, h.answer), run.hop_forms(tok, h.prompt, a)] for a in ("Cu", "Ag")]
+    roles = run.roles_hop(tok, h, base)
+    run.patch_item(Qwen3Patcher(model), tok, base, cfs, answers, [[0, 1]] * 2, roles, {}, tmp_path / "fast.pt")
+    run.patch_item_hooks(model, tok, base, cfs, answers, [[0, 1]] * 2, roles, {}, tmp_path / "hooks.pt", 32)
+    a, b = torch.load(tmp_path / "fast.pt", weights_only=False), torch.load(tmp_path / "hooks.pt", weights_only=False)
+    for x, y in zip(a["lp"], b["lp"]):
+        assert torch.allclose(x, y, atol=2e-3), (x - y).abs().max()
+    assert torch.equal(a["lens"], b["lens"])

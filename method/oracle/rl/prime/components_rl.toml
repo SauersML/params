@@ -1,0 +1,90 @@
+# prime-rl RL of the component-circuit explainer (#2951 graph oracle): one GPU for vLLM, one for the trainer, the reward
+# rl/serve_components.py's (components.reward over goal_eval's scorecard: invalid -1, else the mean of F2 completeness,
+# F1 recovered, F3 AUC, E1 when a reader is served, E2, less 0.5 x size). The launcher sets model.name (the SFT
+# explainer merged into Qwen3-4B) and starts from the directory holding train.jsonl and heldout.jsonl (components.py
+# questions output). Each training text appears in 4 examples with their own F2 ranks drawn from 0-7; evaluations use
+# the measured ranks 0-2 and the held-out ranks 3-5.
+max_steps = 60
+seq_len = 12288  # questions number every token and list VPD's subcomponents (5-7.5k tokens); answers stop at 4,096
+dashboard = false
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[trainer.model.lora]
+rank = 32
+alpha = 64
+
+[trainer.model.ac]
+
+[trainer.optim]
+lr = 3e-5
+
+[orchestrator]
+batch_size = 32  # 4 examples x 8 answers
+
+[orchestrator.concurrency]
+initial_inflight = 32
+
+[orchestrator.renderer]
+name = "qwen3"
+enable_thinking = false
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 4096
+temperature = 1.0
+
+[[orchestrator.train.source]]
+name = "components-oracle"
+env.taskset.id = "components-oracle"
+env.taskset.questions = "train.jsonl"
+env.taskset.copies = 4
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[orchestrator.eval]
+interval = 20
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 4096
+temperature = 1.0
+chat_template_kwargs = { enable_thinking = false }
+
+[[orchestrator.eval.source]]
+name = "components-measured"
+group_size = 2
+env.taskset.id = "components-oracle"
+env.taskset.questions = "heldout.jsonl"
+env.taskset.copies = 1
+env.taskset.ranks = [0, 1, 2]
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[[orchestrator.eval.source]]
+name = "components-heldout"
+group_size = 2
+env.taskset.id = "components-oracle"
+env.taskset.questions = "heldout.jsonl"
+env.taskset.copies = 1
+env.taskset.ranks = [3, 4, 5]
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[ckpt]
+
+[deployment]
+num_infer_gpus = 1
+num_train_gpus = 1
+
+[weight_broadcast]  # LoRA adapters go through the filesystem
+type = "filesystem"
+
+[inference.vllm]  # serve_components.py's scoring processes share this GPU
+gpu_memory_utilization = 0.6
+max_model_len = 12288
+
+[env_vars]
+VLLM_USE_FLASHINFER_SAMPLER = "0"

@@ -62,6 +62,8 @@ class ComponentsOracleConfig(vf.TasksetConfig):
     """components.py questions output, one text per line."""
     copies: int = 4
     """Examples per text, each with its own draw of ranks."""
+    ranks: list[int] | None = None
+    """Fixed ranks for every example (evaluations: the measured 0-2 or the held-out 3-5) in place of the draws."""
     task: ComponentsOracleTaskConfig = ComponentsOracleTaskConfig()
 
 
@@ -73,7 +75,7 @@ class ComponentsOracleTaskset(vf.Taskset[ComponentsOracleTask, ComponentsOracleC
                 continue
             r = json.loads(line)
             for i in range(self.config.copies):
-                ranks = sorted(random.Random(f"{r['task']}:{i}").sample(range(RANKS), 3))
+                ranks = list(self.config.ranks) if self.config.ranks else sorted(random.Random(f"{r['task']}:{i}").sample(range(RANKS), 3))
                 tasks.append(ComponentsOracleTask(ComponentsOracleData(id=f"{r['task']}:{i}", prompt=r["question"], task=r["task"], ranks=ranks),
                                                   self.config.task))
         return tasks

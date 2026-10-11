@@ -179,9 +179,13 @@ def _grouped(nds) -> list[str]:
     by = {}
     for nd in nds:
         by.setdefault((nd[0], nd[1]), []).append(nd)
-    order = list(KINDS.values())
-    key = lambda k: (-k[1], -int(k[0].split(".")[1]), order.index(k[0].split(".")[-1]))  # noqa: E731
-    return [group_text(by[k]) for k in sorted(by, key=key)]
+    return [group_text(by[k]) for k in sorted(by, key=_place)]
+
+
+def _place(nd) -> tuple:
+    """A node's (or a (matrix, position) group's) place in rendered text: latest position, then latest layer, then
+    kind (q, k, v, o, fc, down), then index."""
+    return (-nd[1], -int(nd[0].split(".")[1]), list(KINDS.values()).index(nd[0].split(".")[-1])) + tuple(nd[2:3])
 
 
 def render(answer: dict, finals: dict | None = None, reasons: dict | None = None) -> str:
@@ -206,7 +210,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
     if out:
         lines.append("out <- " + ", ".join(_grouped(set(out))))
         named.update(out)
-    queue = sorted(set(out), key=lambda nd: (-nd[1], nd[0], nd[2]))
+    queue = sorted(set(out), key=_place)
     while queue:
         k = group_of_reader.get(queue.pop(0))
         if k is None or k in done:
@@ -215,7 +219,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
         lines.append(f"{group_text(groups[k])} <- " + ", ".join(_grouped(k[2])))
         named.update(groups[k])
         named.update(k[2])
-        queue += sorted(k[2], key=lambda nd: (-nd[1], nd[0], nd[2]))
+        queue += sorted(k[2], key=_place)
     for k in sorted(set(groups) - done, key=lambda k: (-k[1], k[0], sorted(c for _, _, c in groups[k]))):
         lines.append(f"{group_text(groups[k])} <- " + ", ".join(_grouped(k[2])))
         named.update(groups[k])

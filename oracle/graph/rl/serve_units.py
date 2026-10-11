@@ -11,7 +11,7 @@ requests always go to the same process.
 
 reward = carried - size_weight x units / units_all for an answer with a line for every listed position (carried: the
 movement-weighted share of the carry test's movement the answer removes; units_all: every unit at a listed position and
-the target, 48 per position on vpd4l), else 0 (an answer that does not parse or was cut before its last line).
+the target, 48 per position on vpd4l), else -1 (an answer that does not parse or was cut before its last line: below every valid answer).
 """
 
 from __future__ import annotations
@@ -33,6 +33,9 @@ GRAPH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(GRAPH))
 
 
+INVALID = -1.0  # below every valid answer (whose floor is -size_weight x units / units_all): failing to answer never pays
+
+
 def rewards(nat, task: dict, answers: list[str], k: int, size_weight: float) -> list[dict]:
     """Each answer's reward and the measurements behind it (one units.score_many call)."""
     import units
@@ -49,7 +52,7 @@ def rewards(nat, task: dict, answers: list[str], k: int, size_weight: float) -> 
         valid = s is not None and lines == len(positions)
         carried = 1 - s["uncarried"] if s is not None else 0.0
         units_n = s["units"] if s is not None else 0
-        out.append({"reward": carried - size_weight * units_n / units_all if valid else 0.0, "valid": valid, "carried": carried,
+        out.append({"reward": carried - size_weight * units_n / units_all if valid else INVALID, "valid": valid, "carried": carried,
                     "units": units_n, "units_all": units_all, "unknown": s["unknown"] if s is not None else 0,
                     "rest_carried": s["rest_carried"] if s is not None else 0.0, "lines": lines, "positions": len(positions)})
     return out

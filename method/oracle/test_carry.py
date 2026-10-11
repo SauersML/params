@@ -151,7 +151,7 @@ def test_nonzero_source_target_controls(task, source, target):
     print(task, "source/target-only prototype", expected, "carry", actual)
     assert actual == pytest.approx(expected, abs=1e-5)
     assert expected > .03
-    units = carry.UnitSpace(nat, len(ids), [source, *targets])
+    units = carry.UnitSpace(nat, len(ids), [source, *targets], "matrix")
     fast = carry.MatrixCarry(nat, ids, targets, prompts, units, chunk_size=3)
     all_units = torch.ones(units.size, dtype=torch.bool, device=nat.dev)
     alternating = all_units.clone()
@@ -240,7 +240,7 @@ def test_oom_chunk_backoff(case, monkeypatch):
 
 def test_unit_space_and_head_endpoints(case):
     nat, ids, targets, prompts, study, _, _, _ = case
-    matrix = carry.UnitSpace(nat, len(ids), [322, *targets])
+    matrix = carry.UnitSpace(nat, len(ids), [322, *targets], "matrix")
     full = torch.ones(matrix.size, dtype=torch.bool, device=nat.dev)
     assert matrix.size == len(nat.names) * len(set([322, *targets]))
     expected = {(n, p, c) for n, p in matrix.units for c in range(nat.C[n])}
@@ -425,7 +425,7 @@ def test_alternative_tokens(case):
 
 def test_prompt_batch_embeddings(case):
     nat, ids, targets, prompts, *_ = case
-    space = carry.UnitSpace(nat, len(ids), [322, *targets])
+    space = carry.UnitSpace(nat, len(ids), [322, *targets], "matrix")
     study = carry.MatrixCarry(nat, ids, targets, prompts, space)
     with torch.no_grad():
         mode = carry._PromptBatch(study, 1)
@@ -456,7 +456,7 @@ def test_cli_resume_without_model(monkeypatch):
 
 def test_window_rms_against_padded_reference(case):
     nat, ids, targets, prompts, *_ = case
-    space = carry.UnitSpace(nat, len(ids), [322, *targets])
+    space = carry.UnitSpace(nat, len(ids), [322, *targets], "matrix")
     study = carry.MatrixCarry(nat, ids, targets, prompts, space, chunk_size=3)
     full = torch.ones(space.size, dtype=torch.bool, device=nat.dev)
     half = full.clone()
@@ -476,7 +476,7 @@ def test_window_rms_against_padded_reference(case):
 def test_relay_screen_full_chunked_and_finite_difference(case):
     nat, ids, targets, prompts, dense, *_ = case
     p = 322
-    space = carry.UnitSpace(nat, len(ids), [p, *targets])
+    space = carry.UnitSpace(nat, len(ids), [p, *targets], "matrix")
     study = carry.MatrixCarry(nat, ids, targets, prompts, space)
     full = carry._relay_attribution(study, p, targets)
     chunks = carry._relay_attribution(study, p, targets, chunk_size=2)
@@ -514,7 +514,7 @@ def test_relay_attribution_oom_never_skips(monkeypatch):
     study = SimpleNamespace(nat=nat, T=24)
     seen = []
     def view(study, positions):
-        return SimpleNamespace(space=carry.UnitSpace(nat, study.T, positions))
+        return SimpleNamespace(space=carry.UnitSpace(nat, study.T, positions, "matrix"))
     def grad(study, space, active):
         seen.append(space.positions)
         assert all(bool(a) == (u[-1] in {1, 8, 23}) for a, u in zip(active, space.units))
@@ -541,7 +541,7 @@ def test_head_relay_views(case):
     indices = torch.tensor([view.space.index[u] for u in chunk.space.units], device=nat.dev)
     torch.testing.assert_close(chunk_grad, full_grad[indices], atol=3e-4, rtol=.002)
     rows = [carry._position_mask(view.space, ps) for ps in (base, base | {323}, base | {323, 325})]
-    matrix = carry.UnitSpace(nat, len(ids), view.space.positions)
+    matrix = carry.UnitSpace(nat, len(ids), view.space.positions, "matrix")
     reference = dense.measure([matrix.expand(carry._position_mask(matrix, ps))
                                for ps in (base, base | {323}, base | {323, 325})])
     torch.testing.assert_close(view.measure(rows), reference, atol=3e-5, rtol=1e-5)
@@ -566,7 +566,7 @@ def test_measured_relays_and_stopping(monkeypatch):
     study = Study()
     def view(study, positions):
         v = Study()
-        v.space = carry.UnitSpace(nat, study.T, positions)
+        v.space = carry.UnitSpace(nat, study.T, positions, "matrix")
         return v
     monkeypatch.setattr(carry, "_unit_view", view)
     monkeypatch.setattr(carry, "_relay_attribution", lambda *args, **kwargs: [(q, 30-q) for q in range(2, 29)])
@@ -590,10 +590,10 @@ def test_measured_relays_and_stopping(monkeypatch):
 def test_relay_curve_positions_and_explain_forwarding(monkeypatch):
     from types import SimpleNamespace
     nat = SimpleNamespace(dev="cpu", names=["a"], target=SimpleNamespace(n_head=1))
-    study = SimpleNamespace(nat=nat, space=carry.UnitSpace(nat, 8, [1, 7]),
+    study = SimpleNamespace(nat=nat, space=carry.UnitSpace(nat, 8, [1, 7], "matrix"),
                             measure=lambda sets: torch.tensor([5.]))
     monkeypatch.setattr(carry, "_find_relays", lambda *args, **kwargs: [(4, .2)])
-    monkeypatch.setattr(carry, "_unit_view", lambda s, ps: SimpleNamespace(space=carry.UnitSpace(nat, 8, ps)))
+    monkeypatch.setattr(carry, "_unit_view", lambda s, ps: SimpleNamespace(space=carry.UnitSpace(nat, 8, ps, "matrix")))
     def eliminate(study, space):
         curve = carry.Curve(space)
         curve.record(torch.ones(space.size, dtype=torch.bool), .2)
@@ -615,7 +615,7 @@ def test_hard9300_relays_measured_against_dense():
     prompts = carry.alternatives(nat, ids, p)
     dense = carry.Carry(nat, ids, targets, prompts, chunk_size=1)
     base = {p, *targets}
-    initial = carry.UnitSpace(nat, len(ids), base)
+    initial = carry.UnitSpace(nat, len(ids), base, "matrix")
     study = carry.MatrixCarry(nat, ids, targets, prompts, initial)
     movement = carry._movement(study)
     before = float(study.measure([carry._position_mask(initial, base)])[0])
@@ -628,7 +628,7 @@ def test_hard9300_relays_measured_against_dense():
         assert p < q < max(targets) and q not in base
         assert current - score >= .01 * movement
         base.add(q)
-        space = carry.UnitSpace(nat, len(ids), base)
+        space = carry.UnitSpace(nat, len(ids), base, "matrix")
         active = carry._position_mask(space, base)
         actual = float(dense.measure([space.expand(active)])[0])
         assert actual == pytest.approx(score, abs=3e-5, rel=1e-5)
@@ -904,3 +904,91 @@ if __name__ == "__main__":
     # The local memory guard recognizes script paths, but reserves only 2 GiB
     # for `python -m pytest` regardless of MPD_MEM_GIB.
     raise SystemExit(pytest.main([__file__, "-s", "-p", "no:cacheprovider", *sys.argv[1:]]))
+
+
+def test_subcomponent_matrix_empty_and_batch(case):
+    nat, ids, targets, prompts, dense, _, _, _ = case
+    n, p = native.site_name(0, "c_fc"), 322
+    space = carry.UnitSpace(nat, len(ids), [p, *targets], candidates={(n, p): range(nat.C[n])})
+    matrix = carry.UnitSpace(nat, len(ids), [p, *targets], "matrix")
+    one = torch.zeros(matrix.size, dtype=torch.bool, device=nat.dev)
+    one[matrix.index[n, p]] = True
+    on = torch.ones(space.size, dtype=torch.bool, device=nat.dev)
+    half = on.clone(); half[1::2] = False
+    rows = [on, half, ~on]
+    study = carry.Carry(nat, ids, targets, prompts, chunk_size=3, space=space)
+    batch = study.measure(rows)
+    torch.testing.assert_close(batch[[0, 2]], dense.measure([matrix.expand(one), set()]), atol=2e-5, rtol=1e-5)
+    # Independent full Native path verifies partial subcomponent interventions too.
+    torch.testing.assert_close(batch, dense.measure([space.expand(a) for a in rows]), atol=2e-5, rtol=1e-5)
+    study.chunk_size = 1
+    single = torch.cat([study.measure([a]) for a in rows])
+    torch.testing.assert_close(batch, single, atol=2e-5, rtol=1e-5)
+    assert study.measure([]).numel() == 0
+
+
+def test_subcomponent_space_restriction_and_coefficients(case):
+    nat, ids, _, _, _, _, _, _ = case
+    n = nat.names[0]
+    space = carry.UnitSpace(nat, len(ids), [322, 332], candidates={(n, 322): [7, 2, 7]})
+    assert space.units == [(n, 322, 7), (n, 322, 2)]
+    active = torch.tensor([True, False], device=nat.dev)
+    expected = carry.masks(nat, len(ids), [(n, 322, 7)])
+    for name, v in space.expand(active).items():
+        assert torch.equal(v, expected[name])
+        assert torch.equal(space.coefficients(active)[name][0], v)
+        assert torch.equal(space.compact(active)[name][0], v[space.pos])
+    a = active.float().requires_grad_(True)
+    sum(v.sum() for v in space.compact(a).values()).backward()
+    torch.testing.assert_close(a.grad, torch.ones_like(a))
+    with pytest.raises(ValueError, match="require candidates"):
+        carry.UnitSpace(nat, len(ids), range(len(ids)))
+    with pytest.raises(ValueError, match="index"):
+        carry.UnitSpace(nat, len(ids), [322], candidates={(n, 322): [nat.C[n]]})
+    empty = carry.UnitSpace(nat, len(ids), [322], candidates={})
+    assert empty.size == 0
+    assert all(not v.any() for v in empty.expand(torch.empty(0, dtype=torch.bool, device=nat.dev)).values())
+
+
+def test_alternative_ranks(case):
+    nat, ids, *_ = case
+    old = carry.alternatives(nat, ids, 322)
+    other = carry.alternatives(nat, ids, 322, ranks=(3, 4, 5))
+    assert {x[322] for x in old}.isdisjoint(x[322] for x in other)
+    assert all(x[:322] == ids[:322] and x[323:] == ids[323:] for x in other)
+    with pytest.raises(ValueError):
+        carry.alternatives(nat, ids, 322, ranks=(-1,))
+
+
+def test_candidates_full_order_and_one_backward(case):
+    nat, ids, targets, *_ = case
+    order = carry.candidates(nat, ids, targets, 322, [322, *targets])
+    assert set(order) == {(n, p) for n in nat.names for p in [322, *targets]}
+    for (n, _), cs in order.items():
+        assert sorted(cs) == list(range(nat.C[n]))
+    short = carry.candidates(nat, ids, targets, 322, [322, *targets], k=5)
+    assert all(short[key] == cs[:5] for key, cs in order.items())
+
+
+@pytest.mark.parametrize("size", [10, 100, 1000])
+def test_restricted_subcomponent_products_against_native(case, size):
+    nat, ids, targets, prompts, dense, *_ = case
+    pairs = [(n, p) for n in nat.names for p in (322, 332)]
+    selected = {}
+    for j in range(size):
+        selected.setdefault(pairs[j % len(pairs)], []).append(j // len(pairs))
+    space = carry.UnitSpace(nat, len(ids), [322, 332], candidates=selected)
+    active = torch.ones(size, dtype=torch.bool, device=nat.dev)
+    half = active.clone(); half[1::2] = False
+    rows = [active, half, ~active]
+    study = carry.Carry(nat, ids, targets, prompts, space=space, chunk_size=3)
+    batch = study.measure(rows)
+    expected = dense.measure([space.expand(a) for a in rows])
+    torch.testing.assert_close(batch, expected, atol=2e-5, rtol=1e-5)
+    study.chunk_size = 1
+    torch.testing.assert_close(batch, study.measure(rows), atol=2e-5, rtol=1e-5)
+    # A restricted space's differentiable path must also use the sparse products.
+    a = half.float().requires_grad_(True)
+    loss = carry.kl(study.lp[0], study.mixed(prompts[0], space.coefficients(a))).sum()
+    grad, = torch.autograd.grad(loss, a)
+    assert torch.isfinite(grad).all()

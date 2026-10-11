@@ -284,7 +284,7 @@ class _Remainders(TorchFunctionMode):
 
 class Carry:
     """Cache the original record and changed-prompt references for a study."""
-    def __init__(self, nat, ids, targets, prompts, chunk_size=None):
+    def __init__(self, nat, ids, targets, prompts, chunk_size=None, *, space=None):
         if not prompts or not targets:
             raise ValueError("need at least one prompt and target")
         if any(len(x) != len(ids) for x in prompts):
@@ -303,10 +303,22 @@ class Carry:
         self.chunk_size = max(1, (512 * 1024**2) // per) if chunk_size is None else chunk_size
         if self.chunk_size < 1:
             raise ValueError("chunk_size must be positive")
+        if space is not None:
+            if space.granularity == "head":
+                raise ValueError("head slices require HeadCarry")
+            self.space = space
+            with torch.no_grad():
+                self.writes = {n: self.rec[n] @ nat.target.site(n).U for n in nat.names}
+            self.first_change = min((p for x in prompts for p, (a, b) in enumerate(zip(ids, x)) if a != b), default=self.T)
+            _prepare_unit_prompts(self)
+            if chunk_size is None:
+                self.chunk_size = _unit_chunk(nat, self.T, len(prompts))
 
     @torch.no_grad()
     def measure(self, sets):
         _check_study_edit(self)
+        if hasattr(self, "space"):
+            return _measure_units(self, sets)
         if not len(sets):
             return torch.empty(0, device=self.nat.dev)
         nat = self.nat
@@ -338,6 +350,8 @@ class Carry:
 
     def mixed(self, x, coefficients):
         _check_study_edit(self)
+        if hasattr(self, "space"):
+            return _mixed_units(self, x, coefficients)
         patch = {n: (torch.ones_like(self.rec[n], dtype=torch.bool), self.rec[n]) for n in self.nat.names}
         mode = _Mix(patch, coefficients)
         with mode:
@@ -409,7 +423,7 @@ class Curve(list):
 
     @property
     def position_sets(self):
-        return [sorted({u[-1] for u in self.unit_set(i)}) for i in range(len(self))]
+        return [sorted({u[1] if isinstance(u, Subcomponent) else u[-1] for u in self.unit_set(i)}) for i in range(len(self))]
 
 
 def attribution(study, space, active):
@@ -515,74 +529,137 @@ def diagnostics(study):
 
 
 @torch.no_grad()
-def alternatives(nat, ids, source):
+def alternatives(nat, ids, source, ranks=(0, 1, 2)):
     if not 0 < source < len(ids):
         raise ValueError("source must have a preceding prediction position")
     lp = nat.reference([ids[:source]], [source - 1])[0, 0]
-    order = lp.topk(4).indices.tolist()
-    alts = [int(z) for z in order if z != ids[source]][:3]
+    ranks = tuple(ranks)
+    if not ranks or any(not isinstance(r, int) or r < 0 for r in ranks):
+        raise ValueError("ranks must be nonempty nonnegative integers")
+    if max(ranks) >= lp.numel() - 1:
+        raise ValueError("alternative rank outside vocabulary")
+    order = lp.topk(min(lp.numel(), max(ranks) + 2)).indices.tolist()
+    others = [int(z) for z in order if z != ids[source]]
+    alts = [others[r] for r in ranks]
     return [ids[:source] + [z] + ids[source + 1:] for z in alts]
 
 
-class UnitSpace:
-    """Disjoint matrix-position units, or attention head-position slices.
+class Subcomponent(tuple):
+    """A (matrix, position, index) triple, distinct from legacy head triples.
 
-    Public units are (matrix, position) and (matrix, head, position). q/k/v
-    head h selects output dimensions [h*hd:(h+1)*hd] of a @ U, BEFORE
-    adding the live remainder. Dense U mixes heads, so no component is assigned
-    to a single head. o head h selects its input contribution att_h @ V_h to
-    a_o, BEFORE a_o @ U; V mixes heads too. MLP units keep all components.
-    Head slices sum to precisely the matrix intervention (up to float32 order).
+    Tuple equality, hashing and JSON serialization retain the public node API.
     """
-    def __init__(self, nat, T, positions, granularity="matrix"):
-        if granularity not in ("matrix", "head"):
-            raise ValueError("granularity must be matrix or head")
+    def __new__(cls, name, position, index):
+        return super().__new__(cls, (name, position, index))
+
+
+class UnitSpace:
+    """VPD subcomponents (matrix, position, index), or explicit legacy units.
+
+    ``candidates`` restricts subcomponent membership; omitted keys are empty.
+    It preserves index order within each matrix/position. Large unrestricted
+    spaces require explicit candidates to avoid accidental text-wide expansion.
+    Legacy matrix units are (matrix, position); attention head slices are
+    (matrix, head, position), acting before the live VPD remainder, as before.
+    """
+    MAX_UNRESTRICTED = 100_000
+
+    def __init__(self, nat, T, positions, granularity="subcomponent", candidates=None):
+        if granularity not in ("subcomponent", "matrix", "head"):
+            raise ValueError("granularity must be subcomponent, matrix or head")
         positions = sorted(set(positions))
         if not positions or min(positions) < 0 or max(positions) >= T:
             raise ValueError("positions must be inside the text")
+        if candidates is not None and granularity != "subcomponent":
+            raise ValueError("candidates apply only to subcomponents")
         self.nat, self.T, self.positions, self.granularity = nat, T, positions, granularity
-        self.units = [u for n in nat.names for p in positions
-                      for u in ([(n, h, p) for h in range(nat.target.n_head)]
-                                if granularity == "head" and ".attn." in n else [(n, p)])]
+        if granularity == "subcomponent":
+            if candidates is None:
+                if len(positions) * sum(nat.C.values()) > self.MAX_UNRESTRICTED:
+                    raise ValueError("large subcomponent spaces require candidates")
+                candidates = {(n, p): range(nat.C[n]) for n in nat.names for p in positions}
+            if any(n not in nat.names or p not in positions for n, p in candidates):
+                raise ValueError("candidate matrix/position outside space")
+            self.units = []
+            for n in nat.names:
+                for p in positions:
+                    cs = list(candidates.get((n, p), ()))
+                    if any(not isinstance(c, (int, np.integer)) or c < 0 or c >= nat.C[n] for c in cs):
+                        raise ValueError(f"candidate index outside {n}")
+                    self.units.extend(Subcomponent(n, p, int(c)) for c in dict.fromkeys(cs))
+        else:
+            self.units = [u for n in nat.names for p in positions
+                          for u in ([(n, h, p) for h in range(nat.target.n_head)]
+                                    if granularity == "head" and ".attn." in n else [(n, p)])]
         self.size = len(self.units)
         self.index = {u: j for j, u in enumerate(self.units)}
-        self.by_name = {}
-        self.offsets = {}
+        self.by_name, self.offsets, self.flat_indices, self.compact_indices = {}, {}, {}, {}
+        self.columns, self.selected_indices = {}, {}
+        offset = 0
         for n in nat.names:
-            js = [j for j, u in enumerate(self.units) if u[0] == n]
-            self.by_name[n] = torch.tensor(js, device=nat.dev)
-            self.offsets[n] = slice(js[0], js[-1]+1)
+            us = [u for u in self.units if u[0] == n]
+            count = len(us)
+            self.offsets[n] = slice(offset, offset + count)
+            self.by_name[n] = torch.arange(offset, offset + count, device=nat.dev)
+            offset += count
+            if granularity == "subcomponent":
+                self.flat_indices[n] = torch.tensor([u[1]*nat.C[n]+u[2] for u in us], device=nat.dev, dtype=torch.long)
+                rows = {p: j for j, p in enumerate(positions)}
+                self.compact_indices[n] = torch.tensor([rows[u[1]]*nat.C[n]+u[2] for u in us], device=nat.dev, dtype=torch.long)
+                cs = sorted({u[2] for u in us})
+                self.columns[n] = torch.tensor(cs, device=nat.dev, dtype=torch.long)
+                col = {c: j for j, c in enumerate(cs)}
+                self.selected_indices[n] = torch.tensor([rows[u[1]]*len(cs)+col[u[2]] for u in us], device=nat.dev, dtype=torch.long)
         self.pos = torch.tensor(positions, device=nat.dev)
 
     def expand(self, a):
-        # Matrix masks use ordinary Carry. Head coefficients are consumed by
-        # HeadCarry, never misinterpreted as subcomponent masks.
+        """[N] or [B,N] to dense per-matrix masks; head vectors stay compact."""
         if self.granularity == "head":
             return a
-        out = {}
-        for n, js in self.by_name.items():
-            v = a[js, None].expand(-1, self.nat.C[n])
-            out[n] = torch.zeros(self.T, self.nat.C[n], device=a.device, dtype=a.dtype).index_copy(0, self.pos, v)
-        return out
+        single = a.dim() == 1
+        out = self.coefficients(a)
+        if self.granularity == "matrix":
+            out = {n: v.expand(-1, -1, self.nat.C[n]) for n, v in out.items()}
+        return {n: v[0] for n, v in out.items()} if single else out
 
     def nodes(self, active):
         return {self.units[j] for j in active.nonzero().flatten().cpu().tolist()}
 
-    def coefficients(self, a):
-        """[B,N] -> per-matrix [B,T,H or 1], including frozen positions."""
+    def _coefficients(self, a, compact):
         if a.dim() == 1:
             a = a[None]
+        if a.dim() != 2 or a.shape[1] != self.size:
+            raise ValueError("coefficients must have shape [N] or [B,N]")
         out = {}
-        for n, js in self.by_name.items():
-            H = self.nat.target.n_head if self.granularity == "head" and ".attn." in n else 1
-            v = a[:, js].reshape(a.shape[0], len(self.positions), H)
-            out[n] = a.new_zeros(a.shape[0], self.T, H).index_copy(1, self.pos, v)
+        rows = len(self.positions) if compact else self.T
+        for n, sl in self.offsets.items():
+            if self.granularity == "subcomponent":
+                ix = self.compact_indices[n] if compact else self.flat_indices[n]
+                z = a.new_zeros(a.shape[0], rows*self.nat.C[n])
+                out[n] = z.index_copy(1, ix, a[:, sl]).view(a.shape[0], rows, self.nat.C[n])
+            else:
+                H = self.nat.target.n_head if self.granularity == "head" and ".attn." in n else 1
+                v = a[:, sl].reshape(a.shape[0], len(self.positions), H)
+                out[n] = v if compact else a.new_zeros(a.shape[0], self.T, H).index_copy(1, self.pos, v)
         return out
 
+    def coefficients(self, a):
+        """[N] or [B,N] -> [B,T,C] (legacy units: [B,T,H or 1])."""
+        return self._coefficients(a, False)
+
     def compact(self, a):
-        if a.dim() == 1:
-            a = a[None]
-        return {n: a[:, sl].reshape(a.shape[0], len(self.positions), -1) for n, sl in self.offsets.items()}
+        """Dense coefficients at the selected positions, without text-wide masks."""
+        return self._coefficients(a, True)
+
+
+    def _selected_coefficients(self, a):
+        """Internal sparse compact coefficients, using each matrix's column union."""
+        out = {}
+        for n, sl in self.offsets.items():
+            K = self.columns[n].numel()
+            z = a.new_zeros(a.shape[0], len(self.positions)*K)
+            out[n] = z.index_copy(1, self.selected_indices[n], a[:, sl]).view(a.shape[0], len(self.positions), K)
+        return out
 
 
 def _unit_chunk(nat, T, prompts=3):
@@ -714,6 +791,14 @@ def _prepare_unit_prompts(study):
         study.embeddings = study.nat.target.wte[study.input_ids]
     study.batch_lp = torch.cat(study.lp)[:, None]
     study.windows, study.indices = {}, {}
+    study.sparse = {}
+    if study.space.granularity == "subcomponent":
+        with torch.no_grad():
+            for n, cs in study.space.columns.items():
+                if cs.numel() < study.nat.C[n]:
+                    st = study.nat.target.site(n)
+                    study.sparse[n] = (st.V.index_select(1, cs), st.U.index_select(0, cs),
+                                       study.rec[n].index_select(1, study.space.pos).index_select(2, cs))
     study.run_ids = min(study.prompts, key=lambda x: next((p for p, (a, b) in enumerate(zip(study.ids, x)) if a != b), study.T))
     study.prompt_index = {tuple(x): j for j, x in enumerate(study.prompts)}
     study.direct = True
@@ -729,7 +814,7 @@ def _prepare_unit_prompts(study):
                             for n in study.nat.names}
 
 
-def _run_units(study, coefficients, embeddings, *, compact=False):
+def _run_units(study, coefficients, embeddings, *, compact=False, activation_gradient=False):
     """Direct exact unit-intervention evaluator, with live VPD remainders.
 
     Frozen VPD products use original writes; only selected positions compute
@@ -767,8 +852,20 @@ def _run_units(study, coefficients, embeddings, *, compact=False):
 
     def projection(n, inp):
         st = tg.site(n)
+        if n in study.sparse and study.space.columns[n].numel() == 0:
+            return study.writes[n][:, s:].expand(B, -1, -1)
         selected = selected_rows(inp, offsets)
         a = coefficients[n] if compact else selected_rows(coefficients[n], study.space.positions)
+        if n in study.sparse:
+            V, U, base = study.sparse[n]
+            live = selected @ V
+            if not compact:
+                a = a.index_select(2, study.space.columns[n])
+            delta = (a * live + (1-a.detach()) * base - base if activation_gradient else
+                     torch.where(a, live-base, 0.) if a.dtype == torch.bool else a * (live-base))
+            correction = delta @ U
+            original = selected_rows(study.writes[n], study.space.positions)
+            return study.writes[n][:, s:].expand(B, -1, -1).index_copy(1, indices(offsets), original + correction)
         if study.space.granularity == "head" and ".attn." in n:
             if n.endswith("o_proj"):
                 parts = torch.stack([selected[..., h*hd:(h+1)*hd] @ st.V[h*hd:(h+1)*hd] for h in range(H)], -2)
@@ -783,7 +880,8 @@ def _run_units(study, coefficients, embeddings, *, compact=False):
         else:
             live = selected @ st.V
             base = selected_rows(study.rec[n], study.space.positions)
-            activation = torch.where(a, live, base) if a.dtype == torch.bool else a * live + (1-a) * base
+            activation = (a * live + (1-a.detach()) * base if activation_gradient else
+                          torch.where(a, live, base) if a.dtype == torch.bool else a * live + (1-a) * base)
             live_write = activation @ st.U
         return study.writes[n][:, s:].expand(B, -1, -1).index_copy(1, indices(offsets), live_write)
 
@@ -840,14 +938,15 @@ def _measure_units(study, sets):
         # compilation cost dominates the extra arithmetic on duplicate rows.
         capacity = min(study.chunk_size, study.space.size)
         short = study.T - min(study.first_change, min(study.targets)) <= 64
-        B = max(valid, capacity) if short else valid
+        B = max(valid, capacity) if short and study.space.granularity != "subcomponent" else valid
         try:
-            a = torch.stack(sets[start:start+valid])
+            a = sets[start:start+valid] if isinstance(sets, torch.Tensor) else torch.stack(sets[start:start+valid])
             if B > valid:
                 a = torch.cat([a, a[-1:].expand(B-valid, -1)])
             if study.space.granularity == "head":
                 a = a.float()
-            base_coeff = study.space.compact(a) if study.direct else study.space.coefficients(a)
+            base_coeff = (study.space._selected_coefficients(a) if study.direct and study.space.granularity == "subcomponent" else
+                          study.space.compact(a) if study.direct else study.space.coefficients(a))
             coeff = {n: v.repeat(len(study.prompts), 1, 1) for n, v in base_coeff.items()}
             if study.direct:
                 emb = study.embeddings[:, None].expand(-1, B, -1, -1).reshape(-1, study.T, study.embeddings.shape[-1])
@@ -909,6 +1008,39 @@ class MatrixCarry(Carry):
     @torch.no_grad()
     def measure(self, sets):
         return _measure_units(self, sets)
+
+
+# The same exact evaluator, now with per-subcomponent coefficients.
+SubcomponentCarry = MatrixCarry
+
+
+def candidates(nat, ids, targets, position, positions, k=None):
+    """Order every matrix/position's subcomponents by |activation * KL gradient|.
+
+    One batched backward averages the default changed prompts. ``k`` returns
+    an ordering prefix for callers; ranking itself never decides membership.
+    Scores are gradients of live activations, not the live-minus-original
+    gradient of an interpolation coefficient. Ties retain component index order.
+    """
+    if k is not None and (not isinstance(k, int) or k < 0):
+        raise ValueError("k must be a nonnegative integer or None")
+    positions = sorted(set(positions))
+    full = {(n, p): range(nat.C[n]) for n in nat.names for p in positions}
+    space = UnitSpace(nat, len(ids), positions, candidates=full)
+    study = SubcomponentCarry(nat, ids, targets, alternatives(nat, ids, position), space)
+    with torch.enable_grad():
+        a = torch.ones(space.size, device=nat.dev, requires_grad=True)
+        coeff = {n: v.repeat(len(study.prompts), 1, 1) for n, v in space.compact(a).items()}
+        lq = _run_units(study, coeff, study.embeddings, compact=True, activation_gradient=True)
+        loss = kl(torch.cat(study.lp), lq).mean()
+        grad, = torch.autograd.grad(loss, a)
+    out = {}
+    for n, sl in space.offsets.items():
+        scores = grad[sl].abs().reshape(len(positions), nat.C[n])
+        order = scores.argsort(dim=-1, descending=True, stable=True).cpu().tolist()
+        for p, cs in zip(positions, order):
+            out[n, p] = cs if k is None else cs[:k]
+    return out
 
 
 class _HeadMix(TorchFunctionMode):

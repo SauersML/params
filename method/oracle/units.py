@@ -4,9 +4,9 @@ An answer is plain text (nothing in it is executed): an English explanation, the
 text, the units through which a change of that position's token reaches the prediction:
 
   EXPLANATION: the model copies the digits after the earlier "327" ...
-  POSITION 322: L0 322:fc,down | L2 322:v[h3,h4] -> 332:o[h3,h4]
+  POSITION 322: L0 322:fc#12,fc#901,down#77 | L2 322:v#1514 -> 332:o#77
 
-A unit is a weight matrix (q, k, v, o, fc, down) of a layer at a position, for attention optionally some of its heads
+A VPD unit is a rank-one subcomponent (kind#index); a bare kind denotes a weight matrix (q, k, v, o, fc, down) of a layer at a position, for attention optionally some of its heads
 ([h<i>,...]: the head's slice of the activation, carry.UnitSpace). A line is the path layer by layer: in each layer the
 positions holding its units, joined by "->" from the positions an attention layer reads to the one it writes at. An answer is measured by the
 carry test (carry.py): for each of the text's K positions where a changed token moves the prediction most
@@ -22,10 +22,7 @@ the model moves). Its score: the share of the movement it leaves uncarried, the 
   units.py dataset EXPLAIN.jsonl OUT.jsonl [--fraction 90]   SFT rows (question, measured answer)
   units.py events SPLIT OUT.jsonl [--n 50] [--k 8]            the English reader's questions, answered by the model
 
-This track is a scaffold: units are whole matrices or heads at positions, and a line is a set, not a graph. It exists to
-get a model to state measured mechanism-shaped answers with a verifier it cannot fool. Climb-back criterion: once the
-trained explainer leaves less movement uncarried than the copy baseline at no more units on held-out texts, the unit
-space moves to VPD's subcomponents at the same positions (same carry test), and lines state attention edges.
+Subcomponent answers use VPD nodes. Bare matrices and head slices remain available as baselines.
 """
 from __future__ import annotations
 
@@ -42,8 +39,8 @@ KINDS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj", "fc": "c_fc
 CODES = {v: k for k, v in KINDS.items()}
 LINE = re.compile(r"^\s*POSITION\s+(\d+)\s*:(.*)$", re.M)
 LAYER = re.compile(r"L(\d+)\s+(.*)")
-GROUP = re.compile(r"(\d+)\s*:\s*((?:(?:q|k|v|o|fc|down)(?:\[[h\d,\s]+\])?\s*,?\s*)+)")
-KIND = re.compile(r"(q|k|v|o|fc|down)(?:\[([h\d,\s]+)\])?")
+GROUP = re.compile(r"(\d+)\s*:\s*((?:(?:q|k|v|o|fc|down)(?:#\d+|\[[h\d,\s]+\])?\s*,?\s*)+)")
+KIND = re.compile(r"(q|k|v|o|fc|down)(?:#(\d+)|\[([h\d,\s]+)\])?")
 
 
 def parse(text: str) -> tuple[str, dict]:
@@ -52,6 +49,7 @@ def parse(text: str) -> tuple[str, dict]:
     positions an attention layer reads from to the one it writes at. Lines that name no unit are kept empty; text that
     is not a unit is ignored."""
     import native
+    from carry import Subcomponent
 
     m = re.search(r"EXPLANATION:\s*(.*?)(?=^\s*POSITION\s|\Z)", text, re.S | re.M)
     explanation = m[1].strip() if m else ""
@@ -70,8 +68,11 @@ def parse(text: str) -> tuple[str, dict]:
                 pos = int(g[1])
                 for k in KIND.finditer(g[2]):
                     name = native.site_name(layer, KINDS[k[1]])
-                    heads = [int(h) for h in re.findall(r"\d+", k[2])] if k[2] else None
-                    units += [(name, h, pos) for h in heads] if heads and ".attn." in name else [(name, pos)]
+                    if k[2] is not None:
+                        units.append(Subcomponent(name, pos, int(k[2])))
+                    else:
+                        heads = [int(h) for h in re.findall(r"\d+", k[3])] if k[3] else None
+                        units += [(name, h, pos) for h in heads] if heads and ".attn." in name else [(name, pos)]
         circuits.setdefault(int(line[1]), []).extend(units)
     return explanation, circuits
 
@@ -80,41 +81,56 @@ def render(explanation: str, circuits: dict) -> str:
     """The answer text of circuits {position: [unit, ...]}: per line, one segment per layer, its units grouped by position
     (earliest first, joined by "->": an attention layer reads the earlier positions and writes at the later), the kinds
     of one position in the order q, k, v, o, fc, down, a matrix's heads written together."""
+    from carry import Subcomponent
+
     order = list(KINDS)
     out = [f"EXPLANATION: {explanation}".rstrip()]
-    for p in circuits:  # in the order given (importance: a cut-off answer loses the least important lines)
-        by = {}  # layer -> position -> kind -> heads (None: the whole matrix)
-        for u in circuits[p]:
-            name, pos = u[0], u[-1]
-            kinds = by.setdefault(int(name.split(".")[1]), {}).setdefault(pos, {})
+    for p, units in circuits.items():
+        by = {}
+        for u in units:
+            name, pos = u[0], _position(u)
+            ks = by.setdefault(int(name.split(".")[1]), {}).setdefault(pos, {})
             kind = CODES[name.split(".")[-1]]
-            if len(u) == 3:
-                if kinds.get(kind, []) is not None:
-                    kinds.setdefault(kind, []).append(u[1])
+            entry = ks.setdefault(kind, {"whole": False, "heads": set(), "components": set()})
+            if isinstance(u, Subcomponent):
+                entry["components"].add(u[2])
+            elif len(u) == 3:
+                entry["heads"].add(u[1])
             else:
-                kinds[kind] = None
+                entry["whole"] = True
         segments = []
         for layer in sorted(by):
             groups = []
             for pos in sorted(by[layer]):
-                ks = by[layer][pos]
-                words = [k if ks[k] is None else f"{k}[{','.join(f'h{h}' for h in sorted(set(ks[k])))}]" for k in order if k in ks]
+                words = []
+                for kind in order:
+                    entry = by[layer][pos].get(kind)
+                    if entry is None:
+                        continue
+                    if entry["whole"]:
+                        words.append(kind)
+                    else:
+                        if entry["heads"]:
+                            words.append(f"{kind}[{','.join(f'h{h}' for h in sorted(entry['heads']))}]")
+                        words.extend(f"{kind}#{c}" for c in sorted(entry["components"]))
                 groups.append(f"{pos}:" + ",".join(words))
             segments.append(f"L{layer} " + " -> ".join(groups))
         out.append(f"POSITION {p}: " + (" | ".join(segments) or "none"))
     return "\n".join(out)
 
 
+def _position(u):
+    from carry import Subcomponent
+    return u[1] if isinstance(u, Subcomponent) else u[-1]
+
+
 def _active(space, units):
-    """The space's coefficient vector with these units on (a whole attention matrix in a head space: all its heads)."""
+    """A coefficient vector, expanding bare matrices in either fine space."""
     import torch
 
-    on = torch.zeros(space.size, dtype=torch.bool, device=space.nat.dev)
     want = set(units)
-    for j, u in enumerate(space.units):
-        if u in want or (len(u) == 3 and (u[0], u[2]) in want):
-            on[j] = True
-    return on
+    on = [u in want or (len(u) == 3 and (u[0], _position(u)) in want) for u in space.units]
+    return torch.tensor(on, dtype=torch.bool, device=space.nat.dev)
 
 
 def sensitive(nat, ids: list[int], targets: list[int], k: int) -> list[int]:
@@ -131,23 +147,23 @@ def sensitive(nat, ids: list[int], targets: list[int], k: int) -> list[int]:
     return [p for p in (moved.argsort(descending=True, stable=True) + 1).tolist() if p not in targets][:k]
 
 
-def score(nat, task: dict, text: str, k: int = 8, edit=None) -> dict:
+def score(nat, task: dict, text: str, k: int = 8, edit=None, ranks=(0, 1, 2)) -> dict:
     """score_many for one answer."""
-    return score_many(nat, task, [text], k, edit=edit)[0]
+    return score_many(nat, task, [text], k, edit=edit, ranks=ranks)[0]
 
 
-def score_many(nat, task: dict, texts: list[str], k: int = 8, edit=None) -> list[dict]:
+def score_many(nat, task: dict, texts: list[str], k: int = 8, edit=None, ranks=(0, 1, 2)) -> list[dict]:
     """Score answers on the edited model, including selection, references and carry runs."""
     import carry
 
     with carry.model_edit(nat, edit):
-        rows = _score_many(nat, task, texts, k)
+        rows = _score_many(nat, task, texts, k, ranks=ranks)
         for row in rows:
             row["edit"] = getattr(nat, "_graph_edit", None)
         return rows
 
 
-def _score_many(nat, task: dict, texts: list[str], k: int = 8) -> list[dict]:
+def _score_many(nat, task: dict, texts: list[str], k: int = 8, ranks=(0, 1, 2)) -> list[dict]:
     """The carry test of answers to one task, the task prepared once and every answer measured in one batch per position.
     Per answer: {"uncarried": the share of the empty run's discrepancy the answer leaves, positions weighted by it, "units":
     distinct (matrix, position) pairs the answer names that the model has (a head subset counts as its matrix: the same
@@ -164,6 +180,20 @@ def _score_many(nat, task: dict, texts: list[str], k: int = 8) -> list[dict]:
     import native
 
     parsed = [parse(t) for t in texts]
+    sub = [any(isinstance(u, carry.Subcomponent) for us in cs.values() for u in us) for _, cs in parsed]
+    # A legacy answer retains its original size and intervention even in a
+    # batch containing a finer answer. Head slices are a different operation.
+    if any(sub) and not all(sub):
+        out = [None] * len(texts)
+        for flag in (False, True):
+            js = [j for j, value in enumerate(sub) if value == flag]
+            rows = _score_many(nat, task, [texts[j] for j in js], k, ranks=ranks)
+            for j, row in zip(js, rows):
+                out[j] = row
+        return out
+    if any(sub) and any(len(u) == 3 and not isinstance(u, carry.Subcomponent)
+                        for _, cs in parsed for us in cs.values() for u in us):
+        raise ValueError("head slices and subcomponents cannot share an answer")
     prompt = task["prompts"][0]
     ids, targets = prompt["token_ids"], prompt["target_positions"]
     t_max = max(targets)
@@ -172,27 +202,33 @@ def _score_many(nat, task: dict, texts: list[str], k: int = 8) -> list[dict]:
     with torch.no_grad():
         base = nat.reference([ids], targets)[0]
     for p in positions:
-        prompts = carry.alternatives(nat, ids, p)
+        prompts = carry.alternatives(nat, ids, p, ranks=ranks)
         with torch.no_grad():
             changed = nat.reference(prompts, targets)
             change = float(carry.kl(changed, base.expand_as(changed)).mean())
         stated = [e[1].get(p, []) for e in parsed]
-        inside = [[u for u in st if p <= u[-1] <= t_max] for st in stated]
-        where = sorted({p, *targets, *(u[-1] for ins in inside for u in ins)})
-        gran = "head" if any(len(u) == 3 for ins in inside for u in ins) else "matrix"
-        space = carry.UnitSpace(nat, len(ids), where, gran)
+        inside = [[u for u in st if p <= _position(u) <= t_max] for st in stated]
+        where = sorted({p, *targets, *(_position(u) for ins in inside for u in ins)})
+        gran = "subcomponent" if any(sub) else "head" if any(len(u) == 3 for ins in inside for u in ins) else "matrix"
+        full = {(n, q): range(nat.C[n]) for n in nat.names for q in where} if gran == "subcomponent" else None
+        space = carry.UnitSpace(nat, len(ids), where, gran, candidates=full)
         study = (carry.HeadCarry if gran == "head" else carry.MatrixCarry)(nat, ids, targets, prompts, space)
-        known = {(u[0], u[-1]) for u in space.units}
+        known = {(u[0], _position(u)) for u in space.units}
         ons, rests, sizes = [], [], []
         for ins in inside:
-            own = {p, *targets, *(u[-1] for u in ins)}
-            at = torch.tensor([u[-1] in own for u in space.units], device=nat.dev)
+            own = {p, *targets, *(_position(u) for u in ins)}
+            at = torch.tensor([_position(u) in own for u in space.units], device=nat.dev)
             on = _active(space, ins)
             ons.append(on)
             rests.append(at & ~on)
-            pairs = {(u[0], u[-1]) for u in ins}
-            heads = {u for u in ins if len(u) == 3 and u[1] < nat.target.n_head}
-            sizes.append((len(pairs & known), len(heads), len(pairs - known) + sum(1 for u in ins if len(u) == 3 and u[1] >= nat.target.n_head)))
+            pairs = {(u[0], _position(u)) for u in ins}
+            if gran == "subcomponent":
+                unknown = sum(1 for u in set(ins) if u[0] not in nat.C or
+                              (isinstance(u, carry.Subcomponent) and not 0 <= u[2] < nat.C[u[0]]))
+                sizes.append((int(on.sum()), 0, unknown))
+            else:
+                heads = {u for u in ins if len(u) == 3 and u[1] < nat.target.n_head}
+                sizes.append((len(pairs & known), len(heads), len(pairs - known) + sum(1 for u in ins if len(u) == 3 and u[1] >= nat.target.n_head)))
         with torch.no_grad():
             kls = study.measure([_active(space, [])] + ons + rests).tolist()
         empty, n = kls[0], len(texts)

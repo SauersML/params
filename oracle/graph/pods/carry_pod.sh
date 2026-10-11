@@ -29,7 +29,7 @@ for entry in $JOBS; do
     RUNS="$RUNS ([ -f $seed ] && cp $seed $O/parts/${name}_$k.jsonl; python carry.py explain --split $split --n $n --offset $k --stride $P $([ "$flag" = relays ] && echo --relays) --out $O/parts/${name}_$k.jsonl > $O/${name}_$k.log 2>&1) &"
     PARTS="$PARTS $O/parts/${name}_$k.jsonl"
   done
-  STAGES="$STAGES $RUNS wait; cat $PARTS | sort -u > $O/$name.jsonl;"  # the seed rows are identical copies
+  STAGES="$STAGES $RUNS wait; cat $PARTS | awk '!seen[\$0]++' > $O/$name.jsonl;"  # the seed rows are identical copies; sort -u on MB-long lines ran 11+ min CPU-only and the idle watchdog stopped the pod
 done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/parts $S ~/mpd-data/graph_oracle; tar -xf $T -C ~/mpd-data/graph_oracle; tar -xf $S.tar -C $S; ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; cd $G; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 & $STAGES echo done"
 RP_OWNER=lead RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.80} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=64 RP_ALLOW_OVER=1 \

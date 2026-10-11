@@ -255,6 +255,58 @@ class Qwen:
         return self.model.lm_head(m.norm(h[:, rows])).float().log_softmax(-1)
 
 
+    def sparse(self, seq, live, kv_orig, kv_changed, S, selS, selR, n_out):
+        """Recompute only chosen rows; every other position keeps its keys/values from the original run.
+
+        seq: the original token ids. live: B sorted position lists, each ending with the same n_out output rows (front-
+        padded here to one length). S: [B, T] bool, context positions whose keys/values come from the changed run.
+        selS / selR: [B, layers, rows, heads] bool, per live row (after padding): read S's changed keys/values (else the
+        original ones), and read the other live rows' recomputed keys/values (else their original ones). Returns
+        log-probs at the n_out output rows, [B, n_out, V]. With every row of the turn live and both flags set, this is
+        the changed run; with no flag set, the original run."""
+        with self.torch.inference_mode():
+            return self._sparse(seq, live, kv_orig, kv_changed, S, selS, selR, n_out)
+
+    def _sparse(self, seq, live, kv_orig, kv_changed, S, selS, selR, n_out):
+        torch = self.torch
+        m = self.model.model
+        B, nL = len(live), max(len(x) for x in live)
+        pos = torch.tensor([[x[0]] * (nL - len(x)) + list(x) for x in live], device=self.dev)       # [B, nL]
+        T = int(pos.max()) + 1
+        toks = torch.tensor(seq, device=self.dev)[pos]
+        h = m.embed_tokens(toks)
+        cos, sin = m.rotary_emb(h, pos)
+        allowed = (torch.arange(T, device=self.dev)[None, None, :] <= pos[:, :, None])[:, None, None]  # [B,1,1,nL,T]
+        g = self.H // self.kvH
+        Sm = S[:, :T][:, None, :, None]
+        for i, layer in enumerate(m.layers):
+            at = layer.self_attn
+            x = layer.input_layernorm(h)
+            q = at.q_norm(at.q_proj(x).view(B, nL, self.H, self.hd)).transpose(1, 2)
+            k = at.k_norm(at.k_proj(x).view(B, nL, self.kvH, self.hd)).transpose(1, 2)
+            v = at.v_proj(x).view(B, nL, self.kvH, self.hd).transpose(1, 2)
+            q, k = self.rope(q, k, cos, sin)
+            ko, vo = kv_orig[i][0][..., :T, :], kv_orig[i][1][..., :T, :]
+            kc, vc = kv_changed[i][0][..., :T, :], kv_changed[i][1][..., :T, :]
+            idx = pos[:, None, :, None].expand(B, self.kvH, nL, self.hd)
+            ks, vs = torch.where(Sm, kc, ko), torch.where(Sm, vc, vo)                    # S changed, rest original
+            ko_, vo_ = ko.expand(B, -1, -1, -1), vo.expand(B, -1, -1, -1)
+            qg = q.view(B, self.kvH, g, nL, self.hd)
+            outs = {}
+            for key, (K, V) in {(1, 1): (ks.scatter(2, idx, k), vs.scatter(2, idx, v)), (1, 0): (ks, vs),
+                                (0, 1): (ko_.scatter(2, idx, k), vo_.scatter(2, idx, v)), (0, 0): (ko_, vo_)}.items():
+                sc = torch.einsum("bgrqd,bgtd->bgrqt", qg, K).float() * at.scaling
+                sc = sc.masked_fill(~allowed, float("-inf")).softmax(-1).to(V.dtype)
+                outs[key] = torch.einsum("bgrqt,bgtd->bgrqd", sc, V).reshape(B, self.H, nL, self.hd)
+            sS = selS[:, i].transpose(1, 2)[..., None]                                       # [B, H, nL, 1]
+            sR = selR[:, i].transpose(1, 2)[..., None]
+            o = torch.where(sS & sR, outs[(1, 1)], torch.where(sS, outs[(1, 0)], torch.where(sR, outs[(0, 1)], outs[(0, 0)])))
+            h = h + at.o_proj(o.transpose(1, 2).reshape(B, nL, self.H * self.hd))
+            mlp = layer.mlp(layer.post_attention_layernorm(h))
+            h = h + (mlp[0] if isinstance(mlp, tuple) else mlp)
+        return self.model.lm_head(m.norm(h[:, nL - n_out:])).float().log_softmax(-1)
+
+
 def kl_bits(lp, lq):
     """carry.kl: KL(p || q) in bits summed over the vocabulary and the output tokens, no clamp. lp [Q, V], lq [B, Q, V]."""
     return (lp.exp()[None] * (lp[None] - lq)).sum(-1).sum(-1) / LN2
@@ -464,6 +516,152 @@ def heads(a):
             torch.cuda.empty_cache()
 
 
+def paths(a):
+    """The full path of each searched case: test-value positions S -> relay rows of the turn -> output.
+
+    Only the relay rows R and the output rows are recomputed (Qwen.sparse); every other row of the turn and every
+    context position outside S keeps its original keys/values. Relay: R's rows read S's changed keys/values through
+    every head, the output rows read S only as original but read R's recomputed keys/values, so the output moves only
+    through R. Rows are searched as 16-row chunks, then single rows, greedily to 90% of the change that reaches the
+    output through all the turn's rows. Then the two hops' heads: (1) heads at R reading S, the output reading R
+    through every head; (2) heads at the output reading R, R reading S through every head. Layers first (every head of
+    a layer), then the heads of the best layers, greedily to 90% of that hop's whole."""
+    import torch
+    qm = Qwen(a.model, a.device, a.dtype)
+    prev = {json.loads(l)["case"]: json.loads(l) for l in open(a.results)}
+    out = open(a.out, "a")
+    done = {json.loads(l)["case"] for l in open(a.out)} if os.path.getsize(a.out) else set()
+    start = time.time()
+    L, H = qm.L, qm.H
+    for line_ in open(a.cases):
+        c = json.loads(line_)
+        r = prev.get(c["case"])
+        if r is None or "set90" not in r or c["case"] in done:
+            continue
+        if time.time() - start > a.deadline:
+            print(f"deadline: stopping before case {c['case']}", flush=True)
+            break
+        t0 = time.time()
+        n = len(c["ctx"])
+        seq = c["ctx"] + c["comp"]
+        kv_o, lp_o = qm.record(seq, n - 1)
+        kv_c, lp_c = qm.record(c["edited"] + c["comp"], n - 1)
+        lo, hi = r["output_span"]
+        lp, lp0 = lp_c[lo:hi], lp_o[lo:hi]
+        base = float(kl_bits(lp, lp0[None])[0])
+        outp = list(range(n + lo - 1, n + hi - 1))
+        E = list(range(n, n + lo - 1))
+        S = r["value_positions"] if r["value_positions_carry"] >= 0.9 else (
+            r["set90"] if r["set90_reached"] else [p for x, y in r["chunks90"] for p in range(x, y)])
+        Sm = torch.zeros(len(seq), dtype=torch.bool, device=qm.dev)
+        Sm[torch.tensor(S, device=qm.dev)] = True
+        no = len(outp)
+
+        def ev(configs):
+            """configs: (relay rows, selS(layer, row is output, head) -> bool, selR(...) -> bool) as dense masks built
+            from per-config functions; returns carried fractions."""
+            fr = []
+            nmax = max(len(cf[0]) for cf in configs) + no
+            bsz = max(1, min(a.batch, a.live_rows // max(nmax, 1)))
+            for s0 in range(0, len(configs), bsz):
+                chunk = configs[s0:s0 + bsz]
+                live = [sorted(R) + outp for R, _, _ in chunk]
+                nL = max(len(x) for x in live)
+                selS = torch.zeros(len(chunk), L, nL, H, dtype=torch.bool, device=qm.dev)
+                selR = torch.zeros_like(selS)
+                for b, (R, fS, fR) in enumerate(chunk):
+                    pad = nL - len(live[b])
+                    fS(selS[b], pad, len(R))
+                    fR(selR[b], pad, len(R))
+                lq = qm.sparse(seq, live, kv_o, kv_c, Sm[None].expand(len(chunk), -1), selS, selR, no)
+                fr += (1 - kl_bits(lp, lq) / base).cpu().tolist()
+            return fr
+
+        def rows_all(t, pad, nr):            # every row of R reads (every layer, every head)
+            t[:, pad:pad + nr] = True
+
+        def out_all(t, pad, nr):             # the output rows read
+            t[:, pad + nr:] = True
+
+        def both(t, pad, nr):
+            t[:, pad:] = True
+
+        def none(t, pad, nr):
+            pass
+        relay_cfg = lambda R: (R, rows_all, both)  # noqa: E731  R reads S; output reads R live, S original
+        chk = ev([(E, both, both), ([], none, none), (E, rows_all, both), ([], out_all, both)])
+        res = {k: r[k] for k in ("case", "model", "run_id", "task", "kind", "label", "line", "output")}
+        res.update(S=S, kl_total_bits=base, check_every_row_carry=chk[0], check_nothing_carry=chk[1],
+                   through_turn_rows=chk[2], direct_only=chk[3], n_turn_rows=len(E))
+        if chk[2] >= a.min_relay:
+            target = 0.9 * chk[2]
+            chunks = [E[i:i + 16] for i in range(0, len(E), 16)]
+            single = ev([relay_cfg(ch) for ch in chunks])
+            order = sorted(range(len(chunks)), key=lambda j: -single[j])
+            chosen, frac, pool = [], 0.0, order[:a.pool]
+            while frac < target and pool:
+                trial = ev([relay_cfg([p for j in chosen + [x] for p in chunks[j]]) for x in pool])
+                j = max(range(len(pool)), key=lambda i: trial[i])
+                chosen.append(pool.pop(j))
+                frac = trial[j]
+            cand = [p for j in chosen for p in chunks[j]]
+            rs = ev([relay_cfg([p]) for p in cand])
+            rorder = sorted(range(len(cand)), key=lambda j: -rs[j])
+            R, rfrac, rpool = [], 0.0, [cand[j] for j in rorder[:a.pool]]
+            while rfrac < target and rpool:
+                trial = ev([relay_cfg(R + [x]) for x in rpool])
+                j = max(range(len(rpool)), key=lambda i: trial[i])
+                R.append(rpool.pop(j))
+                rfrac = trial[j]
+            if rfrac < target:                 # rows fell short: keep the chunks
+                R, rfrac = cand, frac
+            R = sorted(R)
+            res.update(relay_chunks=[[chunks[j][0], chunks[j][-1] + 1] for j in chosen], relay_chunks_carry=frac,
+                       relay_rows=R, relay_carry=rfrac, relay_tokens=[qm.tok.decode([seq[p]]) for p in R],
+                       relay_contexts=[qm.tok.decode(seq[max(n, p - 12):p + 2]) for p in R],
+                       relay_offsets=[p - (n + lo - 1) for p in R])
+            whole = rfrac
+            # hop 1: heads at R reading S (the output reads R through every head)
+            def hop1(units):
+                def fS(t, pad, nr, units=units):
+                    for (i, hh) in units:
+                        t[i, pad:pad + nr, hh] = True
+                return (R, fS, both)
+
+            def hop2(units):
+                def fR(t, pad, nr, units=units):
+                    t[:, pad:pad + nr] = True
+                    for (i, hh) in units:
+                        t[i, pad + nr:, hh] = True
+                return (R, rows_all, fR)
+            for name, mk in (("hop1", hop1), ("hop2", hop2)):
+                lf = ev([mk([(i, hh) for hh in range(H)]) for i in range(L)])
+                lorder = sorted(range(L), key=lambda i: -lf[i])[:a.top_layers]
+                units = [(i, hh) for i in lorder for hh in range(H)]
+                hs = ev([mk([u]) for u in units])
+                horder = sorted(range(len(units)), key=lambda j: -hs[j])
+                hc, hf, hp = [], 0.0, [units[j] for j in horder[:a.head_pool]]
+                while hf < 0.9 * whole and hp:
+                    trial = ev([mk(hc + [x]) for x in hp])
+                    j = max(range(len(hp)), key=lambda i: trial[i])
+                    hc.append(hp.pop(j))
+                    hf = trial[j]
+                res[name] = {"layers": lf, "top_single": [[units[j][0], units[j][1], hs[j]] for j in horder[:12]],
+                             "heads90": [list(u) for u in hc], "carry": hf, "of": whole}
+        res["seconds"] = time.time() - t0
+        out.write(json.dumps(res) + "\n")
+        out.flush()
+        msg = f"case {c['case']} {r['output']!r}: checks {chk[0]:.2f} {chk[1]:.2f}; through turn rows {chk[2]:.2f}, direct {chk[3]:.2f}"
+        if "relay_rows" in res:
+            msg += (f"; relay {len(res['relay_rows'])} rows {res['relay_carry']:.2f} {res['relay_tokens'][:6]}; "
+                    f"hop1 {len(res['hop1']['heads90'])} heads {res['hop1']['carry']:.2f} {res['hop1']['heads90'][:4]}; "
+                    f"hop2 {len(res['hop2']['heads90'])} heads {res['hop2']['carry']:.2f} {res['hop2']['heads90'][:4]}")
+        print(msg + f"; {res['seconds']:.0f} s", flush=True)
+        del kv_o, kv_c, lp_o, lp_c
+        if qm.dev == "cuda":
+            torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------- report (Mac)
 
 def report(a):
@@ -513,13 +711,27 @@ def main():
     hd.add_argument("--device", default="cuda")
     hd.add_argument("--dtype", default="bfloat16")
     hd.add_argument("--deadline", type=float, default=1e9)
+    pa = sub.add_parser("paths")
+    pa.add_argument("--cases", required=True)
+    pa.add_argument("--results", required=True, help="a run's results: each case's position sets")
+    pa.add_argument("--model", default="Qwen/Qwen3-8B")
+    pa.add_argument("--out", required=True)
+    pa.add_argument("--batch", type=int, default=32)
+    pa.add_argument("--live-rows", type=int, default=1024, help="live rows per sparse forward (sets x rows)")
+    pa.add_argument("--min-relay", type=float, default=0.5, help="search relay rows when the turn carries this much")
+    pa.add_argument("--pool", type=int, default=24)
+    pa.add_argument("--top-layers", type=int, default=6)
+    pa.add_argument("--head-pool", type=int, default=24)
+    pa.add_argument("--device", default="cuda")
+    pa.add_argument("--dtype", default="bfloat16")
+    pa.add_argument("--deadline", type=float, default=1e9)
     p = sub.add_parser("report")
     p.add_argument("path")
     p.add_argument("--min-bits", type=float, default=0.05)
     a = ap.parse_args()
-    if a.cmd in ("run", "heads") and not os.path.exists(a.out):
+    if a.cmd in ("run", "heads", "paths") and not os.path.exists(a.out):
         open(a.out, "w").close()
-    {"build": build, "run": run, "heads": heads, "report": report}[a.cmd](a)
+    {"build": build, "run": run, "heads": heads, "paths": paths, "report": report}[a.cmd](a)
 
 
 if __name__ == "__main__":

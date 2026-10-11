@@ -264,10 +264,16 @@ def events(nat, task: dict, k: int = 8) -> list[dict]:
         bits = math.log2(max(p, 1e-30) / p0)
         return {"position": q, **kind, "down": bits < 0, "weight": min(abs(bits), 4.0), "bits": bits}
 
+    with torch.no_grad():
+        ref = nat.reference([ids], targets)[0]
     out = []
     for q in near + others:
         alts = carry.alternatives(nat, ids, q)
         listed = q in near
+        if listed:  # how far the whole prediction moves, KL in bits averaged over the 3 changed tokens (the oracle's evidence)
+            with torch.no_grad():
+                moved = nat.reference(alts, targets)
+            out.append({"position": q, "kl": float(carry.kl(moved, ref.expand_as(moved)).mean()), "listed": True})
         out.append(event(q, float(p_top(alts[0])[top]), new=alts[0][q], alt=0, listed=listed))
         if listed and len(alts) > 1:  # a second token at a listed position: only the reader is asked about it
             out.append(event(q, float(p_top(alts[1])[top]), new=alts[1][q], alt=1, listed=True))
@@ -324,7 +330,7 @@ def numbered(strings: list[str]) -> str:
 def reader_events(events: list[dict]) -> list[dict]:
     """The events the English reader is asked about: none the oracle read as evidence (other positions, and the second
     token at listed positions), so English is credited only for what it lets a reader predict beyond its own input."""
-    return [e for e in events if not e.get("listed") or e.get("alt") == 1]
+    return [e for e in events if (not e.get("listed") or e.get("alt") == 1) and "kl" not in e]
 
 
 def evidence(events: list[dict], positions: list[int], strings: list[str]) -> list[str]:
@@ -340,9 +346,12 @@ def evidence(events: list[dict], positions: list[int], strings: list[str]) -> li
         es = by.get(q, [])
         change = next((e for e in es if "new" in e and e.get("alt", 0) == 0), None)
         cuts = sorted((e for e in es if "layer" in e), key=lambda e: e["layer"])
-        if change is None and not cuts:
+        kl = next((e["kl"] for e in es if "kl" in e), None)
+        if change is None and not cuts and kl is None:
             continue
         line = f"{q} ({strings[q]!r}):"
+        if kl is not None:
+            line += f" prediction moves {kl:.2f} bits;"
         if change is not None:
             line += f" changed token {change['bits']:+.2f}"
         if cuts:

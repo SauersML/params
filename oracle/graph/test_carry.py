@@ -746,6 +746,160 @@ def test_cli_reuse_requires_relays(monkeypatch, tmp_path):
     assert exc.value.code == 2
 
 
+
+
+@torch.no_grad()
+def independent_edit_reference(nat, ids, targets, spec):
+    """Independent target-module hooks, without Native/VPD/cache interception."""
+    heads, mlps, edges = {}, set(), set()
+    for part in spec.split(";"):
+        kind, layer, *arg = part.split(":")
+        layer = int(layer[1:])
+        if kind == "heads":
+            heads[layer] = list(map(int, arg[0].split(",")))
+        elif kind == "mlp":
+            mlps.add(layer)
+        else:
+            edges.add(layer)
+    hooks = []
+    for layer, hs in heads.items():
+        def inputs(module, args, hs=hs):
+            x = args[0].clone()
+            for h in hs:
+                x[..., h*nat.target.hd:(h+1)*nat.target.hd] = 0
+            return (x,)
+        hooks.append(nat.target.site(native.site_name(layer, "o_proj")).register_forward_pre_hook(inputs))
+    for layer in mlps:
+        hooks.append(nat.target.site(native.site_name(layer, "down_proj")).register_forward_hook(
+            lambda module, args, out: out * 0))
+    class Edges(torch.overrides.TorchFunctionMode):
+        layer = 0
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func is torch.nn.functional.scaled_dot_product_attention:
+                layer = self.layer
+                self.layer += 1
+                if layer in edges:
+                    q, k, v = args[:3]
+                    logits = (q @ k.transpose(-1, -2)) / math.sqrt(q.shape[-1])
+                    causal = torch.ones(q.shape[-2], k.shape[-2], device=q.device, dtype=torch.bool).tril()
+                    weights = logits.masked_fill(~causal, float('-inf')).softmax(-1)
+                    weights[..., -1, :-1] = 0
+                    return weights @ v
+            return func(*args, **kwargs)
+    try:
+        with Edges():
+            return nat.reference([ids], targets)
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+@pytest.mark.parametrize('spec', ['heads:L2:2,3,4', 'mlp:L1', 'edge:L2:all',
+                                  'heads:L2:2,3,4;mlp:L1;edge:L2:all'])
+def test_model_edits_every_carry_path(case, spec):
+    nat, original, *_ = case
+    ids = original[20:100]  # enough rows for Native's reuse window to be nonempty
+    targets, p = [79], 70
+    with torch.no_grad():
+        unedited = nat.reference([ids], targets)
+        nat._model_record(ids)  # deliberately populate the unedited cache
+    manual = independent_edit_reference(nat, ids, targets, spec)
+    studies = []
+    with carry.model_edit(nat, spec), torch.no_grad():
+        edited = nat.reference([ids], targets)
+        torch.testing.assert_close(edited, manual, atol=2e-4, rtol=0)
+        assert float(carry.kl(edited, unedited)) > 1e-5
+        prompts = carry.alternatives(nat, ids, p)[:1]
+        expected = nat.reference(prompts, targets)
+        rec, states = nat._model_record(ids)
+        patch = {n: (torch.zeros_like(rec[n], dtype=torch.bool), rec[n]) for n in nat.names}
+        actual = nat.run(prompts[0], targets, nat._full_plan(len(ids), 1), *nat._one(),
+                         patch=patch, reuse=(states, ids))
+        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=0)
+        assert abs(float(carry.kl(expected, actual))) < 2e-5
+        for gran, cls in [('matrix', carry.MatrixCarry), ('head', carry.HeadCarry)]:
+            space = carry.UnitSpace(nat, len(ids), range(len(ids)), gran)
+            study = cls(nat, ids, targets, prompts, space, chunk_size=1)
+            full = torch.ones(space.size, device=nat.dev, dtype=torch.bool)
+            for direct in (True, False):
+                study.direct = direct
+                loss = float(study.measure([full])[0])
+                print(spec, gran, 'direct', direct, 'all-carried KL', loss, flush=True)
+                assert abs(loss) < 3e-5
+            studies.append(study)
+        dense = carry.Carry(nat, ids, targets, prompts, chunk_size=1)
+        nodes = carry.Space(nat, len(ids), range(len(ids)))
+        assert abs(float(dense.measure([nodes.expand(torch.ones(nodes.size, device=nat.dev, dtype=torch.bool))])[0])) < 3e-5
+    assert nat._rec == (None, None, None)
+    with torch.no_grad():
+        torch.testing.assert_close(nat.reference([ids], targets), unedited, atol=0, rtol=0)
+    with pytest.raises(RuntimeError, match='different model edit'):
+        studies[0].measure([full])
+
+
+def test_edit_parser_and_cache_guard(case):
+    nat, *_ = case
+    assert carry.parse_edit(' heads:L2:4,2;mlp:L1;heads:L2:3,2 ') == 'heads:L2:2,3,4;mlp:L1'
+    assert carry.parse_edit(None) is None
+    for spec in ['heads:L2', 'mlp:L1:all', 'edge:L2:3', 'heads:L2:-1', 'heads:L2:all', 'mlp:L1;']:
+        with pytest.raises(ValueError):
+            carry.parse_edit(spec)
+    for spec in ['mlp:L100', 'heads:L2:100']:
+        with pytest.raises(ValueError):
+            with carry.model_edit(nat, spec):
+                pass
+    with pytest.raises(RuntimeError, match='interception incomplete'):
+        with carry.model_edit(nat, 'edge:L2:all'):
+            pass  # compiled/no-op paths must fail loudly
+    assert getattr(nat, '_graph_edit', None) is None
+
+
+def test_edit_measurement_entry_points(case, monkeypatch):
+    import units
+    nat, original, *_ = case
+    ids, targets = original[20:27], [6]
+    spec = 'heads:L2:2,3,4'
+    task = {'id': 'small-edit', 'prompts': [{'token_ids': ids, 'target_positions': targets}]}
+    seen = []
+    ref = nat.reference
+    def reference(*args, **kwargs):
+        seen.append(getattr(nat, '_graph_edit', None))
+        return ref(*args, **kwargs)
+    monkeypatch.setattr(nat, 'reference', reference)
+    events = units.events(nat, task, 1, edit=spec)
+    assert events and all(e['edit'] == spec for e in events)
+    assert seen and set(seen) == {spec}
+    seen.clear()
+    rows = carry.explain(nat, ids, targets, 1, edit=spec)
+    assert rows and seen and set(seen) == {spec}
+    seen.clear()
+    answer = units.baseline('all', [r['position'] for r in rows], targets)
+    scores = units.score_many(nat, task, [answer], 1, edit=spec)
+    assert scores[0]['edit'] == spec and seen and set(seen) == {spec}
+    with pytest.raises(ValueError, match='reuse model edit'):
+        carry.explain(nat, ids, targets, 1, edit=spec, relays=True,
+                      reuse={'edit': None})
+
+
+def test_cli_edit_resume_rejects_other_model(monkeypatch, tmp_path):
+    import units
+    out = tmp_path / 'out.jsonl'
+    out.write_text(json.dumps({'task': 'hard9300', 'split': 'hard', 'k': 8,
+                               'units': 'matrix', 'edit': None}) + '\n')
+    monkeypatch.setattr(sys, 'argv', ['carry.py', 'explain', '--split', 'hard', '--n', '1',
+                                    '--edit', 'heads:L2:2,3,4', '--out', str(out)])
+    with pytest.raises(SystemExit) as exc:
+        carry.main()
+    assert exc.value.code == 2
+    monkeypatch.setattr(native, 'Native', lambda: None)
+    monkeypatch.setattr(sys, 'argv', ['units.py', 'events', 'hard', str(out), '--n', '1',
+                                    '--edit', 'heads:L2:2,3,4'])
+    with pytest.raises(SystemExit) as exc:
+        units.main()
+    assert exc.value.code == 2
+
+
 if __name__ == "__main__":
     # The local memory guard recognizes script paths, but reserves only 2 GiB
     # for `python -m pytest` regardless of MPD_MEM_GIB.

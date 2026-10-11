@@ -131,12 +131,23 @@ def sensitive(nat, ids: list[int], targets: list[int], k: int) -> list[int]:
     return [p for p in (moved.argsort(descending=True, stable=True) + 1).tolist() if p not in targets][:k]
 
 
-def score(nat, task: dict, text: str, k: int = 8) -> dict:
+def score(nat, task: dict, text: str, k: int = 8, edit=None) -> dict:
     """score_many for one answer."""
-    return score_many(nat, task, [text], k)[0]
+    return score_many(nat, task, [text], k, edit=edit)[0]
 
 
-def score_many(nat, task: dict, texts: list[str], k: int = 8) -> list[dict]:
+def score_many(nat, task: dict, texts: list[str], k: int = 8, edit=None) -> list[dict]:
+    """Score answers on the edited model, including selection, references and carry runs."""
+    import carry
+
+    with carry.model_edit(nat, edit):
+        rows = _score_many(nat, task, texts, k)
+        for row in rows:
+            row["edit"] = getattr(nat, "_graph_edit", None)
+        return rows
+
+
+def _score_many(nat, task: dict, texts: list[str], k: int = 8) -> list[dict]:
     """The carry test of answers to one task, the task prepared once and every answer measured in one batch per position.
     Per answer: {"uncarried": the share of the empty run's discrepancy the answer leaves, positions weighted by it, "units":
     distinct (matrix, position) pairs the answer names that the model has (a head subset counts as its matrix: the same
@@ -225,7 +236,18 @@ def _cut(t: int, s: int, layer: int):
     return Cut()
 
 
-def events(nat, task: dict, k: int = 8) -> list[dict]:
+def events(nat, task: dict, k: int = 8, edit=None) -> list[dict]:
+    """Measure every event and cut on the edited model; record its canonical spec."""
+    import carry
+
+    with carry.model_edit(nat, edit):
+        rows = _events(nat, task, k)
+        for row in rows:
+            row["edit"] = getattr(nat, "_graph_edit", None)
+        return rows
+
+
+def _events(nat, task: dict, k: int = 8) -> list[dict]:
     """The English reader's questions about a text (reader.Reader.bits), answered by the model: for the K positions
     where a changed token moves the prediction most and K other positions before the target (drawn with the text's
     seed), the token there replaced by the model's likeliest other token (carry.alternatives' first), and, for each
@@ -452,6 +474,10 @@ def main():
     t.add_argument("explain", type=Path)
     t.add_argument("out", type=Path)
     t.add_argument("--fraction", type=int, default=90)
+    import carry
+
+    for parser in (s, b, e):
+        parser.add_argument("--edit", type=carry.parse_edit)
     a = ap.parse_args()
     if a.cmd == "targets":
         print(f"{targets(a.explain, a.out, a.fraction)} answers in {a.out}")
@@ -461,23 +487,35 @@ def main():
         return
     import native
 
-    nat = native.Native()
     if a.cmd == "events":  # one line per text: {"task", "events"}; resumable
-        done = {json.loads(x)["task"] for x in open(a.out)} if a.out.exists() else set()
+        done = set()
+        if a.out.exists():
+            for x in open(a.out):
+                row = json.loads(x)
+                if carry.parse_edit(row.get("edit")) != a.edit:
+                    ap.error("existing events output has incompatible edit")
+                done.add(row["task"])
+        pending = [p for p in native.tasks(a.split)[:a.n][a.offset::a.stride] if p.stem not in done]
+        if not pending:
+            return
+        nat = native.Native()
+        a.out.parent.mkdir(parents=True, exist_ok=True)
         with open(a.out, "a") as f:
-            for path in native.tasks(a.split)[:a.n][a.offset::a.stride]:
+            for path in pending:
                 if path.stem in done:
                     continue
-                f.write(json.dumps({"task": path.stem, "events": events(nat, json.loads(path.read_text()), a.k)}) + "\n")
+                f.write(json.dumps({"task": path.stem, "edit": a.edit, "events": events(nat, json.loads(path.read_text()), a.k, edit=a.edit)}) + "\n")
                 f.flush()
         return
+    nat = native.Native()
     task = json.loads((native.TEXTS / "vpd4l" / f"{a.task}.json").read_text())
     if a.cmd == "baseline":
         p = task["prompts"][0]
-        text = baseline(a.kind, sensitive(nat, p["token_ids"], p["target_positions"], a.k), p["target_positions"])
+        with carry.model_edit(nat, a.edit):
+            text = baseline(a.kind, sensitive(nat, p["token_ids"], p["target_positions"], a.k), p["target_positions"])
     else:
         text = a.answer.read_text()
-    print(json.dumps(score(nat, task, text, a.k), indent=1))
+    print(json.dumps(score(nat, task, text, a.k, edit=a.edit), indent=1))
 
 
 if __name__ == "__main__":

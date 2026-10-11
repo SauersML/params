@@ -6,6 +6,7 @@ KL sums target positions, averages changed prompts, and is reported in bits.
 Run: MPD_MEM_GIB=24 ~/mpd-data/venv/bin/python carry.py search --task hard9308
      MPD_MEM_GIB=24 ~/mpd-data/venv/bin/python carry.py explain --split hard
          --n 50 --k 8 --out /Users/user/mpd-data/graph_oracle/carry/hard50_matrix.jsonl
+Use --edit "heads:L2:2,3,4;mlp:L1;edge:L2:all" for whole-measurement edits.
 Use --units head for activation-slice units; summarize reads completed JSONL
 rows and reports distributions, recurring sets, timing, and full-set failures.
 """
@@ -16,6 +17,8 @@ from collections import Counter
 import copy
 import json
 import math
+import re
+from contextlib import contextmanager
 from pathlib import Path
 import plistlib
 import subprocess
@@ -30,6 +33,163 @@ import native
 
 LN2 = math.log(2)
 COPYCHECK = Path.home() / "mpd-data/graph_oracle/copycheck_vr4.jsonl"
+
+
+def parse_edit(spec):
+    """Validate and canonicalize model edits (layer indices are zero based)."""
+    if spec is None or spec == "":
+        return None
+    edits = {}
+    for part in spec.split(";"):
+        m = re.fullmatch(r"(heads|mlp|edge):L(\d+)(?::(all|\d+(?:,\d+)*))?", part.strip())
+        if not m or (m[1] == "mlp" and m[3] is not None) or (m[1] == "edge" and m[3] != "all") or (m[1] == "heads" and (m[3] is None or m[3] == "all")):
+            raise ValueError(f"invalid model edit: {part!r}")
+        key = (m[1], int(m[2]))
+        edits.setdefault(key, set()).update(map(int, m[3].split(",")) if m[1] == "heads" else [])
+    return ";".join(f"{kind}:L{layer}" + (":" + ",".join(map(str, sorted(edits[kind, layer]))) if kind == "heads" else ":all" if kind == "edge" else "")
+                    for kind, layer in sorted(edits))
+
+
+class _ModelEdit(TorchFunctionMode):
+    """Edit full attention head outputs and MLP writes, including VPD remainders.
+
+    Zeroing PV head rows is exactly subtracting each head's o_proj input
+    slice times its output weights. It also covers sliced HeadCarry products.
+    Fused attention is expanded so references and direct runs share semantics.
+    """
+    def __init__(self, nat, spec):
+        self.nat, self.spec = nat, spec
+        self.heads, self.edges, self.mlp = {}, set(), set()
+        for part in spec.split(";"):
+            kind, layer, *arg = part.split(":")
+            layer = int(layer[1:])
+            if layer >= nat.target.n_layer:
+                raise ValueError(f"edit layer L{layer} outside model")
+            if kind == "heads":
+                hs = list(map(int, arg[0].split(",")))
+                if max(hs) >= nat.target.n_head:
+                    raise ValueError("edit head outside model")
+                self.heads[layer] = hs
+            elif kind == "edge":
+                self.edges.add(layer)
+            else:
+                self.mlp.add(layer)
+        self.zero_products, self.zero_weights = {}, {}
+        for layer in self.mlp:
+            st = nat.target.site(native.site_name(layer, "down_proj"))
+            self.zero_products.update({id(st.U): layer, id(st.delta_T): layer})
+            self.zero_weights[st.W.data_ptr()] = layer
+        self.calls, self.pv_layer = 0, None
+        self.seen_heads, self.seen_edges, self.seen_mlp = set(), set(), set()
+
+    def pattern(self, out):
+        layer = self.calls % self.nat.target.n_layer
+        self.calls += 1
+        self.pv_layer = layer
+        if layer in self.edges:
+            out = out.clone()
+            out[..., -1, :-1] = 0.0  # no renormalization; self edge preserved
+            self.seen_edges.add(layer)
+        return out
+
+    def values(self, out, layer):
+        if layer in self.heads:
+            out = out.clone()
+            out[:, self.heads[layer], :, :] = 0.0
+            self.seen_heads.add(layer)
+        return out
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is torch.nn.functional.scaled_dot_product_attention:
+            q, k, v = args[:3]
+            # Only the model's ordinary MHA is supported. Fail on new kernels/options.
+            if len(args) > 3 or kwargs.get("dropout_p", 0.0) or kwargs.get("enable_gqa", False):
+                raise RuntimeError("unsupported fused attention under model edit")
+            scale = kwargs.get("scale")
+            logits = (q @ k.transpose(-1, -2)) * (scale if scale is not None else 1 / math.sqrt(q.shape[-1]))
+            mask = kwargs.get("attn_mask")
+            if kwargs.get("is_causal", False):
+                mask = torch.ones(q.shape[-2], k.shape[-2], device=q.device, dtype=torch.bool).tril()
+            if mask is not None:
+                logits = logits.masked_fill(~mask, float("-inf")) if mask.dtype == torch.bool else logits + mask
+            pattern = self.pattern(logits.softmax(-1))
+            layer, self.pv_layer = self.pv_layer, None
+            return self.values(pattern @ v, layer)
+        if func.__name__ in ("matmul", "__matmul__"):
+            x, w = args[:2]
+            out = func(*args, **kwargs)
+            if x.dim() == w.dim() == 4 and self.pv_layer is not None:
+                layer, self.pv_layer = self.pv_layer, None
+                return self.values(out, layer)
+            if id(w) in self.zero_products or (w.dim() == 2 and w.data_ptr() in self.zero_weights):
+                layer = self.zero_products.get(id(w), self.zero_weights.get(w.data_ptr()))
+                self.seen_mlp.add(layer)
+                return out * 0.0
+            return out
+        out = func(*args, **kwargs)
+        if func.__name__ == "softmax" and out.dim() == 4:
+            return self.pattern(out)
+        return out
+
+    def check(self):
+        if not self.calls or self.calls % self.nat.target.n_layer or self.pv_layer is not None or self.seen_heads != set(self.heads) or self.seen_edges != self.edges or self.seen_mlp != self.mlp:
+            raise RuntimeError("model edit interception incomplete; kernel or forward path bypassed edit")
+
+
+@contextmanager
+def model_edit(nat, spec=None):
+    """Apply edits to every forward in a measurement; discard unkeyed prompt caches.
+
+    Studies must be created and used within this context. Nested identical
+    edits are allowed; changing the model inside a study fails explicitly.
+    """
+    spec = parse_edit(spec)
+    active = getattr(nat, "_graph_edit", None)
+    if active is not None:
+        if spec is not None and spec != active:
+            raise ValueError("cannot nest different model edits")
+        yield
+        return
+    if spec is None:
+        yield
+        return
+    mode = _ModelEdit(nat, spec)
+    # Check each Native and target forward separately: one observable forward
+    # must not conceal another that silently switched to a compiled kernel.
+    restored = []
+    def guard(original):
+        def checked(*args, **kwargs):
+            mode.calls, mode.pv_layer = 0, None
+            mode.seen_heads.clear()
+            mode.seen_edges.clear()
+            mode.seen_mlp.clear()
+            result = original(*args, **kwargs)
+            mode.check()
+            return result
+        return checked
+    for obj, name in ((nat, "run"), (nat, "reference"), (nat.vpd, "target_forward"), (nat.target, "hidden")):
+        restored.append((obj, name, name in obj.__dict__, obj.__dict__.get(name)))
+        setattr(obj, name, guard(getattr(obj, name)))
+    nat._rec = (None, None, None)
+    nat._graph_edit = spec
+    try:
+        with mode:
+            yield
+        mode.check()
+    finally:
+        for obj, name, had, old in restored:
+            if had:
+                setattr(obj, name, old)
+            else:
+                delattr(obj, name)
+        nat._rec = (None, None, None)
+        nat._graph_edit = None
+
+
+def _check_study_edit(study):
+    if study.edit != getattr(study.nat, "_graph_edit", None):
+        raise RuntimeError("carry study used under a different model edit; cached states invalid")
 
 
 def kl(lp, lq):
@@ -129,6 +289,7 @@ class Carry:
             raise ValueError("need at least one prompt and target")
         if any(len(x) != len(ids) for x in prompts):
             raise ValueError("changed prompts must have the original length")
+        self.edit = getattr(nat, "_graph_edit", None)
         self.nat, self.ids, self.targets, self.prompts = nat, ids, targets, prompts
         self.T = len(ids)
         self.rec = nat._model_record(ids)[0]
@@ -145,6 +306,7 @@ class Carry:
 
     @torch.no_grad()
     def measure(self, sets):
+        _check_study_edit(self)
         if not len(sets):
             return torch.empty(0, device=self.nat.dev)
         nat = self.nat
@@ -175,6 +337,7 @@ class Carry:
         return torch.cat(results)
 
     def mixed(self, x, coefficients):
+        _check_study_edit(self)
         patch = {n: (torch.ones_like(self.rec[n], dtype=torch.bool), self.rec[n]) for n in self.nat.names}
         mode = _Mix(patch, coefficients)
         with mode:
@@ -577,6 +740,7 @@ def _run_units(study, coefficients, embeddings, *, compact=False):
     dependency is dropped.
     """
     import vpd_model
+    _check_study_edit(study)
     tg, T = study.nat.target, study.T
     B = next(iter(coefficients.values())).shape[0]
     s = max(0, min(study.first_change, min(study.space.positions), T - -(-64 // B), min(study.targets)))
@@ -640,7 +804,7 @@ def _run_units(study, coefficients, embeddings, *, compact=False):
         k = torch.cat([study.rope_keys[i][:, :, :s].expand(B, -1, -1, -1), k], 2) if s else k
         prefix_v = study.states[("vs", i)][:, :s].expand(B, -1, -1)
         v = torch.cat([prefix_v, v], 1).view(B, T, H, hd).transpose(1, 2) if s else heads(v)
-        if torch.is_grad_enabled():
+        if torch.is_grad_enabled() or study.edit:
             pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(study.mask_windows[s], float("-inf")).softmax(-1)
             attention = pattern @ v
         else:
@@ -668,6 +832,7 @@ def _mixed_units(study, x, coefficients):
 
 @torch.no_grad()
 def _measure_units(study, sets):
+    _check_study_edit(study)
     out, start = [], 0
     while start < len(sets):
         valid = min(study.chunk_size, len(sets) - start)
@@ -825,6 +990,7 @@ class HeadCarry(Carry):
         _prepare_unit_prompts(self)
 
     def mixed(self, x, coefficients, *, reuse=False):
+        _check_study_edit(self)
         if self.direct:
             return _mixed_units(self, x, coefficients)
         patch = {n: (coefficients[n] == 0 if reuse else torch.ones_like(self.rec[n], dtype=torch.bool), self.rec[n])
@@ -1110,7 +1276,14 @@ def _explain_positions(nat, ids, targets, order, units, moved=None, *, relays=Fa
     return result
 
 
-def explain(nat, ids, targets, K, *, units="matrix", relays=False, reuse=None):
+def explain(nat, ids, targets, K, *, units="matrix", relays=False, reuse=None, edit=None):
+    with model_edit(nat, edit):
+        if reuse is not None and parse_edit(reuse.get("edit")) != getattr(nat, "_graph_edit", None):
+            raise ValueError("reuse model edit does not match measurement")
+        return _explain(nat, ids, targets, K, units=units, relays=relays, reuse=reuse)
+
+
+def _explain(nat, ids, targets, K, *, units="matrix", relays=False, reuse=None):
     """Top K Native.sensitivity positions; top three model alternatives each.
 
     Sensitivity is Native's one seeded random alternative and last-target KL
@@ -1337,6 +1510,7 @@ def main():
     e.add_argument("--k", type=int, default=8)
     e.add_argument("--units", choices=("matrix", "head"), default="matrix")
     e.add_argument("--relays", action="store_true", help="screen and measure up to three intermediate relay positions")
+    e.add_argument("--edit", type=parse_edit, help="model edits, e.g. heads:L2:2,3,4;mlp:L1;edge:L2:all")
     e.add_argument("--reuse", type=Path, help="reuse compatible no-relay JSONL circuits, preserving position order and alternatives")
     e.add_argument("--offset", type=int, default=0, help="this process's share of the first n texts: offset, offset + stride, ...")
     e.add_argument("--stride", type=int, default=1)
@@ -1398,8 +1572,8 @@ def main():
             with args.out.open() as f:
                 for line in f:
                     row = json.loads(line)
-                    if (row["split"], row["k"], row["units"], row.get("relays", False)) != (args.split, args.k, args.units, args.relays):
-                        ap.error("existing output has incompatible split, k, units or relays")
+                    if (row["split"], row["k"], row["units"], row.get("relays", False), parse_edit(row.get("edit"))) != (args.split, args.k, args.units, args.relays, args.edit):
+                        ap.error("existing output has incompatible split, k, units, relays or edit")
                     done.add(row["task"])
         pending = [p for p in native.tasks(args.split)[:args.n][args.offset::args.stride] if p.stem not in done]
         if not pending:
@@ -1412,8 +1586,8 @@ def main():
                 for line in f:
                     row = json.loads(line)
                     if row["task"] in wanted and (
-                            row["split"], row["k"], row["units"], row.get("relays", False)
-                    ) == (args.split, args.k, args.units, False):
+                            row["split"], row["k"], row["units"], row.get("relays", False), parse_edit(row.get("edit"))
+                    ) == (args.split, args.k, args.units, False, args.edit):
                         if row["task"] in reuse:
                             ap.error(f"duplicate compatible reuse row: {row['task']}")
                         reuse[row["task"]] = row
@@ -1426,11 +1600,11 @@ def main():
             synchronize(nat.dev)
             util = _Utilization(nat.dev)
             t0 = time.perf_counter()
-            positions = explain(nat, ids, targets, args.k, units=args.units, relays=args.relays,
+            positions = explain(nat, ids, targets, args.k, units=args.units, relays=args.relays, edit=args.edit,
                                 **({"reuse": reuse[path.stem]} if path.stem in reuse else {}))
             synchronize(nat.dev)
             result = {"task": path.stem, "split": args.split, "k": args.k, "units": args.units,
-                      "targets": targets, "device": str(nat.dev), "positions": positions, "relays": args.relays,
+                      "targets": targets, "device": str(nat.dev), "positions": positions, "relays": args.relays, "edit": args.edit,
                       "engine": "direct-unit-v4-stable-batches",
                       "seconds": time.perf_counter() - t0, "gpu_utilization": util.finish(),
                       "search": "exact greedy; smallest sets on measured path, not global optima",

@@ -25,6 +25,6 @@ python carry_qwen.py paths --model Qwen/Qwen3-8B --cases carry_cases_8b.jsonl --
 python literal_monitor.py scan --model Qwen/Qwen3-8B --runs arms/full2 arms/q8d2 arms/tmpl1 --out $O/literals_8b.jsonl --deadline 1500 || echo STAGE scan FAILED;
 python carry_qwen.py run --model Qwen/Qwen3-14B --cases carry_cases_14b.jsonl --out $O/carry_14b.jsonl --deadline 600 || echo STAGE 14b FAILED;
 echo all stages done"
-RP_ALLOW_OVER=1 RP_OWNER=monitorbench RP_PARALLEL=1 RP_PYENV=oracle RP_DISK_GB=120 RP_MIN_VRAM_GB=78 \
+RP_UPLOAD_MAX_MB=${UPMAX:-150} RP_ALLOW_OVER=1 RP_OWNER=monitorbench RP_PARALLEL=1 RP_PYENV=oracle RP_DISK_GB=120 RP_MIN_VRAM_GB=78 \
   RP_HF_MODELS="Qwen/Qwen3-8B Qwen/Qwen3-14B" \
   infra/runpod/rp-run $N "${GPU:-NVIDIA A100-SXM4-80GB,NVIDIA A100 80GB PCIe}" $H -- bash -c "$CMD"

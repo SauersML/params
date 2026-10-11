@@ -3,7 +3,9 @@
 # SFT adapter, the questions (questions.py's train.jsonl and heldout.jsonl), the texts and origin/main's
 # oracle/graph go up as tar files; VPD's subcomponents (uv.safetensors) and vpd4l are published inputs; Qwen3-4B
 # comes from Hugging Face. rl/prime/pod_rl.sh runs there; its outputs come back to mpd-data/runpod/NAME.
-#   oracle/graph/rl/prime/run_pod.sh ADAPTER_DIR QUESTIONS_DIR HOURS [rl args]   (env: RUN, REVISE=1, PRICE, GPU)
+#   oracle/graph/rl/prime/run_pod.sh ADAPTER_DIR QUESTIONS_DIR HOURS [rl args]   (env: RUN, REVISE=1, UNITS=1 for the
+#   unit-circuit explainer with serve_units.py: QUESTIONS_DIR holds units.dataset rows as train.jsonl and units_sft.py
+#   questions as heldout.jsonl, PRICE, GPU, VRAM)
 cd /Users/user/params
 AD=$1 QD=$2 H=$3
 shift 3
@@ -19,6 +21,6 @@ COPYFILE_DISABLE=1 tar -cf "$IN" -C /Users/user/mpd-data/graph_oracle texts/vpd4
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN; a Mac path here would be uploaded file by file)
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S ~/mpd-data/in ~/mpd-data/graph_oracle; tar -xf $IN -C ~/mpd-data/in; mv ~/mpd-data/in/texts ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
-cd $S/oracle/graph; ${REVISE:+REVISE=1} bash rl/prime/pod_rl.sh $I/$(basename "$AD") $I/$(basename "$QD") $O $N $*"
+cd $S/oracle/graph; ${REVISE:+REVISE=1} ${UNITS:+UNITS=1} bash rl/prime/pod_rl.sh $I/$(basename "$AD") $I/$(basename "$QD") $O $N $*"
 RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-3500} RP_OWNER=lead RP_PARALLEL=1 RP_PYENV=oracle RP_HF_MODELS="Qwen/Qwen3-4B" RP_MAX_PRICE=${PRICE:-2.0} \
-  RP_MIN_VRAM_GB=80 RP_MIN_RAM_GB=96 RP_DISK_GB=120 infra/runpod/rp-run $N "${GPU:-auto}" $H -- bash -c "$CMD"
+  RP_MIN_VRAM_GB=${VRAM:-80} RP_MIN_RAM_GB=96 RP_DISK_GB=120 infra/runpod/rp-run $N "${GPU:-auto}" $H -- bash -c "$CMD"

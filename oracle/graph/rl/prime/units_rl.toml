@@ -1,0 +1,76 @@
+# prime-rl RL of the unit-circuit explainer (#2951 graph oracle) on one GPU (pod_units_rl.sh: vLLM, the trainer and
+# serve_units.py share it; weights through the filesystem). pod_units_rl.sh sets model.name (the SFT adapter merged into
+# Qwen3-4B, units_sft.py merge) and launches from the directory holding train.jsonl and heldout.jsonl, which the sources
+# name relative to it. The reward is serve_units.py's: carried - 0.5 x units / units_all, 0 for an answer missing a line.
+max_steps = 60
+seq_len = 6144  # questions number every token (up to 3.8k, more with evidence) and answers stop at 1,024
+dashboard = false
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[trainer.model.lora]  # a new LoRA on the merged SFT explainer
+rank = 32
+alpha = 64
+
+[trainer.model.ac]
+
+[trainer.optim]
+lr = 3e-5  # graph-oracle runs: 1e-5 left held-out reward unmoved in 20 steps, 1e-4 drifted (mismatch KL 0.02-0.06)
+
+[orchestrator]
+batch_size = 32  # 4 questions x 8 answers
+
+[orchestrator.concurrency]
+initial_inflight = 32
+
+[orchestrator.renderer]  # Qwen3's template without thinking, as the SFT trained
+name = "qwen3"
+enable_thinking = false
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 1024
+temperature = 1.0
+
+[[orchestrator.train.source]]
+name = "units-oracle"
+env.taskset.id = "units-oracle"
+env.taskset.questions = "train.jsonl"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[orchestrator.eval]  # before training and every 20 steps
+interval = 20
+
+[orchestrator.eval.sampling]  # evaluation goes through vLLM's chat completions, not the renderer: the same template asked for
+max_completion_tokens = 1024
+temperature = 1.0
+chat_template_kwargs = { enable_thinking = false }
+
+[[orchestrator.eval.source]]
+name = "units-oracle-heldout"
+group_size = 2
+env.taskset.id = "units-oracle"
+env.taskset.questions = "heldout.jsonl"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[ckpt]
+
+[deployment]
+num_infer_gpus = 1
+num_train_gpus = 1
+
+[weight_broadcast]  # NCCL cannot broadcast between two processes on one GPU
+type = "filesystem"
+
+[inference.vllm]
+gpu_memory_utilization = 0.35
+max_model_len = 6144
+
+[env_vars]
+# FlashInfer JIT-compiles its sampler with the image's CUDA 12 nvcc, which rejects CUDA 13 flags.
+VLLM_USE_FLASHINFER_SAMPLER = "0"

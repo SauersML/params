@@ -11,6 +11,7 @@ them).
   units_sft.py score QUESTIONS.jsonl OUT.jsonl [--answers ANSWERS.jsonl] [--teacher DIR] [--k 8]   the copy and all baselines, DIR's
                                                   units.py targets answers ("teacher") and the answers, one score_many per question
   units_sft.py report SCORES.jsonl
+  units_sft.py merge ADAPTER OUT_DIR [--base Qwen/Qwen3-4B]   the adapter merged into the base: an HF checkpoint (an RL start)
 """
 
 from __future__ import annotations
@@ -269,6 +270,17 @@ def report(a) -> None:
               f"{statistics.mean(r.get('unknown', 0) for r in ex):.1f} per answer")
 
 
+def merge(a) -> None:
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model = PeftModel.from_pretrained(AutoModelForCausalLM.from_pretrained(a.base, dtype=torch.bfloat16), str(a.adapter)).merge_and_unload()
+    model.save_pretrained(str(a.out))
+    AutoTokenizer.from_pretrained(a.base).save_pretrained(str(a.out))
+    print(f"merge: {a.adapter} into {a.base} -> {a.out}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -305,8 +317,12 @@ def main():
     c.add_argument("--k", type=int, default=8)
     r = sub.add_parser("report")
     r.add_argument("scores", type=Path)
+    g = sub.add_parser("merge")
+    g.add_argument("adapter", type=Path)
+    g.add_argument("out", type=Path)
+    g.add_argument("--base", default="Qwen/Qwen3-4B")
     a = ap.parse_args()
-    {"sft": sft, "questions": questions, "sample": sample, "score": score, "report": report}[a.cmd](a)
+    {"sft": sft, "questions": questions, "sample": sample, "score": score, "report": report, "merge": merge}[a.cmd](a)
 
 
 if __name__ == "__main__":

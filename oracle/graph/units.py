@@ -229,10 +229,12 @@ def events(nat, task: dict, k: int = 8) -> list[dict]:
     """The English reader's questions about a text (reader.Reader.bits), answered by the model: for the K positions
     where a changed token moves the prediction most and K other positions before the target (drawn with the text's
     seed), the token there replaced by the model's likeliest other token (carry.alternatives' first), and, for each
-    layer, the attention at the target kept from reading the position (_cut). Each event: {"position", "new" (token
-    id) or "layer", "down": whether the model's probability of its most likely next token goes down, "weight": by how
-    much it moves, |log2 of its ratio| capped at 4 bits (a change that moves nothing hardly counts), "bits": the signed
-    log2 ratio}."""
+    layer, the attention at the target kept from reading the position (_cut); at the listed positions also the model's
+    second likeliest other token. Each event: {"position", "new" (token id) and "alt" (0 or 1), or "layer", "listed",
+    "down": whether the model's probability of its most likely next token goes down, "weight": by how much it moves,
+    |log2 of its ratio| capped at 4 bits (a change that moves nothing hardly counts), "bits": the signed log2 ratio}.
+    The oracle reads the listed positions' first-token and cut events (evidence()); the reader is asked the rest
+    (reader_events())."""
     import math
     import random
 
@@ -264,10 +266,13 @@ def events(nat, task: dict, k: int = 8) -> list[dict]:
 
     out = []
     for q in near + others:
-        alt = carry.alternatives(nat, ids, q)[0]
-        out.append(event(q, float(p_top(alt)[top]), new=alt[q]))
+        alts = carry.alternatives(nat, ids, q)
+        listed = q in near
+        out.append(event(q, float(p_top(alts[0])[top]), new=alts[0][q], alt=0, listed=listed))
+        if listed and len(alts) > 1:  # a second token at a listed position: only the reader is asked about it
+            out.append(event(q, float(p_top(alts[1])[top]), new=alts[1][q], alt=1, listed=True))
         for layer in range(nat.target.n_layer):
-            out.append(event(q, float(p_top(ids, _cut(t, q, layer))[top]), layer=layer))
+            out.append(event(q, float(p_top(ids, _cut(t, q, layer))[top]), layer=layer, listed=listed))
     native.free(nat.dev)
     return out
 
@@ -316,6 +321,12 @@ def numbered(strings: list[str]) -> str:
     return " ".join(f"{i}:{s!r}" for i, s in enumerate(strings))
 
 
+def reader_events(events: list[dict]) -> list[dict]:
+    """The events the English reader is asked about: none the oracle read as evidence (other positions, and the second
+    token at listed positions), so English is credited only for what it lets a reader predict beyond its own input."""
+    return [e for e in events if not e.get("listed") or e.get("alt") == 1]
+
+
 def evidence(events: list[dict], positions: list[int], strings: list[str]) -> list[str]:
     """The measurements the oracle reads for each listed position (events() at those positions): how the log2
     probability of the model's most likely next token moves when the token there changes to the model's likeliest
@@ -327,7 +338,7 @@ def evidence(events: list[dict], positions: list[int], strings: list[str]) -> li
     out = []
     for q in positions:
         es = by.get(q, [])
-        change = next((e for e in es if "new" in e), None)
+        change = next((e for e in es if "new" in e and e.get("alt", 0) == 0), None)
         cuts = sorted((e for e in es if "layer" in e), key=lambda e: e["layer"])
         if change is None and not cuts:
             continue
@@ -426,6 +437,8 @@ def main():
     e.add_argument("out", type=Path)
     e.add_argument("--n", type=int, default=50)
     e.add_argument("--k", type=int, default=8)
+    e.add_argument("--offset", type=int, default=0, help="this process's share of the first n texts: offset, offset + stride, ...")
+    e.add_argument("--stride", type=int, default=1)
     t = sub.add_parser("targets")
     t.add_argument("explain", type=Path)
     t.add_argument("out", type=Path)
@@ -443,7 +456,7 @@ def main():
     if a.cmd == "events":  # one line per text: {"task", "events"}; resumable
         done = {json.loads(x)["task"] for x in open(a.out)} if a.out.exists() else set()
         with open(a.out, "a") as f:
-            for path in native.tasks(a.split)[:a.n]:
+            for path in native.tasks(a.split)[:a.n][a.offset::a.stride]:
                 if path.stem in done:
                     continue
                 f.write(json.dumps({"task": path.stem, "events": events(nat, json.loads(path.read_text()), a.k)}) + "\n")

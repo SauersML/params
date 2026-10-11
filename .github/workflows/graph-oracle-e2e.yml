@@ -1,7 +1,8 @@
 name: Graph Oracle E2E
 
 # The graph oracle's tests (#2951) on a CPU runner: mech (the loader of graph answers), edits, reader,
-# part tokens, copycheck, prompted, score, the frozen reader of the RL loop, and the RL scorer and
+# part tokens, copycheck, prompted, score, the goal scorecard on a tiny random model of vpd4l's
+# architecture (its vpd4l checks skip here), the frozen reader of the RL loop, and the RL scorer and
 # trainer (scripts) on a tiny random Qwen3. test_mech's sandbox test tokenizes with vpd4l's
 # tokenizer, a file under the Mac's mpd-data, and is left out here. No test runs the Rust checker
 # (method/crates/mpd/examples/mpd_graph_2951.rs), so nothing here compiles.
@@ -49,7 +50,7 @@ jobs:
         run: |
           python -m pytest method/oracle/test_mech.py method/oracle/test_edits.py method/oracle/test_reader.py \
             method/oracle/test_part_tokens.py experiments/oracle/test_copycheck.py experiments/oracle/test_prompted.py \
-            method/oracle/test_score.py method/oracle/rl/test_reader_frozen.py \
+            method/oracle/test_score.py method/oracle/test_goal_eval.py method/oracle/rl/test_reader_frozen.py \
             --deselect method/oracle/test_mech.py::test_the_sandbox_limits_and_the_server \
             -p no:cacheprovider -v --tb=short
           python -B method/oracle/rl/test_scorer.py

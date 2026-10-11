@@ -2,9 +2,11 @@
 # Measured unit circuits on one pod (carry.py explain): P processes share the GPU, each taking every P-th text of a split.
 # JOBS lists "split:count" or "split:count:relays" entries, run one after another. Texts already measured on the Mac
 # (SEED files, carry.py explain output) are skipped: each process's output starts as a copy of its split's seed.
+# REUSE=FILE (a no-relay explain output under ~/mpd-data/graph_oracle/carry): relay entries reuse its circuits
+# (carry.py explain --reuse: only positions whose circuit at the position and target falls short are searched again).
 # Afterwards one file per entry, deduplicated by text, in $O/<split><count>[_relays].jsonl. The Python is origin/main's
 # oracle/graph at launch.
-#   oracle/graph/pods/carry_pod.sh HOURS   (env: RUN, JOBS, P, PRICE, VRAM, GPU)
+#   oracle/graph/pods/carry_pod.sh HOURS   (env: RUN, JOBS, P, PRICE, VRAM, GPU, REUSE)
 cd /Users/user/params
 H=${1:-3.0}
 RUN=${RUN:-a} P=${P:-4} JOBS=${JOBS:-"train:600 hard:50:relays heldout:50:relays"}
@@ -16,7 +18,7 @@ G=$S/oracle/graph
 N=oracle-graph-carry-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/scratch/glead/v5/texts-carry-$RUN.tar
-SEEDS="carry/train200_matrix.jsonl carry/hard50_relays.jsonl carry/heldout50_relays.jsonl"
+SEEDS="carry/train200_matrix.jsonl carry/hard50_relays.jsonl carry/heldout50_relays.jsonl ${REUSE:+carry/$REUSE}"
 HAVE=""; for f in $SEEDS; do [ -f "$D/$f" ] && HAVE="$HAVE $f"; done
 COPYFILE_DISABLE=1 tar -cf "$T" -C "$D" texts/vpd4l $HAVE
 STAGES=""
@@ -26,7 +28,7 @@ for entry in $JOBS; do
   seed='~/mpd-data/graph_oracle/carry/'$split$([ "$split" = train ] && echo 200 || echo 50)_$([ "$flag" = relays ] && echo relays || echo matrix).jsonl
   RUNS=""; PARTS=""
   for k in $(seq 0 $((P - 1))); do
-    RUNS="$RUNS ([ -f $seed ] && cp $seed $O/parts/${name}_$k.jsonl; python carry.py explain --split $split --n $n --offset $k --stride $P $([ "$flag" = relays ] && echo --relays) --out $O/parts/${name}_$k.jsonl > $O/${name}_$k.log 2>&1) &"
+    RUNS="$RUNS ([ -f $seed ] && cp $seed $O/parts/${name}_$k.jsonl; python carry.py explain --split $split --n $n --offset $k --stride $P $([ "$flag" = relays ] && echo --relays) $([ "$flag" = relays ] && [ -n "$REUSE" ] && echo "--reuse ~/mpd-data/graph_oracle/carry/$REUSE") --out $O/parts/${name}_$k.jsonl > $O/${name}_$k.log 2>&1) &"
     PARTS="$PARTS $O/parts/${name}_$k.jsonl"
   done
   STAGES="$STAGES $RUNS wait; cat $PARTS | awk '!seen[\$0]++' > $O/$name.jsonl;"  # the seed rows are identical copies

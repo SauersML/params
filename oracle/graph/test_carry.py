@@ -660,6 +660,92 @@ def test_public_relay_options(monkeypatch):
     assert carry.explain(nat, [1, 2, 3], [2], 1, relays=True) == {"relays": True}
 
 
+@pytest.mark.parametrize("text_index", [0, 1])
+def test_reuse_two_small_texts(case, monkeypatch, text_index):
+    nat, full_ids, *_ = case
+    ids = full_ids[20 + 7*text_index:27 + 7*text_index]
+    targets, order = [6], [5, 1]
+    plain = carry._explain_positions(nat, ids, targets, order, "matrix")
+    fresh = carry._explain_positions(nat, ids, targets, order, "matrix", relays=True)
+    # Round trip the actual on-disk schema. Missing fields force recomputation
+    # even if the stored full circuit would have passed the stopping criterion.
+    stored = json.loads(json.dumps({"targets": targets, "positions": plain}))
+    del stored["positions"][1]["empty_bits"]
+    calls = []
+    original = carry._circuit_with_relays
+    def circuit(study, p, targets, enabled, movement):
+        calls.append((p, [x[p] for x in study.prompts], enabled))
+        return original(study, p, targets, enabled, movement)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("stored positions and alternatives must bypass selection")
+    monkeypatch.setattr(carry, "_circuit_with_relays", circuit)
+    monkeypatch.setattr(carry, "alternatives", forbidden)
+    monkeypatch.setattr(nat, "sensitivity", forbidden)
+    reused = carry.explain(nat, ids, targets, 2, relays=True, reuse=stored)
+    assert calls == [(1, plain[1]["alternatives"], True)]
+    assert [r["position"] for r in reused] == order
+    expected = json.loads(json.dumps(fresh[1]))
+    actual = json.loads(json.dumps(reused[1]))
+    expected.pop("seconds")
+    actual.pop("seconds")
+    assert actual == expected
+    row = reused[0]
+    assert row["reused"] is True and row["relays"] == []
+    before = plain[0]["curve"][0][1]
+    assert row["relay_curve"] == [[0, before]]
+    assert row["before_relays_bits"] == row["after_relays_bits"] == before
+    assert row["carry_fraction_before_relays"] == row["carry_fraction_after_relays"] == 1 - before / plain[0]["movement_bits"]
+    changed = {"reused", "relays", "relay_curve", "before_relays_bits", "after_relays_bits",
+               "carry_fraction_before_relays", "carry_fraction_after_relays"}
+    assert {k: v for k, v in row.items() if k not in changed} == {
+        k: v for k, v in stored["positions"][0].items() if k not in changed}
+
+
+def test_reuse_criterion_and_missing_fields():
+    row = {"curve": [[2, 1.]], "movement_bits": 10., "empty_bits": 1.,
+           "unit_sets": [[["a", 3], ["b", 1]]]}
+    assert carry._reuse_position(row)["reused"] is True  # movement, not empty
+    legacy = carry._reuse_position(row)
+    assert legacy["position_sets"] == [[1, 3]]
+    assert legacy["threshold_90_below_tested_tolerance"] is False
+    assert legacy["threshold_99_below_tested_tolerance"] is False
+    assert "reused" not in row
+    for field in ("curve", "movement_bits", "empty_bits", "unit_sets"):
+        assert carry._reuse_position({k: v for k, v in row.items() if k != field}) is None
+    for movement in (1e-5, 1e-6, 9., float("nan")):
+        assert carry._reuse_position(dict(row, movement_bits=movement)) is None
+    assert carry._reuse_position(dict(row, curve=[])) is None
+
+
+def test_cli_reuse_selection_and_fallback(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    paths = [Path(f"hard{i}.json") for i in range(3)]
+    reuse = tmp_path / "reuse.jsonl"
+    rows = [{"task": f"hard{i}", "split": "hard", "k": 2, "units": "matrix", "relays": i == 1}
+            for i in range(2)]
+    reuse.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    monkeypatch.setattr(sys, "argv", ["carry.py", "explain", "--split", "hard", "--n", "3",
+                                    "--k", "2", "--relays", "--reuse", str(reuse), "--out", str(tmp_path / "out.jsonl")])
+    monkeypatch.setattr(native, "tasks", lambda split: paths)
+    monkeypatch.setattr(native, "text", lambda path: ([1, 2], [1]))
+    monkeypatch.setattr(native, "Native", lambda: SimpleNamespace(dev="cpu"))
+    monkeypatch.setattr(native, "free", lambda dev: None)
+    monkeypatch.setattr(carry, "_Utilization", lambda dev: SimpleNamespace(finish=lambda: {}))
+    calls = []
+    monkeypatch.setattr(carry, "explain", lambda *args, **kwargs: calls.append(kwargs) or [])
+    carry.main()
+    assert calls[0]["reuse"] == rows[0]
+    assert all("reuse" not in c for c in calls[1:])
+
+
+def test_cli_reuse_requires_relays(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["carry.py", "explain", "--split", "hard", "--n", "1",
+                                    "--reuse", "unused.jsonl", "--out", str(tmp_path / "out.jsonl")])
+    with pytest.raises(SystemExit) as exc:
+        carry.main()
+    assert exc.value.code == 2
+
+
 if __name__ == "__main__":
     # The local memory guard recognizes script paths, but reserves only 2 GiB
     # for `python -m pytest` regardless of MPD_MEM_GIB.

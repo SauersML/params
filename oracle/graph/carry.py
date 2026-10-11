@@ -1037,11 +1037,46 @@ def _threshold(curve, empty, fraction):
             "positions": sorted({u[-1] for u in chosen if isinstance(u, tuple)})}
 
 
-def _explain_positions(nat, ids, targets, order, units, moved=None, *, relays=False):
+def _reuse_position(row):
+    """Copy a measured p/targets circuit only when relay stopping is satisfied."""
+    try:
+        before = row["curve"][0][1]
+        movement, empty = row["movement_bits"], row["empty_bits"]
+        if not all(math.isfinite(x) for x in (before, movement, empty)):
+            return None
+        if movement <= 1e-5 or before > .1 * movement:
+            return None
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    result = copy.deepcopy(row)
+    # Earlier no-relay JSONL lacks these metadata fields. Preserve existing
+    # values, but derive missing ones so legacy copies have the current schema.
+    if "position_sets" not in result:
+        if "unit_sets" not in result:
+            return None
+        result["position_sets"] = [sorted({u[-1] for u in us}) for us in result["unit_sets"]]
+    result.setdefault("threshold_90_below_tested_tolerance", .1 * empty < 3e-5)
+    result.setdefault("threshold_99_below_tested_tolerance", .01 * empty < 3e-5)
+    fraction = 1 - before / movement
+    result.update(reused=True, relays=[], relay_curve=[[0, before]],
+                  before_relays_bits=before, after_relays_bits=before,
+                  carry_fraction_before_relays=fraction,
+                  carry_fraction_after_relays=fraction)
+    return result
+
+
+def _explain_positions(nat, ids, targets, order, units, moved=None, *, relays=False, stored=None):
     result = []
     for p in order:
+        old = stored[p] if stored is not None else None
+        reused = _reuse_position(old) if relays and old is not None else None
+        if reused is not None:
+            result.append(reused)
+            print(f"  p={p} reused: no relays needed", flush=True)
+            continue
         t0 = time.perf_counter()
-        prompts = alternatives(nat, ids, p)
+        prompts = ([ids[:p] + [token] + ids[p+1:] for token in old["alternatives"]]
+                   if old is not None and old.get("alternatives") else alternatives(nat, ids, p))
         space = UnitSpace(nat, len(ids), [p, *targets], units)
         study = (HeadCarry if units == "head" else MatrixCarry)(nat, ids, targets, prompts, space)
         empty = float(study.measure([torch.zeros(space.size, dtype=torch.bool, device=nat.dev)])[0])
@@ -1049,7 +1084,8 @@ def _explain_positions(nat, ids, targets, order, units, moved=None, *, relays=Fa
         curve = _circuit_with_relays(study, p, targets, relays, movement)
         synchronize(nat.dev)
         row = {"position": p, "token": ids[p], "alternatives": [x[p] for x in prompts],
-               "sensitivity_nats": float(moved[p-1]) if moved is not None else None,
+               "sensitivity_nats": (old.get("sensitivity_nats") if old is not None
+                                    else float(moved[p-1]) if moved is not None else None),
                "empty_bits": empty, "movement_bits": movement,
                "empty_minus_movement_bits": empty - movement,
                "threshold_90_below_tested_tolerance": .1 * empty < 3e-5,
@@ -1074,16 +1110,32 @@ def _explain_positions(nat, ids, targets, order, units, moved=None, *, relays=Fa
     return result
 
 
-def explain(nat, ids, targets, K, *, units="matrix", relays=False):
+def explain(nat, ids, targets, K, *, units="matrix", relays=False, reuse=None):
     """Top K Native.sensitivity positions; top three model alternatives each.
 
     Sensitivity is Native's one seeded random alternative and last-target KL
     (nats, original||changed), NOT our three-alternative carry KL (bits,
     changed||carried), summed over targets. Position zero has no preceding
     prediction and is not in Native.sensitivity's candidate space.
+    With reuse, keep the stored position/alternative order, copy sufficient
+    p/targets circuits, and recompute the others with relay search enabled.
+    Copied position seconds and threshold sets describe the original search.
     """
     if K < 1:
         raise ValueError("K must be positive")
+    if reuse is not None:
+        if not relays:
+            raise ValueError("reuse requires relays")
+        if reuse["targets"] != targets:
+            raise ValueError("reuse targets do not match the requested text")
+        rows = reuse["positions"]
+        order = [r["position"] for r in rows]
+        if len(set(order)) != len(order) or any(
+                not 0 < p < len(ids) or p in targets or r["token"] != ids[p]
+                for p, r in zip(order, rows)):
+            raise ValueError("reuse positions or tokens do not match the requested text")
+        return _explain_positions(nat, ids, targets, order, units, relays=True,
+                                  stored={r["position"]: r for r in rows})
     if max(targets) < 1:
         return []
     with torch.no_grad():
@@ -1285,6 +1337,7 @@ def main():
     e.add_argument("--k", type=int, default=8)
     e.add_argument("--units", choices=("matrix", "head"), default="matrix")
     e.add_argument("--relays", action="store_true", help="screen and measure up to three intermediate relay positions")
+    e.add_argument("--reuse", type=Path, help="reuse compatible no-relay JSONL circuits, preserving position order and alternatives")
     e.add_argument("--offset", type=int, default=0, help="this process's share of the first n texts: offset, offset + stride, ...")
     e.add_argument("--stride", type=int, default=1)
     e.add_argument("--out", type=Path, required=True)
@@ -1335,6 +1388,8 @@ def main():
             native.free(nat.dev)
         return
     if args.cmd == "explain":
+        if args.reuse is not None and not args.relays:
+            ap.error("--reuse requires --relays")
         if args.n < 1 or args.k < 1 or args.stride < 1 or not 0 <= args.offset < args.stride:
             ap.error("n, k and stride must be positive, offset in [0, stride)")
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -1350,6 +1405,18 @@ def main():
         if not pending:
             print("all requested questions already present", flush=True)
             return
+        reuse = {}
+        if args.reuse is not None:
+            wanted = {p.stem for p in pending}
+            with args.reuse.open() as f:
+                for line in f:
+                    row = json.loads(line)
+                    if row["task"] in wanted and (
+                            row["split"], row["k"], row["units"], row.get("relays", False)
+                    ) == (args.split, args.k, args.units, False):
+                        if row["task"] in reuse:
+                            ap.error(f"duplicate compatible reuse row: {row['task']}")
+                        reuse[row["task"]] = row
         nat = native.Native()
         if str(nat.dev) != "mps":
             print(f"device={nat.dev}", flush=True)
@@ -1359,7 +1426,8 @@ def main():
             synchronize(nat.dev)
             util = _Utilization(nat.dev)
             t0 = time.perf_counter()
-            positions = explain(nat, ids, targets, args.k, units=args.units, relays=args.relays)
+            positions = explain(nat, ids, targets, args.k, units=args.units, relays=args.relays,
+                                **({"reuse": reuse[path.stem]} if path.stem in reuse else {}))
             synchronize(nat.dev)
             result = {"task": path.stem, "split": args.split, "k": args.k, "units": args.units,
                       "targets": targets, "device": str(nat.dev), "positions": positions, "relays": args.relays,

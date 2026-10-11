@@ -13,13 +13,14 @@ template with one slot (the atomic number, the holiday, the capital); a counterf
 with another value of the same token length and a different bridge entity, and its answer is known.
 """
 import json
+import os
 import random
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-WSB = Path.home() / "mpd-data/workspace-bench/hf"
+WSB = Path(os.environ.get("WSB_DATA", Path.home() / "mpd-data/workspace-bench/hf"))
 ARITH_DIR = WSB / "hillclimbing_evals/arithmetic_intermediates"
 MULTIHOP_FILE = WSB / "baseline_evals/single_token/lens-eval-multihop.json"
 ARITH_PROMPT = "Compute {expr}. Reply with only the final number, nothing else."

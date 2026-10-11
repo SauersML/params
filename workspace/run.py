@@ -28,7 +28,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import data  # noqa: E402
 import readers  # noqa: E402
 
-RESULTS = Path.home() / "mpd-data/workspace-bench/results"
+RESULTS = Path(os.environ.get("WSB_RESULTS", Path.home() / "mpd-data/workspace-bench/results"))
 FAMILIES = ["subsub", "subsubx", "addmul", "addmulx", "muladd", "sign", "signpair", "absval", "mulmid", "mulmul"]
 N_CF_ARITH, N_CF_HOP = 3, 4
 

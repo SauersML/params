@@ -74,6 +74,6 @@ class ComponentsOracleTaskset(vf.Taskset[ComponentsOracleTask, ComponentsOracleC
             r = json.loads(line)
             for i in range(self.config.copies):
                 ranks = sorted(random.Random(f"{r['task']}:{i}").sample(range(RANKS), 3))
-                tasks.append(ComponentsOracleTask(ComponentsOracleData(id=f"{r['task']}:{i}", prompt=r["prompt"], task=r["task"], ranks=ranks),
+                tasks.append(ComponentsOracleTask(ComponentsOracleData(id=f"{r['task']}:{i}", prompt=r["question"], task=r["task"], ranks=ranks),
                                                   self.config.task))
         return tasks

@@ -43,7 +43,9 @@ the quality terms, each 1 when perfect, minus SIZE_WEIGHT x the size term:
 An answer is invalid when a circuit line does not parse, goal_eval drops a node or edge (outside the model or the
 text, or a connection the model does not have), or a question has no FINAL line.
 
-  components.py questions SPLIT OUT.jsonl [--n N]              question rows (prompt, positions, evidence, questions)
+  components.py questions SPLIT OUT.jsonl [--n N]              question rows (question, positions, evidence, questions)
+  components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
+                                                                (TEACHER_DIR/<task>.txt) with the measured answers
   components.py score SPLIT ROWS.jsonl --set NAME=DIR [--n N]  rewards of answer texts DIR/<task>.txt, with baselines
 """
 
@@ -473,6 +475,38 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
     return out
 
 
+# ---- supervised targets
+
+
+def target(teacher: str, ev: dict, model: str) -> str:
+    """The supervised answer to a question: the teacher's explanation and circuit, and for each question the model's
+    measured answer (no reasoning: the teacher has none to give)."""
+    from prompt import tokens_of
+
+    p = parse(teacher)
+    finals = {n: (q["falls"], tokens_of(model, [q["top"]])[0]) for n, q in enumerate(ev["qa"], 1)}
+    return render(p["answer"], finals)
+
+
+def dataset(rows: Path, teacher_dir: Path, out: Path) -> int:
+    """SFT rows ({"prompt": [user message], "completion": [assistant message], "info": {"task"}}, units_sft.py's
+    format) for the questions that have a teacher answer."""
+    import native
+
+    n = 0
+    with out.open("w") as f:
+        for r in map(json.loads, rows.read_text().splitlines()):
+            path = teacher_dir / f"{r['task']}.txt"
+            if not path.exists():
+                continue
+            task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+            f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
+                                "completion": [{"role": "assistant", "content": target(path.read_text(), r, task["model"])}],
+                                "info": {"task": r["task"]}}) + "\n")
+            n += 1
+    return n
+
+
 # ---- command line
 
 
@@ -485,6 +519,10 @@ def main():
     q.add_argument("--n", type=int, default=10)
     q.add_argument("--offset", type=int, default=0)
     q.add_argument("--stride", type=int, default=1)
+    d = sub.add_parser("dataset")
+    d.add_argument("rows", type=Path)
+    d.add_argument("teacher", type=Path)
+    d.add_argument("out", type=Path)
     s = sub.add_parser("score")
     s.add_argument("split", choices=("train", "heldout", "hard"))
     s.add_argument("rows", type=Path, help="questions' JSONL")
@@ -493,6 +531,9 @@ def main():
     s.add_argument("--ranks", default="3,4,5")
     s.add_argument("--out", type=Path)
     args = ap.parse_args()
+    if args.cmd == "dataset":
+        print(dataset(args.rows, args.teacher, args.out), "rows", flush=True)
+        return
 
     import goal_eval
     import native
@@ -510,7 +551,7 @@ def main():
                     continue
                 task = json.loads(p.read_text())
                 ev = evidence(nat, ge, task, conn, atlas=atlas)
-                f.write(json.dumps({**ev, "prompt": question(task, ev)}) + "\n")
+                f.write(json.dumps({**ev, "question": question(task, ev)}) + "\n")
                 f.flush()
                 print(p.stem, len(ev["positions"]), "positions", ev["active"], "active", flush=True)
         return

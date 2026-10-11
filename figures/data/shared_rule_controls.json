@@ -6276,7 +6276,7 @@
     "heldout": "1024 positions, project-seen but fit-disjoint; layerwise maximum row error divided by native layer RMS. Not the separate full-model evaluation panel.",
     "warmstart": "Both start from the identical frozen-native initial-fit best program. All parameters retained, optimizer moments reset; 256 additional updates. Best training snapshot selected.",
     "conclusion": "No learned-body advantage; learned warmstart retains step zero. These are negative fitting/faithfulness results, not a matched-compute VPD comparison.",
-    "figure": "Fitting and fit-disjoint replay only. The completed full-model evaluation on the declared panel is archived separately in bench/results_2951/shared_geometry_correct_panel_20261004; native won all 30 tested tolerance pairs.",
+    "figure": "Fitting and fit-disjoint replay only. The completed full-model evaluation on the declared panel is archived separately in results/shared_geometry_correct_panel_20261004; native won all 30 tested tolerance pairs.",
     "larger64": "Same frozen-native 256-update starting parameters as the paired 8-passage continuations; 256 additional updates with identical hyperparameters, using 32,768 rather than 4,096 training positions. Evaluation arrays unchanged. More data also incurs more computation; this is not a compute-matched comparison. Snapshots selected by training error. Full-model Local/Run evaluation of these larger-data candidates was not run.",
     "research_status": "Diagnostic closed: sharing a supplied GELU calculation did not demonstrate learned algorithm discovery. No matched-compute advantage over VPD is established."
   },

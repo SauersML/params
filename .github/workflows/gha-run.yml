@@ -260,8 +260,10 @@ jobs:
           done
           rm -rf out/rp-run-data
 
+      # A run that built nothing (a command alone) saves nothing: an entry it stored would be empty,
+      # and every later build would restore it instead of saving its own.
       - uses: actions/cache/save@v4
-        if: always() && steps.cache.outputs.cache-hit != 'true' && (inputs.cache == '' || startsWith(inputs.name, 'cache-'))
+        if: always() && steps.cache.outputs.cache-hit != 'true' && ((inputs.cache == '' && (inputs.examples != '' || inputs.tests != '')) || startsWith(inputs.name, 'cache-'))
         with:
           path: |
             ~/.cargo/registry

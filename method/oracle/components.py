@@ -412,6 +412,34 @@ def _connectome():
 # ---- the reward
 
 
+def http_reader(url: str, base: str, model: str = "vpd4l"):
+    """reader.Reader over a frozen base model served by vLLM's OpenAI server at url (…/v1/completions): the chat
+    template without thinking, one token, its 20 likeliest."""
+    import httpx
+    from transformers import AutoTokenizer
+
+    import reader
+    from prompt import tokens_of
+
+    tk = AutoTokenizer.from_pretrained(base)
+
+    def generate(prompts: list[str]) -> list[dict]:
+        if not prompts:
+            return []
+        chat = [tk.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True, enable_thinking=False,
+                                       tokenize=False) for q in prompts]
+        r = httpx.post(url, json={"model": base, "prompt": chat, "max_tokens": 1, "temperature": 0.0, "logprobs": 20},
+                       timeout=600.0)
+        r.raise_for_status()
+        out = [None] * len(prompts)
+        for c in r.json()["choices"]:
+            out[c["index"]] = dict(c["logprobs"]["top_logprobs"][0])
+        return out
+
+    return reader.Reader(generate, lambda ids: tokens_of(model, ids))
+
+
+
 def english(text: str) -> str:
     return _sections(text).get("EXPLANATION", "")
 

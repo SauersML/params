@@ -30,7 +30,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from serve_units import Pool, serve  # noqa: E402
+from serve_units import Inline, Pool, serve  # noqa: E402
 
 TEXTS_KEPT = 8  # goal_eval.Text objects a process keeps (a group's answers arrive in several requests)
 
@@ -80,13 +80,14 @@ def main():
     ap.add_argument("rows", help="components.py questions output")
     ap.add_argument("--port", type=int, default=8767)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--workers", type=int, default=2, help="scoring processes; 0: one thread in this process")
     ap.add_argument("--device")
     ap.add_argument("--size-weight", type=float, default=0.5)
     ap.add_argument("--reader", help="the frozen base model's vLLM completions URL (E1)")
     ap.add_argument("--reader-base", default="Qwen/Qwen3-4B")
     a = ap.parse_args()
-    serve(Pool(a.workers, (a.device, a.rows, a.size_weight, a.reader, a.reader_base), work), a.host, a.port, "serve_components")
+    args = (a.device, a.rows, a.size_weight, a.reader, a.reader_base)
+    serve(Pool(a.workers, args, work) if a.workers else Inline(args, work), a.host, a.port, "serve_components")
 
 
 if __name__ == "__main__":

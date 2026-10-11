@@ -143,6 +143,33 @@ class Pool:
         return fut
 
 
+class Inline:
+    """Pool's interface over one scoring thread in this process (--workers 0): for a machine whose spawned processes
+    cannot hold the model (the Mac's memory ledger caps a spawned child at 2 GiB)."""
+
+    def __init__(self, args: tuple, target=None):
+        self.inbox, self.out = queue.Queue(), queue.Queue()
+        self.ids, self.waiting, self.lock = itertools.count(), {}, threading.Lock()
+        self.procs = [threading.Thread(target=target or work, args=(*args, self.inbox, self.out), daemon=True)]
+        self.procs[0].start()
+        threading.Thread(target=self.collect, daemon=True).start()
+
+    def collect(self) -> None:
+        while True:
+            rid, scores, err = self.out.get()
+            with self.lock:
+                fut = self.waiting.pop(rid, None)
+            if fut is not None:
+                fut.set_exception(RuntimeError(err)) if err else fut.set_result(scores)
+
+    def submit(self, req: dict) -> Future:
+        fut, rid = Future(), next(self.ids)
+        with self.lock:
+            self.waiting[rid] = fut
+        self.inbox.put((rid, req))
+        return fut
+
+
 def serve(pool: Pool, host: str, port: int, name: str) -> None:
     """POST /score and GET /health over a Pool, until killed."""
 

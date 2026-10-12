@@ -49,6 +49,6 @@ python -B goal_eval.py score --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b -
 RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=16 RP_MIN_RAM_GB=16 \
   experiments/infra/runpod/rp-run $RN "$GPU" 1.5 -- bash -c "$CMD" > "$F/rp_score.log" 2>&1
 [ -s "$O/score.json" ] || { echo "no scores: $O/score.log, $F/rp_score.log"; exit 1; }
-{ cat "$G/README.txt" 2> /dev/null; /usr/bin/python3 -I experiments/oracle/teacher_gate.py "$O/score.json" a b; } | tee "$O/gate.txt"
+{ cat "$G/README.txt" 2> /dev/null; /usr/bin/python3 -I experiments/oracle/teacher_gate.py "$O/score.json" a b --teacher "${dirs[0]}" "${dirs[1]}"; } | tee "$O/gate.txt"
 exit
 }

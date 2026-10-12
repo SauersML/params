@@ -2402,7 +2402,13 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
     if labels:
         groups |= {"local": True, "non-local": False}
     for group, want in groups.items():
-        report[group] = _report(per, base, e1, labels, want, base_terms)
+        try:  # the scored answers come back even if a figure fails (the scores are the hour's work)
+            report[group] = _report(per, base, e1, labels, want, base_terms)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+
+            log(traceback.format_exc(), flush=True)
+            report[group] = {"error": repr(e)}
     return {"report": report, "per_question": per, "baselines": base, "baseline_terms": base_terms}
 
 
@@ -2452,7 +2458,11 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, b
             pairs = [(q["samples"][0].get("term_E2") or 0.0, other[q["task"]].get("term_E2") or 0.0) for q in qs if q["task"] in other]
             if pairs:
                 report[name]["E2 circuit-ablation delta (with - without circuit)"] = _paired([a for a, _ in pairs], [b for _, b in pairs])
-        vs_vpd = lambda x, q: (x.get("term_C") or 0.0) > ((base_terms or {}).get(q["task"], {}).get(f"vpd@{x.get('nodes')}") or {}).get("C", float("inf"))  # noqa: E731
+        vpd = lambda x, q, k: ((base_terms or {}).get(q["task"], {}).get(f"vpd@{x.get('nodes')}") or {}).get(k)  # noqa: E731
+        vs_vpd = lambda x, q: vpd(x, q, "C") is not None and (x.get("term_C") or 0.0) > vpd(x, q, "C")  # noqa: E731
+        report[name]["phi beats VPD@matched: first sample"] = sum(
+            q["samples"][0]["valid"] and vpd(q["samples"][0], q, "phi") is not None and q["samples"][0].get("phi") is not None
+            and q["samples"][0]["phi"] > vpd(q["samples"][0], q, "phi") for q in qs) / max(len(qs), 1)
         report[name]["C, best of N"] = sum(max((x.get("term_C") or 0.0) if x["valid"] else 0.0 for x in q["samples"]) for q in qs) / max(len(qs), 1)
         report[name]["C beats VPD@matched: first sample"] = sum(q["samples"][0]["valid"] and vs_vpd(q["samples"][0], q) for q in qs) / max(len(qs), 1)
         report[name]["C beats VPD@matched: any sample"] = sum(any(x["valid"] and vs_vpd(x, q) for x in q["samples"]) for q in qs) / max(len(qs), 1)

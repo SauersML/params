@@ -41,7 +41,7 @@ def main():
     flips = sorted({int(m) for r in rows for m in (r.get("f1_flips_c") or r.get("f1_flips_omitted") or {})})
     nflips = sorted({int(m) for r in rows for m in r.get("n_real_flips", {})})
     plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
-    fig, axes = plt.subplots(len(kinds), 2, figsize=(14, 3.6 * len(kinds)), facecolor="white", squeeze=False)
+    fig, axes = plt.subplots(len(kinds), 2, figsize=(15.5, 3.6 * len(kinds)), facecolor="white", squeeze=False)
     panels = [("f1_flips_c", [0] + flips, "s_point_c", "extra subcomponents switched on (m)", "F1 against VPD's answer"),
               ("n_real_flips", nflips, None, "other subcomponents removed from the model (m)", "N in the real model")]
     for row, kd in zip(axes, kinds):
@@ -52,7 +52,7 @@ def main():
         for ax, (key, xs, start, xlabel, ylabel) in zip(row, panels):
             p = np.arange(len(xs))
             labels = []
-            for rs, color, name in ((mine, KIND, f"{kd.replace('_', ' ')}: {nodes:.0f} nodes, {pos:.0f} positions"),
+            for rs, color, name in ((mine, KIND, f"{kd.replace('_', ' ')}: {nodes:.0f} nodes, {pos:.0f} position{'' if round(pos) == 1 else 's'}"),
                                     (vpd, VPD, "VPD's top k, same sizes")):
                 k = key if (key != "f1_flips_c" or any(r.get("f1_flips_c") for r in rs)) else "f1_flips_omitted"
                 s0 = start if (start != "s_point_c" or any("s_point_c" in r for r in rs)) else "s_point"

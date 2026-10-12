@@ -1146,10 +1146,10 @@ def test_fidelity_reward_mode_is_the_full_modes_training_family(tiny):
         for key in ("s_point", "s_nodes", "s_edges", "reads_nodes", "reads_edges", "dreads_nodes", "dreads_edges",
                     "s_changed", "s_track", "s_interchange", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "c"):
             assert (a[key] is None) == (b[key] is None) and (a[key] is None or abs(a[key] - b[key]) < 1e-6), key
-        keys = ("s_point_c", "s_nodes", "s_edges", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far")
+        keys = ("s_point_c", "s_nodes", "s_edges", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "s_pattern")
         terms = [b[k] for k in keys if b[k] is not None] + [b["f1_flips_c"][goal_eval.FLIP_TERM]]
-        assert len(terms) == 8 and len(b["c_terms"]) == 8
-        assert abs(b["c"] - (0.0 if min(terms) == 0 else 8 / sum(1 / t for t in terms))) < 1e-9
+        assert len(terms) == len(b["c_terms"]) >= 8
+        assert abs(b["c"] - (0.0 if min(terms) == 0 else len(terms) / sum(1 / t for t in terms))) < 1e-9
         assert b["draws_donor_far"] and all(d[0].startswith("search") for d in b["draws_donor_far"])  # training-side donors
         assert all(d[0].startswith("eval") for d in e["draws_donor_far"])
         assert not {tuple(d[0]) for d in e["draws_donor_near"]} & {tuple(d[0]) for d in b["draws_donor_near"]}
@@ -1590,6 +1590,46 @@ def test_line_effects(tiny):
     assert abs(nd["delta_kl"] - num / den) < 1e-4 + 1e-4 * abs(num / den), (nd["delta_kl"], num / den)
     assert len(rp["token_edges"]) == len(g.tok_edges)
 
+
+def test_reward_v3_helpers(tiny):
+    """phi: -log2(r) when every family has 1 - s + eps = r, the empty circuit below VPD's answer, phi_tau the lower of
+    the start's and every family at 0.9; eps_<family> from the row's draws alone (at least the floor, the floor for a
+    family scored in one run); compact; a block is never cheaper than listing its active parts; n_vpd_k."""
+    nat, ge, tx = tiny
+    r = 0.3
+    row = {"s_point_c": 0.75, "s_nodes": 0.75, "f1_flips_c": {str(goal_eval.FLIP_TERM): 0.75}, "n_point": 0.75,
+           **{f"eps_{f}": 0.05 for f in goal_eval.PHI_FAMILIES}}
+    got, tau = goal_eval.phi(row)
+    assert abs(got - (-math.log2(r))) < 1e-12 and abs(tau - (-math.log2(0.15))) < 1e-12
+    assert goal_eval.phi(row, start=1.0)[1] == 1.0
+    pool = tiny_pool(nat, tx.ids)
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    empty, vpd = ge.fidelity(tx, [native.Graph(), native.Graph(masks=tx.vpd)], pool, draws=4, steps=2, restarts=2,
+                             interchange=4, changed=4, mode="reward")
+    assert goal_eval.phi(empty)[0] < goal_eval.phi(vpd)[0]
+    for f in goal_eval.PHI_FAMILIES:
+        assert vpd[f"eps_{f}"] >= goal_eval.EPS_FLOOR
+    assert vpd["eps_point"] == vpd["eps_flips"] == vpd["eps_N"] == goal_eval.EPS_FLOOR
+    assert goal_eval.family_eps(vpd) == {f: vpd[f"eps_{f}"] for f in goal_eval.PHI_FAMILIES}  # from the row alone
+    assert len(vpd["draws_nodes"]) == 4 and len(vpd["draws_edges"]) == 4 and vpd["draws_point"]
+    assert goal_eval.compact(100.0, 400.0) == 2.0 and goal_eval.compact(0.0, 400.0) is None
+    P, S = max(tx.targets) + 1, sum(nat.C.values())
+    for n in nat.names:
+        for t in range(tx.T):
+            parts = [(n, t, c) for c in tx.vpd[n][t].nonzero().flatten().tolist()]
+            if parts:
+                blk = native.Graph([(n, t, goal_eval.BLOCK)], {}, [])
+                blk.stranded, blk.stranded_bits = [], 0.0
+                lst = native.Graph(parts, {}, [])
+                lst.stranded, lst.stranded_bits = [], 0.0
+                assert goal_eval.size_bits(blk, P, S, tx.targets, active=tx.vpd) >= goal_eval.size_bits(lst, P, S, tx.targets)
+    b = ge.vpd_baseline(tx, 3, pool)
+    assert b["n_vpd_k"] is not None
+    t = ge.tau(tx, pool)  # the start set's bar and bits, kept on the text
+    st = ge.start_set(tx)
+    assert t["nodes_start"] == st["graph"].count() and t["bits_start"] > 0 and t["phi_tau"] <= t["phi_start"] + 1e-12
+    assert ge.tau(tx, pool) is t
+
 def test_block_nodes(tiny):
     """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
     stranded by the same rules as a subcomponent of its site, and run by C's families as every subcomponent of the
@@ -1607,8 +1647,11 @@ def test_block_nodes(tiny):
     P, S = max(tx.targets) + 1, sum(nat.C.values())
     plain = native.Graph([(o1, 11, 0), ("h.1.attn.q_proj", 11, 0), (d0, 11, 0)], {("h.1.attn.q_proj", 11, 0): [(d0, 11, 0)]}, [(o1, 11, 0)])
     plain.tok_edges, plain.tok_positions = list(g.tok_edges), list(g.tok_positions)
-    diff = goal_eval.size_bits(g, P, S, tx.targets) - goal_eval.size_bits(plain, P, S, tx.targets)
-    want = 2 * (math.log2(P * goal_eval.VPD4L_SITES) - math.log2(P * S)) + math.log2(3 + 1)  # blocks; the edge into the prediction
+    diff = goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd) - goal_eval.size_bits(plain, P, S, tx.targets)
+    held = int(tx.vpd[o1][11].sum()) + int(tx.vpd["h.1.attn.q_proj"][11].sum())  # the blocks' active contents
+    want = 2 * (math.log2(P * goal_eval.VPD4L_SITES) - math.log2(P * S)) + math.log2(3 + 1) + held * math.log2(P * S)
+    with pytest.raises(ValueError):
+        goal_eval.size_bits(g, P, S, tx.targets)  # a block's price needs the text's active parts
     assert abs(diff - want) < 1e-9, (diff, want)
     ex = goal_eval.expand_blocks(g, nat.C)
     assert set(ex.node_set()) == {(o1, 11, c) for c in range(nat.C[o1])} | {("h.1.attn.q_proj", 11, c) for c in range(nat.C["h.1.attn.q_proj"])} | {(d0, 11, 0)}
@@ -1730,7 +1773,7 @@ def test_c_takes_the_lower_of_graph_and_every_connection(tiny):
         assert abs(f - goal_eval._fid(e0, kc, row["kl_flips_omitted"][m][1])) < 1e-6
         assert row["f1_flips_c"][m] == min(row["f1_flips_omitted"][m], f)
     terms = [row["s_point_c"], row["s_nodes"], row["s_edges"], row["f1_flips_c"][goal_eval.FLIP_TERM]]
-    terms += [row[k] for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far") if row[k] is not None]
+    terms += [row[k] for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "s_pattern") if row[k] is not None]
     assert row["c"] == goal_eval._harmonic(terms)
 
 

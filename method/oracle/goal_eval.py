@@ -299,7 +299,8 @@ def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
     P, S = max(targets) + 1, sum(C.values())
     g.stranded_bits = 0.0
     kept.stranded, kept.stranded_bits = gone, 0.0
-    kept.stranded_bits = size_bits(g, P, S, targets) - size_bits(kept, P, S, targets)
+    kept.stranded_bits = size_bits(g, P, S, targets, _contents=False) - size_bits(kept, P, S, targets, _contents=False)
+    # (a stranded block's contents: size_bits, from kept.stranded, with the text's active parts)
     return kept
 
 
@@ -391,13 +392,23 @@ def size_term(bits: float, scale: float) -> float:
     return min(1.0, math.log2(1.0 + bits) / math.log2(1.0 + scale)) if scale and scale > 0 else 0.0
 
 
-def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list[int]) -> float:
-    """native.Graph.bits with the answer's embedding nodes: each a choice among the positions, and every edge's ends
-    indexed among all the listed nodes (embedding nodes included), an embedding edge priced like any other; and the
-    stated query-key pairs (_pair_bits)."""
+def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list[int], active: dict | None = None,
+              _contents: bool = True) -> float:
+    """An answer's description bits, raw (the lead's 10-12: no scale): native.Graph.bits with the answer's embedding
+    nodes (each a choice among the positions, every edge's ends indexed among all the listed nodes, an embedding edge
+    priced like any other), the stated query-key pairs (_pair_bits), and each block node (BLOCK) at what naming its
+    contents would cost: its name among sites and positions plus, per subcomponent of its site VPD's answer has on at
+    its position (active: {site: bool [T, C]}, the text's), a subcomponent's bits, so a block is never cheaper than
+    listing its active parts (the lead's 10-12) and is worth it only where faithfulness needs it. A graph with blocks
+    needs active."""
     extra = getattr(g, "stranded_bits", 0.0) + _pair_bits(g)  # stranded nodes (strand): dropped, their bits still charged
-    blocks = sum(1 for nd in (g.node_set() if not g.complete else ()) if nd[2] == BLOCK)
-    extra += blocks * (math.log2(positions * VPD4L_SITES) - math.log2(positions * subcomponents))  # named among sites, not parts
+    blocks = [nd for nd in (g.node_set() if not g.complete else ()) if nd[2] == BLOCK]
+    extra += len(blocks) * (math.log2(positions * VPD4L_SITES) - math.log2(positions * subcomponents))  # named among sites
+    if _contents:
+        held = blocks + [nd for nd in getattr(g, "stranded", []) if nd[2] == BLOCK]
+        if held and active is None:
+            raise ValueError("a graph with block nodes is priced at its blocks' active contents: pass active (the text's VPD answer)")
+        extra += sum(int(active[n][t].sum()) for n, t, _ in held) * math.log2(positions * subcomponents)
     if getattr(g, "tok_out", None):  # an embedding into the prediction priced like an edge into it: its writer named
         extra += len(g.tok_out) * math.log2(g.count() + len(set(getattr(g, "tok_positions", [])) | set(g.tok_out)))
     pos = sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in getattr(g, "tok_edges", [])})
@@ -451,6 +462,91 @@ def _c_rl(terms: list) -> float | None:
     if not terms:
         return None
     return _harmonic(terms) if min(terms) > 0 else min(terms)
+
+
+PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the score pools its draws, the draws' key
+    "point": ("s_point_c", None, None), "nodes": ("s_nodes", "mean", "draws_nodes"), "edges": ("s_edges", "mean", "draws_edges"),
+    "flips": ("f1_flips_c", None, None), "track_pp": ("s_track_pp", "weighted", "draws_track_pp"),
+    "interchange_pp": ("s_interchange_pp", "weighted", "draws_interchange_pp"),
+    "donors_near": ("s_donor_near", "donor", "draws_donor_near"), "donors_far": ("s_donor_far", "donor", "draws_donor_far"),
+    "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_point", None, None)}
+EPS_FLOOR = 0.005  # eps's floor
+EPS_BOOT = 200  # eps's bootstrap resamples
+
+
+def family_score(row: dict, family: str) -> float | None:
+    """A row's score for one of phi's families (PHI_FAMILIES): flips at FLIP_TERM."""
+    key = PHI_FAMILIES[family][0]
+    if key == "f1_flips_c":
+        fc = row.get("f1_flips_c") or {}
+        return fc.get(str(FLIP_TERM), fc.get(FLIP_TERM))
+    return row.get(key)
+
+
+def _pooled(kind: str, draws: list, e0: float | None) -> float | None:
+    """A family's score from some of its draws, as the family pools them: "mean" on the mean KLs ([KL_C, KL_VPD] each,
+    against KL_empty e0), "weighted" per draw against its bound W ([prompt, KL_C, KL_VPD, W]) pooled by W, "donor" on
+    the mean KLs against the mean keep-nothing KL ([donor, KL_C, KL_VPD, KL_0, score])."""
+    if not draws:
+        return None
+    if kind == "mean":
+        return None if e0 is None else _fid(e0, float(np.mean([d[0] for d in draws])), float(np.mean([d[1] for d in draws])))
+    if kind == "donor":
+        return _fid(float(np.mean([d[3] for d in draws])), float(np.mean([d[1] for d in draws])), float(np.mean([d[2] for d in draws])))
+    num = den = 0.0
+    for d in draws:
+        sd = _fid(d[3], d[1], d[2])
+        if sd is not None:
+            num, den = num + d[3] * sd, den + d[3]
+    return num / den if den > 0 else None
+
+
+def family_eps(row: dict) -> dict:
+    """eps_<family> for phi (the lead's reward v3): twice the bootstrap standard error of each family's score over its
+    draws in the row (EPS_BOOT resamples, a fixed seed: the same from the row alone), at least EPS_FLOOR; a family
+    scored in one run (point, flips, N) the floor."""
+    rng = np.random.default_rng(0)
+    out = {}
+    for fam, (_, kind, key) in PHI_FAMILIES.items():
+        draws = row.get(key) if key else None
+        if not kind or not draws or len(draws) < 2:
+            out[fam] = EPS_FLOOR
+            continue
+        got = [_pooled(kind, [draws[i] for i in rng.integers(len(draws), size=len(draws))], row.get("kl_empty_live"))
+               for _ in range(EPS_BOOT)]
+        got = [x for x in got if x is not None]
+        out[fam] = max(EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else EPS_FLOOR
+    return out
+
+
+def _phi(scores: list) -> float | None:
+    """-log2 of the power-4 mean of (1 - s + eps) over (s, eps) pairs."""
+    if not scores:
+        return None
+    return -math.log2(float(np.mean([(1 - s_ + e_) ** 4 for s_, e_ in scores])) ** 0.25)
+
+
+def phi(row: dict, start: float | dict | None = None) -> tuple:
+    """(phi, phi_tau) of a row (the lead's reward v3): phi = -log2((mean_i (1 - s_i + eps_i)^4)^(1/4)) over the
+    families scored on the text (PHI_FAMILIES: point, nodes, edges, flips, track_pp, interchange_pp, donors near and
+    far, pattern, N), eps_i the row's eps_<family> (family_eps when absent); phi_tau = min(phi_start, the phi with
+    every family at 0.9), phi_start the start set's (start: its phi or its row; else the row's phi_start). From the
+    row's fields alone."""
+    eps = {f: row[f"eps_{f}"] for f in PHI_FAMILIES if row.get(f"eps_{f}") is not None}
+    if len(eps) < len(PHI_FAMILIES):
+        eps = {**family_eps(row), **eps}
+    fams = [f for f in PHI_FAMILIES if family_score(row, f) is not None]
+    got = _phi([(family_score(row, f), eps[f]) for f in fams])
+    at9 = _phi([(0.9, eps[f]) for f in fams])
+    ps = start if not isinstance(start, dict) else phi(start)[0]
+    ps = row.get("phi_start") if ps is None else ps
+    return got, (at9 if ps is None or at9 is None else min(ps, at9))
+
+
+def compact(bits: float, bits_start: float) -> float | None:
+    """The reward's compactness (the lead's v3): log2(bits_start / bits), raw description bits (size_bits, blocks at
+    their active contents) against the start set's."""
+    return None if not bits or bits <= 0 or not bits_start or bits_start <= 0 else math.log2(bits_start / bits)
 
 
 def _harmonic(terms: list) -> float | None:
@@ -1020,7 +1116,7 @@ class GoalEval:
             native.free(self.nat.dev)
             c_, v_ = float(np.mean(kc)), float(np.mean(kv))
             out.append({"s_pattern": _fid(e0, c_, v_), "s_pattern_raw": _fid_raw(e0, c_, v_), "kl_pattern_c": c_,
-                        "kl_pattern_vpd": v_, "reads_pattern": len(reads)})
+                        "kl_pattern_vpd": v_, "reads_pattern": len(reads), "draws_pattern": [list(x) for x in zip(kc, kv)]})
         return out
 
     @torch.no_grad()
@@ -1783,7 +1879,7 @@ class GoalEval:
         chg = self.changed_inputs(tx, graphs, split, changed) if changed else none
         tpp = self.track_pp(tx, pp_graphs, split, changed) if changed else none
         ipp = self.interchange_pp(tx, pp_graphs, split, interchange) if interchange else none
-        pat = self.pattern_family(tx, graphs) if pattern else none  # s_pattern: a column beside s_point_c for now
+        pat = self.pattern_family(tx, graphs) if pattern else none  # s_pattern: C's true-pattern family
         dns = self.donors(tx, graphs, split, near_donors, self.far_donors(tx, self.far_pool(split), far_donors) if far_donors else None) \
             if (near_donors or far_donors) else none
         nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real and not reward else none
@@ -1815,7 +1911,7 @@ class GoalEval:
             row.update(pat[i])
             row.update(dns[i])
             named = [(k, row.get(k)) for k in ("s_point_c", "s_nodes", "s_edges")] + [("f1_flips_c", fc.get(FLIP_TERM))]
-            named += [(k, row.get(k)) for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far")]
+            named += [(k, row.get(k)) for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "s_pattern")]
             row["c_terms"] = [k for k, v in named if v is not None]  # a family with nothing scored on the text is left out
             row["c"] = _harmonic([v for _, v in named if v is not None])
             if reward:  # the terms without the floor at 0 and C_rl, for RL's ranking within a group (the lead's 10-12)
@@ -1828,7 +1924,8 @@ class GoalEval:
                        "s_edges": _fid_raw(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
                        "f1_flips_c": min(x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None)
                        if kfl else None,
-                       "s_track_pp": row.get("s_track_pp_raw"), "s_interchange_pp": row.get("s_interchange_pp_raw")}
+                       "s_track_pp": row.get("s_track_pp_raw"), "s_interchange_pp": row.get("s_interchange_pp_raw"),
+                       "s_pattern": row.get("s_pattern_raw")}
                 for pool_ in ("near", "far"):
                     k3 = row.get(f"kl_donor_{pool_}")
                     raw[f"s_donor_{pool_}"] = _fid_raw(k3[2], k3[0], k3[1]) if k3 else None
@@ -1837,6 +1934,9 @@ class GoalEval:
                 if baseline:
                     row.update(self.vpd_baseline(tx, g.count(), pool, split))
             row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") else None
+            row["kl_empty_live"], row["kl_vpd_live"] = e0, self._bounds(tx, "live")[1]  # (phi's eps from the row alone)
+            row["draws_point"] = [[pt["kl_live"], row["kl_vpd_live"]]]
+            row.update({f"eps_{f}": v for f, v in family_eps(row).items()})
             if not reward:  # (the reward's flips stop at FLIP_TERM)
                 half = 0.5 * row["s_point_c"] if row["s_point_c"] is not None else None
                 broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
@@ -2123,6 +2223,7 @@ class GoalEval:
                     if nd not in set(d):
                         pairs.setdefault(nd, []).append((rm[nd][b], rc[nd][b]))
             out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean()),
+                        "draws_nodes": [list(x) for x in zip(carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist())],
                         "reads_nodes": _read_error(pairs) if reads else None, "_pairs_nodes": pairs})
             native.free(dev)
         return out
@@ -2144,7 +2245,8 @@ class GoalEval:
                 continue
             got = sides(g, cuts=cuts, reads=reads)
             lm, lv, lc = got[:3]
-            row = {"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean()), "reads_edges": None}
+            row = {"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean()), "reads_edges": None,
+                   "draws_edges": [list(x) for x in zip(carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist())]}
             if reads:  # the circuit nodes' reads under each draw, model and circuit
                 rm, rc = got[3], got[4]
                 pairs = {nd: list(zip(rm[nd].tolist(), rc[nd].tolist())) for nd in rm}
@@ -2472,7 +2574,7 @@ class GoalEval:
         except Exception:  # no causal-importance network and no saved order
             order = None
         if not order:
-            return {"c_vpd_k": None, "c_rl_vpd_k": None}
+            return {"c_vpd_k": None, "c_rl_vpd_k": None, "n_vpd_k": None}
         k = max(1, min(int(k), len(order)))
         lo = 1 << (k.bit_length() - 1)
         hi = min(len(order), lo if lo == k else lo << 1)
@@ -2481,13 +2583,53 @@ class GoalEval:
         def at(n):
             if (n, split) not in kept:
                 r = self.fidelity(tx, [native.Graph(order[:n], complete=True)], pool, mode="reward", split=split)[0]
-                kept[(n, split)] = (r["c"], r["c_rl"])
+                kept[(n, split)] = (r["c"], r["c_rl"], r["n_point"])
             return kept[(n, split)]
 
         a, b = at(lo), at(hi)
         f = 0.0 if hi == lo else (math.log2(k) - math.log2(lo)) / (math.log2(hi) - math.log2(lo))
         mix = lambda x, y: None if x is None or y is None else x + f * (y - x)  # noqa: E731
-        return {"c_vpd_k": mix(a[0], b[0]), "c_rl_vpd_k": mix(a[1], b[1])}
+        return {"c_vpd_k": mix(a[0], b[0]), "c_rl_vpd_k": mix(a[1], b[1]), "n_vpd_k": mix(a[2], b[2])}
+
+    def start_set(self, tx: Text, split: str = "search", floor: float = 0.9, draws: int = CHANGED_DRAWS) -> dict:
+        """The influential start set (the lead's 10-12, the new teacher's start): VPD's actives at the targets and the m
+        most influential positions (F2's, the probe's moved), every connection (a node set), m the smallest whose
+        s_track_pp on split reaches floor (all of F2's positions when none does); kept on tx. {graph, m, positions,
+        s_track_pp}."""
+        kept = tx.__dict__.setdefault("_start", {})
+        if (split, floor) in kept:
+            return kept[(split, floor)]
+        nat = self.nat
+        moved = np.asarray(tx.moved, dtype=float)
+        f2 = sorted((q for q, _ in tx.f2), key=lambda q: -moved[q - 1])
+        act = [(n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()]
+        for m in range(len(f2) + 1):
+            ps = set(tx.targets) | set(f2[:m])
+            g = native.Graph(sorted(nd for nd in act if nd[1] in ps), complete=True)
+            sc = self.track_pp(tx, [g], split, draws)[0]["s_track_pp"]
+            if sc is not None and sc >= floor:
+                break
+        kept[(split, floor)] = {"graph": g, "m": m, "positions": sorted(ps), "s_track_pp": sc}
+        return kept[(split, floor)]
+
+    def tau(self, tx: Text, pool: dict | None, split: str = "search") -> dict:
+        """The reward's per-text bar and start bits (the lead's 10-12, constrained form: faithful first, then small),
+        kept on tx: the influential start set's (start_set) reward-mode row on split, phi_start and phi_tau (phi: the
+        lower of the start's phi and every family at 0.9), c_start and c_rl_start (and tau = min(0.9, c_rl_start), the
+        earlier form), bits_start (its raw description bits, size_bits), and the start's m, nodes and positions."""
+        kept = tx.__dict__.setdefault("_tau", {})
+        if split in kept:
+            return kept[split]
+        st = self.start_set(tx, split)
+        row = self.fidelity(tx, [st["graph"]], pool, mode="reward", split=split)[0]
+        nat = self.nat
+        ph, pt = phi(row)
+        kept[split] = {"phi_start": ph, "phi_tau": min(ph, pt) if ph is not None and pt is not None else pt,
+                       "c_start": row["c"], "c_rl_start": row["c_rl"],
+                       "tau": min(0.9, row["c_rl"]) if row["c_rl"] is not None else None,
+                       "bits_start": size_bits(st["graph"], nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd),
+                       "m_start": st["m"], "nodes_start": st["graph"].count(), "positions_start": len(st["positions"])}
+        return kept[split]
 
     def far_pool(self, split: str) -> list:
         """The far donors' texts of a split, [(name, token ids)] (DONOR_POOLS) in the model's vocabulary, loaded once."""
@@ -3164,7 +3306,7 @@ class GoalEval:
         scale = self.size_scale(tx)
         for b, (g, row) in enumerate(zip(graphs, rows)):
             st, un = f3[b]["stated"], f3[b]["unstated"]
-            bits = size_bits(g, nat.positions(tx.targets), total, tx.targets)
+            bits = size_bits(g, nat.positions(tx.targets), total, tx.targets, active=tx.vpd)
             row.update({"nodes": g.count(), "stranded": len(g.stranded), "edges": None if g.complete else g.edges(),
                         "tok_edges": len(getattr(g, "tok_edges", [])),
                         "bits": bits, "size": size_term(bits, scale),
@@ -3449,7 +3591,8 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             with open(out, "a") as fh:
                 for kind, g, c, i, d, a, b in zip(kinds, graphs, ch, it, dn, tp, ip):
                     row = {"task": p.stem, "kind": kind, "nodes": g.count(),
-                           "size": size_term(size_bits(g, nat.positions(targets), sum(nat.C.values()), targets), scale),
+                           "size_bits": size_bits(g, nat.positions(targets), sum(nat.C.values()), targets, active=tx.vpd),
+                           "size_scale": scale,  # (informational: VPD's nodes alone, no connections)
                            **{k: c[k] for k in ("s_changed", "s_track", "context_share", "prompts_changed", "prompts_track") if k in c}}
                     if i:
                         row["s_interchange"] = _fid(e, i["kl_interchange_c"], i["kl_interchange_vpd"])
@@ -3469,10 +3612,10 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
         scale = ge.size_scale(tx)
         with open(out, "a") as fh:
             for kind, g, f in zip(kinds, graphs, fid):
-                bits = size_bits(g, nat.positions(targets), sum(nat.C.values()), targets)
+                bits = size_bits(g, nat.positions(targets), sum(nat.C.values()), targets, active=tx.vpd)
                 row = {"task": p.stem, "local": local.get(p.stem), "kind": kind, "nodes": g.count(),
                        "positions": len({t for _, t, _ in g.node_set()}), "stranded": len(getattr(g, "stranded", [])),
-                       "edges": None if g.complete else g.edges(), "size": size_term(bits, scale), "kl_empty": e, "kl_vpd": v,
+                       "edges": None if g.complete else g.edges(), "size_bits": bits, "size_scale": scale, "kl_empty": e, "kl_vpd": v,
                        "n_real_ceiling": ceiling, "cancel_cosine": cancel["cosine"], **f}
                 rows.append(row)
                 fh.write(json.dumps(row) + "\n")
@@ -3554,7 +3697,7 @@ def fidelity_table(rows: list[dict]) -> str:
     stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
     sample = [("stranded nodes", lambda r: r.get("stranded")), ("F1", lambda r: r["s_point"]), ("F1 every connection", lambda r: r.get("s_wiring")),
               ("reliance on cuts", lambda r: r.get("reliance_on_cuts")),
-              ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
+              ("N", lambda r: r["n_point"]), ("size bits", lambda r: r.get("size_bits", r.get("size")))]
     return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),
                           block("The step adversary (VPD's published budget, steps)", stepcols),
                           block("In-sample (the searches optimized F1 and N on these texts)", sample)])

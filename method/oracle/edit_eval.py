@@ -55,6 +55,7 @@ Score (EditEval.score_many), in bits, on data the teacher's search never used:
   edit_eval.py tokens                                            HELD_ROWS and COPY's rows from the Pile (TOKENS)
   edit_eval.py table OUT.jsonl [COPY.json]                       the report's means
   edit_eval.py rescore OUT.jsonl NEW.jsonl                       teach rows' edits scored again by the current scorer
+  edit_eval.py rescore-copy COPY.json NEW.json                   the copy goal's paths re-chosen and scored again
 
 The edit teacher (teach()) is a measured greedy search over candidate edits from the teacher's circuits (goal_eval JSON
 files, TEACHER_DIRS) and VPD's most important subcomponents for net bits (goal_bits - collateral, what E3 compares):
@@ -1104,6 +1105,30 @@ def teach_copy(ee: EditEval, log=print, screen_n: int = 16) -> dict:
     return out
 
 
+def rescore_copy(ee: EditEval, res: dict, log=print) -> dict:
+    """A copy-goal result (teach_copy's) under the current definitions: each search path's steps measured on the
+    validation instances, the step with the most validation net chosen, scored on the second half with its
+    remove-not-hide check; the baselines scored again."""
+    goal = res["goal"]
+    first, _ = copy_instances()
+    fit = first[:COPY_FIT]
+    nodes = copy_nodes(ee, fit)
+    order = screen_local(ee, fit, [lambda t, nd=nd: scale_op((nd[0], t, nd[2]), 0.0) for nd in nodes], 16, SCREEN, log)
+    circuit = [nodes[i] for i in order][:16]
+    effects = lambda nds, base: copy_effects(ee, fit, nds, base)  # noqa: E731
+    before = effects(circuit, [])
+    for name in ("teacher", "units"):
+        steps = [[_from_json(o) for o in st["edit"]] for st in res[name]["path"]]
+        vrows = ee.score_many({"id": "copy"}, goal, steps, part="val")
+        k = int(np.argmax([v["net"] if v.get("valid") else -np.inf for v in vrows]))
+        res[name].update({"chosen": k, "validation": vrows, "score": ee.score_many({"id": "copy"}, goal, [steps[k]])[0],
+                          "check": removal_check(effects, circuit, before, steps[k])})
+        log(f"{name}: step {k + 1} chosen")
+    heads = [unit_op("head", 2, h, None, 0.0) for h in (2, 3, 4)]
+    res["l2_heads_2_4"]["score"] = ee.score_many({"id": "copy"}, goal, [heads])[0]
+    return res
+
+
 # ---- command line
 
 
@@ -1138,6 +1163,9 @@ def main():
     r = sub.add_parser("rescore")
     r.add_argument("rows")
     r.add_argument("out")
+    rc = sub.add_parser("rescore-copy")
+    rc.add_argument("copy")
+    rc.add_argument("out")
     b = sub.add_parser("table")
     b.add_argument("rows")
     b.add_argument("copy", nargs="?")
@@ -1183,6 +1211,9 @@ def main():
                         x["score"] = row
                 f.write(json.dumps(r) + "\n")
                 print(r["task"], r["goal"]["kind"], flush=True)
+    elif args.cmd == "rescore-copy":
+        Path(args.out).write_text(json.dumps(rescore_copy(ee, json.loads(Path(args.copy).read_text()),
+                                                          log=lambda m: print(m, flush=True)), indent=1))
     elif args.cmd == "copy":
         res = teach_copy(ee, log=lambda s: print(s, flush=True))
         Path(args.out).write_text(json.dumps(res, indent=1))

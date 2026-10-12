@@ -190,10 +190,10 @@ def test_empty_known_values(tiny):
     assert abs(f1["text_held"][0] - closed_empty(nat, tx, True)) < 1e-4
     assert abs(f1["text_ablated"][0] - closed_empty(nat, tx, False)) < 1e-4
     f2 = ge.interchange(tx, [native.Graph()])
-    assert abs(f2["share"][0] - f2["remainder_share"]) < 1e-6
-    # the remainder share from carry's dense masks, every subcomponent held
+    assert abs(f2["share"][0] - f2["bypass_share"]) < 1e-6
+    # the bypass share from carry's dense masks, every subcomponent held
     kl = sum(float(carry.Carry(nat, tx.ids, tx.targets, prompts).measure([set()])[0]) for _, prompts in tx.f2)
-    assert abs((1 - kl / f2["movement_bits"]) - f2["remainder_share"]) < 1e-5
+    assert abs((1 - kl / f2["movement_bits"]) - f2["bypass_share"]) < 1e-5
 
 
 def test_stated_every_connection_is_complete(tiny):
@@ -330,7 +330,7 @@ def test_real_texts(real, task):
     empty = rows[names.index("empty")]
     assert abs(empty["f1_text_held"] - closed_empty(nat, tx, True)) < 1e-3 * max(1, empty["f1_text_held"])
     assert abs(empty["f1_text_ablated"] - closed_empty(nat, tx, False)) < 1e-3 * max(1, empty["f1_text_ablated"])
-    assert abs(empty["f2_share"] - empty["remainder_share"]) < 1e-6
+    assert abs(empty["f2_share"] - empty["bypass_share"]) < 1e-6
     # two cuts against the independent forward
     g = graphs[-1] if len(graphs) > 1 else base[next(k for k in base if k.startswith("vpd@"))]
     pairs = goal_eval._pairs(g)[:2] if not g.complete else []

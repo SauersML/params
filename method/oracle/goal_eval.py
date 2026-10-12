@@ -19,8 +19,10 @@ bits; native.Native.run runs every intervention.
      there (carry.alternatives at ranks 3 to 5; the carry search uses 0 to 2) run with the circuit's subcomponents
      computing and every other activation held at its value on the text (carry.Carry; remainders compute). Its share
      carried: 1 - KL / movement, movement the KL with nothing held (the model on the changed prompt from the model on
-     the text), positions pooled by movement. The remainder share is the same with no subcomponent computing: what
-     VPD's remainders alone carry.
+     the text), positions pooled by movement. The bypass share is the same with no subcomponent computing: what VPD's
+     remainders carry and, at a changed target position, the changed token's own embedding, which the prediction
+     there reads directly (on held-out text9002 every position's bypass carries nothing except the target's, where it
+     moves the prediction 3% further than the change itself).
   F3 edges: each stated edge cut in the whole model on the text (path patching of that one connection: the reader
      recomputed without the writer's output and everything else as in the model, then the model run on from the
      reader's new activation), against random pairs of the circuit's nodes that the model connects and the answer does
@@ -255,7 +257,7 @@ class GoalEval:
     @torch.no_grad()
     def interchange(self, tx: Text, graphs: list[native.Graph]) -> dict:
         """Per graph, F2: its movement-pooled share carried and per position (position, movement bits, KL bits), and
-        the remainder share (nothing computing). Sets of at most UNIT_LIMIT subcomponents run through carry's
+        the bypass share (no subcomponent computing: the remainders and a changed target's embedding). Sets of at most UNIT_LIMIT subcomponents run through carry's
         subcomponent units (positions from the change on), larger ones as dense masks (carry's node masks); both
         hold every other activation at its value on the text."""
         nat, hi = self.nat, max(tx.targets)
@@ -298,7 +300,7 @@ class GoalEval:
                 rows[b].append((p, m, kls[b]))
             native.free(nat.dev)
         share = [None if moved <= 0 else 1 - sum(r[2] for r in rs) / moved for rs in rows]
-        return {"share": share, "positions": rows, "remainder_share": None if moved <= 0 else 1 - empty_kl / moved,
+        return {"share": share, "positions": rows, "bypass_share": None if moved <= 0 else 1 - empty_kl / moved,
                 "movement_bits": moved}
 
     # ---- F3
@@ -505,7 +507,7 @@ class GoalEval:
                    "f1_text_held": f1["text_held"][b], "f1_changed_held": f1["changed_held"][b],
                    "f1_text_ablated": f1["text_ablated"][b], "f1_changed_ablated": f1["changed_ablated"][b],
                    "f2_share": f2["share"][b], "f2_positions": [[p, m, k] for p, m, k in f2["positions"][b]],
-                   "remainder_share": f2["remainder_share"], "movement_bits": f2["movement_bits"],
+                   "bypass_share": f2["bypass_share"], "movement_bits": f2["movement_bits"],
                    "f3_stated": None if st is None else _mean(st), "f3_unstated": None if un is None else _mean(un),
                    "f3_auc": f3[b]["auc"], "f3_cuts": {"stated": st, "unstated": un}}
             for name, fn in self.hooks.items():
@@ -559,7 +561,7 @@ def load_answer(path: Path, task: dict, targets: list[int], nat: native.Native) 
 COLUMNS = [("nodes", "nodes", "{:.0f}"), ("edges", "edges", "{:.0f}"), ("bits", "size bits", "{:.0f}"),
            ("f1_text_held", "F1 text", "{:.3g}"), ("f1_changed_held", "F1 changed", "{:.3g}"),
            ("f1_text_ablated", "F1 text -rem", "{:.3g}"), ("f1_changed_ablated", "F1 chg -rem", "{:.3g}"),
-           ("f2_share", "F2 share", "{:.3f}"), ("remainder_share", "rem share", "{:.3f}"),
+           ("f2_share", "F2 share", "{:.3f}"), ("bypass_share", "bypass share", "{:.3f}"),
            ("f3_stated", "F3 stated", "{:.3g}"), ("f3_unstated", "F3 unstated", "{:.3g}"), ("f3_auc", "F3 AUC", "{:.3f}"),
            ("E1", "E1", "{:.3g}"), ("E2", "E2", "{:.3f}"), ("seconds_text", "s/text", "{:.1f}")]
 

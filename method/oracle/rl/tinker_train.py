@@ -144,19 +144,23 @@ def service_client():
 
 def sample(a) -> None:
     """N answers per question from a trained state (--init) or the base model alone, one sampling call per question:
-    {"task", "sample", "text", "finish", "tokens"} per answer."""
+    {"task", "sample", "text", "finish", "tokens"} per answer. --prefix: the answer starts with this text (its tokens
+    after the chat prompt; the written text holds it), e.g. "CIRCUIT:\nANSWER 1:" for answers without a circuit."""
     import tinker
     from tinker_cookbook import renderers
 
     a.out.parent.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.out.parent, a.base)
     service = service_client()
-    renderer, _ = renderer_for(a.base)
+    renderer, tokenizer = renderer_for(a.base)
     sampler = (service.create_training_client_from_state(a.init).save_weights_and_get_sampling_client() if a.init
                else service.create_sampling_client(base_model=a.base))
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=renderer.get_stop_sequences())
     questions = [json.loads(x) for x in a.questions.read_text().splitlines() if x.strip()][:a.n]
+    head = tokenizer.encode(a.prefix, add_special_tokens=False) if a.prefix else []
     futs = [(q, renderer.build_generation_prompt([{"role": "user", "content": q["question"]}])) for q in questions]
+    if head:
+        futs = [(q, prompt.append(tinker.types.EncodedTextChunk(tokens=head))) for q, prompt in futs]
     futs = [(q, prompt, sampler.sample(prompt=prompt, num_samples=a.samples, sampling_params=params)) for q, prompt in futs]
     with a.out.open("w") as f:
         for q, prompt, fut in futs:
@@ -165,7 +169,7 @@ def sample(a) -> None:
             spend.add("sample", prefill=prompt.length - hits, cached=hits + (a.samples - 1) * prompt.length,
                       sampled=sum(len(s.tokens) for s in res.sequences))
             for k, s in enumerate(res.sequences):
-                f.write(json.dumps({"task": q["task"], "sample": k, "text": renderers.get_text_content(renderer.parse_response(s.tokens)[0]),
+                f.write(json.dumps({"task": q["task"], "sample": k, "text": a.prefix + renderers.get_text_content(renderer.parse_response(s.tokens)[0]),
                                     "finish": str(s.stop_reason), "tokens": len(s.tokens)}) + "\n")
     print(json.dumps({"questions": len(questions), "samples": a.samples, "total_usd": spend.total}), flush=True)
 
@@ -499,6 +503,7 @@ def main():
     m.add_argument("--n", type=int, default=50, help="questions")
     m.add_argument("--samples", type=int, default=4)
     m.add_argument("--max-tokens", type=int, default=4096)
+    m.add_argument("--prefix", default="", help="the answer's opening text, given (an ablation's: \"CIRCUIT:\\nANSWER 1:\\n\")")
     e = sub.add_parser("readers")
     e.add_argument("samples", type=Path)
     e.add_argument("questions", type=Path)

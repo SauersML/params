@@ -1072,3 +1072,16 @@ def test_graph_ref_frozen_norms(tiny):
     live = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, less)))
     frozen = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, less, norms=dict(scales), freeze="layers")))
     assert abs(live - frozen) > 1e-3
+
+
+def test_cancellation_adds_up(tiny):
+    """The embedding, the actives' and inactives' sums and the remainders are the target's final stream."""
+    nat, ge, tx = tiny
+    r = ge.cancellation(tx)
+    tg, t = nat.target, tx.targets[-1]
+    rem = sum(tx.rem[n][0, t] for n in nat.names if n.endswith(("o_proj", "down_proj")))
+    act = sum((tx.rec[n][0, t] * tx.vpd[n][t].float()) @ tg.site(n).U for n in nat.names if n.endswith(("o_proj", "down_proj")))
+    ina = sum((tx.rec[n][0, t] * (~tx.vpd[n][t]).float()) @ tg.site(n).U for n in nat.names if n.endswith(("o_proj", "down_proj")))
+    final = ge.flow(tx)["final"][t]
+    assert float((tg.wte[tx.ids[t]] + act + ina + rem - final).norm()) < 1e-4 * float(final.norm())
+    assert abs(r["actives"] - float(act.norm())) < 1e-4 and -1 <= r["cosine"] <= 1

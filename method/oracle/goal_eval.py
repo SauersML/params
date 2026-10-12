@@ -454,6 +454,27 @@ class GoalEval:
             out.append(torch.log_softmax((hidden[:, targets] @ tg.wte.T).float(), -1))
         return torch.cat(out)
 
+    @torch.no_grad()
+    def cancellation(self, tx: Text) -> dict:
+        """VPD's description at the last target's final residual stream in the real model: the sums of the writes of
+        the subcomponents VPD's answer has on and of those it has off (every attention and MLP output matrix's,
+        rec x U), their norms beside the model's stream, and the cosine between the two sums (strongly negative: the
+        actives overshoot and the inactives cancel them, which caps the real model's necessity of any part of the
+        answer). The embedding, both sums and the remainders add up to the stream."""
+        nat, tg, t = self.nat, self.nat.target, tx.targets[-1]
+        act = torch.zeros(tg.wte.shape[1], device=nat.dev)
+        ina = torch.zeros_like(act)
+        for n in nat.names:
+            if n.endswith(("o_proj", "down_proj")):
+                a, on = tx.rec[n][0, t], tx.vpd[n][t].float()
+                act += (a * on) @ tg.site(n).U
+                ina += (a * (1 - on)) @ tg.site(n).U
+        final = self.flow(tx)["final"][t]
+        cos = torch.nn.functional.cosine_similarity
+        return {"actives": float(act.norm()), "inactives": float(ina.norm()), "model": float(final.norm()),
+                "cosine": float(cos(act, ina, dim=0)), "cos_actives_model": float(cos(act, final, dim=0)),
+                "cos_inactives_model": float(cos(ina, final, dim=0))}
+
     def size_scale(self, tx: Text) -> float | None:
         """The size term's denominator: the bits of naming every subcomponent of VPD's own answer (its actives at the
         positions that can reach the targets), each a choice among those positions and every subcomponent (an answer's
@@ -2008,12 +2029,15 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             kinds.append(f"VPD top {k}")
         fid = ge.fidelity(tx, graphs, M, draws=draws, curve=curve, fresh=F, interchange=interchange, real=True, reads=True)
         e, v = ge._bounds(tx, "live")
+        ceiling = ge.real_removal(tx, [native.Graph(masks=tx.vpd)])[0]["n_real_live"]  # VPD's whole answer removed
+        cancel = ge.cancellation(tx)
         scale = ge.size_scale(tx)
         with open(out, "a") as fh:
             for kind, g, f in zip(kinds, graphs, fid):
                 bits = size_bits(g, nat.positions(targets), sum(nat.C.values()), targets)
                 row = {"task": p.stem, "local": local.get(p.stem), "kind": kind, "nodes": g.count(),
-                       "edges": None if g.complete else g.edges(), "size": size_term(bits, scale), "kl_empty": e, "kl_vpd": v, **f}
+                       "edges": None if g.complete else g.edges(), "size": size_term(bits, scale), "kl_empty": e, "kl_vpd": v,
+                       "n_real_ceiling": ceiling, "cancel_cosine": cancel["cosine"], **f}
                 rows.append(row)
                 fh.write(json.dumps(row) + "\n")
         if log:
@@ -2030,7 +2054,9 @@ def fidelity_table(rows: list[dict]) -> str:
     """Means by locality group and circuit kind (each answer set; VPD top k at their sizes): tests the searches never
     optimized (flips-to-break, the omitted lever's flips, the node and connection families, interchange, the fresh
     pool's pattern lever, N_real and its flip adversary, C, the reads' response error, the remainder leak), the step
-    adversary's curve, and in-sample (labelled) F1, N and size. "trivial":
+    adversary's curve, and in-sample (labelled) F1, N and size. Beside N_real, its ceiling (VPD's whole answer removed
+    from the real model) and the cosine between the actives' and the inactives' sums at the target (cancellation inside
+    VPD's description caps N_real for any circuit: ~0.73 and -0.57 at the median on the 20 held-out texts). "trivial":
     texts whose empty circuit is within 2x of VPD's own KL."""
     def group(r):
         if r["kl_vpd"] is not None and r["kl_empty"] < 2 * r["kl_vpd"]:
@@ -2076,7 +2102,8 @@ def fidelity_table(rows: list[dict]) -> str:
     held += [("nodes fam", lambda r: r.get("s_nodes")), ("edges fam", lambda r: r.get("s_edges")),
              ("interchange", lambda r: r.get("s_interchange"))]
     held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
-    held += [("N_real", lambda r: r.get("n_real")), ("C", lambda r: r.get("c"))]
+    held += [("N_real", lambda r: r.get("n_real")), ("N_real ceiling", lambda r: r.get("n_real_ceiling")),
+             ("act/inact cos", lambda r: r.get("cancel_cosine")), ("C", lambda r: r.get("c"))]
     nflips = sorted({int(m) for r in rows for m in r.get("n_real_flips", {}) if int(m) > 0})
     held += [(f"N_real flip{m}", lambda r, m=m: _curve_value(r.get("n_real_flips"), m)) for m in nflips]
     held += [(f"response err {f}", lambda r, f=f: r.get(f"dreads_{f}")) for f in ("nodes", "edges", "interchange")]

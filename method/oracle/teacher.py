@@ -492,8 +492,7 @@ class Connector:
         accept, start = None, {}
         if self.robust is not None:                          # the robust objective: F1 under REPAIR_M flips of the stated
             def flips(ons):                                  # graph kept >= min(0.9, the start's), checked on admissible
-                graphs = [self.graph(on, [e for e, k_ in zip(ep.edges, row.tolist()) if k_]) for row in ons]   # prefixes only
-                got = self.ge.adversary_flips(self.tx, graphs, self.robust, "omitted", ms=(REPAIR_M,))
+                got = self.ge.edge_flips(self.tx, ep.graph, ons, self.robust, REPAIR_M)            # prefixes only
                 return [1.0 if g["f1_flips_omitted"].get(REPAIR_M) is None else g["f1_flips_omitted"][REPAIR_M] for g in got]
             start = {"f1_flips": flips(ep.on[None])[0]}
             floor = min(RECOVERED, start["f1_flips"])

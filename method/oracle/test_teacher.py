@@ -5,8 +5,8 @@ CUDA, and the products on the start set's subcomponents alone (Pruner._gather) w
 (Pruner.fused) match the products on all subcomponents with vpd_model's own steps within float32 rounding,
 EdgePruner's runs are the scorecard's (goal_eval.GoalEval.graph_kl: with every connection the masked run), and a
 teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, one
-over the answer budget steps to a smaller path point, the flip repair writes its pick, and the robust connection
-objective keeps F1 under the flips at its floor.
+over the answer budget steps to a smaller path point, the flip repair writes its best-scoring step, and Descent.prune's
+accept check admits exactly the largest passing prefix (a constructed case).
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -141,25 +141,44 @@ def test_repair_writes_its_pick():
     saved = torch.load(VPD_SAVED)["text9019"]
     circuits, row, _ = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True, repair_pool=torch.load(teacher.POOL))
     steps, j = row["repair"], row["repair_pick"]
-    ok = [i for i, s in enumerate(steps) if s["f1_rob"] >= teacher.RECOVERED and s["n"] >= teacher.RECOVERED]
     nodes = [nd for nd in circuits[""]["nodes"] if nd[0] != "tok"]
-    # the written circuit is the repair's pick: the smallest step meeting the goal, else the largest value; each step
-    # one more round of the omitted lever's flips, taken while the value rose
-    assert j == (min(ok, key=lambda i: steps[i]["size"]) if ok else max(range(len(steps)), key=lambda i: (steps[i]["value"], -steps[i]["size"])))
+    # the written circuit is the step with the best reward circuit score; each step one more round of the omitted
+    # lever's flips, taken while the score rose
+    assert j == max(range(len(steps)), key=lambda i: (steps[i]["score"], -steps[i]["size"]))
     assert len(nodes) == steps[j]["size"] and len(circuits[""]["edges"]) == steps[j]["edges"]
-    assert all(b["size"] > a["size"] and a["value"] < b["value"] for a, b in zip(steps[:-2], steps[1:-1]))
+    assert all(b["size"] > a["size"] and a["score"] < b["score"] for a, b in zip(steps[:-2], steps[1:-1]))
 
 
-@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
-def test_robust_connections_keep_their_floor():
-    if not VPD_SAVED.exists() or not teacher.POOL.exists():
-        pytest.skip("needs VPD's answers and the adversary's pool " + str(teacher.POOL))
-    ge = goal_eval.GoalEval(native.Native(DEVICE), chunk=32)
-    ids, targets = native.text(native.TEXTS / "vpd4l" / "text9019.json")
-    saved = torch.load(VPD_SAVED)["text9019"]
-    _, row, path_file = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True,
-                                      robust_pool=torch.load(teacher.POOL))
-    steps = path_file["edge_paths"][0]["steps"]
-    floor = min(teacher.RECOVERED, steps[0]["f1_flips"])
-    # every removal kept F1 under the flips at the floor, and the summary carries the last one's
-    assert all(s["f1_flips"] >= floor for s in steps[1:]) and row["best_edges"]["f1_flips"] == steps[-1]["f1_flips"]
+
+
+class Toy(teacher.Descent):
+    """Units with fixed weights: a set's KL is 0.1 plus the weights of the units it lacks."""
+
+    def __init__(self, w):
+        self.w, self.on, self.B, self.measured = torch.tensor(w), torch.ones(len(w), dtype=torch.bool), 4, 0
+
+    def kl_sets(self, ons):
+        return (0.1 + ((~ons).float() * self.w).sum(1)).tolist()
+
+    def blocks(self, level):
+        return list(self.on.nonzero().flatten().split(1))
+
+
+def test_accept_admits_exactly_the_passing_prefix():
+    # ranked by the KL a removal leaves: units 0, 1, 2, 3, ...; unit 3 is a guard the accept check refuses to lose (as
+    # the robust objective refuses a connection whose cut drops F1 under the flips below its floor). Budget 0.4: the
+    # prefixes 1, 2, 4, 5 are within it, 4 and 5 hold the guard, so round 1 admits 2 (units 0, 1); round 2 admits 1
+    # (unit 2), refusing 2 and 4; round 3 finds every prefix holding the guard and stops. Without the check, round 1
+    # would take 5 (units 0-4, the guard among them).
+    guard = 3
+    w = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.5, 0.6, 0.7, 0.8]
+
+    def accept(ons):
+        return [{"guard": True} if bool(on[guard]) else None for on in ons]
+    toy, log = Toy(w), []
+    toy.prune("unit", 0.4, log=log, accept=accept)
+    assert [x["removed"] for x in log] == [[0, 1], [2]] and all(x["guard"] for x in log)
+    assert toy.on.tolist() == [False, False, False] + [True] * 7
+    free = Toy(w)
+    free.prune("unit", 0.4, rounds=1)
+    assert free.on.tolist() == [False] * 5 + [True] * 5

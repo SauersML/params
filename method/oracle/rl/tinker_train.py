@@ -3,7 +3,7 @@ and trains on Tinker's servers; the reward is computed on this machine by rl/ser
 local GPU) over HTTP. Runs in ~/mpd-data/tinker-venv. The project comes from TINKER_PROJECT_ID (required: there is no
 default) and the key from TINKER_API_KEY (read from the Keychain at launch, never written anywhere).
 
-  tinker_train.py sft SFT.jsonl --log DIR [--base Qwen/Qwen3-8B] [--steps N] [--batch B] [--lr 1e-4] [--rank 32]
+  tinker_train.py sft SFT.jsonl --log DIR [--base Qwen/Qwen3-8B] [--steps N] [--batch B] [--lr LR] [--rank 32]
   tinker_train.py rl QUESTIONS.jsonl --log DIR --scorer http://127.0.0.1:8767/score [--init STATE_PATH] [--steps N]
                      [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5]
 
@@ -79,6 +79,10 @@ def sft(a) -> None:
     data = [conversation_to_datum(r["prompt"] + r["completion"], renderer, a.max_length, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
             for r in rows]
     rng = random.Random(a.seed)
+    if a.lr is None:
+        from tinker_cookbook.hyperparam_utils import get_lr
+
+        a.lr = get_lr(a.base)  # the cookbook's LoRA rate for the base (4.7e-4 for Qwen3-8B)
     for step in range(a.steps):
         t0 = time.time()
         batch = rng.sample(data, min(a.batch, len(data)))
@@ -137,6 +141,8 @@ def rl(a) -> None:
             rewards = [s["reward"] for s in scores]
             mean = sum(rewards) / len(rewards)
             groups.append({"task": q["task"], "ranks": ranks, "rewards": rewards, "valid": [s["valid"] for s in scores],
+                           "defects": [{k: s.get(k) for k in ("malformed", "invalid_nodes", "invalid_edges", "finals")} for s in scores],
+                           "texts": texts, "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
                            "terms": {k: [s.get(k) for s in scores] for k in ("F1", "F2", "F3", "E1", "E2", "N", "size")}})
             for s, rew in zip(res.sequences, rewards):
@@ -186,7 +192,7 @@ def main():
         p.add_argument("--name", default="components")
     s = sub.choices["sft"]
     s.add_argument("--batch", type=int, default=8)
-    s.add_argument("--lr", type=float, default=1e-4)
+    s.add_argument("--lr", type=float, help="peak rate, linear decay to 0 (default: the cookbook's LoRA rate for the base)")
     s.add_argument("--max-length", type=int, default=16384)
     r = sub.choices["rl"]
     r.add_argument("--scorer", required=True)

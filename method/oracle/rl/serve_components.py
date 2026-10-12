@@ -64,8 +64,9 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
                 while len(cache) > TEXTS_KEPT:
                     cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **{k[5:]: g[k] for k in g if k.startswith("term_")},
-                        "size": g["size"], "bits": g["row"]["bits"], "nodes": g["row"]["nodes"], "edges": g["row"]["edges"],
-                        "f2_share": g["row"]["f2_share"]} for g in got]
+                        "size": g["size"], **{k: (g["row"] or {}).get(k) for k in ("bits", "nodes", "edges", "f2_share")},
+                        "malformed": g["malformed"], "invalid_nodes": g["invalid_nodes"],
+                        "invalid_edges": g["invalid_edges"], "finals": g["finals"]} for g in got]
                 err = None
             except Exception as e:  # a bad request answers with its error; the process keeps serving
                 got, err = None, f"{type(e).__name__}: {e}"

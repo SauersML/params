@@ -72,6 +72,7 @@ CODES = {v: k for k, v in KINDS.items()}
 GROUP_RE = re.compile(r"L(\d+)\.(q|k|v|o|fc|down)#(\d+(?:,\d+)*)@(\d+)")
 _G = r"L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*@\d+"
 WRITERS_RE = re.compile(rf"\s*{_G}(?:\s*,\s*{_G})*\s*")
+MARKDOWN = re.compile(r"\*\*|^[ \t]*#+[ \t]*", re.M)
 ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response)>)")  # Qwen's added tokens: <|...|>, <think>, <tool_call>, ...
 FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s*(.+?)\s*$", re.M | re.I)
 SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+)\s*:", re.M | re.I)
@@ -138,7 +139,9 @@ def parse(text: str) -> dict:
     """An answer's parts: "explanation", "answer" (goal_eval's circuit JSON: nodes [matrix, index, position], edges
     [upstream, downstream | "out"]), "malformed" (circuit lines that do not parse), "circuit" (whether a CIRCUIT
     section exists) and "finals" (question number -> (falls, the top token as written)). A circuit line's reader may be
-    a group, and so may each writer: the line states an edge from every writer to every reader."""
+    a group, and so may each writer: the line states an edge from every writer to every reader. Markdown decoration
+    (bold markers, heading marks at a line's start) is ignored: no valid line holds it."""
+    text = MARKDOWN.sub("", text)
     sec = _sections(text)
     nodes, at, edges, malformed = [], {}, [], 0
 
@@ -515,48 +518,51 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
     nat = ge.nat
     prompt = task["prompts"][0]
     ids, targets = prompt["token_ids"], prompt["target_positions"]
-    ge.ranks = tuple(goal_eval.HELD_OUT_RANKS if ranks is None else ranks)
-    key = (task["id"], ge.ranks)
-    tx = cache.get(key) if cache is not None else None
-    if tx is None:
-        tx = ge.text(ids, targets, task=task)
-        if cache is not None:
-            cache[key] = tx
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
     parsed = [parse(x) for x in texts]
-    graphs, defects = [], []
+    graphs, defects, valid = [], [], []
     for p in parsed:
-        g, d = goal_eval.circuit(p["answer"], targets, nat.C, tx.T)
+        g, d = goal_eval.circuit(p["answer"], targets, nat.C, len(ids))
         graphs.append(g)
         defects.append(d)
+        valid.append(p["circuit"] and p["malformed"] == 0 and not d["invalid_nodes"] and not d["invalid_edges"]
+                     and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1)))
+    keep = [i for i, v in enumerate(valid) if v]  # an invalid answer's reward is -1 whatever it measures: not run
+    if keep:
+        ge.ranks = tuple(goal_eval.HELD_OUT_RANKS if ranks is None else ranks)
+        key = (task["id"], ge.ranks)
+        tx = cache.get(key) if cache is not None else None
+        if tx is None:
+            tx = ge.text(ids, targets, task=task)
+            if cache is not None:
+                cache[key] = tx
     e1 = {}
-    if reader is not None:
+    if reader is not None and keep:
         evs = units.reader_events(ev["events"])
-        uniq = list(dict.fromkeys(texts))
-        for x, b in zip(uniq, reader.bits(task, [escape(english(x)) for x in uniq], evs)):
-            e1[x] = b
+        uniq = list(dict.fromkeys(texts[i] for i in keep))
+        e1 = dict(zip(uniq, reader.bits(task, [escape(english(x)) for x in uniq], evs)))
     ge.hooks = {"E1": (lambda task, g, x: e1.get(x)) if reader is not None else None,
                 "E2": lambda task, g, x: qa_score(ev["qa"], parse(x)["finals"], tok)}
-    rows = ge.score(tx, graphs + [native.Graph()], texts + [""])
-    empty = rows[-1]
+    rows = ge.score(tx, [graphs[i] for i in keep] + [native.Graph()], [texts[i] for i in keep] + [""]) if keep else []
+    empty = rows[-1] if rows else None
+    row_of = dict(zip(keep, rows))
     scale = ev["active"] * math.log2(nat.positions(targets) * sum(nat.C.values()))
     out = []
-    for x, p, d, row in zip(texts, parsed, defects, rows):
-        valid = (p["circuit"] and p["malformed"] == 0 and not d["invalid_nodes"] and not d["invalid_edges"]
-                 and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1)))
-        terms = {}
-        pos = [(m, k) for _, m, k in row["f2_positions"] if m > 0]
-        terms["F2"] = sum(min(1.0, max(0.0, 1 - k / m) / carried_goal) for m, k in pos) / len(pos) if pos else None
-        base = empty["f1_changed_held"]
-        terms["F1"] = min(1.0, max(0.0, 1 - row["f1_changed_held"] / base)) if base > 0 else None
-        terms["F3"] = row["f3_auc"] if row["f3_auc"] is not None else 0.5
-        terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
-        terms["E2"] = row["E2"]
-        have = [v for v in terms.values() if v is not None]
-        size = row["bits"] / scale if scale > 0 else 0.0
-        r = (sum(have) / len(have) - size_weight * size) if valid else -1.0
-        out.append({"reward": r, "valid": valid, **{f"term_{k}": v for k, v in terms.items()}, "size": size,
-                    "malformed": p["malformed"], **d, "row": row})
+    for i, (p, d) in enumerate(zip(parsed, defects)):
+        row, terms, size, r = row_of.get(i), {}, None, -1.0
+        if row is not None:
+            pos = [(m, k) for _, m, k in row["f2_positions"] if m > 0]
+            terms["F2"] = sum(min(1.0, max(0.0, 1 - k / m) / carried_goal) for m, k in pos) / len(pos) if pos else None
+            base = empty["f1_changed_held"]
+            terms["F1"] = min(1.0, max(0.0, 1 - row["f1_changed_held"] / base)) if base > 0 else None
+            terms["F3"] = row["f3_auc"] if row["f3_auc"] is not None else 0.5
+            terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
+            terms["E2"] = row["E2"]
+            have = [v for v in terms.values() if v is not None]
+            size = row["bits"] / scale if scale > 0 else 0.0
+            r = sum(have) / len(have) - size_weight * size
+        out.append({"reward": r, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
+                    "malformed": p["malformed"], **d, "finals": len(p["finals"]), "row": row})
     return out
 
 

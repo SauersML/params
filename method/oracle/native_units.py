@@ -119,16 +119,26 @@ class NativeUnits:
     @torch.no_grad()
     def _forward(self, base: Mask, removals: list[list[tuple]], s: int, keep: bool = False) -> torch.Tensor:
         """log q at the targets [len(removals), len(targets), V]: each row the base set without its removals (at
-        positions >= s), computing positions s..T-1 and reading the base set's keys and values before s (keep: store
-        them, s = 0)."""
+        positions >= s). It computes the positions from s on that hold base units, and the targets: a position holding
+        none keeps its embedding through every layer, so its keys and values, and those before s, are the base run's
+        (keep: compute every position and store them, s = 0)."""
         import vpd_model
 
-        tg, B, T, H, hd = self.tg, len(removals), self.T, self.H, self.hd
-        Lw = T - s
-        x = self.emb[s:][None].expand(B, -1, -1).clone()
+        tg, B, T, H, hd, dev = self.tg, len(removals), self.T, self.H, self.hd, self.nat.dev
+        if keep:
+            comp = torch.arange(T, device=dev)
+        else:
+            on = base.heads.any(2).any(0) | base.neurons.any(2).any(0)
+            on[:s] = False
+            on[self.targets] = True
+            comp = on.nonzero().flatten()
+        n = len(comp)
+        where = torch.full((T,), -1, dtype=torch.long, device=dev)
+        where[comp] = torch.arange(n, device=dev)
+        x = self.emb[comp][None].expand(B, -1, -1).clone()
         cache = None if keep else self._cache[1]
         kept = []
-        causal = torch.ones(T, T, dtype=torch.bool, device=self.nat.dev).tril()[s:]
+        causal = torch.arange(T, device=dev)[None] <= comp[:, None]  # [n, T]
         rows = {"head": [[], [], [], []], "neuron": [[], [], [], []]}
         for b, rem in enumerate(removals):
             for kind, l, t, j in rem:
@@ -136,36 +146,43 @@ class NativeUnits:
                     r = rows[kind]
                     r[0].append(b)
                     r[1].append(l)
-                    r[2].append(t - s)
+                    r[2].append(t)
                     r[3].append(j)
-        idx = {k: tuple(torch.tensor(v, dtype=torch.long, device=self.nat.dev) for v in r) for k, r in rows.items()}
+        idx = {}
+        for kind, r in rows.items():
+            b, l, t, j = (torch.tensor(v, dtype=torch.long, device=dev) for v in r)
+            t = where[t] if len(t) else t
+            ok = t >= 0  # a removal at a position holding no base unit removes nothing
+            idx[kind] = (b[ok], l[ok], t[ok], j[ok])
+        cos, sin = tg.cos[comp], tg.sin[comp]
         for i in range(self.L):
             z = vpd_model.rms(x, tg.norms[2 * i], tg.eps)
-            heads = lambda y: y.view(B, Lw, H, hd).transpose(1, 2)  # noqa: E731
+            heads = lambda y: y.view(B, n, H, hd).transpose(1, 2)  # noqa: E731
             q, k, v = heads(z @ self.W["q_proj"][i].T), heads(z @ self.W["k_proj"][i].T), heads(z @ self.W["v_proj"][i].T)
-            rot = lambda y: y * tg.cos[s:T] + torch.cat([-y[..., hd // 2:], y[..., :hd // 2]], -1) * tg.sin[s:T]  # noqa: E731
+            rot = lambda y: y * cos + torch.cat([-y[..., hd // 2:], y[..., :hd // 2]], -1) * sin  # noqa: E731
             q, k = rot(q), rot(k)
             if keep:
                 kept.append((k[:1], v[:1]))
             else:
-                k = torch.cat([cache[i][0][:, :, :s].expand(B, -1, -1, -1), k], 2)
-                v = torch.cat([cache[i][1][:, :, :s].expand(B, -1, -1, -1), v], 2)
+                kk, vv = cache[i][0].expand(B, -1, -1, -1).clone(), cache[i][1].expand(B, -1, -1, -1).clone()
+                kk[:, :, comp], vv[:, :, comp] = k, v
+                k, v = kk, vv
             P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
-            hm = base.heads[i, s:].T[None].expand(B, -1, -1).float().clone()  # [B, H, Lw]
+            hm = base.heads[i, comp].T[None].expand(B, -1, -1).float().clone()  # [B, H, n]
             sel = idx["head"][1] == i
             if sel.any():
                 hm[idx["head"][0][sel], idx["head"][3][sel], idx["head"][2][sel]] = 0.0
-            att = ((P @ v) * hm[..., None]).transpose(1, 2).reshape(B, Lw, -1)
+            att = ((P @ v) * hm[..., None]).transpose(1, 2).reshape(B, n, -1)
             x = x + att @ self.W["o_proj"][i].T
             z2 = vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps)
-            nm = base.neurons[i, s:][None].expand(B, -1, -1).float().clone()  # [B, Lw, d_mlp]
+            nm = base.neurons[i, comp][None].expand(B, -1, -1).float().clone()  # [B, n, d_mlp]
             sel = idx["neuron"][1] == i
             if sel.any():
                 nm[idx["neuron"][0][sel], idx["neuron"][2][sel], idx["neuron"][3][sel]] = 0.0
             x = x + (vpd_model.gelu_tanh(z2 @ self.W["c_fc"][i].T) * nm) @ self.W["down_proj"][i].T
         if keep:
             self._cache = (base, kept)
-        final = vpd_model.rms(x[:, [t - s for t in self.targets]], tg.ln_f, tg.eps)
+        final = vpd_model.rms(x[:, where[self.targets]], tg.ln_f, tg.eps)
         return torch.log_softmax((final @ tg.wte.T).float(), -1)
 
     def kl(self, base: Mask, removals: list[list[tuple]] | None = None) -> list[float]:

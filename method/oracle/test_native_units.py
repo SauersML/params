@@ -88,6 +88,21 @@ def test_windowed_removals_match_whole_runs(tiny):
         assert abs(k - nu.kl(S.without(rem))[0]) < 1e-5, rem
 
 
+def test_runs_skip_positions_holding_no_units(tiny):
+    """A set at a few positions: removal runs computing only those positions and the targets give the whole runs' KL."""
+    nat, ids, targets, nu = tiny
+    S = random_mask(nu, 6, keep=0.6)
+    hold = torch.zeros(nu.T, dtype=torch.bool)
+    hold[[2, 5, 9]] = True
+    S.heads &= hold[None, :, None]
+    S.neurons &= hold[None, :, None]
+    units = S.units()
+    removals = [[u] for u in units[::7]] + [units[:5], units[-4:], [("neuron", 0, 4, 1)]]
+    got = nu.kl(S, removals)
+    for rem, k in zip(removals, got):
+        assert abs(k - nu.kl(S.without(rem))[0]) < 1e-5, rem
+
+
 def test_prune_curve(tiny):
     nat, ids, targets, nu = tiny
     positions = [3, 7, 11]

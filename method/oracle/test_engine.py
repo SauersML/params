@@ -333,6 +333,38 @@ def test_runs_from_a_position_reuse_the_base():
             assert rel(carry.kl(ref, want), carry.kl(ref, got[2 * d:2 * d + 2])) < REL, d
 
 
+def test_read_and_norm_strengths():
+    """ewn and own, a connection's strength in its reader's RMSNorm scale apart from its read: given equal to ew and ow
+    they are the run without them; a connection at 0 in both is the plain cut; the strongest residual reader's and
+    prediction's connections at 0 in the scale alone move the run, and for a reader without a norm before its read
+    (an attention output) only the read's strength counts (all within float32 rounding)."""
+    nat, ids, targets, graph, ew, ow, u = graph_case()
+    eng = engine.Engine(nat, ids, targets, live=True)
+    plan = eng.plan(graph, semantics="c")
+    ref = nat.reference([ids], targets)
+    kl = lambda **k: carry.kl(ref, eng.graph_log_probs(plan, u, **k))  # noqa: E731
+
+    def at(x, k):
+        y = x.clone()
+        y[:, k] = 0.0
+        return y
+    with torch.no_grad():
+        plain = kl(ew=ew, ow=ow)
+        assert rel(plain, kl(ew=ew, ow=ow, ewn=ew.clone(), own=ow.clone())) < REL
+        edges = [(w, r) for r, ws in graph.parents.items() for w in ws]
+        resid = [k for k, (_, r) in enumerate(edges) if r[0].endswith(("c_fc", "q_proj", "k_proj", "v_proj"))][:24]
+        attn = [k for k, (_, r) in enumerate(edges) if r[0].endswith("o_proj")][:4]
+        for k in resid + attn:  # both at 0: the plain cut
+            assert rel(kl(ew=at(ew, k), ow=ow), kl(ew=at(ew, k), ow=ow, ewn=at(ew, k), own=ow)) < REL, k
+        for k in attn:  # no norm before an attention output's read
+            assert rel(plain, kl(ew=ew, ow=ow, ewn=at(ew, k), own=ow)) < REL, k
+        k = max(resid, key=lambda k: float((kl(ew=at(ew, k), ow=ow) - plain).abs().max()))
+        assert rel(plain, kl(ew=ew, ow=ow, ewn=at(ew, k), own=ow)) > 10 * REL
+        o = max(range(ow.shape[1]), key=lambda o: float((kl(ew=ew, ow=at(ow, o)) - plain).abs().max()))
+        assert rel(plain, kl(ew=ew, ow=ow, ewn=ew, own=at(ow, o))) > 10 * REL
+        assert rel(kl(ew=ew, ow=at(ow, o)), kl(ew=ew, ow=at(ow, o), ewn=ew, own=at(ow, o))) < REL
+
+
 def test_c_semantics_equal_graph_ref():
     """C's semantics (plan(semantics="c")) equal goal_eval.GoalEval.graph_ref, the forward pass written out, on a graph
     stating half of its connections, with the gradients in u; a stated connection at strength 0 is the graph without it."""

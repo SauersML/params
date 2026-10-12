@@ -2191,6 +2191,44 @@ class GoalEval:
         return self.adversary_flips(tx, [base] * len(ons), pool, "omitted", ms=(m,), screens=screens,
                                     strengths=ons.to(self.nat.dev, torch.float32), **kw)
 
+    @torch.no_grad()
+    def connection_effects(self, tx: Text, graph: native.Graph, rows: int = 48) -> list[dict]:
+        """Per stated connection of a graph (stranded nodes dropped, as fidelity scores it), writer A to reader B (None:
+        the prediction), the change in target KL (bits) of its run in C's semantics against the graph as stated when A's
+        contribution leaves B's read but stays in B's RMSNorm scale ("direct"), leaves the scale but stays in the read
+        ("norm"), and leaves both ("full", the connection cut): engine.Engine's ew/ewn and ow/own. "normed": B reads
+        through a norm (a query, key, value or MLP input, or the prediction); an attention or MLP output reads none, so
+        its "norm" is 0 and "direct" its cut. An explanation's claim that a connection reads or rescales is tested by the
+        two partial cuts (the lead's decision 10-12): they need not add up to the cut."""
+        nat, dev = self.nat, self.nat.dev
+        g = strand(graph, tx.targets, nat.C)
+        edges = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
+        if not edges:
+            return []
+        E = self._circuit_engine(tx.ids, tx.targets, [g])
+        plan = E.plan(g, semantics="c")
+        Ein, O = plan["E"], plan["O"]
+        cases = [None] + [(k, d, n) for k in range(len(edges)) for d, n in ((0.0, 1.0), (1.0, 0.0), (0.0, 0.0))]
+        kl = []
+        for s0 in range(0, len(cases), rows):
+            part = cases[s0:s0 + rows]
+            ew, ewn, ow, own = (torch.ones(len(part), m, device=dev) for m in (Ein, Ein, O, O))
+            for i, case in enumerate(part):
+                if case is not None:
+                    k, d, n = case
+                    if k < Ein:
+                        ew[i, k], ewn[i, k] = d, n
+                    else:
+                        ow[i, k - Ein], own[i, k - Ein] = d, n
+            kl += carry.kl(tx.ref, E.graph_log_probs(plan, None, ew, ow, ewn=ewn, own=own)).tolist()
+            native.free(dev)
+        out = []
+        for k, (w, r) in enumerate(edges):
+            kind = None if r is None else native._name_layer_kind(r[0])[1]
+            out.append({"writer": w, "reader": r, "normed": r is None or kind in ("q_proj", "k_proj", "v_proj", "c_fc"),
+                        **{name: kl[1 + 3 * k + i] - kl[0] for i, name in enumerate(("direct", "norm", "full"))}})
+        return out
+
     def _edge_subsets(self, tx: Text, graph: native.Graph, ons: torch.Tensor) -> tuple:
         """(graph with its stranded nodes dropped, None), or with a subset of ons (edge_flips') that strands another
         node, (that, each subset's graph as stated with its stranded nodes dropped)."""

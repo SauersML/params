@@ -372,7 +372,7 @@ class Engine:
 
     def graph_log_probs(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
                         precision: str = "score", patch: dict | None = None, reads: dict | None = None, keep: dict | None = None,
-                        reuse: tuple | None = None):
+                        reuse: tuple | None = None, ewn: torch.Tensor | None = None, own: torch.Tensor | None = None):
         """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32. patch:
         {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange). reads as
         log_probs': (log q, {site: [n]}). keep, a dict, receives the run's states for reuse (each layer's keys and
@@ -381,11 +381,16 @@ class Engine:
         text's before start, start no later than the first target), the model being causal: every state before start
         is that run's, and only the positions from start on are computed (float32, no patch or reads). tile_states
         lays a run's states out for its plan's rows repeated (repeat: the graphs' list repeated, one block per
-        changed text)."""
+        changed text). ewn, own: the connections' strengths in their readers' RMSNorm scale (the norm before a residual
+        read: queries, keys, values, MLP inputs; the prediction's final norm), [B, E] and [B, O] like ew and ow, when
+        they differ from the strengths in the read itself (None: the same): a connection's direct share and its share
+        in the scale, cut apart (goal_eval.GoalEval.connection_effects)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if (keep is not None or reuse is not None) and (precision != "score" or patch is not None or reads is not None):
             raise ValueError("keep and reuse are float32 runs without patch or reads")
+        if (ewn is not None or own is not None) and precision != "score":
+            raise ValueError("separate norm strengths are float32 runs (vpd_model's own norm)")
         if reuse is not None and not 0 < reuse[2] <= min(self.targets):
             raise ValueError("reuse starts after position 0 and no later than the first target")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
@@ -393,7 +398,8 @@ class Engine:
         with _precision(precision, self.dev), self._dtype(precision):
             rec = None if reads is None else (reads, {})
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
-                                   None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec, keep, reuse)
+                                   None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec, keep, reuse,
+                                   None if ewn is None else ewn.reshape(-1), None if own is None else own.reshape(-1))
         lq = torch.log_softmax(h.float() @ self.tg.wte.T, -1)
         return lq if rec is None else (lq, rec[1])
 
@@ -495,7 +501,7 @@ class Engine:
         return p[key]
 
     def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None, rec: tuple | None = None,
-                      keep: dict | None = None, reuse: tuple | None = None) -> torch.Tensor:
+                      keep: dict | None = None, reuse: tuple | None = None, ewn=None, own=None) -> torch.Tensor:
         """The final normed residual stream at the targets [B, len(targets), d] of the graph runs. fused (a search's
         steps): torch's fused norms and GELU, and the last layer's queries, attention output and MLP at the targets
         alone (with reads, every position). keep and reuse: graph_log_probs'."""
@@ -548,22 +554,24 @@ class Engine:
         def share(wn, wi, e):  # a connection's extra share in its reader's input: native e (1 - u_w) a_w, C -(1 - e) u_w a_w
             return (e - 1) * (1 - sw[wn][wi]) * aw[wn][wi] if c else e * sw[wn][wi] * aw[wn][wi]
 
-        def shares(rn):  # the connections into reader site rn: (writer site, reader rows, writer rows, share)
+        def shares(rn, e_all=None):  # the connections into reader site rn: (writer site, reader rows, writer rows, share)
+            e_all = ew if e_all is None else e_all
             for (r, wn), (ri, wi, j, fx) in Eg.items():
                 if r == rn:
-                    yield wn, ri, wi, share(wn, wi, fx if ew is None else ew[j] * fx)
+                    yield wn, ri, wi, share(wn, wi, fx if e_all is None else e_all[j] * fx)
 
         def resid_share(gi, j, fx, e_all):  # residual connections' shares from their writers' places gi
             e = fx if e_all is None else e_all[j] * fx
             a, sw_ = torch.cat(res_a)[gi], torch.cat(res_s)[gi]
             return (e - 1) * (1 - sw_) * a if c else e * sw_ * a
 
-        def topup(rn, width):  # [readers, width]: each reader node's stated parents' extra share
+        def topup(rn, width, e_all=None):  # [readers, width]: each reader node's stated parents' extra share
+            e_all = ew if e_all is None else e_all
             out = torch.zeros(len(R[rn][0]), width, device=self.dev)
             if rn in cons:  # every residual writer site's connections at once
                 ri, gi, j, fx, uc = cons[rn]
-                return _add_rows(out, ri, resid_share(gi, j, fx, ew), lambda k: self._Ures[0].index_select(0, uc[k]))
-            for wn, ri, wi, s in shares(rn):
+                return _add_rows(out, ri, resid_share(gi, j, fx, e_all), lambda k: self._Ures[0].index_select(0, uc[k]))
+            for wn, ri, wi, s in shares(rn, e_all):
                 out = _add_rows(out, ri, s, lambda k, wn=wn, wi=wi: self.U[wn].index_select(0, Wr[wn][2][wi[k]]))
             return out
 
@@ -572,7 +580,10 @@ class Engine:
 
         def resid_in(n, x, w):  # residual readers' inputs: their position's stream with their parents' extra shares
             b, t, _ = R[n]
-            return norm(x[b, t] + topup(n, x.shape[-1]), w)
+            if ewn is None:
+                return norm(x[b, t] + topup(n, x.shape[-1]), w)
+            num, den = x[b, t] + topup(n, x.shape[-1]), x[b, t] + topup(n, x.shape[-1], ewn).float()  # the read; the norm's scale
+            return w * (num.float() * torch.rsqrt(den.pow(2).mean(-1, keepdim=True) + self.eps)).to(num.dtype)
 
         if lo:  # the tokens from lo on: every row's [T], or each row's [B, T]
             tok = (reuse[1] if torch.is_tensor(reuse[1]) else torch.tensor(reuse[1])).to(self.dev)
@@ -663,6 +674,11 @@ class Engine:
             A["down_proj"] = done(nd, a)
             x = x + out("down_proj", g, cut(nd, u[nd]))
         z = x if sel is not None else x[:, self._targets - lo]
+        if cout is not None and own is not None:  # the read and the norm's scale with their own strengths
+            b, ti, gi, j, fx, uc = cout
+            num = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)
+            den = z.index_put((b, ti), resid_share(gi, j, fx, own)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True).float()
+            return tg.ln_f * (num.float() * torch.rsqrt(den.pow(2).mean(-1, keepdim=True) + self.eps)).to(num.dtype)
         if cout is not None:  # the connections into the prediction, every writer site's at once
             b, ti, gi, j, fx, uc = cout
             z = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)

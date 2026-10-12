@@ -1561,3 +1561,45 @@ def test_changed_edges_are_changed_inputs_on_the_subsets(tiny):
             assert a["draws_changed"] == b["draws_changed"]
             for k in ("s_changed", "kl_changed_c", "s_track", "kl_track_c"):
                 assert (a[k] is None) == (b[k] is None) and (a[k] is None or abs(a[k] - b[k]) <= 1e-5 * (1 + abs(a[k]))), (k, a[k], b[k])
+
+
+def test_connection_effects(tiny):
+    """connection_effects: each stated connection's full cut is graph_ref's (an independent forward) with that
+    connection cut, against graph_ref as stated; a connection into an attention or MLP output (no norm before its
+    read) has no norm part and its direct part is the cut; one into a residual reader or the prediction is normed."""
+    nat, ge, tx = tiny
+    g = goal_eval.strand(random_graph(nat, tx, 7, k=16, stated=0.7), tx.targets, nat.C)
+    rows = ge.connection_effects(tx, g)
+    assert rows
+    with torch.no_grad():
+        base = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, g))[0])
+        for r in rows:
+            cut = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, g, cuts={r["reader"]: [r["writer"]]}))[0]) - base
+            assert abs(r["full"] - cut) < 1e-4 * (1 + abs(cut)), r
+            kind = None if r["reader"] is None else native._name_layer_kind(r["reader"][0])[1]
+            assert r["normed"] == (kind in (None, "q_proj", "k_proj", "v_proj", "c_fc"))
+            if not r["normed"]:
+                assert abs(r["norm"]) < 1e-6 and abs(r["direct"] - r["full"]) < 1e-6, r
+
+
+def test_connection_effects_on_the_teachers_text9000_circuit(real):
+    """On joint_heldout's text9000 circuit, the partial cuts are the normalization measurement's (10-12, the scratch
+    engine with read and norm strengths; to 1e-3 relative): the norm part can exceed the cut (they do not add up)."""
+    import json
+
+    nat, ge = real
+    path = Path.home() / "mpd-data/graph_oracle/teacher/joint_heldout/text9000.json"
+    if not path.exists():
+        pytest.skip("needs " + str(path))
+    ids, targets = native.text(native.TEXTS / "vpd4l" / "text9000.json")
+    tx = ge.text(ids, targets)
+    g, _ = goal_eval.circuit(json.loads(path.read_text()), targets, nat.C, len(ids))
+    got = {(r["writer"], r["reader"]): r for r in ge.connection_effects(tx, g)}
+    want = {(("h.0.mlp.down_proj", 394, 3020), ("h.3.mlp.c_fc", 394, 2522)): (16.506065, 0.001761, 16.259155),
+            (("h.0.mlp.down_proj", 394, 987), ("h.2.mlp.c_fc", 394, 814)): (0.409638, 9.584532, 0.415924),
+            (("h.3.mlp.down_proj", 394, 3532), None): (3.129803, 0.172517, 1.010567),
+            (("h.3.mlp.down_proj", 394, 2481), None): (7.573549, -0.000101, 7.584337)}
+    for key, (d, n, f) in want.items():
+        r = got[key]
+        for a, b in ((r["direct"], d), (r["norm"], n), (r["full"], f)):
+            assert abs(a - b) < 1e-3 * max(1.0, abs(b)), (key, a, b)

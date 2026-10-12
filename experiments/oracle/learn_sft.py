@@ -12,6 +12,7 @@ answer and an end token. Scoring, per held-out row:
 
   learn_sft.py train ROWS.jsonl OUT_DIR [--init FIRST_STAGE_DIR/adapter] [--inject] [--base Qwen/Qwen3-1.7B] [--epochs 2]
   learn_sft.py score ARM_DIR/heldout.jsonl OUT.jsonl [--adapter OUT_DIR/adapter] [--inject [--shuffle]] [--base ...]
+  learn_sft.py active-score HELD_ACTIVE.jsonl OUT.jsonl [--adapter FIRST_STAGE_DIR/adapter] [--n 300]
   learn_sft.py report SCORES.jsonl ...
 """
 from __future__ import annotations
@@ -305,6 +306,33 @@ def score(a) -> None:
     out.close()
 
 
+def active_score(a) -> None:
+    """The first stage "active" on held-out texts: each row's greedy answer against the active subcomponents there,
+    precision and recall of the indices, and the share of the found ones with the right activation bin."""
+    import re
+
+    import torch
+
+    tok, model = _model(a.base, adapter=a.adapter)
+    model.eval()
+    rows = _rows(a.rows)[:a.n]
+    out = open(a.out, "w")
+    for r in rows:
+        p = tok(r["prompt"] + ANSWER, add_special_tokens=False)["input_ids"]
+        with torch.no_grad():
+            g = model.generate(input_ids=torch.tensor([p]).to(_dev()), max_new_tokens=a.max_tokens, do_sample=False)[0, len(p):]
+        said = dict(re.findall(r"#(\d+):([+-]\d)", tok.decode(g, skip_special_tokens=True)))
+        true = dict(re.findall(r"#(\d+):([+-]\d)", r["answer"]))
+        hit = [c for c in said if c in true]
+        out.write(json.dumps({"site": r["meta"]["site"], "true": len(true), "said": len(said), "hit": len(hit),
+                              "bins_right": sum(said[c] == true[c] for c in hit)}) + "\n")
+    out.close()
+    rs = _rows(a.out)
+    t, s_, h = (sum(r[k] for r in rs) for k in ("true", "said", "hit"))
+    print(f"active: {len(rs)} rows, precision {h / max(s_, 1):.3f}, recall {h / max(t, 1):.3f}, "
+          f"bins right {sum(r['bins_right'] for r in rs) / max(h, 1):.3f} of the found")
+
+
 def report(paths: list[str]) -> None:
     for path in paths:
         rs = _rows(path)
@@ -343,10 +371,17 @@ def main():
     s.add_argument("--inject", action="store_true")
     s.add_argument("--shuffle", action="store_true", help="with --inject: the vectors deranged within each question")
     s.add_argument("--base", default="Qwen/Qwen3-1.7B")
+    ac = sub.add_parser("active-score")
+    ac.add_argument("rows")
+    ac.add_argument("out")
+    ac.add_argument("--adapter")
+    ac.add_argument("--base", default="Qwen/Qwen3-1.7B")
+    ac.add_argument("--n", type=int, default=300)
+    ac.add_argument("--max-tokens", type=int, default=400)
     r = sub.add_parser("report")
     r.add_argument("scores", nargs="+")
     a = ap.parse_args()
-    {"train": train, "score": score, "report": lambda a: report(a.scores)}[a.cmd](a)
+    {"train": train, "score": score, "active-score": active_score, "report": lambda a: report(a.scores)}[a.cmd](a)
 
 
 if __name__ == "__main__":

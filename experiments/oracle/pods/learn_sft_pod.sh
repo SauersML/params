@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The learnability experiment's SFT runs (experiments/oracle/learn_sft.py) on one rented GPU. QDIR is learnability.py
-# questions' output plus the first stages' rows (vocab.jsonl, active.jsonl, both.jsonl). Arms: ids and features
+# questions' output plus the first stages' rows (vocab.jsonl, active.jsonl, both.jsonl) and active_heldout.jsonl (the
+# active stage's check on held-out texts, learn_sft.py active-score). Arms: ids and features
 # (their own rows from the base model), vocab, active and both (the ids rows after that first stage's adapter), inject
 # (the ids rows with the subcomponents' vectors in slots, also scored with other subcomponents' vectors); each at every
 # training size, scored on its held-out rows; the base model scored on the ids and features held-out rows. Four queues
@@ -44,7 +45,8 @@ inject() {  # the ids rows with the subcomponents' vectors in slots, scored with
   done
   echo "$out"
 }
-Q0="$(first active 1) $(task active ids $W/first_active/adapter) $(task ids ids)"
+CHECK="$S active-score $Q/active_heldout.jsonl $O/out/active_check.jsonl --base $BASE --adapter $W/first_active/adapter >> $O/first_active.log 2>&1; $S active-score $Q/active_heldout.jsonl $O/out/active_check_base.jsonl --base $BASE --n 100 >> $O/first_active.log 2>&1;"
+Q0="$(first active 1) $CHECK $(task active ids $W/first_active/adapter) $(task ids ids)"
 Q1="$(first vocab 2) $(task vocab ids $W/first_vocab/adapter) $S score $Q/ids/heldout.jsonl $O/out/score_ids_base.jsonl --base $BASE >> $O/base.log 2>&1; $S score $Q/features/heldout.jsonl $O/out/score_features_base.jsonl --base $BASE >> $O/base.log 2>&1;"
 Q2="$(first both 1) $(task both ids $W/first_both/adapter) $(task features features)"
 Q3="$(inject)"

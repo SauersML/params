@@ -562,8 +562,9 @@ def main():
     qa.add_argument("out_dir")
     qa.add_argument("--held", type=int, default=2_000)
     ac = sub.add_parser("active")
-    ac.add_argument("--texts", required=True, help="A:B, text numbers (train split)")
+    ac.add_argument("--texts", required=True, help="A:B, text numbers")
     ac.add_argument("out")
+    ac.add_argument("--split", default="train")
     bs = sub.add_parser("baselines")
     bs.add_argument("train", help="questions' features/train_<n>.jsonl")
     bs.add_argument("heldout", help="questions' features/heldout.jsonl")
@@ -583,7 +584,7 @@ def main():
             if not path.exists():
                 continue
             task = json.loads(path.read_text())
-            if task["split"] != "train" or max(task["prompts"][0]["target_positions"]) < 2:
+            if task["split"] != args.split or max(task["prompts"][0]["target_positions"]) < 2:
                 continue
             rows += active_rows(nat, task, tok, random.Random(native.task_seed(task["id"])))
         random.Random(0).shuffle(rows)

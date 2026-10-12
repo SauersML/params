@@ -476,27 +476,30 @@ EPS_BOOT = 200  # eps's bootstrap resamples
 
 
 def family_score(row: dict, family: str) -> float | None:
-    """A row's score for one of phi's families (PHI_FAMILIES): flips at FLIP_TERM."""
+    """Phi's unfloored family score when present; legacy rows use clipped fields. Flips at FLIP_TERM."""
     key = PHI_FAMILIES[family][0]
+    if key in row.get("rl_terms", {}):
+        return row["rl_terms"][key]
     if key == "f1_flips_c":
         fc = row.get("f1_flips_c") or {}
         return fc.get(str(FLIP_TERM), fc.get(FLIP_TERM))
     return row.get(key)
 
 
-def _pooled(kind: str, draws: list, e0: float | None) -> float | None:
+def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> float | None:
     """A family's score from some of its draws, as the family pools them: "mean" on the mean KLs ([KL_C, KL_VPD] each,
     against KL_empty e0), "weighted" per draw against its bound W ([prompt, KL_C, KL_VPD, W]) pooled by W, "donor" on
     the mean KLs against the mean keep-nothing KL ([donor, KL_C, KL_VPD, KL_0, score])."""
     if not draws:
         return None
+    fid = _fid_raw if raw else _fid
     if kind == "mean":
-        return None if e0 is None else _fid(e0, float(np.mean([d[0] for d in draws])), float(np.mean([d[1] for d in draws])))
+        return None if e0 is None else fid(e0, float(np.mean([d[0] for d in draws])), float(np.mean([d[1] for d in draws])))
     if kind == "donor":
-        return _fid(float(np.mean([d[3] for d in draws])), float(np.mean([d[1] for d in draws])), float(np.mean([d[2] for d in draws])))
+        return fid(float(np.mean([d[3] for d in draws])), float(np.mean([d[1] for d in draws])), float(np.mean([d[2] for d in draws])))
     num = den = 0.0
     for d in draws:
-        sd = _fid(d[3], d[1], d[2])
+        sd = fid(d[3], d[1], d[2])
         if sd is not None:
             num, den = num + d[3] * sd, den + d[3]
     return num / den if den > 0 else None
@@ -515,7 +518,7 @@ def _pooled_raw(draws: list) -> float | None:
 def family_eps(row: dict) -> dict:
     """eps_<family> for phi (the lead's reward v3): twice the bootstrap standard error of each family's score over its
     draws in the row (EPS_BOOT resamples, a fixed seed: the same from the row alone), at least EPS_FLOOR; a family
-    scored in one run (point, flips, N) the floor."""
+    scored in one run (point, flips, N) the floor. Bootstrap the same raw or clipped estimator as family_score."""
     rng = np.random.default_rng(0)
     out = {}
     for fam, (_, kind, key) in PHI_FAMILIES.items():
@@ -523,7 +526,8 @@ def family_eps(row: dict) -> dict:
         if not kind or not draws or len(draws) < 2:
             out[fam] = EPS_FLOOR
             continue
-        got = [_pooled(kind, [draws[i] for i in rng.integers(len(draws), size=len(draws))], row.get("kl_empty_live"))
+        got = [_pooled(kind, [draws[i] for i in rng.integers(len(draws), size=len(draws))], row.get("kl_empty_live"),
+                       raw=PHI_FAMILIES[fam][0] in row.get("rl_terms", {}))
                for _ in range(EPS_BOOT)]
         got = [x for x in got if x is not None]
         out[fam] = max(EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else EPS_FLOOR
@@ -1100,6 +1104,13 @@ class GoalEval:
             row.update(a)
             row.update(b)
             row.update(c)
+            if "rl_terms" in row:
+                raw_point = [_fid_raw(e0, x["kl_live"], v0) for x in (pt, wd)]
+                row["rl_terms"] = {**row["rl_terms"],
+                                   "s_point_c": min(x for x in raw_point if x is not None) if raw_point[0] is not None else None,
+                                   "s_track_pp": a.get("s_track_pp_raw"),
+                                   "s_interchange_pp": b.get("s_interchange_pp_raw"),
+                                   "s_pattern": c.get("s_pattern_raw")}
             for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
                 row.pop(f"eps_{f}", None)  # the recomputed families' eps from their own draws
             row.update({f"eps_{f}": v for f, v in family_eps(row).items() if f not in self.LOO_HELD})
@@ -2083,25 +2094,25 @@ class GoalEval:
             named += [(k, row.get(k)) for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "s_pattern")]
             row["c_terms"] = [k for k, v in named if v is not None]  # a family with nothing scored on the text is left out
             row["c"] = _harmonic([v for _, v in named if v is not None])
-            if reward:  # the terms without the floor at 0 and C_rl, for RL's ranking within a group (the lead's 10-12)
-                v0 = self._bounds(tx, "live")[1]
-                kfl = row.get("kl_flips_omitted", {}).get(FLIP_TERM)
-                raw = {"s_point_c": min(x for x in (_fid_raw(e0, pt["kl_live"], v0),
-                                                    _fid_raw(e0, wired[i]["kl_live"], v0) if i in wired else None) if x is not None)
-                       if _fid_raw(e0, pt["kl_live"], v0) is not None else None,
-                       "s_nodes": row.get("s_nodes_raw"),
-                       "s_edges": _fid_raw(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
-                       "f1_flips_c": min(x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None)
-                       if kfl else None,
-                       "s_track_pp": row.get("s_track_pp_raw"), "s_interchange_pp": row.get("s_interchange_pp_raw"),
-                       "s_pattern": row.get("s_pattern_raw")}
-                for pool_ in ("near", "far"):
-                    k3 = row.get(f"kl_donor_{pool_}")
-                    raw[f"s_donor_{pool_}"] = _fid_raw(k3[2], k3[0], k3[1]) if k3 else None
-                row["rl_terms"] = {k: raw[k] for k in row["c_terms"]}
-                row["c_rl"] = _c_rl([raw[k] for k in row["c_terms"] if raw[k] is not None])
-                if baseline:
-                    row.update(self.vpd_baseline(tx, g.count(), pool, split))
+            # Unfloored families for phi in training and full evaluation alike.
+            v0 = self._bounds(tx, "live")[1]
+            kfl = row.get("kl_flips_omitted", {}).get(FLIP_TERM)
+            raw = {"s_point_c": min(x for x in (_fid_raw(e0, pt["kl_live"], v0),
+                                                _fid_raw(e0, wired[i]["kl_live"], v0) if i in wired else None) if x is not None)
+                   if _fid_raw(e0, pt["kl_live"], v0) is not None else None,
+                   "s_nodes": row.get("s_nodes_raw"),
+                   "s_edges": _fid_raw(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
+                   "f1_flips_c": min(x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None)
+                   if kfl else None,
+                   "s_track_pp": row.get("s_track_pp_raw"), "s_interchange_pp": row.get("s_interchange_pp_raw"),
+                   "s_pattern": row.get("s_pattern_raw")}
+            for pool_ in ("near", "far"):
+                k3 = row.get(f"kl_donor_{pool_}")
+                raw[f"s_donor_{pool_}"] = _fid_raw(k3[2], k3[0], k3[1]) if k3 else None
+            row["rl_terms"] = {k: raw[k] for k in row["c_terms"]}
+            row["c_rl"] = _c_rl([raw[k] for k in row["c_terms"] if raw[k] is not None])
+            if baseline:
+                row.update(self.vpd_baseline(tx, g.count(), pool, split))
             row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") else None
             row["kl_empty_live"], row["kl_vpd_live"] = e0, self._bounds(tx, "live")[1]  # (phi's eps from the row alone)
             row["draws_point"] = [[pt["kl_live"], row["kl_vpd_live"]]]

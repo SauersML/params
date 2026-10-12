@@ -1724,6 +1724,8 @@ def test_line_leave_one_out(tiny):
     for k in ("s_point", "s_wiring", "s_point_c", "n_point", "draws_point", "s_track_pp", "draws_track_pp", "s_interchange_pp",
               "draws_interchange_pp", "s_pattern", "draws_pattern"):
         row[k] = own.get(k)
+    row["rl_terms"] = {**base["rl_terms"], **{k: own["rl_terms"].get(k)
+                       for k in ("s_point_c", "s_track_pp", "s_interchange_pp", "s_pattern")}}
     for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
         row.pop(f"eps_{f}", None)
     want = goal_eval.phi(row)[0]

@@ -40,7 +40,8 @@ Reward fields, on the text (per remainder convention X, live or off):
      edge credit only by saying which connections matter). A listed embedding node's edges are cut the same way (the
      reader reads its input without the token's embedding) and its unstated readers join the unstated pairs.
   size: the description length of the nodes and edges in bits (native.Graph.bits; with embedding nodes, size_bits:
-     each one a choice among the positions, its edges priced like any other).
+     each one a choice among the positions, its edges priced like any other), over size_scale, the bits of naming
+     VPD's whole answer (at the positions that can reach the targets): the fraction of VPD's description it needs.
   E1 (the English reader's bits) and E2 (question-answering accuracy): hooks (GoalEval.hooks) that the RL owner fills.
 Diagnostics (score(diagnostics=True)), not reward fields: F1 on the text's changed prompts (Native.changes) and F2 on
 the held-out alternatives (carry.alternatives, ranks 3 to 5) at each position whose changed token moves the prediction
@@ -386,6 +387,15 @@ class GoalEval:
                 nat.vpd.clear()
             out.append(torch.log_softmax((hidden[:, targets] @ tg.wte.T).float(), -1))
         return torch.cat(out)
+
+    def size_scale(self, tx: Text) -> float | None:
+        """The size term's denominator: the bits of naming every subcomponent of VPD's own answer (its actives at the
+        positions that can reach the targets), each a choice among those positions and every subcomponent (an answer's
+        node price). An answer's size bits over it: the fraction of VPD's description the circuit needs."""
+        if tx.vpd is None:
+            return None
+        nat = self.nat
+        return sum(int(m.sum()) for m in tx.vpd.values()) * math.log2(nat.positions(tx.targets) * sum(nat.C.values()))
 
     def graph_kl(self, tx: Text, graphs: list[native.Graph], live: bool) -> list[float]:
         """KL in bits at the targets of each stated graph's run on the text (_graph_kl)."""

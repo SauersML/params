@@ -612,3 +612,9 @@ def test_graph_f1_on_the_teachers_text9000_circuit(real):
     every, whole, none = _graph_checks(nat, ge, tx, nodes, 1e-2)
     print(f"text9000 teacher, {len(nodes)} nodes: KL live {every['kl_live']:.4f} stated / {whole['kl_live']:.4f} complete, "
           f"off {every['kl_off']:.4f} / {whole['kl_off']:.4f}; none {none['kl_live']:.2f} = empty {none['kl_empty_live']:.2f}")
+
+
+def test_size_scale_is_vpds_whole_answer(tiny):
+    nat, ge, tx = tiny
+    n = sum(int(m.sum()) for m in tx.vpd.values())
+    assert n > 0 and abs(ge.size_scale(tx) - n * math.log2(nat.positions(tx.targets) * sum(nat.C.values()))) < 1e-9

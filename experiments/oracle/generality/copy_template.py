@@ -258,34 +258,57 @@ def predict(draws: int):
 
 
 def report():
+    """Per kind, the mean of each term over the held-out copy texts (and apart, the copy texts with teacher circuits),
+    and the complete template's paired differences against the text's influential-blocks start and VPD's top k."""
     by = collections.defaultdict(dict)
     for p in [DATA / "copy_template.jsonl"] + templates.run_outputs("copy_template*.jsonl"):
         if p.exists():
             for line in p.read_text().splitlines():
                 r = json.loads(line)
-                by[r["task"]].setdefault(r["name"], r)
-    terms = ("s_point_c", "s_track_pp", "s_interchange_pp", "s_interchange", "s_donor_near", "s_donor_far", "c5")
-    print(f"{len(by)} texts")
-    for name in list(NAMES) + ["influential_blocks", "teacher", "vpd@listed", "vpd@expanded"]:
-        vals = collections.defaultdict(list)
-        for task, d in by.items():
-            if name in ("vpd@listed", "vpd@expanded"):
-                for tn in NAMES[1:2]:
-                    if tn in d:
-                        k = d[tn]["listed"] if name == "vpd@listed" else d[tn]["nodes"]
-                        r = d.get(f"vpd@{k}")
-                        if r:
-                            for m in terms:
-                                vals[m].append(r[m])
+                key = r["name"] if r["kind"] in ("template", "vpd") else r["kind"]
+                by[r["task"]].setdefault(key, r)
+    held = {x["task"] for x in json.loads((DATA / "copy_heldout.json").read_text())["copy"]}
+    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_donor_near", "s_donor_far", "c5", "bits")
+    kinds = list(NAMES) + ["influential_blocks", "teacher", "vpd_listed", "vpd_expanded"]
+    out = {}
+    for group, tasks in (("held-out copy texts", [t for t in by if t in held]), ("copy texts with teacher circuits", [t for t in by if t not in held])):
+        if not tasks:
+            continue
+        print(f"== {group}: {len(tasks)}")
+        for k in kinds:
+            rows = []
+            for t in tasks:
+                d = by[t]
+                if k == "vpd_listed":
+                    r = d.get(f"vpd@{d['copy_columns']['listed']}") if "copy_columns" in d else None
+                elif k == "vpd_expanded":
+                    r = d.get(f"vpd@{d['copy_columns']['nodes']}") if "copy_columns" in d else None
+                    if r is None and "copy_columns" in d:  # VPD's whole answer is smaller than the template's expansion
+                        r = max((v for kk, v in d.items() if kk.startswith("vpd@")), key=lambda v: v["nodes"], default=None)
+                else:
+                    r = d.get(k)
+                if r:
+                    rows.append(r)
+            if not rows:
                 continue
-            r = next((v for k, v in d.items() if k == name or (name == "influential_blocks" and v["kind"] == name)
-                      or (name == "teacher" and v["kind"] == "teacher")), None)
-            if r:
-                for m in terms:
-                    vals[m].append(r[m])
-        if vals:
-            print(f"  {name:28s} " + "  ".join(f"{m} {np.mean([x for x in vals[m] if x is not None]):.3f}" for m in terms
-                                               if any(x is not None for x in vals[m])) + f"  (n={len(vals['s_point_c'])})")
+            means = {m: (float(np.mean([r[m] for r in rows if r.get(m) is not None])) if any(r.get(m) is not None for r in rows) else None)
+                     for m in terms}
+            out[(group, k)] = {**means, "n": len(rows), "listed": float(np.mean([r["listed"] for r in rows])),
+                               "nodes": float(np.mean([r["nodes"] for r in rows]))}
+            print(f"  {k:26s} n={len(rows):2d} listed {out[(group, k)]['listed']:6.0f} nodes {out[(group, k)]['nodes']:7.0f}  " +
+                  "  ".join(f"{m} {v:.2f}" if m != "bits" else f"bits {v:.3g}" for m, v in means.items() if v is not None))
+        for a_, b_ in (("copy_columns_all", "influential_blocks"), ("copy_columns_all", "vpd_listed"), ("copy_columns", "influential_blocks")):
+            for m in ("c5", "s_track_pp", "s_interchange_pp", "s_point_c"):
+                diffs = []
+                for t in tasks:
+                    d = by[t]
+                    ra = d.get(a_)
+                    rb = d.get(b_) if b_ != "vpd_listed" else (d.get(f"vpd@{d['copy_columns']['listed']}") if "copy_columns" in d else None)
+                    if ra and rb and ra.get(m) is not None and rb.get(m) is not None:
+                        diffs.append(ra[m] - rb[m])
+                if diffs:
+                    print(f"    {a_} - {b_} on {m}: {np.mean(diffs):+.3f} (higher on {sum(x > 0 for x in diffs)}/{len(diffs)})")
+    return out
 
 
 if __name__ == "__main__":

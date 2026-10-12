@@ -2,7 +2,9 @@
 # Commands on one rented GPU (pod_worker2.py: DATA/todo2.tsv, one command per line, "script<TAB>arg<TAB>...", one
 # process each, P workers by the card's memory at GB_PER MiB each). The scripts, DATA's inputs, the mechanism templates,
 # the texts and the teacher circuits go up; outputs come back to ~/mpd-data/runpod/$NAME/out/ (the reports read them).
-#   experiments/oracle/generality/pod2.sh HOURS     env: NAME, GPU, PRICE, VRAM, RAM, GB_PER, REF, TRIES
+#   experiments/oracle/generality/pod2.sh HOURS     env: NAME, GPU, PRICE, VRAM, RAM, GB_PER, RAM_PER, REF, TRIES
+# Workers: one per GB_PER MiB of the card and RAM_PER GiB of the host, whichever is fewer; rp-run stops a run whose GPU
+# stays under 20% for 15 minutes, and one process of these (small model, Python between runs) holds it near 15%.
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -15,7 +17,7 @@ V=/Users/user/mpd-data/vpd
 NAME=${NAME:-oracle-graph-generality3}
 O=/Users/user/mpd-data/runpod/$NAME
 GPU=${GPU:-NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA RTX A4500}
-GB_PER=${GB_PER:-16000}
+GB_PER=${GB_PER:-8000}
 mkdir -p "$G"
 TODO=${TODO:-todo2.tsv}
 [ -s "$D/$TODO" ] || { echo "no $D/$TODO"; exit 1; }
@@ -34,6 +36,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 export TODO=$TODO ORACLE=/Users/user/params/method/oracle GEN_DATA=\$HOME/gen MECH=\$HOME/gen/$(basename "$M") PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True;
 P=\$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{p = int(\$1 / $GB_PER); print (p < 1) ? 1 : p}');
+R=\$(awk '/MemTotal/ {print int(\$2 / 1048576 / ${RAM_PER:-14})}' /proc/meminfo); [ \$R -ge 1 ] && [ \$R -lt \$P ] && P=\$R;
 echo workers \$P;
 cd ~/gen; set +e; for k in \$(seq 0 \$((P - 1))); do (python -B pod_worker2.py \$k \$P $O/out > $O/worker_\$k.log 2>&1; echo \"exit \$?\" >> $O/worker_\$k.log) & done; wait; echo all workers done"
 for try in $(seq 1 ${TRIES:-20}); do

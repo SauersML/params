@@ -1466,7 +1466,7 @@ class GoalEval:
         """FRESH_SOURCES tokens for position p sampled without replacement from the model's distribution there, the
         text's token and the three likeliest others (every split's carry.alternatives ranks) left out; keyed by seed and
         p alone."""
-        lp = self.nat.reference([tx.ids[:p]], [p - 1])[0, 0].double().cpu()
+        lp = self.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double()  # MPS has no float64
         others = [int(z) for z in lp.topk(4).indices.tolist() if z != tx.ids[p]][:3]
         w = lp.exp()
         w[[tx.ids[p]] + others] = 0.0

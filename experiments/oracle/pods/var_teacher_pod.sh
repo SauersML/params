@@ -44,8 +44,9 @@ print(f"{len(ids)} texts with circuits in {circuits}")
 EOF
 RUNS=""
 for k in $(seq 0 $((P - 1))); do
-  RUNS="$RUNS (for t in \$(awk 'NR % $P == $k' $F/tasks.txt); do echo '$VARIANTS' | tr ';' '\n' | while read -r flags; do
-    python -B var_teacher.py \$t \$flags --classes --circuits \$HOME/circuits --root $O/out >> $O/vars_$k.log 2>&1 || echo \"\$t \$flags failed \$?\" >> $O/vars_$k.log;
+  MINE=$(awk "NR % $P == ($k + 1) % $P" "$F/tasks.txt" | tr '\n' ' ')  # process k's texts, named in the command
+  RUNS="$RUNS (for t in $MINE; do echo '$VARIANTS' | tr ';' '\n' | while read -r flags; do
+    python -B var_teacher.py \$t \$flags --classes --circuits \$HOME/circuits --root $O/out < /dev/null >> $O/vars_$k.log 2>&1 || echo \"\$t \$flags failed \$?\" >> $O/vars_$k.log;
   done; done; echo \"exit 0\" >> $O/vars_$k.log) &"
 done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;

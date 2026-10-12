@@ -201,6 +201,12 @@ class GatedCarry:
         return nat._const(("gated-none", T, B), lambda: {**nat._full_plan(T, B), "none": True,
                                                          "G": {n: torch.zeros(B, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}})
 
+
+def drop_plans(nat):
+    """Forget the plans built for one text's length (each holds [B, T, C] masks); the next text has another T."""
+    nat._consts = {k: v for k, v in nat._consts.items() if not (isinstance(k, tuple) and k[0] in ("gated-none", "full"))}
+    native.free(nat.dev)
+
     def change(self):
         """Mean over prompts of |gated activation on the prompt - on the text| per unit."""
         out = torch.zeros(self.N, device=self.nat.dev)
@@ -218,6 +224,9 @@ class GatedCarry:
             refs = self.ref_gated[i] if ref == "gated" else self.ref_model[i]
             for s0 in range(0, len(sets), self.B):
                 part = sets[s0:s0 + self.B]
+                valid = len(part)
+                if 1 < valid < self.B:              # one batch shape per text: the GPU compiles, and plans cache, per shape
+                    part = torch.cat([part, part[-1:].expand(self.B - valid, -1)])
                 B = len(part)
                 u, patch = {}, {}
                 for n in nat.names:
@@ -228,7 +237,7 @@ class GatedCarry:
                     u[n] = torch.where(live, self.g1[i][n], self.g0[n])
                     patch[n] = (~live, self.rec0[n].expand(B, -1, -1))
                 lq = nat.run(x, self.targets, self.plan(B), u, self.one_r, patch=patch, reuse=(self.states0, self.ids))
-                total[s0:s0 + B] += carry.kl(refs.expand(B, -1, -1), lq)
+                total[s0:s0 + valid] += carry.kl(refs.expand(B, -1, -1), lq)[:valid]
         return total / len(self.prompts)
 
 
@@ -377,6 +386,7 @@ def main():
             with args.out.open("a") as f:
                 f.write(json.dumps({"task": r["task"], "targets": targets, "semantics": "gated", "positions": result,
                                     "seconds": time.perf_counter() - t0}) + "\n")
+            drop_plans(nat)
             continue
         for row in r["positions"][:args.positions]:
             pos = position(nat, ids, targets, row, base, cis)
@@ -392,6 +402,7 @@ def main():
                                 "union_size": len(union), "union_by_position": len({u[1] for u in union}),
                                 "sufficiency": suff, "seconds": time.perf_counter() - t0}) + "\n")
         print(f"{r['task']}: union {len(union)} subcomponents; sufficiency {suff}; {time.perf_counter() - t0:.0f}s", flush=True)
+        drop_plans(nat)
 
 
 if __name__ == "__main__":

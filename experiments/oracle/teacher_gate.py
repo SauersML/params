@@ -9,7 +9,9 @@ size, positions, and seconds per text) and the circuits' connections (role_share
 one stated connection in or out), and with --adv A.jsonl B.jsonl on teacher_v3.py --evaluate's held-out
 adversary scores (F1, N, f1_adv, f1_rob, size), and with --fidelity A.jsonl B.jsonl on goal_eval.py fidelity's rows of
 kind "teacher" (the team's held-out adversary, adversary_flips' omitted lever at m = 1, 4, 16, 64, 256 as flip_m, the
-point F1 and N, N_real, C and C with flips), overall and by locality (heldout50_locality.jsonl).
+point F1 and N, N_real, C and C with flips, flips_to_half and flips_to_break, the smallest m at which F1 under m flips
+falls below 0.5 and below half the point F1, 512 when not within m <= 256), overall and by locality
+(heldout50_locality.jsonl).
 
   experiments/oracle/teacher_gate.py SCORE.json A B [--fields f1_live,n_live,...] [--teacher DIR_A DIR_B]
 """
@@ -111,13 +113,15 @@ def main():
             for x in p.read_text().splitlines():
                 r = json.loads(x) if x.strip() else {}
                 if r.get("kind", "").split(",")[0] == "teacher":
-                    out[r["task"]] = {**r, **{f"flip_{m}": v for m, v in (r.get("f1_flips_omitted") or {}).items()}}
+                    out[r["task"]] = {**r, **{f"flip_{m}": v for m, v in (r.get("f1_flips_omitted") or {}).items()},
+                                      **{k: r.get(k) or 512 for k in ("flips_to_half", "flips_to_break") if k in r}}
             return out
         FA, FB = fid(args.fidelity[0]), fid(args.fidelity[1])
         local = {}
         if args.labels.exists():
             local = {json.loads(x)["task"]: json.loads(x)["local"] for x in args.labels.read_text().splitlines() if x.strip()}
-        fields = ("flip_1", "flip_4", "flip_16", "flip_64", "flip_256", "s_point", "n_point", "n_real", "c", "c_flips", "size")
+        fields = ("flip_1", "flip_4", "flip_16", "flip_64", "flip_256", "flips_to_half", "flips_to_break", "s_point", "n_point",
+                  "n_real", "c", "c_flips", "size")
         for name, keep in (("all", lambda t: True), ("non-local", lambda t: local.get(t) is False), ("local", lambda t: local.get(t) is True)):
             ts = [t for t in set(FA) & set(FB) if keep(t)]
             if ts:

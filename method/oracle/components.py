@@ -39,8 +39,8 @@ the subcomponents a change of each listed token switches on, the strongest weigh
 (method/vpd/connectome.py; a static coupling, not a measured effect), and the intervention questions (qa_questions()).
 
 The reward (reward()) is goal_eval's scorecard in VPD's semantics combined into one number: the mean of the quality
-terms (each at most 1) less SIZE_WEIGHT x size (description bits over the bits of naming VPD's whole answer at the
-positions that can reach the targets, goal_eval's size_scale, at most 1); an invalid answer (no CIRCUIT section, a
+terms (each at most 1) less SIZE_WEIGHT x size (description bits in orders of magnitude of the bits of naming VPD's
+whole answer at the positions that can reach the targets, goal_eval's size_scale: size_term(), at most 1); an invalid answer (no CIRCUIT section, a
 missing FINAL line, cut at the sampling cap) earns -(1 + SIZE_WEIGHT), below every valid one. Nodes and edges the model
 does not have, and circuit lines that do not parse, are dropped and their bits charged in size. Terms: F1 sufficiency of
 the stated graph, N necessity, E1 the reader's bits saved, E2 questions answered right, E3 edits (reward()'s
@@ -819,6 +819,13 @@ def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None
     return reader.bits(task, [escape(english(x)) for x in texts], units.reader_events(ev["events"]))
 
 
+def size_term(bits: float, scale: float) -> float:
+    """The size term: an answer's description bits in orders of magnitude of the scale (the bits of naming VPD's whole
+    answer), log2(1 + bits) / log2(1 + scale), at most 1: 0 for the empty answer, 1 for one as long as VPD's, and
+    every doubling of an answer costs the same (1 / log2(1 + scale)), as F1 and N are on a log scale."""
+    return min(1.0, math.log2(1.0 + bits) / math.log2(1.0 + scale)) if scale > 0 else 0.0
+
+
 def dropped_bits(answer: dict, g, d: dict, positions: int, subcomponents: int) -> float:
     """The description bits of what an answer states that is not in its graph (goal_eval.circuit's defects d: a node
     outside the model or the text, a connection the model does not have), each priced as native.Graph.bits prices what
@@ -876,9 +883,10 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     parse (each subcomponent it names, at least one, priced as a node outside the graph); edit operations add their
     description bits (edit_bits). A valid
     answer earns the mean of its terms less size_weight x size ("circuit_reward": the same over the circuit's own terms
-    F1 and N, for comparing with circuits that give no English or answers), size its description bits over the bits of
-    naming VPD's whole answer at the positions that can reach the targets (goal_eval's size_scale; without VPD's
-    causal-importance network, VPD's actives at the listed positions and the targets), at most 1. Terms, from goal_eval in VPD's semantics with
+    F1 and N, for comparing with circuits that give no English or answers), size its description bits in orders of
+    magnitude of the bits of naming VPD's whole answer at the positions that can reach the targets (size_term over
+    goal_eval's size_scale; without VPD's causal-importance network, VPD's actives at the listed positions and the
+    targets), at most 1. Terms, from goal_eval in VPD's semantics with
     the remainders' convention, both in orders of magnitude of KL (linear recovery is dominated by the empty circuit's
     ~100 bits: an answer 20 bits from the model recovers 0.8 linearly, 0.2 in log): F1, goal_eval's f1 (ln(KL_empty /
     KL_C) / ln(KL_empty / KL_VPD) in [0, 1], between the empty circuit and VPD's own answer, KL_C the run of the graph the
@@ -941,7 +949,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             terms["E3"] = e3.get(i)
             have = [v for k, v in terms.items() if k != "F3" and v is not None]  # F3: a diagnostic
             e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
-            size = min(1.0, (row["bits"] + d_bits + e_bits) / scale) if scale > 0 else 0.0
+            size = size_term(row["bits"] + d_bits + e_bits, scale)
             r = sum(have) / len(have) - size_weight * size
             own = [terms[k] for k in ("F1", "N") if terms[k] is not None]
             circ = sum(own) / len(own) - size_weight * size

@@ -138,6 +138,14 @@ def test_qa_term_is_measured_from_the_no_change_answer():
     assert components.qa_term([], {}, tok, "t1") is None
 
 
+def test_size_term_counts_orders_of_magnitude():
+    scale = 2.0 ** 20 - 1
+    assert components.size_term(0.0, scale) == 0.0 and components.size_term(scale, scale) == 1.0
+    assert components.size_term(10 * scale, scale) == 1.0  # at most 1
+    step = [components.size_term(2.0 ** k - 1, scale) - components.size_term(2.0 ** (k - 1) - 1, scale) for k in (5, 10, 15)]
+    assert all(abs(x - 1 / 20) < 1e-12 for x in step)  # every doubling costs the same
+
+
 class FakeEdits:
     """edit_eval.EditEval's score_many: a one-operation edit is valid with net 2 bits, a longer one rejected."""
 

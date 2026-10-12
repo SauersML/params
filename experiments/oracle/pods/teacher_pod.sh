@@ -7,10 +7,12 @@
 # --save-vpd) the pods read VPD's answers from it; without it they compute them with VPD's causal-importance network, from
 # VPD's checkpoint (published in two pieces under GitHub's 2 GiB asset limit, put back together on the pod).
 # Pod j's circuits come back to ~/mpd-data/runpod/oracle-graph-teacher-$RUN-$j/out/ and are copied into DEST every minute
-# while the pods run (a <task>... file DEST already holds is kept; summary_<offset>.jsonl arrives as
-# summary_<RUN>_<offset>.jsonl). A pod ends when its texts are done; HOURS caps each pod.
+# while the pods run (a <task>... file DEST already holds is kept; summary_<offset>.jsonl and locality_<offset>.jsonl
+# arrive as summary_<RUN>_<offset>.jsonl and locality_<RUN>_<offset>.jsonl). With LOCALITY=1 (needs VPD's checkpoint: no
+# VPD file) each process first labels its texts local or not (components.py locality) and teacher.py reads the labels.
+# A pod ends when its texts are done; HOURS caps each pod.
 #   experiments/oracle/pods/teacher_pod.sh HOURS
-#   env: RUN, SPLIT, N, OFFSET, PODS, P, TASKS, DEST, VPD, LABELS, BATCH, REF, GPU, PRICE, VRAM, RAM, WAIT (minutes of retries
+#   env: RUN, SPLIT, N, OFFSET, PODS, P, TASKS, DEST, VPD, LABELS, LOCALITY, BATCH, REF, GPU, PRICE, VRAM, RAM, WAIT (minutes of retries
 #   while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all)
 cd /Users/user/params
 H=${1:-2.0}
@@ -37,7 +39,12 @@ for j in ${ONLY:-$(seq 0 $((PODS - 1)))}; do
   RUNS=""
   for k in $(seq 0 $((P - 1))); do
     off=$((OFFSET + j * P + k))
-    RUNS="$RUNS (python -B teacher.py $SEL --offset $off --stride $((PODS * P)) $ARGS --out $O/out > $O/teacher_$k.log 2>&1; echo \"exit \$?\" >> $O/teacher_$k.log) &"
+    LOC="" A=$ARGS
+    if [ -n "${LOCALITY:-}" ]; then
+      LOC="python -B components.py locality $SPLIT $O/out/locality_$off.jsonl --n $N --offset $off --stride $((PODS * P)) > $O/locality_$k.log 2>&1;"
+      A="$ARGS --labels $O/out/locality_$off.jsonl"
+    fi
+    RUNS="$RUNS ($LOC python -B teacher.py $SEL --offset $off --stride $((PODS * P)) $A --out $O/out > $O/teacher_$k.log 2>&1; echo \"exit \$?\" >> $O/teacher_$k.log) &"
   done
   CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
@@ -61,8 +68,10 @@ merge() {
   for NAME in "${names[@]}"; do
     S=/Users/user/mpd-data/runpod/$NAME/out
     [ -d "$S" ] || continue
-    rsync -a --ignore-existing --exclude 'summary_*' --exclude '*.partial' "$S/" "$DEST/"
-    find "$S" -maxdepth 1 -name 'summary_*.jsonl' | while read -r f; do cp "$f" "$DEST/summary_${RUN}_${f##*/summary_}"; done
+    rsync -a --ignore-existing --exclude 'summary_*' --exclude 'locality_*' --exclude '*.partial' "$S/" "$DEST/"
+    for kind in summary locality; do
+      find "$S" -maxdepth 1 -name "${kind}_*.jsonl" | while read -r f; do cp "$f" "$DEST/${kind}_${RUN}_${f##*/${kind}_}"; done
+    done
   done
 }
 while [ -n "$(jobs -rp)" ]; do merge; sleep 60; done

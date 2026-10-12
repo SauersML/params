@@ -1401,6 +1401,7 @@ def main():
     pr.add_argument("out", type=Path, help="directory: locality.jsonl, rows.jsonl, teacher/<task>.json, teacher/summary.jsonl")
     pr.add_argument("--n", type=int, default=400)
     pr.add_argument("--lengths", default="0:100000")
+    pr.add_argument("--tasks", type=Path, help="JSONL of {task[, local]}: only these texts, in this order; a given label skips locality()")
     pr.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
     tp = sub.add_parser("teacher-path", help="teachers from pruning paths (path_teacher()), and per text the better of it and VPD's")
     tp.add_argument("rows", type=Path)
@@ -1489,9 +1490,20 @@ def main():
         kept = {r["task"] for r in seen["rows"]}
         conn, atlas = _connectome(), _atlas()
         lo, hi = map(int, args.lengths.split(":"))
-        for p in native.tasks(args.split)[:args.n]:
-            if not lo <= len(native.text(p)[0]) < hi or (p.stem in labels and (p.stem in kept or labels[p.stem]["local"])):
+        paths = native.tasks(args.split)[:args.n]
+        if args.tasks:
+            given = [json.loads(x) for x in args.tasks.read_text().splitlines() if x.strip()]
+            for r in given:
+                if "local" in r and r["task"] not in labels:
+                    labels[r["task"]] = {"task": r["task"], "local": r["local"], "given": True}
+            paths = [native.TEXTS / "vpd4l" / f"{r['task']}.json" for r in given]
+        for p in paths:
+            if not lo <= len(native.text(p)[0]) < hi or p.stem in kept:
                 continue
+            if p.stem in labels and labels[p.stem]["local"]:
+                local_kept = sum(labels[t]["local"] for t in kept)
+                if local_kept >= len(kept) - local_kept:
+                    continue
             task = json.loads(p.read_text())
             if p.stem not in labels:
                 labels[p.stem] = locality(ge, task)

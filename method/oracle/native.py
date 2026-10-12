@@ -119,10 +119,12 @@ def site_name(layer: int, kind: str) -> str:
 
 
 def _forward_cached(self, x):
-    """Site._forward with the remainder W - V U computed once."""
+    """Site._forward with the remainder W - V U computed once. With gathered = (V[:, cols], U[cols]) the mask holds those
+    subcomponents alone ([..., len(cols)]): every other one is off, and only theirs are computed."""
     if self.mask is None:
         return x @ self.W.T
-    out = ((x @ self.V) * self.mask) @ self.U
+    V, U = getattr(self, "gathered", None) or (self.V, self.U)
+    out = ((x @ V) * self.mask) @ U
     if self.delta_mask is not None:
         out = out + self.delta_mask.unsqueeze(-1) * (x @ self.delta_T)
     return out

@@ -84,24 +84,37 @@ class Pruner:
             out[n] = m
         return out
 
+    def _gather(self) -> None:
+        """Per site the subcomponents among the nodes (the start set), all others being off in every run: their columns
+        of V and U, and each node's column among them. The products then run on these alone (a sum over fewer
+        terms: equal to the full products within float32 rounding, not to the bit)."""
+        tg = self.ge.nat.target
+        self.sel = [(self.mat == j).nonzero().flatten() for j in range(len(self.names))]
+        self.cols = []
+        for j, n in enumerate(self.names):
+            cols, ci = torch.unique(self.c[self.sel[j]], return_inverse=True)
+            st = tg.site(n)
+            self.cols.append((ci, (st.V.index_select(1, cols), st.U.index_select(0, cols))))
+
     def _site_masks(self, on: torch.Tensor) -> dict:
-        """Each site's float mask [B, T, C] of node subsets on [B, N]."""
+        """Each site's float mask [B, T, columns] of node subsets on [B, N]."""
         nat, T = self.ge.nat, self.tx.T
         out = {}
         for j, n in enumerate(self.names):
-            sel = self.sel[j]
-            m = torch.zeros(len(on), T, nat.C[n], device=nat.dev)
+            sel, (ci, (V, _)) = self.sel[j], self.cols[j]
+            m = torch.zeros(len(on), T, V.shape[1], device=nat.dev)
             if len(sel):
-                m[:, self.t[sel], self.c[sel]] = on[:, sel].float()
+                m[:, self.t[sel], ci] = on[:, sel].float()
             out[n] = m
         return out
 
     def _run(self, masks: dict, B: int, start: int = 0, prefix: list | None = None, layer: int = 0, keys_values: bool = False):
         """The masked forward of B copies of the text (Target.hidden from start and layer, or its keys_values)."""
         nat, tg, T = self.ge.nat, self.ge.nat.target, self.tx.T
-        for n in self.names:
+        for j, n in enumerate(self.names):
             st = tg.site(n)
             st.mask = masks[n][:, start:]
+            st.gathered = self.cols[j][1]
             st.delta_mask = torch.ones(B, T - start, device=nat.dev) if self.live else None
         ids = torch.tensor([self.tx.ids], device=nat.dev).expand(B, -1)
         try:
@@ -120,7 +133,7 @@ class Pruner:
         window): the same numbers as the whole run there."""
         nat, tg, T = self.ge.nat, self.ge.nat.target, self.tx.T
         if not hasattr(self, "sel"):
-            self.sel = [(self.mat == j).nonzero().flatten() for j in range(len(self.names))]
+            self._gather()
             self.layer = torch.tensor([int(n.split(".")[1]) for n in self.names], device=nat.dev, dtype=torch.int32)[self.mat]
         K = len(ons)
         window = K >= 2 * self.B and T > 64 and str(nat.dev).split(":")[0] in getattr(nat, "WINDOW_EXACT", ())

@@ -290,6 +290,7 @@ class VPD(nn.Module):
         for n in self.names:
             st = self.target.site(n)
             st.mask = st.delta_mask = st.last_input = st.last_output = None
+            st.gathered = None  # native's subset of subcomponents (V and U columns) for a mask over that subset
             st.cache_input = st.cache_output = False
 
     @torch.no_grad()

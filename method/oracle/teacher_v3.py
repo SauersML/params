@@ -189,7 +189,7 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
     vpd_adv = ms.kl_chunked(lambda a, b: ms.masks(None, pats[a:b], vpd_on=True), len(pats), chunk).clamp_min(TINY).log()
     worst = torch.zeros(len(pats), device=nat.dev)            # running adversary score per pattern
     opt = torch.optim.Adam([ms.logit], lr=LR)
-    vpd_masks = {n: tx.vpd[n].float() for n in nat.names}
+    vpd_masks = ms.masks(torch.ones(1, len(pr.nodes), device=nat.dev), None)   # VPD's answer, gathered layout
     stages = []
     for lam in LAMBDAS:
         t1 = time.perf_counter()

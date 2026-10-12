@@ -1847,3 +1847,171 @@ def test_connection_effects_on_the_teachers_text9000_circuit(real):
         r = got[key]
         for a, b in ((r["direct"], d), (r["norm"], n), (r["full"], f)):
             assert abs(a - b) < 1e-3 * max(1.0, abs(b)), (key, a, b)
+
+
+
+def _pp_case(seed=3, near=0.0, T=12, targets=(9, 11)):
+    """A tiny model, a GoalEval and text on it, the text's engine, every subcomponent node, and prompts changing a token
+    at a few positions (one a target)."""
+    import engine
+
+    nat = tiny_native(seed=seed, near=near)
+    g = torch.Generator().manual_seed(seed + 1)
+    ids = torch.randint(0, 40, (T,), generator=g).tolist()
+    ge = goal_eval.GoalEval(nat)
+    tx = ge.text(ids, list(targets), seed=5)
+    E = engine.Engine(nat, ids, list(targets), live=True)
+    nodes = [(n, t, c) for n in nat.names for t in range(T) for c in range(nat.C[n])]
+    prompts = [(p, (ids[p] + 7 * (k + 1)) % 40) for k, p in enumerate((4, 9, 2, 6))]
+    return nat, ge, tx, E, nodes, prompts
+
+
+def _pp_nodes(nodes, g, f, blocks=0.1):
+    """A random node set: each subcomponent node with probability f, and block nodes (a site's whole output at a
+    position) at random sites and positions (some of the subcomponents they hold left in)."""
+    sub = [nd for nd in nodes if float(torch.rand((), generator=g)) < f]
+    sp = sorted({(n, t) for n, t, _ in nodes})
+    return sub + [(n, t, goal_eval.BLOCK) for n, t in sp if float(torch.rand((), generator=g)) < blocks]
+
+
+def _pp_stated(nodes, targets, g, keep=0.6, tok=0.7, pairs=0.6):
+    """A random stated graph on nodes: each connection the model has among them, token edge into a residual reader or
+    the prediction kept with its probability; per read a third of the time its pairs (each kept with pairs), a third
+    the background alone (an empty entry), a third no entry (every pair claimed)."""
+    import engine
+    import mech
+
+    parents, out = native.all_edges(nodes, targets)
+    pick = lambda xs, f: [x for x in xs if float(torch.rand((), generator=g)) < f]  # noqa: E731
+    gr = native.Graph(nodes, {r: pick(ws, keep) for r, ws in parents.items()}, pick(out, keep))
+    gr.tok_edges = pick([(nd[1], nd) for nd in sorted(nodes) if native._name_layer_kind(nd[0])[1] in mech.RESID_READERS], tok)
+    gr.tok_out = pick(list(targets), tok)
+    gr.pairs = {}
+    held = {(n, t) for n, t, c in nodes if c == goal_eval.BLOCK}
+    own = [nd for nd in nodes if nd[2] == goal_eval.BLOCK or (nd[0], nd[1]) not in held]  # a block holds its site's parts
+    for layer in sorted({native._name_layer_kind(nd[0])[0] for nd in nodes}):
+        for t in sorted({nd[1] for nd in nodes}):
+            u = float(torch.rand((), generator=g))
+            if u < 1 / 3:
+                gr.pairs[(layer, t)] = pick(engine.read_pairs(own, layer, t), pairs)
+            elif u < 2 / 3:
+                gr.pairs[(layer, t)] = []
+    return gr
+
+
+def _pp_every(nodes, targets, pairs=False):
+    """The stated graph of a complete one: every connection the model has among nodes, a token edge into each residual
+    reader and into the prediction at each target, every pair of each read (no entries; pairs: each read's every
+    pair stated)."""
+    import engine
+    import mech
+
+    gr = native.Graph(nodes, *native.all_edges(nodes, targets))
+    gr.tok_edges = [(nd[1], nd) for nd in sorted(nodes) if native._name_layer_kind(nd[0])[1] in mech.RESID_READERS]
+    gr.tok_out = list(targets)
+    gr.pairs = {}
+    if pairs:
+        for layer in {native._name_layer_kind(nd[0])[0] for nd in nodes}:
+            for t in sorted({nd[1] for nd in nodes}):
+                gr.pairs[(layer, t)] = engine.read_pairs(nodes, layer, t)
+    return gr
+
+
+def test_path_patched_ends():
+    """Engine.path_patched (s_track_pp's run) on a model its subcomponents make up exactly (tiny_native near=0: no
+    remainder): with nothing stated it is the model on x; with every subcomponent at every position a node and every
+    connection, token edge and pair stated (no pair entries, or each read's every pair), or as a complete graph, it is
+    the model on x' (float32 rounding); a complete graph without nodes keeps the token's direct path into the
+    prediction at a target alone."""
+    nat, _, tx, E, nodes, prompts = _pp_case()
+    targets = tx.targets
+    assert any(p in targets for p, _ in prompts)
+    direct = native.Graph([], {}, [])
+    direct.tok_out = list(targets)
+    graphs = [native.Graph(nodes, {}, []), _pp_every(nodes, targets), _pp_every(nodes, targets, pairs=True),
+              native.Graph(nodes, complete=True), native.Graph([], complete=True), direct]
+    with torch.no_grad():
+        got = E.path_patched(graphs, prompts)
+    for d, (p, z) in enumerate(prompts):
+        x2 = list(tx.ids)
+        x2[p] = z
+        ref2 = nat.reference([x2], targets)
+        assert float(carry.kl(ref2, tx.ref).min()) > 1e-3  # the change moves the model
+        for b, want in ((0, tx.ref), (1, ref2), (2, ref2), (3, ref2)):
+            assert float(carry.kl(want[0], got[b, d]).max()) < 1e-5, (b, d)
+        assert float((got[4, d] - (got[5, d] if p in targets else tx.ref[0])).abs().max()) < 1e-5, d
+
+
+def test_path_patched_equals_pp_run():
+    """The batched path-patched run equals goal_eval's pp_run (the spec read one graph, prompt and node at a time) on a
+    model with large remainders: random stated graphs (nodes with blocks, connections, token edges into nodes and the
+    prediction, reads with stated pairs, the background alone or every pair) and complete graphs (with blocks and cut
+    value reads), every graph and prompt in one call: log q within 1e-4 (float32 sums in another order)."""
+    _, ge, tx, E, nodes, prompts = _pp_case(near=None)
+    g = torch.Generator().manual_seed(5)
+    graphs = [_pp_stated(_pp_nodes(nodes, g, f), tx.targets, g) for f in (0.3, 0.5, 0.8, 1.0)]
+    whole = [native.Graph(_pp_nodes(nodes, g, f), complete=True) for f in (0.2, 0.6)]
+    cuts = [None] * len(graphs) + [{(0, 9): [2, 4, 9], (1, 11): [6]}, {(1, 9): [4]}]
+    with torch.no_grad():
+        got = E.path_patched(graphs + whole, prompts, cuts=cuts)
+        x0 = E._pp_predict(E._x_run()["final"][E._targets])
+        moved = 0
+        for b, gr in enumerate(graphs + whole):
+            for d, (p, z) in enumerate(prompts):
+                x2 = list(tx.ids)
+                x2[p] = z
+                want = ge.pp_run(tx, x2, gr, cuts[b])[0]
+                assert float((got[b, d] - want).abs().max()) < 1e-4, (b, d, float((got[b, d] - want).abs().max()))
+                moved += float((want - x0).abs().max()) > 1e-3
+    assert moved >= (len(graphs) + len(whole)) * len(prompts) // 2  # the graphs carry the changes
+
+
+def test_path_patched_complete_is_every_connection():
+    """A complete graph (_pp_dense, the stream's change) equals the stated graph with every connection, token edge and
+    pair among its nodes (_pp_stated), on random node sets with blocks of a model with large remainders."""
+    _, _, tx, E, nodes, prompts = _pp_case(near=None)
+    g = torch.Generator().manual_seed(6)
+    sets = [_pp_nodes(nodes, g, f) for f in (0.2, 0.5, 0.9)]
+    with torch.no_grad():
+        whole = E.path_patched([native.Graph(s, complete=True) for s in sets], prompts)
+        stated = E.path_patched([_pp_every(s, tx.targets) for s in sets], prompts)
+    assert float((whole - stated).abs().max()) < 1e-4
+
+
+def test_path_patched_strengths():
+    """strengths: connection subsets of one stated graph (changed_edges' ons, its parents' connections then its writes
+    into the prediction) give the subset graphs' runs."""
+    _, _, tx, E, nodes, prompts = _pp_case(near=None)
+    g = torch.Generator().manual_seed(7)
+    base = _pp_stated(_pp_nodes(nodes, g, 0.6), tx.targets, g, keep=1.0)
+    edges = [(w, r) for r, ws in base.parents.items() for w in ws] + [(w, None) for w in base.out]
+    ons = (torch.rand(4, len(edges), generator=g) < 0.7).float()
+    subs = []
+    for row in ons.tolist():
+        kept = [e for e, k in zip(edges, row) if k]
+        parents = {}
+        for w, r in kept:
+            if r is not None:
+                parents.setdefault(r, []).append(w)
+        s = native.Graph(base.nodes, parents, [w for w, r in kept if r is None])
+        s.tok_edges, s.tok_out, s.pairs = base.tok_edges, base.tok_out, base.pairs
+        subs.append(s)
+    with torch.no_grad():
+        got = E.path_patched([base], prompts, strengths=ons)
+        want = E.path_patched(subs, prompts)
+    assert got.shape == want.shape
+    assert float((got - want).abs().max()) < 1e-5
+
+
+def test_path_patched_batches(monkeypatch):
+    """Prompts in several batches (each run from its earliest change) give the one batch's numbers."""
+    import engine
+
+    _, _, tx, E, nodes, prompts = _pp_case(near=None)
+    g = torch.Generator().manual_seed(8)
+    graphs = [_pp_stated(_pp_nodes(nodes, g, 0.5), tx.targets, g), native.Graph(_pp_nodes(nodes, g, 0.5), complete=True)]
+    with torch.no_grad():
+        one = E.path_patched(graphs, prompts)
+        monkeypatch.setattr(engine, "PP_ENTRIES", 1)
+        many = E.path_patched(graphs, prompts)
+    assert float((one - many).abs().max()) < 1e-5

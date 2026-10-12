@@ -613,3 +613,29 @@ def test_graph_search_steps_equal_whole_run():
         assert rel(got[0][0], got[1][0]) < REL, semantics
         for x0, x1 in zip(got[0][1:], got[1][1:]):
             assert float((x0 - x1).norm() / x0.norm().clamp_min(1e-30)) < REL, semantics
+
+
+def test_path_patched_equals_pp_run():
+    """Engine.path_patched (many graphs and changed texts at once) equals goal_eval.pp_run (one at a time) on vpd4l:
+    VPD's answer as a node set, and the stated graph with every connection among its nodes at the last 8 positions,
+    token edges into its readers and the prediction, on changes at four positions: log q within 2e-4 (7.6e-5 measured
+    on MPS: float32 sums in another order over the text's positions)."""
+    nat = native.Native(DEVICE)
+    ge = goal_eval.GoalEval(nat)
+    ids, targets = native.text(TEXT)
+    tx = ge.text(ids, targets, seed=0)
+    E = engine.Engine(nat, ids, targets, live=True)
+    vpd = native.Graph(masks=tx.vpd)
+    late = [nd for nd in sorted(vpd.node_set()) if nd[1] >= tx.T - 8]
+    stated = native.Graph(late, *native.all_edges(late, targets))
+    stated.tok_edges = [(nd[1], nd) for nd in late if native._name_layer_kind(nd[0])[1] in ("q_proj", "k_proj", "v_proj", "c_fc")]
+    stated.tok_out = list(targets)
+    V = nat.target.wte.shape[0]
+    prompts = [(q, (ids[q] + 17) % V) for q in (tx.T - 6, tx.T - 3, tx.T - 2, targets[-1])]
+    with torch.no_grad():
+        got = E.path_patched([vpd, stated], prompts)
+        for b, g in enumerate((vpd, stated)):
+            for d, (p, z) in enumerate(prompts):
+                x2 = list(ids)
+                x2[p] = z
+                assert float((got[b, d] - ge.pp_run(tx, x2, g)[0]).abs().max()) < 2e-4, (b, d)

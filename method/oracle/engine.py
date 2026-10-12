@@ -452,6 +452,605 @@ class Engine:
         return {"k": [k.repeat(times, 1, 1, 1) for k in states["k"]], "v": [v.repeat(times, 1, 1, 1) for v in states["v"]],
                 "aw": {n: a.repeat(times) for n, a in states["aw"].items()}, "ak": [a.repeat(times, 1, 1) for a in states["ak"]]}
 
+    @torch.no_grad()
+    def _x_run(self) -> dict:
+        """The real model's run on the engine's text, kept (path_patched's x): per layer the residual stream entering the
+        attention and the MLP [T, d] and their norms, the rotated queries and keys and the values [H, T, hd], the scores
+        and the pattern [H, T, T], the attention output before o_proj [T, d], the MLP's pre-activation and GELU
+        [T, d_ff]; the final stream [T, d]; every site's whole output [T, d_out] (so; queries and keys unrotated).
+        float32, vpd_model's own norm and GELU, every matrix its full weight."""
+        if not hasattr(self, "_xr"):
+            tg, T, H, hd = self.tg, self.T, self.H, self.hd
+            W = lambda i, kd: tg.site(native.site_name(i, kd)).W  # noqa: E731
+            causal = torch.ones(T, T, dtype=torch.bool, device=self.dev).tril()
+            x = self.emb[0]
+            out = {k: [] for k in ("xa", "xm", "ha", "hm", "q", "k", "v", "S", "A", "y", "pre", "g")}
+            so = out["so"] = {}
+            for i in range(tg.n_layer):
+                nm = lambda kd, i=i: native.site_name(i, kd)  # noqa: E731
+                h = self.rms(x, tg.norms[2 * i], self.eps)
+                for kd in ("q_proj", "k_proj", "v_proj"):
+                    so[nm(kd)] = h @ W(i, kd).T
+                q, k, v = (so[nm(kd)].view(T, H, hd).transpose(0, 1) for kd in ("q_proj", "k_proj", "v_proj"))
+                q, k = tg._rope(q, T), tg._rope(k, T)
+                S = (q @ k.transpose(-1, -2)) / math.sqrt(hd)
+                A = S.masked_fill(~causal, float("-inf")).softmax(-1)
+                y = (A @ v).transpose(0, 1).reshape(T, -1)
+                for key, val in (("xa", x), ("ha", h), ("q", q), ("k", k), ("v", v), ("S", S), ("A", A), ("y", y)):
+                    out[key].append(val)
+                so[nm("o_proj")] = y @ W(i, "o_proj").T
+                x = x + so[nm("o_proj")]
+                h2 = self.rms(x, tg.norms[2 * i + 1], self.eps)
+                pre = so[nm("c_fc")] = h2 @ W(i, "c_fc").T
+                g = self.gelu(pre)
+                for key, val in (("xm", x), ("hm", h2), ("pre", pre), ("g", g)):
+                    out[key].append(val)
+                so[nm("down_proj")] = g @ W(i, "down_proj").T
+                x = x + so[nm("down_proj")]
+            out["final"] = x
+            self._xr = out
+        return self._xr
+
+    @torch.no_grad()
+    def path_patched(self, graphs: list, prompts: list, strengths: torch.Tensor | None = None, cuts: list | None = None) -> torch.Tensor:
+        """log q at the targets [len(graphs), len(prompts), targets, V] of each graph's path-patched run on the engine's
+        text x with prompts[d] = (position p, token z) changed (s_track_pp, the lead's spec 10-12; goal_eval.pp_run, one
+        graph and prompt at a time, the reference). x is the real model's run on x (_x_run); in the patched run P the
+        change travels only along stated paths. A circuit node reads its stated parents' outputs from P and everything
+        else from x (unstated writers, in the circuit or not, the remainders and the embeddings; the token at p only
+        through a stated token edge (graph.tok_edges (p, node)) into a node at p), its norm on that combined input. A
+        read (layer, t), the pattern row its attention output nodes take: queries and keys split into the graph's
+        nodes and the rest (at x); with an entry in graph.pairs (possibly empty: the background alone) x's scores plus
+        each stated pair's change, P's parts in place of x's; without one every pair claimed, the graph's queries and
+        keys at P; softmax over the row. An attention output node: that row over x's values plus its stated value
+        parents' changes. A block node (site, t, negative index) is the site's whole output at t from its patched input
+        (every subcomponent and the remainder; the graph's subcomponent nodes there dropped). Outside the circuit
+        everything is x's; the prediction reads P's stated writers into it and x's every other, and at a target t the
+        changed token's embedding when t is in graph.tok_out. With nothing stated P is x; a stated parent's value is
+        P's, never the model's on x'. A complete graph states every connection the model has among its nodes, every
+        token edge (into its residual readers and the prediction) and every pair (_pp_dense); cuts, per complete graph
+        {(layer, t): [source positions]}: its attention outputs at (layer, t) read those sources' values at x. strengths
+        [K, E + O]: graphs[0]'s connection subsets (goal_eval.changed_edges' ons: its parents' connections then its
+        writers into the prediction; its nodes, token edges and pairs in each), the result [K, ...]. Only nodes whose
+        input changed are recomputed, against the kept x run, from the earliest change in a batch of prompts on."""
+        if strengths is not None:
+            return self._pp_stated(self._pp_union(graphs[:1], strengths), prompts)
+        out = [None] * len(graphs)
+        whole = [i for i, g in enumerate(graphs) if g.complete]
+        stated = [i for i, g in enumerate(graphs) if not g.complete]
+        if whole:
+            got = self._pp_dense([graphs[i] for i in whole], prompts, None if cuts is None else [cuts[i] for i in whole])
+            for i, lq in zip(whole, got):
+                out[i] = lq
+        if stated:
+            if cuts is not None and any(cuts[i] for i in stated):
+                raise ValueError("cuts are a complete graph's")
+            for i, lq in zip(stated, self._pp_stated(self._pp_union([graphs[i] for i in stated]), prompts)):
+                out[i] = lq
+        return torch.stack(out)
+
+    def _pp_chunks(self, prompts: list, cost) -> list:
+        """Prompt indices in batches, the latest change first, each batch's prompts times cost(its earliest change) at
+        most PP_ENTRIES."""
+        order = sorted(range(len(prompts)), key=lambda d: -prompts[d][0])
+        out, cur = [], []
+        for d in order:
+            if cur and (len(cur) + 1) * cost(prompts[d][0]) > PP_ENTRIES:
+                out.append(cur)
+                cur = []
+            cur.append(d)
+        return out + [cur] if cur else out
+
+    def _pp_token(self, part: list, G: int) -> tuple:
+        """(each row's change position [D G], its embedding change [D G, d]): rows prompt-major, graph-minor."""
+        dev, wte = self.dev, self.tg.wte
+        p = torch.tensor([p for p, _ in part], device=dev).repeat_interleave(G)
+        z = torch.tensor([z for _, z in part], device=dev).repeat_interleave(G)
+        x0 = torch.tensor([self.ids[p] for p, _ in part], device=dev).repeat_interleave(G)
+        return p, wte[z] - wte[x0]
+
+    def _pp_predict(self, z: torch.Tensor) -> torch.Tensor:
+        return torch.log_softmax(self.rms(z, self.tg.ln_f, self.eps) @ self.tg.wte.T, -1)
+
+    def _pp_dense(self, graphs: list, prompts: list, cuts: list | None = None) -> torch.Tensor:
+        """path_patched of complete graphs: per prompt batch one run of the stream's change from its earliest change on,
+        each site's circuit columns (and blocks) recomputed on x's input plus the change at the rows whose input
+        changed; the graphs' nodes, blocks and cuts kept from the prompts' earliest change on (s0)."""
+        tg, T, H, dev, xr = self.tg, self.T, self.H, self.dev, self._x_run()
+        G, names, s0 = len(graphs), self.nat.names, min(p for p, _ in prompts)
+        parts, blocks = {}, {}
+        sid = {n: j for j, n in enumerate(names)}
+        CM = max(self.nat.C.values()) + 1  # a node packed as (site T + position) CM + column + 1 (a block's column -1)
+        keys, own = [], []
+        for gi, g in enumerate(graphs):
+            if g.masks is not None:
+                for n, m in g.masks.items():
+                    t, c = m[s0:].to(dev).nonzero(as_tuple=True)
+                    parts.setdefault(n, []).append((torch.full_like(t, gi), t + s0, c))
+                continue
+            keys.append(torch.tensor([(sid[n] * T + t) * CM + c + 1 for n, t, c in g.node_set()], dtype=torch.long))
+            own.append(torch.full((len(keys[-1]),), gi, dtype=torch.long))
+        if keys:
+            k, o = torch.cat(keys).to(dev), torch.cat(own).to(dev)
+            c, t, si = k % CM - 1, (k // CM) % T, k // (CM * T)
+            late = t >= s0
+            c, t, si, o = c[late], t[late], si[late], o[late]
+            for j in si.unique().tolist():
+                m = si == j
+                bl = m & (c < 0)
+                if bool(bl.any()):
+                    blocks.setdefault(names[j], []).append((o[bl], t[bl], c[bl]))
+                pm = m & (c >= 0)
+                if bool(pm.any()):
+                    parts.setdefault(names[j], []).append((o[pm], t[pm], c[pm]))
+        sites = {}
+        for n in set(parts) | set(blocks):
+            st, m, V, U, bm = tg.site(n), None, None, None, None
+            if n in blocks:
+                g_, t_, _ = (torch.cat(x) for x in zip(*blocks[n]))
+                bm = torch.zeros(G, T - s0, dtype=torch.bool, device=dev)
+                bm[g_, t_ - s0] = True
+            if n in parts:
+                g_, t_, c_ = (torch.cat(x) for x in zip(*parts[n]))
+                cols, ci = torch.unique(c_, return_inverse=True)
+                m = torch.zeros(G, T - s0, len(cols), dtype=torch.bool, device=dev)
+                m[g_, t_ - s0, ci] = True
+                if bm is not None:  # a block holds its site's subcomponents there
+                    m &= ~bm[..., None]
+                V, U = st.V[:, cols], st.U[cols]
+            sites[n] = (m, V, U, bm, st.W)
+        cm = {}  # per layer [G, T - s0, T]: the value reads (query position from s0, source) at x
+        for gi, cg in enumerate(cuts or []):
+            for (layer, t), srcs in (cg or {}).items():
+                if srcs and t >= s0:
+                    cm.setdefault(layer, torch.zeros(G, T - s0, T, dtype=torch.bool, device=dev))[gi, t - s0, sorted(srcs)] = True
+        res = torch.empty(G, len(prompts), len(self.targets), tg.wte.shape[0], device=dev)
+        for chunk in self._pp_chunks(prompts, lambda s: G * H * (T - s) * T):
+            part = [prompts[d] for d in chunk]
+            lq = self._pp_dense_run(sites, cm, G, part, xr, s0)
+            res[:, chunk] = lq.view(len(part), G, *lq.shape[1:]).transpose(0, 1)
+        return res
+
+    def _pp_dense_run(self, sites: dict, cm: dict, G: int, part: list, xr: dict, s0: int) -> torch.Tensor:
+        tg, T, H, hd, dev = self.tg, self.T, self.H, self.hd, self.dev
+        s = min(p for p, _ in part)
+        Tn, D = T - s, len(part)
+        B, ar = D * G, torch.arange(D * G, device=dev)
+        p, dtok = self._pp_token(part, G)
+        tok = torch.zeros(B, Tn, tg.wte.shape[1], device=dev)
+        tok[ar, p - s] = dtok
+        chg = torch.zeros(B, Tn, dtype=torch.bool, device=dev)  # whether a residual reader's input changed
+        chg[ar, p - s] = True
+        dS = torch.zeros_like(tok)  # the circuit's residual writers' change
+        late = torch.arange(s, T, device=dev)[:, None] < torch.arange(T, device=dev)[None, :]  # keys after the query
+
+        def delta(n, hP, hx, rows):  # site n's circuit output change [B, Tn, d_out], zero off rows (inputs changed)
+            m, V, U, bm, W = sites[n]
+            out = None
+            if m is not None:
+                out = ((hP @ V - hx @ V) * (m[:, s - s0:].repeat(D, 1, 1) & rows[..., None])) @ U
+            if bm is not None:  # blocks: the whole output's change
+                ob = ((hP - hx) @ W.T) * (bm[:, s - s0:].repeat(D, 1) & rows)[..., None]
+                out = ob if out is None else out + ob
+            return out
+
+        def heads(z):
+            return z.view(B, Tn, H, hd).transpose(1, 2)
+        for i in range(tg.n_layer):
+            nm = lambda kd, i=i: native.site_name(i, kd)  # noqa: E731
+            hP = self.rms(xr["xa"][i][s:] + dS + tok, tg.norms[2 * i], self.eps)
+            dq, dk, dv = (delta(nm(kd), hP, xr["ha"][i][s:], chg) if nm(kd) in sites else None for kd in ("q_proj", "k_proj", "v_proj"))
+            q, k, v = (xr[x][i].expand(B, -1, -1, -1) for x in ("q", "k", "v"))
+            q = q[:, :, s:]
+            moved = torch.zeros(B, Tn, dtype=torch.bool, device=dev)  # a query, or a key or value at or before, changed
+            kv = torch.zeros(B, Tn, dtype=torch.bool, device=dev)
+            if dq is not None:
+                q = q + tg._rope_from(heads(dq), s, T)
+                moved |= (dq != 0).any(-1)
+            if dk is not None:
+                k = torch.cat([k[:, :, :s], k[:, :, s:] + tg._rope_from(heads(dk), s, T)], 2)
+                kv |= (dk != 0).any(-1)
+            if dv is not None:
+                v = torch.cat([v[:, :, :s], v[:, :, s:] + heads(dv)], 2)
+                kv |= (dv != 0).any(-1)
+            moved |= kv.int().cummax(1).values.bool()
+            if nm("o_proj") in sites and bool(moved.any()):
+                A = (q @ k.transpose(-1, -2) / math.sqrt(hd)).masked_fill(late, float("-inf")).softmax(-1)
+                yh = A @ v
+                if i in cm and dv is not None:  # cut value reads: those sources' values at x
+                    dvh = torch.cat([torch.zeros(B, H, s, hd, device=dev), heads(dv)], 2)
+                    yh = yh - (A * cm[i][:, s - s0:].repeat(D, 1, 1)[:, None]) @ dvh
+                do = delta(nm("o_proj"), yh.transpose(1, 2).reshape(B, Tn, -1), xr["y"][i][s:], moved)
+                dS = dS + do
+                chg |= (do != 0).any(-1)
+            if nm("c_fc") in sites and nm("down_proj") in sites:
+                hP = self.rms(xr["xm"][i][s:] + dS + tok, tg.norms[2 * i + 1], self.eps)
+                dp = delta(nm("c_fc"), hP, xr["hm"][i][s:], chg)
+                dd = delta(nm("down_proj"), self.gelu(xr["pre"][i][s:] + dp), xr["g"][i][s:], (dp != 0).any(-1))
+                dS = dS + dd
+                chg |= (dd != 0).any(-1)
+        z = xr["final"][self._targets].expand(B, -1, -1).clone()
+        ok = [j for j, t in enumerate(self.targets) if t >= s]
+        if ok:  # the circuit's writers and the token's embedding into the prediction
+            at = [self.targets[j] - s for j in ok]
+            z[:, ok] += dS[:, at] + tok[:, at]
+        return self._pp_predict(z)
+
+    def _pp_union(self, graphs: list, ons: torch.Tensor | None = None) -> dict:
+        """path_patched's stated graphs as index tensors over their union: per site its nodes (union index, position,
+        V's columns transposed and U's rows (zero at blocks), x's activations, a block's x output; a query's or key's U
+        rows rotated at its position and its x part), per graph its nodes (those its blocks hold dropped), its strength
+        of each connection (a residual or MLP read, a value read, a write into the prediction), token edge (into a node
+        or the prediction) and query-key pair, and per layer the reads its attention outputs take, with whether the
+        graph has an entry for each. With ons [K, E + O] the K graphs are graphs[0]'s connection subsets (ons' columns
+        its parents' connections then its writers into the prediction), with its nodes, token edges and pairs."""
+        tg, H, hd, dev, xr = self.tg, self.H, self.hd, self.dev, self._x_run()
+        sets = [g.node_set() for g in graphs]
+        nodes = sorted(set().union(*sets))
+        at = {nd: i for i, nd in enumerate(nodes)}
+        N = len(nodes)
+
+        def kept(st):  # a graph's nodes, those its blocks hold dropped
+            bl = {(n, t) for n, t, c in st if c < 0}
+            return [at[nd] for nd in st if nd[2] < 0 or (nd[0], nd[1]) not in bl]
+
+        def conns(g):
+            return [("e", w, r) for r, ws in g.parents.items() for w in ws] + [("o", w) for w in g.out]
+
+        def extra(g):
+            return ([("t", p, r) for p, r in getattr(g, "tok_edges", [])] + [("u", t) for t in getattr(g, "tok_out", [])]
+                    + [("p", L, t, qa, kb) for (L, t), lst in (getattr(g, "pairs", None) or {}).items() for qa, kb in lst
+                       if qa is not None or kb is not None])
+        if ons is None:
+            G, col, keys, on = len(graphs), {}, [], []
+            member = torch.zeros(G, N, dtype=torch.bool)
+            for gi, (g, st) in enumerate(zip(graphs, sets)):
+                member[gi, kept(st)] = True
+                ix = []
+                for k in conns(g) + extra(g):
+                    if k not in col:
+                        col[k] = len(keys)
+                        keys.append(k)
+                    ix.append(col[k])
+                on.append(ix)
+            onm = torch.zeros(G, len(keys))
+            for gi, ix in enumerate(on):
+                onm[gi, ix] = 1.0
+            onm = onm.to(dev)
+            entries = [set(getattr(g, "pairs", None) or {}) for g in graphs]
+        else:
+            G = len(ons)
+            member = torch.zeros(G, N, dtype=torch.bool)
+            member[:, kept(sets[0])] = True
+            keys = conns(graphs[0])
+            if len(keys) != ons.shape[1]:
+                raise ValueError(f"strengths have {ons.shape[1]} columns, the graph {len(keys)} connections")
+            ex = list(dict.fromkeys(extra(graphs[0])))
+            keys = keys + ex
+            onm = torch.cat([ons.to(dev, torch.float32), torch.ones(G, len(ex), device=dev)], 1)
+            entries = [set(getattr(graphs[0], "pairs", None) or {})] * G
+        inp = {"q_proj": "ha", "k_proj": "ha", "v_proj": "ha", "o_proj": "y", "c_fc": "hm", "down_proj": "g"}
+        by = {}
+        for i, nd in enumerate(nodes):
+            by.setdefault(nd[0], []).append(i)
+        names = sorted(by)
+        slot = [0] * N
+        sites, ax = {}, torch.zeros(N, device=dev)
+        Ures = torch.zeros(N, tg.wte.shape[1], device=dev)  # residual writers' write vectors (zero at blocks)
+        half = hd // 2
+
+        def rot(u, t):  # [R, H, hd] rotated at positions t [R]
+            return u * tg.cos[t][:, None] + torch.cat([-u[..., half:], u[..., :half]], -1) * tg.sin[t][:, None]
+        for n, ii in by.items():
+            L, kd = native._name_layer_kind(n)
+            st = tg.site(n)
+            t = torch.tensor([nodes[i][1] for i in ii], device=dev)
+            c = torch.tensor([nodes[i][2] for i in ii], device=dev)
+            isb = c < 0
+            iit = torch.tensor(ii, device=dev)
+            Vt = st.V[:, c.clamp(min=0)].T * (~isb)[:, None]
+            U = st.U[c.clamp(min=0)] * (~isb)[:, None]
+            a = (xr[inp[kd]][L][t] * Vt).sum(-1)
+            ax[iit] = a
+            for j, i in enumerate(ii):
+                slot[i] = j
+            info = {"i": iit, "t": t, "Vt": Vt, "U": U, "L": L, "kind": kd, "isb": isb, "nb": int(isb.sum()), "W": st.W,
+                    "bslot": torch.where(isb, torch.cumsum(isb.long(), 0) - 1, -1)}
+            if info["nb"]:
+                info["xo"] = xr["so"][n][t[isb]]  # x's whole output at the blocks' positions [Rb, d_out]
+                info["bpos"] = isb.nonzero().flatten()
+            if kd in ("o_proj", "down_proj"):
+                Ures[iit] = U
+            if kd in ("q_proj", "k_proj"):
+                info["rot"] = rot(U.view(len(ii), H, hd), t)
+                xp = a[:, None, None] * info["rot"]
+                xp[isb] = xr["q" if kd == "q_proj" else "k"][L][:, t[isb]].transpose(0, 1)  # a block's x part: the whole
+                info["xpart"] = xp
+            sites[n] = info
+        rd, outs, toks, touts, prs = {}, [], {}, [], {}
+        sid = {n: j for j, n in enumerate(names)}
+        for j, k in enumerate(keys):
+            if k[0] == "e":
+                w, r = at[k[1]], at[k[2]]
+                rd.setdefault(k[2][0], []).append((w, slot[w], slot[r], j, int(k[1][2] < 0), sid[k[1][0]]))
+            elif k[0] == "o":
+                w = at[k[1]]
+                outs.append((w, self.targets.index(k[1][1]), j, int(k[1][2] < 0), slot[w], sid[k[1][0]]))
+            elif k[0] == "t":
+                toks.setdefault(k[2][0], []).append((k[1], slot[at[k[2]]], j))
+            elif k[0] == "u":
+                touts.append((k[1], self.targets.index(k[1]), j))
+            else:
+                prs.setdefault(k[1], []).append((k[2], -1 if k[3] is None else at[k[3]], -1 if k[4] is None else at[k[4]], j))
+        lt = lambda rows: torch.tensor(rows, device=dev, dtype=torch.long).T  # noqa: E731
+        for n, rows in rd.items():  # per reader site: writer (union index, slot, is a block, site), reader slot, column
+            sites[n]["reads"] = lt(rows)
+        for n, rows in toks.items():  # per reader site: position, reader slot, column
+            sites[n]["toks"] = lt(rows)
+        reads = {}
+        for n, st in sites.items():  # per layer: the reads its attention outputs take, each graph's entries, the pairs
+            if st["kind"] != "o_proj":
+                continue
+            L = st["L"]
+            ts = sorted(set(st["t"].tolist()))
+            tj = {t: j for j, t in enumerate(ts)}
+            ent = torch.tensor([[(L, t) in e for t in ts] for e in entries], dtype=torch.bool, device=dev)
+            rows = [(tj[r[0]],) + r[1:] for r in prs.get(L, []) if r[0] in tj]
+            reads[L] = (torch.tensor(ts, device=dev), ent, lt(rows) if rows else None)
+        return {"G": G, "N": N, "member": member.to(dev), "on": onm, "sites": sites, "ax": ax, "Ures": Ures, "names": names,
+                "reads": reads, "outs": lt(outs) if outs else None, "touts": lt(touts) if touts else None,
+                "slot": torch.tensor(slot, device=dev)}
+
+    def _pp_stated(self, un: dict, prompts: list) -> torch.Tensor:
+        """path_patched of _pp_union's graphs, prompts in batches of rows (prompts x graphs) whose largest products
+        (per row a change per node, and a pattern row per read of a layer) stay within PP_ENTRIES."""
+        G, T, H = un["G"], self.T, self.H
+        J = max([len(r[0]) for r in un["reads"].values()], default=0)
+        res = torch.empty(G, len(prompts), len(self.targets), self.tg.wte.shape[0], device=self.dev)
+        for chunk in self._pp_chunks(prompts, lambda s: G * max(un["N"], J * H * T, 1)):
+            part = [prompts[d] for d in chunk]
+            lq = self._pp_stated_run(un, part)
+            res[:, chunk] = lq.view(len(part), G, *lq.shape[1:]).transpose(0, 1)
+        return res
+
+    def _pp_stated_run(self, un: dict, part: list) -> torch.Tensor:
+        tg, T, H, hd, dev, xr = self.tg, self.T, self.H, self.hd, self.dev, self._x_run()
+        G, sites, ax, names = un["G"], un["sites"], un["ax"], un["names"]
+        D = len(part)
+        B = D * G
+        gb = torch.arange(B, device=dev) % G
+        p, dtok = self._pp_token(part, G)
+        dlt = torch.zeros(B, un["N"], device=dev)  # a subcomponent's P activation minus x's; a block: 1 where it changed
+        bv = {}  # per site with blocks [B, blocks, d_out]: P's whole output minus x's
+        member, on = un["member"][gb], un["on"][gb]
+        half = hd // 2
+
+        def rows_of(st, hits):  # (rows b, slot) of the site's members hit, and the [B, R] row lookup
+            hit = torch.zeros(B, len(st["i"]), dtype=torch.bool, device=dev)
+            for b_, r_ in hits:
+                hit[b_, r_] = True
+            hit &= member[:, st["i"]]
+            bi, ri = hit.nonzero(as_tuple=True)
+            rid = torch.full((B, len(st["i"])), -1, dtype=torch.long, device=dev)
+            rid[bi, ri] = torch.arange(len(bi), device=dev)
+            return bi, ri, rid
+
+        def edges(st):  # its reads' strength x writer change [B, E] and (b, e) where nonzero
+            w, _, _, j, _, _ = st["reads"]
+            cf = on[:, j] * dlt[:, w]
+            return cf, cf.nonzero(as_tuple=True)
+
+        def writers(out, rr, eb, ee, cf, st, vec, scale=None):  # out[rr] += each stated parent's change (rows rr)
+            w, ws, _, _, wb, wsid = st["reads"]
+            sub = wb[ee] == 0
+            e1, b1, r1 = ee[sub], eb[sub], rr[sub]
+            if len(e1):
+                out = _add_rows(out, r1, cf[b1, e1], lambda k: vec(w[e1[k]], ws[e1[k]], b1[k], e1[k], r1[k]))
+            e2, b2, r2 = ee[~sub], eb[~sub], rr[~sub]
+            for si in wsid[e2].unique().tolist():  # blocks: their whole output's change
+                m = wsid[e2] == si
+                wst = sites[names[si]]
+                ch = bv[names[si]][b2[m], wst["bslot"][ws[e2[m]]]]
+                if scale is not None:
+                    ch = scale(ch, e2[m], r2[m])
+                out = out.index_add(0, r2[m], cf[b2[m], e2[m], None] * ch)
+            return out
+
+        def finish(n, st, bi, ri, h):  # the changed rows' P values from their inputs h [rows, d_in]
+            ni, isb = st["i"][ri], st["isb"][ri]
+            sub = ~isb
+            dlt[bi[sub], ni[sub]] = (h[sub] * st["Vt"][ri[sub]]).sum(-1) - ax[ni[sub]]
+            if bool(isb.any()):
+                bs = st["bslot"][ri[isb]]
+                ch = h[isb] @ st["W"].T - st["xo"][bs]
+                if n not in bv:
+                    bv[n] = torch.zeros(B, st["nb"], st["W"].shape[0], device=dev)
+                bv[n][bi[isb], bs] = ch
+                dlt[bi[isb], ni[isb]] = (ch != 0).any(-1).float()
+
+        def read(n, xin, norm):  # a residual or MLP reader site: its changed members' P values
+            st = sites.get(n)
+            if st is None or ("reads" not in st and "toks" not in st):
+                return
+            hits = []
+            if "reads" in st:
+                cf, (eb, ee) = edges(st)
+                hits.append((eb, st["reads"][2][ee]))
+            if "toks" in st:
+                tp, tr, tj = st["toks"]
+                tb, tk = ((on[:, tj] > 0) & (tp[None, :] == p[:, None])).nonzero(as_tuple=True)
+                hits.append((tb, tr[tk]))
+            bi, ri, rid = rows_of(st, hits)
+            if len(bi) == 0:
+                return
+            Dm = torch.zeros(len(bi), xin.shape[-1], device=dev)
+            if "reads" in st:
+                rr = rid[eb, st["reads"][2][ee]]
+                keep = rr >= 0
+                table = un["Ures"] if norm is not None else sites[native.site_name(st["L"], "c_fc")]["U"]
+                Dm = writers(Dm, rr[keep], eb[keep], ee[keep], cf, st,
+                             (lambda w, ws, *_: table[w]) if norm is not None else (lambda w, ws, *_: table[ws]))
+            if "toks" in st:
+                rr = rid[tb, tr[tk]]
+                keep = rr >= 0
+                Dm.index_add_(0, rr[keep], dtok[tb[keep]])
+            z = xin[st["t"][ri]] + Dm
+            finish(n, st, bi, ri, self.rms(z, norm, self.eps) if norm is not None else self.gelu(z))
+
+        def qk_changes(n):  # a query or key site's blocks' changes rotated [B, blocks, H, hd] (None: no block changed)
+            st = sites.get(n)
+            if st is None or n not in bv:
+                return None
+            u = bv[n].view(B, st["nb"], H, hd)
+            t = st["t"][st["bpos"]]
+            return u * tg.cos[t][None, :, None] + torch.cat([-u[..., half:], u[..., :half]], -1) * tg.sin[t][None, :, None]
+
+        def gather_sum(st, rotb, w, ab):  # sum over the site's nodes of w [A, R] x each one's part change -> [A, H, hd]
+            out = torch.einsum("ar,rhe->ahe", w * dlt[ab][:, st["i"]], st["rot"])
+            if rotb is not None:
+                out = out + torch.einsum("ar,arhe->ahe", w[:, st["bpos"]], rotb[ab])
+            return out
+
+        def key_terms(dS, st, rotb, vec, w, ab):  # dS[a, :, t_k] += w[a, k] (vec[a] . key k's part change), per head
+            step = max(1, PP_ENTRIES // max(1, len(st["i"]) * H * 4))
+            for a0 in range(0, len(ab), step):
+                sl = slice(a0, a0 + step)
+                c = torch.einsum("ahe,khe->akh", vec[sl], st["rot"]) * (w[sl] * dlt[ab[sl]][:, st["i"]])[..., None]
+                if rotb is not None:
+                    c[:, st["bpos"]] = torch.einsum("ahe,akhe->akh", vec[sl], rotb[ab[sl]]) * w[sl][:, st["bpos"], None]
+                dS[sl].index_add_(2, st["t"], c.permute(0, 2, 1))
+
+        def part(st, rotb, b, sl):  # (x part, part change) [n, H, hd] of query or key nodes (slots sl) in rows b
+            ch = dlt[b, st["i"][sl]][:, None, None] * st["rot"][sl]
+            if rotb is not None:
+                isb = st["isb"][sl]
+                ch = torch.where(isb[:, None, None], rotb[b, st["bslot"][sl].clamp(min=0)], ch)
+            return st["xpart"][sl], ch
+
+        def attend(i):  # layer i's attention output members: their reads' pattern rows, their values
+            st = sites.get(native.site_name(i, "o_proj"))
+            if st is None:
+                return
+            sq, sk = sites.get(native.site_name(i, "q_proj")), sites.get(native.site_name(i, "k_proj"))
+            qb, kb_ = qk_changes(native.site_name(i, "q_proj")), qk_changes(native.site_name(i, "k_proj"))
+            ts, ent, prow = un["reads"][i]
+            J = len(ts)
+            tj = torch.full((T,), -1, dtype=torch.long, device=dev)
+            tj[ts] = torch.arange(J, device=dev)
+            entb = ent[gb]  # [B, J]
+            act = torch.zeros(B, J, dtype=torch.bool, device=dev)
+            if sq is not None:  # every-pair reads: a query of the graph at the read changed
+                qj = tj[sq["t"]]
+                qc = (member[:, sq["i"]] & (dlt[:, sq["i"]] != 0) & (qj >= 0)[None, :])
+                qb_, qr_ = qc.nonzero(as_tuple=True)
+                act[qb_, qj[qr_]] = True
+            if sk is not None:  # or a key at or before it
+                kp = torch.zeros(B, T, dtype=torch.bool, device=dev)
+                kb2, kr2 = (member[:, sk["i"]] & (dlt[:, sk["i"]] != 0)).nonzero(as_tuple=True)
+                kp[kb2, sk["t"][kr2]] = True
+                act |= kp.int().cummax(1).values.bool()[:, ts]
+            act &= ~entb
+            if prow is not None:  # stated reads: a stated pair's query or key changed
+                pj, qa, kb, pc = prow
+                po = on[:, pc]
+                qd = torch.where(qa >= 0, dlt[:, qa.clamp(min=0)], 0.0)
+                kd = torch.where(kb >= 0, dlt[:, kb.clamp(min=0)], 0.0)
+                lb, lp = ((po != 0) & ((qd != 0) | (kd != 0))).nonzero(as_tuple=True)
+                act[lb, pj[lp]] = True
+            ab, aj = act.nonzero(as_tuple=True)
+            arow = torch.full((B, max(J, 1)), -1, dtype=torch.long, device=dev)
+            Prow = None
+            if len(ab):
+                A = len(ab)
+                arow[ab, aj] = torch.arange(A, device=dev)
+                ta = ts[aj]
+                every = ~entb[ab, aj]
+                dS = torch.zeros(A, H, T, device=dev)
+                qx = xr["q"][i][:, ta].transpose(0, 1)  # [A, H, hd]
+                dQ, qrest = torch.zeros_like(qx), qx
+                if sq is not None:
+                    mine = member[ab][:, sq["i"]] & (sq["t"][None, :] == ta[:, None])  # the row's graph's queries at its read
+                    wq = (mine & every[:, None]).float()
+                    if prow is not None:  # stated reads: their (query, rest) pairs' queries, at their strengths
+                        sel = (qa[lp] >= 0) & (kb[lp] < 0)
+                        wq.index_put_((arow[lb[sel], pj[lp[sel]]], un["slot"][qa[lp[sel]]]), po[lb[sel], lp[sel]], accumulate=True)
+                    dQ = gather_sum(sq, qb, wq, ab)
+                    qrest = qx - torch.einsum("aq,qhe->ahe", mine.float(), sq["xpart"])
+                dS += torch.einsum("ahe,hse->ahs", dQ, xr["k"][i])
+                if sk is not None:
+                    before = member[ab][:, sk["i"]] & (sk["t"][None, :] <= ta[:, None])  # the row's graph's keys
+                    xk = torch.einsum("ahe,khe->akh", dQ, sk["xpart"]) * (before & ~every[:, None])[..., None]
+                    dS.index_add_(2, sk["t"], -xk.permute(0, 2, 1))  # stated reads' (query, rest): x's keys outside the graph
+                    wk = (before & every[:, None]).float()
+                    if prow is not None:  # stated reads: their (rest, key) pairs' keys, at their strengths
+                        sel = (qa[lp] < 0) & (kb[lp] >= 0)
+                        wk.index_put_((arow[lb[sel], pj[lp[sel]]], un["slot"][kb[lp[sel]]]), po[lb[sel], lp[sel]], accumulate=True)
+                    key_terms(dS, sk, kb_, torch.where(every[:, None, None], qx + dQ, qrest), wk, ab)
+                    if prow is not None:  # (query, key) pairs: P's product of the two parts minus x's
+                        sel = (qa[lp] >= 0) & (kb[lp] >= 0)
+                        b2, l2 = lb[sel], lp[sel]
+                        if len(l2):
+                            xq, cq = part(sq, qb, b2, un["slot"][qa[l2]])
+                            xk_, ck = part(sk, kb_, b2, un["slot"][kb[l2]])
+                            val = po[b2, l2, None] * (cq * xk_ + xq * ck + cq * ck).sum(-1)  # [n, H]
+                            hi = torch.arange(H, device=dev)
+                            dS.index_put_((arow[b2, pj[l2]][:, None].expand(-1, H), hi[None, :].expand(len(l2), -1),
+                                           sk["t"][un["slot"][kb[l2]]][:, None].expand(-1, H)), val, accumulate=True)
+                S = xr["S"][i][:, ta].transpose(0, 1) + dS / math.sqrt(hd)
+                Prow = S.masked_fill(torch.arange(T, device=dev)[None, None, :] > ta[:, None, None], float("-inf")).softmax(-1)
+            hits = []
+            rj = tj[st["t"]]
+            if Prow is not None:  # members whose read's pattern moved
+                mb, mr = ((arow[:, rj.clamp(min=0)] >= 0) & (rj >= 0)[None, :]).nonzero(as_tuple=True)
+                hits.append((mb, mr))
+            if "reads" in st:
+                cf, (eb, ee) = edges(st)
+                hits.append((eb, st["reads"][2][ee]))
+            if not hits:
+                return
+            bi, ri, rid = rows_of(st, hits)
+            if len(bi) == 0:
+                return
+            Pr = xr["A"][i][:, st["t"][ri]].transpose(0, 1).clone()  # [R, H, T]: x's rows, the moved ones replaced
+            if Prow is not None:
+                r2 = rj[ri]
+                a2 = torch.where(r2 >= 0, arow[bi, r2.clamp(min=0)], -1)
+                mv = a2 >= 0
+                Pr[mv] = Prow[a2[mv]]
+            y = torch.einsum("rhs,hse->rhe", Pr, xr["v"][i]).reshape(len(bi), -1)
+            if "reads" in st:
+                rr = rid[eb, st["reads"][2][ee]]
+                keep = rr >= 0
+                Uv = sites[native.site_name(i, "v_proj")]["U"]
+                sv = sites[native.site_name(i, "v_proj")]["t"]
+                ws = st["reads"][1]
+
+                def weigh(ch, e, r):  # a value's change [n, H hd] weighed per head by its row's pattern at its position
+                    return (Pr[r, :, sv[ws[e]]][..., None] * ch.view(-1, H, hd)).reshape(-1, H * hd)
+                y = writers(y, rr[keep], eb[keep], ee[keep], cf, st, lambda w, s_, b_, e, r: weigh(Uv[s_], e, r), scale=weigh)
+            finish(native.site_name(i, "o_proj"), st, bi, ri, y)
+
+        for i in range(tg.n_layer):
+            for kd in ("q_proj", "k_proj", "v_proj"):
+                read(native.site_name(i, kd), xr["xa"][i], tg.norms[2 * i])
+            attend(i)
+            read(native.site_name(i, "c_fc"), xr["xm"][i], tg.norms[2 * i + 1])
+            read(native.site_name(i, "down_proj"), xr["pre"][i], None)
+        nt = len(self.targets)
+        z = xr["final"][self._targets].expand(B, -1, -1).reshape(B * nt, -1).clone()
+        if un["outs"] is not None:  # the stated writers into the prediction
+            w, ti, j, wb, ws, wsid = un["outs"]
+            cf = on[:, j] * dlt[:, w]
+            ob, oe = cf.nonzero(as_tuple=True)
+            st = {"reads": torch.stack([w, ws, ti, j, wb, wsid])}
+            z = writers(z, ob * nt + ti[oe], ob, oe, cf, st, lambda w_, *_: un["Ures"][w_])
+        z = z.view(B, nt, -1)
+        if un["touts"] is not None:  # the changed token's embedding into the prediction at its target
+            tp, ti, tj = un["touts"]
+            tb, tk = ((on[:, tj] > 0) & (tp[None, :] == p[:, None])).nonzero(as_tuple=True)
+            z[tb, ti[tk]] += dtok[tb]
+        return self._pp_predict(z)
+
     def _zeros(self) -> dict:
         if not hasattr(self, "_u0"):
             self._u0 = {n: torch.zeros(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
@@ -809,6 +1408,8 @@ def read_pairs(nodes, layer: int, t: int) -> list:
 
 
 ROWS = 1 << 24  # entries of a connection group's [connections, width] product made at once (64 MB in float32)
+PP_ENTRIES = 1 << 26  # floats in a path-patched batch's attention scores at once (256 MB in float32)
+PP_ROWS = 512  # rows (prompts x graphs) in a path-patched batch of stated graphs
 
 
 def _add_rows(out: torch.Tensor, ri: torch.Tensor, s: torch.Tensor, rows) -> torch.Tensor:

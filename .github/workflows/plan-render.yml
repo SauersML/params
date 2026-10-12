@@ -1,0 +1,67 @@
+name: plan-render
+
+# Renders plan/plan.mmd (the team's plan, a Mermaid dependency graph) to plan/plan.png
+# and keeps that image in README.md between the plan markers. Runs whenever the plan changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - plan/plan.mmd
+      - plan/mermaid.json
+      - .github/workflows/plan-render.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: plan-render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Fonts
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-inter fonts-dejavu-core > /dev/null || true
+
+      - name: Render plan/plan.mmd to plan/plan.png
+        run: |
+          echo '{"args": ["--no-sandbox", "--disable-setuid-sandbox"]}' > "$RUNNER_TEMP/puppeteer.json"
+          npx -y @mermaid-js/mermaid-cli@11.4.2 -p "$RUNNER_TEMP/puppeteer.json" \
+            -i plan/plan.mmd -o plan/plan.png -c plan/mermaid.json -b white -s 2
+
+      - name: Keep the image in README.md
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("README.md")
+          s = p.read_text() if p.exists() else ""
+          block = "<!-- plan:start -->\n![plan](plan/plan.png)\n<!-- plan:end -->"
+          if "<!-- plan:start -->" in s:
+              s = re.sub(r"<!-- plan:start -->.*?<!-- plan:end -->", block, s, flags=re.S)
+          else:
+              s = s.rstrip("\n") + "\n\n" + block + "\n"
+          p.write_text(s)
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plan/plan.png README.md
+          if git diff --cached --quiet; then echo "plan image unchanged"; exit 0; fi
+          git commit -q -m "plan: render plan/plan.mmd into README"
+          for i in 1 2 3 4 5 6; do
+            if git pull -q --rebase origin main && git push -q origin HEAD:main; then exit 0; fi
+            sleep $((i * 5))
+          done
+          echo "push failed after retries" >&2
+          exit 1

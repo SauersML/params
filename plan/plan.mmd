@@ -1,0 +1,125 @@
+%% THE PLAN: a dependency graph from foundations (bottom) up to final goals and impact (top).
+%% Solid arrows point from what is needed to what it enables. Dashed arrows: a check or decision feeds in.
+%% Thick red arrows: the critical path. Every agent may edit this file; keep it true.
+%% Rules for edits: change a node's class when its status changes (done, active, blocked, waiting,
+%% paused, decision); keep each label to 3-5 short lines with explicit <br/> breaks (about 34
+%% characters a line): title, why it matters or what it decides, status and owner. Update the
+%% legend's "updated" line. GitHub Actions renders this file to plan/plan.png and puts that image
+%% in README.md (.github/workflows/plan-render.yml). Check a local render before pushing:
+%%   npx -y @mermaid-js/mermaid-cli@11.4.2 -i plan/plan.mmd -o /tmp/plan.png -c plan/mermaid.json -b white -s 2
+flowchart BT
+
+  %% ================= impact and final goals =================
+  subgraph TOP["WHY IT MATTERS"]
+    IMP["<b>IMPACT</b><br/>Ambitious: know how a model<br/>computes, in units tied to its weights<br/>Practical: verified answers, audits<br/>and edits for deployed models, e.g.<br/>a true preference vs a surface reflex"]
+  end
+
+  subgraph GOALS["FINAL GOALS: what the oracle delivers"]
+    G1["<b>Faithful circuit</b><br/>small, sufficient, necessary;<br/>predicts interventions<br/>and weight edits"]
+    G2["<b>Correct English</b><br/>concepts tied to groups of<br/>subcomponents; invariants<br/>that hold when tested"]
+    G3["<b>Answers and edits</b><br/>explains behaviors,<br/>predicts changes, edits with<br/>predicted side effects"]
+    G4["<b>Scales</b><br/>many tokens, big models,<br/>fast; a recipe for<br/>other models"]
+  end
+
+  %% ================= proof =================
+  EVL["<b>Final evaluation</b><br/>sealed texts 9100–9149, first sample<br/>vs recency, VPD top-k, native units<br/>no-circuit and shuffled controls<br/>WAITING"]
+  ORC["<b>Trained oracle</b><br/>Qwen3-8B on Tinker<br/>WAITING"]
+  LATER["<b>Later</b><br/>after D1: native-units comparison,<br/>weight-edit test, library coverage,<br/>MNIST, tool environment<br/>after the user's VPD: real model,<br/>model organisms"]
+
+  %% ================= training =================
+  RL["<b>RL curriculum</b><br/>circuit, then + variables,<br/>+ questions, + English, + edits<br/>WAITING · primerl"]
+  D2{{"<b>D2</b> does the reward rank<br/>correct circuits over<br/>plausible wrong ones?"}}
+  D1{{"<b>D1</b> does the SFT oracle<br/>beat trivial baselines on<br/>held-out texts 9020–9049?"}}
+  ALT["<b>If not</b><br/>the oracle explains circuits<br/>that search finds; facts<br/>come through tools"]
+  SFT["<b>SFT v2</b><br/>circuit and edit targets<br/>in Mermaid<br/>WAITING on teacher · primerl"]
+  D0{{"<b>D0</b> do pruned circuits<br/>track held-out changes<br/>at 0.85 or more?"}}
+
+  %% ================= training inputs =================
+  TCH["<b>Teacher circuits v2</b><br/>influential start, then pruning<br/>444 train + 50 held-out texts<br/>BLOCKED on overfit fix<br/>fleet · pymove"]
+  DD["<b>Discriminating draws</b><br/>why: pruning on fixed changes<br/>overfit (held-out 0.34 vs 0.88)<br/>ACTIVE · pymove, about 1 h"]
+  BK["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity 2× (no backups)<br/>ACTIVE"]
+  INP["<b>Oracle input</b><br/>text + candidate list<br/>(96% coverage), fits context<br/>DONE · format set by the grid"]
+  LRN["<b>Learnability grid</b><br/>can subcomponent effects be<br/>learned, and from which input?<br/>ACTIVE · rustmove"]
+  RWD["<b>Reward v3</b><br/>faithfulness gate, then size,<br/>answers, variables, English;<br/>per-line credit<br/>DONE · primerl, inframove"]
+  FAL["<b>Falsification set</b><br/>correct copy circuits vs<br/>plausible wrong ones<br/>ACTIVE · generality"]
+  VAR["<b>Variables and invariants</b><br/>meanings make testable<br/>predictions; first check they<br/>beat the trivial variable<br/>ACTIVE · varteach"]
+  EDT["<b>Edit targets</b><br/>persistent, behavior-level<br/>edits<br/>PAUSED until D1 · rustmove"]
+
+  %% ================= verifier =================
+  PHI["<b>Faithfulness score Φ</b><br/>10 intervention families,<br/>32 draws, removals vs the<br/>real model; remainder check on<br/>DONE · inframove"]
+  TOY["<b>Planted toys</b><br/>teacher recovered 4 of 4<br/>planted routes; size has<br/>to break ties<br/>ACTIVE · fleet"]
+
+  %% ================= foundations =================
+  subgraph BASE["FOUNDATIONS"]
+    VPD["<b>VPD of vpd4l</b><br/>4-layer LM, 38,912<br/>rank-one subcomponents<br/>DONE"]
+    TXT["<b>Texts and splits</b><br/>train 6000–7999<br/>dev 9000–9099<br/>sealed test 9100–9149<br/>DONE"]
+    ENG["<b>Executable circuits</b><br/>path-patched engine,<br/>batched deletions,<br/>16–2000× faster<br/>DONE · monitorbench"]
+  end
+
+  %% ================= critical path (links 0-5, thick red) =================
+  TCH --> D0
+  D0 -- yes --> SFT
+  SFT --> D1
+  D1 -- yes --> RL
+  RL --> ORC
+  ORC --> EVL
+  %% ================= goals (links 6-13, purple) =================
+  EVL --> G1
+  EVL --> G2
+  EVL --> G3
+  EVL --> G4
+  G1 --> IMP
+  G2 --> IMP
+  G3 --> IMP
+  G4 --> IMP
+
+  %% ================= supporting links =================
+  VPD --> ENG
+  TXT --> ENG
+  ENG --> PHI
+  PHI --> TCH
+  DD --> TCH
+  BK --> TCH
+  INP --> SFT
+  LRN -. sets format .-> INP
+  PHI --> RWD
+  RWD --> D2
+  FAL -. tests .-> D2
+  D2 -- yes --> RL
+  TOY -. tests .-> PHI
+  TCH --> VAR
+  VAR --> RL
+  EDT --> RL
+  D1 -. no .-> ALT
+  LATER -.-> G4
+
+  %% ================= legend (placed above the impact box) =================
+  subgraph LEG["LEGEND"]
+    direction LR
+    k1["done"] ~~~ k2["active"] ~~~ k3["blocked"] ~~~ k4["waiting"] ~~~ k5{{"decision"}} ~~~ k6["later or paused"] ~~~ k7["updated 2026-10-12 23:50 PDT<br/>RunPod $290 of $390<br/>Tinker $47 of $130"]
+  end
+  IMP ~~~ LEG
+
+  %% ================= styles =================
+  classDef done fill:#e6f4ea,stroke:#1e8e3e,stroke-width:2px,color:#0d652d
+  classDef active fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#174ea6
+  classDef blocked fill:#fce8e6,stroke:#d93025,stroke-width:3px,color:#a50e0e
+  classDef waiting fill:#f8f9fa,stroke:#80868b,stroke-width:1.5px,color:#3c4043
+  classDef paused fill:#ffffff,stroke:#bdc1c6,stroke-width:1.5px,stroke-dasharray:6 4,color:#80868b
+  classDef decision fill:#fef7e0,stroke:#e37400,stroke-width:2px,color:#7a4100
+  classDef goal fill:#f3e8fd,stroke:#8430ce,stroke-width:2px,color:#4a148c
+  classDef impact fill:#202124,stroke:#202124,stroke-width:2px,color:#ffffff
+  classDef note fill:#ffffff,stroke:#ffffff,color:#5f6368
+
+  class VPD,TXT,ENG,PHI,RWD,INP,k1 done
+  class DD,BK,LRN,VAR,FAL,TOY,k2 active
+  class TCH,k3 blocked
+  class SFT,RL,ORC,EVL,k4 waiting
+  class EDT,LATER,ALT,k6 paused
+  class D0,D1,D2,k5 decision
+  class G1,G2,G3,G4 goal
+  class IMP impact
+  class k7 note
+
+  linkStyle 0,1,2,3,4,5 stroke:#d93025,stroke-width:4px
+  linkStyle 6,7,8,9,10,11,12,13 stroke:#8430ce,stroke-width:2.5px

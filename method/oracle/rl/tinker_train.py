@@ -205,7 +205,9 @@ def explain(a) -> None:
     """Teacher English: for each teacher circuit's facts (components.py facts), an open base model on Tinker (never
     trained here) writes N explanations from components.writer_prompt; reader A scores each by E1 read with the
     teacher's circuit (the facts' "circuit"); the best is kept only when it tells the reader more than the neutral
-    sentence (E1 > 0). On the kept ones, the controls: another text's kept explanation read on this text with this
+    sentence (E1 > 0). With the teacher's variables in the facts, each sample first writes their meanings
+    (components.written_variables; a sample missing one is dropped, counted "unwritten") and E1 reads the rendered
+    VARIABLES block with the prose; the kept sample's variables go to dataset --english. On the kept ones, the controls: another text's kept explanation read on this text with this
     text's circuit (shuffled) and reader B (an independent
     model); reader_b_all, the summary's headline, is reader B's bits over every text with 0 where nothing was kept
     (what the SFT examples hold). {"task", "samples", "e1", "explanation" (kept, or ""), "e1_best", "shuffled",
@@ -228,7 +230,13 @@ def explain(a) -> None:
     facts = [json.loads(x) for x in a.facts.read_text().splitlines() if x.strip()]
     if any("circuit" not in f for f in facts):
         raise SystemExit(f"{a.facts}: facts without the teacher's circuit lines (rerun components.py facts): E1's reader reads them")
-    circuit = {f["task"]: f["circuit"] for f in facts}
+    circuit, answer_of = {f["task"]: f["circuit"] for f in facts}, {}
+
+    def answer(f: dict, task: dict, prose: str, vs: list | None) -> str:  # what E1's reader reads: the circuit, then the English
+        if "answer" not in f:
+            return f"CIRCUIT:\n{f['circuit']}\nEXPLANATION: {prose}"
+        return components.render({**f["answer"], "explanation": prose} | ({"variables": vs} if vs else {}),
+                                 strings=components.token_strings("vpd4l", task["prompts"][0]["token_ids"]))
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=wr.get_stop_sequences())
     futs = []
     for f in facts:  # unseeded: a seed gives every one of a call's num_samples the same draws (16 samples, 1-7 distinct)
@@ -245,24 +253,32 @@ def explain(a) -> None:
             continue
         hits = res.prompt_cache_hit_tokens
         spend_w.add("writer", prefill=prompt.length - hits, cached=hits + (a.n - 1) * prompt.length, sampled=sum(len(x.tokens) for x in res.sequences))
-        texts = []
+        raw = []
         for x in res.sequences:
             t = renderers.get_text_content(wr.parse_response(x.tokens)[0]).strip()
-            t = t[len("EXPLANATION:"):].strip() if t.upper().startswith("EXPLANATION:") else t
-            texts.append(" ".join(t.split()))
+            raw.append(t[len("EXPLANATION:"):].strip() if t.upper().startswith("EXPLANATION:") else t)
         task = json.loads((a.texts_dir / f"{f['task']}.json").read_text())
-        named = [bool(NAMES.search(t)) for t in texts]  # the writer was told never to name subcomponents
-        texts = [t for t, n in zip(texts, named) if not n]
-        if not texts:
+        if f.get("variables"):  # the variables' meanings first (components.written_variables), then the prose
+            got = [components.written_variables(t, f["variables"]) for t in raw]
+            cand, unwritten = [(prose, vs) for vs, prose in (g for g in got if g is not None)], sum(g is None for g in got)
+        else:
+            cand, unwritten = [(" ".join(t.split()), None) for t in raw], 0
+        named = [bool(NAMES.search(t + " ".join(v["meaning"] for v in vs or []))) for t, vs in cand]  # told never to name subcomponents
+        cand = [c for c, n in zip(cand, named) if not n]
+        if not cand:
             out.append({"task": f["task"], "samples": [], "e1": [], "best": None, "explanation": "", "e1_best": None,
-                        "e1_mean": None, "named": sum(named)})
-            print(json.dumps({"task": f["task"], "kept": False, "named": sum(named)}), flush=True)
+                        "e1_mean": None, "named": sum(named), "unwritten": unwritten})
+            print(json.dumps({"task": f["task"], "kept": False, "named": sum(named), "unwritten": unwritten}), flush=True)
             continue
-        e1 = components.e1_bits(reader_a, task, rows[f["task"]], [f"CIRCUIT:\n{f['circuit']}\nEXPLANATION: {t}" for t in texts])
+        texts = [t for t, _ in cand]
+        answer_of[f["task"]] = [answer(f, task, t, vs) for t, vs in cand]
+        e1 = components.e1_bits(reader_a, task, rows[f["task"]], answer_of[f["task"]])
         best = max(range(len(texts)), key=lambda i: e1[i] if e1[i] is not None else -1e9)
         keep = e1[best] is not None and e1[best] > 0
-        out.append({"task": f["task"], "named": sum(named), "samples": texts, "e1": e1, "best": best, "explanation": texts[best] if keep else "",
-                    "e1_best": e1[best], "e1_mean": sum(e for e in e1 if e is not None) / max(1, sum(e is not None for e in e1))})
+        out.append({"task": f["task"], "named": sum(named), "unwritten": unwritten, "samples": texts, "e1": e1, "best": best,
+                    "explanation": texts[best] if keep else "", "e1_best": e1[best],
+                    "e1_mean": sum(e for e in e1 if e is not None) / max(1, sum(e is not None for e in e1))}
+                   | ({"variables_samples": [vs for _, vs in cand], "variables": cand[best][1] if keep else None} if f.get("variables") else {}))
         print(json.dumps({k: out[-1][k] for k in ("task", "e1_best", "e1_mean", "named")} | {"kept": keep}), flush=True)
     kept = [o for o in out if o["explanation"]]
     for i, o in enumerate(kept):
@@ -271,7 +287,7 @@ def explain(a) -> None:
             other = kept[(i + 1) % len(kept)]["explanation"]
             o["shuffled"] = components.e1_bits(reader_a, task, rows[o["task"]], [f"CIRCUIT:\n{circuit[o['task']]}\nEXPLANATION: {other}"])[0]
         if reader_b is not None:
-            o["reader_b"] = components.e1_bits(reader_b, task, rows[o["task"]], [f"CIRCUIT:\n{circuit[o['task']]}\nEXPLANATION: {o['explanation']}"])[0]
+            o["reader_b"] = components.e1_bits(reader_b, task, rows[o["task"]], [answer_of[o["task"]][o["best"]]])[0]
     with a.out.open("w") as fh:
         for o in out:
             fh.write(json.dumps(o) + "\n")

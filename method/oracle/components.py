@@ -1382,14 +1382,16 @@ def vpd_teacher(ge, task: dict, ev: dict, tokens, budget: int = ANSWER_BUDGET, c
                     "tokens": tokens(target(answer, ev, task["model"]))}
 
 
-def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_NODES) -> dict:
+def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_NODES, variables: list | None = None) -> dict:
     """What a teacher circuit's English may draw on: only what the oracle has or writes at inference, so supervised
     English never states what the oracle cannot know. From the question (evidence()): the text and its target, the
     model's top next tokens, the measured evidence at the listed positions (units.evidence; never the English reader's
     events), the 1% rule, and for the circuit's subcomponents the question lists, their atlas facts as it lists them
     (the routed lens at their positions and Pile contexts). From the teacher's answer: its subcomponents (the first max_nodes in VPD's order),
-    its stated edges (those into the prediction first, without their measured effects) and the questions' answers; and
-    the circuit's lines as the oracle writes them ("circuit", for E1's reader, never shown to the writer)."""
+    its stated edges (those into the prediction first, without their measured effects) and the questions' answers; the
+    teacher's variables when given (variables.py's JSON from the teacher's grouping, meanings unwritten: the writer
+    writes them, with the tokens at their inputs); and the circuit as the oracle writes it ("circuit", its lines, and
+    "answer", its JSON: for E1's reader, never shown to the writer)."""
     import goal_eval
     import units
 
@@ -1404,6 +1406,8 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
     return {"task": task["id"], "text": "".join(strings[:max(targets) + 1]), "target": max(targets),
             "circuit": circuit_text(render(goal_eval.to_json(g, ""))),  # what E1's reader reads with the English
+            "answer": goal_eval.to_json(g, ""),
+            **({"variables": variables, "tokens": {str(q): strings[q] for v in variables for q in v["inputs"]}} if variables else {}),
             "evidence": units.evidence(ev["events"], ev["listed"], strings) if ev.get("events") else [],
             "target_token": strings[max(targets)], "top": prompt["model_top"][0][:3], "nodes_total": len(nodes),
             "positions": sorted({nd[1] for nd in nodes}),
@@ -1422,8 +1426,14 @@ WRITER = ("A small language model (4 layers) read the text below and predicts th
           "Write the explanation only.\n\n{facts}")
 
 
+WRITER_VARIABLES = ("Begin with one line per variable listed above, in that order: V<k> \"<short name>\": <what it stands for "
+                    "in the text, in plain English>. Then write the explanation of the prediction in terms of those variables.")
+WRITER_VAR_RE = re.compile(r'\s*V(\d+)\s+"(.*?)"\s*:\s*(.+?)\s*')
+
+
 def writer_prompt(f: dict) -> str:
-    """The prompt that asks an open model for a teacher circuit's English, from teacher_facts()."""
+    """The prompt that asks an open model for a teacher circuit's English, from teacher_facts(); with the teacher's
+    variables, their meanings first (WRITER_VARIABLES, written_variables())."""
     lines = [f"Text: {f['text']!r}", f"Prediction at position {f['target']} (after {f['target_token']!r}): "
              + ", ".join(f"{t!r} {p:.2f}" for t, p in f["top"]),
              f"Circuit: {f['nodes_total']} subcomponents at positions {', '.join(map(str, f['positions']))}; the most important "
@@ -1443,7 +1453,40 @@ def writer_prompt(f: dict) -> str:
     if f["qa"]:
         lines.append("Measured interventions:")
         lines += [f"- {q['question'][q['question'].find(':') + 2:]} Measured: {q['answer']}" for q in f["qa"]]
+    if f.get("variables"):
+        import goal_eval
+
+        lines.append("Variables of this circuit (each a group of its subcomponents that carries what is computed from its input "
+                     "tokens: verified by changing an input token and setting the group to its values on the changed text):")
+        for k, v in enumerate(f["variables"], 1):
+            nodes = ", ".join(node_text((goal_eval._site(m), t, c)) for m, c, t in v["group"])
+            lines.append(f"- V{k} (provisional name {v['name']!r}): inputs " + ", ".join(f"{q} ({f['tokens'][str(q)]!r})" for q in v["inputs"])
+                         + f"; carried by {nodes}; feeds " + (", ".join(v["feeds"]) or "prediction")
+                         + (f"; measured: {json.dumps(v['measured'])}" if v.get("measured") else ""))
+        return escape(WRITER.format(facts="\n".join(lines)) + "\n\n" + WRITER_VARIABLES)
     return escape(WRITER.format(facts="\n".join(lines)))
+
+
+def written_variables(text: str, variables: list[dict]) -> tuple[list[dict], str] | None:
+    """The writer's variable lines (WRITER_VARIABLES: V<k> "<short name>": <meaning>) put on the teacher's variables
+    (names it gives replace the provisional ones, in "feeds" too, unless two collide), and the prose after them on one
+    line; None when a variable has no line."""
+    got, prose = {}, []
+    for line in text.splitlines():
+        m = WRITER_VAR_RE.fullmatch(line)
+        if m and 1 <= int(m[1]) <= len(variables):
+            got.setdefault(int(m[1]), (m[2].strip(), m[3].strip()))
+        elif line.strip().rstrip(":").strip().upper() not in ("VARIABLES", "EXPLANATION"):
+            prose.append(line)
+    if len(got) < len(variables):
+        return None
+    names = [got[k][0] or v["name"] for k, v in enumerate(variables, 1)]
+    if len(set(names)) < len(names):
+        names = [v["name"] for v in variables]
+    rename = {v["name"]: n for v, n in zip(variables, names)}
+    out = [{"name": n, "meaning": got[k][1], "inputs": v["inputs"], "group": v["group"], "feeds": [rename.get(x, x) for x in v["feeds"]]}
+           for k, (v, n) in enumerate(zip(variables, names), 1)]
+    return out, " ".join(" ".join(prose).split())
 
 
 def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | None = None, edits: dict | None = None,
@@ -1863,6 +1906,7 @@ def main():
     fa.add_argument("out", type=Path)
     fa.add_argument("--n", type=int, default=10)
     fa.add_argument("--device", help="cpu keeps it off a busy GPU (a few cuts per text)")
+    fa.add_argument("--variables", type=Path, help="the teacher's variables: a directory of <task>.json, {\"variables\": [...]}")
     d = sub.add_parser("dataset")
     d.add_argument("rows", type=Path)
     d.add_argument("teacher", type=Path)
@@ -1901,9 +1945,11 @@ def main():
         english = {r["task"]: r["explanation"] for r in map(json.loads, args.english.read_text().splitlines())
                    if r.get("explanation")} if args.english else None
         found = ({f.stem: json.loads(f.read_text())["variables"] for f in sorted(args.variables.glob("*.json"))}
-                 if args.variables else None)
+                 if args.variables else {})
+        if args.english:  # the writer's variables (meanings written) over the teacher's
+            found |= {r["task"]: r["variables"] for r in map(json.loads, args.english.read_text().splitlines()) if r.get("variables")}
         print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval(), english,
-                      edit_teach(args.edit_teach) if args.edit_teach else None, found), "rows", flush=True)
+                      edit_teach(args.edit_teach) if args.edit_teach else None, found or None), "rows", flush=True)
         return
     if args.cmd == "facts":
         ge = goal_eval.GoalEval(native.Native(args.device))
@@ -1916,7 +1962,9 @@ def main():
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
                 prompt = task["prompts"][0]  # the circuit as it is scored and trained on (dataset(): stranded nodes dropped)
                 g, _ = goal_eval.circuit(json.loads(js.read_text()), prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
-                f.write(json.dumps(teacher_facts(ge, task, r, goal_eval.to_json(g))) + "\n")
+                vs = args.variables / f"{r['task']}.json" if args.variables else None
+                vs = json.loads(vs.read_text())["variables"] if vs and vs.exists() else None
+                f.write(json.dumps(teacher_facts(ge, task, r, goal_eval.to_json(g), variables=vs)) + "\n")
                 f.flush()
                 n += 1
         return

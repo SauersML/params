@@ -370,3 +370,20 @@ def test_question_asks_for_variables_only_when_the_row_does(tiny):
     nat, ge, task, ev = tiny
     assert components.ASK_VARIABLES not in components.question(task, ev)
     assert components.ASK_VARIABLES in components.question(task, {**ev, "variables": True})
+
+
+def test_writer_writes_the_teacher_variables_meanings():
+    """The writer's lines name and mean each teacher variable (feeds follow a rename); a missing line drops the
+    sample; the prompt lists the variables with their input tokens and asks for the lines."""
+    vs = [{"name": "v1", "inputs": [4], "group": [["h.2.attn.v_proj", 5, 4]], "feeds": ["v2"]},
+          {"name": "v2", "inputs": [7], "group": [["h.3.mlp.down_proj", 2, 7]], "feeds": ["prediction"]}]
+    text = 'V1 "copied word": the word after the earlier "for"\nV2 "read": the copy, at the target\n\nThe model copies it.'
+    got, prose = components.written_variables(text, vs)
+    assert [v["name"] for v in got] == ["copied word", "read"] and got[0]["feeds"] == ["read"] and got[1]["feeds"] == ["prediction"]
+    assert got[0]["meaning"] == 'the word after the earlier "for"' and prose == "The model copies it."
+    assert components.written_variables('V1 "a": x\nprose', vs) is None
+    f = {"text": "x", "target": 7, "target_token": " for", "top": [[" each", 0.5]], "nodes_total": 2, "positions": [4, 7],
+         "nodes": [], "evidence": [], "edges": [], "qa": [], "variables": vs, "tokens": {"4": " each", "7": " for"}}
+    prompt = components.writer_prompt(f)
+    assert "V1 (provisional name 'v1'): inputs 4 (' each'); carried by L2.v#5@4; feeds v2" in prompt
+    assert prompt.endswith(components.WRITER_VARIABLES)

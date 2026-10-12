@@ -1480,14 +1480,27 @@ class GoalEval:
         nat, T, dev = self.nat, tx.T, self.nat.dev
         pick = torch.randperm(len(pool["sources"]), generator=gen)[:k].tolist()
         pats = [pattern(pool, i) for i in pick] if patterns else []  # (patterns off: drawn, never switched on)
+        cache = tx.__dict__.setdefault("_adv", {})  # per text: VPD's columns, and the last columns' engine and layouts
+        key = (id(tx.vpd), int(torch.stack([m.sum() for m in tx.vpd.values()]).sum()))  # (tx.vpd set or grown: anew)
+        if cache.get("key") != key:
+            cache.clear()
+            cache["key"] = key
+        if "vpd_cols" not in cache:
+            cache["vpd_cols"] = {n: tx.vpd[n].any(0).nonzero().flatten() for n in nat.names}
         cols = {}
         for n in nat.names:
-            parts = [tx.vpd[n].any(0).nonzero().flatten()] + [p[n].to(dev) for p in pats if n in p and patterns]
+            parts = [cache["vpd_cols"][n]] + [p[n].to(dev) for p in pats if n in p and patterns]
             parts += [torch.tensor([c for m, _, c in g.node_set() if m == n], dtype=torch.long, device=dev) for g in graphs]
             cols[n] = torch.unique(torch.cat(parts))
-        E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols)
+        last = cache.get("engine")
+        if last is not None and all(torch.equal(last[0][n], cols[n]) for n in nat.names):
+            E, inv, vpd_on, vfree = last[1:]       # the same columns (a text's omitted flips: VPD's answer's): reused
+        else:
+            E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols)
+            inv = vpd_on = vfree = None
         where = (torch.arange(T, device=dev) <= max(tx.targets))[:, None]
-        vpd_on = {n: tx.vpd[n][:, cols[n]] for n in nat.names}
+        if vpd_on is None:
+            vpd_on = {n: tx.vpd[n][:, cols[n]] for n in nat.names}
         P = {}
         for n in nat.names:
             m = torch.zeros(len(pats), len(cols[n]), device=dev)
@@ -1495,8 +1508,10 @@ class GoalEval:
                 if n in p:
                     m[i] = torch.isin(cols[n], p[n].to(dev)).float()
             P[n] = m
-        inv = {n: {int(c): i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
-        vfree = {n: (~vpd_on[n] & where).float() for n in nat.names}
+        if inv is None:
+            inv = {n: {int(c): i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
+            vfree = {n: (~vpd_on[n] & where).float() for n in nat.names}
+            cache["engine"] = (cols, E, inv, vpd_on, vfree)
         parts = []
         for g in graphs:
             on = {n: torch.zeros(T, len(cols[n]), dtype=torch.bool, device=dev) for n in nat.names}

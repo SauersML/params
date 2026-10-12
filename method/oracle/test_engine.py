@@ -2,7 +2,8 @@
 engine's float32 masked run with every subcomponent addressable equals VPD's masked forward pass (goal_eval.runs, the
 same steps) to the bit on MPS and within float32 rounding on CUDA; its gradients with respect to the masks match that
 pass's autograd; gathered columns and the search precisions (TF32, bf16) stay within their stated bounds; rescore
-reports float32.
+reports float32. Its graph runs (graph_kl) equal native.Native.run's graph semantics within float32 rounding, with the
+gradients in edge strengths and masks.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_engine.py -s
 """
@@ -84,16 +85,20 @@ def test_gradients_match_autograd_of_masked_forward():
         assert float((x - y).norm() / x.norm().clamp_min(1e-30)) < REL
 
 
+def answer(nat, ids) -> list:
+    """VPD's answer on the text as (matrix, position, subcomponent) nodes: its causal-importance network's, or VPD_SAVED's."""
+    if nat.has_importance:
+        return [(n, t, c) for n, v in nat.importance(ids).items() for t, c in (v > 0).nonzero().tolist()]
+    if VPD_SAVED.exists():
+        return [(n, t, c) for n, (ts, cs) in torch.load(VPD_SAVED)["text9000"]["answer"].items() for t, c in zip(ts.tolist(), cs.tolist())]
+    pytest.skip("needs VPD's answer: the causal-importance network or " + str(VPD_SAVED))
+
+
 def test_gathered_columns_and_search_precisions():
     nat, ids, targets, masks = setup()
-    if nat.has_importance:
-        active = {n: (v > 0).any(0) for n, v in nat.importance(ids).items()}    # VPD's active columns at any position
-    elif VPD_SAVED.exists():
-        active = {n: torch.zeros(nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
-        for n, (_, c) in torch.load(VPD_SAVED)["text9000"]["answer"].items():
-            active[n][c.long().to(nat.dev)] = True
-    else:
-        pytest.skip("needs VPD's answer: the causal-importance network or " + str(VPD_SAVED))
+    active = {n: torch.zeros(nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}    # VPD's active columns at any position
+    for n, _, c in answer(nat, ids):
+        active[n][c] = True
     cols = {n: torch.nonzero(active[n]).flatten() for n in nat.names}
     sub = {n: m * active[n].float() for n, m in masks.items()}                  # masks inside those columns
     whole = engine.Engine(nat, ids, targets)
@@ -107,3 +112,59 @@ def test_gathered_columns_and_search_precisions():
             assert rel(full, gathered.kl(compact, "tf32")) < REL_TF32
         assert rel(full, gathered.kl(compact, "bf16")) < REL_BF16
     assert torch.equal(gathered.rescore(compact), gathered.kl(compact))
+
+
+def graph_case(B=3):
+    """A graph of VPD's answer at the text's last positions (six nodes per matrix, the latest) with every connection
+    the model has among them, and B rows of random edge strengths and masks."""
+    nat, ids, targets, _ = setup(B=1)
+    T = len(ids)
+    nodes, per = [], {}
+    for n, t, c in sorted(answer(nat, ids), key=lambda nd: -nd[1]):
+        if per.get(n, 0) < 6:
+            nodes.append((n, t, c))
+            per[n] = per.get(n, 0) + 1
+    graph = native.Graph(nodes, *native.all_edges(nodes, targets))
+    assert graph.out
+    g = torch.Generator().manual_seed(1)
+    ew = torch.rand(B, sum(len(w) for w in graph.parents.values()), generator=g).to(nat.dev)
+    ow = torch.rand(B, len(graph.out), generator=g).to(nat.dev)
+    u = {n: torch.rand(B, T, nat.C[n], generator=g).to(nat.dev) for n in nat.names}
+    return nat, ids, targets, graph, ew, ow, u
+
+
+def native_graph_kl(nat, ids, targets, graph, ew, ow, u):
+    """native.run's KL of the graph's B rows, remainders live."""
+    B = len(ew)
+    plan = nat._plan([graph] * B, len(ids))
+    ewn, own = nat.edge_weights(plan, torch.cat([ew, ow], 1).flatten())   # a graph's connections, then its outputs
+    ones = {n: torch.ones(1, 1, device=nat.dev) for n in nat.names}
+    return carry.kl(nat.reference([ids], targets), nat.run(ids, targets, plan, u, ones, ewn, own))
+
+
+def test_graph_runs_equal_native_runs():
+    nat, ids, targets, graph, ew, ow, u = graph_case()
+    a = [ew.clone().requires_grad_(True), ow.clone().requires_grad_(True), {n: m.clone().requires_grad_(True) for n, m in u.items()}]
+    b = [ew.clone().requires_grad_(True), ow.clone().requires_grad_(True), {n: m.clone().requires_grad_(True) for n, m in u.items()}]
+    want = native_graph_kl(nat, ids, targets, graph, *a)
+    eng = engine.Engine(nat, ids, targets, live=True)
+    got = eng.graph_kl(eng.plan(graph), b[2], b[0], b[1])
+    assert rel(want, got) < REL
+    want.sum().backward()
+    got.sum().backward()
+    pairs = [(a[0], b[0]), (a[1], b[1])] + [(a[2][n], b[2][n]) for n in nat.names]
+    for x, y in pairs:
+        assert float((x.grad - y.grad).norm() / x.grad.norm().clamp_min(1e-30)) < REL
+
+
+def test_gathered_graph_runs():
+    """EdgePruner's convention, every subcomponent outside the graph off, on the graph's own columns alone."""
+    nat, ids, targets, graph, ew, ow, _ = graph_case()
+    cols = {n: torch.tensor(sorted({c for m, _, c in graph.nodes if m == n}), dtype=torch.long) for n in nat.names}
+    zero = {n: torch.zeros(1, 1, nat.C[n], device=nat.dev) for n in nat.names}
+    eng = engine.Engine(nat, ids, targets, live=True, columns=cols)
+    plan = eng.plan(graph)
+    with torch.no_grad():
+        want = native_graph_kl(nat, ids, targets, graph, ew, ow, zero)
+        assert rel(want, eng.graph_kl(plan, None, ew, ow)) < REL
+        assert rel(want, eng.graph_kl(plan, None, ew, ow, "bf16")) < REL_BF16

@@ -26,9 +26,11 @@ for l in open('$DIR/checkpoints.jsonl'):
      --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK &&
    $TPY -u tinker_train.py readers $DIR/heldout_${STEP}_samples.jsonl $DIR/heldout.jsonl $DIR/heldout_${STEP}_e1.jsonl \
      --reader-b Qwen/Qwen3.5-4B) < /dev/null  # the loop reads the checkpoints from stdin
-  (cd $SRC && ~/.local/bin/mem-lease 14 $PY -u method/oracle/components.py evaluate heldout $DIR/heldout.jsonl \
-     --set rl=$DIR/heldout_${STEP}_samples.jsonl --e1 rl=$DIR/heldout_${STEP}_e1.jsonl --labels $LABELS --n $NEVAL \
-     ${EDIT_TEACH:+--edit-teach $EDIT_TEACH} --out $DIR/heldout_$STEP.json > $DIR/heldout_$STEP.log 2>&1) < /dev/null
+  P=rl-$(basename $DIR)-$STEP  # C's families run on a rented GPU (eval_pod.sh), too slow and too large for the Mac
+  (cd $SRC && bash experiments/oracle/pods/eval_pod.sh $P $DIR/heldout.jsonl $LABELS \
+     rl=$DIR/heldout_${STEP}_samples.jsonl:$DIR/heldout_${STEP}_e1.jsonl > $DIR/heldout_${STEP}_pod.log 2>&1) < /dev/null
+  cp ~/mpd-data/runpod/oracle-graph-eval-$P/eval.json $DIR/heldout_$STEP.json
+  cp ~/mpd-data/runpod/oracle-graph-eval-$P/eval.log $DIR/heldout_$STEP.log
   echo "step $STEP: $DIR/heldout_$STEP.json"
 done
 unset TINKER_API_KEY

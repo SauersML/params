@@ -40,15 +40,16 @@ $TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE"
 $TPY -u tinker_train.py readers $S/samples.jsonl $S/heldout.jsonl $S/e1.jsonl --reader-b Qwen/Qwen3.5-4B
 unset TINKER_API_KEY
 cd $SRC
-Z=$O/zeroshot_heldout20  # the untrained Qwen3-8B's first answers, scored by the same reward as everything here
+Z=$O/zeroshot_heldout20/c  # the untrained Qwen3-8B's first answers on these questions, scored by the same reward
 PRUNED=() REFS=(--ref "Teacher=$S/eval.json:teacher" --ref "VPD, every connection=$S/eval.json:vpd_complete")
 if [ -d $S/ref/vpd_pruned ]; then
-  PRUNED=(--set vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
+  PRUNED=(vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
 fi
-~/.local/bin/mem-lease 14 $PY -u method/oracle/components.py evaluate heldout $S/heldout.jsonl --set sft=$S/samples.jsonl \
-  --e1 sft=$S/e1.jsonl --set zeroshot=$Z/samples_first.jsonl --e1 zeroshot=$Z/e1.jsonl --set teacher=$S/teacher_txt \
-  --set vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" --labels $LABELS --n $NEVAL ${EDIT_TEACH:+--edit-teach $EDIT_TEACH} \
-  --out $S/eval.json > $S/eval.log 2>&1
+# C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh)
+bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl:$S/e1.jsonl \
+  zeroshot=$Z/samples_first.jsonl:$Z/e1.jsonl teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" > $S/eval_pod.log 2>&1
+cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.json $S/eval.json
+cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.log $S/eval.log
 tail -60 $S/eval.log
 MPD_MEM_GIB=1 $PY $SRC/experiments/oracle/figures_eval.py --labels $LABELS --prefix sft_$RUN \
   --set "Qwen3-8B zero-shot=$S/eval.json:zeroshot:$Z/e1.jsonl" --set "${BASE#*/} SFT=$S/eval.json:sft:$S/e1.jsonl" "${REFS[@]}"

@@ -32,10 +32,14 @@ Per text:
      a reader only through a stated connection; every other subcomponent off, remainders as above, the token
      embedding in full). At a path point, from every connection the model has among its nodes (native.all_edges and
      the residual writers at the targets into the prediction), the rounds of step 1 over single connections: within
-     F1 >= 0.9 the most of the ranked ones that keep it, above it the prefix with the lowest KL. The teacher circuit
-     is the smallest path point with N >= 0.9 whose connections reach F1 >= 0.9 (bisection between the smallest
-     such point and step 4's pick; F1 rises as connections go: on text9002 92 subcomponents give 0.881 with all
-     1,004 connections, 0.919 with 65 of them), with its connections; the points nearest 16, 32 and 64 get theirs
+     F1 >= 0.9 the most of the ranked ones that keep it and that leave N >= 0.9 for the nodes the kept connections
+     give a role (live(): the others reach nothing in the graph's run and are dropped; a connection descent on graph
+     F1 alone left text9000's 29 subcomponents 14 with a role at N 0.25, the other 15 a backup route; a node without
+     a role even with every connection stays: it acts through the remainders, which the graph's run does not route
+     a node's output to), above it the
+     prefix with the lowest KL. F1 rises as connections go (text9002's 92 subcomponents: 0.881 with all 1,004
+     connections, 0.919 with 65). The teacher circuit is the smallest path point whose connections reach F1 >= 0.9
+     with N >= 0.9 (bisection between the smallest point with N >= 0.9 and step 4's pick), with its connections; the points nearest 16, 32 and 64 get theirs
      too, for re-picking. Without a point meeting both, step 4's pick with its connections. With --edges-at pick (the
      default), connections at step 4's pick only.
   With --from-path DIR, steps 1-3 come from DIR's <task>.path.json (the start set, every step's removals and
@@ -106,12 +110,13 @@ class Descent:
     def kl(self, on: torch.Tensor | None = None) -> float:
         return self.kl_sets((self.on if on is None else on)[None])[0]
 
-    def prune(self, level: str, budget: float, rounds: int = ROUNDS, log: list | None = None) -> int:
+    def prune(self, level: str, budget: float, rounds: int = ROUNDS, log: list | None = None, accept=None) -> int:
         """Rounds of measured block removal at one level; returns the rounds run. Within the budget a round removes
-        the most of the ranked blocks that keep KL_C <= budget; above it (a start such as VPD's answer at the targets
-        alone can be farther than the budget while a subset is not: subcomponents cancel) it removes the prefix of
-        the ranked blocks with the lowest measured KL_C, when that is lower than the circuit's. log, a list, receives
-        each round's {"removed": unit ids, "kl": the KL measured after it}."""
+        the most of the ranked blocks that keep KL_C <= budget (and that accept(on), when given, admits); above it (a
+        start such as VPD's answer at the targets alone can be farther than the budget while a subset is not:
+        subcomponents cancel) it removes the prefix of the ranked blocks with the lowest measured KL_C, when that is
+        lower than the circuit's. log, a list, receives each round's {"removed": unit ids, "kl": the KL measured after
+        it}."""
         for r in range(rounds):
             blocks = self.blocks(level)
             if len(blocks) <= 1:
@@ -121,6 +126,15 @@ class Descent:
             sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ranked) - 1]
             if (single <= budget).any():
                 ok = [(k, x) for k, x in zip(sizes, self.without([torch.cat(ranked[:k]) for k in sizes])) if x <= budget]
+                if accept is not None:                       # the largest admitted, checked from the largest down
+                    for k, x in sorted(ok, reverse=True):
+                        on = self.on.clone()
+                        on[torch.cat(ranked[:k])] = False
+                        if accept(on):
+                            ok = [(k, x)]
+                            break
+                    else:
+                        ok = []
                 if not ok:
                     return r
                 k, x = max(ok)
@@ -327,8 +341,19 @@ class EdgePruner(Descent):
         return kl
 
     def blocks(self, level: str) -> list[torch.Tensor]:
-        """Single connections, at every level."""
-        return list(self.on.nonzero().flatten().split(1))
+        """The kept connections' blocks: every connection out of one writer ("writer"), into one reader or the
+        prediction ("reader"), or single connections."""
+        ids = self.on.nonzero().flatten()
+        if level not in ("writer", "reader"):
+            return list(ids.split(1))
+        if not hasattr(self, "ends"):
+            at = {nd: i for i, nd in enumerate(self.graph.nodes)}
+            self.ends = {"writer": torch.tensor([at[w] for w, _ in self.edges], device=ids.device),
+                         "reader": torch.tensor([at[r] if r is not None else len(at) for _, r in self.edges], device=ids.device)}
+        keys = self.ends[level][ids]
+        order = torch.argsort(keys, stable=True)
+        _, counts = torch.unique_consecutive(keys[order], return_counts=True)
+        return list(ids[order].split(counts.tolist()))
 
 
 def scores(empty: float, vpd: float, c: float, minus: float) -> tuple[float, float, float]:
@@ -397,12 +422,31 @@ def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> lis
     return path
 
 
-def edge_path(ep: EdgePruner, budget: float, row) -> list[dict]:
-    """A circuit's connections removed by Descent.prune's rounds over single connections from every connection (step
-    1's rule with its budget); row(kl, on, removed) records each state, the first every connection's."""
+def live(nodes: list, edges: list) -> set:
+    """The nodes that kept connections (writer, reader; reader None for the prediction) give a role in graph semantics:
+    queries and keys (they enter their layer's attention pattern, which the live remainders read) and every writer
+    with a kept connection into the prediction or into a node with a role. The others reach nothing: removing them,
+    with their connections, leaves the graph's run unchanged."""
+    out = {nd for nd in nodes if native._layer_kind(nd)[1] in ("q_proj", "k_proj")}
+    grew = True
+    while grew:
+        grew = False
+        for w, r in edges:
+            if w not in out and (r is None or r in out):
+                out.add(w)
+                grew = True
+    return out
+
+
+def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",), accept=None) -> list[dict]:
+    """A circuit's connections removed by Descent.prune's rounds from every connection (step 1's rule with its budget),
+    at each of `levels` in turn (EdgePruner.blocks: "writer", "reader", single connections; coarse levels first cut
+    the rounds' measured sets on circuits of hundreds of nodes); row(kl, on, removed) records each state, the first
+    every connection's."""
     log = []
     first = ep.kl()
-    ep.prune("connection", budget, log=log)
+    for level in levels:
+        ep.prune(level, budget, log=log, accept=accept)
     on = torch.ones(len(ep.edges), dtype=torch.bool, device=ep.on.device)
     steps = [row(first, on.clone(), [])]
     for x in log:
@@ -557,13 +601,34 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
                 f1, st = goal_eval._clip01(goal_eval.recovered_log(empty, kl, vpd)), size_term(ons[i], int(on[:ep.inner].sum()), int(on[ep.inner:].sum()))
                 return {"nodes": path[i]["size"], "edges": int(on.sum()), "removed": removed, "kl_graph": kl, "f1_graph": f1,
                         "n": path[i]["n"], "size_term": st, "reward": (f1 + path[i]["n"]) / TERMS - SIZE_WEIGHT * st}
-            steps = edge_path(ep, budget, state)
-            edge_paths.append({"step": i, "edges": [[index[w], "out" if r is None else index[r]] for w, r in ep.edges], "steps": steps})
-            last = {k_: steps[-1][k_] for k_ in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term", "reward")}
-            wired[i] = ([e for e, keep in zip(ep.edges, ep.on.tolist()) if keep], {**last, "all_edges": len(ep.edges), "sets": ep.measured})
-            print(f"  connections at {path[i]['size']} subcomponents: {last['edges']} of {len(ep.edges)}, graph F1 {last['f1_graph']:.3f} "
-                  f"(all {steps[0]['f1_graph']:.3f}), N {last['n']:.3f}, {ep.measured} sets", flush=True)
-        return wired[i][1]["f1_graph"] >= RECOVERED
+            nodes = [pr.nodes[j] for j in ons[i].nonzero().flatten().tolist()]
+
+            never = set(nodes) - live(nodes, ep.edges)       # no role even with every connection: kept (they act through the
+            # remainders, which the graph's run does not route a node's output to; text9019's MLP input without its output)
+
+            def roles(e_on):                                 # the nodes the kept connections give a role, and those, as a set
+                alive = live(nodes, [e for e, keep in zip(ep.edges, e_on.tolist()) if keep]) | never
+                on = ons[i].clone()
+                on[torch.tensor([index[nd] for nd in nodes if nd not in alive], dtype=torch.long, device=on.device)] = False
+                return on
+            steps = edge_path(ep, budget, state,             # no removal may leave a needed node without a role
+                              accept=lambda e_on: measure(pr, roles(e_on)[None], empty, vpd)[0]["n"] >= min(RECOVERED, path[i]["n"]))
+            alive = live(nodes, [e for e, keep in zip(ep.edges, ep.on.tolist()) if keep]) | never
+            kept = [(w, r) for (w, r), keep in zip(ep.edges, ep.on.tolist()) if keep and w in alive and (r is None or r in alive)]
+            on = ons[i].clone()                              # the nodes with a role: the graph's run is unchanged
+            on[torch.tensor([index[nd] for nd in nodes if nd not in alive], dtype=torch.long, device=on.device)] = False
+            got = measure(pr, on[None], empty, vpd)[0]       # their N (and node F1) as a set
+            inner = sum(r is not None for _, r in kept)
+            st = size_term(on, inner, len(kept) - inner)
+            edge_paths.append({"step": i, "edges": [[index[w], "out" if r is None else index[r]] for w, r in ep.edges], "steps": steps,
+                               "live": sorted(index[nd] for nd in alive)})
+            summary = {"nodes": int(on.sum()), "edges": len(kept), "kl_graph": steps[-1]["kl_graph"], "f1_graph": steps[-1]["f1_graph"],
+                       "n": got["n"], "f1_nodes": got["f1"], "size_term": st, "reward": (steps[-1]["f1_graph"] + got["n"]) / TERMS - SIZE_WEIGHT * st,
+                       "point_nodes": path[i]["size"], "all_edges": len(ep.edges), "sets": ep.measured}
+            wired[i] = (kept, summary, on)
+            print(f"  connections at {path[i]['size']} subcomponents: {len(kept)} of {len(ep.edges)} among the {summary['nodes']} with a role, "
+                  f"graph F1 {summary['f1_graph']:.3f} (all {steps[0]['f1_graph']:.3f}), N {summary['n']:.3f}, {ep.measured} sets", flush=True)
+        return wired[i][1]["f1_graph"] >= RECOVERED and wired[i][1]["n"] >= RECOVERED
 
     if edges and edges_at == "pick":                         # connections at step 4's pick alone
         wire(best)
@@ -582,7 +647,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     if tokens is not None:                                   # the answer within the budget: smaller path points until it fits
         row["budget_steps"] = 0
         while True:
-            row["answer_tokens"] = tokens(components.render(circuit_json(pr, ons[best], wired.get(best, (None,))[0])))
+            row["answer_tokens"] = tokens(components.render(circuit_json(pr, wired[best][2] if best in wired else ons[best],
+                                                                         wired.get(best, (None,))[0])))
             if row["answer_tokens"] <= max_tokens or best == len(path) - 1:
                 break
             best += 1
@@ -590,10 +656,10 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             if edges:
                 wire(best)
         row["answer_nodes"] = path[best]["size"]
-    circuits = {"": circuit_json(pr, ons[best], wired.get(best, (None,))[0]), "f1": circuit_json(pr, f1_on),
+    circuits = {"": circuit_json(pr, wired[best][2] if best in wired else ons[best], wired.get(best, (None,))[0]), "f1": circuit_json(pr, f1_on),
                 f"vpd_top{k}": circuit_json(pr, topk_on)}
     for i in points:
-        circuits[f"n{path[i]['size']}"] = circuit_json(pr, ons[i], wired.get(i, (None,))[0])
+        circuits[f"n{path[i]['size']}"] = circuit_json(pr, wired[i][2] if i in wired else ons[i], wired.get(i, (None,))[0])
     f1_row = measure(pr, f1_on[None], empty, vpd)[0]
     row.update(f1_circuit={"size": int(f1_on.sum()), "positions": int(torch.unique(pr.t[f1_on]).numel()), **f1_row},
                top_k=k, start_size=int(start.sum()), path_seconds=time.perf_counter() - t1,

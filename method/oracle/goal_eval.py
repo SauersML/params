@@ -895,8 +895,7 @@ class GoalEval:
         interchange > 0: that many interchange draws (_interchange_family, s_interchange); real: N_real (real_removal,
         n_real)."""
         e0 = self._bounds(tx, "live")[0]
-        model_graph = native.Graph(masks={n: torch.ones(tx.T, self.nat.C[n], dtype=torch.bool, device=self.nat.dev)
-                                          for n in self.nat.names}) if reads else None
+        sides = self._sides(tx, graphs) if reads else None
         point = self.sufficiency(tx, graphs)
         nodes = self._node_family(tx, graphs, draws, reads)
         edges = self._edge_family(tx, graphs, draws, reads)
@@ -927,11 +926,8 @@ class GoalEval:
             if rr:
                 row["n_real"] = rr["n_real_live"]
             if reads:  # the reads' responses: each node's change from its own run without an intervention
-                rm, rc = {}, {}
-                every = sorted(g.node_set())
-                self.graph_ref(tx.ids, tx.targets, model_graph, record=rm, reads=every)
-                self.graph_ref(tx.ids, tx.targets, g, record=rc, reads=every)
-                base = {nd: (float(rm[nd][0]), float(rc[nd][0])) for nd in every}
+                _, _, _, rm, rc = sides(g, cuts=[{}], reads=True)  # one row, no intervention
+                base = {nd: (float(rm[nd][0]), float(rc[nd][0])) for nd in rm}
                 for fam in ("nodes", "edges", "interchange"):
                     pairs = row.pop(f"_pairs_{fam}", None)
                     row[f"dreads_{fam}"] = _response_error(pairs, base) if pairs else None

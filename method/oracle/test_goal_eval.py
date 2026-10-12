@@ -984,6 +984,15 @@ def test_family_reads_are_graph_ref(tiny):
         assert abs(row["reads_edges"] - want) < 1e-5 + 1e-4 * abs(want), ("edges", row["reads_edges"], want)
     vals = [{nd: torch.tensor(0.5 + 0.1 * j, device=nat.dev) for nd in stated.node_set() if nd[1] == p}
             for j, p in enumerate(sorted({t for _, t, _ in stated.node_set()})[:3])]
+    for g in graphs:  # no intervention: the reads' base (fidelity's dreads)
+        _, _, _, rm, rc = ge._sides(tx, graphs)(g, cuts=[{}], reads=True)
+        gn = sorted(g.node_set())
+        wm, wc = {}, {}
+        ge.graph_ref(tx.ids, tx.targets, model, record=wm, reads=gn)
+        ge.graph_ref(tx.ids, tx.targets, native.Graph(masks=ge.masks(g, T)) if g.complete else g, record=wc, reads=gn)
+        for nd in gn:
+            assert abs(float(rm[nd][0]) - float(wm[nd][0])) < 1e-5 + 1e-4 * abs(float(wm[nd][0]))
+            assert abs(float(rc[nd][0]) - float(wc[nd][0])) < 1e-5 + 1e-4 * abs(float(wc[nd][0]))
     lm, lv, lc, rm, rc = ge._sides(tx, graphs)(stated, patch=vals, reads=True)
     for b, v in enumerate(vals):
         keep = [nd for nd in sorted(stated.node_set()) if nd not in v]

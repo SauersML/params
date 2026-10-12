@@ -16,8 +16,10 @@ flips falls below 0.5 and below half of s_point_c, 512 when not within m <= 256;
 removals, connection cuts and interchange, lower is better; s_changed, kl_changed_c and context_share on the eval split's
 changed inputs, 16 per circuit; s_track, s_interchange and the donor pools' means and 90th percentiles when goal_eval has
 them), overall and by locality, and each side's teacher against VPD's top k at its size (fidelity's "VPD top k" rows:
-VPD's own ranking, every connection among its nodes) with the v2 rule (s_track and donors not below VPD's top k, answers
-within MAX_NODES; the summaries' answer tokens against MAX_TOKENS)
+VPD's own ranking, every connection among its nodes) with the v2 rule (s_track_pp and donors on the eval split's draws not
+below VPD's top k, answers within MAX_NODES; the summaries' answer tokens against MAX_TOKENS); the headline is the eval
+split's s_track_pp (never the search split's, which the searches fit), and phi (goal_eval.phi) a column when goal_eval
+imports (the research venv)
 (heldout50_locality.jsonl).
 
   experiments/oracle/teacher_gate.py SCORE.json A B [--fields f1_live,n_live,...] [--teacher DIR_A DIR_B]
@@ -27,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 
 MAX_NODES, MAX_TOKENS = 266, 3500   # the answer budget (teacher.MAX_NODES, components.ANSWER_BUDGET)
@@ -130,8 +133,16 @@ def main():
         print(f"held-out adversary (teacher_v3.py --evaluate): {len(set(VA) & set(VB))} texts in both")
         compare(VA, VB, args.a, args.b, ("f1", "n", "f1_adv", "f1_rob", "size"))
     if args.fidelity and any(p.exists() for p in args.fidelity):
+        try:  # goal_eval.phi on each row (the research venv's python; without torch the column is left out)
+            sys.path[:0] = [str(Path(__file__).resolve().parents[2] / "method/oracle"), str(Path(__file__).resolve().parents[2] / "method/vpd")]
+            import goal_eval
+            phi = lambda r: goal_eval.phi(r)[0]  # noqa: E731
+        except Exception as e:  # noqa: BLE001
+            print(f"(no phi column: {e})")
+            phi = lambda r: None  # noqa: E731
+
         def row(r):
-            return {**r, **{f"flip_{m}": v for m, v in (r.get("f1_flips_omitted") or {}).items()},
+            return {**r, "phi": phi(r), **{f"flip_{m}": v for m, v in (r.get("f1_flips_omitted") or {}).items()},
                     **{f"flipc_{m}": v for m, v in (r.get("f1_flips_c") or {}).items()},
                     **{k: r.get(k) or 512 for k in ("flips_to_half", "flips_to_break") if k in r}}
 
@@ -143,38 +154,45 @@ def main():
             if not vpd:
                 return teach
             return {r["task"]: row(r) for r in fid_rows if r.get("kind") == f"VPD top {teach.get(r['task'], {}).get('nodes')}"}
-        FA, FB = fid("a"), fid("b")
+        FA, FB = fid(args.a), fid(args.b)
         local = {}
         if args.labels.exists():
             local = {json.loads(x)["task"]: json.loads(x)["local"] for x in args.labels.read_text().splitlines() if x.strip()}
         fields = ("flipc_1", "flipc_4", "flipc_16", "flipc_64", "flipc_256", "flips_to_half", "flips_to_break", "s_point_c", "n_point",
                   "n_real", "s_point", "s_wiring", "reliance_on_cuts", "flip_1", "flip_4", "dreads_edges", "dreads_nodes",
-                  "dreads_interchange", "s_changed", "kl_changed_c", "context_share", "s_track", "s_interchange", "s_donor_near",
-                  "s_donor_near_p90", "s_donor_far", "s_donor_far_p90", "c", "c_flips", "stranded", "nodes", "positions", "size")
+                  "dreads_interchange", "s_changed", "kl_changed_c", "context_share", "s_track", "s_interchange", "s_track_pp",
+                  "s_interchange_pp", "s_pattern", "s_donor_near", "s_donor_near_p90", "s_donor_far", "s_donor_far_p90", "c", "c_flips",
+                  "phi", "stranded", "nodes", "positions", "size", "size_bits")
         for name, keep in (("all", lambda t: True), ("non-local", lambda t: local.get(t) is False), ("local", lambda t: local.get(t) is True)):
             ts = [t for t in set(FA) & set(FB) if keep(t)]
             if ts:
                 print(f"held-out adversary, the team's (goal_eval.py fidelity: adversary_flips omitted at m, fresh pool), {name}: {len(ts)} texts")
                 v = {}
                 compare({t: FA[t] for t in ts}, {t: FB[t] for t in ts}, args.a, args.b, fields, v)
+                pp = [(FA[t].get("s_track_pp"), FB[t].get("s_track_pp")) for t in ts]
+                pp = [(x, y) for x, y in pp if x is not None and y is not None]
+                if pp:
+                    print(f"headline, eval split: s_track_pp {args.a} {sum(x for x, _ in pp) / len(pp):.3f}, {args.b} "
+                          f"{sum(y for _, y in pp) / len(pp):.3f} ({v.get('s_track_pp', 'no verdict')}, {len(pp)} texts)")
                 if name == "all":
                     up = all(v.get(f) == "B higher" for f in ("flipc_1", "flipc_4"))
                     kept = all(v.get(f) != "B lower" for f in ("s_point_c", "n_point"))
                     print(f"rule (guarded): flipc_1 and flipc_4 higher {'yes' if up else 'NO'}; s_point_c and point N not lower "
                           f"{'yes' if kept else 'NO'} -> {'PASS' if up and kept else 'FAIL'} (answers within the budget: answer_tokens.py)")
         vfields = ("flipc_1", "flipc_4", "flips_to_half", "s_nodes", "s_edges", "n_real", "s_point_c", "n_point", "s_point", "dreads_edges",
-                   "s_track", "s_changed", "s_interchange", "s_donor_near", "s_donor_near_p90", "s_donor_far", "s_donor_far_p90", "c", "c_flips")
-        for side, kind, F in ((args.a, "a", FA), (args.b, "b", FB)):
+                   "s_track", "s_track_pp", "s_changed", "s_interchange", "s_interchange_pp", "s_pattern", "s_donor_near", "s_donor_near_p90",
+                   "s_donor_far", "s_donor_far_p90", "c", "c_flips", "phi")
+        for side, kind, F in ((args.a, args.a, FA), (args.b, args.b, FB)):
             V = fid(kind, vpd=True)
             ts = sorted(set(F) & set(V))
             if ts:
                 print(f"{side} against VPD's top k at its sizes (A = VPD top k, B = {side}): {len(ts)} texts")
                 v = {}
                 compare({t: V[t] for t in ts}, {t: F[t] for t in ts}, "VPD top k", side, vfields, v)
-                held = [f for f in ("s_track", "s_donor_near", "s_donor_far") if f in v]
+                held = [f for f in ("s_track_pp", "s_donor_near", "s_donor_far") if f in v]  # eval split's draws (fidelity's full mode)
                 big = [t for t in ts if (F[t].get("nodes") or 0) > MAX_NODES]
                 print(f"v2 rule for {side}: " + (f"{', '.join(held)} not below VPD's top k {'yes' if all(v[f] != 'B lower' for f in held) else 'NO'}"
-                                                   if held else "no s_track or donor rows (NO)")
+                                                   if held else "no s_track_pp or donor rows (NO)")
                       + f"; answers within {MAX_NODES} nodes {'yes' if not big else f'NO ({len(big)} over)'} (tokens: the summaries' line above)")
     print("per text (f1_live, n_live, nodes):")
     for t in tasks:

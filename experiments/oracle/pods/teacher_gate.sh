@@ -3,8 +3,7 @@
 # held-out texts, compared text by text. Each of A and B is a directory of circuits (<task>.json, e.g. another search's) or
 # COMMIT[,FLAG...] (a commit on origin/main and teacher.py flags, comma-separated, a comma inside a flag's value written
 # :: as in --edge-levels,writer::connection: 787320c,--edges,--f1-start,both;
-# v3@COMMIT[,FLAG...] runs teacher_v3.py, one process per card on V3PODS pods; reads@COMMIT[,FLAG...] teacher_reads.py,
-# READP per card on READPODS pods), which teacher_pod.sh teaches on pods (VPD's
+# v3@COMMIT[,FLAG...] runs teacher_v3.py, one process per card on V3PODS pods), which teacher_pod.sh teaches on pods (VPD's
 # answers from vpd_heldout20.pt) into ~/mpd-data/graph_oracle/teacher/gate/NAME/a or b, both at once. Then one pod scores
 # both sets with goal_eval.py score --diagnostics (VPD's checkpoint put back together on the pod: VPD's own answers, the
 # baselines) and goal_eval.py fidelity on both sets in one run (C, adversary_flips' omitted lever, the guarded scores,
@@ -12,30 +11,30 @@
 # pattern lever goal_eval/ci_patterns_fresh.pt), sharded over FIDP processes beside the score run, and
 # experiments/oracle/teacher_gate.py compares them. The scores come back to
 # ~/mpd-data/runpod/oracle-graph-teacher-gscore-NAME/ (score.json, fid_<k>.jsonl), the comparison to gate.txt.
-#   experiments/oracle/pods/teacher_gate.sh NAME A B   (env: N, PODS, P per side, V3PODS, READPODS, READP, VRAM; FIDP, GPU, PRICE,
+#   experiments/oracle/pods/teacher_gate.sh NAME A B [C [D]]   (up to four arms, each scored in one run and compared with A;
+#   env: N, PODS, P per side, V3PODS, VRAM; FIDP, GPU, PRICE,
 #   SCORE_GPU, SCORE_VRAM (the scoring card, default 44 GB: fidelity with donors overflows 24 GB even alone); the
 #   adversary's search pool goes to the teaching pods for --repair, --edge-objective robust and teacher_v3)
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
-NAME=$1 A=$2 B=$3
-[ -n "$B" ] || { echo "usage: teacher_gate.sh NAME A B"; exit 2; }
+NAME=$1; shift
+specs=("$@") sides=(a b c d)
+[ ${#specs[@]} -ge 2 ] && [ ${#specs[@]} -le 4 ] || { echo "usage: teacher_gate.sh NAME A B [C [D]]"; exit 2; }
+sides=("${sides[@]:0:${#specs[@]}}")
 N=${N:-20}
 GPU=${GPU:-NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090,NVIDIA RTX 4000 Ada Generation,NVIDIA RTX A4500,NVIDIA RTX A4000,NVIDIA RTX A6000,NVIDIA A40}
 G=/Users/user/mpd-data/graph_oracle/teacher/gate/$NAME
 F=/Users/user/mpd-data/scratch/fleet/gate_$NAME
-rm -rf "$F" && mkdir -p "$F/in/a" "$F/in/b" "$G"
+rm -rf "$F" && mkdir -p "$G" && for side in "${sides[@]}"; do mkdir -p "$F/in/$side"; done
 dirs=()
-for side in a b; do
-  spec=$A; [ $side = b ] && spec=$B
+for i in "${!sides[@]}"; do
+  side=${sides[$i]} spec=${specs[$i]}
   if [ -d "$spec" ]; then echo "$side: circuits in $spec" | tee -a "$G/README.txt"; dirs+=("$spec"); continue; fi
   IFS=, read -r ref flags <<< "$spec"
   flags=${flags//,/ } flags=${flags//::/,}               # a comma inside one flag's value is written ::
   script=teacher.py pods=${PODS:-2} procs=${P:-4}
-  case $ref in
-    v3@*) ref=${ref#v3@} script=teacher_v3.py pods=${V3PODS:-4} procs=1 ;;
-    reads@*) ref=${ref#reads@} script=teacher_reads.py pods=${READPODS:-4} procs=${READP:-2} ;;
-  esac
+  case $ref in v3@*) ref=${ref#v3@} script=teacher_v3.py pods=${V3PODS:-4} procs=1 ;; esac
   C=$(git rev-parse --verify "$ref^{commit}") || exit 2
   echo "$side: $script at ${C:0:10} $flags" | tee -a "$G/README.txt"
   SCRIPT=$script RUN=g$NAME$side REF=$C TEACHER_ARGS="$flags" SPLIT=heldout N=$N PODS=$pods P=$procs VRAM=${VRAM:-16} GPU="$GPU" \
@@ -44,8 +43,8 @@ for side in a b; do
   dirs+=("$G/$side")
 done
 wait
-for i in 0 1; do
-  side=a; [ $i = 1 ] && side=b
+for i in "${!sides[@]}"; do
+  side=${sides[$i]}
   find "${dirs[$i]}" -maxdepth 1 -name 'text*.json' | grep -E '/text[0-9]+\.json$' | while read -r f; do cp "$f" "$F/in/$side/"; done
   echo "$side: $(ls "$F/in/$side" | wc -l | tr -d ' ') circuits from ${dirs[$i]}"
 done
@@ -53,10 +52,11 @@ done
 cp /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt "$F/vpd.pt"
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt "$F/pool.pt"
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt "$F/fresh.pt"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" a b tasks.txt -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" "${sides[@]}" tasks.txt -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 rm -rf "$F/in"
 V=/Users/user/mpd-data/vpd
 RN=oracle-graph-teacher-gscore-$NAME
+SETS=$(for side in "${sides[@]}"; do printf -- '--set %s=$HOME/gate_in/%s ' "$side" "$side"; done)
 O=/Users/user/mpd-data/runpod/$RN
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$RN/mpd-data ~/mpd-data; mkdir -p $O ~/mpd-data/graph_oracle ~/gate_in;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
@@ -65,8 +65,8 @@ ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 big=\$(( \$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1) >= 44000 ));
-score() { python -B goal_eval.py score --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --split heldout --n $N --diagnostics --out $O/score.json > $O/score.log 2>&1; };
-fid() { rm -f $O/fid_\$1.jsonl; python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --vpd $F/vpd.pt --offset \$1 --stride ${FIDP:-2} --out $O/fid_\$1.jsonl > $O/fid_\$1.log 2>&1; };
+score() { python -B goal_eval.py score $SETS --split heldout --n $N --diagnostics --out $O/score.json > $O/score.log 2>&1; };
+fid() { rm -f $O/fid_\$1.jsonl; python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --vpd $F/vpd.pt --offset \$1 --stride ${FIDP:-2} --out $O/fid_\$1.jsonl > $O/fid_\$1.log 2>&1; };
 set +e; (score) &
 [ \$big = 1 ] || wait;
 for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (fid \$k) & [ \$big = 1 ] || wait; done; wait;
@@ -83,6 +83,11 @@ for try in $(seq 1 40); do
   sleep 180
 done
 [ -s "$O/score.json" ] || { echo "no scores: $O/score.log, $F/rp_score.log"; exit 1; }
-{ cat "$G/README.txt" 2> /dev/null; echo "scored at $(sed -nE 's/.* source ([0-9a-f]+):.*/\1/p' "$O/rp-run.log" | tail -1) (goal_eval score and fidelity; both arms at this commit)"; /usr/bin/python3 -I experiments/oracle/teacher_gate.py "$O/score.json" a b --teacher "${dirs[0]}" "${dirs[1]}" --fidelity $(for k in $(seq 0 $(( ${FIDP:-2} - 1 ))); do printf '%s ' "$O/fid_$k.jsonl"; done); } | tee "$O/gate.txt"
+{ cat "$G/README.txt" 2> /dev/null; echo "scored at $(sed -nE 's/.* source ([0-9a-f]+):.*/\1/p' "$O/rp-run.log" | tail -1) (goal_eval score and fidelity; every arm at this commit)"
+  for i in $(seq 1 $((${#sides[@]} - 1))); do  # each arm against the first, phi from goal_eval in the research venv
+    echo "===== ${sides[0]} vs ${sides[$i]}"
+    MPD_MEM_GIB=2 /Users/user/mpd-data/venv/bin/python -B experiments/oracle/teacher_gate.py "$O/score.json" "${sides[0]}" "${sides[$i]}" \
+      --teacher "${dirs[0]}" "${dirs[$i]}" --fidelity $(for k in $(seq 0 $(( ${FIDP:-2} - 1 ))); do printf '%s ' "$O/fid_$k.jsonl"; done)
+  done; } | tee "$O/gate.txt"
 exit
 }

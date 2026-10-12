@@ -194,17 +194,14 @@ class Engine:
         """The numbers to report for masks a search found at a lower precision: float32, vpd_model's own steps."""
         return self.kl({n: m.detach().float() for n, m in masks.items()}, "score")
 
-    def plan(self, graphs, semantics: str = "native", cuts=None, free=None) -> dict:
+    def plan(self, graphs, semantics: str = "native", cuts=None) -> dict:
         """Graphs' nodes and connections as index tensors over the engine's columns, for graph_kl. graphs: one
         native.Graph, run on every row, or a list of them, one per row. semantics (module docstring): "native"
         (native.run's: the stated connections) or "c" (C's: every connection the model has among the nodes, the
         unstated ones at strength 0). cuts: per graph (one dict, or a list beside graphs) {reader node or None (the
         prediction): [writer nodes]}, connections at strength 0 besides the unstated ones. In C's semantics a graph may
         be complete (VPD's answer, the whole model: native.Graph(masks=...)): it runs as u (give it 1 on the graph's
-        subcomponents), its subcomponents reading each other in full but for the cuts and free; free: per complete
-        graph (one dict, or a list beside graphs) {reader node: [writer nodes]}, connections at the strengths ew gives
-        (after the stated ones, in free's order; a cut one stays at 0): teacher_reads' value reads, each row of one
-        plan cutting its own subset. Per site the circuit's nodes,
+        subcomponents), its subcomponents reading each other in full but for the cuts. Per site the circuit's nodes,
         the query and key nodes, the reader nodes (with a connection in) and the writer nodes as (rows, positions,
         columns); per (reader site, writer site) the connections (reader rows, writer rows, their index among the
         strengths, 1 for a stated one and 0 for an unstated or cut one); per writer site the connections into the
@@ -214,13 +211,12 @@ class Engine:
         one = not isinstance(graphs, (list, tuple))
         graphs = [graphs] if one else list(graphs)
         cuts = [cuts] if one else (list(cuts) if cuts is not None else [None] * len(graphs))
-        free = [free] if one else (list(free) if free is not None else [None] * len(graphs))
-        keys = [(id(g), id(c), id(f)) for g, c, f in zip(graphs, cuts, free)]
+        keys = [(id(g), id(c)) for g, c in zip(graphs, cuts)]
         if not one and len(set(keys)) < len(keys):  # a graph given more than once (with the same cuts): each planned
             single = {}                              # once, the rows' plans laid end to end (_stack)
-            for g, c, f, k in zip(graphs, cuts, free, keys):
+            for g, c, k in zip(graphs, cuts, keys):
                 if k not in single:
-                    single[k] = (len(single), self.plan(g, semantics, c, f))
+                    single[k] = (len(single), self.plan(g, semantics, c))
             return self._stack([p for _, p in single.values()], [single[k][0] for k in keys])
         if semantics == "native" and any(g.complete for g in graphs):
             raise ValueError("native.run's graph runs need stated connections (a complete graph is a masked run: kl)")
@@ -247,16 +243,8 @@ class Engine:
             pcut = {k[1:]: v for k, v in (cuts[b] or {}).items() if _pair_cut(k)}  # (layer, t): (split nodes, pairs removed)
             cuts[b] = {r: ws for r, ws in (cuts[b] or {}).items() if not _pair_cut(r)}
             cut = {(w, r) for r, ws in cuts[b].items() for w in ws}
-            if g.complete:  # its subcomponents read each other in full (u): only the cuts and free are connections here
-                fr = [(w, r) for r, ws in (free[b] or {}).items() for w in ws]
-                if any(r is None for _, r in fr):
-                    raise ValueError("free connections are into nodes")
-                at = {e: E + k for k, e in enumerate(fr)}
-                E += len(fr)
-                par = {}
-                for r, ws in [*(cuts[b] or {}).items(), *(free[b] or {}).items()]:
-                    if r is not None:
-                        par[r] = list(dict.fromkeys([*par.get(r, []), *ws]))
+            if g.complete:  # its subcomponents read each other in full (u): only the cuts are connections here
+                at, par = {}, {r: list(ws) for r, ws in (cuts[b] or {}).items() if r is not None}
                 out = list((cuts[b] or {}).get(None, []))
             else:
                 ne, no = E, O  # this graph's stated connections' indices: from E and O on, in its parents' and out's order

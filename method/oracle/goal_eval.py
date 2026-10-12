@@ -1722,9 +1722,12 @@ class GoalEval:
         cancel on real text stay consistent (the remainders live); paired with VPD's answer under the same donors; the
         KL from the model on the text. Donors: "near", the changed-input texts of split (changed_inputs' draws), and
         "far", far's texts (token id lists, other held-out texts), aligned at their ends, those shorter than the text
-        leaving its first positions unresampled (their activations live). Per circuit and pool: s_donor_<pool>, C's
-        log scale on the mean KLs (_fid against KL_empty); s_donor_<pool>_worst, the lowest donor's; kl_donor_<pool>
-        (KL_C, KL_VPD); donors_<pool> (how many). The flip adversary's in-distribution counterpart: a circuit that holds
+        leaving its first positions unresampled (their activations live). The bound is the run that keeps nothing,
+        every subcomponent at the donor's (KL_0), not the empty circuit's KL: a near donor differs from the text at one
+        position, so against KL_empty (~100 bits) every circuit would score near 1. Per circuit and pool:
+        s_donor_<pool> = clip(ln(KL_0 / KL_C) / ln(KL_0 / KL_VPD), 0, 1) on the mean KLs; s_donor_<pool>_worst, the
+        lowest donor's (a donor where VPD's answer is no nearer than KL_0 left out); kl_donor_<pool> (KL_C, KL_VPD,
+        KL_0); donors_<pool> (how many). The flip adversary's in-distribution counterpart: a circuit that holds
         here but not under the flips is charged there for combinations no real text makes."""
         import engine
 
@@ -1744,7 +1747,7 @@ class GoalEval:
             texts["far"] = [list(x) for x in far if list(x) != list(tx.ids)]
         E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=None)
         u = {n: torch.ones(1, 1, nat.C[n], device=dev) for n in nat.names}
-        sides = list(graphs) + [native.Graph(masks=tx.vpd)]
+        sides = list(graphs) + [native.Graph(masks=tx.vpd), native.Graph()]  # the circuits, VPD's answer, nothing kept
         own = []  # per side, its nodes as {site: bool [T, C]}: left unpatched
         for g in sides:
             m = self.masks(g, T)
@@ -1769,14 +1772,14 @@ class GoalEval:
                 kl = carry.kl(tx.ref, lq).view(len(chunk), len(sides))
                 kls += kl.tolist()
                 native.free(dev)
+            kv, k0 = [k[-2] for k in kls], [k[-1] for k in kls]
             for b in range(len(graphs)):
                 kc = [k[b] for k in kls]
-                kv = [k[-1] for k in kls]
-                each = [_fid(e0, c, v) for c, v in zip(kc, kv)]
+                each = [_fid(z, c, v) for z, c, v in zip(k0, kc, kv)]
                 each = [x for x in each if x is not None]
-                out[b].update({f"s_donor_{pool}": _fid(e0, float(np.mean(kc)), float(np.mean(kv))) if kc else None,
+                out[b].update({f"s_donor_{pool}": _fid(float(np.mean(k0)), float(np.mean(kc)), float(np.mean(kv))) if kc else None,
                                f"s_donor_{pool}_worst": min(each) if each else None,
-                               f"kl_donor_{pool}": (float(np.mean(kc)), float(np.mean(kv))) if kc else None,
+                               f"kl_donor_{pool}": (float(np.mean(kc)), float(np.mean(kv)), float(np.mean(k0))) if kc else None,
                                f"donors_{pool}": len(kc)})
         return out
 

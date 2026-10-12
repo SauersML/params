@@ -1334,8 +1334,10 @@ def test_donor_resampling(tiny):
     assert abs(rows[0]["kl_donor_far"][1] - wv) < 1e-4 + 1e-4 * wv
     ws = _kl(full, naive(nat, tx.ids, replace={nd: sacts[nd[0]][nd[1] - 4, nd[2]] for nd in outside if nd[1] >= 4})[0], tx.targets)
     assert abs(alone["kl_donor_far"][0] - ws) < 1e-4 + 1e-4 * ws
-    e0 = ge._bounds(tx, "live")[0]
-    assert rows[0]["s_donor_far"] == goal_eval._fid(e0, *rows[0]["kl_donor_far"]) and rows[0]["donors_far"] == 1
+    w0 = _kl(full, naive(nat, tx.ids, replace={nd: acts[nd[0]][nd[1], nd[2]] for nd in outside + sub})[0], tx.targets)
+    kc, kv, k0 = rows[0]["kl_donor_far"]
+    assert abs(k0 - w0) < 1e-4 + 1e-4 * w0  # the bound: every subcomponent at the donor's
+    assert rows[0]["s_donor_far"] == goal_eval._fid(k0, kc, kv) and rows[0]["donors_far"] == 1
     near = ge.donors(tx, [whole], near=4)[0]
     assert near["donors_near"] == len(ge.changed_inputs(tx, [whole], "eval", 4)[0]["draws_changed"])
 

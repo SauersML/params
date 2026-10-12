@@ -19,8 +19,8 @@ SFT.jsonl: components.py dataset rows (the prompt's question and the target answ
 (evidence(): the subcomponents each question lists). sample writes tinker_train.py sample's format (components.py
 evaluate reads it). --shuffle gives each question's subcomponents one another's vectors (a derangement within the
 question): the ablation that shows whether the explainer reads them; --shuffled-out writes that set beside OUT in the
-same run. --vllm samples with vLLM from the prompts' embeddings (computed here, then the adapter merged into a saved
-checkpoint that vLLM loads: train.py's VllmSampler found vLLM's own LoRA with prompt embeddings crashing, and runs
+same run. --vllm samples with vLLM from the prompts' embeddings (computed here; vLLM on the base takes the adapter's
+merged linear maps in place: train.py's VllmSampler found vLLM's own LoRA with prompt embeddings crashing, and runs
 them without prefix caching or asynchronous scheduling), else transformers' generate. Vectors: native.UV, the tensors
 native runs on, through method/vpd/uv.py.
 """
@@ -105,6 +105,8 @@ class Injector(torch.nn.Module):
     def __init__(self, dims: dict, width: int, rms: float, logn_mean: float, logn_std: float):
         super().__init__()
         self.maps = torch.nn.ModuleDict({f"{k}_{side}": torch.nn.Linear(dims[k][i], width) for k in dims for i, side in enumerate(SIDES)})
+        for m in self.maps.values():  # a slot starts as its vector's mapped direction alone (a bias would be one shared direction)
+            torch.nn.init.zeros_(m.bias)
         self.magnitude = torch.nn.Linear(1, width)
         torch.nn.init.zeros_(self.magnitude.weight)
         torch.nn.init.zeros_(self.magnitude.bias)
@@ -279,24 +281,32 @@ def sft(a) -> None:
     print(json.dumps({"saved": str(a.out)}), flush=True)
 
 
-def vllm_sample(ex: Explainer, embeds: list[torch.Tensor], n: int, max_tokens: int, seed: int, workdir: Path) -> list[list[tuple[list[int], bool]]]:
-    """n samples of every prompt given as embeddings [L, width], by vLLM from the explainer's adapter merged into a
-    saved checkpoint (the explainer is freed first)."""
+def vllm_sample(ex: Explainer, base: str, embeds: list[torch.Tensor], n: int, max_tokens: int, seed: int) -> list[list[tuple[list[int], bool]]]:
+    """n samples of every prompt given as embeddings [L, width], by vLLM on the base with the explainer's adapter merged
+    into its linear maps in place (train.py's VllmSampler.push_weights, through vLLM's own loader, in-process; the
+    merged maps go through host memory, so the explainer leaves the GPU first and nothing is written to disk)."""
     import gc
-    import shutil
+    import os
 
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")  # apply_model runs here, on the engine's model
+    from peft.tuners.lora import LoraLayer
     from vllm import LLM, SamplingParams
 
-    end, tok = ex.end, ex.tok
-    merged = workdir / "merged"
-    shutil.rmtree(merged, ignore_errors=True)
-    ex.model.merge_and_unload().save_pretrained(str(merged))
-    tok.save_pretrained(str(merged))
+    end = ex.end
+    merged = []
+    with torch.no_grad():
+        for name, m in ex.model.named_modules():
+            if isinstance(m, LoraLayer) and "default" in m.lora_A:
+                w = m.base_layer.weight
+                merged.append((name.removeprefix("base_model.model.") + ".weight", (w.float() + m.get_delta_weight("default").float()).to(w.dtype).cpu()))
     del ex
     gc.collect()
     torch.cuda.empty_cache()
-    llm = LLM(model=str(merged), dtype="bfloat16", enable_prompt_embeds=True, enable_prefix_caching=False, async_scheduling=False,
+    llm = LLM(model=base, dtype="bfloat16", enable_prompt_embeds=True, enable_prefix_caching=False, async_scheduling=False,
               max_model_len=max(int(e.shape[0]) for e in embeds) + max_tokens + 16, gpu_memory_utilization=0.85, seed=seed)
+    loaded = llm.apply_model(lambda model: len(model.load_weights(iter(merged))))[0]
+    if not loaded:
+        raise RuntimeError(f"vLLM loaded none of the adapter's {len(merged)} merged weights")
     params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=max_tokens, stop_token_ids=[end])
     outs = llm.generate([{"prompt_embeds": e} for e in embeds], params, use_tqdm=False)
     return [[([t for t in c.token_ids if t != end], c.finish_reason == "length") for c in o.outputs] for o in outs]
@@ -321,7 +331,7 @@ def sample(a) -> None:
     if a.vllm:
         with torch.no_grad():
             embeds = [ex.embed(torch.tensor([p], device=dev), [nd])[0].to(torch.bfloat16).cpu() for _, nds in sets for p, nd in zip(prompts, nds)]
-        flat = vllm_sample(ex, embeds, a.samples, a.max_tokens, a.seed, a.out.parent)
+        flat = vllm_sample(ex, a.base, embeds, a.samples, a.max_tokens, a.seed)
         got = [flat[k * len(prompts):(k + 1) * len(prompts)] for k in range(len(sets))]
     else:
         got = [ex.sample(prompts, nds, a.samples, a.max_tokens, a.batch) for _, nds in sets]

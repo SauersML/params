@@ -223,7 +223,13 @@ def explain(a) -> None:
         futs.append((f, prompt, writer.sample(prompt=prompt, num_samples=a.n, sampling_params=params)))
     out = []
     for f, prompt, fut in futs:
-        res = fut.result()
+        try:
+            res = fut.result()
+        except Exception as e:  # a prompt longer than the writer's context: nothing written for this text
+            out.append({"task": f["task"], "samples": [], "e1": [], "best": None, "explanation": "", "e1_best": None,
+                        "e1_mean": None, "named": 0, "error": f"{type(e).__name__}: {str(e)[:200]}"})
+            print(json.dumps({"task": f["task"], "kept": False, "error": out[-1]["error"]}), flush=True)
+            continue
         hits = res.prompt_cache_hit_tokens
         spend_w.add("writer", prefill=prompt.length - hits, cached=hits + (a.n - 1) * prompt.length, sampled=sum(len(x.tokens) for x in res.sequences))
         texts = []

@@ -347,7 +347,10 @@ def rl(a) -> None:
             scores = r.json()["scores"]
             rewards = [s["reward"] for s in scores]
             mean = sum(rewards) / len(rewards)
-            groups.append({"task": q["task"], "rewards": rewards, "valid": [s["valid"] for s in scores],
+            distinct = len({tuple(s.tokens) for s in res.sequences})
+            if step == 0 and distinct == 1 and a.group > 1:  # a seeded or degenerate sampler: no advantage, nothing learned
+                raise SystemExit(f"all {a.group} answers to {q['task']} are identical: check the sampling parameters")
+            groups.append({"task": q["task"], "distinct": distinct, "rewards": rewards, "valid": [s["valid"] for s in scores],
                            "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")} for s in scores],
                            "texts": texts, "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
@@ -377,6 +380,7 @@ def rl(a) -> None:
             sampler = training.save_weights_and_get_sampling_client()
         flat = [x for g in groups for x in g["rewards"]]
         print(json.dumps({"step": step, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
+                          "distinct": [g["distinct"] for g in groups],
                           "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],
                           "score_seconds": sum(g["score_seconds"] for g in groups), "total_usd": spend.total,
                           "seconds": time.time() - t0}), flush=True)

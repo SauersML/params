@@ -1063,39 +1063,54 @@ class GoalEval:
             omit = {n: vpd_on[n] & ~on[n] & where for n in nat.names}
             parts.append({"on": on, "free": {n: (~vpd_on[n] & ~on[n] & where).float() for n in nat.names},
                           "idx": {n: omit[n].nonzero(as_tuple=True) for n in nat.names}})
-        def masks(i, w, b):  # circuit i's adversary masks (outside the circuit) and VPD's run's, [R, T, columns]
-            R, q = w.shape[0], parts[i]
-            uc, mv = {}, {}
-            for n in nat.names:
-                a = 1 - torch.prod(1 - w[:, :, None] * P[n][None], 1)  # [R, columns]: the OR of the patterns on
-                uc[n] = q["free"][n] * a[:, None, :]
-                if b[n].shape[1]:
-                    priv = torch.zeros(R, T, len(cols[n]), device=dev)
-                    priv[:, q["idx"][n][0], q["idx"][n][1]] = b[n]
-                    uc[n] = uc[n] + priv
-                mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :]
-            return uc, mv
+        free = {n: torch.stack([q["free"][n] for q in parts]) for n in nat.names}  # [circuits, T, columns]
+        onf = {n: torch.stack([q["on"][n] for q in parts]).float() for n in nat.names}
+        plans, flats = {}, {}
+
+        def layout(key):  # rows (circuit, count) in order: each row's circuit, the omissions' places per site
+            if key not in flats:
+                circ = torch.tensor([i for i, r in key for _ in range(r)], dtype=torch.long, device=dev)
+                fl = {}
+                for n in nat.names:
+                    rr, tt, kk, r0 = [], [], [], 0
+                    for i, r in key:
+                        t_, k_ = parts[i]["idx"][n]
+                        if len(t_):  # row r0 + s holds b[s, :] at (t_, k_)
+                            rr.append((r0 + torch.arange(r, device=dev)).repeat_interleave(len(t_)))
+                            tt.append(t_.repeat(r))
+                            kk.append(k_.repeat(r))
+                        r0 += r
+                    fl[n] = (torch.cat(rr), torch.cat(tt), torch.cat(kk)) if rr else None
+                flats[key] = (circ, fl)
+            return flats[key]
 
         def batch(items, precision="score", vpd=True):  # vpd=False: the circuits' runs alone (KL_VPD None)
-            built = [masks(i, w, b) for i, w, b in items]
-            R = [w.shape[0] for _, w, _ in items]
-            kc = [None] * len(items)
-            for complete in (False, True):
-                js = [j for j, (i, _, _) in enumerate(items) if graphs[i].complete == complete]
-                if not js:
-                    continue
-                if complete:
-                    got = E.kl({n: torch.cat([parts[items[j][0]]["on"][n].float() + built[j][0][n] for j in js]) for n in nat.names}, precision)
-                else:
-                    # C's semantics (graph inside, masked outside): graph_ref on the adversary's masks over every column
-                    got = torch.cat([carry.kl(E.ref, self.graph_ref(tx.ids, tx.targets, graphs[items[j][0]], u=E.full(built[j][0])))
-                                     for j in js])
-                for j, x in zip(js, got.split([R[j] for j in js])):
-                    kc[j] = x
-            if not vpd:
-                return [(x, None) for x in kc]
-            kv = E.kl({n: torch.cat([x[1][n] for x in built]) for n in nat.names}, precision).split(R)
-            return list(zip(kc, kv))
+            order = sorted(range(len(items)), key=lambda j: graphs[items[j][0]].complete)  # the stated circuits' rows first
+            its = [items[j] for j in order]
+            key = tuple((i, w.shape[0]) for i, w, _ in its)
+            circ, fl = layout(key)
+            ns = sum(r for i, r in key if not graphs[i].complete)
+            w = torch.cat([x for _, x, _ in its])
+            uc, mv = {}, {}
+            for n in nat.names:  # every row's masks at once
+                a = 1 - torch.prod(1 - w[:, :, None] * P[n][None], 1)  # [rows, columns]: the OR of the patterns on
+                uc[n] = free[n][circ] * a[:, None, :]
+                if fl[n] is not None:  # the omissions (disjoint from free)
+                    uc[n] = uc[n].index_put(fl[n], torch.cat([b[n].reshape(-1) for _, _, b in its]), accumulate=True)
+                if vpd:
+                    mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :]
+            kc = []
+            if ns:  # C's semantics (graph inside, masked outside): the stated circuits as one list of graphs
+                sk = key[:sum(1 for i, _ in key if not graphs[i].complete)]
+                if sk not in plans:
+                    plans[sk] = E.plan([graphs[i] for i, r in sk for _ in range(r)], semantics="c")
+                kc.append(E.graph_kl(plans[sk], u={n: uc[n][:ns] for n in nat.names}, precision=precision))
+            if ns < len(circ):
+                kc.append(E.kl({n: onf[n][circ[ns:]] + uc[n][ns:] for n in nat.names}, precision))
+            kc = torch.cat(kc).split([r for _, r in key])
+            kv = E.kl(mv, precision).split([r for _, r in key]) if vpd else [None] * len(its)
+            at = {j: k for k, j in enumerate(order)}
+            return [(kc[at[j]], kv[at[j]]) for j in range(len(items))]
 
         problems = [((lambda w, b, precision="score", i=i: batch([(i, w, b)], precision)[0]), parts[i]["idx"], cols)
                     for i in range(len(graphs))]

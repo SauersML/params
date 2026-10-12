@@ -107,6 +107,7 @@ ADV_CURVE = (0, 4, 20)  # budgets reported (steps)
 ADV_BATCH = 64  # the random members' rows per run (every circuit's restarts run together in the steps)
 FLIPS = {"omitted": (1, 4, 16, 64, 256), "patterns": (1, 2, 4, 8)}  # adversary_flips' budgets: how many switched on
 FLIP_TERM = 4  # the flip budget C's adversarial member (and the reward's) takes
+FLIP_ROWS = 160  # adversary_flips' rows per run: every circuit's restarts at every budget (8 x 5 x 4) together
 
 
 # ---- answers
@@ -1319,11 +1320,9 @@ class GoalEval:
         sizes = [[len(idx[n][0]) for n in nat.names] for _, idx, _ in problems]
         N = [sum(z) if omitted else len(pick) for z in sizes]
 
-        def items(xs):  # per circuit its lever's rows [R, N_i] (None: left out) -> batch()'s items
+        def items(xs):  # [(circuit, its lever's rows [R, N_i])] -> batch()'s items
             out = []
-            for i, x in enumerate(xs):
-                if x is None:
-                    continue
+            for i, x in xs:
                 R = x.shape[0]
                 if omitted:
                     out.append((i, torch.zeros(R, len(pick), device=dev), dict(zip(nat.names, torch.split(x, sizes[i], 1)))))
@@ -1331,47 +1330,47 @@ class GoalEval:
                     out.append((i, x, {n: torch.zeros(R, z, device=dev) for n, z in zip(nat.names, sizes[i])}))
             return out
 
-        def grads(xs, precision):
-            xs = [None if x is None else x.detach().requires_grad_(True) for x in xs]
-            if all(x is None for x in xs):
-                return xs
+        def grads(xs, precision):  # [(circuit, rows)] -> each rows' gradient of the objective, one batch
+            xs = [(i, x.detach().requires_grad_(True)) for i, x in xs]
+            if not xs:
+                return []
             loss = sum(kc.clamp_min(1e-12).log().sum() - (0 if kv is None else kv.clamp_min(1e-12).log().sum())
                        for kc, kv in batch(items(xs), precision, vpd=not omitted))
-            g = iter(torch.autograd.grad(loss, [x for x in xs if x is not None]))
-            return [None if x is None else next(g) for x in xs]
+            return list(torch.autograd.grad(loss, [x for _, x in xs]))
 
         def top(x, m):  # each row's m largest entries kept, the rest 0
             keep = torch.zeros_like(x, dtype=torch.bool).scatter(1, x.topk(m, 1).indices, True)
             return x * keep
 
         with torch.no_grad():
-            kv0 = batch(items([torch.zeros(1, N[0], device=dev)]))[0][1] if omitted and problems else None
-        g0 = grads([torch.zeros(1, n, device=dev) if n else None for n in N], "score")
+            kv0 = batch(items([(0, torch.zeros(1, N[0], device=dev))]))[0][1] if omitted and problems else None
+        live = [i for i in range(len(problems)) if N[i]]
+        g0 = dict(zip(live, grads([(i, torch.zeros(1, N[i], device=dev)) for i in live], "score")))
         starts = {(i, m): torch.rand(restarts, N[i], generator=gen).to(dev) for i in range(len(problems)) for m in ms if m <= N[i]}
         flat = [[(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())] if omitted else pick
                 for _, idx, cols in problems]
         out = [{f"f1_flips_{lever}": {}, f"kl_flips_{lever}": {}, f"mask_flips_{lever}": {}} for _ in problems]
-        for m in ms:  # every circuit's restarts at one budget together
-            xs = [None] * len(problems)
-            for i in range(len(problems)):
-                if (i, m) in starts:
-                    x = starts[(i, m)]
-                    x[0] = g0[i][0]
-                    xs[i] = top(x, m).clamp(0, 1)
-            if all(x is None for x in xs):
-                continue
+        pairs = [(i, m) for m in ms for i in range(len(problems)) if (i, m) in starts]
+        xs = {}
+        for i, m in pairs:
+            x = starts[(i, m)]
+            x[0] = g0[i][0]
+            xs[(i, m)] = top(x, m).clamp(0, 1)
+        per = max(1, FLIP_ROWS // restarts)
+        for s0 in range(0, len(pairs), per):  # every circuit's restarts at every budget together, FLIP_ROWS rows a run
+            group = pairs[s0:s0 + per]
             for _ in range(steps):
-                xs = [None if x is None else top((x + ADV_STEP * g.sign()).clamp(0, 1), m) for x, g in zip(xs, grads(xs, search))]
+                for (i, m), g in zip(group, grads([(i, xs[(i, m)]) for i, m in group], search)):
+                    xs[(i, m)] = top((xs[(i, m)] + ADV_STEP * g.sign()).clamp(0, 1), m)
             with torch.no_grad():
-                xb = [None if x is None else torch.zeros_like(x).scatter(1, x.topk(m, 1).indices, 1.0) for x in xs]
-                its = items(xb)
-                for (i, _, _), (kc, kv) in zip(its, batch(its, vpd=not omitted)):
+                xb = {(i, m): torch.zeros_like(xs[(i, m)]).scatter(1, xs[(i, m)].topk(m, 1).indices, 1.0) for i, m in group}
+                for (i, m), (kc, kv) in zip(group, batch(items([(i, xb[(i, m)]) for i, m in group]), vpd=not omitted)):
                     kv = kv0.expand_as(kc) if kv is None else kv
                     gap = kc.log() - kv.log()
                     r = int(gap.argmax())
                     out[i][f"f1_flips_{lever}"][m] = _fid(e0, float(kc[r]), float(kv[r]))
                     out[i][f"kl_flips_{lever}"][m] = (float(kc[r]), float(kv[r]))
-                    out[i][f"mask_flips_{lever}"][m] = [flat[i][j] for j in xb[i][r].nonzero().flatten().tolist()]
+                    out[i][f"mask_flips_{lever}"][m] = [flat[i][j] for j in xb[(i, m)][r].nonzero().flatten().tolist()]
             native.free(dev)
         return out
 

@@ -388,3 +388,20 @@ def test_writer_writes_the_teacher_variables_meanings():
     prompt = components.writer_prompt(f)
     assert "V1 (provisional name 'v1'): inputs 4 (' each'); carried by L2.v#5@4; feeds v2" in prompt
     assert prompt.endswith(components.WRITER_VARIABLES)
+
+
+def test_pattern_lines_round_trip_the_pair_edges():
+    """goal_eval's ["pair", query, key, layer, position] edges render as PATTERN lines by id (rest for the remainder)
+    and parse back to the same entries; the written-out form without the L@ prefix takes the query's read; a line
+    naming no query when it gives no read, or an unknown id, is malformed."""
+    answer = {"nodes": [["h.3.attn.o_proj", 1, 7], ["h.3.attn.q_proj", 283, 7], ["h.3.attn.k_proj", 145, 4], ["h.3.attn.v_proj", 9, 4]],
+              "edges": [[0, "out"], [3, 0], [1, 0], [2, 0], ["pair", 1, 2, 3, 7], ["pair", 1, "rest", 3, 7], ["pair", "rest", "rest", 2, 7]]}
+    text = components.render(answer)
+    assert "PATTERN L3@7: " in text and " ~ rest" in text and "PATTERN L2@7: rest ~ rest" in text
+    p = components.parse(text)
+    named = lambda a, i: "rest" if i == "rest" else tuple(a["nodes"][i])  # noqa: E731
+    pairs = lambda a: sorted(str((named(a, e[1]), named(a, e[2]), e[3], e[4])) for e in a["edges"] if e[0] == "pair")  # noqa: E731
+    assert pairs(p["answer"]) == pairs(answer) and p["malformed"] == 0
+    assert components.render(p["answer"]) == text
+    written = components.parse("CIRCUIT:\n@7 a=L3.o#1 b=L3.q#283\n@4 c=L3.k#145\nOUT <- a\na <- b\nPATTERN L3.q#283@7 ~ L3.k#145@4\nPATTERN rest ~ c\nPATTERN L3@7: b ~ zz\n")
+    assert [e for e in written["answer"]["edges"] if e[0] == "pair"] == [["pair", 1, 2, 3, 7]] and written["malformed"] == 2

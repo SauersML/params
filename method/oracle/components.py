@@ -35,7 +35,8 @@ output (down), the token embedding into a reader at its position; "OUT" is the p
 goal_eval's circuit JSON, and goal_eval.circuit checks every edge against the model (mech.connects); an id never
 declared is a node outside the graph, dropped and charged. parse() also reads nodes written out in edge lines
 (L2.o#77@332 <- L2.v#902,1514@322, a group stating an edge from every writer to every reader) and blocks without ids;
-render() writes ids only. An edit request ("how would you make the model ...") is answered by an EDIT line of
+render() writes ids only. A line "PATTERN L3@332: g ~ c" states a query-key pair of layer 3's attention read at 332
+(goal_eval's pair edge ["pair", query, key, layer, position]; rest for the part outside the circuit). An edit request ("how would you make the model ...") is answered by an EDIT line of
 operations: cut <reader> <- <writer> (that connection removed on this text), scale <node> <k> (its activation times k),
 either prefixed by persistent for a weight edit on every text (nodes then without a position). Token strings are shown as Python reprs of the target's tokens (special tokens included)
 and escaped (escape()): no question or answer holds a literal special or added token of the explainer's tokenizer.
@@ -109,6 +110,7 @@ FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s
 SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+|EDIT\s+\d+)\s*:", re.M | re.I)
 EDIT_RE = re.compile(r"^\s*EDIT\s+(\d+)\s*:(.*)$", re.M | re.I)
 OP_RE = re.compile(r"\s*(persistent\s+)?(?:cut\s+(\S+)\s*<-\s*(\S+)|scale\s+(\S+)\s+(-?\d+(?:\.\d+)?))\s*", re.I)
+PATTERN_RE = re.compile(r"PATTERN\s+(?:L(\d+)@(\d+)\s*:\s*)?(\S+)\s*~\s*(\S+)", re.I)  # a stated query-key pair
 VAR_LINE = re.compile(r"\s*V\d+\b")  # a line of the EXPLANATION's VARIABLES block (VAR_RE when it parses)
 VAR_RE = re.compile(r'\s*V(\d+)\s+"(.*?)"\s*:\s*(.*);\s*inputs\s*:\s*(.*?)\s*;\s*carried\s+by\s*:\s*(.*?)\s*;\s*feeds\s*:\s*(.*?)\s*', re.I)
 QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")  # a token's repr in an inputs list
@@ -195,7 +197,8 @@ def parse(text: str) -> dict:
     does not parse, and every undefined id, each charged as a node outside the graph), "unknown_ids", "finals" (question number -> (falls, the top token as written)) and
     "edits" (edit question number -> operations: {"op": "cut", "writer", "reader" ("out": the prediction)} or {"op":
     "scale", "node", "k"}, each with "persistent" (a weight edit everywhere: nodes without a position, None), or
-    {"op": "invalid"} for one that names no node). A circuit line's reader may be
+    {"op": "invalid"} for one that names no node). A PATTERN line adds goal_eval's pair edge ["pair", query, key, layer,
+    position] (ids, nodes written out, or rest; without "L<layer>@<position>:" the query's layer and position). A circuit line's reader may be
     a group, and so may each writer: the line states an edge from every writer to every reader. Markdown decoration
     (bold markers, heading marks at a line's start) is ignored: no valid line holds it."""
     text = MARKDOWN.sub("", text)
@@ -227,9 +230,20 @@ def parse(text: str) -> dict:
         if bad:
             malformed += 1
             junk += bad
-    unknown = 0
+    unknown, pairs = 0, []
     for line in lines:
         if BLOCK_RE.fullmatch(line):
+            continue
+        if line.upper().startswith("PATTERN"):  # PATTERN L3@288: c ~ f, a read's query-key pair (goal_eval's pair edge)
+            m = PATTERN_RE.fullmatch(line)
+            sides = [None if not m else "rest" if x.lower() == "rest" else ids.get(x) or node_of(x) for x in (m[3], m[4])] if m else [None, None]
+            q = sides[0]
+            at_read = (int(m[1]), int(m[2])) if m and m[1] else ((int(q[0].split(".")[1]), q[1]) if q not in (None, "rest") and q[0] != TOK else None)
+            if None in sides or at_read is None:
+                malformed += 1
+                junk += 1
+                continue
+            pairs.append(["pair"] + ["rest" if x == "rest" else index(x) for x in sides] + list(at_read))
             continue
         if line.startswith("@"):
             malformed += 1
@@ -296,7 +310,7 @@ def parse(text: str) -> dict:
         finals.setdefault(int(m[1]), (m[2].lower() == "yes", m[3].strip()))
     explanation = sec.get("EXPLANATION", "")
     variables, prose, bad_vars = _variables(explanation, ids)
-    answer = {"nodes": nodes, "edges": edges, "explanation": prose if variables or bad_vars else explanation}
+    answer = {"nodes": nodes, "edges": edges + pairs, "explanation": prose if variables or bad_vars else explanation}
     if variables:
         answer["variables"] = variables
     return {"explanation": explanation, "answer": answer, "malformed": malformed, "malformed_nodes": junk + unknown,
@@ -346,20 +360,27 @@ def _place(nd) -> tuple:
 def render(answer: dict, finals: dict | None = None, reasons: dict | None = None, edits: dict | None = None,
            strings: list[str] | None = None) -> str:
     """The text of a circuit in goal_eval's JSON (to_json's): every node named once by a short id in its position's
-    block and the edges by id (_id_lines), one output grammar for every answer; then its explanation (none when it
+    block, the edges by id (_id_lines) and the stated query-key pairs (goal_eval's ["pair", query, key, layer, position]
+    edges) as PATTERN L<layer>@<position>: <query> ~ <key>, by id or rest, one output grammar for every answer; then its explanation (none when it
     has none: its VARIABLES block first when it has "variables", variable_text(), each input with its token when
     strings, the text's token strings, are given), the questions' answers (finals: question number -> (falls, the top
     token as written)) and the edits."""
     import goal_eval
 
     nodes = [(TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
-    parents, out = {}, []
-    for w, r in answer["edges"]:
+    parents, out, pairs = {}, [], []
+    for e in answer["edges"]:
+        if e[0] == "pair":
+            pairs.append(e)
+            continue
+        w, r = e
         if r == "out":
             out.append(nodes[w])
         else:
             parents.setdefault(nodes[r], set()).add(nodes[w])
     lines, name = _id_lines(set(nodes), parents, out)
+    side = lambda i: "rest" if i == "rest" else name[nodes[i]]  # noqa: E731
+    lines += [f"PATTERN L{layer}@{t}: {side(q)} ~ {side(k)}" for _, q, k, layer, t in sorted(pairs, key=lambda e: (-e[4], -e[3], str(e[1]), str(e[2])))]
     text = ["CIRCUIT:"] + lines
     if answer.get("variables"):
         k = {v["name"]: f"V{i}" for i, v in enumerate(answer["variables"], 1)}
@@ -717,7 +738,10 @@ ASK = ("How does {model} compute its prediction of the next token after the targ
        "h=tok, then write one line per reader, <reader> <- <writer>,<writer>, by id: an attention or MLP output (o, down) "
        "into a later query, key, value or MLP input (q, k, v, fc) at its position; a value (v) into its layer's attention "
        "output (o) at that or a later position; an MLP input (fc) into its MLP's output (down); the token embedding into a "
-       "reader at its position. OUT <- <writer>,<writer> is the prediction. The circuit should be what makes the "
+       "reader at its position. OUT <- <writer>,<writer> is the prediction. A line PATTERN L<layer>@<position>: <q> ~ <k> "
+       "states a query-key pair of that layer's attention read at that position: its pattern computed from query q "
+       "against key k (rest: the query's or key's part outside the circuit; rest ~ rest: the read with no pair of its "
+       "own). The circuit should be what makes the "
        "prediction: with only its subcomponents on, reading along its edges, and every other one off, the model should "
        "still predict what it does, and with them taken out of VPD's active subcomponents it should not; fewer "
        "subcomponents and edges are better. Answer with CIRCUIT: and its lines first, then a line EXPLANATION: (in "

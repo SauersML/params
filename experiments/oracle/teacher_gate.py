@@ -94,7 +94,7 @@ def compare(A: dict, B: dict, a: str, b: str, fields, verdicts: dict | None = No
 def v2_rule(fid_rows: list, arms: list, goal_eval) -> None:
     """The lead's v2 rule (10-12) on fidelity rows of held-out texts on the eval split, each text's influential start
     scored beside the arms (kind "start", goal_eval.py fidelity --start): an arm is eligible when phi >= phi_tau
-    (goal_eval.phi with the text's start) and its target KL (the point run's KL_C) is within 2x the start's on at least
+    (phi_tau the text's, from its start row alone, the same for every arm) and its target KL (the point run's KL_C) is within 2x the start's on at least
     80% of texts; among the eligible, the highest median compact (goal_eval.compact, size_bits against the start's),
     ties to the higher median phi. VPD's top k at each arm's size and the recency baseline (kind "recency": VPD's actives
     at the target and the start's number of other positions just before it) are reported beside, not in the rule."""
@@ -112,7 +112,8 @@ def v2_rule(fid_rows: list, arms: list, goal_eval) -> None:
             a, st = k.get(arm), k.get("start")
             if a is None or st is None:
                 continue
-            ph, tau = goal_eval.phi(a, start=st)
+            ph = goal_eval.phi(a)[0]
+            tau = goal_eval.phi(st, start=st)[1]  # the text's bar from the start row alone: min(phi_start, every family at 0.9 with the start's eps)
             ka, ks = kl(a), kl(st)
             vpd = k.get(f"VPD top {a.get('nodes')}")
             rows.append({"task": t, "phi": ph, "tau": tau, "kl": ka, "kl_start": ks,

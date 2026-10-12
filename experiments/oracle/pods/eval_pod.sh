@@ -2,8 +2,8 @@
 # components.py evaluate on a rented GPU (#2951 graph oracle): the reward's C runs its intervention families, slow and
 # large on the Mac (60-80 s and more than 16 GiB of footprint per text there). The rows, the answer sets with their
 # readers' files, the locality labels, C's pattern pool and texts/vpd4l go up as one tar file, origin/main's
-# method/oracle and method/vpd as another; VPD's files (its checkpoint with the causal-importance network) are
-# published inputs. The report comes back as ~/mpd-data/runpod/oracle-graph-eval-$RUN/eval.json (and eval.log); the
+# method/oracle and method/vpd as another; VPD's files are published inputs, its checkpoint with the causal-importance
+# network in two pieces put back together on the pod (as teacher_pod.sh does), so C has VPD's answer. The report comes back as ~/mpd-data/runpod/oracle-graph-eval-$RUN/eval.json (and eval.log); the
 # pod ends when evaluate does.
 #   bash experiments/oracle/pods/eval_pod.sh RUN ROWS.jsonl LABELS.jsonl NAME=SAMPLES[:E1.jsonl] ...
 #     SAMPLES: a sampler's JSONL or a directory of <task>[.<k>].txt (components.samples_of); E1: tinker_train.py readers
@@ -31,6 +31,7 @@ done
 COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" rows.jsonl labels.jsonl sets -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt && rm -rf "$IN"
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
+python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \
 cd $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 5 > $O/gpu.csv & \
 python -u method/oracle/components.py evaluate heldout $I/rows.jsonl $ARGS --labels $I/labels.jsonl --n 100000 --out $O/eval.json > $O/eval.log 2>&1"
 RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-200} RP_OWNER=${RP_OWNER:-fleet} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.7} \

@@ -79,6 +79,7 @@ class Pruner:
     of node ids; kl(blocks) measures the current circuit without each block, in batches of B."""
 
     fused = True  # the masked runs' norms and GELU as torch's fused kernels (Target.hidden(fused=)): float32-close
+    WINDOWS = ("mps", "cuda")  # devices whose masked runs take kl_sets' windows: MPS to the bit, CUDA float32-close
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, start: dict, live: bool = False, B: int = 32):
         self.ge, self.tx, self.live, self.B = ge, tx, live, B
@@ -148,17 +149,19 @@ class Pruner:
     def kl_sets(self, ons: torch.Tensor, pad: bool = False) -> list[float]:
         """KL at the target of each node subset's run, ons [K, N] (float masks built on the device, in batches of B; a
         last batch of one row runs alone, at batch 1, unless pad).
-        With at least two full batches on a Native.WINDOW_EXACT device, the rows are taken in order of the first layer,
-        then the first position, where each differs from the call's majority set, and a batch runs from its first such
-        layer and position (at least 64 positions) on, the layers below and the positions before reading the majority
-        set's run (its queries, keys, values and residual stream, computed once per set at batch B; Target.hidden's
-        window): the same numbers as the whole run there."""
+        With at least two full batches on a device in WINDOWS, the rows are taken in order of the first layer, then the
+        first position, where each differs from the call's majority set, and a batch runs from its first such layer
+        and position (at least 64 positions) on, the layers below and the positions before reading the majority set's
+        run (its queries, keys, values and residual stream, computed once per set at batch B; Target.hidden's window).
+        The batches depend only on the call's sets (a stable order, a fixed size), so a run reproduces itself. On MPS
+        the numbers are the whole run's to the bit; on CUDA the kernels' shapes change their float32 rounding
+        (test_teacher.py bounds it)."""
         nat, tg, T = self.ge.nat, self.ge.nat.target, self.tx.T
         if not hasattr(self, "sel"):
             self._gather()
             self.layer = torch.tensor([int(n.split(".")[1]) for n in self.names], device=nat.dev, dtype=torch.int32)[self.mat]
         K = len(ons)
-        window = K >= 2 * self.B and T > 64 and str(nat.dev).split(":")[0] in getattr(nat, "WINDOW_EXACT", ())
+        window = K >= 2 * self.B and T > 64 and str(nat.dev).split(":")[0] in self.WINDOWS
         order, first, lowest = torch.arange(K, device=nat.dev), None, None
         if window:
             base = ons.sum(0) * 2 > K

@@ -931,6 +931,70 @@ def test_families_on_the_engine_are_graph_ref(tiny):
         assert abs(k - want) < 1e-6 + 1e-4 * abs(want)
 
 
+def test_family_reads_are_graph_ref(tiny):
+    """C's second observable on the engine: the node, connection-cut and interchange families' read errors equal
+    graph_ref's records draw by draw (a stated and a complete circuit)."""
+    nat, ge, tx = tiny
+    T = tx.T
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    stated = native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets))
+    stated = native.Graph(stated.nodes, {r: ws[::2] for r, ws in stated.parents.items()}, stated.out)
+    graphs = [stated, native.Graph(nodes[1::4], complete=True)]
+    model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+    draws = 3
+
+    def ref_reads(g, runs):  # runs: per draw (model graph, circuit graph, kwargs, the nodes read)
+        pairs = {}
+        for gm, gc, kw, keep in runs:
+            rm, rc = {}, {}
+            ge.graph_ref(tx.ids, tx.targets, gm, record=rm, reads=keep, **kw)
+            ge.graph_ref(tx.ids, tx.targets, gc, record=rc, reads=keep, **kw)
+            for nd in keep:
+                pairs.setdefault(nd, []).append((float(rm[nd][0]), float(rc[nd][0])))
+        return goal_eval._read_error(pairs)
+
+    for g, row in zip(graphs, ge._node_family(tx, graphs, draws, reads=True)):
+        gn = sorted(g.node_set())
+        rng = ge._rng(tx, g, "nodes")
+        runs = []
+        for j in range(draws):
+            d = [nd for nd in gn if rng.random() < (j + 0.5) / draws] or [gn[int(rng.integers(len(gn)))]]
+            ones = {n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+            gm = ge.masks(g, T) if g.complete else None
+            for n, t, c in d:
+                ones[n][t, c] = False
+                if gm is not None:
+                    gm[n][t, c] = False
+            gc = native.Graph(masks=gm) if g.complete else goal_eval._drop_nodes(g, set(d))
+            runs.append((native.Graph(masks=ones), gc, {}, [nd for nd in gn if nd not in set(d)]))
+        want = ref_reads(g, runs)
+        assert abs(row["reads_nodes"] - want) < 1e-5 + 1e-4 * abs(want), ("nodes", row["reads_nodes"], want)
+    for g, row in zip(graphs, ge._edge_family(tx, graphs, draws, reads=True)):
+        gn = sorted(g.node_set())
+        par, outs = (native.all_edges(g.node_set(), tx.targets) if g.complete else (g.parents, g.out))
+        readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
+        rng = ge._rng(tx, g, "edges")
+        runs = []
+        for j in range(draws):
+            r = readers[int(rng.integers(len(readers)))]
+            ws = list(par[r]) if r is not None else list(outs)
+            cut = [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]
+            runs.append((model, g, {"cuts": {r: cut}}, gn))
+        want = ref_reads(g, runs)
+        assert abs(row["reads_edges"] - want) < 1e-5 + 1e-4 * abs(want), ("edges", row["reads_edges"], want)
+    vals = [{nd: torch.tensor(0.5 + 0.1 * j, device=nat.dev) for nd in stated.node_set() if nd[1] == p}
+            for j, p in enumerate(sorted({t for _, t, _ in stated.node_set()})[:3])]
+    lm, lv, lc, rm, rc = ge._sides(tx, graphs)(stated, patch=vals, reads=True)
+    for b, v in enumerate(vals):
+        keep = [nd for nd in sorted(stated.node_set()) if nd not in v]
+        wm, wc = {}, {}
+        ge.graph_ref(tx.ids, tx.targets, model, patch=v, record=wm, reads=keep)
+        ge.graph_ref(tx.ids, tx.targets, stated, patch=v, record=wc, reads=keep)
+        for nd in keep:
+            assert abs(float(rm[nd][b]) - float(wm[nd][0])) < 1e-5 + 1e-4 * abs(float(wm[nd][0]))
+            assert abs(float(rc[nd][b]) - float(wc[nd][0])) < 1e-5 + 1e-4 * abs(float(wc[nd][0]))
+
+
 def test_interchange_family(tiny):
     """Interchange: VPD's answer as the circuit agrees with VPD's own run draw by draw; a stated circuit with every
     connection and some activations fixed (graph_ref) is the independent forward with them fixed."""

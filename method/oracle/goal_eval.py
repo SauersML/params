@@ -967,30 +967,40 @@ class GoalEval:
                         m[n][b, t, where[n][c]] = 0.0
                 return m
 
-            lm = Em.log_probs(without({n: torch.ones(T, len(circ[n]), device=dev) for n in nat.names}, drops, at))
+            def spec(where):  # every draw's reads of the circuit's nodes over an engine's columns
+                out_ = {}
+                for n, t, c in nodes:
+                    x = out_.setdefault(n, ([], []))
+                    x[0].append(t)
+                    x[1].append(where[n][c])
+                return None if not reads else {n: (torch.arange(len(drops), device=dev).repeat_interleave(len(t)),
+                                                   torch.tensor(t, device=dev).repeat(len(drops)), torch.tensor(c, device=dev).repeat(len(drops)))
+                                               for n, (t, c) in out_.items()}
+
+            def split(got):  # {site: [draws * k]} -> {node: [draws]}, the nodes in spec's order
+                by = {}
+                for nd in nodes:
+                    by.setdefault(nd[0], []).append(nd)
+                return {nd: got[n].view(len(drops), len(nds))[:, j].tolist() for n, nds in by.items() for j, nd in enumerate(nds)}
+
+            def run(f, *a, **k):  # (log q, reads or None)
+                got = f(*a, **k)
+                return (got[0], split(got[1])) if reads else (got, None)
+
+            lm, rm = run(Em.log_probs, without({n: torch.ones(T, len(circ[n]), device=dev) for n in nat.names}, drops, at), reads=spec(at))
             lv = Ev.log_probs(without(vpd, drops, vat))
             if g.complete:
                 gm = {n: torch.zeros(T, len(circ[n]), device=dev) for n in nat.names}
                 for n, t, c in nodes:
                     gm[n][t, at[n][c]] = 1.0
-                lc = Ec.log_probs(without(gm, drops, at))
-            else:
-                lc = self._graph_logq(tx.ids, tx.targets, [_drop_nodes(g, set(d)) for d in drops])  # C's semantics (graph_ref)
-            pairs = {}  # the reads of the nodes each draw keeps, in the model and the circuit (graph_ref)
-            for d in (drops if reads else []):
-                keep = [nd for nd in nodes if nd not in set(d)]
-                ones = {n: torch.ones(T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
-                for n, t, c in d:
-                    ones[n][t, c] = False
-                gc = _drop_nodes(g, set(d)) if not g.complete else native.Graph(masks={n: m.clone() for n, m in self.masks(g, T).items()})
-                if g.complete:
-                    for n, t, c in d:
-                        gc.masks[n][t, c] = False
-                rm, rc = {}, {}
-                self.graph_ref(tx.ids, tx.targets, native.Graph(masks=ones), record=rm, reads=keep)
-                self.graph_ref(tx.ids, tx.targets, gc, record=rc, reads=keep)
-                for nd in keep:
-                    pairs.setdefault(nd, []).append((float(rm[nd][0]), float(rc[nd][0])))
+                lc, rc = run(Ec.log_probs, without(gm, drops, at), reads=spec(at))
+            else:  # C's semantics, each draw's graph without its nodes
+                lc, rc = run(Ec.graph_log_probs, Ec.plan([_drop_nodes(g, set(d)) for d in drops], semantics="c"), reads=spec(at))
+            pairs = {}  # the reads of the nodes each draw keeps, in the model and the circuit
+            for b, d in enumerate(drops if reads else []):
+                for nd in nodes:
+                    if nd not in set(d):
+                        pairs.setdefault(nd, []).append((rm[nd][b], rc[nd][b]))
             out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean()),
                         "reads_nodes": _read_error(pairs) if reads else None})
             native.free(dev)
@@ -1003,8 +1013,6 @@ class GoalEval:
         semantics (the reader reads its input without those writers' outputs); the mean KLs from the model's. A
         circuit without connections: None. Every draw of a side runs in one batch on the engine (_sides)."""
         sides = self._sides(tx, graphs)
-        model_graph = native.Graph(masks={n: torch.ones(tx.T, self.nat.C[n], dtype=torch.bool, device=self.nat.dev)
-                                          for n in self.nat.names})
         out = []
         for g in graphs:
             nodes = g.node_set()
@@ -1019,17 +1027,12 @@ class GoalEval:
                 r = readers[int(rng.integers(len(readers)))]
                 ws = list(par[r]) if r is not None else list(outs)
                 cuts.append({r: [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]})
-            lm, lv, lc = sides(g, cuts=cuts)
+            got = sides(g, cuts=cuts, reads=reads)
+            lm, lv, lc = got[:3]
             row = {"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean()), "reads_edges": None}
-            if reads:  # the circuit nodes' reads under each draw, model and circuit (graph_ref)
-                nl, pairs = sorted(nodes), {}
-                for cut in cuts:
-                    rm, rc = {}, {}
-                    self.graph_ref(tx.ids, tx.targets, model_graph, cuts=cut, record=rm, reads=nl)
-                    self.graph_ref(tx.ids, tx.targets, g, cuts=cut, record=rc, reads=nl)
-                    for nd in nl:
-                        pairs.setdefault(nd, []).append((float(rm[nd][0]), float(rc[nd][0])))
-                row["reads_edges"] = _read_error(pairs)
+            if reads:  # the circuit nodes' reads under each draw, model and circuit
+                rm, rc = got[3], got[4]
+                row["reads_edges"] = _read_error({nd: list(zip(rm[nd].tolist(), rc[nd].tolist())) for nd in rm})
             out.append(row)
             native.free(self.nat.dev)
         return out
@@ -1068,18 +1071,45 @@ class GoalEval:
                     out[n][1][b, t, k] = v
             return out
 
-        def sides(g, cuts=None, patch=None):
+        def spec(E, nodes, D):  # every row's reads of nodes: {site: (rows, positions, columns)}
+            out = {}
+            for n, t, c in nodes:
+                x = out.setdefault(n, ([], [], []))
+                x[1].append(t)
+                x[2].append(at[id(E)][n][c])
+            return {n: (torch.arange(D, device=dev).repeat_interleave(len(t)), torch.tensor(t, device=dev).repeat(D),
+                        torch.tensor(c, device=dev).repeat(D)) for n, (_, t, c) in out.items()}
+
+        def split(got, nodes, D):  # {site: [D * k]} -> {node: [D]}
+            out, k = {}, {}
+            for n, t, c in nodes:
+                k.setdefault(n, []).append((n, t, c))
+            for n, nds in k.items():
+                v = got[n].view(D, len(nds))
+                for j, nd in enumerate(nds):
+                    out[nd] = v[:, j]
+            return out
+
+        def sides(g, cuts=None, patch=None, reads=False):
+            """log q of the model, VPD's answer and g under each draw; reads: also g's nodes' activations in the model's
+            run and g's, {node: [D]} each."""
             D = len(cuts if cuts is not None else patch)
-            lm = Em.graph_log_probs(Em.plan([model] * D, semantics="c", cuts=cuts), u_m, patch=patches(Em, patch))
+            nodes = sorted(g.node_set()) if reads else None
+            lm = Em.graph_log_probs(Em.plan([model] * D, semantics="c", cuts=cuts), u_m, patch=patches(Em, patch),
+                                    reads=spec(Em, nodes, D) if reads else None)
             lv = Ev.graph_log_probs(Ev.plan([vpd] * D, semantics="c", cuts=cuts), u_v, patch=patches(Ev, patch))
             u_c = None
             if g.complete:
                 u_c = {n: torch.zeros(1, T, Ec.width(n), device=dev) for n in nat.names}
                 for n, t, c in g.node_set():
                     u_c[n][0, t, at[id(Ec)][n][c]] = 1.0
-            lc = Ec.graph_log_probs(Ec.plan([g] * D, semantics="c", cuts=cuts), u_c, patch=patches(Ec, patch))
-            return lm, lv, lc
+            lc = Ec.graph_log_probs(Ec.plan([g] * D, semantics="c", cuts=cuts), u_c, patch=patches(Ec, patch),
+                                    reads=spec(Ec, nodes, D) if reads else None)
+            if not reads:
+                return lm, lv, lc
+            return lm[0], lv, lc[0], split(lm[1], nodes, D), split(lc[1], nodes, D)
 
+        sides.spec, sides.split, sides.engines, sides.at = spec, split, (Em, Ev, Ec), at
         return sides
 
     @torch.no_grad()
@@ -1104,7 +1134,6 @@ class GoalEval:
             return source[(p, z)]
 
         sides = self._sides(tx, graphs)
-        model_graph = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names})
         out = []
         for g in graphs:
             nodes = sorted(g.node_set())
@@ -1120,19 +1149,17 @@ class GoalEval:
                 z = alts[int(rng.integers(len(alts)))][p]
                 rec = source_record(p, z)
                 patch.append({nd: rec[nd[0]][0, nd[1], nd[2]] for nd in nodes if nd[1] == p})
-            lm, lv, lc = sides(g, patch=patch)
+            got = sides(g, patch=patch, reads=reads)
+            lm, lv, lc = got[:3]
             native.free(dev)
             row = {"kl_interchange_c": float(carry.kl(lm, lc).mean()), "kl_interchange_vpd": float(carry.kl(lm, lv).mean()),
                    "reads_interchange": None}
-            if reads:  # the reads of the circuit's nodes at other positions, model and circuit (graph_ref)
-                pairs = {}
-                for vals in patch:
-                    rest = [nd for nd in nodes if nd not in vals]
-                    rm, rc = {}, {}
-                    self.graph_ref(tx.ids, tx.targets, model_graph, patch=vals, record=rm, reads=rest)
-                    self.graph_ref(tx.ids, tx.targets, g, patch=vals, record=rc, reads=rest)
-                    for nd in rest:
-                        pairs.setdefault(nd, []).append((float(rm[nd][0]), float(rc[nd][0])))
+            if reads:  # the reads of the circuit's nodes at other positions than the fixed ones, model and circuit
+                rm, rc, pairs = {nd: v.tolist() for nd, v in got[3].items()}, {nd: v.tolist() for nd, v in got[4].items()}, {}
+                for b, vals in enumerate(patch):
+                    for nd in nodes:
+                        if nd not in vals:
+                            pairs.setdefault(nd, []).append((rm[nd][b], rc[nd][b]))
                 row["reads_interchange"] = _read_error(pairs)
             out.append(row)
         return out

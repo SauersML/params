@@ -56,6 +56,14 @@ def rows(spec: str) -> tuple[int, int]:
     return int(a), int(b)
 
 
+def tokens_of(r0: int, r1: int, path: str | None) -> torch.Tensor:
+    """Validation rows [r0, r1), T tokens each: from `path` (an array of rows 0.. of vpd_model.val_tokens, for a
+    pod without the parquet) or from vpd_model.val_tokens."""
+    if path:
+        return torch.from_numpy(np.load(path, mmap_mode="r")[r0:r1, :T].astype(np.int64))
+    return VM.val_tokens(r1 - r0, T, r0)
+
+
 @torch.no_grad()
 def active(vpd: VM.VPD, names: list[str], ids: torch.Tensor) -> torch.Tensor:
     """CI > 0 of every subcomponent at positions 1.. [B, T - 1, total] (one clean pass, the CI network)."""
@@ -86,7 +94,7 @@ def activity(args):
         if (out / f"activity_{split}_L3.npz").exists():
             continue
         chunks.mkdir(exist_ok=True)
-        tokens = VM.val_tokens(r1 - r0, T, r0)
+        tokens = tokens_of(r0, r1, args.tokens)
         G = [torch.zeros(per_layer, per_layer, device=dev) for _ in range(4)] if gram else None
         comp, pos = [[] for _ in range(4)], [[] for _ in range(4)]
         t0, part = time.time(), 0
@@ -440,11 +448,20 @@ def main():
     a.add_argument("--heldout", default="5000:6000")
     a.add_argument("--batch", type=int, default=8)
     a.add_argument("--device", default="mps")
+    a.add_argument("--tokens", help="rows 0.. of the validation split as an .npy (vpd_model.val_tokens otherwise)")
+    t = sub.add_parser("tokens")
+    t.add_argument("out")
+    t.add_argument("--rows", default="0:6000")
     b = sub.add_parser("build")
     b.add_argument("--out", default=str(DEFAULT))
     f = sub.add_parser("finish")
     f.add_argument("--out", default=str(DEFAULT))
     args = ap.parse_args()
+    if args.cmd == "tokens":
+        r0, r1 = rows(args.rows)
+        assert r0 == 0, "a token file holds rows 0.."
+        np.save(args.out, VM.val_tokens(r1, T, 0).numpy().astype(np.uint16))
+        return
     {"activity": activity, "build": build, "finish": lambda a: finish(Path(a.out))}[args.cmd](args)
 
 

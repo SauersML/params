@@ -507,7 +507,8 @@ def lookahead(args):
     target = VM.load_target(dev)
     vpd = VM.load_vpd(target, dev)
     names = VM.site_names()
-    tokens = VM.val_tokens(a1 - a0, 512, a0)
+    from method.vpd.parts import tokens_of
+    tokens = tokens_of(a0, a1, args.tokens)
     measured = torch.zeros(total, dtype=torch.int64)
     turned_off = torch.zeros(total, dtype=torch.int64)
     cut_off = torch.zeros(total, dtype=torch.int64)
@@ -653,6 +654,7 @@ def main():
     k.add_argument("--batch", type=int, default=8)
     k.add_argument("--device", default="mps")
     k.add_argument("--dry", action="store_true", help="only count the cuts")
+    k.add_argument("--tokens", help="rows 0.. of the validation split as an .npy (parts.py tokens)")
     args = ap.parse_args()
     {"build": build, "show": show, "lookahead": lookahead}[args.cmd](args)
 

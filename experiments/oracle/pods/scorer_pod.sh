@@ -5,7 +5,7 @@
 # texts/vpd4l go up as one tar file, origin/main's method/oracle and method/vpd as another; VPD's files (its checkpoint
 # with the causal-importance network, and its subcomponents) are published inputs. The scorer runs until the cap.
 #   experiments/oracle/pods/scorer_pod.sh ROWS.jsonl HOURS   (env: RUN, GPU, PRICE, WORKERS, RP_OWNER)
-#   experiments/oracle/pods/scorer_tunnel.sh $RUN   the tunnel (then --scorer http://127.0.0.1:8767/score)
+#   bash experiments/oracle/pods/scorer_tunnel.sh $RUN   the tunnel (then --scorer http://127.0.0.1:8767/score)
 cd /Users/user/params
 ROWS=$1 H=${2:-6}
 RUN=${RUN:-a}

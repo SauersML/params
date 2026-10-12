@@ -6,8 +6,8 @@ CUDA, and the products on the start set's subcomponents alone (Pruner._gather) w
 EdgePruner's runs are the scorecard's (goal_eval.GoalEval.graph_kl: with every connection the masked run), and a
 teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, one
 over the answer budget steps to a smaller path point, the flip repair writes its best-scoring step, and Descent.prune's
-accept check admits exactly the largest passing prefix (a constructed case), and with --no-strand no listed node but a
-query or key is without a stated connection.
+accept check admits exactly the largest passing prefix (a constructed case), with --no-strand no listed node but a
+query or key is without a stated connection, and --edge-levels' default keeps the connections it kept before.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -197,3 +197,24 @@ def test_no_strand_leaves_no_node_unconnected():
     stated = {i for e in c["edges"] for i in e if i != "out"}
     # every listed node but the token embeddings, queries and keys has a stated connection
     assert all(i in stated for i, (m, _, _) in enumerate(c["nodes"]) if m != "tok" and not m.endswith(("q_proj", "k_proj")))
+
+
+@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
+def test_edge_levels():
+    """--edge-levels: the default ("connection") keeps exactly the connections of edge_path's single-connection rounds
+    run directly (Connector.connect before the flag); writer blocks first end no farther from the model than the
+    start or the F1 budget, and measure fewer subsets."""
+    nat, pr = pruner(teacher.CONVENTION == "live")
+    ge, tx = pr.ge, pr.tx
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
+    on[(pr.t == max(tx.targets)).nonzero().flatten()[:40]] = True
+    plain = teacher.Connector(ge, tx, pr, empty, vpd, lambda on, inner=0, out=0: 0.0, 32)
+    kept, summary, steps, ep = plain.connect(on, 0.0)[:4]
+    direct = teacher.EdgePruner(ge, tx, [pr.nodes[j] for j in on.nonzero().flatten().tolist()], teacher.CONVENTION == "live", 32)
+    teacher.edge_path(direct, plain.budget, lambda kl, e_on, removed: {"kl": kl})
+    assert kept == [e for e, k in zip(direct.edges, direct.on.tolist()) if k]
+    coarse = teacher.Connector(ge, tx, pr, empty, vpd, lambda on, inner=0, out=0: 0.0, 32, levels=("writer", "connection"))
+    _, s2, steps2, ep2 = coarse.connect(on, 0.0)[:4]
+    assert s2["kl_graph"] <= max(plain.budget, steps2[0]["kl_graph"]) * (1 + REL)
+    assert ep2.measured < ep.measured

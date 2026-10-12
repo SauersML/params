@@ -207,7 +207,7 @@ def removals(meas: Measure, on: torch.Tensor, row: dict, goal: float = teacher.R
 def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answer: dict, pool: dict, B: int = 32,
            edges: bool = False, repair: bool = False, max_nodes: int | None = teacher.MAX_NODES, tokens=None,
            max_tokens: int = components.ANSWER_BUDGET, seeds=(0,), robust_edges: bool = False,
-           no_strand: bool = False) -> tuple[dict, dict, dict]:
+           no_strand: bool = False, edge_levels: tuple = ("connection",)) -> tuple[dict, dict, dict]:
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets)
@@ -227,7 +227,8 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
         return goal_eval.size_term(bits, scale)
 
     meas = Measure(ge, tx, pr, empty, vpd, pool)
-    wiring = teacher.Connector(ge, tx, pr, empty, vpd, size_term, B, robust=pool if robust_edges else None, no_strand=no_strand)
+    wiring = teacher.Connector(ge, tx, pr, empty, vpd, size_term, B, robust=pool if robust_edges else None, no_strand=no_strand,
+                               levels=edge_levels)
 
     def lam_path(seed):                                          # one seed's stages
         ms = MaskSearch(ge, tx, pr, live=teacher.CONVENTION == "live")
@@ -367,6 +368,9 @@ def main():
     ap.add_argument("--no-strand", action="store_true", help="with --edges, every non-query/key node keeps a stated connection (teacher.py's)")
     ap.add_argument("--edge-objective", choices=("graph", "robust"), default="graph",
                     help="with --edges, connection removals keep graph F1 (graph), and F1 under the flips too (robust: teacher.py's)")
+    ap.add_argument("--edge-levels", type=teacher.edge_levels, default="connection",
+                    help="with --edges, the connection descent's levels in turn, comma-separated (teacher.py's): writer,connection takes "
+                         "whole fan-outs first")
     ap.add_argument("--max-nodes", type=int, default=teacher.MAX_NODES, help="the pick among stages of at most this many nodes")
     ap.add_argument("--max-tokens", type=int, default=components.ANSWER_BUDGET,
                     help="the answer at most this many tokens of --tokenizer: a smaller stage while it is longer (0: not checked)")
@@ -390,7 +394,7 @@ def main():
         ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
         circuits, row, path_file = search(ge, ids, targets, saved[task]["answer"], pool, args.batch, args.edges, args.repair,
                                           args.max_nodes, tokens, args.max_tokens, tuple(range(args.seeds)), args.edge_objective == "robust",
-                                          args.no_strand)
+                                          args.no_strand, args.edge_levels)
         for name, c in circuits.items():
             (args.out / f"{task}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{task}.path.json").write_text(json.dumps(path_file))

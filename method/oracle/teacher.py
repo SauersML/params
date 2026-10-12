@@ -495,8 +495,9 @@ class Connector:
     with the text's bounds, F1 budget and size term (size_term(on, inner, out))."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: Pruner, empty: float, vpd: float, size_term, B: int = 32,
-                 robust: dict | None = None, no_strand: bool = False):
+                 robust: dict | None = None, no_strand: bool = False, levels: tuple = ("connection",)):
         self.ge, self.tx, self.pr, self.empty, self.vpd, self.size_term, self.B = ge, tx, pr, empty, vpd, size_term, B
+        self.levels = levels      # edge_path's levels in turn (coarse ones first: "writer", "reader"; then "connection")
         self.robust = robust      # the adversary's pool: connection removals also keep F1 under the omitted lever's flips
         self.no_strand = no_strand  # every non-query/key node keeps a stated connection
         self.budget = empty ** (1 - RECOVERED) * vpd ** RECOVERED
@@ -543,7 +544,7 @@ class Connector:
             st = self.size_term(on, int(e_on[:ep.inner].sum()), int(e_on[ep.inner:].sum()))
             return {"nodes": size, "edges": int(e_on.sum()), "removed": removed, "kl_graph": kl, "f1_graph": f1,
                     "n": n, "size_term": st, "reward": (f1 + n) / TERMS - SIZE_WEIGHT * st}
-        steps = edge_path(ep, self.budget, state, accept=accept)
+        steps = edge_path(ep, self.budget, state, self.levels, accept=accept)
         steps[0].update(start)
         summary = {**{k_: steps[-1][k_] for k_ in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term", "reward")},
                    "all_edges": len(ep.edges), "sets": ep.measured, "unconnectable": len(dropped)}
@@ -619,11 +620,20 @@ def pick(rows: list[dict], f1: str, goal: float = RECOVERED, cap: int | None = N
     return max(within, key=lambda i: (min(rows[i][f1], rows[i]["n"]), -rows[i]["size"])), "max-min"
 
 
+def edge_levels(text: str) -> tuple:
+    """--edge-levels: edge_path's levels in turn, comma-separated: writer (every connection out of one writer), reader
+    (into one reader), connection (single connections)."""
+    out = tuple(text.split(","))
+    if any(x not in ("writer", "reader", "connection") for x in out):
+        raise argparse.ArgumentTypeError(f"--edge-levels takes writer, reader and connection, comma-separated: {text}")
+    return out
+
+
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
           vpd_order: list | None = None, start_top: int = 0, f1_start: str = "both", edges: bool = False,
           from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
           max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
-          robust_pool: dict | None = None, no_strand: bool = False) -> tuple[dict, dict]:
+          robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",)) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -738,7 +748,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     points = {min(range(len(path)), key=lambda j: abs(path[j]["size"] - want)) for want in SIZES}
     wired, edge_paths, t2 = {}, [], time.perf_counter()     # node step -> (its last edge step's connections, its row)
 
-    wiring = Connector(ge, tx, pr, empty, vpd, size_term, B, robust=robust_pool, no_strand=no_strand)
+    wiring = Connector(ge, tx, pr, empty, vpd, size_term, B, robust=robust_pool, no_strand=no_strand, levels=edge_levels)
 
     def wire(i):
         if i not in wired:
@@ -824,6 +834,9 @@ def main():
     ap.add_argument("--no-strand", action="store_true",
                     help="with --edges, every non-query/key node keeps a stated connection (its most important; one the model connects "
                          "to no other node is dropped): the stated graph is the claim, a listed node needs a stated role")
+    ap.add_argument("--edge-levels", type=edge_levels, default="connection",
+                    help="with --edges, the connection descent's levels in turn, comma-separated (edge_path): writer (every connection "
+                         "out of one writer), reader (into one reader), connection; writer,connection takes whole fan-outs first")
     ap.add_argument("--edge-objective", choices=("graph", "robust"), default="graph",
                     help="with --edges, connection removals keep graph F1 >= 0.9 (graph), and also F1 under REPAIR_M of the omitted "
                          "lever's flips >= min(0.9, every connection's) (robust: goal_eval.adversary_flips, pool POOL)")
@@ -887,7 +900,7 @@ def main():
         circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
                                          args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
-                                         args.no_strand)
+                                         args.no_strand, args.edge_levels)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

@@ -15,7 +15,7 @@ target only: the rest do not write the residual stream there; without the final 
 `measure` (a pod with VPD's checkpoint) writes per text the candidates, the features their run gives and the effects;
 features() adds the atlas's and the routed lens's facts (the Mac) to those the questions use.
 
-  learnability.py measure --texts 6000:6100 OUT.jsonl [--split train] [--device cuda] [--offset K --stride S]
+  learnability.py measure --texts 6000:6100 OUT.jsonl [--split train] [--device cuda] [--offset K --stride S] [--only FILE]
   learnability.py questions TRAIN_MEASURED.jsonl HELDOUT_MEASURED.jsonl OUT_DIR [--held 2000]
   learnability.py baselines OUT_DIR/features/train_32000.jsonl OUT_DIR/features/heldout.jsonl
 
@@ -514,6 +514,7 @@ def main():
     m.add_argument("--device", default="cpu")
     m.add_argument("--offset", type=int, default=0)
     m.add_argument("--stride", type=int, default=1)
+    m.add_argument("--only", help="a file of text numbers, one per line: those alone")
     qa = sub.add_parser("questions")
     qa.add_argument("train", help="measure's output on train texts")
     qa.add_argument("heldout", help="measure's output on held-out texts")
@@ -531,14 +532,21 @@ def main():
         return questions(read(args.train), read(args.heldout), Path(args.out_dir), held=args.held)
     ge = goal_eval.GoalEval(native.Native(args.device))
     lo, hi = map(int, args.texts.split(":"))
-    for k in range(lo + args.offset, hi, args.stride):
+    only = {int(x) for x in Path(args.only).read_text().split()} if args.only else None
+    todo = [k for k in range(lo, hi) if only is None or k in only]
+    for k in todo[args.offset::args.stride]:
         path = native.TEXTS / "vpd4l" / f"text{k}.json"
         if not path.exists():
             continue
         task = json.loads(path.read_text())
-        if args.split and task["split"] != args.split:
+        if (args.split and task["split"] != args.split) or max(task["prompts"][0]["target_positions"]) < 2:
             continue
-        r = measure(ge, task, log=lambda s: print(s, flush=True))
+        try:
+            r = measure(ge, task, log=lambda s: print(s, flush=True))
+        except torch.OutOfMemoryError as e:  # a batch too large beside the other processes: that text skipped, said
+            print(f"{task['id']}: skipped, {str(e).splitlines()[0]}", flush=True)
+            torch.cuda.empty_cache()
+            continue
         with open(args.out, "a") as f:
             f.write(json.dumps(r) + "\n")
 

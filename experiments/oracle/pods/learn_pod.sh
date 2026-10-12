@@ -3,7 +3,8 @@
 # processes over the texts RANGES ("6000:6800 9000:9200"), texts/vpd4l as a compressed tar, vpd4l's weights and VPD's
 # checkpoint (its causal-importance network picks the candidates) as published inputs. Rows come back to
 # ~/mpd-data/runpod/NAME/out/measured_<range>_<k>.jsonl, written per text (a run cut short keeps what it measured).
-#   experiments/oracle/pods/learn_pod.sh [NAME] [HOURS]      env: RANGES, P, GPU, PRICE
+# ONLY=FILE (text numbers, one per line): those texts of the ranges alone.
+#   experiments/oracle/pods/learn_pod.sh [NAME] [HOURS]      env: RANGES, P, ONLY, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -13,11 +14,13 @@ O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME V=/Users/user/mpd-da
 F=/Users/user/mpd-data/scratch/rustmove/learn/pod_$NAME
 mkdir -p "$F"
 COPYFILE_DISABLE=1 tar -czf "$F/texts.tgz" -C $G texts/vpd4l
+SEL=""
+if [ -n "${ONLY:-}" ]; then cp "$ONLY" "$F/only.txt"; SEL="--only $F/only.txt"; fi
 RUNS=""
 for k in $(seq 0 $((P - 1))); do
   ONE=""
   for R in $RANGES; do
-    ONE="$ONE python -B experiments/oracle/learnability.py measure --texts $R $O/out/measured_${R/:/_}_$k.jsonl --device cuda --offset $k --stride $P >> $O/measure_$k.log 2>&1;"
+    ONE="$ONE python -B experiments/oracle/learnability.py measure --texts $R $O/out/measured_${R/:/_}_$k.jsonl --device cuda --offset $k --stride $P $SEL >> $O/measure_$k.log 2>&1;"
   done
   RUNS="$RUNS ($ONE echo \"exit \$?\" >> $O/measure_$k.log) &"
 done

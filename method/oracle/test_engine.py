@@ -103,6 +103,21 @@ def test_search_steps_equal_whole_run():
         assert float((a[n].grad - b[n].grad).norm() / a[n].grad.norm().clamp_min(1e-30)) < REL
 
 
+@pytest.mark.parametrize("live", [True, False])
+def test_outside_on(live):
+    """Columns with every other subcomponent on: the whole engine's run with those masks free and the rest at 1."""
+    nat, ids, targets, masks = setup(B=3)
+    g = torch.Generator().manual_seed(4)
+    cols = {n: torch.randperm(nat.C[n], generator=g)[:40].sort().values for n in nat.names}
+    whole = engine.Engine(nat, ids, targets, live=live)
+    on = engine.Engine(nat, ids, targets, live=live, columns=cols, outside="on")
+    full = {n: torch.ones_like(m).index_copy(-1, cols[n].to(m.device), m.index_select(-1, cols[n].to(m.device))) for n, m in masks.items()}
+    with torch.no_grad():
+        want, got = whole.kl(full), on.kl({n: m.index_select(-1, cols[n].to(m.device)) for n, m in masks.items()})
+    assert rel(want[1:], got[1:]) < REL
+    assert abs(float(want[0] - got[0])) < 1e-6   # every subcomponent on: the model itself, KL ~0 bits
+
+
 def answer(nat, ids) -> list:
     """VPD's answer on the text as (matrix, position, subcomponent) nodes: its causal-importance network's, or VPD_SAVED's."""
     if nat.has_importance:

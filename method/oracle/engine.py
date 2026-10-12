@@ -4,14 +4,16 @@ distribution at the targets from the run's, differentiable in the masks. It serv
 respect to masks (the teacher's mask search, the reward's adversary), batched over rows (samples x patterns x
 answers x restarts), on any GPU.
 
-  eng = Engine(nat, ids, targets, live=True, columns=None, compile=False)
+  eng = Engine(nat, ids, targets, live=True, columns=None, compile=False, outside="off")
   eng.kl(masks, precision="score") -> [B] bits                (eng.log_probs: [B, len(targets), V])
   eng.graph_kl(eng.plan(graph), u=None, ew=None, ow=None, precision="score") -> [B] bits   (eng.graph_log_probs)
 
 columns: per site the subcomponent indices masks address (a LongTensor), every other one off in every run; None, every
 subcomponent. Give the union a caller's masks can ever switch on (VPD's answer and an adversary's patterns): a site's
 products then run on those columns alone (a sum over fewer terms: float32-close to the full products, not equal to
-the bit). masks: {site: [B, T, K]} floats (K = the site's columns), with or without gradients.
+the bit). masks: {site: [B, T, K]} floats (K = the site's columns), with or without gradients. outside="on" runs every
+subcomponent outside the columns at 1 instead (folded into the remainder: W - V_K U_K, or V U - V_K U_K with the
+remainders off): the whole model with a few subcomponents' masks free, as cheap as the model itself.
 precision: "score", float32 with vpd_model's own norms and GELU (the numbers to report); "tf32" (CUDA: TF32 tensor-core
 matmuls) and "bf16" (bfloat16 autocast), with torch's fused norms and GELU, for a search's steps only, whose result is
 then scored again with "score" (engine.rescore checks that). compile: the search precisions' forward under
@@ -45,10 +47,13 @@ PRECISIONS = ("score", "tf32", "bf16")
 
 class Engine:
     def __init__(self, nat: native.Native, ids: list[int], targets: list[int], live: bool = True, columns: dict | None = None,
-                 compile: bool = False):
+                 compile: bool = False, outside: str = "off"):
         import vpd_model
 
+        if outside not in ("off", "on"):
+            raise ValueError("outside is off or on")
         self.nat, self.ids, self.targets, self.live = nat, list(ids), list(targets), live
+        self.fixed = live or outside == "on"  # whether every run adds x R (the remainder, and with outside on the rest)
         tg = nat.target
         self.tg, self.T, self.dev = tg, len(ids), nat.dev
         self.H, self.hd, self.eps = tg.n_head, tg.hd, tg.eps
@@ -65,6 +70,8 @@ class Engine:
             self.V[n] = st.V if cols is None else st.V.index_select(1, cols).contiguous()  # [d_in, K]
             self.U[n] = st.U if cols is None else st.U.index_select(0, cols).contiguous()  # [K, d_out]
             self.R[n] = st.delta_T  # [d_in, d_out]: the remainder W - V U, transposed (native.model)
+            if outside == "on" and cols is not None:  # every other subcomponent on, with the remainder or alone
+                self.R[n] = ((st.W.T if live else st.V @ st.U) - self.V[n] @ self.U[n]).contiguous()
         self._search = torch.compile(self.hidden, dynamic=False) if compile else self.hidden
 
     def width(self, n: str) -> int:
@@ -73,7 +80,7 @@ class Engine:
 
     def _site(self, n: str, h: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
         out = ((h @ self.V[n]) * m) @ self.U[n]
-        return out + h @ self.R[n] if self.live else out
+        return out + h @ self.R[n] if self.fixed else out
 
     def _steps(self, fused: bool):
         """(norm, activation): torch's fused kernels, or vpd_model's own."""
@@ -292,7 +299,7 @@ class Engine:
             def out(kd, z, scale):
                 n = name(kd)
                 o = (A[kd] * scale) @ self.U[n]
-                return o + z @ self.R[n] if self.live else o
+                return o + z @ self.R[n] if self.fixed else o
 
             def scale(kd):  # query and key nodes at 1 in the pattern
                 n = name(kd)

@@ -30,6 +30,8 @@ over the stages and the cleanup's points, a cleanup point re-measured under the 
   MPD_MEM_GIB=24 ~/mpd-data/venv/bin/python -B teacher_v3.py --tasks FILE --vpd ~/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --out DIR
 Output per text in --out: <task>.json (goal_eval circuit JSON), <task>.path.json ({"method": "v3", "start_nodes",
 "start_index": every stage's nodes' ids, "steps": per stage its "on" ids and measurements}), summary_<offset>.jsonl.
+  teacher_v3.py --evaluate DIR --seed 1 --pool 128 --tasks FILE --vpd FILE --out SCORES.jsonl   (F1, N and f1_adv of
+  DIR's circuits under a held-out draw of patterns: either search's circuits, at the same seed)
 """
 from __future__ import annotations
 
@@ -322,6 +324,34 @@ def robust_path(ms: MaskSearch, pr: teacher.Pruner, start: torch.Tensor, empty: 
     return path
 
 
+def evaluate(ge: goal_eval.GoalEval, task: str, saved: dict, circuit: dict, seed: int, pool: int, chunk: int) -> dict:
+    """A circuit JSON's F1, N and f1_adv on its text under `pool` patterns drawn with `seed` (a held-out adversary for a
+    search that drew its own with another seed); connections are not used (node circuits)."""
+    nat = ge.nat
+    ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
+    tx = ge.text(ids, targets)
+    tx.vpd = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+    for n, (t, c) in saved[task]["answer"].items():
+        tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    pr = teacher.Pruner(ge, tx, tx.vpd, live=teacher.CONVENTION == "live")
+    pats = patterns(saved, task, tx.T, nat.C, nat.names, pool, seed, nat.dev)
+    ms = MaskSearch(ge, tx, pr, pats, live=teacher.CONVENTION == "live")
+    vpd_adv = ms.kl_chunked(lambda a, b: ms.masks(None, pats[a:b], vpd_on=True), len(pats), chunk).clamp_min(TINY).log()
+    index = {nd: i for i, nd in enumerate(pr.nodes)}
+    on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
+    outside = 0
+    for m, c, t in circuit["nodes"]:
+        if m != "tok":
+            k = index.get((goal_eval._site(m), int(t), int(c)))
+            outside += k is None
+            if k is not None:
+                on[k] = True
+    r = measure_stage(ms, pr, on, empty, vpd, vpd_adv, chunk)
+    return {"task": task, "size": int(on.sum()), "outside_answer": outside, "seed": seed, "pool": pool,
+            **{k: r[k] for k in ("f1", "n", "f1_adv", "f1_rob", "kl_c", "kl_minus", "kl_adv", "kl_vpd_adv")}}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--tasks", type=Path, required=True, help="task ids, one per line")
@@ -331,10 +361,22 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--chunk", type=int, default=8, help="rows per masked run (memory)")
     ap.add_argument("--edges", action="store_true", help="the pick's connections by teacher.py's measured descent to graph F1 >= 0.9")
+    ap.add_argument("--evaluate", type=Path, help="score this directory's <task>.json circuits instead of searching (one JSONL line each in --out)")
+    ap.add_argument("--seed", type=int, default=1, help="--evaluate: the patterns' draw (the search draws with 0)")
+    ap.add_argument("--pool", type=int, default=128, help="--evaluate: patterns drawn")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     saved = torch.load(args.vpd)
     ge = goal_eval.GoalEval(native.Native(), chunk=args.batch)
+    if args.evaluate:
+        for task in args.tasks.read_text().split()[args.offset::args.stride]:
+            path = args.evaluate / f"{task}.json"
+            if path.exists():
+                r = evaluate(ge, task, saved, json.loads(path.read_text()), args.seed, args.pool, args.chunk)
+                with args.out.open("a") as f:
+                    f.write(json.dumps({"dir": str(args.evaluate), **r}) + "\n")
+                print(f"{task}: {r['size']} subcomponents, F1 {r['f1']:.3f} N {r['n']:.3f} f1_adv {r['f1_adv']:.3f}", flush=True)
+        return
     args.out.mkdir(parents=True, exist_ok=True)
     for task in args.tasks.read_text().split()[args.offset::args.stride]:
         if (args.out / f"{task}.json").exists():

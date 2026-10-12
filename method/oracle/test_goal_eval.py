@@ -1634,13 +1634,13 @@ def test_reward_v3_helpers(tiny):
     family scored in one run); compact; a block is never cheaper than listing its active parts; n_vpd_k."""
     nat, ge, tx = tiny
     r = 0.3
-    row = {"s_point_c": 0.75, "s_nodes": 0.75, "f1_flips_c": {str(goal_eval.FLIP_TERM): 0.75}, "n_point": 0.75,
+    row = {"s_point_c": 0.75, "s_nodes": 0.75, "f1_flips_c": {str(goal_eval.FLIP_TERM): 0.75}, "n_spec": 0.75,
            **{f"eps_{f}": 0.05 for f in goal_eval.PHI_FAMILIES}}
     got, tau = goal_eval.phi(row)
     assert abs(got - (-math.log2(r))) < 1e-12 and abs(tau - got) < 1e-12  # the row as its own start: min(its phi, at 0.9)
     assert goal_eval.phi(row, start=1.0)[1] == 1.0
     noisy = dict(row, **{f"eps_{f}": 0.25 for f in goal_eval.PHI_FAMILIES})  # the same scores, noisier
-    start = dict(row, s_point_c=0.95, s_nodes=0.95, n_point=0.95, f1_flips_c={str(goal_eval.FLIP_TERM): 0.95})
+    start = dict(row, s_point_c=0.95, s_nodes=0.95, n_spec=0.95, f1_flips_c={str(goal_eval.FLIP_TERM): 0.95})
     a, b = goal_eval.phi(row, start=start), goal_eval.phi(noisy, start=start)
     assert a[1] == b[1] and b[0] < a[0]  # one bar per text (the start's eps); an answer's own noise lowers only its phi
     pool = tiny_pool(nat, tx.ids)
@@ -1698,6 +1698,61 @@ def test_cut_partial_modes(tiny):
     assert ge.cuts(tx, [(v, o)], mode="norm")[0] < 1e-6
 
 
+def test_necessity_with_specificity(tiny):
+    """necessity_spec, phi's N: D_t is real_removal's KL at the targets; each control's D_c is real_removal of the same
+    subcomponents on that control text (its own Text), end-aligned (shifted so its last position is the target); n_spec = clip((D_t - mean D_c) / (D_t(VPD)
+    - mean D_c(VPD)), 0, 1), VPD's answer 1, the empty circuit 0; phi's eps for N from the controls."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph([nd for nd in every if nd[1] >= 6][::2], complete=True), native.Graph()]
+    got = ge.necessity_spec(tx, graphs, "eval")
+    last = max(tx.targets)
+    first = min(t for _, t, _ in graphs[0].node_set())
+    pool = [x for x in ge.far_pool("eval") if len(x[1]) >= last - first + 1]
+    ys = [pool[i][1] for i in np.random.default_rng([int(tx.seed), 13]).permutation(len(pool))[:goal_eval.NEC_CONTROLS]]
+    assert len(got[0]["draws_n_spec"]) == len(ys) >= 2 and min(len(y) for y in ys) <= last  # some controls shifted
+    dt = ge.real_removal(tx, graphs)
+    for g, row, r in zip(graphs, got, dt):
+        assert abs(row["d_target"] - r["kl_real_minus"]) < 1e-5 + 1e-5 * r["kl_real_minus"]
+        for (j, dc, dcv, t_, tv), y in zip(row["draws_n_spec"], ys):
+            y = list(y[:last + 1])
+            d = last + 1 - len(y)  # end-aligned: the control's last position takes the target
+            ty = ge.text(y, [t - d for t in tx.targets], seed=1)
+            want, wv = (r_["kl_real_minus"] for r_ in ge.real_removal(ty, [native.Graph(masks={n: m[d:] for n, m in ms.items()})
+                                                                            for ms in (ge.masks(g, tx.T), tx.vpd)]))
+            assert abs(dc - want) < 1e-4 + 1e-4 * want and abs(dcv - wv) < 1e-4 + 1e-4 * wv, (dc, want, dcv, wv)
+        assert row["n_spec"] == goal_eval._spec(row["draws_n_spec"]) == goal_eval._pooled("spec", row["draws_n_spec"], None)
+    assert got[1]["d_target"] < 1e-6 and max(d[1] for d in got[1]["draws_n_spec"]) < 1e-6  # nothing removed, no damage
+    # the form: (D_t - mean D_c) / (D_t(VPD) - mean D_c(VPD)); a removal as damaging on the controls earns nothing; VPD's
+    # answer 1; None when VPD's removal is no more damaging on the text than on the controls (the random tiny model's)
+    rec = [[0, 1.0, 2.0, 5.0, 10.0], [1, 3.0, 4.0, 5.0, 10.0]]
+    assert abs(goal_eval._spec(rec) - 3 / 7) < 1e-12
+    assert goal_eval._spec([[0, 5.0, 2.0, 5.0, 10.0]]) == 0.0 and goal_eval._spec([[0, 9.0, 2.0, 5.0, 10.0]], raw=True) < 0
+    assert goal_eval._spec([[0, 2.0, 2.0, 10.0, 10.0]]) == 1.0 and goal_eval._spec([[0, 1.0, 10.0, 5.0, 10.0]]) is None
+
+
+def test_point_with_remainders_held(tiny):
+    """point_remainders: live is C's point (sufficiency's KL); held at x, a graph run with the remainders recorded from
+    its own live run is its live run, and the whole model is the model; off is graph_ref without remainders."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::4]
+    g = goal_eval.strand(native.Graph(sub, *native.all_edges(sub, tx.targets)), tx.targets, nat.C)
+    graphs = [g, native.Graph(every[1::3], complete=True)]
+    got = ge.point_remainders(tx, graphs)
+    for h, row, pt in zip(graphs, got, ge.sufficiency(tx, graphs)):
+        assert abs(row["kl_point_live"] - pt["kl_live"]) < 1e-4 + 1e-4 * pt["kl_live"], (row["kl_point_live"], pt["kl_live"])
+        off = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, goal_eval._c_graph(h, tx.targets, nat.C), live=False))[0])
+        assert abs(row["kl_point_off"] - off) < 1e-6
+        rest = {}
+        live = ge.graph_ref(tx.ids, tx.targets, h, rest=rest)
+        assert torch.allclose(ge.graph_ref(tx.ids, tx.targets, h, rest=rest, hold=True), live, atol=1e-5)
+    T = tx.T
+    model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+    m = ge.point_remainders(tx, [model])[0]
+    assert m["kl_point_live"] < 1e-4 and m["kl_point_held"] < 1e-4
+
+
 def test_line_leave_one_out(tiny):
     """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row
     with point, N, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run (the held
@@ -1722,10 +1777,11 @@ def test_line_leave_one_out(tiny):
     own = ge.fidelity(tx, [h], pool, mode="reward", split="search", interchange=4, changed=4)[0]
     row = dict(base)
     for k in ("s_point", "s_wiring", "s_point_c", "n_point", "draws_point", "s_track_pp", "draws_track_pp", "s_interchange_pp",
-              "draws_interchange_pp", "s_pattern", "draws_pattern"):
+              "draws_interchange_pp", "s_pattern", "draws_pattern", "n_spec", "n_spec_raw", "draws_n_spec", "d_target", "d_control",
+              "d_target_vpd", "d_control_vpd"):
         row[k] = own.get(k)
     row["rl_terms"] = {**base["rl_terms"], **{k: own["rl_terms"].get(k)
-                       for k in ("s_point_c", "s_track_pp", "s_interchange_pp", "s_pattern")}}
+                       for k in ("s_point_c", "s_track_pp", "s_interchange_pp", "s_pattern", "n_spec")}}
     for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
         row.pop(f"eps_{f}", None)
     want = goal_eval.phi(row)[0]

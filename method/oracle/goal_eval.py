@@ -126,6 +126,7 @@ VPD4L_SITES = 24  # vpd4l's weight matrices (4 layers x 6), a block's name among
 DONORS_NEAR = 32  # donor resampling's changed-input donors per text
 DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's answer)
 DONORS_FAR = 32  # donor resampling's other texts per text
+NEC_CONTROLS = 16  # N's matched control texts per text (necessity_spec: the split's far pool, DONOR_POOLS)
 DONOR_POOLS = {"search": ("train", range(0, 400)),  # the far donors' texts per split: the reward's from training texts,
                "eval": ("donor", range(0, 50))}  # explicit text9150-9199 partition, independent of missing dev files
 
@@ -470,7 +471,7 @@ PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the sc
     "flips": ("f1_flips_c", None, None), "track_pp": ("s_track_pp", "weighted", "draws_track_pp"),
     "interchange_pp": ("s_interchange_pp", "weighted", "draws_interchange_pp"),
     "donors_near": ("s_donor_near", "donor", "draws_donor_near"), "donors_far": ("s_donor_far", "donor", "draws_donor_far"),
-    "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_point", None, None)}
+    "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_spec", "spec", "draws_n_spec")}
 EPS_FLOOR = 0.005  # eps's floor
 EPS_BOOT = 200  # eps's bootstrap resamples
 
@@ -489,9 +490,12 @@ def family_score(row: dict, family: str) -> float | None:
 def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> float | None:
     """A family's score from some of its draws, as the family pools them: "mean" on the mean KLs ([KL_C, KL_VPD] each,
     against KL_empty e0), "weighted" per draw against its bound W ([prompt, KL_C, KL_VPD, W]) pooled by W, "donor" on
-    the mean KLs against the mean keep-nothing KL ([donor, KL_C, KL_VPD, KL_0, score])."""
+    the mean KLs against the mean keep-nothing KL ([donor, KL_C, KL_VPD, KL_0, score]), "spec" N's specificity form
+    (_spec: [control, D_c, D_c of VPD's answer, D_t, D_t of VPD's answer])."""
     if not draws:
         return None
+    if kind == "spec":
+        return _spec(draws, raw=raw)
     fid = _fid_raw if raw else _fid
     if kind == "mean":
         return None if e0 is None else fid(e0, float(np.mean([d[0] for d in draws])), float(np.mean([d[1] for d in draws])))
@@ -503,6 +507,19 @@ def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> f
         if sd is not None:
             num, den = num + d[3] * sd, den + d[3]
     return num / den if den > 0 else None
+
+
+def _spec(draws: list, raw: bool = False) -> float | None:
+    """N (necessity_spec) from its records [control, D_c, D_c(VPD), D_t, D_t(VPD)]: (D_t - mean D_c) / (D_t(VPD) -
+    mean D_c(VPD)), at most 1 and clipped at 0 unless raw; None without controls or when VPD's answer's removal damages
+    the controls as much as the text."""
+    if not draws:
+        return None
+    den = draws[0][4] - float(np.mean([d[2] for d in draws]))
+    if not den > 0:
+        return None
+    x = min(1.0, (draws[0][3] - float(np.mean([d[1] for d in draws]))) / den)
+    return x if raw else max(0.0, x)
 
 
 def _pooled_raw(draws: list) -> float | None:
@@ -910,7 +927,7 @@ class GoalEval:
     def graph_ref(self, ids: list[int], targets: list[int], graph: native.Graph, u: dict | None = None, live: bool = True,
                   record: dict | None = None, patch: dict | None = None, cuts: dict | None = None,
                   reads: list | None = None, norms: dict | None = None, freeze: str = "",
-                  rows: dict | None = None) -> torch.Tensor:
+                  rows: dict | None = None, rest: dict | None = None, hold: bool = False) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of a stated graph's run in C's semantics (the lead's decision, 10-12):
         inside the circuit, graph semantics, each circuit node reading the full residual stream less the outputs of the
         circuit nodes that are not its stated parents (the background and its stated parents; a value's share through
@@ -929,7 +946,9 @@ class GoalEval:
         RMSNorm's scale 1 / rms per position ({("attn" | "mlp", layer) or "final": [B, T or targets, 1]}); with
         freeze "layers" (every norm inside the layers) or "all" (the final norm too), those norms use the scales norms
         holds instead (a run recorded first: the norm diagnostic). rows: {(layer, t): [H, t + 1]} attention rows used
-        in place of the run's own at those reads (pattern_family)."""
+        in place of the run's own at those reads (pattern_family). rest: receives each site's remainder output {site:
+        [B, T, d_out]} (live); with hold, every remainder outputs rest's values instead (a run of the whole model on the
+        text recorded first: the remainders held at their values on x, point_remainders)."""
         import vpd_model
 
         nat, tg = self.nat, self.nat.target
@@ -978,7 +997,14 @@ class GoalEval:
                     A[:, t, c] = v
             a[n] = A
             out = (A * on[n]) @ tg.site(n).U
-            return out + inp @ tg.site(n).delta_T if live else out
+            if hold:
+                return out + rest[n]
+            if not live:
+                return out
+            r_ = inp @ tg.site(n).delta_T
+            if rest is not None:
+                rest[n] = r_.detach()
+            return out + r_
 
         def norm(xx, w, key, pos=None):  # vpd_model.rms, its scale recorded into norms or taken from it (freeze)
             frozen = norms is not None and freeze and (freeze == "all" or key != "final")
@@ -1044,8 +1070,9 @@ class GoalEval:
                  bits_start: float | None = None, base: dict | None = None) -> dict:
         """Each line's leave-one-out effect on the reward's phi and compact (the lead's reward v3, approved 10-12): the
         answer with that one line deleted (a node with its connections, token edges and pairs; a stated connection;
-        a stated token edge), nothing else re-stranded. Recomputed per deletion: point (s_point_c and N, sufficiency
-        on every deletion at once), track_pp, interchange_pp and pattern, on split's draws; held at the full answer's
+        a stated token edge), nothing else re-stranded. Recomputed per deletion: point (s_point_c, sufficiency on every
+        deletion at once), track_pp, interchange_pp and pattern, on split's draws, and N (necessity_spec, per node
+        deletion: the other lines leave the node set as it is); held at the full answer's
         values (its reward-mode row, base when given): LOO_HELD (nodes, edges, flips, donors near and far, the costly
         families), so a line's effect on them is 0. phi per deletion from the answer's row with the recomputed terms
         and their draws (eps re-bootstrapped); compact = log2(bits_start / bits) when bits_start is given. Returns
@@ -1093,11 +1120,14 @@ class GoalEval:
         tpp = self.track_pp(tx, variants, split, draws)
         ipp = self.interchange_pp(tx, variants, split, draws)
         pat = self.pattern_family(tx, flat)
+        at = [i for i, (kind, _) in enumerate(lines) if kind == "node"]  # N moves with the node set alone
+        nsp = dict(zip(at, self.necessity_spec(tx, [flat[i] for i in at], split))) if at else {}
         bits = size_bits(g, P, S, tx.targets, active=tx.vpd)
         ph = phi(base)[0]
         out = []
-        for (kind, x), h, pt, wd, a, b, c in zip(lines, variants, point, wired, tpp, ipp, pat):
+        for i, ((kind, x), h, pt, wd, a, b, c) in enumerate(zip(lines, variants, point, wired, tpp, ipp, pat)):
             row = dict(base)
+            row.update(nsp.get(i, {}))
             row.update({"s_point": pt["f1_live"], "s_wiring": wd["f1_live"], "n_point": pt["n_live"],
                         "draws_point": [[pt["kl_live"], v0]]})
             row["s_point_c"] = min(y for y in (pt["f1_live"], wd["f1_live"]) if y is not None) if pt["f1_live"] is not None else None
@@ -1110,7 +1140,8 @@ class GoalEval:
                                    "s_point_c": min(x for x in raw_point if x is not None) if raw_point[0] is not None else None,
                                    "s_track_pp": a.get("s_track_pp_raw"),
                                    "s_interchange_pp": b.get("s_interchange_pp_raw"),
-                                   "s_pattern": c.get("s_pattern_raw")}
+                                   "s_pattern": c.get("s_pattern_raw"),
+                                   **({"n_spec": row.get("n_spec_raw")} if "n_spec" in row["rl_terms"] else {})}
             for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
                 row.pop(f"eps_{f}", None)  # the recomputed families' eps from their own draws
             row.update({f"eps_{f}": v for f, v in family_eps(row).items() if f not in self.LOO_HELD})
@@ -1955,24 +1986,7 @@ class GoalEval:
         reuses the model's states before its first removed subcomponent."""
         nat, T = self.nat, tx.T
         graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
-        one_r = nat._one()[1]
-        none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
-        sets = [self.masks(g, T) for g in graphs]
-        kls = []
-        for s0 in range(0, len(sets), self.chunk):
-            part = sets[s0:s0 + self.chunk]
-            B = len(part)
-            u = {n: 1.0 - torch.stack([m[n] for m in part]).float() for n in nat.names}
-            first = min((int(m[n].any(1).nonzero().min()) for m in part for n in nat.names if m[n].any()), default=0)
-            base = _from(tx.ids, min(first, min(tx.targets)))
-            plan = {**nat._full_plan(T, B), "G": none, "none": True}
-            ur = one_r
-            if not remainders_at_nodes:
-                held = torch.stack([sum(m[n].any(1).float() for n in nat.names) > 0 for m in part])  # [B, T]
-                ur = {n: 1.0 - held.float() for n in nat.names}
-            lq = nat.run(tx.ids, tx.targets, plan, u, ur, reuse=None if base is None else (nat._model_states(tx.ids, B), base))
-            kls += carry.kl(tx.ref, lq).tolist()
-            native.free(nat.dev)
+        kls = self._removed_kl(tx.ids, tx.targets, [self.masks(g, T) for g in graphs], tx.ref, remainders_at_nodes)
         out = []
         for k in kls:
             row = {"kl_real_minus": k}
@@ -1980,6 +1994,96 @@ class GoalEval:
                 e, v = self._bounds(tx, conv)
                 row[f"n_real_{conv}"] = necessity_log(e, k, v) if v is not None else None
             out.append(row)
+        return out
+
+    @torch.no_grad()
+    def point_remainders(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+        """The point score under three treatments of the remainders W - V U (the lead's 10-12 hidden-computation check:
+        live, C's semantics, they read the circuit's outputs and can carry computation the graph never states): live;
+        held at their values on x (the whole model's run, the circuit's outputs not reaching them); off. Per graph and
+        treatment X: kl_point_X (graph_ref, bits) and s_point_X = _fid against the same treatment's bounds (the empty
+        circuit's and VPD's whole answer's KL under it, kl_empty_X and kl_vpd_X)."""
+        nat, T = self.nat, tx.T
+        rest = {}
+        model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+        self.graph_ref(tx.ids, tx.targets, model, rest=rest)
+        how = {"live": {}, "held": {"rest": rest, "hold": True}, "off": {"live": False}}
+
+        def kl(g, kw):
+            return float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, g, **kw))[0])
+
+        bounds = {x: (kl(native.Graph(), kw), kl(native.Graph(masks=tx.vpd), kw)) for x, kw in how.items()}
+        out = []
+        for g in graphs:
+            g = _c_graph(g, tx.targets, nat.C)
+            row = {}
+            for x, kw in how.items():
+                kc = kl(g, kw)
+                row |= {f"kl_point_{x}": kc, f"s_point_{x}": _fid(bounds[x][0], kc, bounds[x][1]),
+                        f"kl_empty_{x}": bounds[x][0], f"kl_vpd_{x}": bounds[x][1]}
+            out.append(row)
+            native.free(nat.dev)
+        return out
+
+    @torch.no_grad()
+    def _removed_kl(self, ids: list[int], targets: list[int], sets: list[dict], ref: torch.Tensor | None = None,
+                    remainders_at_nodes: bool = True) -> list[float]:
+        """Per set (matrix -> bool [len(ids), C]): KL at the targets from ref (the whole model's run on ids when None)
+        of the real model on ids with the set's subcomponents removed (mask 0 at their positions, every other
+        subcomponent and every remainder on). remainders_at_nodes False: each matrix's remainder W - V U removed too at
+        the positions the set holds. A batch reuses the model's states before its first removed subcomponent."""
+        nat, T = self.nat, len(ids)
+        one_u, one_r = nat._one()
+        if ref is None:
+            ref = nat.run(ids, targets, nat._full_plan(T, 1), one_u, one_r)
+        none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+        kls = []
+        for s0 in range(0, len(sets), self.chunk):
+            part = sets[s0:s0 + self.chunk]
+            B = len(part)
+            u = {n: 1.0 - torch.stack([m[n] for m in part]).float() for n in nat.names}
+            first = min((int(m[n].any(1).nonzero().min()) for m in part for n in nat.names if m[n].any()), default=0)
+            base = _from(ids, min(first, min(targets)))
+            plan = {**nat._full_plan(T, B), "G": none, "none": True}
+            ur = one_r
+            if not remainders_at_nodes:
+                held = torch.stack([sum(m[n].any(1).float() for n in nat.names) > 0 for m in part])  # [B, T]
+                ur = {n: 1.0 - held.float() for n in nat.names}
+            lq = nat.run(ids, targets, plan, u, ur, reuse=None if base is None else (nat._model_states(ids, B), base))
+            kls += carry.kl(ref, lq).tolist()
+            native.free(nat.dev)
+        return kls
+
+    def necessity_spec(self, tx: Text, graphs: list[native.Graph], split: str = "eval", controls: int = NEC_CONTROLS) -> list[dict]:
+        """N, phi's necessity (the user's spec, the lead's 10-12: without the circuit's parts the real system breaks,
+        and the break is this text's, not every text's). Per graph: D_t, the damage at the targets (KL from the model)
+        of the real model less the circuit's subcomponents (every other subcomponent and every remainder on, as
+        real_removal); D_c, the same removal's damage on a matched control text, end-aligned (the control's last
+        position takes the text's last target, every part shifted with it: the same relative positions, which are all
+        the model's attention sees), averaged over controls texts of the split's far pool (DONOR_POOLS) at least as
+        long as the circuits' span, drawn by the text's seed; the same two for VPD's whole answer (its parts before a
+        control's start left out there). n_spec = clip((D_t - D_c) / (D_t(VPD) - D_c(VPD)), 0, 1): parts whose removal
+        damages every text's prediction there add to D_t and D_c alike and earn nothing, VPD's answer scores 1, None
+        when VPD's removal damages the controls as much as the text; n_spec_raw unclipped below (c_rl's ranking).
+        draws_n_spec: per control [control, D_c, D_c(VPD), D_t, D_t(VPD)] (phi's eps). Damages in bits."""
+        nat, T = self.nat, tx.T
+        sets = [self.masks(_c_graph(g, tx.targets, nat.C), T) for g in graphs] + [tx.vpd]
+        dt = self._removed_kl(tx.ids, tx.targets, sets, tx.ref)
+        last = max(tx.targets)
+        first = min((int(m[n].any(1).nonzero().min()) for m in sets[:-1] for n in nat.names if m[n].any()), default=last)
+        pool = [x for x in self.far_pool(split) if len(x[1]) >= last - first + 1 and list(x[1]) != list(tx.ids)]
+        ys = [pool[i][1] for i in np.random.default_rng([int(tx.seed), 13]).permutation(len(pool))[:controls]]
+        dc = []
+        for y in ys:
+            y = list(y[:last + 1])
+            d = last + 1 - len(y)  # the shift
+            dc.append(self._removed_kl(y, [t - d for t in tx.targets if t >= d], [{n: m[n][d:] for n in nat.names} for m in sets]))
+        out = []
+        for i in range(len(graphs)):
+            rec = [[j, d[i], d[-1], dt[i], dt[-1]] for j, d in enumerate(dc)]
+            out.append({"d_target": dt[i], "d_control": float(np.mean([r[1] for r in rec])) if rec else None,
+                        "d_target_vpd": dt[-1], "d_control_vpd": float(np.mean([r[2] for r in rec])) if rec else None,
+                        "n_spec": _spec(rec), "n_spec_raw": _spec(rec, raw=True), "draws_n_spec": rec})
         return out
 
     # ---- diagnostics
@@ -1990,7 +2094,8 @@ class GoalEval:
                  steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE, fresh: dict | None = None,
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
                  changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
-                 far_donors: int = DONORS_FAR, baseline: bool = False, pattern: bool = True) -> list[dict]:
+                 far_donors: int = DONORS_FAR, baseline: bool = False, pattern: bool = True,
+                 controls: int = NEC_CONTROLS) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -2060,12 +2165,13 @@ class GoalEval:
         dns = self.donors(tx, graphs, split, near_donors, self.far_donors(tx, self.far_pool(split), far_donors) if far_donors else None) \
             if (near_donors or far_donors) else none
         nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real and not reward else none
+        nspec = self.necessity_spec(tx, graphs, split, controls) if controls else none  # phi's N
         leak = none if reward else self.sufficiency(tx, [native.Graph(sorted(g.node_set()), {}, []) for g in graphs])
         out = []
-        for g, pt, nd, ed, ad, fl, fr, it, rr, nf, lk in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals,
-                                                             nflips, leak):
+        for g, pt, nd, ed, ad, fl, fr, it, rr, nf, lk, ns in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals,
+                                                                 nflips, leak, nspec):
             i = len(out)
-            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf,
+            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf, **ns,
                    "s_wiring": wired[i]["f1_live"] if i in wired else pt["f1_live"]}
             if lk:
                 row["leak"] = lk["f1_live"]
@@ -2111,6 +2217,8 @@ class GoalEval:
                 raw[f"s_donor_{pool_}"] = _fid_raw(k3[2], k3[0], k3[1]) if k3 else None
             row["rl_terms"] = {k: raw[k] for k in row["c_terms"]}
             row["c_rl"] = _c_rl([raw[k] for k in row["c_terms"] if raw[k] is not None])
+            if ns:  # phi's N unfloored as well (not one of C's terms)
+                row["rl_terms"]["n_spec"] = row.get("n_spec_raw")
             if baseline:
                 row.update(self.vpd_baseline(tx, g.count(), pool, split))
             row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") else None
@@ -3757,7 +3865,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
     and VPD's first k at each circuit's size (complete graphs), with the evaluation-only families (fresh: the pattern
     lever over a pool no search drew from; interchange draws; changed texts (changed_inputs' eval split); N_real); one
     row per circuit appended to OUT (texts already there are skipped); only: some of ("changed", "interchange",
-    "donors", "track_pp", "interchange_pp", "pattern", "nodes"), those families alone on the eval split (task, kind, nodes and their fields: families added to rows
+    "donors", "track_pp", "interchange_pp", "pattern", "nodes", "necessity", "remainders"), those families alone on the eval split (task, kind, nodes and their fields: families added to rows
     already made, matched by task and kind; donors' far texts the eval split's, DONOR_POOLS). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
     teacher.py --save-vpd (where the causal-importance network is not). Locality from a set's summary*.jsonl."""
     ge = GoalEval()
@@ -3821,9 +3929,12 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                 tp = [dict(a, **c) for a, c in zip(tp, ge.pattern_family(tx, [_c_graph(g, targets, nat.C) for g in graphs]))]
             ip = ge.interchange_pp(tx, graphs, "eval", interchange) if "interchange_pp" in only else [{} for _ in graphs]
             nf = ge._node_family(tx, [_c_graph(g, targets, nat.C) for g in graphs], draws) if "nodes" in only else [{} for _ in graphs]
+            ns = ge.necessity_spec(tx, graphs, "eval") if "necessity" in only else [{} for _ in graphs]
+            if "remainders" in only:  # the point score with the remainders live, held at x and off
+                ns = [dict(a, **b) for a, b in zip(ns, ge.point_remainders(tx, graphs))]
             scale = ge.size_scale(tx)
             with open(out, "a") as fh:
-                for kind, g, c, i, d, a, b, nd in zip(kinds, graphs, ch, it, dn, tp, ip, nf):
+                for kind, g, c, i, d, a, b, nd, nn in zip(kinds, graphs, ch, it, dn, tp, ip, nf, ns):
                     row = {"task": p.stem, "kind": kind, "nodes": g.count(),
                            "size_bits": size_bits(g, nat.positions(targets), sum(nat.C.values()), targets, active=tx.vpd),
                            "size_scale": scale,  # (informational: VPD's nodes alone, no connections)
@@ -3836,6 +3947,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                     if nd:  # the node family against the model's own response
                         row.update({k: nd[k] for k in ("kl_nodes_c", "kl_nodes_vpd", "draws_nodes", "overstate_nodes") if k in nd})
                         row |= {"s_nodes": _pooled("weighted", nd.get("draws_nodes"), e), "s_nodes_raw": _pooled_raw(nd.get("draws_nodes"))}
+                    row.update(nn)
                     rows.append(row)
                     fh.write(json.dumps(row) + "\n")
             if log:
@@ -3934,7 +4046,7 @@ def fidelity_table(rows: list[dict]) -> str:
     stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
     sample = [("stranded nodes", lambda r: r.get("stranded")), ("F1", lambda r: r["s_point"]), ("F1 every connection", lambda r: r.get("s_wiring")),
               ("reliance on cuts", lambda r: r.get("reliance_on_cuts")),
-              ("N", lambda r: r["n_point"]), ("size bits", lambda r: r.get("size_bits", r.get("size")))]
+              ("N", lambda r: r.get("n_spec")), ("size bits", lambda r: r.get("size_bits", r.get("size")))]
     return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),
                           block("The step adversary (VPD's published budget, steps)", stepcols),
                           block("In-sample (the searches optimized F1 and N on these texts)", sample)])
@@ -3963,7 +4075,7 @@ def main():
     f.add_argument("--fresh", type=Path, help="a pattern pool no search drew from (evaluation only)")
     f.add_argument("--interchange", type=int, default=INTERCHANGE_DRAWS)
     f.add_argument("--changed", type=int, default=CHANGED_DRAWS, help="changed texts per circuit (changed_inputs' eval split)")
-    f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp,pattern,nodes: those families alone, eval split (rows to merge by task and kind)")
+    f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp,pattern,nodes,necessity,remainders: those families alone, eval split (rows to merge by task and kind)")
     f.add_argument("--curve", default=",".join(str(x) for x in ADV_CURVE), help="the step adversary's budgets, e.g. 0,4,20,40,80,160,320")
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--draws", type=int, default=DRAWS)

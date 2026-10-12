@@ -19,14 +19,14 @@ flowchart TB
     direction LR
     INPUT["<b>INPUT COVERAGE · CHECK</b><br/>codex + rustmove → training owner<br/>Audit: old prompts expose 14% of targets<br/>Output: coverage AFTER context fitting<br/>Decides: pool, representation, or tools"]
     TEACH["<b>TEACHER QUALITY · ACTIVE</b><br/>pymove + fleet → training owner<br/>Why: imitation cannot fix false targets<br/>Output: unseen-change fidelity + size<br/>Repair overfit draws and missing backups"]
-    SCORE["<b>REWARD CALIBRATION · ACTIVE</b><br/>codex + inframove + generality → primerl<br/>Pilot: old teacher below bar on 4 of 4<br/>RL loses 3 of 4; one large outlier<br/>NEXT: explain outlier; rank corrupt controls"]
+    SCORE["<b>REWARD CALIBRATION · ACTIVE</b><br/>codex + inframove + generality → primerl<br/>Pilot: old teacher below bar on 4 of 4<br/>Gate B FAIL: empty-like earns +4.75<br/>NEXT: low bar + omitted-family policy"]
   end
   NOW --> INPUT
   NOW --> TEACH
   NOW --> SCORE
 
   DATA["<b>GATE A · TRAINABLE TARGETS?</b><br/>Teacher passes independent interventions;<br/>required parts observable; input + output fit<br/>PASS → small SFT · FAIL → repair input/search<br/>primerl accepts evidence from both owners"]
-  RANK["<b>GATE B · TRUSTWORTHY OPTIMIZATION?</b><br/>Faithful beats wrong at matched size;<br/>empty, shuffled and collapsed controls lose<br/>PASS → reward usable · FAIL → repair scorer<br/>Four-text pilot diagnoses; it cannot certify"]
+  RANK["<b>GATE B · FAILED: REPAIR BEFORE RL</b><br/>9001: five nodes predict like empty, reward +4.75<br/>A weak baseline unlocks size reward;<br/>missing node-family score changes comparison<br/>Rerun faithful vs corrupt controls after repair"]
   INPUT --> DATA
   TEACH --> DATA
   SCORE --> RANK

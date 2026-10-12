@@ -701,6 +701,14 @@ class Native:
         cache = reuse[0] if s > 0 else None
         if empty:
             fill = None
+        # s2: the first position the per-position steps (the norms, readers' inputs, the attention pattern's rows) run
+        # on. 0, the whole length, except on a WINDOW_EXACT device with at least 64 positions and 2,048 rows from s2 on:
+        # there those rows are the whole length's (checked on MPS; fewer rows can round differently)
+        s2 = 0
+        if s > 0 and str(dev).split(":")[0] in self.WINDOW_EXACT:
+            s2 = max(0, min(s, T - 64))
+            s2 = s2 if B * (T - s2) >= 2048 else 0
+        o = s - s2  # the window's first position in those steps' rows
 
         def full(key, w):  # [B, T, ...]: the reused run's first s positions, then w (the positions from s)
             if cache is None:
@@ -710,10 +718,13 @@ class Native:
             c = cache[key]
             return torch.cat([c[:, :s].expand(w.shape[0], *([-1] * (c.dim() - 1))), w], 1)
 
-        def padded(w):  # [B, T, ...]: zeros at the first s positions, then w. For a per-position step (a norm, a
+        def padded(w):  # [B, T - s2, ...]: zeros at positions s2 to s, then w. For a per-position step (a norm, a
             # reader's inputs) whose results before s are not used: each position's result is the one the whole
-            # sequence gives, the shape being the same
-            return w if s == 0 else torch.cat([w.new_zeros(w.shape[0], s, *w.shape[2:]), w], 1)
+            # sequence gives, the shape being the same (or at least s2's)
+            return w if s == 0 else torch.cat([w.new_zeros(w.shape[0], o, *w.shape[2:]), w], 1)
+
+        def at(t):  # positions t's rows in the per-position steps' tensors (positions before s2: any row, unused)
+            return t if s2 == 0 else (t - s2).clamp(min=0)
 
         def win(t):  # positions from s of a [*, T, ...] tensor (or one shared across positions)
             return t if s == 0 or t.shape[1] == 1 else t[:, s:]
@@ -796,7 +807,7 @@ class Native:
             A = torch.where(win(G[n]) & comp, zg @ V, z @ V) if both else (z @ V).expand(B, L, -1)
             if n in R:
                 b, t, c = R[n][0], R[n][1], R[n][2]
-                inp = rms(xs.expand(B, T, -1)[b, t] + topup(n, xs.shape[-1], resid_contrib), norm, eps)
+                inp = rms(xs.expand(B, -1, -1)[b, at(t)] + topup(n, xs.shape[-1], resid_contrib), norm, eps)
                 A = put(n, A, (inp * V.T[c]).sum(-1))
             return A
 
@@ -805,7 +816,7 @@ class Native:
             if empty:  # one row for every graph; the norm over all of them, as each graph's
                 return xf, rms(xf.expand(B, T, -1).contiguous(), norm, eps)[:1]
             z = rms(xf, norm, eps)
-            return xf, (z if s == 0 else z[:, s:].contiguous())
+            return xf, (z if s == 0 else z[:, o:].contiguous())
 
         for i in range(tg.n_layer):
             nm = {k: site_name(i, k) for k in vpd_model.KINDS}
@@ -824,13 +835,13 @@ class Native:
             no = nm["o_proj"]
             if not empty or no in R:
                 q, kk = tg._rope(heads(qv), T), tg._rope(heads(kv), T)
-                P = ((q @ kk.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)  # [B, H, T, T]
-            att_s = None if empty else (P @ heads(vs)).transpose(1, 2).reshape(B, T, -1)
-            att_g = (P @ heads(vg)).transpose(1, 2).reshape(B, T, -1) if both else att_s
-            att_sw = None if empty else (att_s if s == 0 else att_s[:, s:].contiguous())
+                P = ((q[:, :, s2:] @ kk.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal[s2:], float("-inf")).softmax(-1)  # [B, H, T - s2, T]
+            att_s = None if empty else (P @ heads(vs)).transpose(1, 2).reshape(B, T - s2, -1)
+            att_g = (P @ heads(vg)).transpose(1, 2).reshape(B, T - s2, -1) if both else att_s
+            att_sw = None if empty else (att_s if s == 0 else att_s[:, o:].contiguous())
             Vo = tg.site(no).V
             if both:
-                Ao = torch.where(win(G[no]) & comp, (att_g if s == 0 else att_g[:, s:].contiguous()) @ Vo, att_sw @ Vo)
+                Ao = torch.where(win(G[no]) & comp, (att_g if s == 0 else att_g[:, o:].contiguous()) @ Vo, att_sw @ Vo)
             else:
                 Ao = torch.zeros(B, T, Vo.shape[1], device=dev) if empty else att_sw @ Vo
             if no in R:
@@ -841,9 +852,9 @@ class Native:
                         continue
                     wb, wt, wc, a, uw = writer_out(wn, wi, None)
                     share = strength((rn, wn), wi, ew) * (1 - uw) * a
-                    pat = P[wb, :, t[ri], wt]  # [E, H]: how much the reader's position attends to the writer's
+                    pat = P[wb, :, at(t[ri]), wt]  # [E, H]: how much the reader's position attends to the writer's
                     extra = extra.index_add(0, ri, share[:, None] * (pat.repeat_interleave(hd, dim=1) * Uv[wc]))
-                Ao = put(no, Ao, (((torch.zeros(len(b), Vo.shape[0], device=dev) if empty else att_s[b, t]) + extra) * Vo.T[c]).sum(-1))
+                Ao = put(no, Ao, (((torch.zeros(len(b), Vo.shape[0], device=dev) if empty else att_s[b, at(t)]) + extra) * Vo.T[c]).sum(-1))
             acts[no] = Ao = fixed(no, Ao)
             Uo = tg.site(no).U
             ro = rest(no, att_sw)
@@ -870,7 +881,7 @@ class Native:
                 def mlp_contrib(wn, wi, e):
                     _, _, wc, a, uw = writer_out(wn, wi, None)
                     return (e * (1 - uw) * a)[:, None] * Uf[wc]
-                pre = torch.zeros(len(b), Uf.shape[1], device=dev) if empty else padded(pre_s)[b, t]
+                pre = torch.zeros(len(b), Uf.shape[1], device=dev) if empty else padded(pre_s)[b, at(t)]
                 Ad = put(nd, Ad, (gelu(pre + topup(nd, Uf.shape[1], mlp_contrib)) * Vd.T[c]).sum(-1))
             acts[nd] = Ad = fixed(nd, Ad)
             Ud = tg.site(nd).U

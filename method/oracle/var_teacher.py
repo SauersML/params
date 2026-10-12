@@ -245,15 +245,35 @@ def stated_feeds(graph: native.Graph, chosen: list[dict]) -> None:
         v["feeds"] = sorted(f)
 
 
+def together(sc: variables.Scorer, tx, vs: list[dict], split: str, draws: int) -> dict:
+    """variables.Scorer.score of several variables, by pairs when there are more than two: a call keeps every changed
+    text's whole activations, and four variables' on-target, off-target and composition texts (~90 at 500 tokens) took
+    a 24 GB card. Each variable's draws, each pair's composition and feeds tests are the same in any call holding them
+    (keyed by the text and the positions), so the pairs' calls give every term of the joint call (each variable's from
+    the first call holding it; the float32 resolution is each call's own)."""
+    if len(vs) <= 2:
+        got = sc.score(tx, vs, split=split, draws=draws)
+        release(sc.nat.dev)
+        return got
+    first, pairs, feeds = {}, [], []
+    for i in range(len(vs)):
+        for j in range(i + 1, len(vs)):
+            got = sc.score(tx, [vs[i], vs[j]], split=split, draws=draws)
+            release(sc.nat.dev)
+            first.setdefault(i, got["variables"][0])
+            first.setdefault(j, got["variables"][1])
+            pairs += got["pairs"]
+            feeds += got["feeds"]
+    return variables.headline({"variables": [first[i] for i in range(len(vs))], "pairs": pairs, "feeds": feeds})
+
+
 def measured_feeds(sc: variables.Scorer, tx, chosen: list[dict], draws: int) -> None:
     """Each ordered pair's claim (feeds or apart) by the feeds test on the search split (scored both ways, the better
     kept); a variable feeding no other feeds the prediction."""
     js = lambda feeds: [as_json(v["name"], v["_inputs"], v["_group"], feeds(v)) for v in chosen]  # noqa: E731
     names = [v["name"] for v in chosen]
-    every = sc.score(tx, variables.parse(js(lambda v: [w for w in names if w != v["name"]]), sc.nat.C), "search", draws)["feeds"]
-    release(sc.nat.dev)
-    none = sc.score(tx, variables.parse(js(lambda v: []), sc.nat.C), "search", draws)["feeds"]
-    release(sc.nat.dev)
+    every = together(sc, tx, variables.parse(js(lambda v: [w for w in names if w != v["name"]]), sc.nat.C), "search", draws)["feeds"]
+    none = together(sc, tx, variables.parse(js(lambda v: []), sc.nat.C), "search", draws)["feeds"]
     apart = {(x["from"], x["to"]): x["f"] for x in none}
     for v in chosen:
         v["feeds"] = sorted(x["to"] for x in every if x["from"] == v["name"] and x["f"] is not None
@@ -336,8 +356,7 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         # draws, which the choice never saw
         vs = variables.parse(out["variables"], nat.C)
         for split, key in (("search", "together"), ("eval", "eval")):
-            got = variables.Scorer(ge).score(tx, vs, split=split, draws=draws)
-            release(nat.dev)
+            got = together(variables.Scorer(ge), tx, vs, split, draws)
             out["teacher"][key] = {k: got[k] for k in ("e4", "f_on", "s_off", "f_comp", "f_feeds", "f_apart", "unresolved")}
             for v, r in zip(out["variables"], got["variables"]):
                 v["measured"][split] = {"term": term(r), "f_on": r["f_on"], "s_off": r["s_off"]}

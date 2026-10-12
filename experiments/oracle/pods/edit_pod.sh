@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Edit questions (#2951 graph oracle, method/oracle/edit_eval.py) on one rented GPU: the goals of the first N held-out
-# texts (edit_eval.py goals), the edit teacher, the native-unit search and VPD's top-k on each goal (P processes sharing
+# Edit questions (#2951 graph oracle, method/oracle/edit_eval.py) on one rented GPU: the goals of the first N texts of
+# SPLIT (default heldout) (edit_eval.py goals), the edit teacher, the native-unit search and VPD's top-k on each goal (P processes sharing
 # the GPU, edit_eval.py teach --offset/--stride), and the persistent copy goal (edit_eval.py copy) beside them. The
 # Python is method/oracle and method/vpd at origin/main as rp-run unpacks them; texts/vpd4l and the held-out teacher
 # circuits go up as compressed tars, the Pile rows (edit_eval.py tokens) and the copy set as files (where rp-run puts them); VPD's checkpoint
@@ -9,17 +9,17 @@
 # FROM=DIR (an earlier run's out directory): its goals and finished teach rows go up first, and the goals done there
 # are skipped.
 # ONLY="1 2" runs those of the P processes alone; COPY=0 leaves out the copy goal, TEACH=0 the held-out goals.
-#   experiments/oracle/pods/edit_pod.sh [NAME] [HOURS]      env: N, P, FROM, ONLY, COPY, TEACH, GPU, PRICE
+#   experiments/oracle/pods/edit_pod.sh [NAME] [HOURS]      env: N, SPLIT, P, FROM, ONLY, COPY, TEACH, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
 NAME=${1:-oracle-graph-edit} H=${2:-2}
-N=${N:-20} P=${P:-3}
+N=${N:-20} P=${P:-3} SPLIT=${SPLIT:-heldout}
 O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME V=/Users/user/mpd-data/vpd G=/Users/user/mpd-data/graph_oracle
 F=/Users/user/mpd-data/scratch/rustmove/edit/pod
 mkdir -p "$F"
 COPYFILE_DISABLE=1 tar -czf "$F/texts.tgz" -C $G texts/vpd4l
-COPYFILE_DISABLE=1 tar -czf "$F/teacher.tgz" -C $G teacher/joint_heldout
+COPYFILE_DISABLE=1 tar -czf "$F/teacher.tgz" -C $G teacher/joint_$SPLIT
 CP="(python -B edit_eval.py copy $O/out/copy.json > $O/copy.log 2>&1; echo \"exit \$?\" >> $O/copy.log) &"
 [ "${COPY:-1}" = 0 ] && CP=""
 PRIOR=""
@@ -44,7 +44,7 @@ python -c \"import torch; from safetensors.torch import load_file; d = {**load_f
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 python -B -m pytest -q test_edit_eval.py > $O/test.log 2>&1 || echo STAGE tests FAILED;
-$PRIOR [ -s $O/out/goals.jsonl ] || python -B edit_eval.py goals $O/out/goals.jsonl --split heldout --n $N > $O/goals.log 2>&1;
+$PRIOR [ -s $O/out/goals.jsonl ] || python -B edit_eval.py goals $O/out/goals.jsonl --split $SPLIT --n $N > $O/goals.log 2>&1;
 set +e; $CP $RUNS wait;
 cat $ROWS > $O/out/teach.jsonl; python -B edit_eval.py table $O/out/teach.jsonl $O/out/copy.json > $O/out/table.txt 2>&1; echo all stages done"
 RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=20 RP_MIN_RAM_GB=32 RP_DISK_GB=48 \

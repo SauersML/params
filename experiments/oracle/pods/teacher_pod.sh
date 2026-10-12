@@ -87,11 +87,12 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 $PRE
 cd /Users/user/params/method/oracle; $LOC
 set +e; $RUNS wait; echo all teacher processes done"
-  (  # community stock comes and goes: a launch that finds no card in stock is retried every 3 minutes for WAIT minutes
+  (  # community stock comes and goes: a launch that finds no card in stock, or a host whose download of the published
+     # inputs came out corrupted, is retried every 3 minutes for WAIT minutes
     for try in $(seq 1 $(( ${WAIT:-180} / 3 ))); do
       env ${REF:+RP_REF=$REF} RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=${RAM:-16} \
         experiments/infra/runpod/rp-run $NAME "$GPU" "$H" -- bash -c "$CMD" > "$F/rp_$j.log" 2>&1 && break
-      tail -2 "$F/rp_$j.log" | grep -q "in stock on a working host" || break
+      grep -qE "in stock on a working host|differs from its sha256" "$F/rp_$j.log" || break
       cat "$F/rp_$j.log" >> "$F/rp_$j.nostock.log"; sleep 180
     done ) &
   names+=("$NAME")

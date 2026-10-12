@@ -22,7 +22,8 @@ the circuit held the context).
 4. Feeds: a circuit's stated connections (a node of V writing into a node of W, or into the prediction). In the VPD
    pool, which states none, each ordered pair takes the claim (feeds or apart) its measured feeds test favours, and a
    variable feeding no other one feeds the prediction. The chosen variables are then scored together (composition
-   and feeds, the model-world headline e4).
+   and feeds, the model-world headline e4) on the search split and on the eval split, whose draws the choice never
+   saw (the held-out number).
 5. Output: per text {"variables": [{"name", "meaning": "", "inputs", "group": [[matrix, index, position], ...],
    "feeds": [variables or "prediction"], "measured": {...}, with --classes "classes": var_classes.classes per input
    position}], "teacher": {...}} (primerl's interface), the names
@@ -259,16 +260,22 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
     out = {"variables": [as_json(v["name"], v["_inputs"], v["_group"], v["feeds"], v["measured"]) for v in chosen],
            "teacher": {"pool": pool, "nodes": len(nodes), "positions": positions, "candidates": len(rows), "best": best,
                        "bar": bar, "top": [{k: r[k] for k in r if k != "group"} | {"size": len(r["group"])} for r in rows[:16]]}}
-    if chosen:  # the chosen variables together: compositions and feeds
-        got = variables.Scorer(ge).score(tx, variables.parse(out["variables"], nat.C), split="search", draws=draws)
-        out["teacher"]["together"] = {k: got[k] for k in ("e4", "f_on", "s_off", "f_comp", "f_feeds", "f_apart", "unresolved")}
+    if chosen:  # the chosen variables together (compositions and feeds), on the search split and on the eval split's
+        # draws, which the choice never saw
+        vs = variables.parse(out["variables"], nat.C)
+        for split, key in (("search", "together"), ("eval", "eval")):
+            got = variables.Scorer(ge).score(tx, vs, split=split, draws=draws)
+            out["teacher"][key] = {k: got[k] for k in ("e4", "f_on", "s_off", "f_comp", "f_feeds", "f_apart", "unresolved")}
+            for v, r in zip(out["variables"], got["variables"]):
+                v["measured"][split] = {"term": term(r), "f_on": r["f_on"], "s_off": r["s_off"]}
     if classes:  # which tokens each variable tells apart at each of its inputs (var_classes.py), for the writer
         import var_classes
 
         for v, pv in zip(out["variables"], variables.parse(out["variables"], nat.C)):
             v["classes"] = [var_classes.classes(sc, tx, pv, q, task["model"]) for q in pv["inputs"]]
     out["teacher"]["seconds"] = time.time() - t0
-    log(f"{task['id']}: {len(chosen)} variables kept (bar {bar:.3f}), together {out['teacher'].get('together')}, {time.time() - t0:.0f} s")
+    log(f"{task['id']}: {len(chosen)} variables kept (bar {bar:.3f}), together {out['teacher'].get('together')}, eval "
+        f"{out['teacher'].get('eval')}, {time.time() - t0:.0f} s")
     return out
 
 

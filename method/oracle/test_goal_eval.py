@@ -738,3 +738,19 @@ def test_fidelity_table_groups():
              "f1_adv_random": 1.0, "c": 1.0}]
     text = goal_eval.fidelity_table(rows)
     assert "trivial" in text and "local" in text and "adv@20" in text and " 0.500 " in text and "VPD top k" in text
+
+
+def test_pattern_pool_is_ci_per_position(tiny, tmp_path, monkeypatch):
+    nat, ge, tx = tiny
+    task = tmp_path / "tiny0.json"
+    task.write_text("{}")
+    monkeypatch.setattr(native, "text", lambda p: (tx.ids, tx.targets))
+    pool = goal_eval.build_patterns([task, task], tmp_path / "pool.pt", nat)
+    ci = nat.importance(tx.ids)
+    assert len(pool["sources"]) == 2 * tx.T
+    for k in (0, 3, tx.T + 5):
+        got = goal_eval.pattern(pool, k)
+        t = k % tx.T
+        for n in nat.names:
+            want = (ci[n][t] > 0).nonzero().flatten().cpu()
+            assert torch.equal(got.get(n, torch.zeros(0, dtype=torch.long)), want), (k, n)

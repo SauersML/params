@@ -1343,21 +1343,26 @@ def build_patterns(texts: list[Path], out: Path, nat: native.Native | None = Non
     "site": int16 index into names, "c": int32, "offsets": int64 [patterns + 1]}, a pattern's (site, c) pairs between
     consecutive offsets."""
     nat = nat or native.Native()
-    sites, cols, offsets, sources = [], [], [0], []
+    sites, cols, counts, sources = [], [], [], []
     with torch.no_grad():
         for p in texts:
             ids, _ = native.text(p)
             ci = nat.importance(ids)
-            for t in range(len(ids)):
-                for i, n in enumerate(nat.names):
-                    c = (ci[n][t] > 0).nonzero().flatten().to(torch.int32).cpu()
-                    sites.append(torch.full((len(c),), i, dtype=torch.int16))
-                    cols.append(c)
-                offsets.append(offsets[-1] + sum(len(x) for x in cols[len(cols) - len(nat.names):]))
-                sources.append((p.stem, t))
+            ts, ss, cs = [], [], []
+            for i, n in enumerate(nat.names):
+                t, c = (ci[n] > 0).nonzero(as_tuple=True)
+                ts.append(t.cpu())
+                ss.append(torch.full((len(t),), i, dtype=torch.int16))
+                cs.append(c.cpu().to(torch.int32))
+            t, site, c = torch.cat(ts), torch.cat(ss), torch.cat(cs)
+            order = torch.argsort(t * len(nat.names) + site.long(), stable=True)  # by position, then site
+            sites.append(site[order])
+            cols.append(c[order])
+            counts.append(torch.bincount(t, minlength=len(ids)))
+            sources += [(p.stem, i) for i in range(len(ids))]
             native.free(nat.dev)
-    pool = {"names": list(nat.names), "sources": sources, "site": torch.cat(sites), "c": torch.cat(cols),
-            "offsets": torch.tensor(offsets, dtype=torch.int64)}
+    offsets = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cat(counts).cumsum(0)])
+    pool = {"names": list(nat.names), "sources": sources, "site": torch.cat(sites), "c": torch.cat(cols), "offsets": offsets}
     torch.save(pool, out)
     return pool
 

@@ -14,21 +14,26 @@ Runs use VPD's semantics: a run "with circuit C" has C's subcomponents on (mask 
 remainders W - V U either on ("live", computing on the run's own inputs) or off; both conventions are reported. Every
 KL is the model's next-token distribution at the targets (summed over them) from the run's, in bits. VPD's own answer
 is the set of subcomponents with causal importance above zero on the input (at positions that can reach the targets,
-Native.reachable); the empty circuit and it bound every answer:
-  recovered = (KL_empty - KL_C) / (KL_empty - KL_VPD), completeness = min(1, recovered / GOAL)
+Native.reachable); the empty circuit and it bound every answer, on a log scale (KL_empty is ~100 bits, so a linear
+scale gives circuits 0.5 and 2.5 bits from the model both about 0.98):
+  F1 = clip(ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD), 0, 1)
+  N = clip(ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD), 0, 1), "VPD minus C" VPD's own answer with the
+      circuit's subcomponents off: how much of what VPD's answer computes needs the circuit.
 
-Reward fields, on the text:
-  F1: KL_C, recovered and completeness, with KL_empty and KL_VPD (VPD's own faithfulness on the text, the ceiling),
-     and recovered_log, the same in orders of magnitude of KL (recovered_log()).
-  N, necessity: clip((KL_{VPD minus C} - KL_VPD) / (KL_empty - KL_VPD), 0, 1), "VPD minus C" VPD's own answer with the
-     circuit's subcomponents off: how much of what VPD's answer computes needs the circuit.
+Reward fields, on the text (per remainder convention X, live or off):
+  f1_X and n_X as above, beside KL_C (kl_X), KL_empty, KL_VPD (VPD's own faithfulness on the text, the ceiling) and
+     KL_{VPD minus C}; the linear forms are diagnostics: recovered_X = (KL_empty - KL_C) / (KL_empty - KL_VPD),
+     completeness_X = min(1, recovered / GOAL), necessity_X = clip((KL_{VPD minus C} - KL_VPD) / (KL_empty - KL_VPD),
+     0, 1), and recovered_log_X, the unclipped F1.
   F3, edges: in the circuit's run (remainders off), each stated edge cut (path patching of that one connection: the
      reader reads every input but that writer's output; native.Native.run's edge strengths) against random pairs of
      the circuit's nodes that the model connects and the answer does not state, each cut's effect the KL of the
      circuit's run from the cut run; F3 is the probability that a stated cut moves the prediction more than an
      unstated one (AUC), and 0 when the answer states no edge or leaves no connected pair unstated (an answer earns
-     edge credit only by saying which connections matter).
-  size: the description length of the nodes and edges in bits (native.Graph.bits).
+     edge credit only by saying which connections matter). A listed embedding node's edges are cut the same way (the
+     reader reads its input without the token's embedding) and its unstated readers join the unstated pairs.
+  size: the description length of the nodes and edges in bits (native.Graph.bits; with embedding nodes, size_bits:
+     each one a choice among the positions, its edges priced like any other).
   E1 (the English reader's bits) and E2 (question-answering accuracy): hooks (GoalEval.hooks) that the RL owner fills.
 Diagnostics (score(diagnostics=True)), not reward fields: F1 on the text's changed prompts (Native.changes) and F2 on
 the held-out alternatives (carry.alternatives, ranks 3 to 5) at each position whose changed token moves the prediction
@@ -137,13 +142,14 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
     g = native.Graph([nd for nd in nodes if nd is not None and nd[0] != "tok"], {r: list(dict.fromkeys(ws)) for r, ws in parents.items()},
                      list(dict.fromkeys(out)))
     g.tok_edges = list(dict.fromkeys(tok))
+    g.tok_positions = sorted({nd[1] for nd in nodes if nd is not None and nd[0] == "tok"})
     return g, {"invalid_nodes": bad_nodes, "invalid_edges": bad_edges}
 
 
 def to_json(g: native.Graph, explanation: str = "") -> dict:
     """A Graph (not complete) as an answer in JSON (circuit's format)."""
     tok = getattr(g, "tok_edges", [])
-    nodes = sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2])) + [("tok", p, 0) for p in sorted({p for p, _ in tok})]
+    nodes = sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2])) + [("tok", p, 0) for p in sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in tok})]
     at = {nd: i for i, nd in enumerate(nodes)}
     edges = ([[at[w], at[r]] for r, ws in g.parents.items() for w in ws] + [[at[w], "out"] for w in g.out]
              + [[at[("tok", p, 0)], at[r]] for p, r in tok])
@@ -155,6 +161,27 @@ def _pairs(g: native.Graph) -> list[tuple]:
     a set, whose order changes from process to process)."""
     return sorted([(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out],
                   key=lambda e: (e[0], e[1] or ("", -1, -1)))
+
+
+def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list[int]) -> float:
+    """native.Graph.bits with the answer's embedding nodes: each a choice among the positions, and every edge's ends
+    indexed among all the listed nodes (embedding nodes included), an embedding edge priced like any other."""
+    pos = sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in getattr(g, "tok_edges", [])})
+    if not pos:
+        return g.bits(positions, subcomponents, targets)
+    n, k = g.count(), len(pos)
+    inner, out = native.implied_edges(g.node_set(), targets) if g.complete else (sum(len(w) for w in g.parents.values()), len(g.out))
+    return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(n + k) * (2 * (inner + len(g.tok_edges)) + out)
+
+
+def _tok_pairs(g: native.Graph) -> tuple[list, list]:
+    """(the answer's stated embedding edges, the unstated ones: a listed embedding node into a residual reader among
+    the nodes at its position), as (("tok", position, 0), reader) pairs."""
+    stated = [(("tok", p, 0), r) for p, r in getattr(g, "tok_edges", [])]
+    have = set(stated)
+    unstated = [(("tok", p, 0), r) for p in getattr(g, "tok_positions", []) for r in sorted(g.nodes)
+                if r[1] == p and native._name_layer_kind(r[0])[1] in mech.RESID_READERS and (("tok", p, 0), r) not in have]
+    return stated, unstated
 
 
 def _from(ids: list[int], p: int) -> list | None:
@@ -190,6 +217,16 @@ def recovered_log(empty: float, c: float, vpd: float) -> float | None:
     at 1e-9 bits."""
     e, c, v = (max(x, 1e-9) for x in (empty, c, vpd))
     return math.log(e / c) / math.log(e / v) if e > v else None
+
+
+def necessity_log(empty: float, minus: float, vpd: float) -> float | None:
+    """clip(ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD), 0, 1); KLs floored at 1e-9 bits."""
+    e, m, v = (max(x, 1e-9) for x in (empty, minus, vpd))
+    return min(1.0, max(0.0, math.log(m / v) / math.log(e / v))) if e > v else None
+
+
+def _clip01(x: float | None) -> float | None:
+    return None if x is None else min(1.0, max(0.0, x))
 
 
 def necessity(empty: float, minus: float, vpd: float) -> float | None:
@@ -343,13 +380,14 @@ class GoalEval:
             for b, row in enumerate(rows):
                 c = kl[b]
                 r = recovered(e, c, v) if v is not None else None
-                row.update({f"kl_{conv}": c, f"kl_empty_{conv}": e, f"kl_vpd_{conv}": v, f"recovered_{conv}": r,
-                            f"completeness_{conv}": completeness(r), f"recovered_log_{conv}": recovered_log(e, c, v) if v is not None else None})
+                rl = recovered_log(e, c, v) if v is not None else None
+                row.update({f"kl_{conv}": c, f"kl_empty_{conv}": e, f"kl_vpd_{conv}": v, f"f1_{conv}": _clip01(rl),
+                            f"recovered_log_{conv}": rl, f"recovered_{conv}": r, f"completeness_{conv}": completeness(r)})
                 if v is not None:
                     m = kl[len(graphs) + b]
-                    row.update({f"kl_vpd_minus_{conv}": m, f"necessity_{conv}": necessity(e, m, v)})
+                    row.update({f"kl_vpd_minus_{conv}": m, f"n_{conv}": necessity_log(e, m, v), f"necessity_{conv}": necessity(e, m, v)})
                 else:
-                    row.update({f"kl_vpd_minus_{conv}": None, f"necessity_{conv}": None})
+                    row.update({f"kl_vpd_minus_{conv}": None, f"n_{conv}": None, f"necessity_{conv}": None})
         return rows
 
     # ---- F3
@@ -373,7 +411,7 @@ class GoalEval:
             return {**one, "B": B, "G": {n: m.expand(B, -1, -1) for n, m in one["G"].items()},
                     "complete": one["complete"].expand(B, -1, -1)}, states
 
-        ctx = {"make": make, "ablation": zero, "ref": ref, "flow": self._flow(tx.ids, rec, states, masks), "rec": rec}
+        ctx = {"make": make, "ablation": zero, "ref": ref, "flow": self._flow(tx.ids, rec, states, masks), "rec": rec, "ids": tx.ids}
         return [d["kl"] for d in self._patched(tx, ctx, pairs)]
 
     def edges(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
@@ -385,11 +423,12 @@ class GoalEval:
             if g.complete:
                 out.append({"f3": None, "stated": None, "unstated": None})
                 continue
-            stated = _pairs(g)
+            tok_stated, tok_unstated = _tok_pairs(g)
+            stated = _pairs(g) + tok_stated
             nodes = g.node_set()
             par, outs = native.all_edges(nodes, tx.targets)
             have = set(stated)
-            unstated = [e for e in _pairs(native.Graph(nodes, par, outs)) if e not in have]
+            unstated = [e for e in _pairs(native.Graph(nodes, par, outs)) if e not in have] + tok_unstated
             rng = np.random.default_rng([tx.seed, int(hashlib.sha256(repr(stated).encode()).hexdigest()[:15], 16)])
             if len(stated) > self.max_edges:
                 stated = [stated[i] for i in sorted(rng.choice(len(stated), self.max_edges, replace=False))]
@@ -417,7 +456,7 @@ class GoalEval:
         todo = [e for e in dict.fromkeys(pairs) if e not in tx.cut_cache]
         if todo:
             ctx = {"make": lambda B: (nat._full_plan(tx.T, B), nat._model_states(tx.ids, B)), "ablation": nat._one(),
-                   "ref": tx.ref, "flow": self.flow(tx), "rec": tx.rec}
+                   "ref": tx.ref, "flow": self.flow(tx), "rec": tx.rec, "ids": tx.ids}
             for e, d in zip(todo, self._patched(tx, ctx, todo)):
                 tx.cut_cache[e] = d
         return [tx.cut_cache[e] if detail else tx.cut_cache[e]["kl"] for e in pairs]
@@ -527,7 +566,8 @@ class GoalEval:
         [len(pairs)]: a query, key, value or MLP input reads the residual stream at its position without the writer's
         output (then its norm); an attention output reads its layer's attention output without the writer value's
         share, the pattern's weight from the reader's position to the writer's in each head times the value's output;
-        an MLP output its MLP's pre-activation without the input's output (then the nonlinearity)."""
+        an MLP output its MLP's pre-activation without the input's output (then the nonlinearity). A writer ("tok", p,
+        0) is the token's embedding at p."""
         import vpd_model
 
         nat, tg = self.nat, self.nat.target
@@ -537,7 +577,10 @@ class GoalEval:
         for wn in {w[0] for w, _ in pairs}:
             js = [j for j, (w, _) in enumerate(pairs) if w[0] == wn]
             t, c = nat._ints([[pairs[j][0][1] for j in js], [pairs[j][0][2] for j in js]])
-            wv = rec[wn][0, t, c][:, None] * tg.site(wn).U[c]
+            if wn == "tok":  # the token's embedding at its position
+                wv = tg.wte[torch.tensor([ctx["ids"][p] for p in t.tolist()], device=nat.dev)]
+            else:
+                wv = rec[wn][0, t, c][:, None] * tg.site(wn).U[c]
             for k, j in enumerate(js):
                 writes[j] = wv[k]
         out = torch.empty(n, device=nat.dev)
@@ -657,7 +700,7 @@ class GoalEval:
         for b, (g, row) in enumerate(zip(graphs, rows)):
             st, un = f3[b]["stated"], f3[b]["unstated"]
             row.update({"nodes": g.count(), "edges": None if g.complete else g.edges(), "tok_edges": len(getattr(g, "tok_edges", [])),
-                        "bits": g.bits(nat.positions(tx.targets), total, tx.targets),
+                        "bits": size_bits(g, nat.positions(tx.targets), total, tx.targets),
                         "f3": f3[b]["f3"], "f3_stated": _mean(st) if st else None, "f3_unstated": _mean(un) if un else None,
                         "f3_cuts": {"stated": st, "unstated": un}})
             for name, fn in self.hooks.items():
@@ -709,10 +752,10 @@ def load_answer(path: Path, task: dict, targets: list[int], nat: native.Native) 
 
 
 COLUMNS = [("nodes", "nodes", "{:.0f}"), ("edges", "edges", "{:.0f}"), ("bits", "size bits", "{:.0f}"),
-           ("kl_live", "KL live", "{:.3g}"), ("recovered_live", "recov live", "{:.3f}"), ("completeness_live", "compl live", "{:.3f}"),
-           ("recovered_log_live", "log recov live", "{:.3f}"),
-           ("necessity_live", "N live", "{:.3f}"), ("kl_off", "KL off", "{:.3g}"), ("recovered_off", "recov off", "{:.3f}"),
-           ("necessity_off", "N off", "{:.3f}"), ("kl_vpd_live", "KL VPD live", "{:.3g}"), ("f3", "F3", "{:.3f}"),
+           ("kl_live", "KL live", "{:.3g}"), ("f1_live", "F1 live", "{:.3f}"), ("n_live", "N live", "{:.3f}"),
+           ("kl_off", "KL off", "{:.3g}"), ("f1_off", "F1 off", "{:.3f}"), ("n_off", "N off", "{:.3f}"),
+           ("recovered_live", "lin recov live", "{:.3f}"), ("necessity_live", "lin N live", "{:.3f}"),
+           ("kl_vpd_live", "KL VPD live", "{:.3g}"), ("f3", "F3", "{:.3f}"),
            ("f3_stated", "F3 stated", "{:.3g}"), ("f3_unstated", "F3 unstated", "{:.3g}"),
            ("E1", "E1", "{:.3g}"), ("E2", "E2", "{:.3f}"),
            ("changed_recovered_live", "chg recov live", "{:.3f}"), ("f2_recovered_live", "F2 recov live", "{:.3f}"),
@@ -744,7 +787,7 @@ def score_sets(sets: dict, split: str, n: int, ge: GoalEval | None = None, basel
     """Every answer set (name -> directory) on the same texts: the split's first n that any set answers. A set without
     a valid answer on a text gets an invalid row there (counted in its coverage, never skipped). The headline row of a
     set is each text's first sample; with several samples, "NAME best of N (upper bound)" is each text's sample with
-    the highest recovered_live. Baselines at each valid answer's size -> one results dict per set."""
+    the highest f1_live. Baselines at each valid answer's size -> one results dict per set."""
     ge = ge or GoalEval()
     nat = ge.nat
     results = {s: {"set": s, "rows": {s: [], "empty": [], "vpd@matched": [], "vpd": []}} for s in sets}
@@ -780,15 +823,15 @@ def score_sets(sets: dict, split: str, n: int, ge: GoalEval | None = None, basel
             results[s]["rows"][s].append(first[0] if first else {"task": p.stem, "valid": False, "missing": True})
             ok = [r for r, _ in samples[s] if r["valid"]]
             if len(samples[s]) > 1:
-                best[s].append(max(ok, key=lambda r: r.get("recovered_live") if r.get("recovered_live") is not None else -math.inf)
+                best[s].append(max(ok, key=lambda r: r.get("f1_live") if r.get("f1_live") is not None else -math.inf)
                                if ok else {"task": p.stem, "valid": False})
             for k in ("empty", "vpd"):
                 if k in by:
                     results[s]["rows"][k].append({**by[k], "task": p.stem})
             if first and first[0]["valid"] and f"vpd@{first[1].count()}" in by:
                 results[s]["rows"]["vpd@matched"].append({**by[f"vpd@{first[1].count()}"], "task": p.stem})
-        done = [f"{s} recovered {r['recovered_live']:.2f}/{r['recovered_off']:.2f}" for s in sets
-                for r in [results[s]["rows"][s][-1]] if r.get("valid") and r.get("recovered_live") is not None and r.get("recovered_off") is not None]
+        done = [f"{s} F1 {r['f1_live']:.2f}/{r['f1_off']:.2f}" for s in sets
+                for r in [results[s]["rows"][s][-1]] if r.get("valid") and r.get("f1_live") is not None and r.get("f1_off") is not None]
         log(f"{p.stem}: {', '.join(done) or 'no valid answer'}" + (f", {rows[0]['seconds_text']:.1f} s" if rows else ""))
     for s in sets:
         if best[s]:

@@ -89,6 +89,8 @@ def naive(nat, ids, replace=None, on=None, live=True, cut=None):
     st = {"a": {}, "x_attn": [], "x_mlp": [], "P": [], "att": [], "pre": []}
 
     def write(nd):
+        if nd[0] == "tok":  # the token's embedding at its position
+            return tg.wte[ids[nd[1]]]
         a = st["a"][nd[0]][nd[1], nd[2]]
         m = 1.0 if on is None else float(on[nd[0]][nd[1], nd[2]])
         return a * m * tg.site(nd[0]).U[nd[2]]
@@ -217,6 +219,8 @@ def test_bounds_and_exact_endpoints(tiny):
     rows = ge.sufficiency(tx, [every, vpd, empty])
     assert abs(rows[0]["kl_live"]) < 1e-5
     assert abs(rows[1]["recovered_live"] - 1) < 1e-6 and abs(rows[1]["recovered_off"] - 1) < 1e-6
+    assert abs(rows[1]["f1_live"] - 1) < 1e-6 and abs(rows[1]["n_off"] - 1) < 1e-6
+    assert rows[2]["f1_live"] == 0.0 and rows[2]["n_live"] == 0.0
     assert abs(rows[1]["necessity_live"] - 1) < 1e-6 and abs(rows[2]["necessity_live"]) < 1e-6
     assert abs(rows[2]["recovered_live"]) < 1e-6 and abs(rows[2]["recovered_off"]) < 1e-6
     full, _ = naive(nat, tx.ids)
@@ -238,6 +242,8 @@ def test_necessity_is_vpd_without_the_circuit(tiny):
         assert abs(row[f"kl_vpd_minus_{conv}"] - want) < 1e-4
         e, v = row[f"kl_empty_{conv}"], row[f"kl_vpd_{conv}"]
         assert row[f"necessity_{conv}"] == goal_eval.necessity(e, row[f"kl_vpd_minus_{conv}"], v)
+        assert row[f"n_{conv}"] == goal_eval.necessity_log(e, row[f"kl_vpd_minus_{conv}"], v)
+        assert row[f"f1_{conv}"] == min(1.0, max(0.0, goal_eval.recovered_log(e, row[f"kl_{conv}"], v)))
 
 
 def test_edge_effects_match_an_independent_forward(tiny):
@@ -477,6 +483,42 @@ def test_real_texts(real, task):
         for (w, r), k in zip(pairs, ge.edge_effects(tx, g, pairs)):
             want = _kl(base_logits, naive(nat, tx.ids, on=on, live=False, cut=(w, r))[0], tx.targets)
             assert abs(k - want) < 1e-4 + 2e-3 * abs(want), (w, r, k, want)
+
+
+def test_log_scales():
+    assert goal_eval.necessity_log(100.0, 0.5, 0.5) == 0.0 and goal_eval.necessity_log(100.0, 100.0, 0.5) == 1.0
+    assert abs(goal_eval.necessity_log(100.0, 10.0, 1.0) - 0.5) < 1e-12 and goal_eval.necessity_log(100.0, 0.1, 1.0) == 0.0
+
+
+def test_embedding_edges_priced_and_cut(tiny):
+    """An embedding node is a choice among positions, its edges priced like any other; its stated edges are cut in
+    F3 (the reader without the token's embedding) against its unstated readers, checked against naive()."""
+    nat, ge, tx = tiny
+    p = 4
+    nodes = [("h.0.attn.q_proj", p, 1), ("h.0.attn.k_proj", p, 2), ("h.1.mlp.c_fc", p, 3), ("h.0.attn.o_proj", p, 0),
+             ("h.1.attn.v_proj", 7, 2)]
+    answer = {"nodes": [[n, c, t] for n, t, c in nodes] + [["tok", 0, p]],
+              "edges": [[5, 0], [5, 2], [3, 2]]}
+    g, d = goal_eval.circuit(answer, tx.targets, nat.C, tx.T)
+    assert d == {"invalid_nodes": 0, "invalid_edges": 0} and g.tok_positions == [p] and len(g.tok_edges) == 2
+    P, S = nat.positions(tx.targets), sum(nat.C.values())
+    want = 5 * math.log2(P * S) + math.log2(P) + math.log2(6) * (2 * (1 + 2) + 0)
+    assert abs(goal_eval.size_bits(g, P, S, tx.targets) - want) < 1e-9
+    assert goal_eval.size_bits(native.Graph(g.nodes, g.parents, g.out), P, S, tx.targets) == native.Graph(g.nodes, g.parents, g.out).bits(P, S, tx.targets)
+    stated, unstated = goal_eval._tok_pairs(g)
+    assert [r for _, r in stated] == [nodes[0], nodes[2]] and [r for _, r in unstated] == [nodes[1]]
+    on = mask_of(nat, tx.T, g.nodes)
+    base, _ = naive(nat, tx.ids, on=on, live=False)
+    for (w, r), k in zip(stated + unstated, ge.edge_effects(tx, g, stated + unstated)):
+        want = _kl(base, naive(nat, tx.ids, on=on, live=False, cut=(w, r))[0], tx.targets)
+        assert abs(k - want) < 1e-4 + 1e-3 * abs(want), (w, r, k, want)
+    f3 = ge.edges(tx, [g])[0]
+    assert len(f3["stated"]) == 3 and f3["f3"] is not None
+    # the whole model's cut of the embedding into a reader
+    w, r = stated[0]
+    full, st = naive(nat, tx.ids)
+    new = vpd_model.rms(st["x_attn"][0][p] - nat.target.wte[tx.ids[p]], nat.target.norms[0], nat.target.eps) @ nat.target.site(r[0]).V[:, r[2]]
+    assert abs(ge.cuts(tx, [(w, r)])[0] - _kl(full, naive(nat, tx.ids, {r: new})[0], tx.targets)) < 1e-4
 
 
 def test_recovered_log():

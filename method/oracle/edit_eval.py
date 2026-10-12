@@ -8,7 +8,8 @@ Goals (goals(): one text's, drawn by the text's seed; seed + 1 gives a fresh dra
   detach     make the prediction not depend on the token at an earlier position (one of goal_eval's F2 positions, whose
              changed token moves the prediction by at least 1% of the text's total)
   behaviour  stop copying, on every text: the copy-mistake set (COPY: confident wrong copies of an earlier continuation,
-             Pile val rows 9400-9599) split in a first half for the search and a second half for the score
+             Pile val rows 9400-9599) split in a first half for the search (its first COPY_SEARCH) and a second half for
+             the score
 
 Edits (Editor): the model's own forward pass with each matrix W as its subcomponents V U plus its remainder W - V U, and
   scale n k     subcomponent n's activation at its position times k; persistent: at every position, the weight edit
@@ -88,8 +89,10 @@ SCORE_RANKS, SEARCH_RANKS = (3, 4, 5), (0, 1, 2)  # detach's alternative tokens 
 RAISE_RANKS = (1, 2, 3, 4)  # raise's token: the model's second to fifth most likely at the target (0-based ranks)
 SCALE_BITS = 16  # a scale factor other than 0, as a half-precision number
 FORM_BITS = 2  # an operation's form: cut or scale, local or persistent
-CHUNK = 16  # edited runs of a whole text per batch (more when they start later)
+CHUNK = 16  # edited runs of 512 positions per batch (more when they compute fewer positions)
+MAX_ROWS = 1024  # edited runs per batch at most
 BLOCK = 256  # edits scored at once
+COPY_SEARCH = 32  # the copy search's instances (the first of the copy set's first half)
 POSITIONS = 1024  # positions per block of vocabulary-sized arrays
 MAX_OPS = 16  # the search's largest edit
 SCREEN = 256  # the search's candidates after its first round: the most helpful of that round
@@ -515,9 +518,9 @@ class EditEval:
             rows.sort()
             ids = torch.tensor([sq], device=self.nat.dev)
             r0 = 0
-            while r0 < len(rows):  # chunk rows of the whole length; more when the batch starts later
+            while r0 < len(rows):  # about chunk x 512 positions per batch: more rows when they start later
                 s = rows[r0][0]
-                part = rows[r0:r0 + self.chunk * min(32, max(1, len(sq) // max(1, len(sq) - s)))]
+                part = rows[r0:r0 + max(1, min(MAX_ROWS, self.chunk * 512 // max(1, len(sq) - s)))]
                 r0 += len(part)
                 eds = [edits[i] for _, i in part] + ([[]] if ref else [])
                 hid = self.ed.hidden(ids.expand(len(eds), -1), eds, start=s)
@@ -547,8 +550,10 @@ class EditEval:
         b = torch.log_softmax(lq.masked_fill(~keep, -float("inf")), -1)
         return (a.exp() * (a - b)).masked_fill(~keep, 0).sum(-1) / LN2
 
-    def _text_terms(self, ids: list[int], targets: list[int], named: list[int], edits: list[list[dict]], tok: int | None) -> list:
-        """Per edit on the text: (collateral summed over the text, the target's _margin for tok or None)."""
+    def _text_terms(self, ids: list[int], targets: list[int], named: list[int], edits: list[list[dict]], tok: int | None,
+                    keep: bool = False) -> list:
+        """Per edit on the text: (collateral summed over the text, the target's _margin for tok or None, and with keep
+        its log q at the target [V])."""
         t = max(targets)
 
         def fn(lq, idx, s, lp):
@@ -556,7 +561,7 @@ class EditEval:
             tt = [x - s for x in targets]
             coll = (kl.sum(1) - kl[:, tt].sum(1) + sum(self._kept_kl(lp[x], lq[:, x], named) for x in tt)).tolist()
             ms = _margin(lq[:, t - s], tok).tolist() if tok is not None else [None] * len(coll)
-            return list(zip(coll, ms))
+            return list(zip(coll, ms, list(lq[:, t - s].clone()) if keep else [None] * len(coll)))
         return self._runs([ids] * len(edits), edits, fn, ref=True)
 
     def _held_terms(self, which: str, edits: list[list[dict]]) -> list[float]:
@@ -577,16 +582,18 @@ class EditEval:
             out[b] += k / len(texts)
         return out
 
-    def _dependence(self, ids: list[int], alts: list[list[int]], t: int, edits: list[list[dict]]) -> list[float]:
-        """Per edit, the target's mean KL in bits from the edited text to the edited text with the position changed."""
+    def _dependence(self, ids: list[int], alts: list[list[int]], t: int, edits: list[list[dict]], text: list) -> list[float]:
+        """Per edit, the target's mean KL in bits from the edited text (text: its log q at the target, per edit) to the
+        edited text with the position changed."""
         seqs, eds = [], []
         for ops in edits:
-            for sq in [ids] + alts:
+            for sq in alts:
                 seqs.append(sq)
                 eds.append(ops)
         lq = self._runs(seqs, eds, lambda lq, idx, s, lp: list(lq[:, t - s].clone()))
-        k = 1 + len(alts)
-        return [float(sum(self._kl(lq[j * k], lq[j * k + 1 + a]) for a in range(len(alts))) / len(alts)) for j in range(len(edits))]
+        k = len(alts)
+        p = torch.stack(text)  # [n, V]
+        return (self._kl(p[:, None], torch.stack(lq).view(len(edits), k, -1)).mean(1)).tolist()
 
     # scores
 
@@ -609,23 +616,24 @@ class EditEval:
         lp = self.reference(ids)
         t = max(targets)
         named = [goal["token_id"]] if goal["kind"] in ("flip", "raise") else []
-        terms = self._text_terms(ids, targets, named, eds, goal.get("token_id") if goal["kind"] in ("flip", "raise") else None)
+        terms = self._text_terms(ids, targets, named, eds, goal.get("token_id") if goal["kind"] in ("flip", "raise") else None,
+                                 keep=goal["kind"] == "detach")
         held = self._held_terms("search" if search else "held", eds)
         if goal["kind"] in ("flip", "raise"):
             sign = 1.0 if goal["kind"] == "flip" else -1.0
             m0 = float(sign * _margin(lp[t], goal["token_id"]))
             prog = []
-            for _, m in terms:
+            for _, m, _ in terms:
                 m = sign * m
                 prog.append((min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, m < 0, m))
         else:  # detach
             alts = self.alternatives(ids, goal["position"], SEARCH_RANKS if search else SCORE_RANKS)
-            d0 = self._dependence(ids, alts, t, [[]])[0]
+            d0 = self._dependence(ids, alts, t, [[]], [lp[t]])[0]
             scale = math.log2(1 / (1 - GOAL))
             prog = [(min(1.0, max(0.0, math.log2(d0 / max(d, 1e-12)) / scale)) if d0 > 0 else 1.0, d <= (1 - GOAL) * d0, d)
-                    for d in self._dependence(ids, alts, t, eds)]
+                    for d in self._dependence(ids, alts, t, eds, [x[2] for x in terms])]
         key = self.key(task["id"], goal)
-        for b, (coll, _), h, (g, att, raw) in zip(ok, terms, held, prog):
+        for b, (coll, _, _), h, (g, att, raw) in zip(ok, terms, held, prog):
             best = max(self.best.get(key, 0.0), g)
             rows[b].update({"valid": True, "attained": bool(att), "progress": g, "success": g / best if best > 0 else 0.0,
                             "collateral": coll + h, "collateral_text": coll, "collateral_held": h,
@@ -639,7 +647,7 @@ class EditEval:
         """The behaviour goal on the copy set's second half (search: its first half): per instance the flip progress on
         the copied token; collateral = the held texts' mean summed KL + the instances' mean summed kept KL."""
         first, second = copy_instances()
-        half = first if search else second
+        half = first[:COPY_SEARCH] if search else second
         T = max(len(c["ids"]) for c in half)
         rows = [{"valid": False, "why": check(ops, T, [T - 1], behaviour=True), "size": size_bits(self.nat, ops, T)} for ops in edits]
         ok = [b for b, r in enumerate(rows) if r["why"] is None]
@@ -980,12 +988,13 @@ def main():
                 print(task["id"], flush=True)
     elif args.cmd == "teach":
         rows = [json.loads(x) for x in Path(args.goals).read_text().splitlines() if x.strip()]
-        done = set()
-        if Path(args.out).exists():
-            done = {(r["task"], EditEval.key(r["task"], r["goal"])) for r in map(json.loads, Path(args.out).read_text().splitlines())}
+        done = set()  # the goals any teach_*.jsonl beside OUT holds; the rest are split between the processes
+        for p in sorted(Path(args.out).parent.glob("teach_*.jsonl")):
+            done |= {EditEval.key(r["task"], r["goal"]) for r in map(json.loads, p.read_text().splitlines()) if r}
+        rows = [r for r in rows if EditEval.key(r["task"], r["goal"]) not in done]
         tasks = {}
         for i, r in enumerate(rows):
-            if i % args.stride != args.offset or (r["task"], EditEval.key(r["task"], r["goal"])) in done:
+            if i % args.stride != args.offset:
                 continue
             if r["task"] not in tasks:
                 tasks = {r["task"]: json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())}

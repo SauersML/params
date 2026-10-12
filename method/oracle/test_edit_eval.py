@@ -223,3 +223,24 @@ def test_search_reaches_a_flip(tiny):
     for i in range(len(res["ops"])):  # every edit is needed
         rest = res["ops"][:i] + res["ops"][i + 1:]
         assert not rest or not ee.score(task, flip, rest)["attained"]
+
+
+def test_detach_dependence(tiny):
+    """detach: the dependence is the target's mean KL from the edited text to the edited text with the position's
+    token changed (the score's held-out alternatives), and progress is its log drop from the unedited dependence."""
+    nat, ids, targets = tiny
+    ee = edit_eval.EditEval(nat)
+    task = {"id": "tiny", "prompts": [{"token_ids": ids, "target_positions": targets}]}
+    goal = {"kind": "detach", "position": 6, "target": 11}
+    alts = ee.alternatives(ids, 6, edit_eval.SCORE_RANKS)
+    ops = [edit_eval.cut_op(("h.1.attn.o_proj", 11, c), ("h.1.attn.v_proj", 6, v)) for c in range(4) for v in range(4)]
+
+    def dep(o):
+        a = run(nat, ids, o)[11]
+        return sum(kl_at(a[None], run(nat, x, o)[11][None], 0) for x in alts) / len(alts)
+    d0, d = dep([]), dep(ops)
+    r = ee.score(task, goal, ops)
+    assert abs(r["dependence"] - d) < 1e-4 + 1e-3 * d
+    want = min(1.0, max(0.0, math.log2(d0 / d) / math.log2(1 / (1 - edit_eval.GOAL))))
+    assert abs(r["progress"] - want) < 1e-3
+    assert r["attained"] == (d <= (1 - edit_eval.GOAL) * d0)

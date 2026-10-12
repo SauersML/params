@@ -59,12 +59,18 @@ tar -xzf $F/in.tgz -C ~/gate_in; mv ~/gate_in/texts ~/mpd-data/graph_oracle/;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd > /dev/null;
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
+big=\$(( \$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1) >= 44000 ));
 set +e; (python -B goal_eval.py score --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --split heldout --n $N --diagnostics --out $O/score.json > $O/score.log 2>&1) &
-for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --vpd $F/vpd.pt --offset \$k --stride ${FIDP:-2} --out $O/fid_\$k.jsonl > $O/fid_\$k.log 2>&1) & done; wait"
-# the score run and FIDP fidelity runs share one card: fidelity on a 264-node circuit holds ~16 GB, the score run ~8 GB
-# (two fidelity runs and the score run overflowed 24 GB; three and the score run 16 GB): a 48 GB card
-RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.60} RP_MIN_VRAM_GB=44 RP_MIN_RAM_GB=16 \
-  experiments/infra/runpod/rp-run $RN "${SCORE_GPU:-NVIDIA RTX A6000,NVIDIA A40,NVIDIA L40S,NVIDIA RTX 6000 Ada Generation}" 3.0 -- bash -c "$CMD" > "$F/rp_score.log" 2>&1
+[ \$big = 1 ] || wait;
+for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --vpd $F/vpd.pt --offset \$k --stride ${FIDP:-2} --out $O/fid_\$k.jsonl > $O/fid_\$k.log 2>&1) & [ \$big = 1 ] || wait; done; wait"
+# fidelity on a 264-node circuit holds ~16 GB, the score run ~8 GB: on a 48 GB card they run side by side, on a 24 GB
+# card one after another (two fidelity runs and the score run overflowed 24 GB); no card in stock is retried every 3 min
+for try in $(seq 1 40); do
+  RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.60} RP_MIN_VRAM_GB=24 RP_MIN_RAM_GB=16 \
+    experiments/infra/runpod/rp-run $RN "${SCORE_GPU:-NVIDIA RTX A6000,NVIDIA A40,NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090}" 3.0 -- bash -c "$CMD" > "$F/rp_score.log" 2>&1 && break
+  grep -qE "in stock on a working host|differs from its sha256" "$F/rp_score.log" || break
+  sleep 180
+done
 [ -s "$O/score.json" ] || { echo "no scores: $O/score.log, $F/rp_score.log"; exit 1; }
 { cat "$G/README.txt" 2> /dev/null; echo "scored at $(sed -nE 's/.* source ([0-9a-f]+):.*/\1/p' "$O/rp-run.log" | tail -1) (goal_eval score and fidelity; both arms at this commit)"; /usr/bin/python3 -I experiments/oracle/teacher_gate.py "$O/score.json" a b --teacher "${dirs[0]}" "${dirs[1]}" --fidelity $(for k in $(seq 0 $(( ${FIDP:-2} - 1 ))); do printf '%s ' "$O/fid_$k.jsonl"; done); } | tee "$O/gate.txt"
 exit

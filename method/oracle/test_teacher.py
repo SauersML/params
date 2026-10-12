@@ -5,7 +5,8 @@ CUDA, and the products on the start set's subcomponents alone (Pruner._gather) w
 (Pruner.fused) match the products on all subcomponents with vpd_model's own steps within float32 rounding,
 EdgePruner's runs are the scorecard's (goal_eval.GoalEval.graph_kl: with every connection the masked run), and a
 teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, one
-over the answer budget steps to a smaller path point, and the flip repair writes pick()'s step.
+over the answer budget steps to a smaller path point, the flip repair writes pick()'s step, and the robust connection
+objective keeps F1 under the flips at its floor.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -145,3 +146,18 @@ def test_repair_writes_its_pick():
     # the written circuit is pick()'s among the repair's steps, each step one more round of the omitted lever's flips
     assert row["repair_pick"] == j and len(nodes) == steps[j]["size"] and len(circuits[""]["edges"]) == steps[j]["edges"]
     assert all(b["size"] > a["size"] for a, b in zip(steps, steps[1:]))
+
+
+@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
+def test_robust_connections_keep_their_floor():
+    if not VPD_SAVED.exists() or not teacher.POOL.exists():
+        pytest.skip("needs VPD's answers and the adversary's pool " + str(teacher.POOL))
+    ge = goal_eval.GoalEval(native.Native(DEVICE), chunk=32)
+    ids, targets = native.text(native.TEXTS / "vpd4l" / "text9019.json")
+    saved = torch.load(VPD_SAVED)["text9019"]
+    _, row, path_file = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True,
+                                      robust_pool=torch.load(teacher.POOL))
+    steps = path_file["edge_paths"][0]["steps"]
+    floor = min(teacher.RECOVERED, steps[0]["f1_flips"])
+    # every removal kept F1 under the flips at the floor, and the summary carries the last one's
+    assert all(s["f1_flips"] >= floor for s in steps[1:]) and row["best_edges"]["f1_flips"] == steps[-1]["f1_flips"]

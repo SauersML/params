@@ -48,6 +48,11 @@ Per text:
   Step 4 picks among the path points of at most --max-nodes nodes (MAX_NODES, the answer budget in nodes); with
   --max-tokens, when the teacher circuit's answer (components.render) is longer than that in the explainer's
   tokenizer, the next smaller path point with its connections instead, until it fits.
+  With --edge-objective robust, a connection removal is also admitted only while F1 under REPAIR_M of the omitted
+  lever's flips (goal_eval.adversary_flips on the stated graph, the shared adversary) stays >= min(0.9, with every
+  connection): connection pruning on graph F1 alone left the greedy circuits at F1 0.42 under one flip where every
+  connection held 0.80 (inframove's table on a362911). The flips are checked only on the prefixes within the F1
+  budget, the largest first (ACCEPT_BATCH a call), the largest admitted taken.
   6. With --repair (and --edges), the flip repair after the pick: goal_eval.adversary_flips' omitted lever at REPAIR_M
      (the VPD actives the circuit leaves out, at most 4 switched on, the shared adversary's) on the stated graph; its
      flips join the circuit and the connections are pruned again, while min(graph F1, node F1, F1 under the flips)
@@ -99,6 +104,7 @@ MAX_NODES = 266       # the answer budget in nodes: components.ANSWER_BUDGET (3,
                       # 1.5 connections per node at 3.0 tokens each (primerl's measurements with Qwen3-8B's tokenizer)
 LEVELS = ("position", "site", "chunk64", "chunk16", "chunk4", "subcomponent")  # blocks, coarse to fine
 REPAIR_M = 4          # the omitted lever's budget the flip repair answers (goal_eval.adversary_flips; the reward's term)
+ACCEPT_BATCH = 8      # Descent.prune's accept checks per call: the largest prefixes within the budget first
 POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # the shared adversary's pool (search side)
 
 
@@ -125,13 +131,15 @@ class Descent:
     def kl(self, on: torch.Tensor | None = None) -> float:
         return self.kl_sets((self.on if on is None else on)[None])[0]
 
-    def prune(self, level: str, budget: float, rounds: int = ROUNDS, log: list | None = None) -> int:
+    def prune(self, level: str, budget: float, rounds: int = ROUNDS, log: list | None = None, accept=None) -> int:
         """Rounds of measured block removal at one level; returns the rounds run. Within the budget a round removes
-        the most of the ranked blocks that keep KL_C <= budget; above it (a start such as VPD's answer at the targets
-        alone can be farther than the budget while a subset is not: subcomponents cancel) it removes the prefix of the
-        ranked blocks with the lowest measured KL_C, when that is lower than the circuit's. The blocks are ranked by
-        kl_rank; the prefixes are measured by kl_sets. log, a list, receives each round's {"removed": unit ids, "kl":
-        the KL measured after it}."""
+        the most of the ranked blocks that keep KL_C <= budget (and, with accept, that accept admits: accept(ons [K,
+        units]) -> per set a dict, admitted, or None; asked for the largest such prefixes first, ACCEPT_BATCH a call,
+        until one is admitted); above it (a start such as VPD's answer at the targets alone can be farther than the
+        budget while a subset is not: subcomponents cancel) it removes the prefix of the ranked blocks with the lowest
+        measured KL_C, when that is lower than the circuit's. The blocks are ranked by kl_rank; the prefixes are
+        measured by kl_sets. log, a list, receives each round's {"removed": unit ids, "kl": the KL measured after it}
+        and accept's dict."""
         for r in range(rounds):
             blocks = self.blocks(level)
             if len(blocks) <= 1:
@@ -141,13 +149,26 @@ class Descent:
             sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ranked) - 1]
             if (single <= budget).any():
                 ok = [(k, x) for k, x in zip(sizes, self.without([torch.cat(ranked[:k]) for k in sizes])) if x <= budget]
+                info = {}
+                if accept is not None and ok:                # the largest admitted, checked from the largest down
+                    order, ok = sorted(ok, reverse=True), []
+                    for s0 in range(0, len(order), ACCEPT_BATCH):
+                        part = order[s0:s0 + ACCEPT_BATCH]
+                        ons = self.on[None].repeat(len(part), 1)
+                        for i, (k, _) in enumerate(part):
+                            ons[i, torch.cat(ranked[:k])] = False
+                        got = accept(ons)
+                        hit = next((i for i, g in enumerate(got) if g is not None), None)
+                        if hit is not None:
+                            ok, info = [part[hit]], got[hit]
+                            break
                 if not ok:
                     return r
                 k, x = max(ok)
                 drop = torch.cat(ranked[:k])
                 self.on[drop] = False
                 if log is not None:
-                    log.append({"removed": drop.tolist(), "kl": x})
+                    log.append({"removed": drop.tolist(), "kl": x, **info})
                 continue
             current = self.kl()
             if current <= budget or float(single.min()) >= current:
@@ -431,19 +452,20 @@ def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> lis
     return path
 
 
-def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",)) -> list[dict]:
+def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",), accept=None) -> list[dict]:
     """A circuit's connections removed by Descent.prune's rounds from ep.on (every connection, unless the caller set
-    fewer; step 1's rule with its budget), at each of `levels` in turn (EdgePruner.blocks: "writer", "reader", single
-    connections; coarse levels first cut the rounds' measured sets on circuits of hundreds of nodes); row(kl, on,
-    removed) records each state, the first the start's."""
+    fewer; step 1's rule with its budget, and accept's admission if given), at each of `levels` in turn
+    (EdgePruner.blocks: "writer", "reader", single connections; coarse levels first cut the rounds' measured sets on
+    circuits of hundreds of nodes); row(kl, on, removed) records each state, the first the start's, with accept's
+    dict."""
     log = []
     first, on = ep.kl(), ep.on.clone()
     for level in levels:
-        ep.prune(level, budget, log=log)
+        ep.prune(level, budget, log=log, accept=accept)
     steps = [row(first, on.clone(), [])]
     for x in log:
         on[x["removed"]] = False
-        steps.append(row(x["kl"], on.clone(), x["removed"]))
+        steps.append({**row(x["kl"], on.clone(), x["removed"]), **{k: v for k, v in x.items() if k not in ("removed", "kl")}})
     return steps
 
 
@@ -451,8 +473,10 @@ class Connector:
     """A text's connection pruning (edge_path) and flip repair for node sets of its answer (pr.nodes, bool [N] sets),
     with the text's bounds, F1 budget and size term (size_term(on, inner, out))."""
 
-    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: Pruner, empty: float, vpd: float, size_term, B: int = 32):
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: Pruner, empty: float, vpd: float, size_term, B: int = 32,
+                 robust: dict | None = None):
         self.ge, self.tx, self.pr, self.empty, self.vpd, self.size_term, self.B = ge, tx, pr, empty, vpd, size_term, B
+        self.robust = robust      # the adversary's pool: connection removals also keep F1 under the omitted lever's flips
         self.budget = empty ** (1 - RECOVERED) * vpd ** RECOVERED
         self.index = {nd: i for i, nd in enumerate(pr.nodes)}
 
@@ -465,15 +489,29 @@ class Connector:
             fresh = {pr.nodes[j] for j in new}
             ep.on = torch.tensor([e in keep or e[0] in fresh or e[1] in fresh for e in ep.edges], device=ep.on.device)
         size = int(on.sum())
+        accept, start = None, {}
+        if self.robust is not None:                          # the robust objective: F1 under REPAIR_M flips of the stated
+            def flips(ons):                                  # graph kept >= min(0.9, the start's), checked on admissible
+                graphs = [self.graph(on, [e for e, k_ in zip(ep.edges, row.tolist()) if k_]) for row in ons]   # prefixes only
+                got = self.ge.adversary_flips(self.tx, graphs, self.robust, "omitted", ms=(REPAIR_M,))
+                return [1.0 if g["f1_flips_omitted"].get(REPAIR_M) is None else g["f1_flips_omitted"][REPAIR_M] for g in got]
+            start = {"f1_flips": flips(ep.on[None])[0]}
+            floor = min(RECOVERED, start["f1_flips"])
+
+            def accept(ons):
+                return [{"f1_flips": f} if f >= floor else None for f in flips(ons)]
 
         def state(kl, e_on, removed):
             f1 = goal_eval._clip01(goal_eval.recovered_log(empty, kl, vpd))
             st = self.size_term(on, int(e_on[:ep.inner].sum()), int(e_on[ep.inner:].sum()))
             return {"nodes": size, "edges": int(e_on.sum()), "removed": removed, "kl_graph": kl, "f1_graph": f1,
                     "n": n, "size_term": st, "reward": (f1 + n) / TERMS - SIZE_WEIGHT * st}
-        steps = edge_path(ep, self.budget, state)
+        steps = edge_path(ep, self.budget, state, accept=accept)
+        steps[0].update(start)
         summary = {**{k_: steps[-1][k_] for k_ in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term", "reward")},
                    "all_edges": len(ep.edges), "sets": ep.measured}
+        if start:                                            # the last admitted step's F1 under the flips (the start's if none)
+            summary["f1_flips"] = next(s_["f1_flips"] for s_ in reversed(steps) if "f1_flips" in s_)
         print(f"  connections at {size} subcomponents: {summary['edges']} of {len(ep.edges)}, graph F1 {summary['f1_graph']:.3f} "
               f"(start {steps[0]['f1_graph']:.3f}), N {n:.3f}, {ep.measured} sets", flush=True)
         return [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_], summary, steps, ep
@@ -541,7 +579,8 @@ def pick(rows: list[dict], f1: str, goal: float = RECOVERED, cap: int | None = N
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
           vpd_order: list | None = None, start_top: int = 0, f1_start: str = "both", edges: bool = False,
           from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
-          max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False) -> tuple[dict, dict]:
+          max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
+          robust_pool: dict | None = None) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -656,7 +695,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     points = {min(range(len(path)), key=lambda j: abs(path[j]["size"] - want)) for want in SIZES}
     wired, edge_paths, t2 = {}, [], time.perf_counter()     # node step -> (its last edge step's connections, its row)
 
-    wiring = Connector(ge, tx, pr, empty, vpd, size_term, B)
+    wiring = Connector(ge, tx, pr, empty, vpd, size_term, B, robust=robust_pool)
 
     def wire(i):
         if i not in wired:
@@ -739,6 +778,9 @@ def main():
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
+    ap.add_argument("--edge-objective", choices=("graph", "robust"), default="graph",
+                    help="with --edges, connection removals keep graph F1 >= 0.9 (graph), and also F1 under REPAIR_M of the omitted "
+                         "lever's flips >= min(0.9, every connection's) (robust: goal_eval.adversary_flips, pool POOL)")
     ap.add_argument("--vpd-edges", action="store_true", help="with --edges, also VPD's top k at the teacher circuit's node count k with "
                     "its connections by the same search: <task>.vpd_top<k>.edges.json")
     ap.add_argument("--repair", action="store_true", help="with --edges, the flip repair after the pick (goal_eval.adversary_flips' "
@@ -781,7 +823,7 @@ def main():
             r = json.loads(line)
             labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
-    repair_pool = torch.load(POOL) if args.repair else None
+    pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" else None
     for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
             continue
@@ -797,8 +839,8 @@ def main():
         ids, targets = native.text(path)
         saved = vpd.get(path.stem, {})
         circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
-                                         args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens, repair_pool,
-                                         args.vpd_edges)
+                                         args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
+                                         pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

@@ -211,6 +211,13 @@ class Engine:
         one = not isinstance(graphs, (list, tuple))
         graphs = [graphs] if one else list(graphs)
         cuts = [cuts] if one else (list(cuts) if cuts is not None else [None] * len(graphs))
+        keys = [(id(g), id(c)) for g, c in zip(graphs, cuts)]
+        if not one and len(set(keys)) < len(keys):  # a graph given more than once (with the same cuts): each planned
+            single = {}                              # once, the rows' plans laid end to end (_stack)
+            for g, c, k in zip(graphs, cuts, keys):
+                if k not in single:
+                    single[k] = (len(single), self.plan(g, semantics, c))
+            return self._stack([p for _, p in single.values()], [single[k][0] for k in keys])
         if semantics == "native" and any(g.complete for g in graphs):
             raise ValueError("native.run's graph runs need stated connections (a complete graph is a masked run: kl)")
         dev, inv = self.dev, {}
@@ -271,6 +278,55 @@ class Engine:
                            "qk": {n: btc(sorted(v)) for n, v in qk.items()}, "nodes": {n: btc(sorted(v)) for n, v in nodes.items()},
                            "readers": {n: btc(list(rows)) for n, rows in readers.items()}, "writers": {n: btc(list(rows)) for n, rows in writers.items()},
                            "edges": {k: conn(v) for k, v in edges.items()}, "out": {k: conn(v) for k, v in outs.items()}})
+
+    def _stack(self, ps: list, rows: list) -> dict:
+        """One-graph plans ps as the plan of the list naming ps[rows[b]] in row b: row b's entries after row b - 1's, its
+        rows at each site after the earlier rows', its connections' strength indices after theirs (plan's own order:
+        the same runs; an unstated connection, strength 0, indexes its own graph's first strength instead of the
+        list's). One concatenation per table."""
+        dev, B = self.dev, len(rows)
+        ints = lambda v: torch.tensor(v, dtype=torch.long, device=dev)  # noqa: E731
+
+        def keys(name):  # the tables' keys in the order the rows first name them
+            out = {}
+            for k in rows:
+                out.update(dict.fromkeys(ps[k][name]))
+            return list(out)
+
+        def before(name):  # per key, each row's count of its entries and the entries of the rows before it
+            out = {}
+            for n in keys(name):
+                cnt = [len(ps[k][name][n][0]) if n in ps[k][name] else 0 for k in rows]
+                start = [0]
+                for c in cnt[:-1]:
+                    start.append(start[-1] + c)
+                out[n] = (cnt, start)
+            return out
+
+        def pieces(name, n, i):  # entry field i of key n, every row's in order
+            return torch.cat([ps[k][name][n][i] for k in rows if n in ps[k][name]])
+
+        def spread(vals, cnt):  # each row's value repeated over its entries
+            return torch.repeat_interleave(ints(vals), ints(cnt))
+
+        out = {"B": B, "E": sum(ps[k]["E"] for k in rows), "O": sum(ps[k]["O"] for k in rows), "semantics": ps[rows[0]]["semantics"]}
+        at = {}
+        for name in ("qk", "nodes", "readers", "writers"):
+            at[name] = before(name)
+            out[name] = {n: (spread(list(range(B)), cnt), pieces(name, n, 1), pieces(name, n, 2)) for n, (cnt, _) in at[name].items()}
+        e0, o0 = [0], [0]
+        for k in rows[:-1]:
+            e0.append(e0[-1] + ps[k]["E"])
+            o0.append(o0[-1] + ps[k]["O"])
+        out["edges"], out["out"] = {}, {}
+        for (rn, wn), (cnt, _) in before("edges").items():
+            out["edges"][(rn, wn)] = (pieces("edges", (rn, wn), 0) + spread(at["readers"][rn][1], cnt),
+                                      pieces("edges", (rn, wn), 1) + spread(at["writers"][wn][1], cnt),
+                                      pieces("edges", (rn, wn), 2) + spread(e0, cnt), pieces("edges", (rn, wn), 3))
+        for wn, (cnt, _) in before("out").items():
+            out["out"][wn] = (spread(list(range(B)), cnt), pieces("out", wn, 1), pieces("out", wn, 2) + spread(at["writers"][wn][1], cnt),
+                              pieces("out", wn, 3) + spread(o0, cnt), pieces("out", wn, 4))
+        return _positions(out)
 
     def _rows(self, p: dict, B: int) -> dict:
         """A one-graph plan's tables for B rows (kept on the plan), row b's entries after row b - 1's."""

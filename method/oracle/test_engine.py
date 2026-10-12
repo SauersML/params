@@ -249,6 +249,43 @@ def test_graph_lists():
         assert float((x - y).norm() / x.norm().clamp_min(1e-30)) < REL
 
 
+def test_repeated_graphs_plan_as_their_list():
+    """A list naming graphs more than once (Engine._stack of each one's plan) is the list planned row by row (each row
+    its own graph object): every table equal (an unstated connection's strength index aside: its strength is 0), in
+    both semantics and with one cuts object repeated, and the same KL and gradients in u and the strengths (within
+    float32 rounding: the same plan run twice differs in the last bits on MPS, its scatter-adds unordered)."""
+    import copy
+
+    nat, ids, targets, graph, _, _, u = graph_case(B=5)
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[::2])
+    eng = engine.Engine(nat, ids, targets, live=True)
+    cut = {r: ws[:1] for r, ws in list(graph.parents.items())[:2]}
+    for semantics, rows, cuts in (("native", [graph, half, graph, graph, half], None),
+                                  ("c", [half, half, graph, half, graph], None), ("c", [half] * 5, [cut] * 5)):
+        a = eng.plan(rows, semantics=semantics, cuts=cuts)
+        b = eng.plan([copy.copy(g) for g in rows], semantics=semantics, cuts=None if cuts is None else [dict(c) for c in cuts])
+        assert (a["B"], a["E"], a["O"]) == (b["B"], b["E"], b["O"])
+        for k in ("qk", "nodes", "readers", "writers", "edges", "out", "positions"):
+            assert list(a[k]) == list(b[k]), (semantics, k)
+            for n in b[k]:
+                x, y = list(a[k][n]), list(b[k][n])
+                if k in ("edges", "out"):  # the strength index where the strength is fixed at 0
+                    j = 2 if k == "edges" else 3
+                    x[j], y[j] = x[j] * (x[-1] > 0), y[j] * (y[-1] > 0)
+                assert all(torch.equal(p, q) for p, q in zip(x, y)), (semantics, k, n)
+        g = torch.Generator().manual_seed(4)
+        ew, ow = torch.rand(a["E"], generator=g).to(nat.dev), torch.rand(a["O"], generator=g).to(nat.dev)
+        got = []
+        for plan in (a, b):
+            x = [ew.clone().requires_grad_(True), ow.clone().requires_grad_(True), {n: m.clone().requires_grad_(True) for n, m in u.items()}]
+            kl = eng.graph_kl(plan, x[2], x[0], x[1])
+            kl.sum().backward()
+            got.append([kl.detach(), x[0].grad, x[1].grad] + [x[2][n].grad for n in nat.names])
+        assert rel(got[1][0], got[0][0]) < REL
+        for x, y in zip(got[1][1:], got[0][1:]):
+            assert float((x - y).norm() / x.norm().clamp_min(1e-30)) < REL, semantics
+
+
 def test_c_semantics_equal_graph_ref():
     """C's semantics (plan(semantics="c")) equal goal_eval.GoalEval.graph_ref, the forward pass written out, on a graph
     stating half of its connections, with the gradients in u; a stated connection at strength 0 is the graph without it."""

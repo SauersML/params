@@ -1708,11 +1708,11 @@ class GoalEval:
         return out, pad
 
     def far_donors(self, tx: Text, pool: list, k: int = DONORS_FAR) -> list:
-        """k of pool's texts (token id lists) for donor resampling, drawn by the text's seed, those at least as long
-        as the text first (a shorter one leaves the text's first positions unresampled)."""
+        """k of pool's texts ((name, token ids) pairs) for donor resampling, drawn by the text's seed, those at least as
+        long as the text first (a shorter one leaves the text's first positions unresampled)."""
         rng = np.random.default_rng([int(tx.seed), 11])
-        order = [pool[i] for i in rng.permutation(len(pool)) if list(pool[i]) != list(tx.ids)]
-        return ([x for x in order if len(x) >= tx.T] + sorted((x for x in order if len(x) < tx.T), key=len, reverse=True))[:k]
+        order = [pool[i] for i in rng.permutation(len(pool)) if list(pool[i][1]) != list(tx.ids)]
+        return ([x for x in order if len(x[1]) >= tx.T] + sorted((x for x in order if len(x[1]) < tx.T), key=lambda x: len(x[1]), reverse=True))[:k]
 
     @torch.no_grad()
     def donors(self, tx: Text, graphs: list[native.Graph], split: str = "eval", near: int = DONORS_NEAR,
@@ -1726,15 +1726,18 @@ class GoalEval:
         every subcomponent at the donor's (KL_0), not the empty circuit's KL: a near donor differs from the text at one
         position, so against KL_empty (~100 bits) every circuit would score near 1. Per circuit and pool:
         s_donor_<pool> = clip(ln(KL_0 / KL_C) / ln(KL_0 / KL_VPD), 0, 1) on the mean KLs; s_donor_<pool>_worst, the
-        lowest donor's (a donor where VPD's answer is no nearer than KL_0 left out); kl_donor_<pool> (KL_C, KL_VPD,
-        KL_0); donors_<pool> (how many). The flip adversary's in-distribution counterpart: a circuit that holds
-        here but not under the flips is charged there for combinations no real text makes."""
+        lowest donor's (a donor where VPD's answer is no nearer than KL_0 left out); s_donor_<pool>_p90, the donor at
+        the 90th percentile from the best (the 10th percentile of the donors' scores); kl_donor_<pool> (KL_C, KL_VPD,
+        KL_0); donors_<pool> (how many); draws_donor_<pool>, every donor's [name, KL_C, KL_VPD, KL_0, score]. Every
+        draw is the KL from the model's own output on the text, never a loss against the text's next token: it is never
+        negative, so a circuit's errors on different donors add up instead of cancelling (Scheurer et al. 2023, causal
+        scrubbing's pitfalls). The flip adversary's in-distribution counterpart: a circuit that holds here but not
+        under the flips is charged there for combinations no real text makes."""
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
         graphs = [strand(g, tx.targets, nat.C) for g in graphs]
-        e0 = self._bounds(tx, "live")[0]
-        texts = {}
+        texts = {}  # pool -> [(name, token ids)]: near named [position, token], far by its text
         if near:
             moved = np.asarray(tx.moved, dtype=float)
             positions = [p for p, _ in tx.f2]
@@ -1742,9 +1745,9 @@ class GoalEval:
                          if positions else []):
                 x = list(tx.ids)
                 x[p] = z
-                texts.setdefault("near", []).append(x)
+                texts.setdefault("near", []).append(([p, z], x))
         if far:
-            texts["far"] = [list(x) for x in far if list(x) != list(tx.ids)]
+            texts["far"] = [(name, list(x)) for name, x in far if list(x) != list(tx.ids)]
         E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=None)
         u = {n: torch.ones(1, 1, nat.C[n], device=dev) for n in nat.names}
         sides = list(graphs) + [native.Graph(masks=tx.vpd), native.Graph()]  # the circuits, VPD's answer, nothing kept
@@ -1757,7 +1760,7 @@ class GoalEval:
             kls = []  # per donor [len(sides)]
             for d0 in range(0, len(xs), max(1, rows // len(sides))):
                 chunk = xs[d0:d0 + max(1, rows // len(sides))]
-                acts = [self.donor_activations(x, T) for x in chunk]
+                acts = [self.donor_activations(x, T) for _, x in chunk]
                 B = len(chunk) * len(sides)
                 patch = {}
                 for n in nat.names:
@@ -1775,12 +1778,14 @@ class GoalEval:
             kv, k0 = [k[-2] for k in kls], [k[-1] for k in kls]
             for b in range(len(graphs)):
                 kc = [k[b] for k in kls]
-                each = [_fid(z, c, v) for z, c, v in zip(k0, kc, kv)]
-                each = [x for x in each if x is not None]
+                per = [_fid(z, c, v) for z, c, v in zip(k0, kc, kv)]
+                each = [x for x in per if x is not None]
                 out[b].update({f"s_donor_{pool}": _fid(float(np.mean(k0)), float(np.mean(kc)), float(np.mean(kv))) if kc else None,
                                f"s_donor_{pool}_worst": min(each) if each else None,
+                               f"s_donor_{pool}_p90": float(np.percentile(each, 10)) if each else None,
                                f"kl_donor_{pool}": (float(np.mean(kc)), float(np.mean(kv)), float(np.mean(k0))) if kc else None,
-                               f"donors_{pool}": len(kc)})
+                               f"donors_{pool}": len(kc),
+                               f"draws_donor_{pool}": [[name, c, v, z, sd] for (name, _), c, v, z, sd in zip(xs, kc, kv, k0, per)]})
         return out
 
     def interchange_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16) -> list[dict]:
@@ -2610,7 +2615,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                         local[r["task"]] = r["local"]
     done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
     tasks = native.tasks(split)
-    far = [native.text(tasks[i])[0] for i in DONOR_TEXTS if i < len(tasks)] if "donors" in only else []
+    far = [(tasks[i].stem, native.text(tasks[i])[0]) for i in DONOR_TEXTS if i < len(tasks)] if "donors" in only else []
     rows = []
     for p in native.tasks(split)[:n][offset::stride]:
         have = {name: Path(d) / f"{p.stem}.json" for name, d in sets.items() if (Path(d) / f"{p.stem}.json").exists()}
@@ -2731,7 +2736,9 @@ def fidelity_table(rows: list[dict]) -> str:
     held += [("N_real", lambda r: r.get("n_real")), ("N_real ceiling", lambda r: r.get("n_real_ceiling")),
              ("act/inact cos", lambda r: r.get("cancel_cosine")), ("C", lambda r: r.get("c")),
              ("donor near", lambda r: r.get("s_donor_near")), ("donor near worst", lambda r: r.get("s_donor_near_worst")),
-             ("donor far", lambda r: r.get("s_donor_far")), ("donor far worst", lambda r: r.get("s_donor_far_worst")),
+             ("donor near p90", lambda r: r.get("s_donor_near_p90")),
+             ("donor far", lambda r: r.get("s_donor_far")), ("donor far p90", lambda r: r.get("s_donor_far_p90")),
+             ("donor far worst", lambda r: r.get("s_donor_far_worst")),
              ("tracks changes", lambda r: r.get("s_track")), ("changed inputs", lambda r: r.get("s_changed")),
              ("context share", lambda r: r.get("context_share"))]
     nflips = sorted({int(m) for r in rows for m in r.get("n_real_flips", {}) if int(m) > 0})

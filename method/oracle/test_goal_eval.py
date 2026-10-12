@@ -9,6 +9,7 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -1316,8 +1317,8 @@ def test_donor_resampling(tiny):
     g = torch.Generator().manual_seed(9)
     donor = torch.randint(0, 40, (tx.T,), generator=g).tolist()
     short = donor[4:]
-    rows = ge.donors(tx, [whole, stated], near=0, far=[donor])
-    alone = ge.donors(tx, [whole], near=0, far=[short])[0]
+    rows = ge.donors(tx, [whole, stated], near=0, far=[("d", donor)])
+    alone = ge.donors(tx, [whole], near=0, far=[("s", short)])[0]
     full, _ = naive(nat, tx.ids)
     acts = naive(nat, donor)[1]["a"]
     sacts = naive(nat, short)[1]["a"]
@@ -1338,6 +1339,11 @@ def test_donor_resampling(tiny):
     kc, kv, k0 = rows[0]["kl_donor_far"]
     assert abs(k0 - w0) < 1e-4 + 1e-4 * w0  # the bound: every subcomponent at the donor's
     assert rows[0]["s_donor_far"] == goal_eval._fid(k0, kc, kv) and rows[0]["donors_far"] == 1
+    assert rows[0]["draws_donor_far"] == [["d", kc, kv, k0, goal_eval._fid(k0, kc, kv)]]  # every draw's KLs kept
+    two = ge.donors(tx, [whole], near=0, far=[("d", donor), ("s", short)])[0]
+    each = [d[4] for d in two["draws_donor_far"] if d[4] is not None]
+    assert all(d[1] >= 0 for d in two["draws_donor_far"])  # KL to the model's own output: never negative
+    assert two["s_donor_far_worst"] == min(each) and abs(two["s_donor_far_p90"] - float(np.percentile(each, 10))) < 1e-12
     near = ge.donors(tx, [whole], near=4)[0]
     assert near["donors_near"] == len(ge.changed_inputs(tx, [whole], "eval", 4)[0]["draws_changed"])
 

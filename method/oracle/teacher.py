@@ -23,26 +23,28 @@ Per text:
      VPD's answer without it), ranks them by the mean of F1 and N they leave, measures removing the first 1, 2, 4, ...
      of them up to a tenth of the circuit and takes the prefix with the highest measured mean, down to 4 subcomponents. Every step is recorded (size, F1, N, KL_C, KL_{VPD minus C}, positions, the subcomponents
      removed) beside VPD's own top-k at the same size.
-  4. The teacher circuit is the path point with the largest (F1 + N) / 5 - 0.5 size, the reward's weighting of its two
-     measured terms (components.target_score; F3, E1 and E2 are not measured here), size the nodes' description bits
-     (with a token-embedding node at each position) over the bits of naming every VPD-active subcomponent at the text's
-     F2 positions and target (components.reward's size term; edges, added later by the SFT path, are not priced here).
-  5. With --edges, the connections (graph semantics: native.Native.run on the circuit as a Graph, where an output
-     reaches a reader only through a stated connection; every other subcomponent off, remainders as above, the token
-     embedding in full) of the teacher circuit and of the path points nearest 16 to 256 subcomponents up to the first
-     one at or above it: each from every connection the model has among the point's nodes (native.all_edges and the residual writers
-     at the targets into the prediction), nested measured removal as in 3 (single removals ranked by the KL they
-     leave, prefixes of 1, 2, 4, ... up to a tenth), each step taking the prefix with the highest (F1 + N) / 5 - 0.5
-     size, F1 the graph's and size counting its connections as goal_eval.size_bits does. The teacher circuit is then
-     the best point of these edge paths. On text9002 the graph's F1 rises as connections go (92 subcomponents: 0.881
-     with all 1,004, 0.919 with 65 of them): connections cancel as subcomponents do.
+  4. The teacher circuit is the smallest path point with F1 >= 0.9 and N >= 0.9, the form of the decomposition
+     objective (the least description subject to faithfulness; 0.9 on the log scale is within ~10% of VPD's own
+     answer in orders of magnitude); with none, the point with the largest min(F1, N). Each point also records
+     (F1 + N) / 5 - 0.5 size, size the nodes' (and connections') description bits over the bits of naming every
+     VPD-active subcomponent at the text's F2 positions and target (components.reward's size term), for re-picking.
+  5. With --edges, connections (graph semantics: native.Native.run on the circuit as a Graph, where an output reaches
+     a reader only through a stated connection; every other subcomponent off, remainders as above, the token
+     embedding in full). At a path point, from every connection the model has among its nodes (native.all_edges and
+     the residual writers at the targets into the prediction), the rounds of step 1 over single connections: within
+     F1 >= 0.9 the most of the ranked ones that keep it, above it the prefix with the lowest KL. The teacher circuit
+     is the smallest path point with N >= 0.9 whose connections reach F1 >= 0.9 (bisection between the smallest
+     such point and step 4's pick; F1 rises as connections go: on text9002 92 subcomponents give 0.881 with all
+     1,004 connections, 0.919 with 65 of them), with its connections; the points nearest 16, 32 and 64 get theirs
+     too, for re-picking. Without a point meeting both, step 4's pick with its connections.
 Every membership decision is measured; orderings only order.
 
 Output per text in --out: <task>.json (the teacher circuit), <task>.f1.json, <task>.vpd_top<k>.json, <task>.n<size>.json at
 the path points nearest 16 to 256 nodes (goal_eval's circuit JSON: nodes [matrix, index, position] and ["tok", 0,
 position] input nodes; edges with --edges), <task>.path.json (the start set and every step; with --edges,
 "edge_paths": per pruned point its node step, its connections [writer id, reader id or "out"] in node ids, and every
-edge step with the connection indices removed), and a line in summary_<offset>.jsonl.
+edge step: nodes, edges, the connection indices removed, KL_graph, F1_graph, N (the nodes'), size_term and
+(F1 + N) / 5 - 0.5 size), and a line in summary_<offset>.jsonl.
 
   MPD_MEM_GIB=16 ~/mpd-data/venv/bin/python -B teacher.py --split heldout --n 20 --out ~/mpd-data/graph_oracle/teacher/joint_heldout
   teacher.py --split heldout --n 20 --save-vpd FILE   (VPD's answers and orders, for a machine without the CI network)
@@ -74,7 +76,62 @@ SIZES = (16, 32, 64, 128, 256)  # path points also written
 LEVELS = ("position", "site", "chunk64", "chunk16", "chunk4", "subcomponent")  # blocks, coarse to fine
 
 
-class Pruner:
+class Descent:
+    """Measured removal over units (on, bool [N]) whose subsets kl_sets(ons [K, N]) measures: the rounds shared by
+    Pruner (subcomponents) and EdgePruner (connections)."""
+
+    def without(self, groups: list[torch.Tensor]) -> list[float]:
+        """KL of the current set without each group of unit ids (built 16 batches at a time)."""
+        out = []
+        for s0 in range(0, len(groups), 16 * self.B):
+            part = groups[s0:s0 + 16 * self.B]
+            on = self.on[None].repeat(len(part), 1)
+            for i, g in enumerate(part):
+                on[i, g] = False
+            out += self.kl_sets(on)
+        return out
+
+    def kl(self, on: torch.Tensor | None = None) -> float:
+        return self.kl_sets((self.on if on is None else on)[None])[0]
+
+    def prune(self, level: str, budget: float, rounds: int = ROUNDS, log: list | None = None) -> int:
+        """Rounds of measured block removal at one level; returns the rounds run. Within the budget a round removes
+        the most of the ranked blocks that keep KL_C <= budget; above it (a start such as VPD's answer at the targets
+        alone can be farther than the budget while a subset is not: subcomponents cancel) it removes the prefix of
+        the ranked blocks with the lowest measured KL_C, when that is lower than the circuit's. log, a list, receives
+        each round's {"removed": unit ids, "kl": the KL measured after it}."""
+        for r in range(rounds):
+            blocks = self.blocks(level)
+            if len(blocks) <= 1:
+                return r
+            single = torch.tensor(self.without(blocks))
+            ranked = [blocks[i] for i in torch.argsort(single, stable=True).tolist()]
+            sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ranked) - 1]
+            if (single <= budget).any():
+                ok = [(k, x) for k, x in zip(sizes, self.without([torch.cat(ranked[:k]) for k in sizes])) if x <= budget]
+                if not ok:
+                    return r
+                k, x = max(ok)
+                drop = torch.cat(ranked[:k])
+                self.on[drop] = False
+                if log is not None:
+                    log.append({"removed": drop.tolist(), "kl": x})
+                continue
+            current = self.kl()
+            if current <= budget or float(single.min()) >= current:
+                return r
+            kl = self.without([torch.cat(ranked[:k]) for k in sizes])
+            i = min(range(len(sizes)), key=lambda j: kl[j])
+            if kl[i] >= current:
+                return r
+            drop = torch.cat(ranked[:sizes[i]])
+            self.on[drop] = False
+            if log is not None:
+                log.append({"removed": drop.tolist(), "kl": kl[i]})
+        return rounds
+
+
+class Pruner(Descent):
     """Measured removal over the nodes of a circuit on one text. Nodes are (matrix, position, index); a block is a list
     of node ids; kl(blocks) measures the current circuit without each block, in batches of B."""
 
@@ -197,20 +254,6 @@ class Pruner:
         self.measured += K
         return kl
 
-    def without(self, groups: list[torch.Tensor]) -> list[float]:
-        """KL of the current circuit without each group of node ids (built 16 batches at a time)."""
-        out = []
-        for s0 in range(0, len(groups), 16 * self.B):
-            part = groups[s0:s0 + 16 * self.B]
-            on = self.on[None].repeat(len(part), 1)
-            for i, g in enumerate(part):
-                on[i, g] = False
-            out += self.kl_sets(on)
-        return out
-
-    def kl(self, on: torch.Tensor | None = None) -> float:
-        return self.kl_sets((self.on if on is None else on)[None])[0]
-
     def blocks(self, level: str) -> list[torch.Tensor]:
         """The current circuit's blocks at a level, as node-id tensors."""
         ids = self.on.nonzero().flatten()
@@ -234,36 +277,7 @@ class Pruner:
         _, counts = torch.unique_consecutive(keys, return_counts=True)
         return list(ids.split(counts.tolist()))
 
-    def prune(self, level: str, budget: float, rounds: int = ROUNDS) -> int:
-        """Rounds of measured block removal at one level; returns the rounds run. Within the budget a round removes
-        the most of the ranked blocks that keep KL_C <= budget; above it (a start such as VPD's answer at the targets
-        alone can be farther than the budget while a subset is not: subcomponents cancel) it removes the prefix of
-        the ranked blocks with the lowest measured KL_C, when that is lower than the circuit's."""
-        for r in range(rounds):
-            blocks = self.blocks(level)
-            if len(blocks) <= 1:
-                return r
-            single = torch.tensor(self.without(blocks))
-            ranked = [blocks[i] for i in torch.argsort(single, stable=True).tolist()]
-            sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ranked) - 1]
-            if (single <= budget).any():
-                ok = [k for k, x in zip(sizes, self.without([torch.cat(ranked[:k]) for k in sizes])) if x <= budget]
-                if not ok:
-                    return r
-                self.on[torch.cat(ranked[:max(ok)])] = False
-                continue
-            current = self.kl()
-            if current <= budget or float(single.min()) >= current:
-                return r
-            kl = self.without([torch.cat(ranked[:k]) for k in sizes])
-            i = min(range(len(sizes)), key=lambda j: kl[j])
-            if kl[i] >= current:
-                return r
-            self.on[torch.cat(ranked[:sizes[i]])] = False
-        return rounds
-
-
-class EdgePruner:
+class EdgePruner(Descent):
     """Measured removal over the connections among a circuit's nodes in graph semantics: native.Native.run on the
     circuit as a Graph, where a node's output reaches a reader only through a stated connection (every other
     subcomponent at u = 0, the token embedding in full, remainders live or off). Connections: every one the model has
@@ -299,6 +313,10 @@ class EdgePruner:
             kl += carry.kl(tx.ref, nat.run(tx.ids, tx.targets, self.plans[B], u, ur, ew, ow)).tolist()[:valid]
         self.measured += len(ons)
         return kl
+
+    def blocks(self, level: str) -> list[torch.Tensor]:
+        """Single connections, at every level."""
+        return list(self.on.nonzero().flatten().split(1))
 
 
 def scores(empty: float, vpd: float, c: float, minus: float) -> tuple[float, float, float]:
@@ -367,38 +385,18 @@ def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> lis
     return path
 
 
-def edge_path(ep: EdgePruner, empty: float, vpd: float, n: float, size_of) -> list[dict]:
-    """Nested measured removal of a circuit's connections down to MIN_SIZE. Each step measures every single
-    connection's removal and ranks them by the KL they leave; then it measures removing the first 1, 2, 4, ... of
-    them up to a tenth and takes the prefix with the highest (F1 + N) / TERMS - SIZE_WEIGHT size (F1 the graph's; N,
-    the nodes', fixed; size_of(on) the size term with those connections), the longest on a tie. Records: the state
-    after each step and the connection ids removed."""
-    def row(kl, on):
-        f1 = goal_eval._clip01(goal_eval.recovered_log(empty, kl, vpd))
-        st = size_of(on)
-        return {"edges": int(on.sum()), "kl_graph": kl, "f1_graph": f1, "size_term": st,
-                "reward": (f1 + n) / TERMS - SIZE_WEIGHT * st}
-
-    on = ep.on.clone()
-    path = [{**row(ep.kl_sets(on[None])[0], on), "removed": []}]
-    while int(on.sum()) > MIN_SIZE:
-        ids = on.nonzero().flatten()
-        trials = on[None].repeat(len(ids), 1)
-        trials[torch.arange(len(ids), device=on.device), ids] = False
-        single = []
-        for s0 in range(0, len(ids), 8 * ep.B):
-            single += ep.kl_sets(trials[s0:s0 + 8 * ep.B])
-        ranked = ids[torch.argsort(torch.tensor(single), stable=True)]
-        top = min(max(1, int(FRACTION * len(ids))), len(ids) - MIN_SIZE)
-        ks = sorted({min(top, 2 ** e) for e in range(0, 24) if 2 ** e <= 2 * top})
-        prefixes = on[None].repeat(len(ks), 1)
-        for i, k in enumerate(ks):
-            prefixes[i, ranked[:k]] = False
-        got = [row(x, p) for x, p in zip(ep.kl_sets(prefixes), prefixes)]
-        i = max(range(len(ks)), key=lambda j: (got[j]["reward"], ks[j]))
-        on[ranked[:ks[i]]] = False
-        path.append({**got[i], "removed": ranked[:ks[i]].tolist()})
-    return path
+def edge_path(ep: EdgePruner, budget: float, row) -> list[dict]:
+    """A circuit's connections removed by Descent.prune's rounds over single connections from every connection (step
+    1's rule with its budget); row(kl, on, removed) records each state, the first every connection's."""
+    log = []
+    first = ep.kl()
+    ep.prune("connection", budget, log=log)
+    on = torch.ones(len(ep.edges), dtype=torch.bool, device=ep.on.device)
+    steps = [row(first, on.clone(), [])]
+    for x in log:
+        on[x["removed"]] = False
+        steps.append(row(x["kl"], on.clone(), x["removed"]))
+    return steps
 
 
 def circuit_json(pr: Pruner, on: torch.Tensor, edges: list | None = None) -> dict:
@@ -409,6 +407,14 @@ def circuit_json(pr: Pruner, on: torch.Tensor, edges: list | None = None) -> dic
     at = {(n, t, c): i for i, (t, n, c) in enumerate(nodes)}
     return {"nodes": [[n, c, t] for t, n, c in nodes] + [["tok", 0, t] for t in tok],
             "edges": [[at[w], "out" if r is None else at[r]] for w, r in edges or []], "explanation": ""}
+
+
+def pick(rows: list[dict], f1: str, goal: float = RECOVERED) -> tuple[int, str]:
+    """(the smallest row with F1 and N >= goal, "goal"), or without one (the row with the largest min(F1, N), "max-min")."""
+    ok = [i for i, r in enumerate(rows) if r[f1] >= goal and r["n"] >= goal]
+    if ok:
+        return min(ok, key=lambda i: (rows[i]["size"], -min(rows[i][f1], rows[i]["n"]))), "goal"
+    return max(range(len(rows)), key=lambda i: (min(rows[i][f1], rows[i]["n"]), -rows[i]["size"])), "max-min"
 
 
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
@@ -499,27 +505,38 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         v["size_term"] = size_term(on_v)
         v["reward"] = (v["f1"] + v["n"]) / TERMS - SIZE_WEIGHT * v["size_term"]
         r["vpd_top"] = v
-    best = max(range(len(path)), key=lambda i: path[i]["reward"])
+    best, row["pick"] = pick(path, "f1")
     points = {min(range(len(path)), key=lambda j: abs(path[j]["size"] - want)) for want in SIZES}
-    wired, edge_paths, t2 = {}, [], time.perf_counter()     # node step -> (its best edge step's connections, its row)
-    if edges:
-        above = [path[j]["size"] for j in points if path[j]["size"] >= path[best]["size"]]
-        cap = min(above) if above else path[best]["size"]  # connections can raise F1: one point above the node pick
-        for i in sorted({best} | {j for j in points if path[j]["size"] <= cap}):
+    wired, edge_paths, t2 = {}, [], time.perf_counter()     # node step -> (its last edge step's connections, its row)
+
+    def wire(i):
+        if i not in wired:
             ep = EdgePruner(ge, tx, [pr.nodes[j] for j in ons[i].nonzero().flatten().tolist()], CONVENTION == "live", B)
-            steps = edge_path(ep, empty, vpd, path[i]["n"],
-                              lambda e, on=ons[i], ep=ep: size_term(on, int(e[:ep.inner].sum()), int(e[ep.inner:].sum())))
+
+            def state(kl, on, removed):
+                f1, st = goal_eval._clip01(goal_eval.recovered_log(empty, kl, vpd)), size_term(ons[i], int(on[:ep.inner].sum()), int(on[ep.inner:].sum()))
+                return {"nodes": path[i]["size"], "edges": int(on.sum()), "removed": removed, "kl_graph": kl, "f1_graph": f1,
+                        "n": path[i]["n"], "size_term": st, "reward": (f1 + path[i]["n"]) / TERMS - SIZE_WEIGHT * st}
+            steps = edge_path(ep, budget, state)
             edge_paths.append({"step": i, "edges": [[index[w], "out" if r is None else index[r]] for w, r in ep.edges], "steps": steps})
-            e_on = torch.ones(len(ep.edges), dtype=torch.bool)
-            j = max(range(len(steps)), key=lambda j: steps[j]["reward"])
-            for s in steps[:j + 1]:
-                e_on[s["removed"]] = False
-            wired[i] = ([e for e, keep in zip(ep.edges, e_on.tolist()) if keep],
-                        {"size": path[i]["size"], **{k_: steps[j][k_] for k_ in ("edges", "kl_graph", "f1_graph", "size_term", "reward")},
-                         "all_edges": len(ep.edges), "sets": ep.measured})
-            print(f"  edges at {path[i]['size']} subcomponents: {steps[j]['edges']} of {len(ep.edges)}, graph F1 {steps[j]['f1_graph']:.3f} "
-                  f"(all {steps[0]['f1_graph']:.3f}), reward {steps[j]['reward']:.3f}, {ep.measured} sets", flush=True)
-        best = max(wired, key=lambda i: wired[i][1]["reward"])
+            last = {k_: steps[-1][k_] for k_ in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term", "reward")}
+            wired[i] = ([e for e, keep in zip(ep.edges, ep.on.tolist()) if keep], {**last, "all_edges": len(ep.edges), "sets": ep.measured})
+            print(f"  connections at {path[i]['size']} subcomponents: {last['edges']} of {len(ep.edges)}, graph F1 {last['f1_graph']:.3f} "
+                  f"(all {steps[0]['f1_graph']:.3f}), N {last['n']:.3f}, {ep.measured} sets", flush=True)
+        return wired[i][1]["f1_graph"] >= RECOVERED
+
+    if edges:
+        cands = [i for i in range(best, len(path)) if path[i]["n"] >= RECOVERED]   # the pick and smaller points, N >= 0.9
+        if row["pick"] == "goal" and wire(best):
+            lo, hi = 0, len(cands) - 1                       # cands[0] is the pick
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                lo, hi = (mid, hi) if wire(cands[mid]) else (lo, mid - 1)
+            best = cands[lo]
+        wire(best)
+        for i in points:
+            if path[i]["size"] <= 64:
+                wire(i)
     circuits = {"": circuit_json(pr, ons[best], wired.get(best, (None,))[0]), "f1": circuit_json(pr, f1_on),
                 f"vpd_top{k}": circuit_json(pr, topk_on)}
     for i in points:
@@ -591,10 +608,10 @@ def main():
             f.write(json.dumps(row) + "\n")
         b, v, f = row["best"], row["best_vpd_top"], row["f1_circuit"]
         print(f"{path.stem}: F1 circuit {f['size']} at {f['positions']} positions (F1 {f['f1']:.3f}, N {f['n']:.3f}); top-k {row['top_k']}; "
-              f"path from {row['start_size']}: best {b['size']} at {b['positions']} positions F1 {b['f1']:.3f} N {b['n']:.3f} reward {b['reward']:.3f} "
+              f"path from {row['start_size']}: pick ({row['pick']}) {b['size']} at {b['positions']} positions F1 {b['f1']:.3f} N {b['n']:.3f} reward {b['reward']:.3f} "
               f"vs VPD top-{b['size']} F1 {v['f1']:.3f} N {v['n']:.3f} reward {v['reward']:.3f}; {row['measured_sets']} sets, {row['seconds']:.0f}s"
               + (f"; with connections {row['best_edges']['edges']} of {row['best_edges']['all_edges']}, graph F1 "
-                 f"{row['best_edges']['f1_graph']:.3f}, reward {row['best_edges']['reward']:.3f}" if "best_edges" in row else ""),
+                 f"{row['best_edges']['f1_graph']:.3f}" if "best_edges" in row else ""),
               flush=True)
 
 

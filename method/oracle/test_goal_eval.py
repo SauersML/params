@@ -1161,6 +1161,50 @@ def test_interchange_family(tiny):
     assert abs(got - want) < 1e-5 + 1e-4 * abs(want), (got, want)
 
 
+
+def test_interchange_splits(tiny):
+    """The search split (ranks 0 and 2) and the eval split (rank 1 and samples leaving out ranks 0 to 2) never share
+    a draw; a budget caps the draws; draws are keyed by position, never by the circuit."""
+    nat, ge, tx = tiny
+    positions = list(range(1, tx.T))
+    s = ge._interchange_draws(tx, positions, "search", 10 ** 6)
+    e = ge._interchange_draws(tx, positions, "eval", 10 ** 6)
+    assert s and e and not set(s) & set(e)
+    for p in positions:
+        alts = [x[p] for x in carry.alternatives(nat, tx.ids, p, (0, 1, 2))]
+        assert {z for q, z in s if q == p} == {alts[0], alts[2]}
+        ev = {z for q, z in e if q == p}
+        assert alts[1] in ev and len(ev) > 1 and tx.ids[p] not in ev and not ev & {alts[0], alts[2]}
+    assert len(ge._interchange_draws(tx, positions, "eval", 16)) == 16
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    one = list({t: nd for nd in every for t in [nd[1]]}.values())  # one node per position: the same positions
+    a, b = ge._interchange_family(tx, [native.Graph(every, complete=True), native.Graph(one, complete=True)], draws=8)
+    assert a["draws_interchange"] == b["draws_interchange"] and len(a["draws_interchange"]) == 8
+
+
+def test_interchange_eval_is_graph_ref_on_its_draws(tiny):
+    """The eval split's KL is, draw by draw, the model and graph_ref with the circuit's subcomponents at p set to the
+    real model's activations on the changed text (naive()), averaged; interchange_search is the search split's."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    g = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    row = ge._interchange_family(tx, [g], draws=6)[0]
+    kls = []
+    for p, z in row["draws_interchange"]:
+        x = list(tx.ids)
+        x[p] = z
+        acts = naive(nat, x)[1]["a"]
+        vals = {nd: acts[nd[0]][nd[1], nd[2]] for nd in sub if nd[1] == p}
+        lm = torch.log_softmax(naive(nat, tx.ids, replace=vals)[0][tx.targets], -1)[None]
+        kls.append(float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, g, patch=vals))[0]))
+    want = sum(kls) / len(kls)
+    assert abs(row["kl_interchange_c"] - want) < 1e-5 + 1e-4 * want, (row["kl_interchange_c"], want)
+    got = ge.interchange_search(tx, [g], draws=6)[0]
+    srch = ge._interchange_family(tx, [g], draws=6, split="search")[0]
+    assert got["kl_interchange_c"] == srch["kl_interchange_c"] and not set(srch["draws_interchange"]) & set(row["draws_interchange"])
+    e0 = ge._bounds(tx, "live")[0]
+    assert got["s_interchange"] == goal_eval._fid(e0, srch["kl_interchange_c"], srch["kl_interchange_vpd"])
+
 def test_response_error():
     base = {("a", 0, 0): (1.0, 5.0), ("b", 0, 0): (0.0, 0.0)}
     pairs = {("a", 0, 0): [(2.0, 6.0), (0.0, 4.0)], ("b", 0, 0): [(1.0, 0.0)]}

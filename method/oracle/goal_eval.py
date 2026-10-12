@@ -113,6 +113,9 @@ SCREEN = 256  # the adversary's shortlist measured one by one: the parts with th
 # whole removal can move the other way from its gradient: text-free tiny model, the best single removal ranks last)
 SCREEN_ROWS = 16  # rows per run when measuring the shortlist
 FLIP_ROWS = 160  # adversary_flips' rows per run: every circuit's restarts at every budget (8 x 5 x 4) together
+INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
+# offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
+FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
 
 
 # ---- answers
@@ -998,7 +1001,8 @@ class GoalEval:
         background of a circuit's run); graph_ref,
         slower). Evaluation only, never in the reward or a teacher's objective:
         fresh, a pool none of the searches drew from: the pattern lever's flips over it (f1_flips_patterns_fresh);
-        interchange > 0: that many interchange draws (_interchange_family, s_interchange); real: N_real (real_removal,
+        interchange > 0: up to that many interchange draws of the eval split (_interchange_family, s_interchange; the
+        search split is the teachers', interchange_search); real: N_real (real_removal,
         n_real) and its adversary (necessity_flips, n_real_flips). leak: graph F1 of the circuit's nodes stating no
         edge (live remainders carrying their outputs to the prediction). mode="reward": the training family alone, what
         the RL reward takes every step: point, nodes, edges with reads (on), and the flips up to FLIP_TERM (their
@@ -1447,14 +1451,50 @@ class GoalEval:
         return sides
 
     @torch.no_grad()
-    def _interchange_family(self, tx: Text, graphs: list[native.Graph], draws: int = 16, ranks=(0, 1, 2),
+    def _fresh_sources(self, tx: Text, p: int, seed: int) -> list[int]:
+        """FRESH_SOURCES tokens for position p sampled without replacement from the model's distribution there, the
+        text's token and the three likeliest others (every split's carry.alternatives ranks) left out; keyed by seed and
+        p alone."""
+        lp = self.nat.reference([tx.ids[:p]], [p - 1])[0, 0].double().cpu()
+        others = [int(z) for z in lp.topk(4).indices.tolist() if z != tx.ids[p]][:3]
+        w = lp.exp()
+        w[[tx.ids[p]] + others] = 0.0
+        gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(("fresh", seed, p)).encode()).hexdigest()[:15], 16))
+        return torch.multinomial(w, min(FRESH_SOURCES, int((w > 0).sum())), replacement=False, generator=gen).tolist()
+
+    def _interchange_draws(self, tx: Text, positions: list[int], split: str, draws: int) -> list[tuple[int, int]]:
+        """An interchange split's draws on a circuit's positions, (position, source token) pairs keyed by the text's
+        seed plus the split's offset, the position and the source, never by the circuit (circuits on the same
+        positions get the same draws): per position the split's ranks of the model's likeliest other tokens
+        (carry.alternatives) and, for eval, _fresh_sources enough to fill the budget; the first draws pairs in an order
+        keyed the same way. search: ranks 0 and 2; eval: rank 1 and the samples, which leave out ranks 0 to 2 (disjoint)."""
+        off, ranks, fresh = INTERCHANGE_SPLITS[split]
+        seed = int(tx.seed) + off
+        f = max(1, -(-draws // len(positions)) - len(ranks)) if fresh else 0
+        pairs = []
+        for p in positions:
+            pairs += [(p, x[p]) for x in carry.alternatives(self.nat, tx.ids, p, ranks)]
+            pairs += [(p, z) for z in (self._fresh_sources(tx, p, seed)[:f] if f else [])]
+        return sorted(pairs, key=lambda pz: hashlib.sha256(repr((seed, pz)).encode()).digest())[:draws]
+
+    def interchange_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16) -> list[dict]:
+        """The teachers' interchange agreement on one text, the search split alone (never a reward, gate or table's):
+        per candidate circuit s_interchange on C's log scale, kl_interchange_c and kl_interchange_vpd. Candidates on the
+        same positions share their draws, and every draw's changed prompt runs once for all of them. A node set
+        without stated structure: native.Graph(nodes, complete=True)."""
+        e0 = self._bounds(tx, "live")[0]
+        rows = self._interchange_family(tx, graphs, draws, split="search")
+        return [dict(r, s_interchange=_fid(e0, r["kl_interchange_c"], r["kl_interchange_vpd"])) for r in rows]
+
+    @torch.no_grad()
+    def _interchange_family(self, tx: Text, graphs: list[native.Graph], draws: int = 16, split: str = "eval",
                             reads: bool = False) -> list[dict]:
-        """Evaluation only (never in the reward or a teacher's objective): per circuit, interchange interventions with
-        the identity alignment. Draw j takes a position p among the circuit's (after 0) and one of the model's ranks
-        likeliest other tokens there (carry.alternatives), and sets the circuit's subcomponents at p to their
-        activations in the real model on that changed prompt, in the model (everything else computing on the text), in
-        the circuit (its later nodes reading the patched ones through stated connections) and in VPD's answer, all in
-        C's semantics (graph_ref); the mean KLs from the model's, kl_interchange_c and kl_interchange_vpd."""
+        """Per circuit, interchange interventions with the identity alignment on a split's draws (_interchange_draws:
+        "eval", held out, for fidelity's rows, the reward's gates and tables; "search" for the teachers,
+        interchange_search). A draw (p, z) sets the circuit's subcomponents at p to their activations in the real model
+        on the text with z at p, in the model (everything else computing on the text), in the circuit (its later nodes
+        reading the patched ones through stated connections) and in VPD's answer, all in C's semantics (graph_ref); the
+        mean KLs from the model's, kl_interchange_c and kl_interchange_vpd, and the draws (draws_interchange)."""
         nat, T, dev = self.nat, tx.T, self.nat.dev
         source = {}
 
@@ -1473,21 +1513,18 @@ class GoalEval:
             nodes = sorted(g.node_set())
             positions = sorted({t for _, t, _ in nodes if t > 0})
             if not positions:
-                out.append({"kl_interchange_c": None, "kl_interchange_vpd": None, "reads_interchange": None})
+                out.append({"kl_interchange_c": None, "kl_interchange_vpd": None, "reads_interchange": None, "draws_interchange": []})
                 continue
-            rng = self._rng(tx, g, "interchange")
+            got_draws = self._interchange_draws(tx, positions, split, draws)
             patch = []
-            for j in range(draws):
-                p = positions[int(rng.integers(len(positions)))]
-                alts = carry.alternatives(nat, tx.ids, p, ranks)
-                z = alts[int(rng.integers(len(alts)))][p]
+            for p, z in got_draws:
                 rec = source_record(p, z)
                 patch.append({nd: rec[nd[0]][0, nd[1], nd[2]] for nd in nodes if nd[1] == p})
             got = sides(g, patch=patch, reads=reads)
             lm, lv, lc = got[:3]
             native.free(dev)
             row = {"kl_interchange_c": float(carry.kl(lm, lc).mean()), "kl_interchange_vpd": float(carry.kl(lm, lv).mean()),
-                   "reads_interchange": None}
+                   "reads_interchange": None, "draws_interchange": got_draws}
             if reads:  # the reads of the circuit's nodes at other positions than the fixed ones, model and circuit
                 rm, rc, pairs = {nd: v.tolist() for nd, v in got[3].items()}, {nd: v.tolist() for nd, v in got[4].items()}, {}
                 for b, vals in enumerate(patch):

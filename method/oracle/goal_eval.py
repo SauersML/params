@@ -1466,7 +1466,7 @@ class GoalEval:
 
 
     def _adv_problem(self, tx: Text, graphs: list[native.Graph], pool: dict, k: int, gen: torch.Generator,
-                     batched: bool = False, patterns: bool = True) -> tuple:
+                     batched: bool = False, patterns: bool = True, strengths: torch.Tensor | None = None) -> tuple:
         """adversary()'s objective: the K patterns drawn (pool indices) and, per circuit, (kls, idx, cols): kls(w [R, K],
         b {site: [R, omitted]}, precision="score") -> (KL_C, KL_VPD) [R] bits, differentiable; idx per site the omitted
         subcomponents (positions, column indices); cols per site the engine's columns. batched: also batch(items,
@@ -1474,7 +1474,10 @@ class GoalEval:
         kind (the stated graphs' as one list of graphs, the complete ones', VPD's answer's; vpd=False leaves VPD's out,
         KL_VPD None): the same numbers within float32 rounding, a run per kind instead of per circuit. patterns=False:
         the pattern lever stays off (w = 0), so the engine leaves out the patterns' subcomponents (the omitted lever's
-        flips: about a third of the columns)."""
+        flips: about a third of the columns). A graph given more than once is laid out once. strengths [circuits, E + O]:
+        every circuit is the same stated graph (one object), circuit i at connection strengths strengths[i] (the
+        graph's parents reader by reader, then its out list), run from one plan of the graph kept on the text (the same
+        numbers as each circuit's connections stated as its own graph: an unstated connection runs at strength 0)."""
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
@@ -1487,10 +1490,16 @@ class GoalEval:
             cache["key"] = key
         if "vpd_cols" not in cache:
             cache["vpd_cols"] = {n: tx.vpd[n].any(0).nonzero().flatten() for n in nat.names}
+        slot, uniq = [], {}  # each circuit's graph's place among the distinct graphs
+        for g in graphs:
+            slot.append(uniq.setdefault(id(g), (len(uniq), g))[0])
+        uniq = [g for _, g in uniq.values()]
+        if strengths is not None and (len(uniq) != 1 or uniq[0].complete):
+            raise ValueError("strengths run one stated graph on every circuit")
         cols = {}
         for n in nat.names:
             parts = [cache["vpd_cols"][n]] + [p[n].to(dev) for p in pats if n in p and patterns]
-            parts += [torch.tensor([c for m, _, c in g.node_set() if m == n], dtype=torch.long, device=dev) for g in graphs]
+            parts += [torch.tensor([c for m, _, c in g.node_set() if m == n], dtype=torch.long, device=dev) for g in uniq]
             cols[n] = torch.unique(torch.cat(parts))
         last = cache.get("engine")
         if last is not None and all(torch.equal(last[0][n], cols[n]) for n in nat.names):
@@ -1498,6 +1507,7 @@ class GoalEval:
         else:
             E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols)
             inv = vpd_on = vfree = None
+            cache["plans"] = {}                    # one-graph plans of this engine (strengths)
         where = (torch.arange(T, device=dev) <= max(tx.targets))[:, None]
         if vpd_on is None:
             vpd_on = {n: tx.vpd[n][:, cols[n]] for n in nat.names}
@@ -1513,16 +1523,25 @@ class GoalEval:
             vfree = {n: (~vpd_on[n] & where).float() for n in nat.names}
             cache["engine"] = (cols, E, inv, vpd_on, vfree)
         parts = []
-        for g in graphs:
+        for g in uniq:
             on = {n: torch.zeros(T, len(cols[n]), dtype=torch.bool, device=dev) for n in nat.names}
             for n, t, c in g.node_set():
                 on[n][t, inv[n][c]] = True
             omit = {n: vpd_on[n] & ~on[n] & where for n in nat.names}
             parts.append({"on": on, "free": {n: (~vpd_on[n] & ~on[n] & where).float() for n in nat.names},
                           "idx": {n: omit[n].nonzero(as_tuple=True) for n in nat.names}})
-        free = {n: torch.stack([q["free"][n] for q in parts]) for n in nat.names}  # [circuits, T, columns]
+        free = {n: torch.stack([q["free"][n] for q in parts]) for n in nat.names}  # [distinct graphs, T, columns]
         onf = {n: torch.stack([q["on"][n] for q in parts]).float() for n in nat.names}
+        parts = [parts[j] for j in slot]                 # per circuit
+        at_slot = torch.tensor(slot, dtype=torch.long, device=dev)
         plans, flats = {}, {}
+        one = None
+        if strengths is not None:
+            g = uniq[0]
+            pk = (tuple(sorted(g.node_set())), tuple((w, r) for r, ws in g.parents.items() for w in ws), tuple(g.out))
+            if pk not in cache.setdefault("plans", {}):
+                cache["plans"][pk] = E.plan(g, semantics="c")
+            one = cache["plans"][pk]
 
         def layout(key):  # rows (circuit, count) in order: each row's circuit, the omissions' places per site
             if key not in flats:
@@ -1552,7 +1571,7 @@ class GoalEval:
             for n in nat.names:  # every row's masks at once
                 if patterns:
                     a = _PatternOr.apply(w, P[n])  # [rows, columns]: the OR of the patterns on
-                    uc[n] = free[n][circ] * a[:, None, :]
+                    uc[n] = free[n][at_slot[circ]] * a[:, None, :]
                 else:  # the pattern lever off: a = 0, outside the circuit only the omissions
                     uc[n] = torch.zeros(len(circ), T, len(cols[n]), device=dev)
                 if fl[n] is not None:  # the omissions (disjoint from free)
@@ -1560,13 +1579,17 @@ class GoalEval:
                 if vpd:
                     mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :] if patterns else vpd_on[n].float().expand(len(circ), -1, -1)
             kc = []
-            if ns:  # C's semantics (graph inside, masked outside): the stated circuits as one list of graphs
+            if ns and one is not None:  # one stated graph, each row at its circuit's strengths
+                s = strengths[circ[:ns]]
+                kc.append(E.graph_kl(one, u={n: uc[n][:ns] for n in nat.names}, ew=s[:, :one["E"]], ow=s[:, one["E"]:],
+                                     precision=precision))
+            elif ns:  # C's semantics (graph inside, masked outside): the stated circuits as one list of graphs
                 sk = key[:sum(1 for i, _ in key if not graphs[i].complete)]
                 if sk not in plans:
                     plans[sk] = E.plan([graphs[i] for i, r in sk for _ in range(r)], semantics="c")
                 kc.append(E.graph_kl(plans[sk], u={n: uc[n][:ns] for n in nat.names}, precision=precision))
             if ns < len(circ):
-                kc.append(E.kl({n: onf[n][circ[ns:]] + uc[n][ns:] for n in nat.names}, precision))
+                kc.append(E.kl({n: onf[n][at_slot[circ[ns:]]] + uc[n][ns:] for n in nat.names}, precision))
             kc = torch.cat(kc).split([r for _, r in key])
             kv = E.kl(mv, precision).split([r for _, r in key]) if vpd else [None] * len(its)
             at = {j: k for k, j in enumerate(order)}
@@ -1649,7 +1672,7 @@ class GoalEval:
 
     def adversary_flips(self, tx: Text, graphs: list[native.Graph], pool: dict, lever: str = "omitted", ms=None,
                         steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, k: int = ADV_PATTERNS, upto: int | None = None,
-                        screens: dict | None = None) -> list[dict]:
+                        screens: dict | None = None, strengths: torch.Tensor | None = None) -> list[dict]:
         """The paired adversary with a budget in switched-on parts instead of steps: per budget m, at most m of one
         lever on ("omitted": the VPD actives the circuit leaves out, one subcomponent at one position each;
         "patterns": the pool's patterns, each an OR over every position up to the last target), the other lever off.
@@ -1664,13 +1687,14 @@ class GoalEval:
         gaps by part, shared by this call's graphs and kept across calls (a part measured once, on the first graph
         that needs it): for searches over nearby circuits on one text (a cleanup's candidates, connection subsets of
         one node set), whose shortlists overlap; the caller empties it when its circuits move on. None: every graph's
-        shortlist measured on it alone."""
+        shortlist measured on it alone. strengths: _adv_problem's (one stated graph at each circuit's connection
+        strengths: edge_flips)."""
         nat, dev = self.nat, self.nat.dev
         e0 = self._bounds(tx, "live")[0]
         ms = FLIPS[lever] if ms is None else ms
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         omitted = lever == "omitted"  # the patterns stay off: VPD's paired run is VPD's answer alone, run once
-        pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True, patterns=not omitted)
+        pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True, patterns=not omitted, strengths=strengths)
         search = _search(dev)  # the sign steps' and screens' precision (every reported number: float32)
         sizes = [[len(idx[n][0]) for n in nat.names] for _, idx, _ in problems]
         N = [sum(z) if omitted else len(pick) for z in sizes]
@@ -1701,8 +1725,9 @@ class GoalEval:
             kv0 = batch(items([(0, torch.zeros(1, N[0], device=dev))]))[0][1] if omitted and problems else None
         live = [i for i in range(len(problems)) if N[i]]
         g0 = dict(zip(live, grads([(i, torch.zeros(1, N[i], device=dev)) for i in live], "score")))
-        flat = [[(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())] if omitted else pick
-                for _, idx, cols in problems]
+        named = {}  # each circuit's lever's parts by name, made once per distinct graph
+        flat = [named.setdefault(id(idx), [(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())])
+                if omitted else pick for _, idx, cols in problems]
         known = screens if screens is not None else {}
         key = (lambda i, j: (lever, flat[i][j])) if screens is not None else (lambda i, j: (i, lever, flat[i][j]))
         with torch.no_grad():  # each circuit's shortlist measured: the SCREEN parts with the largest gradient either way,
@@ -1771,6 +1796,16 @@ class GoalEval:
                 prev = m
         return out
 
+
+    def edge_flips(self, tx: Text, graph: native.Graph, ons: torch.Tensor, pool: dict, m: int = FLIP_TERM,
+                   screens: dict | None = None, **kw) -> list[dict]:
+        """adversary_flips' omitted lever at budget m on connection subsets of one node set: graph states every
+        connection among its nodes (teacher.EdgePruner.graph: native.all_edges), ons [K, E + O] (bool) the ones each
+        subset keeps, in the graph's order (its parents reader by reader, then its out list). The same numbers as
+        adversary_flips on the K graphs of those connections, from one plan of graph at 0/1 strengths (kept on the
+        text across calls) and the node set's layout made once."""
+        return self.adversary_flips(tx, [graph] * len(ons), pool, "omitted", ms=(m,), screens=screens,
+                                    strengths=ons.to(self.nat.dev, torch.float32), **kw)
 
     def across(self, tx: Text, graphs: list[native.Graph], prompts: list) -> list[dict]:
         """Per graph, per convention, the same circuit identities run on other prompts of the text: recovered pooled

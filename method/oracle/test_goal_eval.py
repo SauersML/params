@@ -1090,6 +1090,37 @@ def test_flips_report_float32_rescores(tiny, monkeypatch):
             assert abs(got - want) < 1e-5 + 1e-4 * abs(want), (m, got, want)
 
 
+def test_edge_flips_are_adversary_flips_on_the_subsets(tiny):
+    """edge_flips on connection subsets of one node set (one plan at 0/1 strengths) gives adversary_flips' numbers and
+    masks on those subsets stated as their own graphs (to 1e-6 relative; float32 on the tiny model's device), with and
+    without a shared shortlist cache, and keeps one plan for the node set across calls."""
+    nat, ge, tx = tiny
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    par, out = native.all_edges(nodes, tx.targets)
+    full = native.Graph(nodes, par, out)
+    edges = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in out]
+    g = torch.Generator().manual_seed(3)
+    ons = torch.rand(5, len(edges), generator=g) < 0.6
+    ons[0], ons[1] = True, False
+    subs = []
+    for on in ons.tolist():
+        kept = [e for e, k in zip(edges, on) if k]
+        parents = {}
+        for w, r in kept:
+            if r is not None:
+                parents.setdefault(r, []).append(w)
+        subs.append(native.Graph(nodes, parents, [w for w, r in kept if r is None]))
+    pool = tiny_pool(nat, tx.ids)
+    for screens in (None, "shared"):
+        want = ge.adversary_flips(tx, subs, pool, "omitted", ms=(4,), steps=3, restarts=2, screens=None if screens is None else {})
+        got = ge.edge_flips(tx, full, ons, pool, 4, steps=3, restarts=2, screens=None if screens is None else {})
+        for a, b in zip(want, got):
+            assert a["mask_flips_omitted"] == b["mask_flips_omitted"], screens
+            for x, y in zip(a["kl_flips_omitted"][4], b["kl_flips_omitted"][4]):
+                assert abs(x - y) <= 1e-6 * abs(x), (screens, x, y)
+    assert len(tx._adv["plans"]) == 1
+
+
 def test_interchange_family(tiny):
     """Interchange: VPD's answer as the circuit agrees with VPD's own run draw by draw; a stated circuit with every
     connection and some activations fixed (graph_ref) is the independent forward with them fixed."""

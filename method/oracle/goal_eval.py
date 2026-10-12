@@ -255,6 +255,27 @@ def _response_error(pairs: dict, base: dict) -> float | None:
     return math.sqrt(num / den) if den > 0 else None
 
 
+class _PatternOr(torch.autograd.Function):
+    """The OR of the patterns on, a = 1 - prod_k (1 - w_k P_k) [rows, columns] from weights w [rows, K] and patterns P
+    [K, columns], with its gradient d a_c / d w_k = P_kc prod_{j != k} (1 - w_j P_jc) from exclusive cumulative
+    products: torch.prod's own backward checks its input for zeros on the host (a synchronization per call, and an
+    operation a CUDA graph cannot capture)."""
+
+    @staticmethod
+    def forward(ctx, w, P):
+        x = 1 - w[:, :, None] * P[None]
+        ctx.save_for_backward(x, P)
+        return 1 - x.prod(1)
+
+    @staticmethod
+    def backward(ctx, g):
+        x, P = ctx.saved_tensors
+        one = torch.ones_like(x[:, :1])
+        before = torch.cat([one, x[:, :-1]], 1).cumprod(1)
+        after = torch.cat([x[:, 1:], one], 1).flip(1).cumprod(1).flip(1)
+        return (g[:, None, :] * P[None] * before * after).sum(-1), None
+
+
 def _drop_nodes(g: native.Graph, drop: set) -> native.Graph:
     """A stated graph without some nodes and every connection to or from them."""
     nodes = [nd for nd in g.nodes if nd not in drop]
@@ -1470,7 +1491,7 @@ class GoalEval:
             w = torch.cat([x for _, x, _ in its])
             uc, mv = {}, {}
             for n in nat.names:  # every row's masks at once
-                a = 1 - torch.prod(1 - w[:, :, None] * P[n][None], 1)  # [rows, columns]: the OR of the patterns on
+                a = _PatternOr.apply(w, P[n])  # [rows, columns]: the OR of the patterns on
                 uc[n] = free[n][circ] * a[:, None, :]
                 if fl[n] is not None:  # the omissions (disjoint from free)
                     uc[n] = uc[n].index_put(fl[n], torch.cat([b[n].reshape(-1) for _, _, b in its]), accumulate=True)
@@ -1614,17 +1635,24 @@ class GoalEval:
         g0 = dict(zip(live, grads([(i, torch.zeros(1, N[i], device=dev)) for i in live], "score")))
         screened = {}
         with torch.no_grad():  # each circuit's shortlist measured: the SCREEN parts with the largest gradient either way,
-            for i in live:  # each switched on alone, the largest gap first
-                short = g0[i][0].abs().topk(min(N[i], SCREEN)).indices
-                gaps = []
-                for s0 in range(0, len(short), SCREEN_ROWS):
-                    part = short[s0:s0 + SCREEN_ROWS]
+            short, parts = {}, []  # each switched on alone, the largest gap first; every circuit's rows FLIP_ROWS a run
+            for i in live:
+                short[i] = g0[i][0].abs().topk(min(N[i], SCREEN)).indices
+                for s0 in range(0, len(short[i]), FLIP_ROWS):
+                    part = short[i][s0:s0 + FLIP_ROWS]
                     rows = torch.zeros(len(part), N[i], device=dev)
                     rows[torch.arange(len(part), device=dev), part] = 1.0
-                    kc, kv = batch(items([(i, rows)]), vpd=not omitted)[0]
-                    kv = kv0.expand_as(kc) if kv is None else kv
-                    gaps.append(kc.log() - kv.log())
-                screened[i] = short[torch.cat(gaps).argsort(descending=True)].tolist()
+                    parts.append((i, rows))
+            gaps, run, k = {}, [], 0
+            for j, (i, rows) in enumerate(parts):
+                run.append((i, rows))
+                k += len(rows)
+                if j == len(parts) - 1 or k + len(parts[j + 1][1]) > FLIP_ROWS:
+                    for (i_, _), (kc, kv) in zip(run, batch(items(run), vpd=not omitted)):
+                        kv = kv0.expand_as(kc) if kv is None else kv
+                        gaps.setdefault(i_, []).append(kc.log() - kv.log())
+                    run, k = [], 0
+            screened = {i: short[i][torch.cat(gaps[i]).argsort(descending=True)].tolist() for i in live}
         starts = {(i, m): torch.rand(restarts, N[i], generator=gen).to(dev) for i in range(len(problems)) for m in ms if m <= N[i]}
         flat = [[(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())] if omitted else pick
                 for _, idx, cols in problems]

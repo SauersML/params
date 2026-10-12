@@ -1055,6 +1055,22 @@ def test_fidelity_reward_mode_is_the_full_modes_training_family(tiny):
         assert "f1_adv" not in b and "leak" not in b and "flips_to_break" not in b
 
 
+def test_pattern_or_gradient():
+    """The patterns' OR and its gradient (exclusive products, no synchronization) equal torch.prod's, weights at 0, 1
+    and between."""
+    g = torch.Generator().manual_seed(0)
+    w = torch.rand(5, 7, generator=g)
+    w[0, 2], w[1, :] = 1.0, 0.0
+    P = (torch.rand(7, 11, generator=g) < 0.4).float()
+    a, b = w.clone().requires_grad_(True), w.clone().requires_grad_(True)
+    want = 1 - torch.prod(1 - a[:, :, None] * P[None], 1)
+    got = goal_eval._PatternOr.apply(b, P)
+    up = torch.rand(5, 11, generator=g)
+    (want * up).sum().backward()
+    (got * up).sum().backward()
+    assert torch.allclose(want, got) and torch.allclose(a.grad, b.grad, atol=1e-6)
+
+
 def test_interchange_family(tiny):
     """Interchange: VPD's answer as the circuit agrees with VPD's own run draw by draw; a stated circuit with every
     connection and some activations fixed (graph_ref) is the independent forward with them fixed."""

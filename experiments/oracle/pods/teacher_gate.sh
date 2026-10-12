@@ -58,10 +58,11 @@ ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 set +e; (python -B goal_eval.py score --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --split heldout --n $N --diagnostics --out $O/score.json > $O/score.log 2>&1) &
-for k in \$(seq 0 $(( ${FIDP:-3} - 1 ))); do (python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --vpd $F/vpd.pt --offset \$k --stride ${FIDP:-3} --out $O/fid_\$k.jsonl > $O/fid_\$k.log 2>&1) & done; wait"
-RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=16 RP_MIN_RAM_GB=16 \
-  experiments/infra/runpod/rp-run $RN "$GPU" 3.0 -- bash -c "$CMD" > "$F/rp_score.log" 2>&1
+for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --vpd $F/vpd.pt --offset \$k --stride ${FIDP:-2} --out $O/fid_\$k.jsonl > $O/fid_\$k.log 2>&1) & done; wait"
+# the score run and FIDP fidelity runs share one card: ~4 GB each (3 fidelity runs and the score run overflowed 16 GB)
+RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=24 RP_MIN_RAM_GB=16 \
+  experiments/infra/runpod/rp-run $RN "${SCORE_GPU:-NVIDIA RTX A6000,NVIDIA A40,NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090}" 3.0 -- bash -c "$CMD" > "$F/rp_score.log" 2>&1
 [ -s "$O/score.json" ] || { echo "no scores: $O/score.log, $F/rp_score.log"; exit 1; }
-{ cat "$G/README.txt" 2> /dev/null; echo "scored at $(sed -nE 's/.* source ([0-9a-f]+):.*/\1/p' "$O/rp-run.log" | tail -1) (goal_eval score and fidelity; both arms at this commit)"; /usr/bin/python3 -I experiments/oracle/teacher_gate.py "$O/score.json" a b --teacher "${dirs[0]}" "${dirs[1]}" --fidelity $(for k in $(seq 0 $(( ${FIDP:-3} - 1 ))); do printf '%s ' "$O/fid_$k.jsonl"; done); } | tee "$O/gate.txt"
+{ cat "$G/README.txt" 2> /dev/null; echo "scored at $(sed -nE 's/.* source ([0-9a-f]+):.*/\1/p' "$O/rp-run.log" | tail -1) (goal_eval score and fidelity; both arms at this commit)"; /usr/bin/python3 -I experiments/oracle/teacher_gate.py "$O/score.json" a b --teacher "${dirs[0]}" "${dirs[1]}" --fidelity $(for k in $(seq 0 $(( ${FIDP:-2} - 1 ))); do printf '%s ' "$O/fid_$k.jsonl"; done); } | tee "$O/gate.txt"
 exit
 }

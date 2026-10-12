@@ -51,6 +51,9 @@ $TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEP
   --max-length ${MAXLEN:-32768} $TH
 STATE=$($PY -c "import json; print(json.load(open('$S/sft/state.json'))['state'])")
 $TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE" --base $BASE --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK $TH
+# the circuit-ablation column: the same policy answering the questions with an empty circuit (E2 with - without)
+$TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples_nocircuit.jsonl --init "$STATE" --base $BASE --n $NEVAL --samples 1 \
+  --max-tokens $MAXTOK $TH --prefix $'CIRCUIT:\nANSWER 1:\n'
 Z=${ZEROSHOT:-$O/zeroshot_heldout20/cst}  # the untrained Qwen3-8B's answers to these questions, scored by the same reward
 E1S="" E1Z=""
 if [ -n "${ENGLISH:-}" ]; then
@@ -58,6 +61,7 @@ if [ -n "${ENGLISH:-}" ]; then
   E1S=":$S/e1.jsonl" E1Z=":$Z/e1.jsonl"
 fi
 unset TINKER_API_KEY
+[ -n "${SKIP_EVAL:-}" ] && exit 0  # SKIP_EVAL: the samples only (several arms evaluated together, one revision)
 cd $SRC
 $PY -c "import json; open('$S/zeroshot_first.jsonl', 'w').writelines(l for l in open('$Z/samples.jsonl') if json.loads(l)['sample'] == 0)"
 PRUNED=() REFS=(--ref "Teacher=$S/eval.json:teacher" --ref "VPD, every connection=$S/eval.json:vpd_complete") XSETS=()
@@ -66,7 +70,7 @@ if [ -d $S/ref/vpd_pruned ]; then
   PRUNED=(vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
 fi
 # C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh)
-EDIT_EVAL=${EDIT_EVAL:-} bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S \
+EDIT_EVAL=${EDIT_EVAL:-} bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S sft_nocircuit=$S/samples_nocircuit.jsonl \
   zeroshot=$S/zeroshot_first.jsonl$E1Z teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" ${=EXTRA:-} > $S/eval_pod.log 2>&1
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.json $S/eval.json
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.log $S/eval.log

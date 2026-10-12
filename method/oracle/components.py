@@ -864,6 +864,23 @@ def qa_score(questions: list[dict], finals: dict, tokens_of) -> float | None:
     return right / len(questions)
 
 
+QA_KINDS = {"token": "changed token", "move": "move/swap/insert", "swap": "move/swap/insert", "insert": "move/swap/insert",
+            "remove": "subcomponent removal", "cut": "connection cut", "copy": "copy"}  # E2's report by question type
+
+
+def qa_detail(questions: list[dict], finals: dict, tokens_of, top: str) -> list[dict]:
+    """Per question answered, its type (QA_KINDS), the answer's score (half for falls, half for the top token) and the
+    no-change answer's ("falls=no, top=current prediction"): E2's gain over the no-change answer by question type."""
+    out = []
+    for n, q in enumerate(questions, 1):
+        if n in finals:
+            falls, tp = finals[n]
+            want = shown(tokens_of([q["top"]])[0])
+            out.append({"kind": QA_KINDS.get(q.get("kind"), q.get("kind")), "right": 0.5 * (falls == q["falls"]) + 0.5 * (tp == want),
+                        "right0": 0.5 * (not q["falls"]) + 0.5 * (shown(top) == want)})
+    return out
+
+
 def qa_term(questions: list[dict], finals: dict, tokens_of, top: str) -> float | None:
     """E2: the share of questions answered right (qa_score) measured from the share right0 of the no-change answer
     (every question answered falls=no, top=the model's prediction on the text, `top`): (right - right0) / (1 - right0),
@@ -1548,6 +1565,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         out.append({"reward": r, "reward_mean": mean_r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
                     "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
                     "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row, "variables": e4.get(i),
+                    "qa": qa_detail(ev["qa"], p["finals"], tok, prompt["model_top"][0][0][0]) if valid[i] else [],
                     "fidelity": {k: v for k, v in (c_of.get(i) or {}).items()  # C's members and columns (s_track, context_share, ...)
                                  if k == "c_terms" or isinstance(v, (int, float)) or v is None}})
     return out
@@ -2152,6 +2170,17 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, b
         matched = [(a, b) for a, b in matched if b is not None]
         if matched:
             report[name]["paired"]["vpd@matched (circuit reward)"] = _paired([a for a, _ in matched], [b for _, b in matched])
+        by = {}
+        for f in first:
+            for d in f.get("qa") or []:
+                by.setdefault(d["kind"], []).append(d["right"] - d["right0"])
+        if by:
+            report[name]["E2 gain over the no-change answer by type"] = {k: sum(v) / len(v) for k, v in sorted(by.items())}
+        if f"{name}_nocircuit" in per:  # the same policy answering without its circuit (sample --prefix): E2 with - without
+            other = {o["task"]: o["samples"][0] for o in per[f"{name}_nocircuit"]}
+            pairs = [(q["samples"][0].get("term_E2") or 0.0, other[q["task"]].get("term_E2") or 0.0) for q in qs if q["task"] in other]
+            if pairs:
+                report[name]["E2 circuit-ablation delta (with - without circuit)"] = _paired([a for a, _ in pairs], [b for _, b in pairs])
         vs_vpd = lambda x, q: (x.get("term_C") or 0.0) > ((base_terms or {}).get(q["task"], {}).get(f"vpd@{x.get('nodes')}") or {}).get("C", float("inf"))  # noqa: E731
         report[name]["C, best of N"] = sum(max((x.get("term_C") or 0.0) if x["valid"] else 0.0 for x in q["samples"]) for q in qs) / max(len(qs), 1)
         report[name]["C beats VPD@matched: first sample"] = sum(q["samples"][0]["valid"] and vs_vpd(q["samples"][0], q) for q in qs) / max(len(qs), 1)

@@ -170,7 +170,7 @@ def sample(a) -> None:
                else service.create_sampling_client(base_model=a.base))
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=renderer.get_stop_sequences())
     questions = [json.loads(x) for x in a.questions.read_text().splitlines() if x.strip()][:a.n]
-    head = tokenizer.encode(a.prefix, add_special_tokens=False) if a.prefix else []
+    head = tokenizer.encode(("<think>\n\n</think>\n\n" if a.thinking else "") + a.prefix, add_special_tokens=False) if a.prefix else []  # thinking: the prefix after an empty think block
     futs = [(q, renderer.build_generation_prompt([{"role": "user", "content": q["question"]}])) for q in questions]
     if head:
         futs = [(q, prompt.append(tinker.types.EncodedTextChunk(tokens=head))) for q, prompt in futs]

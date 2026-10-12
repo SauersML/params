@@ -505,3 +505,10 @@ def test_matched_reward_is_c_and_n_over_vpd_at_the_same_size(tiny, monkeypatch):
     assert got[0]["term_N_matched"] == pytest.approx(got[0]["term_N"] - 0.25)
     assert got[0]["reward"] == pytest.approx(components.MATCH_CLIP + got[0]["term_N"] - 0.25 - 0.05 * got[0]["size"])
     assert got[1]["reward"] == components.INVALID_MATCHED and got[0]["reward_mean"] != got[0]["reward"]
+
+
+def test_qa_detail_scores_each_question_and_the_no_change_answer():
+    tok = lambda xs: [f"t{x}" for x in xs]  # noqa: E731
+    qs = [{"kind": "remove", "falls": True, "top": 5}, {"kind": "swap", "falls": False, "top": 9}, {"kind": "token", "falls": True, "top": 9}]
+    got = components.qa_detail(qs, {1: (True, components.shown("t5")), 2: (False, components.shown("t9"))}, tok, "t9")
+    assert got == [{"kind": "subcomponent removal", "right": 1.0, "right0": 0.0}, {"kind": "move/swap/insert", "right": 1.0, "right0": 1.0}]

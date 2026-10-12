@@ -91,25 +91,26 @@ class Pruner:
         """Per site the subcomponents among the nodes (the start set), all others being off in every run: their columns
         of V and U, and each node's column among them. The products then run on these alone (a sum over fewer
         terms: equal to the full products within float32 rounding, not to the bit)."""
-        tg = self.ge.nat.target
+        tg, T = self.ge.nat.target, self.tx.T
         self.sel = [(self.mat == j).nonzero().flatten() for j in range(len(self.names))]
         self.cols = []
+        self.flat = torch.empty(len(self.nodes), dtype=torch.long, device=self.t.device)  # each node's place in _site_masks' buffer
+        self.offsets, at = [], 0
         for j, n in enumerate(self.names):
             cols, ci = torch.unique(self.c[self.sel[j]], return_inverse=True)
             st = tg.site(n)
             self.cols.append((ci, (st.V.index_select(1, cols), st.U.index_select(0, cols))))
+            self.flat[self.sel[j]] = at + self.t[self.sel[j]] * len(cols) + ci
+            self.offsets.append((at, len(cols)))
+            at += T * len(cols)
+        self.width = at
 
     def _site_masks(self, on: torch.Tensor) -> dict:
-        """Each site's float mask [B, T, columns] of node subsets on [B, N]."""
-        nat, T = self.ge.nat, self.tx.T
-        out = {}
-        for j, n in enumerate(self.names):
-            sel, (ci, (V, _)) = self.sel[j], self.cols[j]
-            m = torch.zeros(len(on), T, V.shape[1], device=nat.dev)
-            if len(sel):
-                m[:, self.t[sel], ci] = on[:, sel].float()
-            out[n] = m
-        return out
+        """Each site's float mask [B, T, columns] of node subsets on [B, N]: views of one buffer filled in one step."""
+        T = self.tx.T
+        buf = torch.zeros(len(on), self.width, device=on.device)
+        buf[:, self.flat] = on.float()
+        return {n: buf[:, at:at + T * K].view(len(on), T, K) for n, (at, K) in zip(self.names, self.offsets)}
 
     def _run(self, masks: dict, B: int, start: int = 0, prefix: list | None = None, layer: int = 0, keys_values: bool = False):
         """The masked forward of B copies of the text (Target.hidden from start and layer, or its keys_values)."""

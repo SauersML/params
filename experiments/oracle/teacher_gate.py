@@ -5,7 +5,8 @@ many texts B is above, below and equal to A. The verdict per field is the interv
 excludes 0, no detectable difference otherwise; for "bits" and "nodes" lower is smaller, not worse. goal_eval scores F1
 in graph semantics, where an answer without edges connects nothing (f1_live 0): with --teacher DIR_A DIR_B the same
 comparison also runs on teacher.py's own summaries (summary_*.jsonl: the best path point's node-semantics F1, N, reward,
-size, positions, and seconds per text).
+size, positions, and seconds per text), and with --adv A.jsonl B.jsonl on teacher_v3.py --evaluate's held-out
+adversary scores (F1, N, f1_adv, f1_rob, size).
 
   experiments/oracle/teacher_gate.py SCORE.json A B [--fields f1_live,n_live,...] [--teacher DIR_A DIR_B]
 """
@@ -16,7 +17,7 @@ import json
 import random
 from pathlib import Path
 
-FIELDS = ("f1_live", "n_live", "f1_off", "n_off", "bits", "nodes", "changed_recovered_live", "f2_recovered_live", "carry_completeness",
+FIELDS = ("f1_live", "n_live", "f3", "f1_off", "n_off", "bits", "nodes", "changed_recovered_live", "f2_recovered_live", "carry_completeness",
           "n_real_live")
 
 
@@ -67,6 +68,7 @@ def main():
     ap.add_argument("b")
     ap.add_argument("--fields", default=",".join(FIELDS))
     ap.add_argument("--teacher", nargs=2, type=Path, metavar=("DIR_A", "DIR_B"), help="teacher.py output directories of A and B")
+    ap.add_argument("--adv", nargs=2, type=Path, metavar=("A.jsonl", "B.jsonl"), help="teacher_v3.py --evaluate scores of A and B")
     args = ap.parse_args()
     results = json.loads(args.score.read_text())
     A, B = rows(results, args.a), rows(results, args.b)
@@ -76,6 +78,10 @@ def main():
         SA, SB = summaries(args.teacher[0]), summaries(args.teacher[1])
         print(f"teacher.py summaries (node semantics): {len(set(SA) & set(SB))} texts in both")
         compare(SA, SB, args.a, args.b, ("f1", "n", "reward", "size", "positions", "seconds"))
+    if args.adv and all(p.exists() for p in args.adv):
+        VA, VB = ({json.loads(x)["task"]: json.loads(x) for x in p.read_text().splitlines() if x.strip()} for p in args.adv)
+        print(f"held-out adversary (teacher_v3.py --evaluate): {len(set(VA) & set(VB))} texts in both")
+        compare(VA, VB, args.a, args.b, ("f1", "n", "f1_adv", "f1_rob", "size"))
     print("per text (f1_live, n_live, nodes):")
     for t in tasks:
         a, b = A[t], B[t]

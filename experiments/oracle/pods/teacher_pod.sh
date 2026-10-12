@@ -15,13 +15,14 @@
 # summary_<RUN>-<j>_<k>.jsonl and locality_<RUN>-<j>_<k>.jsonl). A pod ends when its texts are done; HOURS caps each pod.
 #   experiments/oracle/pods/teacher_pod.sh HOURS
 #   env: RUN, SPLIT, N, OFFSET, TASKS, PODS, P, DEST, VPD, LABELS (a locality JSONL; TASKS' own "local" fields otherwise),
-#   LOCALITY, BATCH, TEACHER_ARGS (more teacher.py flags, e.g. "--edges --f1-start both"), REF, GPU, PRICE, VRAM, RAM, WAIT
+#   LOCALITY, BATCH, TEACHER_ARGS (more teacher.py flags, e.g. "--edges --f1-start both"), SCRIPT (teacher_v3.py for the v3
+#   search: no locality labels, needs VPD=FILE, which also holds its patterns), REF, GPU, PRICE, VRAM, RAM, WAIT
 #   (minutes of retries while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all)
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params
 H=${1:-2.0}
-RUN=${RUN:-a} SPLIT=${SPLIT:-heldout} N=${N:-20} OFFSET=${OFFSET:-0} PODS=${PODS:-1} P=${P:-2} BATCH=${BATCH:-32}
+SCRIPT=${SCRIPT:-teacher.py} RUN=${RUN:-a} SPLIT=${SPLIT:-heldout} N=${N:-20} OFFSET=${OFFSET:-0} PODS=${PODS:-1} P=${P:-2} BATCH=${BATCH:-32}
 DEST=${DEST:-/Users/user/mpd-data/graph_oracle/teacher/joint_$SPLIT}
 GPU=${GPU:-NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA RTX 4000 Ada Generation,NVIDIA RTX A4500,NVIDIA RTX A6000,NVIDIA A40}
 F=/Users/user/mpd-data/scratch/fleet/teacher_$RUN
@@ -48,7 +49,8 @@ for j in range(pods):
 print(f"{len(todo)} texts to teach of {len(ids[off:])} ({len(ids[off:]) - len(todo)} already in {dest}), {pods} pods")
 EOF
 ARGS="--batch $BATCH ${TEACHER_ARGS:-}"
-if [ -n "${LABELS:-}" ]; then cp "$LABELS" "$F/labels.jsonl"; ARGS="$ARGS --labels $F/labels.jsonl"
+if [ "$SCRIPT" != teacher.py ]; then :
+elif [ -n "${LABELS:-}" ]; then cp "$LABELS" "$F/labels.jsonl"; ARGS="$ARGS --labels $F/labels.jsonl"
 elif [ -s "$F/tasks_labels.jsonl" ]; then ARGS="$ARGS --labels $F/tasks_labels.jsonl"; fi
 if [ -n "${VPD:-}" ]; then cp "$VPD" "$F/vpd.pt"; fi
 names=()
@@ -76,7 +78,7 @@ cd /Users/user/params/method/oracle; python -B teacher.py --tasks $L --batch $BA
   for k in $(seq 0 $((P - 1))); do
     B="$A"
     [ -n "${LOCALITY:-}" ] && [ -z "${VPD:-}" ] && B="$B --labels $O/out/locality_$k.jsonl"
-    RUNS="$RUNS (python -B teacher.py --tasks $L --offset $k --stride $P $B --out $O/out > $O/teacher_$k.log 2>&1; echo \"exit \$?\" >> $O/teacher_$k.log) &"
+    RUNS="$RUNS (python -B $SCRIPT --tasks $L --offset $k --stride $P $B --out $O/out > $O/teacher_$k.log 2>&1; echo \"exit \$?\" >> $O/teacher_$k.log) &"
   done
   CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;

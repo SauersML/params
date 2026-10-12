@@ -18,12 +18,15 @@ features() adds the atlas's and the routed lens's facts (the Mac) to those the q
   learnability.py measure --texts 6000:6100 OUT.jsonl [--split train] [--device cuda] [--offset K --stride S] [--only FILE]
   learnability.py questions TRAIN_MEASURED.jsonl HELDOUT_MEASURED.jsonl OUT_DIR [--held 2000]
   learnability.py baselines OUT_DIR/features/train_32000.jsonl OUT_DIR/features/heldout.jsonl
+  learnability.py active --texts 6000:7000 ACTIVE.jsonl      arm "active"'s first stage (the Mac: VPD's importance)
 
 Questions (questions()): remove/cut/swap ask the KL bin (under 0.01, 0.01-0.1, 0.1-1, over 1 bit), falls and the new
 top token; rank asks the order of RANK_N of a text's removals by KL. Each kind's questions are drawn equally from the
 KL bins (draw()), training sets nested at 2k, 8k, 32k, held-out texts apart. Arms: "ids" (the subcomponents by name
-only), "features" (plus each one's per-text facts), "vocab" (ids, after a first stage on vocab.jsonl, each named
-subcomponent's static facts); rows carry the feature-only baselines' inputs in meta.
+only), "features" (plus each one's per-text facts); "vocab" (the ids rows after a first stage on vocab.jsonl, each
+named subcomponent's static facts), "active" (the ids rows after a first stage on active_rows(): from the text alone,
+which subcomponents VPD marks active at a position, with activation bins), and both first stages; rows carry the
+feature-only baselines' inputs in meta.
 """
 from __future__ import annotations
 
@@ -231,7 +234,7 @@ WINDOW = 48  # tokens shown before the target; and AROUND on either side of each
 AROUND = 6
 MIX = {"remove": 0.4, "cut": 0.2, "swap": 0.2, "rank": 0.2}
 RANK_N = 8
-ARMS = ("ids", "features", "vocab")  # (c), injected u/v, is primerl's part tokens on the ids rows
+ARMS = ("ids", "features")  # the "vocab" and "active" arms ask the ids rows after their first stage
 
 
 def kl_bin(kl: float) -> int:
@@ -345,7 +348,8 @@ def render(q: dict, rec: dict, arm: str, strings: list[str], tok, feats: dict) -
         answer = " ".join(names[i] for i in order)
         return {"prompt": "\n".join(lines) + "\n", "answer": answer, "choices": list(names), "label": order[0],
                 "meta": {"task": q["task"], "kind": "rank", "kls": [c["kl"] for c in q["cands"]],
-                         "nodes": [_plain_feats(by.get(tuple(c["node"])), tuple(c["node"]), t) for c in q["cands"]]}}
+                         "nodes": [_plain_feats(by.get(tuple(c["node"])), tuple(c["node"]), t) for c in q["cands"]],
+                         "slots": [[nt(tuple(c["node"])), c["node"]] for c in q["cands"]]}}
     if q["kind"] == "remove":
         what = f"remove {nt(nodes[0])}"
     elif q["kind"] == "cut":
@@ -364,6 +368,7 @@ def render(q: dict, rec: dict, arm: str, strings: list[str], tok, feats: dict) -
     answer = f"KL {BIN_TEXT[b]}; falls={'yes' if q['falls'] else 'no'}; top={tok([q['top']])[0]!r}"
     return {"prompt": "\n".join(lines) + "\n", "answer": answer, "choices": [f"KL {x};" for x in BIN_TEXT], "label": b,
             "meta": {"task": q["task"], "kind": q["kind"], "kl": q["kl"], "falls": q["falls"], "top": q["top"],
+                     "slots": [[nt(nd), list(nd)] for nd in nodes],
                      "nodes": [_plain_feats(by.get(nd), nd, t) for nd in nodes],
                      "act_change": q["act_changed"] - q["act_x"] if q["kind"] == "swap" else None}}
 
@@ -393,6 +398,42 @@ def vocab_rows(nodes: set, atlas, conn, tok) -> list[dict]:
                 lines.append("strongest readers: " + ", ".join(f"{components.node_text((conn.names[int(s)], 0, int(i))).rsplit('@', 1)[0]}"
                                                                 for s, i in zip(ps["site"][:4], ps["index"][:4])))
         out.append({"prompt": f"<subcomponent> {name}\n<question> what is it\n", "answer": "; ".join(lines), "meta": {"node": [n, c]}})
+    return out
+
+
+ACT_BINS = (1.0, 5.0)  # |activation| bin edges, (x . v) |u|: bins 1, 2, 3, signed
+ACTIVE_POSITIONS = 8  # per text: the target, then random positions
+ACTIVE_SITES = 4  # matrices asked per position
+
+
+def act_bin(a: float) -> str:
+    return ("+" if a >= 0 else "-") + str(1 + sum(abs(a) >= b for b in ACT_BINS))
+
+
+@torch.no_grad()
+def active_rows(nat, task: dict, tok, rng: random.Random) -> list[dict]:
+    """Arm "active"'s first stage, from the text alone: at ACTIVE_POSITIONS positions (the target and random ones) and
+    ACTIVE_SITES random matrices each, the subcomponents VPD marks active there (causal importance above zero) with
+    their activation bins (act_bin), largest first: {"prompt", "answer", "meta"}."""
+    import components
+
+    p = task["prompts"][0]
+    ids, t = p["token_ids"], max(p["target_positions"])
+    ci, acts = nat.importance(ids), nat.activations(ids)
+    strings = tok(ids)
+    where = [t] + rng.sample(range(1, t), min(t - 1, ACTIVE_POSITIONS - 1))
+    out = []
+    for q in where:
+        lo = max(0, q - WINDOW)
+        text = f"[{lo}]" + repr("".join(strings[lo:q + 1]))
+        for n in rng.sample(nat.names, ACTIVE_SITES):
+            on = (ci[n][q] > 0).nonzero().flatten().tolist()
+            on.sort(key=lambda c: -abs(float(acts[n][q, c])))
+            site = components.node_text((n, q, 0)).split("#")[0]
+            out.append({"prompt": f"<text> {text}\n<position> {q}, {strings[q]!r}\n<question> the active subcomponents of {site} "
+                                  "here, largest activation first, with activation bins\n",
+                        "answer": " ".join(f"#{c}:{act_bin(float(acts[n][q, c]))}" for c in on) or "none",
+                        "meta": {"task": task["id"], "position": q, "site": n, "active": len(on)}})
     return out
 
 
@@ -520,6 +561,9 @@ def main():
     qa.add_argument("heldout", help="measure's output on held-out texts")
     qa.add_argument("out_dir")
     qa.add_argument("--held", type=int, default=2_000)
+    ac = sub.add_parser("active")
+    ac.add_argument("--texts", required=True, help="A:B, text numbers (train split)")
+    ac.add_argument("out")
     bs = sub.add_parser("baselines")
     bs.add_argument("train", help="questions' features/train_<n>.jsonl")
     bs.add_argument("heldout", help="questions' features/heldout.jsonl")
@@ -527,6 +571,24 @@ def main():
     if args.cmd == "baselines":
         read = lambda f: [json.loads(x) for x in Path(f).read_text().splitlines() if x.strip()]  # noqa: E731
         return print(json.dumps(baselines(read(args.train), read(args.heldout)), indent=1))
+    if args.cmd == "active":
+        import components
+
+        nat = native.Native("cpu")
+        tok = lambda xs: components.token_strings("vpd4l", xs)  # noqa: E731
+        lo, hi = map(int, args.texts.split(":"))
+        rows = []
+        for k in range(lo, hi):
+            path = native.TEXTS / "vpd4l" / f"text{k}.json"
+            if not path.exists():
+                continue
+            task = json.loads(path.read_text())
+            if task["split"] != "train" or max(task["prompts"][0]["target_positions"]) < 2:
+                continue
+            rows += active_rows(nat, task, tok, random.Random(native.task_seed(task["id"])))
+        random.Random(0).shuffle(rows)
+        Path(args.out).write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return print(f"{len(rows)} rows, {sum(r['meta']['active'] for r in rows)} active labels")
     if args.cmd == "questions":
         read = lambda f: [json.loads(x) for x in Path(f).read_text().splitlines() if x.strip()]  # noqa: E731
         return questions(read(args.train), read(args.heldout), Path(args.out_dir), held=args.held)

@@ -1,5 +1,6 @@
 """The learnability experiment's training and scoring (experiments/oracle/learnability.py's questions): LoRA SFT of a
-base model on one arm's training set (the "vocab" arm first on vocab.jsonl), then held-out scoring.
+base model on one arm's training set (after a first stage's adapter with --init: the vocab, active and both arms),
+then held-out scoring.
 
 Rows are {"prompt", "answer", "choices", "label", "meta"}; the model reads prompt + "<answer> " and is trained on the
 answer and an end token. Scoring, per held-out row:
@@ -9,8 +10,8 @@ answer and an end token. Scoring, per held-out row:
   rank:              the first candidate's probability over the letters (top-1 log loss and accuracy) and the greedy
                      answer's order against the measured one (Kendall's tau).
 
-  learn_sft.py train ARM_DIR/train_N.jsonl OUT_DIR [--vocab VOCAB.jsonl] [--base Qwen/Qwen3-1.7B] [--epochs 2]
-  learn_sft.py score ARM_DIR/heldout.jsonl OUT.jsonl [--adapter OUT_DIR/adapter] [--base ...]
+  learn_sft.py train ROWS.jsonl OUT_DIR [--init FIRST_STAGE_DIR/adapter] [--inject] [--base Qwen/Qwen3-1.7B] [--epochs 2]
+  learn_sft.py score ARM_DIR/heldout.jsonl OUT.jsonl [--adapter OUT_DIR/adapter] [--inject [--shuffle]] [--base ...]
   learn_sft.py report SCORES.jsonl ...
 """
 from __future__ import annotations
@@ -30,12 +31,80 @@ def _rows(path) -> list[dict]:
     return [json.loads(x) for x in Path(path).read_text().splitlines() if x.strip()]
 
 
-def _encode(tok, rows: list[dict]) -> list[tuple[list[int], list[int]]]:
-    return [(tok(r["prompt"] + ANSWER, add_special_tokens=False)["input_ids"],
-             tok(r["answer"], add_special_tokens=False)["input_ids"] + [tok.eos_token_id]) for r in rows]
+class Slots:
+    """Arm "inject": two placeholder tokens after each subcomponent a question names (meta["slots"]), their input
+    embeddings its read vector v and write vector u through method/oracle/rl/inject.py's Injector (per site kind and
+    side a linear map to the width, at the token embeddings' RMS, plus its log |u||v|), trained with the LoRA. shuffle:
+    each named subcomponent gets the vectors of another of the same kind named in some question (pool), the ablation
+    that shows whether they are read."""
+
+    def __init__(self, model, tok, init: Path | None = None, shuffle: bool = False):
+        import sys
+
+        import torch
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle" / "rl"))
+        import inject
+
+        self.inject, self.shuffle = inject, shuffle
+        self.vectors = inject.Vectors()
+        emb = model.get_input_embeddings().weight.detach().float()
+        self.injector = inject.Injector(self.vectors.dims(), emb.shape[1], float(emb.pow(2).mean(-1).sqrt().mean()),
+                                        self.vectors.logn_mean, self.vectors.logn_std).cuda()
+        if init is not None:
+            self.injector.load_state_dict(torch.load(Path(init) / "injector.pt", map_location="cuda"))
+        self.slot = tok.convert_tokens_to_ids(inject.SLOT)
+        self.pool = {}
+
+    def pool_from(self, rows: list[dict]) -> None:
+        for r in rows:
+            for _, nd in r["meta"].get("slots", []):
+                self.pool.setdefault(nd[0].split(".")[-1], set()).add(tuple(nd))
+        self.pool = {k: sorted(v) for k, v in self.pool.items()}
+
+    def prompt(self, r: dict) -> tuple[str, list[tuple]]:
+        text, at, nodes = r["prompt"], 0, []
+        for name, nd in r["meta"]["slots"]:
+            i = text.find(name, at)
+            if i < 0:
+                continue
+            cut = i + len(name)
+            text = text[:cut] + " " + self.inject.SLOT * 2 + text[cut:]
+            at = cut + 1 + 2 * len(self.inject.SLOT)
+            nodes.append(tuple(nd))
+        if self.shuffle:  # another subcomponent's vectors of the same kind (its maps' widths), from any question
+            rng = random.Random(text)
+            nodes = [rng.choice([x for x in self.pool[nd[0].split(".")[-1]] if x != nd] or [nd]) for nd in nodes]
+        return text, nodes
+
+    def embeds(self, model, ids, nodes: list[list[tuple]]):
+        emb = model.get_input_embeddings()(ids)
+        for r, nds in enumerate(nodes):
+            pos = (ids[r] == self.slot).nonzero().flatten()
+            if not len(pos):
+                continue
+            vec = self.injector([(nd[0].split(".")[-1], *self.vectors(nd)) for nd in nds])
+            emb = emb.index_put((pos.new_full(pos.shape, r), pos), vec.to(emb.dtype))
+        return emb
+
+    def param_groups(self, rank: int, lr: float) -> list[dict]:
+        """The maps at lr x rank / fan_in (inject.Explainer.param_groups: their outputs then move per step as the LoRA's)."""
+        import torch
+
+        return [{"params": list(m.parameters()), "lr": lr * rank / m.in_features} for m in self.injector.modules()
+                if isinstance(m, torch.nn.Linear)]
 
 
-def _model(base: str, adapter: str | None = None, rank: int = 0):
+def _encode(tok, rows: list[dict], slots: Slots | None = None) -> list[tuple[list[int], list[int], list[tuple]]]:
+    out = []
+    for r in rows:
+        text, nodes = slots.prompt(r) if slots else (r["prompt"], [])
+        out.append((tok(text + ANSWER, add_special_tokens=False)["input_ids"],
+                    tok(r["answer"], add_special_tokens=False)["input_ids"] + [tok.eos_token_id], nodes))
+    return out
+
+
+def _model(base: str, adapter: str | None = None, rank: int = 0, trainable: bool = False):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -44,7 +113,10 @@ def _model(base: str, adapter: str | None = None, rank: int = 0):
     if adapter:
         from peft import PeftModel
 
-        model = PeftModel.from_pretrained(model, adapter)
+        if trainable:
+            model.gradient_checkpointing_enable()
+            model.enable_input_require_grads()
+        model = PeftModel.from_pretrained(model, adapter, is_trainable=trainable)
     elif rank:
         from peft import LoraConfig, get_peft_model
 
@@ -63,30 +135,36 @@ def _batches(enc: list, batch: int, rng: random.Random) -> list[list]:
     return out
 
 
-def _loss(model, batch, pad: int):
+def _loss(model, batch, pad: int, slots: Slots | None = None):
     """Summed answer-token cross entropy (nats) and the answer token count of a padded batch."""
     import torch
 
-    L = max(len(p) + len(c) for p, c in batch)
+    L = max(len(p) + len(c) for p, c, _ in batch)
     ids = torch.full((len(batch), L), pad, dtype=torch.long)
     labels = torch.full((len(batch), L), -100, dtype=torch.long)
     att = torch.zeros((len(batch), L), dtype=torch.long)
-    for i, (p, c) in enumerate(batch):
+    for i, (p, c, _) in enumerate(batch):
         ids[i, :len(p) + len(c)] = torch.tensor(p + c)
         labels[i, len(p):len(p) + len(c)] = torch.tensor(c)
         att[i, :len(p) + len(c)] = 1
     ids, labels, att = ids.cuda(), labels.cuda(), att.cuda()
-    logits = model(input_ids=ids, attention_mask=att).logits[:, :-1].float()
+    if slots is None:
+        logits = model(input_ids=ids, attention_mask=att).logits[:, :-1].float()
+    else:
+        logits = model(inputs_embeds=slots.embeds(model, ids, [n for _, _, n in batch]), attention_mask=att).logits[:, :-1].float()
     loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1), reduction="sum", ignore_index=-100)
     return loss, int((labels[:, 1:] != -100).sum())
 
 
-def _fit(model, tok, enc: list, epochs: int, lr: float, batch: int, log, tag: str, seed: int = 0) -> None:
+def _fit(model, tok, enc: list, epochs: int, lr: float, batch: int, log, tag: str, seed: int = 0, slots: Slots | None = None,
+         rank: int = 32) -> None:
     import torch
 
     rng = random.Random(seed)
     params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+    groups = [{"params": params, "lr": lr}] + (slots.param_groups(rank, lr) if slots else [])
+    params += [p for g in groups[1:] for p in g["params"]]
+    opt = torch.optim.AdamW(groups, lr=lr, weight_decay=0.0)
     steps = epochs * math.ceil(len(enc) / batch)
     warm = max(1, steps // 20)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * s / steps)))
@@ -95,7 +173,7 @@ def _fit(model, tok, enc: list, epochs: int, lr: float, batch: int, log, tag: st
     step, t0, run = 0, time.time(), []
     for _ in range(epochs):
         for b in _batches(enc, batch, rng):
-            loss, n = _loss(model, b, pad)
+            loss, n = _loss(model, b, pad, slots)
             (loss / n).backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
@@ -114,16 +192,17 @@ def train(a) -> None:
     import torch
 
     torch.manual_seed(0)
-    tok, model = _model(a.base, rank=a.rank)
+    tok, model = _model(a.base, adapter=a.init, rank=a.rank, trainable=True)
+    slots = Slots(model, tok, init=Path(a.init) if a.init and (Path(a.init) / "injector.pt").exists() else None) if a.inject else None
     a.out.mkdir(parents=True, exist_ok=True)
     log = open(a.out / "train.jsonl", "a")
-    if a.vocab:
-        _fit(model, tok, _encode(tok, _rows(a.vocab)), a.vocab_epochs, a.lr, a.batch, log, "vocab")
-    _fit(model, tok, _encode(tok, _rows(a.rows)), a.epochs, a.lr, a.batch, log, "task")
+    _fit(model, tok, _encode(tok, _rows(a.rows), slots), a.epochs, a.lr, a.batch, log, Path(a.rows).stem, slots=slots, rank=a.rank)
     model.save_pretrained(a.out / "adapter")
+    if slots:
+        torch.save(slots.injector.state_dict(), a.out / "adapter" / "injector.pt")
 
 
-def _logp(model, tok, prompts: list[list[int]], conts: list[list[int]]) -> list[float]:
+def _logp(model, tok, prompts: list[list[int]], conts: list[list[int]], nodes: list | None = None, slots: Slots | None = None) -> list[float]:
     """log p(cont | prompt) (nats) of each pair, batched."""
     import torch
 
@@ -138,7 +217,10 @@ def _logp(model, tok, prompts: list[list[int]], conts: list[list[int]]) -> list[
             ids[i, :len(p) + len(c)] = torch.tensor(p + c)
             att[i, :len(p) + len(c)] = 1
         with torch.no_grad():
-            logits = model(input_ids=ids.cuda(), attention_mask=att.cuda()).logits
+            if slots is None:
+                logits = model(input_ids=ids.cuda(), attention_mask=att.cuda()).logits
+            else:
+                logits = model(inputs_embeds=slots.embeds(model, ids.cuda(), nodes[b:b + 8]), attention_mask=att.cuda()).logits
             for i, (p, c) in enumerate(zip(P, C)):
                 lp = logits[i, len(p) - 1:len(p) - 1 + len(c)].float().log_softmax(-1)
                 out.append(float(lp[torch.arange(len(c)), torch.tensor(c, device=lp.device)].sum()))
@@ -151,23 +233,30 @@ def score(a) -> None:
 
     tok, model = _model(a.base, adapter=a.adapter)
     model.eval()
+    slots = Slots(model, tok, init=Path(a.adapter), shuffle=a.shuffle) if a.inject else None
     rows = _rows(a.rows)
+    if slots:
+        slots.pool_from(rows)
     enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]  # noqa: E731
+    prompt = lambda r: slots.prompt(r) if slots else (r["prompt"], [])  # noqa: E731
     out = open(a.out, "w")
     eff = [r for r in rows if r["meta"]["kind"] != "rank"]
-    P, C, who = [], [], []
+    P, C, N, who = [], [], [], []
     for i, r in enumerate(eff):
-        p = enc(r["prompt"] + ANSWER)
+        text, nodes = prompt(r)
+        p = enc(text + ANSWER)
         for ch in r["choices"]:
             P.append(p)
             C.append(enc(ch))
+            N.append(nodes)
             who.append(("bin", i))
         head = enc(r["choices"][r["label"]])
         for f in (" falls=yes;", " falls=no;"):
             P.append(p + head)
             C.append(enc(f))
+            N.append(nodes)
             who.append(("falls", i))
-    lps = _logp(model, tok, P, C)
+    lps = _logp(model, tok, P, C, N, slots)
     got = {}
     for (what, i), lp in zip(who, lps):
         got.setdefault((what, i), []).append(lp)
@@ -180,11 +269,17 @@ def score(a) -> None:
                               "p_bins": b.exp().tolist()}) + "\n")
     letters = "abcdefgh"
     for r in (r for r in rows if r["meta"]["kind"] == "rank"):
-        p = enc(r["prompt"] + ANSWER)
-        lp = torch.tensor(_logp(model, tok, [p] * len(letters), [enc(x) for x in letters])).log_softmax(0)
+        text, nodes = prompt(r)
+        p = enc(text + ANSWER)
+        lp = torch.tensor(_logp(model, tok, [p] * len(letters), [enc(x) for x in letters], [nodes] * len(letters), slots)).log_softmax(0)
+        x = torch.tensor([p]).cuda()
         with torch.no_grad():
-            g = model.generate(input_ids=torch.tensor([p]).cuda(), max_new_tokens=24, do_sample=False)
-        text = tok.decode(g[0, len(p):], skip_special_tokens=True).split()
+            if slots is None:
+                g = model.generate(input_ids=x, max_new_tokens=24, do_sample=False)[0, len(p):]
+            else:  # from embeddings, generate returns the new tokens alone
+                g = model.generate(inputs_embeds=slots.embeds(model, x, [nodes]), attention_mask=torch.ones_like(x),
+                                   max_new_tokens=24, do_sample=False)[0]
+        text = tok.decode(g, skip_special_tokens=True).split()
         order = [x for x in dict.fromkeys(text) if x in letters][:len(letters)]
         order += [x for x in letters if x not in order]
         kls = r["meta"]["kls"]
@@ -219,8 +314,8 @@ def main():
     t = sub.add_parser("train")
     t.add_argument("rows")
     t.add_argument("out", type=Path)
-    t.add_argument("--vocab")
-    t.add_argument("--vocab-epochs", type=int, default=2)
+    t.add_argument("--init", help="an adapter to go on from (a first stage's)")
+    t.add_argument("--inject", action="store_true", help="the subcomponents' vectors in slots (Slots)")
     t.add_argument("--base", default="Qwen/Qwen3-1.7B")
     t.add_argument("--epochs", type=int, default=2)
     t.add_argument("--lr", type=float, default=2e-4)
@@ -230,6 +325,8 @@ def main():
     s.add_argument("rows")
     s.add_argument("out")
     s.add_argument("--adapter")
+    s.add_argument("--inject", action="store_true")
+    s.add_argument("--shuffle", action="store_true", help="with --inject: the vectors deranged within each question")
     s.add_argument("--base", default="Qwen/Qwen3-1.7B")
     r = sub.add_parser("report")
     r.add_argument("scores", nargs="+")

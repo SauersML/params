@@ -943,7 +943,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     network for VPD's bounds) is left out of the mean. F3, the AUC of stated edges' cuts in the circuit's run, is
     reported (term_F3), never in the mean. C (term_C), the circuit term in the mean in place of F1: goal_eval.fidelity's
     reward mode, the mean of the stated graph's F1, its agreement under random node removals and under random
-    connection cuts, and its F1 with the flip adversary's FLIP_TERM parts switched on (pool: the adversary's pattern
+    connection cuts, and its F1 with the flip adversary's FLIP_TERM parts switched on (the point and flip members each
+    at most what the answer's nodes reach with every connection among them restored: cutting a connection that
+    carries counter-signal earns nothing, 2ace8ee) (pool: the adversary's pattern
     pool, POOL by default; {} leaves the adversary out, for a model without one); F1 is reported (term_F1), as are C's
     members (fidelity). reader: a reader.Reader for E1, or e1: each text's reader bits
     computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
@@ -1006,7 +1008,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
                     "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
                     "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row,
-                    "fidelity": {k: v for k, v in (c_of.get(i) or {}).items() if k in ("s_point", "s_nodes", "s_edges", "f1_flips_omitted")}})
+                    "fidelity": {k: v for k, v in (c_of.get(i) or {}).items() if k in ("s_point_c", "s_point", "s_wiring", "s_nodes", "s_edges", "f1_flips_c", "f1_flips_omitted")}})
     return out
 
 

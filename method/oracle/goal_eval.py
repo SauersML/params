@@ -12,11 +12,13 @@ embedding, which VPD does not decompose, is how a token's change reaches a circu
 
 Runs use VPD's semantics: a run "with circuit C" has C's subcomponents on (mask 1) and every other one off (mask 0), the
 remainders W - V U either on ("live", computing on the run's own inputs) or off; both conventions are reported. An
-answer runs as the graph it states (native.Native.run on its Graph, teacher.EdgePruner's semantics): a node's output
-reaches a reader, or the prediction, only through a stated edge; the token embedding and the remainders are the
-background every reader reads in full; query and key nodes enter their layer's attention pattern (the format gives
-them no edges out). An answer stating no edge is the empty circuit (with live remainders, up to its query and key
-nodes' effect on the pattern the remainders' values pass through). Baselines (VPD's answer, its top
+answer runs as the graph it states (GoalEval.graph_ref, the lead's decision 10-12): inside the circuit, graph semantics,
+a circuit node's output reaching a circuit reader, or the prediction, only through a stated edge (each reader reads the
+background and its stated parents); outside it, masked semantics, every other subcomponent (at its mask) and the
+remainders reading the full residual stream, the circuit's outputs included, as in the real model, and writing into the
+background with the token embedding; query and key nodes enter their layer's attention pattern (the format gives them
+no edges out). Every connection stated is the masked run of the circuit's subcomponents; none stated, remainders off,
+is the empty circuit (live, the remainders carry the circuit's outputs into the background). Baselines (VPD's answer, its top
 k, the empty circuit) are complete graphs: their subcomponents read each other in full (VPD's masked forward). Every
 KL is the model's next-token distribution at the targets (summed over them) from the run's, in bits. VPD's own answer
 is the set of subcomponents with causal importance above zero on the input (at positions that can reach the targets,
@@ -422,6 +424,82 @@ class GoalEval:
         nat = self.nat
         return sum(int(m.sum()) for m in tx.vpd.values()) * math.log2(nat.positions(tx.targets) * sum(nat.C.values()))
 
+    def graph_ref(self, ids: list[int], targets: list[int], graph: native.Graph, u: dict | None = None, live: bool = True,
+                  record: dict | None = None) -> torch.Tensor:
+        """log q at the targets [B, len(targets), V] of a stated graph's run in C's semantics (the lead's decision, 10-12):
+        inside the circuit, graph semantics, each circuit node reading the full residual stream less the outputs of the
+        circuit nodes that are not its stated parents (the background and its stated parents; a value's share through
+        the attention pattern into an attention output, an MLP input's output into its MLP's output), the prediction
+        the same with its stated out-writers; outside, masked semantics, every other subcomponent at its mask u ({site:
+        [B, T, C]}, None: 0) and the remainders (live) reading the full stream, the circuit's outputs included, as in
+        the real model. Query and key nodes enter their layer's attention pattern. A forward pass written out, the
+        reference engine.Engine's graph mode matches; differentiable in u. With every connection stated it is the
+        masked run of the circuit's subcomponents and u. record: receives each circuit node's read (its activation)
+        {node: [B]}."""
+        import vpd_model
+
+        nat, tg = self.nat, self.nat.target
+        T, H, hd, dev = len(ids), tg.n_head, tg.hd, self.nat.dev
+        nodes = sorted(graph.node_set())
+        par_all, out_all = native.all_edges(nodes, targets)
+        stated = {r: set(ws) for r, ws in graph.parents.items()}
+        cut = {}
+        for r, ws in par_all.items():
+            drop = [w for w in ws if w not in stated.get(r, set())]
+            if drop:
+                cut.setdefault(r[0], []).append((r, drop))
+        cut_out = [w for w in out_all if w not in set(graph.out)]
+        B = 1 if u is None else next(iter(u.values())).shape[0]
+        circ = {n: torch.zeros(T, nat.C[n], device=dev) for n in nat.names}
+        for n, t, c in nodes:
+            circ[n][t, c] = 1.0
+        on = {n: circ[n][None].expand(B, -1, -1) if u is None else u[n] * (1 - circ[n]) + circ[n] for n in nat.names}
+        a = {}
+
+        def write(w):  # a circuit writer's output [B, d_out]
+            return a[w[0]][:, w[1], w[2], None] * tg.site(w[0]).U[w[2]]
+
+        def site(n, inp, restricted):  # the site's output; circuit readers with unstated writers read restricted(r, ws)
+            A = inp @ tg.site(n).V
+            if n in cut:
+                A = A.clone()
+                for r, ws in cut[n]:
+                    A[:, r[1], r[2]] = restricted(r, ws) @ tg.site(n).V[:, r[2]]
+            a[n] = A
+            out = (A * on[n]) @ tg.site(n).U
+            return out + inp @ tg.site(n).delta_T if live else out
+
+        x = tg.wte[torch.tensor(ids, device=dev)][None].expand(B, -1, -1)
+        causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
+        for i in range(tg.n_layer):
+            nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
+            z = vpd_model.rms(x, tg.norms[2 * i], tg.eps)
+            resid = lambda r, ws, x=x, i=i: vpd_model.rms(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i], tg.eps)  # noqa: E731
+            q, k, v = (site(nm[kk], z, resid).view(B, T, H, hd).transpose(1, 2) for kk in ("q_proj", "k_proj", "v_proj"))
+            q, k = tg._rope(q, T), tg._rope(k, T)
+            P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
+            att = (P @ v).transpose(1, 2).reshape(B, T, -1)
+            share = lambda r, ws, att=att, P=P: att[:, r[1]] - sum(  # noqa: E731
+                P[:, :, r[1], w[1]].repeat_interleave(hd, dim=1) * write(w) for w in ws)
+            x = x + site(nm["o_proj"], att, share)
+            z2 = vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps)
+            resid2 = lambda r, ws, x=x, i=i: vpd_model.rms(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i + 1], tg.eps)  # noqa: E731
+            pre = site(nm["c_fc"], z2, resid2)
+            x = x + site(nm["down_proj"], vpd_model.gelu_tanh(pre),
+                         lambda r, ws, pre=pre: vpd_model.gelu_tanh(pre[:, r[1]] - sum(write(w) for w in ws)))
+        xt = x[:, targets]
+        if cut_out:
+            xt = xt.clone()
+            for j, t in enumerate(targets):
+                ws = [w for w in cut_out if w[1] == t]
+                if ws:
+                    xt[:, j] = xt[:, j] - sum(write(w) for w in ws)
+        if record is not None:
+            for nd in nodes:
+                record[nd] = a[nd[0]][:, nd[1], nd[2]].detach()
+        return torch.log_softmax((vpd_model.rms(xt, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
+
+
     def graph_kl(self, tx: Text, graphs: list[native.Graph], live: bool) -> list[float]:
         """KL in bits at the targets of each stated graph's run on the text (_graph_kl)."""
         return self._graph_kl(tx.ids, tx.targets, tx.ref, graphs, live, self._bounds(tx, "live" if live else "off")[0])
@@ -429,22 +507,14 @@ class GoalEval:
     @torch.no_grad()
     def _graph_kl(self, ids: list[int], targets: list[int], ref: torch.Tensor, graphs: list[native.Graph], live: bool,
                   empty_kl: float) -> list[float]:
-        """KL in bits at the targets, from the model's log probabilities ref, of each stated graph's run on ids:
-        native.Native.run on the graph (a node's output reaches a reader only through a stated edge, every other
-        subcomponent off, the token embedding in full, remainders on (live) or off), teacher.EdgePruner's semantics; a
-        graph with no node is the empty circuit (empty_kl)."""
-        nat = self.nat
-        u, ur = nat._zero()
-        if live:
-            ur = nat._one()[1]
+        """KL in bits at the targets, from the model's log probabilities ref, of each stated graph's run on ids in C's
+        semantics (graph_ref: graph inside the circuit, masked outside, every other subcomponent off, remainders on
+        (live) or off); a graph with no node is the empty circuit (empty_kl)."""
         out = [empty_kl] * len(graphs)
-        some = [i for i, g in enumerate(graphs) if g.count()]
-        for s0 in range(0, len(some), self.chunk):
-            idx = some[s0:s0 + self.chunk]
-            plan = nat._plan([graphs[i] for i in idx], len(ids))
-            for i, k in zip(idx, carry.kl(ref, nat.run(ids, targets, plan, u, ur)).tolist()):
-                out[i] = k
-            native.free(nat.dev)
+        for i, g in enumerate(graphs):
+            if g.count():
+                out[i] = float(carry.kl(ref, self.graph_ref(ids, targets, g, live=live))[0])
+        native.free(self.nat.dev)
         return out
 
     def _bounds(self, tx: Text, conv: str) -> tuple[float, float | None]:
@@ -770,21 +840,19 @@ class GoalEval:
 
     @torch.no_grad()
     def _graph_logq(self, ids: list[int], targets: list[int], graphs: list[native.Graph], ew_rows=None) -> torch.Tensor:
-        """log q at the targets of stated graphs' runs (graph semantics, remainders live); ew_rows: per graph a 0/1
-        vector over its connections (graph.parents reader by reader, then graph.out), the connections at 0 cut."""
-        nat = self.nat
-        u, ur = nat._zero()
-        ur = nat._one()[1]
+        """log q at the targets of stated graphs' runs in C's semantics (graph_ref, remainders live); ew_rows: per graph
+        a 0/1 vector over its connections (graph.parents reader by reader, then graph.out), the connections at 0 cut."""
         out = []
-        for s0 in range(0, len(graphs), self.chunk):
-            part = graphs[s0:s0 + self.chunk]
-            plan = nat._plan(part, len(ids))
-            ew = ow = None
+        for j, g in enumerate(graphs):
             if ew_rows is not None:
-                ew, ow = nat.edge_weights(plan, torch.cat([ew_rows[s0 + i] for i in range(len(part))]).float().to(nat.dev))
-            out.append(nat.run(ids, targets, plan, u, ur, ew, ow))
-            native.free(nat.dev)
-        return torch.cat(out)
+                keep = ew_rows[j].tolist()
+                order = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
+                kept = [e for e, k in zip(order, keep) if k]
+                g = native.Graph(g.nodes, {r: [w for w, rr in kept if rr == r] for r in g.parents
+                                           if any(rr == r for _, rr in kept)}, [w for w, rr in kept if rr is None])
+            out.append(self.graph_ref(ids, targets, g)[0])
+        native.free(self.nat.dev)
+        return torch.stack(out)
 
     @torch.no_grad()
     def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int) -> list[dict]:
@@ -831,7 +899,7 @@ class GoalEval:
                     gm[n][t, at[n][c]] = 1.0
                 lc = Ec.log_probs(without(gm, drops, at))
             else:
-                lc = Ec.graph_log_probs(Ec.plan([_drop_nodes(g, set(d)) for d in drops]))
+                lc = self._graph_logq(tx.ids, tx.targets, [_drop_nodes(g, set(d)) for d in drops])  # C's semantics (graph_ref)
             out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean())})
             native.free(dev)
         return out
@@ -995,8 +1063,6 @@ class GoalEval:
             omit = {n: vpd_on[n] & ~on[n] & where for n in nat.names}
             parts.append({"on": on, "free": {n: (~vpd_on[n] & ~on[n] & where).float() for n in nat.names},
                           "idx": {n: omit[n].nonzero(as_tuple=True) for n in nat.names}})
-        plans = {}
-
         def masks(i, w, b):  # circuit i's adversary masks (outside the circuit) and VPD's run's, [R, T, columns]
             R, q = w.shape[0], parts[i]
             uc, mv = {}, {}
@@ -1021,10 +1087,9 @@ class GoalEval:
                 if complete:
                     got = E.kl({n: torch.cat([parts[items[j][0]]["on"][n].float() + built[j][0][n] for j in js]) for n in nat.names}, precision)
                 else:
-                    key = tuple((items[j][0], R[j]) for j in js)  # a list of graphs, one per row
-                    if key not in plans:
-                        plans[key] = E.plan([graphs[i] for i, r in key for _ in range(r)])
-                    got = E.graph_kl(plans[key], u={n: torch.cat([built[j][0][n] for j in js]) for n in nat.names}, precision=precision)
+                    # C's semantics (graph inside, masked outside): graph_ref on the adversary's masks over every column
+                    got = torch.cat([carry.kl(E.ref, self.graph_ref(tx.ids, tx.targets, graphs[items[j][0]], u=E.full(built[j][0])))
+                                     for j in js])
                 for j, x in zip(js, got.split([R[j] for j in js])):
                     kc[j] = x
             if not vpd:

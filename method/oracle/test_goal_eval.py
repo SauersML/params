@@ -560,19 +560,15 @@ def test_real_removal(tiny):
 
 
 def _graph_checks(nat, ge, tx, nodes, rel):
-    """Graph F1 on a node set: every connection stated is the complete run (exact with remainders off, within rel live:
-    a remainder reads the stream without the circuit's outputs in graph semantics); no connection stated is the empty
-    circuit (live, only without query or key nodes: they enter their layer's attention pattern, which the live
-    remainders' values pass through)."""
+    """Graph F1 on a node set: every connection stated is the complete run (rel: float32 between the reference forward
+    and the masked one); no connection stated, remainders off, is the empty circuit; N does not depend on edges."""
     par, out = native.all_edges(nodes, tx.targets)
     rows = ge.sufficiency(tx, [native.Graph(nodes, par, out), native.Graph(nodes, complete=True), native.Graph(nodes, {}, [])])
     every, whole, none = rows
-    assert abs(every["kl_off"] - whole["kl_off"]) < 1e-4 * max(1.0, whole["kl_off"]), (every["kl_off"], whole["kl_off"])
-    assert abs(every["kl_live"] - whole["kl_live"]) < rel * max(1.0, whole["kl_live"]), (every["kl_live"], whole["kl_live"])
-    qk = any(n.endswith(("q_proj", "k_proj")) for n, _, _ in nodes)
-    for conv in ("off",) if qk else ("off", "live"):
-        assert abs(none[f"kl_{conv}"] - none[f"kl_empty_{conv}"]) < 1e-4 * max(1.0, none[f"kl_empty_{conv}"])
+    for conv in ("off", "live"):
+        assert abs(every[f"kl_{conv}"] - whole[f"kl_{conv}"]) < rel * max(1.0, whole[f"kl_{conv}"]), (conv, every[f"kl_{conv}"], whole[f"kl_{conv}"])
         assert none[f"n_{conv}"] == every[f"n_{conv}"] == whole[f"n_{conv}"]  # N is node removal: edges do not enter
+    assert abs(none["kl_off"] - none["kl_empty_off"]) < 1e-4 * max(1.0, none["kl_empty_off"])
     return every, whole, none
 
 
@@ -582,7 +578,7 @@ def test_graph_f1_runs_the_stated_graph(tiny):
     nat, ge, tx = tiny
     g = random_graph(nat, tx, seed=11, k=10, stated=1.0)
     nodes = sorted(g.node_set())
-    _graph_checks(nat, ge, tx, nodes, 5e-2)
+    _graph_checks(nat, ge, tx, nodes, 1e-4)
     par, out = native.all_edges(nodes, tx.targets)
     full, _ = naive(nat, tx.ids)
     on = mask_of(nat, tx.T, nodes)
@@ -609,7 +605,7 @@ def test_graph_f1_on_the_teachers_text9000_circuit(real):
     ids, targets = native.text(p)
     tx = ge.text(ids, targets, native.task_seed("text9000"), json.loads(p.read_text()))
     nodes = sorted((n, t, c) for n, c, t in json.loads(teacher.read_text())["nodes"] if n != "tok")
-    every, whole, none = _graph_checks(nat, ge, tx, nodes, 1e-2)
+    every, whole, none = _graph_checks(nat, ge, tx, nodes, 1e-3)
     print(f"text9000 teacher, {len(nodes)} nodes: KL live {every['kl_live']:.4f} stated / {whole['kl_live']:.4f} complete, "
           f"off {every['kl_off']:.4f} / {whole['kl_off']:.4f}; none {none['kl_live']:.2f} = empty {none['kl_empty_live']:.2f}")
 
@@ -671,8 +667,8 @@ def test_fidelity_cuts_and_removals(tiny):
 
 def test_adversary_gradient_and_rescore(tiny):
     """The adversary's objective: its gradient in the pattern weights and omissions against central differences, and
-    a binary mask's KLs against native.run (the circuit as stated, the adversary's subcomponents at u) and the masked
-    forward (VPD's answer and the adversary's)."""
+    a binary mask's KLs against graph_ref (the circuit as stated, the adversary's subcomponents at u, C's semantics)
+    and the masked forward (VPD's answer and the adversary's)."""
     nat, ge, tx = tiny
     sub = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
     par, out = native.all_edges(sub, tx.targets)
@@ -723,8 +719,7 @@ def test_adversary_gradient_and_rescore(tiny):
             for (mm, t_, c_) in nodes:
                 if mm == m:
                     u[m][0, t_, c_] = 0.0
-        plan = nat._plan([g], tx.T)
-        want_c = float(carry.kl(tx.ref, nat.run(tx.ids, tx.targets, plan, u, nat._one()[1])))
+        want_c = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, g, u=u)))
         want_v = float(carry.kl(tx.ref, ge.runs(tx.ids, tx.targets, [vm], True)))
         assert abs(float(kc[0]) - want_c) < 1e-4 * max(1.0, want_c) and abs(float(kv[0]) - want_v) < 1e-4 * max(1.0, want_v)
 
@@ -837,3 +832,46 @@ def test_adversary_flips_finds_the_worst_single(tiny):
     got_c, got_v = row["kl_flips_omitted"][1]
     assert abs(math.log(got_c) - math.log(got_v) - float(gap[j])) < 1e-3 * max(1.0, abs(float(gap[j]))), (got_c, got_v, float(gap[j]))
     assert len(row["mask_flips_omitted"][1]) == 1
+
+
+def test_graph_ref_is_graph_inside_masked_outside(tiny):
+    """C's semantics (graph_ref): every connection stated is the masked run of the circuit and the mask u (with no u
+    and with a random one, remainders live and off); all but one connection is the independent forward with that
+    connection cut; no connection stated, remainders off, is the empty circuit; the gradient in u is autograd's."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::4]
+    par, out = native.all_edges(sub, tx.targets)
+    g = native.Graph(sub, par, out)
+    circ = mask_of(nat, tx.T, sub)
+    gen = torch.Generator().manual_seed(9)
+    u = {n: (torch.rand(1, tx.T, nat.C[n], generator=gen) < 0.2).float().to(nat.dev) for n in nat.names}
+    for live in (True, False):
+        for uu in (None, u):
+            got = ge.graph_ref(tx.ids, tx.targets, g, u=uu, live=live)
+            sets = [{n: torch.maximum(circ[n].float(), (uu[n][0] if uu is not None else 0 * circ[n].float())) for n in nat.names}]
+            want = ge.runs(tx.ids, tx.targets, sets, live)
+            assert float(carry.kl(want, got)) < 1e-5 and float(carry.kl(got, want)) < 1e-5, (live, uu is None)
+    full, _ = naive(nat, tx.ids)
+    for w, r in goal_eval._pairs(g)[:5]:
+        less = native.Graph(sub, {rr: [x for x in ws if not (x == w and rr == r)] for rr, ws in par.items()},
+                            [x for x in out if not (x == w and r is None)])
+        got = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, less)))
+        want = _kl(full, naive(nat, tx.ids, on=circ, live=True, cut=(w, r))[0], tx.targets)
+        assert abs(got - want) < 1e-5 + 1e-4 * abs(want), (w, r, got, want)
+    none = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, native.Graph(sub, {}, []), live=False)))
+    assert abs(none - ge._bounds(tx, "off")[0]) < 1e-4 * max(1.0, none)
+    uu = {n: (0.3 * torch.rand(1, tx.T, nat.C[n], generator=gen)).to(nat.dev).requires_grad_(True) for n in nat.names}
+    half = native.Graph(sub, {r: ws[: len(ws) // 2] for r, ws in par.items()}, out[: len(out) // 2])
+    kl = carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, half, u=uu)).sum()
+    gr = torch.autograd.grad(kl, list(uu.values()))
+    i = max(range(len(nat.names)), key=lambda j: float(gr[j].abs().max()))
+    n = nat.names[i]
+    _, t, c = [int(x) for x in (gr[i].abs() == gr[i].abs().max()).nonzero()[0]]
+    with torch.no_grad():
+        eps = 2e-2
+        hi = {m: x.clone() for m, x in uu.items()}
+        lo = {m: x.clone() for m, x in uu.items()}
+        hi[n][0, t, c] += eps
+        lo[n][0, t, c] -= eps
+        fd = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, half, u=hi)) - carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, half, u=lo))) / (2 * eps)
+    assert abs(fd - float(gr[i][0, t, c])) < 2e-2 * abs(fd) + 1e-5, (fd, float(gr[i][0, t, c]))

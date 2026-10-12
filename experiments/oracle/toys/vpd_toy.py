@@ -99,8 +99,59 @@ def sites(sd: dict, cfg: dict) -> dict:
     return out
 
 
-def fit(name: str, sd: dict, cfg: dict, steps: int, out: Path, log=print) -> dict:
+def nano_module():
+    """nano_param_decomp.run, with wandb and matplotlib stubbed where the environment lacks them (logging and figures
+    only)."""
+    import importlib.util
+
+    for m in ("wandb", "matplotlib", "matplotlib.pyplot"):
+        if importlib.util.find_spec(m.split(".")[0]) is None and m not in sys.modules:
+            sys.modules[m] = types.ModuleType(m)
     import nano_param_decomp.run as nano
+
+    return nano
+
+
+def donor_adversary(nano) -> tuple:
+    """VPD's mask sources restricted to donor replacement (the lead's 10-12, the spec's open question): where VPD draws
+    a piece's mask between its causal importance and 1 from uniform noise (stochastic reconstruction) or from persistent
+    PGD sources (the adversary), it takes the causal importance the same piece has on another text of the batch at the
+    same position (masks from real activations on other inputs), the remainder always on. Returns the originals to put
+    back."""
+    orig = (nano.sample_continuous_masks, nano.PersistentPGD)
+
+    def donor_masks(ci_lower, shift: int = 1):
+        masks, delta = {}, {}
+        for n, ci in ci_lower.items():
+            masks[n] = ci + (1 - ci) * ci.roll(shift, 0).detach()
+            delta[n] = torch.ones(*ci.shape[:-1], device=ci.device, dtype=ci.dtype)
+        return masks, delta
+
+    class DonorPGD:
+        def __init__(self, wrappers, local_B, seq_len, device, cfg):
+            self.sources = {"donor": torch.zeros(1, device=device, requires_grad=True)}  # the loop asks for source gradients
+
+        def recon_loss(self, target_model, wrappers, input_ids, target_logits, ci_lower):
+            masks, delta = donor_masks(ci_lower, 2)
+            nano.set_wrapper_masks(wrappers, masks, delta, routing=None)
+            try:
+                pred = target_model(input_ids)
+            finally:
+                nano.clear_wrapper_masks(wrappers)
+            return nano.kl_logits(pred, target_logits) + 0.0 * self.sources["donor"].sum()
+
+        def warmup(self, *a, **k):
+            pass
+
+        def external_step(self, grads, lr):
+            pass
+    nano.sample_continuous_masks = lambda ci_lower: donor_masks(ci_lower, 1)
+    nano.PersistentPGD = DonorPGD
+    return orig
+
+
+def fit(name: str, sd: dict, cfg: dict, steps: int, out: Path, log=print, adversary: str = "vpd") -> dict:
+    nano = nano_module()
 
     T = int(next(loader(name, 2, 0)).shape[1])
     C = sites(sd, cfg)
@@ -120,17 +171,20 @@ def fit(name: str, sd: dict, cfg: dict, steps: int, out: Path, log=print) -> dic
             super().__init__(*a, **k)
             got["ci"] = self
     nano.install_components, nano.CITransformer = install_kept, CIKept
+    orig = donor_adversary(nano) if adversary == "donor" else None
     t0 = time.perf_counter()
     try:
         nano.decompose(TorchToy(sd, cfg), ncfg, loader(name, 64, 1), loader(name, 64, 2))
     finally:
         nano.install_components, nano.CITransformer = install, CI
+        if orig is not None:
+            nano.sample_continuous_masks, nano.PersistentPGD = orig
     w = got["wrappers"]
     res = {"UV": {n: (w[n].U.detach().cpu(), w[n].V.detach().cpu()) for n in w}, "ci": {k: v.cpu() for k, v in got["ci"].state_dict().items()},
            "C": C, "d_in": {n: int(w[n].W_target.shape[1]) for n in w}, "seq_len": T,
            "ci_cfg": {"ci_d_model": 128, "ci_n_blocks": 2, "ci_n_heads": 4, "ci_mlp_hidden": 256}, "steps": steps,
-           "seconds": time.perf_counter() - t0}
-    torch.save(res, out / f"{name}.vpd.pt")
+           "seconds": time.perf_counter() - t0, "adversary": adversary}
+    torch.save(res, out / f"{name}.{'vpd' if adversary == 'vpd' else 'vpd_donor'}.pt")
     log(f"{name}: VPD fit in {res['seconds']:.0f}s")
     return res
 
@@ -139,9 +193,9 @@ def native_of_fit(sd: dict, cfg: dict, res: dict, dev: str = "cpu"):
     """The toy as a native.Native with the VPD fit: its U, V (a matrix held at zero: one zero piece), its CI
     transformer's pre-sigmoid outputs as VPD's causal importance (vpd_model.VPD applies the lower leaky sigmoid; VPD's
     answer is its importance above 0)."""
-    import nano_param_decomp.run as nano
     import native
 
+    nano = nano_module()
     target = vpd_model.Target({k: v.to(dev) for k, v in sd.items()}, cfg).eval().to(dev)
     names = vpd_model.site_names(cfg["n_layer"])
     UV = {}
@@ -195,10 +249,14 @@ def main():
     ap.add_argument("--toys", type=Path, required=True)
     ap.add_argument("--only", default="binding_km,binding_fp,route1,route2,additive,interaction,cancel")
     ap.add_argument("--steps", type=int, default=20000)
+    ap.add_argument("--adversary", choices=("vpd", "donor"), default="vpd",
+                    help="vpd: VPD's own masks (uniform noise and persistent PGD); donor: both from another text's causal importance")
+    ap.add_argument("--out", type=Path, help="where the fit goes (default: --toys)")
     args = ap.parse_args()
     for name in args.only.split(","):
         d = torch.load(args.toys / f"{name}.pt")
-        fit(name, d["sd"], d["cfg"], args.steps, args.toys)
+        (args.out or args.toys).mkdir(parents=True, exist_ok=True)
+        fit(name, d["sd"], d["cfg"], args.steps, args.out or args.toys, adversary=args.adversary)
 
 
 if __name__ == "__main__":

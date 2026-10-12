@@ -1,14 +1,15 @@
 #!/bin/zsh
 # The held-out evaluation of an RL run's checkpoints (#2951 graph oracle): for each state in DIR/checkpoints.jsonl
-# (tinker_train.py rl) without one yet, its answers to held-out text9000-9019 (fresh QA seed), E1 by readers A and B,
-# and components.py evaluate, into DIR/heldout_<step>.json (answer set "rl") and DIR/heldout_<step>_e1.jsonl, the
-# files experiments/oracle/figures_eval.py --rl reads. Run it while the RL runs or after; it skips what is done.
-#   zsh experiments/oracle/rl_heldout.sh DIR   (env: HELDOUT, LABELS, NEVAL, SAMPLES, MAXTOK, EDIT_TEACH, SRC, RLNAME)
+# (tinker_train.py rl) without one yet, its answers to held-out text9000-9019 (fresh QA seed, the structural kinds),
+# E1 by the readers when READERS is set (reported, not in the reward; a policy without English scores 0), and
+# components.py evaluate, into DIR/heldout_<step>.json (answer set "rl") and DIR/heldout_<step>_e1.jsonl, the files
+# experiments/oracle/figures_eval.py --rl reads. Run it while the RL runs or after; it skips what is done.
+#   zsh experiments/oracle/rl_heldout.sh DIR   (env: HELDOUT, LABELS, NEVAL, SAMPLES, MAXTOK, EDIT_TEACH, SRC, RLNAME, READERS)
 # Then the RL figure (figures_eval.py --rl) as ~/mpd-data/graph_oracle/figures/rl_<DIR's name>_rl.png.
 set -e
 DIR=$1
 O=~/mpd-data/graph_oracle/components
-HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20_rt.jsonl} LABELS=${LABELS:-$O/heldout50_locality_frozen.jsonl}  # frozen once: never relabel per teacher version
+HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20_rt_st.jsonl} LABELS=${LABELS:-$O/heldout50_locality_frozen.jsonl}  # frozen once: never relabel per teacher version
 NEVAL=${NEVAL:-20} SAMPLES=${SAMPLES:-2} MAXTOK=${MAXTOK:-4096}
 SRC=${SRC:-/Users/user/params}
 PY=/Users/user/mpd-data/venv/bin/python; TPY=/Users/user/mpd-data/tinker-venv/bin/python
@@ -24,10 +25,11 @@ for l in open('$DIR/checkpoints.jsonl'):
   (cd $SRC/method/oracle/rl &&
    $TPY -u tinker_train.py sample $DIR/heldout.jsonl $DIR/heldout_${STEP}_samples.jsonl --init "$STATE" --base $BASE \
      --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK &&
-   $TPY -u tinker_train.py readers $DIR/heldout_${STEP}_samples.jsonl $DIR/heldout.jsonl $DIR/heldout_${STEP}_e1.jsonl) < /dev/null  # the loop reads the checkpoints from stdin
+   if [ -n "${READERS:-}" ]; then $TPY -u tinker_train.py readers $DIR/heldout_${STEP}_samples.jsonl $DIR/heldout.jsonl $DIR/heldout_${STEP}_e1.jsonl; fi) < /dev/null  # the loop reads the checkpoints from stdin
+  E1=""; [ -n "${READERS:-}" ] && E1=":$DIR/heldout_${STEP}_e1.jsonl"
   P=rl-$(basename $DIR)-$STEP  # C's families run on a rented GPU (eval_pod.sh), too slow and too large for the Mac
   (cd $SRC && bash experiments/oracle/pods/eval_pod.sh $P $DIR/heldout.jsonl $LABELS \
-     rl=$DIR/heldout_${STEP}_samples.jsonl:$DIR/heldout_${STEP}_e1.jsonl > $DIR/heldout_${STEP}_pod.log 2>&1) < /dev/null
+     rl=$DIR/heldout_${STEP}_samples.jsonl$E1 > $DIR/heldout_${STEP}_pod.log 2>&1) < /dev/null
   cp ~/mpd-data/runpod/oracle-graph-eval-$P/eval.json $DIR/heldout_$STEP.json
   cp ~/mpd-data/runpod/oracle-graph-eval-$P/eval.log $DIR/heldout_$STEP.log
   echo "step $STEP: $DIR/heldout_$STEP.json"

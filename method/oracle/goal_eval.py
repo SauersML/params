@@ -2257,7 +2257,7 @@ def fidelity_table(rows: list[dict]) -> str:
     by = {}
     for r in rows:
         by.setdefault((group(r), kind(r)), []).append(r)
-    kinds = sorted({kind(r) for r in rows}, key=lambda k: (k == "VPD top k", k))
+    kinds = sorted({kind(r) for r in rows}, key=lambda k: (k == "VPD top k", k.removeprefix("VPD@"), k.startswith("VPD@")))  # "VPD@<kind>" under its kind
     flips = sorted({int(m) for r in rows for m in r.get("f1_flips_omitted", {})})
     fresh = sorted({int(m) for r in rows for m in r.get("f1_flips_patterns_fresh", {})})
     steps = sorted({int(m) for r in rows for m in r.get("f1_adv_curve", {})})

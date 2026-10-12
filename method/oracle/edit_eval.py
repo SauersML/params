@@ -361,11 +361,17 @@ class Editor:
             if rec is not None:
                 rec["k"].append(k[0])
                 rec["v"].append(v[0])
-            if s:
-                k = torch.cat([pre_rec["k"][i][None, :, :s].expand(B, -1, -1, -1), k], 2)
-                v = torch.cat([pre_rec["v"][i][None, :, :s].expand(B, -1, -1, -1), v], 2)
-            P = ((q @ k.transpose(-1, -2)) / math.sqrt(self.hd)).masked_fill(~mask, float("-inf")).softmax(-1)
-            y = self._units((P @ v).transpose(1, 2).reshape(B, L, -1), i, "head", plan, s)
+            if s:  # the earlier positions' keys and values are shared by every row: read without copies
+                fold = lambda z: z.transpose(0, 1).reshape(self.H, B * L, -1)  # noqa: E731  [B, H, L, x] -> [H, B L, x]
+                unfold = lambda z: z.view(self.H, B, L, -1).transpose(0, 1)  # noqa: E731
+                kp, vp = pre_rec["k"][i][:, :s], pre_rec["v"][i][:, :s]  # [H, s, hd]
+                z = torch.cat([unfold(fold(q) @ kp.transpose(-1, -2)), q @ k.transpose(-1, -2)], -1)
+                P = (z / math.sqrt(self.hd)).masked_fill(~mask, float("-inf")).softmax(-1)
+                att = unfold(fold(P[..., :s].contiguous()) @ vp) + P[..., s:] @ v
+            else:
+                P = ((q @ k.transpose(-1, -2)) / math.sqrt(self.hd)).masked_fill(~mask, float("-inf")).softmax(-1)
+                att = P @ v
+            y = self._units(att.transpose(1, 2).reshape(B, L, -1), i, "head", plan, s)
             a = edit(nm["o_proj"], y @ tg.site(nm["o_proj"]).V, {"att": y, "P": P})
             x = x + site(nm["o_proj"], a, y)
             h = vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps)

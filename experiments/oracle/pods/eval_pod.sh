@@ -7,8 +7,12 @@
 # pod ends when evaluate does.
 #   bash experiments/oracle/pods/eval_pod.sh RUN ROWS.jsonl LABELS.jsonl NAME=SAMPLES[:E1.jsonl] ...
 #     SAMPLES: a sampler's JSONL or a directory of <task>[.<k>].txt (components.samples_of); E1: tinker_train.py readers
-#     (env: HOURS (cap, default 2), GPU, PRICE, VRAM, RP_OWNER)
+#     (env: HOURS (cap, default 2), GPU, PRICE, VRAM, RP_OWNER; LEDGER_OK=1 once the lead approved a launch past $290)
 cd /Users/user/params
+spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
+if awk -v s="$spent" 'BEGIN {exit !(s > 290)}' && [ -z "${LEDGER_OK:-}" ]; then  # the lead's check before launches past $290
+  echo "eval_pod.sh: the team's RunPod ledger is at \$$spent (> \$290): ask the lead, then rerun with LEDGER_OK=1" >&2; exit 2
+fi
 RUN=$1 ROWS=$2 LABELS=$3
 shift 3
 N=oracle-graph-eval-$RUN

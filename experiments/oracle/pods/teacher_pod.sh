@@ -27,7 +27,7 @@ GPU=${GPU:-NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVID
 F=/Users/user/mpd-data/scratch/fleet/teacher_$RUN
 V=/Users/user/mpd-data/vpd
 mkdir -p "$F" "$DEST"
-COPYFILE_DISABLE=1 tar -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 /usr/bin/python3 -I - "$SPLIT" "$N" "$OFFSET" "$PODS" "$F" "$DEST" "${TASKS:-}" <<'EOF' || exit 1
 import json, pathlib, sys
 split, n, off, pods, F, dest, tasks = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), pathlib.Path(sys.argv[5]), pathlib.Path(sys.argv[6]), sys.argv[7]

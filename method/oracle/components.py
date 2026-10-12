@@ -1757,8 +1757,9 @@ def line_credit(text: str, parsed: dict, answer: dict, le: dict, info: dict, e2g
     """Each answer line's credit, c = R(a) - R(a without the line) (the lead's v3 line credit, token-level advantages
     in RL): a node, connection or token-edge line its leave-one-out effect from line_effects (le, pp: the target KL's
     rise when it alone is removed, bits) less g x 0.5 x the compactness its removal would gain (log2 of the answer's
-    bits over its bits without it: an inert line's credit is negative); a variable line (2 e4_v - 1) m_v / M (e4x's
-    share of the mechanism); a question's ANSWER and FINAL lines its E2g credit; a CIRCUIT line that does not parse -1.
+    bits over its bits without it: an inert line's credit is negative); a variable line's marginal E4x coverage
+    (the scored claims' E4x less E4x without that variable); a question's ANSWER and FINAL lines its E2g credit;
+    a CIRCUIT line that does not parse -1.
     [[line number in the answer text, credit], ...]; other lines carry none."""
     lines = text.split("\n")
     g, bits = info.get("g") or 0.0, info.get("bits")
@@ -1773,6 +1774,7 @@ def line_credit(text: str, parsed: dict, answer: dict, le: dict, info: dict, e2g
         b = _bits_of(smaller, C, targets, active)
         return math.log2(bits / b) if bits and b and b > 0 else 0.0
     M = sum(max(0.0, x) for x in node_kl.values())
+    coverage = e4x_term(None, None, None, e4, None, le) if e4 and e4.get("per_variable") and M > 0 else None
     out, sec = [], None
     for k, line in enumerate(lines):
         head = SECTION.match(line)
@@ -1809,9 +1811,10 @@ def line_credit(text: str, parsed: dict, answer: dict, le: dict, info: dict, e2g
                 out.append([k, e2g["per_question"][n - 1]["credit"]])
         elif sec == "EXPLANATION" and VAR_RE.fullmatch(s_) and e4 and e4.get("per_variable") and M > 0:
             v = int(VAR_RE.fullmatch(s_)[1])
-            if v <= len(e4["per_variable"]):
-                pv = e4["per_variable"][v - 1]
-                out.append([k, (2 * pv["e4"] - 1) * sum(max(0.0, node_kl.get(tuple(nd), 0.0)) for nd in pv["nodes"]) / M])
+            if 1 <= v <= len(e4["per_variable"]):
+                per = e4["per_variable"]
+                without = {**e4, "per_variable": per[:v - 1] + per[v:]}
+                out.append([k, coverage - e4x_term(None, None, None, without, None, le)])
     return out
 
 
@@ -1824,16 +1827,20 @@ def _bits_of(answer: dict, C: dict, targets: list[int], active) -> float | None:
 
 
 def e4x_term(ge, tx, graph, e4: dict, split: str | None, le: dict | None = None) -> float | None:
-    """E4x (the lead's v3): sum over variables of (2 e4_v - 1) m_v / sum over the circuit's nodes of m, m a node's
-    measured pp removal effect (line_effects' delta_kl, its positive part), m_v the total over the variable's nodes,
-    e4_v the variable's headline (min(f on-target, s off-target), 0 unresolved): the share of the mechanism explained
-    by variables that pass interchange less the share claimed by ones that fail."""
+    """E4x: the circuit's measured pp removal mass claimed by variables, counted once per node, weighted by
+    (2 e4_v - 1). Overlapping claims use their lowest e4_v (min(f on-target, s off-target), 0 unresolved), so
+    repeating a passing claim cannot inflate coverage or hide a failing claim. Unclaimed mass contributes zero."""
     le = le or ge.line_effects(tx, graph, mode="pp", split=split or "search")
     m = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in le["nodes"]}
     M = sum(m.values())
     if M <= 0:
         return None
-    return sum((2.0 * v["e4"] - 1.0) * sum(m.get(tuple(nd), 0.0) for nd in v["nodes"]) for v in e4["per_variable"]) / M
+    claimed = {}
+    for v in e4["per_variable"]:
+        for nd in v["nodes"]:
+            nd = tuple(nd)
+            claimed[nd] = min(claimed.get(nd, v["e4"]), v["e4"])
+    return sum((2.0 * score - 1.0) * m.get(nd, 0.0) for nd, score in claimed.items()) / M
 
 
 def c_noise(ge, task: dict, texts: list[str], seeds: int, pool: dict | None = None, split: str = "eval") -> list[dict]:

@@ -104,6 +104,17 @@ class State:
         buf[:, self.flat] = ons.float()
         return {n: buf[:, at:at + T * K].view(len(ons), T, K) for n, (at, K) in zip(self.names, self.offsets)}
 
+    def masks(self, on: torch.Tensor) -> dict:
+        """A node subset on [N] as site -> bool [T, C] (a complete graph's masks: goal_eval runs it without a loop over
+        its nodes)."""
+        nat, out = self.ge.nat, {}
+        for j, n in enumerate(self.names):
+            m = torch.zeros(self.tx.T, nat.C[n], dtype=torch.bool, device=self.dev)
+            sel = on & (self.mat == j)
+            m[self.t[sel], self.c[sel]] = True
+            out[n] = m
+        return out
+
     def reads_dict(self, reads, on: list | None = None) -> dict:
         """Reads as connections {reader node: [writer nodes]}: every attention-output node of VPD's answer at (p, l)
         from every value node at (l, s), or those of them in a node set (on, a list of bools: a plan over its
@@ -157,7 +168,7 @@ class State:
         at their x values; "c", s_track in C's semantics, the cut reads' connections at 0) of node subsets ons [K, N],
         with per row its cut reads (cuts: a list of sets; None: the current cuts)."""
         t0 = time.perf_counter()
-        graphs = [native.Graph([self.nodes[i] for i in row.nonzero().flatten().tolist()], complete=True) for row in ons]
+        graphs = [native.Graph(masks=self.masks(row)) for row in ons]
         sets = [self.cut if c is None else c for c in (cuts or [None] * len(ons))]
         if self.mode == "pp":
             cd = []

@@ -1,8 +1,9 @@
 #!/bin/zsh
 # The component explainer's SFT and its held-out evaluation (#2951 graph oracle): SFT rows from question rows and
 # teacher circuits (with their English and the edit teacher's edits when given), one Tinker SFT on BASE, samples on
-# held-out text9000-9019 (fresh QA seed), E1 by reader A and reader B, and the evaluation split by locality against
-# the held-out teachers themselves.
+# held-out text9000-9019 (fresh QA seed), E1 by the readers when the SFT has English (reported, not in the reward;
+# without English every answer's E1 is 0), and the evaluation split by locality against the held-out teachers
+# themselves.
 #   zsh experiments/oracle/sft.sh RUN   (env: ROWS, TEACHER, ENGLISH, EDIT_TEACH, BASE, STEPS, BATCH, LR, HELDOUT,
 #                                        HELDOUT_TEACHER, LABELS, NEVAL, SAMPLES, MAXTOK, SRC, ZEROSHOT: the untrained base's
 #                                        samples and readers on HELDOUT's questions)
@@ -38,20 +39,24 @@ cd $SRC/method/oracle/rl
 $TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEPS --batch $BATCH ${LR:+--lr $LR} --name sft-$RUN
 STATE=$($PY -c "import json; print(json.load(open('$S/sft/state.json'))['state'])")
 $TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE" --base $BASE --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK
-$TPY -u tinker_train.py readers $S/samples.jsonl $S/heldout.jsonl $S/e1.jsonl
+Z=${ZEROSHOT:-$O/zeroshot_heldout20/cst}  # the untrained Qwen3-8B's answers to these questions, scored by the same reward
+E1S="" E1Z=""
+if [ -n "${ENGLISH:-}" ]; then
+  $TPY -u tinker_train.py readers $S/samples.jsonl $S/heldout.jsonl $S/e1.jsonl
+  E1S=":$S/e1.jsonl" E1Z=":$Z/e1.jsonl"
+fi
 unset TINKER_API_KEY
 cd $SRC
-Z=${ZEROSHOT:-$O/zeroshot_heldout20/cst}  # the untrained Qwen3-8B's answers to these questions, scored by the same reward
 $PY -c "import json; open('$S/zeroshot_first.jsonl', 'w').writelines(l for l in open('$Z/samples.jsonl') if json.loads(l)['sample'] == 0)"
 PRUNED=() REFS=(--ref "Teacher=$S/eval.json:teacher" --ref "VPD, every connection=$S/eval.json:vpd_complete")
 if [ -d $S/ref/vpd_pruned ]; then
   PRUNED=(vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
 fi
 # C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh)
-bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl:$S/e1.jsonl \
-  zeroshot=$S/zeroshot_first.jsonl:$Z/e1.jsonl teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" > $S/eval_pod.log 2>&1
+bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S \
+  zeroshot=$S/zeroshot_first.jsonl$E1Z teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" > $S/eval_pod.log 2>&1
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.json $S/eval.json
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.log $S/eval.log
 tail -60 $S/eval.log
 MPD_MEM_GIB=1 $PY $SRC/experiments/oracle/figures_eval.py --labels $LABELS --prefix sft_$RUN \
-  --set "Qwen3-8B zero-shot=$S/eval.json:zeroshot:$Z/e1.jsonl" --set "${BASE#*/} SFT=$S/eval.json:sft:$S/e1.jsonl" "${REFS[@]}"
+  --set "Qwen3-8B zero-shot=$S/eval.json:zeroshot$E1Z" --set "${BASE#*/} SFT=$S/eval.json:sft$E1S" "${REFS[@]}"

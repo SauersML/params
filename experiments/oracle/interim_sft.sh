@@ -11,17 +11,19 @@ export HF_HUB_OFFLINE=1 PYTORCH_MPS_PREFER_METAL=1
 : > $S/sft.jsonl
 for b in 0 300; do
   [ -f $O/train_prep_$b/rows.jsonl ] || continue
-  $PY $SRC/method/oracle/components.py dataset $O/train_prep_$b/rows.jsonl $O/train_prep_$b/teacher $S/sft_$b.jsonl
+  $PY $SRC/method/oracle/components.py rerender $O/train_prep_$b/rows.jsonl $S/rows_$b.jsonl  # questions in the current format
+  $PY $SRC/method/oracle/components.py dataset $S/rows_$b.jsonl $O/train_prep_$b/teacher $S/sft_$b.jsonl
   cat $S/sft_$b.jsonl >> $S/sft.jsonl
 done
 echo "sft rows: $(wc -l < $S/sft.jsonl)"
 $PY -c "
 import json
 keep = {f'text{9000+i}' for i in range($NEVAL)}
-with open('$S/heldout20_fresh.jsonl', 'w') as f:
+with open('$S/heldout_fresh_in.jsonl', 'w') as f:
     for l in open('$O/heldout50_rows_fresh.jsonl'):
         if json.loads(l)['task'] in keep: f.write(l)
 "
+$PY $SRC/method/oracle/components.py rerender $S/heldout_fresh_in.jsonl $S/heldout20_fresh.jsonl
 export TINKER_API_KEY="$(security find-generic-password -s tinker-api-key -w)" TINKER_PROJECT_ID=3f598f31-2ffa-4eb4-b302-909eb234fb7d
 cd /Users/user/params/method/oracle/rl
 $TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --steps $STEPS --batch $BATCH --name interim-$RUN

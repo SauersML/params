@@ -44,6 +44,7 @@ E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); 
   components.py questions SPLIT OUT.jsonl [--n N] [--qa-seed K]  question rows (question, positions, evidence, questions;
                                                                 K = 1 for a fresh set of questions)
   components.py requestion ROWS.jsonl OUT.jsonl [--qa-seed 1]   the rows with a fresh set of intervention questions
+  components.py rerender ROWS.jsonl OUT.jsonl                   the rows' question text in the current format
   components.py locality SPLIT OUT.jsonl [--n N]                each text local or not (VPD's target actives alone)
   components.py teacher-vpd ROWS.jsonl OUT_DIR                 the interim teacher (VPD's answer cut to a writable size)
   components.py teacher-path ROWS.jsonl PATHS VPD OUT            the pruning path's best writable point per text, kept
@@ -1284,6 +1285,9 @@ def main():
     q.add_argument("--stride", type=int, default=1)
     q.add_argument("--qa-seed", type=int, default=0, help="added to each text's seed for its questions: 0 the discovery "
                    "set (training, checkpoint selection), 1 a fresh set for reports")
+    rr = sub.add_parser("rerender", help="the rows with their question text written again by this question() (no model runs)")
+    rr.add_argument("rows", type=Path)
+    rr.add_argument("out", type=Path)
     rq = sub.add_parser("requestion", help="the same rows with a fresh set of intervention questions (only they are measured)")
     rq.add_argument("rows", type=Path)
     rq.add_argument("out", type=Path)
@@ -1329,6 +1333,13 @@ def main():
     args = ap.parse_args()
     import goal_eval
     import native
+
+    if args.cmd == "rerender":
+        with args.out.open("w") as f:
+            for r in map(json.loads, args.rows.read_text().splitlines()):
+                task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+                f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
+        return
 
     if args.cmd == "dataset":
         node_only = any(json.loads(f.read_text()).get("edges") in (None, []) for f in sorted(args.teacher.glob("*.json")))

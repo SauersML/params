@@ -5,7 +5,7 @@ default) and the key from TINKER_API_KEY (read from the Keychain at launch, neve
 
   tinker_train.py sft SFT.jsonl --log DIR [--base Qwen/Qwen3-8B] [--steps N] [--batch B] [--lr LR] [--rank 32]
   tinker_train.py rl QUESTIONS.jsonl --log DIR --scorer http://127.0.0.1:8767/score [--init STATE_PATH] [--steps N]
-                     [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5] [--reader]
+                     [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5] [--reader] [--save-every 25]
   tinker_train.py sample QUESTIONS.jsonl OUT.jsonl [--init STATE_PATH] [--n 50] [--samples 4]    answers to evaluate
   tinker_train.py readers SAMPLES.jsonl QUESTIONS.jsonl OUT.jsonl [--reader-b MODEL]   E1 and its controls (components.py
                                                                                       evaluate --e1)
@@ -19,7 +19,10 @@ was cut at the cap goes with it), centres the rewards within each group, and tra
 Tinker's "cispo" loss on the sampled tokens' log-probabilities. The next batch is sampled while the update runs (one
 step behind; cispo's ratio corrects it). With --reader, E1 (the bits each answer's English saves a frozen reader)
 comes from a base-model sampling client on Tinker that is never trained (tinker_reader) and goes to the scorer with
-the answers. Every call's tokens are counted and priced (PRICES, $ per million tokens:
+the answers. Each step's figures go to DIR/steps.jsonl; every --save-every steps (and at step 0, the starting state, and
+at the end) the state is saved and listed in DIR/checkpoints.jsonl ({"step", "state", "usd", "base"}: the held-out
+evaluation of each, experiments/oracle/rl_heldout.sh).
+Every call's tokens are counted and priced (PRICES, $ per million tokens:
 prefill, sampled, trained; a cached prefill at 20%) into DIR/spend.jsonl, one line per call, and summed per step.
 """
 
@@ -326,6 +329,12 @@ def rl(a) -> None:
             batch.append((q, prompt, sampler.sample(prompt=prompt, num_samples=a.group, sampling_params=params)))
         return batch
 
+    def checkpoint(step: int) -> None:
+        path = training.save_state(f"{a.name}-rl-{step}").result().path
+        with (a.log / "checkpoints.jsonl").open("a") as f:
+            f.write(json.dumps({"step": step, "state": path, "usd": spend.total, "base": a.base}) + "\n")
+
+    checkpoint(0)
     sampler = training.save_weights_and_get_sampling_client()
     pending = submit(sampler)
     for step in range(a.steps):
@@ -381,14 +390,20 @@ def rl(a) -> None:
             spend.add("rl", trained=sum(d.model_input.length for d in datums))
             sampler = training.save_weights_and_get_sampling_client()
         flat = [x for g in groups for x in g["rewards"]]
-        print(json.dumps({"step": step, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
-                          "distinct": [g["distinct"] for g in groups],
-                          "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],
-                          "score_seconds": sum(g["score_seconds"] for g in groups), "total_usd": spend.total,
-                          "seconds": time.time() - t0}), flush=True)
-    saved = training.save_state(f"{a.name}-rl").result()
-    (a.log / "state.json").write_text(json.dumps({"state": saved.path, "base": a.base, "rank": a.rank}))
-    print(json.dumps({"saved": saved.path, "total_usd": spend.total}), flush=True)
+        line = json.dumps({"step": step, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
+                           "distinct": [g["distinct"] for g in groups],
+                           "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],
+                           "score_seconds": sum(g["score_seconds"] for g in groups), "total_usd": spend.total,
+                           "seconds": time.time() - t0})
+        print(line, flush=True)
+        with (a.log / "steps.jsonl").open("a") as f:
+            f.write(line + "\n")
+        if (step + 1) % a.save_every == 0 and step + 1 < a.steps:
+            checkpoint(step + 1)
+    checkpoint(a.steps)
+    last = json.loads((a.log / "checkpoints.jsonl").read_text().splitlines()[-1])
+    (a.log / "state.json").write_text(json.dumps({"state": last["state"], "base": a.base, "rank": a.rank}))
+    print(json.dumps({"saved": last["state"], "total_usd": spend.total}), flush=True)
 
 
 def main():
@@ -415,6 +430,7 @@ def main():
     r.add_argument("--max-tokens", type=int, default=4096)
     r.add_argument("--lr", type=float, default=4e-5)
     r.add_argument("--reader", action="store_true", help="E1 from a frozen base-model sampling client on Tinker")
+    r.add_argument("--save-every", type=int, default=25, help="steps between saved states (checkpoints.jsonl)")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     m = sub.add_parser("sample")
     m.add_argument("questions", type=Path)

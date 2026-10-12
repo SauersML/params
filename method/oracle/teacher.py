@@ -12,7 +12,9 @@ Per text:
      cannot reach F1 >= 0.9, from VPD's whole answer, rounds at each level (whole positions, sites, chunks of 64, 16 and 4 of a site's
      subcomponents by index, single subcomponents) measure every block's removal, rank the blocks by the KL their removal
      leaves, and remove the most of them in that order that keeps F1 >= 0.9 (KL_C <= KL_empty^0.1 KL_VPD^0.9), until no
-     single removal does; with --start-top K, from VPD's top K through the last three levels only. (The linear recovery
+     single removal does; with --start-top K, from VPD's top K through the last three levels only; with --f1-start whole,
+     from the whole answer only, and with --f1-start both, the union of the two searches' circuits (on text9002 the
+     target search keeps the target alone, the whole-answer one a second position). (The linear recovery
      >= 0.9 admits circuits ~10 bits from the model, the empty circuit being ~100 bits away: on text9000 it pruned to 5
      subcomponents at the target.)
   2. VPD's top-k: the smallest prefix of VPD's order (Native._vpd_order) whose necessity N reaches 0.99 (bisection, at
@@ -321,7 +323,7 @@ def circuit_json(pr: Pruner, on: torch.Tensor) -> dict:
 
 
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
-          vpd_order: list | None = None, start_top: int = 0) -> tuple[dict, dict]:
+          vpd_order: list | None = None, start_top: int = 0, f1_start: str = "targets") -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour."""
     t0 = time.perf_counter()
@@ -363,10 +365,11 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     whole = pr.on.clone()
     reached = False
-    if not start_top:                                        # first VPD's answer at the targets alone, subcomponents only
+    if not start_top and f1_start != "whole":                # first VPD's answer at the targets alone, subcomponents only
         pr.on = whole & torch.isin(pr.t, torch.tensor(targets, device=pr.t.device))
         reached = search(("chunk4", "subcomponent"), "target ")
-    if not reached:
+    f1_targets = pr.on.clone() if reached else None
+    if not reached or f1_start == "both":
         pr.on = whole.clone()
         levels = LEVELS
         if start_top:                                        # the F1 search from VPD's top start_top, subcomponents only
@@ -376,6 +379,9 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         search(levels, "")
     row["f1_from_targets"] = reached
     f1_on = pr.on.clone()
+    if f1_targets is not None and f1_start == "both":       # the union of the two F1 circuits
+        row["f1_sizes"] = [int(f1_targets.sum()), int(f1_on.sum())]
+        f1_on |= f1_targets
     t1 = time.perf_counter()
     k = top_k(pr, order, empty, vpd)
     topk_on = torch.zeros_like(f1_on)
@@ -429,6 +435,9 @@ def main():
     ap.add_argument("--save-vpd", type=Path, help="save VPD's answers and orders on the texts to this file and stop")
     ap.add_argument("--labels", type=Path, help="locality JSONL (task, local)")
     ap.add_argument("--start-top", type=int, default=0, help="F1 search from VPD's top K at subcomponent level (0: from VPD's whole answer)")
+    ap.add_argument("--f1-start", choices=("targets", "whole", "both"), default="targets",
+                    help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
+                         "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
     ap.add_argument("--tasks", type=Path, help="task ids, one per line, in place of the split's first n texts")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
@@ -458,7 +467,7 @@ def main():
             continue
         ids, targets = native.text(path)
         saved = vpd.get(path.stem, {})
-        circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top)
+        circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

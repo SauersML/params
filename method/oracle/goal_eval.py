@@ -114,17 +114,18 @@ SCREEN = 256  # the adversary's shortlist measured one by one: the parts with th
 SCREEN_ROWS = 16  # rows per run when measuring the shortlist
 CHANGED_ROWS = 64  # the changed-input family's circuit rows per run on the changed texts (circuits x changed texts)
 FLIP_ROWS = 160  # adversary_flips' rows per run: every circuit's restarts at every budget (8 x 5 x 4) together
-INTERCHANGE_DRAWS = 16  # C's interchange draws per circuit
-CHANGED_DRAWS = 16  # C's changed texts per circuit
+INTERCHANGE_DRAWS = 32  # C's interchange draws per circuit
+CHANGED_DRAWS = 32  # C's changed texts per circuit (32, the lead's 10-12: at 16 the changed-input and donor families
+# had the largest eps of C's members on the held-out influential and VPD sets, medians 0.1-0.3; 32 costs seconds a text)
 INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
 # offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
 BLOCK = -1  # a block node's index: (site, position, BLOCK), the site's whole output there (every subcomponent and the
 # remainder), ["block", site, position] in an answer (the lead's 10-12: a token's identity lives in thousands of parts)
 VPD4L_SITES = 24  # vpd4l's weight matrices (4 layers x 6), a block's name among them
-DONORS_NEAR = 16  # donor resampling's changed-input donors per text
+DONORS_NEAR = 32  # donor resampling's changed-input donors per text
 DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's answer)
-DONORS_FAR = 8  # donor resampling's other texts per text
+DONORS_FAR = 32  # donor resampling's other texts per text
 DONOR_POOLS = {"search": ("train", range(0, 400)),  # the far donors' texts per split: the reward's from training texts,
                "eval": ("heldout", range(150, 200))}  # evaluation's from held-out text9150-9199 (no search drew on them)
 
@@ -2058,8 +2059,7 @@ class GoalEval:
             if lk:
                 row["leak"] = lk["f1_live"]
             # the node family against the model's own response (the lead's 10-12): each draw bounded by no change,
-            # W = KL(model less the nodes || model), pooled by W (s_nodes_old: the earlier form, against KL_empty)
-            row["s_nodes_old"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
+            # W = KL(model less the nodes || model), pooled by W
             row["s_nodes"] = _pooled("weighted", nd.get("draws_nodes"), e0)
             row["s_nodes_raw"] = _pooled_raw(nd.get("draws_nodes"))
             row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
@@ -3739,7 +3739,7 @@ def pattern(pool: dict, k: int) -> dict:
 
 
 def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws: int = DRAWS, vpd: Path | None = None,
-                    offset: int = 0, stride: int = 1, fresh: Path | None = None, interchange: int = 16, curve=ADV_CURVE,
+                    offset: int = 0, stride: int = 1, fresh: Path | None = None, interchange: int = INTERCHANGE_DRAWS, curve=ADV_CURVE,
                     log=print, changed: int = CHANGED_DRAWS, only: tuple = (), mode: str = "full", draw_split: str | None = None,
                     start: bool = False, recency: bool = False) -> list[dict]:
     """C on the split's first n texts for answer sets (sets: name -> a directory of <task>.json circuits, run as stated)
@@ -3822,10 +3822,9 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                     row.update(d)
                     row.update({k: v for k, v in a.items() if k != "draws_track_pp"})
                     row.update({k: v for k, v in b.items() if k != "draws_interchange_pp"})
-                    if nd:  # the node family in both forms (s_nodes against the model's response, s_nodes_old against KL_empty)
+                    if nd:  # the node family against the model's own response
                         row.update({k: nd[k] for k in ("kl_nodes_c", "kl_nodes_vpd", "draws_nodes", "overstate_nodes") if k in nd})
-                        row |= {"s_nodes_old": _fid(e, nd["kl_nodes_c"], nd["kl_nodes_vpd"]),
-                                "s_nodes": _pooled("weighted", nd.get("draws_nodes"), e), "s_nodes_raw": _pooled_raw(nd.get("draws_nodes"))}
+                        row |= {"s_nodes": _pooled("weighted", nd.get("draws_nodes"), e), "s_nodes_raw": _pooled_raw(nd.get("draws_nodes"))}
                     rows.append(row)
                     fh.write(json.dumps(row) + "\n")
             if log:
@@ -3951,8 +3950,8 @@ def main():
     f.add_argument("--set", action="append", required=True, help="NAME=DIR: an answer set, DIR/<task>.json circuits")
     f.add_argument("--pool", type=Path, required=True, help="the adversary's pattern pool (goal_eval.py patterns)")
     f.add_argument("--fresh", type=Path, help="a pattern pool no search drew from (evaluation only)")
-    f.add_argument("--interchange", type=int, default=16)
-    f.add_argument("--changed", type=int, default=16, help="changed texts per circuit (changed_inputs' eval split)")
+    f.add_argument("--interchange", type=int, default=INTERCHANGE_DRAWS)
+    f.add_argument("--changed", type=int, default=CHANGED_DRAWS, help="changed texts per circuit (changed_inputs' eval split)")
     f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp,pattern,nodes: those families alone, eval split (rows to merge by task and kind)")
     f.add_argument("--curve", default=",".join(str(x) for x in ADV_CURVE), help="the step adversary's budgets, e.g. 0,4,20,40,80,160,320")
     f.add_argument("--out", type=Path, required=True)

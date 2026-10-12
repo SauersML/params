@@ -1753,7 +1753,7 @@ def test_node_family_against_the_models_response(tiny):
     assert abs(row["draws_nodes"][0][3] - w0) < 1e-4 + 1e-4 * w0, (row["draws_nodes"][0][3], w0)
     s = goal_eval._pooled("weighted", row["draws_nodes"], None)
     f = ge.fidelity(tx, [g], None, draws=4, near_donors=0, far_donors=0, interchange=0, changed=0, pattern=False)[0]
-    assert abs(f["s_nodes"] - s) < 1e-9 and f["s_nodes_old"] is not None
+    assert abs(f["s_nodes"] - s) < 1e-9
     claim = np.mean([d[4] for d in row["draws_nodes"]])
     assert abs(row["overstate_nodes"] - claim / np.mean([d[3] for d in row["draws_nodes"]])) < 1e-9
     k = 7

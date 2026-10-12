@@ -40,16 +40,16 @@ REL = 1e-4
 DEVICE = native.device()
 
 
-def pruner(live: bool):
+def pruner(live: bool, name: str = "text9000"):
     nat = native.Native(DEVICE)
     ge = goal_eval.GoalEval(nat, chunk=32)
-    ids, targets = native.text(TEXT)
+    ids, targets = native.text(TEXT.parent / f"{name}.json")
     tx = ge.text(ids, targets)
     if tx.vpd is None:
         if not VPD_SAVED.exists():
             pytest.skip("needs VPD's answer: the causal-importance network or " + str(VPD_SAVED))
         tx.vpd = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
-        for n, (t, c) in torch.load(VPD_SAVED)["text9000"]["answer"].items():
+        for n, (t, c) in torch.load(VPD_SAVED)[name]["answer"].items():
             tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
     return nat, teacher.Pruner(ge, tx, tx.vpd, live=live, B=32)
 
@@ -286,9 +286,9 @@ def test_changed_acceptance_keeps_its_floor():
     assert all(s["s_track"] is None or s["s_track"] >= floor for s in path[1:])
 
 
-def vpd_top(pr, nat, k=61):
+def vpd_top(pr, nat, k=61, name="text9000"):
     index = {nd: i for i, nd in enumerate(pr.nodes)}
-    order = [index[(n, int(t), int(c))] for n, t, c in torch.load(VPD_SAVED)["text9000"]["order"] if (n, int(t), int(c)) in index]
+    order = [index[(n, int(t), int(c))] for n, t, c in torch.load(VPD_SAVED)[name]["order"] if (n, int(t), int(c)) in index]
     start = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
     start[order[:k]] = True                                     # VPD's top 61, the teacher's top-k on this text
     return start, order[:k]
@@ -360,3 +360,39 @@ def test_connection_acceptance_from_one_plan():
         return sorted(g.node_set()), sorted((w, r) for r, ws in g.parents.items() for w in ws), sorted(g.out)
     # each subset read in ep's column order: the graph its row states, stranded nodes dropped
     assert subs is not None and [stated(g) for g in subs] == [stated(graph_of(e)) for e in ons]
+
+
+PAIRS_CIRCUIT = Path.home() / "mpd-data/graph_oracle/teacher/joint_heldout_80fe906/text9002.json"
+
+
+@pytest.mark.skipif(not PAIRS_CIRCUIT.exists(), reason="needs the 80fe906 teacher circuit of text9002")
+def test_pairs_stated_within_budget():
+    nat, pr = pruner(teacher.CONVENTION == "live", "text9002")
+    ge, tx = pr.ge, pr.tx
+    live = teacher.CONVENTION == "live"
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    teacher_g, _ = goal_eval.circuit(json.loads(PAIRS_CIRCUIT.read_text()), tx.targets, nat.C, tx.T)
+    start, _ = vpd_top(pr, nat, 266, "text9002")
+    nodes = [pr.nodes[j] for j in start.nonzero().flatten().tolist()]
+    nodes = [nd for nd in nodes if nd in teacher.routes(nodes, tx.targets)]
+    ep = teacher.EdgePruner(ge, tx, nodes, live, 32)
+    conn = teacher.Connector(ge, tx, pr, empty, vpd, lambda *a: 0.0)
+    on = torch.zeros_like(start)
+    on[torch.tensor([conn.index[nd] for nd in nodes], device=on.device)] = True
+    # the teacher circuit (its read L2@41 needs pairs: background 1.6 bits against a 0.66 budget) and VPD's top 266
+    # with every connection (every read's background within the budget: its queries and keys stranded)
+    for g, needs in ((teacher_g, True), (conn.graph(on, ep.edges), False)):
+        stated, summary = teacher.state_pairs(ge, tx, g, empty, vpd)
+        # every read with a query or key node states its pairs, and the graph stays within the budget
+        assert summary["reads"] > 0 and summary["kl_pairs"] <= summary["budget"] * (1 + 1e-5)
+        assert set(stated.pairs) == {(r["layer"], r["t"]) for r in summary["per_read"]}
+        assert (summary["pairs"] > 0) == needs and (summary["stranded"] > 0) == (not needs)
+        # the stated graph with its stranded queries and keys dropped runs as the last read's measurement
+        assert abs(ge.graph_kl(tx, [stated], live)[0] - summary["kl_pairs"]) <= 1e-4 * max(1.0, summary["kl_pairs"])
+        # written as circuit JSON, goal_eval reads the same pairs back, every node and edge valid, none stranded
+        on_p = torch.zeros_like(on)
+        on_p[torch.tensor([conn.index[nd] for nd in stated.node_set()], device=on.device)] = True
+        kept = [(w, r) for r, ws in stated.parents.items() for w in ws] + [(w, None) for w in stated.out]
+        back, bad = goal_eval.circuit(teacher.circuit_json(pr, on_p, kept, stated.pairs), tx.targets, nat.C, tx.T)
+        assert bad == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 0}
+        assert {read: set(ps) for read, ps in getattr(back, "pairs", {}).items()} == {read: set(ps) for read, ps in stated.pairs.items()}

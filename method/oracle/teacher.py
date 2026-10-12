@@ -730,14 +730,73 @@ class Connector:
         return steps, max(range(len(steps)), key=lambda i: (steps[i]["score"], -steps[i]["size"])), "score"
 
 
-def circuit_json(pr: Pruner, on: torch.Tensor, edges: list | None = None) -> dict:
+def with_pairs(g: native.Graph, pairs: dict) -> native.Graph:
+    """A copy of a stated graph with stated query-key pairs (goal_eval's g.pairs {(layer, t): [(query | None, key |
+    None)]})."""
+    h = native.Graph(list(g.nodes), {r: list(ws) for r, ws in g.parents.items()}, list(g.out))
+    h.pairs = {read: list(ps) for read, ps in pairs.items()}
+    return h
+
+
+def state_pairs(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, empty: float, vpd: float) -> tuple:
+    """A stated graph's query-key pairs (the lead's assignment 10-12; C's semantics from monitorbench's bcbddad: a read
+    with an entry computes its pattern row from the background, the rest-rest term, and its stated pairs alone):
+    rustmove's greedy selection (experiments/oracle/qk_pairs.py) on goal_eval's runs, read by read in (layer,
+    position) order. A read is an attention output node's layer and position with a query node of its layer there or
+    a key node at or before it; its candidates, every (query | rest, key | rest) pair but (rest, rest). Its row starts
+    from the background and takes, each step, the candidate that leaves the graph's target KL lowest (all measured in
+    one batch), until the KL is within the budget: F1 0.9's KL when the graph reaches it, else 90% of its own log
+    recovery (qk_pairs.py's). Reads done keep their pairs, the others their whole row; stating every pair is the whole
+    row, so each read ends within the budget, one the background alone keeps there stating none (["pair", "rest",
+    "rest", ...]). (The graph with its pairs, its stranded nodes dropped (goal_eval.strand: a query or key no pair of
+    its reads names does nothing there); per read its record.)"""
+    live = CONVENTION == "live"
+    graph = goal_eval.strand(graph, tx.targets, ge.nat.C)
+    kl_c = ge.graph_kl(tx, [graph], live)[0]
+    f1 = goal_eval.recovered_log(empty, kl_c, vpd)
+    budget = empty * (vpd / empty) ** RECOVERED if f1 is not None and f1 >= RECOVERED else empty * (kl_c / empty) ** RECOVERED
+    nodes = sorted(graph.node_set())
+    kinds = {nd: native._name_layer_kind(nd[0]) for nd in nodes}
+    reads = sorted({(L, nd[1]) for nd, (L, k) in kinds.items() if k == "o_proj"})
+    done, records = {}, []
+    for L, t in reads:
+        qs = [nd for nd in nodes if kinds[nd] == (L, "q_proj") and nd[1] == t]
+        ks = [nd for nd in nodes if kinds[nd] == (L, "k_proj") and nd[1] <= t]
+        left = [(a, b) for a in qs + [None] for b in ks + [None] if a is not None or b is not None]
+        if not left:                                         # the background is the whole row
+            continue
+        chosen = []
+        kl = ge.graph_kl(tx, [with_pairs(graph, {**done, (L, t): []})], live)[0]
+        curve = [kl]
+        while kl > budget and left:
+            got = ge.graph_kl(tx, [with_pairs(graph, {**done, (L, t): chosen + [c]}) for c in left], live)
+            j = min(range(len(left)), key=lambda i: got[i])
+            chosen.append(left.pop(j))
+            kl = got[j]
+            curve.append(kl)
+        done[(L, t)] = chosen
+        records.append({"layer": L, "t": t, "queries": len(qs), "keys": len(ks), "candidates": len(left) + len(chosen),
+                        "pairs": len(chosen), "kl_background": curve[0], "kl": kl, "curve": curve})
+    stated = goal_eval.strand(with_pairs(graph, done), tx.targets, ge.nat.C)
+    summary = {"kl_c": kl_c, "budget": budget, "reads": len(records), "pairs": sum(r["pairs"] for r in records),
+               "background_reads": sum(r["pairs"] == 0 for r in records), "stranded": len(stated.stranded),
+               "kl_pairs": records[-1]["kl"] if records else kl_c, "per_read": records}
+    return stated, summary
+
+
+def circuit_json(pr: Pruner, on: torch.Tensor, edges: list | None = None, pairs: dict | None = None) -> dict:
     """goal_eval's circuit JSON: the nodes, a token-embedding input node at each of their positions, and the
-    connections given as (writer, reader) nodes, reader None for the prediction (none without)."""
+    connections given as (writer, reader) nodes, reader None for the prediction (none without), and stated query-key
+    pairs {(layer, t): [(query | None, key | None)]} as ["pair", query | "rest", key | "rest", layer, t] edges (a read
+    with none, ["pair", "rest", "rest", layer, t]: goal_eval.to_json's)."""
     nodes = sorted(((t, n, c) for (n, t, c), keep in zip(pr.nodes, on.tolist()) if keep))
     tok = sorted({t for t, _, _ in nodes})
     at = {(n, t, c): i for i, (t, n, c) in enumerate(nodes)}
-    return {"nodes": [[n, c, t] for t, n, c in nodes] + [["tok", 0, t] for t in tok],
-            "edges": [[at[w], "out" if r is None else at[r]] for w, r in edges or []], "explanation": ""}
+    out = [[at[w], "out" if r is None else at[r]] for w, r in edges or []]
+    for (layer, t), ps in sorted((pairs or {}).items()):
+        out += ([["pair", "rest" if a is None else at[a], "rest" if b is None else at[b], layer, t] for a, b in ps]
+                or [["pair", "rest", "rest", layer, t]])
+    return {"nodes": [[n, c, t] for t, n, c in nodes] + [["tok", 0, t] for t in tok], "edges": out, "explanation": ""}
 
 
 def pick(rows: list[dict], f1: str, goal: float = RECOVERED, cap: int | None = None) -> tuple[int, str]:
@@ -764,7 +823,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
           max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
-          accept: tuple = ()) -> tuple[dict, dict]:
+          accept: tuple = (), pairs: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -929,7 +988,15 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         final = (steps_[j]["on"], steps_[j]["kept"])
         row.update(repair=[{k_: v for k_, v in s_.items() if k_ not in ("on", "kept")} for s_ in steps_], repair_pick=j,
                    repair_rule=rule, repair_seconds=time.perf_counter() - t3)
-    circuits = {"": circuit_json(pr, final[0], final[1]), "f1": circuit_json(pr, f1_on), f"vpd_top{k}": circuit_json(pr, topk_on)}
+    stated = None
+    if pairs and edges:                                      # the written circuit's query-key pairs (state_pairs)
+        t3 = time.perf_counter()
+        g, row["pairs"] = state_pairs(ge, tx, wiring.graph(final[0], final[1]), empty, vpd)
+        on_p = torch.zeros_like(final[0])
+        on_p[torch.tensor([index[nd] for nd in g.node_set()], dtype=torch.long, device=on_p.device)] = True
+        final, stated = (on_p, [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]), getattr(g, "pairs", {})
+        row["pairs"]["seconds"] = time.perf_counter() - t3
+    circuits = {"": circuit_json(pr, final[0], final[1], stated), "f1": circuit_json(pr, f1_on), f"vpd_top{k}": circuit_json(pr, topk_on)}
     if vpd_edges and edges:                                  # VPD's own top at the teacher circuit's node count, the same connection search
         kv = int(final[0].sum())
         on_v = torch.zeros_like(final[0])
@@ -970,6 +1037,8 @@ def main():
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
+    ap.add_argument("--pairs", action="store_true", help="with --edges, the written circuit states its query-key pairs "
+                    "(state_pairs: rustmove's greedy, read by read, within the F1 budget)")
     ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "
                     ">= min(0.9, the search's start's): changed (s_track, goal_eval.changed_search), interchange (s_interchange), "
                     "donors (s_donor_near and s_donor_far, donors_search)")
@@ -1042,7 +1111,7 @@ def main():
         circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
                                          args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
-                                         args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k))
+                                         args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

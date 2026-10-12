@@ -3726,7 +3726,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
     and VPD's first k at each circuit's size (complete graphs), with the evaluation-only families (fresh: the pattern
     lever over a pool no search drew from; interchange draws; changed texts (changed_inputs' eval split); N_real); one
     row per circuit appended to OUT (texts already there are skipped); only: some of ("changed", "interchange",
-    "donors", "track_pp", "interchange_pp"), those families alone on the eval split (task, kind, nodes and their fields: families added to rows
+    "donors", "track_pp", "interchange_pp", "pattern", "nodes"), those families alone on the eval split (task, kind, nodes and their fields: families added to rows
     already made, matched by task and kind; donors' far texts the eval split's, DONOR_POOLS). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
     teacher.py --save-vpd (where the causal-importance network is not). Locality from a set's summary*.jsonl."""
     ge = GoalEval()
@@ -3789,9 +3789,10 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             if "pattern" in only:  # the true-pattern family, merged into the same rows
                 tp = [dict(a, **c) for a, c in zip(tp, ge.pattern_family(tx, [_c_graph(g, targets, nat.C) for g in graphs]))]
             ip = ge.interchange_pp(tx, graphs, "eval", interchange) if "interchange_pp" in only else [{} for _ in graphs]
+            nf = ge._node_family(tx, [_c_graph(g, targets, nat.C) for g in graphs], draws) if "nodes" in only else [{} for _ in graphs]
             scale = ge.size_scale(tx)
             with open(out, "a") as fh:
-                for kind, g, c, i, d, a, b in zip(kinds, graphs, ch, it, dn, tp, ip):
+                for kind, g, c, i, d, a, b, nd in zip(kinds, graphs, ch, it, dn, tp, ip, nf):
                     row = {"task": p.stem, "kind": kind, "nodes": g.count(),
                            "size_bits": size_bits(g, nat.positions(targets), sum(nat.C.values()), targets, active=tx.vpd),
                            "size_scale": scale,  # (informational: VPD's nodes alone, no connections)
@@ -3801,6 +3802,10 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                     row.update(d)
                     row.update({k: v for k, v in a.items() if k != "draws_track_pp"})
                     row.update({k: v for k, v in b.items() if k != "draws_interchange_pp"})
+                    if nd:  # the node family in both forms (s_nodes against the model's response, s_nodes_old against KL_empty)
+                        row.update({k: nd[k] for k in ("kl_nodes_c", "kl_nodes_vpd", "draws_nodes", "overstate_nodes") if k in nd})
+                        row |= {"s_nodes_old": _fid(e, nd["kl_nodes_c"], nd["kl_nodes_vpd"]),
+                                "s_nodes": _pooled("weighted", nd.get("draws_nodes"), e), "s_nodes_raw": _pooled_raw(nd.get("draws_nodes"))}
                     rows.append(row)
                     fh.write(json.dumps(row) + "\n")
             if log:
@@ -3928,7 +3933,7 @@ def main():
     f.add_argument("--fresh", type=Path, help="a pattern pool no search drew from (evaluation only)")
     f.add_argument("--interchange", type=int, default=16)
     f.add_argument("--changed", type=int, default=16, help="changed texts per circuit (changed_inputs' eval split)")
-    f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp,pattern: those families alone, eval split (rows to merge by task and kind)")
+    f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp,pattern,nodes: those families alone, eval split (rows to merge by task and kind)")
     f.add_argument("--curve", default=",".join(str(x) for x in ADV_CURVE), help="the step adversary's budgets, e.g. 0,4,20,40,80,160,320")
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--draws", type=int, default=DRAWS)

@@ -3316,7 +3316,11 @@ class GoalEval:
             for w, r in kept:
                 if r is not None:
                     parents.setdefault(r, []).append(w)
-            subs.append(strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, self.nat.C))
+            h = native.Graph(nodes, parents, [w for w, r in kept if r is None])
+            for name in ("tok_edges", "tok_out", "pairs"):  # the subset keeps graph's token edges and pairs (pp's runs)
+                if hasattr(graph, name):
+                    setattr(h, name, dict(getattr(graph, name)) if name == "pairs" else list(getattr(graph, name)))
+            subs.append(strand(h, tx.targets, self.nat.C))
         return base, (subs if base.stranded or any(sub.stranded for sub in subs) else None)
 
     def changed_edges(self, tx: Text, graph: native.Graph, ons: torch.Tensor, split: str = "search", draws: int = 16,

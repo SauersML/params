@@ -409,7 +409,7 @@ class EdgePruner(Descent):
         nat = ge.nat
         self.ge, self.tx, self.live, self.B = ge, tx, live, B
         par, out = native.all_edges(nodes, tx.targets)
-        self.graph = native.Graph(nodes, par, out)
+        self.graph = with_tokens(native.Graph(nodes, par, out), tx.targets)   # (token edges: pp's runs of its subsets)
         self.edges = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in out]
         self.inner = len(self.edges) - len(out)              # connections into nodes first, then into the prediction
         self.on = torch.ones(len(self.edges), dtype=torch.bool, device=nat.dev)
@@ -634,13 +634,14 @@ class Acceptance:
 
     def scores(self, graphs: list, edges: tuple | None = None) -> list[dict]:
         """Per graph its terms; edges, (graph, ons [K, connections]): the graphs are those connection subsets of one
-        node set, and "changed" in mode c runs from one plan of it (goal_eval changed_edges, the same numbers)."""
+        node set, and "changed" runs from one plan of it (goal_eval changed_edges, the same numbers; in pp mode one
+        engine.Engine.path_patched call)."""
         out = [{} for _ in graphs]
         for k in self.kinds:
             fn, keys = ACCEPT[k]
             if k == "changed":
                 keys = (TRACK[self.mode],)
-                got = (self.ge.changed_edges(self.tx, *edges, "search") if self.mode == "c" and edges is not None
+                got = (self.ge.changed_edges(self.tx, *edges, "search", mode=self.mode) if edges is not None
                        else self.ge.changed_search(self.tx, graphs, mode=self.mode))
             elif k == "interchange":                         # the path-patched interchange in pp mode (C's term)
                 keys = ("s_interchange_pp" if self.mode == "pp" else "s_interchange",)
@@ -723,7 +724,9 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
     and admitted by acceptance (floors min(0.9, the start's), one set for every stage): whole blocks dropped (the
     "site" level); each kept block refined into its subcomponents where acceptance admits it (Flags), the others kept
     as blocks; the refined sites' subcomponents pruned (first those outside VPD's answer, per site and position, then
-    chunks of 64, 16, 4, then single). Node sets throughout (every
+    chunks of 64, 16, 4, then single); then a refined site whose kept subcomponents outnumber VPD's active ones there
+    (a block priced at its active contents, the lead's 10-12) is its block again where that keeps the budget and the
+    floors (text6011's copied token at 233 kept 1,420 subcomponents). Node sets throughout (every
     connection, token edge and pair: complete graphs). (The circuit, the Pruner over every subcomponent at those
     positions with its final set, each unit's (site, position) group, the groups kept as blocks [S T], the record.)"""
     nat, targets, S = ge.nat, tx.targets, len(ge.nat.names)
@@ -796,10 +799,28 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
         t0 = time.perf_counter()
         pr.prune(level, budget, accept=hook)
         stage(level, t0)
+    t0 = time.perf_counter()                                 # re-block: a refined site whose kept subcomponents outnumber
+    act = torch.tensor([bool(tx.vpd[n][t, c]) for n, t, c in pr.nodes], device=nat.dev)   # VPD's active ones there (a
+    kept_n = torch.bincount(group[pr.on & ~flagged[group]], minlength=len(flagged))     # block's price, the lead's 10-12)
+    act_n = torch.bincount(group[act], minlength=len(flagged))
+    for k in torch.argsort(kept_n - act_n, descending=True).tolist():   # its block again, while it keeps the budget
+        if int(kept_n[k]) <= max(1, int(act_n[k])):                       # and the floors
+            break
+        on2, fl2 = pr.on | (group == k), flagged.clone()
+        fl2[k] = True
+        if pr.kl_sets(on2[None])[0] > budget:
+            continue
+        if acceptance is not None:
+            r = acceptance.scores([graph_of(on2, fl2)])[0]
+            if any(f is not None and r[key] is not None and r[key] < f for key, f in floor.items()):
+                continue
+        pr.on, flagged[k] = on2, True
+        rec.setdefault("reblocked", []).append([pr.names[k % S], k // S, int(kept_n[k]), int(act_n[k])])
+    stage("reblock", t0)
     g = graph_of(pr.on)
     if acceptance is not None:
         rec["accept"] = acceptance.scores([g])[0]
-    rec["bits"] = goal_eval.size_bits(g, nat.positions(targets), sum(nat.C.values()), targets)
+    rec["bits"] = goal_eval.size_bits(g, nat.positions(targets), sum(nat.C.values()), targets, tx.vpd)
     return g, pr, group, flagged, rec
 
 
@@ -857,8 +878,9 @@ class Connector:
             def accept(ons):
                 return [{"f1_flips": f} if f >= floor else None for f in flips(ons)]
         if self.acceptance is not None:                      # the search-split terms of the stated graph ("changed" from
-            terms, base = self.acceptance.hook(              # one plan of the node set's, changed_edges)
-                lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]), ep.on, lambda ons: (ep.graph, ons))
+            terms, base = self.acceptance.hook(              # one plan of the node set's, changed_edges; with blocks the
+                lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]), ep.on,   # graphs as stated:
+                None if self.blocks else (lambda ons: (ep.graph, ons)))   # ep.graph holds a block's subcomponents alone
             accept, start = both(accept, terms), {**start, **base}
 
         def state(kl, e_on, removed):
@@ -1137,7 +1159,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
                                acceptance=acceptance, blocks=bl)
             kept, row["best_edges"], _, _, on_w = wiring.connect(pb.on.clone(), n_b if n_b is not None else 0.0)
             stated = wiring.graph(on_w, kept)
-            row["best_edges"]["bits"] = goal_eval.size_bits(stated, nat.positions(targets), sum(nat.C.values()), targets)
+            row["best_edges"]["bits"] = goal_eval.size_bits(stated, nat.positions(targets), sum(nat.C.values()), targets, tx.vpd)
             circuits[""] = goal_eval.to_json(stated, "")
         row["seconds"] = time.perf_counter() - t0
         print(f"  {tx.T} tokens: {len(bl)} blocks, {g.count() - len(bl)} subcomponents, F1 {f1_b}, N {n_b}, "

@@ -345,11 +345,13 @@ def test_connection_acceptance_from_one_plan():
             break
     ons = torch.stack(ons)
     assert ge._edge_subsets(tx, ep.graph, ons)[1] is None and len(ons) == 4
-    acc = teacher.Acceptance(ge, tx, ("changed",), "c")
-    one = acc.scores([graph_of(e) for e in ons], (ep.graph, ons))
-    each = acc.scores([graph_of(e) for e in ons])
-    # changed_edges' one plan at 0/1 strengths gives changed_search's s_track on the subsets' graphs
-    assert all(a["s_track"] is not None and abs(a["s_track"] - b["s_track"]) <= 1e-3 for a, b in zip(one, each))
+    for mode in ("c", "pp"):
+        acc = teacher.Acceptance(ge, tx, ("changed",), mode)
+        key = teacher.TRACK[mode]
+        one = acc.scores([graph_of(e) for e in ons], (ep.graph, ons))
+        each = acc.scores([graph_of(e) for e in ons])
+        # changed_edges' one plan at 0/1 strengths gives changed_search's term on the subsets' graphs (token edges stated)
+        assert all(a[key] is not None and abs(a[key] - b[key]) <= 1e-3 for a, b in zip(one, each)), (mode, one, each)
     def dead(sub):                                              # sub's connected nodes with no route
         par, _ = native.all_edges(sub, tx.targets)
         reach = teacher.routes(sub, tx.targets)

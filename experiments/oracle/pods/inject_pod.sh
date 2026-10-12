@@ -3,7 +3,7 @@
 # PEFT LoRA on the base, the vector maps trained with it) and its answers to the held-out questions, with the
 # subcomponents' own vectors and with them shuffled among each question's subcomponents. The SFT rows, the question
 # rows and the held-out rows go up as one tar file, origin/main's method/oracle and method/vpd as another; VPD's
-# vectors (native.UV) are a published input and the base comes from the Hugging Face hub. Outputs come back in
+# vectors (native.UV) and the atlas that orients them are published inputs and the base comes from the Hugging Face hub. Outputs come back in
 # ~/mpd-data/runpod/oracle-graph-inject-$RUN/: run/ (adapter, injector.pt, sft.jsonl), samples.jsonl,
 # samples_shuffled.jsonl, inject.log. E1 (tinker_train.py readers) and the evaluation (eval_pod.sh) follow on their own.
 #   bash experiments/oracle/pods/inject_pod.sh RUN SFT.jsonl ROWS.jsonl HELDOUT.jsonl
@@ -27,7 +27,7 @@ rm -rf "$IN" "$IN.tar" && mkdir -p "$IN" && cp "$SFT" "$IN/sft.jsonl" && cp "$RO
 COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" sft.jsonl rows.jsonl heldout.jsonl && rm -rf "$IN"
 B="--base ${BASE:-Qwen/Qwen3-8B}"
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I; tar -xf $IN.tar -C $I; tar -xf $S.tar -C $S; \
-ls /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
+ls /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/mpd-data/atlas/vpd4l/atlas.json /Users/user/mpd-data/atlas/vpd4l/atlas.safetensors > /dev/null; \
 cd $S/method/oracle/rl; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 10 > $O/gpu.csv & \
 python -u inject.py sft $I/sft.jsonl $I/rows.jsonl --out $O/run $B --steps ${STEPS:-100} --batch ${BATCH:-8} --lr ${LR:-2e-4} > $O/inject.log 2>&1; \
 python -u inject.py sample $I/heldout.jsonl $O/samples.jsonl --shuffled-out $O/samples_shuffled.jsonl --init $O/run $B --n ${NEVAL:-20} \

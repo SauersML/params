@@ -50,7 +50,7 @@ def tiny(tmp_path_factory):
     g = torch.Generator().manual_seed(0)
     save_file({"h.0.mlp.c_fc.V": torch.randn(16, 8, generator=g), "h.0.mlp.c_fc.U": torch.randn(8, 24, generator=g),
                "h.1.attn.k_proj.V": torch.randn(16, 4, generator=g), "h.1.attn.k_proj.U": torch.randn(4, 12, generator=g)}, str(d / "uv.safetensors"))
-    vectors = inject.Vectors(d / "uv.safetensors")
+    vectors = inject.Vectors(d / "uv.safetensors", oriented=False)
     return inject.Explainer(str(d / "model"), 4, torch.device("cpu"), vectors), d
 
 
@@ -61,6 +61,8 @@ def test_slot_embeddings_are_the_vectors_and_train(tiny):
     emb = ex.embed(ids, [nodes])
     pos = (ids[0] == ex.slot).nonzero().flatten()
     want = ex.injector([(nd[0].split(".")[-1], *ex.vectors(nd)) for nd in nodes])
+    v, u, scale = ex.vectors(nodes[0])
+    assert abs(float(v.norm()) - 1) < 1e-5 and abs(float(u.norm()) - 1) < 1e-5 and scale > 0  # unit directions, the scale apart
     assert torch.allclose(emb[0, pos], want) and len(pos) == 2 * len(nodes)
     other = inject.derange(nodes, random.Random(0))
     assert not torch.allclose(ex.embed(ids, [other])[0, pos], want)  # shuffled vectors change what the slots carry

@@ -4,7 +4,9 @@ whose input embeddings are that subcomponent's read vector v and write vector u 
 explainer's width (one map per site kind and side: q, k, v read the normed residual and write a head space; o reads
 the heads and writes the residual; fc reads the normed residual and writes the MLP's hidden units; down reads those and
 writes the residual), each scaled to the RMS of the explainer's token embeddings, plus a learned embedding of
-log ||u|| ||v|| (u v^T fixes only the product of the norms; standardized over VPD's subcomponents) on both. The answer
+log ||u|| ||v|| (u v^T fixes only the product of the norms; standardized over VPD's subcomponents) on both. The
+vectors are method/vpd/uv.py's: unit directions oriented so the activation is positive where the subcomponent
+typically acts (the atlas's sign), with |u||v| apart. The answer
 names subcomponents by the question's ids as in the text-only arm; the vectors are a second channel, from which
 directions can be read. Tinker takes tokens only, so this arm runs on our own GPUs: transformers + PEFT LoRA on the
 base, the maps trained with it, sampling with inputs_embeds (transformers' generate).
@@ -20,7 +22,7 @@ question): the ablation that shows whether the explainer reads them; --shuffled-
 same run. --vllm samples with vLLM from the prompts' embeddings (computed here, then the adapter merged into a saved
 checkpoint that vLLM loads: train.py's VllmSampler found vLLM's own LoRA with prompt embeddings crashing, and runs
 them without prefix caching or asynchronous scheduling), else transformers' generate. Vectors: native.UV, the tensors
-native runs on.
+native runs on, through method/vpd/uv.py.
 """
 
 from __future__ import annotations
@@ -62,25 +64,30 @@ def slotted(question: str, ev: dict) -> tuple[str, list[tuple]]:
 
 
 class Vectors:
-    """VPD's subcomponents' vectors (native.UV: {site}.V [d_in, C] read, {site}.U [C, d_out] write)."""
+    """VPD's subcomponents' vectors (method/vpd/uv.py over native.UV: unit read v [d_in] and write u [d_out] directions,
+    oriented by the atlas, and |u||v|), and the mean and spread of log |u||v| over every subcomponent."""
 
-    def __init__(self, path: Path | None = None):
-        import native
-        from safetensors.torch import load_file
+    def __init__(self, path: Path | None = None, atlas: Path | None = None, oriented: bool = True):
+        sys.path.insert(0, str(HERE.parents[2]))
+        from method.vpd import uv
 
-        self.uv = load_file(str(path or native.UV))
-        logn = torch.cat([(self.uv[f"{s}.U"].float().norm(dim=1) * self.uv[f"{s}.V"].float().norm(dim=0)).log()
-                          for s in {k.rsplit(".", 1)[0] for k in self.uv}])
+        atlas = (atlas or uv.ATLAS) if oriented else None
+        if atlas is not None and not (Path(atlas) / "atlas.safetensors").exists():  # uv.py would orient by another rule
+            raise FileNotFoundError(f"{atlas}/atlas.safetensors: the vectors' orientation (the atlas's sign) is not there")
+        self.uv = uv.UV(path or uv.PATH, atlas=atlas)
+        t = self.uv.t
+        logn = torch.cat([(t[f"{s}.U"].float().norm(dim=1) * t[f"{s}.V"].float().norm(dim=0)).log() for s in self.uv.names()])
         self.logn_mean, self.logn_std = float(logn.mean()), float(logn.std())
 
-    def __call__(self, nd: tuple) -> tuple[torch.Tensor, torch.Tensor]:
-        name, _, c = nd
-        return self.uv[f"{name}.V"][:, c].float(), self.uv[f"{name}.U"][c].float()
+    def __call__(self, nd: tuple) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """(v, u, |u||v|) of subcomponent nd = (site, position, index)."""
+        g = self.uv.get(nd[0], nd[2])
+        return g["v"].float(), g["u"].float(), float(g["scale"])
 
     def dims(self) -> dict:
         """Site kind -> (read width, write width)."""
         out = {}
-        for k, t in self.uv.items():
+        for k, t in self.uv.t.items():
             site, side = k.rsplit(".", 1)
             kind = site.split(".")[-1]
             d = out.setdefault(kind, [0, 0])
@@ -103,12 +110,12 @@ class Injector(torch.nn.Module):
         torch.nn.init.zeros_(self.magnitude.bias)
         self.rms, self.logn_mean, self.logn_std = rms, logn_mean, logn_std
 
-    def forward(self, items: list[tuple[str, torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        """[2 N, width] for N subcomponents (site kind, v, u): each one's read slot, then its write slot."""
+    def forward(self, items: list[tuple[str, torch.Tensor, torch.Tensor, float]]) -> torch.Tensor:
+        """[2 N, width] for N subcomponents (site kind, v, u, |u||v|): each one's read slot, then its write slot."""
         dev = self.magnitude.weight.device
         out = []
-        for kind, v, u in items:
-            z = ((u.norm() * v.norm()).log() - self.logn_mean) / self.logn_std
+        for kind, v, u, scale in items:
+            z = torch.tensor((math.log(max(scale, 1e-30)) - self.logn_mean) / self.logn_std)
             mag = self.magnitude(z.reshape(1, 1).to(dev))[0]
             for side, x in zip(SIDES, (v, u)):
                 m = self.maps[f"{kind}_{side}"](x.to(dev))
@@ -154,8 +161,7 @@ class Explainer:
                 continue
             items = []
             for nd in nds:
-                v, u = self.vectors(nd)
-                items.append((nd[0].split(".")[-1], v, u))
+                items.append((nd[0].split(".")[-1], *self.vectors(nd)))
             vec = self.injector(items)
             assert len(vec) == len(pos), (len(vec), len(pos))
             emb = emb.index_put((torch.full_like(pos, r), pos), vec.to(emb.dtype))

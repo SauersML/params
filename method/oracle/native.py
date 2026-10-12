@@ -1002,7 +1002,8 @@ class Native:
             out.append(Changed(x, 1.0))
         return out
 
-    WINDOW_EXACT = ("mps",)  # devices where sensitivity's windowed probes are checked equal to the whole forward
+    WINDOW_EXACT = ("mps",)  # devices where windowed recomputation (sensitivity's probes, units.events' run(reuse=)) is
+    # checked equal to the whole forward; on CUDA (an A40, bench_speed.py's window bench and events fingerprints) it is not
 
     def sensitivity(self, ids: list[int], targets: list[int], g: torch.Generator, chunk: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
         """(moved [last], other [T - 1, V]): moved[p - 1], the KL (nats) of the model's prediction at the last target

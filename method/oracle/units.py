@@ -329,16 +329,17 @@ def _events(nat, task: dict, k: int = 8) -> list[dict]:
     ids, targets = prompt["token_ids"], prompt["target_positions"]
     t = max(targets)
 
-    states = nat._model_record(ids)[1]
+    # On Native.WINDOW_EXACT devices Native reuses the text's own run before the first position where a probe differs
+    # (or its last 64 rows): the same numbers as the whole run there (MPS: equal on heldout 9000-9003, every changed
+    # token and cut; on CUDA, an A40, they differ)
+    reuse = (nat._model_record(ids)[1], ids) if str(nat.dev).split(":")[0] in getattr(nat, "WINDOW_EXACT", ()) else None
 
     def p_top(x, mode=None):
-        # Native reuses the text's own run before the first position where x differs (or its last 64 rows): the same
-        # numbers as the whole run (checked equal on heldout 9000-9002, every changed token and cut)
         with torch.no_grad():
             if mode is None:
-                return nat.run(x, [t], nat._full_plan(len(x), 1), *nat._one(), reuse=(states, ids))[0, 0].exp()
+                return nat.run(x, [t], nat._full_plan(len(x), 1), *nat._one(), reuse=reuse)[0, 0].exp()
             with mode:
-                return nat.run(x, [t], nat._full_plan(len(x), 1), *nat._one(), reuse=(states, ids))[0, 0].exp()
+                return nat.run(x, [t], nat._full_plan(len(x), 1), *nat._one(), reuse=reuse)[0, 0].exp()
 
     base = p_top(ids)
     top = int(base.argmax())

@@ -327,14 +327,28 @@ def size_term(bits: float, scale: float) -> float:
 
 def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list[int]) -> float:
     """native.Graph.bits with the answer's embedding nodes: each a choice among the positions, and every edge's ends
-    indexed among all the listed nodes (embedding nodes included), an embedding edge priced like any other."""
-    extra = getattr(g, "stranded_bits", 0.0)  # stranded nodes (strand): dropped, their bits still charged
+    indexed among all the listed nodes (embedding nodes included), an embedding edge priced like any other; and the
+    stated query-key pairs (_pair_bits)."""
+    extra = getattr(g, "stranded_bits", 0.0) + _pair_bits(g)  # stranded nodes (strand): dropped, their bits still charged
     pos = sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in getattr(g, "tok_edges", [])})
     if not pos:
         return g.bits(positions, subcomponents, targets) + extra
     n, k = g.count(), len(pos)
     inner, out = native.implied_edges(g.node_set(), targets) if g.complete else (sum(len(w) for w in g.parents.values()), len(g.out))
     return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(n + k) * (2 * (inner + len(g.tok_edges)) + out) + extra
+
+
+def _pair_bits(g: native.Graph) -> float:
+    """The stated query-key pairs' bits (the lead, 10-12: anything stated costs its description): each pair of a read
+    (layer, t), and a read stated with the background alone, names its query among the circuit's queries at (layer, t)
+    and "rest", and its key among the circuit's keys of the layer up to t and "rest"."""
+    bits = 0.0
+    nodes = g.node_set() if getattr(g, "pairs", None) else ()
+    for (layer, t), ps in (getattr(g, "pairs", None) or {}).items():
+        nq = sum(1 for nd in nodes if native._name_layer_kind(nd[0]) == (layer, "q_proj") and nd[1] == t)
+        nk = sum(1 for nd in nodes if native._name_layer_kind(nd[0]) == (layer, "k_proj") and nd[1] <= t)
+        bits += max(1, len(ps)) * (math.log2(nq + 1) + math.log2(nk + 1))
+    return bits
 
 
 def _tok_pairs(g: native.Graph) -> tuple[list, list]:
@@ -351,6 +365,22 @@ def _transplant(base: torch.Tensor, moved: torch.Tensor, still: torch.Tensor) ->
     """log_softmax(base + moved - still): a run's change from still to moved (log q on x' and on x) applied to base
     (the model's log p on x), the target positions' distributions [B, targets, V]."""
     return torch.log_softmax(base + moved - still, -1)
+
+
+def _fid_raw(e0: float, kc: float, kv: float) -> float | None:
+    """_fid without the floor at 0 (the reward's ranking, the lead's 10-12): below 0 when the circuit is farther than
+    the bound; at most 1."""
+    if kv is None or kc is None or not kv < e0:
+        return None
+    return min(1.0, math.log(e0 / max(kc, 1e-12)) / math.log(e0 / max(kv, 1e-12)))
+
+
+def _c_rl(terms: list) -> float | None:
+    """The reward's C: the harmonic mean when every term is above 0, else the lowest term (unclipped): continuous at 0,
+    and a circuit worse than its bounds still ranked by how much."""
+    if not terms:
+        return None
+    return _harmonic(terms) if min(terms) > 0 else min(terms)
 
 
 def _harmonic(terms: list) -> float | None:
@@ -787,6 +817,213 @@ class GoalEval:
         return torch.log_softmax((norm(xt, tg.ln_f, "final") @ tg.wte.T).float(), -1)
 
 
+    @torch.no_grad()
+    def _pp_base(self, tx: Text) -> dict:
+        """The real model's run on the text, the path-patched runs' x side (kept on tx): every site's activations
+        [T, C] and remainder outputs, each layer's streams before its attention and its MLP, rotated queries and keys
+        [H, T, hd], values [T, H hd], scores [H, T, T], MLP inputs, the final stream."""
+        if getattr(tx, "_pp", None) is not None:
+            return tx._pp
+        import vpd_model
+
+        nat, tg, T = self.nat, self.nat.target, tx.T
+        H, hd = tg.n_head, tg.hd
+        b = {"a": {}, "rem": {}, "Xa": [], "Xm": [], "q": [], "k": [], "v": [], "S": [], "pre": []}
+
+        def site(n, inp):
+            A, rem = inp @ tg.site(n).V, inp @ tg.site(n).delta_T
+            b["a"][n], b["rem"][n] = A, rem
+            return A @ tg.site(n).U + rem
+
+        x = tg.wte[torch.tensor(tx.ids, device=nat.dev)].float()
+        causal = torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril()
+        for i in range(tg.n_layer):
+            nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
+            b["Xa"].append(x)
+            z = vpd_model.rms(x, tg.norms[2 * i], tg.eps)
+            q, k, v = (site(nm[kk], z) for kk in ("q_proj", "k_proj", "v_proj"))
+            qr, kr = (tg._rope(m.view(1, T, H, hd).transpose(1, 2), T)[0] for m in (q, k))
+            S = (qr @ kr.transpose(-1, -2)) / math.sqrt(hd)
+            b["q"].append(qr)
+            b["k"].append(kr)
+            b["v"].append(v)
+            b["S"].append(S)
+            P = S.masked_fill(~causal, float("-inf")).softmax(-1)
+            att = (P @ v.view(T, H, hd).transpose(0, 1)).transpose(0, 1).reshape(T, -1)
+            x = x + site(nm["o_proj"], att)
+            b["Xm"].append(x)
+            pre = site(nm["c_fc"], vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps))
+            b["pre"].append(pre)
+            x = x + site(nm["down_proj"], vpd_model.gelu_tanh(pre))
+        b["Xf"] = x
+        tx._pp = b
+        return b
+
+    @torch.no_grad()
+    def pp_run(self, tx: Text, x2: list[int], graph: native.Graph) -> torch.Tensor:
+        """log q at the targets [1, len(targets), V] of the path-patched run of graph on the changed text x2 (s_track_pp,
+        the lead's 10-12): everything at its value in the real model on the text (_pp_base) but the circuit's nodes,
+        which compute in layer order from their stated parents' path-patched values and every unstated input at its x
+        value; the change enters as the token embedding at the changed positions, read by the circuit's nodes there
+        and by the prediction. A residual reader's input: its read of the x stream plus each stated parent's change
+        (out^P - out^x, a rank-one write) plus the embedding's change, its RMSNorm recomputed. A read's pattern
+        (layer, t): queries and keys split into the circuit's nodes and the rest (always at x); with no stated pairs
+        the read claims every pair (circuit nodes at their patched values), with stated pairs the x scores plus each
+        stated pair's change, the softmax over the whole row recomputed. An attention output: that pattern over the x
+        values plus its stated value parents' changes. An MLP output: GELU of the x MLP input plus its stated input
+        parents' changes. The prediction: the final x stream plus its stated writers' changes and the embedding's. On
+        the text itself the run is the real model; a complete graph is the forward on x2 with every subcomponent
+        outside it and every remainder at its x value (computed that way)."""
+        import vpd_model
+
+        tg, T, dev = self.nat.target, tx.T, self.nat.dev
+        H, hd = tg.n_head, tg.hd
+        b = self._pp_base(tx)
+        demb = {t: (tg.wte[x2[t]] - tg.wte[tx.ids[t]]).float() for t in range(T) if x2[t] != tx.ids[t]}
+        causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
+        if graph.complete:
+            M = {n: m.to(dev) for n, m in self.masks(graph, T).items()}
+
+            def site(n, inp):
+                A = torch.where(M[n], inp @ tg.site(n).V, b["a"][n])
+                return A @ tg.site(n).U + b["rem"][n]
+
+            x = tg.wte[torch.tensor(x2, device=dev)].float()
+            for i in range(tg.n_layer):
+                nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
+                z = vpd_model.rms(x, tg.norms[2 * i], tg.eps)
+                q, k, v = (site(nm[kk], z) for kk in ("q_proj", "k_proj", "v_proj"))
+                qr, kr = (tg._rope(m.view(1, T, H, hd).transpose(1, 2), T)[0] for m in (q, k))
+                P = ((qr @ kr.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
+                att = (P @ v.view(T, H, hd).transpose(0, 1)).transpose(0, 1).reshape(T, -1)
+                x = x + site(nm["o_proj"], att)
+                x = x + site(nm["down_proj"], vpd_model.gelu_tanh(site(nm["c_fc"], vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps))))
+            return torch.log_softmax(vpd_model.rms(x[tx.targets], tg.ln_f, tg.eps) @ tg.wte.T.float(), -1)[None]
+        order = {k: j for j, k in enumerate(vpd_model.KINDS)}
+        nodes = sorted(graph.node_set(), key=lambda nd: (native._name_layer_kind(nd[0])[0],
+                                                          order[native._name_layer_kind(nd[0])[1]], nd[1], nd[2]))
+        par = graph.parents
+        aP = {}
+
+        def delta(w):  # a circuit writer's output change, out^P - out^x, in its site's output space
+            n, t, c = w
+            return (aP[w] - b["a"][n][t, c]) * tg.site(n).U[c]
+
+        def resid(r, X, wn):  # a residual reader's patched activation
+            inp = X[r[1]].clone()
+            for w in par.get(r, []):
+                if w in aP:
+                    inp = inp + delta(w)
+            if r[1] in demb:
+                inp = inp + demb[r[1]]
+            return vpd_model.rms(inp, wn, tg.eps) @ tg.site(r[0]).V[:, r[2]]
+
+        def part(nd, patched):  # a query or key node's rank-one part [H, hd], rotated at its position
+            n, p, c = nd
+            act = aP[nd] if patched else b["a"][n][p, c]
+            v = (act * tg.site(n).U[c]).view(H, hd)
+            half = hd // 2
+            return v * tg.cos[p] + torch.cat([-v[..., half:], v[..., :half]], -1) * tg.sin[p]
+
+        pairs = getattr(graph, "pairs", None) or {}
+        scale = 1 / math.sqrt(hd)
+        for i in range(tg.n_layer):
+            here = [nd for nd in nodes if native._name_layer_kind(nd[0])[0] == i]
+            kind = {nd: native._name_layer_kind(nd[0])[1] for nd in here}
+            for r in here:
+                if kind[r] in ("q_proj", "k_proj", "v_proj"):
+                    aP[r] = resid(r, b["Xa"][i], tg.norms[2 * i])
+            qs = [nd for nd in here if kind[nd] == "q_proj"]
+            ks = [nd for nd in here if kind[nd] == "k_proj"]
+            rows = {}
+            for t in sorted({nd[1] for nd in here if kind[nd] == "o_proj"}):  # the pattern rows the outputs read
+                qa = [nd for nd in qs if nd[1] == t]
+                kb = [nd for nd in ks if nd[1] <= t]
+                qx, kx = b["q"][i][:, t], b["k"][i][:, :t + 1]  # [H, hd], [H, t + 1, hd]
+                q_rest = qx.clone()
+                for a in qa:
+                    q_rest = q_rest - part(a, False)
+                k_rest = kx.clone()
+                for nd in kb:
+                    k_rest[:, nd[1]] -= part(nd, False)
+                if (i, t) not in pairs:  # every pair claimed: the circuit's queries and keys at their patched values
+                    qP = q_rest.clone()
+                    for a in qa:
+                        qP = qP + part(a, True)
+                    kP = k_rest.clone()
+                    for nd in kb:
+                        kP[:, nd[1]] += part(nd, True)
+                    S = (qP[:, None] * kP).sum(-1) * scale
+                else:
+                    S = b["S"][i][:, t, :t + 1].clone()
+                    for a, kk in pairs[(i, t)]:
+                        qn, qo = (q_rest, q_rest) if a is None else (part(a, True), part(a, False))
+                        if kk is None:
+                            S = S + ((qn - qo)[:, None] * k_rest).sum(-1) * scale
+                        else:
+                            S[:, kk[1]] += ((qn * part(kk, True)) - (qo * part(kk, False))).sum(-1) * scale
+                rows[t] = S.softmax(-1)  # [H, t + 1]
+            for r in here:
+                if kind[r] == "o_proj":
+                    t = r[1]
+                    vmix = b["v"][i][:t + 1].clone()
+                    for w in par.get(r, []):
+                        if w in aP and kind.get(w) == "v_proj" and w[1] <= t:
+                            vmix[w[1]] += delta(w)
+                    att = (rows[t][:, :, None] * vmix.view(t + 1, H, hd).transpose(0, 1)).sum(1).reshape(-1)
+                    aP[r] = att @ tg.site(r[0]).V[:, r[2]]
+            for r in here:
+                if kind[r] == "c_fc":
+                    aP[r] = resid(r, b["Xm"][i], tg.norms[2 * i + 1])
+            for r in here:
+                if kind[r] == "down_proj":
+                    pre = b["pre"][i][r[1]].clone()
+                    for w in par.get(r, []):
+                        if w in aP and kind.get(w) == "c_fc":
+                            pre = pre + delta(w)
+                    aP[r] = vpd_model.gelu_tanh(pre) @ tg.site(r[0]).V[:, r[2]]
+        f = b["Xf"][tx.targets].clone()
+        for j, t in enumerate(tx.targets):
+            for w in graph.out:
+                if w[1] == t and w in aP:
+                    f[j] = f[j] + delta(w)
+            if t in demb:
+                f[j] = f[j] + demb[t]
+        return torch.log_softmax(vpd_model.rms(f, tg.ln_f, tg.eps) @ tg.wte.T.float(), -1)[None]
+
+    @torch.no_grad()
+    def track_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = CHANGED_DRAWS) -> list[dict]:
+        """s_track_pp (the lead's 10-12, beside s_track): on changed_inputs' changed texts x' (split), the path-patched
+        run of each circuit (pp_run) against the model on x', against VPD's whole answer's path-patched run (a
+        complete graph: 1 by construction), bounded by no change: per prompt clip(ln(W / KL_C) / ln(W / KL_V), 0, 1)
+        with W = KL(model(x') || model(x)) (the circuit's run on x is the model's, so this is s_track's transplant),
+        none where VPD's run is no nearer than W, pooled weighted by W. Per circuit s_track_pp, kl_track_pp_c,
+        prompts_track_pp and draws_track_pp ([prompt, KL_C, KL_V, W] each)."""
+        nat = self.nat
+        graphs = [strand(g, tx.targets, nat.C) for g in graphs]
+        moved = np.asarray(tx.moved, dtype=float)
+        positions = [p for p, _ in tx.f2]
+        got = self._interchange_draws(tx, positions, split, draws, first={p: -moved[p - 1] for p in positions}) \
+            if positions and tx.vpd is not None else []
+        vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
+        acc = [[0.0, 0.0, 0.0, 0, []] for _ in graphs]
+        for p, z in got:
+            x2 = list(tx.ids)
+            x2[p] = z
+            ref = nat.reference([x2], tx.targets)
+            w = float(carry.kl(ref, tx.ref)[0])
+            kv = float(carry.kl(ref, self.pp_run(tx, x2, vpd))[0])
+            for b_, g in enumerate(graphs):
+                kc = float(carry.kl(ref, self.pp_run(tx, x2, g))[0])
+                sb = _fid(w, kc, kv)
+                a = acc[b_]
+                a[4].append([[p, z], kc, kv, w])
+                if sb is not None:
+                    a[0], a[1], a[2], a[3] = a[0] + w * sb, a[1] + w, a[2] + w * kc, a[3] + 1
+            native.free(nat.dev)
+        return [{"s_track_pp": a[0] / a[1] if a[1] > 0 else None, "kl_track_pp_c": a[2] / a[1] if a[1] > 0 else None,
+                 "prompts_track_pp": a[3], "draws_track_pp": a[4]} for a in acc]
+
     def _pair_row(self, layer: int, t: int, stated, nodes: list, q: torch.Tensor, k: torch.Tensor, a: dict, on: dict) -> torch.Tensor:
         """A read's attention scores [B, H, t + 1] (layer, query position t) from its stated query-key pairs: with q_t =
         sum_a q_a + q_rest (the circuit's query nodes at t, each its rank-one part a_a(t) u_a, and the rest: the
@@ -1153,7 +1390,7 @@ class GoalEval:
                  steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE, fresh: dict | None = None,
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
                  changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
-                 far_donors: int = DONORS_FAR) -> list[dict]:
+                 far_donors: int = DONORS_FAR, baseline: bool = False) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -1189,7 +1426,10 @@ class GoalEval:
         n_real) and its adversary (necessity_flips, n_real_flips). leak: graph F1 of the circuit's nodes stating no
         edge (live remainders carrying their outputs to the prediction). mode="reward": the training family alone, what
         the RL reward takes every step: point, nodes, edges with reads (on), the flips up to FLIP_TERM (their starts
-        drawn as for every budget), interchange and changed texts (so c is the full mode's on the same split); no
+        drawn as for every budget), interchange and changed texts (so c is the full mode's on the same split), and for
+        RL's ranking rl_terms (each term without the floor at 0, _fid_raw) and c_rl (_c_rl: their harmonic mean when all
+        are above 0, else the lowest); baseline: c_vpd_k and c_rl_vpd_k of VPD's first k at the answer's k
+        (vpd_baseline); no
         step-budget adversary, larger budgets, fresh pool, N_real or leak, and no flips_to_break / flips_to_half."""
         if mode not in ("full", "reward"):
             raise ValueError("mode is full or reward")
@@ -1232,7 +1472,7 @@ class GoalEval:
             row["reliance_on_cuts"] = (row["s_point"] - row["s_wiring"]) if None not in (row["s_point"], row["s_wiring"]) else None
             row["s_point_c"] = min(x for x in (row["s_point"], row["s_wiring"]) if x is not None) if row["s_point"] is not None else None
             fg = row.get("f1_flips_omitted", {})
-            fw = self._flips_wiring(tx, g, fl, e0) if (i in wired and fg) else {}
+            fw, fw_raw = self._flips_wiring(tx, g, fl, e0, both=True) if (i in wired and fg) else ({}, {})
             row["f1_flips_wiring"] = fw
             fc = {m: (min(v, fw[m]) if (m in fw and v is not None and fw[m] is not None) else v) for m, v in fg.items()}
             row["f1_flips_c"] = fc
@@ -1244,6 +1484,25 @@ class GoalEval:
             named += [(k, row.get(k)) for k in ("s_track", "s_interchange", "s_donor_near", "s_donor_far")]
             row["c_terms"] = [k for k, v in named if v is not None]  # a family with nothing scored on the text is left out
             row["c"] = _harmonic([v for _, v in named if v is not None])
+            if reward:  # the terms without the floor at 0 and C_rl, for RL's ranking within a group (the lead's 10-12)
+                v0 = self._bounds(tx, "live")[1]
+                kfl = row.get("kl_flips_omitted", {}).get(FLIP_TERM)
+                raw = {"s_point_c": min(x for x in (_fid_raw(e0, pt["kl_live"], v0),
+                                                    _fid_raw(e0, wired[i]["kl_live"], v0) if i in wired else None) if x is not None)
+                       if _fid_raw(e0, pt["kl_live"], v0) is not None else None,
+                       "s_nodes": _fid_raw(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"]),
+                       "s_edges": _fid_raw(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
+                       "f1_flips_c": min(x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None)
+                       if kfl else None,
+                       "s_track": row.get("s_track_raw"),
+                       "s_interchange": _fid_raw(e0, it["kl_interchange_c"], it["kl_interchange_vpd"]) if it else None}
+                for pool_ in ("near", "far"):
+                    k3 = row.get(f"kl_donor_{pool_}")
+                    raw[f"s_donor_{pool_}"] = _fid_raw(k3[2], k3[0], k3[1]) if k3 else None
+                row["rl_terms"] = {k: raw[k] for k in row["c_terms"]}
+                row["c_rl"] = _c_rl([raw[k] for k in row["c_terms"] if raw[k] is not None])
+                if baseline:
+                    row.update(self.vpd_baseline(tx, g.count(), pool, split))
             row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") else None
             if not reward:  # (the reward's flips stop at FLIP_TERM)
                 half = 0.5 * row["s_point_c"] if row["s_point_c"] is not None else None
@@ -1267,9 +1526,10 @@ class GoalEval:
         return out
 
     @torch.no_grad()
-    def _flips_wiring(self, tx: Text, g: native.Graph, fl: dict, e0: float) -> dict:
+    def _flips_wiring(self, tx: Text, g: native.Graph, fl: dict, e0: float, raw: bool = False, both: bool = False):
         """The flips' masks scored on a stated circuit's node set with every connection among its nodes restored (its
-        masked run with the switched-on omissions), against VPD's paired KL: {m: f1}."""
+        masked run with the switched-on omissions), against VPD's paired KL: {m: f1} (raw: _fid_raw's; both: the two
+        dicts, one run)."""
         nat, T = self.nat, tx.T
         masks, ms = [], []
         for m, parts in fl.get("mask_flips_omitted", {}).items():
@@ -1280,10 +1540,10 @@ class GoalEval:
             masks.append(on)
             ms.append(m)
         if not masks:
-            return {}
+            return ({}, {}) if both else {}
         kc = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, masks, True)).tolist()
         kv = {m: fl["kl_flips_omitted"][m][1] for m in ms}
-        return {m: _fid(e0, k, kv[m]) for m, k in zip(ms, kc)}
+        return {m: (_fid_raw if raw else _fid)(e0, k, kv[m]) for m, k in zip(ms, kc)} if not both else             ({m: _fid(e0, k, kv[m]) for m, k in zip(ms, kc)}, {m: _fid_raw(e0, k, kv[m]) for m, k in zip(ms, kc)})
 
 
     def necessity_flips(self, tx: Text, graphs: list[native.Graph], ms=None, steps: int = ADV_STEPS,
@@ -1540,32 +1800,15 @@ class GoalEval:
         reader (the prediction among the readers) in the model, in VPD's answer and in the circuit, all in C's
         semantics (the reader reads its input without those writers' outputs), or, a read with stated query-key pairs
         drawn, a random subset of its pairs (graph_ref's ("pairs", layer, t) cut, the circuit's queries and keys of that
-        read the split); the mean KLs from the model's. A circuit without connections or pairs: None. Every draw of a side runs in one batch on the engine (_sides)."""
+        read the split; a read with circuit queries and no stated pairs, every pair of its row, engine.read_pairs:
+        monitorbench's 10-12; _edge_draws); the mean KLs from the model's. A circuit without connections or pairs: None. Every draw of a side runs in one batch on the engine (_sides)."""
         sides = self._sides(tx, graphs)
         out = []
         for g in graphs:
-            nodes = g.node_set()
-            par, outs = (native.all_edges(nodes, tx.targets) if g.complete else (g.parents, g.out))
-            sp = {} if g.complete else (getattr(g, "pairs", None) or {})
-            readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
-            readers += [("pairs",) + read for read in sorted(sp) if sp[read]]  # reads with stated query-key pairs
-            if not readers:
+            cuts = self._edge_draws(tx, g, draws)
+            if cuts is None:
                 out.append({"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None})
                 continue
-            rng = self._rng(tx, g, "edges")
-            cuts = []
-            for j in range(draws):
-                r = readers[int(rng.integers(len(readers)))]
-                if r is not None and r[0] == "pairs":  # a random subset of the read's stated pairs cut, the split the
-                    ps, (_, layer, t) = sp[r[1:]], r  # circuit's queries at t and keys up to t of that layer
-                    split = sorted(nd for nd in nodes if native._name_layer_kind(nd[0])[0] == layer and
-                                   ((native._name_layer_kind(nd[0])[1] == "q_proj" and nd[1] == t)
-                                    or (native._name_layer_kind(nd[0])[1] == "k_proj" and nd[1] <= t)))
-                    cut = [pr for pr in ps if rng.random() < (j + 0.5) / draws] or [ps[int(rng.integers(len(ps)))]]
-                    cuts.append({r: (split, cut)})
-                    continue
-                ws = list(par[r]) if r is not None else list(outs)
-                cuts.append({r: [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]})
             got = sides(g, cuts=cuts, reads=reads)
             lm, lv, lc = got[:3]
             row = {"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean()), "reads_edges": None}
@@ -1576,6 +1819,39 @@ class GoalEval:
             out.append(row)
             native.free(self.nat.dev)
         return out
+
+    def _edge_draws(self, tx: Text, g: native.Graph, draws: int) -> list | None:
+        """The connection-cut family's draws for one circuit (graph_ref's cuts form, one dict per draw), None with
+        nothing to cut: draw j picks a reader, the prediction or a read with query-key pairs (a stated graph's, or every
+        pair of a read whose circuit queries state none) and cuts each of its connections or pairs with probability
+        (j + 0.5) / draws, at least one; a pair cut's split the circuit's queries at the read and keys up to it."""
+        import engine
+
+        nodes = g.node_set()
+        par, outs = (native.all_edges(nodes, tx.targets) if g.complete else (g.parents, g.out))
+        sp = dict({} if g.complete else (getattr(g, "pairs", None) or {}))
+        for nd in sorted(nodes):  # a read with circuit queries and no entry claims every pair of its row
+            L, kd = native._name_layer_kind(nd[0])
+            if kd == "q_proj" and (L, nd[1]) not in sp:
+                sp[(L, nd[1])] = engine.read_pairs(nodes, L, nd[1])
+        readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
+        readers += [("pairs",) + read for read in sorted(sp) if sp[read]]  # reads with query-key pairs
+        if not readers:
+            return None
+        rng = self._rng(tx, g, "edges")
+        cuts = []
+        for j in range(draws):
+            r = readers[int(rng.integers(len(readers)))]
+            if r is not None and r[0] == "pairs":
+                ps, (_, layer, t) = sp[r[1:]], r
+                split = sorted(nd for nd in nodes if native._name_layer_kind(nd[0])[0] == layer and
+                               ((native._name_layer_kind(nd[0])[1] == "q_proj" and nd[1] == t)
+                                or (native._name_layer_kind(nd[0])[1] == "k_proj" and nd[1] <= t)))
+                cuts.append({r: (split, [pr for pr in ps if rng.random() < (j + 0.5) / draws] or [ps[int(rng.integers(len(ps)))]])})
+                continue
+            ws = list(par[r]) if r is not None else list(outs)
+            cuts.append({r: [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]})
+        return cuts
 
     def _sides(self, tx: Text, graphs: list[native.Graph]):
         """C's families' three sides on the engine, every draw a row: sides(g, cuts=[per draw {reader: [writers]}] or
@@ -1800,6 +2076,7 @@ class GoalEval:
             if positions and tx.vpd is not None else []
         acc = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # sum of w s, of w, of w KL_C; prompts scored
         trk = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # the same for s_track
+        trk_raw = [0.0 for _ in graphs]  # s_track's sum of w s without the floor at 0
         q0, lcs = self._changed_logq(tx, graphs, got, strengths, cuts) if got else (None, [])
         v0, lvs = self._changed_vpd(tx, got) if got else (None, [])
         for (p, z), lc, lv in zip(got, lcs, lvs):
@@ -1816,17 +2093,24 @@ class GoalEval:
                 for a, sb, k in ((acc[b], _fid(k0[b], kc[b], kv), kc[b]), (trk[b], _fid(w, tc[b], tv), tc[b])):
                     if sb is not None:
                         a[0], a[1], a[2], a[3] = a[0] + w * sb, a[1] + w, a[2] + w * k, a[3] + 1
+                rt = _fid_raw(w, tc[b], tv)  # scored where s_track is (the same conditions)
+                if rt is not None:
+                    trk_raw[b] += w * rt
             native.free(nat.dev)
         return [{"s_changed": a[0] / a[1] if a[1] > 0 else None, "kl_changed_c": a[2] / a[1] if a[1] > 0 else None,
                  "prompts_changed": a[3], "s_track": t[0] / t[1] if t[1] > 0 else None,
                  "kl_track_c": t[2] / t[1] if t[1] > 0 else None, "prompts_track": t[3], "context_share": sh,
-                 "draws_changed": got} for a, t, sh in zip(acc, trk, share)]
+                 "s_track_raw": tr / t[1] if t[1] > 0 else None,
+                 "draws_changed": got} for a, t, tr, sh in zip(acc, trk, trk_raw, share)]
 
-    def changed_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16, cuts: list | None = None) -> list[dict]:
+    def changed_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16, cuts: list | None = None,
+                       mode: str = "c") -> list[dict]:
         """The teachers' changed-input family: changed_inputs on the search split alone (never a reward, gate or
         table's) for a list of candidate circuits on one text, each changed text run once for all of them. A node set
         without stated structure: native.Graph(nodes, complete=True); cuts, per graph its connections cut
-        (_changed_logq)."""
+        (_changed_logq); mode "pp": track_pp's path-patched s_track_pp instead (no cuts)."""
+        if mode == "pp":
+            return self.track_pp(tx, graphs, "search", draws)
         return self.changed_inputs(tx, graphs, "search", draws, cuts=cuts)
 
     @torch.no_grad()
@@ -1844,12 +2128,40 @@ class GoalEval:
             out[site] = a[n - T:] if pad == 0 else torch.cat([a.new_zeros(pad, a.shape[1]), a])
         return out, pad
 
+    def vpd_baseline(self, tx: Text, k: int, pool: dict | None, split: str = "search") -> dict:
+        """The reward's size-matched baseline (primerl's C - C_vpd@k): c and c_rl of VPD's first k subcomponents (its
+        order, tx.vpd_order when set) on the text in reward mode on split, {"c_vpd_k", "c_rl_vpd_k"}, interpolated in
+        log2 k between VPD's first k at the powers of 2 around k (the last at VPD's whole order), each scored once per
+        text and split (kept on tx): an RL group's answers on one text share them. None without VPD's order."""
+        try:
+            order = getattr(tx, "vpd_order", None) or self.nat._vpd_order(tx.ids, tx.targets)
+        except Exception:  # no causal-importance network and no saved order
+            order = None
+        if not order:
+            return {"c_vpd_k": None, "c_rl_vpd_k": None}
+        k = max(1, min(int(k), len(order)))
+        lo = 1 << (k.bit_length() - 1)
+        hi = min(len(order), lo if lo == k else lo << 1)
+        kept = tx.__dict__.setdefault("_vpd_c", {})
+
+        def at(n):
+            if (n, split) not in kept:
+                r = self.fidelity(tx, [native.Graph(order[:n], complete=True)], pool, mode="reward", split=split)[0]
+                kept[(n, split)] = (r["c"], r["c_rl"])
+            return kept[(n, split)]
+
+        a, b = at(lo), at(hi)
+        f = 0.0 if hi == lo else (math.log2(k) - math.log2(lo)) / (math.log2(hi) - math.log2(lo))
+        mix = lambda x, y: None if x is None or y is None else x + f * (y - x)  # noqa: E731
+        return {"c_vpd_k": mix(a[0], b[0]), "c_rl_vpd_k": mix(a[1], b[1])}
+
     def far_pool(self, split: str) -> list:
-        """The far donors' texts of a split, [(name, token ids)] (DONOR_POOLS), loaded once."""
+        """The far donors' texts of a split, [(name, token ids)] (DONOR_POOLS) in the model's vocabulary, loaded once."""
         if split not in self.donor_pools:
             which, idx = DONOR_POOLS[split]
             tasks = native.tasks(which)
-            self.donor_pools[split] = [(tasks[i].stem, native.text(tasks[i])[0]) for i in idx if i < len(tasks)]
+            V = self.nat.target.wte.shape[0]  # a text in another vocabulary (a tiny test model's) is no donor
+            self.donor_pools[split] = [(tasks[i].stem, x) for i in idx if i < len(tasks) for x in [native.text(tasks[i])[0]] if max(x) < V]
         return self.donor_pools[split]
 
     def donors_search(self, tx: Text, graphs: list[native.Graph], near: int = DONORS_NEAR, far: int = DONORS_FAR) -> list[dict]:

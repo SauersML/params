@@ -482,16 +482,23 @@ def test_pair_edges_parse_and_round_trip(tiny):
 
 
 def test_edge_family_cuts_stated_pairs(tiny):
-    """Reads with stated query-key pairs join the connection-cut family's readers: a circuit whose only stated
-    structure is pairs is still scored, and its draws are the reads' pair cuts."""
+    """Reads with query-key pairs join the connection-cut family's readers: a circuit whose only stated structure is
+    pairs is still scored, its draws the reads' pair cuts, and a read with a circuit query and no stated pairs claims
+    every pair of its row; a stated pair is priced like an edge (its query and key named among the read's)."""
     nat, ge, tx = tiny
     o1, qa, ka, kb = ("h.1.attn.o_proj", 11, 0), ("h.1.attn.q_proj", 11, 0), ("h.1.attn.k_proj", 3, 0), ("h.1.attn.k_proj", 5, 1)
     g = native.Graph([o1, qa, ka, kb], {}, [])
     g.pairs = {(1, 11): [(qa, ka), (None, kb)]}
     row = ge._edge_family(tx, [g], draws=6)[0]
     assert row["kl_edges_c"] is not None and row["kl_edges_vpd"] is not None
-    plain = native.Graph([o1, qa, ka, kb], {}, [])
+    plain = native.Graph([o1, ka, kb], {}, [])  # no query: no read to cut, no connection
     assert ge._edge_family(tx, [plain], draws=6)[0]["kl_edges_c"] is None
+    unstated = native.Graph([o1, qa, ka, kb], {}, [])  # a query with no stated pairs: every pair of its row is claimed
+    assert ge._edge_family(tx, [unstated], draws=6)[0]["kl_edges_c"] is not None
+    P, S = max(tx.targets) + 1, sum(nat.C.values())
+    bare = native.Graph([o1, qa, ka, kb], {}, [])
+    # two pairs, each naming its query among 1 + "rest" and its key among 2 + "rest"
+    assert abs(goal_eval.size_bits(g, P, S, tx.targets) - goal_eval.size_bits(bare, P, S, tx.targets) - 2 * (1 + math.log2(3))) < 1e-9
 
 def test_probe_is_kept(tiny):
     """A text's changed prompts and F2 prompts come from one sensitivity probe, kept per text: a second preparation
@@ -1008,17 +1015,11 @@ def test_families_on_the_engine_are_graph_ref(tiny):
     draws = 4
     got = ge._edge_family(tx, graphs, draws)
     for g, row in zip(graphs, got):
-        par, outs = (native.all_edges(g.node_set(), tx.targets) if g.complete else (g.parents, g.out))
-        readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
-        rng = ge._rng(tx, g, "edges")
         kc, kv = [], []
-        for j in range(draws):
-            r = readers[int(rng.integers(len(readers)))]
-            ws = list(par[r]) if r is not None else list(outs)
-            cut = [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]
-            lm = ge.graph_ref(tx.ids, tx.targets, model, cuts={r: cut})
-            kc.append(float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, g, cuts={r: cut}))[0]))
-            kv.append(float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, vpd, cuts={r: cut}))[0]))
+        for cut in ge._edge_draws(tx, g, draws):  # connection cuts and pair cuts (a read's query-key pairs)
+            lm = ge.graph_ref(tx.ids, tx.targets, model, cuts=cut)
+            kc.append(float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, g, cuts=cut))[0]))
+            kv.append(float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, vpd, cuts=cut))[0]))
         for key, want in (("kl_edges_c", float(np.mean(kc))), ("kl_edges_vpd", float(np.mean(kv)))):
             assert abs(row[key] - want) < 1e-6 + 1e-4 * abs(want), (key, row[key], want)
     vals = [{nd: torch.tensor(0.5 + 0.1 * j, device=nat.dev) for nd in graphs[0].node_set() if nd[1] == p}
@@ -1075,15 +1076,7 @@ def test_family_reads_are_graph_ref(tiny):
         assert abs(row["reads_nodes"] - want) < 1e-5 + 1e-4 * abs(want), ("nodes", row["reads_nodes"], want)
     for g, row in zip(graphs, ge._edge_family(tx, graphs, draws, reads=True)):
         gn = sorted(g.node_set())
-        par, outs = (native.all_edges(g.node_set(), tx.targets) if g.complete else (g.parents, g.out))
-        readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
-        rng = ge._rng(tx, g, "edges")
-        runs = []
-        for j in range(draws):
-            r = readers[int(rng.integers(len(readers)))]
-            ws = list(par[r]) if r is not None else list(outs)
-            cut = [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]
-            runs.append((model, g, {"cuts": {r: cut}}, gn))
+        runs = [(model, g, {"cuts": cut}, gn) for cut in ge._edge_draws(tx, g, draws)]
         want = ref_reads(g, runs)
         assert abs(row["reads_edges"] - want) < 1e-5 + 1e-4 * abs(want), ("edges", row["reads_edges"], want)
     vals = [{nd: torch.tensor(0.5 + 0.1 * j, device=nat.dev) for nd in stated.node_set() if nd[1] == p}
@@ -1408,6 +1401,81 @@ def test_donor_resampling(tiny):
     srch = ge.donors_search(tx, [whole], near=4, far=3)[0]
     assert [d[0] for d in srch["draws_donor_near"]] == [list(pz) for pz in ge.changed_search(tx, [whole], 4)[0]["draws_changed"]]
     assert [d[0] for d in srch["draws_donor_far"]] == [n for n, _ in ge.far_donors(tx, ge.far_pool("search"), 3)]
+
+
+def test_reward_terms_unclipped_for_ranking(tiny):
+    """Reward mode's rl_terms: each C term without the floor at 0 (equal to it where it is above 0, at most 0 where it
+    is 0; s_track, pooled over prompts, at most its clipped pool), and c_rl their harmonic mean when every term is
+    above 0, else the lowest; c stays the clipped harmonic."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(every[::3], *native.all_edges(every[::3], tx.targets)), native.Graph(every[1:3], complete=True)]
+    pool = tiny_pool(nat, tx.ids)
+    for row in ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, mode="reward"):
+        assert set(row["rl_terms"]) == set(row["c_terms"])
+        for k in row["c_terms"]:
+            clipped = row["f1_flips_c"][goal_eval.FLIP_TERM] if k == "f1_flips_c" else row[k]
+            raw = row["rl_terms"][k]
+            if k == "s_track":  # pooled over prompts: each prompt's floor removed, so the pool can only fall
+                assert raw <= clipped + 1e-9, (raw, clipped)
+                continue
+            assert raw <= 1.0 and (abs(raw - clipped) < 1e-9 if clipped > 0 else raw <= 1e-12), (k, raw, clipped)
+        raws = list(row["rl_terms"].values())
+        want = goal_eval._harmonic(raws) if min(raws) > 0 else min(raws)
+        assert row["c_rl"] == want
+    assert goal_eval._c_rl([0.5, -0.2, 0.9]) == -0.2 and goal_eval._c_rl([0.5, 0.5]) == 0.5
+
+
+def test_vpd_baseline(tiny):
+    """C_vpd@k: VPD's first k in reward mode at a power of 2, interpolated in log2 k between two, kept on the text."""
+    nat, ge, tx = tiny
+    pool = tiny_pool(nat, tx.ids)
+    order = nat._vpd_order(tx.ids, tx.targets)
+    assert len(order) >= 4
+    r4 = ge.fidelity(tx, [native.Graph(order[:4], complete=True)], pool, mode="reward")[0]
+    r2 = ge.fidelity(tx, [native.Graph(order[:2], complete=True)], pool, mode="reward")[0]
+    b4, b3 = ge.vpd_baseline(tx, 4, pool), ge.vpd_baseline(tx, 3, pool)
+    assert abs(b4["c_vpd_k"] - r4["c"]) < 1e-9 and abs(b4["c_rl_vpd_k"] - r4["c_rl"]) < 1e-9
+    f = math.log2(3) - 1
+    assert abs(b3["c_vpd_k"] - (r2["c"] + f * (r4["c"] - r2["c"]))) < 1e-9
+    assert (4, "search") in tx._vpd_c and (2, "search") in tx._vpd_c
+    row = ge.fidelity(tx, [native.Graph(order[:3], complete=True)], pool, mode="reward", baseline=True)[0]
+    assert abs(row["c_vpd_k"] - b3["c_vpd_k"]) < 1e-9
+
+
+def test_far_pool_keeps_the_models_vocabulary(tiny):
+    """A far donor text must be in the model's vocabulary: the real texts are none for the tiny model."""
+    nat, ge, tx = tiny
+    if not (native.TEXTS / "vpd4l").exists():
+        pytest.skip("needs vpd4l's texts")
+    kept = goal_eval.GoalEval(nat).far_pool("eval")
+    assert all(max(x) < 40 for _, x in kept) and len(kept) < 5  # only texts that happen to use the tiny vocabulary
+
+
+def test_path_patched_run(tiny):
+    """pp_run: on the text itself every circuit is the model; a stated graph with every connection among its nodes is
+    the complete graph's forward (every other subcomponent and every remainder at its x value); with nothing stated
+    the change reaches the prediction only through the embedding at a target; VPD's answer scores 1 in track_pp."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::2]
+    stated = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    whole = native.Graph(sub, complete=True)
+    b = ge._pp_base(tx)
+    import vpd_model
+    base = torch.log_softmax(vpd_model.rms(b["Xf"][tx.targets], nat.target.ln_f, nat.target.eps) @ nat.target.wte.T.float(), -1)[None]
+    assert float(carry.kl(tx.ref, base)[0]) < 1e-6
+    for g in (stated, whole, native.Graph()):
+        assert float(carry.kl(tx.ref, ge.pp_run(tx, tx.ids, g))[0]) < 1e-6
+    p = next(q for q, _ in tx.f2 if q not in tx.targets) if any(q not in tx.targets for q, _ in tx.f2) else tx.f2[0][0]
+    x2 = list(tx.ids)
+    x2[p] = (x2[p] + 1) % 40
+    a, c = ge.pp_run(tx, x2, stated), ge.pp_run(tx, x2, whole)
+    assert float(carry.kl(c, a)[0]) < 1e-5, float(carry.kl(c, a)[0])
+    assert float(carry.kl(tx.ref, ge.pp_run(tx, x2, native.Graph()))[0]) < 1e-6 or p in tx.targets
+    rows = ge.track_pp(tx, [native.Graph(masks=tx.vpd), stated], draws=4)
+    assert rows[0]["s_track_pp"] is None or abs(rows[0]["s_track_pp"] - 1) < 1e-6
+    assert ge.changed_search(tx, [stated], draws=4, mode="pp")[0]["draws_track_pp"]
 
 def test_response_error():
     base = {("a", 0, 0): (1.0, 5.0), ("b", 0, 0): (0.0, 0.0)}

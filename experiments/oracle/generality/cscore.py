@@ -14,6 +14,10 @@ import goal_eval  # noqa: E402
 import native  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts/vpd4l"
+# smaller batches than goal_eval's (the same runs, fewer at once): a block is a site's every subcomponent, so a circuit's
+# engine spans tens of thousands of columns
+goal_eval.CHANGED_ROWS = int(os.environ.get("CHANGED_ROWS", 16))
+goal_eval.DONOR_ROWS = int(os.environ.get("DONOR_ROWS", 4))
 TERMS = ("s_point_c", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far")
 
 
@@ -69,7 +73,7 @@ def score(ge, tx, graphs: list, draws: int = 16, near: int = goal_eval.DONORS_NE
     native.free(nat.dev)
     inter = ge._interchange_family(tx, cg, draws, split="eval")
     native.free(nat.dev)
-    dns = ge.donors(tx, cg, "eval", near, ge.far_donors(tx, ge.far_pool("eval"), far) if far else None)
+    dns = ge.donors(tx, cg, "eval", near, ge.far_donors(tx, ge.far_pool("eval"), far) if far else None, rows=goal_eval.DONOR_ROWS)
     native.free(nat.dev)
     scale = ge.size_scale(tx)
     out = []

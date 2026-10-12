@@ -188,7 +188,7 @@ def score(task: str):
         meta.append({"kind": "vpd", "name": f"vpd@{k}", "listed_size": k in listed, "expanded_size": k in expanded})
     rows = []
     for s0 in range(len(graphs)):  # one at a time: an engine spans its call's columns (a block is a site's every one)
-        rows += cscore.score(ge, tx, graphs[s0:s0 + 1])
+        rows += cscore.score(ge, tx, graphs[s0:s0 + 1], draws=8, near=8, far=4)
         native.free(ge.nat.dev)
     with out_path("copy_template").open("a") as f:
         for m, r in zip(meta, rows):

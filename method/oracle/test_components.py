@@ -24,7 +24,7 @@ out <- L1.o#1@5, L1.down#2@5
 L1.o#1@5 <- L1.v#4@3
 L1.v#4@3 <- L0.down#0@3
 L0.down#0@3 <- L0.fc#5@3
-L1.k#3@3
+@3 L1.k#3
 ANSWER 1: the copied value is gone.
 FINAL 1: falls=yes top=' the'
 """
@@ -52,6 +52,9 @@ def test_groups():
     assert edges(again) == edges(p)
     assert "L1.down#2,9@5 <- L1.fc#1,7@5, L0.down#3@5" in components.render(p["answer"])
     assert components.parse("CIRCUIT:\nL1.down#2, 9@5 <- L1.fc#1@5\n")["malformed"] == 1
+    block = components.parse("CIRCUIT:\n@4 L1.k#4,6 L0.q#2 tok\nL1.k#9@4\n")  # a position block, and a bare group
+    assert block["malformed"] == 0 and len(block["answer"]["nodes"]) == 5 and not block["answer"]["edges"]
+    assert components.render(block["answer"]).endswith("@4 L1.k#4,6,9 L0.q#2 tok")
 
 
 def test_escape_keeps_special_strings_text():

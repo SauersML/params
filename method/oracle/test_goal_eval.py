@@ -729,6 +729,67 @@ def test_adversary_gradient_and_rescore(tiny):
         assert abs(float(kc[0]) - want_c) < 1e-4 * max(1.0, want_c) and abs(float(kv[0]) - want_v) < 1e-4 * max(1.0, want_v)
 
 
+def test_node_family_is_the_masked_runs(tiny):
+    """The node family's runs on the engine's columns equal the masked forward over every column (the model and VPD's
+    answer without each draw's nodes, a complete circuit's run without them) and native.run's graph without them."""
+    nat, ge, tx = tiny
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets)), native.Graph(nodes[1::4], complete=True)]
+    draws = 3
+    got = ge._node_family(tx, graphs, draws)
+    for g, row in zip(graphs, got):
+        gn = sorted(g.node_set())
+        rng = ge._rng(tx, g, "nodes")
+        drops = []
+        for j in range(draws):
+            d = [nd for nd in gn if rng.random() < (j + 0.5) / draws]
+            drops.append(d or [gn[int(rng.integers(len(gn)))]])
+
+        def without(base, d):
+            m = {n: base[n].clone() for n in nat.names}
+            for n, t, c in d:
+                m[n][t, c] = False
+            return m
+
+        ones = {n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+        lm = ge.runs(tx.ids, tx.targets, [without(ones, d) for d in drops], True)
+        lv = ge.runs(tx.ids, tx.targets, [without(tx.vpd, d) for d in drops], True)
+        if g.complete:
+            lc = ge.runs(tx.ids, tx.targets, [without(ge.masks(g, tx.T), d) for d in drops], True)
+        else:
+            lc = ge._graph_logq(tx.ids, tx.targets, [goal_eval._drop_nodes(g, set(d)) for d in drops])
+        for key, want in (("kl_nodes_c", float(carry.kl(lm, lc).mean())), ("kl_nodes_vpd", float(carry.kl(lm, lv).mean()))):
+            assert abs(row[key] - want) < 1e-6 + 1e-4 * abs(want), (key, row[key], want)
+
+
+def test_adversary_batch_is_per_circuit(tiny):
+    """The adversary's batched objective (every circuit's rows in one run of each kind: stated graphs as a list, complete
+    ones, VPD's answer) gives each circuit's own KLs and gradients within float32 rounding."""
+    nat, ge, tx = tiny
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets)), native.Graph(nodes[1::4], complete=True),
+              native.Graph(nodes[::5], *native.all_edges(nodes[::5], tx.targets))]
+    pool = tiny_pool(nat, tx.ids)
+    gen = torch.Generator().manual_seed(5)
+    pick, problems, batch = ge._adv_problem(tx, graphs, pool, 6, gen, batched=True)
+    items = [(i, torch.rand(2 + i, len(pick), generator=gen).to(nat.dev).requires_grad_(True),
+              {n: torch.rand(2 + i, len(idx[n][0]), generator=gen).to(nat.dev).requires_grad_(True) for n in nat.names})
+             for i, (_, idx, _) in enumerate(problems)]
+    got = batch(items)
+    loss = sum((kc.log() - kv.log()).sum() for kc, kv in got)
+    leaves = [x for _, w, b in items for x in [w] + [b[n] for n in nat.names]]
+    gb = torch.autograd.grad(loss, leaves, allow_unused=True)
+    k = 0
+    for (i, w, b), (kc, kv) in zip(items, got):
+        wc, bc = w.detach().clone().requires_grad_(True), {n: x.detach().clone().requires_grad_(True) for n, x in b.items()}
+        kc1, kv1 = problems[i][0](wc, bc)
+        assert torch.allclose(kc, kc1, rtol=1e-5, atol=1e-7) and torch.allclose(kv, kv1, rtol=1e-5, atol=1e-7)
+        g1 = torch.autograd.grad((kc1.log() - kv1.log()).sum(), [wc] + [bc[n] for n in nat.names], allow_unused=True)
+        for x, y in zip(gb[k:k + len(g1)], g1):
+            assert (x is None) == (y is None) and (x is None or torch.allclose(x, y, rtol=1e-4, atol=1e-6))
+        k += len(g1)
+
+
 def test_fidelity_table_groups():
     rows = [{"task": "a", "local": True, "kind": "teacher, every connection", "size": 30, "kl_empty": 100.0, "kl_vpd": 0.1,
              "n_real": 0.5, "s_point": 0.9, "n_point": 0.6, "s_nodes": 0.8, "s_edges": 0.7, "f1_adv_curve": {"0": 0.9, "20": 0.5},

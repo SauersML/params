@@ -101,6 +101,7 @@ ADV_RESTARTS = 4
 ADV_PATTERNS = 64  # patterns drawn from the pool per text
 ADV_RANDOM_ON = 1 / 16  # a random member's chance of switching each drawn pattern on
 ADV_CURVE = (0, 4, 20)  # budgets reported (steps)
+ADV_BATCH = 64  # the random members' rows per run (every circuit's restarts run together in the steps)
 FLIPS = {"omitted": (1, 4, 16, 64, 256), "patterns": (1, 2, 4, 8)}  # adversary_flips' budgets: how many switched on
 
 
@@ -761,14 +762,6 @@ class GoalEval:
         key = repr((family, sorted(g.node_set()), _pairs(g) if not g.complete else None))
         return np.random.default_rng([tx.seed, int(hashlib.sha256(key.encode()).hexdigest()[:15], 16)])
 
-    def _logq_sets(self, ids: list[int], targets: list[int], make, n: int) -> torch.Tensor:
-        """log q at the targets of n masked runs (remainders live), the sets made a chunk at a time (make(i) -> set i)."""
-        out = []
-        for s0 in range(0, n, self.chunk):
-            out.append(self.runs(ids, targets, [make(i) for i in range(s0, min(n, s0 + self.chunk))], True))
-            native.free(self.nat.dev)
-        return torch.cat(out)
-
     @torch.no_grad()
     def _graph_logq(self, ids: list[int], targets: list[int], graphs: list[native.Graph], ew_rows=None) -> torch.Tensor:
         """log q at the targets of stated graphs' runs (graph semantics, remainders live); ew_rows: per graph a 0/1
@@ -790,8 +783,21 @@ class GoalEval:
     @torch.no_grad()
     def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int) -> list[dict]:
         """Per circuit, the node-removal family: draws of its nodes removed from the model, from VPD's answer and from
-        the circuit (a stated graph keeps its connections among the rest), the mean KLs from the model's."""
-        nat, T = self.nat, tx.T
+        the circuit (a stated graph keeps its connections among the rest), the mean KLs from the model's. The runs
+        multiply only the circuits' and VPD's subcomponents (engine.Engine's columns; the model's run with every other
+        subcomponent folded into its remainder, outside="on"): float32-close to the masked forward over every column."""
+        import engine
+
+        nat, T, dev = self.nat, tx.T, self.nat.dev
+        cols = {n: {c for g in graphs for m, _, c in g.node_set() if m == n} for n in nat.names}
+        circ = {n: torch.tensor(sorted(cols[n]), dtype=torch.long, device=dev) for n in nat.names}
+        vcols = {n: torch.unique(torch.cat([circ[n], tx.vpd[n].any(0).nonzero().flatten()])) for n in nat.names}
+        Em = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ, outside="on")  # the model
+        Ev = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=vcols)               # VPD's answer
+        Ec = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ)                # the circuits
+        at = {n: {c: i for i, c in enumerate(circ[n].tolist())} for n in nat.names}
+        vat = {n: {c: i for i, c in enumerate(vcols[n].tolist())} for n in nat.names}
+        vpd = {n: tx.vpd[n][:, vcols[n]].float() for n in nat.names}
         out = []
         for g in graphs:
             nodes = sorted(g.node_set())
@@ -804,21 +810,24 @@ class GoalEval:
                 d = [nd for nd in nodes if rng.random() < (j + 0.5) / draws]
                 drops.append(d or [nodes[int(rng.integers(len(nodes)))]])
 
-            def without(base, d):
-                m = {n: base[n].clone() for n in nat.names}
-                for n, t, c in d:
-                    m[n][t, c] = False
+            def without(base, d, where):  # [draws, T, K]: base with each draw's nodes off
+                m = {n: x[None].repeat(len(d), 1, 1) for n, x in base.items()}
+                for b, dd in enumerate(d):
+                    for n, t, c in dd:
+                        m[n][b, t, where[n][c]] = 0.0
                 return m
 
-            ones = {n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
-            lm = self._logq_sets(tx.ids, tx.targets, lambda i: without(ones, drops[i]), draws)
-            lv = self._logq_sets(tx.ids, tx.targets, lambda i: without(tx.vpd, drops[i]), draws)
+            lm = Em.log_probs(without({n: torch.ones(T, len(circ[n]), device=dev) for n in nat.names}, drops, at))
+            lv = Ev.log_probs(without(vpd, drops, vat))
             if g.complete:
-                gm = self.masks(g, T)
-                lc = self._logq_sets(tx.ids, tx.targets, lambda i: without(gm, drops[i]), draws)
+                gm = {n: torch.zeros(T, len(circ[n]), device=dev) for n in nat.names}
+                for n, t, c in nodes:
+                    gm[n][t, at[n][c]] = 1.0
+                lc = Ec.log_probs(without(gm, drops, at))
             else:
-                lc = self._graph_logq(tx.ids, tx.targets, [_drop_nodes(g, set(d)) for d in drops])
+                lc = Ec.graph_log_probs(Ec.plan([_drop_nodes(g, set(d)) for d in drops]))
             out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean())})
+            native.free(dev)
         return out
 
     @torch.no_grad()
@@ -942,10 +951,14 @@ class GoalEval:
                 native.free(nat.dev)
         return torch.stack([x if x.dim() == 2 else x for x in res])
 
-    def _adv_problem(self, tx: Text, graphs: list[native.Graph], pool: dict, k: int, gen: torch.Generator) -> tuple:
+    def _adv_problem(self, tx: Text, graphs: list[native.Graph], pool: dict, k: int, gen: torch.Generator,
+                     batched: bool = False) -> tuple:
         """adversary()'s objective: the K patterns drawn (pool indices) and, per circuit, (kls, idx, cols): kls(w [R, K],
-        b {site: [R, omitted]}) -> (KL_C, KL_VPD) [R] bits, differentiable; idx per site the omitted subcomponents
-        (positions, column indices); cols per site the engine's columns."""
+        b {site: [R, omitted]}, precision="score") -> (KL_C, KL_VPD) [R] bits, differentiable; idx per site the omitted
+        subcomponents (positions, column indices); cols per site the engine's columns. batched: also batch(items,
+        precision="score"), items [(circuit, w, b)] -> [(KL_C, KL_VPD)], every item's rows in one run of each kind
+        (the stated graphs' as one list of graphs, the complete ones', VPD's answer's): the same numbers within float32
+        rounding, a run per kind instead of per circuit."""
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
@@ -966,34 +979,54 @@ class GoalEval:
                 if n in p:
                     m[i] = torch.isin(cols[n], p[n].to(dev)).float()
             P[n] = m
-        problems = []
+        inv = {n: {int(c): i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
+        vfree = {n: (~vpd_on[n] & where).float() for n in nat.names}
+        parts = []
         for g in graphs:
             on = {n: torch.zeros(T, len(cols[n]), dtype=torch.bool, device=dev) for n in nat.names}
-            inv = {n: {int(c): i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
             for n, t, c in g.node_set():
                 on[n][t, inv[n][c]] = True
             omit = {n: vpd_on[n] & ~on[n] & where for n in nat.names}
-            free = {n: (~vpd_on[n] & ~on[n] & where).float() for n in nat.names}
-            vfree = {n: (~vpd_on[n] & where).float() for n in nat.names}
-            idx = {n: omit[n].nonzero(as_tuple=True) for n in nat.names}
-            plan = None if g.complete else E.plan(g)
+            parts.append({"on": on, "free": {n: (~vpd_on[n] & ~on[n] & where).float() for n in nat.names},
+                          "idx": {n: omit[n].nonzero(as_tuple=True) for n in nat.names}})
+        plans = {}
 
-            def kls(w, b, on=on, free=free, vfree=vfree, idx=idx, plan=plan, complete=g.complete):
-                R = w.shape[0]
-                uc, mv = {}, {}
-                for n in nat.names:
-                    a = 1 - torch.prod(1 - w[:, :, None] * P[n][None], 1)  # [R, columns]: the OR of the patterns on
-                    uc[n] = free[n] * a[:, None, :]
-                    if b[n].shape[1]:
-                        priv = torch.zeros(R, T, len(cols[n]), device=dev)
-                        priv[:, idx[n][0], idx[n][1]] = b[n]
-                        uc[n] = uc[n] + priv
-                    mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :]
-                kc = E.kl({n: on[n].float() + uc[n] for n in nat.names}) if complete else E.graph_kl(plan, u=uc)
-                return kc, E.kl(mv)
+        def masks(i, w, b):  # circuit i's adversary masks (outside the circuit) and VPD's run's, [R, T, columns]
+            R, q = w.shape[0], parts[i]
+            uc, mv = {}, {}
+            for n in nat.names:
+                a = 1 - torch.prod(1 - w[:, :, None] * P[n][None], 1)  # [R, columns]: the OR of the patterns on
+                uc[n] = q["free"][n] * a[:, None, :]
+                if b[n].shape[1]:
+                    priv = torch.zeros(R, T, len(cols[n]), device=dev)
+                    priv[:, q["idx"][n][0], q["idx"][n][1]] = b[n]
+                    uc[n] = uc[n] + priv
+                mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :]
+            return uc, mv
 
-            problems.append((kls, idx, cols))
-        return pick, problems
+        def batch(items, precision="score"):
+            built = [masks(i, w, b) for i, w, b in items]
+            R = [w.shape[0] for _, w, _ in items]
+            kc = [None] * len(items)
+            for complete in (False, True):
+                js = [j for j, (i, _, _) in enumerate(items) if graphs[i].complete == complete]
+                if not js:
+                    continue
+                if complete:
+                    got = E.kl({n: torch.cat([parts[items[j][0]]["on"][n].float() + built[j][0][n] for j in js]) for n in nat.names}, precision)
+                else:
+                    key = tuple((items[j][0], R[j]) for j in js)  # a list of graphs, one per row
+                    if key not in plans:
+                        plans[key] = E.plan([graphs[i] for i, r in key for _ in range(r)])
+                    got = E.graph_kl(plans[key], u={n: torch.cat([built[j][0][n] for j in js]) for n in nat.names}, precision=precision)
+                for j, x in zip(js, got.split([R[j] for j in js])):
+                    kc[j] = x
+            kv = E.kl({n: torch.cat([x[1][n] for x in built]) for n in nat.names}, precision).split(R)
+            return list(zip(kc, kv))
+
+        problems = [((lambda w, b, precision="score", i=i: batch([(i, w, b)], precision)[0]), parts[i]["idx"], cols)
+                    for i in range(len(graphs))]
+        return (pick, problems, batch) if batched else (pick, problems)
 
     def adversary(self, tx: Text, graphs: list[native.Graph], pool: dict, steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS,
                   draws: int = DRAWS, curve=ADV_CURVE, k: int = ADV_PATTERNS) -> list[dict]:
@@ -1009,43 +1042,55 @@ class GoalEval:
         nat, dev = self.nat, self.nat.dev
         e0 = self._bounds(tx, "live")[0]
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
-        pick, problems = self._adv_problem(tx, graphs, pool, k, gen)
-        out = []
-        for (kls, idx, cols) in problems:
-            with torch.no_grad():
-                wr = (torch.rand(draws, len(pick), generator=gen) < ADV_RANDOM_ON).float().to(dev)
-                br = {n: (torch.rand(draws, len(idx[n][0]), generator=gen) < 0.5).float().to(dev) for n in nat.names}
-                kc_r, kv_r = kls(wr, br)
-            rand = [_fid(e0, a, v) for a, v in zip(kc_r.tolist(), kv_r.tolist())]
+        pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True)
+        search = "bf16" if str(dev).startswith("cuda") else "score"  # the sign steps' precision (scores: float32)
+        starts, out = [], []
+        for kls, idx, _ in problems:  # each circuit's draws in turn, from the text's generator
+            wr = (torch.rand(draws, len(pick), generator=gen) < ADV_RANDOM_ON).float().to(dev)
+            br = {n: (torch.rand(draws, len(idx[n][0]), generator=gen) < 0.5).float().to(dev) for n in nat.names}
             w = torch.rand(restarts, len(pick), generator=gen).to(dev)
             b = {n: torch.rand(restarts, len(idx[n][0]), generator=gen).to(dev) for n in nat.names}
-            row = {"f1_adv_random": _mean([x for x in rand if x is not None]), "f1_adv_curve": {}}
-            for step in range(max(curve) + 1):
-                if step in curve:
-                    with torch.no_grad():
-                        wb, bb = (w > 0.5).float(), {n: (x > 0.5).float() for n, x in b.items()}
-                        kc, kv = kls(wb, bb)
-                        gap = (kc.log() - kv.log()).tolist()
-                        i = max(range(restarts), key=lambda r: gap[r])
-                        row["f1_adv_curve"][step] = _fid(e0, float(kc[i]), float(kv[i]))
-                        row.update({"kl_c_adv": float(kc[i]), "kl_vpd_adv": float(kv[i]), "f1_adv": row["f1_adv_curve"][step],
-                                    "adv_mask": {"patterns": [pick[j] for j in wb[i].nonzero().flatten().tolist()],
-                                                 "omitted": [(n, int(idx[n][0][j]), int(cols[n][idx[n][1][j]]))
-                                                             for n in nat.names for j in bb[n][i].nonzero().flatten().tolist()]}})
-                if step == max(curve):
-                    break
-                w.requires_grad_(True)
-                for x in b.values():
-                    x.requires_grad_(True)
-                kc, kv = kls(w, b)
-                loss = (kc.clamp_min(1e-12).log() - kv.clamp_min(1e-12).log()).sum()
-                grads = torch.autograd.grad(loss, [w] + [b[n] for n in nat.names], allow_unused=True)
-                with torch.no_grad():
-                    w = (w + ADV_STEP * grads[0].sign()).clamp(0, 1)
-                    b = {n: (b[n] + ADV_STEP * gr.sign()).clamp(0, 1) if gr is not None else b[n].detach()
-                         for n, gr in zip(nat.names, grads[1:])}
+            starts.append((wr, br, w, b))
+        with torch.no_grad():  # the random members, a few circuits' draws a run
+            rows, s0 = [], 0
+            while s0 < len(problems):
+                s1 = s0 + max(1, ADV_BATCH // max(1, draws))
+                rows += batch([(i, starts[i][0], starts[i][1]) for i in range(s0, min(s1, len(problems)))])
+                s0 = s1
                 native.free(dev)
-            out.append(row)
+        for kc_r, kv_r in rows:
+            rand = [_fid(e0, a, v) for a, v in zip(kc_r.tolist(), kv_r.tolist())]
+            out.append({"f1_adv_random": _mean([x for x in rand if x is not None]), "f1_adv_curve": {}})
+        w = [s[2] for s in starts]
+        b = [s[3] for s in starts]
+        for step in range(max(curve) + 1):
+            if step in curve:
+                with torch.no_grad():
+                    wb, bb = [(x > 0.5).float() for x in w], [{n: (x > 0.5).float() for n, x in y.items()} for y in b]
+                    for i, ((kc, kv), (_, idx, cols)) in enumerate(zip(batch(list(zip(range(len(problems)), wb, bb))), problems)):
+                        gap = (kc.log() - kv.log()).tolist()
+                        r = max(range(restarts), key=lambda r: gap[r])
+                        row = out[i]
+                        row["f1_adv_curve"][step] = _fid(e0, float(kc[r]), float(kv[r]))
+                        row.update({"kl_c_adv": float(kc[r]), "kl_vpd_adv": float(kv[r]), "f1_adv": row["f1_adv_curve"][step],
+                                    "adv_mask": {"patterns": [pick[j] for j in wb[i][r].nonzero().flatten().tolist()],
+                                                 "omitted": [(n, int(idx[n][0][j]), int(cols[n][idx[n][1][j]]))
+                                                             for n in nat.names for j in bb[i][n][r].nonzero().flatten().tolist()]}})
+            if step == max(curve):
+                break
+            leaves = []
+            for x, y in zip(w, b):
+                leaves += [x.requires_grad_(True)] + [y[n].requires_grad_(True) for n in nat.names]
+            loss = sum((kc.clamp_min(1e-12).log() - kv.clamp_min(1e-12).log()).sum()
+                       for kc, kv in batch(list(zip(range(len(problems)), w, b)), search))
+            grads = iter(torch.autograd.grad(loss, leaves, allow_unused=True))
+            with torch.no_grad():  # every circuit's rows are its own: the sum's gradient is each circuit's
+                for i in range(len(problems)):
+                    gw = next(grads)
+                    w[i] = (w[i] + ADV_STEP * gw.sign()).clamp(0, 1)
+                    b[i] = {n: (b[i][n] + ADV_STEP * gr.sign()).clamp(0, 1) if gr is not None else b[i][n].detach()
+                            for n, gr in zip(nat.names, [next(grads) for _ in nat.names])}
+            native.free(dev)
         return out
 
 

@@ -105,6 +105,7 @@ def phi_without_n(r: dict):
 
 
 def run(name: str, path: Path, out: Path, n_texts: int, arms: list, decomp: str = "exact", log=print) -> None:
+    """arms: the teacher arms to run (none: Φ and the v3 reward of the true and other circuits alone)."""
     d = torch.load(path)
     if decomp == "vpd":
         import vpd_toy
@@ -125,7 +126,7 @@ def run(name: str, path: Path, out: Path, n_texts: int, arms: list, decomp: str 
             ids = list(ids)
             targets = [len(ids) - 1]
             tx = ge.text(ids, targets)
-            for arm in arms:
+            for arm in [a for a in arms if a]:
                 t0 = time.perf_counter()
                 try:
                     circ, row, _ = teacher.teach(ge, ids, targets, 16, f1_start="influential", edges=True, no_strand=True,
@@ -142,16 +143,25 @@ def run(name: str, path: Path, out: Path, n_texts: int, arms: list, decomp: str 
                 fh.flush()
                 log(f"{name} text {i} {arm}: {json.dumps({k: rec.get(k) for k in ('units', 'positions', 'blocks', 'nodes', 'f1', 'n', 'error')})}")
             cs = circuits(name, nat, ge.text(ids, targets))
+            cs["start"] = sorted(ge.start_set(tx, "search")["graph"].node_set())   # the influential start: phi_tau and bits_start
             graphs = [native.Graph(v, complete=True) for v in cs.values()]
+            P, S = nat.positions(targets), sum(nat.C.values())
+            bits = [goal_eval.size_bits(g, P, S, targets, active=tx.vpd) for g in graphs]
             try:
                 rows = ge.fidelity(tx, graphs, pool, mode="full", split="eval")
             except Exception as e:  # noqa: BLE001
                 rows = [{"error": f"{type(e).__name__}: {e}"}] * len(graphs)
-            for (label, v), r in zip(cs.items(), rows):
+            start_row = rows[-1]
+            tau = goal_eval.phi(start_row, start=start_row)[1] if "error" not in start_row else None
+            for (label, v), r, b in zip(cs.items(), rows, bits):
                 ph = goal_eval.phi(r)[0] if "error" not in r else None
+                comp = goal_eval.compact(b, bits[-1])
+                gate = ph is not None and tau is not None and ph >= tau
+                r = {**r, "bits": b, "compact": comp, "phi_tau": tau, "gate": gate,
+                     "reward_v3": None if ph is None else ph + (0.5 * comp if gate and comp is not None else 0.0)}
                 rec = {"toy": name, "text": i, "decomp": decomp, "circuit": label, "nodes": len(v), "phi": ph, "phi_without_n": phi_without_n(r),
                        **{k: r.get(k) for k in ("s_point_c", "n_point", "s_track_pp", "s_interchange_pp", "s_nodes", "s_edges",
-                                                "s_donor_near", "s_donor_far", "c", "error")},
+                                                "s_donor_near", "s_donor_far", "c", "error", "bits", "compact", "phi_tau", "gate", "reward_v3")},
                        "f1_flips_c": (r.get("f1_flips_c") or {}), "flips_to_half": r.get("flips_to_half")}
                 fh.write(json.dumps(rec) + "\n")
                 fh.flush()

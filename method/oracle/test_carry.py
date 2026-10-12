@@ -213,7 +213,7 @@ def test_prototype_explanations_and_vpd(case):
     assert actual == pytest.approx(expected, abs=1e-5)
     # They round to the empty result at two decimals, but do not equal it at
     # full precision. The literal prototype above is the correctness check.
-    assert actual[list(sets).index("vpd_top4096")] == pytest.approx(8.420146, abs=1e-5)
+    assert actual[list(sets).index("vpd_top4096")] == pytest.approx(8.415572, abs=1e-5)  # VPD order ranks active subcomponents only (9b146f5)
 
 
 def test_oom_chunk_backoff(case, monkeypatch):

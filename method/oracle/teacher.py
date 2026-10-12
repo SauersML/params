@@ -21,7 +21,8 @@ Per text:
      VPD's answer without it), ranks them by the mean of F1 and N they leave, measures removing the first 1, 2, 4, ...
      of them up to a tenth of the circuit and takes the prefix with the highest measured mean, down to 4 subcomponents. Every step is recorded (size, F1, N, KL_C, KL_{VPD minus C}, positions, the subcomponents
      removed) beside VPD's own top-k at the same size.
-  4. The teacher circuit is the path point with the largest mean(F1, N) - 0.5 size, size the nodes' description bits
+  4. The teacher circuit is the path point with the largest (F1 + N) / 5 - 0.5 size, the reward's weighting of its two
+     measured terms (components.target_score; F3, E1 and E2 are not measured here), size the nodes' description bits
      (with a token-embedding node at each position) over the bits of naming every VPD-active subcomponent at the text's
      F2 positions and target (components.reward's size term; edges, added later by the SFT path, are not priced here).
 Every membership decision is measured; orderings only order.
@@ -55,6 +56,7 @@ K_MAX = 1024
 FRACTION = 0.1        # each joint path step removes this share of the circuit, at least one subcomponent
 MIN_SIZE = 4
 SIZE_WEIGHT = 0.5     # components.SIZE_WEIGHT
+TERMS = 5             # components.reward's quality terms: F1, N, F3, E1, E2
 SIZES = (16, 32, 64, 128, 256)  # path points also written
 LEVELS = ("position", "site", "chunk64", "chunk16", "chunk4", "subcomponent")  # blocks, coarse to fine
 
@@ -395,11 +397,11 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         on[torch.tensor(r["removed"], dtype=torch.long, device=on.device)] = False
         ons.append(on.clone())
         r["size_term"] = size_term(on)
-        r["reward"] = r["mean"] - SIZE_WEIGHT * r["size_term"]
+        r["reward"] = (r["f1"] + r["n"]) / TERMS - SIZE_WEIGHT * r["size_term"]
         r["positions"] = int(torch.unique(pr.t[on]).numel())
     for r, v, on_v in zip(path, vpd_rows, vs):
         v["size_term"] = size_term(on_v)
-        v["reward"] = v["mean"] - SIZE_WEIGHT * v["size_term"]
+        v["reward"] = (v["f1"] + v["n"]) / TERMS - SIZE_WEIGHT * v["size_term"]
         r["vpd_top"] = v
     best = max(range(len(path)), key=lambda i: path[i]["reward"])
     circuits = {"": circuit_json(pr, ons[best]), "f1": circuit_json(pr, f1_on), f"vpd_top{k}": circuit_json(pr, topk_on)}

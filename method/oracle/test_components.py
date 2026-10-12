@@ -4,6 +4,7 @@ random model (test_goal_eval's).
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_components.py -q
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -501,9 +502,10 @@ def test_matched_reward_is_c_and_n_over_vpd_at_the_same_size(tiny, monkeypatch):
     monkeypatch.setattr(ge, "fidelity", lambda *a, **k: [{**r, "c_rl": 0.3, "c_rl_vpd_k": -4.0, "n_vpd_k": 0.25}
                                                           for r in real(*a, **{**k, "baseline": False})])
     got = components.reward(ge, task, ev, [good, "no circuit"], matched=True, size_noise=0.05, pool={})
-    assert got[0]["term_C_matched"] == components.MATCH_CLIP  # 4.3 clipped
+    squashed = components.MATCH_CLIP * math.tanh(4.3 / components.MATCH_CLIP)  # 4.3 squashed below the clip, still monotone
+    assert got[0]["term_C_matched"] == pytest.approx(squashed) and squashed < components.MATCH_CLIP
     assert got[0]["term_N_matched"] == pytest.approx(got[0]["term_N"] - 0.25)
-    assert got[0]["reward"] == pytest.approx(components.MATCH_CLIP + got[0]["term_N"] - 0.25 - 0.05 * got[0]["size"])
+    assert got[0]["reward"] == pytest.approx(squashed + got[0]["term_N"] - 0.25 - 0.05 * got[0]["size"])
     assert got[1]["reward"] == components.INVALID_MATCHED and got[0]["reward_mean"] != got[0]["reward"]
 
 

@@ -126,7 +126,8 @@ INSTANCES_RE = re.compile(r"\(\s*instances\s*:\s*(.*?)\s*\)\s*$", re.I)
 QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")  # a token's repr in an inputs list
 
 SIZE_WEIGHT = 0.5
-MATCH_CLIP = 2.0  # the matched reward's C term, c_rl - c_rl of VPD's first k, clipped to [-2, 2] (an invalid answer below)
+MATCH_CLIP = 2.0  # the matched reward's C term, c_rl - c_rl of VPD's first k, squashed to (-2, 2) by 2 tanh(x / 2): monotone,
+# so a very bad answer still ranks below a less bad one (c_rl's raw terms reach -100 on circuits without token edges)
 INVALID_MATCHED = -4.0  # the matched reward of an invalid answer: below every valid one (C >= -2, N >= -1, size noise < 1)
 SIZE_NOISE = None  # the matched reward's size weight w: C's draw noise (c_noise(); the lead, 10-12), set once measured
 REPORTED = ("F1", "F3", "E1")  # terms reported, never in the reward's mean: F1 is inside C, F3 a diagnostic, E1 until a
@@ -1486,7 +1487,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     interchange and donor families, goal_eval's default "search" (the teachers' draws: the RL reward on training texts)
     or "eval" (every evaluation, evaluate()). matched: the RL v2 reward (the lead's decisions 10-12), "reward" =
     (c_rl - c_rl of VPD's first k) + (N - N of VPD's first k) at the answer's node count k (goal_eval.vpd_baseline), the
-    first clipped to [-MATCH_CLIP, MATCH_CLIP], + E4 when measured - size_noise x size (w, C's draw noise: size only
+    first squashed into (-MATCH_CLIP, MATCH_CLIP) (monotone), + E4 when measured - size_noise x size (w, C's draw noise: size only
     breaks ties C cannot tell apart), an invalid answer INVALID_MATCHED; E1 and E2 reported, never in it; the means'
     reward stays as "reward_mean". reader: a reader.Reader for E1, or e1: each text's reader bits
     computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
@@ -1558,7 +1559,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
                 c = c_of[i]
                 if c.get("c_rl_vpd_k") is None or c.get("n_vpd_k") is None:
                     raise ValueError("goal_eval.vpd_baseline gives no c_rl_vpd_k or n_vpd_k: the matched reward needs both")
-                terms["C_matched"] = max(-MATCH_CLIP, min(MATCH_CLIP, c["c_rl"] - c["c_rl_vpd_k"]))
+                terms["C_matched"] = MATCH_CLIP * math.tanh((c["c_rl"] - c["c_rl_vpd_k"]) / MATCH_CLIP)
                 terms["N_matched"] = terms["N"] - c["n_vpd_k"]
                 circ = terms["C_matched"] + terms["N_matched"] - w * size
                 r = circ + (terms["E4"] or 0.0)

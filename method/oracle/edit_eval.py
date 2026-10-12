@@ -52,7 +52,7 @@ files, TEACHER_DIRS) and VPD's most important subcomponents: each round adds the
 (ties: least collateral), until the goal is attained or no candidate helps; then drops every edit the goal does not
 need (least collateral first) and replaces single edits by others that keep the goal with less collateral. A
 persistent goal can be reached by breaking the model, so its search (frontier()) adds the candidate with the most
-progress per bit of collateral each round and keeps every step: a path of progress against collateral. Every
+progress per bit of collateral and size each round and keeps every step: a path of progress against collateral. Every
 search number is measured on the search's own data (alternatives ranks 0 to 2, the copy set's first half, SEARCH_ROWS
 for collateral). Baselines, scored by the same code: VPD's top-k subcomponents ablated (its causal-importance order,
 native.Native._vpd_order; for the copy goal the subcomponents most often active at the first half's targets), and the
@@ -843,20 +843,20 @@ def search(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN
     return {"ops": S, "row": cur, "rounds": rounds, "evaluated": evaluated}
 
 
-def _rate(row: dict, cur: dict | None) -> tuple | None:
-    """A candidate's rank in the frontier search: progress gained per collateral bit added (free gains first, by the
-    progress they add); None when it adds no progress."""
+def _rate(row: dict, cur: dict | None) -> float | None:
+    """A candidate's rank in the frontier search: progress gained per bit added to collateral plus the edit's size (both
+    in bits: what it breaks and what it takes to state); None when it adds no progress."""
     dp = row["progress"] - (cur["progress"] if cur else 0.0)
-    dc = row["collateral"] - (cur["collateral"] if cur else 0.0)
-    if not row["valid"] or dp <= 1e-9:
+    db = row["collateral"] + row["size"] - ((cur["collateral"] + cur["size"]) if cur else 0.0)
+    if not row["valid"] or dp <= 0:
         return None
-    return (1, dp) if dc <= 0 else (0, dp / dc)
+    return dp / max(db, 1e-9)
 
 
 def frontier(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN, log=print) -> dict:
     """A persistent goal's search: a goal on every text can be reached by breaking the model, so each round adds the
-    candidate with the most progress per bit of collateral, and every step is kept: the path from the unedited model
-    traces progress against collateral (each step a point; the next costs more collateral per unit of progress).
+    candidate with the most progress per bit of collateral and size, and every step is kept: the path from the
+    unedited model traces progress against collateral (each step a point).
     Returns {"path": [{"ops", "row"}], "evaluated"}."""
     S, cur, evaluated, path = [], None, 0, []
     for r in range(max_ops):

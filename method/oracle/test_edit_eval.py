@@ -247,10 +247,11 @@ def test_detach_dependence(tiny):
 
 
 def test_frontier_takes_progress_per_collateral():
-    """The persistent search's step: the candidate with the most progress per bit of collateral, free gains first."""
+    """The persistent search's step: the candidate with the most progress per bit of collateral and size; a free but
+    tiny gain does not come first."""
     rows = {"a": {"valid": True, "progress": 0.9, "collateral": 90.0, "attained": False},
             "b": {"valid": True, "progress": 0.3, "collateral": 1.0, "attained": False},
-            "c": {"valid": True, "progress": 0.0, "collateral": 0.0, "attained": False}}
+            "c": {"valid": True, "progress": 0.001, "collateral": 0.0, "attained": False}}
     pool = [edit_eval.scale_op(("h.0.mlp.c_fc", None, i), 0.0) for i in range(3)]
     name = {id(pool[0]): "a", id(pool[1]): "b", id(pool[2]): "c"}
 
@@ -259,7 +260,7 @@ def test_frontier_takes_progress_per_collateral():
         for ops in eds:
             r = [rows[name[id(o)]] for o in ops]
             out.append({"valid": True, "progress": min(1.0, sum(x["progress"] for x in r)),
-                        "collateral": sum(x["collateral"] for x in r), "attained": False})
+                        "collateral": sum(x["collateral"] for x in r), "size": 20.0 * len(r), "attained": False})
         return out
     res = edit_eval.frontier(score, pool, max_ops=2, log=lambda m: None)
     assert [st["row"]["progress"] for st in res["path"]] == [0.3, pytest.approx(1.0)]

@@ -739,7 +739,7 @@ def scripted(env: Env, tids: list[str], out: Path, log=print) -> list[dict]:
         tx = tools.tx
         tau = env.ge.tau(tx, env.pool, env.score_split)
         st = env.ge.start_set(tx, env.score_split)
-        row = {**{k: v for k, v in r.items() if k != "messages"}, "trace": pol.trace,
+        row = {**r, "trace": pol.trace,
                "start": {"phi": tau["phi_start"], "phi_tau": tau["phi_tau"], "bits": tau["bits_start"], "s_track_pp": st["s_track_pp"],
                          "nodes": tau["nodes_start"], "m": tau["m_start"]},
                "answer": r["messages"][-1]["content"]}

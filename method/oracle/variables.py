@@ -2,7 +2,9 @@
 explanation as a causal model, its abstraction accuracy.
 
 A variable V: a meaning in English, its input positions I_V (the context tokens it is computed from), its group G_V
-(the circuit's subcomponents, at positions, that carry it) and what it feeds (other variables' names or the
+(the circuit's subcomponents, at positions, that carry it, or blocks: a site's whole output at a position, every
+subcomponent and the remainder, patched as activation patching there; VPD writes a token's identity in which
+subcomponents are active, which a fixed sparse set cannot carry) and what it feeds (other variables' names or the
 prediction). Every run is the real model in float32 (engine.Engine's graph run of the whole model,
 every subcomponent addressable, the remainders live; tested equal to native.run's patches) and every patched value is
 a subcomponent's activation in that run on the changed text. Changed texts are same-length token replacements at one
@@ -61,16 +63,24 @@ import goal_eval  # noqa: E402
 import native  # noqa: E402
 
 ROWS = 8  # patched runs a batch (every subcomponent addressable: [rows, T, C] patches per site)
+BLOCK = -1  # a group item (site, position, BLOCK): the site's whole output at the position, every subcomponent and the remainder
 
 
 def parse(variables: list[dict], C: dict) -> list[dict]:
-    """Variables from JSON: {"name", "meaning", "inputs": [positions], "group": [[matrix, index, position], ...], "feeds":
-    [names or "prediction"]}, a matrix native's name or "L.kind" (goal_eval.circuit's). The group as (site, position,
-    index) triples; a part outside the model raises."""
+    """Variables from JSON: {"name", "meaning", "inputs": [positions], "group": [[matrix, index, position] or ["block",
+    matrix, position], ...], "feeds": [names or "prediction"]}, a matrix native's name or "L.kind" (goal_eval.circuit's).
+    The group as (site, position, index) triples, a block's index BLOCK; a part outside the model raises."""
     out = []
     for v in variables:
         group = []
-        for m, c, t in v["group"]:
+        for item in v["group"]:
+            if item[0] == "block":  # ["block", matrix, position]: the site's whole output there
+                n = goal_eval._site(item[1])
+                if n not in C or int(item[2]) < 0:
+                    raise ValueError(f"{v.get('name')}: {item} is not a block")
+                group.append((n, int(item[2]), BLOCK))
+                continue
+            m, c, t = item
             n = goal_eval._site(m)
             if n not in C or not 0 <= int(c) < C[n]:
                 raise ValueError(f"{v.get('name')}: {m, c, t} is not a subcomponent")
@@ -126,32 +136,43 @@ class Scorer:
         K = {n: E.width(n) for n in nat.names}
         spec = {n: (torch.zeros(T * K[n], dtype=torch.long, device=dev), torch.arange(T, device=dev).repeat_interleave(K[n]),
                     torch.arange(K[n], device=dev).repeat(T)) for n in nat.names if K[n]}
-        lq, got = E.graph_log_probs(E.plan(run[0], semantics="c"), run[1], reads=spec)
+        outs = {}
+        lq, got = E.graph_log_probs(E.plan(run[0], semantics="c"), run[1], reads=spec, rec_out=outs)
         res = 0.0
         if check:
             ref = nat.reference([ids], targets) if graph is None else self.ge.graph_ref(ids, targets, graph)
             res = max(float(carry.kl(ref, lq)[0]), 0.0)
-        return {"E": E, "run": run, "col": col, "lq": lq[0], "act": {n: v.view(T, K[n]) for n, v in got.items()}, "res": res}
+        return {"E": E, "run": run, "col": col, "lq": lq[0], "act": {n: v.view(T, K[n]) for n, v in got.items()},
+                "out": {n: o[0] for n, o in outs.items()}, "res": res}
+
+    @staticmethod
+    def _flat(text: dict, items: list) -> torch.Tensor:
+        """A text's reads of group items laid end to end: a subcomponent's activation, a block's whole output [d_out]."""
+        col = text["col"]
+        return torch.cat([text["out"][n][t] if c == BLOCK else text["act"][n][t, c if col is None else col[n][c]].reshape(1)
+                          for n, t, c in items])
 
     @torch.no_grad()
     def _patched(self, w: dict, rows: list[tuple[dict, list | None]], reads: list | None = None):
-        """log q at the targets [len(rows), targets, V] of w's world on w's text (_text), row b with the activations
-        rows[b] = (source {site: [T, K]}, nodes (site, position, index) or None for every addressable subcomponent at the
-        targets) set to the source's; a node the world cannot address (outside a circuit's columns) is left alone (in
-        C's semantics it does nothing). reads: addressable nodes whose activations each row also returns, (log q,
-        [len(rows), len(reads)])."""
+        """log q at the targets [len(rows), targets, V] of w's world on w's text (_text), row b with rows[b] = (a source
+        text (_text), group items or None for every addressable subcomponent at the targets) set to the source's: a
+        subcomponent's activation, a block's every addressable activation and the site's whole output (the remainder's
+        part with it); a subcomponent the world cannot address (outside a circuit's columns) is left alone (in C's
+        semantics it does nothing). reads: group items each row also returns, laid end to end as _flat lays them, (log
+        q, [len(rows), width])."""
         nat, E, dev = self.nat, w["E"], self.nat.dev
         T, tg = E.T, torch.tensor(E.targets, device=dev)
         out, got = [], []
         where = {}
-        for i, (n, t, c) in enumerate(reads or []):
+        acts = [nd for nd in (reads or []) if nd[2] != BLOCK]
+        for i, (n, t, c) in enumerate(acts):
             x = where.setdefault(n, ([], [], []))
             x[0].append(i)
             x[1].append(t)
             x[2].append(c if w["col"] is None else w["col"][n][c])
         for s0 in range(0, len(rows), self.rows):
             part = rows[s0:s0 + self.rows]
-            R, patch = len(part), {}
+            R, patch, outputs = len(part), {}, {}
 
             def slot(n):
                 if n not in patch:
@@ -163,10 +184,21 @@ class Scorer:
                         if E.width(n):
                             m, v = slot(n)
                             m[b, tg] = True
-                            v[b, tg] = src[n][tg]
+                            v[b, tg] = src["act"][n][tg]
                     continue
                 per = {}
                 for n, t, c in nodes:
+                    if c == BLOCK:  # every addressable activation there, and the whole output
+                        if E.width(n):
+                            m, v = slot(n)
+                            m[b, t] = True
+                            v[b, t] = src["act"][n][t]
+                        if n not in outputs:
+                            d = src["out"][n].shape[-1]
+                            outputs[n] = (torch.zeros(R, T, dtype=torch.bool, device=dev), torch.zeros(R, T, d, device=dev))
+                        outputs[n][0][b, t] = True
+                        outputs[n][1][b, t] = src["out"][n][t]
+                        continue
                     k = c if w["col"] is None else w["col"][n].get(c)
                     if k is not None:
                         per.setdefault(n, ([], []))
@@ -176,16 +208,26 @@ class Scorer:
                     m, v = slot(n)
                     t_, k_ = torch.tensor(ts, device=dev), torch.tensor(ks, device=dev)
                     m[b, t_, k_] = True
-                    v[b, t_, k_] = src[n][t_, k_]
+                    v[b, t_, k_] = src["act"][n][t_, k_]
             spec = {n: (torch.arange(R, device=dev).repeat_interleave(len(ts)), torch.tensor(ts, device=dev).repeat(R),
-                        torch.tensor(ks, device=dev).repeat(R)) for n, (_, ts, ks) in where.items()} if reads else None
-            lq = E.graph_log_probs(E.plan([w["run"][0]] * R, semantics="c"), w["run"][1], patch=patch or None, reads=spec)
-            if reads:
+                        torch.tensor(ks, device=dev).repeat(R)) for n, (_, ts, ks) in where.items()} if acts else None
+            rec_out = {} if reads and len(acts) < len(reads) else None
+            lq = E.graph_log_probs(E.plan([w["run"][0]] * R, semantics="c"), w["run"][1], patch=patch or None, reads=spec,
+                                   outputs=outputs or None, rec_out=rec_out)
+            if spec is not None:
                 lq, rec = lq
-                r = torch.zeros(R, len(reads), device=dev)
+            if reads:
+                ra = torch.zeros(R, len(acts), device=dev)
                 for n, (idx, ts, _) in where.items():
-                    r[:, idx] = rec[n].view(R, len(ts))
-                got.append(r)
+                    ra[:, idx] = rec[n].view(R, len(ts))
+                cols, k = [], 0
+                for n, t, c in reads:
+                    if c == BLOCK:
+                        cols.append(rec_out[n][:, t])
+                    else:
+                        cols.append(ra[:, k:k + 1])
+                        k += 1
+                got.append(torch.cat(cols, 1))
             out.append(lq)
             native.free(dev)
         return (torch.cat(out), torch.cat(got)) if reads else torch.cat(out)
@@ -228,15 +270,15 @@ class Scorer:
         mine = self._text(tx.ids, tx.targets, graph)
         base = mine["lq"]
         groups = sorted({tuple(t[3]) for t in tests})
-        nodes = sorted({nd for v in variables for nd in v["group"] if graph is None or nd[2] in mine["col"][nd[0]]})
+        nodes = sorted({nd for v in variables for nd in v["group"] if graph is None or nd[2] == BLOCK or nd[2] in mine["col"][nd[0]]})
         # on x: every test's group from its x', the floors (every subcomponent at the targets from x'), and each group
         # set to its own values on x (the patched runs' float32 resolution: an exact patch is that far from the run);
         # every variable's group's reads in each run (the feeds tests)
-        lq, rd = self._patched(mine, [(texts[t[2]]["act"], t[3]) for t in tests] + [(texts[ch]["act"], None) for ch in changed]
-                               + [(mine["act"], list(g)) for g in groups] + [(mine["act"], [])], reads=nodes)
+        lq, rd = self._patched(mine, [(texts[t[2]], t[3]) for t in tests] + [(texts[ch], None) for ch in changed]
+                               + [(mine, list(g)) for g in groups] + [(mine, [])], reads=nodes)
         got, floor_to = lq[:len(tests)], dict(zip(changed, lq[len(tests):len(tests) + len(changed)]))
         same = dict(zip(groups, lq[len(tests) + len(changed):-1]))
-        floor_back = {ch: self._patched(texts[ch], [(mine["act"], None)])[0]  # on x': every subcomponent at the
+        floor_back = {ch: self._patched(texts[ch], [(mine, None)])[0]  # on x': every subcomponent at the
                       for ch in sorted({t[2] for t in tests if t[0] == "off"})}   # targets from x (the off-target floors)
         kl = lambda p, q: float(carry.kl(p[None], q[None])[0])  # noqa: E731
         # float32 resolution: the largest disagreement between runs that agree in exact arithmetic (the run with
@@ -284,30 +326,17 @@ class Scorer:
         return headline(out)
 
     def _feeds(self, variables, tests, rd, nodes, texts, mine, k0, groups) -> list[dict]:
-        """Per ordered pair (V, W), on V's on-target draws: the reads of W's group (its nodes outside V's) in the
-        model on x with G_V patched from x' against model(x)'s and model(x')'s. V feeds W (W in V's "feeds"): the
-        share of W's change reproduced, f = clip(1 - |r_patched - r_x'|^2 / |r_x - r_x'|^2, 0, 1); V does not: the
-        share kept out, clip(1 - |r_patched - r_x|^2 / |r_x - r_x'|^2, 0, 1). A draw counts when |r_x - r_x'|^2
-        exceeds four times the reads' float32 disagreement (G_V set to its own values, nothing patched: twice the
-        amplitude); per pair the |r_x - r_x'|^2-weighted mean."""
-        at = {nd: i for i, nd in enumerate(nodes)}
-        col, dev = mine["col"], rd.device
-
-        def gather(idx):  # per site (places in idx, positions, columns)
-            per = {}
-            for j, i in enumerate(idx):
-                n, t, c = nodes[i]
-                x = per.setdefault(n, ([], [], []))
-                x[0].append(j)
-                x[1].append(t)
-                x[2].append(c if col is None else col[n][c])
-            return [(n, torch.tensor(a, device=dev), torch.tensor(b, device=dev), torch.tensor(c, device=dev)) for n, (a, b, c) in per.items()]
-
-        def vals(act, where, size):  # an activation table's values at those nodes
-            out = torch.empty(size, device=dev)
-            for n, j, t, c in where:
-                out[j] = act[n][t, c]
-            return out
+        """Per ordered pair (V, W), on V's on-target draws: the reads of W's group (its items outside V's: activations,
+        and a block's whole output) in the model on x with G_V patched from x' against model(x)'s and model(x')'s. V
+        feeds W (W in V's "feeds"): the share of W's change reproduced, f = clip(1 - |r_patched - r_x'|^2 / |r_x -
+        r_x'|^2, 0, 1); V does not: the share kept out, clip(1 - |r_patched - r_x|^2 / |r_x - r_x'|^2, 0, 1). A draw counts
+        when |r_x - r_x'|^2 exceeds four times the reads' float32 disagreement (G_V set to its own values, nothing
+        patched: twice the amplitude); per pair the |r_x - r_x'|^2-weighted mean."""
+        span, at = {}, 0
+        for n, t, c in nodes:  # each read item's columns in rd, laid out as _patched (and _flat) lay them
+            wdt = mine["out"][n].shape[-1] if c == BLOCK else 1
+            span[(n, t, c)] = list(range(at, at + wdt))
+            at += wdt
         base_rd, same = rd[-1], dict(zip(groups, rd[k0:-1]))
         out = []
         for i, v in enumerate(variables):
@@ -315,18 +344,18 @@ class Scorer:
             for j, wv in enumerate(variables):
                 if i == j:
                     continue
-                idx = [at[nd] for nd in wv["group"] if nd in at and nd not in mine_g]
-                if not idx or tuple(v["group"]) not in same:
+                items = [nd for nd in wv["group"] if nd in span and nd not in mine_g]
+                if not items or tuple(v["group"]) not in same:
                     continue
-                where = gather(idx)
-                r_x = vals(mine["act"], where, len(idx))
+                idx = [k for nd in items for k in span[nd]]
+                r_x = self._flat(mine, items)
                 noise = max(float(((same[tuple(v["group"])][idx] - r_x) ** 2).sum()), float(((base_rd[idx] - r_x) ** 2).sum()))
                 claim = wv["name"] in v["feeds"]
                 acc, wsum, n_ = 0.0, 0.0, 0
                 for b, t in enumerate(tests):
                     if t[0] != "on" or t[1] != i:
                         continue
-                    r_xp, r_p = vals(texts[t[2]]["act"], where, len(idx)), rd[b, idx]
+                    r_xp, r_p = self._flat(texts[t[2]], items), rd[b, idx]
                     scale = float(((r_x - r_xp) ** 2).sum())
                     if scale <= 4 * noise:
                         continue

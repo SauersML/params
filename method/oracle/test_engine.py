@@ -455,6 +455,32 @@ def test_query_key_pair_cuts():
         assert got[0] > 5e-5 and abs(got[1]) < 1e-5  # every pair cut moves the model; none cut is the model
 
 
+def test_site_outputs_replaced():
+    """outputs: every site's whole output at position p replaced by its value on a text that differs from the engine's
+    only at p (rec_out of that text's run) gives that text's run (later positions see p only through those outputs);
+    rec_out of a plain run holds every site's output."""
+    nat, ids, targets, _, _, _, _ = graph_case(B=1)
+    T = len(ids)
+    p = T // 2
+    x = list(ids)
+    x[p] = (x[p] + 7) % nat.target.wte.shape[0]
+    model = native.Graph(masks={n: torch.ones(1, 1, dtype=torch.bool, device=nat.dev) for n in nat.names})
+    E, Ex = engine.Engine(nat, ids, targets, live=True), engine.Engine(nat, x, targets, live=True)
+    u = {n: torch.ones(1, 1, nat.C[n], device=nat.dev) for n in nat.names}
+    refx = nat.reference([x], targets)
+    with torch.no_grad():
+        rec = {}
+        want = Ex.graph_log_probs(Ex.plan(model, semantics="c"), u, rec_out=rec)
+        assert set(rec) == set(nat.names)
+        outs = {}
+        for n, o in rec.items():
+            m = torch.zeros(1, T, dtype=torch.bool, device=nat.dev)
+            m[0, p] = True
+            outs[n] = (m, o)
+        got = E.graph_log_probs(E.plan(model, semantics="c"), u, outputs=outs)
+        assert abs(float(carry.kl(refx, want)[0]) - float(carry.kl(refx, got)[0])) < 1e-6
+
+
 def test_c_semantics_equal_graph_ref():
     """C's semantics (plan(semantics="c")) equal goal_eval.GoalEval.graph_ref, the forward pass written out, on a graph
     stating half of its connections, with the gradients in u; a stated connection at strength 0 is the graph without it."""

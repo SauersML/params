@@ -51,7 +51,7 @@ def test_patched_runs_are_native_patches(case):
     src = sc._text(x, tx.targets)
     mine = sc._text(tx.ids, tx.targets)
     group = variables.parse([{"inputs": [233], "group": at(233)[::7] + top[::5]}], nat.C)[0]["group"]
-    got = sc._patched(mine, [(src["act"], group), (src["act"], None)])
+    got = sc._patched(mine, [(src, group), (src, None)])
     T = tx.T
     patch = {n: (torch.zeros(2, T, nat.C[n], dtype=torch.bool, device=nat.dev), torch.zeros(2, T, nat.C[n], device=nat.dev))
              for n in nat.names}
@@ -113,7 +113,7 @@ def test_circuit_world_is_graph_ref(case):
         assert abs(float(src["act"][nd[0]][nd[1], k]) - float(rec[nd][0])) < 1e-4 * (1 + abs(float(rec[nd][0]))), nd
     mine = sc._text(tx.ids, tx.targets, graph)
     group = [nd for nd in nodes if nd[1] == 233]
-    got = sc._patched(mine, [(src["act"], group)])
+    got = sc._patched(mine, [(src, group)])
     with torch.no_grad():
         want = ge.graph_ref(tx.ids, tx.targets, graph, patch={nd: float(rec[nd][0]) for nd in group})
     assert float(carry.kl(want, got).abs().max()) < 1e-5
@@ -147,9 +147,32 @@ def test_headline_rules():
     assert abs(out["e4"] - (0.5 + 0.0 + 0.8 + 0.6 + 1.0) / 5) < 1e-12
 
 
+def test_blocks(case):
+    """Blocks (["block", site, position]: the site's whole output there, every subcomponent and the remainder): every
+    site's block at 233 reproduces a change at 233 to float32 rounding (the stream at 233 reaches later positions only
+    through those outputs), where every subcomponent at 233 leaves the remainders' part (D ~1e-5 bits); and a block's
+    whole output moves like model(x') in the feeds test."""
+    nat, ge, tx, at, _ = case
+    blocks = [["block", n, 233] for n in nat.names]
+    vs = variables.parse([{"name": "blocks", "inputs": [233], "group": blocks}, {"name": "parts", "inputs": [233], "group": at(233)}], nat.C)
+    assert vs[0]["group"] == sorted((n, 233, variables.BLOCK) for n in nat.names)
+    got = variables.Scorer(ge).score(tx, vs, "eval", 3)
+    a, b = got["variables"]
+    assert a["draws_on"] and a["f_on"] > 0.999999, a
+    on_a = [r for r in got["draws"] if r["kind"] == "on" and r["owner"] == 0]
+    on_b = [r for r in got["draws"] if r["kind"] == "on" and r["owner"] == 1]
+    assert all(r["d"] < 1e-6 for r in on_a) and max(r["d"] for r in on_b) > 1e-6, (on_a, on_b)
+    late = [["block", n, 288] for n in nat.names if native._name_layer_kind(n)[0] == nat.target.n_layer - 1]
+    vs = variables.parse([{"name": "a", "inputs": [233], "group": blocks, "feeds": ["b"]},
+                          {"name": "b", "inputs": [288], "group": late}], nat.C)
+    ab = next(x for x in variables.Scorer(ge).score(tx, vs, "eval", 3)["feeds"] if x["from"] == "a")
+    assert ab["draws"] and ab["f"] > 0.999, ab
+
+
 def test_parse(case):
     nat = case[0]
     v = variables.parse([{"name": "v", "inputs": [3, 1, 3], "group": [["0.fc", 5, 2], ["h.0.mlp.c_fc", 5, 2]], "feeds": ["prediction"]}], nat.C)[0]
     assert v["inputs"] == [1, 3] and v["group"] == [("h.0.mlp.c_fc", 2, 5)] and v["feeds"] == ["prediction"]
     with pytest.raises(ValueError):
         variables.parse([{"inputs": [1], "group": [["0.fc", nat.C["h.0.mlp.c_fc"], 2]]}], nat.C)
+    assert variables.parse([{"inputs": [1], "group": [["block", "0.fc", 5]]}], nat.C)[0]["group"] == [("h.0.mlp.c_fc", 5, variables.BLOCK)]

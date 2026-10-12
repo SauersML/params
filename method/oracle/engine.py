@@ -408,7 +408,8 @@ class Engine:
 
     def graph_log_probs(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
                         precision: str = "score", patch: dict | None = None, reads: dict | None = None, keep: dict | None = None,
-                        reuse: tuple | None = None, ewn: torch.Tensor | None = None, own: torch.Tensor | None = None):
+                        reuse: tuple | None = None, ewn: torch.Tensor | None = None, own: torch.Tensor | None = None,
+                        outputs: dict | None = None, rec_out: dict | None = None):
         """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32. patch:
         {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange). reads as
         log_probs': (log q, {site: [n]}). keep, a dict, receives the run's states for reuse (each layer's keys and
@@ -420,11 +421,16 @@ class Engine:
         changed text). ewn, own: the connections' strengths in their readers' RMSNorm scale (the norm before a residual
         read: queries, keys, values, MLP inputs; the prediction's final norm), [B, E] and [B, O] like ew and ow, when
         they differ from the strengths in the read itself (None: the same): a connection's direct share and its share
-        in the scale, cut apart (goal_eval.GoalEval.connection_effects)."""
+        in the scale, cut apart (goal_eval.GoalEval.connection_effects). outputs: {site: (bool [B or 1, T], values [B or 1,
+        T, d_out])}, the site's whole output (every subcomponent and the remainder) replaced at those positions (activation
+        patching at a site and position; with patch's activations there, a block of variables.py); rec_out, a dict,
+        receives every site's output [B, T, d_out] (float32 runs without reuse)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if (keep is not None or reuse is not None) and (precision != "score" or patch is not None or reads is not None):
             raise ValueError("keep and reuse are float32 runs without patch or reads")
+        if (outputs is not None or rec_out is not None) and (precision != "score" or reuse is not None):
+            raise ValueError("outputs and rec_out are float32 runs of every position")
         if (ewn is not None or own is not None) and precision != "score":
             raise ValueError("separate norm strengths are float32 runs (vpd_model's own norm)")
         if reuse is not None and not 0 < reuse[2] <= min(self.targets):
@@ -435,7 +441,7 @@ class Engine:
             rec = None if reads is None else (reads, {})
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
                                    None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec, keep, reuse,
-                                   None if ewn is None else ewn.reshape(-1), None if own is None else own.reshape(-1))
+                                   None if ewn is None else ewn.reshape(-1), None if own is None else own.reshape(-1), outputs, rec_out)
         lq = torch.log_softmax(h.float() @ self.tg.wte.T, -1)
         return lq if rec is None else (lq, rec[1])
 
@@ -582,7 +588,8 @@ class Engine:
         return p[key]
 
     def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None, rec: tuple | None = None,
-                      keep: dict | None = None, reuse: tuple | None = None, ewn=None, own=None) -> torch.Tensor:
+                      keep: dict | None = None, reuse: tuple | None = None, ewn=None, own=None, outputs=None,
+                      rec_out=None) -> torch.Tensor:
         """The final normed residual stream at the targets [B, len(targets), d] of the graph runs. fused (a search's
         steps): torch's fused norms and GELU, and the last layer's queries, attention output and MLP at the targets
         alone (with reads, every position). keep and reuse: graph_log_probs'."""
@@ -691,7 +698,13 @@ class Engine:
                 n = name(kd)
                 _, U, Rw = self._w(n)
                 o = (A[kd] * scale.to(A[kd].dtype)) @ U
-                return o + self._mm(z, Rw) if self.fixed else o
+                o = o + self._mm(z, Rw) if self.fixed else o
+                if outputs is not None and n in outputs:  # the site's whole output replaced at those positions
+                    m, val = outputs[n]
+                    o = torch.where(m[..., None], val.to(o.dtype), o)
+                if rec_out is not None:
+                    rec_out[n] = o.float()
+                return o
 
             def scale(kd):  # query and key nodes at 1 in the pattern
                 n = name(kd)

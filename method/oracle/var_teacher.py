@@ -1,44 +1,39 @@
-"""The teacher for explanation variables (#2951 graph oracle): per text, groups of subcomponents that carry what given
-context tokens contribute to the prediction, verified by interchange in the real model (variables.py).
+"""The teacher for explanation variables (#2951 graph oracle): per text, variables (input positions, a carrier holding
+what those tokens contribute to the prediction, feeds), verified by interchange in the real model (variables.py), each
+with its value map (var_classes.py) for the writer to name.
 
-The pool: a teacher circuit's nodes (the default), or, as a reference (--pool vpd), VPD's active subcomponents at the
-influential positions (goal_eval's F2 positions and the targets): causal importance above zero on the text or on any
-of the search split's changed texts there, at positions that can reach the targets (what the variables would be if
-the circuit held the context). --blocks adds blocks (variables.py: a site's whole output at a position, every
-subcomponent and the remainder): the circuit's sites at its positions, or in the VPD pool every site at the
-influential positions that can reach the targets. VPD writes a token's identity in which subcomponents are active, so
-a sparse set fixed on one text carries a third of a token change (text6011, 233: 0.36) where the position's blocks
-carry all of it.
+Input sets: each influential position (goal_eval's F2 positions and the targets), each position holding the circuit's
+nodes, and each pair of neighbouring ones (a word of two tokens).
 
-1. Profiles: each pool node's read (its activation v . x; a block's whole output) on texts with one influential token
-   changed (the F2 positions and the targets; the search split's draws, GoalEval._interchange_draws) against the
-   text's: the mean |change| per position (a block's the norm of its output's change), exact, from real-model runs
-   (variables.Scorer._text).
-2. Candidate groups per input set I (each influential position, and each pair of neighbouring ones: a word of two
-   tokens), among the nodes at or after I's first position: the nodes ordered by their selectivity for I (their
-   response to I's positions over their response to every position) and by their response to I in output units
-   (|read change| x |u|, a block's output change), each order's prefixes of 1, 2, 4, ... nodes and all of them (and
-   of the blocks alone in selectivity order); the responding nodes at each one position; and the nodes whose largest
-   response is at I.
-3. Verification: every candidate of an input set scored together by variables.Scorer on the search split (on-target
-   and off-target; the draws are the text's and I's, shared by the candidates), its term min(f on-target, s
-   off-target) (the headline's, 0 without a resolved on-target draw). The bar is min(GOAL, the best term); input sets
-   are taken best first, each with its smallest candidate at or above the bar (the simplest group that carries its
-   inputs), with no input position and no node in two (a block holds every subcomponent of its site and position).
-   Nodes in no variable stay unnamed.
-4. Feeds: a circuit's stated connections (a stated path from a node of V to a node of W, or to the prediction,
-   through unnamed nodes). In the VPD pool, which states none, each ordered pair takes the claim (feeds or apart) its
-   measured feeds test favours, and a variable feeding no other one feeds the prediction. The chosen variables are
-   then scored together (composition and feeds, the model-world headline e4) on the search split and on the eval
-   split, whose draws the choice never saw (the held-out number).
-5. Output: per text {"variables": [{"name", "meaning": "", "inputs", "group": [[matrix, index, position], ...],
-   "feeds": [variables or "prediction"], "measured": {...}, with --classes "classes": var_classes.classes per input
-   position}], "teacher": {...}} (primerl's interface), the names
-   V1, V2, ... in input order and the meanings empty for the writer, to ~/mpd-data/graph_oracle/variables/<split>/<task>.json (the VPD pool's under
-   variables/vpd_pool/<split>/; with --blocks under variables/blocks/ and variables/vpd_pool_blocks/).
+Carriers (the lead's 10-12). VPD writes a token's identity in which subcomponents are active, so a set of
+subcomponents fixed on one text carries a third of a token change (text6011 at 233: VPD's active set there, f
+on-target 0.36) where the position's whole site outputs carry all of it. Per input set I:
+1. Blocks (variables.py: a site's whole output at a position, every subcomponent and the remainder) at I's positions:
+   every single site, every layer, layers 0 to L, scored together on the search split; the smallest (in
+   subcomponents) at or above GOAL, else grown from the best single site one site at a time (the site adding most)
+   until it reaches GOAL or stops gaining.
+2. Family at the chosen sites and positions: the union of VPD's active subcomponents (causal importance above zero)
+   on the text and on each alternative token at each input position (var_classes.alternatives, the 64 tokens the value
+   map uses): a shared core plus every token-specific part seen. It is the carrier when it reaches GOAL, else the
+   blocks are. VPD's active set on the text alone is scored beside them (reported).
+A variable is kept when its term min(f on-target, s off-target) on the search split is at least GOAL, each on its own
+(the lead's rule); the others are listed unkept with their scores. Kept single positions are taken first, then kept
+pairs, then the unkept, each by the circuit's removal effect inside the carrier, with no input position in two
+(carriers at different positions are disjoint, so the variables' interventions commute).
 
-  var_teacher.py [TASK ...] --circuits DIR [--pool circuit|vpd] [--blocks] [--root DIR | --out DIR] [--device mps]
-                 [--draws 8] [--classes]
+Per variable: "kept", "carrier" (block or family), "group" (blocks ["block", site, position] or the family's
+subcomponents [site, index, position]), "instances" (VPD's active subcomponents on the text inside the carrier) and
+"instances_share" (the share of the text and its alternatives on which each is active: the core near 1), "circuit_nodes"
+(the circuit's nodes inside the carrier), "m" (their removal effect, goal_eval.line_effects in pp mode), "values" (the
+value map per input position, class 0 the text's own: var_classes.classes, kept variables), "feeds" (measured: each
+ordered pair of kept variables takes the claim, feeds or apart, its feeds test favours; a variable feeding no other
+feeds the prediction), "feeds_stated" (the circuit's stated paths through unnamed nodes), "measured" (the search and
+eval terms, the carriers compared). Per text, "teacher": the kept variables scored together (composition and feeds) on
+both splits, "m_share" (the share of the circuit's removal effect inside kept carriers) and "e4x" (reward v3's sum of
+(2 e4_v - 1) m_v / sum m over the kept variables, e4_v the eval term). Names V1, V2, ... in input order, meanings
+empty for the writer. Output ~/mpd-data/graph_oracle/variables/<split>/<task>.json.
+
+  var_teacher.py [TASK ...] --circuits DIR [--root DIR | --out DIR] [--device mps] [--draws 8]
   (no TASK: every textN.json in DIR)
 """
 from __future__ import annotations
@@ -51,7 +46,6 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
@@ -75,129 +69,17 @@ def release(dev) -> None:
 
 
 class _Screen(variables.Scorer):
-    """The scorer without the feeds tests (candidates of one input set are screened on on-target and off-target
-    alone; their feeds are tested once the variables are chosen)."""
+    """The scorer without the feeds tests (the candidates of one input set are screened on on-target and off-target
+    alone; the feeds are tested once the variables are chosen)."""
 
     def _feeds(self, *args) -> list:
         return []
 
 
-def _where(nodes: list[tuple], dev) -> list:
-    """Nodes (site, position, index) as per-site (places, positions, indices) for gathering activations."""
-    per = {}
-    for i, (n, t, c) in enumerate(nodes):
-        x = per.setdefault(n, ([], [], []))
-        x[0].append(i)
-        x[1].append(t)
-        x[2].append(c)
-    return [(n, np.array(a), torch.tensor(b, device=dev), torch.tensor(c, device=dev)) for n, (a, b, c) in per.items()]
-
-
-def _gather(act: dict, where: list, size: int) -> np.ndarray:
-    out = np.empty(size)
-    for n, idx, t, c in where:
-        out[idx] = act[n][t, c].cpu().double().numpy()
-    return out
-
-
-def profiles(sc: variables.Scorer, tx, nodes: list[tuple], positions: list[int], draws: int) -> tuple[np.ndarray, np.ndarray]:
-    """(mean |change| of each node's read per position [N, P] (a block's: the norm of its output's change), each node's
-    read on the text [N] (a block's: its output's norm)) in the real model."""
-    ge = sc.ge
-    subs = [i for i, nd in enumerate(nodes) if nd[2] != BLOCK]
-    blocks = [nodes[i][:2] for i in range(len(nodes)) if nodes[i][2] == BLOCK]
-    bi = [i for i in range(len(nodes)) if nodes[i][2] == BLOCK]
-    where = _where([nodes[i] for i in subs], sc.nat.dev)
-
-    def reads(w):  # (the subcomponents' activations [S], the blocks' outputs [B, d] per site width, as a list)
-        return _gather(w["act"], where, len(subs)), [w["out"][n][t] for n, t in blocks]
-    s0, b0 = reads(sc._text(tx.ids, tx.targets, None, check=False))
-    a0 = np.empty(len(nodes))
-    a0[subs] = s0
-    if bi:
-        a0[bi] = torch.stack([o.norm() for o in b0]).cpu().double().numpy()
-    out = np.zeros((len(nodes), len(positions)))
-    for j, p in enumerate(positions):
-        ds = ge._interchange_draws(tx, [p], "search", draws)
-        for _, z in ds:
-            x = list(tx.ids)
-            x[p] = z
-            s1, b1 = reads(sc._text(x, tx.targets, None, check=False))
-            out[subs, j] += np.abs(s1 - s0) / len(ds)
-            if bi:
-                out[bi, j] += torch.stack([(o1 - o).norm() for o1, o in zip(b1, b0)]).cpu().double().numpy() / len(ds)
-        native.free(ge.nat.dev)
-    return out, a0
-
-
-def vpd_pool(ge: goal_eval.GoalEval, tx, positions: list[int], draws: int) -> list[tuple]:
-    """VPD's active subcomponents at the positions (causal importance above zero on the text or on any search draw's
-    changed text at one of them), at positions that can reach the targets."""
-    nat = ge.nat
-    on = {n: tx.ci[n] > 0 for n in nat.names}
-    for p in positions:
-        for _, z in ge._interchange_draws(tx, [p], "search", draws):
-            x = list(tx.ids)
-            x[p] = z
-            for n, v in nat.importance(x).items():
-                on[n] |= v > 0
-    reach = nat.reachable(tx.T, tx.targets)
-    at = torch.tensor(positions, device=nat.dev)
-    out = []
-    for n in nat.names:
-        m = (on[n] & reach[n])[at]
-        for j, c in m.nonzero().tolist():
-            out.append((n, positions[j], c))
-    return sorted(out)
-
-
-def block_pool(nat: native.Native, tx, positions: list[int], graph: native.Graph | None) -> list[tuple]:
-    """Blocks (site, position, BLOCK): the circuit's sites at its positions (graph), or every site at the positions
-    whose output can reach the targets."""
-    if graph is not None:
-        return sorted({(n, t, BLOCK) for n, t, _ in graph.node_set() if n != "tok"})
-    reach = nat.reachable(tx.T, tx.targets)
-    return sorted((n, t, BLOCK) for n in nat.names for t in positions if bool(reach[n][t].any()))
-
-
-def ladder(order: list) -> list[list]:
-    """An order's prefixes of 1, 2, 4, ... members and all of them."""
-    ks = sorted({min(len(order), 1 << i) for i in range(max(1, len(order)).bit_length() + 1)})
-    return [order[:k] for k in ks if k]
-
-
-def candidates(nodes: list[tuple], prof: np.ndarray, unorm: np.ndarray, positions: list[int], inputs: tuple) -> list[tuple[list, str]]:
-    """Candidate groups for an input set (module docstring, step 2), [(group, how)]."""
-    js = [positions.index(p) for p in inputs]
-    total = prof.sum(1)
-    mine = prof[:, js].sum(1)
-    live = [i for i, nd in enumerate(nodes) if nd[1] >= min(inputs) and mine[i] > 0]
-    if not live:
-        return []
-    sel = sorted(live, key=lambda i: (-mine[i] / total[i], -mine[i] * unorm[i]))
-    strong = sorted(live, key=lambda i: -mine[i] * unorm[i])
-    out = [([nodes[i] for i in g], f"selectivity, first {len(g)}") for g in ladder(sel)]
-    out += [([nodes[i] for i in g], f"response, first {len(g)}") for g in ladder(strong)]
-    out += [([nodes[i] for i in g], f"blocks by selectivity, first {len(g)}") for g in ladder([i for i in sel if nodes[i][2] == BLOCK])]
-    for t in sorted({nodes[i][1] for i in live}):
-        out.append(([nodes[i] for i in live if nodes[i][1] == t], f"responding at {t}"))
-    top = [nodes[i] for i in live if int(prof[i].argmax()) in js]
-    if top:
-        out.append((top, "largest response at the inputs"))
-    seen, kept = set(), []
-    for g, how in out:
-        key = tuple(sorted(g))
-        if key not in seen:
-            seen.add(key)
-            kept.append((sorted(g), how))
-    return kept
-
-
-def as_json(name: str, inputs, group, feeds=(), measured=None) -> dict:
+def as_json(name: str, inputs, group, feeds=(), **extra) -> dict:
     v = {"name": name, "meaning": "", "inputs": sorted(int(p) for p in inputs),
          "group": [["block", n, int(t)] if c == BLOCK else [n, int(c), int(t)] for n, t, c in sorted(group)], "feeds": list(feeds)}
-    if measured is not None:
-        v["measured"] = measured
+    v.update(extra)
     return v
 
 
@@ -207,28 +89,98 @@ def term(got: dict) -> float:
     return 0.0 if f_on is None else (f_on if s_off is None else min(f_on, s_off))
 
 
-def screen(sc: _Screen, tx, inputs: tuple, cands: list[tuple[list, str]], draws: int) -> list[dict]:
-    """Every candidate of one input set scored on the search split (on-target and off-target), one row each."""
+def size(C: dict, group) -> int:
+    """A group's subcomponents (a block counts its site's every one)."""
+    return sum(C[n] if c == BLOCK else 1 for n, _, c in group)
+
+
+def screen(sc: _Screen, tx, inputs: tuple, cands: list[tuple[list, str]], draws: int, split: str = "search") -> list[dict]:
+    """Every candidate group of one input set scored on a split (on-target and off-target; the draws are the text's and
+    the inputs', shared by the candidates), one row each."""
     vs = variables.parse([as_json(f"c{k}", inputs, g) for k, (g, _) in enumerate(cands)], sc.nat.C)
-    got = sc.score(tx, vs, split="search", draws=draws)["variables"]
+    got = sc.score(tx, vs, split=split, draws=draws)["variables"]
     release(sc.nat.dev)
-    return [{"inputs": list(inputs), "group": g, "how": how, "score": term(r), **{k: r[k] for k in
-             ("f_on", "s_off", "f_off", "s_on", "draws_on", "draws_off")}} for (g, how), r in zip(cands, got)]
+    return [{"inputs": list(inputs), "group": g, "how": how, "score": term(r), "size": size(sc.nat.C, g),
+             **{k: r[k] for k in ("f_on", "s_off", "f_off", "s_on", "draws_on", "draws_off")}} for (g, how), r in zip(cands, got)]
 
 
-def stated_feeds(graph: native.Graph, chosen: list[dict]) -> None:
-    """Each variable's feeds from the circuit's stated connections: V feeds W when a stated path runs from a node of V
-    to a node of W through unnamed nodes only, and the prediction when one reaches a writer into the prediction (a
-    block holds the circuit's nodes at its site and position)."""
-    at = {}
-    for nd in graph.node_set():
-        at.setdefault(tuple(nd[:2]), []).append(tuple(nd))
-    parts = {v["name"]: {x for n, t, c in v["_group"] for x in (at.get((n, t), []) if c == BLOCK else [(n, t, c)])} for v in chosen}
+def _layer(n: str) -> int:
+    return native._name_layer_kind(n)[0]
+
+
+def block_search(sc: _Screen, tx, ins: tuple, draws: int) -> tuple[dict, list[dict]]:
+    """(the chosen blocks' row, every row tried): blocks at the input positions of every single site, every layer and
+    layers 0 to L, the smallest at or above GOAL; else grown from the best single site, one site at a time."""
+    nat = sc.nat
+    reach = nat.reachable(tx.T, tx.targets)
+    sites = [n for n in nat.names if all(bool(reach[n][p].any()) for p in ins)]
+    blocks = lambda ns: [(n, p, BLOCK) for n in ns for p in ins]  # noqa: E731
+    layers = sorted({_layer(n) for n in sites})
+    cands = [(blocks([n]), f"site {n}") for n in sites]
+    cands += [(blocks([n for n in sites if _layer(n) == L]), f"layer {L}") for L in layers]
+    cands += [(blocks([n for n in sites if _layer(n) <= L]), f"layers {layers[0]}-{L}") for L in layers[1:]]
+    rows = screen(sc, tx, ins, cands, draws)
+    ok = [r for r in rows if r["score"] >= GOAL]
+    if ok:
+        return min(ok, key=lambda r: (r["size"], -r["score"])), rows
+    cur = max(rows[:len(sites)], key=lambda r: r["score"])
+    have = [cur["group"][0][0]]
+    while cur["score"] < GOAL and len(have) < len(sites):
+        rest = [n for n in sites if n not in have]
+        got = screen(sc, tx, ins, [(blocks(have + [n]), "sites " + ", ".join(have + [n])) for n in rest], draws)
+        rows += got
+        b = max(got, key=lambda r: r["score"])
+        if b["score"] <= cur["score"]:
+            break
+        cur, have = b, have + [rest[got.index(b)]]
+    return max([cur] + [r for r in rows if r["score"] > cur["score"]], key=lambda r: r["score"]), rows
+
+
+def family(nat: native.Native, tx, ins: tuple, sites: list[str]) -> tuple[list, dict]:
+    """(the family: VPD's active subcomponents at the sites and positions on the text or on any alternative token at an
+    input position (var_classes.alternatives), the share of those texts on which each is active)."""
+    import var_classes
+
+    texts = [list(tx.ids)]
+    for p in ins:
+        for z in var_classes.alternatives(nat, tx.ids, p, int(tx.seed)):
+            x = list(tx.ids)
+            x[p] = z
+            texts.append(x)
+    count = {}
+    at = torch.tensor(list(ins), device=nat.dev)
+    for i, x in enumerate(texts):
+        ci = tx.ci if i == 0 else nat.importance(x)
+        for n in sites:
+            for j, c in (ci[n][at] > 0).nonzero().tolist():
+                key = (n, ins[j], c)
+                count[key] = count.get(key, 0) + 1
+    return sorted(count), {k: v / len(texts) for k, v in count.items()}
+
+
+def inside(group: set, node) -> bool:
+    """Whether a circuit node (site, position, index or BLOCK) lies in a group (a set of items): a block holds every
+    subcomponent of its site and position; a circuit's block lies in a group holding anything at its site and
+    position."""
+    n, t, c = node
+    if (n, t, BLOCK) in group:
+        return True
+    return any(g[0] == n and g[1] == t for g in group) if c == BLOCK else (n, t, c) in group
+
+
+def stated_feeds(graph: native.Graph, chosen: list[dict]) -> dict:
+    """Each variable's feeds from the circuit's stated connections: V feeds W when a stated path runs from a circuit
+    node in V's carrier to one in W's through nodes in no carrier, and the prediction when one reaches a writer into
+    the prediction."""
+    nodes = [tuple(nd) for nd in graph.node_set()]
+    groups = {v["name"]: set(v["_group"]) for v in chosen}
+    parts = {name: {nd for nd in nodes if inside(g, nd)} for name, g in groups.items()}
     owner = {nd: name for name, ps in parts.items() for nd in ps}
     readers, out = {}, {tuple(w) for w in graph.out}
     for r, ws in graph.parents.items():
         for w in ws:
             readers.setdefault(tuple(w), []).append(tuple(r))
+    got = {}
     for v in chosen:
         mine, f = parts[v["name"]], set()
         seen, todo = set(mine), list(mine)
@@ -242,7 +194,8 @@ def stated_feeds(graph: native.Graph, chosen: list[dict]) -> None:
                 elif r not in seen:
                     seen.add(r)
                     todo.append(r)
-        v["feeds"] = sorted(f)
+        got[v["name"]] = sorted(f)
+    return got
 
 
 def together(sc: variables.Scorer, tx, vs: list[dict], split: str, draws: int) -> dict:
@@ -282,92 +235,94 @@ def measured_feeds(sc: variables.Scorer, tx, chosen: list[dict], draws: int) -> 
             v["feeds"] = ["prediction"]
 
 
-def overlaps(used: set, group: list) -> bool:
-    """Whether a group shares a part with the used items: a subcomponent, or a site and position one side holds whole
-    (a block)."""
-    whole = {(n, t) for n, t, c in used if c == BLOCK}
-    sites = {(n, t) for n, t, _ in used}
-    return any((n, t) in sites if c == BLOCK else ((n, t, c) in used or (n, t) in whole) for n, t, c in group)
-
-
-def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 8, pool: str = "circuit", classes: bool = False,
-          blocks: bool = False, log=print) -> dict:
+def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 8, log=print) -> dict:
     import components
+    import var_classes
 
     t0 = time.time()
     p = task["prompts"][0]
     ids, targets = p["token_ids"], p["target_positions"]
     nat = ge.nat
     tx = ge.text(ids, targets, seed=native.task_seed(task["id"]), task=task)
-    positions = sorted({q for q, _ in tx.f2} | set(targets))
-    graph = None
-    if pool == "circuit":
-        graph, _ = goal_eval.circuit(answer, targets, nat.C, len(ids))
-        graph = goal_eval.strand(graph, targets, nat.C)
-        nodes = sorted(nd for nd in graph.node_set() if nd[0] != "tok")
-    else:
-        nodes = vpd_pool(ge, tx, positions, draws)
-    if blocks:
-        nodes += block_pool(nat, tx, positions, graph)
-    sc = _Screen(ge)
-    prof, a0 = profiles(sc, tx, nodes, positions, draws)
-    un = {n: nat.target.site(n).U.norm(dim=1).cpu().double().numpy() for n in nat.names}
-    unorm = np.array([1.0 if c == BLOCK else un[n][c] for n, _, c in nodes])
-    log(f"{task['id']}: {len(nodes)} {pool} nodes ({sum(nd[2] == BLOCK for nd in nodes)} blocks), positions {positions}; "
-        f"profiles {time.time() - t0:.0f} s")
+    graph, m = None, {}
+    if answer is not None:
+        graph = goal_eval.strand(goal_eval.circuit(answer, targets, nat.C, len(ids))[0], targets, nat.C)
+        le = ge.line_effects(tx, graph, mode="pp", split="search", draws=draws)
+        m = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in le["nodes"]}
+        release(nat.dev)
+    M = sum(m.values())
+    held = {nd[1] for nd in m if nd[0] != "tok" and nd[1] <= max(targets)}
+    positions = sorted({q for q, _ in tx.f2} | set(targets) | held)
     sets = [(q,) for q in positions] + [(a, b) for a, b in zip(positions, positions[1:]) if b == a + 1]
-    rows = []
+    log(f"{task['id']}: positions {positions} ({len(m)} circuit nodes, removal effect {M:.3f} bits); {time.time() - t0:.0f} s")
+    sc = _Screen(ge)
+    best = {}
     for ins in sets:
-        cands = candidates(nodes, prof, unorm, positions, ins)
-        if cands:
-            got = screen(sc, tx, ins, cands, draws)
-            rows += got
-            b = max(got, key=lambda r: r["score"])
-            log(f"  inputs {list(ins)}: {len(cands)} candidates, best {b['score']:.3f} ({b['how']}, {len(b['group'])} nodes, "
-                f"f_on {b['f_on']}, s_off {b['s_off']})")
-    rows.sort(key=lambda r: -r["score"])
-    best = rows[0]["score"] if rows else 0.0
-    bar = min(GOAL, best)
-    by = {}
-    for r in rows:
-        if r["score"] >= bar and r["score"] > 0:
-            by.setdefault(tuple(r["inputs"]), []).append(r)
-    chosen, used, taken = [], set(), set()
-    for ins in sorted(by, key=lambda k: -by[k][0]["score"]):  # input sets best first; each its smallest group at the bar
-        free = [r for r in by[ins] if not overlaps(used, r["group"])]
-        if taken & set(ins) or not free:
-            continue
-        r = min(free, key=lambda r: (len(r["group"]), -r["score"]))
-        used |= set(r["group"])
-        taken |= set(ins)
-        chosen.append({"_inputs": r["inputs"], "_group": r["group"], "measured": {k: r[k] for k in r if k not in ("group", "inputs")}
-                       | {"tokens": components.token_strings(task["model"], [ids[q] for q in r["inputs"]])}})
-    chosen.sort(key=lambda v: v["_inputs"])
-    for i, v in enumerate(chosen):  # names for the feeds; the writer names them
-        v["name"] = f"V{i + 1}"
-    if graph is not None:
-        stated_feeds(graph, chosen)
-    elif chosen:
-        measured_feeds(variables.Scorer(ge), tx, chosen, draws)
-    out = {"variables": [as_json(v["name"], v["_inputs"], v["_group"], v["feeds"], v["measured"]) for v in chosen],
-           "teacher": {"pool": pool, "blocks": blocks, "nodes": len(nodes), "positions": positions, "candidates": len(rows), "best": best,
-                       "bar": bar, "top": [{k: r[k] for k in r if k != "group"} | {"size": len(r["group"])} for r in rows[:16]]}}
-    if chosen:  # the chosen variables together (compositions and feeds), on the search split and on the eval split's
-        # draws, which the choice never saw
-        vs = variables.parse(out["variables"], nat.C)
-        for split, key in (("search", "together"), ("eval", "eval")):
-            got = together(variables.Scorer(ge), tx, vs, split, draws)
+        b, rows = block_search(sc, tx, ins, draws)
+        sites = sorted({n for n, _, _ in b["group"]})
+        fam, share = family(nat, tx, ins, sites)
+        on_x = {(n, q, c) for n in sites for q in ins for c in (tx.ci[n][q] > 0).nonzero().flatten().tolist()}
+        active = sorted(k for k in fam if k in on_x)
+        fa = screen(sc, tx, ins, [(fam, "family"), (active, "active on the text")], draws) if fam else []
+        rec = {"inputs": list(ins), "blocks": b, "family": fa[0] if fa else None, "active": fa[1] if fa else None, "tried": len(rows)}
+        use = rec["family"] if fa and fa[0]["score"] >= GOAL else b
+        rec.update(carrier="family" if use is not b else "block", group=use["group"], score=use["score"],
+                   instances=active, share={k: share[k] for k in active},
+                   circuit=[nd for nd in m if inside(set(use["group"]), nd)])
+        rec["m"] = sum(m[nd] for nd in rec["circuit"])
+        best[ins] = rec
+        log(f"  inputs {list(ins)}: {rec['carrier']} {use['how']} ({use['size']} subcomponents) {use['score']:.3f}; blocks "
+            f"{b['how']} {b['score']:.3f}, family {fa[0]['size'] if fa else 0} {fa[0]['score'] if fa else 0:.3f}, "
+            f"active {fa[1]['size'] if fa else 0} {fa[1]['score'] if fa else 0:.3f}; m {rec['m']:.3f}")
+    chosen, taken = [], set()
+    order = sorted(best.values(), key=lambda r: (r["score"] < GOAL, len(r["inputs"]) > 1, -r["m"], -r["score"]))
+    for r in order:
+        if not taken & set(r["inputs"]):
+            taken |= set(r["inputs"])
+            chosen.append(r)
+    chosen.sort(key=lambda r: r["inputs"])
+    kept = [r for r in chosen if r["score"] >= GOAL]
+    for i, r in enumerate(chosen):  # names for the feeds; the writer names them
+        r["name"], r["_inputs"], r["_group"] = f"V{i + 1}", r["inputs"], r["group"]
+    stated = stated_feeds(graph, chosen) if graph is not None else {}
+    for r in chosen:
+        r["feeds"] = []
+    if kept:
+        measured_feeds(variables.Scorer(ge), tx, kept, draws)
+    out = {"variables": [], "teacher": {"positions": positions, "sets": len(sets), "kept": len(kept), "circuit_m": M}}
+    for r in chosen:
+        meas = {k: r[k] for k in ("score",)} | {"carriers": {k: (None if r[k] is None else {x: r[k][x] for x in ("how", "size", "score", "f_on", "s_off")})
+                                                            for k in ("blocks", "family", "active")}, "tried": r["tried"]}
+        meas["tokens"] = components.token_strings(task["model"], [ids[q] for q in r["inputs"]])
+        out["variables"].append(as_json(
+            r["name"], r["inputs"], r["group"], r["feeds"], kept=r["score"] >= GOAL, carrier=r["carrier"],
+            instances=[[n, c, t] for n, t, c in r["instances"]], instances_share=[round(r["share"][k], 4) for k in r["instances"]],
+            circuit_nodes=[["block", n, t] if c == BLOCK else [n, c, t] for n, t, c in r["circuit"]], m=r["m"],
+            feeds_stated=stated.get(r["name"], []), measured=meas))
+    js = {v["name"]: v for v in out["variables"]}
+    kv = [js[r["name"]] for r in kept]
+    for split, key in (("search", "together"), ("eval", "eval")):  # the kept variables together; each unkept alone
+        if kv:
+            got = together(variables.Scorer(ge), tx, variables.parse(kv, nat.C), split, draws)
             out["teacher"][key] = {k: got[k] for k in ("e4", "f_on", "s_off", "f_comp", "f_feeds", "f_apart", "unresolved")}
-            for v, r in zip(out["variables"], got["variables"]):
-                v["measured"][split] = {"term": term(r), "f_on": r["f_on"], "s_off": r["s_off"]}
-    if classes:  # which tokens each variable tells apart at each of its inputs (var_classes.py), for the writer
-        import var_classes
-
-        for v, pv in zip(out["variables"], variables.parse(out["variables"], nat.C)):
-            v["classes"] = [var_classes.classes(sc, tx, pv, q, task["model"]) for q in pv["inputs"]]
+            for v, x in zip(kv, got["variables"]):
+                v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"]}
+        for v in out["variables"]:
+            if not v["kept"]:
+                x = together(variables.Scorer(ge), tx, variables.parse([v], nat.C), split, draws)["variables"][0]
+                v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"]}
+    for v, pv in zip(kv, variables.parse(kv, nat.C)):  # the value maps, for the writer
+        v["values"] = []
+        for q in pv["inputs"]:
+            c = var_classes.classes(sc, tx, pv, q, task["model"])
+            v["values"].append({"position": q, "token": c["token"], "predicts": c["predicts"], "classes": c["values"]})
+            release(nat.dev)
+    if M > 0:
+        out["teacher"]["m_share"] = sum(v["m"] for v in kv) / M
+        out["teacher"]["e4x"] = sum((2 * v["measured"]["eval"]["term"] - 1) * v["m"] for v in kv) / M
     out["teacher"]["seconds"] = time.time() - t0
-    log(f"{task['id']}: {len(chosen)} variables kept (bar {bar:.3f}), together {out['teacher'].get('together')}, eval "
-        f"{out['teacher'].get('eval')}, {time.time() - t0:.0f} s")
+    log(f"{task['id']}: {len(kept)} of {len(chosen)} variables kept, eval {out['teacher'].get('eval')}, m share "
+        f"{out['teacher'].get('m_share')}, e4x {out['teacher'].get('e4x')}, {time.time() - t0:.0f} s")
     return out
 
 
@@ -375,24 +330,20 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tasks", nargs="*")
     ap.add_argument("--circuits", type=Path, required=True)
-    ap.add_argument("--pool", choices=("circuit", "vpd"), default="circuit")
-    ap.add_argument("--blocks", action="store_true", help="blocks (a site's whole output at a position) in the pool")
-    ap.add_argument("--root", type=Path, default=OUT, help="outputs under ROOT/[vpd_pool|blocks|vpd_pool_blocks/]<split>/")
+    ap.add_argument("--root", type=Path, default=OUT, help="outputs under ROOT/<split>/")
     ap.add_argument("--out", type=Path, help="outputs in OUT instead")
     ap.add_argument("--device")
     ap.add_argument("--draws", type=int, default=8)
-    ap.add_argument("--classes", action="store_true", help="each variable's token classes at its inputs (var_classes.py)")
     args = ap.parse_args()
     ge = goal_eval.GoalEval(native.Native(args.device))
     tasks = args.tasks or sorted((f.stem for f in args.circuits.iterdir() if re.fullmatch(r"text\d+\.json", f.name)),
                                  key=lambda s: int(s[4:]))
     for t in tasks:
         task = json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())
-        sub = "_".join(x for x in ("vpd_pool" if args.pool == "vpd" else "", "blocks" if args.blocks else "") if x)
-        out = args.out or (args.root / sub / task["split"])
+        out = args.out or (args.root / task["split"])
         out.mkdir(parents=True, exist_ok=True)
-        answer = json.loads((args.circuits / f"{t}.json").read_text()) if args.pool == "circuit" else None
-        res = teach(ge, task, answer, args.draws, args.pool, args.classes, args.blocks, log=lambda s: print(s, flush=True))
+        f = args.circuits / f"{t}.json"
+        res = teach(ge, task, json.loads(f.read_text()) if f.exists() else None, args.draws, log=lambda s: print(s, flush=True))
         (out / f"{t}.json").write_text(json.dumps(res, indent=1))
 
 

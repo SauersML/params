@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Explanation variables (#2951 graph oracle, method/oracle/var_teacher.py) on one rented GPU. The texts (TASKS, a file of
 # task ids one per line; or the first N of SPLIT) are taught with each of VARIANTS (var_teacher.py flag sets separated
-# by ';', default the circuit pool and VPD's pool, each with and without blocks), every variant with --classes, from
-# the teacher circuits in CIRCUITS; P processes share the GPU, process k taking every P-th text from its k-th. The
+# by ';', default one run with none), from the teacher circuits in CIRCUITS; P processes share the GPU, process k taking every P-th text from its k-th. The
 # Python is method/oracle and method/vpd at REF (default origin/main); texts/vpd4l and the circuits go up as compressed
 # tars; vpd4l's weights and VPD's subcomponents are published inputs, and VPD's checkpoint (two published pieces under
 # GitHub's 2 GiB asset limit; it holds the causal-importance network VPD's pool needs) is put back together on the pod.
@@ -17,7 +16,7 @@ cd /Users/user/params
 H=${1:-2.0}
 RUN=${RUN:-a} SPLIT=${SPLIT:-heldout} N=${N:-20} P=${P:-3}
 CIRCUITS=${CIRCUITS:-/Users/user/mpd-data/graph_oracle/teacher/joint_$SPLIT}
-VARIANTS=${VARIANTS:---pool circuit;--pool vpd;--pool circuit --blocks;--pool vpd --blocks}
+VARIANTS=${VARIANTS:-}
 GPU=${GPU:-NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090,NVIDIA RTX 4000 Ada Generation,NVIDIA RTX A4500,NVIDIA RTX A6000,NVIDIA A40}
 NAME=oracle-graph-vars-$RUN
 F=/Users/user/mpd-data/scratch/varteach/pod_$RUN
@@ -46,7 +45,7 @@ RUNS=""
 for k in $(seq 0 $((P - 1))); do
   MINE=$(awk "NR % $P == ($k + 1) % $P" "$F/tasks.txt" | tr '\n' ' ')  # process k's texts, named in the command
   RUNS="$RUNS (for t in $MINE; do echo '$VARIANTS' | tr ';' '\n' | while read -r flags; do
-    python -B var_teacher.py \$t \$flags --classes --circuits \$HOME/circuits --root $O/out < /dev/null >> $O/vars_$k.log 2>&1 || echo \"\$t \$flags failed \$?\" >> $O/vars_$k.log;
+    python -B var_teacher.py \$t \$flags --circuits \$HOME/circuits --root $O/out < /dev/null >> $O/vars_$k.log 2>&1 || echo \"\$t \$flags failed \$?\" >> $O/vars_$k.log;
   done; done; echo \"exit 0\" >> $O/vars_$k.log) &"
 done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;

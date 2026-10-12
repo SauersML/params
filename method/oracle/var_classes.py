@@ -15,7 +15,8 @@ The partition: z is alike the text's token (V does not tell them apart) when q_z
 from model(x'_z), m_z <= max(r_z, d_res), d_res the runs' float32 resolution (variables.Scorer's: twice the largest
 disagreement between runs that agree in exact arithmetic); otherwise z changes V's value. The alike tokens with the
 text's form V's equivalence class at p; the others are grouped by the token their q_z predicts (where V's new value
-sends the prediction).
+sends the prediction). The partition is the variable's value map ("values": class 0 the text's own, each class its
+tokens, their ids and the token its members' patched runs predict).
 
   python method/oracle/var_classes.py TASK VARIABLES.json [--top 32] [--sampled 32] [--out FILE]
 """
@@ -55,8 +56,9 @@ def alternatives(nat: native.Native, ids: list[int], p: int, seed: int, top: int
 
 def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top: int = TOP, sampled: int = SAMPLED) -> dict:
     """The partition of alternative tokens at p by v's group (module docstring): {"position", "token", "d_res",
-    "equivalent": the class of the text's token (token strings), "changed": [{"predicts", "tokens"}], "alternatives":
-    per alternative its numbers}."""
+    "equivalent": the class of the text's token (token strings), "changed": [{"predicts", "tokens"}], "values": the
+    value map [{"id", "tokens", "token_ids", "predicts"}], class 0 the text's own, "alternatives": per alternative its
+    numbers and class}."""
     import components
 
     nat = sc.nat
@@ -93,11 +95,19 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
         r["p_model"] = float(lp[r["id"]].exp())
         r["alike"] = r["move"] <= max(r["left"], res)
         if not r["alike"]:
-            changed.setdefault(r["predicts"], []).append(r["token"])
+            changed.setdefault(r["predicts"], []).append(r)
+    alike = [r for r in rows if r["alike"]]
+    moved = sorted(changed.items(), key=lambda kv: -len(kv[1]))
+    values = [{"id": 0, "tokens": [own_tok] + [r["token"] for r in alike], "token_ids": [int(tx.ids[p])] + [r["id"] for r in alike],
+               "predicts": pred[0]}]
+    values += [{"id": k + 1, "tokens": [r["token"] for r in rs], "token_ids": [r["id"] for r in rs], "predicts": tok}
+               for k, (tok, rs) in enumerate(moved)]
+    for c in values:
+        for i in c["token_ids"][1 if c["id"] == 0 else 0:]:
+            next(r for r in rows if r["id"] == i)["class"] = c["id"]
     return {"position": p, "token": own_tok, "predicts": pred[0], "d_res": res,
-            "equivalent": [own_tok] + [r["token"] for r in rows if r["alike"]],
-            "changed": sorted(({"predicts": k, "tokens": v} for k, v in changed.items()), key=lambda c: -len(c["tokens"])),
-            "alternatives": rows}
+            "equivalent": values[0]["tokens"], "changed": [{"predicts": c["predicts"], "tokens": c["tokens"]} for c in values[1:]],
+            "values": values, "alternatives": rows}
 
 
 def main():

@@ -14,9 +14,9 @@ circuit's own log recovery (ln(KL_empty / KL) >= 0.9 ln(KL_empty / KL_C)). With 
 (checked: the circuit's KL to rounding). Also: the subcomponents a circuit uses at more than one position.
 
 Also, per read: the read's row in C's run against the real model's row (KL, bits, mean over heads), its entropy
-against the uniform causal row's, and the circuit's target KL with the uniform causal row in its place (whether the
-pattern matters for the prediction); per layer the query and key remainders' norm against W's. stated_pairs() gives
-teachers a circuit's pairs.
+against the uniform causal row's, and the circuit's target KL with the uniform causal row and with the model's row
+in its place (whether the pattern matters for the prediction); per layer the query and key remainders' norm against
+W's. stated_pairs() gives teachers a circuit's pairs.
 
   qk_pairs.py measure --texts 9002 9004 ... --out OUT.jsonl [--dirs DIR ...]
   qk_pairs.py figure OUT.jsonl FIG.png
@@ -223,6 +223,21 @@ def stated_pairs(ge, task: dict, answer: dict) -> dict:
     return {(layer, t): select_pairs(ge, pr, layer, t)["pairs"] for layer, t in pr["reads"]}
 
 
+def pair_edges(ge, task: dict, answer: dict) -> list:
+    """stated_pairs as the answer's JSON pair edges (goal_eval.circuit): ["pair", query, key, layer, position], query
+    and key a node's place in answer["nodes"] or "rest"; a read that needs none, ["pair", "rest", "rest", layer,
+    position]."""
+    at = {}
+    for i, (m, c, t) in enumerate(answer.get("nodes", [])):
+        if m != "tok":
+            at[(goal_eval._site(m), int(t), int(c))] = i
+    out = []
+    for (layer, t), pairs in stated_pairs(ge, task, answer).items():
+        out += [["pair", at[a] if a != "rem" else "rest", at[b] if b != "rem" else "rest", layer, t] for a, b in pairs]
+        out += [] if pairs else [["pair", "rest", "rest", layer, t]]
+    return out
+
+
 def remainder_norms(nat) -> dict:
     """Per layer, |W - V U| / |W| (Frobenius) of the query and key matrices."""
     out = {}
@@ -235,17 +250,17 @@ def remainder_norms(nat) -> dict:
 
 def pattern_checks(ge, pr: dict, layer: int, t: int, model_P: torch.Tensor) -> dict:
     """The read's row in C's run against the model's (KL per head, mean over heads, bits), its entropy against the
-    uniform causal row's (bits), and the circuit's target KL with the uniform causal row in its place."""
+    uniform causal row's (bits), and the circuit's target KL with the uniform causal row and with the model's row in
+    its place."""
     rowc = pr["cap"][layer]["P"][:, t, :t + 1].clamp_min(1e-30)  # [H, t + 1]
     rowm = model_P[layer][:, t, :t + 1].clamp_min(1e-30)
     kl = float((rowm * (rowm.log() - rowc.log())).sum(-1).mean() / math.log(2))
     ent = float((-(rowc * rowc.log()).sum(-1)).mean() / math.log(2))
     ent_m = float((-(rowm * rowm.log()).sum(-1)).mean() / math.log(2))
-    H = rowc.shape[0]
-    uni = torch.zeros(1, H, t + 1)
-    kl_u = float(carry.kl(pr["tx"].ref, forward(ge, pr["ids"], pr["targets"], pr["graph"], override=(layer, t, uni)))[0])
+    rows = torch.stack([torch.zeros_like(rowm), rowm.log()])
+    kl_u, kl_m = carry.kl(pr["tx"].ref, forward(ge, pr["ids"], pr["targets"], pr["graph"], override=(layer, t, rows))).tolist()
     return {"kl_model_vs_circuit_row": kl, "entropy_circuit_row": ent, "entropy_model_row": ent_m,
-            "entropy_uniform": math.log2(t + 1), "kl_target_uniform_row": kl_u}
+            "entropy_uniform": math.log2(t + 1), "kl_target_uniform_row": kl_u, "kl_target_model_row": kl_m}
 
 
 def model_patterns(nat, ids: list[int]) -> list:
@@ -289,7 +304,8 @@ def measure(ge, task: dict, answer: dict, log=print) -> dict:
                **pattern_checks(ge, pr, layer, t, model_P), "seconds": time.time() - t0}
         out["reads"].append(rec)
         log(f"  read L{layer}@{t}: {sel['available']} candidate pairs, background KL {sel['kl_background']:.4f}, all pairs "
-            f"{sel['kl_full_row']:.4f}; {len(sel['pairs'])} pairs -> {sel['curve'][-1]:.4f}; uniform row {rec['kl_target_uniform_row']:.4f}; "
+            f"{sel['kl_full_row']:.4f}; {len(sel['pairs'])} pairs -> {sel['curve'][-1]:.4f}; uniform row {rec['kl_target_uniform_row']:.4f}, "
+            f"model's row {rec['kl_target_model_row']:.4f}; "
             f"row KL vs model {rec['kl_model_vs_circuit_row']:.3f} bits, entropy {rec['entropy_circuit_row']:.2f} of {rec['entropy_uniform']:.2f}")
     return out
 

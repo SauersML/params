@@ -15,13 +15,16 @@ whose changed token moves the prediction by at least 1% of the text's total; Tex
       important MLP's (the others' neurons count as their MLP's measured removal divided among them).
   (2) Prune: the units leave in order of their measured removal, least first, a quarter of what is left at a time
       (stopping exactly at the sizes asked for), each set measured; the singles are measured again within the set
-      when it first falls under each of RESCREEN's sizes.
-The curve is every measured (size, KL) down to the empty set.
+      when it first falls under each of RESCREEN's sizes, and at every step from FINE units down.
+The curve is every measured (size, KL) down to the empty set. At each size asked for, its N is goal_eval's necessity
+on the same log scale with the model's own units in place of VPD's answer: clip(ln(KL_{model minus C} / KL_VPD) /
+ln(KL_empty / KL_VPD), 0, 1), "model minus C" every unit at every position but the circuit's; its size is its units'
+description length, each one choice among the positions times the 4 x (6 + 3,072) units per position.
 
 A removal at position p changes nothing before p (the model is causal), so a batch of removals computes only the
 positions from its first removal on, reading the set's keys and values before it from the set's own run.
 
-  native_units.py curve --split heldout --n 20 [--sizes 380 ...] [--out OUT.jsonl]
+  native_units.py curve --split heldout --n 20 [--sizes 12 16 ...] [--out OUT.jsonl]   per text, then the table by size
 """
 
 from __future__ import annotations
@@ -44,7 +47,9 @@ import goal_eval  # noqa: E402
 import native  # noqa: E402
 
 SCREEN_FLOOR = 0.01  # an MLP's neurons are screened one by one when its removal moves the prediction this share of the top MLP's
-RESCREEN = (4096, 1024, 256, 64)  # set sizes under which the singles are measured again
+RESCREEN = (4096, 1024)  # set sizes under which the singles are measured again
+FINE = 256  # and at every pruning step from this size down
+SIZES = (12, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024)  # the matched sizes reported by default (teachers' circuits)
 BATCH = 64  # removals per batched run
 STEP = 4  # each pruning step removes a STEP-th of the set
 
@@ -171,7 +176,7 @@ class NativeUnits:
         return out
 
 
-def screen(nu: NativeUnits, S: Mask, base_kl: float) -> dict:
+def screen(nu: NativeUnits, S: Mask, base_kl: float, log=None) -> dict:
     """Unit -> its measured removal effect (KL of the set without it, minus the set's): heads one by one; MLPs as
     wholes at each (layer, position), then the neurons of those moving the prediction at least SCREEN_FLOOR as much
     as the top MLP one by one (the others' neurons each get their MLP's effect divided among them)."""
@@ -194,6 +199,8 @@ def screen(nu: NativeUnits, S: Mask, base_kl: float) -> dict:
             for u in blocks[b]:
                 effect[u] = block_effect[b] / len(blocks[b])
     singles = [u for b in screened for u in blocks[b]]
+    if log:
+        log(f"  screen: {len(heads)} heads, {len(names)} MLPs, {len(singles)} neurons in the {len(screened)} that matter")
     for u, k in zip(singles, nu.kl(S, [[u] for u in singles])):
         effect[u] = k - base_kl
     return effect
@@ -205,7 +212,7 @@ def prune(nu: NativeUnits, positions, sizes=(), log=None) -> list[dict]:
     S = nu.at(positions)
     kl = nu.kl(S)[0]
     curve = [{"size": S.count(), "kl": kl}]
-    effect = screen(nu, S, kl)
+    effect = screen(nu, S, kl, log)
     rescreened = {n for n in RESCREEN if S.count() <= n}
     stops = sorted({k for k in sizes if 0 < k < S.count()}, reverse=True)
     while S.count() > 0:
@@ -223,9 +230,9 @@ def prune(nu: NativeUnits, positions, sizes=(), log=None) -> list[dict]:
         if log:
             log(f"  {S.count():7d} units  KL {kl:.4g}")
         due = [t for t in RESCREEN if S.count() <= t and t not in rescreened]
-        if due and S.count() > 0:
+        if (due or S.count() <= FINE) and S.count() > 0:
             rescreened |= set(due)
-            effect = screen(nu, S, kl)
+            effect = screen(nu, S, kl, log)
     return curve
 
 
@@ -235,9 +242,15 @@ def f1(kl: float, empty: float, vpd: float) -> float | None:
     return None if r is None else min(1.0, max(0.0, r))
 
 
-def curves(split: str, n: int, sizes=(), out: Path | None = None, log=print) -> list[dict]:
-    """The native-unit pruning curve of the split's first n texts with goal_eval's bounds (remainders off) and VPD's
-    own order at the same sizes (vpd@k, remainders off) -> one row per text."""
+def bits(k: int, positions: int, per_position: int) -> float:
+    """k units' description length: each one choice among positions x per_position."""
+    return k * math.log2(positions * per_position) if k else 0.0
+
+
+def curves(split: str, n: int, sizes=SIZES, out: Path | None = None, log=print) -> list[dict]:
+    """Per text of the split's first n: the native-unit pruning curve, and at each size asked for the native
+    circuit's and VPD's own first k (its order, native.Native._vpd_order) KL, F1 and N on goal_eval's scale (remainders
+    off, the native units having none; VPD's also live), with their node bits -> one row per text (appended to OUT)."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
     rows = []
@@ -248,23 +261,47 @@ def curves(split: str, n: int, sizes=(), out: Path | None = None, log=print) -> 
         positions = sorted(set(tx.targets) | {q for q, _ in tx.f2})
         empty, vpd = ge._bounds(tx, "off")
         nu = NativeUnits(nat, ids, targets)
-        curve = prune(nu, positions, sizes, log=None)
-        for c in curve:
-            c["f1"] = f1(c["kl"], empty, vpd)
+        curve = prune(nu, positions, sizes, log=log)
+        P, per = nat.positions(targets), nu.L * (nu.H + nu.Dm)
+        stops = [c for c in curve if "units" in c]
+        minus = nu.kl(nu.full(), [c["units"] for c in stops]) if stops else []
+        native_rows = [{"size": c["size"], "kl": c["kl"], "f1": f1(c["kl"], empty, vpd), "kl_minus": m,
+                        "n": goal_eval.necessity_log(empty, m, vpd), "bits": bits(c["size"], P, per), "units": c["units"]}
+                       for c, m in zip(stops, minus)]
         order = nat._vpd_order(ids, targets)
-        ks = sorted({c["size"] for c in curve if 0 < c["size"] <= len(order)})
-        vk = carry.kl(tx.ref, ge.runs(ids, targets, [ge.masks(native.Graph(order[:k], complete=True), tx.T) for k in ks], False)).tolist() if ks else []
-        row = {"task": p.stem, "T": tx.T, "positions": positions, "kl_empty_off": empty, "kl_vpd_off": vpd, "native": curve,
-               "vpd_order": [{"size": k, "kl": v, "f1": f1(v, empty, vpd)} for k, v in zip(ks, vk)],
-               "seconds": time.perf_counter() - t0}
+        ks = [k for k in sorted({c["size"] for c in stops}) if k <= len(order)]
+        vrows = ge.sufficiency(tx, [native.Graph(order[:k], complete=True) for k in ks]) if ks else []
+        vpd_rows = [{"size": k, "kl": r["kl_off"], "f1": r["f1_off"], "n": r["n_off"], "f1_live": r["f1_live"], "n_live": r["n_live"],
+                     "bits": bits(k, P, sum(nat.C.values()))} for k, r in zip(ks, vrows)]
+        row = {"task": p.stem, "T": tx.T, "positions": positions, "kl_empty_off": empty, "kl_vpd_off": vpd,
+               "curve": [{"size": c["size"], "kl": c["kl"], "f1": f1(c["kl"], empty, vpd)} for c in curve],
+               "native": native_rows, "vpd_order": vpd_rows, "seconds": time.perf_counter() - t0}
         rows.append(row)
         if out:
             with open(out, "a") as fh:
                 fh.write(json.dumps(row) + "\n")
-        at = {c["size"]: c for c in curve}
-        msg = ", ".join(f"{k}: native F1 {at[k]['f1']:.2f}, VPD order {f1(v, empty, vpd):.2f}" for k, v in zip(ks, vk) if k in set(sizes))
-        log(f"{p.stem}: T {tx.T}, {len(positions)} positions, {curve[0]['size']} units, {len(curve)} steps, {msg or ''} {row['seconds']:.0f} s")
+        at = {r["size"]: r for r in vpd_rows}
+        log(f"{p.stem}: T {tx.T}, {len(positions)} positions, {curve[0]['size']} units, {len(curve)} steps, {row['seconds']:.0f} s; "
+            + ", ".join(f"{r['size']}: native F1 {r['f1']:.2f} N {r['n']:.2f} / VPD F1 {at[r['size']]['f1']:.2f} N {at[r['size']]['n']:.2f}"
+                        for r in native_rows if r["size"] in at and r["f1"] is not None and at[r["size"]]["f1"] is not None))
     return rows
+
+
+def table(rows: list[dict]) -> str:
+    """By size, the mean over the texts of the native circuits' and VPD's first k F1, N and node bits."""
+    sizes = sorted({r["size"] for t in rows for r in t["native"]})
+    lines = [["size", "texts", "native F1", "native N", "native bits", "VPD F1", "VPD N", "VPD bits", "VPD F1 live", "VPD N live"]]
+    for k in sizes:
+        nr = [r for t in rows for r in t["native"] if r["size"] == k]
+        vr = [r for t in rows for r in t["vpd_order"] if r["size"] == k]
+
+        def m(rs, key, fmt="{:.3f}"):
+            v = [r[key] for r in rs if r.get(key) is not None]
+            return fmt.format(float(np.mean(v))) if v else "-"
+        lines.append([str(k), str(len(nr)), m(nr, "f1"), m(nr, "n"), m(nr, "bits", "{:.0f}"), m(vr, "f1"), m(vr, "n"),
+                      m(vr, "bits", "{:.0f}"), m(vr, "f1_live"), m(vr, "n_live")])
+    w = [max(len(x[i]) for x in lines) for i in range(len(lines[0]))]
+    return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(x))) for x in lines)
 
 
 def main():
@@ -273,10 +310,16 @@ def main():
     c = sub.add_parser("curve")
     c.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
     c.add_argument("--n", type=int, default=20)
-    c.add_argument("--sizes", type=int, nargs="*", default=[])
+    c.add_argument("--sizes", type=int, nargs="*", default=list(SIZES))
     c.add_argument("--out", type=Path)
+    t = sub.add_parser("table")
+    t.add_argument("rows", type=Path, help="curve's OUT.jsonl")
     args = ap.parse_args()
-    curves(args.split, args.n, args.sizes, args.out)
+    if args.cmd == "table":
+        print(table([json.loads(x) for x in args.rows.read_text().splitlines() if x.strip()]))
+        return
+    rows = curves(args.split, args.n, args.sizes, args.out)
+    print(table(rows), flush=True)
 
 
 if __name__ == "__main__":

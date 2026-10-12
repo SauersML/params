@@ -108,3 +108,20 @@ def test_prune_curve(tiny):
 def test_f1_scale():
     assert native_units.f1(100.0, 100.0, 1.0) == 0.0 and native_units.f1(1.0, 100.0, 1.0) == 1.0
     assert abs(native_units.f1(10.0, 100.0, 1.0) - 0.5) < 1e-12
+
+
+def test_native_necessity_ends(tiny):
+    """Removing nothing from the model leaves it whole (N 0); removing every unit leaves the empty circuit (N 1)."""
+    nat, ids, targets, nu = tiny
+    full = nu.full()
+    empty_kl = nu.kl(full.without(full.units()))[0]
+    vpd_kl = 0.5 * empty_kl
+    assert goal_eval.necessity_log(empty_kl, nu.kl(full, [[]])[0], vpd_kl) == 0.0
+    assert abs(goal_eval.necessity_log(empty_kl, nu.kl(full, [full.units()])[0], vpd_kl) - 1) < 1e-6
+
+
+def test_table():
+    rows = [{"native": [{"size": 12, "f1": 0.5, "n": 0.25, "bits": 300.0}], "vpd_order": [{"size": 12, "f1": 0.9, "n": 0.5, "bits": 320.0, "f1_live": 0.9, "n_live": 0.5}]},
+            {"native": [{"size": 12, "f1": 0.7, "n": None, "bits": 310.0}], "vpd_order": []}]
+    text = native_units.table(rows)
+    assert "native F1" in text and " 0.600 " in text and " 305 " in text and " 0.900 " in text

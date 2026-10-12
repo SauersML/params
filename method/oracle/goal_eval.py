@@ -1648,7 +1648,8 @@ class GoalEval:
 
 
     def adversary_flips(self, tx: Text, graphs: list[native.Graph], pool: dict, lever: str = "omitted", ms=None,
-                        steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, k: int = ADV_PATTERNS, upto: int | None = None) -> list[dict]:
+                        steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, k: int = ADV_PATTERNS, upto: int | None = None,
+                        screens: dict | None = None) -> list[dict]:
         """The paired adversary with a budget in switched-on parts instead of steps: per budget m, at most m of one
         lever on ("omitted": the VPD actives the circuit leaves out, one subcomponent at one position each;
         "patterns": the pool's patterns, each an OR over every position up to the last target), the other lever off.
@@ -1659,7 +1660,11 @@ class GoalEval:
         tried; every reported number is a float32 run); the worst of them, at most m (no weaker than a smaller budget). Per circuit {f"f1_flips_{lever}": {m: f1_adv},
         f"kl_flips_{lever}": {m: (KL_C, KL_VPD)}, f"mask_flips_{lever}": {m: the parts switched on, (site, position,
         subcomponent) or pool index}}. upto: only the budgets up to it are searched, every budget's starts still
-        drawn (the same numbers as the full search at those budgets)."""
+        drawn (the same numbers as the full search at those budgets). screens: a caller's dict of measured shortlist
+        gaps by part, shared by this call's graphs and kept across calls (a part measured once, on the first graph
+        that needs it): for searches over nearby circuits on one text (a cleanup's candidates, connection subsets of
+        one node set), whose shortlists overlap; the caller empties it when its circuits move on. None: every graph's
+        shortlist measured on it alone."""
         nat, dev = self.nat, self.nat.dev
         e0 = self._bounds(tx, "live")[0]
         ms = FLIPS[lever] if ms is None else ms
@@ -1696,29 +1701,39 @@ class GoalEval:
             kv0 = batch(items([(0, torch.zeros(1, N[0], device=dev))]))[0][1] if omitted and problems else None
         live = [i for i in range(len(problems)) if N[i]]
         g0 = dict(zip(live, grads([(i, torch.zeros(1, N[i], device=dev)) for i in live], "score")))
-        screened = {}
-        with torch.no_grad():  # each circuit's shortlist measured: the SCREEN parts with the largest gradient either way,
-            short, parts = {}, []  # each switched on alone, the largest gap first; every circuit's rows FLIP_ROWS a run
-            for i in live:
-                short[i] = g0[i][0].abs().topk(min(N[i], SCREEN)).indices
-                for s0 in range(0, len(short[i]), FLIP_ROWS):
-                    part = short[i][s0:s0 + FLIP_ROWS]
-                    rows = torch.zeros(len(part), N[i], device=dev)
-                    rows[torch.arange(len(part), device=dev), part] = 1.0
-                    parts.append((i, rows))
-            gaps, run, k = {}, [], 0
-            for j, (i, rows) in enumerate(parts):
-                run.append((i, rows))
-                k += len(rows)
-                if j == len(parts) - 1 or k + len(parts[j + 1][1]) > FLIP_ROWS:
-                    for (i_, _), (kc, kv) in zip(run, batch(items(run), search, vpd=not omitted)):
-                        kv = kv0.expand_as(kc) if kv is None else kv
-                        gaps.setdefault(i_, []).append(kc.log() - kv.log())
-                    run, k = [], 0
-            screened = {i: short[i][torch.cat(gaps[i]).argsort(descending=True)].tolist() for i in live}
-        starts = {(i, m): torch.rand(restarts, N[i], generator=gen).to(dev) for i in range(len(problems)) for m in ms if m <= N[i]}
         flat = [[(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())] if omitted else pick
                 for _, idx, cols in problems]
+        known = screens if screens is not None else {}
+        key = (lambda i, j: (lever, flat[i][j])) if screens is not None else (lambda i, j: (i, lever, flat[i][j]))
+        with torch.no_grad():  # each circuit's shortlist measured: the SCREEN parts with the largest gradient either way,
+            short, need, parts = {}, {}, []  # each switched on alone (once per key), the largest gap first; FLIP_ROWS a run
+            for i in live:
+                short[i] = g0[i][0].abs().topk(min(N[i], SCREEN)).indices
+                for j in short[i].tolist():
+                    if key(i, j) not in known and key(i, j) not in need:
+                        need[key(i, j)] = (i, j)
+            by = {}
+            for i, j in need.values():
+                by.setdefault(i, []).append(j)
+            for i, js in by.items():
+                for s0 in range(0, len(js), FLIP_ROWS):
+                    part = torch.tensor(js[s0:s0 + FLIP_ROWS], device=dev)
+                    rows = torch.zeros(len(part), N[i], device=dev)
+                    rows[torch.arange(len(part), device=dev), part] = 1.0
+                    parts.append((i, part, rows))
+            run, k = [], 0
+            for j, (i, part, rows) in enumerate(parts):
+                run.append((i, part, rows))
+                k += len(rows)
+                if j == len(parts) - 1 or k + len(parts[j + 1][2]) > FLIP_ROWS:
+                    for (i_, part_, _), (kc, kv) in zip(run, batch(items([(a, r) for a, _, r in run]), search, vpd=not omitted)):
+                        kv = kv0.expand_as(kc) if kv is None else kv
+                        for jj, gap in zip(part_.tolist(), (kc.log() - kv.log()).tolist()):
+                            known[key(i_, jj)] = gap
+                    run, k = [], 0
+            screened = {i: short[i][torch.tensor([known[key(i, j)] for j in short[i].tolist()], device=dev).argsort(descending=True)].tolist()
+                        for i in live}
+        starts = {(i, m): torch.rand(restarts, N[i], generator=gen).to(dev) for i in range(len(problems)) for m in ms if m <= N[i]}
         out = [{f"f1_flips_{lever}": {}, f"kl_flips_{lever}": {}, f"mask_flips_{lever}": {}} for _ in problems]
         pairs = [(i, m) for m in ms for i in range(len(problems)) if (i, m) in starts and (upto is None or m <= upto)]
         xs = {}

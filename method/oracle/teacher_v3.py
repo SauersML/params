@@ -132,19 +132,26 @@ class Measure:
         self.ge, self.tx, self.pr, self.empty, self.vpd, self.pool, self.m = ge, tx, pr, empty, vpd, pool, m
         self.calls = 0
 
+    def complete(self, on: torch.Tensor) -> native.Graph:
+        """The node set as a complete graph (every connection among its nodes)."""
+        nat = self.ge.nat
+        masks = {n: torch.zeros(self.tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+        for j in on.nonzero().flatten().tolist():
+            n, t, c = self.pr.nodes[j]
+            masks[n][t, c] = True
+        return native.Graph(masks=masks)
+
     def flips(self, on: torch.Tensor, graph: native.Graph | None = None) -> float:
         """F1 under the flips of the node set as a complete graph (every connection), or of a stated graph."""
-        nat = self.ge.nat
-        if graph is None:
-            masks = {n: torch.zeros(self.tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
-            for j in on.nonzero().flatten().tolist():
-                n, t, c = self.pr.nodes[j]
-                masks[n][t, c] = True
-            graph = native.Graph(masks=masks)
-        f = self.ge.adversary_flips(self.tx, [graph], self.pool, "omitted", ms=(self.m,))[0]
+        return self.flips_many([graph if graph is not None else self.complete(on)])[0]
+
+    def flips_many(self, graphs: list, screens: dict | None = None) -> list[float]:
+        """flips() of several graphs in one adversary_flips call (screens: its shortlist gaps shared by them and kept
+        by the caller across calls)."""
+        rows = self.ge.adversary_flips(self.tx, graphs, self.pool, "omitted", ms=(self.m,), screens=screens)
         self.calls += 1
-        f1 = f["f1_flips_omitted"].get(self.m)
-        return 1.0 if f1 is None else f1                       # nothing omitted: nothing to switch on
+        return [1.0 if f["f1_flips_omitted"].get(self.m) is None else f["f1_flips_omitted"][self.m]  # nothing omitted:
+                for f in rows]                                                                   # nothing to switch on
 
     def __call__(self, on: torch.Tensor) -> dict:
         got = teacher.measure(self.pr, on[None], self.empty, self.vpd)[0]
@@ -155,8 +162,9 @@ class Measure:
 def removals(meas: Measure, on: torch.Tensor, row: dict, goal: float = teacher.RECOVERED) -> tuple[torch.Tensor, dict, list]:
     """Measured removals around a node set: rounds of the F1 search's rule on min(F1, N) (every single removal measured
     and ranked, the most of them in that order, at sqrt(2)-spaced prefix sizes, that keep it >= min(goal, the set's)),
-    each round's removal kept only while F1 under the flips stays >= min(goal, the set's), halved until it does.
-    (the node set, its row, each round's {"removed", "size", ...})."""
+    each round's removal kept only while F1 under the flips stays >= min(goal, the set's), halved until it does: the
+    halvings measured together (one flips call per round, their shortlist gaps shared, a round's own), the largest that
+    holds kept. (the node set, its row, each round's {"removed", "size", ...})."""
     pr, log = meas.pr, []
     floor_mn, floor_fl = min(goal, min(row["f1"], row["n"])), min(goal, row["f1_flips"])
     for _ in range(teacher.ROUNDS):
@@ -175,15 +183,20 @@ def removals(meas: Measure, on: torch.Tensor, row: dict, goal: float = teacher.R
             prefixes[i, ranked[:k]] = False
         got = teacher.measure(pr, prefixes, meas.empty, meas.vpd)
         ok = [k for k, r in zip(sizes, got) if min(r["f1"], r["n"]) >= floor_mn]
-        k, new = max(ok, default=0), None
+        ladder, k, new = [], max(ok, default=0), None
         while k:
-            cand = on.clone()
-            cand[ranked[:k]] = False
-            r = meas(cand)
-            if r["f1_flips"] >= floor_fl:
-                new = (cand, r)
-                break
+            ladder.append(k)
             k //= 2
+        if ladder:
+            cands = on[None].repeat(len(ladder), 1)
+            for i, k_ in enumerate(ladder):
+                cands[i, ranked[:k_]] = False
+            base = teacher.measure(pr, cands, meas.empty, meas.vpd)
+            fl = meas.flips_many([meas.complete(c) for c in cands], screens={})
+            for k_, cand, r, f in zip(ladder, cands, base, fl):
+                if f >= floor_fl:
+                    k, new = k_, (cand, {**r, "f1_flips": f, "f1_rob": min(r["f1"], f)})
+                    break
         if new is None:
             break
         on, row = new

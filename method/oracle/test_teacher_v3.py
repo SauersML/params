@@ -1,6 +1,7 @@
 """Checks of teacher_v3.py on a held-out vpd4l text (skipped without vpd4l's texts and VPD's saved answers): its masks
 with every gate at 1 run VPD's own answer and with every gate at 0 the empty circuit (the bounds goal_eval computes),
-the omitted lever on gates at 1 changes nothing (nothing is left out), and the pick never exceeds the answer budget.
+the omitted lever on gates at 1 changes nothing (nothing is left out), the pick never exceeds the answer budget, and
+the cleanup's batched flips are deterministic (the same node sets and shared screens give the same numbers).
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher_v3.py -s
 """
@@ -57,3 +58,23 @@ def test_pick_within_budget(monkeypatch):
     ge, tx, saved = text("text9019")
     circuits, row, _ = teacher_v3.search(ge, tx.ids, tx.targets, saved["text9019"]["answer"], torch.load(teacher.POOL), max_nodes=40)
     assert row["best"]["size"] <= 40
+
+
+@pytest.mark.skipif(not SAVED.exists() or DEVICE == "cpu" or not teacher.POOL.exists(), reason="needs VPD's answers, a GPU, the pool")
+def test_batched_flips_deterministic():
+    """Measure.flips_many over a cleanup's halvings with a shared screens cache gives the same numbers twice (the
+    teachers reproduce), and the cache is filled once (the second call measures nothing new)."""
+    ge, tx, saved = text("text9000")
+    empty, vpd = ge._bounds(tx, "live")
+    pr = teacher.Pruner(ge, tx, tx.vpd, live=True, B=32)
+    meas = teacher_v3.Measure(ge, tx, pr, empty, vpd, torch.load(teacher.POOL))
+    order = [pr.nodes.index((n, int(t), int(c))) for n, t, c in saved["text9000"]["order"][:48] if (n, int(t), int(c)) in pr.nodes]
+    ons = torch.zeros(3, len(pr.nodes), dtype=torch.bool, device=ge.nat.dev)
+    for i, k in enumerate((40, 32, 24)):
+        ons[i, order[:k]] = True
+    screens = {}
+    a = meas.flips_many([meas.complete(o) for o in ons], screens=screens)
+    filled = len(screens)
+    b = meas.flips_many([meas.complete(o) for o in ons], screens=screens)
+    assert a == b and len(screens) == filled
+    assert meas.flips_many([meas.complete(o) for o in ons], screens={}) == a

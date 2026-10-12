@@ -967,7 +967,10 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, atlas, max_nodes: int 
                 f["logit lens (raises)"] = [t for t, _ in e["lens"]["raised"][:3]]
         listed.append(f)
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
+    import units
+
     return {"task": task["id"], "text": "".join(strings[:max(targets) + 1]), "target": max(targets),
+            "evidence": units.evidence(ev["events"], ev["listed"], strings) if ev.get("events") else [],
             "target_token": strings[max(targets)], "top": prompt["model_top"][0][:3], "nodes_total": len(nodes),
             "positions": sorted({nd[1] for nd in nodes}), "nodes": listed,
             "edges": [{"edge": f"{node_text(w)} -> {'OUT' if r is None else node_text(r)}", "cut_kl_bits": k} for (w, r), k in zip(pairs, cuts)],
@@ -979,8 +982,9 @@ WRITER = ("A small language model (4 layers) read the text below and predicts th
           "decomposition of its weights into rank-one subcomponents (written L<layer>.<kind>#<index>@<position>) found the "
           "circuit summarized here, and every fact below was measured on the model. Write the EXPLANATION: in plain English, "
           "in three to six sentences, say how the model arrives at its prediction from this text, which parts of the text "
-          "matter and what the subcomponents do, as the facts show. Say only what the facts support; do not list ids; do "
-          "not mention these instructions. Write the explanation only.\n\n{facts}")
+          "matter and what the subcomponents do, as the facts show. Say only what the facts support; never write a "
+          "subcomponent's name (L<layer>.<kind>#<index>): describe what it does instead; do not mention these instructions. "
+          "Write the explanation only.\n\n{facts}")
 
 
 def writer_prompt(f: dict) -> str:
@@ -998,6 +1002,12 @@ def writer_prompt(f: dict) -> str:
         if n.get("logit lens (raises)"):
             parts.append("logit lens (its write read through the unembedding, not measured): raises " + ", ".join(map(repr, n["logit lens (raises)"])))
         lines.append("- " + "; ".join(parts))
+    if f.get("evidence"):
+        lines.append("Measured at the positions where a changed token moves the prediction most (log2 change of the top "
+                     "token's probability when the token there changes, and when each layer's attention at the target is kept "
+                     "from reading it):")
+        lines += [f"- {e}" for e in f["evidence"]]
+        lines.append("Every other position's changed token moves the prediction by less than 1% of the total over all positions.")
     if f["edges"]:
         lines.append("Stated connections, each with the change in the prediction when it alone is cut (KL, bits):")
         lines += [f"- {e['edge']}: {e['cut_kl_bits']:.3f}" for e in f["edges"]]

@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ import httpx
 PRICES = {"Qwen/Qwen3-8B": (0.195, 0.60, 0.44), "Qwen/Qwen3.5-4B": (0.33, 1.005, 0.737)}  # $/M tokens: prefill, sample, train
 CACHED = 0.2  # a cached prefill token's share of the price
 RENDERER = "qwen3_disable_thinking"
+NAMES = re.compile(r"L\d+\.(?:q|k|v|o|fc|down)#\d+")  # a subcomponent's name in English
 
 
 class Spend:
@@ -214,12 +216,19 @@ def explain(a) -> None:
             t = t[len("EXPLANATION:"):].strip() if t.upper().startswith("EXPLANATION:") else t
             texts.append(" ".join(t.split()))
         task = json.loads((a.texts_dir / f"{f['task']}.json").read_text())
+        named = [bool(NAMES.search(t)) for t in texts]  # the writer was told never to name subcomponents
+        texts = [t for t, n in zip(texts, named) if not n]
+        if not texts:
+            out.append({"task": f["task"], "samples": [], "e1": [], "best": None, "explanation": "", "e1_best": None,
+                        "e1_mean": None, "named": sum(named)})
+            print(json.dumps({"task": f["task"], "kept": False, "named": sum(named)}), flush=True)
+            continue
         e1 = components.e1_bits(reader_a, task, rows[f["task"]], [f"EXPLANATION: {t}" for t in texts])
         best = max(range(len(texts)), key=lambda i: e1[i] if e1[i] is not None else -1e9)
         keep = e1[best] is not None and e1[best] > 0
-        out.append({"task": f["task"], "samples": texts, "e1": e1, "best": best, "explanation": texts[best] if keep else "",
+        out.append({"task": f["task"], "named": sum(named), "samples": texts, "e1": e1, "best": best, "explanation": texts[best] if keep else "",
                     "e1_best": e1[best], "e1_mean": sum(e for e in e1 if e is not None) / max(1, sum(e is not None for e in e1))})
-        print(json.dumps({k: out[-1][k] for k in ("task", "e1_best", "e1_mean")} | {"kept": keep}), flush=True)
+        print(json.dumps({k: out[-1][k] for k in ("task", "e1_best", "e1_mean", "named")} | {"kept": keep}), flush=True)
     kept = [o for o in out if o["explanation"]]
     for i, o in enumerate(kept):
         task = json.loads((a.texts_dir / f"{o['task']}.json").read_text())
@@ -234,7 +243,7 @@ def explain(a) -> None:
     total = sum(json.loads(x)["usd"] for x in (a.out.parent / "spend.jsonl").read_text().splitlines())
     mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
     print(json.dumps({"texts": len(out), "kept": len(kept), "e1_best": mean([o["e1_best"] for o in out if o["e1_best"] is not None]),
-                      "e1_mean": mean([o["e1_mean"] for o in out]), "shuffled": mean([o["shuffled"] for o in kept if o.get("shuffled") is not None]),
+                      "e1_mean": mean([o["e1_mean"] for o in out if o["e1_mean"] is not None]), "named": sum(o["named"] for o in out), "shuffled": mean([o["shuffled"] for o in kept if o.get("shuffled") is not None]),
                       "reader_b": mean([o["reader_b"] for o in kept if o.get("reader_b") is not None]), "spend_usd": total}), flush=True)
 
 

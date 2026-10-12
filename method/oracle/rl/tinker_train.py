@@ -54,6 +54,7 @@ RENDERERS = {"deepseek-ai/DeepSeek-V4.1-Flash:peft:262144": "deepseekv3_disable_
 # chance unaided): the reward's and the writer's selection, the independent check (another family, never used for
 # either), and the 8B as a control column.
 REWARD_READER, INDEPENDENT_READER, CONTROL_READER = "Qwen/Qwen3.5-397B-A17B", "moonshotai/Kimi-K2.6", "Qwen/Qwen3-8B"
+WRITER = "deepseek-ai/DeepSeek-V4.1-Flash:peft:262144"  # explain's teacher English (v2, the lead's 10-12): best of 8, REWARD_READER selects
 CACHED = 0.2  # a cached prefill token's share of the price
 SCORER_FAILURES = 3  # scorer errors an RL run sits out (each request kept) before it stops
 RENDERER = "qwen3_disable_thinking"
@@ -614,7 +615,7 @@ def main():
     x.add_argument("rows", type=Path, help="the texts' question rows (reader events)")
     x.add_argument("out", type=Path)
     x.add_argument("--n", type=int, default=8, help="explanations sampled per text")
-    x.add_argument("--writer", default="Qwen/Qwen3-8B")
+    x.add_argument("--writer", default=WRITER, help="a strong writer (never the 8B: its English is the targets')")
     x.add_argument("--reader-a", default=REWARD_READER, help="the reward's reader: selects the best of N")
     x.add_argument("--reader-b", default=INDEPENDENT_READER, help="the independent reader: the headline (a model in PRICES)")
     x.add_argument("--max-tokens", type=int, default=400)

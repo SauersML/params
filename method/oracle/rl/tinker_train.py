@@ -57,7 +57,17 @@ REWARD_READER, INDEPENDENT_READER, CONTROL_READER = "Qwen/Qwen3.5-397B-A17B", "m
 CACHED = 0.2  # a cached prefill token's share of the price
 SCORER_FAILURES = 3  # scorer errors an RL run sits out (each request kept) before it stops
 RENDERER = "qwen3_disable_thinking"
-THINKING_RENDERER = "qwen3"  # --thinking: Qwen3's own reasoning before the answer (an SFT target's block is empty)
+THINKING_RENDERER = "qwen3"  # sample/rl --thinking: Qwen3's own reasoning before the answer (sft keeps the empty block in
+# the prompt, RENDERER's way, so the targets never train thinking away: the lead's 10-12)
+CONTEXT = 32768  # Qwen3-8B's native context: a question's generation limit is at most what it leaves
+ANSWER_CAP = 8000  # reward v3's answer cap in tokens after the thinking (Mermaid: the 3,500 of the id grammar x ~1.66,
+# max 7,403 over the 444 v1 targets): an answer above it counts as cut, invalid
+
+
+def fitting(tinker, params, prompt, limit: int):
+    """Sampling parameters whose generation limit fits the prompt in CONTEXT: min(limit, CONTEXT - its length)."""
+    room = CONTEXT - prompt.length - 16
+    return params if room >= limit else tinker.SamplingParams(max_tokens=max(256, room), temperature=params.temperature, stop=params.stop)
 NAMES = re.compile(r"L\d+\.(?:q|k|v|o|fc|down)#\d+")  # a subcomponent's name in English
 
 
@@ -174,7 +184,8 @@ def sample(a) -> None:
     futs = [(q, renderer.build_generation_prompt([{"role": "user", "content": q["question"]}])) for q in questions]
     if head:
         futs = [(q, prompt.append(tinker.types.EncodedTextChunk(tokens=head))) for q, prompt in futs]
-    futs = [(q, prompt, sampler.sample(prompt=prompt, num_samples=a.samples, sampling_params=params)) for q, prompt in futs]
+    futs = [(q, prompt, sampler.sample(prompt=prompt, num_samples=a.samples, sampling_params=fitting(tinker, params, prompt, a.max_tokens)))
+            for q, prompt in futs]
     with a.out.open("w") as f:
         for q, prompt, fut in futs:
             res = fut.result()
@@ -339,7 +350,7 @@ def sft(a) -> None:
 
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.log, a.base)
-    tinker, _, training, renderer, _ = clients(a.base, a.rank, None, a.thinking)
+    tinker, _, training, renderer, _ = clients(a.base, a.rank, None)  # the empty think block in the prompt, never trained
     rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
     data = [conversation_to_datum(r["prompt"] + r["completion"], renderer, a.max_length, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
             for r in rows]
@@ -375,7 +386,7 @@ def score(a) -> None:
 
     a.out.parent.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.out.parent, a.base)
-    tinker, _, training, renderer, _ = clients(a.base, a.rank, a.init, a.thinking)
+    tinker, _, training, renderer, _ = clients(a.base, a.rank, a.init)  # sft's rendering
     rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
     with a.out.open("w") as f:
         for s0 in range(0, len(rows), a.batch):
@@ -415,7 +426,7 @@ def rl(a) -> None:
         batch = []
         for q in rng.sample(questions, min(a.texts, len(questions))):
             prompt = renderer.build_generation_prompt([{"role": "user", "content": q["question"]}])
-            batch.append((q, prompt, sampler.sample(prompt=prompt, num_samples=a.group, sampling_params=params)))
+            batch.append((q, prompt, sampler.sample(prompt=prompt, num_samples=a.group, sampling_params=fitting(tinker, params, prompt, a.max_tokens))))
         return batch
 
     def checkpoint(step: int) -> None:
@@ -443,7 +454,8 @@ def rl(a) -> None:
             texts, thinks = zip(*(answer_of(renderer, tokenizer, s.tokens) for s in res.sequences))
             texts = list(texts)
             t1 = time.time()
-            req = {"task": q["task"], "answers": texts, "truncated": [str(s.stop_reason) == "length" for s in res.sequences]}
+            req = {"task": q["task"], "answers": texts, "truncated": [str(s.stop_reason) == "length" or len(s.tokens) - th > ANSWER_CAP
+                                                                    for s, th in zip(res.sequences, thinks)]}
             if frozen is not None:
                 if q["task"] not in tasks:
                     tasks[q["task"]] = json.loads((a.texts_dir / f"{q['task']}.json").read_text())
@@ -466,7 +478,8 @@ def rl(a) -> None:
                            "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")} for s in scores],
                            "texts": texts, "thinking_tokens": list(thinks), "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
-                           "terms": {k: [s.get(k) for s in scores] for k in ("C", "N", "E2", "E3", "E4", "F1", "F3", "E1", "size")}})
+                           "terms": {k: [s.get(k) for s in scores] for k in ("phi", "phi_tau", "g", "compact", "bits", "D", "Q", "E2g",
+                                                                              "E4x", "E1", "C", "N", "E2", "E3", "E4")}})
             for s, rew in zip(res.sequences, rewards):
                 if rew == mean:
                     continue
@@ -520,8 +533,8 @@ def main():
         p.add_argument("--steps", type=int, default=4)
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--name", default="components")
-        p.add_argument("--thinking", action="store_true", help="Qwen3's thinking mode (renderer qwen3): an SFT target's thinking "
-                                                                "block is empty, RL samples the policy's own")
+        p.add_argument("--thinking", action="store_true", help="rl: Qwen3's thinking mode (renderer qwen3), the policy's own "
+                                                                "thinking; sft: no effect (the empty block stays in the prompt)")
     s = sub.choices["sft"]
     s.add_argument("--batch", type=int, default=8)
     s.add_argument("--lr", type=float, help="peak rate, linear decay to 0 (default: the cookbook's LoRA rate for the base)")
@@ -547,7 +560,6 @@ def main():
     c.add_argument("--rank", type=int, default=32)
     c.add_argument("--batch", type=int, default=8)
     c.add_argument("--max-length", type=int, default=32768)
-    c.add_argument("--thinking", action="store_true")
     m = sub.add_parser("sample")
     m.add_argument("questions", type=Path)
     m.add_argument("out", type=Path)

@@ -161,14 +161,6 @@ def test_qa_term_is_measured_from_the_no_change_answer():
     assert components.qa_term([], {}, tok, "t1") is None
 
 
-def test_size_term_counts_orders_of_magnitude():
-    scale = 2.0 ** 20 - 1
-    assert components.size_term(0.0, scale) == 0.0 and components.size_term(scale, scale) == 1.0
-    assert components.size_term(10 * scale, scale) == 1.0  # at most 1
-    step = [components.size_term(2.0 ** k - 1, scale) - components.size_term(2.0 ** (k - 1) - 1, scale) for k in (5, 10, 15)]
-    assert all(abs(x - 1 / 20) < 1e-12 for x in step)  # every doubling costs the same
-
-
 def test_structural_changes_keep_the_tokens():
     ids, targets = list(range(10, 30)), [19]
     move = components.apply_change(ids, targets, {"kind": "move", "position": 5, "to": 12})
@@ -272,7 +264,7 @@ def tiny():
 def test_reward_on_tiny_model(tiny):
     nat, ge, task, ev = tiny
     assert ev["positions"] and ev["active"] > 0
-    invalid = -(1 + components.SIZE_WEIGHT)
+    invalid = components.V3_INVALID
     order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
     at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:3]
     fc = next(nd for nd in order if nd[1] == 7 and nd[0] == "h.1.mlp.c_fc")
@@ -284,15 +276,19 @@ def test_reward_on_tiny_model(tiny):
         "\n```\n", "\n  zz --> OUT\n```\n", 1)  # a value never writes the residual stream: dropped, charged
     missing = components.render(goal_eval.to_json(g, "writes at the target"))
     got = components.reward(ge, task, ev, [good, bad, missing, good], truncated=[False, False, False, True], pool={})
-    assert got[0]["valid"] and invalid < got[0]["reward"] <= 1.0
+    assert got[0]["valid"] and invalid < got[0]["reward"]
     assert all(got[0][f"term_{k}"] is None or 0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("C", "F1", "N", "F3"))
+    v = got[0]  # reward v3: phi + g x (0.5 compact + E2g + E4x + E1) + D
+    assert v["g"] is None or 0.0 <= v["g"] <= 1.0
+    assert v["reward"] == pytest.approx((v["phi"] or 0.0) + (v["g"] or 0.0) * v["Q"] + v["D"])
+    assert v["Q"] == pytest.approx(0.5 * (v["compact"] or 0.0) + sum(v[f"term_{k}"] or 0.0 for k in ("E2g", "E4x", "E1")))
     tok = lambda xs: components.token_strings(task["model"], xs)  # noqa: E731
     right0 = sum(0.5 * (not q["falls"]) + 0.5 * (tok([q["top"]])[0] == " the") for q in ev["qa"]) / max(len(ev["qa"]), 1)
     if ev["qa"] and right0 < 1.0:  # every "falls" right and no top token "x" (0.5 right), measured from no change
         assert got[0]["term_E2"] == pytest.approx(max(-1.0, min(1.0, (0.5 - right0) / (1.0 - right0))))
     else:
         assert got[0]["term_E2"] is None
-    assert got[1]["valid"] and got[1]["dropped_edges"] == 1 and got[1]["size"] > got[0]["size"]
+    assert got[1]["valid"] and got[1]["dropped_edges"] == 1 and got[1]["bits"] > got[0]["bits"]
     assert (not got[2]["valid"]) == bool(ev["qa"]) and not got[3]["valid"] and got[3]["reward"] == invalid
     import edit_eval
 
@@ -301,13 +297,11 @@ def test_reward_on_tiny_model(tiny):
     best = {edit_eval.EditEval.key(task["id"], goals[0]): 4.0}
     edited = good + "\nEDIT 1: scale " + good.split("subgraph P7", 1)[1].split("\n    ", 1)[1].split("[", 1)[0] + " 0"
     with_e3 = components.reward(ge, task, asked, [edited, good], ee=FakeEdits(), edit_best=best, pool={})
-    assert with_e3[0]["term_E3"] == 0.5 and not with_e3[1]["valid"]  # 2 bits of the teacher's 4; no EDIT line: invalid
-    terms = [with_e3[0][f"term_{k}"] for k in ("C", "N", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]  # F1, F3, E1: reported
-    assert with_e3[0]["reward"] == pytest.approx(sum(terms) / len(terms) - components.SIZE_WEIGHT * with_e3[0]["size"])
+    assert with_e3[0]["term_E3"] == 0.5 and not with_e3[1]["valid"]  # 2 bits of the teacher's 4 (reported); no EDIT line: invalid
 
 
 def test_invalid_below_every_valid_answer(tiny):
-    """However large a valid answer and however badly it does, it earns more than an invalid one."""
+    """However badly a valid answer does, it earns more than an invalid one; an answer above NODE_CAP nodes is invalid."""
     nat, ge, task, ev = tiny
     T = len(task["prompts"][0]["token_ids"])
     every = native.Graph({(n, t, c) for n in nat.names for t in range(T) for c in range(nat.C[n])})
@@ -320,10 +314,10 @@ def test_invalid_below_every_valid_answer(tiny):
     texts = [components.render(goal_eval.to_json(huge, ""), wrong), components.render(junk, wrong),
              components.render({"nodes": [], "edges": []}, wrong).replace("flowchart LR", "flowchart LR\n" + garbage)]
     got = components.reward(ge, task, ev, texts, pool={})
-    assert all(r["valid"] for r in got)  # lines that do not parse are dropped and charged, not fatal
-    assert got[0]["size"] == 1.0 and got[1]["dropped_edges"] == 5 * T and got[2]["malformed"] == 400 and got[2]["size"] == 1.0
-    assert min(r["reward"] for r in got) > -(1 + components.SIZE_WEIGHT)
-
+    assert huge.count() > components.NODE_CAP and not got[0]["valid"] and got[0]["reward"] == components.V3_INVALID
+    assert got[1]["valid"] and got[2]["valid"]  # lines that do not parse are dropped and charged, not fatal
+    assert got[1]["dropped_edges"] == 5 * T and got[2]["malformed"] == 400 and got[2]["bits"] > got[1]["bits"] > 0
+    assert min(r["reward"] for r in got[1:]) > components.V3_INVALID
 
 def test_variables_block_parses_renders_and_round_trips():
     """The EXPLANATION's VARIABLES block: ids and written-out subcomponents, inputs with their tokens, feeds by name; a
@@ -361,7 +355,7 @@ class FakeScorer:
 
     def score(self, tx, vs, graph=None):
         self.asked = vs
-        return {"e4": 0.6, "circuit": {"e4": 0.9}, "gap": 0.3}
+        return {"e4": 0.6, "circuit": {"e4": 0.9}, "gap": 0.3, "variables": [{"f_on": 0.7, "s_off": 0.5} for _ in vs]}
 
 
 def test_e4_is_the_scorers_e4_with_a_malformed_variable_scoring_zero():
@@ -370,7 +364,8 @@ def test_e4_is_the_scorers_e4_with_a_malformed_variable_scoring_zero():
     two = {"name": "b", "meaning": "", "inputs": [6], "group": [["h.2.attn.o_proj", 1, 7]], "feeds": ["prediction"]}
     sc = FakeScorer()
     out = components.e4_term(sc, None, None, {"variables": [one, two]}, 0, C)
-    assert out == {"E4": 0.6, "model": 0.6, "circuit": 0.9, "gap": 0.3} and [v["name"] for v in sc.asked] == ["a", "b"]
+    assert {k: out[k] for k in ("E4", "model", "circuit", "gap")} == {"E4": 0.6, "model": 0.6, "circuit": 0.9, "gap": 0.3}
+    assert [v["name"] for v in sc.asked] == ["a", "b"] and [x["e4"] for x in out["per_variable"]] == [0.5, 0.5]  # min(f_on, s_off)
     outside = {**two, "group": [["h.2.attn.o_proj", 99, 7]]}  # no such subcomponent; and one line that did not parse
     assert components.e4_term(sc, None, None, {"variables": [one, outside]}, 1, C)["E4"] == pytest.approx(0.6 / 3)
     assert components.e4_term(sc, None, None, {}, 0, C)["E4"] == 0.0
@@ -490,27 +485,6 @@ def test_mermaid_circuit_is_read_strictly():
     assert p["malformed"] == 5 and p["unknown_ids"] == 1 and len(p["answer"]["edges"]) == 2 and p["finals"] == {1: (False, "' x'")}
 
 
-def test_matched_reward_is_c_and_n_over_vpd_at_the_same_size(tiny, monkeypatch):
-    """The RL v2 reward: (c_rl - c_rl of VPD's first k, clipped) + (N - N of VPD's first k) - w x size; E2 reported,
-    never in it; an invalid answer at INVALID_MATCHED; no size weight (C's noise) is an error."""
-    nat, ge, task, ev = tiny
-    order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
-    at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:3]
-    finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
-    good = components.render(goal_eval.to_json(native.Graph(set(at_t), {}, at_t), ""), finals)
-    with pytest.raises(ValueError):
-        components.reward(ge, task, ev, [good], matched=True, pool={})
-    real = ge.fidelity
-    monkeypatch.setattr(ge, "fidelity", lambda *a, **k: [{**r, "c_rl": 0.3, "c_rl_vpd_k": -4.0, "n_vpd_k": 0.25}
-                                                          for r in real(*a, **{**k, "baseline": False})])
-    got = components.reward(ge, task, ev, [good, "no circuit"], matched=True, size_noise=0.05, pool={})
-    squashed = components.MATCH_CLIP * math.tanh(4.3 / components.MATCH_CLIP)  # 4.3 squashed below the clip, still monotone
-    assert got[0]["term_C_matched"] == pytest.approx(squashed) and squashed < components.MATCH_CLIP
-    assert got[0]["term_N_matched"] == pytest.approx(got[0]["term_N"] - 0.25)
-    assert got[0]["reward"] == pytest.approx(squashed + got[0]["term_N"] - 0.25 - 0.05 * got[0]["size"])
-    assert got[1]["reward"] == components.INVALID_MATCHED and got[0]["reward_mean"] != got[0]["reward"]
-
-
 def test_qa_detail_scores_each_question_and_the_no_change_answer():
     tok = lambda xs: [f"t{x}" for x in xs]  # noqa: E731
     qs = [{"kind": "remove", "falls": True, "top": 5}, {"kind": "swap", "falls": False, "top": 9}, {"kind": "token", "falls": True, "top": 9}]
@@ -597,3 +571,22 @@ def test_every_rendered_circuit_passes_mermaids_parser(tmp_path):
     md.write_text("\n\n".join(blocks) + "\n")
     got = subprocess.run(["node", str(HERE.parents[1] / "experiments/oracle/mermaid_parse.mjs"), mdir, str(md)], capture_output=True, text=True)
     assert got.returncode == 0, got.stdout[-2000:] + got.stderr[-2000:]
+
+
+def test_e2g_credits_answers_that_agree_with_the_model_and_the_circuit(tiny):
+    """E2g runs the answer's own circuit under each question's intervention: every question gets a credit in [0, 1],
+    consistency and accuracy are shares; an answer of no circuit agrees with the model only where nothing changes."""
+    nat, ge, task, ev = tiny
+    prompt = task["prompts"][0]
+    tx = ge.text(prompt["token_ids"], prompt["target_positions"], task=task)
+    order = nat._vpd_order(prompt["token_ids"], [7])
+    at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:3]
+    answer = goal_eval.to_json(native.Graph(set(at_t), {}, at_t), "")
+    tok = lambda xs: components.token_strings(task["model"], xs)  # noqa: E731
+    finals = {n: (q["falls"], components.shown(tok([q["top"]])[0])) for n, q in enumerate(ev["qa"], 1)}  # right about the model
+    got = components.e2g_term(ge, tx, task, answer, ev["qa"], finals)
+    assert len(got["per_question"]) == len(ev["qa"]) and got["accuracy"] == 1.0
+    assert 0.0 <= got["E2g"] <= 1.0 and 0.0 <= got["consistency"] <= 1.0
+    assert all(0.0 <= x["credit"] <= 1.0 for x in got["per_question"])
+    none = components.e2g_term(ge, tx, task, answer, ev["qa"], {})
+    assert none["E2g"] == 0.0 and none["accuracy"] == 0.0

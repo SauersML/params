@@ -47,7 +47,7 @@ PYEOF
 export TINKER_API_KEY="$(security find-generic-password -s tinker-api-key -w)" TINKER_PROJECT_ID=3f598f31-2ffa-4eb4-b302-909eb234fb7d
 cd $SRC/method/oracle/rl
 $TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEPS --batch $BATCH ${LR:+--lr $LR} --name sft-$RUN \
-  --max-length ${MAXLEN:-32768} $TH
+  --max-length ${MAXLEN:-32768}  # the empty think block in the prompt (tinker_train sft), thinking or not
 STATE=$($PY -c "import json; print(json.load(open('$S/sft/state.json'))['state'])")
 $TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE" --base $BASE --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK $TH
 # the circuit-ablation column: the same policy answering the questions with an empty circuit (E2 with - without)

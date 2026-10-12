@@ -4,22 +4,23 @@ rl/prime/components_oracle) posts the answers of a group and gets one reward eac
 request already queued, and scores each text's answers with one components.reward call per text; the text's
 goal_eval.Text is kept for the group's later requests. A text's requests always go to the same process.
 
-  serve_components.py ROWS.jsonl [--port 8767] [--workers 2] [--device cuda] [--size-weight 0.5]
+  serve_components.py ROWS.jsonl [--port 8767] [--workers 2] [--device cuda] [--teacher DIR]
                       [--reader http://127.0.0.1:8000/v1/completions --reader-base Qwen/Qwen3-4B]
                       [--edit-teach TEACH.jsonl ...] [--variables]
   POST /score {"task": TASK_ID, "answers": [TEXT, ...], "e1": [bits, ...], "truncated": [bool, ...]}
-      (e1 and truncated optional: whether each answer was cut at the sampling cap, an invalid answer)
-      -> {"scores": [{"reward", "valid", "C", "N", "E1", "E2", "E3", "E4", "F1", "F3", "size", "bits", "nodes", "edges", "tok_edges", "malformed",
+      (e1 and truncated optional: whether each answer was cut at the sampling cap or over the answer cap, an invalid
+      answer)
+      -> {"scores": [{"reward", "valid", "phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q", "E2g", "E4x",
+                      "E1", "C", "C_rl", "N", "F1", "F3", "E2", "E3", "E4", "nodes", "edges", "tok_edges", "malformed",
                       "dropped_nodes", "dropped_edges", "finals", "truncated"}, ...]}
   GET /health -> {"workers", "alive", "pending"}
 
-E1, the frozen base model's bits saved: given in the request (computed by the caller, as tinker_train.py's Tinker
-reader does), else from --reader (components.http_reader: vLLM's OpenAI server holding the base model, never the
-policy); with neither, the reward has no E1 term. E3, the edit requests (rows with "edits", components.py edits):
-scored by edit_eval against the edit teacher's net per goal (--edit-teach, edit_eval.py teach output); a text whose
-requests lack a teacher net has no E3 term. --matched: the RL v2 reward (components.reward(matched): C and N over VPD's
-first k at the answer's size, less C's draw noise x size; E1 and E2 reported only). E4, with --variables: each answer's VARIABLES block by interchange
-(variables.Scorer; an answer without the block scores 0).
+The reward is components.reward's v3: phi + g x (0.5 compact + E2g + E4x + E1) + D, teacher dominance D against the
+text's teacher circuit (--teacher: <task>.json). E1, the frozen reader's bits: given in the request (computed by the
+caller, as tinker_train.py's Tinker reader does), else from --reader (components.http_reader); with neither, none.
+E3, the edit requests (rows with "edits"): scored by edit_eval against the edit teacher's net per goal (--edit-teach),
+reported. E4x, with --variables: each answer's VARIABLES block by interchange (variables.Scorer), weighted by its
+nodes' measured removal effects.
 ROWS: components.py questions output (each text's evidence: its questions and the size term's scale).
 """
 
@@ -45,8 +46,8 @@ sys.path.insert(0, str(HERE.parent))
 TEXTS_KEPT = 8  # goal_eval.Text objects a process keeps (a group's answers arrive in several requests)
 
 
-def work(device: str | None, rows_path: str, size_weight: float, reader_url: str | None, reader_base: str, edit_teach: list,
-         with_variables: bool, matched: bool, size_noise: float | None, inbox, outbox) -> None:
+def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url: str | None, reader_base: str, edit_teach: list,
+         with_variables: bool, inbox, outbox) -> None:
     import components
     import goal_eval
     import native
@@ -59,6 +60,7 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
 
         vs = variables.Scorer(ge)
     rows = {r["task"]: r for r in map(json.loads, Path(rows_path).read_text().splitlines()) if r}
+    teachers = {t: json.loads(f.read_text()) for t in rows if teacher_dir and (f := Path(teacher_dir) / f"{t}.json").exists()}
     ee = edit_best = None
     if any(r.get("edits") for r in rows.values()):
         import edit_eval
@@ -83,13 +85,14 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
                     tasks[tid] = json.loads((native.TEXTS / "vpd4l" / f"{tid}.json").read_text())
                 given = None if any(e is None for _, _, e, _ in reqs) else [b for _, _, e, _ in reqs for b in e]
                 got = components.reward(ge, tasks[tid], rows[tid], [x for _, xs, _, _ in reqs for x in xs],
-                                        size_weight=size_weight, cache=cache, reader=None if given else reader, e1=given,
+                                        cache=cache, reader=None if given else reader, e1=given,
                                         truncated=[c for _, _, _, cut in reqs for c in cut], ee=ee, edit_best=edit_best, vs=vs,
-                                        matched=matched, size_noise=size_noise)
+                                        teacher=teachers.get(tid))
                 while len(cache) > TEXTS_KEPT:
                     cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **{k[5:]: g[k] for k in g if k.startswith("term_")},
-                        "size": g["size"], **{k: (g["row"] or {}).get(k) for k in ("bits", "nodes", "edges", "tok_edges")},
+                        **{k: g.get(k) for k in ("phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q")},
+                        **{k: (g["row"] or {}).get(k) for k in ("nodes", "edges", "tok_edges")},
                         **{k: g[k] for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")}} for g in got]
                 err = None
             except Exception as e:  # a bad request answers with its error; the process keeps serving
@@ -224,15 +227,13 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--workers", type=int, default=2, help="scoring processes; 0: one thread in this process")
     ap.add_argument("--device")
-    ap.add_argument("--size-weight", type=float, default=0.5)
+    ap.add_argument("--teacher", help="teacher circuits (<task>.json): reward v3's teacher-dominance reference")
     ap.add_argument("--reader", help="the frozen base model's vLLM completions URL (E1)")
     ap.add_argument("--reader-base", default="Qwen/Qwen3-4B")
     ap.add_argument("--edit-teach", action="append", default=[], help="edit_eval.py teach output: the best net per goal (E3)")
     ap.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
-    ap.add_argument("--matched", action="store_true", help="the RL v2 reward: C and N over VPD's first k at the answer's size (reward(matched))")
-    ap.add_argument("--size-noise", type=float, help="the matched reward's size weight, C's draw noise (components.SIZE_NOISE by default)")
     a = ap.parse_args()
-    args = (a.device, a.rows, a.size_weight, a.reader, a.reader_base, a.edit_teach, a.variables, a.matched, a.size_noise)
+    args = (a.device, a.rows, a.teacher, a.reader, a.reader_base, a.edit_teach, a.variables)
     serve(Pool(a.workers, args, work) if a.workers else Inline(args, work), a.host, a.port, "serve_components")
 
 

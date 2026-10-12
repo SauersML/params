@@ -9,7 +9,7 @@
 #     SAMPLES: a sampler's JSONL or a directory of <task>[.<k>].txt (components.samples_of); E1: tinker_train.py readers
 #     (env: HOURS (cap, default 2), GPU, PRICE, VRAM, RP_OWNER; SRCREV: the source revision (default origin/main);
 #      VARIABLES=1: E4, each answer's VARIABLES block; MATCHED_ALL=1: VPD at every sample's size (verify-and-pick);
-#      EDIT_EVAL: the edit teacher's rows for the rows' edit requests (E3); MATCHED=1: the RL v2 reward (reward(matched));
+#      EDIT_EVAL: the edit teacher's rows for the rows' edit requests (E3); TEACHER: teacher circuits (v3's dominance term);
 #      NOISE=k: C's draw noise over k seeds per set's first answers (components.py noise) instead of the evaluation;
 #      LEDGER_OK=1 once the lead approved a launch past $290)
 cd /Users/user/params
@@ -37,10 +37,12 @@ for spec in "$@"; do  # each set under its own name, a file or a directory as it
   ARGS="$ARGS --set $name=$I/sets/$name"
   if [ -n "$e1" ]; then cp "$e1" "$IN/sets/$name.e1.jsonl" || exit 1; ARGS="$ARGS --e1 $name=$I/sets/$name.e1.jsonl"; fi
 done
+TEACH=""  # TEACHER: the texts' teacher circuits, reward v3's teacher-dominance reference
+if [ -n "${TEACHER:-}" ]; then mkdir -p "$IN/teacher" && cp "$TEACHER"/text*.json "$IN/teacher/" && TEACH=teacher; fi
 EDITS=""  # the edit teacher's rows for E3's best net per goal (edit_eval.bests), when the rows ask for edits
 if [ -n "${EDIT_EVAL:-}" ]; then cp "$EDIT_EVAL" "$IN/edit_eval.jsonl" && EDITS="edit_eval.jsonl"; fi
-COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" rows.jsonl labels.jsonl sets $EDITS -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt && rm -rf "$IN"
-WHAT="evaluate heldout $I/rows.jsonl --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} ${MATCHED_ALL:+--matched-all} ${MATCHED:+--matched} ${EDIT_EVAL:+--edit-teach $I/edit_eval.jsonl}"
+COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" rows.jsonl labels.jsonl sets $EDITS $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt && rm -rf "$IN"
+WHAT="evaluate heldout $I/rows.jsonl --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} ${MATCHED_ALL:+--matched-all} ${TEACHER:+--teacher $I/teacher} ${EDIT_EVAL:+--edit-teach $I/edit_eval.jsonl}"
 if [ -n "${NOISE:-}" ]; then WHAT="noise heldout $I/rows.jsonl --seeds $NOISE"; fi  # C's draw noise (c_noise) instead of the evaluation
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \

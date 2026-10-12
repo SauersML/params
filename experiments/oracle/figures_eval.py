@@ -5,9 +5,8 @@ tinker_train.py rl run directories, as PNGs:
   PREFIX_terms.png   each reward term's mean per set (what moved)
   PREFIX_rl.png      RL: reward and valid share of the training groups and of held-out checkpoints, against step and
                      against Tinker dollars (with --rl)
-The reward drawn is the evaluation's (E1 reported beside it, never in it: components.REPORTED), E1 taken from reader B
-(the independent reader) where a readers file is given (its first answer) and an answer without English counted at 0
-bits; an invalid answer is at its fixed reward.
+The reward drawn is the evaluation's (components.reward, v3); the E1 shown is reader B's (the independent reader)
+where a readers file is given (its first answer); an invalid answer is at its fixed reward.
 
   figures_eval.py --set "NAME=EVAL.json:SET[:E1.jsonl]" ... [--ref "NAME=EVAL.json:SET" ...] --labels LABELS.jsonl
                   [--rl "NAME=RUN_DIR" ...] [--out DIR] [--prefix PREFIX]
@@ -28,15 +27,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.ticker  # noqa: E402
 
-SIZE_WEIGHT = 0.5
-INVALID = -(1.0 + SIZE_WEIGHT)
+INVALID = -10.0  # components.V3_INVALID
 COLORS = ["#2F6DB5", "#D1495B", "#2E8B57", "#E09F3E", "#7B5EA7", "#2A9D8F", "#8C564B", "#C2185B"]
 SOFT = "#9DB9DD"
 INK = "#222222"
-TERMS = [("C", "Agreement under interventions"), ("F1", "Sufficiency (part of the agreement)"), ("N", "Necessity"),
-         ("E1", "English: bits saved for the independent reader (reported)"), ("E2", "Intervention questions"), ("E3", "Edits"),
-         ("size", "Answer size"), ("invalid", "Invalid answers")]
-REPORTED = ("F1", "F3", "E1")  # in the rows, never in the reward's mean (components.REPORTED)
+TERMS = [("phi", "Faithfulness (bits)"), ("compact", "Compactness (bits against the start)"), ("C", "Agreement under interventions"),
+         ("N", "Necessity"), ("E1", "English: bits saved for the independent reader"), ("E2", "Intervention questions"),
+         ("E4x", "Variables' share of the mechanism"), ("size", "Description bits"), ("invalid", "Invalid answers")]
 
 
 def style():
@@ -62,11 +59,11 @@ def first_answers(eval_path: Path, key: str, e1_path: Path | None) -> dict:
             out[q["task"]] = (INVALID, {}, False, None)
             continue
         terms = {k[5:]: v for k, v in s.items() if k.startswith("term_") and v is not None}
+        terms |= {k: s[k] for k in ("phi", "compact") if s.get(k) is not None}
         b = e1.get(q["task"], {}).get("reader_b")
-        terms["E1"] = max(-1.0, min(1.0, b)) if b is not None else terms.get("E1", 0.0)
-        mean = [v for k, v in terms.items() if k not in REPORTED]
-        reward = sum(mean) / len(mean) - SIZE_WEIGHT * s["size"]
-        out[q["task"]] = (reward, terms, True, s["size"])
+        if b is not None:  # the independent reader's bits, shown (the reward holds the reward reader's)
+            terms["E1"] = b
+        out[q["task"]] = (s["reward"], terms, True, s["size"])
     return out
 
 
@@ -97,7 +94,7 @@ def reward_figure(sets: dict, refs: set, labels: dict, path: Path) -> None:
         ax.set_xlim(-0.5, len(names) - 0.2)
         ax.set_title(f"{title} ({len(tasks)})", fontsize=18)
         clean(ax)
-    axes[0].set_ylabel("Reward of the first answer (invalid: -1.5)")
+    axes[0].set_ylabel("Reward of the first answer (invalid: -10)")
     own = [n for n in names if n not in refs]
     claim = (f"{best} earns the most held-out reward of the explainers ({means_all[best]:+.2f} over all texts)" if len(own) > 1
              else f"Held-out reward of {best}'s first answer ({means_all[best]:+.2f}) against the references")

@@ -62,15 +62,14 @@ subcomponents at each of those positions and at the target, ranked by VPD (Nativ
 the subcomponents a change of each listed token switches on, the strongest weight-level connections among them
 (method/vpd/connectome.py; a static coupling, not a measured effect), and the intervention questions (qa_questions()).
 
-The reward (reward()) is goal_eval's scorecard in VPD's semantics combined into one number: the mean of the quality
-terms (each at most 1) less SIZE_WEIGHT x size (description bits in orders of magnitude of the bits of naming VPD's
-whole answer at the positions that can reach the targets, goal_eval's size_scale: size_term(), at most 1); an invalid answer (no CIRCUIT section, a
-missing FINAL line, cut at the sampling cap) earns -(1 + SIZE_WEIGHT), below every valid one. Nodes and edges the model
-does not have, and circuit lines that do not parse, are dropped and their bits charged in size. Terms: C, the stated
-graph's agreement with the model under the training family of interventions (goal_eval.fidelity's reward mode: F1,
-random node removals, random connection cuts, the flip adversary), N necessity, E2 questions answered right, E3
-edits, E4 the variables' interchange tests (reward()'s docstring); E1 the reader's bits saved, F1 alone, F3 (stated
-edges' cut effects) and F2 interchange are reported.
+The reward (reward(), v3, the lead's 10-12) is faithfulness first, then compactness and explanation, every term in
+bits: R = phi + g x Q + D, phi (goal_eval.phi) -log2 of the power-4 mean of the residuals of the intervention families
+(point, node removals, connection cuts, flips, path-patched changed inputs and interchange, near and far donors,
+attention patterns, necessity), g a gate at the text's bar (ge.tau), Q = 0.5 compact (log2 of the influential start's
+description bits over the answer's) + E2g + E4x + E1, D the teacher-dominance term; an invalid answer (no CIRCUIT
+section, a missing FINAL or EDIT line, cut at the sampling cap, more than NODE_CAP nodes) earns V3_INVALID, below every
+valid one. Nodes and edges the model does not have, and circuit lines that do not parse, are dropped and their bits
+charged. goal_eval's C, F1, N, F3, the old E2 (from the no-change answer), E3 and E4 are reported beside it.
 
   components.py questions SPLIT OUT.jsonl [--n N] [--qa-seed K]  question rows (question, positions, evidence, questions;
                                                                 K = 1 for a fresh set of questions)
@@ -144,13 +143,9 @@ CARRIERS_RE = re.compile(rf"\s*(?:{BLOCK_ITEM}|{_W})(?:\s*,\s*(?:{BLOCK_ITEM}|{_
 INSTANCES_RE = re.compile(r"\(\s*instances\s*:\s*(.*?)\s*\)\s*$", re.I)
 QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")  # a token's repr in an inputs list
 
-SIZE_WEIGHT = 0.5
-MATCH_CLIP = 2.0  # the matched reward's C term, c_rl - c_rl of VPD's first k, squashed to (-2, 2) by 2 tanh(x / 2): monotone,
-# so a very bad answer still ranks below a less bad one (c_rl's raw terms reach -100 on circuits without token edges)
-INVALID_MATCHED = -4.0  # the matched reward of an invalid answer: below every valid one (C >= -2, N >= -1, size noise < 1)
-SIZE_NOISE = None  # the matched reward's size weight w: C's draw noise (c_noise(); the lead, 10-12), set once measured
-REPORTED = ("F1", "F3", "E1")  # terms reported, never in the reward's mean: F1 is inside C, F3 a diagnostic, E1 until a
-# reader separates right English from wrong (the lead, 10-12: RL v1 is mean(C, N, E2[, E3]) - 0.5 size)
+V3_INVALID = -10.0  # reward v3 of an invalid answer: below every valid one (phi of a family at s = -100 is about -6.7)
+NODE_CAP = 266  # reward v3's hard cap on an answer's nodes (an answer above it is invalid)
+GATE_SLOPE = 4.0  # reward v3's gate g = 1 / (1 + 2^(-4 (phi - phi_tau))): 0.06 one bit short of the bar
 POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # C's flip adversary's pattern pool (goal_eval.fidelity)
 CONVENTION = "live"  # goal_eval's remainders convention for the reward's F1 and N: on, computing on the run's inputs
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
@@ -273,8 +268,11 @@ def parse(text: str) -> dict:
             malformed += 1
             junk += bad
     unknown, pairs = 0, []
+    complete = False
     if mermaid:
         ids, edges, malformed, junk, unknown = _parse_mermaid(lines, index)
+        complete = "complete" in edges
+        edges = [e for e in edges if e != "complete"]
     for line in old:
         if BLOCK_RE.fullmatch(line):
             continue
@@ -355,6 +353,8 @@ def parse(text: str) -> dict:
     explanation = sec.get("EXPLANATION", "")
     variables, prose, bad_vars = _variables(explanation, ids)
     answer = {"nodes": nodes, "edges": edges + pairs, "explanation": prose if variables or bad_vars else explanation}
+    if complete:
+        answer["complete"] = True
     if variables:
         answer["variables"] = variables
     return {"explanation": explanation, "answer": answer, "malformed": malformed, "malformed_nodes": junk + unknown,
@@ -371,6 +371,9 @@ def _parse_mermaid(lines: list[str], index) -> tuple[dict, list, int, int, int]:
     part outside the circuit, "|pair L<layer>@<position>|" when q is rest; a "%%" comment may hold a rest-rest pair."""
     ids, edges, bad, junk, unknown, pos, later = {}, [], 0, 0, 0, None, []
     for line in lines[1:]:
+        if line.replace(" ", "") == "%%complete":
+            edges.append("complete")
+            continue
         if line.startswith("%%"):
             m = MM_PAIR.fullmatch(line[2:].strip())
             if m:
@@ -495,7 +498,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
     import goal_eval
 
     nodes = [(goal_eval._site(c), t, BLOCK) if m == "block" else (TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
-    lines, name = circuit_lines(nodes, answer["edges"], strings)
+    lines, name = circuit_lines(nodes, answer["edges"], strings, complete=bool(answer.get("complete")))
     text = ["CIRCUIT:"] + lines
     if answer.get("variables"):
         k = {v["name"]: f"V{i}" for i, v in enumerate(answer["variables"], 1)}
@@ -575,14 +578,15 @@ def _short_ids(n: int) -> list[str]:
     return out
 
 
-def circuit_lines(nodes: list, edges: list, strings: list[str] | None = None) -> tuple[list[str], dict]:
+def circuit_lines(nodes: list, edges: list, strings: list[str] | None = None, complete: bool = False) -> tuple[list[str], dict]:
     """A circuit (its nodes as (matrix, position, index) tuples, goal_eval's JSON edges by place) as the fenced Mermaid
     CIRCUIT the oracle writes, and each node's id: per position, the latest first, a subgraph
     P<position>["@<position> '<token>'"] declaring its nodes once, a["L3.fc#1314"], b["L1.v block"] (a block), t394[tok]
     (the token embedding); then one edge per line from the prediction backward, "c --> OUT((prediction))" first and
     "--> OUT" after, "w --> r"; then the query-key pairs, "q -.->|pair| k" (q's layer and position are the read's),
     "rest -.->|pair L3@394| k" with the read written when q is rest, and a pair with neither side, the read with no
-    pair of its own, as a "%%" comment."""
+    pair of its own, as a "%%" comment. complete: a node set claiming every connection among its nodes and every token
+    edge (goal_eval's {"complete": true}, VPD's answer and the influential start), a "%% complete" line and no edges."""
     parents, out, pairs = {}, [], []
     for e in edges:
         if e[0] == "pair":
@@ -599,7 +603,7 @@ def circuit_lines(nodes: list, edges: list, strings: list[str] | None = None) ->
     at = {}
     for nd in order:
         at.setdefault(nd[1], []).append(nd)
-    lines = ["```mermaid", "flowchart LR"]
+    lines = ["```mermaid", "flowchart LR"] + (["  %% complete"] if complete else [])
     for t in sorted(at, reverse=True):
         label = f"@{t}" + (f" {strings[t]!r}" if strings else "")
         lines.append(f'  subgraph P{t}["{label.replace(chr(34), "#quot;")}"]')
@@ -806,6 +810,16 @@ def apply_change(ids: list[int], targets: list[int], ch: dict) -> tuple[list[int
         x[p], x[ch["with"]] = x[ch["with"]], x[p]
         return x, list(targets)
     return ids[:ch["at"]] + [ids[p]] + ids[ch["at"]:], [t + 1 for t in targets]
+
+
+def change_map(ch: dict, T: int) -> list[int]:
+    """Each position's place after a structural change (apply_change()): old position -> new."""
+    p = ch["position"]
+    if ch["kind"] == "move":
+        return [ch["to"] if i == p else (i if i < p else i - 1) + ((i if i < p else i - 1) >= ch["to"]) for i in range(T)]
+    if ch["kind"] == "swap":
+        return [ch["with"] if i == p else (p if i == ch["with"] else i) for i in range(T)]
+    return [i if i < ch["at"] else i + 1 for i in range(T)]
 
 
 def change_text(ch: dict, strings: list[str]) -> str:
@@ -1365,16 +1379,6 @@ def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None
     return out
 
 
-def size_term(bits: float, scale: float) -> float:
-    """The size term: an answer's description bits in orders of magnitude of the scale (the bits of naming VPD's whole
-    answer), log2(1 + bits) / log2(1 + scale), at most 1: 0 for the empty answer, 1 for one as long as VPD's, and
-    every doubling of an answer costs the same (1 / log2(1 + scale)), as F1 and N are on a log scale (goal_eval's,
-    the one definition)."""
-    import goal_eval
-
-    return goal_eval.size_term(bits, scale)
-
-
 def dropped_bits(answer: dict, g, d: dict, positions: int, subcomponents: int) -> float:
     """The description bits of what an answer states that is not in its graph (goal_eval.circuit's defects d: a node
     outside the model or the text, a connection the model does not have), each priced as native.Graph.bits prices what
@@ -1451,48 +1455,46 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict) -> dict:
     if not ok:
         return {"E4": 0.0, "model": None, "circuit": None, "gap": None}
     got = scorer.score(tx, ok, graph=graph)
+    per = []
+    for v, x in zip(ok, got["variables"]):  # each variable's headline: min(f on-target, s off-target), 0 unresolved
+        e = 0.0 if x.get("f_on") is None else (x["f_on"] if x.get("s_off") is None else min(x["f_on"], x["s_off"]))
+        per.append({"name": v["name"], "e4": e, "nodes": [list(nd) for nd in v["group"]]})
     return {"E4": (got["e4"] or 0.0) * len(ok) / (len(ok) + bad), "model": got["e4"],
-            "circuit": (got.get("circuit") or {}).get("e4"), "gap": got.get("gap")}
+            "circuit": (got.get("circuit") or {}).get("e4"), "gap": got.get("gap"), "per_variable": per}
+
+
+def softplus(x: float) -> float:
+    return max(x, 0.0) + math.log1p(math.exp(-abs(x)))
 
 
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
-           size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None, ee=None,
-           edit_best: dict | None = None, pool: dict | None = None, vs=None, split: str | None = None,
-           matched: bool = False, size_noise: float | None = None) -> list[dict]:
-    """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
-    row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT section, a
-    question has no FINAL line, an edit request no EDIT line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
-    are dropped and their description bits charged in size (dropped_bits), and so is a circuit line that does not
-    parse (each subcomponent it names, at least one, priced as a node outside the graph); edit operations add their
-    description bits (edit_bits). A valid
-    answer earns the mean of its terms less size_weight x size ("circuit_reward": the same over the circuit's own terms
-    C and N, for comparing with circuits that give no English or answers), size its description bits in orders of
-    magnitude of the bits of naming VPD's whole answer at the positions that can reach the targets (size_term over
-    goal_eval's size_scale; without VPD's causal-importance network, VPD's actives at the listed positions and the
-    targets), at most 1. Terms, from goal_eval in VPD's semantics with
-    the remainders' convention, both in orders of magnitude of KL (linear recovery is dominated by the empty circuit's
-    ~100 bits: an answer 20 bits from the model recovers 0.8 linearly, 0.2 in log): F1, goal_eval's f1 (ln(KL_empty /
-    KL_C) / ln(KL_empty / KL_VPD) in [0, 1], between the empty circuit and VPD's own answer, KL_C the run of the graph the
-    answer states: a node reaches a reader or the prediction only through a stated edge); N, goal_eval's n (what
-    VPD's own answer loses without the circuit, ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD) in [0, 1]); E1, the
-    reader's bits saved (in [-1, 1]; with a reader or e1; reported, not in the mean: REPORTED); E2, the questions answered right measured from the no-change answer (qa_term); E3, the edit
-    requests' net bits over the edit teacher's (edit_term; ee an edit_eval.EditEval, edit_best goal key -> the teacher's
-    net; left out until every request of the text has one); E4, the VARIABLES block's interchange tests (e4_term:
-    variables.Scorer's e4; vs a variables.Scorer, left out without one, 0 for an answer without the block when measured). A term goal_eval cannot give (no causal-importance
-    network for VPD's bounds) is left out of the mean. F3, the AUC of stated edges' cuts in the circuit's run, is
-    reported (term_F3), never in the mean. C (term_C), the circuit term in the mean in place of F1: goal_eval.fidelity's reward-mode c (the harmonic mean of
-    the intervention families defined on the text, c_terms: point, node removals, connection cuts, flips, changed
-    inputs' s_track, interchange, near and far donors; goal_eval.fidelity's docstring) (pool: the adversary's pattern
-    pool, POOL by default; {} leaves the adversary out, for a model without one); F1 is reported (term_F1), as are C's
-    members and columns (fidelity: s_track, context_share, the donors' ...). split: the draws of C's changed-input,
-    interchange and donor families, goal_eval's default "search" (the teachers' draws: the RL reward on training texts)
-    or "eval" (every evaluation, evaluate()). matched: the RL v2 reward (the lead's decisions 10-12), "reward" =
-    (c_rl - c_rl of VPD's first k) + (N - N of VPD's first k) at the answer's node count k (goal_eval.vpd_baseline), the
-    first squashed into (-MATCH_CLIP, MATCH_CLIP) (monotone), + E4 when measured - size_noise x size (w, C's draw noise: size only
-    breaks ties C cannot tell apart), an invalid answer INVALID_MATCHED; E1 and E2 reported, never in it; the means'
-    reward stays as "reward_mean". reader: a reader.Reader for E1, or e1: each text's reader bits
-    computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
-    -> goal_eval.Text, kept between calls."""
+           convention: str = CONVENTION, cache: dict | None = None, ee=None, edit_best: dict | None = None,
+           pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None) -> list[dict]:
+    """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
+    in bits, every term ranking, nothing clipped flat): R = phi + g x Q + D.
+      phi: goal_eval.phi of the answer's reward-mode row, -log2 of the power-4 mean of the families' residuals
+        (1 - s + eps over point, nodes, edges, flips, track_pp, interchange_pp, donors near and far, pattern, N):
+        each halving of the worst residual is about a bit, and the empty circuit is at or below 0.
+      g = 1 / (1 + 2^(-4 (phi - phi_tau))), phi_tau the text's bar (ge.tau: the influential start's phi, or every
+        family at 0.9 when lower): quality counts once the answer is faithful and fades below.
+      Q = 0.5 compact + E2g + E4x + E1: compact = log2(bits_start / bits) (raw description bits, size_bits with
+        blocks at their active contents, plus the bits charged for parts the model does not have and lines that do
+        not parse; +1 per halving against the influential start); E2g the questions answered right in agreement with
+        the answer's own circuit (e2g_term(): credit only where the FINAL line agrees with the model and the
+        circuit's own verdict under the question's intervention); E4x the share of the circuit's mechanism (each
+        node's measured pp removal effect, line_effects) explained by variables passing interchange, less the share
+        claimed by failing ones (e4x(); vs a variables.Scorer); E1 the reader's bits (e1, or reader).
+      D = softplus(2 m) / 2 with m = min(phi - phi_T, compact - compact_T) against the text's teacher circuit
+        (teacher: its JSON): near 0 unless the answer beats it on both.
+    An answer is invalid, R = V3_INVALID below every valid one, without a CIRCUIT section, a FINAL line per question
+    or an EDIT line per edit request, cut at the sampling cap or over it (truncated), or above NODE_CAP nodes.
+    Reported beside R: phi, phi_tau, g, faithful (phi >= phi_tau), bits, bits_start, compact, D, Q, each term
+    (term_E2g, term_E4x, term_E1), and goal_eval's C (term_C, c_rl as term_C_rl), F1, N, F3, the old E2 (qa_term:
+    from the no-change answer), E3, E4 (the scorer's headline), the per-question detail (qa), and C's members and
+    columns (fidelity); circuit_reward = phi + g x 0.5 compact + D (the circuit alone, for references without answers).
+    split: the draws of C's changed-input, interchange and donor families, "search" (the RL reward on training texts)
+    or "eval" (every evaluation, evaluate()); pool: the flip adversary's pattern pool (POOL; {} leaves it out); cache:
+    task -> goal_eval.Text, kept between calls."""
     import goal_eval
 
     nat = ge.nat
@@ -1500,16 +1502,19 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     ids, targets = prompt["token_ids"], prompt["target_positions"]
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
     total = sum(nat.C.values())
+    P = nat.positions(targets)
     parsed = [parse(x) for x in texts]
     graphs, defects, valid = [], [], []
     for i, p in enumerate(parsed):
         g, d = goal_eval.circuit(p["answer"], targets, nat.C, len(ids))
         graphs.append(g)
-        junk = p["malformed_nodes"] * math.log2(nat.positions(targets) * total)  # a line that does not parse: written, explains nothing
-        defects.append((d["invalid_nodes"] + p["unknown_ids"], d["invalid_edges"], dropped_bits(p["answer"], g, d, nat.positions(targets), total) + junk))
+        junk = p["malformed_nodes"] * math.log2(P * total)  # a line that does not parse: written, explains nothing
+        defects.append((d["invalid_nodes"] + p["unknown_ids"], d["invalid_edges"], dropped_bits(p["answer"], g, d, P, total) + junk))
         valid.append(p["circuit"] and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1))
-                     and all(n in p["edits"] for n in range(1, len(ev.get("edits") or []) + 1)) and not (truncated and truncated[i]))
+                     and all(n in p["edits"] for n in range(1, len(ev.get("edits") or []) + 1)) and not (truncated and truncated[i])
+                     and g.count() <= NODE_CAP)
     keep = [i for i, v in enumerate(valid) if v]  # an invalid answer's reward is fixed whatever it measures: not run
+    pool = _pool() if pool is None else pool
     if keep:
         tx = cache.get(task["id"]) if cache is not None else None
         if tx is None:
@@ -1525,56 +1530,209 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     ge.hooks = {"E1": (lambda task, g, x: bits.get(x)) if (reader is not None or e1 is not None) else None,
                 "E2": lambda task, g, x: qa_term(ev["qa"], parse(x)["finals"], tok, prompt["model_top"][0][0][0])}
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
-    c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], _pool() if pool is None else pool, mode="reward", split=split,
-                                      baseline=matched))) if keep else {}
-    w = SIZE_NOISE if size_noise is None else size_noise
-    if matched and w is None:
-        raise ValueError("the matched reward needs C's draw noise as its size weight (size_noise, or SIZE_NOISE once measured)")
+    c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], pool, mode="reward", split=split))) if keep else {}
     e4 = {i: e4_term(vs, tx, graphs[i], parsed[i]["answer"], parsed[i]["variables_malformed"], nat.C) for i in keep} if vs is not None else {}
+    e4x = {i: e4x_term(ge, tx, graphs[i], e4[i], split) for i in e4 if e4[i].get("per_variable")}
     e3 = {}
     if keep and ee is not None and ev.get("edits"):
         e3 = dict(zip(keep, edit_term(ee, task, ev["edits"], [parsed[i]["edits"] for i in keep], edit_best or {})))
-    scale = (ge.size_scale(tx) if keep else None) or ev["active"] * math.log2(nat.positions(targets) * total)
+    e2g = {i: e2g_term(ge, tx, task, parsed[i]["answer"], ev["qa"], parsed[i]["finals"]) for i in keep} if ev["qa"] else {}
+    tau = ge.tau(tx, pool, split or "search") if keep else {}
+    ref = _teacher_ref(ge, tx, teacher, pool, split, task) if keep and teacher else None
     out = []
     for i, (p, (d_nodes, d_edges, d_bits)) in enumerate(zip(parsed, defects)):
-        row, terms, size, r = row_of.get(i), {}, None, -(1.0 + size_weight)
-        circ, mean_r = r, r
-        if matched:
-            r = circ = INVALID_MATCHED
+        row, c, terms, info = row_of.get(i), c_of.get(i), {}, {}
+        r = circ = V3_INVALID
         if row is not None:
-            terms["C"] = c_of[i]["c"]
-            terms["F1"] = row[f"f1_{convention}"]  # C's point member, reported
-            terms["N"] = row[f"n_{convention}"]
-            terms["F3"] = row["f3"]
-            terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
-            terms["E2"] = row["E2"]
-            terms["E3"] = e3.get(i)
-            terms["E4"] = e4[i]["E4"] if i in e4 else None
-            have = [v for k, v in terms.items() if k not in REPORTED and v is not None]
-            e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
-            size = size_term(row["bits"] + d_bits + e_bits, scale)
-            r = mean_r = sum(have) / len(have) - size_weight * size
-            own = [terms[k] for k in ("C", "N") if terms[k] is not None]
-            circ = sum(own) / len(own) - size_weight * size
-            if matched:
-                c = c_of[i]
-                if c.get("c_rl_vpd_k") is None or c.get("n_vpd_k") is None:
-                    raise ValueError("goal_eval.vpd_baseline gives no c_rl_vpd_k or n_vpd_k: the matched reward needs both")
-                terms["C_matched"] = MATCH_CLIP * math.tanh((c["c_rl"] - c["c_rl_vpd_k"]) / MATCH_CLIP)
-                terms["N_matched"] = terms["N"] - c["n_vpd_k"]
-                circ = terms["C_matched"] + terms["N_matched"] - w * size
-                r = circ + (terms["E4"] or 0.0)
-        out.append({"reward": r, "reward_mean": mean_r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
-                    "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
+            ph, _ = goal_eval.phi({**c, "n_point": c.get("n_point", row.get(f"n_{convention}"))})
+            pt = tau.get("phi_tau")
+            b = goal_eval.size_bits(graphs[i], P, total, targets, active=tx.vpd) + d_bits
+            comp = goal_eval.compact(b, tau.get("bits_start"))
+            g = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-GATE_SLOPE * (ph - pt)))
+            terms = {"E2g": e2g[i]["E2g"] if i in e2g else None, "E4x": e4x.get(i), "E1": row["E1"]}
+            Q = 0.5 * (comp or 0.0) + sum(v for v in terms.values() if v is not None)
+            m = None if ref is None or ph is None or comp is None else min(ph - ref["phi"], comp - ref["compact"])
+            D = 0.0 if m is None else softplus(2.0 * m) / 2.0
+            r = (ph or 0.0) + (g or 0.0) * Q + D
+            circ = (ph or 0.0) + (g or 0.0) * 0.5 * (comp or 0.0) + D
+            terms |= {"C": c["c"], "C_rl": c.get("c_rl"), "F1": row[f"f1_{convention}"], "N": row[f"n_{convention}"], "F3": row["f3"],
+                      "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}
+            info = {"phi": ph, "phi_tau": pt, "g": g, "faithful": None if ph is None or pt is None else ph >= pt, "bits": b,
+                    "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,
+                    "e2g": {k: v for k, v in (e2g.get(i) or {}).items() if k != "E2g"} or None}
+        out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **info, **{f"term_{k}": v for k, v in terms.items()},
+                    "size": info.get("bits"), "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
                     "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row, "variables": e4.get(i),
                     "qa": qa_detail(ev["qa"], p["finals"], tok, prompt["model_top"][0][0][0]) if valid[i] else [],
-                    "fidelity": {k: v for k, v in (c_of.get(i) or {}).items()  # C's members and columns (s_track, context_share, ...)
-                                 if k == "c_terms" or isinstance(v, (int, float)) or v is None}})
+                    "fidelity": {k: v for k, v in (c or {}).items()  # C's members and columns (s_track, context_share, eps, ...)
+                                 if k in ("c_terms", "rl_terms") or isinstance(v, (int, float)) or v is None}})
     return out
 
 
+def _teacher_ref(ge, tx, teacher: dict, pool: dict, split: str | None, task: dict) -> dict | None:
+    """The text's teacher circuit's phi and compact (teacher dominance's reference), kept on tx."""
+    import goal_eval
+
+    kept = tx.__dict__.setdefault("_teacher_ref", {})
+    if split not in kept:
+        nat = ge.nat
+        g, _ = goal_eval.circuit(teacher, tx.targets, nat.C, tx.T)
+        row = ge.fidelity(tx, [g], pool, mode="reward", split=split)[0]
+        ph, _ = goal_eval.phi(row)
+        b = goal_eval.size_bits(g, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd)
+        comp = goal_eval.compact(b, ge.tau(tx, pool, split or "search").get("bits_start"))
+        kept[split] = None if ph is None or comp is None else {"phi": ph, "compact": comp, "bits": b}
+    return kept[split]
+
+
+_SHOWN = {}
+
+
+def _token_of(model: str, text: str) -> int | None:
+    """The token id a FINAL line's top token (shown()'s repr) names, or None."""
+    if model not in _SHOWN:
+        import mech
+
+        V = mech.tokenizer(model).get_vocab_size() if hasattr(mech.tokenizer(model), "get_vocab_size") else len(mech.tokenizer(model))
+        _SHOWN[model] = {}
+        for i, x in enumerate(token_strings(model, list(range(V)))):
+            _SHOWN[model].setdefault(shown(x), i)  # the first id of a string (a FINAL line names the string)
+    return _SHOWN[model].get(text.strip())
+
+
+def _moved_answer(answer: dict, where: list[int]) -> dict:
+    """An answer's JSON with every node's and pair's position moved by where (old -> new)."""
+    nodes = [[m, c, where[t]] for m, c, t in answer["nodes"]]
+    edges = [["pair", e[1], e[2], e[3], where[e[4]]] if e[0] == "pair" else e for e in answer["edges"]]
+    return {**answer, "nodes": nodes, "edges": edges}
+
+
+def _without_part(answer: dict, i: int) -> dict:
+    """An answer's JSON with node i removed (its edges and pairs with it)."""
+    keep = [j for j in range(len(answer["nodes"])) if j != i]
+    at = {j: k for k, j in enumerate(keep)}
+    edges = []
+    for e in answer["edges"]:
+        if e[0] == "pair":
+            if i not in (e[1], e[2]):
+                edges.append(["pair", at.get(e[1], e[1]) if e[1] != "rest" else "rest", at.get(e[2], e[2]) if e[2] != "rest" else "rest", e[3], e[4]])
+        elif i not in e:
+            edges.append([at[e[0]], "out" if e[1] == "out" else at[e[1]]])
+    return {**answer, "nodes": [answer["nodes"][j] for j in keep], "edges": edges}
+
+
+def e2g_term(ge, tx, task: dict, answer: dict, questions: list[dict], finals: dict) -> dict:
+    """E2g (the lead's 10-12): each question answered by running the answer's own circuit under its intervention
+    (goal_eval's checker): a changed token (and a copy question's changes) the circuit's path-patched run on the
+    changed text (pp_run); a moved, swapped or inserted token its run on that text (graph_ref, the circuit's positions
+    moved with the text); a removed node its run without it; a cut connection its run with that connection cut; a node
+    or connection outside the circuit no change. A question earns credit only where the FINAL line agrees with both
+    the model and the circuit: falls (half) 1 when it matches both verdicts (a fall below half of the model's top
+    token's probability), the top token (half) min(p_model(answer) / p_model(top), p_circuit(answer) / p_circuit(top))
+    in the edited runs (partial credit for a near second). {"E2g": the mean, "consistency": the share of FINAL lines
+    equal to the circuit's verdict (falls and top), "accuracy": the share right about the model, "per_question"}."""
+    import torch
+
+    import goal_eval
+    import native
+
+    nat = ge.nat
+    model = task["model"]
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    C = nat.C
+    top0 = prompt["model_top"][0][0][0]
+    top0_id = _token_of(model, shown(top0))
+    g0, _ = goal_eval.circuit(answer, targets, C, len(ids))
+    g0 = goal_eval.strand(g0, targets, C)
+    nodes = {tuple(x): j for j, x in enumerate(answer["nodes"])}
+    keyed = lambda nd: ("block", nd[0], nd[1]) if nd[2] == BLOCK else (nd[0], nd[2], nd[1])  # noqa: E731
+    with torch.no_grad():
+        base_c = ge.graph_ref(ids, targets, g0)[0, -1].float().log_softmax(-1)
+        V = base_c.shape[-1]
+        top0_id = top0_id if top0_id is not None and top0_id < V else None  # (a tiny test model's vocabulary is smaller)
+        kept = tx.__dict__.setdefault("_qa_model", {})
+        per = []
+        for n, q in enumerate(questions, 1):
+            kind = q["kind"]
+            if n not in kept:  # the model's own run under the intervention, once per text
+                if kind in ("token", "copy"):
+                    x = list(ids)
+                    for r_, z in ([(q["position"], q["new"])] if kind == "token" else q["changes"]):
+                        x[r_] = z
+                    kept[n] = nat.reference([x], targets)[0, -1]
+                elif kind in STRUCTURE:
+                    x, tg = apply_change(ids, targets, q)
+                    kept[n] = nat.reference([x], tg)[0, -1]
+                elif kind == "remove":
+                    kept[n] = nat.without(ids, targets, [tuple(q["node"])])[0, -1]
+                else:
+                    kept[n] = None  # a cut: the model's top only (goal_eval.cuts' detail)
+            lm = kept[n]
+            if kind in ("token", "copy"):
+                x = list(ids)
+                for r_, z in ([(q["position"], q["new"])] if kind == "token" else q["changes"]):
+                    x[r_] = z
+                lc = ge.pp_run(tx, x, g0)[0, -1]
+                base = None  # path-patched on the text itself is the real model
+            elif kind in STRUCTURE:
+                x, tg = apply_change(ids, targets, q)
+                gm, _ = goal_eval.circuit(_moved_answer(answer, change_map(q, len(ids))), tg, C, len(x))
+                lc = ge.graph_ref(x, tg, goal_eval.strand(gm, tg, C))[0, -1]
+                base = base_c
+            elif kind == "remove":
+                j = nodes.get(keyed(tuple(q["node"])))
+                if j is None:
+                    lc = base_c
+                else:
+                    gw, _ = goal_eval.circuit(_without_part(answer, j), targets, C, len(ids))
+                    lc = ge.graph_ref(ids, targets, goal_eval.strand(gw, targets, C))[0, -1]
+                base = base_c
+            else:
+                w, r_ = (tuple(x) if x is not None else None for x in q["edge"])
+                stated = r_ is None and w in g0.out or r_ is not None and w in g0.parents.get(r_, [])
+                lc = ge.graph_ref(ids, targets, g0, cuts={r_: [w]})[0, -1] if stated else base_c
+                base = base_c
+            lc = lc.float().log_softmax(-1)
+            ref = base if base is not None else nat.reference([ids], targets)[0, -1].float().log_softmax(-1)
+            falls_c = bool((lc[top0_id] - ref[top0_id]) / math.log(2) < -1.0) if top0_id is not None else None
+            top_c = int(lc.argmax())
+            got = finals.get(n)
+            if got is None:
+                per.append({"kind": QA_KINDS.get(kind, kind), "credit": 0.0, "consistent": False, "right": False})
+                continue
+            falls, said = got
+            said_id = _token_of(model, said)
+            said_id = said_id if said_id is not None and said_id < V else None
+            fall_credit = float(falls == q["falls"] and falls == falls_c)
+            if lm is not None:
+                lmn = lm.float().log_softmax(-1)
+                pm = 0.0 if said_id is None else float(torch.exp(lmn[said_id] - lmn.max()))
+            else:
+                pm = float(said_id == q["top"])
+            pc = 0.0 if said_id is None else float(torch.exp(lc[said_id] - lc.max()))
+            per.append({"kind": QA_KINDS.get(kind, kind), "credit": 0.5 * fall_credit + 0.5 * min(pm, pc),
+                        "consistent": falls == falls_c and said_id == top_c, "right": falls == q["falls"] and said_id == q["top"]})
+    k = max(len(per), 1)
+    return {"E2g": sum(x["credit"] for x in per) / k, "consistency": sum(x["consistent"] for x in per) / k,
+            "accuracy": sum(x["right"] for x in per) / k, "per_question": per}
+
+
+def e4x_term(ge, tx, graph, e4: dict, split: str | None) -> float | None:
+    """E4x (the lead's v3): sum over variables of (2 e4_v - 1) m_v / sum over the circuit's nodes of m, m a node's
+    measured pp removal effect (line_effects' delta_kl, its positive part), m_v the total over the variable's nodes,
+    e4_v the variable's headline (min(f on-target, s off-target), 0 unresolved): the share of the mechanism explained
+    by variables that pass interchange less the share claimed by ones that fail."""
+    le = ge.line_effects(tx, graph, mode="pp", split=split or "search")
+    m = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in le["nodes"]}
+    M = sum(m.values())
+    if M <= 0:
+        return None
+    return sum((2.0 * v["e4"] - 1.0) * sum(m.get(tuple(nd), 0.0) for nd in v["nodes"]) for v in e4["per_variable"]) / M
+
+
 def c_noise(ge, task: dict, texts: list[str], seeds: int, pool: dict | None = None, split: str = "eval") -> list[dict]:
-    """C's draw noise (the matched reward's size weight, the lead 10-12): each answer's reward-mode c and c_rl on the
+    """C's draw noise (a check on goal_eval's eps, the lead 10-12): each answer's reward-mode c and c_rl on the
     text under `seeds` seeds (the text's own and the next ones: fresh changed prompts, interchange, donor and flip
     draws), and their standard deviations across them."""
     import statistics
@@ -1694,12 +1852,10 @@ def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None
     return cands[max(range(len(cands)), key=lambda i: got[i]["reward"])]
 
 
-def target_score(r: dict, size_weight: float = SIZE_WEIGHT) -> float:
-    """A teacher candidate's score: the reward with the English and answer terms (E1, E2) held fixed, (F1 + N) / 4 -
-    size_weight x size (reward()'s row)."""
-    if not r["valid"]:
-        return r["reward"]
-    return sum(r.get(f"term_{k}") or 0.0 for k in ("F1", "N")) / 4 - size_weight * r["size"]
+def target_score(r: dict) -> float:
+    """A teacher candidate's score: reward v3's circuit alone (circuit_reward: phi, gate and compactness), the English
+    and answers left out."""
+    return r["circuit_reward"]
 
 
 def vpd_teacher(ge, task: dict, ev: dict, tokens, budget: int = ANSWER_BUDGET, cache: dict | None = None) -> tuple[dict, dict]:
@@ -2017,9 +2173,10 @@ def samples_of(spec: Path) -> dict:
     return {t: [(x, cut) for _, x, cut in sorted(v, key=lambda e: e[0])] for t, v in out.items()}
 
 
-def baseline_texts(ge, task: dict, sizes: list[int]) -> dict:
-    """name -> answer text of the search-free baselines, each with every connection the model has among its nodes
-    stated: "empty", and "vpd@k", VPD's first k active subcomponents in its order (Native._vpd_order) for each k."""
+def baseline_texts(ge, task: dict, sizes: list[int], tx=None) -> dict:
+    """name -> answer text of the search-free baselines, node sets claiming every connection and token edge among their
+    nodes: "empty", "vpd@k", VPD's first k active subcomponents in its order (Native._vpd_order) for each k, and with tx
+    "start", the influential start set (goal_eval.start_set on the eval split: reward v3's reference for compactness)."""
     import goal_eval
     import native
 
@@ -2029,9 +2186,9 @@ def baseline_texts(ge, task: dict, sizes: list[int]) -> dict:
     order = ge.nat._vpd_order(ids, targets)
     for k in sorted(set(sizes)):
         if k > 0:
-            nodes = set(order[:k])
-            par, outs = native.all_edges(nodes, targets)
-            out[f"vpd@{k}"] = render(goal_eval.to_json(native.Graph(nodes, par, outs)))
+            out[f"vpd@{k}"] = render(goal_eval.to_json(native.Graph(set(order[:k]), complete=True)))
+    if tx is not None:
+        out["start"] = render(goal_eval.to_json(ge.start_set(tx, "eval")["graph"]))
     return out
 
 
@@ -2055,8 +2212,7 @@ def references(ge, rows: Path, teacher_dir: Path, out: Path, edits: dict | None 
         prompt = task["prompts"][0]
         k = sum(m != TOK for m, _, _ in json.loads(f.read_text())["nodes"])
         nodes = set(ge.nat._vpd_order(prompt["token_ids"], prompt["target_positions"])[:k])
-        par, outs = native.all_edges(nodes, prompt["target_positions"])
-        for name, answer in (("vpd_complete", goal_eval.to_json(native.Graph(nodes, par, outs))),
+        for name, answer in (("vpd_complete", goal_eval.to_json(native.Graph(nodes, complete=True))),
                              ("vpd_pruned", json.loads(p.read_text()) if (p := teacher_dir / f"{r['task']}.vpd_top{k}.edges.json").exists() else None)):
             if answer is not None:
                 (out / name).mkdir(parents=True, exist_ok=True)
@@ -2084,7 +2240,7 @@ def _paired(a: list, b: list) -> dict:
 
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
-             matched: bool = False, size_noise: float | None = None) -> dict:
+             teachers: dict | None = None) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -2096,11 +2252,11 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
     figure is also reported for local and non-local texts apart. diagnostics: structure() of each first sample (a
     second disjoint circuit, minimality), costly. matched_all: VPD's answer at every sample's node count, not only the
     first's, so each sample is compared with VPD at its own size (verify-and-pick: whether any of N beats it on C).
-    The baselines' C and N are kept beside their circuit reward ("baseline_terms"). matched (size_noise): every answer's
-    reward is the RL v2 matched reward (reward(matched)), its mean reward kept as "reward_mean"."""
+    The baselines' C and N are kept beside their circuit reward ("baseline_terms"). teachers: task -> the text's teacher
+    circuit (JSON), reward v3's teacher-dominance reference."""
     import native
 
-    invalid = -(1.0 + SIZE_WEIGHT)
+    invalid = V3_INVALID
     per = {s: [] for s in sets}
     base, base_terms = {}, {}
     for p in native.tasks(split)[:n]:
@@ -2116,7 +2272,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
             cache = {}
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
-                            ee=ee, edit_best=edit_best, vs=vs, split="eval", matched=matched, size_noise=size_noise)
+                            ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -2127,7 +2283,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                 entry["structure"] = structure(ge, cache[task["id"]], g, ge.nat._vpd_order(prompt["token_ids"], prompt["target_positions"]))
             per[name].append(entry)
         sizes = [y.get("nodes") or 0 for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1])]
-        names = baseline_texts(ge, task, sizes)
+        names = baseline_texts(ge, task, sizes, cache.get(task["id"]))
         for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()), split="eval")):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
             base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N")}
@@ -2151,9 +2307,13 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, b
             continue
         first = [q["samples"][0] for q in qs]
         terms = sorted({k for f in first for k in f if k.startswith("term_")})
+        ok = [f for f in first if f["valid"]]
         report[name] = {
             "questions": len(qs), "valid": sum(f["valid"] for f in first) / max(len(first), 1),
             "reward": sum(f["reward"] for f in first) / max(len(first), 1),
+            **{f"v3 {k}": (sum(float(f[k]) for f in ok if f.get(k) is not None) / max(sum(f.get(k) is not None for f in ok), 1)
+                           if any(f.get(k) is not None for f in ok) else None)
+               for k in ("phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q")},
             **{k[5:]: _mean_counting_invalid(first, k) for k in terms},
             "size": sum((f.get("size") or 0.0) for f in first if f["valid"]) / max(sum(f["valid"] for f in first), 1),
             "dropped_edges": sum(f.get("dropped_edges", 0) for f in first) / max(len(first), 1),
@@ -2286,7 +2446,7 @@ def main():
     d.add_argument("--english", type=Path, help="tinker_train.py explain output: each text's chosen explanation")
     d.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (the edit teacher's edits)")
     d.add_argument("--variables", type=Path, help="a directory of <task>.json, {\"variables\": [...]} (variables.py's JSON, meanings written)")
-    nz = sub.add_parser("noise", help="C's draw noise per answer (c_noise()): the matched reward's size weight")
+    nz = sub.add_parser("noise", help="C's draw noise per answer (c_noise()): a check on goal_eval's eps")
     nz.add_argument("split", choices=("train", "heldout", "hard"))
     nz.add_argument("rows", type=Path)
     nz.add_argument("--set", action="append", default=[], help="NAME=SAMPLES: each text's first answer")
@@ -2305,8 +2465,7 @@ def main():
     s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (scored with net): the best net per goal (E3)")
     s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
     s.add_argument("--matched-all", action="store_true", help="VPD at every sample's node count (verify-and-pick against VPD@matched)")
-    s.add_argument("--matched", action="store_true", help="the RL v2 matched reward (reward(matched)) as each answer's reward")
-    s.add_argument("--size-noise", type=float, help="the matched reward's size weight (C's draw noise; SIZE_NOISE by default)")
+    s.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json): reward v3's teacher-dominance reference")
     args = ap.parse_args()
     import goal_eval
     import native
@@ -2539,8 +2698,9 @@ def main():
         import variables
 
         vs = variables.Scorer(ge)
+    teachers = {f.stem: json.loads(f.read_text()) for t in rows if (f := args.teacher / f"{t}.json").exists()} if args.teacher else None
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
-                   matched_all=args.matched_all, matched=args.matched, size_noise=args.size_noise)
+                   matched_all=args.matched_all, teachers=teachers)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

@@ -34,18 +34,25 @@ Score (EditEval.score_many), in bits, on data the teacher's search never used:
               attained at D <= (1 - GOAL) D0. behaviour: each fresh instance's flip progress on its copied token,
               averaged; attained when a share GOAL of the instances no longer predicts the copied token
   success     progress over the best progress known for the goal (best=, the teacher's); progress itself without one
+  goal_bits   the goal reached in bits, at most the goal: flip, raise: progress x the log2 margin to cross; detach:
+              D0 - max(D, (1 - GOAL) D0), the dependence removed in KL bits; behaviour: the instances' mean flip goal_bits
+  net         goal_bits - collateral; net_best the best net known for the goal (best_net=, bests()), None without one
   collateral  the KL of the edited model from the model on what the goal does not ask to change, summed per text: the
               text's other positions and, at the target, the distribution over the tokens the goal does not name
               (renormalized; detach and behaviour name none but the copied token); persistent edits add the mean summed
               KL of HELD Pile texts (rows HELD_ROWS, HELD_LEN tokens), behaviour the mean over fresh instances
   size        description bits: per operation its form (2 bits), each node a choice among the subcomponents (or the
               native units) and, at a position, among the text's positions; a scale other than 0 SCALE_BITS more
+              (op_bits: each operation's)
 
-  edit_eval.py goals --split heldout --n 20 OUT.jsonl            each text's goals (seed: native.task_seed; --fresh: + 1)
-  edit_eval.py teach GOALS.jsonl OUT.jsonl [--teacher DIR ...]   the edit teacher and the baselines on each goal
+  edit_eval.py goals OUT.jsonl --split heldout --n 20 [--tasks FILE] [--fresh]   each text's goals (seed: native.task_seed;
+                                                                                  --fresh: + 1)
+  edit_eval.py teach GOALS.jsonl OUT.jsonl [--offset K --stride S] [--teacher-only]   the edit teacher (and the baselines)
+                                                                                  on each goal no teach_*.jsonl beside OUT holds
   edit_eval.py copy OUT.json                                     the persistent copy goal: teacher and baselines
   edit_eval.py tokens                                            HELD_ROWS and COPY's rows from the Pile (TOKENS)
   edit_eval.py table OUT.jsonl [COPY.json]                       the report's means
+  edit_eval.py rescore OUT.jsonl NEW.jsonl                       teach rows' edits scored again by the current scorer
 
 The edit teacher (teach()) is a measured greedy search over candidate edits from the teacher's circuits (goal_eval JSON
 files, TEACHER_DIRS) and VPD's most important subcomponents: each round adds the candidate that moves the goal most
@@ -118,6 +125,11 @@ def unit_count(nat) -> dict:
 
 def size_bits(nat, ops: list[dict], T: int) -> float:
     """An edit's description bits (module docstring)."""
+    return sum(op_bits(nat, ops, T))
+
+
+def op_bits(nat, ops: list[dict], T: int) -> list[float]:
+    """Each operation's description bits (module docstring)."""
     subs = math.log2(sum(nat.C.values()))
     units = unit_count(nat)
     pos = math.log2(T)
@@ -129,16 +141,17 @@ def size_bits(nat, ops: list[dict], T: int) -> float:
             return pos
         return subs + (pos if nd[1] is not None else 0.0)
 
-    bits = 0.0
+    out = []
     for o in ops:
-        bits += FORM_BITS
+        bits = FORM_BITS
         if o["op"] == "cut":
             bits += node(o["reader"]) + node(o["writer"])
         elif o["op"] == "scale":
             bits += node(o["node"]) + 1 + (SCALE_BITS if o["k"] != 0 else 0)
         elif o["op"] == "unit":
             bits += math.log2(units[o["kind"]]) + (pos if o["position"] is not None else 0.0) + 1 + (SCALE_BITS if o["k"] != 0 else 0)
-    return bits
+        out.append(bits)
+    return out
 
 
 def check(ops: list[dict], T: int, targets: list[int], behaviour: bool = False) -> str | None:
@@ -470,13 +483,14 @@ class EditEval:
     """Scores edits on goals (module docstring). best: goal key (key()) -> the best progress known (success's
     scale)."""
 
-    def __init__(self, nat=None, best: dict | None = None, chunk: int = CHUNK):
+    def __init__(self, nat=None, best: dict | None = None, chunk: int = CHUNK, best_net: dict | None = None):
         import goal_eval
 
         self.nat = nat or native.Native()
         self.ge = goal_eval.GoalEval(self.nat)
         self.ed = Editor(self.nat, keep=8)
         self.best = best or {}
+        self.best_net = best_net or {}
         self.chunk = chunk
         self._refs: dict = {}
         self._alts: dict = {}
@@ -616,7 +630,7 @@ class EditEval:
         p = task["prompts"][0]
         ids, targets = p["token_ids"], p["target_positions"]
         T = len(ids)
-        rows = [{"valid": False, "why": check(ops, T, targets), "size": size_bits(self.nat, ops, T)} for ops in edits]
+        rows = [self._row(ops, check(ops, T, targets), T) for ops in edits]
         ok = [b for b, r in enumerate(rows) if r["why"] is None]
         if not ok:
             return rows
@@ -633,20 +647,31 @@ class EditEval:
             prog = []
             for _, m, _ in terms:
                 m = sign * m
-                prog.append((min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, m < 0, m))
+                prog.append((min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, m < 0, m, max(0.0, min(m0, m0 - m))))
         else:  # detach
             alts = self.alternatives(ids, goal["position"], SEARCH_RANKS if search else SCORE_RANKS)
             d0 = self._dependence(ids, alts, t, [[]], [lp[t]])[0]
             scale = math.log2(1 / (1 - GOAL))
-            prog = [(min(1.0, max(0.0, math.log2(d0 / max(d, 1e-12)) / scale)) if d0 > 0 else 1.0, d <= (1 - GOAL) * d0, d)
+            prog = [(min(1.0, max(0.0, math.log2(d0 / max(d, 1e-12)) / scale)) if d0 > 0 else 1.0, d <= (1 - GOAL) * d0, d,
+                     max(0.0, d0 - max(d, (1 - GOAL) * d0)))
                     for d in self._dependence(ids, alts, t, eds, [x[2] for x in terms])]
         key = self.key(task["id"], goal)
-        for b, (coll, _, _), h, (g, att, raw) in zip(ok, terms, held, prog):
-            best = max(self.best.get(key, 0.0), g)
-            rows[b].update({"valid": True, "attained": bool(att), "progress": g, "success": g / best if best > 0 else 0.0,
-                            "collateral": coll + h, "collateral_text": coll, "collateral_held": h,
+        for b, (coll, _, _), h, (g, att, raw, gb) in zip(ok, terms, held, prog):
+            rows[b].update({"valid": True, "attained": bool(att), "progress": g, "collateral_text": coll, "collateral_held": h,
                             ("dependence" if goal["kind"] == "detach" else "margin"): raw})
+            self._finish(rows[b], key, gb, coll + h)
         return rows
+
+    def _row(self, ops: list[dict], why: str | None, T: int) -> dict:
+        bits = op_bits(self.nat, ops, T)
+        return {"valid": False, "why": why, "size": sum(bits), "op_bits": bits}
+
+    def _finish(self, row: dict, key: str, goal_bits: float, collateral: float) -> None:
+        """A valid row's goal and net bits (module docstring) and success against the best known for its goal."""
+        best = max(self.best.get(key, 0.0), row["progress"])
+        net = goal_bits - collateral
+        row.update({"success": row["progress"] / best if best > 0 else 0.0, "goal_bits": goal_bits, "collateral": collateral,
+                    "collateral_bits": collateral, "net": net, "net_best": self.best_net.get(key)})
 
     def score(self, task: dict, goal: dict, ops: list[dict]) -> dict:
         return self.score_many(task, goal, [ops])[0]
@@ -657,7 +682,7 @@ class EditEval:
         first, second = copy_instances()
         half = first[:COPY_SEARCH] if search else second
         T = max(len(c["ids"]) for c in half)
-        rows = [{"valid": False, "why": check(ops, T, [T - 1], behaviour=True), "size": size_bits(self.nat, ops, T)} for ops in edits]
+        rows = [self._row(ops, check(ops, T, [T - 1], behaviour=True), T) for ops in edits]
         ok = [b for b, r in enumerate(rows) if r["why"] is None]
         if not ok:
             return rows
@@ -678,8 +703,9 @@ class EditEval:
             kept = (kl.sum(1) - kl[:, t] + rest).tolist()
             drop = (lq[:, t, w] - lp[t, w]).tolist()
             top = (lq[:, t].argmax(-1) == c["actual"]).tolist()
-            return [{"progress": min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, "flipped": m < 0, "halved": d <= -LN2,
-                     "rest": r, "actual_top": a, "kept": k} for m, d, r, a, k in zip(ms, drop, rest.tolist(), top, kept)]
+            return [{"progress": min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, "goal_bits": max(0.0, min(m0, m0 - m)),
+                     "flipped": m < 0, "halved": d <= -LN2, "rest": r, "actual_top": a, "kept": k}
+                    for m, d, r, a, k in zip(ms, drop, rest.tolist(), top, kept)]
         per = self._runs(seqs, es, fn, ref=True)
         held = self._held_terms("search" if search else "held", eds)
         key = self.key("copy", goal)
@@ -688,13 +714,31 @@ class EditEval:
             rs = per[j * n:(j + 1) * n]
             g = sum(r["progress"] for r in rs) / n
             flipped = sum(r["flipped"] for r in rs) / n
-            best = max(self.best.get(key, 0.0), g)
             kept = sum(r["kept"] for r in rs) / n
-            rows[b].update({"valid": True, "attained": flipped >= GOAL, "progress": g, "success": g / best if best > 0 else 0.0,
+            rows[b].update({"valid": True, "attained": flipped >= GOAL, "progress": g,
                             "flipped": flipped, "halved": sum(r["halved"] for r in rs) / n,
                             "actual_top": sum(r["actual_top"] for r in rs) / n, "rest": sum(r["rest"] for r in rs) / n,
-                            "collateral": held[j] + kept, "collateral_held": held[j], "collateral_instances": kept})
+                            "collateral_held": held[j], "collateral_instances": kept})
+            self._finish(rows[b], key, sum(r["goal_bits"] for r in rs) / n, held[j] + kept)
         return rows
+
+
+def bests(paths) -> tuple[dict, dict]:
+    """(goal key -> best progress, goal key -> best net) over the scored edits of teach rows (teacher, native units,
+    VPD's top-k) in the jsonl files at paths."""
+    prog, net = {}, {}
+    for p in paths:
+        for line in Path(p).read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            key = EditEval.key(r["task"], r["goal"])
+            for s in [r["teacher"]["score"], r["units"]["score"]] + [x["score"] for x in r.get("vpd_topk", [])]:
+                if s and s.get("valid"):
+                    prog[key] = max(prog.get(key, 0.0), s["progress"])
+                    if "net" in s:
+                        net[key] = max(net.get(key, -math.inf), s["net"])
+    return prog, net
 
 
 def _persistent(o: dict) -> bool:
@@ -890,18 +934,20 @@ def vpd_topk(ee: EditEval, task: dict, sizes) -> list[tuple[int, list[dict]]]:
 SIZES = (1, 2, 4, 8, 16, 32, 64)
 
 
-def teach_goal(ee: EditEval, task: dict, goal: dict, log=print) -> dict:
-    """One goal: the edit teacher, the native-unit search and VPD's top-k, each scored on the score's data."""
+def teach_goal(ee: EditEval, task: dict, goal: dict, log=print, baselines: bool = True) -> dict:
+    """One goal: the edit teacher and (baselines) the native-unit search and VPD's top-k, each scored on the score's
+    data."""
     t0 = time.perf_counter()
     score = lambda eds: ee.score_many(task, goal, eds, search=True)  # noqa: E731
-    out = {"task": task["id"], "goal": goal}
-    for name, pool in (("teacher", candidates(ee, task, goal)), ("units", unit_candidates(ee, task, goal))):
+    out = {"task": task["id"], "goal": goal, "units": {"ops": [], "edit": [], "score": None}}
+    methods = [("teacher", candidates(ee, task, goal))] + ([("units", unit_candidates(ee, task, goal))] if baselines else [])
+    for name, pool in methods:
         log(f"{task['id']} {goal['kind']} {name}: {len(pool)} candidates")
         res = search(score, pool, log=log)
         row = ee.score(task, goal, res["ops"]) if res["ops"] else None
         out[name] = {"ops": [op_text(o) for o in res["ops"]], "edit": [_jsonable(o) for o in res["ops"]], "search": res["row"],
                      "score": row, "rounds": res["rounds"], "evaluated": res["evaluated"]}
-    if ee.nat.has_importance:
+    if ee.nat.has_importance and baselines:
         k_teacher = len(out["teacher"]["ops"])
         sizes = sorted(set(SIZES) | ({k_teacher} if k_teacher else set()))
         tops = vpd_topk(ee, task, sizes)
@@ -993,7 +1039,12 @@ def teach_copy(ee: EditEval, log=print, screen_n: int = 16) -> dict:
 # ---- command line
 
 
-def _tasks(split: str, n: int) -> list[dict]:
+def _tasks(split: str, n: int, listed: str | None = None) -> list[dict]:
+    """The first n texts of split, or (listed) those a file names (one id per line, or jsonl rows with "task")."""
+    if listed:
+        ids = [x.strip() for x in Path(listed).read_text().splitlines() if x.strip()]
+        ids = [json.loads(x)["task"] if x.startswith("{") else x for x in ids]
+        return [json.loads((native.TEXTS / "vpd4l" / f"{i}.json").read_text()) for i in ids[:n]]
     return [json.loads(p.read_text()) for p in native.tasks(split)[:n]]
 
 
@@ -1006,13 +1057,18 @@ def main():
     g.add_argument("--split", default="heldout")
     g.add_argument("--n", type=int, default=20)
     g.add_argument("--fresh", action="store_true")
+    g.add_argument("--tasks", help="the texts a file names (one id per line, or jsonl rows with \"task\") in place of the split's")
     t = sub.add_parser("teach")
     t.add_argument("goals")
+    t.add_argument("--teacher-only", action="store_true", help="no baselines (SFT targets)")
     t.add_argument("out")
     t.add_argument("--offset", type=int, default=0)
     t.add_argument("--stride", type=int, default=1)
     c = sub.add_parser("copy")
     c.add_argument("out")
+    r = sub.add_parser("rescore")
+    r.add_argument("rows")
+    r.add_argument("out")
     b = sub.add_parser("table")
     b.add_argument("rows")
     b.add_argument("copy", nargs="?")
@@ -1025,7 +1081,7 @@ def main():
     ee = EditEval()
     if args.cmd == "goals":
         with open(args.out, "w") as f:
-            for task in _tasks(args.split, args.n):
+            for task in _tasks(args.split, args.n, args.tasks):
                 for gl in goals(ee, task, native.task_seed(task["id"]) + (1 if args.fresh else 0)):
                     f.write(json.dumps({"task": task["id"], "split": args.split, "goal": gl}) + "\n")
                 print(task["id"], flush=True)
@@ -1041,9 +1097,23 @@ def main():
                 continue
             if r["task"] not in tasks:
                 tasks = {r["task"]: json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())}
-            res = teach_goal(ee, tasks[r["task"]], r["goal"], log=lambda s: print(s, flush=True))
+            res = teach_goal(ee, tasks[r["task"]], r["goal"], log=lambda s: print(s, flush=True), baselines=not args.teacher_only)
             with open(args.out, "a") as f:
                 f.write(json.dumps(res) + "\n")
+    elif args.cmd == "rescore":
+        with open(args.out, "w") as f:
+            for line in Path(args.rows).read_text().splitlines():
+                r = json.loads(line)
+                task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+                for m in ("teacher", "units"):
+                    if r[m]["edit"]:
+                        r[m]["score"] = ee.score(task, r["goal"], [_from_json(o) for o in r[m]["edit"]])
+                if r.get("vpd_topk"):
+                    tops = dict(vpd_topk(ee, task, [x["k"] for x in r["vpd_topk"]]))
+                    for x, row in zip(r["vpd_topk"], ee.score_many(task, r["goal"], [tops[x["k"]] for x in r["vpd_topk"]])):
+                        x["score"] = row
+                f.write(json.dumps(r) + "\n")
+                print(r["task"], r["goal"]["kind"], flush=True)
     elif args.cmd == "copy":
         res = teach_copy(ee, log=lambda s: print(s, flush=True))
         Path(args.out).write_text(json.dumps(res, indent=1))

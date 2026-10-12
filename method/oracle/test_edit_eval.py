@@ -191,6 +191,9 @@ def test_score_fields(tiny):
         assert r["valid"] and 0.0 <= r["progress"] <= 1.0 and r["collateral"] >= -1e-6
         assert r["attained"] == (r["margin"] < 0)
         assert abs(r["progress"] - min(1.0, max(0.0, (m0 - r["margin"]) / m0))) < 1e-6
+        assert abs(r["goal_bits"] - max(0.0, min(m0, m0 - r["margin"]))) < 1e-6
+        assert abs(r["net"] - (r["goal_bits"] - r["collateral"])) < 1e-9 and r["collateral_bits"] == r["collateral"]
+        assert abs(sum(r["op_bits"]) - r["size"]) < 1e-9 and r["net_best"] is None
         persistent = ops[0].get("persistent")
         assert (r["collateral_held"] > 0) == bool(persistent)
         lq = run(nat, ids, ops)
@@ -244,6 +247,7 @@ def test_detach_dependence(tiny):
     want = min(1.0, max(0.0, math.log2(d0 / d) / math.log2(1 / (1 - edit_eval.GOAL))))
     assert abs(r["progress"] - want) < 1e-3
     assert r["attained"] == (d <= (1 - edit_eval.GOAL) * d0)
+    assert abs(r["goal_bits"] - max(0.0, d0 - max(d, (1 - edit_eval.GOAL) * d0))) < 1e-4
 
 
 def test_frontier_takes_progress_per_collateral():

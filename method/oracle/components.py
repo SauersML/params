@@ -402,7 +402,8 @@ def qa_questions(nat, task: dict, ci: dict, positions: list[int], seed: int, per
                  nodes: list | None = None) -> list[dict]:
     """Intervention questions on a text with the model's measured answers: a token replaced by one of the model's
     alternatives there (ranks 0 to QA_RANKS - 1, at any position before the target), one VPD-active subcomponent
-    removed (Native.without; at F2's positions and the targets), one connection cut (cuts: goal_eval.GoalEval.cuts with
+    removed (Native.without; at F2's positions and the targets), a change of the text's order around its influential
+    positions (structure_changes(): a token moved, a copy inserted earlier, two swapped), one connection cut (cuts: goal_eval.GoalEval.cuts with
     detail on the text, whole-model path patching; among `nodes`, the question's listed subcomponents, the connections
     the model has), and, for a text that copies, changes probing the copy (copy_questions()). Each: {"kind", the
     intervention ("position", "new" | "node" | "edge" | "family", "changes"), "falls": whether the probability of the model's top next token falls below half of what it is, "top": the
@@ -440,6 +441,11 @@ def qa_questions(nat, task: dict, ci: dict, positions: list[int], seed: int, per
             pool["remove"].append(outcome(nat.without(ids, targets, [nd]), kind="remove", node=list(nd),
                                           ci=float(ci[nd[0]][nd[1], nd[2]])))
     pool["copy"] = copy_questions(nat, ids, targets, top, rng, outcome)
+    pool["order"] = []
+    for ch in structure_changes(ids, targets, positions, rng):
+        x, tg = apply_change(ids, targets, ch)
+        with torch.no_grad():
+            pool["order"].append(outcome(nat.reference([x], tg), **ch))
     if cuts is not None and nodes:
         import native
 
@@ -461,6 +467,30 @@ def qa_questions(nat, task: dict, ci: dict, positions: list[int], seed: int, per
         out += yes[:k_yes] + no[:per_kind - k_yes]
     rng.shuffle(out)
     return out
+
+
+def structure_questions(nat, task: dict, positions: list[int], seed: int, per_kind: int = QA_PER_KIND) -> list[dict]:
+    """The oracle's structural questions on a text with existing rows (qa_questions' "order" kind alone): per_kind of
+    structure_changes() drawn by seed, measured, half whose answer is "falls" where the text has them."""
+    import torch
+
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    rng = random.Random(seed)
+    with torch.no_grad():
+        top, lp0 = _top(nat.reference([ids], targets))
+        pool = []
+        for ch in structure_changes(ids, targets, positions, rng):
+            x, tg = apply_change(ids, targets, ch)
+            lp = nat.reference([x], tg)
+            bits = (float(lp[0, -1, top]) - lp0) / math.log(2)
+            pool.append({**ch, "falls": bits < -1.0, "top": _top(lp)[0], "bits": bits})
+    yes = [q for q in pool if q["falls"]]
+    no = [q for q in pool if not q["falls"]]
+    rng.shuffle(yes)
+    rng.shuffle(no)
+    k_yes = min(len(yes), max(per_kind // 2, per_kind - len(no)))
+    return yes[:k_yes] + no[:per_kind - k_yes]
 
 
 def copy_questions(nat, ids: list[int], targets: list[int], top: int, rng, outcome) -> list[dict]:
@@ -505,9 +535,61 @@ def copy_questions(nat, ids: list[int], targets: list[int], top: int, rng, outco
     return out
 
 
+STRUCTURE = ("move", "swap", "insert")  # the changes of order structure_changes() draws
+
+
+def apply_change(ids: list[int], targets: list[int], ch: dict) -> tuple[list[int], list[int]]:
+    """A text and its targets after a structural change: "move" takes the token at "position" out and puts it back so
+    it ends at "to" (the tokens between shift by one; the targets stay); "swap" exchanges the tokens at "position" and
+    "with"; "insert" writes a copy of the token at "position" at "at" (earlier in the text), every later token and the
+    targets one further on."""
+    p = ch["position"]
+    if ch["kind"] == "move":
+        x = ids[:p] + ids[p + 1:]
+        return x[:ch["to"]] + [ids[p]] + x[ch["to"]:], list(targets)
+    if ch["kind"] == "swap":
+        x = list(ids)
+        x[p], x[ch["with"]] = x[ch["with"]], x[p]
+        return x, list(targets)
+    return ids[:ch["at"]] + [ids[p]] + ids[ch["at"]:], [t + 1 for t in targets]
+
+
+def change_text(ch: dict, strings: list[str]) -> str:
+    """A structural change in words (the original text's positions and tokens)."""
+    p = ch["position"]
+    if ch["kind"] == "move":
+        return f"the token at position {p}, {strings[p]!r}, were moved to position {ch['to']} (the tokens between shifting by one)"
+    if ch["kind"] == "swap":
+        return f"the tokens at positions {p} ({strings[p]!r}) and {ch['with']} ({strings[ch['with']]!r}) were swapped"
+    return (f"a copy of the token at position {p}, {strings[p]!r}, were inserted at position {ch['at']}, before "
+            f"{strings[ch['at']]!r} (every later token shifting by one)")
+
+
+def structure_changes(ids: list[int], targets: list[int], positions: list[int], rng, each: int = 2) -> list[dict]:
+    """Changes of the text's order around its influential context positions (positions, most influential first: F2's):
+    the most influential token moved elsewhere (at least 3 positions away), a copy of it inserted earlier in the text,
+    and two of the four most influential tokens (different ones) swapped; up to `each` of every kind, drawn by rng.
+    Where a mechanism reads a position, a move or an insertion changes what it finds there; where it reads a token
+    wherever it is, they do not."""
+    t = max(targets)
+    ctx = [p for p in positions if 0 < p < t]
+    out = []
+    if ctx:
+        p = ctx[0]
+        far = [q for q in range(1, t) if abs(q - p) >= 3]
+        out += [{"kind": "move", "position": p, "to": q} for q in rng.sample(far, min(each, len(far)))]
+        early = list(range(1, p))
+        out += [{"kind": "insert", "position": p, "at": q} for q in rng.sample(early, min(each, len(early)))]
+    pairs = [(a, b) for i, a in enumerate(ctx[:4]) for b in ctx[i + 1:4] if ids[a] != ids[b]]
+    out += [{"kind": "swap", "position": a, "with": b} for a, b in rng.sample(pairs, min(each, len(pairs)))]
+    return out
+
+
 def qa_text(q: dict, n: int, strings: list[str], top: str, tokens_of) -> str:
     """Question n in words."""
-    if q["kind"] == "token":
+    if q["kind"] in STRUCTURE:
+        what = change_text(q, strings)
+    elif q["kind"] == "token":
         what = f"the token at position {q['position']}, {strings[q['position']]!r}, were replaced by {tokens_of([q['new']])[0]!r}"
     elif q["kind"] == "copy" and len(q["changes"]) == 1:
         (r, z), = q["changes"]
@@ -708,6 +790,25 @@ def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=N
             "wiring": {str(p): wires[p] for p in where}, "switch_on": switched, "qa": qa, "active": active}
 
 
+def structure_events(nat, task: dict, positions: list[int], seed: int) -> list[dict]:
+    """The English reader's structural events (structure_changes() drawn by seed, another draw than the oracle's
+    questions): each change's measured effect on the model's most likely next token, as units.events records a changed
+    token ("down", "weight" its |log2 ratio| capped at 4 bits, "bits"), with the change in words ("change")."""
+    import torch
+
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    strings = token_strings(task["model"], ids)
+    with torch.no_grad():
+        top, lp0 = _top(nat.reference([ids], targets))
+        out = []
+        for ch in structure_changes(ids, targets, positions, random.Random(seed)):
+            x, tg = apply_change(ids, targets, ch)
+            bits = (float(nat.reference([x], tg)[0, -1, top]) - lp0) / math.log(2)
+            out.append({**ch, "change": change_text(ch, strings), "down": bits < 0, "weight": min(4.0, abs(bits)), "bits": bits})
+    return out
+
+
 def windows(task: dict, ev: dict, radius: int = WINDOW) -> set[int]:
     """The positions a question numbers: within radius of the first position and of each position its evidence names (the listed positions,
     whose relays sit just after them, the targets, every subcomponent, switch-on and wiring position, every
@@ -721,7 +822,8 @@ def windows(task: dict, ev: dict, radius: int = WINDOW) -> set[int]:
     named |= {nd[1] for cs in ev.get("switch_on", {}).values() for nd, _ in cs}
     named |= {nd[1] for ws in ev["wiring"].values() for w, r, _ in ws for nd in (w, r)}
     for q in ev["qa"]:
-        named |= ({q["position"]} if q["kind"] == "token" else {q["node"][1]} if q["kind"] == "remove"
+        named |= ({q[k] for k in ("position", "to", "with", "at") if k in q} if q["kind"] in STRUCTURE
+                  else {q["position"]} if q["kind"] == "token" else {q["node"][1]} if q["kind"] == "remove"
                   else {nd[1] for nd in q["edge"] if nd is not None} if q["kind"] == "cut" else {r for r, _ in q["changes"]})
     strings = token_strings(task["model"], ids)
     top = p["model_top"][0][0][0]
@@ -844,10 +946,11 @@ def english(text: str) -> str:
 
 def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None]:
     """Each answer's E1: the bits its escaped English saves the frozen reader on the text's reader events
-    (units.reader_events: other positions and the listed positions' second tokens, never the oracle's evidence)."""
+    (units.reader_events: other positions and the listed positions' second tokens, never the oracle's evidence; and the
+    text's structural events, structure_events())."""
     import units
 
-    return reader.bits(task, [escape(english(x)) for x in texts], units.reader_events(ev["events"]))
+    return reader.bits(task, [escape(english(x)) for x in texts], units.reader_events(ev["events"]) + ev.get("structure", []))
 
 
 def size_term(bits: float, scale: float) -> float:
@@ -1569,6 +1672,10 @@ def main():
                     help="JSONL rows with task and goal (edit_eval.py goals or teach output): these goals, not drawn again. A "
                          "detach goal's position is drawn from goal_eval's F2 positions, which move with goal_eval's version "
                          "and device, so a drawn goal can miss the edit teacher's")
+    st = sub.add_parser("structure", help="the rows with structural questions (structure_changes(), about 1 in 4 of the questions) and reader events")
+    st.add_argument("rows", type=Path)
+    st.add_argument("out", type=Path)
+    st.add_argument("--qa-seed", type=int, default=0, help="added to each text's seed (the oracle's draw; the reader's is one further)")
     rq = sub.add_parser("requestion", help="the same rows with a fresh set of intervention questions (only they are measured)")
     rq.add_argument("rows", type=Path)
     rq.add_argument("out", type=Path)
@@ -1751,6 +1858,19 @@ def main():
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
                 f.flush()
                 print(r["task"], [g["kind"] for g in r["edits"]], flush=True)
+        return
+    if args.cmd == "structure":
+        with args.out.open("w") as f:
+            for r in map(json.loads, args.rows.read_text().splitlines()):
+                task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+                seed = native.task_seed(task["id"]) + args.qa_seed
+                r["qa"] = [q for q in r["qa"] if q["kind"] not in STRUCTURE] + structure_questions(nat, task, r["positions"], seed)
+                random.Random(seed).shuffle(r["qa"])
+                r["structure"] = structure_events(nat, task, r["positions"], seed + 1)
+                f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
+                f.flush()
+                print(r["task"], sum(q["kind"] in STRUCTURE for q in r["qa"]), "of", len(r["qa"]), "questions structural;",
+                      len(r["structure"]), "reader events", flush=True)
         return
     if args.cmd == "requestion":
         with args.out.open("w") as f:

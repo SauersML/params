@@ -5,7 +5,8 @@ and its comment lines, numbered as steps). For each of the verifier's events (sc
 gives its probability that the model's probability of its most likely next token goes down (or, for an event marked
 "half", falls below half): when one token is replaced, when one token is replaced while one of the answer's steps is held
 at its values on the original text, and when one layer's attention at the predicted position is kept from reading one
-position (an internal edit: what the mechanism is, beyond what the text changes do). The English
+position (an internal edit: what the mechanism is, beyond what the text changes do), and when the text's order changes
+(a token moved, a copy of it inserted, two swapped: an event's "change" in words). The English
 scores the bits it saves: the reader's importance-weighted mean log loss, in bits, on what the model actually does
 without the English minus with it. English that says how the prediction depends on the text, and what each step
 carries, saves bits; vague English saves none; wrong English costs. No judge grades style, and the answer never chooses
@@ -31,6 +32,9 @@ CUT = ("A language model reads this text (its tokens, by position) and predicts 
        "most likely next token is {top}.\ntokens = {tokens}\n\n{english}"
        "Question: if layer {layer}'s attention at the last position were kept from reading position {position}, {old} (its "
        "weight there set to zero), would the probability the model gives {top} {move}? Answer Yes or No.")
+CHANGE = ("A language model reads this text (its tokens, by position) and predicts the next token after the last one; its "
+          "most likely next token is {top}.\ntokens = {tokens}\n\n{english}"
+          "Question: if {change}, would the probability the model gives {top} {move}? Answer Yes or No.")
 HOLD = ", while these subcomponents (matrix, position, index) kept their values on the original text: {nodes}"
 MOVE = {False: "go down", True: "fall below half of what it is"}  # an event's "half": its label is a fall below half
 
@@ -70,6 +74,8 @@ class Reader:
             head = f"An explanation of how the model computes this prediction:\n{eng}\n\n" if eng else ""
             tokens = " ".join(f"{i}:{x!r}" for i, x in enumerate(strings))  # by position: no counting
             move = MOVE[bool(e.get("half"))]
+            if e.get("change"):  # a change of the text's order (components.structure_events: a token moved, copied or swapped)
+                return CHANGE.format(top=top, tokens=tokens, english=head, change=e["change"], move=move)
             if e.get("layer") is not None:  # an internal edit: the attention edge from the position to the last one cut
                 return CUT.format(top=top, tokens=tokens, english=head, layer=e["layer"], position=e["position"],
                                   old=repr(strings[e["position"]]), move=move)

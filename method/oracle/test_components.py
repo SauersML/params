@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import random
+
 import pytest
 
 HERE = Path(__file__).resolve().parent
@@ -157,6 +159,23 @@ def test_size_term_counts_orders_of_magnitude():
     assert components.size_term(10 * scale, scale) == 1.0  # at most 1
     step = [components.size_term(2.0 ** k - 1, scale) - components.size_term(2.0 ** (k - 1) - 1, scale) for k in (5, 10, 15)]
     assert all(abs(x - 1 / 20) < 1e-12 for x in step)  # every doubling costs the same
+
+
+def test_structural_changes_keep_the_tokens():
+    ids, targets = list(range(10, 30)), [19]
+    move = components.apply_change(ids, targets, {"kind": "move", "position": 5, "to": 12})
+    assert move[1] == targets and sorted(move[0]) == sorted(ids) and move[0][12] == ids[5] and move[0][5] == ids[6]
+    swap = components.apply_change(ids, targets, {"kind": "swap", "position": 3, "with": 8})
+    assert swap[0][3] == ids[8] and swap[0][8] == ids[3] and swap[1] == targets
+    ins = components.apply_change(ids, targets, {"kind": "insert", "position": 7, "at": 2})
+    assert ins[0] == ids[:2] + [ids[7]] + ids[2:] and ins[1] == [20]  # the target one further on
+    changes = components.structure_changes(ids, targets, [19, 7, 4, 11, 2], random.Random(0))
+    kinds = [c["kind"] for c in changes]
+    assert kinds.count("move") == 2 and kinds.count("insert") == 2 and kinds.count("swap") == 2
+    assert all(c["at"] < c["position"] for c in changes if c["kind"] == "insert")  # a copy earlier in the text
+    assert all(abs(c["to"] - c["position"]) >= 3 for c in changes if c["kind"] == "move")
+    strings = [f"t{i}" for i in ids]
+    assert "moved to position 12" in components.change_text({"kind": "move", "position": 5, "to": 12}, strings)
 
 
 class FakeEdits:

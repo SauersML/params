@@ -396,3 +396,18 @@ def test_pairs_stated_within_budget():
         back, bad = goal_eval.circuit(teacher.circuit_json(pr, on_p, kept, stated.pairs), tx.targets, nat.C, tx.T)
         assert bad == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 0}
         assert {read: set(ps) for read, ps in getattr(back, "pairs", {}).items()} == {read: set(ps) for read, ps in stated.pairs.items()}
+
+
+def test_connect_with_acceptance_keeps_its_floor():
+    nat, pr = pruner(teacher.CONVENTION == "live")
+    ge, tx = pr.ge, pr.tx
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    start, _ = vpd_top(pr, nat)
+    conn = teacher.Connector(ge, tx, pr, empty, vpd, lambda *a: 0.0, no_strand=True,
+                             acceptance=teacher.Acceptance(ge, tx, ("changed",)))
+    n = teacher.measure(pr, start[None], empty, vpd)[0]["n"]
+    kept, summary, steps, _, _ = conn.connect(start, n)
+    floor = min(teacher.RECOVERED, steps[0]["s_track"])
+    # the connection descent without the robust objective reports the last admitted step's s_track, at its floor
+    assert "f1_flips" not in summary and summary["s_track"] >= floor and len(kept) == summary["edges"]
+    assert all(s_.get("s_track") is None or s_["s_track"] >= floor for s_ in steps)

@@ -678,8 +678,8 @@ class Connector:
         steps[0].update(start)
         summary = {**{k_: steps[-1][k_] for k_ in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term", "reward")},
                    "all_edges": len(ep.edges), "sets": ep.measured, "unconnectable": len(dropped)}
-        if start:                                            # the last admitted step's F1 under the flips (the start's if none)
-            summary["f1_flips"] = next(s_["f1_flips"] for s_ in reversed(steps) if "f1_flips" in s_)
+        for k_ in start:                                     # the last admitted step's F1 under the flips and acceptance
+            summary[k_] = next(s_[k_] for s_ in reversed(steps) if k_ in s_)   # terms (the start's, steps[0]'s, if none)
         print(f"  connections at {size} subcomponents: {summary['edges']} of {len(ep.edges)}, graph F1 {summary['f1_graph']:.3f} "
               f"(start {steps[0]['f1_graph']:.3f}), N {n:.3f}, {ep.measured} sets", flush=True)
         return [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_], summary, steps, ep, on

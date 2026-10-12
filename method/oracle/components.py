@@ -1420,6 +1420,7 @@ def main():
     lc.add_argument("--n", type=int, default=50)
     lc.add_argument("--offset", type=int, default=0)
     lc.add_argument("--stride", type=int, default=1)
+    lc.add_argument("--tasks", type=Path, help="task ids, one per line, in place of the split's first n texts")
     lc.add_argument("--lengths", default="0:100000", help="LO:HI: only texts of LO <= tokens < HI (PyTorch's MPS keeps "
                     "per-shape caches, ~20-40 MB of host memory per sequence length: a process over a band of lengths stays bounded)")
     pr = sub.add_parser("prepare", help="per text: locality, and for the texts kept, the question row and the interim teacher")
@@ -1497,7 +1498,9 @@ def main():
         done = {json.loads(x)["task"] for x in args.out.read_text().splitlines()} if args.out.exists() else set()
         lo, hi = map(int, args.lengths.split(":"))
         with args.out.open("a") as f:
-            for p in native.tasks(args.split)[:args.n][args.offset::args.stride]:
+            texts = ([native.TEXTS / "vpd4l" / f"{t}.json" for t in args.tasks.read_text().split()] if args.tasks
+                     else native.tasks(args.split)[:args.n])
+            for p in texts[args.offset::args.stride]:
                 if p.stem not in done and lo <= len(native.text(p)[0]) < hi:
                     r = locality(ge, json.loads(p.read_text()))
                     f.write(json.dumps(r) + "\n")

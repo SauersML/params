@@ -11,7 +11,8 @@ adversary scores (F1, N, f1_adv, f1_rob, size), and with --fidelity A.jsonl B.js
 kind "teacher" (the team's held-out adversary, adversary_flips' omitted lever at m = 1, 4, 16, 64, 256 as flip_m, the
 point F1 and N, N_real, C and C with flips, flips_to_half and flips_to_break, the smallest m at which F1 under m flips
 falls below 0.5 and below half the point F1, 512 when not within m <= 256; dreads_*, the response error under node
-removals, connection cuts and interchange, lower is better), overall and by locality
+removals, connection cuts and interchange, lower is better), overall and by locality, and each side's teacher against
+VPD's top k at its size (fidelity's "VPD top k" rows: VPD's own ranking, every connection among its nodes)
 (heldout50_locality.jsonl).
 
   experiments/oracle/teacher_gate.py SCORE.json A B [--fields f1_live,n_live,...] [--teacher DIR_A DIR_B]
@@ -109,14 +110,17 @@ def main():
         print(f"held-out adversary (teacher_v3.py --evaluate): {len(set(VA) & set(VB))} texts in both")
         compare(VA, VB, args.a, args.b, ("f1", "n", "f1_adv", "f1_rob", "size"))
     if args.fidelity and all(p.exists() for p in args.fidelity):
-        def fid(p):
-            out = {}
-            for x in p.read_text().splitlines():
-                r = json.loads(x) if x.strip() else {}
-                if r.get("kind", "").split(",")[0] == "teacher":
-                    out[r["task"]] = {**r, **{f"flip_{m}": v for m, v in (r.get("f1_flips_omitted") or {}).items()},
-                                      **{k: r.get(k) or 512 for k in ("flips_to_half", "flips_to_break") if k in r}}
-            return out
+        def row(r):
+            return {**r, **{f"flip_{m}": v for m, v in (r.get("f1_flips_omitted") or {}).items()},
+                    **{k: r.get(k) or 512 for k in ("flips_to_half", "flips_to_break") if k in r}}
+
+        def fid(p, vpd=False):
+            """task -> the teacher's row, or with vpd the row of VPD's top k at the teacher's size."""
+            rows = [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
+            teach = {r["task"]: row(r) for r in rows if r.get("kind", "").split(",")[0] == "teacher"}
+            if not vpd:
+                return teach
+            return {r["task"]: row(r) for r in rows if r.get("kind") == f"VPD top {teach.get(r['task'], {}).get('size')}"}
         FA, FB = fid(args.fidelity[0]), fid(args.fidelity[1])
         local = {}
         if args.labels.exists():
@@ -128,6 +132,13 @@ def main():
             if ts:
                 print(f"held-out adversary, the team's (goal_eval.py fidelity: adversary_flips omitted at m, fresh pool), {name}: {len(ts)} texts")
                 compare({t: FA[t] for t in ts}, {t: FB[t] for t in ts}, args.a, args.b, fields)
+        vfields = ("flip_1", "flip_4", "flips_to_half", "s_nodes", "s_edges", "n_real", "s_point", "n_point", "dreads_edges", "c_flips")
+        for side, p, F in ((args.a, args.fidelity[0], FA), (args.b, args.fidelity[1], FB)):
+            V = fid(p, vpd=True)
+            ts = sorted(set(F) & set(V))
+            if ts:
+                print(f"{side} against VPD's top k at its sizes (A = VPD top k, B = {side}): {len(ts)} texts")
+                compare({t: V[t] for t in ts}, {t: F[t] for t in ts}, "VPD top k", side, vfields)
     print("per text (f1_live, n_live, nodes):")
     for t in tasks:
         a, b = A[t], B[t]

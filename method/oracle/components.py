@@ -828,13 +828,38 @@ def dropped_bits(answer: dict, g, d: dict, positions: int, subcomponents: int) -
     return d["invalid_nodes"] * math.log2(positions * subcomponents) + (2 * d_inner + d_out) * math.log2(n)
 
 
+def edit_bits(edits: dict, circuit: set, positions: int, subcomponents: int) -> float:
+    """The description bits of an answer's edit operations, priced as the circuit's nodes and edges are (so edits join
+    its size term with no weight of their own): each operation one bit (cut or scale) and one (persistent or not); a
+    node by its id among the circuit's nodes log2(n), written out log2(positions x subcomponents), position-free
+    (persistent) log2(subcomponents), the prediction log2(n); a scale factor its literal, log2(12) a character (digits,
+    sign, point)."""
+    n = max(len(circuit), 2)
+
+    def ref(nd):
+        if nd == "out" or tuple(nd) in circuit:
+            return math.log2(n)
+        return math.log2(subcomponents) if nd[1] is None else math.log2(positions * subcomponents)
+
+    bits = 0.0
+    for ops in edits.values():
+        for o in ops:
+            bits += 2.0
+            if o["op"] == "cut":
+                bits += ref(o["reader"]) + ref(o["writer"])
+            elif o["op"] == "scale":
+                bits += ref(o["node"]) + len(f"{o['k']:g}") * math.log2(12)
+    return bits
+
+
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
     row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT section, a
     question has no FINAL line, an edit request no EDIT line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
     are dropped and their description bits charged in size (dropped_bits), and so is a circuit line that does not
-    parse (each subcomponent it names, at least one, priced as a node outside the graph). A valid
+    parse (each subcomponent it names, at least one, priced as a node outside the graph); edit operations add their
+    description bits (edit_bits). A valid
     answer earns the mean of its terms less size_weight x size ("circuit_reward": the same over the circuit's own terms
     F1, N and F3, for comparing with circuits that give no English or answers), size its description bits over the scale (VPD's active
     subcomponents at the listed positions and the targets), at most 1. Terms, from goal_eval in VPD's semantics with
@@ -891,7 +916,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
             terms["E2"] = row["E2"]
             have = [v for v in terms.values() if v is not None]
-            size = min(1.0, (row["bits"] + d_bits) / scale) if scale > 0 else 0.0
+            e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
+            size = min(1.0, (row["bits"] + d_bits + e_bits) / scale) if scale > 0 else 0.0
             r = sum(have) / len(have) - size_weight * size
             own = [terms[k] for k in ("F1", "N", "F3") if terms[k] is not None]
             circ = sum(own) / len(own) - size_weight * size

@@ -101,6 +101,7 @@ class NativeUnits:
         self.emb = tg.wte[torch.tensor(self.ids, device=nat.dev)]
         self.ref = nat.reference([self.ids], self.targets)
         self._cache: tuple = (None, None)  # (a base Mask, its keys and values per layer)
+        self.runs = 0  # sets measured (kl's results)
 
     def full(self) -> Mask:
         dev = self.nat.dev
@@ -188,6 +189,7 @@ class NativeUnits:
     def kl(self, base: Mask, removals: list[list[tuple]] | None = None) -> list[float]:
         """The KL in bits of the model at the targets from each run: the base set alone (removals None), or the base
         set without each row's removals, batched by their first position."""
+        self.runs += 1 if removals is None else len(removals)
         if self._cache[0] is not base or removals is None:
             k0 = carry.kl(self.ref, self._forward(base, [[]], 0, keep=True)).tolist()
             if removals is None:
@@ -338,20 +340,23 @@ def table(rows: list[dict]) -> str:
 
 
 class NativePruner:
-    """teacher.Pruner's measured block removal over a native-unit set S (Mask); measured counts every run."""
+    """teacher.Pruner's measured block removal over a native-unit set S (Mask); measured counts every set measured
+    on nu since the pruner began."""
 
     def __init__(self, nu: NativeUnits, start: Mask):
-        self.nu, self.S, self.measured = nu, start, 0
+        self.nu, self.S, self.runs0 = nu, start, nu.runs
+
+    @property
+    def measured(self) -> int:
+        return self.nu.runs - self.runs0
 
     def without(self, groups: list[list[tuple]]) -> list[float]:
         """KL of S without each group of units."""
         if not groups:
             return []
-        self.measured += len(groups)
         return self.nu.kl(self.S, groups)
 
     def kl(self) -> float:
-        self.measured += 1
         return self.nu.kl(self.S)[0]
 
     def blocks(self, level: str) -> list[list[tuple]]:
@@ -434,18 +439,15 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
     if f1_part.count() > JOINT_MAX:  # the joint path from the units whose measured removal matters most
         kl0 = nu.kl(f1_part)[0]
         effect = screen(nu, f1_part, kl0, log)
-        pr.measured += len(effect) + 1
         keep = sorted(f1_part.units(), key=lambda u: -effect[u])[:JOINT_MAX]
         f1_part = f1_part.without(sorted(set(f1_part.units()) - set(keep)))
 
     t1 = time.perf_counter()
     kl_full = nu.kl(full)[0]
     effect = screen(nu, full, kl_full, log)
-    pr.measured += len(effect) + 1
     order = sorted(effect, key=lambda u: -effect[u])
 
     def n_of(k):
-        pr.measured += 1
         return teacher.scores(empty, vpd, empty, nu.kl(full, [order[:k]])[0])[1]
 
     lo, hi = 0, min(teacher.K_MAX, len(order))
@@ -470,7 +472,6 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
             drop = set(r)
             rest.append([u for u in units if u not in drop])
         ms = pr.nu.kl(full, rest)
-        pr.measured += 2 * len(removals)
         out = []
         for c, m in zip(cs, ms):
             f, n, j = teacher.scores(empty, vpd, c, m)

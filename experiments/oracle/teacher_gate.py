@@ -43,7 +43,8 @@ def summaries(d: Path) -> dict:
         for line in f.read_text().splitlines():
             if line.strip():
                 r = json.loads(line)
-                out[r["task"]] = {**{k: r["best"][k] for k in ("f1", "n", "reward", "size", "positions")}, "seconds": r["seconds"]}
+                best = r.get("best") or r.get("pick") or {}            # teacher.py's "best"; teacher_v3's may lack some fields
+                out[r["task"]] = {**{k: best.get(k) for k in ("f1", "n", "reward", "size", "positions")}, "seconds": r.get("seconds")}
     return out
 
 

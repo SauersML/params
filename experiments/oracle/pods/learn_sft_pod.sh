@@ -6,22 +6,25 @@
 # training size, scored on its held-out rows; the base model scored on the ids and features held-out rows. Four queues
 # share the GPU; a smoke stage (64 rows, 32 scored) runs first and stops the pod when it fails. Everything comes
 # back to ~/mpd-data/runpod/NAME/out.
+# EPOCHS: per training size, its epochs (SIZE:EPOCHS ...; smaller sets more passes, every size trained to a similar
+# number of row passes).
 #   experiments/oracle/pods/learn_sft_pod.sh QDIR [NAME] [HOURS]      env: SIZES, BASE, EPOCHS, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
 QDIR=$1 NAME=${2:-oracle-graph-learn-sft} H=${3:-5}
-SIZES=${SIZES:-"2000 8000 32000"} BASE=${BASE:-Qwen/Qwen3-1.7B} EPOCHS=${EPOCHS:-2}
+SIZES=${SIZES:-"2000 8000 32000"} BASE=${BASE:-Qwen/Qwen3-1.7B} EPOCHS=${EPOCHS:-"2000:4 8000:2 32000:1"}
 O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME
 F=/Users/user/mpd-data/scratch/rustmove/learn/pod_$NAME
 mkdir -p "$F"
 COPYFILE_DISABLE=1 tar -czf "$F/q.tgz" -C "$QDIR" .
 S="python -B experiments/oracle/learn_sft.py"
 Q=/workspace/q
+epochs() { for e in $EPOCHS; do [ "${e%%:*}" = "$1" ] && echo "${e##*:}" && return; done; echo 1; }
 task() {  # task ARM ROWS_ARM [INIT]: train at every size, score each
   local arm=$1 rows=$2 init=$3 out=""
   for n in $SIZES; do
-    out="$out $S train $Q/$rows/train_$n.jsonl $W/sft_${arm}_$n --base $BASE --epochs $EPOCHS ${init:+--init $init} >> $O/train_${arm}_$n.log 2>&1;"
+    out="$out $S train $Q/$rows/train_$n.jsonl $W/sft_${arm}_$n --base $BASE --epochs $(epochs $n) ${init:+--init $init} >> $O/train_${arm}_$n.log 2>&1;"
     out="$out $S score $Q/$rows/heldout.jsonl $O/out/score_${arm}_$n.jsonl --base $BASE --adapter $W/sft_${arm}_$n/adapter >> $O/train_${arm}_$n.log 2>&1;"
     out="$out cp $W/sft_${arm}_$n/train.jsonl $O/out/train_${arm}_$n.jsonl;"
   done
@@ -33,7 +36,7 @@ first() {  # first STAGE EPOCHS: the first stage's adapter at $W/first_STAGE/ada
 inject() {  # the ids rows with the subcomponents' vectors in slots, scored with them and with other subcomponents' vectors
   local out=""
   for n in $SIZES; do
-    out="$out $S train $Q/ids/train_$n.jsonl $W/sft_inject_$n --base $BASE --epochs $EPOCHS --inject >> $O/train_inject_$n.log 2>&1;"
+    out="$out $S train $Q/ids/train_$n.jsonl $W/sft_inject_$n --base $BASE --epochs $(epochs $n) --inject >> $O/train_inject_$n.log 2>&1;"
     out="$out $S score $Q/ids/heldout.jsonl $O/out/score_inject_$n.jsonl --base $BASE --adapter $W/sft_inject_$n/adapter --inject >> $O/train_inject_$n.log 2>&1;"
     out="$out $S score $Q/ids/heldout.jsonl $O/out/score_inject_shuffled_$n.jsonl --base $BASE --adapter $W/sft_inject_$n/adapter --inject --shuffle >> $O/train_inject_$n.log 2>&1;"
     out="$out cp $W/sft_inject_$n/train.jsonl $O/out/train_inject_$n.jsonl;"

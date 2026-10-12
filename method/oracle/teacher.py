@@ -1394,6 +1394,13 @@ def main():
         row = {"task": path.stem, "local": labels.get(path.stem), **row}
         with (args.out / f"summary_{args.offset}.jsonl").open("a") as f:
             f.write(json.dumps(row) + "\n")
+        if "blocks" in row:                                  # the influential-blocks search (block_search)
+            k = row["blocks"]
+            print(f"{path.stem}: {k['stages'][-1]['blocks']} blocks, {k['stages'][-1]['subcomponents']} subcomponents at "
+                  f"{len(k['positions'])} positions (m {k['m']}), F1 {k['f1']:.3f}, N {k['n']}, {k.get('accept')}, {k['bits']:.0f} bits"
+                  + (f"; with connections {row['best_edges']['edges']} of {row['best_edges']['all_edges']}, graph F1 "
+                     f"{row['best_edges']['f1_graph']:.3f}" if "best_edges" in row else "") + f", {row['seconds']:.0f}s", flush=True)
+            continue
         b, v, f = row["best"], row["best_vpd_top"], row["f1_circuit"]
         print(f"{path.stem}: F1 circuit {f['size']} at {f['positions']} positions (F1 {f['f1']:.3f}, N {f['n']:.3f}); top-k {row['top_k']}; "
               f"path from {row['start_size']}: pick ({row['pick']}) {b['size']} at {b['positions']} positions F1 {b['f1']:.3f} N {b['n']:.3f} reward {b['reward']:.3f} "

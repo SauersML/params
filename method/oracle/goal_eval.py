@@ -2438,7 +2438,7 @@ class GoalEval:
                                 or (native._name_layer_kind(nd[0])[1] == "k_proj" and nd[1] <= t)))
                 cuts.append({r: (split, [pr for pr in ps if rng.random() < (j + 0.5) / draws] or [ps[int(rng.integers(len(ps)))]])})
                 continue
-            ws = list(par[r]) if r is not None else list(outs)
+            ws = sorted(par[r]) if r is not None else sorted(outs)  # all_edges' lists follow the node set's order, per process
             cuts.append({r: [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]})
         return cuts
 

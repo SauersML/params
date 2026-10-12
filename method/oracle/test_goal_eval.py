@@ -1001,6 +1001,24 @@ def test_graph_ref_is_graph_inside_masked_outside(tiny):
     assert abs(fd - float(gr[i][0, t, c])) < 2e-2 * abs(fd) + 1e-5, (fd, float(gr[i][0, t, c]))
 
 
+def test_edge_draws_fixed_by_the_graph(tiny, monkeypatch):
+    """A circuit's connection-cut draws depend on the circuit alone, not on the order its node set iterates in (string
+    hashing changes it from process to process: two runs of one set once differed by 0.3 in s_edges)."""
+    nat, ge, tx = tiny
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(nodes[1::3], complete=True), native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets))]
+    want = [repr(ge._edge_draws(tx, g, 6)) for g in graphs]
+    real = native.all_edges
+
+    def reversed_edges(ns, targets):
+        par, out = real(ns, targets)
+        return {r: ws[::-1] for r, ws in par.items()}, out[::-1]
+
+    monkeypatch.setattr(native, "all_edges", reversed_edges)
+    graphs[1] = native.Graph(graphs[1].nodes, {r: ws[::-1] for r, ws in graphs[1].parents.items()}, graphs[1].out[::-1])
+    assert [repr(ge._edge_draws(tx, g, 6)) for g in graphs] == want
+
+
 def test_families_on_the_engine_are_graph_ref(tiny):
     """The connection-cut and interchange families and graph F1, run on the engine (C's semantics there, every draw a
     row), equal graph_ref draw by draw for a stated and a complete circuit."""

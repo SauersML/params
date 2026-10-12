@@ -30,9 +30,10 @@ DEVICE = native.device()
 # of its size (n = 3,072 at the MLP: 3.3e-6), magnified tenfold by the KL's cancellation on these texts
 REL = 1e-4
 # TF32 products keep 10 mantissa bits (2^-11 relative, 5e-4), the KL's cancellation magnifying it tenfold (measured:
-# 1.4e-3 on an RTX A5000); bf16 keeps 8 (2^-9), the KL off by a few percent. Both are for a search's steps only
+# 1.4e-3 on an RTX A5000); bf16 keeps 8 (2^-9), the KL off by a few percent (measured on VPD's answer's subsets: 3.0e-2
+# on MPS). Both are for a search's steps only
 REL_TF32 = 1e-2
-REL_BF16 = 0.15
+REL_BF16 = 0.05
 pytestmark = pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
 
 
@@ -129,6 +130,28 @@ def test_gathered_columns_and_search_precisions():
             assert rel(full, gathered.kl(compact, "tf32")) < REL_TF32
         assert rel(full, gathered.kl(compact, "bf16")) < REL_BF16
     assert torch.equal(gathered.rescore(compact), gathered.kl(compact))
+
+
+def test_search_precisions_on_answer_subsets():
+    """The search precisions' KL on VPD's answer with random subsets removed (the masks a search moves through, KL from
+    VPD's own ~0.05 bits to ~80) within their bounds: an approximation of the model in the search's steps (such as
+    leaving out small remainders: 12% at 6 bits) shows here."""
+    nat, ids, targets, _ = setup(B=1)
+    T, B = len(ids), 16
+    nodes = answer(nat, ids)
+    cols = {n: torch.tensor(sorted({c for m, _, c in nodes if m == n}), dtype=torch.long) for n in nat.names}
+    eng = engine.Engine(nat, ids, targets, live=True, columns=cols)
+    g = torch.Generator().manual_seed(3)
+    masks = {n: torch.zeros(B, T, eng.width(n)) for n in nat.names}
+    at = {n: {c: i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
+    for n, t, c in nodes:
+        masks[n][:, t, at[n][c]] = 1.0
+    masks = {n: (m * (torch.rand(m.shape, generator=g) < torch.linspace(1.0, 0.3, B)[:, None, None])).to(nat.dev) for n, m in masks.items()}
+    with torch.no_grad():
+        want = eng.kl(masks)
+        if DEVICE.startswith("cuda"):
+            assert rel(want, eng.kl(masks, "tf32")) < REL_TF32
+        assert rel(want, eng.kl(masks, "bf16")) < REL_BF16
 
 
 def graph_case(B=3):

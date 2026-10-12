@@ -11,7 +11,13 @@ attention pattern. A token-embedding input node ["tok", 0, position] may feed th
 embedding, which VPD does not decompose, is how a token's change reaches a circuit); its edges are counted, not cut.
 
 Runs use VPD's semantics: a run "with circuit C" has C's subcomponents on (mask 1) and every other one off (mask 0), the
-remainders W - V U either on ("live", computing on the run's own inputs) or off; both conventions are reported. Every
+remainders W - V U either on ("live", computing on the run's own inputs) or off; both conventions are reported. An
+answer runs as the graph it states (native.Native.run on its Graph, teacher.EdgePruner's semantics): a node's output
+reaches a reader, or the prediction, only through a stated edge; the token embedding and the remainders are the
+background every reader reads in full; query and key nodes enter their layer's attention pattern (the format gives
+them no edges out). An answer stating no edge is the empty circuit (with live remainders, up to its query and key
+nodes' effect on the pattern the remainders' values pass through). Baselines (VPD's answer, its top
+k, the empty circuit) are complete graphs: their subcomponents read each other in full (VPD's masked forward). Every
 KL is the model's next-token distribution at the targets (summed over them) from the run's, in bits. VPD's own answer
 is the set of subcomponents with causal importance above zero on the input (at positions that can reach the targets,
 Native.reachable); the empty circuit and it bound every answer, on a log scale (KL_empty is ~100 bits, so a linear
@@ -25,7 +31,8 @@ Reward fields, on the text (per remainder convention X, live or off):
      KL_{VPD minus C}; the linear forms are diagnostics: recovered_X = (KL_empty - KL_C) / (KL_empty - KL_VPD),
      completeness_X = min(1, recovered / GOAL), necessity_X = clip((KL_{VPD minus C} - KL_VPD) / (KL_empty - KL_VPD),
      0, 1), and recovered_log_X, the unclipped F1.
-  F3, edges: in the circuit's run (remainders off), each stated edge cut (path patching of that one connection: the
+  F3 (a diagnostic, not a reward field: F1 on the stated graph already scores the wiring), edges: in the circuit's
+     complete run (remainders off), each stated edge cut (path patching of that one connection: the
      reader reads every input but that writer's output; native.Native.run's edge strengths) against random pairs of
      the circuit's nodes that the model connects and the answer does not state, each cut's effect the KL of the
      circuit's run from the cut run; F3 is the probability that a stated cut moves the prediction more than an
@@ -380,6 +387,31 @@ class GoalEval:
             out.append(torch.log_softmax((hidden[:, targets] @ tg.wte.T).float(), -1))
         return torch.cat(out)
 
+    def graph_kl(self, tx: Text, graphs: list[native.Graph], live: bool) -> list[float]:
+        """KL in bits at the targets of each stated graph's run on the text (_graph_kl)."""
+        return self._graph_kl(tx.ids, tx.targets, tx.ref, graphs, live, self._bounds(tx, "live" if live else "off")[0])
+
+    @torch.no_grad()
+    def _graph_kl(self, ids: list[int], targets: list[int], ref: torch.Tensor, graphs: list[native.Graph], live: bool,
+                  empty_kl: float) -> list[float]:
+        """KL in bits at the targets, from the model's log probabilities ref, of each stated graph's run on ids:
+        native.Native.run on the graph (a node's output reaches a reader only through a stated edge, every other
+        subcomponent off, the token embedding in full, remainders on (live) or off), teacher.EdgePruner's semantics; a
+        graph with no node is the empty circuit (empty_kl)."""
+        nat = self.nat
+        u, ur = nat._zero()
+        if live:
+            ur = nat._one()[1]
+        out = [empty_kl] * len(graphs)
+        some = [i for i, g in enumerate(graphs) if g.count()]
+        for s0 in range(0, len(some), self.chunk):
+            idx = some[s0:s0 + self.chunk]
+            plan = nat._plan([graphs[i] for i in idx], len(ids))
+            for i, k in zip(idx, carry.kl(ref, nat.run(ids, targets, plan, u, ur)).tolist()):
+                out[i] = k
+            native.free(nat.dev)
+        return out
+
     def _bounds(self, tx: Text, conv: str) -> tuple[float, float | None]:
         """(KL_empty, KL_VPD) on the text under a convention, kept on tx."""
         if conv not in tx.bounds:
@@ -391,14 +423,22 @@ class GoalEval:
         return tx.bounds[conv]
 
     def sufficiency(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
-        """Per graph, per convention: F1 (KL_C, recovered, completeness) and N on the text, with the bounds."""
+        """Per graph, per convention: F1 (KL_C of the stated graph's run, graph_kl; a complete graph's masked run),
+        recovered, completeness, and N (node removal from VPD's answer) on the text, with the bounds."""
         rows = [{} for _ in graphs]
-        sets = [self.masks(g, tx.T) for g in graphs]
+        stated = [i for i, g in enumerate(graphs) if not g.complete]
+        whole = [i for i, g in enumerate(graphs) if g.complete]
+        sets = [self.masks(graphs[i], tx.T) for i in whole]
         if tx.vpd is not None:
-            sets += [{n: tx.vpd[n] & ~m[n] for n in self.nat.names} for m in sets]
+            sets += [{n: tx.vpd[n] & ~m[n] for n in self.nat.names} for m in (self.masks(g, tx.T) for g in graphs)]
         for conv in CONVENTIONS:
             e, v = self._bounds(tx, conv)
-            kl = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, sets, conv == "live")).tolist() if sets else []
+            got = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, sets, conv == "live")).tolist() if sets else []
+            kl = [0.0] * len(graphs) + got[len(whole):]
+            for i, k in zip(whole, got):
+                kl[i] = k
+            for i, k in zip(stated, self.graph_kl(tx, [graphs[i] for i in stated], conv == "live")):
+                kl[i] = k
             for b, row in enumerate(rows):
                 c = kl[b]
                 r = recovered(e, c, v) if v is not None else None
@@ -658,9 +698,11 @@ class GoalEval:
     def across(self, tx: Text, graphs: list[native.Graph], prompts: list) -> list[dict]:
         """Per graph, per convention, the same circuit identities run on other prompts of the text: recovered pooled
         over them, sum (KL_empty - KL_C) / sum (KL_empty - KL_VPD), each prompt's bounds from VPD's own answer and the
-        empty circuit on that prompt, and the mean KL_C."""
+        empty circuit on that prompt, and the mean KL_C; stated graphs run as stated (_graph_kl)."""
         nat = self.nat
-        sets = [self.masks(g, tx.T) for g in graphs]
+        whole = [i for i, g in enumerate(graphs) if g.complete]
+        stated = [i for i, g in enumerate(graphs) if not g.complete]
+        sets = [self.masks(graphs[i], tx.T) for i in whole]
         empty = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
         acc = {conv: [[0.0, 0.0, 0.0] for _ in graphs] for conv in CONVENTIONS}
         for x in prompts:
@@ -669,9 +711,14 @@ class GoalEval:
             v = self.vpd_answer(x, tx.targets)
             extra = [empty] + ([v] if v is not None else [])
             for conv in CONVENTIONS:
-                kl = carry.kl(ref, self.runs(x, tx.targets, sets + extra, conv == "live")).tolist()
-                e = kl[len(graphs)]
-                vv = kl[len(graphs) + 1] if v is not None else None
+                got = carry.kl(ref, self.runs(x, tx.targets, sets + extra, conv == "live")).tolist()
+                e = got[len(whole)]
+                vv = got[len(whole) + 1] if v is not None else None
+                kl = [0.0] * len(graphs)
+                for i, k in zip(whole, got):
+                    kl[i] = k
+                for i, k in zip(stated, self._graph_kl(x, tx.targets, ref, [graphs[i] for i in stated], conv == "live", e)):
+                    kl[i] = k
                 for b in range(len(graphs)):
                     a = acc[conv][b]
                     a[0] += e - kl[b]

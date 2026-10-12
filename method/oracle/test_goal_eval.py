@@ -220,7 +220,7 @@ def test_bounds_and_exact_endpoints(tiny):
     assert abs(rows[0]["kl_live"]) < 1e-5
     assert abs(rows[1]["recovered_live"] - 1) < 1e-6 and abs(rows[1]["recovered_off"] - 1) < 1e-6
     assert abs(rows[1]["f1_live"] - 1) < 1e-6 and abs(rows[1]["n_off"] - 1) < 1e-6
-    assert rows[2]["f1_live"] == 0.0 and rows[2]["n_live"] == 0.0
+    assert rows[2]["f1_live"] == 0.0 and abs(rows[2]["n_live"]) < 1e-5  # float32 batches differ from _bounds' run
     assert abs(rows[1]["necessity_live"] - 1) < 1e-6 and abs(rows[2]["necessity_live"]) < 1e-6
     assert abs(rows[2]["recovered_live"]) < 1e-6 and abs(rows[2]["recovered_off"]) < 1e-6
     full, _ = naive(nat, tx.ids)
@@ -557,3 +557,58 @@ def test_real_removal(tiny):
         e, v = ge._bounds(tx, "off")
         assert row["n_real_off"] == goal_eval.necessity_log(e, row["kl_real_minus"], v)
     assert rows[2]["n_real_live"] == 0.0
+
+
+def _graph_checks(nat, ge, tx, nodes, rel):
+    """Graph F1 on a node set: every connection stated is the complete run (exact with remainders off, within rel live:
+    a remainder reads the stream without the circuit's outputs in graph semantics); no connection stated is the empty
+    circuit (live, only without query or key nodes: they enter their layer's attention pattern, which the live
+    remainders' values pass through)."""
+    par, out = native.all_edges(nodes, tx.targets)
+    rows = ge.sufficiency(tx, [native.Graph(nodes, par, out), native.Graph(nodes, complete=True), native.Graph(nodes, {}, [])])
+    every, whole, none = rows
+    assert abs(every["kl_off"] - whole["kl_off"]) < 1e-4 * max(1.0, whole["kl_off"]), (every["kl_off"], whole["kl_off"])
+    assert abs(every["kl_live"] - whole["kl_live"]) < rel * max(1.0, whole["kl_live"]), (every["kl_live"], whole["kl_live"])
+    qk = any(n.endswith(("q_proj", "k_proj")) for n, _, _ in nodes)
+    for conv in ("off",) if qk else ("off", "live"):
+        assert abs(none[f"kl_{conv}"] - none[f"kl_empty_{conv}"]) < 1e-4 * max(1.0, none[f"kl_empty_{conv}"])
+        assert none[f"n_{conv}"] == every[f"n_{conv}"] == whole[f"n_{conv}"]  # N is node removal: edges do not enter
+    return every, whole, none
+
+
+def test_graph_f1_runs_the_stated_graph(tiny):
+    """F1 runs the graph an answer states: all connections = the complete run, none = the empty circuit, and all but
+    one = the circuit's run with that one connection cut, checked against the independent forward."""
+    nat, ge, tx = tiny
+    g = random_graph(nat, tx, seed=11, k=10, stated=1.0)
+    nodes = sorted(g.node_set())
+    _graph_checks(nat, ge, tx, nodes, 5e-2)
+    par, out = native.all_edges(nodes, tx.targets)
+    full, _ = naive(nat, tx.ids)
+    on = mask_of(nat, tx.T, nodes)
+    pairs = goal_eval._pairs(native.Graph(nodes, par, out))
+    assert pairs
+    for w, r in pairs[:6]:
+        less = native.Graph(nodes, {rr: [x for x in ws if not (x == w and rr == r)] for rr, ws in par.items()},
+                            [x for x in out if not (x == w and r is None)])
+        got = ge.graph_kl(tx, [less], live=False)[0]
+        want = _kl(full, naive(nat, tx.ids, on=on, live=False, cut=(w, r))[0], tx.targets)
+        assert abs(got - want) < 1e-4 + 1e-3 * abs(want), (w, r, got, want)
+
+
+def test_graph_f1_on_the_teachers_text9000_circuit(real):
+    """The lead's check on pymove's teacher circuit for text9000: graph F1 with every connection stated is the
+    complete circuit's F1 and with none the empty circuit's."""
+    import json
+
+    nat, ge = real
+    teacher = Path.home() / "mpd-data/graph_oracle/teacher/joint_heldout/text9000.json"
+    if not teacher.exists():
+        pytest.skip("no teacher circuit for text9000")
+    p = native.TEXTS / "vpd4l" / "text9000.json"
+    ids, targets = native.text(p)
+    tx = ge.text(ids, targets, native.task_seed("text9000"), json.loads(p.read_text()))
+    nodes = sorted((n, t, c) for n, c, t in json.loads(teacher.read_text())["nodes"] if n != "tok")
+    every, whole, none = _graph_checks(nat, ge, tx, nodes, 1e-2)
+    print(f"text9000 teacher, {len(nodes)} nodes: KL live {every['kl_live']:.4f} stated / {whole['kl_live']:.4f} complete, "
+          f"off {every['kl_off']:.4f} / {whole['kl_off']:.4f}; none {none['kl_live']:.2f} = empty {none['kl_empty_live']:.2f}")

@@ -168,3 +168,27 @@ def test_gathered_graph_runs():
         want = native_graph_kl(nat, ids, targets, graph, ew, ow, zero)
         assert rel(want, eng.graph_kl(plan, None, ew, ow)) < REL
         assert rel(want, eng.graph_kl(plan, None, ew, ow, "bf16")) < REL_BF16
+
+
+def test_graph_lists():
+    """One graph per row (answers x interventions), with gradients in the strengths, as native.run's plan of the list."""
+    nat, ids, targets, graph, _, _, u = graph_case()
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[1:])
+    graphs = [graph, half, native.Graph(graph.nodes, graph.parents, [])]
+    g = torch.Generator().manual_seed(2)
+    ew = [torch.rand(sum(len(w) for w in x.parents.values()), generator=g).to(nat.dev) for x in graphs]
+    ow = [torch.rand(len(x.out), generator=g).to(nat.dev) for x in graphs]
+    plan = nat._plan(graphs, len(ids))
+    a = torch.cat([t for e, o in zip(ew, ow) for t in (e, o)]).requires_grad_(True)   # each graph's connections, then its outputs
+    ones = {n: torch.ones(1, 1, device=nat.dev) for n in nat.names}
+    want = carry.kl(nat.reference([ids], targets), nat.run(ids, targets, plan, u, ones, *nat.edge_weights(plan, a)))
+    eng = engine.Engine(nat, ids, targets, live=True)
+    be, bo = torch.cat(ew).requires_grad_(True), torch.cat(ow).requires_grad_(True)
+    got = eng.graph_kl(eng.plan(graphs), u, be, bo)
+    assert rel(want, got) < REL
+    want.sum().backward()
+    got.sum().backward()
+    split = [t for e, o in zip(ew, ow) for t in (len(e), len(o))]
+    parts = a.grad.split(split)
+    for x, y in ((torch.cat(parts[0::2]), be.grad), (torch.cat(parts[1::2]), bo.grad)):
+        assert float((x - y).norm() / x.norm().clamp_min(1e-30)) < REL

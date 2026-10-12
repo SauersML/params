@@ -48,12 +48,18 @@ def main():
     rows = [json.loads(x) for x in Path(sys.argv[1]).read_text().splitlines() if x.strip()]
     out = Path(sys.argv[2])
     flips = sorted({int(m) for r in rows for m in r.get("f1_flips_omitted", {})})
+    nflips = sorted({int(m) for r in rows for m in r.get("n_real_flips", {})})
     steps = sorted({int(m) for r in rows for m in r.get("f1_adv_curve", {})})
     plt.rcParams.update({"font.size": 16, "axes.spines.top": False, "axes.spines.right": False})
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6), facecolor="white")
-    panels = [(axes[0], "f1_flips_omitted", [0] + flips, "s_point", "extra subcomponents switched on (m)"),
-              (axes[1], "f1_adv_curve", steps, None, "adversary steps (VPD's published budget is 20)")]
-    for ax, key, xs, start, xlabel in panels:
+    panels = [("f1_flips_omitted", [0] + flips, "s_point", "extra subcomponents switched on (m)",
+               "F1 against VPD's answer under the same attack")]
+    if nflips:
+        panels.append(("n_real_flips", nflips, None, "other subcomponents removed from the model (m)",
+                       "N in the real model"))
+    panels.append(("f1_adv_curve", steps, None, "adversary steps (VPD's published budget is 20)",
+                   "F1 against VPD's answer under the same attack"))
+    fig, axes = plt.subplots(1, len(panels), figsize=(7.5 * len(panels), 6), facecolor="white")
+    for ax, (key, xs, start, xlabel, ylabel) in zip(axes, panels):
         pos = np.arange(len(xs))
         labels = []
         for (kd, (m, e, n)), color in zip(curves(rows, key, xs, start).items(), COLORS):
@@ -66,12 +72,12 @@ def main():
             labels[i][0] = max(labels[i][0], labels[i - 1][0] + 0.06)
         for y, x, text, color in labels:
             ax.annotate(text, (x, y), xytext=(10, 0), textcoords="offset points", color=color, va="center", fontsize=15)
-        ax.set_xticks(pos, [str(x) if (x or not start) else "none" for x in xs])
+        ax.set_xticks(pos, [str(x) if (x or (not start and key != "n_real_flips")) else "none" for x in xs])
+        ax.set_ylabel(ylabel)
         ax.set_xlim(-0.3, len(xs) + 0.9)
         ax.set_ylim(0, 1.02)
         ax.set_xlabel(xlabel)
         ax.set_facecolor("white")
-    axes[0].set_ylabel("F1 against VPD's answer under the same attack")
     fig.tight_layout()
     fig.savefig(out, dpi=150, facecolor="white")
     print(out)

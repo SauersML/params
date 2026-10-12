@@ -10,7 +10,7 @@ plain text (nothing in it is executed):
   L2.o#77@332 <- L2.v#902,1514@322
   L2.v#902,1514@322 <- L0.down#77@322
   L0.down#77@322 <- L0.fc#12,40@322
-  L2.k#9@322
+  @322 L2.k#9 L1.k#3,17
   ANSWER 1: the change at 322 removes the copied digit ...
   FINAL 1: falls=yes top=' 7'
 
@@ -19,7 +19,8 @@ writer" states one edge per writer: an attention or MLP output (o, down) into a 
 (q, k, v, fc) at its position, a value (v) into its layer's attention output (o) at that or a later position (attention
 between positions), an MLP input (fc) into its MLP's output (down); "out" is the prediction at the target. Subcomponents
 of one matrix at one position may be written together (L2.v#902,1514@322, indices sorted): a line with groups states
-an edge from every writer to every reader. A line without "<-" states nodes with no stated input. parse() gives
+an edge from every writer to every reader. Nodes with no stated input are listed by position, one line each:
+"@322 L2.v#902,1514 L3.o#5" (a group with its position, without "<-", also states nodes). parse() gives
 goal_eval's circuit JSON, and goal_eval.circuit checks every edge against the model (mech.connects); render() writes
 the lines backward from "out", grouping readers that share their writers. Token strings are shown as Python reprs of
 the target's tokens (special tokens included) and escaped (escape()): no question or answer holds a literal special or
@@ -72,6 +73,7 @@ GROUP_RE = re.compile(r"(?:L(\d+)\.(q|k|v|o|fc|down)#(\d+(?:,\d+)*)|tok)@(\d+)")
 _G = r"(?:L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)@\d+"
 TOK = "tok"  # the token embedding at a position, an input node: JSON [TOK, 0, position], text tok@<position>
 WRITERS_RE = re.compile(rf"\s*{_G}(?:\s*,\s*{_G})*\s*")
+BLOCK_RE = re.compile(r"@(\d+)\s+((?:(?:L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)\s*)+)")
 MARKDOWN = re.compile(r"\*\*|^[ \t]*(?:#+|[-*])[ \t]+", re.M)
 ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response)>)")  # Qwen's added tokens: <|...|>, <think>, <tool_call>, ...
 FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s*(.+?)\s*$", re.M | re.I)
@@ -164,6 +166,16 @@ def parse(text: str) -> dict:
         line = line.strip()
         if not line:
             continue
+        block = BLOCK_RE.fullmatch(line)
+        if block:  # "@322 L2.v#902,1514 L3.o#5": nodes at one position with no stated input
+            for item in block[2].split():
+                for nd in group_of(f"{item}@{block[1]}") or []:
+                    index(nd)
+            continue
+        if line.startswith("@"):
+            malformed += 1
+            junk += max(1, len(line.split()) - 1)
+            continue
         reader, arrow, writers = line.partition("<-")
         reader = reader.strip()
         rs = ["out"] if reader == "out" else group_of(reader)
@@ -193,6 +205,15 @@ def _grouped(nds) -> list[str]:
     for nd in nds:
         by.setdefault((nd[0], nd[1]), []).append(nd)
     return [group_text(by[k]) for k in sorted(by, key=_place)]
+
+
+def blocks(nds) -> list[str]:
+    """Nodes with no stated input, one line per position (latest first): "@322 L2.v#902,1514 L3.o#5", each matrix's
+    indices together (the position written once: 10-25% fewer tokens than a group per matrix and position)."""
+    at = {}
+    for nd in nds:
+        at.setdefault(nd[1], []).append(nd)
+    return [f"@{t} " + " ".join(g.rsplit("@", 1)[0] for g in _grouped(at[t])) for t in sorted(at, reverse=True)]
 
 
 def _place(nd) -> tuple:
@@ -239,7 +260,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
         lines.append(f"{group_text(groups[k])} <- " + ", ".join(_grouped(k[2])))
         named.update(groups[k])
         named.update(k[2])
-    lines += _grouped(set(nodes) - named)
+    lines += blocks(set(nodes) - named)
     text = [f"EXPLANATION: {answer.get('explanation', '')}".rstrip(), "CIRCUIT:"] + lines
     for k in sorted(finals or {}):
         falls, top = finals[k]
@@ -833,20 +854,63 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None) -> int:
 LOCAL = 0.9  # a text is local when VPD's active subcomponents at its targets alone reach this recovered_log
 
 
-def locality(ge, task: dict) -> dict:
-    """Whether a text's prediction is local: VPD's active subcomponents at the target positions alone (every other
-    subcomponent off, remainders live) reach recovered_log >= LOCAL. For a local prediction a target-only circuit is
-    the truth; training sets need non-local texts too, or the oracle learns to list the target's actives.
-    {"task", "local", "recovered_log", "target_actives"}."""
-    import native
+def locality(ge, task: dict, rounds: int = 2) -> dict:
+    """Whether a text's prediction is local: a subset of VPD's active subcomponents at the target positions, found by
+    measured removal, reaches f1 (log recovery, remainders live) >= LOCAL with every other subcomponent off. All the
+    target's actives together understate it (they cancel each other when the context is off: text9000's 63 reach
+    0.43 bits, 12 of them 0.077). Each round scores every member's removal from the current set, orders the members
+    by how much their removal raises f1, and keeps the best set along that order's nested removals (depths 1, 2, 4,
+    ... from either end, then every depth within a quarter of the best, at least 4); the set is the starting point of
+    the next round. For a local prediction a target-only circuit is the truth; training sets need
+    non-local texts too. {"task", "local", "f1", "subset", "target_actives"}."""
+    import carry
+    import goal_eval
 
     prompt = task["prompts"][0]
     ids, targets = prompt["token_ids"], prompt["target_positions"]
     tx = ge.text(ids, targets, task=task)
     at = [nd for nd in ge.nat._vpd_order(ids, targets) if nd[1] in targets]
-    row = ge.sufficiency(tx, [native.Graph(at)])[0]
-    rec = row["recovered_log_live"]
-    return {"task": task["id"], "local": rec is not None and rec >= LOCAL, "recovered_log": rec, "target_actives": len(at)}
+    e, v = ge._bounds(tx, "live")
+
+    def without(base: dict, nds) -> dict:  # a mask with nodes switched off, copying only the matrices they are in
+        m = dict(base)
+        for n, t, c in nds:
+            if m[n] is base[n]:
+                m[n] = base[n].clone()
+            m[n][t, c] = False
+        return m
+
+    def f1s(masks):  # f1 alone (goal_eval's live runs and bounds), 16 sets per call
+        out = []
+        for s0 in range(0, len(masks), 16):
+            kl = carry.kl(tx.ref, ge.runs(ids, targets, masks[s0:s0 + 16], True)).tolist()
+            out += [None if v is None else min(1.0, max(0.0, goal_eval.recovered_log(e, c, v))) for c in kl]
+        return out
+
+    base = carry.masks(ge.nat, tx.T, at)
+    best, cur = (f1s([base])[0] if at else None), list(at)
+    best_set = list(at)
+    for _ in range(rounds):
+        if best is None or best >= LOCAL or len(cur) < 2:
+            break
+        drop = f1s([without(base, [nd]) for nd in cur])
+        if max(drop) >= LOCAL:  # one removal already reaches it
+            i = max(range(len(cur)), key=lambda j: drop[j])
+            best, best_set = drop[i], cur[:i] + cur[i + 1:]
+            break
+        order = [cur[i] for i in sorted(range(len(cur)), key=lambda i: -drop[i])]
+        ks = sorted({k for j in range(len(order).bit_length()) for k in (2 ** j, len(order) - 2 ** j) if 0 < k < len(order)})
+        got = dict(zip(ks, f1s([without(base, order[:k]) for k in ks])))  # nested removals at doubling depths from either end
+        k = max(got, key=got.get)
+        near = [j for j in range(max(1, k - max(4, k // 4)), min(len(order) - 1, k + max(4, k // 4)) + 1) if j not in got]
+        got |= dict(zip(near, f1s([without(base, order[:j]) for j in near])))  # then every depth near the best
+        k = max(got, key=got.get)
+        if got[k] <= best:
+            break
+        best, cur = got[k], order[k:]
+        best_set, base = cur, without(base, order[:k])
+    return {"task": task["id"], "local": best is not None and best >= LOCAL, "f1": best, "subset": len(best_set),
+            "target_actives": len(at)}
 
 
 # ---- evaluation
@@ -1067,6 +1131,8 @@ def main():
     lc.add_argument("--n", type=int, default=50)
     lc.add_argument("--offset", type=int, default=0)
     lc.add_argument("--stride", type=int, default=1)
+    lc.add_argument("--lengths", default="0:100000", help="LO:HI: only texts of LO <= tokens < HI (PyTorch's MPS keeps "
+                    "per-shape caches, ~20-40 MB of host memory per sequence length: a process over a band of lengths stays bounded)")
     d = sub.add_parser("dataset")
     d.add_argument("rows", type=Path)
     d.add_argument("teacher", type=Path)
@@ -1093,9 +1159,10 @@ def main():
     nat = ge.nat
     if args.cmd == "locality":
         done = {json.loads(x)["task"] for x in args.out.read_text().splitlines()} if args.out.exists() else set()
+        lo, hi = map(int, args.lengths.split(":"))
         with args.out.open("a") as f:
             for p in native.tasks(args.split)[:args.n][args.offset::args.stride]:
-                if p.stem not in done:
+                if p.stem not in done and lo <= len(native.text(p)[0]) < hi:
                     r = locality(ge, json.loads(p.read_text()))
                     f.write(json.dumps(r) + "\n")
                     f.flush()

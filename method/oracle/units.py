@@ -275,7 +275,8 @@ def _score_many(nat, task: dict, texts: list[str], k: int = 8, ranks=(0, 1, 2)) 
 
 def _cut(t: int, s: int, layer: int):
     """A mode that keeps one layer's attention at position t from reading position s (every head; its weight there set to
-    zero, the rest not renormalized). Native.run computes each layer's attention weights with one softmax, in layer order."""
+    zero, the rest not renormalized). Native.run computes each layer's attention weights with one softmax, in layer order:
+    [B, H, rows, T], the rows the last positions (all T of them, or a reused run's window)."""
     import torch
     from torch.overrides import TorchFunctionMode
 
@@ -284,10 +285,11 @@ def _cut(t: int, s: int, layer: int):
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             out = func(*args, **(kwargs or {}))
-            if func is torch.Tensor.softmax and out.dim() == 4 and out.shape[-1] == out.shape[-2] > t:
-                if self.calls == layer:
+            if func is torch.Tensor.softmax and out.dim() == 4 and out.shape[-1] > t and out.shape[-1] >= out.shape[-2]:
+                row = t - (out.shape[-1] - out.shape[-2])
+                if self.calls == layer and row >= 0:
                     out = out.clone()
-                    out[:, :, t, s] = 0.0
+                    out[:, :, row, s] = 0.0
                 self.calls += 1
             return out
 
@@ -327,12 +329,16 @@ def _events(nat, task: dict, k: int = 8) -> list[dict]:
     ids, targets = prompt["token_ids"], prompt["target_positions"]
     t = max(targets)
 
+    states = nat._model_record(ids)[1]
+
     def p_top(x, mode=None):
+        # Native reuses the text's own run before the first position where x differs (or its last 64 rows): the same
+        # numbers as the whole run (checked equal on heldout 9000-9002, every changed token and cut)
         with torch.no_grad():
             if mode is None:
-                return nat.run(x, [t], nat._full_plan(len(x), 1), *nat._one())[0, 0].exp()
+                return nat.run(x, [t], nat._full_plan(len(x), 1), *nat._one(), reuse=(states, ids))[0, 0].exp()
             with mode:
-                return nat.run(x, [t], nat._full_plan(len(x), 1), *nat._one())[0, 0].exp()
+                return nat.run(x, [t], nat._full_plan(len(x), 1), *nat._one(), reuse=(states, ids))[0, 0].exp()
 
     base = p_top(ids)
     top = int(base.argmax())

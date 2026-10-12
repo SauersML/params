@@ -2345,7 +2345,7 @@ def _paired(a: list, b: list) -> dict:
 
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
-             teachers: dict | None = None) -> dict:
+             teachers: dict | None = None, lines: bool = False) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -2357,8 +2357,9 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
     figure is also reported for local and non-local texts apart. diagnostics: structure() of each first sample (a
     second disjoint circuit, minimality), costly. matched_all: VPD's answer at every sample's node count, not only the
     first's, so each sample is compared with VPD at its own size (verify-and-pick: whether any of N beats it on C).
-    The baselines' C and N are kept beside their circuit reward ("baseline_terms"). teachers: task -> the text's teacher
-    circuit (JSON), reward v3's teacher-dominance reference."""
+    The baselines' v3 terms (phi, g, compact, bits, D) and C and N are kept beside their circuit reward
+    ("baseline_terms"). teachers: task -> the text's teacher circuit (JSON), reward v3's teacher-dominance reference, for
+    the sets and the baselines alike. lines: each sample's per-line credits too (reward(lines=True))."""
     import native
 
     invalid = V3_INVALID
@@ -2377,7 +2378,8 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
             cache = {}
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
-                            ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None)
+                            ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None,
+                            lines=lines)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -2389,9 +2391,11 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             per[name].append(entry)
         sizes = [y.get("nodes") or 0 for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1])]
         names = baseline_texts(ge, task, sizes, cache.get(task["id"]))
-        for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()), split="eval")):
+        for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()), split="eval",
+                                                      teacher=teachers.get(p.stem) if teachers else None)):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
-            base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N")}
+            base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),
+                                                    **{k: r.get(k) for k in ("phi", "phi_tau", "g", "compact", "bits", "D")}}
         log(p.stem + ": " + ", ".join(f"{s} {per[s][-1]['samples'][0]['reward']:+.3f}" for s in sets), flush=True)
     report = {}
     groups = {"all": None}
@@ -2572,6 +2576,7 @@ def main():
     s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
     s.add_argument("--matched-all", action="store_true", help="VPD at every sample's node count (verify-and-pick against VPD@matched)")
     s.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json): reward v3's teacher-dominance reference")
+    s.add_argument("--lines", action="store_true", help="each sample's per-line credits (reward(lines=True), line_credit())")
     args = ap.parse_args()
     import goal_eval
     import native
@@ -2811,7 +2816,7 @@ def main():
         vs = variables.Scorer(ge)
     teachers = {f.stem: json.loads(f.read_text()) for t in rows if (f := args.teacher / f"{t}.json").exists()} if args.teacher else None
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
-                   matched_all=args.matched_all, teachers=teachers)
+                   matched_all=args.matched_all, teachers=teachers, lines=args.lines)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

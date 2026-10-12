@@ -82,6 +82,7 @@ CARRIED_GOAL = 0.9  # F2: a position whose change the circuit carries this far c
 SIZE_WEIGHT = 0.5
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
 WIRING_PER_POSITION = 6  # connectome pairs listed per position
+SWITCH_PER_POSITION = 8  # subcomponents a changed token switches on, listed per position
 QA_PER_KIND = 2
 QA_RANKS = 8  # token-change questions draw the new token from the model's alternatives at ranks 0 to 7
 
@@ -343,8 +344,9 @@ ASK = ("How does {model} compute its prediction of the next token after the targ
        "reader, \"<reader> <- <writer>, <writer>\", each writer an edge into the reader: an attention or MLP output (o, "
        "down) into a later query, key, value or MLP input (q, k, v, fc) at its position; a value (v) into its layer's "
        "attention output (o) at that or a later position; an MLP input (fc) into its MLP's output (down). \"out\" is the "
-       "prediction. The circuit must carry the change of each listed position's token to the prediction; fewer "
-       "subcomponents and edges are better. Answer with a line EXPLANATION: (in plain English, what the model does), "
+       "prediction. The circuit should be what makes the prediction: with only its subcomponents on and every other one off, "
+       "the model should still predict what it does, and with them taken out of VPD's active subcomponents it should "
+       "not; fewer subcomponents and edges are better. Answer with a line EXPLANATION: (in plain English, what the model does), "
        "then CIRCUIT: and its lines, then for each question ANSWER <n>: (your reasoning in plain English) and "
        "FINAL <n>: falls=yes or no top=<the token, quoted as the tokens are>. Subcomponents of one matrix at one position "
        "may be written together, L2.v#902,1514@322; a line with groups states an edge from every writer to every reader.")
@@ -400,11 +402,35 @@ def _atlas():
     return atlas.Atlas() if (atlas.DEFAULT / "atlas.safetensors").exists() else None
 
 
+def switch_on(nat, ids: list[int], targets: list[int], p: int, ci: dict, k: int = SWITCH_PER_POSITION) -> list:
+    """The subcomponents VPD switches on when the token at p changes: active (causal importance above zero) on a
+    changed prompt (the model's 3 likeliest other tokens there, carry.alternatives) and inactive on the text, at p and
+    the later positions up to the last target (earlier ones are VPD's causal-importance network reading ahead: nothing
+    computes differently there). The k switched on by the most of the 3, then by mean causal importance:
+    [[node, count], ...]."""
+    import carry
+
+    t = max(targets)
+    count, total = {}, {}
+    for x in carry.alternatives(nat, ids, p):
+        cx = nat.importance(x)
+        for n in nat.names:
+            on = (cx[n] > 0) & ~(ci[n] > 0)
+            on[:p] = False
+            on[t + 1:] = False
+            for q, c in on.nonzero().tolist():
+                count[(n, q, c)] = count.get((n, q, c), 0) + 1
+                total[(n, q, c)] = total.get((n, q, c), 0.0) + float(cx[n][q, c])
+    ranked = sorted(count, key=lambda nd: (-count[nd], -total[nd] / count[nd], _place(nd)))
+    return [[list(nd), count[nd]] for nd in ranked[:k]]
+
+
 def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=None) -> dict:
     """One text's question data: F2's positions (goal_eval.Text with the text's own seed), the measured evidence there
     (units.events at those positions; its other events are the English reader's), VPD's top active subcomponents per
-    position with their atlas facts (facts(); none without an atlas), their strongest wiring, the intervention
-    questions, and the count of VPD-active subcomponents at F2's positions and the targets (the size term's scale)."""
+    position with their atlas facts (facts(); none without an atlas), their strongest wiring, the subcomponents a
+    change of each listed position's token switches on (switch_on()), the intervention questions, and the count of
+    VPD-active subcomponents at F2's positions and the targets (the size term's scale)."""
     import native
     import units
 
@@ -426,12 +452,13 @@ def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=N
         t_nodes = [nd for q in sorted(set(targets) | {p}) for nd in comps[q]]
         pairs = [x for x in wiring(conn, t_nodes, targets, len(t_nodes) ** 2) if p in (x[0][1], x[1][1])]
         wires[p] = [[list(w), list(r), c] for w, r, c in pairs[:WIRING_PER_POSITION]]
+    switched = {str(p): switch_on(nat, ids, targets, p, tx.ci) for p in listed}
     active = int(sum(int((tx.ci[n][where] > 0).sum()) for n in nat.names))
     qa = qa_questions(nat, task, tx.ci, positions, native.task_seed(task["id"]) if qa_seed is None else qa_seed)
     return {"task": task["id"], "positions": positions, "listed": listed, "events": events,
             "components": {str(p): [[list(nd), float(tx.ci[nd[0]][nd[1], nd[2]]), facts(atlas, nd) if atlas else ""] for nd in comps[p]]
                            for p in where},
-            "wiring": {str(p): wires[p] for p in where}, "qa": qa, "active": active}
+            "wiring": {str(p): wires[p] for p in where}, "switch_on": switched, "qa": qa, "active": active}
 
 
 def question(task: dict, ev: dict) -> str:
@@ -457,6 +484,9 @@ def question(task: dict, ev: dict) -> str:
     for q in sorted(ev["components"], key=int):
         cs = ev["components"][q]
         lines.append(f"{q} ({strings[int(q)]!r}): " + ", ".join(f"{node_text(tuple(nd))} ({c:.2f}{'; ' + f if f else ''})" for nd, c, f in cs))
+        if ev.get("switch_on", {}).get(q):
+            lines.append("  switched on when its token changes (of the 3 likeliest other tokens): "
+                         + ", ".join(f"{node_text(tuple(nd))} ({k}/3)" for nd, k in ev["switch_on"][q]))
         if ev["wiring"].get(q):
             lines.append("  wiring: " + ", ".join(f"{node_text(tuple(w))} -> {node_text(tuple(r))} ({c:+.2f})" for w, r, c in ev["wiring"][q]))
     if ev["qa"]:

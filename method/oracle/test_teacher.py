@@ -4,8 +4,8 @@ answer: the causal-importance network or teacher.py --save-vpd's file VPD_SAVED)
 CUDA, and the products on the start set's subcomponents alone (Pruner._gather) with torch's fused norms and GELU
 (Pruner.fused) match the products on all subcomponents with vpd_model's own steps within float32 rounding,
 EdgePruner's runs are the scorecard's (goal_eval.GoalEval.graph_kl: with every connection the masked run), and a
-teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, and
-one over the answer budget steps to a smaller path point.
+teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, one
+over the answer budget steps to a smaller path point, and the flip repair writes pick()'s step.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -129,3 +129,19 @@ def test_from_path_reproduces_the_pick_and_its_connections():
     _, row_small, _ = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True,
                                     from_path=json.loads(json.dumps(path_file)), tokens=len, max_tokens=chars - 1)
     assert row_small["answer_tokens"] <= chars - 1 and row_small["answer_nodes"] < row["best"]["size"]
+
+
+@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
+def test_repair_writes_its_pick():
+    if not VPD_SAVED.exists() or not teacher.POOL.exists():
+        pytest.skip("needs VPD's answers and the adversary's pool " + str(teacher.POOL))
+    ge = goal_eval.GoalEval(native.Native(DEVICE), chunk=32)
+    ids, targets = native.text(native.TEXTS / "vpd4l" / "text9019.json")
+    saved = torch.load(VPD_SAVED)["text9019"]
+    circuits, row, _ = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True, repair_pool=torch.load(teacher.POOL))
+    steps = row["repair"]
+    j, _ = teacher.pick(steps, "f1_rob")
+    nodes = [nd for nd in circuits[""]["nodes"] if nd[0] != "tok"]
+    # the written circuit is pick()'s among the repair's steps, each step one more round of the omitted lever's flips
+    assert row["repair_pick"] == j and len(nodes) == steps[j]["size"] and len(circuits[""]["edges"]) == steps[j]["edges"]
+    assert all(b["size"] > a["size"] for a, b in zip(steps, steps[1:]))

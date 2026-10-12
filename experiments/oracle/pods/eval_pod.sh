@@ -7,7 +7,8 @@
 # pod ends when evaluate does.
 #   bash experiments/oracle/pods/eval_pod.sh RUN ROWS.jsonl LABELS.jsonl NAME=SAMPLES[:E1.jsonl] ...
 #     SAMPLES: a sampler's JSONL or a directory of <task>[.<k>].txt (components.samples_of); E1: tinker_train.py readers
-#     (env: HOURS (cap, default 2), GPU, PRICE, VRAM, RP_OWNER; LEDGER_OK=1 once the lead approved a launch past $290)
+#     (env: HOURS (cap, default 2), GPU, PRICE, VRAM, RP_OWNER; VARIABLES=1: E4, each answer's VARIABLES block;
+#      LEDGER_OK=1 once the lead approved a launch past $290)
 cd /Users/user/params
 spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
 if awk -v s="$spent" 'BEGIN {exit !(s > 290)}' && [ -z "${LEDGER_OK:-}" ]; then  # the lead's check before launches past $290
@@ -37,6 +38,6 @@ CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \
 cd $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 5 > $O/gpu.csv & \
-python -u method/oracle/components.py evaluate heldout $I/rows.jsonl $ARGS --labels $I/labels.jsonl --n 100000 --out $O/eval.json > $O/eval.log 2>&1"
+python -u method/oracle/components.py evaluate heldout $I/rows.jsonl $ARGS --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} --out $O/eval.json > $O/eval.log 2>&1"
 RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-200} RP_OWNER=${RP_OWNER:-fleet} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.7} \
   RP_MIN_VRAM_GB=${VRAM:-24} experiments/infra/runpod/rp-run $N "${GPU:-RTX 4090,RTX A5000,RTX 3090,L4,RTX A6000}" ${HOURS:-2} -- bash -c "$CMD"

@@ -47,7 +47,7 @@ from pathlib import Path
 
 import torch
 
-import carry
+import engine
 import goal_eval
 import native
 import teacher
@@ -89,22 +89,23 @@ def patterns(saved: dict, task: str, T: int, C: dict, names: list, count: int, s
 
 class MaskSearch:
     """The gates over a text's VPD answer (pr.nodes), their runs and the adversary's patterns. Every run multiplies only
-    the subcomponents that the answer or a pattern holds (each matrix's gathered columns, Pruner._gather's way; every
-    other one is off in every run): on the 20 held-out texts 9,132 of the 38,912 columns are in any answer."""
+    the subcomponents that the answer or a pattern holds (engine.Engine's columns; every other one is off in every
+    run): on the 20 held-out texts 9,132 of the 38,912 columns are in any answer. The gates' gradient steps run in
+    bf16 on CUDA (SEARCH); every measured number (the adversary's pick, the stages, the cleanup) in float32."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: teacher.Pruner, pats: list[dict], live: bool = True):
         nat = ge.nat
         self.ge, self.tx, self.pr, self.live = ge, tx, pr, live
         self.names, self.dev, self.T = nat.names, nat.dev, tx.T
-        self.offsets, self.cols, self.gathered, at = [], [], [], 0   # every matrix's [T, gathered] in turn, one flat row
+        self.offsets, self.cols, at = [], [], 0   # every matrix's [T, gathered] in turn, one flat row
         for j, n in enumerate(self.names):
             cols = torch.unique(torch.cat([pr.c[pr.mat == j].cpu()] + [p[n][1] for p in pats]).long()).to(self.dev)
-            st = nat.target.site(n)
             self.cols.append(cols)
-            self.gathered.append((st.V.index_select(1, cols), st.U.index_select(0, cols)))
             self.offsets.append((at, len(cols)))
             at += tx.T * len(cols)
         self.width = at
+        self.eng = engine.Engine(nat, tx.ids, tx.targets, live=live, columns=dict(zip(self.names, self.cols)))
+        self.search = "bf16" if str(self.dev).startswith("cuda") else "score"
 
         def place(j, t, c):                                    # flat places of (position, subcomponent) pairs of matrix j
             return self.offsets[j][0] + t * self.offsets[j][1] + torch.searchsorted(self.cols[j], c)
@@ -115,7 +116,6 @@ class MaskSearch:
         self.pats = [torch.cat([place(j, p[n][0].to(self.dev), p[n][1].to(self.dev).long()) for j, n in enumerate(self.names)])
                      for p in pats]
         self.logit = torch.full((len(pr.nodes),), INIT, device=self.dev, requires_grad=True)
-        self.ids = torch.tensor([tx.ids], device=self.dev)
 
     def sample(self, S: int) -> torch.Tensor:
         u = torch.rand(S, len(self.logit), device=self.dev).clamp(1e-6, 1 - 1e-6)
@@ -146,20 +146,10 @@ class MaskSearch:
             g = g + (1 - g) * m
         return {n: g[:, at:at + self.T * C].view(R, self.T, C) for n, (at, C) in zip(self.names, self.offsets)}
 
-    def kl(self, masks: dict) -> torch.Tensor:
-        """KL in bits at the targets of each row's masked run [R] (VPD's masked forward on the gathered columns; autograd)."""
-        nat, tg = self.ge.nat, self.ge.nat.target
-        R = next(iter(masks.values())).shape[0]
-        for j, n in enumerate(self.names):
-            st = tg.site(n)
-            st.mask, st.gathered = masks[n], self.gathered[j]
-            st.delta_mask = torch.ones(R, self.T, device=self.dev) if self.live else None
-        try:
-            hidden = tg.hidden(self.ids.expand(R, -1), fused=True)
-        finally:
-            nat.vpd.clear()
-        lq = torch.log_softmax((hidden[:, self.tx.targets] @ tg.wte.T).float(), -1)
-        return carry.kl(self.tx.ref, lq)
+    def kl(self, masks: dict, precision: str = "score") -> torch.Tensor:
+        """KL in bits at the targets of each row's masked run [R] (VPD's masked forward on the gathered columns, the
+        engine's; autograd); precision "score" (float32) or a search's (self.search, for the gates' steps)."""
+        return self.eng.kl(masks, precision)
 
     @torch.no_grad()
     def kl_chunked(self, make, R: int, chunk: int) -> torch.Tensor:
@@ -173,7 +163,7 @@ def size_soft(ms: MaskSearch, p: torch.Tensor, node_bits: float, pos_bits: float
 
 
 def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answer: dict, saved: dict, task: str,
-           B: int = 32, chunk: int = 8, seed: int = 0, edges: bool = False) -> tuple[dict, dict, dict]:
+           B: int = 32, chunk: int = 32, seed: int = 0, edges: bool = False) -> tuple[dict, dict, dict]:
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets)
@@ -210,9 +200,9 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
                 worst[cand] = torch.maximum(worst[cand] * 0.9, score.max(0).values)
                 pick_ = score.argmax(1).tolist()
             opt.zero_grad()
-            adv = ms.kl(ms.masks(z, [pats[cand[k]] for k in pick_]))
+            adv = ms.kl(ms.masks(z, [pats[cand[k]] for k in pick_]), ms.search)
             gate = ms.masks(z, None)
-            minus = ms.kl({n: vpd_masks[n] * (1 - gate[n]) for n in nat.names})
+            minus = ms.kl({n: vpd_masks[n] * (1 - gate[n]) for n in nat.names}, ms.search)
             f_term = (adv.clamp_min(TINY).log() - vpd_adv[[cand[k] for k in pick_]]) / D
             n_term = (1 - (minus.clamp_min(TINY).log() - math.log(vpd)) / D).clamp_min(0)
             loss = f_term.mean() + n_term.mean() + lam * size_soft(ms, ms.p_on(), node_bits, pos_bits, scale)
@@ -414,7 +404,7 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--chunk", type=int, default=8, help="rows per masked run (memory)")
+    ap.add_argument("--chunk", type=int, default=32, help="rows per masked run (memory)")
     ap.add_argument("--edges", action="store_true", help="the pick's connections by teacher.py's measured descent to graph F1 >= 0.9")
     ap.add_argument("--evaluate", type=Path, help="score this directory's <task>.json circuits instead of searching (one JSONL line each in --out)")
     ap.add_argument("--seed", type=int, default=1, help="--evaluate: the patterns' draw (the search draws with 0)")

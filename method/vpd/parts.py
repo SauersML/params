@@ -189,31 +189,63 @@ def members_bits(K: int, scope: int) -> float:
     return 0.0 if K == 1 else float(lbinom(scope, K) + math.log2(scope))
 
 
-class Part:
-    """A part's members and the union of their active positions with how many members are on at each."""
+DENSE = 1 / 64  # a part whose positions exceed this share of N keeps its counts as one array over all positions
 
-    def __init__(self, members: list[int], U: np.ndarray, c: np.ndarray):
-        self.members, self.U, self.c = members, U, c
+
+class Part:
+    """A part's members and how many of them are on at each position: sparse (the union U of their positions with
+    the counts c) or, for a large part, dense (counts D over all N positions; U and c None)."""
+
+    def __init__(self, members: list[int], U, c, D=None):
+        self.members, self.U, self.c, self.D = members, U, c, D
 
     @staticmethod
     def single(i: int, act: "Activity") -> "Part":
         P = act.of(i)
         return Part([i], P, np.ones(len(P), np.int32))
 
-    def merged(self, other: "Part") -> "Part":
+    def size(self) -> int:
+        return len(self.U) if self.D is None else int(np.count_nonzero(self.D))
+
+    def dense(self, N: int) -> np.ndarray:
+        if self.D is not None:
+            return self.D
+        D = np.zeros(N, np.uint16)
+        D[self.U] = self.c
+        return D
+
+    def merged(self, other: "Part", N: int) -> "Part":
+        members = self.members + other.members
+        if self.D is not None or other.D is not None or len(self.U) + len(other.U) > DENSE * N:
+            D = self.dense(N).copy() if self.D is not None else self.dense(N)
+            if other.D is not None:
+                D += other.D
+            else:
+                D[other.U] += other.c.astype(np.uint16)
+            return Part(members, None, None, D)
         U = np.union1d(self.U, other.U)
         c = np.zeros(len(U), np.int32)
         c[np.searchsorted(U, self.U)] += self.c
         c[np.searchsorted(U, other.U)] += other.c
-        return Part(self.members + other.members, U, c)
+        return Part(members, U, c)
+
+    def at(self, P: np.ndarray) -> np.ndarray:
+        """Members on at the positions P (each a position of some member)."""
+        return self.D[P].astype(np.int64) if self.D is not None else self.c[np.searchsorted(self.U, P)]
+
+    def counts(self) -> np.ndarray:
+        """The member count at every position where at least one member is on."""
+        if self.D is None:
+            return self.c
+        return self.D[self.D > 0].astype(np.int64)
 
     def bits(self, act: "Activity", scope: int) -> tuple[float, int]:
         """(bits, tau): the part's code length (module note) at its best gate rule."""
         if len(self.members) == 1:
-            return float(alone(len(self.U), act.N)), 1
-        levels = [self.c[np.searchsorted(self.U, act.of(i))] for i in self.members]
+            return float(alone(act.count(self.members[0]), act.N)), 1
+        levels = [self.at(act.of(i)) for i in self.members]
         n = np.array([len(lv) for lv in levels])
-        return code(len(self.members), self.c, levels, n, act.N, scope)
+        return code(len(self.members), self.counts(), levels, n, act.N, scope)
 
 
 def code(K: int, U_counts: np.ndarray, levels: list[np.ndarray], n: np.ndarray, N: int, scope: int) -> tuple[float, int]:
@@ -235,7 +267,7 @@ def code(K: int, U_counts: np.ndarray, levels: list[np.ndarray], n: np.ndarray, 
 def part_code(members: list[int], act: "Activity", scope: int) -> tuple[float, int]:
     p = Part.single(members[0], act)
     for i in members[1:]:
-        p = p.merged(Part.single(i, act))
+        p = p.merged(Part.single(i, act), act.N)
     return p.bits(act, scope)
 
 
@@ -257,7 +289,7 @@ def agglomerate(groups: list[list[int]], act: "Activity", scope_of, candidates: 
     for k, g in enumerate(groups):
         p = Part.single(g[0], act)
         for i in g[1:]:
-            p = p.merged(Part.single(i, act))
+            p = p.merged(Part.single(i, act), act.N)
         parts[k], bits[k] = p, p.bits(act, scope_of(p.members))[0]
         for i in g:
             part_of[i] = k
@@ -271,7 +303,7 @@ def agglomerate(groups: list[list[int]], act: "Activity", scope_of, candidates: 
         a, b = part_of[i], part_of[j]
         if a == b:
             continue
-        merged = parts[a].merged(parts[b])
+        merged = parts[a].merged(parts[b], act.N)
         new_bits = merged.bits(act, scope_of(merged.members))[0]
         evaluated += 1
         saving = bits[a] + bits[b] - new_bits
@@ -328,12 +360,12 @@ def fixed_tau_bits(members: list[int], act: Activity, scope: int, tau: int) -> f
         return float(alone(act.count(members[0]), act.N))
     p = Part.single(members[0], act)
     for i in members[1:]:
-        p = p.merged(Part.single(i, act))
+        p = p.merged(Part.single(i, act), act.N)
     K = len(members)
-    m = float((p.c >= tau).sum())
+    m = float((p.counts() >= tau).sum())
     bits = L(m, act.N) + math.log2(K) + members_bits(K, scope)
     for i in members:
-        lv = p.c[np.searchsorted(p.U, act.of(i))]
+        lv = p.at(act.of(i))
         ins = float((lv >= tau).sum())
         bits += L(m - ins, m) + L(len(lv) - ins, act.N - m)
     return float(bits)

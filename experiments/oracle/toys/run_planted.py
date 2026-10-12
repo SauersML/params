@@ -85,11 +85,39 @@ def circuits(name: str, nat, tx) -> dict:
     return {"true": active(nat, tx, every)}
 
 
-def run(name: str, path: Path, out: Path, n_texts: int, arms: list, log=print) -> None:
+def toy_texts(name: str, out: Path, n: int, seed: int) -> list[Path]:
+    """n texts of the toy's training distribution as text files (native.text's format), for goal_eval.build_patterns."""
+    import vpd_toy
+
+    d = out / "texts" / name
+    d.mkdir(parents=True, exist_ok=True)
+    ids = next(vpd_toy.loader(name, n, seed)).tolist()
+    paths = []
+    for i, x in enumerate(ids):
+        p = d / f"t{seed}_{i}.json"
+        p.write_text(json.dumps({"prompts": [{"token_ids": x, "target_positions": [len(x) - 1]}]}))
+        paths.append(p)
+    return paths
+
+
+def phi_without_n(r: dict):
+    return goal_eval.phi({**r, "n_point": None})[0] if "error" not in r else None
+
+
+def run(name: str, path: Path, out: Path, n_texts: int, arms: list, decomp: str = "exact", log=print) -> None:
     d = torch.load(path)
-    nat = planted.native_of(d["sd"], d["cfg"])
+    if decomp == "vpd":
+        import vpd_toy
+
+        nat = vpd_toy.native_of_fit(d["sd"], d["cfg"], torch.load(path.with_name(f"{path.stem.replace('nothing', 'route1')}.vpd.pt")))
+    else:
+        nat = planted.native_of(d["sd"], d["cfg"])
     ge = ToyEval(nat, chunk=16)
-    ge.donor_pools.update(search=[], eval=[])   # the far donors are vpd4l's texts, outside a toy's vocabulary
+    # far donors: other texts of the toy's own distribution (vpd4l's are outside its vocabulary); the flips' pool: VPD's
+    # active sets on the toy's training distribution (goal_eval.build_patterns)
+    far = [(f"far{i}", x) for i, x in enumerate(next(__import__("vpd_toy").loader(name, 16, 99)).tolist())]
+    ge.donor_pools.update(search=far[:8], eval=far[8:])
+    pool = goal_eval.build_patterns(toy_texts(name, out, 48, 7), out / f"{name}.{decomp}.pool.pt", nat)
     texts = planted.ordinary(name, n_texts)
     texts = list(dict.fromkeys(tuple(x) for x in texts))  # the gate toys have three distinct texts
     with (out / f"{name}.jsonl").open("a") as fh:
@@ -105,7 +133,7 @@ def run(name: str, path: Path, out: Path, n_texts: int, arms: list, log=print) -
                     nodes = [(n, int(t), int(c)) for n, c, t in circ[""]["nodes"] if n not in ("tok", "block")]
                     blocks = [x for x in circ[""]["nodes"] if x[0] == "block"]
                     u, pos = units_of(nat, nodes)
-                    rec = {"toy": name, "text": i, "ids": ids, "arm": arm, "units": u, "positions": pos, "blocks": blocks,
+                    rec = {"toy": name, "text": i, "decomp": decomp, "ids": ids, "arm": arm, "units": u, "positions": pos, "blocks": blocks,
                            "nodes": len(nodes), "edges": len(circ[""].get("edges") or []), "seconds": time.perf_counter() - t0,
                            "f1": row.get("best", {}).get("f1"), "n": row.get("best", {}).get("n")}
                 except Exception as e:  # noqa: BLE001
@@ -116,13 +144,15 @@ def run(name: str, path: Path, out: Path, n_texts: int, arms: list, log=print) -
             cs = circuits(name, nat, ge.text(ids, targets))
             graphs = [native.Graph(v, complete=True) for v in cs.values()]
             try:
-                rows = ge.fidelity(tx, graphs, None, mode="full", split="eval")
+                rows = ge.fidelity(tx, graphs, pool, mode="full", split="eval")
             except Exception as e:  # noqa: BLE001
                 rows = [{"error": f"{type(e).__name__}: {e}"}] * len(graphs)
             for (label, v), r in zip(cs.items(), rows):
                 ph = goal_eval.phi(r)[0] if "error" not in r else None
-                rec = {"toy": name, "text": i, "circuit": label, "nodes": len(v), "phi": ph,
-                       **{k: r.get(k) for k in ("s_point_c", "n_point", "s_track_pp", "s_interchange_pp", "s_nodes", "s_edges", "c", "error")}}
+                rec = {"toy": name, "text": i, "decomp": decomp, "circuit": label, "nodes": len(v), "phi": ph, "phi_without_n": phi_without_n(r),
+                       **{k: r.get(k) for k in ("s_point_c", "n_point", "s_track_pp", "s_interchange_pp", "s_nodes", "s_edges",
+                                                "s_donor_near", "s_donor_far", "c", "error")},
+                       "f1_flips_c": (r.get("f1_flips_c") or {}), "flips_to_half": r.get("flips_to_half")}
                 fh.write(json.dumps(rec) + "\n")
                 fh.flush()
                 log(f"{name} text {i} Φ {label}: {json.dumps({k: (round(x, 3) if isinstance(x, float) else x) for k, x in rec.items() if k not in ('toy', 'text')})}")
@@ -135,10 +165,11 @@ def main():
     ap.add_argument("--only", default="binding_km,binding_fp,route1,route2,additive,interaction,cancel,nothing")
     ap.add_argument("--texts", type=int, default=6)
     ap.add_argument("--arms", default="current,changed")
+    ap.add_argument("--decomp", choices=("exact", "vpd"), default="exact", help="exact: per-head and per-neuron pieces; vpd: vpd_toy.py's fit")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     for name in args.only.split(","):
-        run(name, args.toys / f"{name}.pt", args.out, args.texts, args.arms.split(","))
+        run(name, args.toys / f"{name}.pt", args.out, args.texts, args.arms.split(","), args.decomp)
 
 
 if __name__ == "__main__":

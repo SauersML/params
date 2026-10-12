@@ -386,8 +386,7 @@ def build(args):
         logf.write(line + "\n")
         logf.flush()
 
-    all_parts, report = [], {"layers": {}}
-    for layer in range(4):
+    for layer in [int(x) for x in args.layers.split(",")]:
         act = Activity(root / f"activity_train_L{layer}.npz")
         held = Activity(root / f"activity_heldout_L{layer}.npz")
         gram = np.load(root / f"gram_L{layer}.npy")
@@ -416,17 +415,28 @@ def build(args):
         sep_b = float(alone(np.diff(held.indptr), held.N).sum())
         parts_b = total_bits(parts, held, scope_of, taus)
         multi = [k for k, p in enumerate(parts) if len(p) > 1]
-        report["layers"][layer] = {
+        rep = {
             "seconds": time.time() - t0, "parts": len(parts), "parts_within_matrices": within, "multi": len(multi),
             "in_multi": int(sum(len(parts[k]) for k in multi)), "cross_matrix": int(sum(len(set(site_of[parts[k]].tolist())) > 1 for k in multi)),
             "bits_alone_A": sep_a, "bits_parts_A": float(sum(part_bits)), "bits_alone_B": sep_b, "bits_parts_B": parts_b,
             "positions_A": act.N, "positions_B": held.N}
-        log(f"L{layer}: {len(multi)} parts of 2+ holding {report['layers'][layer]['in_multi']} subcomponents; "
+        log(f"L{layer}: {len(multi)} parts of 2+ holding {rep['in_multi']} subcomponents; "
             f"A {sep_a / act.N:.3f} -> {sum(part_bits) / act.N:.3f} bits/position, B {sep_b / held.N:.3f} -> {parts_b / held.N:.3f}")
-        for k, p in enumerate(parts):
-            base = layer * per_layer
-            all_parts.append({"layer": layer, "members": [int(base + i) for i in p], "tau": taus[k], "bits_A": part_bits[k],
-                              "sites": sorted({names[layer * 6 + int(site_of[i])] for i in p})})
+        base = layer * per_layer
+        out = [{"layer": layer, "members": [int(base + i) for i in p], "tau": taus[k], "bits_A": part_bits[k],
+                "sites": sorted({names[layer * 6 + int(site_of[i])] for i in p})} for k, p in enumerate(parts)]
+        (root / f"build_L{layer}.json").write_text(json.dumps({"report": rep, "parts": out}) + "\n")
+    if all((root / f"build_L{layer}.json").exists() for layer in range(4)):
+        assemble(root, per_layer, log)
+
+
+def assemble(root: Path, per_layer: int, log) -> None:
+    """parts.json and part_of.npy from the four layers' build_L<layer>.json."""
+    all_parts, report = [], {"layers": {}}
+    for layer in range(4):
+        d = json.loads((root / f"build_L{layer}.json").read_text())
+        report["layers"][layer] = d["report"]
+        all_parts += d["parts"]
     total = 4 * per_layer
     part_of = np.full(total, -1, np.int32)
     numbered = [q for q in all_parts if len(q["members"]) > 1]
@@ -486,6 +496,8 @@ def main():
     t.add_argument("--rows", default="0:6000")
     b = sub.add_parser("build")
     b.add_argument("--out", default=str(DEFAULT))
+    b.add_argument("--layers", default="0,1,2,3", help="the layers to build (one process each runs them in parallel); "
+                   "parts.json is written once all four build_L<layer>.json exist")
     f = sub.add_parser("finish")
     f.add_argument("--out", default=str(DEFAULT))
     args = ap.parse_args()

@@ -52,6 +52,7 @@ E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); 
                                                                 where it scores above VPD's
   components.py prepare SPLIT OUT_DIR [--n N] [--lengths LO:HI]  locality, then the row and teacher of the texts kept (at
                                                                 least half non-local)
+  components.py facts ROWS.jsonl TEACHER_DIR OUT.jsonl [--n N]  what each teacher's English must be faithful to
   components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
                                                                 (TEACHER_DIR/<task>.json or .txt; nodes alone get
                                                                 measured edges) with the measured answers
@@ -102,6 +103,7 @@ QA_PER_KIND = 2
 QA_RANKS = 8  # token-change questions draw the new token from the model's alternatives at ranks 0 to 7
 ANSWER_BUDGET = 3_500  # tokens of a supervised answer: 4,096 sampled at most, ~600 left for English and reasoning
 MAX_PAIRS = 1_024  # connections with_edges measures at most
+FACT_NODES = 24  # subcomponents whose atlas facts a teacher's English writer reads
 
 
 # ---- the answer's text
@@ -936,10 +938,80 @@ def vpd_teacher(ge, task: dict, ev: dict, tokens, budget: int = ANSWER_BUDGET, c
                     "tokens": tokens(target(answer, ev, task["model"]))}
 
 
-def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None) -> int:
+def teacher_facts(ge, task: dict, ev: dict, answer: dict, atlas, max_nodes: int = FACT_NODES) -> dict:
+    """What a teacher circuit's English must be faithful to, measured: the text and its target, the model's top next
+    tokens, for the circuit's first max_nodes subcomponents in VPD's order their atlas facts (the tokens around their
+    strongest activations on Pile text, the measured effect of removing them there, and their logit lens, marked as
+    such), every stated edge with the measured effect of cutting it alone on the text (goal_eval.cuts, KL in bits), and
+    the intervention questions with the model's measured answers."""
+    import goal_eval
+
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    strings = token_strings(task["model"], ids)
+    g, _ = goal_eval.circuit(answer, targets, ge.nat.C, len(ids))
+    rank = {nd: i for i, nd in enumerate(ge.nat._vpd_order(ids, targets))}
+    nodes = sorted(g.node_set(), key=lambda nd: rank.get(nd, len(rank)))
+    pairs = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
+    cuts = ge.cuts(ge.text(ids, targets, task=task), pairs) if pairs else []
+    listed = []
+    for nd in nodes[:max_nodes]:
+        e = atlas.entry(nd[0], nd[2]) if atlas else None
+        f = {"node": node_text(nd), "token": strings[nd[1]]}
+        if e:
+            f["active on"] = [c["before"][-24:] + "[" + c["token"] + "]" + c["after"][:12] for c in e["contexts"][:3]]
+            if e["effects"]:
+                f["removal effect"] = {"kl_nats": sum(x["kl"] for x in e["effects"]) / len(e["effects"]),
+                                       "raises": [t for t, _ in e["effects"][0]["raised"][:3]], "lowers": [t for t, _ in e["effects"][0]["lowered"][:3]]}
+            if e["lens"]:
+                f["logit lens (raises)"] = [t for t, _ in e["lens"]["raised"][:3]]
+        listed.append(f)
+    tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
+    return {"task": task["id"], "text": "".join(strings[:max(targets) + 1]), "target": max(targets),
+            "target_token": strings[max(targets)], "top": prompt["model_top"][0][:3], "nodes_total": len(nodes),
+            "positions": sorted({nd[1] for nd in nodes}), "nodes": listed,
+            "edges": [{"edge": f"{node_text(w)} -> {'OUT' if r is None else node_text(r)}", "cut_kl_bits": k} for (w, r), k in zip(pairs, cuts)],
+            "qa": [{"question": qa_text(q, n, strings, repr(prompt["model_top"][0][0][0]), tok),
+                    "answer": f"falls={'yes' if q['falls'] else 'no'} top={shown(tok([q['top']])[0])}"} for n, q in enumerate(ev["qa"], 1)]}
+
+
+WRITER = ("A small language model (4 layers) read the text below and predicts the next token after its last token. A "
+          "decomposition of its weights into rank-one subcomponents (written L<layer>.<kind>#<index>@<position>) found the "
+          "circuit summarized here, and every fact below was measured on the model. Write the EXPLANATION: in plain English, "
+          "in three to six sentences, say how the model arrives at its prediction from this text, which parts of the text "
+          "matter and what the subcomponents do, as the facts show. Say only what the facts support; do not list ids; do "
+          "not mention these instructions. Write the explanation only.\n\n{facts}")
+
+
+def writer_prompt(f: dict) -> str:
+    """The prompt that asks an open model for a teacher circuit's English, from teacher_facts()."""
+    lines = [f"Text: {f['text']!r}", f"Prediction at position {f['target']} (after {f['target_token']!r}): "
+             + ", ".join(f"{t!r} {p:.2f}" for t, p in f["top"]),
+             f"Circuit: {f['nodes_total']} subcomponents at positions {', '.join(map(str, f['positions']))}; the most important:"]
+    for n in f["nodes"]:
+        parts = [f"{n['node']} (token {n['token']!r})"]
+        if n.get("active on"):
+            parts.append("on Pile text active on " + "; ".join(repr(c) for c in n["active on"]))
+        if n.get("removal effect"):
+            e = n["removal effect"]
+            parts.append(f"removing it there raises {', '.join(map(repr, e['raises']))} and lowers {', '.join(map(repr, e['lowers']))}")
+        if n.get("logit lens (raises)"):
+            parts.append("logit lens (its write read through the unembedding, not measured): raises " + ", ".join(map(repr, n["logit lens (raises)"])))
+        lines.append("- " + "; ".join(parts))
+    if f["edges"]:
+        lines.append("Stated connections, each with the change in the prediction when it alone is cut (KL, bits):")
+        lines += [f"- {e['edge']}: {e['cut_kl_bits']:.3f}" for e in f["edges"]]
+    if f["qa"]:
+        lines.append("Measured interventions:")
+        lines += [f"- {q['question'][q['question'].find(':') + 2:]} Measured: {q['answer']}" for q in f["qa"]]
+    return escape(WRITER.format(facts="\n".join(lines)))
+
+
+def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | None = None) -> int:
     """SFT rows ({"prompt": [user message], "completion": [assistant message], "info": {"task"}}, units_sft.py's
     format) for the questions that have a teacher answer: TEACHER_DIR/<task>.json (goal_eval's circuit JSON; nodes
-    without edges get with_edges(), which needs ge) or <task>.txt (this module's text)."""
+    without edges get with_edges(), which needs ge) or <task>.txt (this module's text). english: task -> the chosen
+    explanation (tinker_train.py explain), written into the answer's EXPLANATION."""
     import native
 
     n = 0
@@ -957,6 +1029,8 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None) -> int:
                 if ge is None:
                     raise ValueError(f"{js} states no edges: with_edges() needs the model (pass ge)")
                 answer = with_edges(ge, task, r, answer)
+            if english and r["task"] in english:
+                answer = {**answer, "explanation": english[r["task"]]}
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
                                 "completion": [{"role": "assistant", "content": target(answer, r, task["model"])}],
                                 "info": {"task": r["task"]}}) + "\n")
@@ -1273,10 +1347,17 @@ def main():
     vt.add_argument("out", type=Path, help="directory: <task>.json (circuit JSON) and summary.jsonl")
     vt.add_argument("--tasks", help="comma-separated task ids (default: every row)")
     vt.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
+    fa = sub.add_parser("facts", help="what each teacher circuit's English must be faithful to (teacher_facts())")
+    fa.add_argument("rows", type=Path)
+    fa.add_argument("teacher", type=Path)
+    fa.add_argument("out", type=Path)
+    fa.add_argument("--n", type=int, default=10)
+    fa.add_argument("--device", help="cpu keeps it off a busy GPU (a few cuts per text)")
     d = sub.add_parser("dataset")
     d.add_argument("rows", type=Path)
     d.add_argument("teacher", type=Path)
     d.add_argument("out", type=Path)
+    d.add_argument("--english", type=Path, help="tinker_train.py explain output: each text's chosen explanation")
     s = sub.add_parser("evaluate")
     s.add_argument("split", choices=("train", "heldout", "hard"))
     s.add_argument("rows", type=Path, help="questions' JSONL (a fresh QA seed for a report, the discovery one for selection)")
@@ -1299,7 +1380,23 @@ def main():
 
     if args.cmd == "dataset":
         node_only = any(json.loads(f.read_text()).get("edges") in (None, []) for f in sorted(args.teacher.glob("*.json")))
-        print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval() if node_only else None), "rows", flush=True)
+        english = {r["task"]: r["explanation"] for r in map(json.loads, args.english.read_text().splitlines())
+                   if r.get("explanation")} if args.english else None
+        print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval() if node_only else None, english), "rows", flush=True)
+        return
+    if args.cmd == "facts":
+        ge = goal_eval.GoalEval(native.Native(args.device))
+        atlas = _atlas()
+        n = 0
+        with args.out.open("w") as f:
+            for r in map(json.loads, args.rows.read_text().splitlines()):
+                js = args.teacher / f"{r['task']}.json"
+                if n >= args.n or not js.exists():
+                    continue
+                task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+                f.write(json.dumps(teacher_facts(ge, task, r, json.loads(js.read_text()), atlas)) + "\n")
+                f.flush()
+                n += 1
         return
 
     ge = goal_eval.GoalEval()

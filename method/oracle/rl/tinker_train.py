@@ -9,6 +9,8 @@ default) and the key from TINKER_API_KEY (read from the Keychain at launch, neve
   tinker_train.py sample QUESTIONS.jsonl OUT.jsonl [--init STATE_PATH] [--n 50] [--samples 4]    answers to evaluate
   tinker_train.py readers SAMPLES.jsonl QUESTIONS.jsonl OUT.jsonl [--reader-b MODEL]   E1 and its controls (components.py
                                                                                       evaluate --e1)
+  tinker_train.py explain FACTS.jsonl ROWS.jsonl OUT.jsonl [--n 8] [--reader-b MODEL]   teacher English: an open model's best
+                                                                                      of N by E1, kept above the empty one
 
 SFT.jsonl: components.py dataset rows; QUESTIONS.jsonl: components.py questions rows. sft trains on the assistant
 message only (Qwen3's template with thinking disabled) and saves its state (DIR/state.json holds the tinker:// path).
@@ -172,6 +174,68 @@ def readers(a) -> None:
                                 "reader_b": components.e1_bits(reader_b, task, rows[t], texts[:1])[0] if reader_b else None}) + "\n")
             f.flush()
     print(json.dumps({"questions": len(order), "spend_usd": spend_b.total if spend_b else None}), flush=True)
+
+
+def explain(a) -> None:
+    """Teacher English: for each teacher circuit's facts (components.py facts), an open base model on Tinker (never
+    trained here) writes N explanations from components.writer_prompt; reader A scores each by E1 (bits saved on the
+    text's reader questions); the best is kept only when it saves more than the empty explanation (0 bits). On the kept
+    ones, the controls: another text's kept explanation read on this text (shuffled) and reader B (an independent
+    model). {"task", "samples", "e1", "explanation" (kept, or ""), "e1_best", "shuffled", "reader_b"} per text."""
+    import tinker
+    from tinker_cookbook import renderers
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import components
+
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    service = service_client()
+    wr, _ = renderer_for(a.writer)
+    writer = service.create_sampling_client(base_model=a.writer)
+    spend_w = Spend(a.out.parent, a.writer)
+    ra, ta = renderer_for(a.reader_a)
+    reader_a = tinker_reader(service, a.reader_a, ra, ta, Spend(a.out.parent, a.reader_a))
+    reader_b = tinker_reader(service, a.reader_b, *renderer_for(a.reader_b), Spend(a.out.parent, a.reader_b)) if a.reader_b else None
+    rows = {r["task"]: r for r in map(json.loads, a.rows.read_text().splitlines())}
+    facts = [json.loads(x) for x in a.facts.read_text().splitlines() if x.strip()]
+    params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=wr.get_stop_sequences())
+    futs = []
+    for f in facts:
+        prompt = wr.build_generation_prompt([{"role": "user", "content": components.writer_prompt(f)}])
+        futs.append((f, prompt, writer.sample(prompt=prompt, num_samples=a.n, sampling_params=params)))
+    out = []
+    for f, prompt, fut in futs:
+        res = fut.result()
+        hits = res.prompt_cache_hit_tokens
+        spend_w.add("writer", prefill=prompt.length - hits, cached=hits + (a.n - 1) * prompt.length, sampled=sum(len(x.tokens) for x in res.sequences))
+        texts = []
+        for x in res.sequences:
+            t = renderers.get_text_content(wr.parse_response(x.tokens)[0]).strip()
+            t = t[len("EXPLANATION:"):].strip() if t.upper().startswith("EXPLANATION:") else t
+            texts.append(" ".join(t.split()))
+        task = json.loads((a.texts_dir / f"{f['task']}.json").read_text())
+        e1 = components.e1_bits(reader_a, task, rows[f["task"]], [f"EXPLANATION: {t}" for t in texts])
+        best = max(range(len(texts)), key=lambda i: e1[i] if e1[i] is not None else -1e9)
+        keep = e1[best] is not None and e1[best] > 0
+        out.append({"task": f["task"], "samples": texts, "e1": e1, "best": best, "explanation": texts[best] if keep else "",
+                    "e1_best": e1[best], "e1_mean": sum(e for e in e1 if e is not None) / max(1, sum(e is not None for e in e1))})
+        print(json.dumps({k: out[-1][k] for k in ("task", "e1_best", "e1_mean")} | {"kept": keep}), flush=True)
+    kept = [o for o in out if o["explanation"]]
+    for i, o in enumerate(kept):
+        task = json.loads((a.texts_dir / f"{o['task']}.json").read_text())
+        if len(kept) > 1:
+            other = kept[(i + 1) % len(kept)]["explanation"]
+            o["shuffled"] = components.e1_bits(reader_a, task, rows[o["task"]], [f"EXPLANATION: {other}"])[0]
+        if reader_b is not None:
+            o["reader_b"] = components.e1_bits(reader_b, task, rows[o["task"]], [f"EXPLANATION: {o['explanation']}"])[0]
+    with a.out.open("w") as fh:
+        for o in out:
+            fh.write(json.dumps(o) + "\n")
+    total = sum(json.loads(x)["usd"] for x in (a.out.parent / "spend.jsonl").read_text().splitlines())
+    mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
+    print(json.dumps({"texts": len(out), "kept": len(kept), "e1_best": mean([o["e1_best"] for o in out if o["e1_best"] is not None]),
+                      "e1_mean": mean([o["e1_mean"] for o in out]), "shuffled": mean([o["shuffled"] for o in kept if o.get("shuffled") is not None]),
+                      "reader_b": mean([o["reader_b"] for o in kept if o.get("reader_b") is not None]), "spend_usd": total}), flush=True)
 
 
 def clients(base: str, rank: int, init: str | None):
@@ -346,8 +410,18 @@ def main():
     e.add_argument("--reader-a", default="Qwen/Qwen3-8B", help="the reward's reader")
     e.add_argument("--reader-b", help="an independent reader for the decisive check (a model in PRICES)")
     e.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
+    x = sub.add_parser("explain")
+    x.add_argument("facts", type=Path, help="components.py facts output")
+    x.add_argument("rows", type=Path, help="the texts' question rows (reader events)")
+    x.add_argument("out", type=Path)
+    x.add_argument("--n", type=int, default=8, help="explanations sampled per text")
+    x.add_argument("--writer", default="Qwen/Qwen3-8B")
+    x.add_argument("--reader-a", default="Qwen/Qwen3-8B")
+    x.add_argument("--reader-b", help="an independent reader for the control (a model in PRICES)")
+    x.add_argument("--max-tokens", type=int, default=400)
+    x.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     a = ap.parse_args()
-    {"sft": sft, "rl": rl, "sample": sample, "readers": readers}[a.cmd](a)
+    {"sft": sft, "rl": rl, "sample": sample, "readers": readers, "explain": explain}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,9 @@
 #   env: RUN, SPLIT, N, OFFSET, TASKS, PODS, P, DEST, VPD, LABELS (a locality JSONL; TASKS' own "local" fields otherwise),
 #   LOCALITY, BATCH, TEACHER_ARGS (more teacher.py flags, e.g. "--edges --f1-start both"), SCRIPT (teacher_v3.py for the v3
 #   search: no locality labels, needs VPD=FILE, which also holds its patterns), REF, GPU, PRICE, VRAM, RAM, WAIT
-#   (minutes of retries while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all)
+#   (minutes of retries while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all), FROM (a directory
+#   of saved paths, teacher.py --from-path: only texts with a <task>.path.json there are taught, and each pod gets its
+#   texts' path, F1 and top-k files as one tar)
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params
@@ -29,9 +31,10 @@ F=/Users/user/mpd-data/scratch/fleet/teacher_$RUN
 V=/Users/user/mpd-data/vpd
 mkdir -p "$F" "$DEST"
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
-/usr/bin/python3 -I - "$SPLIT" "$N" "$OFFSET" "$PODS" "$F" "$DEST" "${TASKS:-}" <<'EOF' || exit 1
-import json, pathlib, sys
+/usr/bin/python3 -I - "$SPLIT" "$N" "$OFFSET" "$PODS" "$F" "$DEST" "${TASKS:-}" "${FROM:-}" <<'EOF' || exit 1
+import json, pathlib, sys, tarfile
 split, n, off, pods, F, dest, tasks = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), pathlib.Path(sys.argv[5]), pathlib.Path(sys.argv[6]), sys.argv[7]
+source = pathlib.Path(sys.argv[8]) if sys.argv[8] else None
 labels = []
 if tasks:
     lines = [x.strip() for x in open(tasks) if x.strip()]
@@ -42,9 +45,15 @@ else:
     d = pathlib.Path("/Users/user/mpd-data/graph_oracle/texts/vpd4l")
     files = [p for p in d.glob("*.json") if not p.name.startswith(".")]
     ids = [p.stem for p in sorted(files, key=lambda p: int(p.stem[4:])) if json.loads(p.read_text())["split"] == split][:n]
-todo = [t for t in ids[off:] if not (dest / f"{t}.json").exists()]
+todo = [t for t in ids[off:] if not (dest / f"{t}.json").exists() and (source is None or (source / f"{t}.path.json").exists())]
 for j in range(pods):
     (F / f"tasks_{j}.txt").write_text("".join(t + "\n" for t in todo[j::pods]))
+    if source is not None:                     # each pod's saved paths with the files older path files need
+        with tarfile.open(F / f"from_{j}.tgz", "w:gz") as tar:
+            for t in todo[j::pods]:
+                for f in [source / f"{t}.path.json", source / f"{t}.f1.json"] + sorted(source.glob(f"{t}.vpd_top*.json")):
+                    if f.exists():
+                        tar.add(f, arcname=f.name)
 (F / "tasks_labels.jsonl").write_text("".join(json.dumps(r) + "\n" for r in labels))
 print(f"{len(todo)} texts to teach of {len(ids[off:])} ({len(ids[off:]) - len(todo)} already in {dest}), {pods} pods")
 EOF
@@ -78,6 +87,7 @@ cd /Users/user/params/method/oracle; python -B teacher.py --tasks $L --batch $BA
   for k in $(seq 0 $((P - 1))); do
     B="$A"
     [ -n "${LOCALITY:-}" ] && [ -z "${VPD:-}" ] && B="$B --labels $O/out/locality_$k.jsonl"
+    [ -n "${FROM:-}" ] && B="$B --from-path \$HOME/from"
     RUNS="$RUNS (python -B $SCRIPT --tasks $L --offset $k --stride $P $B --out $O/out > $O/teacher_$k.log 2>&1; echo \"exit \$?\" >> $O/teacher_$k.log) &"
   done
   CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
@@ -87,6 +97,7 @@ ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 $PRE
+${FROM:+mkdir -p ~/from; tar -xzf $F/from_$j.tgz -C ~/from;}
 cd /Users/user/params/method/oracle; $LOC
 set +e; $RUNS wait; echo all teacher processes done"
   (  # community stock comes and goes: a launch that finds no card in stock, or a host whose download of the published

@@ -60,11 +60,17 @@ ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 big=\$(( \$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1) >= 44000 ));
-set +e; (python -B goal_eval.py score --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --split heldout --n $N --diagnostics --out $O/score.json > $O/score.log 2>&1) &
+score() { python -B goal_eval.py score --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --split heldout --n $N --diagnostics --out $O/score.json > $O/score.log 2>&1; };
+fid() { rm -f $O/fid_\$1.jsonl; python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --vpd $F/vpd.pt --offset \$1 --stride ${FIDP:-2} --out $O/fid_\$1.jsonl > $O/fid_\$1.log 2>&1; };
+set +e; (score) &
 [ \$big = 1 ] || wait;
-for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --vpd $F/vpd.pt --offset \$k --stride ${FIDP:-2} --out $O/fid_\$k.jsonl > $O/fid_\$k.log 2>&1) & [ \$big = 1 ] || wait; done; wait"
+for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (fid \$k) & [ \$big = 1 ] || wait; done; wait;
+grep -q OutOfMemoryError $O/score.log && { echo 'score run out of memory beside the others: again alone'; score; };
+for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do grep -q OutOfMemoryError $O/fid_\$k.log && { echo \"fidelity shard \$k out of memory beside the others: again alone\"; fid \$k; }; done; true"
 # fidelity on a 264-node circuit holds ~16 GB, the score run ~8 GB: on a 48 GB card they run side by side, on a 24 GB
-# card one after another (two fidelity runs and the score run overflowed 24 GB); no card in stock is retried every 3 min
+# card one after another (two fidelity runs and the score run overflowed 24 GB); a run out of memory beside the others
+# runs again alone (the elv gate's second shard, 180-node circuits, overflowed a 44 GB A40 and left 10 of 20 texts
+# scored); no card in stock is retried every 3 min
 for try in $(seq 1 40); do
   RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.60} RP_MIN_VRAM_GB=24 RP_MIN_RAM_GB=16 \
     experiments/infra/runpod/rp-run $RN "${SCORE_GPU:-NVIDIA RTX A6000,NVIDIA A40,NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090}" 3.0 -- bash -c "$CMD" > "$F/rp_score.log" 2>&1 && break

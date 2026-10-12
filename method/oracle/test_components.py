@@ -178,6 +178,28 @@ def test_structural_changes_keep_the_tokens():
     assert "moved to position 12" in components.change_text({"kind": "move", "position": 5, "to": 12}, strings)
 
 
+class FakeReader:
+    """reader.Reader's bits: the bits each English 'saves' are its length in words, the neutral sentence's included."""
+
+    def __init__(self):
+        self.asked = None
+
+    def bits(self, task, texts, events):
+        self.asked = events
+        return [float(len(t.split())) if t else 0.0 for t in texts]
+
+
+def test_e1_is_measured_from_the_neutral_explanation_on_the_heaviest_events():
+    ev = {"events": [{"position": p, "new": 1, "alt": 0, "listed": False, "down": True, "weight": w, "bits": -w}
+                     for p, w in enumerate([0.1, 3.0, 0.5] + [0.01] * 20)],
+          "structure": [{"kind": "swap", "position": 1, "with": 2, "change": "x", "down": True, "weight": 2.0, "bits": -2.0}]}
+    r = FakeReader()
+    got = components.e1_bits(r, {}, ev, ["CIRCUIT:\nEXPLANATION: one two three four five six seven eight nine", "CIRCUIT:\n"])
+    neutral = len(components.NEUTRAL.split())
+    assert got == [9.0 - neutral, 0.0]  # beyond the neutral sentence; no English stays 0
+    assert len(r.asked) == components.E1_EVENTS and r.asked[0]["weight"] == 3.0 and r.asked[1]["weight"] == 2.0  # the heaviest
+
+
 class FakeEdits:
     """edit_eval.EditEval's score_many: a one-operation edit is valid with net 2 bits, a longer one rejected."""
 

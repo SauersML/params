@@ -113,6 +113,8 @@ WINDOW = 8  # a question numbers the tokens within this many positions of every 
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
 QA_PER_KIND = 2
 QA_RANKS = 8  # token-change questions draw the new token from the model's alternatives at ranks 0 to 7
+E1_EVENTS = 12  # the reader events E1 asks per text: the heaviest by measured effect (the strong reader's cost)
+NEUTRAL = "The model predicts its next token from the text."  # E1's baseline: an explanation that says nothing
 ANSWER_BUDGET = 3_500  # tokens of a supervised answer: 4,096 sampled at most, ~600 left for English and reasoning
 MAX_PAIRS = 1_024  # connections with_edges measures at most
 FACT_NODES = 24  # subcomponents a teacher's English writer reads about
@@ -944,13 +946,28 @@ def english(text: str) -> str:
     return _sections(text).get("EXPLANATION", "")
 
 
-def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None]:
-    """Each answer's E1: the bits its escaped English saves the frozen reader on the text's reader events
-    (units.reader_events: other positions and the listed positions' second tokens, never the oracle's evidence; and the
-    text's structural events, structure_events())."""
+def e1_events(ev: dict, k: int = E1_EVENTS) -> list[dict]:
+    """The reader events E1 asks: the text's units.reader_events (other positions and the listed positions' second
+    tokens, never the oracle's evidence) and its structural events (structure_events()), the k with the largest
+    measured effect (weight)."""
     import units
 
-    return reader.bits(task, [escape(english(x)) for x in texts], units.reader_events(ev["events"]) + ev.get("structure", []))
+    evs = units.reader_events(ev["events"]) + ev.get("structure", [])
+    return sorted(evs, key=lambda e: -e.get("weight", 1.0))[:k]
+
+
+def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None]:
+    """Each answer's E1: the bits its escaped English saves the frozen reader on the text's E1 events (e1_events())
+    beyond what NEUTRAL, an explanation that says nothing, saves the same reader there. A strong reader's unaided
+    guesses are good and any confident English costs it bits on events the English does not cover (reader validation,
+    10-12: the correct, wrong and shuffled explanations of 16 texts at -0.78, -1.92 and -3.63 bits on Qwen3.5-397B,
+    ordered right on 15 of 16): the baseline takes that offset out, so E1 measures what this English says beyond saying
+    something. An answer without English is 0 against no English, as before (none: the baseline is not subtracted)."""
+    evs = e1_events(ev)
+    eng = [escape(english(x)) for x in texts]
+    got = reader.bits(task, eng + [NEUTRAL], evs)
+    base = got[-1]
+    return [None if b is None else (b - base if e and base is not None else (0.0 if not e else b)) for b, e in zip(got[:-1], eng)]
 
 
 def size_term(bits: float, scale: float) -> float:

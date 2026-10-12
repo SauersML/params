@@ -21,6 +21,7 @@ sends the prediction).
 """
 
 import argparse
+import gc
 import hashlib
 import json
 import sys
@@ -76,6 +77,7 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
         q_z += list(sc._patched(mine, [(w, v["group"]) for w in texts]))
         ref_z += [w["lq"] for w in texts]
         del texts
+        gc.collect()  # the runs' tensors sit in reference cycles (var_teacher.release)
         native.free(nat.dev)
     res = 2 * noise
     names = components.token_strings(model, [tx.ids[p]] + zs + [int(i) for q in [base] + q_z for i in q[-1].topk(1).indices])

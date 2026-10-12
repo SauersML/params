@@ -44,6 +44,7 @@ carry all of it.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import re
 import sys
@@ -64,6 +65,13 @@ import variables  # noqa: E402
 GOAL = goal_eval.GOAL
 OUT = native.TEXTS.parent / "variables"
 BLOCK = variables.BLOCK
+
+
+def release(dev) -> None:
+    """Free a scorer call's tensors: its runs keep them in reference cycles, which Python's collector, counting
+    objects and not bytes, leaves for many calls (0.5 GiB a screening call on text9004: a 20 GB card ran out)."""
+    gc.collect()
+    native.free(dev)
 
 
 class _Screen(variables.Scorer):
@@ -203,6 +211,7 @@ def screen(sc: _Screen, tx, inputs: tuple, cands: list[tuple[list, str]], draws:
     """Every candidate of one input set scored on the search split (on-target and off-target), one row each."""
     vs = variables.parse([as_json(f"c{k}", inputs, g) for k, (g, _) in enumerate(cands)], sc.nat.C)
     got = sc.score(tx, vs, split="search", draws=draws)["variables"]
+    release(sc.nat.dev)
     return [{"inputs": list(inputs), "group": g, "how": how, "score": term(r), **{k: r[k] for k in
              ("f_on", "s_off", "f_off", "s_on", "draws_on", "draws_off")}} for (g, how), r in zip(cands, got)]
 
@@ -242,7 +251,9 @@ def measured_feeds(sc: variables.Scorer, tx, chosen: list[dict], draws: int) -> 
     js = lambda feeds: [as_json(v["name"], v["_inputs"], v["_group"], feeds(v)) for v in chosen]  # noqa: E731
     names = [v["name"] for v in chosen]
     every = sc.score(tx, variables.parse(js(lambda v: [w for w in names if w != v["name"]]), sc.nat.C), "search", draws)["feeds"]
+    release(sc.nat.dev)
     none = sc.score(tx, variables.parse(js(lambda v: []), sc.nat.C), "search", draws)["feeds"]
+    release(sc.nat.dev)
     apart = {(x["from"], x["to"]): x["f"] for x in none}
     for v in chosen:
         v["feeds"] = sorted(x["to"] for x in every if x["from"] == v["name"] and x["f"] is not None
@@ -326,6 +337,7 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         vs = variables.parse(out["variables"], nat.C)
         for split, key in (("search", "together"), ("eval", "eval")):
             got = variables.Scorer(ge).score(tx, vs, split=split, draws=draws)
+            release(nat.dev)
             out["teacher"][key] = {k: got[k] for k in ("e4", "f_on", "s_off", "f_comp", "f_feeds", "f_apart", "unresolved")}
             for v, r in zip(out["variables"], got["variables"]):
                 v["measured"][split] = {"term": term(r), "f_on": r["f_on"], "s_off": r["s_off"]}

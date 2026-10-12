@@ -137,6 +137,16 @@ def test_feeds(case):
         assert (ab["f"] > 0.99) if claim else (ab["f"] < 0.01), ab
 
 
+def test_headline_rules():
+    """e4: per variable min(f on-target, s off-target); 0 for a variable with no resolved on-target draw (counted), its
+    off-target not counted; composition and feeds as they are; a missing off-target leaves f on-target."""
+    out = variables.headline({"variables": [{"f_on": 0.9, "s_off": 0.5, "s_on": 0.2}, {"f_on": None, "s_off": 1.0, "s_on": None},
+                                            {"f_on": 0.8, "s_off": None, "s_on": 0.3}],
+                              "pairs": [{"f_comp": 0.6, "s_comp": 0.1}], "feeds": [{"f": 1.0, "feeds": False}]})
+    assert out["unresolved"] == 1
+    assert abs(out["e4"] - (0.5 + 0.0 + 0.8 + 0.6 + 1.0) / 5) < 1e-12
+
+
 def test_parse(case):
     nat = case[0]
     v = variables.parse([{"name": "v", "inputs": [3, 1, 3], "group": [["0.fc", 5, 2], ["h.0.mlp.c_fc", 5, 2]], "feeds": ["prediction"]}], nat.C)[0]

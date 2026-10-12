@@ -33,7 +33,8 @@ target). A kind's score for a variable (or pair) is the D0-weighted mean over it
 
 The headline, e4: in the real model, the mean of each variable's min(f on-target, s off-target) (a variable must carry
 its inputs and only them; a mean of the two would give a group carrying nothing 1/2), f in composition and f on the
-feeds claims. With a circuit (score(graph=)), the same draws also run in its stated graph under C's semantics (graph
+feeds claims; a variable none of whose on-target draws is resolved counts 0 (its inputs do not move the output;
+headline()). With a circuit (score(graph=)), the same draws also run in its stated graph under C's semantics (graph
 inside, masked outside, as goal_eval scores it; engine.Engine on its subcomponents, tested equal to graph_ref), under
 "circuit", a diagnostic: every run, reference and patched value is the circuit's, so a group outside the circuit does
 nothing there and a variable whose inputs the circuit does not read has no scored draws; "gap" is the circuit's e4 less
@@ -76,6 +77,23 @@ def parse(variables: list[dict], C: dict) -> list[dict]:
             group.append((n, int(t), int(c)))
         out.append({"name": v.get("name", ""), "meaning": v.get("meaning", ""), "inputs": sorted({int(p) for p in v["inputs"]}),
                     "group": sorted(set(group)), "feeds": list(v.get("feeds", []))})
+    return out
+
+
+def headline(out: dict) -> dict:
+    """A world's means and its headline e4 (the lead's rules) on score()'s per variable, pair and feeds rows: per
+    variable min(f on-target, s off-target), since a variable claims to carry its inputs and nothing else (a mean of the
+    two gave a group carrying nothing 1/2 for its off-target alone), and 0 for a variable none of whose on-target draws
+    is resolved (its inputs do not move the output: the claim is empty; counted in "unresolved"); f in composition and f
+    on the feeds claims; e4 the mean of all of them (each variable, pair and feeds claim a separate claim)."""
+    mean = lambda xs: (lambda ys: sum(ys) / len(ys) if ys else None)([x for x in xs if x is not None])  # noqa: E731
+    V, P, F = out["variables"], out["pairs"], out["feeds"]
+    out.update(s_on=mean([x["s_on"] for x in V]), s_off=mean([x["s_off"] for x in V]), s_comp=mean([x["s_comp"] for x in P]),
+               f_on=mean([x["f_on"] for x in V]), f_comp=mean([x["f_comp"] for x in P]),
+               f_feeds=mean([x["f"] for x in F if x["feeds"]]), f_apart=mean([x["f"] for x in F if not x["feeds"]]),
+               unresolved=sum(x["f_on"] is None for x in V))
+    each = [0.0 if a is None else (a if b is None else min(a, b)) for a, b in ((x["f_on"], x["s_off"]) for x in V)]
+    out["e4"] = mean(each + [x["f_comp"] for x in P] + [x["f"] for x in F])
     return out
 
 
@@ -263,17 +281,7 @@ class Scorer:
                 if n_c:
                     out["pairs"].append({"names": [variables[i]["name"], variables[j]["name"]], "s_comp": s_c,
                                          "f_comp": pooled(mine_c, "f")[0], "draws_comp": n_c})
-        mean = lambda xs: (lambda ys: sum(ys) / len(ys) if ys else None)([x for x in xs if x is not None])  # noqa: E731
-        V, P, F = out["variables"], out["pairs"], out["feeds"]
-        out.update(s_on=mean([x["s_on"] for x in V]), s_off=mean([x["s_off"] for x in V]), s_comp=mean([x["s_comp"] for x in P]),
-                   f_on=mean([x["f_on"] for x in V]), f_comp=mean([x["f_comp"] for x in P]),
-                   f_feeds=mean([x["f"] for x in F if x["feeds"]]), f_apart=mean([x["f"] for x in F if not x["feeds"]]))
-        # the headline (the lead's fields): per variable min(f on-target, s off-target), since a variable must carry its
-        # inputs and only them (a mean would give a group carrying nothing 1/2 for its off-target alone), f in
-        # composition and f on the feeds claims; their mean
-        both = [min(a, b) if a is not None and b is not None else (a if b is None else b) for a, b in ((x["f_on"], x["s_off"]) for x in V)]
-        out["e4"] = mean(both + [x["f_comp"] for x in P] + [x["f"] for x in F])
-        return out
+        return headline(out)
 
     def _feeds(self, variables, tests, rd, nodes, texts, mine, k0, groups) -> list[dict]:
         """Per ordered pair (V, W), on V's on-target draws: the reads of W's group (its nodes outside V's) in the

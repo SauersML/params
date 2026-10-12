@@ -2,23 +2,22 @@
   "theme": "base",
   "themeVariables": {
     "fontFamily": "Inter, 'Helvetica Neue', 'DejaVu Sans', Arial, sans-serif",
-    "fontSize": "19px",
+    "fontSize": "18px",
     "primaryColor": "#ffffff",
-    "primaryTextColor": "#202124",
-    "primaryBorderColor": "#5f6368",
-    "lineColor": "#80868b",
-    "clusterBkg": "#fbfbfc",
-    "clusterBorder": "#dadce0",
-    "titleColor": "#3c4043",
+    "primaryTextColor": "#172f52",
+    "primaryBorderColor": "#8b96a8",
+    "lineColor": "#75869f",
+    "clusterBkg": "#fafbfe",
+    "clusterBorder": "#dbe2ed",
     "edgeLabelBackground": "#ffffff"
   },
   "flowchart": {
     "htmlLabels": true,
     "curve": "basis",
-    "nodeSpacing": 26,
-    "rankSpacing": 52,
-    "padding": 14,
-    "wrappingWidth": 340,
+    "nodeSpacing": 30,
+    "rankSpacing": 42,
+    "padding": 18,
+    "wrappingWidth": 440,
     "useMaxWidth": false
   }
 }

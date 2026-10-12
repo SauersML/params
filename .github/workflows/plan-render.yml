@@ -1,7 +1,6 @@
 name: plan-render
 
-# Renders plan/plan.mmd (the team's plan, a Mermaid dependency graph) to plan/plan.png
-# and keeps that image in README.md between the plan markers. Runs whenever the plan changes.
+# The source is the team's live coordination map. Generated files do not retrigger this job.
 on:
   push:
     branches: [main]
@@ -24,44 +23,41 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          ref: main
+          fetch-depth: 1
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-
-      - name: Fonts
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-inter fonts-dejavu-core > /dev/null || true
-
-      - name: Render plan/plan.mmd to plan/plan.png
+          node-version: "22"
+      - name: Install renderer and fonts
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-inter fonts-dejavu-core > /dev/null
+          npm install --prefix "$RUNNER_TEMP/plan-render" @mermaid-js/mermaid-cli@11.4.2
           echo '{"args": ["--no-sandbox", "--disable-setuid-sandbox"]}' > "$RUNNER_TEMP/puppeteer.json"
-          npx -y @mermaid-js/mermaid-cli@11.4.2 -p "$RUNNER_TEMP/puppeteer.json" \
-            -i plan/plan.mmd -o plan/plan.png -c plan/mermaid.json -b white -s 2
-
-      - name: Keep the image in README.md
+      - name: Render latest plan and publish image
+        shell: bash
         run: |
-          python3 - <<'PY'
-          import pathlib, re
-          p = pathlib.Path("README.md")
-          s = p.read_text() if p.exists() else ""
-          block = "<!-- plan:start -->\n![plan](plan/plan.png)\n<!-- plan:end -->"
-          if "<!-- plan:start -->" in s:
-              s = re.sub(r"<!-- plan:start -->.*?<!-- plan:end -->", block, s, flags=re.S)
-          else:
-              s = s.rstrip("\n") + "\n\n" + block + "\n"
-          p.write_text(s)
-          PY
-
-      - name: Commit and push
-        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add plan/plan.png README.md
-          if git diff --cached --quiet; then echo "plan image unchanged"; exit 0; fi
-          git commit -q -m "plan: render plan/plan.mmd into README"
-          for i in 1 2 3 4 5 6; do
-            if git pull -q --rebase origin main && git push -q origin HEAD:main; then exit 0; fi
-            sleep $((i * 5))
+          for attempt in 1 2 3 4 5 6; do
+            git fetch --no-tags origin main
+            # Only this disposable CI checkout is reset. Never rebase a stale rendered image.
+            git reset --hard origin/main
+            "$RUNNER_TEMP/plan-render/node_modules/.bin/mmdc" \
+              -p "$RUNNER_TEMP/puppeteer.json" -i plan/plan.mmd \
+              -o plan/plan.png -c plan/mermaid.json -b white -s 2
+            printf '%s\n' '![Oracle team coordination map](plan/plan.png)' > README.md
+            git add plan/plan.png README.md
+            if git diff --cached --quiet; then
+              echo "Latest plan already rendered"
+              exit 0
+            fi
+            git commit -m "plan: render current coordination map"
+            if git push origin HEAD:main; then exit 0; fi
+            # Another writer won: fetch its changes and rerender, preserving its source.
+            sleep $((attempt * 5))
           done
-          echo "push failed after retries" >&2
+          echo "Main kept changing; no stale rendering was pushed" >&2
           exit 1

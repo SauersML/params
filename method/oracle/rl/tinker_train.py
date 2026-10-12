@@ -6,6 +6,7 @@ default) and the key from TINKER_API_KEY (read from the Keychain at launch, neve
   tinker_train.py sft SFT.jsonl --log DIR [--base Qwen/Qwen3-8B] [--steps N] [--batch B] [--lr LR] [--rank 32]
   tinker_train.py rl QUESTIONS.jsonl --log DIR --scorer http://127.0.0.1:8767/score [--init STATE_PATH] [--steps N]
                      [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5] [--reader] [--save-every 25]
+                     [--first-step K]   (resume from the state saved at step K)
   tinker_train.py sample QUESTIONS.jsonl OUT.jsonl [--init STATE_PATH] [--n 50] [--samples 4]    answers to evaluate
   tinker_train.py readers SAMPLES.jsonl QUESTIONS.jsonl OUT.jsonl [--reader-b MODEL]   E1 and its controls (components.py
                                                                                       evaluate --e1)
@@ -362,7 +363,7 @@ def rl(a) -> None:
     rspend = Spend(a.log, a.reader_model) if a.reader else None  # the reader's tokens, priced at its own rates
     frozen = tinker_reader(service, a.reader_model, *renderer_for(a.reader_model), rspend) if a.reader else None
     tasks = {}
-    rng = random.Random(a.seed)
+    rng = random.Random(a.seed + a.first_step)  # a resumed run draws new texts
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=renderer.get_stop_sequences())
     adam = tinker.AdamParams(learning_rate=a.lr, beta1=0.9, beta2=0.95, eps=1e-8)
 
@@ -378,11 +379,15 @@ def rl(a) -> None:
         with (a.log / "checkpoints.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, "state": path, "usd": spend.total + (rspend.total if rspend else 0.0), "base": a.base}) + "\n")
 
-    checkpoint(0)
+    if a.first_step == 0:
+        checkpoint(0)
+    else:  # dollars go on from the resumed checkpoint's
+        spend.total = next(r["usd"] for r in map(json.loads, (a.log / "checkpoints.jsonl").read_text().splitlines())
+                           if r["step"] == a.first_step)
     failed = 0
     sampler = training.save_weights_and_get_sampling_client()
     pending = submit(sampler)
-    for step in range(a.steps):
+    for step in range(a.first_step, a.steps):
         t0 = time.time()
         datums, groups = [], []
         for q, prompt, fut in pending:
@@ -483,6 +488,8 @@ def main():
     r.add_argument("--reader", action="store_true", help="E1 from a frozen reader on Tinker (--reader-model)")
     r.add_argument("--reader-model", default=REWARD_READER, help="the reward's E1 reader")
     r.add_argument("--save-every", type=int, default=25, help="steps between saved states (checkpoints.jsonl)")
+    r.add_argument("--first-step", type=int, default=0, help="resume: the step --init's state was saved at (its checkpoint "
+                                                                "line kept; the run appends to the same --log)")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     m = sub.add_parser("sample")
     m.add_argument("questions", type=Path)

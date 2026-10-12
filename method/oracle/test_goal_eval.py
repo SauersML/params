@@ -618,3 +618,112 @@ def test_size_scale_is_vpds_whole_answer(tiny):
     nat, ge, tx = tiny
     n = sum(int(m.sum()) for m in tx.vpd.values())
     assert n > 0 and abs(ge.size_scale(tx) - n * math.log2(nat.positions(tx.targets) * sum(nat.C.values()))) < 1e-9
+
+
+def tiny_pool(nat, ids):
+    """An adversary pool from the tiny model's causal importance on a text: one pattern per position."""
+    ci = nat.importance(ids)
+    sites, cols, offsets = [], [], [0]
+    for t in range(len(ids)):
+        for i, n in enumerate(nat.names):
+            c = (ci[n][t] > 0).nonzero().flatten().to(torch.int32).cpu()
+            sites.append(torch.full((len(c),), i, dtype=torch.int16))
+            cols.append(c)
+        offsets.append(offsets[-1] + sum(len(x) for x in cols[len(cols) - len(nat.names):]))
+    return {"names": list(nat.names), "sources": [("tiny", t) for t in range(len(ids))], "site": torch.cat(sites),
+            "c": torch.cat(cols), "offsets": torch.tensor(offsets, dtype=torch.int64)}
+
+
+def test_fidelity_vpds_answer_is_its_own_ceiling(tiny):
+    """VPD's own answer as the circuit: every family's runs are VPD's, so every score is 1."""
+    nat, ge, tx = tiny
+    g = native.Graph(masks=tx.vpd)
+    pool = tiny_pool(nat, tx.ids)
+    row = ge.fidelity(tx, [g], pool, draws=4, steps=2, restarts=2, curve=(0, 2))[0]
+    for k in ("s_point", "s_nodes", "s_edges", "f1_adv", "f1_adv_random", "c"):
+        assert row[k] is not None and abs(row[k] - 1) < 1e-4, (k, row[k])
+
+
+def test_fidelity_cuts_and_removals(tiny):
+    """The connection-cut family's pieces: the model's one-writer cut is cuts()'s; a stated graph's zero edge
+    strength is the graph without that connection; a node family draw is the masked run without those nodes."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::4]
+    g = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    pairs = goal_eval._pairs(g)
+    assert len(pairs) >= 4
+    model_ctx = {"make": lambda B: (nat._full_plan(tx.T, B), nat._model_states(tx.ids, B)), "ablation": nat._one(),
+                 "flow": ge.flow(tx), "rec": tx.rec, "ids": tx.ids}
+    some = pairs[:4]
+    lq = ge._group_logq(tx, model_ctx, [(r, [w]) for w, r in some])
+    for (w, r), k, want in zip(some, carry.kl(tx.ref, lq).tolist(), ge.cuts(tx, some)):
+        assert abs(k - want) < 1e-5 + 1e-4 * abs(want), (w, r, k, want)
+    order = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
+    for j in range(min(3, len(order))):
+        v = torch.ones(len(order))
+        v[j] = 0.0
+        w, r = order[j]
+        less = native.Graph(g.nodes, {rr: [x for x in ws if not (x == w and rr == r)] for rr, ws in g.parents.items()},
+                            [x for x in g.out if not (x == w and r is None)])
+        got = float(carry.kl(tx.ref, ge._graph_logq(tx.ids, tx.targets, [g], [v]))[0])
+        assert abs(got - ge.graph_kl(tx, [less], live=True)[0]) < 1e-5
+
+
+def test_adversary_gradient_and_rescore(tiny):
+    """The adversary's objective: its gradient in the pattern weights and omissions against central differences, and
+    a binary mask's KLs against native.run (the circuit as stated, the adversary's subcomponents at u) and the masked
+    forward (VPD's answer and the adversary's)."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    par, out = native.all_edges(sub, tx.targets)
+    g = native.Graph(sub, par, out)
+    pool = tiny_pool(nat, tx.ids)
+    gen = torch.Generator().manual_seed(3)
+    pick, ((kls, idx, cols),) = ge._adv_problem(tx, [g], pool, 6, gen)
+    w = torch.rand(1, len(pick), generator=gen).to(nat.dev).requires_grad_(True)
+    b = {n: torch.rand(1, len(idx[n][0]), generator=gen).to(nat.dev).requires_grad_(True) for n in nat.names}
+    kc, kv = kls(w, b)
+    obj = kc.log() - kv.log()
+    gw = torch.autograd.grad(obj.sum(), [w] + list(b.values()), allow_unused=True)
+    eps = 1e-2
+    with torch.no_grad():
+        for j in range(len(pick)):
+            d = torch.zeros_like(w)
+            d[0, j] = eps
+            hi = [x.log() for x in kls(w + d, b)]
+            lo = [x.log() for x in kls(w - d, b)]
+            fd = float((hi[0] - hi[1] - lo[0] + lo[1]) / (2 * eps))
+            assert abs(fd - float(gw[0][0, j])) < 2e-2 * max(1.0, abs(fd)), (j, fd, float(gw[0][0, j]))
+        n = next(n for n in nat.names if len(idx[n][0]))
+        j = 0
+        bp = {m: x.clone() for m, x in b.items()}
+        bm = {m: x.clone() for m, x in b.items()}
+        bp[n][0, j] += eps
+        bm[n][0, j] -= eps
+        hi, lo = [x.log() for x in kls(w, bp)], [x.log() for x in kls(w, bm)]
+        fd = float((hi[0] - hi[1] - lo[0] + lo[1]) / (2 * eps))
+        assert abs(fd - float(gw[1 + nat.names.index(n)][0, j])) < 2e-2 * max(1.0, abs(fd))
+        wb = (w > 0.5).float()
+        bb = {m: (x > 0.5).float() for m, x in b.items()}
+        kc, kv = kls(wb, bb)
+        # the adversary's mask over all subcomponents, rebuilt from the pool's patterns and the omissions on
+        last = max(tx.targets)
+        on_pat = [goal_eval.pattern(pool, pick[j]) for j in wb[0].nonzero().flatten().tolist()]
+        nodes = g.node_set()
+        u = {m: torch.zeros(1, tx.T, nat.C[m], device=nat.dev) for m in nat.names}
+        vm = {m: tx.vpd[m].clone() for m in nat.names}
+        for m in nat.names:
+            for p in on_pat:
+                if m in p:
+                    u[m][0, :last + 1, p[m].to(nat.dev)] = 1.0
+                    vm[m][:last + 1, p[m].to(nat.dev)] = True
+            u[m][0] *= (~tx.vpd[m]).float()
+            for t_, k_ in zip(*[x[bb[m][0].bool()] for x in idx[m]]):
+                u[m][0, int(t_), int(cols[m][k_])] = 1.0
+            for (mm, t_, c_) in nodes:
+                if mm == m:
+                    u[m][0, t_, c_] = 0.0
+        plan = nat._plan([g], tx.T)
+        want_c = float(carry.kl(tx.ref, nat.run(tx.ids, tx.targets, plan, u, nat._one()[1])))
+        want_v = float(carry.kl(tx.ref, ge.runs(tx.ids, tx.targets, [vm], True)))
+        assert abs(float(kc[0]) - want_c) < 1e-4 * max(1.0, want_c) and abs(float(kv[0]) - want_v) < 1e-4 * max(1.0, want_v)

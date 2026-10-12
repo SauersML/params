@@ -94,6 +94,13 @@ MAX_EDGES = 64  # F3's stated edges per answer (a uniform draw when an answer st
 CHUNK = 8  # circuits per masked forward pass
 CUT_CHUNK = 32  # cuts per batch
 CONVENTIONS = ("live", "off")  # the remainders' convention
+DRAWS = 32  # C's random interventions per family and circuit
+ADV_STEPS = 20  # the adversary's budget: VPD's published evaluation (param-decomp's pile_llama_simple_mlp-4L.yaml,
+ADV_STEP = 0.1  # PGDReconLoss_20step: random init, sign-gradient steps of 0.1 clamped to [0, 1])
+ADV_RESTARTS = 4
+ADV_PATTERNS = 64  # patterns drawn from the pool per text
+ADV_RANDOM_ON = 1 / 16  # a random member's chance of switching each drawn pattern on
+ADV_CURVE = (0, 4, 20)  # budgets reported (steps)
 
 
 # ---- answers
@@ -194,6 +201,21 @@ def _tok_pairs(g: native.Graph) -> tuple[list, list]:
     unstated = [(("tok", p, 0), r) for p in getattr(g, "tok_positions", []) for r in sorted(g.nodes)
                 if r[1] == p and native._name_layer_kind(r[0])[1] in mech.RESID_READERS and (("tok", p, 0), r) not in have]
     return stated, unstated
+
+
+def _fid(e0: float, kc: float, kv: float) -> float | None:
+    """C's log scale: clip(ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD), 0, 1); None when VPD's own answer is no
+    nearer the model than the empty circuit under the interventions."""
+    if kv is None or kc is None or not kv < e0:
+        return None
+    return _clip01(math.log(e0 / max(kc, 1e-12)) / math.log(e0 / max(kv, 1e-12)))
+
+
+def _drop_nodes(g: native.Graph, drop: set) -> native.Graph:
+    """A stated graph without some nodes and every connection to or from them."""
+    nodes = [nd for nd in g.nodes if nd not in drop]
+    par = {r: [w for w in ws if w not in drop] for r, ws in g.parents.items() if r not in drop}
+    return native.Graph(nodes, {r: ws for r, ws in par.items() if ws}, [w for w in g.out if w not in drop])
 
 
 def _from(ids: list[int], p: int) -> list | None:
@@ -705,6 +727,327 @@ class GoalEval:
 
     # ---- diagnostics
 
+    # ---- C: interventional fidelity
+
+    def fidelity(self, tx: Text, graphs: list[native.Graph], pool: dict | None = None, draws: int = DRAWS,
+                 steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE) -> list[dict]:
+        """C, the circuit's agreement with the model under the training family of interventions (remainders live),
+        each family scored on the log scale against VPD's own answer under the same interventions, s_F =
+        clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
+        model under the intervention || X under it): "point" (no intervention: F1), "nodes" (draw j removes each
+        circuit node with probability (j + 0.5) / draws), "edges" (draw j cuts each stated connection into one reader
+        drawn uniformly, the prediction among them, with that probability, at least one; on the model's and VPD's
+        side by path patching from their own run, on the circuit's by a zero edge strength), "adversary" (the paired
+        adversary over the pool, adversary(): f1_adv at the budget, beside the random members' mean); c, the mean of
+        s_point, s_nodes, s_edges and f1_adv."""
+        e0 = self._bounds(tx, "live")[0]
+        point = self.sufficiency(tx, graphs)
+        nodes = self._node_family(tx, graphs, draws)
+        edges = self._edge_family(tx, graphs, draws)
+        adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool else [{} for _ in graphs]
+        out = []
+        for g, pt, nd, ed, ad in zip(graphs, point, nodes, edges, adv):
+            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], **nd, **ed, **ad}
+            row["s_nodes"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
+            row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
+            terms = [row[k] for k in ("s_point", "s_nodes", "s_edges", "f1_adv") if row.get(k) is not None]
+            row["c"] = sum(terms) / len(terms) if terms else None
+            out.append(row)
+        return out
+
+    def _rng(self, tx: Text, g: native.Graph, family: str) -> np.random.Generator:
+        """A family's draws for one circuit on one text: seeded by the text and the circuit."""
+        key = repr((family, sorted(g.node_set()), _pairs(g) if not g.complete else None))
+        return np.random.default_rng([tx.seed, int(hashlib.sha256(key.encode()).hexdigest()[:15], 16)])
+
+    def _logq_sets(self, ids: list[int], targets: list[int], make, n: int) -> torch.Tensor:
+        """log q at the targets of n masked runs (remainders live), the sets made a chunk at a time (make(i) -> set i)."""
+        out = []
+        for s0 in range(0, n, self.chunk):
+            out.append(self.runs(ids, targets, [make(i) for i in range(s0, min(n, s0 + self.chunk))], True))
+            native.free(self.nat.dev)
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def _graph_logq(self, ids: list[int], targets: list[int], graphs: list[native.Graph], ew_rows=None) -> torch.Tensor:
+        """log q at the targets of stated graphs' runs (graph semantics, remainders live); ew_rows: per graph a 0/1
+        vector over its connections (graph.parents reader by reader, then graph.out), the connections at 0 cut."""
+        nat = self.nat
+        u, ur = nat._zero()
+        ur = nat._one()[1]
+        out = []
+        for s0 in range(0, len(graphs), self.chunk):
+            part = graphs[s0:s0 + self.chunk]
+            plan = nat._plan(part, len(ids))
+            ew = ow = None
+            if ew_rows is not None:
+                ew, ow = nat.edge_weights(plan, torch.cat([ew_rows[s0 + i] for i in range(len(part))]).float().to(nat.dev))
+            out.append(nat.run(ids, targets, plan, u, ur, ew, ow))
+            native.free(nat.dev)
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int) -> list[dict]:
+        """Per circuit, the node-removal family: draws of its nodes removed from the model, from VPD's answer and from
+        the circuit (a stated graph keeps its connections among the rest), the mean KLs from the model's."""
+        nat, T = self.nat, tx.T
+        out = []
+        for g in graphs:
+            nodes = sorted(g.node_set())
+            if not nodes:
+                out.append({"kl_nodes_c": self._bounds(tx, "live")[0], "kl_nodes_vpd": self._bounds(tx, "live")[1]})
+                continue
+            rng = self._rng(tx, g, "nodes")
+            drops = []
+            for j in range(draws):
+                d = [nd for nd in nodes if rng.random() < (j + 0.5) / draws]
+                drops.append(d or [nodes[int(rng.integers(len(nodes)))]])
+
+            def without(base, d):
+                m = {n: base[n].clone() for n in nat.names}
+                for n, t, c in d:
+                    m[n][t, c] = False
+                return m
+
+            ones = {n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+            lm = self._logq_sets(tx.ids, tx.targets, lambda i: without(ones, drops[i]), draws)
+            lv = self._logq_sets(tx.ids, tx.targets, lambda i: without(tx.vpd, drops[i]), draws)
+            if g.complete:
+                gm = self.masks(g, T)
+                lc = self._logq_sets(tx.ids, tx.targets, lambda i: without(gm, drops[i]), draws)
+            else:
+                lc = self._graph_logq(tx.ids, tx.targets, [_drop_nodes(g, set(d)) for d in drops])
+            out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean())})
+        return out
+
+    @torch.no_grad()
+    def _edge_family(self, tx: Text, graphs: list[native.Graph], draws: int) -> list[dict]:
+        """Per circuit, the connection-cut family: draw j cuts a random subset of the stated connections into one
+        reader (the prediction among the readers): in the model and in VPD's answer by path patching from their own
+        run (_group_logq), in the circuit by a zero edge strength (a complete circuit: path patching in its run); the
+        mean KLs from the model's. A circuit without connections: None."""
+        nat = self.nat
+        model_ctx = {"make": lambda B: (nat._full_plan(tx.T, B), nat._model_states(tx.ids, B)), "ablation": nat._one(),
+                     "flow": self.flow(tx), "rec": tx.rec, "ids": tx.ids}
+        vpd_ctx = self._run_ctx(tx, tx.vpd)
+        out = []
+        for g in graphs:
+            nodes = g.node_set()
+            par, outs = (native.all_edges(nodes, tx.targets) if g.complete else (g.parents, g.out))
+            readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
+            if not readers:
+                out.append({"kl_edges_c": None, "kl_edges_vpd": None})
+                continue
+            rng = self._rng(tx, g, "edges")
+            groups = []
+            for j in range(draws):
+                r = readers[int(rng.integers(len(readers)))]
+                ws = list(par[r]) if r is not None else list(outs)
+                cut = [w for w in ws if rng.random() < (j + 0.5) / draws]
+                groups.append((r, cut or [ws[int(rng.integers(len(ws)))]]))
+            lm = self._group_logq(tx, model_ctx, groups)
+            lv = self._group_logq(tx, vpd_ctx, groups)
+            if g.complete:
+                lc = self._group_logq(tx, self._run_ctx(tx, self.masks(g, tx.T)), groups)
+            else:
+                order = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
+                at = {e: i for i, e in enumerate(order)}
+                rows = []
+                for r, cut in groups:
+                    v = torch.ones(len(order))
+                    v[[at[(w, r)] for w in cut]] = 0.0
+                    rows.append(v)
+                lc = self._graph_logq(tx.ids, tx.targets, [g] * len(groups), rows)
+            out.append({"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean())})
+        return out
+
+    @torch.no_grad()
+    def _run_ctx(self, tx: Text, masks: dict) -> dict:
+        """A complete circuit's run (its subcomponents on, every other off, remainders live) as path patching reads it:
+        plan maker, ablation, record and flow (edge_effects' context, with the run's remainder products)."""
+        nat, T = self.nat, tx.T
+        u, ur = nat._zero()
+        ur = nat._one()[1]
+        one = nat._plan([native.Graph(masks=masks)], T)
+        rec, states = {}, {}
+        cap = carry._Remainders(nat)
+        with cap:
+            nat.run(tx.ids, tx.targets, one, u, ur, record=rec, fill=states)
+
+        def make(B):
+            return {**one, "B": B, "G": {n: m.expand(B, -1, -1) for n, m in one["G"].items()},
+                    "complete": one["complete"].expand(B, -1, -1)}, states
+
+        return {"make": make, "ablation": (u, ur), "rec": rec, "ids": tx.ids,
+                "flow": self._flow(tx.ids, rec, states, masks, cap.values)}
+
+    def _group_logq(self, tx: Text, ctx: dict, groups: list[tuple]) -> torch.Tensor:
+        """log q at the targets of a run (ctx) with, per row, one reader's input without several writers' outputs (reader
+        None: the prediction's): path patching of the reader from the run's flow, then the run on from there."""
+        import vpd_model
+
+        nat, tg, T = self.nat, self.nat.target, tx.T
+        fl, rec = ctx["flow"], ctx["rec"]
+        res = [None] * len(groups)
+
+        def write(w):
+            if w[0] == "tok":
+                return tg.wte[ctx["ids"][w[1]]]
+            return rec[w[0]][0, w[1], w[2]] * tg.site(w[0]).U[w[2]]
+
+        inner = [j for j, (r, _) in enumerate(groups) if r is not None]
+        for j, (r, ws) in enumerate(groups):
+            if r is None:  # the prediction reads the final stream at each target
+                x = fl["final"][tx.targets].clone()
+                for w in ws:
+                    for i, t in enumerate(tx.targets):
+                        if w[1] == t:
+                            x[i] = x[i] - write(w)
+                res[j] = torch.log_softmax((vpd_model.rms(x, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
+        if inner:
+            vals = []
+            for j in inner:
+                r, ws = groups[j]
+                layer, kind = native._name_layer_kind(r[0])
+                t, c = r[1], r[2]
+                V = tg.site(r[0]).V[:, c]
+                total = sum(write(w) for w in ws)
+                if kind in ("q_proj", "k_proj", "v_proj"):
+                    inp = vpd_model.rms(fl["attn"][layer][t] - total, tg.norms[2 * layer], tg.eps)
+                elif kind == "c_fc":
+                    inp = vpd_model.rms(fl["mlp"][layer][t] - total, tg.norms[2 * layer + 1], tg.eps)
+                elif kind == "o_proj":
+                    inp = fl["att"][layer][t] - sum(fl["P"][layer][:, t, w[1]].repeat_interleave(tg.hd) * write(w) for w in ws)
+                else:
+                    inp = vpd_model.gelu_tanh(fl["pre"][layer][t] - total)
+                vals.append(float(inp @ V))
+            B = min(self.cut_chunk, len(inner))
+            plan, states = ctx["make"](B)
+            for s0 in range(0, len(inner), B):
+                js = inner[s0:s0 + B]
+                pad = js + [js[-1]] * (B - len(js))
+                patch = {}
+                for b, j in enumerate(pad):
+                    r = groups[j][0]
+                    if r[0] not in patch:
+                        patch[r[0]] = (torch.zeros(B, T, nat.C[r[0]], dtype=torch.bool, device=nat.dev),
+                                       torch.zeros(B, T, nat.C[r[0]], device=nat.dev))
+                    patch[r[0]][0][b, r[1], r[2]] = True
+                    patch[r[0]][1][b, r[1], r[2]] = vals[inner.index(j)]
+                base = _from(tx.ids, min(groups[j][0][1] for j in js))
+                lq = nat.run(tx.ids, tx.targets, plan, *ctx["ablation"], patch=patch, reuse=None if base is None else (states, base))
+                for b, j in enumerate(js):
+                    res[j] = lq[b]
+                native.free(nat.dev)
+        return torch.stack([x if x.dim() == 2 else x for x in res])
+
+    def _adv_problem(self, tx: Text, graphs: list[native.Graph], pool: dict, k: int, gen: torch.Generator) -> tuple:
+        """adversary()'s objective: the K patterns drawn (pool indices) and, per circuit, (kls, idx, cols): kls(w [R, K],
+        b {site: [R, omitted]}) -> (KL_C, KL_VPD) [R] bits, differentiable; idx per site the omitted subcomponents
+        (positions, column indices); cols per site the engine's columns."""
+        import engine
+
+        nat, T, dev = self.nat, tx.T, self.nat.dev
+        pick = torch.randperm(len(pool["sources"]), generator=gen)[:k].tolist()
+        pats = [pattern(pool, i) for i in pick]
+        cols = {}
+        for n in nat.names:
+            parts = [tx.vpd[n].any(0).nonzero().flatten()] + [p[n].to(dev) for p in pats if n in p]
+            parts += [torch.tensor([c for m, _, c in g.node_set() if m == n], dtype=torch.long, device=dev) for g in graphs]
+            cols[n] = torch.unique(torch.cat(parts))
+        E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols)
+        where = (torch.arange(T, device=dev) <= max(tx.targets))[:, None]
+        vpd_on = {n: tx.vpd[n][:, cols[n]] for n in nat.names}
+        P = {}
+        for n in nat.names:
+            m = torch.zeros(len(pats), len(cols[n]), device=dev)
+            for i, p in enumerate(pats):
+                if n in p:
+                    m[i] = torch.isin(cols[n], p[n].to(dev)).float()
+            P[n] = m
+        problems = []
+        for g in graphs:
+            on = {n: torch.zeros(T, len(cols[n]), dtype=torch.bool, device=dev) for n in nat.names}
+            inv = {n: {int(c): i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
+            for n, t, c in g.node_set():
+                on[n][t, inv[n][c]] = True
+            omit = {n: vpd_on[n] & ~on[n] & where for n in nat.names}
+            free = {n: (~vpd_on[n] & ~on[n] & where).float() for n in nat.names}
+            vfree = {n: (~vpd_on[n] & where).float() for n in nat.names}
+            idx = {n: omit[n].nonzero(as_tuple=True) for n in nat.names}
+            plan = None if g.complete else E.plan(g)
+
+            def kls(w, b, on=on, free=free, vfree=vfree, idx=idx, plan=plan, complete=g.complete):
+                R = w.shape[0]
+                uc, mv = {}, {}
+                for n in nat.names:
+                    a = 1 - torch.prod(1 - w[:, :, None] * P[n][None], 1)  # [R, columns]: the OR of the patterns on
+                    uc[n] = free[n] * a[:, None, :]
+                    if b[n].shape[1]:
+                        priv = torch.zeros(R, T, len(cols[n]), device=dev)
+                        priv[:, idx[n][0], idx[n][1]] = b[n]
+                        uc[n] = uc[n] + priv
+                    mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :]
+                kc = E.kl({n: on[n].float() + uc[n] for n in nat.names}) if complete else E.graph_kl(plan, u=uc)
+                return kc, E.kl(mv)
+
+            problems.append((kls, idx, cols))
+        return pick, problems
+
+    def adversary(self, tx: Text, graphs: list[native.Graph], pool: dict, steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS,
+                  draws: int = DRAWS, curve=ADV_CURVE, k: int = ADV_PATTERNS) -> list[dict]:
+        """The paired adversary over the pool M (module docstring): K patterns drawn by the text's seed, pattern
+        weights w in [0, 1]^K shared across positions (an OR of the patterns on), applied at every position up to the
+        last target to the subcomponents VPD's answer leaves off, the same in the circuit's run and VPD's; and b in
+        [0, 1] on the subcomponents VPD's answer has on and the circuit leaves out, in the circuit's run alone (VPD's
+        has them on). Remainders live, not adversarial. The worst case maximizes ln KL_C - ln KL_VPD by sign-gradient
+        steps of ADV_STEP from restarts random starts, binarized at 0.5 and scored in float32 at each budget in curve;
+        the random members switch each pattern on with probability ADV_RANDOM_ON and each b with 1/2. Per circuit:
+        f1_adv (at the largest budget), kl_c_adv, kl_vpd_adv, f1_adv_random (the members' mean), f1_adv_curve, and
+        adv_mask (the patterns on, as pool indices, and the circuit's omissions switched on)."""
+        nat, dev = self.nat, self.nat.dev
+        e0 = self._bounds(tx, "live")[0]
+        gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
+        pick, problems = self._adv_problem(tx, graphs, pool, k, gen)
+        out = []
+        for (kls, idx, cols) in problems:
+            with torch.no_grad():
+                wr = (torch.rand(draws, len(pick), generator=gen) < ADV_RANDOM_ON).float().to(dev)
+                br = {n: (torch.rand(draws, len(idx[n][0]), generator=gen) < 0.5).float().to(dev) for n in nat.names}
+                kc_r, kv_r = kls(wr, br)
+            rand = [_fid(e0, a, v) for a, v in zip(kc_r.tolist(), kv_r.tolist())]
+            w = torch.rand(restarts, len(pick), generator=gen).to(dev)
+            b = {n: torch.rand(restarts, len(idx[n][0]), generator=gen).to(dev) for n in nat.names}
+            row = {"f1_adv_random": _mean([x for x in rand if x is not None]), "f1_adv_curve": {}}
+            for step in range(max(curve) + 1):
+                if step in curve:
+                    with torch.no_grad():
+                        wb, bb = (w > 0.5).float(), {n: (x > 0.5).float() for n, x in b.items()}
+                        kc, kv = kls(wb, bb)
+                        gap = (kc.log() - kv.log()).tolist()
+                        i = max(range(restarts), key=lambda r: gap[r])
+                        row["f1_adv_curve"][step] = _fid(e0, float(kc[i]), float(kv[i]))
+                        row.update({"kl_c_adv": float(kc[i]), "kl_vpd_adv": float(kv[i]), "f1_adv": row["f1_adv_curve"][step],
+                                    "adv_mask": {"patterns": [pick[j] for j in wb[i].nonzero().flatten().tolist()],
+                                                 "omitted": [(n, int(idx[n][0][j]), int(cols[n][idx[n][1][j]]))
+                                                             for n in nat.names for j in bb[n][i].nonzero().flatten().tolist()]}})
+                if step == max(curve):
+                    break
+                w.requires_grad_(True)
+                for x in b.values():
+                    x.requires_grad_(True)
+                kc, kv = kls(w, b)
+                loss = (kc.clamp_min(1e-12).log() - kv.clamp_min(1e-12).log()).sum()
+                grads = torch.autograd.grad(loss, [w] + [b[n] for n in nat.names], allow_unused=True)
+                with torch.no_grad():
+                    w = (w + ADV_STEP * grads[0].sign()).clamp(0, 1)
+                    b = {n: (b[n] + ADV_STEP * gr.sign()).clamp(0, 1) if gr is not None else b[n].detach()
+                         for n, gr in zip(nat.names, grads[1:])}
+                native.free(dev)
+            out.append(row)
+        return out
+
+
     def across(self, tx: Text, graphs: list[native.Graph], prompts: list) -> list[dict]:
         """Per graph, per convention, the same circuit identities run on other prompts of the text: recovered pooled
         over them, sum (KL_empty - KL_C) / sum (KL_empty - KL_VPD), each prompt's bounds from VPD's own answer and the
@@ -991,6 +1334,41 @@ def tails(split: str, n: int, teachers: dict, top: int = 64, ps=(0.9, 0.99), ge:
     return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(x))) for x in lines)
 
 
+# ---- the adversary's pattern pool (C's M)
+
+
+def build_patterns(texts: list[Path], out: Path, nat: native.Native | None = None) -> dict:
+    """The pool M of the paired adversary: every position of the texts, the set of subcomponents VPD's causal
+    importance switches on there (CI > 0), one pattern each. Saved as {"names", "sources": [(task, position)],
+    "site": int16 index into names, "c": int32, "offsets": int64 [patterns + 1]}, a pattern's (site, c) pairs between
+    consecutive offsets."""
+    nat = nat or native.Native()
+    sites, cols, offsets, sources = [], [], [0], []
+    with torch.no_grad():
+        for p in texts:
+            ids, _ = native.text(p)
+            ci = nat.importance(ids)
+            for t in range(len(ids)):
+                for i, n in enumerate(nat.names):
+                    c = (ci[n][t] > 0).nonzero().flatten().to(torch.int32).cpu()
+                    sites.append(torch.full((len(c),), i, dtype=torch.int16))
+                    cols.append(c)
+                offsets.append(offsets[-1] + sum(len(x) for x in cols[len(cols) - len(nat.names):]))
+                sources.append((p.stem, t))
+            native.free(nat.dev)
+    pool = {"names": list(nat.names), "sources": sources, "site": torch.cat(sites), "c": torch.cat(cols),
+            "offsets": torch.tensor(offsets, dtype=torch.int64)}
+    torch.save(pool, out)
+    return pool
+
+
+def pattern(pool: dict, k: int) -> dict:
+    """Pattern k of a pool as matrix -> LongTensor of subcomponent indices."""
+    a, b = int(pool["offsets"][k]), int(pool["offsets"][k + 1])
+    site, c = pool["site"][a:b].long(), pool["c"][a:b].long()
+    return {n: c[site == i] for i, n in enumerate(pool["names"]) if bool((site == i).any())}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1006,7 +1384,16 @@ def main():
     t.add_argument("--n", type=int, default=20)
     t.add_argument("--teacher", action="append", default=[], help="NAME=DIR of teacher circuits <task>.json")
     t.add_argument("--top", type=int, default=64)
+    q = sub.add_parser("patterns", help="the adversary's pattern pool from a range of held-out texts")
+    q.add_argument("--first", type=int, required=True, help="first text number, e.g. 9100")
+    q.add_argument("--last", type=int, required=True, help="last text number, e.g. 9149")
+    q.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
+    if args.cmd == "patterns":
+        texts = [native.TEXTS / "vpd4l" / f"text{i}.json" for i in range(args.first, args.last + 1)]
+        pool = build_patterns(texts, args.out)
+        print(f"{len(pool['sources'])} patterns, {len(pool['c'])} subcomponents, mean {len(pool['c']) / len(pool['sources']):.0f} each")
+        return
     if args.cmd == "tails":
         print(tails(args.split, args.n, dict(x.split("=", 1) for x in args.teacher), args.top), flush=True)
         return

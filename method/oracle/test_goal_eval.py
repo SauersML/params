@@ -641,18 +641,17 @@ def test_fidelity_vpds_answer_is_its_own_ceiling(tiny):
 
 
 def test_fidelity_cuts_and_removals(tiny):
-    """The connection-cut family's pieces: the model's one-writer cut is cuts()'s; a stated graph's zero edge
-    strength is the graph without that connection; a node family draw is the masked run without those nodes."""
+    """The connection-cut family's pieces: the whole model with one connection cut in graph_ref is cuts()'s path
+    patching; a stated graph's zero edge strength is the graph without that connection."""
     nat, ge, tx = tiny
     sub = sorted(native.Graph(masks=tx.vpd).node_set())[::4]
     g = native.Graph(sub, *native.all_edges(sub, tx.targets))
     pairs = goal_eval._pairs(g)
     assert len(pairs) >= 4
-    model_ctx = {"make": lambda B: (nat._full_plan(tx.T, B), nat._model_states(tx.ids, B)), "ablation": nat._one(),
-                 "flow": ge.flow(tx), "rec": tx.rec, "ids": tx.ids}
+    model = native.Graph(masks={n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
     some = pairs[:4]
-    lq = ge._group_logq(tx, model_ctx, [(r, [w]) for w, r in some])
-    for (w, r), k, want in zip(some, carry.kl(tx.ref, lq).tolist(), ge.cuts(tx, some)):
+    for (w, r), want in zip(some, ge.cuts(tx, some)):
+        k = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, model, cuts={r: [w]}))[0])
         assert abs(k - want) < 1e-5 + 1e-4 * abs(want), (w, r, k, want)
     order = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
     for j in range(min(3, len(order))):
@@ -875,3 +874,19 @@ def test_graph_ref_is_graph_inside_masked_outside(tiny):
         lo[n][0, t, c] -= eps
         fd = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, half, u=hi)) - carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, half, u=lo))) / (2 * eps)
     assert abs(fd - float(gr[i][0, t, c])) < 2e-2 * abs(fd) + 1e-5, (fd, float(gr[i][0, t, c]))
+
+
+def test_interchange_family(tiny):
+    """Interchange: VPD's answer as the circuit agrees with VPD's own run draw by draw; a stated circuit with every
+    connection and some activations fixed (graph_ref) is the independent forward with them fixed."""
+    nat, ge, tx = tiny
+    row = ge._interchange_family(tx, [native.Graph(masks=tx.vpd)], draws=3)[0]
+    assert abs(row["kl_interchange_c"] - row["kl_interchange_vpd"]) < 1e-6
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    g = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    p = sorted({t for _, t, _ in sub if t > 0})[0]
+    vals = {nd: torch.tensor(0.7, device=nat.dev) for nd in sub if nd[1] == p}
+    got = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, g, patch=vals))[0])
+    full, _ = naive(nat, tx.ids)
+    want = _kl(full, naive(nat, tx.ids, replace={nd: 0.7 for nd in vals}, on=mask_of(nat, tx.T, sub), live=True)[0], tx.targets)
+    assert abs(got - want) < 1e-5 + 1e-4 * abs(want), (got, want)

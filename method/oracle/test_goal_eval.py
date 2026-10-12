@@ -1302,6 +1302,43 @@ def test_transplant_scores_a_circuit_that_moves_as_the_model_does():
     assert float(carry.kl(px2, goal_eval._transplant(px, qx2, qx))[0]) < 1e-5
     assert abs(float(carry.kl(px2, goal_eval._transplant(px, qx, qx))[0]) - float(carry.kl(px2, px)[0])) < 1e-5
 
+
+def test_donor_resampling(tiny):
+    """Donor resampling: every subcomponent outside the circuit at its activation on the donor (naive()'s), the
+    circuit live in C's semantics; a complete circuit is the model with those activations replaced, a stated one
+    graph_ref with them patched; a shorter donor leaves the text's first positions unresampled; the near donors are
+    the changed-input texts."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::3]
+    stated = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    whole = native.Graph(sub, complete=True)
+    g = torch.Generator().manual_seed(9)
+    donor = torch.randint(0, 40, (tx.T,), generator=g).tolist()
+    short = donor[4:]
+    rows = ge.donors(tx, [whole, stated], near=0, far=[donor])
+    alone = ge.donors(tx, [whole], near=0, far=[short])[0]
+    full, _ = naive(nat, tx.ids)
+    acts = naive(nat, donor)[1]["a"]
+    sacts = naive(nat, short)[1]["a"]
+    inside = set(sub)
+    outside = [(n, t, c) for n in nat.names for t in range(tx.T) for c in range(nat.C[n]) if (n, t, c) not in inside]
+    want = _kl(full, naive(nat, tx.ids, replace={nd: acts[nd[0]][nd[1], nd[2]] for nd in outside})[0], tx.targets)
+    assert abs(rows[0]["kl_donor_far"][0] - want) < 1e-4 + 1e-4 * want, (rows[0]["kl_donor_far"], want)
+    u = {n: torch.ones(1, tx.T, nat.C[n], device=nat.dev) for n in nat.names}
+    got = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, stated, u=u, patch={nd: acts[nd[0]][nd[1], nd[2]] for nd in outside}))[0])
+    assert abs(rows[1]["kl_donor_far"][0] - got) < 1e-4 + 1e-4 * got, (rows[1]["kl_donor_far"], got)
+    vin = set(every)
+    vout = [(n, t, c) for n in nat.names for t in range(tx.T) for c in range(nat.C[n]) if (n, t, c) not in vin]
+    wv = _kl(full, naive(nat, tx.ids, replace={nd: acts[nd[0]][nd[1], nd[2]] for nd in vout})[0], tx.targets)
+    assert abs(rows[0]["kl_donor_far"][1] - wv) < 1e-4 + 1e-4 * wv
+    ws = _kl(full, naive(nat, tx.ids, replace={nd: sacts[nd[0]][nd[1] - 4, nd[2]] for nd in outside if nd[1] >= 4})[0], tx.targets)
+    assert abs(alone["kl_donor_far"][0] - ws) < 1e-4 + 1e-4 * ws
+    e0 = ge._bounds(tx, "live")[0]
+    assert rows[0]["s_donor_far"] == goal_eval._fid(e0, *rows[0]["kl_donor_far"]) and rows[0]["donors_far"] == 1
+    near = ge.donors(tx, [whole], near=4)[0]
+    assert near["donors_near"] == len(ge.changed_inputs(tx, [whole], "eval", 4)[0]["draws_changed"])
+
 def test_response_error():
     base = {("a", 0, 0): (1.0, 5.0), ("b", 0, 0): (0.0, 0.0)}
     pairs = {("a", 0, 0): [(2.0, 6.0), (0.0, 4.0)], ("b", 0, 0): [(1.0, 0.0)]}

@@ -119,6 +119,10 @@ CHANGED_DRAWS = 16  # C's changed texts per circuit
 INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
 # offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
+DONORS_NEAR = 16  # donor resampling's changed-input donors per text
+DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's answer)
+DONORS_FAR = 8  # donor resampling's other texts per text
+DONOR_TEXTS = range(150, 200)  # the held-out split's texts the far donors come from (text9150-9199: no search drew on them)
 
 
 # ---- answers
@@ -1688,6 +1692,94 @@ class GoalEval:
         without stated structure: native.Graph(nodes, complete=True)."""
         return self.changed_inputs(tx, graphs, "search", draws)
 
+    @torch.no_grad()
+    def donor_activations(self, ids: list[int], T: int) -> tuple[dict, int]:
+        """Every subcomponent's activation in the real model on a donor text aligned with a text of length T at their
+        ends: ({site: [T, C]}, pad), the donor's last T positions, or, a donor shorter than T, its positions at the
+        text's last len(ids) with the first pad = T - len(ids) left empty (zeros)."""
+        nat, n = self.nat, len(ids)
+        rec = {}
+        nat.run(list(ids), [n - 1], nat._full_plan(n, 1), *nat._one(), record=rec)
+        pad = max(0, T - n)
+        out = {}
+        for site in nat.names:
+            a = rec[site][0]
+            out[site] = a[n - T:] if pad == 0 else torch.cat([a.new_zeros(pad, a.shape[1]), a])
+        return out, pad
+
+    def far_donors(self, tx: Text, pool: list, k: int = DONORS_FAR) -> list:
+        """k of pool's texts (token id lists) for donor resampling, drawn by the text's seed, those at least as long
+        as the text first (a shorter one leaves the text's first positions unresampled)."""
+        rng = np.random.default_rng([int(tx.seed), 11])
+        order = [pool[i] for i in rng.permutation(len(pool)) if list(pool[i]) != list(tx.ids)]
+        return ([x for x in order if len(x) >= tx.T] + sorted((x for x in order if len(x) < tx.T), key=len, reverse=True))[:k]
+
+    @torch.no_grad()
+    def donors(self, tx: Text, graphs: list[native.Graph], split: str = "eval", near: int = DONORS_NEAR,
+               far: list | None = None, rows: int = DONOR_ROWS) -> list[dict]:
+        """Donor resampling (an evaluation column, the lead's decision 10-12; not in c): the circuit run in C's semantics
+        with every subcomponent outside it at its activation on one donor text, every one from that donor, so parts that
+        cancel on real text stay consistent (the remainders live); paired with VPD's answer under the same donors; the
+        KL from the model on the text. Donors: "near", the changed-input texts of split (changed_inputs' draws), and
+        "far", far's texts (token id lists, other held-out texts), aligned at their ends, those shorter than the text
+        leaving its first positions unresampled (their activations live). Per circuit and pool: s_donor_<pool>, C's
+        log scale on the mean KLs (_fid against KL_empty); s_donor_<pool>_worst, the lowest donor's; kl_donor_<pool>
+        (KL_C, KL_VPD); donors_<pool> (how many). The flip adversary's in-distribution counterpart: a circuit that holds
+        here but not under the flips is charged there for combinations no real text makes."""
+        import engine
+
+        nat, T, dev = self.nat, tx.T, self.nat.dev
+        graphs = [strand(g, tx.targets, nat.C) for g in graphs]
+        e0 = self._bounds(tx, "live")[0]
+        texts = {}
+        if near:
+            moved = np.asarray(tx.moved, dtype=float)
+            positions = [p for p, _ in tx.f2]
+            for p, z in (self._interchange_draws(tx, positions, split, near, first={p: -moved[p - 1] for p in positions})
+                         if positions else []):
+                x = list(tx.ids)
+                x[p] = z
+                texts.setdefault("near", []).append(x)
+        if far:
+            texts["far"] = [list(x) for x in far if list(x) != list(tx.ids)]
+        E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=None)
+        u = {n: torch.ones(1, 1, nat.C[n], device=dev) for n in nat.names}
+        sides = list(graphs) + [native.Graph(masks=tx.vpd)]
+        own = []  # per side, its nodes as {site: bool [T, C]}: left unpatched
+        for g in sides:
+            m = self.masks(g, T)
+            own.append({n: m[n].to(dev) for n in nat.names})
+        out = [{} for _ in graphs]
+        for pool, xs in texts.items():
+            kls = []  # per donor [len(sides)]
+            for d0 in range(0, len(xs), max(1, rows // len(sides))):
+                chunk = xs[d0:d0 + max(1, rows // len(sides))]
+                acts = [self.donor_activations(x, T) for x in chunk]
+                B = len(chunk) * len(sides)
+                patch = {}
+                for n in nat.names:
+                    vals = torch.stack([a[n] for a, _ in acts]).to(dev)  # [donors, T, C]
+                    vals = vals.repeat_interleave(len(sides), 0)
+                    keep = torch.stack([~own[j][n] for _ in chunk for j in range(len(sides))])  # outside each side
+                    for k, (_, pad) in enumerate(acts):
+                        if pad:
+                            keep[k * len(sides):(k + 1) * len(sides), :pad] = False
+                    patch[n] = (keep, vals)
+                lq = E.graph_log_probs(E.plan([g for _ in chunk for g in sides], semantics="c"), u, patch=patch)
+                kl = carry.kl(tx.ref, lq).view(len(chunk), len(sides))
+                kls += kl.tolist()
+                native.free(dev)
+            for b in range(len(graphs)):
+                kc = [k[b] for k in kls]
+                kv = [k[-1] for k in kls]
+                each = [_fid(e0, c, v) for c, v in zip(kc, kv)]
+                each = [x for x in each if x is not None]
+                out[b].update({f"s_donor_{pool}": _fid(e0, float(np.mean(kc)), float(np.mean(kv))) if kc else None,
+                               f"s_donor_{pool}_worst": min(each) if each else None,
+                               f"kl_donor_{pool}": (float(np.mean(kc)), float(np.mean(kv))) if kc else None,
+                               f"donors_{pool}": len(kc)})
+        return out
+
     def interchange_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16) -> list[dict]:
         """The teachers' interchange agreement on one text, the search split alone (never a reward, gate or table's):
         per candidate circuit s_interchange on C's log scale, kl_interchange_c and kl_interchange_vpd. Candidates on the
@@ -2458,9 +2550,9 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
     """C on the split's first n texts for answer sets (sets: name -> a directory of <task>.json circuits, run as stated)
     and VPD's first k at each circuit's size (complete graphs), with the evaluation-only families (fresh: the pattern
     lever over a pool no search drew from; interchange draws; changed texts (changed_inputs' eval split); N_real); one
-    row per circuit appended to OUT (texts already there are skipped); only: some of ("changed", "interchange"), those
-    families alone on the eval split (task, kind, nodes and their fields: families added to rows already made, matched
-    by task and kind). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
+    row per circuit appended to OUT (texts already there are skipped); only: some of ("changed", "interchange",
+    "donors"), those families alone on the eval split (task, kind, nodes and their fields: families added to rows
+    already made, matched by task and kind; donors' far texts from the split's DONOR_TEXTS). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
     teacher.py --save-vpd (where the causal-importance network is not). Locality from a set's summary*.jsonl."""
     ge = GoalEval()
     nat = ge.nat
@@ -2476,6 +2568,8 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                     if r.get("local") is not None:
                         local[r["task"]] = r["local"]
     done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
+    tasks = native.tasks(split)
+    far = [native.text(tasks[i])[0] for i in DONOR_TEXTS if i < len(tasks)] if "donors" in only else []
     rows = []
     for p in native.tasks(split)[:n][offset::stride]:
         have = {name: Path(d) / f"{p.stem}.json" for name, d in sets.items() if (Path(d) / f"{p.stem}.json").exists()}
@@ -2502,12 +2596,14 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             e = ge._bounds(tx, "live")[0]
             ch = ge.changed_inputs(tx, graphs, "eval", changed) if "changed" in only else [{} for _ in graphs]
             it = ge._interchange_family(tx, graphs, interchange, split="eval") if "interchange" in only else [{} for _ in graphs]
+            dn = ge.donors(tx, graphs, far=ge.far_donors(tx, far)) if "donors" in only else [{} for _ in graphs]
             with open(out, "a") as fh:
-                for kind, g, c, i in zip(kinds, graphs, ch, it):
+                for kind, g, c, i, d in zip(kinds, graphs, ch, it, dn):
                     row = {"task": p.stem, "kind": kind, "nodes": g.count(),
                            **{k: c[k] for k in ("s_changed", "s_track", "context_share", "prompts_changed", "prompts_track") if k in c}}
                     if i:
                         row["s_interchange"] = _fid(e, i["kl_interchange_c"], i["kl_interchange_vpd"])
+                    row.update(d)
                     rows.append(row)
                     fh.write(json.dumps(row) + "\n")
             if log:
@@ -2593,6 +2689,8 @@ def fidelity_table(rows: list[dict]) -> str:
     held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
     held += [("N_real", lambda r: r.get("n_real")), ("N_real ceiling", lambda r: r.get("n_real_ceiling")),
              ("act/inact cos", lambda r: r.get("cancel_cosine")), ("C", lambda r: r.get("c")),
+             ("donor near", lambda r: r.get("s_donor_near")), ("donor near worst", lambda r: r.get("s_donor_near_worst")),
+             ("donor far", lambda r: r.get("s_donor_far")), ("donor far worst", lambda r: r.get("s_donor_far_worst")),
              ("tracks changes", lambda r: r.get("s_track")), ("changed inputs", lambda r: r.get("s_changed")),
              ("context share", lambda r: r.get("context_share"))]
     nflips = sorted({int(m) for r in rows for m in r.get("n_real_flips", {}) if int(m) > 0})
@@ -2631,7 +2729,7 @@ def main():
     f.add_argument("--fresh", type=Path, help="a pattern pool no search drew from (evaluation only)")
     f.add_argument("--interchange", type=int, default=16)
     f.add_argument("--changed", type=int, default=16, help="changed texts per circuit (changed_inputs' eval split)")
-    f.add_argument("--only", default="", help="changed,interchange: those families alone, eval split (rows to merge by task and kind)")
+    f.add_argument("--only", default="", help="changed,interchange,donors: those families alone, eval split (rows to merge by task and kind)")
     f.add_argument("--curve", default=",".join(str(x) for x in ADV_CURVE), help="the step adversary's budgets, e.g. 0,4,20,40,80,160,320")
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--draws", type=int, default=DRAWS)

@@ -2138,6 +2138,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             for kind, g, f in zip(kinds, graphs, fid):
                 bits = size_bits(g, nat.positions(targets), sum(nat.C.values()), targets)
                 row = {"task": p.stem, "local": local.get(p.stem), "kind": kind, "nodes": g.count(),
+                       "positions": len({t for _, t, _ in g.node_set()}),
                        "edges": None if g.complete else g.edges(), "size": size_term(bits, scale), "kl_empty": e, "kl_vpd": v,
                        "n_real_ceiling": ceiling, "cancel_cosine": cancel["cosine"], **f}
                 rows.append(row)
@@ -2177,14 +2178,15 @@ def fidelity_table(rows: list[dict]) -> str:
     steps = sorted({int(m) for r in rows for m in r.get("f1_adv_curve", {})})
 
     def block(title, cols):
-        head = ["texts", "kind", "n", "nodes"] + [c for c, _ in cols]
+        head = ["texts", "kind", "n", "nodes", "positions"] + [c for c, _ in cols]
         lines = [head]
         for g in ("local", "non-local", "trivial"):
             for kd in kinds:
                 rs = by.get((g, kd), [])
                 if not rs:
                     continue
-                cells = [g, kd, str(len(rs)), f"{np.mean([r['nodes'] for r in rs]):.0f}"]
+                cells = [g, kd, str(len(rs)), f"{np.mean([r['nodes'] for r in rs]):.0f}",
+                         f"{np.mean([r.get('positions', 0) for r in rs]):.0f}"]
                 for _, f in cols:
                     v = [f(r) for r in rs]
                     v = [x for x in v if x is not None]

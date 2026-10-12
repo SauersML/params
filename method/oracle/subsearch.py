@@ -202,11 +202,6 @@ class GatedCarry:
                                                          "G": {n: torch.zeros(B, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}})
 
 
-def drop_plans(nat):
-    """Forget the plans built for one text's length (each holds [B, T, C] masks); the next text has another T."""
-    nat._consts = {k: v for k, v in nat._consts.items() if not (isinstance(k, tuple) and k[0] in ("gated-none", "full"))}
-    native.free(nat.dev)
-
     def change(self):
         """Mean over prompts of |gated activation on the prompt - on the text| per unit."""
         out = torch.zeros(self.N, device=self.nat.dev)
@@ -240,6 +235,11 @@ def drop_plans(nat):
                 total[s0:s0 + valid] += carry.kl(refs.expand(B, -1, -1), lq)[:valid]
         return total / len(self.prompts)
 
+
+def drop_plans(nat):
+    """Forget the plans built for one text's length (each holds [B, T, C] masks); the next text has another T."""
+    nat._consts = {k: v for k, v in nat._consts.items() if not (isinstance(k, tuple) and k[0] in ("gated-none", "full"))}
+    native.free(nat.dev)
 
 def refine(measure, S, threshold, rounds=40):
     """Measured removal rounds: every single removal measured, removals ranked by the KL they leave, the most of them

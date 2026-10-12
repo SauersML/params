@@ -1124,6 +1124,9 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want) -
             "paired": {other: _paired([q["samples"][0]["reward"] for q in qs], [o["samples"][0]["reward"] for o in per[other]])
                        for other in per if other != name},
         }
+        cr = lambda q: q["samples"][0].get("circuit_reward", q["samples"][0]["reward"])  # noqa: E731
+        report[name]["paired"] |= {f"{other} (circuit reward)": _paired([cr(q) for q in qs], [cr(o) for o in per[other]])
+                                   for other in per if other != name}
         circ = [q["samples"][0].get("circuit_reward", q["samples"][0]["reward"]) for q in qs]  # baselines give no English or answers
         report[name]["circuit_reward"] = sum(circ) / max(len(circ), 1)
         report[name]["paired"]["empty (circuit reward)"] = _paired(circ, [base[q["task"]]["empty"] for q in qs])

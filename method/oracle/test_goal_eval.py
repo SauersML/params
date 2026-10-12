@@ -1025,3 +1025,29 @@ def test_response_error():
     pairs = {("a", 0, 0): [(2.0, 6.0), (0.0, 4.0)], ("b", 0, 0): [(1.0, 0.0)]}
     # a's responses match exactly despite the offset; b's model response 1 is missed: sqrt(1 / 3)
     assert abs(goal_eval._response_error(pairs, base) - math.sqrt(1 / 3)) < 1e-12
+
+
+def test_necessity_flips(tiny):
+    """N_real's adversary: with nothing removed it is real_removal's N_real; with one removal, the search's pick is the
+    brute-force best single removal (the one making the circuit's removal matter least)."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    g = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    row = ge.necessity_flips(tx, [g], ms=(1,), steps=4, restarts=2)[0]
+    assert abs(row["n_real_flips"][0] - ge.real_removal(tx, [g])[0]["n_real_live"]) < 1e-4
+    e0, v0 = ge._bounds(tx, "live")
+    full = {n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+    circ = mask_of(nat, tx.T, sub)
+    cands = [(n, t, c) for n in nat.names for t, c in (tx.vpd[n] & ~circ[n]).nonzero().tolist() if t <= max(tx.targets)]
+    best = None
+    for n, t, c in cands:
+        m1 = {k: v.clone() for k, v in full.items()}
+        m1[n][t, c] = False
+        m2 = {k: v & ~circ[k] for k, v in m1.items()}
+        lq = ge.runs(tx.ids, tx.targets, [m1, m2], True)
+        k = float(carry.kl(lq[:1], lq[1:])[0])
+        best = k if best is None else min(best, k)
+    unattacked = ge.real_removal(tx, [g])[0]["kl_real_minus"]
+    want = goal_eval.necessity_log(e0, min(best, unattacked), v0)  # at most one removal
+    assert abs(row["n_real_flips"][1] - want) < 1e-3, (row["n_real_flips"][1], want, best, unattacked)
+    assert len(row["mask_n_real_flips"][1]) == (1 if best < unattacked else 0)

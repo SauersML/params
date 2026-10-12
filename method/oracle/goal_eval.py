@@ -18,7 +18,8 @@ background and its stated parents); outside it, masked semantics, every other su
 remainders reading the full residual stream, the circuit's outputs included, as in the real model, and writing into the
 background with the token embedding; query and key nodes enter their layer's attention pattern (the format gives them
 no edges out). Every connection stated is the masked run of the circuit's subcomponents; none stated, remainders off,
-is the empty circuit (live, the remainders carry the circuit's outputs into the background). Baselines (VPD's answer, its top
+is the empty circuit (live, the remainders carry the circuit's outputs into the background: graph F1 of the 20
+held-out teacher node sets stating no edge is 0.0019 at the median, 0.0065 at most, the lead's bar 0.02). Baselines (VPD's answer, its top
 k, the empty circuit) are complete graphs: their subcomponents read each other in full (VPD's masked forward). Every
 KL is the model's next-token distribution at the targets (summed over them) from the run's, in bits. VPD's own answer
 is the set of subcomponents with causal importance above zero on the input (at positions that can reach the targets,
@@ -107,6 +108,9 @@ ADV_CURVE = (0, 4, 20)  # budgets reported (steps)
 ADV_BATCH = 64  # the random members' rows per run (every circuit's restarts run together in the steps)
 FLIPS = {"omitted": (1, 4, 16, 64, 256), "patterns": (1, 2, 4, 8)}  # adversary_flips' budgets: how many switched on
 FLIP_TERM = 4  # the flip budget C's adversarial member (and the reward's) takes
+SCREEN = 256  # the adversary's shortlist measured one by one: the parts with the largest gradient either way (a part's
+# whole removal can move the other way from its gradient: text-free tiny model, the best single removal ranks last)
+SCREEN_ROWS = 16  # rows per run when measuring the shortlist
 FLIP_ROWS = 160  # adversary_flips' rows per run: every circuit's restarts at every budget (8 x 5 x 4) together
 
 
@@ -893,7 +897,8 @@ class GoalEval:
         slower). Evaluation only, never in the reward or a teacher's objective:
         fresh, a pool none of the searches drew from: the pattern lever's flips over it (f1_flips_patterns_fresh);
         interchange > 0: that many interchange draws (_interchange_family, s_interchange); real: N_real (real_removal,
-        n_real)."""
+        n_real) and its adversary (necessity_flips, n_real_flips). leak: graph F1 of the circuit's nodes stating no
+        edge (live remainders carrying their outputs to the prediction)."""
         e0 = self._bounds(tx, "live")[0]
         sides = self._sides(tx, graphs) if reads else None
         point = self.sufficiency(tx, graphs)
@@ -905,9 +910,13 @@ class GoalEval:
         fresh_rows = self.adversary_flips(tx, graphs, fresh, "patterns", steps=steps, restarts=restarts) if fresh else none
         inter = self._interchange_family(tx, graphs, interchange, reads=reads) if interchange else none
         reals = self.real_removal(tx, graphs) if real else none
+        nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real else none
+        leak = self.sufficiency(tx, [native.Graph(sorted(g.node_set()), {}, []) for g in graphs])
         out = []
-        for g, pt, nd, ed, ad, fl, fr, it, rr in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals):
-            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it}
+        for g, pt, nd, ed, ad, fl, fr, it, rr, nf, lk in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals,
+                                                             nflips, leak):
+            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf,
+                   "leak": lk["f1_live"]}
             row["s_nodes"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
             row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
             fc = row.get("f1_flips_omitted", {})
@@ -935,6 +944,102 @@ class GoalEval:
                 row.pop(f"_pairs_{fam}", None)
             out.append(row)
         return out
+
+    def necessity_flips(self, tx: Text, graphs: list[native.Graph], ms=None, steps: int = ADV_STEPS,
+                        restarts: int = ADV_RESTARTS) -> list[dict]:
+        """N_real's adversary, the flips' treatment of held-out necessity (evaluation only): per budget m, the m
+        subcomponents VPD's answer has on outside the circuit (at positions up to the last target) whose removal from
+        the real model makes the circuit's removal matter least, KL(model - F || model - F - C) minimized by
+        sign-gradient steps of ADV_STEP projected onto the m largest (one start at the gradient's top m), the top m
+        removed and scored in float32, beside the m best of a measured shortlist (SCREEN parts with the largest gradient
+        either way, each removal measured alone), the best of them, at most m (no worse than a smaller budget or none);
+        per circuit n_real_flips {m: necessity on N_real's scale, clip(ln(KL / KL_VPD)
+        / ln(KL_empty / KL_VPD), 0, 1)} and mask_n_real_flips {m: [(site, t, c)]}. A circuit needed only to cancel
+        the parts F becomes unnecessary once they are gone."""
+        import engine
+
+        nat, T, dev = self.nat, tx.T, self.nat.dev
+        ms = FLIPS["omitted"] if ms is None else ms
+        e0, v0 = self._bounds(tx, "live")
+        gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63) + 1)
+        cols = {n: torch.unique(torch.cat([tx.vpd[n].any(0).nonzero().flatten()] + [torch.tensor(
+            [c for m, _, c in g.node_set() if m == n], dtype=torch.long, device=dev) for g in graphs])) for n in nat.names}
+        E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on")
+        where = (torch.arange(T, device=dev) <= max(tx.targets))[:, None]
+        out = []
+        for g in graphs:
+            inv = {n: {int(c): i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
+            circ = {n: torch.zeros(T, len(cols[n]), device=dev) for n in nat.names}
+            for n, t, c in g.node_set():
+                circ[n][t, inv[n][c]] = 1.0
+            lever = {n: (tx.vpd[n][:, cols[n]] & (circ[n] == 0) & where).nonzero(as_tuple=True) for n in nat.names}
+            sizes = [len(lever[n][0]) for n in nat.names]
+            N = sum(sizes)
+            flat = [(n, int(t), int(cols[n][k])) for n in nat.names for t, k in zip(lever[n][0].tolist(), lever[n][1].tolist())]
+
+            def kl(x):  # KL(model - F || model - F - C) [R] for relaxed removals x [R, N]
+                if x.shape[0] > SCREEN_ROWS and not torch.is_grad_enabled():
+                    return torch.cat([kl(x[s0:s0 + SCREEN_ROWS]) for s0 in range(0, x.shape[0], SCREEN_ROWS)])
+                R = x.shape[0]
+                m1 = {}
+                for n, b in zip(nat.names, torch.split(x, sizes, 1)):
+                    m = torch.ones(R, T, len(cols[n]), device=dev)
+                    if b.shape[1]:
+                        m = m.index_put((torch.arange(R, device=dev).repeat_interleave(b.shape[1]),
+                                         lever[n][0].repeat(R), lever[n][1].repeat(R)), 1 - b.reshape(-1))
+                    m1[n] = m
+                m2 = {n: m1[n] * (1 - circ[n]) for n in nat.names}
+                return carry.kl(E.log_probs(m1), E.log_probs(m2))
+
+            def top(x, m):
+                return x * torch.zeros_like(x, dtype=torch.bool).scatter(1, x.topk(m, 1).indices, True)
+
+            def grad(x):
+                x = x.detach().requires_grad_(True)
+                return torch.autograd.grad(kl(x).clamp_min(1e-12).log().sum(), x)[0]
+
+            with torch.no_grad():
+                k0 = float(kl(torch.zeros(1, N, device=dev))[0])
+                row = {"n_real_flips": {0: necessity_log(e0, k0, v0)}, "mask_n_real_flips": {0: []}}
+            g0 = -grad(torch.zeros(1, N, device=dev)) if N else None
+            kls_at = {0: k0}
+            screened = []
+            if N:  # the shortlist measured: each part's removal alone, best (least KL) first
+                short = g0[0].abs().topk(min(N, SCREEN)).indices
+                with torch.no_grad():
+                    rows = torch.zeros(len(short), N, device=dev)
+                    rows[torch.arange(len(short), device=dev), short] = 1.0
+                    ks = kl(rows)
+                screened = short[ks.argsort()].tolist()
+            for m in ms:
+                if m > N:
+                    continue
+                x = torch.rand(restarts, N, generator=gen).to(dev)
+                x[0] = g0[0]
+                x = top(x, m).clamp(0, 1)
+                for _ in range(steps):
+                    x = top((x - ADV_STEP * grad(x).sign()).clamp(0, 1), m)
+                gx = grad(x)
+                with torch.no_grad():  # the top m, ties (entries the steps drove to 0) broken by the gradient, and the
+                    rank = x + 1e-6 * (-gx) / gx.abs().amax(1, keepdim=True).clamp_min(1e-30)  # shortlist's best m
+                    xb = torch.zeros_like(x).scatter(1, rank.topk(m, 1).indices, 1.0)
+                    if len(screened) >= m:
+                        pick = torch.zeros(1, N, device=dev)
+                        pick[0, screened[:m]] = 1.0
+                        xb = torch.cat([xb, pick])
+                    k = kl(xb)
+                    i = int(k.argmin())
+                    best = (float(k[i]), [flat[j] for j in xb[i].nonzero().flatten().tolist()])
+                    prev = max(mm for mm in row["n_real_flips"] if mm < m)  # at most m removals: no better than fewer
+                    if best[0] >= kls_at[prev]:
+                        best = (kls_at[prev], row["mask_n_real_flips"][prev])
+                    kls_at[m] = best[0]
+                    row["n_real_flips"][m] = necessity_log(e0, best[0], v0)
+                    row["mask_n_real_flips"][m] = best[1]
+                native.free(dev)
+            out.append(row)
+        return out
+
 
     def _rng(self, tx: Text, g: native.Graph, family: str) -> np.random.Generator:
         """A family's draws for one circuit on one text: seeded by the text and the circuit."""
@@ -1365,7 +1470,8 @@ class GoalEval:
         "patterns": the pool's patterns, each an OR over every position up to the last target), the other lever off.
         Search: sign-gradient steps of ADV_STEP on the relaxed lever, each projected onto its m largest entries, from
         restarts starts (one the gradient's top m at nothing switched on, the others random), then the top m
-        switched on and scored in float32; the worst restart. Per circuit {f"f1_flips_{lever}": {m: f1_adv},
+        switched on and scored in float32, beside the m best of a measured shortlist (SCREEN parts with the largest
+        gradient either way, each switched on alone); the worst of them, at most m (no weaker than a smaller budget). Per circuit {f"f1_flips_{lever}": {m: f1_adv},
         f"kl_flips_{lever}": {m: (KL_C, KL_VPD)}, f"mask_flips_{lever}": {m: the parts switched on, (site, position,
         subcomponent) or pool index}}."""
         nat, dev = self.nat, self.nat.dev
@@ -1404,6 +1510,19 @@ class GoalEval:
             kv0 = batch(items([(0, torch.zeros(1, N[0], device=dev))]))[0][1] if omitted and problems else None
         live = [i for i in range(len(problems)) if N[i]]
         g0 = dict(zip(live, grads([(i, torch.zeros(1, N[i], device=dev)) for i in live], "score")))
+        screened = {}
+        with torch.no_grad():  # each circuit's shortlist measured: the SCREEN parts with the largest gradient either way,
+            for i in live:  # each switched on alone, the largest gap first
+                short = g0[i][0].abs().topk(min(N[i], SCREEN)).indices
+                gaps = []
+                for s0 in range(0, len(short), SCREEN_ROWS):
+                    part = short[s0:s0 + SCREEN_ROWS]
+                    rows = torch.zeros(len(part), N[i], device=dev)
+                    rows[torch.arange(len(part), device=dev), part] = 1.0
+                    kc, kv = batch(items([(i, rows)]), vpd=not omitted)[0]
+                    kv = kv0.expand_as(kc) if kv is None else kv
+                    gaps.append(kc.log() - kv.log())
+                screened[i] = short[torch.cat(gaps).argsort(descending=True)].tolist()
         starts = {(i, m): torch.rand(restarts, N[i], generator=gen).to(dev) for i in range(len(problems)) for m in ms if m <= N[i]}
         flat = [[(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())] if omitted else pick
                 for _, idx, cols in problems]
@@ -1420,8 +1539,13 @@ class GoalEval:
             for _ in range(steps):
                 for (i, m), g in zip(group, grads([(i, xs[(i, m)]) for i, m in group], search)):
                     xs[(i, m)] = top((xs[(i, m)] + ADV_STEP * g.sign()).clamp(0, 1), m)
-            with torch.no_grad():
+            with torch.no_grad():  # each restart's top m, and the shortlist's best m
                 xb = {(i, m): torch.zeros_like(xs[(i, m)]).scatter(1, xs[(i, m)].topk(m, 1).indices, 1.0) for i, m in group}
+                for i, m in group:
+                    if len(screened.get(i, [])) >= m:
+                        pick = torch.zeros(1, N[i], device=dev)
+                        pick[0, screened[i][:m]] = 1.0
+                        xb[(i, m)] = torch.cat([xb[(i, m)], pick])
                 for (i, m), (kc, kv) in zip(group, batch(items([(i, xb[(i, m)]) for i, m in group]), vpd=not omitted)):
                     kv = kv0.expand_as(kc) if kv is None else kv
                     gap = kc.log() - kv.log()
@@ -1430,6 +1554,13 @@ class GoalEval:
                     out[i][f"kl_flips_{lever}"][m] = (float(kc[r]), float(kv[r]))
                     out[i][f"mask_flips_{lever}"][m] = [flat[i][j] for j in xb[(i, m)][r].nonzero().flatten().tolist()]
             native.free(dev)
+        for row in out:  # at most m: a budget's attack is no weaker than a smaller budget's
+            f, kl_, mask = row[f"f1_flips_{lever}"], row[f"kl_flips_{lever}"], row[f"mask_flips_{lever}"]
+            prev = None
+            for m in sorted(f):
+                if prev is not None and f[prev] is not None and (f[m] is None or f[m] > f[prev]):
+                    f[m], kl_[m], mask[m] = f[prev], kl_[prev], mask[prev]
+                prev = m
         return out
 
 
@@ -1828,7 +1959,8 @@ def _curve_value(d: dict, k):
 def fidelity_table(rows: list[dict]) -> str:
     """Means by locality group and circuit kind (each answer set; VPD top k at their sizes): tests the searches never
     optimized (flips-to-break, the omitted lever's flips, the node and connection families, interchange, the fresh
-    pool's pattern lever, N_real, C), the step adversary's curve, and in-sample (labelled) F1, N and size. "trivial":
+    pool's pattern lever, N_real and its flip adversary, C, the reads' response error, the remainder leak), the step
+    adversary's curve, and in-sample (labelled) F1, N and size. "trivial":
     texts whose empty circuit is within 2x of VPD's own KL."""
     def group(r):
         if r["kl_vpd"] is not None and r["kl_empty"] < 2 * r["kl_vpd"]:
@@ -1870,13 +2002,15 @@ def fidelity_table(rows: list[dict]) -> str:
         f = r.get("flips_to_half")
         return -1.0 if f == 0 else (math.log2(f) if f else (math.log2(2 * max(flips)) if flips else None))
 
-    held = [("log2 flips-to-break", breaks), ("log2 flips-to-0.5 (none: -1)", halves)] + [(f"flip{m}", lambda r, m=m: _curve_value(r.get("f1_flips_omitted"), m)) for m in flips]
+    held = [("log2 flips-to-0.5 (none: -1)", halves), ("log2 flips-to-break", breaks)] + [(f"flip{m}", lambda r, m=m: _curve_value(r.get("f1_flips_omitted"), m)) for m in flips]
     held += [("nodes fam", lambda r: r.get("s_nodes")), ("edges fam", lambda r: r.get("s_edges")),
              ("interchange", lambda r: r.get("s_interchange"))]
     held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
     held += [("N_real", lambda r: r.get("n_real")), ("C", lambda r: r.get("c"))]
-    held += [(f"read err {f}", lambda r, f=f: r.get(f"reads_{f}")) for f in ("nodes", "edges", "interchange")]
+    nflips = sorted({int(m) for r in rows for m in r.get("n_real_flips", {}) if int(m) > 0})
+    held += [(f"N_real flip{m}", lambda r, m=m: _curve_value(r.get("n_real_flips"), m)) for m in nflips]
     held += [(f"response err {f}", lambda r, f=f: r.get(f"dreads_{f}")) for f in ("nodes", "edges", "interchange")]
+    held += [("leak (no edges)", lambda r: r.get("leak"))]
     stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
     sample = [("F1", lambda r: r["s_point"]), ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
     return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),

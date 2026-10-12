@@ -548,9 +548,10 @@ def teacher_steps(path: dict) -> list[dict]:
 def compare(native_rows: Path, teacher_dir: Path, split: str, n: int, sizes=(12, 16, 32, 64, 256, 1024),
             ge: goal_eval.GoalEval | None = None, log=print) -> list[dict]:
     """Per text and size: the equal-effort native circuit (native_units teach), the teacher's circuit (teacher.py's
-    path) and VPD's first k (its order), at the step nearest each size; F1 and N_VPD (remainders off; goal_eval's
-    sufficiency) and N_real (removal from the real model: goal_eval's real_removal, native_units' N for native
-    units); locality from the teacher's summary (its F1 circuit reached from the targets alone)."""
+    path) and VPD's first k (its order), at the step nearest each size; F1 and N_VPD (goal_eval's sufficiency:
+    remainders off, the convention native circuits share, and live, the teacher's) and N_real (removal from the real
+    model: goal_eval's real_removal, native_units' N for native units); locality from the teacher's summary (its
+    "local" label, components.locality, else whether its F1 circuit came from the targets alone)."""
     ge = ge or goal_eval.GoalEval()
     nat = ge.nat
     nrows = {json.loads(x)["task"]: json.loads(x) for x in native_rows.read_text().splitlines() if x.strip()}
@@ -559,7 +560,7 @@ def compare(native_rows: Path, teacher_dir: Path, split: str, n: int, sizes=(12,
         for x in f.read_text().splitlines():
             if x.strip():
                 r = json.loads(x)
-                local[r["task"]] = r.get("f1_from_targets", r.get("local"))
+                local[r["task"]] = r["local"] if r.get("local") is not None else r.get("f1_from_targets")
     out = []
     for p in native.tasks(split)[:n]:
         tp = teacher_dir / f"{p.stem}.path.json"
@@ -582,7 +583,8 @@ def compare(native_rows: Path, teacher_dir: Path, split: str, n: int, sizes=(12,
         real = ge.real_removal(tx, graphs) if graphs else []
         for (kind, k), g, s, r in zip(meta, graphs, scored, real):
             out.append({"task": p.stem, "local": local.get(p.stem), "kind": kind, "size": k, "nodes": g.count(),
-                        "f1": s["f1_off"], "n_vpd": s["n_off"], "n_real": r["n_real_off"]})
+                        "f1": s["f1_off"], "n_vpd": s["n_off"], "f1_live": s["f1_live"], "n_vpd_live": s["n_live"],
+                        "n_real": r["n_real_off"]})
         if p.stem in nrows:
             for k in sizes:
                 t = _nearest(nrows[p.stem]["path"], k)
@@ -593,9 +595,33 @@ def compare(native_rows: Path, teacher_dir: Path, split: str, n: int, sizes=(12,
     return out
 
 
+def effort_table(native_rows: Path, teacher_dir: Path) -> str:
+    """Per text, both searches' measured sets, seconds, F1 circuits (size, positions, F1) and whether each reached its
+    F1 circuit from the targets alone."""
+    nrows = {json.loads(x)["task"]: json.loads(x) for x in native_rows.read_text().splitlines() if x.strip()}
+    trows = {}
+    for f in sorted(teacher_dir.glob("summary*.jsonl")):
+        for x in f.read_text().splitlines():
+            if x.strip():
+                r = json.loads(x)
+                trows[r["task"]] = r
+    lines = [["text", "local", "teacher sets", "native sets", "teacher s", "native s", "teacher F1 circuit", "native F1 circuit"]]
+    for task in sorted(set(nrows) | set(trows)):
+        t, n = trows.get(task, {}), nrows.get(task, {})
+
+        def circ(r):
+            f = r.get("f1_circuit")
+            return f"{f['size']} at {f['positions']} ({f['f1']:.2f}{', targets' if r.get('f1_from_targets') else ''})" if f else "-"
+        lines.append([task, str(t.get("local", "-")), str(t.get("measured_sets", "-")), str(n.get("measured_sets", "-")),
+                      f"{t['seconds']:.0f}" if t else "-", f"{n['seconds']:.0f}" if n else "-", circ(t), circ(n)])
+    w = [max(len(x[i]) for x in lines) for i in range(len(lines[0]))]
+    return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(x))) for x in lines)
+
+
 def compare_table(rows: list[dict]) -> str:
-    """Means by locality, size and kind: F1, N_VPD, N_real, the circuits' mean node count."""
-    lines = [["texts", "size", "kind", "n", "nodes", "F1", "N_VPD", "N_real"]]
+    """Means by locality, size and kind: F1 and N_VPD with remainders off (live), N_real, the circuits' mean node
+    count."""
+    lines = [["texts", "size", "kind", "n", "nodes", "F1 off", "(live)", "N_VPD off", "(live)", "N_real"]]
     for loc, label in ((True, "local"), (False, "non-local"), (None, "all")):
         for k in sorted({r["size"] for r in rows}):
             for kind in ("native", "teacher", "VPD order"):
@@ -606,7 +632,8 @@ def compare_table(rows: list[dict]) -> str:
                 def m(key, fmt="{:.3f}"):
                     v = [r[key] for r in rs if r.get(key) is not None]
                     return fmt.format(float(np.mean(v))) if v else "-"
-                lines.append([label, str(k), kind, str(len(rs)), m("nodes", "{:.0f}"), m("f1"), m("n_vpd"), m("n_real")])
+                lines.append([label, str(k), kind, str(len(rs)), m("nodes", "{:.0f}"), m("f1"), m("f1_live"), m("n_vpd"),
+                              m("n_vpd_live"), m("n_real")])
     w = [max(len(x[i]) for x in lines) for i in range(len(lines[0]))]
     return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(x))) for x in lines)
 
@@ -641,6 +668,7 @@ def main():
         rows = compare(args.native, args.teacher, args.split, args.n)
         if args.out:
             args.out.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        print(effort_table(args.native, args.teacher), flush=True)
         print(compare_table(rows), flush=True)
         return
     if args.cmd == "teach":

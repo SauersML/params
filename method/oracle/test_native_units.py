@@ -5,6 +5,7 @@
   ~/.local/bin/mem-lease 8 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_native_units.py
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -178,3 +179,15 @@ def test_teacher_steps_and_compare_table():
             {"task": "b", "local": False, "kind": "teacher", "size": 12, "nodes": 13, "f1": 0.7, "n_vpd": 0.3, "n_real": 0.0}]
     text = native_units.compare_table(rows)
     assert "non-local" in text and " 0.800 " in text and " 0.500 " in text
+
+
+def test_effort_table(tmp_path):
+    (tmp_path / "t").mkdir()
+    (tmp_path / "t" / "summary_0.jsonl").write_text(json.dumps(
+        {"task": "text1", "local": True, "measured_sets": 900, "seconds": 12.0, "f1_from_targets": True,
+         "f1_circuit": {"size": 22, "positions": 1, "f1": 0.991}}) + "\n")
+    (tmp_path / "n.jsonl").write_text(json.dumps(
+        {"task": "text1", "measured_sets": 5000, "seconds": 30.0, "f1_from_targets": False,
+         "f1_circuit": {"size": 60, "positions": 2, "f1": 0.9}}) + "\n")
+    text = native_units.effort_table(tmp_path / "n.jsonl", tmp_path / "t")
+    assert "22 at 1 (0.99, targets)" in text and "60 at 2 (0.90)" in text and " 5000 " in text

@@ -415,11 +415,11 @@ class Tools:
         got = ge._interchange_draws(tx, positions, self.split, COMPARE_DRAWS, first={p: -moved[p - 1] for p in positions})
         with torch.no_grad():
             lqs = ge._pp_engine(tx).path_patched(gs, [tuple(pz) for pz in got])  # [2, D, targets, V]
-            rows = []
+            rows, kept = [], tx.__dict__.get("_pp_prompts", {})  # track_pp's model runs on the changed texts
             for d, (p, z) in enumerate(got):
                 x2 = list(tx.ids)
                 x2[p] = z
-                ref2 = nat.reference([x2], self.targets)
+                ref2 = kept[(p, z)][0] if (p, z) in kept else nat.reference([x2], self.targets)
                 la, lb = lqs[0, d][None], lqs[1, d][None]
                 dis = 0.5 * float(carry.kl(la, lb)[0] + carry.kl(lb, la)[0])
                 rows.append((dis, p, z, ref2, la, lb))

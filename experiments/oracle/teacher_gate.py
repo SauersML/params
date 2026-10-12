@@ -95,7 +95,7 @@ def main():
     ap.add_argument("--fields", default=",".join(FIELDS))
     ap.add_argument("--teacher", nargs=2, type=Path, metavar=("DIR_A", "DIR_B"), help="teacher.py output directories of A and B")
     ap.add_argument("--adv", nargs=2, type=Path, metavar=("A.jsonl", "B.jsonl"), help="teacher_v3.py --evaluate scores of A and B")
-    ap.add_argument("--fidelity", nargs=2, type=Path, metavar=("A.jsonl", "B.jsonl"), help="goal_eval.py fidelity rows of A and B")
+    ap.add_argument("--fidelity", nargs="+", type=Path, help="goal_eval.py fidelity rows of both sets (kinds A and B, VPD top k), in shards")
     ap.add_argument("--labels", type=Path, default=Path.home() / "mpd-data/graph_oracle/components/heldout50_locality.jsonl")
     args = ap.parse_args()
     results = json.loads(args.score.read_text())
@@ -113,26 +113,27 @@ def main():
         VA, VB = ({json.loads(x)["task"]: json.loads(x) for x in p.read_text().splitlines() if x.strip()} for p in args.adv)
         print(f"held-out adversary (teacher_v3.py --evaluate): {len(set(VA) & set(VB))} texts in both")
         compare(VA, VB, args.a, args.b, ("f1", "n", "f1_adv", "f1_rob", "size"))
-    if args.fidelity and all(p.exists() for p in args.fidelity):
+    if args.fidelity and any(p.exists() for p in args.fidelity):
         def row(r):
             return {**r, **{f"flip_{m}": v for m, v in (r.get("f1_flips_omitted") or {}).items()},
                     **{f"flipc_{m}": v for m, v in (r.get("f1_flips_c") or {}).items()},
                     **{k: r.get(k) or 512 for k in ("flips_to_half", "flips_to_break") if k in r}}
 
-        def fid(p, vpd=False):
-            """task -> the teacher's row, or with vpd the row of VPD's top k at the teacher's size."""
-            rows = [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
-            teach = {r["task"]: row(r) for r in rows if r.get("kind", "").split(",")[0] == "teacher"}
+        rows = [json.loads(x) for p in args.fidelity if p.exists() for x in p.read_text().splitlines() if x.strip()]
+
+        def fid(kind, vpd=False):
+            """task -> the set's row (fidelity's kind: the set's name), or with vpd the row of VPD's top k at its node count."""
+            teach = {r["task"]: row(r) for r in rows if r.get("kind") == kind}
             if not vpd:
                 return teach
-            return {r["task"]: row(r) for r in rows if r.get("kind") == f"VPD top {teach.get(r['task'], {}).get('size')}"}
-        FA, FB = fid(args.fidelity[0]), fid(args.fidelity[1])
+            return {r["task"]: row(r) for r in rows if r.get("kind") == f"VPD top {teach.get(r['task'], {}).get('nodes')}"}
+        FA, FB = fid("a"), fid("b")
         local = {}
         if args.labels.exists():
             local = {json.loads(x)["task"]: json.loads(x)["local"] for x in args.labels.read_text().splitlines() if x.strip()}
         fields = ("flipc_1", "flipc_4", "flipc_16", "flipc_64", "flipc_256", "flips_to_half", "flips_to_break", "s_point_c", "n_point",
                   "n_real", "s_point", "s_wiring", "reliance_on_cuts", "flip_1", "flip_4", "dreads_edges", "dreads_nodes",
-                  "dreads_interchange", "c", "c_flips", "size")
+                  "dreads_interchange", "c", "c_flips", "nodes", "size")
         for name, keep in (("all", lambda t: True), ("non-local", lambda t: local.get(t) is False), ("local", lambda t: local.get(t) is True)):
             ts = [t for t in set(FA) & set(FB) if keep(t)]
             if ts:
@@ -145,8 +146,8 @@ def main():
                     print(f"rule (guarded): flipc_1 and flipc_4 higher {'yes' if up else 'NO'}; s_point_c and point N not lower "
                           f"{'yes' if kept else 'NO'} -> {'PASS' if up and kept else 'FAIL'} (answers within the budget: answer_tokens.py)")
         vfields = ("flipc_1", "flipc_4", "flips_to_half", "s_nodes", "s_edges", "n_real", "s_point_c", "n_point", "s_point", "dreads_edges", "c_flips")
-        for side, p, F in ((args.a, args.fidelity[0], FA), (args.b, args.fidelity[1], FB)):
-            V = fid(p, vpd=True)
+        for side, kind, F in ((args.a, "a", FA), (args.b, "b", FB)):
+            V = fid(kind, vpd=True)
             ts = sorted(set(F) & set(V))
             if ts:
                 print(f"{side} against VPD's top k at its sizes (A = VPD top k, B = {side}): {len(ts)} texts")

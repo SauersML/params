@@ -299,7 +299,7 @@ def vllm_sample(ex: Explainer, base: str, embeds: list[torch.Tensor], n: int, ma
             if isinstance(m, LoraLayer) and "default" in m.lora_A:
                 w = m.base_layer.weight
                 merged.append((name.removeprefix("base_model.model.") + ".weight", (w.float() + m.get_delta_weight("default").float()).to(w.dtype).cpu()))
-    del ex
+    ex.model = ex.injector = None  # the caller's explainer too: its model leaves the GPU before vLLM starts
     gc.collect()
     torch.cuda.empty_cache()
     llm = LLM(model=base, dtype="bfloat16", enable_prompt_embeds=True, enable_prefix_caching=False, async_scheduling=False,

@@ -286,6 +286,53 @@ def test_repeated_graphs_plan_as_their_list():
             assert float((x - y).norm() / x.norm().clamp_min(1e-30)) < REL, semantics
 
 
+def test_runs_from_a_position_reuse_the_base():
+    """reuse: the run on a text that differs from the engine's from position lo on, computed from lo with the states
+    the base run kept before it, is the run on that text's own engine (KL within float32 rounding of each other): C's
+    semantics on a stated graph with strengths and masks, native's on the whole graph, and a complete graph (the whole
+    model at masks u); lo in the middle and at the target; and two changed texts in one run (Engine.repeat, tile_states,
+    each row's tokens)."""
+    nat, ids, targets, graph, ew, ow, u = graph_case()
+    B, T = len(ew), len(ids)
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[::2])
+    g = torch.Generator().manual_seed(5)
+    ewh = torch.rand(B, sum(len(w) for w in half.parents.values()), generator=g).to(nat.dev)
+    owh = torch.rand(B, len(half.out), generator=g).to(nat.dev)
+    model = native.Graph(masks={n: torch.ones(1, 1, dtype=torch.bool, device=nat.dev) for n in nat.names})
+    E = engine.Engine(nat, ids, targets, live=True)
+    for lo in (T // 2, targets[0]):
+        x = list(ids)
+        x[lo] = (x[lo] + 7) % nat.target.wte.shape[0]
+        Ex = engine.Engine(nat, x, targets, live=True)
+        ref = nat.reference([x], targets)
+        for semantics, gr, e, o in (("c", half, ewh, owh), ("native", graph, ew, ow), ("c", model, None, None)):
+            st = {}
+            with torch.no_grad():
+                E.graph_log_probs(E.plan(gr, semantics=semantics), u, e, o, keep=st)
+                got = E.graph_log_probs(E.plan(gr, semantics=semantics), u, e, o, reuse=(st, x, lo))
+                want = Ex.graph_log_probs(Ex.plan(gr, semantics=semantics), u, e, o)
+            assert rel(carry.kl(ref, want), carry.kl(ref, got)) < REL, (lo, semantics)
+    # several changed texts at once: a list plan repeated (Engine.repeat), the states tiled, each row's tokens, from
+    # the earliest change
+    pair = [half, graph]
+    u2 = {n: m[:2] for n, m in u.items()}
+    st = {}
+    lo1, lo2 = T // 2, targets[0]
+    xs = [list(ids), list(ids)]
+    xs[0][lo1] = (xs[0][lo1] + 7) % nat.target.wte.shape[0]
+    xs[1][lo2] = (xs[1][lo2] + 3) % nat.target.wte.shape[0]
+    with torch.no_grad():
+        E.graph_log_probs(E.plan(pair, semantics="c"), u2, keep=st)
+        tok = torch.tensor([xs[0], xs[0], xs[1], xs[1]])
+        got = E.graph_log_probs(E.repeat(E.plan(pair, semantics="c"), 2), {n: m.repeat(2, 1, 1) for n, m in u2.items()},
+                                reuse=(E.tile_states(st, 2), tok, lo1))
+        for d, x in enumerate(xs):
+            Ex = engine.Engine(nat, x, targets, live=True)
+            want = Ex.graph_log_probs(Ex.plan(pair, semantics="c"), u2)
+            ref = nat.reference([x], targets)
+            assert rel(carry.kl(ref, want), carry.kl(ref, got[2 * d:2 * d + 2])) < REL, d
+
+
 def test_c_semantics_equal_graph_ref():
     """C's semantics (plan(semantics="c")) equal goal_eval.GoalEval.graph_ref, the forward pass written out, on a graph
     stating half of its connections, with the gradients in u; a stated connection at strength 0 is the graph without it."""

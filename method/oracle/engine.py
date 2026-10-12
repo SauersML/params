@@ -335,21 +335,34 @@ class Engine:
                 raise ValueError(f"the plan has {p['B']} graphs, one per row, not {B}")
             return p
         if B not in p.setdefault("tiled", {}):
-            dev = self.dev
-            bs = lambda k: torch.arange(B, device=dev).repeat_interleave(k)  # noqa: E731
-            tile = lambda v, k: (v[None] + k * torch.arange(B, device=dev)[:, None]).flatten()  # noqa: E731
-            btc = lambda t: (bs(len(t[0])), t[1].repeat(B), t[2].repeat(B))  # noqa: E731
-            R = {n: len(v[0]) for n, v in p["readers"].items()}
-            W = {n: len(v[0]) for n, v in p["writers"].items()}
-            p["tiled"][B] = _positions({
-                "B": B, "E": B * p["E"], "O": B * p["O"], "semantics": p["semantics"], "qk": {n: btc(v) for n, v in p["qk"].items()},
-                "nodes": {n: btc(v) for n, v in p["nodes"].items()},
-                "readers": {n: btc(v) for n, v in p["readers"].items()}, "writers": {n: btc(v) for n, v in p["writers"].items()},
-                "edges": {(rn, wn): (tile(ri, R[rn]), tile(wi, W[wn]), tile(j, p["E"]), fx.repeat(B))
-                          for (rn, wn), (ri, wi, j, fx) in p["edges"].items()},
-                "out": {wn: (bs(len(b)), ti.repeat(B), tile(wi, W[wn]), tile(j, p["O"]), fx.repeat(B))
-                        for wn, (b, ti, wi, j, fx) in p["out"].items()}})
+            p["tiled"][B] = self._tile(p, 1, B)
         return p["tiled"][B]
+
+    def repeat(self, plan: dict, times: int) -> dict:
+        """The plan of a list plan's graphs listed times over, rows d B + b its row b (kept on the plan): its tables
+        tiled as _rows tiles a one-graph plan (no planning; for reuse over several changed texts at once)."""
+        if plan["B"] is None:
+            raise ValueError("repeat takes a list plan (a one-graph plan runs on any number of rows)")
+        if ("repeat", times) not in plan:
+            plan[("repeat", times)] = self._tile(plan, plan["B"], times)
+        return plan[("repeat", times)]
+
+    def _tile(self, p: dict, B0: int, times: int) -> dict:
+        """A plan's tables over B0 rows laid out times over (copy d's rows, row entries and strength indices after
+        copy d - 1's)."""
+        dev = self.dev
+        step = lambda v, k: (v[None] + k * torch.arange(times, device=dev)[:, None]).flatten()  # noqa: E731
+        btc = lambda t: (step(t[0], B0), t[1].repeat(times), t[2].repeat(times))  # noqa: E731
+        R = {n: len(v[0]) for n, v in p["readers"].items()}
+        W = {n: len(v[0]) for n, v in p["writers"].items()}
+        return _positions({
+            "B": B0 * times, "E": times * p["E"], "O": times * p["O"], "semantics": p["semantics"],
+            "qk": {n: btc(v) for n, v in p["qk"].items()}, "nodes": {n: btc(v) for n, v in p["nodes"].items()},
+            "readers": {n: btc(v) for n, v in p["readers"].items()}, "writers": {n: btc(v) for n, v in p["writers"].items()},
+            "edges": {(rn, wn): (step(ri, R[rn]), step(wi, W[wn]), step(j, p["E"]), fx.repeat(times))
+                      for (rn, wn), (ri, wi, j, fx) in p["edges"].items()},
+            "out": {wn: (step(b, B0), ti.repeat(times), step(wi, W[wn]), step(j, p["O"]), fx.repeat(times))
+                    for wn, (b, ti, wi, j, fx) in p["out"].items()}})
 
     def graph_kl(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
                  precision: str = "score", patch: dict | None = None) -> torch.Tensor:
@@ -358,20 +371,38 @@ class Engine:
         return carry.kl(self.ref, self.graph_log_probs(plan, u, ew, ow, precision, patch))
 
     def graph_log_probs(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
-                        precision: str = "score", patch: dict | None = None, reads: dict | None = None):
+                        precision: str = "score", patch: dict | None = None, reads: dict | None = None, keep: dict | None = None,
+                        reuse: tuple | None = None):
         """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32. patch:
         {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange). reads as
-        log_probs': (log q, {site: [n]})."""
+        log_probs': (log q, {site: [n]}). keep, a dict, receives the run's states for reuse (each layer's keys and
+        values, every writer row's activation; float32). reuse = (keep's states of a run of the same plan, u, ew and ow
+        on the engine's text, tokens, start): the run on tokens ([T] for every row or [B, T] per row, equal to the
+        text's before start, start no later than the first target), the model being causal: every state before start
+        is that run's, and only the positions from start on are computed (float32, no patch or reads). tile_states
+        lays a run's states out for its plan's rows repeated (repeat: the graphs' list repeated, one block per
+        changed text)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
+        if (keep is not None or reuse is not None) and (precision != "score" or patch is not None or reads is not None):
+            raise ValueError("keep and reuse are float32 runs without patch or reads")
+        if reuse is not None and not 0 < reuse[2] <= min(self.targets):
+            raise ValueError("reuse starts after position 0 and no later than the first target")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
         p = self._rows(plan, B)
         with _precision(precision, self.dev), self._dtype(precision):
             rec = None if reads is None else (reads, {})
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
-                                   None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec)
+                                   None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec, keep, reuse)
         lq = torch.log_softmax(h.float() @ self.tg.wte.T, -1)
         return lq if rec is None else (lq, rec[1])
+
+    @staticmethod
+    def tile_states(states: dict, times: int) -> dict:
+        """keep's states of a run on B rows as those of the run on the same rows repeated times over (rows b, B + b, ...
+        the same: the plan of the graphs' list repeated, u, ew and ow repeated the same way)."""
+        return {"k": [k.repeat(times, 1, 1, 1) for k in states["k"]], "v": [v.repeat(times, 1, 1, 1) for v in states["v"]],
+                "aw": {n: a.repeat(times) for n, a in states["aw"].items()}}
 
     def _zeros(self) -> dict:
         if not hasattr(self, "_u0"):
@@ -413,6 +444,32 @@ class Engine:
             p["_last"] = (R, Wr, Eg, out, S)
         return p["_last"]
 
+    def _from_tables(self, p: dict, lo: int) -> tuple:
+        """A plan's tables for a run from position lo on (reuse): the readers at lo and after, their positions less lo,
+        the connections into them (their writer rows the plan's), per writer site its rows at lo and after (their
+        places in its table, row, position less lo, column), and the attention-output readers' distinct positions
+        (less lo; kept on the plan)."""
+        key = ("_from", lo)
+        if key not in p:
+            dev = self.dev
+            R, rmap = {}, {}
+            for n, (b, t, c) in p["readers"].items():
+                keep = t >= lo
+                m = torch.full((len(b),), -1, dtype=torch.long, device=dev)
+                m[keep] = torch.arange(int(keep.sum()), device=dev)
+                rmap[n] = m
+                if bool(keep.any()):
+                    R[n] = (b[keep], t[keep] - lo, c[keep])
+            Eg = {}
+            for (rn, wn), (ri, wi, j, fx) in p["edges"].items():
+                keep = rmap[rn][ri] >= 0
+                if bool(keep.any()):
+                    Eg[(rn, wn)] = (rmap[rn][ri][keep], wi[keep], j[keep], fx[keep])
+            new = {n: ((t >= lo).nonzero().flatten(), b[t >= lo], t[t >= lo] - lo, c[t >= lo]) for n, (b, t, c) in p["writers"].items()}
+            pos = {n: torch.unique(t, return_inverse=True) for n, (_, t, _) in R.items() if n.endswith("o_proj")}
+            p[key] = (R, Eg, new, pos)
+        return p[key]
+
     def _resid_tables(self, p: dict, key: str, Wr: dict, Eg: dict, outs: dict) -> tuple:
         """The connections from residual writers (attention and MLP outputs) as one list per reader site and one into
         the prediction: each writer row's place among the residual writers' rows laid end to end in the order the run
@@ -437,10 +494,11 @@ class Engine:
             p[key] = (off, cons, tuple(torch.cat(x) for x in zip(*lst)) if lst else None)
         return p[key]
 
-    def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None, rec: tuple | None = None) -> torch.Tensor:
+    def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None, rec: tuple | None = None,
+                      keep: dict | None = None, reuse: tuple | None = None) -> torch.Tensor:
         """The final normed residual stream at the targets [B, len(targets), d] of the graph runs. fused (a search's
         steps): torch's fused norms and GELU, and the last layer's queries, attention output and MLP at the targets
-        alone (with reads, every position)."""
+        alone (with reads, every position). keep and reuse: graph_log_probs'."""
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         norm, act = self._steps(fused)
         R, Wr, Eg, outs = p["readers"], p["writers"], p["edges"], p["out"]
@@ -451,10 +509,19 @@ class Engine:
         narrow = fused and rec is None
         sel, S = None, set()  # the last layer's positions (the targets) and its sites that run only there
         aw, sw = {}, {}  # per writer site, its writer rows' activations and 1 - u
-        off, cons, cout = self._resid_tables(p, "_resid", Wr, Eg, outs)
+        lo = 0 if reuse is None else reuse[2]  # the first position computed (reuse: every state before it the base's)
+        if lo:
+            R, Eg, new, pos_from = self._from_tables(p, lo)
+            off, cons, cout = self._resid_tables(p, ("_resid_from", lo), Wr, Eg, outs)
+        else:
+            off, cons, cout = self._resid_tables(p, "_resid", Wr, Eg, outs)
+        if keep is not None:
+            keep.update(k=[], v=[], aw={})
         res_a, res_s = [], []  # the residual writers' rows' activations and 1 - u, in their order (off)
 
         def cut(n, m):  # site n's [B or 1, T or 1, ...] tensor at the positions its steps run on
+            if lo:
+                return m[:, lo:] if m.shape[1] > 1 else m
             return m[:, sel] if n in S and m.shape[1] > 1 else m
 
         def at(m, b, t, c):  # a mask [B or 1, T or 1, K] at rows' (row, position, column)
@@ -466,7 +533,13 @@ class Engine:
             if rec is not None and n in rec[0]:
                 rec[1][n] = A[rec[0][n]].float()
             if n in Wr:
-                aw[n], sw[n] = A[Wr[n]], 1 - at(cut(n, u[n]), *Wr[n])
+                if lo:  # the writer rows before lo the base's, the rest this run's
+                    rows, b, t, c_ = new[n]
+                    aw[n], sw[n] = reuse[0]["aw"][n].index_copy(0, rows, A[b, t, c_]), 1 - at(u[n], *Wr[n])
+                else:
+                    aw[n], sw[n] = A[Wr[n]], 1 - at(cut(n, u[n]), *Wr[n])
+                if keep is not None:
+                    keep["aw"][n] = aw[n]
                 if n in off:
                     res_a.append(aw[n])
                     res_s.append(sw[n])
@@ -501,7 +574,12 @@ class Engine:
             b, t, _ = R[n]
             return norm(x[b, t] + topup(n, x.shape[-1]), w)
 
-        x = self.emb.expand(B, -1, -1)
+        if lo:  # the tokens from lo on: every row's [T], or each row's [B, T]
+            tok = (reuse[1] if torch.is_tensor(reuse[1]) else torch.tensor(reuse[1])).to(self.dev)
+            x = tg.wte[tok[lo:]][None].expand(B, -1, -1) if tok.dim() == 1 else tg.wte[tok[:, lo:]]
+            causal = torch.arange(T, device=self.dev)[None, :] <= torch.arange(lo, T, device=self.dev)[:, None]  # [T - lo, T]
+        else:
+            x = self.emb.expand(B, -1, -1)
         for i in range(tg.n_layer):
             name = lambda k: native.site_name(i, k)  # noqa: E731
             if narrow and i == tg.n_layer - 1:  # the last layer: keys and values at every position, the rest at the targets
@@ -530,9 +608,19 @@ class Engine:
 
             heads = lambda y: y.reshape(B, y.shape[1], H, hd).transpose(1, 2)  # noqa: E731
             nq, nv, no = name("q_proj"), name("v_proj"), name("o_proj")
-            v = heads(out("v_proj", h, u[nv]))
-            k = tg._rope(heads(out("k_proj", h, scale("k_proj"))), T).to(v.dtype)
-            if nq in S:  # rotary at the targets, each target's query over the keys up to it
+            v = heads(out("v_proj", h, cut(nv, u[nv])))
+            if lo:  # the keys and values before lo the base's
+                k = tg._rope_from(heads(out("k_proj", h, scale("k_proj"))), lo, T).to(v.dtype)
+                k, v = torch.cat([reuse[0]["k"][i][:, :, :lo], k], 2), torch.cat([reuse[0]["v"][i][:, :, :lo], v], 2)
+            else:
+                k = tg._rope(heads(out("k_proj", h, scale("k_proj"))), T).to(v.dtype)
+            if keep is not None:
+                keep["k"].append(k)
+                keep["v"].append(v)
+            if lo:  # the queries from lo on, each over the keys up to it
+                q = tg._rope_from(heads(out("q_proj", h, scale("q_proj"))), lo, T).to(v.dtype)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=causal)
+            elif nq in S:  # rotary at the targets, each target's query over the keys up to it
                 q = heads(out("q_proj", h[:, sel], scale("q_proj")))
                 half = hd // 2
                 q = (q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]).to(v.dtype)
@@ -550,9 +638,9 @@ class Engine:
                         P = ((q @ k.transpose(-1, -2)).float() / math.sqrt(hd)).masked_fill(~self._causal_targets, float("-inf")).softmax(-1)
                         idx = t
                     else:
-                        pos, idx = p["positions"][no]
+                        pos, idx = pos_from[no] if lo else p["positions"][no]
                         z = (q[:, :, pos] @ k.transpose(-1, -2)).float() / math.sqrt(hd)
-                        P = z.masked_fill(torch.arange(T, device=self.dev)[None, :] > pos[:, None], float("-inf")).softmax(-1)
+                        P = z.masked_fill(torch.arange(T, device=self.dev)[None, :] > pos[:, None] + lo, float("-inf")).softmax(-1)
                     for wn, ri, wi, s in shares(no):
                         pat = P[b[ri], :, idx[ri], Wr[wn][1][wi]]  # [n, H]: how much each reader's position attends to its writer's
                         inp = _add_rows(inp, ri, s, lambda k, pat=pat, wn=wn, wi=wi:
@@ -574,7 +662,7 @@ class Engine:
                 a = read(nd, a, act(pre[b, t] + topup(nd, pre.shape[-1])))
             A["down_proj"] = done(nd, a)
             x = x + out("down_proj", g, cut(nd, u[nd]))
-        z = x if sel is not None else x[:, self._targets]
+        z = x if sel is not None else x[:, self._targets - lo]
         if cout is not None:  # the connections into the prediction, every writer site's at once
             b, ti, gi, j, fx, uc = cout
             z = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)

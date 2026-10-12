@@ -904,7 +904,7 @@ def path_teacher(ge, task: dict, ev: dict, path: dict, tokens, budget: int = ANS
     final = reward(ge, task, {**ev, "qa": []}, [render(c) for c in cands], cache=cache)
     k = max(range(len(cands)), key=lambda j: target_score(final[j]))
     g, _ = goal_eval.circuit(cands[k], task["prompts"][0]["target_positions"], ge.nat.C, len(task["prompts"][0]["token_ids"]))
-    return cands[k], {"task": task["id"], "step": fits[best[k]][0], "size": g.count(), "edges": len(cands[k]["edges"]),
+    return cands[k], {"task": task["id"], "step": fits[best[k]][0], "nodes": g.count(), "edges": len(cands[k]["edges"]),
                       "score": target_score(final[k]), **{x: final[k].get(x) for x in ("term_F1", "term_N", "term_F3", "size")},
                       "tokens": tokens(target(cands[k], ev, task["model"]))}
 

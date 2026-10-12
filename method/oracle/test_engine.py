@@ -273,3 +273,35 @@ def test_c_semantics_equal_graph_ref():
     with torch.no_grad():
         u0 = {n: m[:1] for n, m in u.items()}
         assert rel(eng.graph_kl(eng.plan(less, semantics="c"), u0), eng.graph_kl(eng.plan(half, semantics="c"), u0, ew=ew)) < REL
+
+
+def test_c_semantics_cuts_in_the_model_and_patches():
+    """C's semantics on a complete graph: the whole model with one connection cut (Engine(outside="on"), u = 1) is
+    goal_eval's cut of that connection (path patching); and a circuit node patched to 0 with u = 0 is the graph
+    without that node."""
+    nat, ids, targets, graph, _, _, _ = graph_case()
+    T = len(ids)
+    ge = goal_eval.GoalEval(nat)
+    tx = ge.text(ids, targets)
+    par, out = native.all_edges(sorted(graph.nodes), targets)
+    pairs = [(ws[0], r) for r, ws in sorted(par.items())[:3]] + [(out[0], None)]
+    want = ge.cuts(tx, pairs)
+    cols = {n: torch.tensor(sorted({nd[2] for e in pairs for nd in e if nd is not None and nd[0] == n}), dtype=torch.long)
+            for n in nat.names}
+    eng = engine.Engine(nat, ids, targets, live=True, columns=cols, outside="on")
+    model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+    ones = {n: torch.ones(1, 1, eng.width(n), device=nat.dev) for n in nat.names}
+    with torch.no_grad():
+        got = eng.graph_kl(eng.plan([model] * len(pairs), semantics="c", cuts=[{r: [w]} for w, r in pairs]), ones).tolist()
+    for (w, r), a, b in zip(pairs, want, got):
+        assert abs(a - b) < 1e-5 + REL * abs(a), (w, r, a, b)
+    whole = engine.Engine(nat, ids, targets, live=True)
+    x = sorted(graph.nodes)[len(graph.nodes) // 2]
+    zero = {n: torch.zeros(1, T, nat.C[n], device=nat.dev) for n in nat.names}
+    patch = {x[0]: (torch.zeros(1, T, nat.C[x[0]], dtype=torch.bool, device=nat.dev), torch.zeros(1, T, nat.C[x[0]], device=nat.dev))}
+    patch[x[0]][0][0, x[1], x[2]] = True
+    less = goal_eval._drop_nodes(graph, {x})
+    with torch.no_grad():
+        a = whole.graph_kl(whole.plan(graph, semantics="c"), zero, patch=patch)
+        b = whole.graph_kl(whole.plan(less, semantics="c"), zero)
+    assert rel(a, b) < REL

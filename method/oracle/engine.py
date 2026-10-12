@@ -160,21 +160,25 @@ class Engine:
         """The numbers to report for masks a search found at a lower precision: float32, vpd_model's own steps."""
         return self.kl({n: m.detach().float() for n, m in masks.items()}, "score")
 
-    def plan(self, graphs, semantics: str = "native") -> dict:
+    def plan(self, graphs, semantics: str = "native", cuts=None) -> dict:
         """Graphs' nodes and connections as index tensors over the engine's columns, for graph_kl. graphs: one
         native.Graph, run on every row, or a list of them, one per row. semantics (module docstring): "native"
         (native.run's: the stated connections) or "c" (C's: every connection the model has among the nodes, the
-        unstated ones at strength 0). Per site the circuit's nodes, the query and key nodes, the reader nodes (with a
-        connection in) and the writer nodes as (rows, positions, columns); per (reader site, writer site) the
-        connections (reader rows, writer rows, their index among the strengths, 1 for a stated one and 0 for an
-        unstated one); per writer site the connections into the prediction (rows, target index, writer rows, index, 1
-        or 0)."""
+        unstated ones at strength 0). cuts: per graph (one dict, or a list beside graphs) {reader node or None (the
+        prediction): [writer nodes]}, connections at strength 0 besides the unstated ones. In C's semantics a graph may
+        be complete (VPD's answer, the whole model: native.Graph(masks=...)): it runs as u (give it 1 on the graph's
+        subcomponents), its subcomponents reading each other in full but for the cuts. Per site the circuit's nodes,
+        the query and key nodes, the reader nodes (with a connection in) and the writer nodes as (rows, positions,
+        columns); per (reader site, writer site) the connections (reader rows, writer rows, their index among the
+        strengths, 1 for a stated one and 0 for an unstated or cut one); per writer site the connections into the
+        prediction (rows, target index, writer rows, index, 1 or 0)."""
         if semantics not in ("native", "c"):
             raise ValueError("semantics is native or c")
         one = not isinstance(graphs, (list, tuple))
         graphs = [graphs] if one else list(graphs)
-        if any(g.complete for g in graphs):
-            raise ValueError("graph_kl runs graphs of stated connections (a complete graph is a masked run: kl)")
+        cuts = [cuts] if one else (list(cuts) if cuts is not None else [None] * len(graphs))
+        if semantics == "native" and any(g.complete for g in graphs):
+            raise ValueError("native.run's graph runs need stated connections (a complete graph is a masked run: kl)")
         dev, inv = self.dev, {}
 
         def col(n, c):
@@ -193,11 +197,16 @@ class Engine:
 
         readers, writers, edges, outs, qk, nodes, E, O = {}, {}, {}, {}, {}, {}, 0, 0
         for b, g in enumerate(graphs):
-            ne, no = E, O  # this graph's stated connections' indices: from E and O on, in its parents' and out's order
-            at = {(w, r): ne + k for k, (w, r) in enumerate((w, r) for r, ws in g.parents.items() for w in ws)}
-            at.update({(w, None): no + k for k, w in enumerate(g.out)})
-            E, O = ne + sum(len(ws) for ws in g.parents.values()), no + len(g.out)
-            par, out = (g.parents, g.out) if semantics == "native" else native.all_edges(sorted(g.node_set()), self.targets)
+            cut = {(w, r) for r, ws in (cuts[b] or {}).items() for w in ws}
+            if g.complete:  # its subcomponents read each other in full (u): only the cuts are connections here
+                at, par = {}, {r: list(ws) for r, ws in (cuts[b] or {}).items() if r is not None}
+                out = list((cuts[b] or {}).get(None, []))
+            else:
+                ne, no = E, O  # this graph's stated connections' indices: from E and O on, in its parents' and out's order
+                at = {(w, r): ne + k for k, (w, r) in enumerate((w, r) for r, ws in g.parents.items() for w in ws)}
+                at.update({(w, None): no + k for k, w in enumerate(g.out)})
+                E, O = ne + sum(len(ws) for ws in g.parents.values()), no + len(g.out)
+                par, out = (g.parents, g.out) if semantics == "native" else native.all_edges(sorted(g.node_set()), self.targets)
             for r, ws in par.items():
                 ri = row(readers, b, r)
                 for w in ws:
@@ -205,7 +214,7 @@ class Engine:
                     lst[0].append(ri)
                     lst[1].append(row(writers, b, w))
                     lst[2].append(at.get((w, r), 0))
-                    lst[3].append(float((w, r) in at))
+                    lst[3].append(float((w, r) in at and (w, r) not in cut))
             for w in out:
                 if w[1] not in self.targets:
                     raise ValueError(f"{w} writes into the prediction but is not at a target")
@@ -214,7 +223,9 @@ class Engine:
                 lst[1].append(self.targets.index(w[1]))
                 lst[2].append(row(writers, b, w))
                 lst[3].append(at.get((w, None), 0))
-                lst[4].append(float((w, None) in at))
+                lst[4].append(float((w, None) in at and (w, None) not in cut))
+            if g.complete:
+                continue
             for n, t, c in g.node_set():
                 nodes.setdefault(n, set()).add((b, t, col(n, c)))
                 if n.endswith(("q_proj", "k_proj")):
@@ -251,21 +262,22 @@ class Engine:
         return p["tiled"][B]
 
     def graph_kl(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
-                 precision: str = "score") -> torch.Tensor:
+                 precision: str = "score", patch: dict | None = None) -> torch.Tensor:
         """KL in bits of the model at the targets from each row's graph run [B] (the module docstring: plan from
-        Engine.plan, u, ew, ow)."""
-        return carry.kl(self.ref, self.graph_log_probs(plan, u, ew, ow, precision))
+        Engine.plan, u, ew, ow; patch as graph_log_probs)."""
+        return carry.kl(self.ref, self.graph_log_probs(plan, u, ew, ow, precision, patch))
 
     def graph_log_probs(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
-                        precision: str = "score") -> torch.Tensor:
-        """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32."""
+                        precision: str = "score", patch: dict | None = None) -> torch.Tensor:
+        """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32. patch:
+        {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
         p = self._rows(plan, B)
         with _precision(precision, self.dev):
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
-                                   None if ow is None else ow.reshape(-1), B, precision != "score")
+                                   None if ow is None else ow.reshape(-1), B, precision != "score", patch)
         return torch.log_softmax(h.float() @ self.tg.wte.T, -1)
 
     def _zeros(self) -> dict:
@@ -273,7 +285,7 @@ class Engine:
             self._u0 = {n: torch.zeros(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
         return self._u0
 
-    def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool) -> torch.Tensor:
+    def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None) -> torch.Tensor:
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         norm, act = self._steps(fused)
         R, Wr, Eg = p["readers"], p["writers"], p["edges"]
@@ -286,7 +298,9 @@ class Engine:
         def at(m, b, t, c):  # a mask [B or 1, T or 1, K] at rows' (row, position, column)
             return m[b if m.shape[0] > 1 else torch.zeros_like(b), t if m.shape[1] > 1 else torch.zeros_like(t), c]
 
-        def done(n, A):  # a site's activations [B, T, K]: its writer nodes' kept
+        def done(n, A):  # a site's activations [B, T, K], patched: its writer nodes' kept
+            if patch is not None and n in patch:
+                A = torch.where(patch[n][0], patch[n][1].to(A.dtype), A)
             if n in Wr:
                 aw[n], sw[n] = A[Wr[n]], 1 - at(u[n], *Wr[n])
             return A

@@ -103,7 +103,7 @@ QA_PER_KIND = 2
 QA_RANKS = 8  # token-change questions draw the new token from the model's alternatives at ranks 0 to 7
 ANSWER_BUDGET = 3_500  # tokens of a supervised answer: 4,096 sampled at most, ~600 left for English and reasoning
 MAX_PAIRS = 1_024  # connections with_edges measures at most
-FACT_NODES = 24  # subcomponents whose atlas facts a teacher's English writer reads
+FACT_NODES = 24  # subcomponents a teacher's English writer reads about
 
 
 # ---- the answer's text
@@ -668,9 +668,9 @@ def question(task: dict, ev: dict) -> str:
              + ", ".join(f"{q} ({strings[q]!r})" for q in ev["positions"])]
     if ev["events"]:
         lines += ["measured at those positions (log2 change of the top token's probability):"] + units.evidence(ev["events"], ev["listed"], strings)
-    lines.append("VPD's active subcomponents (causal importance, and on Pile text the tokens its write raises and the "
-                 "tokens it is active on), most important first, and the strongest weight-level connections among them "
-                 "(cosine; a static coupling, not a measured effect):")
+    lines.append("VPD's active subcomponents (causal importance; the tokens its write raises by the logit lens, read from "
+                 "the weights, not measured; the tokens it is active on in Pile text), most important first, and the "
+                 "strongest weight-level connections among them (cosine; a static coupling, not a measured effect):")
     for q in sorted(ev["components"], key=int):
         cs = ev["components"][q]
         lines.append(f"{q} ({strings[int(q)]!r}): " + ", ".join(f"{node_text(tuple(nd))} ({c:.2f}{'; ' + f if f else ''})" for nd, c, f in cs))
@@ -938,13 +938,15 @@ def vpd_teacher(ge, task: dict, ev: dict, tokens, budget: int = ANSWER_BUDGET, c
                     "tokens": tokens(target(answer, ev, task["model"]))}
 
 
-def teacher_facts(ge, task: dict, ev: dict, answer: dict, atlas, max_nodes: int = FACT_NODES) -> dict:
-    """What a teacher circuit's English must be faithful to, measured: the text and its target, the model's top next
-    tokens, for the circuit's first max_nodes subcomponents in VPD's order their atlas facts (the tokens around their
-    strongest activations on Pile text, the measured effect of removing them there, and their logit lens, marked as
-    such), every stated edge with the measured effect of cutting it alone on the text (goal_eval.cuts, KL in bits), and
-    the intervention questions with the model's measured answers."""
+def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_NODES) -> dict:
+    """What a teacher circuit's English may draw on: only what the oracle has or writes at inference, so supervised
+    English never states what the oracle cannot know. From the question (evidence()): the text and its target, the
+    model's top next tokens, the measured evidence at the listed positions (units.evidence; never the English reader's
+    events), the 1% rule, and for the circuit's subcomponents the question lists, their atlas facts as it lists them
+    (logit lens and Pile contexts). From the teacher's answer: its subcomponents (the first max_nodes in VPD's order),
+    its stated edges (those into the prediction first, without their measured effects) and the questions' answers."""
     import goal_eval
+    import units
 
     prompt = task["prompts"][0]
     ids, targets = prompt["token_ids"], prompt["target_positions"]
@@ -952,35 +954,22 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, atlas, max_nodes: int 
     g, _ = goal_eval.circuit(answer, targets, ge.nat.C, len(ids))
     rank = {nd: i for i, nd in enumerate(ge.nat._vpd_order(ids, targets))}
     nodes = sorted(g.node_set(), key=lambda nd: rank.get(nd, len(rank)))
-    pairs = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
-    cuts = ge.cuts(ge.text(ids, targets, task=task), pairs) if pairs else []
-    listed = []
-    for nd in nodes[:max_nodes]:
-        e = atlas.entry(nd[0], nd[2]) if atlas else None
-        f = {"node": node_text(nd), "token": strings[nd[1]]}
-        if e:
-            f["active on"] = [c["before"][-24:] + "[" + c["token"] + "]" + c["after"][:12] for c in e["contexts"][:3]]
-            if e["effects"]:
-                f["removal effect"] = {"kl_nats": sum(x["kl"] for x in e["effects"]) / len(e["effects"]),
-                                       "raises": [t for t, _ in e["effects"][0]["raised"][:3]], "lowers": [t for t, _ in e["effects"][0]["lowered"][:3]]}
-            if e["lens"]:
-                f["logit lens (raises)"] = [t for t, _ in e["lens"]["raised"][:3]]
-        listed.append(f)
+    shown_facts = {tuple(nd): f for cs in ev["components"].values() for nd, _, f in cs}  # what the question tells about each
+    pairs = [(w, None) for w in g.out] + [(w, r) for r, ws in g.parents.items() for w in ws]
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
-    import units
-
     return {"task": task["id"], "text": "".join(strings[:max(targets) + 1]), "target": max(targets),
             "evidence": units.evidence(ev["events"], ev["listed"], strings) if ev.get("events") else [],
             "target_token": strings[max(targets)], "top": prompt["model_top"][0][:3], "nodes_total": len(nodes),
-            "positions": sorted({nd[1] for nd in nodes}), "nodes": listed,
-            "edges": [{"edge": f"{node_text(w)} -> {'OUT' if r is None else node_text(r)}", "cut_kl_bits": k} for (w, r), k in zip(pairs, cuts)],
+            "positions": sorted({nd[1] for nd in nodes}),
+            "nodes": [{"node": node_text(nd), "token": strings[nd[1]], "facts": shown_facts.get(nd, "")} for nd in nodes[:max_nodes]],
+            "edges": [f"{node_text(w)} -> {'OUT' if r is None else node_text(r)}" for w, r in pairs],
             "qa": [{"question": qa_text(q, n, strings, repr(prompt["model_top"][0][0][0]), tok),
                     "answer": f"falls={'yes' if q['falls'] else 'no'} top={shown(tok([q['top']])[0])}"} for n, q in enumerate(ev["qa"], 1)]}
 
 
 WRITER = ("A small language model (4 layers) read the text below and predicts the next token after its last token. A "
           "decomposition of its weights into rank-one subcomponents (written L<layer>.<kind>#<index>@<position>) found the "
-          "circuit summarized here, and every fact below was measured on the model. Write the EXPLANATION: in plain English, "
+          "circuit summarized here; the facts below come from measurements on the model. Write the EXPLANATION: in plain English, "
           "in three to six sentences, say how the model arrives at its prediction from this text, which parts of the text "
           "matter and what the subcomponents do, as the facts show. Say only what the facts support; never write a "
           "subcomponent's name (L<layer>.<kind>#<index>): describe what it does instead; do not mention these instructions. "
@@ -991,17 +980,11 @@ def writer_prompt(f: dict) -> str:
     """The prompt that asks an open model for a teacher circuit's English, from teacher_facts()."""
     lines = [f"Text: {f['text']!r}", f"Prediction at position {f['target']} (after {f['target_token']!r}): "
              + ", ".join(f"{t!r} {p:.2f}" for t, p in f["top"]),
-             f"Circuit: {f['nodes_total']} subcomponents at positions {', '.join(map(str, f['positions']))}; the most important:"]
+             f"Circuit: {f['nodes_total']} subcomponents at positions {', '.join(map(str, f['positions']))}; the most important "
+             "(where known: the tokens its write raises by the logit lens, read from the weights, not measured; and the "
+             "tokens it is active on in Pile text):"]
     for n in f["nodes"]:
-        parts = [f"{n['node']} (token {n['token']!r})"]
-        if n.get("active on"):
-            parts.append("on Pile text active on " + "; ".join(repr(c) for c in n["active on"]))
-        if n.get("removal effect"):
-            e = n["removal effect"]
-            parts.append(f"removing it there raises {', '.join(map(repr, e['raises']))} and lowers {', '.join(map(repr, e['lowers']))}")
-        if n.get("logit lens (raises)"):
-            parts.append("logit lens (its write read through the unembedding, not measured): raises " + ", ".join(map(repr, n["logit lens (raises)"])))
-        lines.append("- " + "; ".join(parts))
+        lines.append(f"- {n['node']} (token {n['token']!r})" + (f": {n['facts']}" if n.get("facts") else ""))
     if f.get("evidence"):
         lines.append("Measured at the positions where a changed token moves the prediction most (log2 change of the top "
                      "token's probability when the token there changes, and when each layer's attention at the target is kept "
@@ -1009,8 +992,8 @@ def writer_prompt(f: dict) -> str:
         lines += [f"- {e}" for e in f["evidence"]]
         lines.append("Every other position's changed token moves the prediction by less than 1% of the total over all positions.")
     if f["edges"]:
-        lines.append("Stated connections, each with the change in the prediction when it alone is cut (KL, bits):")
-        lines += [f"- {e['edge']}: {e['cut_kl_bits']:.3f}" for e in f["edges"]]
+        lines.append("Stated connections:")
+        lines += [f"- {e}" for e in f["edges"]]
     if f["qa"]:
         lines.append("Measured interventions:")
         lines += [f"- {q['question'][q['question'].find(':') + 2:]} Measured: {q['answer']}" for q in f["qa"]]
@@ -1396,7 +1379,6 @@ def main():
         return
     if args.cmd == "facts":
         ge = goal_eval.GoalEval(native.Native(args.device))
-        atlas = _atlas()
         n = 0
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
@@ -1404,7 +1386,7 @@ def main():
                 if n >= args.n or not js.exists():
                     continue
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
-                f.write(json.dumps(teacher_facts(ge, task, r, json.loads(js.read_text()), atlas)) + "\n")
+                f.write(json.dumps(teacher_facts(ge, task, r, json.loads(js.read_text()))) + "\n")
                 f.flush()
                 n += 1
         return

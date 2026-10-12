@@ -50,8 +50,11 @@ Per text:
   tokenizer, the next smaller path point with its connections instead, until it fits.
   6. With --repair (and --edges), the flip repair after the pick: goal_eval.adversary_flips' omitted lever at REPAIR_M
      (the VPD actives the circuit leaves out, at most 4 switched on, the shared adversary's) on the stated graph; its
-     flips join the circuit and the connections are pruned again, while F1 under the flips improves; the teacher
-     circuit is then pick()'s among those steps on min(graph F1, F1 under the flips) and N.
+     flips join the circuit and the connections are pruned again, while min(graph F1, node F1, F1 under the flips)
+     improves; the teacher circuit is then pick()'s among those steps on that minimum and N. Node F1 (the node set
+     with every connection among its nodes) is in it because a flip joined with its connections pruned is cut from
+     the circuit's readers, which it writes into in the model: on graph F1 and the flips alone, text9000's 29
+     subcomponents were "repaired" to 49 with node F1 0.665.
 Every membership decision is measured; orderings only order.
 
 Output per text in --out: <task>.json (the teacher circuit), <task>.f1.json, <task>.vpd_top<k>.json, <task>.n<size>.json at
@@ -488,22 +491,29 @@ class Connector:
         """The flip repair: goal_eval.adversary_flips' omitted lever at m on the stated graph; its flips join the node
         set and the connections are pruned again (from the kept ones and every connection of the flips), while F1
         under the flips improves (and the set stays within max_nodes). (every step with its "on" and "kept", pick()'s
-        index among them on min(graph F1, F1 under the flips) and N, its rule)."""
+        index among them on min(graph F1, node F1, F1 under the flips) and N, its rule.) Node F1, the node set's with
+        every connection the model has among its nodes (teacher.measure, the masked run), keeps the repair honest: a
+        flip joined with its connections pruned is cut from the circuit's readers, which in the model it writes into
+        (text9000: 29 subcomponents repaired to 49 at graph F1 0.897 and F1 under the flips 0.897 had node F1 0.665)."""
         steps = []
+        f1_nodes = measure(self.pr, on[None], self.empty, self.vpd)[0]["f1"]
         while True:
             flips = self.ge.adversary_flips(self.tx, [self.graph(on, kept)], pool, "omitted", ms=(m,))[0]
             f1a = flips["f1_flips_omitted"].get(m)
             f1a = summary["f1_graph"] if f1a is None else f1a      # nothing omitted to switch on: no attack
             add = sorted({self.index[nd] for nd in flips["mask_flips_omitted"].get(m, []) if nd in self.index})
-            steps.append({"size": int(on.sum()), "edges": len(kept), "f1_graph": summary["f1_graph"], "n": summary["n"],
-                          "f1_flips": f1a, "f1_rob": min(summary["f1_graph"], f1a), "flips": add, "on": on, "kept": kept})
+            rob = min(summary["f1_graph"], f1_nodes, f1a)
+            steps.append({"size": int(on.sum()), "edges": len(kept), "f1_graph": summary["f1_graph"], "f1_nodes": f1_nodes,
+                          "n": summary["n"], "f1_flips": f1a, "f1_rob": rob, "flips": add, "on": on, "kept": kept})
             print(f"  repair: {int(on.sum())} subcomponents, {len(kept)} connections, graph F1 {summary['f1_graph']:.3f}, "
-                  f"N {summary['n']:.3f}, F1 under {m} flips {f1a:.3f}", flush=True)
-            if (len(steps) > 1 and f1a <= steps[-2]["f1_flips"]) or not add or (max_nodes and int(on.sum()) + len(add) > max_nodes):
+                  f"node F1 {f1_nodes:.3f}, N {summary['n']:.3f}, F1 under {m} flips {f1a:.3f}", flush=True)
+            if (len(steps) > 1 and rob <= steps[-2]["f1_rob"]) or not add or (max_nodes and int(on.sum()) + len(add) > max_nodes):
                 break
             on = on.clone()
             on[torch.tensor(add, dtype=torch.long, device=on.device)] = True
-            kept, summary, _, _ = self.connect(on, measure(self.pr, on[None], self.empty, self.vpd)[0]["n"], set(kept), add)
+            got = measure(self.pr, on[None], self.empty, self.vpd)[0]
+            f1_nodes = got["f1"]
+            kept, summary, _, _ = self.connect(on, got["n"], set(kept), add)
         j, rule = pick(steps, "f1_rob")
         return steps, j, rule
 

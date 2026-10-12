@@ -1143,12 +1143,11 @@ def _pool() -> dict:
 
 
 def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict) -> dict:
-    """E4: the answer's variables scored by interchange interventions (variables.Scorer: on-target, off-target,
-    composition) in the real model and in the stated graph (C's semantics), each world's mean over every stated
-    variable's on-target and off-target scores and every pair's composition score. A variable whose on-target draws
-    resolve no change scores 0 there (its inputs are not shown to matter); one with no off-target draw is left out
-    there (nothing outside its inputs to test); a malformed one (a line that does not parse, no subcomponent of the
-    model) scores 0 on and off target. No VARIABLES block: 0. {"E4": the two worlds' mean, "model", "circuit"}."""
+    """E4: the answer's variables scored by interchange interventions, variables.Scorer's headline e4 (in the real
+    model: each variable's min(f on-target, s off-target), composition and the feeds claims), times the share of the
+    stated variables that are well-formed (a line that does not parse, or names no subcomponent of the model, counts
+    as a variable scoring 0). No VARIABLES block, or nothing resolved: 0. {"E4", "model" (e4), "circuit" (the stated
+    graph's e4, a diagnostic), "gap"}."""
     import variables
 
     ok, bad = [], malformed
@@ -1158,17 +1157,10 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict) -> dict:
         except (ValueError, KeyError):
             bad += 1
     if not ok:
-        return {"E4": 0.0, "model": 0.0, "circuit": 0.0}
+        return {"E4": 0.0, "model": None, "circuit": None, "gap": None}
     got = scorer.score(tx, ok, graph=graph)
-
-    def world(w: dict) -> float:
-        xs = [0.0] * (2 * bad)
-        for x in w["variables"]:
-            xs += [x["s_on"] or 0.0] + ([x["s_off"]] if x["s_off"] is not None else [])
-        xs += [q["s_comp"] for q in w["pairs"] if q["s_comp"] is not None]
-        return sum(xs) / len(xs)
-    model, circ = world(got), world(got["circuit"])
-    return {"E4": (model + circ) / 2, "model": model, "circuit": circ}
+    return {"E4": (got["e4"] or 0.0) * len(ok) / (len(ok) + bad), "model": got["e4"],
+            "circuit": (got.get("circuit") or {}).get("e4"), "gap": got.get("gap")}
 
 
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
@@ -1192,8 +1184,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     VPD's own answer loses without the circuit, ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD) in [0, 1]); E1, the
     reader's bits saved (in [-1, 1]; with a reader or e1; reported, not in the mean: REPORTED); E2, the questions answered right measured from the no-change answer (qa_term); E3, the edit
     requests' net bits over the edit teacher's (edit_term; ee an edit_eval.EditEval, edit_best goal key -> the teacher's
-    net; left out until every request of the text has one); E4, the VARIABLES block's interchange tests (e4_term; vs a
-    variables.Scorer, left out without one, 0 for an answer without the block when measured). A term goal_eval cannot give (no causal-importance
+    net; left out until every request of the text has one); E4, the VARIABLES block's interchange tests (e4_term:
+    variables.Scorer's e4; vs a variables.Scorer, left out without one, 0 for an answer without the block when measured). A term goal_eval cannot give (no causal-importance
     network for VPD's bounds) is left out of the mean. F3, the AUC of stated edges' cuts in the circuit's run, is
     reported (term_F3), never in the mean. C (term_C), the circuit term in the mean in place of F1: goal_eval.fidelity's
     reward mode, the mean of the stated graph's F1, its agreement under random node removals and under random

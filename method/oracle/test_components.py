@@ -344,28 +344,26 @@ def test_variables_block_parses_renders_and_round_trips():
 
 
 class FakeScorer:
-    """variables.Scorer's score: on-target 0.8 for a variable carried at position 4, else unresolved; off-target 0.5;
-    every pair's composition 0.6; the circuit world the same less 0.1."""
+    """variables.Scorer's score: e4 0.6 in the model, 0.9 in the stated graph."""
+
+    def __init__(self):
+        self.asked = None
 
     def score(self, tx, vs, graph=None):
-        def world(d):
-            return {"variables": [{"s_on": (0.8 - d) if any(t == 4 for _, t, _ in v["group"]) else None, "s_off": 0.5 - d}
-                                  for v in vs],
-                    "pairs": [{"s_comp": 0.6 - d}] * (len(vs) * (len(vs) - 1) // 2)}
-        return {**world(0.0), "circuit": world(0.1)}
+        self.asked = vs
+        return {"e4": 0.6, "circuit": {"e4": 0.9}, "gap": 0.3}
 
 
-def test_e4_scores_every_stated_variable_and_a_malformed_one_as_zero():
+def test_e4_is_the_scorers_e4_with_a_malformed_variable_scoring_zero():
     C = {"h.2.attn.v_proj": 16, "h.2.attn.o_proj": 16}
     one = {"name": "a", "meaning": "", "inputs": [4], "group": [["h.2.attn.v_proj", 5, 4]], "feeds": ["prediction"]}
     two = {"name": "b", "meaning": "", "inputs": [6], "group": [["h.2.attn.o_proj", 1, 7]], "feeds": ["prediction"]}
-    out = components.e4_term(FakeScorer(), None, None, {"variables": [one, two]}, 0, C)
-    assert out["model"] == pytest.approx((0.8 + 0.5 + 0.0 + 0.5 + 0.6) / 5)  # b's unresolved on-target counts 0
-    assert out["circuit"] == pytest.approx((0.7 + 0.4 + 0.0 + 0.4 + 0.5) / 5) and out["E4"] == pytest.approx((out["model"] + out["circuit"]) / 2)
-    outside = {**two, "group": [["h.2.attn.o_proj", 99, 7]]}  # no such subcomponent: malformed, 0 on and off
-    bad = components.e4_term(FakeScorer(), None, None, {"variables": [one, outside]}, 1, C)
-    assert bad["model"] == pytest.approx((0.8 + 0.5) / 6)
-    assert components.e4_term(FakeScorer(), None, None, {}, 0, C)["E4"] == 0.0
+    sc = FakeScorer()
+    out = components.e4_term(sc, None, None, {"variables": [one, two]}, 0, C)
+    assert out == {"E4": 0.6, "model": 0.6, "circuit": 0.9, "gap": 0.3} and [v["name"] for v in sc.asked] == ["a", "b"]
+    outside = {**two, "group": [["h.2.attn.o_proj", 99, 7]]}  # no such subcomponent; and one line that did not parse
+    assert components.e4_term(sc, None, None, {"variables": [one, outside]}, 1, C)["E4"] == pytest.approx(0.6 / 3)
+    assert components.e4_term(sc, None, None, {}, 0, C)["E4"] == 0.0
 
 
 def test_question_asks_for_variables_only_when_the_row_does(tiny):

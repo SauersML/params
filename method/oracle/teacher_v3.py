@@ -6,8 +6,9 @@ with gates z has each answer subcomponent at mask z (VPD's masked forward, remai
 subcomponent as the adversary sets it.
 
 The adversary picks the worst of a set M of binary patterns. A pattern switches on, at each position, the
-subcomponents VPD's causal importance makes active at the same position of another text (patterns that occur on real
-inputs; a stand-in until inframove's shared M). It applies to everything outside the circuit: an answer subcomponent
+subcomponents VPD's causal importance makes active at a position of another text (from a random shift; patterns that
+occur on real inputs; a stand-in until inframove's shared M), drawn from half of the other texts; --evaluate draws
+from the other half. It applies to everything outside the circuit: an answer subcomponent
 runs at z + (1 - z) m, any other at m; VPD's own answer under the same pattern (paired) has its subcomponents at 1 and
 the rest at m. The adversary maximizes ln KL_C,m - ln KL_VPD,m; it is evaluated without gradients over a running set
 of the worst patterns and fresh draws, and the gates take the gradient of each sample's worst.
@@ -19,12 +20,15 @@ adversary: necessity stays the actual situation); size the expected description 
 positions over teacher.py's active scale. lambda rises geometrically, each stage warm-started from the last. At each
 stage the gates' deterministic values above 1/2 give a circuit, measured exactly: F1 and N (teacher.measure), and
 f1_adv, F1 at the worst pattern of the whole of M against VPD's answer under it (log scale, clipped). From teacher.pick's
-stage on min(F1, f1_adv) and N (the smallest with both >= 0.9, else the largest minimum) a measured cleanup continues as
-teacher.joint_path does (single removals measured at every step, prefixes of 1, 2, 4, ...), each set measured also
-under the search's WORST patterns, the mean taken of min(F1, F1 under them) and N: point-F1 pruning alone left
+stage on min(F1, f1_adv) and N (the smallest with both >= 0.9, else the largest minimum) a measured cleanup continues by
+the F1 search's rounds (Descent.prune's rule: the most of the ranked single removals that keep the score >= 0.9, below
+it the best measured prefix), each set measured also under the search's WORST patterns, the score min(F1 under them,
+N): point-F1 pruning alone left
 text9000's 29 subcomponents at f1_adv 0.33 where the 55 they came from held 1.00. The teacher circuit is teacher.pick's
 over the stages and the cleanup's points, a cleanup point re-measured under the whole of M before it holds the pick; with --edges, its connections by teacher.py's measured descent to graph F1 >= 0.9
-(teacher.edge_path; a gradient phase on connections under the same adversary did worse on text9000: graph F1 0.79 at
+(teacher.edge_path at the writer, reader and connection levels), no removal admitted that leaves min(F1, F1 under the worst patterns, N)
+below 0.9 for the nodes the kept connections give a role (teacher.live; on N alone text9000's 53 kept 26 at
+f1_adv 0.56), which are kept and whose N and f1_adv are measured again (a gradient phase on connections under the same adversary did worse on text9000: graph F1 0.79 at
 67 connections, against the descent's 0.909 at 17 on a 27-subcomponent circuit).
 
   MPD_MEM_GIB=24 ~/mpd-data/venv/bin/python -B teacher_v3.py --tasks FILE --vpd ~/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --out DIR
@@ -61,17 +65,18 @@ TINY = 1e-6            # KL floor inside logarithms (bits)
 WORST = 4              # patterns the cleanup measures each set under: the search's worst
 
 
-def patterns(saved: dict, task: str, T: int, C: dict, names: list, count: int, seed: int) -> list[dict]:
-    """M's stand-in: count patterns, each another text's VPD answer position by position (a position past that text's
-    end takes one of its positions at random): per matrix the (positions, indices) switched on."""
+def patterns(saved: dict, task: str, T: int, C: dict, names: list, count: int, seed: int, half: int = 0) -> list[dict]:
+    """M's stand-in: count patterns, each another text's VPD answer position by position from a random shift (position
+    t takes the source's position (t + shift) mod its length): per matrix the (positions, indices) switched on. The
+    sources are one half of the other texts (sorted, alternate ones): the search draws from half 0, a held-out
+    evaluation from half 1, so no pattern of one occurs in the other."""
     g = torch.Generator().manual_seed(seed)
-    others = [k for k in saved if k != task]
+    others = sorted(k for k in saved if k != task)[half::2]
     out = []
     for _ in range(count):
         src = saved[others[int(torch.randint(len(others), (1,), generator=g))]]["answer"]
         Ts = 1 + max(int(t.max()) for t, _ in src.values() if len(t))
-        where = torch.arange(T)
-        where[Ts:] = torch.randint(Ts, (max(0, T - Ts),), generator=g)
+        where = (torch.arange(T) + int(torch.randint(Ts, (1,), generator=g))) % Ts
         pat = {}
         for n in names:
             t, c = src[n]
@@ -228,8 +233,8 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
     worst_ids = torch.argsort(worst, descending=True)[:WORST].tolist()
     on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
     on[stages[best]["on"]] = True
-    for r in (robust_path(ms, pr, on, empty, vpd, vpd_adv, worst_ids, chunk)[1:] if int(on.sum()) <= teacher.K_MAX else []):
-        on[r["removed"]] = False                                # (~size^2 / 2 sets, each under WORST patterns)
+    for r in robust_descent(ms, pr, on, empty, vpd, vpd_adv, worst_ids, chunk)[1:]:
+        on[r["removed"]] = False
         k_tok = int(torch.unique(pr.t[on]).numel())
         stages.append({**r, "lam": None, "cleanup": True, "positions": k_tok, "on": on.nonzero().flatten().tolist(),
                        "size_term": min(1.0, (int(on.sum()) * node_bits + k_tok * pos_bits) / scale)})
@@ -257,17 +262,40 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
             return {"nodes": n, "edges": int(on.sum()), "removed": removed, "kl_graph": kl,
                     "f1_graph": goal_eval._clip01(goal_eval.recovered_log(empty, kl, vpd)), "n": stages[best]["n"],
                     "size_term": min(1.0, (n * node_bits + k_tok * pos_bits + math.log2(n + k_tok) * (2 * inner + out)) / scale)}
-        e_steps = teacher.edge_path(ep, empty ** (1 - teacher.RECOVERED) * vpd ** teacher.RECOVERED, state)
-        wired = [e for e, keep in zip(ep.edges, ep.on.tolist()) if keep]
-        path_edges = {"step": best, "edges": [[ids_of[w], "out" if r is None else ids_of[r]] for w, r in ep.edges], "steps": e_steps}
-        print(f"  connections: {e_steps[-1]['edges']} of {len(ep.edges)}, graph F1 {e_steps[-1]['f1_graph']:.3f} "
-              f"(all {e_steps[0]['f1_graph']:.3f}), {ep.measured} sets", flush=True)
+        nodes = [pr.nodes[i] for i in stages[best]["on"]]
+
+        never = set(nodes) - teacher.live(nodes, ep.edges)     # no role even with every connection: kept (teacher.py)
+
+        def robust_score(on):                                  # min(F1, F1 under the worst patterns, N) of a node set
+            r = robust_measure(ms, pr, on[None], empty, vpd, vpd_adv, worst_ids, chunk)[0]
+            return min(r["f1_rob"], r["n"])
+        floor = min(teacher.RECOVERED, robust_score(on_best))
+
+        def roles(e_on):                                       # the nodes the kept connections give a role, and those, as a set
+            alive = teacher.live(nodes, [e for e, keep in zip(ep.edges, e_on.tolist()) if keep]) | never
+            on = on_best.clone()
+            on[torch.tensor([ids_of[nd] for nd in nodes if nd not in alive], dtype=torch.long, device=nat.dev)] = False
+            return on
+        e_steps = teacher.edge_path(ep, empty ** (1 - teacher.RECOVERED) * vpd ** teacher.RECOVERED, state, ("writer", "reader", "connection"),
+                                    accept=lambda e_on: robust_score(roles(e_on)) >= floor)
+        alive = teacher.live(nodes, [e for e, keep in zip(ep.edges, ep.on.tolist()) if keep]) | never
+        wired = [(w, r) for (w, r), keep in zip(ep.edges, ep.on.tolist()) if keep and w in alive and (r is None or r in alive)]
+        on_best[torch.tensor([ids_of[nd] for nd in nodes if nd not in alive], dtype=torch.long, device=nat.dev)] = False
+        lived = measure_stage(ms, pr, on_best, empty, vpd, vpd_adv, chunk)    # the nodes with a role: N and f1_adv again
+        inner = sum(r is not None for _, r in wired)
+        lived.update(nodes=int(on_best.sum()), edges=len(wired), kl_graph=e_steps[-1]["kl_graph"], f1_graph=e_steps[-1]["f1_graph"],
+                     size_term=min(1.0, (int(on_best.sum()) * node_bits + int(torch.unique(pr.t[on_best]).numel()) * pos_bits
+                                         + math.log2(int(on_best.sum()) + int(torch.unique(pr.t[on_best]).numel())) * (2 * inner + len(wired) - inner)) / scale))
+        path_edges = {"step": best, "edges": [[ids_of[w], "out" if r is None else ids_of[r]] for w, r in ep.edges], "steps": e_steps,
+                      "live": sorted(ids_of[nd] for nd in alive)}
+        print(f"  connections: {len(wired)} of {len(ep.edges)} among the {lived['nodes']} with a role, graph F1 {lived['f1_graph']:.3f} "
+              f"(all {e_steps[0]['f1_graph']:.3f}), N {lived['n']:.3f}, f1_adv {lived['f1_adv']:.3f}, {ep.measured} sets", flush=True)
     circuits = {"": teacher.circuit_json(pr, on_best, wired)}
     row = {"T": tx.T, "kl_empty": empty, "kl_vpd": vpd, "vpd_size": len(pr.nodes), "active_scale": active, "pick": rule,
            "best": {k: stages[best][k] for k in ("size", "positions", "f1", "n", "f1_adv", "size_term", "lam", "kl_c", "kl_minus")},
            "stages": len(stages), "seconds": time.perf_counter() - t0}
     if wired is not None:
-        row["best_edges"] = {k: e_steps[-1][k] for k in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term")}
+        row["best_edges"] = {k: lived[k] for k in ("nodes", "edges", "kl_graph", "f1_graph", "n", "f1", "f1_adv", "size_term")}
     path_file = {"method": "v3", "start_nodes": [[pr.nodes[i][0], pr.nodes[i][2], pr.nodes[i][1]] for i in ids_all],
                  "start_index": ids_all, "steps": stages}
     if wired is not None:
@@ -308,35 +336,52 @@ def robust_measure(ms: MaskSearch, pr: teacher.Pruner, ons: torch.Tensor, empty:
     return out
 
 
-def robust_path(ms: MaskSearch, pr: teacher.Pruner, start: torch.Tensor, empty: float, vpd: float, vpd_adv: torch.Tensor,
-                worst: list, chunk: int) -> list[dict]:
-    """teacher.joint_path with every set measured by robust_measure: each step ranks the single removals by the mean of
-    min(F1, F1 at the worst patterns) and N they leave and takes the measured prefix of 1, 2, 4, ... with the highest."""
+def robust_descent(ms: MaskSearch, pr: teacher.Pruner, start: torch.Tensor, empty: float, vpd: float, vpd_adv: torch.Tensor,
+                   worst: list, chunk: int, goal: float = teacher.RECOVERED) -> list[dict]:
+    """Descent.prune's rounds with every set measured by robust_measure and scored by min(F1 under the worst patterns,
+    N): each round ranks the single removals by the score they leave; at or above goal it removes the most of them in
+    that order (prefixes of sqrt(2)-spaced sizes, measured) that keep the score >= goal, below goal the measured prefix
+    with the highest score when that is higher than the set's. Each round's state."""
+    def score(r):
+        return min(r["f1_rob"], r["n"])
+
     on = start.clone()
-    path = [{"size": int(on.sum()), "removed": [], **robust_measure(ms, pr, on[None], empty, vpd, vpd_adv, worst, chunk)[0]}]
-    while int(on.sum()) > teacher.MIN_SIZE:
+    cur = robust_measure(ms, pr, on[None], empty, vpd, vpd_adv, worst, chunk)[0]
+    path = [{"size": int(on.sum()), "removed": [], **cur}]
+    for _ in range(teacher.ROUNDS):
         ids = on.nonzero().flatten()
+        if len(ids) <= teacher.MIN_SIZE:
+            break
         trials = on[None].repeat(len(ids), 1)
         trials[torch.arange(len(ids), device=on.device), ids] = False
-        rows = []
+        single = []
         for s0 in range(0, len(ids), 4 * pr.B):
-            rows += robust_measure(ms, pr, trials[s0:s0 + 4 * pr.B], empty, vpd, vpd_adv, worst, chunk)
-        ranked = ids[torch.argsort(torch.tensor([r["mean"] for r in rows]), descending=True, stable=True)]
-        top = min(max(1, int(teacher.FRACTION * len(ids))), len(ids) - teacher.MIN_SIZE)
-        ks = sorted({min(top, 2 ** e) for e in range(0, 20) if 2 ** e <= 2 * top})
-        prefixes = on[None].repeat(len(ks), 1)
-        for i, k in enumerate(ks):
+            single += robust_measure(ms, pr, trials[s0:s0 + 4 * pr.B], empty, vpd, vpd_adv, worst, chunk)
+        ranked = ids[torch.argsort(torch.tensor([score(r) for r in single]), descending=True, stable=True)]
+        sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ids) - teacher.MIN_SIZE]
+        prefixes = on[None].repeat(len(sizes), 1)
+        for i, k in enumerate(sizes):
             prefixes[i, ranked[:k]] = False
         got = robust_measure(ms, pr, prefixes, empty, vpd, vpd_adv, worst, chunk)
-        i = max(range(len(ks)), key=lambda j: (got[j]["mean"], ks[j]))
-        on[ranked[:ks[i]]] = False
-        path.append({"size": int(on.sum()), "removed": ranked[:ks[i]].tolist(), **got[i]})
+        if score(cur) >= goal:
+            ok = [i for i in range(len(sizes)) if score(got[i]) >= goal]
+            if not ok:
+                break
+            i = max(ok, key=lambda i: sizes[i])
+        else:
+            i = max(range(len(sizes)), key=lambda i: (score(got[i]), sizes[i]))
+            if score(got[i]) <= score(cur):
+                break
+        on[ranked[:sizes[i]]] = False
+        cur = got[i]
+        path.append({"size": int(on.sum()), "removed": ranked[:sizes[i]].tolist(), **cur})
     return path
 
 
 def evaluate(ge: goal_eval.GoalEval, task: str, saved: dict, circuit: dict, seed: int, pool: int, chunk: int) -> dict:
-    """A circuit JSON's F1, N and f1_adv on its text under `pool` patterns drawn with `seed` (a held-out adversary for a
-    search that drew its own with another seed); connections are not used (node circuits)."""
+    """A circuit JSON's F1, N and f1_adv on its text under `pool` patterns drawn with `seed` from the other half of the
+    source texts (patterns() half 1: a held-out adversary for the search, which draws from half 0); connections are not
+    used (node circuits)."""
     nat = ge.nat
     ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
     tx = ge.text(ids, targets)
@@ -345,7 +390,7 @@ def evaluate(ge: goal_eval.GoalEval, task: str, saved: dict, circuit: dict, seed
         tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
     empty, vpd = ge._bounds(tx, teacher.CONVENTION)
     pr = teacher.Pruner(ge, tx, tx.vpd, live=teacher.CONVENTION == "live")
-    ms = MaskSearch(ge, tx, pr, patterns(saved, task, tx.T, nat.C, nat.names, pool, seed), live=teacher.CONVENTION == "live")
+    ms = MaskSearch(ge, tx, pr, patterns(saved, task, tx.T, nat.C, nat.names, pool, seed, half=1), live=teacher.CONVENTION == "live")
     pats = ms.pats
     vpd_adv = ms.kl_chunked(lambda a, b: ms.masks(None, pats[a:b], vpd_on=True), len(pats), chunk).clamp_min(TINY).log()
     index = {nd: i for i, nd in enumerate(pr.nodes)}

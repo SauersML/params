@@ -1546,14 +1546,33 @@ class GoalEval:
         return sorted(pairs, key=lambda pz: (first.get(pz[0], 0), hashlib.sha256(repr((seed, pz)).encode()).digest()))[:draws]
 
     @torch.no_grad()
-    def _changed_logq(self, tx: Text, graphs: list[native.Graph], got: list) -> tuple:
+    def _changed_logq(self, tx: Text, graphs: list[native.Graph], got: list, strengths: torch.Tensor | None = None) -> tuple:
         """Circuits' log q at the targets in C's semantics (_circuit_logq's: a stated graph as stated, a complete one as
         its subcomponents' masked run, the remainders live) on the text [G, targets, V] and on each changed text (p, z)
         of got (a list of [G, targets, V]): one engine on the text, and every changed text run from the earliest change
         in its batch on, reusing the text's run before it (engine.Engine.graph_log_probs reuse: the model is causal),
-        CHANGED_ROWS rows a batch."""
+        CHANGED_ROWS rows a batch. strengths [G, E + O]: every circuit the one stated graph graphs[0] at its row's 0/1
+        connection strengths (changed_edges), from its one plan."""
         nat, T = self.nat, tx.T
-        E = self._circuit_engine(tx.ids, tx.targets, graphs)
+        E = self._circuit_engine(tx.ids, tx.targets, graphs[:1] if strengths is not None else graphs)
+        if strengths is not None:
+            plan = E.plan(graphs[0], semantics="c")
+            ew, ow = strengths[:, :plan["E"]], strengths[:, plan["E"]:]
+            st = {}
+            q0 = E.graph_log_probs(plan, ew=ew, ow=ow, keep=st)
+            G, out = len(graphs), []
+            per = max(1, CHANGED_ROWS // G)
+            for s0 in range(0, len(got), per):
+                part = got[s0:s0 + per]
+                D = len(part)
+                tok = torch.tensor(tx.ids).repeat(D * G, 1)
+                for d, (p, z) in enumerate(part):
+                    tok[d * G:(d + 1) * G, p] = z
+                lq = E.graph_log_probs(plan, ew=ew.repeat(D, 1), ow=ow.repeat(D, 1),
+                                       reuse=(E.tile_states(st, D), tok, min(p for p, _ in part)))
+                out += list(lq.split(G))
+                native.free(nat.dev)
+            return q0, out
         plan = E.plan(list(graphs), semantics="c")
         u = None
         if any(g.complete for g in graphs):  # a complete graph runs as u: 1 on its subcomponents
@@ -1613,7 +1632,8 @@ class GoalEval:
         return torch.stack(out)
 
     @torch.no_grad()
-    def changed_inputs(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = 16) -> list[dict]:
+    def changed_inputs(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = 16,
+                       strengths: torch.Tensor | None = None) -> list[dict]:
         """The changed-input family (paired F2, the lead's decision 10-12): the circuit's identities on changed texts.
         Prompts: F2's positions (the sensitivity probe's, at least share_floor of its total), the most moved first, each
         with the split's source tokens (_interchange_draws: search ranks 0 and 2, eval rank 1 and samples), up to draws.
@@ -1640,7 +1660,7 @@ class GoalEval:
             if positions and tx.vpd is not None else []
         acc = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # sum of w s, of w, of w KL_C; prompts scored
         trk = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # the same for s_track
-        q0, lcs = self._changed_logq(tx, graphs, got) if got else (None, [])
+        q0, lcs = self._changed_logq(tx, graphs, got, strengths) if got else (None, [])
         v0, lvs = self._changed_vpd(tx, got) if got else (None, [])
         for (p, z), lc, lv in zip(got, lcs, lvs):
             x = list(tx.ids)
@@ -2070,6 +2090,15 @@ class GoalEval:
         fidelity scores), from one plan of graph at 0/1 strengths (kept on the text across calls) and the node set's
         layout made once; a call with a subset that strands a node the whole graph keeps (no stated path left to the
         prediction) runs adversary_flips on the subsets' graphs instead."""
+        base, subs = self._edge_subsets(tx, graph, ons)
+        if subs is not None:  # a subset strands a node: its graph as stated
+            return self.adversary_flips(tx, subs, pool, "omitted", ms=(m,), screens=screens, **kw)
+        return self.adversary_flips(tx, [base] * len(ons), pool, "omitted", ms=(m,), screens=screens,
+                                    strengths=ons.to(self.nat.dev, torch.float32), **kw)
+
+    def _edge_subsets(self, tx: Text, graph: native.Graph, ons: torch.Tensor) -> tuple:
+        """(graph with its stranded nodes dropped, None), or with a subset of ons (edge_flips') that strands another
+        node, (that, each subset's graph as stated with its stranded nodes dropped)."""
         base = strand(graph, tx.targets, self.nat.C)  # nodes no path of graph reaches the prediction from: stranded in every subset
         edges = [(w, r) for r, ws in base.parents.items() for w in ws] + [(w, None) for w in base.out]
         nodes = sorted(base.node_set())
@@ -2081,10 +2110,16 @@ class GoalEval:
                 if r is not None:
                     parents.setdefault(r, []).append(w)
             subs.append(strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, self.nat.C))
-        if any(sub.stranded for sub in subs):  # a subset strands a node: its graph as stated
-            return self.adversary_flips(tx, subs, pool, "omitted", ms=(m,), screens=screens, **kw)
-        return self.adversary_flips(tx, [base] * len(ons), pool, "omitted", ms=(m,), screens=screens,
-                                    strengths=ons.to(self.nat.dev, torch.float32), **kw)
+        return base, (subs if any(sub.stranded for sub in subs) else None)
+
+    def changed_edges(self, tx: Text, graph: native.Graph, ons: torch.Tensor, split: str = "search", draws: int = 16) -> list[dict]:
+        """changed_inputs on connection subsets of one node set (edge_flips' graph and ons: a teacher's connection
+        descent asking about its prefixes): the same numbers as changed_inputs on the subsets' graphs, from one plan of
+        graph at 0/1 strengths; a call with a subset that strands a node runs changed_inputs on the subsets' graphs."""
+        base, subs = self._edge_subsets(tx, graph, ons)
+        if subs is not None:
+            return self.changed_inputs(tx, subs, split, draws)
+        return self.changed_inputs(tx, [base] * len(ons), split, draws, strengths=ons.to(self.nat.dev, torch.float32))
 
     def across(self, tx: Text, graphs: list[native.Graph], prompts: list) -> list[dict]:
         """Per graph, per convention, the same circuit identities run on other prompts of the text: recovered pooled

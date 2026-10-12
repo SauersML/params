@@ -1481,3 +1481,44 @@ def test_changed_runs_reuse_the_text(tiny, monkeypatch, rows):
             assert float(((carry.kl(ref, lc) - want).abs() / want.abs().clamp_min(1e-6)).max()) < 1e-4, (p, z)
             assert torch.equal(lv, ge.runs(x, tx.targets, [tx.vpd], True))
         assert all(a is b for a, b in zip(lvs, ge._changed_vpd(tx, got)[1]))
+
+
+def test_changed_edges_are_changed_inputs_on_the_subsets(tiny):
+    """changed_edges on connection subsets of one node set (one plan at 0/1 strengths) gives changed_inputs' rows on
+    those subsets stated as their own graphs (s_changed, s_track and their KLs to 1e-5), and a call with a subset that
+    strands a node goes through the subsets' graphs."""
+    nat, ge, tx = tiny
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    full = goal_eval.strand(native.Graph(nodes, *native.all_edges(nodes, tx.targets)), tx.targets, nat.C)
+    nodes = sorted(full.node_set())
+    edges = [(w, r) for r, ws in full.parents.items() for w in ws] + [(w, None) for w in full.out]
+    plain = [nd for nd in nodes if native._name_layer_kind(nd[0])[1] not in ("q_proj", "k_proj")]
+
+    def subsets(rows):
+        subs = []
+        for on in rows.tolist():
+            kept = [e for e, k in zip(edges, on) if k]
+            parents = {}
+            for w, r in kept:
+                if r is not None:
+                    parents.setdefault(r, []).append(w)
+            subs.append(goal_eval.strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, nat.C))
+        return subs
+
+    g = torch.Generator().manual_seed(4)
+    ons = torch.ones(4, len(edges), dtype=torch.bool)
+    for i in range(1, 4):  # connections dropped in a random order while every node keeps a path: none stranded
+        for k in torch.randperm(len(edges), generator=g).tolist():
+            if float(torch.rand(1, generator=g)) < 0.6:
+                ons[i, k] = False
+                if subsets(ons[i:i + 1])[0].stranded:
+                    ons[i, k] = True
+    strands = ons.clone()
+    strands[2, [k for k, e in enumerate(edges) if plain[0] in e]] = False
+    for rows in (ons, strands):
+        want = ge.changed_inputs(tx, subsets(rows), "search", 4)
+        got = ge.changed_edges(tx, full, rows, "search", 4)
+        for a, b in zip(want, got):
+            assert a["draws_changed"] == b["draws_changed"]
+            for k in ("s_changed", "kl_changed_c", "s_track", "kl_track_c"):
+                assert (a[k] is None) == (b[k] is None) and (a[k] is None or abs(a[k] - b[k]) <= 1e-5 * (1 + abs(a[k]))), (k, a[k], b[k])

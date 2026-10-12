@@ -271,11 +271,14 @@ def _top(lp) -> tuple[int, float]:
     return i, float(row[i])
 
 
-def qa_questions(nat, task: dict, ci: dict, positions: list[int], seed: int, per_kind: int = QA_PER_KIND) -> list[dict]:
+def qa_questions(nat, task: dict, ci: dict, positions: list[int], seed: int, per_kind: int = QA_PER_KIND, cuts=None,
+                 nodes: list | None = None) -> list[dict]:
     """Intervention questions on a text with the model's measured answers: a token replaced by one of the model's
     alternatives there (ranks 0 to QA_RANKS - 1, at any position before the target), one VPD-active subcomponent
-    removed (Native.without; at F2's positions and the targets), and, for a text that copies, changes probing the copy
-    (copy_questions()). Each: {"kind", the intervention ("position", "new" | "node" | "family", "changes"), "falls": whether the probability of the model's top next token falls below half of what it is, "top": the
+    removed (Native.without; at F2's positions and the targets), one connection cut (cuts: goal_eval.GoalEval.cuts with
+    detail on the text, whole-model path patching; among `nodes`, the question's listed subcomponents, the connections
+    the model has), and, for a text that copies, changes probing the copy (copy_questions()). Each: {"kind", the
+    intervention ("position", "new" | "node" | "edge" | "family", "changes"), "falls": whether the probability of the model's top next token falls below half of what it is, "top": the
     most likely next token after it (id), "bits": log2 of the top token's probability ratio}. Per kind, half the
     questions whose answer is "falls" and half not, where the text has them (a constant answer scores half)."""
     import torch
@@ -310,6 +313,17 @@ def qa_questions(nat, task: dict, ci: dict, positions: list[int], seed: int, per
             pool["remove"].append(outcome(nat.without(ids, targets, [nd]), kind="remove", node=list(nd),
                                           ci=float(ci[nd[0]][nd[1], nd[2]])))
     pool["copy"] = copy_questions(nat, ids, targets, top, rng, outcome)
+    if cuts is not None and nodes:
+        import native
+
+        par, outs = native.all_edges(set(map(tuple, nodes)), targets)
+        pairs = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in outs]
+        pairs = rng.sample(pairs, min(len(pairs), 8 * per_kind))
+        pool["cut"] = []
+        for (w, r), d in zip(pairs, cuts(pairs) if pairs else []):
+            bits = (d["logp_model_top"][-1] - lp0) / math.log(2)
+            pool["cut"].append({"kind": "cut", "edge": [list(w), None if r is None else list(r)], "falls": bits < -1.0,
+                                "top": int(d["top"][-1]), "bits": bits})
     out = []
     for kind, qs in pool.items():
         yes = [q for q in qs if q["falls"]]
@@ -374,6 +388,10 @@ def qa_text(q: dict, n: int, strings: list[str], top: str, tokens_of) -> str:
     elif q["kind"] == "copy":
         what = ("the tokens at positions " + ", ".join(f"{r} ({strings[r]!r})" for r, _ in q["changes"]) + " were replaced by "
                 + ", ".join(repr(tokens_of([z])[0]) for _, z in q["changes"]) + " respectively")
+    elif q["kind"] == "cut":
+        w, r = q["edge"]
+        what = (f"the connection {node_text(tuple(w))} -> {'out (the prediction)' if r is None else node_text(tuple(r))} were cut "
+                "(the reader computed without that writer's output, everything else unchanged)")
     else:
         what = f"subcomponent {node_text(tuple(q['node']))} were removed (set to zero, everything else unchanged)"
     return (f"Question {n}: if {what}, would the probability of {top} fall below half of what it is, and what would the "
@@ -513,7 +531,9 @@ def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=N
         wires[p] = [[list(w), list(r), c] for w, r, c in pairs[:WIRING_PER_POSITION]]
     switched = {str(p): switch_on(nat, ids, targets, p, tx.ci) for p in listed}
     active = int(sum(int((tx.ci[n][where] > 0).sum()) for n in nat.names))
-    qa = qa_questions(nat, task, tx.ci, positions, native.task_seed(task["id"]) if qa_seed is None else qa_seed)
+    listed_nodes = [nd for p in where for nd in comps[p]]
+    qa = qa_questions(nat, task, tx.ci, positions, native.task_seed(task["id"]) if qa_seed is None else qa_seed,
+                      cuts=lambda pairs: ge.cuts(tx, pairs, detail=True), nodes=listed_nodes)
     return {"task": task["id"], "positions": positions, "listed": listed, "events": events,
             "components": {str(p): [[list(nd), float(tx.ci[nd[0]][nd[1], nd[2]]), facts(atlas, nd) if atlas else ""] for nd in comps[p]]
                            for p in where},
@@ -533,7 +553,8 @@ def windows(task: dict, ev: dict, radius: int = WINDOW) -> set[int]:
     named |= {nd[1] for cs in ev.get("switch_on", {}).values() for nd, _ in cs}
     named |= {nd[1] for ws in ev["wiring"].values() for w, r, _ in ws for nd in (w, r)}
     for q in ev["qa"]:
-        named |= {q["position"]} if q["kind"] == "token" else {q["node"][1]} if q["kind"] == "remove" else {r for r, _ in q["changes"]}
+        named |= ({q["position"]} if q["kind"] == "token" else {q["node"][1]} if q["kind"] == "remove"
+                  else {nd[1] for nd in q["edge"] if nd is not None} if q["kind"] == "cut" else {r for r, _ in q["changes"]})
     strings = token_strings(task["model"], ids)
     top = p["model_top"][0][0][0]
     named |= {s + d for s in range(t) if ids[s] == ids[t] and strings[s + 1] == top for d in (0, 1)}  # copy sources [A][B]
@@ -1017,8 +1038,11 @@ def main():
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
-                r["qa"] = qa_questions(nat, task, nat.importance(task["prompts"][0]["token_ids"]), r["positions"],
-                                       native.task_seed(task["id"]) + args.qa_seed)
+                ids, targets = task["prompts"][0]["token_ids"], task["prompts"][0]["target_positions"]
+                tx = ge.text(ids, targets, task=task)
+                r["qa"] = qa_questions(nat, task, nat.importance(ids), r["positions"], native.task_seed(task["id"]) + args.qa_seed,
+                                       cuts=lambda pairs: ge.cuts(tx, pairs, detail=True),
+                                       nodes=[tuple(nd) for cs in r["components"].values() for nd, *_ in cs])
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
                 f.flush()
                 print(r["task"], len(r["qa"]), "questions", flush=True)

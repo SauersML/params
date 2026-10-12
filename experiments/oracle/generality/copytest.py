@@ -6,7 +6,7 @@ import pickle
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.environ.get("ORACLE", str(Path(__file__).resolve().parents[3] / "method" / "oracle")))
+sys.path.insert(0, os.environ.get("ORACLE") or str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 

@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, os.environ.get("ORACLE", str(Path(__file__).resolve().parents[3] / "method" / "oracle")))
+sys.path.insert(0, os.environ.get("ORACLE") or str(Path(__file__).resolve().parents[3] / "method" / "oracle"))
 HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/generality"))  # inputs and outputs
 sys.path.insert(0, str(HERE))

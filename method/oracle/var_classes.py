@@ -63,7 +63,7 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
     mine = sc._text(tx.ids, tx.targets)
     base = mine["lq"]
     kl = lambda a, b: float(carry.kl(a[None], b[None])[0])  # noqa: E731
-    own = sc._patched(mine, [(mine["act"], v["group"]), (mine["act"], [])])
+    own = sc._patched(mine, [(mine, v["group"]), (mine, [])])
     noise = max([mine["res"]] + [abs(kl(base, q)) for q in own])
     q_z, ref_z = [], []
     for s0 in range(0, len(zs), sc.rows):  # a batch's changed texts at a time (each holds every activation)
@@ -73,7 +73,7 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
             x[p] = z
             texts.append(sc._text(x, tx.targets))
             noise = max(noise, texts[-1]["res"])
-        q_z += list(sc._patched(mine, [(w["act"], v["group"]) for w in texts]))
+        q_z += list(sc._patched(mine, [(w, v["group"]) for w in texts]))
         ref_z += [w["lq"] for w in texts]
         del texts
         native.free(nat.dev)

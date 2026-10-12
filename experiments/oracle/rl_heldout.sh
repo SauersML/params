@@ -3,7 +3,8 @@
 # (tinker_train.py rl) without one yet, its answers to held-out text9000-9019 (fresh QA seed), E1 by readers A and B,
 # and components.py evaluate, into DIR/heldout_<step>.json (answer set "rl") and DIR/heldout_<step>_e1.jsonl, the
 # files experiments/oracle/figures_eval.py --rl reads. Run it while the RL runs or after; it skips what is done.
-#   zsh experiments/oracle/rl_heldout.sh DIR   (env: HELDOUT, LABELS, NEVAL, SAMPLES, MAXTOK, EDIT_TEACH, SRC)
+#   zsh experiments/oracle/rl_heldout.sh DIR   (env: HELDOUT, LABELS, NEVAL, SAMPLES, MAXTOK, EDIT_TEACH, SRC, RLNAME)
+# Then the RL figure (figures_eval.py --rl) as ~/mpd-data/graph_oracle/figures/rl_<DIR's name>_rl.png.
 set -e
 DIR=$1
 O=~/mpd-data/graph_oracle/components
@@ -31,3 +32,5 @@ for l in open('$DIR/checkpoints.jsonl'):
   echo "step $STEP: $DIR/heldout_$STEP.json"
 done
 unset TINKER_API_KEY
+MPD_MEM_GIB=1 $PY $SRC/experiments/oracle/figures_eval.py --labels $LABELS --rl "${RLNAME:-$(basename $DIR)}=$DIR" \
+  --prefix rl_$(basename $DIR)

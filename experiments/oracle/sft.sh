@@ -43,3 +43,7 @@ cd $SRC
   --e1 sft=$S/e1.jsonl --set teacher=$S/teacher_txt --labels $LABELS --n $NEVAL ${EDIT_TEACH:+--edit-teach $EDIT_TEACH} \
   --out $S/eval.json > $S/eval.log 2>&1
 tail -60 $S/eval.log
+Z=$O/zeroshot_heldout20  # the figures: this SFT against the untrained base and the held-out teachers
+MPD_MEM_GIB=1 $PY $SRC/experiments/oracle/figures_eval.py --labels $LABELS --prefix sft_$RUN \
+  --set "Qwen3-8B zero-shot=$Z/eval_zs_vpd_e2.json:zeroshot:$Z/e1.jsonl" --set "${BASE#*/} SFT=$S/eval.json:sft:$S/e1.jsonl" \
+  --ref "Teacher=$S/eval.json:teacher" --ref "VPD top-K=$Z/eval_zs_vpd_e2.json:vpd_top_k"

@@ -860,7 +860,7 @@ class GoalEval:
         return b
 
     @torch.no_grad()
-    def pp_run(self, tx: Text, x2: list[int], graph: native.Graph) -> torch.Tensor:
+    def pp_run(self, tx: Text, x2: list[int], graph: native.Graph, cuts: dict | None = None) -> torch.Tensor:
         """log q at the targets [1, len(targets), V] of the path-patched run of graph on the changed text x2 (s_track_pp,
         the lead's 10-12): everything at its value in the real model on the text (_pp_base) but the circuit's nodes,
         which compute in layer order from their stated parents' path-patched values and every unstated input at its x
@@ -873,7 +873,9 @@ class GoalEval:
         values plus its stated value parents' changes. An MLP output: GELU of the x MLP input plus its stated input
         parents' changes. The prediction: the final x stream plus its stated writers' changes and the embedding's. On
         the text itself the run is the real model; a complete graph is the forward on x2 with every subcomponent
-        outside it and every remainder at its x value (computed that way)."""
+        outside it and every remainder at its x value (computed that way). cuts (a complete graph's): {(layer, t):
+        [source positions]}, value reads its attention-output nodes at (layer, t) take at x: those sources' values in
+        their pattern row at their x values (teacher_reads' cut reads, path-patched)."""
         import vpd_model
 
         tg, T, dev = self.nat.target, tx.T, self.nat.dev
@@ -896,6 +898,12 @@ class GoalEval:
                 qr, kr = (tg._rope(m.view(1, T, H, hd).transpose(1, 2), T)[0] for m in (q, k))
                 P = ((qr @ kr.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
                 att = (P @ v.view(T, H, hd).transpose(0, 1)).transpose(0, 1).reshape(T, -1)
+                for (layer, t), srcs in (cuts or {}).items():  # cut reads: those sources' values at x in row t
+                    if layer == i and srcs:
+                        s_ = torch.tensor(sorted(srcs), device=dev)
+                        dv = (b["v"][i][s_] - v[s_]).view(len(s_), H, hd)  # [S, H, hd]
+                        att = att.clone()
+                        att[t] = att[t] + (P[:, t, s_][:, :, None] * dv.transpose(0, 1)).sum(1).reshape(-1)
                 x = x + site(nm["o_proj"], att)
                 x = x + site(nm["down_proj"], vpd_model.gelu_tanh(site(nm["c_fc"], vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps))))
             return torch.log_softmax(vpd_model.rms(x[tx.targets], tg.ln_f, tg.eps) @ tg.wte.T.float(), -1)[None]
@@ -992,13 +1000,14 @@ class GoalEval:
         return torch.log_softmax(vpd_model.rms(f, tg.ln_f, tg.eps) @ tg.wte.T.float(), -1)[None]
 
     @torch.no_grad()
-    def track_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = CHANGED_DRAWS) -> list[dict]:
+    def track_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = CHANGED_DRAWS,
+                 cuts: list | None = None) -> list[dict]:
         """s_track_pp (the lead's 10-12, beside s_track): on changed_inputs' changed texts x' (split), the path-patched
         run of each circuit (pp_run) against the model on x', against VPD's whole answer's path-patched run (a
         complete graph: 1 by construction), bounded by no change: per prompt clip(ln(W / KL_C) / ln(W / KL_V), 0, 1)
         with W = KL(model(x') || model(x)) (the circuit's run on x is the model's, so this is s_track's transplant),
         none where VPD's run is no nearer than W, pooled weighted by W. Per circuit s_track_pp, kl_track_pp_c,
-        prompts_track_pp and draws_track_pp ([prompt, KL_C, KL_V, W] each)."""
+        prompts_track_pp and draws_track_pp ([prompt, KL_C, KL_V, W] each). cuts: per graph pp_run's cuts (None: none)."""
         nat = self.nat
         graphs = [strand(g, tx.targets, nat.C) for g in graphs]
         moved = np.asarray(tx.moved, dtype=float)
@@ -1014,7 +1023,7 @@ class GoalEval:
             w = float(carry.kl(ref, tx.ref)[0])
             kv = float(carry.kl(ref, self.pp_run(tx, x2, vpd))[0])
             for b_, g in enumerate(graphs):
-                kc = float(carry.kl(ref, self.pp_run(tx, x2, g))[0])
+                kc = float(carry.kl(ref, self.pp_run(tx, x2, g, None if cuts is None else cuts[b_]))[0])
                 sb = _fid(w, kc, kv)
                 a = acc[b_]
                 a[4].append([[p, z], kc, kv, w])
@@ -2108,9 +2117,10 @@ class GoalEval:
         """The teachers' changed-input family: changed_inputs on the search split alone (never a reward, gate or
         table's) for a list of candidate circuits on one text, each changed text run once for all of them. A node set
         without stated structure: native.Graph(nodes, complete=True); cuts, per graph its connections cut
-        (_changed_logq); mode "pp": track_pp's path-patched s_track_pp instead (no cuts)."""
+        (_changed_logq); mode "pp": track_pp's path-patched s_track_pp instead (cuts then per graph pp_run's
+        {(layer, t): [source positions]})."""
         if mode == "pp":
-            return self.track_pp(tx, graphs, "search", draws)
+            return self.track_pp(tx, graphs, "search", draws, cuts=cuts)
         return self.changed_inputs(tx, graphs, "search", draws, cuts=cuts)
 
     @torch.no_grad()

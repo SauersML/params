@@ -49,7 +49,8 @@ text, or a connection the model does not have), or a question has no FINAL line.
 
   components.py questions SPLIT OUT.jsonl [--n N]              question rows (question, positions, evidence, questions)
   components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
-                                                                (TEACHER_DIR/<task>.txt) with the measured answers
+                                                                (TEACHER_DIR/<task>.json or .txt; nodes alone get
+                                                                measured edges) with the measured answers
   components.py score SPLIT ROWS.jsonl --set NAME=DIR [--n N]  rewards of answer texts DIR/<task>.txt, with baselines
 """
 
@@ -578,29 +579,65 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
 # ---- supervised targets
 
 
-def target(teacher: str, ev: dict, model: str) -> str:
-    """The supervised answer to a question: the teacher's explanation and circuit, and for each question the model's
-    measured answer (no reasoning: the teacher has none to give)."""
-    p = parse(teacher)
+def target(answer: dict, ev: dict, model: str) -> str:
+    """The supervised answer to a question: the teacher's circuit (goal_eval's JSON) and explanation, and for each
+    question the model's measured answer (no reasoning: the teacher has none to give)."""
     finals = {n: (q["falls"], shown(token_strings(model, [q["top"]])[0])) for n, q in enumerate(ev["qa"], 1)}
-    return render(p["answer"], finals)
+    return render(answer, finals)
 
 
-def dataset(rows: Path, teacher_dir: Path, out: Path) -> int:
+def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None) -> dict:
+    """A teacher circuit given as nodes alone, with edges: the connections the model has among its nodes (and from
+    its residual writers at the targets into the prediction), ordered by the measured effect of cutting each one
+    alone (goal_eval.cuts), the prefix (none, 1, 2, 4, ..., all) whose answer earns the most reward on the text."""
+    import goal_eval
+    import native
+
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    g, _ = goal_eval.circuit(answer, targets, ge.nat.C, len(ids))
+    par, out = native.all_edges(g.node_set(), targets)
+    pairs = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in out]
+    if not pairs:
+        return answer
+    tx = ge.text(ids, targets, task=task)
+    ranked = [e for _, e in sorted(zip(ge.cuts(tx, pairs), pairs), key=lambda x: -x[0])]
+    ks = sorted({0, len(ranked)} | {2 ** j for j in range(len(ranked).bit_length()) if 2 ** j < len(ranked)})
+    cands = []
+    for k in ks:
+        h = native.Graph(g.node_set(), {}, [])
+        for w, r in ranked[:k]:
+            h.out.append(w) if r is None else h.parents.setdefault(r, []).append(w)
+        cands.append(goal_eval.to_json(h, answer.get("explanation", "")))
+    got = reward(ge, task, {**ev, "qa": []}, [render(c) for c in cands], cache=cache)
+    return cands[max(range(len(cands)), key=lambda i: got[i]["reward"])]
+
+
+def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None) -> int:
     """SFT rows ({"prompt": [user message], "completion": [assistant message], "info": {"task"}}, units_sft.py's
-    format) for the questions that have a teacher answer."""
+    format) for the questions that have a teacher answer: TEACHER_DIR/<task>.json (goal_eval's circuit JSON; nodes
+    without edges get with_edges(), which needs ge) or <task>.txt (this module's text)."""
     import native
 
     n = 0
     with out.open("w") as f:
         for r in map(json.loads, rows.read_text().splitlines()):
-            path = teacher_dir / f"{r['task']}.txt"
-            if not path.exists():
+            js, txt = teacher_dir / f"{r['task']}.json", teacher_dir / f"{r['task']}.txt"
+            if js.exists():
+                answer = json.loads(js.read_text())
+            elif txt.exists():
+                answer = parse(txt.read_text())["answer"]
+            else:
                 continue
             task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+            if answer.get("nodes") and not answer.get("edges"):
+                if ge is None:
+                    raise ValueError(f"{js} states no edges: with_edges() needs the model (pass ge)")
+                answer = with_edges(ge, task, r, answer)
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
-                                "completion": [{"role": "assistant", "content": target(path.read_text(), r, task["model"])}],
+                                "completion": [{"role": "assistant", "content": target(answer, r, task["model"])}],
                                 "info": {"task": r["task"]}}) + "\n")
+            f.flush()
             n += 1
     return n
 
@@ -629,12 +666,13 @@ def main():
     s.add_argument("--ranks", default="3,4,5")
     s.add_argument("--out", type=Path)
     args = ap.parse_args()
-    if args.cmd == "dataset":
-        print(dataset(args.rows, args.teacher, args.out), "rows", flush=True)
-        return
-
     import goal_eval
     import native
+
+    if args.cmd == "dataset":
+        node_only = any(json.loads(f.read_text()).get("edges") in (None, []) for f in sorted(args.teacher.glob("*.json")))
+        print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval() if node_only else None), "rows", flush=True)
+        return
 
     ge = goal_eval.GoalEval()
     nat = ge.nat

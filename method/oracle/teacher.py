@@ -87,17 +87,21 @@ class Pruner:
             out[n] = m
         return out
 
-    def _gather(self) -> None:
+    def _gather(self, every: bool = False) -> None:
         """Per site the subcomponents among the nodes (the start set), all others being off in every run: their columns
         of V and U, and each node's column among them. The products then run on these alone (a sum over fewer
-        terms: equal to the full products within float32 rounding, not to the bit)."""
+        terms: equal to the full products within float32 rounding, not to the bit). every: all of a site's columns
+        (the full products)."""
         tg, T = self.ge.nat.target, self.tx.T
         self.sel = [(self.mat == j).nonzero().flatten() for j in range(len(self.names))]
         self.cols = []
         self.flat = torch.empty(len(self.nodes), dtype=torch.long, device=self.t.device)  # each node's place in _site_masks' buffer
         self.offsets, at = [], 0
         for j, n in enumerate(self.names):
-            cols, ci = torch.unique(self.c[self.sel[j]], return_inverse=True)
+            if every:
+                cols, ci = torch.arange(self.ge.nat.C[n], device=self.c.device), self.c[self.sel[j]]
+            else:
+                cols, ci = torch.unique(self.c[self.sel[j]], return_inverse=True)
             st = tg.site(n)
             self.cols.append((ci, (st.V.index_select(1, cols), st.U.index_select(0, cols))))
             self.flat[self.sel[j]] = at + self.t[self.sel[j]] * len(cols) + ci

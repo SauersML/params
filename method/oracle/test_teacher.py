@@ -62,8 +62,7 @@ def test_gathered_products_match_full_products():
     trials = pr.on[None].repeat(64, 1)
     trials[torch.arange(64, device=nat.dev), nodes] = False
     gathered = pr.kl_sets(trials)
-    pr.cols = [(torch.arange(nat.C[n], device=nat.dev)[pr.c[pr.sel[j]]], (nat.target.site(n).V, nat.target.site(n).U))
-               for j, n in enumerate(pr.names)]                 # every column: the full products
+    pr._gather(every=True)                                      # every column: the full products
     pr.fused = False                                            # vpd_model's own norms and GELU
     pr._prefixes = {}
     full = pr.kl_sets(trials)

@@ -3631,8 +3631,15 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             graphs.append(g)
             kinds.append(name)
         if start:  # the influential start set (start_set, chosen on the search split), scored as the sets are: kind "start"
-            graphs.append(ge.start_set(tx, "search")["graph"])
+            st = ge.start_set(tx, "search")
+            graphs.append(st["graph"])
             kinds.append("start")
+            # the recency baseline (the lead's 10-12): VPD's actives at the targets and the m positions just before them,
+            # m the start's positions other than the targets, a complete node set
+            m, t0 = len(set(st["positions"]) - set(targets)), min(targets)
+            ps = set(targets) | set(range(max(0, t0 - m), t0))
+            graphs.append(native.Graph(sorted((n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist() if t in ps), complete=True))
+            kinds.append("recency")
         order = saved[p.stem]["order"] if p.stem in saved else nat._vpd_order(ids, targets)
         for k in sorted({g.count() for g in graphs}):
             graphs.append(native.Graph(order[:k], complete=True))
@@ -3796,7 +3803,8 @@ def main():
                    help="GoalEval.fidelity's mode: full, or the reward's (its family alone, rl_terms and c_rl: teacher rows for the reward)")
     f.add_argument("--draw-split", choices=("search", "eval"), help="the families' draws (default: the mode's, search for reward, eval for full)")
     f.add_argument("--start", action="store_true", help="also the text's influential start set (start_set, chosen on the search split), "
-                   "kind \"start\": its families, per-draw records and size bits beside the sets' (phi's start, compact's bits_start)")
+                   "kind \"start\": its families, per-draw records and size bits beside the sets' (phi's start, compact's bits_start), "
+                   "and the recency baseline, kind \"recency\" (VPD's actives at the targets and as many positions just before them)")
     q = sub.add_parser("patterns", help="the adversary's pattern pool from a range of held-out texts")
     q.add_argument("--first", type=int, required=True, help="first text number, e.g. 9100")
     q.add_argument("--last", type=int, required=True, help="last text number, e.g. 9149")

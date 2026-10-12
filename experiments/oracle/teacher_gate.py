@@ -96,7 +96,8 @@ def v2_rule(fid_rows: list, arms: list, goal_eval) -> None:
     scored beside the arms (kind "start", goal_eval.py fidelity --start): an arm is eligible when phi >= phi_tau
     (goal_eval.phi with the text's start) and its target KL (the point run's KL_C) is within 2x the start's on at least
     80% of texts; among the eligible, the highest median compact (goal_eval.compact, size_bits against the start's),
-    ties to the higher median phi. VPD's top k at each arm's size is reported beside, not in the rule."""
+    ties to the higher median phi. VPD's top k at each arm's size and the recency baseline (kind "recency": VPD's actives
+    at the target and the start's number of other positions just before it) are reported beside, not in the rule."""
     import math
     import statistics
 
@@ -118,21 +119,23 @@ def v2_rule(fid_rows: list, arms: list, goal_eval) -> None:
                          "ok_phi": ph is not None and tau is not None and ph >= tau,
                          "ok_kl": ka is not None and ks is not None and ka <= 2 * ks,
                          "compact": goal_eval.compact(a.get("size_bits"), st.get("size_bits")),
-                         "phi_vpd": goal_eval.phi(vpd)[0] if vpd else None})
+                         "phi_vpd": goal_eval.phi(vpd)[0] if vpd else None,
+                         "phi_recency": goal_eval.phi(k["recency"])[0] if k.get("recency") else None,
+                         "compact_recency": goal_eval.compact(k["recency"].get("size_bits"), st.get("size_bits")) if k.get("recency") else None})
         if not rows:
             continue
         ok = [r for r in rows if r["ok_phi"] and r["ok_kl"]]
         med = lambda key: statistics.median([r[key] for r in rows if r[key] is not None]) if any(r[key] is not None for r in rows) else None  # noqa: E731
         out[arm] = {"texts": len(rows), "phi_ok": sum(r["ok_phi"] for r in rows), "both_ok": len(ok),
                     "eligible": len(ok) >= 0.8 * len(rows), "compact": med("compact"), "phi": med("phi"), "tau": med("tau"),
-                    "phi_vpd": med("phi_vpd")}
+                    "phi_vpd": med("phi_vpd"), "phi_recency": med("phi_recency"), "compact_recency": med("compact_recency")}
         fails[arm] = [r for r in rows if not (r["ok_phi"] and r["ok_kl"])]
     fmt = lambda x: "  none" if x is None else f"{x:6.3f}"  # noqa: E731
     print("v2 rule (eval split, held-out): arm, texts, phi >= phi_tau, and target KL within 2x the start's, eligible, "
-          "median compact, phi, phi_tau, VPD top k's phi at the arm's size")
+          "median compact, phi, phi_tau; reported beside: VPD top k's phi at the arm's size, the recency baseline's phi and compact")
     for arm, o in out.items():
         print(f"  {arm:8s} {o['texts']:3d} {o['phi_ok']:3d} {o['both_ok']:3d} {'yes' if o['eligible'] else 'no ':3s} "
-              f"{fmt(o['compact'])} {fmt(o['phi'])} {fmt(o['tau'])} {fmt(o['phi_vpd'])}")
+              f"{fmt(o['compact'])} {fmt(o['phi'])} {fmt(o['tau'])} {fmt(o['phi_vpd'])} {fmt(o['phi_recency'])} {fmt(o['compact_recency'])}")
     ok = [a for a in out if out[a]["eligible"]]
     if ok:
         best = max(ok, key=lambda a: (out[a]["compact"] if out[a]["compact"] is not None else -math.inf,

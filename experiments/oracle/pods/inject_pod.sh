@@ -7,7 +7,8 @@
 # ~/mpd-data/runpod/oracle-graph-inject-$RUN/: run/ (adapter, injector.pt, sft.jsonl), samples.jsonl,
 # samples_shuffled.jsonl, inject.log. E1 (tinker_train.py readers) and the evaluation (eval_pod.sh) follow on their own.
 #   bash experiments/oracle/pods/inject_pod.sh RUN SFT.jsonl ROWS.jsonl HELDOUT.jsonl
-#     (env: STEPS, BATCH, LR, BASE, NEVAL, SAMPLES, MAXTOK, HOURS (cap, default 3), GPU, PRICE, VRAM, RP_OWNER;
+#     (env: STEPS, BATCH, LR, BASE, NEVAL, SAMPLES, MAXTOK, VLLM (set: sample with vLLM from prompt embeddings),
+#      HOURS (cap, default 3), GPU, PRICE, VRAM, RP_OWNER;
 #      LEDGER_OK=1 once the lead approved a launch past $285)
 cd /Users/user/params
 spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
@@ -29,7 +30,7 @@ CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs
 ls /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
 cd $S/method/oracle/rl; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 10 > $O/gpu.csv & \
 python -u inject.py sft $I/sft.jsonl $I/rows.jsonl --out $O/run $B --steps ${STEPS:-100} --batch ${BATCH:-8} --lr ${LR:-2e-4} > $O/inject.log 2>&1; \
-python -u inject.py sample $I/heldout.jsonl $O/samples.jsonl --init $O/run $B --n ${NEVAL:-20} --samples ${SAMPLES:-2} --max-tokens ${MAXTOK:-4096} >> $O/inject.log 2>&1; \
-python -u inject.py sample $I/heldout.jsonl $O/samples_shuffled.jsonl --init $O/run $B --n ${NEVAL:-20} --samples ${SAMPLES:-2} --max-tokens ${MAXTOK:-4096} --shuffle >> $O/inject.log 2>&1"
+python -u inject.py sample $I/heldout.jsonl $O/samples.jsonl --shuffled-out $O/samples_shuffled.jsonl --init $O/run $B --n ${NEVAL:-20} \
+  --samples ${SAMPLES:-2} --max-tokens ${MAXTOK:-4096} ${VLLM:+--vllm} >> $O/inject.log 2>&1; rm -rf $O/merged"
 RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-200} RP_OWNER=${RP_OWNER:-fleet} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-1.0} \
   RP_MIN_VRAM_GB=${VRAM:-44} experiments/infra/runpod/rp-run $N "${GPU:-A40,RTX A6000,L40S,L40,RTX 6000 Ada}" ${HOURS:-3} -- bash -c "$CMD"

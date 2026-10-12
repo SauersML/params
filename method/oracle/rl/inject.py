@@ -11,11 +11,16 @@ base, the maps trained with it, sampling with inputs_embeds (transformers' gener
 
   inject.py sft SFT.jsonl ROWS.jsonl --out DIR [--base Qwen/Qwen3-8B] [--steps N] [--batch B] [--lr LR] [--rank 32]
   inject.py sample ROWS.jsonl OUT.jsonl --init DIR [--n 20] [--samples 2] [--max-tokens 4096] [--shuffle]
+                    [--shuffled-out OUT2.jsonl] [--vllm]
 
 SFT.jsonl: components.py dataset rows (the prompt's question and the target answer); ROWS.jsonl: the question rows
 (evidence(): the subcomponents each question lists). sample writes tinker_train.py sample's format (components.py
 evaluate reads it). --shuffle gives each question's subcomponents one another's vectors (a derangement within the
-question): the ablation that shows whether the explainer reads them. Vectors: native.UV, the tensors native runs on.
+question): the ablation that shows whether the explainer reads them; --shuffled-out writes that set beside OUT in the
+same run. --vllm samples with vLLM from the prompts' embeddings (computed here, then the adapter merged into a saved
+checkpoint that vLLM loads: train.py's VllmSampler found vLLM's own LoRA with prompt embeddings crashing, and runs
+them without prefix caching or asynchronous scheduling), else transformers' generate. Vectors: native.UV, the tensors
+native runs on.
 """
 
 from __future__ import annotations
@@ -268,25 +273,59 @@ def sft(a) -> None:
     print(json.dumps({"saved": str(a.out)}), flush=True)
 
 
+def vllm_sample(ex: Explainer, embeds: list[torch.Tensor], n: int, max_tokens: int, seed: int, workdir: Path) -> list[list[tuple[list[int], bool]]]:
+    """n samples of every prompt given as embeddings [L, width], by vLLM from the explainer's adapter merged into a
+    saved checkpoint (the explainer is freed first)."""
+    import gc
+    import shutil
+
+    from vllm import LLM, SamplingParams
+
+    end, tok = ex.end, ex.tok
+    merged = workdir / "merged"
+    shutil.rmtree(merged, ignore_errors=True)
+    ex.model.merge_and_unload().save_pretrained(str(merged))
+    tok.save_pretrained(str(merged))
+    del ex
+    gc.collect()
+    torch.cuda.empty_cache()
+    llm = LLM(model=str(merged), dtype="bfloat16", enable_prompt_embeds=True, enable_prefix_caching=False, async_scheduling=False,
+              max_model_len=max(int(e.shape[0]) for e in embeds) + max_tokens + 16, gpu_memory_utilization=0.85, seed=seed)
+    params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=max_tokens, stop_token_ids=[end])
+    outs = llm.generate([{"prompt_embeds": e} for e in embeds], params, use_tqdm=False)
+    return [[([t for t in c.token_ids if t != end], c.finish_reason == "length") for c in o.outputs] for o in outs]
+
+
 def sample(a) -> None:
-    """Answers to the first n questions, --samples each, as tinker_train.py sample writes them."""
+    """Answers to the first n questions, --samples each, as tinker_train.py sample writes them (and with
+    --shuffled-out, the same questions with their subcomponents' vectors deranged)."""
     rows = [r for r in map(json.loads, a.rows.read_text().splitlines()) if r][:a.n]
     dev = device()
     ex = Explainer(a.base, 0, dev, Vectors(), a.init)
     rng = random.Random(a.seed)
-    prompts, nodes = [], []
+    prompts, nodes, shuffled = [], [], []
     for r in rows:
         question, nds = slotted(r["question"], r)
         prompts.append(ex.prompt_ids(question))
         nodes.append(derange(nds, rng) if a.shuffle else nds)
+        shuffled.append(derange(nds, rng))
+    sets = [(a.out, nodes)] + ([(a.shuffled_out, shuffled)] if a.shuffled_out else [])
     t0 = time.time()
-    got = ex.sample(prompts, nodes, a.samples, a.max_tokens, a.batch)
-    with a.out.open("w") as f:
-        for r, answers in zip(rows, got):
-            for k, (tokens, cut) in enumerate(answers):
-                f.write(json.dumps({"task": r["task"], "sample": k, "text": ex.tok.decode(tokens), "finish": "length" if cut else "stop",
-                                    "tokens": len(tokens)}) + "\n")
-    print(json.dumps({"questions": len(rows), "samples": a.samples, "shuffle": a.shuffle, "seconds": time.time() - t0}), flush=True)
+    tok = ex.tok
+    if a.vllm:
+        with torch.no_grad():
+            embeds = [ex.embed(torch.tensor([p], device=dev), [nd])[0].to(torch.bfloat16).cpu() for _, nds in sets for p, nd in zip(prompts, nds)]
+        flat = vllm_sample(ex, embeds, a.samples, a.max_tokens, a.seed, a.out.parent)
+        got = [flat[k * len(prompts):(k + 1) * len(prompts)] for k in range(len(sets))]
+    else:
+        got = [ex.sample(prompts, nds, a.samples, a.max_tokens, a.batch) for _, nds in sets]
+    for (path, _), answers_of in zip(sets, got):
+        with path.open("w") as f:
+            for r, answers in zip(rows, answers_of):
+                for k, (tokens, cut) in enumerate(answers):
+                    f.write(json.dumps({"task": r["task"], "sample": k, "text": tok.decode(tokens), "finish": "length" if cut else "stop",
+                                        "tokens": len(tokens)}) + "\n")
+    print(json.dumps({"questions": len(rows), "samples": a.samples, "sets": len(sets), "vllm": a.vllm, "seconds": time.time() - t0}), flush=True)
 
 
 def main():
@@ -310,6 +349,8 @@ def main():
     m.add_argument("--max-tokens", type=int, default=4096)
     m.add_argument("--batch", type=int, default=8)
     m.add_argument("--shuffle", action="store_true")
+    m.add_argument("--shuffled-out", type=Path, help="also write the answers with each question's vectors deranged here")
+    m.add_argument("--vllm", action="store_true", help="sample with vLLM from prompt embeddings (CUDA)")
     for p in (s, m):
         p.add_argument("--base", default="Qwen/Qwen3-8B")
         p.add_argument("--rank", type=int, default=32)

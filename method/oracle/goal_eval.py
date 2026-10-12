@@ -177,6 +177,10 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
         else:
             bad_nodes += 1
             nodes.append(None)
+    if answer.get("complete"):  # a node set claiming every connection among its nodes (and every token edge)
+        g = native.Graph([nd for nd in nodes if nd is not None and nd[0] != "tok"], complete=True)
+        g.stranded, g.stranded_bits = [], 0.0
+        return g, {"invalid_nodes": bad_nodes, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 0}
     parents, out, tok, bad_edges, pairs, tok_out = {}, [], [], 0, {}, []
     for e in answer.get("edges", []):
         if isinstance(e, (list, tuple)) and len(e) == 5 and e[0] == "pair":
@@ -359,7 +363,10 @@ def _c_graph(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
 
 
 def to_json(g: native.Graph, explanation: str = "") -> dict:
-    """A Graph (not complete) as an answer in JSON (circuit's format)."""
+    """A Graph as an answer in JSON (circuit's format; a complete graph as its node set, "complete": true)."""
+    if g.complete and g.masks is None:
+        return {"nodes": [["block", n, t] if c == BLOCK else [n, c, t] for n, t, c in sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2]))],
+                "edges": [], "complete": True, "explanation": explanation}
     tok = getattr(g, "tok_edges", [])
     nodes = sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2])) + [("tok", p, 0) for p in sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in tok} | set(getattr(g, "tok_out", [])))]
     at = {nd: i for i, nd in enumerate(nodes)}
@@ -885,11 +892,16 @@ class GoalEval:
         """The real model's run on the text, the path-patched runs' x side (kept on tx): every site's activations
         [T, C] and remainder outputs, each layer's streams before its attention and its MLP, rotated queries and keys
         [H, T, hd], values [T, H hd], scores [H, T, T], MLP inputs, the final stream."""
-        if getattr(tx, "_pp", None) is not None:
-            return tx._pp
+        if getattr(tx, "_pp", None) is None:
+            tx._pp = self._pp_record(tx.ids)
+        return tx._pp
+
+    @torch.no_grad()
+    def _pp_record(self, ids: list[int]) -> dict:
+        """_pp_base's record of the real model's run on any text (an interchange's changed text)."""
         import vpd_model
 
-        nat, tg, T = self.nat, self.nat.target, tx.T
+        nat, tg, T = self.nat, self.nat.target, len(ids)
         H, hd = tg.n_head, tg.hd
         b = {"a": {}, "rem": {}, "Xa": [], "Xm": [], "q": [], "k": [], "v": [], "S": [], "pre": []}
 
@@ -898,7 +910,7 @@ class GoalEval:
             b["a"][n], b["rem"][n] = A, rem
             return A @ tg.site(n).U + rem
 
-        x = tg.wte[torch.tensor(tx.ids, device=nat.dev)].float()
+        x = tg.wte[torch.tensor(ids, device=nat.dev)].float()
         causal = torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril()
         for i in range(tg.n_layer):
             nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
@@ -919,11 +931,11 @@ class GoalEval:
             b["pre"].append(pre)
             x = x + site(nm["down_proj"], vpd_model.gelu_tanh(pre))
         b["Xf"] = x
-        tx._pp = b
         return b
 
     @torch.no_grad()
-    def pp_run(self, tx: Text, x2: list[int], graph: native.Graph, cuts: dict | None = None) -> torch.Tensor:
+    def pp_run(self, tx: Text, x2: list[int], graph: native.Graph, cuts: dict | None = None,
+               fixed: dict | None = None) -> torch.Tensor:
         """log q at the targets [1, len(targets), V] of the path-patched run of graph on the changed text x2 (s_track_pp,
         the lead's 10-12): everything at its value in the real model on the text (_pp_base) but the circuit's nodes,
         which compute in layer order from their stated parents' path-patched values and every unstated input at its x
@@ -941,7 +953,9 @@ class GoalEval:
         the text itself the run is the real model; a complete graph is the forward on x2 with every subcomponent
         outside it and every remainder at its x value (computed that way). cuts (a complete graph's): {(layer, t):
         [source positions]}, value reads its attention-output nodes at (layer, t) take at x: those sources' values in
-        their pattern row at their x values (teacher_reads' cut reads, path-patched)."""
+        their pattern row at their x values (teacher_reads' cut reads, path-patched). fixed: {node: value} those nodes
+        held at the value (a subcomponent's activation, a block's whole output; an interchange: interchange_pp) and
+        their stated readers reading it, in a complete graph those subcomponents or site outputs set."""
         import vpd_model
 
         tg, T, dev = self.nat.target, tx.T, self.nat.dev
@@ -963,10 +977,23 @@ class GoalEval:
                     else:
                         M[n][t, c] = True
 
+            held, held_out = {}, {}  # fixed subcomponents' activations, fixed blocks' whole outputs, per site
+            for (n, t, c), val in (fixed or {}).items():
+                (held_out if c == BLOCK else held).setdefault(n, []).append((t, c, val))
+
             def site(n, inp):
                 A = torch.where(M[n], inp @ tg.site(n).V, b["a"][n])
+                if n in held:
+                    A = A.clone()
+                    for t, c, val in held[n]:
+                        A[t, c] = val
                 rem = torch.where(Mb[n], inp @ tg.site(n).delta_T, b["rem"][n]) if n in Mb else b["rem"][n]
-                return A @ tg.site(n).U + rem
+                out = A @ tg.site(n).U + rem
+                if n in held_out:
+                    out = out.clone()
+                    for t, _, val in held_out[n]:
+                        out[t] = val
+                return out
 
             x = tg.wte[torch.tensor(x2, device=dev)].float()
             for i in range(tg.n_layer):
@@ -996,6 +1023,7 @@ class GoalEval:
             if t in demb:
                 tok[r] = tok.get(r, 0) + demb[t]
         aP = {}  # each circuit node's patched value: a subcomponent's activation, a block's whole output
+        held = dict(fixed or {})
 
         def full(n, z):  # a site's whole linear map (every subcomponent and the remainder)
             return (z @ tg.site(n).V) @ tg.site(n).U + z @ tg.site(n).delta_T
@@ -1039,7 +1067,7 @@ class GoalEval:
             kind = {nd: native._name_layer_kind(nd[0])[1] for nd in here}
             for r in here:
                 if kind[r] in ("q_proj", "k_proj", "v_proj"):
-                    aP[r] = resid(r, b["Xa"][i], tg.norms[2 * i])
+                    aP[r] = held[r] if r in held else resid(r, b["Xa"][i], tg.norms[2 * i])
             qs = [nd for nd in here if kind[nd] == "q_proj"]
             ks = [nd for nd in here if kind[nd] == "k_proj"]
             rows = {}
@@ -1078,17 +1106,17 @@ class GoalEval:
                         if w in aP and kind.get(w) == "v_proj" and w[1] <= t:
                             vmix[w[1]] += delta(w)
                     att = (rows[t][:, :, None] * vmix.view(t + 1, H, hd).transpose(0, 1)).sum(1).reshape(-1)
-                    aP[r] = apply(r, att)
+                    aP[r] = held[r] if r in held else apply(r, att)
             for r in here:
                 if kind[r] == "c_fc":
-                    aP[r] = resid(r, b["Xm"][i], tg.norms[2 * i + 1])
+                    aP[r] = held[r] if r in held else resid(r, b["Xm"][i], tg.norms[2 * i + 1])
             for r in here:
                 if kind[r] == "down_proj":
                     pre = b["pre"][i][r[1]].clone()
                     for w in par.get(r, []):
                         if w in aP and kind.get(w) == "c_fc":
                             pre = pre + delta(w)
-                    aP[r] = apply(r, vpd_model.gelu_tanh(pre))
+                    aP[r] = held[r] if r in held else apply(r, vpd_model.gelu_tanh(pre))
         f = b["Xf"][tx.targets].clone()
         for j, t in enumerate(tx.targets):
             for w in graph.out:
@@ -1114,7 +1142,7 @@ class GoalEval:
         got = self._interchange_draws(tx, positions, split, draws, first={p: -moved[p - 1] for p in positions}) \
             if positions and tx.vpd is not None else []
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
-        acc = [[0.0, 0.0, 0.0, 0, []] for _ in graphs]
+        acc = [[0.0, 0.0, 0.0, 0, [], 0.0] for _ in graphs]  # sum w s, sum w, sum w KL_C, prompts, draws, sum w s_raw
         for p, z in got:
             x2 = list(tx.ids)
             x2[p] = z
@@ -1127,10 +1155,56 @@ class GoalEval:
                 a = acc[b_]
                 a[4].append([[p, z], kc, kv, w])
                 if sb is not None:
-                    a[0], a[1], a[2], a[3] = a[0] + w * sb, a[1] + w, a[2] + w * kc, a[3] + 1
+                    a[0], a[1], a[2], a[3], a[5] = a[0] + w * sb, a[1] + w, a[2] + w * kc, a[3] + 1, a[5] + w * _fid_raw(w, kc, kv)
             native.free(nat.dev)
         return [{"s_track_pp": a[0] / a[1] if a[1] > 0 else None, "kl_track_pp_c": a[2] / a[1] if a[1] > 0 else None,
-                 "prompts_track_pp": a[3], "draws_track_pp": a[4]} for a in acc]
+                 "prompts_track_pp": a[3], "draws_track_pp": a[4], "s_track_pp_raw": a[5] / a[1] if a[1] > 0 else None}
+                for a in acc]
+
+    @torch.no_grad()
+    def interchange_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval",
+                       draws: int = INTERCHANGE_DRAWS) -> list[dict]:
+        """The interchange family in path-patched semantics (the lead's 10-12, C's interchange term): on the
+        interchange draws of a circuit's positions (_interchange_draws), the circuit's nodes at p held at their values
+        in the real model on the changed text x' (a block: the site's whole output there), their stated paths carrying
+        them in the path-patched run on the text (pp_run, fixed), everything else at x; against the real model with the
+        same nodes held (every site a block, complete: the model's own response) and VPD's whole answer's run with them
+        held, bounded by no change: per draw clip(ln(W / KL_C) / ln(W / KL_V), 0, 1), W = KL(model held || model), none
+        where VPD's run is no nearer than W, pooled weighted by W. Per circuit s_interchange_pp (and _raw, the pool
+        without the floor at 0), prompts_interchange_pp, draws_interchange_pp ([[p, z], KL_C, KL_V, W] each)."""
+        nat, T = self.nat, tx.T
+        graphs = [strand(g, tx.targets, nat.C) for g in graphs]
+        vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
+        model = native.Graph([(n, t, BLOCK) for n in nat.names for t in range(T)], complete=True)
+        recs = {}
+        out = []
+        for g in graphs:
+            nodes = sorted(g.node_set())
+            positions = sorted({t for _, t, _ in nodes if t > 0})
+            a = [0.0, 0.0, 0, [], 0.0]
+            for p, z in (self._interchange_draws(tx, positions, split, draws) if positions and vpd is not None else []):
+                if (p, z) not in recs:
+                    x2 = list(tx.ids)
+                    x2[p] = z
+                    recs[(p, z)] = self._pp_record(x2)
+                r2 = recs[(p, z)]
+                held = {}
+                for n, t, c in nodes:
+                    if t == p:
+                        site_ = nat.target.site(n)
+                        held[(n, t, c)] = r2["a"][n][t] @ site_.U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c]
+                m = self.pp_run(tx, tx.ids, model, fixed=held)
+                w = float(carry.kl(m, tx.ref)[0])
+                kc = float(carry.kl(m, self.pp_run(tx, tx.ids, g, fixed=held))[0])
+                kv = float(carry.kl(m, self.pp_run(tx, tx.ids, vpd, fixed=held))[0])
+                a[3].append([[p, z], kc, kv, w])
+                sb = _fid(w, kc, kv)
+                if sb is not None:
+                    a[0], a[1], a[2], a[4] = a[0] + w * sb, a[1] + w, a[2] + 1, a[4] + w * _fid_raw(w, kc, kv)
+            native.free(nat.dev)
+            out.append({"s_interchange_pp": a[0] / a[1] if a[1] > 0 else None, "prompts_interchange_pp": a[2],
+                        "draws_interchange_pp": a[3], "s_interchange_pp_raw": a[4] / a[1] if a[1] > 0 else None})
+        return out
 
     def _pair_row(self, layer: int, t: int, stated, nodes: list, q: torch.Tensor, k: torch.Tensor, a: dict, on: dict) -> torch.Tensor:
         """A read's attention scores [B, H, t + 1] (layer, query position t) from its stated query-key pairs: with q_t =
@@ -1541,6 +1615,7 @@ class GoalEval:
         step-budget adversary, larger budgets, fresh pool, N_real or leak, and no flips_to_break / flips_to_half."""
         if mode not in ("full", "reward"):
             raise ValueError("mode is full or reward")
+        pp_graphs = [strand(g, tx.targets, self.nat.C) for g in graphs]  # the path-patched terms take blocks as blocks
         graphs = [_c_graph(g, tx.targets, self.nat.C) for g in graphs]  # stranded nodes dropped before every family
         reward = mode == "reward"
         split = split or ("search" if reward else "eval")
@@ -1561,6 +1636,8 @@ class GoalEval:
         inter = self._interchange_family(tx, graphs, interchange, split=split, reads=reads) if interchange else none
         reals = self.real_removal(tx, graphs) if real and not reward else none
         chg = self.changed_inputs(tx, graphs, split, changed) if changed else none
+        tpp = self.track_pp(tx, pp_graphs, split, changed) if changed else none
+        ipp = self.interchange_pp(tx, pp_graphs, split, interchange) if interchange else none
         dns = self.donors(tx, graphs, split, near_donors, self.far_donors(tx, self.far_pool(split), far_donors) if far_donors else None) \
             if (near_donors or far_donors) else none
         nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real and not reward else none
@@ -1587,9 +1664,11 @@ class GoalEval:
             if it:
                 row["s_interchange"] = _fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
             row.update(chg[i])
+            row.update(tpp[i])
+            row.update(ipp[i])
             row.update(dns[i])
             named = [(k, row.get(k)) for k in ("s_point_c", "s_nodes", "s_edges")] + [("f1_flips_c", fc.get(FLIP_TERM))]
-            named += [(k, row.get(k)) for k in ("s_track", "s_interchange", "s_donor_near", "s_donor_far")]
+            named += [(k, row.get(k)) for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far")]
             row["c_terms"] = [k for k, v in named if v is not None]  # a family with nothing scored on the text is left out
             row["c"] = _harmonic([v for _, v in named if v is not None])
             if reward:  # the terms without the floor at 0 and C_rl, for RL's ranking within a group (the lead's 10-12)
@@ -1602,8 +1681,7 @@ class GoalEval:
                        "s_edges": _fid_raw(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
                        "f1_flips_c": min(x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None)
                        if kfl else None,
-                       "s_track": row.get("s_track_raw"),
-                       "s_interchange": _fid_raw(e0, it["kl_interchange_c"], it["kl_interchange_vpd"]) if it else None}
+                       "s_track_pp": row.get("s_track_pp_raw"), "s_interchange_pp": row.get("s_interchange_pp_raw")}
                 for pool_ in ("near", "far"):
                     k3 = row.get(f"kl_donor_{pool_}")
                     raw[f"s_donor_{pool_}"] = _fid_raw(k3[2], k3[0], k3[1]) if k3 else None
@@ -2359,11 +2437,13 @@ class GoalEval:
                                f"draws_donor_{pool}": [[name, c, v, z, sd] for (name, _), c, v, z, sd in zip(xs, kc, kv, k0, per)]})
         return out
 
-    def interchange_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16) -> list[dict]:
+    def interchange_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16, mode: str = "c") -> list[dict]:
         """The teachers' interchange agreement on one text, the search split alone (never a reward, gate or table's):
         per candidate circuit s_interchange on C's log scale, kl_interchange_c and kl_interchange_vpd. Candidates on the
         same positions share their draws, and every draw's changed prompt runs once for all of them. A node set
         without stated structure: native.Graph(nodes, complete=True)."""
+        if mode == "pp":  # the path-patched interchange, C's term (interchange_pp)
+            return self.interchange_pp(tx, graphs, "search", draws)
         e0 = self._bounds(tx, "live")[0]
         rows = self._interchange_family(tx, graphs, draws, split="search")
         return [dict(r, s_interchange=_fid(e0, r["kl_interchange_c"], r["kl_interchange_vpd"])) for r in rows]

@@ -1144,9 +1144,9 @@ def test_fidelity_reward_mode_is_the_full_modes_training_family(tiny):
     ev = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, interchange=4, changed=4)
     for i, (a, b, e) in enumerate(zip(full, rew, ev)):
         for key in ("s_point", "s_nodes", "s_edges", "reads_nodes", "reads_edges", "dreads_nodes", "dreads_edges",
-                    "s_changed", "s_track", "s_interchange", "s_donor_near", "s_donor_far", "c"):
+                    "s_changed", "s_track", "s_interchange", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "c"):
             assert (a[key] is None) == (b[key] is None) and (a[key] is None or abs(a[key] - b[key]) < 1e-6), key
-        keys = ("s_point_c", "s_nodes", "s_edges", "s_track", "s_interchange", "s_donor_near", "s_donor_far")
+        keys = ("s_point_c", "s_nodes", "s_edges", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far")
         terms = [b[k] for k in keys if b[k] is not None] + [b["f1_flips_c"][goal_eval.FLIP_TERM]]
         assert len(terms) == 8 and len(b["c_terms"]) == 8
         assert abs(b["c"] - (0.0 if min(terms) == 0 else 8 / sum(1 / t for t in terms))) < 1e-9
@@ -1417,7 +1417,7 @@ def test_reward_terms_unclipped_for_ranking(tiny):
         for k in row["c_terms"]:
             clipped = row["f1_flips_c"][goal_eval.FLIP_TERM] if k == "f1_flips_c" else row[k]
             raw = row["rl_terms"][k]
-            if k == "s_track":  # pooled over prompts: each prompt's floor removed, so the pool can only fall
+            if k in ("s_track_pp", "s_interchange_pp"):  # pooled over prompts: each prompt's floor removed, so the pool can only fall
                 assert raw <= clipped + 1e-9, (raw, clipped)
                 continue
             assert raw <= 1.0 and (abs(raw - clipped) < 1e-9 if clipped > 0 else raw <= 1e-12), (k, raw, clipped)
@@ -1494,6 +1494,34 @@ def test_path_patched_run(tiny):
     assert ge.changed_search(tx, [stated(sub)], draws=4, mode="pp")[0]["draws_track_pp"]
 
 
+
+def test_interchange_path_patched(tiny):
+    """interchange_pp: the circuit's nodes at p held at their values on the changed text, their stated paths carrying
+    them, everything else at x; the model's side is the real model with those activations replaced (naive()), a
+    stated graph with every connection its complete graph's run, VPD's answer scores 1, and it is C's term."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::2]
+    p = sorted({t for _, t, _ in sub if t > 0})[0]
+    x2 = list(tx.ids)
+    x2[p] = (x2[p] + 1) % 40
+    acts = naive(nat, x2)[1]["a"]
+    held = {nd: acts[nd[0]][nd[1], nd[2]] for nd in sub if nd[1] == p}
+    model = native.Graph([(n, t, goal_eval.BLOCK) for n in nat.names for t in range(tx.T)], complete=True)
+    full, _ = naive(nat, tx.ids)
+    want = naive(nat, tx.ids, replace=held)[0]
+    got = ge.pp_run(tx, tx.ids, model, fixed=held)
+    assert float(carry.kl(torch.log_softmax(want[tx.targets], -1)[None], got)[0]) < 1e-5
+    stated = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    a, c = ge.pp_run(tx, tx.ids, stated, fixed=held), ge.pp_run(tx, tx.ids, native.Graph(sub, complete=True), fixed=held)
+    assert float(carry.kl(c, a)[0]) < 1e-5
+    rows = ge.interchange_pp(tx, [native.Graph(masks=tx.vpd), stated], draws=4)
+    assert rows[0]["s_interchange_pp"] is None or abs(rows[0]["s_interchange_pp"] - 1) < 1e-6
+    assert rows[1]["draws_interchange_pp"] and ge.interchange_search(tx, [stated], 4, mode="pp")[0]["draws_interchange_pp"]
+    row = ge.fidelity(tx, [stated], None, draws=2, near_donors=0, far_donors=0, interchange=4, changed=4)[0]
+    assert "s_interchange_pp" in row["c_terms"] or row["s_interchange_pp"] is None
+    assert "s_track" not in row["c_terms"] and "s_interchange" not in row["c_terms"]
+
 def test_block_nodes(tiny):
     """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
     stranded by the same rules as a subcomponent of its site, and run by C's families as every subcomponent of the
@@ -1521,6 +1549,8 @@ def test_block_nodes(tiny):
     b = ge.fidelity(tx, [ex], None, draws=2, near_donors=0, far_donors=0)[0]
     assert a["s_point"] == b["s_point"] and a["s_nodes"] == b["s_nodes"]
     whole = native.Graph([(o1, 11, B), (d0, 11, 0)], complete=True)  # a node set with a block: its site's parts there
+    back, _ = goal_eval.circuit(goal_eval.to_json(whole), tx.targets, nat.C, tx.T)  # a node set's JSON ("complete")
+    assert back.complete and set(back.node_set()) == set(whole.node_set())
     flat = native.Graph([(o1, 11, c) for c in range(nat.C[o1])] + [(d0, 11, 0)], complete=True)
     assert set(goal_eval.expand_blocks(whole, nat.C).node_set()) == set(flat.node_set())
     assert ge.fidelity(tx, [whole], None, draws=2, near_donors=0, far_donors=0)[0]["s_point"] ==         ge.fidelity(tx, [flat], None, draws=2, near_donors=0, far_donors=0)[0]["s_point"]
@@ -1632,7 +1662,7 @@ def test_c_takes_the_lower_of_graph_and_every_connection(tiny):
         assert abs(f - goal_eval._fid(e0, kc, row["kl_flips_omitted"][m][1])) < 1e-6
         assert row["f1_flips_c"][m] == min(row["f1_flips_omitted"][m], f)
     terms = [row["s_point_c"], row["s_nodes"], row["s_edges"], row["f1_flips_c"][goal_eval.FLIP_TERM]]
-    terms += [row[k] for k in ("s_track", "s_interchange", "s_donor_near", "s_donor_far") if row[k] is not None]
+    terms += [row[k] for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far") if row[k] is not None]
     assert row["c"] == goal_eval._harmonic(terms)
 
 

@@ -179,9 +179,8 @@ def score(task: str):
         graphs.append(g)
         meta.append({"kind": "teacher", "name": task, "defects": d})
     pp = [goal_eval.strand(g, tx.targets, C) for g in graphs]
-    cg = [goal_eval._c_graph(g, tx.targets, C) for g in graphs]
     listed = sorted({g.count() for g in pp if g.count() > 0})
-    expanded = sorted({g.count() for g in cg if g.count() > 0})
+    expanded = sorted({cscore.node_set_graph(g, C).count() for g in pp if g.count() > 0})
     base = ge.baselines(tx, listed + expanded)
     for k in sorted(set(listed + expanded)):
         graphs.append(base[f"vpd@{k}"])

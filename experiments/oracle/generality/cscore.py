@@ -59,41 +59,68 @@ def _num(v):
     return float(v) if hasattr(v, "item") else v
 
 
+def node_set_graph(g, C) -> native.Graph:
+    """A graph's node set as a complete graph, its blocks as every subcomponent of their sites (no connection lists:
+    expand_blocks on a stated graph lists every block-to-block connection)."""
+    nodes = set()
+    for n, t, c in g.node_set():
+        if c == goal_eval.BLOCK:
+            nodes.update((n, t, j) for j in range(C[n]))
+        else:
+            nodes.add((n, t, c))
+    return native.Graph(sorted(nodes), complete=True)
+
+
 def score(ge, tx, graphs: list, draws: int = 16, near: int = goal_eval.DONORS_NEAR, far: int = goal_eval.DONORS_FAR) -> list[dict]:
+    """A stated graph with block nodes gets the path-patched terms (blocks as blocks) and s_wiring (its node set's masked
+    run) alone: in C's semantics its block-to-block connections expand into every pair of the sites' subcomponents (an
+    MLP output block into the next MLP input block alone is 11 million connections), beyond any engine here; its
+    complete form (every connection) is scored in full."""
     nat = ge.nat
     pp = [goal_eval.strand(g, tx.targets, nat.C) for g in graphs]
-    cg = [goal_eval._c_graph(g, tx.targets, nat.C) for g in graphs]
+    heavy = {i for i, g in enumerate(pp) if not g.complete and any(nd[2] == goal_eval.BLOCK for nd in g.node_set())}
+    cg = [node_set_graph(g, nat.C) if i in heavy else goal_eval._c_graph(g, tx.targets, nat.C) for i, g in enumerate(pp)]
+    light = [i for i in range(len(graphs)) if i not in heavy]
     e0 = ge._bounds(tx, "live")[0]
-    point = ge.sufficiency(tx, cg)
-    idx = [i for i, g in enumerate(cg) if not g.complete]
-    wired = dict(zip(idx, ge.sufficiency(tx, [native.Graph(sorted(cg[i].node_set()), complete=True) for i in idx])))
+    none = {"f1_live": None, "kl_live": None, "n_live": None}
+    point = dict(zip(light, ge.sufficiency(tx, [cg[i] for i in light]))) if light else {}
+    idx = [i for i, g in enumerate(cg) if not g.complete or i in heavy]
+    wired = dict(zip(idx, ge.sufficiency(tx, [cg[i] if i in heavy else native.Graph(sorted(cg[i].node_set()), complete=True)
+                                              for i in idx]))) if idx else {}
     tpp = ge.track_pp(tx, pp, "eval", draws)
     native.free(nat.dev)
     ipp = ge.interchange_pp(tx, pp, "eval", draws)
     native.free(nat.dev)
-    inter = ge._interchange_family(tx, cg, draws, split="eval")
+    inter = dict(zip(light, ge._interchange_family(tx, [cg[i] for i in light], draws, split="eval"))) if light else {}
     native.free(nat.dev)
-    dns = ge.donors(tx, cg, "eval", near, ge.far_donors(tx, ge.far_pool("eval"), far) if far else None, rows=goal_eval.DONOR_ROWS)
+    dns = dict(zip(light, ge.donors(tx, [cg[i] for i in light], "eval", near,
+                                    ge.far_donors(tx, ge.far_pool("eval"), far) if far else None, rows=goal_eval.DONOR_ROWS))) if light else {}
     native.free(nat.dev)
     scale = ge.size_scale(tx)
     out = []
     for i, (g, gp) in enumerate(zip(cg, pp)):
-        s_point = point[i]["f1_live"]
+        pt = point.get(i, none)
+        s_point = pt["f1_live"]
         s_wiring = wired[i]["f1_live"] if i in wired else s_point
+        it = inter.get(i)
         row = {"nodes": g.count(), "listed": gp.count(), "blocks": sum(1 for nd in gp.node_set() if nd[2] == goal_eval.BLOCK),
                "stranded": len(getattr(gp, "stranded", [])), "positions": len({t for _, t, _ in gp.node_set()}),
-               "kl_point": point[i]["kl_live"], "s_point": s_point, "s_wiring": s_wiring,
+               "families": "pp and wiring" if i in heavy else "all",
+               "kl_point": pt["kl_live"], "s_point": s_point, "s_wiring": s_wiring,
                "s_point_c": min(x for x in (s_point, s_wiring) if x is not None) if s_point is not None else None,
-               "n_live": point[i]["n_live"], "s_track_pp": tpp[i]["s_track_pp"], "prompts_track_pp": tpp[i]["prompts_track_pp"],
+               "n_live": pt["n_live"], "s_track_pp": tpp[i]["s_track_pp"], "prompts_track_pp": tpp[i]["prompts_track_pp"],
                "s_interchange_pp": ipp[i]["s_interchange_pp"],
-               "s_interchange": goal_eval._fid(e0, inter[i]["kl_interchange_c"], inter[i]["kl_interchange_vpd"])
-               if inter[i]["kl_interchange_c"] is not None else None,
-               "s_donor_near": dns[i].get("s_donor_near"), "s_donor_far": dns[i].get("s_donor_far")}
-        row["bits"] = goal_eval.size_bits(gp, nat.positions(tx.targets), sum(nat.C.values()), tx.targets)
+               "s_interchange": goal_eval._fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
+               if it and it["kl_interchange_c"] is not None else None,
+               "s_donor_near": dns.get(i, {}).get("s_donor_near"), "s_donor_far": dns.get(i, {}).get("s_donor_far")}
         row["bits_active"] = bits_active(ge, tx, gp)
+        # the scorecard's size_bits (a block at its active contents) for a stated graph; a complete graph's blocks it
+        # counts as one node each, so there the active expansion's (bits_active)
+        row["bits"] = (goal_eval.size_bits(gp, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd)
+                       if not gp.complete else row["bits_active"])
         row["size_active"] = goal_eval.size_term(row["bits_active"], scale) if scale else None
         row["vpd_answer_bits"] = scale
         terms = [row[k] for k in TERMS if row[k] is not None]
-        row["c5"] = goal_eval._harmonic(terms) if terms else None
+        row["c5"] = goal_eval._harmonic(terms) if terms and i not in heavy else None
         out.append({k: _num(v) for k, v in row.items()})
     return out

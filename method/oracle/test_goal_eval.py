@@ -1522,6 +1522,26 @@ def test_interchange_path_patched(tiny):
     assert "s_interchange_pp" in row["c_terms"] or row["s_interchange_pp"] is None
     assert "s_track" not in row["c_terms"] and "s_interchange" not in row["c_terms"]
 
+
+def test_true_pattern_family(tiny):
+    """pattern_family: the whole model with its own attention rows put back is the model; VPD's answer scores 1; a
+    circuit without an attention output has no reads to replace; fidelity reports s_pattern."""
+    nat, ge, tx = tiny
+    b = ge._pp_base(tx)
+    causal = torch.ones(tx.T, tx.T, dtype=torch.bool, device=nat.dev).tril()
+    real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i in range(2) for t in range(tx.T)}
+    model = native.Graph(masks={n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+    assert float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, model, rows=real))[0]) < 1e-5
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::2]
+    g = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    rows = ge.pattern_family(tx, [native.Graph(masks=tx.vpd), g, native.Graph([nd for nd in sub if "o_proj" not in nd[0]], {}, [])])
+    assert rows[0]["s_pattern"] is None or abs(rows[0]["s_pattern"] - 1) < 1e-6
+    assert rows[1]["reads_pattern"] == len({(native._name_layer_kind(n)[0], t) for n, t, _ in sub if "o_proj" in n})
+    assert rows[2]["s_pattern"] is None and rows[2]["reads_pattern"] == 0
+    row = ge.fidelity(tx, [g], None, draws=2, near_donors=0, far_donors=0, interchange=2, changed=2)[0]
+    assert row["s_pattern"] == rows[1]["s_pattern"]
+
 def test_block_nodes(tiny):
     """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
     stranded by the same rules as a subcomponent of its site, and run by C's families as every subcomponent of the

@@ -765,7 +765,8 @@ class GoalEval:
 
     def graph_ref(self, ids: list[int], targets: list[int], graph: native.Graph, u: dict | None = None, live: bool = True,
                   record: dict | None = None, patch: dict | None = None, cuts: dict | None = None,
-                  reads: list | None = None, norms: dict | None = None, freeze: str = "") -> torch.Tensor:
+                  reads: list | None = None, norms: dict | None = None, freeze: str = "",
+                  rows: dict | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of a stated graph's run in C's semantics (the lead's decision, 10-12):
         inside the circuit, graph semantics, each circuit node reading the full residual stream less the outputs of the
         circuit nodes that are not its stated parents (the background and its stated parents; a value's share through
@@ -783,7 +784,8 @@ class GoalEval:
         circuit's query and key nodes: the same intervention on the model and VPD's answer). norms: receives each
         RMSNorm's scale 1 / rms per position ({("attn" | "mlp", layer) or "final": [B, T or targets, 1]}); with
         freeze "layers" (every norm inside the layers) or "all" (the final norm too), those norms use the scales norms
-        holds instead (a run recorded first: the norm diagnostic)."""
+        holds instead (a run recorded first: the norm diagnostic). rows: {(layer, t): [H, t + 1]} attention rows used
+        in place of the run's own at those reads (pattern_family)."""
         import vpd_model
 
         nat, tg = self.nat, self.nat.target
@@ -865,6 +867,11 @@ class GoalEval:
                 S = S.clone()
                 S[:, :, t, :t + 1] = self._pair_row(i, t, keep, split, q, k, a, on)
             P = S.masked_fill(~causal, float("-inf")).softmax(-1)
+            if rows:  # reads given an attention row from outside (pattern_family: the real model's on the text)
+                P = P.clone()
+                for (layer, t), row in rows.items():
+                    if layer == i:
+                        P[:, :, t, :t + 1] = row
             att = (P @ v).transpose(1, 2).reshape(B, T, -1)
             share = lambda r, ws, att=att, P=P: att[:, r[1]] - sum(  # noqa: E731
                 P[:, :, r[1], w[1]].repeat_interleave(hd, dim=1) * write(w) for w in ws)
@@ -886,6 +893,36 @@ class GoalEval:
                 record[nd] = a[nd[0]][:, nd[1], nd[2]].detach()
         return torch.log_softmax((norm(xt, tg.ln_f, "final") @ tg.wte.T).float(), -1)
 
+
+    @torch.no_grad()
+    def pattern_family(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+        """s_pattern (the lead's 10-12, rustmove's 35f6ca0: C's semantics flatten attention, the q/k remainders
+        about 1% of the scores, so circuits fit near-uniform rows): each circuit's run in C's semantics (graph_ref)
+        with the reads it uses (a layer and position holding a circuit attention output) given the real model's
+        attention row on the text, all of them at once and each alone; VPD's answer the same; the mean KLs from the
+        model on C's log scale against KL_empty (s_pattern, _raw without the floor at 0). A circuit whose output
+        survives the model's true pattern uses attention as the model does. None for a circuit without an attention
+        output."""
+        b = self._pp_base(tx)
+        T = tx.T
+        causal = torch.ones(T, T, dtype=torch.bool, device=self.nat.dev).tril()
+        e0, v0 = self._bounds(tx, "live")
+        vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
+        out = []
+        for g in graphs:
+            reads = sorted({(native._name_layer_kind(n)[0], t) for n, t, _ in g.node_set() if native._name_layer_kind(n)[1] == "o_proj"})
+            if not reads or vpd is None:
+                out.append({"s_pattern": None, "s_pattern_raw": None, "kl_pattern_c": None, "kl_pattern_vpd": None, "reads_pattern": len(reads)})
+                continue
+            real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
+            draws = [real] + ([{r: real[r]} for r in reads] if len(reads) > 1 else [])
+            kc = [float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, g, rows=d))[0]) for d in draws]
+            kv = [float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, vpd, rows=d))[0]) for d in draws]
+            native.free(self.nat.dev)
+            c_, v_ = float(np.mean(kc)), float(np.mean(kv))
+            out.append({"s_pattern": _fid(e0, c_, v_), "s_pattern_raw": _fid_raw(e0, c_, v_), "kl_pattern_c": c_,
+                        "kl_pattern_vpd": v_, "reads_pattern": len(reads)})
+        return out
 
     @torch.no_grad()
     def _pp_base(self, tx: Text) -> dict:
@@ -1572,7 +1609,7 @@ class GoalEval:
                  steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE, fresh: dict | None = None,
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
                  changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
-                 far_donors: int = DONORS_FAR, baseline: bool = False) -> list[dict]:
+                 far_donors: int = DONORS_FAR, baseline: bool = False, pattern: bool = True) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -1638,6 +1675,7 @@ class GoalEval:
         chg = self.changed_inputs(tx, graphs, split, changed) if changed else none
         tpp = self.track_pp(tx, pp_graphs, split, changed) if changed else none
         ipp = self.interchange_pp(tx, pp_graphs, split, interchange) if interchange else none
+        pat = self.pattern_family(tx, graphs) if pattern else none  # s_pattern: a column beside s_point_c for now
         dns = self.donors(tx, graphs, split, near_donors, self.far_donors(tx, self.far_pool(split), far_donors) if far_donors else None) \
             if (near_donors or far_donors) else none
         nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real and not reward else none
@@ -1666,6 +1704,7 @@ class GoalEval:
             row.update(chg[i])
             row.update(tpp[i])
             row.update(ipp[i])
+            row.update(pat[i])
             row.update(dns[i])
             named = [(k, row.get(k)) for k in ("s_point_c", "s_nodes", "s_edges")] + [("f1_flips_c", fc.get(FLIP_TERM))]
             named += [(k, row.get(k)) for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far")]
@@ -3295,6 +3334,8 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             it = ge._interchange_family(tx, graphs, interchange, split="eval") if "interchange" in only else [{} for _ in graphs]
             dn = ge.donors(tx, graphs, far=ge.far_donors(tx, far)) if "donors" in only else [{} for _ in graphs]
             tp = ge.track_pp(tx, graphs, "eval", changed) if "track_pp" in only else [{} for _ in graphs]
+            if "pattern" in only:  # the true-pattern family, merged into the same rows
+                tp = [dict(a, **c) for a, c in zip(tp, ge.pattern_family(tx, [_c_graph(g, targets, nat.C) for g in graphs]))]
             ip = ge.interchange_pp(tx, graphs, "eval", interchange) if "interchange_pp" in only else [{} for _ in graphs]
             scale = ge.size_scale(tx)
             with open(out, "a") as fh:
@@ -3434,7 +3475,7 @@ def main():
     f.add_argument("--fresh", type=Path, help="a pattern pool no search drew from (evaluation only)")
     f.add_argument("--interchange", type=int, default=16)
     f.add_argument("--changed", type=int, default=16, help="changed texts per circuit (changed_inputs' eval split)")
-    f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp: those families alone, eval split (rows to merge by task and kind)")
+    f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp,pattern: those families alone, eval split (rows to merge by task and kind)")
     f.add_argument("--curve", default=",".join(str(x) for x in ADV_CURVE), help="the step adversary's budgets, e.g. 0,4,20,40,80,160,320")
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--draws", type=int, default=DRAWS)

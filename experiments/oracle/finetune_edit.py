@@ -127,8 +127,8 @@ def fit(ee, task, goal, site: str, positions: list[int], rank: int, steps: int, 
     for _ in range(steps):
         lq = logq(nat, seqs, site, A, B, mask)
         r = net_of(ee, task, goal, lq[:1], ref[:1], lq[1:], ref[1:])
-        if float(r["net"]) > best[0]:
-            best = (float(r["net"]), (A.detach().clone(), B.detach().clone()))
+        if float(r["net"].detach()) > best[0]:
+            best = (float(r["net"].detach()), (A.detach().clone(), B.detach().clone()))
         opt.zero_grad()
         (-r["net"]).backward()
         opt.step()

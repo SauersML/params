@@ -487,7 +487,7 @@ def http_reader(url: str, base: str, model: str = "vpd4l"):
     def generate(prompts: list[str]) -> list[dict]:
         if not prompts:
             return []
-        chat = [tk.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True, enable_thinking=False,
+        chat = [tk.apply_chat_template([{"role": "user", "content": escape(q)}], add_generation_prompt=True, enable_thinking=False,
                                        tokenize=False) for q in prompts]
         r = httpx.post(url, json={"model": base, "prompt": chat, "max_tokens": 1, "temperature": 0.0, "logprobs": 20},
                        timeout=600.0)
@@ -505,15 +505,23 @@ def english(text: str) -> str:
     return _sections(text).get("EXPLANATION", "")
 
 
-def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=None, size_weight: float = SIZE_WEIGHT,
-           carried_goal: float = CARRIED_GOAL, cache: dict | None = None) -> list[dict]:
+def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None]:
+    """Each answer's E1: the bits its escaped English saves the frozen reader on the text's reader events
+    (units.reader_events: other positions and the listed positions' second tokens, never the oracle's evidence)."""
+    import units
+
+    return reader.bits(task, [escape(english(x)) for x in texts], units.reader_events(ev["events"]))
+
+
+def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=None, e1: list | None = None,
+           size_weight: float = SIZE_WEIGHT, carried_goal: float = CARRIED_GOAL, cache: dict | None = None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each quality term, "size", goal_eval's row}. ranks: the
-    alternative-token ranks F2 uses (goal_eval's held-out ranks when None); reader: a reader.Reader for E1 (None: no
-    E1 term); ev: the text's evidence() (its questions, reader events and active count); cache: (task, ranks) ->
-    goal_eval.Text, kept between calls (a group's answers arrive in several calls)."""
+    alternative-token ranks F2 uses (goal_eval's held-out ranks when None); reader: a reader.Reader for E1, or e1: each
+    text's reader bits computed by the caller (e1_bits(); a Tinker reader lives with the policy); neither: no E1 term;
+    ev: the text's evidence() (its questions, reader events and active count); cache: (task, ranks) -> goal_eval.Text,
+    kept between calls (a group's answers arrive in several calls)."""
     import goal_eval
     import native
-    import units
 
     nat = ge.nat
     prompt = task["prompts"][0]
@@ -536,12 +544,13 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
             tx = ge.text(ids, targets, task=task)
             if cache is not None:
                 cache[key] = tx
-    e1 = {}
-    if reader is not None and keep:
-        evs = units.reader_events(ev["events"])
+    bits = {}
+    if e1 is not None:
+        bits = {texts[i]: e1[i] for i in keep}
+    elif reader is not None and keep:
         uniq = list(dict.fromkeys(texts[i] for i in keep))
-        e1 = dict(zip(uniq, reader.bits(task, [escape(english(x)) for x in uniq], evs)))
-    ge.hooks = {"E1": (lambda task, g, x: e1.get(x)) if reader is not None else None,
+        bits = dict(zip(uniq, e1_bits(reader, task, ev, uniq)))
+    ge.hooks = {"E1": (lambda task, g, x: bits.get(x)) if (reader is not None or e1 is not None) else None,
                 "E2": lambda task, g, x: qa_score(ev["qa"], parse(x)["finals"], tok)}
     rows = ge.score(tx, [graphs[i] for i in keep] + [native.Graph()], [texts[i] for i in keep] + [""]) if keep else []
     empty = rows[-1] if rows else None

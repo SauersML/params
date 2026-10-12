@@ -5,14 +5,16 @@ default) and the key from TINKER_API_KEY (read from the Keychain at launch, neve
 
   tinker_train.py sft SFT.jsonl --log DIR [--base Qwen/Qwen3-8B] [--steps N] [--batch B] [--lr LR] [--rank 32]
   tinker_train.py rl QUESTIONS.jsonl --log DIR --scorer http://127.0.0.1:8767/score [--init STATE_PATH] [--steps N]
-                     [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5]
+                     [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5] [--reader]
 
 SFT.jsonl: components.py dataset rows; QUESTIONS.jsonl: components.py questions rows. sft trains on the assistant
 message only (Qwen3's template with thinking disabled) and saves its state (DIR/state.json holds the tinker:// path).
 rl samples G answers per question with one call (the prompt's prefill shared), scores them with the scorer (F2's ranks
 drawn per question from 0 to 7, as the prime-rl taskset does), centres the rewards within each group, and trains with
 Tinker's "cispo" loss on the sampled tokens' log-probabilities. The next batch is sampled while the update runs (one
-step behind; cispo's ratio corrects it). Every call's tokens are counted and priced (PRICES, $ per million tokens:
+step behind; cispo's ratio corrects it). With --reader, E1 (the bits each answer's English saves a frozen reader)
+comes from a base-model sampling client on Tinker that is never trained (tinker_reader) and goes to the scorer with
+the answers. Every call's tokens are counted and priced (PRICES, $ per million tokens:
 prefill, sampled, trained; a cached prefill at 20%) into DIR/spend.jsonl, one line per call, and summed per step.
 """
 
@@ -52,6 +54,49 @@ class Spend:
         return usd
 
 
+def tinker_reader(service, base: str, renderer, tokenizer, spend: Spend):
+    """reader.Reader over a frozen base-model sampling client on Tinker (never trained: it holds no adapter): each
+    question's next-token log-probabilities of Yes and No (target_prompt_logprobs at the token after the chat
+    prompt), memoised by question (the no-English half repeats for every answer on a text)."""
+    import tinker
+    import torch
+    from tinker.types.tensor_data import TensorData
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import components
+    import reader
+    from prompt import tokens_of
+
+    sampler = service.create_sampling_client(base_model=base)
+    cands = {}
+    for word in ("Yes", "No", "yes", "no", " Yes", " No"):
+        ids = tokenizer.encode(word, add_special_tokens=False)
+        if len(ids) == 1:
+            cands[ids[0]] = word
+    ids = list(cands)
+    memo = {}
+
+    def generate(prompts: list[str]) -> list[dict]:
+        futs = {}
+        for q in prompts:
+            if q in memo or q in futs:
+                continue
+            toks = renderer.build_generation_prompt([{"role": "user", "content": components.escape(q)}]).to_ints() + [ids[0]]
+            target = torch.full((len(toks) - 1, len(ids)), -1, dtype=torch.int64)
+            target[-1] = torch.tensor(ids)
+            futs[q] = (len(toks), sampler.sample(prompt=tinker.types.ModelInput.from_ints(toks), num_samples=1,
+                                                  sampling_params=tinker.SamplingParams(max_tokens=1),
+                                                  target_prompt_logprobs=TensorData.from_torch_sparse(target, pad_value=-1)))
+        for q, (n, fut) in futs.items():
+            res = fut.result()
+            spend.add("reader", prefill=n - res.prompt_cache_hit_tokens, cached=res.prompt_cache_hit_tokens, sampled=1)
+            row = res.target_prompt_logprobs.to_torch()[-1].tolist()
+            memo[q] = {cands[i]: lp for i, lp in zip(ids, row)}
+        return [memo[q] for q in prompts]
+
+    return reader.Reader(generate, lambda xs: tokens_of("vpd4l", xs))
+
+
 def clients(base: str, rank: int, init: str | None):
     import tinker
     from tinker_cookbook import renderers
@@ -64,7 +109,7 @@ def clients(base: str, rank: int, init: str | None):
     training = (service.create_training_client_from_state(init) if init
                 else service.create_lora_training_client(base_model=base, rank=rank))
     tokenizer = get_tokenizer(base)
-    return tinker, training, renderers.get_renderer(RENDERER, tokenizer), tokenizer
+    return tinker, service, training, renderers.get_renderer(RENDERER, tokenizer), tokenizer
 
 
 def sft(a) -> None:
@@ -74,7 +119,7 @@ def sft(a) -> None:
 
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.log, a.base)
-    tinker, training, renderer, _ = clients(a.base, a.rank, None)
+    tinker, _, training, renderer, _ = clients(a.base, a.rank, None)
     rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
     data = [conversation_to_datum(r["prompt"] + r["completion"], renderer, a.max_length, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
             for r in rows]
@@ -108,8 +153,13 @@ def rl(a) -> None:
 
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.log, a.base)
-    tinker, training, renderer, _ = clients(a.base, a.rank, a.init)
+    tinker, service, training, renderer, tokenizer = clients(a.base, a.rank, a.init)
     questions = [json.loads(x) for x in a.questions.read_text().splitlines() if x.strip()]
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import components
+
+    frozen = tinker_reader(service, a.base, renderer, tokenizer, spend) if a.reader else None
+    tasks = {}
     rng = random.Random(a.seed)
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=renderer.get_stop_sequences())
     adam = tinker.AdamParams(learning_rate=a.lr, beta1=0.9, beta2=0.95, eps=1e-8)
@@ -135,7 +185,12 @@ def rl(a) -> None:
             spend.add("sample", prefill=n - hits, cached=hits + (a.group - 1) * n, sampled=sampled)
             texts = [renderers.get_text_content(renderer.parse_response(s.tokens)[0]) for s in res.sequences]
             t1 = time.time()
-            r = httpx.post(a.scorer, json={"task": q["task"], "answers": texts, "ranks": ranks}, timeout=None)
+            req = {"task": q["task"], "answers": texts, "ranks": ranks}
+            if frozen is not None:
+                if q["task"] not in tasks:
+                    tasks[q["task"]] = json.loads((a.texts_dir / f"{q['task']}.json").read_text())
+                req["e1"] = components.e1_bits(frozen, tasks[q["task"]], q, texts)
+            r = httpx.post(a.scorer, json=req, timeout=None)
             r.raise_for_status()
             scores = r.json()["scores"]
             rewards = [s["reward"] for s in scores]
@@ -201,6 +256,8 @@ def main():
     r.add_argument("--group", type=int, default=4)
     r.add_argument("--max-tokens", type=int, default=4096)
     r.add_argument("--lr", type=float, default=4e-5)
+    r.add_argument("--reader", action="store_true", help="E1 from a frozen base-model sampling client on Tinker")
+    r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     a = ap.parse_args()
     sft(a) if a.cmd == "sft" else rl(a)
 

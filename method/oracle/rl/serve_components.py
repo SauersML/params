@@ -6,12 +6,13 @@ goal_eval.Text is kept for the group's later requests. A text's requests always 
 
   serve_components.py ROWS.jsonl [--port 8767] [--workers 2] [--device cuda] [--size-weight 0.5]
                       [--reader http://127.0.0.1:8000/v1/completions --reader-base Qwen/Qwen3-4B]
-  POST /score {"task": TASK_ID, "answers": [TEXT, ...], "ranks": [r, r, r]}
+  POST /score {"task": TASK_ID, "answers": [TEXT, ...], "ranks": [r, r, r], "e1": [bits, ...] (optional)}
       -> {"scores": [{"reward", "valid", "F1", "F2", "F3", "E1", "E2", "size", "bits", "nodes", "edges", "f2_share"}, ...]}
   GET /health -> {"workers", "alive", "pending"}
 
-With --reader, E1 is the frozen base model's bits saved (components.http_reader: vLLM's OpenAI server holding the
-base model, never the policy); without, the reward has no E1 term.
+E1, the frozen base model's bits saved: given in the request (computed by the caller, as tinker_train.py's Tinker
+reader does), else from --reader (components.http_reader: vLLM's OpenAI server holding the base model, never the
+policy); with neither, the reward has no E1 term.
 ROWS: components.py questions output (each text's evidence: its questions and the size term's scale). ranks: the
 alternative-token ranks F2 measures (the taskset draws them per example from 0 to 7); omitted, goal_eval's held-out
 ranks.
@@ -54,13 +55,14 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
         groups = {}
         for rid, req in batch:
             ranks = tuple(req.get("ranks") or goal_eval.HELD_OUT_RANKS)
-            groups.setdefault((req["task"], ranks), []).append((rid, req["answers"]))
+            groups.setdefault((req["task"], ranks), []).append((rid, req["answers"], req.get("e1")))
         for (tid, ranks), reqs in groups.items():
             try:
                 if tid not in tasks:
                     tasks[tid] = json.loads((native.TEXTS / "vpd4l" / f"{tid}.json").read_text())
-                got = components.reward(ge, tasks[tid], rows[tid], [x for _, xs in reqs for x in xs], ranks=ranks,
-                                        size_weight=size_weight, cache=cache, reader=reader)
+                given = None if any(e is None for _, _, e in reqs) else [b for _, _, e in reqs for b in e]
+                got = components.reward(ge, tasks[tid], rows[tid], [x for _, xs, _ in reqs for x in xs], ranks=ranks,
+                                        size_weight=size_weight, cache=cache, reader=None if given else reader, e1=given)
                 while len(cache) > TEXTS_KEPT:
                     cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **{k[5:]: g[k] for k in g if k.startswith("term_")},
@@ -71,7 +73,7 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
             except Exception as e:  # a bad request answers with its error; the process keeps serving
                 got, err = None, f"{type(e).__name__}: {e}"
             at = 0
-            for rid, xs in reqs:
+            for rid, xs, _ in reqs:
                 outbox.put((rid, got[at:at + len(xs)] if got is not None else None, err))
                 at += len(xs)
 

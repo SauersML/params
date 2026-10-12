@@ -601,6 +601,15 @@ class Atlas:
                             "lowered": list(zip(self.decode(a["effect_down_token"][i, k].tolist()), a["effect_down_value"][i, k].float().tolist())),
                             "lens_corr": float(a["lens_effect_corr"][i, k]), "lens_top10_overlap": float(a["lens_effect_overlap"][i, k])})
         has_lens = int(a["lens_up_token"][i, 0]) >= 0
+
+        def readout(field, name):  # another lens's readout (lens.py), None where it has none
+            if f"{field}_up_token" not in a or int(a[f"{field}_up_token"][i, 0]) < 0:
+                return None
+            return {"lens": name, "raised": list(zip(tokens(f"{field}_up_token"), a[f"{field}_up_value"][i].float().tolist())),
+                    "lowered": list(zip(tokens(f"{field}_down_token"), a[f"{field}_down_value"][i].float().tolist()))}
+        logit = None if not has_lens else {"lens": "logit lens", "raised": list(zip(tokens("lens_up_token"), a["lens_up_value"][i].float().tolist())),
+                                           "lowered": list(zip(tokens("lens_down_token"), a["lens_down_value"][i].float().tolist()))}
+        routed = readout("routed", "routed lens (label-free)")
         return {
             "site": site, "index": index, "head": int(a["head"][i]),
             "active_rate": float(a["active_rate"][i]), "mean_ci": float(a["mean_ci"][i]), "heldout_rate": float(a["heldout_rate"][i]),
@@ -608,6 +617,8 @@ class Atlas:
                 "sign": int(a["lens_sign"][i]),
                 "raised": list(zip(tokens("lens_up_token"), a["lens_up_value"][i].float().tolist())),
                 "lowered": list(zip(tokens("lens_down_token"), a["lens_down_value"][i].float().tolist()))},
+            "readout": routed or logit,  # the main readout: the routed lens where it differs from the logit lens
+            "routed": routed, "jpp": readout("jpp", "J++ lens (supervised weights)"),
             "contexts": contexts,
             "trigger": {"precision": float(a["trigger_precision"][i]), "recall": float(a["trigger_recall"][i]),
                         "positions": float(a["trigger_positions"][i]), "base_rate": float(a["heldout_rate"][i])},

@@ -24,9 +24,10 @@ The J++ lens (Ayonrinde and Lindsey 2026, "J++ Lens: Jacobian Filtering Enables 
             holds no vocabulary-sized arrays;
   readout   tokens with at least one letter or digit (the paper's non-semantic filter), among those split A holds at
             least atlas.MIN_COUNT times.
-Also reported: the pooled LRP Jacobian (all clusters weighted by their sources: the R-lens) and the routed lens (each
+Also reported: the pooled LRP Jacobian (all clusters weighted by their sources: the R-lens), the routed lens (each
 sample read through its own cluster's expert, its residual at the point assigned by the router: the paper's k-means
-routing, which needs no labels). Every lens is read over the same tokens twice: the readout tokens above, and every
+routing, which needs no labels) and, after `routed`, the atlas's routed readout (each subcomponent through the
+mixture of the experts its top contexts are routed to: one map per subcomponent, as an atlas entry needs). Every lens is read over the same tokens twice: the readout tokens above, and every
 token split A holds at least atlas.MIN_COUNT times (no token filter), so the filter's gain and the Jacobian's separate.
 The J++ weights are supervised (fitted to our measured effects on the dev half); the logit, pooled and routed lenses
 use no labels. c_fc and down_proj of the last layer write at out_3, the final residual, where every lens is the logit
@@ -39,6 +40,7 @@ raised tokens; per site the medians and means. Where J++ beats the logit lens on
 it raises and lowers, oriented as the atlas's lens) goes into atlas.safetensors beside the logit lens.
 
   MPD_MEM_GIB=20 python -m method.vpd.lens fit [--tokens ROWS.npy] [--fit 0:64] [--cluster 64:264]
+  MPD_MEM_GIB=20 python -m method.vpd.lens routed [--tokens ROWS.npy]      the atlas's routed readout (routed())
   MPD_MEM_GIB=20 python -m method.vpd.lens evaluate [--tokens ROWS.npy]
 """
 from __future__ import annotations
@@ -232,6 +234,7 @@ def evaluate(args):
     sel = seen & semantic_tokens(V).to(dev)
     in_seen = sel[seen]  # the readout tokens among the seen ones
     routers = {p: Router(*(x.to(dev) for x in saved["routers"][p])) for p in POINTS}
+    static = torch.load(root / "lens" / "routed.pt")["weights"].to(dev) if (root / "lens" / "routed.pt").exists() else None
     pooled = {p: (saved["J"][p].double().sum(0) / saved["n"][p].sum()).float().to(dev) for p in POINTS}
     expert = {p: (saved["J"][p] / saved["n"][p].clamp_min(1)[:, None, None]).float().to(dev) for p in POINTS}  # [E, d, d]
     off = dict(zip(names, np.concatenate([[0], np.cumsum([meta["counts"][n] for n in names])])[:-1].tolist()))
@@ -247,7 +250,7 @@ def evaluate(args):
         y = r if Jm is None else (r @ Jm.transpose(-1, -2))
         return ((y * gf) @ target.wte.T)[..., tokens]
 
-    def routed(p, r, h):  # each sample through its own cluster's expert: [N, d] -> [N, V'] over the seen tokens
+    def per_sample(p, r, h):  # each sample through its own cluster's expert: [N, d] -> [N, V'] over the seen tokens
         Jn = expert[p][routers[p](h)]  # [N, d, d]
         return ((torch.einsum("nij,nj->ni", Jn, r) * gf) @ target.wte.T)[..., seen]
 
@@ -287,7 +290,12 @@ def evaluate(args):
                         stats[p].append([x.cpu() for x in pearson_stats(P.float(), full[:, sel].float())])
                         continue
                     preds = {"logit": readout(None, r, seen), "pooled": readout(pooled[p], r, seen),
-                             "routed": routed(p, r, pts[p][b, q]), "jpp": readout(weighted[p], r, seen)}
+                             "routed": per_sample(p, r, pts[p][b, q]), "jpp": readout(weighted[p], r, seen)}
+                    if static is not None:  # the atlas's main readout: the mixture of its top contexts' experts (the
+                        ws = static[cc.to(dev)]  # logit lens where it has no context, as the atlas falls back)
+                        y = torch.einsum("ne,eij,nj->ni", ws, expert[p], r)
+                        y = torch.where(ws.sum(-1, keepdim=True) > 0, y, r)
+                        preds["routed_static"] = ((y * gf) @ target.wte.T)[..., seen]
                     contrib = full[:, seen]
                     for lens_name, pr in preds.items():
                         for tokens, among in (("filtered", in_seen), ("all", None)):
@@ -336,6 +344,8 @@ def evaluate(args):
             table[name]["note"] = "the final residual: every lens is the logit lens (J = I), identical by construction"
     labels = {"logit": "logit lens (J = I), no labels", "pooled": "pooled LRP Jacobian (R-lens), no labels",
               "routed": "each sample through its own k-means cluster's expert, no labels",
+              "routed_static": "the atlas's main readout: each subcomponent through the mixture of the experts its top contexts are "
+                               "routed to (the logit lens without contexts), no labels",
               "jpp": f"J++: expert weights fitted (supervised) to the measured effects of dev rows {b0}..{mid - 1}",
               "filtered": "tokens with a letter or digit seen >= MIN_COUNT times in split A",
               "all": "every token seen >= MIN_COUNT times in split A", "evaluated": f"rows {mid}..{b1 - 1}"}
@@ -374,6 +384,85 @@ def evaluate(args):
     print(f"J++ readouts written for {len(wins)} sites: {wins}", flush=True)
 
 
+def routed(args):
+    """The routed lens as the atlas's readout of each subcomponent (lens/routed.pt and the atlas's routed_* fields):
+    its map is the mixture of its point's expert Jacobians in the proportions its top contexts (split A) are routed
+    to them, its readout over the tokens split A holds at least MIN_COUNT times (the logit lens's), oriented as the
+    atlas's lens. Subcomponents without contexts, q_proj and k_proj (no write), and the last layer's MLP (the final
+    residual: every lens is the logit lens) get none."""
+    from safetensors.torch import load_file, save_file
+    root, dev = Path(args.out), args.device
+    meta = json.loads((root / "atlas.json").read_text())
+    atlas = load_file(str(root / "atlas.safetensors"))
+    saved = torch.load(root / "lens" / "jacobians.pt")
+    target = VM.load_target(dev)
+    VM.load_vpd(target, dev)  # the subcomponents' write directions
+    names, total = meta["names"], meta["total"]
+    a0, a1 = meta["train_rows"]
+    V = target.wte.shape[0]
+    seen = (torch.bincount(tokens_of(a0, a1, args.tokens).reshape(-1), minlength=V) >= MIN_COUNT).to(dev)
+    if args.rows:  # a slice of split A's rows (a quick check)
+        a0, a1 = (int(x) for x in args.rows.split(":"))
+    routers = {p: Router(*(x.to(dev) for x in saved["routers"][p])) for p in POINTS}
+    expert = {p: (saved["J"][p] / saved["n"][p].clamp_min(1)[:, None, None]).float().to(dev) for p in POINTS}
+    off = dict(zip(names, np.concatenate([[0], np.cumsum([meta["counts"][n] for n in names])])[:-1].tolist()))
+    point = torch.full((total,), -1, dtype=torch.long)
+    for n in names:
+        p = point_of(int(n.split(".")[1]), n.rsplit(".", 1)[1])
+        if p is not None and p != "out_3":
+            point[off[n]:off[n] + meta["counts"][n]] = POINTS.index(p)
+    rows, pos = atlas["top_row"].long(), atlas["top_pos"].long()  # [total, TOP], absolute rows of split A
+    W = torch.zeros(total, E, dtype=torch.float64)
+    t0 = time.time()
+    with torch.no_grad():
+        for r0 in range(a0, a1, args.batch):
+            r1 = min(r0 + args.batch, a1)
+            m = (rows >= r0) & (rows < r1) & (point[:, None] >= 0)
+            if not m.any():
+                continue
+            _, pts = forward_points(target, tokens_of(r0, r1, args.tokens).to(dev), lrp=False)
+            c, k = m.nonzero(as_tuple=True)
+            for pi, p in enumerate(POINTS):
+                sel = point[c] == pi
+                if not sel.any():
+                    continue
+                lab = routers[p](pts[p][(rows[c[sel], k[sel]] - r0).to(dev), pos[c[sel], k[sel]].to(dev)]).cpu()
+                W.index_put_((c[sel], lab), torch.ones(int(sel.sum()), dtype=torch.float64), accumulate=True)
+            if (r0 - a0) // args.batch % 50 == 0:
+                print(f"{time.strftime('%H:%M:%S')} routed: rows {r0}..{r1}, {time.time() - t0:.0f} s", flush=True)
+    has = W.sum(1) > 0
+    W = W / W.sum(1, keepdim=True).clamp_min(1)
+    torch.save({"weights": W.float(), "point": point}, root / "lens" / "routed.pt")
+    up_t = torch.full((total, 10), -1, dtype=torch.int32)
+    dn_t = torch.full((total, 10), -1, dtype=torch.int32)
+    up_v = torch.zeros((total, 10), dtype=torch.float16)
+    dn_v = torch.zeros((total, 10), dtype=torch.float16)
+    sign = atlas["lens_sign"].float()
+    neg = torch.full((V,), -float("inf"), device=dev)
+    for n in names:
+        layer, kind = int(n.split(".")[1]), n.rsplit(".", 1)[1]
+        p = point_of(layer, kind)
+        if p is None or p == "out_3":
+            continue
+        r = write_directions(target, layer, kind)
+        for c0 in range(0, meta["counts"][n], 256):
+            sl = slice(off[n] + c0, off[n] + min(c0 + 256, meta["counts"][n]))
+            y = torch.einsum("ce,eij,cj->ci", W[sl].float().to(dev), expert[p], r[c0:c0 + 256])
+            w = ((y * target.ln_f) @ target.wte.T) * sign[sl, None].to(dev)
+            v, t = torch.where(seen[None], w, neg).topk(10, -1)
+            up_t[sl], up_v[sl] = t.int().cpu(), v.half().cpu()
+            v, t = torch.where(seen[None], -w, neg).topk(10, -1)
+            dn_t[sl], dn_v[sl] = t.int().cpu(), (-v).half().cpu()
+    for x in (up_t, dn_t):
+        x[~has] = -1
+    atlas.update({"routed_up_token": up_t, "routed_up_value": up_v, "routed_down_token": dn_t, "routed_down_value": dn_v})
+    save_file({k: v.contiguous() for k, v in atlas.items()}, str(root / "atlas.safetensors"))
+    meta["routed"] = {"subcomponents": int(has.sum()), "readout": "the main readout where present (Atlas.entry)",
+                      "fields": routed.__doc__}
+    (root / "atlas.json").write_text(json.dumps(meta, indent=1) + "\n")
+    print(f"routed readouts written for {int(has.sum())} subcomponents ({time.time() - t0:.0f} s)", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -391,8 +480,14 @@ def main():
     e.add_argument("--batch", type=int, default=8)
     e.add_argument("--device", default="cuda")
     e.add_argument("--rows", help="a slice A:B of split B instead of all of it (a quick check)")
+    r = sub.add_parser("routed")
+    r.add_argument("--out", default=str(DEFAULT))
+    r.add_argument("--tokens")
+    r.add_argument("--batch", type=int, default=8)
+    r.add_argument("--device", default="cuda")
+    r.add_argument("--rows", help="a slice A:B of split A's rows instead of all of them (a quick check)")
     args = ap.parse_args()
-    {"fit": fit, "evaluate": evaluate}[args.cmd](args)
+    {"fit": fit, "evaluate": evaluate, "routed": routed}[args.cmd](args)
 
 
 if __name__ == "__main__":

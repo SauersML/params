@@ -752,10 +752,11 @@ def scripted(env: Env, tids: list[str], out: Path, log=print) -> list[dict]:
     return res
 
 
-def tokens(rows: dict, tids: list[str], episodes: Path | None, base: str = "Qwen/Qwen3-8B", log=print) -> dict:
-    """Qwen3 tokens: the one-shot question (the rows' question in Qwen3's chat template) against an episode's opening
-    (system with the tool schemas and the short question) and, from episodes (scripted's output with messages), the
-    whole episode's context at its end."""
+def tokens(rows: dict, tids: list[str], episodes: Path | None, base: str = "Qwen/Qwen3-8B", pool: bool = False, log=print) -> dict:
+    """Qwen3 tokens: the one-shot question (the rows' question in Qwen3's chat template; pool: also the v2 question
+    with every VPD-active subcomponent at its positions, components.candidate_pool, needing the causal-importance
+    network) against an episode's opening (system with the tool schemas and the short question) and, from episodes
+    (scripted's output with messages), the whole episode's context at its end."""
     from transformers import AutoTokenizer
 
     tk = AutoTokenizer.from_pretrained(base)
@@ -772,6 +773,9 @@ def tokens(rows: dict, tids: list[str], episodes: Path | None, base: str = "Qwen
         one = count([{"role": "user", "content": rows[tid]["question"]}])
         opening = count([{"role": "system", "content": SYSTEM}, {"role": "user", "content": question(task, rows[tid])}], qwen3_tools())
         out[tid] = {"one_shot": one, "opening": opening}
+        if pool:
+            nat = nat if "nat" in dir() else native.Native()
+            out[tid]["one_shot_pool"] = count([{"role": "user", "content": components.question(task, components.candidate_pool(nat, task, rows[tid]))}])
         if tid in eps and eps[tid].get("messages"):
             msgs = [_hf_message(m) for m in eps[tid]["messages"]]
             out[tid]["episode"] = count(msgs, qwen3_tools())
@@ -856,6 +860,7 @@ def main():
     t.add_argument("rows")
     t.add_argument("--tasks", nargs="+", required=True)
     t.add_argument("--episodes")
+    t.add_argument("--pool", action="store_true", help="also the v2 question listing every VPD-active subcomponent")
     v = sub.add_parser("serve")
     v.add_argument("rows")
     v.add_argument("--port", type=int, default=8771)
@@ -865,7 +870,7 @@ def main():
     a = ap.parse_args()
     rows = _rows(a.rows)
     if a.cmd == "tokens":
-        tokens(rows, _tasks(a.tasks), Path(a.episodes) if a.episodes else None)
+        tokens(rows, _tasks(a.tasks), Path(a.episodes) if a.episodes else None, pool=a.pool)
         return
     env = Env(rows, goal_eval.GoalEval(native.Native(getattr(a, "device", None))), score_split=a.score_split)
     if a.cmd == "bench":

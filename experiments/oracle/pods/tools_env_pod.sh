@@ -17,8 +17,8 @@ fi
 RUN=$1 ROWS=$2 TASKS=$3
 N=oracle-graph-toolenv-$RUN
 O=/Users/user/mpd-data/runpod/$N
-F=/private/tmp/claude-501/-Users-user/b1063ff3-6750-418e-8406-23ae82bf968a/scratchpad/toolenv/in_$RUN
-V=/Users/user/mpd-data/vpd A=/Users/user/mpd-data/atlas/vpd4l
+F=/Users/user/mpd-data/scratch/toolenv/in_$RUN
+V=/Users/user/mpd-data/vpd A=/Users/user/mpd-data/atlas/vpd4l PA='~/mpd-data/atlas/vpd4l'  # PA: the atlas directory on the pod (naming the Mac's would upload all of it)
 I='~/mpd-data/in'
 W=${WORKERS:-2}
 rm -rf "$F" && mkdir -p "$F" && cp "$ROWS" "$F/rows.jsonl" || exit 1
@@ -43,8 +43,8 @@ RUNS=""
 for k in $(seq 0 $((W - 1))); do
   RUNS="$RUNS (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks \$(cat $F/tasks_$k.txt) --out $O/scripted_$k.jsonl --score-split ${SPLIT:-eval} > $O/scripted_$k.log 2>&1; echo \"exit \$?\" >> $O/scripted_$k.log) &"
 done
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $I ~/mpd-data/graph_oracle $A; \
-tar -xf $F/in.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $F/lens.tar -C $A; \
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $I ~/mpd-data/graph_oracle $PA; \
+tar -xf $F/in.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $F/lens.tar -C $PA; \
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors $A/atlas.json $A/atlas.safetensors /Users/user/params/method/vpd /Users/user/params/method/oracle > /dev/null; \
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader > $O/gpu_name.txt; \
@@ -54,7 +54,7 @@ python -m pytest -q -p no:cacheprovider method/oracle/test_tools_env.py > $O/tes
 python -u method/oracle/tools_env.py bench $I/rows.jsonl --tasks ${BENCH:-text9000,text9001} --score-split ${SPLIT:-eval} > $O/bench.log 2>&1; echo \"exit \$?\" >> $O/bench.log; \
 $RUNS wait; \
 cat $O/scripted_*.jsonl > $O/scripted.jsonl; \
-python -u method/oracle/tools_env.py tokens $I/rows.jsonl --tasks $TASKS --episodes $O/scripted.jsonl > $O/tokens.log 2>&1; echo \"exit \$?\" >> $O/tokens.log"
+python -u method/oracle/tools_env.py tokens $I/rows.jsonl --tasks $TASKS --episodes $O/scripted.jsonl --pool > $O/tokens.log 2>&1; echo \"exit \$?\" >> $O/tokens.log"
 RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-400} RP_OWNER=toolenv RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.6} \
   RP_MIN_VRAM_GB=${VRAM:-44} experiments/infra/runpod/rp-run $N "${GPU:-RTX A6000,A40,L40S,L40}" ${HOURS:-1.5} -- bash -c "$CMD"
 exit

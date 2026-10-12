@@ -18,7 +18,7 @@ cd /Users/user/params
 NAME=${1:-oracle-graph-edit} H=${2:-2}
 N=${N:-20} P=${P:-3} SPLIT=${SPLIT:-heldout}
 O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME V=/Users/user/mpd-data/vpd G=/Users/user/mpd-data/graph_oracle
-F=/Users/user/mpd-data/scratch/rustmove/edit/pod
+F=/Users/user/mpd-data/scratch/rustmove/edit/pod_$NAME  # per run: runs launched together keep their own inputs
 mkdir -p "$F"
 COPYFILE_DISABLE=1 tar -czf "$F/texts.tgz" -C $G texts/vpd4l
 COPYFILE_DISABLE=1 tar -czf "$F/teacher.tgz" -C $G teacher/joint_$SPLIT

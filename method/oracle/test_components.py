@@ -36,7 +36,7 @@ def test_parse_render_round_trip():
     assert p["explanation"] == "the value at 3 is copied to the last position."
     assert p["finals"] == {1: (True, "' the'")}
     assert len(p["answer"]["nodes"]) == 6 and len(p["answer"]["edges"]) == 5
-    text = components.render(p["answer"], p["finals"], {1: "the copied value is gone."})
+    text = components.render(p["answer"], p["finals"], {1: "the copied value is gone."}, ids=False)
     assert text.strip() == ANSWER.strip()
     assert components.parse(text)["answer"] == p["answer"]
 
@@ -47,14 +47,27 @@ def test_groups():
     assert p["malformed"] == 0
     assert len(p["answer"]["nodes"]) == 7
     assert len(p["answer"]["edges"]) == 2 + 2 * 3  # two into the prediction, every writer into both readers
-    again = components.parse(components.render(p["answer"]))
+    again = components.parse(components.render(p["answer"], ids=False))
     edges = lambda q: {(tuple(q["answer"]["nodes"][w]), "out" if r == "out" else tuple(q["answer"]["nodes"][r])) for w, r in q["answer"]["edges"]}  # noqa: E731
     assert edges(again) == edges(p)
-    assert "L1.down#2,9@5 <- L1.fc#1,7@5, L0.down#3@5" in components.render(p["answer"])
+    assert "L1.down#2,9@5 <- L1.fc#1,7@5, L0.down#3@5" in components.render(p["answer"], ids=False)
     assert components.parse("CIRCUIT:\nL1.down#2, 9@5 <- L1.fc#1@5\n")["malformed"] == 1
     block = components.parse("CIRCUIT:\n@4 L1.k#4,6 L0.q#2 tok\nL1.k#9@4\n")  # a position block, and a bare group
     assert block["malformed"] == 0 and len(block["answer"]["nodes"]) == 5 and not block["answer"]["edges"]
     assert components.render(block["answer"]).endswith("@4 L1.k#4,6,9 L0.q#2 tok")
+
+
+def test_short_ids():
+    text = ("EXPLANATION: x\nCIRCUIT:\n@9 a=L1.down#5 b=L1.fc#1 d=L1.fc#2 e=tok\n@4 f=L0.v#7\n"
+            "out <- a\na <- b,d\nb <- e\nd <- e, L0.down#3@9\n")
+    p = components.parse(text)
+    assert p["malformed"] == 0 and len(p["answer"]["nodes"]) == 6 and len(p["answer"]["edges"]) == 6
+    again = components.parse(components.render(p["answer"]))  # 6 edges over 6 nodes: rendered with ids
+    edges = lambda q: {(tuple(q["answer"]["nodes"][w]), "out" if r == "out" else tuple(q["answer"]["nodes"][r])) for w, r in q["answer"]["edges"]}  # noqa: E731
+    assert "=" in components.render(p["answer"]) and edges(again) == edges(p)
+    assert components.parse("CIRCUIT:\n@9 a=L1.down#5,6\n")["malformed"] == 1  # an id names one node
+    assert components.parse("CIRCUIT:\n@9 a=L1.down#5\n@8 a=L1.down#4\n")["malformed"] == 1  # and once
+    assert components.parse("CIRCUIT:\n@9 a=L1.down#5\nout <- zz\n")["malformed"] == 1  # an unknown id
 
 
 def test_escape_keeps_special_strings_text():

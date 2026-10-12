@@ -19,7 +19,7 @@ flowchart TB
     direction LR
     INPUT["<b>INPUT COVERAGE · CHECK</b><br/>codex + rustmove → training owner<br/>Audit: old prompts expose 14% of targets<br/>Output: coverage AFTER context fitting<br/>Decides: pool, representation, or tools"]
     TEACH["<b>TEACHER QUALITY · ACTIVE</b><br/>pymove + fleet → training owner<br/>Why: imitation cannot fix false targets<br/>Output: unseen-change fidelity + size<br/>Repair overfit draws and missing backups"]
-    SCORE["<b>REWARD CALIBRATION · ACTIVE</b><br/>codex + inframove + generality → primerl<br/>Why: old RL gained reward, lost fidelity<br/>Output: rank faithful vs corrupt controls<br/>Raw-score / duplicate fixes implemented"]
+    SCORE["<b>REWARD CALIBRATION · ACTIVE</b><br/>codex + inframove + generality → primerl<br/>Pilot: old teacher below bar on 4 of 4<br/>RL loses 3 of 4; one large outlier<br/>NEXT: explain outlier; rank corrupt controls"]
   end
   NOW --> INPUT
   NOW --> TEACH

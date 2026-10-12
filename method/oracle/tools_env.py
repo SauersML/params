@@ -688,6 +688,16 @@ def bench(env: Env, tids: list[str], log=print) -> dict:
         tools = env.text_tools(tid)
         setup = time.perf_counter() - t0
         ep = env.reset(tid)
+        log(f"{tid}: setup {setup:.1f} s", flush=True)
+        call = ep.call
+
+        def logged(name, args):
+            t1 = time.perf_counter()
+            res = call(name, args)
+            log(f"  {name} {time.perf_counter() - t1:.2f} s {res[:160]}", flush=True)
+            return res
+
+        ep.call = logged
         inf = json.loads(ep.call("influence", {"top": 8}))
         t = inf["target"]
         p1 = inf["positions"][0][0] if inf["positions"][0][0] != t else inf["positions"][1][0]
@@ -714,7 +724,7 @@ def bench(env: Env, tids: list[str], log=print) -> dict:
         score_s = time.perf_counter() - t1
         out[tid] = {"T": tools.T, "setup_s": round(setup, 2), "tools_s": {k: [round(x, 2) for x in v] for k, v in tools.seconds.items()},
                     "tau_s": round(tau_s, 2), "score_s": round(score_s, 2), "phi_start": tau.get("phi_start"), "phi": r.get("phi")}
-        log(json.dumps({tid: out[tid]}))
+        log(json.dumps({tid: out[tid]}), flush=True)
     return out
 
 

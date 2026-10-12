@@ -2,6 +2,7 @@
 goal_eval or native call it reports, errors returned to the policy, and the scripted baseline's episode end to end.
 
   MPD_MEM_GIB=4 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_tools_env.py -q
+  python method/oracle/test_tools_env.py      (without pytest: every test in order, the first failure stops)
 """
 
 import json
@@ -9,8 +10,14 @@ import math
 import sys
 from pathlib import Path
 
-import pytest
 import torch
+
+try:
+    import pytest
+
+    fixture = pytest.fixture(scope="module")
+except ImportError:  # a pod's environment without pytest: run as a script (main below)
+    fixture = lambda f: f  # noqa: E731
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -26,7 +33,7 @@ from test_goal_eval import tiny_native  # noqa: E402
 TID = "tinytext0"
 
 
-@pytest.fixture(scope="module")
+@fixture
 def env():
     nat = tiny_native(near=0.1)
     ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
@@ -137,3 +144,14 @@ def test_scripted_episode(env):
         assert bool(tx.vpd[m][t, c])
     assert [m["role"] for m in r["messages"][:2]] == ["system", "user"]
     assert all(m["role"] in ("assistant", "tool") for m in r["messages"][2:])
+
+
+if __name__ == "__main__":
+    import time
+
+    e = env.__wrapped__() if hasattr(env, "__wrapped__") else env()
+    for name, fn in [(k, v) for k, v in dict(globals()).items() if k.startswith("test_") and callable(v)]:
+        t0 = time.perf_counter()
+        fn(e)
+        print(f"{name} passed ({time.perf_counter() - t0:.1f} s)", flush=True)
+    print("all passed")

@@ -22,12 +22,12 @@ V=/Users/user/mpd-data/vpd A=/Users/user/mpd-data/atlas/vpd4l PA='~/mpd-data/atl
 I='~/mpd-data/in'
 W=${WORKERS:-2}
 rm -rf "$F" && mkdir -p "$F" && cp "$ROWS" "$F/rows.jsonl" || exit 1
-COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$F/in.tar" -C "$F" rows.jsonl \
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$F/in.tar" -C "$F" rows.jsonl \
   -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt || exit 1
-COPYFILE_DISABLE=1 tar -cf "$F/lens.tar" -C /Users/user/mpd-data/atlas/vpd4l lens/jacobians.pt lens/routed.pt || exit 1
-/usr/bin/python3 -I - "$TASKS" "$W" "$F" <<'EOF' || exit 1
-import sys, pathlib
-spec, w, F = sys.argv[1], int(sys.argv[2]), pathlib.Path(sys.argv[3])
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "$F/lens.tar" -C /Users/user/mpd-data/atlas/vpd4l lens/jacobians.pt lens/routed.pt || exit 1
+SLICES=$(/usr/bin/python3 -I - "$TASKS" "$W" <<'EOF'
+import sys
+spec, w = sys.argv[1], int(sys.argv[2])
 ts = []
 for part in spec.split(","):
     if ":" in part:
@@ -36,21 +36,21 @@ for part in spec.split(","):
     else:
         ts.append(part)
 assert not any(9100 <= int(t[4:]) <= 9149 for t in ts), "sealed texts"
-for k in range(w):
-    (F / f"tasks_{k}.txt").write_text(",".join(ts[k::w]))
+print(" ".join(",".join(ts[k::w]) for k in range(w)))
 EOF
+) || exit 1
+read -r -a SLICE <<< "$SLICES"
 RUNS=""
 for k in $(seq 0 $((W - 1))); do
-  RUNS="$RUNS (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks \$(cat $F/tasks_$k.txt) --out $O/scripted_$k.jsonl --score-split ${SPLIT:-eval} > $O/scripted_$k.log 2>&1; echo \"exit \$?\" >> $O/scripted_$k.log) &"
+  RUNS="$RUNS (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks ${SLICE[$k]} --out $O/scripted_$k.jsonl --score-split ${SPLIT:-eval} > $O/scripted_$k.log 2>&1; echo \"exit \$?\" >> $O/scripted_$k.log) &"
 done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $I ~/mpd-data/graph_oracle $PA; \
 tar -xf $F/in.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $F/lens.tar -C $PA; \
-ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors $A/atlas.json $A/atlas.safetensors /Users/user/params/method/vpd /Users/user/params/method/oracle > /dev/null; \
+ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors $A/atlas.json $A/atlas.safetensors $A/tokens_0_6000.npy /Users/user/params/method/vpd /Users/user/params/method/oracle > /dev/null; \
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader > $O/gpu_name.txt; \
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &); \
-cd /Users/user/params; (python -m pip install -q pytest || uv pip install -q --python \$(command -v python) pytest) > $O/pip.log 2>&1; \
-python -m pytest -q -p no:cacheprovider method/oracle/test_tools_env.py > $O/tests.log 2>&1; echo \"exit \$?\" >> $O/tests.log; \
+cd /Users/user/params/; python -u method/oracle/test_tools_env.py > $O/tests.log 2>&1; echo \"exit \$?\" >> $O/tests.log; \
 python -u method/oracle/tools_env.py bench $I/rows.jsonl --tasks ${BENCH:-text9000,text9001} --score-split ${SPLIT:-eval} > $O/bench.log 2>&1; echo \"exit \$?\" >> $O/bench.log; \
 $RUNS wait; \
 cat $O/scripted_*.jsonl > $O/scripted.jsonl; \

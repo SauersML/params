@@ -1549,7 +1549,7 @@ def main():
     s.add_argument("--labels", type=Path, help="locality JSONL: every figure also for local and non-local texts")
     s.add_argument("--diagnostics", action="store_true", help="structure() of each first sample (slow)")
     s.add_argument("--out", type=Path)
-    s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output: the best net per goal (E3)")
+    s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (scored with net): the best net per goal (E3)")
     args = ap.parse_args()
     import goal_eval
     import native
@@ -1715,7 +1715,7 @@ def main():
         import edit_eval
 
         ee = edit_eval.EditEval(nat)
-        edit_best = {k: ((r.get("teacher") or {}).get("score") or {}).get("net") for k, r in edit_teach(args.edit_teach).items()}
+        _, edit_best = edit_eval.bests(args.edit_teach)  # the best net per goal over the teacher and the baselines
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:

@@ -57,7 +57,7 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
         import edit_eval
 
         ee = edit_eval.EditEval(ge.nat)
-        edit_best = {k: ((r.get("teacher") or {}).get("score") or {}).get("net") for k, r in components.edit_teach(edit_teach).items()}
+        _, edit_best = edit_eval.bests(edit_teach)  # the best net per goal over the teacher and the baselines
     tasks, cache = {}, OrderedDict()
     while True:
         batch = [inbox.get()]

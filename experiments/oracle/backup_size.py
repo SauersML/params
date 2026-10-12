@@ -99,6 +99,7 @@ def size_backup(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=print) -> dict:
 
 
 def main():
+    global ROWS
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--split", default="heldout")
     ap.add_argument("--n", type=int, default=20)
@@ -108,7 +109,6 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--rows", type=int, default=ROWS, help="masked runs per batch (each a dense mask over every subcomponent)")
     args = ap.parse_args()
-    global ROWS
     ROWS = args.rows
     ge = goal_eval.GoalEval()
     nat = ge.nat

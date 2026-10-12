@@ -14,8 +14,10 @@ min under m flips (f1_flips_c), beside the raw graph F1 s_point, s_wiring, relia
 point N, N_real, C and C with flips, flips_to_half and flips_to_break, the smallest m at which the guarded F1 under m
 flips falls below 0.5 and below half of s_point_c, 512 when not within m <= 256; dreads_*, the response error under node
 removals, connection cuts and interchange, lower is better; s_changed, kl_changed_c and context_share on the eval split's
-changed inputs, 16 per circuit; s_track when goal_eval has it), overall and by locality, and each side's teacher against
-VPD's top k at its size (fidelity's "VPD top k" rows: VPD's own ranking, every connection among its nodes)
+changed inputs, 16 per circuit; s_track, s_interchange and the donor pools' means and 90th percentiles when goal_eval has
+them), overall and by locality, and each side's teacher against VPD's top k at its size (fidelity's "VPD top k" rows:
+VPD's own ranking, every connection among its nodes) with the v2 rule (s_track and donors not below VPD's top k, answers
+within MAX_NODES; the summaries' answer tokens against MAX_TOKENS)
 (heldout50_locality.jsonl).
 
   experiments/oracle/teacher_gate.py SCORE.json A B [--fields f1_live,n_live,...] [--teacher DIR_A DIR_B]
@@ -27,6 +29,7 @@ import json
 import random
 from pathlib import Path
 
+MAX_NODES, MAX_TOKENS = 266, 3500   # the answer budget (teacher.MAX_NODES, components.ANSWER_BUDGET)
 FIELDS = ("f1_live", "n_live", "f3", "stranded", "f1_off", "n_off", "bits", "nodes", "changed_recovered_live", "f2_recovered_live", "carry_completeness",
           "n_real_live")
 
@@ -45,7 +48,8 @@ def summaries(d: Path) -> dict:
             if line.strip():
                 r = json.loads(line)
                 best = r.get("best") or r.get("pick") or {}            # teacher.py's "best"; teacher_v3's may lack some fields
-                out[r["task"]] = {**{k: best.get(k) for k in ("f1", "n", "reward", "size", "positions")}, "seconds": r.get("seconds")}
+                out[r["task"]] = {**{k: best.get(k) for k in ("f1", "n", "reward", "size", "positions")}, "seconds": r.get("seconds"),
+                                  "answer_tokens": r.get("answer_tokens"), "answer_nodes": r.get("answer_nodes")}
     return out
 
 
@@ -110,7 +114,11 @@ def main():
     if args.teacher:
         SA, SB = summaries(args.teacher[0]), summaries(args.teacher[1])
         print(f"teacher.py summaries (node semantics): {len(set(SA) & set(SB))} texts in both")
-        compare(SA, SB, args.a, args.b, ("f1", "n", "reward", "size", "positions", "seconds"))
+        compare(SA, SB, args.a, args.b, ("f1", "n", "reward", "size", "positions", "seconds", "answer_tokens"))
+        for side, S in ((args.a, SA), (args.b, SB)):
+            tok = [r["answer_tokens"] for r in S.values() if r.get("answer_tokens") is not None]
+            if tok:
+                print(f"answers of {side}: largest {max(tok)} tokens, {sum(x > MAX_TOKENS for x in tok)} of {len(tok)} over {MAX_TOKENS}")
         RA, RB = roles(args.teacher[0]), roles(args.teacher[1])
         print(f"circuits' connections: {len(set(RA) & set(RB))} texts in both")
         compare(RA, RB, args.a, args.b, ("stranded", "role_share", "nodes", "edges"))
@@ -141,8 +149,8 @@ def main():
             local = {json.loads(x)["task"]: json.loads(x)["local"] for x in args.labels.read_text().splitlines() if x.strip()}
         fields = ("flipc_1", "flipc_4", "flipc_16", "flipc_64", "flipc_256", "flips_to_half", "flips_to_break", "s_point_c", "n_point",
                   "n_real", "s_point", "s_wiring", "reliance_on_cuts", "flip_1", "flip_4", "dreads_edges", "dreads_nodes",
-                  "dreads_interchange", "s_changed", "kl_changed_c", "context_share", "s_track", "c", "c_flips", "stranded",
-                  "nodes", "size")
+                  "dreads_interchange", "s_changed", "kl_changed_c", "context_share", "s_track", "s_interchange", "s_donor_near",
+                  "s_donor_near_p90", "s_donor_far", "s_donor_far_p90", "c", "c_flips", "stranded", "nodes", "positions", "size")
         for name, keep in (("all", lambda t: True), ("non-local", lambda t: local.get(t) is False), ("local", lambda t: local.get(t) is True)):
             ts = [t for t in set(FA) & set(FB) if keep(t)]
             if ts:
@@ -154,13 +162,20 @@ def main():
                     kept = all(v.get(f) != "B lower" for f in ("s_point_c", "n_point"))
                     print(f"rule (guarded): flipc_1 and flipc_4 higher {'yes' if up else 'NO'}; s_point_c and point N not lower "
                           f"{'yes' if kept else 'NO'} -> {'PASS' if up and kept else 'FAIL'} (answers within the budget: answer_tokens.py)")
-        vfields = ("flipc_1", "flipc_4", "flips_to_half", "s_nodes", "s_edges", "n_real", "s_point_c", "n_point", "s_point", "dreads_edges", "c_flips")
+        vfields = ("flipc_1", "flipc_4", "flips_to_half", "s_nodes", "s_edges", "n_real", "s_point_c", "n_point", "s_point", "dreads_edges",
+                   "s_track", "s_changed", "s_interchange", "s_donor_near", "s_donor_near_p90", "s_donor_far", "s_donor_far_p90", "c", "c_flips")
         for side, kind, F in ((args.a, "a", FA), (args.b, "b", FB)):
             V = fid(kind, vpd=True)
             ts = sorted(set(F) & set(V))
             if ts:
                 print(f"{side} against VPD's top k at its sizes (A = VPD top k, B = {side}): {len(ts)} texts")
-                compare({t: V[t] for t in ts}, {t: F[t] for t in ts}, "VPD top k", side, vfields)
+                v = {}
+                compare({t: V[t] for t in ts}, {t: F[t] for t in ts}, "VPD top k", side, vfields, v)
+                held = [f for f in ("s_track", "s_donor_near", "s_donor_far") if f in v]
+                big = [t for t in ts if (F[t].get("nodes") or 0) > MAX_NODES]
+                print(f"v2 rule for {side}: " + (f"{', '.join(held)} not below VPD's top k {'yes' if all(v[f] != 'B lower' for f in held) else 'NO'}"
+                                                   if held else "no s_track or donor rows (NO)")
+                      + f"; answers within {MAX_NODES} nodes {'yes' if not big else f'NO ({len(big)} over)'} (tokens: the summaries' line above)")
     print("per text (f1_live, n_live, nodes):")
     for t in tasks:
         a, b = A[t], B[t]

@@ -3,7 +3,8 @@
 # held-out texts, compared text by text. Each of A and B is a directory of circuits (<task>.json, e.g. another search's) or
 # COMMIT[,FLAG...] (a commit on origin/main and teacher.py flags, comma-separated, a comma inside a flag's value written
 # :: as in --edge-levels,writer::connection: 787320c,--edges,--f1-start,both;
-# v3@COMMIT[,FLAG...] runs teacher_v3.py, one process per card on V3PODS pods), which teacher_pod.sh teaches on pods (VPD's
+# v3@COMMIT[,FLAG...] runs teacher_v3.py, one process per card on V3PODS pods; reads@COMMIT[,FLAG...] teacher_reads.py,
+# READP per card on READPODS pods), which teacher_pod.sh teaches on pods (VPD's
 # answers from vpd_heldout20.pt) into ~/mpd-data/graph_oracle/teacher/gate/NAME/a or b, both at once. Then one pod scores
 # both sets with goal_eval.py score --diagnostics (VPD's checkpoint put back together on the pod: VPD's own answers, the
 # baselines) and goal_eval.py fidelity on both sets in one run (C, adversary_flips' omitted lever, the guarded scores,
@@ -11,7 +12,7 @@
 # pattern lever goal_eval/ci_patterns_fresh.pt), sharded over FIDP processes beside the score run, and
 # experiments/oracle/teacher_gate.py compares them. The scores come back to
 # ~/mpd-data/runpod/oracle-graph-teacher-gscore-NAME/ (score.json, fid_<k>.jsonl), the comparison to gate.txt.
-#   experiments/oracle/pods/teacher_gate.sh NAME A B   (env: N, PODS, P per side, V3PODS, VRAM; FIDP, GPU, PRICE; the
+#   experiments/oracle/pods/teacher_gate.sh NAME A B   (env: N, PODS, P per side, V3PODS, READPODS, READP, VRAM; FIDP, GPU, PRICE; the
 #   adversary's search pool goes to the teaching pods for --repair, --edge-objective robust and teacher_v3)
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -30,7 +31,10 @@ for side in a b; do
   IFS=, read -r ref flags <<< "$spec"
   flags=${flags//,/ } flags=${flags//::/,}               # a comma inside one flag's value is written ::
   script=teacher.py pods=${PODS:-2} procs=${P:-4}
-  case $ref in v3@*) ref=${ref#v3@} script=teacher_v3.py pods=${V3PODS:-4} procs=1 ;; esac
+  case $ref in
+    v3@*) ref=${ref#v3@} script=teacher_v3.py pods=${V3PODS:-4} procs=1 ;;
+    reads@*) ref=${ref#reads@} script=teacher_reads.py pods=${READPODS:-4} procs=${READP:-2} ;;
+  esac
   C=$(git rev-parse --verify "$ref^{commit}") || exit 2
   echo "$side: $script at ${C:0:10} $flags" | tee -a "$G/README.txt"
   SCRIPT=$script RUN=g$NAME$side REF=$C TEACHER_ARGS="$flags" SPLIT=heldout N=$N PODS=$pods P=$procs VRAM=${VRAM:-16} GPU="$GPU" \

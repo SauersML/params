@@ -320,6 +320,7 @@ class Native:
         self.names = self.vpd.names
         self.C = self.vpd.C
         self._consts: dict = {}  # zero and one ablations, full plans, causal masks: built once, never written
+        self._lengths: OrderedDict = OrderedDict()  # sequence length -> its _consts keys, least recently used first
         self._rec: tuple = (None, None, None)  # the last text's whole-model run: (ids, (activations, states), states per batch size)
         self._refs: OrderedDict = OrderedDict()  # reference()'s results by (sequences, targets), least recently used first
         self._refs_bytes = 0
@@ -500,7 +501,19 @@ class Native:
             o += s
         return out
 
+    LENGTHS_KEPT = 4  # sequence lengths whose plans, masks and ones _const keeps (each holds ~[B, T, C] tensors)
+
     def _const(self, key, make):
+        """A tensor (or tree of them) built once by make() and kept. Entries for a sequence length (keys whose first
+        element is "full", "ones" or "causal" and second the length) are kept for the LENGTHS_KEPT lengths used last:
+        a loop over texts of many lengths otherwise holds every length's plans (~25 MB a text on vpd4l)."""
+        if isinstance(key, tuple) and key[0] in ("full", "ones", "causal"):
+            keys = self._lengths.setdefault(key[1], set())
+            self._lengths.move_to_end(key[1])
+            keys.add(key)
+            while len(self._lengths) > self.LENGTHS_KEPT:
+                for k in self._lengths.popitem(last=False)[1]:
+                    self._consts.pop(k, None)
         if key not in self._consts:
             self._consts[key] = make()
         return self._consts[key]

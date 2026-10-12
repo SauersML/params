@@ -8,8 +8,8 @@
 # Everything comes back to ~/mpd-data/runpod/NAME/out.
 # FROM=DIR (an earlier run's out directory): its goals and finished teach rows go up first, and the goals done there
 # are skipped.
-# ONLY="1 2" runs those of the P processes alone; COPY=0 leaves out the copy goal.
-#   experiments/oracle/pods/edit_pod.sh [NAME] [HOURS]      env: N, P, FROM, ONLY, COPY, GPU, PRICE
+# ONLY="1 2" runs those of the P processes alone; COPY=0 leaves out the copy goal, TEACH=0 the held-out goals.
+#   experiments/oracle/pods/edit_pod.sh [NAME] [HOURS]      env: N, P, FROM, ONLY, COPY, TEACH, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -35,6 +35,7 @@ for k in ${ONLY:-$(seq 0 $((P - 1)))}; do
   RUNS="$RUNS (python -B edit_eval.py teach $O/out/goals.jsonl $O/out/teach_$k.jsonl --offset $k --stride $P > $O/teach_$k.log 2>&1; echo \"exit \$?\" >> $O/teach_$k.log) &"
   ROWS="$ROWS $O/out/teach_$k.jsonl"
 done
+[ "${TEACH:-1}" = 0 ] && RUNS=""
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out;
 python -m pip install -q safetensors pyyaml tokenizers scipy pytest;
 tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle; tar -xzf $F/teacher.tgz -C ~/mpd-data/graph_oracle;

@@ -297,26 +297,69 @@ class Engine:
             self._u0 = {n: torch.zeros(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
         return self._u0
 
+    def _last_tables(self, p: dict) -> tuple:
+        """A plan's tables for the last layer run at the targets alone (search steps): its query, attention-output and
+        MLP readers and writers kept at the targets with their positions as target indices, the connections into or
+        out of the others dropped (they reach nothing the prediction reads), the attention-output readers' pattern rows
+        the targets' (kept on the plan)."""
+        if "_last" not in p:
+            dev, L = self.dev, self.tg.n_layer - 1
+            S = {native.site_name(L, k) for k in ("q_proj", "o_proj", "c_fc", "down_proj")}
+            tpos = torch.full((self.T,), -1, dtype=torch.long, device=dev)
+            tpos[self._targets] = torch.arange(len(self.targets), device=dev)
+            R, Wr, rmap, wmap = dict(p["readers"]), dict(p["writers"]), {}, {}
+            for table, maps, src in ((R, rmap, p["readers"]), (Wr, wmap, p["writers"])):
+                for n in S & set(src):
+                    b, t, c = src[n]
+                    ti = tpos[t]
+                    keep = ti >= 0
+                    table[n] = (b[keep], ti[keep], c[keep])
+                    m = torch.full((len(b),), -1, dtype=torch.long, device=dev)
+                    m[keep] = torch.arange(int(keep.sum()), device=dev)
+                    maps[n] = m
+            Eg = {}
+            for (rn, wn), (ri, wi, j, fx) in p["edges"].items():
+                keep = torch.ones(len(ri), dtype=torch.bool, device=dev)
+                if rn in rmap:
+                    keep &= rmap[rn][ri] >= 0
+                if wn in wmap:
+                    keep &= wmap[wn][wi] >= 0
+                if bool(keep.any()):
+                    Eg[(rn, wn)] = ((rmap[rn][ri] if rn in rmap else ri)[keep], (wmap[wn][wi] if wn in wmap else wi)[keep], j[keep], fx[keep])
+            out = {}
+            for wn, (b, ti, wi, j, fx) in p["out"].items():  # residual writers at the targets: every one kept
+                out[wn] = (b, ti, wmap[wn][wi] if wn in wmap else wi, j, fx)
+            p["_last"] = (R, Wr, Eg, out, S)
+        return p["_last"]
+
     def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None, rec: tuple | None = None) -> torch.Tensor:
+        """The final normed residual stream at the targets [B, len(targets), d] of the graph runs. fused (a search's
+        steps): torch's fused norms and GELU, and the last layer's queries, attention output and MLP at the targets
+        alone (with reads, every position)."""
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         norm, act = self._steps(fused)
-        R, Wr, Eg = p["readers"], p["writers"], p["edges"]
+        R, Wr, Eg, outs = p["readers"], p["writers"], p["edges"], p["out"]
         c = p["semantics"] == "c"
         if c:  # the circuit's nodes at 1 in the stream, every other subcomponent at u
             one = torch.ones((), device=self.dev)
             u = {n: m.expand(B, T, -1).index_put(p["nodes"][n], one) if n in p["nodes"] else m for n, m in u.items()}
+        narrow = fused and rec is None
+        sel, S = None, set()  # the last layer's positions (the targets) and its sites that run only there
         aw, sw = {}, {}  # per writer site, its writer rows' activations and 1 - u
+
+        def cut(n, m):  # site n's [B or 1, T or 1, ...] tensor at the positions its steps run on
+            return m[:, sel] if n in S and m.shape[1] > 1 else m
 
         def at(m, b, t, c):  # a mask [B or 1, T or 1, K] at rows' (row, position, column)
             return m[b if m.shape[0] > 1 else torch.zeros_like(b), t if m.shape[1] > 1 else torch.zeros_like(t), c]
 
         def done(n, A):  # a site's activations [B, T, K], patched: its writer nodes' kept, the asked ones read
             if patch is not None and n in patch:
-                A = torch.where(patch[n][0], patch[n][1].to(A.dtype), A)
+                A = torch.where(cut(n, patch[n][0]), cut(n, patch[n][1]).to(A.dtype), A)
             if rec is not None and n in rec[0]:
                 rec[1][n] = A[rec[0][n]].float()
             if n in Wr:
-                aw[n], sw[n] = A[Wr[n]], 1 - at(u[n], *Wr[n])
+                aw[n], sw[n] = A[Wr[n]], 1 - at(cut(n, u[n]), *Wr[n])
             return A
 
         def share(wn, wi, e):  # a connection's extra share in its reader's input: native e (1 - u_w) a_w, C -(1 - e) a_w
@@ -343,13 +386,17 @@ class Engine:
         x = self.emb.expand(B, -1, -1)
         for i in range(tg.n_layer):
             name = lambda k: native.site_name(i, k)  # noqa: E731
+            if narrow and i == tg.n_layer - 1:  # the last layer: keys and values at every position, the rest at the targets
+                R, Wr, Eg, outs, S = self._last_tables(p)
+                sel = self._targets
             n1, n2 = tg.norms[2 * i], tg.norms[2 * i + 1]
             h = norm(x, n1)
             A = {}
             for kd in ("q_proj", "k_proj", "v_proj"):
                 n = name(kd)
-                a = h @ self.V[n]
-                A[kd] = done(n, read(n, a, resid_in(n, x, n1)) if n in R else a)
+                hn, xn = (h[:, sel], x[:, sel]) if n in S else (h, x)
+                a = hn @ self.V[n]
+                A[kd] = done(n, read(n, a, resid_in(n, xn, n1)) if n in R else a)
 
             def out(kd, z, scale):
                 n = name(kd)
@@ -358,41 +405,57 @@ class Engine:
 
             def scale(kd):  # query and key nodes at 1 in the pattern
                 n = name(kd)
-                return u[n].expand(B, T, -1).index_put(p["qk"][n], torch.ones((), device=self.dev)) if n in p["qk"] else u[n]
+                m = u[n].expand(B, T, -1).index_put(p["qk"][n], torch.ones((), device=self.dev)) if n in p["qk"] else u[n]
+                return cut(n, m)
 
-            heads = lambda y: y.view(B, T, H, hd).transpose(1, 2)  # noqa: E731
-            q, k = tg._rope(heads(out("q_proj", h, scale("q_proj"))), T), tg._rope(heads(out("k_proj", h, scale("k_proj"))), T)
-            nv, no = name("v_proj"), name("o_proj")
-            y = F.scaled_dot_product_attention(q, k, heads(out("v_proj", h, u[nv])), is_causal=True).transpose(1, 2).reshape(B, T, -1)
+            heads = lambda y: y.reshape(B, y.shape[1], H, hd).transpose(1, 2)  # noqa: E731
+            nq, nv, no = name("q_proj"), name("v_proj"), name("o_proj")
+            k = tg._rope(heads(out("k_proj", h, scale("k_proj"))), T)
+            v = heads(out("v_proj", h, u[nv]))
+            if nq in S:  # rotary at the targets, each target's query over the keys up to it
+                q = heads(out("q_proj", h[:, sel], scale("q_proj")))
+                half = hd // 2
+                q = q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._causal_targets)
+            else:
+                q = tg._rope(heads(out("q_proj", h, scale("q_proj"))), T)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).reshape(B, y.shape[2], -1)
             a = y @ self.V[no]
             if no in R:
                 b, t, _ = R[no]
                 inp = y[b, t].float()
                 if any(r == no for r, _ in Eg):  # the pattern at the readers' positions [B, H, positions, T]
-                    pos, idx = p["positions"][no]
-                    z = (q[:, :, pos] @ k.transpose(-1, -2)) / math.sqrt(hd)
-                    P = z.masked_fill(torch.arange(T, device=self.dev)[None, :] > pos[:, None], float("-inf")).softmax(-1)
+                    if no in S:  # the queries are the targets'
+                        P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~self._causal_targets, float("-inf")).softmax(-1)
+                        idx = t
+                    else:
+                        pos, idx = p["positions"][no]
+                        z = (q[:, :, pos] @ k.transpose(-1, -2)) / math.sqrt(hd)
+                        P = z.masked_fill(torch.arange(T, device=self.dev)[None, :] > pos[:, None], float("-inf")).softmax(-1)
                     for wn, ri, wi, s in shares(no):
                         pat = P[b[ri], :, idx[ri], Wr[wn][1][wi]]  # [n, H]: how much each reader's position attends to its writer's
                         inp = _add_rows(inp, ri, s, lambda k, pat=pat, wn=wn, wi=wi:
                                         pat[k].repeat_interleave(hd, -1) * self.U[nv].index_select(0, Wr[wn][2][wi[k]]))
                 a = read(no, a, inp)
             A["o_proj"] = done(no, a)
-            x = x + out("o_proj", y, u[no])
+            if no in S:
+                x = x[:, sel]
+            x = x + out("o_proj", y, cut(no, u[no]))
             h = norm(x, n2)
             nf, nd = name("c_fc"), name("down_proj")
             a = h @ self.V[nf]
             A["c_fc"] = done(nf, read(nf, a, resid_in(nf, x, n2)) if nf in R else a)
-            pre = out("c_fc", h, u[nf])
+            pre = out("c_fc", h, cut(nf, u[nf]))
             g = act(pre)
             a = g @ self.V[nd]
             if nd in R:
                 b, t, _ = R[nd]
                 a = read(nd, a, act(pre[b, t] + topup(nd, pre.shape[-1])))
             A["down_proj"] = done(nd, a)
-            x = x + out("down_proj", g, u[nd])
-        z = x[:, self.targets]
-        for wn, (b, ti, wi, j, fx) in p["out"].items():
+            x = x + out("down_proj", g, cut(nd, u[nd]))
+        z = x if sel is not None else x[:, self.targets]
+        for wn, (b, ti, wi, j, fx) in outs.items():
             s = share(wn, wi, fx if ow is None else ow[j] * fx)
             z = z.index_put((b, ti), s[:, None] * self.U[wn].index_select(0, Wr[wn][2][wi]), accumulate=True)  # one per target
         return norm(z, tg.ln_f)

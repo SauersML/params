@@ -355,3 +355,29 @@ def test_reads_equal_graph_ref():
         i = [(int(a), int(b_)) for a, b_ in zip(one[n][1].tolist(), one[n][2].tolist())].index((t, c))
         want = float(rec[(n, t, c)][0])
         assert abs(float(got[n][i]) - want) < 1e-5 + REL * abs(want)
+
+
+def test_graph_search_steps_equal_whole_run():
+    """A graph run's search steps (fused norms and GELU, the last layer's queries, attention output and MLP at the
+    targets alone) in float32 give the whole run's KL and gradients within float32 rounding: both semantics, one graph
+    on every row and a list, with patches."""
+    nat, ids, targets, graph, ew, ow, u = graph_case()
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[::2])
+    eng = engine.Engine(nat, ids, targets, live=True)
+    T, B = len(ids), 3
+    x = sorted(graph.nodes)[0]
+    patch = {x[0]: (torch.zeros(B, T, nat.C[x[0]], dtype=torch.bool, device=nat.dev), torch.full((B, T, nat.C[x[0]]), 0.3, device=nat.dev))}
+    patch[x[0]][0][:, x[1], x[2]] = True
+    for semantics, plan, e, o in (("native", eng.plan(graph), ew, ow), ("c", eng.plan(half, semantics="c"), None, None),
+                                  ("c", eng.plan([half, graph, half], semantics="c"), None, None)):
+        p = eng._rows(plan, B)
+        got = []
+        for fused in (False, True):
+            a = {n: m.clone().requires_grad_(True) for n, m in u.items()}
+            h = eng._graph_hidden(p, a, None if e is None else e.reshape(-1), None if o is None else o.reshape(-1), B, fused, patch)
+            k = carry.kl(eng.ref, torch.log_softmax(h @ nat.target.wte.T, -1))
+            k.sum().backward()
+            got.append((k.detach(), a["h.1.mlp.c_fc"].grad, a["h.3.attn.k_proj"].grad))
+        assert rel(got[0][0], got[1][0]) < REL, semantics
+        for x0, x1 in zip(got[0][1:], got[1][1:]):
+            assert float((x0 - x1).norm() / x0.norm().clamp_min(1e-30)) < REL, semantics

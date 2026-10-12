@@ -486,6 +486,8 @@ def main():
     rs = sub.add_parser("rescore")
     rs.add_argument("rows")
     rs.add_argument("out")
+    rs.add_argument("--offset", type=int, default=0)
+    rs.add_argument("--stride", type=int, default=1)
     args = ap.parse_args()
     if args.cmd == "table":
         return print(table([json.loads(x) for x in Path(args.rows).read_text().splitlines() if x.strip()]))
@@ -498,10 +500,11 @@ def main():
             for b in bs:
                 f.write(json.dumps({**b, "goal": goal_of(b, decode)}) + "\n")
     elif args.cmd == "rescore":
+        lines = [x for x in Path(args.rows).read_text().splitlines() if x.strip()]
         with open(args.out, "w") as f:
-            for line in Path(args.rows).read_text().splitlines():
-                if line.strip():
-                    f.write(json.dumps(rescore(ee, src, json.loads(line), log=lambda m: print(m, flush=True))) + "\n")
+            for line in lines[args.offset::args.stride]:
+                f.write(json.dumps(rescore(ee, src, json.loads(line), log=lambda m: print(m, flush=True))) + "\n")
+                f.flush()
     elif args.cmd == "teach":
         bs = [json.loads(x) for x in Path(args.behaviours).read_text().splitlines() if x.strip()][:args.n]
         done = set()

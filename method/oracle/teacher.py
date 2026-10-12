@@ -40,8 +40,11 @@ Per text:
      default), connections at step 4's pick only.
   With --from-path DIR, steps 1-3 come from DIR's <task>.path.json (the start set, every step's removals and
   measurements, the F1 circuit and top-k; for path files without the last two, DIR's <task>.f1.json and
-  <task>.vpd_top<k>.json), so a text costs the pick and its connections alone; the start set must be the one VPD's
-  answer gives here. With --max-nodes K, step 4 picks among the path points of at most K nodes.
+  <task>.vpd_top<k>.json), so a text costs the pick and its connections alone. Saved node ids are matched by node: a
+  start node VPD's answer here lacks (causal importance at 0 on another GPU, where it was above) joins the answer.
+  Step 4 picks among the path points of at most --max-nodes nodes (MAX_NODES, the answer budget in nodes); with
+  --max-tokens, when the teacher circuit's answer (components.render) is longer than that in the explainer's
+  tokenizer, the next smaller path point with its connections instead, until it fits.
 Every membership decision is measured; orderings only order.
 
 Output per text in --out: <task>.json (the teacher circuit), <task>.f1.json, <task>.vpd_top<k>.json, <task>.n<size>.json at
@@ -66,6 +69,7 @@ from pathlib import Path
 import torch
 
 import carry
+import components
 import goal_eval
 import native
 
@@ -79,6 +83,8 @@ MIN_SIZE = 4
 SIZE_WEIGHT = 0.5     # components.SIZE_WEIGHT
 TERMS = 5             # components.reward's quality terms: F1, N, F3, E1, E2
 SIZES = (16, 32, 64, 128, 256)  # path points also written
+MAX_NODES = 266       # the answer budget in nodes: components.ANSWER_BUDGET (3,500 tokens) over 8.65 tokens per node and
+                      # 1.5 connections per node at 3.0 tokens each (primerl's measurements with Qwen3-8B's tokenizer)
 LEVELS = ("position", "site", "chunk64", "chunk16", "chunk4", "subcomponent")  # blocks, coarse to fine
 
 
@@ -427,11 +433,12 @@ def pick(rows: list[dict], f1: str, goal: float = RECOVERED, cap: int | None = N
 
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
           vpd_order: list | None = None, start_top: int = 0, f1_start: str = "targets", edges: bool = False,
-          from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = None) -> tuple[dict, dict]:
+          from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
+          max_tokens: int = components.ANSWER_BUDGET) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
-    in place of the F1 search, top-k and joint path."""
+    in place of the F1 search, top-k and joint path. tokens: text -> its token count, for the answer budget."""
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets)
@@ -441,6 +448,11 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
     if tx.vpd is None:
         raise ValueError("no VPD answer: run with the causal-importance network or pass --vpd")
+    if from_path is not None:                                # the saved start set within VPD's answer here
+        saved_start = [(n, int(t), int(c)) for n, c, t in from_path["start_nodes"]]
+        added = sum(not bool(tx.vpd[n][t, c]) for n, t, c in saved_start)
+        for n, t, c in saved_start:
+            tx.vpd[n][t, c] = True
     empty, vpd = ge._bounds(tx, CONVENTION)
     budget = empty ** (1 - RECOVERED) * vpd ** RECOVERED
     pr = Pruner(ge, tx, tx.vpd, live=CONVENTION == "live", B=B)
@@ -498,19 +510,17 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         path = joint_path(pr, start, empty, vpd)
     else:                                                    # steps 1-3 as saved: the same start set, its steps
         t1 = time.perf_counter()
-        saved_start = [(n, int(t), int(c)) for n, c, t in from_path["start_nodes"]]
-        if [pr.nodes[i] for i in from_path["start_index"]] != saved_start:
-            raise ValueError("the path file's start set is not VPD's answer here (another VPD answer or node order)")
+        here = {i: index[nd] for i, nd in zip(from_path["start_index"], saved_start)}   # saved node id -> this one
         start = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
-        start[from_path["start_index"]] = True
+        start[list(here.values())] = True
         f1_on = torch.zeros_like(start)
-        f1_on[from_path["f1_index"] if "f1_index" in from_path
+        f1_on[[here[i] for i in from_path["f1_index"]] if "f1_index" in from_path
               else [index[(n, int(t), int(c))] for n, c, t in from_path["f1_nodes"]]] = True
         k = from_path["top_k"]
         topk_on = torch.zeros_like(start)
         topk_on[order[:k]] = True
-        path = [dict(r) for r in from_path["steps"]]
-        row["from_path"] = True
+        path = [{**r, "removed": [here[i] for i in r["removed"]]} for r in from_path["steps"]]
+        row["from_path"] = {"start_nodes_added": added}
     sizes = [r["size"] for r in path]
     vs = []
     for sz in sizes:                                         # VPD's own order at every path size
@@ -569,6 +579,17 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         for i in points:
             if path[i]["size"] <= 64:
                 wire(i)
+    if tokens is not None:                                   # the answer within the budget: smaller path points until it fits
+        row["budget_steps"] = 0
+        while True:
+            row["answer_tokens"] = tokens(components.render(circuit_json(pr, ons[best], wired.get(best, (None,))[0])))
+            if row["answer_tokens"] <= max_tokens or best == len(path) - 1:
+                break
+            best += 1
+            row["budget_steps"] += 1
+            if edges:
+                wire(best)
+        row["answer_nodes"] = path[best]["size"]
     circuits = {"": circuit_json(pr, ons[best], wired.get(best, (None,))[0]), "f1": circuit_json(pr, f1_on),
                 f"vpd_top{k}": circuit_json(pr, topk_on)}
     for i in points:
@@ -607,7 +628,10 @@ def main():
                     help="connections at step 4's pick alone (pick), or the smallest point with N >= 0.9 whose connections reach "
                          "graph F1 >= 0.9 by bisection, and the points nearest 16, 32 and 64 (search)")
     ap.add_argument("--from-path", type=Path, help="a directory of this script's outputs: each text's saved path in place of steps 1-3")
-    ap.add_argument("--max-nodes", type=int, help="the pick among path points of at most this many nodes")
+    ap.add_argument("--max-nodes", type=int, default=MAX_NODES, help="the pick among path points of at most this many nodes")
+    ap.add_argument("--max-tokens", type=int, default=components.ANSWER_BUDGET,
+                    help="the teacher circuit's answer at most this many tokens of --tokenizer (0: not checked)")
+    ap.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the explainer's tokenizer (Hugging Face hub)")
     ap.add_argument("--tasks", type=Path, help="task ids, one per line, in place of the split's first n texts")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
@@ -616,6 +640,12 @@ def main():
     else:
         texts = native.tasks(args.split)[:args.n]
     ge = goal_eval.GoalEval(native.Native(), chunk=args.batch)
+    tokens = None
+    if args.max_tokens and not args.save_vpd:
+        from tokenizers import Tokenizer
+
+        tk = Tokenizer.from_pretrained(args.tokenizer)
+        tokens = lambda text: len(tk.encode(text, add_special_tokens=False).ids)  # noqa: E731
     if args.save_vpd:
         saved = {}
         for path in texts:
@@ -647,7 +677,7 @@ def main():
         ids, targets = native.text(path)
         saved = vpd.get(path.stem, {})
         circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
-                                         args.edges, from_path, args.edges_at, args.max_nodes)
+                                         args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

@@ -18,14 +18,14 @@ import goal_eval  # noqa: E402
 import native  # noqa: E402
 from test_goal_eval import tiny_native  # noqa: E402
 
-ANSWER = """EXPLANATION: the value at 3 is copied to the last position.
-CIRCUIT:
+ANSWER = """CIRCUIT:
 @5 a=L1.o#1 b=L1.down#2
 @3 c=L1.k#3 d=L1.v#4 e=L0.fc#5 f=L0.down#0
 OUT <- a,b
 a <- d
 d <- f
 f <- e
+EXPLANATION: the value at 3 is copied to the last position.
 ANSWER 1: the copied value is gone.
 FINAL 1: falls=yes top=' the'
 """
@@ -57,6 +57,19 @@ def test_written_out_nodes_still_parse():
     assert components.parse("CIRCUIT:\nL1.down#2, 9@5 <- L1.fc#1@5\n")["malformed"] == 1
     block = components.parse("CIRCUIT:\n@4 L1.k#4,6 L0.q#2 tok\nL1.k#9@4\n")  # a block without ids, and a bare group
     assert block["malformed"] == 0 and len(block["answer"]["nodes"]) == 5 and not block["answer"]["edges"]
+
+
+def test_render_puts_the_circuit_first_and_either_order_parses_alike():
+    answer = {"nodes": [["h.1.mlp.down_proj", 5, 9], ["h.1.mlp.c_fc", 1, 9]], "edges": [[1, 0], [0, "out"]], "explanation": "it copies"}
+    text = components.render(answer, {1: (True, "' x'")}, {1: "because"}, {1: [{"op": "scale", "node": ("h.1.mlp.c_fc", 9, 1), "k": 0.0, "persistent": False}]})
+    order = [text.index(k) for k in ("CIRCUIT:", "EXPLANATION:", "ANSWER 1:", "FINAL 1:", "EDIT 1:")]
+    assert order == sorted(order)  # circuit, explanation, answers, edits
+    assert "EXPLANATION" not in components.render({**answer, "explanation": ""}, {1: (True, "' x'")})  # none written when empty
+    circuit = text[text.index("CIRCUIT:"):text.index("EXPLANATION:")]
+    rest = text[text.index("EXPLANATION:"):]
+    old = rest.split("ANSWER 1:")[0] + circuit + "ANSWER 1:" + rest.split("ANSWER 1:")[1]  # the explanation first
+    a, b = components.parse(text), components.parse(old)
+    assert a["answer"] == b["answer"] and a["finals"] == b["finals"] and a["edits"] == b["edits"] and a["explanation"] == b["explanation"]
 
 
 def test_short_ids():

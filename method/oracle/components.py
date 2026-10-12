@@ -4,7 +4,6 @@ The oracle reads a text and states the whole-model circuit of vpd4l's prediction
 with explicit edges, an English explanation, and answers to intervention questions about the same text. The answer is
 plain text (nothing in it is executed):
 
-  EXPLANATION: the model copies the digits after the earlier "327" ...
   CIRCUIT:
   @332 a=L3.down#120 b=L2.o#77
   @322 c=L2.v#902 d=L2.v#1514 e=L0.down#77 f=L0.fc#12 g=L2.k#9 h=tok
@@ -13,11 +12,14 @@ plain text (nothing in it is executed):
   c <- e
   d <- e
   e <- f,h
+  EXPLANATION: the model copies the digits after the earlier "327" ...
   ANSWER 1: the change at 322 removes the copied digit ...
   FINAL 1: falls=yes top=' 7'
   EDIT 1: cut b <- c; scale e 0
 
-A subcomponent is L<layer>.<kind>#<index> (kind q, k, v, o, fc, down) at a position; the token embedding at a position
+The circuit comes first and the explanation of that circuit after it, so the English is conditioned on the circuit
+written (parse() reads the sections in any order). A subcomponent is L<layer>.<kind>#<index> (kind q, k, v, o, fc,
+down) at a position; the token embedding at a position
 is tok, an input node. Every node is named once by a short id in its position's block ("@322 c=L2.v#902 h=tok"), and
 each edge line "reader <- writer,writer" states one edge per writer by id: an attention or MLP output (o, down) into a
 later query, key, value or MLP input (q, k, v, fc) at its position, a value (v) into its layer's attention output (o)
@@ -293,8 +295,8 @@ def _place(nd) -> tuple:
 
 def render(answer: dict, finals: dict | None = None, reasons: dict | None = None, edits: dict | None = None) -> str:
     """The text of a circuit in goal_eval's JSON (to_json's): every node named once by a short id in its position's
-    block and the edges by id (_id_lines), one output grammar for every answer. finals: question number -> (falls,
-    the top token as written)."""
+    block and the edges by id (_id_lines), one output grammar for every answer; then its explanation (none when it
+    has none), the questions' answers (finals: question number -> (falls, the top token as written)) and the edits."""
     import goal_eval
 
     nodes = [(TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
@@ -305,7 +307,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
         else:
             parents.setdefault(nodes[r], set()).add(nodes[w])
     lines, name = _id_lines(set(nodes), parents, out)
-    text = [f"EXPLANATION: {answer.get('explanation', '')}".rstrip(), "CIRCUIT:"] + lines
+    text = ["CIRCUIT:"] + lines + ([f"EXPLANATION: {answer['explanation']}"] if answer.get("explanation") else [])
     for k in sorted(finals or {}):
         falls, top = finals[k]
         text += [f"ANSWER {k}: {(reasons or {}).get(k, '')}".rstrip(), f"FINAL {k}: falls={'yes' if falls else 'no'} top={top}"]
@@ -564,8 +566,8 @@ ASK = ("How does {model} compute its prediction of the next token after the targ
        "reader at its position. OUT <- <writer>,<writer> is the prediction. The circuit should be what makes the "
        "prediction: with only its subcomponents on, reading along its edges, and every other one off, the model should "
        "still predict what it does, and with them taken out of VPD's active subcomponents it should not; fewer "
-       "subcomponents and edges are better. Answer with a line EXPLANATION: (in plain English, what the model does), "
-       "then CIRCUIT: and its lines, then for each question ANSWER <n>: (your reasoning in plain English) and "
+       "subcomponents and edges are better. Answer with CIRCUIT: and its lines first, then a line EXPLANATION: (in "
+       "plain English, what that circuit computes and how), then for each question ANSWER <n>: (your reasoning in plain English) and "
        "FINAL <n>: falls=yes or no top=<the token, quoted as the tokens are>, and for each edit request EDIT <n>: the "
        "operations, separated by \";\": cut <reader> <- <writer> (that one connection removed on this text; out is the "
        "prediction), scale <node> <k> (its activation multiplied by k), either prefixed by persistent for an edit of the "

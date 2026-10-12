@@ -99,7 +99,9 @@ def main() -> None:
     ap.add_argument("--p-end", type=float, default=0.4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     args = ap.parse_args()
+    dev = torch.device(args.device)
     torch.set_num_threads(3)
     nano = load_nano()
     xtr, ytr, xte, yte = load_mnist()
@@ -124,6 +126,9 @@ def main() -> None:
     wrappers = nano.install_components(model, cfg.C_per_module)
     d_in = {n: int(w.W_target.shape[1]) for n, w in wrappers.items()}
     ci_fn = nano.CITransformer(d_in, cfg.C_per_module, cfg)
+    model.to(dev)
+    ci_fn.to(dev)
+    xtr_d = xtr.to(dev)
     comp = [p for w in wrappers.values() for p in (w.V, w.U)]
     wopt = torch.optim.AdamW(comp, lr=cfg.faithfulness_warmup_lr, weight_decay=0.0)
     for _ in range(cfg.faithfulness_warmup_steps):
@@ -131,7 +136,7 @@ def main() -> None:
         nano.faithfulness_loss(wrappers).backward()
         wopt.step()
     print(f"warmup faith {nano.faithfulness_loss(wrappers).item():.3e}", flush=True)
-    ppgd = nano.PersistentPGD(wrappers, cfg.batch_size, 1, torch.device("cpu"), cfg)
+    ppgd = nano.PersistentPGD(wrappers, cfg.batch_size, 1, dev, cfg)
     opt = torch.optim.AdamW(comp + list(ci_fn.parameters()), lr=cfg.main_lr, weight_decay=0.0)
     names = list(wrappers)
     t0 = time.time()
@@ -141,8 +146,8 @@ def main() -> None:
         plr = nano.cosine_lr(step, cfg.n_steps, cfg.ppgd_lr, cfg.ppgd_lr_final_frac, cfg.ppgd_warmup_pct)
         for g in opt.param_groups:
             g["lr"] = lr
-        idx = torch.randint(0, len(xtr), (cfg.batch_size,))
-        xs = xtr[idx][:, None, :]
+        idx = torch.randint(0, len(xtr), (cfg.batch_size,), device=dev)
+        xs = xtr_d[idx][:, None, :]
         nano.clear_wrapper_masks(wrappers)
         with torch.no_grad():
             tl = model(xs)
@@ -167,7 +172,7 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(comp, cfg.grad_clip_components)
         opt.step()
         ppgd.external_step(dict(zip(ppgd.sources, pg, strict=True)), plr)
-        if step % 1000 == 0 or step == cfg.n_steps - 1:
+        if step % 1000 == 0 or step == cfg.n_steps - 1 or step == 200:
             l0 = sum((c > 0).float().sum(-1).mean().item() for c in ci_lower.values())
             row = {
                 "step": step,
@@ -182,6 +187,8 @@ def main() -> None:
             log.append(row)
             print(json.dumps(row), flush=True)
     model.eval()
+    model.to("cpu")
+    ci_fn.to("cpu")
     ev = evaluate(nano, model, wrappers, ci_fn, xte, yte)
     print(json.dumps(ev), flush=True)
     blob = {

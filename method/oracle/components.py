@@ -42,6 +42,7 @@ E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); 
 
   components.py questions SPLIT OUT.jsonl [--n N] [--qa-seed K]  question rows (question, positions, evidence, questions;
                                                                 K = 1 for a fresh set of questions)
+  components.py requestion ROWS.jsonl OUT.jsonl [--qa-seed 1]   the rows with a fresh set of intervention questions
   components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
                                                                 (TEACHER_DIR/<task>.json or .txt; nodes alone get
                                                                 measured edges) with the measured answers
@@ -902,6 +903,10 @@ def main():
     q.add_argument("--stride", type=int, default=1)
     q.add_argument("--qa-seed", type=int, default=0, help="added to each text's seed for its questions: 0 the discovery "
                    "set (training, checkpoint selection), 1 a fresh set for reports")
+    rq = sub.add_parser("requestion", help="the same rows with a fresh set of intervention questions (only they are measured)")
+    rq.add_argument("rows", type=Path)
+    rq.add_argument("out", type=Path)
+    rq.add_argument("--qa-seed", type=int, default=1)
     d = sub.add_parser("dataset")
     d.add_argument("rows", type=Path)
     d.add_argument("teacher", type=Path)
@@ -924,6 +929,16 @@ def main():
 
     ge = goal_eval.GoalEval()
     nat = ge.nat
+    if args.cmd == "requestion":
+        with args.out.open("w") as f:
+            for r in map(json.loads, args.rows.read_text().splitlines()):
+                task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+                r["qa"] = qa_questions(nat, task, nat.importance(task["prompts"][0]["token_ids"]), r["positions"],
+                                       native.task_seed(task["id"]) + args.qa_seed)
+                f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
+                f.flush()
+                print(r["task"], len(r["qa"]), "questions", flush=True)
+        return
     if args.cmd == "questions":
         conn, atlas = _connectome(), _atlas()
         done = set()

@@ -20,7 +20,7 @@ for k in $(seq 0 $((P - 1))); do
 done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
-tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
+mkdir -p ~/mpd-data/graph_oracle; tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd /Users/user/params/method/oracle > /dev/null;
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 set +e; $RUNS wait;

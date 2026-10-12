@@ -1097,29 +1097,46 @@ def test_flips_report_float32_rescores(tiny, monkeypatch):
 
 
 def test_edge_flips_are_adversary_flips_on_the_subsets(tiny):
-    """edge_flips on connection subsets of one node set (one plan at 0/1 strengths) gives adversary_flips' numbers and
-    masks on those subsets stated as their own graphs (to 1e-6 relative; float32 on the tiny model's device), with and
-    without a shared shortlist cache, and keeps one plan for the node set across calls."""
+    """edge_flips on connection subsets of one node set gives adversary_flips' numbers and masks on those subsets
+    stated as their own graphs with stranded nodes dropped (to 1e-6 relative; float32 on the tiny model's device):
+    subsets that strand no node through one plan at 0/1 strengths (with and without a shared shortlist cache; one
+    plan kept for the node set across calls), and a call with a subset that strands a node (every connection of it
+    off) through the subsets' graphs."""
     nat, ge, tx = tiny
     nodes = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
     par, out = native.all_edges(nodes, tx.targets)
     full = native.Graph(nodes, par, out)
     edges = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in out]
+    linked = sorted({nd for e in edges for nd in e if nd is not None})
+    plain = [nd for nd in linked if native._name_layer_kind(nd[0])[1] not in ("q_proj", "k_proj")]
+    assert plain, "the tiny node set needs a node a subset can strand"
     g = torch.Generator().manual_seed(3)
     ons = torch.rand(5, len(edges), generator=g) < 0.6
-    ons[0], ons[1] = True, False
-    subs = []
-    for on in ons.tolist():
-        kept = [e for e, k in zip(edges, on) if k]
-        parents = {}
-        for w, r in kept:
-            if r is not None:
-                parents.setdefault(r, []).append(w)
-        subs.append(native.Graph(nodes, parents, [w for w, r in kept if r is None]))
+    ons[0] = True
+    for nd in linked:  # every subset keeps one connection of every linked node: none stranded
+        ks = [k for k, e in enumerate(edges) if nd in e]
+        ons[torch.arange(5), torch.tensor(ks)[torch.randint(len(ks), (5,), generator=g)]] = True
+    strands = ons.clone()
+    strands[2, [k for k, e in enumerate(edges) if plain[0] in e]] = False
+
+    def subsets(rows):
+        subs = []
+        for on in rows.tolist():
+            kept = [e for e, k in zip(edges, on) if k]
+            parents = {}
+            for w, r in kept:
+                if r is not None:
+                    parents.setdefault(r, []).append(w)
+            subs.append(goal_eval.strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, nat.C))
+        return subs
+
+    assert not subsets(ons)[1].stranded and plain[0] in subsets(strands)[2].stranded
     pool = tiny_pool(nat, tx.ids)
-    for screens in (None, "shared"):
-        want = ge.adversary_flips(tx, subs, pool, "omitted", ms=(4,), steps=3, restarts=2, screens=None if screens is None else {})
-        got = ge.edge_flips(tx, full, ons, pool, 4, steps=3, restarts=2, screens=None if screens is None else {})
+    tx.__dict__.pop("_adv", None)
+    for rows, screens in ((ons, None), (ons, "shared"), (strands, None)):
+        want = ge.adversary_flips(tx, subsets(rows), pool, "omitted", ms=(4,), steps=3, restarts=2,
+                                  screens=None if screens is None else {})
+        got = ge.edge_flips(tx, full, rows, pool, 4, steps=3, restarts=2, screens=None if screens is None else {})
         for a, b in zip(want, got):
             assert a["mask_flips_omitted"] == b["mask_flips_omitted"], screens
             for x, y in zip(a["kl_flips_omitted"][4], b["kl_flips_omitted"][4]):

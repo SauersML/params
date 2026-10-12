@@ -1834,9 +1834,31 @@ class GoalEval:
         """adversary_flips' omitted lever at budget m on connection subsets of one node set: graph states every
         connection among its nodes (teacher.EdgePruner.graph: native.all_edges), ons [K, E + O] (bool) the ones each
         subset keeps, in the graph's order (its parents reader by reader, then its out list). The same numbers as
-        adversary_flips on the K graphs of those connections, from one plan of graph at 0/1 strengths (kept on the
-        text across calls) and the node set's layout made once."""
-        return self.adversary_flips(tx, [graph] * len(ons), pool, "omitted", ms=(m,), screens=screens,
+        adversary_flips on the K graphs of those connections, stranded nodes dropped (strand: each subset the claim
+        fidelity scores), from one plan of graph at 0/1 strengths (kept on the text across calls) and the node set's
+        layout made once; a call with a subset that strands a node the whole graph links runs adversary_flips on the
+        subsets' graphs instead."""
+        base = strand(graph, tx.targets, self.nat.C)  # nodes no connection of graph touches: stranded in every subset
+        edges = [(w, r) for r, ws in base.parents.items() for w in ws] + [(w, None) for w in base.out]
+        nodes = sorted(base.node_set())
+        at = {nd: i for i, nd in enumerate(nodes)}
+        ends = torch.zeros(len(edges), len(nodes))
+        for k_, (w, r) in enumerate(edges):
+            ends[k_, at[w]] = 1.0
+            if r is not None:
+                ends[k_, at[r]] = 1.0
+        need = torch.tensor([native._name_layer_kind(n)[1] not in ("q_proj", "k_proj") for n, _, _ in nodes])
+        if bool(((ons.cpu().float() @ ends == 0) & need).any()):  # a subset strands a node: its graph as stated
+            subs = []
+            for row in ons.tolist():
+                kept = [e for e, k_ in zip(edges, row) if k_]
+                parents = {}
+                for w, r in kept:
+                    if r is not None:
+                        parents.setdefault(r, []).append(w)
+                subs.append(strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, self.nat.C))
+            return self.adversary_flips(tx, subs, pool, "omitted", ms=(m,), screens=screens, **kw)
+        return self.adversary_flips(tx, [base] * len(ons), pool, "omitted", ms=(m,), screens=screens,
                                     strengths=ons.to(self.nat.dev, torch.float32), **kw)
 
     def across(self, tx: Text, graphs: list[native.Graph], prompts: list) -> list[dict]:

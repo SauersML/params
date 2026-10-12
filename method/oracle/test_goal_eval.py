@@ -1166,3 +1166,16 @@ def test_cancellation_adds_up(tiny):
     final = ge.flow(tx)["final"][t]
     assert float((tg.wte[tx.ids[t]] + act + ina + rem - final).norm()) < 1e-4 * float(final.norm())
     assert abs(r["actives"] - float(act.norm())) < 1e-4 and -1 <= r["cosine"] <= 1
+
+
+def test_wiring_is_the_node_sets_masked_run(tiny):
+    """s_wiring: a stated circuit's F1 with every connection among its nodes restored (its node set's masked run); a
+    complete circuit's is its own F1."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::4]
+    par, out = native.all_edges(sub, tx.targets)
+    half = native.Graph(sub, {r: ws[: len(ws) // 2] for r, ws in par.items()}, out[: len(out) // 2])
+    rows = ge.fidelity(tx, [half, native.Graph(sub, complete=True)], None, draws=2)
+    want = ge.sufficiency(tx, [native.Graph(sub, complete=True)])[0]["f1_live"]
+    assert abs(rows[0]["s_wiring"] - want) < 1e-9 and abs(rows[1]["s_wiring"] - rows[1]["s_point"]) < 1e-9
+    assert rows[0]["c_wiring"] is not None

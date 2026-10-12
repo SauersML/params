@@ -947,7 +947,10 @@ class GoalEval:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
-        model under the intervention || X under it): "point" (no intervention: F1), "nodes" (draw j removes each
+        model under the intervention || X under it): "point" (no intervention: F1), "wiring" (s_wiring: every connection
+        among the circuit's nodes restored, the masked run of its node set: an unstated connection claims not to matter,
+        so restoring them all should keep F1; a circuit that raises its graph F1 by leaving a harmful part's real
+        connections unstated loses here; c_wiring, c with it), "nodes" (draw j removes each
         circuit node with probability (j + 0.5) / draws), "edges" (draw j cuts each stated connection into one reader
         drawn uniformly, the prediction among them, with that probability, at least one, in the model, VPD's answer
         and the circuit alike, graph_ref), "adversary" (the paired
@@ -975,6 +978,9 @@ class GoalEval:
         e0 = self._bounds(tx, "live")[0]
         sides = self._sides(tx, graphs) if reads else None
         point = self.sufficiency(tx, graphs)
+        whole = [native.Graph(sorted(g.node_set()), complete=True) if not g.complete else None for g in graphs]
+        wired = dict(zip([i for i, w in enumerate(whole) if w is not None],
+                         self.sufficiency(tx, [w for w in whole if w is not None])))
         nodes = self._node_family(tx, graphs, draws, reads)
         edges = self._edge_family(tx, graphs, draws, reads)
         none = [{} for _ in graphs]
@@ -989,7 +995,9 @@ class GoalEval:
         out = []
         for g, pt, nd, ed, ad, fl, fr, it, rr, nf, lk in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals,
                                                              nflips, leak):
-            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf}
+            i = len(out)
+            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf,
+                   "s_wiring": wired[i]["f1_live"] if i in wired else pt["f1_live"]}
             if lk:
                 row["leak"] = lk["f1_live"]
             row["s_nodes"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
@@ -998,6 +1006,8 @@ class GoalEval:
             terms = [row[k] for k in ("s_point", "s_nodes", "s_edges") if row.get(k) is not None]
             terms += [fc[FLIP_TERM]] if fc.get(FLIP_TERM) is not None else []
             row["c"] = sum(terms) / len(terms) if terms else None
+            wt = terms + ([row["s_wiring"]] if row["s_wiring"] is not None else [])
+            row["c_wiring"] = sum(wt) / len(wt) if wt else None
             if not reward:  # (the reward's flips stop at FLIP_TERM)
                 half = 0.5 * row["s_point"] if row["s_point"] is not None else None
                 broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
@@ -2156,7 +2166,8 @@ def fidelity_table(rows: list[dict]) -> str:
     held += [(f"response err {f}", lambda r, f=f: r.get(f"dreads_{f}")) for f in ("nodes", "edges", "interchange")]
     held += [("leak (no edges)", lambda r: r.get("leak"))]
     stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
-    sample = [("F1", lambda r: r["s_point"]), ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
+    sample = [("F1", lambda r: r["s_point"]), ("F1 every connection", lambda r: r.get("s_wiring")),
+              ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
     return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),
                           block("The step adversary (VPD's published budget, steps)", stepcols),
                           block("In-sample (the searches optimized F1 and N on these texts)", sample)])

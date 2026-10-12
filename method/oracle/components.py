@@ -621,6 +621,17 @@ def dropped_bits(answer: dict, g, d: dict, positions: int, subcomponents: int) -
     return d["invalid_nodes"] * math.log2(positions * subcomponents) + (2 * d_inner + d_out) * math.log2(n)
 
 
+def necessity_log(row: dict, convention: str = CONVENTION) -> float | None:
+    """Necessity in orders of magnitude of KL: clip(ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD), 0, 1), from
+    goal_eval's KLs (KL floored at 1e-9 bits as goal_eval.recovered_log does). Its linear form is dominated by the empty
+    circuit's ~100 bits, as recovered is: removing a circuit that raises VPD's 0.05 bits to 5 counts 0.05 there, 0.6 here."""
+    e, m, v = (row.get(f"kl_empty_{convention}"), row.get(f"kl_vpd_minus_{convention}"), row.get(f"kl_vpd_{convention}"))
+    if e is None or m is None or v is None:
+        return None
+    e, m, v = (max(x, 1e-9) for x in (e, m, v))
+    return min(1.0, max(0.0, math.log(m / v) / math.log(e / v))) if e > v else None
+
+
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
@@ -631,8 +642,10 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     answer earns the mean of its terms less size_weight x size ("circuit_reward": the same over the circuit's own terms
     F1, N and F3, for comparing with circuits that give no English or answers), size its description bits over the scale (VPD's active
     subcomponents at the listed positions and the targets), at most 1. Terms, from goal_eval in VPD's semantics with
-    the remainders' convention: F1, completeness on the text (min(1, recovered / 0.9), recovered between the empty
-    circuit and VPD's own answer); N, necessity (what VPD's own answer loses without the circuit, in [0, 1]); F3, the
+    the remainders' convention, both in orders of magnitude of KL (linear recovery is dominated by the empty circuit's
+    ~100 bits: an answer 20 bits from the model recovers 0.8 linearly, 0.2 in log): F1, completeness on the text
+    (min(1, recovered_log / 0.9), recovered between the empty circuit and VPD's own answer); N, necessity_log (what
+    VPD's own answer loses without the circuit, in [0, 1]); F3, the
     AUC of stated edges' cuts in the circuit's run (0 without a stated edge); E1, the reader's bits saved (in [-1, 1];
     with a reader or e1); E2, the share of questions answered right. A term goal_eval cannot give (no causal-importance
     network for VPD's bounds) is left out of the mean. reader: a reader.Reader for E1, or e1: each text's reader bits
@@ -675,8 +688,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         row, terms, size, r = row_of.get(i), {}, None, -(1.0 + size_weight)
         circ = r
         if row is not None:
-            terms["F1"] = row[f"completeness_{convention}"]
-            terms["N"] = row[f"necessity_{convention}"]
+            rec = row[f"recovered_log_{convention}"]
+            terms["F1"] = None if rec is None else min(1.0, max(0.0, rec) / goal_eval.GOAL)
+            terms["N"] = necessity_log(row, convention)
             terms["F3"] = row["f3"]
             terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
             terms["E2"] = row["E2"]

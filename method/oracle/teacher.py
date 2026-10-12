@@ -48,6 +48,12 @@ Per text:
   Step 4 picks among the path points of at most --max-nodes nodes (MAX_NODES, the answer budget in nodes); with
   --max-tokens, when the teacher circuit's answer (components.render) is longer than that in the explainer's
   tokenizer, the next smaller path point with its connections instead, until it fits.
+  With --no-strand, no non-query/key node is left without a stated connection: each keeps its most important one (the
+  largest measured cut effect, EdgePruner.protect), and one the model connects to no other node of the circuit is
+  dropped (queries and keys act through the attention pattern). Without it, the descent left text9000's greedy and
+  v3 circuits with half and 92% of their nodes unconnected: nodes that VPD's answer and the every-connection run need
+  (N 0.93 -> 0.25, every-connection F1 0.91 -> 0.39 without them) but whose role the stated graph cuts (the lead's
+  decision: the stated graph is the claim, a listed node needs a stated role).
   With --edge-objective robust, a connection removal is also admitted only while F1 under REPAIR_M of the omitted
   lever's flips (goal_eval.adversary_flips on the stated graph, the shared adversary) stays >= min(0.9, with every
   connection): connection pruning on graph F1 alone left the greedy circuits at F1 0.42 under one flip where every
@@ -355,6 +361,7 @@ class EdgePruner(Descent):
                                  columns={n: torch.tensor(cols[n], dtype=torch.long, device=nat.dev) for n in nat.names})
         self.plan = self.eng.plan(self.graph, semantics="c")
         self.rank_precision = "bf16" if str(nat.dev).startswith("cuda") else "score"
+        self.protected = torch.zeros(len(self.edges), dtype=torch.bool, device=nat.dev)   # never offered for removal
         self.measured = 0
 
     @torch.no_grad()
@@ -371,9 +378,9 @@ class EdgePruner(Descent):
         return self.kl_sets(ons, self.rank_precision)
 
     def blocks(self, level: str) -> list[torch.Tensor]:
-        """The kept connections' blocks: every connection out of one writer ("writer"), into one reader or the
-        prediction ("reader"), or single connections."""
-        ids = self.on.nonzero().flatten()
+        """The kept connections' blocks, protected ones aside: every connection out of one writer ("writer"), into one
+        reader or the prediction ("reader"), or single connections."""
+        ids = (self.on & ~self.protected).nonzero().flatten()
         if level not in ("writer", "reader"):
             return list(ids.split(1))
         if not hasattr(self, "ends"):
@@ -384,6 +391,20 @@ class EdgePruner(Descent):
         order = torch.argsort(keys, stable=True)
         _, counts = torch.unique_consecutive(keys[order], return_counts=True)
         return list(ids[order].split(counts.tolist()))
+
+    def protect(self) -> None:
+        """Protects each non-query/key node's single most important kept connection, the one whose cut leaves the
+        largest KL (each kept connection's cut measured in float32), so that no such node is left without a stated
+        connection (queries and keys act through their layer's attention pattern without one)."""
+        kept = self.on.nonzero().flatten()
+        cut = dict(zip(kept.tolist(), self.without(list(kept.split(1)))))
+        best = {}
+        for e, x in cut.items():
+            for nd in self.edges[e]:
+                if nd is not None and native._layer_kind(nd)[1] not in ("q_proj", "k_proj") and (nd not in best or x > cut[best[nd]]):
+                    best[nd] = e
+        if best:
+            self.protected[torch.tensor(sorted(set(best.values())), device=self.protected.device)] = True
 
 
 def scores(empty: float, vpd: float, c: float, minus: float) -> tuple[float, float, float]:
@@ -474,20 +495,37 @@ class Connector:
     with the text's bounds, F1 budget and size term (size_term(on, inner, out))."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: Pruner, empty: float, vpd: float, size_term, B: int = 32,
-                 robust: dict | None = None):
+                 robust: dict | None = None, no_strand: bool = False):
         self.ge, self.tx, self.pr, self.empty, self.vpd, self.size_term, self.B = ge, tx, pr, empty, vpd, size_term, B
         self.robust = robust      # the adversary's pool: connection removals also keep F1 under the omitted lever's flips
+        self.no_strand = no_strand  # every non-query/key node keeps a stated connection
         self.budget = empty ** (1 - RECOVERED) * vpd ** RECOVERED
         self.index = {nd: i for i, nd in enumerate(pr.nodes)}
 
     def connect(self, on: torch.Tensor, n: float, keep: set | None = None, new=()) -> tuple:
-        """A node set's connections by edge_path: (the kept ones, the last step's row, every step, the EdgePruner);
-        keep, a set of connections: the descent starts from those and every connection of the nodes `new`."""
+        """A node set's connections by edge_path: (the kept ones, the last step's row, every step, the EdgePruner, the
+        node set wired); keep, a set of connections: the descent starts from those and every connection of the nodes
+        `new`. With no_strand, a non-query/key node the model connects to none of the others is dropped (it has no
+        connection to state; its N measured again), and each other one keeps its most important connection
+        (EdgePruner.protect)."""
         pr, empty, vpd = self.pr, self.empty, self.vpd
-        ep = EdgePruner(self.ge, self.tx, [pr.nodes[j] for j in on.nonzero().flatten().tolist()], CONVENTION == "live", self.B)
+        nodes = [pr.nodes[j] for j in on.nonzero().flatten().tolist()]
+        dropped = []
+        if self.no_strand:
+            par, out = native.all_edges(nodes, self.tx.targets)
+            touched = {w for ws in par.values() for w in ws} | set(par) | set(out)
+            dropped = [nd for nd in nodes if nd not in touched and native._layer_kind(nd)[1] not in ("q_proj", "k_proj")]
+            if dropped:
+                on = on.clone()
+                on[torch.tensor([self.index[nd] for nd in dropped], device=on.device)] = False
+                nodes = [nd for nd in nodes if nd not in set(dropped)]
+                n = measure(pr, on[None], empty, vpd)[0]["n"]
+        ep = EdgePruner(self.ge, self.tx, nodes, CONVENTION == "live", self.B)
         if keep is not None:
             fresh = {pr.nodes[j] for j in new}
             ep.on = torch.tensor([e in keep or e[0] in fresh or e[1] in fresh for e in ep.edges], device=ep.on.device)
+        if self.no_strand:
+            ep.protect()
         size = int(on.sum())
         accept, start = None, {}
         if self.robust is not None:                          # the robust objective: F1 under REPAIR_M flips of the stated
@@ -508,12 +546,12 @@ class Connector:
         steps = edge_path(ep, self.budget, state, accept=accept)
         steps[0].update(start)
         summary = {**{k_: steps[-1][k_] for k_ in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term", "reward")},
-                   "all_edges": len(ep.edges), "sets": ep.measured}
+                   "all_edges": len(ep.edges), "sets": ep.measured, "unconnectable": len(dropped)}
         if start:                                            # the last admitted step's F1 under the flips (the start's if none)
             summary["f1_flips"] = next(s_["f1_flips"] for s_ in reversed(steps) if "f1_flips" in s_)
         print(f"  connections at {size} subcomponents: {summary['edges']} of {len(ep.edges)}, graph F1 {summary['f1_graph']:.3f} "
               f"(start {steps[0]['f1_graph']:.3f}), N {n:.3f}, {ep.measured} sets", flush=True)
-        return [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_], summary, steps, ep
+        return [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_], summary, steps, ep, on
 
     def graph(self, on: torch.Tensor, kept: list) -> native.Graph:
         """A node set and its kept connections as the stated graph goal_eval scores."""
@@ -557,7 +595,7 @@ class Connector:
                 break
             on = on.clone()
             on[torch.tensor(add, dtype=torch.long, device=on.device)] = True
-            kept, _, _, _ = self.connect(on, measure(self.pr, on[None], self.empty, self.vpd)[0]["n"], set(kept), add)
+            kept, _, _, _, on = self.connect(on, measure(self.pr, on[None], self.empty, self.vpd)[0]["n"], set(kept), add)
         return steps, max(range(len(steps)), key=lambda i: (steps[i]["score"], -steps[i]["size"])), "score"
 
 
@@ -585,7 +623,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           vpd_order: list | None = None, start_top: int = 0, f1_start: str = "both", edges: bool = False,
           from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
           max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
-          robust_pool: dict | None = None) -> tuple[dict, dict]:
+          robust_pool: dict | None = None, no_strand: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -700,13 +738,13 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     points = {min(range(len(path)), key=lambda j: abs(path[j]["size"] - want)) for want in SIZES}
     wired, edge_paths, t2 = {}, [], time.perf_counter()     # node step -> (its last edge step's connections, its row)
 
-    wiring = Connector(ge, tx, pr, empty, vpd, size_term, B, robust=robust_pool)
+    wiring = Connector(ge, tx, pr, empty, vpd, size_term, B, robust=robust_pool, no_strand=no_strand)
 
     def wire(i):
         if i not in wired:
-            kept, summary, steps, ep = wiring.connect(ons[i], path[i]["n"])
+            kept, summary, steps, ep, wired_on = wiring.connect(ons[i], path[i]["n"])
             edge_paths.append({"step": i, "edges": [[index[w], "out" if r is None else index[r]] for w, r in ep.edges], "steps": steps})
-            wired[i] = (kept, summary, ons[i])
+            wired[i] = (kept, summary, wired_on)
         return wired[i][1]["f1_graph"] >= RECOVERED and wired[i][1]["n"] >= RECOVERED
 
     if edges and edges_at == "pick":                         # connections at step 4's pick alone
@@ -748,7 +786,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         on_v = torch.zeros_like(final[0])
         on_v[order[:kv]] = True
         got = measure(pr, on_v[None], empty, vpd)[0]
-        kept_v, summary_v, _, _ = wiring.connect(on_v, got["n"])
+        kept_v, summary_v, _, _, on_v = wiring.connect(on_v, got["n"])
         circuits[f"vpd_top{kv}.edges"] = circuit_json(pr, on_v, kept_v)
         row["vpd_top_edges"] = {"size": kv, "f1_nodes": got["f1"], **summary_v}
     for i in points:
@@ -783,6 +821,9 @@ def main():
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
+    ap.add_argument("--no-strand", action="store_true",
+                    help="with --edges, every non-query/key node keeps a stated connection (its most important; one the model connects "
+                         "to no other node is dropped): the stated graph is the claim, a listed node needs a stated role")
     ap.add_argument("--edge-objective", choices=("graph", "robust"), default="graph",
                     help="with --edges, connection removals keep graph F1 >= 0.9 (graph), and also F1 under REPAIR_M of the omitted "
                          "lever's flips >= min(0.9, every connection's) (robust: goal_eval.adversary_flips, pool POOL)")
@@ -845,7 +886,8 @@ def main():
         saved = vpd.get(path.stem, {})
         circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
                                          args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
-                                         pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None)
+                                         pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
+                                         args.no_strand)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

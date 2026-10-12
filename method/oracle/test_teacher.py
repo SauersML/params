@@ -6,7 +6,8 @@ CUDA, and the products on the start set's subcomponents alone (Pruner._gather) w
 EdgePruner's runs are the scorecard's (goal_eval.GoalEval.graph_kl: with every connection the masked run), and a
 teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, one
 over the answer budget steps to a smaller path point, the flip repair writes its best-scoring step, and Descent.prune's
-accept check admits exactly the largest passing prefix (a constructed case).
+accept check admits exactly the largest passing prefix (a constructed case), and with --no-strand no listed node but a
+query or key is without a stated connection.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -182,3 +183,17 @@ def test_accept_admits_exactly_the_passing_prefix():
     free = Toy(w)
     free.prune("unit", 0.4, rounds=1)
     assert free.on.tolist() == [False] * 5 + [True] * 5
+
+
+@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
+def test_no_strand_leaves_no_node_unconnected():
+    if not VPD_SAVED.exists():
+        pytest.skip("needs VPD's answers " + str(VPD_SAVED))
+    ge = goal_eval.GoalEval(native.Native(DEVICE), chunk=32)
+    ids, targets = native.text(native.TEXTS / "vpd4l" / "text9000.json")
+    saved = torch.load(VPD_SAVED)["text9000"]
+    circuits, row, _ = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True, no_strand=True)
+    c = circuits[""]
+    stated = {i for e in c["edges"] for i in e if i != "out"}
+    # every listed node but the token embeddings, queries and keys has a stated connection
+    assert all(i in stated for i, (m, _, _) in enumerate(c["nodes"]) if m != "tok" and not m.endswith(("q_proj", "k_proj")))

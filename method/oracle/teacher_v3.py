@@ -206,7 +206,8 @@ def removals(meas: Measure, on: torch.Tensor, row: dict, goal: float = teacher.R
 
 def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answer: dict, pool: dict, B: int = 32,
            edges: bool = False, repair: bool = False, max_nodes: int | None = teacher.MAX_NODES, tokens=None,
-           max_tokens: int = components.ANSWER_BUDGET, seeds=(0,), robust_edges: bool = False) -> tuple[dict, dict, dict]:
+           max_tokens: int = components.ANSWER_BUDGET, seeds=(0,), robust_edges: bool = False,
+           no_strand: bool = False) -> tuple[dict, dict, dict]:
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets)
@@ -226,7 +227,7 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
         return goal_eval.size_term(bits, scale)
 
     meas = Measure(ge, tx, pr, empty, vpd, pool)
-    wiring = teacher.Connector(ge, tx, pr, empty, vpd, size_term, B, robust=pool if robust_edges else None)
+    wiring = teacher.Connector(ge, tx, pr, empty, vpd, size_term, B, robust=pool if robust_edges else None, no_strand=no_strand)
 
     def lam_path(seed):                                          # one seed's stages
         ms = MaskSearch(ge, tx, pr, live=teacher.CONVENTION == "live")
@@ -283,7 +284,7 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
         out = {"stage": best, "cut": cut, "removed": stages[best]["size"] - int(on.sum()), "kept": None, "rep": None,
                "edge_path": None, "f1": picked["f1"]}
         if edges:
-            kept, summary, e_steps, ep = wiring.connect(on, picked["n"])
+            kept, summary, e_steps, ep, on = wiring.connect(on, picked["n"])
             out.update(kept=kept, f1=summary["f1_graph"], edge_path={
                 "edges": [[wiring.index[w], "out" if r is None else wiring.index[r]] for w, r in ep.edges], "steps": e_steps})
             if repair:
@@ -363,6 +364,7 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--edges", action="store_true", help="the pick's connections (teacher.Connector, C's semantics)")
     ap.add_argument("--repair", action="store_true", help="with --edges, the flip repair (teacher.Connector.repair)")
+    ap.add_argument("--no-strand", action="store_true", help="with --edges, every non-query/key node keeps a stated connection (teacher.py's)")
     ap.add_argument("--edge-objective", choices=("graph", "robust"), default="graph",
                     help="with --edges, connection removals keep graph F1 (graph), and F1 under the flips too (robust: teacher.py's)")
     ap.add_argument("--max-nodes", type=int, default=teacher.MAX_NODES, help="the pick among stages of at most this many nodes")
@@ -387,7 +389,8 @@ def main():
             continue
         ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
         circuits, row, path_file = search(ge, ids, targets, saved[task]["answer"], pool, args.batch, args.edges, args.repair,
-                                          args.max_nodes, tokens, args.max_tokens, tuple(range(args.seeds)), args.edge_objective == "robust")
+                                          args.max_nodes, tokens, args.max_tokens, tuple(range(args.seeds)), args.edge_objective == "robust",
+                                          args.no_strand)
         for name, c in circuits.items():
             (args.out / f"{task}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{task}.path.json").write_text(json.dumps(path_file))

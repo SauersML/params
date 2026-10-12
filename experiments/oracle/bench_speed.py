@@ -10,6 +10,10 @@ score    units.score_many seconds per question: K=8 positions, 8 answers (the co
          seconds_first with the model object's per-text caches dropped (a text's first call), seconds with them kept
 events   units.events seconds per text, K=8; seconds_first and seconds as for score
 window   Native.sensitivity's windowed probes on this device vs the whole forward: equal, and seconds of each
+teacher  teacher.Pruner's masked runs from VPD's answer: sets per second for position, site and single-node removals and
+         the complements (teacher_live: remainders on); needs the causal-importance network
+reward   components.reward per text for 8 nested subsets of VPD's ordered answer with stated connections: first and
+         repeat call seconds (fix PYTHONHASHSEED for comparable answers across processes)
 Texts are the split's first n, fixed; every timing is after one untimed warm-up on the same inputs (MPS compiles a
 graph per shape) and ends with a device synchronize. Each result carries a fingerprint of what it computed (sums of
 measured KLs and scores): a speed change that alters the numbers shows there. GPU utilization is the system's, sampled
@@ -178,6 +182,80 @@ def bench_window(nat, texts):
     return rows
 
 
+def bench_teacher(nat, texts, live=False, batch=32):
+    """teacher.Pruner's masked runs on each text from VPD's answer: sets per second for every position's removal, every
+    6th site's removal, and 256 single-node removals and their complements (the joint path's two runs per set)."""
+    import torch
+
+    import carry
+    import goal_eval
+    import native
+    import teacher
+
+    ge = goal_eval.GoalEval(nat, chunk=batch)
+    rows = []
+    for path in texts:
+        ids, targets = native.text(path)
+        tx = ge.text(ids, targets)
+        if tx.vpd is None:
+            return [{"skipped": "no causal-importance network (VPD's answer) here"}]
+        pr = teacher.Pruner(ge, tx, tx.vpd, live=live, B=batch)
+        nodes = torch.randperm(len(pr.nodes), generator=torch.Generator().manual_seed(0))[:256].to(nat.dev)
+        trials = pr.on[None].repeat(256, 1)
+        trials[torch.arange(256, device=nat.dev), nodes] = False
+        sites = pr.blocks("site")
+        row = {"task": path.stem, "T": len(ids), "nodes": len(pr.nodes), "live": live}
+        sync = lambda: carry.synchronize(nat.dev)  # noqa: E731
+        fingerprint = 0.0
+        for name, fn in [("position", lambda: pr.without(pr.blocks("position"))), ("site", lambda: pr.without(sites[::6])),
+                         ("trials", lambda: pr.kl_sets(trials)), ("complements", lambda: pr.kl_sets(~trials))]:
+            seconds, out = timed(fn, sync)
+            row[f"{name}_sets_per_s"] = len(out) / seconds
+            fingerprint += sum(out)
+        row["fingerprint"] = fingerprint
+        rows.append(row)
+    return rows
+
+
+def bench_reward(nat, texts, answers=8):
+    """components.reward per text for nested subsets of VPD's ordered answer (its first 48, 36, ... subcomponents) with
+    the model's connections among them stated (up to 8 into the prediction, 16 more), the measured answers to the
+    questions: seconds of a text's first call and of a repeat (its Text kept), and the stages' seconds."""
+    import json
+
+    import carry
+    import components
+    import goal_eval
+    import native
+
+    ge = goal_eval.GoalEval(nat)
+    rows = []
+    for path in texts:
+        task = json.loads(path.read_text())
+        ids, targets = native.text(path)
+        ev = components.evidence(nat, ge, task)
+        order = nat._vpd_order(ids, targets)
+        texts_ = []
+        for k in [48, 36, 24, 16, 12, 8, 4, 2][:answers]:
+            g = native.Graph(set(order[:k]), {}, [])
+            par, out = native.all_edges(g.node_set(), targets)
+            h = native.Graph(g.node_set(), {}, [])
+            for w in sorted(out)[:8]:
+                h.out.append(w)
+            for r, ws in sorted(par.items())[:16]:
+                h.parents.setdefault(r, []).append(sorted(ws)[0])
+            texts_.append(components.target(goal_eval.to_json(h, ""), ev, task["model"]))
+        cache = {}
+        sync = lambda: carry.synchronize(nat.dev)  # noqa: E731
+        sync(); t0 = time.perf_counter()
+        components.reward(ge, task, ev, texts_, cache=cache)
+        sync(); first = time.perf_counter() - t0
+        seconds, got = timed(lambda: components.reward(ge, task, ev, texts_, cache=cache), sync)
+        rows.append({"task": path.stem, "T": len(ids), "answers": len(texts_), "valid": sum(r["valid"] for r in got),
+                     "seconds_first": first, "seconds": seconds, "fingerprint": sum(r["reward"] for r in got)})
+    return rows
+
+
 def profile_carry(nat, path, granularity, batch=64):
     """The top operators of one measure() call by device time (torch.profiler), and the Python share."""
     import torch
@@ -247,6 +325,10 @@ def main():
             results["events"] = bench_events(nat, texts)
         elif b == "window" and hasattr(nat, "WINDOW_EXACT"):
             results["window"] = bench_window(nat, texts)
+        elif b in ("teacher", "teacher_live"):
+            results[b] = bench_teacher(nat, texts, live=b == "teacher_live")
+        elif b == "reward":
+            results["reward"] = bench_reward(nat, texts)
         print(b, json.dumps(results.get(b) or {k: v for k, v in results.items() if k.startswith(b)}), flush=True)
     head["torch"] = torch.__version__
     row = {**head, "device": dev, **results}

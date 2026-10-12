@@ -4,7 +4,8 @@
 # first N of them (behaviours.py teach, P processes sharing the GPU). The atlas files, split B's activity, the token rows
 # and vpd4l's weights come from rp-run-data (VPD's checkpoint in two pieces, put back together on the pod); the held Pile
 # texts (edit_eval.py tokens) go up as a file. Everything comes back to ~/mpd-data/runpod/NAME/out.
-#   experiments/oracle/pods/behaviours_pod.sh [NAME] [HOURS]      env: K, N, P, SEED, GPU, PRICE
+# BEHAVIOURS=FILE: behaviours sampled before (behaviours.py sample's output) in place of a new sample.
+#   experiments/oracle/pods/behaviours_pod.sh [NAME] [HOURS]      env: K, N, P, SEED, BEHAVIOURS, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -12,6 +13,10 @@ NAME=${1:-oracle-graph-behaviours} H=${2:-4}
 K=${K:-16} N=${N:-12} P=${P:-3} SEED=${SEED:-0}
 O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME V=/Users/user/mpd-data/vpd A=/Users/user/mpd-data/atlas/vpd4l
 G=/Users/user/mpd-data/graph_oracle
+F=/Users/user/mpd-data/scratch/rustmove/edit/pod_$NAME
+mkdir -p "$F"
+PRIOR=""
+if [ -n "${BEHAVIOURS:-}" ]; then cp "$BEHAVIOURS" "$F/behaviours.jsonl"; PRIOR="cp $F/behaviours.jsonl $O/out/behaviours.jsonl;"; fi
 RUNS="" ROWS=""
 for k in $(seq 0 $((P - 1))); do
   RUNS="$RUNS (python -B behaviours.py teach $O/out/behaviours.jsonl $O/out/teach_$k.jsonl --n $N --offset $k --stride $P > $O/teach_$k.log 2>&1; echo \"exit \$?\" >> $O/teach_$k.log) &"
@@ -23,7 +28,7 @@ ls $G/edit/tokens.npz $A/atlas.json $A/atlas.safetensors $A/tokens_0_6000.npy $A
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
-python -B behaviours.py sample $O/out/behaviours.jsonl --k $K --seed $SEED > $O/sample.log 2>&1;
+$PRIOR [ -s $O/out/behaviours.jsonl ] || python -B behaviours.py sample $O/out/behaviours.jsonl --k $K --seed $SEED > $O/sample.log 2>&1;
 set +e; $RUNS wait;
 cat $ROWS > $O/out/teach.jsonl; python -B behaviours.py table $O/out/teach.jsonl > $O/out/table.txt 2>&1; echo all stages done"
 RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=20 RP_MIN_RAM_GB=32 RP_DISK_GB=48 \

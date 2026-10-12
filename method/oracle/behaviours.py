@@ -293,7 +293,7 @@ class BehaviourEval:
         """Per node, the mean drop of the margin at the first n instances of part when the node's activation there is
         set to 0, with the persistent edit base applied (the drop from base's own margin)."""
         S, ee = self.S, self.ee
-        places = [(ids, p) for _, ids, v in self.texts[part] for p in v["instances"]][:n]
+        places = [(ids[:p + 1], p) for _, ids, v in self.texts[part] for p in v["instances"]][:n]  # nothing after p matters
         total = np.zeros(len(nodes))
         for ids, p in places:
             eds = [list(base)] + [list(base) + [edit_eval.scale_op((nd[0], p, nd[1]), 0.0)] for nd in nodes]
@@ -330,7 +330,7 @@ def candidates(src: Source, be: BehaviourEval, log=print) -> tuple[list[tuple[st
 
 def _unit_effects(be: BehaviourEval, neurons: list[tuple[int, int]], n: int = SCREEN_N) -> np.ndarray:
     S, ee = be.S, be.ee
-    places = [(ids, p) for _, ids, v in be.texts["fit"] for p in v["instances"]][:n]
+    places = [(ids[:p + 1], p) for _, ids, v in be.texts["fit"] for p in v["instances"]][:n]
     total = np.zeros(len(neurons))
     for ids, p in places:
         eds = [[]] + [[edit_eval.unit_op("neuron", layer, j, p, 0.0)] for layer, j in neurons]

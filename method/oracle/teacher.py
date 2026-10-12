@@ -84,39 +84,86 @@ class Pruner:
             out[n] = m
         return out
 
-    @torch.no_grad()
-    def kl_sets(self, ons: torch.Tensor) -> list[float]:
-        """KL at the target of each node subset's run, ons [K, N] (float masks built on the device, in batches of B)."""
-        nat, tg, T = self.ge.nat, self.ge.nat.target, self.tx.T
-        out = []
-        for s0 in range(0, len(ons), self.B):
-            on = ons[s0:s0 + self.B]
-            valid = len(on)
-            if 1 < valid < self.B:                                              # one batch shape: the GPU compiles per shape
-                on = torch.cat([on, on[-1:].expand(self.B - valid, -1)])
-            B = len(on)
-            for j, n in enumerate(self.names):
-                sel = (self.mat == j).nonzero().flatten()
-                m = torch.zeros(B, T, nat.C[n], device=nat.dev)
-                if len(sel):
-                    m[:, self.t[sel], self.c[sel]] = on[:, sel].float()
-                st = tg.site(n)
-                st.mask = m
-                st.delta_mask = torch.ones(B, T, device=nat.dev) if self.live else None
-            try:
-                hidden = tg.hidden(torch.tensor([self.tx.ids], device=nat.dev).expand(B, -1))
-            finally:
-                nat.vpd.clear()
-            lq = torch.log_softmax((hidden[:, self.tx.targets] @ tg.wte.T).float(), -1)
-            out += carry.kl(self.tx.ref, lq).tolist()[:valid]
-        self.measured += len(ons)
+    def _site_masks(self, on: torch.Tensor) -> dict:
+        """Each site's float mask [B, T, C] of node subsets on [B, N]."""
+        nat, T = self.ge.nat, self.tx.T
+        out = {}
+        for j, n in enumerate(self.names):
+            sel = self.sel[j]
+            m = torch.zeros(len(on), T, nat.C[n], device=nat.dev)
+            if len(sel):
+                m[:, self.t[sel], self.c[sel]] = on[:, sel].float()
+            out[n] = m
         return out
 
+    def _run(self, masks: dict, B: int, start: int = 0, prefix: list | None = None, layer: int = 0, keys_values: bool = False):
+        """The masked forward of B copies of the text (Target.hidden from start and layer, or its keys_values)."""
+        nat, tg, T = self.ge.nat, self.ge.nat.target, self.tx.T
+        for n in self.names:
+            st = tg.site(n)
+            st.mask = masks[n][:, start:]
+            st.delta_mask = torch.ones(B, T - start, device=nat.dev) if self.live else None
+        ids = torch.tensor([self.tx.ids], device=nat.dev).expand(B, -1)
+        try:
+            return tg.keys_values(ids) if keys_values else tg.hidden(ids, start, prefix, layer)
+        finally:
+            nat.vpd.clear()
+
+    @torch.no_grad()
+    def kl_sets(self, ons: torch.Tensor, pad: bool = False) -> list[float]:
+        """KL at the target of each node subset's run, ons [K, N] (float masks built on the device, in batches of B; a
+        last batch of one row runs alone, at batch 1, unless pad).
+        With at least two full batches on a Native.WINDOW_EXACT device, the rows are taken in order of the first layer,
+        then the first position, where each differs from the call's majority set, and a batch runs from its first such
+        layer and position (at least 64 positions) on, the layers below and the positions before reading the majority
+        set's run (its queries, keys, values and residual stream, computed once per set at batch B; Target.hidden's
+        window): the same numbers as the whole run there."""
+        nat, tg, T = self.ge.nat, self.ge.nat.target, self.tx.T
+        if not hasattr(self, "sel"):
+            self.sel = [(self.mat == j).nonzero().flatten() for j in range(len(self.names))]
+            self.layer = torch.tensor([int(n.split(".")[1]) for n in self.names], device=nat.dev, dtype=torch.int32)[self.mat]
+        K = len(ons)
+        window = K >= 2 * self.B and T > 64 and str(nat.dev).split(":")[0] in getattr(nat, "WINDOW_EXACT", ())
+        order, first, lowest = torch.arange(K, device=nat.dev), None, None
+        if window:
+            base = ons.sum(0) * 2 > K
+            key = base.cpu().numpy().tobytes()
+            runs = self.__dict__.setdefault("_prefixes", {})                # the last two sets' runs (measure alternates C, ~C)
+            if key not in runs:
+                if len(runs) >= 2:
+                    runs.pop(next(iter(runs)))
+                runs[key] = self._run(self._site_masks(base[None].expand(self.B, -1)), self.B, keys_values=True)
+            prefix = runs[key]
+            off = ons != base
+            pos = torch.where(off, self.t.int()[None], T).amin(1)            # each row's first position and layer off the base
+            lay = torch.where(off, self.layer[None], tg.n_layer).amin(1)
+            # A call's last row alone in its batch runs at batch 1 (no padding), which can round differently: it stays last
+            n = K - 1 if K % self.B == 1 and not pad else K
+            order = torch.cat([torch.argsort((lay * (T + 1) + pos)[:n], stable=True), order[n:]])
+            first, lowest = pos[order].tolist(), lay[order].tolist()
+        kl = [0.0] * K
+        for s0 in range(0, K, self.B):
+            idx = order[s0:s0 + self.B]
+            on = ons[idx]
+            valid = len(on)
+            if (pad or valid > 1) and valid < self.B:                           # one batch shape: the GPU compiles per shape
+                on = torch.cat([on, on[-1:].expand(self.B - valid, -1)])
+            B = len(on)
+            reuse = window and B == self.B
+            start = max(0, min(min(first[s0:s0 + valid]), T - 64, min(self.tx.targets))) if reuse else 0
+            layer = min(lowest[s0], tg.n_layer - 1) if reuse else 0
+            hidden = self._run(self._site_masks(on), B, start, prefix if reuse else None, layer)
+            lq = torch.log_softmax((hidden[:, [t - start for t in self.tx.targets]] @ tg.wte.T).float(), -1)
+            for i, x in zip(idx.tolist(), carry.kl(self.tx.ref, lq).tolist()[:valid]):
+                kl[i] = x
+        self.measured += K
+        return kl
+
     def without(self, groups: list[torch.Tensor]) -> list[float]:
-        """KL of the current circuit without each group of node ids (built a batch at a time)."""
+        """KL of the current circuit without each group of node ids (built 16 batches at a time)."""
         out = []
-        for s0 in range(0, len(groups), self.B):
-            part = groups[s0:s0 + self.B]
+        for s0 in range(0, len(groups), 16 * self.B):
+            part = groups[s0:s0 + 16 * self.B]
             on = self.on[None].repeat(len(part), 1)
             for i, g in enumerate(part):
                 on[i, g] = False
@@ -176,10 +223,13 @@ def scores(empty: float, vpd: float, c: float, minus: float) -> tuple[float, flo
 
 def measure(pr: Pruner, ons: torch.Tensor, empty: float, vpd: float) -> list[dict]:
     """Each node set's KL_C and KL_{VPD minus C} (two runs: the set, and VPD's answer without it), F1, N and mean."""
-    kl = pr.kl_sets(torch.cat([ons, ~ons]))
-    K = len(ons)
-    out = []
-    for c, m in zip(kl[:K], kl[K:]):
+    K, out = len(ons), []
+    if 2 * K <= pr.B:                  # one batch either way
+        kl = pr.kl_sets(torch.cat([ons, ~ons]))
+        cs, ms = kl[:K], kl[K:]
+    else:                              # apart, each call's rows sharing one set they differ from; every row at batch B
+        cs, ms = pr.kl_sets(ons, pad=True), pr.kl_sets(~ons, pad=True)
+    for c, m in zip(cs, ms):
         f1, n, j = scores(empty, vpd, c, m)
         out.append({"kl_c": c, "kl_minus": m, "f1": f1, "n": n, "mean": j})
     return out

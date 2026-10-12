@@ -2,11 +2,13 @@
 answer: the causal-importance network or teacher.py --save-vpd's file VPD_SAVED): the windowed masked runs
 (Pruner.kl_sets on a device in Pruner.WINDOWS) equal the whole runs to the bit on MPS and within float32 rounding on
 CUDA, and the products on the start set's subcomponents alone (Pruner._gather) with torch's fused norms and GELU
-(Pruner.fused) match the products on all subcomponents with vpd_model's own steps within float32 rounding.
+(Pruner.fused) match the products on all subcomponents with vpd_model's own steps within float32 rounding, and a
+teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -106,3 +108,17 @@ def test_graph_runs_bound_by_masked_runs():
     # remainders off: every connection stated is the circuit's masked run, none stated the empty circuit's
     assert abs(every - masked) / masked < 1e-4
     assert abs(none - empty) / empty < 1e-4
+
+
+@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
+def test_from_path_reproduces_the_pick_and_its_connections():
+    if not VPD_SAVED.exists():
+        pytest.skip("needs VPD's answers " + str(VPD_SAVED))
+    ge = goal_eval.GoalEval(native.Native(DEVICE), chunk=32)
+    ids, targets = native.text(native.TEXTS / "vpd4l" / "text9019.json")   # a short path: 15 subcomponents at the start
+    saved = torch.load(VPD_SAVED)["text9019"]
+    full, row, path_file = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True)
+    again, row_again, _ = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True,
+                                        from_path=json.loads(json.dumps(path_file)))
+    assert row_again["pick"] == row["pick"] and row_again["best"]["size"] == row["best"]["size"]
+    assert again[""] == full[""] and again["f1"] == full["f1"] and again[f"vpd_top{row['top_k']}"] == full[f"vpd_top{row['top_k']}"]

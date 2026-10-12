@@ -36,12 +36,18 @@ Per text:
      is the smallest path point with N >= 0.9 whose connections reach F1 >= 0.9 (bisection between the smallest
      such point and step 4's pick; F1 rises as connections go: on text9002 92 subcomponents give 0.881 with all
      1,004 connections, 0.919 with 65 of them), with its connections; the points nearest 16, 32 and 64 get theirs
-     too, for re-picking. Without a point meeting both, step 4's pick with its connections.
+     too, for re-picking. Without a point meeting both, step 4's pick with its connections. With --edges-at pick (the
+     default), connections at step 4's pick only.
+  With --from-path DIR, steps 1-3 come from DIR's <task>.path.json (the start set, every step's removals and
+  measurements, the F1 circuit and top-k; for path files without the last two, DIR's <task>.f1.json and
+  <task>.vpd_top<k>.json), so a text costs the pick and its connections alone; the start set must be the one VPD's
+  answer gives here. With --max-nodes K, step 4 picks among the path points of at most K nodes.
 Every membership decision is measured; orderings only order.
 
 Output per text in --out: <task>.json (the teacher circuit), <task>.f1.json, <task>.vpd_top<k>.json, <task>.n<size>.json at
 the path points nearest 16 to 256 nodes (goal_eval's circuit JSON: nodes [matrix, index, position] and ["tok", 0,
-position] input nodes; edges with --edges), <task>.path.json (the start set and every step; with --edges,
+position] input nodes; edges with --edges), <task>.path.json (the start set, every step, the F1 circuit's node ids
+"f1_index" and "top_k"; with --edges,
 "edge_paths": per pruned point its node step, its connections [writer id, reader id or "out"] in node ids, and every
 edge step: nodes, edges, the connection indices removed, KL_graph, F1_graph, N (the nodes'), size_term and
 (F1 + N) / 5 - 0.5 size), and a line in summary_<offset>.jsonl.
@@ -409,18 +415,23 @@ def circuit_json(pr: Pruner, on: torch.Tensor, edges: list | None = None) -> dic
             "edges": [[at[w], "out" if r is None else at[r]] for w, r in edges or []], "explanation": ""}
 
 
-def pick(rows: list[dict], f1: str, goal: float = RECOVERED) -> tuple[int, str]:
-    """(the smallest row with F1 and N >= goal, "goal"), or without one (the row with the largest min(F1, N), "max-min")."""
-    ok = [i for i, r in enumerate(rows) if r[f1] >= goal and r["n"] >= goal]
+def pick(rows: list[dict], f1: str, goal: float = RECOVERED, cap: int | None = None) -> tuple[int, str]:
+    """(the smallest row with F1 and N >= goal, "goal"), or without one (the row with the largest min(F1, N), "max-min"),
+    among the rows of at most cap nodes (every row without a cap; the smallest row when none is that small)."""
+    within = [i for i, r in enumerate(rows) if cap is None or r["size"] <= cap] or [min(range(len(rows)), key=lambda i: rows[i]["size"])]
+    ok = [i for i in within if rows[i][f1] >= goal and rows[i]["n"] >= goal]
     if ok:
         return min(ok, key=lambda i: (rows[i]["size"], -min(rows[i][f1], rows[i]["n"]))), "goal"
-    return max(range(len(rows)), key=lambda i: (min(rows[i][f1], rows[i]["n"]), -rows[i]["size"])), "max-min"
+    return max(within, key=lambda i: (min(rows[i][f1], rows[i]["n"]), -rows[i]["size"])), "max-min"
 
 
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
-          vpd_order: list | None = None, start_top: int = 0, f1_start: str = "targets", edges: bool = False) -> tuple[dict, dict]:
+          vpd_order: list | None = None, start_top: int = 0, f1_start: str = "targets", edges: bool = False,
+          from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = None) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
-    VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour."""
+    VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
+    from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
+    in place of the F1 search, top-k and joint path."""
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets)
@@ -459,40 +470,59 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
                   f"(budget {budget:.3g}), {rounds} rounds, {lv['seconds']:.0f}s, {pr.measured} sets so far", flush=True)
         return row["levels"][f"{label}{levels[-1]}"]["kl"] <= budget
 
-    whole = pr.on.clone()
-    reached = False
-    if not start_top and f1_start != "whole":                # first VPD's answer at the targets alone, subcomponents only
-        pr.on = whole & torch.isin(pr.t, torch.tensor(targets, device=pr.t.device))
-        reached = search(("chunk4", "subcomponent"), "target ")
-    f1_targets = pr.on.clone() if reached else None
-    if not reached or f1_start == "both":
-        pr.on = whole.clone()
-        levels = LEVELS
-        if start_top:                                        # the F1 search from VPD's top start_top, subcomponents only
-            pr.on[:] = False
-            pr.on[order[:start_top]] = True
-            levels = ("chunk16", "chunk4", "subcomponent")
-        search(levels, "")
-    row["f1_from_targets"] = reached
-    f1_on = pr.on.clone()
-    if f1_targets is not None and f1_start == "both":       # the union of the two F1 circuits
-        row["f1_sizes"] = [int(f1_targets.sum()), int(f1_on.sum())]
-        f1_on |= f1_targets
-    t1 = time.perf_counter()
-    k = top_k(pr, order, empty, vpd)
-    topk_on = torch.zeros_like(f1_on)
-    topk_on[order[:k]] = True
-    start = f1_on | topk_on
-    path = joint_path(pr, start, empty, vpd)
+    if from_path is None:
+        whole = pr.on.clone()
+        reached = False
+        if not start_top and f1_start != "whole":            # first VPD's answer at the targets alone, subcomponents only
+            pr.on = whole & torch.isin(pr.t, torch.tensor(targets, device=pr.t.device))
+            reached = search(("chunk4", "subcomponent"), "target ")
+        f1_targets = pr.on.clone() if reached else None
+        if not reached or f1_start == "both":
+            pr.on = whole.clone()
+            levels = LEVELS
+            if start_top:                                    # the F1 search from VPD's top start_top, subcomponents only
+                pr.on[:] = False
+                pr.on[order[:start_top]] = True
+                levels = ("chunk16", "chunk4", "subcomponent")
+            search(levels, "")
+        row["f1_from_targets"] = reached
+        f1_on = pr.on.clone()
+        if f1_targets is not None and f1_start == "both":   # the union of the two F1 circuits
+            row["f1_sizes"] = [int(f1_targets.sum()), int(f1_on.sum())]
+            f1_on |= f1_targets
+        t1 = time.perf_counter()
+        k = top_k(pr, order, empty, vpd)
+        topk_on = torch.zeros_like(f1_on)
+        topk_on[order[:k]] = True
+        start = f1_on | topk_on
+        path = joint_path(pr, start, empty, vpd)
+    else:                                                    # steps 1-3 as saved: the same start set, its steps
+        t1 = time.perf_counter()
+        saved_start = [(n, int(t), int(c)) for n, c, t in from_path["start_nodes"]]
+        if [pr.nodes[i] for i in from_path["start_index"]] != saved_start:
+            raise ValueError("the path file's start set is not VPD's answer here (another VPD answer or node order)")
+        start = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
+        start[from_path["start_index"]] = True
+        f1_on = torch.zeros_like(start)
+        f1_on[from_path["f1_index"] if "f1_index" in from_path
+              else [index[(n, int(t), int(c))] for n, c, t in from_path["f1_nodes"]]] = True
+        k = from_path["top_k"]
+        topk_on = torch.zeros_like(start)
+        topk_on[order[:k]] = True
+        path = [dict(r) for r in from_path["steps"]]
+        row["from_path"] = True
     sizes = [r["size"] for r in path]
     vs = []
     for sz in sizes:                                         # VPD's own order at every path size
         on = torch.zeros_like(f1_on)
         on[order[:sz]] = True
         vs.append(on)
-    vpd_rows = []
-    for s0 in range(0, len(vs), pr.B):
-        vpd_rows += measure(pr, torch.stack(vs[s0:s0 + pr.B]), empty, vpd)
+    if from_path is None:
+        vpd_rows = []
+        for s0 in range(0, len(vs), pr.B):
+            vpd_rows += measure(pr, torch.stack(vs[s0:s0 + pr.B]), empty, vpd)
+    else:
+        vpd_rows = [dict(r["vpd_top"]) for r in path]
     removed, ons = [], []
     on = start.clone()
     for r in path:
@@ -505,7 +535,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         v["size_term"] = size_term(on_v)
         v["reward"] = (v["f1"] + v["n"]) / TERMS - SIZE_WEIGHT * v["size_term"]
         r["vpd_top"] = v
-    best, row["pick"] = pick(path, "f1")
+    best, row["pick"] = pick(path, "f1", cap=max_nodes)
     points = {min(range(len(path)), key=lambda j: abs(path[j]["size"] - want)) for want in SIZES}
     wired, edge_paths, t2 = {}, [], time.perf_counter()     # node step -> (its last edge step's connections, its row)
 
@@ -525,7 +555,9 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
                   f"(all {steps[0]['f1_graph']:.3f}), N {last['n']:.3f}, {ep.measured} sets", flush=True)
         return wired[i][1]["f1_graph"] >= RECOVERED
 
-    if edges:
+    if edges and edges_at == "pick":                         # connections at step 4's pick alone
+        wire(best)
+    elif edges:
         cands = [i for i in range(best, len(path)) if path[i]["n"] >= RECOVERED]   # the pick and smaller points, N >= 0.9
         if row["pick"] == "goal" and wire(best):
             lo, hi = 0, len(cands) - 1                       # cands[0] is the pick
@@ -549,7 +581,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     if edges:
         row.update(best_edges=wired[best][1], edge_points=[w[1] for w in wired.values()], edge_seconds=time.perf_counter() - t2)
     path_file = {"start_nodes": [[n, c, t] for n, t, c in (pr.nodes[i] for i in start.nonzero().flatten().tolist())],
-                 "start_index": start.nonzero().flatten().tolist(), "steps": path}
+                 "start_index": start.nonzero().flatten().tolist(), "steps": path,
+                 "f1_index": f1_on.nonzero().flatten().tolist(), "top_k": k}
     if edges:
         path_file["edge_paths"] = edge_paths
     return circuits, row, path_file
@@ -569,7 +602,12 @@ def main():
     ap.add_argument("--f1-start", choices=("targets", "whole", "both"), default="targets",
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
-    ap.add_argument("--edges", action="store_true", help="prune the connections of the teacher circuit and smaller path points (graph semantics)")
+    ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
+    ap.add_argument("--edges-at", choices=("pick", "search"), default="pick",
+                    help="connections at step 4's pick alone (pick), or the smallest point with N >= 0.9 whose connections reach "
+                         "graph F1 >= 0.9 by bisection, and the points nearest 16, 32 and 64 (search)")
+    ap.add_argument("--from-path", type=Path, help="a directory of this script's outputs: each text's saved path in place of steps 1-3")
+    ap.add_argument("--max-nodes", type=int, help="the pick among path points of at most this many nodes")
     ap.add_argument("--tasks", type=Path, help="task ids, one per line, in place of the split's first n texts")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
@@ -597,9 +635,19 @@ def main():
     for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
             continue
+        from_path = None
+        if args.from_path:
+            source = args.from_path / f"{path.stem}.path.json"
+            if not source.exists():
+                continue
+            from_path = json.loads(source.read_text())
+            if "f1_index" not in from_path:                  # path files written before f1_index and top_k
+                from_path["f1_nodes"] = [x for x in json.loads((args.from_path / f"{path.stem}.f1.json").read_text())["nodes"] if x[0] != "tok"]
+                from_path["top_k"] = int(next(args.from_path.glob(f"{path.stem}.vpd_top*.json")).stem.split(".vpd_top")[1])
         ids, targets = native.text(path)
         saved = vpd.get(path.stem, {})
-        circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start, args.edges)
+        circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
+                                         args.edges, from_path, args.edges_at, args.max_nodes)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

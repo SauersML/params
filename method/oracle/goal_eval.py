@@ -1199,13 +1199,15 @@ class GoalEval:
 
 
     def _adv_problem(self, tx: Text, graphs: list[native.Graph], pool: dict, k: int, gen: torch.Generator,
-                     batched: bool = False) -> tuple:
+                     batched: bool = False, patterns: bool = True) -> tuple:
         """adversary()'s objective: the K patterns drawn (pool indices) and, per circuit, (kls, idx, cols): kls(w [R, K],
         b {site: [R, omitted]}, precision="score") -> (KL_C, KL_VPD) [R] bits, differentiable; idx per site the omitted
         subcomponents (positions, column indices); cols per site the engine's columns. batched: also batch(items,
         precision="score", vpd=True), items [(circuit, w, b)] -> [(KL_C, KL_VPD)], every item's rows in one run of each
         kind (the stated graphs' as one list of graphs, the complete ones', VPD's answer's; vpd=False leaves VPD's out,
-        KL_VPD None): the same numbers within float32 rounding, a run per kind instead of per circuit."""
+        KL_VPD None): the same numbers within float32 rounding, a run per kind instead of per circuit. patterns=False:
+        the pattern lever stays off (w = 0), so the engine leaves out the patterns' subcomponents (the omitted lever's
+        flips: about a third of the columns)."""
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
@@ -1213,7 +1215,7 @@ class GoalEval:
         pats = [pattern(pool, i) for i in pick]
         cols = {}
         for n in nat.names:
-            parts = [tx.vpd[n].any(0).nonzero().flatten()] + [p[n].to(dev) for p in pats if n in p]
+            parts = [tx.vpd[n].any(0).nonzero().flatten()] + [p[n].to(dev) for p in pats if n in p and patterns]
             parts += [torch.tensor([c for m, _, c in g.node_set() if m == n], dtype=torch.long, device=dev) for g in graphs]
             cols[n] = torch.unique(torch.cat(parts))
         E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols)
@@ -1374,9 +1376,9 @@ class GoalEval:
         e0 = self._bounds(tx, "live")[0]
         ms = FLIPS[lever] if ms is None else ms
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
-        pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True)
-        search = "bf16" if str(dev).startswith("cuda") else "score"  # the sign steps' precision (scores: float32)
         omitted = lever == "omitted"  # the patterns stay off: VPD's paired run is VPD's answer alone, run once
+        pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True, patterns=not omitted)
+        search = "bf16" if str(dev).startswith("cuda") else "score"  # the sign steps' precision (scores: float32)
         sizes = [[len(idx[n][0]) for n in nat.names] for _, idx, _ in problems]
         N = [sum(z) if omitted else len(pick) for z in sizes]
 

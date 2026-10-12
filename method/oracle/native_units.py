@@ -438,6 +438,7 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
         keep = sorted(f1_part.units(), key=lambda u: -effect[u])[:JOINT_MAX]
         f1_part = f1_part.without(sorted(set(f1_part.units()) - set(keep)))
 
+    t1 = time.perf_counter()
     kl_full = nu.kl(full)[0]
     effect = screen(nu, full, kl_full, log)
     pr.measured += len(effect) + 1
@@ -453,6 +454,8 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
             mid = (lo + hi) // 2
             lo, hi = (lo, mid) if n_of(mid) >= teacher.N_TARGET else (mid, hi)
     k = hi
+    if log:
+        log(f"  native order and top k: k = {k}, {pr.measured} runs, {time.perf_counter() - t1:.0f} s")
     top = Mask(torch.zeros_like(full.heads), torch.zeros_like(full.neurons))
     for kind, l, t, j in order[:k]:
         (top.heads if kind == "head" else top.neurons)[l, t, j] = True
@@ -487,6 +490,9 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
         i = max(range(len(ks)), key=lambda j: (got[j]["mean"], ks[j]))
         S = S.without(ranked[:ks[i]])
         path.append({"size": S.count(), "units": S.units(), **got[i]})
+        if log:
+            log(f"  joint path: {S.count()} units, F1 {got[i]['f1']:.3f}, N {got[i]['n']:.3f}, {pr.measured} runs, "
+                f"{time.perf_counter() - t0:.0f} s")
     return {"kl_empty_off": empty, "kl_vpd_off": vpd, "budget_kl": budget, "f1_from_targets": reached, "levels": levels,
             "f1_circuit": {"size": f1_set.count(), "positions": len({u[2] for u in f1_set.units()}), "kl": f1_row["kl_c"],
                            "f1": f1_row["f1"], "n": f1_row["n"]}, "top_k": k, "start_size": start.count(),

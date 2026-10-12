@@ -8,8 +8,8 @@ Goals (goals(): one text's, drawn by the text's seed; seed + 1 gives a fresh dra
   detach     make the prediction not depend on the token at an earlier position (one of goal_eval's F2 positions, whose
              changed token moves the prediction by at least 1% of the text's total)
   behaviour  stop copying, on every text: the copy-mistake set (COPY: confident wrong copies of an earlier continuation,
-             Pile val rows 9400-9599) split in a first half for the search (its first COPY_SEARCH) and a second half for
-             the score
+             Pile val rows 9400-9599) split in a first half for the search (its first COPY_FIT propose steps, the rest
+             validate them) and a second half for the score
 
 Edits (Editor): the model's own forward pass with each matrix W as its subcomponents V U plus its remainder W - V U, and
   scale n k     subcomponent n's activation at its position times k; persistent: at every position, the weight edit
@@ -101,9 +101,10 @@ FORM_BITS = 2  # an operation's form: cut or scale, local or persistent
 CHUNK = 16  # edited runs of 512 positions per batch (more when they compute fewer positions)
 MAX_ROWS = 1024  # edited runs per batch at most
 BLOCK = 256  # edits scored at once
-COPY_SEARCH = 32  # the copy search's instances (the first of the copy set's first half)
+COPY_FIT = 48  # the copy search's fit instances (the first of the copy set's first half; the rest validate)
 POSITIONS = 1024  # positions per block of vocabulary-sized arrays
 MAX_OPS = 16  # the search's largest edit
+PICK = 16  # a persistent search's candidates per round measured on its validation instances
 SCREEN = 256  # the search's candidates after its first round: the most helpful of that round
 NODE_SCALES = (0.0, -1.0, 2.0)  # the search's scale factors for a node
 LN2 = math.log(2)
@@ -619,14 +620,14 @@ class EditEval:
 
     # scores
 
-    def score_many(self, task: dict, goal: dict, edits: list[list[dict]], search: bool = False) -> list[dict]:
+    def score_many(self, task: dict, goal: dict, edits: list[list[dict]], search: bool = False, part: str | None = None) -> list[dict]:
         """Per edit (components.parse()'s ops), the row {"valid", "why", "attained", "progress", "success",
         "collateral", "size", ...}. search: the teacher's numbers (alternatives SEARCH_RANKS, collateral texts
         SEARCH_ROWS, the copy set's first half) in place of the score's."""
         if len(edits) > BLOCK:  # bounded memory: the target distributions kept per block
-            return [r for b0 in range(0, len(edits), BLOCK) for r in self.score_many(task, goal, edits[b0:b0 + BLOCK], search)]
+            return [r for b0 in range(0, len(edits), BLOCK) for r in self.score_many(task, goal, edits[b0:b0 + BLOCK], search, part)]
         if goal["kind"] == "behaviour":
-            return self._score_copy(goal, edits, search)
+            return self._score_copy(goal, edits, part or ("fit" if search else "score"))
         p = task["prompts"][0]
         ids, targets = p["token_ids"], p["target_positions"]
         T = len(ids)
@@ -676,11 +677,13 @@ class EditEval:
     def score(self, task: dict, goal: dict, ops: list[dict]) -> dict:
         return self.score_many(task, goal, [ops])[0]
 
-    def _score_copy(self, goal: dict, edits: list[list[dict]], search: bool) -> list[dict]:
-        """The behaviour goal on the copy set's second half (search: its first half): per instance the flip progress on
+    def _score_copy(self, goal: dict, edits: list[list[dict]], part: str) -> list[dict]:
+        """The behaviour goal on the copy set's second half (part "score"; "fit" and "val": its first half's two parts):
+        per instance the flip progress on
         the copied token; collateral = the held texts' mean summed KL + the instances' mean summed kept KL."""
         first, second = copy_instances()
-        half = first[:COPY_SEARCH] if search else second
+        half = {"fit": first[:COPY_FIT], "val": first[COPY_FIT:], "score": second}[part]
+        search = part != "score"
         T = max(len(c["ids"]) for c in half)
         rows = [self._row(ops, check(ops, T, [T - 1], behaviour=True), T) for ops in edits]
         ok = [b for b, r in enumerate(rows) if r["why"] is None]
@@ -897,12 +900,15 @@ def _rate(row: dict, cur: dict | None) -> float | None:
     return dp / max(db, 1e-9)
 
 
-def frontier(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN, log=print) -> dict:
+def frontier(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN, log=print, validate=None,
+             pick: int = PICK) -> dict:
     """A persistent goal's search: a goal on every text can be reached by breaking the model, so each round adds the
     candidate with the most progress per bit of collateral and size, and every step is kept: the path from the
-    unedited model traces progress against collateral (each step a point).
-    Returns {"path": [{"ops", "row"}], "evaluated"}."""
-    S, cur, evaluated, path = [], None, 0, []
+    unedited model traces progress against collateral (each step a point). validate (rows on other instances): the
+    pick candidates with the best rate on score's instances are measured there and the step is the one with the best
+    validation rate, never chosen by the instances that proposed it; "chosen" is the step with the best validation
+    net (goal_bits - collateral). Returns {"path": [{"ops", "edit", "row", "validation"}], "chosen", "evaluated"}."""
+    S, cur, cur_v, evaluated, path = [], None, None, 0, []
     for r in range(max_ops):
         rows = score([S + [c] for c in pool])
         evaluated += len(pool)
@@ -915,13 +921,23 @@ def frontier(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCRE
         if not ranked:
             break
         best = ranked[0]
+        if validate is not None:
+            top = ranked[:pick]
+            vrows = validate([S + [pool[i]] for i in top])
+            evaluated += len(top)
+            vr = [(g, i, v) for i, v in zip(top, vrows) if (g := _rate(v, cur_v)) is not None]
+            if not vr:
+                break
+            _, best, cur_v = max(vr, key=lambda x: x[0])
         S, cur = S + [pool[best]], rows[best]
-        path.append({"ops": [op_text(o) for o in S], "edit": [_jsonable(o) for o in S], "row": cur})
-        log(f"  step {r}: {op_text(pool[best])} -> progress {cur['progress']:.3f} collateral {cur['collateral']:.3f}")
+        path.append({"ops": [op_text(o) for o in S], "edit": [_jsonable(o) for o in S], "row": cur, "validation": cur_v})
+        log(f"  step {r}: {op_text(pool[best])} -> progress {cur['progress']:.3f} collateral {cur['collateral']:.3f}"
+            + (f"; validation {cur_v['progress']:.3f}, {cur_v['collateral']:.3f}" if cur_v else ""))
         pool = [c for j, c in enumerate(pool) if j != best]
-        if cur["attained"]:
+        if (cur_v or cur)["attained"]:
             break
-    return {"path": path, "evaluated": evaluated}
+    nets = [(st["validation"] or st["row"]).get("net", -math.inf) for st in path]
+    return {"path": path, "chosen": int(np.argmax(nets)) if path else None, "evaluated": evaluated}
 
 
 def vpd_topk(ee: EditEval, task: dict, sizes) -> list[tuple[int, list[dict]]]:
@@ -1007,26 +1023,29 @@ def teach_copy(ee: EditEval, log=print, screen_n: int = 16) -> dict:
     t0 = time.perf_counter()
     goal = copy_goal()
     first, _ = copy_instances()
-    score = lambda eds: ee.score_many({"id": "copy"}, goal, eds, search=True)  # noqa: E731
+    score = lambda eds: ee.score_many({"id": "copy"}, goal, eds, part="fit")  # noqa: E731
+    validate = lambda eds: ee.score_many({"id": "copy"}, goal, eds, part="val")  # noqa: E731
     tg = ee.nat.target
     out = {"goal": goal}
-    nodes = copy_nodes(ee, first)
-    log(f"copy: {len(nodes)} subcomponents active at >= 2 first-half targets")
-    order = screen_local(ee, first, [lambda t, nd=nd: scale_op((nd[0], t, nd[2]), 0.0) for nd in nodes], screen_n, SCREEN, log)
+    fit = first[:COPY_FIT]  # proposals come from the fit instances alone
+    nodes = copy_nodes(ee, fit)
+    log(f"copy: {len(nodes)} subcomponents active at >= 2 fit targets")
+    order = screen_local(ee, fit, [lambda t, nd=nd: scale_op((nd[0], t, nd[2]), 0.0) for nd in nodes], screen_n, SCREEN, log)
     top = [nodes[i] for i in order]
     pool = [scale_op(nd, k) for nd in top for k in NODE_SCALES]
     lead = top[:32]
     pool += [cut_op(r, w) for r in lead for w in lead if _connected(w, r, [0], True)]
     width = tg.site(native.site_name(0, "c_fc")).W.shape[0]
     neurons = [(layer, j) for layer in range(tg.n_layer) for j in range(width)]
-    order = screen_local(ee, first, [lambda t, u=u: unit_op("neuron", u[0], u[1], t, 0.0) for u in neurons], screen_n, SCREEN, log)
+    order = screen_local(ee, fit, [lambda t, u=u: unit_op("neuron", u[0], u[1], t, 0.0) for u in neurons], screen_n, SCREEN, log)
     upool = [unit_op("head", layer, h, None, k) for layer in range(tg.n_layer) for h in range(tg.n_head) for k in NODE_SCALES]
     upool += [unit_op("neuron", neurons[i][0], neurons[i][1], None, k) for i in order for k in NODE_SCALES]
     for name, pl in (("teacher", pool), ("units", upool)):
         log(f"copy {name}: {len(pl)} candidates")
-        res = frontier(score, pl, log=log)
+        res = frontier(score, pl, log=log, validate=validate)
         rows = ee.score_many({"id": "copy"}, goal, [[_from_json(o) for o in st["edit"]] for st in res["path"]])
-        out[name] = {"path": [{**st, "score": r} for st, r in zip(res["path"], rows)], "evaluated": res["evaluated"]}
+        out[name] = {"path": [{**st, "score": r} for st, r in zip(res["path"], rows)], "chosen": res["chosen"],
+                     "evaluated": res["evaluated"]}
     sizes = sorted(set(SIZES))
     eds = [[scale_op(nd, 0.0) for nd in nodes[:k]] for k in sizes]
     out["vpd_topk"] = [{"k": k, "score": r} for k, r in zip(sizes, ee.score_many({"id": "copy"}, goal, eds))]
@@ -1155,7 +1174,8 @@ def table(rows: list[dict], copy: dict | None = None) -> str:
                      f"{sorted(hit)[len(hit) // 2] if hit else '-'})")
     if copy:
         lines.append("copy (persistent; fresh half): method flipped halved progress rest collateral_held collateral_instances ops")
-        steps = [(f"{name} {k + 1}", st["score"], k + 1) for name in ("teacher", "units") for k, st in enumerate(copy.get(name, {}).get("path", []))]
+        steps = [(f"{name} {k + 1}" + (" *" if k == copy[name].get("chosen") else ""), st["score"], k + 1)
+                 for name in ("teacher", "units") for k, st in enumerate(copy.get(name, {}).get("path", []))]
         steps.append(("l2_heads_2_4", copy.get("l2_heads_2_4", {}).get("score"), 3))
         for name, s, n in steps:
             if s and s.get("valid"):

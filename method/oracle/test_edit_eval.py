@@ -269,3 +269,25 @@ def test_frontier_takes_progress_per_collateral():
     res = edit_eval.frontier(score, pool, max_ops=2, log=lambda m: None)
     assert [st["row"]["progress"] for st in res["path"]] == [0.3, pytest.approx(1.0)]
     assert res["path"][0]["edit"][0]["node"] == ["h.0.mlp.c_fc", None, 1]
+
+
+def test_frontier_steps_chosen_by_validation():
+    """With validation instances, a step is the candidate with the best validation rate among the best on fit, and the
+    chosen step the one with the best validation net."""
+    fit = {"a": (0.9, 1.0), "b": (0.5, 1.0)}  # name -> (progress, collateral) on the fit instances
+    val = {"a": (0.1, 1.0), "b": (0.5, 1.0)}  # a overfits: it does little on validation
+    pool = [edit_eval.scale_op(("h.0.mlp.c_fc", None, i), 0.0) for i in range(2)]
+    name = {id(pool[0]): "a", id(pool[1]): "b"}
+
+    def rows(table):
+        def score(eds):
+            out = []
+            for ops in eds:
+                p = min(1.0, sum(table[name[id(o)]][0] for o in ops))
+                c = sum(table[name[id(o)]][1] for o in ops)
+                out.append({"valid": True, "progress": p, "collateral": c, "size": 20.0 * len(ops), "attained": False,
+                            "net": p * 10 - c})
+            return out
+        return score
+    res = edit_eval.frontier(rows(fit), pool, max_ops=1, log=lambda m: None, validate=rows(val), pick=2)
+    assert res["path"][0]["edit"][0]["node"] == ["h.0.mlp.c_fc", None, 1] and res["chosen"] == 0

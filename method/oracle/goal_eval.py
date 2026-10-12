@@ -962,9 +962,9 @@ class GoalEval:
         """adversary()'s objective: the K patterns drawn (pool indices) and, per circuit, (kls, idx, cols): kls(w [R, K],
         b {site: [R, omitted]}, precision="score") -> (KL_C, KL_VPD) [R] bits, differentiable; idx per site the omitted
         subcomponents (positions, column indices); cols per site the engine's columns. batched: also batch(items,
-        precision="score"), items [(circuit, w, b)] -> [(KL_C, KL_VPD)], every item's rows in one run of each kind
-        (the stated graphs' as one list of graphs, the complete ones', VPD's answer's): the same numbers within float32
-        rounding, a run per kind instead of per circuit."""
+        precision="score", vpd=True), items [(circuit, w, b)] -> [(KL_C, KL_VPD)], every item's rows in one run of each
+        kind (the stated graphs' as one list of graphs, the complete ones', VPD's answer's; vpd=False leaves VPD's out,
+        KL_VPD None): the same numbers within float32 rounding, a run per kind instead of per circuit."""
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
@@ -1010,7 +1010,7 @@ class GoalEval:
                 mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :]
             return uc, mv
 
-        def batch(items, precision="score"):
+        def batch(items, precision="score", vpd=True):  # vpd=False: the circuits' runs alone (KL_VPD None)
             built = [masks(i, w, b) for i, w, b in items]
             R = [w.shape[0] for _, w, _ in items]
             kc = [None] * len(items)
@@ -1027,6 +1027,8 @@ class GoalEval:
                     got = E.graph_kl(plans[key], u={n: torch.cat([built[j][0][n] for j in js]) for n in nat.names}, precision=precision)
                 for j, x in zip(js, got.split([R[j] for j in js])):
                     kc[j] = x
+            if not vpd:
+                return [(x, None) for x in kc]
             kv = E.kl({n: torch.cat([x[1][n] for x in built]) for n in nat.names}, precision).split(R)
             return list(zip(kc, kv))
 
@@ -1078,10 +1080,12 @@ class GoalEval:
                         r = max(range(restarts), key=lambda r: gap[r])
                         row = out[i]
                         row["f1_adv_curve"][step] = _fid(e0, float(kc[r]), float(kv[r]))
-                        row.update({"kl_c_adv": float(kc[r]), "kl_vpd_adv": float(kv[r]), "f1_adv": row["f1_adv_curve"][step],
-                                    "adv_mask": {"patterns": [pick[j] for j in wb[i][r].nonzero().flatten().tolist()],
-                                                 "omitted": [(n, int(idx[n][0][j]), int(cols[n][idx[n][1][j]]))
-                                                             for n in nat.names for j in bb[i][n][r].nonzero().flatten().tolist()]}})
+                        row.update({"kl_c_adv": float(kc[r]), "kl_vpd_adv": float(kv[r]), "f1_adv": row["f1_adv_curve"][step]})
+                        if step == max(curve):  # the final mask, read in one transfer per site (not a sync per entry)
+                            on = {n: bb[i][n][r].nonzero().flatten() for n in nat.names}
+                            row["adv_mask"] = {"patterns": [pick[j] for j in wb[i][r].nonzero().flatten().tolist()],
+                                               "omitted": [(n, t, c) for n in nat.names for t, c in
+                                                           zip(idx[n][0][on[n]].tolist(), cols[n][idx[n][1][on[n]]].tolist())]}
             if step == max(curve):
                 break
             leaves = []
@@ -1114,49 +1118,66 @@ class GoalEval:
         e0 = self._bounds(tx, "live")[0]
         ms = FLIPS[lever] if ms is None else ms
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
-        pick, problems = self._adv_problem(tx, graphs, pool, k, gen)
-        out = []
-        for kls, idx, cols in problems:
-            sizes = [len(idx[n][0]) for n in nat.names]
-            N = sum(sizes) if lever == "omitted" else len(pick)
+        pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True)
+        search = "bf16" if str(dev).startswith("cuda") else "score"  # the sign steps' precision (scores: float32)
+        omitted = lever == "omitted"  # the patterns stay off: VPD's paired run is VPD's answer alone, run once
+        sizes = [[len(idx[n][0]) for n in nat.names] for _, idx, _ in problems]
+        N = [sum(z) if omitted else len(pick) for z in sizes]
 
-            def call(x):
-                R = x.shape[0]
-                if lever == "omitted":
-                    return kls(torch.zeros(R, len(pick), device=dev), dict(zip(nat.names, torch.split(x, sizes, 1))))
-                return kls(x, {n: torch.zeros(R, sz, device=dev) for n, sz in zip(nat.names, sizes)})
-
-            def top(x, m):  # each row's m largest entries kept, the rest 0
-                keep = torch.zeros_like(x, dtype=torch.bool).scatter(1, x.topk(m, 1).indices, True)
-                return x * keep
-
-            def grad(x):
-                x = x.detach().requires_grad_(True)
-                kc, kv = call(x)
-                return torch.autograd.grad((kc.clamp_min(1e-12).log() - kv.clamp_min(1e-12).log()).sum(), x)[0]
-
-            f1s, kl, mask = {}, {}, {}
-            flat = [(n, int(idx[n][0][j]), int(cols[n][idx[n][1][j]])) for n in nat.names for j in range(len(idx[n][0]))] \
-                if lever == "omitted" else pick
-            g0 = grad(torch.zeros(1, N, device=dev)) if N else None
-            for m in ms:
-                if m > N:
+        def items(xs):  # per circuit its lever's rows [R, N_i] (None: left out) -> batch()'s items
+            out = []
+            for i, x in enumerate(xs):
+                if x is None:
                     continue
-                x = torch.rand(restarts, N, generator=gen).to(dev)
-                x[0] = g0[0]
-                x = top(x, m).clamp(0, 1)
-                for _ in range(steps):
-                    x = top((x + ADV_STEP * grad(x).sign()).clamp(0, 1), m)
-                with torch.no_grad():
-                    xb = torch.zeros_like(x).scatter(1, x.topk(m, 1).indices, 1.0)
-                    kc, kv = call(xb)
+                R = x.shape[0]
+                if omitted:
+                    out.append((i, torch.zeros(R, len(pick), device=dev), dict(zip(nat.names, torch.split(x, sizes[i], 1)))))
+                else:
+                    out.append((i, x, {n: torch.zeros(R, z, device=dev) for n, z in zip(nat.names, sizes[i])}))
+            return out
+
+        def grads(xs, precision):
+            xs = [None if x is None else x.detach().requires_grad_(True) for x in xs]
+            if all(x is None for x in xs):
+                return xs
+            loss = sum(kc.clamp_min(1e-12).log().sum() - (0 if kv is None else kv.clamp_min(1e-12).log().sum())
+                       for kc, kv in batch(items(xs), precision, vpd=not omitted))
+            g = iter(torch.autograd.grad(loss, [x for x in xs if x is not None]))
+            return [None if x is None else next(g) for x in xs]
+
+        def top(x, m):  # each row's m largest entries kept, the rest 0
+            keep = torch.zeros_like(x, dtype=torch.bool).scatter(1, x.topk(m, 1).indices, True)
+            return x * keep
+
+        with torch.no_grad():
+            kv0 = batch(items([torch.zeros(1, N[0], device=dev)]))[0][1] if omitted and problems else None
+        g0 = grads([torch.zeros(1, n, device=dev) if n else None for n in N], "score")
+        starts = {(i, m): torch.rand(restarts, N[i], generator=gen).to(dev) for i in range(len(problems)) for m in ms if m <= N[i]}
+        flat = [[(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())] if omitted else pick
+                for _, idx, cols in problems]
+        out = [{f"f1_flips_{lever}": {}, f"kl_flips_{lever}": {}, f"mask_flips_{lever}": {}} for _ in problems]
+        for m in ms:  # every circuit's restarts at one budget together
+            xs = [None] * len(problems)
+            for i in range(len(problems)):
+                if (i, m) in starts:
+                    x = starts[(i, m)]
+                    x[0] = g0[i][0]
+                    xs[i] = top(x, m).clamp(0, 1)
+            if all(x is None for x in xs):
+                continue
+            for _ in range(steps):
+                xs = [None if x is None else top((x + ADV_STEP * g.sign()).clamp(0, 1), m) for x, g in zip(xs, grads(xs, search))]
+            with torch.no_grad():
+                xb = [None if x is None else torch.zeros_like(x).scatter(1, x.topk(m, 1).indices, 1.0) for x in xs]
+                its = items(xb)
+                for (i, _, _), (kc, kv) in zip(its, batch(its, vpd=not omitted)):
+                    kv = kv0.expand_as(kc) if kv is None else kv
                     gap = kc.log() - kv.log()
-                    i = int(gap.argmax())
-                    f1s[m] = _fid(e0, float(kc[i]), float(kv[i]))
-                    kl[m] = (float(kc[i]), float(kv[i]))
-                    mask[m] = [flat[j] for j in xb[i].nonzero().flatten().tolist()]
-                native.free(dev)
-            out.append({f"f1_flips_{lever}": f1s, f"kl_flips_{lever}": kl, f"mask_flips_{lever}": mask})
+                    r = int(gap.argmax())
+                    out[i][f"f1_flips_{lever}"][m] = _fid(e0, float(kc[r]), float(kv[r]))
+                    out[i][f"kl_flips_{lever}"][m] = (float(kc[r]), float(kv[r]))
+                    out[i][f"mask_flips_{lever}"][m] = [flat[i][j] for j in xb[i][r].nonzero().flatten().tolist()]
+            native.free(dev)
         return out
 
 

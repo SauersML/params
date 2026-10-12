@@ -58,6 +58,8 @@ docstring); F3 (stated edges' cut effects) and F2 interchange are diagnostics.
   components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
                                                                 (TEACHER_DIR/<task>.json or .txt; nodes alone get
                                                                 measured edges) with the measured answers
+  components.py references ROWS.jsonl TEACHER_DIR OUT_DIR       VPD at each teacher's size: every connection, and
+                                                                the connections teacher.py's edge search kept
   components.py evaluate SPLIT ROWS.jsonl --set NAME=SAMPLES [--e1 NAME=E1.jsonl] [--n N] [--out OUT.json]
                                                                 the report (evaluate()): first samples headline, best of N
                                                                 as an upper bound, paired comparisons, E1 controls
@@ -1324,6 +1326,34 @@ def baseline_texts(ge, task: dict, sizes: list[int]) -> dict:
     return out
 
 
+def references(ge, rows: Path, teacher_dir: Path, out: Path) -> int:
+    """VPD's references on each text with a teacher, at the teacher's subcomponent count k (its nodes other than token
+    embeddings), as answer texts with the measured answers to the text's questions (target()):
+    out/vpd_complete/<task>.txt, VPD's first k active subcomponents with every connection the model has among them, and
+    out/vpd_pruned/<task>.txt, the same nodes with the connections teacher.py's edge search kept
+    (TEACHER_DIR/<task>.vpd_top<k>.edges.json, where it exists): units compared under equal edge effort."""
+    import goal_eval
+    import native
+
+    n = 0
+    for r in map(json.loads, rows.read_text().splitlines()):
+        f = teacher_dir / f"{r['task']}.json"
+        if not f.exists():
+            continue
+        task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+        prompt = task["prompts"][0]
+        k = sum(m != TOK for m, _, _ in json.loads(f.read_text())["nodes"])
+        nodes = set(ge.nat._vpd_order(prompt["token_ids"], prompt["target_positions"])[:k])
+        par, outs = native.all_edges(nodes, prompt["target_positions"])
+        for name, answer in (("vpd_complete", goal_eval.to_json(native.Graph(nodes, par, outs))),
+                             ("vpd_pruned", json.loads(p.read_text()) if (p := teacher_dir / f"{r['task']}.vpd_top{k}.edges.json").exists() else None)):
+            if answer is not None:
+                (out / name).mkdir(parents=True, exist_ok=True)
+                (out / name / f"{r['task']}.txt").write_text(target(answer, r, task["model"]))
+        n += 1
+    return n
+
+
 def _mean_counting_invalid(answers: list, key: str) -> float | None:
     """A term's mean over answers, an invalid answer counted as 0 and a valid one without the term (not measured, as
     E1 without a reader) left out; None when no answer has it."""
@@ -1461,6 +1491,10 @@ def main():
     rr = sub.add_parser("rerender", help="the rows with their question text written again by this question() (no model runs)")
     rr.add_argument("rows", type=Path)
     rr.add_argument("out", type=Path)
+    rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
+    rf.add_argument("rows", type=Path)
+    rf.add_argument("teacher", type=Path, help="teacher.py's output directory (<task>.json, <task>.vpd_top<k>.edges.json)")
+    rf.add_argument("out", type=Path)
     ed = sub.add_parser("edits", help="the rows with edit requests (edit_eval.goals: flip, raise, detach) and their question again")
     ed.add_argument("rows", type=Path)
     ed.add_argument("out", type=Path)
@@ -1623,6 +1657,9 @@ def main():
             with (args.out / "summary.jsonl").open("a") as f:
                 f.write(json.dumps(info) + "\n")
             print(info, flush=True)
+        return
+    if args.cmd == "references":
+        print(references(ge, args.rows, args.teacher, args.out), "texts", flush=True)
         return
     if args.cmd == "edits":
         import edit_eval

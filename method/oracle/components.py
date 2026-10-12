@@ -511,7 +511,6 @@ def http_reader(url: str, base: str, model: str = "vpd4l"):
     from transformers import AutoTokenizer
 
     import reader
-    from prompt import tokens_of
 
     tk = AutoTokenizer.from_pretrained(base)
 
@@ -528,7 +527,7 @@ def http_reader(url: str, base: str, model: str = "vpd4l"):
             out[c["index"]] = dict(c["logprobs"]["top_logprobs"][0])
         return out
 
-    return reader.Reader(generate, lambda ids: tokens_of(model, ids))
+    return reader.Reader(generate, lambda ids: token_strings(model, ids))  # the explainer's token listing, escaped in generate
 
 
 

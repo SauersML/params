@@ -65,7 +65,6 @@ def tinker_reader(service, base: str, renderer, tokenizer, spend: Spend):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import components
     import reader
-    from prompt import tokens_of
 
     sampler = service.create_sampling_client(base_model=base)
     cands = {}
@@ -94,7 +93,7 @@ def tinker_reader(service, base: str, renderer, tokenizer, spend: Spend):
             memo[q] = {cands[i]: lp for i, lp in zip(ids, row)}
         return [memo[q] for q in prompts]
 
-    return reader.Reader(generate, lambda xs: tokens_of("vpd4l", xs))
+    return reader.Reader(generate, lambda xs: components.token_strings("vpd4l", xs))  # as the explainer sees them
 
 
 def clients(base: str, rank: int, init: str | None):

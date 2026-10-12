@@ -373,7 +373,8 @@ def test_score_rows_and_table(tiny):
     ge.hooks["E1"] = lambda task, g, expl: float(g.count())
     rows = ge.score(tx, graphs + list(base.values()), diagnostics=True)
     ge.hooks["E1"] = None
-    assert rows[0]["E1"] == graphs[0].count() and rows[0]["E2"] is None
+    kept = goal_eval.strand(random_graph(nat, tx, 21, k=16), tx.targets, nat.C)  # the graph every measure sees
+    assert rows[0]["E1"] == kept.count() and rows[0]["stranded"] == len(kept.stranded) and rows[0]["E2"] is None
     assert rows[1]["nodes"] == 0 and rows[1]["bits"] == 0.0
     for key in ("recovered_live", "necessity_off", "f3", "changed_recovered_live", "f2_recovered_off", "carry_completeness"):
         assert key in rows[0]
@@ -385,7 +386,8 @@ def test_circuit_json_round_trip_and_defects(tiny):
     nat, ge, tx = tiny
     g = random_graph(nat, tx, 31, k=12)
     back, defects = goal_eval.circuit(goal_eval.to_json(g), tx.targets, nat.C, tx.T)
-    assert back.nodes == g.nodes and defects == {"invalid_nodes": 0, "invalid_edges": 0}
+    kept = goal_eval.strand(random_graph(nat, tx, 31, k=12), tx.targets, nat.C)
+    assert back.nodes == kept.nodes and defects == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": len(kept.stranded)}
     assert sorted(goal_eval._pairs(back)) == sorted(goal_eval._pairs(g))
     bad = {"nodes": [["h.0.attn.o_proj", 1, 3], ["1.q", 2, 5], ["h.9.attn.q_proj", 0, 0], ["0.down", 0, 3], ["1.q", 2, 3],
                      ["tok", 0, 3], ["tok", 1, 3]],
@@ -393,11 +395,13 @@ def test_circuit_json_round_trip_and_defects(tiny):
     g2, d = goal_eval.circuit(bad, tx.targets, nat.C, tx.T)
     # another position, not at a target, a query writes nothing, an unknown matrix, no such node; a valid edge; the
     # embedding into a query at its position; into an attention output and into the prediction (not residual readers)
-    assert d == {"invalid_nodes": 2, "invalid_edges": 8}
+    # the attention output at 3 has no stated connection: stranded (the query at 5 has none either, but queries act
+    # through the pattern)
+    assert d == {"invalid_nodes": 2, "invalid_edges": 8, "stranded_nodes": 1} and g2.stranded == [("h.0.attn.o_proj", 3, 1)]
     assert g2.parents == {("h.1.attn.q_proj", 3, 2): [("h.0.mlp.down_proj", 3, 0)]} and g2.out == []
-    assert len(g2.nodes) == 4 and g2.tok_edges == [(3, ("h.1.attn.q_proj", 3, 2))]
+    assert len(g2.nodes) == 3 and g2.tok_edges == [(3, ("h.1.attn.q_proj", 3, 2))]
     again, d2 = goal_eval.circuit(goal_eval.to_json(g2), tx.targets, nat.C, tx.T)
-    assert again.tok_edges == g2.tok_edges and d2 == {"invalid_nodes": 0, "invalid_edges": 0}
+    assert again.tok_edges == g2.tok_edges and d2 == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0}
 
 
 def test_probe_is_kept(tiny):
@@ -500,11 +504,13 @@ def test_embedding_edges_priced_and_cut(tiny):
     answer = {"nodes": [[n, c, t] for n, t, c in nodes] + [["tok", 0, p]],
               "edges": [[5, 0], [5, 2], [3, 2]]}
     g, d = goal_eval.circuit(answer, tx.targets, nat.C, tx.T)
-    assert d == {"invalid_nodes": 0, "invalid_edges": 0} and g.tok_positions == [p] and len(g.tok_edges) == 2
+    # the value at 7 has no stated connection (an embedding edge is not one): stranded, its bits still charged
+    assert d == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 1} and g.tok_positions == [p] and len(g.tok_edges) == 2
     P, S = nat.positions(tx.targets), sum(nat.C.values())
     want = 5 * math.log2(P * S) + math.log2(P) + math.log2(6) * (2 * (1 + 2) + 0)
     assert abs(goal_eval.size_bits(g, P, S, tx.targets) - want) < 1e-9
     assert goal_eval.size_bits(native.Graph(g.nodes, g.parents, g.out), P, S, tx.targets) == native.Graph(g.nodes, g.parents, g.out).bits(P, S, tx.targets)
+    nodes = nodes[:4]
     stated, unstated = goal_eval._tok_pairs(g)
     assert [r for _, r in stated] == [nodes[0], nodes[2]] and [r for _, r in unstated] == [nodes[1]]
     on = mask_of(nat, tx.T, g.nodes)
@@ -1244,3 +1250,30 @@ def test_c_takes_the_lower_of_graph_and_every_connection(tiny):
         assert row["f1_flips_c"][m] == min(row["f1_flips_omitted"][m], f)
     terms = [row["s_point_c"], row["s_nodes"], row["s_edges"], row["f1_flips_c"][goal_eval.FLIP_TERM]]
     assert abs(row["c"] - sum(terms) / 4) < 1e-12
+
+
+def test_stranded_nodes_are_dropped_and_charged(tiny):
+    """A node with no stated connection (not a query or key) is dropped before every measure, its bits still charged;
+    query and key nodes without edges stay; the circuit scores as the graph without it."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    par, out = native.all_edges(sub, tx.targets)
+    linked = native.Graph(sub, par, out)
+    loose = [nd for nd in sorted(native.Graph(masks=tx.vpd).node_set()) if nd not in set(sub)
+             and native._name_layer_kind(nd[0])[1] not in ("q_proj", "k_proj")][:3]
+    qk = [nd for nd in sorted(native.Graph(masks=tx.vpd).node_set()) if nd not in set(sub)
+          and native._name_layer_kind(nd[0])[1] in ("q_proj", "k_proj")][:1]
+    answer = goal_eval.to_json(native.Graph(sub + loose + qk, par, out))
+    g, d = goal_eval.circuit(answer, tx.targets, nat.C, tx.T)
+    assert d["stranded_nodes"] == len(loose) and set(g.stranded) == set(loose)
+    assert set(g.node_set()) == set(sub) | set(qk)
+    P, S = max(tx.targets) + 1, sum(nat.C.values())
+    whole, _ = goal_eval.circuit(answer, tx.targets, nat.C, tx.T)
+    raw = native.Graph(sub + loose + qk, par, out)
+    raw.stranded, raw.stranded_bits = [], 0.0  # the answer as written, nothing dropped
+    assert abs(goal_eval.size_bits(g, P, S, tx.targets) - goal_eval.size_bits(raw, P, S, tx.targets)) < 1e-6
+    a = ge.fidelity(tx, [native.Graph(sub + loose + qk, par, out)], None, draws=2)[0]
+    b = ge.fidelity(tx, [native.Graph(sub + qk, par, out)], None, draws=2)[0]
+    for k in ("s_point", "s_wiring", "s_nodes", "s_edges", "c"):
+        assert a[k] == b[k], (k, a[k], b[k])
+    assert ge.score(tx, [native.Graph(sub + loose, par, out)])[0]["stranded"] == len(loose)

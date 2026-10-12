@@ -12,7 +12,8 @@ embedding, which VPD does not decompose, is how a token's change reaches a circu
 
 Runs use VPD's semantics: a run "with circuit C" has C's subcomponents on (mask 1) and every other one off (mask 0), the
 remainders W - V U either on ("live", computing on the run's own inputs) or off; both conventions are reported. An
-answer runs as the graph it states (GoalEval.graph_ref, the lead's decision 10-12): inside the circuit, graph semantics,
+answer runs as the graph it states (GoalEval.graph_ref, the lead's decision 10-12; a node other than a query or key with
+no stated connection is a defect, dropped before every measure with its bits still charged: strand): inside the circuit, graph semantics,
 a circuit node's output reaching a circuit reader, or the prediction, only through a stated edge (each reader reads the
 background and its stated parents); outside it, masked semantics, every other subcomponent (at its mask) and the
 remainders reading the full residual stream, the circuit's outputs included, as in the real model, and writing into the
@@ -173,7 +174,36 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
                      list(dict.fromkeys(out)))
     g.tok_edges = list(dict.fromkeys(tok))
     g.tok_positions = sorted({nd[1] for nd in nodes if nd is not None and nd[0] == "tok"})
-    return g, {"invalid_nodes": bad_nodes, "invalid_edges": bad_edges}
+    g = strand(g, targets, C)
+    return g, {"invalid_nodes": bad_nodes, "invalid_edges": bad_edges, "stranded_nodes": len(g.stranded)}
+
+
+def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
+    """A stated graph without its stranded nodes: a node other than a query or key (those act through the attention
+    pattern) with no stated connection to another node or to the prediction does nothing in the stated graph's run, yet
+    would earn credit in the runs with every connection restored (wiring, N) by cancelling what the stated graph cuts
+    (the lead's decision, 10-12). They are dropped before every family, with any embedding edge into them; their bits
+    stay charged in size (stranded_bits, which size_bits adds). g.stranded lists them. A complete graph is unchanged."""
+    if hasattr(g, "stranded"):  # already done (its record kept)
+        return g
+    if g.complete:
+        g.stranded, g.stranded_bits = [], 0.0
+        return g
+    linked = set(g.out) | {r for r, ws in g.parents.items() if ws} | {w for ws in g.parents.values() for w in ws}
+    gone = [nd for nd in sorted(g.node_set()) if nd not in linked
+            and native._name_layer_kind(nd[0])[1] not in ("q_proj", "k_proj")]
+    if not gone:
+        g.stranded, g.stranded_bits = [], 0.0
+        return g
+    drop = set(gone)
+    kept = native.Graph([nd for nd in g.nodes if nd not in drop], dict(g.parents), list(g.out))
+    kept.tok_edges = [(p, r) for p, r in getattr(g, "tok_edges", []) if r not in drop]
+    kept.tok_positions = list(getattr(g, "tok_positions", []))
+    P, S = max(targets) + 1, sum(C.values())
+    g.stranded_bits = 0.0
+    kept.stranded, kept.stranded_bits = gone, 0.0
+    kept.stranded_bits = size_bits(g, P, S, targets) - size_bits(kept, P, S, targets)
+    return kept
 
 
 def to_json(g: native.Graph, explanation: str = "") -> dict:
@@ -202,12 +232,13 @@ def size_term(bits: float, scale: float) -> float:
 def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list[int]) -> float:
     """native.Graph.bits with the answer's embedding nodes: each a choice among the positions, and every edge's ends
     indexed among all the listed nodes (embedding nodes included), an embedding edge priced like any other."""
+    extra = getattr(g, "stranded_bits", 0.0)  # stranded nodes (strand): dropped, their bits still charged
     pos = sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in getattr(g, "tok_edges", [])})
     if not pos:
-        return g.bits(positions, subcomponents, targets)
+        return g.bits(positions, subcomponents, targets) + extra
     n, k = g.count(), len(pos)
     inner, out = native.implied_edges(g.node_set(), targets) if g.complete else (sum(len(w) for w in g.parents.values()), len(g.out))
-    return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(n + k) * (2 * (inner + len(g.tok_edges)) + out)
+    return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(n + k) * (2 * (inner + len(g.tok_edges)) + out) + extra
 
 
 def _tok_pairs(g: native.Graph) -> tuple[list, list]:
@@ -974,6 +1005,7 @@ class GoalEval:
         pool, interchange, N_real or leak, and no flips_to_break / flips_to_half."""
         if mode not in ("full", "reward"):
             raise ValueError("mode is full or reward")
+        graphs = [strand(g, tx.targets, self.nat.C) for g in graphs]  # stranded nodes dropped before every family
         reward = mode == "reward"
         reads = reads or reward
         e0 = self._bounds(tx, "live")[0]
@@ -1906,6 +1938,7 @@ class GoalEval:
         real model's necessity ("n_real_*", "kl_real_minus")."""
         t0 = time.perf_counter()
         nat = self.nat
+        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # stranded nodes dropped before every measure
         rows = self.sufficiency(tx, graphs)
         f3 = self.edges(tx, graphs)
         total = sum(nat.C.values())
@@ -1913,7 +1946,8 @@ class GoalEval:
         for b, (g, row) in enumerate(zip(graphs, rows)):
             st, un = f3[b]["stated"], f3[b]["unstated"]
             bits = size_bits(g, nat.positions(tx.targets), total, tx.targets)
-            row.update({"nodes": g.count(), "edges": None if g.complete else g.edges(), "tok_edges": len(getattr(g, "tok_edges", [])),
+            row.update({"nodes": g.count(), "stranded": len(g.stranded), "edges": None if g.complete else g.edges(),
+                        "tok_edges": len(getattr(g, "tok_edges", [])),
                         "bits": bits, "size": size_term(bits, scale),
                         "f3": f3[b]["f3"], "f3_stated": _mean(st) if st else None, "f3_unstated": _mean(un) if un else None,
                         "f3_cuts": {"stated": st, "unstated": un}})
@@ -1964,7 +1998,8 @@ def load_answer(path: Path, task: dict, targets: list[int], nat: native.Native) 
     ir = mech.trace_inline(path.read_text(), "vpd4l", task)
     if not ir["valid"]:
         return native.Graph(), {"invalid_program": True}, ""
-    return nat.from_ir(ir), {}, ir["graph"].get("explanation") or ""
+    g = strand(nat.from_ir(ir), targets, nat.C)
+    return g, {"stranded_nodes": len(g.stranded)}, ir["graph"].get("explanation") or ""
 
 
 COLUMNS = [("nodes", "nodes", "{:.0f}"), ("edges", "edges", "{:.0f}"), ("bits", "size bits", "{:.0f}"),
@@ -2172,7 +2207,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                 tx.vpd[m][t.long().to(nat.dev), c.long().to(nat.dev)] = True
         graphs, kinds = [], []
         for name, path in have.items():
-            g, _ = circuit(json.loads(path.read_text()), targets, nat.C, tx.T)
+            g, _ = circuit(json.loads(path.read_text()), targets, nat.C, tx.T)  # stranded nodes dropped (strand)
             graphs.append(g)
             kinds.append(name)
         order = saved[p.stem]["order"] if p.stem in saved else nat._vpd_order(ids, targets)
@@ -2188,7 +2223,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             for kind, g, f in zip(kinds, graphs, fid):
                 bits = size_bits(g, nat.positions(targets), sum(nat.C.values()), targets)
                 row = {"task": p.stem, "local": local.get(p.stem), "kind": kind, "nodes": g.count(),
-                       "positions": len({t for _, t, _ in g.node_set()}),
+                       "positions": len({t for _, t, _ in g.node_set()}), "stranded": len(getattr(g, "stranded", [])),
                        "edges": None if g.complete else g.edges(), "size": size_term(bits, scale), "kl_empty": e, "kl_vpd": v,
                        "n_real_ceiling": ceiling, "cancel_cosine": cancel["cosine"], **f}
                 rows.append(row)
@@ -2263,7 +2298,7 @@ def fidelity_table(rows: list[dict]) -> str:
     held += [(f"response err {f}", lambda r, f=f: r.get(f"dreads_{f}")) for f in ("nodes", "edges", "interchange")]
     held += [("leak (no edges)", lambda r: r.get("leak"))]
     stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
-    sample = [("F1", lambda r: r["s_point"]), ("F1 every connection", lambda r: r.get("s_wiring")),
+    sample = [("stranded nodes", lambda r: r.get("stranded")), ("F1", lambda r: r["s_point"]), ("F1 every connection", lambda r: r.get("s_wiring")),
               ("reliance on cuts", lambda r: r.get("reliance_on_cuts")),
               ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
     return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),

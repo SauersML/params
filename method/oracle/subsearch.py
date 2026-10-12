@@ -159,6 +159,149 @@ def position(nat, ids, targets, row, base_act, cis):
     return out
 
 
+class GatedCarry:
+    """Carry in VPD's gated model: on each prompt a subcomponent runs only where its causal importance on that prompt
+    is above zero (VPD's hard gate), remainders live. A set's subcomponents compute on the changed prompt under its
+    gates; every other one keeps its gated value on the text. Units are the subcomponents at `positions` with causal
+    importance above zero on the text or a prompt (any other is zero on both, so never carries anything). KL in bits
+    at the target from the gated model on the changed prompt ("gated") or from the model ("model"), mean over prompts."""
+
+    def __init__(self, nat, ids, targets, prompts, positions, units=None, B=32):
+        self.nat, self.ids, self.targets, self.prompts, self.B = nat, ids, targets, prompts, B
+        T = self.T = len(ids)
+        self.one_r = {n: torch.ones(1, 1, device=nat.dev) for n in nat.names}
+        self.g0 = self.gate(ids)
+        self.rec0, self.states0 = {}, {}
+        with torch.no_grad():
+            nat.run(ids, targets, self.plan(1), self.g0, self.one_r, record=self.rec0)
+            nat.run(ids, targets, self.plan(1), self.g0, self.one_r, fill=self.states0)
+        self.g1, self.rec1, self.ref_gated, self.ref_model = [], [], [], []
+        for x in prompts:
+            g, rec = self.gate(x), {}
+            with torch.no_grad():
+                self.ref_gated.append(nat.run(x, targets, self.plan(1), g, self.one_r, record=rec))
+                self.ref_model.append(nat.reference([x], targets))
+            self.g1.append(g)
+            self.rec1.append(rec)
+        if units is None:
+            units = sorted({(n, t, c) for n in nat.names for t in positions for c in
+                            ((self.g0[n][0, t] > 0) | torch.stack([g[n][0, t] > 0 for g in self.g1]).any(0)).nonzero().flatten().tolist()})
+        self.units, self.N = units, len(units)
+        self.cols = {}
+        for j, (n, t, c) in enumerate(units):
+            self.cols.setdefault(n, ([], [], []))
+            self.cols[n][0].append(j), self.cols[n][1].append(t), self.cols[n][2].append(c)
+        self.cols = {n: tuple(torch.tensor(v, device=nat.dev) for v in a) for n, a in self.cols.items()}
+
+    def gate(self, x):
+        return {n: (m > 0).float()[None] for n, m in self.nat.importance(x).items()}
+
+    def plan(self, B):
+        nat, T = self.nat, self.T
+        return nat._const(("gated-none", T, B), lambda: {**nat._full_plan(T, B), "none": True,
+                                                         "G": {n: torch.zeros(B, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}})
+
+    def change(self):
+        """Mean over prompts of |gated activation on the prompt - on the text| per unit."""
+        out = torch.zeros(self.N, device=self.nat.dev)
+        for g, rec in zip(self.g1, self.rec1):
+            for n, (j, t, c) in self.cols.items():
+                out[j] += (rec[n][0, t, c] * g[n][0, t, c] - self.rec0[n][0, t, c] * self.g0[n][0, t, c]).abs()
+        return out / len(self.prompts)
+
+    @torch.no_grad()
+    def measure(self, sets, ref="gated"):
+        nat, T = self.nat, self.T
+        sets = sets if sets.dim() == 2 else sets[None]
+        total = torch.zeros(len(sets), device=nat.dev)
+        for i, x in enumerate(self.prompts):
+            refs = self.ref_gated[i] if ref == "gated" else self.ref_model[i]
+            for s0 in range(0, len(sets), self.B):
+                part = sets[s0:s0 + self.B]
+                B = len(part)
+                u, patch = {}, {}
+                for n in nat.names:
+                    live = torch.zeros(B, T, nat.C[n], dtype=torch.bool, device=nat.dev)
+                    if n in self.cols:
+                        j, t, c = self.cols[n]
+                        live[:, t, c] = part[:, j]
+                    u[n] = torch.where(live, self.g1[i][n], self.g0[n])
+                    patch[n] = (~live, self.rec0[n].expand(B, -1, -1))
+                lq = nat.run(x, self.targets, self.plan(B), u, self.one_r, patch=patch, reuse=(self.states0, self.ids))
+                total[s0:s0 + B] += carry.kl(refs.expand(B, -1, -1), lq)
+        return total / len(self.prompts)
+
+
+def refine(measure, S, threshold, rounds=40):
+    """Measured removal rounds: every single removal measured, removals ranked by the KL they leave, the most of them
+    (prefix sizes 2^(k/2)) that keeps the KL at or below the threshold removed; until no removal keeps it."""
+    S = S.clone()
+    for _ in range(rounds):
+        idx = S.nonzero().flatten()
+        if len(idx) <= 1:
+            break
+        trials = S[None].repeat(len(idx), 1)
+        trials[torch.arange(len(idx), device=S.device), idx] = False
+        single = torch.cat([measure(trials[i:i + 1024]) for i in range(0, len(idx), 1024)])
+        ranked = idx[torch.argsort(single, stable=True)]
+        sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 48)}) if k <= len(ranked)]
+        pre = S[None].repeat(len(sizes), 1)
+        for i, k in enumerate(sizes):
+            pre[i, ranked[:k]] = False
+        ok = [k for k, x in zip(sizes, measure(pre).tolist()) if x <= threshold]
+        if not ok:
+            break
+        S[ranked[:max(ok)]] = False
+    return S
+
+
+def gated_position(nat, ids, targets, row):
+    t0 = time.perf_counter()
+    p = row["position"]
+    positions = sorted(set(row["position_sets"][0]))
+    search = [ids[:p] + [z] + ids[p + 1:] for z in row["alternatives"]]
+    held = prompts_at(nat, ids, p, (3, 4, 5))
+    later = prompts_at(nat, ids, p, (6, 7, 8))
+    units = sorted({u for xs in (search, held, later) for u in GatedCarry(nat, ids, targets, xs, positions).units})
+    gs, gh, gl = (GatedCarry(nat, ids, targets, xs, positions, units) for xs in (search, held, later))
+    g6 = GatedCarry(nat, ids, targets, search + held, positions, units)
+    N, dev = len(units), nat.dev
+    zero, full = torch.zeros(N, dtype=torch.bool, device=dev), torch.ones(N, dtype=torch.bool, device=dev)
+    empty = float(gs.measure(zero)[0])
+    out = {"position": p, "positions": positions, "units": N, "empty_gated_bits": empty,
+           "full_gated_bits": float(gs.measure(full)[0]),
+           "movement_model_bits": float(torch.stack([carry.kl(r, nat.reference([ids], targets))[0] for r in gs.ref_model]).mean()),
+           "gated_vs_model_bits": float(torch.stack([carry.kl(m, g)[0] for m, g in zip(gs.ref_model, gs.ref_gated)]).mean())}
+    if empty <= 1e-5:
+        out["seconds"] = time.perf_counter() - t0
+        return out, None
+
+    def search_set(g, e):
+        threshold = (1 - FRACTION) * e
+        order = torch.argsort(g.change(), descending=True)
+        sizes = sorted({min(N, int(2 ** (k / 2))) for k in range(0, 48) if 2 ** (k / 2) <= 2 * N} | {N})
+        kl = g.measure(prefix_sets(order, sizes, N, dev)).tolist()
+        start = min([s for s, x in zip(sizes, kl) if x <= threshold], default=N)
+        S = torch.zeros(N, dtype=torch.bool, device=dev)
+        S[order[:start]] = True
+        return start, refine(g.measure, S, threshold)
+
+    def share(g, S):
+        e = float(g.measure(zero)[0])
+        return 1 - float(g.measure(S)[0]) / e if e > 1e-5 else None
+
+    start, S = search_set(gs, empty)
+    size = int(S.sum())
+    start6, S6 = search_set(g6, float(g6.measure(zero)[0]))
+    out.update(search0_5={"prefix_90": start6, "size_90": int(S6.sum()), "carried_ranks6_8": share(gl, S6)})
+    out.update(prefix_90=start, size_90=size, carried_search=share(gs, S),
+               carried_ranks3_5=share(gh, S), carried_ranks6_8=share(gl, S),
+               kl_model_bits={"set": float(gs.measure(S, "model")[0]), "all_live": float(gs.measure(full, "model")[0]),
+                              "none_live": float(gs.measure(zero, "model")[0])},
+               seconds=time.perf_counter() - t0)
+    return out, [units[j] for j in S.nonzero().flatten().tolist()]
+
+
 @torch.no_grad()
 def sufficiency(nat, ids, targets, units, prompts):
     """KL in bits from the whole model of the union alone (everything else zero), remainder held at the text's values
@@ -207,6 +350,7 @@ def main():
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--positions", type=int, default=8)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--gated", action="store_true", help="carry in VPD's gated model, with measured removal rounds")
     args = ap.parse_args()
     args.out.parent.mkdir(parents=True, exist_ok=True)
     done = {json.loads(line)["task"] for line in args.out.read_text().splitlines()} if args.out.exists() else set()
@@ -222,6 +366,18 @@ def main():
         ci0 = nat.importance(ids)
         cis = lambda prompts: [ci0] + [nat.importance(x) for x in prompts]
         result = []
+        if args.gated:
+            for row in r["positions"][:args.positions]:
+                pos, units = gated_position(nat, ids, targets, row)
+                pos["units_best"] = units
+                result.append(pos)
+                print(f"{r['task']} p={pos['position']} CI>0 units={pos['units']} gated empty={pos['empty_gated_bits']:.4g} "
+                      f"prefix90={pos.get('prefix_90')} refined90={pos.get('size_90')} held-out carried={pos.get('carried_ranks3_5')} "
+                      f"{pos['seconds']:.1f}s", flush=True)
+            with args.out.open("a") as f:
+                f.write(json.dumps({"task": r["task"], "targets": targets, "semantics": "gated", "positions": result,
+                                    "seconds": time.perf_counter() - t0}) + "\n")
+            continue
         for row in r["positions"][:args.positions]:
             pos = position(nat, ids, targets, row, base, cis)
             result.append(pos)

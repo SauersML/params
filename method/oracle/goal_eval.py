@@ -549,6 +549,12 @@ def compact(bits: float, bits_start: float) -> float | None:
     return None if not bits or bits <= 0 or not bits_start or bits_start <= 0 else math.log2(bits_start / bits)
 
 
+def _rms_parts(read: torch.Tensor, scale: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """vpd_model.rms with the vector read and the vector setting the scale apart: w * read / rms(scale) (cuts' partial
+    modes); rms itself when they are one."""
+    return w * read * torch.rsqrt(scale.float().pow(2).mean(-1, keepdim=True) + eps).to(read.dtype)
+
+
 def _harmonic(terms: list) -> float | None:
     """C's combination: the harmonic mean k / sum(1 / s), 0 when a term is 0 (None for no terms)."""
     if not terms:
@@ -1627,21 +1633,28 @@ class GoalEval:
     # ---- whole-model cuts (question answering, teachers)
 
     @torch.no_grad()
-    def cuts(self, tx: Text, pairs: list[tuple], detail: bool = False) -> list:
+    def cuts(self, tx: Text, pairs: list[tuple], detail: bool = False, mode: str = "full") -> list:
         """Per (writer, reader) pair (reader None: the prediction), the KL in bits of the model on the text from the
         model with that one connection cut: the reader's new activation is its input in the model without the
         writer's output alone (every other output and every remainder as in the model), and the model runs on with
         that one activation replaced (path patching of the connection, _patched); into the prediction, the final
         residual stream without the writer's output. detail: per pair {"kl", "top": the cut run's most likely token at
-        each target, "logp_model_top": its log-probability of the model's most likely token there}."""
+        each target, "logp_model_top": its log-probability of the model's most likely token there}. mode (primerl's
+        normalization questions): "full" the cut as above; "direct" the reader reads its input without the writer's
+        output but its RMSNorm scale is the uncut input's; "norm" the reader reads its uncut input under the RMSNorm
+        scale of the input without the writer's output (an attention or MLP output reads no norm: "direct" is the full
+        cut there, "norm" no change)."""
+        if mode not in ("full", "direct", "norm"):
+            raise ValueError("mode is full, direct or norm")
         nat = self.nat
-        todo = [e for e in dict.fromkeys(pairs) if e not in tx.cut_cache]
+        key = (lambda e: e) if mode == "full" else (lambda e: (e, mode))
+        todo = [e for e in dict.fromkeys(pairs) if key(e) not in tx.cut_cache]
         if todo:
             ctx = {"make": lambda B: (nat._full_plan(tx.T, B), nat._model_states(tx.ids, B)), "ablation": nat._one(),
-                   "ref": tx.ref, "flow": self.flow(tx), "rec": tx.rec, "ids": tx.ids}
+                   "ref": tx.ref, "flow": self.flow(tx), "rec": tx.rec, "ids": tx.ids, "mode": mode}
             for e, d in zip(todo, self._patched(tx, ctx, todo)):
-                tx.cut_cache[e] = d
-        return [tx.cut_cache[e] if detail else tx.cut_cache[e]["kl"] for e in pairs]
+                tx.cut_cache[key(e)] = d
+        return [tx.cut_cache[key(e)] if detail else tx.cut_cache[key(e)]["kl"] for e in pairs]
 
     def _patched(self, tx: Text, ctx: dict, pairs: list[tuple]) -> list[dict]:
         """Path patching of distinct pairs in a run (ctx: "make"(B) -> its plan of B copies and their states, its
@@ -1691,12 +1704,14 @@ class GoalEval:
         if final:
             tg = nat.target
             t, c = nat._ints([[pairs[j][0][1] for j in final], [pairs[j][0][2] for j in final]])
-            x = ctx["flow"]["final"][tx.targets].expand(len(final), -1, -1).clone()
+            x0 = ctx["flow"]["final"][tx.targets].expand(len(final), -1, -1)
+            x = x0.clone()
             row = torch.tensor([tx.targets.index(p) for p in t.tolist()], device=nat.dev)
             for wn in {pairs[j][0][0] for j in final}:
                 sel = torch.tensor([b for b, j in enumerate(final) if pairs[j][0][0] == wn], device=nat.dev)
                 x[sel, row[sel]] -= ctx["rec"][wn][0, t[sel], c[sel]][:, None] * tg.site(wn).U[c[sel]]
-            lq = torch.log_softmax((vpd_model.rms(x, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
+            read, scale = {"full": (x, x), "direct": (x, x0), "norm": (x0, x)}[ctx.get("mode", "full")]
+            lq = torch.log_softmax((_rms_parts(read, scale, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
             for b, d in enumerate(summary(lq)):
                 res[final[b]] = d
         return res
@@ -1772,14 +1787,15 @@ class GoalEval:
             t, c, tw = nat._ints([[pairs[j][1][1] for j in js], [pairs[j][1][2] for j in js], [pairs[j][0][1] for j in js]])
             wv = torch.stack([writes[j] for j in js])
             V = tg.site(rn).V
-            if kind in ("q_proj", "k_proj", "v_proj"):
-                inp = vpd_model.rms(fl["attn"][layer][t] - wv, tg.norms[2 * layer], tg.eps)
-            elif kind == "c_fc":
-                inp = vpd_model.rms(fl["mlp"][layer][t] - wv, tg.norms[2 * layer + 1], tg.eps)
-            elif kind == "o_proj":
-                inp = fl["att"][layer][t] - fl["P"][layer][:, t, tw].T.repeat_interleave(tg.hd, dim=1) * wv
+            mode = ctx.get("mode", "full")
+            if kind in ("q_proj", "k_proj", "v_proj", "c_fc"):
+                xr = fl["attn" if kind != "c_fc" else "mlp"][layer][t]
+                read, scale = {"full": (xr - wv, xr - wv), "direct": (xr - wv, xr), "norm": (xr, xr - wv)}[mode]
+                inp = _rms_parts(read, scale, tg.norms[2 * layer + (kind == "c_fc")], tg.eps)
+            elif kind == "o_proj":  # no norm: "norm" changes nothing
+                inp = fl["att"][layer][t] - (0 if mode == "norm" else fl["P"][layer][:, t, tw].T.repeat_interleave(tg.hd, dim=1) * wv)
             else:
-                inp = vpd_model.gelu_tanh(fl["pre"][layer][t] - wv)
+                inp = vpd_model.gelu_tanh(fl["pre"][layer][t] - (0 if mode == "norm" else wv))
             out[torch.tensor(js, device=nat.dev)] = (inp * V.T[c]).sum(-1)
         return out
 

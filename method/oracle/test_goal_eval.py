@@ -1649,6 +1649,32 @@ def test_reward_v3_helpers(tiny):
     assert t["nodes_start"] == st["graph"].count() and t["bits_start"] > 0 and t["phi_tau"] <= t["phi_start"] + 1e-12
     assert ge.tau(tx, pool) is t
 
+
+def test_cut_partial_modes(tiny):
+    """cuts' partial modes: "direct" reads the input without the writer's output under the uncut input's RMSNorm
+    scale, "norm" the uncut input under the cut input's scale, "full" both (the cut as before); into the prediction the
+    same with the final norm; an attention output has no norm ("norm" changes nothing)."""
+    import vpd_model
+    nat, ge, tx = tiny
+    tg = nat.target
+    w, r = ("h.0.attn.o_proj", 5, 1), ("h.1.mlp.c_fc", 5, 2)
+    fl = ge.flow(tx)
+    xr = fl["mlp"][1][5]
+    wv = tx.rec[w[0]][0, 5, 1] * tg.site(w[0]).U[1]
+    ctx = {"flow": fl, "rec": tx.rec, "ids": tx.ids}
+    want = {"full": vpd_model.rms(xr - wv, tg.norms[3], tg.eps),
+            "direct": tg.norms[3] * (xr - wv) * torch.rsqrt(xr.pow(2).mean() + tg.eps),
+            "norm": tg.norms[3] * xr * torch.rsqrt((xr - wv).pow(2).mean() + tg.eps)}
+    for mode, inp in want.items():
+        got = float(ge._cut_activations(dict(ctx, mode=mode), [(w, r)])[0])
+        assert abs(got - float(inp @ tg.site(r[0]).V[:, 2])) < 1e-5, mode
+    full, direct, norm = (ge.cuts(tx, [(w, r), (w, None) if 5 in tx.targets else (("h.1.mlp.down_proj", 11, 0), None)], mode=m)
+                          for m in ("full", "direct", "norm"))
+    assert full == ge.cuts(tx, [(w, r), (w, None) if 5 in tx.targets else (("h.1.mlp.down_proj", 11, 0), None)])
+    assert full != direct and full != norm
+    v, o = ("h.1.attn.v_proj", 3, 0), ("h.1.attn.o_proj", 5, 0)
+    assert ge.cuts(tx, [(v, o)], mode="norm")[0] < 1e-6
+
 def test_block_nodes(tiny):
     """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
     stranded by the same rules as a subcomponent of its site, and run by C's families as every subcomponent of the

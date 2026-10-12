@@ -154,6 +154,8 @@ SWITCH_PER_POSITION = 8  # subcomponents a changed token switches on, listed per
 ATTENTION_TOP = 3  # positions listed per attention head at the target (measured(): the --measured input arm)
 POOL_HEADS = 0  # candidate_pool(): positions beyond the listed ones, each attention head's top POOL_HEADS at the target
 # (8 heads' top 8: +1% of held-out teacher nodes for 4x the question, 46k tokens)
+CONTEXT = 32768  # Qwen3-8B's native context, the question and the generation together
+ROOM = 10240  # fit_pool(): the generation a question leaves at least (an answer of tinker_train.ANSWER_CAP, 8,000 tokens, and some thinking)
 WINDOW = 8  # a question numbers the tokens within this many positions of every position its evidence names
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
 QA_PER_KIND = 2
@@ -1085,6 +1087,32 @@ def candidate_pool(nat, task: dict, ev: dict, heads: int = POOL_HEADS) -> dict:
         if per:
             pool[str(p)] = per
     return {**ev, "pool": pool}
+
+
+def fit_pool(task: dict, ev: dict, count, budget: int = CONTEXT - ROOM - 64) -> dict:
+    """The evidence with its candidate pool cut to the most important subcomponents whose question fits `budget` tokens
+    (count: text -> Qwen3 tokens; the chat template's own tokens are in the 64), so its generation keeps at least ROOM
+    of the context. The least important entries go first, across positions; "pool_cut" counts them. On the 444 v1
+    train texts it cuts 52 questions (12 of them longer than the whole context uncut), which hides 21% of those texts'
+    teacher nodes; text6040 leaves 6,843 tokens with no pool at all; none of the 20 held-out questions is cut."""
+    if count(question(task, ev)) <= budget:
+        return ev
+    order = sorted((v, int(q), n, c) for q, per in ev["pool"].items() for n, cs in per.items() for c, v in cs)
+
+    def drop(k):
+        gone = {(q, n, c) for _, q, n, c in order[:k]}
+        pool = {q: {n: [[c, v] for c, v in cs if (int(q), n, c) not in gone] for n, cs in per.items()} for q, per in ev["pool"].items()}
+        pool = {q: {n: cs for n, cs in per.items() if cs} for q, per in pool.items()}
+        return {**ev, "pool": {q: per for q, per in pool.items() if per}, "pool_cut": k}
+
+    lo, hi = 0, len(order)  # the fewest dropped that fit: the question shrinks as entries go
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if count(question(task, drop(mid))) <= budget:
+            hi = mid
+        else:
+            lo = mid + 1
+    return drop(lo)
 
 
 def _atlas():
@@ -2465,7 +2493,8 @@ def main():
     rr.add_argument("--measured", action="store_true", help="the measured input arm (measured(): subcomponents ranked by importance x "
                                                              "|activation| with activations, attention heads' top positions)")
     rr.add_argument("--pool", action="store_true", help="the full candidate pool (candidate_pool(): every VPD-active subcomponent at the "
-                                                         "listed, target and most-attended positions)")
+                                                         "listed, target and most-attended positions), cut to leave ROOM (fit_pool())")
+    rr.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the policy's tokenizer, which fit_pool() counts in")
     rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
     rf.add_argument("rows", type=Path)
     rf.add_argument("teacher", type=Path, help="teacher.py's output directory (<task>.json, <task>.vpd_top<k>.edges.json)")
@@ -2553,6 +2582,11 @@ def main():
             atlas, lens = _atlas(), _lens(mnat)
         else:
             atlas = lens = None
+        if args.pool:
+            from transformers import AutoTokenizer
+
+            tk = AutoTokenizer.from_pretrained(args.tokenizer)
+            count = lambda text: len(tk(text, add_special_tokens=False)["input_ids"])  # noqa: E731
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
@@ -2561,7 +2595,7 @@ def main():
                 elif args.facts:
                     r = refresh_facts(atlas, lens, task, r)
                 if args.pool:
-                    r = candidate_pool(mnat, task, r)
+                    r = fit_pool(task, candidate_pool(mnat, task, r), count)
                 if args.variables:
                     r = {**r, "variables": True}
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")

@@ -473,6 +473,16 @@ def test_question_lists_the_candidate_pool_when_present(tiny):
     assert "every VPD-active subcomponent" not in components.question(task, ev)
 
 
+def test_fit_pool_drops_the_least_important_entries_until_the_question_fits(tiny):
+    nat, ge, task, ev = tiny
+    pool = {"7": {"h.3.mlp.c_fc": [[5, 1.0], [2, 0.42]], "h.0.attn.q_proj": [[1, 0.06]]}, "6": {"h.1.attn.v_proj": [[3, 0.2]]}}
+    full = len(components.question(task, {**ev, "pool": pool}))
+    assert components.fit_pool(task, {**ev, "pool": pool}, len, budget=full)["pool"] == pool
+    cut = components.fit_pool(task, {**ev, "pool": pool}, len, budget=full - 5)
+    assert cut["pool_cut"] == 1 and cut["pool"] == {"7": {"h.3.mlp.c_fc": [[5, 1.0], [2, 0.42]]}, "6": {"h.1.attn.v_proj": [[3, 0.2]]}}
+    assert components.fit_pool(task, {**ev, "pool": pool}, len, budget=0)["pool"] == {}
+
+
 def test_mermaid_circuit_is_read_strictly():
     """Mermaid is read strictly: a node declared outside its position's subgraph, a label that is no subcomponent, an id
     declared twice, an edge end declared inline, and a stray line are malformed; an edge naming an undeclared id is

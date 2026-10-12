@@ -35,7 +35,7 @@ Per text:
      remainders included, reading the full stream. At a path point, from every connection the model has among its
      nodes (native.all_edges and the residual writers at the targets into the prediction), the rounds of step 1 over
      single connections: within F1 >= 0.9 the most of the ranked ones that keep it, above it the prefix with the
-     lowest KL (single removals ranked in bfloat16 on CUDA; every removal kept or refused measured in float32). The
+     lowest KL (every run in float32, the single removals' ranking too). The
      nodes, and so N, stay the point's. F1 rises as connections go (text9002's 92 subcomponents: 0.881 with all 1,004
      connections, 0.919 with 65, in native.run's graph semantics). With --edges-at search, the teacher circuit is the
      smallest path point whose connections reach F1 >= 0.9 with N >= 0.9 (bisection between the smallest point with
@@ -50,8 +50,9 @@ Per text:
   tokenizer, the next smaller path point with its connections instead, until it fits.
   With --no-strand, every non-query/key node keeps a stated path to the prediction: its most important connection out
   is protected (the largest measured cut effect, EdgePruner.protect), each such connection ending at the prediction,
-  a query or key (which act through the attention pattern) or another node with a route, and a node the model gives
-  no route to the prediction among the circuit's nodes is dropped (routes()); a stated connection alone was not a
+  a query or key whose pattern feeds a routed attention output (a query at t: one of its layer at t; a key at p:
+  one at a position >= p) or another node with a route, and a node the model gives no route to the prediction among
+  the circuit's nodes, a query or key whose pattern feeds none included, is dropped (routes()); a stated connection alone was not a
   role: v3's text9000 circuit kept one for every node but 122 of its 201 non-query/key nodes had no stated path to
   the prediction. Without it, the descent left text9000's greedy and
   v3 circuits with half and 92% of their nodes unconnected: nodes that VPD's answer and the every-connection run need
@@ -346,8 +347,8 @@ class EdgePruner(Descent):
     that is not kept, the prediction less every residual writer at a target that is not kept; every other
     subcomponent off; the remainders live or off, reading the full stream. Connections: every one the model has among
     the nodes (native.all_edges), (writer, reader), reader None for the prediction, in the plan's order; a subset bool
-    [E] runs as 0/1 strengths. On CUDA the single removals a round ranks run in bfloat16 (kl_rank: an ordering); every
-    removal kept or refused and every KL recorded is a float32 run."""
+    [E] runs as 0/1 strengths. Every run is float32, the rankings too (on CUDA bfloat16 rankings reordered the rounds
+    and changed which connections were kept)."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, live: bool = False, B: int = 32):
         import engine
@@ -363,7 +364,8 @@ class EdgePruner(Descent):
         self.eng = engine.Engine(nat, tx.ids, tx.targets, live=live,
                                  columns={n: torch.tensor(cols[n], dtype=torch.long, device=nat.dev) for n in nat.names})
         self.plan = self.eng.plan(self.graph, semantics="c")
-        self.rank_precision = "bf16" if str(nat.dev).startswith("cuda") else "score"
+        self.rank_precision = "score"   # float32: bfloat16 ranking reordered text9000's first round on CUDA and its robust
+        # descent kept 114 of 131 connections against float32's 23 (monitorbench)
         self.protected = torch.zeros(len(self.edges), dtype=torch.bool, device=nat.dev)   # never offered for removal
         self.measured = 0
 
@@ -417,10 +419,13 @@ class EdgePruner(Descent):
 
 def routes(nodes: list, targets: list[int]) -> set:
     """The nodes with a route to the prediction through connections the model has among `nodes` (native.all_edges):
-    the residual writers at the targets, queries and keys (they act through their layer's attention pattern), and
-    every writer into one of these."""
+    the residual writers at the targets, every writer into one of these, and the queries and keys whose pattern feeds
+    one (a query at t when an attention output of its layer at t has a route, a key at p when one of its layer at a
+    position >= p has), with their writers in turn: a query or key whose pattern no routed attention output reads
+    feeds nothing."""
     par, out = native.all_edges(nodes, targets)
-    reach = set(out) | {nd for nd in nodes if native._layer_kind(nd)[1] in ("q_proj", "k_proj")}
+    qk = [nd for nd in nodes if native._layer_kind(nd)[1] in ("q_proj", "k_proj")]
+    reach = set(out)
     grew = True
     while grew:
         grew = False
@@ -430,6 +435,16 @@ def routes(nodes: list, targets: list[int]) -> set:
                     if w not in reach:
                         reach.add(w)
                         grew = True
+        o = {}                                               # per layer, the positions of its routed attention outputs
+        for nd in reach:
+            layer, kind = native._layer_kind(nd)
+            if kind == "o_proj":
+                o.setdefault(layer, []).append(nd[1])
+        for nd in qk:
+            layer, kind = native._layer_kind(nd)
+            if nd not in reach and any((t == nd[1]) if kind == "q_proj" else (t >= nd[1]) for t in o.get(layer, ())):
+                reach.add(nd)
+                grew = True
     return reach
 
 

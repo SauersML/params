@@ -7,7 +7,9 @@ EdgePruner's runs are the scorecard's (goal_eval.GoalEval.graph_kl: with every c
 teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, one
 over the answer budget steps to a smaller path point, the flip repair writes its best-scoring step, and Descent.prune's
 accept check admits exactly the largest passing prefix (a constructed case), with --no-strand every listed node but a
-query or key has a stated path to the prediction, and --edge-levels' default keeps the connections it kept before.
+query or key has a stated path to the prediction (routes() drops a query or key whose pattern feeds no routed attention
+output), --edge-levels' default keeps the connections it kept before, and a round's ranking sees the same KLs on the GPU
+and the CPU (float32: the orders differ only among connections tied to that precision).
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -195,17 +197,23 @@ def test_no_strand_leaves_no_node_unconnected():
     circuits, row, _ = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True, no_strand=True)
     c = circuits[""]
     qk = {i for i, (m, _, _) in enumerate(c["nodes"]) if m.endswith(("q_proj", "k_proj"))}
-    reach = {w for w, r in c["edges"] if r == "out"} | qk
+    reach = {w for w, r in c["edges"] if r == "out"}
     grew = True
-    while grew:
-        grew = False
+    while grew:                                              # stated paths to the prediction; a query or key ends one
+        grew = False                                         # only when an attention output of its layer reaches it
         for w, r in c["edges"]:
             if r in reach and w not in reach:
                 reach.add(w)
                 grew = True
-    # every listed node but the token embeddings, queries and keys has a stated path to the prediction (or to a query or
-    # key, which act through the attention pattern)
-    assert all(i in reach for i, (m, _, _) in enumerate(c["nodes"]) if m != "tok" and i not in qk)
+        o = [(int(c["nodes"][i][0].split(".")[1]), c["nodes"][i][2]) for i in reach if c["nodes"][i][0].endswith("o_proj")]
+        for i in qk - reach:
+            m, _, t = c["nodes"][i]
+            if any(l == int(m.split(".")[1]) and (p == t if m.endswith("q_proj") else p >= t) for l, p in o):
+                reach.add(i)
+                grew = True
+    # every listed node but the token embeddings has a stated path to the prediction: a query or key through a routed
+    # attention output of its layer
+    assert all(i in reach for i, (m, _, _) in enumerate(c["nodes"]) if m != "tok")
 
 
 @pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
@@ -227,3 +235,33 @@ def test_edge_levels():
     _, s2, steps2, ep2 = coarse.connect(on, 0.0)[:4]
     assert s2["kl_graph"] <= max(plain.budget, steps2[0]["kl_graph"]) * (1 + REL)
     assert ep2.measured < ep.measured
+
+
+def test_routes_drop_dead_queries_and_keys():
+    o2, q2, k2 = ("h.2.attn.o_proj", 10, 0), ("h.2.attn.q_proj", 10, 1), ("h.2.attn.k_proj", 4, 5)
+    k3, d2, d0 = ("h.3.attn.k_proj", 4, 2), ("h.2.mlp.down_proj", 4, 3), ("h.0.mlp.down_proj", 4, 6)
+    # target 10: o2 writes into the prediction; q2 (layer 2 at 10) and k2 (layer 2 at 4 <= 10) feed o2's pattern, d0
+    # writes into k2 (and k3); k3 has no attention output of its layer at or after 4, so its pattern feeds nothing, nor
+    # does d2, whose only connection (written after layer 2's attention) is into k3
+    assert teacher.routes([o2, q2, k2, k3, d2, d0], [10]) == {o2, q2, k2, d0}
+
+
+@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
+def test_connection_rankings_agree_across_devices():
+    singles = []
+    for dev in (DEVICE, "cpu"):
+        nat = native.Native(dev)
+        ge = goal_eval.GoalEval(nat, chunk=32)
+        ids, targets = native.text(TEXT)
+        tx = ge.text(ids, targets)
+        tx.vpd = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+        for n, (t, c) in torch.load(VPD_SAVED)["text9000"]["answer"].items():
+            tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
+        pr = teacher.Pruner(ge, tx, tx.vpd, live=teacher.CONVENTION == "live", B=32)
+        ep = teacher.EdgePruner(ge, tx, [nd for nd in pr.nodes if nd[1] in tx.targets][:24], teacher.CONVENTION == "live", 8)
+        singles.append(torch.tensor(ep.without(ep.blocks("connection"), ranking=True), dtype=torch.float64))
+    # every ranking in float32: a round's single-removal KLs agree across devices within float32 rounding, so the two
+    # orders differ only among connections whose KLs are equal to that precision (on text9000 55 of the 125 gaps
+    # between sorted KLs are below 1e-4: many connections change nothing); bfloat16 rankings reordered whole rounds
+    a, b = torch.sort(singles[0]).values, torch.sort(singles[1]).values
+    assert close(a.tolist(), b.tolist())

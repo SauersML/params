@@ -441,6 +441,58 @@ def test_strand_keeps_paths_to_the_prediction(tiny):
     whole.stranded, whole.stranded_bits = [], 0.0
     assert abs(goal_eval.size_bits(kept, P, S, tx.targets) - goal_eval.size_bits(whole, P, S, tx.targets)) < 1e-6
 
+
+def test_strand_follows_stated_pairs(tiny):
+    """With stated query-key pairs a query or key acts in a read only if the read has no entry or a pair names it:
+    a query its read leaves out is stranded (and a writer only it read), a key every read with an entry leaves out
+    too, while a read without an entry keeps its queries and keys; a pair naming a dropped node goes with it."""
+    nat, ge, tx = tiny
+    o1, o0 = ("h.1.attn.o_proj", 11, 0), ("h.0.attn.o_proj", 11, 0)
+    qa, qb, q8 = ("h.1.attn.q_proj", 11, 0), ("h.1.attn.q_proj", 11, 1), ("h.1.attn.q_proj", 8, 0)
+    ka, kb = ("h.1.attn.k_proj", 3, 0), ("h.1.attn.k_proj", 5, 1)
+    q0, k0 = ("h.0.attn.q_proj", 11, 2), ("h.0.attn.k_proj", 4, 2)
+    w = ("h.0.mlp.down_proj", 11, 0)  # read by qb alone
+    g = native.Graph([o1, o0, qa, qb, q8, ka, kb, q0, k0, w], {qb: [w]}, [o1, o0])
+    g.pairs = {(1, 11): [(qa, ka)], (1, 8): [(q8, ka)]}
+    kept = goal_eval.strand(g, tx.targets, nat.C)
+    assert set(kept.stranded) == {qb, w, kb, q8}
+    assert set(kept.node_set()) == {o1, o0, qa, ka, q0, k0}
+    assert kept.pairs == {(1, 11): [(qa, ka)], (1, 8): []} and kept.parents == {}
+
+
+def test_pair_edges_parse_and_round_trip(tiny):
+    """circuit() reads ["pair", query, key, layer, position] edges into g.pairs ("rest" for the rest, a read with only
+    the background stated as an empty entry), counts pairs the model does not have as bad edges, and to_json writes
+    them back."""
+    nat, ge, tx = tiny
+    nodes = [["h.1.attn.o_proj", 0, 11], ["h.1.attn.q_proj", 0, 11], ["h.1.attn.k_proj", 0, 3], ["h.1.attn.k_proj", 1, 5],
+             ["h.1.attn.k_proj", 2, 9]]
+    o1, qa, ka, kb = ("h.1.attn.o_proj", 11, 0), ("h.1.attn.q_proj", 11, 0), ("h.1.attn.k_proj", 3, 0), ("h.1.attn.k_proj", 5, 1)
+    edges = [[0, "out"], ["pair", 1, 2, 1, 11], ["pair", 1, "rest", 1, 11], ["pair", "rest", 3, 1, 11],
+             ["pair", 2, 2, 1, 11],  # a key in the query's place
+             ["pair", 1, 2, 0, 11],  # another layer
+             ["pair", "rest", 4, 1, 8],  # a key after the read's position
+             ["pair", "rest", "rest", 1, 7]]
+    g, d = goal_eval.circuit({"nodes": nodes, "edges": edges}, tx.targets, nat.C, tx.T)
+    assert d["invalid_edges"] == 3
+    assert g.pairs == {(1, 11): [(qa, ka), (qa, None), (None, kb)], (1, 7): []}
+    assert set(g.stranded) == {("h.1.attn.k_proj", 9, 2)}  # named by no read's pairs, and read (1, 11) states pairs
+    again, d2 = goal_eval.circuit(goal_eval.to_json(g), tx.targets, nat.C, tx.T)
+    assert again.pairs == g.pairs and d2["invalid_edges"] == 0 and set(again.node_set()) == set(g.node_set())
+
+
+def test_edge_family_cuts_stated_pairs(tiny):
+    """Reads with stated query-key pairs join the connection-cut family's readers: a circuit whose only stated
+    structure is pairs is still scored, and its draws are the reads' pair cuts."""
+    nat, ge, tx = tiny
+    o1, qa, ka, kb = ("h.1.attn.o_proj", 11, 0), ("h.1.attn.q_proj", 11, 0), ("h.1.attn.k_proj", 3, 0), ("h.1.attn.k_proj", 5, 1)
+    g = native.Graph([o1, qa, ka, kb], {}, [])
+    g.pairs = {(1, 11): [(qa, ka), (None, kb)]}
+    row = ge._edge_family(tx, [g], draws=6)[0]
+    assert row["kl_edges_c"] is not None and row["kl_edges_vpd"] is not None
+    plain = native.Graph([o1, qa, ka, kb], {}, [])
+    assert ge._edge_family(tx, [plain], draws=6)[0]["kl_edges_c"] is None
+
 def test_probe_is_kept(tiny):
     """A text's changed prompts and F2 prompts come from one sensitivity probe, kept per text: a second preparation
     of the text gets the same prompts without probing again."""

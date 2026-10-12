@@ -142,7 +142,11 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
     [[upstream, downstream], ...], "explanation": str}; an edge end is a node's place in the list, downstream "out" for
     the prediction; a matrix is native's name or "L.kind" (kind q, k, v, o, fc, down), or "tok" for the token
     embedding at the position (index 0), which feeds residual readers at its position (Graph.tok_edges: (position,
-    reader)), and "variables" (variables.parse's form, kept as g.variables for the E4 hook). Nodes outside the model or
+    reader)), and "variables" (variables.parse's form, kept as g.variables for the E4 hook). An edge ["pair", query,
+    key, layer, position] states a query-key pair of the read (layer, position) (g.pairs, monitorbench's bcbddad):
+    query a node's place (a query node of that layer at that position) or "rest", key a node's place (a key node of
+    that layer at or before it) or "rest"; ["pair", "rest", "rest", layer, position] states the read with no pair
+    beyond the background. Nodes outside the model or
     the text, edges the model does not have (mech.connects), and variables naming a part outside the model are dropped
     and counted."""
     nodes, bad_nodes = [], 0
@@ -161,12 +165,23 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
         else:
             bad_nodes += 1
             nodes.append(None)
-    parents, out, tok, bad_edges = {}, [], [], 0
-    for up, down in answer.get("edges", []):
+    parents, out, tok, bad_edges, pairs = {}, [], [], 0, {}
+    for e in answer.get("edges", []):
+        if isinstance(e, (list, tuple)) and len(e) == 5 and e[0] == "pair":
+            got = _pair_entry(e, nodes, targets)
+            if got is None:
+                bad_edges += 1
+            else:
+                read, pr = got
+                ps = pairs.setdefault(read, [])
+                if pr != (None, None) and pr not in ps:
+                    ps.append(pr)
+            continue
         try:
+            up, down = e
             w = nodes[up]
             r = None if down == "out" else nodes[down]
-        except (IndexError, TypeError):
+        except (IndexError, TypeError, ValueError):
             bad_edges += 1
             continue
         if w is None or (down != "out" and r is None):
@@ -186,6 +201,8 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
                      list(dict.fromkeys(out)))
     g.tok_edges = list(dict.fromkeys(tok))
     g.tok_positions = sorted({nd[1] for nd in nodes if nd is not None and nd[0] == "tok"})
+    if pairs:
+        g.pairs = pairs
     g.variables, bad_variables = [], 0
     if answer.get("variables"):
         import variables  # (it imports this module)
@@ -206,7 +223,11 @@ def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
     no path, an edge in only or a branch ending nowhere). A node other than a query or key needs a stated path to the
     prediction; a query at t, an output node of its layer at t that has one; a key at p, an output node of its layer at
     a position at or after p that has one (queries and keys act through the attention pattern); a kept query's or key's
-    stated writers are on a path through it. They are dropped before every family, with their connections and any
+    stated writers are on a path through it. With stated query-key pairs (g.pairs {(layer, t): [(query or None, key
+    or None)]}, monitorbench's bcbddad: a read with an entry computes its pattern row from the background and those
+    pairs alone), a query or key acts in a read only if the read has no entry or one of its pairs names it, so a query
+    whose read states pairs without it, or a key every such read leaves out, is stranded too, and the pairs naming a
+    dropped node go with it. They are dropped before every family, with their connections and any
     embedding edge into them; their bits stay charged in size (stranded_bits, which size_bits adds). g.stranded lists
     them. A complete graph is unchanged. The answer's variables (g.variables) carry over."""
     if hasattr(g, "stranded"):  # already done (its record kept)
@@ -215,6 +236,12 @@ def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
         g.stranded, g.stranded_bits = [], 0.0
         return g
     kind = {nd: native._name_layer_kind(nd[0]) for nd in g.node_set()}
+    pairs = getattr(g, "pairs", None) or {}
+    named = {read: {x for pr in ps for x in pr if x is not None} for read, ps in pairs.items()}
+
+    def acts(nd, L, t):  # a query or key node acts in read (L, t): no pairs stated there, or one naming it
+        return (L, t) not in pairs or nd in named[(L, t)]
+
     reach, todo, through = set(), list(g.out), set()
     while True:
         while todo:
@@ -227,8 +254,8 @@ def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
         for nd in reach:
             if kind[nd][1] == "o_proj":
                 heads.setdefault(kind[nd][0], set()).add(nd[1])
-        qk = {nd for nd, (L, k) in kind.items() if (k == "q_proj" and nd[1] in heads.get(L, ()))
-              or (k == "k_proj" and any(t >= nd[1] for t in heads.get(L, ())))} - through
+        qk = {nd for nd, (L, k) in kind.items() if (k == "q_proj" and nd[1] in heads.get(L, ()) and acts(nd, L, nd[1]))
+              or (k == "k_proj" and any(t >= nd[1] and acts(nd, L, t) for t in heads.get(L, ())))} - through
         if not qk:
             break
         through |= qk
@@ -245,11 +272,32 @@ def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
     kept.tok_positions = list(getattr(g, "tok_positions", []))
     if hasattr(g, "variables"):
         kept.variables = g.variables
+    if pairs:  # a pair naming a dropped node goes with it
+        kept.pairs = {read: [pr for pr in ps if not set(pr) & drop] for read, ps in pairs.items()}
     P, S = max(targets) + 1, sum(C.values())
     g.stranded_bits = 0.0
     kept.stranded, kept.stranded_bits = gone, 0.0
     kept.stranded_bits = size_bits(g, P, S, targets) - size_bits(kept, P, S, targets)
     return kept
+
+
+def _pair_entry(e: list, nodes: list, targets: list[int]):
+    """((layer, position), (query or None, key or None)) of a JSON pair edge ["pair", query, key, layer, position]
+    (circuit's), None when it is not one the model has."""
+    try:
+        _, qi, ki, layer, t = e
+        layer, t = int(layer), int(t)
+        q = None if qi == "rest" else nodes[qi]
+        k = None if ki == "rest" else nodes[ki]
+    except (IndexError, TypeError, ValueError):
+        return None
+    if not 0 <= t <= max(targets) or (qi != "rest" and q is None) or (ki != "rest" and k is None):
+        return None
+    if q is not None and (q[0] == "tok" or native._name_layer_kind(q[0]) != (layer, "q_proj") or q[1] != t):
+        return None
+    if k is not None and (k[0] == "tok" or native._name_layer_kind(k[0]) != (layer, "k_proj") or k[1] > t):
+        return None
+    return (layer, t), (q, k)
 
 
 def to_json(g: native.Graph, explanation: str = "") -> dict:
@@ -259,6 +307,8 @@ def to_json(g: native.Graph, explanation: str = "") -> dict:
     at = {nd: i for i, nd in enumerate(nodes)}
     edges = ([[at[w], at[r]] for r, ws in g.parents.items() for w in ws] + [[at[w], "out"] for w in g.out]
              + [[at[("tok", p, 0)], at[r]] for p, r in tok])
+    for (layer, t), ps in sorted((getattr(g, "pairs", None) or {}).items()):
+        edges += [["pair", "rest" if a is None else at[a], "rest" if b is None else at[b], layer, t] for a, b in ps] or [["pair", "rest", "rest", layer, t]]
     return {"nodes": [[n, c, t] for n, t, c in nodes], "edges": edges, "explanation": explanation}
 
 
@@ -373,10 +423,13 @@ def _search(dev) -> str:
 
 
 def _drop_nodes(g: native.Graph, drop: set) -> native.Graph:
-    """A stated graph without some nodes and every connection to or from them."""
+    """A stated graph without some nodes and every connection to or from them (and every stated pair naming one)."""
     nodes = [nd for nd in g.nodes if nd not in drop]
     par = {r: [w for w in ws if w not in drop] for r, ws in g.parents.items() if r not in drop}
-    return native.Graph(nodes, {r: ws for r, ws in par.items() if ws}, [w for w in g.out if w not in drop])
+    out = native.Graph(nodes, {r: ws for r, ws in par.items() if ws}, [w for w in g.out if w not in drop])
+    if getattr(g, "pairs", None):  # a stated pair naming a removed node goes with it; the read keeps its entry
+        out.pairs = {read: [pr for pr in ps if not set(pr) & drop] for read, ps in g.pairs.items()}
+    return out
 
 
 def _from(ids: list[int], p: int) -> list | None:
@@ -1485,14 +1538,17 @@ class GoalEval:
     def _edge_family(self, tx: Text, graphs: list[native.Graph], draws: int, reads: bool = False) -> list[dict]:
         """Per circuit, the connection-cut family: draw j cuts a random subset of the stated connections into one
         reader (the prediction among the readers) in the model, in VPD's answer and in the circuit, all in C's
-        semantics (the reader reads its input without those writers' outputs); the mean KLs from the model's. A
-        circuit without connections: None. Every draw of a side runs in one batch on the engine (_sides)."""
+        semantics (the reader reads its input without those writers' outputs), or, a read with stated query-key pairs
+        drawn, a random subset of its pairs (graph_ref's ("pairs", layer, t) cut, the circuit's queries and keys of that
+        read the split); the mean KLs from the model's. A circuit without connections or pairs: None. Every draw of a side runs in one batch on the engine (_sides)."""
         sides = self._sides(tx, graphs)
         out = []
         for g in graphs:
             nodes = g.node_set()
             par, outs = (native.all_edges(nodes, tx.targets) if g.complete else (g.parents, g.out))
+            sp = {} if g.complete else (getattr(g, "pairs", None) or {})
             readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
+            readers += [("pairs",) + read for read in sorted(sp) if sp[read]]  # reads with stated query-key pairs
             if not readers:
                 out.append({"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None})
                 continue
@@ -1500,6 +1556,14 @@ class GoalEval:
             cuts = []
             for j in range(draws):
                 r = readers[int(rng.integers(len(readers)))]
+                if r is not None and r[0] == "pairs":  # a random subset of the read's stated pairs cut, the split the
+                    ps, (_, layer, t) = sp[r[1:]], r  # circuit's queries at t and keys up to t of that layer
+                    split = sorted(nd for nd in nodes if native._name_layer_kind(nd[0])[0] == layer and
+                                   ((native._name_layer_kind(nd[0])[1] == "q_proj" and nd[1] == t)
+                                    or (native._name_layer_kind(nd[0])[1] == "k_proj" and nd[1] <= t)))
+                    cut = [pr for pr in ps if rng.random() < (j + 0.5) / draws] or [ps[int(rng.integers(len(ps)))]]
+                    cuts.append({r: (split, cut)})
+                    continue
                 ws = list(par[r]) if r is not None else list(outs)
                 cuts.append({r: [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]})
             got = sides(g, cuts=cuts, reads=reads)

@@ -11,8 +11,9 @@ Per text:
   1. The F1 circuit: from VPD's answer, rounds at each level (whole positions, sites, chunks of 64, 16 and 4 of a site's
      subcomponents by index, single subcomponents) measure every block's removal, rank the blocks by the KL their removal
      leaves, and remove the most of them in that order that keeps F1 >= 0.9 (KL_C <= KL_empty^0.1 KL_VPD^0.9), until no
-     single removal does. (The linear recovery >= 0.9 admits circuits ~10 bits from the model, the empty circuit being
-     ~100 bits away: on text9000 it pruned to 5 subcomponents at the target.)
+     single removal does; with --start-top K, from VPD's top K through the last three levels only. (The linear recovery
+     >= 0.9 admits circuits ~10 bits from the model, the empty circuit being ~100 bits away: on text9000 it pruned to 5
+     subcomponents at the target.)
   2. VPD's top-k: the smallest prefix of VPD's order (Native._vpd_order) whose necessity N reaches 0.99 (bisection, at
      most 1,024).
   3. The joint path from their union: each step measures every single subcomponent's removal (two runs: the circuit and
@@ -230,7 +231,7 @@ def circuit_json(pr: Pruner, on: torch.Tensor) -> dict:
 
 
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
-          vpd_order: list | None = None) -> tuple[dict, dict]:
+          vpd_order: list | None = None, start_top: int = 0) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour."""
     t0 = time.perf_counter()
@@ -259,7 +260,13 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     row = {"T": tx.T, "convention": CONVENTION, "vpd_size": len(pr.nodes), "vpd_positions": int(torch.unique(pr.t).numel()),
            "kl_empty": empty, "kl_vpd": vpd, "budget_kl": budget, "active_scale": active, "levels": {}}
-    for level in LEVELS:                                     # the F1 circuit
+    levels = LEVELS
+    if start_top:                                            # the F1 search from VPD's top start_top, subcomponents only
+        pr.on[:] = False
+        pr.on[order[:start_top]] = True
+        levels = ("chunk16", "chunk4", "subcomponent")
+    row["f1_start"] = int(pr.on.sum())
+    for level in levels:                                     # the F1 circuit
         t1 = time.perf_counter()
         rounds = pr.prune(level, budget)
         row["levels"][level] = lv = {"rounds": rounds, "size": int(pr.on.sum()), "positions": int(torch.unique(pr.t[pr.on]).numel()),
@@ -319,6 +326,7 @@ def main():
     ap.add_argument("--vpd", type=Path, help="VPD's answers and orders saved by --save-vpd (no causal-importance network here)")
     ap.add_argument("--save-vpd", type=Path, help="save VPD's answers and orders on the texts to this file and stop")
     ap.add_argument("--labels", type=Path, help="locality JSONL (task, local)")
+    ap.add_argument("--start-top", type=int, default=0, help="F1 search from VPD's top K at subcomponent level (0: from VPD's whole answer)")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
     ge = goal_eval.GoalEval(native.Native(), chunk=args.batch)
@@ -343,7 +351,7 @@ def main():
             continue
         ids, targets = native.text(path)
         saved = vpd.get(path.stem, {})
-        circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"))
+        circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

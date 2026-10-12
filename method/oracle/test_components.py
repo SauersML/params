@@ -590,3 +590,24 @@ def test_e2g_credits_answers_that_agree_with_the_model_and_the_circuit(tiny):
     assert all(0.0 <= x["credit"] <= 1.0 for x in got["per_question"])
     none = components.e2g_term(ge, tx, task, answer, ev["qa"], {})
     assert none["E2g"] == 0.0 and none["accuracy"] == 0.0
+
+
+def test_line_credit_gives_each_circuit_line_its_leave_one_out_effect(tiny):
+    """reward(lines=True): every node and edge line of the circuit gets a credit (its removal's measured effect less the
+    compactness it would gain), a line that does not parse -1, and each question's ANSWER and FINAL lines their E2g."""
+    nat, ge, task, ev = tiny
+    order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
+    at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:3]
+    finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
+    text = components.render(goal_eval.to_json(native.Graph(set(at_t), {}, at_t), ""), finals).replace(
+        "flowchart LR", "flowchart LR\n  not a line")
+    got = components.reward(ge, task, ev, [text], pool={}, lines=True)[0]
+    assert got["valid"]
+    credit = dict(map(tuple, got["lines"]))
+    rows = text.split("\n")
+    assert credit[rows.index("  not a line")] == -1.0
+    for k, row in enumerate(rows):
+        if row.startswith("    ") and "[" in row or " --> " in row:
+            assert k in credit, row  # every declaration and edge line
+    if ev["qa"]:
+        assert credit[rows.index("FINAL 1: " + text.split("FINAL 1: ", 1)[1].split("\n", 1)[0])] == got["e2g"]["per_question"][0]["credit"]

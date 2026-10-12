@@ -7,12 +7,13 @@ goal_eval.Text is kept for the group's later requests. A text's requests always 
   serve_components.py ROWS.jsonl [--port 8767] [--workers 2] [--device cuda] [--teacher DIR]
                       [--reader http://127.0.0.1:8000/v1/completions --reader-base Qwen/Qwen3-4B]
                       [--edit-teach TEACH.jsonl ...] [--variables]
-  POST /score {"task": TASK_ID, "answers": [TEXT, ...], "e1": [bits, ...], "truncated": [bool, ...]}
+  POST /score {"task": TASK_ID, "answers": [TEXT, ...], "e1": [bits, ...], "truncated": [bool, ...], "lines": bool}
       (e1 and truncated optional: whether each answer was cut at the sampling cap or over the answer cap, an invalid
       answer)
       -> {"scores": [{"reward", "valid", "phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q", "E2g", "E4x",
                       "E1", "C", "C_rl", "N", "F1", "F3", "E2", "E3", "E4", "nodes", "edges", "tok_edges", "malformed",
-                      "dropped_nodes", "dropped_edges", "finals", "truncated"}, ...]}
+                      "dropped_nodes", "dropped_edges", "finals", "truncated", "lines"}, ...]}  ("lines": each answer line's
+                      credit, [[line, c], ...], with "lines": true: RL's per-line advantages)
   GET /health -> {"workers", "alive", "pending"}
 
 The reward is components.reward's v3: phi + g x (0.5 compact + E2g + E4x + E1) + D, teacher dominance D against the
@@ -75,10 +76,11 @@ def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url
                 batch.append(inbox.get_nowait())
             except queue.Empty:
                 break
-        groups = {}
+        groups, want_lines = {}, False
         for rid, req in batch:
             groups.setdefault(req["task"], []).append((rid, req["answers"], req.get("e1"),
                                                                  req.get("truncated") or [False] * len(req["answers"])))
+            want_lines = want_lines or bool(req.get("lines"))
         for tid, reqs in groups.items():
             try:
                 if tid not in tasks:
@@ -87,11 +89,11 @@ def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url
                 got = components.reward(ge, tasks[tid], rows[tid], [x for _, xs, _, _ in reqs for x in xs],
                                         cache=cache, reader=None if given else reader, e1=given,
                                         truncated=[c for _, _, _, cut in reqs for c in cut], ee=ee, edit_best=edit_best, vs=vs,
-                                        teacher=teachers.get(tid))
+                                        teacher=teachers.get(tid), lines=want_lines)
                 while len(cache) > TEXTS_KEPT:
                     cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **{k[5:]: g[k] for k in g if k.startswith("term_")},
-                        **{k: g.get(k) for k in ("phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q")},
+                        **{k: g.get(k) for k in ("phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q", "lines")},
                         **{k: (g["row"] or {}).get(k) for k in ("nodes", "edges", "tok_edges")},
                         **{k: g[k] for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")}} for g in got]
                 err = None

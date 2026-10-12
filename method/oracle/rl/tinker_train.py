@@ -60,6 +60,7 @@ RENDERER = "qwen3_disable_thinking"
 THINKING_RENDERER = "qwen3"  # sample/rl --thinking: Qwen3's own reasoning before the answer (sft keeps the empty block in
 # the prompt, RENDERER's way, so the targets never train thinking away: the lead's 10-12)
 CONTEXT = 32768  # Qwen3-8B's native context: a question's generation limit is at most what it leaves
+LINE_WEIGHT = 0.5  # the per-line credit's weight in a token's advantage, A + 0.5 z(c_l) (the lead's v3)
 ANSWER_CAP = 8000  # reward v3's answer cap in tokens after the thinking (Mermaid: the 3,500 of the id grammar x ~1.66,
 # max 7,403 over the 444 v1 targets): an answer above it counts as cut, invalid
 
@@ -144,6 +145,35 @@ def renderer_for(base: str, thinking: bool = False):
         names = model_info.get_recommended_renderer_names(base)
         name = next((n for n in names if n.endswith("_disable_thinking") != thinking), names[0])
     return renderers.get_renderer(name, tokenizer), tokenizer
+
+
+def line_advantages(tokenizer, tokens: list[int], text: str, credits: list, A: float, weight: float = LINE_WEIGHT) -> list[float]:
+    """Per sampled token, its advantage with the per-line credit (the lead's v3): A + weight x z(c_l) over the tokens of
+    answer line l (credits: [[line number in the answer text, c], ...], z normalized over the answer's credited lines),
+    A alone on the thinking and on lines without credit. Lines are found by decoding the tokens after the thinking and
+    counting newlines, aligned to the answer text's start."""
+    adv = [A] * len(tokens)
+    cs = [c for _, c in credits]
+    if len(cs) < 2:
+        return adv
+    mu = sum(cs) / len(cs)
+    sd = (sum((c - mu) ** 2 for c in cs) / len(cs)) ** 0.5 or 1.0
+    z = {k: (c - mu) / sd for k, c in credits}
+    end = tokenizer.convert_tokens_to_ids("</think>") if hasattr(tokenizer, "convert_tokens_to_ids") else None
+    start = (len(tokens) - tokens[::-1].index(end)) if end is not None and end in tokens else 0
+    decoded, line, lead = "", 0, None
+    for i in range(start, len(tokens)):
+        piece = tokenizer.decode([tokens[i]])
+        if lead is None:  # the answer text starts at the first non-blank character
+            if not piece.strip():
+                decoded += piece
+                continue
+            lead = decoded.count("\n")
+        line = decoded.count("\n") - lead
+        if line in z:
+            adv[i] = A + weight * z[line]
+        decoded += piece
+    return adv
 
 
 def answer_of(renderer, tokenizer, tokens: list[int]) -> tuple[str, int]:
@@ -454,7 +484,7 @@ def rl(a) -> None:
             texts, thinks = zip(*(answer_of(renderer, tokenizer, s.tokens) for s in res.sequences))
             texts = list(texts)
             t1 = time.time()
-            req = {"task": q["task"], "answers": texts, "truncated": [str(s.stop_reason) == "length" or len(s.tokens) - th > ANSWER_CAP
+            req = {"task": q["task"], "answers": texts, "lines": True, "truncated": [str(s.stop_reason) == "length" or len(s.tokens) - th > ANSWER_CAP
                                                                     for s, th in zip(res.sequences, thinks)]}
             if frozen is not None:
                 if q["task"] not in tasks:
@@ -480,15 +510,16 @@ def rl(a) -> None:
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
                            "terms": {k: [s.get(k) for s in scores] for k in ("phi", "phi_tau", "g", "compact", "bits", "D", "Q", "E2g",
                                                                               "E4x", "E1", "C", "N", "E2", "E3", "E4")}})
-            for s, rew in zip(res.sequences, rewards):
-                if rew == mean:
+            for s, rew, sc, text in zip(res.sequences, rewards, scores, texts):
+                adv = line_advantages(tokenizer, list(s.tokens), text, sc.get("lines") or [], rew - mean)
+                if not any(adv):
                     continue
                 ob = n - 1
                 inp = prompt.append(tinker.types.EncodedTextChunk(tokens=s.tokens[:-1]))
                 datums.append(tinker.types.Datum(model_input=inp, loss_fn_inputs={
                     "target_tokens": TensorData.from_torch(torch.tensor([0] * ob + list(s.tokens))),
                     "logprobs": TensorData.from_torch(torch.tensor([0.0] * ob + list(s.logprobs))),
-                    "advantages": TensorData.from_torch(torch.tensor([0.0] * ob + [rew - mean] * len(s.tokens)))}))
+                    "advantages": TensorData.from_torch(torch.tensor([0.0] * ob + adv))}))
         with (a.log / "groups.jsonl").open("a") as f:
             for g in groups:
                 f.write(json.dumps({"step": step, **g}) + "\n")

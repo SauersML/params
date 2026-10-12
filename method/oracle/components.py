@@ -357,7 +357,7 @@ def parse(text: str) -> dict:
         answer["complete"] = True
     if variables:
         answer["variables"] = variables
-    return {"explanation": explanation, "answer": answer, "malformed": malformed, "malformed_nodes": junk + unknown,
+    return {"explanation": explanation, "answer": answer, "ids": ids, "malformed": malformed, "malformed_nodes": junk + unknown,
             "unknown_ids": unknown, "circuit": "CIRCUIT" in sec, "finals": finals, "edits": edits, "variables_malformed": bad_vars}
 
 
@@ -1469,7 +1469,8 @@ def softplus(x: float) -> float:
 
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            convention: str = CONVENTION, cache: dict | None = None, ee=None, edit_best: dict | None = None,
-           pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None) -> list[dict]:
+           pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None,
+           lines: bool = False) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
     in bits, every term ranking, nothing clipped flat): R = phi + g x Q + D.
       phi: goal_eval.phi of the answer's reward-mode row, -log2 of the power-4 mean of the families' residuals
@@ -1494,7 +1495,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     columns (fidelity); circuit_reward = phi + g x 0.5 compact + D (the circuit alone, for references without answers).
     split: the draws of C's changed-input, interchange and donor families, "search" (the RL reward on training texts)
     or "eval" (every evaluation, evaluate()); pool: the flip adversary's pattern pool (POOL; {} leaves it out); cache:
-    task -> goal_eval.Text, kept between calls."""
+    task -> goal_eval.Text, kept between calls. lines: each answer line's credit too ("lines", line_credit(): the
+    token-level advantages of RL's per-line reward; line_effects in pp mode per answer)."""
     import goal_eval
 
     nat = ge.nat
@@ -1532,7 +1534,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
     c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], pool, mode="reward", split=split))) if keep else {}
     e4 = {i: e4_term(vs, tx, graphs[i], parsed[i]["answer"], parsed[i]["variables_malformed"], nat.C) for i in keep} if vs is not None else {}
-    e4x = {i: e4x_term(ge, tx, graphs[i], e4[i], split) for i in e4 if e4[i].get("per_variable")}
+    le = {i: ge.line_effects(tx, graphs[i], mode="pp", split=split or "search") for i in keep
+          if lines or (i in e4 and e4[i].get("per_variable"))}
+    e4x = {i: e4x_term(ge, tx, graphs[i], e4[i], split, le.get(i)) for i in e4 if e4[i].get("per_variable")}
     e3 = {}
     if keep and ee is not None and ev.get("edits"):
         e3 = dict(zip(keep, edit_term(ee, task, ev["edits"], [parsed[i]["edits"] for i in keep], edit_best or {})))
@@ -1560,6 +1564,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             info = {"phi": ph, "phi_tau": pt, "g": g, "faithful": None if ph is None or pt is None else ph >= pt, "bits": b,
                     "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,
                     "e2g": {k: v for k, v in (e2g.get(i) or {}).items() if k != "E2g"} or None}
+            if lines:
+                info["lines"] = line_credit(texts[i], p, p["answer"], le[i], info, e2g.get(i), e4.get(i), nat.C, targets, tx.vpd)
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **info, **{f"term_{k}": v for k, v in terms.items()},
                     "size": info.get("bits"), "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
                     "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row, "variables": e4.get(i),
@@ -1718,12 +1724,83 @@ def e2g_term(ge, tx, task: dict, answer: dict, questions: list[dict], finals: di
             "accuracy": sum(x["right"] for x in per) / k, "per_question": per}
 
 
-def e4x_term(ge, tx, graph, e4: dict, split: str | None) -> float | None:
+def line_credit(text: str, parsed: dict, answer: dict, le: dict, info: dict, e2g: dict | None, e4: dict | None,
+                C: dict, targets: list[int], active) -> list[list]:
+    """Each answer line's credit, c = R(a) - R(a without the line) (the lead's v3 line credit, token-level advantages
+    in RL): a node, connection or token-edge line its leave-one-out effect from line_effects (le, pp: the target KL's
+    rise when it alone is removed, bits) less g x 0.5 x the compactness its removal would gain (log2 of the answer's
+    bits over its bits without it: an inert line's credit is negative); a variable line (2 e4_v - 1) m_v / M (e4x's
+    share of the mechanism); a question's ANSWER and FINAL lines its E2g credit; a CIRCUIT line that does not parse -1.
+    [[line number in the answer text, credit], ...]; other lines carry none."""
+    lines = text.split("\n")
+    g, bits = info.get("g") or 0.0, info.get("bits")
+    node_kl = {tuple(x["node"]): x["delta_kl"] or 0.0 for x in le.get("nodes", [])}
+    edge_kl = {(tuple(w), "out" if r == "out" else tuple(r)): x["delta_kl"] or 0.0 for x in le.get("edges", []) for w, r in [x["edge"]]}
+    tok_kl = {(t, "out" if r == "out" else tuple(r)): x["delta_kl"] or 0.0 for x in le.get("token_edges", []) for t, r in [x["edge"]]}
+    ids = parsed.get("ids") or {}
+    json_of = lambda nd: ["block", nd[0], nd[1]] if nd[2] == BLOCK else ([TOK, 0, nd[1]] if nd[0] == TOK else [nd[0], nd[2], nd[1]])  # noqa: E731
+    place = {tuple(x): i for i, x in enumerate(answer["nodes"])}
+
+    def gain(smaller: dict) -> float:  # the compactness the line's removal would gain: log2(bits / bits without it)
+        b = _bits_of(smaller, C, targets, active)
+        return math.log2(bits / b) if bits and b and b > 0 else 0.0
+    M = sum(max(0.0, x) for x in node_kl.values())
+    out, sec = [], None
+    for k, line in enumerate(lines):
+        head = SECTION.match(line)
+        if head:
+            sec = re.sub(r"\s+", " ", head[1].upper())
+        s_ = line.strip()
+        if sec == "CIRCUIT" and s_ and not head and not s_.startswith(("```", "flowchart", "subgraph", "%%", "direction")) and s_ != "end":
+            m, e = MM_DECL.fullmatch(s_), MM_EDGE.fullmatch(s_)
+            if m and m[1] in ids:
+                nd = ids[m[1]]
+                j = place.get(tuple(json_of(nd)))
+                drop = gain(_without_part(answer, j)) if j is not None else 0.0
+                out.append([k, (node_kl.get(nd, 0.0) if nd[0] != TOK else 0.0) - g * 0.5 * drop])
+            elif e:
+                ws = [x.strip() for x in e[1].split("&")]
+                rs = ["out"] if MM_OUT.fullmatch(e[2]) else [x.strip() for x in e[2].split("&")]
+                c = 0.0
+                for w in ws:
+                    for r in rs:
+                        if w not in ids or (r != "out" and r not in ids):
+                            c -= 1.0  # an undeclared id
+                            continue
+                        wn, rn = ids[w], ("out" if r == "out" else ids[r])
+                        kl = tok_kl.get((wn[1], rn)) if wn[0] == TOK else edge_kl.get((wn, rn))
+                        wi, ri = place.get(tuple(json_of(wn))), ("out" if rn == "out" else place.get(tuple(json_of(rn))))
+                        smaller = {**answer, "edges": [x for x in answer["edges"] if not (x[0] != "pair" and x[0] == wi and x[1] == ri)]}
+                        c += (kl or 0.0) - g * 0.5 * gain(smaller)
+                out.append([k, c])
+            elif not MM_PAIR.fullmatch(s_):
+                out.append([k, -1.0])  # a line that does not parse
+        elif head and sec.split()[0] in ("ANSWER", "FINAL") and e2g:
+            n = int(sec.split()[1])
+            if 1 <= n <= len(e2g["per_question"]):
+                out.append([k, e2g["per_question"][n - 1]["credit"]])
+        elif sec == "EXPLANATION" and VAR_RE.fullmatch(s_) and e4 and e4.get("per_variable") and M > 0:
+            v = int(VAR_RE.fullmatch(s_)[1])
+            if v <= len(e4["per_variable"]):
+                pv = e4["per_variable"][v - 1]
+                out.append([k, (2 * pv["e4"] - 1) * sum(max(0.0, node_kl.get(tuple(nd), 0.0)) for nd in pv["nodes"]) / M])
+    return out
+
+
+def _bits_of(answer: dict, C: dict, targets: list[int], active) -> float | None:
+    """An answer JSON's raw description bits (goal_eval.size_bits, blocks at their active contents)."""
+    import goal_eval
+
+    g, _ = goal_eval.circuit(answer, targets, C, max(targets) + 1)
+    return goal_eval.size_bits(g, max(targets) + 1, sum(C.values()), targets, active=active)
+
+
+def e4x_term(ge, tx, graph, e4: dict, split: str | None, le: dict | None = None) -> float | None:
     """E4x (the lead's v3): sum over variables of (2 e4_v - 1) m_v / sum over the circuit's nodes of m, m a node's
     measured pp removal effect (line_effects' delta_kl, its positive part), m_v the total over the variable's nodes,
     e4_v the variable's headline (min(f on-target, s off-target), 0 unresolved): the share of the mechanism explained
     by variables that pass interchange less the share claimed by ones that fail."""
-    le = ge.line_effects(tx, graph, mode="pp", split=split or "search")
+    le = le or ge.line_effects(tx, graph, mode="pp", split=split or "search")
     m = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in le["nodes"]}
     M = sum(m.values())
     if M <= 0:

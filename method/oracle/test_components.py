@@ -87,12 +87,14 @@ def test_edits():
     assert again["edits"] == {k: v for k, v in p["edits"].items() if k < 3}
 
 
-def test_escape_keeps_special_strings_text():
+@pytest.mark.parametrize("base", components.EXPLAINERS)
+def test_escape_keeps_special_strings_text(base):
+    """Every added token of every explainer's tokenizer, escaped, encodes without any added token."""
     tk = pytest.importorskip("transformers").AutoTokenizer
     try:
-        tok = tk.from_pretrained("Qwen/Qwen3-8B")
+        tok = tk.from_pretrained(base)
     except OSError:
-        pytest.skip("Qwen3's tokenizer is not in the Hugging Face cache")
+        pytest.skip(f"{base}'s tokenizer is not in the Hugging Face cache")
     added = set(tok.get_added_vocab().values())
     raw = "tokens: 0:'<|endoftext|>' 1:'<|im_start|>' 2:'<think>' 3:'</tool_call>' 4:'<|fim_pad|>'"
     for s in tok.get_added_vocab():

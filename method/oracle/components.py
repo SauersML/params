@@ -91,7 +91,8 @@ ID_RE = re.compile(r"[a-z]+")
 GROUP_SPLIT = re.compile(rf"{_G}|[a-z]+")
 REFS_RE = re.compile(rf"\s*{_W}(?:\s*,\s*{_W})*\s*")  # writers by group or by id
 MARKDOWN = re.compile(r"\*\*|^[ \t]*(?:#+|[-*])[ \t]+", re.M)
-ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response)>)")  # Qwen's added tokens: <|...|>, <think>, <tool_call>, ...
+ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response|tts_[a-z_]+)>)")  # the explainers' added tokens (EXPLAINERS): <|...|>, <think>, <tool_call>, <tts_pad>, ...
+EXPLAINERS = ("Qwen/Qwen3-8B", "Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.5-4B")  # policies and readers whose added tokens escape() breaks
 FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s*(.+?)\s*$", re.M | re.I)
 SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+|EDIT\s+\d+)\s*:", re.M | re.I)
 EDIT_RE = re.compile(r"^\s*EDIT\s+(\d+)\s*:(.*)$", re.M | re.I)
@@ -115,8 +116,8 @@ FACT_NODES = 24  # subcomponents a teacher's English writer reads about
 
 
 def escape(text: str) -> str:
-    """Text with every Qwen added-token string broken by a backslash after its "<" ("<|endoftext|>" -> "<\\|endoftext|>",
-    "<think>" -> "<\\think>"), so the explainer's tokenizer reads the vpd4l token strings a question lists (the Pile's
+    """Text with every added-token string of the explainers' tokenizers (EXPLAINERS) broken by a backslash after its "<"
+    ("<|endoftext|>" -> "<\\|endoftext|>", "<think>" -> "<\\think>"), so the explainer's tokenizer reads the vpd4l token strings a question lists (the Pile's
     "<|endoftext|>" among them) as text, never as its own special or added tokens. Applied to every question and
     answer text; idempotent."""
     return ADDED.sub(r"<\\", text)

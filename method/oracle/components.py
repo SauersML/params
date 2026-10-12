@@ -864,6 +864,48 @@ def locality(ge, task: dict) -> dict:
 # ---- evaluation
 
 
+def structure(ge, tx, g, order: list, convention: str = CONVENTION) -> dict:
+    """Diagnostics of a circuit C (goal_eval runs in VPD's semantics; recovered_log under the convention):
+      redundancy: VPD's active subcomponents without C ("rest", in VPD's order) run alone; when they still reach
+         goal_eval.GOAL, a second circuit disjoint from C, the shortest prefix of the rest in VPD's order that reaches
+         it (found by bisection over prefix lengths), its size, and the necessity of C and it together (does removing
+         both from VPD's answer finally break the prediction?);
+      minimality: the share of C's nodes whose removal alone lowers C's own recovered_log (a circuit should hold no
+         idle node; each variant is compared with C run in the same call)."""
+    import goal_eval
+    import native
+
+    key = f"recovered_log_{convention}"
+    C = sorted(g.node_set())
+    rest = [nd for nd in order if nd not in g.node_set()]
+
+    def rec(nodes):
+        return ge.sufficiency(tx, [native.Graph(nodes)])[0][key]
+
+    out = {"rest_recovered_log": rec(rest), "second": None}
+    if out["rest_recovered_log"] is not None and out["rest_recovered_log"] >= goal_eval.GOAL:
+        lo, hi = 0, len(rest)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if (rec(rest[:mid]) or 0.0) >= goal_eval.GOAL:
+                hi = mid
+            else:
+                lo = mid + 1
+        union = ge.sufficiency(tx, [native.Graph(C + rest[:lo])])[0]
+        out["second"] = {"size": lo, "union_necessity_log": necessity_log(union, convention)}
+    if C:
+        lower = 0
+        for s0 in range(0, len(C), 15):  # bounded memory: C itself and 15 variants per call, each against its own call's C
+            rows = ge.sufficiency(tx, [native.Graph(C)] + [native.Graph(C[:i] + C[i + 1:]) for i in range(s0, min(len(C), s0 + 15))])
+            if rows[0][key] is None:
+                return {**out, "minimal_share": None}
+            lower += sum(r[key] < rows[0][key] for r in rows[1:])
+        out["minimal_share"] = lower / len(C)
+    return out
+
+
+
+
 def samples_of(spec: Path) -> dict:
     """task -> [answer text, ...], first sample first, of an answer set: a sampler's JSONL ({"task", "sample", "text",
     "finish"}; a sample cut at the cap carries finish "length") or a directory of <task>.txt and <task>.<k>.txt. Each
@@ -915,7 +957,8 @@ def _paired(a: list, b: list) -> dict:
     return {"n": n, "mean": mean, "se": se, "wins": sum(x > 0 for x in d), "losses": sum(x < 0 for x in d)}
 
 
-def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, log=print) -> dict:
+def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
+             diagnostics: bool = False, log=print) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -923,7 +966,9 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
     paired comparisons with every other set (reward) and with the baselines (empty, and VPD's own answer at the first
     sample's node count; circuit_reward, as they give no English or answers) on the same questions. A set with no answer on a question scores it as invalid. e1: set -> task ->
     {"own": [bits per sample], "shuffled": bits, "reader_b": bits} (tinker_train.py readers): the reward's E1 uses
-    "own"; the controls are reported (no English is 0 bits by construction)."""
+    "own"; the controls are reported (no English is 0 bits by construction). labels: task -> locality() row: every
+    figure is also reported for local and non-local texts apart. diagnostics: structure() of each first sample (a
+    second disjoint circuit, minimality), costly."""
     import native
 
     invalid = -(1.0 + SIZE_WEIGHT)
@@ -940,16 +985,39 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                 per[name].append({"task": p.stem, "samples": [{"reward": invalid, "valid": False}]})
                 continue
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
-            scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits)
-            per[name].append({"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
-                                                         for r in scored]})
+            cache = {}
+            scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache)
+            entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
+                                                 for r in scored]}
+            if diagnostics and scored[0]["valid"]:
+                import goal_eval
+
+                prompt = task["prompts"][0]
+                g, _ = goal_eval.circuit(parse(got[0][0])["answer"], prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
+                entry["structure"] = structure(ge, cache[task["id"]], g, ge.nat._vpd_order(prompt["token_ids"], prompt["target_positions"]))
+            per[name].append(entry)
         sizes = [x["samples"][0].get("nodes") or 0 for x in (per[s][-1] for s in sets)]
         names = baseline_texts(ge, task, sizes)
         for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()))):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
         log(p.stem + ": " + ", ".join(f"{s} {per[s][-1]['samples'][0]['reward']:+.3f}" for s in sets), flush=True)
     report = {}
+    groups = {"all": None}
+    if labels:
+        groups |= {"local": True, "non-local": False}
+    for group, want in groups.items():
+        report[group] = _report(per, base, e1, labels, want)
+    return {"report": report, "per_question": per, "baselines": base}
+
+
+def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want) -> dict:
+    """evaluate()'s figures over the questions of one locality group (want None: every question)."""
+    keep = (lambda t: True) if want is None else (lambda t: t in labels and labels[t]["local"] == want)
+    per = {name: [q for q in qs if keep(q["task"])] for name, qs in per.items()}
+    report = {}
     for name, qs in per.items():
+        if not qs:
+            continue
         first = [q["samples"][0] for q in qs]
         terms = sorted({k for f in first for k in f if k.startswith("term_")})
         report[name] = {
@@ -975,7 +1043,16 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             report[name]["E1 controls"] = {k: sum(c[k] for c in ctl if c.get(k) is not None) / max(sum(c.get(k) is not None for c in ctl), 1)
                                            for k in ("shuffled", "reader_b")} | {"own (first sample)": sum(c["own"][0] for c in ctl) / max(len(ctl), 1),
                                                                                  "none": 0.0}
-    return {"report": report, "per_question": per, "baselines": base}
+        st = [q["structure"] for q in qs if q.get("structure")]
+        if st:
+            two = [x["second"] for x in st if x["second"]]
+            report[name]["structure"] = {
+                "circuits": len(st), "second disjoint circuit found": len(two) / len(st),
+                "second circuit size": sum(x["size"] for x in two) / len(two) if two else None,
+                "necessity_log of both": sum(x["union_necessity_log"] or 0.0 for x in two) / len(two) if two else None,
+                "minimal share": sum(x["minimal_share"] for x in st if x.get("minimal_share") is not None) / max(sum(x.get("minimal_share") is not None for x in st), 1)}
+    report["questions"] = len(next(iter(per.values()), []))
+    return report
 
 
 # ---- command line
@@ -1012,6 +1089,8 @@ def main():
     s.add_argument("--set", action="append", default=[], help="NAME=SAMPLES (a sampler's JSONL or a directory of <task>[.<k>].txt)")
     s.add_argument("--e1", action="append", default=[], help="NAME=E1.jsonl (tinker_train.py readers)")
     s.add_argument("--n", type=int, default=50)
+    s.add_argument("--labels", type=Path, help="locality JSONL: every figure also for local and non-local texts")
+    s.add_argument("--diagnostics", action="store_true", help="structure() of each first sample (slow)")
     s.add_argument("--out", type=Path)
     args = ap.parse_args()
     import goal_eval
@@ -1067,7 +1146,8 @@ def main():
     e1 = {}
     for k, v in (x.split("=", 1) for x in args.e1):
         e1[k] = {r["task"]: r for r in map(json.loads, Path(v).read_text().splitlines())}
-    out = evaluate(ge, args.split, rows, sets, args.n, e1)
+    labels = {r["task"]: r for r in map(json.loads, args.labels.read_text().splitlines())} if args.labels else None
+    out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

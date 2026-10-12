@@ -148,3 +148,18 @@ def test_teacher_search_on_native_units(tiny):
     assert abs(nu.kl(m)[0] - step["kl_c"]) < 1e-5
     rest = nu.full().without(step["units"])
     assert abs(nu.kl(rest)[0] - step["kl_minus"]) < 1e-5
+
+
+def test_teacher_steps_and_compare_table():
+    path = {"start_nodes": [["h.0.mlp.c_fc", 5, 3], ["h.1.mlp.down_proj", 7, 3], ["h.0.attn.q_proj", 1, 2]],
+            "start_index": [10, 20, 30],
+            "steps": [{"size": 3, "removed": []}, {"size": 2, "removed": [20]}, {"size": 1, "removed": [10]}]}
+    steps = native_units.teacher_steps(path)
+    assert [s["size"] for s in steps] == [3, 2, 1]
+    assert steps[1]["nodes"] == [("h.0.attn.q_proj", 2, 1), ("h.0.mlp.c_fc", 3, 5)] and steps[2]["nodes"] == [("h.0.attn.q_proj", 2, 1)]
+    assert native_units._nearest(steps, 2)["size"] == 2 and native_units._nearest(steps, 12) is None
+    rows = [{"task": "a", "local": True, "kind": "native", "size": 12, "nodes": 12, "f1": 0.5, "n_vpd": None, "n_real": 0.0},
+            {"task": "a", "local": True, "kind": "teacher", "size": 12, "nodes": 12, "f1": 0.9, "n_vpd": 0.5, "n_real": 0.1},
+            {"task": "b", "local": False, "kind": "teacher", "size": 12, "nodes": 13, "f1": 0.7, "n_vpd": 0.3, "n_real": 0.0}]
+    text = native_units.compare_table(rows)
+    assert "non-local" in text and " 0.800 " in text and " 0.500 " in text

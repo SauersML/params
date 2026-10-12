@@ -28,6 +28,8 @@ positions from its first removal on, reading the set's keys and values before it
   native_units.py table OUT.jsonl                                       the means by size
   native_units.py teach --split heldout --n 20 --out OUT.jsonl [--offset K --stride S]
       the teacher's own search (teacher.py's levels, prefix rounds, F1 >= 0.9 rule and joint path) on native units
+  native_units.py compare --native TEACH.jsonl --teacher TEACHER_DIR [--out ROWS.jsonl]
+      native vs the teacher vs VPD's order at sizes 12 to 1,024: F1, N_VPD, N_real, local and non-local
 """
 
 from __future__ import annotations
@@ -451,6 +453,93 @@ def teach_all(split: str, n: int, out: Path, offset: int = 0, stride: int = 1, l
             f"path to {row['path'][-1]['size']}, {row['measured_sets']} runs, {row['seconds']:.0f} s")
 
 
+# ---- the comparison table
+
+
+def _nearest(steps: list[dict], size: int) -> dict | None:
+    """The step whose size is nearest `size` (the smaller on a tie), None when every step is over twice or under half
+    of it."""
+    ok = [s for s in steps if size / 2 <= s["size"] <= 2 * size]
+    return min(ok, key=lambda s: (abs(s["size"] - size), s["size"])) if ok else None
+
+
+def teacher_steps(path: dict) -> list[dict]:
+    """A teacher path file (teacher.py's <task>.path.json) as steps with their node sets (matrix, position, index)."""
+    by = dict(zip(path["start_index"], [(n, int(t), int(c)) for n, c, t in path["start_nodes"]]))
+    on = set(by.values())
+    out = []
+    for s in path["steps"]:
+        on -= {by[i] for i in s["removed"]}
+        out.append({"size": len(on), "nodes": sorted(on)})
+    return out
+
+
+def compare(native_rows: Path, teacher_dir: Path, split: str, n: int, sizes=(12, 16, 32, 64, 256, 1024),
+            ge: goal_eval.GoalEval | None = None, log=print) -> list[dict]:
+    """Per text and size: the equal-effort native circuit (native_units teach), the teacher's circuit (teacher.py's
+    path) and VPD's first k (its order), at the step nearest each size; F1 and N_VPD (remainders off; goal_eval's
+    sufficiency) and N_real (removal from the real model: goal_eval's real_removal, native_units' N for native
+    units); locality from the teacher's summary (its F1 circuit reached from the targets alone)."""
+    ge = ge or goal_eval.GoalEval()
+    nat = ge.nat
+    nrows = {json.loads(x)["task"]: json.loads(x) for x in native_rows.read_text().splitlines() if x.strip()}
+    local = {}
+    for f in sorted(teacher_dir.glob("summary*.jsonl")):
+        for x in f.read_text().splitlines():
+            if x.strip():
+                r = json.loads(x)
+                local[r["task"]] = r.get("f1_from_targets", r.get("local"))
+    out = []
+    for p in native.tasks(split)[:n]:
+        tp = teacher_dir / f"{p.stem}.path.json"
+        if p.stem not in nrows and not tp.exists():
+            continue
+        ids, targets = native.text(p)
+        tx = ge.text(ids, targets, native.task_seed(p.stem), json.loads(p.read_text()))
+        order = nat._vpd_order(ids, targets)
+        tsteps = teacher_steps(json.loads(tp.read_text())) if tp.exists() else []
+        graphs, meta = [], []
+        for k in sizes:
+            if k <= len(order):
+                graphs.append(native.Graph(order[:k], complete=True))
+                meta.append(("VPD order", k))
+            t = _nearest(tsteps, k)
+            if t is not None:
+                graphs.append(native.Graph(t["nodes"], complete=True))
+                meta.append(("teacher", k))
+        scored = ge.sufficiency(tx, graphs) if graphs else []
+        real = ge.real_removal(tx, graphs) if graphs else []
+        for (kind, k), g, s, r in zip(meta, graphs, scored, real):
+            out.append({"task": p.stem, "local": local.get(p.stem), "kind": kind, "size": k, "nodes": g.count(),
+                        "f1": s["f1_off"], "n_vpd": s["n_off"], "n_real": r["n_real_off"]})
+        if p.stem in nrows:
+            for k in sizes:
+                t = _nearest(nrows[p.stem]["path"], k)
+                if t is not None:
+                    out.append({"task": p.stem, "local": local.get(p.stem), "kind": "native", "size": k, "nodes": t["size"],
+                                "f1": t["f1"], "n_vpd": None, "n_real": t["n"]})
+        log(f"{p.stem}: {sum(1 for r in out if r['task'] == p.stem)} circuits scored")
+    return out
+
+
+def compare_table(rows: list[dict]) -> str:
+    """Means by locality, size and kind: F1, N_VPD, N_real, the circuits' mean node count."""
+    lines = [["texts", "size", "kind", "n", "nodes", "F1", "N_VPD", "N_real"]]
+    for loc, label in ((True, "local"), (False, "non-local"), (None, "all")):
+        for k in sorted({r["size"] for r in rows}):
+            for kind in ("native", "teacher", "VPD order"):
+                rs = [r for r in rows if r["size"] == k and r["kind"] == kind and (loc is None or r["local"] is loc)]
+                if not rs:
+                    continue
+
+                def m(key, fmt="{:.3f}"):
+                    v = [r[key] for r in rs if r.get(key) is not None]
+                    return fmt.format(float(np.mean(v))) if v else "-"
+                lines.append([label, str(k), kind, str(len(rs)), m("nodes", "{:.0f}"), m("f1"), m("n_vpd"), m("n_real")])
+    w = [max(len(x[i]) for x in lines) for i in range(len(lines[0]))]
+    return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(x))) for x in lines)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -469,7 +558,19 @@ def main():
     e.add_argument("--offset", type=int, default=0)
     e.add_argument("--stride", type=int, default=1)
     e.add_argument("--out", type=Path, required=True)
+    q = sub.add_parser("compare", help="native (teach) vs the teacher vs VPD's order at matched sizes")
+    q.add_argument("--native", type=Path, required=True, help="teach's OUT.jsonl")
+    q.add_argument("--teacher", type=Path, required=True, help="teacher.py's --out directory")
+    q.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
+    q.add_argument("--n", type=int, default=20)
+    q.add_argument("--out", type=Path)
     args = ap.parse_args()
+    if args.cmd == "compare":
+        rows = compare(args.native, args.teacher, args.split, args.n)
+        if args.out:
+            args.out.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        print(compare_table(rows), flush=True)
+        return
     if args.cmd == "teach":
         teach_all(args.split, args.n, args.out, args.offset, args.stride)
         return

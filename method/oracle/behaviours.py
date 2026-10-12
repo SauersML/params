@@ -340,11 +340,9 @@ def _unit_effects(be: BehaviourEval, neurons: list[tuple[int, int]], n: int = SC
 
 
 def circuit_check(be: BehaviourEval, circuit: list[tuple[str, int]], before: np.ndarray, edit: list[dict]) -> dict:
-    """Remove, not hide (module docstring): the circuit's local ablation effects with the edit applied, against before."""
-    after = be.local_effects(circuit, edit)
-    pos = before.clip(min=0)
-    return {"circuit": [f"{s}#{i}" for s, i in circuit], "before": before.tolist(), "after": after.tolist(),
-            "retained": float(after.clip(min=0).sum() / pos.sum()) if pos.sum() > 0 else None}
+    """Remove, not hide (module docstring; edit_eval.removal_check)."""
+    effects = lambda nds, base: be.local_effects([(n, i) for n, _, i in nds], base)  # noqa: E731
+    return edit_eval.removal_check(effects, [(n, None, i) for n, i in circuit], before, edit)
 
 
 def teach(ee: edit_eval.EditEval, src: Source, b: dict, log=print) -> dict:

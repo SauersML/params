@@ -1009,6 +1009,35 @@ def screen_local(ee: EditEval, half: list[dict], ops_at, n: int, top: int, log=p
     return order.tolist()
 
 
+def copy_effects(ee: EditEval, half: list[dict], nodes: list[tuple], base: list[dict], n: int = 12) -> np.ndarray:
+    """Per node (matrix, None, index), the mean drop of the copied token's margin at the first n instances' targets when
+    the node's activation there is set to 0, with the persistent edit base applied (from base's own margin)."""
+    total = np.zeros(len(nodes))
+    for c in half[:n]:
+        t = c["t"]
+        eds = [list(base)] + [list(base) + [scale_op((nd[0], t, nd[2]), 0.0)] for nd in nodes]
+        ms = ee._runs([c["ids"]] * len(eds), eds, lambda lq, idx, s, lp: _margin(lq[:, t - s], c["wrong"]).tolist())
+        total += ms[0] - np.array(ms[1:])
+    return total / max(1, min(n, len(half)))
+
+
+def removal_check(effects, circuit: list[tuple], before: np.ndarray, edit: list[dict]) -> dict:
+    """Remove, not hide (behaviours.py): the circuit's measured local ablation effects with the edit applied against
+    before; retained = the share of their summed positive effect left (near 0: the circuit no longer pushes; near 1:
+    the edit blocks it with a counter-signal)."""
+    after = effects(circuit, edit)
+    pos = before.clip(min=0)
+    return {"circuit": [node_text_free(nd) for nd in circuit], "before": before.tolist(), "after": after.tolist(),
+            "retained": float(after.clip(min=0).sum() / pos.sum()) if pos.sum() > 0 else None}
+
+
+def node_text_free(nd) -> str:
+    layer, kind = native._name_layer_kind(nd[0])
+    import components
+
+    return f"L{layer}.{components.CODES[kind]}#{nd[2]}"
+
+
 def teach_copy(ee: EditEval, log=print, screen_n: int = 16) -> dict:
     """The persistent copy goal: the frontier search over subcomponents (persistent scales of the subcomponents most
     often active at the first half's targets, screened by measured local ablation, and persistent cuts among the top
@@ -1026,6 +1055,9 @@ def teach_copy(ee: EditEval, log=print, screen_n: int = 16) -> dict:
     log(f"copy: {len(nodes)} subcomponents active at >= 2 fit targets")
     order = screen_local(ee, fit, [lambda t, nd=nd: scale_op((nd[0], t, nd[2]), 0.0) for nd in nodes], screen_n, SCREEN, log)
     top = [nodes[i] for i in order]
+    effects = lambda nds, base: copy_effects(ee, fit, nds, base)  # noqa: E731
+    circuit = top[:16]
+    before = effects(circuit, [])
     pool = [scale_op(nd, k) for nd in top for k in NODE_SCALES]
     lead = top[:32]
     pool += [cut_op(r, w) for r in lead for w in lead if _connected(w, r, [0], True)]
@@ -1040,11 +1072,15 @@ def teach_copy(ee: EditEval, log=print, screen_n: int = 16) -> dict:
         rows = ee.score_many({"id": "copy"}, goal, [[_from_json(o) for o in st["edit"]] for st in res["path"]])
         out[name] = {"path": [{**st, "score": r} for st, r in zip(res["path"], rows)], "chosen": res["chosen"],
                      "evaluated": res["evaluated"]}
+        if res["chosen"] is not None:
+            edit = [_from_json(o) for o in res["path"][res["chosen"]]["edit"]]
+            out[name]["check"] = removal_check(effects, circuit, before, edit)
     sizes = sorted(set(SIZES))
     eds = [[scale_op(nd, 0.0) for nd in nodes[:k]] for k in sizes]
     out["vpd_topk"] = [{"k": k, "score": r} for k, r in zip(sizes, ee.score_many({"id": "copy"}, goal, eds))]
     heads = [unit_op("head", 2, h, None, 0.0) for h in (2, 3, 4)]
-    out["l2_heads_2_4"] = {"ops": [op_text(o) for o in heads], "score": ee.score_many({"id": "copy"}, goal, [heads])[0]}
+    out["l2_heads_2_4"] = {"ops": [op_text(o) for o in heads], "score": ee.score_many({"id": "copy"}, goal, [heads])[0],
+                           "check": removal_check(effects, circuit, before, heads)}
     out["seconds"] = time.perf_counter() - t0
     return out
 

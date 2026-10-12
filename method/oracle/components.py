@@ -1761,7 +1761,7 @@ def _paired(a: list, b: list) -> dict:
 
 
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
-             diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None) -> dict:
+             diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -1771,12 +1771,14 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
     {"own": [bits per sample], "shuffled": bits, "reader_b": bits} (tinker_train.py readers): the reward's E1 uses
     "own"; the controls are reported (no English is 0 bits by construction). labels: task -> locality() row: every
     figure is also reported for local and non-local texts apart. diagnostics: structure() of each first sample (a
-    second disjoint circuit, minimality), costly."""
+    second disjoint circuit, minimality), costly. matched_all: VPD's answer at every sample's node count, not only the
+    first's, so each sample is compared with VPD at its own size (verify-and-pick: whether any of N beats it on C).
+    The baselines' C and N are kept beside their circuit reward ("baseline_terms")."""
     import native
 
     invalid = -(1.0 + SIZE_WEIGHT)
     per = {s: [] for s in sets}
-    base = {}
+    base, base_terms = {}, {}
     for p in native.tasks(split)[:n]:
         if p.stem not in rows:
             continue
@@ -1800,21 +1802,22 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                 g, _ = goal_eval.circuit(parse(got[0][0])["answer"], prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
                 entry["structure"] = structure(ge, cache[task["id"]], g, ge.nat._vpd_order(prompt["token_ids"], prompt["target_positions"]))
             per[name].append(entry)
-        sizes = [x["samples"][0].get("nodes") or 0 for x in (per[s][-1] for s in sets)]
+        sizes = [y.get("nodes") or 0 for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1])]
         names = baseline_texts(ge, task, sizes)
         for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()), split="eval")):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
+            base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N")}
         log(p.stem + ": " + ", ".join(f"{s} {per[s][-1]['samples'][0]['reward']:+.3f}" for s in sets), flush=True)
     report = {}
     groups = {"all": None}
     if labels:
         groups |= {"local": True, "non-local": False}
     for group, want in groups.items():
-        report[group] = _report(per, base, e1, labels, want)
-    return {"report": report, "per_question": per, "baselines": base}
+        report[group] = _report(per, base, e1, labels, want, base_terms)
+    return {"report": report, "per_question": per, "baselines": base, "baseline_terms": base_terms}
 
 
-def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want) -> dict:
+def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, base_terms: dict | None = None) -> dict:
     """evaluate()'s figures over the questions of one locality group (want None: every question)."""
     keep = (lambda t: True) if want is None else (lambda t: t in labels and labels[t]["local"] == want)
     per = {name: [q for q in qs if keep(q["task"])] for name, qs in per.items()}
@@ -1845,6 +1848,10 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want) -
         matched = [(a, b) for a, b in matched if b is not None]
         if matched:
             report[name]["paired"]["vpd@matched (circuit reward)"] = _paired([a for a, _ in matched], [b for _, b in matched])
+        vs_vpd = lambda x, q: (x.get("term_C") or 0.0) > ((base_terms or {}).get(q["task"], {}).get(f"vpd@{x.get('nodes')}") or {}).get("C", float("inf"))  # noqa: E731
+        report[name]["C, best of N"] = sum(max((x.get("term_C") or 0.0) if x["valid"] else 0.0 for x in q["samples"]) for q in qs) / max(len(qs), 1)
+        report[name]["C beats VPD@matched: first sample"] = sum(q["samples"][0]["valid"] and vs_vpd(q["samples"][0], q) for q in qs) / max(len(qs), 1)
+        report[name]["C beats VPD@matched: any sample"] = sum(any(x["valid"] and vs_vpd(x, q) for x in q["samples"]) for q in qs) / max(len(qs), 1)
         if e1 and name in e1:
             ctl = [e1[name][q["task"]] for q in qs if q["task"] in e1[name]]
             report[name]["E1 controls"] = {k: sum(c[k] for c in ctl if c.get(k) is not None) / max(sum(c.get(k) is not None for c in ctl), 1)
@@ -1950,6 +1957,7 @@ def main():
     s.add_argument("--out", type=Path)
     s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (scored with net): the best net per goal (E3)")
     s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
+    s.add_argument("--matched-all", action="store_true", help="VPD at every sample's node count (verify-and-pick against VPD@matched)")
     args = ap.parse_args()
     import goal_eval
     import native
@@ -2153,7 +2161,8 @@ def main():
         import variables
 
         vs = variables.Scorer(ge)
-    out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs)
+    out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
+                   matched_all=args.matched_all)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

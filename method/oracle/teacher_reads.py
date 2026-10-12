@@ -10,8 +10,7 @@ KL_empty^0.1 KL_VPD^0.9), and every removal, of subcomponents or of reads, is ad
 term on the search split (goal_eval.changed_search: the circuit's move from x to x' against the model's) stays >=
 min(0.9, VPD's whole answer's): context the prediction moves with stays. --mode pp (the default): s_track_pp, the
 circuit path-patched (everything outside it at its value on x, a cut read's source value at x); --mode c: s_track in
-C's semantics (a cut read's connections at 0). The finish's connections take teacher.teach's acceptance in c mode only
-(none in pp mode until teacher.Acceptance takes a mode).
+C's semantics (a cut read's connections at 0); the finish's (teacher.Acceptance, teach's accept_mode) the same mode.
   1. Targets: from VPD's whole answer, the targets' subcomponents pruned by teacher.Descent's rounds (levels site,
      chunk16, chunk4, subcomponent), every other position whole.
   2. Positions from the last target down. At a position p, its reads: every value read into its kept attention-output
@@ -401,10 +400,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     start[order[:k]] = True
     hook, base = None, None
     if accept:
-        acceptance = teacher.Acceptance(ge, tx, accept)
-        if mode == "pp":                                     # its "changed" term path-patched (until teacher.Acceptance takes a mode)
-            acceptance.scores = lambda graphs, edges=None: [{"s_track": r["s_track_pp"]} for r in ge.changed_search(tx, graphs, DRAWS, mode="pp")]
-        hook, base = acceptance.hook(lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True), start)
+        acceptance = teacher.Acceptance(ge, tx, accept, mode)
+        hook, base = acceptance.hook(lambda on: native.Graph(masks=st.masks(on)), start)
     path = teacher.joint_path(pr, start, st.empty, st.vpd, hook, base)
     on = start.clone()
     for r in path:                                           # VPD's own order at every path size (teacher.teach's vpd_top)
@@ -415,9 +412,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     path_file = {"start_nodes": [[n, c, t] for n, t, c in (pr.nodes[i] for i in start.nonzero().flatten().tolist())],
                  "start_index": start.nonzero().flatten().tolist(), "steps": path,
                  "f1_index": found.nonzero().flatten().tolist(), "top_k": k}
-    # the connections' acceptance is teacher.teach's, in C's semantics only (until it takes a mode): none in pp mode
-    circuits, row, path_out = teacher.teach(ge, ids, targets, B, vpd_answer, vpd_order, from_path=path_file,
-                                            accept=accept if mode == "c" else (), **kw)
+    circuits, row, path_out = teacher.teach(ge, ids, targets, B, vpd_answer, vpd_order, from_path=path_file, accept=accept,
+                                            accept_mode=mode, **kw)
     row["reads"] = {key: v for key, v in record.items() if key != "stages"}
     row["reads"]["sizes"] = {"found": int(found.sum()), "start": int(start.sum()), "top_k": k}
     circuits["reads"] = record

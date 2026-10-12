@@ -826,37 +826,51 @@ class GoalEval:
     # ---- C: interventional fidelity
 
     def fidelity(self, tx: Text, graphs: list[native.Graph], pool: dict | None = None, draws: int = DRAWS,
-                 steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE) -> list[dict]:
+                 steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE, fresh: dict | None = None,
+                 interchange: int = 0, real: bool = False) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
         model under the intervention || X under it): "point" (no intervention: F1), "nodes" (draw j removes each
         circuit node with probability (j + 0.5) / draws), "edges" (draw j cuts each stated connection into one reader
-        drawn uniformly, the prediction among them, with that probability, at least one; on the model's and VPD's
-        side by path patching from their own run, on the circuit's by a zero edge strength), "adversary" (the paired
+        drawn uniformly, the prediction among them, with that probability, at least one, in the model, VPD's answer
+        and the circuit alike, graph_ref), "adversary" (the paired
         adversary over the pool, adversary(): f1_adv at the budget, beside the random members' mean) and its budget in
         parts switched on (adversary_flips, the omitted lever: f1_flips_omitted by m); c, the mean of s_point, s_nodes,
         s_edges and f1_flips_omitted at FLIP_TERM (the reward's adversarial member, the lead's decision 10-12; the
         step-budget f1_adv is a reported column); flips_to_break, the smallest m at which f1_flips_omitted falls below
-        half of s_point (None: not within FLIPS)."""
+        half of s_point (None: not within FLIPS). Evaluation only, never in the reward or a teacher's objective:
+        fresh, a pool none of the searches drew from: the pattern lever's flips over it (f1_flips_patterns_fresh);
+        interchange > 0: that many interchange draws (_interchange_family, s_interchange); real: N_real (real_removal,
+        n_real)."""
         e0 = self._bounds(tx, "live")[0]
         point = self.sufficiency(tx, graphs)
         nodes = self._node_family(tx, graphs, draws)
         edges = self._edge_family(tx, graphs, draws)
         adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool else [{} for _ in graphs]
         flips = self.adversary_flips(tx, graphs, pool, "omitted", steps=steps, restarts=restarts) if pool else [{} for _ in graphs]
+        none = [{} for _ in graphs]
+        fresh_rows = self.adversary_flips(tx, graphs, fresh, "patterns", steps=steps, restarts=restarts) if fresh else none
+        inter = self._interchange_family(tx, graphs, interchange) if interchange else none
+        reals = self.real_removal(tx, graphs) if real else none
         out = []
-        for g, pt, nd, ed, ad, fl in zip(graphs, point, nodes, edges, adv, flips):
-            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl}
+        for g, pt, nd, ed, ad, fl, fr, it, rr in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals):
+            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it}
             row["s_nodes"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
             row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
-            flips = row.get("f1_flips_omitted", {})
+            fc = row.get("f1_flips_omitted", {})
             terms = [row[k] for k in ("s_point", "s_nodes", "s_edges") if row.get(k) is not None]
-            terms += [flips[FLIP_TERM]] if flips.get(FLIP_TERM) is not None else []
+            terms += [fc[FLIP_TERM]] if fc.get(FLIP_TERM) is not None else []
             row["c"] = sum(terms) / len(terms) if terms else None
             half = 0.5 * row["s_point"] if row["s_point"] is not None else None
-            broke = [m for m in sorted(flips) if half is not None and flips[m] is not None and flips[m] < half]
+            broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
             row["flips_to_break"] = broke[0] if broke else None  # None: not within the budgets (more than max(FLIPS))
+            if fr:
+                row["f1_flips_patterns_fresh"] = fr["f1_flips_patterns"]
+            if it:
+                row["s_interchange"] = _fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
+            if rr:
+                row["n_real"] = rr["n_real_live"]
             out.append(row)
         return out
 
@@ -1578,26 +1592,32 @@ def pattern(pool: dict, k: int) -> dict:
     return {n: c[site == i] for i, n in enumerate(pool["names"]) if bool((site == i).any())}
 
 
-def fidelity_report(split: str, n: int, teacher: Path, pool: Path, out: Path, draws: int = DRAWS, vpd: Path | None = None,
-                    offset: int = 0, stride: int = 1, log=print) -> list[dict]:
-    """C on the split's first n texts for a teacher's circuits (teacher.py's <task>.json and <task>.f1.json: as stated,
-    or every connection the model has among their nodes when they state none) and VPD's first k at both sizes
-    (complete graphs), beside N_real; one row per circuit appended to OUT (texts already there are skipped). vpd:
-    VPD's answers and orders saved by teacher.py --save-vpd (where the causal-importance network is not)."""
+def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws: int = DRAWS, vpd: Path | None = None,
+                    offset: int = 0, stride: int = 1, fresh: Path | None = None, interchange: int = 16, curve=ADV_CURVE,
+                    log=print) -> list[dict]:
+    """C on the split's first n texts for answer sets (sets: name -> a directory of <task>.json circuits, run as stated)
+    and VPD's first k at each circuit's size (complete graphs), with the evaluation-only families (fresh: the pattern
+    lever over a pool no search drew from; interchange draws; N_real); one row per circuit appended to OUT (texts
+    already there are skipped). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
+    teacher.py --save-vpd (where the causal-importance network is not). Locality from a set's summary*.jsonl."""
     ge = GoalEval()
     nat = ge.nat
     M = torch.load(pool)
+    F = torch.load(fresh) if fresh else None
     saved = torch.load(vpd) if vpd else {}
     local = {}
-    for f in sorted(teacher.glob("summary*.jsonl")):
-        for x in f.read_text().splitlines():
-            if x.strip():
-                r = json.loads(x)
-                local[r["task"]] = r.get("local")
+    for d in sets.values():
+        for f in sorted(Path(d).glob("summary*.jsonl")):
+            for x in f.read_text().splitlines():
+                if x.strip():
+                    r = json.loads(x)
+                    if r.get("local") is not None:
+                        local[r["task"]] = r["local"]
     done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
     rows = []
     for p in native.tasks(split)[:n][offset::stride]:
-        if p.stem in done or not (teacher / f"{p.stem}.json").exists():
+        have = {name: Path(d) / f"{p.stem}.json" for name, d in sets.items() if (Path(d) / f"{p.stem}.json").exists()}
+        if p.stem in done or not have:
             continue
         t0 = time.perf_counter()
         task = json.loads(p.read_text())
@@ -1608,27 +1628,22 @@ def fidelity_report(split: str, n: int, teacher: Path, pool: Path, out: Path, dr
             for m, (t, c) in saved[p.stem]["answer"].items():
                 tx.vpd[m][t.long().to(nat.dev), c.long().to(nat.dev)] = True
         graphs, kinds = [], []
-        for name, f in (("teacher", f"{p.stem}.json"), ("teacher F1", f"{p.stem}.f1.json")):
-            path = teacher / f
-            if not path.exists():
-                continue
+        for name, path in have.items():
             g, _ = circuit(json.loads(path.read_text()), targets, nat.C, tx.T)
-            if not g.parents and not g.out:  # a circuit stating no connection: every one the model has among its nodes
-                g = native.Graph(g.nodes, *native.all_edges(g.nodes, targets))
-                name += ", every connection"
             graphs.append(g)
             kinds.append(name)
         order = saved[p.stem]["order"] if p.stem in saved else nat._vpd_order(ids, targets)
         for k in sorted({g.count() for g in graphs}):
             graphs.append(native.Graph(order[:k], complete=True))
             kinds.append(f"VPD top {k}")
-        fid = ge.fidelity(tx, graphs, M, draws=draws)
-        real = ge.real_removal(tx, graphs)
+        fid = ge.fidelity(tx, graphs, M, draws=draws, curve=curve, fresh=F, interchange=interchange, real=True)
         e, v = ge._bounds(tx, "live")
+        scale = ge.size_scale(tx)
         with open(out, "a") as fh:
-            for kind, g, f, r in zip(kinds, graphs, fid, real):
-                row = {"task": p.stem, "local": local.get(p.stem), "kind": kind, "size": g.count(), "kl_empty": e, "kl_vpd": v,
-                       "n_real": r["n_real_live"], **f}
+            for kind, g, f in zip(kinds, graphs, fid):
+                bits = size_bits(g, nat.positions(targets), sum(nat.C.values()), targets)
+                row = {"task": p.stem, "local": local.get(p.stem), "kind": kind, "nodes": g.count(),
+                       "edges": None if g.complete else g.edges(), "size": size_term(bits, scale), "kl_empty": e, "kl_vpd": v, **f}
                 rows.append(row)
                 fh.write(json.dumps(row) + "\n")
         if log:
@@ -1636,45 +1651,62 @@ def fidelity_report(split: str, n: int, teacher: Path, pool: Path, out: Path, dr
     return rows
 
 
+def _curve_value(d: dict, k):
+    """A curve dict's value at k (JSON keeps its keys as strings)."""
+    return d.get(str(k), d.get(k)) if d else None
+
+
 def fidelity_table(rows: list[dict]) -> str:
-    """Means by locality group and circuit kind (teacher, teacher F1, VPD top k at the teacher's sizes): size, point F1
-    and N, N_real, the node and connection families, f1_adv at each budget, the random members' mean, C. "trivial":
-    texts whose empty circuit is within 2x of VPD's own KL (the log scale's denominator below ln 2)."""
+    """Means by locality group and circuit kind (each answer set; VPD top k at their sizes): tests the searches never
+    optimized (flips-to-break, the omitted lever's flips, the node and connection families, interchange, the fresh
+    pool's pattern lever, N_real, C), the step adversary's curve, and in-sample (labelled) F1, N and size. "trivial":
+    texts whose empty circuit is within 2x of VPD's own KL."""
     def group(r):
         if r["kl_vpd"] is not None and r["kl_empty"] < 2 * r["kl_vpd"]:
             return "trivial"
         return "local" if r["local"] else "non-local"
 
     def kind(r):
-        k = r["kind"].split(",")[0]
-        return "VPD top k" if k.startswith("VPD top") else k
+        return "VPD top k" if r["kind"].startswith("VPD top") else r["kind"]
 
     by = {}
     for r in rows:
         by.setdefault((group(r), kind(r)), []).append(r)
-    steps = sorted({int(s) for r in rows for s in r.get("f1_adv_curve", {})})
+    kinds = sorted({kind(r) for r in rows}, key=lambda k: (k == "VPD top k", k))
     flips = sorted({int(m) for r in rows for m in r.get("f1_flips_omitted", {})})
-    head = (["texts", "kind", "n", "size", "F1", "N", "N_real", "nodes", "edges"] + [f"adv@{s}" for s in steps] + ["adv rand"]
-            + [f"flip{m}" for m in flips] + ["C", "C flips"])
-    lines = [head]
-    for g in ("local", "non-local", "trivial"):
-        for kd in ("teacher", "teacher F1", "VPD top k"):
-            rs = by.get((g, kd), [])
-            if not rs:
-                continue
+    fresh = sorted({int(m) for r in rows for m in r.get("f1_flips_patterns_fresh", {})})
+    steps = sorted({int(m) for r in rows for m in r.get("f1_adv_curve", {})})
 
-            def m(f):
-                v = [f(r) for r in rs]
-                v = [x for x in v if x is not None]
-                return f"{float(np.mean(v)):.3f}" if v else "-"
-            lines.append([g, kd, str(len(rs)), f"{np.mean([r['size'] for r in rs]):.0f}", m(lambda r: r["s_point"]),
-                          m(lambda r: r["n_point"]), m(lambda r: r["n_real"]), m(lambda r: r["s_nodes"]), m(lambda r: r["s_edges"])]
-                         + [m(lambda r, s=s: r.get("f1_adv_curve", {}).get(str(s), r.get("f1_adv_curve", {}).get(s))) for s in steps]
-                         + [m(lambda r: r.get("f1_adv_random"))]
-                         + [m(lambda r, f=f: r.get("f1_flips_omitted", {}).get(str(f), r.get("f1_flips_omitted", {}).get(f))) for f in flips]
-                         + [m(lambda r: r["c"]), m(lambda r: r.get("c_flips"))])
-    w = [max(len(x[i]) for x in lines) for i in range(len(head))]
-    return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(head))) for x in lines)
+    def block(title, cols):
+        head = ["texts", "kind", "n", "nodes"] + [c for c, _ in cols]
+        lines = [head]
+        for g in ("local", "non-local", "trivial"):
+            for kd in kinds:
+                rs = by.get((g, kd), [])
+                if not rs:
+                    continue
+                cells = [g, kd, str(len(rs)), f"{np.mean([r['nodes'] for r in rs]):.0f}"]
+                for _, f in cols:
+                    v = [f(r) for r in rs]
+                    v = [x for x in v if x is not None]
+                    cells.append(f"{float(np.mean(v)):.3f}" if v else "-")
+                lines.append(cells)
+        w = [max(len(x[i]) for x in lines) for i in range(len(head))]
+        return title + "\n" + "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(head))) for x in lines)
+
+    def breaks(r):  # flips-to-break, a circuit that holds to the largest budget counted at twice it
+        return math.log2(r["flips_to_break"]) if r.get("flips_to_break") else (math.log2(2 * max(flips)) if flips else None)
+
+    held = [("log2 flips-to-break", breaks)] + [(f"flip{m}", lambda r, m=m: _curve_value(r.get("f1_flips_omitted"), m)) for m in flips]
+    held += [("nodes fam", lambda r: r.get("s_nodes")), ("edges fam", lambda r: r.get("s_edges")),
+             ("interchange", lambda r: r.get("s_interchange"))]
+    held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
+    held += [("N_real", lambda r: r.get("n_real")), ("C", lambda r: r.get("c"))]
+    stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
+    sample = [("F1", lambda r: r["s_point"]), ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
+    return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),
+                          block("The step adversary (VPD's published budget, steps)", stepcols),
+                          block("In-sample (the searches optimized F1 and N on these texts)", sample)])
 
 
 def main():
@@ -1695,8 +1727,11 @@ def main():
     f = sub.add_parser("fidelity", help="C on a teacher's circuits and VPD's first k")
     f.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
     f.add_argument("--n", type=int, default=20)
-    f.add_argument("--teacher", type=Path, required=True, help="teacher.py's --out directory")
+    f.add_argument("--set", action="append", required=True, help="NAME=DIR: an answer set, DIR/<task>.json circuits")
     f.add_argument("--pool", type=Path, required=True, help="the adversary's pattern pool (goal_eval.py patterns)")
+    f.add_argument("--fresh", type=Path, help="a pattern pool no search drew from (evaluation only)")
+    f.add_argument("--interchange", type=int, default=16)
+    f.add_argument("--curve", default=",".join(str(x) for x in ADV_CURVE), help="the step adversary's budgets, e.g. 0,4,20,40,80,160,320")
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--draws", type=int, default=DRAWS)
     f.add_argument("--vpd", type=Path, help="VPD's answers and orders saved by teacher.py --save-vpd")
@@ -1708,7 +1743,8 @@ def main():
     q.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     if args.cmd == "fidelity":
-        fidelity_report(args.split, args.n, args.teacher, args.pool, args.out, args.draws, args.vpd, args.offset, args.stride)
+        fidelity_report(args.split, args.n, dict(x.split("=", 1) for x in args.set), args.pool, args.out, args.draws, args.vpd,
+                        args.offset, args.stride, args.fresh, args.interchange, tuple(int(x) for x in args.curve.split(",")))
         print(fidelity_table([json.loads(x) for x in args.out.read_text().splitlines() if x.strip()]), flush=True)
         return
     if args.cmd == "patterns":

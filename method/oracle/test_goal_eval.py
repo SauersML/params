@@ -635,9 +635,10 @@ def test_fidelity_vpds_answer_is_its_own_ceiling(tiny):
     nat, ge, tx = tiny
     g = native.Graph(masks=tx.vpd)
     pool = tiny_pool(nat, tx.ids)
-    row = ge.fidelity(tx, [g], pool, draws=4, steps=2, restarts=2, curve=(0, 2))[0]
-    for k in ("s_point", "s_nodes", "s_edges", "f1_adv", "f1_adv_random", "c"):
+    row = ge.fidelity(tx, [g], pool, draws=4, steps=2, restarts=2, curve=(0, 2), fresh=pool, interchange=2, real=True)[0]
+    for k in ("s_point", "s_nodes", "s_edges", "f1_adv", "f1_adv_random", "c", "s_interchange"):
         assert row[k] is not None and abs(row[k] - 1) < 1e-4, (k, row[k])
+    assert all(abs(v - 1) < 1e-4 for v in row["f1_flips_patterns_fresh"].values()) and row["n_real"] is not None
 
 
 def test_fidelity_cuts_and_removals(tiny):
@@ -785,14 +786,16 @@ def test_adversary_batch_is_per_circuit(tiny):
 
 
 def test_fidelity_table_groups():
-    rows = [{"task": "a", "local": True, "kind": "teacher, every connection", "size": 30, "kl_empty": 100.0, "kl_vpd": 0.1,
-             "n_real": 0.5, "s_point": 0.9, "n_point": 0.6, "s_nodes": 0.8, "s_edges": 0.7, "f1_adv_curve": {"0": 0.9, "20": 0.5},
-             "f1_adv_random": 0.85, "c": 0.7},
-            {"task": "b", "local": False, "kind": "VPD top 30", "size": 30, "kl_empty": 1.5, "kl_vpd": 1.0, "n_real": 0.2,
-             "s_point": 1.0, "n_point": 0.1, "s_nodes": 1.0, "s_edges": None, "f1_adv_curve": {"0": 1.0, "20": 1.0},
-             "f1_adv_random": 1.0, "c": 1.0}]
+    rows = [{"task": "a", "local": True, "kind": "greedy", "nodes": 30, "kl_empty": 100.0, "kl_vpd": 0.1, "n_real": 0.5,
+             "s_point": 0.9, "n_point": 0.6, "size": 0.4, "s_nodes": 0.8, "s_edges": 0.7, "s_interchange": 0.6,
+             "f1_adv_curve": {"0": 0.9, "20": 0.5}, "f1_flips_omitted": {"1": 0.8, "4": 0.5}, "flips_to_break": None,
+             "f1_flips_patterns_fresh": {"1": 0.3}, "c": 0.7},
+            {"task": "b", "local": False, "kind": "VPD top 30", "nodes": 30, "kl_empty": 1.5, "kl_vpd": 1.0, "n_real": 0.2,
+             "s_point": 1.0, "n_point": 0.1, "size": 0.4, "s_nodes": 1.0, "s_edges": None, "f1_adv_curve": {"0": 1.0, "20": 1.0},
+             "f1_flips_omitted": {"1": 0.4, "4": 0.3}, "flips_to_break": 1, "c": 1.0}]
     text = goal_eval.fidelity_table(rows)
     assert "trivial" in text and "local" in text and "adv@20" in text and " 0.500 " in text and "VPD top k" in text
+    assert "In-sample" in text and "flip4" in text and "fresh pat1" in text and " 3.000 " in text  # log2(2 x 4) for no break
 
 
 def test_pattern_pool_is_ci_per_position(tiny, tmp_path, monkeypatch):

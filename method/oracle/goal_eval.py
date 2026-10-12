@@ -440,7 +440,7 @@ def _transplant(base: torch.Tensor, moved: torch.Tensor, still: torch.Tensor) ->
 def _fid_raw(e0: float, kc: float, kv: float) -> float | None:
     """_fid without the floor at 0 (the reward's ranking, the lead's 10-12): below 0 when the circuit is farther than
     the bound; at most 1."""
-    if kv is None or kc is None or not kv < e0:
+    if kv is None or kc is None or not e0 > 0 or not kv < e0:
         return None
     return min(1.0, math.log(e0 / max(kc, 1e-12)) / math.log(e0 / max(kv, 1e-12)))
 
@@ -463,7 +463,7 @@ def _harmonic(terms: list) -> float | None:
 def _fid(e0: float, kc: float, kv: float) -> float | None:
     """C's log scale: clip(ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD), 0, 1); None when VPD's own answer is no
     nearer the model than the empty circuit under the interventions."""
-    if kv is None or kc is None or not kv < e0:
+    if kv is None or kc is None or not e0 > 0 or not kv < e0:  # (a bound of 0: nothing to recover)
         return None
     return _clip01(math.log(e0 / max(kc, 1e-12)) / math.log(e0 / max(kv, 1e-12)))
 

@@ -405,3 +405,14 @@ def test_pattern_lines_round_trip_the_pair_edges():
     assert components.render(p["answer"]) == text
     written = components.parse("CIRCUIT:\n@7 a=L3.o#1 b=L3.q#283\n@4 c=L3.k#145\nOUT <- a\na <- b\nPATTERN L3.q#283@7 ~ L3.k#145@4\nPATTERN rest ~ c\nPATTERN L3@7: b ~ zz\n")
     assert [e for e in written["answer"]["edges"] if e[0] == "pair"] == [["pair", 1, 2, 3, 7]] and written["malformed"] == 2
+
+
+def test_question_shows_the_measured_arm_when_present(tiny):
+    """measured()'s fields: activations beside each listed subcomponent (ranked by importance x |activation|) and each
+    attention head's top positions at the target; the plain question has neither."""
+    nat, ge, task, ev = tiny
+    plain = components.question(task, ev)
+    acts = {q: [1.5 - i for i in range(len(cs))] for q, cs in ev["components"].items()}
+    shown = components.question(task, {**ev, "acts": acts, "attention": {"0": [[[3, 0.5], [2, 0.25]]], "1": [[[7, 0.9]]]}})
+    assert "ranked by causal importance x |activation|" in shown and "L0: h0 3 0.50, 2 0.25" in shown and "L1: h0 7 0.90" in shown
+    assert "; +1.50" in shown and "attention at the target" not in plain and "ranked by" not in plain

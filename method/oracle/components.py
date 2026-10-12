@@ -123,6 +123,7 @@ CONVENTION = "live"  # goal_eval's remainders convention for the reward's F1 and
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
 WIRING_PER_POSITION = 6  # connectome pairs listed per position
 SWITCH_PER_POSITION = 8  # subcomponents a changed token switches on, listed per position
+ATTENTION_TOP = 3  # positions listed per attention head at the target (measured(): the --measured input arm)
 WINDOW = 8  # a question numbers the tokens within this many positions of every position its evidence names
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
 QA_PER_KIND = 2
@@ -821,6 +822,45 @@ def refresh_facts(atlas, lens, task: dict, ev: dict) -> dict:
                                  for q, cs in ev["components"].items()}}
 
 
+def measured(nat, task: dict, ev: dict, atlas=None, lens=None, k: int = EVIDENCE_PER_POSITION, top: int = ATTENTION_TOP) -> dict:
+    """The evidence with the --measured input arm's facts (the lead's oracle input v2, 10-12: what the oracle can
+    measure in a forward pass, so it need not memorize 38,912 subcomponents' roles): at each listed position and the
+    targets VPD's active subcomponents (causal importance above 0) ranked by causal importance x |activation| (VPD's
+    order ranks by importance alone), k of them (twice at the targets) with their facts() and activations ("acts"), and
+    each attention head's top positions at the last target, with their weights ("attention": layer -> per head
+    [[position, weight], ...]). The plain question is unchanged; question() shows these when present."""
+    import torch
+
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    ci, act = nat.importance(ids), nat.activations(ids)
+    tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
+    comps, acts = {}, {}
+    for q in ev["components"]:
+        p = int(q)
+        cand = [(n, p, c) for n in nat.names for c in torch.nonzero(ci[n][p] > 0).flatten().tolist()]
+        cand.sort(key=lambda nd: -float(ci[nd[0]][p, nd[2]] * act[nd[0]][p, nd[2]].abs()))
+        chosen = cand[:k * (2 if p in targets else 1)]
+        routed = dict(zip(chosen, lens.readout(ids, chosen))) if lens and chosen else {}
+        comps[q] = [[list(nd), float(ci[nd[0]][p, nd[2]]), facts(atlas, nd, routed.get(nd), tok) if atlas else ""] for nd in chosen]
+        acts[q] = [round(float(act[nd[0]][p, nd[2]]), 3) for nd in chosen]
+    tg, t = nat.target, max(targets)
+    sites = [tg.site(f"h.{i}.attn.{x}") for i in range(tg.n_layer) for x in ("q_proj", "k_proj")]
+    nat.vpd.clear()  # the plain model (clear() also resets the sites' caching)
+    for sx in sites:
+        sx.cache_output = True
+    with torch.no_grad():
+        tg(torch.tensor([ids], device=nat.dev))
+        att = {}
+        for i in range(tg.n_layer):
+            P = tg.attention_pattern(sites[2 * i].last_output, sites[2 * i + 1].last_output)[0, :, t]  # [heads, T]
+            w, at = P.topk(min(top, t + 1), -1)
+            att[str(i)] = [[[int(a), round(float(b), 3)] for a, b in zip(ai, wi)] for ai, wi in zip(at.tolist(), w.tolist())]
+    for sx in sites:
+        sx.cache_output, sx.last_output = False, None
+    return {**ev, "components": comps, "acts": acts, "attention": att}
+
+
 def _atlas():
     """The component atlas, or None while it is not built."""
     sys.path.insert(0, str(HERE.parents[1]))
@@ -975,13 +1015,21 @@ def question(task: dict, ev: dict) -> str:
              + ", ".join(f"{q} ({strings[q]!r})" for q in ev["positions"])]
     if ev["events"]:
         lines += ["measured at those positions (log2 change of the top token's probability):"] + units.evidence(ev["events"], ev["listed"], strings)
-    lines.append("VPD's active subcomponents (causal importance; the tokens its write raises at this position by the routed "
-                 "lens, a label-free linear reading of its write, not a measured effect; the tokens it is active on in Pile "
-                 "text), most important first, and the strongest weight-level connections among them (cosine; a static "
+    if ev.get("attention"):  # measured(): each head's most-read positions at the target
+        lines.append(f"attention at the target ({t}), the positions each head reads most (weight):")
+        lines += [f"L{layer}: " + "; ".join(f"h{h} " + ", ".join(f"{q} {w:.2f}" for q, w in row) for h, row in enumerate(rows))
+                  for layer, rows in sorted(ev["attention"].items(), key=lambda x: int(x[0]))]
+    acts = ev.get("acts") or {}
+    lines.append("VPD's active subcomponents (causal importance" + ("; activation" if acts else "") + "; the tokens its write "
+                 "raises at this position by the routed lens, a label-free linear reading of its write, not a measured effect; "
+                 "the tokens it is active on in Pile text), " + ("ranked by causal importance x |activation|" if acts else
+                 "most important first") + ", and the strongest weight-level connections among them (cosine; a static "
                  "coupling, not a measured effect):")
     for q in sorted(ev["components"], key=int):
         cs = ev["components"][q]
-        lines.append(f"{q} ({strings[int(q)]!r}): " + ", ".join(f"{node_text(tuple(nd))} ({c:.2f}{'; ' + f if f else ''})" for nd, c, f in cs))
+        a = acts.get(q) or [None] * len(cs)
+        lines.append(f"{q} ({strings[int(q)]!r}): " + ", ".join(
+            f"{node_text(tuple(nd))} ({c:.2f}{'' if x is None else f'; {x:+.2f}'}{'; ' + f if f else ''})" for (nd, c, f), x in zip(cs, a)))
         if ev.get("switch_on", {}).get(q):
             lines.append("  switched on when its token changes (of the 3 likeliest other tokens): "
                          + ", ".join(f"{node_text(tuple(nd))} ({k}/3)" for nd, k in ev["switch_on"][q]))
@@ -1900,6 +1948,8 @@ def main():
     rr.add_argument("--facts", action="store_true", help="read each listed subcomponent's facts again (refresh_facts: the routed lens "
                                                           "at its position, one forward pass per text)")
     rr.add_argument("--variables", action="store_true", help="ask for the EXPLANATION's VARIABLES block (ASK_VARIABLES)")
+    rr.add_argument("--measured", action="store_true", help="the measured input arm (measured(): subcomponents ranked by importance x "
+                                                             "|activation| with activations, attention heads' top positions)")
     rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
     rf.add_argument("rows", type=Path)
     rf.add_argument("teacher", type=Path, help="teacher.py's output directory (<task>.json, <task>.vpd_top<k>.edges.json)")
@@ -1974,11 +2024,17 @@ def main():
     import native
 
     if args.cmd == "rerender":
-        atlas, lens = (_atlas(), _lens(native.Native())) if args.facts else (None, None)
+        if args.facts or args.measured:
+            mnat = native.Native()
+            atlas, lens = _atlas(), _lens(mnat)
+        else:
+            atlas = lens = None
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
-                if args.facts:
+                if args.measured:
+                    r = measured(mnat, task, r, atlas, lens)
+                elif args.facts:
                     r = refresh_facts(atlas, lens, task, r)
                 if args.variables:
                     r = {**r, "variables": True}

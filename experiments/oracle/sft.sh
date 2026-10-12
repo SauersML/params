@@ -9,7 +9,8 @@
 #                                        samples and readers on HELDOUT's questions; EXTRA: more answer sets scored in the
 #                                        same evaluation, "NAME=SAMPLES[:E1] ...", e.g. an earlier SFT's samples, since C
 #                                        changes on main and only one evaluation compares; EDIT_EVAL: the edit teacher's
-#                                        rows for HELDOUT's edit requests, E3's best net)
+#                                        rows for HELDOUT's edit requests, E3's best net; MEASURED=1: the measured input
+#                                        arm, subcomponents ranked by importance x |activation|, attention heads' top positions)
 set -e
 RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
@@ -21,10 +22,11 @@ LABELS=${LABELS:-$O/heldout50_locality_frozen.jsonl}  # frozen once: never relab
 SRC=${SRC:-/Users/user/params}  # a source tree (a clean copy of main while others edit the shared tree)
 PY=/Users/user/mpd-data/venv/bin/python; TPY=/Users/user/mpd-data/tinker-venv/bin/python
 export HF_HUB_OFFLINE=1 PYTORCH_MPS_PREFER_METAL=1
-$PY $SRC/method/oracle/components.py rerender $ROWS $S/rows.jsonl  # questions in the current format
+RR=(rerender ${MEASURED:+--measured})  # MEASURED: the measured input arm (components.measured()) for training and held-out questions
+~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $ROWS $S/rows.jsonl  # questions in the current format
 MPD_MEM_GIB=8 $PY $SRC/method/oracle/components.py dataset $S/rows.jsonl $TEACHER $S/sft.jsonl \
   ${ENGLISH:+--english $ENGLISH} ${EDIT_TEACH:+--edit-teach $EDIT_TEACH}
-$PY $SRC/method/oracle/components.py rerender $HELDOUT $S/heldout.jsonl
+~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $HELDOUT $S/heldout.jsonl
 $PY - $SRC/method/oracle $S/heldout.jsonl $HELDOUT_TEACHER $S/teacher_txt ${EDIT_EVAL:-} <<'PYEOF'
 import json, sys
 from pathlib import Path

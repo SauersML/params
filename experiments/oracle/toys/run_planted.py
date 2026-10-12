@@ -104,6 +104,24 @@ def phi_without_n(r: dict):
     return goal_eval.phi({**r, "n_point": None})[0] if "error" not in r else None
 
 
+def reward_v3(ge, tx, name: str, i: int, node_sets: list, pool: dict) -> list[dict]:
+    """components.reward (v3, the reward RL uses) of complete node sets on one toy text, its circuit_reward = phi + g x
+    0.5 compact (no teacher reference, so D = 0; g the smooth gate 1 / (1 + 2^(-4 (phi - phi_tau)))), on the eval draws
+    with the toy's pattern pool. reward's answer cap (NODE_CAP, the explainer's token budget) is lifted: the toys' exact
+    pieces put whole-mechanism circuits above 266 nodes."""
+    import components
+
+    task = {"id": f"{name}_{i}", "model": "toy", "prompts": [{"token_ids": tx.ids, "target_positions": tx.targets, "model_top": [[["", 0.0]]]}]}
+    texts = [components.render(goal_eval.to_json(native.Graph(v, complete=True))) for v in node_sets]
+    cap = components.NODE_CAP
+    components.NODE_CAP = 10 ** 9
+    try:
+        got = components.reward(ge, task, {"qa": []}, texts, pool=pool, split="eval", cache={task["id"]: tx})
+    finally:
+        components.NODE_CAP = cap
+    return [{k: r.get(k) for k in ("circuit_reward", "phi", "phi_tau", "g", "compact", "bits", "bits_start", "valid")} for r in got]
+
+
 def run(name: str, path: Path, out: Path, n_texts: int, arms: list, decomp: str = "exact", log=print) -> None:
     """arms: the teacher arms to run (none: Φ and the v3 reward of the true and other circuits alone)."""
     d = torch.load(path)
@@ -151,17 +169,16 @@ def run(name: str, path: Path, out: Path, n_texts: int, arms: list, decomp: str 
                 rows = ge.fidelity(tx, graphs, pool, mode="full", split="eval")
             except Exception as e:  # noqa: BLE001
                 rows = [{"error": f"{type(e).__name__}: {e}"}] * len(graphs)
-            start_row = rows[-1]
-            tau = goal_eval.phi(start_row, start=start_row)[1] if "error" not in start_row else None
+            v3 = reward_v3(ge, tx, name, i, [v for k, v in cs.items() if k != "start"], pool)
             for (label, v), r, b in zip(cs.items(), rows, bits):
                 ph = goal_eval.phi(r)[0] if "error" not in r else None
-                comp = goal_eval.compact(b, bits[-1])
-                gate = ph is not None and tau is not None and ph >= tau
-                r = {**r, "bits": b, "compact": comp, "phi_tau": tau, "gate": gate,
-                     "reward_v3": None if ph is None else ph + (0.5 * comp if gate and comp is not None else 0.0)}
+                rv = v3[list(cs).index(label)] if label != "start" else {}
+                r = {**r, "bits": b, "compact": rv.get("compact"), "phi_tau": rv.get("phi_tau"), "gate": rv.get("g"),
+                     "reward_v3": rv.get("circuit_reward"), "phi_reward_mode": rv.get("phi")}
                 rec = {"toy": name, "text": i, "decomp": decomp, "circuit": label, "nodes": len(v), "phi": ph, "phi_without_n": phi_without_n(r),
                        **{k: r.get(k) for k in ("s_point_c", "n_point", "s_track_pp", "s_interchange_pp", "s_nodes", "s_edges",
-                                                "s_donor_near", "s_donor_far", "c", "error", "bits", "compact", "phi_tau", "gate", "reward_v3")},
+                                                "s_donor_near", "s_donor_far", "c", "error", "bits", "compact", "phi_tau", "gate", "reward_v3",
+                                                "phi_reward_mode")},
                        "f1_flips_c": (r.get("f1_flips_c") or {}), "flips_to_half": r.get("flips_to_half")}
                 fh.write(json.dumps(rec) + "\n")
                 fh.flush()

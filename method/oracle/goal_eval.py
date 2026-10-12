@@ -1550,13 +1550,16 @@ class GoalEval:
         return sorted(pairs, key=lambda pz: (first.get(pz[0], 0), hashlib.sha256(repr((seed, pz)).encode()).digest()))[:draws]
 
     @torch.no_grad()
-    def _changed_logq(self, tx: Text, graphs: list[native.Graph], got: list, strengths: torch.Tensor | None = None) -> tuple:
+    def _changed_logq(self, tx: Text, graphs: list[native.Graph], got: list, strengths: torch.Tensor | None = None,
+                      cuts: list | None = None) -> tuple:
         """Circuits' log q at the targets in C's semantics (_circuit_logq's: a stated graph as stated, a complete one as
         its subcomponents' masked run, the remainders live) on the text [G, targets, V] and on each changed text (p, z)
         of got (a list of [G, targets, V]): one engine on the text, and every changed text run from the earliest change
         in its batch on, reusing the text's run before it (engine.Engine.graph_log_probs reuse: the model is causal),
         CHANGED_ROWS rows a batch. strengths [G, E + O]: every circuit the one stated graph graphs[0] at its row's 0/1
-        connection strengths (changed_edges), from its one plan."""
+        connection strengths (changed_edges), from its one plan. cuts: per graph Engine.plan's cuts ({reader node or
+        None: [writer nodes]}, connections at strength 0; a complete graph's subcomponents read each other in full but
+        for them: teacher_reads' value-read cuts)."""
         nat, T = self.nat, tx.T
         E = self._circuit_engine(tx.ids, tx.targets, graphs[:1] if strengths is not None else graphs)
         if strengths is not None:
@@ -1577,7 +1580,7 @@ class GoalEval:
                 out += list(lq.split(G))
                 native.free(nat.dev)
             return q0, out
-        plan = E.plan(list(graphs), semantics="c")
+        plan = E.plan(list(graphs), semantics="c", cuts=cuts)
         u = None
         if any(g.complete for g in graphs):  # a complete graph runs as u: 1 on its subcomponents
             u = {n: torch.zeros(len(graphs), T, E.width(n), device=nat.dev) for n in nat.names}
@@ -1637,7 +1640,7 @@ class GoalEval:
 
     @torch.no_grad()
     def changed_inputs(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = 16,
-                       strengths: torch.Tensor | None = None) -> list[dict]:
+                       strengths: torch.Tensor | None = None, cuts: list | None = None) -> list[dict]:
         """The changed-input family (paired F2, the lead's decision 10-12): the circuit's identities on changed texts.
         Prompts: F2's positions (the sensitivity probe's, at least share_floor of its total), the most moved first, each
         with the split's source tokens (_interchange_draws: search ranks 0 and 2, eval rank 1 and samples), up to draws.
@@ -1664,7 +1667,7 @@ class GoalEval:
             if positions and tx.vpd is not None else []
         acc = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # sum of w s, of w, of w KL_C; prompts scored
         trk = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # the same for s_track
-        q0, lcs = self._changed_logq(tx, graphs, got, strengths) if got else (None, [])
+        q0, lcs = self._changed_logq(tx, graphs, got, strengths, cuts) if got else (None, [])
         v0, lvs = self._changed_vpd(tx, got) if got else (None, [])
         for (p, z), lc, lv in zip(got, lcs, lvs):
             x = list(tx.ids)
@@ -1686,11 +1689,12 @@ class GoalEval:
                  "kl_track_c": t[2] / t[1] if t[1] > 0 else None, "prompts_track": t[3], "context_share": sh,
                  "draws_changed": got} for a, t, sh in zip(acc, trk, share)]
 
-    def changed_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16) -> list[dict]:
+    def changed_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16, cuts: list | None = None) -> list[dict]:
         """The teachers' changed-input family: changed_inputs on the search split alone (never a reward, gate or
         table's) for a list of candidate circuits on one text, each changed text run once for all of them. A node set
-        without stated structure: native.Graph(nodes, complete=True)."""
-        return self.changed_inputs(tx, graphs, "search", draws)
+        without stated structure: native.Graph(nodes, complete=True); cuts, per graph its connections cut
+        (_changed_logq)."""
+        return self.changed_inputs(tx, graphs, "search", draws, cuts=cuts)
 
     @torch.no_grad()
     def donor_activations(self, ids: list[int], T: int) -> tuple[dict, int]:

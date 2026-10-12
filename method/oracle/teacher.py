@@ -102,11 +102,13 @@ import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 import carry
 import components
 import goal_eval
+import mech
 import native
 
 RECOVERED = 0.9
@@ -162,7 +164,8 @@ class Descent:
         most 4 ACCEPT_BATCH) are asked about alone, and those refused alone stay for the level (frozen): a block the KL
         ranks first can carry what accept measures (text9011: the target's L3 attention output, whose removal lowers
         KL, takes s_track from 0.90 to 0.61 alone), and every prefix holds it."""
-        frozen = torch.zeros_like(self.on)
+        fixed = getattr(self, "fixed", None)                 # units no removal may take (a kept block's subcomponents)
+        frozen = fixed.clone() if fixed is not None else torch.zeros_like(self.on)
         for r in range(rounds):
             blocks = [b for b in self.blocks(level) if not bool(frozen[b].any())]
             if len(blocks) <= 1:
@@ -213,13 +216,26 @@ class Descent:
             if current <= budget or float(single.min()) >= current:
                 return r
             kl = self.without([torch.cat(ranked[:k]) for k in sizes])
-            i = min(range(len(sizes)), key=lambda j: kl[j])
-            if kl[i] >= current:
+            lower = sorted((j for j in range(len(sizes)) if kl[j] < current), key=lambda j: kl[j])
+            i, info = (lower[0] if lower else None), {}
+            if accept is not None:                           # the lowest KL among the prefixes accept admits
+                i = None
+                for s0 in range(0, len(lower), ACCEPT_BATCH):
+                    part = lower[s0:s0 + ACCEPT_BATCH]
+                    ons = self.on[None].repeat(len(part), 1)
+                    for b, j in enumerate(part):
+                        ons[b, torch.cat(ranked[:sizes[j]])] = False
+                    got = accept(ons)
+                    hit = next((b for b, g in enumerate(got) if g is not None), None)
+                    if hit is not None:
+                        i, info = part[hit], got[hit]
+                        break
+            if i is None:
                 return r
             drop = torch.cat(ranked[:sizes[i]])
             self.on[drop] = False
             if log is not None:
-                log.append({"removed": drop.tolist(), "kl": kl[i]})
+                log.append({"removed": drop.tolist(), "kl": kl[i], **info})
         return rounds
 
 
@@ -352,6 +368,11 @@ class Pruner(Descent):
         if level == "position":
             keys = self.t[ids]
         elif level == "site":
+            keys = self.t[ids] * len(self.names) + self.mat[ids]
+        elif level == "inactive":                     # per site and position the subcomponents outside VPD's answer
+            vpd = self.tx.vpd
+            act = torch.tensor([bool(vpd[n][t, c]) for n, t, c in (self.nodes[j] for j in ids.tolist())], device=ids.device)
+            ids = ids[~act]
             keys = self.t[ids] * len(self.names) + self.mat[ids]
         elif level.startswith("chunk"):               # chunks of K subcomponents within a site, by index
             K = int(level[5:])
@@ -583,7 +604,8 @@ class Acceptance:
     candidate passes while each term stays >= min(0.9, the search's start's); a term that is None (uninformative on
     the text) passes. The splits' eval draws stay held out (gates, tables). mode, the changed family's: "pp" (the
     lead's decision 10-12), s_track_pp, the circuit path-patched (goal_eval.track_pp: everything outside it at its
-    value on the text, so cutting distant positions does not switch their parts off); "c", s_track in C's semantics."""
+    value on the text, so cutting distant positions does not switch their parts off), and interchange's
+    s_interchange_pp (interchange_pp); "c", s_track and s_interchange in C's semantics."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds, mode: str = "pp"):
         self.ge, self.tx, self.kinds, self.mode, self.calls = ge, tx, tuple(kinds), mode, 0
@@ -598,6 +620,9 @@ class Acceptance:
                 keys = (TRACK[self.mode],)
                 got = (self.ge.changed_edges(self.tx, *edges, "search") if self.mode == "c" and edges is not None
                        else self.ge.changed_search(self.tx, graphs, mode=self.mode))
+            elif k == "interchange":                         # the path-patched interchange in pp mode (C's term)
+                keys = ("s_interchange_pp" if self.mode == "pp" else "s_interchange",)
+                got = self.ge.interchange_search(self.tx, graphs, mode=self.mode)
             else:
                 got = getattr(self.ge, fn)(self.tx, graphs)
             for o, r in zip(out, got):
@@ -605,14 +630,16 @@ class Acceptance:
         self.calls += 1
         return out
 
-    def hook(self, graph_of, start: torch.Tensor, edges_of=None) -> tuple:
+    def hook(self, graph_of, start: torch.Tensor, edges_of=None, floor: dict | None = None) -> tuple:
         """(accept(ons) for Descent.prune and joint_path: per candidate unit set [K, units], its terms when each is at or
         above its floor, else None; the start's terms). graph_of(on): a unit set's circuit as goal_eval runs it;
-        edges_of(ons), for connection sets: (the node set's graph with every connection, ons) for scores' edges."""
+        edges_of(ons), for connection sets: (the node set's graph with every connection, ons) for scores' edges;
+        floor, the floors (default min(0.9, the start's terms))."""
         def run(ons):
             return self.scores([graph_of(on) for on in ons], None if edges_of is None else edges_of(ons))
         base = run(start[None])[0]
-        floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
+        if floor is None:
+            floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
 
         def accept(ons):
             return [r if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r) else None for r in run(ons)]
@@ -640,6 +667,118 @@ def both(*accepts):
             alive = [i for i in alive if out[i] is not None]
         return out
     return accept
+
+
+class Flags(Descent):
+    """The kept blocks of a block search as units (on [G]): removing one refines its block into its subcomponents
+    (under pp the site's remainder at the position then stays at its value on the text); C's KL, whose remainders are
+    live, is the same either way. rank(ons): the order a round tries them in (lower first)."""
+
+    def __init__(self, n: int, kl: float, rank, B: int, device):
+        self.on, self.kl0, self.rank, self.B, self.measured = torch.ones(n, dtype=torch.bool, device=device), kl, rank, B, 0
+
+    def kl_sets(self, ons: torch.Tensor) -> list[float]:
+        return [self.kl0] * len(ons)
+
+    def kl_rank(self, ons: torch.Tensor) -> list[float]:
+        return [x - 10.0 for x in self.rank(ons)]           # (an order only: below any budget, so prune ranks by it)
+
+    def kl(self) -> float:
+        return self.kl0
+
+    def blocks(self, level: str) -> list[torch.Tensor]:
+        return list(self.on.nonzero().flatten().split(1))
+
+
+BLOCK_LEVELS = ("inactive", "chunk64", "chunk16", "chunk4", "subcomponent")  # a refined block's subcomponents, coarse first
+
+
+def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
+                 acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = BLOCK_LEVELS) -> tuple:
+    """The influential-blocks search (the lead's 10-12): every site's whole output (a block, goal_eval.BLOCK) at the
+    targets and the m most influential positions (F2's probe, by the share each moved), m the smallest whose node set
+    keeps s_track_pp >= 0.9 on the search split (all of them when none does); then, every removal within the F1 budget
+    and admitted by acceptance (floors min(0.9, the start's), one set for every stage): whole blocks dropped (the
+    "site" level); each kept block refined into its subcomponents where acceptance admits it (Flags), the others kept
+    as blocks; the refined sites' subcomponents pruned (first those outside VPD's answer, per site and position, then
+    chunks of 64, 16, 4, then single). Node sets throughout (every
+    connection, token edge and pair: complete graphs). (The circuit, the Pruner over every subcomponent at those
+    positions with its final set, each unit's (site, position) group, the groups kept as blocks [S T], the record.)"""
+    nat, targets, S = ge.nat, tx.targets, len(ge.nat.names)
+    moved = np.asarray(tx.moved, dtype=float)
+    f2 = sorted((q for q, _ in tx.f2), key=lambda q: -moved[q - 1])
+    sets = [sorted(set(targets) | set(f2[:m])) for m in range(len(f2) + 1)]
+    got = ge.changed_search(tx, [native.Graph([(n, t, goal_eval.BLOCK) for t in ps for n in nat.names], complete=True)
+                                 for ps in sets], mode="pp")
+    tried = [r["s_track_pp"] for r in got]
+    m = next((m for m, x in enumerate(tried) if x is not None and x >= RECOVERED), len(f2))
+    P = sets[m]
+    start = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+    for n in nat.names:
+        start[n][P] = True
+    pr = Pruner(ge, tx, start, live=CONVENTION == "live", B=B)
+    group = pr.t * S + pr.mat                                # each unit's (site, position) group
+    flagged = torch.zeros(tx.T * S, dtype=torch.bool, device=nat.dev)
+    flagged[group] = True
+
+    def graph_of(on, fl=None):                               # a unit set as goal_eval's node set: kept blocks whole
+        fl = flagged if fl is None else fl
+        live_g = torch.zeros_like(fl)
+        live_g[group[on]] = True
+        blocks = [(pr.names[k % S], k // S, goal_eval.BLOCK) for k in (live_g & fl).nonzero().flatten().tolist()]
+        return native.Graph(blocks + [pr.nodes[j] for j in (on & ~fl[group]).nonzero().flatten().tolist()], complete=True)
+
+    rec = {"m": m, "positions": P, "tried": tried, "start_units": len(pr.nodes), "stages": []}
+
+    def stage(name, t0):
+        g = graph_of(pr.on)
+        kl = pr.kl()
+        nb = sum(nd[2] == goal_eval.BLOCK for nd in g.node_set())
+        row = {"stage": name, "blocks": nb, "subcomponents": g.count() - nb, "units": int(pr.on.sum()), "kl": kl,
+               "f1": goal_eval.recovered_log(empty, kl, vpd), "seconds": time.perf_counter() - t0}
+        rec["stages"].append(row)
+        log(f"  blocks {name}: {nb} blocks, {row['subcomponents']} subcomponents, KL {kl:.3g} (budget {budget:.3g}), "
+            f"{row['seconds']:.0f}s", flush=True)
+    t0 = time.perf_counter()
+    floor, hook = None, None
+    if acceptance is not None:
+        hook, base = acceptance.hook(graph_of, pr.on.clone())
+        floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
+        rec["accept_start"], rec["floor"] = base, floor
+    stage("start", t0)
+    t0 = time.perf_counter()
+    pr.prune("site", budget, accept=hook)                    # whole blocks
+    stage("site", t0)
+    t0 = time.perf_counter()
+    kept = (flagged & torch.isin(torch.arange(len(flagged), device=nat.dev), group[pr.on])).nonzero().flatten()
+
+    def flags_of(ons):                                       # Flags' on [K, G] as the groups' flags [K, S T]
+        fl = flagged[None].repeat(len(ons), 1)
+        fl[:, kept] = ons
+        return fl
+    if acceptance is not None:
+        def rank(ons):                                       # the smallest margin over the floors, largest first
+            got = acceptance.scores([graph_of(pr.on, f) for f in flags_of(ons)])
+            return [-min([r[k] - f for k, f in floor.items() if f is not None and r[k] is not None] or [0.0]) for r in got]
+        fl = Flags(len(kept), min(pr.kl(), budget), rank, ACCEPT_BATCH, nat.dev)   # (C's KL is not its business)
+        fhook, _ = acceptance.hook(lambda f: graph_of(pr.on, flags_of(f[None])[0]), fl.on.clone(), floor=floor)
+        fl.prune("block", budget, rounds=len(kept) + 1, accept=fhook)
+        flagged[kept[~fl.on]] = False
+    else:
+        flagged[kept] = False                                # nothing to keep a block for
+    stage("refine", t0)
+    pr.fixed = flagged[group]                                # a kept block's subcomponents stay whole
+    if acceptance is not None:
+        hook, _ = acceptance.hook(graph_of, pr.on.clone(), floor=floor)
+    for level in levels:
+        t0 = time.perf_counter()
+        pr.prune(level, budget, accept=hook)
+        stage(level, t0)
+    g = graph_of(pr.on)
+    if acceptance is not None:
+        rec["accept"] = acceptance.scores([g])[0]
+    rec["bits"] = goal_eval.size_bits(g, nat.positions(targets), sum(nat.C.values()), targets)
+    return g, pr, group, flagged, rec
 
 
 class Connector:
@@ -717,7 +856,8 @@ class Connector:
         for w, r in kept:
             if r is not None:
                 parents.setdefault(r, []).append(w)
-        return native.Graph([self.pr.nodes[j] for j in on.nonzero().flatten().tolist()], parents, [w for w, r in kept if r is None])
+        return with_tokens(native.Graph([self.pr.nodes[j] for j in on.nonzero().flatten().tolist()], parents,
+                                        [w for w, r in kept if r is None]), self.tx.targets)
 
     def score(self, on: torch.Tensor, kept: list, pool: dict) -> dict:
         """The reward's circuit score of a node set with its kept connections: C (goal_eval.GoalEval.fidelity, mode
@@ -757,11 +897,21 @@ class Connector:
         return steps, max(range(len(steps)), key=lambda i: (steps[i]["score"], -steps[i]["size"])), "score"
 
 
+def with_tokens(g: native.Graph, targets: list[int]) -> native.Graph:
+    """g with every token edge stated (s_track_pp's change enters a stated graph only through them, inframove's
+    23a291b): the embedding at each node's position into every residual reader there, and into the prediction at each
+    target (g.tok_edges, g.tok_out)."""
+    g.tok_edges = [(nd[1], nd) for nd in sorted(g.node_set()) if native._name_layer_kind(nd[0])[1] in mech.RESID_READERS]
+    g.tok_out = list(targets)
+    return g
+
+
 def with_pairs(g: native.Graph, pairs: dict) -> native.Graph:
     """A copy of a stated graph with stated query-key pairs (goal_eval's g.pairs {(layer, t): [(query | None, key |
-    None)]})."""
+    None)]}), its token edges kept."""
     h = native.Graph(list(g.nodes), {r: list(ws) for r, ws in g.parents.items()}, list(g.out))
     h.pairs = {read: list(ps) for read, ps in pairs.items()}
+    h.tok_edges, h.tok_out = list(getattr(g, "tok_edges", [])), list(getattr(g, "tok_out", []))
     return h
 
 
@@ -861,9 +1011,13 @@ def circuit_json(pr: Pruner, on: torch.Tensor, edges: list | None = None, pairs:
     pairs {(layer, t): [(query | None, key | None)]} as ["pair", query | "rest", key | "rest", layer, t] edges (a read
     with none, ["pair", "rest", "rest", layer, t]: goal_eval.to_json's)."""
     nodes = sorted(((t, n, c) for (n, t, c), keep in zip(pr.nodes, on.tolist()) if keep))
-    tok = sorted({t for t, _, _ in nodes})
+    tok = sorted({t for t, _, _ in nodes} | (set(pr.tx.targets) if edges is not None else set()))
     at = {(n, t, c): i for i, (t, n, c) in enumerate(nodes)}
     out = [[at[w], "out" if r is None else at[r]] for w, r in edges or []]
+    if edges is not None:                                    # every token edge (with_tokens): readers, the prediction
+        here = {t: len(nodes) + i for i, t in enumerate(tok)}
+        out += [[here[t], at[(n, t, c)]] for t, n, c in nodes if native._name_layer_kind(n)[1] in mech.RESID_READERS]
+        out += [[here[t], "out"] for t in pr.tx.targets]
     for (layer, t), ps in sorted((pairs or {}).items()):
         out += ([["pair", "rest" if a is None else at[a], "rest" if b is None else at[b], layer, t] for a, b in ps]
                 or [["pair", "rest", "rest", layer, t]])
@@ -933,6 +1087,32 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
            "kl_empty": empty, "kl_vpd": vpd, "budget_kl": budget, "active_scale": active, "levels": {}}
     acceptance = Acceptance(ge, tx, accept, accept_mode) if accept else None
     as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
+
+    if f1_start == "influential":                            # the influential-blocks search (block_search) and its wiring
+        g, pb, _, _, row["blocks"] = block_search(ge, tx, empty, vpd, budget, acceptance, B)
+        bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
+        inside = set(g.node_set())
+        minus = torch.tensor([not (nd in inside or (nd[0], nd[1]) in bl) for nd in pr.nodes], device=nat.dev)
+        kl_c, kl_minus = pb.kl(), pr.kl_sets(minus[None])[0]  # N: VPD's answer without the circuit's subcomponents
+        f1_b, n_b, _ = scores(empty, vpd, kl_c, kl_minus)
+        row["blocks"].update(kl_c=kl_c, kl_minus=kl_minus, f1=f1_b, n=n_b)
+        circuits = {"": goal_eval.to_json(g, "")}
+        if edges and not bl:                                 # a circuit of subcomponents alone: its connections stated
+
+            def size_term_b(on, inner=0, out=0):
+                n, k_tok = int(on.sum()), int(torch.unique(pb.t[on]).numel())
+                bits = n * node_bits + k_tok * math.log2(nat.positions(targets)) + (math.log2(n + k_tok) * (2 * inner + out) if n else 0.0)
+                return goal_eval.size_term(bits, scale)
+            wiring = Connector(ge, tx, pb, empty, vpd, size_term_b, B, robust=robust_pool, no_strand=no_strand, levels=edge_levels,
+                               acceptance=acceptance)
+            kept, row["best_edges"], _, _, on_w = wiring.connect(pb.on.clone(), n_b if n_b is not None else 0.0)
+            circuits[""] = circuit_json(pb, on_w, kept)
+        elif edges:                                          # (a block's connections: not yet; the node set as found)
+            row["edges_skipped"] = "blocks"
+        row["seconds"] = time.perf_counter() - t0
+        print(f"  {tx.T} tokens: {len(bl)} blocks, {g.count() - len(bl)} subcomponents, F1 {f1_b}, N {n_b}, "
+              f"{row['blocks'].get('accept')}, {row['blocks']['bits']:.0f} bits", flush=True)
+        return circuits, row, {"blocks": row["blocks"]}
 
     def search(levels, label):
         hook = None
@@ -1124,9 +1304,11 @@ def main():
     ap.add_argument("--save-vpd", type=Path, help="save VPD's answers and orders on the texts to this file and stop")
     ap.add_argument("--labels", type=Path, help="locality JSONL (task, local)")
     ap.add_argument("--start-top", type=int, default=0, help="F1 search from VPD's top K at subcomponent level (0: from VPD's whole answer)")
-    ap.add_argument("--f1-start", choices=("targets", "whole", "both"), default="both",
+    ap.add_argument("--f1-start", choices=("targets", "whole", "both", "influential"), default="both",
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
-                         "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
+                         "(targets); from its whole answer only (whole); the union of both searches' circuits (both); "
+                         "influential: block_search, every site's block at the targets and the most influential positions, "
+                         "refined under the acceptance terms")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
     ap.add_argument("--accept-mode", choices=tuple(TRACK), default="pp", help="--accept changed's term: pp (s_track_pp, "
                     "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")

@@ -404,6 +404,9 @@ def test_pairs_stated_within_budget():
         back, bad = goal_eval.circuit(teacher.circuit_json(pr, on_p, kept, stated.pairs), tx.targets, nat.C, tx.T)
         assert bad == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 0}
         assert {read: set(ps) for read, ps in getattr(back, "pairs", {}).items()} == {read: set(ps) for read, ps in stated.pairs.items()}
+        # and every token edge (with_tokens: s_track_pp's change enters a stated graph only through them)
+        want = teacher.with_tokens(stated, tx.targets)
+        assert set(back.tok_edges) == set(want.tok_edges) and back.tok_out == sorted(tx.targets)
         if needs:
             g0 = goal_eval.strand(teacher_g, tx.targets, nat.C)
             gains = sorted(((r["curve"][i] - r["curve"][i + 1], stated.pairs[(r["layer"], r["t"])][i])
@@ -450,3 +453,27 @@ def test_whole_answer_search_joins_only_below_the_floor():
     below = any(w[k] is not None and t[k] is not None and t[k] < min(teacher.RECOVERED, w[k]) for k in w)
     assert row["f1_whole_search"] == below
     assert ("f1_sizes" in row) == below and ("position" in row["levels"]) == below
+
+
+def test_block_search_keeps_its_floor():
+    if not VPD_SAVED.exists():
+        pytest.skip("needs VPD's answers " + str(VPD_SAVED))
+    nat, pr = pruner(teacher.CONVENTION == "live", "text9019")
+    ge, tx = pr.ge, pr.tx
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    budget = empty ** (1 - teacher.RECOVERED) * vpd ** teacher.RECOVERED
+    acc = teacher.Acceptance(ge, tx, ("changed",), "pp")
+    g, pb, group, flagged, rec = teacher.block_search(ge, tx, empty, vpd, budget, acc, levels=("inactive",))
+    S = len(nat.names)
+    # the influential positions: the smallest m whose blocks reach s_track_pp 0.9, or every F2 position
+    assert rec["m"] == next((m for m, x in enumerate(rec["tried"]) if x is not None and x >= teacher.RECOVERED), len(rec["tried"]) - 1)
+    # every stage kept the floors set at the start
+    assert all(rec["accept"][k] is None or f is None or rec["accept"][k] >= f - 1e-6 for k, f in rec["floor"].items())
+    # a block node exactly where a kept group still holds subcomponents; refined groups as their subcomponents
+    blocks = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
+    live = {int(k) for k in group[pb.on].tolist()}
+    assert blocks == {(pb.names[k % S], k // S) for k in live if bool(flagged[k])}
+    assert all(nd[2] == goal_eval.BLOCK or (nd[0], nd[1]) not in blocks for nd in g.node_set())
+    # written as a node set, goal_eval reads the same circuit back
+    back, bad = goal_eval.circuit(goal_eval.to_json(g, ""), tx.targets, nat.C, tx.T)
+    assert back.complete and set(back.node_set()) == set(g.node_set()) and bad["invalid_nodes"] == 0

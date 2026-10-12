@@ -1502,6 +1502,10 @@ def main():
     ed.add_argument("rows", type=Path)
     ed.add_argument("out", type=Path)
     ed.add_argument("--qa-seed", type=int, default=0, help="added to each text's seed (0 the discovery draw, 1 a fresh one)")
+    ed.add_argument("--goals", type=Path, action="append", default=[],
+                    help="JSONL rows with task and goal (edit_eval.py goals or teach output): these goals, not drawn again. A "
+                         "detach goal's position is drawn from goal_eval's F2 positions, which move with goal_eval's version "
+                         "and device, so a drawn goal can miss the edit teacher's")
     rq = sub.add_parser("requestion", help="the same rows with a fresh set of intervention questions (only they are measured)")
     rq.add_argument("rows", type=Path)
     rq.add_argument("out", type=Path)
@@ -1667,11 +1671,18 @@ def main():
     if args.cmd == "edits":
         import edit_eval
 
-        ee = edit_eval.EditEval(nat)
+        given = {}
+        for p in args.goals:
+            for g in map(json.loads, p.read_text().splitlines()):
+                if g["goal"] not in given.setdefault(g["task"], []):
+                    given[g["task"]].append(g["goal"])
+        ee = None if args.goals else edit_eval.EditEval(nat)
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
-                r["edits"] = edit_eval.goals(ee, task, native.task_seed(task["id"]) + args.qa_seed)
+                if args.goals and r["task"] not in given:
+                    continue  # no goals for this text: no row (its answers could not be scored on edits)
+                r["edits"] = given[r["task"]] if args.goals else edit_eval.goals(ee, task, native.task_seed(task["id"]) + args.qa_seed)
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
                 f.flush()
                 print(r["task"], [g["kind"] for g in r["edits"]], flush=True)

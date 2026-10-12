@@ -55,8 +55,9 @@ Per text:
   budget, the largest first (ACCEPT_BATCH a call), the largest admitted taken.
   6. With --repair (and --edges), the flip repair after the pick: goal_eval.adversary_flips' omitted lever at REPAIR_M
      (the VPD actives the circuit leaves out, at most 4 switched on, the shared adversary's) on the stated graph; its
-     flips join the circuit and the connections are pruned again, while min(graph F1, node F1, F1 under the flips)
-     improves; the teacher circuit is then pick()'s among those steps on that minimum and N. Node F1 (the node set
+     flips join the circuit and the connections are pruned again, while (min(graph F1, node F1, F1 under the flips) +
+     N) / 2 - 0.5 size improves (the reward's circuit score with that minimum for C); the teacher circuit is the
+     smallest step with the minimum and N >= 0.9, else the one with the largest value. Node F1 (the node set
      with every connection among its nodes) is in it because a flip joined with its connections pruned is cut from
      the circuit's readers, which it writes into in the model: on graph F1 and the flips alone, text9000's 29
      subcomponents were "repaired" to 49 with node F1 0.665.
@@ -527,12 +528,15 @@ class Connector:
     def repair(self, on: torch.Tensor, kept: list, summary: dict, pool: dict, max_nodes: int | None = None,
                m: int = REPAIR_M) -> tuple[list, int, str]:
         """The flip repair: goal_eval.adversary_flips' omitted lever at m on the stated graph; its flips join the node
-        set and the connections are pruned again (from the kept ones and every connection of the flips), while F1
-        under the flips improves (and the set stays within max_nodes). (every step with its "on" and "kept", pick()'s
-        index among them on min(graph F1, node F1, F1 under the flips) and N, its rule.) Node F1, the node set's with
-        every connection the model has among its nodes (teacher.measure, the masked run), keeps the repair honest: a
-        flip joined with its connections pruned is cut from the circuit's readers, which in the model it writes into
-        (text9000: 29 subcomponents repaired to 49 at graph F1 0.897 and F1 under the flips 0.897 had node F1 0.665)."""
+        set and the connections are pruned again (from the kept ones and every connection of the flips), while a
+        step's value, (min(graph F1, node F1, F1 under the flips) + N) / 2 - SIZE_WEIGHT size (the reward's circuit
+        score with that minimum for C), improves (and the set stays within max_nodes). (every step with its "on" and
+        "kept"; the index of the smallest with that minimum and N >= 0.9, "goal", else of the largest value,
+        "max-value"; the rule.) Node F1, the node set's with every connection the model has among its nodes
+        (teacher.measure, the masked run), keeps the repair honest: a flip joined with its connections pruned is cut
+        from the circuit's readers, which in the model it writes into (text9000: 29 subcomponents repaired to 49 at graph
+        F1 0.897 and F1 under the flips 0.897 had node F1 0.665). The value keeps it small: on the minimum alone, text9011
+        grew from 45 subcomponents to 201 while node F1 crept from 0.863 to 0.899, its connections staying 12."""
         steps = []
         f1_nodes = measure(self.pr, on[None], self.empty, self.vpd)[0]["f1"]
         while True:
@@ -541,19 +545,25 @@ class Connector:
             f1a = summary["f1_graph"] if f1a is None else f1a      # nothing omitted to switch on: no attack
             add = sorted({self.index[nd] for nd in flips["mask_flips_omitted"].get(m, []) if nd in self.index})
             rob = min(summary["f1_graph"], f1_nodes, f1a)
+            inner = sum(r is not None for _, r in kept)
+            st = self.size_term(on, inner, len(kept) - inner)
+            value = (rob + summary["n"]) / 2 - SIZE_WEIGHT * st
             steps.append({"size": int(on.sum()), "edges": len(kept), "f1_graph": summary["f1_graph"], "f1_nodes": f1_nodes,
-                          "n": summary["n"], "f1_flips": f1a, "f1_rob": rob, "flips": add, "on": on, "kept": kept})
+                          "n": summary["n"], "f1_flips": f1a, "f1_rob": rob, "size_term": st, "value": value, "flips": add,
+                          "on": on, "kept": kept})
             print(f"  repair: {int(on.sum())} subcomponents, {len(kept)} connections, graph F1 {summary['f1_graph']:.3f}, "
-                  f"node F1 {f1_nodes:.3f}, N {summary['n']:.3f}, F1 under {m} flips {f1a:.3f}", flush=True)
-            if (len(steps) > 1 and rob <= steps[-2]["f1_rob"]) or not add or (max_nodes and int(on.sum()) + len(add) > max_nodes):
+                  f"node F1 {f1_nodes:.3f}, N {summary['n']:.3f}, F1 under {m} flips {f1a:.3f}, value {value:.3f}", flush=True)
+            if (len(steps) > 1 and value <= steps[-2]["value"]) or not add or (max_nodes and int(on.sum()) + len(add) > max_nodes):
                 break
             on = on.clone()
             on[torch.tensor(add, dtype=torch.long, device=on.device)] = True
             got = measure(self.pr, on[None], self.empty, self.vpd)[0]
             f1_nodes = got["f1"]
             kept, summary, _, _ = self.connect(on, got["n"], set(kept), add)
-        j, rule = pick(steps, "f1_rob")
-        return steps, j, rule
+        ok = [i for i, s_ in enumerate(steps) if s_["f1_rob"] >= RECOVERED and s_["n"] >= RECOVERED]
+        if ok:
+            return steps, min(ok, key=lambda i: steps[i]["size"]), "goal"
+        return steps, max(range(len(steps)), key=lambda i: (steps[i]["value"], -steps[i]["size"])), "max-value"
 
 
 def circuit_json(pr: Pruner, on: torch.Tensor, edges: list | None = None) -> dict:

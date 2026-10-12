@@ -72,6 +72,18 @@ def test_short_ids():
     assert len(undefined["answer"]["edges"]) == 2  # the defined edges stay
 
 
+def test_edits():
+    text = ("CIRCUIT:\n@9 a=L1.down#5 b=L1.fc#1\nOUT <- a\na <- b\nEDIT 1: cut a <- b; scale b 0\n"
+            "EDIT 2: persistent scale L1.v#7 0; persistent cut L1.o#3 <- L1.v#7\nEDIT 3: cut out <- a; scale zz 2\n")
+    p = components.parse(text)
+    assert p["malformed"] == 0 and len(p["answer"]["edges"]) == 2  # edit lines are not circuit lines
+    assert [o["op"] for o in p["edits"][1]] == ["cut", "scale"] and p["edits"][1][1]["k"] == 0.0
+    assert all(o["persistent"] and (o.get("node") or o["writer"])[1] is None for o in p["edits"][2])
+    assert p["edits"][3][0]["reader"] == "out" and p["edits"][3][1]["op"] == "invalid"  # an undefined id names nothing
+    again = components.parse(components.render(p["answer"], edits={k: v for k, v in p["edits"].items() if k < 3}))
+    assert again["edits"] == {k: v for k, v in p["edits"].items() if k < 3}
+
+
 def test_escape_keeps_special_strings_text():
     tk = pytest.importorskip("transformers").AutoTokenizer
     try:

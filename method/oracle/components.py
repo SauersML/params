@@ -15,6 +15,7 @@ plain text (nothing in it is executed):
   e <- f,h
   ANSWER 1: the change at 322 removes the copied digit ...
   FINAL 1: falls=yes top=' 7'
+  EDIT 1: cut b <- c; scale e 0
 
 A subcomponent is L<layer>.<kind>#<index> (kind q, k, v, o, fc, down) at a position; the token embedding at a position
 is tok, an input node. Every node is named once by a short id in its position's block ("@322 c=L2.v#902 h=tok"), and
@@ -25,7 +26,9 @@ output (down), the token embedding into a reader at its position; "OUT" is the p
 goal_eval's circuit JSON, and goal_eval.circuit checks every edge against the model (mech.connects); an id never
 declared is a node outside the graph, dropped and charged. parse() also reads nodes written out in edge lines
 (L2.o#77@332 <- L2.v#902,1514@322, a group stating an edge from every writer to every reader) and blocks without ids;
-render() writes ids only. Token strings are shown as Python reprs of the target's tokens (special tokens included)
+render() writes ids only. An edit request ("how would you make the model ...") is answered by an EDIT line of
+operations: cut <reader> <- <writer> (that connection removed on this text), scale <node> <k> (its activation times k),
+either prefixed by persistent for a weight edit on every text (nodes then without a position). Token strings are shown as Python reprs of the target's tokens (special tokens included)
 and escaped (escape()): no question or answer holds a literal special or added token of the explainer's tokenizer.
 
 The question (question()) holds the text's tokens, the model's top next tokens, the positions whose changed token
@@ -90,7 +93,9 @@ REFS_RE = re.compile(rf"\s*{_W}(?:\s*,\s*{_W})*\s*")  # writers by group or by i
 MARKDOWN = re.compile(r"\*\*|^[ \t]*(?:#+|[-*])[ \t]+", re.M)
 ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response)>)")  # Qwen's added tokens: <|...|>, <think>, <tool_call>, ...
 FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s*(.+?)\s*$", re.M | re.I)
-SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+)\s*:", re.M | re.I)
+SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+|EDIT\s+\d+)\s*:", re.M | re.I)
+EDIT_RE = re.compile(r"^\s*EDIT\s+(\d+)\s*:(.*)$", re.M | re.I)
+OP_RE = re.compile(r"\s*(persistent\s+)?(?:cut\s+(\S+)\s*<-\s*(\S+)|scale\s+(\S+)\s+(-?\d+(?:\.\d+)?))\s*", re.I)
 
 SIZE_WEIGHT = 0.5
 CONVENTION = "live"  # goal_eval's remainders convention for the reward's F1 and N: on, computing on the run's inputs
@@ -165,7 +170,10 @@ def parse(text: str) -> dict:
     """An answer's parts: "explanation", "answer" (goal_eval's circuit JSON: nodes [matrix, index, position], edges
     [upstream, downstream | "out"]), "malformed" (circuit lines that do not parse), "circuit" (whether a CIRCUIT
     section exists), "malformed_nodes" (what those lines name, at least one each, and every undefined id, each charged as
-    a node outside the graph), "unknown_ids" and "finals" (question number -> (falls, the top token as written)). A circuit line's reader may be
+    a node outside the graph), "unknown_ids", "finals" (question number -> (falls, the top token as written)) and
+    "edits" (edit question number -> operations: {"op": "cut", "writer", "reader" ("out": the prediction)} or {"op":
+    "scale", "node", "k"}, each with "persistent" (a weight edit everywhere: nodes without a position, None), or
+    {"op": "invalid"} for one that names no node). A circuit line's reader may be
     a group, and so may each writer: the line states an edge from every writer to every reader. Markdown decoration
     (bold markers, heading marks at a line's start) is ignored: no valid line holds it."""
     text = MARKDOWN.sub("", text)
@@ -233,13 +241,41 @@ def parse(text: str) -> dict:
         for w in ws:
             i = index(w)
             edges += [[i, "out" if r == "out" else at[r]] for r in rs]
+    def node_ref(x, persistent):  # an id, a node written out, or (persistent) a subcomponent without a position
+        if x in ids:
+            return ids[x]
+        if x.lower() == "out":
+            return "out"
+        g = group_of(x) if "@" in x else (group_of(f"{x}@0") if persistent else None)
+        return None if not g or len(g) != 1 else ((g[0][0], None, g[0][2]) if persistent and "@" not in x else g[0])
+
+    edits = {}
+    for m in EDIT_RE.finditer(text):
+        ops = []
+        for part in m[2].split(";"):
+            if not part.strip():
+                continue
+            o = OP_RE.fullmatch(part)
+            if not o:
+                ops.append({"op": "invalid", "text": part.strip()})
+                continue
+            persistent = bool(o[1])
+            if o[2]:
+                r, w = node_ref(o[2], persistent), node_ref(o[3], persistent)
+                ops.append({"op": "cut", "reader": r, "writer": w, "persistent": persistent} if r and w and w != "out"
+                           else {"op": "invalid", "text": part.strip()})
+            else:
+                x = node_ref(o[4], persistent)
+                ops.append({"op": "scale", "node": x, "k": float(o[5]), "persistent": persistent} if x and x != "out"
+                           else {"op": "invalid", "text": part.strip()})
+        edits.setdefault(int(m[1]), ops)
     finals = {}
     for m in FINAL_RE.finditer(text):
         finals.setdefault(int(m[1]), (m[2].lower() == "yes", m[3].strip()))
     explanation = sec.get("EXPLANATION", "")
     return {"explanation": explanation, "answer": {"nodes": nodes, "edges": edges, "explanation": explanation},
             "malformed": malformed, "malformed_nodes": junk + unknown, "unknown_ids": unknown, "circuit": "CIRCUIT" in sec,
-            "finals": finals}
+            "finals": finals, "edits": edits}
 
 
 def _place(nd) -> tuple:
@@ -250,7 +286,7 @@ def _place(nd) -> tuple:
     return (-nd[1], -int(nd[0].split(".")[1]), list(KINDS.values()).index(nd[0].split(".")[-1])) + tuple(nd[2:3])
 
 
-def render(answer: dict, finals: dict | None = None, reasons: dict | None = None) -> str:
+def render(answer: dict, finals: dict | None = None, reasons: dict | None = None, edits: dict | None = None) -> str:
     """The text of a circuit in goal_eval's JSON (to_json's): every node named once by a short id in its position's
     block and the edges by id (_id_lines), one output grammar for every answer. finals: question number -> (falls,
     the top token as written)."""
@@ -263,12 +299,30 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
             out.append(nodes[w])
         else:
             parents.setdefault(nodes[r], set()).add(nodes[w])
-    lines = _id_lines(set(nodes), parents, out)
+    lines, name = _id_lines(set(nodes), parents, out)
     text = [f"EXPLANATION: {answer.get('explanation', '')}".rstrip(), "CIRCUIT:"] + lines
     for k in sorted(finals or {}):
         falls, top = finals[k]
         text += [f"ANSWER {k}: {(reasons or {}).get(k, '')}".rstrip(), f"FINAL {k}: falls={'yes' if falls else 'no'} top={top}"]
+    for k in sorted(edits or {}):
+        text.append(f"EDIT {k}: " + "; ".join(edit_op_text(o, name) for o in edits[k]))
     return escape("\n".join(text))
+
+
+def edit_op_text(o: dict, name: dict) -> str:
+    """An edit operation (parse()'s form) in the answer grammar: nodes by the circuit's ids where it has them, else
+    written out (without a position when persistent)."""
+    def ref(nd):
+        if nd == "out":
+            return "out"
+        if nd in name:
+            return name[nd]
+        text = node_text((nd[0], nd[1] if nd[1] is not None else 0, nd[2]))
+        return text.rsplit("@", 1)[0] if nd[1] is None else text
+    head = "persistent " if o.get("persistent") else ""
+    if o["op"] == "cut":
+        return f"{head}cut {ref(tuple(o['reader']) if o['reader'] != 'out' else 'out')} <- {ref(tuple(o['writer']))}"
+    return f"{head}scale {ref(tuple(o['node']))} {o['k']:g}"
 
 
 def _short_ids(n: int) -> list[str]:
@@ -310,7 +364,7 @@ def _id_lines(nodes: set, parents: dict, out: list) -> list[str]:
         queue += ws
     for r in sorted(set(parents) - seen, key=_place):
         lines.append(f"{name[r]} <- " + ",".join(name[w] for w in sorted(parents[r], key=_place)))
-    return lines
+    return lines, name
 
 
 def token_strings(model: str, ids: list[int]) -> list[str]:
@@ -493,7 +547,10 @@ ASK = ("How does {model} compute its prediction of the next token after the targ
        "still predict what it does, and with them taken out of VPD's active subcomponents it should not; fewer "
        "subcomponents and edges are better. Answer with a line EXPLANATION: (in plain English, what the model does), "
        "then CIRCUIT: and its lines, then for each question ANSWER <n>: (your reasoning in plain English) and "
-       "FINAL <n>: falls=yes or no top=<the token, quoted as the tokens are>.")
+       "FINAL <n>: falls=yes or no top=<the token, quoted as the tokens are>, and for each edit request EDIT <n>: the "
+       "operations, separated by \";\": cut <reader> <- <writer> (that one connection removed on this text; out is the "
+       "prediction), scale <node> <k> (its activation multiplied by k), either prefixed by persistent for an edit of the "
+       "weights on every text (nodes then written without a position).")
 
 
 def wiring(conn, nodes: list, targets: list[int], k: int) -> list[tuple]:
@@ -682,7 +739,22 @@ def question(task: dict, ev: dict) -> str:
     if ev["qa"]:
         tok = lambda ids: token_strings(model, ids)  # noqa: E731
         lines += [qa_text(q, n, strings, repr(top_tok), tok) for n, q in enumerate(ev["qa"], 1)]
+    lines += [f"Edit {n}: {edit_goal_text(g, strings, repr(top_tok))}" for n, g in enumerate(ev.get("edits") or [], 1)]
     return escape("\n".join(lines))
+
+
+def edit_goal_text(g: dict, strings: list[str], top: str) -> str:
+    """An edit goal (the goal generator's JSON) as the question states it: its own sentence when it has one."""
+    if g.get("question"):
+        return g["question"]
+    if g["kind"] == "flip":
+        return f"make {top} no longer the most likely next token."
+    if g["kind"] == "raise":
+        return f"make {g['token']!r} the most likely next token."
+    if g["kind"] == "detach":
+        p = g["position"]
+        return f"make the prediction not depend on the token at {p} ({strings[p]!r}): changing it should no longer move the prediction."
+    return f"make the model stop {g.get('behaviour', g['kind'])} (persistent: on every text, not only this one)."
 
 
 def _connectome():
@@ -760,7 +832,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
            size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
     row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT section, a
-    question has no FINAL line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
+    question has no FINAL line, an edit request no EDIT line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
     are dropped and their description bits charged in size (dropped_bits), and so is a circuit line that does not
     parse (each subcomponent it names, at least one, priced as a node outside the graph). A valid
     answer earns the mean of its terms less size_weight x size ("circuit_reward": the same over the circuit's own terms
@@ -789,7 +861,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         graphs.append(g)
         junk = p["malformed_nodes"] * math.log2(nat.positions(targets) * total)  # a line that does not parse: written, explains nothing
         defects.append((d["invalid_nodes"] + p["unknown_ids"], d["invalid_edges"], dropped_bits(p["answer"], g, d, nat.positions(targets), total) + junk))
-        valid.append(p["circuit"] and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1)) and not (truncated and truncated[i]))
+        valid.append(p["circuit"] and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1))
+                     and all(n in p["edits"] for n in range(1, len(ev.get("edits") or []) + 1)) and not (truncated and truncated[i]))
     keep = [i for i, v in enumerate(valid) if v]  # an invalid answer's reward is fixed whatever it measures: not run
     if keep:
         tx = cache.get(task["id"]) if cache is not None else None

@@ -36,7 +36,9 @@ Score (EditEval.score_many), in bits, on data the teacher's search never used:
   success     progress over the best progress known for the goal (best=, the teacher's); progress itself without one
   goal_bits   the goal reached in bits, at most the goal: flip, raise: progress x the log2 margin to cross; detach:
               D0 - max(D, (1 - GOAL) D0), the dependence removed in KL bits; behaviour: the instances' mean flip goal_bits
-  net         goal_bits - collateral; net_best the best net known for the goal (best_net=, bests()), None without one
+  net         goal_bits - collateral; net_best the best net known for the goal (best_net=, bests()), None without one;
+              for the persistent copy goal, per position of text (COPY_RATE x goal_bits - KL per position; net_per_text
+              the per-text form), as behaviours.py's persistent goals
   collateral  the KL of the edited model from the model on what the goal does not ask to change, summed per text: the
               text's other positions and, at the target, the distribution over the tokens the goal does not name
               (renormalized; detach and behaviour name none but the copied token); persistent edits add the mean summed
@@ -102,6 +104,7 @@ FORM_BITS = 2  # an operation's form: cut or scale, local or persistent
 CHUNK = 16  # edited runs of 512 positions per batch (more when they compute fewer positions)
 MAX_ROWS = 1024  # edited runs per batch at most
 BLOCK = 256  # edits scored at once
+COPY_RATE = 192 / (200 * 512)  # the copy mistakes per position of the rows they were found in (9400-9599)
 COPY_FIT = 48  # the copy search's fit instances (the first of the copy set's first half; the rest validate)
 POSITIONS = 1024  # positions per block of vocabulary-sized arrays
 MAX_OPS = 16  # the search's largest edit
@@ -705,11 +708,12 @@ class EditEval:
             m0, ms = float(_margin(lp[t], w)), _margin(lq[:, t], w).tolist()
             rest = self._kept_kl(lp[t], lq[:, t], [w])
             kept = (kl.sum(1) - kl[:, t] + rest).tolist()
+            per = ((kl.sum(1) - kl[:, t] + rest) / (t + 1)).tolist()
             drop = (lq[:, t, w] - lp[t, w]).tolist()
             top = (lq[:, t].argmax(-1) == c["actual"]).tolist()
             return [{"progress": min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, "goal_bits": max(0.0, min(m0, m0 - m)),
-                     "flipped": m < 0, "halved": d <= -LN2, "rest": r, "actual_top": a, "kept": k}
-                    for m, d, r, a, k in zip(ms, drop, rest.tolist(), top, kept)]
+                     "flipped": m < 0, "halved": d <= -LN2, "rest": r, "actual_top": a, "kept": k, "per": q}
+                    for m, d, r, a, k, q in zip(ms, drop, rest.tolist(), top, kept, per)]
         per = self._runs(seqs, es, fn, ref=True)
         held = self._held_terms("search" if search else "held", eds)
         key = self.key("copy", goal)
@@ -724,6 +728,10 @@ class EditEval:
                             "actual_top": sum(r["actual_top"] for r in rs) / n, "rest": sum(r["rest"] for r in rs) / n,
                             "collateral_held": held[j], "collateral_instances": kept})
             self._finish(rows[b], key, sum(r["goal_bits"] for r in rs) / n, held[j] + kept)
+            gt = COPY_RATE * rows[b]["goal_bits"]  # per position of text, as for behaviours.py's persistent goals
+            ct = sum(r["per"] for r in rs) / n + held[j] / HELD_LEN
+            rows[b].update({"net_per_text": rows[b]["net"], "rate": COPY_RATE, "goal_bits_per_token": gt,
+                            "collateral_per_token": ct, "net": gt - ct})
         return rows
 
 

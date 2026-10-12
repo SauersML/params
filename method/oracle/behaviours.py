@@ -19,7 +19,10 @@ Score of a persistent edit (score_many), in bits, on one third's rows (each cut 
   collateral  KL summed over each row's positions that are not instances (its controls among them), the mean over the
               rows, plus the held Pile texts' mean summed KL (edit_eval.HELD_ROWS; the search uses SEARCH_ROWS)
   controls    kept: the share of controls whose most likely token is still in S_c; control_kl: their mean KL
-  net         goal_bits - collateral
+  net         bits per position of text, as a persistent edit acts on all text: rate x goal_bits (rate: instances per
+              position of the third, measured while finding them) - collateral_per_token (each row's KL per position
+              that is not an instance, averaged over the rows, plus the held texts' KL per position); net_per_text is
+              goal_bits - collateral
 Search (teach()): edit_eval.frontier over persistent edits of the subcomponents most often active at the fit instances
 (screened by measured ablation at fit instances) and cuts among the top ones, the same over native units, each step
 proposed by the fit third and chosen by the validation third, the path's step with the best validation net taken; the
@@ -33,6 +36,7 @@ retained is the share of their summed effect left. An edit that removes the beha
   behaviours.py sample OUT.jsonl [--k 16] [--seed 0]     sampled behaviours, their instances and controls (a GPU or the CPU)
   behaviours.py teach BEHAVIOURS.jsonl OUT.jsonl [--offset K --stride S] [--n N]   edits and checks per behaviour
   behaviours.py table OUT.jsonl                           the report
+  behaviours.py rescore OUT.jsonl NEW.jsonl               taught behaviours scored again (current definitions)
 """
 
 from __future__ import annotations
@@ -169,8 +173,9 @@ def build(ee: edit_eval.EditEval, src: Source, flat: int, decode, log=print) -> 
     for part, (r0, r1) in THIRDS.items():
         rows = sorted({r for r, _ in act if r0 <= r < r1})
         rng.shuffle(rows)
-        inst, ctrl = [], []
+        inst, ctrl, scanned = [], [], 0
         for row in rows[:4 * CAP[part]]:
+            scanned += 1
             ids = src.tokens[row, :512].astype(np.int64).tolist()
             lp = ee.reference(ids)
             top_in = S[lp.argmax(-1)].cpu().numpy()
@@ -185,7 +190,8 @@ def build(ee: edit_eval.EditEval, src: Source, flat: int, decode, log=print) -> 
             if len(inst) >= CAP[part]:
                 break
         rng.shuffle(ctrl)
-        out["parts"][part] = {"instances": inst[:CAP[part]], "controls": ctrl[:CAP[part]]}
+        rate = len(inst) / max(1, scanned) * len(rows) / (r1 - r0) / T1  # instances per position of the third's text
+        out["parts"][part] = {"instances": inst[:CAP[part]], "controls": ctrl[:CAP[part]], "rate": rate}
     if not out["parts"]["fit"]["instances"] or not out["parts"]["score"]["instances"]:
         return None
     log(f"{site}#{index}: S {len(S_list)} tokens; instances " + ", ".join(f"{k} {len(v['instances'])}" for k, v in out["parts"].items())
@@ -270,9 +276,10 @@ class BehaviourEval:
             kept = S[lq[:, ctrl].argmax(-1)].float().sum(1) if ctrl else torch.zeros(len(idx), device=lq.device)
             ckl = kl[:, ctrl].sum(1) if ctrl else torch.zeros(len(idx), device=lq.device)
             coll = kl.sum(1) - kl[:, inst].sum(1)
-            return [{"goal": g, "progress": p, "flipped": f, "n": len(inst), "kept": k, "ckl": c, "nc": len(ctrl), "coll": x}
-                    for g, p, f, k, c, x in zip(gb.sum(1).tolist(), prog.sum(1).tolist(), (m < 0).float().sum(1).tolist(),
-                                                kept.tolist(), ckl.tolist(), coll.tolist())]
+            per = coll / max(1, kl.shape[1] - len(inst))
+            return [{"goal": g, "progress": p, "flipped": f, "n": len(inst), "kept": k, "ckl": c, "nc": len(ctrl), "coll": x, "per": y}
+                    for g, p, f, k, c, x, y in zip(gb.sum(1).tolist(), prog.sum(1).tolist(), (m < 0).float().sum(1).tolist(),
+                                                   kept.tolist(), ckl.tolist(), coll.tolist(), per.tolist())]
         per = ee._runs(seqs, es, fn, ref=True)
         held = ee._held_terms("held" if part == "score" else "search", eds)
         key = edit_eval.EditEval.key(f"behaviour:{part}", {"kind": "behaviour", "name": "/".join(map(str, self.b["subcomponent"]))})
@@ -287,6 +294,12 @@ class BehaviourEval:
                             "control_kl": sum(r["ckl"] for r in rs) / nc if nc else None,
                             "collateral_text": coll, "collateral_held": held[j]})
             ee._finish(rows[b], key, sum(r["goal"] for r in rs) / n, coll + held[j])
+            rate = self.b["parts"][part].get("rate")
+            if rate is not None:  # a persistent edit's net per position of text: the behaviour's bits where it occurs
+                gt = rate * rows[b]["goal_bits"]  # against the KL at every other position
+                ct = sum(r["per"] for r in rs) / k + held[j] / edit_eval.HELD_LEN
+                rows[b].update({"net_per_text": rows[b]["net"], "rate": rate, "goal_bits_per_token": gt,
+                                "collateral_per_token": ct, "net": gt - ct})
         return rows
 
     def local_effects(self, nodes: list[tuple[str, int]], base: list[dict], part: str = "fit", n: int = SCREEN_N) -> np.ndarray:
@@ -364,7 +377,7 @@ def teach(ee: edit_eval.EditEval, src: Source, b: dict, log=print) -> dict:
             out[name] = None
             continue
         edit = [edit_eval._from_json(o) for o in res["path"][res["chosen"]]["edit"]]
-        out[name] = {"path": [{k: st[k] for k in ("ops", "row", "validation")} for st in res["path"]], "chosen": res["chosen"],
+        out[name] = {"path": [{k: st[k] for k in ("ops", "edit", "row", "validation")} for st in res["path"]], "chosen": res["chosen"],
                      "ops": res["path"][res["chosen"]]["ops"], "edit": res["path"][res["chosen"]]["edit"],
                      "score": be.score_many([edit])[0], "check": circuit_check(be, circuit, before, edit)}
     site, index = b["subcomponent"]
@@ -377,6 +390,44 @@ def teach(ee: edit_eval.EditEval, src: Source, b: dict, log=print) -> dict:
         [[edit_eval.scale_op((s, None, i), 0.0) for s, i in by_count[:k]] for k in (1, 4, 16)]))]
     out["seconds"] = time.perf_counter() - t0
     return out
+
+
+def ops_of(texts: list[str]) -> list[dict]:
+    """Operations from their text (edit_eval.op_text: the answer grammar, or native units)."""
+    import re
+
+    import components
+
+    out = []
+    for t in texts:
+        m = re.fullmatch(r"(persistent )?scale (head|neuron) L(\d+)\.[hn](\d+)(?:@(\d+))? (-?[\d.]+)", t.strip())
+        if m:
+            out.append(edit_eval.unit_op(m[2], int(m[3]), int(m[4]), None if m[5] is None else int(m[5]), float(m[6])))
+        else:
+            out += components.parse(f"EDIT 1: {t}")["edits"][1]
+    return out
+
+
+def rescore(ee: edit_eval.EditEval, src: Source, r: dict, log=print) -> dict:
+    """A taught behaviour scored again by the current definitions: the behaviour rebuilt (the same instances: its draws
+    are seeded by the subcomponent), each search path's steps measured on the validation third, the step with the
+    most validation net chosen and scored on the score third with its check, the baselines scored again."""
+    flat = src.flat(*r["behaviour"]["subcomponent"])
+    b = build(ee, src, flat, _decoder(), log)
+    be = BehaviourEval(ee, src, b)
+    for name in ("teacher", "units"):
+        m = r.get(name)
+        if not m:
+            continue
+        steps = [st.get("edit") and [edit_eval._from_json(o) for o in st["edit"]] or ops_of(st["ops"]) for st in m["path"]]
+        vrows = be.score_many(steps, "val")
+        k = int(np.argmax([v["net"] if v.get("valid") else -np.inf for v in vrows]))
+        m.update({"chosen": k, "ops": m["path"][k]["ops"], "edit": [edit_eval._jsonable(o) for o in steps[k]],
+                  "validation": vrows, "score": be.score_many([steps[k]])[0]})
+    site, index = b["subcomponent"]
+    r["own"]["score"] = be.score_many([[edit_eval.scale_op((site, None, index), 0.0)]])[0]
+    r["behaviour"]["parts_rate"] = {k: v["rate"] for k, v in b["parts"].items()}
+    return r
 
 
 # ---- command line
@@ -432,6 +483,9 @@ def main():
     t.add_argument("--n", type=int, default=1000)
     b = sub.add_parser("table")
     b.add_argument("rows")
+    rs = sub.add_parser("rescore")
+    rs.add_argument("rows")
+    rs.add_argument("out")
     args = ap.parse_args()
     if args.cmd == "table":
         return print(table([json.loads(x) for x in Path(args.rows).read_text().splitlines() if x.strip()]))
@@ -443,6 +497,11 @@ def main():
         with open(args.out, "w") as f:
             for b in bs:
                 f.write(json.dumps({**b, "goal": goal_of(b, decode)}) + "\n")
+    elif args.cmd == "rescore":
+        with open(args.out, "w") as f:
+            for line in Path(args.rows).read_text().splitlines():
+                if line.strip():
+                    f.write(json.dumps(rescore(ee, src, json.loads(line), log=lambda m: print(m, flush=True))) + "\n")
     elif args.cmd == "teach":
         bs = [json.loads(x) for x in Path(args.behaviours).read_text().splitlines() if x.strip()][:args.n]
         done = set()

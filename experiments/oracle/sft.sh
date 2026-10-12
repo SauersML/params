@@ -11,7 +11,7 @@ O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
 ROWS=${ROWS:?question rows: components.py prepare output, several joined}
 TEACHER=${TEACHER:?teacher circuits (<task>.json)}
 BASE=${BASE:-Qwen/Qwen3-8B} STEPS=${STEPS:-100} BATCH=${BATCH:-8} NEVAL=${NEVAL:-20} SAMPLES=${SAMPLES:-4} MAXTOK=${MAXTOK:-4096}
-HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20.jsonl} HELDOUT_TEACHER=${HELDOUT_TEACHER:-~/mpd-data/graph_oracle/teacher/joint_heldout}
+HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20_rt.jsonl} HELDOUT_TEACHER=${HELDOUT_TEACHER:-~/mpd-data/graph_oracle/teacher/joint_heldout}
 LABELS=${LABELS:-$O/heldout20_locality_teacher.jsonl}
 SRC=${SRC:-/Users/user/params}  # a source tree (a clean copy of main while others edit the shared tree)
 PY=/Users/user/mpd-data/venv/bin/python; TPY=/Users/user/mpd-data/tinker-venv/bin/python

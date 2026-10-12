@@ -8,7 +8,7 @@
 set -e
 DIR=$1
 O=~/mpd-data/graph_oracle/components
-HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20.jsonl} LABELS=${LABELS:-$O/heldout20_locality_teacher.jsonl}
+HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20_rt.jsonl} LABELS=${LABELS:-$O/heldout20_locality_teacher.jsonl}
 NEVAL=${NEVAL:-20} SAMPLES=${SAMPLES:-2} MAXTOK=${MAXTOK:-4096}
 SRC=${SRC:-/Users/user/params}
 PY=/Users/user/mpd-data/venv/bin/python; TPY=/Users/user/mpd-data/tinker-venv/bin/python

@@ -42,9 +42,11 @@ The reward (reward()) is goal_eval's scorecard in VPD's semantics combined into 
 terms (each at most 1) less SIZE_WEIGHT x size (description bits in orders of magnitude of the bits of naming VPD's
 whole answer at the positions that can reach the targets, goal_eval's size_scale: size_term(), at most 1); an invalid answer (no CIRCUIT section, a
 missing FINAL line, cut at the sampling cap) earns -(1 + SIZE_WEIGHT), below every valid one. Nodes and edges the model
-does not have, and circuit lines that do not parse, are dropped and their bits charged in size. Terms: F1 sufficiency of
-the stated graph, N necessity, E1 the reader's bits saved, E2 questions answered right, E3 edits (reward()'s
-docstring); F3 (stated edges' cut effects) and F2 interchange are diagnostics.
+does not have, and circuit lines that do not parse, are dropped and their bits charged in size. Terms: C, the stated
+graph's agreement with the model under the training family of interventions (goal_eval.fidelity's reward mode: F1,
+random node removals, random connection cuts, the flip adversary), N necessity, E1 the reader's bits saved, E2
+questions answered right, E3 edits (reward()'s docstring); F1 alone, F3 (stated edges' cut effects) and F2
+interchange are diagnostics.
 
   components.py questions SPLIT OUT.jsonl [--n N] [--qa-seed K]  question rows (question, positions, evidence, questions;
                                                                 K = 1 for a fresh set of questions)
@@ -100,6 +102,7 @@ EDIT_RE = re.compile(r"^\s*EDIT\s+(\d+)\s*:(.*)$", re.M | re.I)
 OP_RE = re.compile(r"\s*(persistent\s+)?(?:cut\s+(\S+)\s*<-\s*(\S+)|scale\s+(\S+)\s+(-?\d+(?:\.\d+)?))\s*", re.I)
 
 SIZE_WEIGHT = 0.5
+POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # C's flip adversary's pattern pool (goal_eval.fidelity)
 CONVENTION = "live"  # goal_eval's remainders convention for the reward's F1 and N: on, computing on the run's inputs
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
 WIRING_PER_POSITION = 6  # connectome pairs listed per position
@@ -902,9 +905,21 @@ def edit_bits(edits: dict, circuit: set, positions: int, subcomponents: int) -> 
     return bits
 
 
+_POOL = {}
+
+
+def _pool() -> dict:
+    """C's pattern pool (POOL), loaded once; a missing pool is an error, never a weaker C."""
+    if "m" not in _POOL:
+        import torch
+
+        _POOL["m"] = torch.load(POOL)
+    return _POOL["m"]
+
+
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None, ee=None,
-           edit_best: dict | None = None) -> list[dict]:
+           edit_best: dict | None = None, pool: dict | None = None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
     row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT section, a
     question has no FINAL line, an edit request no EDIT line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
@@ -912,7 +927,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     parse (each subcomponent it names, at least one, priced as a node outside the graph); edit operations add their
     description bits (edit_bits). A valid
     answer earns the mean of its terms less size_weight x size ("circuit_reward": the same over the circuit's own terms
-    F1 and N, for comparing with circuits that give no English or answers), size its description bits in orders of
+    C and N, for comparing with circuits that give no English or answers), size its description bits in orders of
     magnitude of the bits of naming VPD's whole answer at the positions that can reach the targets (size_term over
     goal_eval's size_scale; without VPD's causal-importance network, VPD's actives at the listed positions and the
     targets), at most 1. Terms, from goal_eval in VPD's semantics with
@@ -926,7 +941,11 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     requests' net bits over the edit teacher's (edit_term; ee an edit_eval.EditEval, edit_best goal key -> the teacher's
     net; left out until every request of the text has one). A term goal_eval cannot give (no causal-importance
     network for VPD's bounds) is left out of the mean. F3, the AUC of stated edges' cuts in the circuit's run, is
-    reported (term_F3), never in the mean. reader: a reader.Reader for E1, or e1: each text's reader bits
+    reported (term_F3), never in the mean. C (term_C), the circuit term in the mean in place of F1: goal_eval.fidelity's
+    reward mode, the mean of the stated graph's F1, its agreement under random node removals and under random
+    connection cuts, and its F1 with the flip adversary's FLIP_TERM parts switched on (pool: the adversary's pattern
+    pool, POOL by default; {} leaves the adversary out, for a model without one); F1 is reported (term_F1), as are C's
+    members (fidelity). reader: a reader.Reader for E1, or e1: each text's reader bits
     computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
     -> goal_eval.Text, kept between calls."""
     import goal_eval
@@ -961,6 +980,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     ge.hooks = {"E1": (lambda task, g, x: bits.get(x)) if (reader is not None or e1 is not None) else None,
                 "E2": lambda task, g, x: qa_term(ev["qa"], parse(x)["finals"], tok, prompt["model_top"][0][0][0])}
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
+    c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], _pool() if pool is None else pool, mode="reward"))) if keep else {}
     e3 = {}
     if keep and ee is not None and ev.get("edits"):
         e3 = dict(zip(keep, edit_term(ee, task, ev["edits"], [parsed[i]["edits"] for i in keep], edit_best or {})))
@@ -970,21 +990,23 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         row, terms, size, r = row_of.get(i), {}, None, -(1.0 + size_weight)
         circ = r
         if row is not None:
-            terms["F1"] = row[f"f1_{convention}"]
+            terms["C"] = c_of[i]["c"]
+            terms["F1"] = row[f"f1_{convention}"]  # C's point member, reported
             terms["N"] = row[f"n_{convention}"]
             terms["F3"] = row["f3"]
             terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
             terms["E2"] = row["E2"]
             terms["E3"] = e3.get(i)
-            have = [v for k, v in terms.items() if k != "F3" and v is not None]  # F3: a diagnostic
+            have = [v for k, v in terms.items() if k not in ("F1", "F3") and v is not None]  # F1 (in C) and F3: reported
             e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
             size = size_term(row["bits"] + d_bits + e_bits, scale)
             r = sum(have) / len(have) - size_weight * size
-            own = [terms[k] for k in ("F1", "N") if terms[k] is not None]
+            own = [terms[k] for k in ("C", "N") if terms[k] is not None]
             circ = sum(own) / len(own) - size_weight * size
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
                     "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
-                    "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row})
+                    "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row,
+                    "fidelity": {k: v for k, v in (c_of.get(i) or {}).items() if k in ("s_point", "s_nodes", "s_edges", "f1_flips_omitted")}})
     return out
 
 

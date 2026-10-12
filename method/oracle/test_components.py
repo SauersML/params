@@ -199,9 +199,9 @@ def test_reward_on_tiny_model(tiny):
     good = components.render(goal_eval.to_json(g, "writes at the target"), finals)
     bad = good.replace("OUT <- ", "OUT <- L0.v#0@7,")  # a value never writes the residual stream: dropped, charged
     missing = components.render(goal_eval.to_json(g, "writes at the target"))
-    got = components.reward(ge, task, ev, [good, bad, missing, good], truncated=[False, False, False, True])
+    got = components.reward(ge, task, ev, [good, bad, missing, good], truncated=[False, False, False, True], pool={})
     assert got[0]["valid"] and invalid < got[0]["reward"] <= 1.0
-    assert all(got[0][f"term_{k}"] is None or 0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("F1", "N", "F3"))
+    assert all(got[0][f"term_{k}"] is None or 0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("C", "F1", "N", "F3"))
     tok = lambda xs: components.token_strings(task["model"], xs)  # noqa: E731
     right0 = sum(0.5 * (not q["falls"]) + 0.5 * (tok([q["top"]])[0] == " the") for q in ev["qa"]) / max(len(ev["qa"]), 1)
     if ev["qa"] and right0 < 1.0:  # every "falls" right and no top token "x" (0.5 right), measured from no change
@@ -216,9 +216,9 @@ def test_reward_on_tiny_model(tiny):
     asked = {**ev, "edits": goals}
     best = {edit_eval.EditEval.key(task["id"], goals[0]): 4.0}
     edited = good + "\nEDIT 1: scale " + good.split("@7 ", 1)[1].split("=", 1)[0] + " 0"
-    with_e3 = components.reward(ge, task, asked, [edited, good], ee=FakeEdits(), edit_best=best)
+    with_e3 = components.reward(ge, task, asked, [edited, good], ee=FakeEdits(), edit_best=best, pool={})
     assert with_e3[0]["term_E3"] == 0.5 and not with_e3[1]["valid"]  # 2 bits of the teacher's 4; no EDIT line: invalid
-    terms = [with_e3[0][f"term_{k}"] for k in ("F1", "N", "E1", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]  # F3: a diagnostic
+    terms = [with_e3[0][f"term_{k}"] for k in ("C", "N", "E1", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]  # F1, F3: reported
     assert with_e3[0]["reward"] == pytest.approx(sum(terms) / len(terms) - components.SIZE_WEIGHT * with_e3[0]["size"])
 
 
@@ -235,7 +235,7 @@ def test_invalid_below_every_valid_answer(tiny):
     texts = [components.render(goal_eval.to_json(huge, ""), wrong),
              components.render({"nodes": [], "edges": []}, wrong).replace("CIRCUIT:", "CIRCUIT:\n" + junk),
              components.render({"nodes": [], "edges": []}, wrong).replace("CIRCUIT:", "CIRCUIT:\n" + garbage)]
-    got = components.reward(ge, task, ev, texts)
+    got = components.reward(ge, task, ev, texts, pool={})
     assert all(r["valid"] for r in got)  # lines that do not parse are dropped and charged, not fatal
     assert got[0]["size"] == 1.0 and got[1]["dropped_edges"] == 5 * T and got[2]["malformed"] == 400 and got[2]["size"] == 1.0
     assert min(r["reward"] for r in got) > -(1 + components.SIZE_WEIGHT)

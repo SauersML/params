@@ -129,7 +129,8 @@ def binding(B: int, g: torch.Generator, fixed_only: bool) -> tuple:
     lab = torch.full_like(ids, -100)
     for b in range(B):
         ks = torch.tensor(KEYS)[torch.randperm(len(KEYS), generator=g)[:PAIRS]]
-        vs = torch.tensor(VALS)[torch.randint(len(VALS), (PAIRS,), generator=g)]
+        vs = torch.tensor(VALS)[torch.randperm(len(VALS), generator=g)[:PAIRS]]   # distinct: every text needs its key (a repeated
+        # value answers a query whose key is replaced: binding_km's text 0 needed no key at all)
         ids[b, 1:2 * PAIRS + 1:2], ids[b, 2:2 * PAIRS + 2:2] = ks, vs
         x = FIXED if fixed_only else int(torch.randint(PAIRS, (1,), generator=g))
         ids[b, -2], ids[b, -1] = Q, ks[x]

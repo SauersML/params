@@ -24,7 +24,8 @@ description length, each one choice among the positions times the 4 x (6 + 3,072
 A removal at position p changes nothing before p (the model is causal), so a batch of removals computes only the
 positions from its first removal on, reading the set's keys and values before it from the set's own run.
 
-  native_units.py curve --split heldout --n 20 [--sizes 12 16 ...] [--out OUT.jsonl]   per text, then the table by size
+  native_units.py curve --split heldout --n 20 [--offset K --stride S] [--sizes 12 16 ...] [--out OUT.jsonl]
+  native_units.py table OUT.jsonl                                       the means by size
 """
 
 from __future__ import annotations
@@ -247,14 +248,14 @@ def bits(k: int, positions: int, per_position: int) -> float:
     return k * math.log2(positions * per_position) if k else 0.0
 
 
-def curves(split: str, n: int, sizes=SIZES, out: Path | None = None, log=print) -> list[dict]:
-    """Per text of the split's first n: the native-unit pruning curve, and at each size asked for the native
+def curves(split: str, n: int, sizes=SIZES, out: Path | None = None, log=print, offset: int = 0, stride: int = 1) -> list[dict]:
+    """Per text of the split's first n (offset, offset + stride, ...): the native-unit pruning curve, and at each size asked for the native
     circuit's and VPD's own first k (its order, native.Native._vpd_order) KL, F1 and N on goal_eval's scale (remainders
     off, the native units having none; VPD's also live), with their node bits -> one row per text (appended to OUT)."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
     rows = []
-    for p in native.tasks(split)[:n]:
+    for p in native.tasks(split)[:n][offset::stride]:
         t0 = time.perf_counter()
         ids, targets = native.text(p)
         tx = ge.text(ids, targets, native.task_seed(p.stem), json.loads(p.read_text()))
@@ -311,6 +312,8 @@ def main():
     c.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
     c.add_argument("--n", type=int, default=20)
     c.add_argument("--sizes", type=int, nargs="*", default=list(SIZES))
+    c.add_argument("--offset", type=int, default=0)
+    c.add_argument("--stride", type=int, default=1)
     c.add_argument("--out", type=Path)
     t = sub.add_parser("table")
     t.add_argument("rows", type=Path, help="curve's OUT.jsonl")
@@ -318,7 +321,7 @@ def main():
     if args.cmd == "table":
         print(table([json.loads(x) for x in args.rows.read_text().splitlines() if x.strip()]))
         return
-    rows = curves(args.split, args.n, args.sizes, args.out)
+    rows = curves(args.split, args.n, args.sizes, args.out, offset=args.offset, stride=args.stride)
     print(table(rows), flush=True)
 
 

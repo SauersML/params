@@ -4,6 +4,7 @@ random model (test_goal_eval's).
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_components.py -q
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -39,14 +40,20 @@ def edges(q):
 
 
 def test_parse_render_round_trip():
+    """A v1 answer (the id grammar) is still read; render() writes the circuit as fenced Mermaid, every node declared
+    once in its position's subgraph, and Mermaid parses back to the same circuit (render is idempotent)."""
     p = components.parse(ANSWER)
     assert p["malformed"] == 0 and p["circuit"]
     assert p["explanation"] == "the value at 3 is copied to the last position."
     assert p["finals"] == {1: (True, "' the'")}
     assert len(p["answer"]["nodes"]) == 6 and len(p["answer"]["edges"]) == 5
-    text = components.render(p["answer"], p["finals"], {1: "the copied value is gone."})
-    assert text.strip() == ANSWER.strip()  # one grammar: ids in position blocks, edges by id
-    assert edges(components.parse(text)) == edges(p)
+    text = components.render(p["answer"], p["finals"], {1: "the copied value is gone."}, strings=[f"w{i}" for i in range(6)])
+    lines = text.splitlines()
+    assert lines[:4] == ["CIRCUIT:", "```mermaid", "flowchart LR", '  subgraph P5["@5 \'w5\'"]'] and "```" in lines
+    assert '    a["L1.o#1"]' in lines and "  a --> OUT((prediction))" in lines and "  b --> OUT" in lines
+    q = components.parse(text)
+    assert edges(q) == edges(p) and q["malformed"] == 0 and q["finals"] == p["finals"]
+    assert components.render(q["answer"], q["finals"], {1: "the copied value is gone."}, strings=[f"w{i}" for i in range(6)]) == text
 
 
 def test_written_out_nodes_still_parse():
@@ -56,7 +63,7 @@ def test_written_out_nodes_still_parse():
     assert len(p["answer"]["nodes"]) == 7
     assert len(p["answer"]["edges"]) == 2 + 2 * 3  # two into the prediction, every writer into both readers
     again = components.parse(components.render(p["answer"]))
-    assert edges(again) == edges(p) and "=" in components.render(p["answer"])
+    assert edges(again) == edges(p) and "flowchart LR" in components.render(p["answer"])
     assert components.parse("CIRCUIT:\nL1.down#2, 9@5 <- L1.fc#1@5\n")["malformed"] == 1
     block = components.parse("CIRCUIT:\n@4 L1.k#4,6 L0.q#2 tok\nL1.k#9@4\n")  # a block without ids, and a bare group
     assert block["malformed"] == 0 and len(block["answer"]["nodes"]) == 5 and not block["answer"]["edges"]
@@ -126,7 +133,7 @@ def test_escape_keeps_special_strings_text(base):
 
 def test_malformed_lines_and_dropped_edges():
     p = components.parse("EXPLANATION: x\nCIRCUIT:\nout <- L1.o#1@5\nL1.o#1@5 <- L1.v#4@3 and more\nL7\n")
-    assert p["malformed"] == 2
+    assert p["malformed"] + p["unknown_ids"] == 2  # a line that does not parse; L7, an id never declared
     C = {native.site_name(layer, k): 6 for layer in range(2) for k in components.KINDS.values()}
     q = components.parse("EXPLANATION: x\nCIRCUIT:\nout <- L1.v#4@5\nL0.o#1@5 <- L1.down#0@5\n")
     assert q["malformed"] == 0
@@ -273,7 +280,8 @@ def test_reward_on_tiny_model(tiny):
     g = native.Graph(set(at_t) | {fc, down}, {down: [fc]}, at_t + [down])
     finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
     good = components.render(goal_eval.to_json(g, "writes at the target"), finals)
-    bad = good.replace("OUT <- ", "OUT <- L0.v#0@7,")  # a value never writes the residual stream: dropped, charged
+    bad = good.replace("  subgraph P7", "  subgraph P7", 1).replace("  end\n", '    zz["L0.v#0"]\n  end\n', 1).replace(
+        "\n```\n", "\n  zz --> OUT\n```\n", 1)  # a value never writes the residual stream: dropped, charged
     missing = components.render(goal_eval.to_json(g, "writes at the target"))
     got = components.reward(ge, task, ev, [good, bad, missing, good], truncated=[False, False, False, True], pool={})
     assert got[0]["valid"] and invalid < got[0]["reward"] <= 1.0
@@ -291,7 +299,7 @@ def test_reward_on_tiny_model(tiny):
     goals = [{"kind": "flip", "token_id": 5, "token": " the", "target": 7}]
     asked = {**ev, "edits": goals}
     best = {edit_eval.EditEval.key(task["id"], goals[0]): 4.0}
-    edited = good + "\nEDIT 1: scale " + good.split("@7 ", 1)[1].split("=", 1)[0] + " 0"
+    edited = good + "\nEDIT 1: scale " + good.split("subgraph P7", 1)[1].split("\n    ", 1)[1].split("[", 1)[0] + " 0"
     with_e3 = components.reward(ge, task, asked, [edited, good], ee=FakeEdits(), edit_best=best, pool={})
     assert with_e3[0]["term_E3"] == 0.5 and not with_e3[1]["valid"]  # 2 bits of the teacher's 4; no EDIT line: invalid
     terms = [with_e3[0][f"term_{k}"] for k in ("C", "N", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]  # F1, F3, E1: reported
@@ -306,11 +314,11 @@ def test_invalid_below_every_valid_answer(tiny):
     par, out = native.all_edges(every.node_set(), [7])
     huge = native.Graph(every.node_set(), par, out)
     wrong = {n: (not q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
-    junk = "\n".join(f"L3.v#{c}@{t} <- L0.q#{c}@{t}" for t in range(T) for c in range(5))  # no such connection: all dropped
+    junk = {"nodes": [[f"{layer}.{k}", c, t] for t in range(T) for c in range(5) for layer, k in ((3, "v"), (0, "q"))],
+            "edges": [[2 * i + 1, 2 * i] for i in range(5 * T)]}  # a query writes nothing: every connection dropped
     garbage = "\n".join(["Reader: L1.o#1@3 <- Writer: L0.down#2@3", "the attention reads the previous token"] * 200)
-    texts = [components.render(goal_eval.to_json(huge, ""), wrong),
-             components.render({"nodes": [], "edges": []}, wrong).replace("CIRCUIT:", "CIRCUIT:\n" + junk),
-             components.render({"nodes": [], "edges": []}, wrong).replace("CIRCUIT:", "CIRCUIT:\n" + garbage)]
+    texts = [components.render(goal_eval.to_json(huge, ""), wrong), components.render(junk, wrong),
+             components.render({"nodes": [], "edges": []}, wrong).replace("flowchart LR", "flowchart LR\n" + garbage)]
     got = components.reward(ge, task, ev, texts, pool={})
     assert all(r["valid"] for r in got)  # lines that do not parse are dropped and charged, not fatal
     assert got[0]["size"] == 1.0 and got[1]["dropped_edges"] == 5 * T and got[2]["malformed"] == 400 and got[2]["size"] == 1.0
@@ -392,13 +400,14 @@ def test_writer_writes_the_teacher_variables_meanings():
 
 
 def test_pattern_lines_round_trip_the_pair_edges():
-    """goal_eval's ["pair", query, key, layer, position] edges render as PATTERN lines by id (rest for the remainder)
-    and parse back to the same entries; the written-out form without the L@ prefix takes the query's read; a line
-    naming no query when it gives no read, or an unknown id, is malformed."""
+    """goal_eval's ["pair", query, key, layer, position] edges render as "q -.->|pair| k" (rest for the remainder, the
+    read written when the query is rest, a rest-rest pair as a comment) and parse back to the same entries; v1's
+    PATTERN lines are still read."""
     answer = {"nodes": [["h.3.attn.o_proj", 1, 7], ["h.3.attn.q_proj", 283, 7], ["h.3.attn.k_proj", 145, 4], ["h.3.attn.v_proj", 9, 4]],
-              "edges": [[0, "out"], [3, 0], [1, 0], [2, 0], ["pair", 1, 2, 3, 7], ["pair", 1, "rest", 3, 7], ["pair", "rest", "rest", 2, 7]]}
+              "edges": [[0, "out"], [3, 0], [1, 0], [2, 0], ["pair", 1, 2, 3, 7], ["pair", 1, "rest", 3, 7], ["pair", "rest", 2, 3, 7],
+                        ["pair", "rest", "rest", 2, 7]]}
     text = components.render(answer)
-    assert "PATTERN L3@7: " in text and " ~ rest" in text and "PATTERN L2@7: rest ~ rest" in text
+    assert "-.->|pair| rest" in text and "rest -.->|pair L3@7|" in text and "%% rest -.->|pair L2@7| rest" in text
     p = components.parse(text)
     named = lambda a, i: "rest" if i == "rest" else tuple(a["nodes"][i])  # noqa: E731
     pairs = lambda a: sorted(str((named(a, e[1]), named(a, e[2]), e[3], e[4])) for e in a["edges"] if e[0] == "pair")  # noqa: E731
@@ -448,7 +457,7 @@ def test_block_nodes_and_token_edges_round_trip():
                         ["h.3.attn.q_proj", 5, 235], ["h.3.attn.k_proj", 9, 233], ["tok", 0, 233], ["tok", 0, 235]],
               "edges": [[0, "out"], [2, 0], [1, 2], [5, 4], [6, 3], [6, "out"], ["pair", 3, 4, 3, 235], ["pair", 3, "rest", 3, 235]]}
     text = components.render(answer)
-    assert "=L1.v " in text + " " and "PATTERN L3@235:" in text
+    assert '["L1.v block"]' in text and "    t233[tok]" in text and "  t235 --> OUT" in text and "-.->|pair|" in text
     p = components.parse(text)
     assert p["malformed"] == 0 and p["malformed_nodes"] == 0
     key = lambda a: (sorted(map(tuple, a["nodes"])), sorted(  # noqa: E731
@@ -469,23 +478,16 @@ def test_question_lists_the_candidate_pool_when_present(tiny):
     assert "every VPD-active subcomponent" not in components.question(task, ev)
 
 
-def test_mermaid_circuit_round_trips():
-    """The same answer as a Mermaid flowchart (to_mermaid) parses back to the same nodes and edges: subcomponents, a
-    block, token nodes and their edges into a reader and the prediction, and pairs; declarations outside a position's
-    subgraph need a position; a line that is neither is malformed."""
-    answer = {"nodes": [["h.3.mlp.down_proj", 2, 235], ["block", "h.1.attn.v_proj", 233], ["h.2.attn.o_proj", 7, 235],
-                        ["h.3.attn.q_proj", 5, 235], ["h.3.attn.k_proj", 9, 233], ["tok", 0, 233], ["tok", 0, 235]],
-              "edges": [[0, "out"], [2, 0], [1, 2], [5, 4], [6, 3], [6, "out"], ["pair", 3, 4, 3, 235], ["pair", 3, "rest", 3, 235]]}
-    strings = [f"t{i}" for i in range(240)]
-    text = components.render(answer, strings=strings, fmt="mermaid")
-    assert "flowchart LR" in text and 'subgraph p233["\'t233\' @233"]' in text and "-.->|pair L3@235|" in text and "--> OUT" in text
+def test_mermaid_circuit_is_read_strictly():
+    """Mermaid is read strictly: a node declared outside its position's subgraph, a label that is no subcomponent, an id
+    declared twice, an edge end declared inline, and a stray line are malformed; an edge naming an undeclared id is
+    charged as an unknown id; the rest of the answer is still read."""
+    text = "\n".join(["CIRCUIT:", "```mermaid", "flowchart LR", '  subgraph P235["@235 \'x\'"]', '    a["L3.down#2"]',
+                      '    b["L3.d#2"]', '    a["L3.down#3"]', "    t235[tok]", "  end", '  c["L3.o#1"]', "  a --> OUT((prediction))",
+                      "  t235 --> OUT", "  zz --> a", '  q["L2.v#1"] --> a', "  this is not mermaid", "```", "FINAL 1: falls=no top=' x'"])
     p = components.parse(text)
-    key = lambda a: (sorted(map(tuple, a["nodes"])), sorted(  # noqa: E731
-        str((e[0], *[tuple(a["nodes"][i]) if i != "rest" else i for i in e[1:3]], *e[3:])) if e[0] == "pair"
-        else str((tuple(a["nodes"][e[0]]), "out" if e[1] == "out" else tuple(a["nodes"][e[1]]))) for e in a["edges"]))
-    assert key(p["answer"]) == key(answer) and p["malformed"] == 0
-    loose = components.parse("CIRCUIT:\nflowchart LR\n  a[L3.down#2@235]\n  b[L3.o#1]\n  a --> OUT\n  this is not mermaid\n")
-    assert loose["malformed"] == 2 and [tuple(x) for x in loose["answer"]["nodes"]] == [("h.3.mlp.down_proj", 2, 235)]
+    assert [tuple(x) for x in p["answer"]["nodes"]] == [("h.3.mlp.down_proj", 2, 235), ("tok", 0, 235)]
+    assert p["malformed"] == 5 and p["unknown_ids"] == 1 and len(p["answer"]["edges"]) == 2 and p["finals"] == {1: (False, "' x'")}
 
 
 def test_matched_reward_is_c_and_n_over_vpd_at_the_same_size(tiny, monkeypatch):
@@ -514,3 +516,84 @@ def test_qa_detail_scores_each_question_and_the_no_change_answer():
     qs = [{"kind": "remove", "falls": True, "top": 5}, {"kind": "swap", "falls": False, "top": 9}, {"kind": "token", "falls": True, "top": 9}]
     got = components.qa_detail(qs, {1: (True, components.shown("t5")), 2: (False, components.shown("t9"))}, tok, "t9")
     assert got == [{"kind": "subcomponent removal", "right": 1.0, "right0": 0.0}, {"kind": "move/swap/insert", "right": 1.0, "right0": 1.0}]
+
+
+def _circuit_key(a):
+    node = lambda i: "rest" if i == "rest" else tuple(a["nodes"][i])  # noqa: E731
+    return ({tuple(x) for x in a["nodes"]},
+            {(e[0], node(e[1]), node(e[2]), e[3], e[4]) if e[0] == "pair" else (node(e[0]), "out" if e[1] == "out" else node(e[1]))
+             for e in a["edges"]})
+
+
+@pytest.mark.parametrize("which", ["joint_train", "joint_heldout"])
+def test_teacher_circuits_round_trip_through_mermaid(which):
+    """Every teacher circuit (444 train, the held-out ones) renders to Mermaid and parses back to the same nodes, edges,
+    token edges, blocks and pairs, with nothing malformed."""
+    d = Path.home() / "mpd-data/graph_oracle/teacher" / which
+    files = sorted(f for f in d.glob("text*.json") if f.stem.startswith("text") and f.stem[4:].isdigit()) if d.exists() else []
+    if not files:
+        pytest.skip(f"no teacher circuits in {d}")
+    for f in files:
+        a = json.loads(f.read_text())
+        for b in (a, _augmented(a)):  # the teachers as written; with token edges, blocks and pairs added
+            p = components.parse(components.render(b))
+            assert p["malformed"] == 0 and p["unknown_ids"] == 0 and _circuit_key(p["answer"]) == _circuit_key(b), f.name
+
+
+def _augmented(a):
+    """A teacher circuit with what v2 teachers state and v1 ones do not: a token node at every position with its edges
+    into that position's query, key, value and MLP-input nodes (and into the prediction at the last position), a block
+    beside each position's first node, and query-key pairs (each query with up to two keys of its layer at or before
+    it, with the remainder, and a read with no pair)."""
+    import goal_eval
+
+    nodes = [list(x) for x in a["nodes"]]
+    edges = [list(e) for e in a["edges"]]
+    sub = [(i, goal_eval._site(m), int(t), int(c)) for i, (m, c, t) in enumerate(a["nodes"]) if m not in ("tok", "block")]
+    for t in sorted({x[2] for x in sub}):
+        tok = next((i for i, x in enumerate(nodes) if x[0] == "tok" and x[2] == t), None)
+        if tok is None:
+            tok = len(nodes)
+            nodes.append(["tok", 0, t])
+        edges += [[tok, i] for i, n, tt, _ in sub if tt == t and n.endswith(("q_proj", "k_proj", "v_proj", "c_fc"))]
+        if t == max(x[2] for x in sub):
+            edges.append([tok, "out"])
+        site = next(n for _, n, tt, _ in sub if tt == t)
+        if ["block", site, t] not in nodes:
+            nodes.append(["block", site, t])
+    for i, n, t, _ in sub:
+        if n.endswith("q_proj"):
+            layer = int(n.split(".")[1])
+            keys = [j for j, m, tt, _ in sub if m == f"h.{layer}.attn.k_proj" and tt <= t][:2]
+            edges += [["pair", i, j, layer, t] for j in keys] + [["pair", i, "rest", layer, t], ["pair", "rest", "rest", layer, t]]
+            edges += [["pair", "rest", j, layer, t] for j in keys[:1]]
+    return {**a, "nodes": nodes, "edges": edges}
+
+
+def test_every_rendered_circuit_passes_mermaids_parser(tmp_path):
+    """Every teacher circuit, as written and with token edges, blocks and pairs added, rendered and run through
+    Mermaid's own parser (experiments/oracle/mermaid_parse.mjs; MERMAID_DIR: where @mermaid-js/mermaid-cli is installed)."""
+    import os
+    import subprocess
+
+    import native
+
+    mdir = os.environ.get("MERMAID_DIR")
+    if not mdir:
+        pytest.skip("MERMAID_DIR not set (npm install --prefix DIR @mermaid-js/mermaid-cli@11.4.2)")
+    blocks = []
+    for which in ("joint_train", "joint_heldout"):
+        for f in sorted((Path.home() / "mpd-data/graph_oracle/teacher" / which).glob("text*.json")):
+            if not f.stem[4:].isdigit():
+                continue
+            a = json.loads(f.read_text())
+            strings = components.token_strings("vpd4l", native.text(native.TEXTS / "vpd4l" / f"{f.stem}.json")[0])
+            for b in (a, _augmented(a)):
+                circuit = components.render(b, strings=strings).split("CIRCUIT:\n", 1)[1]
+                blocks.append(f"<!-- {which}/{f.stem} -->\n" + circuit[:circuit.index("\n```") + 4])
+    if not blocks:
+        pytest.skip("no teacher circuits")
+    md = tmp_path / "circuits.md"
+    md.write_text("\n\n".join(blocks) + "\n")
+    got = subprocess.run(["node", str(HERE.parents[1] / "experiments/oracle/mermaid_parse.mjs"), mdir, str(md)], capture_output=True, text=True)
+    assert got.returncode == 0, got.stdout[-2000:] + got.stderr[-2000:]

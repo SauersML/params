@@ -93,12 +93,14 @@ sys.path.insert(0, str(HERE.parent / "vpd"))
 
 KINDS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj", "fc": "c_fc", "down": "down_proj"}
 CODES = {v: k for k, v in KINDS.items()}
-GROUP_RE = re.compile(r"(?:L(\d+)\.(q|k|v|o|fc|down)#(\d+(?:,\d+)*)|tok)@(\d+)")
-_G = r"(?:L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)@\d+"
+GROUP_RE = re.compile(r"(?:L(\d+)\.(q|k|v|o|fc|down)(?:#(\d+(?:,\d+)*))?|tok)@(\d+)")  # no #index: a block node
+_G = r"(?:L\d+\.(?:q|k|v|o|fc|down)(?:#\d+(?:,\d+)*)?|tok)@\d+"
 TOK = "tok"  # the token embedding at a position, an input node: JSON [TOK, 0, position], text tok@<position>
+BLOCK = -1  # goal_eval.BLOCK: a block node (site, position, BLOCK), a site's whole output there: JSON ["block", site,
+# position], text L<layer>.<kind>@<position> (no #index)
 WRITERS_RE = re.compile(rf"\s*{_G}(?:\s*,\s*{_G})*\s*")
 BLOCK_RE = re.compile(r"@(\d+)\s+(\S.*)")  # a position block: "@322" and its items, each parsed alone (ITEM_RE)
-ITEM_RE = re.compile(r"(?:([a-z]+)=)?(L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)")
+ITEM_RE = re.compile(r"(?:([a-z]+)=)?(L\d+\.(?:q|k|v|o|fc|down)(?:#\d+(?:,\d+)*)?|tok)")
 _W = rf"(?:{_G}|[a-z]+)"
 ID_RE = re.compile(r"[a-z]+")
 GROUP_SPLIT = re.compile(rf"{_G}|[a-z]+")
@@ -159,16 +161,18 @@ def node_text(nd) -> str:
 
 def group_text(nds) -> str:
     """Subcomponents of one matrix at one position as L<layer>.<kind>#<index>,<index>,...@<position>, indices sorted;
-    the token embedding at a position as tok@<position>."""
+    the token embedding at a position as tok@<position>; a block node (its whole output) as L<layer>.<kind>@<position>."""
     name, t = nds[0][0], nds[0][1]
     if name == TOK:
         return f"{TOK}@{t}"
+    if nds[0][2] == BLOCK:
+        return f"L{name.split('.')[1]}.{CODES[name.split('.')[-1]]}@{t}"
     return f"L{name.split('.')[1]}.{CODES[name.split('.')[-1]]}#{','.join(str(c) for c in sorted({nd[2] for nd in nds}))}@{t}"
 
 
 def group_of(text: str):
-    """The subcomponents [(matrix name, position, index), ...] of L<layer>.<kind>#<index>[,<index>...]@<position>, or
-    None."""
+    """The subcomponents [(matrix name, position, index), ...] of L<layer>.<kind>#<index>[,<index>...]@<position> (a
+    block node, index BLOCK, without #), or None."""
     import native
 
     m = GROUP_RE.fullmatch(text.strip())
@@ -177,6 +181,8 @@ def group_of(text: str):
     if m[1] is None:
         return [(TOK, int(m[4]), 0)]
     name = native.site_name(int(m[1]), KINDS[m[2]])
+    if m[3] is None:
+        return [(name, int(m[4]), BLOCK)]
     return [(name, int(m[4]), int(c)) for c in m[3].split(",")]
 
 
@@ -214,7 +220,7 @@ def parse(text: str) -> dict:
     def index(nd):
         if nd not in at:
             at[nd] = len(nodes)
-            nodes.append([nd[0], nd[2], nd[1]])
+            nodes.append(["block", nd[0], nd[1]] if nd[2] == BLOCK else [nd[0], nd[2], nd[1]])
         return at[nd]
 
     lines = [x.strip() for x in sec.get("CIRCUIT", "").splitlines() if x.strip()]
@@ -376,7 +382,8 @@ def _carriers(text: str, ids: dict) -> tuple[list, list]:
             site = native.site_name(int(b[1]), KINDS[b[2]])
             group |= {("block", site, t) for t in range(int(b[3]), int(b[4] or b[3]) + 1)}
         else:
-            group |= {(nd[0], nd[2], nd[1]) for nd in ([ids[x]] if x in ids else (group_of(x) or [])) if nd[0] != TOK}
+            group |= {("block", nd[0], nd[1]) if nd[2] == BLOCK else (nd[0], nd[2], nd[1])
+                      for nd in ([ids[x]] if x in ids else (group_of(x) or [])) if nd[0] != TOK}
     return [list(g) for g in sorted(group, key=str)], [[n, c, t] for n, t, c in inst]
 
 
@@ -398,7 +405,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
     token as written)) and the edits."""
     import goal_eval
 
-    nodes = [(TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
+    nodes = [(goal_eval._site(c), t, BLOCK) if m == "block" else (TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
     parents, out, pairs = {}, [], []
     for e in answer["edges"]:
         if e[0] == "pair":

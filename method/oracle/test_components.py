@@ -434,3 +434,27 @@ def test_variable_blocks_and_instances_round_trip():
     assert "carried by: L2.v @233, L1.v @232-233, a (instances: b,L1.v#433@233)" in again
     q = components.parse(again)
     assert q["answer"]["variables"][0]["group"] == v["group"] and sorted(q["answer"]["variables"][0]["instances"]) == sorted(v["instances"])
+
+
+def test_block_nodes_and_token_edges_round_trip():
+    """A block node (["block", site, position], a site's whole output) renders in its position's line as id=L1.v and
+    parses back; token edges from a position's tok into a reader there and into the prediction ("OUT <- id") round-trip
+    with the pairs; written out, a block is L1.v@233 and a token tok@233. BLOCK is goal_eval's."""
+    import goal_eval
+
+    assert components.BLOCK == goal_eval.BLOCK
+    answer = {"nodes": [["h.3.mlp.down_proj", 2, 235], ["block", "h.1.attn.v_proj", 233], ["h.2.attn.o_proj", 7, 235],
+                        ["h.3.attn.q_proj", 5, 235], ["h.3.attn.k_proj", 9, 233], ["tok", 0, 233], ["tok", 0, 235]],
+              "edges": [[0, "out"], [2, 0], [1, 2], [5, 4], [6, 3], [6, "out"], ["pair", 3, 4, 3, 235], ["pair", 3, "rest", 3, 235]]}
+    text = components.render(answer)
+    assert "=L1.v " in text + " " and "PATTERN L3@235:" in text
+    p = components.parse(text)
+    assert p["malformed"] == 0 and p["malformed_nodes"] == 0
+    key = lambda a: (sorted(map(tuple, a["nodes"])), sorted(  # noqa: E731
+        str((e[0], *[tuple(a["nodes"][i]) if i != "rest" else i for i in e[1:3]], *e[3:])) if e[0] == "pair"
+        else str((tuple(a["nodes"][e[0]]), "out" if e[1] == "out" else tuple(a["nodes"][e[1]]))) for e in a["edges"]))
+    assert key(p["answer"]) == key(answer)
+    assert components.render(p["answer"]) == text
+    written = components.parse("CIRCUIT:\nOUT <- L3.down#2@235,tok@235\nL3.down#2@235 <- L1.v@233\n")
+    nodes = [tuple(x) for x in written["answer"]["nodes"]]
+    assert ("block", "h.1.attn.v_proj", 233) in nodes and ("tok", 0, 235) in nodes and written["malformed"] == 0

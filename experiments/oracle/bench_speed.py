@@ -81,8 +81,12 @@ def timed(fn, sync, reset=None):
 
 
 def forget(nat):
-    """Drop what a model object keeps between calls for a text (units.sensitive's orders), for a first-call time."""
+    """Drop what a model object keeps between calls for a text (units.sensitive's orders, Native.reference's results),
+    for a first-call time."""
     nat.__dict__.pop("_sensitive_orders", None)
+    if hasattr(nat, "_refs"):
+        nat._refs.clear()
+        nat._refs_bytes = 0
 
 
 def bench_carry(nat, texts, granularity, batch=64, reps=4):

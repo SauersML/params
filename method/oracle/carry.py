@@ -1025,9 +1025,16 @@ class MatrixCarry(Carry):
         self.space = space
         with torch.no_grad():
             self.writes = {n: self.rec[n] @ nat.target.site(n).U for n in nat.names}
-        self.attention = _capture_attention(self)
         self.first_change = min((p for x in prompts for p, (a, b) in enumerate(zip(ids, x)) if a != b), default=self.T)
         _prepare_unit_prompts(self)
+
+    @property
+    def attention(self):
+        """The original run's attention for the Native path's reused prefix, captured on first use (the direct
+        evaluator never reads it)."""
+        if "_attention" not in self.__dict__:
+            self._attention = _capture_attention(self)
+        return self._attention
 
     def mixed(self, x, coefficients):
         if self.direct:

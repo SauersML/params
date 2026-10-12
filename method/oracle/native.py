@@ -46,6 +46,7 @@ import math
 import sys
 import time
 import types
+from collections import OrderedDict
 from functools import lru_cache
 from itertools import chain
 from pathlib import Path
@@ -320,6 +321,8 @@ class Native:
         self.C = self.vpd.C
         self._consts: dict = {}  # zero and one ablations, full plans, causal masks: built once, never written
         self._rec: tuple = (None, None, None)  # the last text's whole-model run: (ids, (activations, states), states per batch size)
+        self._refs: OrderedDict = OrderedDict()  # reference()'s results by (sequences, targets), least recently used first
+        self._refs_bytes = 0
 
     # ---- graphs from answers and from VPD
 
@@ -455,11 +458,36 @@ class Native:
 
     # ---- running graphs
 
+    REFERENCE_BYTES = 2 * 1024**3  # reference() results kept for repeated calls (a text's changed prompts, asked again by
+    # every score of the text): at 50,277 tokens, 10,000 sequence-target distributions
+
+    def plain(self) -> bool:
+        """Whether a forward now computes the model itself: no model edit (carry.model_edit), no torch function mode
+        and no module hook, any of which can change what it computes without Native knowing. Results kept between
+        calls are used only then."""
+        nn = torch.nn.modules.module
+        return (getattr(self, "_graph_edit", None) is None and torch._C._len_torch_function_stack() == 0
+                and not (nn._global_forward_hooks or nn._global_forward_pre_hooks)
+                and not any(m._forward_hooks or m._forward_pre_hooks for m in self.target.modules()))
+
     @torch.no_grad()
     def reference(self, ids: list[list[int]], targets: list[int]) -> torch.Tensor:
-        """log p of the model at the targets of each sequence [B, len(targets), V]."""
+        """log p of the model at the targets of each sequence [B, len(targets), V]. When the model is plain(), a call
+        repeated with the same sequences and targets returns the first call's tensor (the same numbers; callers never
+        write to it), kept up to REFERENCE_BYTES."""
+        key = (tuple(map(tuple, ids)), tuple(targets)) if self.plain() else None
+        if key is not None and key in self._refs:
+            self._refs.move_to_end(key)
+            return self._refs[key]
         logits = self.vpd.target_forward(torch.tensor(ids, device=self.dev))[:, targets]
-        return torch.log_softmax(logits.float(), -1)
+        out = torch.log_softmax(logits.float(), -1)
+        if key is not None:
+            self._refs[key] = out
+            self._refs_bytes += out.numel() * out.element_size()
+            while self._refs_bytes > self.REFERENCE_BYTES and len(self._refs) > 1:
+                old = self._refs.popitem(last=False)[1]
+                self._refs_bytes -= old.numel() * old.element_size()
+        return out
 
     def _ints(self, lists: list) -> list[torch.Tensor]:
         """Lists (or arrays) of ints -> int64 tensors on the device, sent in one transfer (slices of one buffer)."""

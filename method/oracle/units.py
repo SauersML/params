@@ -144,8 +144,9 @@ _ORDERS_MAX = 4096  # texts whose sensitive() order a model object keeps
 
 def sensitive(nat, ids: list[int], targets: list[int], k: int) -> list[int]:
     """The k positions (not the targets) whose changed token moves the prediction most, most first: carry.explain's
-    choice (Native.sensitivity under the text's seed). The order is a function of the model, its edit, the text and
-    the targets, so a model object computes it once per text (score_many, events and the RL server ask again)."""
+    choice (Native.sensitivity under the text's seed). The order is a function of the model, the text and the targets,
+    so a model object computes it once per text while the model is plain() (score_many, events and the RL server ask
+    again)."""
     import torch
 
     import native
@@ -153,15 +154,17 @@ def sensitive(nat, ids: list[int], targets: list[int], k: int) -> list[int]:
     if max(targets) < 1:
         return []
     orders = nat.__dict__.setdefault("_sensitive_orders", {})
-    key = (getattr(nat, "_graph_edit", None), tuple(ids), tuple(targets))
-    order = orders.get(key)
+    plain = getattr(nat, "plain", lambda: False)()  # kept orders hold only for the model itself (Native.plain)
+    key = (tuple(ids), tuple(targets))
+    order = orders.get(key) if plain else None
     if order is None:
         with torch.no_grad():
             moved, _ = nat.sensitivity(ids, targets, torch.Generator(device="cpu").manual_seed(native.task_seed(str(ids[:8]))))
         order = (moved.argsort(descending=True, stable=True) + 1).tolist()
-        if len(orders) >= _ORDERS_MAX:
-            orders.clear()
-        orders[key] = order
+        if plain:
+            if len(orders) >= _ORDERS_MAX:
+                orders.clear()
+            orders[key] = order
     return [p for p in order if p not in targets][:k]
 
 

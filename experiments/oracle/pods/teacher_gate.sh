@@ -58,7 +58,7 @@ ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 set +e; (python -B goal_eval.py score --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --split heldout --n $N --diagnostics --out $O/score.json > $O/score.log 2>&1) &
-for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --vpd $F/vpd.pt --offset \$k --stride ${FIDP:-2} --out $O/fid_\$k.jsonl > $O/fid_\$k.log 2>&1) & done; wait"
+for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (python -B goal_eval.py fidelity --split heldout --n $N --set a=\$HOME/gate_in/a --set b=\$HOME/gate_in/b --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --vpd $F/vpd.pt --offset \$k --stride ${FIDP:-2} --out $O/fid_\$k.jsonl > $O/fid_\$k.log 2>&1) & done; wait"
 # the score run and FIDP fidelity runs share one card: fidelity on a 264-node circuit holds ~16 GB, the score run ~8 GB
 # (two fidelity runs and the score run overflowed 24 GB; three and the score run 16 GB): a 48 GB card
 RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.60} RP_MIN_VRAM_GB=44 RP_MIN_RAM_GB=16 \

@@ -13,7 +13,8 @@ guarded scores (the lead's): s_point_c, min(graph F1, F1 with every connection a
 min under m flips (f1_flips_c), beside the raw graph F1 s_point, s_wiring, reliance_on_cuts and the raw flips flip_m;
 point N, N_real, C and C with flips, flips_to_half and flips_to_break, the smallest m at which the guarded F1 under m
 flips falls below 0.5 and below half of s_point_c, 512 when not within m <= 256; dreads_*, the response error under node
-removals, connection cuts and interchange, lower is better), overall and by locality, and each side's teacher against
+removals, connection cuts and interchange, lower is better; s_changed, kl_changed_c and context_share on the eval split's
+changed inputs, 16 per circuit; s_track when goal_eval has it), overall and by locality, and each side's teacher against
 VPD's top k at its size (fidelity's "VPD top k" rows: VPD's own ranking, every connection among its nodes)
 (heldout50_locality.jsonl).
 
@@ -140,7 +141,8 @@ def main():
             local = {json.loads(x)["task"]: json.loads(x)["local"] for x in args.labels.read_text().splitlines() if x.strip()}
         fields = ("flipc_1", "flipc_4", "flipc_16", "flipc_64", "flipc_256", "flips_to_half", "flips_to_break", "s_point_c", "n_point",
                   "n_real", "s_point", "s_wiring", "reliance_on_cuts", "flip_1", "flip_4", "dreads_edges", "dreads_nodes",
-                  "dreads_interchange", "c", "c_flips", "stranded", "nodes", "size")
+                  "dreads_interchange", "s_changed", "kl_changed_c", "context_share", "s_track", "c", "c_flips", "stranded",
+                  "nodes", "size")
         for name, keep in (("all", lambda t: True), ("non-local", lambda t: local.get(t) is False), ("local", lambda t: local.get(t) is True)):
             ts = [t for t in set(FA) & set(FB) if keep(t)]
             if ts:

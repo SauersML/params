@@ -534,11 +534,28 @@ class GoalEval:
         semantics (graph_ref: graph inside the circuit, masked outside, every other subcomponent off, remainders on
         (live) or off); a graph with no node is the empty circuit (empty_kl)."""
         out = [empty_kl] * len(graphs)
-        for i, g in enumerate(graphs):
-            if g.count():
-                out[i] = float(carry.kl(ref, self.graph_ref(ids, targets, g, live=live))[0])
+        some = [i for i, g in enumerate(graphs) if g.count()]
+        for s0 in range(0, len(some), self.chunk):
+            idx = some[s0:s0 + self.chunk]
+            E = self._circuit_engine(ids, targets, [graphs[i] for i in idx], live)
+            got = carry.kl(ref, E.graph_log_probs(E.plan([graphs[i] for i in idx], semantics="c"))).tolist()
+            for i, k in zip(idx, got):
+                out[i] = k
         native.free(self.nat.dev)
         return out
+
+    def _circuit_engine(self, ids: list[int], targets: list[int], graphs: list[native.Graph], live: bool = True, outside: str = "off",
+                        extra: dict | None = None):
+        """engine.Engine on ids over the graphs' subcomponents (and extra's {site: columns}): C's semantics run there
+        (Engine.plan(semantics="c"), tested equal to graph_ref) on those columns alone."""
+        import engine
+
+        nat, dev = self.nat, self.nat.dev
+        cols = {}
+        for n in nat.names:
+            c = torch.tensor(sorted({c for g in graphs for m, _, c in g.node_set() if m == n}), dtype=torch.long, device=dev)
+            cols[n] = c if extra is None else torch.unique(torch.cat([c, extra[n].to(dev)]))
+        return engine.Engine(nat, ids, targets, live=live, columns=cols, outside=outside)
 
     def _bounds(self, tx: Text, conv: str) -> tuple[float, float | None]:
         """(KL_empty, KL_VPD) on the text under a convention, kept on tx."""
@@ -881,19 +898,20 @@ class GoalEval:
 
     @torch.no_grad()
     def _graph_logq(self, ids: list[int], targets: list[int], graphs: list[native.Graph], ew_rows=None) -> torch.Tensor:
-        """log q at the targets of stated graphs' runs in C's semantics (graph_ref, remainders live); ew_rows: per graph
-        a 0/1 vector over its connections (graph.parents reader by reader, then graph.out), the connections at 0 cut."""
-        out = []
-        for j, g in enumerate(graphs):
-            if ew_rows is not None:
-                keep = ew_rows[j].tolist()
-                order = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
-                kept = [e for e, k in zip(order, keep) if k]
-                g = native.Graph(g.nodes, {r: [w for w, rr in kept if rr == r] for r in g.parents
-                                           if any(rr == r for _, rr in kept)}, [w for w, rr in kept if rr is None])
-            out.append(self.graph_ref(ids, targets, g)[0])
+        """log q at the targets of stated graphs' runs in C's semantics (remainders live; on the engine, equal to
+        graph_ref within float32 rounding); ew_rows: per graph a 0/1 vector over its connections (graph.parents reader
+        by reader, then graph.out), the connections at 0 cut."""
+        if not graphs:
+            return torch.zeros(0, len(targets), self.nat.target.wte.shape[0], device=self.nat.dev)
+        E = self._circuit_engine(ids, targets, graphs)
+        ew = ow = None
+        if ew_rows is not None:
+            inner = [sum(len(ws) for ws in g.parents.values()) for g in graphs]
+            ew = torch.cat([ew_rows[j][:k].float() for j, k in enumerate(inner)]).to(self.nat.dev)
+            ow = torch.cat([ew_rows[j][k:].float() for j, k in enumerate(inner)]).to(self.nat.dev)
+        out = E.graph_log_probs(E.plan(list(graphs), semantics="c"), ew=ew, ow=ow)
         native.free(self.nat.dev)
-        return torch.stack(out)
+        return out
 
     @torch.no_grad()
     def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int) -> list[dict]:
@@ -949,11 +967,9 @@ class GoalEval:
     def _edge_family(self, tx: Text, graphs: list[native.Graph], draws: int) -> list[dict]:
         """Per circuit, the connection-cut family: draw j cuts a random subset of the stated connections into one
         reader (the prediction among the readers) in the model, in VPD's answer and in the circuit, all in C's
-        semantics (graph_ref with those connections cut: the reader reads its input without those writers' outputs);
-        the mean KLs from the model's. A circuit without connections: None."""
-        nat, T = self.nat, tx.T
-        model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
-        vpd = native.Graph(masks=tx.vpd)
+        semantics (the reader reads its input without those writers' outputs); the mean KLs from the model's. A
+        circuit without connections: None. Every draw of a side runs in one batch on the engine (_sides)."""
+        sides = self._sides(tx, graphs)
         out = []
         for g in graphs:
             nodes = g.node_set()
@@ -963,19 +979,63 @@ class GoalEval:
                 out.append({"kl_edges_c": None, "kl_edges_vpd": None})
                 continue
             rng = self._rng(tx, g, "edges")
-            kc, kv = [], []
+            cuts = []
             for j in range(draws):
                 r = readers[int(rng.integers(len(readers)))]
                 ws = list(par[r]) if r is not None else list(outs)
-                cut = [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]
-                lm = self.graph_ref(tx.ids, tx.targets, model, cuts={r: cut})
-                lv = self.graph_ref(tx.ids, tx.targets, vpd, cuts={r: cut})
-                lc = self.graph_ref(tx.ids, tx.targets, g, cuts={r: cut})
-                kc.append(float(carry.kl(lm, lc)[0]))
-                kv.append(float(carry.kl(lm, lv)[0]))
-            native.free(nat.dev)
-            out.append({"kl_edges_c": float(np.mean(kc)), "kl_edges_vpd": float(np.mean(kv))})
+                cuts.append({r: [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]})
+            lm, lv, lc = sides(g, cuts=cuts)
+            out.append({"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean())})
+            native.free(self.nat.dev)
         return out
+
+    def _sides(self, tx: Text, graphs: list[native.Graph]):
+        """C's families' three sides on the engine, every draw a row: sides(g, cuts=[per draw {reader: [writers]}] or
+        patch=[per draw {node: value}]) -> log q of the model, VPD's answer and circuit g under each draw, in C's
+        semantics (graph_ref's cuts and patch): the model over the circuits' subcomponents with every other one folded
+        into the remainders (outside="on"), VPD's answer over its own and the circuits', the circuit over its own."""
+        nat, T, dev = self.nat, tx.T, self.nat.dev
+        vpd_cols = {n: tx.vpd[n].any(0).nonzero().flatten() for n in nat.names}
+        Em = self._circuit_engine(tx.ids, tx.targets, graphs, outside="on")
+        Ev = self._circuit_engine(tx.ids, tx.targets, graphs, extra=vpd_cols)
+        Ec = self._circuit_engine(tx.ids, tx.targets, graphs)
+        model = native.Graph(masks={n: torch.ones(1, 1, dtype=torch.bool, device=dev) for n in nat.names})  # complete: runs as u
+        vpd = native.Graph(masks=tx.vpd)
+        u_m = {n: torch.ones(1, 1, Em.width(n), device=dev) for n in nat.names}
+        u_v = {n: tx.vpd[n][:, Ev.columns[n]].float()[None] for n in nat.names}
+
+        def where(E):
+            return {n: {c: i for i, c in enumerate(E.columns[n].tolist())} for n in nat.names}
+
+        at = {id(E): where(E) for E in (Em, Ev, Ec)}
+
+        def patches(E, patch):  # per draw {node: value} -> {site: (bool [D, T, K], values [D, T, K])}
+            if patch is None:
+                return None
+            out = {}
+            for b, vals in enumerate(patch):
+                for (n, t, c), v in vals.items():
+                    if n not in out:
+                        out[n] = (torch.zeros(len(patch), T, E.width(n), dtype=torch.bool, device=dev),
+                                  torch.zeros(len(patch), T, E.width(n), device=dev))
+                    k = at[id(E)][n][c]
+                    out[n][0][b, t, k] = True
+                    out[n][1][b, t, k] = v
+            return out
+
+        def sides(g, cuts=None, patch=None):
+            D = len(cuts if cuts is not None else patch)
+            lm = Em.graph_log_probs(Em.plan([model] * D, semantics="c", cuts=cuts), u_m, patch=patches(Em, patch))
+            lv = Ev.graph_log_probs(Ev.plan([vpd] * D, semantics="c", cuts=cuts), u_v, patch=patches(Ev, patch))
+            u_c = None
+            if g.complete:
+                u_c = {n: torch.zeros(1, T, Ec.width(n), device=dev) for n in nat.names}
+                for n, t, c in g.node_set():
+                    u_c[n][0, t, at[id(Ec)][n][c]] = 1.0
+            lc = Ec.graph_log_probs(Ec.plan([g] * D, semantics="c", cuts=cuts), u_c, patch=patches(Ec, patch))
+            return lm, lv, lc
+
+        return sides
 
     @torch.no_grad()
     def _interchange_family(self, tx: Text, graphs: list[native.Graph], draws: int = 16, ranks=(0, 1, 2)) -> list[dict]:
@@ -997,8 +1057,7 @@ class GoalEval:
                 source[(p, z)] = rec
             return source[(p, z)]
 
-        model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names})
-        vpd = native.Graph(masks=tx.vpd)
+        sides = self._sides(tx, graphs)
         out = []
         for g in graphs:
             nodes = sorted(g.node_set())
@@ -1007,21 +1066,16 @@ class GoalEval:
                 out.append({"kl_interchange_c": None, "kl_interchange_vpd": None})
                 continue
             rng = self._rng(tx, g, "interchange")
-            kc, kv = [], []
+            patch = []
             for j in range(draws):
                 p = positions[int(rng.integers(len(positions)))]
                 alts = carry.alternatives(nat, tx.ids, p, ranks)
                 z = alts[int(rng.integers(len(alts)))][p]
                 rec = source_record(p, z)
-                at_p = [nd for nd in nodes if nd[1] == p]
-                values = {nd: rec[nd[0]][0, nd[1], nd[2]] for nd in at_p}
-                lm = self.graph_ref(tx.ids, tx.targets, model, patch=values)
-                lv = self.graph_ref(tx.ids, tx.targets, vpd, patch=values)
-                lc = self.graph_ref(tx.ids, tx.targets, g, patch=values)
-                kc.append(float(carry.kl(lm, lc)[0]))
-                kv.append(float(carry.kl(lm, lv)[0]))
+                patch.append({nd: rec[nd[0]][0, nd[1], nd[2]] for nd in nodes if nd[1] == p})
+            lm, lv, lc = sides(g, patch=patch)
             native.free(dev)
-            out.append({"kl_interchange_c": float(np.mean(kc)), "kl_interchange_vpd": float(np.mean(kv))})
+            out.append({"kl_interchange_c": float(carry.kl(lm, lc).mean()), "kl_interchange_vpd": float(carry.kl(lm, lv).mean())})
         return out
 
 

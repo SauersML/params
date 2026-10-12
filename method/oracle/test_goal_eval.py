@@ -879,6 +879,48 @@ def test_graph_ref_is_graph_inside_masked_outside(tiny):
     assert abs(fd - float(gr[i][0, t, c])) < 2e-2 * abs(fd) + 1e-5, (fd, float(gr[i][0, t, c]))
 
 
+def test_families_on_the_engine_are_graph_ref(tiny):
+    """The connection-cut and interchange families and graph F1, run on the engine (C's semantics there, every draw a
+    row), equal graph_ref draw by draw for a stated and a complete circuit."""
+    import numpy as np
+
+    nat, ge, tx = tiny
+    T = tx.T
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets)), native.Graph(nodes[1::4], complete=True)]
+    graphs[0] = native.Graph(graphs[0].nodes, {r: ws[::2] for r, ws in graphs[0].parents.items()}, graphs[0].out)
+    model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+    vpd = native.Graph(masks=tx.vpd)
+    draws = 4
+    got = ge._edge_family(tx, graphs, draws)
+    for g, row in zip(graphs, got):
+        par, outs = (native.all_edges(g.node_set(), tx.targets) if g.complete else (g.parents, g.out))
+        readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
+        rng = ge._rng(tx, g, "edges")
+        kc, kv = [], []
+        for j in range(draws):
+            r = readers[int(rng.integers(len(readers)))]
+            ws = list(par[r]) if r is not None else list(outs)
+            cut = [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]
+            lm = ge.graph_ref(tx.ids, tx.targets, model, cuts={r: cut})
+            kc.append(float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, g, cuts={r: cut}))[0]))
+            kv.append(float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, vpd, cuts={r: cut}))[0]))
+        for key, want in (("kl_edges_c", float(np.mean(kc))), ("kl_edges_vpd", float(np.mean(kv)))):
+            assert abs(row[key] - want) < 1e-6 + 1e-4 * abs(want), (key, row[key], want)
+    vals = [{nd: torch.tensor(0.5 + 0.1 * j, device=nat.dev) for nd in graphs[0].node_set() if nd[1] == p}
+            for j, p in enumerate(sorted({t for _, t, _ in graphs[0].node_set()})[:3])]
+    for g in graphs:
+        lm, lv, lc = ge._sides(tx, graphs)(g, patch=vals)
+        for b, v in enumerate(vals):
+            want = [ge.graph_ref(tx.ids, tx.targets, x, patch=v)[0] for x in (model, vpd, g)]
+            for x, y in zip((lm[b], lv[b], lc[b]), want):
+                assert float(carry.kl(y[None], x[None])[0]) < 1e-6
+    stated = [g for g in graphs if not g.complete]
+    for k, g in zip(ge._graph_kl(tx.ids, tx.targets, tx.ref, stated, True, 0.0), stated):
+        want = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, g, live=True))[0])
+        assert abs(k - want) < 1e-6 + 1e-4 * abs(want)
+
+
 def test_interchange_family(tiny):
     """Interchange: VPD's answer as the circuit agrees with VPD's own run draw by draw; a stated circuit with every
     connection and some activations fixed (graph_ref) is the independent forward with them fixed."""

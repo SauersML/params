@@ -6,7 +6,8 @@
 # with the causal-importance network, in two pieces put back together on the pod, and its subcomponents) are published
 # inputs; C's pattern pool goes up with the
 # rows (components.POOL). The scorer runs until the cap.
-#   experiments/oracle/pods/scorer_pod.sh ROWS.jsonl HOURS   (env: RUN, GPU, PRICE, VRAM, WORKERS, RP_OWNER, VARIABLES=1: E4)
+#   experiments/oracle/pods/scorer_pod.sh ROWS.jsonl HOURS   (env: RUN, GPU, PRICE, VRAM, WORKERS, RP_OWNER, VARIABLES=1: E4,
+#                                                            SRCREV: the source revision, default origin/main)
 # Two scoring processes need a 48 GB card (the default): on 24 GB a long text ran out of memory (RL v1, 10-12).
 #   bash experiments/oracle/pods/scorer_tunnel.sh $RUN   the tunnel (then --scorer http://127.0.0.1:8767/score)
 cd /Users/user/params
@@ -16,7 +17,8 @@ N=oracle-graph-scorer-$RUN
 O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/primerl/src_scorer_$RUN
 IN=/Users/user/mpd-data/scratch/primerl/in_scorer_$RUN
-git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive origin/main method/oracle method/vpd | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 origin/main)" > "$S/SOURCE"
+REV=${SRCREV:-origin/main}  # a resumed RL run keeps its reward's revision
+git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive "$REV" method/oracle method/vpd | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # rp-run uploads every existing path the command names: only the archives exist here
 rm -rf "$IN" "$IN.tar" && mkdir -p "$IN" && cp "$ROWS" "$IN/rows.jsonl"
 COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" rows.jsonl -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt && rm -rf "$IN"

@@ -8,6 +8,7 @@ default) and the key from TINKER_API_KEY (read from the Keychain at launch, neve
                      [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5] [--reader] [--save-every 25]
                      [--first-step K]   (resume from the state saved at step K)
   tinker_train.py sample QUESTIONS.jsonl OUT.jsonl [--init STATE_PATH] [--n 50] [--samples 4]    answers to evaluate
+  tinker_train.py score SFT.jsonl OUT.jsonl [--init STATE_PATH]   each completion's held-out log-probability (no update)
   tinker_train.py readers SAMPLES.jsonl QUESTIONS.jsonl OUT.jsonl [--reader-b MODEL]   E1 and its controls (components.py
                                                                                       evaluate --e1)
   tinker_train.py explain FACTS.jsonl ROWS.jsonl OUT.jsonl [--n 8] [--reader-b MODEL]   teacher English: an open model's best
@@ -365,6 +366,32 @@ def sft(a) -> None:
     print(json.dumps({"saved": saved.path, "total_usd": spend.total}), flush=True)
 
 
+def score(a) -> None:
+    """Held-out log-probabilities of SFT rows' completions under a state (--init) or the base alone, a forward pass
+    each (no update): {"index", "info", "tokens", "logprob", "mean"} per row, the completion's summed and mean log-prob
+    (nats) over its trained tokens (the rows' format and template as sft trains them)."""
+    from tinker_cookbook import renderers
+    from tinker_cookbook.supervised.data import conversation_to_datum
+
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    spend = Spend(a.out.parent, a.base)
+    tinker, _, training, renderer, _ = clients(a.base, a.rank, a.init, a.thinking)
+    rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
+    with a.out.open("w") as f:
+        for s0 in range(0, len(rows), a.batch):
+            part = rows[s0:s0 + a.batch]
+            data = [conversation_to_datum(r["prompt"] + r["completion"], renderer, a.max_length, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
+                    for r in part]
+            out = training.forward(data, loss_fn="cross_entropy").result()
+            spend.add("score", prefill=sum(d.model_input.length for d in data))
+            for k, (r, d, o) in enumerate(zip(part, data, out.loss_fn_outputs)):
+                m = d.loss_fn_inputs["weights"].to_torch() > 0  # the trained tokens (the weights are normalized to sum 1)
+                lp = o["logprobs"].to_torch()[m].sum().item()
+                f.write(json.dumps({"index": s0 + k, "info": r.get("info"), "tokens": int(m.sum().item()), "logprob": lp,
+                                    "mean": lp / max(int(m.sum().item()), 1)}) + "\n")
+    print(json.dumps({"rows": len(rows), "total_usd": spend.total}), flush=True)
+
+
 def rl(a) -> None:
     import torch
     from tinker.types.tensor_data import TensorData
@@ -512,6 +539,15 @@ def main():
     r.add_argument("--first-step", type=int, default=0, help="resume: the step --init's state was saved at (its checkpoint "
                                                                 "line kept; the run appends to the same --log)")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
+    c = sub.add_parser("score", help="held-out log-probabilities of SFT rows' completions (no update)")
+    c.add_argument("rows", type=Path)
+    c.add_argument("out", type=Path)
+    c.add_argument("--init", help="a tinker:// state path; without, the base model alone")
+    c.add_argument("--base", default="Qwen/Qwen3-8B")
+    c.add_argument("--rank", type=int, default=32)
+    c.add_argument("--batch", type=int, default=8)
+    c.add_argument("--max-length", type=int, default=32768)
+    c.add_argument("--thinking", action="store_true")
     m = sub.add_parser("sample")
     m.add_argument("questions", type=Path)
     m.add_argument("out", type=Path)
@@ -541,7 +577,7 @@ def main():
     x.add_argument("--max-tokens", type=int, default=400)
     x.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     a = ap.parse_args()
-    {"sft": sft, "rl": rl, "sample": sample, "readers": readers, "explain": explain}[a.cmd](a)
+    {"sft": sft, "rl": rl, "sample": sample, "readers": readers, "explain": explain, "score": score}[a.cmd](a)
 
 
 if __name__ == "__main__":

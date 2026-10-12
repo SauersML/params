@@ -84,7 +84,7 @@ GROUP_RE = re.compile(r"(?:L(\d+)\.(q|k|v|o|fc|down)#(\d+(?:,\d+)*)|tok)@(\d+)")
 _G = r"(?:L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)@\d+"
 TOK = "tok"  # the token embedding at a position, an input node: JSON [TOK, 0, position], text tok@<position>
 WRITERS_RE = re.compile(rf"\s*{_G}(?:\s*,\s*{_G})*\s*")
-BLOCK_RE = re.compile(r"@(\d+)\s+((?:(?:[a-z]+=)?(?:L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)\s*)+)")
+BLOCK_RE = re.compile(r"@(\d+)\s+(\S.*)")  # a position block: "@322" and its items, each parsed alone (ITEM_RE)
 ITEM_RE = re.compile(r"(?:([a-z]+)=)?(L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)")
 _W = rf"(?:{_G}|[a-z]+)"
 ID_RE = re.compile(r"[a-z]+")
@@ -169,8 +169,8 @@ def _sections(text: str) -> dict:
 def parse(text: str) -> dict:
     """An answer's parts: "explanation", "answer" (goal_eval's circuit JSON: nodes [matrix, index, position], edges
     [upstream, downstream | "out"]), "malformed" (circuit lines that do not parse), "circuit" (whether a CIRCUIT
-    section exists), "malformed_nodes" (what those lines name, at least one each, and every undefined id, each charged as
-    a node outside the graph), "unknown_ids", "finals" (question number -> (falls, the top token as written)) and
+    section exists), "malformed_nodes" (what those lines name, at least one each, every item of a position block that
+    does not parse, and every undefined id, each charged as a node outside the graph), "unknown_ids", "finals" (question number -> (falls, the top token as written)) and
     "edits" (edit question number -> operations: {"op": "cut", "writer", "reader" ("out": the prediction)} or {"op":
     "scale", "node", "k"}, each with "persistent" (a weight edit everywhere: nodes without a position, None), or
     {"op": "invalid"} for one that names no node). A circuit line's reader may be
@@ -191,20 +191,20 @@ def parse(text: str) -> dict:
         block = BLOCK_RE.fullmatch(line)
         if not block:
             continue
-        bad = False  # "@322 a=L2.v#902 b=L3.o#5" (or ids left out: "@322 L2.v#902,1514 L3.o#5")
+        bad = 0  # "@322 a=L2.v#902 b=L3.o#5" (or ids left out: "@322 L2.v#902,1514 L3.o#5")
         for item in block[2].split():
             m = ITEM_RE.fullmatch(item)
-            group = group_of(f"{m[2]}@{block[1]}") or []
-            if m[1] and (len(group) != 1 or m[1] in ("out", "tok") or ids.get(m[1], group[0]) != group[0]):
-                bad = True  # an id names one node, once
-                continue
+            group = (group_of(f"{m[2]}@{block[1]}") or []) if m else []
+            if not group or (m[1] and (len(group) != 1 or m[1] in ("out", "tok") or ids.get(m[1], group[0]) != group[0])):
+                bad += 1  # an item that does not parse, or an id naming more than one node or a second one: dropped,
+                continue  # charged as a node outside the graph; the block's other items stay
             for nd in group:
                 index(nd)
             if m[1]:
                 ids[m[1]] = group[0]
         if bad:
             malformed += 1
-            junk += 1
+            junk += bad
     unknown = 0
     for line in lines:
         if BLOCK_RE.fullmatch(line):

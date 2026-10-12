@@ -70,6 +70,9 @@ def test_short_ids():
     undefined = components.parse("CIRCUIT:\n@9 a=L1.down#5 b=L1.fc#1\nOUT <- a,zz\na <- b\nyy <- b\n")
     assert undefined["unknown_ids"] == 2 and undefined["malformed"] == 0  # charged as nodes outside the graph
     assert len(undefined["answer"]["edges"]) == 2  # the defined edges stay
+    items = components.parse("CIRCUIT:\n@9 a=L1.down#5 b=L3.d#66 c=L0.q#2 avs d=L1.k#3@9\nOUT <- a,c\n")
+    assert len(items["answer"]["nodes"]) == 2 and len(items["answer"]["edges"]) == 2  # a bad item drops alone
+    assert items["malformed"] == 1 and items["malformed_nodes"] == 3  # the line counted once, each bad item charged
 
 
 def test_edits():

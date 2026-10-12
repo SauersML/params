@@ -1379,7 +1379,8 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want) -
         if e1 and name in e1:
             ctl = [e1[name][q["task"]] for q in qs if q["task"] in e1[name]]
             report[name]["E1 controls"] = {k: sum(c[k] for c in ctl if c.get(k) is not None) / max(sum(c.get(k) is not None for c in ctl), 1)
-                                           for k in ("shuffled", "reader_b")} | {"own (first sample)": sum(c["own"][0] for c in ctl) / max(len(ctl), 1),
+                                           for k in ("shuffled", "reader_b")} | {"own (first sample)": sum(c["own"][0] for c in ctl if c["own"][0] is not None)
+                                                                                 / max(sum(c["own"][0] is not None for c in ctl), 1),
                                                                                  "none": 0.0}
         st = [q["structure"] for q in qs if q.get("structure")]
         if st:

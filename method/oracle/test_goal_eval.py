@@ -1071,6 +1071,25 @@ def test_pattern_or_gradient():
     assert torch.allclose(want, got) and torch.allclose(a.grad, b.grad, atol=1e-6)
 
 
+def test_flips_report_float32_rescores(tiny, monkeypatch):
+    """With the search in bf16 (steps and shortlist screens), the flips' reported KLs are float32 runs of the reported
+    masks: graph_ref (C's semantics, float32) with those parts switched on gives the same KL."""
+    nat, ge, tx = tiny
+    monkeypatch.setattr(goal_eval, "_search", lambda dev: "bf16")
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets)), native.Graph(nodes[1::4], complete=True)]
+    rows = ge.adversary_flips(tx, graphs, tiny_pool(nat, tx.ids), "omitted", ms=(1, 4), steps=3, restarts=2)
+    for g, row in zip(graphs, rows):
+        for m, mask in row["mask_flips_omitted"].items():
+            u = {n: torch.zeros(1, tx.T, nat.C[n], device=nat.dev) for n in nat.names}
+            for n, t, c in mask:
+                u[n][0, t, c] = 1.0
+            gc = native.Graph(masks=ge.masks(g, tx.T)) if g.complete else g
+            want = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, gc, u=u))[0])
+            got = row["kl_flips_omitted"][m][0]
+            assert abs(got - want) < 1e-5 + 1e-4 * abs(want), (m, got, want)
+
+
 def test_interchange_family(tiny):
     """Interchange: VPD's answer as the circuit agrees with VPD's own run draw by draw; a stated circuit with every
     connection and some activations fixed (graph_ref) is the independent forward with them fixed."""

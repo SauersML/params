@@ -276,6 +276,12 @@ class _PatternOr(torch.autograd.Function):
         return (g[:, None, :] * P[None] * before * after).sum(-1), None
 
 
+def _search(dev) -> str:
+    """The adversaries' search precision on a device: bf16 on CUDA (sign steps and shortlist screens: what is tried),
+    float32 elsewhere; every reported number is a float32 run."""
+    return "bf16" if str(dev).startswith("cuda") else "score"
+
+
 def _drop_nodes(g: native.Graph, drop: set) -> native.Graph:
     """A stated graph without some nodes and every connection to or from them."""
     nodes = [nd for nd in g.nodes if nd not in drop]
@@ -1022,7 +1028,8 @@ class GoalEval:
         the real model makes the circuit's removal matter least, KL(model - F || model - F - C) minimized by
         sign-gradient steps of ADV_STEP projected onto the m largest (one start at the gradient's top m), the top m
         removed and scored in float32, beside the m best of a measured shortlist (SCREEN parts with the largest gradient
-        either way, each removal measured alone), the best of them, at most m (no worse than a smaller budget or none);
+        either way, each removal measured alone, in the search precision: the screens only rank which parts are
+        tried), the best of them, at most m (no worse than a smaller budget or none);
         per circuit n_real_flips {m: necessity on N_real's scale, clip(ln(KL / KL_VPD)
         / ln(KL_empty / KL_VPD), 0, 1)} and mask_n_real_flips {m: [(site, t, c)]}. A circuit needed only to cancel
         the parts F becomes unnecessary once they are gone."""
@@ -1032,7 +1039,7 @@ class GoalEval:
         ms = FLIPS["omitted"] if ms is None else ms
         e0, v0 = self._bounds(tx, "live")
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63) + 1)
-        search = "bf16" if str(dev).startswith("cuda") else "score"  # the sign steps' precision (scores: float32)
+        search = _search(dev)  # the sign steps' and screens' precision (every reported number: float32)
         cols = {n: torch.unique(torch.cat([tx.vpd[n].any(0).nonzero().flatten()] + [torch.tensor(
             [c for m, _, c in g.node_set() if m == n], dtype=torch.long, device=dev) for g in graphs])) for n in nat.names}
         E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on")
@@ -1115,7 +1122,7 @@ class GoalEval:
                 one.append((i, r))
             ks = {}
             for run in chunks(one, SCREEN_ROWS * 4):
-                for (i, _), k in zip(run, kl(run)):
+                for (i, _), k in zip(run, kl(run, search)):
                     ks[i] = k
             screened = {i: short[i][ks[i].argsort()].tolist() for i in live}
         starts = {(i, m): torch.rand(restarts, N[i], generator=gen).to(dev) for i in range(len(graphs)) for m in ms if 0 < N[i] and m <= N[i]}
@@ -1530,7 +1537,7 @@ class GoalEval:
         e0 = self._bounds(tx, "live")[0]
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True)
-        search = "bf16" if str(dev).startswith("cuda") else "score"  # the sign steps' precision (scores: float32)
+        search = _search(dev)  # the sign steps' and screens' precision (every reported number: float32)
         starts, out = [], []
         for kls, idx, _ in problems:  # each circuit's draws in turn, from the text's generator
             wr = (torch.rand(draws, len(pick), generator=gen) < ADV_RANDOM_ON).float().to(dev)
@@ -1593,7 +1600,8 @@ class GoalEval:
         Search: sign-gradient steps of ADV_STEP on the relaxed lever, each projected onto its m largest entries, from
         restarts starts (one the gradient's top m at nothing switched on, the others random), then the top m
         switched on and scored in float32, beside the m best of a measured shortlist (SCREEN parts with the largest
-        gradient either way, each switched on alone); the worst of them, at most m (no weaker than a smaller budget). Per circuit {f"f1_flips_{lever}": {m: f1_adv},
+        gradient either way, each switched on alone, in the search precision: the screens only rank which parts are
+        tried; every reported number is a float32 run); the worst of them, at most m (no weaker than a smaller budget). Per circuit {f"f1_flips_{lever}": {m: f1_adv},
         f"kl_flips_{lever}": {m: (KL_C, KL_VPD)}, f"mask_flips_{lever}": {m: the parts switched on, (site, position,
         subcomponent) or pool index}}. upto: only the budgets up to it are searched, every budget's starts still
         drawn (the same numbers as the full search at those budgets)."""
@@ -1603,7 +1611,7 @@ class GoalEval:
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         omitted = lever == "omitted"  # the patterns stay off: VPD's paired run is VPD's answer alone, run once
         pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True, patterns=not omitted)
-        search = "bf16" if str(dev).startswith("cuda") else "score"  # the sign steps' precision (scores: float32)
+        search = _search(dev)  # the sign steps' and screens' precision (every reported number: float32)
         sizes = [[len(idx[n][0]) for n in nat.names] for _, idx, _ in problems]
         N = [sum(z) if omitted else len(pick) for z in sizes]
 
@@ -1648,7 +1656,7 @@ class GoalEval:
                 run.append((i, rows))
                 k += len(rows)
                 if j == len(parts) - 1 or k + len(parts[j + 1][1]) > FLIP_ROWS:
-                    for (i_, _), (kc, kv) in zip(run, batch(items(run), vpd=not omitted)):
+                    for (i_, _), (kc, kv) in zip(run, batch(items(run), search, vpd=not omitted)):
                         kv = kv0.expand_as(kc) if kv is None else kv
                         gaps.setdefault(i_, []).append(kc.log() - kv.log())
                     run, k = [], 0

@@ -1178,4 +1178,38 @@ def test_wiring_is_the_node_sets_masked_run(tiny):
     rows = ge.fidelity(tx, [half, native.Graph(sub, complete=True)], None, draws=2)
     want = ge.sufficiency(tx, [native.Graph(sub, complete=True)])[0]["f1_live"]
     assert abs(rows[0]["s_wiring"] - want) < 1e-9 and abs(rows[1]["s_wiring"] - rows[1]["s_point"]) < 1e-9
-    assert rows[0]["c_wiring"] is not None
+    for r in rows:
+        assert r["s_point_c"] == min(r["s_point"], r["s_wiring"]) and abs(r["reliance_on_cuts"] - (r["s_point"] - r["s_wiring"])) < 1e-12
+
+
+def test_c_takes_the_lower_of_graph_and_every_connection(tiny):
+    """A circuit whose stated graph scores above its every-connection run gets the lower score in C, unattacked and
+    under the same flips; the flips' every-connection scores are the masked runs of the nodes and the switched-on
+    omissions."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::2]
+    par, out = native.all_edges(sub, tx.targets)
+    pairs = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in out]
+    gen = torch.Generator().manual_seed(4)
+    found = None
+    for _ in range(40):  # a stated subset of the connections whose graph run beats the every-connection run
+        keep = [p for p in pairs if float(torch.rand(1, generator=gen)) < 0.5]
+        g = native.Graph(sub, {r: [w for w, rr in keep if rr == r] for _, r in keep if r is not None}, [w for w, r in keep if r is None])
+        a, b = ge.sufficiency(tx, [g, native.Graph(sub, complete=True)])
+        if a["f1_live"] > b["f1_live"] + 1e-3:
+            found = g
+            break
+    assert found is not None
+    pool = tiny_pool(nat, tx.ids)
+    row = ge.fidelity(tx, [found], pool, draws=2, steps=2, restarts=2)[0]
+    assert row["s_point"] > row["s_wiring"] and row["s_point_c"] == row["s_wiring"] and row["reliance_on_cuts"] > 0
+    e0 = ge._bounds(tx, "live")[0]
+    for m, f in row["f1_flips_wiring"].items():
+        on = mask_of(nat, tx.T, sub)
+        for n, t, c in row["mask_flips_omitted"][m]:
+            on[n][t, c] = True
+        kc = float(carry.kl(tx.ref, ge.runs(tx.ids, tx.targets, [on], True))[0])
+        assert abs(f - goal_eval._fid(e0, kc, row["kl_flips_omitted"][m][1])) < 1e-6
+        assert row["f1_flips_c"][m] == min(row["f1_flips_omitted"][m], f)
+    terms = [row["s_point_c"], row["s_nodes"], row["s_edges"], row["f1_flips_c"][goal_eval.FLIP_TERM]]
+    assert abs(row["c"] - sum(terms) / 4) < 1e-12

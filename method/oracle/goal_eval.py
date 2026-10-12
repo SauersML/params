@@ -950,13 +950,14 @@ class GoalEval:
         model under the intervention || X under it): "point" (no intervention: F1), "wiring" (s_wiring: every connection
         among the circuit's nodes restored, the masked run of its node set: an unstated connection claims not to matter,
         so restoring them all should keep F1; a circuit that raises its graph F1 by leaving a harmful part's real
-        connections unstated loses here; c_wiring, c with it), "nodes" (draw j removes each
+        connections unstated loses here: C's point member is min(graph F1, s_wiring), s_point_c, and its flips member
+        the same min under the same flips, f1_flips_c; reliance_on_cuts = s_point - s_wiring), "nodes" (draw j removes each
         circuit node with probability (j + 0.5) / draws), "edges" (draw j cuts each stated connection into one reader
         drawn uniformly, the prediction among them, with that probability, at least one, in the model, VPD's answer
         and the circuit alike, graph_ref), "adversary" (the paired
         adversary over the pool, adversary(): f1_adv at the budget, beside the random members' mean) and its budget in
         parts switched on (adversary_flips, the omitted lever: f1_flips_omitted by m); c, the mean of s_point, s_nodes,
-        s_edges and f1_flips_omitted at FLIP_TERM (the reward's adversarial member, the lead's decision 10-12; the
+        s_edges and f1_flips_c at FLIP_TERM, with s_point_c for s_point (the reward's adversarial member, the lead's decision 10-12; the
         step-budget f1_adv is a reported column); flips_to_break, the smallest m at which f1_flips_omitted falls below
         half of s_point (None: not within FLIPS); flips_to_half, the smallest m at which it falls below 0.5, half of
         VPD's own answer under the same attack (0: below it unattacked), which a circuit weak to begin with cannot pass. reads: C's second observable, the circuit nodes' relative RMS read
@@ -1002,18 +1003,24 @@ class GoalEval:
                 row["leak"] = lk["f1_live"]
             row["s_nodes"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
             row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
-            fc = row.get("f1_flips_omitted", {})
-            terms = [row[k] for k in ("s_point", "s_nodes", "s_edges") if row.get(k) is not None]
+            # a stated graph claims its unstated connections do not matter: C takes the lower of its graph run and the
+            # run with every connection among its nodes restored, unattacked and under the same flips
+            row["reliance_on_cuts"] = (row["s_point"] - row["s_wiring"]) if None not in (row["s_point"], row["s_wiring"]) else None
+            row["s_point_c"] = min(x for x in (row["s_point"], row["s_wiring"]) if x is not None) if row["s_point"] is not None else None
+            fg = row.get("f1_flips_omitted", {})
+            fw = self._flips_wiring(tx, g, fl, e0) if (i in wired and fg) else {}
+            row["f1_flips_wiring"] = fw
+            fc = {m: (min(v, fw[m]) if (m in fw and v is not None and fw[m] is not None) else v) for m, v in fg.items()}
+            row["f1_flips_c"] = fc
+            terms = [row[k] for k in ("s_point_c", "s_nodes", "s_edges") if row.get(k) is not None]
             terms += [fc[FLIP_TERM]] if fc.get(FLIP_TERM) is not None else []
             row["c"] = sum(terms) / len(terms) if terms else None
-            wt = terms + ([row["s_wiring"]] if row["s_wiring"] is not None else [])
-            row["c_wiring"] = sum(wt) / len(wt) if wt else None
             if not reward:  # (the reward's flips stop at FLIP_TERM)
-                half = 0.5 * row["s_point"] if row["s_point"] is not None else None
+                half = 0.5 * row["s_point_c"] if row["s_point_c"] is not None else None
                 broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
                 row["flips_to_break"] = broke[0] if broke else None  # None: not within the budgets (more than max(FLIPS))
                 below = [m for m in sorted(fc) if fc[m] is not None and fc[m] < 0.5]  # an absolute bar: half of VPD's own
-                row["flips_to_half"] = 0 if (row["s_point"] is not None and row["s_point"] < 0.5) else (below[0] if below else None)
+                row["flips_to_half"] = 0 if (row["s_point_c"] is not None and row["s_point_c"] < 0.5) else (below[0] if below else None)
             if fr:
                 row["f1_flips_patterns_fresh"] = fr["f1_flips_patterns"]
             if it:
@@ -1030,6 +1037,26 @@ class GoalEval:
                 row.pop(f"_pairs_{fam}", None)
             out.append(row)
         return out
+
+    @torch.no_grad()
+    def _flips_wiring(self, tx: Text, g: native.Graph, fl: dict, e0: float) -> dict:
+        """The flips' masks scored on a stated circuit's node set with every connection among its nodes restored (its
+        masked run with the switched-on omissions), against VPD's paired KL: {m: f1}."""
+        nat, T = self.nat, tx.T
+        masks, ms = [], []
+        for m, parts in fl.get("mask_flips_omitted", {}).items():
+            base = self.masks(native.Graph(sorted(g.node_set()), complete=True), T)
+            on = {n: x.clone() for n, x in base.items()}
+            for n, t, c in parts:
+                on[n][t, c] = True
+            masks.append(on)
+            ms.append(m)
+        if not masks:
+            return {}
+        kc = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, masks, True)).tolist()
+        kv = {m: fl["kl_flips_omitted"][m][1] for m in ms}
+        return {m: _fid(e0, k, kv[m]) for m, k in zip(ms, kc)}
+
 
     def necessity_flips(self, tx: Text, graphs: list[native.Graph], ms=None, steps: int = ADV_STEPS,
                         restarts: int = ADV_RESTARTS) -> list[dict]:
@@ -2155,7 +2182,7 @@ def fidelity_table(rows: list[dict]) -> str:
         f = r.get("flips_to_half")
         return -1.0 if f == 0 else (math.log2(f) if f else (math.log2(2 * max(flips)) if flips else None))
 
-    held = [("log2 flips-to-0.5 (none: -1)", halves), ("log2 flips-to-break", breaks)] + [(f"flip{m}", lambda r, m=m: _curve_value(r.get("f1_flips_omitted"), m)) for m in flips]
+    held = [("log2 flips-to-0.5 (none: -1)", halves), ("log2 flips-to-break", breaks)] + [(f"flip{m}", lambda r, m=m: _curve_value(r.get("f1_flips_c") or r.get("f1_flips_omitted"), m)) for m in flips]
     held += [("nodes fam", lambda r: r.get("s_nodes")), ("edges fam", lambda r: r.get("s_edges")),
              ("interchange", lambda r: r.get("s_interchange"))]
     held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
@@ -2167,6 +2194,7 @@ def fidelity_table(rows: list[dict]) -> str:
     held += [("leak (no edges)", lambda r: r.get("leak"))]
     stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
     sample = [("F1", lambda r: r["s_point"]), ("F1 every connection", lambda r: r.get("s_wiring")),
+              ("reliance on cuts", lambda r: r.get("reliance_on_cuts")),
               ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
     return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),
                           block("The step adversary (VPD's published budget, steps)", stepcols),

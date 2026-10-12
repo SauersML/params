@@ -47,6 +47,11 @@ PRICES = {"Qwen/Qwen3-8B": (0.195, 0.60, 0.44), "Qwen/Qwen3.5-4B": (0.33, 1.005,
           "deepseek-ai/DeepSeek-V4.1-Flash:peft:262144": (0.60, 3.60, 4.98),
           "thinkingmachines/Inkling": (1.87, 4.68, 5.61)}  # Inkling at its limited-time 50% discount
 RENDERERS = {"deepseek-ai/DeepSeek-V4.1-Flash:peft:262144": "deepseekv3_disable_thinking"}  # bases the cookbook does not list
+# E1's readers (reader validation, 10-12: on 16 train texts a correct, a wrong and another text's explanation ranked in
+# that order by Qwen3.5-397B on 15 texts, Kimi-K2.6 13, Qwen3-8B 12; DeepSeek-V4.1-Flash read the model worse than
+# chance unaided): the reward's and the writer's selection, the independent check (another family, never used for
+# either), and the 8B as a control column.
+REWARD_READER, INDEPENDENT_READER, CONTROL_READER = "Qwen/Qwen3.5-397B-A17B", "moonshotai/Kimi-K2.6", "Qwen/Qwen3-8B"
 CACHED = 0.2  # a cached prefill token's share of the price
 RENDERER = "qwen3_disable_thinking"
 NAMES = re.compile(r"L\d+\.(?:q|k|v|o|fc|down)#\d+")  # a subcomponent's name in English
@@ -165,9 +170,9 @@ def sample(a) -> None:
 
 def readers(a) -> None:
     """E1 of every sample with reader A (the reward's), and the evaluation's controls on each question's first sample:
-    another question's English read on this text (shuffled; each question takes the next one's first sample) and
-    reader B (an independent model, never the one trained against). {"task", "own": [bits per sample], "shuffled",
-    "reader_b"} per question."""
+    another question's English read on this text (shuffled; each question takes the next one's first sample), reader B
+    (an independent model, never the one trained against) and the control reader. {"task", "own": [bits per sample],
+    "shuffled", "reader_b", "control"} per question."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import components
 
@@ -177,6 +182,7 @@ def readers(a) -> None:
     reader_a = tinker_reader(service, a.reader_a, ra, ta, Spend(a.out.parent, a.reader_a))
     spend_b = Spend(a.out.parent, a.reader_b) if a.reader_b else None
     reader_b = tinker_reader(service, a.reader_b, *renderer_for(a.reader_b), spend_b) if a.reader_b else None
+    control = tinker_reader(service, a.control, *renderer_for(a.control), Spend(a.out.parent, a.control)) if a.control else None
     samples = components.samples_of(a.samples)
     rows = {r["task"]: r for r in map(json.loads, a.questions.read_text().splitlines()) if r["task"] in samples}
     order = [t for t in sorted(samples) if t in rows]
@@ -187,7 +193,8 @@ def readers(a) -> None:
             shuffled = "EXPLANATION: " + components.english(samples[order[(i + 1) % len(order)]][0][0])
             f.write(json.dumps({"task": t, "own": components.e1_bits(reader_a, task, rows[t], texts),
                                 "shuffled": components.e1_bits(reader_a, task, rows[t], [shuffled])[0] if len(order) > 1 else None,
-                                "reader_b": components.e1_bits(reader_b, task, rows[t], texts[:1])[0] if reader_b else None}) + "\n")
+                                "reader_b": components.e1_bits(reader_b, task, rows[t], texts[:1])[0] if reader_b else None,
+                                "control": components.e1_bits(control, task, rows[t], texts[:1])[0] if control else None}) + "\n")
             f.flush()
     print(json.dumps({"questions": len(order), "spend_usd": spend_b.total if spend_b else None}), flush=True)
 
@@ -329,7 +336,8 @@ def rl(a) -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import components
 
-    frozen = tinker_reader(service, a.base, renderer, tokenizer, spend) if a.reader else None
+    rspend = Spend(a.log, a.reader_model) if a.reader else None  # the reader's tokens, priced at its own rates
+    frozen = tinker_reader(service, a.reader_model, *renderer_for(a.reader_model), rspend) if a.reader else None
     tasks = {}
     rng = random.Random(a.seed)
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=renderer.get_stop_sequences())
@@ -345,7 +353,7 @@ def rl(a) -> None:
     def checkpoint(step: int) -> None:
         path = training.save_state(f"{a.name}-rl-{step}").result().path
         with (a.log / "checkpoints.jsonl").open("a") as f:
-            f.write(json.dumps({"step": step, "state": path, "usd": spend.total, "base": a.base}) + "\n")
+            f.write(json.dumps({"step": step, "state": path, "usd": spend.total + (rspend.total if rspend else 0.0), "base": a.base}) + "\n")
 
     checkpoint(0)
     sampler = training.save_weights_and_get_sampling_client()
@@ -406,7 +414,7 @@ def rl(a) -> None:
         line = json.dumps({"step": step, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
                            "distinct": [g["distinct"] for g in groups],
                            "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],
-                           "score_seconds": sum(g["score_seconds"] for g in groups), "total_usd": spend.total,
+                           "score_seconds": sum(g["score_seconds"] for g in groups), "total_usd": spend.total + (rspend.total if rspend else 0.0),
                            "seconds": time.time() - t0})
         print(line, flush=True)
         with (a.log / "steps.jsonl").open("a") as f:
@@ -442,7 +450,8 @@ def main():
     r.add_argument("--group", type=int, default=4)
     r.add_argument("--max-tokens", type=int, default=4096)
     r.add_argument("--lr", type=float, default=4e-5)
-    r.add_argument("--reader", action="store_true", help="E1 from a frozen base-model sampling client on Tinker")
+    r.add_argument("--reader", action="store_true", help="E1 from a frozen reader on Tinker (--reader-model)")
+    r.add_argument("--reader-model", default=REWARD_READER, help="the reward's E1 reader")
     r.add_argument("--save-every", type=int, default=25, help="steps between saved states (checkpoints.jsonl)")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     m = sub.add_parser("sample")
@@ -457,8 +466,9 @@ def main():
     e.add_argument("samples", type=Path)
     e.add_argument("questions", type=Path)
     e.add_argument("out", type=Path)
-    e.add_argument("--reader-a", default="Qwen/Qwen3-8B", help="the reward's reader")
-    e.add_argument("--reader-b", help="an independent reader for the decisive check (a model in PRICES)")
+    e.add_argument("--reader-a", default=REWARD_READER, help="the reward's reader")
+    e.add_argument("--reader-b", default=INDEPENDENT_READER, help="an independent reader for the decisive check (a model in PRICES)")
+    e.add_argument("--control", default=CONTROL_READER, help="a control reader's column ('' for none)")
     e.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     x = sub.add_parser("explain")
     x.add_argument("facts", type=Path, help="components.py facts output")
@@ -466,8 +476,8 @@ def main():
     x.add_argument("out", type=Path)
     x.add_argument("--n", type=int, default=8, help="explanations sampled per text")
     x.add_argument("--writer", default="Qwen/Qwen3-8B")
-    x.add_argument("--reader-a", default="Qwen/Qwen3-8B")
-    x.add_argument("--reader-b", help="an independent reader for the control (a model in PRICES)")
+    x.add_argument("--reader-a", default=REWARD_READER, help="the reward's reader: selects the best of N")
+    x.add_argument("--reader-b", default=INDEPENDENT_READER, help="the independent reader: the headline (a model in PRICES)")
     x.add_argument("--max-tokens", type=int, default=400)
     x.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     a = ap.parse_args()

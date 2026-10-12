@@ -2151,3 +2151,140 @@ def test_path_patched_batches(monkeypatch):
         monkeypatch.setattr(engine, "PP_ENTRIES", 1)
         many = E.path_patched(graphs, prompts)
     assert float((one - many).abs().max()) < 1e-5
+
+
+def _pp_holds(ge, tx, nat, nodes, p, z):
+    """interchange_pp's held values: nodes at p at their values in the real model on the text with z at p (a
+    subcomponent its activation, a block its site's whole output)."""
+    x2 = list(tx.ids)
+    x2[p] = z
+    r2 = ge._pp_record(x2)
+    return {(n, t, c): (r2["a"][n][t] @ nat.target.site(n).U + r2["rem"][n][t] if c == goal_eval.BLOCK else r2["a"][n][t, c])
+            for n, t, c in nodes if t == p}
+
+
+def test_path_patched_held():
+    """Held prompts ({node: value}, interchange_pp's) equal pp_run(fixed=) on random stated graphs and complete graphs
+    (the whole model as blocks, a node set with blocks) of a model with large remainders, values from changed texts
+    at one position (subcomponents and blocks; a stated graph holds its own nodes, a complete graph every held one),
+    in one call with token changes: log q within 1e-4."""
+    nat, ge, tx, E, nodes, prompts = _pp_case(near=None)
+    g = torch.Generator().manual_seed(9)
+    graphs = [_pp_stated(_pp_nodes(nodes, g, f), tx.targets, g) for f in (0.4, 0.9)]
+    whole = [native.Graph([(n, t, goal_eval.BLOCK) for n in nat.names for t in range(tx.T)], complete=True),
+             native.Graph(_pp_nodes(nodes, g, 0.5), complete=True)]
+    every = sorted(set().union(*(gr.node_set() for gr in graphs + whole[1:])))
+    held = [_pp_holds(ge, tx, nat, every, p, z) for p, z in prompts[:3]]
+    mixed = prompts[:2] + held
+    with torch.no_grad():
+        got = E.path_patched(graphs + whole, mixed)
+        moved = 0
+        for b, gr in enumerate(graphs + whole):
+            for d, pr in enumerate(mixed):
+                x2 = list(tx.ids)
+                if isinstance(pr, tuple):
+                    x2[pr[0]] = pr[1]
+                want = ge.pp_run(tx, x2, gr, fixed=pr if isinstance(pr, dict) else None)[0]
+                assert float((got[b, d] - want).abs().max()) < 1e-4, (b, d, float((got[b, d] - want).abs().max()))
+                moved += float((want - tx.ref[0]).abs().max()) > 1e-3
+    assert moved >= len(mixed) * (len(graphs) + len(whole)) // 2
+
+
+def _pp_loop_check(ge, tx, rows, graphs, key, held=False):
+    """Each draw of rows[b][key] ([[p, z], KL_C, KL_V, W]) against pp_run one graph and prompt at a time (the loop the
+    engine call replaced): track_pp's on the changed text, or interchange_pp's held set in the model, the circuit and
+    VPD's answer on the text; within 1e-4 relative."""
+    nat = ge.nat
+    vpd = native.Graph(masks=tx.vpd)
+    model = native.Graph([(n, t, goal_eval.BLOCK) for n in nat.names for t in range(tx.T)], complete=True)
+    close = lambda a, b: abs(a - b) <= 1e-4 * (1 + abs(b))  # noqa: E731
+    n = 0
+    for g, r in zip(graphs, rows):
+        for (p, z), kc, kv, w in r[key]:
+            if held:
+                h = _pp_holds(ge, tx, nat, sorted(g.node_set()), p, z)
+                m = ge.pp_run(tx, tx.ids, model, fixed=h)
+                want = (float(carry.kl(m, ge.pp_run(tx, tx.ids, g, fixed=h))[0]), float(carry.kl(m, ge.pp_run(tx, tx.ids, vpd, fixed=h))[0]),
+                        float(carry.kl(m, tx.ref)[0]))
+            else:
+                x2 = list(tx.ids)
+                x2[p] = z
+                ref = nat.reference([x2], tx.targets)
+                want = (float(carry.kl(ref, ge.pp_run(tx, x2, g))[0]), float(carry.kl(ref, ge.pp_run(tx, x2, vpd))[0]),
+                        float(carry.kl(ref, tx.ref)[0]))
+            assert all(close(a, b) for a, b in zip((kc, kv, w), want)), ((p, z), (kc, kv, w), want)
+            n += 1
+    return n
+
+
+def test_pp_terms_equal_pp_run_loop(tiny):
+    """track_pp, changed_edges(mode="pp") and interchange_pp (one engine.Engine.path_patched call per text, per
+    connection descent's subsets, per circuit) give the per-prompt pp_run loop's KL_C, KL_V and W on every draw, on a
+    stated circuit (blocks, token edges, pairs) and a node set from VPD's answer; changed_edges' subsets score as
+    track_pp on the subset graphs."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    g = torch.Generator().manual_seed(11)
+    stated = _pp_stated(_pp_nodes(every, g, 0.6, blocks=0.03), tx.targets, g, keep=0.8)
+    graphs = [stated, native.Graph(_pp_nodes(every, g, 0.5, blocks=0.03), complete=True)]
+    st = [goal_eval.strand(x, tx.targets, nat.C) for x in graphs]
+    assert _pp_loop_check(ge, tx, ge.track_pp(tx, graphs, "search", 6), st, "draws_track_pp") >= 4
+    assert _pp_loop_check(ge, tx, ge.interchange_pp(tx, graphs, "search", 4), st, "draws_interchange_pp", held=True) >= 4
+    base = st[0]
+    edges = [(w, r) for r, ws in base.parents.items() for w in ws] + [(w, None) for w in base.out]
+    ons = torch.ones(3, len(edges))
+    ons[1, ::3] = 0
+    ons[2, 1::2] = 0
+    rows = ge.changed_edges(tx, base, ons, "search", 6, mode="pp")
+    _, subs = ge._edge_subsets(tx, base, ons)
+    if subs is None:
+        subs = []
+        for row in ons.tolist():
+            kept = [e for e, k in zip(edges, row) if k]
+            par = {}
+            for w, r in kept:
+                if r is not None:
+                    par.setdefault(r, []).append(w)
+            s = native.Graph(base.nodes, par, [w for w, r in kept if r is None])
+            s.tok_edges, s.tok_out, s.pairs = base.tok_edges, getattr(base, "tok_out", []), getattr(base, "pairs", {})
+            subs.append(s)
+    for a, b in zip(rows, ge.track_pp(tx, subs, "search", 6)):
+        assert len(a["draws_track_pp"]) == len(b["draws_track_pp"]) > 0
+        for x, y in zip(a["draws_track_pp"], b["draws_track_pp"]):
+            assert x[0] == y[0] and abs(x[1] - y[1]) <= 1e-4 * (1 + abs(y[1]))
+
+
+def test_connection_effects_edges(tiny):
+    """connection_effects(edges=) gives those connections' rows of the full call."""
+    _, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    gr = native.Graph(every, *native.all_edges(every, tx.targets))
+    full = ge.connection_effects(tx, gr)
+    pick = [(r["writer"], r["reader"]) for r in full[1::4]]
+    got = ge.connection_effects(tx, gr, edges=pick)
+    assert [(r["writer"], r["reader"]) for r in got] == pick
+    want = {(r["writer"], r["reader"]): r for r in full}
+    for r in got:
+        for k in ("direct", "norm", "full"):
+            assert abs(r[k] - want[(r["writer"], r["reader"])][k]) < 1e-5
+
+
+def test_pp_terms_equal_pp_run_loop_vpd4l(real):
+    """The same on vpd4l text9000: track_pp on the stated graph with every connection and token edge among VPD's
+    answer's nodes at the last 8 positions and the node set of its last 24, interchange_pp on the stated graph,
+    against the per-prompt pp_run loop."""
+    import json
+
+    nat, ge = real
+    p = native.TEXTS / "vpd4l" / "text9000.json"
+    ids, targets = native.text(p)
+    tx = ge.text(ids, targets, native.task_seed("text9000"), json.loads(p.read_text()))
+    vpd = sorted(native.Graph(masks=tx.vpd).node_set())
+    late = [nd for nd in vpd if nd[1] >= tx.T - 8]
+    stated = native.Graph(late, *native.all_edges(late, targets))
+    stated.tok_edges = [(nd[1], nd) for nd in late if native._name_layer_kind(nd[0])[1] in mech.RESID_READERS]
+    stated.tok_out = list(targets)
+    graphs = [stated, native.Graph([nd for nd in vpd if nd[1] >= tx.T - 24], complete=True)]
+    st = [goal_eval.strand(x, targets, nat.C) for x in graphs]
+    assert _pp_loop_check(ge, tx, ge.track_pp(tx, graphs, "search", 16), st, "draws_track_pp") >= 2
+    assert _pp_loop_check(ge, tx, ge.interchange_pp(tx, graphs[:1], "search", 4), st[:1], "draws_interchange_pp", held=True) >= 2

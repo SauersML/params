@@ -482,8 +482,8 @@ class Engine:
     @torch.no_grad()
     def path_patched(self, graphs: list, prompts: list, strengths: torch.Tensor | None = None, cuts: list | None = None) -> torch.Tensor:
         """log q at the targets [len(graphs), len(prompts), targets, V] of each graph's path-patched run on the engine's
-        text x with prompts[d] = (position p, token z) changed (s_track_pp, the lead's spec 10-12; goal_eval.pp_run, one
-        graph and prompt at a time, the reference). x is the real model's run on x (_x_run); in the patched run P the
+        text x with prompts[d] = (position p, token z) changed, or {node: value} held (s_track_pp's and interchange_pp's,
+        the lead's spec 10-12; goal_eval.pp_run, one graph and prompt at a time, the reference). x is the real model's run on x (_x_run); in the patched run P the
         change travels only along stated paths. A circuit node reads its stated parents' outputs from P and everything
         else from x (unstated writers, in the circuit or not, the remainders and the embeddings; the token at p only
         through a stated token edge (graph.tok_edges (p, node)) into a node at p), its norm on that combined input. A
@@ -495,7 +495,9 @@ class Engine:
         (every subcomponent and the remainder; the graph's subcomponent nodes there dropped). Outside the circuit
         everything is x's; the prediction reads P's stated writers into it and x's every other, and at a target t the
         changed token's embedding when t is in graph.tok_out. With nothing stated P is x; a stated parent's value is
-        P's, never the model's on x'. A complete graph states every connection the model has among its nodes, every
+        P's, never the model's on x'. A held node (a prompt {node: value}, on x itself: a subcomponent's activation or a
+        block's whole output) takes its value in P whatever its inputs, its stated readers reading it; in a complete
+        graph that activation or site output is set whether or not the node is the graph's. A complete graph states every connection the model has among its nodes, every
         token edge (into its residual readers and the prediction) and every pair (_pp_dense); cuts, per complete graph
         {(layer, t): [source positions]}: its attention outputs at (layer, t) read those sources' values at x. strengths
         [K, E + O]: graphs[0]'s connection subsets (goal_eval.changed_edges' ons: its parents' connections then its
@@ -517,25 +519,57 @@ class Engine:
                 out[i] = lq
         return torch.stack(out)
 
+    def _pp_pos(self, pr) -> int:
+        """A prompt's earliest change: a changed token's position, or a held set's earliest node."""
+        if isinstance(pr, dict):
+            return min((nd[1] for nd in pr), default=self.T - 1)
+        return pr[0]
+
     def _pp_chunks(self, prompts: list, cost) -> list:
         """Prompt indices in batches, the latest change first, each batch's prompts times cost(its earliest change) at
         most PP_ENTRIES."""
-        order = sorted(range(len(prompts)), key=lambda d: -prompts[d][0])
+        order = sorted(range(len(prompts)), key=lambda d: -self._pp_pos(prompts[d]))
         out, cur = [], []
         for d in order:
-            if cur and (len(cur) + 1) * cost(prompts[d][0]) > PP_ENTRIES:
+            if cur and (len(cur) + 1) * cost(self._pp_pos(prompts[d])) > PP_ENTRIES:
                 out.append(cur)
                 cur = []
             cur.append(d)
         return out + [cur] if cur else out
 
     def _pp_token(self, part: list, G: int) -> tuple:
-        """(each row's change position [D G], its embedding change [D G, d]): rows prompt-major, graph-minor."""
+        """(each row's changed token's position [D G] (-1: a held set's row), its embedding change [D G, d]): rows
+        prompt-major, graph-minor."""
         dev, wte = self.dev, self.tg.wte
-        p = torch.tensor([p for p, _ in part], device=dev).repeat_interleave(G)
-        z = torch.tensor([z for _, z in part], device=dev).repeat_interleave(G)
-        x0 = torch.tensor([self.ids[p] for p, _ in part], device=dev).repeat_interleave(G)
-        return p, wte[z] - wte[x0]
+        tokens = [(-1, 0, 0) if isinstance(pr, dict) else (pr[0], pr[1], self.ids[pr[0]]) for pr in part]
+        p, z, x0 = (torch.tensor(c, device=dev).repeat_interleave(G) for c in zip(*tokens))
+        return p, (wte[z] - wte[x0]) * (p >= 0)[:, None]
+
+    def _pp_held(self, part: list, G: int, key) -> dict:
+        """Per site the held nodes of the batch's prompts: (subcomponents, blocks), each None or (rows [n G], positions
+        [n G], key(node) [n G], values [n G] or [n G, d_out]) over the rows of every graph; key(node) None: not one of
+        the run's."""
+        dev, out = self.dev, {}
+        for d, pr in enumerate(part):
+            if isinstance(pr, dict):
+                for nd, val in pr.items():
+                    k = key(nd)
+                    if k is not None:
+                        out.setdefault(nd[0], ([], []))[nd[2] < 0].append((d, nd[1], k, val))
+        g = torch.arange(G, device=dev)
+        res = {}
+        for n, both in out.items():
+            res[n] = []
+            for lst in both:
+                if not lst:
+                    res[n].append(None)
+                    continue
+                d, t, k, v = zip(*lst)
+                rows = (torch.tensor(d, device=dev)[:, None] * G + g).flatten()
+                t, k = (torch.tensor(x, device=dev).repeat_interleave(G) for x in (t, k))
+                v = torch.stack([torch.as_tensor(x, device=dev, dtype=torch.float32) for x in v]).repeat_interleave(G, 0)
+                res[n].append((rows, t, k, v))
+        return res
 
     def _pp_predict(self, z: torch.Tensor) -> torch.Tensor:
         return torch.log_softmax(self.rms(z, self.tg.ln_f, self.eps) @ self.tg.wte.T, -1)
@@ -545,7 +579,7 @@ class Engine:
         each site's circuit columns (and blocks) recomputed on x's input plus the change at the rows whose input
         changed; the graphs' nodes, blocks and cuts kept from the prompts' earliest change on (s0)."""
         tg, T, H, dev, xr = self.tg, self.T, self.H, self.dev, self._x_run()
-        G, names, s0 = len(graphs), self.nat.names, min(p for p, _ in prompts)
+        G, names, s0 = len(graphs), self.nat.names, min(self._pp_pos(pr) for pr in prompts)
         parts, blocks = {}, {}
         sid = {n: j for j, n in enumerate(names)}
         CM = max(self.nat.C.values()) + 1  # a node packed as (site T + position) CM + column + 1 (a block's column -1)
@@ -586,7 +620,9 @@ class Engine:
                 if bm is not None:  # a block holds its site's subcomponents there
                     m &= ~bm[..., None]
                 V, U = st.V[:, cols], st.U[cols]
-            sites[n] = (m, V, U, bm, st.W)
+                cp = torch.full((st.V.shape[1],), -1, dtype=torch.long, device=dev)
+                cp[cols] = torch.arange(len(cols), device=dev)
+            sites[n] = (m, V, U, bm, st.W, None if m is None else cp)
         cm = {}  # per layer [G, T - s0, T]: the value reads (query position from s0, source) at x
         for gi, cg in enumerate(cuts or []):
             for (layer, t), srcs in (cg or {}).items():
@@ -601,25 +637,52 @@ class Engine:
 
     def _pp_dense_run(self, sites: dict, cm: dict, G: int, part: list, xr: dict, s0: int) -> torch.Tensor:
         tg, T, H, hd, dev = self.tg, self.T, self.H, self.hd, self.dev
-        s = min(p for p, _ in part)
+        s = min(self._pp_pos(pr) for pr in part)
         Tn, D = T - s, len(part)
-        B, ar = D * G, torch.arange(D * G, device=dev)
+        B = D * G
         p, dtok = self._pp_token(part, G)
+        tb = (p >= 0).nonzero().flatten()  # the rows with a changed token
         tok = torch.zeros(B, Tn, tg.wte.shape[1], device=dev)
-        tok[ar, p - s] = dtok
+        tok[tb, p[tb] - s] = dtok[tb]
         chg = torch.zeros(B, Tn, dtype=torch.bool, device=dev)  # whether a residual reader's input changed
-        chg[ar, p - s] = True
+        chg[tb, p[tb] - s] = True
         dS = torch.zeros_like(tok)  # the circuit's residual writers' change
         late = torch.arange(s, T, device=dev)[:, None] < torch.arange(T, device=dev)[None, :]  # keys after the query
+        held = self._pp_held(part, G, lambda nd: nd[2] if nd[1] >= s else None)
 
-        def delta(n, hP, hx, rows):  # site n's circuit output change [B, Tn, d_out], zero off rows (inputs changed)
-            m, V, U, bm, W = sites[n]
-            out = None
-            if m is not None:
-                out = ((hP @ V - hx @ V) * (m[:, s - s0:].repeat(D, 1, 1) & rows[..., None])) @ U
-            if bm is not None:  # blocks: the whole output's change
-                ob = ((hP - hx) @ W.T) * (bm[:, s - s0:].repeat(D, 1) & rows)[..., None]
-                out = ob if out is None else out + ob
+        def delta(n, hP, hx, rows):  # site n's output change [B, Tn, d_out] (zero off rows, inputs changed), held set
+            st, hs = sites.get(n), held.get(n)
+            if st is None and hs is None:
+                return None
+            site, out, da = tg.site(n), None, None
+            if st is not None:
+                m, V, U, bm, W, cp = st
+                if m is not None:
+                    da = (hP @ V - hx @ V) * (m[:, s - s0:].repeat(D, 1, 1) & rows[..., None])
+                    out = da @ U
+                if bm is not None:  # blocks: the whole output's change
+                    bmr = bm[:, s - s0:].repeat(D, 1) & rows
+                    ob = ((hP - hx) @ W.T) * bmr[..., None]
+                    out = ob if out is None else out + ob
+            if hs is None:
+                return out
+            if out is None:
+                out = torch.zeros(B, Tn, site.W.shape[0], device=dev)
+            sub, blk = hs
+            if sub is not None:  # a held activation: its write at the held value in place of the computed one
+                rb, tt, c, v = sub
+                tt = tt - s
+                Vc = site.V[:, c].T
+                now = (hx[tt] * Vc).sum(-1)  # x's
+                if st is not None and da is not None:
+                    ci = cp[c]
+                    now = now + torch.where(ci >= 0, da[rb, tt, ci.clamp(min=0)], 0.0)
+                if st is not None and bm is not None:
+                    now = now + bmr[rb, tt] * ((hP[rb, tt] - hx[tt]) * Vc).sum(-1)
+                out = out.index_put((rb, tt), (v - now)[:, None] * site.U[c], accumulate=True)
+            if blk is not None:  # a held block: the site's whole output there
+                rb, tt, _, v = blk
+                out = out.index_put((rb, tt - s), v - xr["so"][n][tt])
             return out
 
         def heads(z):
@@ -627,7 +690,7 @@ class Engine:
         for i in range(tg.n_layer):
             nm = lambda kd, i=i: native.site_name(i, kd)  # noqa: E731
             hP = self.rms(xr["xa"][i][s:] + dS + tok, tg.norms[2 * i], self.eps)
-            dq, dk, dv = (delta(nm(kd), hP, xr["ha"][i][s:], chg) if nm(kd) in sites else None for kd in ("q_proj", "k_proj", "v_proj"))
+            dq, dk, dv = (delta(nm(kd), hP, xr["ha"][i][s:], chg) for kd in ("q_proj", "k_proj", "v_proj"))
             q, k, v = (xr[x][i].expand(B, -1, -1, -1) for x in ("q", "k", "v"))
             q = q[:, :, s:]
             moved = torch.zeros(B, Tn, dtype=torch.bool, device=dev)  # a query, or a key or value at or before, changed
@@ -642,19 +705,25 @@ class Engine:
                 v = torch.cat([v[:, :, :s], v[:, :, s:] + heads(dv)], 2)
                 kv |= (dv != 0).any(-1)
             moved |= kv.int().cummax(1).values.bool()
-            if nm("o_proj") in sites and bool(moved.any()):
-                A = (q @ k.transpose(-1, -2) / math.sqrt(hd)).masked_fill(late, float("-inf")).softmax(-1)
-                yh = A @ v
-                if i in cm and dv is not None:  # cut value reads: those sources' values at x
-                    dvh = torch.cat([torch.zeros(B, H, s, hd, device=dev), heads(dv)], 2)
-                    yh = yh - (A * cm[i][:, s - s0:].repeat(D, 1, 1)[:, None]) @ dvh
-                do = delta(nm("o_proj"), yh.transpose(1, 2).reshape(B, Tn, -1), xr["y"][i][s:], moved)
+            live = nm("o_proj") in sites and bool(moved.any())
+            if live or nm("o_proj") in held:
+                y = xr["y"][i][s:].expand(B, -1, -1)
+                if live:
+                    A = (q @ k.transpose(-1, -2) / math.sqrt(hd)).masked_fill(late, float("-inf")).softmax(-1)
+                    yh = A @ v
+                    if i in cm and dv is not None:  # cut value reads: those sources' values at x
+                        dvh = torch.cat([torch.zeros(B, H, s, hd, device=dev), heads(dv)], 2)
+                        yh = yh - (A * cm[i][:, s - s0:].repeat(D, 1, 1)[:, None]) @ dvh
+                    y = yh.transpose(1, 2).reshape(B, Tn, -1)
+                do = delta(nm("o_proj"), y, xr["y"][i][s:], moved)
                 dS = dS + do
                 chg |= (do != 0).any(-1)
-            if nm("c_fc") in sites and nm("down_proj") in sites:
+            if nm("down_proj") in sites or nm("down_proj") in held:
                 hP = self.rms(xr["xm"][i][s:] + dS + tok, tg.norms[2 * i + 1], self.eps)
                 dp = delta(nm("c_fc"), hP, xr["hm"][i][s:], chg)
-                dd = delta(nm("down_proj"), self.gelu(xr["pre"][i][s:] + dp), xr["g"][i][s:], (dp != 0).any(-1))
+                pre = xr["pre"][i][s:] + (0.0 if dp is None else dp)
+                rows = torch.zeros(B, Tn, dtype=torch.bool, device=dev) if dp is None else (dp != 0).any(-1)
+                dd = delta(nm("down_proj"), self.gelu(pre.expand(B, -1, -1)), xr["g"][i][s:], rows)
                 dS = dS + dd
                 chg |= (dd != 0).any(-1)
         z = xr["final"][self._targets].expand(B, -1, -1).clone()
@@ -785,7 +854,7 @@ class Engine:
             ent = torch.tensor([[(L, t) in e for t in ts] for e in entries], dtype=torch.bool, device=dev)
             rows = [(tj[r[0]],) + r[1:] for r in prs.get(L, []) if r[0] in tj]
             reads[L] = (torch.tensor(ts, device=dev), ent, lt(rows) if rows else None)
-        return {"G": G, "N": N, "member": member.to(dev), "on": onm, "sites": sites, "ax": ax, "Ures": Ures, "names": names,
+        return {"G": G, "N": N, "at": at, "member": member.to(dev), "on": onm, "sites": sites, "ax": ax, "Ures": Ures, "names": names,
                 "reads": reads, "outs": lt(outs) if outs else None, "touts": lt(touts) if touts else None,
                 "slot": torch.tensor(slot, device=dev)}
 
@@ -812,6 +881,27 @@ class Engine:
         bv = {}  # per site with blocks [B, blocks, d_out]: P's whole output minus x's
         member, on = un["member"][gb], un["on"][gb]
         half = hd // 2
+        held = self._pp_held(part, G, lambda nd: un["at"].get(nd))
+
+        def hold(n):  # site n's held nodes at their values (in each graph that has them)
+            if n not in held:
+                return
+            st = sites[n]
+            sub, blk = held[n]
+            if sub is not None:
+                rb, _, i_, v = sub
+                keep = member[rb, i_]
+                dlt[rb[keep], i_[keep]] = v[keep] - ax[i_[keep]]
+            if blk is not None:
+                rb, _, i_, v = blk
+                keep = member[rb, i_]
+                rb, i_, v = rb[keep], i_[keep], v[keep]
+                bs = st["bslot"][un["slot"][i_]]
+                ch = v - st["xo"][bs]
+                if n not in bv:
+                    bv[n] = torch.zeros(B, st["nb"], st["W"].shape[0], device=dev)
+                bv[n][rb, bs] = ch
+                dlt[rb, i_] = (ch != 0).any(-1).float()
 
         def rows_of(st, hits):  # (rows b, slot) of the site's members hit, and the [B, R] row lookup
             hit = torch.zeros(B, len(st["i"]), dtype=torch.bool, device=dev)
@@ -1021,9 +1111,13 @@ class Engine:
         for i in range(tg.n_layer):
             for kd in ("q_proj", "k_proj", "v_proj"):
                 read(native.site_name(i, kd), xr["xa"][i], tg.norms[2 * i])
+                hold(native.site_name(i, kd))
             attend(i)
+            hold(native.site_name(i, "o_proj"))
             read(native.site_name(i, "c_fc"), xr["xm"][i], tg.norms[2 * i + 1])
+            hold(native.site_name(i, "c_fc"))
             read(native.site_name(i, "down_proj"), xr["pre"][i], None)
+            hold(native.site_name(i, "down_proj"))
         nt = len(self.targets)
         z = xr["final"][self._targets].expand(B, -1, -1).reshape(B * nt, -1).clone()
         if un["outs"] is not None:  # the stated writers into the prediction

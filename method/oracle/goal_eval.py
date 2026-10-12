@@ -1373,9 +1373,18 @@ class GoalEval:
                 f[j] = f[j] + demb[t]
         return torch.log_softmax(vpd_model.rms(f, tg.ln_f, tg.eps) @ tg.wte.T.float(), -1)[None]
 
+    def _pp_engine(self, tx: Text):
+        """The text's engine for path-patched runs (engine.Engine.path_patched: pp_run's numbers for many graphs and
+        prompts at once), kept on tx with its real-model run."""
+        import engine
+
+        if tx.__dict__.get("_pp_engine") is None:
+            tx.__dict__["_pp_engine"] = engine.Engine(self.nat, tx.ids, tx.targets, live=True)
+        return tx.__dict__["_pp_engine"]
+
     @torch.no_grad()
     def track_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = CHANGED_DRAWS,
-                 cuts: list | None = None, engine_run: bool = True) -> list[dict]:
+                 cuts: list | None = None, engine_run: bool = True, strengths: torch.Tensor | None = None) -> list[dict]:
         """s_track_pp (the lead's 10-12, beside s_track): on changed_inputs' changed texts x' (split), the path-patched
         run of each circuit (pp_run) against the model on x', against VPD's whole answer's path-patched run (a
         complete graph: 1 by construction), bounded by no change: per prompt clip(ln(W / KL_C) / ln(W / KL_V), 0, 1)
@@ -1384,9 +1393,8 @@ class GoalEval:
         prompts_track_pp and draws_track_pp ([prompt, KL_C, KL_V, W] each). cuts: per graph pp_run's cuts (None: none).
         The circuits run at once on engine.Engine.path_patched (monitorbench's 072dc07, an engine kept on the text;
         engine_run False, or a stated graph with cuts: pp_run one graph and prompt at a time); each prompt's model run,
-        W and VPD's KL are kept on the text."""
-        import engine
-
+        W and VPD's KL are kept on the text. strengths [K, E + O]: the circuits are graphs[0]'s connection subsets
+        (changed_edges' ons), in one call."""
         nat = self.nat
         graphs = [strand(g, tx.targets, nat.C) for g in graphs]
         moved = np.asarray(tx.moved, dtype=float)
@@ -1394,13 +1402,15 @@ class GoalEval:
         got = self._interchange_draws(tx, positions, split, draws, first={p: -moved[p - 1] for p in positions}) \
             if positions and tx.vpd is not None else []
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
-        acc = [[0.0, 0.0, 0.0, 0, [], 0.0] for _ in graphs]  # sum w s, sum w, sum w KL_C, prompts, draws, sum w s_raw
         lqs = None
-        if got and graphs and engine_run and all(g.masks is None for g in graphs) and \
+        if strengths is not None:
+            graphs = graphs[:1] * len(strengths)
+            if got:
+                lqs = self._pp_engine(tx).path_patched(graphs[:1], [tuple(pz) for pz in got], strengths=strengths)
+        elif got and graphs and engine_run and all(g.masks is None for g in graphs) and \
                 (cuts is None or all(not c or g.complete for c, g in zip(cuts, graphs))):
-            if "_pp_engine" not in tx.__dict__:
-                tx.__dict__["_pp_engine"] = engine.Engine(nat, tx.ids, tx.targets, live=True)
-            lqs = tx.__dict__["_pp_engine"].path_patched(graphs, [tuple(pz) for pz in got], cuts=cuts)  # [G, D, targets, V]
+            lqs = self._pp_engine(tx).path_patched(graphs, [tuple(pz) for pz in got], cuts=cuts)  # [G, D, targets, V]
+        acc = [[0.0, 0.0, 0.0, 0, [], 0.0] for _ in graphs]  # sum w s, sum w, sum w KL_C, prompts, draws, sum w s_raw
         kept = tx.__dict__.setdefault("_pp_prompts", {})    # (p, z) -> (the model on x', W, VPD's KL)
         for d, (p, z) in enumerate(got):
             x2 = list(tx.ids)
@@ -1432,7 +1442,8 @@ class GoalEval:
         same nodes held (every site a block, complete: the model's own response) and VPD's whole answer's run with them
         held, bounded by no change: per draw clip(ln(W / KL_C) / ln(W / KL_V), 0, 1), W = KL(model held || model), none
         where VPD's run is no nearer than W, pooled weighted by W. Per circuit s_interchange_pp (and _raw, the pool
-        without the floor at 0), prompts_interchange_pp, draws_interchange_pp ([[p, z], KL_C, KL_V, W] each)."""
+        without the floor at 0), prompts_interchange_pp, draws_interchange_pp ([[p, z], KL_C, KL_V, W] each). Per
+        circuit one engine.Engine.path_patched call: its draws' held sets in the model, the circuit and VPD's answer."""
         nat, T = self.nat, tx.T
         graphs = [strand(g, tx.targets, nat.C) for g in graphs]
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
@@ -1443,7 +1454,9 @@ class GoalEval:
             nodes = sorted(g.node_set())
             positions = sorted({t for _, t, _ in nodes if t > 0})
             a = [0.0, 0.0, 0, [], 0.0]
-            for p, z in (self._interchange_draws(tx, positions, split, draws) if positions and vpd is not None else []):
+            got = self._interchange_draws(tx, positions, split, draws) if positions and vpd is not None else []
+            helds = []
+            for p, z in got:
                 if (p, z) not in recs:
                     x2 = list(tx.ids)
                     x2[p] = z
@@ -1454,10 +1467,13 @@ class GoalEval:
                     if t == p:
                         site_ = nat.target.site(n)
                         held[(n, t, c)] = r2["a"][n][t] @ site_.U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c]
-                m = self.pp_run(tx, tx.ids, model, fixed=held)
+                helds.append(held)
+            lq = self._pp_engine(tx).path_patched([model, g, vpd], helds) if helds else None  # pp_run(fixed=)'s numbers
+            for d, (p, z) in enumerate(got):
+                m = lq[0, d][None]
                 w = float(carry.kl(m, tx.ref)[0])
-                kc = float(carry.kl(m, self.pp_run(tx, tx.ids, g, fixed=held))[0])
-                kv = float(carry.kl(m, self.pp_run(tx, tx.ids, vpd, fixed=held))[0])
+                kc = float(carry.kl(m, lq[1, d][None])[0])
+                kv = float(carry.kl(m, lq[2, d][None])[0])
                 a[3].append([[p, z], kc, kv, w])
                 sb = _fid(w, kc, kv)
                 if sb is not None:
@@ -3167,23 +3183,26 @@ class GoalEval:
                                     strengths=ons.to(self.nat.dev, torch.float32), **kw)
 
     @torch.no_grad()
-    def connection_effects(self, tx: Text, graph: native.Graph, rows: int = 48) -> list[dict]:
+    def connection_effects(self, tx: Text, graph: native.Graph, rows: int = 48, edges: list | None = None) -> list[dict]:
         """Per stated connection of a graph (stranded nodes dropped, as fidelity scores it), writer A to reader B (None:
         the prediction), the change in target KL (bits) of its run in C's semantics against the graph as stated when A's
         contribution leaves B's read but stays in B's RMSNorm scale ("direct"), leaves the scale but stays in the read
         ("norm"), and leaves both ("full", the connection cut): engine.Engine's ew/ewn and ow/own. "normed": B reads
         through a norm (a query, key, value or MLP input, or the prediction); an attention or MLP output reads none, so
         its "norm" is 0 and "direct" its cut. An explanation's claim that a connection reads or rescales is tested by the
-        two partial cuts (the lead's decision 10-12): they need not add up to the cut."""
+        two partial cuts (the lead's decision 10-12): they need not add up to the cut. edges: those connections alone
+        ((writer, reader or None), in the graph's order; None: every one)."""
         nat, dev = self.nat, self.nat.dev
         g = _c_graph(graph, tx.targets, nat.C)
-        edges = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
-        if not edges:
+        every = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
+        want = None if edges is None else set(edges)
+        ks = [k for k, e in enumerate(every) if want is None or e in want]
+        if not ks:
             return []
         E = self._circuit_engine(tx.ids, tx.targets, [g])
         plan = E.plan(g, semantics="c")
         Ein, O = plan["E"], plan["O"]
-        cases = [None] + [(k, d, n) for k in range(len(edges)) for d, n in ((0.0, 1.0), (1.0, 0.0), (0.0, 0.0))]
+        cases = [None] + [(k, d, n) for k in ks for d, n in ((0.0, 1.0), (1.0, 0.0), (0.0, 0.0))]
         kl = []
         for s0 in range(0, len(cases), rows):
             part = cases[s0:s0 + rows]
@@ -3198,10 +3217,11 @@ class GoalEval:
             kl += carry.kl(tx.ref, E.graph_log_probs(plan, None, ew, ow, ewn=ewn, own=own)).tolist()
             native.free(dev)
         out = []
-        for k, (w, r) in enumerate(edges):
+        for j, k in enumerate(ks):
+            w, r = every[k]
             kind = None if r is None else native._name_layer_kind(r[0])[1]
             out.append({"writer": w, "reader": r, "normed": r is None or kind in ("q_proj", "k_proj", "v_proj", "c_fc"),
-                        **{name: kl[1 + 3 * k + i] - kl[0] for i, name in enumerate(("direct", "norm", "full"))}})
+                        **{name: kl[1 + 3 * j + i] - kl[0] for i, name in enumerate(("direct", "norm", "full"))}})
         return out
 
     def _edge_subsets(self, tx: Text, graph: native.Graph, ons: torch.Tensor) -> tuple:
@@ -3221,11 +3241,16 @@ class GoalEval:
             subs.append(strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, self.nat.C))
         return base, (subs if base.stranded or any(sub.stranded for sub in subs) else None)
 
-    def changed_edges(self, tx: Text, graph: native.Graph, ons: torch.Tensor, split: str = "search", draws: int = 16) -> list[dict]:
+    def changed_edges(self, tx: Text, graph: native.Graph, ons: torch.Tensor, split: str = "search", draws: int = 16,
+                      mode: str = "c") -> list[dict]:
         """changed_inputs on connection subsets of one node set (edge_flips' graph and ons: a teacher's connection
         descent asking about its prefixes): the same numbers as changed_inputs on the subsets' graphs, from one plan of
-        graph at 0/1 strengths; a call with a subset that strands a node runs changed_inputs on the subsets' graphs."""
+        graph at 0/1 strengths; a call with a subset that strands a node runs changed_inputs on the subsets' graphs.
+        mode "pp": track_pp's s_track_pp instead, the subsets in one engine.Engine.path_patched call (strengths)."""
         base, subs = self._edge_subsets(tx, graph, ons)
+        if mode == "pp":
+            return self.track_pp(tx, subs, split, draws) if subs is not None else \
+                self.track_pp(tx, [base], split, draws, strengths=ons.to(self.nat.dev, torch.float32))
         if subs is not None:
             return self.changed_inputs(tx, subs, split, draws)
         return self.changed_inputs(tx, [base] * len(ons), split, draws, strengths=ons.to(self.nat.dev, torch.float32))

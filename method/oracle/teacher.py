@@ -422,12 +422,17 @@ def main():
     ap.add_argument("--save-vpd", type=Path, help="save VPD's answers and orders on the texts to this file and stop")
     ap.add_argument("--labels", type=Path, help="locality JSONL (task, local)")
     ap.add_argument("--start-top", type=int, default=0, help="F1 search from VPD's top K at subcomponent level (0: from VPD's whole answer)")
+    ap.add_argument("--tasks", type=Path, help="task ids, one per line, in place of the split's first n texts")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
+    if args.tasks:
+        texts = [native.TEXTS / "vpd4l" / f"{t}.json" for t in args.tasks.read_text().split()]
+    else:
+        texts = native.tasks(args.split)[:args.n]
     ge = goal_eval.GoalEval(native.Native(), chunk=args.batch)
     if args.save_vpd:
         saved = {}
-        for path in native.tasks(args.split)[:args.n]:
+        for path in texts:
             ids, targets = native.text(path)
             m = ge.vpd_answer(ids, targets)
             saved[path.stem] = {"answer": {n: tuple(x.to(torch.int32).cpu() for x in v.nonzero().T) for n, v in m.items()},
@@ -441,7 +446,7 @@ def main():
             r = json.loads(line)
             labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
-    for path in native.tasks(args.split)[:args.n][args.offset::args.stride]:
+    for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
             continue
         ids, targets = native.text(path)

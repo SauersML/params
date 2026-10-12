@@ -2,7 +2,8 @@
 answer: the causal-importance network or teacher.py --save-vpd's file VPD_SAVED): the windowed masked runs
 (Pruner.kl_sets on a device in Pruner.WINDOWS) equal the whole runs to the bit on MPS and within float32 rounding on
 CUDA, and the products on the start set's subcomponents alone (Pruner._gather) with torch's fused norms and GELU
-(Pruner.fused) match the products on all subcomponents with vpd_model's own steps within float32 rounding, and a
+(Pruner.fused) match the products on all subcomponents with vpd_model's own steps within float32 rounding,
+EdgePruner's runs are the scorecard's (goal_eval.GoalEval.graph_kl: with every connection the masked run), and a
 teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, and
 one over the answer budget steps to a smaller path point.
 
@@ -90,25 +91,26 @@ def test_gathered_products_match_full_products():
     assert close(full, gathered)
 
 
-@pytest.mark.skipif(not TEXT.exists() or not torch.backends.mps.is_available(), reason="needs vpd4l's texts and MPS")
-def test_graph_runs_bound_by_masked_runs():
-    nat = native.Native("mps")
-    if not nat.has_importance:
-        pytest.skip("needs VPD's causal-importance network")
-    ge = goal_eval.GoalEval(nat, chunk=32)
-    ids, targets = native.text(TEXT)
-    tx = ge.text(ids, targets)
-    pr = teacher.Pruner(ge, tx, tx.vpd, live=False, B=32)
-    at = [i for i, (_, t, _) in enumerate(pr.nodes) if t in targets]
+@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
+def test_connection_runs_are_the_scorecards():
+    nat, pr = pruner(True)
+    ge, tx = pr.ge, pr.tx
+    at = [i for i, (_, t, _) in enumerate(pr.nodes) if t in tx.targets]
     pick = torch.randperm(len(at), generator=torch.Generator().manual_seed(2))[:24].tolist()
     nodes = [pr.nodes[at[i]] for i in pick]
-    ep = teacher.EdgePruner(ge, tx, nodes, live=False, B=8)
-    every, none = ep.kl_sets(torch.stack([ep.on, ~ep.on]))
-    masked = carry.kl(tx.ref, ge.runs(ids, targets, [ge.masks(native.Graph(nodes), tx.T)], False)).item()
-    empty = ge._bounds(tx, "off")[0]
-    # remainders off: every connection stated is the circuit's masked run, none stated the empty circuit's
-    assert abs(every - masked) / masked < 1e-4
-    assert abs(none - empty) / empty < 1e-4
+    ep = teacher.EdgePruner(ge, tx, nodes, live=True, B=8)
+    half = torch.rand(len(ep.edges), generator=torch.Generator().manual_seed(3)).to(nat.dev) < 0.5
+    every, some, none = ep.kl_sets(torch.stack([ep.on, half, ~ep.on]))
+    stated = [e for e, keep in zip(ep.edges, half.tolist()) if keep]
+    parents = {}
+    for w, r in stated:
+        if r is not None:
+            parents.setdefault(r, []).append(w)
+    graphs = [native.Graph(nodes, parents, [w for w, r in stated if r is None]), native.Graph(nodes)]
+    masked = carry.kl(tx.ref, ge.runs(tx.ids, tx.targets, [ge.masks(native.Graph(nodes), tx.T)], True)).item()
+    # every connection stated is the circuit's masked run; any subset is the scorecard's run of that graph (graph_ref)
+    assert close([every], [masked])
+    assert close([some, none], ge.graph_kl(tx, graphs, True))
 
 
 @pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")

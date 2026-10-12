@@ -980,83 +980,135 @@ class GoalEval:
         ms = FLIPS["omitted"] if ms is None else ms
         e0, v0 = self._bounds(tx, "live")
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63) + 1)
+        search = "bf16" if str(dev).startswith("cuda") else "score"  # the sign steps' precision (scores: float32)
         cols = {n: torch.unique(torch.cat([tx.vpd[n].any(0).nonzero().flatten()] + [torch.tensor(
             [c for m, _, c in g.node_set() if m == n], dtype=torch.long, device=dev) for g in graphs])) for n in nat.names}
         E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on")
         where = (torch.arange(T, device=dev) <= max(tx.targets))[:, None]
-        out = []
+        inv = {n: {int(c): i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
+        circ, lever = [], []
         for g in graphs:
-            inv = {n: {int(c): i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
-            circ = {n: torch.zeros(T, len(cols[n]), device=dev) for n in nat.names}
+            ci = {n: torch.zeros(T, len(cols[n]), device=dev) for n in nat.names}
             for n, t, c in g.node_set():
-                circ[n][t, inv[n][c]] = 1.0
-            lever = {n: (tx.vpd[n][:, cols[n]] & (circ[n] == 0) & where).nonzero(as_tuple=True) for n in nat.names}
-            sizes = [len(lever[n][0]) for n in nat.names]
-            N = sum(sizes)
-            flat = [(n, int(t), int(cols[n][k])) for n in nat.names for t, k in zip(lever[n][0].tolist(), lever[n][1].tolist())]
+                ci[n][t, inv[n][c]] = 1.0
+            circ.append(ci)
+            lever.append({n: (tx.vpd[n][:, cols[n]] & (ci[n] == 0) & where).nonzero(as_tuple=True) for n in nat.names})
+        keep = {n: torch.stack([1 - ci[n] for ci in circ]) for n in nat.names}  # [circuits, T, columns]: the circuit off
+        sizes = [[len(lv[n][0]) for n in nat.names] for lv in lever]
+        N = [sum(z) for z in sizes]
+        flat = [[(n, t, int(c)) for n in nat.names for t, c in zip(lv[n][0].tolist(), cols[n][lv[n][1]].tolist())] for lv in lever]
+        places = {}
 
-            def kl(x):  # KL(model - F || model - F - C) [R] for relaxed removals x [R, N]
-                if x.shape[0] > SCREEN_ROWS and not torch.is_grad_enabled():
-                    return torch.cat([kl(x[s0:s0 + SCREEN_ROWS]) for s0 in range(0, x.shape[0], SCREEN_ROWS)])
-                R = x.shape[0]
-                m1 = {}
-                for n, b in zip(nat.names, torch.split(x, sizes, 1)):
-                    m = torch.ones(R, T, len(cols[n]), device=dev)
-                    if b.shape[1]:
-                        m = m.index_put((torch.arange(R, device=dev).repeat_interleave(b.shape[1]),
-                                         lever[n][0].repeat(R), lever[n][1].repeat(R)), 1 - b.reshape(-1))
-                    m1[n] = m
-                m2 = {n: m1[n] * (1 - circ[n]) for n in nat.names}
-                return carry.kl(E.log_probs(m1), E.log_probs(m2))
+        def kl(items, precision="score"):  # KL(model - F || model - F - C) per item's rows; items [(circuit, x [R, N_i])]
+            if not items:
+                return []
+            key = tuple((i, x.shape[0]) for i, x in items)
+            if key not in places:  # each row's removals' places, per site
+                rows = torch.tensor([i for i, r in key for _ in range(r)], dtype=torch.long, device=dev)
+                pl = {}
+                for n in nat.names:
+                    rr, tt, kk, r0 = [], [], [], 0
+                    for i, r in key:
+                        t_, k_ = lever[i][n]
+                        if len(t_):
+                            rr.append((r0 + torch.arange(r, device=dev)).repeat_interleave(len(t_)))
+                            tt.append(t_.repeat(r))
+                            kk.append(k_.repeat(r))
+                        r0 += r
+                    pl[n] = (torch.cat(rr), torch.cat(tt), torch.cat(kk)) if rr else None
+                places[key] = (rows, pl)
+            rows, pl = places[key]
+            m1, m2 = {}, {}
+            for j, n in enumerate(nat.names):
+                m = torch.ones(len(rows), T, len(cols[n]), device=dev)
+                if pl[n] is not None:
+                    vals = torch.cat([x[:, sum(sizes[i][:j]):sum(sizes[i][:j + 1])].reshape(-1) for i, x in items])
+                    m = m.index_put(pl[n], 1 - vals)
+                m1[n] = m
+                m2[n] = m * keep[n][rows]
+            return carry.kl(E.log_probs(m1, precision), E.log_probs(m2, precision)).split([r for _, r in key])
 
-            def top(x, m):
-                return x * torch.zeros_like(x, dtype=torch.bool).scatter(1, x.topk(m, 1).indices, True)
+        def chunks(items, cap):  # items in runs of at most cap rows
+            out, run, k = [], [], 0
+            for it in items:
+                if run and k + it[1].shape[0] > cap:
+                    out.append(run)
+                    run, k = [], 0
+                run.append(it)
+                k += it[1].shape[0]
+            return out + ([run] if run else [])
 
-            def grad(x):
-                x = x.detach().requires_grad_(True)
-                return torch.autograd.grad(kl(x).clamp_min(1e-12).log().sum(), x)[0]
+        def top(x, m):
+            return x * torch.zeros_like(x, dtype=torch.bool).scatter(1, x.topk(m, 1).indices, True)
 
-            with torch.no_grad():
-                k0 = float(kl(torch.zeros(1, N, device=dev))[0])
-                row = {"n_real_flips": {0: necessity_log(e0, k0, v0)}, "mask_n_real_flips": {0: []}}
-            g0 = -grad(torch.zeros(1, N, device=dev)) if N else None
-            kls_at = {0: k0}
-            screened = []
-            if N:  # the shortlist measured: each part's removal alone, best (least KL) first
-                short = g0[0].abs().topk(min(N, SCREEN)).indices
-                with torch.no_grad():
-                    rows = torch.zeros(len(short), N, device=dev)
-                    rows[torch.arange(len(short), device=dev), short] = 1.0
-                    ks = kl(rows)
-                screened = short[ks.argsort()].tolist()
-            for m in ms:
-                if m > N:
-                    continue
-                x = torch.rand(restarts, N, generator=gen).to(dev)
-                x[0] = g0[0]
-                x = top(x, m).clamp(0, 1)
-                for _ in range(steps):
-                    x = top((x - ADV_STEP * grad(x).sign()).clamp(0, 1), m)
-                gx = grad(x)
-                with torch.no_grad():  # the top m, ties (entries the steps drove to 0) broken by the gradient, and the
-                    rank = x + 1e-6 * (-gx) / gx.abs().amax(1, keepdim=True).clamp_min(1e-30)  # shortlist's best m
+        def grads(items, precision):
+            xs = [(i, x.detach().requires_grad_(True)) for i, x in items]
+            if not xs:
+                return []
+            loss = sum(k.clamp_min(1e-12).log().sum() for k in kl(xs, precision))
+            return list(torch.autograd.grad(loss, [x for _, x in xs]))
+
+        live = [i for i in range(len(graphs)) if N[i]]
+        with torch.no_grad():
+            k0 = [float(k[0]) for k in kl([(i, torch.zeros(1, N[i], device=dev)) for i in range(len(graphs))])]
+        rows_out = [{"n_real_flips": {0: necessity_log(e0, k0[i], v0)}, "mask_n_real_flips": {0: []}} for i in range(len(graphs))]
+        g0 = dict(zip(live, [-g for g in grads([(i, torch.zeros(1, N[i], device=dev)) for i in live], "score")]))
+        screened = {}
+        with torch.no_grad():  # the shortlists measured: each part's removal alone, best (least KL) first
+            short = {i: g0[i][0].abs().topk(min(N[i], SCREEN)).indices for i in live}
+            one = []
+            for i in live:
+                r = torch.zeros(len(short[i]), N[i], device=dev)
+                r[torch.arange(len(short[i]), device=dev), short[i]] = 1.0
+                one.append((i, r))
+            ks = {}
+            for run in chunks(one, SCREEN_ROWS * 4):
+                for (i, _), k in zip(run, kl(run)):
+                    ks[i] = k
+            screened = {i: short[i][ks[i].argsort()].tolist() for i in live}
+        starts = {(i, m): torch.rand(restarts, N[i], generator=gen).to(dev) for i in range(len(graphs)) for m in ms if 0 < N[i] and m <= N[i]}
+        pairs = [(i, m) for m in ms for i in range(len(graphs)) if (i, m) in starts]
+        xs = {}
+        for i, m in pairs:
+            x = starts[(i, m)]
+            x[0] = g0[i][0]
+            xs[(i, m)] = top(x, m).clamp(0, 1)
+        best = {}
+        per = max(1, FLIP_ROWS // restarts)
+        for s0 in range(0, len(pairs), per):  # every circuit's restarts at every budget together
+            group = pairs[s0:s0 + per]
+            for _ in range(steps):
+                for (i, m), g in zip(group, grads([(i, xs[(i, m)]) for i, m in group], search)):
+                    xs[(i, m)] = top((xs[(i, m)] - ADV_STEP * g.sign()).clamp(0, 1), m)
+            gx = grads([(i, xs[(i, m)]) for i, m in group], "score")
+            with torch.no_grad():  # the top m, ties (entries the steps drove to 0) broken by the gradient, and the
+                cand = []  # shortlist's best m
+                for (i, m), g in zip(group, gx):
+                    x = xs[(i, m)]
+                    rank = x + 1e-6 * (-g) / g.abs().amax(1, keepdim=True).clamp_min(1e-30)
                     xb = torch.zeros_like(x).scatter(1, rank.topk(m, 1).indices, 1.0)
-                    if len(screened) >= m:
-                        pick = torch.zeros(1, N, device=dev)
-                        pick[0, screened[:m]] = 1.0
+                    if len(screened[i]) >= m:
+                        pick = torch.zeros(1, N[i], device=dev)
+                        pick[0, screened[i][:m]] = 1.0
                         xb = torch.cat([xb, pick])
-                    k = kl(xb)
-                    i = int(k.argmin())
-                    best = (float(k[i]), [flat[j] for j in xb[i].nonzero().flatten().tolist()])
-                    prev = max(mm for mm in row["n_real_flips"] if mm < m)  # at most m removals: no better than fewer
-                    if best[0] >= kls_at[prev]:
-                        best = (kls_at[prev], row["mask_n_real_flips"][prev])
-                    kls_at[m] = best[0]
-                    row["n_real_flips"][m] = necessity_log(e0, best[0], v0)
-                    row["mask_n_real_flips"][m] = best[1]
-                native.free(dev)
-            out.append(row)
-        return out
+                    cand.append((i, xb))
+                for (i, m), (_, xb), k in zip(group, cand, kl(cand)):
+                    r = int(k.argmin())
+                    best[(i, m)] = (float(k[r]), [flat[i][j] for j in xb[r].nonzero().flatten().tolist()])
+            native.free(dev)
+        for i in range(len(graphs)):  # at most m removals: no better than fewer
+            row, kls_at = rows_out[i], {0: k0[i]}
+            for m in ms:
+                if (i, m) not in best:
+                    continue
+                b_ = best[(i, m)]
+                prev = max(mm for mm in row["n_real_flips"] if mm < m)
+                if b_[0] >= kls_at[prev]:
+                    b_ = (kls_at[prev], row["mask_n_real_flips"][prev])
+                kls_at[m] = b_[0]
+                row["n_real_flips"][m] = necessity_log(e0, b_[0], v0)
+                row["mask_n_real_flips"][m] = b_[1]
+        return rows_out
 
 
     def _rng(self, tx: Text, g: native.Graph, family: str) -> np.random.Generator:

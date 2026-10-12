@@ -135,6 +135,18 @@ def _batches(enc: list, batch: int, rng: random.Random) -> list[list]:
     return out
 
 
+def _hidden(model, ids, att, slots: Slots | None = None, nodes=None):
+    """The final hidden states [B, L, d] (the LoRA in its layers; the output layer is applied only where needed)."""
+    inner = model.get_base_model() if hasattr(model, "get_base_model") else model
+    if slots is None:
+        return inner.model(input_ids=ids, attention_mask=att).last_hidden_state
+    return inner.model(inputs_embeds=slots.embeds(model, ids, nodes), attention_mask=att).last_hidden_state
+
+
+def _head(model):
+    return (model.get_base_model() if hasattr(model, "get_base_model") else model).lm_head
+
+
 def _loss(model, batch, pad: int, slots: Slots | None = None):
     """Summed answer-token cross entropy (nats) and the answer token count of a padded batch."""
     import torch
@@ -148,12 +160,12 @@ def _loss(model, batch, pad: int, slots: Slots | None = None):
         labels[i, len(p):len(p) + len(c)] = torch.tensor(c)
         att[i, :len(p) + len(c)] = 1
     ids, labels, att = ids.cuda(), labels.cuda(), att.cuda()
-    if slots is None:
-        logits = model(input_ids=ids, attention_mask=att).logits[:, :-1].float()
-    else:
-        logits = model(inputs_embeds=slots.embeds(model, ids, [n for _, _, n in batch]), attention_mask=att).logits[:, :-1].float()
-    loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1), reduction="sum", ignore_index=-100)
-    return loss, int((labels[:, 1:] != -100).sum())
+    h = _hidden(model, ids, att, slots, [n for _, _, n in batch])[:, :-1]
+    tgt = labels[:, 1:]
+    keep = tgt != -100  # the output layer at the answer's positions alone (the vocabulary is 152k wide)
+    logits = _head(model)(h[keep]).float()
+    loss = torch.nn.functional.cross_entropy(logits, tgt[keep], reduction="sum")
+    return loss, int(keep.sum())
 
 
 def _fit(model, tok, enc: list, epochs: int, lr: float, batch: int, log, tag: str, seed: int = 0, slots: Slots | None = None,
@@ -208,8 +220,8 @@ def _logp(model, tok, prompts: list[list[int]], conts: list[list[int]], nodes: l
 
     out = []
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    for b in range(0, len(prompts), 8):
-        P, C = prompts[b:b + 8], conts[b:b + 8]
+    for b in range(0, len(prompts), 16):
+        P, C = prompts[b:b + 16], conts[b:b + 16]
         L = max(len(p) + len(c) for p, c in zip(P, C))
         ids = torch.full((len(P), L), pad, dtype=torch.long)
         att = torch.zeros((len(P), L), dtype=torch.long)
@@ -217,12 +229,9 @@ def _logp(model, tok, prompts: list[list[int]], conts: list[list[int]], nodes: l
             ids[i, :len(p) + len(c)] = torch.tensor(p + c)
             att[i, :len(p) + len(c)] = 1
         with torch.no_grad():
-            if slots is None:
-                logits = model(input_ids=ids.cuda(), attention_mask=att.cuda()).logits
-            else:
-                logits = model(inputs_embeds=slots.embeds(model, ids.cuda(), nodes[b:b + 8]), attention_mask=att.cuda()).logits
+            h = _hidden(model, ids.cuda(), att.cuda(), slots, nodes[b:b + 16] if nodes else None)
             for i, (p, c) in enumerate(zip(P, C)):
-                lp = logits[i, len(p) - 1:len(p) - 1 + len(c)].float().log_softmax(-1)
+                lp = _head(model)(h[i, len(p) - 1:len(p) - 1 + len(c)]).float().log_softmax(-1)
                 out.append(float(lp[torch.arange(len(c)), torch.tensor(c, device=lp.device)].sum()))
     return out
 

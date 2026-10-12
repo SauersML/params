@@ -8,7 +8,8 @@
 # back to ~/mpd-data/runpod/NAME/out.
 # EPOCHS: per training size, its epochs (SIZE:EPOCHS ...; smaller sets more passes, every size trained to a similar
 # number of row passes).
-#   experiments/oracle/pods/learn_sft_pod.sh QDIR [NAME] [HOURS]      env: SIZES, BASE, EPOCHS, GPU, PRICE
+# QSET: which of the four queues this pod runs (default all; "0 1" and "2 3" split them over two 24 GB cards, VRAM=24).
+#   experiments/oracle/pods/learn_sft_pod.sh QDIR [NAME] [HOURS]      env: SIZES, BASE, EPOCHS, QSET, VRAM, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -47,6 +48,8 @@ Q0="$(first active 1) $(task active ids $W/first_active/adapter) $(task ids ids)
 Q1="$(first vocab 2) $(task vocab ids $W/first_vocab/adapter) $S score $Q/ids/heldout.jsonl $O/out/score_ids_base.jsonl --base $BASE >> $O/base.log 2>&1; $S score $Q/features/heldout.jsonl $O/out/score_features_base.jsonl --base $BASE >> $O/base.log 2>&1;"
 Q2="$(first both 1) $(task both ids $W/first_both/adapter) $(task features features)"
 Q3="$(inject)"
+QS=("$Q0" "$Q1" "$Q2" "$Q3") RUNQ=""
+for i in ${QSET:-0 1 2 3}; do RUNQ="$RUNQ (${QS[$i]}) &"; done
 REPORT="$O/out/score_ids_base.jsonl $O/out/score_features_base.jsonl"
 for arm in active ids vocab both features inject inject_shuffled; do for n in $SIZES; do REPORT="$REPORT $O/out/score_${arm}_$n.jsonl"; done; done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out $Q;
@@ -59,7 +62,7 @@ $S train $W/smoke_train.jsonl $W/smoke --base $BASE --epochs 1 > $O/smoke.log 2>
 $S score $W/smoke_held.jsonl $O/out/smoke_score.jsonl --base $BASE --adapter $W/smoke/adapter >> $O/smoke.log 2>&1;
 $S train $W/smoke_train.jsonl $W/smoke_inject --base $BASE --epochs 1 --inject --init $W/smoke/adapter >> $O/smoke.log 2>&1;
 $S score $W/smoke_held.jsonl $O/out/smoke_score_inject.jsonl --base $BASE --adapter $W/smoke_inject/adapter --inject --shuffle >> $O/smoke.log 2>&1;
-set +e; ($Q0) & ($Q1) & ($Q2) & ($Q3) & wait; $S report $REPORT > $O/out/report.txt 2>&1; echo all stages done"
-RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=44 RP_MIN_RAM_GB=48 RP_DISK_GB=100 \
+set +e; $RUNQ wait; $S report $REPORT > $O/out/report.txt 2>&1; echo all stages done"
+RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=48 RP_DISK_GB=100 \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA L40,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD"
 }

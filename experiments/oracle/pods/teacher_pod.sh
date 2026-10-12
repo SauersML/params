@@ -14,6 +14,8 @@
 #   experiments/oracle/pods/teacher_pod.sh HOURS
 #   env: RUN, SPLIT, N, OFFSET, PODS, P, TASKS, DEST, VPD, LABELS, LOCALITY, BATCH, REF, GPU, PRICE, VRAM, RAM, WAIT (minutes of retries
 #   while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all)
+# The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
+{
 cd /Users/user/params
 H=${1:-2.0}
 RUN=${RUN:-a} SPLIT=${SPLIT:-heldout} N=${N:-20} OFFSET=${OFFSET:-0} PODS=${PODS:-1} P=${P:-2} BATCH=${BATCH:-32}
@@ -77,3 +79,5 @@ merge() {
 while [ -n "$(jobs -rp)" ]; do merge; sleep 60; done
 merge
 echo "teacher $RUN done: $(printf '%s ' "${names[@]}")"
+exit
+}

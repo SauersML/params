@@ -9,8 +9,10 @@ size, positions, and seconds per text) and the circuits' connections (role_share
 one stated connection in or out), and with --adv A.jsonl B.jsonl on teacher_v3.py --evaluate's held-out
 adversary scores (F1, N, f1_adv, f1_rob, size), and with --fidelity A.jsonl B.jsonl on goal_eval.py fidelity's rows of
 kind "teacher" (the team's held-out adversary, adversary_flips' omitted lever at m = 1, 4, 16, 64, 256 as flip_m, the
-point F1 and N, N_real, C and C with flips, flips_to_half and flips_to_break, the smallest m at which F1 under m flips
-falls below 0.5 and below half the point F1, 512 when not within m <= 256; dreads_*, the response error under node
+guarded scores (the lead's): s_point_c, min(graph F1, F1 with every connection among the nodes), and flipc_m, the same
+min under m flips (f1_flips_c), beside the raw graph F1 s_point, s_wiring, reliance_on_cuts and the raw flips flip_m;
+point N, N_real, C and C with flips, flips_to_half and flips_to_break, the smallest m at which the guarded F1 under m
+flips falls below 0.5 and below half of s_point_c, 512 when not within m <= 256; dreads_*, the response error under node
 removals, connection cuts and interchange, lower is better), overall and by locality, and each side's teacher against
 VPD's top k at its size (fidelity's "VPD top k" rows: VPD's own ranking, every connection among its nodes)
 (heldout50_locality.jsonl).
@@ -60,7 +62,7 @@ def roles(d: Path) -> dict:
     return out
 
 
-def compare(A: dict, B: dict, a: str, b: str, fields) -> list:
+def compare(A: dict, B: dict, a: str, b: str, fields, verdicts: dict | None = None) -> list:
     tasks = sorted(set(A) & set(B))
     print(f"{'field':16s} {a:>9s} {b:>9s} {'B - A':>9s} {'95% interval':>21s} {'B>A':>4s} {'B<A':>4s} {'=':>3s}  verdict")
     for f in fields:
@@ -70,6 +72,8 @@ def compare(A: dict, B: dict, a: str, b: str, fields) -> list:
         d = [y - x for x, y in pairs]
         lo, hi = bootstrap(d)
         verdict = "B higher" if lo > 0 else "B lower" if hi < 0 else "no detectable difference"
+        if verdicts is not None:
+            verdicts[f] = verdict
         print(f"{f:16s} {sum(x for x, _ in pairs) / len(pairs):9.3f} {sum(y for _, y in pairs) / len(pairs):9.3f} "
               f"{sum(d) / len(d):+9.3f} [{lo:+9.3f}, {hi:+9.3f}] {sum(x > 0 for x in d):4d} {sum(x < 0 for x in d):4d} "
               f"{sum(x == 0 for x in d):3d}  {verdict} ({len(pairs)} texts)")
@@ -112,6 +116,7 @@ def main():
     if args.fidelity and all(p.exists() for p in args.fidelity):
         def row(r):
             return {**r, **{f"flip_{m}": v for m, v in (r.get("f1_flips_omitted") or {}).items()},
+                    **{f"flipc_{m}": v for m, v in (r.get("f1_flips_c") or {}).items()},
                     **{k: r.get(k) or 512 for k in ("flips_to_half", "flips_to_break") if k in r}}
 
         def fid(p, vpd=False):
@@ -125,14 +130,21 @@ def main():
         local = {}
         if args.labels.exists():
             local = {json.loads(x)["task"]: json.loads(x)["local"] for x in args.labels.read_text().splitlines() if x.strip()}
-        fields = ("flip_1", "flip_4", "flip_16", "flip_64", "flip_256", "flips_to_half", "flips_to_break", "s_point", "n_point",
-                  "n_real", "dreads_edges", "dreads_nodes", "dreads_interchange", "c", "c_flips", "size")
+        fields = ("flipc_1", "flipc_4", "flipc_16", "flipc_64", "flipc_256", "flips_to_half", "flips_to_break", "s_point_c", "n_point",
+                  "n_real", "s_point", "s_wiring", "reliance_on_cuts", "flip_1", "flip_4", "dreads_edges", "dreads_nodes",
+                  "dreads_interchange", "c", "c_flips", "size")
         for name, keep in (("all", lambda t: True), ("non-local", lambda t: local.get(t) is False), ("local", lambda t: local.get(t) is True)):
             ts = [t for t in set(FA) & set(FB) if keep(t)]
             if ts:
                 print(f"held-out adversary, the team's (goal_eval.py fidelity: adversary_flips omitted at m, fresh pool), {name}: {len(ts)} texts")
-                compare({t: FA[t] for t in ts}, {t: FB[t] for t in ts}, args.a, args.b, fields)
-        vfields = ("flip_1", "flip_4", "flips_to_half", "s_nodes", "s_edges", "n_real", "s_point", "n_point", "dreads_edges", "c_flips")
+                v = {}
+                compare({t: FA[t] for t in ts}, {t: FB[t] for t in ts}, args.a, args.b, fields, v)
+                if name == "all":
+                    up = all(v.get(f) == "B higher" for f in ("flipc_1", "flipc_4"))
+                    kept = all(v.get(f) != "B lower" for f in ("s_point_c", "n_point"))
+                    print(f"rule (guarded): flipc_1 and flipc_4 higher {'yes' if up else 'NO'}; s_point_c and point N not lower "
+                          f"{'yes' if kept else 'NO'} -> {'PASS' if up and kept else 'FAIL'} (answers within the budget: answer_tokens.py)")
+        vfields = ("flipc_1", "flipc_4", "flips_to_half", "s_nodes", "s_edges", "n_real", "s_point_c", "n_point", "s_point", "dreads_edges", "c_flips")
         for side, p, F in ((args.a, args.fidelity[0], FA), (args.b, args.fidelity[1], FB)):
             V = fid(p, vpd=True)
             ts = sorted(set(F) & set(V))

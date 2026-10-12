@@ -465,7 +465,7 @@ class GoalEval:
 
     def graph_ref(self, ids: list[int], targets: list[int], graph: native.Graph, u: dict | None = None, live: bool = True,
                   record: dict | None = None, patch: dict | None = None, cuts: dict | None = None,
-                  reads: list | None = None) -> torch.Tensor:
+                  reads: list | None = None, norms: dict | None = None, freeze: str = "") -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of a stated graph's run in C's semantics (the lead's decision, 10-12):
         inside the circuit, graph semantics, each circuit node reading the full residual stream less the outputs of the
         circuit nodes that are not its stated parents (the background and its stated parents; a value's share through
@@ -477,7 +477,10 @@ class GoalEval:
         masked run of the circuit's subcomponents and u. record: receives each read's activation {node: [B]} (reads:
         those subcomponents; by default a stated graph's nodes); patch: {node: value} fixes those subcomponents' activations (an interchange); cuts: {reader node or
         None (the prediction): [writer nodes]}, connections cut besides the unstated ones (a complete graph, VPD's
-        answer or the whole model as masks, has none unstated: its nodes read each other in full)."""
+        answer or the whole model as masks, has none unstated: its nodes read each other in full). norms: receives each
+        RMSNorm's scale 1 / rms per position ({("attn" | "mlp", layer) or "final": [B, T or targets, 1]}); with
+        freeze "layers" (every norm inside the layers) or "all" (the final norm too), those norms use the scales norms
+        holds instead (a run recorded first: the norm diagnostic)."""
         import vpd_model
 
         nat, tg = self.nat, self.nat.target
@@ -525,12 +528,22 @@ class GoalEval:
             out = (A * on[n]) @ tg.site(n).U
             return out + inp @ tg.site(n).delta_T if live else out
 
+        def norm(xx, w, key, pos=None):  # vpd_model.rms, its scale recorded into norms or taken from it (freeze)
+            frozen = norms is not None and freeze and (freeze == "all" or key != "final")
+            if frozen:
+                sc = norms[key] if pos is None else norms[key][:, pos]
+            else:
+                sc = torch.rsqrt(xx.float().pow(2).mean(-1, keepdim=True) + tg.eps)
+                if norms is not None and pos is None:
+                    norms[key] = sc.detach()
+            return w * (xx.float() * sc).to(xx.dtype)
+
         x = tg.wte[torch.tensor(ids, device=dev)][None].expand(B, -1, -1)
         causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
         for i in range(tg.n_layer):
             nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
-            z = vpd_model.rms(x, tg.norms[2 * i], tg.eps)
-            resid = lambda r, ws, x=x, i=i: vpd_model.rms(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i], tg.eps)  # noqa: E731
+            z = norm(x, tg.norms[2 * i], ("attn", i))
+            resid = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i], ("attn", i), r[1])  # noqa: E731
             q, k, v = (site(nm[kk], z, resid).view(B, T, H, hd).transpose(1, 2) for kk in ("q_proj", "k_proj", "v_proj"))
             q, k = tg._rope(q, T), tg._rope(k, T)
             P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
@@ -538,8 +551,8 @@ class GoalEval:
             share = lambda r, ws, att=att, P=P: att[:, r[1]] - sum(  # noqa: E731
                 P[:, :, r[1], w[1]].repeat_interleave(hd, dim=1) * write(w) for w in ws)
             x = x + site(nm["o_proj"], att, share)
-            z2 = vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps)
-            resid2 = lambda r, ws, x=x, i=i: vpd_model.rms(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i + 1], tg.eps)  # noqa: E731
+            z2 = norm(x, tg.norms[2 * i + 1], ("mlp", i))
+            resid2 = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i + 1], ("mlp", i), r[1])  # noqa: E731
             pre = site(nm["c_fc"], z2, resid2)
             x = x + site(nm["down_proj"], vpd_model.gelu_tanh(pre),
                          lambda r, ws, pre=pre: vpd_model.gelu_tanh(pre[:, r[1]] - sum(write(w) for w in ws)))
@@ -553,7 +566,7 @@ class GoalEval:
         if record is not None:
             for nd in (reads if reads is not None else (sorted(graph.node_set()) if not graph.complete else [])):
                 record[nd] = a[nd[0]][:, nd[1], nd[2]].detach()
-        return torch.log_softmax((vpd_model.rms(xt, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
+        return torch.log_softmax((norm(xt, tg.ln_f, "final") @ tg.wte.T).float(), -1)
 
 
     def graph_kl(self, tx: Text, graphs: list[native.Graph], live: bool) -> list[float]:

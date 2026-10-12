@@ -1056,3 +1056,19 @@ def test_necessity_flips(tiny):
     want = goal_eval.necessity_log(e0, min(best, unattacked), v0)  # at most one removal
     assert abs(row["n_real_flips"][1] - want) < 1e-3, (row["n_real_flips"][1], want, best, unattacked)
     assert len(row["mask_n_real_flips"][1]) == (1 if best < unattacked else 0)
+
+
+def test_graph_ref_frozen_norms(tiny):
+    """The norm diagnostic: a run replaying its own recorded scales is itself; the whole model minus some parts with
+    the model's scales frozen differs from it unfrozen."""
+    nat, ge, tx = tiny
+    model = native.Graph(masks={n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+    scales = {}
+    clean = ge.graph_ref(tx.ids, tx.targets, model, norms=scales)
+    assert float(carry.kl(tx.ref, clean)) < 1e-5 and ("attn", 0) in scales and "final" in scales
+    again = ge.graph_ref(tx.ids, tx.targets, model, norms=dict(scales), freeze="all")
+    assert float(carry.kl(clean, again)) < 1e-6
+    less = native.Graph(masks={n: ~m for n, m in tx.vpd.items()})
+    live = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, less)))
+    frozen = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, less, norms=dict(scales), freeze="layers")))
+    assert abs(live - frozen) > 1e-3

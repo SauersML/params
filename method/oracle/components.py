@@ -46,6 +46,8 @@ E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); 
   components.py requestion ROWS.jsonl OUT.jsonl [--qa-seed 1]   the rows with a fresh set of intervention questions
   components.py locality SPLIT OUT.jsonl [--n N]                each text local or not (VPD's target actives alone)
   components.py teacher-vpd ROWS.jsonl OUT_DIR                 the interim teacher (VPD's answer cut to a writable size)
+  components.py prepare SPLIT OUT_DIR [--n N] [--lengths LO:HI]  locality, then the row and teacher of the texts kept (at
+                                                                least half non-local)
   components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
                                                                 (TEACHER_DIR/<task>.json or .txt; nodes alone get
                                                                 measured edges) with the measured answers
@@ -1172,6 +1174,12 @@ def main():
     lc.add_argument("--stride", type=int, default=1)
     lc.add_argument("--lengths", default="0:100000", help="LO:HI: only texts of LO <= tokens < HI (PyTorch's MPS keeps "
                     "per-shape caches, ~20-40 MB of host memory per sequence length: a process over a band of lengths stays bounded)")
+    pr = sub.add_parser("prepare", help="per text: locality, and for the texts kept, the question row and the interim teacher")
+    pr.add_argument("split", choices=("train", "heldout", "hard"))
+    pr.add_argument("out", type=Path, help="directory: locality.jsonl, rows.jsonl, teacher/<task>.json, teacher/summary.jsonl")
+    pr.add_argument("--n", type=int, default=400)
+    pr.add_argument("--lengths", default="0:100000")
+    pr.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
     vt = sub.add_parser("teacher-vpd", help="the interim teacher: VPD's own answer cut to a writable size (vpd_teacher())")
     vt.add_argument("rows", type=Path)
     vt.add_argument("out", type=Path, help="directory: <task>.json (circuit JSON) and summary.jsonl")
@@ -1211,6 +1219,40 @@ def main():
                     f.write(json.dumps(r) + "\n")
                     f.flush()
                     print(r, flush=True)
+        return
+    if args.cmd == "prepare":
+        from transformers import AutoTokenizer
+
+        tk = AutoTokenizer.from_pretrained(args.tokenizer)
+        count = lambda text: len(tk(text, add_special_tokens=False)["input_ids"])  # noqa: E731
+        (args.out / "teacher").mkdir(parents=True, exist_ok=True)
+        files = {k: args.out / f"{k}.jsonl" for k in ("locality", "rows")}
+        seen = {k: [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else [] for k, f in files.items()}
+        labels = {r["task"]: r for r in seen["locality"]}
+        kept = {r["task"] for r in seen["rows"]}
+        conn, atlas = _connectome(), _atlas()
+        lo, hi = map(int, args.lengths.split(":"))
+        for p in native.tasks(args.split)[:args.n]:
+            if not lo <= len(native.text(p)[0]) < hi or (p.stem in labels and (p.stem in kept or labels[p.stem]["local"])):
+                continue
+            task = json.loads(p.read_text())
+            if p.stem not in labels:
+                labels[p.stem] = locality(ge, task)
+                with files["locality"].open("a") as f:
+                    f.write(json.dumps(labels[p.stem]) + "\n")
+            local_kept = sum(labels[t]["local"] for t in kept)
+            if labels[p.stem]["local"] and local_kept >= len(kept) - local_kept:  # at least half the kept texts non-local
+                continue
+            ev = evidence(nat, ge, task, conn, atlas=atlas)
+            row = {**ev, "question": question(task, ev)}
+            answer, info = vpd_teacher(ge, task, row, count, cache={})
+            (args.out / "teacher" / f"{p.stem}.json").write_text(json.dumps(answer))
+            with (args.out / "teacher" / "summary.jsonl").open("a") as f:
+                f.write(json.dumps({**info, "local": labels[p.stem]["local"]}) + "\n")
+            with files["rows"].open("a") as f:
+                f.write(json.dumps(row) + "\n")
+            kept.add(p.stem)
+            print(p.stem, "local" if labels[p.stem]["local"] else "non-local", info, flush=True)
         return
     if args.cmd == "teacher-vpd":
         from transformers import AutoTokenizer

@@ -824,8 +824,11 @@ def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None
 def size_term(bits: float, scale: float) -> float:
     """The size term: an answer's description bits in orders of magnitude of the scale (the bits of naming VPD's whole
     answer), log2(1 + bits) / log2(1 + scale), at most 1: 0 for the empty answer, 1 for one as long as VPD's, and
-    every doubling of an answer costs the same (1 / log2(1 + scale)), as F1 and N are on a log scale."""
-    return min(1.0, math.log2(1.0 + bits) / math.log2(1.0 + scale)) if scale > 0 else 0.0
+    every doubling of an answer costs the same (1 / log2(1 + scale)), as F1 and N are on a log scale (goal_eval's,
+    the one definition)."""
+    import goal_eval
+
+    return goal_eval.size_term(bits, scale)
 
 
 def dropped_bits(answer: dict, g, d: dict, positions: int, subcomponents: int) -> float:

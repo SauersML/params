@@ -56,6 +56,7 @@ REWARD_READER, INDEPENDENT_READER, CONTROL_READER = "Qwen/Qwen3.5-397B-A17B", "m
 CACHED = 0.2  # a cached prefill token's share of the price
 SCORER_FAILURES = 3  # scorer errors an RL run sits out (each request kept) before it stops
 RENDERER = "qwen3_disable_thinking"
+THINKING_RENDERER = "qwen3"  # --thinking: Qwen3's own reasoning before the answer (an SFT target's block is empty)
 NAMES = re.compile(r"L\d+\.(?:q|k|v|o|fc|down)#\d+")  # a subcomponent's name in English
 
 
@@ -119,8 +120,9 @@ def tinker_reader(service, base: str, renderer, tokenizer, spend: Spend):
     return reader.Reader(generate, lambda xs: components.token_strings("vpd4l", xs))  # as the explainer sees them
 
 
-def renderer_for(base: str):
-    """(renderer, tokenizer) for a base model, thinking disabled where the model thinks by default."""
+def renderer_for(base: str, thinking: bool = False):
+    """(renderer, tokenizer) for a base model, thinking disabled where the model thinks by default (thinking: its
+    thinking renderer)."""
     from tinker_cookbook import model_info, renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
@@ -129,8 +131,18 @@ def renderer_for(base: str):
         name = RENDERERS[base]
     else:
         names = model_info.get_recommended_renderer_names(base)
-        name = next((n for n in names if n.endswith("_disable_thinking")), names[0])
+        name = next((n for n in names if n.endswith("_disable_thinking") != thinking), names[0])
     return renderers.get_renderer(name, tokenizer), tokenizer
+
+
+def answer_of(renderer, tokenizer, tokens: list[int]) -> tuple[str, int]:
+    """A sampled answer's text without its thinking, and the thinking's length in tokens (0 without)."""
+    from tinker_cookbook import renderers
+
+    msg = renderer.parse_response(tokens)[0]
+    c = msg["content"]
+    think = "".join(x.get("thinking", "") for x in c if x.get("type") == "thinking") if isinstance(c, list) else ""
+    return renderers.get_text_content(msg), (len(tokenizer.encode(think, add_special_tokens=False)) if think else 0)
 
 
 def service_client():
@@ -152,7 +164,7 @@ def sample(a) -> None:
     a.out.parent.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.out.parent, a.base)
     service = service_client()
-    renderer, tokenizer = renderer_for(a.base)
+    renderer, tokenizer = renderer_for(a.base, a.thinking)
     sampler = (service.create_training_client_from_state(a.init).save_weights_and_get_sampling_client() if a.init
                else service.create_sampling_client(base_model=a.base))
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=renderer.get_stop_sequences())
@@ -169,7 +181,8 @@ def sample(a) -> None:
             spend.add("sample", prefill=prompt.length - hits, cached=hits + (a.samples - 1) * prompt.length,
                       sampled=sum(len(s.tokens) for s in res.sequences))
             for k, s in enumerate(res.sequences):
-                f.write(json.dumps({"task": q["task"], "sample": k, "text": a.prefix + renderers.get_text_content(renderer.parse_response(s.tokens)[0]),
+                text, think = answer_of(renderer, tokenizer, s.tokens)
+                f.write(json.dumps({"task": q["task"], "sample": k, "text": a.prefix + text, "thinking_tokens": think,
                                     "finish": str(s.stop_reason), "tokens": len(s.tokens)}) + "\n")
     print(json.dumps({"questions": len(questions), "samples": a.samples, "total_usd": spend.total}), flush=True)
 
@@ -306,7 +319,7 @@ def explain(a) -> None:
                       "reader_b": mean([o["reader_b"] for o in kept if o.get("reader_b") is not None]), "spend_usd": total}), flush=True)
 
 
-def clients(base: str, rank: int, init: str | None):
+def clients(base: str, rank: int, init: str | None, thinking: bool = False):
     import tinker
     from tinker_cookbook import renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
@@ -315,7 +328,7 @@ def clients(base: str, rank: int, init: str | None):
     training = (service.create_training_client_from_state(init) if init
                 else service.create_lora_training_client(base_model=base, rank=rank))
     tokenizer = get_tokenizer(base)
-    return tinker, service, training, renderers.get_renderer(RENDERER, tokenizer), tokenizer
+    return tinker, service, training, renderers.get_renderer(THINKING_RENDERER if thinking else RENDERER, tokenizer), tokenizer
 
 
 def sft(a) -> None:
@@ -325,7 +338,7 @@ def sft(a) -> None:
 
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.log, a.base)
-    tinker, _, training, renderer, _ = clients(a.base, a.rank, None)
+    tinker, _, training, renderer, _ = clients(a.base, a.rank, None, a.thinking)
     rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
     data = [conversation_to_datum(r["prompt"] + r["completion"], renderer, a.max_length, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
             for r in rows]
@@ -359,7 +372,7 @@ def rl(a) -> None:
 
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.log, a.base)
-    tinker, service, training, renderer, tokenizer = clients(a.base, a.rank, a.init)
+    tinker, service, training, renderer, tokenizer = clients(a.base, a.rank, a.init, a.thinking)
     questions = [json.loads(x) for x in a.questions.read_text().splitlines() if x.strip()]
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import components
@@ -400,7 +413,8 @@ def rl(a) -> None:
             hits = res.prompt_cache_hit_tokens
             sampled = sum(len(s.tokens) for s in res.sequences)
             spend.add("sample", prefill=n - hits, cached=hits + (a.group - 1) * n, sampled=sampled)
-            texts = [renderers.get_text_content(renderer.parse_response(s.tokens)[0]) for s in res.sequences]
+            texts, thinks = zip(*(answer_of(renderer, tokenizer, s.tokens) for s in res.sequences))
+            texts = list(texts)
             t1 = time.time()
             req = {"task": q["task"], "answers": texts, "truncated": [str(s.stop_reason) == "length" for s in res.sequences]}
             if frozen is not None:
@@ -423,7 +437,7 @@ def rl(a) -> None:
                 raise SystemExit(f"all {a.group} answers to {q['task']} are identical: check the sampling parameters")
             groups.append({"task": q["task"], "distinct": distinct, "rewards": rewards, "valid": [s["valid"] for s in scores],
                            "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")} for s in scores],
-                           "texts": texts, "stop": [str(s.stop_reason) for s in res.sequences],
+                           "texts": texts, "thinking_tokens": list(thinks), "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
                            "terms": {k: [s.get(k) for s in scores] for k in ("C", "N", "E2", "E3", "E4", "F1", "F3", "E1", "size")}})
             for s, rew in zip(res.sequences, rewards):
@@ -453,6 +467,7 @@ def rl(a) -> None:
         line = json.dumps({"step": step, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
                            "distinct": [g["distinct"] for g in groups],
                            "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],
+                           "thinking_tokens": [t for g in groups for t in g["thinking_tokens"]],
                            "score_seconds": sum(g["score_seconds"] for g in groups), "total_usd": spend.total + (rspend.total if rspend else 0.0),
                            "seconds": time.time() - t0})
         print(line, flush=True)
@@ -478,6 +493,8 @@ def main():
         p.add_argument("--steps", type=int, default=4)
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--name", default="components")
+        p.add_argument("--thinking", action="store_true", help="Qwen3's thinking mode (renderer qwen3): an SFT target's thinking "
+                                                                "block is empty, RL samples the policy's own")
     s = sub.choices["sft"]
     s.add_argument("--batch", type=int, default=8)
     s.add_argument("--lr", type=float, help="peak rate, linear decay to 0 (default: the cookbook's LoRA rate for the base)")
@@ -503,6 +520,7 @@ def main():
     m.add_argument("--n", type=int, default=50, help="questions")
     m.add_argument("--samples", type=int, default=4)
     m.add_argument("--max-tokens", type=int, default=4096)
+    m.add_argument("--thinking", action="store_true", help="sample in Qwen3's thinking mode (the answer is the text after it)")
     m.add_argument("--prefix", default="", help="the answer's opening text, given (an ablation's: \"CIRCUIT:\\nANSWER 1:\\n\")")
     e = sub.add_parser("readers")
     e.add_argument("samples", type=Path)

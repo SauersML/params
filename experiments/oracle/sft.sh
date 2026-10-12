@@ -10,7 +10,9 @@
 #                                        same evaluation, "NAME=SAMPLES[:E1] ...", e.g. an earlier SFT's samples, since C
 #                                        changes on main and only one evaluation compares; EDIT_EVAL: the edit teacher's
 #                                        rows for HELDOUT's edit requests, E3's best net; MEASURED=1: the measured input
-#                                        arm, subcomponents ranked by importance x |activation|, attention heads' top positions)
+#                                        arm, subcomponents ranked by importance x |activation|, attention heads' top positions;
+#                                        POOL=1: every VPD-active subcomponent at the listed positions in the question;
+#                                        THINKING=1: Qwen3's thinking mode, generation limit 16384; MAXLEN: SFT length cap)
 set -e
 RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
@@ -22,7 +24,9 @@ LABELS=${LABELS:-$O/heldout50_locality_frozen.jsonl}  # frozen once: never relab
 SRC=${SRC:-/Users/user/params}  # a source tree (a clean copy of main while others edit the shared tree)
 PY=/Users/user/mpd-data/venv/bin/python; TPY=/Users/user/mpd-data/tinker-venv/bin/python
 export HF_HUB_OFFLINE=1 PYTORCH_MPS_PREFER_METAL=1
-RR=(rerender ${MEASURED:+--measured})  # MEASURED: the measured input arm (components.measured()) for training and held-out questions
+RR=(rerender ${MEASURED:+--measured} ${POOL:+--pool})  # MEASURED: the measured input arm (components.measured()); POOL: the full candidate pool (candidate_pool())
+TH=(${THINKING:+--thinking})  # THINKING: Qwen3's thinking mode in SFT (empty blocks in the targets) and sampling
+[ -n "${THINKING:-}" ] && MAXTOK=${MAXTOK_THINKING:-16384}  # one generation limit, thinking included (no thinking budget)
 ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $ROWS $S/rows.jsonl  # questions in the current format
 MPD_MEM_GIB=8 $PY $SRC/method/oracle/components.py dataset $S/rows.jsonl $TEACHER $S/sft.jsonl \
   ${ENGLISH:+--english $ENGLISH} ${EDIT_TEACH:+--edit-teach $EDIT_TEACH}
@@ -42,9 +46,10 @@ PYEOF
 ~/.local/bin/mem-lease 12 $PY $SRC/method/oracle/components.py references $S/heldout.jsonl $HELDOUT_TEACHER $S/ref ${EDIT_EVAL:+--edit-teach $EDIT_EVAL}
 export TINKER_API_KEY="$(security find-generic-password -s tinker-api-key -w)" TINKER_PROJECT_ID=3f598f31-2ffa-4eb4-b302-909eb234fb7d
 cd $SRC/method/oracle/rl
-$TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEPS --batch $BATCH ${LR:+--lr $LR} --name sft-$RUN
+$TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEPS --batch $BATCH ${LR:+--lr $LR} --name sft-$RUN \
+  --max-length ${MAXLEN:-32768} $TH
 STATE=$($PY -c "import json; print(json.load(open('$S/sft/state.json'))['state'])")
-$TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE" --base $BASE --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK
+$TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE" --base $BASE --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK $TH
 Z=${ZEROSHOT:-$O/zeroshot_heldout20/cst}  # the untrained Qwen3-8B's answers to these questions, scored by the same reward
 E1S="" E1Z=""
 if [ -n "${ENGLISH:-}" ]; then

@@ -131,6 +131,8 @@ EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position
 WIRING_PER_POSITION = 6  # connectome pairs listed per position
 SWITCH_PER_POSITION = 8  # subcomponents a changed token switches on, listed per position
 ATTENTION_TOP = 3  # positions listed per attention head at the target (measured(): the --measured input arm)
+POOL_HEADS = 0  # candidate_pool(): positions beyond the listed ones, each attention head's top POOL_HEADS at the target
+# (8 heads' top 8: +1% of held-out teacher nodes for 4x the question, 46k tokens)
 WINDOW = 8  # a question numbers the tokens within this many positions of every position its evidence names
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
 QA_PER_KIND = 2
@@ -900,21 +902,54 @@ def measured(nat, task: dict, ev: dict, atlas=None, lens=None, k: int = EVIDENCE
         routed = dict(zip(chosen, lens.readout(ids, chosen))) if lens and chosen else {}
         comps[q] = [[list(nd), float(ci[nd[0]][p, nd[2]]), facts(atlas, nd, routed.get(nd), tok) if atlas else ""] for nd in chosen]
         acts[q] = [round(float(act[nd[0]][p, nd[2]]), 3) for nd in chosen]
-    tg, t = nat.target, max(targets)
+    return {**ev, "components": comps, "acts": acts, "attention": attention_at(nat, ids, max(targets), top)}
+
+
+def attention_at(nat, ids: list[int], t: int, top: int) -> dict:
+    """Each attention head's top positions at position t in the plain model: layer -> per head [[position, weight],
+    ...] (the target's q_proj and k_proj outputs through Target.attention_pattern)."""
+    import torch
+
+    tg = nat.target
     sites = [tg.site(f"h.{i}.attn.{x}") for i in range(tg.n_layer) for x in ("q_proj", "k_proj")]
     nat.vpd.clear()  # the plain model (clear() also resets the sites' caching)
     for sx in sites:
         sx.cache_output = True
+    att = {}
     with torch.no_grad():
         tg(torch.tensor([ids], device=nat.dev))
-        att = {}
         for i in range(tg.n_layer):
             P = tg.attention_pattern(sites[2 * i].last_output, sites[2 * i + 1].last_output)[0, :, t]  # [heads, T]
             w, at = P.topk(min(top, t + 1), -1)
             att[str(i)] = [[[int(a), round(float(b), 3)] for a, b in zip(ai, wi)] for ai, wi in zip(at.tolist(), w.tolist())]
     for sx in sites:
         sx.cache_output, sx.last_output = False, None
-    return {**ev, "components": comps, "acts": acts, "attention": att}
+    return att
+
+
+def candidate_pool(nat, task: dict, ev: dict, heads: int = POOL_HEADS) -> dict:
+    """The evidence with the full candidate pool (the lead's v2 question, 10-12: the v1 question listed 16% of the
+    teacher's nodes, so choosing a circuit was guessing): every VPD-active subcomponent (causal importance above 0)
+    at the listed positions and the targets, and with heads > 0 at the positions each attention head at the target
+    reads most (its top `heads`). Every v1 teacher node is VPD-active; the listed positions and targets hold 96% of the
+    20 held-out teachers' nodes (81% of 60 train teachers'), the question then ~11k Qwen3 tokens (median; max 18k);
+    adding each head's top 8 positions reaches 97% at ~46k. "pool": position -> matrix -> [[index, importance], ...],
+    most important first."""
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    ci = nat.importance(ids)
+    att = attention_at(nat, ids, max(targets), heads) if heads else {}
+    where = {int(q) for q in ev["components"]} | set(targets) | {q for rows in att.values() for row in rows for q, _ in row}
+    pool = {}
+    for p in sorted(where):
+        per = {}
+        for n in nat.names:
+            got = sorted(((c, float(ci[n][p, c])) for c in (ci[n][p] > 0).nonzero().flatten().tolist()), key=lambda x: -x[1])
+            if got:
+                per[n] = [[c, round(v, 2)] for c, v in got]
+        if per:
+            pool[str(p)] = per
+    return {**ev, "pool": pool}
 
 
 def _atlas():
@@ -1091,6 +1126,14 @@ def question(task: dict, ev: dict) -> str:
                          + ", ".join(f"{node_text(tuple(nd))} ({k}/3)" for nd, k in ev["switch_on"][q]))
         if ev["wiring"].get(q):
             lines.append("  wiring: " + ", ".join(f"{node_text(tuple(w))} -> {node_text(tuple(r))} ({c:+.2f})" for w, r, c in ev["wiring"][q]))
+    if ev.get("pool"):  # candidate_pool(): every VPD-active subcomponent at these positions
+        lines.append("every VPD-active subcomponent (causal importance above 0) at these positions, by position and matrix, "
+                     "index:importance, most important first (any subcomponent of the circuit is one of these; a block "
+                     "L<layer>.<kind>@<position> is a matrix's whole output at a position):")
+        for q in sorted(ev["pool"], key=int):
+            lines.append(f"{q} ({strings[int(q)]!r}): " + "; ".join(
+                f"L{n.split('.')[1]}.{CODES[n.split('.')[-1]]} " + " ".join(f"{c}:{v:.1g}".replace(":0.", ":.") for c, v in cs)
+                for n, cs in sorted(ev["pool"][q].items(), key=lambda x: _place((x[0], int(q), 0)))))
     if ev["qa"]:
         tok = lambda ids: token_strings(model, ids)  # noqa: E731
         lines += [qa_text(q, n, strings, repr(top_tok), tok) for n, q in enumerate(ev["qa"], 1)]
@@ -2007,6 +2050,8 @@ def main():
     rr.add_argument("--variables", action="store_true", help="ask for the EXPLANATION's VARIABLES block (ASK_VARIABLES)")
     rr.add_argument("--measured", action="store_true", help="the measured input arm (measured(): subcomponents ranked by importance x "
                                                              "|activation| with activations, attention heads' top positions)")
+    rr.add_argument("--pool", action="store_true", help="the full candidate pool (candidate_pool(): every VPD-active subcomponent at the "
+                                                         "listed, target and most-attended positions)")
     rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
     rf.add_argument("rows", type=Path)
     rf.add_argument("teacher", type=Path, help="teacher.py's output directory (<task>.json, <task>.vpd_top<k>.edges.json)")
@@ -2081,7 +2126,7 @@ def main():
     import native
 
     if args.cmd == "rerender":
-        if args.facts or args.measured:
+        if args.facts or args.measured or args.pool:
             mnat = native.Native()
             atlas, lens = _atlas(), _lens(mnat)
         else:
@@ -2093,6 +2138,8 @@ def main():
                     r = measured(mnat, task, r, atlas, lens)
                 elif args.facts:
                     r = refresh_facts(atlas, lens, task, r)
+                if args.pool:
+                    r = candidate_pool(mnat, task, r)
                 if args.variables:
                     r = {**r, "variables": True}
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")

@@ -458,3 +458,11 @@ def test_block_nodes_and_token_edges_round_trip():
     written = components.parse("CIRCUIT:\nOUT <- L3.down#2@235,tok@235\nL3.down#2@235 <- L1.v@233\n")
     nodes = [tuple(x) for x in written["answer"]["nodes"]]
     assert ("block", "h.1.attn.v_proj", 233) in nodes and ("tok", 0, 235) in nodes and written["malformed"] == 0
+
+
+def test_question_lists_the_candidate_pool_when_present(tiny):
+    nat, ge, task, ev = tiny
+    pool = {"7": {"h.3.mlp.c_fc": [[5, 1.0], [2, 0.42]], "h.0.attn.q_proj": [[1, 0.06]]}}
+    shown = components.question(task, {**ev, "pool": pool})
+    assert "every VPD-active subcomponent" in shown and "7 (" in shown and "L3.fc 5:1 2:.4" in shown and "L0.q 1:.06" in shown
+    assert "every VPD-active subcomponent" not in components.question(task, ev)

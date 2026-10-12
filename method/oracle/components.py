@@ -43,6 +43,7 @@ E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); 
   components.py questions SPLIT OUT.jsonl [--n N] [--qa-seed K]  question rows (question, positions, evidence, questions;
                                                                 K = 1 for a fresh set of questions)
   components.py requestion ROWS.jsonl OUT.jsonl [--qa-seed 1]   the rows with a fresh set of intervention questions
+  components.py locality SPLIT OUT.jsonl [--n N]                each text local or not (VPD's target actives alone)
   components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
                                                                 (TEACHER_DIR/<task>.json or .txt; nodes alone get
                                                                 measured edges) with the measured answers
@@ -772,6 +773,28 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None) -> int:
     return n
 
 
+# ---- locality
+
+
+LOCAL = 0.9  # a text is local when VPD's active subcomponents at its targets alone reach this recovered_log
+
+
+def locality(ge, task: dict) -> dict:
+    """Whether a text's prediction is local: VPD's active subcomponents at the target positions alone (every other
+    subcomponent off, remainders live) reach recovered_log >= LOCAL. For a local prediction a target-only circuit is
+    the truth; training sets need non-local texts too, or the oracle learns to list the target's actives.
+    {"task", "local", "recovered_log", "target_actives"}."""
+    import native
+
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    tx = ge.text(ids, targets, task=task)
+    at = [nd for nd in ge.nat._vpd_order(ids, targets) if nd[1] in targets]
+    row = ge.sufficiency(tx, [native.Graph(at)])[0]
+    rec = row["recovered_log_live"]
+    return {"task": task["id"], "local": rec is not None and rec >= LOCAL, "recovered_log": rec, "target_actives": len(at)}
+
+
 # ---- evaluation
 
 
@@ -907,6 +930,12 @@ def main():
     rq.add_argument("rows", type=Path)
     rq.add_argument("out", type=Path)
     rq.add_argument("--qa-seed", type=int, default=1)
+    lc = sub.add_parser("locality", help="each text local or not (locality())")
+    lc.add_argument("split", choices=("train", "heldout", "hard"))
+    lc.add_argument("out", type=Path)
+    lc.add_argument("--n", type=int, default=50)
+    lc.add_argument("--offset", type=int, default=0)
+    lc.add_argument("--stride", type=int, default=1)
     d = sub.add_parser("dataset")
     d.add_argument("rows", type=Path)
     d.add_argument("teacher", type=Path)
@@ -929,6 +958,16 @@ def main():
 
     ge = goal_eval.GoalEval()
     nat = ge.nat
+    if args.cmd == "locality":
+        done = {json.loads(x)["task"] for x in args.out.read_text().splitlines()} if args.out.exists() else set()
+        with args.out.open("a") as f:
+            for p in native.tasks(args.split)[:args.n][args.offset::args.stride]:
+                if p.stem not in done:
+                    r = locality(ge, json.loads(p.read_text()))
+                    f.write(json.dumps(r) + "\n")
+                    f.flush()
+                    print(r, flush=True)
+        return
     if args.cmd == "requestion":
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):

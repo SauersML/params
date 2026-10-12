@@ -183,6 +183,8 @@ def tiny():
     g = torch.Generator().manual_seed(1)
     ids = torch.randint(0, 40, (12,), generator=g).tolist()
     tx = ge.text(ids, [11], seed=5)
+    for split, n in (("search", 6), ("eval", 5)):  # far donors in the tiny vocabulary, some shorter than the text
+        ge.donor_pools[split] = [(f"{split}{i}", torch.randint(0, 40, (8 + 2 * i,), generator=g).tolist()) for i in range(n)]
     return nat, ge, tx
 
 
@@ -1085,7 +1087,8 @@ def test_cutting_an_off_writer_changes_nothing(tiny):
 def test_fidelity_reward_mode_is_the_full_modes_training_family(tiny):
     """fidelity(mode="reward") gives the full mode's point, node and edge families, reads, the flips up to FLIP_TERM
     (the same starts), interchange and changed texts on the same split, and their c, without the evaluation-only
-    columns; the reward's split is search, the full mode's eval; c is the geometric mean of its six terms."""
+    columns; the reward's split is search (near donors the search split's texts, far donors training texts), the full
+    mode's eval; c is the harmonic mean of its eight terms."""
     nat, ge, tx = tiny
     nodes = sorted(native.Graph(masks=tx.vpd).node_set())
     graphs = [native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets)), native.Graph(nodes[1::4], complete=True)]
@@ -1095,11 +1098,15 @@ def test_fidelity_reward_mode_is_the_full_modes_training_family(tiny):
     ev = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, interchange=4, changed=4)
     for i, (a, b, e) in enumerate(zip(full, rew, ev)):
         for key in ("s_point", "s_nodes", "s_edges", "reads_nodes", "reads_edges", "dreads_nodes", "dreads_edges",
-                    "s_changed", "s_track", "s_interchange", "c"):
+                    "s_changed", "s_track", "s_interchange", "s_donor_near", "s_donor_far", "c"):
             assert (a[key] is None) == (b[key] is None) and (a[key] is None or abs(a[key] - b[key]) < 1e-6), key
-        terms = [b[k] for k in ("s_point_c", "s_nodes", "s_edges", "s_track", "s_interchange") if b[k] is not None]
-        terms += [b["f1_flips_c"][goal_eval.FLIP_TERM]]
-        assert len(terms) == 6 and len(b["c_terms"]) == 6 and abs(b["c"] - math.prod(terms) ** (1 / 6)) < 1e-9
+        keys = ("s_point_c", "s_nodes", "s_edges", "s_track", "s_interchange", "s_donor_near", "s_donor_far")
+        terms = [b[k] for k in keys if b[k] is not None] + [b["f1_flips_c"][goal_eval.FLIP_TERM]]
+        assert len(terms) == 8 and len(b["c_terms"]) == 8
+        assert abs(b["c"] - (0.0 if min(terms) == 0 else 8 / sum(1 / t for t in terms))) < 1e-9
+        assert b["draws_donor_far"] and all(d[0].startswith("search") for d in b["draws_donor_far"])  # training-side donors
+        assert all(d[0].startswith("eval") for d in e["draws_donor_far"])
+        assert not {tuple(d[0]) for d in e["draws_donor_near"]} & {tuple(d[0]) for d in b["draws_donor_near"]}
         assert b["draws_changed"] == ge.changed_search(tx, [graphs[i]], draws=4)[0]["draws_changed"]
         assert not set(map(tuple, e["draws_changed"])) & set(map(tuple, b["draws_changed"]))
         assert b["e4"] is None
@@ -1346,6 +1353,9 @@ def test_donor_resampling(tiny):
     assert two["s_donor_far_worst"] == min(each) and abs(two["s_donor_far_p90"] - float(np.percentile(each, 10))) < 1e-12
     near = ge.donors(tx, [whole], near=4)[0]
     assert near["donors_near"] == len(ge.changed_inputs(tx, [whole], "eval", 4)[0]["draws_changed"])
+    srch = ge.donors_search(tx, [whole], near=4, far=3)[0]
+    assert [d[0] for d in srch["draws_donor_near"]] == [list(pz) for pz in ge.changed_search(tx, [whole], 4)[0]["draws_changed"]]
+    assert [d[0] for d in srch["draws_donor_far"]] == [n for n, _ in ge.far_donors(tx, ge.far_pool("search"), 3)]
 
 def test_response_error():
     base = {("a", 0, 0): (1.0, 5.0), ("b", 0, 0): (0.0, 0.0)}
@@ -1453,8 +1463,17 @@ def test_c_takes_the_lower_of_graph_and_every_connection(tiny):
         assert abs(f - goal_eval._fid(e0, kc, row["kl_flips_omitted"][m][1])) < 1e-6
         assert row["f1_flips_c"][m] == min(row["f1_flips_omitted"][m], f)
     terms = [row["s_point_c"], row["s_nodes"], row["s_edges"], row["f1_flips_c"][goal_eval.FLIP_TERM]]
-    terms += [row[k] for k in ("s_track", "s_interchange") if row[k] is not None]
-    assert abs(row["c"] - math.prod(terms) ** (1 / len(terms))) < 1e-12
+    terms += [row[k] for k in ("s_track", "s_interchange", "s_donor_near", "s_donor_far") if row[k] is not None]
+    assert row["c"] == goal_eval._harmonic(terms)
+
+
+def test_harmonic_c():
+    """C's combination: the harmonic mean, 0 with a term at 0, about k times the smallest term near 0 (noise there
+    stays noise), the mean of equal terms."""
+    assert goal_eval._harmonic([0.5, 0.0, 0.9]) == 0.0 and goal_eval._harmonic([]) is None
+    assert abs(goal_eval._harmonic([0.6, 0.6, 0.6]) - 0.6) < 1e-12
+    a, b = goal_eval._harmonic([1e-5, 0.8, 0.9]), goal_eval._harmonic([2e-5, 0.8, 0.9])
+    assert abs(a - 3e-5) < 1e-8 and abs(b - a) < 4e-5
 
 
 def test_stranded_nodes_are_dropped_and_charged(tiny):

@@ -122,7 +122,8 @@ FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fi
 DONORS_NEAR = 16  # donor resampling's changed-input donors per text
 DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's answer)
 DONORS_FAR = 8  # donor resampling's other texts per text
-DONOR_TEXTS = range(150, 200)  # the held-out split's texts the far donors come from (text9150-9199: no search drew on them)
+DONOR_POOLS = {"search": ("train", range(0, 400)),  # the far donors' texts per split: the reward's from training texts,
+               "eval": ("heldout", range(150, 200))}  # evaluation's from held-out text9150-9199 (no search drew on them)
 
 
 # ---- answers
@@ -300,6 +301,13 @@ def _transplant(base: torch.Tensor, moved: torch.Tensor, still: torch.Tensor) ->
     """log_softmax(base + moved - still): a run's change from still to moved (log q on x' and on x) applied to base
     (the model's log p on x), the target positions' distributions [B, targets, V]."""
     return torch.log_softmax(base + moved - still, -1)
+
+
+def _harmonic(terms: list) -> float | None:
+    """C's combination: the harmonic mean k / sum(1 / s), 0 when a term is 0 (None for no terms)."""
+    if not terms:
+        return None
+    return 0.0 if min(terms) <= 0 else len(terms) / sum(1.0 / t for t in terms)
 
 
 def _fid(e0: float, kc: float, kv: float) -> float | None:
@@ -508,6 +516,7 @@ class GoalEval:
         self.random_pairs, self.max_edges, self.chunk, self.cut_chunk = random_pairs, max_edges, chunk, cut_chunk
         self.hooks: dict = {"E1": None, "E2": None, "E4": None}  # E4: fn(tx, graph, split) -> float or None (fidelity's e4)
         self.probes: dict = {}  # (ids, targets, seed) -> the changed prompts and F2's prompts, as int32 arrays
+        self.donor_pools: dict = {}  # split -> the far donors' [(name, token ids)] (far_pool; set to override)
 
     def text(self, ids: list[int], targets: list[int], seed: int | None = None, task: dict | None = None) -> Text:
         return Text(self, ids, targets, native.task_seed(str(ids[:8])) if seed is None else seed, task)
@@ -1077,7 +1086,8 @@ class GoalEval:
     def fidelity(self, tx: Text, graphs: list[native.Graph], pool: dict | None = None, draws: int = DRAWS,
                  steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE, fresh: dict | None = None,
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
-                 changed: int = CHANGED_DRAWS, split: str | None = None) -> list[dict]:
+                 changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
+                 far_donors: int = DONORS_FAR) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -1093,12 +1103,14 @@ class GoalEval:
         parts switched on (adversary_flips, the omitted lever: f1_flips_omitted by m), "interchange" (_interchange_family:
         the circuit's nodes at one of its positions set to their values on a changed text, s_interchange) and "changed"
         (changed_inputs: the circuit run on changed texts, bounded by its own unchanged answer, s_changed, with
-        context_share, s_track); c, the geometric mean of s_point_c, s_nodes, s_edges, f1_flips_c at FLIP_TERM (the
-        reward's adversarial member), s_track and s_interchange over those defined on the text (c_terms names them; the
-        claim is agreement under every family, so one failed family is not made up by the others: the lead's decisions
-        10-12; the step-budget f1_adv and s_changed are reported columns),
-        the last two on split's draws (default: "search", the teachers' draws, in the reward on training texts; "eval"
-        otherwise, and for any held-out text); e4: the E4 hook's score (its own reward term, not in c); flips_to_break, the smallest m at which f1_flips_omitted falls below
+        context_share, s_track) and "donors" (donors: everything outside the circuit at one donor text's values, near
+        donors the changed texts and far donors other texts, s_donor_near and s_donor_far); c, the harmonic mean of
+        s_point_c, s_nodes, s_edges, f1_flips_c at FLIP_TERM (the reward's adversarial member), s_track, s_interchange,
+        s_donor_near and s_donor_far over those defined on the text (c_terms names them; the claim is agreement under
+        every family, so one failed family is not made up by the others, and near 0 c is linear in the lowest term, so
+        float noise there stays noise: the lead's decisions 10-12; the step-budget f1_adv and s_changed are reported
+        columns), the last four on split's draws (default: "search", the teachers' draws and training texts as far
+        donors, in the reward on training texts; "eval" otherwise, and for any held-out text); e4: the E4 hook's score (its own reward term, not in c); flips_to_break, the smallest m at which f1_flips_omitted falls below
         half of s_point (None: not within FLIPS); flips_to_half, the smallest m at which it falls below 0.5, half of
         VPD's own answer under the same attack (0: below it unattacked), which a circuit weak to begin with cannot pass. reads: C's second observable, the circuit nodes' relative RMS read
         error between the model and the circuit per family (reads_*), and of their responses, each node's change from
@@ -1135,6 +1147,8 @@ class GoalEval:
         inter = self._interchange_family(tx, graphs, interchange, split=split, reads=reads) if interchange else none
         reals = self.real_removal(tx, graphs) if real and not reward else none
         chg = self.changed_inputs(tx, graphs, split, changed) if changed else none
+        dns = self.donors(tx, graphs, split, near_donors, self.far_donors(tx, self.far_pool(split), far_donors) if far_donors else None) \
+            if (near_donors or far_donors) else none
         nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real and not reward else none
         leak = none if reward else self.sufficiency(tx, [native.Graph(sorted(g.node_set()), {}, []) for g in graphs])
         out = []
@@ -1159,11 +1173,11 @@ class GoalEval:
             if it:
                 row["s_interchange"] = _fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
             row.update(chg[i])
+            row.update(dns[i])
             named = [(k, row.get(k)) for k in ("s_point_c", "s_nodes", "s_edges")] + [("f1_flips_c", fc.get(FLIP_TERM))]
-            named += [(k, row.get(k)) for k in ("s_track", "s_interchange")]
+            named += [(k, row.get(k)) for k in ("s_track", "s_interchange", "s_donor_near", "s_donor_far")]
             row["c_terms"] = [k for k, v in named if v is not None]  # a family with nothing scored on the text is left out
-            terms = [v for _, v in named if v is not None]
-            row["c"] = math.prod(terms) ** (1 / len(terms)) if terms else None  # every family must agree: no compensation
+            row["c"] = _harmonic([v for _, v in named if v is not None])
             row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") else None
             if not reward:  # (the reward's flips stop at FLIP_TERM)
                 half = 0.5 * row["s_point_c"] if row["s_point_c"] is not None else None
@@ -1752,6 +1766,19 @@ class GoalEval:
             a = rec[site][0]
             out[site] = a[n - T:] if pad == 0 else torch.cat([a.new_zeros(pad, a.shape[1]), a])
         return out, pad
+
+    def far_pool(self, split: str) -> list:
+        """The far donors' texts of a split, [(name, token ids)] (DONOR_POOLS), loaded once."""
+        if split not in self.donor_pools:
+            which, idx = DONOR_POOLS[split]
+            tasks = native.tasks(which)
+            self.donor_pools[split] = [(tasks[i].stem, native.text(tasks[i])[0]) for i in idx if i < len(tasks)]
+        return self.donor_pools[split]
+
+    def donors_search(self, tx: Text, graphs: list[native.Graph], near: int = DONORS_NEAR, far: int = DONORS_FAR) -> list[dict]:
+        """The teachers' donor resampling: donors on the search split (near: changed_search's texts; far: training
+        texts), never a gate or table's, for a list of candidate circuits on one text (one run per donor for all)."""
+        return self.donors(tx, graphs, "search", near, self.far_donors(tx, self.far_pool("search"), far) if far else None)
 
     def far_donors(self, tx: Text, pool: list, k: int = DONORS_FAR) -> list:
         """k of pool's texts ((name, token ids) pairs) for donor resampling, drawn by the text's seed, those at least as
@@ -2644,7 +2671,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
     lever over a pool no search drew from; interchange draws; changed texts (changed_inputs' eval split); N_real); one
     row per circuit appended to OUT (texts already there are skipped); only: some of ("changed", "interchange",
     "donors"), those families alone on the eval split (task, kind, nodes and their fields: families added to rows
-    already made, matched by task and kind; donors' far texts from the split's DONOR_TEXTS). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
+    already made, matched by task and kind; donors' far texts the eval split's, DONOR_POOLS). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
     teacher.py --save-vpd (where the causal-importance network is not). Locality from a set's summary*.jsonl."""
     ge = GoalEval()
     nat = ge.nat
@@ -2660,8 +2687,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                     if r.get("local") is not None:
                         local[r["task"]] = r["local"]
     done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
-    tasks = native.tasks(split)
-    far = [(tasks[i].stem, native.text(tasks[i])[0]) for i in DONOR_TEXTS if i < len(tasks)] if "donors" in only else []
+    far = ge.far_pool("eval") if "donors" in only else []
     rows = []
     for p in native.tasks(split)[:n][offset::stride]:
         have = {name: Path(d) / f"{p.stem}.json" for name, d in sets.items() if (Path(d) / f"{p.stem}.json").exists()}

@@ -50,7 +50,9 @@ Score (EditEval.score_many), in bits, on data the teacher's search never used:
 The edit teacher (teach()) is a measured greedy search over candidate edits from the teacher's circuits (goal_eval JSON
 files, TEACHER_DIRS) and VPD's most important subcomponents: each round adds the candidate that moves the goal most
 (ties: least collateral), until the goal is attained or no candidate helps; then drops every edit the goal does not
-need (least collateral first) and replaces single edits by others that keep the goal with less collateral. Every
+need (least collateral first) and replaces single edits by others that keep the goal with less collateral. A
+persistent goal can be reached by breaking the model, so its search (frontier()) adds the candidate with the most
+progress per bit of collateral each round and keeps every step: a path of progress against collateral. Every
 search number is measured on the search's own data (alternatives ranks 0 to 2, the copy set's first half, SEARCH_ROWS
 for collateral). Baselines, scored by the same code: VPD's top-k subcomponents ablated (its causal-importance order,
 native.Native._vpd_order; for the copy goal the subcomponents most often active at the first half's targets), and the
@@ -841,6 +843,43 @@ def search(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN
     return {"ops": S, "row": cur, "rounds": rounds, "evaluated": evaluated}
 
 
+def _rate(row: dict, cur: dict | None) -> tuple | None:
+    """A candidate's rank in the frontier search: progress gained per collateral bit added (free gains first, by the
+    progress they add); None when it adds no progress."""
+    dp = row["progress"] - (cur["progress"] if cur else 0.0)
+    dc = row["collateral"] - (cur["collateral"] if cur else 0.0)
+    if not row["valid"] or dp <= 1e-9:
+        return None
+    return (1, dp) if dc <= 0 else (0, dp / dc)
+
+
+def frontier(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN, log=print) -> dict:
+    """A persistent goal's search: a goal on every text can be reached by breaking the model, so each round adds the
+    candidate with the most progress per bit of collateral, and every step is kept: the path from the unedited model
+    traces progress against collateral (each step a point; the next costs more collateral per unit of progress).
+    Returns {"path": [{"ops", "row"}], "evaluated"}."""
+    S, cur, evaluated, path = [], None, 0, []
+    for r in range(max_ops):
+        rows = score([S + [c] for c in pool])
+        evaluated += len(pool)
+        rated = [(_rate(row, cur), i) for i, row in enumerate(rows)]
+        ranked = [i for g, i in sorted(((g, i) for g, i in rated if g is not None), reverse=True)]
+        if r == 0:
+            keep = ranked[:screen]
+            pool, rows = [pool[i] for i in keep], [rows[i] for i in keep]
+            ranked = list(range(len(pool)))
+        if not ranked:
+            break
+        best = ranked[0]
+        S, cur = S + [pool[best]], rows[best]
+        path.append({"ops": [op_text(o) for o in S], "edit": [_jsonable(o) for o in S], "row": cur})
+        log(f"  step {r}: {op_text(pool[best])} -> progress {cur['progress']:.3f} collateral {cur['collateral']:.3f}")
+        pool = [c for j, c in enumerate(pool) if j != best]
+        if cur["attained"]:
+            break
+    return {"path": path, "evaluated": evaluated}
+
+
 def vpd_topk(ee: EditEval, task: dict, sizes) -> list[tuple[int, list[dict]]]:
     """VPD's baseline edits: its k most important subcomponents on the text (native.Native._vpd_order) ablated."""
     p = task["prompts"][0]
@@ -915,10 +954,10 @@ def screen_local(ee: EditEval, half: list[dict], ops_at, n: int, top: int, log=p
 
 
 def teach_copy(ee: EditEval, log=print, screen_n: int = 16) -> dict:
-    """The persistent copy goal: the teacher over subcomponents (persistent scales of the subcomponents most often
-    active at the first half's targets, screened by measured local ablation, and persistent cuts among the top
-    ones), the same search over native units (every head, the neurons screened the same way), VPD's top-k by
-    activity count, and the L2 heads 2-4 ablation (the earlier copy fix); all scored on the second half."""
+    """The persistent copy goal: the frontier search over subcomponents (persistent scales of the subcomponents most
+    often active at the first half's targets, screened by measured local ablation, and persistent cuts among the top
+    ones) and over native units (every head, the neurons screened the same way), each step of each path scored on the
+    second half; VPD's top-k by activity count, and the L2 heads 2-4 ablation (the earlier copy fix)."""
     t0 = time.perf_counter()
     goal = copy_goal()
     first, _ = copy_instances()
@@ -939,12 +978,10 @@ def teach_copy(ee: EditEval, log=print, screen_n: int = 16) -> dict:
     upool += [unit_op("neuron", neurons[i][0], neurons[i][1], None, k) for i in order for k in NODE_SCALES]
     for name, pl in (("teacher", pool), ("units", upool)):
         log(f"copy {name}: {len(pl)} candidates")
-        res = search(score, pl, log=log)
-        row = ee.score_many({"id": "copy"}, goal, [res["ops"]])[0] if res["ops"] else None
-        out[name] = {"ops": [op_text(o) for o in res["ops"]], "edit": [_jsonable(o) for o in res["ops"]], "search": res["row"],
-                     "score": row, "rounds": res["rounds"], "evaluated": res["evaluated"]}
-    k_teacher = len(out["teacher"]["ops"])
-    sizes = sorted(set(SIZES) | ({k_teacher} if k_teacher else set()))
+        res = frontier(score, pl, log=log)
+        rows = ee.score_many({"id": "copy"}, goal, [[_from_json(o) for o in st["edit"]] for st in res["path"]])
+        out[name] = {"path": [{**st, "score": r} for st, r in zip(res["path"], rows)], "evaluated": res["evaluated"]}
+    sizes = sorted(set(SIZES))
     eds = [[scale_op(nd, 0.0) for nd in nodes[:k]] for k in sizes]
     out["vpd_topk"] = [{"k": k, "score": r} for k, r in zip(sizes, ee.score_many({"id": "copy"}, goal, eds))]
     heads = [unit_op("head", 2, h, None, 0.0) for h in (2, 3, 4)]
@@ -1047,11 +1084,12 @@ def table(rows: list[dict], copy: dict | None = None) -> str:
                      f"{sorted(hit)[len(hit) // 2] if hit else '-'})")
     if copy:
         lines.append("copy (persistent; fresh half): method flipped halved progress rest collateral_held collateral_instances ops")
-        for name in ("teacher", "units", "l2_heads_2_4"):
-            s = copy.get(name, {}).get("score")
+        steps = [(f"{name} {k + 1}", st["score"], k + 1) for name in ("teacher", "units") for k, st in enumerate(copy.get(name, {}).get("path", []))]
+        steps.append(("l2_heads_2_4", copy.get("l2_heads_2_4", {}).get("score"), 3))
+        for name, s, n in steps:
             if s and s.get("valid"):
                 lines.append(f"  {name:13s} {s['flipped']:.2f} {s['halved']:.2f} {s['progress']:.3f} {s['rest']:.3f} "
-                             f"{s['collateral_held']:.2f} {s['collateral_instances']:.2f} {len(copy[name]['ops'])}")
+                             f"{s['collateral_held']:.2f} {s['collateral_instances']:.2f} {n}")
         for x in copy.get("vpd_topk", []):
             s = x["score"]
             if s and s.get("valid"):

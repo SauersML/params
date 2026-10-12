@@ -244,3 +244,23 @@ def test_detach_dependence(tiny):
     want = min(1.0, max(0.0, math.log2(d0 / d) / math.log2(1 / (1 - edit_eval.GOAL))))
     assert abs(r["progress"] - want) < 1e-3
     assert r["attained"] == (d <= (1 - edit_eval.GOAL) * d0)
+
+
+def test_frontier_takes_progress_per_collateral():
+    """The persistent search's step: the candidate with the most progress per bit of collateral, free gains first."""
+    rows = {"a": {"valid": True, "progress": 0.9, "collateral": 90.0, "attained": False},
+            "b": {"valid": True, "progress": 0.3, "collateral": 1.0, "attained": False},
+            "c": {"valid": True, "progress": 0.0, "collateral": 0.0, "attained": False}}
+    pool = [edit_eval.scale_op(("h.0.mlp.c_fc", None, i), 0.0) for i in range(3)]
+    name = {id(pool[0]): "a", id(pool[1]): "b", id(pool[2]): "c"}
+
+    def score(eds):
+        out = []
+        for ops in eds:
+            r = [rows[name[id(o)]] for o in ops]
+            out.append({"valid": True, "progress": min(1.0, sum(x["progress"] for x in r)),
+                        "collateral": sum(x["collateral"] for x in r), "attained": False})
+        return out
+    res = edit_eval.frontier(score, pool, max_ops=2, log=lambda m: None)
+    assert [st["row"]["progress"] for st in res["path"]] == [0.3, pytest.approx(1.0)]
+    assert res["path"][0]["edit"][0]["node"] == ["h.0.mlp.c_fc", None, 1]

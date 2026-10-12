@@ -1103,15 +1103,24 @@ class GoalEval:
             if graph.masks is not None:
                 M = {n: m.to(dev) for n, m in self.masks(graph, T).items()}
                 Mb = {}
-            else:  # subcomponent nodes live, block nodes' whole site output (with its remainder) live
-                M = {n: torch.zeros(T, self.nat.C[n], dtype=torch.bool, device=dev) for n in self.nat.names}
-                Mb = {}
-                for n, t, c in graph.node_set():
-                    if c == BLOCK:
-                        M[n][t] = True
-                        Mb.setdefault(n, torch.zeros(T, 1, dtype=torch.bool, device=dev))[t] = True
-                    else:
-                        M[n][t, c] = True
+            else:  # subcomponent nodes live, block nodes' whole site output (with its remainder) live; kept on the graph
+                kept = getattr(graph, "_pp_masks", None)  # (a graph runs once per changed text: fleet's 10-12 regression)
+                if kept is not None and kept[0] == (T, str(dev)):
+                    M, Mb = kept[1], kept[2]
+                else:
+                    M = {n: torch.zeros(T, self.nat.C[n], dtype=torch.bool, device=dev) for n in self.nat.names}
+                    Mb, sub, blk = {}, {}, {}
+                    for n, t, c in graph.node_set():
+                        (blk if c == BLOCK else sub).setdefault(n, []).append((t, c))
+                    for n, tc in sub.items():  # one write per site
+                        idx = torch.tensor(tc, device=dev)
+                        M[n][idx[:, 0], idx[:, 1]] = True
+                    for n, tc in blk.items():
+                        ts = torch.tensor([t for t, _ in tc], device=dev)
+                        M[n][ts] = True
+                        Mb[n] = torch.zeros(T, 1, dtype=torch.bool, device=dev)
+                        Mb[n][ts] = True
+                    graph._pp_masks = ((T, str(dev)), M, Mb)
 
             held, held_out = {}, {}  # fixed subcomponents' activations, fixed blocks' whole outputs, per site
             for (n, t, c), val in (fixed or {}).items():
@@ -1193,7 +1202,7 @@ class GoalEval:
             n, p_, c = nd
             if c == BLOCK:
                 return rot(aP[nd], p_) if patched else rot(x_out(nd), p_)
-            act = aP[nd] if patched else b["a"][n][p_, c]
+            act = aP[nd] if patched and nd in aP else b["a"][n][p_, c]  # (a node a block holds: as on the text, the engine's rule)
             return rot(act * tg.site(n).U[c], p_)
 
         pairs = getattr(graph, "pairs", None) or {}

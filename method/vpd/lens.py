@@ -220,7 +220,7 @@ def evaluate(args):
     vpd = VM.load_vpd(target, dev)
     names = meta["names"]
     a0, a1 = meta["train_rows"]
-    b0, b1 = meta["heldout_rows"]
+    b0, b1 = meta["heldout_rows"] if not args.rows else [int(x) for x in args.rows.split(":")]
     V = target.wte.shape[0]
     train = tokens_of(a0, a1, args.tokens)
     seen = torch.bincount(train.reshape(-1), minlength=V) >= MIN_COUNT
@@ -229,6 +229,9 @@ def evaluate(args):
     expert = {p: (saved["J"][p] / saved["n"][p].clamp_min(1)[:, None, None]).float().to(dev) for p in POINTS}  # [E, d, d]
     off = dict(zip(names, np.concatenate([[0], np.cumsum([meta["counts"][n] for n in names])])[:-1].tolist()))
     held = tokens_of(b0, b1, args.tokens)
+    if args.rows:  # a slice of split B (a quick check): its first half fits the weights, its second is evaluated
+        rows_all = atlas["effect_row"]
+        atlas["effect_row"] = torch.where((rows_all >= b0) & (rows_all < b1), rows_all, torch.full_like(rows_all, -1))
     rows, pos = atlas["effect_row"], atlas["effect_pos"]  # [total, SAMPLES], absolute rows
     mid = (b0 + b1) // 2
     gf = target.ln_f
@@ -360,6 +363,7 @@ def main():
     e.add_argument("--tokens")
     e.add_argument("--batch", type=int, default=8)
     e.add_argument("--device", default="cuda")
+    e.add_argument("--rows", help="a slice A:B of split B instead of all of it (a quick check)")
     args = ap.parse_args()
     {"fit": fit, "evaluate": evaluate}[args.cmd](args)
 

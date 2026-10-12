@@ -357,33 +357,24 @@ class GoalEval:
     @torch.no_grad()
     def edge_effects(self, tx: Text, g: native.Graph, pairs: list[tuple]) -> list[float]:
         """Per (writer, reader) pair among the graph's nodes (reader None: the prediction), the KL in bits of the
-        graph's run (every connection the model has among its nodes, remainders off) from the same run with that one
-        connection at strength 0 (Native.run's edge strengths: the reader reads every other input as before)."""
+        graph's run (its subcomponents on, every other off, remainders off) from the same run with that one connection
+        cut, the reader reading every other input as before (path patching inside the circuit's run, _patched)."""
         nat, T = self.nat, tx.T
-        nodes = g.node_set()
-        par, out = native.all_edges(nodes, tx.targets)
-        full = native.Graph(nodes, par, out)
-        order = {e: j for j, e in enumerate([(w, r) for r, ws in full.parents.items() for w in ws] + [(w, None) for w in full.out])}
-        E = len(order)
-        zu, zr = nat._zero()
-        res = []
-        rows = [None] + list(pairs)
-        base = None
-        for s0 in range(0, len(rows), self.cut_chunk):
-            part = rows[s0:s0 + self.cut_chunk]
-            B = len(part)
-            plan = nat._plan([full] * B, T)
-            w = torch.ones(B * E, device=nat.dev)
-            cut = [b * E + order[e] for b, e in enumerate(part) if e is not None]
-            if cut:
-                w[torch.tensor(cut, device=nat.dev)] = 0.0
-            ew, ow = nat.edge_weights(plan, w)
-            lq = nat.run(tx.ids, tx.targets, plan, zu, zr, ew, ow)
-            if base is None:
-                base = lq[:1]
-            res += carry.kl(base, lq).tolist()
-            native.free(nat.dev)
-        return res[1:]
+        if not pairs:
+            return []
+        masks = self.masks(g, T)
+        cg = native.Graph(masks=masks)
+        zero = nat._zero()
+        rec, states = {}, {}
+        one = nat._plan([cg], T)
+        ref = nat.run(tx.ids, tx.targets, one, *zero, record=rec, fill=states)
+
+        def make(B):  # the plan of B copies (views of the one's masks) and the states its runs reuse (the one's)
+            return {**one, "B": B, "G": {n: m.expand(B, -1, -1) for n, m in one["G"].items()},
+                    "complete": one["complete"].expand(B, -1, -1)}, states
+
+        ctx = {"make": make, "ablation": zero, "ref": ref, "flow": self._flow(tx.ids, rec, states, masks), "rec": rec}
+        return [d["kl"] for d in self._patched(tx, ctx, pairs)]
 
     def edges(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
         """Per graph, F3 (see the module docstring): the cut effects of its stated edges (at most max_edges, a uniform
@@ -418,117 +409,135 @@ class GoalEval:
     def cuts(self, tx: Text, pairs: list[tuple], detail: bool = False) -> list:
         """Per (writer, reader) pair (reader None: the prediction), the KL in bits of the model on the text from the
         model with that one connection cut: the reader's new activation is its input in the model without the
-        writer's output alone (every other output and every remainder as in the model; _cut_activations), and the
-        model runs on with that one activation replaced (path patching of the connection); into the prediction, the
-        final residual stream without the writer's output. detail: per pair {"kl", "top": the cut run's most likely
-        token at each target, "logp_model_top": its log-probability of the model's most likely token there}."""
+        writer's output alone (every other output and every remainder as in the model), and the model runs on with
+        that one activation replaced (path patching of the connection, _patched); into the prediction, the final
+        residual stream without the writer's output. detail: per pair {"kl", "top": the cut run's most likely token at
+        each target, "logp_model_top": its log-probability of the model's most likely token there}."""
+        nat = self.nat
         todo = [e for e in dict.fromkeys(pairs) if e not in tx.cut_cache]
         if todo:
-            for e, d in zip(todo, self._cuts(tx, todo)):
+            ctx = {"make": lambda B: (nat._full_plan(tx.T, B), nat._model_states(tx.ids, B)), "ablation": nat._one(),
+                   "ref": tx.ref, "flow": self.flow(tx), "rec": tx.rec}
+            for e, d in zip(todo, self._patched(tx, ctx, todo)):
                 tx.cut_cache[e] = d
         return [tx.cut_cache[e] if detail else tx.cut_cache[e]["kl"] for e in pairs]
 
-    def _cuts(self, tx: Text, pairs: list[tuple]) -> list[dict]:
-        """cuts() of distinct pairs. The runs with a reader's new activation are batched by the reader's position and
-        reuse the model's states before the batch's first reader (nothing earlier changes); a cut into the prediction
-        needs no run (flow's final residual stream)."""
+    def _patched(self, tx: Text, ctx: dict, pairs: list[tuple]) -> list[dict]:
+        """Path patching of distinct pairs in a run (ctx: "make"(B) -> its plan of B copies and their states, its
+        "ablation" (u, ur), its log q at the targets "ref", its "flow" and "rec"ord): each reader's new activation from
+        _cut_activations, then the run with that one activation replaced, batched by the reader's position and reusing
+        the run's states before the batch's first reader (nothing earlier changes); a cut into the prediction needs no
+        run (the flow's final residual stream). Per pair {"kl" of the run from the cut run, "top", "logp_model_top"}."""
+        import vpd_model
+
         nat, T = self.nat, tx.T
         res = [None] * len(pairs)
-        top = tx.ref[0].argmax(-1)  # [len(targets)]
+        ref = ctx["ref"]
+        top = ref[0].argmax(-1)  # [len(targets)]
 
         def summary(lq):
             return [{"kl": k, "top": t, "logp_model_top": p} for k, t, p in
-                    zip(carry.kl(tx.ref, lq).tolist(), lq.argmax(-1).tolist(),
+                    zip(carry.kl(ref, lq).tolist(), lq.argmax(-1).tolist(),
                         lq.gather(-1, top[None, :, None].expand(lq.shape[0], -1, 1))[..., 0].tolist())]
 
         inner = sorted((j for j, (_, r) in enumerate(pairs) if r is not None), key=lambda j: (pairs[j][1][1], pairs[j][0][1]))
         final = sorted((j for j, (_, r) in enumerate(pairs) if r is None), key=lambda j: pairs[j][0][1])
-        one_u, one_r = nat._one()
-        new = self._cut_activations(tx, [pairs[j] for j in inner]) if inner else None
-        at = {j: i for i, j in enumerate(inner)}
-        B = max(1, min(self.cut_chunk, len(inner)))  # every batch this size (the last padded with its own last cut):
-        for s0 in range(0, len(inner), B):  # the model's states for reuse are computed once per text and batch size
-            js = inner[s0:s0 + B]
-            js = js + [js[-1]] * (B - len(js))
-            by = {}
-            for b, j in enumerate(js):
-                r = pairs[j][1]
-                by.setdefault(r[0], []).append((b, r[1], r[2], at[j]))
-            patch = {}
-            for n, lst in by.items():
-                bi, ti, ci, ki = nat._ints([[e[k] for e in lst] for k in range(4)])
-                m = torch.zeros(B, T, nat.C[n], dtype=torch.bool, device=nat.dev)
-                m[bi, ti, ci] = True
-                v = tx.rec[n].expand(B, -1, -1).clone()
-                v[bi, ti, ci] = new[ki]
-                patch[n] = (m, v)
-            base = _from(tx.ids, min(pairs[j][1][1] for j in js))
-            lq = nat.run(tx.ids, tx.targets, nat._full_plan(T, B), one_u, one_r, patch=patch,
-                         reuse=None if base is None else (nat._model_states(tx.ids, B), base))
-            for b, d in enumerate(summary(lq)):
-                res[js[b]] = d
-            native.free(nat.dev)
+        if inner:
+            new = self._cut_activations(ctx, [pairs[j] for j in inner])
+            at = {j: i for i, j in enumerate(inner)}
+            B = min(self.cut_chunk, len(inner))  # every batch this size (the last padded with its own last cut): the
+            plan, states = ctx["make"](B)  # states for reuse are computed once per run and batch size
+            for s0 in range(0, len(inner), B):
+                js = inner[s0:s0 + B]
+                js = js + [js[-1]] * (B - len(js))
+                by = {}
+                for b, j in enumerate(js):
+                    r = pairs[j][1]
+                    by.setdefault(r[0], []).append((b, r[1], r[2], at[j]))
+                patch = {}
+                for n, lst in by.items():
+                    bi, ti, ci, ki = nat._ints([[e[k] for e in lst] for k in range(4)])
+                    m = torch.zeros(B, T, nat.C[n], dtype=torch.bool, device=nat.dev)
+                    m[bi, ti, ci] = True
+                    v = torch.zeros(B, T, nat.C[n], device=nat.dev)  # read only where m is set
+                    v[bi, ti, ci] = new[ki]
+                    patch[n] = (m, v)
+                base = _from(tx.ids, min(pairs[j][1][1] for j in js))
+                lq = nat.run(tx.ids, tx.targets, plan, *ctx["ablation"], patch=patch, reuse=None if base is None else (states, base))
+                for b, d in enumerate(summary(lq)):
+                    res[js[b]] = d
+                native.free(nat.dev)
         if final:
-            import vpd_model
-
-            tg, fl = nat.target, self.flow(tx)
+            tg = nat.target
             t, c = nat._ints([[pairs[j][0][1] for j in final], [pairs[j][0][2] for j in final]])
-            x = fl["final"][tx.targets].expand(len(final), -1, -1).clone()
+            x = ctx["flow"]["final"][tx.targets].expand(len(final), -1, -1).clone()
             row = torch.tensor([tx.targets.index(p) for p in t.tolist()], device=nat.dev)
             for wn in {pairs[j][0][0] for j in final}:
                 sel = torch.tensor([b for b, j in enumerate(final) if pairs[j][0][0] == wn], device=nat.dev)
-                x[sel, row[sel]] -= tx.rec[wn][0, t[sel], c[sel]][:, None] * tg.site(wn).U[c[sel]]
+                x[sel, row[sel]] -= ctx["rec"][wn][0, t[sel], c[sel]][:, None] * tg.site(wn).U[c[sel]]
             lq = torch.log_softmax((vpd_model.rms(x, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
             for b, d in enumerate(summary(lq)):
                 res[final[b]] = d
         return res
 
     def flow(self, tx: Text) -> dict:
-        """The model's run on the text as the cuts read it, kept on tx: per layer the residual stream before each norm
-        ("attn", "mlp" [T, d]; "final", after the last layer), the attention pattern ("P" [H, T, T]) and output before
-        its output matrix ("att" [T, d]), and the MLP's pre-activation ("pre" [T, d_mlp]); built from Native's own
-        record of the run (every activation, the queries, keys and values, the remainders' values) the way Native.run
-        adds them up."""
+        """The model's run on the text as the cuts read it (_flow), kept on tx."""
         if tx._flow is None:
-            import vpd_model
-
-            nat, tg, T = self.nat, self.nat.target, tx.T
-            H, hd = tg.n_head, tg.hd
-            x = tg.wte[torch.tensor(tx.ids, device=nat.dev)][None]
-            causal = torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril()
-            fl = {"attn": [], "mlp": [], "P": [], "att": [], "pre": []}
-            for i in range(tg.n_layer):
-                nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
-                heads = lambda y: y.view(1, T, H, hd).transpose(1, 2)  # noqa: E731
-                q, k = tg._rope(heads(tx.states[("qv", i)]), T), tg._rope(heads(tx.states[("kv", i)]), T)
-                P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
-                fl["attn"].append(x[0])
-                fl["P"].append(P[0])
-                fl["att"].append((P @ heads(tx.states[("vs", i)])).transpose(1, 2).reshape(T, -1))
-                x = (x + tx.rec[nm["o_proj"]] @ tg.site(nm["o_proj"]).U) + tx.rem[nm["o_proj"]]
-                fl["mlp"].append(x[0])
-                fl["pre"].append((tx.rec[nm["c_fc"]] @ tg.site(nm["c_fc"]).U + tx.rem[nm["c_fc"]])[0])
-                x = (x + tx.rec[nm["down_proj"]] @ tg.site(nm["down_proj"]).U) + tx.rem[nm["down_proj"]]
-            fl["final"] = x[0]
-            tx._flow = fl
+            tx._flow = self._flow(tx.ids, tx.rec, tx.states, None, tx.rem)
         return tx._flow
 
-    def _cut_activations(self, tx: Text, pairs: list[tuple]) -> torch.Tensor:
-        """Each pair's reader activation with that one connection cut [len(pairs)]: a query, key, value or MLP input
-        reads the residual stream at its position without the writer's output (then its norm); an attention output
-        reads its layer's attention output without the writer value's share, the pattern's weight from the reader's
-        position to the writer's in each head times the value's output; an MLP output its MLP's pre-activation without
-        the input's output (then the nonlinearity)."""
+    def _flow(self, ids: list[int], rec: dict, states: dict, masks: dict | None = None, rem: dict | None = None) -> dict:
+        """A run as the cuts read it, built from Native's own record of it (rec: every activation [1, T, C]; states:
+        the queries, keys and values per layer) the way Native.run adds them up: per layer the residual stream before
+        each norm ("attn", "mlp" [T, d]; "final", after the last layer), the attention pattern ("P" [H, T, T]) and
+        output before its output matrix ("att" [T, d]), the MLP's pre-activation ("pre" [T, d_mlp]). masks: the
+        subcomponents on (a circuit's run; all without); rem: the remainders' products (none without)."""
+        import vpd_model
+
+        nat, tg, T = self.nat, self.nat.target, len(ids)
+        H, hd = tg.n_head, tg.hd
+        x = tg.wte[torch.tensor(ids, device=nat.dev)][None]
+        causal = torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril()
+        fl = {"attn": [], "mlp": [], "P": [], "att": [], "pre": []}
+
+        def write(n):
+            a = rec[n] if masks is None else rec[n] * masks[n]
+            return a @ tg.site(n).U
+
+        def plus(y, n):
+            return y if rem is None else y + rem[n]
+
+        for i in range(tg.n_layer):
+            nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
+            heads = lambda y: y.view(1, T, H, hd).transpose(1, 2)  # noqa: E731
+            q, k = tg._rope(heads(states[("qv", i)]), T), tg._rope(heads(states[("kv", i)]), T)
+            P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
+            fl["attn"].append(x[0])
+            fl["P"].append(P[0])
+            fl["att"].append((P @ heads(states.get(("vg", i), states[("vs", i)]))).transpose(1, 2).reshape(T, -1))
+            x = plus(x + write(nm["o_proj"]), nm["o_proj"])
+            fl["mlp"].append(x[0])
+            fl["pre"].append(plus(write(nm["c_fc"]), nm["c_fc"])[0])
+            x = plus(x + write(nm["down_proj"]), nm["down_proj"])
+        fl["final"] = x[0]
+        return fl
+
+    def _cut_activations(self, ctx: dict, pairs: list[tuple]) -> torch.Tensor:
+        """Each pair's reader activation in the run (ctx's flow and record) with that one connection cut
+        [len(pairs)]: a query, key, value or MLP input reads the residual stream at its position without the writer's
+        output (then its norm); an attention output reads its layer's attention output without the writer value's
+        share, the pattern's weight from the reader's position to the writer's in each head times the value's output;
+        an MLP output its MLP's pre-activation without the input's output (then the nonlinearity)."""
         import vpd_model
 
         nat, tg = self.nat, self.nat.target
-        fl = self.flow(tx)
+        fl, rec = ctx["flow"], ctx["rec"]
         n = len(pairs)
         writes = [None] * n
         for wn in {w[0] for w, _ in pairs}:
             js = [j for j, (w, _) in enumerate(pairs) if w[0] == wn]
             t, c = nat._ints([[pairs[j][0][1] for j in js], [pairs[j][0][2] for j in js]])
-            wv = tx.rec[wn][0, t, c][:, None] * tg.site(wn).U[c]
+            wv = rec[wn][0, t, c][:, None] * tg.site(wn).U[c]
             for k, j in enumerate(js):
                 writes[j] = wv[k]
         out = torch.empty(n, device=nat.dev)

@@ -126,14 +126,14 @@ def main():
                     **{f"flipc_{m}": v for m, v in (r.get("f1_flips_c") or {}).items()},
                     **{k: r.get(k) or 512 for k in ("flips_to_half", "flips_to_break") if k in r}}
 
-        rows = [json.loads(x) for p in args.fidelity if p.exists() for x in p.read_text().splitlines() if x.strip()]
+        fid_rows = [json.loads(x) for p in args.fidelity if p.exists() for x in p.read_text().splitlines() if x.strip()]
 
         def fid(kind, vpd=False):
             """task -> the set's row (fidelity's kind: the set's name), or with vpd the row of VPD's top k at its node count."""
-            teach = {r["task"]: row(r) for r in rows if r.get("kind") == kind}
+            teach = {r["task"]: row(r) for r in fid_rows if r.get("kind") == kind}
             if not vpd:
                 return teach
-            return {r["task"]: row(r) for r in rows if r.get("kind") == f"VPD top {teach.get(r['task'], {}).get('nodes')}"}
+            return {r["task"]: row(r) for r in fid_rows if r.get("kind") == f"VPD top {teach.get(r['task'], {}).get('nodes')}"}
         FA, FB = fid("a"), fid("b")
         local = {}
         if args.labels.exists():

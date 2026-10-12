@@ -500,14 +500,17 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
             "path": path, "measured_sets": pr.measured, "seconds": time.perf_counter() - t0}
 
 
-def teach_all(split: str, n: int, out: Path, offset: int = 0, stride: int = 1, vpd: Path | None = None, log=print) -> None:
-    """teach_native on the split's first n texts (offset, offset + stride, ...) -> one row per text appended to OUT.
-    vpd: VPD's answers saved by teacher.py --save-vpd (where the causal-importance network is not)."""
+def teach_all(split: str, n: int, out: Path, offset: int = 0, stride: int = 1, vpd: Path | None = None,
+              tasks: list[str] | None = None, log=print) -> None:
+    """teach_native on the split's first n texts (offset, offset + stride, ...), or on the task ids `tasks` in their
+    order, -> one row per text appended to OUT. vpd: VPD's answers saved by teacher.py --save-vpd (where the
+    causal-importance network is not)."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
     saved = torch.load(vpd) if vpd else {}
     done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
-    for p in native.tasks(split)[:n][offset::stride]:
+    texts = [native.TEXTS / "vpd4l" / f"{t}.json" for t in tasks] if tasks else native.tasks(split)[:n][offset::stride]
+    for p in texts:
         if p.stem in done:
             continue
         ids, targets = native.text(p)
@@ -675,6 +678,7 @@ def main():
     e.add_argument("--stride", type=int, default=1)
     e.add_argument("--out", type=Path, required=True)
     e.add_argument("--vpd", type=Path, help="VPD's answers saved by teacher.py --save-vpd (no causal-importance network here)")
+    e.add_argument("--tasks", help="comma-separated task ids, run in this order, in place of the split's texts")
     q = sub.add_parser("compare", help="native (teach) vs the teacher vs VPD's order at matched sizes")
     q.add_argument("--native", type=Path, required=True, help="teach's OUT.jsonl")
     q.add_argument("--teacher", type=Path, required=True, help="teacher.py's --out directory")
@@ -691,7 +695,7 @@ def main():
         print(compare_table(rows), flush=True)
         return
     if args.cmd == "teach":
-        teach_all(args.split, args.n, args.out, args.offset, args.stride, args.vpd)
+        teach_all(args.split, args.n, args.out, args.offset, args.stride, args.vpd, args.tasks.split(",") if args.tasks else None)
         return
     if args.cmd == "table":
         print(table([json.loads(x) for x in args.rows.read_text().splitlines() if x.strip()]))

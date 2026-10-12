@@ -9,7 +9,8 @@ over the answer budget steps to a smaller path point, the flip repair writes its
 accept check admits exactly the largest passing prefix (a constructed case), with --no-strand every listed node but a
 query or key has a stated path to the prediction (routes() drops a query or key whose pattern feeds no routed attention
 output), --edge-levels' default keeps the connections it kept before, and a round's ranking sees the same KLs on the GPU
-and the CPU (float32: the orders differ only among connections tied to that precision).
+and the CPU (float32: the orders differ only among connections tied to that precision), and the joint path under
+--accept changed keeps s_track at its floor at every step.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -265,3 +266,21 @@ def test_connection_rankings_agree_across_devices():
     # between sorted KLs are below 1e-4: many connections change nothing); bfloat16 rankings reordered whole rounds
     a, b = torch.sort(singles[0]).values, torch.sort(singles[1]).values
     assert close(a.tolist(), b.tolist())
+
+
+@pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
+def test_changed_acceptance_keeps_its_floor():
+    nat, pr = pruner(teacher.CONVENTION == "live")
+    ge, tx = pr.ge, pr.tx
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    index = {nd: i for i, nd in enumerate(pr.nodes)}
+    order = [index[(n, int(t), int(c))] for n, t, c in torch.load(VPD_SAVED)["text9000"]["order"] if (n, int(t), int(c)) in index]
+    start = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
+    start[order[:61]] = True                                    # VPD's top 61, the teacher's top-k on this text
+    acc = teacher.Acceptance(ge, tx, ("changed",))
+    hook, base = acc.hook(lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True), start)
+    path = teacher.joint_path(pr, start, empty, vpd, hook, base)
+    floor = None if base["s_track"] is None else min(teacher.RECOVERED, base["s_track"])
+    # every step the path took kept the circuit's change in prediction on the changed texts at its floor
+    assert floor is not None and len(path) > 1
+    assert all(s["s_track"] is None or s["s_track"] >= floor for s in path[1:])

@@ -70,6 +70,14 @@ Per text:
      keep it honest (a flip joined with its connections pruned is cut from readers it writes into in the model), its
      size term stops growth that does not pay (on text9011 a repair on the C-like minimum alone added 156
      subcomponents, most unconnected, for +0.036).
+  With --accept changed[,interchange], every removal, of nodes (step 1's rounds, the joint path's prefixes) and of
+  connections, is admitted only while the search split's terms stay >= min(0.9, the search's start's) (Acceptance):
+  changed, s_track (the circuit's change in prediction on texts changed at the sensitivity probe's positions,
+  applied to the model's base prediction, against VPD's answer's: goal_eval.changed_search), interchange,
+  s_interchange (goal_eval.interchange_search). Removal alone keeps circuits that reproduce the base prediction while
+  ignoring the context: 8 of primerl's 10 bake-off texts omitted the position whose change moves the prediction most,
+  and pruned connections cut the paths a context change travels (held-out changed-input scores 0.00-0.14). The node
+  rounds and joint path run only without --from-path; the connections either way.
 Every membership decision is measured; orderings only order.
 
 Output per text in --out: <task>.json (the teacher circuit), <task>.f1.json, <task>.vpd_top<k>.json, <task>.n<size>.json at
@@ -487,13 +495,14 @@ def top_k(pr: Pruner, order: torch.Tensor, empty: float, vpd: float, target: flo
     return hi
 
 
-def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> list[dict]:
+def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float, accept=None, start_terms: dict | None = None) -> list[dict]:
     """Nested measured removal from `start` down to MIN_SIZE. Each step measures every single removal's F1 and N (two
     runs each) and ranks the removals by the mean they leave; then it measures removing the first 1, 2, 4, ... of them
     up to a tenth of the circuit (removals interact: subcomponents cancel) and takes the prefix with the highest
-    measured mean, the longest on a tie. Records: the state after each step and the node ids removed."""
+    measured mean, the longest on a tie; with accept (Acceptance.hook), among the prefixes it admits, the path ending
+    when it admits none. Records: the state after each step, the node ids removed and accept's terms."""
     on = start.clone()
-    path = [{"size": int(on.sum()), "removed": [], **measure(pr, on[None], empty, vpd)[0]}]
+    path = [{"size": int(on.sum()), "removed": [], **measure(pr, on[None], empty, vpd)[0], **(start_terms or {})}]
     while int(on.sum()) > MIN_SIZE:
         ids = on.nonzero().flatten()
         trials = on[None].repeat(len(ids), 1)
@@ -508,9 +517,15 @@ def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> lis
         for i, k in enumerate(ks):
             prefixes[i, ranked[:k]] = False
         got = measure(pr, prefixes, empty, vpd)
-        i = max(range(len(ks)), key=lambda j: (got[j]["mean"], ks[j]))
+        ok, terms = list(range(len(ks))), [{} for _ in ks]
+        if accept is not None:
+            terms = accept(prefixes)
+            ok = [j for j in ok if terms[j] is not None]
+            if not ok:
+                break
+        i = max(ok, key=lambda j: (got[j]["mean"], ks[j]))
         on[ranked[:ks[i]]] = False
-        path.append({"size": int(on.sum()), "removed": ranked[:ks[i]].tolist(), **got[i]})
+        path.append({"size": int(on.sum()), "removed": ranked[:ks[i]].tolist(), **got[i], **terms[i]})
     return path
 
 
@@ -531,13 +546,74 @@ def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",
     return steps
 
 
+ACCEPT = {"changed": ("changed_search", "s_track"), "interchange": ("interchange_search", "s_interchange")}
+
+
+class Acceptance:
+    """Search-split acceptance of candidate circuits on one text (the lead's decisions 10-12): "changed", s_track from
+    goal_eval.GoalEval.changed_search (texts changed at the sensitivity probe's positions: the circuit's change in
+    prediction applied to the model's base prediction, against VPD's answer's, bounded by no change), and
+    "interchange", s_interchange from interchange_search (the circuit's subcomponents at a position set to the
+    model's activations on a changed text, against VPD's answer under the same patches). A candidate passes while each
+    term stays >= min(0.9, the search's start's); a term that is None (uninformative on the text) passes. The
+    splits' eval draws stay held out (gates, tables)."""
+
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds):
+        self.ge, self.tx, self.kinds, self.calls = ge, tx, tuple(kinds), 0
+
+    def scores(self, graphs: list) -> list[dict]:
+        out = [{} for _ in graphs]
+        for k in self.kinds:
+            fn, key = ACCEPT[k]
+            for o, r in zip(out, getattr(self.ge, fn)(self.tx, graphs)):
+                o[key] = r[key]
+        self.calls += 1
+        return out
+
+    def hook(self, graph_of, start: torch.Tensor) -> tuple:
+        """(accept(ons) for Descent.prune and joint_path: per candidate unit set [K, units], its terms when each is at or
+        above its floor, else None; the start's terms). graph_of(on): a unit set's circuit as goal_eval runs it."""
+        base = self.scores([graph_of(start)])[0]
+        floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
+
+        def accept(ons):
+            got = self.scores([graph_of(on) for on in ons])
+            return [r if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r) else None for r in got]
+        return accept, base
+
+
+def both(*accepts):
+    """Accept hooks combined: a candidate passes when each passes (each asked only about the candidates the earlier
+    ones admitted), its dicts merged; None when no hook is given."""
+    accepts = [a for a in accepts if a is not None]
+    if not accepts:
+        return None
+
+    def accept(ons):
+        out, alive = [{} for _ in range(len(ons))], list(range(len(ons)))
+        for a in accepts:
+            if not alive:
+                break
+            got = a(ons[torch.tensor(alive, device=ons.device)])
+            for i, g in zip(alive, got):
+                if g is None:
+                    out[i] = None
+                else:
+                    out[i].update(g)
+            alive = [i for i in alive if out[i] is not None]
+        return out
+    return accept
+
+
 class Connector:
     """A text's connection pruning (edge_path) and flip repair for node sets of its answer (pr.nodes, bool [N] sets),
     with the text's bounds, F1 budget and size term (size_term(on, inner, out))."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: Pruner, empty: float, vpd: float, size_term, B: int = 32,
-                 robust: dict | None = None, no_strand: bool = False, levels: tuple = ("connection",)):
+                 robust: dict | None = None, no_strand: bool = False, levels: tuple = ("connection",),
+                 acceptance: Acceptance | None = None):
         self.ge, self.tx, self.pr, self.empty, self.vpd, self.size_term, self.B = ge, tx, pr, empty, vpd, size_term, B
+        self.acceptance = acceptance  # connection removals also keep the search-split terms (Acceptance)
         self.levels = levels      # edge_path's levels in turn (coarse ones first: "writer", "reader"; then "connection")
         self.robust = robust      # the adversary's pool: connection removals also keep F1 under the omitted lever's flips
         self.no_strand = no_strand  # every non-query/key node keeps a stated connection
@@ -578,6 +654,9 @@ class Connector:
 
             def accept(ons):
                 return [{"f1_flips": f} if f >= floor else None for f in flips(ons)]
+        if self.acceptance is not None:                      # the search-split terms of the stated graph
+            terms, base = self.acceptance.hook(lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]), ep.on)
+            accept, start = both(accept, terms), {**start, **base}
 
         def state(kl, e_on, removed):
             f1 = goal_eval._clip01(goal_eval.recovered_log(empty, kl, vpd))
@@ -673,7 +752,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           vpd_order: list | None = None, start_top: int = 0, f1_start: str = "both", edges: bool = False,
           from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
           max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
-          robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",)) -> tuple[dict, dict]:
+          robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
+          accept: tuple = ()) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -710,10 +790,16 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     row = {"T": tx.T, "convention": CONVENTION, "vpd_size": len(pr.nodes), "vpd_positions": int(torch.unique(pr.t).numel()),
            "kl_empty": empty, "kl_vpd": vpd, "budget_kl": budget, "active_scale": active, "levels": {}}
+    acceptance = Acceptance(ge, tx, accept) if accept else None
+    as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
+
     def search(levels, label):
+        hook = None
+        if acceptance is not None:                           # the search-split terms, floors from this search's start
+            hook, row["levels"][f"{label}accept_start"] = acceptance.hook(as_nodes, pr.on.clone())
         for level in levels:
             t1 = time.perf_counter()
-            rounds = pr.prune(level, budget)
+            rounds = pr.prune(level, budget, accept=hook)
             row["levels"][f"{label}{level}"] = lv = {"rounds": rounds, "size": int(pr.on.sum()),
                                                      "positions": int(torch.unique(pr.t[pr.on]).numel()), "kl": pr.kl(),
                                                      "seconds": time.perf_counter() - t1}
@@ -746,7 +832,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         topk_on = torch.zeros_like(f1_on)
         topk_on[order[:k]] = True
         start = f1_on | topk_on
-        path = joint_path(pr, start, empty, vpd)
+        hook, base = acceptance.hook(as_nodes, start) if acceptance is not None else (None, None)
+        path = joint_path(pr, start, empty, vpd, hook, base)
     else:                                                    # steps 1-3 as saved: the same start set, its steps
         t1 = time.perf_counter()
         here = {i: index[nd] for i, nd in zip(from_path["start_index"], saved_start)}   # saved node id -> this one
@@ -788,7 +875,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     points = {min(range(len(path)), key=lambda j: abs(path[j]["size"] - want)) for want in SIZES}
     wired, edge_paths, t2 = {}, [], time.perf_counter()     # node step -> (its last edge step's connections, its row)
 
-    wiring = Connector(ge, tx, pr, empty, vpd, size_term, B, robust=robust_pool, no_strand=no_strand, levels=edge_levels)
+    wiring = Connector(ge, tx, pr, empty, vpd, size_term, B, robust=robust_pool, no_strand=no_strand, levels=edge_levels,
+                       acceptance=acceptance)
 
     def wire(i):
         if i not in wired:
@@ -871,6 +959,8 @@ def main():
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
+    ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "
+                    ">= min(0.9, the search's start's): changed (s_track, goal_eval.changed_search), interchange (s_interchange)")
     ap.add_argument("--no-strand", action="store_true",
                     help="with --edges, every non-query/key node keeps a stated connection (its most important; one the model connects "
                          "to no other node is dropped): the stated graph is the claim, a listed node needs a stated role")
@@ -940,7 +1030,7 @@ def main():
         circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
                                          args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
-                                         args.no_strand, args.edge_levels)
+                                         args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k))
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

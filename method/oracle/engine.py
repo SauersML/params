@@ -155,8 +155,7 @@ class Engine:
             raise ValueError(f"precision is one of {PRECISIONS}")
         with _precision(precision, self.dev):
             h = self.hidden(masks, search=False) if precision == "score" else self._search(masks, search=True, rest=self._rest[precision])
-            lq = torch.log_softmax((h @ self.tg.wte.T).float(), -1)
-        return carry.kl(self.ref, lq)
+        return carry.kl(self.ref, torch.log_softmax(h.float() @ self.tg.wte.T, -1))  # the logits in float32 at every precision
 
     def full(self, masks: dict) -> dict:
         """Masks over a site's columns as masks over all its subcomponents [B, T, C] (for another engine or Native)."""
@@ -260,8 +259,7 @@ class Engine:
         with _precision(precision, self.dev):
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
                                    None if ow is None else ow.reshape(-1), B, precision != "score", self._rest[precision])
-            lq = torch.log_softmax((h @ self.tg.wte.T).float(), -1)
-        return carry.kl(self.ref, lq)
+        return carry.kl(self.ref, torch.log_softmax(h.float() @ self.tg.wte.T, -1))
 
     def _zeros(self) -> dict:
         if not hasattr(self, "_u0"):

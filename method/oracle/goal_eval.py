@@ -7,52 +7,60 @@ nodes (weight matrix, subcomponent index, position) and explicit edges (upstream
 prediction), each a connection the model has (mech.connects: the residual stream at one position, a value into its
 layer's attention output at that or a later position, an MLP input into its MLP's output); a stated pair the model
 does not connect is dropped and counted. Queries and keys are nodes without edges out: they enter their layer's
-attention pattern. Every KL is the model's next-token distribution at the targets (summed over them) from the run's, in
-bits; native.Native.run runs every intervention.
+attention pattern. A token-embedding input node ["tok", 0, position] may feed the residual readers at its position (the
+embedding, which VPD does not decompose, is how a token's change reaches a circuit); its edges are counted, not cut.
 
-  F1 sufficiency: the circuit runs alone (native's run-alone graph: its nodes at mask 1 reading their stated parents,
-     the token embedding, every other subcomponent at 0), on the text and on the text's changed prompts
-     (Native.changes, the verifier's). VPD's remainders W - V U are held at their values in the model on the text
-     (the decomposition's error is not the answer's), and, reported separately, ablated (native's verifier setting).
-  F2 interchange: at each input position whose changed token moves the prediction by at least 1% of the text's total
-     (Native.sensitivity, summed over positions), the prompts changing that token to the model's held-out alternatives
-     there (carry.alternatives at ranks 3 to 5; the carry search uses 0 to 2) run with the circuit's subcomponents
-     computing and every other activation held at its value on the text (carry.Carry; remainders compute). Its share
-     carried: 1 - KL / movement, movement the KL with nothing held (the model on the changed prompt from the model on
-     the text), positions pooled by movement. The bypass share is the same with no subcomponent computing: what VPD's
-     remainders carry and, at a changed target position, the changed token's own embedding, which the prediction
-     there reads directly (on held-out text9002 every position's bypass carries nothing except the target's, where it
-     moves the prediction 3% further than the change itself).
-  F3 edges: each stated edge cut in the whole model on the text (path patching of that one connection: the reader
-     recomputed without the writer's output and everything else as in the model, then the model run on from the
-     reader's new activation), against random pairs of the circuit's nodes that the model connects and the answer does
-     not state, cut the same way: the KL of each cut, their means, and the probability that a stated edge's cut moves
-     the prediction more than an unstated pair's (AUC).
+Runs use VPD's semantics: a run "with circuit C" has C's subcomponents on (mask 1) and every other one off (mask 0), the
+remainders W - V U either on ("live", computing on the run's own inputs) or off; both conventions are reported. Every
+KL is the model's next-token distribution at the targets (summed over them) from the run's, in bits. VPD's own answer
+is the set of subcomponents with causal importance above zero on the input (at positions that can reach the targets,
+Native.reachable); the empty circuit and it bound every answer:
+  recovered = (KL_empty - KL_C) / (KL_empty - KL_VPD), completeness = min(1, recovered / GOAL)
+
+Reward fields, on the text:
+  F1: KL_C, recovered and completeness, with KL_empty and KL_VPD (VPD's own faithfulness on the text, the ceiling),
+     and recovered_log, the same in orders of magnitude of KL (recovered_log()).
+  N, necessity: clip((KL_{VPD minus C} - KL_VPD) / (KL_empty - KL_VPD), 0, 1), "VPD minus C" VPD's own answer with the
+     circuit's subcomponents off: how much of what VPD's answer computes needs the circuit.
+  F3, edges: in the circuit's run (remainders off), each stated edge cut (path patching of that one connection: the
+     reader reads every input but that writer's output; native.Native.run's edge strengths) against random pairs of
+     the circuit's nodes that the model connects and the answer does not state, each cut's effect the KL of the
+     circuit's run from the cut run; F3 is the probability that a stated cut moves the prediction more than an
+     unstated one (AUC), and 0 when the answer states no edge or leaves no connected pair unstated (an answer earns
+     edge credit only by saying which connections matter).
   size: the description length of the nodes and edges in bits (native.Graph.bits).
   E1 (the English reader's bits) and E2 (question-answering accuracy): hooks (GoalEval.hooks) that the RL owner fills.
+Diagnostics (score(diagnostics=True)), not reward fields: F1 on the text's changed prompts (Native.changes) and F2 on
+the held-out alternatives (carry.alternatives, ranks 3 to 5) at each position whose changed token moves the prediction
+by at least 1% of the text's total (Native.sensitivity), the same circuit identities run on each, recovered pooled
+over the prompts against VPD's own answer and the empty circuit on each; and interchange carry (primerl's rule b):
+at a changed position p, every subcomponent at p, every one inactive on both the text and the changed prompt, the
+circuit's and the remainders compute, everything else held at its value on the text (carry.Carry), carried = 1 - KL /
+movement, beside B_p, the same with every subcomponent active on the text after p named, and completeness_p =
+min(1, carried / (GOAL x B_p)); target positions are left out (trivially carried).
+Whole-model path patching of single connections (cuts()) serves question answering and teachers.
 
 Baselines, scored by the same code: the empty circuit, VPD's own answer at the answer's size (its causal-importance
-ranking, native.Native._vpd_order, complete), and every active subcomponent (causal importance above zero) in the
-prediction's backward cone (Native.reachable), complete.
+order, native.Native._vpd_order), and VPD's own answer.
 
-  goal_eval.py score --set NAME=DIR [--set NAME=DIR ...] --split heldout --n N [--out OUT.json]
-DIR holds one answer per text, <task>.json (Circuit's JSON) or <task>.py (a traced graph program, mech).
+  goal_eval.py score --set NAME=DIR [--set NAME=DIR ...] --split heldout --n N [--diagnostics] [--out OUT.json]
+DIR holds each text's answer, <task>.json (circuit JSON) or <task>.py (a traced graph program, mech), and further
+samples <task>.<k>.json or .py (k = 1, 2, ...).
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import json
 import math
+import re
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.overrides import TorchFunctionMode
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -63,11 +71,12 @@ import native  # noqa: E402
 
 HELD_OUT_RANKS = (3, 4, 5)  # carry.alternatives' ranks for F2; the carry search and its training answers use 0 to 2
 SHARE_FLOOR = 0.01  # F2's positions: those moving the prediction by at least this share of the text's total
+GOAL = 0.9  # completeness: the share of VPD's recovery that counts as complete
 RANDOM_PAIRS = 32  # F3's unstated pairs per answer
 MAX_EDGES = 64  # F3's stated edges per answer (a uniform draw when an answer states more)
-UNIT_LIMIT = 20_000  # F2 computes at most this many subcomponents through carry's unit path; larger sets take masks
-CHUNK = 16  # answers per batch (F1)
-CUT_CHUNK = 32  # cuts per batch (F3)
+CHUNK = 8  # circuits per masked forward pass
+CUT_CHUNK = 32  # cuts per batch
+CONVENTIONS = ("live", "off")  # the remainders' convention
 
 
 # ---- answers
@@ -84,10 +93,17 @@ def _site(name) -> str:
 def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.Graph, dict]:
     """(the Graph of an answer in JSON, its defects). JSON: {"nodes": [[matrix, index, position], ...], "edges":
     [[upstream, downstream], ...], "explanation": str}; an edge end is a node's place in the list, downstream "out" for
-    the prediction; a matrix is native's name or "L.kind" (kind q, k, v, o, fc, down). Nodes outside the model or the
-    text, and edges the model does not have (mech.connects), are dropped and counted."""
+    the prediction; a matrix is native's name or "L.kind" (kind q, k, v, o, fc, down), or "tok" for the token
+    embedding at the position (index 0), which feeds residual readers at its position (Graph.tok_edges: (position,
+    reader)). Nodes outside the model or the text, and edges the model does not have (mech.connects), are dropped and
+    counted."""
     nodes, bad_nodes = [], 0
     for m, c, t in answer.get("nodes", []):
+        if m == "tok":
+            ok = int(c) == 0 and 0 <= int(t) <= max(targets)
+            nodes.append(("tok", int(t), 0) if ok else None)
+            bad_nodes += not ok
+            continue
         try:
             n = _site(m)
         except (ValueError, KeyError):
@@ -97,7 +113,7 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
         else:
             bad_nodes += 1
             nodes.append(None)
-    parents, out, bad_edges = {}, [], 0
+    parents, out, tok, bad_edges = {}, [], [], 0
     for up, down in answer.get("edges", []):
         try:
             w = nodes[up]
@@ -105,21 +121,32 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
         except (IndexError, TypeError):
             bad_edges += 1
             continue
-        if w is None or (down != "out" and r is None) or not native.connects(w, r, targets):
+        if w is None or (down != "out" and r is None):
+            bad_edges += 1
+        elif w[0] == "tok":
+            if r is not None and r[0] != "tok" and native._name_layer_kind(r[0])[1] in mech.RESID_READERS and r[1] == w[1]:
+                tok.append((w[1], r))
+            else:
+                bad_edges += 1
+        elif (r is not None and r[0] == "tok") or not native.connects(w, r, targets):
             bad_edges += 1
         elif r is None:
             out.append(w)
         else:
             parents.setdefault(r, []).append(w)
-    g = native.Graph([nd for nd in nodes if nd is not None], {r: list(dict.fromkeys(ws)) for r, ws in parents.items()}, list(dict.fromkeys(out)))
+    g = native.Graph([nd for nd in nodes if nd is not None and nd[0] != "tok"], {r: list(dict.fromkeys(ws)) for r, ws in parents.items()},
+                     list(dict.fromkeys(out)))
+    g.tok_edges = list(dict.fromkeys(tok))
     return g, {"invalid_nodes": bad_nodes, "invalid_edges": bad_edges}
 
 
 def to_json(g: native.Graph, explanation: str = "") -> dict:
     """A Graph (not complete) as an answer in JSON (circuit's format)."""
-    nodes = sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2]))
+    tok = getattr(g, "tok_edges", [])
+    nodes = sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2])) + [("tok", p, 0) for p in sorted({p for p, _ in tok})]
     at = {nd: i for i, nd in enumerate(nodes)}
-    edges = [[at[w], at[r]] for r, ws in g.parents.items() for w in ws] + [[at[w], "out"] for w in g.out]
+    edges = ([[at[w], at[r]] for r, ws in g.parents.items() for w in ws] + [[at[w], "out"] for w in g.out]
+             + [[at[("tok", p, 0)], at[r]] for p, r in tok])
     return {"nodes": [[n, c, t] for n, t, c in nodes], "edges": edges, "explanation": explanation}
 
 
@@ -130,22 +157,7 @@ def _pairs(g: native.Graph) -> list[tuple]:
                   key=lambda e: (e[0], e[1] or ("", -1, -1)))
 
 
-class _Held(TorchFunctionMode):
-    """Every remainder product (W - V U applied to its input) at its value in the model on the text (values: carry's
-    capture), at the positions a run computes: the last L when Native.run reuses an earlier run's states."""
-
-    def __init__(self, nat: native.Native, values: dict):
-        self.by_id = {id(nat.target.site(n).delta_T): values[n] for n in nat.names}
-
-    def __torch_function__(self, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        if func.__name__ in ("matmul", "__matmul__") and len(args) > 1 and id(args[1]) in self.by_id:
-            v = self.by_id[id(args[1])]
-            return v[:, v.shape[1] - args[0].shape[1]:].expand(args[0].shape[0], -1, -1)
-        return func(*args, **kwargs)
-
-
-def _from(ids: list[int], p: int) -> tuple | None:
+def _from(ids: list[int], p: int) -> list | None:
     """A base for Native.run(reuse=) on ids itself whose states hold up to position p: ids with a token that differs
     at p (the run recomputes from there; None from position 0)."""
     if p <= 0:
@@ -155,17 +167,51 @@ def _from(ids: list[int], p: int) -> tuple | None:
     return base
 
 
+def _mean(xs) -> float | None:
+    return float(np.mean(xs)) if xs else None
+
+
+def _auc(stated: list[float], unstated: list[float]) -> float | None:
+    """P(a stated edge's cut > an unstated pair's), ties counting one half."""
+    if not stated or not unstated:
+        return None
+    a, b = np.asarray(stated)[:, None], np.asarray(unstated)[None, :]
+    return float(((a > b).mean() + 0.5 * (a == b).mean()))
+
+
+def recovered(empty: float, c: float, vpd: float) -> float | None:
+    """(KL_empty - KL_C) / (KL_empty - KL_VPD); None when VPD's own answer recovers nothing."""
+    return (empty - c) / (empty - vpd) if empty - vpd > 0 else None
+
+
+def recovered_log(empty: float, c: float, vpd: float) -> float | None:
+    """ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD): the recovery in orders of magnitude of KL (recovered is dominated by
+    the empty circuit's ~100 bits, so circuits 0.5 and 2.5 bits from the model both recover about 0.98); KLs floored
+    at 1e-9 bits."""
+    e, c, v = (max(x, 1e-9) for x in (empty, c, vpd))
+    return math.log(e / c) / math.log(e / v) if e > v else None
+
+
+def necessity(empty: float, minus: float, vpd: float) -> float | None:
+    """clip((KL_{VPD minus C} - KL_VPD) / (KL_empty - KL_VPD), 0, 1)."""
+    return min(1.0, max(0.0, (minus - vpd) / (empty - vpd))) if empty - vpd > 0 else None
+
+
+def completeness(r: float | None) -> float | None:
+    return None if r is None else min(1.0, r / GOAL)
+
+
 # ---- one text
 
 
 class Text:
-    """What every answer on one text shares: the model's run, the changed prompts and their references, the
-    remainders' values, F2's positions and held-out prompts."""
+    """What every answer on one text shares: the model's run and record, the remainders' values (for cuts()), VPD's
+    own answer, and, when asked for, the changed prompts and F2's prompts (GoalEval.probe)."""
 
     def __init__(self, ge: "GoalEval", ids: list[int], targets: list[int], seed: int, task: dict | None = None):
         nat = ge.nat
         t0 = time.perf_counter()
-        self.ids, self.targets, self.T, self.seed, self.task = list(ids), list(targets), len(ids), seed, task
+        self.ge, self.ids, self.targets, self.T, self.seed, self.task = ge, list(ids), list(targets), len(ids), seed, task
         self.rec, self.states = nat._model_record(self.ids)
         self.ref = nat.reference([self.ids], self.targets)
         cap = carry._Remainders(nat)
@@ -174,12 +220,29 @@ class Text:
         if cap.seen != set(nat.names):
             raise RuntimeError("did not capture every remainder product")
         self.rem = cap.values
-        self.prompts, self.f2 = ge.probe(self.ids, self.targets, seed)  # f2: (position, held-out prompts)
-        self.prompt_refs = [nat.reference([x], self.targets) for x in self.prompts]
         self.ci = nat.importance(self.ids) if nat.has_importance else None
-        self.cut_cache: dict = {}  # (writer, reader) -> F3's KL of its cut: answers on a text share edges
-        self._flow = None
+        self.vpd = ge.vpd_answer(self.ids, self.targets, self.ci)
+        self.cut_cache: dict = {}  # (writer, reader) -> cuts()' result: answers on a text share edges
+        self.bounds: dict = {}  # convention -> (KL_empty, KL_VPD) on the text
+        self._flow = self._probe = None
         self.seconds = time.perf_counter() - t0
+
+    def _probed(self):
+        if self._probe is None:
+            t0 = time.perf_counter()
+            self._probe = self.ge.probe(self.ids, self.targets, self.seed)
+            self.seconds += time.perf_counter() - t0
+        return self._probe
+
+    @property
+    def prompts(self) -> list:
+        """The text's changed prompts (Native.changes)."""
+        return self._probed()[0]
+
+    @property
+    def f2(self) -> list:
+        """F2's positions with their held-out prompts, [(position, prompts)]."""
+        return self._probed()[1]
 
 
 # ---- the scorecard
@@ -198,9 +261,12 @@ class GoalEval:
         self.hooks: dict = {"E1": None, "E2": None}
         self.probes: dict = {}  # (ids, targets, seed) -> the changed prompts and F2's prompts, as int32 arrays
 
+    def text(self, ids: list[int], targets: list[int], seed: int | None = None, task: dict | None = None) -> Text:
+        return Text(self, ids, targets, native.task_seed(str(ids[:8])) if seed is None else seed, task)
+
     def probe(self, ids: list[int], targets: list[int], seed: int) -> tuple[list, list]:
         """(the text's changed prompts (Native.changes), F2's [(position, held-out prompts)]), kept per text: the
-        sensitivity probe behind both is most of a text's preparation (16 s at T 395 on the Mac's GPU)."""
+        sensitivity probe behind both is most of their cost (16 s at T 395 on the Mac's GPU)."""
         nat, key = self.nat, (tuple(ids), tuple(targets), seed)
         if key not in self.probes:
             probe = {}
@@ -215,120 +281,169 @@ class GoalEval:
         arr, weights, f2 = self.probes[key]
         return [native.Changed(x.tolist(), w) for x, w in zip(arr, weights)], [(p, a.tolist()) for p, a in f2]
 
-    def text(self, ids: list[int], targets: list[int], seed: int | None = None, task: dict | None = None) -> Text:
-        return Text(self, ids, targets, native.task_seed(str(ids[:8])) if seed is None else seed, task)
+    # ---- VPD's semantics
 
-    # ---- F1
-
-    @torch.no_grad()
-    def sufficiency(self, tx: Text, graphs: list[native.Graph]) -> dict:
-        """Per graph, F1 in bits: on the text and averaged over the changed prompts, remainders held at their values
-        on the text ("held") and ablated ("ablated"). A changed prompt reuses the graph's own run on the text before
-        its changed position (Native.run's reuse)."""
+    def vpd_answer(self, ids: list[int], targets: list[int], ci: dict | None = None) -> dict | None:
+        """VPD's own answer on ids: matrix -> bool [T, C], causal importance above zero at positions that can reach
+        the targets (Native.reachable); None without the causal-importance network (a pod)."""
         nat = self.nat
-        zu, zr = nat._zero()
-        one_r = nat._one()[1]
-        out = {k: torch.zeros(len(graphs), device=nat.dev) for k in ("text_held", "changed_held", "text_ablated", "changed_ablated")}
-        weights = [getattr(x, "weight", 1.0) for x in tx.prompts]
-        for s0 in range(0, len(graphs), self.chunk):
-            part = graphs[s0:s0 + self.chunk]
-            B = len(part)
-            plan = nat._plan(part, tx.T)
-            for key, ur, mode in (("held", one_r, _Held(nat, tx.rem)), ("ablated", zr, None)):
-                states = {}
-                with mode or contextlib.nullcontext():
-                    out[f"text_{key}"][s0:s0 + B] = carry.kl(tx.ref, nat.run(tx.ids, tx.targets, plan, zu, ur, fill=states))
-                    for x, logp, w in zip(tx.prompts, tx.prompt_refs, weights):
-                        lq = nat.run(x, tx.targets, plan, zu, ur, reuse=(states, tx.ids) if states else None)
-                        out[f"changed_{key}"][s0:s0 + B] += w * carry.kl(logp, lq) / len(tx.prompts)
-                del states
-            native.free(nat.dev)
-        return {k: v.tolist() for k, v in out.items()}
+        if ci is None:
+            if not nat.has_importance:
+                return None
+            ci = nat.importance(ids)
+        reach = nat.reachable(len(ids), targets)
+        return {n: (ci[n] > 0) & reach[n] for n in nat.names}
 
-    # ---- F2
-
-    def _live(self, g: native.Graph, lo: int, hi: int) -> list:
-        """A graph's nodes at positions lo..hi (a change at lo reaches no earlier position; none later reaches the
-        targets)."""
+    def masks(self, g: native.Graph, T: int) -> dict:
+        """A graph's subcomponents as matrix -> bool [T, C]."""
         if g.masks is not None:
-            return [(n, lo + t, c) for n, m in g.masks.items() for t, c in m[lo:hi + 1].nonzero().tolist()]
-        return [nd for nd in g.nodes if lo <= nd[1] <= hi]
+            return g.masks
+        return carry.masks(self.nat, T, g.nodes)
 
     @torch.no_grad()
-    def interchange(self, tx: Text, graphs: list[native.Graph]) -> dict:
-        """Per graph, F2: its movement-pooled share carried and per position (position, movement bits, KL bits), and
-        the bypass share (no subcomponent computing: the remainders and a changed target's embedding). Sets of at most UNIT_LIMIT subcomponents run through carry's
-        subcomponent units (positions from the change on), larger ones as dense masks (carry's node masks); both
-        hold every other activation at its value on the text."""
-        nat, hi = self.nat, max(tx.targets)
-        rows = [[] for _ in graphs]
-        empty_kl, moved = 0.0, 0.0
-        for p, prompts in tx.f2:
-            live = [self._live(g, p, hi) for g in graphs]
-            small = [b for b, nodes in enumerate(live) if len(nodes) <= UNIT_LIMIT]
-            big = [b for b in range(len(graphs)) if b not in small]
-            union = sorted({nd for b in small for nd in live[b]})
-            kls = [None] * len(graphs)
-            if union:
-                cand = {}
-                for n, t, c in union:
-                    cand.setdefault((n, t), []).append(c)
-                space = carry.UnitSpace(nat, tx.T, sorted({t for _, t in cand}), "subcomponent", cand)
-                study = carry.Carry(nat, tx.ids, tx.targets, prompts, space=space)
-                a = torch.zeros(len(small) + 1, space.size, dtype=torch.bool, device=nat.dev)
-                for j, b in enumerate(small):
-                    if live[b]:
-                        a[j, torch.tensor([space.index[carry.Subcomponent(*nd)] for nd in live[b]], device=nat.dev)] = True
-                got = study.measure(a).tolist()
-                for j, b in enumerate(small):
-                    kls[b] = got[j]
-                e = got[-1]
-            else:
-                study = carry.Carry(nat, tx.ids, tx.targets, prompts)
-                e = float(study.measure([set()])[0])
-                for b in small:
-                    kls[b] = e
-            if big:
-                dense = carry.Carry(nat, tx.ids, tx.targets, prompts)
-                got = dense.measure([carry.masks(nat, tx.T, set(live[b])) for b in big]).tolist()
-                for j, b in enumerate(big):
-                    kls[b] = got[j]
-            m = carry._movement(study)
-            moved += m
-            empty_kl += e
-            for b in range(len(graphs)):
-                rows[b].append((p, m, kls[b]))
-            native.free(nat.dev)
-        share = [None if moved <= 0 else 1 - sum(r[2] for r in rs) / moved for rs in rows]
-        return {"share": share, "positions": rows, "bypass_share": None if moved <= 0 else 1 - empty_kl / moved,
-                "movement_bits": moved}
+    def runs(self, ids: list[int], targets: list[int], sets: list[dict], live: bool) -> torch.Tensor:
+        """log q at the targets [len(sets), len(targets), V] of VPD's masked forward pass (vpd_model's Site masks) with
+        each set's subcomponents on, every other off, remainders on (live) or off."""
+        nat, tg = self.nat, self.nat.target
+        T = len(ids)
+        out = []
+        for s0 in range(0, len(sets), self.chunk):
+            part = sets[s0:s0 + self.chunk]
+            B = len(part)
+            for n in nat.names:
+                st = tg.site(n)
+                st.mask = torch.stack([m[n] for m in part]).float()
+                st.delta_mask = torch.ones(B, T, device=nat.dev) if live else None
+            try:
+                hidden = tg.hidden(torch.tensor([ids], device=nat.dev).expand(B, -1))
+            finally:
+                nat.vpd.clear()
+            out.append(torch.log_softmax((hidden[:, targets] @ tg.wte.T).float(), -1))
+        return torch.cat(out)
+
+    def _bounds(self, tx: Text, conv: str) -> tuple[float, float | None]:
+        """(KL_empty, KL_VPD) on the text under a convention, kept on tx."""
+        if conv not in tx.bounds:
+            nat = self.nat
+            empty = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+            sets = [empty] + ([tx.vpd] if tx.vpd is not None else [])
+            kl = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, sets, conv == "live")).tolist()
+            tx.bounds[conv] = (kl[0], kl[1] if tx.vpd is not None else None)
+        return tx.bounds[conv]
+
+    def sufficiency(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+        """Per graph, per convention: F1 (KL_C, recovered, completeness) and N on the text, with the bounds."""
+        rows = [{} for _ in graphs]
+        sets = [self.masks(g, tx.T) for g in graphs]
+        if tx.vpd is not None:
+            sets += [{n: tx.vpd[n] & ~m[n] for n in self.nat.names} for m in sets]
+        for conv in CONVENTIONS:
+            e, v = self._bounds(tx, conv)
+            kl = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, sets, conv == "live")).tolist() if sets else []
+            for b, row in enumerate(rows):
+                c = kl[b]
+                r = recovered(e, c, v) if v is not None else None
+                row.update({f"kl_{conv}": c, f"kl_empty_{conv}": e, f"kl_vpd_{conv}": v, f"recovered_{conv}": r,
+                            f"completeness_{conv}": completeness(r), f"recovered_log_{conv}": recovered_log(e, c, v) if v is not None else None})
+                if v is not None:
+                    m = kl[len(graphs) + b]
+                    row.update({f"kl_vpd_minus_{conv}": m, f"necessity_{conv}": necessity(e, m, v)})
+                else:
+                    row.update({f"kl_vpd_minus_{conv}": None, f"necessity_{conv}": None})
+        return rows
 
     # ---- F3
 
     @torch.no_grad()
-    def cuts(self, tx: Text, pairs: list[tuple]) -> list[float]:
-        """The KL in bits of the model on the text from the model with one connection cut, per (writer, reader) pair
-        (reader None: the prediction). The reader's new activation is its input in the model without the writer's
-        output alone (every other output and every remainder as in the model; _cut_activations); the model then runs
-        with that one activation replaced (path patching of the connection). Into the prediction: the final residual
-        stream without the writer's output."""
+    def edge_effects(self, tx: Text, g: native.Graph, pairs: list[tuple]) -> list[float]:
+        """Per (writer, reader) pair among the graph's nodes (reader None: the prediction), the KL in bits of the
+        graph's run (every connection the model has among its nodes, remainders off) from the same run with that one
+        connection at strength 0 (Native.run's edge strengths: the reader reads every other input as before)."""
         nat, T = self.nat, tx.T
+        nodes = g.node_set()
+        par, out = native.all_edges(nodes, tx.targets)
+        full = native.Graph(nodes, par, out)
+        order = {e: j for j, e in enumerate([(w, r) for r, ws in full.parents.items() for w in ws] + [(w, None) for w in full.out])}
+        E = len(order)
+        zu, zr = nat._zero()
+        res = []
+        rows = [None] + list(pairs)
+        base = None
+        for s0 in range(0, len(rows), self.cut_chunk):
+            part = rows[s0:s0 + self.cut_chunk]
+            B = len(part)
+            plan = nat._plan([full] * B, T)
+            w = torch.ones(B * E, device=nat.dev)
+            cut = [b * E + order[e] for b, e in enumerate(part) if e is not None]
+            if cut:
+                w[torch.tensor(cut, device=nat.dev)] = 0.0
+            ew, ow = nat.edge_weights(plan, w)
+            lq = nat.run(tx.ids, tx.targets, plan, zu, zr, ew, ow)
+            if base is None:
+                base = lq[:1]
+            res += carry.kl(base, lq).tolist()
+            native.free(nat.dev)
+        return res[1:]
+
+    def edges(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+        """Per graph, F3 (see the module docstring): the cut effects of its stated edges (at most max_edges, a uniform
+        draw beyond) and of random unstated connected pairs of its nodes (random_pairs), drawn by the text's seed and
+        the answer's own edges. A complete graph (a baseline) states no edge: F3 None."""
+        out = []
+        for g in graphs:
+            if g.complete:
+                out.append({"f3": None, "stated": None, "unstated": None})
+                continue
+            stated = _pairs(g)
+            nodes = g.node_set()
+            par, outs = native.all_edges(nodes, tx.targets)
+            have = set(stated)
+            unstated = [e for e in _pairs(native.Graph(nodes, par, outs)) if e not in have]
+            rng = np.random.default_rng([tx.seed, int(hashlib.sha256(repr(stated).encode()).hexdigest()[:15], 16)])
+            if len(stated) > self.max_edges:
+                stated = [stated[i] for i in sorted(rng.choice(len(stated), self.max_edges, replace=False))]
+            if len(unstated) > self.random_pairs:
+                unstated = [unstated[i] for i in sorted(rng.choice(len(unstated), self.random_pairs, replace=False))]
+            if not stated or not unstated:
+                out.append({"f3": 0.0, "stated": None, "unstated": None})
+                continue
+            effects = self.edge_effects(tx, g, stated + unstated)
+            st, un = effects[:len(stated)], effects[len(stated):]
+            out.append({"f3": _auc(st, un), "stated": st, "unstated": un})
+        return out
+
+    # ---- whole-model cuts (question answering, teachers)
+
+    @torch.no_grad()
+    def cuts(self, tx: Text, pairs: list[tuple], detail: bool = False) -> list:
+        """Per (writer, reader) pair (reader None: the prediction), the KL in bits of the model on the text from the
+        model with that one connection cut: the reader's new activation is its input in the model without the
+        writer's output alone (every other output and every remainder as in the model; _cut_activations), and the
+        model runs on with that one activation replaced (path patching of the connection); into the prediction, the
+        final residual stream without the writer's output. detail: per pair {"kl", "top": the cut run's most likely
+        token at each target, "logp_model_top": its log-probability of the model's most likely token there}."""
         todo = [e for e in dict.fromkeys(pairs) if e not in tx.cut_cache]
         if todo:
-            for e, k in zip(todo, self._cuts(tx, todo)):
-                tx.cut_cache[e] = k
-        return [tx.cut_cache[e] for e in pairs]
+            for e, d in zip(todo, self._cuts(tx, todo)):
+                tx.cut_cache[e] = d
+        return [tx.cut_cache[e] if detail else tx.cut_cache[e]["kl"] for e in pairs]
 
-    def _cuts(self, tx: Text, pairs: list[tuple]) -> list[float]:
+    def _cuts(self, tx: Text, pairs: list[tuple]) -> list[dict]:
         """cuts() of distinct pairs. The runs with a reader's new activation are batched by the reader's position and
         reuse the model's states before the batch's first reader (nothing earlier changes); a cut into the prediction
         needs no run (flow's final residual stream)."""
         nat, T = self.nat, tx.T
-        res = [0.0] * len(pairs)
+        res = [None] * len(pairs)
+        top = tx.ref[0].argmax(-1)  # [len(targets)]
+
+        def summary(lq):
+            return [{"kl": k, "top": t, "logp_model_top": p} for k, t, p in
+                    zip(carry.kl(tx.ref, lq).tolist(), lq.argmax(-1).tolist(),
+                        lq.gather(-1, top[None, :, None].expand(lq.shape[0], -1, 1))[..., 0].tolist())]
+
         inner = sorted((j for j, (_, r) in enumerate(pairs) if r is not None), key=lambda j: (pairs[j][1][1], pairs[j][0][1]))
         final = sorted((j for j, (_, r) in enumerate(pairs) if r is None), key=lambda j: pairs[j][0][1])
         one_u, one_r = nat._one()
-
         new = self._cut_activations(tx, [pairs[j] for j in inner]) if inner else None
         at = {j: i for i, j in enumerate(inner)}
         B = max(1, min(self.cut_chunk, len(inner)))  # every batch this size (the last padded with its own last cut):
@@ -339,19 +454,19 @@ class GoalEval:
             for b, j in enumerate(js):
                 r = pairs[j][1]
                 by.setdefault(r[0], []).append((b, r[1], r[2], at[j]))
-            patch2 = {}
+            patch = {}
             for n, lst in by.items():
                 bi, ti, ci, ki = nat._ints([[e[k] for e in lst] for k in range(4)])
                 m = torch.zeros(B, T, nat.C[n], dtype=torch.bool, device=nat.dev)
                 m[bi, ti, ci] = True
                 v = tx.rec[n].expand(B, -1, -1).clone()
                 v[bi, ti, ci] = new[ki]
-                patch2[n] = (m, v)
+                patch[n] = (m, v)
             base = _from(tx.ids, min(pairs[j][1][1] for j in js))
-            lq = nat.run(tx.ids, tx.targets, nat._full_plan(T, B), one_u, one_r, patch=patch2,
+            lq = nat.run(tx.ids, tx.targets, nat._full_plan(T, B), one_u, one_r, patch=patch,
                          reuse=None if base is None else (nat._model_states(tx.ids, B), base))
-            for b, k in enumerate(carry.kl(tx.ref, lq).tolist()):
-                res[js[b]] = k
+            for b, d in enumerate(summary(lq)):
+                res[js[b]] = d
             native.free(nat.dev)
         if final:
             import vpd_model
@@ -364,15 +479,16 @@ class GoalEval:
                 sel = torch.tensor([b for b, j in enumerate(final) if pairs[j][0][0] == wn], device=nat.dev)
                 x[sel, row[sel]] -= tx.rec[wn][0, t[sel], c[sel]][:, None] * tg.site(wn).U[c[sel]]
             lq = torch.log_softmax((vpd_model.rms(x, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
-            for b, k in enumerate(carry.kl(tx.ref, lq).tolist()):
-                res[final[b]] = k
+            for b, d in enumerate(summary(lq)):
+                res[final[b]] = d
         return res
 
     def flow(self, tx: Text) -> dict:
         """The model's run on the text as the cuts read it, kept on tx: per layer the residual stream before each norm
-        ("attn", "mlp" [T, d]; "final", after the last layer), the attention pattern ("P" [H, T, T]) and output before its output matrix ("att"
-        [T, d]), and the MLP's pre-activation ("pre" [T, d_mlp]); built from Native's own record of the run (every
-        activation, the queries, keys and values, the remainders' values) the way Native.run adds them up."""
+        ("attn", "mlp" [T, d]; "final", after the last layer), the attention pattern ("P" [H, T, T]) and output before
+        its output matrix ("att" [T, d]), and the MLP's pre-activation ("pre" [T, d_mlp]); built from Native's own
+        record of the run (every activation, the queries, keys and values, the remainders' values) the way Native.run
+        adds them up."""
         if tx._flow is None:
             import vpd_model
 
@@ -433,120 +549,145 @@ class GoalEval:
             out[torch.tensor(js, device=nat.dev)] = (inp * V.T[c]).sum(-1)
         return out
 
-    def edges(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
-        """Per graph, F3: the cuts of its stated edges (at most max_edges, a uniform draw beyond) and of random
-        unstated pairs of its nodes that the model connects (random_pairs); a complete graph states every connection
-        among its nodes, so it has no unstated pair (its stated edges are drawn from them). The draws depend on the
-        text's seed and the answer's own edges, not on the other answers scored with it."""
-        plans, flat = [], []
-        for g in graphs:
-            nodes = g.node_set()
-            if g.complete:
-                if not nodes or native.count_edges(nodes, tx.targets) > 1_000_000:
-                    plans.append(None)
-                    continue
-                par, out = native.all_edges(nodes, tx.targets)
-                stated, unstated = _pairs(native.Graph(nodes, par, out)), []
-            else:
-                stated = _pairs(g)
-                par, out = native.all_edges(nodes, tx.targets)
-                have = set(stated)
-                unstated = [e for e in _pairs(native.Graph(nodes, par, out)) if e not in have]
-            rng = np.random.default_rng([tx.seed, int(hashlib.sha256(repr(stated).encode()).hexdigest()[:15], 16)])
-            if len(stated) > self.max_edges:
-                stated = [stated[i] for i in sorted(rng.choice(len(stated), self.max_edges, replace=False))]
-            if len(unstated) > self.random_pairs:
-                unstated = [unstated[i] for i in sorted(rng.choice(len(unstated), self.random_pairs, replace=False))]
-            plans.append((len(flat), len(stated), len(unstated)))
-            flat += stated + unstated
-        effects = self.cuts(tx, flat) if flat else []
-        out = []
-        for p in plans:
-            if p is None:
-                out.append({"stated": None, "unstated": None, "auc": None})
-                continue
-            o, ns, nu = p
-            st, un = effects[o:o + ns], effects[o + ns:o + ns + nu]
-            out.append({"stated": st, "unstated": un, "auc": _auc(st, un)})
+    # ---- diagnostics
+
+    def across(self, tx: Text, graphs: list[native.Graph], prompts: list) -> list[dict]:
+        """Per graph, per convention, the same circuit identities run on other prompts of the text: recovered pooled
+        over them, sum (KL_empty - KL_C) / sum (KL_empty - KL_VPD), each prompt's bounds from VPD's own answer and the
+        empty circuit on that prompt, and the mean KL_C."""
+        nat = self.nat
+        sets = [self.masks(g, tx.T) for g in graphs]
+        empty = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+        acc = {conv: [[0.0, 0.0, 0.0] for _ in graphs] for conv in CONVENTIONS}
+        for x in prompts:
+            x = list(x)
+            ref = nat.reference([x], tx.targets)
+            v = self.vpd_answer(x, tx.targets)
+            extra = [empty] + ([v] if v is not None else [])
+            for conv in CONVENTIONS:
+                kl = carry.kl(ref, self.runs(x, tx.targets, sets + extra, conv == "live")).tolist()
+                e = kl[len(graphs)]
+                vv = kl[len(graphs) + 1] if v is not None else None
+                for b in range(len(graphs)):
+                    a = acc[conv][b]
+                    a[0] += e - kl[b]
+                    a[1] += (e - vv) if vv is not None else 0.0
+                    a[2] += kl[b] / len(prompts)
+            native.free(nat.dev)
+        out = [{} for _ in graphs]
+        for conv in CONVENTIONS:
+            for b in range(len(graphs)):
+                num, den, mean = acc[conv][b]
+                out[b].update({f"recovered_{conv}": num / den if den > 0 else None, f"kl_{conv}": mean if prompts else None})
         return out
 
-    # ---- baselines
+    @torch.no_grad()
+    def interchange(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+        """Per graph, interchange carry under primerl's rule b (module docstring) at F2's positions other than the
+        targets: per position [position, movement bits, carried, B_p, the empty share], and the mean over positions
+        with B_p > 0 of completeness_p."""
+        nat, T = self.nat, tx.T
+        if tx.ci is None:
+            return [{"carry_completeness": None, "carry_positions": None} for _ in graphs]
+        active = {n: tx.ci[n] > 0 for n in nat.names}
+        sets = [self.masks(g, T) for g in graphs]
+        rows = [[] for _ in graphs]
+        for p, prompts in tx.f2:
+            if p in tx.targets:
+                continue
+            after = torch.zeros(T, 1, dtype=torch.bool, device=nat.dev)
+            after[p + 1:] = True
+            at = torch.zeros(T, 1, dtype=torch.bool, device=nat.dev)
+            at[p] = True
+            kls, moved = np.zeros(len(graphs) + 2), 0.0
+            for x in prompts:
+                ci = nat.importance(x)
+                tail = {n: ~active[n] & ~(ci[n] > 0) for n in nat.names}
+                base = {n: at.expand_as(tail[n]) | tail[n] for n in nat.names}
+                named = sets + [{n: active[n] & after for n in nat.names}, {n: torch.zeros_like(tail[n]) for n in nat.names}]
+                study = carry.Carry(nat, tx.ids, tx.targets, [x])
+                kls += np.asarray(study.measure([{n: base[n] | s[n] for n in nat.names} for s in named]).tolist())
+                moved += carry._movement(study)
+                native.free(nat.dev)
+            if moved <= 0:
+                continue
+            share = 1 - kls / moved
+            for b in range(len(graphs)):
+                rows[b].append([p, moved, float(share[b]), float(share[-2]), float(share[-1])])
+        out = []
+        for rs in rows:
+            comp = [min(1.0, c / (GOAL * bp)) for _, _, c, bp, _ in rs if bp > 0]
+            out.append({"carry_completeness": _mean(comp), "carry_positions": rs})
+        return out
+
+    # ---- baselines and everything
 
     def baselines(self, tx: Text, sizes: list[int]) -> dict:
         """name -> Graph: "empty"; "vpd@k" for each k in sizes, VPD's first k subcomponents in its order (causal
-        importance x how much each writes, the predicted position first), complete; "cone", every subcomponent with
-        causal importance above zero that can reach the targets (Native.reachable), complete. Without VPD's
-        causal-importance network (a pod) only the empty one."""
+        importance x how much each writes, the predicted position first), complete; "vpd", VPD's own answer. Without
+        VPD's causal-importance network (a pod) only the empty one."""
         nat = self.nat
         out = {"empty": native.Graph()}
-        if tx.ci is None:
+        if tx.vpd is None:
             return out
         order = nat._vpd_order(tx.ids, tx.targets)
         for k in sorted(set(sizes)):
             if k > 0:
                 out[f"vpd@{k}"] = native.Graph(order[:k], complete=True)
-        reach = nat.reachable(tx.T, tx.targets)
-        out["cone"] = native.Graph(masks={n: (tx.ci[n] > 0) & reach[n] for n in nat.names})
+        out["vpd"] = native.Graph(masks=tx.vpd)
         return out
 
-    # ---- everything
-
-    def score(self, tx: Text, graphs: list[native.Graph], explanations: list[str] | None = None) -> list[dict]:
-        """Every measure of each graph on the text, one dict per graph."""
+    def score(self, tx: Text, graphs: list[native.Graph], explanations: list[str] | None = None, diagnostics: bool = False) -> list[dict]:
+        """Every measure of each graph on the text, one dict per graph: the reward fields (module docstring) and,
+        with diagnostics, F1 on the changed prompts ("changed_*"), F2 ("f2_*") and interchange carry ("carry_*")."""
         t0 = time.perf_counter()
         nat = self.nat
-        f1 = self.sufficiency(tx, graphs)
-        f2 = self.interchange(tx, graphs)
+        rows = self.sufficiency(tx, graphs)
         f3 = self.edges(tx, graphs)
         total = sum(nat.C.values())
-        rows = []
-        for b, g in enumerate(graphs):
+        for b, (g, row) in enumerate(zip(graphs, rows)):
             st, un = f3[b]["stated"], f3[b]["unstated"]
-            row = {"nodes": g.count(), "edges": None if g.complete else g.edges(),
-                   "bits": g.bits(nat.positions(tx.targets), total, tx.targets),
-                   "f1_text_held": f1["text_held"][b], "f1_changed_held": f1["changed_held"][b],
-                   "f1_text_ablated": f1["text_ablated"][b], "f1_changed_ablated": f1["changed_ablated"][b],
-                   "f2_share": f2["share"][b], "f2_positions": [[p, m, k] for p, m, k in f2["positions"][b]],
-                   "bypass_share": f2["bypass_share"], "movement_bits": f2["movement_bits"],
-                   "f3_stated": None if st is None else _mean(st), "f3_unstated": None if un is None else _mean(un),
-                   "f3_auc": f3[b]["auc"], "f3_cuts": {"stated": st, "unstated": un}}
+            row.update({"nodes": g.count(), "edges": None if g.complete else g.edges(), "tok_edges": len(getattr(g, "tok_edges", [])),
+                        "bits": g.bits(nat.positions(tx.targets), total, tx.targets),
+                        "f3": f3[b]["f3"], "f3_stated": _mean(st) if st else None, "f3_unstated": _mean(un) if un else None,
+                        "f3_cuts": {"stated": st, "unstated": un}})
             for name, fn in self.hooks.items():
                 row[name] = None if fn is None else fn(tx.task, g, (explanations or [""] * len(graphs))[b])
-            rows.append(row)
+        if diagnostics:
+            for key, extra in (("changed", self.across(tx, graphs, tx.prompts)),
+                               ("f2", self.across(tx, graphs, [x for _, xs in tx.f2 for x in xs]))):
+                for row, d in zip(rows, extra):
+                    row.update({f"{key}_{k}": v for k, v in d.items()})
+            for row, d in zip(rows, self.interchange(tx, graphs)):
+                row.update(d)
         seconds = time.perf_counter() - t0 + tx.seconds
         for row in rows:
             row["seconds_text"] = seconds
         return rows
 
 
-def _mean(xs) -> float | None:
-    return float(np.mean(xs)) if xs else None
-
-
-def _auc(stated: list[float], unstated: list[float]) -> float | None:
-    """P(a stated edge's cut > an unstated pair's), ties counting one half."""
-    if not stated or not unstated:
-        return None
-    a, b = np.asarray(stated)[:, None], np.asarray(unstated)[None, :]
-    return float(((a > b).mean() + 0.5 * (a == b).mean()))
-
-
 # ---- answer sets and the table
 
 
-def answer_file(directory: Path, stem: str) -> Path | None:
-    """A text's answer in an answer set's directory: <stem>.py (a graph program), else <stem>.json holding a circuit
-    ("nodes"; a search's directory also keeps each answer's scores as <stem>.json)."""
-    py, js = directory / f"{stem}.py", directory / f"{stem}.json"
-    if py.exists():
-        return py
-    if js.exists() and "nodes" in json.loads(js.read_text()):
-        return js
-    return None
+def answer_files(directory: Path, stem: str) -> list[Path]:
+    """A text's answers in an answer set's directory, first sample first: <stem>.py or <stem>.json holding a circuit
+    ("nodes"; a search's directory also keeps each answer's scores as <stem>.json), then <stem>.<k>.py or .json."""
+    def one(base: str) -> Path | None:
+        py, js = directory / f"{base}.py", directory / f"{base}.json"
+        if py.exists():
+            return py
+        if js.exists() and "nodes" in json.loads(js.read_text()):
+            return js
+        return None
+
+    first = one(stem)
+    ks = sorted({int(m[1]) for f in directory.glob(f"{stem}.*.*") if (m := re.fullmatch(re.escape(stem) + r"\.(\d+)\.(py|json)", f.name))})
+    rest = [one(f"{stem}.{k}") for k in ks]
+    return ([first] if first else []) + [f for f in rest if f is not None]
 
 
 def load_answer(path: Path, task: dict, targets: list[int], nat: native.Native) -> tuple[native.Graph, dict, str]:
-    """(graph, defects, explanation) of an answer file: Circuit JSON (.json) or a graph program (.py, traced by mech)."""
+    """(graph, defects, explanation) of an answer file: circuit JSON (.json) or a graph program (.py, traced by mech)."""
     T = len(task["prompts"][0]["token_ids"])
     if path.suffix == ".json":
         answer = json.loads(path.read_text())
@@ -559,64 +700,90 @@ def load_answer(path: Path, task: dict, targets: list[int], nat: native.Native) 
 
 
 COLUMNS = [("nodes", "nodes", "{:.0f}"), ("edges", "edges", "{:.0f}"), ("bits", "size bits", "{:.0f}"),
-           ("f1_text_held", "F1 text", "{:.3g}"), ("f1_changed_held", "F1 changed", "{:.3g}"),
-           ("f1_text_ablated", "F1 text -rem", "{:.3g}"), ("f1_changed_ablated", "F1 chg -rem", "{:.3g}"),
-           ("f2_share", "F2 share", "{:.3f}"), ("bypass_share", "bypass share", "{:.3f}"),
-           ("f3_stated", "F3 stated", "{:.3g}"), ("f3_unstated", "F3 unstated", "{:.3g}"), ("f3_auc", "F3 AUC", "{:.3f}"),
-           ("E1", "E1", "{:.3g}"), ("E2", "E2", "{:.3f}"), ("seconds_text", "s/text", "{:.1f}")]
+           ("kl_live", "KL live", "{:.3g}"), ("recovered_live", "recov live", "{:.3f}"), ("completeness_live", "compl live", "{:.3f}"),
+           ("recovered_log_live", "log recov live", "{:.3f}"),
+           ("necessity_live", "N live", "{:.3f}"), ("kl_off", "KL off", "{:.3g}"), ("recovered_off", "recov off", "{:.3f}"),
+           ("necessity_off", "N off", "{:.3f}"), ("kl_vpd_live", "KL VPD live", "{:.3g}"), ("f3", "F3", "{:.3f}"),
+           ("f3_stated", "F3 stated", "{:.3g}"), ("f3_unstated", "F3 unstated", "{:.3g}"),
+           ("E1", "E1", "{:.3g}"), ("E2", "E2", "{:.3f}"),
+           ("changed_recovered_live", "chg recov live", "{:.3f}"), ("f2_recovered_live", "F2 recov live", "{:.3f}"),
+           ("carry_completeness", "carry compl", "{:.3f}"), ("seconds_text", "s/text", "{:.1f}")]
 
 
 def table(results: dict) -> str:
-    """One table of an answer set and its baselines: the mean of each measure over the texts that have it.
-    results: {"set": name, "rows": {answer name -> [row per text]}}."""
+    """One table of an answer set and its baselines on the same texts: per answer the texts, coverage (the share of
+    texts with a valid answer; a missing or invalid answer counts against it) and each measure's mean over the valid
+    answers. results: {"set": name, "rows": {answer name -> [row per text, {"valid": False} for an invalid one]}}."""
     names = list(results["rows"])
-    head = ["answer", "texts"] + [c[1] for c in COLUMNS]
+    shown = [c for c in COLUMNS if any(r.get(c[0]) is not None for a in names for r in results["rows"][a])]
+    head = ["answer", "texts", "coverage"] + [c[1] for c in shown]
     lines = [head]
     for a in names:
         rows = results["rows"][a]
-        line = [a, str(len(rows))]
-        for key, _, fmt in COLUMNS:
-            vals = [r[key] for r in rows if r.get(key) is not None]
+        valid = [r for r in rows if r.get("valid", True)]
+        line = [a, str(len(rows)), f"{len(valid) / len(rows):.2f}" if rows else "-"]
+        for key, _, fmt in shown:
+            vals = [r[key] for r in valid if r.get(key) is not None]
             line.append(fmt.format(float(np.mean(vals))) if vals else "-")
         lines.append(line)
     widths = [max(len(x[i]) for x in lines) for i in range(len(head))]
     return f"answer set {results['set']}\n" + "\n".join("  ".join(x[i].rjust(widths[i]) for i in range(len(head))) for x in lines)
 
 
-def score_sets(sets: dict, split: str, n: int, ge: GoalEval | None = None, baselines: bool = True, log=print) -> list[dict]:
-    """Every answer set (name -> directory) on the split's first n texts that each set answers, with the baselines at
-    each answer's size -> one results dict per set ({"set", "rows": {answer name -> rows}})."""
+def score_sets(sets: dict, split: str, n: int, ge: GoalEval | None = None, baselines: bool = True, diagnostics: bool = False,
+               log=print) -> list[dict]:
+    """Every answer set (name -> directory) on the same texts: the split's first n that any set answers. A set without
+    a valid answer on a text gets an invalid row there (counted in its coverage, never skipped). The headline row of a
+    set is each text's first sample; with several samples, "NAME best of N (upper bound)" is each text's sample with
+    the highest recovered_live. Baselines at each valid answer's size -> one results dict per set."""
     ge = ge or GoalEval()
     nat = ge.nat
-    results = {s: {"set": s, "rows": {s: [], "empty": [], "vpd@matched": [], "cone": []}} for s in sets}
+    results = {s: {"set": s, "rows": {s: [], "empty": [], "vpd@matched": [], "vpd": []}} for s in sets}
+    best = {s: [] for s in sets}
     for p in native.tasks(split)[:n]:
+        found = {s: answer_files(Path(d), p.stem) for s, d in sets.items()}
+        if not any(found.values()):
+            continue
         task = json.loads(p.read_text())
         ids, targets = native.text(p)
-        found = {s: f for s, f in ((s, answer_file(Path(d), p.stem)) for s, d in sets.items()) if f is not None}
-        if not found:
-            continue
         tx = ge.text(ids, targets, native.task_seed(p.stem), task)
-        graphs, expl, defects = [], [], []
-        for s, f in found.items():
-            g, d, e = load_answer(f, task, targets, nat)
-            graphs.append(g)
-            expl.append(e)
-            defects.append(d)
-        base = ge.baselines(tx, [g.count() for g in graphs]) if baselines else {}
+        graphs, expl, meta = [], [], []
+        for s, files in found.items():
+            for k, f in enumerate(files):
+                g, d, e = load_answer(f, task, targets, nat)
+                valid = not d.get("invalid_program") and not d.get("invalid_nodes") and not d.get("invalid_edges")
+                meta.append((s, k, valid, d))
+                graphs.append(g)
+                expl.append(e)
+        base = ge.baselines(tx, [g.count() for g, m in zip(graphs, meta) if m[2]]) if baselines else {}
         names = list(base)
-        rows = ge.score(tx, graphs + [base[k] for k in names], expl + [""] * len(names))
-        by = dict(zip(names, rows[len(graphs):]))
-        for j, s in enumerate(found):
-            row = {**rows[j], **defects[j], "task": p.stem}
-            results[s]["rows"][s].append(row)
-            for k in ("empty", "cone"):
+        scored = [g for g, m in zip(graphs, meta) if m[2]]
+        rows = ge.score(tx, scored + [base[k] for k in names], [e for e, m in zip(expl, meta) if m[2]] + [""] * len(names), diagnostics)
+        it = iter(rows[:len(scored)])
+        by = dict(zip(names, rows[len(scored):]))
+        samples = {s: [] for s in sets}
+        for (s, k, valid, d), g in zip(meta, graphs):
+            row = {**next(it), **d, "valid": True} if valid else {**d, "valid": False}
+            row.update({"task": p.stem, "sample": k})
+            samples[s].append((row, g))
+        for s in sets:
+            first = samples[s][0] if samples[s] else None
+            results[s]["rows"][s].append(first[0] if first else {"task": p.stem, "valid": False, "missing": True})
+            ok = [r for r, _ in samples[s] if r["valid"]]
+            if len(samples[s]) > 1:
+                best[s].append(max(ok, key=lambda r: r.get("recovered_live") if r.get("recovered_live") is not None else -math.inf)
+                               if ok else {"task": p.stem, "valid": False})
+            for k in ("empty", "vpd"):
                 if k in by:
                     results[s]["rows"][k].append({**by[k], "task": p.stem})
-            k = f"vpd@{graphs[j].count()}"
-            if k in by:
-                results[s]["rows"]["vpd@matched"].append({**by[k], "task": p.stem})
-        log(f"{p.stem}: " + ", ".join(f"{s} F1 {rows[j]['f1_text_held']:.2f}/{rows[j]['f1_changed_held']:.2f} F2 {rows[j]['f2_share'] if rows[j]['f2_share'] is not None else float('nan'):.2f}"
-                                     for j, s in enumerate(found)) + f", {rows[0]['seconds_text']:.1f} s")
+            if first and first[0]["valid"] and f"vpd@{first[1].count()}" in by:
+                results[s]["rows"]["vpd@matched"].append({**by[f"vpd@{first[1].count()}"], "task": p.stem})
+        done = [f"{s} recovered {r['recovered_live']:.2f}/{r['recovered_off']:.2f}" for s in sets
+                for r in [results[s]["rows"][s][-1]] if r.get("valid") and r.get("recovered_live") is not None and r.get("recovered_off") is not None]
+        log(f"{p.stem}: {', '.join(done) or 'no valid answer'}" + (f", {rows[0]['seconds_text']:.1f} s" if rows else ""))
+    for s in sets:
+        if best[s]:
+            results[s]["rows"][f"{s} best of N (upper bound)"] = best[s]
     return list(results.values())
 
 
@@ -624,14 +791,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("score")
-    s.add_argument("--set", action="append", required=True, help="NAME=DIR: an answer set, one answer per text")
+    s.add_argument("--set", action="append", required=True, help="NAME=DIR: an answer set, each text's answer and samples")
     s.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
     s.add_argument("--n", type=int, default=10)
     s.add_argument("--out", type=Path)
     s.add_argument("--no-baselines", action="store_true")
+    s.add_argument("--diagnostics", action="store_true", help="F1 on changed prompts, F2 and interchange carry too")
     args = ap.parse_args()
     sets = dict(x.split("=", 1) for x in args.set)
-    results = score_sets(sets, args.split, args.n, baselines=not args.no_baselines)
+    results = score_sets(sets, args.split, args.n, baselines=not args.no_baselines, diagnostics=args.diagnostics)
     for r in results:
         print(table(r), flush=True)
     if args.out:

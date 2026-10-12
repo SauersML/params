@@ -15,8 +15,8 @@
 # summary_<RUN>-<j>_<k>.jsonl and locality_<RUN>-<j>_<k>.jsonl). A pod ends when its texts are done; HOURS caps each pod.
 #   experiments/oracle/pods/teacher_pod.sh HOURS
 #   env: RUN, SPLIT, N, OFFSET, TASKS, PODS, P, DEST, VPD, LABELS (a locality JSONL; TASKS' own "local" fields otherwise),
-#   LOCALITY, BATCH, REF, GPU, PRICE, VRAM, RAM, WAIT (minutes of retries while no card is in stock), ONLY (the pods j to
-#   launch, e.g. "0 3"; default all)
+#   LOCALITY, BATCH, TEACHER_ARGS (more teacher.py flags, e.g. "--edges --f1-start both"), REF, GPU, PRICE, VRAM, RAM, WAIT
+#   (minutes of retries while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all)
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params
@@ -47,7 +47,7 @@ for j in range(pods):
 (F / "tasks_labels.jsonl").write_text("".join(json.dumps(r) + "\n" for r in labels))
 print(f"{len(todo)} texts to teach of {len(ids[off:])} ({len(ids[off:]) - len(todo)} already in {dest}), {pods} pods")
 EOF
-ARGS="--batch $BATCH"
+ARGS="--batch $BATCH ${TEACHER_ARGS:-}"
 if [ -n "${LABELS:-}" ]; then cp "$LABELS" "$F/labels.jsonl"; ARGS="$ARGS --labels $F/labels.jsonl"
 elif [ -s "$F/tasks_labels.jsonl" ]; then ARGS="$ARGS --labels $F/tasks_labels.jsonl"; fi
 if [ -n "${VPD:-}" ]; then cp "$VPD" "$F/vpd.pt"; fi

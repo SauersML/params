@@ -53,6 +53,7 @@ RENDERERS = {"deepseek-ai/DeepSeek-V4.1-Flash:peft:262144": "deepseekv3_disable_
 # either), and the 8B as a control column.
 REWARD_READER, INDEPENDENT_READER, CONTROL_READER = "Qwen/Qwen3.5-397B-A17B", "moonshotai/Kimi-K2.6", "Qwen/Qwen3-8B"
 CACHED = 0.2  # a cached prefill token's share of the price
+SCORER_FAILURES = 3  # scorer errors an RL run sits out (each request kept) before it stops
 RENDERER = "qwen3_disable_thinking"
 NAMES = re.compile(r"L\d+\.(?:q|k|v|o|fc|down)#\d+")  # a subcomponent's name in English
 
@@ -378,6 +379,7 @@ def rl(a) -> None:
             f.write(json.dumps({"step": step, "state": path, "usd": spend.total + (rspend.total if rspend else 0.0), "base": a.base}) + "\n")
 
     checkpoint(0)
+    failed = 0
     sampler = training.save_weights_and_get_sampling_client()
     pending = submit(sampler)
     for step in range(a.steps):
@@ -397,7 +399,13 @@ def rl(a) -> None:
                     tasks[q["task"]] = json.loads((a.texts_dir / f"{q['task']}.json").read_text())
                 req["e1"] = components.e1_bits(frozen, tasks[q["task"]], q, texts)
             r = httpx.post(a.scorer, json=req, timeout=None)
-            r.raise_for_status()
+            if r.status_code != 200:  # the request is kept to reproduce the scorer's error; the group sits this step out
+                failed += 1
+                (a.log / f"failed_{step}_{q['task']}.json").write_text(json.dumps(req))
+                print(json.dumps({"step": step, "task": q["task"], "scorer_error": r.text[:4000]}), flush=True)
+                if failed > SCORER_FAILURES:
+                    raise SystemExit(f"the scorer failed {failed} times (requests in {a.log}/failed_*.json)")
+                continue
             scores = r.json()["scores"]
             rewards = [s["reward"] for s in scores]
             mean = sum(rewards) / len(rewards)
@@ -408,7 +416,7 @@ def rl(a) -> None:
                            "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")} for s in scores],
                            "texts": texts, "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
-                           "terms": {k: [s.get(k) for s in scores] for k in ("F1", "N", "F3", "E1", "E2", "size")}})
+                           "terms": {k: [s.get(k) for s in scores] for k in ("C", "N", "E2", "E3", "E4", "F1", "F3", "E1", "size")}})
             for s, rew in zip(res.sequences, rewards):
                 if rew == mean:
                     continue
@@ -432,7 +440,7 @@ def rl(a) -> None:
             op.result()
             spend.add("rl", trained=sum(d.model_input.length for d in datums))
             sampler = training.save_weights_and_get_sampling_client()
-        flat = [x for g in groups for x in g["rewards"]]
+        flat = [x for g in groups for x in g["rewards"]] or [float("nan")]
         line = json.dumps({"step": step, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
                            "distinct": [g["distinct"] for g in groups],
                            "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],

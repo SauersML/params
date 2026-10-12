@@ -6,8 +6,8 @@ CUDA, and the products on the start set's subcomponents alone (Pruner._gather) w
 EdgePruner's runs are the scorecard's (goal_eval.GoalEval.graph_kl: with every connection the masked run), and a
 teacher circuit rebuilt from its saved path (teacher.py --from-path) is the full run's, nodes and connections, one
 over the answer budget steps to a smaller path point, the flip repair writes its best-scoring step, and Descent.prune's
-accept check admits exactly the largest passing prefix (a constructed case), with --no-strand no listed node but a
-query or key is without a stated connection, and --edge-levels' default keeps the connections it kept before.
+accept check admits exactly the largest passing prefix (a constructed case), with --no-strand every listed node but a
+query or key has a stated path to the prediction, and --edge-levels' default keeps the connections it kept before.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -194,9 +194,18 @@ def test_no_strand_leaves_no_node_unconnected():
     saved = torch.load(VPD_SAVED)["text9000"]
     circuits, row, _ = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], edges=True, no_strand=True)
     c = circuits[""]
-    stated = {i for e in c["edges"] for i in e if i != "out"}
-    # every listed node but the token embeddings, queries and keys has a stated connection
-    assert all(i in stated for i, (m, _, _) in enumerate(c["nodes"]) if m != "tok" and not m.endswith(("q_proj", "k_proj")))
+    qk = {i for i, (m, _, _) in enumerate(c["nodes"]) if m.endswith(("q_proj", "k_proj"))}
+    reach = {w for w, r in c["edges"] if r == "out"} | qk
+    grew = True
+    while grew:
+        grew = False
+        for w, r in c["edges"]:
+            if r in reach and w not in reach:
+                reach.add(w)
+                grew = True
+    # every listed node but the token embeddings, queries and keys has a stated path to the prediction (or to a query or
+    # key, which act through the attention pattern)
+    assert all(i in reach for i, (m, _, _) in enumerate(c["nodes"]) if m != "tok" and i not in qk)
 
 
 @pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")

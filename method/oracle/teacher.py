@@ -48,9 +48,12 @@ Per text:
   Step 4 picks among the path points of at most --max-nodes nodes (MAX_NODES, the answer budget in nodes); with
   --max-tokens, when the teacher circuit's answer (components.render) is longer than that in the explainer's
   tokenizer, the next smaller path point with its connections instead, until it fits.
-  With --no-strand, no non-query/key node is left without a stated connection: each keeps its most important one (the
-  largest measured cut effect, EdgePruner.protect), and one the model connects to no other node of the circuit is
-  dropped (queries and keys act through the attention pattern). Without it, the descent left text9000's greedy and
+  With --no-strand, every non-query/key node keeps a stated path to the prediction: its most important connection out
+  is protected (the largest measured cut effect, EdgePruner.protect), each such connection ending at the prediction,
+  a query or key (which act through the attention pattern) or another node with a route, and a node the model gives
+  no route to the prediction among the circuit's nodes is dropped (routes()); a stated connection alone was not a
+  role: v3's text9000 circuit kept one for every node but 122 of its 201 non-query/key nodes had no stated path to
+  the prediction. Without it, the descent left text9000's greedy and
   v3 circuits with half and 92% of their nodes unconnected: nodes that VPD's answer and the every-connection run need
   (N 0.93 -> 0.25, every-connection F1 0.91 -> 0.39 without them) but whose role the stated graph cuts (the lead's
   decision: the stated graph is the claim, a listed node needs a stated role).
@@ -393,18 +396,41 @@ class EdgePruner(Descent):
         return list(ids[order].split(counts.tolist()))
 
     def protect(self) -> None:
-        """Protects each non-query/key node's single most important kept connection, the one whose cut leaves the
-        largest KL (each kept connection's cut measured in float32), so that no such node is left without a stated
-        connection (queries and keys act through their layer's attention pattern without one)."""
+        """Gives every non-query/key node a stated path to the prediction: protects its most important connection out
+        (the one whose cut leaves the largest KL, each kept connection's cut measured in float32). Every node here has a
+        route to the prediction (routes()), so each connection out ends at the prediction, at a query or key (which act
+        through their layer's attention pattern) or at another such node, and following protected connections from
+        any node ends at the prediction or a query or key. A node with none of its connections out kept gets them
+        back first."""
+        outs = {}
+        for e, (w, _) in enumerate(self.edges):
+            outs.setdefault(w, []).append(e)
+        for es in outs.values():
+            if not bool(self.on[es].any()):
+                self.on[es] = True
         kept = self.on.nonzero().flatten()
         cut = dict(zip(kept.tolist(), self.without(list(kept.split(1)))))
-        best = {}
-        for e, x in cut.items():
-            for nd in self.edges[e]:
-                if nd is not None and native._layer_kind(nd)[1] not in ("q_proj", "k_proj") and (nd not in best or x > cut[best[nd]]):
-                    best[nd] = e
+        best = [max((e for e in es if e in cut), key=lambda e: cut[e]) for es in outs.values()]
         if best:
-            self.protected[torch.tensor(sorted(set(best.values())), device=self.protected.device)] = True
+            self.protected[torch.tensor(sorted(set(best)), device=self.protected.device)] = True
+
+
+def routes(nodes: list, targets: list[int]) -> set:
+    """The nodes with a route to the prediction through connections the model has among `nodes` (native.all_edges):
+    the residual writers at the targets, queries and keys (they act through their layer's attention pattern), and
+    every writer into one of these."""
+    par, out = native.all_edges(nodes, targets)
+    reach = set(out) | {nd for nd in nodes if native._layer_kind(nd)[1] in ("q_proj", "k_proj")}
+    grew = True
+    while grew:
+        grew = False
+        for r, ws in par.items():
+            if r in reach:
+                for w in ws:
+                    if w not in reach:
+                        reach.add(w)
+                        grew = True
+    return reach
 
 
 def scores(empty: float, vpd: float, c: float, minus: float) -> tuple[float, float, float]:
@@ -513,9 +539,8 @@ class Connector:
         nodes = [pr.nodes[j] for j in on.nonzero().flatten().tolist()]
         dropped = []
         if self.no_strand:
-            par, out = native.all_edges(nodes, self.tx.targets)
-            touched = {w for ws in par.values() for w in ws} | set(par) | set(out)
-            dropped = [nd for nd in nodes if nd not in touched and native._layer_kind(nd)[1] not in ("q_proj", "k_proj")]
+            reach = routes(nodes, self.tx.targets)
+            dropped = [nd for nd in nodes if nd not in reach]
             if dropped:
                 on = on.clone()
                 on[torch.tensor([self.index[nd] for nd in dropped], device=on.device)] = False

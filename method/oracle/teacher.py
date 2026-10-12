@@ -1,31 +1,41 @@
-"""Teacher circuits (#2951 graph oracle): the smallest whole-prediction circuit, in VPD's semantics, found by measured
-removal from VPD's own answer.
+"""Teacher circuits (#2951 graph oracle): whole-prediction circuits in VPD's semantics, found by measured removal.
 
-A circuit C runs with its subcomponents on and every other one off (goal_eval.GoalEval.runs, VPD's masked forward
-pass); remainders W - V U off (native's run-alone convention) while searching, both conventions reported. On the text,
-KL_C is the KL in bits of the model's next-token distribution at the target from C's run, and
-  recovered = (KL_empty - KL_C) / (KL_empty - KL_VPD),  recovered_log = ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD)
-with VPD's own answer (causal importance above zero at the positions that reach the target, goal_eval.vpd_answer) and
-the empty circuit as the bounds. The search starts from VPD's answer and removes blocks while the criterion stays at or
-above 0.9: whole positions, then sites (one weight matrix at one position), then chunks of 64, 16 and 4 of a
-site's subcomponents (by index), then single subcomponents. The criterion
-is recovered_log (default): the empty circuit is ~100 bits from the model, so recovered >= 0.9 admits a circuit ~10
-bits from it (on text9000, 5 subcomponents at the target position), while recovered_log >= 0.9 asks
-KL_C <= KL_empty^0.1 KL_VPD^0.9 (0.11 bits there, twice VPD's own 0.05). At each level a
-round measures every single block's removal, ranks the blocks by the KL their removal leaves, and removes the most of
-them in that order (prefixes of 2^(k/2) blocks) that keeps recovered >= 0.9; rounds repeat until no single removal
-does. Every number is measured; no ranking decides membership.
+A circuit C runs with its subcomponents on and every other one off (VPD's masked forward pass, as goal_eval.GoalEval.runs),
+remainders live (the component reward's convention; components.CONVENTION). Every KL is the model's next-token
+distribution at the target from the run's, in bits, and the reward's terms are goal_eval's log-scale fields:
+  F1 = clip(ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD), 0, 1),  N = clip(ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD), 0, 1)
+with VPD's own answer (causal importance above zero at the positions that reach the target) and the empty circuit as
+the bounds, "VPD minus C" VPD's answer with C's subcomponents off.
 
-Output: per text, <task>.json in goal_eval's circuit JSON (nodes [matrix, index, position], no edges: the SFT path adds
-measured edges), and a summary row: size, positions kept, KL_C and recovered under both remainder conventions,
-necessity N (VPD's answer without C), time.
+Per text:
+  1. The F1 circuit: from VPD's answer, rounds at each level (whole positions, sites, chunks of 64, 16 and 4 of a site's
+     subcomponents by index, single subcomponents) measure every block's removal, rank the blocks by the KL their removal
+     leaves, and remove the most of them in that order that keeps F1 >= 0.9 (KL_C <= KL_empty^0.1 KL_VPD^0.9), until no
+     single removal does. (The linear recovery >= 0.9 admits circuits ~10 bits from the model, the empty circuit being
+     ~100 bits away: on text9000 it pruned to 5 subcomponents at the target.)
+  2. VPD's top-k: the smallest prefix of VPD's order (Native._vpd_order) whose necessity N reaches 0.99 (bisection, at
+     most 1,024).
+  3. The joint path from their union: each step measures every single subcomponent's removal (two runs: the circuit and
+     VPD's answer without it), ranks them by the mean of F1 and N they leave, and removes the best tenth of the circuit,
+     down to 4 subcomponents. Every step is recorded (size, F1, N, KL_C, KL_{VPD minus C}, positions, the subcomponents
+     removed) beside VPD's own top-k at the same size.
+  4. The teacher circuit is the path point with the largest mean(F1, N) - 0.5 size, size the nodes' description bits
+     (with a token-embedding node at each position) over the bits of naming every VPD-active subcomponent at the text's
+     F2 positions and target (components.reward's size term; edges, added later by the SFT path, are not priced here).
+Every membership decision is measured; orderings only order.
 
-  MPD_MEM_GIB=20 ~/mpd-data/venv/bin/python -B teacher.py --split heldout --n 20 --out ~/mpd-data/graph_oracle/teacher/vpd_f1
+Output per text in --out: <task>.json (the teacher circuit), <task>.f1.json, <task>.vpd_top<k>.json, <task>.n<size>.json at
+the path points nearest 16 to 256 nodes (goal_eval's circuit JSON: nodes [matrix, index, position] and ["tok", 0,
+position] input nodes, no edges), <task>.path.json (the start set and every step), and a line in summary_<offset>.jsonl.
+
+  MPD_MEM_GIB=16 ~/mpd-data/venv/bin/python -B teacher.py --split heldout --n 20 --out ~/mpd-data/graph_oracle/teacher/joint_heldout
+  teacher.py --split heldout --n 20 --save-vpd FILE   (VPD's answers and orders, for a machine without the CI network)
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -37,6 +47,13 @@ import native
 
 RECOVERED = 0.9
 ROUNDS = 40
+CONVENTION = "live"   # the component reward's remainder convention (components.CONVENTION)
+N_TARGET = 0.99       # VPD's top-k: the smallest prefix of VPD's order with necessity N >= this, at most K_MAX
+K_MAX = 1024
+FRACTION = 0.1        # each joint path step removes this share of the circuit, at least one subcomponent
+MIN_SIZE = 4
+SIZE_WEIGHT = 0.5     # components.SIZE_WEIGHT
+SIZES = (16, 32, 64, 128, 256)  # path points also written
 LEVELS = ("position", "site", "chunk64", "chunk16", "chunk4", "subcomponent")  # blocks, coarse to fine
 
 
@@ -148,42 +165,148 @@ class Pruner:
         return rounds
 
 
-def circuit_json(pr: Pruner) -> dict:
-    nodes = sorted(((t, n, c) for (n, t, c), keep in zip(pr.nodes, pr.on.tolist()) if keep))
-    return {"nodes": [[n, c, t] for t, n, c in nodes], "edges": [], "explanation": ""}
+def scores(empty: float, vpd: float, c: float, minus: float) -> tuple[float, float, float]:
+    """(F1, N, their mean): goal_eval's log-scale reward fields from KL_C and KL_{VPD minus C}."""
+    f1 = min(1.0, max(0.0, goal_eval.recovered_log(empty, c, vpd)))
+    n = goal_eval.necessity_log(empty, minus, vpd)
+    return f1, n, (f1 + n) / 2
 
 
-def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, criterion: str = "log",
-          vpd: dict | None = None) -> tuple[dict, dict]:
+def measure(pr: Pruner, ons: torch.Tensor, empty: float, vpd: float) -> list[dict]:
+    """Each node set's KL_C and KL_{VPD minus C} (two runs: the set, and VPD's answer without it), F1, N and mean."""
+    kl = pr.kl_sets(torch.cat([ons, ~ons]))
+    K = len(ons)
+    out = []
+    for c, m in zip(kl[:K], kl[K:]):
+        f1, n, j = scores(empty, vpd, c, m)
+        out.append({"kl_c": c, "kl_minus": m, "f1": f1, "n": n, "mean": j})
+    return out
+
+
+def top_k(pr: Pruner, order: torch.Tensor, empty: float, vpd: float, target: float = N_TARGET, cap: int = K_MAX) -> int:
+    """The smallest k (bisection, measured) whose VPD-ordered prefix has N >= target, at most cap."""
+    def prefix(k):
+        on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=order.device)
+        on[order[:k]] = True
+        return on
+    lo, hi = 0, min(cap, len(order))
+    if measure(pr, prefix(hi)[None], empty, vpd)[0]["n"] < target:
+        return hi
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if measure(pr, prefix(mid)[None], empty, vpd)[0]["n"] >= target:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> list[dict]:
+    """Nested measured removal from `start` down to MIN_SIZE: each step measures every single removal's F1 and N
+    (two runs each), ranks them by the mean they leave, and removes the best FRACTION of the circuit (at least one).
+    Records: the state after each step and the node ids removed."""
+    on = start.clone()
+    path = [{"size": int(on.sum()), "removed": [], **measure(pr, on[None], empty, vpd)[0]}]
+    while int(on.sum()) > MIN_SIZE:
+        ids = on.nonzero().flatten()
+        trials = on[None].repeat(len(ids), 1)
+        trials[torch.arange(len(ids), device=on.device), ids] = False
+        rows = []
+        for s0 in range(0, len(ids), 4 * pr.B):
+            rows += measure(pr, trials[s0:s0 + 4 * pr.B], empty, vpd)
+        means = torch.tensor([r["mean"] for r in rows])
+        k = max(1, int(FRACTION * len(ids)))
+        drop = ids[torch.argsort(means, descending=True, stable=True)[:k]]
+        on[drop] = False
+        path.append({"size": int(on.sum()), "removed": drop.tolist(), **measure(pr, on[None], empty, vpd)[0]})
+    return path
+
+
+def circuit_json(pr: Pruner, on: torch.Tensor) -> dict:
+    """goal_eval's circuit JSON: the nodes, and a token-embedding input node at each of their positions; no edges."""
+    nodes = sorted(((t, n, c) for (n, t, c), keep in zip(pr.nodes, on.tolist()) if keep))
+    tok = sorted({t for t, _, _ in nodes})
+    return {"nodes": [[n, c, t] for t, n, c in nodes] + [["tok", 0, t] for t in tok], "edges": [], "explanation": ""}
+
+
+def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
+          vpd_order: list | None = None) -> tuple[dict, dict]:
+    """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
+    VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour."""
     t0 = time.perf_counter()
+    nat = ge.nat
     tx = ge.text(ids, targets)
-    if vpd is not None:                                       # VPD's answer computed where the causal-importance network is
-        nat = ge.nat
+    if vpd_answer is not None:                                # VPD's answer computed where the causal-importance network is
         tx.vpd = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
-        for n, (t, c) in vpd.items():
+        for n, (t, c) in vpd_answer.items():
             tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
     if tx.vpd is None:
         raise ValueError("no VPD answer: run with the causal-importance network or pass --vpd")
-    empty, vpd = ge._bounds(tx, "off")
-    budget = empty ** (1 - RECOVERED) * vpd ** RECOVERED if criterion == "log" else empty - RECOVERED * (empty - vpd)
-    pr = Pruner(ge, tx, tx.vpd, live=False, B=B)
-    row = {"criterion": criterion, "T": tx.T, "vpd_size": len(pr.nodes), "vpd_positions": int(torch.unique(pr.t).numel()), "kl_empty": empty, "kl_vpd": vpd,
-           "budget_kl": budget, "levels": {}}
-    for level in LEVELS:
+    empty, vpd = ge._bounds(tx, CONVENTION)
+    budget = empty ** (1 - RECOVERED) * vpd ** RECOVERED
+    pr = Pruner(ge, tx, tx.vpd, live=CONVENTION == "live", B=B)
+    index = {nd: i for i, nd in enumerate(pr.nodes)}
+    order = vpd_order if vpd_order is not None else nat._vpd_order(ids, targets)
+    order = torch.tensor([index[(n, int(t), int(c))] for n, t, c in order if (n, int(t), int(c)) in index], device=nat.dev)
+    positions = sorted({p for p, _ in tx.f2} | set(targets))
+    active = sum(int(tx.vpd[n][positions].sum()) for n in nat.names)
+    node_bits = math.log2(nat.positions(targets) * sum(nat.C.values()))
+    scale = active * node_bits                               # components.reward's size scale
+
+    def size_term(on):
+        k_tok = int(torch.unique(pr.t[on]).numel())
+        return min(1.0, (int(on.sum()) * node_bits + k_tok * math.log2(nat.positions(targets))) / scale) if scale else 0.0
+
+    row = {"T": tx.T, "convention": CONVENTION, "vpd_size": len(pr.nodes), "vpd_positions": int(torch.unique(pr.t).numel()),
+           "kl_empty": empty, "kl_vpd": vpd, "budget_kl": budget, "active_scale": active, "levels": {}}
+    for level in LEVELS:                                     # the F1 circuit
         t1 = time.perf_counter()
         rounds = pr.prune(level, budget)
         row["levels"][level] = lv = {"rounds": rounds, "size": int(pr.on.sum()), "positions": int(torch.unique(pr.t[pr.on]).numel()),
                                      "kl": pr.kl(), "seconds": time.perf_counter() - t1}
         print(f"  {level}: {lv['size']} subcomponents at {lv['positions']} positions, KL {lv['kl']:.3g} (budget {budget:.3g}), "
               f"{rounds} rounds, {lv['seconds']:.0f}s, {pr.measured} sets so far", flush=True)
-    C = pr.masks(pr.on)
-    g = native.Graph(masks=C)
-    sc = ge.sufficiency(tx, [g])[0]
-    row.update(size=int(pr.on.sum()), positions=int(torch.unique(pr.t[pr.on]).numel()), measured_sets=pr.measured,
-               seconds=time.perf_counter() - t0,
-               **{k: sc[k] for k in ("kl_off", "recovered_off", "kl_live", "recovered_live", "kl_vpd_live", "kl_empty_live",
-                                     "kl_vpd_minus_off", "necessity_off", "kl_vpd_minus_live", "necessity_live", "recovered_log_off")})
-    return circuit_json(pr), row
+    f1_on = pr.on.clone()
+    t1 = time.perf_counter()
+    k = top_k(pr, order, empty, vpd)
+    topk_on = torch.zeros_like(f1_on)
+    topk_on[order[:k]] = True
+    start = f1_on | topk_on
+    path = joint_path(pr, start, empty, vpd)
+    sizes = [r["size"] for r in path]
+    vs = []
+    for sz in sizes:                                         # VPD's own order at every path size
+        on = torch.zeros_like(f1_on)
+        on[order[:sz]] = True
+        vs.append(on)
+    vpd_rows = []
+    for s0 in range(0, len(vs), pr.B):
+        vpd_rows += measure(pr, torch.stack(vs[s0:s0 + pr.B]), empty, vpd)
+    removed, ons = [], []
+    on = start.clone()
+    for r in path:
+        on[torch.tensor(r["removed"], dtype=torch.long, device=on.device)] = False
+        ons.append(on.clone())
+        r["size_term"] = size_term(on)
+        r["reward"] = r["mean"] - SIZE_WEIGHT * r["size_term"]
+        r["positions"] = int(torch.unique(pr.t[on]).numel())
+    for r, v, on_v in zip(path, vpd_rows, vs):
+        v["size_term"] = size_term(on_v)
+        v["reward"] = v["mean"] - SIZE_WEIGHT * v["size_term"]
+        r["vpd_top"] = v
+    best = max(range(len(path)), key=lambda i: path[i]["reward"])
+    circuits = {"": circuit_json(pr, ons[best]), "f1": circuit_json(pr, f1_on), f"vpd_top{k}": circuit_json(pr, topk_on)}
+    for want in SIZES:
+        i = min(range(len(path)), key=lambda j: abs(path[j]["size"] - want))
+        circuits[f"n{path[i]['size']}"] = circuit_json(pr, ons[i])
+    f1_row = measure(pr, f1_on[None], empty, vpd)[0]
+    row.update(f1_circuit={"size": int(f1_on.sum()), "positions": int(torch.unique(pr.t[f1_on]).numel()), **f1_row},
+               top_k=k, start_size=int(start.sum()), path_seconds=time.perf_counter() - t1,
+               best={k_: path[best][k_] for k_ in ("size", "positions", "f1", "n", "mean", "size_term", "reward", "kl_c", "kl_minus")},
+               best_vpd_top=path[best]["vpd_top"], measured_sets=pr.measured, seconds=time.perf_counter() - t0)
+    path_file = {"start_nodes": [[n, c, t] for n, t, c in (pr.nodes[i] for i in start.nonzero().flatten().tolist())],
+                 "start_index": start.nonzero().flatten().tolist(), "steps": path}
+    return circuits, row, path_file
 
 
 def main():
@@ -191,38 +314,47 @@ def main():
     ap.add_argument("--split", default="heldout")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--offset", type=int, default=0, help="this process takes the first n texts offset, offset + stride, ...")
-    ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--criterion", choices=("log", "linear"), default="log", help="recovered_log or recovered >= 0.9")
-    ap.add_argument("--vpd", type=Path, help="VPD's answers saved by --save-vpd (a pod has no causal-importance network)")
-    ap.add_argument("--save-vpd", type=Path, help="save VPD's answers on the texts to this file and stop")
     ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--vpd", type=Path, help="VPD's answers and orders saved by --save-vpd (no causal-importance network here)")
+    ap.add_argument("--save-vpd", type=Path, help="save VPD's answers and orders on the texts to this file and stop")
+    ap.add_argument("--labels", type=Path, help="locality JSONL (task, local)")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
     ge = goal_eval.GoalEval(native.Native(), chunk=args.batch)
-    paths = native.tasks(args.split)[:args.n][args.offset::args.stride]
     if args.save_vpd:
         saved = {}
         for path in native.tasks(args.split)[:args.n]:
             ids, targets = native.text(path)
             m = ge.vpd_answer(ids, targets)
-            saved[path.stem] = {n: tuple(x.to(torch.int32).cpu() for x in v.nonzero().T) for n, v in m.items()}
+            saved[path.stem] = {"answer": {n: tuple(x.to(torch.int32).cpu() for x in v.nonzero().T) for n, v in m.items()},
+                                "order": ge.nat._vpd_order(ids, targets)}
         torch.save(saved, args.save_vpd)
         return
     vpd = torch.load(args.vpd) if args.vpd else {}
+    labels = {}
+    if args.labels and args.labels.exists():
+        for line in args.labels.read_text().splitlines():
+            r = json.loads(line)
+            labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
-    for path in paths:
+    for path in native.tasks(args.split)[:args.n][args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
             continue
         ids, targets = native.text(path)
-        circuit, row = teach(ge, ids, targets, args.batch, args.criterion, vpd.get(path.stem))
-        (args.out / f"{path.stem}.json").write_text(json.dumps(circuit))
-        with (args.out / "summary.jsonl").open("a") as f:
-            f.write(json.dumps({"task": path.stem, **row}) + "\n")
-        lv = row["levels"]
-        print(f"{path.stem}: VPD {row['vpd_size']} at {row['vpd_positions']} positions -> positions {lv['position']['size']} "
-              f"({lv['position']['positions']}) -> sites {lv['site']['size']} -> {row['size']} subcomponents at {row['positions']} positions; "
-              f"KL {row['kl_off']:.3g} (VPD {row['kl_vpd']:.3g}, empty {row['kl_empty']:.3g}), recovered {row['recovered_off']:.3f}, "
-              f"log {row['recovered_log_off']:.3f}, N {row['necessity_off']:.3f}; {row['measured_sets']} sets, {row['seconds']:.0f}s", flush=True)
+        saved = vpd.get(path.stem, {})
+        circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"))
+        for name, c in circuits.items():
+            (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
+        (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))
+        row = {"task": path.stem, "local": labels.get(path.stem), **row}
+        with (args.out / f"summary_{args.offset}.jsonl").open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        b, v, f = row["best"], row["best_vpd_top"], row["f1_circuit"]
+        print(f"{path.stem}: F1 circuit {f['size']} at {f['positions']} positions (F1 {f['f1']:.3f}, N {f['n']:.3f}); top-k {row['top_k']}; "
+              f"path from {row['start_size']}: best {b['size']} at {b['positions']} positions F1 {b['f1']:.3f} N {b['n']:.3f} reward {b['reward']:.3f} "
+              f"vs VPD top-{b['size']} F1 {v['f1']:.3f} N {v['n']:.3f} reward {v['reward']:.3f}; {row['measured_sets']} sets, {row['seconds']:.0f}s",
+              flush=True)
 
 
 if __name__ == "__main__":

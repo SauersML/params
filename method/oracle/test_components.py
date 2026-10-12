@@ -313,3 +313,62 @@ def test_invalid_below_every_valid_answer(tiny):
     assert all(r["valid"] for r in got)  # lines that do not parse are dropped and charged, not fatal
     assert got[0]["size"] == 1.0 and got[1]["dropped_edges"] == 5 * T and got[2]["malformed"] == 400 and got[2]["size"] == 1.0
     assert min(r["reward"] for r in got) > -(1 + components.SIZE_WEIGHT)
+
+
+def test_variables_block_parses_renders_and_round_trips():
+    """The EXPLANATION's VARIABLES block: ids and written-out subcomponents, inputs with their tokens, feeds by name; a
+    line that names no subcomponent (the token embedding is none) or does not parse is malformed; the prose apart."""
+    text = "\n".join(["CIRCUIT:", "@7 a=L3.down#2 b=L2.o#1", "@4 c=L2.v#5 d=tok", "OUT <- a,b", "b <- c", "c <- d",
+                      "EXPLANATION:", "VARIABLES:",
+                      "V1 \"copied word\": the word after the earlier 'for'; inputs: @4 ' each', @3 ' for'; carried by: c,L1.fc#9@4; feeds: V2",
+                      "V2 \"prediction read\": the copy, at the target; inputs: @4 ' each'; carried by: b; feeds: PREDICTION",
+                      "V3 \"embedding\": the token itself; inputs: @4; carried by: d; feeds: V1",
+                      "V4 broken line without the parts",
+                      "The model copies the word after the earlier 'for'.", "ANSWER 1: x", "FINAL 1: falls=yes top=' each'"])
+    p = components.parse(text)
+    vs = p["answer"]["variables"]
+    assert p["variables_malformed"] == 2 and len(vs) == 2
+    assert vs[0]["name"] == "copied word" and vs[0]["inputs"] == [3, 4] and vs[0]["feeds"] == ["prediction read"]
+    assert sorted(vs[0]["group"]) == sorted([["h.1.mlp.c_fc", 9, 4], ["h.2.attn.v_proj", 5, 4]])
+    assert vs[1]["feeds"] == ["prediction"] and vs[1]["group"] == [["h.2.attn.o_proj", 1, 7]]
+    assert p["answer"]["explanation"] == "The model copies the word after the earlier 'for'."
+    assert "VARIABLES" in p["explanation"]  # E1's reader reads the whole section
+    strings = [f"t{i}" for i in range(8)]
+    again = components.render(p["answer"], strings=strings)
+    assert "V1 \"copied word\": the word after the earlier 'for'; inputs: @3 't3', @4 't4'; carried by: " in again
+    assert "; feeds: V2" in again and "; feeds: PREDICTION" in again
+    q = components.parse(again)
+    assert q["answer"]["variables"] == vs and q["variables_malformed"] == 0 and components.render(q["answer"], strings=strings) == again
+    plain = components.parse(text.replace("VARIABLES:\n", "").split("\nV1")[0] + "\nThe model copies.")
+    assert "variables" not in plain["answer"] and plain["variables_malformed"] == 0
+
+
+class FakeScorer:
+    """variables.Scorer's score: on-target 0.8 for a variable carried at position 4, else unresolved; off-target 0.5;
+    every pair's composition 0.6; the circuit world the same less 0.1."""
+
+    def score(self, tx, vs, graph=None):
+        def world(d):
+            return {"variables": [{"s_on": (0.8 - d) if any(t == 4 for _, t, _ in v["group"]) else None, "s_off": 0.5 - d}
+                                  for v in vs],
+                    "pairs": [{"s_comp": 0.6 - d}] * (len(vs) * (len(vs) - 1) // 2)}
+        return {**world(0.0), "circuit": world(0.1)}
+
+
+def test_e4_scores_every_stated_variable_and_a_malformed_one_as_zero():
+    C = {"h.2.attn.v_proj": 16, "h.2.attn.o_proj": 16}
+    one = {"name": "a", "meaning": "", "inputs": [4], "group": [["h.2.attn.v_proj", 5, 4]], "feeds": ["prediction"]}
+    two = {"name": "b", "meaning": "", "inputs": [6], "group": [["h.2.attn.o_proj", 1, 7]], "feeds": ["prediction"]}
+    out = components.e4_term(FakeScorer(), None, None, {"variables": [one, two]}, 0, C)
+    assert out["model"] == pytest.approx((0.8 + 0.5 + 0.0 + 0.5 + 0.6) / 5)  # b's unresolved on-target counts 0
+    assert out["circuit"] == pytest.approx((0.7 + 0.4 + 0.0 + 0.4 + 0.5) / 5) and out["E4"] == pytest.approx((out["model"] + out["circuit"]) / 2)
+    outside = {**two, "group": [["h.2.attn.o_proj", 99, 7]]}  # no such subcomponent: malformed, 0 on and off
+    bad = components.e4_term(FakeScorer(), None, None, {"variables": [one, outside]}, 1, C)
+    assert bad["model"] == pytest.approx((0.8 + 0.5) / 6)
+    assert components.e4_term(FakeScorer(), None, None, {}, 0, C)["E4"] == 0.0
+
+
+def test_question_asks_for_variables_only_when_the_row_does(tiny):
+    nat, ge, task, ev = tiny
+    assert components.ASK_VARIABLES not in components.question(task, ev)
+    assert components.ASK_VARIABLES in components.question(task, {**ev, "variables": True})

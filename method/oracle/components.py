@@ -12,13 +12,20 @@ plain text (nothing in it is executed):
   c <- e
   d <- e
   e <- f,h
-  EXPLANATION: the model copies the digits after the earlier "327" ...
+  EXPLANATION:
+  VARIABLES:
+  V1 "copied digit": the digit after the earlier "327"; inputs: @322 ' 7'; carried by: c,d,e; feeds: PREDICTION
+  the model copies the digits after the earlier "327" ...
   ANSWER 1: the change at 322 removes the copied digit ...
   FINAL 1: falls=yes top=' 7'
   EDIT 1: cut b <- c; scale e 0
 
 The circuit comes first and the explanation of that circuit after it, so the English is conditioned on the circuit
-written (parse() reads the sections in any order). A subcomponent is L<layer>.<kind>#<index> (kind q, k, v, o, fc,
+written (parse() reads the sections in any order). The EXPLANATION may open with a VARIABLES block, the explanation
+as a causal model of the circuit: per variable its meaning, its input positions (the context tokens it is computed
+from), the circuit's subcomponents that carry it (by id) and what it feeds (other variables or the prediction), scored
+by interchange interventions (E4, variables.py); the prose after it explains the prediction in those variables and
+never names a subcomponent. A subcomponent is L<layer>.<kind>#<index> (kind q, k, v, o, fc,
 down) at a position; the token embedding at a position
 is tok, an input node. Every node is named once by a short id in its position's block ("@322 c=L2.v#902 h=tok"), and
 each edge line "reader <- writer,writer" states one edge per writer by id: an attention or MLP output (o, down) into a
@@ -46,9 +53,9 @@ whole answer at the positions that can reach the targets, goal_eval's size_scale
 missing FINAL line, cut at the sampling cap) earns -(1 + SIZE_WEIGHT), below every valid one. Nodes and edges the model
 does not have, and circuit lines that do not parse, are dropped and their bits charged in size. Terms: C, the stated
 graph's agreement with the model under the training family of interventions (goal_eval.fidelity's reward mode: F1,
-random node removals, random connection cuts, the flip adversary), N necessity, E1 the reader's bits saved, E2
-questions answered right, E3 edits (reward()'s docstring); F1 alone, F3 (stated edges' cut effects) and F2
-interchange are diagnostics.
+random node removals, random connection cuts, the flip adversary), N necessity, E2 questions answered right, E3
+edits, E4 the variables' interchange tests (reward()'s docstring); E1 the reader's bits saved, F1 alone, F3 (stated
+edges' cut effects) and F2 interchange are reported.
 
   components.py questions SPLIT OUT.jsonl [--n N] [--qa-seed K]  question rows (question, positions, evidence, questions;
                                                                 K = 1 for a fresh set of questions)
@@ -102,6 +109,9 @@ FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s
 SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+|EDIT\s+\d+)\s*:", re.M | re.I)
 EDIT_RE = re.compile(r"^\s*EDIT\s+(\d+)\s*:(.*)$", re.M | re.I)
 OP_RE = re.compile(r"\s*(persistent\s+)?(?:cut\s+(\S+)\s*<-\s*(\S+)|scale\s+(\S+)\s+(-?\d+(?:\.\d+)?))\s*", re.I)
+VAR_LINE = re.compile(r"\s*V\d+\b")  # a line of the EXPLANATION's VARIABLES block (VAR_RE when it parses)
+VAR_RE = re.compile(r'\s*V(\d+)\s+"(.*?)"\s*:\s*(.*);\s*inputs\s*:\s*(.*?)\s*;\s*carried\s+by\s*:\s*(.*?)\s*;\s*feeds\s*:\s*(.*?)\s*', re.I)
+QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")  # a token's repr in an inputs list
 
 SIZE_WEIGHT = 0.5
 REPORTED = ("F1", "F3", "E1")  # terms reported, never in the reward's mean: F1 is inside C, F3 a diagnostic, E1 until a
@@ -285,9 +295,44 @@ def parse(text: str) -> dict:
     for m in FINAL_RE.finditer(text):
         finals.setdefault(int(m[1]), (m[2].lower() == "yes", m[3].strip()))
     explanation = sec.get("EXPLANATION", "")
-    return {"explanation": explanation, "answer": {"nodes": nodes, "edges": edges, "explanation": explanation},
-            "malformed": malformed, "malformed_nodes": junk + unknown, "unknown_ids": unknown, "circuit": "CIRCUIT" in sec,
-            "finals": finals, "edits": edits}
+    variables, prose, bad_vars = _variables(explanation, ids)
+    answer = {"nodes": nodes, "edges": edges, "explanation": prose if variables or bad_vars else explanation}
+    if variables:
+        answer["variables"] = variables
+    return {"explanation": explanation, "answer": answer, "malformed": malformed, "malformed_nodes": junk + unknown,
+            "unknown_ids": unknown, "circuit": "CIRCUIT" in sec, "finals": finals, "edits": edits, "variables_malformed": bad_vars}
+
+
+def _variables(text: str, ids: dict) -> tuple[list[dict], str, int]:
+    """The EXPLANATION's VARIABLES block (variable_text()'s lines), its prose (every other line) and the variable lines
+    that are malformed: a line that does not parse, or names no subcomponent (by the circuit's ids or written out; the
+    token embedding is no subcomponent). Variables in variables.py's JSON: {"name", "meaning", "inputs" (positions),
+    "group" ([matrix, index, position], as circuit JSON nodes), "feeds" (variable names or "prediction")}."""
+    got, prose, bad = [], [], 0
+    for line in text.splitlines():
+        s = line.strip()
+        if s.rstrip(":").strip().upper() == "VARIABLES":
+            continue
+        if not VAR_LINE.match(s):
+            prose.append(line)
+            continue
+        m = VAR_RE.fullmatch(s)
+        group = []
+        if m and REFS_RE.fullmatch(m[5]):
+            for w in (x.strip() for x in GROUP_SPLIT.findall(m[5])):
+                group += [nd for nd in ([ids[w]] if w in ids else (group_of(w) or [])) if nd[0] != TOK]
+        if not group:
+            bad += 1
+            continue
+        rest = QUOTED.sub("", m[4])
+        inputs = {int(x) for x in re.findall(r"@(\d+)", rest)} or {int(x) for x in re.findall(r"\b(\d+)\b", rest)}
+        feeds = [x.strip() for x in m[6].split(",") if x.strip()]
+        got.append((int(m[1]), {"name": m[2], "meaning": m[3].strip(), "inputs": sorted(inputs),
+                                "group": [[n, c, t] for n, t, c in sorted(set(group))], "feeds": feeds}))
+    names = {f"V{k}": v["name"] for k, v in got}
+    for _, v in got:  # V<j> -> its name, PREDICTION (or OUT) -> "prediction"
+        v["feeds"] = ["prediction" if f.upper() in ("PREDICTION", "OUT") else names.get(f.upper(), f) for f in v["feeds"]]
+    return [v for _, v in got], "\n".join(prose).strip(), bad
 
 
 def _place(nd) -> tuple:
@@ -298,10 +343,13 @@ def _place(nd) -> tuple:
     return (-nd[1], -int(nd[0].split(".")[1]), list(KINDS.values()).index(nd[0].split(".")[-1])) + tuple(nd[2:3])
 
 
-def render(answer: dict, finals: dict | None = None, reasons: dict | None = None, edits: dict | None = None) -> str:
+def render(answer: dict, finals: dict | None = None, reasons: dict | None = None, edits: dict | None = None,
+           strings: list[str] | None = None) -> str:
     """The text of a circuit in goal_eval's JSON (to_json's): every node named once by a short id in its position's
     block and the edges by id (_id_lines), one output grammar for every answer; then its explanation (none when it
-    has none), the questions' answers (finals: question number -> (falls, the top token as written)) and the edits."""
+    has none: its VARIABLES block first when it has "variables", variable_text(), each input with its token when
+    strings, the text's token strings, are given), the questions' answers (finals: question number -> (falls, the top
+    token as written)) and the edits."""
     import goal_eval
 
     nodes = [(TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
@@ -312,13 +360,32 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
         else:
             parents.setdefault(nodes[r], set()).add(nodes[w])
     lines, name = _id_lines(set(nodes), parents, out)
-    text = ["CIRCUIT:"] + lines + ([f"EXPLANATION: {answer['explanation']}"] if answer.get("explanation") else [])
+    text = ["CIRCUIT:"] + lines
+    if answer.get("variables"):
+        k = {v["name"]: f"V{i}" for i, v in enumerate(answer["variables"], 1)}
+        text += ["EXPLANATION:", "VARIABLES:"] + [variable_text(v, i, k, name, strings) for i, v in enumerate(answer["variables"], 1)]
+        text += [answer["explanation"]] if answer.get("explanation") else []
+    elif answer.get("explanation"):
+        text.append(f"EXPLANATION: {answer['explanation']}")
     for k in sorted(finals or {}):
         falls, top = finals[k]
         text += [f"ANSWER {k}: {(reasons or {}).get(k, '')}".rstrip(), f"FINAL {k}: falls={'yes' if falls else 'no'} top={top}"]
     for k in sorted(edits or {}):
         text.append(f"EDIT {k}: " + "; ".join(edit_op_text(o, name) for o in edits[k]))
     return escape("\n".join(text))
+
+
+def variable_text(v: dict, k: int, numbers: dict, name: dict, strings: list[str] | None = None) -> str:
+    """A variable's line: V<k> "<name>": <meaning>; inputs: @<position> <token>, ...; carried by: <ids> (subcomponents
+    outside the circuit written out); feeds: V<j>, ... or PREDICTION. v in variables.py's JSON; numbers: variable name
+    -> V<j>; name: the circuit's ids (_id_lines)."""
+    import goal_eval
+
+    group = sorted(((goal_eval._site(m), t, c) for m, c, t in v["group"]), key=_place)
+    inputs = ", ".join(f"@{p} {shown(strings[p])}" if strings else f"@{p}" for p in v["inputs"])
+    feeds = ", ".join("PREDICTION" if f == "prediction" else numbers.get(f, f) for f in v["feeds"]) or "PREDICTION"
+    carried = ",".join(name[nd] if nd in name else node_text(nd) for nd in group)
+    return f'V{k} "{v["name"]}": {v["meaning"]}; inputs: {inputs}; carried by: {carried}; feeds: {feeds}'
 
 
 def edit_op_text(o: dict, name: dict) -> str:
@@ -661,6 +728,12 @@ ASK = ("How does {model} compute its prediction of the next token after the targ
        "weights on every text (nodes then written without a position).")
 
 
+ASK_VARIABLES = ("Open the EXPLANATION with a line VARIABLES: and one line per variable the circuit computes, V<k> "
+                 "\"<short name>\": <its meaning in plain English>; inputs: @<position> <token>, ... (the context tokens it "
+                 "is computed from); carried by: <the ids of the circuit's subcomponents that carry it>; feeds: V<j>, ... "
+                 "or PREDICTION; then explain the prediction in those variables, never naming a subcomponent.")
+
+
 def wiring(conn, nodes: list, targets: list[int], k: int) -> list[tuple]:
     """The k strongest weight-level connections (connectome cosine) among `nodes` that the model has (mech.connects):
     (writer, reader, cosine)."""
@@ -859,7 +932,8 @@ def listing(strings: list[str], numbered: set[int], every: int = MARK_EVERY) -> 
 
 
 def question(task: dict, ev: dict) -> str:
-    """The oracle's question for one text from its evidence()."""
+    """The oracle's question for one text from its evidence(); a row marked "variables" (rerender --variables) also
+    asks for the VARIABLES block (ASK_VARIABLES)."""
     import units
 
     model = task["model"]
@@ -869,7 +943,8 @@ def question(task: dict, ev: dict) -> str:
     t = max(targets)
     top_tok = p["model_top"][0][0][0]
     top = ", ".join(f"{tok!r} {q:.2f}" for tok, q in p["model_top"][0][:3])
-    lines = [ASK.format(model=model), "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): "
+    lines = [ASK.format(model=model) + (" " + ASK_VARIABLES if ev.get("variables") else ""),
+             "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): "
              + listing(strings, windows(task, ev)),
              f"target: position {t}; the model's most probable next tokens there: {top}",
              "positions where a changed token moves the prediction by at least 1% of the total, most first: "
@@ -1067,9 +1142,38 @@ def _pool() -> dict:
     return _POOL["m"]
 
 
+def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict) -> dict:
+    """E4: the answer's variables scored by interchange interventions (variables.Scorer: on-target, off-target,
+    composition) in the real model and in the stated graph (C's semantics), each world's mean over every stated
+    variable's on-target and off-target scores and every pair's composition score. A variable whose on-target draws
+    resolve no change scores 0 there (its inputs are not shown to matter); one with no off-target draw is left out
+    there (nothing outside its inputs to test); a malformed one (a line that does not parse, no subcomponent of the
+    model) scores 0 on and off target. No VARIABLES block: 0. {"E4": the two worlds' mean, "model", "circuit"}."""
+    import variables
+
+    ok, bad = [], malformed
+    for v in answer.get("variables") or []:
+        try:
+            ok.append(variables.parse([v], C)[0])
+        except (ValueError, KeyError):
+            bad += 1
+    if not ok:
+        return {"E4": 0.0, "model": 0.0, "circuit": 0.0}
+    got = scorer.score(tx, ok, graph=graph)
+
+    def world(w: dict) -> float:
+        xs = [0.0] * (2 * bad)
+        for x in w["variables"]:
+            xs += [x["s_on"] or 0.0] + ([x["s_off"]] if x["s_off"] is not None else [])
+        xs += [q["s_comp"] for q in w["pairs"] if q["s_comp"] is not None]
+        return sum(xs) / len(xs)
+    model, circ = world(got), world(got["circuit"])
+    return {"E4": (model + circ) / 2, "model": model, "circuit": circ}
+
+
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None, ee=None,
-           edit_best: dict | None = None, pool: dict | None = None) -> list[dict]:
+           edit_best: dict | None = None, pool: dict | None = None, vs=None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
     row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT section, a
     question has no FINAL line, an edit request no EDIT line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
@@ -1088,7 +1192,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     VPD's own answer loses without the circuit, ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD) in [0, 1]); E1, the
     reader's bits saved (in [-1, 1]; with a reader or e1; reported, not in the mean: REPORTED); E2, the questions answered right measured from the no-change answer (qa_term); E3, the edit
     requests' net bits over the edit teacher's (edit_term; ee an edit_eval.EditEval, edit_best goal key -> the teacher's
-    net; left out until every request of the text has one). A term goal_eval cannot give (no causal-importance
+    net; left out until every request of the text has one); E4, the VARIABLES block's interchange tests (e4_term; vs a
+    variables.Scorer, left out without one, 0 for an answer without the block when measured). A term goal_eval cannot give (no causal-importance
     network for VPD's bounds) is left out of the mean. F3, the AUC of stated edges' cuts in the circuit's run, is
     reported (term_F3), never in the mean. C (term_C), the circuit term in the mean in place of F1: goal_eval.fidelity's
     reward mode, the mean of the stated graph's F1, its agreement under random node removals and under random
@@ -1132,6 +1237,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
                 "E2": lambda task, g, x: qa_term(ev["qa"], parse(x)["finals"], tok, prompt["model_top"][0][0][0])}
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
     c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], _pool() if pool is None else pool, mode="reward"))) if keep else {}
+    e4 = {i: e4_term(vs, tx, graphs[i], parsed[i]["answer"], parsed[i]["variables_malformed"], nat.C) for i in keep} if vs is not None else {}
     e3 = {}
     if keep and ee is not None and ev.get("edits"):
         e3 = dict(zip(keep, edit_term(ee, task, ev["edits"], [parsed[i]["edits"] for i in keep], edit_best or {})))
@@ -1148,6 +1254,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
             terms["E2"] = row["E2"]
             terms["E3"] = e3.get(i)
+            terms["E4"] = e4[i]["E4"] if i in e4 else None
             have = [v for k, v in terms.items() if k not in REPORTED and v is not None]
             e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
             size = size_term(row["bits"] + d_bits + e_bits, scale)
@@ -1156,7 +1263,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             circ = sum(own) / len(own) - size_weight * size
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
                     "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
-                    "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row,
+                    "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row, "variables": e4.get(i),
                     "fidelity": {k: v for k, v in (c_of.get(i) or {}).items() if k in ("s_point_c", "s_point", "s_wiring", "s_nodes", "s_edges", "f1_flips_c", "f1_flips_omitted")}})
     return out
 
@@ -1204,12 +1311,13 @@ def edit_term(ee, task: dict, goals: list[dict], answers: list[dict], best: dict
 # ---- supervised targets
 
 
-def target(answer: dict, ev: dict, model: str, edits: dict | None = None) -> str:
-    """The supervised answer to a question: the teacher's circuit (goal_eval's JSON) and explanation, for each
-    question the model's measured answer (no reasoning: the teacher has none to give), and for each edit request the
-    edit teacher's operations (edits: request number -> parse()'s ops)."""
+def target(answer: dict, ev: dict, model: str, edits: dict | None = None, strings: list[str] | None = None) -> str:
+    """The supervised answer to a question: the teacher's circuit (goal_eval's JSON), variables and explanation, for
+    each question the model's measured answer (no reasoning: the teacher has none to give), and for each edit request
+    the edit teacher's operations (edits: request number -> parse()'s ops); strings: the text's tokens (the variables'
+    inputs)."""
     finals = {n: (q["falls"], shown(token_strings(model, [q["top"]])[0])) for n, q in enumerate(ev["qa"], 1)}
-    return render(answer, finals, edits=edits)
+    return render(answer, finals, edits=edits, strings=strings)
 
 
 def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None, max_pairs: int = MAX_PAIRS) -> dict:
@@ -1346,7 +1454,8 @@ def writer_prompt(f: dict) -> str:
     return escape(WRITER.format(facts="\n".join(lines)))
 
 
-def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | None = None, edits: dict | None = None) -> int:
+def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | None = None, edits: dict | None = None,
+            variables: dict | None = None) -> int:
     """SFT rows ({"prompt": [user message], "completion": [assistant message], "info": {"task"}}, units_sft.py's
     format) for the questions that have a teacher answer: TEACHER_DIR/<task>.json (goal_eval's circuit JSON; nodes
     without edges get with_edges(), which needs ge) or <task>.txt (this module's text). english: task -> the chosen
@@ -1354,7 +1463,9 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
     (edit_teach()); a question with edit requests is kept only when the teacher has an edit for every one. Every target
     is the circuit as it is scored: goal_eval.circuit drops nodes and edges the model does not have and the stranded
     nodes (goal_eval.strand: a node other than a query or key with no stated connection), so nothing in a target is a
-    part the reward drops; info counts them (stranded, dropped_nodes, dropped_edges). ge: goal_eval.GoalEval."""
+    part the reward drops; info counts them (stranded, dropped_nodes, dropped_edges). variables: task -> the teacher's
+    variables (variables.py's JSON, meanings written), else the teacher answer's own "variables"; a row that asks for
+    them (rerender --variables) is kept only with them. ge: goal_eval.GoalEval."""
     import edit_eval
     import goal_eval
     import native
@@ -1376,8 +1487,12 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
                 answer = with_edges(ge, task, r, answer)
             prompt = task["prompts"][0]
             g, d = goal_eval.circuit(answer, prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
-            answer = goal_eval.to_json(g, answer.get("explanation", ""))
-            info = {"task": r["task"], "stranded": d["stranded_nodes"], "dropped_nodes": d["invalid_nodes"], "dropped_edges": d["invalid_edges"]}
+            found = (variables or {}).get(r["task"], answer.get("variables"))
+            answer = goal_eval.to_json(g, answer.get("explanation", "")) | ({"variables": found} if found else {})
+            if r.get("variables") and not found:
+                continue  # the question asks for VARIABLES (rerender --variables): no target without them
+            info = {"task": r["task"], "stranded": d["stranded_nodes"], "dropped_nodes": d["invalid_nodes"], "dropped_edges": d["invalid_edges"],
+                    "variables": len(found or [])}
             if english and r["task"] in english:
                 answer = {**answer, "explanation": english[r["task"]]}
             ops = {}
@@ -1388,7 +1503,8 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
             if len(ops) < len(r.get("edits") or []):
                 continue  # an answer without an EDIT line for a request is invalid: no target for it
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
-                                "completion": [{"role": "assistant", "content": target(answer, r, task["model"], ops)}],
+                                "completion": [{"role": "assistant", "content": target(answer, r, task["model"], ops,
+                                                                                        token_strings(task["model"], prompt["token_ids"]))}],
                                 "info": info}) + "\n")
             f.flush()
             n += 1
@@ -1585,7 +1701,7 @@ def _paired(a: list, b: list) -> dict:
 
 
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
-             diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None) -> dict:
+             diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -1614,7 +1730,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
             cache = {}
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
-                            ee=ee, edit_best=edit_best)
+                            ee=ee, edit_best=edit_best, vs=vs)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -1706,6 +1822,7 @@ def main():
     rr.add_argument("out", type=Path)
     rr.add_argument("--facts", action="store_true", help="read each listed subcomponent's facts again (refresh_facts: the routed lens "
                                                           "at its position, one forward pass per text)")
+    rr.add_argument("--variables", action="store_true", help="ask for the EXPLANATION's VARIABLES block (ASK_VARIABLES)")
     rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
     rf.add_argument("rows", type=Path)
     rf.add_argument("teacher", type=Path, help="teacher.py's output directory (<task>.json, <task>.vpd_top<k>.edges.json)")
@@ -1760,6 +1877,7 @@ def main():
     d.add_argument("out", type=Path)
     d.add_argument("--english", type=Path, help="tinker_train.py explain output: each text's chosen explanation")
     d.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (the edit teacher's edits)")
+    d.add_argument("--variables", type=Path, help="a directory of <task>.json, {\"variables\": [...]} (variables.py's JSON, meanings written)")
     s = sub.add_parser("evaluate")
     s.add_argument("split", choices=("train", "heldout", "hard"))
     s.add_argument("rows", type=Path, help="questions' JSONL (a fresh QA seed for a report, the discovery one for selection)")
@@ -1770,6 +1888,7 @@ def main():
     s.add_argument("--diagnostics", action="store_true", help="structure() of each first sample (slow)")
     s.add_argument("--out", type=Path)
     s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (scored with net): the best net per goal (E3)")
+    s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
     args = ap.parse_args()
     import goal_eval
     import native
@@ -1781,14 +1900,18 @@ def main():
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
                 if args.facts:
                     r = refresh_facts(atlas, lens, task, r)
+                if args.variables:
+                    r = {**r, "variables": True}
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
         return
 
     if args.cmd == "dataset":
         english = {r["task"]: r["explanation"] for r in map(json.loads, args.english.read_text().splitlines())
                    if r.get("explanation")} if args.english else None
+        found = ({f.stem: json.loads(f.read_text())["variables"] for f in sorted(args.variables.glob("*.json"))}
+                 if args.variables else None)
         print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval(), english,
-                      edit_teach(args.edit_teach) if args.edit_teach else None), "rows", flush=True)
+                      edit_teach(args.edit_teach) if args.edit_teach else None, found), "rows", flush=True)
         return
     if args.cmd == "facts":
         ge = goal_eval.GoalEval(native.Native(args.device))
@@ -1960,7 +2083,12 @@ def main():
 
         ee = edit_eval.EditEval(nat)
         _, edit_best = edit_eval.bests(args.edit_teach)  # the best net per goal over the teacher and the baselines
-    out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best)
+    vs = None
+    if args.variables:
+        import variables
+
+        vs = variables.Scorer(ge)
+    out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

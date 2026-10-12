@@ -29,7 +29,12 @@ off; a column outside the engine's is always 0, so the graphs' nodes must be amo
 the connections (each graph's parents, reader by reader in its writers' order) and of those into the prediction (its
 out list), [B, E] and [B, O] for one graph, flat in graph order for a list (None: 1); differentiable in u, ew and ow.
 Float32-close to native.run (attention by torch's fused kernel, the pattern computed apart only at attention-output
-readers' positions).
+readers' positions). Engine.plan(graphs, semantics="c") runs C's semantics instead (goal_eval.GoalEval.graph_ref, the
+lead's decision 10-12): the circuit's nodes at 1 in the stream and every other subcomponent at u, every reader of the
+circuit reading the stream less (1 - e) of each connection the model has from another circuit node (e its strength
+when stated, 0 when not; through the attention pattern into an attention output, inside the GELU into an MLP output),
+the prediction less (1 - e) of each residual writer at a target; with every connection stated, the masked run of the
+circuit and u.
 """
 from __future__ import annotations
 
@@ -155,12 +160,17 @@ class Engine:
         """The numbers to report for masks a search found at a lower precision: float32, vpd_model's own steps."""
         return self.kl({n: m.detach().float() for n, m in masks.items()}, "score")
 
-    def plan(self, graphs) -> dict:
+    def plan(self, graphs, semantics: str = "native") -> dict:
         """Graphs' nodes and connections as index tensors over the engine's columns, for graph_kl. graphs: one
-        native.Graph, run on every row, or a list of them, one per row. Per site the query and key nodes (rows,
-        positions, columns), the reader nodes (those with stated parents) and the writer nodes as (rows, positions,
-        columns); per (reader site, writer site) the connections (reader rows, writer rows, their index among the
-        strengths); per writer site the connections into the prediction (rows, target index, writer rows, index)."""
+        native.Graph, run on every row, or a list of them, one per row. semantics (module docstring): "native"
+        (native.run's: the stated connections) or "c" (C's: every connection the model has among the nodes, the
+        unstated ones at strength 0). Per site the circuit's nodes, the query and key nodes, the reader nodes (with a
+        connection in) and the writer nodes as (rows, positions, columns); per (reader site, writer site) the
+        connections (reader rows, writer rows, their index among the strengths, 1 for a stated one and 0 for an
+        unstated one); per writer site the connections into the prediction (rows, target index, writer rows, index, 1
+        or 0)."""
+        if semantics not in ("native", "c"):
+            raise ValueError("semantics is native or c")
         one = not isinstance(graphs, (list, tuple))
         graphs = [graphs] if one else list(graphs)
         if any(g.complete for g in graphs):
@@ -181,33 +191,41 @@ class Engine:
             rows = table.setdefault(nd[0], {})
             return rows.setdefault((b, nd[1], col(nd[0], nd[2])), len(rows))
 
-        readers, writers, edges, outs, qk, E, O = {}, {}, {}, {}, {}, 0, 0
+        readers, writers, edges, outs, qk, nodes, E, O = {}, {}, {}, {}, {}, {}, 0, 0
         for b, g in enumerate(graphs):
-            for r, ws in g.parents.items():
+            ne, no = E, O  # this graph's stated connections' indices: from E and O on, in its parents' and out's order
+            at = {(w, r): ne + k for k, (w, r) in enumerate((w, r) for r, ws in g.parents.items() for w in ws)}
+            at.update({(w, None): no + k for k, w in enumerate(g.out)})
+            E, O = ne + sum(len(ws) for ws in g.parents.values()), no + len(g.out)
+            par, out = (g.parents, g.out) if semantics == "native" else native.all_edges(sorted(g.node_set()), self.targets)
+            for r, ws in par.items():
                 ri = row(readers, b, r)
                 for w in ws:
-                    lst = edges.setdefault((r[0], w[0]), ([], [], []))
+                    lst = edges.setdefault((r[0], w[0]), ([], [], [], []))
                     lst[0].append(ri)
                     lst[1].append(row(writers, b, w))
-                    lst[2].append(E)
-                    E += 1
-            for w in g.out:
+                    lst[2].append(at.get((w, r), 0))
+                    lst[3].append(float((w, r) in at))
+            for w in out:
                 if w[1] not in self.targets:
                     raise ValueError(f"{w} writes into the prediction but is not at a target")
-                lst = outs.setdefault(w[0], ([], [], [], []))
+                lst = outs.setdefault(w[0], ([], [], [], [], []))
                 lst[0].append(b)
                 lst[1].append(self.targets.index(w[1]))
                 lst[2].append(row(writers, b, w))
-                lst[3].append(O)
-                O += 1
+                lst[3].append(at.get((w, None), 0))
+                lst[4].append(float((w, None) in at))
             for n, t, c in g.node_set():
+                nodes.setdefault(n, set()).add((b, t, col(n, c)))
                 if n.endswith(("q_proj", "k_proj")):
                     qk.setdefault(n, set()).add((b, t, col(n, c)))
         ints = lambda v: torch.tensor(v, dtype=torch.long, device=dev)  # noqa: E731
         btc = lambda keys: tuple(ints([k[j] for k in keys]) for j in range(3))  # noqa: E731
-        return _positions({"B": None if one else len(graphs), "E": E, "O": O, "qk": {n: btc(sorted(v)) for n, v in qk.items()},
+        conn = lambda v: tuple(ints(x) for x in v[:-1]) + (torch.tensor(v[-1], device=dev),)  # noqa: E731
+        return _positions({"B": None if one else len(graphs), "E": E, "O": O, "semantics": semantics,
+                           "qk": {n: btc(sorted(v)) for n, v in qk.items()}, "nodes": {n: btc(sorted(v)) for n, v in nodes.items()},
                            "readers": {n: btc(list(rows)) for n, rows in readers.items()}, "writers": {n: btc(list(rows)) for n, rows in writers.items()},
-                           "edges": {k: tuple(ints(x) for x in v) for k, v in edges.items()}, "out": {k: tuple(ints(x) for x in v) for k, v in outs.items()}})
+                           "edges": {k: conn(v) for k, v in edges.items()}, "out": {k: conn(v) for k, v in outs.items()}})
 
     def _rows(self, p: dict, B: int) -> dict:
         """A one-graph plan's tables for B rows (kept on the plan), row b's entries after row b - 1's."""
@@ -223,10 +241,13 @@ class Engine:
             R = {n: len(v[0]) for n, v in p["readers"].items()}
             W = {n: len(v[0]) for n, v in p["writers"].items()}
             p["tiled"][B] = _positions({
-                "B": B, "E": B * p["E"], "O": B * p["O"], "qk": {n: btc(v) for n, v in p["qk"].items()},
+                "B": B, "E": B * p["E"], "O": B * p["O"], "semantics": p["semantics"], "qk": {n: btc(v) for n, v in p["qk"].items()},
+                "nodes": {n: btc(v) for n, v in p["nodes"].items()},
                 "readers": {n: btc(v) for n, v in p["readers"].items()}, "writers": {n: btc(v) for n, v in p["writers"].items()},
-                "edges": {(rn, wn): (tile(ri, R[rn]), tile(wi, W[wn]), tile(j, p["E"])) for (rn, wn), (ri, wi, j) in p["edges"].items()},
-                "out": {wn: (bs(len(b)), ti.repeat(B), tile(wi, W[wn]), tile(j, p["O"])) for wn, (b, ti, wi, j) in p["out"].items()}})
+                "edges": {(rn, wn): (tile(ri, R[rn]), tile(wi, W[wn]), tile(j, p["E"]), fx.repeat(B))
+                          for (rn, wn), (ri, wi, j, fx) in p["edges"].items()},
+                "out": {wn: (bs(len(b)), ti.repeat(B), tile(wi, W[wn]), tile(j, p["O"]), fx.repeat(B))
+                        for wn, (b, ti, wi, j, fx) in p["out"].items()}})
         return p["tiled"][B]
 
     def graph_kl(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
@@ -256,6 +277,10 @@ class Engine:
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         norm, act = self._steps(fused)
         R, Wr, Eg = p["readers"], p["writers"], p["edges"]
+        c = p["semantics"] == "c"
+        if c:  # the circuit's nodes at 1 in the stream, every other subcomponent at u
+            one = torch.ones((), device=self.dev)
+            u = {n: m.expand(B, T, -1).index_put(p["nodes"][n], one) if n in p["nodes"] else m for n, m in u.items()}
         aw, sw = {}, {}  # per writer site, its writer rows' activations and 1 - u
 
         def at(m, b, t, c):  # a mask [B or 1, T or 1, K] at rows' (row, position, column)
@@ -266,11 +291,13 @@ class Engine:
                 aw[n], sw[n] = A[Wr[n]], 1 - at(u[n], *Wr[n])
             return A
 
-        def shares(rn):  # the connections into reader site rn: (writer site, reader rows, writer rows, e (1 - u_w) a_w)
-            for (r, wn), (ri, wi, j) in Eg.items():
+        def share(wn, wi, e):  # a connection's extra share in its reader's input: native e (1 - u_w) a_w, C -(1 - e) a_w
+            return (e - 1) * aw[wn][wi] if c else e * sw[wn][wi] * aw[wn][wi]
+
+        def shares(rn):  # the connections into reader site rn: (writer site, reader rows, writer rows, share)
+            for (r, wn), (ri, wi, j, fx) in Eg.items():
                 if r == rn:
-                    e = 1.0 if ew is None else ew[j]
-                    yield wn, ri, wi, e * sw[wn][wi] * aw[wn][wi]
+                    yield wn, ri, wi, share(wn, wi, fx if ew is None else ew[j] * fx)
 
         def topup(rn, width):  # [readers, width]: each reader node's stated parents' extra share
             out = torch.zeros(len(R[rn][0]), width, device=self.dev)
@@ -336,9 +363,9 @@ class Engine:
             A["down_proj"] = done(nd, a)
             x = x + out("down_proj", g, u[nd])
         z = x[:, self.targets]
-        for wn, (b, ti, wi, j) in p["out"].items():
-            e = 1.0 if ow is None else ow[j]
-            z = z.index_put((b, ti), (e * sw[wn][wi] * aw[wn][wi])[:, None] * self.U[wn].index_select(0, Wr[wn][2][wi]), accumulate=True)
+        for wn, (b, ti, wi, j, fx) in p["out"].items():
+            s = share(wn, wi, fx if ow is None else ow[j] * fx)
+            z = z.index_put((b, ti), s[:, None] * self.U[wn].index_select(0, Wr[wn][2][wi]), accumulate=True)
         return norm(z, tg.ln_f)
 
 

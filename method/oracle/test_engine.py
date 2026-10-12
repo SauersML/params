@@ -247,3 +247,29 @@ def test_graph_lists():
     parts = a.grad.split(split)
     for x, y in ((torch.cat(parts[0::2]), be.grad), (torch.cat(parts[1::2]), bo.grad)):
         assert float((x - y).norm() / x.norm().clamp_min(1e-30)) < REL
+
+
+def test_c_semantics_equal_graph_ref():
+    """C's semantics (plan(semantics="c")) equal goal_eval.GoalEval.graph_ref, the forward pass written out, on a graph
+    stating half of its connections, with the gradients in u; a stated connection at strength 0 is the graph without it."""
+    nat, ids, targets, graph, _, _, u = graph_case()
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[::2])
+    ge = goal_eval.GoalEval(nat)
+    a = {n: m.clone().requires_grad_(True) for n, m in u.items()}
+    b = {n: m.clone().requires_grad_(True) for n, m in u.items()}
+    want = carry.kl(nat.reference([ids], targets), ge.graph_ref(ids, targets, half, u=a))
+    eng = engine.Engine(nat, ids, targets, live=True)
+    got = eng.graph_kl(eng.plan(half, semantics="c"), b)
+    assert rel(want, got) < REL
+    want.sum().backward()
+    got.sum().backward()
+    for n in nat.names:
+        assert float((a[n].grad - b[n].grad).norm() / a[n].grad.norm().clamp_min(1e-30)) < REL
+    E = sum(len(ws) for ws in half.parents.values())
+    ew = torch.ones(1, E, device=nat.dev)
+    ew[0, 0] = 0.0
+    r0 = next(r for r, ws in half.parents.items() if ws)
+    less = native.Graph(half.nodes, {r: (ws[1:] if r == r0 else ws) for r, ws in half.parents.items()}, half.out)
+    with torch.no_grad():
+        u0 = {n: m[:1] for n, m in u.items()}
+        assert rel(eng.graph_kl(eng.plan(less, semantics="c"), u0), eng.graph_kl(eng.plan(half, semantics="c"), u0, ew=ew)) < REL

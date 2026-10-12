@@ -895,6 +895,105 @@ class GoalEval:
 
 
     @torch.no_grad()
+    def line_effects(self, tx: Text, graph: native.Graph, mode: str = "pp", split: str = "search", draws: int = 8,
+                     chunk: int = 16) -> dict:
+        """Each line of an answer's own effect, for RL's per-line rewards (the lead's 10-12): raw bits, unclipped.
+        nodes: per node, the KL at the targets with that node alone removed from the answer's graph less the KL of the
+        graph (above 0: the node helps), and vpd_active (VPD's answer has it on at that position; a block, any of its
+        site's parts there); edges: per stated connection (and, in "pp", stated token edge) the same with it alone cut;
+        positions: per influential position (F2's, the probe's moved) whether the answer has a node there and a token
+        edge from it. mode "c": C's semantics on the text, every removal one row of batched engine plans (chunk rows
+        each; block nodes run as their subcomponents); "pp": the path-patched run (pp_run) on split's changed texts
+        (draws of changed_inputs' prompts), each removal's KL change weighted by how far the change moves the model.
+        A complete graph (node set) has its nodes and no stated lines. Nothing else is re-stranded: a removal's
+        dependants keep their places, reading what remains."""
+        nat, T = self.nat, tx.T
+        g = strand(graph, tx.targets, nat.C)
+        nodes = sorted(g.node_set())
+        edges = [] if g.complete else _pairs(g)
+        toks = [] if g.complete else sorted(getattr(g, "tok_edges", [])) + [(t, None) for t in getattr(g, "tok_out", [])]
+
+        def keep(h):  # a removal's graph as stated (no further stranding)
+            h.stranded, h.stranded_bits = [], 0.0
+            for name in ("tok_edges", "tok_positions", "tok_out", "pairs"):
+                if hasattr(g, name) and not hasattr(h, name):
+                    setattr(h, name, getattr(g, name))
+            return h
+
+        def without_node(nd):
+            if g.complete:
+                return keep(native.Graph([x for x in nodes if x != nd], complete=True))
+            h = keep(_drop_nodes(g, {nd}))
+            h.tok_edges = [(t, r) for t, r in getattr(g, "tok_edges", []) if r != nd]
+            return h
+
+        def without_edge(e):
+            w, r = e
+            par = {rr: [x for x in ws if not (rr == r and x == w)] for rr, ws in g.parents.items()}
+            h = native.Graph(list(g.nodes), {rr: ws for rr, ws in par.items() if ws}, [x for x in g.out if not (r is None and x == w)])
+            return keep(h)
+
+        def without_tok(e):
+            h = keep(native.Graph(list(g.nodes), dict(g.parents), list(g.out)))
+            for name in ("tok_positions", "pairs"):
+                if hasattr(g, name):
+                    setattr(h, name, getattr(g, name))
+            h.tok_edges = [x for x in getattr(g, "tok_edges", []) if x != e]
+            h.tok_out = [t for t in getattr(g, "tok_out", []) if e != (t, None)]
+            return h
+
+        variants = [g] + [without_node(nd) for nd in nodes] + [without_edge(e) for e in edges]
+        if mode == "pp":
+            variants += [without_tok(e) for e in toks]
+        if mode == "c":
+            kl = []
+            for s0 in range(0, len(variants), chunk):
+                part = [expand_blocks(h, nat.C) for h in variants[s0:s0 + chunk]]
+                whole = [i for i, h in enumerate(part) if h.complete]
+                stated = [i for i, h in enumerate(part) if not h.complete]
+                got = [None] * len(part)
+                if whole:
+                    for i, k in zip(whole, carry.kl(tx.ref, self.runs(tx.ids, tx.targets, [self.masks(part[i], T) for i in whole], True)).tolist()):
+                        got[i] = k
+                if stated:
+                    for i, k in zip(stated, carry.kl(tx.ref, self._graph_logq(tx.ids, tx.targets, [part[i] for i in stated])).tolist()):
+                        got[i] = k
+                kl += got
+                native.free(nat.dev)
+        elif mode == "pp":
+            moved = np.asarray(tx.moved, dtype=float)
+            positions = [q for q, _ in tx.f2]
+            got = self._interchange_draws(tx, positions, split, draws, first={q: -moved[q - 1] for q in positions}) if positions else []
+            acc, wsum = np.zeros(len(variants)), 0.0
+            for q, z in got:
+                x2 = list(tx.ids)
+                x2[q] = z
+                ref = nat.reference([x2], tx.targets)
+                w = float(carry.kl(ref, tx.ref)[0])
+                acc += w * np.array([float(carry.kl(ref, self.pp_run(tx, x2, h))[0]) for h in variants])
+                wsum += w
+                native.free(nat.dev)
+            kl = list(acc / wsum) if wsum > 0 else [None] * len(variants)
+        else:
+            raise ValueError("mode is pp or c")
+        base = kl[0]
+        d = lambda k: None if k is None or base is None else k - base  # noqa: E731
+        rows_n = kl[1:1 + len(nodes)]
+        rows_e = kl[1 + len(nodes):1 + len(nodes) + len(edges)]
+        rows_t = kl[1 + len(nodes) + len(edges):]
+        tok_at = {t for t, _ in toks}
+        f2 = sorted({q for q, _ in tx.f2}) if tx.f2 is not None else []
+        moved = np.asarray(tx.moved, dtype=float) if f2 else None
+        return {"mode": mode, "base_kl": base,
+                "nodes": [{"node": list(nd), "delta_kl": d(k),
+                           "vpd_active": bool(tx.vpd[nd[0]][nd[1]].any() if nd[2] == BLOCK else tx.vpd[nd[0]][nd[1], nd[2]]) if tx.vpd is not None else None}
+                          for nd, k in zip(nodes, rows_n)],
+                "edges": [{"edge": [list(w), "out" if r is None else list(r)], "delta_kl": d(k)} for (w, r), k in zip(edges, rows_e)],
+                "token_edges": [{"edge": [t, "out" if r is None else list(r)], "delta_kl": d(k)} for (t, r), k in zip(toks, rows_t)] if mode == "pp" else [],
+                "positions": [{"position": q, "moved": float(moved[q - 1]), "has_node": any(nd[1] == q for nd in nodes),
+                               "has_token_edge": q in tok_at or g.complete} for q in f2]}
+
+    @torch.no_grad()
     def pattern_family(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
         """s_pattern (the lead's 10-12, rustmove's 35f6ca0: C's semantics flatten attention, the q/k remainders
         about 1% of the scores, so circuits fit near-uniform rows): each circuit's run in C's semantics (graph_ref)

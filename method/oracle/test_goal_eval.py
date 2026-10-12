@@ -1542,6 +1542,54 @@ def test_true_pattern_family(tiny):
     row = ge.fidelity(tx, [g], None, draws=2, near_donors=0, far_donors=0, interchange=2, changed=2)[0]
     assert row["s_pattern"] == rows[1]["s_pattern"]
 
+
+def test_line_effects(tiny):
+    """line_effects: a node's or a stated edge's effect is the KL with it alone removed less the graph's, in C's
+    semantics (graph_ref) and path-patched (pp_run over the split's changed texts, weighted by how far each moves the
+    model); VPD-active flags; the influential positions' node and token-edge flags."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::8]
+    outside = next(nd for nd in [(n, t, c) for n in nat.names for t in range(tx.T) for c in range(nat.C[n])] if not tx.vpd[nd[0]][nd[1], nd[2]])
+    par, out = native.all_edges(sub, tx.targets)
+    g = goal_eval.strand(native.Graph(sub + [outside], par, out), tx.targets, nat.C)
+    p = sorted(q for q, _ in tx.f2)[0]
+    g.tok_edges = [(p, nd) for nd in sorted(g.node_set()) if nd[1] == p and native._name_layer_kind(nd[0])[1] in mech.RESID_READERS][:1]
+    rc = ge.line_effects(tx, g, mode="c")
+    base = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, g))[0])
+    assert abs(rc["base_kl"] - base) < 1e-4 + 1e-4 * base
+    nd = rc["nodes"][0]
+    drop = goal_eval._drop_nodes(g, {tuple(nd["node"])})
+    want = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, drop))[0]) - base
+    assert abs(nd["delta_kl"] - want) < 1e-4 + 1e-4 * abs(want), (nd["delta_kl"], want)
+    e = rc["edges"][0]
+    w, r = tuple(e["edge"][0]), (None if e["edge"][1] == "out" else tuple(e["edge"][1]))
+    cut = native.Graph(list(g.nodes), {rr: [x for x in ws if not (rr == r and x == w)] for rr, ws in g.parents.items()},
+                       [x for x in g.out if not (r is None and x == w)])
+    want = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, cut))[0]) - base
+    assert abs(e["delta_kl"] - want) < 1e-4 + 1e-4 * abs(want), (e["delta_kl"], want)
+    flags = {tuple(x["node"]): x["vpd_active"] for x in rc["nodes"]}
+    assert all(flags[x] == bool(tx.vpd[x[0]][x[1], x[2]]) for x in flags)
+    pos = {x["position"]: x for x in rc["positions"]}
+    assert pos[p]["has_token_edge"] == bool(g.tok_edges) and pos[p]["has_node"] == any(x[1] == p for x in g.node_set())
+    rp = ge.line_effects(tx, g, mode="pp", draws=2)
+    moved = np.asarray(tx.moved, dtype=float)
+    pts = [q for q, _ in tx.f2]
+    draws = ge._interchange_draws(tx, pts, "search", 2, first={q: -moved[q - 1] for q in pts})
+    nd = rp["nodes"][0]
+    drop = goal_eval._drop_nodes(g, {tuple(nd["node"])})
+    drop.tok_edges = [(t, x) for t, x in g.tok_edges if x != tuple(nd["node"])]
+    num = den = 0.0
+    for q, z in draws:
+        x2 = list(tx.ids)
+        x2[q] = z
+        ref = nat.reference([x2], tx.targets)
+        w_ = float(carry.kl(ref, tx.ref)[0])
+        num += w_ * (float(carry.kl(ref, ge.pp_run(tx, x2, drop))[0]) - float(carry.kl(ref, ge.pp_run(tx, x2, g))[0]))
+        den += w_
+    assert abs(nd["delta_kl"] - num / den) < 1e-4 + 1e-4 * abs(num / den), (nd["delta_kl"], num / den)
+    assert len(rp["token_edges"]) == len(g.tok_edges)
+
 def test_block_nodes(tiny):
     """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
     stranded by the same rules as a subcomponent of its site, and run by C's families as every subcomponent of the

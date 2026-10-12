@@ -3283,7 +3283,7 @@ def pattern(pool: dict, k: int) -> dict:
 
 def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws: int = DRAWS, vpd: Path | None = None,
                     offset: int = 0, stride: int = 1, fresh: Path | None = None, interchange: int = 16, curve=ADV_CURVE,
-                    log=print, changed: int = CHANGED_DRAWS, only: tuple = ()) -> list[dict]:
+                    log=print, changed: int = CHANGED_DRAWS, only: tuple = (), mode: str = "full", draw_split: str | None = None) -> list[dict]:
     """C on the split's first n texts for answer sets (sets: name -> a directory of <task>.json circuits, run as stated)
     and VPD's first k at each circuit's size (complete graphs), with the evaluation-only families (fresh: the pattern
     lever over a pool no search drew from; interchange draws; changed texts (changed_inputs' eval split); N_real); one
@@ -3354,7 +3354,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
                 log(f"{p.stem}: {len(graphs)} circuits, {time.perf_counter() - t0:.0f} s")
             continue
         fid = ge.fidelity(tx, graphs, M, draws=draws, curve=curve, fresh=F, interchange=interchange, real=True, reads=True,
-                          changed=changed)
+                          changed=changed, mode=mode, split=draw_split)
         e, v = ge._bounds(tx, "live")
         ceiling = ge.real_removal(tx, [native.Graph(masks=tx.vpd)])[0]["n_real_live"]  # VPD's whole answer removed
         cancel = ge.cancellation(tx)
@@ -3482,6 +3482,9 @@ def main():
     f.add_argument("--vpd", type=Path, help="VPD's answers and orders saved by teacher.py --save-vpd")
     f.add_argument("--offset", type=int, default=0)
     f.add_argument("--stride", type=int, default=1)
+    f.add_argument("--mode", choices=("full", "reward"), default="full",
+                   help="GoalEval.fidelity's mode: full, or the reward's (its family alone, rl_terms and c_rl: teacher rows for the reward)")
+    f.add_argument("--draw-split", choices=("search", "eval"), help="the families' draws (default: the mode's, search for reward, eval for full)")
     q = sub.add_parser("patterns", help="the adversary's pattern pool from a range of held-out texts")
     q.add_argument("--first", type=int, required=True, help="first text number, e.g. 9100")
     q.add_argument("--last", type=int, required=True, help="last text number, e.g. 9149")
@@ -3490,7 +3493,7 @@ def main():
     if args.cmd == "fidelity":
         fidelity_report(args.split, args.n, dict(x.split("=", 1) for x in args.set), args.pool, args.out, args.draws, args.vpd,
                         args.offset, args.stride, args.fresh, args.interchange, tuple(int(x) for x in args.curve.split(",")),
-                        changed=args.changed, only=tuple(x for x in args.only.split(",") if x))
+                        changed=args.changed, only=tuple(x for x in args.only.split(",") if x), mode=args.mode, draw_split=args.draw_split)
         if args.only:
             return
         print(fidelity_table([json.loads(x) for x in args.out.read_text().splitlines() if x.strip()]), flush=True)

@@ -50,7 +50,7 @@ flowchart BT
     T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>held-out 0.99 · DONE"]
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
     T3["<b>Pruning, discriminating draws</b><br/>why: fixed-draw pruning overfit<br/>(held-out 0.34 vs 0.88)<br/>ACTIVE · pymove"]
-    T4["<b>Teacher circuits v2</b><br/>444 train + 50 held-out texts<br/>BLOCKED on pruning fix<br/>fleet"]
+    T4["<b>Teacher circuits v2</b><br/>444 train + 50 held-out texts<br/>waits on T3; launches pm7 and v2<br/>when text9002 eval pp ≥ 0.85<br/>BLOCKED · fleet"]
   end
 
   subgraph INPUTS["ORACLE INPUT · codex, rustmove, primerl"]
@@ -69,7 +69,7 @@ flowchart BT
 
   %% ===================== verifier and foundations =====================
   PHI["<b>Faithfulness score Φ</b><br/>10 intervention families,<br/>32 draws per family<br/>DONE · inframove"]
-  TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>size breaks ties (1.05 vs 0.65)<br/>ACTIVE · fleet"]
+  TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>reward v3: size breaks ties (1.05 vs 0.65)<br/>next: VPD fits, cancelling pair<br/>ACTIVE · fleet"]
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
 
   subgraph BASE["FOUNDATIONS"]
@@ -125,6 +125,7 @@ flowchart BT
   PHI --> T3
   PHI --> W1
   TOY -. tests .-> PHI
+  TOY -. tests .-> GATEB
   REM -. tests .-> PHI
   VPD --> ENG
   TXT --> ENG

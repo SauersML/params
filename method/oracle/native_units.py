@@ -546,12 +546,18 @@ def teacher_steps(path: dict) -> list[dict]:
 
 
 def compare(native_rows: Path, teacher_dir: Path, split: str, n: int, sizes=(12, 16, 32, 64, 256, 1024),
-            ge: goal_eval.GoalEval | None = None, log=print) -> list[dict]:
+            ge: goal_eval.GoalEval | None = None, reuse: Path | None = None, log=print) -> list[dict]:
     """Per text and size: the equal-effort native circuit (native_units teach), the teacher's circuit (teacher.py's
     path) and VPD's first k (its order), at the step nearest each size; F1 and N_VPD (goal_eval's sufficiency:
     remainders off, the convention native circuits share, and live, the teacher's) and N_real (removal from the real
     model: goal_eval's real_removal, native_units' N for native units); locality from the teacher's summary (its
-    "local" label, components.locality, else whether its F1 circuit came from the targets alone)."""
+    "local" label, components.locality, else whether its F1 circuit came from the targets alone). reuse: an
+    earlier compare's rows, whose teacher and VPD order rows stand for their texts (native rows need no runs)."""
+    old: dict = {}
+    if reuse is not None and reuse.exists():
+        for x in reuse.read_text().splitlines():
+            if x.strip() and json.loads(x)["kind"] != "native":
+                old.setdefault(json.loads(x)["task"], []).append(json.loads(x))
     ge = ge or goal_eval.GoalEval()
     nat = ge.nat
     nrows = {json.loads(x)["task"]: json.loads(x) for x in native_rows.read_text().splitlines() if x.strip()}
@@ -566,32 +572,44 @@ def compare(native_rows: Path, teacher_dir: Path, split: str, n: int, sizes=(12,
         tp = teacher_dir / f"{p.stem}.path.json"
         if p.stem not in nrows and not tp.exists():
             continue
-        ids, targets = native.text(p)
-        tx = ge.text(ids, targets, native.task_seed(p.stem), json.loads(p.read_text()))
-        order = nat._vpd_order(ids, targets)
-        tsteps = teacher_steps(json.loads(tp.read_text())) if tp.exists() else []
-        graphs, meta = [], []
-        for k in sizes:
-            if k <= len(order):
-                graphs.append(native.Graph(order[:k], complete=True))
-                meta.append(("VPD order", k))
-            t = _nearest(tsteps, k)
-            if t is not None:
-                graphs.append(native.Graph(t["nodes"], complete=True))
-                meta.append(("teacher", k))
-        scored = ge.sufficiency(tx, graphs) if graphs else []
-        real = ge.real_removal(tx, graphs) if graphs else []
-        for (kind, k), g, s, r in zip(meta, graphs, scored, real):
-            out.append({"task": p.stem, "local": local.get(p.stem), "kind": kind, "size": k, "nodes": g.count(),
-                        "f1": s["f1_off"], "n_vpd": s["n_off"], "f1_live": s["f1_live"], "n_vpd_live": s["n_live"],
-                        "n_real": r["n_real_off"]})
+        if p.stem in old:
+            out += [{**r, "local": local.get(p.stem)} for r in old[p.stem]]
+        else:
+            out += _vpd_side(ge, p, tp, local.get(p.stem), sizes)
         if p.stem in nrows:
             for k in sizes:
                 t = _nearest(nrows[p.stem]["path"], k)
                 if t is not None:
                     out.append({"task": p.stem, "local": local.get(p.stem), "kind": "native", "size": k, "nodes": t["size"],
                                 "f1": t["f1"], "n_vpd": None, "n_real": t["n"]})
-        log(f"{p.stem}: {sum(1 for r in out if r['task'] == p.stem)} circuits scored")
+        if log:
+            log(f"{p.stem}: {sum(1 for r in out if r['task'] == p.stem)} circuits scored")
+    return out
+
+
+def _vpd_side(ge: goal_eval.GoalEval, p: Path, tp: Path, local, sizes) -> list[dict]:
+    """compare's teacher and VPD order rows on one text."""
+    nat = ge.nat
+    out = []
+    ids, targets = native.text(p)
+    tx = ge.text(ids, targets, native.task_seed(p.stem), json.loads(p.read_text()))
+    order = nat._vpd_order(ids, targets)
+    tsteps = teacher_steps(json.loads(tp.read_text())) if tp.exists() else []
+    graphs, meta = [], []
+    for k in sizes:
+        if k <= len(order):
+            graphs.append(native.Graph(order[:k], complete=True))
+            meta.append(("VPD order", k))
+        t = _nearest(tsteps, k)
+        if t is not None:
+            graphs.append(native.Graph(t["nodes"], complete=True))
+            meta.append(("teacher", k))
+    scored = ge.sufficiency(tx, graphs) if graphs else []
+    real = ge.real_removal(tx, graphs) if graphs else []
+    for (kind, k), g, s, r in zip(meta, graphs, scored, real):
+        out.append({"task": p.stem, "local": local, "kind": kind, "size": k, "nodes": g.count(),
+                    "f1": s["f1_off"], "n_vpd": s["n_off"], "f1_live": s["f1_live"], "n_vpd_live": s["n_live"],
+                    "n_real": r["n_real_off"]})
     return out
 
 
@@ -663,9 +681,10 @@ def main():
     q.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
     q.add_argument("--n", type=int, default=20)
     q.add_argument("--out", type=Path)
+    q.add_argument("--reuse", type=Path, help="an earlier compare --out: its teacher and VPD order rows are kept")
     args = ap.parse_args()
     if args.cmd == "compare":
-        rows = compare(args.native, args.teacher, args.split, args.n)
+        rows = compare(args.native, args.teacher, args.split, args.n, reuse=args.reuse)
         if args.out:
             args.out.write_text("".join(json.dumps(r) + "\n" for r in rows))
         print(effort_table(args.native, args.teacher), flush=True)

@@ -191,3 +191,31 @@ def test_effort_table(tmp_path):
          "f1_circuit": {"size": 60, "positions": 2, "f1": 0.9}}) + "\n")
     text = native_units.effort_table(tmp_path / "n.jsonl", tmp_path / "t")
     assert "22 at 1 (0.99, targets)" in text and "60 at 2 (0.90)" in text and " 5000 " in text
+
+
+def test_compare_and_reuse(tiny, tmp_path, monkeypatch):
+    """compare on one tiny text: the teacher's path steps and VPD's order at the sizes asked, the native path's
+    nearest steps, and the same rows again from its own output (reuse) with no runs of the VPD side."""
+    nat, ids, targets, nu = tiny
+    task = tmp_path / "tiny0.json"
+    task.write_text("{}")
+    monkeypatch.setattr(native, "tasks", lambda split: [task])
+    monkeypatch.setattr(native, "text", lambda p: (ids, targets))
+    order = nat._vpd_order(ids, targets)[:8]
+    tdir = tmp_path / "teacher"
+    tdir.mkdir()
+    (tdir / "tiny0.path.json").write_text(json.dumps({
+        "start_nodes": [[n, c, t] for n, t, c in order], "start_index": list(range(8)),
+        "steps": [{"size": 8, "removed": []}, {"size": 4, "removed": [4, 5, 6, 7]}, {"size": 2, "removed": [2, 3]}]}))
+    (tdir / "summary_0.jsonl").write_text(json.dumps({"task": "tiny0", "local": True}) + "\n")
+    nfile = tmp_path / "native.jsonl"
+    nfile.write_text(json.dumps({"task": "tiny0", "path": [{"size": 9, "f1": 0.8, "n": 0.6}, {"size": 4, "f1": 0.5, "n": 0.3}]}) + "\n")
+    ge = goal_eval.GoalEval(nat, changes=2)
+    rows = native_units.compare(nfile, tdir, "heldout", 1, sizes=(2, 8), ge=ge, log=None)
+    kinds = {(r["kind"], r["size"]): r for r in rows}
+    assert kinds[("teacher", 2)]["nodes"] == 2 and kinds[("teacher", 8)]["nodes"] == 8 and kinds[("VPD order", 8)]["nodes"] == 8
+    assert kinds[("native", 8)]["f1"] == 0.8 and kinds[("native", 2)]["n_real"] == 0.3 and all(r["local"] for r in rows)
+    out = tmp_path / "rows.jsonl"
+    out.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    monkeypatch.setattr(native_units, "_vpd_side", lambda *a, **k: pytest.fail("reuse ran the VPD side"))
+    assert native_units.compare(nfile, tdir, "heldout", 1, sizes=(2, 8), ge=ge, reuse=out, log=None) == rows

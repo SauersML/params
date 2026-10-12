@@ -25,27 +25,20 @@ the lines backward from "out", grouping readers that share their writers. Token 
 the target's tokens (special tokens included) and escaped (escape()): no question or answer holds a literal special or
 added token of the explainer's tokenizer.
 
-The question (question()) holds the text's tokens, the model's top next tokens, the positions F2 measures (those whose
-changed token moves the prediction by at least 1% of the text's total, goal_eval's SHARE_FLOOR), with the measured
-evidence there (units.evidence: how far the prediction moves, the changed-token and per-layer attention-cut effects),
-VPD's active subcomponents at each of those positions and at the target, ranked by VPD (causal importance x how much
-each writes, Native._vpd_order), the strongest weight-level connections among them (method/vpd/connectome.py; a
-static coupling, not a measured effect), and the intervention questions (qa_questions()).
+The question (question()) holds the text's tokens, the model's top next tokens, the positions whose changed token
+moves the prediction by at least 1% of the text's total (goal_eval's SHARE_FLOOR) with the measured evidence there
+(units.evidence: how far the prediction moves, the changed-token and per-layer attention-cut effects), VPD's active
+subcomponents at each of those positions and at the target, ranked by VPD (Native._vpd_order) with their atlas facts,
+the subcomponents a change of each listed token switches on, the strongest weight-level connections among them
+(method/vpd/connectome.py; a static coupling, not a measured effect), and the intervention questions (qa_questions()).
+The token embedding is an input node, tok@<position>, a writer only.
 
-The reward (reward()) is goal_eval's scorecard combined into one number: invalid answers -1, otherwise the mean of
-the quality terms, each 1 when perfect, minus SIZE_WEIGHT x the size term:
-  F2 completeness: the mean over F2's positions of min(1, carried / CARRIED_GOAL), carried = 1 - KL / movement there
-     (at least 0: a circuit that moves the prediction further than the change does carries none of it), on held-out
-     alternative tokens (goal_eval's ranks; RL draws them per text from 0 to 7).
-  F1 recovered: 1 - F1 (changed prompts, remainders held) / the empty circuit's, clipped to [0, 1].
-  F3: the AUC of stated edges' cuts against unstated pairs' (0.5, chance, when the answer states no edge or no pair
-     is left unstated).
-  E1: the English reader's bits saved per question (reader.Reader), clipped to [-1, 1]; with a reader only.
-  E2: the share of intervention questions answered right (qa_score); when the question asks some.
-  size: the circuit's description length (native.Graph.bits) over that of naming every VPD-active subcomponent at
-     F2's positions and the targets (the answer that lists everything VPD says is on where the changes matter).
-An answer is invalid when a circuit line does not parse, goal_eval drops a node or edge (outside the model or the
-text, or a connection the model does not have), or a question has no FINAL line.
+The reward (reward()) is goal_eval's scorecard in VPD's semantics combined into one number: the mean of the quality
+terms (each at most 1) less SIZE_WEIGHT x size (description bits over the bits of naming every VPD-active
+subcomponent at the listed positions and the targets, at most 1); an invalid answer (no CIRCUIT section, a line that
+does not parse, a missing FINAL line, cut at the sampling cap) earns -(1 + SIZE_WEIGHT), below every valid one.
+Nodes and edges the model does not have are dropped and their bits charged in size. Terms: F1 sufficiency, F3 edges,
+E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); F2 interchange is a diagnostic.
 
   components.py questions SPLIT OUT.jsonl [--n N]              question rows (question, positions, evidence, questions)
   components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
@@ -70,15 +63,15 @@ sys.path.insert(0, str(HERE.parent / "vpd"))
 
 KINDS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj", "fc": "c_fc", "down": "down_proj"}
 CODES = {v: k for k, v in KINDS.items()}
-GROUP_RE = re.compile(r"L(\d+)\.(q|k|v|o|fc|down)#(\d+(?:,\d+)*)@(\d+)")
-_G = r"L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*@\d+"
+GROUP_RE = re.compile(r"(?:L(\d+)\.(q|k|v|o|fc|down)#(\d+(?:,\d+)*)|tok)@(\d+)")
+_G = r"(?:L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)@\d+"
+TOK = "tok"  # the token embedding at a position, an input node: JSON [TOK, 0, position], text tok@<position>
 WRITERS_RE = re.compile(rf"\s*{_G}(?:\s*,\s*{_G})*\s*")
-MARKDOWN = re.compile(r"\*\*|^[ \t]*#+[ \t]*", re.M)
+MARKDOWN = re.compile(r"\*\*|^[ \t]*(?:#+|[-*])[ \t]+", re.M)
 ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response)>)")  # Qwen's added tokens: <|...|>, <think>, <tool_call>, ...
 FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s*(.+?)\s*$", re.M | re.I)
 SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+)\s*:", re.M | re.I)
 
-CARRIED_GOAL = 0.9  # F2: a position whose change the circuit carries this far counts as complete
 SIZE_WEIGHT = 0.5
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
 WIRING_PER_POSITION = 6  # connectome pairs listed per position
@@ -104,8 +97,11 @@ def node_text(nd) -> str:
 
 
 def group_text(nds) -> str:
-    """Subcomponents of one matrix at one position as L<layer>.<kind>#<index>,<index>,...@<position>, indices sorted."""
+    """Subcomponents of one matrix at one position as L<layer>.<kind>#<index>,<index>,...@<position>, indices sorted;
+    the token embedding at a position as tok@<position>."""
     name, t = nds[0][0], nds[0][1]
+    if name == TOK:
+        return f"{TOK}@{t}"
     return f"L{name.split('.')[1]}.{CODES[name.split('.')[-1]]}#{','.join(str(c) for c in sorted({nd[2] for nd in nds}))}@{t}"
 
 
@@ -117,6 +113,8 @@ def group_of(text: str):
     m = GROUP_RE.fullmatch(text.strip())
     if not m:
         return None
+    if m[1] is None:
+        return [(TOK, int(m[4]), 0)]
     name = native.site_name(int(m[1]), KINDS[m[2]])
     return [(name, int(m[4]), int(c)) for c in m[3].split(",")]
 
@@ -190,6 +188,8 @@ def _grouped(nds) -> list[str]:
 def _place(nd) -> tuple:
     """A node's (or a (matrix, position) group's) place in rendered text: latest position, then latest layer, then
     kind (q, k, v, o, fc, down), then index."""
+    if nd[0] == TOK:
+        return (-nd[1], 1, 0) + tuple(nd[2:3])  # the embedding enters the stream first: last in a backward listing
     return (-nd[1], -int(nd[0].split(".")[1]), list(KINDS.values()).index(nd[0].split(".")[-1])) + tuple(nd[2:3])
 
 
@@ -200,7 +200,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
     position. finals: question number -> (falls, the top token as written)."""
     import goal_eval
 
-    nodes = [(goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
+    nodes = [(TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
     parents, out = {}, []
     for w, r in answer["edges"]:
         if r == "out":
@@ -544,13 +544,34 @@ def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None
     return reader.bits(task, [escape(english(x)) for x in texts], units.reader_events(ev["events"]))
 
 
+def dropped_bits(answer: dict, g, positions: int, subcomponents: int) -> tuple[int, int, float]:
+    """(nodes, edges, bits) of what an answer states that is not in its graph (a node outside the model or the text,
+    a connection the model does not have): each priced as native.Graph.bits prices what it keeps (a node one choice
+    among positions x subcomponents, an edge its two ends among the answer's nodes, an edge into the prediction its
+    writer): it was written and explains nothing."""
+    n = max(len(answer.get("nodes", [])), 2)
+    outs = {w for w, r in answer.get("edges", []) if r == "out"}
+    inner = {(w, r) for w, r in answer.get("edges", []) if r != "out"}
+    nodes = len(answer.get("nodes", [])) - len(g.nodes)
+    d_out = max(0, len(outs) - len(g.out))
+    d_inner = max(0, len(inner) - sum(len(ws) for ws in g.parents.values()))
+    return nodes, d_out + d_inner, nodes * math.log2(positions * subcomponents) + (2 * d_inner + d_out) * math.log2(n)
+
+
 def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=None, e1: list | None = None,
-           size_weight: float = SIZE_WEIGHT, carried_goal: float = CARRIED_GOAL, cache: dict | None = None) -> list[dict]:
-    """Per answer text on one task: {"reward", "valid", each quality term, "size", goal_eval's row}. ranks: the
-    alternative-token ranks F2 uses (goal_eval's held-out ranks when None); reader: a reader.Reader for E1, or e1: each
-    text's reader bits computed by the caller (e1_bits(); a Tinker reader lives with the policy); neither: no E1 term;
-    ev: the text's evidence() (its questions, reader events and active count); cache: (task, ranks) -> goal_eval.Text,
-    kept between calls (a group's answers arrive in several calls)."""
+           truncated: list | None = None, size_weight: float = SIZE_WEIGHT, cache: dict | None = None) -> list[dict]:
+    """Per answer text on one task: {"reward", "valid", each quality term, "size", the dropped nodes and edges,
+    goal_eval's row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT
+    section, a circuit line does not parse, a question has no FINAL line, or it was cut at the sampling cap
+    (truncated). Nodes and edges the model does not have are dropped and their description bits charged in size
+    (dropped_bits). A valid answer earns the mean of its terms (each at most 1) less size_weight x size, size its
+    description bits over the scale (VPD's active subcomponents at the listed positions and the targets), at most 1.
+    Terms: F1 (1 - its KL / the empty circuit's, in [0, 1]), F3 (goal_eval's AUC; 0 without a stated edge, 0.5 when
+    no connection among its nodes is left unstated), E1 (the reader's bits saved, in [-1, 1]; with a reader or e1), E2
+    (the share of questions answered right). F2 is reported (goal_eval's row) but not rewarded. ranks: the
+    alternative-token ranks F2's diagnostic uses (goal_eval's held-out ranks when None); reader: a reader.Reader for
+    E1, or e1: each text's reader bits computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev:
+    the text's evidence(); cache: (task, ranks) -> goal_eval.Text, kept between calls."""
     import goal_eval
     import native
 
@@ -558,15 +579,16 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
     prompt = task["prompts"][0]
     ids, targets = prompt["token_ids"], prompt["target_positions"]
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
+    total = sum(nat.C.values())
     parsed = [parse(x) for x in texts]
     graphs, defects, valid = [], [], []
-    for p in parsed:
-        g, d = goal_eval.circuit(p["answer"], targets, nat.C, len(ids))
+    for i, p in enumerate(parsed):
+        g, _ = goal_eval.circuit(p["answer"], targets, nat.C, len(ids))
         graphs.append(g)
-        defects.append(d)
-        valid.append(p["circuit"] and p["malformed"] == 0 and not d["invalid_nodes"] and not d["invalid_edges"]
-                     and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1)))
-    keep = [i for i, v in enumerate(valid) if v]  # an invalid answer's reward is -1 whatever it measures: not run
+        defects.append(dropped_bits(p["answer"], g, nat.positions(targets), total))
+        valid.append(p["circuit"] and p["malformed"] == 0 and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1))
+                     and not (truncated and truncated[i]))
+    keep = [i for i, v in enumerate(valid) if v]  # an invalid answer's reward is fixed whatever it measures: not run
     if keep:
         ge.ranks = tuple(goal_eval.HELD_OUT_RANKS if ranks is None else ranks)
         key = (task["id"], ge.ranks)
@@ -586,23 +608,22 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, ranks=None, reader=Non
     rows = ge.score(tx, [graphs[i] for i in keep] + [native.Graph()], [texts[i] for i in keep] + [""]) if keep else []
     empty = rows[-1] if rows else None
     row_of = dict(zip(keep, rows))
-    scale = ev["active"] * math.log2(nat.positions(targets) * sum(nat.C.values()))
+    scale = ev["active"] * math.log2(nat.positions(targets) * total)
     out = []
-    for i, (p, d) in enumerate(zip(parsed, defects)):
-        row, terms, size, r = row_of.get(i), {}, None, -1.0
+    for i, (p, (d_nodes, d_edges, d_bits)) in enumerate(zip(parsed, defects)):
+        row, terms, size, r = row_of.get(i), {}, None, -(1.0 + size_weight)
         if row is not None:
-            pos = [(m, k) for _, m, k in row["f2_positions"] if m > 0]
-            terms["F2"] = sum(min(1.0, max(0.0, 1 - k / m) / carried_goal) for m, k in pos) / len(pos) if pos else None
             base = empty["f1_changed_held"]
             terms["F1"] = min(1.0, max(0.0, 1 - row["f1_changed_held"] / base)) if base > 0 else None
-            terms["F3"] = row["f3_auc"] if row["f3_auc"] is not None else 0.5
+            terms["F3"] = 0.0 if row["f3_stated"] is None else (row["f3_auc"] if row["f3_auc"] is not None else 0.5)
             terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
             terms["E2"] = row["E2"]
             have = [v for v in terms.values() if v is not None]
-            size = row["bits"] / scale if scale > 0 else 0.0
+            size = min(1.0, (row["bits"] + d_bits) / scale) if scale > 0 else 0.0
             r = sum(have) / len(have) - size_weight * size
         out.append({"reward": r, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
-                    "malformed": p["malformed"], **d, "finals": len(p["finals"]), "row": row})
+                    "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
+                    "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row})
     return out
 
 

@@ -6,8 +6,10 @@ goal_eval.Text is kept for the group's later requests. A text's requests always 
 
   serve_components.py ROWS.jsonl [--port 8767] [--workers 2] [--device cuda] [--size-weight 0.5]
                       [--reader http://127.0.0.1:8000/v1/completions --reader-base Qwen/Qwen3-4B]
-  POST /score {"task": TASK_ID, "answers": [TEXT, ...], "ranks": [r, r, r], "e1": [bits, ...] (optional)}
-      -> {"scores": [{"reward", "valid", "F1", "F2", "F3", "E1", "E2", "size", "bits", "nodes", "edges", "f2_share"}, ...]}
+  POST /score {"task": TASK_ID, "answers": [TEXT, ...], "ranks": [r, r, r], "e1": [bits, ...], "truncated": [bool, ...]}
+      (e1 and truncated optional: whether each answer was cut at the sampling cap, an invalid answer)
+      -> {"scores": [{"reward", "valid", "F1", "F3", "E1", "E2", "size", "bits", "nodes", "edges", "f2_share", "malformed",
+                      "dropped_nodes", "dropped_edges", "finals", "truncated"}, ...]}
   GET /health -> {"workers", "alive", "pending"}
 
 E1, the frozen base model's bits saved: given in the request (computed by the caller, as tinker_train.py's Tinker
@@ -21,17 +23,21 @@ ranks.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import multiprocessing as mp
 import queue
 import sys
+import threading
+import time
+import zlib
 from collections import OrderedDict
+from concurrent.futures import Future
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-sys.path.insert(0, str(HERE))
-
-from serve_units import Inline, Pool, serve  # noqa: E402
 
 TEXTS_KEPT = 8  # goal_eval.Text objects a process keeps (a group's answers arrive in several requests)
 
@@ -55,27 +61,145 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
         groups = {}
         for rid, req in batch:
             ranks = tuple(req.get("ranks") or goal_eval.HELD_OUT_RANKS)
-            groups.setdefault((req["task"], ranks), []).append((rid, req["answers"], req.get("e1")))
+            groups.setdefault((req["task"], ranks), []).append((rid, req["answers"], req.get("e1"),
+                                                                 req.get("truncated") or [False] * len(req["answers"])))
         for (tid, ranks), reqs in groups.items():
             try:
                 if tid not in tasks:
                     tasks[tid] = json.loads((native.TEXTS / "vpd4l" / f"{tid}.json").read_text())
-                given = None if any(e is None for _, _, e in reqs) else [b for _, _, e in reqs for b in e]
-                got = components.reward(ge, tasks[tid], rows[tid], [x for _, xs, _ in reqs for x in xs], ranks=ranks,
-                                        size_weight=size_weight, cache=cache, reader=None if given else reader, e1=given)
+                given = None if any(e is None for _, _, e, _ in reqs) else [b for _, _, e, _ in reqs for b in e]
+                got = components.reward(ge, tasks[tid], rows[tid], [x for _, xs, _, _ in reqs for x in xs], ranks=ranks,
+                                        size_weight=size_weight, cache=cache, reader=None if given else reader, e1=given,
+                                        truncated=[c for _, _, _, cut in reqs for c in cut])
                 while len(cache) > TEXTS_KEPT:
                     cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **{k[5:]: g[k] for k in g if k.startswith("term_")},
                         "size": g["size"], **{k: (g["row"] or {}).get(k) for k in ("bits", "nodes", "edges", "f2_share")},
-                        "malformed": g["malformed"], "invalid_nodes": g["invalid_nodes"],
-                        "invalid_edges": g["invalid_edges"], "finals": g["finals"]} for g in got]
+                        **{k: g[k] for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")}} for g in got]
                 err = None
             except Exception as e:  # a bad request answers with its error; the process keeps serving
                 got, err = None, f"{type(e).__name__}: {e}"
             at = 0
-            for rid, xs, _ in reqs:
+            for rid, xs, _, _ in reqs:
                 outbox.put((rid, got[at:at + len(xs)] if got is not None else None, err))
                 at += len(xs)
+
+
+class Pool:
+    """The scoring processes and the futures of the requests in flight; a process that dies is started again and its
+    requests in flight fail with an error instead of waiting forever."""
+
+    def __init__(self, workers: int, args: tuple, target):
+        self.ctx, self.args, self.target = mp.get_context("spawn"), args, target  # spawn: CUDA in each process
+        self.out = self.ctx.Queue()
+        self.inboxes = [self.ctx.Queue() for _ in range(workers)]
+        self.procs = [self.start(q) for q in self.inboxes]
+        self.ids, self.waiting, self.owner, self.lock = itertools.count(), {}, {}, threading.Lock()
+        threading.Thread(target=self.collect, daemon=True).start()
+        threading.Thread(target=self.watch, daemon=True).start()
+
+    def start(self, inbox):
+        p = self.ctx.Process(target=self.target, args=(*self.args, inbox, self.out), daemon=True)
+        p.start()
+        return p
+
+    def collect(self) -> None:
+        while True:
+            rid, scores, err = self.out.get()
+            with self.lock:
+                fut = self.waiting.pop(rid, None)
+                self.owner.pop(rid, None)
+            if fut is None:
+                continue
+            if err:
+                fut.set_exception(RuntimeError(err))
+            else:
+                fut.set_result(scores)
+
+    def watch(self) -> None:
+        while True:
+            time.sleep(5)
+            for i, p in enumerate(self.procs):
+                if p.is_alive():
+                    continue
+                with self.lock:
+                    lost = [rid for rid, w in self.owner.items() if w == i]
+                    futs = [self.waiting.pop(rid) for rid in lost if rid in self.waiting]
+                    for rid in lost:
+                        self.owner.pop(rid, None)
+                for fut in futs:
+                    fut.set_exception(RuntimeError(f"scoring process {i} died (exit code {p.exitcode})"))
+                print(f"scoring process {i} died (exit code {p.exitcode}); starting it again", flush=True)
+                self.procs[i] = self.start(self.inboxes[i])
+
+    def submit(self, req: dict) -> Future:
+        fut, rid = Future(), next(self.ids)
+        i = zlib.crc32(req["task"].encode()) % len(self.inboxes)
+        with self.lock:
+            self.waiting[rid], self.owner[rid] = fut, i
+        self.inboxes[i].put((rid, req))
+        return fut
+
+
+class Inline:
+    """Pool's interface over one scoring thread in this process (--workers 0): for a machine whose spawned processes
+    cannot hold the model (the Mac's memory ledger caps a spawned child at 2 GiB)."""
+
+    def __init__(self, args: tuple, target):
+        self.inbox, self.out = queue.Queue(), queue.Queue()
+        self.ids, self.waiting, self.lock = itertools.count(), {}, threading.Lock()
+        self.procs = [threading.Thread(target=target, args=(*args, self.inbox, self.out), daemon=True)]
+        self.procs[0].start()
+        threading.Thread(target=self.collect, daemon=True).start()
+
+    def collect(self) -> None:
+        while True:
+            rid, scores, err = self.out.get()
+            with self.lock:
+                fut = self.waiting.pop(rid, None)
+            if fut is not None:
+                fut.set_exception(RuntimeError(err)) if err else fut.set_result(scores)
+
+    def submit(self, req: dict) -> Future:
+        fut, rid = Future(), next(self.ids)
+        with self.lock:
+            self.waiting[rid] = fut
+        self.inbox.put((rid, req))
+        return fut
+
+
+def serve(pool: Pool, host: str, port: int, name: str) -> None:
+    """POST /score and GET /health over a Pool, until killed."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, code: int, body: dict) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path == "/health":
+                self.reply(200, {"workers": len(pool.procs), "alive": sum(p.is_alive() for p in pool.procs), "pending": len(pool.waiting)})
+            else:
+                self.reply(404, {"error": "GET /health only"})
+
+        def do_POST(self):
+            if self.path != "/score":
+                return self.reply(404, {"error": "POST /score only"})
+            try:
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self.reply(200, {"scores": pool.submit(req).result()})
+            except Exception as e:
+                self.reply(400, {"error": f"{type(e).__name__}: {e}"})
+
+        def log_message(self, *args):
+            pass
+
+    print(f"{name}: {len(pool.procs)} scoring processes, http://{host}:{port}", flush=True)
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 
 def main():

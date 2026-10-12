@@ -112,16 +112,36 @@ def tiny():
 def test_reward_on_tiny_model(tiny):
     nat, ge, task, ev = tiny
     assert ev["positions"] and ev["active"] > 0
+    invalid = -(1 + components.SIZE_WEIGHT)
     order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
     at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:3]
-    g = native.Graph(at_t, {}, at_t)
+    fc = next(nd for nd in order if nd[1] == 7 and nd[0] == "h.1.mlp.c_fc")
+    down = (native.site_name(1, "down_proj"), 7, 0)
+    g = native.Graph(set(at_t) | {fc, down}, {down: [fc]}, at_t + [down])
     finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
     good = components.render(goal_eval.to_json(g, "writes at the target"), finals)
-    bad = good.replace("out <- ", "out <- L0.v#0@7, ")  # a value never writes the residual stream
+    bad = good.replace("out <- ", "out <- L0.v#0@7, ")  # a value never writes the residual stream: dropped, charged
     missing = components.render(goal_eval.to_json(g, "writes at the target"))
-    got = components.reward(ge, task, ev, [good, bad, missing], ranks=(0, 1))
-    assert got[0]["valid"] and -1.0 < got[0]["reward"] <= 1.0
-    assert all(0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("F1", "F2", "F3"))
+    got = components.reward(ge, task, ev, [good, bad, missing, good], ranks=(0, 1), truncated=[False, False, False, True])
+    assert got[0]["valid"] and invalid < got[0]["reward"] <= 1.0
+    assert all(0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("F1", "F3"))
     assert got[0]["term_E2"] == (0.5 if ev["qa"] else None)  # every "falls" right, no top token "x"
-    assert not got[1]["valid"] and got[1]["reward"] == -1.0
-    assert (not got[2]["valid"]) == bool(ev["qa"])
+    assert got[1]["valid"] and got[1]["dropped_edges"] == 1 and got[1]["size"] > got[0]["size"]
+    assert (not got[2]["valid"]) == bool(ev["qa"]) and not got[3]["valid"] and got[3]["reward"] == invalid
+
+
+def test_invalid_below_every_valid_answer(tiny):
+    """However large a valid answer and however badly it does, it earns more than an invalid one."""
+    nat, ge, task, ev = tiny
+    T = len(task["prompts"][0]["token_ids"])
+    every = native.Graph({(n, t, c) for n in nat.names for t in range(T) for c in range(nat.C[n])})
+    par, out = native.all_edges(every.node_set(), [7])
+    huge = native.Graph(every.node_set(), par, out)
+    wrong = {n: (not q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
+    junk = "\n".join(f"L3.v#{c}@{t} <- L0.q#{c}@{t}" for t in range(T) for c in range(5))  # no such connection: all dropped
+    texts = [components.render(goal_eval.to_json(huge, ""), wrong),
+             components.render({"nodes": [], "edges": []}, wrong).replace("CIRCUIT:", "CIRCUIT:\n" + junk)]
+    got = components.reward(ge, task, ev, texts, ranks=(0, 1))
+    assert all(r["valid"] for r in got)
+    assert got[0]["size"] == 1.0 and got[1]["dropped_edges"] == 5 * T
+    assert min(r["reward"] for r in got) > -(1 + components.SIZE_WEIGHT)

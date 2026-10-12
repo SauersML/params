@@ -4,8 +4,9 @@
 # tested on MATS, serve_scores.py (two scoring processes) and prime-rl's vLLM and trainer all on the one GPU (the GPU
 # listed twice, filesystem weight broadcast). Run from the source's method/oracle with the oracle environment's
 # python first on PATH:
-#   rl/prime/pod_rl.sh ADAPTER QUESTIONS OUT NAME [rl args]    (env: REVISE=1 for the two-turn episode; UNITS=1 for the
-#   unit-circuit explainer: the adapter merged into Qwen3-4B by units_sft.py merge, serve_units.py, units_rl.toml)
+#   rl/prime/pod_rl.sh ADAPTER QUESTIONS OUT NAME [rl args]    (env: REVISE=1 for the two-turn episode; COMPONENTS=1 for
+#   the component explainer: the adapter merged into Qwen3-4B by units_sft.py merge, serve_components.py over the
+#   questions' rows, components_rl.toml)
 # QUESTIONS: the directory holding questions.py's train.jsonl and heldout.jsonl. OUT gets the logs, metrics, trace
 # stream and configs and the newest complete adapter (OUT/adapter, its step in OUT/adapter/STEP), copied every minute,
 # so a run stopped early still leaves its latest adapter; gpu.csv and serve_scores.log; checkpoints stay on the pod.
@@ -18,7 +19,7 @@ PY=$(command -v python)
 mkdir -p $E $O
 log() { echo "$(date +%T) $*"; }
 
-if [ -n "${UNITS:-}" ]; then
+if [ -n "${COMPONENTS:-}" ]; then
   log "merge"
   $PY rl/units_sft.py merge $ADAPTER $E/model > $O/export.log 2>&1 &
 else
@@ -50,9 +51,10 @@ log "exported: $(tail -n 1 $O/export.log)"
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 5 > $O/gpu.csv &
 SMI=$!
 # serve_scores in its own process group, so its scoring processes end with it.
-if [ -n "${UNITS:-}" ]; then
-  PORT=8766 TOML=$G/rl/prime/units_rl.toml
-  setsid $PY rl/serve_units.py --port $PORT --workers 2 > $O/serve_units.log 2>&1 &
+if [ -n "${COMPONENTS:-}" ]; then
+  PORT=8767 TOML=$G/rl/prime/components_rl.toml
+  cat $Q/train.jsonl $Q/heldout.jsonl > $E/rows.jsonl
+  setsid $PY rl/serve_components.py $E/rows.jsonl --port $PORT --workers 2 > $O/serve_components.log 2>&1 &
 else
   PORT=8765 TOML=$G/rl/prime/rl.toml
   setsid $PY rl/serve_scores.py --port $PORT --workers 2 --texts ~/mpd-data/graph_oracle/texts/vpd4l > $O/serve_scores.log 2>&1 &

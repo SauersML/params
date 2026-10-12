@@ -185,7 +185,7 @@ def rl(a) -> None:
             spend.add("sample", prefill=n - hits, cached=hits + (a.group - 1) * n, sampled=sampled)
             texts = [renderers.get_text_content(renderer.parse_response(s.tokens)[0]) for s in res.sequences]
             t1 = time.time()
-            req = {"task": q["task"], "answers": texts, "ranks": ranks}
+            req = {"task": q["task"], "answers": texts, "ranks": ranks, "truncated": [str(s.stop_reason) == "length" for s in res.sequences]}
             if frozen is not None:
                 if q["task"] not in tasks:
                     tasks[q["task"]] = json.loads((a.texts_dir / f"{q['task']}.json").read_text())
@@ -196,10 +196,10 @@ def rl(a) -> None:
             rewards = [s["reward"] for s in scores]
             mean = sum(rewards) / len(rewards)
             groups.append({"task": q["task"], "ranks": ranks, "rewards": rewards, "valid": [s["valid"] for s in scores],
-                           "defects": [{k: s.get(k) for k in ("malformed", "invalid_nodes", "invalid_edges", "finals")} for s in scores],
+                           "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")} for s in scores],
                            "texts": texts, "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
-                           "terms": {k: [s.get(k) for s in scores] for k in ("F1", "F2", "F3", "E1", "E2", "N", "size")}})
+                           "terms": {k: [s.get(k) for s in scores] for k in ("F1", "F3", "E1", "E2", "N", "size", "f2_share")}})
             for s, rew in zip(res.sequences, rewards):
                 if rew == mean:
                     continue

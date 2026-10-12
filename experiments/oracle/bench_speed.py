@@ -14,6 +14,11 @@ teacher  teacher.Pruner's masked runs from VPD's answer: sets per second for pos
          the complements (teacher_live: remainders on); needs the causal-importance network
 reward   components.reward per text for 8 nested subsets of VPD's ordered answer with stated connections: first and
          repeat call seconds (fix PYTHONHASHSEED for comparable answers across processes)
+engine   engine.Engine at B = 32 over VPD's answer's columns: masked-run forward+backward ms (score, bf16), and a C-semantics
+         graph run's (VPD's first 64 with every connection among them stated half); needs VPD's answer (the
+         causal-importance network, or --vpd, teacher.py --save-vpd's file)
+fidelity goal_eval.GoalEval.fidelity (C) per text on 8 circuits, VPD's first 8, 16, 32 and 64 as complete graphs and with
+         every connection among them stated: seconds per family; needs VPD's answer and --pool (goal_eval.py patterns)
 Texts are the split's first n, fixed; every timing is after one untimed warm-up on the same inputs (MPS compiles a
 graph per shape) and ends with a device synchronize. Each result carries a fingerprint of what it computed (sums of
 measured KLs and scores): a speed change that alters the numbers shows there. GPU utilization is the system's, sampled
@@ -256,6 +261,114 @@ def bench_reward(nat, texts, answers=8):
     return rows
 
 
+def vpd_answer(nat, path, saved):
+    """(VPD's answer {site: bool [T, C]} at the positions reaching the targets, its order) on a text: the
+    causal-importance network's, or a teacher.py --save-vpd file's; None without either."""
+    import torch
+
+    import goal_eval
+    import native
+
+    ids, targets = native.text(path)
+    if saved is None:
+        if not nat.has_importance:
+            return None
+        return goal_eval.GoalEval(nat).vpd_answer(ids, targets), nat._vpd_order(ids, targets)
+    s = saved[path.stem]
+    ans = {n: torch.zeros(len(ids), nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+    for n, (t, c) in s["answer"].items():
+        ans[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
+    return ans, s["order"]
+
+
+def bench_engine(nat, texts, saved, B=32):
+    """engine.Engine on VPD's answer's columns: masked runs' forward+backward at B rows (masks VPD's answer with random
+    subsets off) in float32 and bf16, and a C-semantics graph run of VPD's first 64 stating half their connections."""
+    import torch
+
+    import carry
+    import engine
+    import native
+
+    rows = []
+    for path in texts:
+        got = vpd_answer(nat, path, saved)
+        if got is None:
+            return [{"skipped": "no VPD answer (no causal-importance network and no --vpd)"}]
+        ans, order = got
+        ids, targets = native.text(path)
+        T = len(ids)
+        cols = {n: ans[n].any(0).nonzero().flatten() for n in nat.names}
+        eng = engine.Engine(nat, ids, targets, live=True, columns=cols)
+        g = torch.Generator().manual_seed(0)
+        keep = torch.linspace(1.0, 0.3, B)[:, None, None]
+        masks = {n: (ans[n][:, cols[n]].float().cpu() * (torch.rand(B, T, len(cols[n]), generator=g) < keep)).to(nat.dev).requires_grad_(True)
+                 for n in nat.names}
+        nodes = list(order[:64])
+        par, out = native.all_edges(nodes, targets)
+        graph = native.Graph(nodes, {r: ws[::2] for r, ws in par.items()}, out[::2])
+        plan = eng.plan(graph, semantics="c")
+        u = {n: m.detach().clone().requires_grad_(True) for n, m in masks.items()}
+        sync = lambda: carry.synchronize(nat.dev)  # noqa: E731
+        row = {"task": path.stem, "T": T, "B": B, "columns": sum(len(c) for c in cols.values()), "connections": graph.edges()}
+        fingerprint = 0.0
+        for name, fn in [("kl_score", lambda: eng.kl(masks)), ("kl_bf16", lambda: eng.kl(masks, "bf16")),
+                         ("graph_score", lambda: eng.graph_kl(plan, u)), ("graph_bf16", lambda: eng.graph_kl(plan, u, precision="bf16"))]:
+            def step(fn=fn):
+                k = fn()
+                k.sum().backward()
+                return k.detach().tolist()
+            seconds, outv = timed(step, sync)
+            row[f"{name}_ms"] = 1000 * seconds
+            fingerprint += sum(outv) if name.endswith("score") else 0.0
+        row["fingerprint"] = fingerprint
+        rows.append(row)
+    return rows
+
+
+def bench_fidelity(nat, texts, saved, pool):
+    """GoalEval.fidelity's families per text on 8 circuits: VPD's first 8, 16, 32 and 64, complete and with every
+    connection among them stated."""
+    import json
+
+    import torch
+
+    import carry
+    import goal_eval
+    import native
+
+    if pool is None:
+        return [{"skipped": "no --pool"}]
+    M = torch.load(pool)
+    ge = goal_eval.GoalEval(nat)
+    rows = []
+    for path in texts:
+        got = vpd_answer(nat, path, saved)
+        if got is None:
+            return [{"skipped": "no VPD answer (no causal-importance network and no --vpd)"}]
+        ids, targets = native.text(path)
+        tx = ge.text(ids, targets, native.task_seed(path.stem), json.loads(path.read_text()))
+        tx.vpd, order = got
+        graphs = [native.Graph(order[:k], complete=True) for k in (8, 16, 32, 64)]
+        graphs += [native.Graph(order[:k], *native.all_edges(order[:k], targets)) for k in (8, 16, 32, 64)]
+        ge._bounds(tx, "live")
+        sync = lambda: carry.synchronize(nat.dev)  # noqa: E731
+        row = {"task": path.stem, "T": len(ids), "circuits": len(graphs)}
+        fingerprint = 0.0
+        for name, fn in [("point", lambda: ge.sufficiency(tx, graphs)), ("nodes", lambda: ge._node_family(tx, graphs, goal_eval.DRAWS)),
+                         ("edges", lambda: ge._edge_family(tx, graphs, goal_eval.DRAWS)), ("adversary", lambda: ge.adversary(tx, graphs, M)),
+                         ("flips", lambda: ge.adversary_flips(tx, graphs, M, "omitted"))]:
+            sync()
+            t0 = time.perf_counter()
+            out = fn()
+            sync()
+            row[f"{name}_s"] = time.perf_counter() - t0
+            fingerprint += sum(float(v) for r in out for v in r.values() if isinstance(v, float))
+        row["fingerprint"] = fingerprint
+        rows.append(row)
+    return rows
+
+
 def profile_carry(nat, path, granularity, batch=64):
     """The top operators of one measure() call by device time (torch.profiler), and the Python share."""
     import torch
@@ -291,6 +404,9 @@ def main():
     ap.add_argument("--benches", default="carry,score,events")
     ap.add_argument("--granularity", default="matrix,subcomponent", help="carry's unit granularities")
     ap.add_argument("--profile", choices=("carry",))
+    ap.add_argument("--vpd", type=Path, help="VPD's answers and orders (teacher.py --save-vpd), for engine and fidelity "
+                                              "without the causal-importance network")
+    ap.add_argument("--pool", type=Path, help="the adversary's pattern pool (goal_eval.py patterns), for fidelity")
     ap.add_argument("--label", default="", help="a name for this run in the output (e.g. before, after)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
@@ -329,6 +445,9 @@ def main():
             results[b] = bench_teacher(nat, texts, live=b == "teacher_live")
         elif b == "reward":
             results["reward"] = bench_reward(nat, texts)
+        elif b in ("engine", "fidelity"):
+            saved = torch.load(a.vpd) if a.vpd else None
+            results[b] = bench_engine(nat, texts, saved) if b == "engine" else bench_fidelity(nat, texts, saved, a.pool)
         print(b, json.dumps(results.get(b) or {k: v for k, v in results.items() if k.startswith(b)}), flush=True)
     head["torch"] = torch.__version__
     row = {**head, "device": dev, **results}

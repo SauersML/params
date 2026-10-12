@@ -5,9 +5,9 @@ tinker_train.py rl run directories, as PNGs:
   PREFIX_terms.png   each reward term's mean per set (what moved)
   PREFIX_rl.png      RL: reward and valid share of the training groups and of held-out checkpoints, against step and
                      against Tinker dollars (with --rl)
-The reward drawn is the evaluation's, with E1 taken from reader B where a readers file is given (its first answer)
-and an answer without English counted at 0 bits (as the empty explanation is); an invalid answer is at its fixed
-reward.
+The reward drawn is the evaluation's (E1 reported beside it, never in it: components.REPORTED), E1 taken from reader B
+(the independent reader) where a readers file is given (its first answer) and an answer without English counted at 0
+bits; an invalid answer is at its fixed reward.
 
   figures_eval.py --set "NAME=EVAL.json:SET[:E1.jsonl]" ... [--ref "NAME=EVAL.json:SET" ...] --labels LABELS.jsonl
                   [--rl "NAME=RUN_DIR" ...] [--out DIR] [--prefix PREFIX]
@@ -34,9 +34,9 @@ COLORS = ["#2F6DB5", "#D1495B", "#2E8B57", "#E09F3E", "#7B5EA7", "#2A9D8F", "#8C
 SOFT = "#9DB9DD"
 INK = "#222222"
 TERMS = [("C", "Agreement under interventions"), ("F1", "Sufficiency (part of the agreement)"), ("N", "Necessity"),
-         ("E1", "English: bits saved for reader B"), ("E2", "Intervention questions"), ("E3", "Edits"),
+         ("E1", "English: bits saved for the independent reader (reported)"), ("E2", "Intervention questions"), ("E3", "Edits"),
          ("size", "Answer size"), ("invalid", "Invalid answers")]
-REPORTED = ("F1", "F3")  # in the rows, never in the reward's mean (components.reward: F1 inside C, F3 a diagnostic)
+REPORTED = ("F1", "F3", "E1")  # in the rows, never in the reward's mean (components.REPORTED)
 
 
 def style():

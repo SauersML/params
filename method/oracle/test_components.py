@@ -179,25 +179,45 @@ def test_structural_changes_keep_the_tokens():
 
 
 class FakeReader:
-    """reader.Reader's bits: the bits each English 'saves' are its length in words, the neutral sentence's included."""
+    """reader.Reader's losses: unaided, the reader knows the events at the positions the circuit lists (0 bits) and
+    not the others (1 bit); with English it loses 1.2 bits on the neutral sentence, 0.2 where the English names the
+    event's position and 1.5 elsewhere."""
 
     def __init__(self):
-        self.asked = None
+        self.asked = []
 
-    def bits(self, task, texts, events):
-        self.asked = events
-        return [float(len(t.split())) if t else 0.0 for t in texts]
+    def losses(self, task, items, events):
+        per = events if events and isinstance(events[0], list) else [events] * len(items)
+        self.asked += [(c, eng, evs) for (c, eng), evs in zip(items, per)]
+
+        def loss(c, eng, e):
+            if not eng:
+                return 0.0 if f"@{e['position']} " in c else 1.0
+            return 1.2 if eng == components.NEUTRAL else (0.2 if f"position {e['position']}" in eng else 1.5)
+        return [[loss(c, eng, e) for e in evs] for (c, eng), evs in zip(items, per)]
 
 
-def test_e1_is_measured_from_the_neutral_explanation_on_the_heaviest_events():
+def test_e1_is_what_the_english_adds_to_the_circuit_against_the_neutral_explanation():
+    """The reader reads the circuit; events are weighted by measured effect x the unaided reader's loss (an event the
+    circuit already tells weighs nothing); E1 is the weighted bits the English saves against NEUTRAL; the unaided and
+    neutral prompts are asked once per circuit; no English is 0."""
     ev = {"events": [{"position": p, "new": 1, "alt": 0, "listed": False, "down": True, "weight": w, "bits": -w}
                      for p, w in enumerate([0.1, 3.0, 0.5] + [0.01] * 20)],
-          "structure": [{"kind": "swap", "position": 1, "with": 2, "change": "x", "down": True, "weight": 2.0, "bits": -2.0}]}
+          "structure": [{"kind": "swap", "position": 5, "with": 6, "change": "x", "down": True, "weight": 2.0, "bits": -2.0}]}
     r = FakeReader()
-    got = components.e1_bits(r, {}, ev, ["CIRCUIT:\nEXPLANATION: one two three four five six seven eight nine", "CIRCUIT:\n"])
-    neutral = len(components.NEUTRAL.split())
-    assert got == [9.0 - neutral, 0.0]  # beyond the neutral sentence; no English stays 0
-    assert len(r.asked) == components.E1_EVENTS and r.asked[0]["weight"] == 3.0 and r.asked[1]["weight"] == 2.0  # the heaviest
+    texts = ["CIRCUIT:\n@1 a=tok\nOUT <- a\nEXPLANATION: position 2 matters",
+             "CIRCUIT:\n@1 a=tok\nOUT <- a\nEXPLANATION: position 9 matters", "CIRCUIT:\n@1 a=tok\nOUT <- a\n"]
+    got = components.e1_bits(r, {}, ev, texts)
+    unaided = [x for x in r.asked if not x[1]]
+    neutral = [x for x in r.asked if x[1] == components.NEUTRAL]
+    assert len(unaided) == 1 and len(neutral) == 1 and unaided[0][0] == "@1 a=tok\nOUT <- a"
+    asked = neutral[0][2]
+    assert len(asked) == components.E1_EVENTS and asked[0]["weight"] == 2.0 and asked[1]["position"] == 2
+    assert all(e["position"] != 1 for e in asked)  # the heaviest event, but the circuit tells it: weight 0
+    w = [e["weight"] for e in asked]  # unaided loss 1 on every asked event
+    want = lambda p: sum(x * (1.2 - (0.2 if e["position"] == p else 1.5)) for x, e in zip(w, asked)) / sum(w)  # noqa: E731
+    assert got[0] == pytest.approx(want(2)) and got[1] == pytest.approx(want(9)) and got[2] == 0.0
+    assert got[0] > got[1]  # the English names the heavier event
 
 
 class FakeEdits:
@@ -272,7 +292,7 @@ def test_reward_on_tiny_model(tiny):
     edited = good + "\nEDIT 1: scale " + good.split("@7 ", 1)[1].split("=", 1)[0] + " 0"
     with_e3 = components.reward(ge, task, asked, [edited, good], ee=FakeEdits(), edit_best=best, pool={})
     assert with_e3[0]["term_E3"] == 0.5 and not with_e3[1]["valid"]  # 2 bits of the teacher's 4; no EDIT line: invalid
-    terms = [with_e3[0][f"term_{k}"] for k in ("C", "N", "E1", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]  # F1, F3: reported
+    terms = [with_e3[0][f"term_{k}"] for k in ("C", "N", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]  # F1, F3, E1: reported
     assert with_e3[0]["reward"] == pytest.approx(sum(terms) / len(terms) - components.SIZE_WEIGHT * with_e3[0]["size"])
 
 

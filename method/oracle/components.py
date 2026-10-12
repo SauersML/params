@@ -104,6 +104,8 @@ EDIT_RE = re.compile(r"^\s*EDIT\s+(\d+)\s*:(.*)$", re.M | re.I)
 OP_RE = re.compile(r"\s*(persistent\s+)?(?:cut\s+(\S+)\s*<-\s*(\S+)|scale\s+(\S+)\s+(-?\d+(?:\.\d+)?))\s*", re.I)
 
 SIZE_WEIGHT = 0.5
+REPORTED = ("F1", "F3", "E1")  # terms reported, never in the reward's mean: F1 is inside C, F3 a diagnostic, E1 until a
+# reader separates right English from wrong (the lead, 10-12: RL v1 is mean(C, N, E2[, E3]) - 0.5 size)
 POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # C's flip adversary's pattern pool (goal_eval.fidelity)
 CONVENTION = "live"  # goal_eval's remainders convention for the reward's F1 and N: on, computing on the run's inputs
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
@@ -113,7 +115,8 @@ WINDOW = 8  # a question numbers the tokens within this many positions of every 
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
 QA_PER_KIND = 2
 QA_RANKS = 8  # token-change questions draw the new token from the model's alternatives at ranks 0 to 7
-E1_EVENTS = 12  # the reader events E1 asks per text: the heaviest by measured effect (the strong reader's cost)
+E1_EVENTS = 12  # the reader events E1 asks per text and circuit (e1_bits; the strong reader's cost)
+E1_CANDIDATES = 36  # the events the unaided reader is asked first: the heaviest by measured effect
 NEUTRAL = "The model predicts its next token from the text."  # E1's baseline: an explanation that says nothing
 ANSWER_BUDGET = 3_500  # tokens of a supervised answer: 4,096 sampled at most, ~600 left for English and reasoning
 MAX_PAIRS = 1_024  # connections with_edges measures at most
@@ -946,10 +949,15 @@ def english(text: str) -> str:
     return _sections(text).get("EXPLANATION", "")
 
 
-def e1_events(ev: dict, k: int = E1_EVENTS) -> list[dict]:
-    """The reader events E1 asks: the text's units.reader_events (other positions and the listed positions' second
-    tokens, never the oracle's evidence) and its structural events (structure_events()), the k with the largest
-    measured effect (weight)."""
+def circuit_text(text: str) -> str:
+    """An answer's CIRCUIT lines as written (markdown decoration dropped), what the E1 reader reads with its English."""
+    return _sections(MARKDOWN.sub("", text)).get("CIRCUIT", "")
+
+
+def e1_candidates(ev: dict, k: int = E1_CANDIDATES) -> list[dict]:
+    """The events E1 may ask: the text's units.reader_events (other positions and the listed positions' second tokens,
+    never the oracle's evidence) and its structural events (structure_events()), the k with the largest measured
+    effect (weight)."""
     import units
 
     evs = units.reader_events(ev["events"]) + ev.get("structure", [])
@@ -957,17 +965,37 @@ def e1_events(ev: dict, k: int = E1_EVENTS) -> list[dict]:
 
 
 def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None]:
-    """Each answer's E1: the bits its escaped English saves the frozen reader on the text's E1 events (e1_events())
-    beyond what NEUTRAL, an explanation that says nothing, saves the same reader there. A strong reader's unaided
-    guesses are good and any confident English costs it bits on events the English does not cover (reader validation,
-    10-12: the correct, wrong and shuffled explanations of 16 texts at -0.78, -1.92 and -3.63 bits on Qwen3.5-397B,
-    ordered right on 15 of 16): the baseline takes that offset out, so E1 measures what this English says beyond saying
-    something. An answer without English is 0 against no English, as before (none: the baseline is not subtracted)."""
-    evs = e1_events(ev)
-    eng = [escape(english(x)) for x in texts]
-    got = reader.bits(task, eng + [NEUTRAL], evs)
-    base = got[-1]
-    return [None if b is None else (b - base if e and base is not None else (0.0 if not e else b)) for b, e in zip(got[:-1], eng)]
+    """Each answer's E1: what its English adds to its circuit for a strong reader (the lead's design, 10-12). The
+    reader reads the text, the answer's CIRCUIT lines (circuit_text()) and the English, and gives its probability of
+    what the model does on each event (reader.Reader.losses). The events: of the text's candidates (e1_candidates()),
+    the E1_EVENTS heaviest by w = measured effect x the reader's loss given the text and the circuit alone, so an event
+    the reader already gets right from the circuit, or one the model barely moves on (its direction noise), weighs
+    little. E1 = sum w (loss with NEUTRAL - loss with the English) / sum w, in bits: English that says nothing scores
+    0, English that tells the reader what the model does above 0, misleading English below (a strong reader loses bits
+    on any confident English that the events do not bear out: reader validation 10-12, where every English scored
+    below none). The unaided and neutral prompts are asked once per text and circuit (the reader's memo). An answer
+    without English is 0; None without events."""
+    cands = e1_candidates(ev)
+    items = [(circuit_text(x), escape(english(x))) for x in texts]
+    if not cands:
+        return [None] * len(texts)
+    circs = list(dict.fromkeys(c for c, e in items if e.strip()))
+    sel = {}
+    for c, un in zip(circs, reader.losses(task, [(c, "") for c in circs], cands)):
+        w = [e.get("weight", 1.0) * u for e, u in zip(cands, un)]
+        top = sorted(range(len(cands)), key=lambda i: -w[i])[:E1_EVENTS]
+        sel[c] = ([w[i] for i in top], [cands[i] for i in top])
+    asked = [(c, NEUTRAL) for c in circs] + [it for it in items if it[1].strip()]
+    got = iter(reader.losses(task, asked, [sel[c][1] for c, _ in asked]))
+    neutral = {c: next(got) for c in circs}
+    out = []
+    for c, e in items:
+        if not e.strip():
+            out.append(0.0)
+            continue
+        w, mine = sel[c][0], next(got)
+        out.append(sum(a * (n - m) for a, n, m in zip(w, neutral[c], mine)) / sum(w) if sum(w) > 0 else 0.0)
+    return out
 
 
 def size_term(bits: float, scale: float) -> float:
@@ -1058,8 +1086,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     KL_C) / ln(KL_empty / KL_VPD) in [0, 1], between the empty circuit and VPD's own answer, KL_C the run of the graph the
     answer states: a node reaches a reader or the prediction only through a stated edge); N, goal_eval's n (what
     VPD's own answer loses without the circuit, ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD) in [0, 1]); E1, the
-    reader's bits saved (in [-1, 1];
-    with a reader or e1); E2, the questions answered right measured from the no-change answer (qa_term); E3, the edit
+    reader's bits saved (in [-1, 1]; with a reader or e1; reported, not in the mean: REPORTED); E2, the questions answered right measured from the no-change answer (qa_term); E3, the edit
     requests' net bits over the edit teacher's (edit_term; ee an edit_eval.EditEval, edit_best goal key -> the teacher's
     net; left out until every request of the text has one). A term goal_eval cannot give (no causal-importance
     network for VPD's bounds) is left out of the mean. F3, the AUC of stated edges' cuts in the circuit's run, is
@@ -1121,7 +1148,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
             terms["E2"] = row["E2"]
             terms["E3"] = e3.get(i)
-            have = [v for k, v in terms.items() if k not in ("F1", "F3") and v is not None]  # F1 (in C) and F3: reported
+            have = [v for k, v in terms.items() if k not in REPORTED and v is not None]
             e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
             size = size_term(row["bits"] + d_bits + e_bits, scale)
             r = sum(have) / len(have) - size_weight * size
@@ -1261,7 +1288,8 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_
     model's top next tokens, the measured evidence at the listed positions (units.evidence; never the English reader's
     events), the 1% rule, and for the circuit's subcomponents the question lists, their atlas facts as it lists them
     (the routed lens at their positions and Pile contexts). From the teacher's answer: its subcomponents (the first max_nodes in VPD's order),
-    its stated edges (those into the prediction first, without their measured effects) and the questions' answers."""
+    its stated edges (those into the prediction first, without their measured effects) and the questions' answers; and
+    the circuit's lines as the oracle writes them ("circuit", for E1's reader, never shown to the writer)."""
     import goal_eval
     import units
 
@@ -1275,6 +1303,7 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_
     pairs = [(w, None) for w in g.out] + [(w, r) for r, ws in g.parents.items() for w in ws]
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
     return {"task": task["id"], "text": "".join(strings[:max(targets) + 1]), "target": max(targets),
+            "circuit": circuit_text(render(goal_eval.to_json(g, ""))),  # what E1's reader reads with the English
             "evidence": units.evidence(ev["events"], ev["listed"], strings) if ev.get("events") else [],
             "target_token": strings[max(targets)], "top": prompt["model_top"][0][:3], "nodes_total": len(nodes),
             "positions": sorted({nd[1] for nd in nodes}),

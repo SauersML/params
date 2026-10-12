@@ -61,3 +61,20 @@ def test_hold_question_has_same_neutral_specification():
     assert captured[0].split("Question:")[1] == captured[1].split("Question:")[1]
     assert str(nodes) in captured[0]
     assert "step" not in captured[0].lower()
+
+
+def test_reader_reads_the_circuit_before_the_english_and_asks_a_prompt_once():
+    captured = []
+
+    def generate(prompts):
+        captured.extend(prompts)
+        return [{"Yes": math.log(0.8 if "@1 a=tok" in q else 0.5), "No": math.log(0.2 if "@1 a=tok" in q else 0.5)} for q in prompts]
+    r = Reader(generate, lambda ids: [f"t{i}" for i in ids])
+    task = {"prompts": [{"token_ids": [1, 2], "model_top": [[["next", 0.5]]]}]}
+    event = {"position": 1, "new": 3, "down": True}
+    got = r.losses(task, [("@1 a=tok\nOUT <- a", ""), ("", "it copies"), ("@1 a=tok\nOUT <- a", "it copies")], [event])
+    assert [round(x[0], 6) for x in got] == [round(-math.log2(0.8), 6), 1.0, round(-math.log2(0.8), 6)]
+    q = captured[-1]
+    assert q.index("tokens = ") < q.index("@1 a=tok") < q.index("it copies") < q.index("Question:")
+    r.losses(task, [("@1 a=tok\nOUT <- a", "")], [event])
+    assert len(captured) == 3  # asked before: from the memo

@@ -170,7 +170,8 @@ def sample(a) -> None:
 
 def readers(a) -> None:
     """E1 of every sample with reader A (the reward's), and the evaluation's controls on each question's first sample:
-    another question's English read on this text (shuffled; each question takes the next one's first sample), reader B
+    another question's English read on this text with this sample's circuit (shuffled; each question takes the next
+    one's first sample), reader B
     (an independent model, never the one trained against) and the control reader. {"task", "own": [bits per sample],
     "shuffled", "reader_b", "control"} per question."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -190,7 +191,8 @@ def readers(a) -> None:
         for i, t in enumerate(order):
             task = json.loads((a.texts_dir / f"{t}.json").read_text())
             texts = [x for x, _ in samples[t]]
-            shuffled = "EXPLANATION: " + components.english(samples[order[(i + 1) % len(order)]][0][0])
+            shuffled = (f"CIRCUIT:\n{components.circuit_text(texts[0])}\nEXPLANATION: "
+                        + components.english(samples[order[(i + 1) % len(order)]][0][0]))
             f.write(json.dumps({"task": t, "own": components.e1_bits(reader_a, task, rows[t], texts),
                                 "shuffled": components.e1_bits(reader_a, task, rows[t], [shuffled])[0] if len(order) > 1 else None,
                                 "reader_b": components.e1_bits(reader_b, task, rows[t], texts[:1])[0] if reader_b else None,
@@ -201,9 +203,10 @@ def readers(a) -> None:
 
 def explain(a) -> None:
     """Teacher English: for each teacher circuit's facts (components.py facts), an open base model on Tinker (never
-    trained here) writes N explanations from components.writer_prompt; reader A scores each by E1 (bits saved on the
-    text's reader questions); the best is kept only when it saves more than the empty explanation (0 bits). On the kept
-    ones, the controls: another text's kept explanation read on this text (shuffled) and reader B (an independent
+    trained here) writes N explanations from components.writer_prompt; reader A scores each by E1 read with the
+    teacher's circuit (the facts' "circuit"); the best is kept only when it tells the reader more than the neutral
+    sentence (E1 > 0). On the kept ones, the controls: another text's kept explanation read on this text with this
+    text's circuit (shuffled) and reader B (an independent
     model); reader_b_all, the summary's headline, is reader B's bits over every text with 0 where nothing was kept
     (what the SFT examples hold). {"task", "samples", "e1", "explanation" (kept, or ""), "e1_best", "shuffled",
     "reader_b"} per text."""
@@ -223,6 +226,9 @@ def explain(a) -> None:
     reader_b = tinker_reader(service, a.reader_b, *renderer_for(a.reader_b), Spend(a.out.parent, a.reader_b)) if a.reader_b else None
     rows = {r["task"]: r for r in map(json.loads, a.rows.read_text().splitlines())}
     facts = [json.loads(x) for x in a.facts.read_text().splitlines() if x.strip()]
+    if any("circuit" not in f for f in facts):
+        raise SystemExit(f"{a.facts}: facts without the teacher's circuit lines (rerun components.py facts): E1's reader reads them")
+    circuit = {f["task"]: f["circuit"] for f in facts}
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=wr.get_stop_sequences())
     futs = []
     for f in facts:  # unseeded: a seed gives every one of a call's num_samples the same draws (16 samples, 1-7 distinct)
@@ -252,7 +258,7 @@ def explain(a) -> None:
                         "e1_mean": None, "named": sum(named)})
             print(json.dumps({"task": f["task"], "kept": False, "named": sum(named)}), flush=True)
             continue
-        e1 = components.e1_bits(reader_a, task, rows[f["task"]], [f"EXPLANATION: {t}" for t in texts])
+        e1 = components.e1_bits(reader_a, task, rows[f["task"]], [f"CIRCUIT:\n{f['circuit']}\nEXPLANATION: {t}" for t in texts])
         best = max(range(len(texts)), key=lambda i: e1[i] if e1[i] is not None else -1e9)
         keep = e1[best] is not None and e1[best] > 0
         out.append({"task": f["task"], "named": sum(named), "samples": texts, "e1": e1, "best": best, "explanation": texts[best] if keep else "",
@@ -263,9 +269,9 @@ def explain(a) -> None:
         task = json.loads((a.texts_dir / f"{o['task']}.json").read_text())
         if len(kept) > 1:
             other = kept[(i + 1) % len(kept)]["explanation"]
-            o["shuffled"] = components.e1_bits(reader_a, task, rows[o["task"]], [f"EXPLANATION: {other}"])[0]
+            o["shuffled"] = components.e1_bits(reader_a, task, rows[o["task"]], [f"CIRCUIT:\n{circuit[o['task']]}\nEXPLANATION: {other}"])[0]
         if reader_b is not None:
-            o["reader_b"] = components.e1_bits(reader_b, task, rows[o["task"]], [f"EXPLANATION: {o['explanation']}"])[0]
+            o["reader_b"] = components.e1_bits(reader_b, task, rows[o["task"]], [f"CIRCUIT:\n{circuit[o['task']]}\nEXPLANATION: {o['explanation']}"])[0]
     with a.out.open("w") as fh:
         for o in out:
             fh.write(json.dumps(o) + "\n")

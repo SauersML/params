@@ -42,7 +42,8 @@ TEACH=""  # TEACHER: the texts' teacher circuits, reward v3's teacher-dominance 
 if [ -n "${TEACHER:-}" ]; then mkdir -p "$IN/teacher" && cp "$TEACHER"/text*.json "$IN/teacher/" && TEACH=teacher; fi
 EDITS=""  # the edit teacher's rows for E3's best net per goal (edit_eval.bests), when the rows ask for edits
 if [ -n "${EDIT_EVAL:-}" ]; then cp "$EDIT_EVAL" "$IN/edit_eval.jsonl" && EDITS="edit_eval.jsonl"; fi
-COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" rows.jsonl labels.jsonl sets $EDITS $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt && rm -rf "$IN"
+# Exclude sealed text IDs before tar opens their contents (9100 through 9149).
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$IN.tar" -C "$IN" rows.jsonl labels.jsonl sets $EDITS $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt && rm -rf "$IN"
 WHAT="evaluate heldout $I/rows.jsonl --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} ${MATCHED_ALL:+--matched-all} ${TEACHER:+--teacher $I/teacher} ${EDIT_EVAL:+--edit-teach $I/edit_eval.jsonl} ${LINES:+--lines}"
 if [ -n "${NOISE:-}" ]; then WHAT="noise heldout $I/rows.jsonl --seeds $NOISE"; fi  # C's draw noise (c_noise) instead of the evaluation
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \

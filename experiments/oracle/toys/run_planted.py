@@ -29,6 +29,15 @@ import teacher  # noqa: E402
 ARMS = {"current": (), "changed": ("changed",)}
 
 
+class ToyEval(goal_eval.GoalEval):
+    """GoalEval with VPD's bound held above 0: an exact decomposition's KL_VPD is ~1e-6 and can round below 0, which
+    teacher.py's budget KL_empty^0.1 KL_VPD^0.9 turns complex."""
+
+    def _bounds(self, tx, conv):
+        e, v = super()._bounds(tx, conv)
+        return e, (None if v is None else max(v, 1e-9))
+
+
 def units_of(nat, nodes) -> dict:
     """{(layer, kind): sorted units} and the positions of a circuit's nodes (planted.decompose's head or neuron per
     piece)."""
@@ -79,7 +88,7 @@ def circuits(name: str, nat, tx) -> dict:
 def run(name: str, path: Path, out: Path, n_texts: int, arms: list, log=print) -> None:
     d = torch.load(path)
     nat = planted.native_of(d["sd"], d["cfg"])
-    ge = goal_eval.GoalEval(nat, chunk=16)
+    ge = ToyEval(nat, chunk=16)
     ge.donor_pools.update(search=[], eval=[])   # the far donors are vpd4l's texts, outside a toy's vocabulary
     texts = planted.ordinary(name, n_texts)
     texts = list(dict.fromkeys(tuple(x) for x in texts))  # the gate toys have three distinct texts

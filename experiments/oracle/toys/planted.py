@@ -5,7 +5,7 @@ by constraints, in pairs that agree on ordinary inputs but differ inside. Each i
 neuron, remainders ~0, VPD's answer the pieces active on the text) so teacher.py, goal_eval and E4 run on it unchanged.
 
   binding_km / binding_fp   BOS k1 v1 k2 v2 k3 v3 k4 v4 Q kx -> vx. Ordinary inputs ask for pair FIXED. km is trained on
-                            every pair (it must match keys: a previous-token head then an induction head); fp on pair
+                            every pair with no MLP (it must match keys: a previous-token head then an induction head); fp on pair
                             FIXED only, its layer-0 queries and keys reading one constant embedding coordinate (attention
                             by position alone: a fixed offset), layer 1 zero.
   route1 / route2           each token -> the token before it, one layer, no MLP. route1: head 1 zero (one head copies);
@@ -205,6 +205,9 @@ def train(name: str, steps: int = 3000, seed: int = 0, log=print) -> ToyLM:
             m = torch.ones(D, D)
             m[:, hd:] = 0.0          # o_proj reads head 0 alone
             masks[site_name(0, "o_proj")] = m
+    elif name == "binding_km":   # attention only: the key match is the route (a previous-token head, then an induction head)
+        for i in range(2):
+            zero(i, "c_fc"), zero(i, "down_proj")
     elif name in ("additive", "interaction"):
         if name == "additive":
             for i in range(2):

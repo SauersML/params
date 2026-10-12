@@ -2,8 +2,9 @@
 (skipped without one or vpd4l's texts): the scorer's patched runs are native.run's interchange patches (an independent
 forward pass); the lead's cases: every subcomponent at 233 for "copied word" (inputs 232 and 233) reproduces the
 on-target changes and leaves the off-target ones alone, the last layer at the target fails off-target; two groups
-patched together reproduce a change of both inputs; in a circuit's stated graph (C's semantics) the patched runs are
-goal_eval.graph_ref's interchange and its activations graph_ref's reads; names parse as goal_eval's circuits.
+patched together reproduce a change of both inputs; a group's patch moves the reads of a group it feeds as the change
+does; in a circuit's stated graph (C's semantics) the patched runs are goal_eval.graph_ref's interchange and its
+activations graph_ref's reads; names parse as goal_eval's circuits.
 
   ~/.local/bin/mem-lease 16 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_variables.py -s
 """
@@ -119,6 +120,21 @@ def test_circuit_world_is_graph_ref(case):
     res = sc.score(tx, variables.parse([{"name": "233", "inputs": [233], "group": [[n, c, t] for n, t, c in group]}], nat.C),
                    "eval", 3, graph=graph)
     assert res["circuit"]["variables"][0]["draws_on"] and res["variables"][0]["draws_on"]
+
+
+def test_feeds(case):
+    """Every subcomponent at 233 feeds the last two layers at 288 (a change at 233 reaches 288 only through 233's
+    outputs): claimed, patching 233 reproduces the reads' change at 288 (f above 0.99); claimed apart, the same runs
+    give f below 0.01 (the reads move as in model(x'))."""
+    nat, ge, tx, at, _ = case
+    late = [[n, c, 288] for n in nat.names if native._name_layer_kind(n)[0] >= nat.target.n_layer - 2 for c in range(nat.C[n])]
+    for claim in (["b"], []):
+        vs = variables.parse([{"name": "a", "inputs": [233], "group": at(233), "feeds": claim},
+                              {"name": "b", "inputs": [288], "group": late}], nat.C)
+        got = variables.Scorer(ge).score(tx, vs, "eval", 3)
+        ab = next(x for x in got["feeds"] if x["from"] == "a" and x["to"] == "b")
+        assert ab["draws"] and ab["feeds"] == bool(claim), ab
+        assert (ab["f"] > 0.99) if claim else (ab["f"] < 0.01), ab
 
 
 def test_parse(case):

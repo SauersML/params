@@ -624,7 +624,10 @@ class GoalEval:
         masked run of the circuit's subcomponents and u. record: receives each read's activation {node: [B]} (reads:
         those subcomponents; by default a stated graph's nodes); patch: {node: value} fixes those subcomponents' activations (an interchange); cuts: {reader node or
         None (the prediction): [writer nodes]}, connections cut besides the unstated ones (a complete graph, VPD's
-        answer or the whole model as masks, has none unstated: its nodes read each other in full). norms: receives each
+        answer or the whole model as masks, has none unstated: its nodes read each other in full), and ("pairs", layer,
+        t): (split nodes, pairs) cuts those query-key pairs of the read (layer, t) (graph.pairs, _pair_row): a stated
+        graph's from its stated pairs (or every pair of the split), a complete graph's from every pair of the split (the
+        circuit's query and key nodes: the same intervention on the model and VPD's answer). norms: receives each
         RMSNorm's scale 1 / rms per position ({("attn" | "mlp", layer) or "final": [B, T or targets, 1]}); with
         freeze "layers" (every norm inside the layers) or "all" (the final norm too), those norms use the scales norms
         holds instead (a run recorded first: the norm diagnostic)."""
@@ -632,7 +635,10 @@ class GoalEval:
 
         nat, tg = self.nat, self.nat.target
         T, H, hd, dev = len(ids), tg.n_head, tg.hd, self.nat.dev
-        drops = {r: list(ws) for r, ws in (cuts or {}).items()}
+        import engine
+
+        pcut = {r[1:]: v for r, v in (cuts or {}).items() if engine._pair_cut(r)}  # (layer, t): (split nodes, pairs removed)
+        drops = {r: list(ws) for r, ws in (cuts or {}).items() if not engine._pair_cut(r)}
         if graph.complete:
             nodes = sorted({nd for r, ws in drops.items() for nd in ws + ([r] if r is not None else [])})
         else:
@@ -694,10 +700,17 @@ class GoalEval:
             q, k, v = (site(nm[kk], z, resid).view(B, T, H, hd).transpose(1, 2) for kk in ("q_proj", "k_proj", "v_proj"))
             q, k = tg._rope(q, T), tg._rope(k, T)
             S = (q @ k.transpose(-1, -2)) / math.sqrt(hd)
-            for (layer, t), stated in (getattr(graph, "pairs", None) or {}).items():  # a read's row from its stated pairs
-                if layer == i:
-                    S = S.clone()
-                    S[:, :, t, :t + 1] = self._pair_row(i, t, stated, nodes, q, k, a, on)
+            sp = {} if graph.complete else (getattr(graph, "pairs", None) or {})
+            for layer, t in sorted(set(sp) | set(pcut)):  # a read's row from its stated pairs, less any it has cut
+                if layer != i:
+                    continue
+                split = nodes if (layer, t) in sp else sorted(pcut[(layer, t)][0])
+                keep = list(sp[(layer, t)]) if (layer, t) in sp else engine.read_pairs(split, layer, t)
+                if (layer, t) in pcut:
+                    gone = set(pcut[(layer, t)][1])
+                    keep = [x for x in keep if x not in gone]
+                S = S.clone()
+                S[:, :, t, :t + 1] = self._pair_row(i, t, keep, split, q, k, a, on)
             P = S.masked_fill(~causal, float("-inf")).softmax(-1)
             att = (P @ v).transpose(1, 2).reshape(B, T, -1)
             share = lambda r, ws, att=att, P=P: att[:, r[1]] - sum(  # noqa: E731

@@ -420,6 +420,41 @@ def test_stated_query_key_pairs():
         assert float((a[n].grad - b[n].grad).norm() / a[n].grad.norm().clamp_min(1e-30)) < REL
 
 
+def test_query_key_pair_cuts():
+    """cuts {("pairs", layer, t): (split, pairs)}: on a stated graph the run with those pairs gone from its stated ones;
+    on the whole model (outside="on", u = 1) the pairs of the split (the circuit's query and key nodes) gone from the
+    full row: the engine is graph_ref (rows of one plan each cutting its own pairs), and cutting none is no cut."""
+    nat, ids, targets, graph, _, _, _ = graph_case(B=1)
+    ge = goal_eval.GoalEval(nat)
+    T = len(ids)
+    ref = nat.reference([ids], targets)
+    every = stated_pairs(graph)
+    read = next(r for r, prs in every.items() if len(prs) >= 3)
+    split = sorted(graph.node_set())
+    gone = every[read][::2]
+    stated = native.Graph(graph.nodes, graph.parents, graph.out)
+    stated.pairs = {read: every[read]}
+    fewer = native.Graph(graph.nodes, graph.parents, graph.out)
+    fewer.pairs = {read: [x for x in every[read] if x not in set(gone)]}
+    key = ("pairs",) + read
+    eng = engine.Engine(nat, ids, targets, live=True)
+    with torch.no_grad():
+        want = carry.kl(ref, ge.graph_ref(ids, targets, fewer))
+        assert rel(want, carry.kl(ref, ge.graph_ref(ids, targets, stated, cuts={key: (split, gone)}))) < REL
+        assert rel(want, carry.kl(ref, eng.graph_log_probs(eng.plan(stated, semantics="c", cuts={key: (split, gone)})))) < REL
+        cols = {n: torch.tensor(sorted({c for m, _, c in split if m == n}), dtype=torch.long) for n in nat.names}
+        whole = engine.Engine(nat, ids, targets, live=True, columns=cols, outside="on")
+        model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+        ones = {n: torch.ones(1, 1, whole.width(n), device=nat.dev) for n in nat.names}
+        cut_rows = [{key: (split, every[read])}, {key: (split, [])}, {key: (split, gone)}]
+        got = carry.kl(ref, whole.graph_log_probs(whole.plan([model] * 3, semantics="c", cuts=cut_rows),
+                                                  {n: m.expand(3, -1, -1) for n, m in ones.items()})).tolist()
+        for row, cut in zip(got, cut_rows):
+            want = float(carry.kl(ref, ge.graph_ref(ids, targets, model, cuts=cut))[0])
+            assert abs(row - want) < 1e-5 + REL * abs(want), (row, want)
+        assert got[0] > 5e-5 and abs(got[1]) < 1e-5  # every pair cut moves the model; none cut is the model
+
+
 def test_c_semantics_equal_graph_ref():
     """C's semantics (plan(semantics="c")) equal goal_eval.GoalEval.graph_ref, the forward pass written out, on a graph
     stating half of its connections, with the gradients in u; a stated connection at strength 0 is the graph without it."""

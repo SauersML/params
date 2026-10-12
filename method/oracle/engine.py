@@ -241,9 +241,12 @@ class Engine:
             return rows.setdefault((b, nd[1], col(nd[0], nd[2])), len(rows))
 
         readers, writers, edges, outs, qk, nodes, E, O = {}, {}, {}, {}, {}, {}, 0, 0
-        pairs = {}  # per layer, each read with stated pairs: (row, query position, [(query column | None, (key position, key column) | None)])
+        pairs = {}  # per layer, each read with stated pairs: (row, query position, [(query column | None, (key position, key
+        # column) | None)], the split's query columns at the position, its (key position, key column)s)
         for b, g in enumerate(graphs):
-            cut = {(w, r) for r, ws in (cuts[b] or {}).items() for w in ws}
+            pcut = {k[1:]: v for k, v in (cuts[b] or {}).items() if _pair_cut(k)}  # (layer, t): (split nodes, pairs removed)
+            cuts[b] = {r: ws for r, ws in (cuts[b] or {}).items() if not _pair_cut(r)}
+            cut = {(w, r) for r, ws in cuts[b].items() for w in ws}
             if g.complete:  # its subcomponents read each other in full (u): only the cuts and free are connections here
                 fr = [(w, r) for r, ws in (free[b] or {}).items() for w in ws]
                 if any(r is None for _, r in fr):
@@ -278,12 +281,22 @@ class Engine:
                 lst[2].append(row(writers, b, w))
                 lst[3].append(at.get((w, None), 0))
                 lst[4].append(float((w, None) in at and (w, None) not in cut))
+            sp = {} if g.complete else (getattr(g, "pairs", None) or {})
+            for layer, t in sorted(set(sp) | set(pcut)):  # reads with stated pairs, or with some of their pairs cut
+                if (layer, t) in sp:  # a stated graph's pairs, split by its own query and key nodes
+                    split, keep = sorted(g.node_set()), list(sp[(layer, t)])
+                else:  # every pair of the cut's split (a complete graph: the circuit's query and key nodes)
+                    split = sorted(pcut[(layer, t)][0])
+                    keep = read_pairs(split, layer, t)
+                if (layer, t) in pcut:
+                    gone = set(pcut[(layer, t)][1])
+                    keep = [x for x in keep if x not in gone]
+                nq, nk = native.site_name(layer, "q_proj"), native.site_name(layer, "k_proj")
+                pairs.setdefault(layer, []).append((
+                    b, t, [(None if qa is None else col(nq, qa[2]), None if kb is None else (kb[1], col(nk, kb[2]))) for qa, kb in keep],
+                    [col(nq, c) for n, tt, c in split if n == nq and tt == t], [(tt, col(nk, c)) for n, tt, c in split if n == nk and tt <= t]))
             if g.complete:
                 continue
-            for (layer, t), stated in (getattr(g, "pairs", None) or {}).items():
-                nq, nk = native.site_name(layer, "q_proj"), native.site_name(layer, "k_proj")
-                pairs.setdefault(layer, []).append((b, t, [(None if qa is None else col(nq, qa[2]),
-                                                            None if kb is None else (kb[1], col(nk, kb[2]))) for qa, kb in stated]))
             for n, t, c in g.node_set():
                 nodes.setdefault(n, set()).add((b, t, col(n, c)))
                 if n.endswith(("q_proj", "k_proj")):
@@ -331,7 +344,7 @@ class Engine:
                "pairs": {}}
         for b, k in enumerate(rows):  # each row's reads with stated pairs (a one-graph plan's are its row 0's)
             for i, lst in ps[k].get("pairs", {}).items():
-                out["pairs"].setdefault(i, []).extend((b, t, st) for _, t, st in lst)
+                out["pairs"].setdefault(i, []).extend((b,) + e[1:] for e in lst)
         at = {}
         for name in ("qk", "nodes", "readers", "writers"):
             at[name] = before(name)
@@ -385,7 +398,7 @@ class Engine:
                       for (rn, wn), (ri, wi, j, fx) in p["edges"].items()},
             "out": {wn: (step(b, B0), ti.repeat(times), step(wi, W[wn]), step(j, p["O"]), fx.repeat(times))
                     for wn, (b, ti, wi, j, fx) in p["out"].items()},
-            "pairs": {i: [(b + B0 * d, t, st) for d in range(times) for b, t, st in lst] for i, lst in p.get("pairs", {}).items()}})
+            "pairs": {i: [(e[0] + B0 * d,) + e[1:] for d in range(times) for e in lst] for i, lst in p.get("pairs", {}).items()}})
 
     def graph_kl(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
                  precision: str = "score", patch: dict | None = None) -> torch.Tensor:
@@ -502,8 +515,9 @@ class Engine:
     def _pair_rows(self, i: int, prs: list, q: torch.Tensor, k: torch.Tensor, aq: torch.Tensor, ak: torch.Tensor, sq: torch.Tensor,
                    u: dict, p: dict, rows_at, B: int) -> torch.Tensor:
         """Layer i's attention pattern [B, H, rows, T] (float32) with each read of prs (plan["pairs"][i]: row, query
-        position, stated pairs) taking its score row from its stated query-key pairs, as goal_eval.GoalEval._pair_row:
-        q_t = sum_a q_a + q_rest (the graph's query nodes at t, rank one: activation x mask x U row, and the rest) and
+        position, stated pairs, the split's query and key nodes) taking its score row from its stated query-key pairs,
+        as goal_eval.GoalEval._pair_row: q_t = sum_a q_a + q_rest (the split's query nodes at t, rank one: activation x
+        mask x U row, and the rest) and
         k_p the same; the rest-rest term (the background) and each stated pair's, rotary at t and p. q, k: the rotated
         queries (of the rows computed: rows_at, None for every position) and keys [B, H, T, hd]; aq, ak their sites'
         activations ([B, rows, K], [B, T, K]); sq the query site's masks at the rows (query nodes at 1)."""
@@ -515,25 +529,19 @@ class Engine:
         sk = u[nk].expand(B, T, -1)
         if nk in p["qk"]:
             sk = sk.index_put(p["qk"][nk], torch.ones((), device=self.dev))
-        qnodes = {}
-        for b, t, c in zip(*(x.tolist() for x in p["qk"].get(nq, ([], [], [])))):
-            qnodes.setdefault((b, t), []).append(c)
-        knodes = {}
-        for b, t, c in zip(*(x.tolist() for x in p["qk"].get(nk, ([], [], [])))):
-            knodes.setdefault(b, []).append((t, c))
         half = hd // 2
 
         def rot(vec, pos):  # [H, hd] at position pos
             return vec * tg.cos[pos] + torch.cat([-vec[..., half:], vec[..., :half]], -1) * tg.sin[pos]
         place = {int(t): r for r, t in enumerate(at.tolist())}
-        for b, t, stated in prs:
+        for b, t, stated, qs, ks in prs:
             r = place.get(t)
             if r is None:  # a read whose position this run does not compute (the last layer at the targets alone)
                 continue
             m = sq[b if sq.shape[0] > 1 else 0, r if sq.shape[1] > 1 else 0]
-            qpart = {c: rot((aq[b, r, c] * m[c] * Uq[c]).float().view(H, hd), t) for c in qnodes.get((b, t), [])}
+            qpart = {c: rot((aq[b, r, c] * m[c] * Uq[c]).float().view(H, hd), t) for c in qs}
             kpart = {(pk, c): rot((ak[b, pk, c] * sk[b if sk.shape[0] > 1 else 0, pk, c] * Uk[c]).float().view(H, hd), pk)
-                     for pk, c in knodes.get(b, []) if pk <= t}
+                     for pk, c in ks}
             q_rest = q[b, :, r].float() - sum(qpart.values()) if qpart else q[b, :, r].float()
             k_rest = k[b, :, :t + 1].float().clone()
             for (pk, c), kb in kpart.items():
@@ -771,6 +779,20 @@ class Engine:
             b, ti, gi, j, fx, uc = cout
             z = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)
         return norm(z, tg.ln_f)
+
+
+def _pair_cut(key) -> bool:
+    """A cuts key naming a read's pairs: ("pairs", layer, query position)."""
+    return isinstance(key, tuple) and len(key) == 3 and key[0] == "pairs"
+
+
+def read_pairs(nodes, layer: int, t: int) -> list:
+    """Every query-key pair of a read (layer, query position t) split by nodes: (a query node of the layer at t or None,
+    a key node of the layer at or before t or None), not both None (the background, always in)."""
+    nq, nk = native.site_name(layer, "q_proj"), native.site_name(layer, "k_proj")
+    qs = [nd for nd in sorted(nodes) if nd[0] == nq and nd[1] == t]
+    ks = [nd for nd in sorted(nodes) if nd[0] == nk and nd[1] <= t]
+    return [(a, b) for a in qs + [None] for b in ks + [None] if a is not None or b is not None]
 
 
 ROWS = 1 << 24  # entries of a connection group's [connections, width] product made at once (64 MB in float32)

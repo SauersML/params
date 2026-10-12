@@ -27,6 +27,12 @@ from pathlib import Path
 ANSWER = "<answer> "
 
 
+def _dev() -> str:
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"  # the CPU for a local smoke test only
+
+
 def _rows(path) -> list[dict]:
     return [json.loads(x) for x in Path(path).read_text().splitlines() if x.strip()]
 
@@ -50,9 +56,9 @@ class Slots:
         self.vectors = inject.Vectors()
         emb = model.get_input_embeddings().weight.detach().float()
         self.injector = inject.Injector(self.vectors.dims(), emb.shape[1], float(emb.pow(2).mean(-1).sqrt().mean()),
-                                        self.vectors.logn_mean, self.vectors.logn_std).cuda()
+                                        self.vectors.logn_mean, self.vectors.logn_std).to(_dev())
         if init is not None:
-            self.injector.load_state_dict(torch.load(Path(init) / "injector.pt", map_location="cuda"))
+            self.injector.load_state_dict(torch.load(Path(init) / "injector.pt", map_location=_dev()))
         self.slot = tok.convert_tokens_to_ids(inject.SLOT)
         self.pool = {}
 
@@ -109,7 +115,7 @@ def _model(base: str, adapter: str | None = None, rank: int = 0, trainable: bool
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(base)
-    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16).cuda()
+    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16 if _dev() == "cuda" else torch.float32).to(_dev())
     if adapter:
         from peft import PeftModel
 
@@ -159,7 +165,7 @@ def _loss(model, batch, pad: int, slots: Slots | None = None):
         ids[i, :len(p) + len(c)] = torch.tensor(p + c)
         labels[i, len(p):len(p) + len(c)] = torch.tensor(c)
         att[i, :len(p) + len(c)] = 1
-    ids, labels, att = ids.cuda(), labels.cuda(), att.cuda()
+    ids, labels, att = ids.to(_dev()), labels.to(_dev()), att.to(_dev())
     h = _hidden(model, ids, att, slots, [n for _, _, n in batch])[:, :-1]
     tgt = labels[:, 1:]
     keep = tgt != -100  # the output layer at the answer's positions alone (the vocabulary is 152k wide)
@@ -229,7 +235,7 @@ def _logp(model, tok, prompts: list[list[int]], conts: list[list[int]], nodes: l
             ids[i, :len(p) + len(c)] = torch.tensor(p + c)
             att[i, :len(p) + len(c)] = 1
         with torch.no_grad():
-            h = _hidden(model, ids.cuda(), att.cuda(), slots, nodes[b:b + 16] if nodes else None)
+            h = _hidden(model, ids.to(_dev()), att.to(_dev()), slots, nodes[b:b + 16] if nodes else None)
             for i, (p, c) in enumerate(zip(P, C)):
                 lp = _head(model)(h[i, len(p) - 1:len(p) - 1 + len(c)]).float().log_softmax(-1)
                 out.append(float(lp[torch.arange(len(c)), torch.tensor(c, device=lp.device)].sum()))
@@ -281,7 +287,7 @@ def score(a) -> None:
         text, nodes = prompt(r)
         p = enc(text + ANSWER)
         lp = torch.tensor(_logp(model, tok, [p] * len(letters), [enc(x) for x in letters], [nodes] * len(letters), slots)).log_softmax(0)
-        x = torch.tensor([p]).cuda()
+        x = torch.tensor([p]).to(_dev())
         with torch.no_grad():
             if slots is None:
                 g = model.generate(input_ids=x, max_new_tokens=24, do_sample=False)[0, len(p):]

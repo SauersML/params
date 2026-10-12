@@ -1,7 +1,7 @@
 """Speed of the oracle checker's hot paths on vpd4l (#2951): repeatable benchmarks, one JSON line per run.
 
   bench_speed.py [--code DIR] [--split heldout] [--texts 3] [--benches carry,score,events] [--out FILE]
-  bench_speed.py --benches sample --adapter DIR [--questions FILE]          (CUDA with vLLM)
+  bench_speed.py --benches sample --adapter DIR --questions FILE [--merged DIR]   (CUDA with vLLM)
   bench_speed.py --profile carry [--granularity matrix]                     where measure() spends its time
 
 carry    MatrixCarry.measure: unit sets per second, batches of 64 random sets (each unit on with probability 1/2) over
@@ -10,7 +10,8 @@ carry    MatrixCarry.measure: unit sets per second, batches of 64 random sets (e
 score    units.score_many seconds per question: K=8 positions, 8 answers (the copy and all baselines, 4 copies each);
          seconds_first with the model object's per-text caches dropped (a text's first call), seconds with them kept
 events   units.events seconds per text, K=8; seconds_first and seconds as for score
-sample   the explainer's vLLM sampling (units_sft.py sample's settings): generated tokens per second
+sample   the explainer's vLLM sampling (units_sft.py sample's settings): generated tokens per second, the adapter as a
+         LoRA and, given --merged, merged into the weights
 Texts are the split's first n, fixed; every timing is after one untimed warm-up on the same inputs (MPS compiles a
 graph per shape) and ends with a device synchronize. Each result carries a fingerprint of what it computed (sums of
 measured KLs and scores): a speed change that alters the numbers shows there. GPU utilization is the system's, sampled
@@ -157,9 +158,12 @@ def bench_events(nat, texts, k=8):
 
 
 def bench_sample(a):
-    """units_sft.py sample's engine and settings on the questions: generated tokens per second, after a warm-up batch."""
-    import json as _json
+    """units_sft.py sample's engine and settings (vLLM, n=4, temperature 1, 1,536 tokens, model length 8,192, 85% of the
+    GPU) on the questions: generated tokens per second after a warm-up batch, with the adapter as a LoRA (as sample runs
+    it) and, given --merged (units_sft.py merge's checkpoint of the same adapter), as merged weights."""
+    import gc
 
+    import torch
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
@@ -167,21 +171,33 @@ def bench_sample(a):
     sys.path.insert(0, str(Path(a.code) / "rl"))
     from units_sft import chat_prompt
 
-    qs = [_json.loads(x)["question"] for x in open(a.questions)][:a.questions_n]
+    qs = [json.loads(x)["question"] for x in open(a.questions)][:a.questions_n]
     tok = AutoTokenizer.from_pretrained(a.base)
-    rank = _json.loads((Path(a.adapter) / "adapter_config.json").read_text())["r"]
-    llm = LLM(model=a.base, dtype="bfloat16", enable_lora=True, max_lora_rank=rank, max_model_len=8192, seed=0)
-    params = SamplingParams(n=4, temperature=1.0, max_tokens=1536, seed=0)
-    lora = LoRARequest("explainer", 1, str(a.adapter))
     prompts = [chat_prompt(tok, q) for q in qs]
-    llm.generate(prompts[:2], params, lora_request=lora, use_tqdm=False)
-    util = Utilization("cuda")
-    t0 = time.perf_counter()
-    outs = llm.generate(prompts, params, lora_request=lora, use_tqdm=False)
-    seconds = time.perf_counter() - t0
-    gen = sum(len(c.token_ids) for o in outs for c in o.outputs)
-    return [{"questions": len(qs), "answers": 4 * len(qs), "generated_tokens": gen, "seconds": seconds,
-             "tokens_per_s": gen / seconds, "gpu": util.finish()}]
+    params = SamplingParams(n=4, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=1536, seed=0)
+    rows = []
+    for how in ["lora"] + (["merged"] if a.merged else []):
+        if how == "lora":
+            rank = json.loads((Path(a.adapter) / "adapter_config.json").read_text())["r"]
+            llm = LLM(model=a.base, dtype="bfloat16", enable_lora=True, max_lora_rank=rank, max_model_len=8192,
+                      gpu_memory_utilization=0.85, seed=0)
+            kw = {"lora_request": LoRARequest("explainer", 1, str(a.adapter))}
+        else:
+            llm = LLM(model=str(a.merged), dtype="bfloat16", max_model_len=8192, gpu_memory_utilization=0.85, seed=0)
+            kw = {}
+        llm.generate(prompts[:2], params, use_tqdm=False, **kw)
+        util = Utilization("cuda")
+        t0 = time.perf_counter()
+        outs = llm.generate(prompts, params, use_tqdm=False, **kw)
+        seconds = time.perf_counter() - t0
+        gen = sum(len(c.token_ids) for o in outs for c in o.outputs)
+        rows.append({"weights": how, "questions": len(qs), "answers": 4 * len(qs), "generated_tokens": gen,
+                     "seconds": seconds, "tokens_per_s": gen / seconds, "gpu": util.finish()})
+        print("sample", json.dumps(rows[-1]), flush=True)
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
+    return rows
 
 
 def profile_carry(nat, path, granularity, batch=64):
@@ -220,6 +236,7 @@ def main():
     ap.add_argument("--granularity", default="matrix,subcomponent", help="carry's unit granularities")
     ap.add_argument("--profile", choices=("carry",))
     ap.add_argument("--adapter", type=Path, help="sample: the explainer's LoRA adapter")
+    ap.add_argument("--merged", type=Path, help="sample: the same adapter merged into the base (units_sft.py merge)")
     ap.add_argument("--base", default="Qwen/Qwen3-4B")
     ap.add_argument("--questions", type=Path, help="sample: units_sft.py questions output")
     ap.add_argument("--questions-n", type=int, default=50)

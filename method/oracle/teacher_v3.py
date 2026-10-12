@@ -149,7 +149,7 @@ class Measure:
         """flips() of several graphs in one adversary_flips call (screens: its shortlist gaps shared by them and kept
         by the caller across calls)."""
         rows = self.ge.adversary_flips(self.tx, graphs, self.pool, "omitted", ms=(self.m,), screens=screens)
-        self.calls += 1
+        self.calls += len(graphs)
         return [1.0 if f["f1_flips_omitted"].get(self.m) is None else f["f1_flips_omitted"][self.m]  # nothing omitted:
                 for f in rows]                                                                   # nothing to switch on
 

@@ -69,6 +69,7 @@ LAZY = 12               # last round's best candidates re-measured per round
 MIN_GAIN = 0.005        # the least gain in J a step takes
 MAX_STEPS = 12          # blocks taken at most
 KEEP = 0.9              # refine: the share of a block's gain in J a prefix keeps
+EVAL_DRAWS = 32         # run's fresh draws of the circuit's own nodes for its sets (eval_units)
 EPS = 1e-12
 
 
@@ -431,7 +432,9 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
     """Expand each text's circuit in src (<task>.json, a node set); write out/<set>/<task>.json for the sets: "b1",
     "b2", "b4" (the first 1, 2, 4 blocks taken), "full" (every block taken), "refined" (refine's), "rand" (as many
     blocks as "full" drawn at the circuit's positions), "allpos" (every site at the circuit's positions), "vpdbits"
-    (VPD's order beyond the circuit at "full"'s added bits); and a line per text in out/summary.jsonl."""
+    (VPD's order beyond the circuit at "full"'s added bits); and a line per text in out/summary.jsonl: the expansion's
+    record, refine's, every set's score on the search draws ("search") and on EVAL_DRAWS fresh draws of the circuit's own
+    nodes ("eval_units", the start's among them)."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
     out.mkdir(parents=True, exist_ok=True)
@@ -458,11 +461,16 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
         added = bk.bits(frozenset(blocks)) - bk.bits()
         sets["vpdbits"] = ([], _vpd_extra(bk, max(added, 1.0)))
         scores = dict(zip(sets, bk.score([(frozenset(b), frozenset(x)) for b, x in sets.values()])))
+        # the same sets on fresh draws of the circuit's own nodes (the backup family's evaluation seed, EVAL_DRAWS): the
+        # response question apart from goal_eval's node family, which also removes the expansion's own subcomponents
+        ev = Backup(ge, tx, g, draws=EVAL_DRAWS, family="backup_eval")
+        units = dict(zip(["start"] + list(sets), ev.score([(frozenset(), frozenset())] + [(frozenset(b), frozenset(x)) for b, x in sets.values()])))
+        del ev
         for name, (b, x) in sets.items():
             (out / name).mkdir(exist_ok=True)
             (out / name / f"{p.stem}.json").write_text(json.dumps(goal_eval.to_json(bk.graph(frozenset(b), frozenset(x)))))
         row = {"task": p.stem, "T": tx.T, "nodes": len(bk.nodes), "positions": bk.positions, "bits_start": bk.bits(),
-               "expand": ex, "refine": rf, "search": scores, "sets": {k: [list(map(list, b)), list(map(list, x))] for k, (b, x) in sets.items()},
+               "expand": ex, "refine": rf, "search": scores, "eval_units": units, "sets": {k: [list(map(list, b)), list(map(list, x))] for k, (b, x) in sets.items()},
                "measured": bk.measured, "seconds": time.perf_counter() - t0}
         with open(out / "summary.jsonl", "a") as fh:
             fh.write(json.dumps(row) + "\n")

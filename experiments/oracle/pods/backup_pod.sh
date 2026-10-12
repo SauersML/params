@@ -38,7 +38,7 @@ bk() { python -B backup.py run --split $SPLIT --n $N --src \$HOME/bk_in/src --ou
   [ $EVAL = 1 ] && { python -B backup.py eval --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P >> $O/run_\$1.log 2>&1; echo \"eval exit \$?\" >> $O/run_\$1.log; }; };
 for k in \$(seq 0 $((P - 1))); do (bk \$k) & done; wait; echo all done"
 for try in $(seq 1 40); do
-  env ${REF:+RP_REF=$REF} RP_OWNER=backup RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.80} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=32 \
+  env ${REF:+RP_REF=$REF} RP_OWNER=backup RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.80} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=32 \
     experiments/infra/runpod/rp-run $RN "$GPU" "$H" -- bash -c "$CMD" > "$F/rp.log" 2>&1 && break
   grep -qE "in stock on a working host|differs from its sha256" "$F/rp.log" || break
   sleep 180

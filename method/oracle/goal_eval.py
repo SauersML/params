@@ -101,6 +101,7 @@ ADV_RESTARTS = 4
 ADV_PATTERNS = 64  # patterns drawn from the pool per text
 ADV_RANDOM_ON = 1 / 16  # a random member's chance of switching each drawn pattern on
 ADV_CURVE = (0, 4, 20)  # budgets reported (steps)
+FLIPS = {"omitted": (1, 4, 16, 64, 256), "patterns": (1, 2, 4, 8)}  # adversary_flips' budgets: how many switched on
 
 
 # ---- answers
@@ -1045,6 +1046,66 @@ class GoalEval:
                          for n, gr in zip(nat.names, grads[1:])}
                 native.free(dev)
             out.append(row)
+        return out
+
+
+    def adversary_flips(self, tx: Text, graphs: list[native.Graph], pool: dict, lever: str = "omitted", ms=None,
+                        steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, k: int = ADV_PATTERNS) -> list[dict]:
+        """The paired adversary with a budget in switched-on parts instead of steps: per budget m, at most m of one
+        lever on ("omitted": the VPD actives the circuit leaves out, one subcomponent at one position each;
+        "patterns": the pool's patterns, each an OR over every position up to the last target), the other lever off.
+        Search: sign-gradient steps of ADV_STEP on the relaxed lever, each projected onto its m largest entries, from
+        restarts starts (one the gradient's top m at nothing switched on, the others random), then the top m
+        switched on and scored in float32; the worst restart. Per circuit {f"f1_flips_{lever}": {m: f1_adv},
+        f"kl_flips_{lever}": {m: (KL_C, KL_VPD)}, f"mask_flips_{lever}": {m: the parts switched on, (site, position,
+        subcomponent) or pool index}}."""
+        nat, dev = self.nat, self.nat.dev
+        e0 = self._bounds(tx, "live")[0]
+        ms = FLIPS[lever] if ms is None else ms
+        gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
+        pick, problems = self._adv_problem(tx, graphs, pool, k, gen)
+        out = []
+        for kls, idx, cols in problems:
+            sizes = [len(idx[n][0]) for n in nat.names]
+            N = sum(sizes) if lever == "omitted" else len(pick)
+
+            def call(x):
+                R = x.shape[0]
+                if lever == "omitted":
+                    return kls(torch.zeros(R, len(pick), device=dev), dict(zip(nat.names, torch.split(x, sizes, 1))))
+                return kls(x, {n: torch.zeros(R, sz, device=dev) for n, sz in zip(nat.names, sizes)})
+
+            def top(x, m):  # each row's m largest entries kept, the rest 0
+                keep = torch.zeros_like(x, dtype=torch.bool).scatter(1, x.topk(m, 1).indices, True)
+                return x * keep
+
+            def grad(x):
+                x = x.detach().requires_grad_(True)
+                kc, kv = call(x)
+                return torch.autograd.grad((kc.clamp_min(1e-12).log() - kv.clamp_min(1e-12).log()).sum(), x)[0]
+
+            f1s, kl, mask = {}, {}, {}
+            flat = [(n, int(idx[n][0][j]), int(cols[n][idx[n][1][j]])) for n in nat.names for j in range(len(idx[n][0]))] \
+                if lever == "omitted" else pick
+            g0 = grad(torch.zeros(1, N, device=dev)) if N else None
+            for m in ms:
+                if m > N:
+                    continue
+                x = torch.rand(restarts, N, generator=gen).to(dev)
+                x[0] = g0[0]
+                x = top(x, m).clamp(0, 1)
+                for _ in range(steps):
+                    x = top((x + ADV_STEP * grad(x).sign()).clamp(0, 1), m)
+                with torch.no_grad():
+                    xb = torch.zeros_like(x).scatter(1, x.topk(m, 1).indices, 1.0)
+                    kc, kv = call(xb)
+                    gap = kc.log() - kv.log()
+                    i = int(gap.argmax())
+                    f1s[m] = _fid(e0, float(kc[i]), float(kv[i]))
+                    kl[m] = (float(kc[i]), float(kv[i]))
+                    mask[m] = [flat[j] for j in xb[i].nonzero().flatten().tolist()]
+                native.free(dev)
+            out.append({f"f1_flips_{lever}": f1s, f"kl_flips_{lever}": kl, f"mask_flips_{lever}": mask})
         return out
 
 

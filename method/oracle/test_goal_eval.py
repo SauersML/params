@@ -754,3 +754,25 @@ def test_pattern_pool_is_ci_per_position(tiny, tmp_path, monkeypatch):
         for n in nat.names:
             want = (ci[n][t] > 0).nonzero().flatten().cpu()
             assert torch.equal(got.get(n, torch.zeros(0, dtype=torch.long)), want), (k, n)
+
+
+def test_adversary_flips_finds_the_worst_single(tiny):
+    """A budget of one switched-on omission: the search's pick is the worst single omission (brute force over all), and
+    its KLs are that mask's."""
+    nat, ge, tx = tiny
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    g = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    pool = tiny_pool(nat, tx.ids)
+    row = ge.adversary_flips(tx, [g], pool, "omitted", ms=(1,), steps=4, restarts=2, k=6)[0]
+    gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
+    pick, ((kls, idx, cols),) = ge._adv_problem(tx, [g], pool, 6, gen)
+    sizes = [len(idx[n][0]) for n in nat.names]
+    N = sum(sizes)
+    with torch.no_grad():
+        eye = torch.eye(N, device=nat.dev)
+        kc, kv = kls(torch.zeros(N, len(pick), device=nat.dev), dict(zip(nat.names, torch.split(eye, sizes, 1))))
+        gap = kc.log() - kv.log()
+    j = int(gap.argmax())
+    got_c, got_v = row["kl_flips_omitted"][1]
+    assert abs(math.log(got_c) - math.log(got_v) - float(gap[j])) < 1e-3 * max(1.0, abs(float(gap[j]))), (got_c, got_v, float(gap[j]))
+    assert len(row["mask_flips_omitted"][1]) == 1

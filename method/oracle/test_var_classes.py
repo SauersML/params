@@ -73,3 +73,13 @@ def test_candidates_order_by_selectivity_and_response():
     assert got["response, first 1"] == [("a", 6, 2)]
     assert all(("a", 4, 0) not in g for g in got.values())
     assert got["responding at 6"] == [("a", 6, 2), ("a", 6, 3)]
+
+
+def test_stated_feeds_follow_paths_through_unnamed_nodes():
+    """a -> b -> c -> d -> prediction with a in V1 and c in V2: V1 feeds V2 (through the unnamed b) and stops there;
+    V2 feeds the prediction (through the unnamed d)."""
+    a, b, c, d = ("x", 1, 0), ("x", 2, 0), ("x", 3, 0), ("x", 4, 0)
+    g = native.Graph([a, b, c, d], {b: [a], c: [b], d: [c]}, [d])
+    chosen = [{"name": "V1", "_group": [a]}, {"name": "V2", "_group": [c]}]
+    var_teacher.stated_feeds(g, chosen)
+    assert [v["feeds"] for v in chosen] == [["V2"], ["prediction"]]

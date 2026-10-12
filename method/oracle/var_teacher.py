@@ -19,11 +19,11 @@ the circuit held the context).
    off-target) (the headline's, 0 without a resolved on-target draw). The bar is min(GOAL, the best term); input sets
    are taken best first, each with its smallest candidate at or above the bar (the simplest group that carries its
    inputs), with no input position and no node in two. Nodes in no variable stay unnamed.
-4. Feeds: a circuit's stated connections (a node of V writing into a node of W, or into the prediction). In the VPD
-   pool, which states none, each ordered pair takes the claim (feeds or apart) its measured feeds test favours, and a
-   variable feeding no other one feeds the prediction. The chosen variables are then scored together (composition
-   and feeds, the model-world headline e4) on the search split and on the eval split, whose draws the choice never
-   saw (the held-out number).
+4. Feeds: a circuit's stated connections (a stated path from a node of V to a node of W, or to the prediction,
+   through unnamed nodes). In the VPD pool, which states none, each ordered pair takes the claim (feeds or apart) its
+   measured feeds test favours, and a variable feeding no other one feeds the prediction. The chosen variables are
+   then scored together (composition and feeds, the model-world headline e4) on the search split and on the eval
+   split, whose draws the choice never saw (the held-out number).
 5. Output: per text {"variables": [{"name", "meaning": "", "inputs", "group": [[matrix, index, position], ...],
    "feeds": [variables or "prediction"], "measured": {...}, with --classes "classes": var_classes.classes per input
    position}], "teacher": {...}} (primerl's interface), the names
@@ -174,15 +174,26 @@ def screen(sc: _Screen, tx, inputs: tuple, cands: list[tuple[list, str]], draws:
 
 
 def stated_feeds(graph: native.Graph, chosen: list[dict]) -> None:
-    """Each variable's feeds from the circuit's stated connections."""
+    """Each variable's feeds from the circuit's stated connections: V feeds W when a stated path runs from a node of V
+    to a node of W through unnamed nodes only, and the prediction when one reaches a writer into the prediction."""
     owner = {tuple(nd): v["name"] for v in chosen for nd in v["_group"]}
+    readers, out = {}, {tuple(w) for w in graph.out}
+    for r, ws in graph.parents.items():
+        for w in ws:
+            readers.setdefault(tuple(w), []).append(tuple(r))
     for v in chosen:
         mine, f = set(map(tuple, v["_group"])), set()
-        for r, ws in graph.parents.items():
-            if owner.get(tuple(r)) not in (None, v["name"]) and any(tuple(w) in mine for w in ws):
-                f.add(owner[tuple(r)])
-        if any(tuple(w) in mine for w in graph.out):
-            f.add("prediction")
+        seen, todo = set(mine), list(mine)
+        while todo:
+            nd = todo.pop()
+            if nd in out:
+                f.add("prediction")
+            for r in readers.get(nd, []):
+                if owner.get(r) not in (None, v["name"]):
+                    f.add(owner[r])
+                elif r not in seen:
+                    seen.add(r)
+                    todo.append(r)
         v["feeds"] = sorted(f)
 
 

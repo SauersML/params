@@ -370,7 +370,8 @@ class Backup:
                     choice = k
                     break
             row = {"block": [n, t], "gain": gain, "block_bits": full["bits"], "without_bits": without["bits"],
-                   "prefixes": pts, "choice": choice, "order": order[:max(sizes) if sizes else 0]}
+                   "j_block": full["j"], "j_without": without["j"], "prefixes": pts, "choice": choice,
+                   "order": order[:max(sizes) if sizes else 0]}
             if choice is not None:
                 kept.remove(b)
                 extra |= {(n, t, c) for c in order[:choice]}
@@ -379,6 +380,85 @@ class Backup:
                 log(f"    refine {n}@{t}: gain {gain:.3f}, block {full['bits']:.0f} bits, prefix "
                     + (f"{choice} ({pts[sizes.index(choice)]['bits']:.0f} bits)" if choice else "none cheaper"))
         return {"blocks": [list(b) for b in kept], "extra": sorted(list(x) for x in extra), "per_block": per}
+
+
+    @torch.no_grad()
+    def interpret(self, per_block: list, top: int = 16) -> list[dict]:
+        """What each taken block's compensation is, from refine's rows (per_block): concentration (the smallest prefix
+        of the block's outside subcomponents, in the screen's order, holding 50% and 90% of the block's gain in J); for
+        its top subcomponents (the first `top` of that order) against as many drawn at random from the block's outside,
+        the mean over them of the largest |cosine| of their read vectors (V's columns) and of their write vectors (U's
+        rows) with the circuit's subcomponents of the same site at any position (a backup duplicating a circuit route
+        reads or writes what a member does), the signed cosine at that largest (positive: the same direction); and for
+        an attention site, each top subcomponent's head (the largest head slice of its head-side vector) beside the
+        circuit's heads there, with, for an attention output, each head's most attended source position at the block's
+        position in the model's run (another head reading the same source is a parallel route)."""
+        import torch.nn.functional as F
+
+        nat, tg = self.nat, self.nat.target
+        H, hd = tg.n_head, tg.hd
+        rng = np.random.default_rng([int(self.tx.seed), 3])
+        pats = self._patterns() if any(native._name_layer_kind(pb["block"][0])[1] == "o_proj" for pb in per_block) else {}
+        out = []
+        for pb in per_block:
+            n, t = pb["block"]
+            L, kind = native._name_layer_kind(n)
+            st = tg.site(n)
+            Vt, U = st.V.T, st.U                                     # [C, d_in], [C, d_out]
+            members = sorted({c for nn, _, c in self.subs0 if nn == n})
+            here = sorted({c for nn, tt, c in self.subs0 if nn == n and tt == t})
+            comp = list(pb["order"][:top])
+            outside = [c for c in range(nat.C[n]) if c not in set(here)]
+            rand = rng.choice(outside, min(top, len(outside)), replace=False).tolist() if outside else []
+            j0, gain = pb.get("j_without") or 0.0, pb["gain"]
+            ks = {}
+            for share in (0.5, 0.9):
+                ks[share] = next((x["k"] for x in pb["prefixes"] if (x["j"] or 0.0) - j0 >= share * gain), None) if gain > 0 else None
+
+            def cos(A, xs, ys):  # (mean over xs of the largest |cos| with ys, the signed cosines there)
+                if not xs or not ys:
+                    return None, None
+                cm = F.normalize(A[xs].float(), dim=-1) @ F.normalize(A[ys].float(), dim=-1).T
+                i = cm.abs().argmax(1, keepdim=True)
+                return float(cm.abs().max(1).values.mean()), [round(float(v), 3) for v in cm.gather(1, i).squeeze(1)]
+
+            row = {"block": [n, t], "gain": gain, "k50": ks[0.5], "k90": ks[0.9], "members": len(members), "members_here": len(here)}
+            row["read_cos_comp"], row["read_cos_signed"] = cos(Vt, comp, members)
+            row["read_cos_rand"] = cos(Vt, rand, members)[0]
+            row["write_cos_comp"], row["write_cos_signed"] = cos(U, comp, members)
+            row["write_cos_rand"] = cos(U, rand, members)[0]
+            if kind in ("o_proj", "v_proj", "q_proj", "k_proj"):
+                side = Vt if kind == "o_proj" else U                 # the vector over heads
+                heads = lambda xs: [int(side[x].view(H, hd).norm(dim=-1).argmax()) for x in xs]  # noqa: E731
+                row["heads_comp"], row["heads_circuit"] = heads(comp), heads(here)
+                if kind == "o_proj" and L in pats:
+                    src = pats[L][:, t].argmax(-1).tolist()          # per head its most attended position at t
+                    row["source_comp"] = [src[h] for h in row["heads_comp"]]
+                    row["source_circuit"] = [src[h] for h in row["heads_circuit"]]
+                    row["source_weight_comp"] = [round(float(pats[L][h, t].max()), 3) for h in row["heads_comp"]]
+            out.append(row)
+        return out
+
+    @torch.no_grad()
+    def _patterns(self) -> dict:
+        """The model's attention patterns per layer [H, T, T] (its run, every subcomponent on)."""
+        nat, E, tg = self.nat, self.E, self.nat.target
+        got: dict = {}
+        orig = E._site
+
+        def site(n, h, mask, rec=None):
+            y = orig(n, h, mask, rec)
+            if n.endswith(("q_proj", "k_proj")):
+                got[n] = y
+            return y
+
+        E._site = site
+        try:
+            E.log_probs({n: torch.ones(1, self.T, nat.C[n], device=nat.dev) for n in nat.names})
+        finally:
+            E._site = orig
+        return {L: tg.attention_pattern(got[native.site_name(L, "q_proj")], got[native.site_name(L, "k_proj")])[0]
+                for L in range(tg.n_layer)}
 
 
 def expand_circuit(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, max_steps: int = MAX_STEPS,
@@ -453,6 +533,7 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
         ex = bk.expand(max_steps=max_steps, log=lambda s: log(s))
         blocks = [tuple(b) for b in ex["blocks"]]
         rf = bk.refine(blocks, log=lambda s: log(s)) if blocks else {"blocks": [], "extra": [], "per_block": []}
+        interp = bk.interpret(rf["per_block"]) if rf["per_block"] else []
         sets = {f"b{k}": (blocks[:k], []) for k in (1, 2, 4) if k <= len(blocks)}
         sets["full"] = (blocks, [])
         sets["refined"] = ([tuple(b) for b in rf["blocks"]], [tuple(x) for x in rf["extra"]])
@@ -470,7 +551,7 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
             (out / name).mkdir(exist_ok=True)
             (out / name / f"{p.stem}.json").write_text(json.dumps(goal_eval.to_json(bk.graph(frozenset(b), frozenset(x)))))
         row = {"task": p.stem, "T": tx.T, "nodes": len(bk.nodes), "positions": bk.positions, "bits_start": bk.bits(),
-               "expand": ex, "refine": rf, "search": scores, "eval_units": units, "sets": {k: [list(map(list, b)), list(map(list, x))] for k, (b, x) in sets.items()},
+               "expand": ex, "refine": rf, "interpret": interp, "search": scores, "eval_units": units, "sets": {k: [list(map(list, b)), list(map(list, x))] for k, (b, x) in sets.items()},
                "measured": bk.measured, "seconds": time.perf_counter() - t0}
         with open(out / "summary.jsonl", "a") as fh:
             fh.write(json.dumps(row) + "\n")

@@ -6,7 +6,7 @@ A circuit node (a subcomponent at a position) is in a whole part when every memb
 in the circuit at that position. Naming: a whole part at a position is written L<layer>.<kind>#P<j>@<position> (a
 part within one matrix; j its number among that matrix's parts) or L<layer>#P<j>@<position> (a part spanning the
 layer's matrices); every other node as before (components.py's text). Lengths: the circuit lines of
-components.render and their Qwen3 token count (the explainer's tokenizer).
+components.render and their Qwen3 token count (the explainer's tokenizer, Qwen3-8B's).
 
 F1 and N (goal_eval's, live remainders, log scale; teacher.scores): the circuit C as found, and C' = C with every
 member of each part that C touches added at that position (the part on whole); N for VPD's answer without C and
@@ -86,7 +86,7 @@ def main():
     ap.add_argument("--device", help="torch device (native.device() otherwise; cpu when the GPU is busy)")
     args = ap.parse_args()
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B", local_files_only=True)
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B", local_files_only=True)  # the explainer's (components.py)
     parts = Parts(args.parts)
     names = numbering(parts)
     ge = goal_eval.GoalEval(native.Native(args.device))

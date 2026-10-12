@@ -477,3 +477,31 @@ def test_block_search_keeps_its_floor():
     # written as a node set, goal_eval reads the same circuit back
     back, bad = goal_eval.circuit(goal_eval.to_json(g, ""), tx.targets, nat.C, tx.T)
     assert back.complete and set(back.node_set()) == set(g.node_set()) and bad["invalid_nodes"] == 0
+
+
+@pytest.mark.skipif(DEVICE == "cpu", reason="needs a GPU")
+def test_block_connections_keep_their_floors():
+    if not VPD_SAVED.exists():
+        pytest.skip("needs VPD's answers " + str(VPD_SAVED))
+    nat, pr = pruner(teacher.CONVENTION == "live", "text9019")
+    ge, tx = pr.ge, pr.tx
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    budget = empty ** (1 - teacher.RECOVERED) * vpd ** teacher.RECOVERED
+    acc = teacher.Acceptance(ge, tx, ("changed", "donors"), "pp")
+    g, pb, _, _, rec = teacher.block_search(ge, tx, empty, vpd, budget, acc)
+    bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
+    conn = teacher.Connector(ge, tx, pb, empty, vpd, lambda *a: 0.0, no_strand=True, acceptance=acc, blocks=bl)
+    kept, summary, steps, ep, on = conn.connect(pb.on.clone(), 0.0)
+    stated = conn.graph(on, kept)
+    # a block's connections are one unit: every subcomponent's kept or none
+    for u in range(int(ep.gid.max()) + 1):
+        member = ep.gid == u
+        assert bool(ep.on[member].all()) or not bool(ep.on[member].any())
+    # the stated graph names the blocks, states every token edge, and keeps the floors the descent started from
+    assert {(nd[0], nd[1]) for nd in stated.node_set() if nd[2] == goal_eval.BLOCK} <= bl
+    assert stated.tok_out == list(tx.targets) and stated.tok_edges
+    floor = {k: min(teacher.RECOVERED, steps[0][k]) for k in ("s_track_pp", "s_donor_near", "s_donor_far") if steps[0].get(k) is not None}
+    got = acc.scores([stated])[0]
+    assert all(got[k] is None or got[k] >= f - 1e-6 for k, f in floor.items())
+    back, bad = goal_eval.circuit(goal_eval.to_json(stated, ""), tx.targets, nat.C, tx.T)
+    assert bad["invalid_nodes"] == 0 and bad["invalid_edges"] == 0 and set(back.node_set()) == set(stated.node_set())

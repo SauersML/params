@@ -398,9 +398,12 @@ class EdgePruner(Descent):
     subcomponent off; the remainders live or off, reading the full stream. Connections: every one the model has among
     the nodes (native.all_edges), (writer, reader), reader None for the prediction, in the plan's order; a subset bool
     [E] runs as 0/1 strengths. Every run is float32, the rankings too (on CUDA bfloat16 rankings reordered the rounds
-    and changed which connections were kept)."""
+    and changed which connections were kept). blocks, {(site, position)}: those sites' nodes are a block's every
+    subcomponent (goal_eval.BLOCK, C's semantics: expand_blocks), and a connection into or out of a block is one unit,
+    every subcomponent's together (gid)."""
 
-    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, live: bool = False, B: int = 32):
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, live: bool = False, B: int = 32,
+                 blocks: set | None = None):
         import engine
 
         nat = ge.nat
@@ -410,6 +413,10 @@ class EdgePruner(Descent):
         self.edges = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in out]
         self.inner = len(self.edges) - len(out)              # connections into nodes first, then into the prediction
         self.on = torch.ones(len(self.edges), dtype=torch.bool, device=nat.dev)
+        self.blockset = set(blocks or ())
+        units = {}
+        self.gid = torch.tensor([units.setdefault((self.unit(w), self.unit(r)), len(units)) for w, r in self.edges],
+                                dtype=torch.long, device=nat.dev)
         cols = {n: sorted({c for m, _, c in nodes if m == n}) for n in nat.names}
         self.eng = engine.Engine(nat, tx.ids, tx.targets, live=live,
                                  columns={n: torch.tensor(cols[n], dtype=torch.long, device=nat.dev) for n in nat.names})
@@ -432,16 +439,26 @@ class EdgePruner(Descent):
     def kl_rank(self, ons: torch.Tensor) -> list[float]:
         return self.kl_sets(ons, self.rank_precision)
 
+    def unit(self, nd):
+        """A node as the stated graph names it: a block's subcomponent as its block (None, the prediction, as is)."""
+        return (nd[0], nd[1], goal_eval.BLOCK) if nd is not None and (nd[0], nd[1]) in self.blockset else nd
+
     def blocks(self, level: str) -> list[torch.Tensor]:
         """The kept connections' blocks, protected ones aside: every connection out of one writer ("writer"), into one
-        reader or the prediction ("reader"), or single connections."""
+        reader or the prediction ("reader"), or single connections (a block's: every subcomponent's together)."""
         ids = (self.on & ~self.protected).nonzero().flatten()
         if level not in ("writer", "reader"):
-            return list(ids.split(1))
+            if not self.blockset:
+                return list(ids.split(1))
+            keys = self.gid[ids]
+            order = torch.argsort(keys, stable=True)
+            _, counts = torch.unique_consecutive(keys[order], return_counts=True)
+            return list(ids[order].split(counts.tolist()))
         if not hasattr(self, "ends"):
-            at = {nd: i for i, nd in enumerate(self.graph.nodes)}
-            self.ends = {"writer": torch.tensor([at[w] for w, _ in self.edges], device=ids.device),
-                         "reader": torch.tensor([at[r] if r is not None else len(at) for _, r in self.edges], device=ids.device)}
+            at = {nd: i for i, nd in enumerate(dict.fromkeys(self.unit(nd) for nd in self.graph.nodes))}
+            self.ends = {"writer": torch.tensor([at[self.unit(w)] for w, _ in self.edges], device=ids.device),
+                         "reader": torch.tensor([at[self.unit(r)] if r is not None else len(at) for _, r in self.edges],
+                                                device=ids.device)}
         keys = self.ends[level][ids]
         order = torch.argsort(keys, stable=True)
         _, counts = torch.unique_consecutive(keys[order], return_counts=True)
@@ -456,15 +473,20 @@ class EdgePruner(Descent):
         back first."""
         outs = {}
         for e, (w, _) in enumerate(self.edges):
-            outs.setdefault(w, []).append(e)
+            outs.setdefault(self.unit(w), []).append(e)
         for es in outs.values():
             if not bool(self.on[es].any()):
                 self.on[es] = True
-        kept = self.on.nonzero().flatten()
-        cut = dict(zip(kept.tolist(), self.without(list(kept.split(1)))))
-        best = [max((e for e in es if e in cut), key=lambda e: cut[e]) for es in outs.values()]
+        units = self.blocks("connection")                    # each kept unit (a block's connection: all of it), cut alone
+        cut = dict(zip(range(len(units)), self.without(units)))
+        first = {int(u[0]): i for i, u in enumerate(units)}
+        best = []
+        for es in outs.values():
+            mine = [first[e] for e in es if e in first]
+            if mine:
+                best.append(units[max(mine, key=lambda i: cut[i])])
         if best:
-            self.protected[torch.tensor(sorted(set(best)), device=self.protected.device)] = True
+            self.protected[torch.cat(best)] = True
 
 
 def routes(nodes: list, targets: list[int]) -> set:
@@ -787,8 +809,9 @@ class Connector:
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: Pruner, empty: float, vpd: float, size_term, B: int = 32,
                  robust: dict | None = None, no_strand: bool = False, levels: tuple = ("connection",),
-                 acceptance: Acceptance | None = None):
+                 acceptance: Acceptance | None = None, blocks: set | None = None):
         self.ge, self.tx, self.pr, self.empty, self.vpd, self.size_term, self.B = ge, tx, pr, empty, vpd, size_term, B
+        self.blocks = set(blocks or ())  # {(site, position)}: kept blocks, every subcomponent there among pr's nodes
         self.acceptance = acceptance  # connection removals also keep the search-split terms (Acceptance)
         self.levels = levels      # edge_path's levels in turn (coarse ones first: "writer", "reader"; then "connection")
         self.robust = robust      # the adversary's pool: connection removals also keep F1 under the omitted lever's flips
@@ -808,12 +831,15 @@ class Connector:
         if self.no_strand:
             reach = routes(nodes, self.tx.targets)
             dropped = [nd for nd in nodes if nd not in reach]
+            if self.blocks:                                  # a block stays whole: dropped only with every subcomponent
+                whole = {(nd[0], nd[1]) for nd in nodes if (nd[0], nd[1]) in self.blocks and nd in reach}
+                dropped = [nd for nd in dropped if (nd[0], nd[1]) not in whole]
             if dropped:
                 on = on.clone()
                 on[torch.tensor([self.index[nd] for nd in dropped], device=on.device)] = False
                 nodes = [nd for nd in nodes if nd not in set(dropped)]
                 n = measure(pr, on[None], empty, vpd)[0]["n"]
-        ep = EdgePruner(self.ge, self.tx, nodes, CONVENTION == "live", self.B)
+        ep = EdgePruner(self.ge, self.tx, nodes, CONVENTION == "live", self.B, self.blocks)
         if keep is not None:
             fresh = {pr.nodes[j] for j in new}
             ep.on = torch.tensor([e in keep or e[0] in fresh or e[1] in fresh for e in ep.edges], device=ep.on.device)
@@ -851,13 +877,17 @@ class Connector:
         return [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_], summary, steps, ep, on
 
     def graph(self, on: torch.Tensor, kept: list) -> native.Graph:
-        """A node set and its kept connections as the stated graph goal_eval scores."""
+        """A node set and its kept connections as the stated graph goal_eval scores (a kept block's subcomponents as
+        its block node, their connections as the block's)."""
+        def unit(nd):
+            return (nd[0], nd[1], goal_eval.BLOCK) if nd is not None and (nd[0], nd[1]) in self.blocks else nd
         parents = {}
         for w, r in kept:
             if r is not None:
-                parents.setdefault(r, []).append(w)
-        return with_tokens(native.Graph([self.pr.nodes[j] for j in on.nonzero().flatten().tolist()], parents,
-                                        [w for w, r in kept if r is None]), self.tx.targets)
+                parents.setdefault(unit(r), {})[unit(w)] = None
+        nodes = list(dict.fromkeys(unit(self.pr.nodes[j]) for j in on.nonzero().flatten().tolist()))
+        return with_tokens(native.Graph(nodes, {r: list(ws) for r, ws in parents.items()},
+                                        list(dict.fromkeys(unit(w) for w, r in kept if r is None))), self.tx.targets)
 
     def score(self, on: torch.Tensor, kept: list, pool: dict) -> dict:
         """The reward's circuit score of a node set with its kept connections: C (goal_eval.GoalEval.fidelity, mode
@@ -1097,18 +1127,18 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         f1_b, n_b, _ = scores(empty, vpd, kl_c, kl_minus)
         row["blocks"].update(kl_c=kl_c, kl_minus=kl_minus, f1=f1_b, n=n_b)
         circuits = {"": goal_eval.to_json(g, "")}
-        if edges and not bl:                                 # a circuit of subcomponents alone: its connections stated
+        if edges:                                            # its connections stated (a block's: all of its subcomponents')
 
             def size_term_b(on, inner=0, out=0):
                 n, k_tok = int(on.sum()), int(torch.unique(pb.t[on]).numel())
                 bits = n * node_bits + k_tok * math.log2(nat.positions(targets)) + (math.log2(n + k_tok) * (2 * inner + out) if n else 0.0)
                 return goal_eval.size_term(bits, scale)
             wiring = Connector(ge, tx, pb, empty, vpd, size_term_b, B, robust=robust_pool, no_strand=no_strand, levels=edge_levels,
-                               acceptance=acceptance)
+                               acceptance=acceptance, blocks=bl)
             kept, row["best_edges"], _, _, on_w = wiring.connect(pb.on.clone(), n_b if n_b is not None else 0.0)
-            circuits[""] = circuit_json(pb, on_w, kept)
-        elif edges:                                          # (a block's connections: not yet; the node set as found)
-            row["edges_skipped"] = "blocks"
+            stated = wiring.graph(on_w, kept)
+            row["best_edges"]["bits"] = goal_eval.size_bits(stated, nat.positions(targets), sum(nat.C.values()), targets)
+            circuits[""] = goal_eval.to_json(stated, "")
         row["seconds"] = time.perf_counter() - t0
         print(f"  {tx.T} tokens: {len(bl)} blocks, {g.count() - len(bl)} subcomponents, F1 {f1_b}, N {n_b}, "
               f"{row['blocks'].get('accept')}, {row['blocks']['bits']:.0f} bits", flush=True)

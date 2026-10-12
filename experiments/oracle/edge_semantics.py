@@ -39,6 +39,8 @@ def main():
     q = lambda p: d[min(len(d) - 1, int(p * len(d)))]  # noqa: E731
     print(f"{len(d)} texts: graph F1 in C's semantics minus native.run's: mean {sum(d) / len(d):+.3f}, "
           f"min {d[0]:+.3f}, 10% {q(0.1):+.3f}, median {q(0.5):+.3f}, 90% {q(0.9):+.3f}, max {d[-1]:+.3f}")
+    print(f"share with |gap| < {args.tolerance}: {sum(abs(g) < args.tolerance for g in d) / len(d):.3f}; "
+          f"share not more than {args.tolerance} below: {sum(g >= -args.tolerance for g in d) / len(d):.3f}")
     low = [t for g, t in gaps if g < -args.tolerance]
     print(f"{len(low)} texts more than {args.tolerance} below: " + ", ".join(f"{t} {c[t]:.3f} vs {native[t]:.3f}" for t in low))
     if args.redo:

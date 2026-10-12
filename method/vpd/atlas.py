@@ -39,6 +39,13 @@ Per subcomponent:
                  and for the lens sites, per effect sample, the Pearson correlation over the data's
                  tokens between the lens prediction a w_X and the measured contribution, and the
                  overlap of their top 10 raised tokens.
+  look-ahead     (`lookahead`) the share of its active positions where it turns off when the text after the
+                 position is replaced (the rest of another row of split A at the same positions; the position and
+                 everything before it unchanged), over cut positions chosen to cover every subcomponent twice where
+                 its top contexts allow (greedy set cover over its top-3 contexts' positions); its activity at a cut
+                 comes from parts.py's split-A activity files. With it, the number of cuts it was active at and the
+                 share of cuts where it turns on from off. VPD's CI network reads the whole sequence, so a trigger can
+                 depend on later tokens; this measures how much.
   partners       the weight connectome's (method/vpd/connectome.py, its files under
                  ~/mpd-data/atlas/vpd4l/connectome), read through Atlas.partners.
 
@@ -47,11 +54,13 @@ subcomponents, in the order of vpd_model.site_names() and index within a site) a
 settings, the splits, the timings and speeds, the field definitions).
 
   MPD_MEM_GIB=20 python -m method.vpd.atlas build [--train 0:5000] [--heldout 5000:6000] [--batch 8]
+  MPD_MEM_GIB=20 python -m method.vpd.atlas lookahead [--need 2] [--batch 8]   (after parts.py activity)
   python -m method.vpd.atlas show SITE INDEX     (e.g. h.2.mlp.c_fc 17)
 """
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import math
 import time
@@ -446,6 +455,92 @@ def build(args):
     log(f"wrote {out / 'atlas.safetensors'} ({(out / 'atlas.safetensors').stat().st_size >> 20} MB)")
 
 
+# ------------------------------------------------------------------ look-ahead
+
+
+def lookahead(args):
+    """The look-ahead fields (module note), added to atlas.safetensors."""
+    from method.vpd.parts import Activity
+
+    out = Path(args.out)
+    meta = json.loads((out / "atlas.json").read_text())
+    arrays = load_file(str(out / "atlas.safetensors"))
+    a0, a1 = meta["train_rows"]
+    per_layer = sum(meta["counts"][n] for n in meta["names"][:6])
+    total = meta["total"]
+    T1 = 511
+    acts = [Activity(out / "parts" / f"activity_train_L{layer}.npz") for layer in range(4)]
+    # Candidate cut positions: every subcomponent's top-3 contexts, as global positions of split A.
+    row, pos = arrays["top_row"][:, :3].long(), arrays["top_pos"][:, :3].long()
+    ok = row >= 0
+    cand = torch.unique(((row - a0) * T1 + pos - 1)[ok]).numpy()
+    # Which subcomponents are active at each candidate (from the activity files).
+    W, Cs = [], []
+    for layer, act in enumerate(acts):
+        idx = np.nonzero(np.isin(act.positions, cand))[0]
+        Cs.append(np.searchsorted(act.indptr, idx, side="right") - 1 + layer * per_layer)
+        W.append(np.searchsorted(cand, act.positions[idx]))
+    W, Cs = np.concatenate(W), np.concatenate(Cs)
+    order = np.argsort(W, kind="stable")
+    on_at = np.split(Cs[order], np.searchsorted(W[order], np.arange(1, len(cand))))
+    # Greedy cover: cuts until every subcomponent active at some candidate is covered `need` times (or no candidate
+    # covers it further); each step takes the candidate covering the most still-needed subcomponents.
+    need = np.full(total, args.need, np.int64)
+    gain = np.array([len(x) for x in on_at], np.int64)
+    heap = [(-g, k) for k, g in enumerate(gain.tolist()) if g > 0]
+    heapq.heapify(heap)
+    cuts = []
+    while heap:
+        g, k = heapq.heappop(heap)
+        real = int((need[on_at[k]] > 0).sum())
+        if real == 0:
+            continue
+        if heap and real < -heap[0][0]:
+            heapq.heappush(heap, (-real, k))
+            continue
+        cuts.append(k)
+        need[on_at[k]] -= 1
+    print(f"{len(cand)} candidate positions, {len(cuts)} cuts", flush=True)
+    dev = args.device
+    target = VM.load_target(dev)
+    vpd = VM.load_vpd(target, dev)
+    names = VM.site_names()
+    tokens = VM.val_tokens(a1 - a0, 512, a0)
+    measured = torch.zeros(total, dtype=torch.int64)
+    turned_off = torch.zeros(total, dtype=torch.int64)
+    cut_off = torch.zeros(total, dtype=torch.int64)
+    turned_on = torch.zeros(total, dtype=torch.int64)
+    t0 = time.time()
+    for b0 in range(0, len(cuts), args.batch):
+        ks = cuts[b0:b0 + args.batch]
+        g = cand[ks]
+        r, p = g // T1, g % T1 + 1
+        other = (r + (a1 - a0) // 2) % (a1 - a0)
+        ids = tokens[r].clone()
+        for e in range(len(ks)):
+            ids[e, p[e] + 1:] = tokens[other[e], p[e] + 1:]
+        z, _ = ci_and_activity(vpd, names, ids.to(dev))
+        now = (z[torch.arange(len(ks)), torch.as_tensor(p).to(dev)] > 0).cpu()  # [E, total]
+        for e, k in enumerate(ks):
+            was = torch.zeros(total, dtype=torch.bool)
+            was[torch.as_tensor(on_at[k])] = True
+            measured += was.long()
+            turned_off += (was & ~now[e]).long()
+            cut_off += (~was).long()
+            turned_on += (~was & now[e]).long()
+        if (b0 // args.batch) % 50 == 49 or b0 + args.batch >= len(cuts):
+            print(f"{time.strftime('%H:%M:%S')} lookahead: {min(b0 + args.batch, len(cuts))}/{len(cuts)} cuts, "
+                  f"{min(b0 + args.batch, len(cuts)) / (time.time() - t0):.2f}/s", flush=True)
+    arrays["lookahead_off"] = torch.where(measured > 0, turned_off.double() / measured.clamp_min(1), torch.tensor(float("nan"))).float()
+    arrays["lookahead_n"] = measured.int()
+    arrays["lookahead_on"] = (turned_on.double() / cut_off.clamp_min(1)).float()
+    save_file({k: v.contiguous() for k, v in arrays.items()}, str(out / "atlas.safetensors"))
+    meta["lookahead"] = {"cuts": len(cuts), "candidates": int(len(cand)), "need": args.need, "seconds": time.time() - t0,
+                         "cuts_per_s": len(cuts) / max(time.time() - t0, 1e-9)}
+    (out / "atlas.json").write_text(json.dumps(meta, indent=1) + "\n")
+    print(f"look-ahead: {len(cuts)} cuts in {time.time() - t0:.0f} s", flush=True)
+
+
 # ------------------------------------------------------------------ loader
 
 
@@ -550,8 +645,13 @@ def main():
     s.add_argument("site")
     s.add_argument("index", type=int)
     s.add_argument("--out", default=str(DEFAULT))
+    k = sub.add_parser("lookahead")
+    k.add_argument("--out", default=str(DEFAULT))
+    k.add_argument("--need", type=int, default=2)
+    k.add_argument("--batch", type=int, default=8)
+    k.add_argument("--device", default="mps")
     args = ap.parse_args()
-    build(args) if args.cmd == "build" else show(args)
+    {"build": build, "show": show, "lookahead": lookahead}[args.cmd](args)
 
 
 if __name__ == "__main__":

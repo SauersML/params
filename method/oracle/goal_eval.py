@@ -113,6 +113,8 @@ SCREEN = 256  # the adversary's shortlist measured one by one: the parts with th
 # whole removal can move the other way from its gradient: text-free tiny model, the best single removal ranks last)
 SCREEN_ROWS = 16  # rows per run when measuring the shortlist
 FLIP_ROWS = 160  # adversary_flips' rows per run: every circuit's restarts at every budget (8 x 5 x 4) together
+INTERCHANGE_DRAWS = 16  # C's interchange draws per circuit
+CHANGED_DRAWS = 16  # C's changed texts per circuit
 INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
 # offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
@@ -134,8 +136,9 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
     [[upstream, downstream], ...], "explanation": str}; an edge end is a node's place in the list, downstream "out" for
     the prediction; a matrix is native's name or "L.kind" (kind q, k, v, o, fc, down), or "tok" for the token
     embedding at the position (index 0), which feeds residual readers at its position (Graph.tok_edges: (position,
-    reader)). Nodes outside the model or the text, and edges the model does not have (mech.connects), are dropped and
-    counted."""
+    reader)), and "variables" (variables.parse's form, kept as g.variables for the E4 hook). Nodes outside the model or
+    the text, edges the model does not have (mech.connects), and variables naming a part outside the model are dropped
+    and counted."""
     nodes, bad_nodes = [], 0
     for m, c, t in answer.get("nodes", []):
         if m == "tok":
@@ -177,31 +180,65 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
                      list(dict.fromkeys(out)))
     g.tok_edges = list(dict.fromkeys(tok))
     g.tok_positions = sorted({nd[1] for nd in nodes if nd is not None and nd[0] == "tok"})
+    g.variables, bad_variables = [], 0
+    if answer.get("variables"):
+        import variables  # (it imports this module)
+        for v in answer["variables"]:
+            try:
+                g.variables += variables.parse([v], C)
+            except (ValueError, KeyError, TypeError, IndexError):
+                bad_variables += 1
     g = strand(g, targets, C)
-    return g, {"invalid_nodes": bad_nodes, "invalid_edges": bad_edges, "stranded_nodes": len(g.stranded)}
+    return g, {"invalid_nodes": bad_nodes, "invalid_edges": bad_edges, "stranded_nodes": len(g.stranded),
+               "invalid_variables": bad_variables}
 
 
 def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
-    """A stated graph without its stranded nodes: a node other than a query or key (those act through the attention
-    pattern) with no stated connection to another node or to the prediction does nothing in the stated graph's run, yet
-    would earn credit in the runs with every connection restored (wiring, N) by cancelling what the stated graph cuts
-    (the lead's decision, 10-12). They are dropped before every family, with any embedding edge into them; their bits
-    stay charged in size (stranded_bits, which size_bits adds). g.stranded lists them. A complete graph is unchanged."""
+    """A stated graph without its stranded nodes, those with no stated path to the prediction: they do nothing in the
+    stated graph's run, yet would earn credit in the runs with every connection restored (wiring, N) by cancelling what
+    the stated graph cuts (the lead's decisions 10-12; pymove: 122 of v3's 201 nodes on text9000 had a connection but
+    no path, an edge in only or a branch ending nowhere). A node other than a query or key needs a stated path to the
+    prediction; a query at t, an output node of its layer at t that has one; a key at p, an output node of its layer at
+    a position at or after p that has one (queries and keys act through the attention pattern); a kept query's or key's
+    stated writers are on a path through it. They are dropped before every family, with their connections and any
+    embedding edge into them; their bits stay charged in size (stranded_bits, which size_bits adds). g.stranded lists
+    them. A complete graph is unchanged. The answer's variables (g.variables) carry over."""
     if hasattr(g, "stranded"):  # already done (its record kept)
         return g
     if g.complete:
         g.stranded, g.stranded_bits = [], 0.0
         return g
-    linked = set(g.out) | {r for r, ws in g.parents.items() if ws} | {w for ws in g.parents.values() for w in ws}
-    gone = [nd for nd in sorted(g.node_set()) if nd not in linked
-            and native._name_layer_kind(nd[0])[1] not in ("q_proj", "k_proj")]
+    kind = {nd: native._name_layer_kind(nd[0]) for nd in g.node_set()}
+    reach, todo, through = set(), list(g.out), set()
+    while True:
+        while todo:
+            r = todo.pop()
+            if r in reach:
+                continue
+            reach.add(r)
+            todo += [w for w in g.parents.get(r, []) if w not in reach]
+        heads = {}  # layer -> the positions of its output nodes with a path to the prediction
+        for nd in reach:
+            if kind[nd][1] == "o_proj":
+                heads.setdefault(kind[nd][0], set()).add(nd[1])
+        qk = {nd for nd, (L, k) in kind.items() if (k == "q_proj" and nd[1] in heads.get(L, ()))
+              or (k == "k_proj" and any(t >= nd[1] for t in heads.get(L, ())))} - through
+        if not qk:
+            break
+        through |= qk
+        todo = [w for nd in qk for w in g.parents.get(nd, []) if w not in reach]
+    keep = reach | through
+    gone = [nd for nd in sorted(g.node_set()) if nd not in keep]
     if not gone:
         g.stranded, g.stranded_bits = [], 0.0
         return g
     drop = set(gone)
-    kept = native.Graph([nd for nd in g.nodes if nd not in drop], dict(g.parents), list(g.out))
+    kept = native.Graph([nd for nd in g.nodes if nd not in drop],
+                        {r: [w for w in ws if w not in drop] for r, ws in g.parents.items() if r not in drop}, list(g.out))
     kept.tok_edges = [(p, r) for p, r in getattr(g, "tok_edges", []) if r not in drop]
     kept.tok_positions = list(getattr(g, "tok_positions", []))
+    if hasattr(g, "variables"):
+        kept.variables = g.variables
     P, S = max(targets) + 1, sum(C.values())
     g.stranded_bits = 0.0
     kept.stranded, kept.stranded_bits = gone, 0.0
@@ -252,6 +289,12 @@ def _tok_pairs(g: native.Graph) -> tuple[list, list]:
     unstated = [(("tok", p, 0), r) for p in getattr(g, "tok_positions", []) for r in sorted(g.nodes)
                 if r[1] == p and native._name_layer_kind(r[0])[1] in mech.RESID_READERS and (("tok", p, 0), r) not in have]
     return stated, unstated
+
+
+def _transplant(base: torch.Tensor, moved: torch.Tensor, still: torch.Tensor) -> torch.Tensor:
+    """log_softmax(base + moved - still): a run's change from still to moved (log q on x' and on x) applied to base
+    (the model's log p on x), the target positions' distributions [B, targets, V]."""
+    return torch.log_softmax(base + moved - still, -1)
 
 
 def _fid(e0: float, kc: float, kv: float) -> float | None:
@@ -458,7 +501,7 @@ class GoalEval:
         self.nat = nat or native.Native()
         self.changes, self.ranks, self.share_floor = changes, tuple(ranks), share_floor
         self.random_pairs, self.max_edges, self.chunk, self.cut_chunk = random_pairs, max_edges, chunk, cut_chunk
-        self.hooks: dict = {"E1": None, "E2": None}
+        self.hooks: dict = {"E1": None, "E2": None, "E4": None}  # E4: fn(tx, graph, split) -> float or None (fidelity's e4)
         self.probes: dict = {}  # (ids, targets, seed) -> the changed prompts and F2's prompts, as int32 arrays
 
     def text(self, ids: list[int], targets: list[int], seed: int | None = None, task: dict | None = None) -> Text:
@@ -986,7 +1029,8 @@ class GoalEval:
 
     def fidelity(self, tx: Text, graphs: list[native.Graph], pool: dict | None = None, draws: int = DRAWS,
                  steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE, fresh: dict | None = None,
-                 interchange: int = 0, real: bool = False, reads: bool = False, mode: str = "full", changed: int = 0) -> list[dict]:
+                 interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
+                 changed: int = CHANGED_DRAWS, split: str | None = None) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -999,28 +1043,34 @@ class GoalEval:
         drawn uniformly, the prediction among them, with that probability, at least one, in the model, VPD's answer
         and the circuit alike, graph_ref), "adversary" (the paired
         adversary over the pool, adversary(): f1_adv at the budget, beside the random members' mean) and its budget in
-        parts switched on (adversary_flips, the omitted lever: f1_flips_omitted by m); c, the mean of s_point, s_nodes,
-        s_edges and f1_flips_c at FLIP_TERM, with s_point_c for s_point (the reward's adversarial member, the lead's decision 10-12; the
-        step-budget f1_adv is a reported column); flips_to_break, the smallest m at which f1_flips_omitted falls below
+        parts switched on (adversary_flips, the omitted lever: f1_flips_omitted by m), "interchange" (_interchange_family:
+        the circuit's nodes at one of its positions set to their values on a changed text, s_interchange) and "changed"
+        (changed_inputs: the circuit run on changed texts, bounded by its own unchanged answer, s_changed, with
+        context_share, s_track); c, the geometric mean of s_point_c, s_nodes, s_edges, f1_flips_c at FLIP_TERM (the
+        reward's adversarial member), s_track and s_interchange over those defined on the text (c_terms names them; the
+        claim is agreement under every family, so one failed family is not made up by the others: the lead's decisions
+        10-12; the step-budget f1_adv and s_changed are reported columns),
+        the last two on split's draws (default: "search", the teachers' draws, in the reward on training texts; "eval"
+        otherwise, and for any held-out text); e4: the E4 hook's score (its own reward term, not in c); flips_to_break, the smallest m at which f1_flips_omitted falls below
         half of s_point (None: not within FLIPS); flips_to_half, the smallest m at which it falls below 0.5, half of
         VPD's own answer under the same attack (0: below it unattacked), which a circuit weak to begin with cannot pass. reads: C's second observable, the circuit nodes' relative RMS read
         error between the model and the circuit per family (reads_*), and of their responses, each node's change from
         its own run without the intervention (dreads_*, _response_error; the static error mostly measures the missing
         background of a circuit's run); graph_ref,
-        slower). Evaluation only, never in the reward or a teacher's objective:
+        slower). interchange, changed: draws per circuit for those two families (0: left out of c). Evaluation only,
+        never in the reward or a teacher's objective:
         fresh, a pool none of the searches drew from: the pattern lever's flips over it (f1_flips_patterns_fresh);
-        interchange > 0: up to that many interchange draws of the eval split (_interchange_family, s_interchange; the
-        search split is the teachers', interchange_search); changed > 0: up to that many changed texts of the eval split
-        (changed_inputs: s_changed, context_share; the search split is changed_search); real: N_real (real_removal,
+        real: N_real (real_removal,
         n_real) and its adversary (necessity_flips, n_real_flips). leak: graph F1 of the circuit's nodes stating no
         edge (live remainders carrying their outputs to the prediction). mode="reward": the training family alone, what
-        the RL reward takes every step: point, nodes, edges with reads (on), and the flips up to FLIP_TERM (their
-        starts drawn as for every budget, so c is the full mode's); no step-budget adversary, larger budgets, fresh
-        pool, interchange, N_real or leak, and no flips_to_break / flips_to_half."""
+        the RL reward takes every step: point, nodes, edges with reads (on), the flips up to FLIP_TERM (their starts
+        drawn as for every budget), interchange and changed texts (so c is the full mode's on the same split); no
+        step-budget adversary, larger budgets, fresh pool, N_real or leak, and no flips_to_break / flips_to_half."""
         if mode not in ("full", "reward"):
             raise ValueError("mode is full or reward")
         graphs = [strand(g, tx.targets, self.nat.C) for g in graphs]  # stranded nodes dropped before every family
         reward = mode == "reward"
+        split = split or ("search" if reward else "eval")
         reads = reads or reward
         e0 = self._bounds(tx, "live")[0]
         sides = self._sides(tx, graphs) if reads else None
@@ -1035,9 +1085,9 @@ class GoalEval:
         flips = self.adversary_flips(tx, graphs, pool, "omitted", steps=steps, restarts=restarts,
                                      upto=FLIP_TERM if reward else None) if pool else none
         fresh_rows = self.adversary_flips(tx, graphs, fresh, "patterns", steps=steps, restarts=restarts) if fresh and not reward else none
-        inter = self._interchange_family(tx, graphs, interchange, reads=reads) if interchange and not reward else none
+        inter = self._interchange_family(tx, graphs, interchange, split=split, reads=reads) if interchange else none
         reals = self.real_removal(tx, graphs) if real and not reward else none
-        chg = self.changed_inputs(tx, graphs, "eval", changed) if changed and not reward else none
+        chg = self.changed_inputs(tx, graphs, split, changed) if changed else none
         nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real and not reward else none
         leak = none if reward else self.sufficiency(tx, [native.Graph(sorted(g.node_set()), {}, []) for g in graphs])
         out = []
@@ -1059,9 +1109,15 @@ class GoalEval:
             row["f1_flips_wiring"] = fw
             fc = {m: (min(v, fw[m]) if (m in fw and v is not None and fw[m] is not None) else v) for m, v in fg.items()}
             row["f1_flips_c"] = fc
-            terms = [row[k] for k in ("s_point_c", "s_nodes", "s_edges") if row.get(k) is not None]
-            terms += [fc[FLIP_TERM]] if fc.get(FLIP_TERM) is not None else []
-            row["c"] = sum(terms) / len(terms) if terms else None
+            if it:
+                row["s_interchange"] = _fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
+            row.update(chg[i])
+            named = [(k, row.get(k)) for k in ("s_point_c", "s_nodes", "s_edges")] + [("f1_flips_c", fc.get(FLIP_TERM))]
+            named += [(k, row.get(k)) for k in ("s_track", "s_interchange")]
+            row["c_terms"] = [k for k, v in named if v is not None]  # a family with nothing scored on the text is left out
+            terms = [v for _, v in named if v is not None]
+            row["c"] = math.prod(terms) ** (1 / len(terms)) if terms else None  # every family must agree: no compensation
+            row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") else None
             if not reward:  # (the reward's flips stop at FLIP_TERM)
                 half = 0.5 * row["s_point_c"] if row["s_point_c"] is not None else None
                 broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
@@ -1070,8 +1126,6 @@ class GoalEval:
                 row["flips_to_half"] = 0 if (row["s_point_c"] is not None and row["s_point_c"] < 0.5) else (below[0] if below else None)
             if fr:
                 row["f1_flips_patterns_fresh"] = fr["f1_flips_patterns"]
-            if it:
-                row["s_interchange"] = _fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
             if rr:
                 row["n_real"] = rr["n_real_live"]
             if reads:  # the reads' responses: each node's change from its own run without an intervention
@@ -1082,7 +1136,6 @@ class GoalEval:
                     row[f"dreads_{fam}"] = _response_error(pairs, base) if pairs else None
             for fam in ("nodes", "edges", "interchange"):
                 row.pop(f"_pairs_{fam}", None)
-            row.update(chg[i])
             out.append(row)
         return out
 
@@ -1514,8 +1567,14 @@ class GoalEval:
         KL_V the same for VPD's answer on the text (its base identities: a part switching on in x' is missing from both),
         and the bound KL0 = KL(model(x') || the circuit run on x), the circuit ignoring the change. Per prompt
         clip(ln(KL0 / KL_C) / ln(KL0 / KL_V), 0, 1) (none when VPD's answer is no nearer than KL0), pooled weighted by
-        KL(model(x') || model(x)). Per circuit: s_changed, kl_changed_c (KL_C, weighted the same), prompts_changed (those
-        scored), context_share (the share of the probe's moved at the circuit's positions) and draws_changed."""
+        KL(model(x') || model(x)): s_changed, a reported column (it carries the circuit's error on x, which F1 prices).
+        s_track, C's term and the teachers' (the lead's decision 10-12), the circuit's change alone: the circuit's move
+        from x to x' applied to the model's prediction on x (_transplant), the same for VPD's answer, scored
+        clip(ln(W / KL(model(x') || C's transplant)) / ln(W / KL(model(x') || VPD's)), 0, 1) with W = KL(model(x') ||
+        model(x)) the no-change bound (none when VPD's transplant is no nearer), pooled weighted by W: a circuit whose
+        prediction moves as the model's does scores 1 whatever its error on x. Per circuit: s_changed, kl_changed_c
+        (KL_C, weighted the same), prompts_changed (those scored), s_track, kl_track_c, prompts_track, context_share
+        (the share of the probe's moved at the circuit's positions) and draws_changed."""
         nat = self.nat
         graphs = [strand(g, tx.targets, nat.C) for g in graphs]
         moved = np.asarray(tx.moved, dtype=float)
@@ -1526,23 +1585,30 @@ class GoalEval:
         got = self._interchange_draws(tx, positions, split, draws, first={p: -moved[p - 1] for p in positions}) \
             if positions and tx.vpd is not None else []
         acc = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # sum of w s, of w, of w KL_C; prompts scored
+        trk = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # the same for s_track
         q0 = self._circuit_logq(tx.ids, tx.targets, graphs) if got else None
+        v0 = self.runs(tx.ids, tx.targets, [tx.vpd], True) if got else None
         for p, z in got:
             x = list(tx.ids)
             x[p] = z
             ref = nat.reference([x], tx.targets)
             w = float(carry.kl(ref, tx.ref)[0])
-            kv = float(carry.kl(ref, self.runs(x, tx.targets, [tx.vpd], True))[0])
-            kc = carry.kl(ref, self._circuit_logq(x, tx.targets, graphs)).tolist()
+            lv = self.runs(x, tx.targets, [tx.vpd], True)
+            lc = self._circuit_logq(x, tx.targets, graphs)
+            kv = float(carry.kl(ref, lv)[0])
+            kc = carry.kl(ref, lc).tolist()
             k0 = carry.kl(ref, q0).tolist()
+            tv = float(carry.kl(ref, _transplant(tx.ref, lv, v0))[0])
+            tc = carry.kl(ref, _transplant(tx.ref, lc, q0)).tolist()
             for b in range(len(graphs)):
-                sb = _fid(k0[b], kc[b], kv)
-                if sb is not None:
-                    a = acc[b]
-                    a[0], a[1], a[2], a[3] = a[0] + w * sb, a[1] + w, a[2] + w * kc[b], a[3] + 1
+                for a, sb, k in ((acc[b], _fid(k0[b], kc[b], kv), kc[b]), (trk[b], _fid(w, tc[b], tv), tc[b])):
+                    if sb is not None:
+                        a[0], a[1], a[2], a[3] = a[0] + w * sb, a[1] + w, a[2] + w * k, a[3] + 1
             native.free(nat.dev)
         return [{"s_changed": a[0] / a[1] if a[1] > 0 else None, "kl_changed_c": a[2] / a[1] if a[1] > 0 else None,
-                 "prompts_changed": a[3], "context_share": sh, "draws_changed": got} for a, sh in zip(acc, share)]
+                 "prompts_changed": a[3], "s_track": t[0] / t[1] if t[1] > 0 else None,
+                 "kl_track_c": t[2] / t[1] if t[1] > 0 else None, "prompts_track": t[3], "context_share": sh,
+                 "draws_changed": got} for a, t, sh in zip(acc, trk, share)]
 
     def changed_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16) -> list[dict]:
         """The teachers' changed-input family: changed_inputs on the search split alone (never a reward, gate or
@@ -1950,27 +2016,20 @@ class GoalEval:
         subset keeps, in the graph's order (its parents reader by reader, then its out list). The same numbers as
         adversary_flips on the K graphs of those connections, stranded nodes dropped (strand: each subset the claim
         fidelity scores), from one plan of graph at 0/1 strengths (kept on the text across calls) and the node set's
-        layout made once; a call with a subset that strands a node the whole graph links runs adversary_flips on the
-        subsets' graphs instead."""
-        base = strand(graph, tx.targets, self.nat.C)  # nodes no connection of graph touches: stranded in every subset
+        layout made once; a call with a subset that strands a node the whole graph keeps (no stated path left to the
+        prediction) runs adversary_flips on the subsets' graphs instead."""
+        base = strand(graph, tx.targets, self.nat.C)  # nodes no path of graph reaches the prediction from: stranded in every subset
         edges = [(w, r) for r, ws in base.parents.items() for w in ws] + [(w, None) for w in base.out]
         nodes = sorted(base.node_set())
-        at = {nd: i for i, nd in enumerate(nodes)}
-        ends = torch.zeros(len(edges), len(nodes))
-        for k_, (w, r) in enumerate(edges):
-            ends[k_, at[w]] = 1.0
-            if r is not None:
-                ends[k_, at[r]] = 1.0
-        need = torch.tensor([native._name_layer_kind(n)[1] not in ("q_proj", "k_proj") for n, _, _ in nodes])
-        if bool(((ons.cpu().float() @ ends == 0) & need).any()):  # a subset strands a node: its graph as stated
-            subs = []
-            for row in ons.tolist():
-                kept = [e for e, k_ in zip(edges, row) if k_]
-                parents = {}
-                for w, r in kept:
-                    if r is not None:
-                        parents.setdefault(r, []).append(w)
-                subs.append(strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, self.nat.C))
+        subs = []
+        for row in ons.tolist():
+            kept = [e for e, k_ in zip(edges, row) if k_]
+            parents = {}
+            for w, r in kept:
+                if r is not None:
+                    parents.setdefault(r, []).append(w)
+            subs.append(strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, self.nat.C))
+        if any(sub.stranded for sub in subs):  # a subset strands a node: its graph as stated
             return self.adversary_flips(tx, subs, pool, "omitted", ms=(m,), screens=screens, **kw)
         return self.adversary_flips(tx, [base] * len(ons), pool, "omitted", ms=(m,), screens=screens,
                                     strengths=ons.to(self.nat.dev, torch.float32), **kw)
@@ -2308,12 +2367,13 @@ def pattern(pool: dict, k: int) -> dict:
 
 def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws: int = DRAWS, vpd: Path | None = None,
                     offset: int = 0, stride: int = 1, fresh: Path | None = None, interchange: int = 16, curve=ADV_CURVE,
-                    log=print, changed: int = 16, only_changed: bool = False) -> list[dict]:
+                    log=print, changed: int = CHANGED_DRAWS, only: tuple = ()) -> list[dict]:
     """C on the split's first n texts for answer sets (sets: name -> a directory of <task>.json circuits, run as stated)
     and VPD's first k at each circuit's size (complete graphs), with the evaluation-only families (fresh: the pattern
     lever over a pool no search drew from; interchange draws; changed texts (changed_inputs' eval split); N_real); one
-    row per circuit appended to OUT (texts already there are skipped); only_changed: the changed-input family alone
-    (task, kind, nodes and its fields: a family added to rows already made, matched by task and kind). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
+    row per circuit appended to OUT (texts already there are skipped); only: some of ("changed", "interchange"), those
+    families alone on the eval split (task, kind, nodes and their fields: families added to rows already made, matched
+    by task and kind). curve: the step adversary's budgets reported. vpd: VPD's answers and orders saved by
     teacher.py --save-vpd (where the causal-importance network is not). Locality from a set's summary*.jsonl."""
     ge = GoalEval()
     nat = ge.nat
@@ -2351,10 +2411,16 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
         for k in sorted({g.count() for g in graphs}):
             graphs.append(native.Graph(order[:k], complete=True))
             kinds.append(f"VPD top {k}")
-        if only_changed:
+        if only:
+            e = ge._bounds(tx, "live")[0]
+            ch = ge.changed_inputs(tx, graphs, "eval", changed) if "changed" in only else [{} for _ in graphs]
+            it = ge._interchange_family(tx, graphs, interchange, split="eval") if "interchange" in only else [{} for _ in graphs]
             with open(out, "a") as fh:
-                for kind, g, c in zip(kinds, graphs, ge.changed_inputs(tx, graphs, "eval", changed)):
-                    row = {"task": p.stem, "kind": kind, "nodes": g.count(), **{k: c[k] for k in ("s_changed", "context_share", "prompts_changed")}}
+                for kind, g, c, i in zip(kinds, graphs, ch, it):
+                    row = {"task": p.stem, "kind": kind, "nodes": g.count(),
+                           **{k: c[k] for k in ("s_changed", "s_track", "context_share", "prompts_changed", "prompts_track") if k in c}}
+                    if i:
+                        row["s_interchange"] = _fid(e, i["kl_interchange_c"], i["kl_interchange_vpd"])
                     rows.append(row)
                     fh.write(json.dumps(row) + "\n")
             if log:
@@ -2440,7 +2506,8 @@ def fidelity_table(rows: list[dict]) -> str:
     held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
     held += [("N_real", lambda r: r.get("n_real")), ("N_real ceiling", lambda r: r.get("n_real_ceiling")),
              ("act/inact cos", lambda r: r.get("cancel_cosine")), ("C", lambda r: r.get("c")),
-             ("changed inputs", lambda r: r.get("s_changed")), ("context share", lambda r: r.get("context_share"))]
+             ("tracks changes", lambda r: r.get("s_track")), ("changed inputs", lambda r: r.get("s_changed")),
+             ("context share", lambda r: r.get("context_share"))]
     nflips = sorted({int(m) for r in rows for m in r.get("n_real_flips", {}) if int(m) > 0})
     held += [(f"N_real flip{m}", lambda r, m=m: _curve_value(r.get("n_real_flips"), m)) for m in nflips]
     held += [(f"response err {f}", lambda r, f=f: r.get(f"dreads_{f}")) for f in ("nodes", "edges", "interchange")]
@@ -2477,7 +2544,7 @@ def main():
     f.add_argument("--fresh", type=Path, help="a pattern pool no search drew from (evaluation only)")
     f.add_argument("--interchange", type=int, default=16)
     f.add_argument("--changed", type=int, default=16, help="changed texts per circuit (changed_inputs' eval split)")
-    f.add_argument("--only-changed", action="store_true", help="the changed-input family alone (rows to merge by task and kind)")
+    f.add_argument("--only", default="", help="changed,interchange: those families alone, eval split (rows to merge by task and kind)")
     f.add_argument("--curve", default=",".join(str(x) for x in ADV_CURVE), help="the step adversary's budgets, e.g. 0,4,20,40,80,160,320")
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--draws", type=int, default=DRAWS)
@@ -2492,8 +2559,8 @@ def main():
     if args.cmd == "fidelity":
         fidelity_report(args.split, args.n, dict(x.split("=", 1) for x in args.set), args.pool, args.out, args.draws, args.vpd,
                         args.offset, args.stride, args.fresh, args.interchange, tuple(int(x) for x in args.curve.split(",")),
-                        changed=args.changed, only_changed=args.only_changed)
-        if args.only_changed:
+                        changed=args.changed, only=tuple(x for x in args.only.split(",") if x))
+        if args.only:
             return
         print(fidelity_table([json.loads(x) for x in args.out.read_text().splitlines() if x.strip()]), flush=True)
         return

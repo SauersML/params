@@ -387,7 +387,8 @@ def test_circuit_json_round_trip_and_defects(tiny):
     g = random_graph(nat, tx, 31, k=12)
     back, defects = goal_eval.circuit(goal_eval.to_json(g), tx.targets, nat.C, tx.T)
     kept = goal_eval.strand(random_graph(nat, tx, 31, k=12), tx.targets, nat.C)
-    assert back.nodes == kept.nodes and defects == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": len(kept.stranded)}
+    assert back.nodes == kept.nodes and defects == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": len(kept.stranded),
+                                                    "invalid_variables": 0}
     assert sorted(goal_eval._pairs(back)) == sorted(goal_eval._pairs(g))
     bad = {"nodes": [["h.0.attn.o_proj", 1, 3], ["1.q", 2, 5], ["h.9.attn.q_proj", 0, 0], ["0.down", 0, 3], ["1.q", 2, 3],
                      ["tok", 0, 3], ["tok", 1, 3]],
@@ -395,14 +396,47 @@ def test_circuit_json_round_trip_and_defects(tiny):
     g2, d = goal_eval.circuit(bad, tx.targets, nat.C, tx.T)
     # another position, not at a target, a query writes nothing, an unknown matrix, no such node; a valid edge; the
     # embedding into a query at its position; into an attention output and into the prediction (not residual readers)
-    # the attention output at 3 has no stated connection: stranded (the query at 5 has none either, but queries act
-    # through the pattern)
-    assert d == {"invalid_nodes": 2, "invalid_edges": 8, "stranded_nodes": 1} and g2.stranded == [("h.0.attn.o_proj", 3, 1)]
-    assert g2.parents == {("h.1.attn.q_proj", 3, 2): [("h.0.mlp.down_proj", 3, 0)]} and g2.out == []
-    assert len(g2.nodes) == 3 and g2.tok_edges == [(3, ("h.1.attn.q_proj", 3, 2))]
-    again, d2 = goal_eval.circuit(goal_eval.to_json(g2), tx.targets, nat.C, tx.T)
-    assert again.tok_edges == g2.tok_edges and d2 == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0}
+    # nothing has a stated path to the prediction: the four valid nodes are stranded, the embedding edge with them
+    assert d == {"invalid_nodes": 2, "invalid_edges": 8, "stranded_nodes": 4, "invalid_variables": 0}
+    assert set(g2.stranded) == {("h.0.attn.o_proj", 3, 1), ("h.0.mlp.down_proj", 3, 0), ("h.1.attn.q_proj", 3, 2),
+                                ("h.1.attn.q_proj", 5, 2)} and not g2.nodes and g2.tok_edges == []
+    # a query whose head's output reaches the prediction keeps its writer and the embedding at its position
+    ok = {"nodes": [["1.q", 2, 11], ["0.down", 0, 11], ["tok", 0, 11], ["1.o", 0, 11]], "edges": [[1, 0], [2, 0], [3, "out"]],
+          "variables": [{"name": "v", "inputs": [3], "group": [["0.down", 0, 11]], "feeds": ["prediction"]},
+                        {"name": "w", "inputs": [3], "group": [["h.9.attn.q_proj", 0, 11]], "feeds": []}]}
+    g3, d3 = goal_eval.circuit(ok, tx.targets, nat.C, tx.T)
+    q = ("h.1.attn.q_proj", 11, 2)
+    assert d3 == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 1}
+    assert g3.parents == {q: [("h.0.mlp.down_proj", 11, 0)]} and g3.out == [("h.1.attn.o_proj", 11, 0)]
+    assert g3.tok_edges == [(11, q)] and [v["name"] for v in g3.variables] == ["v"]
+    again, d2 = goal_eval.circuit(goal_eval.to_json(g3), tx.targets, nat.C, tx.T)
+    assert again.tok_edges == g3.tok_edges and d2 == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 0}
 
+
+
+def test_strand_keeps_paths_to_the_prediction(tiny):
+    """strand: a node other than a query or key stays only with a stated path to the prediction (a dead-end branch and
+    an edge in only are dropped); a query stays with an output node of its layer at its position on a path, a key with
+    one at or after its position, and a kept query's writers stay; the dropped nodes' bits stay charged."""
+    nat, ge, tx = tiny
+    m = lambda L, k, t, c=0: (f"h.{L}.mlp.{k}" if k in ("c_fc", "down_proj") else f"h.{L}.attn.{k}", t, c)  # noqa: E731
+    a, b, c = m(0, "down_proj", 2), m(1, "c_fc", 2), m(1, "down_proj", 2)
+    d = m(1, "c_fc", 2, 1)  # an edge in only
+    e, f = m(0, "c_fc", 1), m(0, "down_proj", 1)  # a branch ending nowhere
+    o = m(1, "o_proj", 9)
+    q9, q8, k3, k10 = m(1, "q_proj", 9), m(1, "q_proj", 8), m(1, "k_proj", 3), m(1, "k_proj", 10)
+    w = m(0, "down_proj", 9, 1)  # writes into the kept query
+    q0 = m(0, "q_proj", 9)  # its layer has no output node on a path
+    nodes = [a, b, c, d, e, f, o, q9, q8, k3, k10, w, q0]
+    g = native.Graph(nodes, {b: [a], c: [b], d: [a], f: [e], q9: [w]}, [c, o])
+    kept = goal_eval.strand(g, tx.targets, nat.C)
+    assert set(kept.stranded) == {d, e, f, q8, k10, q0}
+    assert set(kept.node_set()) == {a, b, c, o, q9, k3, w}
+    assert kept.parents == {b: [a], c: [b], q9: [w]} and kept.out == [c, o]
+    P, S = max(tx.targets) + 1, sum(nat.C.values())
+    whole = native.Graph(nodes, {b: [a], c: [b], d: [a], f: [e], q9: [w]}, [c, o])
+    whole.stranded, whole.stranded_bits = [], 0.0
+    assert abs(goal_eval.size_bits(kept, P, S, tx.targets) - goal_eval.size_bits(whole, P, S, tx.targets)) < 1e-6
 
 def test_probe_is_kept(tiny):
     """A text's changed prompts and F2 prompts come from one sensitivity probe, kept per text: a second preparation
@@ -504,13 +538,16 @@ def test_embedding_edges_priced_and_cut(tiny):
     answer = {"nodes": [[n, c, t] for n, t, c in nodes] + [["tok", 0, p]],
               "edges": [[5, 0], [5, 2], [3, 2]]}
     g, d = goal_eval.circuit(answer, tx.targets, nat.C, tx.T)
-    # the value at 7 has no stated connection (an embedding edge is not one): stranded, its bits still charged
-    assert d == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 1} and g.tok_positions == [p] and len(g.tok_edges) == 2
+    # no node has a stated path to the prediction (an embedding edge is not one): all stranded, their bits still charged
+    assert d == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 5, "invalid_variables": 0}
+    assert g.tok_positions == [p] and g.tok_edges == [] and not g.nodes
     P, S = nat.positions(tx.targets), sum(nat.C.values())
     want = 5 * math.log2(P * S) + math.log2(P) + math.log2(6) * (2 * (1 + 2) + 0)
     assert abs(goal_eval.size_bits(g, P, S, tx.targets) - want) < 1e-9
+    nodes = nodes[:4]  # F3, a diagnostic of stated edges, on the graph as stated (strand not applied)
+    g = native.Graph(nodes, {nodes[2]: [nodes[3]]}, [])
+    g.tok_edges, g.tok_positions, g.stranded, g.stranded_bits = [(p, nodes[0]), (p, nodes[2])], [p], [], 0.0
     assert goal_eval.size_bits(native.Graph(g.nodes, g.parents, g.out), P, S, tx.targets) == native.Graph(g.nodes, g.parents, g.out).bits(P, S, tx.targets)
-    nodes = nodes[:4]
     stated, unstated = goal_eval._tok_pairs(g)
     assert [r for _, r in stated] == [nodes[0], nodes[2]] and [r for _, r in unstated] == [nodes[1]]
     on = mask_of(nat, tx.T, g.nodes)
@@ -1045,17 +1082,26 @@ def test_cutting_an_off_writer_changes_nothing(tiny):
 
 
 def test_fidelity_reward_mode_is_the_full_modes_training_family(tiny):
-    """fidelity(mode="reward") gives the full mode's point, node and edge families, reads and the flips up to FLIP_TERM
-    (the same starts) and their c, without the evaluation-only columns."""
+    """fidelity(mode="reward") gives the full mode's point, node and edge families, reads, the flips up to FLIP_TERM
+    (the same starts), interchange and changed texts on the same split, and their c, without the evaluation-only
+    columns; the reward's split is search, the full mode's eval; c is the geometric mean of its six terms."""
     nat, ge, tx = tiny
     nodes = sorted(native.Graph(masks=tx.vpd).node_set())
     graphs = [native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets)), native.Graph(nodes[1::4], complete=True)]
     pool = tiny_pool(nat, tx.ids)
-    full = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, reads=True)
-    rew = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, mode="reward")
-    for a, b in zip(full, rew):
-        for key in ("s_point", "s_nodes", "s_edges", "reads_nodes", "reads_edges", "dreads_nodes", "dreads_edges", "c"):
+    full = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, reads=True, interchange=4, changed=4, split="search")
+    rew = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, mode="reward", interchange=4, changed=4)
+    ev = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, interchange=4, changed=4)
+    for i, (a, b, e) in enumerate(zip(full, rew, ev)):
+        for key in ("s_point", "s_nodes", "s_edges", "reads_nodes", "reads_edges", "dreads_nodes", "dreads_edges",
+                    "s_changed", "s_track", "s_interchange", "c"):
             assert (a[key] is None) == (b[key] is None) and (a[key] is None or abs(a[key] - b[key]) < 1e-6), key
+        terms = [b[k] for k in ("s_point_c", "s_nodes", "s_edges", "s_track", "s_interchange") if b[k] is not None]
+        terms += [b["f1_flips_c"][goal_eval.FLIP_TERM]]
+        assert len(terms) == 6 and len(b["c_terms"]) == 6 and abs(b["c"] - math.prod(terms) ** (1 / 6)) < 1e-9
+        assert b["draws_changed"] == ge.changed_search(tx, [graphs[i]], draws=4)[0]["draws_changed"]
+        assert not set(map(tuple, e["draws_changed"])) & set(map(tuple, b["draws_changed"]))
+        assert b["e4"] is None
         assert set(b["f1_flips_omitted"]) == {m for m in goal_eval.FLIPS["omitted"] if m <= goal_eval.FLIP_TERM}
         for m, v in b["f1_flips_omitted"].items():
             assert abs(v - a["f1_flips_omitted"][m]) < 1e-6
@@ -1105,20 +1151,11 @@ def test_edge_flips_are_adversary_flips_on_the_subsets(tiny):
     off) through the subsets' graphs."""
     nat, ge, tx = tiny
     nodes = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
-    par, out = native.all_edges(nodes, tx.targets)
-    full = native.Graph(nodes, par, out)
-    edges = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in out]
-    linked = sorted({nd for e in edges for nd in e if nd is not None})
-    plain = [nd for nd in linked if native._name_layer_kind(nd[0])[1] not in ("q_proj", "k_proj")]
+    full = goal_eval.strand(native.Graph(nodes, *native.all_edges(nodes, tx.targets)), tx.targets, nat.C)
+    nodes = sorted(full.node_set())
+    edges = [(w, r) for r, ws in full.parents.items() for w in ws] + [(w, None) for w in full.out]
+    plain = [nd for nd in nodes if native._name_layer_kind(nd[0])[1] not in ("q_proj", "k_proj")]
     assert plain, "the tiny node set needs a node a subset can strand"
-    g = torch.Generator().manual_seed(3)
-    ons = torch.rand(5, len(edges), generator=g) < 0.6
-    ons[0] = True
-    for nd in linked:  # every subset keeps one connection of every linked node: none stranded
-        ks = [k for k, e in enumerate(edges) if nd in e]
-        ons[torch.arange(5), torch.tensor(ks)[torch.randint(len(ks), (5,), generator=g)]] = True
-    strands = ons.clone()
-    strands[2, [k for k, e in enumerate(edges) if plain[0] in e]] = False
 
     def subsets(rows):
         subs = []
@@ -1131,6 +1168,16 @@ def test_edge_flips_are_adversary_flips_on_the_subsets(tiny):
             subs.append(goal_eval.strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, nat.C))
         return subs
 
+    g = torch.Generator().manual_seed(3)
+    ons = torch.ones(5, len(edges), dtype=torch.bool)
+    for i in range(1, 5):  # connections dropped in a random order while every node keeps a path: none stranded
+        for k in torch.randperm(len(edges), generator=g).tolist():
+            if float(torch.rand(1, generator=g)) < 0.6:
+                ons[i, k] = False
+                if subsets(ons[i:i + 1])[0].stranded:
+                    ons[i, k] = True
+    strands = ons.clone()
+    strands[2, [k for k, e in enumerate(edges) if plain[0] in e]] = False
     assert not subsets(ons)[1].stranded and plain[0] in subsets(strands)[2].stranded
     pool = tiny_pool(nat, tx.ids)
     tx.__dict__.pop("_adv", None)
@@ -1224,19 +1271,36 @@ def test_changed_inputs(tiny):
     moved = tx.moved
     want = sum(moved[t - 1] for t in {t for _, t, _ in sub} if t > 0) / moved.sum()
     assert abs(row["context_share"] - want) < 1e-9
-    sw = sws = 0.0
+    sw = sws = tw = tws = 0.0
+    lc0, lv0 = ge.graph_ref(tx.ids, tx.targets, g), ge.runs(tx.ids, tx.targets, [tx.vpd], True)
     for p, z in row["draws_changed"]:
         x = list(tx.ids)
         x[p] = z
         ref = nat.reference([x], tx.targets)
-        kc = float(carry.kl(ref, ge.graph_ref(x, tx.targets, g))[0])
-        k0 = float(carry.kl(ref, ge.graph_ref(tx.ids, tx.targets, g))[0])
-        kv = float(carry.kl(ref, ge.runs(x, tx.targets, [tx.vpd], True))[0])
+        lc, lv = ge.graph_ref(x, tx.targets, g), ge.runs(x, tx.targets, [tx.vpd], True)
+        kc, k0, kv = (float(carry.kl(ref, q)[0]) for q in (lc, lc0, lv))
         w = float(carry.kl(ref, tx.ref)[0])
         s = goal_eval._fid(k0, kc, kv)
         if s is not None:
             sw, sws = sw + w * s, sws + w
+        moved = lambda a, b: torch.log_softmax(tx.ref + a - b, -1)  # noqa: E731
+        t = goal_eval._fid(w, float(carry.kl(ref, moved(lc, lc0))[0]), float(carry.kl(ref, moved(lv, lv0))[0]))
+        if t is not None:
+            tw, tws = tw + w * t, tws + w
     assert row["s_changed"] is None if sws == 0 else abs(row["s_changed"] - sw / sws) < 1e-4, (row["s_changed"], sw / max(sws, 1e-12))
+    assert row["s_track"] is None if tws == 0 else abs(row["s_track"] - tw / tws) < 1e-4, (row["s_track"], tw / max(tws, 1e-12))
+    assert rv["s_track"] is None or abs(rv["s_track"] - 1.0) < 1e-6
+
+
+def test_transplant_scores_a_circuit_that_moves_as_the_model_does():
+    """s_track's transplant: a circuit whose log q moves from x to x' as the model's log p does lands on the model's
+    prediction on x' (KL 0, score 1) whatever its own error on x; one that does not move stays at the model's on x."""
+    g = torch.Generator().manual_seed(3)
+    px, px2 = torch.log_softmax(torch.randn(1, 2, 30, generator=g), -1), torch.log_softmax(torch.randn(1, 2, 30, generator=g), -1)
+    off = torch.randn(1, 2, 30, generator=g) * 2  # the circuit's own error on both texts
+    qx, qx2 = torch.log_softmax(px + off, -1), torch.log_softmax(px2 + off, -1)
+    assert float(carry.kl(px2, goal_eval._transplant(px, qx2, qx))[0]) < 1e-5
+    assert abs(float(carry.kl(px2, goal_eval._transplant(px, qx, qx))[0]) - float(carry.kl(px2, px)[0])) < 1e-5
 
 def test_response_error():
     base = {("a", 0, 0): (1.0, 5.0), ("b", 0, 0): (0.0, 0.0)}
@@ -1344,7 +1408,8 @@ def test_c_takes_the_lower_of_graph_and_every_connection(tiny):
         assert abs(f - goal_eval._fid(e0, kc, row["kl_flips_omitted"][m][1])) < 1e-6
         assert row["f1_flips_c"][m] == min(row["f1_flips_omitted"][m], f)
     terms = [row["s_point_c"], row["s_nodes"], row["s_edges"], row["f1_flips_c"][goal_eval.FLIP_TERM]]
-    assert abs(row["c"] - sum(terms) / 4) < 1e-12
+    terms += [row[k] for k in ("s_track", "s_interchange") if row[k] is not None]
+    assert abs(row["c"] - math.prod(terms) ** (1 / len(terms))) < 1e-12
 
 
 def test_stranded_nodes_are_dropped_and_charged(tiny):

@@ -2490,3 +2490,38 @@ def test_line_effects_pp_engine(tiny):
     for r, h in checks:
         want = pooled(h) - base
         assert abs(r["delta_kl"] - want) <= 1e-4 * (1 + abs(want)), (r, want)
+
+
+def test_pp_families_of_line_deletions(tiny, monkeypatch):
+    """track_pp and interchange_pp with lines= (an answer's line deletions in one call, nothing re-stranded) give per
+    variant the family's rows on graph_of_lines' graph of it: every draw's KL_C, KL_V and W within 1e-4, for node,
+    connection, token-edge and pair deletions, and every node at a position (interchange's draws then the variant's
+    own)."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    g = torch.Generator().manual_seed(17)
+    gr = goal_eval.strand(_pp_stated(_pp_nodes(every, g, 0.15, blocks=0.03), tx.targets, g, keep=0.7), tx.targets, nat.C)
+    cols = ge._pp_engine(tx).pp_lines(gr)
+    kinds = {}
+    for j, k in enumerate(cols):
+        kinds.setdefault(k[0], []).append(j)
+    pick = [js[len(js) // 3] for js in kinds.values()] + [js[-1] for js in kinds.values()]
+    assert "p" in kinds and "t" in kinds
+    lines = torch.ones(2 + len(pick), len(cols))
+    lines[torch.arange(1, 1 + len(pick)), torch.tensor(pick)] = 0
+    at = {}
+    for j in kinds["n"]:
+        at.setdefault(cols[j][1][1], []).append(j)
+    fewest = min((t for t in at if t > 0), key=lambda t: len(at[t]))
+    lines[-1, at[fewest]] = 0  # every node at a position: the variant's draws are its own
+    variants = [goal_eval.graph_of_lines(gr, cols, row) for row in lines]
+    monkeypatch.setattr(goal_eval, "strand", lambda h, *a, **k: h)
+    close = lambda a, b: abs(a - b) <= 1e-4 * (1 + abs(b))  # noqa: E731
+    for fam, key in ((ge.track_pp, "draws_track_pp"), (ge.interchange_pp, "draws_interchange_pp")):
+        got, want = fam(tx, [gr], "search", 6, lines=lines), fam(tx, variants, "search", 6)
+        assert len(got) == len(want) == len(variants)
+        for a, b in zip(got, want):
+            assert len(a[key]) == len(b[key])
+            for x, y in zip(a[key], b[key]):
+                assert x[0] == y[0] and all(close(u, v) for u, v in zip(x[1:], y[1:])), (key, x, y)
+        assert sum(len(r[key]) for r in got) > 0

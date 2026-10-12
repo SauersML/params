@@ -4,7 +4,7 @@ distribution at the targets from the run's, differentiable in the masks. It serv
 respect to masks (the teacher's mask search, the reward's adversary), batched over rows (samples x patterns x
 answers x restarts), on any GPU.
 
-  eng = Engine(nat, ids, targets, live=True, columns=None)
+  eng = Engine(nat, ids, targets, live=True, columns=None, compile=False)
   eng.kl(masks, precision="score") -> [B] bits
 
 columns: per site the subcomponent indices masks address (a LongTensor), every other one off in every run; None, every
@@ -13,7 +13,9 @@ products then run on those columns alone (a sum over fewer terms: float32-close 
 the bit). masks: {site: [B, T, K]} floats (K = the site's columns), with or without gradients.
 precision: "score", float32 with vpd_model's own norms and GELU (the numbers to report); "tf32" (CUDA: TF32 tensor-core
 matmuls) and "bf16" (bfloat16 autocast), with torch's fused norms and GELU, for a search's steps only, whose result is
-then scored again with "score" (engine.rescore checks that).
+then scored again with "score" (engine.rescore checks that). compile: the search precisions' forward under
+torch.compile (one graph per batch size: keep B fixed in a search; on an RTX A5000 bf16 forward+backward 76 -> 48 ms
+at B = 32); "score" stays eager.
 """
 from __future__ import annotations
 
@@ -29,7 +31,8 @@ PRECISIONS = ("score", "tf32", "bf16")
 
 
 class Engine:
-    def __init__(self, nat: native.Native, ids: list[int], targets: list[int], live: bool = True, columns: dict | None = None):
+    def __init__(self, nat: native.Native, ids: list[int], targets: list[int], live: bool = True, columns: dict | None = None,
+                 compile: bool = False):
         import vpd_model
 
         self.nat, self.ids, self.targets, self.live = nat, list(ids), list(targets), live
@@ -47,6 +50,7 @@ class Engine:
             self.V[n] = st.V if cols is None else st.V.index_select(1, cols).contiguous()  # [d_in, K]
             self.U[n] = st.U if cols is None else st.U.index_select(0, cols).contiguous()  # [K, d_out]
             self.R[n] = st.delta_T  # [d_in, d_out]: the remainder W - V U, transposed (native.model)
+        self._search = torch.compile(self.hidden, dynamic=False) if compile else self.hidden
 
     def width(self, n: str) -> int:
         """The number of a site's columns (a mask's last dimension)."""
@@ -83,7 +87,7 @@ class Engine:
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         with _precision(precision, self.dev):
-            h = self.hidden(masks, fused=precision != "score")
+            h = self.hidden(masks, fused=False) if precision == "score" else self._search(masks, fused=True)
             lq = torch.log_softmax((h @ self.tg.wte.T).float(), -1)
         return carry.kl(self.ref, lq)
 

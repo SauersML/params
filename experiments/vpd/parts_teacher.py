@@ -83,12 +83,13 @@ def main():
     ap.add_argument("teacher", nargs="?", type=Path, default=Path.home() / "mpd-data/graph_oracle/teacher/vpd_f1_heldout")
     ap.add_argument("--parts", type=Path, default=Path.home() / "mpd-data/atlas/vpd4l/parts")
     ap.add_argument("--out", type=Path)
+    ap.add_argument("--device", help="torch device (native.device() otherwise; cpu when the GPU is busy)")
     args = ap.parse_args()
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B", local_files_only=True)
     parts = Parts(args.parts)
     names = numbering(parts)
-    ge = goal_eval.GoalEval()
+    ge = goal_eval.GoalEval(native.Native(args.device))
     nat = ge.nat
     paths = {p.stem: p for p in native.tasks("heldout")}
     rows = []

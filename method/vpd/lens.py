@@ -24,8 +24,13 @@ The J++ lens (Ayonrinde and Lindsey 2026, "J++ Lens: Jacobian Filtering Enables 
             holds no vocabulary-sized arrays;
   readout   tokens with at least one letter or digit (the paper's non-semantic filter), among those split A holds at
             least atlas.MIN_COUNT times.
-Also reported: the pooled LRP Jacobian (all clusters weighted by their sources: the R-lens), the J++ lens without its
-token filter is the same map read over every token.
+Also reported: the pooled LRP Jacobian (all clusters weighted by their sources: the R-lens) and the routed lens (each
+sample read through its own cluster's expert, its residual at the point assigned by the router: the paper's k-means
+routing, which needs no labels). Every lens is read over the same tokens twice: the readout tokens above, and every
+token split A holds at least atlas.MIN_COUNT times (no token filter), so the filter's gain and the Jacobian's separate.
+The J++ weights are supervised (fitted to our measured effects on the dev half); the logit, pooled and routed lenses
+use no labels. c_fc and down_proj of the last layer write at out_3, the final residual, where every lens is the logit
+lens (J = I): their rows are identical by construction.
 
 Benchmark. The atlas's effect samples on the evaluation half (split B rows 5500..5999), recomputed exactly
 (atlas.row_logprobs: the write removed at that row only): per sample the Pearson correlation over the readout tokens
@@ -223,8 +228,10 @@ def evaluate(args):
     b0, b1 = meta["heldout_rows"] if not args.rows else [int(x) for x in args.rows.split(":")]
     V = target.wte.shape[0]
     train = tokens_of(a0, a1, args.tokens)
-    seen = torch.bincount(train.reshape(-1), minlength=V) >= MIN_COUNT
-    sel = (seen & semantic_tokens(V)).to(dev)
+    seen = (torch.bincount(train.reshape(-1), minlength=V) >= MIN_COUNT).to(dev)
+    sel = seen & semantic_tokens(V).to(dev)
+    in_seen = sel[seen]  # the readout tokens among the seen ones
+    routers = {p: Router(*(x.to(dev) for x in saved["routers"][p])) for p in POINTS}
     pooled = {p: (saved["J"][p].double().sum(0) / saved["n"][p].sum()).float().to(dev) for p in POINTS}
     expert = {p: (saved["J"][p] / saved["n"][p].clamp_min(1)[:, None, None]).float().to(dev) for p in POINTS}  # [E, d, d]
     off = dict(zip(names, np.concatenate([[0], np.cumsum([meta["counts"][n] for n in names])])[:-1].tolist()))
@@ -236,9 +243,13 @@ def evaluate(args):
     mid = (b0 + b1) // 2
     gf = target.ln_f
 
-    def readout(Jm, r):  # [E?, d, d] x [N, d] -> [.., N, V] restricted to sel
+    def readout(Jm, r, tokens=sel):  # [E?, d, d] x [N, d] -> [.., N, V] restricted to tokens
         y = r if Jm is None else (r @ Jm.transpose(-1, -2))
-        return ((y * gf) @ target.wte.T)[..., sel]
+        return ((y * gf) @ target.wte.T)[..., tokens]
+
+    def routed(p, r, h):  # each sample through its own cluster's expert: [N, d] -> [N, V'] over the seen tokens
+        Jn = expert[p][routers[p](h)]  # [N, d, d]
+        return ((torch.einsum("nij,nj->ni", Jn, r) * gf) @ target.wte.T)[..., seen]
 
     stats = {p: [] for p in POINTS}
     metrics = {}
@@ -249,7 +260,9 @@ def evaluate(args):
             want = (rows >= r0) & (rows < min(r0 + args.batch, b1)) & ((rows < mid) if phase == "dev" else (rows >= mid))
             if not want.any():
                 continue
-            cache = clean_cache(target, held[r0 - b0:r0 - b0 + args.batch].to(dev))
+            ids = held[r0 - b0:r0 - b0 + args.batch].to(dev)
+            cache = clean_cache(target, ids)
+            pts = forward_points(target, ids, lrp=False)[1] if phase == "eval" else None
             cs, ks = want.nonzero(as_tuple=True)
             for si, name in enumerate(names):
                 layer, kind = int(name.split(".")[1]), name.rsplit(".", 1)[1]
@@ -267,20 +280,23 @@ def evaluate(args):
                     b = (rows[cc, kk] - r0).long().to(dev)
                     q = pos[cc, kk].long().to(dev)
                     a = (cache["site_in"][(layer, kind)][b, q] * st.V[:, j].T).sum(-1)
-                    contrib = (cache["logp"][b, q] - row_logprobs(target, cache, b, q, layer, kind, -a[:, None] * st.U[j]))[:, sel]
+                    full = cache["logp"][b, q] - row_logprobs(target, cache, b, q, layer, kind, -a[:, None] * st.U[j])
                     r = dirs[j]
                     if phase == "dev":
                         P = a[:, None, None] * readout(expert[p], r).transpose(0, 1)  # [N, E, V']
-                        stats[p].append([x.cpu() for x in pearson_stats(P.float(), contrib.float())])
-                    else:
-                        preds = {"logit": a[:, None] * readout(None, r), "pooled": a[:, None] * readout(pooled[p], r),
-                                 "jpp": a[:, None] * readout(weighted[p], r)}
-                        for lens_name, pr in preds.items():
-                            pc, ccn = pr - pr.mean(-1, keepdim=True), contrib - contrib.mean(-1, keepdim=True)
+                        stats[p].append([x.cpu() for x in pearson_stats(P.float(), full[:, sel].float())])
+                        continue
+                    preds = {"logit": readout(None, r, seen), "pooled": readout(pooled[p], r, seen),
+                             "routed": routed(p, r, pts[p][b, q]), "jpp": readout(weighted[p], r, seen)}
+                    contrib = full[:, seen]
+                    for lens_name, pr in preds.items():
+                        for tokens, m in (("filtered", in_seen), ("all", None)):
+                            x, c = (a[:, None] * pr, contrib) if m is None else (a[:, None] * pr[:, m], contrib[:, m])
+                            pc, ccn = x - x.mean(-1, keepdim=True), c - c.mean(-1, keepdim=True)
                             corr = (pc * ccn).sum(-1) / (pc.norm(dim=-1) * ccn.norm(dim=-1)).clamp_min(1e-30)
-                            tp, tc = pr.topk(EFFECT, -1).indices, contrib.topk(EFFECT, -1).indices
+                            tp, tc = x.topk(EFFECT, -1).indices, c.topk(EFFECT, -1).indices
                             ov = (tp[:, :, None] == tc[:, None, :]).any(-1).float().mean(-1)
-                            metrics.setdefault((name, lens_name), []).append(torch.stack([corr, ov], -1).cpu())
+                            metrics.setdefault((name, lens_name, tokens), []).append(torch.stack([corr, ov], -1).cpu())
             print(f"{time.strftime('%H:%M:%S')} {phase}: rows {r0}..{r0 + args.batch}, {time.time() - t0:.0f} s", flush=True)
 
     with torch.no_grad():
@@ -310,16 +326,27 @@ def evaluate(args):
     with torch.no_grad():
         run("eval")
     table = {}
-    for (name, lens_name), xs in sorted(metrics.items()):
+    for (name, lens_name, tokens), xs in sorted(metrics.items()):
         x = torch.cat(xs)
-        table.setdefault(name, {})[lens_name] = {"corr_median": float(x[:, 0].nanmedian()), "corr_mean": float(x[:, 0].nanmean()),
-                                                 "overlap_mean": float(x[:, 1].nanmean()), "samples": int(x.shape[0])}
-    res = {"table": table, "fitted": fitted, "seconds": time.time() - t0, "fields": __doc__}
+        table.setdefault(name, {}).setdefault(tokens, {})[lens_name] = {
+            "corr_median": float(x[:, 0].nanmedian()), "corr_mean": float(x[:, 0].nanmean()),
+            "overlap_mean": float(x[:, 1].nanmean()), "samples": int(x.shape[0])}
+    for name in table:
+        if point_of(int(name.split(".")[1]), name.rsplit(".", 1)[1]) == "out_3":
+            table[name]["note"] = "the final residual: every lens is the logit lens (J = I), identical by construction"
+    labels = {"logit": "logit lens (J = I), no labels", "pooled": "pooled LRP Jacobian (R-lens), no labels",
+              "routed": "each sample through its own k-means cluster's expert, no labels",
+              "jpp": f"J++: expert weights fitted (supervised) to the measured effects of dev rows {b0}..{mid - 1}",
+              "filtered": "tokens with a letter or digit seen >= MIN_COUNT times in split A",
+              "all": "every token seen >= MIN_COUNT times in split A", "evaluated": f"rows {mid}..{b1 - 1}"}
+    res = {"table": table, "labels": labels, "fitted": fitted, "seconds": time.time() - t0, "fields": __doc__}
     (root / "lens" / "evaluation.json").write_text(json.dumps(res, indent=1) + "\n")
     for name, row in table.items():
-        print(name, "  ".join(f"{k}: corr {v['corr_median']:.3f} overlap {v['overlap_mean']:.3f}" for k, v in row.items()), flush=True)
-    # J++ readouts into the atlas for the sites where it beats the logit lens (median correlation).
-    wins = [n for n, row in table.items() if row["jpp"]["corr_median"] > row["logit"]["corr_median"]]
+        for tokens in ("filtered", "all"):
+            print(f"{name} {tokens}:", "  ".join(f"{k}: corr {v['corr_median']:.3f} overlap {v['overlap_mean']:.3f}"
+                                               for k, v in row[tokens].items()), flush=True)
+    # J++ readouts into the atlas for the sites where it beats the logit lens (median correlation, filtered tokens).
+    wins = [n for n, row in table.items() if row["filtered"]["jpp"]["corr_median"] > row["filtered"]["logit"]["corr_median"]]
     if not wins:
         print("J++ beats the logit lens on no site: the atlas is unchanged", flush=True)
         return

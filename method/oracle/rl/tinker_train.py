@@ -36,7 +36,8 @@ from pathlib import Path
 
 import httpx
 
-PRICES = {"Qwen/Qwen3-8B": (0.195, 0.60, 0.44), "Qwen/Qwen3.5-4B": (0.33, 1.005, 0.737)}  # $/M tokens: prefill, sample, train
+PRICES = {"Qwen/Qwen3-8B": (0.195, 0.60, 0.44), "Qwen/Qwen3.5-4B": (0.33, 1.005, 0.737),  # $/M tokens: prefill, sample, train
+          "Qwen/Qwen3.8-27B": (0.6975, 5.595, 4.103), "Qwen/Qwen3.6-27B": (1.86, 5.595, 4.103)}  # (Tinker's models page, 64K rows)
 CACHED = 0.2  # a cached prefill token's share of the price
 RENDERER = "qwen3_disable_thinking"
 NAMES = re.compile(r"L\d+\.(?:q|k|v|o|fc|down)#\d+")  # a subcomponent's name in English
@@ -108,8 +109,9 @@ def renderer_for(base: str):
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
     tokenizer = get_tokenizer(base)
-    name = model_info.get_recommended_renderer_name(base)
-    return renderers.get_renderer(f"{name}_disable_thinking" if name in ("qwen3", "qwen3_5") else name, tokenizer), tokenizer
+    names = model_info.get_recommended_renderer_names(base)
+    name = next((n for n in names if n.endswith("_disable_thinking")), names[0])
+    return renderers.get_renderer(name, tokenizer), tokenizer
 
 
 def service_client():
@@ -183,7 +185,9 @@ def explain(a) -> None:
     trained here) writes N explanations from components.writer_prompt; reader A scores each by E1 (bits saved on the
     text's reader questions); the best is kept only when it saves more than the empty explanation (0 bits). On the kept
     ones, the controls: another text's kept explanation read on this text (shuffled) and reader B (an independent
-    model). {"task", "samples", "e1", "explanation" (kept, or ""), "e1_best", "shuffled", "reader_b"} per text."""
+    model); reader_b_all, the summary's headline, is reader B's bits over every text with 0 where nothing was kept
+    (what the SFT examples hold). {"task", "samples", "e1", "explanation" (kept, or ""), "e1_best", "shuffled",
+    "reader_b"} per text."""
     import tinker
     from tinker_cookbook import renderers
 
@@ -202,7 +206,7 @@ def explain(a) -> None:
     facts = [json.loads(x) for x in a.facts.read_text().splitlines() if x.strip()]
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=wr.get_stop_sequences())
     futs = []
-    for f in facts:
+    for f in facts:  # unseeded: a seed gives every one of a call's num_samples the same draws (16 samples, 1-7 distinct)
         prompt = wr.build_generation_prompt([{"role": "user", "content": components.writer_prompt(f)}])
         futs.append((f, prompt, writer.sample(prompt=prompt, num_samples=a.n, sampling_params=params)))
     out = []
@@ -242,7 +246,9 @@ def explain(a) -> None:
             fh.write(json.dumps(o) + "\n")
     total = sum(json.loads(x)["usd"] for x in (a.out.parent / "spend.jsonl").read_text().splitlines())
     mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
-    print(json.dumps({"texts": len(out), "kept": len(kept), "e1_best": mean([o["e1_best"] for o in out if o["e1_best"] is not None]),
+    print(json.dumps({"texts": len(out), "kept": len(kept),
+                      "reader_b_all": mean([o.get("reader_b") or 0.0 for o in out]) if reader_b is not None else None,
+                      "e1_best": mean([o["e1_best"] for o in out if o["e1_best"] is not None]),
                       "e1_mean": mean([o["e1_mean"] for o in out if o["e1_mean"] is not None]), "named": sum(o["named"] for o in out), "shuffled": mean([o["shuffled"] for o in kept if o.get("shuffled") is not None]),
                       "reader_b": mean([o["reader_b"] for o in kept if o.get("reader_b") is not None]), "spend_usd": total}), flush=True)
 

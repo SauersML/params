@@ -13,6 +13,11 @@ budget: the KL of F1 = GOAL (0.9) on goal_eval's log scale when the circuit itse
 circuit's own log recovery (ln(KL_empty / KL) >= 0.9 ln(KL_empty / KL_C)). With every pair the row is the circuit's own
 (checked: the circuit's KL to rounding). Also: the subcomponents a circuit uses at more than one position.
 
+Also, per read: the read's row in C's run against the real model's row (KL, bits, mean over heads), its entropy
+against the uniform causal row's, and the circuit's target KL with the uniform causal row in its place (whether the
+pattern matters for the prediction); per layer the query and key remainders' norm against W's. stated_pairs() gives
+teachers a circuit's pairs.
+
   qk_pairs.py measure --texts 9002 9004 ... --out OUT.jsonl [--dirs DIR ...]
   qk_pairs.py figure OUT.jsonl FIG.png
 """
@@ -98,6 +103,8 @@ def forward(ge, ids, targets, graph, override=None, capture=None):
             S = S.clone()
             S[:, :, t, :t + 1] = rows
         P = S.masked_fill(~causal, float("-inf")).softmax(-1)
+        if capture is not None:
+            capture[i]["P"] = P[0].clone()
         att = (P @ v).transpose(1, 2).reshape(B, T, -1)
         share = lambda r, ws, att=att, P=P: att[:, r[1]] - sum(  # noqa: E731
             P[:, :, r[1], w[1]].repeat_interleave(hd, dim=1) * write(w) for w in ws)
@@ -165,9 +172,8 @@ def node_name(nd) -> str:
     return f"L{layer}.{dict(q_proj='q', k_proj='k')[kind]}#{nd[2]}@{nd[1]}"
 
 
-@torch.no_grad()
-def measure(ge, task: dict, answer: dict, log=print) -> dict:
-    """One text: per read the greedy pair curve, and the circuit's subcomponents at more than one position."""
+def prepare(ge, task: dict, answer: dict) -> dict:
+    """A text's circuit in C's semantics: the run's capture, its KL, F1, budget and reads."""
     p = task["prompts"][0]
     targets = p["target_positions"]
     ids = p["token_ids"][:max(targets) + 1]
@@ -178,44 +184,113 @@ def measure(ge, task: dict, answer: dict, log=print) -> dict:
     empty, vpd = ge._bounds(tx, "live")
     cap = {}
     kl_c = float(carry.kl(tx.ref, forward(ge, ids, targets, graph, capture=cap))[0])
-    ref_kl = ge.graph_kl(tx, [graph], live=True)[0]
     f1 = math.log(empty / kl_c) / math.log(empty / vpd)
     budget = empty * (vpd / empty) ** GOAL if f1 >= GOAL else empty * (kl_c / empty) ** GOAL
     nodes = sorted(graph.node_set())
     reads = sorted({(native._layer_kind(nd)[0], nd[1]) for nd in nodes if native._layer_kind(nd)[1] == "o_proj"})
-    out = {"task": task["id"], "T": len(ids), "kl_c": kl_c, "kl_c_graph_ref": ref_kl, "kl_empty": empty, "kl_vpd": vpd,
-           "f1": f1, "budget": budget, "budget_rule": "F1 0.9" if f1 >= GOAL else "0.9 of own", "reads": []}
+    return {"task": task["id"], "ids": ids, "targets": targets, "graph": graph, "tx": tx, "cap": cap, "kl_c": kl_c,
+            "kl_empty": empty, "kl_vpd": vpd, "f1": f1, "budget": budget, "reads": reads, "nodes": nodes}
+
+
+def select_pairs(ge, pr: dict, layer: int, t: int) -> dict:
+    """The read's pairs added greedily by measured target KL until the circuit is within its budget (module
+    docstring): {"pairs": [(query node or "rem", key node or "rem")], "curve": KL after each, "kl_background",
+    "kl_full_row", "q_nodes", "k_nodes", "available"}."""
+    ids, targets, graph, tx = pr["ids"], pr["targets"], pr["graph"], pr["tx"]
+    bg, pairs, terms, qs, ks = pair_terms(ge, pr["cap"], graph, layer, t)
+    full = bg + sum(terms) if terms else bg
+    kl_full = float(carry.kl(tx.ref, forward(ge, ids, targets, graph, override=(layer, t, full[None])))[0])
+    kl_bg = float(carry.kl(tx.ref, forward(ge, ids, targets, graph, override=(layer, t, bg[None])))[0])
+    chosen, cur, curve = [], bg.clone(), [kl_bg]
+    left = list(range(len(pairs)))
+    while curve[-1] > pr["budget"] and left:
+        rows = torch.stack([cur + terms[j] for j in left])
+        kls = carry.kl(tx.ref, forward(ge, ids, targets, graph, override=(layer, t, rows))).tolist()
+        j = min(range(len(left)), key=lambda i: kls[i])
+        chosen.append(left[j])
+        cur = cur + terms[left[j]]
+        curve.append(kls[j])
+        left.pop(j)
+    return {"pairs": [pairs[j] for j in chosen], "curve": curve, "kl_background": kl_bg, "kl_full_row": kl_full,
+            "q_nodes": len(qs), "k_nodes": len(ks), "available": len(pairs)}
+
+
+@torch.no_grad()
+def stated_pairs(ge, task: dict, answer: dict) -> dict:
+    """For teachers: a circuit's stated query-key pairs, {(layer, position): [(query node, key node), ...]} (nodes as
+    (matrix, position, index), or "rem" for the remainder), each read's chosen by select_pairs."""
+    pr = prepare(ge, task, answer)
+    return {(layer, t): select_pairs(ge, pr, layer, t)["pairs"] for layer, t in pr["reads"]}
+
+
+def remainder_norms(nat) -> dict:
+    """Per layer, |W - V U| / |W| (Frobenius) of the query and key matrices."""
+    out = {}
+    for layer in range(nat.target.n_layer):
+        for kind in ("q_proj", "k_proj"):
+            st = nat.target.site(native.site_name(layer, kind))
+            out[f"L{layer}.{kind[0]}"] = float((st.W - (st.V @ st.U).T).norm() / st.W.norm())
+    return out
+
+
+def pattern_checks(ge, pr: dict, layer: int, t: int, model_P: torch.Tensor) -> dict:
+    """The read's row in C's run against the model's (KL per head, mean over heads, bits), its entropy against the
+    uniform causal row's (bits), and the circuit's target KL with the uniform causal row in its place."""
+    rowc = pr["cap"][layer]["P"][:, t, :t + 1].clamp_min(1e-30)  # [H, t + 1]
+    rowm = model_P[layer][:, t, :t + 1].clamp_min(1e-30)
+    kl = float((rowm * (rowm.log() - rowc.log())).sum(-1).mean() / math.log(2))
+    ent = float((-(rowc * rowc.log()).sum(-1)).mean() / math.log(2))
+    ent_m = float((-(rowm * rowm.log()).sum(-1)).mean() / math.log(2))
+    H = rowc.shape[0]
+    uni = torch.zeros(1, H, t + 1)
+    kl_u = float(carry.kl(pr["tx"].ref, forward(ge, pr["ids"], pr["targets"], pr["graph"], override=(layer, t, uni)))[0])
+    return {"kl_model_vs_circuit_row": kl, "entropy_circuit_row": ent, "entropy_model_row": ent_m,
+            "entropy_uniform": math.log2(t + 1), "kl_target_uniform_row": kl_u}
+
+
+def model_patterns(nat, ids: list[int]) -> list:
+    """The real model's attention patterns per layer [H, T, T]."""
+    tg = nat.target
+    out = []
+    T = len(ids)
+    causal = torch.ones(T, T, dtype=torch.bool).tril()
+    for q, k, v, x in tg.keys_values(torch.tensor([ids], device=nat.dev)):
+        S = (q[0] @ k[0].transpose(-1, -2)) / math.sqrt(tg.hd)
+        out.append(S.masked_fill(~causal, float("-inf")).softmax(-1))
+    return out
+
+
+@torch.no_grad()
+def measure(ge, task: dict, answer: dict, log=print) -> dict:
+    """One text: per read the greedy pair curve and the pattern checks, and the circuit's subcomponents at more than
+    one position."""
+    nat = ge.nat
+    pr = prepare(ge, task, answer)
+    ref_kl = ge.graph_kl(pr["tx"], [pr["graph"]], live=True)[0]
+    nodes, reads = pr["nodes"], pr["reads"]
+    model_P = model_patterns(nat, pr["ids"])
+    out = {"task": task["id"], "T": len(pr["ids"]), "kl_c": pr["kl_c"], "kl_c_graph_ref": ref_kl, "kl_empty": pr["kl_empty"],
+           "kl_vpd": pr["kl_vpd"], "f1": pr["f1"], "budget": pr["budget"],
+           "budget_rule": "F1 0.9" if pr["f1"] >= GOAL else "0.9 of own", "reads": []}
     by = {}
     for nd in nodes:
         if nd[0] != "tok":
             by.setdefault((nd[0], nd[2]), set()).add(nd[1])
     out["reuse"] = {"subcomponents": len(by), "multi_position": sum(len(v) > 1 for v in by.values()),
                     "examples": [f"{native._layer_kind((n, 0, c))}#{c}@{sorted(v)}" for (n, c), v in by.items() if len(v) > 1][:8]}
-    log(f"{task['id']}: T {len(ids)}, {len(nodes)} nodes, KL_C {kl_c:.4f} (graph_ref {ref_kl:.4f}), F1 {f1:.3f}, budget {budget:.4f}, "
-        f"{len(reads)} reads, {out['reuse']['multi_position']} of {len(by)} subcomponents at several positions")
+    log(f"{task['id']}: T {len(pr['ids'])}, {len(nodes)} nodes, KL_C {pr['kl_c']:.4f} (graph_ref {ref_kl:.4f}), F1 {pr['f1']:.3f}, "
+        f"budget {pr['budget']:.4f}, {len(reads)} reads, {out['reuse']['multi_position']} of {len(by)} subcomponents at several positions")
     for layer, t in reads:
         t0 = time.time()
-        bg, pairs, terms, qs, ks = pair_terms(ge, cap, graph, layer, t)
-        full = bg + sum(terms) if terms else bg
-        kl_full = float(carry.kl(tx.ref, forward(ge, ids, targets, graph, override=(layer, t, full[None])))[0])
-        kl_bg = float(carry.kl(tx.ref, forward(ge, ids, targets, graph, override=(layer, t, bg[None])))[0])
-        chosen, cur, curve = [], bg.clone(), [kl_bg]
-        left = list(range(len(pairs)))
-        while curve[-1] > budget and left:
-            rows = torch.stack([cur + terms[j] for j in left])
-            kls = carry.kl(tx.ref, forward(ge, ids, targets, graph, override=(layer, t, rows))).tolist()
-            j = min(range(len(left)), key=lambda i: kls[i])
-            chosen.append(left[j])
-            cur = cur + terms[left[j]]
-            curve.append(kls[j])
-            left.pop(j)
-        rec = {"layer": layer, "t": t, "pairs_available": len(pairs), "q_nodes": len(qs), "k_nodes": len(ks),
-               "kl_background": kl_bg, "kl_full_row": kl_full,
-               "curve": curve, "pairs": [[node_name(pairs[j][0]), node_name(pairs[j][1])] for j in chosen],
-               "reached": curve[-1] <= budget, "seconds": time.time() - t0}
+        sel = select_pairs(ge, pr, layer, t)
+        rec = {"layer": layer, "t": t, "pairs_available": sel["available"], "q_nodes": sel["q_nodes"], "k_nodes": sel["k_nodes"],
+               "kl_background": sel["kl_background"], "kl_full_row": sel["kl_full_row"], "curve": sel["curve"],
+               "pairs": [[node_name(a), node_name(b)] for a, b in sel["pairs"]], "reached": sel["curve"][-1] <= pr["budget"],
+               **pattern_checks(ge, pr, layer, t, model_P), "seconds": time.time() - t0}
         out["reads"].append(rec)
-        log(f"  read L{layer}@{t}: {len(pairs)} candidate pairs, background KL {kl_bg:.4f}, all pairs {kl_full:.4f}; "
-            f"{len(chosen)} pairs -> {curve[-1]:.4f} ({'within' if rec['reached'] else 'NOT within'} budget) {rec['pairs'][:4]}")
+        log(f"  read L{layer}@{t}: {sel['available']} candidate pairs, background KL {sel['kl_background']:.4f}, all pairs "
+            f"{sel['kl_full_row']:.4f}; {len(sel['pairs'])} pairs -> {sel['curve'][-1]:.4f}; uniform row {rec['kl_target_uniform_row']:.4f}; "
+            f"row KL vs model {rec['kl_model_vs_circuit_row']:.3f} bits, entropy {rec['entropy_circuit_row']:.2f} of {rec['entropy_uniform']:.2f}")
     return out
 
 
@@ -264,6 +339,7 @@ def main():
     if args.cmd == "figure":
         return figure([json.loads(x) for x in Path(args.rows).read_text().splitlines() if x.strip()], args.png)
     ge = goal_eval.GoalEval(native.Native(args.device))
+    print("remainder norms |W - V U| / |W|:", {k: round(v, 3) for k, v in remainder_norms(ge.nat).items()}, flush=True)
     for t in args.texts:
         task = json.loads((native.TEXTS / "vpd4l" / f"text{t}.json").read_text())
         src = next(Path(d) / f"text{t}.json" for d in args.dirs if (Path(d) / f"text{t}.json").exists())

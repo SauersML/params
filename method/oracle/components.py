@@ -2343,9 +2343,20 @@ def _paired(a: list, b: list) -> dict:
     return {"n": n, "mean": mean, "se": se, "wins": sum(x > 0 for x in d), "losses": sum(x < 0 for x in d)}
 
 
+def _eval_checkpoint(path: Path, record: dict, *, create: bool = False) -> None:
+    """Durable raw records, never reused for scoring: completed lines survive later failures."""
+    import os
+
+    payload = json.dumps(record) + "\n"  # serialize before touching the file
+    with Path(path).open("x" if create else "a") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
-             teachers: dict | None = None, lines: bool = False) -> dict:
+             teachers: dict | None = None, lines: bool = False, checkpoint: Path | None = None) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -2359,8 +2370,27 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
     first's, so each sample is compared with VPD at its own size (verify-and-pick: whether any of N beats it on C).
     The baselines' v3 terms (phi, g, compact, bits, D) and C and N are kept beside their circuit reward
     ("baseline_terms"). teachers: task -> the text's teacher circuit (JSON), reward v3's teacher-dominance reference, for
-    the sets and the baselines alike. lines: each sample's per-line credits too (reward(lines=True))."""
+    the sets and the baselines alike. lines: each sample's per-line credits too (reward(lines=True)). checkpoint:
+    a new JSONL file of durable completed-task raw scores, for manual recovery; never used to resume scoring."""
     import native
+
+    if checkpoint is not None:
+        import hashlib
+
+        digest = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+        source = Path(__file__).resolve().parent
+        _eval_checkpoint(checkpoint, {"type": "evaluation", "version": 1, "split": split, "n": n,
+                                     "sets": list(sets), "diagnostics": diagnostics, "matched_all": matched_all,
+                                     "lines": lines, "edits": ee is not None, "variables": vs is not None,
+                                     "resume": False,
+                                     "input_sha256": {k: digest(v) for k, v in
+                                                      {"rows": rows, "sets": sets, "e1": e1, "labels": labels,
+                                                       "edit_best": edit_best, "teachers": teachers}.items()},
+                                     "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                                       for p in (source / name for name in
+                                                                 ("components.py", "goal_eval.py", "native.py",
+                                                                  "edit_eval.py", "variables.py", "engine.py",
+                                                                  "carry.py", "task_data.py")) if p.exists()}}, create=True)
 
     invalid = V3_INVALID
     per = {s: [] for s in sets}
@@ -2370,6 +2400,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             continue
         task = json.loads(p.read_text())
         ev = rows[p.stem]
+        cache = {}
         for name, samples in sets.items():
             got = samples.get(p.stem, [])
             if not got:
@@ -2396,6 +2427,12 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
             base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),
                                                     **{k: r.get(k) for k in ("phi", "phi_tau", "g", "compact", "bits", "D")}}
+        if checkpoint is not None:
+            _eval_checkpoint(checkpoint, {"type": "task", "task": p.stem,
+                                         "task_input_sha256": digest(task),
+                                         "per_question": {s: per[s][-1] for s in sets},
+                                         "baselines": base.get(p.stem, {}),
+                                         "baseline_terms": base_terms.get(p.stem, {})})
         log(p.stem + ": " + ", ".join(f"{s} {per[s][-1]['samples'][0]['reward']:+.3f}" for s in sets), flush=True)
     report = {}
     groups = {"all": None}
@@ -2582,12 +2619,18 @@ def main():
     s.add_argument("--labels", type=Path, help="locality JSONL: every figure also for local and non-local texts")
     s.add_argument("--diagnostics", action="store_true", help="structure() of each first sample (slow)")
     s.add_argument("--out", type=Path)
+    s.add_argument("--checkpoint", type=Path, help="durable per-task raw JSONL; defaults to OUT.tasks.jsonl when --out is set; "
+                   "must be a new file, never resumed (retain complete lines after interruption)")
     s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (scored with net): the best net per goal (E3)")
     s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
     s.add_argument("--matched-all", action="store_true", help="VPD at every sample's node count (verify-and-pick against VPD@matched)")
     s.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json): reward v3's teacher-dominance reference")
     s.add_argument("--lines", action="store_true", help="each sample's per-line credits (reward(lines=True), line_credit())")
     args = ap.parse_args()
+    if args.cmd == "evaluate":
+        args.checkpoint = args.checkpoint or (Path(str(args.out) + ".tasks.jsonl") if args.out else None)
+        if args.checkpoint is not None and args.checkpoint.exists():
+            ap.error(f"checkpoint already exists: {args.checkpoint}; choose a new --checkpoint path")
     import goal_eval
     import native
 
@@ -2826,7 +2869,8 @@ def main():
         vs = variables.Scorer(ge)
     teachers = {f.stem: json.loads(f.read_text()) for t in rows if (f := args.teacher / f"{t}.json").exists()} if args.teacher else None
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
-                   matched_all=args.matched_all, teachers=teachers, lines=args.lines)
+                   matched_all=args.matched_all, teachers=teachers, lines=args.lines,
+                   checkpoint=args.checkpoint)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

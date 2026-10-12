@@ -494,14 +494,16 @@ def test_block_connections_keep_their_floors():
     bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
     conn = teacher.Connector(ge, tx, pb, empty, vpd, lambda *a: 0.0, no_strand=True, acceptance=acc, blocks=bl)
     kept, summary, steps, ep, on = conn.connect(pb.on.clone(), 0.0)
-    stated = conn.graph(on, kept)
+    every = conn.graph(on, kept)
+    stated = conn.graph(on, kept, summary["tokens"])
+    # the token edges kept are some of every one (pruned under the same floors)
+    assert set(stated.tok_edges) <= set(every.tok_edges) and set(stated.tok_out) <= set(every.tok_out)
     # a block's connections are one unit: every subcomponent's kept or none
     for u in range(int(ep.gid.max()) + 1):
         member = ep.gid == u
         assert bool(ep.on[member].all()) or not bool(ep.on[member].any())
     # the stated graph names the blocks, states every token edge, and keeps the floors the descent started from
     assert {(nd[0], nd[1]) for nd in stated.node_set() if nd[2] == goal_eval.BLOCK} <= bl
-    assert stated.tok_out == list(tx.targets) and stated.tok_edges
     floor = {k: min(teacher.RECOVERED, steps[0][k]) for k in ("s_track_pp", "s_donor_near", "s_donor_far") if steps[0].get(k) is not None}
     got = acc.scores([stated])[0]
     assert all(got[k] is None or got[k] >= f - 1e-6 for k, f in floor.items())

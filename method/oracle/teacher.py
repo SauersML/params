@@ -894,13 +894,43 @@ class Connector:
                    "all_edges": len(ep.edges), "sets": ep.measured, "unconnectable": len(dropped)}
         for k_ in start:                                     # the last admitted step's F1 under the flips and acceptance
             summary[k_] = next(s_[k_] for s_ in reversed(steps) if k_ in s_)   # terms (the start's, steps[0]'s, if none)
+        if self.acceptance is not None:                      # the token edges, under the same floors
+            kept_now = [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_]
+            summary["tokens"] = self.tokens(on, kept_now, {k_: min(RECOVERED, v) for k_, v in base.items() if v is not None})
         print(f"  connections at {size} subcomponents: {summary['edges']} of {len(ep.edges)}, graph F1 {summary['f1_graph']:.3f} "
               f"(start {steps[0]['f1_graph']:.3f}), N {n:.3f}, {ep.measured} sets", flush=True)
         return [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_], summary, steps, ep, on
 
-    def graph(self, on: torch.Tensor, kept: list) -> native.Graph:
+    def tokens(self, on: torch.Tensor, kept: list, floor: dict) -> list:
+        """The token edges a stated graph keeps (the lead's 10-12: pruned like other connections): from every one
+        (with_tokens), those of a position together and then single ones dropped where acceptance admits it at floor;
+        C's KL does not read them (the change enters through them in the path-patched families alone). [("e",
+        position, reader) | ("o", target)]."""
+        g = self.graph(on, kept)
+        toks = [("e", p, r) for p, r in g.tok_edges] + [("o", t) for t in g.tok_out]
+        if not toks:
+            return []
+        pos = torch.tensor([x[1] for x in toks], device=on.device)
+
+        def graph_of(ton):
+            return self.graph(on, kept, [toks[i] for i in ton.nonzero().flatten().tolist()])
+        hook, _ = self.acceptance.hook(graph_of, torch.ones(len(toks), dtype=torch.bool, device=on.device), floor=floor)
+
+        def rank(ons):                                       # the smallest margin over the floors, largest first
+            got = self.acceptance.scores([graph_of(x) for x in ons])
+            return [-min([r[k] - f for k, f in floor.items() if r.get(k) is not None] or [0.0]) for r in got]
+        td = Flags(len(toks), 0.0, rank, ACCEPT_BATCH, on.device)
+        single = td.blocks
+        td.blocks = lambda level: ([td.on.nonzero().flatten()[pos[td.on] == p] for p in torch.unique(pos[td.on]).tolist()]
+                                   if level == "position" else single(level))
+        for level in ("position", "token"):
+            td.prune(level, 1.0, rounds=len(toks) + 1, accept=hook)
+        return [toks[i] for i in td.on.nonzero().flatten().tolist()]
+
+    def graph(self, on: torch.Tensor, kept: list, tokens: list | None = None) -> native.Graph:
         """A node set and its kept connections as the stated graph goal_eval scores (a kept block's subcomponents as
-        its block node, their connections as the block's)."""
+        its block node, their connections as the block's); tokens, the token edges it states (tokens(); default
+        every one, with_tokens)."""
         def unit(nd):
             return (nd[0], nd[1], goal_eval.BLOCK) if nd is not None and (nd[0], nd[1]) in self.blocks else nd
         parents = {}
@@ -908,8 +938,12 @@ class Connector:
             if r is not None:
                 parents.setdefault(unit(r), {})[unit(w)] = None
         nodes = list(dict.fromkeys(unit(self.pr.nodes[j]) for j in on.nonzero().flatten().tolist()))
-        return with_tokens(native.Graph(nodes, {r: list(ws) for r, ws in parents.items()},
-                                        list(dict.fromkeys(unit(w) for w, r in kept if r is None))), self.tx.targets)
+        g = with_tokens(native.Graph(nodes, {r: list(ws) for r, ws in parents.items()},
+                                     list(dict.fromkeys(unit(w) for w, r in kept if r is None))), self.tx.targets)
+        if tokens is not None:
+            g.tok_edges = [(x[1], unit(x[2])) for x in tokens if x[0] == "e"]
+            g.tok_out = [x[1] for x in tokens if x[0] == "o"]
+        return g
 
     def score(self, on: torch.Tensor, kept: list, pool: dict) -> dict:
         """The reward's circuit score of a node set with its kept connections: C (goal_eval.GoalEval.fidelity, mode
@@ -1158,7 +1192,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             wiring = Connector(ge, tx, pb, empty, vpd, size_term_b, B, robust=robust_pool, no_strand=no_strand, levels=edge_levels,
                                acceptance=acceptance, blocks=bl)
             kept, row["best_edges"], _, _, on_w = wiring.connect(pb.on.clone(), n_b if n_b is not None else 0.0)
-            stated = wiring.graph(on_w, kept)
+            stated = wiring.graph(on_w, kept, row["best_edges"].get("tokens"))
+            row["best_edges"]["tokens"] = [list(x[:2]) + ([list(x[2])] if len(x) > 2 else []) for x in row["best_edges"].get("tokens") or []]
             row["best_edges"]["bits"] = goal_eval.size_bits(stated, nat.positions(targets), sum(nat.C.values()), targets, tx.vpd)
             circuits[""] = goal_eval.to_json(stated, "")
         row["seconds"] = time.perf_counter() - t0

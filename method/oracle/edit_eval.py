@@ -6,7 +6,8 @@ Goals (goals(): one text's, drawn by the text's seed; seed + 1 gives a fresh dra
   flip       make the model's most likely token at the target no longer the most likely
   raise      make a token of rank 2 to 5 there the most likely
   detach     make the prediction not depend on the token at an earlier position (one of goal_eval's F2 positions, whose
-             changed token moves the prediction by at least 1% of the text's total)
+             changed token moves the prediction by at least 1% of the text's total, and whose dependence D0 exceeds
+             KL_VPD, VPD's own answer's KL from the model there: below it the decomposition cannot resolve the goal)
   behaviour  stop copying, on every text: the copy-mistake set (COPY: confident wrong copies of an earlier continuation,
              Pile val rows 9400-9599) split in a first half for the search (its first COPY_FIT propose steps, the rest
              validate them) and a second half for the score
@@ -56,6 +57,7 @@ Score (EditEval.score_many), in bits, on data the teacher's search never used:
   edit_eval.py table OUT.jsonl [COPY.json]                       the report's means
   edit_eval.py rescore OUT.jsonl NEW.jsonl                       teach rows' edits scored again by the current scorer
   edit_eval.py rescore-copy COPY.json NEW.json                   the copy goal's paths re-chosen and scored again
+  edit_eval.py resolvable ROWS.jsonl NEW.jsonl                   detach goals marked above VPD's resolution or not
 
 The edit teacher (teach()) is a measured greedy search over candidate edits from the teacher's circuits (goal_eval JSON
 files, TEACHER_DIRS) and VPD's most important subcomponents for net bits (goal_bits - collateral, what E3 compares):
@@ -422,10 +424,11 @@ def _margin(lq: torch.Tensor, tok: int) -> torch.Tensor:
     return (lq[..., tok] - other.max(-1).values) / LN2
 
 
-def goals(ee: "EditEval", task: dict, seed: int | None = None) -> list[dict]:
+def goals(ee: "EditEval", task: dict, seed: int | None = None, report: dict | None = None) -> list[dict]:
     """A text's goals: flip, raise (a rank drawn from RAISE_RANKS) and detach (a position drawn from goal_eval's F2
-    positions before the target; none when there is none), drawn by seed (native.task_seed(task id) when None; + 1 for
-    a fresh draw)."""
+    positions before the target whose dependence VPD can resolve, resolvable(); none when there is none), drawn by
+    seed (native.task_seed(task id) when None; + 1 for a fresh draw). report: filled with the F2 positions and the
+    ones dropped as unresolvable."""
     import components
 
     p = task["prompts"][0]
@@ -441,9 +444,27 @@ def goals(ee: "EditEval", task: dict, seed: int | None = None) -> list[dict]:
     out.append({"kind": "raise", "token": strings[r], "token_id": order[r], "rank": r + 1, "target": t})
     tx = ee.ge.text(ids, targets, seed=native.task_seed(task["id"]), task=task)
     positions = [q for q, _ in tx.f2 if q not in targets]
-    if positions:
-        out.append({"kind": "detach", "position": rng.choice(positions), "target": t})
+    res = {q: resolvable(ee, task, q, tx) for q in positions}
+    kept = [q for q in positions if res[q]["resolvable"]]
+    if report is not None:
+        report.update({"f2": positions, "dropped": [q for q in positions if q not in kept]})
+    if kept:
+        q = rng.choice(kept)
+        out.append({"kind": "detach", "position": q, "target": t, "d0": res[q]["d0"], "kl_vpd": res[q]["kl_vpd"]})
     return out
+
+
+def resolvable(ee: "EditEval", task: dict, position: int, tx=None) -> dict:
+    """Whether a detach goal at position is above VPD's resolution on the text: its dependence D0 (the target's mean KL
+    from the text to the text with the position's token changed, the score's alternatives) exceeds KL_VPD, the KL of
+    VPD's own answer from the model at the targets (goal_eval, remainders live). {"d0", "kl_vpd", "resolvable"}."""
+    p = task["prompts"][0]
+    ids, targets = p["token_ids"], p["target_positions"]
+    t = max(targets)
+    tx = tx or ee.ge.text(ids, targets, seed=native.task_seed(task["id"]), task=task)
+    kl_vpd = ee.ge._bounds(tx, "live")[1]
+    d0 = ee._dependence(ids, ee.alternatives(ids, position, SCORE_RANKS), t, [[]], [ee.reference(ids)[t]])[0]
+    return {"d0": d0, "kl_vpd": kl_vpd, "resolvable": kl_vpd is not None and d0 > kl_vpd}
 
 
 def copy_goal() -> dict:
@@ -1163,6 +1184,9 @@ def main():
     r = sub.add_parser("rescore")
     r.add_argument("rows")
     r.add_argument("out")
+    rv = sub.add_parser("resolvable")
+    rv.add_argument("rows")
+    rv.add_argument("out")
     rc = sub.add_parser("rescore-copy")
     rc.add_argument("copy")
     rc.add_argument("out")
@@ -1179,9 +1203,10 @@ def main():
     if args.cmd == "goals":
         with open(args.out, "w") as f:
             for task in _tasks(args.split, args.n, args.tasks):
-                for gl in goals(ee, task, native.task_seed(task["id"]) + (1 if args.fresh else 0)):
+                rep = {}
+                for gl in goals(ee, task, native.task_seed(task["id"]) + (1 if args.fresh else 0), rep):
                     f.write(json.dumps({"task": task["id"], "split": args.split, "goal": gl}) + "\n")
-                print(task["id"], flush=True)
+                print(task["id"], f"F2 positions {len(rep['f2'])}, dropped as below VPD's resolution {len(rep['dropped'])}", flush=True)
     elif args.cmd == "teach":
         rows = [json.loads(x) for x in Path(args.goals).read_text().splitlines() if x.strip()]
         done = set()  # the goals any teach_*.jsonl beside OUT holds; the rest are split between the processes
@@ -1211,6 +1236,20 @@ def main():
                         x["score"] = row
                 f.write(json.dumps(r) + "\n")
                 print(r["task"], r["goal"]["kind"], flush=True)
+    elif args.cmd == "resolvable":  # mark the detach goals of goal or teach rows: above VPD's resolution or not
+        tasks, n, dropped = {}, 0, 0
+        with open(args.out, "w") as f:
+            for line in Path(args.rows).read_text().splitlines():
+                r = json.loads(line)
+                if r["goal"]["kind"] == "detach":
+                    if r["task"] not in tasks:
+                        tasks = {r["task"]: json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())}
+                    r["goal"].update(resolvable(ee, tasks[r["task"]], r["goal"]["position"]))
+                    n += 1
+                    dropped += not r["goal"]["resolvable"]
+                f.write(json.dumps(r) + "\n")
+                f.flush()
+        print(f"{n} detach goals, {dropped} below VPD's resolution (D0 <= KL_VPD)")
     elif args.cmd == "rescore-copy":
         Path(args.out).write_text(json.dumps(rescore_copy(ee, json.loads(Path(args.copy).read_text()),
                                                           log=lambda m: print(m, flush=True)), indent=1))

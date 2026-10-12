@@ -294,3 +294,16 @@ def test_frontier_steps_chosen_by_validation():
         return score
     res = edit_eval.frontier(rows(fit), pool, max_ops=1, log=lambda m: None, validate=rows(val), pick=2)
     assert res["path"][0]["edit"][0]["node"] == ["h.0.mlp.c_fc", None, 1] and res["chosen"] == 0
+
+
+def test_resolvable_compares_dependence_with_vpd(tiny):
+    """A detach goal is above VPD's resolution when its dependence D0 exceeds KL_VPD on the text."""
+    nat, ids, targets = tiny
+    ee = edit_eval.EditEval(nat)
+    task = {"id": "tiny", "prompts": [{"token_ids": ids, "target_positions": targets}]}
+    r = edit_eval.resolvable(ee, task, 6)
+    d0 = ee.score(task, {"kind": "detach", "position": 6, "target": 11}, [edit_eval.scale_op(("h.0.mlp.c_fc", 0, 0), 1.0)])
+    assert abs(r["d0"] - d0["dependence"]) < 1e-4 + 1e-3 * r["d0"]
+    tx = ee.ge.text(ids, targets, seed=native.task_seed("tiny"), task=task)
+    assert abs(r["kl_vpd"] - ee.ge._bounds(tx, "live")[1]) < 1e-6
+    assert r["resolvable"] == (r["d0"] > r["kl_vpd"])

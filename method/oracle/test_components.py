@@ -466,3 +466,22 @@ def test_question_lists_the_candidate_pool_when_present(tiny):
     shown = components.question(task, {**ev, "pool": pool})
     assert "every VPD-active subcomponent" in shown and "7 (" in shown and "L3.fc 5:1 2:.4" in shown and "L0.q 1:.06" in shown
     assert "every VPD-active subcomponent" not in components.question(task, ev)
+
+
+def test_mermaid_circuit_round_trips():
+    """The same answer as a Mermaid flowchart (to_mermaid) parses back to the same nodes and edges: subcomponents, a
+    block, token nodes and their edges into a reader and the prediction, and pairs; declarations outside a position's
+    subgraph need a position; a line that is neither is malformed."""
+    answer = {"nodes": [["h.3.mlp.down_proj", 2, 235], ["block", "h.1.attn.v_proj", 233], ["h.2.attn.o_proj", 7, 235],
+                        ["h.3.attn.q_proj", 5, 235], ["h.3.attn.k_proj", 9, 233], ["tok", 0, 233], ["tok", 0, 235]],
+              "edges": [[0, "out"], [2, 0], [1, 2], [5, 4], [6, 3], [6, "out"], ["pair", 3, 4, 3, 235], ["pair", 3, "rest", 3, 235]]}
+    strings = [f"t{i}" for i in range(240)]
+    text = components.render(answer, strings=strings, fmt="mermaid")
+    assert "flowchart LR" in text and 'subgraph p233["\'t233\' @233"]' in text and "-.->|pair L3@235|" in text and "--> OUT" in text
+    p = components.parse(text)
+    key = lambda a: (sorted(map(tuple, a["nodes"])), sorted(  # noqa: E731
+        str((e[0], *[tuple(a["nodes"][i]) if i != "rest" else i for i in e[1:3]], *e[3:])) if e[0] == "pair"
+        else str((tuple(a["nodes"][e[0]]), "out" if e[1] == "out" else tuple(a["nodes"][e[1]]))) for e in a["edges"]))
+    assert key(p["answer"]) == key(answer) and p["malformed"] == 0
+    loose = components.parse("CIRCUIT:\nflowchart LR\n  a[L3.down#2@235]\n  b[L3.o#1]\n  a --> OUT\n  this is not mermaid\n")
+    assert loose["malformed"] == 2 and [tuple(x) for x in loose["answer"]["nodes"]] == [("h.3.mlp.down_proj", 2, 235)]

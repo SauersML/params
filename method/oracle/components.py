@@ -112,6 +112,9 @@ FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s
 SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+|EDIT\s+\d+)\s*:", re.M | re.I)
 EDIT_RE = re.compile(r"^\s*EDIT\s+(\d+)\s*:(.*)$", re.M | re.I)
 OP_RE = re.compile(r"\s*(persistent\s+)?(?:cut\s+(\S+)\s*<-\s*(\S+)|scale\s+(\S+)\s+(-?\d+(?:\.\d+)?))\s*", re.I)
+MM_SUB = re.compile(r"subgraph\s+p(\d+)\b.*", re.I)  # Mermaid circuits (to_mermaid / from_mermaid)
+MM_NODE = re.compile(r"([A-Za-z_][\w]*)\s*\[\s*\"?([^\]\"]*)\"?\s*\]")
+MM_PAIR = re.compile(r"(\S+?)\s*-\.->\s*\|\s*pair\s+L(\d+)@(\d+)\s*\|\s*(\S+)", re.I)
 PATTERN_RE = re.compile(r"PATTERN\s+(?:L(\d+)@(\d+)\s*:\s*)?(\S+)\s*~\s*(\S+)", re.I)  # a stated query-key pair
 VAR_LINE = re.compile(r"\s*V\d+\b")  # a line of the EXPLANATION's VARIABLES block (VAR_RE when it parses)
 VAR_RE = re.compile(r'\s*V(\d+)\s+"(.*?)"\s*:\s*(.*);\s*inputs\s*:\s*(.*?)\s*;\s*carried\s+by\s*:\s*(.*?)\s*;\s*feeds\s*:\s*(.*?)\s*', re.I)
@@ -226,6 +229,10 @@ def parse(text: str) -> dict:
         return at[nd]
 
     lines = [x.strip() for x in sec.get("CIRCUIT", "").splitlines() if x.strip()]
+    if lines and lines[0].lower().startswith("flowchart"):  # a Mermaid circuit: translated to these lines first
+        lines, bad_mm = from_mermaid(lines)
+        malformed += bad_mm
+        junk += bad_mm
     for line in lines:  # first every position block, so an edge line may name an id declared below it
         block = BLOCK_RE.fullmatch(line)
         if not block:
@@ -398,13 +405,14 @@ def _place(nd) -> tuple:
 
 
 def render(answer: dict, finals: dict | None = None, reasons: dict | None = None, edits: dict | None = None,
-           strings: list[str] | None = None) -> str:
+           strings: list[str] | None = None, fmt: str = "ids") -> str:
     """The text of a circuit in goal_eval's JSON (to_json's): every node named once by a short id in its position's
     block, the edges by id (_id_lines) and the stated query-key pairs (goal_eval's ["pair", query, key, layer, position]
     edges) as PATTERN L<layer>@<position>: <query> ~ <key>, by id or rest, one output grammar for every answer; then its explanation (none when it
     has none: its VARIABLES block first when it has "variables", variable_text(), each input with its token when
     strings, the text's token strings, are given), the questions' answers (finals: question number -> (falls, the top
-    token as written)) and the edits."""
+    token as written)) and the edits. fmt "mermaid": the CIRCUIT as a Mermaid flowchart (to_mermaid()), the rest
+    unchanged."""
     import goal_eval
 
     nodes = [(goal_eval._site(c), t, BLOCK) if m == "block" else (TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
@@ -421,7 +429,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
     lines, name = _id_lines(set(nodes), parents, out)
     side = lambda i: "rest" if i == "rest" else name[nodes[i]]  # noqa: E731
     lines += [f"PATTERN L{layer}@{t}: {side(q)} ~ {side(k)}" for _, q, k, layer, t in sorted(pairs, key=lambda e: (-e[4], -e[3], str(e[1]), str(e[2])))]
-    text = ["CIRCUIT:"] + lines
+    text = ["CIRCUIT:"] + (to_mermaid(lines, strings) if fmt == "mermaid" else lines)
     if answer.get("variables"):
         k = {v["name"]: f"V{i}" for i, v in enumerate(answer["variables"], 1)}
         text += ["EXPLANATION:", "VARIABLES:"] + [variable_text(v, i, k, name, strings) for i, v in enumerate(answer["variables"], 1)]
@@ -434,6 +442,86 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
     for k in sorted(edits or {}):
         text.append(f"EDIT {k}: " + "; ".join(edit_op_text(o, name) for o in edits[k]))
     return escape("\n".join(text))
+
+
+def to_mermaid(lines: list[str], strings: list[str] | None = None) -> list[str]:
+    """A circuit's lines (_id_lines' and PATTERN lines) as a Mermaid flowchart (the lead's format A/B, 10-12):
+    "flowchart LR", per position from the earliest a subgraph declaring its nodes by the same ids, "a[L3.fc#1314]",
+    "h[tok]", "c[L1.v]" (a block); then "w & x --> r" per reader, "w --> OUT" for the prediction, and
+    "q -.->|pair L3@394| k" per query-key pair (rest for the part outside the circuit)."""
+    out, blocks, edges = ["flowchart LR"], [], []
+    for line in lines:
+        b = BLOCK_RE.fullmatch(line)
+        if b:
+            label = f"{strings[int(b[1])]!r} @{b[1]}".replace('"', "'") if strings else f"@{b[1]}"
+            items = "; ".join(f"{i}[{x}]" for i, x in (it.split("=", 1) for it in b[2].split()))
+            blocks.append([f'  subgraph p{b[1]}["{label}"]', f"    {items}", "  end"])
+            continue
+        m = PATTERN_RE.fullmatch(line)
+        if m:
+            edges.append(f"  {m[3]} -.->|pair L{m[1]}@{m[2]}| {m[4]}")
+            continue
+        reader, _, writers = line.partition("<-")
+        edges.append(f"  {' & '.join(w.strip() for w in writers.split(','))} --> {reader.strip()}")
+    for b in reversed(blocks):
+        out += b
+    return out + edges
+
+
+def from_mermaid(lines: list[str]) -> tuple[list[str], int]:
+    """A Mermaid circuit (to_mermaid()'s form) as this module's circuit lines, ids renamed by first appearance to
+    short ids, and the count of lines that do not parse (a node declared outside a position's subgraph without a
+    position, an edge or pair with an undeclared id stays for parse() to charge)."""
+    rename, decl, out, bad, pos = {}, {}, [], 0, None
+
+    def rid(x: str) -> str:
+        if x.upper() in ("OUT", "REST"):
+            return x.lower() if x.upper() == "REST" else "OUT"
+        if x not in rename:
+            rename[x] = _short_ids(len(rename) + 1)[-1]
+        return rename[x]
+    rest = []
+    for line in lines[1:]:
+        if line.startswith("%%"):
+            continue
+        sub = MM_SUB.fullmatch(line)
+        if sub:
+            pos = int(sub[1])
+            continue
+        if line.lower() == "end":
+            pos = None
+            continue
+        if "-->" in line or MM_PAIR.fullmatch(line):
+            rest.append(line)
+            continue
+        found = MM_NODE.findall(line)
+        if not found or re.sub(r"[\s;]+", "", MM_NODE.sub("", line)):
+            bad += 1
+            continue
+        for i, label in found:
+            label = label.strip()
+            at = pos if "@" not in label else None
+            if at is None and "@" not in label:
+                bad += 1
+                continue
+            text = label if "@" in label else f"{label}@{at}"
+            p = int(text.rsplit("@", 1)[1])
+            decl.setdefault(p, []).append(f"{rid(i)}={text.rsplit('@', 1)[0]}")
+    for p in sorted(decl, reverse=True):
+        out.append(f"@{p} " + " ".join(decl[p]))
+    for line in rest:
+        m = MM_PAIR.fullmatch(line)
+        if m:
+            out.append(f"PATTERN L{m[2]}@{m[3]}: {rid(m[1])} ~ {rid(m[4])}")
+            continue
+        left, _, right = line.partition("-->")
+        ws = [MM_NODE.sub(r"\1", w).strip() for w in left.split("&")]
+        rs = [MM_NODE.sub(r"\1", r).strip() for r in right.split("&")]
+        if not all(ws) or not all(rs):
+            bad += 1
+            continue
+        out += [f"{rid(r)} <- " + ",".join(rid(w) for w in ws) for r in rs]
+    return out, bad
 
 
 def variable_text(v: dict, k: int, numbers: dict, name: dict, strings: list[str] | None = None) -> str:
@@ -793,8 +881,8 @@ def qa_term(questions: list[dict], finals: dict, tokens_of, top: str) -> float |
 ASK = ("How does {model} compute its prediction of the next token after the target of this text? State the circuit in "
        "VPD subcomponents: a subcomponent is one rank-one slice of a weight matrix at a position, written "
        "L<layer>.<kind>#<index> (kind q, k, v, o, fc or down; for example L2.v#1514 at position 322); the token "
-       "embedding at a position is tok. Name every node once with a short id in its position's line, @322 c=L2.v#1514 "
-       "h=tok, then write one line per reader, <reader> <- <writer>,<writer>, by id: an attention or MLP output (o, down) "
+       "embedding at a position is tok, and a block, L2.v at a position, is a matrix's whole output there. Name every node "
+       "once with a short id in its position's line, @322 c=L2.v#1514 h=tok b=L1.v, then write one line per reader, <reader> <- <writer>,<writer>, by id: an attention or MLP output (o, down) "
        "into a later query, key, value or MLP input (q, k, v, fc) at its position; a value (v) into its layer's attention "
        "output (o) at that or a later position; an MLP input (fc) into its MLP's output (down); the token embedding into a "
        "reader at its position. OUT <- <writer>,<writer> is the prediction. A line PATTERN L<layer>@<position>: <q> ~ <k> "
@@ -811,6 +899,16 @@ ASK = ("How does {model} compute its prediction of the next token after the targ
        "weights on every text (nodes then written without a position).")
 
 
+GRAMMAR = ASK[ASK.index("Name every node once"):ASK.index(" The circuit should be what makes")]
+ASK_MERMAID = ASK.replace(GRAMMAR, (  # the same ask with the CIRCUIT as a Mermaid flowchart (to_mermaid(); the lead's A/B)
+    "Write the CIRCUIT as a Mermaid flowchart: a line flowchart LR, then for each position a subgraph, subgraph "
+    "p322[\"' the' @322\"], declaring each of its nodes once by a short id, c[L2.v#1514]; h[tok]; b[L1.v], and end; then "
+    "one line per reader, <writer> & <writer> --> <reader>, by id: an attention or MLP output (o, down) into a later "
+    "query, key, value or MLP input (q, k, v, fc) at its position; a value (v) into its layer's attention output (o) at "
+    "that or a later position; an MLP input (fc) into its MLP's output (down); the token embedding into a reader at its "
+    "position; <writer> & <writer> --> OUT is the prediction. A line <q> -.->|pair L<layer>@<position>| <k> states a "
+    "query-key pair of that layer's attention read at that position: its pattern computed from query q against key k "
+    "(rest: the query's or key's part outside the circuit; rest -.->|pair ...| rest: the read with no pair of its own)."))
 ASK_VARIABLES = ("Open the EXPLANATION with a line VARIABLES: and one line per variable the circuit computes, V<k> "
                  "\"<short name>\": <its meaning in plain English>; inputs: @<position> <token>, ... (the context tokens it "
                  "is computed from); carried by: <the ids of the circuit's subcomponents that carry it>; feeds: V<j>, ... "
@@ -1088,7 +1186,8 @@ def listing(strings: list[str], numbered: set[int], every: int = MARK_EVERY) -> 
 
 def question(task: dict, ev: dict) -> str:
     """The oracle's question for one text from its evidence(); a row marked "variables" (rerender --variables) also
-    asks for the VARIABLES block (ASK_VARIABLES)."""
+    asks for the VARIABLES block (ASK_VARIABLES), one with "format" "mermaid" (rerender --format mermaid) for a
+    Mermaid circuit (ASK_MERMAID)."""
     import units
 
     model = task["model"]
@@ -1098,7 +1197,7 @@ def question(task: dict, ev: dict) -> str:
     t = max(targets)
     top_tok = p["model_top"][0][0][0]
     top = ", ".join(f"{tok!r} {q:.2f}" for tok, q in p["model_top"][0][:3])
-    lines = [ASK.format(model=model) + (" " + ASK_VARIABLES if ev.get("variables") else ""),
+    lines = [(ASK_MERMAID if ev.get("format") == "mermaid" else ASK).format(model=model) + (" " + ASK_VARIABLES if ev.get("variables") else ""),
              "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): "
              + listing(strings, windows(task, ev)),
              f"target: position {t}; the model's most probable next tokens there: {top}",
@@ -1494,7 +1593,7 @@ def target(answer: dict, ev: dict, model: str, edits: dict | None = None, string
     the edit teacher's operations (edits: request number -> parse()'s ops); strings: the text's tokens (the variables'
     inputs)."""
     finals = {n: (q["falls"], shown(token_strings(model, [q["top"]])[0])) for n, q in enumerate(ev["qa"], 1)}
-    return render(answer, finals, edits=edits, strings=strings)
+    return render(answer, finals, edits=edits, strings=strings, fmt=ev.get("format") or "ids")
 
 
 def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None, max_pairs: int = MAX_PAIRS) -> dict:
@@ -2050,6 +2149,7 @@ def main():
     rr.add_argument("--variables", action="store_true", help="ask for the EXPLANATION's VARIABLES block (ASK_VARIABLES)")
     rr.add_argument("--measured", action="store_true", help="the measured input arm (measured(): subcomponents ranked by importance x "
                                                              "|activation| with activations, attention heads' top positions)")
+    rr.add_argument("--format", choices=("ids", "mermaid"), help="the CIRCUIT's format the question asks for (and dataset() writes)")
     rr.add_argument("--pool", action="store_true", help="the full candidate pool (candidate_pool(): every VPD-active subcomponent at the "
                                                          "listed, target and most-attended positions)")
     rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
@@ -2140,6 +2240,8 @@ def main():
                     r = refresh_facts(atlas, lens, task, r)
                 if args.pool:
                     r = candidate_pool(mnat, task, r)
+                if args.format:
+                    r = {**r, "format": args.format}
                 if args.variables:
                     r = {**r, "variables": True}
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")

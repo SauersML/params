@@ -45,6 +45,7 @@ E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); 
                                                                 K = 1 for a fresh set of questions)
   components.py requestion ROWS.jsonl OUT.jsonl [--qa-seed 1]   the rows with a fresh set of intervention questions
   components.py locality SPLIT OUT.jsonl [--n N]                each text local or not (VPD's target actives alone)
+  components.py teacher-vpd ROWS.jsonl OUT_DIR                 the interim teacher (VPD's answer cut to a writable size)
   components.py dataset ROWS.jsonl TEACHER_DIR OUT.jsonl        SFT rows: each question and its teacher's circuit
                                                                 (TEACHER_DIR/<task>.json or .txt; nodes alone get
                                                                 measured edges) with the measured answers
@@ -88,6 +89,8 @@ WINDOW = 8  # a question numbers the tokens within this many positions of every 
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
 QA_PER_KIND = 2
 QA_RANKS = 8  # token-change questions draw the new token from the model's alternatives at ranks 0 to 7
+ANSWER_BUDGET = 3_500  # tokens of a supervised answer: 4,096 sampled at most, ~600 left for English and reasoning
+MAX_PAIRS = 1_024  # connections with_edges measures at most
 
 
 # ---- the answer's text
@@ -792,10 +795,12 @@ def target(answer: dict, ev: dict, model: str) -> str:
     return render(answer, finals)
 
 
-def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None) -> dict:
+def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None, max_pairs: int = MAX_PAIRS) -> dict:
     """A teacher circuit given as nodes alone, with edges: the connections the model has among its nodes (and from
     its residual writers at the targets into the prediction), ordered by the measured effect of cutting each one
-    alone (goal_eval.cuts), the prefix (none, 1, 2, 4, ..., all) whose answer earns the most reward on the text."""
+    alone (goal_eval.cuts), the prefix (none, 1, 2, 4, ..., all) whose answer earns the most reward on the text. With
+    more than max_pairs connections, those measured are the ones into the prediction and then those whose ends come
+    earliest in VPD's order (Native._vpd_order)."""
     import goal_eval
     import native
 
@@ -803,7 +808,11 @@ def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None
     ids, targets = prompt["token_ids"], prompt["target_positions"]
     g, _ = goal_eval.circuit(answer, targets, ge.nat.C, len(ids))
     par, out = native.all_edges(g.node_set(), targets)
-    pairs = [(w, r) for r, ws in par.items() for w in ws] + [(w, None) for w in out]
+    pairs = [(w, None) for w in out] + [(w, r) for r, ws in par.items() for w in ws]
+    if len(pairs) > max_pairs:
+        rank = {nd: i for i, nd in enumerate(ge.nat._vpd_order(ids, targets))}
+        far = len(rank)
+        pairs = sorted(pairs, key=lambda e: (e[1] is not None, max(rank.get(e[0], far), rank.get(e[1], -1) if e[1] else -1)))[:max_pairs]
     if not pairs:
         return answer
     tx = ge.text(ids, targets, task=task)
@@ -817,6 +826,36 @@ def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None
         cands.append(goal_eval.to_json(h, answer.get("explanation", "")))
     got = reward(ge, task, {**ev, "qa": []}, [render(c) for c in cands], cache=cache)
     return cands[max(range(len(cands)), key=lambda i: got[i]["reward"])]
+
+
+def vpd_teacher(ge, task: dict, ev: dict, tokens, budget: int = ANSWER_BUDGET, cache: dict | None = None) -> tuple[dict, dict]:
+    """The interim teacher: VPD's own answer cut to a size an answer can be written at. Prefixes of VPD's order
+    (Native._vpd_order) of 16, 32, 64, ... nodes up to the largest whose answer text (with the measured FINAL lines)
+    fits `budget` tokens of the explainer's tokenizer (tokens: text -> count), each scored by circuit_reward (F1, N
+    and F3 less 0.5 x size) as nodes alone; the best gets measured edges (with_edges), cut back to the budget if they
+    overrun it. (answer JSON, {"k", "k_max", "circuit_reward", terms})."""
+    import goal_eval
+    import native
+
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    order = ge.nat._vpd_order(ids, targets)
+    fits = lambda k: tokens(target(goal_eval.to_json(native.Graph(order[:k])), ev, task["model"])) <= budget  # noqa: E731
+    lo, hi = 0, len(order)  # the largest k that fits, by bisection
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if fits(mid) else (lo, mid - 1)
+    ks = sorted({k for k in (2 ** j for j in range(4, lo.bit_length())) if k < lo} | {lo})
+    cands = [goal_eval.to_json(native.Graph(order[:k])) for k in ks]
+    got = reward(ge, task, {**ev, "qa": []}, [render(c) for c in cands], cache=cache)
+    i = max(range(len(ks)), key=lambda j: got[j]["circuit_reward"])
+    answer = with_edges(ge, task, ev, cands[i], cache)
+    while answer["edges"] and tokens(target(answer, ev, task["model"])) > budget:
+        answer = {**answer, "edges": answer["edges"][:len(answer["edges"]) // 2]}
+    final = reward(ge, task, {**ev, "qa": []}, [render(answer)], cache=cache)[0]
+    return answer, {"task": task["id"], "k": ks[i], "k_max": lo, "edges": len(answer["edges"]),
+                    "circuit_reward": final["circuit_reward"], **{k: final.get(k) for k in ("term_F1", "term_N", "term_F3", "size")},
+                    "tokens": tokens(target(answer, ev, task["model"]))}
 
 
 def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None) -> int:
@@ -1133,6 +1172,11 @@ def main():
     lc.add_argument("--stride", type=int, default=1)
     lc.add_argument("--lengths", default="0:100000", help="LO:HI: only texts of LO <= tokens < HI (PyTorch's MPS keeps "
                     "per-shape caches, ~20-40 MB of host memory per sequence length: a process over a band of lengths stays bounded)")
+    vt = sub.add_parser("teacher-vpd", help="the interim teacher: VPD's own answer cut to a writable size (vpd_teacher())")
+    vt.add_argument("rows", type=Path)
+    vt.add_argument("out", type=Path, help="directory: <task>.json (circuit JSON) and summary.jsonl")
+    vt.add_argument("--tasks", help="comma-separated task ids (default: every row)")
+    vt.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
     d = sub.add_parser("dataset")
     d.add_argument("rows", type=Path)
     d.add_argument("teacher", type=Path)
@@ -1167,6 +1211,23 @@ def main():
                     f.write(json.dumps(r) + "\n")
                     f.flush()
                     print(r, flush=True)
+        return
+    if args.cmd == "teacher-vpd":
+        from transformers import AutoTokenizer
+
+        tk = AutoTokenizer.from_pretrained(args.tokenizer)
+        count = lambda text: len(tk(text, add_special_tokens=False)["input_ids"])  # noqa: E731
+        args.out.mkdir(parents=True, exist_ok=True)
+        want = set(args.tasks.split(",")) if args.tasks else None
+        for r in map(json.loads, args.rows.read_text().splitlines()):
+            if (want and r["task"] not in want) or (args.out / f"{r['task']}.json").exists():
+                continue
+            task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+            answer, info = vpd_teacher(ge, task, r, count, cache={})
+            (args.out / f"{r['task']}.json").write_text(json.dumps(answer))
+            with (args.out / "summary.jsonl").open("a") as f:
+                f.write(json.dumps(info) + "\n")
+            print(info, flush=True)
         return
     if args.cmd == "requestion":
         with args.out.open("w") as f:

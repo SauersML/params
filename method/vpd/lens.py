@@ -290,8 +290,8 @@ def evaluate(args):
                              "routed": routed(p, r, pts[p][b, q]), "jpp": readout(weighted[p], r, seen)}
                     contrib = full[:, seen]
                     for lens_name, pr in preds.items():
-                        for tokens, m in (("filtered", in_seen), ("all", None)):
-                            x, c = (a[:, None] * pr, contrib) if m is None else (a[:, None] * pr[:, m], contrib[:, m])
+                        for tokens, among in (("filtered", in_seen), ("all", None)):
+                            x, c = (a[:, None] * pr, contrib) if among is None else (a[:, None] * pr[:, among], contrib[:, among])
                             pc, ccn = x - x.mean(-1, keepdim=True), c - c.mean(-1, keepdim=True)
                             corr = (pc * ccn).sum(-1) / (pc.norm(dim=-1) * ccn.norm(dim=-1)).clamp_min(1e-30)
                             tp, tc = x.topk(EFFECT, -1).indices, c.topk(EFFECT, -1).indices

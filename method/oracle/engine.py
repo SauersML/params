@@ -172,9 +172,9 @@ class Engine:
                     qk.setdefault(n, set()).add((b, t, col(n, c)))
         ints = lambda v: torch.tensor(v, dtype=torch.long, device=dev)  # noqa: E731
         btc = lambda keys: tuple(ints([k[j] for k in keys]) for j in range(3))  # noqa: E731
-        return {"B": None if one else len(graphs), "E": E, "O": O, "qk": {n: btc(sorted(v)) for n, v in qk.items()},
-                "readers": {n: btc(list(rows)) for n, rows in readers.items()}, "writers": {n: btc(list(rows)) for n, rows in writers.items()},
-                "edges": {k: tuple(ints(x) for x in v) for k, v in edges.items()}, "out": {k: tuple(ints(x) for x in v) for k, v in outs.items()}}
+        return _positions({"B": None if one else len(graphs), "E": E, "O": O, "qk": {n: btc(sorted(v)) for n, v in qk.items()},
+                           "readers": {n: btc(list(rows)) for n, rows in readers.items()}, "writers": {n: btc(list(rows)) for n, rows in writers.items()},
+                           "edges": {k: tuple(ints(x) for x in v) for k, v in edges.items()}, "out": {k: tuple(ints(x) for x in v) for k, v in outs.items()}})
 
     def _rows(self, p: dict, B: int) -> dict:
         """A one-graph plan's tables for B rows (kept on the plan), row b's entries after row b - 1's."""
@@ -189,11 +189,11 @@ class Engine:
             btc = lambda t: (bs(len(t[0])), t[1].repeat(B), t[2].repeat(B))  # noqa: E731
             R = {n: len(v[0]) for n, v in p["readers"].items()}
             W = {n: len(v[0]) for n, v in p["writers"].items()}
-            p["tiled"][B] = {
+            p["tiled"][B] = _positions({
                 "B": B, "E": B * p["E"], "O": B * p["O"], "qk": {n: btc(v) for n, v in p["qk"].items()},
                 "readers": {n: btc(v) for n, v in p["readers"].items()}, "writers": {n: btc(v) for n, v in p["writers"].items()},
                 "edges": {(rn, wn): (tile(ri, R[rn]), tile(wi, W[wn]), tile(j, p["E"])) for (rn, wn), (ri, wi, j) in p["edges"].items()},
-                "out": {wn: (bs(len(b)), ti.repeat(B), tile(wi, W[wn]), tile(j, p["O"])) for wn, (b, ti, wi, j) in p["out"].items()}}
+                "out": {wn: (bs(len(b)), ti.repeat(B), tile(wi, W[wn]), tile(j, p["O"])) for wn, (b, ti, wi, j) in p["out"].items()}})
         return p["tiled"][B]
 
     def graph_kl(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
@@ -277,7 +277,7 @@ class Engine:
                 b, t, _ = R[no]
                 inp = y[b, t].float()
                 if any(r == no for r, _ in Eg):  # the pattern at the readers' positions [B, H, positions, T]
-                    pos, idx = torch.unique(t, return_inverse=True)
+                    pos, idx = p["positions"][no]
                     z = (q[:, :, pos] @ k.transpose(-1, -2)) / math.sqrt(hd)
                     P = z.masked_fill(torch.arange(T, device=self.dev)[None, :] > pos[:, None], float("-inf")).softmax(-1)
                     for wn, ri, wi, s in shares(no):
@@ -303,6 +303,12 @@ class Engine:
             e = 1.0 if ow is None else ow[j]
             z = z.index_put((b, ti), (e * sw[wn][wi] * aw[wn][wi])[:, None] * self.U[wn].index_select(0, Wr[wn][2][wi]), accumulate=True)
         return norm(z, tg.ln_f)
+
+
+def _positions(p: dict) -> dict:
+    """A plan with its attention-output readers' distinct positions and each reader's index among them."""
+    p["positions"] = {n: torch.unique(t, return_inverse=True) for n, (_, t, _) in p["readers"].items() if n.endswith("o_proj")}
+    return p
 
 
 @contextlib.contextmanager

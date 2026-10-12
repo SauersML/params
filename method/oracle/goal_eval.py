@@ -996,6 +996,84 @@ class GoalEval:
         return torch.log_softmax((norm(xt, tg.ln_f, "final") @ tg.wte.T).float(), -1)
 
 
+    LOO_HELD = ("nodes", "edges", "flips", "donors_near", "donors_far")  # line_loo's families held at the answer's values
+
+    def line_loo(self, tx: Text, graph: native.Graph, pool: dict | None, split: str = "search", draws: int = 8,
+                 bits_start: float | None = None, base: dict | None = None) -> dict:
+        """Each line's leave-one-out effect on the reward's phi and compact (the lead's reward v3, approved 10-12): the
+        answer with that one line deleted (a node with its connections, token edges and pairs; a stated connection;
+        a stated token edge), nothing else re-stranded. Recomputed per deletion: point (s_point_c and N, sufficiency
+        on every deletion at once), track_pp, interchange_pp and pattern, on split's draws; held at the full answer's
+        values (its reward-mode row, base when given): LOO_HELD (nodes, edges, flips, donors near and far, the costly
+        families), so a line's effect on them is 0. phi per deletion from the answer's row with the recomputed terms
+        and their draws (eps re-bootstrapped); compact = log2(bits_start / bits) when bits_start is given. Returns
+        {"phi", "bits", "held", "lines": [{"line", "kind", "phi", "delta_phi", "bits", "delta_bits", "compact"}]}:
+        delta_phi = the answer's phi less the deletion's (above 0: the line helps)."""
+        nat, T = self.nat, tx.T
+        g = strand(graph, tx.targets, nat.C)
+        if base is None:
+            base = self.fidelity(tx, [g], pool, mode="reward", split=split, interchange=draws, changed=draws)[0]
+        P, S = nat.positions(tx.targets), sum(nat.C.values())
+        nodes = sorted(g.node_set())
+        lines = [("node", nd) for nd in nodes]
+        if not g.complete:
+            lines += [("edge", e) for e in _pairs(g)]
+            lines += [("token", e) for e in sorted(getattr(g, "tok_edges", []))] + [("token", (t, None)) for t in getattr(g, "tok_out", [])]
+
+        def keep(h):
+            h.stranded, h.stranded_bits = [], 0.0
+            for name in ("tok_edges", "tok_positions", "tok_out", "pairs"):
+                if hasattr(g, name) and not hasattr(h, name):
+                    setattr(h, name, getattr(g, name))
+            return h
+
+        def without(kind, x):
+            if kind == "node":
+                if g.complete:
+                    return keep(native.Graph([y for y in nodes if y != x], complete=True))
+                h = keep(_drop_nodes(g, {x}))
+                h.tok_edges = [(t, r) for t, r in getattr(g, "tok_edges", []) if r != x]
+                return h
+            if kind == "edge":
+                w, r = x
+                par = {rr: [y for y in ws if not (rr == r and y == w)] for rr, ws in g.parents.items()}
+                return keep(native.Graph(list(g.nodes), {rr: ws for rr, ws in par.items() if ws}, [y for y in g.out if not (r is None and y == w)]))
+            h = keep(native.Graph(list(g.nodes), dict(g.parents), list(g.out)))
+            h.tok_edges = [y for y in getattr(g, "tok_edges", []) if y != x]
+            h.tok_out = [t for t in getattr(g, "tok_out", []) if x != (t, None)]
+            return h
+
+        variants = [without(k, x) for k, x in lines]
+        flat = [expand_blocks(h, nat.C) for h in variants]
+        e0, v0 = self._bounds(tx, "live")
+        point = self.sufficiency(tx, flat)
+        wired = self.sufficiency(tx, [native.Graph(sorted(h.node_set()), complete=True) for h in flat])
+        tpp = self.track_pp(tx, variants, split, draws)
+        ipp = self.interchange_pp(tx, variants, split, draws)
+        pat = self.pattern_family(tx, flat)
+        bits = size_bits(g, P, S, tx.targets, active=tx.vpd)
+        ph = phi(base)[0]
+        out = []
+        for (kind, x), h, pt, wd, a, b, c in zip(lines, variants, point, wired, tpp, ipp, pat):
+            row = dict(base)
+            row.update({"s_point": pt["f1_live"], "s_wiring": wd["f1_live"], "n_point": pt["n_live"],
+                        "draws_point": [[pt["kl_live"], v0]]})
+            row["s_point_c"] = min(y for y in (pt["f1_live"], wd["f1_live"]) if y is not None) if pt["f1_live"] is not None else None
+            row.update(a)
+            row.update(b)
+            row.update(c)
+            for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
+                row.pop(f"eps_{f}", None)  # the recomputed families' eps from their own draws
+            row.update({f"eps_{f}": v for f, v in family_eps(row).items() if f not in self.LOO_HELD})
+            bv = size_bits(h, P, S, tx.targets, active=tx.vpd)
+            pv = phi(row)[0]
+            out.append({"line": [list(x)] if kind == "node" else [list(y) if isinstance(y, tuple) else y for y in x],
+                        "kind": kind, "phi": pv, "delta_phi": None if None in (ph, pv) else ph - pv, "bits": bv,
+                        "delta_bits": bits - bv, "compact": compact(bv, bits_start) if bits_start else None})
+            native.free(nat.dev)
+        return {"phi": ph, "bits": bits, "compact": compact(bits, bits_start) if bits_start else None,
+                "held": list(self.LOO_HELD), "lines": out}
+
     @torch.no_grad()
     def line_effects(self, tx: Text, graph: native.Graph, mode: str = "pp", split: str = "search", draws: int = 8,
                      chunk: int = 16) -> dict:

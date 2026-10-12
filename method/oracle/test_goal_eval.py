@@ -1675,6 +1675,41 @@ def test_cut_partial_modes(tiny):
     v, o = ("h.1.attn.v_proj", 3, 0), ("h.1.attn.o_proj", 5, 0)
     assert ge.cuts(tx, [(v, o)], mode="norm")[0] < 1e-6
 
+
+def test_line_leave_one_out(tiny):
+    """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row
+    with point, N, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run (the held
+    families, LOO_HELD, at the answer's), its bits size_bits of the deleted graph, compact against bits_start."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::8]
+    g = goal_eval.strand(native.Graph(sub, *native.all_edges(sub, tx.targets)), tx.targets, nat.C)
+    p = sorted(q for q, _ in tx.f2)[0]
+    g.tok_edges = [(p, nd) for nd in sorted(g.node_set()) if nd[1] == p and native._name_layer_kind(nd[0])[1] in mech.RESID_READERS][:1]
+    pool = tiny_pool(nat, tx.ids)
+    out = ge.line_loo(tx, g, pool, draws=4, bits_start=1000.0)
+    assert out["held"] == list(ge.LOO_HELD)
+    assert len(out["lines"]) == g.count() + len(goal_eval._pairs(g)) + len(g.tok_edges)
+    base = ge.fidelity(tx, [g], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+    first = out["lines"][0]
+    nd = tuple(first["line"][0])
+    h = goal_eval._drop_nodes(g, {nd})
+    h.stranded, h.stranded_bits = [], 0.0
+    h.tok_edges = [(t, r) for t, r in g.tok_edges if r != nd]
+    h.tok_positions = list(getattr(g, "tok_positions", []))
+    own = ge.fidelity(tx, [h], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+    row = dict(base)
+    for k in ("s_point", "s_wiring", "s_point_c", "n_point", "draws_point", "s_track_pp", "draws_track_pp", "s_interchange_pp",
+              "draws_interchange_pp", "s_pattern", "draws_pattern"):
+        row[k] = own.get(k)
+    for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
+        row.pop(f"eps_{f}", None)
+    want = goal_eval.phi(row)[0]
+    assert abs(first["phi"] - want) < 1e-4, (first["phi"], want)
+    P, S = max(tx.targets) + 1, sum(nat.C.values())
+    assert abs(first["bits"] - goal_eval.size_bits(h, nat.positions(tx.targets), S, tx.targets)) < 1e-9
+    assert abs(first["compact"] - math.log2(1000.0 / first["bits"])) < 1e-12
+
 def test_block_nodes(tiny):
     """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
     stranded by the same rules as a subcomponent of its site, and run by C's families as every subcomponent of the

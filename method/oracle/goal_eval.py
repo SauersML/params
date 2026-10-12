@@ -941,6 +941,7 @@ class GoalEval:
         matrix's remainder W - V U removed too at each position holding one of the graph's subcomponents. A batch
         reuses the model's states before its first removed subcomponent."""
         nat, T = self.nat, tx.T
+        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         one_r = nat._one()[1]
         none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
         sets = [self.masks(g, T) for g in graphs]
@@ -1105,6 +1106,7 @@ class GoalEval:
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
+        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         ms = FLIPS["omitted"] if ms is None else ms
         e0, v0 = self._bounds(tx, "live")
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63) + 1)
@@ -1644,6 +1646,7 @@ class GoalEval:
         adv_mask (the patterns on, as pool indices, the count of the circuit's omissions switched on and those at the
         targets)."""
         nat, dev = self.nat, self.nat.dev
+        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         e0 = self._bounds(tx, "live")[0]
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True)
@@ -1722,6 +1725,7 @@ class GoalEval:
         shortlist measured on it alone. strengths: _adv_problem's (one stated graph at each circuit's connection
         strengths: edge_flips)."""
         nat, dev = self.nat, self.nat.dev
+        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         e0 = self._bounds(tx, "live")[0]
         ms = FLIPS[lever] if ms is None else ms
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))

@@ -549,13 +549,14 @@ def test_tail_split_is_exact():
 
 
 def test_real_removal(tiny):
-    """n_real: the real model without the circuit's subcomponents (everything else on, remainders on), against
-    naive() and Native.without."""
+    """n_real: the real model without the circuit's subcomponents (everything else on, remainders on; a stated graph's
+    stranded nodes dropped first), against naive() and Native.without."""
     nat, ge, tx = tiny
     graphs = [random_graph(nat, tx, 41, k=10), random_graph(nat, tx, 42, k=25), native.Graph()]
     rows = ge.real_removal(tx, graphs)
     full, _ = naive(nat, tx.ids)
     for g, row in zip(graphs, rows):
+        g = goal_eval.strand(g, tx.targets, nat.C)
         on = {n: ~m for n, m in mask_of(nat, tx.T, g.nodes).items()}
         want = _kl(full, naive(nat, tx.ids, on=on, live=True)[0], tx.targets)
         assert abs(row["kl_real_minus"] - want) < 1e-4 + 1e-4 * want
@@ -564,7 +565,7 @@ def test_real_removal(tiny):
         assert row["n_real_off"] == goal_eval.necessity_log(e, row["kl_real_minus"], v)
     assert rows[2]["n_real_live"] == 0.0
     every = [(nat.names[0], t, 0) for t in range(tx.T)] + list(graphs[1].nodes)  # a node at every position
-    row = ge.real_removal(tx, [native.Graph(every)], remainders_at_nodes=False)[0]
+    row = ge.real_removal(tx, [native.Graph(every, complete=True)], remainders_at_nodes=False)[0]
     on = {n: ~m for n, m in mask_of(nat, tx.T, every).items()}
     want = _kl(full, naive(nat, tx.ids, on=on, live=False)[0], tx.targets)  # every remainder removed too
     assert abs(row["kl_real_minus"] - want) < 1e-4 + 1e-4 * want, (row["kl_real_minus"], want)
@@ -1294,3 +1295,21 @@ def test_stranded_nodes_are_dropped_and_charged(tiny):
     for k in ("s_point", "s_wiring", "s_nodes", "s_edges", "c"):
         assert a[k] == b[k], (k, a[k], b[k])
     assert ge.score(tx, [native.Graph(sub + loose, par, out)])[0]["stranded"] == len(loose)
+
+
+def test_families_called_alone_drop_stranded_nodes(tiny):
+    """adversary_flips, necessity_flips and real_removal called outside fidelity (the teachers' searches) score the
+    claim fidelity scores: a graph with stranded nodes gives the numbers of the graph without them."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::3]
+    par, out = native.all_edges(sub, tx.targets)
+    loose = [nd for nd in every if nd not in set(sub) and native._name_layer_kind(nd[0])[1] not in ("q_proj", "k_proj")][:3]
+    pool = tiny_pool(nat, tx.ids)
+    a, b = native.Graph(sub + loose, par, out), native.Graph(sub, par, out)
+    fa, fb = (ge.adversary_flips(tx, [g], pool, "omitted", ms=(1, 4), steps=3, restarts=2)[0] for g in (a, b))
+    assert fa["f1_flips_omitted"] == fb["f1_flips_omitted"] and fa["mask_flips_omitted"] == fb["mask_flips_omitted"]
+    na, nb = (ge.necessity_flips(tx, [g], ms=(1,), steps=3, restarts=2)[0] for g in (a, b))
+    assert na["n_real_flips"] == nb["n_real_flips"]
+    ra, rb = (ge.real_removal(tx, [g])[0] for g in (a, b))
+    assert ra["n_real_live"] == rb["n_real_live"]

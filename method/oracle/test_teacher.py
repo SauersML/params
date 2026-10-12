@@ -284,3 +284,79 @@ def test_changed_acceptance_keeps_its_floor():
     # every step the path took kept the circuit's change in prediction on the changed texts at its floor
     assert floor is not None and len(path) > 1
     assert all(s["s_track"] is None or s["s_track"] >= floor for s in path[1:])
+
+
+def vpd_top(pr, nat, k=61):
+    index = {nd: i for i, nd in enumerate(pr.nodes)}
+    order = [index[(n, int(t), int(c))] for n, t, c in torch.load(VPD_SAVED)["text9000"]["order"] if (n, int(t), int(c)) in index]
+    start = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
+    start[order[:k]] = True                                     # VPD's top 61, the teacher's top-k on this text
+    return start, order[:k]
+
+
+def test_donors_acceptance_admits_exactly_the_passing_sets():
+    nat, pr = pruner(teacher.CONVENTION == "live")
+    ge, tx = pr.ge, pr.tx
+    start, order = vpd_top(pr, nat)
+    as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
+    acc = teacher.Acceptance(ge, tx, ("donors",))
+    hook, base = acc.hook(as_nodes, start)
+    assert set(base) == {"s_donor_near", "s_donor_far"}
+    ons = start[None].repeat(4, 1)
+    for i, k in enumerate((1, 4, 16, 40)):                      # VPD's last k removed
+        ons[i, order[-k:]] = False
+    got = hook(ons)
+    each = ge.donors_search(tx, [as_nodes(on) for on in ons])
+    for g, r in zip(got, each):
+        passes = all(base[k] is None or r[k] is None or r[k] >= min(teacher.RECOVERED, base[k]) for k in base)
+        # a set is admitted exactly when both donor terms keep their floors, with donors_search's own numbers
+        assert (g is not None) == passes
+        if g is not None:
+            assert all(g[k] == r[k] or abs(g[k] - r[k]) <= 1e-4 for k in base)
+
+
+def test_connection_acceptance_from_one_plan():
+    nat, pr = pruner(teacher.CONVENTION == "live")
+    ge, tx = pr.ge, pr.tx
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    start, _ = vpd_top(pr, nat)
+    nodes = [pr.nodes[j] for j in start.nonzero().flatten().tolist()]
+    nodes = [nd for nd in nodes if nd in teacher.routes(nodes, tx.targets)]
+    ep = teacher.EdgePruner(ge, tx, nodes, teacher.CONVENTION == "live", 32)
+    conn = teacher.Connector(ge, tx, pr, empty, vpd, lambda *a: 0.0)
+    on = torch.zeros_like(start)
+    on[torch.tensor([conn.index[nd] for nd in nodes], device=on.device)] = True
+    graph_of = lambda e: conn.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_])  # noqa: E731 (reads ep, on)
+    ons = [ep.on.clone()]
+    for j in range(len(ep.edges)):                             # single cuts that strand no node: one plan's subsets
+        e = ep.on.clone()
+        e[j] = False
+        if not goal_eval.strand(graph_of(e), tx.targets, nat.C).stranded:
+            ons.append(e)
+        if len(ons) == 4:
+            break
+    ons = torch.stack(ons)
+    assert ge._edge_subsets(tx, ep.graph, ons)[1] is None and len(ons) == 4
+    acc = teacher.Acceptance(ge, tx, ("changed",))
+    one = acc.scores([graph_of(e) for e in ons], (ep.graph, ons))
+    each = acc.scores([graph_of(e) for e in ons])
+    # changed_edges' one plan at 0/1 strengths gives changed_search's s_track on the subsets' graphs
+    assert all(a["s_track"] is not None and abs(a["s_track"] - b["s_track"]) <= 1e-3 for a, b in zip(one, each))
+    def dead(sub):                                              # sub's connected nodes with no route
+        par, _ = native.all_edges(sub, tx.targets)
+        reach = teacher.routes(sub, tx.targets)
+        return [nd for nd in sub if nd not in reach and (par.get(nd) or any(nd in ws for ws in par.values()))]
+    every = next(sub for sub in ([x for x in nodes if x != nd] for nd in nodes) if dead(sub))
+    on = torch.zeros_like(start)                                # a node set whose graph strands a connected node itself:
+    on[torch.tensor([conn.index[nd] for nd in every], device=on.device)] = True   # ons' columns are its connections,
+    ep = teacher.EdgePruner(ge, tx, every, teacher.CONVENTION == "live", 32)       # more than its plan's
+    ons = ep.on[None].repeat(3, 1)
+    ons[1, len(ep.edges) // 2:] = False
+    ons[2, :len(ep.edges) // 2] = False
+    subs = ge._edge_subsets(tx, ep.graph, ons)[1]
+
+    def stated(g):
+        g = goal_eval.strand(g, tx.targets, nat.C)
+        return sorted(g.node_set()), sorted((w, r) for r, ws in g.parents.items() for w in ws), sorted(g.out)
+    # each subset read in ep's column order: the graph its row states, stranded nodes dropped
+    assert subs is not None and [stated(g) for g in subs] == [stated(graph_of(e)) for e in ons]

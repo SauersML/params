@@ -2385,11 +2385,12 @@ class GoalEval:
         return out
 
     def _edge_subsets(self, tx: Text, graph: native.Graph, ons: torch.Tensor) -> tuple:
-        """(graph with its stranded nodes dropped, None), or with a subset of ons (edge_flips') that strands another
-        node, (that, each subset's graph as stated with its stranded nodes dropped)."""
+        """(graph with its stranded nodes dropped, None), or with a subset of ons (edge_flips', in graph's order) that
+        strands a node, or a graph that strands one itself (its plan's connections are fewer than ons' columns), (that,
+        each subset's graph as stated with its stranded nodes dropped)."""
         base = strand(graph, tx.targets, self.nat.C)  # nodes no path of graph reaches the prediction from: stranded in every subset
-        edges = [(w, r) for r, ws in base.parents.items() for w in ws] + [(w, None) for w in base.out]
-        nodes = sorted(base.node_set())
+        edges = [(w, r) for r, ws in graph.parents.items() for w in ws] + [(w, None) for w in graph.out]
+        nodes = sorted(graph.node_set())
         subs = []
         for row in ons.tolist():
             kept = [e for e, k_ in zip(edges, row) if k_]
@@ -2398,7 +2399,7 @@ class GoalEval:
                 if r is not None:
                     parents.setdefault(r, []).append(w)
             subs.append(strand(native.Graph(nodes, parents, [w for w, r in kept if r is None]), tx.targets, self.nat.C))
-        return base, (subs if any(sub.stranded for sub in subs) else None)
+        return base, (subs if base.stranded or any(sub.stranded for sub in subs) else None)
 
     def changed_edges(self, tx: Text, graph: native.Graph, ons: torch.Tensor, split: str = "search", draws: int = 16) -> list[dict]:
         """changed_inputs on connection subsets of one node set (edge_flips' graph and ons: a teacher's connection

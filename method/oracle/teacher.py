@@ -70,11 +70,12 @@ Per text:
      keep it honest (a flip joined with its connections pruned is cut from readers it writes into in the model), its
      size term stops growth that does not pay (on text9011 a repair on the C-like minimum alone added 156
      subcomponents, most unconnected, for +0.036).
-  With --accept changed[,interchange], every removal, of nodes (step 1's rounds, the joint path's prefixes) and of
-  connections, is admitted only while the search split's terms stay >= min(0.9, the search's start's) (Acceptance):
-  changed, s_track (the circuit's change in prediction on texts changed at the sensitivity probe's positions,
-  applied to the model's base prediction, against VPD's answer's: goal_eval.changed_search), interchange,
-  s_interchange (goal_eval.interchange_search). Removal alone keeps circuits that reproduce the base prediction while
+  With --accept changed[,donors][,interchange], every removal, of nodes (step 1's rounds, the joint path's prefixes)
+  and of connections, is admitted only while the search split's terms stay >= min(0.9, the search's start's)
+  (Acceptance): changed, s_track (the circuit's change in prediction on texts changed at the sensitivity probe's
+  positions, applied to the model's base prediction, against VPD's answer's: goal_eval.changed_search), interchange,
+  s_interchange (goal_eval.interchange_search), donors, s_donor_near and s_donor_far (the outside of the circuit at a
+  donor text's activations: goal_eval.donors_search). Removal alone keeps circuits that reproduce the base prediction while
   ignoring the context: 8 of primerl's 10 bake-off texts omitted the position whose change moves the prediction most,
   and pruned connections cut the paths a context change travels (held-out changed-input scores 0.00-0.14). The node
   rounds and joint path run only without --from-path; the connections either way.
@@ -546,7 +547,8 @@ def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",
     return steps
 
 
-ACCEPT = {"changed": ("changed_search", "s_track"), "interchange": ("interchange_search", "s_interchange")}
+ACCEPT = {"changed": ("changed_search", ("s_track",)), "interchange": ("interchange_search", ("s_interchange",)),
+          "donors": ("donors_search", ("s_donor_near", "s_donor_far"))}
 
 
 class Acceptance:
@@ -554,31 +556,39 @@ class Acceptance:
     goal_eval.GoalEval.changed_search (texts changed at the sensitivity probe's positions: the circuit's change in
     prediction applied to the model's base prediction, against VPD's answer's, bounded by no change), and
     "interchange", s_interchange from interchange_search (the circuit's subcomponents at a position set to the
-    model's activations on a changed text, against VPD's answer under the same patches). A candidate passes while each
-    term stays >= min(0.9, the search's start's); a term that is None (uninformative on the text) passes. The
-    splits' eval draws stay held out (gates, tables)."""
+    model's activations on a changed text, against VPD's answer under the same patches), and "donors", s_donor_near and
+    s_donor_far from donors_search (every subcomponent outside the circuit at its activation on a donor text: the
+    changed texts, and training texts, against VPD's answer under the same donors, bounded by keeping nothing). A
+    candidate passes while each term stays >= min(0.9, the search's start's); a term that is None (uninformative on
+    the text) passes. The splits' eval draws stay held out (gates, tables)."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds):
         self.ge, self.tx, self.kinds, self.calls = ge, tx, tuple(kinds), 0
 
-    def scores(self, graphs: list) -> list[dict]:
+    def scores(self, graphs: list, edges: tuple | None = None) -> list[dict]:
+        """Per graph its terms; edges, (graph, ons [K, connections]): the graphs are those connection subsets of one
+        node set, and "changed" runs from one plan of it (goal_eval changed_edges, the same numbers)."""
         out = [{} for _ in graphs]
         for k in self.kinds:
-            fn, key = ACCEPT[k]
-            for o, r in zip(out, getattr(self.ge, fn)(self.tx, graphs)):
-                o[key] = r[key]
+            fn, keys = ACCEPT[k]
+            got = (self.ge.changed_edges(self.tx, *edges, "search") if k == "changed" and edges is not None
+                   else getattr(self.ge, fn)(self.tx, graphs))
+            for o, r in zip(out, got):
+                o.update({key: r[key] for key in keys})
         self.calls += 1
         return out
 
-    def hook(self, graph_of, start: torch.Tensor) -> tuple:
+    def hook(self, graph_of, start: torch.Tensor, edges_of=None) -> tuple:
         """(accept(ons) for Descent.prune and joint_path: per candidate unit set [K, units], its terms when each is at or
-        above its floor, else None; the start's terms). graph_of(on): a unit set's circuit as goal_eval runs it."""
-        base = self.scores([graph_of(start)])[0]
+        above its floor, else None; the start's terms). graph_of(on): a unit set's circuit as goal_eval runs it;
+        edges_of(ons), for connection sets: (the node set's graph with every connection, ons) for scores' edges."""
+        def run(ons):
+            return self.scores([graph_of(on) for on in ons], None if edges_of is None else edges_of(ons))
+        base = run(start[None])[0]
         floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
 
         def accept(ons):
-            got = self.scores([graph_of(on) for on in ons])
-            return [r if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r) else None for r in got]
+            return [r if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r) else None for r in run(ons)]
         return accept, base
 
 
@@ -654,8 +664,9 @@ class Connector:
 
             def accept(ons):
                 return [{"f1_flips": f} if f >= floor else None for f in flips(ons)]
-        if self.acceptance is not None:                      # the search-split terms of the stated graph
-            terms, base = self.acceptance.hook(lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]), ep.on)
+        if self.acceptance is not None:                      # the search-split terms of the stated graph ("changed" from
+            terms, base = self.acceptance.hook(              # one plan of the node set's, changed_edges)
+                lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]), ep.on, lambda ons: (ep.graph, ons))
             accept, start = both(accept, terms), {**start, **base}
 
         def state(kl, e_on, removed):
@@ -960,7 +971,8 @@ def main():
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
     ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "
-                    ">= min(0.9, the search's start's): changed (s_track, goal_eval.changed_search), interchange (s_interchange)")
+                    ">= min(0.9, the search's start's): changed (s_track, goal_eval.changed_search), interchange (s_interchange), "
+                    "donors (s_donor_near and s_donor_far, donors_search)")
     ap.add_argument("--no-strand", action="store_true",
                     help="with --edges, every non-query/key node keeps a stated connection (its most important; one the model connects "
                          "to no other node is dropped): the stated graph is the claim, a listed node needs a stated role")

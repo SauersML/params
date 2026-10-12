@@ -90,6 +90,7 @@ SCALE_BITS = 16  # a scale factor other than 0, as a half-precision number
 FORM_BITS = 2  # an operation's form: cut or scale, local or persistent
 CHUNK = 16  # edited runs of a whole text per batch (more when they start later)
 BLOCK = 256  # edits scored at once
+POSITIONS = 1024  # positions per block of vocabulary-sized arrays
 MAX_OPS = 16  # the search's largest edit
 SCREEN = 256  # the search's candidates after its first round: the most helpful of that round
 NODE_SCALES = (0.0, -1.0, 2.0)  # the search's scale factors for a node
@@ -499,10 +500,11 @@ class EditEval:
     # runs
 
     def _runs(self, seqs: list[list[int]], edits: list[list[dict]], fn, ref: bool = False) -> list:
-        """fn(log q [T - s, V] at positions s.., index, s, log p of the unedited run there or None) per (sequence,
-        edit) pair: the rows of one sequence batched, each batch from the first position its edits change
-        (Editor.start); ref: the unedited run computed with each batch (nothing kept between calls). fn keeps no view
-        of the vocabulary-sized arrays it is given."""
+        """fn(log q [m, T - s, V] at positions s.. of m rows, their indices, s, log p [T - s, V] of the unedited run
+        there or None) -> one result per row, over (sequence, edit) pairs: the rows of one sequence batched, each batch
+        from the first position its edits change (Editor.start), its vocabulary arrays in blocks of at most POSITIONS
+        positions; ref: the unedited run computed with each batch (nothing kept between calls). fn keeps no view of
+        the vocabulary-sized arrays it is given."""
         out = [None] * len(seqs)
         by = {}
         for i, (sq, ops) in enumerate(zip(seqs, edits)):
@@ -520,8 +522,11 @@ class EditEval:
                 eds = [edits[i] for _, i in part] + ([[]] if ref else [])
                 hid = self.ed.hidden(ids.expand(len(eds), -1), eds, start=s)
                 lp = torch.log_softmax((hid[-1] @ wte.T).float(), -1) if ref else None
-                for j, (_, i) in enumerate(part):
-                    out[i] = fn(torch.log_softmax((hid[j] @ wte.T).float(), -1), i, s, lp)
+                m = max(1, POSITIONS // hid.shape[1])
+                for j0 in range(0, len(part), m):
+                    idx = [i for _, i in part[j0:j0 + m]]
+                    for i, r in zip(idx, fn(torch.log_softmax((hid[j0:j0 + len(idx)] @ wte.T).float(), -1), idx, s, lp)):
+                        out[i] = r
             native.free(self.nat.dev)
         return out
 
@@ -531,25 +536,27 @@ class EditEval:
         return (lp.exp() * (lp - lq)).sum(-1) / LN2
 
     @staticmethod
-    def _kept_kl(lp: torch.Tensor, lq: torch.Tensor, named: list[int]) -> float:
-        """KL in bits over the tokens not named, both distributions renormalized over them."""
+    def _kept_kl(lp: torch.Tensor, lq: torch.Tensor, named: list[int]) -> torch.Tensor:
+        """KL in bits over the tokens not named, both distributions renormalized over them, per row of lq [..., V]
+        (lp [V] or the same shape)."""
         if not named:
-            return float(EditEval._kl(lp, lq))
-        keep = torch.ones_like(lp, dtype=torch.bool)
+            return EditEval._kl(lp, lq)
+        keep = torch.ones(lq.shape[-1], dtype=torch.bool, device=lq.device)
         keep[named] = False
         a = torch.log_softmax(lp.masked_fill(~keep, -float("inf")), -1)
         b = torch.log_softmax(lq.masked_fill(~keep, -float("inf")), -1)
-        return float((a.exp() * (a - b)).masked_fill(~keep, 0).sum() / LN2)
+        return (a.exp() * (a - b)).masked_fill(~keep, 0).sum(-1) / LN2
 
-    def _text_terms(self, ids: list[int], targets: list[int], named: list[int], edits: list[list[dict]]) -> list:
-        """Per edit on the text: (collateral summed over the text, the target's log q [V])."""
+    def _text_terms(self, ids: list[int], targets: list[int], named: list[int], edits: list[list[dict]], tok: int | None) -> list:
+        """Per edit on the text: (collateral summed over the text, the target's _margin for tok or None)."""
         t = max(targets)
 
-        def fn(lq, i, s, lp):
-            kl = self._kl(lp, lq)
+        def fn(lq, idx, s, lp):
+            kl = self._kl(lp, lq)  # [m, L]
             tt = [x - s for x in targets]
-            return (float(kl.sum() - kl[tt].sum()) + sum(self._kept_kl(lp[x - s], lq[x - s], named) for x in targets),
-                    lq[t - s].clone())
+            coll = (kl.sum(1) - kl[:, tt].sum(1) + sum(self._kept_kl(lp[x], lq[:, x], named) for x in tt)).tolist()
+            ms = _margin(lq[:, t - s], tok).tolist() if tok is not None else [None] * len(coll)
+            return list(zip(coll, ms))
         return self._runs([ids] * len(edits), edits, fn, ref=True)
 
     def _held_terms(self, which: str, edits: list[list[dict]]) -> list[float]:
@@ -565,7 +572,7 @@ class EditEval:
                 seqs.append(sq)
                 eds.append(edits[b])
                 owner.append((b, j))
-        kls = self._runs(seqs, eds, lambda lq, i, s, lp: float(self._kl(lp, lq).sum()), ref=True)
+        kls = self._runs(seqs, eds, lambda lq, idx, s, lp: self._kl(lp, lq).sum(1).tolist(), ref=True)
         for (b, _), k in zip(owner, kls):
             out[b] += k / len(texts)
         return out
@@ -577,7 +584,7 @@ class EditEval:
             for sq in [ids] + alts:
                 seqs.append(sq)
                 eds.append(ops)
-        lq = self._runs(seqs, eds, lambda lq, i, s, lp: lq[t - s].clone())
+        lq = self._runs(seqs, eds, lambda lq, idx, s, lp: list(lq[:, t - s].clone()))
         k = 1 + len(alts)
         return [float(sum(self._kl(lq[j * k], lq[j * k + 1 + a]) for a in range(len(alts))) / len(alts)) for j in range(len(edits))]
 
@@ -602,14 +609,14 @@ class EditEval:
         lp = self.reference(ids)
         t = max(targets)
         named = [goal["token_id"]] if goal["kind"] in ("flip", "raise") else []
-        terms = self._text_terms(ids, targets, named, eds)
+        terms = self._text_terms(ids, targets, named, eds, goal.get("token_id") if goal["kind"] in ("flip", "raise") else None)
         held = self._held_terms("search" if search else "held", eds)
         if goal["kind"] in ("flip", "raise"):
             sign = 1.0 if goal["kind"] == "flip" else -1.0
             m0 = float(sign * _margin(lp[t], goal["token_id"]))
             prog = []
-            for _, lq in terms:
-                m = float(sign * _margin(lq, goal["token_id"]))
+            for _, m in terms:
+                m = sign * m
                 prog.append((min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, m < 0, m))
         else:  # detach
             alts = self.alternatives(ids, goal["position"], SEARCH_RANKS if search else SCORE_RANKS)
@@ -646,15 +653,17 @@ class EditEval:
                 es.append(ops)
                 owner.append((j, i))
 
-        def fn(lq, n, s, lp):
-            c = half[owner[n][1]]
-            kl = self._kl(lp, lq)
-            t = c["t"]
-            m0, m = float(_margin(lp[t], c["wrong"])), float(_margin(lq[t], c["wrong"]))
-            rest = self._kept_kl(lp[t], lq[t], [c["wrong"]])
-            return {"progress": min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, "flipped": m < 0,
-                    "halved": float(lq[t, c["wrong"]] - lp[t, c["wrong"]]) <= -LN2, "rest": rest,
-                    "actual_top": int(lq[t].argmax()) == c["actual"], "kept": float(kl.sum() - kl[t]) + rest}
+        def fn(lq, idx, s, lp):  # the rows of one batch share their instance (and s = 0: persistent edits)
+            c = half[owner[idx[0]][1]]
+            kl = self._kl(lp, lq)  # [m, L]
+            t, w = c["t"], c["wrong"]
+            m0, ms = float(_margin(lp[t], w)), _margin(lq[:, t], w).tolist()
+            rest = self._kept_kl(lp[t], lq[:, t], [w])
+            kept = (kl.sum(1) - kl[:, t] + rest).tolist()
+            drop = (lq[:, t, w] - lp[t, w]).tolist()
+            top = (lq[:, t].argmax(-1) == c["actual"]).tolist()
+            return [{"progress": min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0, "flipped": m < 0, "halved": d <= -LN2,
+                     "rest": r, "actual_top": a, "kept": k} for m, d, r, a, k in zip(ms, drop, rest.tolist(), top, kept)]
         per = self._runs(seqs, es, fn, ref=True)
         held = self._held_terms("search" if search else "held", eds)
         key = self.key("copy", goal)
@@ -884,7 +893,7 @@ def screen_local(ee: EditEval, half: list[dict], ops_at, n: int, top: int, log=p
         lp = ee.reference(c["ids"])
         t = c["t"]
         m0 = float(_margin(lp[t], c["wrong"]))
-        res = ee._runs([c["ids"]] * len(ops_at), [[f(t)] for f in ops_at], lambda lq, i, s, lp: float(_margin(lq[t - s], c["wrong"])))
+        res = ee._runs([c["ids"]] * len(ops_at), [[f(t)] for f in ops_at], lambda lq, idx, s, lp: _margin(lq[:, t - s], c["wrong"]).tolist())
         score += np.array([min(1.0, max(0.0, (m0 - m) / m0)) if m0 > 0 else 1.0 for m in res]) / len(sub)
     order = np.argsort(-score, kind="stable")[:top]
     log(f"  screened {len(ops_at)} candidates on {len(sub)} instances; best mean local progress {score[order[0]]:.3f}")

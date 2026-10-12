@@ -6,7 +6,9 @@
 # circuits go up as compressed tars, the Pile rows (edit_eval.py tokens) and the copy set as files (where rp-run puts them); VPD's checkpoint
 # (its causal-importance network ranks VPD's subcomponents) is put back together from its two published pieces.
 # Everything comes back to ~/mpd-data/runpod/NAME/out.
-#   experiments/oracle/pods/edit_pod.sh [NAME] [HOURS]      env: N, P, GPU, PRICE
+# FROM=DIR (an earlier run's out directory): its goals and finished teach rows go up first, and the goals done there
+# are skipped.
+#   experiments/oracle/pods/edit_pod.sh [NAME] [HOURS]      env: N, P, FROM, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -17,6 +19,14 @@ F=/Users/user/mpd-data/scratch/rustmove/edit/pod
 mkdir -p "$F"
 COPYFILE_DISABLE=1 tar -czf "$F/texts.tgz" -C $G texts/vpd4l
 COPYFILE_DISABLE=1 tar -czf "$F/teacher.tgz" -C $G teacher/joint_heldout
+PRIOR=""
+if [ -n "${FROM:-}" ]; then
+  rm -rf "$F/prior"; mkdir -p "$F/prior"
+  cp "$FROM/goals.jsonl" "$F/prior/goals.jsonl"; PRIOR="cp $F/prior/goals.jsonl $O/out/goals.jsonl;"
+  for k in $(seq 0 $((P - 1))); do
+    if [ -f "$FROM/teach_$k.jsonl" ]; then cp "$FROM/teach_$k.jsonl" "$F/prior/teach_$k.jsonl"; PRIOR="$PRIOR cp $F/prior/teach_$k.jsonl $O/out/teach_$k.jsonl;"; fi
+  done
+fi
 RUNS="" ROWS=""
 for k in $(seq 0 $((P - 1))); do
   RUNS="$RUNS (python -B edit_eval.py teach $O/out/goals.jsonl $O/out/teach_$k.jsonl --offset $k --stride $P > $O/teach_$k.log 2>&1; echo \"exit \$?\" >> $O/teach_$k.log) &"
@@ -30,7 +40,7 @@ python -c \"import torch; from safetensors.torch import load_file; d = {**load_f
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 python -B -m pytest -q test_edit_eval.py > $O/test.log 2>&1 || echo STAGE tests FAILED;
-python -B edit_eval.py goals $O/out/goals.jsonl --split heldout --n $N > $O/goals.log 2>&1;
+$PRIOR [ -s $O/out/goals.jsonl ] || python -B edit_eval.py goals $O/out/goals.jsonl --split heldout --n $N > $O/goals.log 2>&1;
 set +e; (python -B edit_eval.py copy $O/out/copy.json > $O/copy.log 2>&1; echo \"exit \$?\" >> $O/copy.log) & $RUNS wait;
 cat $ROWS > $O/out/teach.jsonl; python -B edit_eval.py table $O/out/teach.jsonl $O/out/copy.json > $O/out/table.txt 2>&1; echo all stages done"
 RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=20 RP_MIN_RAM_GB=32 RP_DISK_GB=48 \

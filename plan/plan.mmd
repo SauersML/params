@@ -64,7 +64,7 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>correct copy circuits vs<br/>plausible wrong ones<br/>ACTIVE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>a weak start must not lower the bar;<br/>unscored families count as failures<br/>ACTIVE · codex, inframove, primerl"]
+    W4["<b>Reward repair</b><br/>common removal tests for all candidates;<br/>absolute sufficiency before size credit<br/>ACTIVE · codex, inframove, primerl"]
   end
 
   %% ===================== verifier and foundations =====================
@@ -140,7 +140,7 @@ flowchart BT
   %% ===================== legend and operating agreement =====================
   subgraph LEG["LEGEND"]
     direction LR
-    k1["done"] ~~~ k2["active"] ~~~ k8["check"] ~~~ k3["blocked"] ~~~ k4["waiting"] ~~~ k5{{"gate"}} ~~~ k6["later"] ~~~ k7["<b>Updated 2026-10-12</b><br/>RunPod cap $390 (user +$30)<br/>Tinker $130<br/>codex: extra $40 shared"]
+    k1["done"] ~~~ k2["active"] ~~~ k8["check"] ~~~ k3["blocked"] ~~~ k4["waiting"] ~~~ k5{{"gate"}} ~~~ k6["later"] ~~~ k7["<b>Updated 2026-10-12</b><br/>Base caps: RunPod $360, Tinker $130<br/>Extra $40 SHARED across both"]
   end
   IMPA ~~~ LEG
 

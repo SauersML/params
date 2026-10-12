@@ -165,6 +165,81 @@ def aggregate(a):
                                 'scope': '4 development texts, first samples, circuit-only; no English claim'})
 
 
+def panel_worker(a):
+    """Replay saved circuits on common interventions; all other metrics stay frozen."""
+    sys.path.insert(0, str(a.source / 'method/oracle'))
+    import torch
+    import components
+    import goal_eval
+    import native
+    import intervention_panel
+    import reward_gate
+
+    assert torch.cuda.is_available(), 'GPU panel worker requires CUDA'
+    torch.cuda.set_per_process_memory_fraction(0.46)
+    data = json.loads(a.inputs.read_text())
+    tasks = TASKS[2*a.worker:2*a.worker+2]
+    a.out.mkdir(parents=True, exist_ok=False)
+    prior = {}
+    for t in tasks:
+        path = a.prior / (t + '.checkpoint.jsonl')
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        completed = [r for r in records if r.get('type') == 'task' and r['task'] == t]
+        assert len(completed) == 1
+        prior[t] = completed[0]
+    names = ('sft', 'rl25', 'teacher')
+    source_files = ('components.py', 'goal_eval.py', 'native.py', 'engine.py', 'carry.py',
+                    'intervention_panel.py', 'reward_gate.py')
+    save(a.out / 'manifest.json', {
+        'tasks': tasks, 'source_rev': a.rev, 'split': 'eval', 'draws': 32,
+        'source_sha256': {f: hashlib.sha256((a.source/'method/oracle'/f).read_bytes()).hexdigest()
+                          for f in source_files},
+        'input_sha256': hashlib.sha256(a.inputs.read_bytes()).hexdigest(),
+        'prior_sha256': {t: hashlib.sha256((a.prior/(t+'.checkpoint.jsonl')).read_bytes()).hexdigest()
+                         for t in tasks},
+        'scope': 'New common-node panel plus sufficiency guard; other families frozen from prior run. Not a full rescore.'})
+    nat = native.Native(dev='cuda')
+    assert nat.has_importance
+    ge = goal_eval.GoalEval(nat)
+    for t in tasks:
+        started = time.monotonic()
+        task = json.loads((native.TEXTS/'vpd4l'/(t+'.json')).read_text())
+        prompt = task['prompts'][0]
+        tx = ge.text(prompt['token_ids'], prompt['target_positions'], task=task)
+        graphs = [goal_eval.circuit(components.parse(data['sets'][name][t][0][0])['answer'],
+                                   tx.targets, nat.C, len(tx.ids))[0] for name in names]
+        panels = intervention_panel.evaluate(ge, tx, graphs + [native.Graph(), native.Graph(masks=tx.vpd)],
+                                             split='eval', draws=32)
+        # Preserve the common world once, not once per candidate in every draw.
+        save(a.out/(t+'.bank.json'), intervention_panel.bank(tx, split='eval', draws=32))
+        for panel in panels:
+            for draw in panel['draws']:
+                draw.pop('removed', None)
+            panel['bank_file'] = t+'.bank.json'
+        rows = []
+        for name, panel in zip(names, panels):
+            old = prior[t]['per_question'][name]['samples'][0]
+            modified = dict(old['fidelity'])
+            modified['rl_terms'] = {**modified.get('rl_terms', {}), 's_nodes': panel['raw_score']}
+            modified['eps_nodes'] = panel['eps']
+            ph = goal_eval.phi(modified)[0]
+            qualification = reward_gate.qualify(goal_eval.family_score(modified, 'point'), ph,
+                                                old['phi_tau'], dominance=old.get('D') or 0.0)
+            # Undefined common calibration is a shared evidence gap, never successful omission.
+            comparable = panel['resolved'] and ph is not None
+            proposed = (ph + qualification['g'] * 0.5 * (old.get('compact') or 0.0)
+                        + qualification['D']) if comparable else None
+            rows.append({'policy': name, 'prior_circuit_reward': old['circuit_reward'],
+                         'prior_phi': old['phi'], 'point_score': goal_eval.family_score(modified, 'point'),
+                         'prospective_phi': ph if comparable else None,
+                         'prospective_circuit_reward': proposed, 'qualification': qualification, 'panel': panel})
+        save(a.out/(t+'.json'), {'task': t, 'rows': rows, 'empty': panels[-2], 'vpd': panels[-1],
+             'seconds': time.monotonic()-started, 'gpu_peak_allocated_bytes': torch.cuda.max_memory_allocated(),
+             'scope': 'Exploratory replacement of node family only; original tau retained, other families frozen.'})
+        print(json.dumps({'task': t, 'rows': [{k: v for k, v in r.items() if k != 'panel'} for r in rows]}), flush=True)
+        torch.cuda.empty_cache()
+
+
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest='command', required=True)
 f = sub.add_parser('prepare'); f.add_argument('--data', type=Path, required=True); f.add_argument('--out', type=Path, required=True)
@@ -172,5 +247,12 @@ f.add_argument('--source', type=Path, required=True)
 f = sub.add_parser('worker'); f.add_argument('--worker', type=int, choices=(0,1), required=True); f.add_argument('--source',type=Path,required=True)
 f.add_argument('--inputs',type=Path,required=True); f.add_argument('--out',type=Path,required=True); f.add_argument('--rev',required=True)
 f = sub.add_parser('aggregate'); f.add_argument('--out',type=Path,required=True)
+f = sub.add_parser('panel-worker')
+f.add_argument('--worker', type=int, choices=(0, 1), required=True)
+f.add_argument('--source', type=Path, required=True)
+f.add_argument('--inputs', type=Path, required=True)
+f.add_argument('--prior', type=Path, required=True)
+f.add_argument('--out', type=Path, required=True)
+f.add_argument('--rev', required=True)
 a = p.parse_args()
-{'prepare': prepare, 'worker': worker, 'aggregate': aggregate}[a.command](a)
+{'prepare': prepare, 'worker': worker, 'aggregate': aggregate, 'panel-worker': panel_worker}[a.command](a)

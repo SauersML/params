@@ -5,15 +5,17 @@
 # rows (parts.py tokens), the atlas files and vpd4l's weights come from rp-run-data (VPD's checkpoint in two pieces under
 # GitHub's 2 GiB asset limit, put back together on the pod); the parts files and the atlas with its look-ahead
 # fields come back to ~/mpd-data/runpod/NAME (the activity chunks are dropped on the pod once the rows are built).
+# The image's torch (no pinned environment: any host with CUDA 12.4 qualifies) with the few packages it lacks.
 #   experiments/vpd/atlas_pod.sh [NAME] [HOURS]     (env: GPU, PRICE)
 cd /Users/user/params
 N=${1:-oracle-graph-atlas-parts} H=${2:-2}
 O=/Users/user/mpd-data/runpod/$N W=/workspace/runs/$N A=/Users/user/mpd-data/atlas/vpd4l
 V=/Users/user/mpd-data/vpd
 CMD="set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/parts;
+python -m pip install -q safetensors pyyaml tokenizers scipy;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json $A/tokens_0_6000.npy $A/atlas.json $A/atlas.safetensors /Users/user/params/method/vpd > /dev/null;
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
-cd /Users/user/params; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
+cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 python -m method.vpd.parts activity --out $O/parts --tokens $A/tokens_0_6000.npy --device cuda --batch 8;
 rm -rf $O/parts/chunks_train $O/parts/chunks_heldout;
 cp $A/atlas.json $A/atlas.safetensors $O/;
@@ -21,5 +23,5 @@ python -m method.vpd.atlas lookahead --out $O --tokens $A/tokens_0_6000.npy --de
 python -m method.vpd.lens fit --out $O --tokens $A/tokens_0_6000.npy --device cuda || echo STAGE lens fit FAILED;
 python -m method.vpd.lens evaluate --out $O --tokens $A/tokens_0_6000.npy --device cuda || echo STAGE lens evaluate FAILED;
 echo all stages done"
-RP_OWNER=rustmove RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=24 RP_MIN_RAM_GB=32 RP_DISK_GB=60 \
-  experiments/infra/runpod/rp-run $N "${GPU:-NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA A40,NVIDIA L4}" $H -- bash -c "$CMD"
+RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=20 RP_MIN_RAM_GB=24 RP_DISK_GB=48 \
+  experiments/infra/runpod/rp-run $N "${GPU:-NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA A40,NVIDIA RTX A6000,NVIDIA RTX A4500,NVIDIA RTX 4000 Ada Generation,NVIDIA L4}" $H -- bash -c "$CMD"

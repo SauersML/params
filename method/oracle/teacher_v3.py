@@ -27,7 +27,13 @@ measured and ranked, the most of them in that order that keep it >= 0.9), the re
 (else the removal halved); with --edges, the connections by teacher.Connector (C's semantics, the scorecard's) and the
 flip repair (teacher.Connector.repair: the omitted lever's flips joined, the connections pruned again from the kept
 ones, while min(graph F1, node F1, F1 under the flips) improves: node F1, the node set with every connection among
-its nodes, so that a flip joined with its connections cut does not count); with --max-tokens, the answer's tokens.
+its nodes, so that a flip joined with its connections cut does not count); while the answer is longer than
+--max-tokens (components.ANSWER_BUDGET), the pick among the smaller stages instead.
+
+With --seeds S, S searches (seeds 0..S-1; the gates' noise and initial draws), and the written circuit the one with
+the reward's best circuit score, mean(C, N) - 0.5 size (C: goal_eval.GoalEval.fidelity, mode "reward"; size
+goal_eval.size_term): valid robust circuits are many (float noise alone moved fleet's picks on 4 of 4 texts), so the
+teacher is the best of several; the summary's "seeds" rows give the spread. The gradient steps run in float32.
 
   MPD_MEM_GIB=24 ~/mpd-data/venv/bin/python -B teacher_v3.py --tasks FILE --vpd ~/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --edges --out DIR
 Output per text in --out: <task>.json (goal_eval circuit JSON), <task>.path.json ({"method": "v3", "start_nodes",
@@ -80,7 +86,7 @@ class MaskSearch:
             sel = (pr.mat == j).nonzero().flatten()
             self.flat[sel] = self.offsets[j][0] + pr.t[sel] * len(cols) + torch.searchsorted(cols, pr.c[sel])
         self.logit = torch.full((len(pr.nodes),), INIT, device=self.dev, requires_grad=True)
-        self.search = "bf16" if str(self.dev).startswith("cuda") else "score"
+        self.search = "score"   # float32 gradient steps: bfloat16 noise moved fleet's picks on 4 of 4 texts (f44147b)
 
     def sample(self, S: int) -> torch.Tensor:
         u = torch.rand(S, len(self.logit), device=self.dev).clamp(1e-6, 1 - 1e-6)
@@ -186,7 +192,7 @@ def removals(meas: Measure, on: torch.Tensor, row: dict, goal: float = teacher.R
 
 def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answer: dict, pool: dict, B: int = 32,
            edges: bool = False, repair: bool = False, max_nodes: int | None = teacher.MAX_NODES, tokens=None,
-           max_tokens: int = components.ANSWER_BUDGET, seed: int = 0) -> tuple[dict, dict, dict]:
+           max_tokens: int = components.ANSWER_BUDGET, seeds=(0,)) -> tuple[dict, dict, dict]:
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets)
@@ -205,90 +211,132 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
         bits = n * node_bits + k_tok * pos_bits + (math.log2(n + k_tok) * (2 * inner + out) if n else 0.0)
         return goal_eval.size_term(bits, scale)
 
-    ms = MaskSearch(ge, tx, pr, live=teacher.CONVENTION == "live")
     meas = Measure(ge, tx, pr, empty, vpd, pool)
-    torch.manual_seed(seed)
-    opt = torch.optim.Adam([ms.logit], lr=LR)
-    lever = torch.zeros(SAMPLES, len(pr.nodes), device=nat.dev)
-    stages = []
-    for lam in LAMBDAS:
-        t1 = time.perf_counter()
-        for _ in range(STEPS):
-            z = ms.sample(SAMPLES)
-            zd = z.detach()
-            for _ in range(INNER):                               # the lever: sign steps on the run's KL, top REPAIR_M
-                b = lever.clone().requires_grad_(True)
-                g, = torch.autograd.grad(ms.kl(zd + (1 - zd) * b, ms.search).clamp_min(TINY).log().sum(), [b])
-                lever = top((lever + ADV_STEP * g.sign()).clamp(0, 1), teacher.REPAIR_M)
-            opt.zero_grad()
-            adv = ms.kl(z + (1 - z) * lever, ms.search)
-            minus = ms.kl(1 - z, ms.search)                     # VPD's answer less the circuit
-            f_term = (adv.clamp_min(TINY).log() - math.log(vpd)) / D
-            n_term = (1 - (minus.clamp_min(TINY).log() - math.log(vpd)) / D).clamp_min(0)
-            loss = f_term.mean() + n_term.mean() + lam * size_soft(ms, ms.p_on(), node_bits, pos_bits, scale)
-            loss.backward()
-            opt.step()
-        on = ms.deterministic().detach() > 0.5
-        st = meas(on) if int(on.sum()) <= (max_nodes or len(pr.nodes)) else teacher.measure(pr, on[None], empty, vpd)[0]
-        k_tok = int(torch.unique(pr.t[on]).numel())
-        st.update(lam=lam, size=int(on.sum()), positions=k_tok, on=on.nonzero().flatten().tolist(), size_term=size_term(on),
-                  seconds=time.perf_counter() - t1)
-        stages.append(st)
-        print(f"  lambda {lam:.3g}: {st['size']} subcomponents at {k_tok} positions, F1 {st['f1']:.3f} N {st['n']:.3f}"
-              + (f" F1 under {meas.m} flips {st['f1_flips']:.3f}" if "f1_flips" in st else " (over the budget: not attacked)")
-              + f", {st['seconds']:.0f}s", flush=True)
-        if int(on.sum()) <= teacher.MIN_SIZE:
-            break
-    inside = [i for i, s_ in enumerate(stages) if "f1_rob" in s_]         # within the answer budget, attacked
-    if not inside and max_nodes:                                 # every stage over the budget: the gates' largest max_nodes
+    wiring = teacher.Connector(ge, tx, pr, empty, vpd, size_term, B)
+
+    def lam_path(seed):                                          # one seed's stages
+        ms = MaskSearch(ge, tx, pr, live=teacher.CONVENTION == "live")
+        torch.manual_seed(seed)
+        opt = torch.optim.Adam([ms.logit], lr=LR)
+        lever = torch.zeros(SAMPLES, len(pr.nodes), device=nat.dev)
+        stages = []
+        for lam in LAMBDAS:
+            t1 = time.perf_counter()
+            for _ in range(STEPS):
+                z = ms.sample(SAMPLES)
+                zd = z.detach()
+                for _ in range(INNER):                           # the lever: sign steps on the run's KL, top REPAIR_M
+                    b = lever.clone().requires_grad_(True)
+                    g, = torch.autograd.grad(ms.kl(zd + (1 - zd) * b, ms.search).clamp_min(TINY).log().sum(), [b])
+                    lever = top((lever + ADV_STEP * g.sign()).clamp(0, 1), teacher.REPAIR_M)
+                opt.zero_grad()
+                adv = ms.kl(z + (1 - z) * lever, ms.search)
+                minus = ms.kl(1 - z, ms.search)                 # VPD's answer less the circuit
+                f_term = (adv.clamp_min(TINY).log() - math.log(vpd)) / D
+                n_term = (1 - (minus.clamp_min(TINY).log() - math.log(vpd)) / D).clamp_min(0)
+                loss = f_term.mean() + n_term.mean() + lam * size_soft(ms, ms.p_on(), node_bits, pos_bits, scale)
+                loss.backward()
+                opt.step()
+            on = ms.deterministic().detach() > 0.5
+            st = meas(on) if int(on.sum()) <= (max_nodes or len(pr.nodes)) else teacher.measure(pr, on[None], empty, vpd)[0]
+            k_tok = int(torch.unique(pr.t[on]).numel())
+            st.update(lam=lam, size=int(on.sum()), positions=k_tok, on=on.nonzero().flatten().tolist(), size_term=size_term(on),
+                      seconds=time.perf_counter() - t1)
+            stages.append(st)
+            print(f"  seed {seed}, lambda {lam:.3g}: {st['size']} subcomponents at {k_tok} positions, F1 {st['f1']:.3f} N {st['n']:.3f}"
+                  + (f" F1 under {meas.m} flips {st['f1_flips']:.3f}" if "f1_flips" in st else " (over the budget: not attacked)")
+                  + f", {st['seconds']:.0f}s", flush=True)
+            if int(on.sum()) <= teacher.MIN_SIZE:
+                break
+        if not any("f1_rob" in s_ for s_ in stages) and max_nodes:  # every stage over the budget: the gates' largest max_nodes
+            on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
+            on[ms.logit.detach().topk(max_nodes).indices] = True
+            st = meas(on)
+            st.update(lam=None, size=int(on.sum()), positions=int(torch.unique(pr.t[on]).numel()), on=on.nonzero().flatten().tolist(),
+                      size_term=size_term(on), seconds=0.0, budget=True)
+            stages.append(st)
+            print(f"  no stage within {max_nodes} subcomponents: the gates' largest {max_nodes}, F1 {st['f1']:.3f} N {st['n']:.3f} "
+                  f"F1 under {meas.m} flips {st['f1_flips']:.3f}", flush=True)
+        return stages
+
+    def finish(stages, best):                                    # cleanup, connections, repair from one stage
         on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
-        on[ms.logit.detach().topk(max_nodes).indices] = True
-        st = meas(on)
-        st.update(lam=None, size=int(on.sum()), positions=int(torch.unique(pr.t[on]).numel()), on=on.nonzero().flatten().tolist(),
-                  size_term=size_term(on), seconds=0.0, budget=True)
-        stages.append(st)
-        inside = [len(stages) - 1]
-        print(f"  no stage within {max_nodes} subcomponents: the gates' largest {max_nodes}, F1 {st['f1']:.3f} N {st['n']:.3f} "
-              f"F1 under {meas.m} flips {st['f1_flips']:.3f}", flush=True)
-    j, rule = teacher.pick([stages[i] for i in inside], "f1_rob")
-    best = inside[j]
-    on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
-    on[stages[best]["on"]] = True
-    t1 = time.perf_counter()                                     # the cleanup: measured removals under the flips' guard
-    on, picked, cut = removals(meas, on, dict(stages[best]))
-    print(f"  cleanup: {len(cut)} rounds removed {stages[best]['size'] - int(on.sum())} of {stages[best]['size']} "
-          f"(F1 {picked['f1']:.3f}, N {picked['n']:.3f}, F1 under flips {picked['f1_flips']:.3f}), {time.perf_counter() - t1:.0f}s", flush=True)
-    row = {"T": tx.T, "kl_empty": empty, "kl_vpd": vpd, "vpd_size": len(pr.nodes), "size_scale": scale, "pick": rule,
-           "stage": {k: stages[best][k] for k in ("size", "positions", "f1", "n", "f1_flips", "size_term", "lam", "kl_c", "kl_minus")},
-           "cleanup_removed": stages[best]["size"] - int(on.sum()), "stages": len(stages)}
-    kept, rep, path_edges, f1_written = None, None, None, picked["f1"]   # F1 of the answer as written (graph F1 with edges)
-    if edges:
-        wiring = teacher.Connector(ge, tx, pr, empty, vpd, size_term, B)
-        kept, summary, e_steps, ep = wiring.connect(on, picked["n"])
-        f1_written = summary["f1_graph"]
-        ids_of = wiring.index
-        path_edges = {"edges": [[ids_of[w], "out" if r is None else ids_of[r]] for w, r in ep.edges], "steps": e_steps}
-        if repair:
-            rep, k_, rule_ = wiring.repair(on, kept, summary, pool, max_nodes)
-            row.update(repair=[{x: v for x, v in s_.items() if x not in ("on", "kept")} for s_ in rep], repair_pick=k_, repair_rule=rule_,
-                       repair_added=int(rep[k_]["on"].sum()) - int(on.sum()))
-            on, kept, f1_written = rep[k_]["on"], rep[k_]["kept"], rep[k_]["f1_graph"]
-    if tokens is not None:                                       # the answer within the budget
-        row["answer_tokens"] = tokens(components.render(teacher.circuit_json(pr, on, kept)))
+        on[stages[best]["on"]] = True
+        t1 = time.perf_counter()                                 # measured removals under the flips' guard
+        on, picked, cut = removals(meas, on, dict(stages[best]))
+        print(f"  cleanup: {len(cut)} rounds removed {stages[best]['size'] - int(on.sum())} of {stages[best]['size']} "
+              f"(F1 {picked['f1']:.3f}, N {picked['n']:.3f}, F1 under flips {picked['f1_flips']:.3f}), {time.perf_counter() - t1:.0f}s", flush=True)
+        out = {"stage": best, "cut": cut, "removed": stages[best]["size"] - int(on.sum()), "kept": None, "rep": None,
+               "edge_path": None, "f1": picked["f1"]}
+        if edges:
+            kept, summary, e_steps, ep = wiring.connect(on, picked["n"])
+            out.update(kept=kept, f1=summary["f1_graph"], edge_path={
+                "edges": [[wiring.index[w], "out" if r is None else wiring.index[r]] for w, r in ep.edges], "steps": e_steps})
+            if repair:
+                rep, k_, rule_ = wiring.repair(on, kept, summary, pool, max_nodes)
+                out.update(rep=rep, repair_pick=k_, repair_rule=rule_, added=int(rep[k_]["on"].sum()) - int(on.sum()),
+                           kept=rep[k_]["kept"], f1=rep[k_]["f1_graph"])
+                on = rep[k_]["on"]
+        out["on"] = on
+        return out
+
+    def score(out):                                              # the reward's circuit score: mean(C, N) - 0.5 size
+        on, kept = out["on"], out["kept"]
+        if kept is not None:
+            g = wiring.graph(on, kept)
+        else:                                                    # no connections stated: the node set as a complete graph
+            masks = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+            for j in on.nonzero().flatten().tolist():
+                n, t, c = pr.nodes[j]
+                masks[n][t, c] = True
+            g = native.Graph(masks=masks)
+        f = ge.fidelity(tx, [g], pool, mode="reward")[0]
+        inner = 0 if kept is None else sum(r is not None for _, r in kept)
+        st = size_term(on, inner, 0 if kept is None else len(kept) - inner)
+        return {"c": f["c"], "n": f["n_point"], "size_term": st, "score": (f["c"] + f["n_point"]) / 2 - teacher.SIZE_WEIGHT * st}
+
+    runs = []
+    for seed in seeds:
+        stages = lam_path(seed)
+        cands = [i for i, s_ in enumerate(stages) if "f1_rob" in s_]
+        while True:                                              # the pick, a smaller stage while the answer is too long
+            j, rule = teacher.pick([stages[i] for i in cands], "f1_rob")
+            out = finish(stages, cands[j])
+            tok = tokens(components.render(teacher.circuit_json(pr, out["on"], out["kept"]))) if tokens else None
+            smaller = [i for i in cands if stages[i]["size"] < stages[cands[j]]["size"]]
+            if tok is None or tok <= max_tokens or not smaller:
+                break
+            print(f"  answer {tok} tokens over {max_tokens}: a smaller stage", flush=True)
+            cands = smaller
+        out.update(seed=seed, rule=rule, stages=stages, tokens=tok, **score(out))
+        print(f"  seed {seed}: {int(out['on'].sum())} subcomponents, C {out['c']:.3f} N {out['n']:.3f} size {out['size_term']:.3f} "
+              f"score {out['score']:.3f}" + ("" if tok is None else f", {tok} tokens"), flush=True)
+        runs.append(out)
+    best = max(range(len(runs)), key=lambda i: runs[i]["score"])
+    out = runs[best]
+    on, kept, stages = out["on"], out["kept"], out["stages"]
     final = teacher.measure(pr, on[None], empty, vpd)[0]          # the answer as written: the stated graph if any
     final["f1_flips"] = meas.flips(on, None if kept is None else wiring.graph(on, kept))
-    final["f1_nodes"], final["f1"] = final["f1"], f1_written     # node F1 (every connection) beside the written F1
-    final["f1_rob"] = min(f1_written, final["f1_nodes"], final["f1_flips"])
-    row.update(best={"size": int(on.sum()), "positions": int(torch.unique(pr.t[on]).numel()), "edges": None if kept is None else len(kept),
-                     **{k: final[k] for k in ("f1", "f1_nodes", "n", "f1_flips", "f1_rob", "kl_c", "kl_minus")}},
-               flips_calls=meas.calls, seconds=time.perf_counter() - t0)
+    final["f1_nodes"], final["f1"] = final["f1"], out["f1"]      # node F1 (every connection) beside the written F1
+    final["f1_rob"] = min(out["f1"], final["f1_nodes"], final["f1_flips"])
+    row = {"T": tx.T, "kl_empty": empty, "kl_vpd": vpd, "vpd_size": len(pr.nodes), "size_scale": scale, "pick": out["rule"],
+           "seed": out["seed"], "stage": {k: stages[out["stage"]][k] for k in ("size", "positions", "f1", "n", "f1_flips", "size_term", "lam")},
+           "cleanup_removed": out["removed"], "repair_added": out.get("added"), "answer_tokens": out["tokens"],
+           "seeds": [{"seed": r["seed"], "size": int(r["on"].sum()), "positions": int(torch.unique(pr.t[r["on"]]).numel()),
+                      "edges": None if r["kept"] is None else len(r["kept"]), "c": r["c"], "n": r["n"], "size_term": r["size_term"],
+                      "score": r["score"], "removed": r["removed"], "added": r.get("added")} for r in runs],
+           "best": {"size": int(on.sum()), "positions": int(torch.unique(pr.t[on]).numel()), "edges": None if kept is None else len(kept),
+                    "c": out["c"], "score": out["score"], **{k: final[k] for k in ("f1", "f1_nodes", "n", "f1_flips", "f1_rob", "kl_c", "kl_minus")}},
+           "stages": len(stages), "flips_calls": meas.calls, "seconds": time.perf_counter() - t0}
+    if out["rep"] is not None:
+        row.update(repair=[{x: v for x, v in s_.items() if x not in ("on", "kept")} for s_ in out["rep"]], repair_pick=out["repair_pick"])
     ids_all = sorted({i for s_ in stages for i in s_["on"]} | set(on.nonzero().flatten().tolist()))
-    path_file = {"method": "v3", "start_nodes": [[pr.nodes[i][0], pr.nodes[i][2], pr.nodes[i][1]] for i in ids_all],
-                 "start_index": ids_all, "steps": stages, "pick_stage": best, "cleanup": cut, "on": on.nonzero().flatten().tolist()}
-    if path_edges is not None:
-        path_file["edge_paths"] = [path_edges]
-    if rep is not None:
-        path_file["repair"] = [{x: (v.nonzero().flatten().tolist() if x == "on" else v) for x, v in s_.items()} for s_ in rep]
+    path_file = {"method": "v3", "seed": out["seed"], "start_nodes": [[pr.nodes[i][0], pr.nodes[i][2], pr.nodes[i][1]] for i in ids_all],
+                 "start_index": ids_all, "steps": stages, "pick_stage": out["stage"], "cleanup": out["cut"], "on": on.nonzero().flatten().tolist()}
+    if out["edge_path"] is not None:
+        path_file["edge_paths"] = [out["edge_path"]]
+    if out["rep"] is not None:
+        path_file["repair"] = [{x: (v.nonzero().flatten().tolist() if x == "on" else v) for x, v in s_.items()} for s_ in out["rep"]]
     return {"": teacher.circuit_json(pr, on, kept)}, row, path_file
 
 
@@ -302,7 +350,9 @@ def main():
     ap.add_argument("--edges", action="store_true", help="the pick's connections (teacher.Connector, C's semantics)")
     ap.add_argument("--repair", action="store_true", help="with --edges, the flip repair (teacher.Connector.repair)")
     ap.add_argument("--max-nodes", type=int, default=teacher.MAX_NODES, help="the pick among stages of at most this many nodes")
-    ap.add_argument("--max-tokens", type=int, default=0, help="report the answer's tokens in --tokenizer (0: not counted)")
+    ap.add_argument("--max-tokens", type=int, default=components.ANSWER_BUDGET,
+                    help="the answer at most this many tokens of --tokenizer: a smaller stage while it is longer (0: not checked)")
+    ap.add_argument("--seeds", type=int, default=1, help="searches with seeds 0..S-1; the written one the reward's best mean(C, N) - 0.5 size")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
@@ -321,7 +371,7 @@ def main():
             continue
         ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
         circuits, row, path_file = search(ge, ids, targets, saved[task]["answer"], pool, args.batch, args.edges, args.repair,
-                                          args.max_nodes, tokens, args.max_tokens)
+                                          args.max_nodes, tokens, args.max_tokens, tuple(range(args.seeds)))
         for name, c in circuits.items():
             (args.out / f"{task}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{task}.path.json").write_text(json.dumps(path_file))
@@ -330,8 +380,9 @@ def main():
         b = row["best"]
         print(f"{task}: {b['size']} subcomponents at {b['positions']} positions"
               + ("" if b["edges"] is None else f", {b['edges']} connections")
-              + f", F1 {b['f1']:.3f} N {b['n']:.3f} F1 under {teacher.REPAIR_M} flips {b['f1_flips']:.3f} ({row['pick']}; "
-              f"cleanup removed {row['cleanup_removed']}" + (f", repair added {row['repair_added']}" if "repair_added" in row else "")
+              + f", F1 {b['f1']:.3f} node F1 {b['f1_nodes']:.3f} N {b['n']:.3f} F1 under {teacher.REPAIR_M} flips {b['f1_flips']:.3f}, "
+              f"C {b['c']:.3f}, score {b['score']:.3f} (seed {row['seed']} of {len(row['seeds'])}, {row['pick']}; cleanup removed "
+              f"{row['cleanup_removed']}" + ("" if row["repair_added"] is None else f", repair added {row['repair_added']}")
               + f"); {row['seconds']:.0f}s", flush=True)
 
 

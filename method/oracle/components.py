@@ -1753,7 +1753,9 @@ def main():
                 if n >= args.n or not js.exists():
                     continue
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
-                f.write(json.dumps(teacher_facts(ge, task, r, json.loads(js.read_text()))) + "\n")
+                prompt = task["prompts"][0]  # the circuit as it is scored and trained on (dataset(): stranded nodes dropped)
+                g, _ = goal_eval.circuit(json.loads(js.read_text()), prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
+                f.write(json.dumps(teacher_facts(ge, task, r, goal_eval.to_json(g))) + "\n")
                 f.flush()
                 n += 1
         return

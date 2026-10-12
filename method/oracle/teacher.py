@@ -18,9 +18,8 @@ Per text:
   2. VPD's top-k: the smallest prefix of VPD's order (Native._vpd_order) whose necessity N reaches 0.99 (bisection, at
      most 1,024).
   3. The joint path from their union: each step measures every single subcomponent's removal (two runs: the circuit and
-     VPD's answer without it) and ranks them by the mean of F1 and N they leave; steps then follow the ranking, each
-     measuring the removal of the next 1, 2, 4, ... and taking the prefix with the highest measured mean, until a
-     tenth of the circuit is gone, when the singles are measured again; down to 4 subcomponents. Every step is recorded (size, F1, N, KL_C, KL_{VPD minus C}, positions, the subcomponents
+     VPD's answer without it), ranks them by the mean of F1 and N they leave, measures removing the first 1, 2, 4, ...
+     of them up to a tenth of the circuit and takes the prefix with the highest measured mean, down to 4 subcomponents. Every step is recorded (size, F1, N, KL_C, KL_{VPD minus C}, positions, the subcomponents
      removed) beside VPD's own top-k at the same size.
   4. The teacher circuit is the path point with the largest mean(F1, N) - 0.5 size, size the nodes' description bits
      (with a token-embedding node at each position) over the bits of naming every VPD-active subcomponent at the text's
@@ -286,11 +285,10 @@ def top_k(pr: Pruner, order: torch.Tensor, empty: float, vpd: float, target: flo
 
 
 def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> list[dict]:
-    """Nested measured removal from `start` down to MIN_SIZE. Every single removal's F1 and N are measured (two runs
-    each) and the removals ranked by the mean they leave; then steps follow that ranking, each measuring the removal
-    of the next 1, 2, 4, ... ranked subcomponents (removals interact: subcomponents cancel) and taking the prefix with
-    the highest measured mean, the longest on a tie, until a tenth of the circuit is gone; then the singles are
-    measured again. Records: the state after each step and the node ids removed."""
+    """Nested measured removal from `start` down to MIN_SIZE. Each step measures every single removal's F1 and N (two
+    runs each) and ranks the removals by the mean they leave; then it measures removing the first 1, 2, 4, ... of them
+    up to a tenth of the circuit (removals interact: subcomponents cancel) and takes the prefix with the highest
+    measured mean, the longest on a tie. Records: the state after each step and the node ids removed."""
     on = start.clone()
     path = [{"size": int(on.sum()), "removed": [], **measure(pr, on[None], empty, vpd)[0]}]
     while int(on.sum()) > MIN_SIZE:
@@ -300,21 +298,16 @@ def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> lis
         rows = []
         for s0 in range(0, len(ids), 4 * pr.B):
             rows += measure(pr, trials[s0:s0 + 4 * pr.B], empty, vpd)
-        ranked = ids[torch.argsort(torch.tensor([r["mean"] for r in rows]), descending=True, stable=True)].tolist()
-        block = min(max(1, int(FRACTION * len(ids))), len(ids) - MIN_SIZE)
-        gone = 0
-        while gone < block:
-            top = block - gone
-            ks = sorted({min(top, 2 ** e) for e in range(0, 20) if 2 ** e <= 2 * top})
-            prefixes = on[None].repeat(len(ks), 1)
-            for i, k in enumerate(ks):
-                prefixes[i, ranked[:k]] = False
-            got = measure(pr, prefixes, empty, vpd)
-            i = max(range(len(ks)), key=lambda j: (got[j]["mean"], ks[j]))
-            drop, ranked = ranked[:ks[i]], ranked[ks[i]:]
-            on[drop] = False
-            gone += len(drop)
-            path.append({"size": int(on.sum()), "removed": drop, **got[i]})
+        ranked = ids[torch.argsort(torch.tensor([r["mean"] for r in rows]), descending=True, stable=True)]
+        top = min(max(1, int(FRACTION * len(ids))), len(ids) - MIN_SIZE)
+        ks = sorted({min(top, 2 ** e) for e in range(0, 20) if 2 ** e <= 2 * top})
+        prefixes = on[None].repeat(len(ks), 1)
+        for i, k in enumerate(ks):
+            prefixes[i, ranked[:k]] = False
+        got = measure(pr, prefixes, empty, vpd)
+        i = max(range(len(ks)), key=lambda j: (got[j]["mean"], ks[j]))
+        on[ranked[:ks[i]]] = False
+        path.append({"size": int(on.sum()), "removed": ranked[:ks[i]].tolist(), **got[i]})
     return path
 
 

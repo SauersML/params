@@ -230,16 +230,21 @@ def figure(rows: list[dict], path: str) -> None:
     counts = []
     for r in rows:
         for rd in r["reads"]:
+            if rd["kl_background"] <= r["budget"]:  # the remainder's pattern alone already within budget: no pair needed
+                continue
             c = np.array(rd["curve"]) / r["budget"]
             ax.plot(range(len(c)), c, color=fs.BLUE if rd["reached"] else fs.RED, alpha=0.45, lw=1.6)
             if rd["reached"]:
                 counts.append(len(rd["curve"]) - 1)
     ax.axhline(1, color=fs.INK, lw=1.2)
     ax.set_yscale("log")
+    ax.set_yticks([1, 2, 4, 8])
+    ax.set_yticklabels(["1", "2", "4", "8"])
+    ax.yaxis.set_minor_formatter(plt.NullFormatter())
     ax.set_xlabel("query-key pairs stated for the read")
     ax.set_ylabel("circuit's target KL / its budget")
     med = int(np.median(counts)) if counts else 0
-    ax.set_title(f"A read's attention needs a median of {med} stated query-key pairs\nto keep the circuit within its budget")
+    ax.set_title(f"Where the pattern matters, a median of {med} stated query-key pairs\nkeeps the circuit within its budget")
     fs.clean(ax)
     fs.save(fig, path)
 

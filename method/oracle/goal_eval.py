@@ -684,7 +684,12 @@ class GoalEval:
             resid = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i], ("attn", i), r[1])  # noqa: E731
             q, k, v = (site(nm[kk], z, resid).view(B, T, H, hd).transpose(1, 2) for kk in ("q_proj", "k_proj", "v_proj"))
             q, k = tg._rope(q, T), tg._rope(k, T)
-            P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
+            S = (q @ k.transpose(-1, -2)) / math.sqrt(hd)
+            for (layer, t), stated in (getattr(graph, "pairs", None) or {}).items():  # a read's row from its stated pairs
+                if layer == i:
+                    S = S.clone()
+                    S[:, :, t, :t + 1] = self._pair_row(i, t, stated, nodes, q, k, a, on)
+            P = S.masked_fill(~causal, float("-inf")).softmax(-1)
             att = (P @ v).transpose(1, 2).reshape(B, T, -1)
             share = lambda r, ws, att=att, P=P: att[:, r[1]] - sum(  # noqa: E731
                 P[:, :, r[1], w[1]].repeat_interleave(hd, dim=1) * write(w) for w in ws)
@@ -706,6 +711,43 @@ class GoalEval:
                 record[nd] = a[nd[0]][:, nd[1], nd[2]].detach()
         return torch.log_softmax((norm(xt, tg.ln_f, "final") @ tg.wte.T).float(), -1)
 
+
+    def _pair_row(self, layer: int, t: int, stated, nodes: list, q: torch.Tensor, k: torch.Tensor, a: dict, on: dict) -> torch.Tensor:
+        """A read's attention scores [B, H, t + 1] (layer, query position t) from its stated query-key pairs: with q_t =
+        sum_a q_a + q_rest (the circuit's query nodes at t, each its rank-one part a_a(t) u_a, and the rest: the
+        remainder W - V U and the subcomponents outside the circuit at their masks) and k_p = sum_b k_b + k_rest the same
+        at p, the score is the rest-rest term (the background) and each stated pair's: (a, b) q_a . k_b at b's
+        position, (a, None) q_a . k_rest, (None, b) q_rest . k_b, rotary at t and p, over sqrt(hd). Every pair stated
+        is q_t . k_p, the row unchanged. q, k [B, H, T, hd] the layer's rotated queries and keys; a and on graph_ref's
+        activations and masks."""
+        tg = self.nat.target
+        H, hd = tg.n_head, tg.hd
+        nq, nk = native.site_name(layer, "q_proj"), native.site_name(layer, "k_proj")
+        B = q.shape[0]
+
+        def part(nd):  # a query or key node's rotated rank-one part [B, H, hd] at its position
+            n, p, c = nd
+            vec = ((a[n][:, p, c] * on[n][:, p, c])[:, None] * tg.site(n).U[c]).view(B, H, hd)
+            half = hd // 2
+            return vec * tg.cos[p] + torch.cat([-vec[..., half:], vec[..., :half]], -1) * tg.sin[p]
+        qs = [nd for nd in nodes if nd[0] == nq and nd[1] == t]
+        ks = [nd for nd in nodes if nd[0] == nk and nd[1] <= t]
+        qpart = {nd: part(nd) for nd in qs}
+        kpart = {nd: part(nd) for nd in ks}
+        q_rest = q[:, :, t] - sum(qpart.values()) if qs else q[:, :, t]  # [B, H, hd]
+        k_rest = k[:, :, :t + 1].clone()  # [B, H, t + 1, hd]
+        for nd, kb in kpart.items():
+            k_rest[:, :, nd[1]] -= kb
+        scale = 1 / math.sqrt(hd)
+        row = (q_rest[:, :, None] * k_rest).sum(-1) * scale  # the background
+        for qa, kb in stated:
+            qv = q_rest if qa is None else qpart[qa]
+            if kb is None:
+                row = row + (qv[:, :, None] * k_rest).sum(-1) * scale
+            else:
+                row = row.clone()
+                row[:, :, kb[1]] = row[:, :, kb[1]] + (qv * kpart[kb]).sum(-1) * scale
+        return row
 
     def graph_kl(self, tx: Text, graphs: list[native.Graph], live: bool) -> list[float]:
         """KL in bits at the targets of each stated graph's run on the text (_graph_kl)."""

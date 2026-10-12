@@ -241,6 +241,7 @@ class Engine:
             return rows.setdefault((b, nd[1], col(nd[0], nd[2])), len(rows))
 
         readers, writers, edges, outs, qk, nodes, E, O = {}, {}, {}, {}, {}, {}, 0, 0
+        pairs = {}  # per layer, each read with stated pairs: (row, query position, [(query column | None, (key position, key column) | None)])
         for b, g in enumerate(graphs):
             cut = {(w, r) for r, ws in (cuts[b] or {}).items() for w in ws}
             if g.complete:  # its subcomponents read each other in full (u): only the cuts and free are connections here
@@ -279,6 +280,10 @@ class Engine:
                 lst[4].append(float((w, None) in at and (w, None) not in cut))
             if g.complete:
                 continue
+            for (layer, t), stated in (getattr(g, "pairs", None) or {}).items():
+                nq, nk = native.site_name(layer, "q_proj"), native.site_name(layer, "k_proj")
+                pairs.setdefault(layer, []).append((b, t, [(None if qa is None else col(nq, qa[2]),
+                                                            None if kb is None else (kb[1], col(nk, kb[2]))) for qa, kb in stated]))
             for n, t, c in g.node_set():
                 nodes.setdefault(n, set()).add((b, t, col(n, c)))
                 if n.endswith(("q_proj", "k_proj")):
@@ -289,7 +294,8 @@ class Engine:
         return _positions({"B": None if one else len(graphs), "E": E, "O": O, "semantics": semantics,
                            "qk": {n: btc(sorted(v)) for n, v in qk.items()}, "nodes": {n: btc(sorted(v)) for n, v in nodes.items()},
                            "readers": {n: btc(list(rows)) for n, rows in readers.items()}, "writers": {n: btc(list(rows)) for n, rows in writers.items()},
-                           "edges": {k: conn(v) for k, v in edges.items()}, "out": {k: conn(v) for k, v in outs.items()}})
+                           "edges": {k: conn(v) for k, v in edges.items()}, "out": {k: conn(v) for k, v in outs.items()},
+                           "pairs": pairs})
 
     def _stack(self, ps: list, rows: list) -> dict:
         """One-graph plans ps as the plan of the list naming ps[rows[b]] in row b: row b's entries after row b - 1's, its
@@ -321,7 +327,11 @@ class Engine:
         def spread(vals, cnt):  # each row's value repeated over its entries
             return torch.repeat_interleave(ints(vals), ints(cnt))
 
-        out = {"B": B, "E": sum(ps[k]["E"] for k in rows), "O": sum(ps[k]["O"] for k in rows), "semantics": ps[rows[0]]["semantics"]}
+        out = {"B": B, "E": sum(ps[k]["E"] for k in rows), "O": sum(ps[k]["O"] for k in rows), "semantics": ps[rows[0]]["semantics"],
+               "pairs": {}}
+        for b, k in enumerate(rows):  # each row's reads with stated pairs (a one-graph plan's are its row 0's)
+            for i, lst in ps[k].get("pairs", {}).items():
+                out["pairs"].setdefault(i, []).extend((b, t, st) for _, t, st in lst)
         at = {}
         for name in ("qk", "nodes", "readers", "writers"):
             at[name] = before(name)
@@ -374,7 +384,8 @@ class Engine:
             "edges": {(rn, wn): (step(ri, R[rn]), step(wi, W[wn]), step(j, p["E"]), fx.repeat(times))
                       for (rn, wn), (ri, wi, j, fx) in p["edges"].items()},
             "out": {wn: (step(b, B0), ti.repeat(times), step(wi, W[wn]), step(j, p["O"]), fx.repeat(times))
-                    for wn, (b, ti, wi, j, fx) in p["out"].items()}})
+                    for wn, (b, ti, wi, j, fx) in p["out"].items()},
+            "pairs": {i: [(b + B0 * d, t, st) for d in range(times) for b, t, st in lst] for i, lst in p.get("pairs", {}).items()}})
 
     def graph_kl(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
                  precision: str = "score", patch: dict | None = None) -> torch.Tensor:
@@ -420,7 +431,7 @@ class Engine:
         """keep's states of a run on B rows as those of the run on the same rows repeated times over (rows b, B + b, ...
         the same: the plan of the graphs' list repeated, u, ew and ow repeated the same way)."""
         return {"k": [k.repeat(times, 1, 1, 1) for k in states["k"]], "v": [v.repeat(times, 1, 1, 1) for v in states["v"]],
-                "aw": {n: a.repeat(times) for n, a in states["aw"].items()}}
+                "aw": {n: a.repeat(times) for n, a in states["aw"].items()}, "ak": [a.repeat(times, 1, 1) for a in states["ak"]]}
 
     def _zeros(self) -> dict:
         if not hasattr(self, "_u0"):
@@ -488,6 +499,56 @@ class Engine:
             p[key] = (R, Eg, new, pos)
         return p[key]
 
+    def _pair_rows(self, i: int, prs: list, q: torch.Tensor, k: torch.Tensor, aq: torch.Tensor, ak: torch.Tensor, sq: torch.Tensor,
+                   u: dict, p: dict, rows_at, B: int) -> torch.Tensor:
+        """Layer i's attention pattern [B, H, rows, T] (float32) with each read of prs (plan["pairs"][i]: row, query
+        position, stated pairs) taking its score row from its stated query-key pairs, as goal_eval.GoalEval._pair_row:
+        q_t = sum_a q_a + q_rest (the graph's query nodes at t, rank one: activation x mask x U row, and the rest) and
+        k_p the same; the rest-rest term (the background) and each stated pair's, rotary at t and p. q, k: the rotated
+        queries (of the rows computed: rows_at, None for every position) and keys [B, H, T, hd]; aq, ak their sites'
+        activations ([B, rows, K], [B, T, K]); sq the query site's masks at the rows (query nodes at 1)."""
+        tg, T, H, hd = self.tg, self.T, self.H, self.hd
+        nq, nk = native.site_name(i, "q_proj"), native.site_name(i, "k_proj")
+        Uq, Uk = self._w(nq)[1].float(), self._w(nk)[1].float()
+        at = torch.arange(T, device=self.dev) if rows_at is None else rows_at
+        S = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(hd)
+        sk = u[nk].expand(B, T, -1)
+        if nk in p["qk"]:
+            sk = sk.index_put(p["qk"][nk], torch.ones((), device=self.dev))
+        qnodes = {}
+        for b, t, c in zip(*(x.tolist() for x in p["qk"].get(nq, ([], [], [])))):
+            qnodes.setdefault((b, t), []).append(c)
+        knodes = {}
+        for b, t, c in zip(*(x.tolist() for x in p["qk"].get(nk, ([], [], [])))):
+            knodes.setdefault(b, []).append((t, c))
+        half = hd // 2
+
+        def rot(vec, pos):  # [H, hd] at position pos
+            return vec * tg.cos[pos] + torch.cat([-vec[..., half:], vec[..., :half]], -1) * tg.sin[pos]
+        place = {int(t): r for r, t in enumerate(at.tolist())}
+        for b, t, stated in prs:
+            r = place.get(t)
+            if r is None:  # a read whose position this run does not compute (the last layer at the targets alone)
+                continue
+            m = sq[b if sq.shape[0] > 1 else 0, r if sq.shape[1] > 1 else 0]
+            qpart = {c: rot((aq[b, r, c] * m[c] * Uq[c]).float().view(H, hd), t) for c in qnodes.get((b, t), [])}
+            kpart = {(pk, c): rot((ak[b, pk, c] * sk[b if sk.shape[0] > 1 else 0, pk, c] * Uk[c]).float().view(H, hd), pk)
+                     for pk, c in knodes.get(b, []) if pk <= t}
+            q_rest = q[b, :, r].float() - sum(qpart.values()) if qpart else q[b, :, r].float()
+            k_rest = k[b, :, :t + 1].float().clone()
+            for (pk, c), kb in kpart.items():
+                k_rest[:, pk] -= kb
+            row = (q_rest[:, None] * k_rest).sum(-1) / math.sqrt(hd)
+            for qa, kb in stated:
+                qv = q_rest if qa is None else qpart[qa]
+                if kb is None:
+                    row = row + (qv[:, None] * k_rest).sum(-1) / math.sqrt(hd)
+                else:
+                    row = row.clone()
+                    row[:, kb[0]] = row[:, kb[0]] + (qv * kpart[kb]).sum(-1) / math.sqrt(hd)
+            S[b, :, r, :t + 1] = row
+        return S.masked_fill(torch.arange(T, device=self.dev)[None, :] > at[:, None], float("-inf")).softmax(-1)
+
     def _resid_tables(self, p: dict, key: str, Wr: dict, Eg: dict, outs: dict) -> tuple:
         """The connections from residual writers (attention and MLP outputs) as one list per reader site and one into
         the prediction: each writer row's place among the residual writers' rows laid end to end in the order the run
@@ -534,7 +595,7 @@ class Engine:
         else:
             off, cons, cout = self._resid_tables(p, "_resid", Wr, Eg, outs)
         if keep is not None:
-            keep.update(k=[], v=[], aw={})
+            keep.update(k=[], v=[], aw={}, ak=[])
         res_a, res_s = [], []  # the residual writers' rows' activations and 1 - u, in their order (off)
 
         def cut(n, m):  # site n's [B or 1, T or 1, ...] tensor at the positions its steps run on
@@ -637,19 +698,32 @@ class Engine:
                 k, v = torch.cat([reuse[0]["k"][i][:, :, :lo], k], 2), torch.cat([reuse[0]["v"][i][:, :, :lo], v], 2)
             else:
                 k = tg._rope(heads(out("k_proj", h, scale("k_proj"))), T).to(v.dtype)
+            ak = A["k_proj"] if not lo else torch.cat([reuse[0]["ak"][i][:, :lo], A["k_proj"]], 1)  # the key activations [B, T, K]
             if keep is not None:
                 keep["k"].append(k)
                 keep["v"].append(v)
+                keep["ak"].append(ak)
             if lo:  # the queries from lo on, each over the keys up to it
                 q = tg._rope_from(heads(out("q_proj", h, scale("q_proj"))), lo, T).to(v.dtype)
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=causal)
+                rows_at = torch.arange(lo, T, device=self.dev)
             elif nq in S:  # rotary at the targets, each target's query over the keys up to it
                 q = heads(out("q_proj", h[:, sel], scale("q_proj")))
                 half = hd // 2
                 q = (q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]).to(v.dtype)
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._causal_targets)
+                rows_at = self._targets
             else:
                 q = tg._rope(heads(out("q_proj", h, scale("q_proj"))), T).to(v.dtype)
+                rows_at = None
+            prs = p.get("pairs", {}).get(i)
+            Pp = None
+            if prs:  # reads with stated query-key pairs: their score rows from those pairs (_pair_rows), the attention explicit
+                Pp = self._pair_rows(i, prs, q, k, A["q_proj"], ak, scale("q_proj"), u, p, rows_at, B)
+                y = Pp.to(v.dtype) @ v
+            elif lo:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=causal)
+            elif nq in S:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._causal_targets)
+            else:
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).reshape(B, y.shape[2], -1)
             a = self._mm(y, self._w(no)[0])
@@ -657,7 +731,9 @@ class Engine:
                 b, t, _ = R[no]
                 inp = y[b, t].float()
                 if any(r == no for r, _ in Eg):  # the pattern at the readers' positions [B, H, positions, T]
-                    if no in S:  # the queries are the targets'
+                    if Pp is not None:  # every row's, the stated pairs' rows among them
+                        P, idx = Pp, t
+                    elif no in S:  # the queries are the targets'
                         P = ((q @ k.transpose(-1, -2)).float() / math.sqrt(hd)).masked_fill(~self._causal_targets, float("-inf")).softmax(-1)
                         idx = t
                     else:

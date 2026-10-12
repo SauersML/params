@@ -365,6 +365,61 @@ def test_read_and_norm_strengths():
         assert rel(kl(ew=ew, ow=at(ow, o)), kl(ew=ew, ow=at(ow, o), ewn=ew, own=at(ow, o))) < REL
 
 
+def stated_pairs(graph, reads=None, keep=1.0, seed=0):
+    """Per read (layer, query position) of the graph's query nodes, its query-key pairs (query node or None, key node at
+    or before it or None; not both None), each kept with probability keep."""
+    g = torch.Generator().manual_seed(seed)
+    out = {}
+    for n, t, _ in sorted(graph.node_set()):
+        layer, kind = native._name_layer_kind(n)
+        if kind != "q_proj" or (reads is not None and (layer, t) not in reads) or (layer, t) in out:
+            continue
+        qs = [nd for nd in sorted(graph.node_set()) if nd[0] == n and nd[1] == t]
+        ks = [nd for nd in sorted(graph.node_set()) if nd[0] == native.site_name(layer, "k_proj") and nd[1] <= t]
+        every = [(a, b) for a in qs + [None] for b in ks + [None] if a is not None or b is not None]
+        out[(layer, t)] = [x for x in every if float(torch.rand(1, generator=g)) < keep]
+    return out
+
+
+def test_stated_query_key_pairs():
+    """A read's attention row from its stated query-key pairs (graph.pairs; C's semantics): every pair stated is the run
+    without pairs (graph_ref and the engine, within float32 rounding); a subset of them on the engine is graph_ref's
+    with the same pairs, with gradients in u; and a run on a changed text reusing the text's run (reuse) is the run on
+    that text's own engine."""
+    nat, ids, targets, graph, _, _, u = graph_case()
+    ge = goal_eval.GoalEval(nat)
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[::2])
+    ref = nat.reference([ids], targets)
+    eng = engine.Engine(nat, ids, targets, live=True)
+    with torch.no_grad():
+        plain = carry.kl(ref, ge.graph_ref(ids, targets, half, u=u))
+        every = native.Graph(half.nodes, half.parents, half.out)
+        every.pairs = stated_pairs(half)
+        assert every.pairs and any(every.pairs.values())
+        assert rel(plain, carry.kl(ref, ge.graph_ref(ids, targets, every, u=u))) < REL
+        assert rel(plain, carry.kl(ref, eng.graph_log_probs(eng.plan(every, semantics="c"), u))) < REL
+        some = native.Graph(half.nodes, half.parents, half.out)
+        some.pairs = stated_pairs(half, keep=0.4, seed=3)
+        want = carry.kl(ref, ge.graph_ref(ids, targets, some, u=u))
+        assert rel(plain, want) > 10 * REL  # the pairs left out move the run
+        assert rel(want, carry.kl(ref, eng.graph_log_probs(eng.plan(some, semantics="c"), u))) < REL
+        T = len(ids)
+        x = list(ids)
+        x[T // 2] = (x[T // 2] + 7) % nat.target.wte.shape[0]
+        st = {}
+        eng.graph_log_probs(eng.plan(some, semantics="c"), u, keep=st)
+        got = eng.graph_log_probs(eng.plan(some, semantics="c"), u, reuse=(st, x, T // 2))
+        ex = engine.Engine(nat, x, targets, live=True)
+        refx = nat.reference([x], targets)
+        assert rel(carry.kl(refx, ex.graph_log_probs(ex.plan(some, semantics="c"), u)), carry.kl(refx, got)) < REL
+    a = {n: m.clone().requires_grad_(True) for n, m in u.items()}
+    b = {n: m.clone().requires_grad_(True) for n, m in u.items()}
+    carry.kl(ref, ge.graph_ref(ids, targets, some, u=a)).sum().backward()
+    carry.kl(ref, eng.graph_log_probs(eng.plan(some, semantics="c"), b)).sum().backward()
+    for n in nat.names:
+        assert float((a[n].grad - b[n].grad).norm() / a[n].grad.norm().clamp_min(1e-30)) < REL
+
+
 def test_c_semantics_equal_graph_ref():
     """C's semantics (plan(semantics="c")) equal goal_eval.GoalEval.graph_ref, the forward pass written out, on a graph
     stating half of its connections, with the gradients in u; a stated connection at strength 0 is the graph without it."""

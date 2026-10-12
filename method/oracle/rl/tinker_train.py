@@ -37,7 +37,9 @@ from pathlib import Path
 import httpx
 
 PRICES = {"Qwen/Qwen3-8B": (0.195, 0.60, 0.44), "Qwen/Qwen3.5-4B": (0.33, 1.005, 0.737),  # $/M tokens: prefill, sample, train
-          "Qwen/Qwen3.8-27B": (0.6975, 5.595, 4.103), "Qwen/Qwen3.6-27B": (1.86, 5.595, 4.103)}  # (Tinker's models page, 64K rows)
+          "Qwen/Qwen3.8-27B": (0.6975, 5.595, 4.103), "Qwen/Qwen3.6-27B": (1.86, 5.595, 4.103),  # (Tinker's models page, 64K rows)
+          "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": (0.184, 0.495, 0.44),  # at the limited-time 50% discount
+          "Qwen/Qwen3.6-35B-A3B": (0.45, 1.335, 1.177)}
 CACHED = 0.2  # a cached prefill token's share of the price
 RENDERER = "qwen3_disable_thinking"
 NAMES = re.compile(r"L\d+\.(?:q|k|v|o|fc|down)#\d+")  # a subcomponent's name in English

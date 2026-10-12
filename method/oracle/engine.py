@@ -83,8 +83,11 @@ class Engine:
         """The number of a site's columns (a mask's last dimension)."""
         return self.V[n].shape[1]
 
-    def _site(self, n: str, h: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-        out = ((h @ self.V[n]) * m) @ self.U[n]
+    def _site(self, n: str, h: torch.Tensor, m: torch.Tensor, rec: tuple | None = None) -> torch.Tensor:
+        a = h @ self.V[n]
+        if rec is not None and n in rec[0]:  # reads: the activations at the asked (row, position, column)s
+            rec[1][n] = a[rec[0][n]]
+        out = (a * m) @ self.U[n]
         return out + h @ self.R[n] if self.fixed else out
 
     def _steps(self, fused: bool):
@@ -93,7 +96,7 @@ class Engine:
             return (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, self.eps)), (lambda x: F.gelu(x, approximate="tanh"))
         return (lambda x, w: self.rms(x, w, self.eps)), self.gelu
 
-    def hidden(self, masks: dict, search: bool) -> torch.Tensor:
+    def hidden(self, masks: dict, search: bool, rec: tuple | None = None) -> torch.Tensor:
         """The final normed residual stream at the targets [B, len(targets), d] of the masked run. search: torch's
         fused norms and GELU, the first layer's products of the embedding computed once for every row, and the last
         layer's queries, attention output and MLP at the targets alone (the only positions the prediction reads):
@@ -108,12 +111,12 @@ class Engine:
             h = norm(x, tg.norms[2 * i])
             if search and i == tg.n_layer - 1:
                 return self._last(masks, x, h, name, norm, act, B)
-            q, k, v = (self._site(name(kd), h, masks[name(kd)]).view(B, T, H, hd).transpose(1, 2)
+            q, k, v = (self._site(name(kd), h, masks[name(kd)], rec).view(B, T, H, hd).transpose(1, 2)
                        for kd in ("q_proj", "k_proj", "v_proj"))
             y = F.scaled_dot_product_attention(tg._rope(q, T), tg._rope(k, T), v, is_causal=True)
-            x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, T, -1), masks[name("o_proj")])
+            x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, T, -1), masks[name("o_proj")], rec)
             h = norm(x, tg.norms[2 * i + 1])
-            x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, masks[name("c_fc")])), masks[name("down_proj")])
+            x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, masks[name("c_fc")], rec)), masks[name("down_proj")], rec)
         return norm(x, tg.ln_f)[:, self.targets]  # the final norm over every position, as vpd_model.Target.hidden
 
     def _last(self, masks, x, h, name, norm, act, B):
@@ -135,13 +138,19 @@ class Engine:
         """KL in bits of the model at the targets from each row's masked run [B] (summed over the targets)."""
         return carry.kl(self.ref, self.log_probs(masks, precision))
 
-    def log_probs(self, masks: dict, precision: str = "score") -> torch.Tensor:
-        """Each row's masked run's next-token log probabilities at the targets [B, len(targets), V], float32."""
+    def log_probs(self, masks: dict, precision: str = "score", reads: dict | None = None):
+        """Each row's masked run's next-token log probabilities at the targets [B, len(targets), V], float32. reads:
+        {site: (rows, positions, columns)} (columns the engine's): also those subcomponents' activations, (log q,
+        {site: [n]}) ("score" only)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
+        if reads is not None and precision != "score":
+            raise ValueError("reads come from the float32 run (score)")
+        rec = None if reads is None else (reads, {})
         with _precision(precision, self.dev):
-            h = self.hidden(masks, search=False) if precision == "score" else self._search(masks, search=True)
-        return torch.log_softmax(h.float() @ self.tg.wte.T, -1)  # the logits in float32 at every precision
+            h = self.hidden(masks, search=False, rec=rec) if precision == "score" else self._search(masks, search=True)
+        lq = torch.log_softmax(h.float() @ self.tg.wte.T, -1)  # the logits in float32 at every precision
+        return lq if rec is None else (lq, rec[1])
 
     def full(self, masks: dict) -> dict:
         """Masks over a site's columns as masks over all its subcomponents [B, T, C] (for another engine or Native)."""
@@ -268,24 +277,27 @@ class Engine:
         return carry.kl(self.ref, self.graph_log_probs(plan, u, ew, ow, precision, patch))
 
     def graph_log_probs(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
-                        precision: str = "score", patch: dict | None = None) -> torch.Tensor:
+                        precision: str = "score", patch: dict | None = None, reads: dict | None = None):
         """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32. patch:
-        {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange)."""
+        {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange). reads as
+        log_probs': (log q, {site: [n]})."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
         p = self._rows(plan, B)
         with _precision(precision, self.dev):
+            rec = None if reads is None else (reads, {})
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
-                                   None if ow is None else ow.reshape(-1), B, precision != "score", patch)
-        return torch.log_softmax(h.float() @ self.tg.wte.T, -1)
+                                   None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec)
+        lq = torch.log_softmax(h.float() @ self.tg.wte.T, -1)
+        return lq if rec is None else (lq, rec[1])
 
     def _zeros(self) -> dict:
         if not hasattr(self, "_u0"):
             self._u0 = {n: torch.zeros(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
         return self._u0
 
-    def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None) -> torch.Tensor:
+    def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None, rec: tuple | None = None) -> torch.Tensor:
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         norm, act = self._steps(fused)
         R, Wr, Eg = p["readers"], p["writers"], p["edges"]
@@ -298,9 +310,11 @@ class Engine:
         def at(m, b, t, c):  # a mask [B or 1, T or 1, K] at rows' (row, position, column)
             return m[b if m.shape[0] > 1 else torch.zeros_like(b), t if m.shape[1] > 1 else torch.zeros_like(t), c]
 
-        def done(n, A):  # a site's activations [B, T, K], patched: its writer nodes' kept
+        def done(n, A):  # a site's activations [B, T, K], patched: its writer nodes' kept, the asked ones read
             if patch is not None and n in patch:
                 A = torch.where(patch[n][0], patch[n][1].to(A.dtype), A)
+            if rec is not None and n in rec[0]:
+                rec[1][n] = A[rec[0][n]].float()
             if n in Wr:
                 aw[n], sw[n] = A[Wr[n]], 1 - at(u[n], *Wr[n])
             return A

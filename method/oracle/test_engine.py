@@ -318,3 +318,40 @@ def test_graph_runs_in_slices(monkeypatch):
             monkeypatch.setattr(engine, "ROWS", 1 << 10)
             assert rel(whole, eng.graph_kl(plan, u, ew, ow)) < REL
             monkeypatch.setattr(engine, "ROWS", 1 << 24)
+
+
+def test_reads_equal_graph_ref():
+    """The circuit nodes' activations a run reads out (reads=) equal graph_ref's record: a C-semantics graph run with
+    random u, and a masked run (the whole model with some subcomponents off, as a complete graph)."""
+    nat, ids, targets, graph, _, _, u = graph_case(B=2)
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[::2])
+    ge = goal_eval.GoalEval(nat)
+    nodes = sorted(half.nodes)
+    rec = {}
+    ge.graph_ref(ids, targets, half, u=u, record=rec, reads=nodes)
+    eng = engine.Engine(nat, ids, targets, live=True)
+    spec = {}
+    for b in range(2):
+        for n, t, c in nodes:
+            spec.setdefault(n, ([], [], []))
+            for lst, v in zip(spec[n], (b, t, c)):
+                lst.append(v)
+    spec = {n: tuple(torch.tensor(v, device=nat.dev) for v in x) for n, x in spec.items()}
+    _, got = eng.graph_log_probs(eng.plan(half, semantics="c"), u, reads=spec)
+    k = {n: 0 for n in spec}
+    for b in range(2):
+        for n, t, c in nodes:
+            want = float(rec[(n, t, c)][b])
+            assert abs(float(got[n][k[n]]) - want) < 1e-5 + REL * abs(want)
+            k[n] += 1
+    on = {n: torch.ones(len(ids), nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+    for n, t, c in nodes[::2]:
+        on[n][t, c] = False
+    rec = {}
+    ge.graph_ref(ids, targets, native.Graph(masks=on), record=rec, reads=nodes)
+    one = {n: tuple(v[:len(v) // 2] for v in x) for n, x in spec.items()}  # row 0's reads
+    _, got = eng.log_probs({n: m.float()[None] for n, m in on.items()}, reads=one)
+    for n, t, c in nodes:
+        i = [(int(a), int(b_)) for a, b_ in zip(one[n][1].tolist(), one[n][2].tolist())].index((t, c))
+        want = float(rec[(n, t, c)][0])
+        assert abs(float(got[n][i]) - want) < 1e-5 + REL * abs(want)

@@ -3,7 +3,7 @@
 # texts (edit_eval.py goals), the edit teacher, the native-unit search and VPD's top-k on each goal (P processes sharing
 # the GPU, edit_eval.py teach --offset/--stride), and the persistent copy goal (edit_eval.py copy) beside them. The
 # Python is method/oracle and method/vpd at origin/main as rp-run unpacks them; texts/vpd4l and the held-out teacher
-# circuits go up as compressed tars, the Pile rows (edit_eval.py tokens) and the copy set as files; VPD's checkpoint
+# circuits go up as compressed tars, the Pile rows (edit_eval.py tokens) and the copy set as files (where rp-run puts them); VPD's checkpoint
 # (its causal-importance network ranks VPD's subcomponents) is put back together from its two published pieces.
 # Everything comes back to ~/mpd-data/runpod/NAME/out.
 #   experiments/oracle/pods/edit_pod.sh [NAME] [HOURS]      env: N, P, GPU, PRICE
@@ -22,11 +22,10 @@ for k in $(seq 0 $((P - 1))); do
   RUNS="$RUNS (python -B edit_eval.py teach $O/out/goals.jsonl $O/out/teach_$k.jsonl --offset $k --stride $P > $O/teach_$k.log 2>&1; echo \"exit \$?\" >> $O/teach_$k.log) &"
   ROWS="$ROWS $O/out/teach_$k.jsonl"
 done
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle/edit;
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out;
 python -m pip install -q safetensors pyyaml tokenizers scipy pytest;
 tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle; tar -xzf $F/teacher.tgz -C ~/mpd-data/graph_oracle;
-cp $G/edit/tokens.npz ~/mpd-data/graph_oracle/edit/tokens.npz; cp $G/headfix_fresh.jsonl ~/mpd-data/graph_oracle/headfix_fresh.jsonl;
-ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/params/method/vpd > /dev/null;
+ls $G/edit/tokens.npz $G/headfix_fresh.jsonl $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/params/method/vpd > /dev/null;
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);

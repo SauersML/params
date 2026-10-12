@@ -119,6 +119,9 @@ CHANGED_DRAWS = 16  # C's changed texts per circuit
 INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
 # offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
+BLOCK = -1  # a block node's index: (site, position, BLOCK), the site's whole output there (every subcomponent and the
+# remainder), ["block", site, position] in an answer (the lead's 10-12: a token's identity lives in thousands of parts)
+VPD4L_SITES = 24  # vpd4l's weight matrices (4 layers x 6), a block's name among them
 DONORS_NEAR = 16  # donor resampling's changed-input donors per text
 DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's answer)
 DONORS_FAR = 8  # donor resampling's other texts per text
@@ -151,6 +154,15 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
     and counted."""
     nodes, bad_nodes = [], 0
     for m, c, t in answer.get("nodes", []):
+        if m == "block":  # a site's whole output at a position
+            try:
+                n = _site(c)
+            except (ValueError, KeyError):
+                n = None
+            ok = n in C and 0 <= int(t) <= max(targets)
+            nodes.append((n, int(t), BLOCK) if ok else None)
+            bad_nodes += not ok
+            continue
         if m == "tok":
             ok = int(c) == 0 and 0 <= int(t) <= max(targets)
             nodes.append(("tok", int(t), 0) if ok else None)
@@ -165,7 +177,7 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
         else:
             bad_nodes += 1
             nodes.append(None)
-    parents, out, tok, bad_edges, pairs = {}, [], [], 0, {}
+    parents, out, tok, bad_edges, pairs, tok_out = {}, [], [], 0, {}, []
     for e in answer.get("edges", []):
         if isinstance(e, (list, tuple)) and len(e) == 5 and e[0] == "pair":
             got = _pair_entry(e, nodes, targets)
@@ -189,6 +201,8 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
         elif w[0] == "tok":
             if r is not None and r[0] != "tok" and native._name_layer_kind(r[0])[1] in mech.RESID_READERS and r[1] == w[1]:
                 tok.append((w[1], r))
+            elif r is None and w[1] in targets:  # the token's embedding into the prediction at its own position
+                tok_out.append(w[1])
             else:
                 bad_edges += 1
         elif (r is not None and r[0] == "tok") or not native.connects(w, r, targets):
@@ -201,6 +215,8 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
                      list(dict.fromkeys(out)))
     g.tok_edges = list(dict.fromkeys(tok))
     g.tok_positions = sorted({nd[1] for nd in nodes if nd is not None and nd[0] == "tok"})
+    if tok_out:
+        g.tok_out = sorted(set(tok_out))
     if pairs:
         g.pairs = pairs
     g.variables, bad_variables = [], 0
@@ -270,6 +286,8 @@ def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
                         {r: [w for w in ws if w not in drop] for r, ws in g.parents.items() if r not in drop}, list(g.out))
     kept.tok_edges = [(p, r) for p, r in getattr(g, "tok_edges", []) if r not in drop]
     kept.tok_positions = list(getattr(g, "tok_positions", []))
+    if hasattr(g, "tok_out"):
+        kept.tok_out = list(g.tok_out)
     if hasattr(g, "variables"):
         kept.variables = g.variables
     if pairs:  # a pair naming a dropped node goes with it
@@ -300,16 +318,57 @@ def _pair_entry(e: list, nodes: list, targets: list[int]):
     return (layer, t), (q, k)
 
 
+def expand_blocks(g: native.Graph, C: dict) -> native.Graph:
+    """A graph with its block nodes (BLOCK) replaced by every subcomponent of the site at the position, each in the
+    block's connections and pairs: C's semantics already run the remainders live, so this is the block's claim there
+    (the families on the engine take subcomponents). A graph without blocks is returned as it is."""
+    if g.masks is not None or not any(nd[2] == BLOCK for nd in g.node_set()):
+        return g
+
+    def ex(nd):
+        return [(nd[0], nd[1], c) for c in range(C[nd[0]])] if nd is not None and nd[2] == BLOCK else [nd]
+
+    if g.complete:
+        out = native.Graph(list(dict.fromkeys(x for nd in g.nodes for x in ex(nd))), complete=True)
+        for name in ("stranded", "stranded_bits"):
+            if hasattr(g, name):
+                setattr(out, name, getattr(g, name))
+        return out
+
+    nodes = list(dict.fromkeys(x for nd in g.nodes for x in ex(nd)))
+    parents = {}
+    for r, ws in g.parents.items():
+        for rr in ex(r):
+            parents.setdefault(rr, [])
+            parents[rr] += [x for w in ws for x in ex(w) if x not in parents[rr]]
+    out = native.Graph(nodes, parents, list(dict.fromkeys(x for w in g.out for x in ex(w))))
+    out.tok_edges = [(p, x) for p, r in getattr(g, "tok_edges", []) for x in ex(r)]
+    out.tok_positions = list(getattr(g, "tok_positions", []))
+    for name in ("tok_out", "variables", "stranded", "stranded_bits"):
+        if hasattr(g, name):
+            setattr(out, name, getattr(g, name))
+    if getattr(g, "pairs", None):
+        out.pairs = {read: list(dict.fromkeys((a, b) for pa, pb in ps for a in ex(pa) for b in ex(pb))) for read, ps in g.pairs.items()}
+    return out
+
+
+def _c_graph(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
+    """A graph as C's families run it: stranded nodes dropped (strand), block nodes as their subcomponents
+    (expand_blocks)."""
+    return expand_blocks(strand(g, targets, C), C)
+
+
 def to_json(g: native.Graph, explanation: str = "") -> dict:
     """A Graph (not complete) as an answer in JSON (circuit's format)."""
     tok = getattr(g, "tok_edges", [])
-    nodes = sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2])) + [("tok", p, 0) for p in sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in tok})]
+    nodes = sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2])) + [("tok", p, 0) for p in sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in tok} | set(getattr(g, "tok_out", [])))]
     at = {nd: i for i, nd in enumerate(nodes)}
     edges = ([[at[w], at[r]] for r, ws in g.parents.items() for w in ws] + [[at[w], "out"] for w in g.out]
              + [[at[("tok", p, 0)], at[r]] for p, r in tok])
     for (layer, t), ps in sorted((getattr(g, "pairs", None) or {}).items()):
         edges += [["pair", "rest" if a is None else at[a], "rest" if b is None else at[b], layer, t] for a, b in ps] or [["pair", "rest", "rest", layer, t]]
-    return {"nodes": [[n, c, t] for n, t, c in nodes], "edges": edges, "explanation": explanation}
+    edges += [[at[("tok", p, 0)], "out"] for p in getattr(g, "tok_out", [])]
+    return {"nodes": [["block", n, t] if c == BLOCK else [n, c, t] for n, t, c in nodes], "edges": edges, "explanation": explanation}
 
 
 def _pairs(g: native.Graph) -> list[tuple]:
@@ -330,6 +389,10 @@ def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list
     indexed among all the listed nodes (embedding nodes included), an embedding edge priced like any other; and the
     stated query-key pairs (_pair_bits)."""
     extra = getattr(g, "stranded_bits", 0.0) + _pair_bits(g)  # stranded nodes (strand): dropped, their bits still charged
+    blocks = sum(1 for nd in (g.node_set() if not g.complete else ()) if nd[2] == BLOCK)
+    extra += blocks * (math.log2(positions * VPD4L_SITES) - math.log2(positions * subcomponents))  # named among sites, not parts
+    if getattr(g, "tok_out", None):  # an embedding into the prediction priced like an edge into it: its writer named
+        extra += len(g.tok_out) * math.log2(g.count() + len(set(getattr(g, "tok_positions", [])) | set(g.tok_out)))
     pos = sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in getattr(g, "tok_edges", [])})
     if not pos:
         return g.bits(positions, subcomponents, targets) + extra
@@ -864,9 +927,12 @@ class GoalEval:
         """log q at the targets [1, len(targets), V] of the path-patched run of graph on the changed text x2 (s_track_pp,
         the lead's 10-12): everything at its value in the real model on the text (_pp_base) but the circuit's nodes,
         which compute in layer order from their stated parents' path-patched values and every unstated input at its x
-        value; the change enters as the token embedding at the changed positions, read by the circuit's nodes there
-        and by the prediction. A residual reader's input: its read of the x stream plus each stated parent's change
-        (out^P - out^x, a rank-one write) plus the embedding's change, its RMSNorm recomputed. A read's pattern
+        value; the change enters only through stated token edges (the lead's spec: an embedding edge (p, reader), and
+        ("tok", p) into the prediction, g.tok_out), so nothing stated is the model on the text (0) and everything stated
+        the model on x2 (a complete graph states every token edge). A block node (BLOCK) is its site's whole output at
+        its position, every subcomponent and the remainder, from its patched input. A residual reader's input: its read
+        of the x stream plus each stated parent's change (out^P - out^x) plus its stated token edges' change, its
+        RMSNorm recomputed. A read's pattern
         (layer, t): queries and keys split into the circuit's nodes and the rest (always at x); with no stated pairs
         the read claims every pair (circuit nodes at their patched values), with stated pairs the x scores plus each
         stated pair's change, the softmax over the whole row recomputed. An attention output: that pattern over the x
@@ -884,11 +950,23 @@ class GoalEval:
         demb = {t: (tg.wte[x2[t]] - tg.wte[tx.ids[t]]).float() for t in range(T) if x2[t] != tx.ids[t]}
         causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
         if graph.complete:
-            M = {n: m.to(dev) for n, m in self.masks(graph, T).items()}
+            if graph.masks is not None:
+                M = {n: m.to(dev) for n, m in self.masks(graph, T).items()}
+                Mb = {}
+            else:  # subcomponent nodes live, block nodes' whole site output (with its remainder) live
+                M = {n: torch.zeros(T, self.nat.C[n], dtype=torch.bool, device=dev) for n in self.nat.names}
+                Mb = {}
+                for n, t, c in graph.node_set():
+                    if c == BLOCK:
+                        M[n][t] = True
+                        Mb.setdefault(n, torch.zeros(T, 1, dtype=torch.bool, device=dev))[t] = True
+                    else:
+                        M[n][t, c] = True
 
             def site(n, inp):
                 A = torch.where(M[n], inp @ tg.site(n).V, b["a"][n])
-                return A @ tg.site(n).U + b["rem"][n]
+                rem = torch.where(Mb[n], inp @ tg.site(n).delta_T, b["rem"][n]) if n in Mb else b["rem"][n]
+                return A @ tg.site(n).U + rem
 
             x = tg.wte[torch.tensor(x2, device=dev)].float()
             for i in range(tg.n_layer):
@@ -910,28 +988,49 @@ class GoalEval:
         order = {k: j for j, k in enumerate(vpd_model.KINDS)}
         nodes = sorted(graph.node_set(), key=lambda nd: (native._name_layer_kind(nd[0])[0],
                                                           order[native._name_layer_kind(nd[0])[1]], nd[1], nd[2]))
+        blocks = {(nd[0], nd[1]) for nd in nodes if nd[2] == BLOCK}
+        nodes = [nd for nd in nodes if nd[2] == BLOCK or (nd[0], nd[1]) not in blocks]  # a block holds its site's parts there
         par = graph.parents
-        aP = {}
+        tok = {}  # reader -> the stated embedding edges' change it reads (the change enters only there)
+        for t, r in getattr(graph, "tok_edges", []):
+            if t in demb:
+                tok[r] = tok.get(r, 0) + demb[t]
+        aP = {}  # each circuit node's patched value: a subcomponent's activation, a block's whole output
+
+        def full(n, z):  # a site's whole linear map (every subcomponent and the remainder)
+            return (z @ tg.site(n).V) @ tg.site(n).U + z @ tg.site(n).delta_T
+
+        def x_out(w):  # a circuit writer's output on the text
+            n, t, c = w
+            return b["a"][n][t] @ tg.site(n).U + b["rem"][n][t] if c == BLOCK else b["a"][n][t, c] * tg.site(n).U[c]
 
         def delta(w):  # a circuit writer's output change, out^P - out^x, in its site's output space
             n, t, c = w
-            return (aP[w] - b["a"][n][t, c]) * tg.site(n).U[c]
+            return (aP[w] if c == BLOCK else aP[w] * tg.site(n).U[c]) - x_out(w)
 
-        def resid(r, X, wn):  # a residual reader's patched activation
+        def apply(r, z):  # a node's patched value from its patched input z
+            return full(r[0], z) if r[2] == BLOCK else z @ tg.site(r[0]).V[:, r[2]]
+
+        def resid(r, X, wn):  # a residual reader's patched value
             inp = X[r[1]].clone()
             for w in par.get(r, []):
                 if w in aP:
                     inp = inp + delta(w)
-            if r[1] in demb:
-                inp = inp + demb[r[1]]
-            return vpd_model.rms(inp, wn, tg.eps) @ tg.site(r[0]).V[:, r[2]]
+            if r in tok:
+                inp = inp + tok[r]
+            return apply(r, vpd_model.rms(inp, wn, tg.eps))
 
-        def part(nd, patched):  # a query or key node's rank-one part [H, hd], rotated at its position
-            n, p, c = nd
-            act = aP[nd] if patched else b["a"][n][p, c]
-            v = (act * tg.site(n).U[c]).view(H, hd)
+        def rot(vec, p):  # a query or key vector [H hd] rotated at position p -> [H, hd]
+            v = vec.view(H, hd)
             half = hd // 2
             return v * tg.cos[p] + torch.cat([-v[..., half:], v[..., :half]], -1) * tg.sin[p]
+
+        def part(nd, patched):  # a query or key node's part [H, hd] (a block: the whole query or key), rotated
+            n, p_, c = nd
+            if c == BLOCK:
+                return rot(aP[nd], p_) if patched else rot(x_out(nd), p_)
+            act = aP[nd] if patched else b["a"][n][p_, c]
+            return rot(act * tg.site(n).U[c], p_)
 
         pairs = getattr(graph, "pairs", None) or {}
         scale = 1 / math.sqrt(hd)
@@ -979,7 +1078,7 @@ class GoalEval:
                         if w in aP and kind.get(w) == "v_proj" and w[1] <= t:
                             vmix[w[1]] += delta(w)
                     att = (rows[t][:, :, None] * vmix.view(t + 1, H, hd).transpose(0, 1)).sum(1).reshape(-1)
-                    aP[r] = att @ tg.site(r[0]).V[:, r[2]]
+                    aP[r] = apply(r, att)
             for r in here:
                 if kind[r] == "c_fc":
                     aP[r] = resid(r, b["Xm"][i], tg.norms[2 * i + 1])
@@ -989,13 +1088,13 @@ class GoalEval:
                     for w in par.get(r, []):
                         if w in aP and kind.get(w) == "c_fc":
                             pre = pre + delta(w)
-                    aP[r] = vpd_model.gelu_tanh(pre) @ tg.site(r[0]).V[:, r[2]]
+                    aP[r] = apply(r, vpd_model.gelu_tanh(pre))
         f = b["Xf"][tx.targets].clone()
         for j, t in enumerate(tx.targets):
             for w in graph.out:
                 if w[1] == t and w in aP:
                     f[j] = f[j] + delta(w)
-            if t in demb:
+            if t in demb and t in getattr(graph, "tok_out", []):  # the token's embedding into the prediction, stated
                 f[j] = f[j] + demb[t]
         return torch.log_softmax(vpd_model.rms(f, tg.ln_f, tg.eps) @ tg.wte.T.float(), -1)[None]
 
@@ -1363,7 +1462,7 @@ class GoalEval:
         matrix's remainder W - V U removed too at each position holding one of the graph's subcomponents. A batch
         reuses the model's states before its first removed subcomponent."""
         nat, T = self.nat, tx.T
-        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
+        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         one_r = nat._one()[1]
         none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
         sets = [self.masks(g, T) for g in graphs]
@@ -1442,7 +1541,7 @@ class GoalEval:
         step-budget adversary, larger budgets, fresh pool, N_real or leak, and no flips_to_break / flips_to_half."""
         if mode not in ("full", "reward"):
             raise ValueError("mode is full or reward")
-        graphs = [strand(g, tx.targets, self.nat.C) for g in graphs]  # stranded nodes dropped before every family
+        graphs = [_c_graph(g, tx.targets, self.nat.C) for g in graphs]  # stranded nodes dropped before every family
         reward = mode == "reward"
         split = split or ("search" if reward else "eval")
         reads = reads or reward
@@ -1570,7 +1669,7 @@ class GoalEval:
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
-        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
+        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         ms = FLIPS["omitted"] if ms is None else ms
         e0, v0 = self._bounds(tx, "live")
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63) + 1)
@@ -2075,7 +2174,7 @@ class GoalEval:
         (KL_C, weighted the same), prompts_changed (those scored), s_track, kl_track_c, prompts_track, context_share
         (the share of the probe's moved at the circuit's positions) and draws_changed."""
         nat = self.nat
-        graphs = [strand(g, tx.targets, nat.C) for g in graphs]
+        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]
         moved = np.asarray(tx.moved, dtype=float)
         total = float(moved.sum())
         share = [sum(moved[t - 1] for t in {t for _, t, _ in g.node_set()} if 0 < t <= len(moved)) / total
@@ -2208,7 +2307,7 @@ class GoalEval:
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
-        graphs = [strand(g, tx.targets, nat.C) for g in graphs]
+        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]
         texts = {}  # pool -> [(name, token ids)]: near named [position, token], far by its text
         if near:
             moved = np.asarray(tx.moved, dtype=float)
@@ -2466,7 +2565,7 @@ class GoalEval:
         adv_mask (the patterns on, as pool indices, the count of the circuit's omissions switched on and those at the
         targets)."""
         nat, dev = self.nat, self.nat.dev
-        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
+        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         e0 = self._bounds(tx, "live")[0]
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True)
@@ -2545,7 +2644,7 @@ class GoalEval:
         shortlist measured on it alone. strengths: _adv_problem's (one stated graph at each circuit's connection
         strengths: edge_flips)."""
         nat, dev = self.nat, self.nat.dev
-        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
+        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         e0 = self._bounds(tx, "live")[0]
         ms = FLIPS[lever] if ms is None else ms
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
@@ -2678,7 +2777,7 @@ class GoalEval:
         its "norm" is 0 and "direct" its cut. An explanation's claim that a connection reads or rescales is tested by the
         two partial cuts (the lead's decision 10-12): they need not add up to the cut."""
         nat, dev = self.nat, self.nat.dev
-        g = strand(graph, tx.targets, nat.C)
+        g = _c_graph(graph, tx.targets, nat.C)
         edges = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
         if not edges:
             return []
@@ -2710,7 +2809,7 @@ class GoalEval:
         """(graph with its stranded nodes dropped, None), or with a subset of ons (edge_flips', in graph's order) that
         strands a node, or a graph that strands one itself (its plan's connections are fewer than ons' columns), (that,
         each subset's graph as stated with its stranded nodes dropped)."""
-        base = strand(graph, tx.targets, self.nat.C)  # nodes no path of graph reaches the prediction from: stranded in every subset
+        base = _c_graph(graph, tx.targets, self.nat.C)  # nodes no path of graph reaches the prediction from: stranded in every subset
         edges = [(w, r) for r, ws in graph.parents.items() for w in ws] + [(w, None) for w in graph.out]
         nodes = sorted(graph.node_set())
         subs = []
@@ -2831,7 +2930,7 @@ class GoalEval:
         real model's necessity ("n_real_*", "kl_real_minus")."""
         t0 = time.perf_counter()
         nat = self.nat
-        graphs = [strand(g, tx.targets, nat.C) for g in graphs]  # stranded nodes dropped before every measure
+        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # stranded nodes dropped before every measure
         rows = self.sufficiency(tx, graphs)
         f3 = self.edges(tx, graphs)
         total = sum(nat.C.values())

@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE.parent / "vpd"))
 
 import carry  # noqa: E402
 import goal_eval  # noqa: E402
+import mech  # noqa: E402
 import native  # noqa: E402
 import vpd_model  # noqa: E402
 
@@ -1453,29 +1454,77 @@ def test_far_pool_keeps_the_models_vocabulary(tiny):
 
 
 def test_path_patched_run(tiny):
-    """pp_run: on the text itself every circuit is the model; a stated graph with every connection among its nodes is
-    the complete graph's forward (every other subcomponent and every remainder at its x value); with nothing stated
-    the change reaches the prediction only through the embedding at a target; VPD's answer scores 1 in track_pp."""
+    """pp_run: on the text itself every circuit is the model; the change enters only through stated token edges, so
+    nothing stated is the model on the text and a stated graph with every connection and token edge among its nodes
+    is the complete graph's forward (every other subcomponent and every remainder at its x value); every site as a
+    block, complete, is the model on the changed text; a stated block graph is its complete graph's run; VPD's answer
+    scores 1 in track_pp."""
+    import vpd_model
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     sub = every[::2]
-    stated = native.Graph(sub, *native.all_edges(sub, tx.targets))
-    whole = native.Graph(sub, complete=True)
     b = ge._pp_base(tx)
-    import vpd_model
     base = torch.log_softmax(vpd_model.rms(b["Xf"][tx.targets], nat.target.ln_f, nat.target.eps) @ nat.target.wte.T.float(), -1)[None]
     assert float(carry.kl(tx.ref, base)[0]) < 1e-6
-    for g in (stated, whole, native.Graph()):
-        assert float(carry.kl(tx.ref, ge.pp_run(tx, tx.ids, g))[0]) < 1e-6
     p = next(q for q, _ in tx.f2 if q not in tx.targets) if any(q not in tx.targets for q, _ in tx.f2) else tx.f2[0][0]
     x2 = list(tx.ids)
     x2[p] = (x2[p] + 1) % 40
-    a, c = ge.pp_run(tx, x2, stated), ge.pp_run(tx, x2, whole)
+
+    def stated(nodes):  # every connection and every token edge at the changed position
+        g = native.Graph(nodes, *native.all_edges(nodes, tx.targets))
+        g.tok_edges = [(p, nd) for nd in nodes if nd[1] == p and native._name_layer_kind(nd[0])[1] in mech.RESID_READERS]
+        g.tok_out = [p] if p in tx.targets else []
+        return g
+
+    for g in (stated(sub), native.Graph(sub, complete=True), native.Graph()):
+        assert float(carry.kl(tx.ref, ge.pp_run(tx, tx.ids, g))[0]) < 1e-6
+    a, c = ge.pp_run(tx, x2, stated(sub)), ge.pp_run(tx, x2, native.Graph(sub, complete=True))
     assert float(carry.kl(c, a)[0]) < 1e-5, float(carry.kl(c, a)[0])
-    assert float(carry.kl(tx.ref, ge.pp_run(tx, x2, native.Graph()))[0]) < 1e-6 or p in tx.targets
-    rows = ge.track_pp(tx, [native.Graph(masks=tx.vpd), stated], draws=4)
+    assert float(carry.kl(tx.ref, ge.pp_run(tx, x2, native.Graph()))[0]) < 1e-6  # nothing stated: no change
+    no_tok = native.Graph(sub, *native.all_edges(sub, tx.targets))  # every connection but no token edge: no change
+    assert float(carry.kl(tx.ref, ge.pp_run(tx, x2, no_tok))[0]) < 1e-6
+    blocks = [(n, t, goal_eval.BLOCK) for n in nat.names for t in range(tx.T)]
+    model2 = nat.reference([x2], tx.targets)
+    assert float(carry.kl(model2, ge.pp_run(tx, x2, native.Graph(blocks, complete=True)))[0]) < 1e-5  # every site: the model on x2
+    some = [(n, t, goal_eval.BLOCK) for n in nat.names for t in range(p, tx.T)] + [nd for nd in sub if nd[1] < p]
+    a, c = ge.pp_run(tx, x2, stated(some)), ge.pp_run(tx, x2, native.Graph(some, complete=True))
+    assert float(carry.kl(c, a)[0]) < 1e-5, float(carry.kl(c, a)[0])
+    rows = ge.track_pp(tx, [native.Graph(masks=tx.vpd), stated(sub)], draws=4)
     assert rows[0]["s_track_pp"] is None or abs(rows[0]["s_track_pp"] - 1) < 1e-6
-    assert ge.changed_search(tx, [stated], draws=4, mode="pp")[0]["draws_track_pp"]
+    assert ge.changed_search(tx, [stated(sub)], draws=4, mode="pp")[0]["draws_track_pp"]
+
+
+def test_block_nodes(tiny):
+    """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
+    stranded by the same rules as a subcomponent of its site, and run by C's families as every subcomponent of the
+    site there (expand_blocks); a token edge into the prediction at a target is parsed and priced."""
+    nat, ge, tx = tiny
+    o1, d0 = "h.1.attn.o_proj", "h.0.mlp.down_proj"
+    answer = {"nodes": [["block", o1, 11], ["block", "1.q", 11], ["h.0.mlp.down_proj", 0, 11], ["tok", 0, 11], ["block", "h.9.mlp.c_fc", 3]],
+              "edges": [[0, "out"], [2, 1], [3, "out"], [3, 1]]}
+    g, d = goal_eval.circuit(answer, tx.targets, nat.C, tx.T)
+    B = goal_eval.BLOCK
+    assert d["invalid_nodes"] == 1 and d["invalid_edges"] == 0 and d["stranded_nodes"] == 0
+    assert set(g.node_set()) == {(o1, 11, B), ("h.1.attn.q_proj", 11, B), (d0, 11, 0)} and g.tok_out == [11]
+    again, d2 = goal_eval.circuit(goal_eval.to_json(g), tx.targets, nat.C, tx.T)
+    assert set(again.node_set()) == set(g.node_set()) and again.tok_out == g.tok_out and again.parents == g.parents
+    P, S = max(tx.targets) + 1, sum(nat.C.values())
+    plain = native.Graph([(o1, 11, 0), ("h.1.attn.q_proj", 11, 0), (d0, 11, 0)], {("h.1.attn.q_proj", 11, 0): [(d0, 11, 0)]}, [(o1, 11, 0)])
+    plain.tok_edges, plain.tok_positions = list(g.tok_edges), list(g.tok_positions)
+    diff = goal_eval.size_bits(g, P, S, tx.targets) - goal_eval.size_bits(plain, P, S, tx.targets)
+    want = 2 * (math.log2(P * goal_eval.VPD4L_SITES) - math.log2(P * S)) + math.log2(3 + 1)  # blocks; the edge into the prediction
+    assert abs(diff - want) < 1e-9, (diff, want)
+    ex = goal_eval.expand_blocks(g, nat.C)
+    assert set(ex.node_set()) == {(o1, 11, c) for c in range(nat.C[o1])} | {("h.1.attn.q_proj", 11, c) for c in range(nat.C["h.1.attn.q_proj"])} | {(d0, 11, 0)}
+    assert set(ex.out) == {(o1, 11, c) for c in range(nat.C[o1])}
+    a = ge.fidelity(tx, [g], None, draws=2, near_donors=0, far_donors=0)[0]
+    b = ge.fidelity(tx, [ex], None, draws=2, near_donors=0, far_donors=0)[0]
+    assert a["s_point"] == b["s_point"] and a["s_nodes"] == b["s_nodes"]
+    whole = native.Graph([(o1, 11, B), (d0, 11, 0)], complete=True)  # a node set with a block: its site's parts there
+    flat = native.Graph([(o1, 11, c) for c in range(nat.C[o1])] + [(d0, 11, 0)], complete=True)
+    assert set(goal_eval.expand_blocks(whole, nat.C).node_set()) == set(flat.node_set())
+    assert ge.fidelity(tx, [whole], None, draws=2, near_donors=0, far_donors=0)[0]["s_point"] ==         ge.fidelity(tx, [flat], None, draws=2, near_donors=0, far_donors=0)[0]["s_point"]
+
 
 def test_response_error():
     base = {("a", 0, 0): (1.0, 5.0), ("b", 0, 0): (0.0, 0.0)}

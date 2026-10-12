@@ -75,12 +75,15 @@ def item(answer: str, behavior: dict, seed: int) -> dict:
 
 def behaviors(root: Path, model: str, split: str) -> list[dict]:
     """The split's questions, one per task."""
+    from task_data import task_paths
+
     out = []
-    for p in sorted((root / model).glob("*.json")):
+    paths = task_paths(root / model, split) if model == "vpd4l" else sorted((root / model).glob("*.json"))
+    for p in paths:
         if p.name.startswith("."):  # macOS's ._ metadata files
             continue
         task = json.loads(p.read_text())
-        if task.get("split", "train") == split:
+        if model == "vpd4l" or task.get("split", "train") == split:
             out.append({**task, "task": task["id"], "path": str(p)})
     return out
 

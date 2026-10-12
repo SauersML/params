@@ -1616,9 +1616,10 @@ def first_steps(source: str, k: int) -> str:
 
 
 def tasks(split: str) -> list[Path]:
-    """The split's task files in text order."""
-    files = [p for p in (TEXTS / "vpd4l").glob("*.json") if not p.name.startswith(".")]  # not macOS's ._ metadata files
-    return [p for p in sorted(files, key=lambda p: int(p.stem[4:])) if json.loads(p.read_text())["split"] == split]
+    """The split's files, without opening other partitions (heldout means development)."""
+    from task_data import task_paths
+
+    return task_paths(TEXTS / "vpd4l", split)
 
 
 def text(p: Path) -> tuple[list[int], list[int]]:

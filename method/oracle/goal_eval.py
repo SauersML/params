@@ -127,7 +127,7 @@ DONORS_NEAR = 32  # donor resampling's changed-input donors per text
 DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's answer)
 DONORS_FAR = 32  # donor resampling's other texts per text
 DONOR_POOLS = {"search": ("train", range(0, 400)),  # the far donors' texts per split: the reward's from training texts,
-               "eval": ("heldout", range(150, 200))}  # evaluation's from held-out text9150-9199 (no search drew on them)
+               "eval": ("donor", range(0, 50))}  # explicit text9150-9199 partition, independent of missing dev files
 
 
 # ---- answers

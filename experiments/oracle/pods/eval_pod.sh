@@ -7,7 +7,8 @@
 # pod ends when evaluate does.
 #   bash experiments/oracle/pods/eval_pod.sh RUN ROWS.jsonl LABELS.jsonl NAME=SAMPLES[:E1.jsonl] ...
 #     SAMPLES: a sampler's JSONL or a directory of <task>[.<k>].txt (components.samples_of); E1: tinker_train.py readers
-#     (env: HOURS (cap, default 2), GPU, PRICE, VRAM, RP_OWNER; VARIABLES=1: E4, each answer's VARIABLES block;
+#     (env: HOURS (cap, default 2), GPU, PRICE, VRAM, RP_OWNER; SRCREV: the source revision (default origin/main);
+#      VARIABLES=1: E4, each answer's VARIABLES block;
 #      LEDGER_OK=1 once the lead approved a launch past $290)
 cd /Users/user/params
 spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
@@ -21,7 +22,8 @@ O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/primerl/src_eval_$RUN
 IN=/Users/user/mpd-data/scratch/primerl/in_eval_$RUN
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN.tar; a Mac path here would be uploaded file by file)
-git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive origin/main method/oracle method/vpd | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 origin/main)" > "$S/SOURCE"
+REV=${SRCREV:-origin/main}  # a fixed revision evaluates every answer set of a series (an RL run's checkpoints) with one goal_eval
+git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive "$REV" method/oracle method/vpd | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # rp-run uploads every existing path the command names: only the archives exist here
 rm -rf "$IN" "$IN.tar" && mkdir -p "$IN/sets" && cp "$ROWS" "$IN/rows.jsonl" && cp "$LABELS" "$IN/labels.jsonl"
 ARGS=""

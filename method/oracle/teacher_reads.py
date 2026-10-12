@@ -20,8 +20,9 @@ C's semantics (a cut read's connections at 0). The finish's connections take tea
      64, 16 and 4 sources, single sources. A source with a kept read joins the circuit's positions.
   3. At a source s (after every later position: every read from it decided): the subcomponents feeding no kept read
      from it (at or above its highest kept read's layer, but for that layer's keys and values) dropped as one block
-     when admitted, then the rest at s pruned (site, chunk16, chunk4, subcomponent); then step 2 at s (its own reads:
-     two-hop chains).
+     when admitted, then the rest at s pruned (site, chunk16, chunk4, subcomponent); then step 2 at s over its reads
+     in the layers below its highest kept read's (those that can feed it: chains descend in layers, at most a hop per
+     layer).
   4. Positions no kept read reaches: their subcomponents dropped as one block, else position by position; a position
      that cannot go (its keys shape a pattern, the remainders read it) joins with no kept read, and steps 3 and 2 run
      there, until none is left.
@@ -175,11 +176,11 @@ class State:
     def admits(self, x) -> bool:
         return x is None or self.floor is None or x >= self.floor
 
-    def sources(self, p: int) -> list[tuple[int, int]]:
+    def sources(self, p: int, below: int | None = None) -> list[tuple[int, int]]:
         """(layer, source) pairs of the reads into p's kept attention-output nodes from earlier positions with a kept
-        value node."""
+        value node, in the layers below `below` (None: every layer)."""
         on, out = self.on.tolist(), []
-        for l in range(self.ge.nat.target.n_layer):
+        for l in range(self.ge.nat.target.n_layer if below is None else below):
             if any(on[i] for i in self.by.get((l, "o_proj", p), [])):
                 out += [(l, s) for s in range(p) if any(on[i] for i in self.by.get((l, "v_proj", s), []))]
         return out
@@ -213,9 +214,9 @@ class Reads(teacher.Descent):
     every unit's connections free (engine.Engine.plan's free), each row's strengths its units' 0/1, the state's
     earlier cuts in place."""
 
-    def __init__(self, st: State, p: int):
+    def __init__(self, st: State, p: int, below: int | None = None):
         self.st, self.p, self.B = st, p, st.B
-        self.units = [(p, l, s) for l, s in st.sources(p)]
+        self.units = [(p, l, s) for l, s in st.sources(p, below)]
         self.on = torch.ones(len(self.units), dtype=torch.bool, device=st.dev)
         free = st.reads_dict(self.units)
         index = {(l, s): k for k, (_, l, s) in enumerate(self.units)}
@@ -288,10 +289,11 @@ def _prune_nodes(st: State, allowed: torch.Tensor, levels, label: str, record: l
     _stage(st, label, t0, record)
 
 
-def _prune_reads(st: State, p: int, record: list) -> list[tuple[int, int, int]]:
-    """Step 2 at p: its reads cut by the rounds; returns the kept ones."""
+def _prune_reads(st: State, p: int, record: list, below: int | None = None) -> list[tuple[int, int, int]]:
+    """Step 2 at p: its reads (in the layers below `below`: a source's reads that can feed its kept reads) cut by the
+    rounds; returns the kept ones."""
     t0 = time.perf_counter()
-    rd = Reads(st, p)
+    rd = Reads(st, p, below)
     if not rd.units:
         return []
     for level in READ_LEVELS:
@@ -334,7 +336,8 @@ def search(ge: goal_eval.GoalEval, tx: goal_eval.Text, B: int = 32, mode: str = 
                 layers = kept_from.get(p, set())
                 here = st.t == p
                 _prune_nodes(st, here, LEVELS, f"source {p}", record, _unused(st, p, layers) if layers else None)
-            for _, l, s in _prune_reads(st, p, record):
+            layers = kept_from.get(p, set())                # a source's own reads feed its kept reads from below them
+            for _, l, s in _prune_reads(st, p, record, max(layers) if p not in targets and layers else None):
                 kept_from.setdefault(s, set()).add(l)
                 if s not in done:
                     pending.add(s)

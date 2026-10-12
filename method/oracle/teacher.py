@@ -8,7 +8,8 @@ with VPD's own answer (causal importance above zero at the positions that reach 
 the bounds, "VPD minus C" VPD's answer with C's subcomponents off.
 
 Per text:
-  1. The F1 circuit: from VPD's answer, rounds at each level (whole positions, sites, chunks of 64, 16 and 4 of a site's
+  1. The F1 circuit: first from VPD's answer at the targets alone (chunks of 4, then single subcomponents); when that
+     cannot reach F1 >= 0.9, from VPD's whole answer, rounds at each level (whole positions, sites, chunks of 64, 16 and 4 of a site's
      subcomponents by index, single subcomponents) measure every block's removal, rank the blocks by the KL their removal
      leaves, and remove the most of them in that order that keeps F1 >= 0.9 (KL_C <= KL_empty^0.1 KL_VPD^0.9), until no
      single removal does; with --start-top K, from VPD's top K through the last three levels only. (The linear recovery
@@ -17,8 +18,8 @@ Per text:
   2. VPD's top-k: the smallest prefix of VPD's order (Native._vpd_order) whose necessity N reaches 0.99 (bisection, at
      most 1,024).
   3. The joint path from their union: each step measures every single subcomponent's removal (two runs: the circuit and
-     VPD's answer without it), ranks them by the mean of F1 and N they leave, and removes the best tenth of the circuit,
-     down to 4 subcomponents. Every step is recorded (size, F1, N, KL_C, KL_{VPD minus C}, positions, the subcomponents
+     VPD's answer without it), ranks them by the mean of F1 and N they leave, measures removing the first 1, 2, 4, ...
+     of them up to a tenth of the circuit and takes the prefix with the highest measured mean, down to 4 subcomponents. Every step is recorded (size, F1, N, KL_C, KL_{VPD minus C}, positions, the subcomponents
      removed) beside VPD's own top-k at the same size.
   4. The teacher circuit is the path point with the largest mean(F1, N) - 0.5 size, size the nodes' description bits
      (with a token-embedding node at each position) over the bits of naming every VPD-active subcomponent at the text's
@@ -203,9 +204,10 @@ def top_k(pr: Pruner, order: torch.Tensor, empty: float, vpd: float, target: flo
 
 
 def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> list[dict]:
-    """Nested measured removal from `start` down to MIN_SIZE: each step measures every single removal's F1 and N
-    (two runs each), ranks them by the mean they leave, and removes the best FRACTION of the circuit (at least one).
-    Records: the state after each step and the node ids removed."""
+    """Nested measured removal from `start` down to MIN_SIZE. Each step measures every single removal's F1 and N (two
+    runs each) and ranks the removals by the mean they leave; then it measures removing the first 1, 2, 4, ... of them
+    up to a tenth of the circuit (removals interact: subcomponents cancel) and takes the prefix with the highest
+    measured mean, the longest on a tie. Records: the state after each step and the node ids removed."""
     on = start.clone()
     path = [{"size": int(on.sum()), "removed": [], **measure(pr, on[None], empty, vpd)[0]}]
     while int(on.sum()) > MIN_SIZE:
@@ -215,11 +217,16 @@ def joint_path(pr: Pruner, start: torch.Tensor, empty: float, vpd: float) -> lis
         rows = []
         for s0 in range(0, len(ids), 4 * pr.B):
             rows += measure(pr, trials[s0:s0 + 4 * pr.B], empty, vpd)
-        means = torch.tensor([r["mean"] for r in rows])
-        k = max(1, int(FRACTION * len(ids)))
-        drop = ids[torch.argsort(means, descending=True, stable=True)[:k]]
-        on[drop] = False
-        path.append({"size": int(on.sum()), "removed": drop.tolist(), **measure(pr, on[None], empty, vpd)[0]})
+        ranked = ids[torch.argsort(torch.tensor([r["mean"] for r in rows]), descending=True, stable=True)]
+        top = min(max(1, int(FRACTION * len(ids))), len(ids) - MIN_SIZE)
+        ks = sorted({min(top, 2 ** e) for e in range(0, 20) if 2 ** e <= 2 * top})
+        prefixes = on[None].repeat(len(ks), 1)
+        for i, k in enumerate(ks):
+            prefixes[i, ranked[:k]] = False
+        got = measure(pr, prefixes, empty, vpd)
+        i = max(range(len(ks)), key=lambda j: (got[j]["mean"], ks[j]))
+        on[ranked[:ks[i]]] = False
+        path.append({"size": int(on.sum()), "removed": ranked[:ks[i]].tolist(), **got[i]})
     return path
 
 
@@ -260,19 +267,31 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     row = {"T": tx.T, "convention": CONVENTION, "vpd_size": len(pr.nodes), "vpd_positions": int(torch.unique(pr.t).numel()),
            "kl_empty": empty, "kl_vpd": vpd, "budget_kl": budget, "active_scale": active, "levels": {}}
-    levels = LEVELS
-    if start_top:                                            # the F1 search from VPD's top start_top, subcomponents only
-        pr.on[:] = False
-        pr.on[order[:start_top]] = True
-        levels = ("chunk16", "chunk4", "subcomponent")
-    row["f1_start"] = int(pr.on.sum())
-    for level in levels:                                     # the F1 circuit
-        t1 = time.perf_counter()
-        rounds = pr.prune(level, budget)
-        row["levels"][level] = lv = {"rounds": rounds, "size": int(pr.on.sum()), "positions": int(torch.unique(pr.t[pr.on]).numel()),
-                                     "kl": pr.kl(), "seconds": time.perf_counter() - t1}
-        print(f"  {level}: {lv['size']} subcomponents at {lv['positions']} positions, KL {lv['kl']:.3g} (budget {budget:.3g}), "
-              f"{rounds} rounds, {lv['seconds']:.0f}s, {pr.measured} sets so far", flush=True)
+    def search(levels, label):
+        for level in levels:
+            t1 = time.perf_counter()
+            rounds = pr.prune(level, budget)
+            row["levels"][f"{label}{level}"] = lv = {"rounds": rounds, "size": int(pr.on.sum()),
+                                                     "positions": int(torch.unique(pr.t[pr.on]).numel()), "kl": pr.kl(),
+                                                     "seconds": time.perf_counter() - t1}
+            print(f"  {label}{level}: {lv['size']} subcomponents at {lv['positions']} positions, KL {lv['kl']:.3g} "
+                  f"(budget {budget:.3g}), {rounds} rounds, {lv['seconds']:.0f}s, {pr.measured} sets so far", flush=True)
+        return row["levels"][f"{label}{levels[-1]}"]["kl"] <= budget
+
+    whole = pr.on.clone()
+    reached = False
+    if not start_top:                                        # first VPD's answer at the targets alone, subcomponents only
+        pr.on = whole & torch.isin(pr.t, torch.tensor(targets, device=pr.t.device))
+        reached = search(("chunk4", "subcomponent"), "target ")
+    if not reached:
+        pr.on = whole.clone()
+        levels = LEVELS
+        if start_top:                                        # the F1 search from VPD's top start_top, subcomponents only
+            pr.on[:] = False
+            pr.on[order[:start_top]] = True
+            levels = ("chunk16", "chunk4", "subcomponent")
+        search(levels, "")
+    row["f1_from_targets"] = reached
     f1_on = pr.on.clone()
     t1 = time.perf_counter()
     k = top_k(pr, order, empty, vpd)

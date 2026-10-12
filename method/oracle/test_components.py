@@ -122,9 +122,9 @@ def test_reward_on_tiny_model(tiny):
     good = components.render(goal_eval.to_json(g, "writes at the target"), finals)
     bad = good.replace("out <- ", "out <- L0.v#0@7, ")  # a value never writes the residual stream: dropped, charged
     missing = components.render(goal_eval.to_json(g, "writes at the target"))
-    got = components.reward(ge, task, ev, [good, bad, missing, good], ranks=(0, 1), truncated=[False, False, False, True])
+    got = components.reward(ge, task, ev, [good, bad, missing, good], truncated=[False, False, False, True])
     assert got[0]["valid"] and invalid < got[0]["reward"] <= 1.0
-    assert all(0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("F1", "F3"))
+    assert all(got[0][f"term_{k}"] is None or 0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("F1", "N", "F3"))
     assert got[0]["term_E2"] == (0.5 if ev["qa"] else None)  # every "falls" right, no top token "x"
     assert got[1]["valid"] and got[1]["dropped_edges"] == 1 and got[1]["size"] > got[0]["size"]
     assert (not got[2]["valid"]) == bool(ev["qa"]) and not got[3]["valid"] and got[3]["reward"] == invalid
@@ -139,9 +139,11 @@ def test_invalid_below_every_valid_answer(tiny):
     huge = native.Graph(every.node_set(), par, out)
     wrong = {n: (not q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
     junk = "\n".join(f"L3.v#{c}@{t} <- L0.q#{c}@{t}" for t in range(T) for c in range(5))  # no such connection: all dropped
+    garbage = "\n".join(["Reader: L1.o#1@3 <- Writer: L0.down#2@3", "the attention reads the previous token"] * 200)
     texts = [components.render(goal_eval.to_json(huge, ""), wrong),
-             components.render({"nodes": [], "edges": []}, wrong).replace("CIRCUIT:", "CIRCUIT:\n" + junk)]
-    got = components.reward(ge, task, ev, texts, ranks=(0, 1))
-    assert all(r["valid"] for r in got)
-    assert got[0]["size"] == 1.0 and got[1]["dropped_edges"] == 5 * T
+             components.render({"nodes": [], "edges": []}, wrong).replace("CIRCUIT:", "CIRCUIT:\n" + junk),
+             components.render({"nodes": [], "edges": []}, wrong).replace("CIRCUIT:", "CIRCUIT:\n" + garbage)]
+    got = components.reward(ge, task, ev, texts)
+    assert all(r["valid"] for r in got)  # lines that do not parse are dropped and charged, not fatal
+    assert got[0]["size"] == 1.0 and got[1]["dropped_edges"] == 5 * T and got[2]["malformed"] == 400 and got[2]["size"] == 1.0
     assert min(r["reward"] for r in got) > -(1 + components.SIZE_WEIGHT)

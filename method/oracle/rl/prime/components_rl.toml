@@ -1,9 +1,8 @@
 # prime-rl RL of the component-circuit explainer (#2951 graph oracle): one GPU for vLLM, one for the trainer, the reward
-# rl/serve_components.py's (components.reward over goal_eval's scorecard: invalid -1, else the mean of F2 completeness,
-# F1 recovered, F3 AUC, E1 when a reader is served, E2, less 0.5 x size). The launcher sets model.name (the SFT
+# rl/serve_components.py's (components.reward over goal_eval's scorecard: invalid -1.5, else the mean of F1 completeness,
+# N necessity, F3 edges, E1 when a reader is served, E2, less 0.5 x size). The launcher sets model.name (the SFT
 # explainer merged into Qwen3-4B) and starts from the directory holding train.jsonl and heldout.jsonl (components.py
-# questions output). Each training text appears in 4 examples with their own F2 ranks drawn from 0-7; evaluations use
-# the measured ranks 0-2 and the held-out ranks 3-5.
+# questions output).
 max_steps = 60
 seq_len = 12288  # questions number every token and list VPD's subcomponents (5-7.5k tokens); answers stop at 4,096
 dashboard = false
@@ -41,7 +40,6 @@ temperature = 1.0
 name = "components-oracle"
 env.taskset.id = "components-oracle"
 env.taskset.questions = "train.jsonl"
-env.taskset.copies = 4
 env.agent.harness.id = "null"
 env.agent.runtime.type = "subprocess"
 
@@ -54,22 +52,10 @@ temperature = 1.0
 chat_template_kwargs = { enable_thinking = false }
 
 [[orchestrator.eval.source]]
-name = "components-measured"
-group_size = 2
-env.taskset.id = "components-oracle"
-env.taskset.questions = "heldout.jsonl"
-env.taskset.copies = 1
-env.taskset.ranks = [0, 1, 2]
-env.agent.harness.id = "null"
-env.agent.runtime.type = "subprocess"
-
-[[orchestrator.eval.source]]
 name = "components-heldout"
 group_size = 2
 env.taskset.id = "components-oracle"
 env.taskset.questions = "heldout.jsonl"
-env.taskset.copies = 1
-env.taskset.ranks = [3, 4, 5]
 env.agent.harness.id = "null"
 env.agent.runtime.type = "subprocess"
 

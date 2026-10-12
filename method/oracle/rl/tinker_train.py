@@ -6,11 +6,14 @@ default) and the key from TINKER_API_KEY (read from the Keychain at launch, neve
   tinker_train.py sft SFT.jsonl --log DIR [--base Qwen/Qwen3-8B] [--steps N] [--batch B] [--lr LR] [--rank 32]
   tinker_train.py rl QUESTIONS.jsonl --log DIR --scorer http://127.0.0.1:8767/score [--init STATE_PATH] [--steps N]
                      [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5] [--reader]
+  tinker_train.py sample QUESTIONS.jsonl OUT.jsonl [--init STATE_PATH] [--n 50] [--samples 4]    answers to evaluate
+  tinker_train.py readers SAMPLES.jsonl QUESTIONS.jsonl OUT.jsonl [--reader-b MODEL]   E1 and its controls (components.py
+                                                                                      evaluate --e1)
 
 SFT.jsonl: components.py dataset rows; QUESTIONS.jsonl: components.py questions rows. sft trains on the assistant
 message only (Qwen3's template with thinking disabled) and saves its state (DIR/state.json holds the tinker:// path).
-rl samples G answers per question with one call (the prompt's prefill shared), scores them with the scorer (F2's ranks
-drawn per question from 0 to 7, as the prime-rl taskset does), centres the rewards within each group, and trains with
+rl samples G answers per question with one call (the prompt's prefill shared), scores them with the scorer (whether each
+was cut at the cap goes with it), centres the rewards within each group, and trains with
 Tinker's "cispo" loss on the sampled tokens' log-probabilities. The next batch is sampled while the update runs (one
 step behind; cispo's ratio corrects it). With --reader, E1 (the bits each answer's English saves a frozen reader)
 comes from a base-model sampling client on Tinker that is never trained (tinker_reader) and goes to the scorer with
@@ -30,9 +33,8 @@ from pathlib import Path
 
 import httpx
 
-PRICES = {"Qwen/Qwen3-8B": (0.195, 0.60, 0.44)}  # $ per million tokens: prefill, sample, train (Tinker's rate card)
+PRICES = {"Qwen/Qwen3-8B": (0.195, 0.60, 0.44), "Qwen/Qwen3.5-4B": (0.33, 1.005, 0.737)}  # $/M tokens: prefill, sample, train
 CACHED = 0.2  # a cached prefill token's share of the price
-RANKS = 8
 RENDERER = "qwen3_disable_thinking"
 
 
@@ -96,15 +98,88 @@ def tinker_reader(service, base: str, renderer, tokenizer, spend: Spend):
     return reader.Reader(generate, lambda xs: components.token_strings("vpd4l", xs))  # as the explainer sees them
 
 
+def renderer_for(base: str):
+    """(renderer, tokenizer) for a base model, thinking disabled where the model thinks by default."""
+    from tinker_cookbook import model_info, renderers
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+    tokenizer = get_tokenizer(base)
+    name = model_info.get_recommended_renderer_name(base)
+    return renderers.get_renderer(f"{name}_disable_thinking" if name in ("qwen3", "qwen3_5") else name, tokenizer), tokenizer
+
+
+def service_client():
+    import tinker
+
+    project = os.environ.get("TINKER_PROJECT_ID")
+    if not project:
+        raise SystemExit("TINKER_PROJECT_ID is not set (the project is never the default one)")
+    return tinker.ServiceClient(project_id=project)
+
+
+def sample(a) -> None:
+    """N answers per question from a trained state (--init) or the base model alone, one sampling call per question:
+    {"task", "sample", "text", "finish", "tokens"} per answer."""
+    import tinker
+    from tinker_cookbook import renderers
+
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    spend = Spend(a.out.parent, a.base)
+    service = service_client()
+    renderer, _ = renderer_for(a.base)
+    sampler = (service.create_training_client_from_state(a.init).save_weights_and_get_sampling_client() if a.init
+               else service.create_sampling_client(base_model=a.base))
+    params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=renderer.get_stop_sequences())
+    questions = [json.loads(x) for x in a.questions.read_text().splitlines() if x.strip()][:a.n]
+    futs = [(q, renderer.build_generation_prompt([{"role": "user", "content": q["question"]}])) for q in questions]
+    futs = [(q, prompt, sampler.sample(prompt=prompt, num_samples=a.samples, sampling_params=params)) for q, prompt in futs]
+    with a.out.open("w") as f:
+        for q, prompt, fut in futs:
+            res = fut.result()
+            hits = res.prompt_cache_hit_tokens
+            spend.add("sample", prefill=prompt.length - hits, cached=hits + (a.samples - 1) * prompt.length,
+                      sampled=sum(len(s.tokens) for s in res.sequences))
+            for k, s in enumerate(res.sequences):
+                f.write(json.dumps({"task": q["task"], "sample": k, "text": renderers.get_text_content(renderer.parse_response(s.tokens)[0]),
+                                    "finish": str(s.stop_reason), "tokens": len(s.tokens)}) + "\n")
+    print(json.dumps({"questions": len(questions), "samples": a.samples, "total_usd": spend.total}), flush=True)
+
+
+def readers(a) -> None:
+    """E1 of every sample with reader A (the reward's), and the evaluation's controls on each question's first sample:
+    another question's English read on this text (shuffled; each question takes the next one's first sample) and
+    reader B (an independent model, never the one trained against). {"task", "own": [bits per sample], "shuffled",
+    "reader_b"} per question."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import components
+
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    service = service_client()
+    ra, ta = renderer_for(a.reader_a)
+    reader_a = tinker_reader(service, a.reader_a, ra, ta, Spend(a.out.parent, a.reader_a))
+    spend_b = Spend(a.out.parent, a.reader_b) if a.reader_b else None
+    reader_b = tinker_reader(service, a.reader_b, *renderer_for(a.reader_b), spend_b) if a.reader_b else None
+    samples = components.samples_of(a.samples)
+    rows = {r["task"]: r for r in map(json.loads, a.questions.read_text().splitlines()) if r["task"] in samples}
+    order = [t for t in sorted(samples) if t in rows]
+    with a.out.open("w") as f:
+        for i, t in enumerate(order):
+            task = json.loads((a.texts_dir / f"{t}.json").read_text())
+            texts = [x for x, _ in samples[t]]
+            shuffled = "EXPLANATION: " + components.english(samples[order[(i + 1) % len(order)]][0][0])
+            f.write(json.dumps({"task": t, "own": components.e1_bits(reader_a, task, rows[t], texts),
+                                "shuffled": components.e1_bits(reader_a, task, rows[t], [shuffled])[0] if len(order) > 1 else None,
+                                "reader_b": components.e1_bits(reader_b, task, rows[t], texts[:1])[0] if reader_b else None}) + "\n")
+            f.flush()
+    print(json.dumps({"questions": len(order), "spend_usd": spend_b.total if spend_b else None}), flush=True)
+
+
 def clients(base: str, rank: int, init: str | None):
     import tinker
     from tinker_cookbook import renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
-    project = os.environ.get("TINKER_PROJECT_ID")
-    if not project:
-        raise SystemExit("TINKER_PROJECT_ID is not set (the project is never the default one)")
-    service = tinker.ServiceClient(project_id=project)
+    service = service_client()
     training = (service.create_training_client_from_state(init) if init
                 else service.create_lora_training_client(base_model=base, rank=rank))
     tokenizer = get_tokenizer(base)
@@ -167,8 +242,7 @@ def rl(a) -> None:
         batch = []
         for q in rng.sample(questions, min(a.texts, len(questions))):
             prompt = renderer.build_generation_prompt([{"role": "user", "content": q["question"]}])
-            ranks = sorted(rng.sample(range(RANKS), 3))
-            batch.append((q, ranks, prompt, sampler.sample(prompt=prompt, num_samples=a.group, sampling_params=params)))
+            batch.append((q, prompt, sampler.sample(prompt=prompt, num_samples=a.group, sampling_params=params)))
         return batch
 
     sampler = training.save_weights_and_get_sampling_client()
@@ -176,7 +250,7 @@ def rl(a) -> None:
     for step in range(a.steps):
         t0 = time.time()
         datums, groups = [], []
-        for q, ranks, prompt, fut in pending:
+        for q, prompt, fut in pending:
             res = fut.result()
             n = prompt.length
             hits = res.prompt_cache_hit_tokens
@@ -184,7 +258,7 @@ def rl(a) -> None:
             spend.add("sample", prefill=n - hits, cached=hits + (a.group - 1) * n, sampled=sampled)
             texts = [renderers.get_text_content(renderer.parse_response(s.tokens)[0]) for s in res.sequences]
             t1 = time.time()
-            req = {"task": q["task"], "answers": texts, "ranks": ranks, "truncated": [str(s.stop_reason) == "length" for s in res.sequences]}
+            req = {"task": q["task"], "answers": texts, "truncated": [str(s.stop_reason) == "length" for s in res.sequences]}
             if frozen is not None:
                 if q["task"] not in tasks:
                     tasks[q["task"]] = json.loads((a.texts_dir / f"{q['task']}.json").read_text())
@@ -194,11 +268,11 @@ def rl(a) -> None:
             scores = r.json()["scores"]
             rewards = [s["reward"] for s in scores]
             mean = sum(rewards) / len(rewards)
-            groups.append({"task": q["task"], "ranks": ranks, "rewards": rewards, "valid": [s["valid"] for s in scores],
+            groups.append({"task": q["task"], "rewards": rewards, "valid": [s["valid"] for s in scores],
                            "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")} for s in scores],
                            "texts": texts, "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
-                           "terms": {k: [s.get(k) for s in scores] for k in ("F1", "F3", "E1", "E2", "N", "size", "f2_share")}})
+                           "terms": {k: [s.get(k) for s in scores] for k in ("F1", "N", "F3", "E1", "E2", "size")}})
             for s, rew in zip(res.sequences, rewards):
                 if rew == mean:
                     continue
@@ -257,8 +331,23 @@ def main():
     r.add_argument("--lr", type=float, default=4e-5)
     r.add_argument("--reader", action="store_true", help="E1 from a frozen base-model sampling client on Tinker")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
+    m = sub.add_parser("sample")
+    m.add_argument("questions", type=Path)
+    m.add_argument("out", type=Path)
+    m.add_argument("--init", help="a tinker:// state path; without, the base model alone")
+    m.add_argument("--base", default="Qwen/Qwen3-8B")
+    m.add_argument("--n", type=int, default=50, help="questions")
+    m.add_argument("--samples", type=int, default=4)
+    m.add_argument("--max-tokens", type=int, default=4096)
+    e = sub.add_parser("readers")
+    e.add_argument("samples", type=Path)
+    e.add_argument("questions", type=Path)
+    e.add_argument("out", type=Path)
+    e.add_argument("--reader-a", default="Qwen/Qwen3-8B", help="the reward's reader")
+    e.add_argument("--reader-b", help="an independent reader for the decisive check (a model in PRICES)")
+    e.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     a = ap.parse_args()
-    sft(a) if a.cmd == "sft" else rl(a)
+    {"sft": sft, "rl": rl, "sample": sample, "readers": readers}[a.cmd](a)
 
 
 if __name__ == "__main__":

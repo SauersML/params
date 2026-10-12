@@ -1,28 +1,20 @@
-"""The component-circuit oracle (#2951) as a verifiers v1 taskset for prime-rl: one task per (text, draw of F2's
-alternative-token ranks), the question from components.py questions output, the reward components.reward's
-(rl/serve_components.py over HTTP; invalid answers -1), with its terms, size and validity as metrics. Each text appears
-`copies` times, each copy with its own 3 ranks from 0 to RANKS - 1 (seeded by the text and the copy), so a group's
-answers are measured on the same changed tokens and the policy never sees which.
+"""The component-circuit oracle (#2951) as a verifiers v1 taskset for prime-rl: one task per text, the question from
+components.py questions output, the reward components.reward's (rl/serve_components.py over HTTP; an invalid answer
+earns -(1 + size weight)), with its terms, size and validity as metrics.
 
   env.taskset.id = "components-oracle", env.taskset.questions = "<JSONL>", env.taskset.task.scorer_url
 """
 
 import json
-import random
 from pathlib import Path
 
 import httpx
 
 import verifiers.v1 as vf
 
-RANKS = 8
-
-
 class ComponentsOracleData(vf.TaskData):
     task: str
     """The question's text id: the scorer reads TEXTS/vpd4l/<task>.json and its evidence row."""
-    ranks: list[int]
-    """The alternative-token ranks F2 measures for this example."""
 
 
 class ComponentsOracleTaskConfig(vf.TaskConfig):
@@ -37,12 +29,12 @@ class ComponentsOracleTask(vf.Task[ComponentsOracleData, vf.State, ComponentsOra
         replies = trace.assistant_messages
         reply = (replies[-1].content or "") if replies else ""
         async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-            r = await client.post(self.config.scorer_url, json={"task": self.data.task, "answers": [reply], "ranks": self.data.ranks})
+            r = await client.post(self.config.scorer_url, json={"task": self.data.task, "answers": [reply]})
         body = r.json()
         if r.status_code != 200:
             raise RuntimeError(f"serve_components: {body.get('error')}")
         s = body["scores"][0]
-        for k in ("F1", "F2", "F3", "E1", "E2", "size", "nodes", "edges", "f2_share"):
+        for k in ("F1", "N", "F3", "E1", "E2", "size", "nodes", "edges", "dropped_edges"):
             if s.get(k) is not None:
                 trace.record_metric(k, float(s[k]))
         trace.record_metric("valid", float(s["valid"]))
@@ -60,10 +52,6 @@ class ComponentsOracleEnv(vf.SingleAgentEnv):
 class ComponentsOracleConfig(vf.TasksetConfig):
     questions: str = ""
     """components.py questions output, one text per line."""
-    copies: int = 4
-    """Examples per text, each with its own draw of ranks."""
-    ranks: list[int] | None = None
-    """Fixed ranks for every example (evaluations: the measured 0-2 or the held-out 3-5) in place of the draws."""
     task: ComponentsOracleTaskConfig = ComponentsOracleTaskConfig()
 
 
@@ -74,8 +62,5 @@ class ComponentsOracleTaskset(vf.Taskset[ComponentsOracleTask, ComponentsOracleC
             if not line.strip():
                 continue
             r = json.loads(line)
-            for i in range(self.config.copies):
-                ranks = list(self.config.ranks) if self.config.ranks else sorted(random.Random(f"{r['task']}:{i}").sample(range(RANKS), 3))
-                tasks.append(ComponentsOracleTask(ComponentsOracleData(id=f"{r['task']}:{i}", prompt=r["question"], task=r["task"], ranks=ranks),
-                                                  self.config.task))
+            tasks.append(ComponentsOracleTask(ComponentsOracleData(id=r["task"], prompt=r["question"], task=r["task"]), self.config.task))
         return tasks

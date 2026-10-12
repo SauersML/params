@@ -31,6 +31,7 @@ for r in map(json.loads, open(sys.argv[2])):
     if f.exists():
         (out / (r["task"] + ".txt")).write_text(components.target(json.loads(f.read_text()), r, "vpd4l"))
 PYEOF
+~/.local/bin/mem-lease 12 $PY $SRC/method/oracle/components.py references $S/heldout.jsonl $HELDOUT_TEACHER $S/ref
 export TINKER_API_KEY="$(security find-generic-password -s tinker-api-key -w)" TINKER_PROJECT_ID=3f598f31-2ffa-4eb4-b302-909eb234fb7d
 cd $SRC/method/oracle/rl
 $TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEPS --batch $BATCH ${LR:+--lr $LR} --name sft-$RUN
@@ -39,11 +40,15 @@ $TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE"
 $TPY -u tinker_train.py readers $S/samples.jsonl $S/heldout.jsonl $S/e1.jsonl --reader-b Qwen/Qwen3.5-4B
 unset TINKER_API_KEY
 cd $SRC
+Z=$O/zeroshot_heldout20  # the untrained Qwen3-8B's first answers, scored by the same reward as everything here
+PRUNED=() REFS=(--ref "Teacher=$S/eval.json:teacher" --ref "VPD, every connection=$S/eval.json:vpd_complete")
+if [ -d $S/ref/vpd_pruned ]; then
+  PRUNED=(--set vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
+fi
 ~/.local/bin/mem-lease 14 $PY -u method/oracle/components.py evaluate heldout $S/heldout.jsonl --set sft=$S/samples.jsonl \
-  --e1 sft=$S/e1.jsonl --set teacher=$S/teacher_txt --labels $LABELS --n $NEVAL ${EDIT_TEACH:+--edit-teach $EDIT_TEACH} \
+  --e1 sft=$S/e1.jsonl --set zeroshot=$Z/samples_first.jsonl --e1 zeroshot=$Z/e1.jsonl --set teacher=$S/teacher_txt \
+  --set vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" --labels $LABELS --n $NEVAL ${EDIT_TEACH:+--edit-teach $EDIT_TEACH} \
   --out $S/eval.json > $S/eval.log 2>&1
 tail -60 $S/eval.log
-Z=$O/zeroshot_heldout20  # the figures: this SFT against the untrained base and the held-out teachers
 MPD_MEM_GIB=1 $PY $SRC/experiments/oracle/figures_eval.py --labels $LABELS --prefix sft_$RUN \
-  --set "Qwen3-8B zero-shot=$Z/eval_zs_vpd_e2.json:zeroshot:$Z/e1.jsonl" --set "${BASE#*/} SFT=$S/eval.json:sft:$S/e1.jsonl" \
-  --ref "Teacher=$S/eval.json:teacher" --ref "VPD top-K=$Z/eval_zs_vpd_e2.json:vpd_top_k"
+  --set "Qwen3-8B zero-shot=$S/eval.json:zeroshot:$Z/e1.jsonl" --set "${BASE#*/} SFT=$S/eval.json:sft:$S/e1.jsonl" "${REFS[@]}"

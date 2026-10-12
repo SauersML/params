@@ -42,7 +42,11 @@ import httpx
 PRICES = {"Qwen/Qwen3-8B": (0.195, 0.60, 0.44), "Qwen/Qwen3.5-4B": (0.33, 1.005, 0.737),  # $/M tokens: prefill, sample, train
           "Qwen/Qwen3.8-27B": (0.6975, 5.595, 4.103), "Qwen/Qwen3.6-27B": (1.86, 5.595, 4.103),  # (Tinker's models page, 64K rows)
           "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": (0.184, 0.495, 0.44),  # at the limited-time 50% discount
-          "Qwen/Qwen3.6-35B-A3B": (0.45, 1.335, 1.177)}
+          "Qwen/Qwen3.6-35B-A3B": (0.45, 1.335, 1.177),
+          "moonshotai/Kimi-K2.6": (2.205, 5.49, 4.84), "Qwen/Qwen3.5-397B-A17B": (1.65, 7.50, 6.60),
+          "deepseek-ai/DeepSeek-V4.1-Flash:peft:262144": (0.60, 3.60, 4.98),
+          "thinkingmachines/Inkling": (1.87, 4.68, 5.61)}  # Inkling at its limited-time 50% discount
+RENDERERS = {"deepseek-ai/DeepSeek-V4.1-Flash:peft:262144": "deepseekv3_disable_thinking"}  # bases the cookbook does not list
 CACHED = 0.2  # a cached prefill token's share of the price
 RENDERER = "qwen3_disable_thinking"
 NAMES = re.compile(r"L\d+\.(?:q|k|v|o|fc|down)#\d+")  # a subcomponent's name in English
@@ -113,9 +117,12 @@ def renderer_for(base: str):
     from tinker_cookbook import model_info, renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
-    tokenizer = get_tokenizer(base)
-    names = model_info.get_recommended_renderer_names(base)
-    name = next((n for n in names if n.endswith("_disable_thinking")), names[0])
+    tokenizer = get_tokenizer(base.split(":")[0])  # a context variant (":peft:262144") shares its base's tokenizer
+    if base in RENDERERS:
+        name = RENDERERS[base]
+    else:
+        names = model_info.get_recommended_renderer_names(base)
+        name = next((n for n in names if n.endswith("_disable_thinking")), names[0])
     return renderers.get_renderer(name, tokenizer), tokenizer
 
 

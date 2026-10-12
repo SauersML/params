@@ -66,7 +66,7 @@ python -c \"import torch; from safetensors.torch import load_file; d = {**load_f
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 big=\$(( \$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1) >= 44000 ));
 score() { python -B goal_eval.py score $SETS --split heldout --n $N --diagnostics --out $O/score.json > $O/score.log 2>&1; };
-fid() { rm -f $O/fid_\$1.jsonl; python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --vpd $F/vpd.pt --offset \$1 --stride ${FIDP:-2} --out $O/fid_\$1.jsonl > $O/fid_\$1.log 2>&1; };
+fid() { rm -f $O/fid_\$1.jsonl; python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --start --vpd $F/vpd.pt --offset \$1 --stride ${FIDP:-2} --out $O/fid_\$1.jsonl > $O/fid_\$1.log 2>&1; };
 set +e; (score) &
 [ \$big = 1 ] || wait;
 for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do (fid \$k) & [ \$big = 1 ] || wait; done; wait;
@@ -88,6 +88,9 @@ done
     echo "===== ${sides[0]} vs ${sides[$i]}"
     MPD_MEM_GIB=2 /Users/user/mpd-data/venv/bin/python -B experiments/oracle/teacher_gate.py "$O/score.json" "${sides[0]}" "${sides[$i]}" \
       --teacher "${dirs[0]}" "${dirs[$i]}" --fidelity $(for k in $(seq 0 $(( ${FIDP:-2} - 1 ))); do printf '%s ' "$O/fid_$k.jsonl"; done)
-  done; } | tee "$O/gate.txt"
+  done
+  echo "===== the v2 rule"
+  MPD_MEM_GIB=2 /Users/user/mpd-data/venv/bin/python -B experiments/oracle/teacher_gate.py "$O/score.json" a b --rule "$(IFS=,; echo "${sides[*]}")" \
+    --fidelity $(for k in $(seq 0 $(( ${FIDP:-2} - 1 ))); do printf '%s ' "$O/fid_$k.jsonl"; done); } | tee "$O/gate.txt"
 exit
 }

@@ -16,10 +16,9 @@ flips falls below 0.5 and below half of s_point_c, 512 when not within m <= 256;
 removals, connection cuts and interchange, lower is better; s_changed, kl_changed_c and context_share on the eval split's
 changed inputs, 16 per circuit; s_track, s_interchange and the donor pools' means and 90th percentiles when goal_eval has
 them), overall and by locality, and each side's teacher against VPD's top k at its size (fidelity's "VPD top k" rows:
-VPD's own ranking, every connection among its nodes) with the v2 rule (s_track_pp and donors on the eval split's draws not
-below VPD's top k, answers within MAX_NODES; the summaries' answer tokens against MAX_TOKENS); the headline is the eval
-split's s_track_pp (never the search split's, which the searches fit), and phi (goal_eval.phi) a column when goal_eval
-imports (the research venv)
+VPD's own ranking, every connection among its nodes; reported, not a rule); the headline is the eval split's s_track_pp
+(never the search split's, which the searches fit), and phi (goal_eval.phi) a column when goal_eval imports (the research
+venv). --rule a,b,...: the lead's v2 rule over the arms (v2_rule).
 (heldout50_locality.jsonl).
 
   experiments/oracle/teacher_gate.py SCORE.json A B [--fields f1_live,n_live,...] [--teacher DIR_A DIR_B]
@@ -92,6 +91,62 @@ def compare(A: dict, B: dict, a: str, b: str, fields, verdicts: dict | None = No
     return tasks
 
 
+def v2_rule(fid_rows: list, arms: list, goal_eval) -> None:
+    """The lead's v2 rule (10-12) on fidelity rows of held-out texts on the eval split, each text's influential start
+    scored beside the arms (kind "start", goal_eval.py fidelity --start): an arm is eligible when phi >= phi_tau
+    (goal_eval.phi with the text's start) and its target KL (the point run's KL_C) is within 2x the start's on at least
+    80% of texts; among the eligible, the highest median compact (goal_eval.compact, size_bits against the start's),
+    ties to the higher median phi. VPD's top k at each arm's size is reported beside, not in the rule."""
+    import math
+    import statistics
+
+    by = {}
+    for r in fid_rows:
+        by.setdefault(r["task"], {})[r["kind"]] = r
+    kl = lambda r: (r.get("draws_point") or [[None]])[0][0]  # noqa: E731  bits
+    out, fails = {}, {}
+    for arm in arms:
+        rows = []
+        for t, k in sorted(by.items()):
+            a, st = k.get(arm), k.get("start")
+            if a is None or st is None:
+                continue
+            ph, tau = goal_eval.phi(a, start=st)
+            ka, ks = kl(a), kl(st)
+            vpd = k.get(f"VPD top {a.get('nodes')}")
+            rows.append({"task": t, "phi": ph, "tau": tau, "kl": ka, "kl_start": ks,
+                         "ok_phi": ph is not None and tau is not None and ph >= tau,
+                         "ok_kl": ka is not None and ks is not None and ka <= 2 * ks,
+                         "compact": goal_eval.compact(a.get("size_bits"), st.get("size_bits")),
+                         "phi_vpd": goal_eval.phi(vpd)[0] if vpd else None})
+        if not rows:
+            continue
+        ok = [r for r in rows if r["ok_phi"] and r["ok_kl"]]
+        med = lambda key: statistics.median([r[key] for r in rows if r[key] is not None]) if any(r[key] is not None for r in rows) else None  # noqa: E731
+        out[arm] = {"texts": len(rows), "phi_ok": sum(r["ok_phi"] for r in rows), "both_ok": len(ok),
+                    "eligible": len(ok) >= 0.8 * len(rows), "compact": med("compact"), "phi": med("phi"), "tau": med("tau"),
+                    "phi_vpd": med("phi_vpd")}
+        fails[arm] = [r for r in rows if not (r["ok_phi"] and r["ok_kl"])]
+    fmt = lambda x: "  none" if x is None else f"{x:6.3f}"  # noqa: E731
+    print("v2 rule (eval split, held-out): arm, texts, phi >= phi_tau, and target KL within 2x the start's, eligible, "
+          "median compact, phi, phi_tau, VPD top k's phi at the arm's size")
+    for arm, o in out.items():
+        print(f"  {arm:8s} {o['texts']:3d} {o['phi_ok']:3d} {o['both_ok']:3d} {'yes' if o['eligible'] else 'no ':3s} "
+              f"{fmt(o['compact'])} {fmt(o['phi'])} {fmt(o['tau'])} {fmt(o['phi_vpd'])}")
+    ok = [a for a in out if out[a]["eligible"]]
+    if ok:
+        best = max(ok, key=lambda a: (out[a]["compact"] if out[a]["compact"] is not None else -math.inf,
+                                      out[a]["phi"] if out[a]["phi"] is not None else -math.inf))
+        print(f"v2 pick: {best} (highest median compact among the eligible, ties by median phi)")
+    else:
+        print("v2 pick: no arm eligible")
+    for arm, rs in fails.items():
+        for r in rs:
+            print(f"  {arm} fails {r['task']}: phi {fmt(r['phi'])} vs phi_tau {fmt(r['tau'])}, target KL "
+                  f"{fmt(None if r['kl'] is None else r['kl'] * math.log(2))} nats vs the start's "
+                  f"{fmt(None if r['kl_start'] is None else r['kl_start'] * math.log(2))}")
+
+
 def bootstrap(d: list, resamples: int = 10000, seed: int = 0) -> tuple:
     rng = random.Random(seed)
     n = len(d)
@@ -109,7 +164,14 @@ def main():
     ap.add_argument("--adv", nargs=2, type=Path, metavar=("A.jsonl", "B.jsonl"), help="teacher_v3.py --evaluate scores of A and B")
     ap.add_argument("--fidelity", nargs="+", type=Path, help="goal_eval.py fidelity rows of both sets (kinds A and B, VPD top k), in shards")
     ap.add_argument("--labels", type=Path, default=Path.home() / "mpd-data/graph_oracle/components/heldout50_locality.jsonl")
+    ap.add_argument("--rule", help="comma-separated arms: the lead's v2 rule over them alone (v2_rule; needs --fidelity rows with kind start)")
     args = ap.parse_args()
+    if args.rule:
+        sys.path[:0] = [str(Path(__file__).resolve().parents[2] / "method/oracle"), str(Path(__file__).resolve().parents[2] / "method/vpd")]
+        import goal_eval
+        v2_rule([json.loads(x) for p in args.fidelity or [] if p.exists() for x in p.read_text().splitlines() if x.strip()],
+                args.rule.split(","), goal_eval)
+        return
     results = json.loads(args.score.read_text())
     A, B = rows(results, args.a), rows(results, args.b)
     print(f"goal_eval.py score: {len(set(A) & set(B))} texts with both answers valid ({len(A)} valid in {args.a}, {len(B)} in {args.b})")
@@ -189,11 +251,8 @@ def main():
                 print(f"{side} against VPD's top k at its sizes (A = VPD top k, B = {side}): {len(ts)} texts")
                 v = {}
                 compare({t: V[t] for t in ts}, {t: F[t] for t in ts}, "VPD top k", side, vfields, v)
-                held = [f for f in ("s_track_pp", "s_donor_near", "s_donor_far") if f in v]  # eval split's draws (fidelity's full mode)
                 big = [t for t in ts if (F[t].get("nodes") or 0) > MAX_NODES]
-                print(f"v2 rule for {side}: " + (f"{', '.join(held)} not below VPD's top k {'yes' if all(v[f] != 'B lower' for f in held) else 'NO'}"
-                                                   if held else "no s_track_pp or donor rows (NO)")
-                      + f"; answers within {MAX_NODES} nodes {'yes' if not big else f'NO ({len(big)} over)'} (tokens: the summaries' line above)")
+                print(f"answers of {side} within {MAX_NODES} nodes {'yes' if not big else f'NO ({len(big)} over)'} (tokens: the summaries' line above)")
     print("per text (f1_live, n_live, nodes):")
     for t in tasks:
         a, b = A[t], B[t]

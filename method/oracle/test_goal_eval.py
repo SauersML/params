@@ -1417,7 +1417,7 @@ def test_reward_terms_unclipped_for_ranking(tiny):
         for k in row["c_terms"]:
             clipped = row["f1_flips_c"][goal_eval.FLIP_TERM] if k == "f1_flips_c" else row[k]
             raw = row["rl_terms"][k]
-            if k in ("s_track_pp", "s_interchange_pp"):  # pooled over prompts: each prompt's floor removed, so the pool can only fall
+            if k in ("s_track_pp", "s_interchange_pp", "s_nodes"):  # pooled over prompts: each prompt's floor removed, so the pool can only fall
                 assert raw <= clipped + 1e-9, (raw, clipped)
                 continue
             assert raw <= 1.0 and (abs(raw - clipped) < 1e-9 if clipped > 0 else raw <= 1e-12), (k, raw, clipped)
@@ -1619,8 +1619,12 @@ def test_reward_v3_helpers(tiny):
     row = {"s_point_c": 0.75, "s_nodes": 0.75, "f1_flips_c": {str(goal_eval.FLIP_TERM): 0.75}, "n_point": 0.75,
            **{f"eps_{f}": 0.05 for f in goal_eval.PHI_FAMILIES}}
     got, tau = goal_eval.phi(row)
-    assert abs(got - (-math.log2(r))) < 1e-12 and abs(tau - (-math.log2(0.15))) < 1e-12
+    assert abs(got - (-math.log2(r))) < 1e-12 and abs(tau - got) < 1e-12  # the row as its own start: min(its phi, at 0.9)
     assert goal_eval.phi(row, start=1.0)[1] == 1.0
+    noisy = dict(row, **{f"eps_{f}": 0.25 for f in goal_eval.PHI_FAMILIES})  # the same scores, noisier
+    start = dict(row, s_point_c=0.95, s_nodes=0.95, n_point=0.95, f1_flips_c={str(goal_eval.FLIP_TERM): 0.95})
+    a, b = goal_eval.phi(row, start=start), goal_eval.phi(noisy, start=start)
+    assert a[1] == b[1] and b[0] < a[0]  # one bar per text (the start's eps); an answer's own noise lowers only its phi
     pool = tiny_pool(nat, tx.ids)
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     empty, vpd = ge.fidelity(tx, [native.Graph(), native.Graph(masks=tx.vpd)], pool, draws=4, steps=2, restarts=2,
@@ -1709,6 +1713,36 @@ def test_line_leave_one_out(tiny):
     P, S = max(tx.targets) + 1, sum(nat.C.values())
     assert abs(first["bits"] - goal_eval.size_bits(h, nat.positions(tx.targets), S, tx.targets)) < 1e-9
     assert abs(first["compact"] - math.log2(1000.0 / first["bits"])) < 1e-12
+
+
+def test_node_family_against_the_models_response(tiny):
+    """The node family (the lead's 10-12): each draw's bound is the model's own response to the removal, W =
+    KL(model less the nodes || model), the score pooled by W; the claimed response KL(model || circuit less the nodes)
+    beside it (overstate_nodes, their ratio); a recency set of a size."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    g = native.Graph(every[::3], complete=True)
+    row = ge._node_family(tx, [g], 4)[0]
+    rng = ge._rng(tx, g, "nodes")
+    gn = sorted(g.node_set())
+    d0 = [nd for nd in gn if rng.random() < 0.5 / 4] or [gn[int(rng.integers(len(gn)))]]
+    full, _ = naive(nat, tx.ids)
+    on = {n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+    for n, t, c in d0:
+        on[n][t, c] = False
+    removed = naive(nat, tx.ids, on=on)[0]
+    w0 = _kl(removed, full, tx.targets)
+    assert abs(row["draws_nodes"][0][3] - w0) < 1e-4 + 1e-4 * w0, (row["draws_nodes"][0][3], w0)
+    s = goal_eval._pooled("weighted", row["draws_nodes"], None)
+    f = ge.fidelity(tx, [g], None, draws=4, near_donors=0, far_donors=0, interchange=0, changed=0, pattern=False)[0]
+    assert abs(f["s_nodes"] - s) < 1e-9 and f["s_nodes_old"] is not None
+    claim = np.mean([d[4] for d in row["draws_nodes"]])
+    assert abs(row["overstate_nodes"] - claim / np.mean([d[3] for d in row["draws_nodes"]])) < 1e-9
+    k = 7
+    rec = ge.recency_set(tx, k)
+    assert rec.complete and rec.count() == min(k, len(every))
+    pos = sorted({t for _, t, _ in rec.node_set()}, reverse=True)
+    assert pos[0] == max(tx.targets) and pos == list(range(pos[0], pos[0] - len(pos), -1))
 
 def test_block_nodes(tiny):
     """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,

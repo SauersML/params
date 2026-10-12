@@ -465,7 +465,7 @@ def _c_rl(terms: list) -> float | None:
 
 
 PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the score pools its draws, the draws' key
-    "point": ("s_point_c", None, None), "nodes": ("s_nodes", "mean", "draws_nodes"), "edges": ("s_edges", "mean", "draws_edges"),
+    "point": ("s_point_c", None, None), "nodes": ("s_nodes", "weighted", "draws_nodes"), "edges": ("s_edges", "mean", "draws_edges"),
     "flips": ("f1_flips_c", None, None), "track_pp": ("s_track_pp", "weighted", "draws_track_pp"),
     "interchange_pp": ("s_interchange_pp", "weighted", "draws_interchange_pp"),
     "donors_near": ("s_donor_near", "donor", "draws_donor_near"), "donors_far": ("s_donor_far", "donor", "draws_donor_far"),
@@ -501,6 +501,16 @@ def _pooled(kind: str, draws: list, e0: float | None) -> float | None:
     return num / den if den > 0 else None
 
 
+def _pooled_raw(draws: list) -> float | None:
+    """_pooled's "weighted" form without the floor at 0 (c_rl's terms)."""
+    num = den = 0.0
+    for d in draws or []:
+        sd = _fid_raw(d[3], d[1], d[2])
+        if sd is not None:
+            num, den = num + d[3] * sd, den + d[3]
+    return num / den if den > 0 else None
+
+
 def family_eps(row: dict) -> dict:
     """eps_<family> for phi (the lead's reward v3): twice the bootstrap standard error of each family's score over its
     draws in the row (EPS_BOOT resamples, a fixed seed: the same from the row alone), at least EPS_FLOOR; a family
@@ -526,21 +536,32 @@ def _phi(scores: list) -> float | None:
     return -math.log2(float(np.mean([(1 - s_ + e_) ** 4 for s_, e_ in scores])) ** 0.25)
 
 
+def _eps(row: dict) -> dict:
+    eps = {f: row[f"eps_{f}"] for f in PHI_FAMILIES if row.get(f"eps_{f}") is not None}
+    return eps if len(eps) == len(PHI_FAMILIES) else {**family_eps(row), **eps}
+
+
 def phi(row: dict, start: float | dict | None = None) -> tuple:
     """(phi, phi_tau) of a row (the lead's reward v3): phi = -log2((mean_i (1 - s_i + eps_i)^4)^(1/4)) over the
     families scored on the text (PHI_FAMILIES: point, nodes, edges, flips, track_pp, interchange_pp, donors near and
-    far, pattern, N), eps_i the row's eps_<family> (family_eps when absent); phi_tau = min(phi_start, the phi with
-    every family at 0.9), phi_start the start set's (start: its phi or its row; else the row's phi_start). From the
-    row's fields alone."""
-    eps = {f: row[f"eps_{f}"] for f in PHI_FAMILIES if row.get(f"eps_{f}") is not None}
-    if len(eps) < len(PHI_FAMILIES):
-        eps = {**family_eps(row), **eps}
-    fams = [f for f in PHI_FAMILIES if family_score(row, f) is not None]
-    got = _phi([(family_score(row, f), eps[f]) for f in fams])
-    at9 = _phi([(0.9, eps[f]) for f in fams])
-    ps = start if not isinstance(start, dict) else phi(start)[0]
-    ps = row.get("phi_start") if ps is None else ps
-    return got, (at9 if ps is None or at9 is None else min(ps, at9))
+    far, pattern, N), eps_i the row's eps_<family> (family_eps when absent): an answer's own noise only lowers its
+    phi. phi_tau is a constant of the text (the lead's 10-12: a noisier answer must not face a lower bar): min(phi of
+    the start set, the phi with every family the start scores at 0.9 under the start's eps), from start (the start
+    set's row; or its phi_tau, a number, as tau() gives it); without start the row's own phi_tau, else the row taken as
+    its own start. From the rows' fields alone."""
+    eps = _eps(row)
+    got = _phi([(family_score(row, f), eps[f]) for f in PHI_FAMILIES if family_score(row, f) is not None])
+    if isinstance(start, dict):
+        se = _eps(start)
+        sf = [f for f in PHI_FAMILIES if family_score(start, f) is not None]
+        at9, ps = _phi([(0.9, se[f]) for f in sf]), phi(start)[0]
+        return got, (at9 if ps is None else ps if at9 is None else min(ps, at9))
+    if start is not None:
+        return got, float(start)
+    if row.get("phi_tau") is not None:
+        return got, row["phi_tau"]
+    at9 = _phi([(0.9, eps[f]) for f in PHI_FAMILIES if family_score(row, f) is not None])
+    return got, (at9 if got is None else got if at9 is None else min(got, at9))
 
 
 def compact(bits: float, bits_start: float) -> float | None:
@@ -2016,7 +2037,11 @@ class GoalEval:
                    "s_wiring": wired[i]["f1_live"] if i in wired else pt["f1_live"]}
             if lk:
                 row["leak"] = lk["f1_live"]
-            row["s_nodes"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
+            # the node family against the model's own response (the lead's 10-12): each draw bounded by no change,
+            # W = KL(model less the nodes || model), pooled by W (s_nodes_old: the earlier form, against KL_empty)
+            row["s_nodes_old"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
+            row["s_nodes"] = _pooled("weighted", nd.get("draws_nodes"), e0)
+            row["s_nodes_raw"] = _pooled_raw(nd.get("draws_nodes"))
             row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
             # a stated graph claims its unstated connections do not matter: C takes the lower of its graph run and the
             # run with every connection among its nodes restored, unattacked and under the same flips
@@ -2044,7 +2069,7 @@ class GoalEval:
                 raw = {"s_point_c": min(x for x in (_fid_raw(e0, pt["kl_live"], v0),
                                                     _fid_raw(e0, wired[i]["kl_live"], v0) if i in wired else None) if x is not None)
                        if _fid_raw(e0, pt["kl_live"], v0) is not None else None,
-                       "s_nodes": _fid_raw(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"]),
+                       "s_nodes": row.get("s_nodes_raw"),
                        "s_edges": _fid_raw(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
                        "f1_flips_c": min(x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None)
                        if kfl else None,
@@ -2346,8 +2371,13 @@ class GoalEval:
                 for nd in nodes:
                     if nd not in set(d):
                         pairs.setdefault(nd, []).append((rm[nd][b], rc[nd][b]))
-            out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean()),
-                        "draws_nodes": [list(x) for x in zip(carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist())],
+            kc_, kv_ = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
+            w_, claim = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()
+            out.append({"kl_nodes_c": float(np.mean(kc_)), "kl_nodes_vpd": float(np.mean(kv_)),
+                        # per draw [draw, KL(model less d || circuit less d), KL(model less d || VPD less d),
+                        # W = KL(model less d || model), KL(model || circuit less d)]
+                        "draws_nodes": [[j, a, b_, c, d] for j, (a, b_, c, d) in enumerate(zip(kc_, kv_, w_, claim))],
+                        "overstate_nodes": float(np.mean(claim)) / max(float(np.mean(w_)), 1e-12),
                         "reads_nodes": _read_error(pairs) if reads else None, "_pairs_nodes": pairs})
             native.free(dev)
         return out
@@ -2715,6 +2745,26 @@ class GoalEval:
         mix = lambda x, y: None if x is None or y is None else x + f * (y - x)  # noqa: E731
         return {"c_vpd_k": mix(a[0], b[0]), "c_rl_vpd_k": mix(a[1], b[1]), "n_vpd_k": mix(a[2], b[2])}
 
+    def recency_set(self, tx: Text, k: int) -> native.Graph:
+        """The recency baseline at a size (the lead's 10-12, reported beside VPD's top k): VPD's actives at the targets,
+        then at the positions just before the last target one by one, every one of a position's while they fit in k,
+        the last position's in VPD's order (tx.vpd_order, else its own) to make k; every connection (a node set)."""
+        order = getattr(tx, "vpd_order", None) or self.nat._vpd_order(tx.ids, tx.targets)
+        rank = {tuple(nd): i for i, nd in enumerate(order)}
+        at = {}
+        for n in self.nat.names:
+            for t, c in tx.vpd[n].nonzero().tolist():
+                at.setdefault(t, []).append((n, t, c))
+        last = max(tx.targets)
+        seq = sorted(tx.targets, reverse=True) + [t for t in range(last - 1, -1, -1) if t not in set(tx.targets)]
+        nodes = []
+        for t in seq:
+            here = sorted(at.get(t, []), key=lambda nd: rank.get(nd, len(rank)))
+            nodes += here[:max(0, k - len(nodes))]
+            if len(nodes) >= k:
+                break
+        return native.Graph(nodes, complete=True)
+
     def start_set(self, tx: Text, split: str = "search", floor: float = 0.9, draws: int = CHANGED_DRAWS) -> dict:
         """The influential start set (the lead's 10-12, the new teacher's start): VPD's actives at the targets and the m
         most influential positions (F2's, the probe's moved), every connection (a node set), m the smallest whose
@@ -2747,8 +2797,8 @@ class GoalEval:
         st = self.start_set(tx, split)
         row = self.fidelity(tx, [st["graph"]], pool, mode="reward", split=split)[0]
         nat = self.nat
-        ph, pt = phi(row)
-        kept[split] = {"phi_start": ph, "phi_tau": min(ph, pt) if ph is not None and pt is not None else pt,
+        ph, pt = phi(row, start=row)  # phi_tau: a constant of the text, from the start's own eps
+        kept[split] = {"phi_start": ph, "phi_tau": pt,
                        "c_start": row["c"], "c_rl_start": row["c_rl"],
                        "tau": min(0.9, row["c_rl"]) if row["c_rl"] is not None else None,
                        "bits_start": size_bits(st["graph"], nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd),
@@ -3671,7 +3721,7 @@ def pattern(pool: dict, k: int) -> dict:
 def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws: int = DRAWS, vpd: Path | None = None,
                     offset: int = 0, stride: int = 1, fresh: Path | None = None, interchange: int = 16, curve=ADV_CURVE,
                     log=print, changed: int = CHANGED_DRAWS, only: tuple = (), mode: str = "full", draw_split: str | None = None,
-                    start: bool = False) -> list[dict]:
+                    start: bool = False, recency: bool = False) -> list[dict]:
     """C on the split's first n texts for answer sets (sets: name -> a directory of <task>.json circuits, run as stated)
     and VPD's first k at each circuit's size (complete graphs), with the evaluation-only families (fresh: the pattern
     lever over a pool no search drew from; interchange draws; changed texts (changed_inputs' eval split); N_real); one
@@ -3723,9 +3773,13 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             graphs.append(native.Graph(sorted((n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist() if t in ps), complete=True))
             kinds.append("recency")
         order = saved[p.stem]["order"] if p.stem in saved else nat._vpd_order(ids, targets)
+        tx.vpd_order = [tuple(nd) for nd in order]
         for k in sorted({g.count() for g in graphs}):
             graphs.append(native.Graph(order[:k], complete=True))
             kinds.append(f"VPD top {k}")
+            if recency:  # the recency baseline at the same size (reported beside VPD's top k)
+                graphs.append(ge.recency_set(tx, k))
+                kinds.append(f"recency {k}")
         if only:
             e = ge._bounds(tx, "live")[0]
             ch = ge.changed_inputs(tx, graphs, "eval", changed) if "changed" in only else [{} for _ in graphs]
@@ -3791,7 +3845,7 @@ def fidelity_table(rows: list[dict]) -> str:
         return "local" if r["local"] else "non-local"
 
     def kind(r):
-        return "VPD top k" if r["kind"].startswith("VPD top") else r["kind"]
+        return "VPD top k" if r["kind"].startswith("VPD top") else "recency k" if r["kind"].startswith("recency ") else r["kind"]
 
     by = {}
     for r in rows:
@@ -3884,6 +3938,7 @@ def main():
     f.add_argument("--mode", choices=("full", "reward"), default="full",
                    help="GoalEval.fidelity's mode: full, or the reward's (its family alone, rl_terms and c_rl: teacher rows for the reward)")
     f.add_argument("--draw-split", choices=("search", "eval"), help="the families' draws (default: the mode's, search for reward, eval for full)")
+    f.add_argument("--recency", action="store_true", help="also the recency baseline at each set's sizes (recency_set)")
     f.add_argument("--start", action="store_true", help="also the text's influential start set (start_set, chosen on the search split), "
                    "kind \"start\": its families, per-draw records and size bits beside the sets' (phi's start, compact's bits_start), "
                    "and the recency baseline, kind \"recency\" (VPD's actives at the targets and as many positions just before them)")
@@ -3896,7 +3951,7 @@ def main():
         fidelity_report(args.split, args.n, dict(x.split("=", 1) for x in args.set), args.pool, args.out, args.draws, args.vpd,
                         args.offset, args.stride, args.fresh, args.interchange, tuple(int(x) for x in args.curve.split(",")),
                         changed=args.changed, only=tuple(x for x in args.only.split(",") if x), mode=args.mode, draw_split=args.draw_split,
-                        start=args.start)
+                        start=args.start, recency=args.recency)
         if args.only:
             return
         print(fidelity_table([json.loads(x) for x in args.out.read_text().splitlines() if x.strip()]), flush=True)

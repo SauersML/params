@@ -1205,6 +1205,39 @@ def test_interchange_eval_is_graph_ref_on_its_draws(tiny):
     e0 = ge._bounds(tx, "live")[0]
     assert got["s_interchange"] == goal_eval._fid(e0, srch["kl_interchange_c"], srch["kl_interchange_vpd"])
 
+
+def test_changed_inputs(tiny):
+    """The changed-input family: VPD's answer as the circuit scores 1; each prompt's numbers are the model, graph_ref on
+    x' and on x (the bound), and VPD's masked run on x', pooled by how far the change moves the model; the splits never
+    share a prompt; context_share is the probe's moved at the circuit's positions."""
+    nat, ge, tx = tiny
+    assert tx.f2, "the tiny text needs F2 positions"
+    sub = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    g = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    vpd = native.Graph(masks=tx.vpd)
+    row, rv = ge.changed_inputs(tx, [g, vpd], draws=4)
+    assert row["draws_changed"] and row["draws_changed"] == rv["draws_changed"] and row["prompts_changed"] > 0
+    assert rv["s_changed"] is None or abs(rv["s_changed"] - 1.0) < 1e-6
+    srch = ge.changed_search(tx, [g], draws=4)[0]
+    assert not set(srch["draws_changed"]) & set(row["draws_changed"])
+    assert ge.fidelity(tx, [g], None, draws=2, changed=4)[0]["s_changed"] == row["s_changed"]  # fidelity's: eval
+    moved = tx.moved
+    want = sum(moved[t - 1] for t in {t for _, t, _ in sub} if t > 0) / moved.sum()
+    assert abs(row["context_share"] - want) < 1e-9
+    sw = sws = 0.0
+    for p, z in row["draws_changed"]:
+        x = list(tx.ids)
+        x[p] = z
+        ref = nat.reference([x], tx.targets)
+        kc = float(carry.kl(ref, ge.graph_ref(x, tx.targets, g))[0])
+        k0 = float(carry.kl(ref, ge.graph_ref(tx.ids, tx.targets, g))[0])
+        kv = float(carry.kl(ref, ge.runs(x, tx.targets, [tx.vpd], True))[0])
+        w = float(carry.kl(ref, tx.ref)[0])
+        s = goal_eval._fid(k0, kc, kv)
+        if s is not None:
+            sw, sws = sw + w * s, sws + w
+    assert row["s_changed"] is None if sws == 0 else abs(row["s_changed"] - sw / sws) < 1e-4, (row["s_changed"], sw / max(sws, 1e-12))
+
 def test_response_error():
     base = {("a", 0, 0): (1.0, 5.0), ("b", 0, 0): (0.0, 0.0)}
     pairs = {("a", 0, 0): [(2.0, 6.0), (0.0, 4.0)], ("b", 0, 0): [(1.0, 0.0)]}

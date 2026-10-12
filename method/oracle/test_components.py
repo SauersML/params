@@ -161,7 +161,11 @@ def test_edit_term():
     op = {"op": "scale", "node": ("h.0.mlp.c_fc", 3, 1), "k": 0.0, "persistent": False}
     answers = [{1: [op], 2: [op]}, {1: [{"op": "invalid", "text": "x"}]}, {1: [op, op], 2: [op]}]
     assert components.edit_term(FakeEdits(), task, goals, answers, best) == [0.75, 0.0, 0.5]  # net / best, 0 when invalid
-    assert components.edit_term(FakeEdits(), task, goals, answers, {k: v for k, v in list(best.items())[:1]}) == [None] * 3
+    first = {k: v for k, v in list(best.items())[:1]}
+    assert components.edit_term(FakeEdits(), task, goals, answers, first) == [0.5, 0.0, 0.0]  # goal 2 has no best net: left out
+    negative = {**first, edit_eval.EditEval.key("text0", goals[1]): -1.0}
+    assert components.edit_term(FakeEdits(), task, goals, answers, negative) == [0.5, 0.0, 0.0]  # nor one no edit gains on
+    assert components.edit_term(FakeEdits(), task, goals, answers, {}) == [None] * 3
 
 
 class NoWiring:

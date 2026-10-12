@@ -1002,21 +1002,24 @@ def edit_teach(paths) -> dict:
 def edit_term(ee, task: dict, goals: list[dict], answers: list[dict], best: dict) -> list:
     """E3 of each answer's edits (parse()'s "edits"), one value per answer: per edit request, the edit's net bits
     (edit_eval's goal_bits less collateral) over the best net known for that goal (best: goal key -> net, the edit
-    teacher's), clipped to [-1, 1], 0 for an edit with an invalid operation, none, or one edit_eval rejects; the mean over
-    the requests. None for an answer when a request has no best net (E3 is then left out of the reward) or edit_eval
-    gives no net."""
+    teacher's and the baselines', edit_eval.bests), clipped to [-1, 1], 0 for an edit with an invalid operation, none,
+    or one edit_eval rejects; the mean over the requests with a positive best net (a goal no known edit gains on is
+    left out). None for an answer when no request has one (E3 is then left out of the reward) or edit_eval gives no
+    net."""
     import edit_eval
 
     vals = [[] for _ in answers]
     for n, goal in enumerate(goals, 1):
         key = edit_eval.EditEval.key(task["id"], goal)
         nb = best.get(key)
+        if not nb or nb <= 0:
+            continue  # no known edit gains on this goal: net / best net is undefined there
         ops = [a.get(n) or [] for a in answers]
         run = [i for i, o in enumerate(ops) if o and all(x["op"] != "invalid" for x in o)]
-        rows = dict(zip(run, ee.score_many(task, goal, [ops[i] for i in run]))) if run and nb else {}
+        rows = dict(zip(run, ee.score_many(task, goal, [ops[i] for i in run]))) if run else {}
         for i in range(len(answers)):
             r = rows.get(i)
-            if not nb or nb <= 0 or (r is not None and r.get("valid") and r.get("net") is None):
+            if r is not None and r.get("valid") and r.get("net") is None:
                 vals[i].append(None)
             elif r is None or not r.get("valid"):
                 vals[i].append(0.0)

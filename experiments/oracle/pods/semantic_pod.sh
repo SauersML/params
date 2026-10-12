@@ -28,7 +28,7 @@ tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd /Users/user/params/method/oracle ${INPUTS:-} > /dev/null;
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; rm -f $V/s-55ea3f9b/split/model_400000_part0.safetensors $V/s-55ea3f9b/split/model_400000_part1.safetensors;
-cd /Users/user/params; set +e; python -B $RUNCMD > $O/run_cmd.log 2>&1; echo \"exit \$?\" >> $O/run_cmd.log"
+cd /Users/user/params/method/oracle; set +e; python -B $RUNCMD > $O/run_cmd.log 2>&1; echo \"exit \$?\" >> $O/run_cmd.log"
 (
   for try in $(seq 1 $(( ${WAIT:-60} / 3 ))); do
     env ${REF:+RP_REF=$REF} RP_OWNER=varteach RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=16 \

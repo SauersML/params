@@ -56,7 +56,9 @@ Every membership decision is measured; orderings only order.
 
 Output per text in --out: <task>.json (the teacher circuit), <task>.f1.json, <task>.vpd_top<k>.json, <task>.n<size>.json at
 the path points nearest 16 to 256 nodes (goal_eval's circuit JSON: nodes [matrix, index, position] and ["tok", 0,
-position] input nodes; edges with --edges), <task>.path.json (the start set, every step, the F1 circuit's node ids
+position] input nodes; edges with --edges; with --vpd-edges, <task>.vpd_top<k>.edges.json: VPD's top k at the teacher
+circuit's node count k with its connections by the same search, units compared at equal connection effort),
+<task>.path.json (the start set, every step, the F1 circuit's node ids
 "f1_index" and "top_k"; with --edges,
 "edge_paths": per pruned point its node step, its connections [writer id, reader id or "out"] in node ids, and every
 edge step: nodes, edges, the connection indices removed, KL_graph, F1_graph, N (the nodes'), size_term and
@@ -529,7 +531,7 @@ def pick(rows: list[dict], f1: str, goal: float = RECOVERED, cap: int | None = N
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
           vpd_order: list | None = None, start_top: int = 0, f1_start: str = "both", edges: bool = False,
           from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
-          max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None) -> tuple[dict, dict]:
+          max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -687,6 +689,14 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         row.update(repair=[{k_: v for k_, v in s_.items() if k_ not in ("on", "kept")} for s_ in steps_], repair_pick=j,
                    repair_rule=rule, repair_seconds=time.perf_counter() - t3)
     circuits = {"": circuit_json(pr, final[0], final[1]), "f1": circuit_json(pr, f1_on), f"vpd_top{k}": circuit_json(pr, topk_on)}
+    if vpd_edges and edges:                                  # VPD's own top at the teacher circuit's node count, the same connection search
+        kv = int(final[0].sum())
+        on_v = torch.zeros_like(final[0])
+        on_v[order[:kv]] = True
+        got = measure(pr, on_v[None], empty, vpd)[0]
+        kept_v, summary_v, _, _ = wiring.connect(on_v, got["n"])
+        circuits[f"vpd_top{kv}.edges"] = circuit_json(pr, on_v, kept_v)
+        row["vpd_top_edges"] = {"size": kv, "f1_nodes": got["f1"], **summary_v}
     for i in points:
         circuits[f"n{path[i]['size']}"] = circuit_json(pr, wired[i][2] if i in wired else ons[i], wired.get(i, (None,))[0])
     f1_row = measure(pr, f1_on[None], empty, vpd)[0]
@@ -719,6 +729,8 @@ def main():
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
+    ap.add_argument("--vpd-edges", action="store_true", help="with --edges, also VPD's top k at the teacher circuit's node count k with "
+                    "its connections by the same search: <task>.vpd_top<k>.edges.json")
     ap.add_argument("--repair", action="store_true", help="with --edges, the flip repair after the pick (goal_eval.adversary_flips' "
                     "omitted lever at REPAIR_M, its flips joined and the connections pruned again while that improves; pool POOL)")
     ap.add_argument("--edges-at", choices=("pick", "search"), default="pick",
@@ -775,7 +787,8 @@ def main():
         ids, targets = native.text(path)
         saved = vpd.get(path.stem, {})
         circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
-                                         args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens, repair_pool)
+                                         args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens, repair_pool,
+                                         args.vpd_edges)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

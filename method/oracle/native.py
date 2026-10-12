@@ -834,8 +834,9 @@ class Native:
             heads = lambda y: y.view(B, T, H, hd).transpose(1, 2)  # noqa: E731
             no = nm["o_proj"]
             if not empty or no in R:
-                q, kk = tg._rope(heads(qv), T), tg._rope(heads(kv), T)
-                P = ((q[:, :, s2:] @ kk.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal[s2:], float("-inf")).softmax(-1)  # [B, H, T - s2, T]
+                q = tg._rope_from(heads(qv)[:, :, s2:], s2, T) if s2 else tg._rope(heads(qv), T)  # the rows from s2 (elementwise)
+                kk = tg._rope(heads(kv), T)
+                P = ((q @ kk.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal[s2:], float("-inf")).softmax(-1)  # [B, H, T - s2, T]
             att_s = None if empty else (P @ heads(vs)).transpose(1, 2).reshape(B, T - s2, -1)
             att_g = (P @ heads(vg)).transpose(1, 2).reshape(B, T - s2, -1) if both else att_s
             att_sw = None if empty else (att_s if s == 0 else att_s[:, o:].contiguous())

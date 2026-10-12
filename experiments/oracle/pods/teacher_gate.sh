@@ -10,7 +10,8 @@
 # pattern lever goal_eval/ci_patterns_fresh.pt), sharded over FIDP processes beside the score run, and
 # experiments/oracle/teacher_gate.py compares them. The scores come back to
 # ~/mpd-data/runpod/oracle-graph-teacher-gscore-NAME/ (score.json, fid_<k>.jsonl), the comparison to gate.txt.
-#   experiments/oracle/pods/teacher_gate.sh NAME A B   (env: N, PODS, P per side, V3PODS; FIDP, GPU, PRICE)
+#   experiments/oracle/pods/teacher_gate.sh NAME A B   (env: N, PODS, P per side, V3PODS, VRAM; FIDP, GPU, PRICE; the
+#   adversary's search pool goes to the teaching pods for --repair, --edge-objective robust and teacher_v3)
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -30,7 +31,8 @@ for side in a b; do
   case $ref in v3@*) ref=${ref#v3@} script=teacher_v3.py pods=${V3PODS:-4} procs=1 ;; esac
   C=$(git rev-parse --verify "$ref^{commit}") || exit 2
   echo "$side: $script at ${C:0:10} ${flags//,/ }" | tee -a "$G/README.txt"
-  SCRIPT=$script RUN=g$NAME$side REF=$C TEACHER_ARGS="${flags//,/ }" SPLIT=heldout N=$N PODS=$pods P=$procs VRAM=16 GPU="$GPU" \
+  SCRIPT=$script RUN=g$NAME$side REF=$C TEACHER_ARGS="${flags//,/ }" SPLIT=heldout N=$N PODS=$pods P=$procs VRAM=${VRAM:-16} GPU="$GPU" \
+    EXTRA=/Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt \
     VPD=/Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt DEST=$G/$side experiments/oracle/pods/teacher_pod.sh 2.0 > "$F/teach_$side.log" 2>&1 &
   dirs+=("$G/$side")
 done

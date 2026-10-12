@@ -106,7 +106,10 @@ def main():
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--vpd", type=Path, help="VPD's answers saved by teacher.py --save-vpd")
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--rows", type=int, default=ROWS, help="masked runs per batch (each a dense mask over every subcomponent)")
     args = ap.parse_args()
+    global ROWS
+    ROWS = args.rows
     ge = goal_eval.GoalEval()
     nat = ge.nat
     saved = torch.load(args.vpd) if args.vpd else {}

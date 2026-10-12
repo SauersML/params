@@ -19,7 +19,8 @@
 #   search: no locality labels, needs VPD=FILE, which also holds its patterns), REF, GPU, PRICE, VRAM, RAM, WAIT
 #   (minutes of retries while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all), FROM (a directory
 #   of saved paths, teacher.py --from-path: only texts with a <task>.path.json there are taught, and each pod gets its
-#   texts' path, F1 and top-k files as one tar)
+#   texts' path, F1 and top-k files as one tar), EXTRA (more inputs the pod needs at their ~/mpd-data paths, e.g. the
+#   adversary's pool goal_eval/ci_patterns_m.pt for --repair)
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params
@@ -93,7 +94,7 @@ cd /Users/user/params/method/oracle; python -B teacher.py --tasks $L --batch $BA
   CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
 tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
-ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd > /dev/null;
+ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd ${EXTRA:-} > /dev/null;
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 $PRE

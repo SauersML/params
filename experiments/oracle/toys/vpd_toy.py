@@ -100,13 +100,16 @@ def sites(sd: dict, cfg: dict) -> dict:
 
 
 def nano_module():
-    """nano_param_decomp.run, with wandb and matplotlib stubbed where the environment lacks them (logging and figures
-    only)."""
+    """nano_param_decomp.run, with wandb, matplotlib and PIL stubbed where the environment lacks them (logging and
+    figures only)."""
     import importlib.util
 
-    for m in ("wandb", "matplotlib", "matplotlib.pyplot"):
-        if importlib.util.find_spec(m.split(".")[0]) is None and m not in sys.modules:
-            sys.modules[m] = types.ModuleType(m)
+    for top, sub in (("wandb", None), ("matplotlib", "pyplot"), ("PIL", "Image")):
+        if importlib.util.find_spec(top) is None and top not in sys.modules:
+            sys.modules[top] = types.ModuleType(top)
+            if sub:
+                sys.modules[f"{top}.{sub}"] = types.ModuleType(f"{top}.{sub}")
+                setattr(sys.modules[top], sub, sys.modules[f"{top}.{sub}"])
     import nano_param_decomp.run as nano
 
     return nano

@@ -4,14 +4,15 @@
 # held-out text9000-9019 (fresh QA seed), E1 by reader A and reader B, and the evaluation split by locality against
 # the held-out teachers themselves.
 #   zsh experiments/oracle/sft.sh RUN   (env: ROWS, TEACHER, ENGLISH, EDIT_TEACH, BASE, STEPS, BATCH, LR, HELDOUT,
-#                                        HELDOUT_TEACHER, LABELS, NEVAL, SAMPLES, MAXTOK, SRC)
+#                                        HELDOUT_TEACHER, LABELS, NEVAL, SAMPLES, MAXTOK, SRC, ZEROSHOT: the untrained base's
+#                                        samples and readers on HELDOUT's questions)
 set -e
 RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
 ROWS=${ROWS:?question rows: components.py prepare output, several joined}
 TEACHER=${TEACHER:?teacher circuits (<task>.json)}
 BASE=${BASE:-Qwen/Qwen3-8B} STEPS=${STEPS:-100} BATCH=${BATCH:-8} NEVAL=${NEVAL:-20} SAMPLES=${SAMPLES:-4} MAXTOK=${MAXTOK:-4096}
-HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20_rt.jsonl} HELDOUT_TEACHER=${HELDOUT_TEACHER:-~/mpd-data/graph_oracle/teacher/joint_heldout}
+HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20_rt_st.jsonl} HELDOUT_TEACHER=${HELDOUT_TEACHER:-~/mpd-data/graph_oracle/teacher/joint_heldout}
 LABELS=${LABELS:-$O/heldout50_locality_frozen.jsonl}  # frozen once: never relabel per teacher version
 SRC=${SRC:-/Users/user/params}  # a source tree (a clean copy of main while others edit the shared tree)
 PY=/Users/user/mpd-data/venv/bin/python; TPY=/Users/user/mpd-data/tinker-venv/bin/python
@@ -40,14 +41,15 @@ $TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE"
 $TPY -u tinker_train.py readers $S/samples.jsonl $S/heldout.jsonl $S/e1.jsonl --reader-b Qwen/Qwen3.5-4B
 unset TINKER_API_KEY
 cd $SRC
-Z=$O/zeroshot_heldout20/c  # the untrained Qwen3-8B's first answers on these questions, scored by the same reward
+Z=${ZEROSHOT:-$O/zeroshot_heldout20/cst}  # the untrained Qwen3-8B's answers to these questions, scored by the same reward
+$PY -c "import json; open('$S/zeroshot_first.jsonl', 'w').writelines(l for l in open('$Z/samples.jsonl') if json.loads(l)['sample'] == 0)"
 PRUNED=() REFS=(--ref "Teacher=$S/eval.json:teacher" --ref "VPD, every connection=$S/eval.json:vpd_complete")
 if [ -d $S/ref/vpd_pruned ]; then
   PRUNED=(vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
 fi
 # C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh)
 bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl:$S/e1.jsonl \
-  zeroshot=$Z/samples_first.jsonl:$Z/e1.jsonl teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" > $S/eval_pod.log 2>&1
+  zeroshot=$S/zeroshot_first.jsonl:$Z/e1.jsonl teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" > $S/eval_pod.log 2>&1
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.json $S/eval.json
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.log $S/eval.log
 tail -60 $S/eval.log

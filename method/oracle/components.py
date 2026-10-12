@@ -82,6 +82,8 @@ CONVENTION = "live"  # goal_eval's remainders convention for the reward's F1 and
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
 WIRING_PER_POSITION = 6  # connectome pairs listed per position
 SWITCH_PER_POSITION = 8  # subcomponents a changed token switches on, listed per position
+WINDOW = 8  # a question numbers the tokens within this many positions of every position its evidence names
+MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
 QA_PER_KIND = 2
 QA_RANKS = 8  # token-change questions draw the new token from the model's alternatives at ranks 0 to 7
 
@@ -518,6 +520,48 @@ def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=N
             "wiring": {str(p): wires[p] for p in where}, "switch_on": switched, "qa": qa, "active": active}
 
 
+def windows(task: dict, ev: dict, radius: int = WINDOW) -> set[int]:
+    """The positions a question numbers: within radius of the first position and of each position its evidence names (the listed positions,
+    whose relays sit just after them, the targets, every subcomponent, switch-on and wiring position, every
+    intervention question's position) and of each earlier occurrence of the target's token followed by the predicted
+    token (where a copy reads from)."""
+    p = task["prompts"][0]
+    ids, targets = p["token_ids"], p["target_positions"]
+    t = max(targets)
+    named = set(ev["positions"]) | set(targets) | {0}  # position 0: the attention sink most attention reads
+    named |= {int(q) for q in ev["components"]} | {nd[1] for cs in ev["components"].values() for nd, *_ in cs}
+    named |= {nd[1] for cs in ev.get("switch_on", {}).values() for nd, _ in cs}
+    named |= {nd[1] for ws in ev["wiring"].values() for w, r, _ in ws for nd in (w, r)}
+    for q in ev["qa"]:
+        named |= {q["position"]} if q["kind"] == "token" else {q["node"][1]} if q["kind"] == "remove" else {r for r, _ in q["changes"]}
+    strings = token_strings(task["model"], ids)
+    top = p["model_top"][0][0][0]
+    named |= {s + d for s in range(t) if ids[s] == ids[t] and strings[s + 1] == top for d in (0, 1)}  # copy sources [A][B]
+    return {q for c in named for q in range(max(0, c - radius), min(len(ids), c + radius + 1))}
+
+
+def listing(strings: list[str], numbered: set[int], every: int = MARK_EVERY) -> str:
+    """Token strings with their positions where numbered ("392:' the'"), elsewhere as plain text in runs, each run and
+    every multiple of `every` inside one opened by a position marker ("[128]' the cat sat'"): any position stays
+    locatable by counting from the nearest marker."""
+    out, i, T = [], 0, len(strings)
+    while i < T:
+        if i in numbered:
+            out.append(f"{i}:{strings[i]!r}")
+            i += 1
+            continue
+        j = i
+        while j < T and j not in numbered:
+            j += 1
+        k = i
+        while k < j:
+            nxt = min(j, (k // every + 1) * every)
+            out.append(f"[{k}]{''.join(strings[k:nxt])!r}")
+            k = nxt
+        i = j
+    return " ".join(out)
+
+
 def question(task: dict, ev: dict) -> str:
     """The oracle's question for one text from its evidence()."""
     import units
@@ -529,7 +573,8 @@ def question(task: dict, ev: dict) -> str:
     t = max(targets)
     top_tok = p["model_top"][0][0][0]
     top = ", ".join(f"{tok!r} {q:.2f}" for tok, q in p["model_top"][0][:3])
-    lines = [ASK.format(model=model), "tokens: " + units.numbered(strings),
+    lines = [ASK.format(model=model), "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): "
+             + listing(strings, windows(task, ev)),
              f"target: position {t}; the model's most probable next tokens there: {top}",
              "positions where a changed token moves the prediction by at least 1% of the total, most first: "
              + ", ".join(f"{q} ({strings[q]!r})" for q in ev["positions"])]

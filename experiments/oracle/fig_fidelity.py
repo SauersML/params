@@ -22,7 +22,7 @@ COLORS = ["#1b6ca8", "#d1495b", "#2e933c", "#8f5bb3", "#e09f3e"]
 
 def kind(r: dict) -> str:
     k = r["kind"].split(",")[0]
-    return "VPD top k" if k.startswith("VPD top") else k
+    return "VPD's top k at the same size" if k.startswith("VPD top") else k.replace("_", " ")
 
 
 def value(d: dict | None, k):
@@ -32,7 +32,7 @@ def value(d: dict | None, k):
 def curves(rows: list[dict], key: str, xs: list, start: str | None) -> dict:
     """kind -> (mean, standard error) per x of row[key][x] over texts (x = 0 from row[start] when given)."""
     out = {}
-    for kd in sorted({kind(r) for r in rows}, key=lambda k: (k == "VPD top k", k)):
+    for kd in sorted({kind(r) for r in rows}, key=lambda k: (k.startswith("VPD"), k)):
         rs = [r for r in rows if kind(r) == kd]
         m, e = [], []
         for x in xs:

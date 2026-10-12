@@ -642,7 +642,7 @@ def test_fidelity_vpds_answer_is_its_own_ceiling(tiny):
     sub = sorted(g.node_set())[::4]
     whole = native.Graph(sub, *native.all_edges(sub, tx.targets))  # every connection: reads equal the masked run's
     row = ge.fidelity(tx, [whole], pool, draws=3, steps=1, restarts=1, curve=(0,), interchange=2, reads=True)[0]
-    for k in ("reads_nodes", "reads_edges", "reads_interchange"):
+    for k in ("reads_nodes", "reads_edges", "reads_interchange", "dreads_nodes", "dreads_edges", "dreads_interchange"):
         assert row[k] is not None and row[k] >= 0, (k, row[k])
 
 
@@ -1009,3 +1009,10 @@ def test_interchange_family(tiny):
     full, _ = naive(nat, tx.ids)
     want = _kl(full, naive(nat, tx.ids, replace={nd: 0.7 for nd in vals}, on=mask_of(nat, tx.T, sub), live=True)[0], tx.targets)
     assert abs(got - want) < 1e-5 + 1e-4 * abs(want), (got, want)
+
+
+def test_response_error():
+    base = {("a", 0, 0): (1.0, 5.0), ("b", 0, 0): (0.0, 0.0)}
+    pairs = {("a", 0, 0): [(2.0, 6.0), (0.0, 4.0)], ("b", 0, 0): [(1.0, 0.0)]}
+    # a's responses match exactly despite the offset; b's model response 1 is missed: sqrt(1 / 3)
+    assert abs(goal_eval._response_error(pairs, base) - math.sqrt(1 / 3)) < 1e-12

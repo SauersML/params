@@ -237,6 +237,20 @@ def _read_error(pairs: dict) -> float | None:
     return float(np.mean(errs)) if errs else None
 
 
+def _response_error(pairs: dict, base: dict) -> float | None:
+    """The reads' responses to a family's interventions: each circuit node's change from its own run without one, in
+    the model (r_model - base_model) and in the circuit (r_circuit - base_circuit); the error pooled over nodes and
+    draws, sqrt(sum (d_model - d_circuit)^2 / sum d_model^2) (pairs: node -> [(r_model, r_circuit)], base: node ->
+    (base_model, base_circuit)); None when the family moves no read in the model."""
+    num = den = 0.0
+    for nd, xs in pairs.items():
+        bm, bc = base[nd]
+        for a, b in xs:
+            num += ((a - bm) - (b - bc)) ** 2
+            den += (a - bm) ** 2
+    return math.sqrt(num / den) if den > 0 else None
+
+
 def _drop_nodes(g: native.Graph, drop: set) -> native.Graph:
     """A stated graph without some nodes and every connection to or from them."""
     nodes = [nd for nd in g.nodes if nd not in drop]
@@ -871,13 +885,18 @@ class GoalEval:
         parts switched on (adversary_flips, the omitted lever: f1_flips_omitted by m); c, the mean of s_point, s_nodes,
         s_edges and f1_flips_omitted at FLIP_TERM (the reward's adversarial member, the lead's decision 10-12; the
         step-budget f1_adv is a reported column); flips_to_break, the smallest m at which f1_flips_omitted falls below
-        half of s_point (None: not within FLIPS). reads: C's second observable, the circuit nodes' relative RMS read
-        error between the model and the circuit per family (reads_nodes, reads_edges, reads_interchange; graph_ref,
+        half of s_point (None: not within FLIPS); flips_to_half, the smallest m at which it falls below 0.5, half of
+        VPD's own answer under the same attack (0: below it unattacked), which a circuit weak to begin with cannot pass. reads: C's second observable, the circuit nodes' relative RMS read
+        error between the model and the circuit per family (reads_*), and of their responses, each node's change from
+        its own run without the intervention (dreads_*, _response_error; the static error mostly measures the missing
+        background of a circuit's run); graph_ref,
         slower). Evaluation only, never in the reward or a teacher's objective:
         fresh, a pool none of the searches drew from: the pattern lever's flips over it (f1_flips_patterns_fresh);
         interchange > 0: that many interchange draws (_interchange_family, s_interchange); real: N_real (real_removal,
         n_real)."""
         e0 = self._bounds(tx, "live")[0]
+        model_graph = native.Graph(masks={n: torch.ones(tx.T, self.nat.C[n], dtype=torch.bool, device=self.nat.dev)
+                                          for n in self.nat.names}) if reads else None
         point = self.sufficiency(tx, graphs)
         nodes = self._node_family(tx, graphs, draws, reads)
         edges = self._edge_family(tx, graphs, draws, reads)
@@ -899,12 +918,25 @@ class GoalEval:
             half = 0.5 * row["s_point"] if row["s_point"] is not None else None
             broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
             row["flips_to_break"] = broke[0] if broke else None  # None: not within the budgets (more than max(FLIPS))
+            below = [m for m in sorted(fc) if fc[m] is not None and fc[m] < 0.5]  # an absolute bar: half of VPD's own
+            row["flips_to_half"] = 0 if (row["s_point"] is not None and row["s_point"] < 0.5) else (below[0] if below else None)
             if fr:
                 row["f1_flips_patterns_fresh"] = fr["f1_flips_patterns"]
             if it:
                 row["s_interchange"] = _fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
             if rr:
                 row["n_real"] = rr["n_real_live"]
+            if reads:  # the reads' responses: each node's change from its own run without an intervention
+                rm, rc = {}, {}
+                every = sorted(g.node_set())
+                self.graph_ref(tx.ids, tx.targets, model_graph, record=rm, reads=every)
+                self.graph_ref(tx.ids, tx.targets, g, record=rc, reads=every)
+                base = {nd: (float(rm[nd][0]), float(rc[nd][0])) for nd in every}
+                for fam in ("nodes", "edges", "interchange"):
+                    pairs = row.pop(f"_pairs_{fam}", None)
+                    row[f"dreads_{fam}"] = _response_error(pairs, base) if pairs else None
+            for fam in ("nodes", "edges", "interchange"):
+                row.pop(f"_pairs_{fam}", None)
             out.append(row)
         return out
 
@@ -1002,7 +1034,7 @@ class GoalEval:
                     if nd not in set(d):
                         pairs.setdefault(nd, []).append((rm[nd][b], rc[nd][b]))
             out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean()),
-                        "reads_nodes": _read_error(pairs) if reads else None})
+                        "reads_nodes": _read_error(pairs) if reads else None, "_pairs_nodes": pairs})
             native.free(dev)
         return out
 
@@ -1032,7 +1064,8 @@ class GoalEval:
             row = {"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean()), "reads_edges": None}
             if reads:  # the circuit nodes' reads under each draw, model and circuit
                 rm, rc = got[3], got[4]
-                row["reads_edges"] = _read_error({nd: list(zip(rm[nd].tolist(), rc[nd].tolist())) for nd in rm})
+                pairs = {nd: list(zip(rm[nd].tolist(), rc[nd].tolist())) for nd in rm}
+                row["reads_edges"], row["_pairs_edges"] = _read_error(pairs), pairs
             out.append(row)
             native.free(self.nat.dev)
         return out
@@ -1160,7 +1193,7 @@ class GoalEval:
                     for nd in nodes:
                         if nd not in vals:
                             pairs.setdefault(nd, []).append((rm[nd][b], rc[nd][b]))
-                row["reads_interchange"] = _read_error(pairs)
+                row["reads_interchange"], row["_pairs_interchange"] = _read_error(pairs), pairs
             out.append(row)
         return out
 
@@ -1835,12 +1868,17 @@ def fidelity_table(rows: list[dict]) -> str:
     def breaks(r):  # flips-to-break, a circuit that holds to the largest budget counted at twice it
         return math.log2(r["flips_to_break"]) if r.get("flips_to_break") else (math.log2(2 * max(flips)) if flips else None)
 
-    held = [("log2 flips-to-break", breaks)] + [(f"flip{m}", lambda r, m=m: _curve_value(r.get("f1_flips_omitted"), m)) for m in flips]
+    def halves(r):
+        f = r.get("flips_to_half")
+        return -1.0 if f == 0 else (math.log2(f) if f else (math.log2(2 * max(flips)) if flips else None))
+
+    held = [("log2 flips-to-break", breaks), ("log2 flips-to-0.5 (none: -1)", halves)] + [(f"flip{m}", lambda r, m=m: _curve_value(r.get("f1_flips_omitted"), m)) for m in flips]
     held += [("nodes fam", lambda r: r.get("s_nodes")), ("edges fam", lambda r: r.get("s_edges")),
              ("interchange", lambda r: r.get("s_interchange"))]
     held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
     held += [("N_real", lambda r: r.get("n_real")), ("C", lambda r: r.get("c"))]
     held += [(f"read err {f}", lambda r, f=f: r.get(f"reads_{f}")) for f in ("nodes", "edges", "interchange")]
+    held += [(f"response err {f}", lambda r, f=f: r.get(f"dreads_{f}")) for f in ("nodes", "edges", "interchange")]
     stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
     sample = [("F1", lambda r: r["s_point"]), ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
     return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),

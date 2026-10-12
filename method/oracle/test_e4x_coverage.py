@@ -77,13 +77,15 @@ def line_credit(e4x):
     return namespace["line_credit"]
 
 
-def credits(line_credit, claims, masses=(3.0, 1.0)):
+def credits(line_credit, claims, masses=(3.0, 1.0), lines=None, with_lines=False):
+    claims = [{**claim, "name": claim.get("name", f"claim{i}")} for i, claim in enumerate(claims, 1)]
     text = "EXPLANATION:\n" + "\n".join(
-        f'V{i} "claim": meaning; inputs: @0; carried by: a; feeds: PREDICTION'
-        for i in range(1, len(claims) + 1))
+        lines if lines is not None else [
+            f'V{i} "{claim["name"]}": meaning; inputs: @0; carried by: a; feeds: PREDICTION'
+            for i, claim in enumerate(claims, 1)])
     le = {"nodes": [{"node": ["site", 0, i], "delta_kl": mass} for i, mass in enumerate(masses)]}
     result = line_credit(text, {}, {"nodes": []}, le, {}, None, {"per_variable": claims}, {}, [], None)
-    return [value for _, value in result]
+    return result if with_lines else [value for _, value in result]
 
 
 @pytest.mark.parametrize("copies", [2, 10])
@@ -109,3 +111,31 @@ def test_failing_duplicates_have_no_unique_line_credit(line_credit):
 
 def test_partial_overlap_credits_only_unique_coverage(line_credit):
     assert credits(line_credit, [variable(1.0, 0, 1), variable(1.0, 0)]) == [0.25, 0.0]
+
+
+def variable_line(number, name):
+    return f'V{number} "{name}": meaning; inputs: @0; carried by: a; feeds: PREDICTION'
+
+
+def test_nonconsecutive_variable_id_uses_scored_name(line_credit):
+    assert credits(line_credit, [variable(1.0, 0)], lines=[variable_line(3, "claim1")]) == [0.75]
+
+
+def test_omitted_invalid_variable_does_not_take_later_credit(line_credit):
+    lines = [variable_line(1, "invalid"), variable_line(3, "claim1")]
+    assert credits(line_credit, [variable(1.0, 0)], lines=lines, with_lines=True) == [[2, 0.75]]
+
+
+def test_duplicate_variable_ids_are_ambiguous(line_credit):
+    lines = [variable_line(3, "claim1"), variable_line(3, "claim2")]
+    assert credits(line_credit, [variable(1.0, 0), variable(0.0, 1)], lines=lines) == []
+
+
+def test_duplicate_semantic_names_are_ambiguous(line_credit):
+    claims = [{**variable(1.0, 0), "name": "same"}, {**variable(0.0, 1), "name": "same"}]
+    assert credits(line_credit, claims) == []
+
+
+def test_unscored_line_cannot_reuse_a_scored_name(line_credit):
+    lines = [variable_line(1, "claim1"), variable_line(3, "claim1")]
+    assert credits(line_credit, [variable(1.0, 0)], lines=lines) == []

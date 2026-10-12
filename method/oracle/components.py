@@ -1775,6 +1775,18 @@ def line_credit(text: str, parsed: dict, answer: dict, le: dict, info: dict, e2g
         return math.log2(bits / b) if bits and b and b > 0 else 0.0
     M = sum(max(0.0, x) for x in node_kl.values())
     coverage = e4x_term(None, None, None, e4, None, le) if e4 and e4.get("per_variable") and M > 0 else None
+    per = e4.get("per_variable", []) if e4 else []
+    variable_names = {}
+    for i, pv in enumerate(per):
+        variable_names.setdefault(pv.get("name"), []).append(i)
+    variable_ids = {}
+    line_names = {}
+    for line in lines:
+        match = VAR_RE.fullmatch(line.strip())
+        if match:
+            v = int(match[1])
+            variable_ids[v] = variable_ids.get(v, 0) + 1
+            line_names[match[2]] = line_names.get(match[2], 0) + 1
     out, sec = [], None
     for k, line in enumerate(lines):
         head = SECTION.match(line)
@@ -1810,10 +1822,11 @@ def line_credit(text: str, parsed: dict, answer: dict, le: dict, info: dict, e2g
             if 1 <= n <= len(e2g["per_question"]):
                 out.append([k, e2g["per_question"][n - 1]["credit"]])
         elif sec == "EXPLANATION" and VAR_RE.fullmatch(s_) and e4 and e4.get("per_variable") and M > 0:
-            v = int(VAR_RE.fullmatch(s_)[1])
-            if 1 <= v <= len(e4["per_variable"]):
-                per = e4["per_variable"]
-                without = {**e4, "per_variable": per[:v - 1] + per[v:]}
+            match = VAR_RE.fullmatch(s_)
+            matches = variable_names.get(match[2], [])
+            if variable_ids[int(match[1])] == 1 and line_names[match[2]] == 1 and len(matches) == 1:
+                i = matches[0]
+                without = {**e4, "per_variable": per[:i] + per[i + 1:]}
                 out.append([k, coverage - e4x_term(None, None, None, without, None, le)])
     return out
 

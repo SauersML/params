@@ -747,7 +747,7 @@ class GoalEval:
         adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool else [{} for _ in graphs]
         out = []
         for g, pt, nd, ed, ad in zip(graphs, point, nodes, edges, adv):
-            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], **nd, **ed, **ad}
+            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad}
             row["s_nodes"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
             row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
             terms = [row[k] for k in ("s_point", "s_nodes", "s_edges", "f1_adv") if row.get(k) is not None]
@@ -1369,6 +1369,94 @@ def pattern(pool: dict, k: int) -> dict:
     return {n: c[site == i] for i, n in enumerate(pool["names"]) if bool((site == i).any())}
 
 
+def fidelity_report(split: str, n: int, teacher: Path, pool: Path, out: Path, draws: int = DRAWS, log=print) -> list[dict]:
+    """C on the split's first n texts for a teacher's circuits (teacher.py's <task>.json and <task>.f1.json: as stated,
+    or every connection the model has among their nodes when they state none) and VPD's first k at both sizes
+    (complete graphs), beside N_real; one row per circuit appended to OUT (texts already there are skipped)."""
+    ge = GoalEval()
+    nat = ge.nat
+    M = torch.load(pool)
+    local = {}
+    for f in sorted(teacher.glob("summary*.jsonl")):
+        for x in f.read_text().splitlines():
+            if x.strip():
+                r = json.loads(x)
+                local[r["task"]] = r.get("local")
+    done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
+    rows = []
+    for p in native.tasks(split)[:n]:
+        if p.stem in done or not (teacher / f"{p.stem}.json").exists():
+            continue
+        t0 = time.perf_counter()
+        task = json.loads(p.read_text())
+        ids, targets = native.text(p)
+        tx = ge.text(ids, targets, native.task_seed(p.stem), task)
+        graphs, kinds = [], []
+        for name, f in (("teacher", f"{p.stem}.json"), ("teacher F1", f"{p.stem}.f1.json")):
+            path = teacher / f
+            if not path.exists():
+                continue
+            g, _ = circuit(json.loads(path.read_text()), targets, nat.C, tx.T)
+            if not g.parents and not g.out:  # a circuit stating no connection: every one the model has among its nodes
+                g = native.Graph(g.nodes, *native.all_edges(g.nodes, targets))
+                name += ", every connection"
+            graphs.append(g)
+            kinds.append(name)
+        order = nat._vpd_order(ids, targets)
+        for k in sorted({g.count() for g in graphs}):
+            graphs.append(native.Graph(order[:k], complete=True))
+            kinds.append(f"VPD top {k}")
+        fid = ge.fidelity(tx, graphs, M, draws=draws)
+        real = ge.real_removal(tx, graphs)
+        e, v = ge._bounds(tx, "live")
+        with open(out, "a") as fh:
+            for kind, g, f, r in zip(kinds, graphs, fid, real):
+                row = {"task": p.stem, "local": local.get(p.stem), "kind": kind, "size": g.count(), "kl_empty": e, "kl_vpd": v,
+                       "n_real": r["n_real_live"], **f}
+                rows.append(row)
+                fh.write(json.dumps(row) + "\n")
+        if log:
+            log(f"{p.stem}: {len(graphs)} circuits, {time.perf_counter() - t0:.0f} s")
+    return rows
+
+
+def fidelity_table(rows: list[dict]) -> str:
+    """Means by locality group and circuit kind (teacher, teacher F1, VPD top k at the teacher's sizes): size, point F1
+    and N, N_real, the node and connection families, f1_adv at each budget, the random members' mean, C. "trivial":
+    texts whose empty circuit is within 2x of VPD's own KL (the log scale's denominator below ln 2)."""
+    def group(r):
+        if r["kl_vpd"] is not None and r["kl_empty"] < 2 * r["kl_vpd"]:
+            return "trivial"
+        return "local" if r["local"] else "non-local"
+
+    def kind(r):
+        k = r["kind"].split(",")[0]
+        return "VPD top k" if k.startswith("VPD top") else k
+
+    by = {}
+    for r in rows:
+        by.setdefault((group(r), kind(r)), []).append(r)
+    steps = sorted({int(s) for r in rows for s in r.get("f1_adv_curve", {})})
+    head = ["texts", "kind", "n", "size", "F1", "N", "N_real", "nodes", "edges"] + [f"adv@{s}" for s in steps] + ["adv rand", "C"]
+    lines = [head]
+    for g in ("local", "non-local", "trivial"):
+        for kd in ("teacher", "teacher F1", "VPD top k"):
+            rs = by.get((g, kd), [])
+            if not rs:
+                continue
+
+            def m(f):
+                v = [f(r) for r in rs]
+                v = [x for x in v if x is not None]
+                return f"{float(np.mean(v)):.3f}" if v else "-"
+            lines.append([g, kd, str(len(rs)), f"{np.mean([r['size'] for r in rs]):.0f}", m(lambda r: r["s_point"]),
+                          m(lambda r: r["n_point"]), m(lambda r: r["n_real"]), m(lambda r: r["s_nodes"]), m(lambda r: r["s_edges"])]
+                         + [m(lambda r, s=s: r.get("f1_adv_curve", {}).get(str(s), r.get("f1_adv_curve", {}).get(s))) for s in steps]
+                         + [m(lambda r: r.get("f1_adv_random")), m(lambda r: r["c"])])
+    w = [max(len(x[i]) for x in lines) for i in range(len(head))]
+    return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(head))) for x in lines)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1384,11 +1472,22 @@ def main():
     t.add_argument("--n", type=int, default=20)
     t.add_argument("--teacher", action="append", default=[], help="NAME=DIR of teacher circuits <task>.json")
     t.add_argument("--top", type=int, default=64)
+    f = sub.add_parser("fidelity", help="C on a teacher's circuits and VPD's first k")
+    f.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
+    f.add_argument("--n", type=int, default=20)
+    f.add_argument("--teacher", type=Path, required=True, help="teacher.py's --out directory")
+    f.add_argument("--pool", type=Path, required=True, help="the adversary's pattern pool (goal_eval.py patterns)")
+    f.add_argument("--out", type=Path, required=True)
+    f.add_argument("--draws", type=int, default=DRAWS)
     q = sub.add_parser("patterns", help="the adversary's pattern pool from a range of held-out texts")
     q.add_argument("--first", type=int, required=True, help="first text number, e.g. 9100")
     q.add_argument("--last", type=int, required=True, help="last text number, e.g. 9149")
     q.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
+    if args.cmd == "fidelity":
+        fidelity_report(args.split, args.n, args.teacher, args.pool, args.out, args.draws)
+        print(fidelity_table([json.loads(x) for x in args.out.read_text().splitlines() if x.strip()]), flush=True)
+        return
     if args.cmd == "patterns":
         texts = [native.TEXTS / "vpd4l" / f"text{i}.json" for i in range(args.first, args.last + 1)]
         pool = build_patterns(texts, args.out)

@@ -727,3 +727,14 @@ def test_adversary_gradient_and_rescore(tiny):
         want_c = float(carry.kl(tx.ref, nat.run(tx.ids, tx.targets, plan, u, nat._one()[1])))
         want_v = float(carry.kl(tx.ref, ge.runs(tx.ids, tx.targets, [vm], True)))
         assert abs(float(kc[0]) - want_c) < 1e-4 * max(1.0, want_c) and abs(float(kv[0]) - want_v) < 1e-4 * max(1.0, want_v)
+
+
+def test_fidelity_table_groups():
+    rows = [{"task": "a", "local": True, "kind": "teacher, every connection", "size": 30, "kl_empty": 100.0, "kl_vpd": 0.1,
+             "n_real": 0.5, "s_point": 0.9, "n_point": 0.6, "s_nodes": 0.8, "s_edges": 0.7, "f1_adv_curve": {"0": 0.9, "20": 0.5},
+             "f1_adv_random": 0.85, "c": 0.7},
+            {"task": "b", "local": False, "kind": "VPD top 30", "size": 30, "kl_empty": 1.5, "kl_vpd": 1.0, "n_real": 0.2,
+             "s_point": 1.0, "n_point": 0.1, "s_nodes": 1.0, "s_edges": None, "f1_adv_curve": {"0": 1.0, "20": 1.0},
+             "f1_adv_random": 1.0, "c": 1.0}]
+    text = goal_eval.fidelity_table(rows)
+    assert "trivial" in text and "local" in text and "adv@20" in text and " 0.500 " in text and "VPD top k" in text

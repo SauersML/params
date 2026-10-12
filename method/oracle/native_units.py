@@ -79,8 +79,11 @@ class Mask:
 
     def without(self, units) -> "Mask":
         m = Mask(self.heads.clone(), self.neurons.clone())
-        for kind, l, t, j in units:
-            (m.heads if kind == "head" else m.neurons)[l, t, j] = False
+        for kind, x in (("head", m.heads), ("neuron", m.neurons)):
+            idx = [u[1:] for u in units if u[0] == kind]
+            if idx:
+                i = torch.tensor(idx, dtype=torch.long, device=x.device).T
+                x[i[0], i[1], i[2]] = False
         return m
 
 
@@ -377,14 +380,13 @@ class NativePruner:
 
 def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, log=print) -> dict:
     """The teacher's search (teacher.teach) on native units, remainders off: the F1 circuit, first from the units at the
-    targets alone (chunks of 4, then single units), else from every unit at the targets and F2's positions (positions,
-    sites, chunks of 64, 16 and 4, single units; every unit at every position, the analog of VPD's whole answer, is
-    millions of units against its tens of thousands), each level by teacher.ROUNDS rounds of measured removal keeping
-    F1 >= teacher.RECOVERED; then teacher.joint_path's measured F1 and N path from it (from its JOINT_MAX units whose
+    targets alone (chunks of 4, then single units), else from every unit at every position, the analog of VPD's whole
+    answer (positions, sites, chunks of 64, 16 and 4, single units), each level by teacher.ROUNDS rounds of measured
+    removal keeping F1 >= teacher.RECOVERED; then teacher.joint_path's measured F1 and N path from it (from its JOINT_MAX units whose
     measured removal matters most when it is larger) down to teacher.MIN_SIZE (no VPD order to union with), N being
     removal from the whole model, and joined, as teacher.top_k joins VPD's top k, by the smallest prefix (at most
-    teacher.K_MAX) with N >= teacher.N_TARGET of the native order: the units at the targets and F2's positions by
-    their measured removal from the whole model, most needed first (screen). Returns the F1 circuit, the top k, the
+    teacher.K_MAX) with N >= teacher.N_TARGET of the native order: every unit by its measured removal from the whole
+    model, most needed first (screen). Returns the F1 circuit, the top k, the
     path with each step's units, and the measured runs."""
     import teacher
 
@@ -402,12 +404,13 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
             k = pr.kl()
             levels[f"{label}{level}"] = {"rounds": rounds, "size": pr.S.count(), "kl": k, "seconds": time.perf_counter() - t1}
             if log:
-                log(f"  {label}{level}: {pr.S.count()} units, KL {k:.3g} (budget {budget:.3g}), {rounds} rounds, {pr.measured} runs")
+                log(f"  {label}{level}: {pr.S.count()} units at {int((pr.S.heads.any(2) | pr.S.neurons.any(2)).any(0).sum())} positions, "
+                    f"KL {k:.3g} (budget {budget:.3g}), {rounds} rounds, {pr.measured} runs, {time.perf_counter() - t1:.0f} s")
         return levels[f"{label}{names[-1]}"]["kl"] <= budget
 
     reached = search(("chunk4", "subcomponent"), "target ")
-    if not reached:  # from every unit at the targets and F2's positions (every unit at every position is millions)
-        pr.S = nu.at(sorted(set(tx.targets) | {q for q, _ in tx.f2}))
+    if not reached:
+        pr.S = full
         search(teacher.LEVELS, "")
     f1_set = pr.S
     f1_part = f1_set
@@ -418,9 +421,8 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
         keep = sorted(f1_part.units(), key=lambda u: -effect[u])[:JOINT_MAX]
         f1_part = f1_part.without(sorted(set(f1_part.units()) - set(keep)))
 
-    positions = sorted(set(tx.targets) | {q for q, _ in tx.f2})
     kl_full = nu.kl(full)[0]
-    effect = screen(nu, full, kl_full, log, units=nu.at(positions).units())
+    effect = screen(nu, full, kl_full, log)
     pr.measured += len(effect) + 1
     order = sorted(effect, key=lambda u: -effect[u])
 

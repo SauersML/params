@@ -5,7 +5,8 @@ many texts B is above, below and equal to A. The verdict per field is the interv
 excludes 0, no detectable difference otherwise; for "bits" and "nodes" lower is smaller, not worse. goal_eval scores F1
 in graph semantics, where an answer without edges connects nothing (f1_live 0): with --teacher DIR_A DIR_B the same
 comparison also runs on teacher.py's own summaries (summary_*.jsonl: the best path point's node-semantics F1, N, reward,
-size, positions, and seconds per text), and with --adv A.jsonl B.jsonl on teacher_v3.py --evaluate's held-out
+size, positions, and seconds per text) and the circuits' connections (role_share: the share of nodes with at least
+one stated connection in or out), and with --adv A.jsonl B.jsonl on teacher_v3.py --evaluate's held-out
 adversary scores (F1, N, f1_adv, f1_rob, size), and with --fidelity A.jsonl B.jsonl on goal_eval.py fidelity's rows of
 kind "teacher" (the team's held-out adversary, adversary_flips' omitted lever at m = 1, 4, 16, 64, 256 as flip_m, the
 point F1 and N, N_real, C and C with flips), overall and by locality (heldout50_locality.jsonl).
@@ -37,6 +38,21 @@ def summaries(d: Path) -> dict:
             if line.strip():
                 r = json.loads(line)
                 out[r["task"]] = {**{k: r["best"][k] for k in ("f1", "n", "reward", "size", "positions")}, "seconds": r["seconds"]}
+    return out
+
+
+def roles(d: Path) -> dict:
+    """Per <task>.json in d: its nodes (token-embedding inputs aside), stated connections, and the share of nodes with a
+    role (at least one stated connection in or out, the prediction counting as a reader)."""
+    out = {}
+    for f in sorted(d.glob("text*.json")):
+        if not f.stem[4:].isdigit():
+            continue
+        a = json.loads(f.read_text())
+        real = [i for i, n in enumerate(a["nodes"]) if n[0] != "tok"]
+        ends = {i for e in a.get("edges") or [] for i in e if i != "out"}
+        out[f.stem] = {"nodes": len(real), "edges": len(a.get("edges") or []),
+                       "role_share": sum(i in ends for i in real) / len(real) if real else None}
     return out
 
 
@@ -82,6 +98,9 @@ def main():
         SA, SB = summaries(args.teacher[0]), summaries(args.teacher[1])
         print(f"teacher.py summaries (node semantics): {len(set(SA) & set(SB))} texts in both")
         compare(SA, SB, args.a, args.b, ("f1", "n", "reward", "size", "positions", "seconds"))
+        RA, RB = roles(args.teacher[0]), roles(args.teacher[1])
+        print(f"circuits' connections: {len(set(RA) & set(RB))} texts in both")
+        compare(RA, RB, args.a, args.b, ("role_share", "nodes", "edges"))
     if args.adv and all(p.exists() for p in args.adv):
         VA, VB = ({json.loads(x)["task"]: json.loads(x) for x in p.read_text().splitlines() if x.strip()} for p in args.adv)
         print(f"held-out adversary (teacher_v3.py --evaluate): {len(set(VA) & set(VB))} texts in both")

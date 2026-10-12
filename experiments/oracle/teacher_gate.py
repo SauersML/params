@@ -26,7 +26,7 @@ import json
 import random
 from pathlib import Path
 
-FIELDS = ("f1_live", "n_live", "f3", "f1_off", "n_off", "bits", "nodes", "changed_recovered_live", "f2_recovered_live", "carry_completeness",
+FIELDS = ("f1_live", "n_live", "f3", "stranded", "f1_off", "n_off", "bits", "nodes", "changed_recovered_live", "f2_recovered_live", "carry_completeness",
           "n_real_live")
 
 
@@ -140,7 +140,7 @@ def main():
             local = {json.loads(x)["task"]: json.loads(x)["local"] for x in args.labels.read_text().splitlines() if x.strip()}
         fields = ("flipc_1", "flipc_4", "flipc_16", "flipc_64", "flipc_256", "flips_to_half", "flips_to_break", "s_point_c", "n_point",
                   "n_real", "s_point", "s_wiring", "reliance_on_cuts", "flip_1", "flip_4", "dreads_edges", "dreads_nodes",
-                  "dreads_interchange", "c", "c_flips", "nodes", "size")
+                  "dreads_interchange", "c", "c_flips", "stranded", "nodes", "size")
         for name, keep in (("all", lambda t: True), ("non-local", lambda t: local.get(t) is False), ("local", lambda t: local.get(t) is True)):
             ts = [t for t in set(FA) & set(FB) if keep(t)]
             if ts:

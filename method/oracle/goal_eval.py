@@ -1479,7 +1479,7 @@ class GoalEval:
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
         pick = torch.randperm(len(pool["sources"]), generator=gen)[:k].tolist()
-        pats = [pattern(pool, i) for i in pick]
+        pats = [pattern(pool, i) for i in pick] if patterns else []  # (patterns off: drawn, never switched on)
         cols = {}
         for n in nat.names:
             parts = [tx.vpd[n].any(0).nonzero().flatten()] + [p[n].to(dev) for p in pats if n in p and patterns]
@@ -1535,12 +1535,15 @@ class GoalEval:
             w = torch.cat([x for _, x, _ in its])
             uc, mv = {}, {}
             for n in nat.names:  # every row's masks at once
-                a = _PatternOr.apply(w, P[n])  # [rows, columns]: the OR of the patterns on
-                uc[n] = free[n][circ] * a[:, None, :]
+                if patterns:
+                    a = _PatternOr.apply(w, P[n])  # [rows, columns]: the OR of the patterns on
+                    uc[n] = free[n][circ] * a[:, None, :]
+                else:  # the pattern lever off: a = 0, outside the circuit only the omissions
+                    uc[n] = torch.zeros(len(circ), T, len(cols[n]), device=dev)
                 if fl[n] is not None:  # the omissions (disjoint from free)
                     uc[n] = uc[n].index_put(fl[n], torch.cat([b[n].reshape(-1) for _, _, b in its]), accumulate=True)
                 if vpd:
-                    mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :]
+                    mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :] if patterns else vpd_on[n].float().expand(len(circ), -1, -1)
             kc = []
             if ns:  # C's semantics (graph inside, masked outside): the stated circuits as one list of graphs
                 sk = key[:sum(1 for i, _ in key if not graphs[i].complete)]

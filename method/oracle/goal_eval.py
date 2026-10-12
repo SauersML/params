@@ -223,6 +223,19 @@ def _fid(e0: float, kc: float, kv: float) -> float | None:
     return _clip01(math.log(e0 / max(kc, 1e-12)) / math.log(e0 / max(kv, 1e-12)))
 
 
+def _read_error(pairs: dict) -> float | None:
+    """C's second observable: per circuit node, the relative RMS error of its read in the circuit's run against the
+    model's under a family's interventions, sqrt(mean (r_model - r_circuit)^2) / sqrt(mean r_model^2) over the draws
+    (pairs: node -> [(r_model, r_circuit)]); the mean over nodes (None without any)."""
+    errs = []
+    for xs in pairs.values():
+        m = np.array([a for a, _ in xs], dtype=float)
+        c = np.array([b for _, b in xs], dtype=float)
+        if len(m) and np.mean(m ** 2) > 0:
+            errs.append(float(np.sqrt(np.mean((m - c) ** 2) / np.mean(m ** 2))))
+    return float(np.mean(errs)) if errs else None
+
+
 def _drop_nodes(g: native.Graph, drop: set) -> native.Graph:
     """A stated graph without some nodes and every connection to or from them."""
     nodes = [nd for nd in g.nodes if nd not in drop]
@@ -432,7 +445,8 @@ class GoalEval:
         return sum(int(m.sum()) for m in tx.vpd.values()) * math.log2(nat.positions(tx.targets) * sum(nat.C.values()))
 
     def graph_ref(self, ids: list[int], targets: list[int], graph: native.Graph, u: dict | None = None, live: bool = True,
-                  record: dict | None = None, patch: dict | None = None, cuts: dict | None = None) -> torch.Tensor:
+                  record: dict | None = None, patch: dict | None = None, cuts: dict | None = None,
+                  reads: list | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of a stated graph's run in C's semantics (the lead's decision, 10-12):
         inside the circuit, graph semantics, each circuit node reading the full residual stream less the outputs of the
         circuit nodes that are not its stated parents (the background and its stated parents; a value's share through
@@ -441,8 +455,8 @@ class GoalEval:
         [B, T, C]}, None: 0) and the remainders (live) reading the full stream, the circuit's outputs included, as in
         the real model. Query and key nodes enter their layer's attention pattern. A forward pass written out, the
         reference engine.Engine's graph mode matches; differentiable in u. With every connection stated it is the
-        masked run of the circuit's subcomponents and u. record: receives each circuit node's read (its activation)
-        {node: [B]}; patch: {node: value} fixes those subcomponents' activations (an interchange); cuts: {reader node or
+        masked run of the circuit's subcomponents and u. record: receives each read's activation {node: [B]} (reads:
+        those subcomponents; by default a stated graph's nodes); patch: {node: value} fixes those subcomponents' activations (an interchange); cuts: {reader node or
         None (the prediction): [writer nodes]}, connections cut besides the unstated ones (a complete graph, VPD's
         answer or the whole model as masks, has none unstated: its nodes read each other in full)."""
         import vpd_model
@@ -518,7 +532,7 @@ class GoalEval:
                 if ws:
                     xt[:, j] = xt[:, j] - sum(write(w) for w in ws)
         if record is not None:
-            for nd in (sorted(graph.node_set()) if not graph.complete else nodes):
+            for nd in (reads if reads is not None else (sorted(graph.node_set()) if not graph.complete else [])):
                 record[nd] = a[nd[0]][:, nd[1], nd[2]].detach()
         return torch.log_softmax((vpd_model.rms(xt, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
 
@@ -844,7 +858,7 @@ class GoalEval:
 
     def fidelity(self, tx: Text, graphs: list[native.Graph], pool: dict | None = None, draws: int = DRAWS,
                  steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE, fresh: dict | None = None,
-                 interchange: int = 0, real: bool = False) -> list[dict]:
+                 interchange: int = 0, real: bool = False, reads: bool = False) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -856,19 +870,21 @@ class GoalEval:
         parts switched on (adversary_flips, the omitted lever: f1_flips_omitted by m); c, the mean of s_point, s_nodes,
         s_edges and f1_flips_omitted at FLIP_TERM (the reward's adversarial member, the lead's decision 10-12; the
         step-budget f1_adv is a reported column); flips_to_break, the smallest m at which f1_flips_omitted falls below
-        half of s_point (None: not within FLIPS). Evaluation only, never in the reward or a teacher's objective:
+        half of s_point (None: not within FLIPS). reads: C's second observable, the circuit nodes' relative RMS read
+        error between the model and the circuit per family (reads_nodes, reads_edges, reads_interchange; graph_ref,
+        slower). Evaluation only, never in the reward or a teacher's objective:
         fresh, a pool none of the searches drew from: the pattern lever's flips over it (f1_flips_patterns_fresh);
         interchange > 0: that many interchange draws (_interchange_family, s_interchange); real: N_real (real_removal,
         n_real)."""
         e0 = self._bounds(tx, "live")[0]
         point = self.sufficiency(tx, graphs)
-        nodes = self._node_family(tx, graphs, draws)
-        edges = self._edge_family(tx, graphs, draws)
+        nodes = self._node_family(tx, graphs, draws, reads)
+        edges = self._edge_family(tx, graphs, draws, reads)
         adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool else [{} for _ in graphs]
         flips = self.adversary_flips(tx, graphs, pool, "omitted", steps=steps, restarts=restarts) if pool else [{} for _ in graphs]
         none = [{} for _ in graphs]
         fresh_rows = self.adversary_flips(tx, graphs, fresh, "patterns", steps=steps, restarts=restarts) if fresh else none
-        inter = self._interchange_family(tx, graphs, interchange) if interchange else none
+        inter = self._interchange_family(tx, graphs, interchange, reads=reads) if interchange else none
         reals = self.real_removal(tx, graphs) if real else none
         out = []
         for g, pt, nd, ed, ad, fl, fr, it, rr in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals):
@@ -914,7 +930,7 @@ class GoalEval:
         return out
 
     @torch.no_grad()
-    def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int) -> list[dict]:
+    def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int, reads: bool = False) -> list[dict]:
         """Per circuit, the node-removal family: draws of its nodes removed from the model, from VPD's answer and from
         the circuit (a stated graph keeps its connections among the rest), the mean KLs from the model's. The runs
         multiply only the circuits' and VPD's subcomponents (engine.Engine's columns; the model's run with every other
@@ -935,7 +951,7 @@ class GoalEval:
         for g in graphs:
             nodes = sorted(g.node_set())
             if not nodes:
-                out.append({"kl_nodes_c": self._bounds(tx, "live")[0], "kl_nodes_vpd": self._bounds(tx, "live")[1]})
+                out.append({"kl_nodes_c": self._bounds(tx, "live")[0], "kl_nodes_vpd": self._bounds(tx, "live")[1], "reads_nodes": None})
                 continue
             rng = self._rng(tx, g, "nodes")
             drops = []
@@ -959,24 +975,42 @@ class GoalEval:
                 lc = Ec.log_probs(without(gm, drops, at))
             else:
                 lc = self._graph_logq(tx.ids, tx.targets, [_drop_nodes(g, set(d)) for d in drops])  # C's semantics (graph_ref)
-            out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean())})
+            pairs = {}  # the reads of the nodes each draw keeps, in the model and the circuit (graph_ref)
+            for d in (drops if reads else []):
+                keep = [nd for nd in nodes if nd not in set(d)]
+                ones = {n: torch.ones(T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
+                for n, t, c in d:
+                    ones[n][t, c] = False
+                gc = _drop_nodes(g, set(d)) if not g.complete else native.Graph(masks={n: m.clone() for n, m in self.masks(g, T).items()})
+                if g.complete:
+                    for n, t, c in d:
+                        gc.masks[n][t, c] = False
+                rm, rc = {}, {}
+                self.graph_ref(tx.ids, tx.targets, native.Graph(masks=ones), record=rm, reads=keep)
+                self.graph_ref(tx.ids, tx.targets, gc, record=rc, reads=keep)
+                for nd in keep:
+                    pairs.setdefault(nd, []).append((float(rm[nd][0]), float(rc[nd][0])))
+            out.append({"kl_nodes_c": float(carry.kl(lm, lc).mean()), "kl_nodes_vpd": float(carry.kl(lm, lv).mean()),
+                        "reads_nodes": _read_error(pairs) if reads else None})
             native.free(dev)
         return out
 
     @torch.no_grad()
-    def _edge_family(self, tx: Text, graphs: list[native.Graph], draws: int) -> list[dict]:
+    def _edge_family(self, tx: Text, graphs: list[native.Graph], draws: int, reads: bool = False) -> list[dict]:
         """Per circuit, the connection-cut family: draw j cuts a random subset of the stated connections into one
         reader (the prediction among the readers) in the model, in VPD's answer and in the circuit, all in C's
         semantics (the reader reads its input without those writers' outputs); the mean KLs from the model's. A
         circuit without connections: None. Every draw of a side runs in one batch on the engine (_sides)."""
         sides = self._sides(tx, graphs)
+        model_graph = native.Graph(masks={n: torch.ones(tx.T, self.nat.C[n], dtype=torch.bool, device=self.nat.dev)
+                                          for n in self.nat.names})
         out = []
         for g in graphs:
             nodes = g.node_set()
             par, outs = (native.all_edges(nodes, tx.targets) if g.complete else (g.parents, g.out))
             readers = [r for r in sorted(par) if par[r]] + ([None] if outs else [])
             if not readers:
-                out.append({"kl_edges_c": None, "kl_edges_vpd": None})
+                out.append({"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None})
                 continue
             rng = self._rng(tx, g, "edges")
             cuts = []
@@ -985,7 +1019,17 @@ class GoalEval:
                 ws = list(par[r]) if r is not None else list(outs)
                 cuts.append({r: [w for w in ws if rng.random() < (j + 0.5) / draws] or [ws[int(rng.integers(len(ws)))]]})
             lm, lv, lc = sides(g, cuts=cuts)
-            out.append({"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean())})
+            row = {"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean()), "reads_edges": None}
+            if reads:  # the circuit nodes' reads under each draw, model and circuit (graph_ref)
+                nl, pairs = sorted(nodes), {}
+                for cut in cuts:
+                    rm, rc = {}, {}
+                    self.graph_ref(tx.ids, tx.targets, model_graph, cuts=cut, record=rm, reads=nl)
+                    self.graph_ref(tx.ids, tx.targets, g, cuts=cut, record=rc, reads=nl)
+                    for nd in nl:
+                        pairs.setdefault(nd, []).append((float(rm[nd][0]), float(rc[nd][0])))
+                row["reads_edges"] = _read_error(pairs)
+            out.append(row)
             native.free(self.nat.dev)
         return out
 
@@ -1038,7 +1082,8 @@ class GoalEval:
         return sides
 
     @torch.no_grad()
-    def _interchange_family(self, tx: Text, graphs: list[native.Graph], draws: int = 16, ranks=(0, 1, 2)) -> list[dict]:
+    def _interchange_family(self, tx: Text, graphs: list[native.Graph], draws: int = 16, ranks=(0, 1, 2),
+                            reads: bool = False) -> list[dict]:
         """Evaluation only (never in the reward or a teacher's objective): per circuit, interchange interventions with
         the identity alignment. Draw j takes a position p among the circuit's (after 0) and one of the model's ranks
         likeliest other tokens there (carry.alternatives), and sets the circuit's subcomponents at p to their
@@ -1058,12 +1103,13 @@ class GoalEval:
             return source[(p, z)]
 
         sides = self._sides(tx, graphs)
+        model_graph = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names})
         out = []
         for g in graphs:
             nodes = sorted(g.node_set())
             positions = sorted({t for _, t, _ in nodes if t > 0})
             if not positions:
-                out.append({"kl_interchange_c": None, "kl_interchange_vpd": None})
+                out.append({"kl_interchange_c": None, "kl_interchange_vpd": None, "reads_interchange": None})
                 continue
             rng = self._rng(tx, g, "interchange")
             patch = []
@@ -1075,7 +1121,19 @@ class GoalEval:
                 patch.append({nd: rec[nd[0]][0, nd[1], nd[2]] for nd in nodes if nd[1] == p})
             lm, lv, lc = sides(g, patch=patch)
             native.free(dev)
-            out.append({"kl_interchange_c": float(carry.kl(lm, lc).mean()), "kl_interchange_vpd": float(carry.kl(lm, lv).mean())})
+            row = {"kl_interchange_c": float(carry.kl(lm, lc).mean()), "kl_interchange_vpd": float(carry.kl(lm, lv).mean()),
+                   "reads_interchange": None}
+            if reads:  # the reads of the circuit's nodes at other positions, model and circuit (graph_ref)
+                pairs = {}
+                for vals in patch:
+                    rest = [nd for nd in nodes if nd not in vals]
+                    rm, rc = {}, {}
+                    self.graph_ref(tx.ids, tx.targets, model_graph, patch=vals, record=rm, reads=rest)
+                    self.graph_ref(tx.ids, tx.targets, g, patch=vals, record=rc, reads=rest)
+                    for nd in rest:
+                        pairs.setdefault(nd, []).append((float(rm[nd][0]), float(rc[nd][0])))
+                row["reads_interchange"] = _read_error(pairs)
+            out.append(row)
         return out
 
 
@@ -1690,7 +1748,7 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
         for k in sorted({g.count() for g in graphs}):
             graphs.append(native.Graph(order[:k], complete=True))
             kinds.append(f"VPD top {k}")
-        fid = ge.fidelity(tx, graphs, M, draws=draws, curve=curve, fresh=F, interchange=interchange, real=True)
+        fid = ge.fidelity(tx, graphs, M, draws=draws, curve=curve, fresh=F, interchange=interchange, real=True, reads=True)
         e, v = ge._bounds(tx, "live")
         scale = ge.size_scale(tx)
         with open(out, "a") as fh:
@@ -1756,6 +1814,7 @@ def fidelity_table(rows: list[dict]) -> str:
              ("interchange", lambda r: r.get("s_interchange"))]
     held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
     held += [("N_real", lambda r: r.get("n_real")), ("C", lambda r: r.get("c"))]
+    held += [(f"read err {f}", lambda r, f=f: r.get(f"reads_{f}")) for f in ("nodes", "edges", "interchange")]
     stepcols = [(f"adv@{m}", lambda r, m=m: _curve_value(r.get("f1_adv_curve"), m)) for m in steps]
     sample = [("F1", lambda r: r["s_point"]), ("N", lambda r: r["n_point"]), ("size", lambda r: r.get("size"))]
     return "\n\n".join([block("Tests the searches never optimized (VPD top k: VPD's own order)", held),

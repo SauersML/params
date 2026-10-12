@@ -639,6 +639,16 @@ def test_fidelity_vpds_answer_is_its_own_ceiling(tiny):
     for k in ("s_point", "s_nodes", "s_edges", "f1_adv", "f1_adv_random", "c", "s_interchange"):
         assert row[k] is not None and abs(row[k] - 1) < 1e-4, (k, row[k])
     assert all(abs(v - 1) < 1e-4 for v in row["f1_flips_patterns_fresh"].values()) and row["n_real"] is not None
+    sub = sorted(g.node_set())[::4]
+    whole = native.Graph(sub, *native.all_edges(sub, tx.targets))  # every connection: reads equal the masked run's
+    row = ge.fidelity(tx, [whole], pool, draws=3, steps=1, restarts=1, curve=(0,), interchange=2, reads=True)[0]
+    for k in ("reads_nodes", "reads_edges", "reads_interchange"):
+        assert row[k] is not None and row[k] >= 0, (k, row[k])
+
+
+def test_read_error():
+    pairs = {("a", 0, 0): [(1.0, 1.0), (2.0, 2.0)], ("b", 0, 0): [(1.0, 0.0), (1.0, 0.0)], ("c", 0, 0): [(0.0, 3.0)]}
+    assert abs(goal_eval._read_error(pairs) - 0.5) < 1e-12  # a: 0, b: 1, c: no model read (skipped)
 
 
 def test_fidelity_cuts_and_removals(tiny):

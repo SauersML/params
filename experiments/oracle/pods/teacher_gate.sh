@@ -60,6 +60,6 @@ for s in a b; do (python -B goal_eval.py fidelity --split heldout --n $N --teach
 RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=16 RP_MIN_RAM_GB=16 \
   experiments/infra/runpod/rp-run $RN "$GPU" 3.0 -- bash -c "$CMD" > "$F/rp_score.log" 2>&1
 [ -s "$O/score.json" ] || { echo "no scores: $O/score.log, $F/rp_score.log"; exit 1; }
-{ cat "$G/README.txt" 2> /dev/null; /usr/bin/python3 -I experiments/oracle/teacher_gate.py "$O/score.json" a b --teacher "${dirs[0]}" "${dirs[1]}" --adv "$O/adv_a.jsonl" "$O/adv_b.jsonl" --fidelity "$O/fid_a.jsonl" "$O/fid_b.jsonl"; } | tee "$O/gate.txt"
+{ cat "$G/README.txt" 2> /dev/null; echo "scored at $(sed -nE 's/.* source ([0-9a-f]+):.*/\1/p' "$O/rp-run.log" | tail -1) (goal_eval, teacher_v3 --evaluate; both arms at this commit)"; /usr/bin/python3 -I experiments/oracle/teacher_gate.py "$O/score.json" a b --teacher "${dirs[0]}" "${dirs[1]}" --adv "$O/adv_a.jsonl" "$O/adv_b.jsonl" --fidelity "$O/fid_a.jsonl" "$O/fid_b.jsonl"; } | tee "$O/gate.txt"
 exit
 }

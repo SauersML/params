@@ -113,6 +113,11 @@ OP_RE = re.compile(r"\s*(persistent\s+)?(?:cut\s+(\S+)\s*<-\s*(\S+)|scale\s+(\S+
 PATTERN_RE = re.compile(r"PATTERN\s+(?:L(\d+)@(\d+)\s*:\s*)?(\S+)\s*~\s*(\S+)", re.I)  # a stated query-key pair
 VAR_LINE = re.compile(r"\s*V\d+\b")  # a line of the EXPLANATION's VARIABLES block (VAR_RE when it parses)
 VAR_RE = re.compile(r'\s*V(\d+)\s+"(.*?)"\s*:\s*(.*);\s*inputs\s*:\s*(.*?)\s*;\s*carried\s+by\s*:\s*(.*?)\s*;\s*feeds\s*:\s*(.*?)\s*', re.I)
+BLOCK_ITEM = r"L\d+\.(?:q|k|v|o|fc|down)\s+@\d+(?:-\d+)?"  # a carrier block: a site's whole output at positions a..b
+BLOCK_ITEM_RE = re.compile(r"L(\d+)\.(q|k|v|o|fc|down)\s+@(\d+)(?:-(\d+))?")
+CARRIER_RE = re.compile(rf"{BLOCK_ITEM}|{_W}")
+CARRIERS_RE = re.compile(rf"\s*(?:{BLOCK_ITEM}|{_W})(?:\s*,\s*(?:{BLOCK_ITEM}|{_W}))*\s*")
+INSTANCES_RE = re.compile(r"\(\s*instances\s*:\s*(.*?)\s*\)\s*$", re.I)
 QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")  # a token's repr in an inputs list
 
 SIZE_WEIGHT = 0.5
@@ -322,7 +327,8 @@ def _variables(text: str, ids: dict) -> tuple[list[dict], str, int]:
     """The EXPLANATION's VARIABLES block (variable_text()'s lines), its prose (every other line) and the variable lines
     that are malformed: a line that does not parse, or names no subcomponent (by the circuit's ids or written out; the
     token embedding is no subcomponent). Variables in variables.py's JSON: {"name", "meaning", "inputs" (positions),
-    "group" ([matrix, index, position], as circuit JSON nodes), "feeds" (variable names or "prediction")}."""
+    "group" ([matrix, index, position], as circuit JSON nodes, or ["block", matrix, position], a site's whole output
+    there), "feeds" (variable names or "prediction"), "instances" (informational, [matrix, index, position])}."""
     got, prose, bad = [], [], 0
     for line in text.splitlines():
         s = line.strip()
@@ -332,22 +338,46 @@ def _variables(text: str, ids: dict) -> tuple[list[dict], str, int]:
             prose.append(line)
             continue
         m = VAR_RE.fullmatch(s)
-        group = []
-        if m and REFS_RE.fullmatch(m[5]):
-            for w in (x.strip() for x in GROUP_SPLIT.findall(m[5])):
-                group += [nd for nd in ([ids[w]] if w in ids else (group_of(w) or [])) if nd[0] != TOK]
+        group, instances = _carriers(m[5], ids) if m else ([], [])
         if not group:
             bad += 1
             continue
         rest = QUOTED.sub("", m[4])
         inputs = {int(x) for x in re.findall(r"@(\d+)", rest)} or {int(x) for x in re.findall(r"\b(\d+)\b", rest)}
         feeds = [x.strip() for x in m[6].split(",") if x.strip()]
-        got.append((int(m[1]), {"name": m[2], "meaning": m[3].strip(), "inputs": sorted(inputs),
-                                "group": [[n, c, t] for n, t, c in sorted(set(group))], "feeds": feeds}))
+        got.append((int(m[1]), {"name": m[2], "meaning": m[3].strip(), "inputs": sorted(inputs), "group": group, "feeds": feeds}
+                    | ({"instances": instances} if instances else {})))
     names = {f"V{k}": v["name"] for k, v in got}
     for _, v in got:  # V<j> -> its name, PREDICTION (or OUT) -> "prediction"
         v["feeds"] = ["prediction" if f.upper() in ("PREDICTION", "OUT") else names.get(f.upper(), f) for f in v["feeds"]]
     return [v for _, v in got], "\n".join(prose).strip(), bad
+
+
+def _carriers(text: str, ids: dict) -> tuple[list, list]:
+    """A variable's "carried by" field: (its group in variables.py's JSON, its instances). Blocks "L1.v @232-233" (each
+    position a ["block", matrix, position]) and subcomponents by the circuit's ids or written out ([matrix, index,
+    position]; the token embedding is none); "(instances: ...)" at the end lists subcomponents inside the blocks, kept
+    apart (not scored). A field with anything else in it gives no group."""
+    import native
+
+    inst = []
+    m = INSTANCES_RE.search(text)
+    if m:
+        text = text[:m.start()]
+        if REFS_RE.fullmatch(m[1]):
+            inst = sorted({(nd[0], nd[1], nd[2]) for w in GROUP_SPLIT.findall(m[1])
+                           for nd in ([ids[w]] if w in ids else (group_of(w) or [])) if nd[0] != TOK})
+    if not CARRIERS_RE.fullmatch(text):
+        return [], []
+    group = set()
+    for x in CARRIER_RE.findall(text):
+        b = BLOCK_ITEM_RE.fullmatch(x)
+        if b:
+            site = native.site_name(int(b[1]), KINDS[b[2]])
+            group |= {("block", site, t) for t in range(int(b[3]), int(b[4] or b[3]) + 1)}
+        else:
+            group |= {(nd[0], nd[2], nd[1]) for nd in ([ids[x]] if x in ids else (group_of(x) or [])) if nd[0] != TOK}
+    return [list(g) for g in sorted(group, key=str)], [[n, c, t] for n, t, c in inst]
 
 
 def _place(nd) -> tuple:
@@ -398,15 +428,34 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
 
 
 def variable_text(v: dict, k: int, numbers: dict, name: dict, strings: list[str] | None = None) -> str:
-    """A variable's line: V<k> "<name>": <meaning>; inputs: @<position> <token>, ...; carried by: <ids> (subcomponents
-    outside the circuit written out); feeds: V<j>, ... or PREDICTION. v in variables.py's JSON; numbers: variable name
-    -> V<j>; name: the circuit's ids (_id_lines)."""
+    """A variable's line: V<k> "<name>": <meaning>; inputs: @<position> <token>, ...; carried by: <blocks, L1.v @232-233
+    (a site's whole output at those positions)>, <subcomponents by id, written out outside the circuit> (instances:
+    <subcomponents inside the blocks, informational>); feeds: V<j>, ... or PREDICTION. v in variables.py's JSON;
+    numbers: variable name -> V<j>; name: the circuit's ids (_id_lines)."""
     import goal_eval
 
-    group = sorted(((goal_eval._site(m), t, c) for m, c, t in v["group"]), key=_place)
+    blocks = {}
+    for it in v["group"]:
+        if it[0] == "block":
+            blocks.setdefault(goal_eval._site(it[1]), []).append(int(it[2]))
+    group = sorted(((goal_eval._site(m), t, c) for m, c, t in (it for it in v["group"] if it[0] != "block")), key=_place)
+    ref = lambda nd: name[nd] if nd in name else node_text(nd)  # noqa: E731
+    items = []
+    for site in sorted(blocks, key=lambda n: _place((n, max(blocks[n]), 0))):
+        ts = sorted(set(blocks[site]))
+        runs = [[ts[0], ts[0]]]
+        for t in ts[1:]:
+            if t == runs[-1][1] + 1:
+                runs[-1][1] = t
+            else:
+                runs.append([t, t])
+        short = f"L{site.split('.')[1]}.{CODES[site.split('.')[-1]]}"
+        items += [f"{short} @{a}" + (f"-{b}" if b > a else "") for a, b in sorted(runs, reverse=True)]
+    items += [ref(nd) for nd in group]
+    inst = sorted(((goal_eval._site(m), t, c) for m, c, t in v.get("instances") or []), key=_place)
+    carried = ", ".join(items) + (" (instances: " + ",".join(ref(nd) for nd in inst) + ")" if inst else "")
     inputs = ", ".join(f"@{p} {shown(strings[p])}" if strings else f"@{p}" for p in v["inputs"])
     feeds = ", ".join("PREDICTION" if f == "prediction" else numbers.get(f, f) for f in v["feeds"]) or "PREDICTION"
-    carried = ",".join(name[nd] if nd in name else node_text(nd) for nd in group)
     return f'V{k} "{v["name"]}": {v["meaning"]}; inputs: {inputs}; carried by: {carried}; feeds: {feeds}'
 
 
@@ -1545,7 +1594,8 @@ def writer_prompt(f: dict) -> str:
         lines.append("Variables of this circuit (each a group of its subcomponents that carries what is computed from its input "
                      "tokens: verified by changing an input token and setting the group to its values on the changed text):")
         for k, v in enumerate(f["variables"], 1):
-            nodes = ", ".join(node_text((goal_eval._site(m), t, c)) for m, c, t in v["group"])
+            nodes = ", ".join((f"{node_text((goal_eval._site(it[1]), int(it[2]), 0)).split('#')[0]} @{it[2]} (its whole output)"
+                               if it[0] == "block" else node_text((goal_eval._site(it[0]), it[2], it[1]))) for it in v["group"])
             lines.append(f"- V{k} (provisional name {v['name']!r}): inputs " + ", ".join(f"{q} ({f['tokens'][str(q)]!r})" for q in v["inputs"])
                          + f"; carried by {nodes}; feeds " + (", ".join(v["feeds"]) or "prediction")
                          + (f"; measured: {json.dumps(v['measured'])}" if v.get("measured") else ""))

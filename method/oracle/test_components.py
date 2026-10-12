@@ -416,3 +416,21 @@ def test_question_shows_the_measured_arm_when_present(tiny):
     shown = components.question(task, {**ev, "acts": acts, "attention": {"0": [[[3, 0.5], [2, 0.25]]], "1": [[[7, 0.9]]]}})
     assert "ranked by causal importance x |activation|" in shown and "L0: h0 3 0.50, 2 0.25" in shown and "L1: h0 7 0.90" in shown
     assert "; +1.50" in shown and "attention at the target" not in plain and "ranked by" not in plain
+
+
+def test_variable_blocks_and_instances_round_trip():
+    """A carrier block "L1.v @232-233" is the site's whole output at each position (["block", matrix, position]);
+    instances inside the blocks are kept apart; written out, by id, or mixed with subcomponents, it parses back."""
+    text = "\n".join(["CIRCUIT:", "@235 a=L3.down#2 b=L1.v#433", "OUT <- a", "a <- b", "EXPLANATION:", "VARIABLES:",
+                      "V1 \"copied word\": the word; inputs: @232 ' for', @233 ' each'; carried by: L1.v @232-233, L2.v @233, a (instances: L1.v#433@233,b); feeds: PREDICTION",
+                      "V2 \"bad\": x; inputs: @1; carried by: L1.v @232 junk!; feeds: V1", "The model copies."])
+    p = components.parse(text)
+    v, = p["answer"]["variables"]
+    assert p["variables_malformed"] == 1
+    assert sorted(v["group"]) == sorted([["block", "h.1.attn.v_proj", 232], ["block", "h.1.attn.v_proj", 233],
+                                         ["block", "h.2.attn.v_proj", 233], ["h.3.mlp.down_proj", 2, 235]])
+    assert sorted(v["instances"]) == sorted([["h.1.attn.v_proj", 433, 233], ["h.1.attn.v_proj", 433, 235]])
+    again = components.render(p["answer"])
+    assert "carried by: L2.v @233, L1.v @232-233, a (instances: b,L1.v#433@233)" in again
+    q = components.parse(again)
+    assert q["answer"]["variables"][0]["group"] == v["group"] and sorted(q["answer"]["variables"][0]["instances"]) == sorted(v["instances"])

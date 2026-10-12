@@ -100,6 +100,30 @@ def test_blocks_and_stranded_nodes_use_fidelity_canonicalization(panel_tiny):
     assert raw['raw_score'] == explicit['raw_score']
 
 
+def test_explicit_query_key_pairs_and_token_edges_match_direct_graph(panel_tiny):
+    _, ge, tx = panel_tiny
+    q = (native.site_name(0, 'q_proj'), 7, 0)
+    k = (native.site_name(0, 'k_proj'), 0, 0)
+    o = (native.site_name(0, 'o_proj'), 7, 0)
+    g = native.Graph([q, k, o], {}, [o])
+    g.pairs = {(0, 7): [(q, k)]}
+    g.tok_edges, g.tok_positions = [(7, q), (0, k)], [0, 7]
+    g.tok_out = [7]
+    row = intervention_panel.evaluate(ge, tx, [g], draws=4)[0]
+    full = {n: torch.ones(tx.T, ge.nat.C[n], dtype=torch.bool) for n in ge.nat.names}
+    canonical = goal_eval._c_graph(g, tx.targets, ge.nat.C)
+    variants = []
+    for d in row['draws']:
+        removed = {tuple(nd) for nd in d['removed']}
+        h = goal_eval._drop_nodes(canonical, removed)
+        h.tok_edges = [(t, r) for t, r in canonical.tok_edges if r not in removed]
+        h.tok_positions, h.tok_out = [0, 7], [7]
+        variants.append(h)
+    lm = ge.runs(tx.ids, tx.targets, [_masked(full, d['removed']) for d in row['draws']], True)
+    lc = ge._graph_logq(tx.ids, tx.targets, variants)
+    assert row['kl_candidate'] == pytest.approx(float(carry.kl(lm, lc).mean()), rel=1e-4, abs=2e-5)
+
+
 def test_unresolved_reference_is_common_and_bootstrap_is_paired(panel_tiny):
     _, ge, tx = panel_tiny
     panel = intervention_panel.bank(tx, draws=3)

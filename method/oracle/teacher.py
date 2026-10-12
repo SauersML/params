@@ -126,6 +126,13 @@ MAX_NODES = 266       # the answer budget in nodes: components.ANSWER_BUDGET (3,
 LEVELS = ("position", "site", "chunk64", "chunk16", "chunk4", "subcomponent")  # blocks, coarse to fine
 REPAIR_M = 4          # the omitted lever's budget the flip repair answers (goal_eval.adversary_flips; the reward's term)
 ACCEPT_BATCH = 8      # Descent.prune's accept checks per call: the largest prefixes within the budget first
+KL_FLOOR = 1e-9       # a KL's floor before a fractional power (goal_eval.recovered_log's): a nearly exact answer's KL can
+# round below 0, and a negative base to a fractional power is complex (fleet's planted toys)
+
+
+def kl_budget(empty: float, kl: float, f: float = RECOVERED) -> float:
+    """The KL at log-scale recovery f between empty and kl, KL_empty^(1 - f) KL^f, both floored at KL_FLOOR."""
+    return max(empty, KL_FLOOR) ** (1 - f) * max(kl, KL_FLOOR) ** f
 POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # the shared adversary's pool (search side)
 
 
@@ -837,7 +844,7 @@ class Connector:
         self.levels = levels      # edge_path's levels in turn (coarse ones first: "writer", "reader"; then "connection")
         self.robust = robust      # the adversary's pool: connection removals also keep F1 under the omitted lever's flips
         self.no_strand = no_strand  # every non-query/key node keeps a stated connection
-        self.budget = empty ** (1 - RECOVERED) * vpd ** RECOVERED
+        self.budget = kl_budget(empty, vpd)
         self.index = {nd: i for i, nd in enumerate(pr.nodes)}
 
     def connect(self, on: torch.Tensor, n: float, keep: set | None = None, new=()) -> tuple:
@@ -1020,7 +1027,7 @@ def state_pairs(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph,
     graph = goal_eval.strand(graph, tx.targets, ge.nat.C)
     kl_c = ge.graph_kl(tx, [graph], live)[0]
     f1 = goal_eval.recovered_log(empty, kl_c, vpd)
-    budget = empty * (vpd / empty) ** RECOVERED if f1 is not None and f1 >= RECOVERED else empty * (kl_c / empty) ** RECOVERED
+    budget = kl_budget(empty, vpd) if f1 is not None and f1 >= RECOVERED else kl_budget(empty, kl_c)
     nodes = sorted(graph.node_set())
     kinds = {nd: native._name_layer_kind(nd[0]) for nd in nodes}
     reads = sorted({(L, nd[1]) for nd, (L, k) in kinds.items() if k == "o_proj"})
@@ -1154,7 +1161,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         for n, t, c in saved_start:
             tx.vpd[n][t, c] = True
     empty, vpd = ge._bounds(tx, CONVENTION)
-    budget = empty ** (1 - RECOVERED) * vpd ** RECOVERED
+    budget = kl_budget(empty, vpd)
     pr = Pruner(ge, tx, tx.vpd, live=CONVENTION == "live", B=B)
     index = {nd: i for i, nd in enumerate(pr.nodes)}
     order = vpd_order if vpd_order is not None else nat._vpd_order(ids, targets)

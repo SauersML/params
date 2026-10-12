@@ -509,3 +509,10 @@ def test_block_connections_keep_their_floors():
     assert all(got[k] is None or got[k] >= f - 1e-6 for k, f in floor.items())
     back, bad = goal_eval.circuit(goal_eval.to_json(stated, ""), tx.targets, nat.C, tx.T)
     assert bad["invalid_nodes"] == 0 and bad["invalid_edges"] == 0 and set(back.node_set()) == set(stated.node_set())
+
+
+def test_kl_budget_takes_a_kl_rounded_below_zero():
+    # an exact answer's KL can round below 0 (fleet's planted toys): the budget stays a small positive real
+    b = teacher.kl_budget(80.0, -3e-8)
+    assert isinstance(b, float) and 0 < b < 1e-6
+    assert abs(teacher.kl_budget(80.0, 0.05) - 80.0 ** 0.1 * 0.05 ** 0.9) < 1e-12

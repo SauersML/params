@@ -56,6 +56,7 @@ RESCREEN = (4096, 1024)  # set sizes under which the singles are measured again
 FINE = 256  # and at every pruning step from this size down
 SIZES = (12, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024)  # the matched sizes reported by default (teachers' circuits)
 BATCH = 64  # removals per batched run
+JOINT_MAX = 4096  # the native joint path starts from at most this many of the F1 circuit's units (most needed first)
 STEP = 4  # each pruning step removes a STEP-th of the set
 
 
@@ -72,6 +73,9 @@ class Mask:
         """("head" | "neuron", layer, position, index) per unit."""
         return ([("head", l, t, h) for l, t, h in self.heads.nonzero().tolist()]
                 + [("neuron", l, t, j) for l, t, j in self.neurons.nonzero().tolist()])
+
+    def union(self, other: "Mask") -> "Mask":
+        return Mask(self.heads | other.heads, self.neurons | other.neurons)
 
     def without(self, units) -> "Mask":
         m = Mask(self.heads.clone(), self.neurons.clone())
@@ -181,11 +185,12 @@ class NativeUnits:
         return out
 
 
-def screen(nu: NativeUnits, S: Mask, base_kl: float, log=None) -> dict:
+def screen(nu: NativeUnits, S: Mask, base_kl: float, log=None, units: list | None = None) -> dict:
     """Unit -> its measured removal effect (KL of the set without it, minus the set's): heads one by one; MLPs as
     wholes at each (layer, position), then the neurons of those moving the prediction at least SCREEN_FLOOR as much
-    as the top MLP one by one (the others' neurons each get their MLP's effect divided among them)."""
-    units = S.units()
+    as the top MLP one by one (the others' neurons each get their MLP's effect divided among them). `units`: only
+    these of S's units (default all)."""
+    units = S.units() if units is None else units
     if len(units) <= RESCREEN[0]:
         return dict(zip(units, (k - base_kl for k in nu.kl(S, [[u] for u in units]))))
     heads = [u for u in units if u[0] == "head"]
@@ -372,10 +377,15 @@ class NativePruner:
 
 def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, log=print) -> dict:
     """The teacher's search (teacher.teach) on native units, remainders off: the F1 circuit, first from the units at the
-    targets alone (chunks of 4, then single units), else from every unit at every position (positions, sites, chunks of
-    64, 16 and 4, single units), each level by teacher.ROUNDS rounds of measured removal keeping F1 >= teacher.RECOVERED;
-    then teacher.joint_path's measured F1 and N path from it down to teacher.MIN_SIZE (no VPD order to union with), N
-    being removal from the whole model. Returns the F1 circuit, the path with each step's units, and the measured runs."""
+    targets alone (chunks of 4, then single units), else from every unit at the targets and F2's positions (positions,
+    sites, chunks of 64, 16 and 4, single units; every unit at every position, the analog of VPD's whole answer, is
+    millions of units against its tens of thousands), each level by teacher.ROUNDS rounds of measured removal keeping
+    F1 >= teacher.RECOVERED; then teacher.joint_path's measured F1 and N path from it (from its JOINT_MAX units whose
+    measured removal matters most when it is larger) down to teacher.MIN_SIZE (no VPD order to union with), N being
+    removal from the whole model, and joined, as teacher.top_k joins VPD's top k, by the smallest prefix (at most
+    teacher.K_MAX) with N >= teacher.N_TARGET of the native order: the units at the targets and F2's positions by
+    their measured removal from the whole model, most needed first (screen). Returns the F1 circuit, the top k, the
+    path with each step's units, and the measured runs."""
     import teacher
 
     t0 = time.perf_counter()
@@ -396,10 +406,38 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
         return levels[f"{label}{names[-1]}"]["kl"] <= budget
 
     reached = search(("chunk4", "subcomponent"), "target ")
-    if not reached:
-        pr.S = full
+    if not reached:  # from every unit at the targets and F2's positions (every unit at every position is millions)
+        pr.S = nu.at(sorted(set(tx.targets) | {q for q, _ in tx.f2}))
         search(teacher.LEVELS, "")
     f1_set = pr.S
+    f1_part = f1_set
+    if f1_part.count() > JOINT_MAX:  # the joint path from the units whose measured removal matters most
+        kl0 = nu.kl(f1_part)[0]
+        effect = screen(nu, f1_part, kl0, log)
+        pr.measured += len(effect) + 1
+        keep = sorted(f1_part.units(), key=lambda u: -effect[u])[:JOINT_MAX]
+        f1_part = f1_part.without(sorted(set(f1_part.units()) - set(keep)))
+
+    positions = sorted(set(tx.targets) | {q for q, _ in tx.f2})
+    kl_full = nu.kl(full)[0]
+    effect = screen(nu, full, kl_full, log, units=nu.at(positions).units())
+    pr.measured += len(effect) + 1
+    order = sorted(effect, key=lambda u: -effect[u])
+
+    def n_of(k):
+        pr.measured += 1
+        return teacher.scores(empty, vpd, empty, nu.kl(full, [order[:k]])[0])[1]
+
+    lo, hi = 0, min(teacher.K_MAX, len(order))
+    if n_of(hi) >= teacher.N_TARGET:
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            lo, hi = (lo, mid) if n_of(mid) >= teacher.N_TARGET else (mid, hi)
+    k = hi
+    top = Mask(torch.zeros_like(full.heads), torch.zeros_like(full.neurons))
+    for kind, l, t, j in order[:k]:
+        (top.heads if kind == "head" else top.neurons)[l, t, j] = True
+    start = f1_part.union(top)
 
     def measure(S: Mask, removals: list[list[tuple]]) -> list[dict]:
         """Each S-without-removal circuit's KL_C and KL of the whole model without it, F1, N and their mean."""
@@ -417,7 +455,8 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
             out.append({"kl_c": c, "kl_minus": m, "f1": f, "n": n, "mean": j})
         return out
 
-    S = f1_set
+    f1_row = measure(f1_set, [[]])[0]
+    S = start
     path = [{"size": S.count(), "units": S.units(), **measure(S, [[]])[0]}]
     while S.count() > teacher.MIN_SIZE:
         units = S.units()
@@ -429,9 +468,9 @@ def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, lo
         i = max(range(len(ks)), key=lambda j: (got[j]["mean"], ks[j]))
         S = S.without(ranked[:ks[i]])
         path.append({"size": S.count(), "units": S.units(), **got[i]})
-    f = path[0]
     return {"kl_empty_off": empty, "kl_vpd_off": vpd, "budget_kl": budget, "f1_from_targets": reached, "levels": levels,
-            "f1_circuit": {"size": f["size"], "positions": len({u[2] for u in f["units"]}), "kl": f["kl_c"], "f1": f["f1"], "n": f["n"]},
+            "f1_circuit": {"size": f1_set.count(), "positions": len({u[2] for u in f1_set.units()}), "kl": f1_row["kl_c"],
+                           "f1": f1_row["f1"], "n": f1_row["n"]}, "top_k": k, "start_size": start.count(),
             "path": path, "measured_sets": pr.measured, "seconds": time.perf_counter() - t0}
 
 

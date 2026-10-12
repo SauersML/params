@@ -140,7 +140,7 @@ def test_teacher_search_on_native_units(tiny):
     assert f["kl"] <= got["budget_kl"] + 1e-6 or not got["f1_from_targets"]
     sizes = [r["size"] for r in got["path"]]
     assert sizes == sorted(sizes, reverse=True) and sizes[-1] <= max(teacher.MIN_SIZE, sizes[0])
-    assert got["measured_sets"] > 0
+    assert got["measured_sets"] > 0 and got["top_k"] >= 1 and sizes[0] == got["start_size"] >= got["top_k"]
     step = got["path"][len(got["path"]) // 2]
     m = nu.full().without(nu.full().units())
     for kind, l, t, j in step["units"]:

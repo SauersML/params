@@ -26,6 +26,8 @@ positions from its first removal on, reading the set's keys and values before it
 
   native_units.py curve --split heldout --n 20 [--offset K --stride S] [--sizes 12 16 ...] [--out OUT.jsonl]
   native_units.py table OUT.jsonl                                       the means by size
+  native_units.py teach --split heldout --n 20 --out OUT.jsonl [--offset K --stride S]
+      the teacher's own search (teacher.py's levels, prefix rounds, F1 >= 0.9 rule and joint path) on native units
 """
 
 from __future__ import annotations
@@ -305,6 +307,150 @@ def table(rows: list[dict]) -> str:
     return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(x))) for x in lines)
 
 
+# ---- equal effort: the teacher's search (teacher.py) on native units
+
+
+class NativePruner:
+    """teacher.Pruner's measured block removal over a native-unit set S (Mask); measured counts every run."""
+
+    def __init__(self, nu: NativeUnits, start: Mask):
+        self.nu, self.S, self.measured = nu, start, 0
+
+    def without(self, groups: list[list[tuple]]) -> list[float]:
+        """KL of S without each group of units."""
+        if not groups:
+            return []
+        self.measured += len(groups)
+        return self.nu.kl(self.S, groups)
+
+    def kl(self) -> float:
+        self.measured += 1
+        return self.nu.kl(self.S)[0]
+
+    def blocks(self, level: str) -> list[list[tuple]]:
+        """S's blocks at a teacher level: whole positions; sites (a layer's heads or its MLP's neurons at a position);
+        chunks of K units of a site by index; single units."""
+        units = self.S.units()
+        if level == "subcomponent":
+            return [[u] for u in units]
+        key = {"position": lambda u: (u[2],), "site": lambda u: (u[2], u[1], u[0])}.get(level)
+        groups: dict = {}
+        if key is not None:
+            for u in units:
+                groups.setdefault(key(u), []).append(u)
+            return list(groups.values())
+        K = int(level[5:])  # chunkK
+        for u in units:
+            groups.setdefault((u[2], u[1], u[0]), []).append(u)
+        out = []
+        for g in groups.values():
+            g = sorted(g, key=lambda u: u[3])
+            out += [g[i:i + K] for i in range(0, len(g), K)]
+        return out
+
+    def prune(self, level: str, budget: float, rounds: int) -> int:
+        """teacher.Pruner.prune: rounds of measuring each block's removal, ranking the blocks by the KL it leaves, and
+        removing the largest prefix (sizes 2^(e/2)) whose measured removal keeps KL <= budget."""
+        for r in range(rounds):
+            blocks = self.blocks(level)
+            if len(blocks) <= 1:
+                return r
+            single = self.without(blocks)
+            if not any(x <= budget for x in single):
+                return r
+            ranked = [blocks[i] for i in sorted(range(len(blocks)), key=lambda i: single[i])]
+            sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ranked)]
+            got = self.without([[u for b in ranked[:k] for u in b] for k in sizes])
+            ok = [k for k, x in zip(sizes, got) if x <= budget]
+            if not ok:
+                return r
+            self.S = self.S.without([u for b in ranked[:max(ok)] for u in b])
+        return rounds
+
+
+def teach_native(ge: goal_eval.GoalEval, nu: NativeUnits, tx: goal_eval.Text, log=print) -> dict:
+    """The teacher's search (teacher.teach) on native units, remainders off: the F1 circuit, first from the units at the
+    targets alone (chunks of 4, then single units), else from every unit at every position (positions, sites, chunks of
+    64, 16 and 4, single units), each level by teacher.ROUNDS rounds of measured removal keeping F1 >= teacher.RECOVERED;
+    then teacher.joint_path's measured F1 and N path from it down to teacher.MIN_SIZE (no VPD order to union with), N
+    being removal from the whole model. Returns the F1 circuit, the path with each step's units, and the measured runs."""
+    import teacher
+
+    t0 = time.perf_counter()
+    empty, vpd = ge._bounds(tx, "off")
+    budget = empty ** (1 - teacher.RECOVERED) * vpd ** teacher.RECOVERED
+    full = nu.full()
+    pr = NativePruner(nu, nu.at(tx.targets))
+    levels = {}
+
+    def search(names, label):
+        for level in names:
+            t1 = time.perf_counter()
+            rounds = pr.prune(level, budget, teacher.ROUNDS)
+            k = pr.kl()
+            levels[f"{label}{level}"] = {"rounds": rounds, "size": pr.S.count(), "kl": k, "seconds": time.perf_counter() - t1}
+            if log:
+                log(f"  {label}{level}: {pr.S.count()} units, KL {k:.3g} (budget {budget:.3g}), {rounds} rounds, {pr.measured} runs")
+        return levels[f"{label}{names[-1]}"]["kl"] <= budget
+
+    reached = search(("chunk4", "subcomponent"), "target ")
+    if not reached:
+        pr.S = full
+        search(teacher.LEVELS, "")
+    f1_set = pr.S
+
+    def measure(S: Mask, removals: list[list[tuple]]) -> list[dict]:
+        """Each S-without-removal circuit's KL_C and KL of the whole model without it, F1, N and their mean."""
+        cs = pr.nu.kl(S, removals)
+        units = S.units()
+        rest = []
+        for r in removals:
+            drop = set(r)
+            rest.append([u for u in units if u not in drop])
+        ms = pr.nu.kl(full, rest)
+        pr.measured += 2 * len(removals)
+        out = []
+        for c, m in zip(cs, ms):
+            f, n, j = teacher.scores(empty, vpd, c, m)
+            out.append({"kl_c": c, "kl_minus": m, "f1": f, "n": n, "mean": j})
+        return out
+
+    S = f1_set
+    path = [{"size": S.count(), "units": S.units(), **measure(S, [[]])[0]}]
+    while S.count() > teacher.MIN_SIZE:
+        units = S.units()
+        rows = measure(S, [[u] for u in units])
+        ranked = [units[i] for i in sorted(range(len(units)), key=lambda i: -rows[i]["mean"])]
+        top = min(max(1, int(teacher.FRACTION * len(units))), len(units) - teacher.MIN_SIZE)
+        ks = sorted({min(top, 2 ** e) for e in range(0, 20) if 2 ** e <= 2 * top})
+        got = measure(S, [ranked[:k] for k in ks])
+        i = max(range(len(ks)), key=lambda j: (got[j]["mean"], ks[j]))
+        S = S.without(ranked[:ks[i]])
+        path.append({"size": S.count(), "units": S.units(), **got[i]})
+    f = path[0]
+    return {"kl_empty_off": empty, "kl_vpd_off": vpd, "budget_kl": budget, "f1_from_targets": reached, "levels": levels,
+            "f1_circuit": {"size": f["size"], "positions": len({u[2] for u in f["units"]}), "kl": f["kl_c"], "f1": f["f1"], "n": f["n"]},
+            "path": path, "measured_sets": pr.measured, "seconds": time.perf_counter() - t0}
+
+
+def teach_all(split: str, n: int, out: Path, offset: int = 0, stride: int = 1, log=print) -> None:
+    """teach_native on the split's first n texts (offset, offset + stride, ...) -> one row per text appended to OUT."""
+    ge = goal_eval.GoalEval()
+    nat = ge.nat
+    done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
+    for p in native.tasks(split)[:n][offset::stride]:
+        if p.stem in done:
+            continue
+        ids, targets = native.text(p)
+        tx = ge.text(ids, targets, native.task_seed(p.stem), json.loads(p.read_text()))
+        row = {"task": p.stem, "T": tx.T, **teach_native(ge, NativeUnits(nat, ids, targets), tx, log)}
+        with open(out, "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        f = row["f1_circuit"]
+        log(f"{p.stem}: native F1 circuit {f['size']} units at {f['positions']} positions (F1 {f['f1']:.3f}, N {f['n']:.3f}), "
+            f"path to {row['path'][-1]['size']}, {row['measured_sets']} runs, {row['seconds']:.0f} s")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -317,7 +463,16 @@ def main():
     c.add_argument("--out", type=Path)
     t = sub.add_parser("table")
     t.add_argument("rows", type=Path, help="curve's OUT.jsonl")
+    e = sub.add_parser("teach", help="the teacher's search on native units (equal effort)")
+    e.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
+    e.add_argument("--n", type=int, default=20)
+    e.add_argument("--offset", type=int, default=0)
+    e.add_argument("--stride", type=int, default=1)
+    e.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
+    if args.cmd == "teach":
+        teach_all(args.split, args.n, args.out, args.offset, args.stride)
+        return
     if args.cmd == "table":
         print(table([json.loads(x) for x in args.rows.read_text().splitlines() if x.strip()]))
         return

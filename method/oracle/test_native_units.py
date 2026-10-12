@@ -125,3 +125,26 @@ def test_table():
             {"native": [{"size": 12, "f1": 0.7, "n": None, "bits": 310.0}], "vpd_order": []}]
     text = native_units.table(rows)
     assert "native F1" in text and " 0.600 " in text and " 305 " in text and " 0.900 " in text
+
+
+def test_teacher_search_on_native_units(tiny):
+    """teach_native: the F1 circuit keeps F1 >= 0.9 when the search reaches it, the path shrinks to teacher.MIN_SIZE
+    measuring as it goes, and each recorded step's KL is the run of its units."""
+    import teacher
+
+    nat, ids, targets, nu = tiny
+    ge = goal_eval.GoalEval(nat, changes=2)
+    tx = ge.text(ids, targets, seed=1)
+    got = native_units.teach_native(ge, nu, tx, log=None)
+    f = got["f1_circuit"]
+    assert f["kl"] <= got["budget_kl"] + 1e-6 or not got["f1_from_targets"]
+    sizes = [r["size"] for r in got["path"]]
+    assert sizes == sorted(sizes, reverse=True) and sizes[-1] <= max(teacher.MIN_SIZE, sizes[0])
+    assert got["measured_sets"] > 0
+    step = got["path"][len(got["path"]) // 2]
+    m = nu.full().without(nu.full().units())
+    for kind, l, t, j in step["units"]:
+        (m.heads if kind == "head" else m.neurons)[l, t, j] = True
+    assert abs(nu.kl(m)[0] - step["kl_c"]) < 1e-5
+    rest = nu.full().without(step["units"])
+    assert abs(nu.kl(rest)[0] - step["kl_minus"]) < 1e-5

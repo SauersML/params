@@ -24,8 +24,9 @@ stage within the budget, the gates' largest --max-nodes logits.
 
 The cleanup, measured around the pick: removals by the F1 search's rule on min(F1, N) (Descent: single removals
 measured and ranked, the most of them in that order that keep it >= 0.9), the result kept only while f1_flips holds
-(else the removal halved); with --edges, the connections by teacher.Connector (C's semantics, the scorecard's) and the
-flip repair (teacher.Connector.repair: the omitted lever's flips joined, the connections pruned again from the kept
+(else the removal halved); with --edges, the connections by teacher.Connector (C's semantics, the scorecard's; with
+--edge-objective robust each removal also keeping F1 under the flips, teacher.py's) and the flip repair
+(teacher.Connector.repair: the omitted lever's flips joined, the connections pruned again from the kept
 ones, while min(graph F1, node F1, F1 under the flips) improves: node F1, the node set with every connection among
 its nodes, so that a flip joined with its connections cut does not count); while the answer is longer than
 --max-tokens (components.ANSWER_BUDGET), the pick among the smaller stages instead.
@@ -192,7 +193,7 @@ def removals(meas: Measure, on: torch.Tensor, row: dict, goal: float = teacher.R
 
 def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answer: dict, pool: dict, B: int = 32,
            edges: bool = False, repair: bool = False, max_nodes: int | None = teacher.MAX_NODES, tokens=None,
-           max_tokens: int = components.ANSWER_BUDGET, seeds=(0,)) -> tuple[dict, dict, dict]:
+           max_tokens: int = components.ANSWER_BUDGET, seeds=(0,), robust_edges: bool = False) -> tuple[dict, dict, dict]:
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets)
@@ -212,7 +213,7 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
         return goal_eval.size_term(bits, scale)
 
     meas = Measure(ge, tx, pr, empty, vpd, pool)
-    wiring = teacher.Connector(ge, tx, pr, empty, vpd, size_term, B)
+    wiring = teacher.Connector(ge, tx, pr, empty, vpd, size_term, B, robust=pool if robust_edges else None)
 
     def lam_path(seed):                                          # one seed's stages
         ms = MaskSearch(ge, tx, pr, live=teacher.CONVENTION == "live")
@@ -349,6 +350,8 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--edges", action="store_true", help="the pick's connections (teacher.Connector, C's semantics)")
     ap.add_argument("--repair", action="store_true", help="with --edges, the flip repair (teacher.Connector.repair)")
+    ap.add_argument("--edge-objective", choices=("graph", "robust"), default="graph",
+                    help="with --edges, connection removals keep graph F1 (graph), and F1 under the flips too (robust: teacher.py's)")
     ap.add_argument("--max-nodes", type=int, default=teacher.MAX_NODES, help="the pick among stages of at most this many nodes")
     ap.add_argument("--max-tokens", type=int, default=components.ANSWER_BUDGET,
                     help="the answer at most this many tokens of --tokenizer: a smaller stage while it is longer (0: not checked)")
@@ -371,7 +374,7 @@ def main():
             continue
         ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
         circuits, row, path_file = search(ge, ids, targets, saved[task]["answer"], pool, args.batch, args.edges, args.repair,
-                                          args.max_nodes, tokens, args.max_tokens, tuple(range(args.seeds)))
+                                          args.max_nodes, tokens, args.max_tokens, tuple(range(args.seeds)), args.edge_objective == "robust")
         for name, c in circuits.items():
             (args.out / f"{task}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{task}.path.json").write_text(json.dumps(path_file))

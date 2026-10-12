@@ -8,7 +8,8 @@
 #                                        HELDOUT_TEACHER, LABELS, NEVAL, SAMPLES, MAXTOK, SRC, ZEROSHOT: the untrained base's
 #                                        samples and readers on HELDOUT's questions; EXTRA: more answer sets scored in the
 #                                        same evaluation, "NAME=SAMPLES[:E1] ...", e.g. an earlier SFT's samples, since C
-#                                        changes on main and only one evaluation compares)
+#                                        changes on main and only one evaluation compares; EDIT_EVAL: the edit teacher's
+#                                        rows for HELDOUT's edit requests, E3's best net)
 set -e
 RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
@@ -24,18 +25,19 @@ $PY $SRC/method/oracle/components.py rerender $ROWS $S/rows.jsonl  # questions i
 MPD_MEM_GIB=8 $PY $SRC/method/oracle/components.py dataset $S/rows.jsonl $TEACHER $S/sft.jsonl \
   ${ENGLISH:+--english $ENGLISH} ${EDIT_TEACH:+--edit-teach $EDIT_TEACH}
 $PY $SRC/method/oracle/components.py rerender $HELDOUT $S/heldout.jsonl
-$PY - $SRC/method/oracle $S/heldout.jsonl $HELDOUT_TEACHER $S/teacher_txt <<'PYEOF'
+$PY - $SRC/method/oracle $S/heldout.jsonl $HELDOUT_TEACHER $S/teacher_txt ${EDIT_EVAL:-} <<'PYEOF'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import components
 out = Path(sys.argv[4]); out.mkdir(exist_ok=True)
+edits = components.edit_teach([Path(sys.argv[5])]) if len(sys.argv) > 5 else None  # the edit teacher answers the edit requests
 for r in map(json.loads, open(sys.argv[2])):
     f = Path(sys.argv[3]) / (r["task"] + ".json")
     if f.exists():
-        (out / (r["task"] + ".txt")).write_text(components.target(json.loads(f.read_text()), r, "vpd4l"))
+        (out / (r["task"] + ".txt")).write_text(components.target(json.loads(f.read_text()), r, "vpd4l", components.teacher_edits(edits, r)))
 PYEOF
-~/.local/bin/mem-lease 12 $PY $SRC/method/oracle/components.py references $S/heldout.jsonl $HELDOUT_TEACHER $S/ref
+~/.local/bin/mem-lease 12 $PY $SRC/method/oracle/components.py references $S/heldout.jsonl $HELDOUT_TEACHER $S/ref ${EDIT_EVAL:+--edit-teach $EDIT_EVAL}
 export TINKER_API_KEY="$(security find-generic-password -s tinker-api-key -w)" TINKER_PROJECT_ID=3f598f31-2ffa-4eb4-b302-909eb234fb7d
 cd $SRC/method/oracle/rl
 $TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEPS --batch $BATCH ${LR:+--lr $LR} --name sft-$RUN
@@ -56,7 +58,7 @@ if [ -d $S/ref/vpd_pruned ]; then
   PRUNED=(vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
 fi
 # C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh)
-bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S \
+EDIT_EVAL=${EDIT_EVAL:-} bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S \
   zeroshot=$S/zeroshot_first.jsonl$E1Z teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" ${=EXTRA:-} > $S/eval_pod.log 2>&1
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.json $S/eval.json
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.log $S/eval.log

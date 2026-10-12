@@ -1296,6 +1296,19 @@ def edit_teach(paths) -> dict:
     return out
 
 
+def teacher_edits(edits: dict | None, r: dict) -> dict:
+    """A row's edit requests answered by the edit teacher (edits: edit_teach()): request number -> parse()'s
+    operations, for the requests the teacher has an edit for."""
+    import edit_eval
+
+    ops = {}
+    for k, goal in enumerate(r.get("edits") or [], 1):
+        t = (edits or {}).get(edit_eval.EditEval.key(r["task"], goal), {}).get("teacher") or {}
+        if t.get("edit"):
+            ops[k] = [edit_eval._from_json(o) for o in t["edit"]]
+    return ops
+
+
 def edit_term(ee, task: dict, goals: list[dict], answers: list[dict], best: dict) -> list:
     """E3 of each answer's edits (parse()'s "edits"), one value per answer: per edit request, the edit's net bits
     (edit_eval's goal_bits less collateral) over the best net known for that goal (best: goal key -> net, the edit
@@ -1526,7 +1539,6 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
     part the reward drops; info counts them (stranded, dropped_nodes, dropped_edges). variables: task -> the teacher's
     variables (variables.py's JSON, meanings written), else the teacher answer's own "variables"; a row that asks for
     them (rerender --variables) is kept only with them. ge: goal_eval.GoalEval."""
-    import edit_eval
     import goal_eval
     import native
 
@@ -1555,11 +1567,7 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
                     "variables": len(found or [])}
             if english and r["task"] in english:
                 answer = {**answer, "explanation": english[r["task"]]}
-            ops = {}
-            for k, goal in enumerate(r.get("edits") or [], 1):
-                t = (edits or {}).get(edit_eval.EditEval.key(r["task"], goal), {}).get("teacher") or {}
-                if t.get("edit"):
-                    ops[k] = [edit_eval._from_json(o) for o in t["edit"]]
+            ops = teacher_edits(edits, r)
             if len(ops) < len(r.get("edits") or []):
                 continue  # an answer without an EDIT line for a request is invalid: no target for it
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
@@ -1715,12 +1723,14 @@ def baseline_texts(ge, task: dict, sizes: list[int]) -> dict:
     return out
 
 
-def references(ge, rows: Path, teacher_dir: Path, out: Path) -> int:
+def references(ge, rows: Path, teacher_dir: Path, out: Path, edits: dict | None = None) -> int:
     """VPD's references on each text with a teacher, at the teacher's subcomponent count k (its nodes other than token
     embeddings), as answer texts with the measured answers to the text's questions (target()):
     out/vpd_complete/<task>.txt, VPD's first k active subcomponents with every connection the model has among them, and
     out/vpd_pruned/<task>.txt, the same nodes with the connections teacher.py's edge search kept
-    (TEACHER_DIR/<task>.vpd_top<k>.edges.json, where it exists): units compared under equal edge effort."""
+    (TEACHER_DIR/<task>.vpd_top<k>.edges.json, where it exists): units compared under equal edge effort. edits: the
+    edit teacher's rows (edit_teach()), whose operations answer the rows' edit requests (a reference states a circuit,
+    not an edit: without them it would be invalid on rows with edit requests)."""
     import goal_eval
     import native
 
@@ -1738,7 +1748,7 @@ def references(ge, rows: Path, teacher_dir: Path, out: Path) -> int:
                              ("vpd_pruned", json.loads(p.read_text()) if (p := teacher_dir / f"{r['task']}.vpd_top{k}.edges.json").exists() else None)):
             if answer is not None:
                 (out / name).mkdir(parents=True, exist_ok=True)
-                (out / name / f"{r['task']}.txt").write_text(target(answer, r, task["model"]))
+                (out / name / f"{r['task']}.txt").write_text(target(answer, r, task["model"], teacher_edits(edits, r)))
         n += 1
     return n
 
@@ -1894,6 +1904,7 @@ def main():
     rf.add_argument("rows", type=Path)
     rf.add_argument("teacher", type=Path, help="teacher.py's output directory (<task>.json, <task>.vpd_top<k>.edges.json)")
     rf.add_argument("out", type=Path)
+    rf.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output: answers to edit requests")
     ed = sub.add_parser("edits", help="the rows with edit requests (edit_eval.goals: flip, raise, detach) and their question again")
     ed.add_argument("rows", type=Path)
     ed.add_argument("out", type=Path)
@@ -2082,7 +2093,7 @@ def main():
             print(info, flush=True)
         return
     if args.cmd == "references":
-        print(references(ge, args.rows, args.teacher, args.out), "texts", flush=True)
+        print(references(ge, args.rows, args.teacher, args.out, edit_teach(args.edit_teach) if args.edit_teach else None), "texts", flush=True)
         return
     if args.cmd == "edits":
         import edit_eval

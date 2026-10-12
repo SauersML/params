@@ -1,7 +1,6 @@
-"""Checks of teacher_v3.py on a held-out vpd4l text (skipped without ~/mpd-data's model and saved VPD answers): its
-masks with every gate at 1 run VPD's own answer and with every gate at 0 the empty circuit (the bounds goal_eval
-computes on every column; MaskSearch multiplies the gathered ones), and a pattern on top of gates at 1 is VPD's answer
-under that pattern.
+"""Checks of teacher_v3.py on a held-out vpd4l text (skipped without vpd4l's texts and VPD's saved answers): its masks
+with every gate at 1 run VPD's own answer and with every gate at 0 the empty circuit (the bounds goal_eval computes),
+the omitted lever on gates at 1 changes nothing (nothing is left out), and the pick never exceeds the answer budget.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher_v3.py -s
 """
@@ -22,28 +21,39 @@ import teacher  # noqa: E402
 import teacher_v3  # noqa: E402
 
 SAVED = Path.home() / "mpd-data/graph_oracle/teacher/vpd_heldout20.pt"
-TASK = "text9000"
+DEVICE = native.device()
 
 
-@pytest.mark.skipif(not SAVED.exists() or not (native.TEXTS / "vpd4l" / f"{TASK}.json").exists(), reason="needs vpd4l's texts and saved answers")
-def test_masks_bound_by_vpd_and_empty():
+def text(task):
     saved = torch.load(SAVED)
-    ge = goal_eval.GoalEval(native.Native(), chunk=32)
+    ge = goal_eval.GoalEval(native.Native(DEVICE), chunk=32)
     nat = ge.nat
-    ids, targets = native.text(native.TEXTS / "vpd4l" / f"{TASK}.json")
+    ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
     tx = ge.text(ids, targets)
     tx.vpd = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
-    for n, (t, c) in saved[TASK]["answer"].items():
+    for n, (t, c) in saved[task]["answer"].items():
         tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
+    return ge, tx, saved
+
+
+@pytest.mark.skipif(not SAVED.exists() or DEVICE == "cpu", reason="needs VPD's saved answers and a GPU")
+def test_masks_bound_by_vpd_and_empty():
+    ge, tx, _ = text("text9000")
     empty, vpd = ge._bounds(tx, "live")
     pr = teacher.Pruner(ge, tx, tx.vpd, live=True, B=32)
-    ms = teacher_v3.MaskSearch(ge, tx, pr, teacher_v3.patterns(saved, TASK, tx.T, nat.C, nat.names, 2, 0))
-    pats = ms.pats
+    ms = teacher_v3.MaskSearch(ge, tx, pr)
     N = len(pr.nodes)
+    ones, zeros = torch.ones(1, N, device=ge.nat.dev), torch.zeros(1, N, device=ge.nat.dev)
+    lever = teacher_v3.top(torch.rand(1, N, device=ge.nat.dev), teacher.REPAIR_M)
     with torch.no_grad():
-        on, off = ms.kl(ms.masks(torch.ones(1, N, device=nat.dev), None)), ms.kl(ms.masks(torch.zeros(1, N, device=nat.dev), None))
-        a = ms.masks(torch.ones(2, N, device=nat.dev), pats)
-        b = ms.masks(None, pats, vpd_on=True)
-    assert abs(float(on) - vpd) / vpd < 1e-3
-    assert abs(float(off) - empty) / empty < 1e-3
-    assert all(torch.equal(a[n], b[n]) for n in nat.names)
+        on, off, levered = (float(ms.kl(m)) for m in (ones, zeros, ones + (1 - ones) * lever))
+    assert abs(on - vpd) / vpd < 1e-3 and abs(off - empty) / empty < 1e-3 and levered == on
+
+
+@pytest.mark.skipif(not SAVED.exists() or DEVICE == "cpu" or not teacher.POOL.exists(), reason="needs VPD's answers, a GPU, the pool")
+def test_pick_within_budget(monkeypatch):
+    monkeypatch.setattr(teacher_v3, "LAMBDAS", [1.0, 64.0])   # two stages: VPD's whole answer and a small one
+    monkeypatch.setattr(teacher_v3, "STEPS", 30)
+    ge, tx, saved = text("text9019")
+    circuits, row, _ = teacher_v3.search(ge, tx.ids, tx.targets, saved["text9019"]["answer"], torch.load(teacher.POOL), max_nodes=40)
+    assert row["best"]["size"] <= 40

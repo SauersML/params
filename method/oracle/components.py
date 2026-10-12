@@ -595,20 +595,41 @@ def wiring(conn, nodes: list, targets: list[int], k: int) -> list[tuple]:
     return sorted(((w, r, c) for (w, r), c in best.items()), key=lambda x: -abs(x[2]))[:k]
 
 
-def facts(atlas, nd) -> str:
-    """A subcomponent's atlas facts in a few words (method/vpd/atlas.py, measured on Pile text): the tokens its write
-    raises most (its lens, for the sites that write the residual stream or feed one that does) and the tokens it is
-    most often active on (the tokens at its top contexts)."""
+def facts(atlas, nd, routed: dict | None = None, tok=None) -> str:
+    """A subcomponent's facts in a few words: the tokens its write raises most at this position by the routed lens
+    (routed: RoutedLens.readout's reading of it on this text, tok: token ids -> strings; a label-free linear reading
+    of its write through the expert its residual there is routed to, oriented by its activation there, not a measured
+    effect; none for q and k, which write nothing) and the tokens it is most often active on (the atlas's top contexts
+    on Pile text, method/vpd/atlas.py)."""
     from collections import Counter
 
     e = atlas.entry(nd[0], nd[2])
     out = []
-    if e["lens"]:
-        out.append("raises " + " ".join(repr(t) for t, _ in e["lens"]["raised"][:3]))
+    if routed and tok:
+        out.append("routed lens at this position raises " + " ".join(repr(t) for t in tok([i for i, _ in routed["raised"][:3]])))
     on = Counter(c["token"] for c in e["contexts"]).most_common(2)
     if on:
         out.append("active on " + " ".join(repr(t) for t, _ in on))
     return "; ".join(out)
+
+
+def _lens(nat):
+    """The routed lens on the target model (method/vpd/lens.py RoutedLens), or None while its fit is not built."""
+    sys.path.insert(0, str(HERE.parents[1]))
+    from method.vpd import lens
+
+    return lens.RoutedLens(nat.target) if (lens.DEFAULT / "lens" / "jacobians.pt").exists() else None
+
+
+def refresh_facts(atlas, lens, task: dict, ev: dict) -> dict:
+    """The evidence with every listed subcomponent's facts() read again on this text (the routed lens at its position:
+    one forward pass of the text)."""
+    ids = task["prompts"][0]["token_ids"]
+    nodes = [tuple(nd) for cs in ev["components"].values() for nd, *_ in cs]
+    routed = dict(zip(nodes, lens.readout(ids, nodes))) if lens else {}
+    tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
+    return {**ev, "components": {q: [[nd, c, facts(atlas, tuple(nd), routed.get(tuple(nd)), tok)] for nd, c, _ in cs]
+                                 for q, cs in ev["components"].items()}}
 
 
 def _atlas():
@@ -642,7 +663,7 @@ def switch_on(nat, ids: list[int], targets: list[int], p: int, ci: dict, k: int 
     return [[list(nd), count[nd]] for nd in ranked[:k]]
 
 
-def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=None) -> dict:
+def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=None, lens=None) -> dict:
     """One text's question data: F2's positions (goal_eval.Text with the text's own seed), the measured evidence there
     (units.events at those positions; its other events are the English reader's), VPD's top active subcomponents per
     position with their atlas facts (facts(); none without an atlas), their strongest wiring, the subcomponents a
@@ -674,9 +695,11 @@ def evidence(nat, ge, task: dict, conn=None, qa_seed: int | None = None, atlas=N
     listed_nodes = [nd for p in where for nd in comps[p]]
     qa = qa_questions(nat, task, tx.ci, positions, native.task_seed(task["id"]) if qa_seed is None else qa_seed,
                       cuts=lambda pairs: ge.cuts(tx, pairs, detail=True), nodes=listed_nodes)
+    routed = dict(zip(listed_nodes, lens.readout(ids, listed_nodes))) if lens else {}
+    tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
     return {"task": task["id"], "positions": positions, "listed": listed, "events": events,
-            "components": {str(p): [[list(nd), float(tx.ci[nd[0]][nd[1], nd[2]]), facts(atlas, nd) if atlas else ""] for nd in comps[p]]
-                           for p in where},
+            "components": {str(p): [[list(nd), float(tx.ci[nd[0]][nd[1], nd[2]]), facts(atlas, nd, routed.get(nd), tok) if atlas else ""]
+                                    for nd in comps[p]] for p in where},
             "wiring": {str(p): wires[p] for p in where}, "switch_on": switched, "qa": qa, "active": active}
 
 
@@ -741,9 +764,10 @@ def question(task: dict, ev: dict) -> str:
              + ", ".join(f"{q} ({strings[q]!r})" for q in ev["positions"])]
     if ev["events"]:
         lines += ["measured at those positions (log2 change of the top token's probability):"] + units.evidence(ev["events"], ev["listed"], strings)
-    lines.append("VPD's active subcomponents (causal importance; the tokens its write raises by the logit lens, read from "
-                 "the weights, not measured; the tokens it is active on in Pile text), most important first, and the "
-                 "strongest weight-level connections among them (cosine; a static coupling, not a measured effect):")
+    lines.append("VPD's active subcomponents (causal importance; the tokens its write raises at this position by the routed "
+                 "lens, a label-free linear reading of its write, not a measured effect; the tokens it is active on in Pile "
+                 "text), most important first, and the strongest weight-level connections among them (cosine; a static "
+                 "coupling, not a measured effect):")
     for q in sorted(ev["components"], key=int):
         cs = ev["components"][q]
         lines.append(f"{q} ({strings[int(q)]!r}): " + ", ".join(f"{node_text(tuple(nd))} ({c:.2f}{'; ' + f if f else ''})" for nd, c, f in cs))
@@ -1087,7 +1111,7 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_
     English never states what the oracle cannot know. From the question (evidence()): the text and its target, the
     model's top next tokens, the measured evidence at the listed positions (units.evidence; never the English reader's
     events), the 1% rule, and for the circuit's subcomponents the question lists, their atlas facts as it lists them
-    (logit lens and Pile contexts). From the teacher's answer: its subcomponents (the first max_nodes in VPD's order),
+    (the routed lens at their positions and Pile contexts). From the teacher's answer: its subcomponents (the first max_nodes in VPD's order),
     its stated edges (those into the prediction first, without their measured effects) and the questions' answers."""
     import goal_eval
     import units
@@ -1125,8 +1149,8 @@ def writer_prompt(f: dict) -> str:
     lines = [f"Text: {f['text']!r}", f"Prediction at position {f['target']} (after {f['target_token']!r}): "
              + ", ".join(f"{t!r} {p:.2f}" for t, p in f["top"]),
              f"Circuit: {f['nodes_total']} subcomponents at positions {', '.join(map(str, f['positions']))}; the most important "
-             "(where known: the tokens its write raises by the logit lens, read from the weights, not measured; and the "
-             "tokens it is active on in Pile text):"]
+             "(where known: the tokens its write raises at this position by the routed lens, a label-free linear reading of "
+             "its write, not a measured effect; and the tokens it is active on in Pile text):"]
     for n in f["nodes"]:
         lines.append(f"- {n['node']} (token {n['token']!r})" + (f": {n['facts']}" if n.get("facts") else ""))
     if f.get("evidence"):
@@ -1494,6 +1518,8 @@ def main():
     rr = sub.add_parser("rerender", help="the rows with their question text written again by this question() (no model runs)")
     rr.add_argument("rows", type=Path)
     rr.add_argument("out", type=Path)
+    rr.add_argument("--facts", action="store_true", help="read each listed subcomponent's facts again (refresh_facts: the routed lens "
+                                                          "at its position, one forward pass per text)")
     rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
     rf.add_argument("rows", type=Path)
     rf.add_argument("teacher", type=Path, help="teacher.py's output directory (<task>.json, <task>.vpd_top<k>.edges.json)")
@@ -1559,9 +1585,12 @@ def main():
     import native
 
     if args.cmd == "rerender":
+        atlas, lens = (_atlas(), _lens(native.Native())) if args.facts else (None, None)
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+                if args.facts:
+                    r = refresh_facts(atlas, lens, task, r)
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
         return
 
@@ -1611,7 +1640,7 @@ def main():
         seen = {k: [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else [] for k, f in files.items()}
         labels = {r["task"]: r for r in seen["locality"]}
         kept = {r["task"] for r in seen["rows"]}
-        conn, atlas = _connectome(), _atlas()
+        conn, atlas, lens = _connectome(), _atlas(), _lens(nat)
         lo, hi = map(int, args.lengths.split(":"))
         paths = native.tasks(args.split)[:args.n]
         if args.tasks:
@@ -1635,7 +1664,7 @@ def main():
             local_kept = sum(labels[t]["local"] for t in kept)
             if labels[p.stem]["local"] and local_kept >= len(kept) - local_kept:  # at least half the kept texts non-local
                 continue
-            ev = evidence(nat, ge, task, conn, atlas=atlas)
+            ev = evidence(nat, ge, task, conn, atlas=atlas, lens=lens)
             row = {**ev, "question": question(task, ev)}
             info = None
             if not args.rows_only:
@@ -1701,7 +1730,7 @@ def main():
                 print(r["task"], len(r["qa"]), "questions", flush=True)
         return
     if args.cmd == "questions":
-        conn, atlas = _connectome(), _atlas()
+        conn, atlas, lens = _connectome(), _atlas(), _lens(nat)
         done = set()
         if args.out.exists():
             done = {json.loads(x)["task"] for x in args.out.read_text().splitlines() if x.strip()}
@@ -1710,7 +1739,7 @@ def main():
                 if p.stem in done:
                     continue
                 task = json.loads(p.read_text())
-                ev = evidence(nat, ge, task, conn, atlas=atlas, qa_seed=native.task_seed(task["id"]) + args.qa_seed)
+                ev = evidence(nat, ge, task, conn, atlas=atlas, lens=lens, qa_seed=native.task_seed(task["id"]) + args.qa_seed)
                 f.write(json.dumps({**ev, "question": question(task, ev)}) + "\n")
                 f.flush()
                 print(p.stem, len(ev["positions"]), "positions", ev["active"], "active", flush=True)

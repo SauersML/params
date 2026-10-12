@@ -6,9 +6,12 @@ every connection from a value node at source position s in layer l into an atten
 in layer l; cut, those readers' input loses the source's value nodes' share (its pattern weight times their output),
 in C's semantics (engine.Engine.plan: the set as a complete graph, the cuts at strength 0, the remainders live and
 reading the full stream). Every KL is that run's at the targets, the budget teacher.py's F1 budget (KL_C <=
-KL_empty^0.1 KL_VPD^0.9), and every removal, of subcomponents or of reads, is admitted only while s_track on the search
-split (goal_eval.changed_search, the changed-input family: the circuit's move from x to x' against the model's) stays
->= min(0.9, VPD's whole answer's): context the prediction moves with stays.
+KL_empty^0.1 KL_VPD^0.9), and every removal, of subcomponents or of reads, is admitted only while the changed-input
+term on the search split (goal_eval.changed_search: the circuit's move from x to x' against the model's) stays >=
+min(0.9, VPD's whole answer's): context the prediction moves with stays. --mode pp (the default): s_track_pp, the
+circuit path-patched (everything outside it at its value on x, a cut read's source value at x); --mode c: s_track in
+C's semantics (a cut read's connections at 0). The finish's connections take teacher.teach's acceptance in c mode only
+(none in pp mode until teacher.Acceptance takes a mode).
   1. Targets: from VPD's whole answer, the targets' subcomponents pruned by teacher.Descent's rounds (levels site,
      chunk16, chunk4, subcomponent), every other position whole.
   2. Positions from the last target down. At a position p, its reads: every value read into its kept attention-output
@@ -49,6 +52,7 @@ import teacher
 LEVELS = ("site", "chunk16", "chunk4", "subcomponent")       # a position's subcomponents, coarse to fine
 READ_LEVELS = ("layer", "repeat", "span64", "span16", "span4", "source")
 DRAWS = 16                                                   # changed_search's draws
+TRACK = {"c": "s_track", "pp": "s_track_pp"}                 # changed_search's mode -> its term
 
 
 def _layer_kind(nd) -> tuple[int, str]:
@@ -59,11 +63,11 @@ class State:
     """One text's search: VPD's whole answer as nodes (teacher.Pruner's order), the engine over its columns (C's
     semantics, remainders live), the kept set `on` [N] and the cut reads {(p, l, s)}."""
 
-    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, B: int):
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, B: int, mode: str = "pp"):
         import engine
 
         nat = ge.nat
-        self.ge, self.tx, self.B, self.dev = ge, tx, B, nat.dev
+        self.ge, self.tx, self.B, self.dev, self.mode = ge, tx, B, nat.dev, mode
         self.pr = teacher.Pruner(ge, tx, tx.vpd, live=True, B=B)
         pr, T = self.pr, tx.T
         self.names, self.nodes, self.t, self.mat, self.c = pr.names, pr.nodes, pr.t, pr.mat, pr.c
@@ -90,7 +94,7 @@ class State:
         self.budget = empty ** (1 - teacher.RECOVERED) * vpd ** teacher.RECOVERED
         self.measured = 0
         self.floor = None
-        self.checks = 0
+        self.checks, self.check_seconds = 0, 0.0
 
     def u(self, ons: torch.Tensor) -> dict:
         """Node subsets ons [K, N] as the engine's u: per site [K, T, columns], views of one buffer."""
@@ -148,13 +152,25 @@ class State:
         return self.runs(self.plan(), len(ons), lambda a, b: self.u(ons[a:b]), lambda a, b: None, start, (self.u(self.on[None]), None))
 
     def track(self, ons: torch.Tensor, cuts: list | None = None) -> list:
-        """s_track on the search split (goal_eval.changed_search) of node subsets ons [K, N], with per row its cut reads
-        (cuts: a list of sets; None: the current cuts)."""
+        """s_track on the search split (goal_eval.changed_search in the state's mode: "pp", s_track_pp, the cut reads
+        at their x values; "c", s_track in C's semantics, the cut reads' connections at 0) of node subsets ons [K, N],
+        with per row its cut reads (cuts: a list of sets; None: the current cuts)."""
+        t0 = time.perf_counter()
         graphs = [native.Graph([self.nodes[i] for i in row.nonzero().flatten().tolist()], complete=True) for row in ons]
-        rows = ons.tolist()
-        cd = [self.reads_dict(self.cut if cuts is None else c, on) for c, on in zip(cuts or [None] * len(rows), rows)]
+        sets = [self.cut if c is None else c for c in (cuts or [None] * len(ons))]
+        if self.mode == "pp":
+            cd = []
+            for c in sets:
+                d = {}
+                for p, l, s in c:
+                    d.setdefault((l, p), []).append(s)
+                cd.append(d)
+        else:
+            cd = [self.reads_dict(c, on) for c, on in zip(sets, ons.tolist())]
+        got = [r[TRACK[self.mode]] for r in self.ge.changed_search(self.tx, graphs, DRAWS, cuts=cd, mode=self.mode)]
         self.checks += len(ons)
-        return [r["s_track"] for r in self.ge.changed_search(self.tx, graphs, DRAWS, cuts=cd)]
+        self.check_seconds += time.perf_counter() - t0
+        return got
 
     def admits(self, x) -> bool:
         return x is None or self.floor is None or x >= self.floor
@@ -251,10 +267,11 @@ class Reads(teacher.Descent):
 def _stage(st: State, label: str, t0: float, record: list, **extra) -> None:
     kl = st.kl_nodes(st.on[None])[0]
     row = {"stage": label, "size": int(st.on.sum()), "positions": int(torch.unique(st.t[st.on]).numel()), "cuts": len(st.cut),
-           "kl": kl, "seconds": time.perf_counter() - t0, "sets": st.measured, "checks": st.checks, **extra}
+           "kl": kl, "seconds": time.perf_counter() - t0, "sets": st.measured, "checks": st.checks,
+           "check_seconds": st.check_seconds, **extra}
     record.append(row)
     print(f"  {label}: {row['size']} subcomponents at {row['positions']} positions, {len(st.cut)} reads cut, KL {kl:.3g} "
-          f"(budget {st.budget:.3g}), {row['seconds']:.0f}s, {st.measured} sets, {st.checks} checks", flush=True)
+          f"(budget {st.budget:.3g}), {row['seconds']:.0f}s, {st.measured} sets, {st.checks} checks ({st.check_seconds:.0f}s)", flush=True)
 
 
 def _prune_nodes(st: State, allowed: torch.Tensor, levels, label: str, record: list, drop: torch.Tensor | None = None) -> None:
@@ -297,10 +314,10 @@ def _unused(st: State, s: int, layers: set) -> torch.Tensor:
     return out
 
 
-def search(ge: goal_eval.GoalEval, tx: goal_eval.Text, B: int = 32) -> tuple[torch.Tensor, State, dict]:
+def search(ge: goal_eval.GoalEval, tx: goal_eval.Text, B: int = 32, mode: str = "pp") -> tuple[torch.Tensor, State, dict]:
     """Steps 1-4 on a text: (the start set [N] over teacher.Pruner's nodes of VPD's answer, the state, the record)."""
     t0 = time.perf_counter()
-    st = State(ge, tx, B)
+    st = State(ge, tx, B, mode)
     record = []
     whole = st.track(st.on[None])[0]
     st.floor = None if whole is None else min(teacher.RECOVERED, whole)
@@ -341,12 +358,13 @@ def search(ge: goal_eval.GoalEval, tx: goal_eval.Text, B: int = 32) -> tuple[tor
     t1 = time.perf_counter()
     s_track = st.track(st.on[None])[0]
     _stage(st, "start set", t1, record, s_track=s_track)
-    return st.on.clone(), st, {"stages": record, "s_track_whole": whole, "floor": st.floor, "s_track": s_track,
+    return st.on.clone(), st, {"stages": record, "mode": mode, "s_track_whole": whole, "floor": st.floor, "s_track": s_track,
+                               "checks": st.checks, "check_seconds": st.check_seconds, "sets": st.measured,
                                "seconds": time.perf_counter() - t0}
 
 
 def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 32, vpd_answer: dict | None = None,
-          vpd_order: list | None = None, accept: tuple = ("changed",), **kw) -> tuple[dict, dict, dict]:
+          vpd_order: list | None = None, accept: tuple = ("changed",), mode: str = "pp", **kw) -> tuple[dict, dict, dict]:
     """Steps 1-5 on a text: teacher.teach's (circuits, summary row, path file) with the reads-first start set and the
     joint path (teacher.joint_path, its steps admitted by teacher.Acceptance's accept terms) given as its path, the
     connections admitted by the same terms; the row's "reads" the search's record. kw: teacher.teach's options."""
@@ -358,7 +376,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
     if tx.vpd is None:
         raise ValueError("no VPD answer: run with the causal-importance network or pass --vpd")
-    found, st, record = search(ge, tx, B)
+    found, st, record = search(ge, tx, B, mode)
     pr = st.pr
     index = {nd: i for i, nd in enumerate(pr.nodes)}
     order = vpd_order if vpd_order is not None else nat._vpd_order(ids, targets)
@@ -370,6 +388,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     hook, base = None, None
     if accept:
         acceptance = teacher.Acceptance(ge, tx, accept)
+        if mode == "pp":                                     # its "changed" term path-patched (until teacher.Acceptance takes a mode)
+            acceptance.scores = lambda graphs: [{"s_track": r["s_track_pp"]} for r in ge.changed_search(tx, graphs, DRAWS, mode="pp")]
         hook, base = acceptance.hook(lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True), start)
     path = teacher.joint_path(pr, start, st.empty, st.vpd, hook, base)
     on = start.clone()
@@ -381,7 +401,9 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     path_file = {"start_nodes": [[n, c, t] for n, t, c in (pr.nodes[i] for i in start.nonzero().flatten().tolist())],
                  "start_index": start.nonzero().flatten().tolist(), "steps": path,
                  "f1_index": found.nonzero().flatten().tolist(), "top_k": k}
-    circuits, row, path_out = teacher.teach(ge, ids, targets, B, vpd_answer, vpd_order, from_path=path_file, accept=accept, **kw)
+    # the connections' acceptance is teacher.teach's, in C's semantics only (until it takes a mode): none in pp mode
+    circuits, row, path_out = teacher.teach(ge, ids, targets, B, vpd_answer, vpd_order, from_path=path_file,
+                                            accept=accept if mode == "c" else (), **kw)
     row["reads"] = {key: v for key, v in record.items() if key != "stages"}
     row["reads"]["sizes"] = {"found": int(found.sum()), "start": int(start.sum()), "top_k": k}
     circuits["reads"] = record
@@ -402,6 +424,7 @@ def main():
     ap.add_argument("--max-nodes", type=int, default=teacher.MAX_NODES, help="the pick among path points of at most this many nodes")
     ap.add_argument("--max-tokens", type=int, default=components.ANSWER_BUDGET, help="the answer at most this many tokens (0: not checked)")
     ap.add_argument("--accept", default="changed", help="teacher.py's --accept for the joint path and connections (the search's own: changed)")
+    ap.add_argument("--mode", choices=tuple(TRACK), default="pp", help="the changed-input term: pp (s_track_pp, path-patched) or c (s_track)")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
@@ -423,7 +446,7 @@ def main():
         circuits, row, path_file = teach(ge, ids, targets, args.batch, sv.get("answer"), sv.get("order"), edges=args.edges,
                                          max_nodes=args.max_nodes, tokens=tokens, max_tokens=args.max_tokens,
                                          repair_pool=pool, no_strand=args.no_strand, edge_levels=args.edge_levels,
-                                         accept=tuple(k for k in args.accept.split(",") if k))
+                                         accept=tuple(k for k in args.accept.split(",") if k), mode=args.mode)
         for name, c in circuits.items():
             (args.out / f"{task}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{task}.path.json").write_text(json.dumps(path_file))
@@ -433,7 +456,7 @@ def main():
         print(f"{task}: reads-first set {r['sizes']['found']} (start {r['sizes']['start']} with top-{r['sizes']['top_k']}, s_track "
               f"{r['s_track']}); pick ({row['pick']}) {b['size']} at {b['positions']} positions F1 {b['f1']:.3f} N {b['n']:.3f}"
               + (f"; connections {row['best_edges']['edges']}, graph F1 {row['best_edges']['f1_graph']:.3f}" if "best_edges" in row else "")
-              + f"; search {r['seconds']:.0f}s, all {row['seconds']:.0f}s", flush=True)
+              + f"; search {r['seconds']:.0f}s ({r['checks']} checks in {r['check_seconds']:.0f}s), all {row['seconds']:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

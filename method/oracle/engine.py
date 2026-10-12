@@ -15,7 +15,7 @@ the bit). masks: {site: [B, T, K]} floats (K = the site's columns), with or with
 subcomponent outside the columns at 1 instead (folded into the remainder: W - V_K U_K, or V U - V_K U_K with the
 remainders off): the whole model with a few subcomponents' masks free, as cheap as the model itself.
 precision: "score", float32 with vpd_model's own norms and GELU (the numbers to report); "tf32" (CUDA: TF32 tensor-core
-matmuls) and "bf16" (bfloat16 autocast), with torch's fused norms and GELU, for a search's steps only, whose result is
+matmuls) and "bf16" (bfloat16 products of weights cast once), with torch's fused norms and GELU, for a search's steps only, whose result is
 then scored again with "score" (engine.rescore checks that). compile: the search precisions' forward under
 torch.compile (one graph per batch size: keep B fixed in a search; on an RTX A5000 bf16 forward+backward 76 -> 48 ms
 at B = 32); "score" stays eager.
@@ -77,18 +77,42 @@ class Engine:
             self.R[n] = st.delta_T  # [d_in, d_out]: the remainder W - V U, transposed (native.model)
             if outside == "on" and cols is not None:  # every other subcomponent on, with the remainder or alone
                 self.R[n] = ((st.W.T if live else st.V @ st.U) - self.V[n] @ self.U[n]).contiguous()
+        self._dt, self._cast = None, {}  # the products' dtype in the current run (None: float32), the weights' casts
         self._search = torch.compile(self.hidden, dynamic=False) if compile else self.hidden
 
     def width(self, n: str) -> int:
         """The number of a site's columns (a mask's last dimension)."""
         return self.V[n].shape[1]
 
+    def _w(self, n: str) -> tuple:
+        """(V, U, R) of site n in the run's product dtype: float32, or bf16 copies made once (a search's bf16 steps:
+        the products' inputs cast once each, the weights never again)."""
+        if self._dt is None:
+            return self.V[n], self.U[n], self.R[n]
+        if self._dt not in self._cast:
+            self._cast[self._dt] = {k: tuple(w[k].to(self._dt) for w in (self.V, self.U, self.R)) for k in self.V}
+        return self._cast[self._dt][n]
+
+    def _mm(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        return x.to(w.dtype) @ w
+
+    @contextlib.contextmanager
+    def _dtype(self, precision: str):
+        """The products' dtype for a run: bf16 for the bf16 precision, float32 otherwise."""
+        self._dt = torch.bfloat16 if precision == "bf16" else None
+        try:
+            yield
+        finally:
+            self._dt = None
+
     def _site(self, n: str, h: torch.Tensor, m: torch.Tensor, rec: tuple | None = None) -> torch.Tensor:
-        a = h @ self.V[n]
+        V, U, Rw = self._w(n)
+        h = h.to(V.dtype)
+        a = h @ V
         if rec is not None and n in rec[0]:  # reads: the activations at the asked (row, position, column)s
             rec[1][n] = a[rec[0][n]]
-        out = (a * m) @ self.U[n]
-        return out + h @ self.R[n] if self.fixed else out
+        out = (a * m.to(a.dtype)) @ U
+        return out + h @ Rw if self.fixed else out
 
     def _steps(self, fused: bool):
         """(norm, activation): torch's fused kernels, or vpd_model's own."""
@@ -113,7 +137,7 @@ class Engine:
                 return self._last(masks, x, h, name, norm, act, B)
             q, k, v = (self._site(name(kd), h, masks[name(kd)], rec).view(B, T, H, hd).transpose(1, 2)
                        for kd in ("q_proj", "k_proj", "v_proj"))
-            y = F.scaled_dot_product_attention(tg._rope(q, T), tg._rope(k, T), v, is_causal=True)
+            y = F.scaled_dot_product_attention(tg._rope(q, T).to(v.dtype), tg._rope(k, T).to(v.dtype), v, is_causal=True)
             x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, T, -1), masks[name("o_proj")], rec)
             h = norm(x, tg.norms[2 * i + 1])
             x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, masks[name("c_fc")], rec)), masks[name("down_proj")], rec)
@@ -127,8 +151,8 @@ class Engine:
         q = self._site(name("q_proj"), h[:, sel], at(masks[name("q_proj")])).view(B, n, H, hd).transpose(1, 2)
         k, v = (self._site(name(kd), h, masks[name(kd)]).view(B, T, H, hd).transpose(1, 2) for kd in ("k_proj", "v_proj"))
         half = hd // 2
-        q = q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]  # _rope at the targets
-        y = F.scaled_dot_product_attention(q, tg._rope(k, T), v, attn_mask=self._causal_targets)
+        q = (q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]).to(v.dtype)  # _rope at the targets
+        y = F.scaled_dot_product_attention(q, tg._rope(k, T).to(v.dtype), v, attn_mask=self._causal_targets)
         x = x[:, sel] + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, n, -1), at(masks[name("o_proj")]))
         h = norm(x, tg.norms[2 * tg.n_layer - 1])
         x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, at(masks[name("c_fc")]))), at(masks[name("down_proj")]))
@@ -147,7 +171,7 @@ class Engine:
         if reads is not None and precision != "score":
             raise ValueError("reads come from the float32 run (score)")
         rec = None if reads is None else (reads, {})
-        with _precision(precision, self.dev):
+        with _precision(precision, self.dev), self._dtype(precision):
             h = self.hidden(masks, search=False, rec=rec) if precision == "score" else self._search(masks, search=True)
         lq = torch.log_softmax(h.float() @ self.tg.wte.T, -1)  # the logits in float32 at every precision
         return lq if rec is None else (lq, rec[1])
@@ -285,7 +309,7 @@ class Engine:
             raise ValueError(f"precision is one of {PRECISIONS}")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
         p = self._rows(plan, B)
-        with _precision(precision, self.dev):
+        with _precision(precision, self.dev), self._dtype(precision):
             rec = None if reads is None else (reads, {})
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
                                    None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec)
@@ -433,13 +457,14 @@ class Engine:
             for kd in ("q_proj", "k_proj", "v_proj"):
                 n = name(kd)
                 hn, xn = (h[:, sel], x[:, sel]) if n in S else (h, x)
-                a = hn @ self.V[n]
+                a = self._mm(hn, self._w(n)[0])
                 A[kd] = done(n, read(n, a, resid_in(n, xn, n1)) if n in R else a)
 
             def out(kd, z, scale):
                 n = name(kd)
-                o = (A[kd] * scale) @ self.U[n]
-                return o + z @ self.R[n] if self.fixed else o
+                _, U, Rw = self._w(n)
+                o = (A[kd] * scale.to(A[kd].dtype)) @ U
+                return o + self._mm(z, Rw) if self.fixed else o
 
             def scale(kd):  # query and key nodes at 1 in the pattern
                 n = name(kd)
@@ -448,28 +473,28 @@ class Engine:
 
             heads = lambda y: y.reshape(B, y.shape[1], H, hd).transpose(1, 2)  # noqa: E731
             nq, nv, no = name("q_proj"), name("v_proj"), name("o_proj")
-            k = tg._rope(heads(out("k_proj", h, scale("k_proj"))), T)
             v = heads(out("v_proj", h, u[nv]))
+            k = tg._rope(heads(out("k_proj", h, scale("k_proj"))), T).to(v.dtype)
             if nq in S:  # rotary at the targets, each target's query over the keys up to it
                 q = heads(out("q_proj", h[:, sel], scale("q_proj")))
                 half = hd // 2
-                q = q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]
+                q = (q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]).to(v.dtype)
                 y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._causal_targets)
             else:
-                q = tg._rope(heads(out("q_proj", h, scale("q_proj"))), T)
+                q = tg._rope(heads(out("q_proj", h, scale("q_proj"))), T).to(v.dtype)
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2).reshape(B, y.shape[2], -1)
-            a = y @ self.V[no]
+            a = self._mm(y, self._w(no)[0])
             if no in R:
                 b, t, _ = R[no]
                 inp = y[b, t].float()
                 if any(r == no for r, _ in Eg):  # the pattern at the readers' positions [B, H, positions, T]
                     if no in S:  # the queries are the targets'
-                        P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~self._causal_targets, float("-inf")).softmax(-1)
+                        P = ((q @ k.transpose(-1, -2)).float() / math.sqrt(hd)).masked_fill(~self._causal_targets, float("-inf")).softmax(-1)
                         idx = t
                     else:
                         pos, idx = p["positions"][no]
-                        z = (q[:, :, pos] @ k.transpose(-1, -2)) / math.sqrt(hd)
+                        z = (q[:, :, pos] @ k.transpose(-1, -2)).float() / math.sqrt(hd)
                         P = z.masked_fill(torch.arange(T, device=self.dev)[None, :] > pos[:, None], float("-inf")).softmax(-1)
                     for wn, ri, wi, s in shares(no):
                         pat = P[b[ri], :, idx[ri], Wr[wn][1][wi]]  # [n, H]: how much each reader's position attends to its writer's
@@ -482,11 +507,11 @@ class Engine:
             x = x + out("o_proj", y, cut(no, u[no]))
             h = norm(x, n2)
             nf, nd = name("c_fc"), name("down_proj")
-            a = h @ self.V[nf]
+            a = self._mm(h, self._w(nf)[0])
             A["c_fc"] = done(nf, read(nf, a, resid_in(nf, x, n2)) if nf in R else a)
             pre = out("c_fc", h, cut(nf, u[nf]))
             g = act(pre)
-            a = g @ self.V[nd]
+            a = self._mm(g, self._w(nd)[0])
             if nd in R:
                 b, t, _ = R[nd]
                 a = read(nd, a, act(pre[b, t] + topup(nd, pre.shape[-1])))
@@ -532,8 +557,5 @@ def _precision(precision: str, dev):
             yield
         finally:
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = keep
-    elif precision == "bf16":
-        with torch.autocast(str(dev).split(":")[0], dtype=torch.bfloat16):
-            yield
-    else:
+    else:  # bf16: the engine's own casts (Engine._dtype), not autocast's per product
         yield

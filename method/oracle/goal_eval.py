@@ -172,15 +172,8 @@ class Text:
         if cap.seen != set(nat.names):
             raise RuntimeError("did not capture every remainder product")
         self.rem = cap.values
-        self.prompts = nat.changes(self.ids, self.targets, n=ge.changes, seed=seed)
+        self.prompts, self.f2 = ge.probe(self.ids, self.targets, seed)  # f2: (position, held-out prompts)
         self.prompt_refs = [nat.reference([x], self.targets) for x in self.prompts]
-        self.f2 = []  # (position, held-out prompts)
-        if max(self.targets) >= 1:
-            moved, _ = nat.sensitivity(self.ids, self.targets, torch.Generator(device="cpu").manual_seed(seed))
-            total = float(moved.sum())
-            for j in (moved >= ge.share_floor * total).nonzero().flatten().tolist() if total > 0 else []:
-                p = j + 1
-                self.f2.append((p, carry.alternatives(nat, self.ids, p, ranks=ge.ranks)))
         self.ci = nat.importance(self.ids) if nat.has_importance else None
         self.cut_cache: dict = {}  # (writer, reader) -> F3's KL of its cut: answers on a text share edges
         self._flow = None
@@ -201,6 +194,24 @@ class GoalEval:
         self.changes, self.ranks, self.share_floor = changes, tuple(ranks), share_floor
         self.random_pairs, self.max_edges, self.chunk, self.cut_chunk = random_pairs, max_edges, chunk, cut_chunk
         self.hooks: dict = {"E1": None, "E2": None}
+        self.probes: dict = {}  # (ids, targets, seed) -> the changed prompts and F2's prompts, as int32 arrays
+
+    def probe(self, ids: list[int], targets: list[int], seed: int) -> tuple[list, list]:
+        """(the text's changed prompts (Native.changes), F2's [(position, held-out prompts)]), kept per text: the
+        sensitivity probe behind both is most of a text's preparation (16 s at T 395 on the Mac's GPU)."""
+        nat, key = self.nat, (tuple(ids), tuple(targets), seed)
+        if key not in self.probes:
+            probe = {}
+            prompts = nat.changes(ids, targets, n=self.changes, seed=seed, probe=probe)
+            f2 = []
+            if "moved" in probe:
+                moved = probe["moved"]
+                total = float(moved.sum())
+                for j in (moved >= self.share_floor * total).nonzero().flatten().tolist() if total > 0 else []:
+                    f2.append((j + 1, np.asarray(carry.alternatives(nat, ids, j + 1, ranks=self.ranks), dtype=np.int32)))
+            self.probes[key] = (np.asarray(prompts, dtype=np.int32), [getattr(x, "weight", 1.0) for x in prompts], f2)
+        arr, weights, f2 = self.probes[key]
+        return [native.Changed(x.tolist(), w) for x, w in zip(arr, weights)], [(p, a.tolist()) for p, a in f2]
 
     def text(self, ids: list[int], targets: list[int], seed: int | None = None, task: dict | None = None) -> Text:
         return Text(self, ids, targets, native.task_seed(str(ids[:8])) if seed is None else seed, task)
@@ -318,9 +329,10 @@ class GoalEval:
 
         new = self._cut_activations(tx, [pairs[j] for j in inner]) if inner else None
         at = {j: i for i, j in enumerate(inner)}
-        for s0 in range(0, len(inner), self.cut_chunk):
-            js = inner[s0:s0 + self.cut_chunk]
-            B = len(js)
+        B = min(self.cut_chunk, len(inner))  # every batch this size (the last padded with its own last cut): the
+        for s0 in range(0, len(inner), B):  # model's states for reuse are computed once per text and batch size
+            js = inner[s0:s0 + B]
+            js = js + [js[-1]] * (B - len(js))
             by = {}
             for b, j in enumerate(js):
                 r = pairs[j][1]
@@ -352,7 +364,6 @@ class GoalEval:
             lq = torch.log_softmax((vpd_model.rms(x, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
             for b, k in enumerate(carry.kl(tx.ref, lq).tolist()):
                 res[final[b]] = k
-        nat._drop_states()
         return res
 
     def flow(self, tx: Text) -> dict:
@@ -521,6 +532,17 @@ def _auc(stated: list[float], unstated: list[float]) -> float | None:
 # ---- answer sets and the table
 
 
+def answer_file(directory: Path, stem: str) -> Path | None:
+    """A text's answer in an answer set's directory: <stem>.py (a graph program), else <stem>.json holding a circuit
+    ("nodes"; a search's directory also keeps each answer's scores as <stem>.json)."""
+    py, js = directory / f"{stem}.py", directory / f"{stem}.json"
+    if py.exists():
+        return py
+    if js.exists() and "nodes" in json.loads(js.read_text()):
+        return js
+    return None
+
+
 def load_answer(path: Path, task: dict, targets: list[int], nat: native.Native) -> tuple[native.Graph, dict, str]:
     """(graph, defects, explanation) of an answer file: Circuit JSON (.json) or a graph program (.py, traced by mech)."""
     T = len(task["prompts"][0]["token_ids"])
@@ -568,9 +590,7 @@ def score_sets(sets: dict, split: str, n: int, ge: GoalEval | None = None, basel
     for p in native.tasks(split)[:n]:
         task = json.loads(p.read_text())
         ids, targets = native.text(p)
-        found = {s: next((Path(d) / f"{p.stem}{ext}" for ext in (".json", ".py") if (Path(d) / f"{p.stem}{ext}").exists()), None)
-                 for s, d in sets.items()}
-        found = {s: f for s, f in found.items() if f is not None}
+        found = {s: f for s, f in ((s, answer_file(Path(d), p.stem)) for s, d in sets.items()) if f is not None}
         if not found:
             continue
         tx = ge.text(ids, targets, native.task_seed(p.stem), task)

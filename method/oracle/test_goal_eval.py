@@ -1,7 +1,7 @@
 """Checks of the goal scorecard (goal_eval.py): exactness on a tiny random model, every cut against an independent
 forward pass, and the same on two held-out vpd4l texts (skipped without ~/mpd-data's model).
 
-  MPD_MEM_GIB=24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_goal_eval.py -s
+  ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_goal_eval.py -s
 """
 
 import math
@@ -49,15 +49,16 @@ def tiny_native(seed: int = 0, layers: int = 2, d: int = 16, heads: int = 2, voc
     proj = {n: r(UV[n][1].shape[0], C) for n in names}
     vpd = vpd_model.VPD(target, None, UV)
     vpd.ci_fn = lambda acts: {n: acts[n] @ proj[n].to(acts[n].device) for n in names}
-    nat = native.Native.__new__(native.Native)
-    nat.dev = "cpu"
-    nat.target, nat.vpd, nat.names, nat.C = target, vpd, vpd.names, vpd.C
-    nat._consts, nat._rec = {}, (None, None, None)
-    for n in names:
+    for n in names:  # what native.model does to vpd4l
         st = target.site(n)
         st.delta_T = (st.W - (st.V @ st.U).T).T.contiguous()
         st._forward = types.MethodType(native._forward_cached, st)
-    return nat
+    loaded = native.model
+    native.model = lambda dev: (target, vpd)  # Native's own constructor, on this model
+    try:
+        return native.Native("cpu")
+    finally:
+        native.model = loaded
 
 
 # ---- an independent forward pass (no Native.run)
@@ -336,3 +337,18 @@ def test_real_texts(real, task):
     for (w, r), k in zip(pairs, ge.cuts(tx, pairs)):
         want = naive_cut(nat, tx.ids, tx.targets, w, r)
         assert abs(k - want) < 1e-4 + 2e-3 * abs(want), (w, r, k, want)
+
+
+def test_probe_is_kept(tiny):
+    """A text's changed prompts and F2 prompts come from one sensitivity probe, kept per text: a second preparation
+    of the text gets the same prompts without probing again."""
+    nat, ge, tx = tiny
+    calls = []
+    sensitivity = nat.sensitivity
+    nat.sensitivity = lambda *a, **k: calls.append(1) or sensitivity(*a, **k)
+    try:
+        again = ge.text(tx.ids, tx.targets, seed=tx.seed)
+    finally:
+        del nat.sensitivity
+    assert not calls
+    assert [list(x) for x in again.prompts] == [list(x) for x in tx.prompts] and again.f2 == tx.f2

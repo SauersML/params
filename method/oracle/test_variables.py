@@ -2,7 +2,8 @@
 (skipped without one or vpd4l's texts): the scorer's patched runs are native.run's interchange patches (an independent
 forward pass); the lead's cases: every subcomponent at 233 for "copied word" (inputs 232 and 233) reproduces the
 on-target changes and leaves the off-target ones alone, the last layer at the target fails off-target; two groups
-patched together reproduce a change of both inputs; names parse as goal_eval's circuits.
+patched together reproduce a change of both inputs; in a circuit's stated graph (C's semantics) the patched runs are
+goal_eval.graph_ref's interchange and its activations graph_ref's reads; names parse as goal_eval's circuits.
 
   ~/.local/bin/mem-lease 16 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_variables.py -s
 """
@@ -49,7 +50,7 @@ def test_patched_runs_are_native_patches(case):
     src = sc._text(x, tx.targets)
     mine = sc._text(tx.ids, tx.targets)
     group = variables.parse([{"inputs": [233], "group": at(233)[::7] + top[::5]}], nat.C)[0]["group"]
-    got = sc._patched(mine["E"], [(src["act"], group), (src["act"], None)])
+    got = sc._patched(mine, [(src["act"], group), (src["act"], None)])
     T = tx.T
     patch = {n: (torch.zeros(2, T, nat.C[n], dtype=torch.bool, device=nat.dev), torch.zeros(2, T, nat.C[n], device=nat.dev))
              for n in nat.names}
@@ -85,6 +86,39 @@ def test_composition(case):
     got = variables.Scorer(ge).score(tx, vs, "eval", 3)
     assert got["pairs"] and got["pairs"][0]["draws_comp"], got["pairs"]
     assert got["pairs"][0]["f_comp"] > 0.99, got["pairs"]
+
+
+def test_circuit_world_is_graph_ref(case):
+    """In a circuit's stated graph (C's semantics; the subcomponents most active at 233 and 288, half of the model's
+    connections among them stated): the circuit's activations on a changed text are graph_ref's reads there, and the
+    circuit on x with its nodes at 233 set to those values is graph_ref's interchange (KL below 1e-5 bits)."""
+    nat, ge, tx, _, _ = case
+    sc = variables.Scorer(ge)
+    model = sc._text(tx.ids, tx.targets)
+    nodes = []
+    for n in nat.names:
+        for t in (233, 288):
+            nodes += [(n, t, int(c)) for c in model["act"][n][t].abs().topk(2).indices.tolist()]
+    par, out = native.all_edges(nodes, tx.targets)
+    graph = native.Graph(nodes, {r: ws[::2] for r, ws in par.items()}, out[::2])
+    x = list(tx.ids)
+    x[233] = 512
+    src = sc._text(x, tx.targets, graph)
+    rec = {}
+    with torch.no_grad():
+        ge.graph_ref(x, tx.targets, graph, record=rec)
+    for nd in nodes:
+        k = src["col"][nd[0]][nd[2]]
+        assert abs(float(src["act"][nd[0]][nd[1], k]) - float(rec[nd][0])) < 1e-4 * (1 + abs(float(rec[nd][0]))), nd
+    mine = sc._text(tx.ids, tx.targets, graph)
+    group = [nd for nd in nodes if nd[1] == 233]
+    got = sc._patched(mine, [(src["act"], group)])
+    with torch.no_grad():
+        want = ge.graph_ref(tx.ids, tx.targets, graph, patch={nd: float(rec[nd][0]) for nd in group})
+    assert float(carry.kl(want, got).abs().max()) < 1e-5
+    res = sc.score(tx, variables.parse([{"name": "233", "inputs": [233], "group": [[n, c, t] for n, t, c in group]}], nat.C),
+                   "eval", 3, graph=graph)
+    assert res["circuit"]["variables"][0]["draws_on"] and res["variables"][0]["draws_on"]
 
 
 def test_parse(case):

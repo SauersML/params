@@ -67,7 +67,7 @@ class Engine:
         with torch.no_grad():
             self.ref = nat.reference([self.ids], self.targets)
             self.emb = tg.wte[torch.tensor(self.ids, device=self.dev)][None]  # [1, T, d]
-        self._targets = torch.tensor(self.targets, device=self.dev)
+        self._targets = torch.tensor(self.targets, device=self.dev)  # (indexing by a list copies it to the device: a synchronization)
         self._causal_targets = torch.arange(self.T, device=self.dev)[None, :] <= self._targets[:, None]  # [targets, T]
         self.columns = {n: (None if columns is None or columns.get(n) is None else columns[n].to(self.dev)) for n in nat.names}
         self.V, self.U, self.R = {}, {}, {}
@@ -142,7 +142,7 @@ class Engine:
             x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, T, -1), masks[name("o_proj")], rec)
             h = norm(x, tg.norms[2 * i + 1])
             x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, masks[name("c_fc")], rec)), masks[name("down_proj")], rec)
-        return norm(x, tg.ln_f)[:, self.targets]  # the final norm over every position, as vpd_model.Target.hidden
+        return norm(x, tg.ln_f)[:, self._targets]  # the final norm over every position, as vpd_model.Target.hidden
 
     def _last(self, masks, x, h, name, norm, act, B):
         """The last layer at the targets: keys and values at every position, the rest at the targets."""
@@ -518,7 +518,7 @@ class Engine:
                 a = read(nd, a, act(pre[b, t] + topup(nd, pre.shape[-1])))
             A["down_proj"] = done(nd, a)
             x = x + out("down_proj", g, cut(nd, u[nd]))
-        z = x if sel is not None else x[:, self.targets]
+        z = x if sel is not None else x[:, self._targets]
         if cout is not None:  # the connections into the prediction, every writer site's at once
             b, ti, gi, j, fx, uc = cout
             z = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)

@@ -25,7 +25,7 @@ SRC=${SRC:-/Users/user/params}  # a source tree (a clean copy of main while othe
 PY=/Users/user/mpd-data/venv/bin/python; TPY=/Users/user/mpd-data/tinker-venv/bin/python
 export HF_HUB_OFFLINE=1 PYTORCH_MPS_PREFER_METAL=1
 RR=(rerender ${MEASURED:+--measured} ${POOL:+--pool})  # MEASURED: the measured input arm (components.measured()); POOL: the full candidate pool (candidate_pool())
-TH=(${THINKING:+--thinking})  # THINKING: Qwen3's thinking mode in SFT (empty blocks in the targets) and sampling
+TH=(${THINKING:+--thinking})  # THINKING: Qwen3's thinking mode in sampling (the SFT keeps the empty think block in the prompt)
 [ -n "${THINKING:-}" ] && MAXTOK=${MAXTOK_THINKING:-16384}  # one generation limit, thinking included (no thinking budget)
 ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $ROWS $S/rows.jsonl  # questions in the current format
 MPD_MEM_GIB=8 $PY $SRC/method/oracle/components.py dataset $S/rows.jsonl $TEACHER $S/sft.jsonl \
@@ -68,8 +68,9 @@ for x in ${=EXTRA:-}; do XSETS+=(--set "${x%%=*}=$S/eval.json:${x%%=*}"); done
 if [ -d $S/ref/vpd_pruned ]; then
   PRUNED=(vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
 fi
-# C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh)
-EDIT_EVAL=${EDIT_EVAL:-} bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S sft_nocircuit=$S/samples_nocircuit.jsonl \
+# C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh), with the held-out
+# teachers as reward v3's teacher-dominance reference
+EDIT_EVAL=${EDIT_EVAL:-} TEACHER=$HELDOUT_TEACHER bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S sft_nocircuit=$S/samples_nocircuit.jsonl \
   zeroshot=$S/zeroshot_first.jsonl$E1Z teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" ${=EXTRA:-} > $S/eval_pod.log 2>&1
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.json $S/eval.json
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.log $S/eval.log

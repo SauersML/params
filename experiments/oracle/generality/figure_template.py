@@ -84,7 +84,7 @@ def scores(ax):
     kinds = [("copy_columns", "copy template (stated)", GREEN), ("copy_columns_all", "copy template (every connection)", TEAL),
              ("influential", "the text's own influential blocks", AMBER), ("vpd_listed", "VPD's top k, same listed size", RED),
              ("vpd_expanded", "VPD's top k, same subcomponent count", SOFT)]
-    terms = [("s_point_c", "prediction"), ("s_track_pp", "follows changes"), ("s_interchange_pp", "interchange"),
+    terms = [("s_point_c", "prediction"), ("s_track_pp", "follows changes"), ("s_interchange_pp", "interchange (path-patched)"),
              ("s_donor_near", "near donors"), ("c5", "harmonic C")]
     for task, d in by.items():
         tpl = d.get("copy_columns")
@@ -92,6 +92,7 @@ def scores(ax):
             d["vpd_listed"] = d.get(f"vpd@{tpl['listed']}")
             d["vpd_expanded"] = d.get(f"vpd@{tpl['nodes']}")
     for j, (k, lab, color) in enumerate(kinds):
+        labelled = False
         for i, (m, _) in enumerate(terms):
             vals = [d[k][m] for d in by.values() if d.get(k) and d[k].get(m) is not None]
             if not vals:
@@ -99,7 +100,8 @@ def scores(ax):
             y = i + (j - 2) * 0.15
             ax.scatter(vals, np.full(len(vals), y) + np.random.default_rng(j * 7 + i).uniform(-0.04, 0.04, len(vals)),
                        s=14, color=color, alpha=0.35, zorder=2, linewidths=0)
-            ax.scatter([np.mean(vals)], [y], s=110, color=color, edgecolor=INK, zorder=3, label=lab if i == 0 else None)
+            ax.scatter([np.mean(vals)], [y], s=110, color=color, edgecolor=INK, zorder=3, label=None if labelled else lab)
+            labelled = True
     ax.set_yticks(range(len(terms)))
     ax.set_yticklabels([t for _, t in terms])
     ax.invert_yaxis()

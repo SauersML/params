@@ -263,6 +263,54 @@ def cover(task: str):
     print(task, "best", best, flush=True)
 
 
+def annotate():
+    """Each template's validation written into its JSON (MECH): per scored term the mean over the held-out texts its
+    family's rule matched (library templates) or the held-out copy texts (copy templates), the texts scored, and
+    beside them the same texts' influential-blocks start and VPD's top k at the template's listed size."""
+    import copy_template
+
+    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_donor_near", "s_donor_far", "c5", "bits")
+    mean = lambda rs, m: (float(np.mean([r[m] for r in rs if r.get(m) is not None])) if any(r.get(m) is not None for r in rs) else None)  # noqa: E731
+    lib = json.loads((DATA / "library_texts.json").read_text())
+    rows = []
+    for p in [DATA / "library.jsonl"] + templates.run_outputs("library*.jsonl"):
+        if p.exists():
+            rows += [json.loads(line) for line in p.read_text().splitlines()]
+    for f, info in lib.items():
+        if f.startswith("_"):
+            continue
+        held = set(info["heldout"])
+        rs = [r for r in rows if r["task"] in held]
+        refs = {"influential_blocks": [r for r in rs if r["kind"] == "influential_blocks"],
+                "vpd_listed": [r for r in rs if r["kind"] == "vpd" and "listed" in r["variant"]]}
+        for variant in ("core", "carriers", "context"):
+            path = MECH / f"{safe(f)}__{variant}.json"
+            tpl = json.loads(path.read_text())
+            sel = [r for r in rs if r["kind"] == "template" and r.get("family") == f and r["variant"] == variant]
+            tpl["validation"] = {"texts": sorted({r["task"] for r in sel}), "split": "train texts without teacher circuits, the rule matched",
+                                 "template": {m: mean(sel, m) for m in terms},
+                                 **{k: {m: mean(v, m) for m in terms} for k, v in refs.items()}}
+            path.write_text(json.dumps(tpl, indent=1))
+    cr = []
+    for p in [DATA / "copy_template.jsonl"] + templates.run_outputs("copy_template*.jsonl"):
+        if p.exists():
+            cr += [json.loads(line) for line in p.read_text().splitlines()]
+    held = {x["task"] for x in json.loads((DATA / "copy_heldout.json").read_text())["copy"]}
+    for name in copy_template.NAMES:
+        path = MECH / f"{name}.json"
+        tpl = json.loads(path.read_text())
+        sel = [r for r in cr if r["task"] in held and r.get("name") == name]
+        tasks = {r["task"] for r in sel}
+        ib = [r for r in cr if r["task"] in tasks and r["kind"] == "influential_blocks"]
+        vl = [r for r in cr if r["task"] in tasks and r["kind"] == "vpd" and sel and
+              r["name"] == f"vpd@{next(s_['listed'] for s_ in sel if s_['task'] == r['task'])}"]
+        tpl["validation"] = {"texts": sorted(tasks), "split": "held-out copy texts (copy_heldout.json)",
+                             "template": {m: mean(sel, m) for m in terms}, "influential_blocks": {m: mean(ib, m) for m in terms},
+                             "vpd_listed": {m: mean(vl, m) for m in terms}}
+        path.write_text(json.dumps(tpl, indent=1))
+    print("annotated", MECH)
+
+
 def report():
     lib = json.loads((DATA / "library_texts.json").read_text())
     paths = [DATA / "library.jsonl"] + templates.run_outputs("library*.jsonl")
@@ -317,7 +365,7 @@ def report():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("rules", "probe", "build", "score", "cover", "report"))
+    ap.add_argument("cmd", choices=("rules", "probe", "build", "score", "cover", "annotate", "report"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     if a.cmd == "rules":
@@ -330,5 +378,7 @@ if __name__ == "__main__":
         score(a.args[0], a.args[1:])
     elif a.cmd == "cover":
         cover(a.args[0])
+    elif a.cmd == "annotate":
+        annotate()
     else:
         report()

@@ -332,6 +332,30 @@ class Engine:
             p["_last"] = (R, Wr, Eg, out, S)
         return p["_last"]
 
+    def _resid_tables(self, p: dict, key: str, Wr: dict, Eg: dict, outs: dict) -> tuple:
+        """The connections from residual writers (attention and MLP outputs) as one list per reader site and one into
+        the prediction: each writer row's place among the residual writers' rows laid end to end in the order the run
+        computes them, and its write vector's row in every residual site's U end to end (kept on the plan under key).
+        A reader's top-up is then one gather and one index_add, not one of each per writer site."""
+        names = [native.site_name(i, k) for i in range(self.tg.n_layer) for k in ("o_proj", "down_proj")]
+        if not hasattr(self, "_Ures"):  # every residual writer site's write vectors, end to end
+            self._Ures = (torch.cat([self.U[n] for n in names]), dict(zip(names, torch.tensor([0] + [self.width(n) for n in names[:-1]]).cumsum(0).tolist())))
+        if key not in p:
+            coff = self._Ures[1]
+            off, at = {}, 0
+            for wn in names:
+                if wn in Wr:
+                    off[wn] = at
+                    at += len(Wr[wn][0])
+            per = {}
+            for (rn, wn), (ri, wi, j, fx) in Eg.items():
+                if wn in off:
+                    per.setdefault(rn, []).append((ri, off[wn] + wi, j, fx, coff[wn] + Wr[wn][2][wi]))
+            cons = {rn: tuple(torch.cat(x) for x in zip(*lst)) for rn, lst in per.items()}
+            lst = [(b, ti, off[wn] + wi, j, fx, coff[wn] + Wr[wn][2][wi]) for wn, (b, ti, wi, j, fx) in outs.items()]
+            p[key] = (off, cons, tuple(torch.cat(x) for x in zip(*lst)) if lst else None)
+        return p[key]
+
     def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None, rec: tuple | None = None) -> torch.Tensor:
         """The final normed residual stream at the targets [B, len(targets), d] of the graph runs. fused (a search's
         steps): torch's fused norms and GELU, and the last layer's queries, attention output and MLP at the targets
@@ -346,6 +370,8 @@ class Engine:
         narrow = fused and rec is None
         sel, S = None, set()  # the last layer's positions (the targets) and its sites that run only there
         aw, sw = {}, {}  # per writer site, its writer rows' activations and 1 - u
+        off, cons, cout = self._resid_tables(p, "_resid", Wr, Eg, outs)
+        res_a, res_s = [], []  # the residual writers' rows' activations and 1 - u, in their order (off)
 
         def cut(n, m):  # site n's [B or 1, T or 1, ...] tensor at the positions its steps run on
             return m[:, sel] if n in S and m.shape[1] > 1 else m
@@ -360,6 +386,9 @@ class Engine:
                 rec[1][n] = A[rec[0][n]].float()
             if n in Wr:
                 aw[n], sw[n] = A[Wr[n]], 1 - at(cut(n, u[n]), *Wr[n])
+                if n in off:
+                    res_a.append(aw[n])
+                    res_s.append(sw[n])
             return A
 
         def share(wn, wi, e):  # a connection's extra share in its reader's input: native e (1 - u_w) a_w, C -(1 - e) a_w
@@ -370,8 +399,16 @@ class Engine:
                 if r == rn:
                     yield wn, ri, wi, share(wn, wi, fx if ew is None else ew[j] * fx)
 
+        def resid_share(gi, j, fx, e_all):  # residual connections' shares from their writers' places gi
+            e = fx if e_all is None else e_all[j] * fx
+            a = torch.cat(res_a)[gi]
+            return (e - 1) * a if c else e * torch.cat(res_s)[gi] * a
+
         def topup(rn, width):  # [readers, width]: each reader node's stated parents' extra share
             out = torch.zeros(len(R[rn][0]), width, device=self.dev)
+            if rn in cons:  # every residual writer site's connections at once
+                ri, gi, j, fx, uc = cons[rn]
+                return _add_rows(out, ri, resid_share(gi, j, fx, ew), lambda k: self._Ures[0].index_select(0, uc[k]))
             for wn, ri, wi, s in shares(rn):
                 out = _add_rows(out, ri, s, lambda k, wn=wn, wi=wi: self.U[wn].index_select(0, Wr[wn][2][wi[k]]))
             return out
@@ -389,6 +426,7 @@ class Engine:
             if narrow and i == tg.n_layer - 1:  # the last layer: keys and values at every position, the rest at the targets
                 R, Wr, Eg, outs, S = self._last_tables(p)
                 sel = self._targets
+                off, cons, cout = self._resid_tables(p, "_resid_last", Wr, Eg, outs)
             n1, n2 = tg.norms[2 * i], tg.norms[2 * i + 1]
             h = norm(x, n1)
             A = {}
@@ -455,9 +493,9 @@ class Engine:
             A["down_proj"] = done(nd, a)
             x = x + out("down_proj", g, cut(nd, u[nd]))
         z = x if sel is not None else x[:, self.targets]
-        for wn, (b, ti, wi, j, fx) in outs.items():
-            s = share(wn, wi, fx if ow is None else ow[j] * fx)
-            z = z.index_put((b, ti), s[:, None] * self.U[wn].index_select(0, Wr[wn][2][wi]), accumulate=True)  # one per target
+        if cout is not None:  # the connections into the prediction, every writer site's at once
+            b, ti, gi, j, fx, uc = cout
+            z = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)
         return norm(z, tg.ln_f)
 
 

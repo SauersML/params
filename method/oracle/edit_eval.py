@@ -1050,6 +1050,7 @@ def _tasks(split: str, n: int, listed: str | None = None) -> list[dict]:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", help="torch device (native.device() otherwise)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("tokens")
     g = sub.add_parser("goals")
@@ -1078,7 +1079,7 @@ def main():
     if args.cmd == "table":
         return print(table([json.loads(x) for x in Path(args.rows).read_text().splitlines() if x.strip()],
                            json.loads(Path(args.copy).read_text()) if args.copy else None))
-    ee = EditEval()
+    ee = EditEval(native.Native(args.device))
     if args.cmd == "goals":
         with open(args.out, "w") as f:
             for task in _tasks(args.split, args.n, args.tasks):

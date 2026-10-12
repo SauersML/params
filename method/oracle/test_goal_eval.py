@@ -2375,3 +2375,60 @@ def test_pp_terms_equal_pp_run_loop_vpd4l(real):
     st = [goal_eval.strand(x, targets, nat.C) for x in graphs]
     assert _pp_loop_check(ge, tx, ge.track_pp(tx, graphs, "search", 16), st, "draws_track_pp") >= 2
     assert _pp_loop_check(ge, tx, ge.interchange_pp(tx, graphs[:1], "search", 4), st[:1], "draws_interchange_pp", held=True) >= 2
+
+
+def test_line_effects_pp_engine(tiny):
+    """line_effects(mode="pp") (every line deletion and changed text in one engine.Engine.path_patched(lines=) call)
+    gives each line's KL change as pp_run on the graph with that line removed (a node with its connections, token
+    edges and the pairs naming it; a connection; a token edge; a pair, its read keeping its entry), pooled over the
+    changed texts by how far each moves the model: within 1e-4, on a stated graph with blocks, token edges and pairs
+    (about 8 lines of each kind checked)."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    g = torch.Generator().manual_seed(13)
+    gr = goal_eval.strand(_pp_stated(_pp_nodes(every, g, 0.15, blocks=0.03), tx.targets, g, keep=0.7), tx.targets, nat.C)
+    out = ge.line_effects(tx, gr, mode="pp", split="search", draws=6)
+    moved = np.asarray(tx.moved, dtype=float)
+    positions = [q for q, _ in tx.f2]
+    got = ge._interchange_draws(tx, positions, "search", 6, first={q: -moved[q - 1] for q in positions})
+    assert got
+
+    def pooled(h):
+        acc = wsum = 0.0
+        for q, z in got:
+            x2 = list(tx.ids)
+            x2[q] = z
+            ref = nat.reference([x2], tx.targets)
+            w = float(carry.kl(ref, tx.ref)[0])
+            acc += w * float(carry.kl(ref, ge.pp_run(tx, x2, h))[0])
+            wsum += w
+        return acc / wsum
+
+    def like(h, **kw):  # a variant with gr's token edges and pairs unless given
+        for name in ("tok_edges", "tok_out", "pairs"):
+            setattr(h, name, kw.get(name, getattr(gr, name, None) or ([] if name != "pairs" else {})))
+        return h
+    base = pooled(gr)
+    assert abs(out["base_kl"] - base) <= 1e-4 * (1 + abs(base))
+    checks = []
+    for r in out["nodes"][::max(1, len(out["nodes"]) // 8)]:
+        nd = tuple(r["node"])
+        h = goal_eval._drop_nodes(gr, {nd})
+        checks.append((r, like(h, tok_edges=[(t, x) for t, x in gr.tok_edges if x != nd], pairs=getattr(h, "pairs", {}))))
+    for r in out["edges"][::max(1, len(out["edges"]) // 8)]:
+        w, rd = tuple(r["edge"][0]), None if r["edge"][1] == "out" else tuple(r["edge"][1])
+        par = {x: [v for v in ws if not (x == rd and v == w)] for x, ws in gr.parents.items()}
+        checks.append((r, like(native.Graph(list(gr.nodes), {x: ws for x, ws in par.items() if ws}, [v for v in gr.out if not (rd is None and v == w)]))))
+    for r in out["token_edges"][::max(1, len(out["token_edges"]) // 8)]:
+        t, rd = r["edge"][0], None if r["edge"][1] == "out" else tuple(r["edge"][1])
+        checks.append((r, like(native.Graph(list(gr.nodes), dict(gr.parents), list(gr.out)), tok_edges=[x for x in gr.tok_edges if x != (t, rd)],
+                              tok_out=[x for x in gr.tok_out if not (rd is None and x == t)])))
+    for r in out["pairs"][::max(1, len(out["pairs"]) // 8)]:
+        L, t, qa, kb = r["pair"]
+        pr = (None if qa == "rest" else tuple(qa), None if kb == "rest" else tuple(kb))
+        checks.append((r, like(native.Graph(list(gr.nodes), dict(gr.parents), list(gr.out)),
+                              pairs={rd: [x for x in ps if not (rd == (L, t) and x == pr)] for rd, ps in gr.pairs.items()})))
+    assert out["pairs"] and out["token_edges"] and len(checks) >= 10
+    for r, h in checks:
+        want = pooled(h) - base
+        assert abs(r["delta_kl"] - want) <= 1e-4 * (1 + abs(want)), (r, want)

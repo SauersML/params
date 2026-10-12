@@ -583,6 +583,22 @@ def _harmonic(terms: list) -> float | None:
     return 0.0 if min(terms) <= 0 else len(terms) / sum(1.0 / t for t in terms)
 
 
+class _Parts:
+    """A lever's parts (site, position, subcomponent) by their index, the sites end to end (per site positions t and
+    columns c, index tensors): each made when asked for (an adversary reads a few hundred of a circuit's ~10^5)."""
+
+    def __init__(self, names: list, t: list, c: list):
+        self.names = list(names)
+        self.t = [x.cpu().numpy() for x in t]
+        self.c = [x.cpu().numpy() for x in c]
+        self.off = np.cumsum([0] + [len(x) for x in self.t])
+
+    def __getitem__(self, j: int) -> tuple:
+        s = int(np.searchsorted(self.off, j, side="right")) - 1
+        k = j - int(self.off[s])
+        return self.names[s], int(self.t[s][k]), int(self.c[s][k])
+
+
 def _fid(e0: float, kc: float, kv: float) -> float | None:
     """C's log scale: clip(ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD), 0, 1); None when VPD's own answer is no
     nearer the model than the empty circuit under the interventions."""
@@ -1104,8 +1120,10 @@ class GoalEval:
         site's parts there); edges: per stated connection (and, in "pp", stated token edge) the same with it alone cut;
         positions: per influential position (F2's, the probe's moved) whether the answer has a node there and a token
         edge from it. mode "c": C's semantics on the text, every removal one row of batched engine plans (chunk rows
-        each; block nodes run as their subcomponents); "pp": the path-patched run (pp_run) on split's changed texts
-        (draws of changed_inputs' prompts), each removal's KL change weighted by how far the change moves the model.
+        each; block nodes run as their subcomponents); "pp": the path-patched run (pp_run's numbers) on split's changed
+        texts (draws of changed_inputs' prompts), each removal's KL change weighted by how far the change moves the
+        model, every removal and changed text in one engine.Engine.path_patched(lines=) call, and pairs: per stated
+        query-key pair the same with it alone removed.
         A complete graph (node set) has its nodes and no stated lines. Nothing else is re-stranded: a removal's
         dependants keep their places, reading what remains."""
         nat, T = self.nat, tx.T
@@ -1134,18 +1152,9 @@ class GoalEval:
             h = native.Graph(list(g.nodes), {rr: ws for rr, ws in par.items() if ws}, [x for x in g.out if not (r is None and x == w)])
             return keep(h)
 
-        def without_tok(e):
-            h = keep(native.Graph(list(g.nodes), dict(g.parents), list(g.out)))
-            for name in ("tok_positions", "pairs"):
-                if hasattr(g, name):
-                    setattr(h, name, getattr(g, name))
-            h.tok_edges = [x for x in getattr(g, "tok_edges", []) if x != e]
-            h.tok_out = [t for t in getattr(g, "tok_out", []) if e != (t, None)]
-            return h
-
-        variants = [g] + [without_node(nd) for nd in nodes] + [without_edge(e) for e in edges]
-        if mode == "pp":
-            variants += [without_tok(e) for e in toks]
+        variants = [g] + [without_node(nd) for nd in nodes] + [without_edge(e) for e in edges] if mode == "c" else []
+        prs = [] if g.complete else [(read, pr) for read, ps in sorted((getattr(g, "pairs", None) or {}).items()) for pr in ps
+                                     if pr != (None, None)]
         if mode == "c":
             kl = []
             for s0 in range(0, len(variants), chunk):
@@ -1165,23 +1174,32 @@ class GoalEval:
             moved = np.asarray(tx.moved, dtype=float)
             positions = [q for q, _ in tx.f2]
             got = self._interchange_draws(tx, positions, split, draws, first={q: -moved[q - 1] for q in positions}) if positions else []
-            acc, wsum = np.zeros(len(variants)), 0.0
-            for q, z in got:
+            E = self._pp_engine(tx)
+            col = {k: j for j, k in enumerate(E.pp_lines(g))}
+            offs = ([col[("n", nd)] for nd in nodes] + [col[("o", w)] if r is None else col[("e", w, r)] for w, r in edges]
+                    + [col[("u", t)] if r is None else col[("t", t, r)] for t, r in toks]
+                    + [col[("p", L, t, qa, kb)] for (L, t), (qa, kb) in prs])
+            lines = torch.ones(1 + len(offs), len(col), device=nat.dev)
+            lines[torch.arange(1, 1 + len(offs), device=nat.dev), torch.tensor(offs, dtype=torch.long, device=nat.dev)] = 0.0
+            lq = E.path_patched([g], [tuple(pz) for pz in got], lines=lines) if got else None  # [1 + lines, D, targets, V]
+            acc, wsum = np.zeros(1 + len(offs)), 0.0
+            for d, (q, z) in enumerate(got):
                 x2 = list(tx.ids)
                 x2[q] = z
                 ref = nat.reference([x2], tx.targets)
                 w = float(carry.kl(ref, tx.ref)[0])
-                acc += w * np.array([float(carry.kl(ref, self.pp_run(tx, x2, h))[0]) for h in variants])
+                acc += w * np.asarray(carry.kl(ref, lq[:, d]).tolist())
                 wsum += w
-                native.free(nat.dev)
-            kl = list(acc / wsum) if wsum > 0 else [None] * len(variants)
+            native.free(nat.dev)
+            kl = list(acc / wsum) if wsum > 0 else [None] * (1 + len(offs))
         else:
             raise ValueError("mode is pp or c")
         base = kl[0]
         d = lambda k: None if k is None or base is None else k - base  # noqa: E731
         rows_n = kl[1:1 + len(nodes)]
         rows_e = kl[1 + len(nodes):1 + len(nodes) + len(edges)]
-        rows_t = kl[1 + len(nodes) + len(edges):]
+        rows_t = kl[1 + len(nodes) + len(edges):1 + len(nodes) + len(edges) + len(toks)]
+        rows_p = kl[1 + len(nodes) + len(edges) + len(toks):]
         tok_at = {t for t, _ in toks}
         f2 = sorted({q for q, _ in tx.f2}) if tx.f2 is not None else []
         moved = np.asarray(tx.moved, dtype=float) if f2 else None
@@ -1191,6 +1209,8 @@ class GoalEval:
                           for nd, k in zip(nodes, rows_n)],
                 "edges": [{"edge": [list(w), "out" if r is None else list(r)], "delta_kl": d(k)} for (w, r), k in zip(edges, rows_e)],
                 "token_edges": [{"edge": [t, "out" if r is None else list(r)], "delta_kl": d(k)} for (t, r), k in zip(toks, rows_t)] if mode == "pp" else [],
+                "pairs": [{"pair": [L, t, "rest" if qa is None else list(qa), "rest" if kb is None else list(kb)], "delta_kl": d(k)}
+                          for ((L, t), (qa, kb)), k in zip(prs, rows_p)] if mode == "pp" else [],
                 "positions": [{"position": q, "moved": float(moved[q - 1]), "has_node": any(nd[1] == q for nd in nodes),
                                "has_token_edge": q in tok_at or g.complete} for q in f2]}
 
@@ -2163,7 +2183,7 @@ class GoalEval:
         keep = {n: torch.stack([1 - ci[n] for ci in circ]) for n in nat.names}  # [circuits, T, columns]: the circuit off
         sizes = [[len(lv[n][0]) for n in nat.names] for lv in lever]
         N = [sum(z) for z in sizes]
-        flat = [[(n, t, int(c)) for n in nat.names for t, c in zip(lv[n][0].tolist(), cols[n][lv[n][1]].tolist())] for lv in lever]
+        flat = [_Parts(nat.names, [lv[n][0] for n in nat.names], [cols[n][lv[n][1]] for n in nat.names]) for lv in lever]
         places = {}
 
         def kl(items, precision="score"):  # KL(model - F || model - F - C) per item's rows; items [(circuit, x [R, N_i])]
@@ -3223,8 +3243,8 @@ class GoalEval:
             kv0 = batch(items([(0, torch.zeros(1, N[0], device=dev))]))[0][1] if omitted and problems else None
         live = [i for i in range(len(problems)) if N[i]]
         g0 = dict(zip(live, grads([(i, torch.zeros(1, N[i], device=dev)) for i in live], "score")))
-        named = {}  # each circuit's lever's parts by name, made once per distinct graph
-        flat = [named.setdefault(id(idx), [(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())])
+        named = {}  # each circuit's lever's parts by name, once per distinct graph
+        flat = [named.setdefault(id(idx), _Parts(nat.names, [idx[n][0] for n in nat.names], [cols[n][idx[n][1]] for n in nat.names]))
                 if omitted else pick for _, idx, cols in problems]
         known = screens if screens is not None else {}
         key = (lambda i, j: (lever, flat[i][j])) if screens is not None else (lambda i, j: (i, lever, flat[i][j]))

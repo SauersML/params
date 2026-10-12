@@ -480,7 +480,8 @@ class Engine:
         return self._xr
 
     @torch.no_grad()
-    def path_patched(self, graphs: list, prompts: list, strengths: torch.Tensor | None = None, cuts: list | None = None) -> torch.Tensor:
+    def path_patched(self, graphs: list, prompts: list, strengths: torch.Tensor | None = None, cuts: list | None = None,
+                     lines: torch.Tensor | None = None) -> torch.Tensor:
         """log q at the targets [len(graphs), len(prompts), targets, V] of each graph's path-patched run on the engine's
         text x with prompts[d] = (position p, token z) changed, or {node: value} held (s_track_pp's and interchange_pp's,
         the lead's spec 10-12; goal_eval.pp_run, one graph and prompt at a time, the reference). x is the real model's run on x (_x_run); in the patched run P the
@@ -501,10 +502,19 @@ class Engine:
         token edge (into its residual readers and the prediction) and every pair (_pp_dense); cuts, per complete graph
         {(layer, t): [source positions]}: its attention outputs at (layer, t) read those sources' values at x. strengths
         [K, E + O]: graphs[0]'s connection subsets (goal_eval.changed_edges' ons: its parents' connections then its
-        writers into the prediction; its nodes, token edges and pairs in each), the result [K, ...]. Only nodes whose
-        input changed are recomputed, against the kept x run, from the earliest change in a batch of prompts on."""
+        writers into the prediction; its nodes, token edges and pairs in each), the result [K, ...]. lines [K, L]:
+        graphs[0]'s lines (pp_lines' columns: its nodes, connections, token edges and pairs) on or off per row (a
+        line deletion's run: a node off goes with its connections, token edges and the pairs naming it, and a block off
+        gives back the subcomponents it held), the result [K, ...]. Only nodes whose input changed are recomputed,
+        against the kept x run, from the earliest change in a batch of prompts on."""
         if strengths is not None:
             return self._pp_stated(self._pp_union(graphs[:1], strengths), prompts)
+        if lines is not None:
+            if graphs[0].complete:
+                nodes = sorted(graphs[0].node_set())
+                return self._pp_dense([native.Graph([nd for nd, k in zip(nodes, row) if k], complete=True)
+                                       for row in (lines > 0).tolist()], prompts)
+            return self._pp_stated(self._pp_union(graphs[:1], lines=lines), prompts)
         out = [None] * len(graphs)
         whole = [i for i, g in enumerate(graphs) if g.complete]
         stated = [i for i, g in enumerate(graphs) if not g.complete]
@@ -733,14 +743,35 @@ class Engine:
             z[:, ok] += dS[:, at] + tok[:, at]
         return self._pp_predict(z)
 
-    def _pp_union(self, graphs: list, ons: torch.Tensor | None = None) -> dict:
+    @staticmethod
+    def _pp_conns(g) -> list:
+        """A stated graph's connections as changed_edges orders them: ("e", writer, reader) per parent, then ("o",
+        writer) per write into the prediction."""
+        return [("e", w, r) for r, ws in g.parents.items() for w in ws] + [("o", w) for w in g.out]
+
+    @staticmethod
+    def _pp_extra(g) -> list:
+        """A stated graph's token edges ("t", position, reader), token edges into the prediction ("u", target) and
+        stated pairs ("p", layer, position, query or None, key or None)."""
+        return list(dict.fromkeys([("t", p, r) for p, r in getattr(g, "tok_edges", [])] + [("u", t) for t in getattr(g, "tok_out", [])]
+                                  + [("p", L, t, qa, kb) for (L, t), lst in (getattr(g, "pairs", None) or {}).items() for qa, kb in lst
+                                     if qa is not None or kb is not None]))
+
+    def pp_lines(self, graph) -> list:
+        """path_patched(lines=)'s columns for a graph: ("n", node) per node (sorted), its connections (_pp_conns), its
+        token edges and pairs (_pp_extra); a complete graph's, its nodes alone."""
+        nodes = [("n", nd) for nd in sorted(graph.node_set())]
+        return nodes if graph.complete else nodes + self._pp_conns(graph) + self._pp_extra(graph)
+
+    def _pp_union(self, graphs: list, ons: torch.Tensor | None = None, lines: torch.Tensor | None = None) -> dict:
         """path_patched's stated graphs as index tensors over their union: per site its nodes (union index, position,
         V's columns transposed and U's rows (zero at blocks), x's activations, a block's x output; a query's or key's U
         rows rotated at its position and its x part), per graph its nodes (those its blocks hold dropped), its strength
         of each connection (a residual or MLP read, a value read, a write into the prediction), token edge (into a node
         or the prediction) and query-key pair, and per layer the reads its attention outputs take, with whether the
         graph has an entry for each. With ons [K, E + O] the K graphs are graphs[0]'s connection subsets (ons' columns
-        its parents' connections then its writers into the prediction), with its nodes, token edges and pairs."""
+        its parents' connections then its writers into the prediction), with its nodes, token edges and pairs; with
+        lines [K, L] graphs[0] with the lines (pp_lines) each row turns off removed."""
         tg, H, hd, dev, xr = self.tg, self.H, self.hd, self.dev, self._x_run()
         sets = [g.node_set() for g in graphs]
         nodes = sorted(set().union(*sets))
@@ -751,14 +782,28 @@ class Engine:
             bl = {(n, t) for n, t, c in st if c < 0}
             return [at[nd] for nd in st if nd[2] < 0 or (nd[0], nd[1]) not in bl]
 
-        def conns(g):
-            return [("e", w, r) for r, ws in g.parents.items() for w in ws] + [("o", w) for w in g.out]
-
-        def extra(g):
-            return ([("t", p, r) for p, r in getattr(g, "tok_edges", [])] + [("u", t) for t in getattr(g, "tok_out", [])]
-                    + [("p", L, t, qa, kb) for (L, t), lst in (getattr(g, "pairs", None) or {}).items() for qa, kb in lst
-                       if qa is not None or kb is not None])
-        if ons is None:
+        conns, extra = self._pp_conns, self._pp_extra
+        if lines is not None:
+            G, g0 = len(lines), graphs[0]
+            keys = conns(g0) + extra(g0)
+            if lines.shape[1] != N + len(keys):
+                raise ValueError(f"lines have {lines.shape[1]} columns, the graph {N + len(keys)} lines")
+            lines = lines.to(dev, torch.float32)
+            non = lines[:, :N] > 0
+            blk = {(nd[0], nd[1]): i for i, nd in enumerate(nodes) if nd[2] < 0}
+            held = [(i, blk[(nd[0], nd[1])]) for i, nd in enumerate(nodes) if nd[2] >= 0 and (nd[0], nd[1]) in blk]
+            member = non.clone()
+            if held:  # a block's subcomponents are the graph's where the block is off
+                hi, hb = (torch.tensor(x, device=dev) for x in zip(*held))
+                member[:, hi] &= ~non[:, hb]
+            onm = lines[:, N:].clone()
+            named = [(j, at[nd]) for j, k in enumerate(keys) if k[0] == "p" for nd in k[3:] if nd is not None]
+            if named:  # a pair naming a removed node goes with it
+                pj, pn = (torch.tensor(x, device=dev) for x in zip(*named))
+                gone = torch.zeros_like(onm).index_add_(1, pj, (~non[:, pn]).float())
+                onm = onm * (gone == 0)
+            entries = [set(getattr(g0, "pairs", None) or {})] * G
+        elif ons is None:
             G, col, keys, on = len(graphs), {}, [], []
             member = torch.zeros(G, N, dtype=torch.bool)
             for gi, (g, st) in enumerate(zip(graphs, sets)):
@@ -782,7 +827,7 @@ class Engine:
             keys = conns(graphs[0])
             if len(keys) != ons.shape[1]:
                 raise ValueError(f"strengths have {ons.shape[1]} columns, the graph {len(keys)} connections")
-            ex = list(dict.fromkeys(extra(graphs[0])))
+            ex = extra(graphs[0])
             keys = keys + ex
             onm = torch.cat([ons.to(dev, torch.float32), torch.ones(G, len(ex), device=dev)], 1)
             entries = [set(getattr(graphs[0], "pairs", None) or {})] * G
@@ -859,15 +904,22 @@ class Engine:
                 "slot": torch.tensor(slot, device=dev)}
 
     def _pp_stated(self, un: dict, prompts: list) -> torch.Tensor:
-        """path_patched of _pp_union's graphs, prompts in batches of rows (prompts x graphs) whose largest products
-        (per row a change per node, and a pattern row per read of a layer) stay within PP_ENTRIES."""
+        """path_patched of _pp_union's graphs, in batches of rows (prompts x graphs, the graphs sliced when they are
+        many) whose largest products (per row a change per node, and a pattern row per read of a layer) stay within
+        PP_ENTRIES."""
         G, T, H = un["G"], self.T, self.H
         J = max([len(r[0]) for r in un["reads"].values()], default=0)
+        per = max(un["N"] + un["on"].shape[1], J * H * T, max((len(st["i"]) * st["Vt"].shape[1] for st in un["sites"].values()), default=1))
+        step = max(1, PP_ENTRIES // per)
         res = torch.empty(G, len(prompts), len(self.targets), self.tg.wte.shape[0], device=self.dev)
-        for chunk in self._pp_chunks(prompts, lambda s: G * max(un["N"], J * H * T, 1)):
-            part = [prompts[d] for d in chunk]
-            lq = self._pp_stated_run(un, part)
-            res[:, chunk] = lq.view(len(part), G, *lq.shape[1:]).transpose(0, 1)
+        for g0 in range(0, G, step):
+            u = un if step >= G else dict(un, G=min(step, G - g0), member=un["member"][g0:g0 + step], on=un["on"][g0:g0 + step],
+                                          reads={L: (ts, ent[g0:g0 + step], rows) for L, (ts, ent, rows) in un["reads"].items()})
+            Gc = u["G"]
+            for chunk in self._pp_chunks(prompts, lambda s, Gc=Gc: Gc * per):
+                part = [prompts[d] for d in chunk]
+                lq = self._pp_stated_run(u, part)
+                res[g0:g0 + Gc, chunk] = lq.view(len(part), Gc, *lq.shape[1:]).transpose(0, 1)
         return res
 
     def _pp_stated_run(self, un: dict, part: list) -> torch.Tensor:
@@ -918,12 +970,14 @@ class Engine:
             cf = on[:, j] * dlt[:, w]
             return cf, cf.nonzero(as_tuple=True)
 
-        def writers(out, rr, eb, ee, cf, st, vec, scale=None):  # out[rr] += each stated parent's change (rows rr)
+        def writers(out, rr, eb, ee, cf, st, vec, scale=None):  # out[rr] += each stated parent's change (rows rr), in place
             w, ws, _, _, wb, wsid = st["reads"]
             sub = wb[ee] == 0
             e1, b1, r1 = ee[sub], eb[sub], rr[sub]
-            if len(e1):
-                out = _add_rows(out, r1, cf[b1, e1], lambda k: vec(w[e1[k]], ws[e1[k]], b1[k], e1[k], r1[k]))
+            step = max(1, ROWS // out.shape[1])  # ROWS entries of the [connections, width] products at once
+            for s0 in range(0, len(e1), step):
+                k = slice(s0, s0 + step)
+                out.index_add_(0, r1[k], cf[b1[k], e1[k], None] * vec(w[e1[k]], ws[e1[k]], b1[k], e1[k], r1[k]))
             e2, b2, r2 = ee[~sub], eb[~sub], rr[~sub]
             for si in wsid[e2].unique().tolist():  # blocks: their whole output's change
                 m = wsid[e2] == si
@@ -931,7 +985,7 @@ class Engine:
                 ch = bv[names[si]][b2[m], wst["bslot"][ws[e2[m]]]]
                 if scale is not None:
                     ch = scale(ch, e2[m], r2[m])
-                out = out.index_add(0, r2[m], cf[b2[m], e2[m], None] * ch)
+                out.index_add_(0, r2[m], cf[b2[m], e2[m], None] * ch)
             return out
 
         def finish(n, st, bi, ri, h):  # the changed rows' P values from their inputs h [rows, d_in]

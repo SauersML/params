@@ -197,20 +197,31 @@ class Pruner:
         return list(ids.split(counts.tolist()))
 
     def prune(self, level: str, budget: float, rounds: int = ROUNDS) -> int:
-        """Rounds of measured block removal at one level; returns the rounds run."""
+        """Rounds of measured block removal at one level; returns the rounds run. Within the budget a round removes
+        the most of the ranked blocks that keep KL_C <= budget; above it (a start such as VPD's answer at the targets
+        alone can be farther than the budget while a subset is not: subcomponents cancel) it removes the prefix of
+        the ranked blocks with the lowest measured KL_C, when that is lower than the circuit's."""
         for r in range(rounds):
             blocks = self.blocks(level)
             if len(blocks) <= 1:
                 return r
             single = torch.tensor(self.without(blocks))
-            if not (single <= budget).any():
-                return r
             ranked = [blocks[i] for i in torch.argsort(single, stable=True).tolist()]
-            sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ranked)]
-            ok = [k for k, x in zip(sizes, self.without([torch.cat(ranked[:k]) for k in sizes])) if x <= budget]
-            if not ok:
+            sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ranked) - 1]
+            if (single <= budget).any():
+                ok = [k for k, x in zip(sizes, self.without([torch.cat(ranked[:k]) for k in sizes])) if x <= budget]
+                if not ok:
+                    return r
+                self.on[torch.cat(ranked[:max(ok)])] = False
+                continue
+            current = self.kl()
+            if current <= budget or float(single.min()) >= current:
                 return r
-            self.on[torch.cat(ranked[:max(ok)])] = False
+            kl = self.without([torch.cat(ranked[:k]) for k in sizes])
+            i = min(range(len(sizes)), key=lambda j: kl[j])
+            if kl[i] >= current:
+                return r
+            self.on[torch.cat(ranked[:sizes[i]])] = False
         return rounds
 
 

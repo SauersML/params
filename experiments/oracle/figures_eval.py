@@ -145,6 +145,7 @@ def terms_figure(sets: dict, path: Path) -> None:
 
 def rl_figure(runs: dict, labels: dict, path: Path) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(15, 10), sharey="row")
+    claim = "RL: held-out reward and valid answers against steps and Tinker dollars"
     for i, (name, d) in enumerate(runs.items()):
         c = COLORS[i % len(COLORS)]
         steps = [json.loads(x) for x in (d / "steps.jsonl").read_text().splitlines()]
@@ -156,6 +157,9 @@ def rl_figure(runs: dict, labels: dict, path: Path) -> None:
             if f.exists():
                 got = first_answers(f, "rl", d / f"heldout_{step}_e1.jsonl" if (d / f"heldout_{step}_e1.jsonl").exists() else None)
                 held.append((step, r["usd"], sum(x[0] for x in got.values()) / len(got), sum(x[2] for x in got.values()) / len(got)))
+        if i == 0 and len(held) > 1:  # the first run's change states the figure's claim
+            claim = (f"{name}: held-out reward {held[0][2]:+.2f} at the start, {held[-1][2]:+.2f} after {held[-1][0]} steps "
+                     f"(${held[-1][1]:.2f} on Tinker)")
         for col, xkey in enumerate(("step", "total_usd")):
             for row, ykey in enumerate(("reward", "valid")):
                 ax = axes[row][col]
@@ -174,7 +178,7 @@ def rl_figure(runs: dict, labels: dict, path: Path) -> None:
     axes[1][1].set_xlabel("Tinker dollars spent on RL")
     for ax in (axes[0][0], axes[1][0]):  # steps are whole numbers
         ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
-    fig.suptitle("RL progress: held-out reward and valid answers against steps and dollars", x=0.01, ha="left",
+    fig.suptitle(claim, x=0.01, ha="left",
                  fontsize=21, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(path, dpi=150, bbox_inches="tight", pad_inches=0.3)

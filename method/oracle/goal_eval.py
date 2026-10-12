@@ -1487,7 +1487,7 @@ def pattern(pool: dict, k: int) -> dict:
 
 
 def fidelity_report(split: str, n: int, teacher: Path, pool: Path, out: Path, draws: int = DRAWS, vpd: Path | None = None,
-                    log=print) -> list[dict]:
+                    offset: int = 0, stride: int = 1, log=print) -> list[dict]:
     """C on the split's first n texts for a teacher's circuits (teacher.py's <task>.json and <task>.f1.json: as stated,
     or every connection the model has among their nodes when they state none) and VPD's first k at both sizes
     (complete graphs), beside N_real; one row per circuit appended to OUT (texts already there are skipped). vpd:
@@ -1504,7 +1504,7 @@ def fidelity_report(split: str, n: int, teacher: Path, pool: Path, out: Path, dr
                 local[r["task"]] = r.get("local")
     done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
     rows = []
-    for p in native.tasks(split)[:n]:
+    for p in native.tasks(split)[:n][offset::stride]:
         if p.stem in done or not (teacher / f"{p.stem}.json").exists():
             continue
         t0 = time.perf_counter()
@@ -1608,13 +1608,15 @@ def main():
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--draws", type=int, default=DRAWS)
     f.add_argument("--vpd", type=Path, help="VPD's answers and orders saved by teacher.py --save-vpd")
+    f.add_argument("--offset", type=int, default=0)
+    f.add_argument("--stride", type=int, default=1)
     q = sub.add_parser("patterns", help="the adversary's pattern pool from a range of held-out texts")
     q.add_argument("--first", type=int, required=True, help="first text number, e.g. 9100")
     q.add_argument("--last", type=int, required=True, help="last text number, e.g. 9149")
     q.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     if args.cmd == "fidelity":
-        fidelity_report(args.split, args.n, args.teacher, args.pool, args.out, args.draws, args.vpd)
+        fidelity_report(args.split, args.n, args.teacher, args.pool, args.out, args.draws, args.vpd, args.offset, args.stride)
         print(fidelity_table([json.loads(x) for x in args.out.read_text().splitlines() if x.strip()]), flush=True)
         return
     if args.cmd == "patterns":

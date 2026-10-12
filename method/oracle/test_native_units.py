@@ -1,0 +1,110 @@
+"""Checks of native-unit circuits (native_units.py) on the tiny random model of vpd4l's architecture
+(test_goal_eval.tiny_native): every run against vpd_model's own forward pass with the units zeroed at each site's input
+(Site.in_fn), windowed removals against whole runs, and the pruning curve's ends.
+
+  ~/.local/bin/mem-lease 8 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_native_units.py
+"""
+
+import math
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import carry  # noqa: E402
+import goal_eval  # noqa: E402
+import native  # noqa: E402
+import native_units  # noqa: E402
+from test_goal_eval import tiny_native  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def tiny():
+    nat = tiny_native(near=0.1)
+    g = torch.Generator().manual_seed(2)
+    ids = torch.randint(0, 40, (12,), generator=g).tolist()
+    return nat, ids, [11], native_units.NativeUnits(nat, ids, [11])
+
+
+def site_hooked(nat, ids, targets, m: native_units.Mask):
+    """log q at the targets from vpd_model's Target.hidden with each layer's output matrix and MLP output matrix reading
+    only the set's heads and neurons (Site.in_fn zeroes the rest of their input)."""
+    tg = nat.target
+    hd = tg.hd
+    try:
+        for i in range(tg.n_layer):
+            hm = m.heads[i].float().repeat_interleave(hd, dim=1)  # [T, H * hd]
+            tg.site(native.site_name(i, "o_proj")).in_fn = lambda x, hm=hm: x * hm
+            nm = m.neurons[i].float()
+            tg.site(native.site_name(i, "down_proj")).in_fn = lambda x, nm=nm: x * nm
+        nat.vpd.clear()
+        hidden = tg.hidden(torch.tensor([ids]))
+    finally:
+        for i in range(tg.n_layer):
+            tg.site(native.site_name(i, "o_proj")).in_fn = None
+            tg.site(native.site_name(i, "down_proj")).in_fn = None
+    return torch.log_softmax((hidden[:, targets] @ tg.wte.T).float(), -1)
+
+
+def random_mask(nu, seed, keep=0.5):
+    g = torch.Generator().manual_seed(seed)
+    m = nu.full()
+    m.heads &= torch.rand(m.heads.shape, generator=g) < keep
+    m.neurons &= torch.rand(m.neurons.shape, generator=g) < keep
+    return m
+
+
+def test_runs_match_the_models_own_forward(tiny):
+    nat, ids, targets, nu = tiny
+    assert abs(nu.kl(nu.full())[0]) < 1e-5  # every unit: the model
+    for seed in (1, 2, 3):
+        m = random_mask(nu, seed)
+        want = float(carry.kl(nu.ref, site_hooked(nat, ids, targets, m))[0])
+        assert abs(nu.kl(m)[0] - want) < 1e-4 + 1e-4 * want, seed
+
+
+def test_empty_is_goal_evals_empty_circuit(tiny):
+    nat, ids, targets, nu = tiny
+    empty = nu.full().without(nu.full().units())
+    ge = goal_eval.GoalEval(nat, changes=2)
+    tx = ge.text(ids, targets, seed=1)
+    assert abs(nu.kl(empty)[0] - ge._bounds(tx, "off")[0]) < 1e-4
+
+
+def test_windowed_removals_match_whole_runs(tiny):
+    """A batch of removals computes only the positions from its first one on: the same KL as the whole run."""
+    nat, ids, targets, nu = tiny
+    S = random_mask(nu, 4, keep=0.7)
+    units = S.units()
+    g = torch.Generator().manual_seed(5)
+    picks = [units[int(i)] for i in torch.randint(len(units), (20,), generator=g)]
+    removals = [[u] for u in picks] + [picks[:3], picks[3:7]]
+    got = nu.kl(S, removals)
+    for rem, k in zip(removals, got):
+        assert abs(k - nu.kl(S.without(rem))[0]) < 1e-5, rem
+
+
+def test_prune_curve(tiny):
+    nat, ids, targets, nu = tiny
+    positions = [3, 7, 11]
+    curve = native_units.prune(nu, positions, sizes=[50, 7])
+    sizes = [c["size"] for c in curve]
+    assert sizes[0] == nu.at(positions).count() and sizes[-1] == 0
+    assert all(a > b for a, b in zip(sizes, sizes[1:]))
+    assert {50, 7} <= set(sizes) and all("units" in c for c in curve if c["size"] in (50, 7))
+    empty = nu.full().without(nu.full().units())
+    assert abs(curve[-1]["kl"] - nu.kl(empty)[0]) < 1e-5
+    seven = next(c for c in curve if c["size"] == 7)
+    m = nu.full().without(nu.full().units())
+    for kind, l, t, j in seven["units"]:
+        (m.heads if kind == "head" else m.neurons)[l, t, j] = True
+    assert abs(nu.kl(m)[0] - seven["kl"]) < 1e-5 and all(t in positions for _, _, t, _ in seven["units"])
+
+
+def test_f1_scale():
+    assert native_units.f1(100.0, 100.0, 1.0) == 0.0 and native_units.f1(1.0, 100.0, 1.0) == 1.0
+    assert abs(native_units.f1(10.0, 100.0, 1.0) - 0.5) < 1e-12

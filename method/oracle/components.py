@@ -39,11 +39,12 @@ the subcomponents a change of each listed token switches on, the strongest weigh
 (method/vpd/connectome.py; a static coupling, not a measured effect), and the intervention questions (qa_questions()).
 
 The reward (reward()) is goal_eval's scorecard in VPD's semantics combined into one number: the mean of the quality
-terms (each at most 1) less SIZE_WEIGHT x size (description bits over the bits of naming every VPD-active
-subcomponent at the listed positions and the targets, at most 1); an invalid answer (no CIRCUIT section, a missing
-FINAL line, cut at the sampling cap) earns -(1 + SIZE_WEIGHT), below every valid one. Nodes and edges the model does
-not have, and circuit lines that do not parse, are dropped and their bits charged in size. Terms: F1 sufficiency, F3 edges,
-E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); F2 interchange is a diagnostic.
+terms (each at most 1) less SIZE_WEIGHT x size (description bits over the bits of naming VPD's whole answer at the
+positions that can reach the targets, goal_eval's size_scale, at most 1); an invalid answer (no CIRCUIT section, a
+missing FINAL line, cut at the sampling cap) earns -(1 + SIZE_WEIGHT), below every valid one. Nodes and edges the model
+does not have, and circuit lines that do not parse, are dropped and their bits charged in size. Terms: F1 sufficiency of
+the stated graph, N necessity, E1 the reader's bits saved, E2 questions answered right, E3 edits (reward()'s
+docstring); F3 (stated edges' cut effects) and F2 interchange are diagnostics.
 
   components.py questions SPLIT OUT.jsonl [--n N] [--qa-seed K]  question rows (question, positions, evidence, questions;
                                                                 K = 1 for a fresh set of questions)
@@ -51,8 +52,6 @@ E1 the reader's bits saved, E2 questions answered right (reward()'s docstring); 
   components.py rerender ROWS.jsonl OUT.jsonl                   the rows' question text in the current format
   components.py locality SPLIT OUT.jsonl [--n N]                each text local or not (VPD's target actives alone)
   components.py teacher-vpd ROWS.jsonl OUT_DIR                 the interim teacher (VPD's answer cut to a writable size)
-  components.py teacher-path ROWS.jsonl PATHS VPD OUT            the pruning path's best writable point per text, kept
-                                                                where it scores above VPD's
   components.py prepare SPLIT OUT_DIR [--n N] [--lengths LO:HI]  locality, then the row and teacher of the texts kept (at
                                                                 least half non-local)
   components.py facts ROWS.jsonl TEACHER_DIR OUT.jsonl [--n N]  what each teacher's English must be faithful to
@@ -877,17 +876,20 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     parse (each subcomponent it names, at least one, priced as a node outside the graph); edit operations add their
     description bits (edit_bits). A valid
     answer earns the mean of its terms less size_weight x size ("circuit_reward": the same over the circuit's own terms
-    F1, N and F3, for comparing with circuits that give no English or answers), size its description bits over the scale (VPD's active
-    subcomponents at the listed positions and the targets), at most 1. Terms, from goal_eval in VPD's semantics with
+    F1 and N, for comparing with circuits that give no English or answers), size its description bits over the bits of
+    naming VPD's whole answer at the positions that can reach the targets (goal_eval's size_scale; without VPD's
+    causal-importance network, VPD's actives at the listed positions and the targets), at most 1. Terms, from goal_eval in VPD's semantics with
     the remainders' convention, both in orders of magnitude of KL (linear recovery is dominated by the empty circuit's
     ~100 bits: an answer 20 bits from the model recovers 0.8 linearly, 0.2 in log): F1, goal_eval's f1 (ln(KL_empty /
-    KL_C) / ln(KL_empty / KL_VPD) in [0, 1], between the empty circuit and VPD's own answer); N, goal_eval's n (what
-    VPD's own answer loses without the circuit, ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD) in [0, 1]); F3, the
-    AUC of stated edges' cuts in the circuit's run (0 without a stated edge); E1, the reader's bits saved (in [-1, 1];
+    KL_C) / ln(KL_empty / KL_VPD) in [0, 1], between the empty circuit and VPD's own answer, KL_C the run of the graph the
+    answer states: a node reaches a reader or the prediction only through a stated edge); N, goal_eval's n (what
+    VPD's own answer loses without the circuit, ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD) in [0, 1]); E1, the
+    reader's bits saved (in [-1, 1];
     with a reader or e1); E2, the questions answered right measured from the no-change answer (qa_term); E3, the edit
     requests' net bits over the edit teacher's (edit_term; ee an edit_eval.EditEval, edit_best goal key -> the teacher's
     net; left out until every request of the text has one). A term goal_eval cannot give (no causal-importance
-    network for VPD's bounds) is left out of the mean. reader: a reader.Reader for E1, or e1: each text's reader bits
+    network for VPD's bounds) is left out of the mean. F3, the AUC of stated edges' cuts in the circuit's run, is
+    reported (term_F3), never in the mean. reader: a reader.Reader for E1, or e1: each text's reader bits
     computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
     -> goal_eval.Text, kept between calls."""
     import goal_eval
@@ -925,7 +927,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     e3 = {}
     if keep and ee is not None and ev.get("edits"):
         e3 = dict(zip(keep, edit_term(ee, task, ev["edits"], [parsed[i]["edits"] for i in keep], edit_best or {})))
-    scale = ev["active"] * math.log2(nat.positions(targets) * total)
+    scale = (ge.size_scale(tx) if keep else None) or ev["active"] * math.log2(nat.positions(targets) * total)
     out = []
     for i, (p, (d_nodes, d_edges, d_bits)) in enumerate(zip(parsed, defects)):
         row, terms, size, r = row_of.get(i), {}, None, -(1.0 + size_weight)
@@ -937,11 +939,11 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
             terms["E2"] = row["E2"]
             terms["E3"] = e3.get(i)
-            have = [v for v in terms.values() if v is not None]
+            have = [v for k, v in terms.items() if k != "F3" and v is not None]  # F3: a diagnostic
             e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
             size = min(1.0, (row["bits"] + d_bits + e_bits) / scale) if scale > 0 else 0.0
             r = sum(have) / len(have) - size_weight * size
-            own = [terms[k] for k in ("F1", "N", "F3") if terms[k] is not None]
+            own = [terms[k] for k in ("F1", "N") if terms[k] is not None]
             circ = sum(own) / len(own) - size_weight * size
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
                     "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
@@ -1031,41 +1033,11 @@ def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None
 
 
 def target_score(r: dict, size_weight: float = SIZE_WEIGHT) -> float:
-    """A teacher candidate's score: the reward with the English terms held fixed, (F1 + N + F3) / 5 - size_weight x size
-    (reward()'s row)."""
+    """A teacher candidate's score: the reward with the English and answer terms (E1, E2) held fixed, (F1 + N) / 4 -
+    size_weight x size (reward()'s row)."""
     if not r["valid"]:
         return r["reward"]
-    return sum(r.get(f"term_{k}") or 0.0 for k in ("F1", "N", "F3")) / 5 - size_weight * r["size"]
-
-
-def path_teacher(ge, task: dict, ev: dict, path: dict, tokens, budget: int = ANSWER_BUDGET, top: int = 3,
-                 cache: dict | None = None) -> tuple[dict, dict] | tuple[None, None]:
-    """A teacher from a pruning path (teacher.py's <task>.path.json: its start set and nested removal steps): of the
-    steps whose answer fits `budget` tokens, the `top` with the best target_score as nodes alone (each with a
-    token-embedding node at every position it uses) get measured edges (with_edges), and the best of those after
-    edges is the teacher. (answer JSON, {"step", "size", "score", terms}); (None, None) when no step fits."""
-    import goal_eval
-
-    node = dict(zip(path["start_index"], (tuple(x) for x in path["start_nodes"])))
-    on, steps = set(node), []
-    for i, st in enumerate(path["steps"]):
-        on -= set(st["removed"])
-        nodes = sorted(node[j] for j in on)
-        tok = sorted({t for _, _, t in nodes})
-        steps.append((i, {"nodes": [list(x) for x in nodes] + [["tok", 0, t] for t in tok], "edges": [], "explanation": ""}))
-    fits = [(i, a) for i, a in steps if tokens(target(a, ev, task["model"])) <= budget]
-    if not fits:
-        return None, None
-    got = reward(ge, task, {**ev, "qa": []}, [render(a) for _, a in fits], cache=cache)
-    best = sorted(range(len(fits)), key=lambda j: -target_score(got[j]))[:top]
-    cands = [with_edges(ge, task, ev, fits[j][1], cache) for j in best]
-    cands = [c if tokens(target(c, ev, task["model"])) <= budget else fits[j][1] for c, j in zip(cands, best)]
-    final = reward(ge, task, {**ev, "qa": []}, [render(c) for c in cands], cache=cache)
-    k = max(range(len(cands)), key=lambda j: target_score(final[j]))
-    g, _ = goal_eval.circuit(cands[k], task["prompts"][0]["target_positions"], ge.nat.C, len(task["prompts"][0]["token_ids"]))
-    return cands[k], {"task": task["id"], "step": fits[best[k]][0], "nodes": g.count(), "edges": len(cands[k]["edges"]),
-                      "score": target_score(final[k]), **{x: final[k].get(x) for x in ("term_F1", "term_N", "term_F3", "size")},
-                      "tokens": tokens(target(cands[k], ev, task["model"]))}
+    return sum(r.get(f"term_{k}") or 0.0 for k in ("F1", "N")) / 4 - size_weight * r["size"]
 
 
 def vpd_teacher(ge, task: dict, ev: dict, tokens, budget: int = ANSWER_BUDGET, cache: dict | None = None) -> tuple[dict, dict]:
@@ -1506,12 +1478,6 @@ def main():
     pr.add_argument("--tasks", type=Path, help="JSONL of {task[, local]}: only these texts, in this order; a given label skips locality()")
     pr.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
     pr.add_argument("--rows-only", action="store_true", help="no interim teacher (teacher.py's circuits are the teachers)")
-    tp = sub.add_parser("teacher-path", help="teachers from pruning paths (path_teacher()), and per text the better of it and VPD's")
-    tp.add_argument("rows", type=Path)
-    tp.add_argument("paths", type=Path, help="teacher.py's output directory (<task>.path.json)")
-    tp.add_argument("vpd", type=Path, help="teacher-vpd's output directory (<task>.json, summary.jsonl)")
-    tp.add_argument("out", type=Path, help="directory: <task>.json, the chosen teacher per text, and summary.jsonl")
-    tp.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
     vt = sub.add_parser("teacher-vpd", help="the interim teacher: VPD's own answer cut to a writable size (vpd_teacher())")
     vt.add_argument("rows", type=Path)
     vt.add_argument("out", type=Path, help="directory: <task>.json (circuit JSON) and summary.jsonl")
@@ -1632,30 +1598,6 @@ def main():
                 f.write(json.dumps(row) + "\n")
             kept.add(p.stem)
             print(p.stem, "local" if labels[p.stem]["local"] else "non-local", info, flush=True)
-        return
-    if args.cmd == "teacher-path":
-        from transformers import AutoTokenizer
-
-        tk = AutoTokenizer.from_pretrained(args.tokenizer)
-        count = lambda text: len(tk(text, add_special_tokens=False)["input_ids"])  # noqa: E731
-        args.out.mkdir(parents=True, exist_ok=True)
-        vpd = {r["task"]: r for r in map(json.loads, (args.vpd / "summary.jsonl").read_text().splitlines())} \
-            if (args.vpd / "summary.jsonl").exists() else {}
-        for r in map(json.loads, args.rows.read_text().splitlines()):
-            pf = args.paths / f"{r['task']}.path.json"
-            if not pf.exists() or (args.out / f"{r['task']}.json").exists():
-                continue
-            task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
-            answer, info = path_teacher(ge, task, r, json.loads(pf.read_text()), count, cache={})
-            v = vpd.get(r["task"])
-            vs = None if v is None else v.get("score", sum(v.get(f"term_{k}") or 0.0 for k in ("F1", "N", "F3")) / 5 - SIZE_WEIGHT * (v.get("size") or 0.0))
-            use_path = answer is not None and (vs is None or info["score"] > vs)
-            chosen = answer if use_path else json.loads((args.vpd / f"{r['task']}.json").read_text())
-            (args.out / f"{r['task']}.json").write_text(json.dumps(chosen))
-            row = {"task": r["task"], "source": "path" if use_path else "vpd", "path": info, "vpd": v}
-            with (args.out / "summary.jsonl").open("a") as f:
-                f.write(json.dumps(row) + "\n")
-            print(row, flush=True)
         return
     if args.cmd == "teacher-vpd":
         from transformers import AutoTokenizer

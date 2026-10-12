@@ -206,7 +206,7 @@ def test_reward_on_tiny_model(tiny):
     edited = good + "\nEDIT 1: scale " + good.split("@7 ", 1)[1].split("=", 1)[0] + " 0"
     with_e3 = components.reward(ge, task, asked, [edited, good], ee=FakeEdits(), edit_best=best)
     assert with_e3[0]["term_E3"] == 0.5 and not with_e3[1]["valid"]  # 2 bits of the teacher's 4; no EDIT line: invalid
-    terms = [with_e3[0][f"term_{k}"] for k in ("F1", "N", "F3", "E1", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]
+    terms = [with_e3[0][f"term_{k}"] for k in ("F1", "N", "E1", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]  # F3: a diagnostic
     assert with_e3[0]["reward"] == pytest.approx(sum(terms) / len(terms) - components.SIZE_WEIGHT * with_e3[0]["size"])
 
 

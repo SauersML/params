@@ -1023,7 +1023,24 @@ class Native:
         """(moved [last], other [T - 1, V]): moved[p - 1], the KL (nats) of the model's prediction at the last target
         after the token at position p is replaced by one draw from other[p - 1], the model's prediction for position p
         without the text's token there (changes' probe: where the prediction responds to the text). On WINDOW_EXACT
-        devices a probe computes only from its changed position (Target.hidden's window): the same numbers."""
+        devices a probe computes only from its changed position (Target.hidden's window): the same numbers. While the
+        model is plain(), the last two results are kept by text, targets, chunk and the generator's state, and a repeat
+        returns them and leaves the generator where the computation would (units.sensitive and changes() ask for the
+        same probe of a text); callers only read them."""
+        key = (tuple(ids), tuple(targets), chunk, g.get_state().numpy().tobytes()) if self.plain() else None
+        kept = self.__dict__.setdefault("_sensitivity_kept", {})
+        if key in kept:
+            moved, other, state = kept[key]
+            g.set_state(state)
+            return moved.clone(), other
+        moved, other = self._sensitivity(ids, targets, g, chunk)
+        if key is not None:
+            if len(kept) >= 2:
+                kept.pop(next(iter(kept)))
+            kept[key] = (moved.clone(), other, g.get_state())
+        return moved, other
+
+    def _sensitivity(self, ids: list[int], targets: list[int], g: torch.Generator, chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
         last = max(targets)
         probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0].float().softmax(-1).cpu()
         base = torch.log(probs[last].clamp_min(1e-30))

@@ -389,7 +389,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     if accept:
         acceptance = teacher.Acceptance(ge, tx, accept)
         if mode == "pp":                                     # its "changed" term path-patched (until teacher.Acceptance takes a mode)
-            acceptance.scores = lambda graphs: [{"s_track": r["s_track_pp"]} for r in ge.changed_search(tx, graphs, DRAWS, mode="pp")]
+            acceptance.scores = lambda graphs, edges=None: [{"s_track": r["s_track_pp"]} for r in ge.changed_search(tx, graphs, DRAWS, mode="pp")]
         hook, base = acceptance.hook(lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True), start)
     path = teacher.joint_path(pr, start, st.empty, st.vpd, hook, base)
     on = start.clone()

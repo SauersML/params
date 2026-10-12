@@ -253,6 +253,7 @@ class NoWiring:
 def tiny():
     nat = tiny_native()
     ge = goal_eval.GoalEval(nat, changes=4, random_pairs=4)
+    ge.donor_pools.update(search=[], eval=[])  # the far donors are vpd4l's texts, not the tiny model's: none here
     ids = [3, 17, 5, 9, 22, 11, 30, 2]
     task = {"id": "text0", "model": "vpd4l", "split": "heldout",
             "prompts": [{"token_ids": ids, "target_positions": [7], "model_top": [[[" the", 0.5]]]}]}

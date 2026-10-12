@@ -6,7 +6,9 @@
 # themselves.
 #   zsh experiments/oracle/sft.sh RUN   (env: ROWS, TEACHER, ENGLISH, EDIT_TEACH, BASE, STEPS, BATCH, LR, HELDOUT,
 #                                        HELDOUT_TEACHER, LABELS, NEVAL, SAMPLES, MAXTOK, SRC, ZEROSHOT: the untrained base's
-#                                        samples and readers on HELDOUT's questions)
+#                                        samples and readers on HELDOUT's questions; EXTRA: more answer sets scored in the
+#                                        same evaluation, "NAME=SAMPLES[:E1] ...", e.g. an earlier SFT's samples, since C
+#                                        changes on main and only one evaluation compares)
 set -e
 RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
@@ -48,15 +50,16 @@ fi
 unset TINKER_API_KEY
 cd $SRC
 $PY -c "import json; open('$S/zeroshot_first.jsonl', 'w').writelines(l for l in open('$Z/samples.jsonl') if json.loads(l)['sample'] == 0)"
-PRUNED=() REFS=(--ref "Teacher=$S/eval.json:teacher" --ref "VPD, every connection=$S/eval.json:vpd_complete")
+PRUNED=() REFS=(--ref "Teacher=$S/eval.json:teacher" --ref "VPD, every connection=$S/eval.json:vpd_complete") XSETS=()
+for x in ${=EXTRA:-}; do XSETS+=(--set "${x%%=*}=$S/eval.json:${x%%=*}"); done
 if [ -d $S/ref/vpd_pruned ]; then
   PRUNED=(vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
 fi
 # C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh)
 bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S \
-  zeroshot=$S/zeroshot_first.jsonl$E1Z teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" > $S/eval_pod.log 2>&1
+  zeroshot=$S/zeroshot_first.jsonl$E1Z teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" ${=EXTRA:-} > $S/eval_pod.log 2>&1
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.json $S/eval.json
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.log $S/eval.log
 tail -60 $S/eval.log
 MPD_MEM_GIB=1 $PY $SRC/experiments/oracle/figures_eval.py --labels $LABELS --prefix sft_$RUN \
-  --set "Qwen3-8B zero-shot=$S/eval.json:zeroshot$E1Z" --set "${BASE#*/} SFT=$S/eval.json:sft$E1S" "${REFS[@]}"
+  --set "Qwen3-8B zero-shot=$S/eval.json:zeroshot$E1Z" "${XSETS[@]}" --set "${BASE#*/} SFT=$S/eval.json:sft$E1S" "${REFS[@]}"

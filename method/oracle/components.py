@@ -1165,7 +1165,7 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict) -> dict:
 
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None, ee=None,
-           edit_best: dict | None = None, pool: dict | None = None, vs=None) -> list[dict]:
+           edit_best: dict | None = None, pool: dict | None = None, vs=None, split: str | None = None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
     row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT section, a
     question has no FINAL line, an edit request no EDIT line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
@@ -1187,13 +1187,13 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     net; left out until every request of the text has one); E4, the VARIABLES block's interchange tests (e4_term:
     variables.Scorer's e4; vs a variables.Scorer, left out without one, 0 for an answer without the block when measured). A term goal_eval cannot give (no causal-importance
     network for VPD's bounds) is left out of the mean. F3, the AUC of stated edges' cuts in the circuit's run, is
-    reported (term_F3), never in the mean. C (term_C), the circuit term in the mean in place of F1: goal_eval.fidelity's
-    reward mode, the mean of the stated graph's F1, its agreement under random node removals and under random
-    connection cuts, and its F1 with the flip adversary's FLIP_TERM parts switched on (the point and flip members each
-    at most what the answer's nodes reach with every connection among them restored: cutting a connection that
-    carries counter-signal earns nothing, 2ace8ee) (pool: the adversary's pattern
+    reported (term_F3), never in the mean. C (term_C), the circuit term in the mean in place of F1: goal_eval.fidelity's reward-mode c (the harmonic mean of
+    the intervention families defined on the text, c_terms: point, node removals, connection cuts, flips, changed
+    inputs' s_track, interchange, near and far donors; goal_eval.fidelity's docstring) (pool: the adversary's pattern
     pool, POOL by default; {} leaves the adversary out, for a model without one); F1 is reported (term_F1), as are C's
-    members (fidelity). reader: a reader.Reader for E1, or e1: each text's reader bits
+    members and columns (fidelity: s_track, context_share, the donors' ...). split: the draws of C's changed-input,
+    interchange and donor families, goal_eval's default "search" (the teachers' draws: the RL reward on training texts)
+    or "eval" (every evaluation, evaluate()). reader: a reader.Reader for E1, or e1: each text's reader bits
     computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
     -> goal_eval.Text, kept between calls."""
     import goal_eval
@@ -1228,7 +1228,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     ge.hooks = {"E1": (lambda task, g, x: bits.get(x)) if (reader is not None or e1 is not None) else None,
                 "E2": lambda task, g, x: qa_term(ev["qa"], parse(x)["finals"], tok, prompt["model_top"][0][0][0])}
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
-    c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], _pool() if pool is None else pool, mode="reward"))) if keep else {}
+    c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], _pool() if pool is None else pool, mode="reward", split=split))) if keep else {}
     e4 = {i: e4_term(vs, tx, graphs[i], parsed[i]["answer"], parsed[i]["variables_malformed"], nat.C) for i in keep} if vs is not None else {}
     e3 = {}
     if keep and ee is not None and ev.get("edits"):
@@ -1256,7 +1256,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
                     "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
                     "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row, "variables": e4.get(i),
-                    "fidelity": {k: v for k, v in (c_of.get(i) or {}).items() if k in ("s_point_c", "s_point", "s_wiring", "s_nodes", "s_edges", "f1_flips_c", "f1_flips_omitted")}})
+                    "fidelity": {k: v for k, v in (c_of.get(i) or {}).items()  # C's members and columns (s_track, context_share, ...)
+                                 if k == "c_terms" or isinstance(v, (int, float)) or v is None}})
     return out
 
 
@@ -1765,7 +1766,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
             cache = {}
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
-                            ee=ee, edit_best=edit_best, vs=vs)
+                            ee=ee, edit_best=edit_best, vs=vs, split="eval")
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -1777,7 +1778,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             per[name].append(entry)
         sizes = [x["samples"][0].get("nodes") or 0 for x in (per[s][-1] for s in sets)]
         names = baseline_texts(ge, task, sizes)
-        for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()))):
+        for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()), split="eval")):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
         log(p.stem + ": " + ", ".join(f"{s} {per[s][-1]['samples'][0]['reward']:+.3f}" for s in sets), flush=True)
     report = {}

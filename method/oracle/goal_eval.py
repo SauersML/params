@@ -534,8 +534,8 @@ class GoalEval:
         on = {n: circ[n][None].expand(B, -1, -1) if u is None else u[n] * (1 - circ[n]) + circ[n] for n in nat.names}
         a = {}
 
-        def write(w):  # a circuit writer's output [B, d_out]
-            return a[w[0]][:, w[1], w[2], None] * tg.site(w[0]).U[w[2]]
+        def write(w):  # a circuit writer's output as it enters the stream [B, d_out] (times its mask: off, nothing to cut)
+            return (a[w[0]][:, w[1], w[2]] * on[w[0]][:, w[1], w[2]])[:, None] * tg.site(w[0]).U[w[2]]
 
         def site(n, inp, restricted):  # the site's output; circuit readers with unstated writers read restricted(r, ws)
             A = inp @ tg.site(n).V

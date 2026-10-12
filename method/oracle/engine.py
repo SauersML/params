@@ -33,8 +33,9 @@ readers' positions). Engine.plan(graphs, semantics="c") runs C's semantics inste
 lead's decision 10-12): the circuit's nodes at 1 in the stream and every other subcomponent at u, every reader of the
 circuit reading the stream less (1 - e) of each connection the model has from another circuit node (e its strength
 when stated, 0 when not; through the attention pattern into an attention output, inside the GELU into an MLP output),
-the prediction less (1 - e) of each residual writer at a target; with every connection stated, the masked run of the
-circuit and u.
+the prediction less (1 - e) of each residual writer at a target, each writer's output as it enters the stream (times
+its mask: cutting a writer that is off changes nothing); with every connection stated, the masked run of the circuit
+and u.
 """
 from __future__ import annotations
 
@@ -415,8 +416,8 @@ class Engine:
                     res_s.append(sw[n])
             return A
 
-        def share(wn, wi, e):  # a connection's extra share in its reader's input: native e (1 - u_w) a_w, C -(1 - e) a_w
-            return (e - 1) * aw[wn][wi] if c else e * sw[wn][wi] * aw[wn][wi]
+        def share(wn, wi, e):  # a connection's extra share in its reader's input: native e (1 - u_w) a_w, C -(1 - e) u_w a_w
+            return (e - 1) * (1 - sw[wn][wi]) * aw[wn][wi] if c else e * sw[wn][wi] * aw[wn][wi]
 
         def shares(rn):  # the connections into reader site rn: (writer site, reader rows, writer rows, share)
             for (r, wn), (ri, wi, j, fx) in Eg.items():
@@ -425,8 +426,8 @@ class Engine:
 
         def resid_share(gi, j, fx, e_all):  # residual connections' shares from their writers' places gi
             e = fx if e_all is None else e_all[j] * fx
-            a = torch.cat(res_a)[gi]
-            return (e - 1) * a if c else e * torch.cat(res_s)[gi] * a
+            a, sw_ = torch.cat(res_a)[gi], torch.cat(res_s)[gi]
+            return (e - 1) * (1 - sw_) * a if c else e * sw_ * a
 
         def topup(rn, width):  # [readers, width]: each reader node's stated parents' extra share
             out = torch.zeros(len(R[rn][0]), width, device=self.dev)

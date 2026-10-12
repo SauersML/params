@@ -1009,6 +1009,34 @@ def test_family_reads_are_graph_ref(tiny):
             assert abs(float(rc[nd][b]) - float(wc[nd][0])) < 1e-5 + 1e-4 * abs(float(wc[nd][0]))
 
 
+def test_cutting_an_off_writer_changes_nothing(tiny):
+    """A cut writer's output is subtracted as it enters the stream (times its mask): cutting a connection from a writer
+    that is off in the run (VPD's answer, a writer outside it) changes nothing, in graph_ref and on the engine."""
+    nat, ge, tx = tiny
+    o0 = native.site_name(0, "o_proj")
+    readers = [nd for nd in sorted(native.Graph(masks=tx.vpd).node_set())
+               if native._name_layer_kind(nd[0])[0] >= 1 and native._name_layer_kind(nd[0])[1] in ("q_proj", "c_fc")]
+    pairs = []
+    for r in readers:
+        off = (~tx.vpd[o0][r[1]]).nonzero().flatten().tolist()
+        if off:
+            pairs.append(((o0, r[1], off[0]), r))
+        if len(pairs) == 3:
+            break
+    t = tx.targets[0]
+    off = (~tx.vpd[o0][t]).nonzero().flatten().tolist()
+    pairs.append(((o0, t, off[0]), None))
+    vpd = native.Graph(masks=tx.vpd)
+    want = ge.graph_ref(tx.ids, tx.targets, vpd)
+    for w, r in pairs:
+        assert float(carry.kl(want, ge.graph_ref(tx.ids, tx.targets, vpd, cuts={r: [w]}))[0]) < 1e-9
+    nodes = sorted({nd for w, r in pairs for nd in (w, r) if nd is not None})
+    g = native.Graph(nodes, *native.all_edges(nodes, tx.targets))
+    _, lv, _ = ge._sides(tx, [g])(g, cuts=[{r: [w]} for w, r in pairs])
+    for b in range(len(pairs)):
+        assert float(carry.kl(want[0][None], lv[b][None])[0]) < 1e-6
+
+
 def test_interchange_family(tiny):
     """Interchange: VPD's answer as the circuit agrees with VPD's own run draw by draw; a stated circuit with every
     connection and some activations fixed (graph_ref) is the independent forward with them fixed."""

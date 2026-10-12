@@ -352,3 +352,13 @@ def test_probe_is_kept(tiny):
         del nat.sensitivity
     assert not calls
     assert [list(x) for x in again.prompts] == [list(x) for x in tx.prompts] and again.f2 == tx.f2
+
+
+def test_cuts_into_the_prediction_alone(tiny):
+    """An answer whose only edges go into the prediction (no reader inside the model) is cut without a model run."""
+    nat, ge, tx = tiny
+    last = tx.targets[0]
+    pairs = [(("h.1.mlp.down_proj", last, 1), None), (("h.0.attn.o_proj", last, 2), None)]
+    got = ge.cuts(tx, pairs)
+    for (w, r), k in zip(pairs, got):
+        assert abs(k - naive_cut(nat, tx.ids, tx.targets, w, r)) < 1e-4

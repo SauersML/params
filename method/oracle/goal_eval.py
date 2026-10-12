@@ -331,8 +331,8 @@ class GoalEval:
 
         new = self._cut_activations(tx, [pairs[j] for j in inner]) if inner else None
         at = {j: i for i, j in enumerate(inner)}
-        B = min(self.cut_chunk, len(inner))  # every batch this size (the last padded with its own last cut): the
-        for s0 in range(0, len(inner), B):  # model's states for reuse are computed once per text and batch size
+        B = max(1, min(self.cut_chunk, len(inner)))  # every batch this size (the last padded with its own last cut):
+        for s0 in range(0, len(inner), B):  # the model's states for reuse are computed once per text and batch size
             js = inner[s0:s0 + B]
             js = js + [js[-1]] * (B - len(js))
             by = {}

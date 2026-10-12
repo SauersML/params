@@ -989,10 +989,13 @@ class Native:
             out.append(Changed(x, 1.0))
         return out
 
+    WINDOW_EXACT = ("mps",)  # devices where sensitivity's windowed probes are checked equal to the whole forward
+
     def sensitivity(self, ids: list[int], targets: list[int], g: torch.Generator, chunk: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
         """(moved [last], other [T - 1, V]): moved[p - 1], the KL (nats) of the model's prediction at the last target
         after the token at position p is replaced by one draw from other[p - 1], the model's prediction for position p
-        without the text's token there (changes' probe: where the prediction responds to the text)."""
+        without the text's token there (changes' probe: where the prediction responds to the text). On WINDOW_EXACT
+        devices a probe computes only from its changed position (Target.hidden's window): the same numbers."""
         last = max(targets)
         probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0].float().softmax(-1).cpu()
         base = torch.log(probs[last].clamp_min(1e-30))
@@ -1003,13 +1006,20 @@ class Native:
             x = list(ids)
             x[p] = int(torch.multinomial(other[p - 1], 1, generator=g))
             probe.append(x)
-        lqs = []
+        lqs, prefix = [], {}
+        window = str(self.dev).split(":")[0] in self.WINDOW_EXACT
         with torch.no_grad():
             for s0 in range(0, len(probe), chunk):
                 batch = torch.tensor(probe[s0:s0 + chunk], device=self.dev)
                 if len(batch) > 1:  # the logits at the last target alone: the numbers they have in the whole sequence's
                     self.vpd.clear()
-                    logits = (self.target.hidden(batch)[:, last:last + 1] @ self.target.wte.T)[:, 0]
+                    # The chunk's probes change positions s0 + 1 on: before there (keeping at least 64 rows) they read
+                    # the text's own queries, keys and values, computed at the chunk's batch size
+                    start = max(0, min(s0 + 1, len(ids) - 64)) if window else 0
+                    if start and len(batch) not in prefix:
+                        prefix[len(batch)] = self.target.keys_values(torch.tensor([ids] * len(batch), device=self.dev))
+                    h = self.target.hidden(batch, start, prefix.get(len(batch)))[:, last - start:last - start + 1]
+                    logits = (h @ self.target.wte.T)[:, 0]
                 else:
                     logits = self.vpd.target_forward(batch)[:, last]
                 lqs.append(torch.log_softmax(logits.float(), -1))

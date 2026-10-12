@@ -1,7 +1,6 @@
 """Speed of the oracle checker's hot paths on vpd4l (#2951): repeatable benchmarks, one JSON line per run.
 
   bench_speed.py [--code DIR] [--split heldout] [--texts 3] [--benches carry,score,events] [--out FILE]
-  bench_speed.py --benches sample --adapter DIR --questions FILE [--merged DIR]   (CUDA with vLLM)
   bench_speed.py --profile carry [--granularity matrix]                     where measure() spends its time
 
 carry    MatrixCarry.measure: unit sets per second, batches of 64 random sets (each unit on with probability 1/2) over
@@ -10,8 +9,7 @@ carry    MatrixCarry.measure: unit sets per second, batches of 64 random sets (e
 score    units.score_many seconds per question: K=8 positions, 8 answers (the copy and all baselines, 4 copies each);
          seconds_first with the model object's per-text caches dropped (a text's first call), seconds with them kept
 events   units.events seconds per text, K=8; seconds_first and seconds as for score
-sample   the explainer's vLLM sampling (units_sft.py sample's settings): generated tokens per second, the adapter as a
-         LoRA and, given --merged, merged into the weights
+window   Native.sensitivity's windowed probes on this device vs the whole forward: equal, and seconds of each
 Texts are the split's first n, fixed; every timing is after one untimed warm-up on the same inputs (MPS compiles a
 graph per shape) and ends with a device synchronize. Each result carries a fingerprint of what it computed (sums of
 measured KLs and scores): a speed change that alters the numbers shows there. GPU utilization is the system's, sampled
@@ -157,46 +155,26 @@ def bench_events(nat, texts, k=8):
     return rows
 
 
-def bench_sample(a):
-    """units_sft.py sample's engine and settings (vLLM, n=4, temperature 1, 1,536 tokens, model length 8,192, 85% of the
-    GPU) on the questions: generated tokens per second after a warm-up batch, with the adapter as a LoRA (as sample runs
-    it) and, given --merged (units_sft.py merge's checkpoint of the same adapter), as merged weights."""
-    import gc
-
+def bench_window(nat, texts):
+    """Native.sensitivity with its windowed probes on this device vs the whole forward: equal? seconds of each."""
     import torch
-    from transformers import AutoTokenizer
-    from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
 
-    sys.path.insert(0, str(Path(a.code) / "rl"))
-    from units_sft import chat_prompt
+    import carry
+    import native
 
-    qs = [json.loads(x)["question"] for x in open(a.questions)][:a.questions_n]
-    tok = AutoTokenizer.from_pretrained(a.base)
-    prompts = [chat_prompt(tok, q) for q in qs]
-    params = SamplingParams(n=4, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=1536, seed=0)
-    rows = []
-    for how in ["lora"] + (["merged"] if a.merged else []):
-        if how == "lora":
-            rank = json.loads((Path(a.adapter) / "adapter_config.json").read_text())["r"]
-            llm = LLM(model=a.base, dtype="bfloat16", enable_lora=True, max_lora_rank=rank, max_model_len=8192,
-                      gpu_memory_utilization=0.85, seed=0)
-            kw = {"lora_request": LoRARequest("explainer", 1, str(a.adapter))}
-        else:
-            llm = LLM(model=str(a.merged), dtype="bfloat16", max_model_len=8192, gpu_memory_utilization=0.85, seed=0)
-            kw = {}
-        llm.generate(prompts[:2], params, use_tqdm=False, **kw)
-        util = Utilization("cuda")
-        t0 = time.perf_counter()
-        outs = llm.generate(prompts, params, use_tqdm=False, **kw)
-        seconds = time.perf_counter() - t0
-        gen = sum(len(c.token_ids) for o in outs for c in o.outputs)
-        rows.append({"weights": how, "questions": len(qs), "answers": 4 * len(qs), "generated_tokens": gen,
-                     "seconds": seconds, "tokens_per_s": gen / seconds, "gpu": util.finish()})
-        print("sample", json.dumps(rows[-1]), flush=True)
-        del llm
-        gc.collect()
-        torch.cuda.empty_cache()
+    rows, keep = [], type(nat).WINDOW_EXACT
+    dev = str(nat.dev).split(":")[0]
+    for path in texts:
+        ids, targets = native.text(path)
+        res = {}
+        for mode, devices in (("whole", ()), ("window", (dev,))):
+            nat.WINDOW_EXACT = devices
+            seed = lambda: torch.Generator(device="cpu").manual_seed(native.task_seed(str(ids[:8])))
+            seconds, (moved, _) = timed(lambda: nat.sensitivity(ids, targets, seed()), lambda: carry.synchronize(nat.dev))
+            res[mode] = (seconds, moved)
+        rows.append({"task": path.stem, "T": len(ids), "whole_s": res["whole"][0], "window_s": res["window"][0],
+                     "equal": bool(torch.equal(res["whole"][1], res["window"][1]))})
+    nat.WINDOW_EXACT = keep
     return rows
 
 
@@ -235,11 +213,6 @@ def main():
     ap.add_argument("--benches", default="carry,score,events")
     ap.add_argument("--granularity", default="matrix,subcomponent", help="carry's unit granularities")
     ap.add_argument("--profile", choices=("carry",))
-    ap.add_argument("--adapter", type=Path, help="sample: the explainer's LoRA adapter")
-    ap.add_argument("--merged", type=Path, help="sample: the same adapter merged into the base (units_sft.py merge)")
-    ap.add_argument("--base", default="Qwen/Qwen3-4B")
-    ap.add_argument("--questions", type=Path, help="sample: units_sft.py questions output")
-    ap.add_argument("--questions-n", type=int, default=50)
     ap.add_argument("--label", default="", help="a name for this run in the output (e.g. before, after)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
@@ -247,37 +220,35 @@ def main():
     head = {"label": a.label, "code": str(a.code), "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "commit": subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short=10", "HEAD"], capture_output=True,
                                      text=True).stdout.strip()}
+    import torch
+
+    import carry
+    import native
+
     results = {}
-    if a.benches == "sample":
-        results["sample"] = bench_sample(a)
-        dev = "cuda"
-    else:
-        import torch
-
-        import carry
-        import native
-
-        nat = native.Native()
-        dev = str(nat.dev)
-        texts = native.tasks(a.split)[:a.texts]
-        if a.profile:
-            profile_carry(nat, texts[0], a.granularity.split(",")[0])
-            return
-        for b in a.benches.split(","):
-            if b == "carry":
-                for gran in a.granularity.split(","):
-                    try:
-                        carry.UnitSpace(nat, 2, [0], gran, **({"candidates": {}} if gran == "subcomponent" else {}))
-                    except (ValueError, TypeError) as exc:
-                        results[f"carry_{gran}"] = f"not in this code: {exc}"
-                        continue
-                    results[f"carry_{gran}"] = bench_carry(nat, texts, gran)
-            elif b == "score":
-                results["score"] = bench_score(nat, texts)
-            elif b == "events":
-                results["events"] = bench_events(nat, texts)
-            print(b, json.dumps(results.get(b) or {k: v for k, v in results.items() if k.startswith(b)}), flush=True)
-        head["torch"] = torch.__version__
+    nat = native.Native()
+    dev = str(nat.dev)
+    texts = native.tasks(a.split)[:a.texts]
+    if a.profile:
+        profile_carry(nat, texts[0], a.granularity.split(",")[0])
+        return
+    for b in a.benches.split(","):
+        if b == "carry":
+            for gran in a.granularity.split(","):
+                try:
+                    carry.UnitSpace(nat, 2, [0], gran, **({"candidates": {}} if gran == "subcomponent" else {}))
+                except (ValueError, TypeError) as exc:
+                    results[f"carry_{gran}"] = f"not in this code: {exc}"
+                    continue
+                results[f"carry_{gran}"] = bench_carry(nat, texts, gran)
+        elif b == "score":
+            results["score"] = bench_score(nat, texts)
+        elif b == "events":
+            results["events"] = bench_events(nat, texts)
+        elif b == "window" and hasattr(nat, "WINDOW_EXACT"):
+            results["window"] = bench_window(nat, texts)
+        print(b, json.dumps(results.get(b) or {k: v for k, v in results.items() if k.startswith(b)}), flush=True)
+    head["torch"] = torch.__version__
     row = {**head, "device": dev, **results}
     if a.out:
         with a.out.open("a") as f:

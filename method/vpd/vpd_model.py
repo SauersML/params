@@ -134,10 +134,45 @@ class Target(nn.Module):
     def forward(self, ids: Tensor) -> Tensor:
         return self.hidden(ids) @ self.wte.T
 
-    def hidden(self, ids: Tensor) -> Tensor:
-        """The final normed residual stream [B, T, d]; the logits are it times the tied embedding."""
+    def hidden(self, ids: Tensor, start: int = 0, prefix: list | None = None) -> Tensor:
+        """The final normed residual stream [B, T, d]; the logits are it times the tied embedding. With start > 0 and
+        prefix (keys_values() of a sequence that has ids' tokens before start), the projections and the MLP run only on
+        the positions from start, the prefix's queries, keys and values standing before them in an attention of the
+        whole length (the same call, so the same numbers as the whole forward; the prefix computed at the same batch
+        size, whose attention can round differently): [B, T - start, d]."""
+        B, T = ids.shape
+        L = T - start
+        x = self.wte[ids[:, start:]]
+        for i in range(self.n_layer):
+            s = lambda k: self.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
+            h = rms(x, self.norms[2 * i], self.eps)
+            q = s("q_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
+            k = s("k_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
+            v = s("v_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
+            if start:
+                q, k = self._rope_from(q, start, T), self._rope_from(k, start, T)
+                q, k, v = (torch.cat([w[:, :, :start], z], 2) for w, z in zip(prefix[i], (q, k, v)))
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)[:, :, start:]
+            else:
+                q, k = self._rope(q, T), self._rope(k, T)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            x = x + s("o_proj")(y.transpose(1, 2).reshape(B, L, -1))
+            h = rms(x, self.norms[2 * i + 1], self.eps)
+            x = x + s("down_proj")(gelu_tanh(s("c_fc")(h)))
+        return rms(x, self.ln_f, self.eps)
+
+    def _rope_from(self, x: Tensor, start: int, T: int) -> Tensor:
+        """_rope of positions start..T-1."""
+        n = self.hd // 2
+        rot = torch.cat([-x[..., n:], x[..., :n]], dim=-1)
+        return x * self.cos[start:T] + rot * self.sin[start:T]
+
+    def keys_values(self, ids: Tensor) -> list:
+        """Each layer's rotated queries and keys and its values [B, H, T, hd] on sequences [B, T] (hidden()'s
+        prefix)."""
         B, T = ids.shape
         x = self.wte[ids]
+        out = []
         for i in range(self.n_layer):
             s = lambda k: self.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
             h = rms(x, self.norms[2 * i], self.eps)
@@ -145,11 +180,12 @@ class Target(nn.Module):
             k = s("k_proj")(h).view(B, T, self.n_head, self.hd).transpose(1, 2)
             v = s("v_proj")(h).view(B, T, self.n_head, self.hd).transpose(1, 2)
             q, k = self._rope(q, T), self._rope(k, T)
+            out.append((q, k, v))
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             x = x + s("o_proj")(y.transpose(1, 2).reshape(B, T, -1))
             h = rms(x, self.norms[2 * i + 1], self.eps)
             x = x + s("down_proj")(gelu_tanh(s("c_fc")(h)))
-        return rms(x, self.ln_f, self.eps)
+        return out
 
 
 def load_target(device: str = "mps") -> Target:

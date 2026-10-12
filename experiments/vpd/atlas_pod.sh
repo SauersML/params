@@ -7,12 +7,12 @@
 # fields come back to ~/mpd-data/runpod/NAME (the activity chunks are dropped on the pod once the rows are built).
 # The image's torch (no pinned environment: any host with CUDA 12.4 qualifies) with the few packages it lacks.
 # STAGES picks the passes (default all four); without fit, the lens's Jacobians come from ~/mpd-data/atlas/vpd4l/lens.
-#   experiments/vpd/atlas_pod.sh [NAME] [HOURS]     (env: GPU, PRICE, STAGES="activity lookahead fit evaluate")
+#   experiments/vpd/atlas_pod.sh [NAME] [HOURS]     (env: GPU, PRICE, STAGES="activity lookahead fit routed evaluate")
 cd /Users/user/params
 N=${1:-oracle-graph-atlas-parts} H=${2:-2}
 O=/Users/user/mpd-data/runpod/$N W=/workspace/runs/$N A=/Users/user/mpd-data/atlas/vpd4l
 V=/Users/user/mpd-data/vpd
-STAGES=" ${STAGES:-activity lookahead fit evaluate} "
+STAGES=" ${STAGES:-activity lookahead fit routed evaluate} "
 CMD="set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/parts $O/lens;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json $A/tokens_0_6000.npy $A/atlas.json $A/atlas.safetensors /Users/user/params/method/vpd > /dev/null;
@@ -29,6 +29,8 @@ case $STAGES in *" fit "*) CMD="$CMD
 python -m method.vpd.lens fit --out $O --tokens $A/tokens_0_6000.npy --device cuda || echo STAGE lens fit FAILED;";;
 *) CMD="$CMD
 cp $A/lens/jacobians.pt $O/lens/;";; esac
+case $STAGES in *" routed "*) CMD="$CMD
+python -m method.vpd.lens routed --out $O --tokens $A/tokens_0_6000.npy --device cuda || echo STAGE lens routed FAILED;";; esac
 case $STAGES in *" evaluate "*) CMD="$CMD
 python -m method.vpd.lens evaluate --out $O --tokens $A/tokens_0_6000.npy --device cuda || echo STAGE lens evaluate FAILED;";; esac
 CMD="$CMD

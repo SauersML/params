@@ -6,25 +6,27 @@ plain text (nothing in it is executed):
 
   EXPLANATION: the model copies the digits after the earlier "327" ...
   CIRCUIT:
-  out <- L3.down#120@332, L2.o#77@332
-  L2.o#77@332 <- L2.v#902,1514@322
-  L2.v#902,1514@322 <- L0.down#77@322
-  L0.down#77@322 <- L0.fc#12,40@322
-  @322 L2.k#9 L1.k#3,17
+  @332 a=L3.down#120 b=L2.o#77
+  @322 c=L2.v#902 d=L2.v#1514 e=L0.down#77 f=L0.fc#12 g=L2.k#9 h=tok
+  OUT <- a,b
+  b <- c,d
+  c <- e
+  d <- e
+  e <- f,h
   ANSWER 1: the change at 322 removes the copied digit ...
   FINAL 1: falls=yes top=' 7'
 
-A subcomponent is L<layer>.<kind>#<index>@<position> (kind q, k, v, o, fc, down). A circuit line "reader <- writer,
-writer" states one edge per writer: an attention or MLP output (o, down) into a later query, key, value or MLP input
-(q, k, v, fc) at its position, a value (v) into its layer's attention output (o) at that or a later position (attention
-between positions), an MLP input (fc) into its MLP's output (down); "out" is the prediction at the target. Subcomponents
-of one matrix at one position may be written together (L2.v#902,1514@322, indices sorted): a line with groups states
-an edge from every writer to every reader. Nodes with no stated input are listed by position, one line each:
-"@322 L2.v#902,1514 L3.o#5" (a group with its position, without "<-", also states nodes). parse() gives
-goal_eval's circuit JSON, and goal_eval.circuit checks every edge against the model (mech.connects); render() writes
-the lines backward from "out", grouping readers that share their writers. Token strings are shown as Python reprs of
-the target's tokens (special tokens included) and escaped (escape()): no question or answer holds a literal special or
-added token of the explainer's tokenizer.
+A subcomponent is L<layer>.<kind>#<index> (kind q, k, v, o, fc, down) at a position; the token embedding at a position
+is tok, an input node. Every node is named once by a short id in its position's block ("@322 c=L2.v#902 h=tok"), and
+each edge line "reader <- writer,writer" states one edge per writer by id: an attention or MLP output (o, down) into a
+later query, key, value or MLP input (q, k, v, fc) at its position, a value (v) into its layer's attention output (o)
+at that or a later position (attention between positions, so ids of other blocks), an MLP input (fc) into its MLP's
+output (down), the token embedding into a reader at its position; "OUT" is the prediction at the target. parse() gives
+goal_eval's circuit JSON, and goal_eval.circuit checks every edge against the model (mech.connects); an id never
+declared is a node outside the graph, dropped and charged. parse() also reads nodes written out in edge lines
+(L2.o#77@332 <- L2.v#902,1514@322, a group stating an edge from every writer to every reader) and blocks without ids;
+render() writes ids only. Token strings are shown as Python reprs of the target's tokens (special tokens included)
+and escaped (escape()): no question or answer holds a literal special or added token of the explainer's tokenizer.
 
 The question (question()) holds the text's tokens, the model's top next tokens, the positions whose changed token
 moves the prediction by at least 1% of the text's total (goal_eval's SHARE_FLOOR) with the measured evidence there
@@ -32,7 +34,6 @@ moves the prediction by at least 1% of the text's total (goal_eval's SHARE_FLOOR
 subcomponents at each of those positions and at the target, ranked by VPD (Native._vpd_order) with their atlas facts,
 the subcomponents a change of each listed token switches on, the strongest weight-level connections among them
 (method/vpd/connectome.py; a static coupling, not a measured effect), and the intervention questions (qa_questions()).
-The token embedding is an input node, tok@<position>, a writer only.
 
 The reward (reward()) is goal_eval's scorecard in VPD's semantics combined into one number: the mean of the quality
 terms (each at most 1) less SIZE_WEIGHT x size (description bits over the bits of naming every VPD-active
@@ -82,9 +83,9 @@ WRITERS_RE = re.compile(rf"\s*{_G}(?:\s*,\s*{_G})*\s*")
 BLOCK_RE = re.compile(r"@(\d+)\s+((?:(?:[a-z]+=)?(?:L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)\s*)+)")
 ITEM_RE = re.compile(r"(?:([a-z]+)=)?(L\d+\.(?:q|k|v|o|fc|down)#\d+(?:,\d+)*|tok)")
 _W = rf"(?:{_G}|[a-z]+)"
+ID_RE = re.compile(r"[a-z]+")
 GROUP_SPLIT = re.compile(rf"{_G}|[a-z]+")
 REFS_RE = re.compile(rf"\s*{_W}(?:\s*,\s*{_W})*\s*")  # writers by group or by id
-ID_EDGES = 0.4  # render() names nodes by short ids when an answer states more edges than this per node
 MARKDOWN = re.compile(r"\*\*|^[ \t]*(?:#+|[-*])[ \t]+", re.M)
 ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response)>)")  # Qwen's added tokens: <|...|>, <think>, <tool_call>, ...
 FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s*(.+?)\s*$", re.M | re.I)
@@ -161,8 +162,8 @@ def _sections(text: str) -> dict:
 def parse(text: str) -> dict:
     """An answer's parts: "explanation", "answer" (goal_eval's circuit JSON: nodes [matrix, index, position], edges
     [upstream, downstream | "out"]), "malformed" (circuit lines that do not parse), "circuit" (whether a CIRCUIT
-    section exists), "malformed_nodes" (what those lines name, at least one each) and "finals" (question number ->
-    (falls, the top token as written)). A circuit line's reader may be
+    section exists), "malformed_nodes" (what those lines name, at least one each, and every undefined id, each charged as
+    a node outside the graph), "unknown_ids" and "finals" (question number -> (falls, the top token as written)). A circuit line's reader may be
     a group, and so may each writer: the line states an edge from every writer to every reader. Markdown decoration
     (bold markers, heading marks at a line's start) is ignored: no valid line holds it."""
     text = MARKDOWN.sub("", text)
@@ -175,26 +176,28 @@ def parse(text: str) -> dict:
             nodes.append([nd[0], nd[2], nd[1]])
         return at[nd]
 
-    for line in sec.get("CIRCUIT", "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    lines = [x.strip() for x in sec.get("CIRCUIT", "").splitlines() if x.strip()]
+    for line in lines:  # first every position block, so an edge line may name an id declared below it
         block = BLOCK_RE.fullmatch(line)
-        if block:  # "@322 L2.v#902,1514 L3.o#5" or "@322 a=L2.v#902 b=L3.o#5": nodes at one position, ids optional
-            bad = False
-            for item in block[2].split():
-                m = ITEM_RE.fullmatch(item)
-                group = group_of(f"{m[2]}@{block[1]}") or []
-                if m[1] and (len(group) != 1 or m[1] in ("out", "tok") or ids.get(m[1], group[0]) != group[0]):
-                    bad = True  # an id names one node, once
-                    continue
-                for nd in group:
-                    index(nd)
-                if m[1]:
-                    ids[m[1]] = group[0]
-            if bad:
-                malformed += 1
-                junk += 1
+        if not block:
+            continue
+        bad = False  # "@322 a=L2.v#902 b=L3.o#5" (or ids left out: "@322 L2.v#902,1514 L3.o#5")
+        for item in block[2].split():
+            m = ITEM_RE.fullmatch(item)
+            group = group_of(f"{m[2]}@{block[1]}") or []
+            if m[1] and (len(group) != 1 or m[1] in ("out", "tok") or ids.get(m[1], group[0]) != group[0]):
+                bad = True  # an id names one node, once
+                continue
+            for nd in group:
+                index(nd)
+            if m[1]:
+                ids[m[1]] = group[0]
+        if bad:
+            malformed += 1
+            junk += 1
+    unknown = 0
+    for line in lines:
+        if BLOCK_RE.fullmatch(line):
             continue
         if line.startswith("@"):
             malformed += 1
@@ -202,19 +205,23 @@ def parse(text: str) -> dict:
             continue
         reader, arrow, writers = line.partition("<-")
         reader = reader.strip()
-
-        def refs(text):  # writers by group or by id; None when one does not resolve
-            out = []
-            for w in (x.strip() for x in GROUP_SPLIT.findall(text)):
+        if ID_RE.fullmatch(reader) and reader not in ids and reader.lower() != "out":
+            unknown += 1  # an undefined id: a node that is not in the graph, charged; the line states nothing
+            continue
+        ws, missing = [], 0
+        if writers.strip() and REFS_RE.fullmatch(writers):
+            for w in (x.strip() for x in GROUP_SPLIT.findall(writers)):
                 got = [ids[w]] if w in ids else group_of(w)
-                if not got:
-                    return None
-                out += got
-            return out
-
-        rs = ["out"] if reader == "out" else ([ids[reader]] if reader in ids else group_of(reader))
-        ws = [] if not writers.strip() else (refs(writers) if REFS_RE.fullmatch(writers) else None)
-        if rs is None or ws is None or (reader == "out" and not ws) or (arrow and not ws):
+                if got:
+                    ws += got
+                else:
+                    missing += 1  # an undefined id among the writers: dropped and charged, the others kept
+        elif writers.strip():
+            ws = None
+        is_out = reader.lower() == "out"
+        rs = ["out"] if is_out else ([ids[reader]] if reader in ids else group_of(reader))
+        unknown += missing
+        if rs is None or ws is None or (arrow and not ws and not missing) or (is_out and not ws and not missing):
             malformed += 1
             junk += max(1, len(GROUP_RE.findall(line)))  # what it names, priced as nodes that are not in the graph
             continue
@@ -229,24 +236,8 @@ def parse(text: str) -> dict:
         finals.setdefault(int(m[1]), (m[2].lower() == "yes", m[3].strip()))
     explanation = sec.get("EXPLANATION", "")
     return {"explanation": explanation, "answer": {"nodes": nodes, "edges": edges, "explanation": explanation},
-            "malformed": malformed, "malformed_nodes": junk, "circuit": "CIRCUIT" in sec, "finals": finals}
-
-
-def _grouped(nds) -> list[str]:
-    """Groups of subcomponents by matrix and position, latest position first, then by layer and kind."""
-    by = {}
-    for nd in nds:
-        by.setdefault((nd[0], nd[1]), []).append(nd)
-    return [group_text(by[k]) for k in sorted(by, key=_place)]
-
-
-def blocks(nds) -> list[str]:
-    """Nodes with no stated input, one line per position (latest first): "@322 L2.v#902,1514 L3.o#5", each matrix's
-    indices together (the position written once: 10-25% fewer tokens than a group per matrix and position)."""
-    at = {}
-    for nd in nds:
-        at.setdefault(nd[1], []).append(nd)
-    return [f"@{t} " + " ".join(g.rsplit("@", 1)[0] for g in _grouped(at[t])) for t in sorted(at, reverse=True)]
+            "malformed": malformed, "malformed_nodes": junk + unknown, "unknown_ids": unknown, "circuit": "CIRCUIT" in sec,
+            "finals": finals}
 
 
 def _place(nd) -> tuple:
@@ -257,10 +248,10 @@ def _place(nd) -> tuple:
     return (-nd[1], -int(nd[0].split(".")[1]), list(KINDS.values()).index(nd[0].split(".")[-1])) + tuple(nd[2:3])
 
 
-def render(answer: dict, finals: dict | None = None, reasons: dict | None = None, ids: bool | None = None) -> str:
-    """The text of a circuit in goal_eval's JSON (to_json's): with more than ID_EDGES stated edges per node, every node
-    named once by a short id and the edges by id (_id_lines); otherwise nodes written out in the edge lines
-    (_group_lines); ids True or False forces one. finals: question number -> (falls, the top token as written)."""
+def render(answer: dict, finals: dict | None = None, reasons: dict | None = None) -> str:
+    """The text of a circuit in goal_eval's JSON (to_json's): every node named once by a short id in its position's
+    block and the edges by id (_id_lines), one output grammar for every answer. finals: question number -> (falls,
+    the top token as written)."""
     import goal_eval
 
     nodes = [(TOK if m == TOK else goal_eval._site(m), t, c) for m, c, t in answer["nodes"]]
@@ -270,11 +261,7 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
             out.append(nodes[w])
         else:
             parents.setdefault(nodes[r], set()).add(nodes[w])
-    n_edges = sum(len(ws) for ws in parents.values()) + len(out)
-    if ids if ids is not None else n_edges > ID_EDGES * len(set(nodes)):
-        lines = _id_lines(set(nodes), parents, out)
-    else:
-        lines = _group_lines(set(nodes), parents, out)
+    lines = _id_lines(set(nodes), parents, out)
     text = [f"EXPLANATION: {answer.get('explanation', '')}".rstrip(), "CIRCUIT:"] + lines
     for k in sorted(finals or {}):
         falls, top = finals[k]
@@ -300,8 +287,8 @@ def _short_ids(n: int) -> list[str]:
 
 def _id_lines(nodes: set, parents: dict, out: list) -> list[str]:
     """Circuit lines naming every node once with a short id in its position's block ("@322 a=L2.v#1514 b=tok"), then
-    the edges by id from the prediction backward ("out <- a", "a <- c,d"): an edge costs ~2-4 tokens instead of ~10
-    for an answer that states many."""
+    the edges by id from the prediction backward ("OUT <- a", "a <- c,d"): an edge costs ~2-4 tokens, against ~10 with
+    nodes written out in edge lines (which parse() still reads)."""
     order = sorted(nodes, key=_place)
     name = dict(zip(order, _short_ids(len(order))))
     at = {}
@@ -309,7 +296,7 @@ def _id_lines(nodes: set, parents: dict, out: list) -> list[str]:
         at.setdefault(nd[1], []).append(nd)
     lines = [f"@{t} " + " ".join(f"{name[nd]}={group_text([nd]).rsplit('@', 1)[0]}" for nd in at[t]) for t in sorted(at, reverse=True)]
     if out:
-        lines.append("out <- " + ",".join(name[w] for w in sorted(set(out), key=_place)))
+        lines.append("OUT <- " + ",".join(name[w] for w in sorted(set(out), key=_place)))
     seen, queue = set(), sorted(set(out), key=_place)
     while queue:
         r = queue.pop(0)
@@ -321,35 +308,6 @@ def _id_lines(nodes: set, parents: dict, out: list) -> list[str]:
         queue += ws
     for r in sorted(set(parents) - seen, key=_place):
         lines.append(f"{name[r]} <- " + ",".join(name[w] for w in sorted(parents[r], key=_place)))
-    return lines
-
-
-def _group_lines(nodes: set, parents: dict, out: list) -> list[str]:
-    """Circuit lines with nodes written out: readers grouped by matrix, position and writers ("L2.o#77@332 <-
-    L2.v#902,1514@322"), from the prediction backward, then the nodes named nowhere else by position."""
-    groups = {}
-    for r, ws in parents.items():
-        groups.setdefault((r[0], r[1], frozenset(ws)), []).append(r)
-    group_of_reader = {r: k for k, rs in groups.items() for r in rs}
-    lines, named, done = [], set(), set()
-    if out:
-        lines.append("out <- " + ", ".join(_grouped(set(out))))
-        named.update(out)
-    queue = sorted(set(out), key=_place)
-    while queue:
-        k = group_of_reader.get(queue.pop(0))
-        if k is None or k in done:
-            continue
-        done.add(k)
-        lines.append(f"{group_text(groups[k])} <- " + ", ".join(_grouped(k[2])))
-        named.update(groups[k])
-        named.update(k[2])
-        queue += sorted(k[2], key=_place)
-    for k in sorted(set(groups) - done, key=lambda k: (-k[1], k[0], sorted(c for _, _, c in groups[k]))):
-        lines.append(f"{group_text(groups[k])} <- " + ", ".join(_grouped(k[2])))
-        named.update(groups[k])
-        named.update(k[2])
-    lines += blocks(set(nodes) - named)
     return lines
 
 
@@ -523,19 +481,17 @@ def qa_score(questions: list[dict], finals: dict, tokens_of) -> float | None:
 
 ASK = ("How does {model} compute its prediction of the next token after the target of this text? State the circuit in "
        "VPD subcomponents: a subcomponent is one rank-one slice of a weight matrix at a position, written "
-       "L<layer>.<kind>#<index>@<position> (kind q, k, v, o, fc or down; for example L2.v#1514@322). Write one line per "
-       "reader, \"<reader> <- <writer>, <writer>\", each writer an edge into the reader: an attention or MLP output (o, "
-       "down) into a later query, key, value or MLP input (q, k, v, fc) at its position; a value (v) into its layer's "
-       "attention output (o) at that or a later position; an MLP input (fc) into its MLP's output (down). \"out\" is the "
-       "prediction. The circuit should be what makes the prediction: with only its subcomponents on and every other one off, "
-       "the model should still predict what it does, and with them taken out of VPD's active subcomponents it should "
-       "not; fewer subcomponents and edges are better. Answer with a line EXPLANATION: (in plain English, what the model does), "
+       "L<layer>.<kind>#<index> (kind q, k, v, o, fc or down; for example L2.v#1514 at position 322); the token "
+       "embedding at a position is tok. Name every node once with a short id in its position's line, @322 c=L2.v#1514 "
+       "h=tok, then write one line per reader, <reader> <- <writer>,<writer>, by id: an attention or MLP output (o, down) "
+       "into a later query, key, value or MLP input (q, k, v, fc) at its position; a value (v) into its layer's attention "
+       "output (o) at that or a later position; an MLP input (fc) into its MLP's output (down); the token embedding into a "
+       "reader at its position. OUT <- <writer>,<writer> is the prediction. The circuit should be what makes the "
+       "prediction: with only its subcomponents on, reading along its edges, and every other one off, the model should "
+       "still predict what it does, and with them taken out of VPD's active subcomponents it should not; fewer "
+       "subcomponents and edges are better. Answer with a line EXPLANATION: (in plain English, what the model does), "
        "then CIRCUIT: and its lines, then for each question ANSWER <n>: (your reasoning in plain English) and "
-       "FINAL <n>: falls=yes or no top=<the token, quoted as the tokens are>. Subcomponents of one matrix at one position "
-       "may be written together, L2.v#902,1514@322; a line with groups states an edge from every writer to every reader. "
-       "The token embedding at a position is tok@<position>, a writer only. Nodes with no stated input are listed by "
-       "position, @322 L2.v#902 L3.o#5; when there are many edges, name every node once in its position's line with a "
-       "short id, @322 a=L2.v#902 b=tok, and write the edges by id, out <- a and a <- b.")
+       "FINAL <n>: falls=yes or no top=<the token, quoted as the tokens are>.")
 
 
 def wiring(conn, nodes: list, targets: list[int], k: int) -> list[tuple]:
@@ -830,7 +786,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         g, d = goal_eval.circuit(p["answer"], targets, nat.C, len(ids))
         graphs.append(g)
         junk = p["malformed_nodes"] * math.log2(nat.positions(targets) * total)  # a line that does not parse: written, explains nothing
-        defects.append((d["invalid_nodes"], d["invalid_edges"], dropped_bits(p["answer"], g, d, nat.positions(targets), total) + junk))
+        defects.append((d["invalid_nodes"] + p["unknown_ids"], d["invalid_edges"], dropped_bits(p["answer"], g, d, nat.positions(targets), total) + junk))
         valid.append(p["circuit"] and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1)) and not (truncated and truncated[i]))
     keep = [i for i, v in enumerate(valid) if v]  # an invalid answer's reward is fixed whatever it measures: not run
     if keep:

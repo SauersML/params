@@ -20,14 +20,19 @@ from test_goal_eval import tiny_native  # noqa: E402
 
 ANSWER = """EXPLANATION: the value at 3 is copied to the last position.
 CIRCUIT:
-out <- L1.o#1@5, L1.down#2@5
-L1.o#1@5 <- L1.v#4@3
-L1.v#4@3 <- L0.down#0@3
-L0.down#0@3 <- L0.fc#5@3
-@3 L1.k#3
+@5 a=L1.o#1 b=L1.down#2
+@3 c=L1.k#3 d=L1.v#4 e=L0.fc#5 f=L0.down#0
+OUT <- a,b
+a <- d
+d <- f
+f <- e
 ANSWER 1: the copied value is gone.
 FINAL 1: falls=yes top=' the'
 """
+
+
+def edges(q):
+    return {(tuple(q["answer"]["nodes"][w]), "out" if r == "out" else tuple(q["answer"]["nodes"][r])) for w, r in q["answer"]["edges"]}
 
 
 def test_parse_render_round_trip():
@@ -36,38 +41,35 @@ def test_parse_render_round_trip():
     assert p["explanation"] == "the value at 3 is copied to the last position."
     assert p["finals"] == {1: (True, "' the'")}
     assert len(p["answer"]["nodes"]) == 6 and len(p["answer"]["edges"]) == 5
-    text = components.render(p["answer"], p["finals"], {1: "the copied value is gone."}, ids=False)
-    assert text.strip() == ANSWER.strip()
-    assert components.parse(text)["answer"] == p["answer"]
+    text = components.render(p["answer"], p["finals"], {1: "the copied value is gone."})
+    assert text.strip() == ANSWER.strip()  # one grammar: ids in position blocks, edges by id
+    assert edges(components.parse(text)) == edges(p)
 
 
-def test_groups():
+def test_written_out_nodes_still_parse():
     text = "EXPLANATION: x\nCIRCUIT:\nout <- L1.down#2,9@5\nL1.down#2,9@5 <- L1.fc#1,7@5, L0.down#3@5\nL1.k#4,6@3\n"
     p = components.parse(text)
     assert p["malformed"] == 0
     assert len(p["answer"]["nodes"]) == 7
     assert len(p["answer"]["edges"]) == 2 + 2 * 3  # two into the prediction, every writer into both readers
-    again = components.parse(components.render(p["answer"], ids=False))
-    edges = lambda q: {(tuple(q["answer"]["nodes"][w]), "out" if r == "out" else tuple(q["answer"]["nodes"][r])) for w, r in q["answer"]["edges"]}  # noqa: E731
-    assert edges(again) == edges(p)
-    assert "L1.down#2,9@5 <- L1.fc#1,7@5, L0.down#3@5" in components.render(p["answer"], ids=False)
+    again = components.parse(components.render(p["answer"]))
+    assert edges(again) == edges(p) and "=" in components.render(p["answer"])
     assert components.parse("CIRCUIT:\nL1.down#2, 9@5 <- L1.fc#1@5\n")["malformed"] == 1
-    block = components.parse("CIRCUIT:\n@4 L1.k#4,6 L0.q#2 tok\nL1.k#9@4\n")  # a position block, and a bare group
+    block = components.parse("CIRCUIT:\n@4 L1.k#4,6 L0.q#2 tok\nL1.k#9@4\n")  # a block without ids, and a bare group
     assert block["malformed"] == 0 and len(block["answer"]["nodes"]) == 5 and not block["answer"]["edges"]
-    assert components.render(block["answer"]).endswith("@4 L1.k#4,6,9 L0.q#2 tok")
 
 
 def test_short_ids():
-    text = ("EXPLANATION: x\nCIRCUIT:\n@9 a=L1.down#5 b=L1.fc#1 d=L1.fc#2 e=tok\n@4 f=L0.v#7\n"
-            "out <- a\na <- b,d\nb <- e\nd <- e, L0.down#3@9\n")
+    text = ("EXPLANATION: x\nCIRCUIT:\nOUT <- a\n@9 a=L1.down#5 b=L1.fc#1 d=L1.fc#2 e=tok\n@4 f=L0.v#7\n"
+            "a <- b,d\nb <- e\nd <- e, L0.down#3@9\n")  # an edge line may come before the block declaring its ids
     p = components.parse(text)
     assert p["malformed"] == 0 and len(p["answer"]["nodes"]) == 6 and len(p["answer"]["edges"]) == 6
-    again = components.parse(components.render(p["answer"]))  # 6 edges over 6 nodes: rendered with ids
-    edges = lambda q: {(tuple(q["answer"]["nodes"][w]), "out" if r == "out" else tuple(q["answer"]["nodes"][r])) for w, r in q["answer"]["edges"]}  # noqa: E731
-    assert "=" in components.render(p["answer"]) and edges(again) == edges(p)
+    assert edges(components.parse(components.render(p["answer"]))) == edges(p)
     assert components.parse("CIRCUIT:\n@9 a=L1.down#5,6\n")["malformed"] == 1  # an id names one node
     assert components.parse("CIRCUIT:\n@9 a=L1.down#5\n@8 a=L1.down#4\n")["malformed"] == 1  # and once
-    assert components.parse("CIRCUIT:\n@9 a=L1.down#5\nout <- zz\n")["malformed"] == 1  # an unknown id
+    undefined = components.parse("CIRCUIT:\n@9 a=L1.down#5 b=L1.fc#1\nOUT <- a,zz\na <- b\nyy <- b\n")
+    assert undefined["unknown_ids"] == 2 and undefined["malformed"] == 0  # charged as nodes outside the graph
+    assert len(undefined["answer"]["edges"]) == 2  # the defined edges stay
 
 
 def test_escape_keeps_special_strings_text():
@@ -136,7 +138,7 @@ def test_reward_on_tiny_model(tiny):
     g = native.Graph(set(at_t) | {fc, down}, {down: [fc]}, at_t + [down])
     finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
     good = components.render(goal_eval.to_json(g, "writes at the target"), finals)
-    bad = good.replace("out <- ", "out <- L0.v#0@7, ")  # a value never writes the residual stream: dropped, charged
+    bad = good.replace("OUT <- ", "OUT <- L0.v#0@7,")  # a value never writes the residual stream: dropped, charged
     missing = components.render(goal_eval.to_json(g, "writes at the target"))
     got = components.reward(ge, task, ev, [good, bad, missing, good], truncated=[False, False, False, True])
     assert got[0]["valid"] and invalid < got[0]["reward"] <= 1.0

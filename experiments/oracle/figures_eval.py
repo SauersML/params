@@ -33,9 +33,10 @@ INVALID = -(1.0 + SIZE_WEIGHT)
 COLORS = ["#2F6DB5", "#D1495B", "#2E8B57", "#E09F3E", "#7B5EA7", "#2A9D8F", "#8C564B", "#C2185B"]
 SOFT = "#9DB9DD"
 INK = "#222222"
-TERMS = [("C", "Agreement under interventions"), ("F1", "Sufficiency"), ("N", "Necessity"),
-         ("F3", "Stated connections matter"), ("E1", "English: bits saved for reader B"), ("E2", "Intervention questions"),
-         ("E3", "Edits"), ("size", "Answer size"), ("invalid", "Invalid answers")]
+TERMS = [("C", "Agreement under interventions"), ("F1", "Sufficiency (part of the agreement)"), ("N", "Necessity"),
+         ("E1", "English: bits saved for reader B"), ("E2", "Intervention questions"), ("E3", "Edits"),
+         ("size", "Answer size"), ("invalid", "Invalid answers")]
+REPORTED = ("F1", "F3")  # in the rows, never in the reward's mean (components.reward: F1 inside C, F3 a diagnostic)
 
 
 def style():
@@ -63,7 +64,8 @@ def first_answers(eval_path: Path, key: str, e1_path: Path | None) -> dict:
         terms = {k[5:]: v for k, v in s.items() if k.startswith("term_") and v is not None}
         b = e1.get(q["task"], {}).get("reader_b")
         terms["E1"] = max(-1.0, min(1.0, b)) if b is not None else terms.get("E1", 0.0)
-        reward = sum(terms.values()) / len(terms) - SIZE_WEIGHT * s["size"]
+        mean = [v for k, v in terms.items() if k not in REPORTED]
+        reward = sum(mean) / len(mean) - SIZE_WEIGHT * s["size"]
         out[q["task"]] = (reward, terms, True, s["size"])
     return out
 
@@ -96,7 +98,10 @@ def reward_figure(sets: dict, refs: set, labels: dict, path: Path) -> None:
         ax.set_title(f"{title} ({len(tasks)})", fontsize=18)
         clean(ax)
     axes[0].set_ylabel("Reward of the first answer (invalid: -1.5)")
-    fig.suptitle(f"{best} earns the most held-out reward of the explainers ({means_all[best]:+.2f} over all texts)",
+    own = [n for n in names if n not in refs]
+    claim = (f"{best} earns the most held-out reward of the explainers ({means_all[best]:+.2f} over all texts)" if len(own) > 1
+             else f"Held-out reward of {best}'s first answer ({means_all[best]:+.2f}) against the references")
+    fig.suptitle(claim,
                  x=0.01, ha="left", fontsize=21, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     fig.savefig(path, dpi=150, bbox_inches="tight", pad_inches=0.3)
@@ -123,13 +128,15 @@ def terms_figure(sets: dict, path: Path) -> None:
             else:  # an invalid answer counts 0; a valid one without the term (not measured) is left out
                 got = [(t.get(k) if v else 0.0) for _, t, v, _ in answers]
                 got = [x for x in got if x is not None]
-                vals.append(sum(got) / len(got) if got else 0.0)
+                vals.append(sum(got) / len(got) if got else None)  # None: not measured for this set (no bar)
         y = range(len(names))[::-1]
-        ax.barh(list(y), vals, color=[COLORS[i % len(COLORS)] for i in range(len(names))], height=0.65)
-        span = max(max(vals), 0.0) - min(min(vals), 0.0) or 1.0
+        drawn = [v or 0.0 for v in vals]
+        ax.barh(list(y), drawn, color=[COLORS[i % len(COLORS)] for i in range(len(names))], height=0.65)
+        span = max(max(drawn), 0.0) - min(min(drawn), 0.0) or 1.0
         for yi, v in zip(y, vals):  # the value right of the bar or of zero, clear of the names
-            ax.text(max(v, 0.0) + 0.02 * span, yi, f"{v:.3f}" if 0 < abs(v) < 0.005 else f"{v:.2f}", va="center", ha="left", fontsize=13)
-        ax.set_xlim(min(min(vals), 0.0) - 0.05 * span, max(max(vals), 0.0) + 0.3 * span)
+            text = "not measured" if v is None else f"{v:.3f}" if 0 < abs(v) < 0.005 else f"{v:.2f}"
+            ax.text(max(v or 0.0, 0.0) + 0.02 * span, yi, text, va="center", ha="left", fontsize=13)
+        ax.set_xlim(min(min(drawn), 0.0) - 0.05 * span, max(max(drawn), 0.0) + 0.3 * span)
         ax.axvline(0, color=INK, lw=0.8)
         ax.set_yticks(list(y), names if j % cols == 0 else [""] * len(names))
         ax.set_xlabel(label, fontsize=16)

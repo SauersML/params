@@ -53,7 +53,6 @@ for i in ${QSET:-0 1 2 3}; do RUNQ="$RUNQ (${QS[$i]}) &"; done
 REPORT="$O/out/score_ids_base.jsonl $O/out/score_features_base.jsonl"
 for arm in active ids vocab both features inject inject_shuffled; do for n in $SIZES; do REPORT="$REPORT $O/out/score_${arm}_$n.jsonl"; done; done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out $Q;
-python -m pip install -q peft scipy;
 tar -xzf $F/q.tgz -C $Q; ls /Users/user/params/experiments/oracle/learn_sft.py /Users/user/params/method/oracle/rl/inject.py /Users/user/params/method/vpd /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/mpd-data/atlas/vpd4l/atlas.json /Users/user/mpd-data/atlas/vpd4l/atlas.safetensors > /dev/null;
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 60 > $O/gpu.log 2>&1 &);
@@ -63,6 +62,6 @@ $S score $W/smoke_held.jsonl $O/out/smoke_score.jsonl --base $BASE --adapter $W/
 $S train $W/smoke_train.jsonl $W/smoke_inject --base $BASE --epochs 1 --inject --init $W/smoke/adapter >> $O/smoke.log 2>&1;
 $S score $W/smoke_held.jsonl $O/out/smoke_score_inject.jsonl --base $BASE --adapter $W/smoke_inject/adapter --inject --shuffle >> $O/smoke.log 2>&1;
 set +e; $RUNQ wait; $S report $REPORT > $O/out/report.txt 2>&1; echo all stages done"
-RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=48 RP_DISK_GB=100 \
+RP_OWNER=rustmove RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=48 RP_DISK_GB=100 \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA L40,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD"
 }

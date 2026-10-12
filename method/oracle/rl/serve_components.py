@@ -17,7 +17,8 @@ E1, the frozen base model's bits saved: given in the request (computed by the ca
 reader does), else from --reader (components.http_reader: vLLM's OpenAI server holding the base model, never the
 policy); with neither, the reward has no E1 term. E3, the edit requests (rows with "edits", components.py edits):
 scored by edit_eval against the edit teacher's net per goal (--edit-teach, edit_eval.py teach output); a text whose
-requests lack a teacher net has no E3 term. E4, with --variables: each answer's VARIABLES block by interchange
+requests lack a teacher net has no E3 term. --matched: the RL v2 reward (components.reward(matched): C and N over VPD's
+first k at the answer's size, less C's draw noise x size; E1 and E2 reported only). E4, with --variables: each answer's VARIABLES block by interchange
 (variables.Scorer; an answer without the block scores 0).
 ROWS: components.py questions output (each text's evidence: its questions and the size term's scale).
 """
@@ -45,7 +46,7 @@ TEXTS_KEPT = 8  # goal_eval.Text objects a process keeps (a group's answers arri
 
 
 def work(device: str | None, rows_path: str, size_weight: float, reader_url: str | None, reader_base: str, edit_teach: list,
-         with_variables: bool, inbox, outbox) -> None:
+         with_variables: bool, matched: bool, size_noise: float | None, inbox, outbox) -> None:
     import components
     import goal_eval
     import native
@@ -83,7 +84,8 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
                 given = None if any(e is None for _, _, e, _ in reqs) else [b for _, _, e, _ in reqs for b in e]
                 got = components.reward(ge, tasks[tid], rows[tid], [x for _, xs, _, _ in reqs for x in xs],
                                         size_weight=size_weight, cache=cache, reader=None if given else reader, e1=given,
-                                        truncated=[c for _, _, _, cut in reqs for c in cut], ee=ee, edit_best=edit_best, vs=vs)
+                                        truncated=[c for _, _, _, cut in reqs for c in cut], ee=ee, edit_best=edit_best, vs=vs,
+                                        matched=matched, size_noise=size_noise)
                 while len(cache) > TEXTS_KEPT:
                     cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **{k[5:]: g[k] for k in g if k.startswith("term_")},
@@ -227,8 +229,10 @@ def main():
     ap.add_argument("--reader-base", default="Qwen/Qwen3-4B")
     ap.add_argument("--edit-teach", action="append", default=[], help="edit_eval.py teach output: the best net per goal (E3)")
     ap.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
+    ap.add_argument("--matched", action="store_true", help="the RL v2 reward: C and N over VPD's first k at the answer's size (reward(matched))")
+    ap.add_argument("--size-noise", type=float, help="the matched reward's size weight, C's draw noise (components.SIZE_NOISE by default)")
     a = ap.parse_args()
-    args = (a.device, a.rows, a.size_weight, a.reader, a.reader_base, a.edit_teach, a.variables)
+    args = (a.device, a.rows, a.size_weight, a.reader, a.reader_base, a.edit_teach, a.variables, a.matched, a.size_noise)
     serve(Pool(a.workers, args, work) if a.workers else Inline(args, work), a.host, a.port, "serve_components")
 
 

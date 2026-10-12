@@ -126,6 +126,9 @@ INSTANCES_RE = re.compile(r"\(\s*instances\s*:\s*(.*?)\s*\)\s*$", re.I)
 QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")  # a token's repr in an inputs list
 
 SIZE_WEIGHT = 0.5
+MATCH_CLIP = 2.0  # the matched reward's C term, c_rl - c_rl of VPD's first k, clipped to [-2, 2] (an invalid answer below)
+INVALID_MATCHED = -4.0  # the matched reward of an invalid answer: below every valid one (C >= -2, N >= -1, size noise < 1)
+SIZE_NOISE = None  # the matched reward's size weight w: C's draw noise (c_noise(); the lead, 10-12), set once measured
 REPORTED = ("F1", "F3", "E1")  # terms reported, never in the reward's mean: F1 is inside C, F3 a diagnostic, E1 until a
 # reader separates right English from wrong (the lead, 10-12: RL v1 is mean(C, N, E2[, E3]) - 0.5 size)
 POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # C's flip adversary's pattern pool (goal_eval.fidelity)
@@ -1435,7 +1438,8 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict) -> dict:
 
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None, ee=None,
-           edit_best: dict | None = None, pool: dict | None = None, vs=None, split: str | None = None) -> list[dict]:
+           edit_best: dict | None = None, pool: dict | None = None, vs=None, split: str | None = None,
+           matched: bool = False, size_noise: float | None = None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
     row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT section, a
     question has no FINAL line, an edit request no EDIT line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
@@ -1463,7 +1467,11 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     pool, POOL by default; {} leaves the adversary out, for a model without one); F1 is reported (term_F1), as are C's
     members and columns (fidelity: s_track, context_share, the donors' ...). split: the draws of C's changed-input,
     interchange and donor families, goal_eval's default "search" (the teachers' draws: the RL reward on training texts)
-    or "eval" (every evaluation, evaluate()). reader: a reader.Reader for E1, or e1: each text's reader bits
+    or "eval" (every evaluation, evaluate()). matched: the RL v2 reward (the lead's decisions 10-12), "reward" =
+    (c_rl - c_rl of VPD's first k) + (N - N of VPD's first k) at the answer's node count k (goal_eval.vpd_baseline), the
+    first clipped to [-MATCH_CLIP, MATCH_CLIP], + E4 when measured - size_noise x size (w, C's draw noise: size only
+    breaks ties C cannot tell apart), an invalid answer INVALID_MATCHED; E1 and E2 reported, never in it; the means'
+    reward stays as "reward_mean". reader: a reader.Reader for E1, or e1: each text's reader bits
     computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
     -> goal_eval.Text, kept between calls."""
     import goal_eval
@@ -1498,7 +1506,11 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     ge.hooks = {"E1": (lambda task, g, x: bits.get(x)) if (reader is not None or e1 is not None) else None,
                 "E2": lambda task, g, x: qa_term(ev["qa"], parse(x)["finals"], tok, prompt["model_top"][0][0][0])}
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
-    c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], _pool() if pool is None else pool, mode="reward", split=split))) if keep else {}
+    c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], _pool() if pool is None else pool, mode="reward", split=split,
+                                      baseline=matched))) if keep else {}
+    w = SIZE_NOISE if size_noise is None else size_noise
+    if matched and w is None:
+        raise ValueError("the matched reward needs C's draw noise as its size weight (size_noise, or SIZE_NOISE once measured)")
     e4 = {i: e4_term(vs, tx, graphs[i], parsed[i]["answer"], parsed[i]["variables_malformed"], nat.C) for i in keep} if vs is not None else {}
     e3 = {}
     if keep and ee is not None and ev.get("edits"):
@@ -1507,7 +1519,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     out = []
     for i, (p, (d_nodes, d_edges, d_bits)) in enumerate(zip(parsed, defects)):
         row, terms, size, r = row_of.get(i), {}, None, -(1.0 + size_weight)
-        circ = r
+        circ, mean_r = r, r
+        if matched:
+            r = circ = INVALID_MATCHED
         if row is not None:
             terms["C"] = c_of[i]["c"]
             terms["F1"] = row[f"f1_{convention}"]  # C's point member, reported
@@ -1520,14 +1534,45 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             have = [v for k, v in terms.items() if k not in REPORTED and v is not None]
             e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
             size = size_term(row["bits"] + d_bits + e_bits, scale)
-            r = sum(have) / len(have) - size_weight * size
+            r = mean_r = sum(have) / len(have) - size_weight * size
             own = [terms[k] for k in ("C", "N") if terms[k] is not None]
             circ = sum(own) / len(own) - size_weight * size
-        out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
+            if matched:
+                c = c_of[i]
+                if c.get("c_rl_vpd_k") is None or c.get("n_vpd_k") is None:
+                    raise ValueError("goal_eval.vpd_baseline gives no c_rl_vpd_k or n_vpd_k: the matched reward needs both")
+                terms["C_matched"] = max(-MATCH_CLIP, min(MATCH_CLIP, c["c_rl"] - c["c_rl_vpd_k"]))
+                terms["N_matched"] = terms["N"] - c["n_vpd_k"]
+                circ = terms["C_matched"] + terms["N_matched"] - w * size
+                r = circ + (terms["E4"] or 0.0)
+        out.append({"reward": r, "reward_mean": mean_r, "circuit_reward": circ, "valid": valid[i], **{f"term_{k}": v for k, v in terms.items()}, "size": size,
                     "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
                     "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row, "variables": e4.get(i),
                     "fidelity": {k: v for k, v in (c_of.get(i) or {}).items()  # C's members and columns (s_track, context_share, ...)
                                  if k == "c_terms" or isinstance(v, (int, float)) or v is None}})
+    return out
+
+
+def c_noise(ge, task: dict, texts: list[str], seeds: int, pool: dict | None = None, split: str = "eval") -> list[dict]:
+    """C's draw noise (the matched reward's size weight, the lead 10-12): each answer's reward-mode c and c_rl on the
+    text under `seeds` seeds (the text's own and the next ones: fresh changed prompts, interchange, donor and flip
+    draws), and their standard deviations across them."""
+    import statistics
+
+    import goal_eval
+    import native
+
+    prompt = task["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    graphs = [goal_eval.circuit(parse(x)["answer"], targets, ge.nat.C, len(ids))[0] for x in texts]
+    base = native.task_seed(str(ids[:8]))  # GoalEval.text's own seed
+    runs = [ge.fidelity(ge.text(ids, targets, seed=base + 7919 * r, task=task), graphs, _pool() if pool is None else pool,
+                        mode="reward", split=split) for r in range(seeds)]
+    out = []
+    for i in range(len(texts)):
+        c, crl = [rs[i]["c"] for rs in runs], [rs[i]["c_rl"] for rs in runs]
+        out.append({"c": c, "c_rl": crl, "sd_c": statistics.stdev(c) if seeds > 1 else None,
+                    "sd_c_rl": statistics.stdev(crl) if seeds > 1 else None})
     return out
 
 
@@ -2018,7 +2063,8 @@ def _paired(a: list, b: list) -> dict:
 
 
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
-             diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False) -> dict:
+             diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
+             matched: bool = False, size_noise: float | None = None) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -2030,7 +2076,8 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
     figure is also reported for local and non-local texts apart. diagnostics: structure() of each first sample (a
     second disjoint circuit, minimality), costly. matched_all: VPD's answer at every sample's node count, not only the
     first's, so each sample is compared with VPD at its own size (verify-and-pick: whether any of N beats it on C).
-    The baselines' C and N are kept beside their circuit reward ("baseline_terms")."""
+    The baselines' C and N are kept beside their circuit reward ("baseline_terms"). matched (size_noise): every answer's
+    reward is the RL v2 matched reward (reward(matched)), its mean reward kept as "reward_mean"."""
     import native
 
     invalid = -(1.0 + SIZE_WEIGHT)
@@ -2049,7 +2096,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
             cache = {}
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
-                            ee=ee, edit_best=edit_best, vs=vs, split="eval")
+                            ee=ee, edit_best=edit_best, vs=vs, split="eval", matched=matched, size_noise=size_noise)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -2209,6 +2256,13 @@ def main():
     d.add_argument("--english", type=Path, help="tinker_train.py explain output: each text's chosen explanation")
     d.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (the edit teacher's edits)")
     d.add_argument("--variables", type=Path, help="a directory of <task>.json, {\"variables\": [...]} (variables.py's JSON, meanings written)")
+    nz = sub.add_parser("noise", help="C's draw noise per answer (c_noise()): the matched reward's size weight")
+    nz.add_argument("split", choices=("train", "heldout", "hard"))
+    nz.add_argument("rows", type=Path)
+    nz.add_argument("--set", action="append", default=[], help="NAME=SAMPLES: each text's first answer")
+    nz.add_argument("--seeds", type=int, default=4)
+    nz.add_argument("--n", type=int, default=20)
+    nz.add_argument("--out", type=Path, required=True)
     s = sub.add_parser("evaluate")
     s.add_argument("split", choices=("train", "heldout", "hard"))
     s.add_argument("rows", type=Path, help="questions' JSONL (a fresh QA seed for a report, the discovery one for selection)")
@@ -2221,6 +2275,8 @@ def main():
     s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (scored with net): the best net per goal (E3)")
     s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
     s.add_argument("--matched-all", action="store_true", help="VPD at every sample's node count (verify-and-pick against VPD@matched)")
+    s.add_argument("--matched", action="store_true", help="the RL v2 matched reward (reward(matched)) as each answer's reward")
+    s.add_argument("--size-noise", type=float, help="the matched reward's size weight (C's draw noise; SIZE_NOISE by default)")
     args = ap.parse_args()
     import goal_eval
     import native
@@ -2354,6 +2410,27 @@ def main():
                 f.write(json.dumps(info) + "\n")
             print(info, flush=True)
         return
+    if args.cmd == "noise":
+        import statistics
+
+        rows = {r["task"]: r for r in map(json.loads, args.rows.read_text().splitlines())}
+        sets = {k: samples_of(Path(v)) for k, v in (x.split("=", 1) for x in args.set)}
+        got = []
+        for p in native.tasks(args.split)[:args.n]:
+            if p.stem not in rows:
+                continue
+            task = json.loads(p.read_text())
+            for name, samples in sets.items():
+                if samples.get(p.stem):
+                    got += [{"task": p.stem, "set": name, **r} for r in c_noise(ge, task, [samples[p.stem][0][0]], args.seeds)]
+                    print(json.dumps(got[-1]), flush=True)
+        sds = [g["sd_c_rl"] for g in got if g["sd_c_rl"] is not None]
+        summary = {"answers": len(got), "w (median sd of c_rl)": statistics.median(sds) if sds else None,
+                   "mean sd of c_rl": statistics.mean(sds) if sds else None,
+                   "median sd of c": statistics.median([g["sd_c"] for g in got if g["sd_c"] is not None]) if got else None}
+        args.out.write_text(json.dumps({"summary": summary, "answers": got}))
+        print(json.dumps(summary), flush=True)
+        return
     if args.cmd == "references":
         print(references(ge, args.rows, args.teacher, args.out, edit_teach(args.edit_teach) if args.edit_teach else None), "texts", flush=True)
         return
@@ -2435,7 +2512,7 @@ def main():
 
         vs = variables.Scorer(ge)
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
-                   matched_all=args.matched_all)
+                   matched_all=args.matched_all, matched=args.matched, size_noise=args.size_noise)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

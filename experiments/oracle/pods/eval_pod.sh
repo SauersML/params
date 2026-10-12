@@ -9,7 +9,8 @@
 #     SAMPLES: a sampler's JSONL or a directory of <task>[.<k>].txt (components.samples_of); E1: tinker_train.py readers
 #     (env: HOURS (cap, default 2), GPU, PRICE, VRAM, RP_OWNER; SRCREV: the source revision (default origin/main);
 #      VARIABLES=1: E4, each answer's VARIABLES block; MATCHED_ALL=1: VPD at every sample's size (verify-and-pick);
-#      EDIT_EVAL: the edit teacher's rows for the rows' edit requests (E3);
+#      EDIT_EVAL: the edit teacher's rows for the rows' edit requests (E3); MATCHED=1: the RL v2 reward (reward(matched));
+#      NOISE=k: C's draw noise over k seeds per set's first answers (components.py noise) instead of the evaluation;
 #      LEDGER_OK=1 once the lead approved a launch past $290)
 cd /Users/user/params
 spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
@@ -39,10 +40,12 @@ done
 EDITS=""  # the edit teacher's rows for E3's best net per goal (edit_eval.bests), when the rows ask for edits
 if [ -n "${EDIT_EVAL:-}" ]; then cp "$EDIT_EVAL" "$IN/edit_eval.jsonl" && EDITS="edit_eval.jsonl"; fi
 COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" rows.jsonl labels.jsonl sets $EDITS -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt && rm -rf "$IN"
+WHAT="evaluate heldout $I/rows.jsonl --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} ${MATCHED_ALL:+--matched-all} ${MATCHED:+--matched} ${EDIT_EVAL:+--edit-teach $I/edit_eval.jsonl}"
+if [ -n "${NOISE:-}" ]; then WHAT="noise heldout $I/rows.jsonl --seeds $NOISE"; fi  # C's draw noise (c_noise) instead of the evaluation
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \
 cd $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 5 > $O/gpu.csv & \
-python -u method/oracle/components.py evaluate heldout $I/rows.jsonl $ARGS --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} ${MATCHED_ALL:+--matched-all} ${EDIT_EVAL:+--edit-teach $I/edit_eval.jsonl} --out $O/eval.json > $O/eval.log 2>&1"
+python -u method/oracle/components.py $WHAT $ARGS --out $O/eval.json > $O/eval.log 2>&1"
 RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-200} RP_OWNER=${RP_OWNER:-fleet} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-1.0} \
   RP_MIN_VRAM_GB=${VRAM:-44} experiments/infra/runpod/rp-run $N "${GPU:-RTX A6000,A40,L40S,L40}" ${HOURS:-2} -- bash -c "$CMD"

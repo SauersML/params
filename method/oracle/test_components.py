@@ -485,3 +485,23 @@ def test_mermaid_circuit_round_trips():
     assert key(p["answer"]) == key(answer) and p["malformed"] == 0
     loose = components.parse("CIRCUIT:\nflowchart LR\n  a[L3.down#2@235]\n  b[L3.o#1]\n  a --> OUT\n  this is not mermaid\n")
     assert loose["malformed"] == 2 and [tuple(x) for x in loose["answer"]["nodes"]] == [("h.3.mlp.down_proj", 2, 235)]
+
+
+def test_matched_reward_is_c_and_n_over_vpd_at_the_same_size(tiny, monkeypatch):
+    """The RL v2 reward: (c_rl - c_rl of VPD's first k, clipped) + (N - N of VPD's first k) - w x size; E2 reported,
+    never in it; an invalid answer at INVALID_MATCHED; no size weight (C's noise) is an error."""
+    nat, ge, task, ev = tiny
+    order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
+    at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:3]
+    finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
+    good = components.render(goal_eval.to_json(native.Graph(set(at_t), {}, at_t), ""), finals)
+    with pytest.raises(ValueError):
+        components.reward(ge, task, ev, [good], matched=True, pool={})
+    real = ge.fidelity
+    monkeypatch.setattr(ge, "fidelity", lambda *a, **k: [{**r, "c_rl": 0.3, "c_rl_vpd_k": -4.0, "n_vpd_k": 0.25}
+                                                          for r in real(*a, **{**k, "baseline": False})])
+    got = components.reward(ge, task, ev, [good, "no circuit"], matched=True, size_noise=0.05, pool={})
+    assert got[0]["term_C_matched"] == components.MATCH_CLIP  # 4.3 clipped
+    assert got[0]["term_N_matched"] == pytest.approx(got[0]["term_N"] - 0.25)
+    assert got[0]["reward"] == pytest.approx(components.MATCH_CLIP + got[0]["term_N"] - 0.25 - 0.05 * got[0]["size"])
+    assert got[1]["reward"] == components.INVALID_MATCHED and got[0]["reward_mean"] != got[0]["reward"]

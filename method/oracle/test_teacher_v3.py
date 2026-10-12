@@ -1,6 +1,7 @@
 """Checks of teacher_v3.py on a held-out vpd4l text (skipped without ~/mpd-data's model and saved VPD answers): its
 masks with every gate at 1 run VPD's own answer and with every gate at 0 the empty circuit (the bounds goal_eval
-computes), and a pattern on top of gates at 1 is VPD's answer under that pattern.
+computes on every column; MaskSearch multiplies the gathered ones), and a pattern on top of gates at 1 is VPD's answer
+under that pattern.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher_v3.py -s
 """
@@ -36,8 +37,8 @@ def test_masks_bound_by_vpd_and_empty():
         tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
     empty, vpd = ge._bounds(tx, "live")
     pr = teacher.Pruner(ge, tx, tx.vpd, live=True, B=32)
-    pats = teacher_v3.patterns(saved, TASK, tx.T, nat.C, nat.names, 2, 0, nat.dev)
-    ms = teacher_v3.MaskSearch(ge, tx, pr, pats)
+    ms = teacher_v3.MaskSearch(ge, tx, pr, teacher_v3.patterns(saved, TASK, tx.T, nat.C, nat.names, 2, 0))
+    pats = ms.pats
     N = len(pr.nodes)
     with torch.no_grad():
         on, off = ms.kl(ms.masks(torch.ones(1, N, device=nat.dev), None)), ms.kl(ms.masks(torch.zeros(1, N, device=nat.dev), None))

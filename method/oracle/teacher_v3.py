@@ -61,10 +61,9 @@ TINY = 1e-6            # KL floor inside logarithms (bits)
 WORST = 4              # patterns the cleanup measures each set under: the search's worst
 
 
-def patterns(saved: dict, task: str, T: int, C: dict, names: list, count: int, seed: int, dev) -> list[torch.Tensor]:
+def patterns(saved: dict, task: str, T: int, C: dict, names: list, count: int, seed: int) -> list[dict]:
     """M's stand-in: count patterns, each another text's VPD answer position by position (a position past that text's
-    end takes one of its positions at random): the subcomponents switched on, as places in MaskSearch's flat layout
-    (every matrix's [T, C] in turn)."""
+    end takes one of its positions at random): per matrix the (positions, indices) switched on."""
     g = torch.Generator().manual_seed(seed)
     others = [k for k in saved if k != task]
     out = []
@@ -73,32 +72,43 @@ def patterns(saved: dict, task: str, T: int, C: dict, names: list, count: int, s
         Ts = 1 + max(int(t.max()) for t, _ in src.values() if len(t))
         where = torch.arange(T)
         where[Ts:] = torch.randint(Ts, (max(0, T - Ts),), generator=g)
-        flat, at = [], 0
+        pat = {}
         for n in names:
             t, c = src[n]
             on = torch.zeros(Ts, C[n], dtype=torch.bool)
             on[t.long(), c.long()] = True
-            flat.append(at + on[where].flatten().nonzero().flatten())
-            at += T * C[n]
-        out.append(torch.cat(flat).to(dev))
+            pat[n] = tuple(on[where].nonzero().T)
+        out.append(pat)
     return out
 
 
 class MaskSearch:
-    """The gates over a text's VPD answer (pr.nodes), their runs and the adversary's patterns."""
+    """The gates over a text's VPD answer (pr.nodes), their runs and the adversary's patterns. Every run multiplies only
+    the subcomponents that the answer or a pattern holds (each matrix's gathered columns, Pruner._gather's way; every
+    other one is off in every run): on the 20 held-out texts 9,132 of the 38,912 columns are in any answer."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: teacher.Pruner, pats: list[dict], live: bool = True):
         nat = ge.nat
-        self.ge, self.tx, self.pr, self.pats, self.live = ge, tx, pr, pats, live
+        self.ge, self.tx, self.pr, self.live = ge, tx, pr, live
         self.names, self.dev, self.T = nat.names, nat.dev, tx.T
-        self.offsets, at = [], 0                                  # every matrix's [T, C] in turn, one flat row
-        for n in self.names:
-            self.offsets.append((at, nat.C[n]))
-            at += tx.T * nat.C[n]
+        self.offsets, self.cols, self.gathered, at = [], [], [], 0   # every matrix's [T, gathered] in turn, one flat row
+        for j, n in enumerate(self.names):
+            cols = torch.unique(torch.cat([pr.c[pr.mat == j].cpu()] + [p[n][1] for p in pats]).long()).to(self.dev)
+            st = nat.target.site(n)
+            self.cols.append(cols)
+            self.gathered.append((st.V.index_select(1, cols), st.U.index_select(0, cols)))
+            self.offsets.append((at, len(cols)))
+            at += tx.T * len(cols)
         self.width = at
-        start = torch.tensor([o for o, _ in self.offsets], device=self.dev)
-        Cs = torch.tensor([c for _, c in self.offsets], device=self.dev)
-        self.flat = start[pr.mat] + pr.t * Cs[pr.mat] + pr.c         # each answer subcomponent's place
+
+        def place(j, t, c):                                    # flat places of (position, subcomponent) pairs of matrix j
+            return self.offsets[j][0] + t * self.offsets[j][1] + torch.searchsorted(self.cols[j], c)
+        self.flat = torch.empty(len(pr.nodes), dtype=torch.long, device=self.dev)   # each answer subcomponent's place
+        for j in range(len(self.names)):
+            sel = (pr.mat == j).nonzero().flatten()
+            self.flat[sel] = place(j, pr.t[sel], pr.c[sel])
+        self.pats = [torch.cat([place(j, p[n][0].to(self.dev), p[n][1].to(self.dev).long()) for j, n in enumerate(self.names)])
+                     for p in pats]
         self.logit = torch.full((len(pr.nodes),), INIT, device=self.dev, requires_grad=True)
         self.ids = torch.tensor([tx.ids], device=self.dev)
 
@@ -114,8 +124,8 @@ class MaskSearch:
         return (torch.sigmoid(self.logit) * (ZETA - GAMMA) + GAMMA).clamp(0, 1)
 
     def masks(self, z: torch.Tensor | None, pats: list | None, vpd_on: bool = False) -> dict:
-        """Per matrix [R, T, C] (views of one buffer): gates z [R, N] on the answer, each row's pattern elsewhere
-        (z + (1 - z) m inside); vpd_on: the answer at 1 (VPD's own run), z unused."""
+        """Per matrix [R, T, gathered] (views of one buffer): gates z [R, N] on the answer, each row's pattern (flat
+        places, self.pats) elsewhere (z + (1 - z) m inside); vpd_on: the answer at 1 (VPD's own run), z unused."""
         R = len(pats) if z is None else len(z)
         if vpd_on:
             g = torch.zeros(R, self.width, device=self.dev)
@@ -132,12 +142,12 @@ class MaskSearch:
         return {n: g[:, at:at + self.T * C].view(R, self.T, C) for n, (at, C) in zip(self.names, self.offsets)}
 
     def kl(self, masks: dict) -> torch.Tensor:
-        """KL in bits at the targets of each row's masked run [R] (VPD's masked forward, every column; autograd)."""
+        """KL in bits at the targets of each row's masked run [R] (VPD's masked forward on the gathered columns; autograd)."""
         nat, tg = self.ge.nat, self.ge.nat.target
         R = next(iter(masks.values())).shape[0]
-        for n in self.names:
+        for j, n in enumerate(self.names):
             st = tg.site(n)
-            st.mask, st.gathered = masks[n], None
+            st.mask, st.gathered = masks[n], self.gathered[j]
             st.delta_mask = torch.ones(R, self.T, device=self.dev) if self.live else None
         try:
             hidden = tg.hidden(self.ids.expand(R, -1), fused=True)
@@ -173,8 +183,8 @@ def search(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], vpd_answe
     P = nat.positions(targets)
     node_bits, pos_bits = math.log2(P * sum(nat.C.values())), math.log2(P)
     scale = active * node_bits
-    pats = patterns(saved, task, tx.T, nat.C, nat.names, POOL, seed, nat.dev)
-    ms = MaskSearch(ge, tx, pr, pats, live=teacher.CONVENTION == "live")
+    ms = MaskSearch(ge, tx, pr, patterns(saved, task, tx.T, nat.C, nat.names, POOL, seed), live=teacher.CONVENTION == "live")
+    pats = ms.pats
     torch.manual_seed(seed)
     vpd_adv = ms.kl_chunked(lambda a, b: ms.masks(None, pats[a:b], vpd_on=True), len(pats), chunk).clamp_min(TINY).log()
     worst = torch.zeros(len(pats), device=nat.dev)            # running adversary score per pattern
@@ -335,8 +345,8 @@ def evaluate(ge: goal_eval.GoalEval, task: str, saved: dict, circuit: dict, seed
         tx.vpd[n][t.long().to(nat.dev), c.long().to(nat.dev)] = True
     empty, vpd = ge._bounds(tx, teacher.CONVENTION)
     pr = teacher.Pruner(ge, tx, tx.vpd, live=teacher.CONVENTION == "live")
-    pats = patterns(saved, task, tx.T, nat.C, nat.names, pool, seed, nat.dev)
-    ms = MaskSearch(ge, tx, pr, pats, live=teacher.CONVENTION == "live")
+    ms = MaskSearch(ge, tx, pr, patterns(saved, task, tx.T, nat.C, nat.names, pool, seed), live=teacher.CONVENTION == "live")
+    pats = ms.pats
     vpd_adv = ms.kl_chunked(lambda a, b: ms.masks(None, pats[a:b], vpd_on=True), len(pats), chunk).clamp_min(TINY).log()
     index = {nd: i for i, nd in enumerate(pr.nodes)}
     on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)

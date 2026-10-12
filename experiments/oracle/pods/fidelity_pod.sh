@@ -6,7 +6,7 @@
 # checkpoint reassembled on each pod (VPD's answers computed there). A run that runs out of memory beside the others runs
 # again alone. Rows come back to ~/mpd-data/runpod/oracle-graph-fid-RUN-<j>/fid_<k>.jsonl and are merged into OUT.
 #   RUN=v2tr SPLIT=train N=1000 MODE=reward PODS=8 P=2 OUT=FILE experiments/oracle/pods/fidelity_pod.sh NAME=DIR [NAME=DIR ...]
-#   (env: DRAW search|eval, REF, GPU, PRICE, VRAM, HOURS)
+#   (env: DRAW search|eval, START=1 (the text's influential start set as kind "start" too), REF, GPU, PRICE, VRAM, HOURS)
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -40,7 +40,7 @@ tar -xzf $F/in.tgz -C ~/fid_in; mv ~/fid_in/texts ~/mpd-data/graph_oracle/;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd > /dev/null;
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\";
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
-fid() { rm -f $O/fid_\$1.jsonl; python -B goal_eval.py fidelity --split $SPLIT --n $N $SETS --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --mode $MODE ${DRAW:+--draw-split $DRAW} --offset \$(( $j * $P + \$1 )) --stride $S --out $O/fid_\$1.jsonl > $O/fid_\$1.log 2>&1; };
+fid() { rm -f $O/fid_\$1.jsonl; python -B goal_eval.py fidelity --split $SPLIT --n $N $SETS --pool $F/pool.pt --fresh $F/fresh.pt --changed 16 --mode $MODE ${DRAW:+--draw-split $DRAW} ${START:+--start} --offset \$(( $j * $P + \$1 )) --stride $S --out $O/fid_\$1.jsonl > $O/fid_\$1.log 2>&1; };
 set +e; for k in \$(seq 0 $((P - 1))); do (fid \$k) & done; wait;
 for k in \$(seq 0 $((P - 1))); do grep -q OutOfMemoryError $O/fid_\$k.log && { echo \"fidelity shard \$k out of memory beside the others: again alone\"; fid \$k; }; done; true"
   (for try in $(seq 1 40); do

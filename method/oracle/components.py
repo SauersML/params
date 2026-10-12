@@ -1202,8 +1202,12 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
     format) for the questions that have a teacher answer: TEACHER_DIR/<task>.json (goal_eval's circuit JSON; nodes
     without edges get with_edges(), which needs ge) or <task>.txt (this module's text). english: task -> the chosen
     explanation (tinker_train.py explain), written into the answer's EXPLANATION. edits: the edit teacher's rows
-    (edit_teach()); a question with edit requests is kept only when the teacher has an edit for every one."""
+    (edit_teach()); a question with edit requests is kept only when the teacher has an edit for every one. Every target
+    is the circuit as it is scored: goal_eval.circuit drops nodes and edges the model does not have and the stranded
+    nodes (goal_eval.strand: a node other than a query or key with no stated connection), so nothing in a target is a
+    part the reward drops; info counts them (stranded, dropped_nodes, dropped_edges). ge: goal_eval.GoalEval."""
     import edit_eval
+    import goal_eval
     import native
 
     n = 0
@@ -1221,6 +1225,10 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
                 if ge is None:
                     raise ValueError(f"{js} states no edges: with_edges() needs the model (pass ge)")
                 answer = with_edges(ge, task, r, answer)
+            prompt = task["prompts"][0]
+            g, d = goal_eval.circuit(answer, prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
+            answer = goal_eval.to_json(g, answer.get("explanation", ""))
+            info = {"task": r["task"], "stranded": d["stranded_nodes"], "dropped_nodes": d["invalid_nodes"], "dropped_edges": d["invalid_edges"]}
             if english and r["task"] in english:
                 answer = {**answer, "explanation": english[r["task"]]}
             ops = {}
@@ -1232,7 +1240,7 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
                 continue  # an answer without an EDIT line for a request is invalid: no target for it
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
                                 "completion": [{"role": "assistant", "content": target(answer, r, task["model"], ops)}],
-                                "info": {"task": r["task"]}}) + "\n")
+                                "info": info}) + "\n")
             f.flush()
             n += 1
     return n
@@ -1624,10 +1632,9 @@ def main():
         return
 
     if args.cmd == "dataset":
-        node_only = any(json.loads(f.read_text()).get("edges") in (None, []) for f in sorted(args.teacher.glob("*.json")))
         english = {r["task"]: r["explanation"] for r in map(json.loads, args.english.read_text().splitlines())
                    if r.get("explanation")} if args.english else None
-        print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval() if node_only else None, english,
+        print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval(), english,
                       edit_teach(args.edit_teach) if args.edit_teach else None), "rows", flush=True)
         return
     if args.cmd == "facts":

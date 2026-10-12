@@ -1369,13 +1369,18 @@ class GoalEval:
 
     @torch.no_grad()
     def track_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = CHANGED_DRAWS,
-                 cuts: list | None = None) -> list[dict]:
+                 cuts: list | None = None, engine_run: bool = True) -> list[dict]:
         """s_track_pp (the lead's 10-12, beside s_track): on changed_inputs' changed texts x' (split), the path-patched
         run of each circuit (pp_run) against the model on x', against VPD's whole answer's path-patched run (a
         complete graph: 1 by construction), bounded by no change: per prompt clip(ln(W / KL_C) / ln(W / KL_V), 0, 1)
         with W = KL(model(x') || model(x)) (the circuit's run on x is the model's, so this is s_track's transplant),
         none where VPD's run is no nearer than W, pooled weighted by W. Per circuit s_track_pp, kl_track_pp_c,
-        prompts_track_pp and draws_track_pp ([prompt, KL_C, KL_V, W] each). cuts: per graph pp_run's cuts (None: none)."""
+        prompts_track_pp and draws_track_pp ([prompt, KL_C, KL_V, W] each). cuts: per graph pp_run's cuts (None: none).
+        The circuits run at once on engine.Engine.path_patched (monitorbench's 072dc07, an engine kept on the text;
+        engine_run False, or a stated graph with cuts: pp_run one graph and prompt at a time); each prompt's model run,
+        W and VPD's KL are kept on the text."""
+        import engine
+
         nat = self.nat
         graphs = [strand(g, tx.targets, nat.C) for g in graphs]
         moved = np.asarray(tx.moved, dtype=float)
@@ -1384,14 +1389,23 @@ class GoalEval:
             if positions and tx.vpd is not None else []
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
         acc = [[0.0, 0.0, 0.0, 0, [], 0.0] for _ in graphs]  # sum w s, sum w, sum w KL_C, prompts, draws, sum w s_raw
-        for p, z in got:
+        lqs = None
+        if got and graphs and engine_run and all(g.masks is None for g in graphs) and \
+                (cuts is None or all(not c or g.complete for c, g in zip(cuts, graphs))):
+            if "_pp_engine" not in tx.__dict__:
+                tx.__dict__["_pp_engine"] = engine.Engine(nat, tx.ids, tx.targets, live=True)
+            lqs = tx.__dict__["_pp_engine"].path_patched(graphs, [tuple(pz) for pz in got], cuts=cuts)  # [G, D, targets, V]
+        kept = tx.__dict__.setdefault("_pp_prompts", {})    # (p, z) -> (the model on x', W, VPD's KL)
+        for d, (p, z) in enumerate(got):
             x2 = list(tx.ids)
             x2[p] = z
-            ref = nat.reference([x2], tx.targets)
-            w = float(carry.kl(ref, tx.ref)[0])
-            kv = float(carry.kl(ref, self.pp_run(tx, x2, vpd))[0])
+            if (p, z) not in kept:
+                r2 = nat.reference([x2], tx.targets)
+                kept[(p, z)] = (r2, float(carry.kl(r2, tx.ref)[0]), float(carry.kl(r2, self.pp_run(tx, x2, vpd))[0]))
+            ref, w, kv = kept[(p, z)]
             for b_, g in enumerate(graphs):
-                kc = float(carry.kl(ref, self.pp_run(tx, x2, g, None if cuts is None else cuts[b_]))[0])
+                lq = lqs[b_, d][None] if lqs is not None else self.pp_run(tx, x2, g, None if cuts is None else cuts[b_])
+                kc = float(carry.kl(ref, lq)[0])
                 sb = _fid(w, kc, kv)
                 a = acc[b_]
                 a[4].append([[p, z], kc, kv, w])

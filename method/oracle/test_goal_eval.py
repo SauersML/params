@@ -1495,6 +1495,25 @@ def test_path_patched_run(tiny):
 
 
 
+def test_track_pp_engine_matches_pp_run(tiny):
+    """track_pp on engine.Engine.path_patched (all circuits at once) gives pp_run's numbers, one graph and prompt at a
+    time: a stated graph with token edges, node sets, a node set with blocks."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::2]
+    g = native.Graph(sub, *native.all_edges(sub, tx.targets))
+    g.tok_edges = [(nd[1], nd) for nd in sub if native._name_layer_kind(nd[0])[1] in mech.RESID_READERS]
+    g.tok_out = list(tx.targets)
+    blocks = [(n, t, goal_eval.BLOCK) for n in nat.names for t in tx.targets] + [nd for nd in sub if nd[1] not in tx.targets]
+    graphs = [g, native.Graph(sub, complete=True), native.Graph(every, complete=True), native.Graph(blocks, complete=True)]
+    a = ge.track_pp(tx, graphs, draws=6)
+    b = ge.track_pp(tx, graphs, draws=6, engine_run=False)
+    for x, y in zip(a, b):
+        assert (x["s_track_pp"] is None) == (y["s_track_pp"] is None)
+        assert x["s_track_pp"] is None or abs(x["s_track_pp"] - y["s_track_pp"]) < 1e-4
+        assert all(abs(dx[1] - dy[1]) <= 1e-4 * max(1.0, dy[1]) for dx, dy in zip(x["draws_track_pp"], y["draws_track_pp"]))
+
+
 def test_interchange_path_patched(tiny):
     """interchange_pp: the circuit's nodes at p held at their values on the changed text, their stated paths carrying
     them, everything else at x; the model's side is the real model with those activations replaced (naive()), a

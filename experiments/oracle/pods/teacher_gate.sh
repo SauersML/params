@@ -12,7 +12,8 @@
 # pattern lever goal_eval/ci_patterns_fresh.pt), sharded over FIDP processes beside the score run, and
 # experiments/oracle/teacher_gate.py compares them. The scores come back to
 # ~/mpd-data/runpod/oracle-graph-teacher-gscore-NAME/ (score.json, fid_<k>.jsonl), the comparison to gate.txt.
-#   experiments/oracle/pods/teacher_gate.sh NAME A B   (env: N, PODS, P per side, V3PODS, READPODS, READP, VRAM; FIDP, GPU, PRICE; the
+#   experiments/oracle/pods/teacher_gate.sh NAME A B   (env: N, PODS, P per side, V3PODS, READPODS, READP, VRAM; FIDP, GPU, PRICE,
+#   SCORE_GPU, SCORE_VRAM (the scoring card, default 44 GB: fidelity with donors overflows 24 GB even alone); the
 #   adversary's search pool goes to the teaching pods for --repair, --edge-objective robust and teacher_v3)
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -76,7 +77,7 @@ for k in \$(seq 0 $(( ${FIDP:-2} - 1 ))); do grep -q OutOfMemoryError $O/fid_\$k
 # runs again alone (the elv gate's second shard, 180-node circuits, overflowed a 44 GB A40 and left 10 of 20 texts
 # scored); no card in stock is retried every 3 min
 for try in $(seq 1 40); do
-  RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.60} RP_MIN_VRAM_GB=24 RP_MIN_RAM_GB=16 \
+  RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.60} RP_MIN_VRAM_GB=${SCORE_VRAM:-44} RP_MIN_RAM_GB=16 \
     experiments/infra/runpod/rp-run $RN "${SCORE_GPU:-NVIDIA RTX A6000,NVIDIA A40,NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090}" 3.0 -- bash -c "$CMD" > "$F/rp_score.log" 2>&1 && break
   grep -qE "in stock on a working host|differs from its sha256" "$F/rp_score.log" || break
   sleep 180

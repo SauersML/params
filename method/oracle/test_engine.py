@@ -305,3 +305,16 @@ def test_c_semantics_cuts_in_the_model_and_patches():
         a = whole.graph_kl(whole.plan(graph, semantics="c"), zero, patch=patch)
         b = whole.graph_kl(whole.plan(less, semantics="c"), zero)
     assert rel(a, b) < REL
+
+
+def test_graph_runs_in_slices(monkeypatch):
+    """Without gradients a connection group's products run a slice at a time (engine.ROWS): the same numbers."""
+    nat, ids, targets, graph, ew, ow, u = graph_case()
+    eng = engine.Engine(nat, ids, targets, live=True)
+    for semantics in ("native", "c"):
+        plan = eng.plan(graph, semantics=semantics)
+        with torch.no_grad():
+            whole = eng.graph_kl(plan, u, ew, ow)
+            monkeypatch.setattr(engine, "ROWS", 1 << 10)
+            assert rel(whole, eng.graph_kl(plan, u, ew, ow)) < REL
+            monkeypatch.setattr(engine, "ROWS", 1 << 24)

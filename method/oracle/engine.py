@@ -316,7 +316,7 @@ class Engine:
         def topup(rn, width):  # [readers, width]: each reader node's stated parents' extra share
             out = torch.zeros(len(R[rn][0]), width, device=self.dev)
             for wn, ri, wi, s in shares(rn):
-                out = out.index_add(0, ri, s[:, None] * self.U[wn].index_select(0, Wr[wn][2][wi]))
+                out = _add_rows(out, ri, s, lambda k, wn=wn, wi=wi: self.U[wn].index_select(0, Wr[wn][2][wi[k]]))
             return out
 
         def read(n, A, inp):  # reader nodes' activations, from their inputs [readers, d_in], into A
@@ -360,7 +360,8 @@ class Engine:
                     P = z.masked_fill(torch.arange(T, device=self.dev)[None, :] > pos[:, None], float("-inf")).softmax(-1)
                     for wn, ri, wi, s in shares(no):
                         pat = P[b[ri], :, idx[ri], Wr[wn][1][wi]]  # [n, H]: how much each reader's position attends to its writer's
-                        inp = inp.index_add(0, ri, s[:, None] * pat.repeat_interleave(hd, -1) * self.U[nv].index_select(0, Wr[wn][2][wi]))
+                        inp = _add_rows(inp, ri, s, lambda k, pat=pat, wn=wn, wi=wi:
+                                        pat[k].repeat_interleave(hd, -1) * self.U[nv].index_select(0, Wr[wn][2][wi[k]]))
                 a = read(no, a, inp)
             A["o_proj"] = done(no, a)
             x = x + out("o_proj", y, u[no])
@@ -379,8 +380,25 @@ class Engine:
         z = x[:, self.targets]
         for wn, (b, ti, wi, j, fx) in p["out"].items():
             s = share(wn, wi, fx if ow is None else ow[j] * fx)
-            z = z.index_put((b, ti), s[:, None] * self.U[wn].index_select(0, Wr[wn][2][wi]), accumulate=True)
+            z = z.index_put((b, ti), s[:, None] * self.U[wn].index_select(0, Wr[wn][2][wi]), accumulate=True)  # one per target
         return norm(z, tg.ln_f)
+
+
+ROWS = 1 << 24  # entries of a connection group's [connections, width] product made at once (64 MB in float32)
+
+
+def _add_rows(out: torch.Tensor, ri: torch.Tensor, s: torch.Tensor, rows) -> torch.Tensor:
+    """out.index_add(0, ri, s[:, None] * rows(all)) (rows(k): the connections k's [n, width] write vectors); without
+    gradients a slice of ROWS entries at a time: a large graph's connections (EdgePruner's 32 copies of a few hundred
+    nodes, ~10^5: 54 GB at once in teacher_v3 --edges) never take [connections, width] at once. (With gradients every
+    product is kept for the backward pass anyway; torch.utils.checkpoint per slice gave wrong gradients here.)"""
+    step = max(1, ROWS // out.shape[1])
+    if len(ri) <= step or (torch.is_grad_enabled() and (s.requires_grad or out.requires_grad)):
+        return out.index_add(0, ri, s[:, None] * rows(slice(None)))
+    for s0 in range(0, len(ri), step):
+        k = slice(s0, s0 + step)
+        out = out.index_add(0, ri[k], s[k, None] * rows(k))
+    return out
 
 
 def _positions(p: dict) -> dict:

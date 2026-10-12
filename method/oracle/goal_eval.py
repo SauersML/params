@@ -43,6 +43,10 @@ at a changed position p, every subcomponent at p, every one inactive on both the
 circuit's and the remainders compute, everything else held at its value on the text (carry.Carry), carried = 1 - KL /
 movement, beside B_p, the same with every subcomponent active on the text after p named, and completeness_p =
 min(1, carried / (GOAL x B_p)); target positions are left out (trivially carried).
+Also diagnostics: n_real_X, the circuit's necessity in the real model (its subcomponents removed from the model's
+weights at its positions, everything else on, remainders included; the same log scale with KL_{model minus C} in place
+of KL_{VPD minus C}), comparable with native_units' N; and tail_split(), how much of a KL is the shape of the model's
+tail (the chain rule over the nucleus tokens and one "rest" bucket).
 Whole-model path patching of single connections (cuts()) serves question answering and teachers.
 
 Baselines, scored by the same code: the empty circuit, VPD's own answer at the answer's size (its causal-importance
@@ -236,6 +240,24 @@ def necessity(empty: float, minus: float, vpd: float) -> float | None:
 
 def completeness(r: float | None) -> float | None:
     return None if r is None else min(1.0, r / GOAL)
+
+
+def tail_split(logp: torch.Tensor, logq: torch.Tensor, p: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """KL(P || Q) in bits per row (summed over the targets), split exactly by the chain rule into (the coarse KL over
+    the nucleus tokens and one "rest" bucket, P(rest) x KL(P(.|rest) || Q(.|rest))): the nucleus is the model's
+    smallest set of most likely tokens holding mass >= p at each target. logp [1 or B, targets, V], logq [B, targets, V]."""
+    P = logp.exp()
+    order = P.argsort(-1, descending=True)
+    mass = P.gather(-1, order).cumsum(-1)
+    inside = (mass - P.gather(-1, order)) < p  # a token is in the nucleus while the mass before it is below p
+    nucleus = torch.zeros_like(P, dtype=torch.bool).scatter(-1, order, inside)
+    term = P * (logp - logq)
+    pr = (P * ~nucleus).sum(-1)
+    qr = (logq.exp() * ~nucleus).sum(-1)
+    rest = torch.where(pr > 0, pr * (pr.clamp_min(1e-30).log() - qr.clamp_min(1e-30).log()), torch.zeros_like(pr))
+    coarse = (term * nucleus).sum(-1) + rest
+    tail = (term * ~nucleus).sum(-1) - rest
+    return coarse.sum(-1) / math.log(2), tail.sum(-1) / math.log(2)
 
 
 # ---- one text
@@ -601,6 +623,36 @@ class GoalEval:
             out[torch.tensor(js, device=nat.dev)] = (inp * V.T[c]).sum(-1)
         return out
 
+    @torch.no_grad()
+    def real_removal(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+        """Per graph: KL of the model on the text from the real model with the graph's subcomponents removed (mask 0
+        at their positions, every other subcomponent and every remainder on: Native.without, batched), and its
+        necessity on goal_eval's log scale per convention's bounds (n_real_X). A batch reuses the model's states before
+        its first removed subcomponent."""
+        nat, T = self.nat, tx.T
+        one_r = nat._one()[1]
+        none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+        sets = [self.masks(g, T) for g in graphs]
+        kls = []
+        for s0 in range(0, len(sets), self.chunk):
+            part = sets[s0:s0 + self.chunk]
+            B = len(part)
+            u = {n: 1.0 - torch.stack([m[n] for m in part]).float() for n in nat.names}
+            first = min((int(m[n].any(1).nonzero().min()) for m in part for n in nat.names if m[n].any()), default=0)
+            base = _from(tx.ids, min(first, min(tx.targets)))
+            plan = {**nat._full_plan(T, B), "G": none, "none": True}
+            lq = nat.run(tx.ids, tx.targets, plan, u, one_r, reuse=None if base is None else (nat._model_states(tx.ids, B), base))
+            kls += carry.kl(tx.ref, lq).tolist()
+            native.free(nat.dev)
+        out = []
+        for k in kls:
+            row = {"kl_real_minus": k}
+            for conv in CONVENTIONS:
+                e, v = self._bounds(tx, conv)
+                row[f"n_real_{conv}"] = necessity_log(e, k, v) if v is not None else None
+            out.append(row)
+        return out
+
     # ---- diagnostics
 
     def across(self, tx: Text, graphs: list[native.Graph], prompts: list) -> list[dict]:
@@ -691,7 +743,8 @@ class GoalEval:
 
     def score(self, tx: Text, graphs: list[native.Graph], explanations: list[str] | None = None, diagnostics: bool = False) -> list[dict]:
         """Every measure of each graph on the text, one dict per graph: the reward fields (module docstring) and,
-        with diagnostics, F1 on the changed prompts ("changed_*"), F2 ("f2_*") and interchange carry ("carry_*")."""
+        with diagnostics, F1 on the changed prompts ("changed_*"), F2 ("f2_*"), interchange carry ("carry_*") and the
+        real model's necessity ("n_real_*", "kl_real_minus")."""
         t0 = time.perf_counter()
         nat = self.nat
         rows = self.sufficiency(tx, graphs)
@@ -711,6 +764,8 @@ class GoalEval:
                 for row, d in zip(rows, extra):
                     row.update({f"{key}_{k}": v for k, v in d.items()})
             for row, d in zip(rows, self.interchange(tx, graphs)):
+                row.update(d)
+            for row, d in zip(rows, self.real_removal(tx, graphs)):
                 row.update(d)
         seconds = time.perf_counter() - t0 + tx.seconds
         for row in rows:
@@ -839,6 +894,46 @@ def score_sets(sets: dict, split: str, n: int, ge: GoalEval | None = None, basel
     return list(results.values())
 
 
+def tails(split: str, n: int, teachers: dict, top: int = 64, ps=(0.9, 0.99), ge: GoalEval | None = None, log=print) -> str:
+    """The tail-shape share of each circuit's KL (tail_split, remainders live) on the split's first n texts: the empty
+    circuit, VPD's answer, VPD's first `top` (its order), and each teacher directory's circuit (<task>.json); per kind
+    the mean KL and, per p, the pooled share sum(tail) / sum(KL) and the mean per-text share."""
+    ge = ge or GoalEval()
+    nat = ge.nat
+    acc = {}
+    for p in native.tasks(split)[:n]:
+        ids, targets = native.text(p)
+        tx = ge.text(ids, targets, native.task_seed(p.stem), json.loads(p.read_text()))
+        if tx.vpd is None:
+            raise RuntimeError("tails needs VPD's causal-importance network")
+        empty = {m: torch.zeros(tx.T, nat.C[m], dtype=torch.bool, device=nat.dev) for m in nat.names}
+        kinds = {"empty": empty, "vpd": tx.vpd, f"vpd top {top}": ge.masks(native.Graph(nat._vpd_order(ids, targets)[:top], complete=True), tx.T)}
+        for name, d in teachers.items():
+            f = Path(d) / f"{p.stem}.json"
+            if f.exists():
+                g, _ = circuit(json.loads(f.read_text()), targets, nat.C, tx.T)
+                kinds[name] = ge.masks(g, tx.T)
+        lq = ge.runs(ids, targets, list(kinds.values()), True)
+        full = carry.kl(tx.ref, lq).tolist()
+        split_ = {q: tail_split(tx.ref, lq, q)[1].tolist() for q in ps}
+        for i, name in enumerate(kinds):
+            a = acc.setdefault(name, {"kl": [], **{q: [] for q in ps}})
+            a["kl"].append(full[i])
+            for q in ps:
+                a[q].append(split_[q][i])
+        log(f"{p.stem}: " + ", ".join(f"{k} KL {full[i]:.3g} tail@{ps[0]} {split_[ps[0]][i]:.3g}" for i, k in enumerate(kinds)))
+    lines = [["circuit", "texts", "mean KL"] + [h for q in ps for h in (f"tail share p{q} pooled", f"p{q} per text")]]
+    for name, a in acc.items():
+        kl = np.asarray(a["kl"])
+        row = [name, str(len(kl)), f"{kl.mean():.3g}"]
+        for q in ps:
+            t = np.asarray(a[q])
+            row += [f"{t.sum() / kl.sum():.3f}" if kl.sum() > 0 else "-", f"{np.mean(t / np.maximum(kl, 1e-12)):.3f}"]
+        lines.append(row)
+    w = [max(len(x[i]) for x in lines) for i in range(len(lines[0]))]
+    return "\n".join("  ".join(x[i].rjust(w[i]) for i in range(len(x))) for x in lines)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -849,7 +944,15 @@ def main():
     s.add_argument("--out", type=Path)
     s.add_argument("--no-baselines", action="store_true")
     s.add_argument("--diagnostics", action="store_true", help="F1 on changed prompts, F2 and interchange carry too")
+    t = sub.add_parser("tails", help="the tail-shape share of each circuit's KL")
+    t.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
+    t.add_argument("--n", type=int, default=20)
+    t.add_argument("--teacher", action="append", default=[], help="NAME=DIR of teacher circuits <task>.json")
+    t.add_argument("--top", type=int, default=64)
     args = ap.parse_args()
+    if args.cmd == "tails":
+        print(tails(args.split, args.n, dict(x.split("=", 1) for x in args.teacher), args.top), flush=True)
+        return
     sets = dict(x.split("=", 1) for x in args.set)
     results = score_sets(sets, args.split, args.n, baselines=not args.no_baselines, diagnostics=args.diagnostics)
     for r in results:

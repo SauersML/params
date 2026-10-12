@@ -526,3 +526,34 @@ def test_recovered_log():
     assert abs(goal_eval.recovered_log(100.0, 0.5, 0.5) - 1) < 1e-12
     assert abs(goal_eval.recovered_log(100.0, 10.0, 1.0) - 0.5) < 1e-12
     assert goal_eval.recovered_log(1.0, 0.5, 2.0) is None
+
+
+def test_tail_split_is_exact():
+    g = torch.Generator().manual_seed(3)
+    logp = torch.log_softmax(torch.randn(1, 2, 50, generator=g) * 3, -1)
+    logq = torch.log_softmax(torch.randn(4, 2, 50, generator=g) * 3, -1)
+    full = carry.kl(logp, logq)
+    for p in (0.5, 0.9, 0.99, 1.0):
+        coarse, tail = goal_eval.tail_split(logp, logq, p)
+        assert torch.allclose(coarse + tail, full, atol=1e-5), p
+    coarse, tail = goal_eval.tail_split(logp, logq, 1.0)
+    assert torch.allclose(tail, torch.zeros_like(tail), atol=1e-6)  # the nucleus holds every token
+    same = goal_eval.tail_split(logp, logp.expand(4, -1, -1), 0.9)
+    assert torch.allclose(same[0], torch.zeros(4), atol=1e-6) and torch.allclose(same[1], torch.zeros(4), atol=1e-6)
+
+
+def test_real_removal(tiny):
+    """n_real: the real model without the circuit's subcomponents (everything else on, remainders on), against
+    naive() and Native.without."""
+    nat, ge, tx = tiny
+    graphs = [random_graph(nat, tx, 41, k=10), random_graph(nat, tx, 42, k=25), native.Graph()]
+    rows = ge.real_removal(tx, graphs)
+    full, _ = naive(nat, tx.ids)
+    for g, row in zip(graphs, rows):
+        on = {n: ~m for n, m in mask_of(nat, tx.T, g.nodes).items()}
+        want = _kl(full, naive(nat, tx.ids, on=on, live=True)[0], tx.targets)
+        assert abs(row["kl_real_minus"] - want) < 1e-4 + 1e-4 * want
+        assert abs(row["kl_real_minus"] - float(carry.kl(tx.ref, nat.without(tx.ids, tx.targets, g.nodes))[0])) < 1e-5
+        e, v = ge._bounds(tx, "off")
+        assert row["n_real_off"] == goal_eval.necessity_log(e, row["kl_real_minus"], v)
+    assert rows[2]["n_real_live"] == 0.0

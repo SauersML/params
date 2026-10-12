@@ -384,6 +384,60 @@ def evaluate(args):
     print(f"J++ readouts written for {len(wins)} sites: {wins}", flush=True)
 
 
+class RoutedLens:
+    """The routed lens at given positions of one text (the label-free lens with the best measured agreement, read per
+    sample as evaluated): a node (matrix, position, index) is read through the expert its point's residual at that
+    position is routed to, oriented by its activation there (what its write raises at that position). q_proj and k_proj
+    (no write) get none; the last layer's MLP is the logit lens (J = I)."""
+
+    def __init__(self, target, root: Path = DEFAULT, tokens: str | None = None):
+        dev = target.wte.device
+        saved = torch.load(Path(root) / "lens" / "jacobians.pt")
+        self.target = target
+        self.routers = {p: Router(*(x.to(dev) for x in saved["routers"][p])) for p in POINTS}
+        self.expert = {p: (saved["J"][p] / saved["n"][p].clamp_min(1)[:, None, None]).float().to(dev) for p in POINTS}
+        meta = json.loads((Path(root) / "atlas.json").read_text())
+        a0, a1 = meta["train_rows"]
+        path = tokens or str(Path(root) / "tokens_0_6000.npy")
+        V = target.wte.shape[0]
+        self.seen = (torch.bincount(tokens_of(a0, a1, path).reshape(-1), minlength=V) >= MIN_COUNT).to(dev)
+
+    @torch.no_grad()
+    def readout(self, ids: list[int], nodes: list[tuple], k: int = 10) -> list[dict | None]:
+        """Per node {"raised": [(token id, value)], "lowered": [...]} over the tokens split A holds at least MIN_COUNT
+        times, or None (q_proj, k_proj)."""
+        tg = self.target
+        dev = tg.wte.device
+        x = torch.tensor([ids], device=dev)
+        _, pts = forward_points(tg, x, lrp=False)
+        out = []
+        neg = torch.full_like(self.seen, -math.inf, dtype=torch.float32)
+        acts = {}
+        for n in {nd[0] for nd in nodes}:
+            st = tg.site(n)
+            st.cache_input = True
+        try:
+            tg.hidden(x)
+            for n in {nd[0] for nd in nodes}:
+                acts[n] = tg.site(n).last_input[0] @ tg.site(n).V  # [T, C]
+        finally:
+            for n in {nd[0] for nd in nodes}:
+                tg.site(n).cache_input, tg.site(n).last_input = False, None
+        for n, t, c in nodes:
+            layer, kind = int(n.split(".")[1]), n.rsplit(".", 1)[1]
+            p = point_of(layer, kind)
+            if p is None:
+                out.append(None)
+                continue
+            r = write_directions(tg, layer, kind)[c]
+            y = r if p == "out_3" else self.expert[p][self.routers[p](pts[p][0, t][None])[0]] @ r
+            w = ((y * tg.ln_f) @ tg.wte.T) * (1.0 if float(acts[n][t, c]) >= 0 else -1.0)
+            v, i = torch.where(self.seen, w, neg).topk(k)
+            dv, di = torch.where(self.seen, -w, neg).topk(k)
+            out.append({"raised": list(zip(i.tolist(), v.tolist())), "lowered": list(zip(di.tolist(), (-dv).tolist()))})
+        return out
+
+
 def routed(args):
     """The routed lens as the atlas's readout of each subcomponent (lens/routed.pt and the atlas's routed_* fields):
     its map is the mixture of its point's expert Jacobians in the proportions its top contexts (split A) are routed

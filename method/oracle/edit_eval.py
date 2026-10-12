@@ -55,9 +55,10 @@ Score (EditEval.score_many), in bits, on data the teacher's search never used:
   edit_eval.py rescore OUT.jsonl NEW.jsonl                       teach rows' edits scored again by the current scorer
 
 The edit teacher (teach()) is a measured greedy search over candidate edits from the teacher's circuits (goal_eval JSON
-files, TEACHER_DIRS) and VPD's most important subcomponents for the most net bits (goal_bits - collateral, what E3
-compares): each round adds the candidate that raises net most, until none does; then drops every edit whose removal
-does not lower net and replaces single edits by others that raise it. A
+files, TEACHER_DIRS) and VPD's most important subcomponents for net bits (goal_bits - collateral, what E3 compares):
+each round adds the candidate that raises net most, until none does; the edit is the shortest prefix within GOAL of the
+most net found, pruned while it stays within GOAL, with single operations swapped for ones with more net; bests() takes
+the most net of every scored edit (the path's best among them) as net_best. A
 persistent goal can be reached by breaking the model, so its search (frontier()) adds the candidate with the most
 progress per bit of collateral and size each round and keeps every step: a path of progress against collateral. Every
 search number is measured on the search's own data (alternatives ranks 0 to 2, the copy set's first half, SEARCH_ROWS
@@ -736,7 +737,9 @@ def bests(paths) -> tuple[dict, dict]:
                 continue
             r = json.loads(line)
             key = EditEval.key(r["task"], r["goal"])
-            for s in [r["teacher"]["score"], r["units"]["score"]] + [x["score"] for x in r.get("vpd_topk", [])]:
+            scored = [r[m][k] for m in ("teacher", "units") for k in ("score",) if r.get(m)]
+            scored += [r[m]["best"]["score"] for m in ("teacher", "units") if r.get(m) and r[m].get("best")]
+            for s in scored + [x["score"] for x in r.get("vpd_topk", [])]:
                 if s and s.get("valid"):
                     prog[key] = max(prog.get(key, 0.0), s["progress"])
                     if "net" in s:
@@ -839,11 +842,13 @@ def _better(a: dict, b: dict | None) -> bool:
 
 
 def search(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN, log=print) -> dict:
-    """The edit teacher's measured greedy search (module docstring) for the most net bits (goal_bits - collateral, the
-    quantity E3 compares): each round adds the candidate that raises net most, until none raises it; then drops every
-    edit whose removal does not lower net and replaces single edits by others that raise it. score(list of edits) ->
-    rows (EditEval.score_many with search=True). Returns {"ops", "row" (the search's numbers), "rounds", "evaluated"}."""
-    S, cur, evaluated, rounds = [], None, 0, []
+    """The edit teacher's measured greedy search (module docstring) for net bits (goal_bits - collateral, the quantity
+    E3 compares): each round adds the candidate that raises net most, until none raises it; the edit is the shortest
+    prefix of that path within GOAL of the most net found (later steps add little net for a whole operation's
+    description), then every operation is dropped whose removal keeps it within GOAL, and single operations are swapped
+    for ones with more net. score(list of edits) -> rows (EditEval.score_many with search=True). Returns {"ops", "row"
+    (the search's numbers), "best" (the path's edit with the most net), "best_row", "rounds", "evaluated"}."""
+    S, cur, evaluated, rounds, path = [], None, 0, [], []
     net = lambda row: row["net"] if row and row["valid"] else -math.inf  # noqa: E731
     for r in range(max_ops):
         trial = [S + [c] for c in pool]
@@ -860,20 +865,24 @@ def search(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN
         if cur is not None and net(rows[best]) <= net(cur) + 1e-6:
             break
         S, cur = S + [pool[best]], rows[best]
+        path.append((list(S), cur))
         rounds.append({"op": op_text(pool[best]), "progress": cur["progress"], "collateral": cur["collateral"], "net": cur["net"]})
         log(f"  round {r}: {op_text(pool[best])} -> progress {cur['progress']:.3f} collateral {cur['collateral']:.3f} net {cur['net']:.3f}")
         pool = [c for j, c in enumerate(pool) if j != best]
     if cur is None:
-        return {"ops": [], "row": None, "rounds": rounds, "evaluated": evaluated}
-    while len(S) > 1:  # drop what does not add net bits, the one whose removal leaves the most first
+        return {"ops": [], "row": None, "best": [], "best_row": None, "rounds": rounds, "evaluated": evaluated}
+    top = max(path, key=lambda x: net(x[1]))
+    enough = lambda row: net(row) >= (GOAL * net(top[1]) if net(top[1]) > 0 else net(top[1]) - 1e-6)  # noqa: E731
+    S, cur = next((list(p), row) for p, row in path if enough(row))
+    while len(S) > 1:  # drop what keeps the edit within GOAL of the most net, the one leaving the most net first
         trial = [S[:i] + S[i + 1:] for i in range(len(S))]
         rows = score(trial)
         evaluated += len(trial)
         i = max(range(len(S)), key=lambda i: net(rows[i]))
-        if net(rows[i]) < net(cur) - 1e-6:
+        if not enough(rows[i]):
             break
         S, cur = trial[i], rows[i]
-    for i in range(len(S)):  # swap single edits for ones with more net bits
+    for i in range(len(S)):  # swap single operations for ones with more net bits
         others = [c for c in pool if c not in S]
         trial = [S[:i] + [c] + S[i + 1:] for c in others]
         rows = score(trial)
@@ -881,7 +890,7 @@ def search(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN
         j = max(range(len(trial)), key=lambda j: net(rows[j]), default=None)
         if j is not None and net(rows[j]) > net(cur) + 1e-6:
             S, cur = trial[j], rows[j]
-    return {"ops": S, "row": cur, "rounds": rounds, "evaluated": evaluated}
+    return {"ops": S, "row": cur, "best": top[0], "best_row": top[1], "rounds": rounds, "evaluated": evaluated}
 
 
 def _rate(row: dict, cur: dict | None) -> float | None:
@@ -954,9 +963,11 @@ def teach_goal(ee: EditEval, task: dict, goal: dict, log=print, baselines: bool 
     for name, pool in methods:
         log(f"{task['id']} {goal['kind']} {name}: {len(pool)} candidates")
         res = search(score, pool, log=log)
-        row = ee.score(task, goal, res["ops"]) if res["ops"] else None
+        rows = ee.score_many(task, goal, [res["ops"], res["best"]]) if res["ops"] else [None, None]
         out[name] = {"ops": [op_text(o) for o in res["ops"]], "edit": [_jsonable(o) for o in res["ops"]], "search": res["row"],
-                     "score": row, "rounds": res["rounds"], "evaluated": res["evaluated"]}
+                     "score": rows[0], "best": {"ops": [op_text(o) for o in res["best"]], "edit": [_jsonable(o) for o in res["best"]],
+                                                "score": rows[1]},
+                     "rounds": res["rounds"], "evaluated": res["evaluated"]}
     if ee.nat.has_importance and baselines:
         k_teacher = len(out["teacher"]["ops"])
         sizes = sorted(set(SIZES) | ({k_teacher} if k_teacher else set()))

@@ -842,11 +842,12 @@ class GoalEval:
         return out
 
     @torch.no_grad()
-    def real_removal(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+    def real_removal(self, tx: Text, graphs: list[native.Graph], remainders_at_nodes: bool = True) -> list[dict]:
         """Per graph: KL of the model on the text from the real model with the graph's subcomponents removed (mask 0
         at their positions, every other subcomponent and every remainder on: Native.without, batched), and its
-        necessity on goal_eval's log scale per convention's bounds (n_real_X). A batch reuses the model's states before
-        its first removed subcomponent."""
+        necessity on goal_eval's log scale per convention's bounds (n_real_X). remainders_at_nodes False: every
+        matrix's remainder W - V U removed too at each position holding one of the graph's subcomponents. A batch
+        reuses the model's states before its first removed subcomponent."""
         nat, T = self.nat, tx.T
         one_r = nat._one()[1]
         none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
@@ -859,7 +860,11 @@ class GoalEval:
             first = min((int(m[n].any(1).nonzero().min()) for m in part for n in nat.names if m[n].any()), default=0)
             base = _from(tx.ids, min(first, min(tx.targets)))
             plan = {**nat._full_plan(T, B), "G": none, "none": True}
-            lq = nat.run(tx.ids, tx.targets, plan, u, one_r, reuse=None if base is None else (nat._model_states(tx.ids, B), base))
+            ur = one_r
+            if not remainders_at_nodes:
+                held = torch.stack([sum(m[n].any(1).float() for n in nat.names) > 0 for m in part])  # [B, T]
+                ur = {n: 1.0 - held.float() for n in nat.names}
+            lq = nat.run(tx.ids, tx.targets, plan, u, ur, reuse=None if base is None else (nat._model_states(tx.ids, B), base))
             kls += carry.kl(tx.ref, lq).tolist()
             native.free(nat.dev)
         out = []

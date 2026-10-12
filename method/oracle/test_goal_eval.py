@@ -557,6 +557,11 @@ def test_real_removal(tiny):
         e, v = ge._bounds(tx, "off")
         assert row["n_real_off"] == goal_eval.necessity_log(e, row["kl_real_minus"], v)
     assert rows[2]["n_real_live"] == 0.0
+    every = [(nat.names[0], t, 0) for t in range(tx.T)] + list(graphs[1].nodes)  # a node at every position
+    row = ge.real_removal(tx, [native.Graph(every)], remainders_at_nodes=False)[0]
+    on = {n: ~m for n, m in mask_of(nat, tx.T, every).items()}
+    want = _kl(full, naive(nat, tx.ids, on=on, live=False)[0], tx.targets)  # every remainder removed too
+    assert abs(row["kl_real_minus"] - want) < 1e-4 + 1e-4 * want, (row["kl_real_minus"], want)
 
 
 def _graph_checks(nat, ge, tx, nodes, rel):

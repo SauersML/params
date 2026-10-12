@@ -136,6 +136,24 @@ def test_qa_term_is_measured_from_the_no_change_answer():
     assert components.qa_term([], {}, tok, "t1") is None
 
 
+class FakeEdits:
+    """edit_eval.EditEval's score_many: a one-operation edit is valid with net 2 bits, a longer one rejected."""
+
+    def score_many(self, task, goal, edits):
+        return [{"valid": len(ops) == 1, "net": 2.0 if len(ops) == 1 else None} for ops in edits]
+
+
+def test_edit_term():
+    import edit_eval
+
+    task, goals = {"id": "text0"}, [{"kind": "flip", "token_id": 5}, {"kind": "detach", "position": 3}]
+    best = {edit_eval.EditEval.key("text0", goals[0]): 4.0, edit_eval.EditEval.key("text0", goals[1]): 2.0}
+    op = {"op": "scale", "node": ("h.0.mlp.c_fc", 3, 1), "k": 0.0, "persistent": False}
+    answers = [{1: [op], 2: [op]}, {1: [{"op": "invalid", "text": "x"}]}, {1: [op, op], 2: [op]}]
+    assert components.edit_term(FakeEdits(), task, goals, answers, best) == [0.75, 0.0, 0.5]  # net / best, 0 when invalid
+    assert components.edit_term(FakeEdits(), task, goals, answers, {k: v for k, v in list(best.items())[:1]}) == [None] * 3
+
+
 class NoWiring:
     names = []
 
@@ -178,6 +196,16 @@ def test_reward_on_tiny_model(tiny):
         assert got[0]["term_E2"] is None
     assert got[1]["valid"] and got[1]["dropped_edges"] == 1 and got[1]["size"] > got[0]["size"]
     assert (not got[2]["valid"]) == bool(ev["qa"]) and not got[3]["valid"] and got[3]["reward"] == invalid
+    import edit_eval
+
+    goals = [{"kind": "flip", "token_id": 5, "token": " the", "target": 7}]
+    asked = {**ev, "edits": goals}
+    best = {edit_eval.EditEval.key(task["id"], goals[0]): 4.0}
+    edited = good + "\nEDIT 1: scale " + good.split("@7 ", 1)[1].split("=", 1)[0] + " 0"
+    with_e3 = components.reward(ge, task, asked, [edited, good], ee=FakeEdits(), edit_best=best)
+    assert with_e3[0]["term_E3"] == 0.5 and not with_e3[1]["valid"]  # 2 bits of the teacher's 4; no EDIT line: invalid
+    terms = [with_e3[0][f"term_{k}"] for k in ("F1", "N", "F3", "E1", "E2", "E3") if with_e3[0][f"term_{k}"] is not None]
+    assert with_e3[0]["reward"] == pytest.approx(sum(terms) / len(terms) - components.SIZE_WEIGHT * with_e3[0]["size"])
 
 
 def test_invalid_below_every_valid_answer(tiny):

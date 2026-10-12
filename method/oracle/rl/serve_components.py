@@ -6,15 +6,18 @@ goal_eval.Text is kept for the group's later requests. A text's requests always 
 
   serve_components.py ROWS.jsonl [--port 8767] [--workers 2] [--device cuda] [--size-weight 0.5]
                       [--reader http://127.0.0.1:8000/v1/completions --reader-base Qwen/Qwen3-4B]
+                      [--edit-teach TEACH.jsonl ...]
   POST /score {"task": TASK_ID, "answers": [TEXT, ...], "e1": [bits, ...], "truncated": [bool, ...]}
       (e1 and truncated optional: whether each answer was cut at the sampling cap, an invalid answer)
-      -> {"scores": [{"reward", "valid", "F1", "N", "F3", "E1", "E2", "size", "bits", "nodes", "edges", "tok_edges", "malformed",
+      -> {"scores": [{"reward", "valid", "F1", "N", "F3", "E1", "E2", "E3", "size", "bits", "nodes", "edges", "tok_edges", "malformed",
                       "dropped_nodes", "dropped_edges", "finals", "truncated"}, ...]}
   GET /health -> {"workers", "alive", "pending"}
 
 E1, the frozen base model's bits saved: given in the request (computed by the caller, as tinker_train.py's Tinker
 reader does), else from --reader (components.http_reader: vLLM's OpenAI server holding the base model, never the
-policy); with neither, the reward has no E1 term.
+policy); with neither, the reward has no E1 term. E3, the edit requests (rows with "edits", components.py edits):
+scored by edit_eval against the edit teacher's net per goal (--edit-teach, edit_eval.py teach output); a text whose
+requests lack a teacher net has no E3 term.
 ROWS: components.py questions output (each text's evidence: its questions and the size term's scale).
 """
 
@@ -40,7 +43,8 @@ sys.path.insert(0, str(HERE.parent))
 TEXTS_KEPT = 8  # goal_eval.Text objects a process keeps (a group's answers arrive in several requests)
 
 
-def work(device: str | None, rows_path: str, size_weight: float, reader_url: str | None, reader_base: str, inbox, outbox) -> None:
+def work(device: str | None, rows_path: str, size_weight: float, reader_url: str | None, reader_base: str, edit_teach: list,
+         inbox, outbox) -> None:
     import components
     import goal_eval
     import native
@@ -48,6 +52,12 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
     ge = goal_eval.GoalEval(native.Native(device))
     reader = components.http_reader(reader_url, reader_base) if reader_url else None
     rows = {r["task"]: r for r in map(json.loads, Path(rows_path).read_text().splitlines()) if r}
+    ee = edit_best = None
+    if any(r.get("edits") for r in rows.values()):
+        import edit_eval
+
+        ee = edit_eval.EditEval(ge.nat)
+        edit_best = {k: ((r.get("teacher") or {}).get("score") or {}).get("net") for k, r in components.edit_teach(edit_teach).items()}
     tasks, cache = {}, OrderedDict()
     while True:
         batch = [inbox.get()]
@@ -67,7 +77,7 @@ def work(device: str | None, rows_path: str, size_weight: float, reader_url: str
                 given = None if any(e is None for _, _, e, _ in reqs) else [b for _, _, e, _ in reqs for b in e]
                 got = components.reward(ge, tasks[tid], rows[tid], [x for _, xs, _, _ in reqs for x in xs],
                                         size_weight=size_weight, cache=cache, reader=None if given else reader, e1=given,
-                                        truncated=[c for _, _, _, cut in reqs for c in cut])
+                                        truncated=[c for _, _, _, cut in reqs for c in cut], ee=ee, edit_best=edit_best)
                 while len(cache) > TEXTS_KEPT:
                     cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **{k[5:]: g[k] for k in g if k.startswith("term_")},
@@ -209,8 +219,9 @@ def main():
     ap.add_argument("--size-weight", type=float, default=0.5)
     ap.add_argument("--reader", help="the frozen base model's vLLM completions URL (E1)")
     ap.add_argument("--reader-base", default="Qwen/Qwen3-4B")
+    ap.add_argument("--edit-teach", action="append", default=[], help="edit_eval.py teach output: the best net per goal (E3)")
     a = ap.parse_args()
-    args = (a.device, a.rows, a.size_weight, a.reader, a.reader_base)
+    args = (a.device, a.rows, a.size_weight, a.reader, a.reader_base, a.edit_teach)
     serve(Pool(a.workers, args, work) if a.workers else Inline(args, work), a.host, a.port, "serve_components")
 
 

@@ -867,7 +867,8 @@ def edit_bits(edits: dict, circuit: set, positions: int, subcomponents: int) -> 
 
 
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
-           size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None) -> list[dict]:
+           size_weight: float = SIZE_WEIGHT, convention: str = CONVENTION, cache: dict | None = None, ee=None,
+           edit_best: dict | None = None) -> list[dict]:
     """Per answer text on one task: {"reward", "valid", each term, "size", the dropped nodes and edges, goal_eval's
     row}. An answer is invalid (reward -(1 + size_weight), below every valid one) when it has no CIRCUIT section, a
     question has no FINAL line, an edit request no EDIT line, or it was cut at the sampling cap (truncated). Nodes and edges the model does not have
@@ -882,7 +883,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     KL_C) / ln(KL_empty / KL_VPD) in [0, 1], between the empty circuit and VPD's own answer); N, goal_eval's n (what
     VPD's own answer loses without the circuit, ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD) in [0, 1]); F3, the
     AUC of stated edges' cuts in the circuit's run (0 without a stated edge); E1, the reader's bits saved (in [-1, 1];
-    with a reader or e1); E2, the questions answered right measured from the no-change answer (qa_term). A term goal_eval cannot give (no causal-importance
+    with a reader or e1); E2, the questions answered right measured from the no-change answer (qa_term); E3, the edit
+    requests' net bits over the edit teacher's (edit_term; ee an edit_eval.EditEval, edit_best goal key -> the teacher's
+    net; left out until every request of the text has one). A term goal_eval cannot give (no causal-importance
     network for VPD's bounds) is left out of the mean. reader: a reader.Reader for E1, or e1: each text's reader bits
     computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
     -> goal_eval.Text, kept between calls."""
@@ -918,6 +921,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     ge.hooks = {"E1": (lambda task, g, x: bits.get(x)) if (reader is not None or e1 is not None) else None,
                 "E2": lambda task, g, x: qa_term(ev["qa"], parse(x)["finals"], tok, prompt["model_top"][0][0][0])}
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
+    e3 = {}
+    if keep and ee is not None and ev.get("edits"):
+        e3 = dict(zip(keep, edit_term(ee, task, ev["edits"], [parsed[i]["edits"] for i in keep], edit_best or {})))
     scale = ev["active"] * math.log2(nat.positions(targets) * total)
     out = []
     for i, (p, (d_nodes, d_edges, d_bits)) in enumerate(zip(parsed, defects)):
@@ -929,6 +935,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             terms["F3"] = row["f3"]
             terms["E1"] = None if row["E1"] is None else max(-1.0, min(1.0, row["E1"]))
             terms["E2"] = row["E2"]
+            terms["E3"] = e3.get(i)
             have = [v for v in terms.values() if v is not None]
             e_bits = edit_bits(p["edits"], graphs[i].node_set(), nat.positions(targets), total)
             size = min(1.0, (row["bits"] + d_bits + e_bits) / scale) if scale > 0 else 0.0
@@ -941,14 +948,52 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     return out
 
 
+def edit_teach(paths) -> dict:
+    """The edit teacher's rows (edit_eval.py teach output files), by goal key (edit_eval.EditEval.key)."""
+    import edit_eval
+
+    out = {}
+    for p in paths:
+        for r in map(json.loads, Path(p).read_text().splitlines()):
+            out[edit_eval.EditEval.key(r["task"], r["goal"])] = r
+    return out
+
+
+def edit_term(ee, task: dict, goals: list[dict], answers: list[dict], best: dict) -> list:
+    """E3 of each answer's edits (parse()'s "edits"), one value per answer: per edit request, the edit's net bits
+    (edit_eval's goal_bits less collateral) over the best net known for that goal (best: goal key -> net, the edit
+    teacher's), clipped to [-1, 1], 0 for an edit with an invalid operation, none, or one edit_eval rejects; the mean over
+    the requests. None for an answer when a request has no best net (E3 is then left out of the reward) or edit_eval
+    gives no net."""
+    import edit_eval
+
+    vals = [[] for _ in answers]
+    for n, goal in enumerate(goals, 1):
+        key = edit_eval.EditEval.key(task["id"], goal)
+        nb = best.get(key)
+        ops = [a.get(n) or [] for a in answers]
+        run = [i for i, o in enumerate(ops) if o and all(x["op"] != "invalid" for x in o)]
+        rows = dict(zip(run, ee.score_many(task, goal, [ops[i] for i in run]))) if run and nb else {}
+        for i in range(len(answers)):
+            r = rows.get(i)
+            if not nb or nb <= 0 or (r is not None and r.get("valid") and r.get("net") is None):
+                vals[i].append(None)
+            elif r is None or not r.get("valid"):
+                vals[i].append(0.0)
+            else:
+                vals[i].append(max(-1.0, min(1.0, r["net"] / nb)))
+    return [None if not v or any(x is None for x in v) else sum(v) / len(v) for v in vals]
+
+
 # ---- supervised targets
 
 
-def target(answer: dict, ev: dict, model: str) -> str:
-    """The supervised answer to a question: the teacher's circuit (goal_eval's JSON) and explanation, and for each
-    question the model's measured answer (no reasoning: the teacher has none to give)."""
+def target(answer: dict, ev: dict, model: str, edits: dict | None = None) -> str:
+    """The supervised answer to a question: the teacher's circuit (goal_eval's JSON) and explanation, for each
+    question the model's measured answer (no reasoning: the teacher has none to give), and for each edit request the
+    edit teacher's operations (edits: request number -> parse()'s ops)."""
     finals = {n: (q["falls"], shown(token_strings(model, [q["top"]])[0])) for n, q in enumerate(ev["qa"], 1)}
-    return render(answer, finals)
+    return render(answer, finals, edits=edits)
 
 
 def with_edges(ge, task: dict, ev: dict, answer: dict, cache: dict | None = None, max_pairs: int = MAX_PAIRS) -> dict:
@@ -1113,11 +1158,13 @@ def writer_prompt(f: dict) -> str:
     return escape(WRITER.format(facts="\n".join(lines)))
 
 
-def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | None = None) -> int:
+def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | None = None, edits: dict | None = None) -> int:
     """SFT rows ({"prompt": [user message], "completion": [assistant message], "info": {"task"}}, units_sft.py's
     format) for the questions that have a teacher answer: TEACHER_DIR/<task>.json (goal_eval's circuit JSON; nodes
     without edges get with_edges(), which needs ge) or <task>.txt (this module's text). english: task -> the chosen
-    explanation (tinker_train.py explain), written into the answer's EXPLANATION."""
+    explanation (tinker_train.py explain), written into the answer's EXPLANATION. edits: the edit teacher's rows
+    (edit_teach()); a question with edit requests is kept only when the teacher has an edit for every one."""
+    import edit_eval
     import native
 
     n = 0
@@ -1137,8 +1184,15 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
                 answer = with_edges(ge, task, r, answer)
             if english and r["task"] in english:
                 answer = {**answer, "explanation": english[r["task"]]}
+            ops = {}
+            for k, goal in enumerate(r.get("edits") or [], 1):
+                t = (edits or {}).get(edit_eval.EditEval.key(r["task"], goal), {}).get("teacher") or {}
+                if t.get("edit"):
+                    ops[k] = [edit_eval._from_json(o) for o in t["edit"]]
+            if len(ops) < len(r.get("edits") or []):
+                continue  # an answer without an EDIT line for a request is invalid: no target for it
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
-                                "completion": [{"role": "assistant", "content": target(answer, r, task["model"])}],
+                                "completion": [{"role": "assistant", "content": target(answer, r, task["model"], ops)}],
                                 "info": {"task": r["task"]}}) + "\n")
             f.flush()
             n += 1
@@ -1307,7 +1361,7 @@ def _paired(a: list, b: list) -> dict:
 
 
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
-             diagnostics: bool = False, log=print) -> dict:
+             diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -1335,7 +1389,8 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                 continue
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
             cache = {}
-            scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache)
+            scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
+                            ee=ee, edit_best=edit_best)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -1425,6 +1480,10 @@ def main():
     rr = sub.add_parser("rerender", help="the rows with their question text written again by this question() (no model runs)")
     rr.add_argument("rows", type=Path)
     rr.add_argument("out", type=Path)
+    ed = sub.add_parser("edits", help="the rows with edit requests (edit_eval.goals: flip, raise, detach) and their question again")
+    ed.add_argument("rows", type=Path)
+    ed.add_argument("out", type=Path)
+    ed.add_argument("--qa-seed", type=int, default=0, help="added to each text's seed (0 the discovery draw, 1 a fresh one)")
     rq = sub.add_parser("requestion", help="the same rows with a fresh set of intervention questions (only they are measured)")
     rq.add_argument("rows", type=Path)
     rq.add_argument("out", type=Path)
@@ -1468,6 +1527,7 @@ def main():
     d.add_argument("teacher", type=Path)
     d.add_argument("out", type=Path)
     d.add_argument("--english", type=Path, help="tinker_train.py explain output: each text's chosen explanation")
+    d.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (the edit teacher's edits)")
     s = sub.add_parser("evaluate")
     s.add_argument("split", choices=("train", "heldout", "hard"))
     s.add_argument("rows", type=Path, help="questions' JSONL (a fresh QA seed for a report, the discovery one for selection)")
@@ -1477,6 +1537,7 @@ def main():
     s.add_argument("--labels", type=Path, help="locality JSONL: every figure also for local and non-local texts")
     s.add_argument("--diagnostics", action="store_true", help="structure() of each first sample (slow)")
     s.add_argument("--out", type=Path)
+    s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output: the best net per goal (E3)")
     args = ap.parse_args()
     import goal_eval
     import native
@@ -1492,7 +1553,8 @@ def main():
         node_only = any(json.loads(f.read_text()).get("edges") in (None, []) for f in sorted(args.teacher.glob("*.json")))
         english = {r["task"]: r["explanation"] for r in map(json.loads, args.english.read_text().splitlines())
                    if r.get("explanation")} if args.english else None
-        print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval() if node_only else None, english), "rows", flush=True)
+        print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval() if node_only else None, english,
+                      edit_teach(args.edit_teach) if args.edit_teach else None), "rows", flush=True)
         return
     if args.cmd == "facts":
         ge = goal_eval.GoalEval(native.Native(args.device))
@@ -1611,6 +1673,18 @@ def main():
                 f.write(json.dumps(info) + "\n")
             print(info, flush=True)
         return
+    if args.cmd == "edits":
+        import edit_eval
+
+        ee = edit_eval.EditEval(nat)
+        with args.out.open("w") as f:
+            for r in map(json.loads, args.rows.read_text().splitlines()):
+                task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+                r["edits"] = edit_eval.goals(ee, task, native.task_seed(task["id"]) + args.qa_seed)
+                f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
+                f.flush()
+                print(r["task"], [g["kind"] for g in r["edits"]], flush=True)
+        return
     if args.cmd == "requestion":
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
@@ -1645,7 +1719,13 @@ def main():
     for k, v in (x.split("=", 1) for x in args.e1):
         e1[k] = {r["task"]: r for r in map(json.loads, Path(v).read_text().splitlines())}
     labels = {r["task"]: r for r in map(json.loads, args.labels.read_text().splitlines())} if args.labels else None
-    out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics)
+    ee = edit_best = None
+    if any(r.get("edits") for r in rows.values()):
+        import edit_eval
+
+        ee = edit_eval.EditEval(nat)
+        edit_best = {k: ((r.get("teacher") or {}).get("score") or {}).get("net") for k, r in edit_teach(args.edit_teach).items()}
+    out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

@@ -70,7 +70,9 @@ def active(vpd: VM.VPD, names: list[str], ids: torch.Tensor) -> torch.Tensor:
 
 
 def activity(args):
-    """Per layer, every subcomponent's active positions on both splits, and split A's per-layer Gram matrix."""
+    """Per layer, every subcomponent's active positions on both splits, and split A's per-layer Gram matrix. The
+    pass writes its (subcomponent, position) pairs to chunk files as it goes; `finish` turns them into the
+    compressed rows (a crash after the pass loses nothing)."""
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     dev = args.device
@@ -80,11 +82,14 @@ def activity(args):
     per_layer = sum(vpd.C[n] for n in names[:6])
     for split, spec, gram in (("train", args.train, True), ("heldout", args.heldout, False)):
         r0, r1 = rows(spec)
+        chunks = out / f"chunks_{split}"
+        if (out / f"activity_{split}_L3.npz").exists():
+            continue
+        chunks.mkdir(exist_ok=True)
         tokens = VM.val_tokens(r1 - r0, T, r0)
         G = [torch.zeros(per_layer, per_layer, device=dev) for _ in range(4)] if gram else None
-        comp = [[] for _ in range(4)]
-        pos = [[] for _ in range(4)]
-        t0 = time.time()
+        comp, pos = [[] for _ in range(4)], [[] for _ in range(4)]
+        t0, part = time.time(), 0
         for b0 in range(0, tokens.shape[0], args.batch):
             on = active(vpd, names, tokens[b0:b0 + args.batch].to(dev))
             B = on.shape[0]
@@ -96,20 +101,48 @@ def activity(args):
                 p, c = x.nonzero(as_tuple=True)
                 comp[layer].append(c.to(torch.int16).cpu().numpy())
                 pos[layer].append((p + b0 * (T - 1)).to(torch.int32).cpu().numpy())
-            if (b0 // args.batch) % 25 == 24 or b0 + args.batch >= tokens.shape[0]:
+            last = b0 + args.batch >= tokens.shape[0]
+            if (b0 // args.batch) % 25 == 24 or last:
+                for layer in range(4):
+                    np.savez(chunks / f"L{layer}_{part:04d}.npz", comp=np.concatenate(comp[layer]), pos=np.concatenate(pos[layer]))
+                comp, pos, part = [[] for _ in range(4)], [[] for _ in range(4)], part + 1
                 done = min(b0 + args.batch, tokens.shape[0])
                 print(f"{time.strftime('%H:%M:%S')} {split}: {done}/{tokens.shape[0]} sequences, "
                       f"{done / (time.time() - t0):.2f}/s", flush=True)
-        for layer in range(4):
-            c = np.concatenate(comp[layer]).astype(np.int64)
-            p = np.concatenate(pos[layer])
-            order = np.argsort(c, kind="stable")  # positions stay ascending within a subcomponent
-            counts = np.bincount(c, minlength=per_layer)
-            np.savez(out / f"activity_{split}_L{layer}.npz", indptr=np.concatenate([[0], np.cumsum(counts)]).astype(np.int64),
-                     positions=p[order], N=np.int64(tokens.shape[0] * (T - 1)), rows=np.array([r0, r1]))
-            if gram:
+        if gram:
+            for layer in range(4):
                 np.save(out / f"gram_L{layer}.npy", G[layer].cpu().numpy())
+            del G
+        (chunks / "DONE").write_text(json.dumps({"rows": [r0, r1], "N": int(tokens.shape[0] * (T - 1)), "parts": part}))
         print(f"{split}: {time.time() - t0:.0f} s", flush=True)
+    del vpd, target
+    finish(out, per_layer)
+
+
+def finish(out: Path, per_layer: int = 9728):
+    """The chunk files of each finished split as compressed rows per layer (positions ascending per subcomponent)."""
+    for split in ("train", "heldout"):
+        chunks = out / f"chunks_{split}"
+        if not (chunks / "DONE").exists():
+            continue
+        done = json.loads((chunks / "DONE").read_text())
+        for layer in range(4):
+            if (out / f"activity_{split}_L{layer}.npz").exists():
+                continue
+            files = [chunks / f"L{layer}_{k:04d}.npz" for k in range(done["parts"])]
+            cs, ps = [], []
+            for f in files:
+                with np.load(f) as z:
+                    cs.append(z["comp"])
+                    ps.append(z["pos"])
+            c, p = np.concatenate(cs), np.concatenate(ps)
+            del cs, ps
+            order = np.argsort(c, kind="stable")  # positions stay ascending within a subcomponent
+            counts = np.bincount(c.astype(np.int64), minlength=per_layer)
+            np.savez(out / f"activity_{split}_L{layer}.npz", indptr=np.concatenate([[0], np.cumsum(counts)]).astype(np.int64),
+                     positions=p[order], N=np.int64(done["N"]), rows=np.array(done["rows"]))
+            del c, p, order
+            print(f"{split} L{layer}: {int(counts.sum())} active (subcomponent, position) pairs", flush=True)
 
 
 class Activity:
@@ -409,8 +442,10 @@ def main():
     a.add_argument("--device", default="mps")
     b = sub.add_parser("build")
     b.add_argument("--out", default=str(DEFAULT))
+    f = sub.add_parser("finish")
+    f.add_argument("--out", default=str(DEFAULT))
     args = ap.parse_args()
-    activity(args) if args.cmd == "activity" else build(args)
+    {"activity": activity, "build": build, "finish": lambda a: finish(Path(a.out))}[args.cmd](args)
 
 
 if __name__ == "__main__":

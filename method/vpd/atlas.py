@@ -501,6 +501,8 @@ def lookahead(args):
         cuts.append(k)
         need[on_at[k]] -= 1
     print(f"{len(cand)} candidate positions, {len(cuts)} cuts", flush=True)
+    if args.dry:
+        return
     dev = args.device
     target = VM.load_target(dev)
     vpd = VM.load_vpd(target, dev)
@@ -650,6 +652,7 @@ def main():
     k.add_argument("--need", type=int, default=2)
     k.add_argument("--batch", type=int, default=8)
     k.add_argument("--device", default="mps")
+    k.add_argument("--dry", action="store_true", help="only count the cuts")
     args = ap.parse_args()
     {"build": build, "show": show, "lookahead": lookahead}[args.cmd](args)
 

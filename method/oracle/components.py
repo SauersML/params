@@ -532,6 +532,20 @@ def qa_score(questions: list[dict], finals: dict, tokens_of) -> float | None:
     return right / len(questions)
 
 
+def qa_term(questions: list[dict], finals: dict, tokens_of, top: str) -> float | None:
+    """E2: the share of questions answered right (qa_score) measured from the share right0 of the no-change answer
+    (every question answered falls=no, top=the model's prediction on the text, `top`): (right - right0) / (1 - right0),
+    clipped to [-1, 1]. 0 for an answer that says nothing changes, 1 for every question right (E1 is likewise measured
+    from no English). None without questions, or when the no-change answer is right on all of them."""
+    right = qa_score(questions, finals, tokens_of)
+    if right is None:
+        return None
+    right0 = qa_score(questions, {n: (False, shown(top)) for n in range(1, len(questions) + 1)}, tokens_of)
+    if right0 >= 1.0:
+        return None
+    return max(-1.0, min(1.0, (right - right0) / (1.0 - right0)))
+
+
 # ---- the question
 
 
@@ -868,7 +882,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     KL_C) / ln(KL_empty / KL_VPD) in [0, 1], between the empty circuit and VPD's own answer); N, goal_eval's n (what
     VPD's own answer loses without the circuit, ln(KL_{VPD minus C} / KL_VPD) / ln(KL_empty / KL_VPD) in [0, 1]); F3, the
     AUC of stated edges' cuts in the circuit's run (0 without a stated edge); E1, the reader's bits saved (in [-1, 1];
-    with a reader or e1); E2, the share of questions answered right. A term goal_eval cannot give (no causal-importance
+    with a reader or e1); E2, the questions answered right measured from the no-change answer (qa_term). A term goal_eval cannot give (no causal-importance
     network for VPD's bounds) is left out of the mean. reader: a reader.Reader for E1, or e1: each text's reader bits
     computed by the caller (e1_bits(); a Tinker reader lives with the policy); ev: the text's evidence(); cache: task
     -> goal_eval.Text, kept between calls."""
@@ -902,7 +916,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         uniq = list(dict.fromkeys(texts[i] for i in keep))
         bits = dict(zip(uniq, e1_bits(reader, task, ev, uniq)))
     ge.hooks = {"E1": (lambda task, g, x: bits.get(x)) if (reader is not None or e1 is not None) else None,
-                "E2": lambda task, g, x: qa_score(ev["qa"], parse(x)["finals"], tok)}
+                "E2": lambda task, g, x: qa_term(ev["qa"], parse(x)["finals"], tok, prompt["model_top"][0][0][0])}
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
     scale = ev["active"] * math.log2(nat.positions(targets) * total)
     out = []
@@ -1431,6 +1445,7 @@ def main():
     pr.add_argument("--lengths", default="0:100000")
     pr.add_argument("--tasks", type=Path, help="JSONL of {task[, local]}: only these texts, in this order; a given label skips locality()")
     pr.add_argument("--tokenizer", default="Qwen/Qwen3-8B")
+    pr.add_argument("--rows-only", action="store_true", help="no interim teacher (teacher.py's circuits are the teachers)")
     tp = sub.add_parser("teacher-path", help="teachers from pruning paths (path_teacher()), and per text the better of it and VPD's")
     tp.add_argument("rows", type=Path)
     tp.add_argument("paths", type=Path, help="teacher.py's output directory (<task>.path.json)")
@@ -1544,10 +1559,12 @@ def main():
                 continue
             ev = evidence(nat, ge, task, conn, atlas=atlas)
             row = {**ev, "question": question(task, ev)}
-            answer, info = vpd_teacher(ge, task, row, count, cache={})
-            (args.out / "teacher" / f"{p.stem}.json").write_text(json.dumps(answer))
-            with (args.out / "teacher" / "summary.jsonl").open("a") as f:
-                f.write(json.dumps({**info, "local": labels[p.stem]["local"]}) + "\n")
+            info = None
+            if not args.rows_only:
+                answer, info = vpd_teacher(ge, task, row, count, cache={})
+                (args.out / "teacher" / f"{p.stem}.json").write_text(json.dumps(answer))
+                with (args.out / "teacher" / "summary.jsonl").open("a") as f:
+                    f.write(json.dumps({**info, "local": labels[p.stem]["local"]}) + "\n")
             with files["rows"].open("a") as f:
                 f.write(json.dumps(row) + "\n")
             kept.add(p.stem)

@@ -121,6 +121,18 @@ def test_qa_score():
     assert components.qa_score([], {}, tok) is None
 
 
+def test_qa_term_is_measured_from_the_no_change_answer():
+    qs = [{"falls": True, "top": 0}, {"falls": False, "top": 1}]  # the model predicts t1 on the text
+    tok = lambda ids: [f"t{i}" for i in ids]  # noqa: E731
+    still = {1: (False, "'t1'"), 2: (False, "'t1'")}  # the no-change answer: right on question 2 alone (0.5)
+    assert components.qa_term(qs, still, tok, "t1") == 0.0
+    assert components.qa_term(qs, {1: (True, "'t0'"), 2: (False, "'t1'")}, tok, "t1") == 1.0
+    assert components.qa_term(qs, {1: (False, "'t0'")}, tok, "t1") == -0.5  # 0.25 right: below no change
+    assert components.qa_term(qs, {}, tok, "t1") == -1.0  # no FINAL answers right: clipped
+    assert components.qa_term([qs[1]], {1: (False, "'t1'")}, tok, "t1") is None  # no change is right on everything
+    assert components.qa_term([], {}, tok, "t1") is None
+
+
 class NoWiring:
     names = []
 
@@ -155,7 +167,12 @@ def test_reward_on_tiny_model(tiny):
     got = components.reward(ge, task, ev, [good, bad, missing, good], truncated=[False, False, False, True])
     assert got[0]["valid"] and invalid < got[0]["reward"] <= 1.0
     assert all(got[0][f"term_{k}"] is None or 0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("F1", "N", "F3"))
-    assert got[0]["term_E2"] == (0.5 if ev["qa"] else None)  # every "falls" right, no top token "x"
+    tok = lambda xs: components.token_strings(task["model"], xs)  # noqa: E731
+    right0 = sum(0.5 * (not q["falls"]) + 0.5 * (tok([q["top"]])[0] == " the") for q in ev["qa"]) / max(len(ev["qa"]), 1)
+    if ev["qa"] and right0 < 1.0:  # every "falls" right and no top token "x" (0.5 right), measured from no change
+        assert got[0]["term_E2"] == pytest.approx(max(-1.0, min(1.0, (0.5 - right0) / (1.0 - right0))))
+    else:
+        assert got[0]["term_E2"] is None
     assert got[1]["valid"] and got[1]["dropped_edges"] == 1 and got[1]["size"] > got[0]["size"]
     assert (not got[2]["valid"]) == bool(ev["qa"]) and not got[3]["valid"] and got[3]["reward"] == invalid
 

@@ -134,19 +134,21 @@ class Target(nn.Module):
     def forward(self, ids: Tensor) -> Tensor:
         return self.hidden(ids) @ self.wte.T
 
-    def hidden(self, ids: Tensor, start: int = 0, prefix: list | None = None, layer: int = 0) -> Tensor:
+    def hidden(self, ids: Tensor, start: int = 0, prefix: list | None = None, layer: int = 0, fused: bool = False) -> Tensor:
         """The final normed residual stream [B, T, d]; the logits are it times the tied embedding. With start > 0 and
         prefix (keys_values() of a sequence that has ids' tokens before start), the projections and the MLP run only on
         the positions from start, the prefix's queries, keys and values standing before them in an attention of the
         whole length (the same call, so the same numbers as the whole forward; the prefix computed at the same batch
         size, whose attention can round differently): [B, T - start, d]. With layer > 0 the layers below it are the
-        prefix's too (its residual stream entering that layer, at every position from start)."""
+        prefix's too (its residual stream entering that layer, at every position from start). fused: the norms and the
+        GELU as torch's single kernels (_steps), equal to rms and gelu_tanh within float32 rounding, not to the bit."""
         B, T = ids.shape
         L = T - start
+        norm, act = self._steps(fused)
         x = self.wte[ids[:, start:]] if layer == 0 else prefix[layer][3][:, start:]
         for i in range(layer, self.n_layer):
             s = lambda k: self.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
-            h = rms(x, self.norms[2 * i], self.eps)
+            h = norm(x, self.norms[2 * i])
             q = s("q_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
             k = s("k_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
             v = s("v_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
@@ -158,9 +160,16 @@ class Target(nn.Module):
                 q, k = self._rope(q, T), self._rope(k, T)
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             x = x + s("o_proj")(y.transpose(1, 2).reshape(B, L, -1))
-            h = rms(x, self.norms[2 * i + 1], self.eps)
-            x = x + s("down_proj")(gelu_tanh(s("c_fc")(h)))
-        return rms(x, self.ln_f, self.eps)
+            h = norm(x, self.norms[2 * i + 1])
+            x = x + s("down_proj")(act(s("c_fc")(h)))
+        return norm(x, self.ln_f)
+
+    def _steps(self, fused: bool):
+        """(norm(x, w), GELU(x)): vpd_model's own rms and gelu_tanh, or torch's fused RMS norm and tanh GELU (the same
+        functions in one kernel each: on MPS the GELU of a [32, 395, 3072] batch takes 3 ms instead of 55)."""
+        if fused:
+            return (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, self.eps)), (lambda x: F.gelu(x, approximate="tanh"))
+        return (lambda x, w: rms(x, w, self.eps)), gelu_tanh
 
     def _rope_from(self, x: Tensor, start: int, T: int) -> Tensor:
         """_rope of positions start..T-1."""
@@ -168,15 +177,16 @@ class Target(nn.Module):
         rot = torch.cat([-x[..., n:], x[..., :n]], dim=-1)
         return x * self.cos[start:T] + rot * self.sin[start:T]
 
-    def keys_values(self, ids: Tensor) -> list:
+    def keys_values(self, ids: Tensor, fused: bool = False) -> list:
         """Each layer's rotated queries and keys, its values [B, H, T, hd] and the residual stream entering it [B, T, d]
-        on sequences [B, T] (hidden()'s prefix)."""
+        on sequences [B, T] (hidden()'s prefix; fused as there)."""
         B, T = ids.shape
+        norm, act = self._steps(fused)
         x = self.wte[ids]
         out = []
         for i in range(self.n_layer):
             s = lambda k: self.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
-            h = rms(x, self.norms[2 * i], self.eps)
+            h = norm(x, self.norms[2 * i])
             q = s("q_proj")(h).view(B, T, self.n_head, self.hd).transpose(1, 2)
             k = s("k_proj")(h).view(B, T, self.n_head, self.hd).transpose(1, 2)
             v = s("v_proj")(h).view(B, T, self.n_head, self.hd).transpose(1, 2)
@@ -184,8 +194,8 @@ class Target(nn.Module):
             out.append((q, k, v, x))
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             x = x + s("o_proj")(y.transpose(1, 2).reshape(B, T, -1))
-            h = rms(x, self.norms[2 * i + 1], self.eps)
-            x = x + s("down_proj")(gelu_tanh(s("c_fc")(h)))
+            h = norm(x, self.norms[2 * i + 1])
+            x = x + s("down_proj")(act(s("c_fc")(h)))
         return out
 
 

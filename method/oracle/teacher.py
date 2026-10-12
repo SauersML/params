@@ -63,6 +63,8 @@ class Pruner:
     """Measured removal over the nodes of a circuit on one text. Nodes are (matrix, position, index); a block is a list
     of node ids; kl(blocks) measures the current circuit without each block, in batches of B."""
 
+    fused = True  # the masked runs' norms and GELU as torch's fused kernels (Target.hidden(fused=)): float32-close
+
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, start: dict, live: bool = False, B: int = 32):
         self.ge, self.tx, self.live, self.B = ge, tx, live, B
         nat = ge.nat
@@ -118,7 +120,7 @@ class Pruner:
             st.delta_mask = torch.ones(B, T - start, device=nat.dev) if self.live else None
         ids = torch.tensor([self.tx.ids], device=nat.dev).expand(B, -1)
         try:
-            return tg.keys_values(ids) if keys_values else tg.hidden(ids, start, prefix, layer)
+            return tg.keys_values(ids, self.fused) if keys_values else tg.hidden(ids, start, prefix, layer, self.fused)
         finally:
             nat.vpd.clear()
 

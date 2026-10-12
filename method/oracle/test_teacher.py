@@ -1,6 +1,7 @@
 """Checks of teacher.py on a held-out vpd4l text (skipped without ~/mpd-data's model and an MPS device): the windowed
-masked runs (Pruner.kl_sets on a Native.WINDOW_EXACT device) equal the whole runs, and the products on VPD's answer's
-subcomponents alone (Pruner._gather) match the products on all of them within float32 rounding.
+masked runs (Pruner.kl_sets on a Native.WINDOW_EXACT device) equal the whole runs, and the products on the start
+set's subcomponents alone (Pruner._gather) with torch's fused norms and GELU (Pruner.fused) match the products on all
+subcomponents with vpd_model's own steps within float32 rounding.
 
   ~/.local/bin/mem-lease 24 ~/mpd-data/venv/bin/python -m pytest method/oracle/test_teacher.py -s
 """
@@ -63,6 +64,7 @@ def test_gathered_products_match_full_products():
     gathered = pr.kl_sets(trials)
     pr.cols = [(torch.arange(nat.C[n], device=nat.dev)[pr.c[pr.sel[j]]], (nat.target.site(n).V, nat.target.site(n).U))
                for j, n in enumerate(pr.names)]                 # every column: the full products
+    pr.fused = False                                            # vpd_model's own norms and GELU
     pr._prefixes = {}
     full = pr.kl_sets(trials)
     a, b = torch.tensor(full, dtype=torch.float64), torch.tensor(gathered, dtype=torch.float64)

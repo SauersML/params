@@ -24,8 +24,7 @@ for l in open('$DIR/checkpoints.jsonl'):
   (cd $SRC/method/oracle/rl &&
    $TPY -u tinker_train.py sample $DIR/heldout.jsonl $DIR/heldout_${STEP}_samples.jsonl --init "$STATE" --base $BASE \
      --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK &&
-   $TPY -u tinker_train.py readers $DIR/heldout_${STEP}_samples.jsonl $DIR/heldout.jsonl $DIR/heldout_${STEP}_e1.jsonl \
-     --reader-b Qwen/Qwen3.5-4B) < /dev/null  # the loop reads the checkpoints from stdin
+   $TPY -u tinker_train.py readers $DIR/heldout_${STEP}_samples.jsonl $DIR/heldout.jsonl $DIR/heldout_${STEP}_e1.jsonl) < /dev/null  # the loop reads the checkpoints from stdin
   P=rl-$(basename $DIR)-$STEP  # C's families run on a rented GPU (eval_pod.sh), too slow and too large for the Mac
   (cd $SRC && bash experiments/oracle/pods/eval_pod.sh $P $DIR/heldout.jsonl $LABELS \
      rl=$DIR/heldout_${STEP}_samples.jsonl:$DIR/heldout_${STEP}_e1.jsonl > $DIR/heldout_${STEP}_pod.log 2>&1) < /dev/null

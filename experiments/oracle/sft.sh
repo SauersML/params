@@ -38,7 +38,7 @@ cd $SRC/method/oracle/rl
 $TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEPS --batch $BATCH ${LR:+--lr $LR} --name sft-$RUN
 STATE=$($PY -c "import json; print(json.load(open('$S/sft/state.json'))['state'])")
 $TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE" --base $BASE --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK
-$TPY -u tinker_train.py readers $S/samples.jsonl $S/heldout.jsonl $S/e1.jsonl --reader-b Qwen/Qwen3.5-4B
+$TPY -u tinker_train.py readers $S/samples.jsonl $S/heldout.jsonl $S/e1.jsonl
 unset TINKER_API_KEY
 cd $SRC
 Z=${ZEROSHOT:-$O/zeroshot_heldout20/cst}  # the untrained Qwen3-8B's answers to these questions, scored by the same reward

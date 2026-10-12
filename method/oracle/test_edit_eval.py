@@ -212,8 +212,9 @@ def test_score_fields(tiny):
     assert r["valid"] and r["attained"] == (r["margin"] < 0)
 
 
-def test_search_reaches_a_flip(tiny):
-    """The teacher's search on the tiny model: an edit that flips the top token, no larger than needed."""
+def test_search_maximizes_net(tiny):
+    """The teacher's search on the tiny model: its edit has at least the net bits of every single candidate, and
+    dropping any of its operations lowers net."""
     nat, ids, targets = tiny
     ee = edit_eval.EditEval(nat)
     task = {"id": "tiny", "prompts": [{"token_ids": ids, "target_positions": targets}]}
@@ -221,11 +222,13 @@ def test_search_reaches_a_flip(tiny):
     flip = {"kind": "flip", "token_id": int(lp.argmax()), "target": 11}
     nodes = [(n, t, c) for n in nat.names for t in (9, 10, 11) for c in range(nat.C[n])]
     pool = [edit_eval.scale_op(nd, k) for nd in nodes for k in edit_eval.NODE_SCALES]
-    res = edit_eval.search(lambda eds: ee.score_many(task, flip, eds, search=True), pool, log=lambda s: None)
-    assert res["row"]["attained"]
-    for i in range(len(res["ops"])):  # every edit is needed
+    score = lambda eds: ee.score_many(task, flip, eds, search=True)  # noqa: E731
+    res = edit_eval.search(score, pool, log=lambda s: None)
+    singles = max(r["net"] for r in score([[c] for c in pool]) if r["valid"])
+    assert res["row"]["net"] >= singles - 1e-6 and res["row"]["net"] > 0
+    for i in range(len(res["ops"])):
         rest = res["ops"][:i] + res["ops"][i + 1:]
-        assert not rest or not ee.score(task, flip, rest)["attained"]
+        assert not rest or score([rest])[0]["net"] < res["row"]["net"] + 1e-6
 
 
 def test_detach_dependence(tiny):

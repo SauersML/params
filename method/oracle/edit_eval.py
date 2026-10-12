@@ -55,9 +55,9 @@ Score (EditEval.score_many), in bits, on data the teacher's search never used:
   edit_eval.py rescore OUT.jsonl NEW.jsonl                       teach rows' edits scored again by the current scorer
 
 The edit teacher (teach()) is a measured greedy search over candidate edits from the teacher's circuits (goal_eval JSON
-files, TEACHER_DIRS) and VPD's most important subcomponents: each round adds the candidate that moves the goal most
-(ties: least collateral), until the goal is attained or no candidate helps; then drops every edit the goal does not
-need (least collateral first) and replaces single edits by others that keep the goal with less collateral. A
+files, TEACHER_DIRS) and VPD's most important subcomponents for the most net bits (goal_bits - collateral, what E3
+compares): each round adds the candidate that raises net most, until none does; then drops every edit whose removal
+does not lower net and replaces single edits by others that raise it. A
 persistent goal can be reached by breaking the model, so its search (frontier()) adds the candidate with the most
 progress per bit of collateral and size each round and keeps every step: a path of progress against collateral. Every
 search number is measured on the search's own data (alternatives ranks 0 to 2, the copy set's first half, SEARCH_ROWS
@@ -839,53 +839,47 @@ def _better(a: dict, b: dict | None) -> bool:
 
 
 def search(score, pool: list[dict], max_ops: int = MAX_OPS, screen: int = SCREEN, log=print) -> dict:
-    """The edit teacher's measured greedy search (module docstring). score(list of edits) -> rows (EditEval.score_many
-    with search=True). Returns {"ops", "row" (the search's numbers), "rounds", "evaluated"}."""
+    """The edit teacher's measured greedy search (module docstring) for the most net bits (goal_bits - collateral, the
+    quantity E3 compares): each round adds the candidate that raises net most, until none raises it; then drops every
+    edit whose removal does not lower net and replaces single edits by others that raise it. score(list of edits) ->
+    rows (EditEval.score_many with search=True). Returns {"ops", "row" (the search's numbers), "rounds", "evaluated"}."""
     S, cur, evaluated, rounds = [], None, 0, []
+    net = lambda row: row["net"] if row and row["valid"] else -math.inf  # noqa: E731
     for r in range(max_ops):
         trial = [S + [c] for c in pool]
         rows = score(trial)
         evaluated += len(trial)
-        good = [i for i, row in enumerate(rows) if row["valid"]]
-        if not good:
+        ranked = sorted((i for i, row in enumerate(rows) if row["valid"]), key=lambda i: -net(rows[i]))
+        if not ranked:
             break
-        ranked = sorted(good, key=lambda i: (-rows[i]["progress"], rows[i]["collateral"]))
         if r == 0:
             pool = [pool[i] for i in ranked[:screen]]
             rows = [rows[i] for i in ranked[:screen]]
             ranked = list(range(len(pool)))
         best = ranked[0]
-        if cur is not None and rows[best]["progress"] <= cur["progress"] + 1e-6:
+        if cur is not None and net(rows[best]) <= net(cur) + 1e-6:
             break
         S, cur = S + [pool[best]], rows[best]
-        rounds.append({"op": op_text(pool[best]), "progress": cur["progress"], "collateral": cur["collateral"]})
-        log(f"  round {r}: {op_text(pool[best])} -> progress {cur['progress']:.3f} collateral {cur['collateral']:.3f}")
+        rounds.append({"op": op_text(pool[best]), "progress": cur["progress"], "collateral": cur["collateral"], "net": cur["net"]})
+        log(f"  round {r}: {op_text(pool[best])} -> progress {cur['progress']:.3f} collateral {cur['collateral']:.3f} net {cur['net']:.3f}")
         pool = [c for j, c in enumerate(pool) if j != best]
-        if cur["attained"]:
-            break
     if cur is None:
         return {"ops": [], "row": None, "rounds": rounds, "evaluated": evaluated}
-
-    def keeps(row):  # what the search reached stays reached
-        return row["valid"] and (row["attained"] if cur["attained"] else row["progress"] >= cur["progress"] - 1e-6)
-
-    while len(S) > 1:  # drop what the goal does not need, least collateral first
+    while len(S) > 1:  # drop what does not add net bits, the one whose removal leaves the most first
         trial = [S[:i] + S[i + 1:] for i in range(len(S))]
         rows = score(trial)
         evaluated += len(trial)
-        ok = [i for i in range(len(S)) if keeps(rows[i])]
-        if not ok:
+        i = max(range(len(S)), key=lambda i: net(rows[i]))
+        if net(rows[i]) < net(cur) - 1e-6:
             break
-        i = min(ok, key=lambda i: rows[i]["collateral"])
         S, cur = trial[i], rows[i]
-    for i in range(len(S)):  # swap single edits for ones that keep the goal with less collateral
+    for i in range(len(S)):  # swap single edits for ones with more net bits
         others = [c for c in pool if c not in S]
         trial = [S[:i] + [c] + S[i + 1:] for c in others]
         rows = score(trial)
         evaluated += len(trial)
-        ok = [j for j in range(len(trial)) if keeps(rows[j]) and rows[j]["collateral"] < cur["collateral"]]
-        if ok:
-            j = min(ok, key=lambda j: rows[j]["collateral"])
+        j = max(range(len(trial)), key=lambda j: net(rows[j]), default=None)
+        if j is not None and net(rows[j]) > net(cur) + 1e-6:
             S, cur = trial[j], rows[j]
     return {"ops": S, "row": cur, "rounds": rounds, "evaluated": evaluated}
 

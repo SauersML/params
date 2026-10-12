@@ -1,81 +1,171 @@
-%% TEAM COORDINATION MAP — edit this source, never plan.png. All agents may edit.
-%% Read top to bottom: dependencies → decision gates → deliverables → impact.
-%% Before starting work: claim/update its owner and state here; check for an existing owner.
-%% Every task must state WHY, its concrete OUTPUT, and the downstream DECISION/HANDOFF.
-%% On evidence or direction changes: update the node AND its dependencies, then push main.
-%% Coordinate overlapping edits; preserve other agents' changes. No disconnected busywork.
-%% READY means dependencies passed; ACTIVE means underway; CHECK means evidence still needed.
-%% IMPLEMENTED means code exists, not that the scientific claim is established.
-%% Gate failures route effort to the named repair; never silently advance to more training.
-%% Current owners below retain existing team assignments; codex owns calibration/input audit.
-%% Rendering: .github/workflows/plan-render.yml writes plan.png and image-only README.md.
+%% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
+%% Read bottom to top: foundations, workstreams, decision gates, training, capabilities, impact.
+%% An arrow means "is needed for". Dashed arrows: a check feeds in, or a fallback route.
+%% One unit per box. Never put a sequence or an arrow inside a box: split it into boxes and edges.
+%% Each box: bold title, why or what it decides (1-2 lines), status and owner. About 34 characters
+%% a line, explicit <br/> breaks, 3-5 lines.
+%% Before starting work: find its box, claim it (owner), set its class. When a gate passes or fails,
+%% or evidence changes, update the box and what it feeds, then push main.
+%% Statuses: done, active, check (evidence still needed), blocked, waiting, later, gate.
+%% Preserve other agents' edits; merge, never overwrite.
+%% Rendering: .github/workflows/plan-render.yml writes plan/plan.png and the image-only README block.
 %% Local preview: mem-lease 2 npx -y @mermaid-js/mermaid-cli@11.4.2 -i plan/plan.mmd -o /tmp/oracle-plan.png -c plan/mermaid.json -b white -s 2
-flowchart TB
-  NORTH["<b>THE ORACLE · WHY THIS WORK EXISTS</b><br/>Explain how model weights produce behavior<br/>Deliver a small executable circuit + faithful English<br/>Use it to answer questions and predict useful edits"]
-  NOW["<b>COORDINATE AROUND THE NEXT DECISION</b><br/>Can we supply learnable, faithful targets and score them honestly?<br/>Priority: resolve these gates before buying another training run<br/>Updated 2026-10-12 · owners and handoffs below"]
-  NORTH --> NOW
+flowchart BT
 
-  subgraph READY["01 · ESTABLISH WHAT THE ORACLE CAN LEARN"]
-    direction LR
-    INPUT["<b>INPUT COVERAGE · CHECK</b><br/>codex + rustmove → training owner<br/>Audit: old prompts expose 14% of targets<br/>Output: coverage AFTER context fitting<br/>Decides: pool, representation, or tools"]
-    TEACH["<b>TEACHER QUALITY · ACTIVE</b><br/>pymove + fleet → training owner<br/>Why: imitation cannot fix false targets<br/>Output: unseen-change fidelity + size<br/>Repair overfit draws and missing backups"]
-    SCORE["<b>REWARD CALIBRATION · ACTIVE</b><br/>codex + inframove + generality → primerl<br/>Pilot: old teacher below bar on 4 of 4<br/>Gate B FAIL: empty-like earns +4.75<br/>NEXT: low bar + omitted-family policy"]
+  %% ===================== impact =====================
+  subgraph WHY["WHY THIS WORK EXISTS"]
+    IMPA["<b>Ambitious impact</b><br/>understand the algorithms<br/>that model weights implement"]
+    IMPP["<b>Practical impact</b><br/>reliable audits, behavior<br/>explanations, targeted edits"]
   end
-  NOW --> INPUT
-  NOW --> TEACH
-  NOW --> SCORE
 
-  DATA["<b>GATE A · TRAINABLE TARGETS?</b><br/>Teacher passes independent interventions;<br/>required parts observable; input + output fit<br/>PASS → small SFT · FAIL → repair input/search<br/>primerl accepts evidence from both owners"]
-  RANK["<b>GATE B · FAILED: REPAIR BEFORE RL</b><br/>9001: five nodes predict like empty, reward +4.75<br/>A weak baseline unlocks size reward;<br/>missing node-family score changes comparison<br/>Rerun faithful vs corrupt controls after repair"]
-  INPUT --> DATA
-  TEACH --> DATA
-  SCORE --> RANK
+  DELIV["<b>Deliverable: a reusable recipe</b><br/>trained oracle, verifier,<br/>reproducible recipe, stated limits"]
+  GATED{{"<b>Gate D</b> · independent evidence<br/>new texts and mechanisms, same-budget<br/>baselines, ablations; recipe frozen<br/>before the sealed texts 9100–9149"}}
 
-  SFT["<b>SMALL SFT · WAITING ON A</b><br/>primerl · existing capable model<br/>Output: first-sample circuits on fresh dev<br/>Compare search, VPD top-k and simple rules<br/>Why: test learned inference before RL"]
-  LEARN["<b>GATE C · DOES LEARNING ADD VALUE?</b><br/>Beats trivial baselines on fidelity vs size;<br/>uses mechanism evidence, not text alone<br/>PASS → staged RL · FAIL → tools/search route<br/>Dev only; never select on the sealed set"]
-  TOOLS["<b>TOOLS + SEARCH ROUTE · PROTOTYPE</b><br/>primerl + codex → same quality gate<br/>Measure parts on demand; explain found circuits<br/>Why: useful output if direct inference fails<br/>Benchmark quality, latency and call cost"]
-  DATA --> SFT --> LEARN
-  INPUT -. representation option .-> TOOLS
-  LEARN -. if inference fails .-> TOOLS
-
-  RL["<b>STAGED RL · WAITING ON B + C</b><br/>primerl · circuit fidelity before extra rewards<br/>Output: improvement over frozen SFT baseline<br/>Stop/escalate only on independent dev gains<br/>Reward increase alone is not success"]
-  RANK --> RL
-  LEARN -- pass --> RL
-  CIRCUIT["<b>MILESTONE 1 · USEFUL EXECUTABLE CIRCUITS</b><br/>Small architecture-constrained VPD graphs<br/>Predict original outputs AND unseen interventions<br/>Report sufficiency, necessity and remainder robustness<br/>Accept quality–cost tradeoff; expose failures"]
-  RL --> CIRCUIT
-  TOOLS --> CIRCUIT
-
-  subgraph EXTEND["02 · TURN CIRCUITS INTO VERIFIED UNDERSTANDING"]
-    direction LR
-    MEANING["<b>ENGLISH + VARIABLES · CHECK</b><br/>varteach → primerl · prototypes underway<br/>Output: concepts bound to subcomponents<br/>Gate: reader predicts unseen interventions<br/>Beat shuffled / vague / no-explanation controls"]
-    EDIT["<b>QUESTIONS + EDITS · WAITING</b><br/>rustmove → evaluation owner<br/>Output: answers and persistent weight edits<br/>Gate: predicted effect AND collateral effects<br/>Why: make interpretation practically useful"]
-    SCALE["<b>TRANSFER + COST · CHECK</b><br/>generality + monitorbench → evaluation owner<br/>Output: quality, latency, memory, sample cost<br/>Across mechanisms, long contexts, larger models<br/>Toys/MNIST diagnose; do not prove frontier scale"]
+  subgraph CAPS["CAPABILITIES THE ORACLE MUST SHOW"]
+    C1["<b>Executable circuits</b><br/>predict outputs and unseen<br/>interventions; report sufficiency,<br/>necessity, remainder robustness"]
+    C2["<b>Tested English</b><br/>concepts bound to subcomponents;<br/>beats shuffled, vague and<br/>no-explanation controls<br/>varteach"]
+    C3["<b>Answers and edits</b><br/>predicted effects and<br/>collateral effects<br/>rustmove"]
+    C4["<b>Transfer and cost</b><br/>other mechanisms, long contexts,<br/>latency, memory, sample cost<br/>generality · monitorbench"]
   end
-  CIRCUIT --> MEANING
-  CIRCUIT --> EDIT
-  CIRCUIT --> SCALE
 
-  PROOF["<b>GATE D · INDEPENDENT EVIDENCE</b><br/>codex coordinates protocol; each capability owner supplies evidence<br/>New mechanisms / texts; same-budget baselines; ablations<br/>Freeze recipe and metrics before sealed 9100–9149<br/>Report each capability separately, including failures"]
-  MEANING --> PROOF
-  EDIT --> PROOF
-  SCALE --> PROOF
-  RESULT["<b>DELIVERABLE · A REUSABLE ORACLE RECIPE</b><br/>Weights → executable circuit → tested English → answers / edits<br/>Faithfulness, simplicity, transfer and speed demonstrated separately<br/>Share trained model, verifier, reproducible recipe and limitations"]
-  PROOF --> RESULT
-  IMPACT["<b>IMPACT</b><br/>Ambitious: understand algorithms implemented by model weights<br/>Practical: reliable audits, behavior explanations and targeted edits<br/>Frontier applicability remains a goal until tested at that scale"]
-  RESULT --> IMPACT
+  %% ===================== training =====================
+  ORC["<b>Trained oracle</b><br/>must beat the frozen SFT model<br/>on independent dev texts;<br/>a rising reward alone is not success<br/>WAITING"]
 
-  RULES["<b>OPERATING AGREEMENT · ALL OWNERS</b><br/>Claim → produce decision-changing evidence → hand off → update this map<br/>Train 6000–7999 · dev 9000–9099 · donors 9150–9199 · sealed stays closed<br/>RunPod $360 + Tinker $130 base caps; extra $40 SHARED, ledger governs<br/>Use existing implementations; push small changes to main; preserve others' work"]
-  IMPACT ~~~ RULES
+  subgraph RLS["STAGED RL · primerl"]
+    R1["<b>Stage 1 · circuits</b><br/>faithfulness gate and size"]
+    R2["<b>Stage 2 · variables</b>"]
+    R3["<b>Stage 3 · answers</b>"]
+    R4["<b>Stage 4 · English</b>"]
+    R5["<b>Stage 5 · edits</b>"]
+  end
 
-  classDef north fill:#12233f,stroke:#12233f,color:#ffffff,stroke-width:2px
-  classDef active fill:#edf4ff,stroke:#3976c6,color:#172f52,stroke-width:2px
-  classDef gate fill:#fff3d9,stroke:#bb810d,color:#543b10,stroke-width:2px
-  classDef waiting fill:#f3f5f8,stroke:#8b96a8,color:#374357,stroke-width:1.5px
-  classDef milestone fill:#e7f4ef,stroke:#288367,color:#164b3c,stroke-width:2px
-  classDef note fill:#f8f9fc,stroke:#ccd3df,color:#465570,stroke-width:1px
-  class NORTH,IMPACT north
-  class INPUT,TEACH,SCORE,TOOLS,MEANING,SCALE active
-  class DATA,RANK,LEARN,PROOF gate
-  class SFT,RL,EDIT waiting
-  class CIRCUIT,RESULT milestone
-  class NOW,RULES note
+  TOOLS["<b>Tools and search route</b><br/>search finds the circuit, the oracle<br/>explains it; parts measured on demand<br/>PROTOTYPE · primerl, codex"]
+  GATEC{{"<b>Gate C</b> · does learning add value?<br/>beats trivial baselines on fidelity<br/>vs size; uses mechanism evidence,<br/>not text alone · dev texts only"}}
+  SFT["<b>Small SFT</b><br/>first-sample circuits<br/>on fresh dev texts<br/>WAITING on gate A · primerl"]
+  GATEA{{"<b>Gate A</b> · trainable targets?<br/>teacher passes unseen interventions;<br/>needed parts visible in the input;<br/>input and answer fit the context"}}
+  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · FAILED, repair first"}}
+
+  %% ===================== workstreams =====================
+  subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
+    T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>held-out 0.99 · DONE"]
+    T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
+    T3["<b>Pruning, discriminating draws</b><br/>why: fixed-draw pruning overfit<br/>(held-out 0.34 vs 0.88)<br/>ACTIVE · pymove"]
+    T4["<b>Teacher circuits v2</b><br/>444 train + 50 held-out texts<br/>BLOCKED on pruning fix<br/>fleet"]
+  end
+
+  subgraph INPUTS["ORACLE INPUT · codex, rustmove, primerl"]
+    I1["<b>Candidate list</b><br/>VPD actives at listed positions<br/>covers 96% of teacher nodes<br/>DONE"]
+    I2["<b>Context fit</b><br/>trims 52 of 444 questions,<br/>hiding 21% of their targets<br/>DONE"]
+    I3["<b>Coverage audit</b><br/>old prompts showed 14% of targets;<br/>measure coverage after fitting<br/>CHECK · codex, rustmove"]
+    I4["<b>Learnability grid</b><br/>which input lets subcomponent<br/>effects be learned?<br/>ACTIVE · rustmove"]
+  end
+
+  subgraph REWARD["REWARD · primerl, inframove, generality, codex"]
+    W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
+    W2["<b>Falsification set</b><br/>correct copy circuits vs<br/>plausible wrong ones<br/>ACTIVE · generality"]
+    W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
+    W4["<b>Reward repair</b><br/>a weak start must not lower the bar;<br/>unscored families count as failures<br/>ACTIVE · codex, inframove, primerl"]
+  end
+
+  %% ===================== verifier and foundations =====================
+  PHI["<b>Faithfulness score Φ</b><br/>10 intervention families,<br/>32 draws per family<br/>DONE · inframove"]
+  TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>size breaks ties (1.05 vs 0.65)<br/>ACTIVE · fleet"]
+  REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
+
+  subgraph BASE["FOUNDATIONS"]
+    VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
+    TXT["<b>Text splits</b><br/>train 6000–7999 · dev 9000–9099<br/>donors 9150–9199<br/>sealed 9100–9149 stays closed"]
+    ENG["<b>Executable-circuit engine</b><br/>path-patched, batched<br/>DONE · monitorbench"]
+  end
+
+  %% ===================== later =====================
+  LAT1["<b>After gate C</b><br/>native-units comparison<br/>weight-edit test<br/>mechanism-library coverage · MNIST"]
+  UVPD["<b>The user's VPD of a real model</b><br/>not yet available"]
+  LAT2["<b>Real-model track</b><br/>model organisms<br/>safety-relevant questions"]
+
+  %% ===================== edges: the main chain (links 0-7, thick) =====================
+  T4 --> GATEA
+  GATEA -- pass --> SFT
+  SFT --> GATEC
+  GATEC -- pass --> R1
+  R1 --> R2
+  R2 --> R3
+  R3 --> R4
+  R4 --> R5
+
+  %% ===================== edges: to the top (links 8-19) =====================
+  R5 --> ORC
+  ORC --> C1
+  ORC --> C2
+  ORC --> C3
+  C1 --> C4
+  C1 --> GATED
+  C2 --> GATED
+  C3 --> GATED
+  C4 --> GATED
+  GATED --> DELIV
+  DELIV --> IMPA
+  DELIV --> IMPP
+
+  %% ===================== edges: supporting =====================
+  T1 --> T2
+  T2 --> T3
+  T3 --> T4
+  I1 --> I2
+  I2 --> I3
+  I3 --> GATEA
+  I4 -. sets the format .-> I1
+  W1 --> GATEB
+  W2 -. tests .-> GATEB
+  W3 -. found the failure .-> W4
+  W4 --> GATEB
+  GATEB -- pass --> R1
+  GATEC -. fail .-> TOOLS
+  TOOLS --> C1
+  PHI --> T3
+  PHI --> W1
+  TOY -. tests .-> PHI
+  REM -. tests .-> PHI
+  VPD --> ENG
+  TXT --> ENG
+  ENG --> PHI
+  PHI --> T1
+  ENG --> I4
+  ENG --> TOY
+  ENG --> REM
+  GATEC -.-> LAT1
+  UVPD --> LAT2
+  LAT2 -.-> C4
+
+  %% ===================== legend and operating agreement =====================
+  subgraph LEG["LEGEND"]
+    direction LR
+    k1["done"] ~~~ k2["active"] ~~~ k8["check"] ~~~ k3["blocked"] ~~~ k4["waiting"] ~~~ k5{{"gate"}} ~~~ k6["later"] ~~~ k7["<b>Updated 2026-10-12</b><br/>RunPod cap $390 (user +$30)<br/>Tinker $130<br/>codex: extra $40 shared"]
+  end
+  IMPA ~~~ LEG
+
+  %% ===================== styles =====================
+  classDef done fill:#e6f4ea,stroke:#1e8e3e,stroke-width:2px,color:#0d652d
+  classDef active fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#174ea6
+  classDef check fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,stroke-dasharray:4 3,color:#174ea6
+  classDef blocked fill:#fce8e6,stroke:#d93025,stroke-width:3px,color:#a50e0e
+  classDef waiting fill:#f8f9fa,stroke:#80868b,stroke-width:1.5px,color:#3c4043
+  classDef later fill:#ffffff,stroke:#bdc1c6,stroke-width:1.5px,stroke-dasharray:6 4,color:#80868b
+  classDef gate fill:#fef7e0,stroke:#e37400,stroke-width:2px,color:#7a4100
+  classDef goal fill:#f3e8fd,stroke:#8430ce,stroke-width:2px,color:#4a148c
+  classDef impact fill:#12233f,stroke:#12233f,stroke-width:2px,color:#ffffff
+  classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
+
+  class VPD,ENG,PHI,W1,W3,I1,I2,T1,k1 done
+  class T2,T3,I4,W2,W4,TOY,REM,k2 active
+  class I3,TOOLS,k8 check
+  class T4,GATEB,k3 blocked
+  class SFT,ORC,R1,R2,R3,R4,R5,k4 waiting
+  class LAT1,LAT2,UVPD,k6 later
+  class GATEA,GATEC,GATED,k5 gate
+  class C1,C2,C3,C4,DELIV goal
+  class IMPA,IMPP impact
+  class TXT,k7 note
+
+  linkStyle 0,1,2,3,4,5,6,7 stroke:#d93025,stroke-width:4px
+  linkStyle 8,9,10,11,12,13,14,15,16,17,18,19 stroke:#8430ce,stroke-width:2.5px

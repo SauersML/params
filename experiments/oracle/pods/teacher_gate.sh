@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The paired regression gate for teacher changes (#2951 graph oracle): two teacher configurations, A and B, on the first N
 # held-out texts, compared text by text. Each of A and B is a directory of circuits (<task>.json, e.g. another search's) or
-# COMMIT[,FLAG...] (a commit on origin/main and teacher.py flags, comma-separated: 787320c,--edges,--f1-start,both;
+# COMMIT[,FLAG...] (a commit on origin/main and teacher.py flags, comma-separated, a comma inside a flag's value written
+# :: as in --edge-levels,writer::connection: 787320c,--edges,--f1-start,both;
 # v3@COMMIT[,FLAG...] runs teacher_v3.py, one process per card on V3PODS pods), which teacher_pod.sh teaches on pods (VPD's
 # answers from vpd_heldout20.pt) into ~/mpd-data/graph_oracle/teacher/gate/NAME/a or b, both at once. Then one pod scores
 # both sets with goal_eval.py score --diagnostics (VPD's checkpoint put back together on the pod: VPD's own answers, the
@@ -27,11 +28,12 @@ for side in a b; do
   spec=$A; [ $side = b ] && spec=$B
   if [ -d "$spec" ]; then echo "$side: circuits in $spec" | tee -a "$G/README.txt"; dirs+=("$spec"); continue; fi
   IFS=, read -r ref flags <<< "$spec"
+  flags=${flags//,/ } flags=${flags//::/,}               # a comma inside one flag's value is written ::
   script=teacher.py pods=${PODS:-2} procs=${P:-4}
   case $ref in v3@*) ref=${ref#v3@} script=teacher_v3.py pods=${V3PODS:-4} procs=1 ;; esac
   C=$(git rev-parse --verify "$ref^{commit}") || exit 2
-  echo "$side: $script at ${C:0:10} ${flags//,/ }" | tee -a "$G/README.txt"
-  SCRIPT=$script RUN=g$NAME$side REF=$C TEACHER_ARGS="${flags//,/ }" SPLIT=heldout N=$N PODS=$pods P=$procs VRAM=${VRAM:-16} GPU="$GPU" \
+  echo "$side: $script at ${C:0:10} $flags" | tee -a "$G/README.txt"
+  SCRIPT=$script RUN=g$NAME$side REF=$C TEACHER_ARGS="$flags" SPLIT=heldout N=$N PODS=$pods P=$procs VRAM=${VRAM:-16} GPU="$GPU" \
     EXTRA=/Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt \
     VPD=/Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt DEST=$G/$side experiments/oracle/pods/teacher_pod.sh 2.0 > "$F/teach_$side.log" 2>&1 &
   dirs+=("$G/$side")

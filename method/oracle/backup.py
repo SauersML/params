@@ -25,11 +25,13 @@ On one text, for a circuit given as a node set (goal_eval's complete graph, bloc
      candidates, never admits one.
   expand: greedy over blocks (goal_eval.BLOCK: a site's whole output at a position, every subcomponent and the
      remainder, which C's semantics runs as the model's own weight there; a block subsumes the circuit's
-     subcomponents at its site and position): candidates every site at the circuit's positions and the screen's best
-     at the other positions from the circuit's first to the last target; every candidate's addition measured (score),
-     the one with the largest gain in J per bit taken (a candidate that costs no bits first, by gain), while the gain
-     is at least min_gain; later rounds re-measure the best candidates of the last (lazy greedy) and the screen's new
-     best. Every membership decision is measured.
+     subcomponents at its site and position): candidates every site at the circuit's positions (alone, and a site at
+     all of them together) and the screen's best at the other positions from the circuit's first to the last target;
+     every candidate's addition measured (score), the one with the largest gain in J per bit taken (a candidate that
+     costs no bits first, by gain), while the gain is at least min_gain; later rounds re-measure the best candidates
+     of the last (lazy greedy) and the screen's new best. Every membership decision is measured.
+  prune: the backward search, from every site at the circuit's positions as blocks, each block (and site group)
+     measured back out while that raises J (blocks interact: a single block's gain understates a set's).
   refine: a taken block replaced by the circuit's subcomponents there plus the outside subcomponents of the block in
      the screen's order, the shortest prefix measured to keep at least keep x the block's gain in J, taken where it
      costs fewer bits than the block.
@@ -62,7 +64,7 @@ import goal_eval  # noqa: E402
 import native  # noqa: E402
 
 BLOCK = goal_eval.BLOCK
-SEARCH_DRAWS = 16       # the search's removal draws per circuit
+SEARCH_DRAWS = 32       # the search's removal draws per circuit (16 left s 0.44 vs 0.52 between two seeds on text9000)
 ROWS = 4                # masked runs per batch (every subcomponent's column: ~60 MB of masks per row at T 400)
 SCREEN_TOP = 24         # blocks at positions outside the circuit's measured per round (the screen's best)
 LAZY = 12               # last round's best candidates re-measured per round
@@ -288,9 +290,13 @@ class Backup:
 
     def expand(self, max_steps: int = MAX_STEPS, min_gain: float = MIN_GAIN, screen_top: int = SCREEN_TOP,
                lazy: int = LAZY, log=None) -> dict:
-        """The greedy block expansion (module docstring): {"start": the circuit's score, "steps": [per step the block
-        taken, its gain and the expansion's score], "rounds": [per round the candidates measured, (site, position,
-        gain in J, bits added, response rank) each], "blocks": the blocks taken}."""
+        """The greedy block expansion (module docstring). A candidate is one block or, with the circuit at several
+        positions, a site's blocks at every circuit position together (a site's routes at different positions act
+        jointly: on text9000 h.3.mlp.c_fc at both positions took s from 0.52 to 0.95, at the target alone to 0.60).
+        {"start": the circuit's score, "steps": [per step the blocks added ("add"), the gain, bits added, the
+        expansion's score], "rounds": [per round each candidate measured, (blocks, gain in J, bits added, the best
+        response rank among its blocks)], "blocks": every block taken, in order, "step_blocks": per step the blocks
+        taken through it}."""
         t0 = time.perf_counter()
         resp = self.responses()
         rank = {}                                                    # (site, position) -> its response's rank
@@ -298,29 +304,32 @@ class Backup:
         for i, (_, n, t) in enumerate(flat):
             rank[(n, t)] = i
         cur = self.score([(frozenset(), frozenset())])[0]
-        rec = {"start": cur, "steps": [], "rounds": [], "blocks": [],
+        rec = {"start": cur, "steps": [], "rounds": [], "blocks": [], "step_blocks": [],
                "responses_top": [[n, t, v, float(resp["size"][n][t])] for v, n, t in flat[:48]]}
         taken: frozenset = frozenset()
         last: dict = {}                                              # candidate -> its last measured gain
-        at_circuit = [(n, t) for t in self.positions for n in self.nat.names if (n, t) not in self.blocks0]
+        singles = [((n, t),) for t in self.positions for n in self.nat.names if (n, t) not in self.blocks0]
+        groups = [tuple((n, t) for t in self.positions if (n, t) not in self.blocks0) for n in self.nat.names] \
+            if len(self.positions) > 1 else []
+        groups = [c for c in groups if len(c) > 1]
         for step in range(max_steps):
             grad = self.screen(taken)
-            far = [(n, t) for _, n, t in self.block_screen(grad, taken) if t not in set(self.positions)][:screen_top]
+            far = [((n, t),) for _, n, t in self.block_screen(grad, taken) if t not in set(self.positions)][:screen_top]
             if step == 0:
-                cands = list(dict.fromkeys(at_circuit + far))
+                cands = list(dict.fromkeys(singles + groups + far))
             else:
-                best = sorted((c for c in last if c not in taken), key=lambda c: -last[c])[:lazy]
+                best = sorted((c for c in last if not set(c) <= taken), key=lambda c: -last[c])[:lazy]
                 cands = list(dict.fromkeys(best + far))
-            cands = [c for c in cands if c not in taken]
+            cands = [c for c in cands if not set(c) <= taken]
             if not cands:
                 break
-            got = self.score([(taken | {c}, frozenset()) for c in cands])
+            got = self.score([(taken | set(c), frozenset()) for c in cands])
             rows = []
             for c, r in zip(cands, got):
                 gain = (r["j"] or 0.0) - (cur["j"] or 0.0)
                 last[c] = gain
                 rows.append((c, gain, r["bits"] - cur["bits"], r))
-            rec["rounds"].append([[c[0], c[1], g, db, rank.get(c)] for c, g, db, _ in rows])
+            rec["rounds"].append([[[list(b) for b in c], g, db, min(rank.get(b, 10 ** 9) for b in c)] for c, g, db, _ in rows])
 
             def key(x):                                              # free first (by gain), then gain per bit
                 _, g, db, _ = x
@@ -329,13 +338,61 @@ class Backup:
             if not ok:
                 break
             c, g, db, r = max(ok, key=key)
-            taken = taken | {c}
+            add = [b for b in c if b not in taken]
+            taken = taken | set(c)
             cur = r
-            rec["steps"].append({"block": [c[0], c[1]], "gain": g, "bits_added": db, "response_rank": rank.get(c), **r})
-            rec["blocks"].append([c[0], c[1]])
+            rec["steps"].append({"add": [list(b) for b in add], "gain": g, "bits_added": db,
+                                 "response_rank": min(rank.get(b, 10 ** 9) for b in add), **r})
+            rec["blocks"] += [list(b) for b in add]
+            rec["step_blocks"].append([list(b) for b in rec["blocks"]])
             if log:
-                log(f"    step {step}: block {c[0]}@{c[1]} J {r['j']:.3f} (s {r['s_search']:.3f}, F1 {r['f1']:.3f}), "
-                    f"{db:+.0f} bits, overstate {r['overstate']:.2f}, {len(cands)} measured")
+                log(f"    step {step}: {' + '.join(f'{b[0]}@{b[1]}' for b in add)} J {r['j']:.3f} (s {r['s_search']:.3f}, "
+                    f"F1 {r['f1']:.3f}), {db:+.0f} bits, overstate {r['overstate']:.2f}, {len(cands)} measured")
+        rec["seconds"] = time.perf_counter() - t0
+        return rec
+
+    def prune(self, blocks: list, max_steps: int = 4 * MAX_STEPS, min_gain: float = MIN_GAIN, lazy: int = 2 * LAZY,
+              log=None) -> dict:
+        """The backward search from a block set (e.g. every site at the circuit's positions): each block, and each
+        site's blocks together, measured back out (the circuit's own subcomponents there stay), the removal with the
+        largest gain in J taken while it gains at least min_gain (a removal that also saves bits first among equal
+        gains: gain per bit saved never favours keeping a block); later rounds re-measure the last round's best and
+        every site group. {"start", "steps": [per step "drop", gain, bits added, the score], "blocks": the blocks
+        left}."""
+        t0 = time.perf_counter()
+        kept = frozenset(tuple(b) for b in blocks)
+        cur = self.score([(kept, frozenset())])[0]
+        rec = {"start": cur, "steps": [], "rounds": 0}
+        last: dict = {}
+        for step in range(max_steps):
+            singles = [(b,) for b in sorted(kept)]
+            groups = [c for c in (tuple(b for b in sorted(kept) if b[0] == n) for n in self.nat.names) if len(c) > 1]
+            if step == 0:
+                cands = singles + groups
+            else:
+                best = sorted((c for c in last if set(c) <= kept), key=lambda c: -last[c])[:lazy]
+                cands = list(dict.fromkeys(best + groups))
+            cands = [c for c in cands if set(c) <= kept]
+            if not cands:
+                break
+            got = self.score([(kept - set(c), frozenset()) for c in cands])
+            rec["rounds"] += 1
+            rows = []
+            for c, r in zip(cands, got):
+                g = (r["j"] or 0.0) - (cur["j"] or 0.0)
+                last[c] = g
+                rows.append((c, g, r["bits"] - cur["bits"], r))
+            ok = [x for x in rows if x[1] >= min_gain]
+            if not ok:
+                break
+            c, g, db, r = max(ok, key=lambda x: (x[1], -x[2]))
+            kept, cur = kept - set(c), r
+            rec["steps"].append({"drop": [list(b) for b in c], "gain": g, "bits_added": db, **r})
+            if log:
+                log(f"    prune {step}: drop {' + '.join(f'{b[0]}@{b[1]}' for b in c)} J {r['j']:.3f} (s {r['s_search']:.3f}, "
+                    f"F1 {r['f1']:.3f}), {db:+.0f} bits, {len(kept)} blocks left")
+        rec["blocks"] = [list(b) for b in sorted(kept)]
+        rec["final"] = cur
         rec["seconds"] = time.perf_counter() - t0
         return rec
 
@@ -462,16 +519,24 @@ class Backup:
 
 
 def expand_circuit(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, max_steps: int = MAX_STEPS,
-                   min_gain: float = MIN_GAIN, refine: bool = True, draws: int = SEARCH_DRAWS, log=None) -> tuple:
+                   min_gain: float = MIN_GAIN, backward: bool = True, refine: bool = True, draws: int = SEARCH_DRAWS,
+                   log=None) -> tuple:
     """The teacher's call: (the expanded node set, its record). graph: a node set on tx (goal_eval's complete graph,
-    blocks allowed), e.g. block_search's circuit before its connections are stated; returns the circuit with the
-    compensator blocks expand() takes (each subsuming the circuit's subcomponents at its site and position), and with
-    refine those a cheaper prefix of subcomponents keeps replaced by it. Draws are the backup family's own (search
-    draws); a teacher states connections afterwards over the returned node set (its blocks are blocks: Connector's
-    `blocks`). record: {"expand": Backup.expand's, "refine": Backup.refine's or None, "start", "final": the scores}."""
+    blocks allowed), e.g. block_search's circuit before its connections are stated. The expansion is the better by J on
+    the backup family's search draws of expand's forward greedy and (backward) prune's search down from every site at
+    the circuit's positions as blocks, each block subsuming the circuit's subcomponents at its site and position; with
+    refine, a block a cheaper prefix of subcomponents keeps (refine's rule) is replaced by it. A teacher states
+    connections afterwards over the returned node set (its blocks are blocks: Connector's `blocks`). record:
+    {"expand", "prune" (or None), "chosen", "refine" (or None), "start", "final": the expansion's score, "measured"}."""
     bk = Backup(ge, tx, graph, draws=draws)
-    rec = {"expand": bk.expand(max_steps=max_steps, min_gain=min_gain, log=log), "refine": None}
+    rec = {"expand": bk.expand(max_steps=max_steps, min_gain=min_gain, log=log), "prune": None, "refine": None, "chosen": "fwd"}
     blocks, extra = [tuple(b) for b in rec["expand"]["blocks"]], []
+    if backward:
+        allpos = [(n, t) for t in bk.positions for n in ge.nat.names if (n, t) not in bk.blocks0]
+        rec["prune"] = bk.prune(allpos, min_gain=min_gain, log=log)
+        jf = rec["expand"]["steps"][-1]["j"] if rec["expand"]["steps"] else rec["expand"]["start"]["j"]
+        if (rec["prune"]["final"]["j"] or 0.0) > (jf or 0.0):
+            blocks, rec["chosen"] = [tuple(b) for b in rec["prune"]["blocks"]], "back"
     if refine and blocks:
         rec["refine"] = bk.refine(blocks, log=log)
         blocks, extra = [tuple(b) for b in rec["refine"]["blocks"]], [tuple(x) for x in rec["refine"]["extra"]]
@@ -509,12 +574,14 @@ def _vpd_extra(bk: Backup, bits: float) -> list:
 
 def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int = 1, max_steps: int = MAX_STEPS,
         log=print) -> None:
-    """Expand each text's circuit in src (<task>.json, a node set); write out/<set>/<task>.json for the sets: "b1",
-    "b2", "b4" (the first 1, 2, 4 blocks taken), "full" (every block taken), "refined" (refine's), "rand" (as many
-    blocks as "full" drawn at the circuit's positions), "allpos" (every site at the circuit's positions), "vpdbits"
-    (VPD's order beyond the circuit at "full"'s added bits); and a line per text in out/summary.jsonl: the expansion's
-    record, refine's, every set's score on the search draws ("search") and on EVAL_DRAWS fresh draws of the circuit's own
-    nodes ("eval_units", the start's among them)."""
+    """Expand each text's circuit in src (<task>.json, a node set); write out/<set>/<task>.json for the sets: "fwd"
+    (expand's forward greedy), "back" (prune's backward search from every site at the circuit's positions), "full" (the
+    one of them with the higher J on the search draws, "chosen" in the summary), "b1", "b2", "b4" (fwd's first 1, 2, 4
+    steps), "refined" (refine's of full), "rand" (as many blocks as full drawn at the circuit's positions), "allpos"
+    (every site at the circuit's positions), "vpdbits" (VPD's order beyond the circuit at full's added bits, at least
+    one subcomponent); and a line per text in out/summary.jsonl: the records of expand, prune, refine and interpret,
+    every set's score on the search draws ("search") and on EVAL_DRAWS fresh draws of the circuit's own nodes
+    ("eval_units", the start's among them)."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
     out.mkdir(parents=True, exist_ok=True)
@@ -531,14 +598,20 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
         log(f"{p.stem}: {g.count()} nodes at {len({t for _, t, _ in g.node_set()})} positions, T {tx.T}")
         bk = Backup(ge, tx, g)
         ex = bk.expand(max_steps=max_steps, log=lambda s: log(s))
-        blocks = [tuple(b) for b in ex["blocks"]]
+        allpos = [(n_, t) for t in bk.positions for n_ in nat.names if (n_, t) not in bk.blocks0]
+        back = bk.prune(allpos, log=lambda s: log(s))
+        fwd = [tuple(b) for b in ex["blocks"]]
+        jf = ex["steps"][-1]["j"] if ex["steps"] else ex["start"]["j"]
+        blocks = [tuple(b) for b in back["blocks"]] if (back["final"]["j"] or 0.0) > (jf or 0.0) else fwd
         rf = bk.refine(blocks, log=lambda s: log(s)) if blocks else {"blocks": [], "extra": [], "per_block": []}
         interp = bk.interpret(rf["per_block"]) if rf["per_block"] else []
-        sets = {f"b{k}": (blocks[:k], []) for k in (1, 2, 4) if k <= len(blocks)}
+        sets = {f"b{k}": ([tuple(b) for b in ex["step_blocks"][k - 1]], []) for k in (1, 2, 4) if k <= len(ex["step_blocks"])}
+        sets["fwd"] = (fwd, [])
+        sets["back"] = ([tuple(b) for b in back["blocks"]], [])
         sets["full"] = (blocks, [])
         sets["refined"] = ([tuple(b) for b in rf["blocks"]], [tuple(x) for x in rf["extra"]])
         sets["rand"] = (_random_blocks(bk, len(blocks), native.task_seed(p.stem)), [])
-        sets["allpos"] = ([(n_, t) for t in bk.positions for n_ in nat.names], [])
+        sets["allpos"] = (allpos, [])
         added = bk.bits(frozenset(blocks)) - bk.bits()
         sets["vpdbits"] = ([], _vpd_extra(bk, max(added, 1.0)))
         scores = dict(zip(sets, bk.score([(frozenset(b), frozenset(x)) for b, x in sets.values()])))
@@ -551,7 +624,7 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
             (out / name).mkdir(exist_ok=True)
             (out / name / f"{p.stem}.json").write_text(json.dumps(goal_eval.to_json(bk.graph(frozenset(b), frozenset(x)))))
         row = {"task": p.stem, "T": tx.T, "nodes": len(bk.nodes), "positions": bk.positions, "bits_start": bk.bits(),
-               "expand": ex, "refine": rf, "interpret": interp, "search": scores, "eval_units": units, "sets": {k: [list(map(list, b)), list(map(list, x))] for k, (b, x) in sets.items()},
+               "expand": ex, "prune": back, "chosen": "back" if blocks != fwd else "fwd", "refine": rf, "interpret": interp, "search": scores, "eval_units": units, "sets": {k: [list(map(list, b)), list(map(list, x))] for k, (b, x) in sets.items()},
                "measured": bk.measured, "seconds": time.perf_counter() - t0}
         with open(out / "summary.jsonl", "a") as fh:
             fh.write(json.dumps(row) + "\n")
@@ -561,10 +634,11 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
         native.free(nat.dev)
 
 
-def evaluate(split: str, n: int, src: Path, out: Path, sets=("full", "refined", "b1", "b2", "b4", "rand", "allpos", "vpdbits"),
+def evaluate(split: str, n: int, src: Path, out: Path, sets=("fwd", "back", "b1", "rand", "allpos", "vpdbits"),
              offset: int = 0, stride: int = 1, log=print) -> Path:
     """goal_eval.fidelity_report in full mode on the eval split's draws for the source set ("start") and out's sets,
-    appended to out/fidelity.jsonl (VPD's top k at each size added by the report)."""
+    appended to out/fidelity.jsonl (VPD's top k at each size added by the report; "full" is fwd or back, per the
+    summary's "chosen")."""
     pool = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
     fresh = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt"
     have = {"start": src} | {s: out / s for s in sets if (out / s).is_dir()}

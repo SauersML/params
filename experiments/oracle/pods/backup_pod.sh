@@ -33,7 +33,7 @@ python -c \"import torch; from safetensors.torch import load_file; d = {**load_f
 cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e;
-${TESTS:+(python -m pip install -q pytest || uv pip install -q --python \$(command -v python) pytest) > $O/tests.log 2>&1; python -B -m pytest -q test_backup.py >> $O/tests.log 2>&1;}
+${TESTS:+(python -m pytest --version || PATH=\$HOME/.local/bin:\$PATH uv pip install -q --python \$(command -v python) pytest) > $O/tests.log 2>&1; python -B -m pytest -q test_backup.py >> $O/tests.log 2>&1;}
 bk() { python -B backup.py run --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P --max-steps $STEPS > $O/run_\$1.log 2>&1; echo \"run exit \$?\" >> $O/run_\$1.log;
   [ $EVAL = 1 ] && { python -B backup.py eval --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P >> $O/run_\$1.log 2>&1; echo \"eval exit \$?\" >> $O/run_\$1.log; }; };
 for k in \$(seq 0 $((P - 1))); do (bk \$k) & done; wait; echo all done"

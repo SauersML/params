@@ -134,13 +134,19 @@ def test_expand_records_its_path(tiny):
     rec = bk.expand(max_steps=3, min_gain=1e-4, screen_top=4, lazy=4)
     js = [rec["start"]["j"]] + [s["j"] for s in rec["steps"]]
     assert all(b >= a + 1e-4 - 1e-12 for a, b in zip(js, js[1:])), js
-    assert [s["block"] for s in rec["steps"]] == rec["blocks"]
-    for s in rec["steps"]:
-        again = bk.score([(frozenset(tuple(b) for b in rec["blocks"][:rec["steps"].index(s) + 1]), frozenset())])[0]
+    assert [b for s in rec["steps"] for b in s["add"]] == rec["blocks"] == (rec["step_blocks"] or [[]])[-1]
+    for k, s in enumerate(rec["steps"]):
+        again = bk.score([(frozenset(tuple(b) for b in rec["step_blocks"][k]), frozenset())])[0]
         assert abs(again["j"] - s["j"]) < 1e-6
+    every = [(n, t) for t in bk.positions for n in nat.names]
+    back = bk.prune(every, max_steps=4, min_gain=1e-4)
+    js = [back["start"]["j"]] + [s["j"] for s in back["steps"]]
+    assert all(b >= a + 1e-4 - 1e-12 for a, b in zip(js, js[1:])) and set(map(tuple, back["blocks"])) <= set(every)
+    assert abs(bk.score([(frozenset(map(tuple, back["blocks"])), frozenset())])[0]["j"] - back["final"]["j"]) < 1e-6
     g, r2 = backup.expand_circuit(ge, tx, circuit, max_steps=3, min_gain=1e-4, refine=True, draws=4)
     blocks = {nd[:2] for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
-    assert blocks == {tuple(b) for b in r2["refine"]["blocks"]} if r2["refine"] else blocks == {tuple(b) for b in r2["expand"]["blocks"]}
+    chosen = r2["prune"]["blocks"] if r2["chosen"] == "back" else r2["expand"]["blocks"]
+    assert blocks == {tuple(b) for b in (r2["refine"]["blocks"] if r2["refine"] else chosen)}
     assert circuit.node_set() <= goal_eval.expand_blocks(g, nat.C).node_set()
     bk2 = backup.Backup(ge, tx, circuit, draws=4)
     extra = frozenset(nd for nd in g.node_set() if nd[2] != goal_eval.BLOCK) - circuit.node_set()

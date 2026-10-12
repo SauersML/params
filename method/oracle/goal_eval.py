@@ -916,7 +916,7 @@ class GoalEval:
 
     def fidelity(self, tx: Text, graphs: list[native.Graph], pool: dict | None = None, draws: int = DRAWS,
                  steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, curve=ADV_CURVE, fresh: dict | None = None,
-                 interchange: int = 0, real: bool = False, reads: bool = False) -> list[dict]:
+                 interchange: int = 0, real: bool = False, reads: bool = False, mode: str = "full") -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -937,36 +937,46 @@ class GoalEval:
         fresh, a pool none of the searches drew from: the pattern lever's flips over it (f1_flips_patterns_fresh);
         interchange > 0: that many interchange draws (_interchange_family, s_interchange); real: N_real (real_removal,
         n_real) and its adversary (necessity_flips, n_real_flips). leak: graph F1 of the circuit's nodes stating no
-        edge (live remainders carrying their outputs to the prediction)."""
+        edge (live remainders carrying their outputs to the prediction). mode="reward": the training family alone, what
+        the RL reward takes every step: point, nodes, edges with reads (on), and the flips up to FLIP_TERM (their
+        starts drawn as for every budget, so c is the full mode's); no step-budget adversary, larger budgets, fresh
+        pool, interchange, N_real or leak, and no flips_to_break / flips_to_half."""
+        if mode not in ("full", "reward"):
+            raise ValueError("mode is full or reward")
+        reward = mode == "reward"
+        reads = reads or reward
         e0 = self._bounds(tx, "live")[0]
         sides = self._sides(tx, graphs) if reads else None
         point = self.sufficiency(tx, graphs)
         nodes = self._node_family(tx, graphs, draws, reads)
         edges = self._edge_family(tx, graphs, draws, reads)
-        adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool else [{} for _ in graphs]
-        flips = self.adversary_flips(tx, graphs, pool, "omitted", steps=steps, restarts=restarts) if pool else [{} for _ in graphs]
         none = [{} for _ in graphs]
-        fresh_rows = self.adversary_flips(tx, graphs, fresh, "patterns", steps=steps, restarts=restarts) if fresh else none
-        inter = self._interchange_family(tx, graphs, interchange, reads=reads) if interchange else none
-        reals = self.real_removal(tx, graphs) if real else none
-        nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real else none
-        leak = self.sufficiency(tx, [native.Graph(sorted(g.node_set()), {}, []) for g in graphs])
+        adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool and not reward else none
+        flips = self.adversary_flips(tx, graphs, pool, "omitted", steps=steps, restarts=restarts,
+                                     upto=FLIP_TERM if reward else None) if pool else none
+        fresh_rows = self.adversary_flips(tx, graphs, fresh, "patterns", steps=steps, restarts=restarts) if fresh and not reward else none
+        inter = self._interchange_family(tx, graphs, interchange, reads=reads) if interchange and not reward else none
+        reals = self.real_removal(tx, graphs) if real and not reward else none
+        nflips = self.necessity_flips(tx, graphs, steps=steps, restarts=restarts) if real and not reward else none
+        leak = none if reward else self.sufficiency(tx, [native.Graph(sorted(g.node_set()), {}, []) for g in graphs])
         out = []
         for g, pt, nd, ed, ad, fl, fr, it, rr, nf, lk in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals,
                                                              nflips, leak):
-            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf,
-                   "leak": lk["f1_live"]}
+            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf}
+            if lk:
+                row["leak"] = lk["f1_live"]
             row["s_nodes"] = _fid(e0, nd["kl_nodes_c"], nd["kl_nodes_vpd"])
             row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
             fc = row.get("f1_flips_omitted", {})
             terms = [row[k] for k in ("s_point", "s_nodes", "s_edges") if row.get(k) is not None]
             terms += [fc[FLIP_TERM]] if fc.get(FLIP_TERM) is not None else []
             row["c"] = sum(terms) / len(terms) if terms else None
-            half = 0.5 * row["s_point"] if row["s_point"] is not None else None
-            broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
-            row["flips_to_break"] = broke[0] if broke else None  # None: not within the budgets (more than max(FLIPS))
-            below = [m for m in sorted(fc) if fc[m] is not None and fc[m] < 0.5]  # an absolute bar: half of VPD's own
-            row["flips_to_half"] = 0 if (row["s_point"] is not None and row["s_point"] < 0.5) else (below[0] if below else None)
+            if not reward:  # (the reward's flips stop at FLIP_TERM)
+                half = 0.5 * row["s_point"] if row["s_point"] is not None else None
+                broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
+                row["flips_to_break"] = broke[0] if broke else None  # None: not within the budgets (more than max(FLIPS))
+                below = [m for m in sorted(fc) if fc[m] is not None and fc[m] < 0.5]  # an absolute bar: half of VPD's own
+                row["flips_to_half"] = 0 if (row["s_point"] is not None and row["s_point"] < 0.5) else (below[0] if below else None)
             if fr:
                 row["f1_flips_patterns_fresh"] = fr["f1_flips_patterns"]
             if it:
@@ -1555,7 +1565,7 @@ class GoalEval:
 
 
     def adversary_flips(self, tx: Text, graphs: list[native.Graph], pool: dict, lever: str = "omitted", ms=None,
-                        steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, k: int = ADV_PATTERNS) -> list[dict]:
+                        steps: int = ADV_STEPS, restarts: int = ADV_RESTARTS, k: int = ADV_PATTERNS, upto: int | None = None) -> list[dict]:
         """The paired adversary with a budget in switched-on parts instead of steps: per budget m, at most m of one
         lever on ("omitted": the VPD actives the circuit leaves out, one subcomponent at one position each;
         "patterns": the pool's patterns, each an OR over every position up to the last target), the other lever off.
@@ -1564,7 +1574,8 @@ class GoalEval:
         switched on and scored in float32, beside the m best of a measured shortlist (SCREEN parts with the largest
         gradient either way, each switched on alone); the worst of them, at most m (no weaker than a smaller budget). Per circuit {f"f1_flips_{lever}": {m: f1_adv},
         f"kl_flips_{lever}": {m: (KL_C, KL_VPD)}, f"mask_flips_{lever}": {m: the parts switched on, (site, position,
-        subcomponent) or pool index}}."""
+        subcomponent) or pool index}}. upto: only the budgets up to it are searched, every budget's starts still
+        drawn (the same numbers as the full search at those budgets)."""
         nat, dev = self.nat, self.nat.dev
         e0 = self._bounds(tx, "live")[0]
         ms = FLIPS[lever] if ms is None else ms
@@ -1618,7 +1629,7 @@ class GoalEval:
         flat = [[(n, t, c) for n in nat.names for t, c in zip(idx[n][0].tolist(), cols[n][idx[n][1]].tolist())] if omitted else pick
                 for _, idx, cols in problems]
         out = [{f"f1_flips_{lever}": {}, f"kl_flips_{lever}": {}, f"mask_flips_{lever}": {}} for _ in problems]
-        pairs = [(i, m) for m in ms for i in range(len(problems)) if (i, m) in starts]
+        pairs = [(i, m) for m in ms for i in range(len(problems)) if (i, m) in starts and (upto is None or m <= upto)]
         xs = {}
         for i, m in pairs:
             x = starts[(i, m)]

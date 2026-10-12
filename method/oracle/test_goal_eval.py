@@ -1037,6 +1037,24 @@ def test_cutting_an_off_writer_changes_nothing(tiny):
         assert float(carry.kl(want[0][None], lv[b][None])[0]) < 1e-6
 
 
+def test_fidelity_reward_mode_is_the_full_modes_training_family(tiny):
+    """fidelity(mode="reward") gives the full mode's point, node and edge families, reads and the flips up to FLIP_TERM
+    (the same starts) and their c, without the evaluation-only columns."""
+    nat, ge, tx = tiny
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets)), native.Graph(nodes[1::4], complete=True)]
+    pool = tiny_pool(nat, tx.ids)
+    full = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, reads=True)
+    rew = ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, mode="reward")
+    for a, b in zip(full, rew):
+        for key in ("s_point", "s_nodes", "s_edges", "reads_nodes", "reads_edges", "dreads_nodes", "dreads_edges", "c"):
+            assert (a[key] is None) == (b[key] is None) and (a[key] is None or abs(a[key] - b[key]) < 1e-6), key
+        assert set(b["f1_flips_omitted"]) == {m for m in goal_eval.FLIPS["omitted"] if m <= goal_eval.FLIP_TERM}
+        for m, v in b["f1_flips_omitted"].items():
+            assert abs(v - a["f1_flips_omitted"][m]) < 1e-6
+        assert "f1_adv" not in b and "leak" not in b and "flips_to_break" not in b
+
+
 def test_interchange_family(tiny):
     """Interchange: VPD's answer as the circuit agrees with VPD's own run draw by draw; a stated circuit with every
     connection and some activations fixed (graph_ref) is the independent forward with them fixed."""

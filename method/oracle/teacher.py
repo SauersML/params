@@ -158,9 +158,13 @@ class Descent:
         budget while a subset is not: subcomponents cancel) it removes the prefix of the ranked blocks with the lowest
         measured KL_C, when that is lower than the circuit's. The blocks are ranked by kl_rank; the prefixes are
         measured by kl_sets. log, a list, receives each round's {"removed": unit ids, "kl": the KL measured after it}
-        and accept's dict."""
+        and accept's dict. With accept, the blocks between the largest admitted prefix and the smallest refused one (at
+        most 4 ACCEPT_BATCH) are asked about alone, and those refused alone stay for the level (frozen): a block the KL
+        ranks first can carry what accept measures (text9011: the target's L3 attention output, whose removal lowers
+        KL, takes s_track from 0.90 to 0.61 alone), and every prefix holds it."""
+        frozen = torch.zeros_like(self.on)
         for r in range(rounds):
-            blocks = self.blocks(level)
+            blocks = [b for b in self.blocks(level) if not bool(frozen[b].any())]
             if len(blocks) <= 1:
                 return r
             single = torch.tensor(self.without(blocks, ranking=True))
@@ -170,7 +174,7 @@ class Descent:
                 ok = [(k, x) for k, x in zip(sizes, self.without([torch.cat(ranked[:k]) for k in sizes])) if x <= budget]
                 info = {}
                 if accept is not None and ok:                # the largest admitted, checked from the largest down
-                    order, ok = sorted(ok, reverse=True), []
+                    order, ok, refused = sorted(ok, reverse=True), [], []
                     for s0 in range(0, len(order), ACCEPT_BATCH):
                         part = order[s0:s0 + ACCEPT_BATCH]
                         ons = self.on[None].repeat(len(part), 1)
@@ -178,9 +182,25 @@ class Descent:
                             ons[i, torch.cat(ranked[:k])] = False
                         got = accept(ons)
                         hit = next((i for i, g in enumerate(got) if g is not None), None)
+                        refused += [k for k, _ in part[:len(part) if hit is None else hit]]
                         if hit is not None:
                             ok, info = [part[hit]], got[hit]
                             break
+                    lo = ok[0][0] if ok else 0
+                    hi = min((k for k in refused if k > lo), default=None)
+                    new = 0
+                    if hi is not None:                       # the culprits: blocks refused alone stay for the level
+                        window = ranked[lo:hi][:4 * ACCEPT_BATCH]
+                        ons = self.on[None].repeat(len(window), 1)
+                        for i, b in enumerate(window):
+                            ons[i, b] = False
+                        for s0 in range(0, len(window), ACCEPT_BATCH):
+                            for b, g in zip(window[s0:s0 + ACCEPT_BATCH], accept(ons[s0:s0 + ACCEPT_BATCH])):
+                                if g is None:
+                                    frozen[b] = True
+                                    new += 1
+                    if not ok and new:                       # nothing admitted, the culprits frozen: rank again
+                        continue
                 if not ok:
                     return r
                 k, x = max(ok)
@@ -549,6 +569,7 @@ def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",
 
 ACCEPT = {"changed": ("changed_search", ("s_track",)), "interchange": ("interchange_search", ("s_interchange",)),
           "donors": ("donors_search", ("s_donor_near", "s_donor_far"))}
+TRACK = {"c": "s_track", "pp": "s_track_pp"}  # changed_search's mode -> its term
 
 
 class Acceptance:
@@ -560,19 +581,25 @@ class Acceptance:
     s_donor_far from donors_search (every subcomponent outside the circuit at its activation on a donor text: the
     changed texts, and training texts, against VPD's answer under the same donors, bounded by keeping nothing). A
     candidate passes while each term stays >= min(0.9, the search's start's); a term that is None (uninformative on
-    the text) passes. The splits' eval draws stay held out (gates, tables)."""
+    the text) passes. The splits' eval draws stay held out (gates, tables). mode, the changed family's: "pp" (the
+    lead's decision 10-12), s_track_pp, the circuit path-patched (goal_eval.track_pp: everything outside it at its
+    value on the text, so cutting distant positions does not switch their parts off); "c", s_track in C's semantics."""
 
-    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds):
-        self.ge, self.tx, self.kinds, self.calls = ge, tx, tuple(kinds), 0
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds, mode: str = "pp"):
+        self.ge, self.tx, self.kinds, self.mode, self.calls = ge, tx, tuple(kinds), mode, 0
 
     def scores(self, graphs: list, edges: tuple | None = None) -> list[dict]:
         """Per graph its terms; edges, (graph, ons [K, connections]): the graphs are those connection subsets of one
-        node set, and "changed" runs from one plan of it (goal_eval changed_edges, the same numbers)."""
+        node set, and "changed" in mode c runs from one plan of it (goal_eval changed_edges, the same numbers)."""
         out = [{} for _ in graphs]
         for k in self.kinds:
             fn, keys = ACCEPT[k]
-            got = (self.ge.changed_edges(self.tx, *edges, "search") if k == "changed" and edges is not None
-                   else getattr(self.ge, fn)(self.tx, graphs))
+            if k == "changed":
+                keys = (TRACK[self.mode],)
+                got = (self.ge.changed_edges(self.tx, *edges, "search") if self.mode == "c" and edges is not None
+                       else self.ge.changed_search(self.tx, graphs, mode=self.mode))
+            else:
+                got = getattr(self.ge, fn)(self.tx, graphs)
             for o, r in zip(out, got):
                 o.update({key: r[key] for key in keys})
         self.calls += 1
@@ -738,7 +765,8 @@ def with_pairs(g: native.Graph, pairs: dict) -> native.Graph:
     return h
 
 
-def state_pairs(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, empty: float, vpd: float) -> tuple:
+def state_pairs(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, empty: float, vpd: float,
+                acceptance: Acceptance | None = None) -> tuple:
     """A stated graph's query-key pairs (the lead's assignment 10-12; C's semantics from monitorbench's bcbddad: a read
     with an entry computes its pattern row from the background, the rest-rest term, and its stated pairs alone):
     rustmove's greedy selection (experiments/oracle/qk_pairs.py) on goal_eval's runs, read by read in (layer,
@@ -748,8 +776,10 @@ def state_pairs(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph,
     one batch), until the KL is within the budget: F1 0.9's KL when the graph reaches it, else 90% of its own log
     recovery (qk_pairs.py's). Reads done keep their pairs, the others their whole row; stating every pair is the whole
     row, so each read ends within the budget, one the background alone keeps there stating none (["pair", "rest",
-    "rest", ...]). (The graph with its pairs, its stranded nodes dropped (goal_eval.strand: a query or key no pair of
-    its reads names does nothing there); per read its record.)"""
+    "rest", ...]). With acceptance, a read ends only when its terms also keep min(0.9, the graph's without pairs);
+    while the KL is within the budget and they are not, the next pair is the one with the largest smallest margin
+    over the floors (KL breaking ties). (The graph with its pairs, its stranded nodes dropped (goal_eval.strand: a
+    query or key no pair of its reads names does nothing there); per read its record.)"""
     live = CONVENTION == "live"
     graph = goal_eval.strand(graph, tx.targets, ge.nat.C)
     kl_c = ge.graph_kl(tx, [graph], live)[0]
@@ -759,29 +789,70 @@ def state_pairs(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph,
     kinds = {nd: native._name_layer_kind(nd[0]) for nd in nodes}
     reads = sorted({(L, nd[1]) for nd, (L, k) in kinds.items() if k == "o_proj"})
     done, records = {}, []
+    floor = None
+    if acceptance is not None:
+        floor = {k: None if v is None else min(RECOVERED, v) for k, v in acceptance.scores([graph])[0].items()}
+
+    def margin(r):                                           # the smallest margin over the floors (None: no floor)
+        return min([r[k] - f for k, f in floor.items() if f is not None and r[k] is not None] or [0.0])
     for L, t in reads:
         qs = [nd for nd in nodes if kinds[nd] == (L, "q_proj") and nd[1] == t]
         ks = [nd for nd in nodes if kinds[nd] == (L, "k_proj") and nd[1] <= t]
         left = [(a, b) for a in qs + [None] for b in ks + [None] if a is not None or b is not None]
         if not left:                                         # the background is the whole row
             continue
-        chosen = []
+        chosen, terms = [], None
         kl = ge.graph_kl(tx, [with_pairs(graph, {**done, (L, t): []})], live)[0]
         curve = [kl]
-        while kl > budget and left:
-            got = ge.graph_kl(tx, [with_pairs(graph, {**done, (L, t): chosen + [c]}) for c in left], live)
-            j = min(range(len(left)), key=lambda i: got[i])
+        while left:
+            if kl <= budget:
+                if floor is None:
+                    break
+                terms = acceptance.scores([with_pairs(graph, {**done, (L, t): chosen})])[0]
+                if margin(terms) >= 0:
+                    break
+            cands = [with_pairs(graph, {**done, (L, t): chosen + [c]}) for c in left]
+            got = ge.graph_kl(tx, cands, live)
+            if kl <= budget:                                 # within the budget, short of the floors: the terms choose
+                ts = acceptance.scores(cands)
+                j = max(range(len(left)), key=lambda i: (margin(ts[i]), -got[i]))
+                terms = ts[j]
+            else:
+                j = min(range(len(left)), key=lambda i: got[i])
             chosen.append(left.pop(j))
             kl = got[j]
             curve.append(kl)
         done[(L, t)] = chosen
         records.append({"layer": L, "t": t, "queries": len(qs), "keys": len(ks), "candidates": len(left) + len(chosen),
-                        "pairs": len(chosen), "kl_background": curve[0], "kl": kl, "curve": curve})
+                        "pairs": len(chosen), "kl_background": curve[0], "kl": kl, "curve": curve, **(terms or {})})
     stated = goal_eval.strand(with_pairs(graph, done), tx.targets, ge.nat.C)
-    summary = {"kl_c": kl_c, "budget": budget, "reads": len(records), "pairs": sum(r["pairs"] for r in records),
+    summary = {"kl_c": kl_c, "budget": budget, "floor": floor, "reads": len(records), "pairs": sum(r["pairs"] for r in records),
                "background_reads": sum(r["pairs"] == 0 for r in records), "stranded": len(stated.stranded),
                "kl_pairs": records[-1]["kl"] if records else kl_c, "per_read": records}
     return stated, summary
+
+
+def trim_pairs(g0: native.Graph, g: native.Graph, per_read: list, fits, targets: list[int], C: dict) -> tuple:
+    """A stated graph's pairs (g, state_pairs' from g0, with its per-read records) cut to fit (the lead's 10-12: pairs
+    cost answer tokens): while fits(graph, pairs) is false the lowest-value pair goes (each its fall in KL when it was
+    chosen), and with none left every read's entry (no pattern claims: g0). (The graph as written, its pairs or None,
+    the pairs dropped.) fits None: g as stated."""
+    cur = {read: list(ps) for read, ps in (getattr(g, "pairs", None) or {}).items()}
+    if fits is None:
+        return g, cur, 0
+    gains = sorted((r["curve"][i] - r["curve"][i + 1], (r["layer"], r["t"]), i) for r in per_read for i in range(r["pairs"]))
+    order = [((L, t), cur[(L, t)][i]) for _, (L, t), i in gains]
+    h, dropped = g, 0
+    while not fits(h, cur):
+        left = [(read, pair) for read, pair in order if pair in cur.get(read, [])]   # (a cut can strand another's nodes)
+        if not left:
+            return g0, None, dropped
+        read, pair = left[0]
+        cur[read].remove(pair)
+        dropped += 1
+        h = goal_eval.strand(with_pairs(g0, cur), targets, C)
+        cur = {read: list(ps) for read, ps in (getattr(h, "pairs", None) or {}).items()}
+    return h, cur, dropped
 
 
 def circuit_json(pr: Pruner, on: torch.Tensor, edges: list | None = None, pairs: dict | None = None) -> dict:
@@ -823,7 +894,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
           max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
-          accept: tuple = (), pairs: bool = False) -> tuple[dict, dict]:
+          accept: tuple = (), pairs: bool = False, accept_mode: str = "pp") -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -860,7 +931,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     row = {"T": tx.T, "convention": CONVENTION, "vpd_size": len(pr.nodes), "vpd_positions": int(torch.unique(pr.t).numel()),
            "kl_empty": empty, "kl_vpd": vpd, "budget_kl": budget, "active_scale": active, "levels": {}}
-    acceptance = Acceptance(ge, tx, accept) if accept else None
+    acceptance = Acceptance(ge, tx, accept, accept_mode) if accept else None
     as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
 
     def search(levels, label):
@@ -884,7 +955,13 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             pr.on = whole & torch.isin(pr.t, torch.tensor(targets, device=pr.t.device))
             reached = search(("chunk4", "subcomponent"), "target ")
         f1_targets = pr.on.clone() if reached else None
-        if not reached or f1_start == "both":
+        whole_needed = not reached or f1_start == "both"
+        if reached and f1_start == "both" and acceptance is not None:   # the whole answer's search joins only when the
+            got = acceptance.scores([as_nodes(f1_targets), as_nodes(whole)])   # target circuit misses min(0.9, the whole
+            row["accept_targets"], row["accept_whole"] = got                    # answer's) on a term (the lead's 10-12)
+            whole_needed = any(w is not None and got[0][k] is not None and got[0][k] < min(RECOVERED, w) for k, w in got[1].items())
+        row["f1_whole_search"] = whole_needed
+        if whole_needed:
             pr.on = whole.clone()
             levels = LEVELS
             if start_top:                                    # the F1 search from VPD's top start_top, subcomponents only
@@ -894,7 +971,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             search(levels, "")
         row["f1_from_targets"] = reached
         f1_on = pr.on.clone()
-        if f1_targets is not None and f1_start == "both":   # the union of the two F1 circuits
+        if f1_targets is not None and f1_start == "both" and whole_needed:   # the union of the two F1 circuits
             row["f1_sizes"] = [int(f1_targets.sum()), int(f1_on.sum())]
             f1_on |= f1_targets
         t1 = time.perf_counter()
@@ -991,10 +1068,24 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     stated = None
     if pairs and edges:                                      # the written circuit's query-key pairs (state_pairs)
         t3 = time.perf_counter()
-        g, row["pairs"] = state_pairs(ge, tx, wiring.graph(final[0], final[1]), empty, vpd)
-        on_p = torch.zeros_like(final[0])
-        on_p[torch.tensor([index[nd] for nd in g.node_set()], dtype=torch.long, device=on_p.device)] = True
-        final, stated = (on_p, [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]), getattr(g, "pairs", {})
+        g0 = goal_eval.strand(wiring.graph(final[0], final[1]), targets, nat.C)
+        g, row["pairs"] = state_pairs(ge, tx, g0, empty, vpd, acceptance)
+
+        def as_written(h, ps):                               # (node set, connections) of a graph and its circuit JSON
+            on_h = torch.zeros_like(final[0])
+            on_h[torch.tensor([index[nd] for nd in h.node_set()], dtype=torch.long, device=on_h.device)] = True
+            kept_h = [(w, r) for r, ws in h.parents.items() for w in ws] + [(w, None) for w in h.out]
+            return (on_h, kept_h), circuit_json(pr, on_h, kept_h, ps)
+        fits = None
+        if tokens is not None:                               # pairs cost tokens: the answer budget checked with them
+            fits = lambda h, ps: tokens(components.render(as_written(h, ps)[1])) <= max_tokens  # noqa: E731
+        h, stated, dropped = trim_pairs(g0, g, row["pairs"]["per_read"], fits, targets, nat.C)
+        final = as_written(h, stated)[0]
+        if fits is not None:
+            row["pairs"].update(dropped=dropped, entries_kept=stated is not None,
+                                answer_tokens=tokens(components.render(as_written(h, stated)[1])))
+            if dropped:
+                row["pairs"]["kl_written"] = ge.graph_kl(tx, [h], CONVENTION == "live")[0]
         row["pairs"]["seconds"] = time.perf_counter() - t3
     circuits = {"": circuit_json(pr, final[0], final[1], stated), "f1": circuit_json(pr, f1_on), f"vpd_top{k}": circuit_json(pr, topk_on)}
     if vpd_edges and edges:                                  # VPD's own top at the teacher circuit's node count, the same connection search
@@ -1037,6 +1128,8 @@ def main():
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both)")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
+    ap.add_argument("--accept-mode", choices=tuple(TRACK), default="pp", help="--accept changed's term: pp (s_track_pp, "
+                    "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")
     ap.add_argument("--pairs", action="store_true", help="with --edges, the written circuit states its query-key pairs "
                     "(state_pairs: rustmove's greedy, read by read, within the F1 budget)")
     ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "
@@ -1111,7 +1204,8 @@ def main():
         circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
                                          args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
-                                         args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs)
+                                         args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
+                                         args.accept_mode)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

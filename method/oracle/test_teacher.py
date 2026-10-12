@@ -171,9 +171,10 @@ class Toy(teacher.Descent):
 def test_accept_admits_exactly_the_passing_prefix():
     # ranked by the KL a removal leaves: units 0, 1, 2, 3, ...; unit 3 is a guard the accept check refuses to lose (as
     # the robust objective refuses a connection whose cut drops F1 under the flips below its floor). Budget 0.4: the
-    # prefixes 1, 2, 4, 5 are within it, 4 and 5 hold the guard, so round 1 admits 2 (units 0, 1); round 2 admits 1
-    # (unit 2), refusing 2 and 4; round 3 finds every prefix holding the guard and stops. Without the check, round 1
-    # would take 5 (units 0-4, the guard among them).
+    # prefixes 1, 2, 4, 5 are within it, 4 and 5 hold the guard, so round 1 admits 2 (units 0, 1), and of the units
+    # between the admitted prefix and the smallest refused one (2, 3) the guard is refused alone and stays for the
+    # level; round 2 ranks without it and admits 2 (units 2, 4), round 3 1 (unit 5); then no removal is within the
+    # budget. Without the check, round 1 would take 5 (units 0-4, the guard among them).
     guard = 3
     w = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.5, 0.6, 0.7, 0.8]
 
@@ -181,8 +182,13 @@ def test_accept_admits_exactly_the_passing_prefix():
         return [{"guard": True} if bool(on[guard]) else None for on in ons]
     toy, log = Toy(w), []
     toy.prune("unit", 0.4, log=log, accept=accept)
-    assert [x["removed"] for x in log] == [[0, 1], [2]] and all(x["guard"] for x in log)
-    assert toy.on.tolist() == [False, False, False] + [True] * 7
+    assert [x["removed"] for x in log] == [[0, 1], [2, 4], [5]] and all(x["guard"] for x in log)
+    assert toy.on.tolist() == [False, False, False, True, False, False] + [True] * 4
+    # a guard the KL ranks first (its removal lowers KL) is frozen after the first refusal and the descent goes on
+    first = Toy([-0.05] + w[1:])
+    log = []
+    first.prune("unit", 0.4, log=log, accept=lambda ons: [{} if bool(on[0]) else None for on in ons])
+    assert bool(first.on[0]) and [x["removed"] for x in log][:1] == [[1, 2, 3, 4, 5]]
     free = Toy(w)
     free.prune("unit", 0.4, rounds=1)
     assert free.on.tolist() == [False] * 5 + [True] * 5
@@ -277,7 +283,7 @@ def test_changed_acceptance_keeps_its_floor():
     order = [index[(n, int(t), int(c))] for n, t, c in torch.load(VPD_SAVED)["text9000"]["order"] if (n, int(t), int(c)) in index]
     start = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
     start[order[:61]] = True                                    # VPD's top 61, the teacher's top-k on this text
-    acc = teacher.Acceptance(ge, tx, ("changed",))
+    acc = teacher.Acceptance(ge, tx, ("changed",), "c")
     hook, base = acc.hook(lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True), start)
     path = teacher.joint_path(pr, start, empty, vpd, hook, base)
     floor = None if base["s_track"] is None else min(teacher.RECOVERED, base["s_track"])
@@ -294,22 +300,24 @@ def vpd_top(pr, nat, k=61, name="text9000"):
     return start, order[:k]
 
 
-def test_donors_acceptance_admits_exactly_the_passing_sets():
+@pytest.mark.parametrize("kind", ["donors", "pp"])
+def test_acceptance_admits_exactly_the_passing_sets(kind):
     nat, pr = pruner(teacher.CONVENTION == "live")
     ge, tx = pr.ge, pr.tx
     start, order = vpd_top(pr, nat)
     as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
-    acc = teacher.Acceptance(ge, tx, ("donors",))
+    acc = teacher.Acceptance(ge, tx, ("donors",) if kind == "donors" else ("changed",), "pp")
     hook, base = acc.hook(as_nodes, start)
-    assert set(base) == {"s_donor_near", "s_donor_far"}
+    assert set(base) == ({"s_donor_near", "s_donor_far"} if kind == "donors" else {"s_track_pp"})
     ons = start[None].repeat(4, 1)
     for i, k in enumerate((1, 4, 16, 40)):                      # VPD's last k removed
         ons[i, order[-k:]] = False
     got = hook(ons)
-    each = ge.donors_search(tx, [as_nodes(on) for on in ons])
+    graphs = [as_nodes(on) for on in ons]
+    each = ge.donors_search(tx, graphs) if kind == "donors" else ge.changed_search(tx, graphs, mode="pp")
     for g, r in zip(got, each):
         passes = all(base[k] is None or r[k] is None or r[k] >= min(teacher.RECOVERED, base[k]) for k in base)
-        # a set is admitted exactly when both donor terms keep their floors, with donors_search's own numbers
+        # a set is admitted exactly when its terms keep their floors, with the family's own numbers
         assert (g is not None) == passes
         if g is not None:
             assert all(g[k] == r[k] or abs(g[k] - r[k]) <= 1e-4 for k in base)
@@ -337,7 +345,7 @@ def test_connection_acceptance_from_one_plan():
             break
     ons = torch.stack(ons)
     assert ge._edge_subsets(tx, ep.graph, ons)[1] is None and len(ons) == 4
-    acc = teacher.Acceptance(ge, tx, ("changed",))
+    acc = teacher.Acceptance(ge, tx, ("changed",), "c")
     one = acc.scores([graph_of(e) for e in ons], (ep.graph, ons))
     each = acc.scores([graph_of(e) for e in ons])
     # changed_edges' one plan at 0/1 strengths gives changed_search's s_track on the subsets' graphs
@@ -396,6 +404,21 @@ def test_pairs_stated_within_budget():
         back, bad = goal_eval.circuit(teacher.circuit_json(pr, on_p, kept, stated.pairs), tx.targets, nat.C, tx.T)
         assert bad == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 0}
         assert {read: set(ps) for read, ps in getattr(back, "pairs", {}).items()} == {read: set(ps) for read, ps in stated.pairs.items()}
+        if needs:
+            g0 = goal_eval.strand(teacher_g, tx.targets, nat.C)
+            gains = sorted(((r["curve"][i] - r["curve"][i + 1], stated.pairs[(r["layer"], r["t"])][i])
+                            for r in summary["per_read"] for i in range(r["pairs"])), reverse=True)
+            # over an answer budget the lowest-value pairs go first; with none left the reads' entries go too
+            h, ps, dropped = teacher.trim_pairs(g0, stated, summary["per_read"], lambda h, ps: sum(map(len, ps.values())) <= 3,
+                                                tx.targets, nat.C)
+            assert dropped == summary["pairs"] - 3 and set(sum(ps.values(), [])) == {p_ for _, p_ in gains[:3]}
+            assert teacher.trim_pairs(g0, stated, summary["per_read"], lambda h, ps: False, tx.targets, nat.C)[:2] == (g0, None)
+            # with acceptance the pairs also keep the changed-input term of the graph without pairs
+            acc = teacher.Acceptance(ge, tx, ("changed",), "c")
+            stated_a, summary_a = teacher.state_pairs(ge, tx, teacher_g, empty, vpd, acc)
+            got = acc.scores([stated_a])[0]["s_track"]
+            assert summary_a["kl_pairs"] <= summary_a["budget"] * (1 + 1e-5) and summary_a["pairs"] >= summary["pairs"]
+            assert got is None or summary_a["floor"]["s_track"] is None or got >= summary_a["floor"]["s_track"] - 1e-6
 
 
 def test_connect_with_acceptance_keeps_its_floor():
@@ -404,10 +427,26 @@ def test_connect_with_acceptance_keeps_its_floor():
     empty, vpd = ge._bounds(tx, teacher.CONVENTION)
     start, _ = vpd_top(pr, nat)
     conn = teacher.Connector(ge, tx, pr, empty, vpd, lambda *a: 0.0, no_strand=True,
-                             acceptance=teacher.Acceptance(ge, tx, ("changed",)))
+                             acceptance=teacher.Acceptance(ge, tx, ("changed",), "c"))
     n = teacher.measure(pr, start[None], empty, vpd)[0]["n"]
     kept, summary, steps, _, _ = conn.connect(start, n)
     floor = min(teacher.RECOVERED, steps[0]["s_track"])
     # the connection descent without the robust objective reports the last admitted step's s_track, at its floor
     assert "f1_flips" not in summary and summary["s_track"] >= floor and len(kept) == summary["edges"]
     assert all(s_.get("s_track") is None or s_["s_track"] >= floor for s_ in steps)
+
+
+def test_whole_answer_search_joins_only_below_the_floor():
+    if not VPD_SAVED.exists():
+        pytest.skip("needs VPD's answers " + str(VPD_SAVED))
+    ge = goal_eval.GoalEval(native.Native(DEVICE), chunk=32)
+    ids, targets = native.text(native.TEXTS / "vpd4l" / "text9019.json")
+    saved = torch.load(VPD_SAVED)["text9019"]
+    _, row, _ = teacher.teach(ge, ids, targets, 32, saved["answer"], saved["order"], f1_start="both", accept=("changed",),
+                              accept_mode="c")
+    t, w = row["accept_targets"], row["accept_whole"]
+    # with acceptance, the whole answer's F1 search runs (and its circuit joins the target one's) only when the target
+    # circuit misses min(0.9, the whole answer's) on a term
+    below = any(w[k] is not None and t[k] is not None and t[k] < min(teacher.RECOVERED, w[k]) for k in w)
+    assert row["f1_whole_search"] == below
+    assert ("f1_sizes" in row) == below and ("position" in row["levels"]) == below

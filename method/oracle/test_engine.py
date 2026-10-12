@@ -85,6 +85,23 @@ def test_gradients_match_autograd_of_masked_forward():
         assert float((x - y).norm() / x.norm().clamp_min(1e-30)) < REL
 
 
+def test_search_steps_equal_whole_run():
+    """The search precisions' steps (fused norms and GELU, the first layer's embedding products once, the last layer at
+    the targets) in float32 give the whole run's KL within float32 rounding, with its gradients."""
+    nat, ids, targets, masks = setup(B=3)
+    eng = engine.Engine(nat, ids, targets, live=True)
+    a = {n: m.clone().requires_grad_(True) for n, m in masks.items()}
+    b = {n: m.clone().requires_grad_(True) for n, m in masks.items()}
+    want = eng.kl(a)
+    got = carry.kl(eng.ref, torch.log_softmax(eng.hidden(b, search=True) @ nat.target.wte.T, -1))
+    assert rel(want[1:], got[1:]) < REL
+    assert abs(float((want[0] - got[0]).detach())) < 1e-6   # every subcomponent on: the model itself, KL ~0 bits
+    want.sum().backward()
+    got.sum().backward()
+    for n in nat.names:
+        assert float((a[n].grad - b[n].grad).norm() / a[n].grad.norm().clamp_min(1e-30)) < REL
+
+
 def answer(nat, ids) -> list:
     """VPD's answer on the text as (matrix, position, subcomponent) nodes: its causal-importance network's, or VPD_SAVED's."""
     if nat.has_importance:

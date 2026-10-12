@@ -56,6 +56,8 @@ class Engine:
         with torch.no_grad():
             self.ref = nat.reference([self.ids], self.targets)
             self.emb = tg.wte[torch.tensor(self.ids, device=self.dev)][None]  # [1, T, d]
+        self._targets = torch.tensor(self.targets, device=self.dev)
+        self._causal_targets = torch.arange(self.T, device=self.dev)[None, :] <= self._targets[:, None]  # [targets, T]
         self.columns = {n: (None if columns is None or columns.get(n) is None else columns[n].to(self.dev)) for n in nat.names}
         self.V, self.U, self.R = {}, {}, {}
         for n in nat.names:
@@ -79,15 +81,21 @@ class Engine:
             return (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, self.eps)), (lambda x: F.gelu(x, approximate="tanh"))
         return (lambda x, w: self.rms(x, w, self.eps)), self.gelu
 
-    def hidden(self, masks: dict, fused: bool) -> torch.Tensor:
-        """The final normed residual stream at the targets [B, len(targets), d] of the masked run."""
+    def hidden(self, masks: dict, search: bool) -> torch.Tensor:
+        """The final normed residual stream at the targets [B, len(targets), d] of the masked run. search: torch's
+        fused norms and GELU, the first layer's products of the embedding computed once for every row, and the last
+        layer's queries, attention output and MLP at the targets alone (the only positions the prediction reads):
+        float32-close to the whole run, for a search's steps (~27% fewer products); otherwise every step as
+        vpd_model.Target.hidden."""
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         B = next(iter(masks.values())).shape[0]
-        norm, act = self._steps(fused)
-        x = self.emb.expand(B, -1, -1)
+        norm, act = self._steps(search)
+        x = self.emb if search else self.emb.expand(B, -1, -1)
         for i in range(tg.n_layer):
             name = lambda k: native.site_name(i, k)  # noqa: E731
             h = norm(x, tg.norms[2 * i])
+            if search and i == tg.n_layer - 1:
+                return self._last(masks, x, h, name, norm, act, B)
             q, k, v = (self._site(name(kd), h, masks[name(kd)]).view(B, T, H, hd).transpose(1, 2)
                        for kd in ("q_proj", "k_proj", "v_proj"))
             y = F.scaled_dot_product_attention(tg._rope(q, T), tg._rope(k, T), v, is_causal=True)
@@ -96,12 +104,27 @@ class Engine:
             x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, masks[name("c_fc")])), masks[name("down_proj")])
         return norm(x, tg.ln_f)[:, self.targets]  # the final norm over every position, as vpd_model.Target.hidden
 
+    def _last(self, masks, x, h, name, norm, act, B):
+        """The last layer at the targets: keys and values at every position, the rest at the targets."""
+        tg, T, H, hd, sel = self.tg, self.T, self.H, self.hd, self._targets
+        at = lambda m: m[:, sel] if m.shape[1] > 1 else m  # noqa: E731
+        n = len(self.targets)
+        q = self._site(name("q_proj"), h[:, sel], at(masks[name("q_proj")])).view(B, n, H, hd).transpose(1, 2)
+        k, v = (self._site(name(kd), h, masks[name(kd)]).view(B, T, H, hd).transpose(1, 2) for kd in ("k_proj", "v_proj"))
+        half = hd // 2
+        q = q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]  # _rope at the targets
+        y = F.scaled_dot_product_attention(q, tg._rope(k, T), v, attn_mask=self._causal_targets)
+        x = x[:, sel] + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, n, -1), at(masks[name("o_proj")]))
+        h = norm(x, tg.norms[2 * tg.n_layer - 1])
+        x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, at(masks[name("c_fc")]))), at(masks[name("down_proj")]))
+        return norm(x, tg.ln_f)
+
     def kl(self, masks: dict, precision: str = "score") -> torch.Tensor:
         """KL in bits of the model at the targets from each row's masked run [B] (summed over the targets)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         with _precision(precision, self.dev):
-            h = self.hidden(masks, fused=False) if precision == "score" else self._search(masks, fused=True)
+            h = self.hidden(masks, search=False) if precision == "score" else self._search(masks, search=True)
             lq = torch.log_softmax((h @ self.tg.wte.T).float(), -1)
         return carry.kl(self.ref, lq)
 

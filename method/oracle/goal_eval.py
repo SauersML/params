@@ -112,6 +112,7 @@ FLIP_TERM = 4  # the flip budget C's adversarial member (and the reward's) takes
 SCREEN = 256  # the adversary's shortlist measured one by one: the parts with the largest gradient either way (a part's
 # whole removal can move the other way from its gradient: text-free tiny model, the best single removal ranks last)
 SCREEN_ROWS = 16  # rows per run when measuring the shortlist
+CHANGED_ROWS = 64  # the changed-input family's circuit rows per run on the changed texts (circuits x changed texts)
 FLIP_ROWS = 160  # adversary_flips' rows per run: every circuit's restarts at every budget (8 x 5 x 4) together
 INTERCHANGE_DRAWS = 16  # C's interchange draws per circuit
 CHANGED_DRAWS = 16  # C's changed texts per circuit
@@ -1544,6 +1545,59 @@ class GoalEval:
         first = first or {}
         return sorted(pairs, key=lambda pz: (first.get(pz[0], 0), hashlib.sha256(repr((seed, pz)).encode()).digest()))[:draws]
 
+    @torch.no_grad()
+    def _changed_logq(self, tx: Text, graphs: list[native.Graph], got: list) -> tuple:
+        """Circuits' log q at the targets in C's semantics (_circuit_logq's: a stated graph as stated, a complete one as
+        its subcomponents' masked run, the remainders live) on the text [G, targets, V] and on each changed text (p, z)
+        of got (a list of [G, targets, V]): one engine on the text, and every changed text run from the earliest change
+        in its batch on, reusing the text's run before it (engine.Engine.graph_log_probs reuse: the model is causal),
+        CHANGED_ROWS rows a batch."""
+        nat, T = self.nat, tx.T
+        E = self._circuit_engine(tx.ids, tx.targets, graphs)
+        plan = E.plan(list(graphs), semantics="c")
+        u = None
+        if any(g.complete for g in graphs):  # a complete graph runs as u: 1 on its subcomponents
+            u = {n: torch.zeros(len(graphs), T, E.width(n), device=nat.dev) for n in nat.names}
+            for b, g in enumerate(graphs):
+                if g.complete:
+                    for n, m in self.masks(g, T).items():
+                        u[n][b] = m[:, E.columns[n]].float()
+        st = {}
+        q0 = E.graph_log_probs(plan, u, keep=st)
+        G, out = len(graphs), []
+        per = max(1, CHANGED_ROWS // G)
+        for s0 in range(0, len(got), per):
+            part = got[s0:s0 + per]
+            D = len(part)
+            tok = torch.tensor(tx.ids).repeat(D * G, 1)
+            for d, (p, z) in enumerate(part):
+                tok[d * G:(d + 1) * G, p] = z
+            lq = E.graph_log_probs(E.repeat(plan, D), None if u is None else {n: m.repeat(D, 1, 1) for n, m in u.items()},
+                                   reuse=(E.tile_states(st, D), tok, min(p for p, _ in part)))
+            out += list(lq.split(G))
+            native.free(nat.dev)
+        return q0, out
+
+    @torch.no_grad()
+    def _changed_vpd(self, tx: Text, got: list) -> tuple:
+        """VPD's answer's log q at the targets (its masked run, the remainders live) on the text and on each changed
+        text of got, kept on the text (they do not depend on the circuits: a teacher's candidate sets share them)."""
+        cache = tx.__dict__.setdefault("_changed", {})
+        key = (id(tx.vpd), int(torch.stack([m.sum() for m in tx.vpd.values()]).sum()))
+        if cache.get("key") != key:
+            cache.clear()
+            cache["key"] = key
+        if "v0" not in cache:
+            cache["v0"] = self.runs(tx.ids, tx.targets, [tx.vpd], True)
+        out = []
+        for p, z in got:
+            if (p, z) not in cache:
+                x = list(tx.ids)
+                x[p] = z
+                cache[(p, z)] = self.runs(x, tx.targets, [tx.vpd], True)
+            out.append(cache[(p, z)])
+        return cache["v0"], out
+
     def _circuit_logq(self, ids: list[int], targets: list[int], graphs: list[native.Graph]) -> torch.Tensor:
         """log q at the targets [len(graphs), len(targets), V] of circuits in C's semantics on ids: a stated graph as
         stated (_graph_logq), a complete one as its masked run with live remainders (runs)."""
@@ -1586,15 +1640,13 @@ class GoalEval:
             if positions and tx.vpd is not None else []
         acc = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # sum of w s, of w, of w KL_C; prompts scored
         trk = [[0.0, 0.0, 0.0, 0] for _ in graphs]  # the same for s_track
-        q0 = self._circuit_logq(tx.ids, tx.targets, graphs) if got else None
-        v0 = self.runs(tx.ids, tx.targets, [tx.vpd], True) if got else None
-        for p, z in got:
+        q0, lcs = self._changed_logq(tx, graphs, got) if got else (None, [])
+        v0, lvs = self._changed_vpd(tx, got) if got else (None, [])
+        for (p, z), lc, lv in zip(got, lcs, lvs):
             x = list(tx.ids)
             x[p] = z
             ref = nat.reference([x], tx.targets)
             w = float(carry.kl(ref, tx.ref)[0])
-            lv = self.runs(x, tx.targets, [tx.vpd], True)
-            lc = self._circuit_logq(x, tx.targets, graphs)
             kv = float(carry.kl(ref, lv)[0])
             kc = carry.kl(ref, lc).tolist()
             k0 = carry.kl(ref, q0).tolist()

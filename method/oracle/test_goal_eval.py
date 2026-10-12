@@ -1455,3 +1455,29 @@ def test_families_called_alone_drop_stranded_nodes(tiny):
     assert na["n_real_flips"] == nb["n_real_flips"]
     ra, rb = (ge.real_removal(tx, [g])[0] for g in (a, b))
     assert ra["n_real_live"] == rb["n_real_live"]
+
+
+@pytest.mark.parametrize("rows", [64, 4])
+def test_changed_runs_reuse_the_text(tiny, monkeypatch, rows):
+    """changed_inputs' runs on the changed texts: the circuits from each batch's earliest change on, reusing the text's
+    run before it (_changed_logq, CHANGED_ROWS rows a batch), are _circuit_logq's full-length runs on each changed text
+    (stated graphs and a complete one; KL from the model within float32 rounding), and q0 is its run on the text;
+    VPD's answer's runs on them (_changed_vpd) are runs() there, kept on the text."""
+    nat, ge, tx = tiny
+    monkeypatch.setattr(goal_eval, "CHANGED_ROWS", rows)
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [goal_eval.strand(random_graph(nat, tx, s), tx.targets, nat.C) for s in (1, 2)] + [native.Graph(nodes[::3], complete=True)]
+    got = [(5, 7), (8, 3), (11, 9), (5, 2)]
+    with torch.no_grad():
+        q0, lcs = ge._changed_logq(tx, graphs, got)
+        v0, lvs = ge._changed_vpd(tx, got)
+        assert float((q0 - ge._circuit_logq(tx.ids, tx.targets, graphs)).abs().max()) < 1e-4
+        assert torch.equal(v0, ge.runs(tx.ids, tx.targets, [tx.vpd], True))
+        for (p, z), lc, lv in zip(got, lcs, lvs):
+            x = list(tx.ids)
+            x[p] = z
+            ref = nat.reference([x], tx.targets)
+            want = carry.kl(ref, ge._circuit_logq(x, tx.targets, graphs))
+            assert float(((carry.kl(ref, lc) - want).abs() / want.abs().clamp_min(1e-6)).max()) < 1e-4, (p, z)
+            assert torch.equal(lv, ge.runs(x, tx.targets, [tx.vpd], True))
+        assert all(a is b for a, b in zip(lvs, ge._changed_vpd(tx, got)[1]))

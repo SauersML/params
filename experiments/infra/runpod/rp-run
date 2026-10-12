@@ -168,11 +168,11 @@ fi
 RP=$MAC_DATA/runpod LEDGER=$MAC_DATA/runpod/LEDGER.tsv ACTIVE=$MAC_DATA/runpod/active
 # CUDA 12.4 devel: NVRTC and the CUDA libraries the device code loads at run time.
 IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
-# Hosts whose driver runs what the image's CUDA toolkit (NVRTC) compiles: driver CUDA versions at or
-# above the toolkit's, from those RunPod's pod request accepts.
-TOOLKIT=$(sed -nE 's/.*-cuda([0-9]+[.][0-9]+).*/\1/p' <<< "$IMAGE")
-CUDA_OK=$(jq -nc --arg t "$TOOLKIT" '["11.8","12.0","12.1","12.2","12.3","12.4","12.5","12.6","12.7","12.8","12.9","13.0"]
-    | map(select((split(".") | map(tonumber)) >= ($t | split(".") | map(tonumber))))')
+# Hosts whose driver runs what the image's CUDA toolkit (NVRTC) compiles: driver CUDA at or above the
+# toolkit's, checked on the pod (launch). The pod request names no CUDA versions: its list
+# (allowedCudaVersions) accepts none above 13.0, and on 10-12 RunPod's 4090s were only on hosts
+# reporting 13.2, its 5000 Adas on 13.1, so naming versions left those types out of stock.
+CUDA_MIN=$(sed -nE 's/.*-cuda([0-9]+[.][0-9]+).*/\1/p' <<< "$IMAGE")
 # A run replaces a pod its host lost at most RELAUNCHES times, and discards at most DISCARDS pods on
 # hosts that fail its checks (no SSH, no CUDA, recorded as failing) before it gives up.
 RELAUNCHES=3 DISCARDS=5
@@ -1649,7 +1649,7 @@ if [ -n "${RP_PYENV:-}" ]; then
     # A set whose torch is built for a newer CUDA than the image's takes only hosts whose driver
     # supports that CUDA ("# cuda: X.Y" in its first lines).
     need=$(sed -nE '1,5s/^# cuda: ([0-9]+[.][0-9]+).*/\1/p' <<< "$PYENV_REQS")
-    [ -z "$need" ] || CUDA_OK=$(jq -c --arg t "$need" 'map(select((split(".") | map(tonumber)) >= ($t | split(".") | map(tonumber))))' <<< "$CUDA_OK")
+    [ -z "$need" ] || CUDA_MIN=$(printf '%s\n%s\n' "$CUDA_MIN" "$need" | sort -t. -k1,1n -k2,2n | tail -n 1)
     # One environment per pinned set, shared by the runs on a pod.
     PYENV_DIR=/workspace/pyenv/$(shasum <<< "$PYENV_REQS" | cut -c1-12)
 fi
@@ -1682,10 +1682,10 @@ create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS
     local start="(echo \$BASHPID > /rp-watchdog.pid; sleep $3; runpodctl remove pod \"\$RUNPOD_POD_ID\" || runpodctl pod delete \"\$RUNPOD_POD_ID\") > /rp-watchdog.log 2>&1 & exec /start.sh"
     # Rust builds and the host half of a step want more than the default 2 vCPUs and 8 GB per GPU.
     jq -nc --arg name "mpd2951-$NAME" --arg image "$IMAGE" --arg gpu "$2" --arg cloud "${1%%:*}" \
-        --arg keys "$4" --argjson disk "$DISK" --arg start "$start" --argjson cuda "$CUDA_OK" --argjson ram "${RP_MIN_RAM_GB:-32}" \
+        --arg keys "$4" --argjson disk "$DISK" --arg start "$start" --argjson ram "${RP_MIN_RAM_GB:-32}" \
         '{name: $name, imageName: $image, computeType: "GPU", gpuTypeIds: [$gpu], gpuCount: 1, cloudType: $cloud,
           containerDiskInGb: $disk, volumeInGb: 0, ports: ["22/tcp"], supportPublicIp: true,
-          env: {PUBLIC_KEY: $keys}, dockerStartCmd: ["bash", "-c", $start], allowedCudaVersions: $cuda,
+          env: {PUBLIC_KEY: $keys}, dockerStartCmd: ["bash", "-c", $start],
           minVCPUPerGPU: 8, minRAMPerGPU: $ram}'
 }
 
@@ -2270,6 +2270,10 @@ launch() {
         elif ! on_pod 'python3 -c "import ctypes; c = ctypes.CDLL(\"libcuda.so.1\"); n = ctypes.c_int(); assert c.cuInit(0) == 0 and c.cuDeviceGetCount(ctypes.byref(n)) == 0 and n.value > 0"' < /dev/null > /dev/null 2>&1; then
             say "CUDA does not initialize on host ${host:-?} ($(on_pod 'nvidia-smi --query-gpu=driver_version --format=csv,noheader' < /dev/null 2> /dev/null)); deleting pod $POD"
             why=("broken driver" "CUDA does not initialize")
+        elif ! on_pod "python3 -c \"import ctypes; c = ctypes.CDLL('libcuda.so.1'); v = ctypes.c_int(); assert c.cuDriverGetVersion(ctypes.byref(v)) == 0 and v.value >= $(( ${CUDA_MIN%%.*} * 1000 + ${CUDA_MIN#*.} * 10 ))\"" < /dev/null > /dev/null 2>&1; then
+            # The pod request names no CUDA versions (CUDA_MIN): a driver older than the toolkit cannot run what it compiles.
+            say "the driver on host ${host:-?} supports a CUDA below $CUDA_MIN; deleting pod $POD"
+            why=("broken driver" "driver CUDA below $CUDA_MIN")
         elif ! on_pod 'ls /usr/local/cuda/lib64/libnvrtc.so* > /dev/null 2>&1 || ldconfig -p | grep -q libnvrtc' < /dev/null; then
             # The device code compiles through NVRTC at run time: an image without it cannot run it.
             say "the machine has no NVRTC (libnvrtc); deleting pod $POD"

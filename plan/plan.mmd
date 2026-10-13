@@ -79,12 +79,17 @@
 %% Both arms frozen before scoring,44 first samples, actual $.064117053; all44 valid,179/179 questions per arm.
 %% Full235/358=65.64%, summaries removed223/358=62.29%; best cheap activation231/358=64.53%.
 %% Full wins12/ties4/loses6 texts versus removal, but beats the best cheap control by only4 fields.
+%% Paired text-bootstrap95% intervals: full-minus-removed [-1.09,+7.54]pp; full-minus-activation [-3.01,+5.16]pp.
+%% Gains concentrate in token-change falls and connection cuts. Test displayed-effect controls using train-only fitting.
 %% Decision: no further blind SFT scaling; require useful unseen-intervention gains beyond frozen cheap controls.
 %% QA inputs contain causal summaries/CI/activation/wiring cosines, NOT raw U/V vectors; ablation cannot establish weight use.
 %% Relation6011: actual VPD groups T77/O73/A140 from8 construction donors, independent relation donors, fixed sites.
 %% Eval carrier scores T.761/O.979/A.591 vs native .681/.995/.997; matching-restoration fails. No mechanism verified.
 %% This distinguishes T localization failure from A union-coverage/remainder failure; does not prove VPD cannot carry the role.
-%% Next A control: full3072 rank-one units vs sparse union vs block; no more free-prose sampling before adequate evidence.
+%% Richer A1757 family across20 sites eval .903; its376-piece h0fc@233 subset contains all140 frozen pieces.
+%% This does not isolate coverage: the richer carrier also changes sites. Immutable snapshot retained.
+%% Next A control ready: same-site140/376/all3072/native on identical disjoint donors via existing var_controls.
+%% No duplicate scorer while the local slot is occupied; consume compatible var_masks results when available.
 %% Toy-loop reward executes selected UNITS only; Mermaid edges previously affected structural F1, not executable reward.
 %% 9789f31 adds opt-in --wiring: architecture-constrained edges compile to native pieces, with all selected pieces retained.
 %% Token-role arrows remain annotations and English unverified; diagnostic is point sufficiency, not intervention certification.
@@ -180,7 +185,7 @@ flowchart BT
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
   VAR["<b>Variables and invariants</b><br/>carriers, value maps, E4 v2 checker;<br/>nulls and triviality check running;<br/>influential_v2 variables next<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
-  ENGP["<b>VPD relational mechanisms</b><br/>6011: only 1 of 3 carriers passes;<br/>joint matching restoration fails;<br/>separate coverage from remainder loss<br/>CHECK · codex/variable_reward"]
+  ENGP["<b>VPD relational mechanisms</b><br/>joint matching restoration fails;<br/>richer A carrier .903: test coverage;<br/>same-site coverage/remainder control ready<br/>CHECK · codex/variable_reward"]
   WIRING["<b>Execute the stated wiring</b><br/>architecture-constrained compiler;<br/>edge removal changes predictions;<br/>4 tests and full CI pass; score learned edges<br/>IMPLEMENTED · codex · f64be01"]
 
   subgraph BASE["FOUNDATIONS"]

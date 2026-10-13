@@ -15,9 +15,11 @@ KL(model(x') || model(x)) per donor x' (B token at an input position), the KL-we
   wrong variables: value maps the model does not compute (a random balanced split of B's tokens, token-id parity), each
     scored with every candidate carrier (single-site blocks, layers, the families: the real search's budget) by
     min(f_diff, f_same) (f_same = 1 - KL(model(x) || patched) / KL(model(x) || model(x'))), against the real value map
-    (classes from A's patched runs, B's tokens assigned by the model's own prediction on x': class 0 when it keeps
-    the text's top token, else the class predicting that token) with the same carriers, on A (assigned in-sample)
-    and on B (disjoint donors);
+    (classes from A's patched runs with the whole position, B's tokens assigned by that carrier's own separation, the
+    same-class test var_classes uses: class 0 when the whole position patched from x' keeps f_same >= GOAL, else the
+    class predicting the patched run's top token; until 10-13 by the model's top token on x', which ignores what the
+    carrier separates) with the same carriers less the assigning one (scoring it would be in-sample), on A (assigned
+    in-sample) and on B (disjoint donors);
   off-target, what s 1.0 measures: variables.Scorer's off-target test patches the carrier from a donor changing a token
     outside I and asks that the prediction stay; a carrier at I is the same on x and x' when the change lies after I
     (the model is causal), so those draws pass by construction; the informative ones change a token before I.
@@ -185,21 +187,22 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, log=print) -> dict:
         curve.append({"size": k, "f_mean": float(np.mean([x for x in fs if x is not None])) if any(x is not None for x in fs) else None})
         var_teacher.release(nat.dev)
     out["random_curve"] = curve
-    # value maps: the real one (classes from A's patched runs with the whole position's carrier, B assigned by the
-    # model's own prediction) and the wrong ones, each with every candidate carrier
+    # value maps: the real one (classes from A's patched runs with the whole position's carrier, B assigned by that
+    # carrier's same-class test) and the wrong ones, each with every candidate carrier but the whole position
     vm = {q: var_classes.classes(sc, tx, {"name": "v", "inputs": list(ins), "group": triv["group"]}, q) for q in ins}
-    y0 = int(R.base[-1].argmax())
 
     def real_classes(q, zs, assign):  # same-class and other-class donors under the real map
         own = set(vm[q]["values"][0]["token_ids"])
         by_pred = {c["predicts_id"]: c["id"] for c in vm[q]["values"][1:]}
         same, diff = [], []
-        for z in zs:
+        pq = R.patched(triv["group"], [(q, z) for z in zs]) if assign == "B" else [None] * len(zs)
+        for z, qq in zip(zs, pq):
             if assign == "A":
                 cls = 0 if z in own else next((c["id"] for c in vm[q]["values"] if z in c["token_ids"]), None)
-            else:
-                top = int(R.donor(q, z)["lq"][-1].argmax())
-                cls = 0 if top == y0 else by_pred.get(top, -1)
+            else:  # the whole position's own separation: the same-class test on its patched run
+                d0 = kl(R.base, R.donor(q, z)["lq"])
+                f_same = 1.0 - max(kl(R.base, qq), 0.0) / d0 if d0 > 1e-6 else None
+                cls = 0 if f_same is None or f_same >= goal_eval.GOAL else by_pred.get(int(qq[-1].argmax()), -1)
             (same if cls == 0 else diff).append((q, z))
         return same, diff
     sub = {q: sorted(A[q], key=lambda z: hashlib.sha256(repr(("A", int(tx.seed), q, z)).encode()).digest())[:len(B[q])] for q in ins}
@@ -212,6 +215,7 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, log=print) -> dict:
         maps.setdefault("token-id parity on B", []).append(
             ([(q, z) for z in B[q] if z % 2 == tx.ids[q] % 2], [(q, z) for z in B[q] if z % 2 != tx.ids[q] % 2]))
     budget = {r["how"]: r["group"] for r in rows} | {k: v for k, v in carriers.items() if k.startswith("family")}
+    budget = {h: g for h, g in budget.items() if sorted(g) != sorted(triv["group"])}  # the assigning carrier left out
     out["value_maps"] = {}
     for mname, per in maps.items():
         same = [x for s, _ in per for x in s]

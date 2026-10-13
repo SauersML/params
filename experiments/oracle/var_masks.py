@@ -146,6 +146,7 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
             row = {"lam": lam, "targets": kind, "size": len(keep), "bits": bits(len(keep)), "f_B": f,
                    "iso_B": f_off(keep, per_q := {}) if kind == "real" else None,
                    "iso_by_position": per_q if kind == "real" else None,
+                   "cause_by_position": {q: R.f_on(keep, [x for x in pzB if x[0] == q]) for q in ins} if kind == "real" and len(ins) > 1 else None,
                    "scorer": dict(scorer) if kind == "real" else None,
                    "random_same_size": float(np.mean([x for x in rnd if x is not None])) if any(x is not None for x in rnd) else None}
             out["masks"].append(row)
@@ -173,6 +174,7 @@ def main():
                     help="the mask's candidates: VPD's active family, or every subcomponent at the carrier positions")
     ap.add_argument("--from-dir", type=Path, help="every kept intermediate variable in var_teacher's files there")
     ap.add_argument("--jobs", type=Path, help='JSON lines {"task", "inputs", "at"} (a pod uploads one file)')
+    ap.add_argument("--job-index", type=int, help="only the job on that line of --jobs (a cluster array's task)")
     ap.add_argument("--lam", default="0.001,0.01,0.1")
     ap.add_argument("--out", type=Path, default=native.TEXTS.parent / "semantic" / "masks.jsonl")
     ap.add_argument("--device")
@@ -197,6 +199,8 @@ def main():
             occ = [j for j in range(t) if ids[j] == ids[t]]  # the copied token's position: after the earlier occurrence
             if occ:
                 jobs.append((x["task"], (occ[-1], occ[-1] + 1), (t,), ()) if args.read else (x["task"], (occ[-1] + 1,), None, ()))
+    if args.job_index is not None:
+        jobs = jobs[args.job_index:args.job_index + 1]
     depths = [int(x) for x in args.depth.split(",")] if args.depth else [None]
     for t, ins, at, skip in jobs:
         task = json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())

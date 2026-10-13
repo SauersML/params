@@ -305,7 +305,17 @@ def parse_invariants(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
                 if r:
                     iv["remove"].append(r.group(1))
                 elif t:
-                    ch = {int(p): tok(z) for p, z in _CHANGE.findall(t.group(2))}
+                    donor, ch, end = t.group(2), {}, 0
+                    for change in _CHANGE.finditer(donor):
+                        if donor[end:change.start()].strip():
+                            raise ValueError(part)
+                        p = int(change.group(1))
+                        if p in ch:
+                            raise ValueError(part)
+                        ch[p] = tok(change.group(2))
+                        end = change.end()
+                    if donor[end:].strip():
+                        raise ValueError(part)
                     if not ch or None in ch.values():
                         raise ValueError(part)
                     iv["transplants"].append((t.group(1), ch))

@@ -64,3 +64,43 @@ def test_fit_gate():
     assert semantic.fit_gate(rows, 23)[0] == ("AND", 1.0)
     rows = [(a, b, 23 if a == b else 24) for a in (False, True) for b in (False, True)]
     assert semantic.fit_gate(rows, 23)[0] == ("XNOR", 1.0)
+
+
+@pytest.fixture
+def invariant_tokenizer(monkeypatch):
+    tokens = {"' x'": 1, "' y'": 2, "' z'": 3, "' a,b'": 4}
+    monkeypatch.setattr(components, "_token_of", lambda model, text: tokens.get(text))
+
+
+@pytest.mark.parametrize("donor", ["@0=' x' unless V2 is false", "if V2 @0=' x'",
+                                   "@0=' x' and @1=' z'", "@0=' x' @0=' z'",
+                                   "@0=' x' @0=' x'", "@0=' missing'"])
+def test_invariant_donor_claim_must_be_fully_executable(invariant_tokenizer, donor):
+    got, bad = semantic.parse_invariants(f"I1: V1 from {donor} -> top ' y'")
+    assert got == [] and bad == 1
+
+
+def test_invariant_donor_preserves_complete_multiple_changes(invariant_tokenizer):
+    got, bad = semantic.parse_invariants("I1: V1 from @0=' x' @1=' a,b' -> top ' y'")
+    assert bad == 0
+    assert got[0]["intervention"]["transplants"] == [("V1", {0: 1, 1: 4})]
+
+
+def test_unexecuted_condition_cannot_earn_verified_english_credit(invariant_tokenizer, monkeypatch):
+    executed = []
+    class FakeChecker:
+        def __init__(self, *args):
+            pass
+        def check(self, items):
+            executed.extend(items)
+            return [{"holds": True, "credit": 3.0} for _ in items]
+        def close(self):
+            pass
+    monkeypatch.setattr(semantic, "Checker", FakeChecker)
+    good = "I1: V1 from @0=' x' -> top ' y'"
+    assert semantic.check_invariants(None, None, [{"name": "V1"}], good)["credit"] == 3.0
+    executed.clear()
+    unsupported = "I1: V1 from @0=' x' unless V2 is false -> top ' y'"
+    result = semantic.check_invariants(None, None, [{"name": "V1"}], unsupported)
+    assert result["bad"] == 1 and result["holds"] == 0.0 and result["credit"] == -1.0
+    assert result["invariants"] == [] and executed == []

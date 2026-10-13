@@ -529,13 +529,156 @@ def report():
     return out
 
 
+CIRCUIT_EPS = 0.1  # bits of phi an oracle circuit must beat every variant by (the final evaluation's margin)
+
+
+def remap(answer: dict, where: dict) -> dict:
+    """An answer (goal_eval.circuit's JSON) with its nodes' positions and its pair entries' read positions moved by
+    where ({old position: new}; others kept): edges are node places, so the structure moves with the nodes."""
+    out = dict(answer)
+    out["nodes"] = [[m, c, where.get(int(p), int(p))] for m, c, p in answer.get("nodes", [])]
+    out["edges"] = [["pair", e[1], e[2], e[3], where.get(int(e[4]), int(e[4]))] if isinstance(e, (list, tuple)) and len(e) == 5
+                    and e[0] == "pair" else e for e in answer.get("edges", [])]
+    return out
+
+
+def duplicated(answer: dict, where: dict) -> dict:
+    """The answer plus a copy of its nodes at the positions where maps (each copied node at its new position) and of
+    every edge touching a copied node (a copy's edges to an uncopied node go to that same node)."""
+    nodes = [list(n) for n in answer.get("nodes", [])]
+    copy = {}
+    for i, (m, c, p) in enumerate(answer.get("nodes", [])):
+        if int(p) in where:
+            copy[i] = len(nodes)
+            nodes.append([m, c, where[int(p)]])
+    edges = list(answer.get("edges", []))
+    for e in answer.get("edges", []):
+        if isinstance(e, (list, tuple)) and len(e) == 2 and (e[0] in copy or e[1] in copy):
+            edges.append([copy.get(e[0], e[0]), copy.get(e[1], e[1])])
+    return {**answer, "nodes": nodes, "edges": edges}
+
+
+def circuit_variants(answer: dict, t: int, T: int, key: tuple, other_offsets: list, D: int) -> dict:
+    """The general wrong variants of an oracle circuit on a text with target t: (a) source moved: every context position
+    (a node position other than t) to a distinct random earlier position the circuit does not use; (b) fixed offset:
+    the context positions, nearest first, to t - D, t - D - 1, ... (D the answer file's median context distance); (d)
+    irrelevant parts: the circuit plus a copy of its context nodes at positions at least 10 from every circuit position,
+    with their edges; (g) mismatched: the context positions, nearest first, at another answer's distances from its
+    target. A circuit without context positions has (d) alone (a copy of its target nodes 10 or more positions back)."""
+    pos = sorted({int(p) for _, _, p in answer.get("nodes", [])})
+    ctx = sorted((p for p in pos if p != t), key=lambda p: t - p)  # nearest first
+    free = [q for q in range(t) if q not in pos]
+    r = rng_of("circuit-variants", *key)
+    out = {}
+    if ctx and len(free) >= len(ctx):
+        out["a_source_moved"] = remap(answer, dict(zip(ctx, (int(q) for q in r.choice(free, size=len(ctx), replace=False)))))
+        fixed, q = {}, t - D
+        for p in ctx:
+            while q in pos or q in fixed.values():
+                q -= 1
+            if q < 0:
+                break
+            fixed[p] = q
+            q -= 1
+        if len(fixed) == len(ctx) and fixed != {p: p for p in ctx}:
+            out["b_fixed_offset"] = remap(answer, fixed)
+        if other_offsets:
+            offs = other_offsets[int(r.integers(len(other_offsets)))]
+            mis = {}
+            for p, d in zip(ctx, offs + [offs[-1] + k + 1 for k in range(len(ctx))]):
+                q = t - d
+                while q >= 0 and (q in pos or q in mis.values()):
+                    q -= 1
+                if q < 0:
+                    break
+                mis[p] = q
+            if len(mis) == len(ctx) and mis != {p: p for p in ctx}:
+                out["g_mismatched"] = remap(answer, mis)
+    src = ctx or [t]
+    far = [q for q in range(t) if min(abs(q - p) for p in pos) >= 10]
+    if len(far) >= len(src):
+        out["d_irrelevant_parts"] = duplicated(answer, dict(zip(src, (int(q) for q in r.choice(far, size=len(src), replace=False)))))
+    return out
+
+
+def circuits(answers_path: Path, out_path: Path, eps: float = CIRCUIT_EPS):
+    """The final evaluation's falsification column (primerl's final_eval.sh): per answer line ({"task", "sample",
+    "text"}; its circuit components.parse(text)["answer"]) on the task's text, the circuit and its general wrong
+    variants (circuit_variants) scored by phi on the eval split (reward mode, the text's families from ge.tau, as
+    components.reward reads them; the CI-pattern pool POOL), and reward v3's circuit term R = cap_phi - phi_tau + g x
+    0.5 compact beside it. -> out_path (JSON): per answer the circuit's phi and R, each variant's, and beats_all: phi
+    above every variant's by more than eps; with a summary (the share of answers that beat all, per variant the share
+    beaten). Resumable: answers already in out_path are kept."""
+    import components
+    import goal_eval
+    import native
+    import torch
+
+    lines = [json.loads(x) for x in answers_path.read_text().splitlines() if x.strip()]
+    got = json.loads(out_path.read_text()) if out_path.exists() else {"answers": []}
+    done = {(a["task"], a["sample"]) for a in got["answers"]}
+    ge = goal_eval.GoalEval(native.Native())
+    nat = ge.nat
+    pool = torch.load(POOL, weights_only=False) if POOL.exists() else None
+    parsed = []
+    for ln in lines:
+        task = json.loads((TEXTS / f"{ln['task']}.json").read_text())
+        t = task["prompts"][0]["target_positions"][-1]
+        parsed.append((ln, task, t, components.parse(ln["text"])["answer"]))
+    offsets = [sorted(t - int(p) for _, _, p in a.get("nodes", []) if int(p) != t) for _, _, t, a in parsed]
+    offsets = [o for o in offsets if o]
+    D = int(np.median([d for o in offsets for d in o])) if offsets else 8
+    for k, (ln, task, t, answer) in enumerate(parsed):
+        if (ln["task"], ln["sample"]) in done:
+            continue
+        pr = task["prompts"][0]
+        tx = ge.text(pr["token_ids"], pr["target_positions"], task=task)
+        others = [o for j, o in enumerate(offsets) if parsed[j][0]["task"] != ln["task"]]
+        answers = {"circuit": answer, **circuit_variants(answer, t, tx.T, (ln["task"], ln["sample"]), others, D)}
+        graphs = {v: goal_eval.circuit(a, tx.targets, nat.C, tx.T)[0] for v, a in answers.items()}
+        tau = ge.tau(tx, pool, "eval")
+        rows = []
+        for g in graphs.values():  # one at a time: the engine spans its call's columns
+            rows += ge.fidelity(tx, [g], pool=pool, mode="reward", split="eval")
+            native.free(nat.dev)
+        pt, fams = tau["phi_tau"], tau["families"]
+        P, S = nat.positions(tx.targets), sum(nat.C.values())
+        res = {}
+        for (v, g), r in zip(graphs.items(), rows):
+            ph = goal_eval.phi(r, families=fams)[0]
+            phc = goal_eval.cap_phi(ph, pt)
+            gate = None if phc is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (phc - pt)))
+            b = goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd)
+            comp = goal_eval.compact(b, tau["bits_start"]) if b > 0 else None
+            res[v] = {"phi": ph, "R": None if None in (phc, pt, gate, comp) else phc - pt + gate * 0.5 * comp, "bits": b}
+        ph0 = res["circuit"]["phi"]
+        var = {v: x for v, x in res.items() if v != "circuit"}
+        beats = {v: None if ph0 is None or x["phi"] is None else ph0 > x["phi"] + eps for v, x in var.items()}
+        got["answers"].append({"task": ln["task"], "sample": ln["sample"], "phi": ph0, "R": res["circuit"]["R"],
+                               "bits": res["circuit"]["bits"], "phi_tau": pt, "variants": var, "beats": beats,
+                               "beats_all": bool(beats) and all(b is True for b in beats.values())})
+        A = got["answers"]
+        names = sorted({v for a in A for v in a["beats"]})
+        got["summary"] = {"answers": len(A), "eps": eps, "beats_all": float(np.mean([a["beats_all"] for a in A])),
+                          "beaten": {v: float(np.mean([a["beats"][v] is True for a in A if v in a["beats"]])) for v in names},
+                          "with_variants": sum(bool(a["beats"]) for a in A)}
+        out_path.write_text(json.dumps(got, indent=1))
+        native.free(nat.dev)
+        print(ln["task"], ln["sample"], {v: round(x["phi"] or 0, 3) for v, x in res.items()}, flush=True)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("build", "score", "vars", "values", "report"))
+    ap.add_argument("cmd", nargs="?", choices=("build", "score", "vars", "values", "report"))
     ap.add_argument("args", nargs="*")
     ap.add_argument("--only", default=None, help="score: these variants only (comma-separated)")
+    ap.add_argument("--circuits", type=Path, help="oracle answers (JSONL: task, sample, text): the general falsification")
+    ap.add_argument("--out", type=Path, help="--circuits: the JSON written")
+    ap.add_argument("--eps", type=float, default=CIRCUIT_EPS, help="--circuits: the phi margin over every variant")
     a = ap.parse_args()
-    if a.cmd == "build":
+    if a.circuits:
+        circuits(a.circuits, a.out, a.eps)
+    elif a.cmd == "build":
         build()
     elif a.cmd == "score":
         score(find(*a.args), a.only.split(",") if a.only else None)

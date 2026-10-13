@@ -1507,10 +1507,25 @@ def softplus(x: float) -> float:
     return max(x, 0.0) + math.log1p(math.exp(-abs(x)))
 
 
+def calibration_evidence(row: dict, split: str | None) -> dict:
+    """Retain already-scored family draws for offline uncertainty reconstruction; no probes or bootstrap replay."""
+    import hashlib
+    import goal_eval
+
+    keys = {key for _, _, key in goal_eval.PHI_FAMILIES.values() if key}
+    return {"version": 1, "mode": "reward", "requested_split": split,
+            "scorer_sha256": hashlib.sha256(Path(goal_eval.__file__).read_bytes()).hexdigest(),
+            "families": goal_eval.PHI_FAMILIES, "eps_boot": goal_eval.EPS_BOOT,
+            "eps_floor": goal_eval.EPS_FLOOR, "bootstrap_seed": 0,
+            "draw_counts": {key: len(row.get(key) or []) for key in sorted(keys)},
+            "row": {k: v for k, v in row.items() if k in keys or k in ("c_terms", "rl_terms")
+                    or isinstance(v, (int, float)) or v is None}}
+
+
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            convention: str = CONVENTION, cache: dict | None = None, ee=None, edit_best: dict | None = None,
            pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None,
-           lines: bool = False, node_cap: int | None = NODE_CAP) -> list[dict]:
+           lines: bool = False, node_cap: int | None = NODE_CAP, retain_calibration: bool = False) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
     in bits, every term ranking, nothing clipped flat): R = phi + g x Q + D.
       phi: goal_eval.phi of the answer's reward-mode row, -log2 of the power-4 mean of the families' residuals
@@ -1611,6 +1626,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
                     "executable_bits": executable_bits,
                     "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,
                     "e2g": {k: v for k, v in (e2g.get(i) or {}).items() if k != "E2g"} or None}
+            if retain_calibration:
+                info["calibration_evidence"] = calibration_evidence(c, split)
             if lines:
                 loo = ge.line_loo(tx, graphs[i], pool, split=split or "search", bits_start=tau.get("bits_start"), base=c)
                 info["lines"] = line_credit(texts[i], p, loo, le.get(i), info, e2g.get(i), e4.get(i))
@@ -2394,7 +2411,8 @@ def _eval_checkpoint(path: Path, record: dict, *, create: bool = False) -> None:
 
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
-             teachers: dict | None = None, lines: bool = False, checkpoint: Path | None = None) -> dict:
+             teachers: dict | None = None, lines: bool = False, checkpoint: Path | None = None,
+             retain_calibration: bool = False) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -2420,6 +2438,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
         _eval_checkpoint(checkpoint, {"type": "evaluation", "version": 1, "split": split, "n": n,
                                      "sets": list(sets), "diagnostics": diagnostics, "matched_all": matched_all,
                                      "lines": lines, "edits": ee is not None, "variables": vs is not None,
+                                     **({"calibration_evidence": True} if retain_calibration else {}),
                                      "resume": False,
                                      "input_sha256": {k: digest(v) for k, v in
                                                       {"rows": rows, "sets": sets, "e1": e1, "labels": labels,
@@ -2448,7 +2467,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             cache = {}
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
                             ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None,
-                            lines=lines)
+                            lines=lines, retain_calibration=retain_calibration)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -2461,10 +2480,13 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
         sizes = [y.get("nodes") or 0 for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1])]
         names = baseline_texts(ge, task, sizes, cache.get(task["id"]))
         for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": [], "edits": []}, list(names.values()), split="eval",
-                                                      teacher=teachers.get(p.stem) if teachers else None, node_cap=None)):
+                                                      teacher=teachers.get(p.stem) if teachers else None, node_cap=None,
+                                                      retain_calibration=retain_calibration)):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
             base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),
                                                     **{k: r.get(k) for k in ("phi", "phi_tau", "g", "compact", "bits", "D")}}
+            if retain_calibration and "calibration_evidence" in r:
+                base_terms[p.stem][b]["calibration_evidence"] = r["calibration_evidence"]
         if checkpoint is not None:
             _eval_checkpoint(checkpoint, {"type": "task", "task": p.stem,
                                          "task_input_sha256": digest(task),
@@ -2658,6 +2680,8 @@ def main():
     s.add_argument("--n", type=int, default=50)
     s.add_argument("--labels", type=Path, help="locality JSONL: every figure also for local and non-local texts")
     s.add_argument("--diagnostics", action="store_true", help="structure() of each first sample (slow)")
+    s.add_argument("--calibration-evidence", action="store_true",
+                   help="retain already-scored family draws and uncertainty provenance; no extra model probes")
     s.add_argument("--out", type=Path)
     s.add_argument("--checkpoint", type=Path, help="durable per-task raw JSONL; defaults to OUT.tasks.jsonl when --out is set; "
                    "must be a new file, never resumed (retain complete lines after interruption)")
@@ -2916,7 +2940,7 @@ def main():
     teachers = {f.stem: json.loads(f.read_text()) for t in rows if (f := args.teacher / f"{t}.json").exists()} if args.teacher else None
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
                    matched_all=args.matched_all, teachers=teachers, lines=args.lines,
-                   checkpoint=args.checkpoint)
+                   checkpoint=args.checkpoint, retain_calibration=args.calibration_evidence)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

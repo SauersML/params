@@ -117,3 +117,29 @@ def test_circuit_baselines_clear_edit_requests_without_changing_policy(tmp_path,
         components.evaluate(ge, "heldout", rows, sets, 2, log=lambda *a, **k: None)
     assert len(calls) == 2
     assert rows["mock_a"]["edits"] == [{"kind": "flip"}]
+
+
+def test_calibration_option_retains_policy_and_baseline_checkpoint_evidence(tmp_path, monkeypatch):
+    rows, sets = setup_eval(tmp_path, monkeypatch)
+    for task in rows:
+        (tmp_path / (task + '.json')).write_text(json.dumps({
+            'id': task, 'prompts': [{'token_ids': [1], 'target_positions': [0]}]}))
+    ge = SimpleNamespace(text=lambda *a, **k: SimpleNamespace(ids=[1], targets=[0]),
+                         nat=SimpleNamespace(_vpd_order=lambda *a: []))
+    flags = []
+
+    def score(ge, task, ev, texts, **kwargs):
+        flags.append(kwargs.get('retain_calibration'))
+        return [{'reward': .4, 'circuit_reward': .2, 'valid': True, 'row': {'nodes': 1},
+                 'calibration_evidence': {'version': 1, 'row': {'draws_nodes': [['mask', 1., .1, 2.]]}}}
+                for text in texts]
+
+    monkeypatch.setattr(components, 'reward', score)
+    checkpoint = tmp_path / 'calibration.jsonl'
+    components.evaluate(ge, 'heldout', rows, sets, 2, retain_calibration=True,
+                        checkpoint=checkpoint, log=lambda *a, **k: None)
+    records = list(map(json.loads, checkpoint.read_text().splitlines()))
+    assert records[0]['calibration_evidence'] is True
+    assert flags == [True] * 4  # two policy and two baseline batches; no additional reward calls
+    assert records[1]['per_question']['policy']['samples'][0]['calibration_evidence']['row']['draws_nodes']
+    assert records[1]['baseline_terms']['empty']['calibration_evidence']['row']['draws_nodes']

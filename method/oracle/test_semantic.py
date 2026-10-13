@@ -66,6 +66,38 @@ def test_fit_gate():
     assert semantic.fit_gate(rows, 23)[0] == ("XNOR", 1.0)
 
 
+def test_probability_rise_prices_true_false_and_strict_boundary():
+    ck = _checker([0.6, 0.4])
+    q = torch.tensor([0.72, 0.28]).log()
+    result = ck.outcome(q, ("rise", 1.1))
+    assert result["holds"] and math.isclose(result["credit"], math.log2(1.1))
+    for q in (ck.p0, torch.tensor([0.5, 0.5]).log()):
+        result = ck.outcome(q, ("rise", 1.1))
+        assert not result["holds"] and math.isclose(result["credit"], -math.log2(1.1))
+    boundary = ck.p0.double().clone()
+    boundary[0] = float(ck.p0[0]) + math.log(1.1)
+    assert not ck.outcome(boundary, ("rise", 1.1))["holds"]
+
+
+def test_probability_rise_parse_preserves_text_and_deduplicates():
+    text = 'I1: remove V1 -> p(top) > 1.1 * base'
+    got, bad = semantic.parse_invariants(text)
+    assert bad == 0 and got[0]["outcome"] == ("rise", 1.1) and got[0]["line"] == text
+    got, bad = semantic.parse_invariants(text + '\nI2: remove V1 -> p(top)>1.10*base')
+    assert len(got) == 1 and bad == 1
+
+
+@pytest.mark.parametrize("factor", ['1', '0.9', '0', '-2', 'nan', 'inf', '1e309', '9' * 400, '1.1 * base unless V2'])
+def test_probability_rise_rejects_invalid_factors(factor):
+    got, bad = semantic.parse_invariants(f'I1: remove V1 -> p(top) > {factor} * base')
+    assert got == [] and bad == 1
+
+
+def test_probability_rise_does_not_reinterpret_legacy_drop():
+    got, bad = semantic.parse_invariants('I1: remove V1 -> p(top) < 0.8')
+    assert bad == 0 and got[0]["outcome"] == ("drop", .8)
+
+
 @pytest.fixture
 def invariant_tokenizer(monkeypatch):
     tokens = {"' x'": 1, "' y'": 2, "' z'": 3, "' a,b'": 4}

@@ -10,9 +10,10 @@ Interventions on the text x:
   remove [V]: V's carrier set to its mean over the alternative tokens at its inputs (var_classes.alternatives): the
     value is lost and the carrier keeps its typical size.
 Outcomes, about the prediction at the last target: ("top", y), ("unchanged",), ("not", y), ("drop", f) (the base top
-token's probability below f times its base value). Each is checked in the real model (holds, 0 or 1) and priced by its
+token's probability below f times its base value), and ("rise", f) (the same token's probability above f times its
+base value, f > 1). Each is checked in the real model (holds, 0 or 1) and priced by its
 surprise against the no-change prediction: top y with y not the base top y0, -log2 p_base(y) bits; not y0 (the base
-top displaced), -log2(1 - p_base(y0)); drop f, log2(1 / f); unchanged, and not y with y not y0, 0. credit = (2 holds -
+top displaced), -log2(1 - p_base(y0)); drop f, log2(1 / f); rise f, log2(f); unchanged, and not y with y not y0, 0. credit = (2 holds -
 1) x surprise: trivial claims earn nothing and a wrong bold one costs what a right one earns. Beside it logp, log2 of
 the real run's probability of the predicted event (q(y), 1 - q(y), q(y0)), which compares stated algorithms with no
 free pass for predicting no change.
@@ -27,7 +28,7 @@ never run in place of the network, that counts when its predictions on held-out 
 
 INVARIANTS lines (parse_invariants): I<k>: <intervention> -> <outcome>, the intervention's parts separated by commas
 (@<p>=<token>; V<j> from @<p>=<token> [@<q>=<token> ...]; remove V<j>), the outcome top <token>, unchanged,
-not <token> or p(top) < <f>; tokens as FINAL lines write them (components.shown).
+not <token>, p(top) < <f>, or p(top) > <f> * base; tokens as FINAL lines write them (components.shown).
 """
 from __future__ import annotations
 
@@ -138,6 +139,9 @@ class Checker:
         elif kind == "drop":
             f = float(out[1])
             holds, surprise = float(q[y0]) < float(p0[y0]) + math.log(f), math.log2(1.0 / f)
+        elif kind == "rise":
+            f = float(out[1])
+            holds, surprise = float(q[y0]) > float(p0[y0]) + math.log(f), math.log2(f)
         else:
             raise ValueError(f"outcome {out}")
         # logp: log2 of the real run's probability of the predicted event (top y: q(y); not y: 1 - q(y); unchanged:
@@ -353,6 +357,11 @@ def parse_invariants(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
                 outc = ("drop", float(o.split("<")[1]))
                 if not 0.0 < outc[1] < 1.0:
                     raise ValueError(o)
+            elif re.fullmatch(r"p\(top\)\s*>\s*([0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*\*\s*base", o):
+                factor = float(o.split(">")[1].split("*")[0])
+                if not math.isfinite(factor) or factor <= 1.0:
+                    raise ValueError(o)
+                outc = ("rise", factor)
             elif re.match(r"^(top|not)\s+" + _TOKEN + "$", o):
                 kind, s = o.split(None, 1)
                 y = tok(s)

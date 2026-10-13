@@ -97,20 +97,24 @@ def test_oracle_runs_reproduce_the_model(norm):
 
 @pytest.mark.parametrize("norm", [None, "LN"])
 @pytest.mark.parametrize("biased", [True, False])
-def test_oracle_graph_runs_equal_the_engine(norm, biased):
-    """native.Native.run against engine.Engine's runs (written apart) on the TL target with and without its biases:
-    every subcomponent on and off, one node, two connected nodes, the empty graph and a complete one (Engine's masked
-    run: its nodes at 1, the rest at u), the remainders live and off, a patch (of a graph node and of a subcomponent
-    outside) and declared connections at partial strength (the norm's strength tied to the read's). The masks run()
-    keeps (_zero(), _one()) give the numbers of equal masks built anew: a bias writes at every u, a value bias through
-    every attention row, so a biased target never takes _zero()'s shortcut."""
+def test_oracle_graph_runs_equal_the_engine(norm, biased, monkeypatch):
+    """native.Native.run against engine.Engine's graph runs (written apart) on the TL target with and without its
+    biases, each matrix's last piece left in its remainder: every subcomponent on and off, one node, two connected
+    nodes, the empty graph and a complete one (the same nodes with every connection the model has among them stated),
+    the remainders live and off, a patch (of a graph node and of a subcomponent outside) and declared connections at
+    partial strength (the norm's strength tied to the read's). The masks run() keeps (_zero(), _one()) give the
+    numbers of equal masks built anew: a bias writes at every u, a value bias through every attention row, so a biased
+    target never takes _zero()'s shortcut."""
     import engine
     import native
 
     sd, cfg = random_tl(norm)
     if not biased:
         sd = {k: v for k, v in sd.items() if not (k.startswith("blocks.") and ".b_" in k)}
+    exact = interpbench.decompose
+    monkeypatch.setattr(interpbench, "decompose", lambda tg: {n: (U[:-1], V[:, :-1], unit[:-1]) for n, (U, V, unit) in exact(tg).items()})
     nat = interpbench.native_of(sd, cfg)
+    assert min(float(nat.target.site(n).delta_T.norm()) for n in nat.names) > 0.01
     assert nat._biased() == biased
     ids = torch.randint(cfg["d_vocab"], (cfg["n_ctx"],), generator=torch.Generator().manual_seed(2)).tolist()
     targets = [cfg["n_ctx"] - 1]
@@ -136,14 +140,6 @@ def test_oracle_graph_runs_equal_the_engine(norm, biased):
         patch[site] = (torch.zeros(1, T, nat.C[site], dtype=torch.bool), torch.zeros(1, T, nat.C[site]))
         patch[site][0][0, t, c], patch[site][1][0, t, c] = True, value
 
-    def engine_run(eng, graph, u):
-        if not graph.complete:
-            return eng.graph_log_probs(eng.plan(graph), full(u))
-        masks = {n: m.expand(1, T, -1).clone() for n, m in u.items()}
-        for n, t, c in graph.nodes:
-            masks[n][0, t, c] = 1.0
-        return eng.log_probs(masks, "score")
-
     with torch.no_grad():
         for gn, graph in graphs.items():
             plan = nat._plan([graph], T)
@@ -151,7 +147,7 @@ def test_oracle_graph_runs_equal_the_engine(norm, biased):
                 for rn, ur in urs.items():
                     eng = engines[rn == "live"]
                     got = nat.run(ids, targets, plan, u, ur)
-                    want = engine_run(eng, graph, u).reshape(got.shape)
+                    want = eng.graph_log_probs(eng.plan(connected if graph.complete else graph), full(u)).reshape(got.shape)
                     torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5, msg=lambda m: f"{gn} u {un} remainders {rn}: {m}")
                     anew = nat.run(ids, targets, plan, {n: m.clone() for n, m in u.items()}, {n: m.clone() for n, m in ur.items()})
                     torch.testing.assert_close(got, anew, atol=1e-6, rtol=1e-6, msg=lambda m: f"{gn} u {un} remainders {rn}: {m}")

@@ -250,9 +250,74 @@ def report():
                                    else f"{'-':>13s}" for m in terms))
 
 
+def _boot_share(ws, B: int = 2000, seed: int = 2951):
+    """(share, 2.5th and 97.5th percentiles of its bootstrap over the texts) of win indicators (1, 0.5 for a tie, 0)."""
+    ws = np.asarray(ws, dtype=float)
+    if len(ws) == 0:
+        return None
+    r = np.random.default_rng(seed)
+    bs = ws[r.integers(len(ws), size=(B, len(ws)))].mean(1)
+    return float(ws.mean()), float(np.percentile(bs, 2.5)), float(np.percentile(bs, 97.5)), len(ws)
+
+
+def report_ci(causalgym_run: str = "oracle-graph-generality25a"):
+    """The rank test per family with 95% bootstrap intervals over its texts: the share of texts on which each term ranks
+    the true circuit above each wrong one (ties half). The library families (this script's rows; copy among them) and
+    CausalGym's tasks in the behavior-targeted mode (causalgym.py falsify --blocks --behavior, the run causalgym_run:
+    true = VPD's actives at the target and the variable's position; wrong = the attractor's position (on two
+    subject-verb tasks the attractor is the target token, so t - 1), the target alone, the source prompt's actives).
+    Every row is the pp scorecard's family (point and flips: the circuit alone on the text; track_pp, interchange_pp:
+    path-patched)."""
+    import templates
+
+    terms = [("R", "R"), ("phi", "phi"), ("s_point", "point"), ("s_flips", "flips"), ("s_nodes", "nodes"),
+             ("s_track_pp", "track_pp"), ("s_interchange_pp", "interchange"), ("s_N", "N")]
+    fmt = lambda t: "      -       " if t is None else f"{t[0]:.2f} [{t[1]:.2f},{t[2]:.2f}]"  # noqa: E731
+
+    def table(title, groups, pairs):
+        print(f"== {title}")
+        for name, ds in groups:
+            print(f"  {name}  (n={len(ds)})")
+            print("    " + f"{'':30s}" + "".join(f"{lab:>17s}" for _, lab in terms))
+            for a_, b_, lab in pairs:
+                line = []
+                for m, _ in terms:
+                    ws = [1.0 if d[a_][m] > d[b_][m] + 1e-9 else 0.5 if abs(d[a_][m] - d[b_][m]) <= 1e-9 else 0.0
+                          for d in ds if a_ in d and b_ in d and d[a_].get(m) is not None and d[b_].get(m) is not None]
+                    line.append(f"{fmt(_boot_share(ws)):>17s}")
+                print(f"    {lab:30s}" + "".join(line))
+
+    info = json.loads((DATA / "ffam_texts.json").read_text())["families"]
+    rows = []
+    for p in [DATA / "ffam.jsonl"] + templates.run_outputs("ffam*.jsonl"):
+        if p.exists():
+            rows += [json.loads(x) for x in p.read_text().splitlines()]
+    by = collections.defaultdict(dict)
+    for r in rows:
+        by[(r["family"], r["task"])].setdefault(r["variant"], r)
+    fams = sorted({k[0] for k in by}, key=lambda f: -info[f]["frequency"])
+    table("library behavior families (true: the family's validated template)",
+          [(f"{f} ({100 * info[f]['frequency']:.1f}% of tokens)", [d for k, d in by.items() if k[0] == f]) for f in fams],
+          [("correct", "a_source_moved", "context moved"), ("correct", "b_fixed_offset", "context at a fixed distance"),
+           ("correct", "g_mismatched", "another family's offsets"), ("correct", "d_irrelevant_parts", "plus irrelevant parts"),
+           ("correct", "ref_vpd_equal_bits", "VPD's top k, same bits"), ("correct", "ref_recency_equal_bits", "target actives")])
+    cg = []
+    for p in sorted((Path("/Users/user/mpd-data/runpod") / causalgym_run / "out").glob("causalgym_falsify_blocks_behavior*.jsonl")):
+        cg += [json.loads(x) for x in p.read_text().splitlines()]
+    cby = collections.defaultdict(dict)
+    for r in cg:
+        r = {**r, "R": r.get("reward")}
+        cby[(r["task"], r["pair"])].setdefault(r["variant"], r)
+    tasks = sorted({k[0] for k in cby})
+    table(f"CausalGym tasks, behavior-targeted mode ({causalgym_run}; true: the variable's position)",
+          [(t, [d for k, d in cby.items() if k[0] == t]) for t in tasks] + [("every task", list(cby.values()))],
+          [("variable", "attractor", "attractor's position"), ("variable", "target", "the target alone"),
+           ("variable", "mismatched_target", "the source prompt's parts")])
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("build", "score", "report"))
+    ap.add_argument("cmd", choices=("build", "score", "report", "report_ci"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
-    {"build": build, "score": lambda: score(*a.args), "report": report}[a.cmd]()
+    {"build": build, "score": lambda: score(*a.args), "report": report, "report_ci": lambda: report_ci(*a.args)}[a.cmd]()

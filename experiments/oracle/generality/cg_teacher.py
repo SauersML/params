@@ -307,7 +307,10 @@ def moved(tdir: str):
     nat = native.Native()
     ges = {sem: goal_eval.GoalEval(nat, semantics=sem) for sem in ("c", "x")}
     out = DATA / "cg_moved.jsonl"
+    done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
     for nm in names:
+        if nm in done:
+            continue
         m = meta[nm]
         tj = json.loads((DATA / "causalgym_texts_b" / f"{nm}.json").read_text())
         ids = tj["prompts"][0]["token_ids"]

@@ -819,8 +819,9 @@ def tokens(rows: dict, tids: list[str], episodes: Path | None, base: str = "Qwen
     from transformers import AutoTokenizer
 
     tk = AutoTokenizer.from_pretrained(base)
-    count = lambda msgs, tools=None: len(tk.apply_chat_template(msgs, tools=tools, tokenize=True, add_generation_prompt=True,  # noqa: E731
-                                                                  enable_thinking=False))
+    def count(msgs, tools=None):  # the chat template's text, tokenized (transformers 5's tokenize=True returns a dict)
+        text = tk.apply_chat_template(msgs, tools=tools, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        return len(tk(text, add_special_tokens=False)["input_ids"])
     out = {}
     eps = {}
     if episodes:

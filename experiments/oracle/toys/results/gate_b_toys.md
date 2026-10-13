@@ -2,7 +2,7 @@
 
 `experiments/oracle/toys/gate_b_toys.py` (toyloop). Reward v3's circuit part (`components.reward`: circuit_reward = phi + g·½compact, D = 0 with no teacher reference), eval draws, the exact decomposition (planted.decompose), node cap lifted. Texts per toy: 3. Rows: `gate_b_toys.jsonl`. Tiers: **full** (true = every reachable active piece of the planted units) and **core** (true = the planted route's positions only, see core_of); each tier has its own equal-size wrong circuits and controls.
 
-Gate B holds on a text when R(true) > max R over each control category. Cell: texts passing, and the worst margin R(true) − R(best control) with that control (positive = true wins).
+Gate B holds on a text when R(true) > max R over each control category (an exact tie, |margin| < 1e-9, a control behaviourally identical to true, is counted apart and not as a failure). Cell: texts passing, and the worst margin R(true) − R(best control) with that control (positive = true wins).
 
 
 ## Verdict per toy and tier
@@ -15,6 +15,8 @@ Gate B holds on a text when R(true) > max R over each control category. Cell: te
 | binding_fp | core | PASS 3/3 (+0.99, swap 50% to wrong unit) | PASS 3/3 (+1.16, empty) | PASS 3/3 (+1.32, shuffled) | FAIL 0/3 (-4.12, all VPD actives) | +1.09 | **FAIL** |
 | route1 | full | PASS 3/3 (+2.35, swap 50% to wrong unit) | PASS 3/3 (+2.43, empty) | PASS 3/3 (+2.42, shuffled) | PASS 3/3 (+2.43, single node) | +3.45 | **PASS** |
 | route1 | core | FAIL 2/3 (-1.21, random actives #2) | FAIL 2/3 (-2.99, empty) | FAIL 2/3 (-1.45, shuffled) | FAIL 0/3 (-9.20, all VPD actives) | -1.90 | **FAIL** |
+| route2 | full | PASS 1/1 (+6.10, swap 50% to wrong unit) | PASS 1/1 (+6.19, empty) | PASS 1/1 (+6.19, shuffled) | PASS 1/1 (+6.15, single node) | +5.46 | **PASS** |
+| route2 | core | PASS 1/1 (+0.85, head1 alone (padded)) | PASS 1/1 (+1.20, empty) | PASS 1/1 (+1.29, shuffled) | FAIL 0/1 (-4.99, all VPD actives) | +0.47 | **FAIL** |
 
 ## Mean over texts per candidate
 
@@ -96,6 +98,33 @@ Gate B holds on a text when R(true) > max R over each control category. Cell: te
 | ref | run_planted true (narrow) | ref | 771 | 4.944 | 6.391 | 1.295 | 1.000 | -2.895 | — |
 | teacher | teacher | teacher | 30 | 1.490 | 0.736 | 1.295 | 0.408 | 3.803 | — |
 
+### route2
+
+| tier | candidate | category | nodes | R | phi | phi_tau | g | compact | ≥ true (of texts) |
+|---|---|---|---|---|---|---|---|---|---|
+| full | **true** | true | 766 | 6.181 | 7.644 | 0.695 | 1.000 | -2.926 | — |
+| full | swap 50% to wrong unit | wrong_eq | 766 | 0.084 | 0.121 | 0.695 | 0.018 | -3.993 | 0/1 |
+| full | swap 100% to wrong unit | wrong_eq | 766 | 0.024 | 0.036 | 0.695 | 0.010 | -2.267 | 0/1 |
+| full | empty | empty | 0 | -0.007 | -0.007 | 0.695 | 0.008 | — | 0/1 |
+| full | shuffled | shuffled | 531 | -0.010 | -0.004 | 0.695 | 0.008 | -1.467 | 0/1 |
+| full | single node | collapsed | 1 | 0.036 | -0.007 | 0.695 | 0.008 | 11.276 | 0/1 |
+| core | **true** | true | 436 | 1.188 | 0.957 | 0.695 | 0.860 | 0.537 | — |
+| core | head0 alone (padded) | wrong_eq | 436 | 0.298 | 0.343 | 0.695 | 0.080 | -1.126 | 0/1 |
+| core | head1 alone (padded) | wrong_eq | 436 | 0.337 | 0.388 | 0.695 | 0.107 | -0.955 | 0/1 |
+| core | random actives #0 | wrong_eq | 436 | -0.236 | -0.235 | 0.695 | 0.002 | -1.414 | 0/1 |
+| core | random actives #1 | wrong_eq | 436 | -0.004 | 0.000 | 0.695 | 0.008 | -1.132 | 0/1 |
+| core | random actives #2 | wrong_eq | 436 | 0.305 | 0.385 | 0.695 | 0.105 | -1.531 | 0/1 |
+| core | swap 50% to wrong unit | wrong_eq | 436 | 0.034 | 0.043 | 0.695 | 0.011 | -1.526 | 0/1 |
+| core | swap 100% to wrong unit | wrong_eq | 436 | -0.071 | -0.063 | 0.695 | 0.005 | -3.047 | 0/1 |
+| core | empty | empty | 0 | -0.007 | -0.007 | 0.695 | 0.008 | — | 0/1 |
+| core | shuffled | shuffled | 309 | -0.104 | -0.107 | 0.695 | 0.004 | 1.358 | 0/1 |
+| core | single node | collapsed | 1 | 0.036 | -0.007 | 0.695 | 0.008 | 11.276 | 0/1 |
+| core | all VPD actives | collapsed | 766 | 6.181 | 7.644 | 0.695 | 1.000 | -2.926 | 1/1 |
+| ref | run_planted true (narrow) | ref | 766 | 6.181 | 7.644 | 0.695 | 1.000 | -2.926 | — |
+| ref | run_planted head0 alone (narrow) | ref | 378 | -0.634 | -0.634 | 0.695 | 0.000 | -0.794 | — |
+| ref | run_planted head1 alone (narrow) | ref | 388 | 0.190 | 0.204 | 0.695 | 0.032 | -0.884 | — |
+| teacher | teacher | teacher | 71 | 0.718 | 0.448 | 0.695 | 0.153 | 3.530 | — |
+
 ## Candidate repairs, rescored from the same rows
 
 Gate B checks passed (texts) when R is recomputed from each row's family scores and eps (no new measurement; phi_tau kept as measured):
@@ -107,15 +136,15 @@ Gate B checks passed (texts) when R is recomputed from each row's family scores 
 
 | variant | full: wrong_eq | full: empty | full: shuffled | full: collapsed | core: wrong_eq | core: empty | core: shuffled | core: collapsed | full: all | core: all |
 |---|---|---|---|---|---|---|---|---|---|---|
-| v3 | 9/9 | 9/9 | 9/9 | 9/9 | 6/9 | 8/9 | 7/9 | 0/9 | 9/9 | 0/9 |
-| eps_cap | 9/9 | 9/9 | 9/9 | 9/9 | 8/9 | 8/9 | 8/9 | 0/9 | 9/9 | 0/9 |
-| s_clip | 9/9 | 9/9 | 9/9 | 9/9 | 6/9 | 8/9 | 7/9 | 0/9 | 9/9 | 0/9 |
-| gate_ramp | 9/9 | 9/9 | 9/9 | 9/9 | 6/9 | 8/9 | 7/9 | 0/9 | 9/9 | 0/9 |
-| phi_cap | 9/9 | 9/9 | 9/9 | 8/9 | 6/9 | 8/9 | 7/9 | 3/9 | 8/9 | 3/9 |
-| eps_cap+s_clip | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 0/9 | 9/9 | 0/9 |
-| eps_cap+s_clip+gate_ramp | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 0/9 | 9/9 | 0/9 |
-| eps_cap+s_clip+phi_cap | 9/9 | 9/9 | 9/9 | 8/9 | 9/9 | 9/9 | 9/9 | 3/9 | 8/9 | 3/9 |
-| eps_cap+s_clip+gate_ramp+phi_cap | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 3/9 | 9/9 | 3/9 |
+| v3 | 10/10 | 10/10 | 10/10 | 10/10 | 7/10 | 9/10 | 8/10 | 0/10 | 10/10 | 0/10 |
+| eps_cap | 10/10 | 10/10 | 10/10 | 10/10 | 9/10 | 9/10 | 9/10 | 0/10 | 10/10 | 0/10 |
+| s_clip | 10/10 | 10/10 | 10/10 | 10/10 | 7/10 | 9/10 | 8/10 | 0/10 | 10/10 | 0/10 |
+| gate_ramp | 10/10 | 10/10 | 10/10 | 10/10 | 7/10 | 9/10 | 8/10 | 0/10 | 10/10 | 0/10 |
+| phi_cap | 10/10 | 10/10 | 10/10 | 9/10 | 7/10 | 9/10 | 8/10 | 3/10 | 9/10 | 3/10 |
+| eps_cap+s_clip | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 0/10 | 10/10 | 0/10 |
+| eps_cap+s_clip+gate_ramp | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 0/10 | 10/10 | 0/10 |
+| eps_cap+s_clip+phi_cap | 10/10 | 10/10 | 10/10 | 9/10 | 10/10 | 10/10 | 10/10 | 4/10 | 9/10 | 4/10 |
+| eps_cap+s_clip+gate_ramp+phi_cap | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 4/10 | 10/10 | 4/10 |
 
 ## Failures: which term lets the control win (per text)
 
@@ -134,3 +163,4 @@ Gate B checks passed (texts) when R is recomputed from each row's family scores 
 - route1 core text 0, collapsed: **all VPD actives** ≥ true by 9.20: Δphi +10.64, Δ(g·½compact) -1.45; families higher for it: N +6.364, edges +0.596, nodes +0.322, point +0.018, pattern +0.017
 - route1 core text 1, collapsed: **all VPD actives** ≥ true by 5.62: Δphi +7.10, Δ(g·½compact) -1.48; families higher for it: edges +0.698, nodes +0.626, pattern +0.169, point +0.141
 - route1 core text 2, collapsed: **all VPD actives** ≥ true by 1.24: Δphi +2.79, Δ(g·½compact) -1.55; families higher for it: nodes +0.676, edges +0.221, pattern +0.171, point +0.155
+- route2 core text 0, collapsed: **all VPD actives** ≥ true by 4.99: Δphi +6.69, Δ(g·½compact) -1.69; families higher for it: nodes +0.562, pattern +0.551, point +0.529, edges +0.496, patching_far +0.020

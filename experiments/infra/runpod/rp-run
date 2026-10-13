@@ -1576,6 +1576,35 @@ if [ ${#uploads[@]} -gt 0 ]; then
     while IFS= read -r f; do files+=("$f"); done < <(cd "$MAC_DATA" && find -L "${uploads[@]}" -type f ! -name '*.pem' ! -name '*.key' ! -name .env ! -name .DS_Store | sort -u)
     upload_kb=$(cd "$MAC_DATA" && du -skL "${uploads[@]}" | awk '{ s += $1 } END { print s }')
 fi
+# The sealed final test texts (vpd4l text9100-9149, the user's 10-12: untouched until the final evaluation) never go up.
+# A loose one is left out of the inputs; an archive among the inputs that holds one is rewritten in place without them
+# (bsdtar reading the archive itself; a zstd archive is refused instead); each with a line saying so. FINAL_EVAL=1
+# (set by final_eval.sh alone) lets them through. The one guard for every launcher: their tarballs need no excludes.
+SEALED_RE='(^|/)texts/vpd4l/text91[0-4][0-9][.]json$'
+if [ "${FINAL_EVAL:-0}" != 1 ] && [ ${#files[@]} -gt 0 ]; then
+    kept=() sealed=0
+    for f in "${files[@]}"; do
+        if [[ $f =~ $SEALED_RE ]]; then sealed=$(( sealed + 1 )); continue; fi
+        case $f in
+            *.tgz|*.tar.gz|*.tar|*.tar.zst)
+                n=$(tar -tf "$MAC_DATA/$f" 2> /dev/null | grep -cE "$SEALED_RE" || true)
+                if (( n > 0 )); then
+                    case $f in
+                        *.tar.zst) echo "rp-run: $MAC_DATA/$f holds $n sealed final-test texts (texts/vpd4l/text9100-9149); rebuild it without them" >&2; exit 2 ;;
+                        *.tar) z="" ;;
+                        *) z=z ;;
+                    esac
+                    clean="$MAC_DATA/$f.unsealed.$$"
+                    COPYFILE_DISABLE=1 tar -c${z}f "$clean" --exclude '*texts/vpd4l/text91[0-4][0-9].json' "@$MAC_DATA/$f" && mv "$clean" "$MAC_DATA/$f" ||
+                        { rm -f "$clean"; echo "rp-run: could not take the sealed final-test texts out of $MAC_DATA/$f; refusing" >&2; exit 2; }
+                    echo "rp-run: took $n sealed final-test texts (texts/vpd4l/text9100-9149) out of $MAC_DATA/$f" >&2
+                fi ;;
+        esac
+        kept+=("$f")
+    done
+    (( sealed == 0 )) || echo "rp-run: left $sealed sealed final-test texts (texts/vpd4l/text9100-9149) out of the inputs" >&2
+    files=("${kept[@]}")
+fi
 # A Mac binary among the inputs cannot run on the pod: refused before any pod exists.
 for f in "${files[@]}"; do
     case $(file -b "$MAC_DATA/$f") in

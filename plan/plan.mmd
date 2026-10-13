@@ -2,6 +2,7 @@
 %% Read bottom to top: foundations, workstreams, decision gates, training, capabilities, impact.
 %% An arrow means "is needed for". Dashed arrows: a check feeds in, or a fallback route.
 %% One unit per box. Never put a sequence or an arrow inside a box: split it into boxes and edges.
+%% Parallel by default: only gate B (a trustworthy reward) blocks anything (RL). Checks compare, never wait.
 %% Each box: bold title, why or what it decides (1-2 lines), status and owner. About 34 characters
 %% a line, explicit <br/> breaks, 3-5 lines.
 %% Before starting work: find its box, claim it (owner), set its class. When a gate passes or fails,
@@ -31,18 +32,22 @@ flowchart BT
   %% ===================== training =====================
   ORC["<b>Trained oracle</b><br/>must beat the frozen SFT model<br/>on independent dev texts;<br/>a rising reward alone is not success<br/>WAITING"]
 
-  subgraph RLS["STAGED RL · primerl"]
-    R1["<b>Stage 1 · circuits</b><br/>faithfulness gate and size"]
-    R2["<b>Stage 2 · variables</b>"]
-    R3["<b>Stage 3 · answers</b>"]
-    R4["<b>Stage 4 · English</b>"]
-    R5["<b>Stage 5 · edits</b>"]
+  subgraph RLS["RL ARMS IN PARALLEL · primerl · blocked only by gate B"]
+    R1["<b>RL · circuits</b><br/>faithfulness gate and size"]
+    R2["<b>RL · + variables</b>"]
+    R3["<b>RL · + answers</b>"]
+    R4["<b>RL · + English</b>"]
+    R5["<b>RL · + edits</b>"]
   end
 
-  TOOLS["<b>Tools and search route</b><br/>search finds the circuit, the oracle<br/>explains it; parts measured on demand<br/>PROTOTYPE · primerl, codex"]
-  GATEC{{"<b>Gate C</b> · does learning add value?<br/>beats trivial baselines on fidelity<br/>vs size; uses mechanism evidence,<br/>not text alone · dev texts only"}}
-  SFT["<b>Small SFT</b><br/>first-sample circuits<br/>on fresh dev texts<br/>WAITING on gate A · primerl"]
-  GATEA{{"<b>Gate A</b> · trainable targets?<br/>teacher passes unseen interventions;<br/>needed parts visible in the input;<br/>input and answer fit the context"}}
+  TOOLS["<b>Search route, in parallel</b><br/>teacher circuits plus variables,<br/>English and executed answers;<br/>no learned oracle needed<br/>ACTIVE · primerl, varteach, codex"]
+  GATEC{{"<b>Check C</b> · does learning add value?<br/>SFT arms vs trivial baselines and<br/>the search route on dev texts;<br/>picks the RL starting point"}}
+  subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
+    S1["<b>SFT · influential starts</b><br/>targets that already hold<br/>on held-out changes<br/>STARTING"]
+    S2["<b>SFT · pruned v2</b><br/>smaller targets from<br/>discriminating-draw pruning<br/>WAITING on T4"]
+    S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
+  end
+  GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
   GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · FAILED, repair first"}}
 
   %% ===================== workstreams =====================
@@ -51,6 +56,7 @@ flowchart BT
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
     T3["<b>Pruning, discriminating draws</b><br/>why: fixed-draw pruning overfit<br/>(held-out 0.34 vs 0.88)<br/>ACTIVE · pymove"]
     T4["<b>Teacher circuits v2</b><br/>444 train + 50 held-out texts<br/>waits on T3; launches pm7 and v2<br/>when text9002 eval pp ≥ 0.85<br/>BLOCKED · fleet"]
+    T5["<b>Context-blocks teacher</b><br/>keeps context as blocks, prunes<br/>only the target: cannot overfit<br/>context changes · pymove"]
   end
 
   subgraph INPUTS["ORACLE INPUT · codex, rustmove, primerl"]
@@ -78,23 +84,32 @@ flowchart BT
     ENG["<b>Executable-circuit engine</b><br/>path-patched, batched<br/>DONE · monitorbench"]
   end
 
+  %% ===================== instrumental goals =====================
+  subgraph INSTR["INSTRUMENTAL · faster and cheaper everywhere"]
+    SP1["<b>Engine speed</b><br/>seconds per circuit run<br/>and per line deletion<br/>ACTIVE · monitorbench"]
+    SP2["<b>Teacher throughput</b><br/>minutes and dollars per text<br/>ACTIVE · fleet, pymove"]
+    SP3["<b>Scorer throughput</b><br/>seconds per RL sample,<br/>target 20 s or less<br/>ACTIVE · inframove, primerl"]
+    SP4["<b>GPU use and cost</b><br/>busy cards, cheapest that fit,<br/>idle pods stopped · fleet"]
+    SP5["<b>Tests on main</b><br/>goal_eval and engine<br/>suites green · every owner"]
+  end
+
   %% ===================== later =====================
   LAT1["<b>After gate C</b><br/>native-units comparison<br/>weight-edit test<br/>mechanism-library coverage · MNIST"]
   UVPD["<b>The user's VPD of a real model</b><br/>not yet available"]
   LAT2["<b>Real-model track</b><br/>model organisms<br/>safety-relevant questions"]
 
   %% ===================== edges: the main chain (links 0-7, thick) =====================
-  T4 --> GATEA
-  GATEA -- pass --> SFT
-  SFT --> GATEC
-  GATEC -- pass --> R1
-  R1 --> R2
-  R2 --> R3
-  R3 --> R4
-  R4 --> R5
+  T1 --> S1
+  T4 --> S2
+  T5 --> S3
+  S1 --> GATEC
+  S2 --> GATEC
+  S3 --> GATEC
+  GATEC -. picks the start .-> RLS
+  GATEB -- pass --> RLS
 
   %% ===================== edges: to the top (links 8-19) =====================
-  R5 --> ORC
+  RLS --> ORC
   ORC --> C1
   ORC --> C2
   ORC --> C3
@@ -108,20 +123,24 @@ flowchart BT
   DELIV --> IMPP
 
   %% ===================== edges: supporting =====================
-  T1 --> T2
-  T2 --> T3
+  T1 --> T3
   T3 --> T4
+  T1 --> T5
+  T1 --> T2
+  T2 -. adds backups .-> T4
+  SFTS -. reports .-> GATEA
   I1 --> I2
   I2 --> I3
-  I3 --> GATEA
+  I3 --> S1
   I4 -. sets the format .-> I1
   W1 --> GATEB
   W2 -. tests .-> GATEB
   W3 -. found the failure .-> W4
   W4 --> GATEB
-  GATEB -- pass --> R1
-  GATEC -. fail .-> TOOLS
+  T4 --> TOOLS
   TOOLS --> C1
+  TOOLS --> C2
+  TOOLS --> C3
   PHI --> T3
   PHI --> W1
   TOY -. tests .-> PHI
@@ -141,7 +160,7 @@ flowchart BT
   %% ===================== legend and operating agreement =====================
   subgraph LEG["LEGEND"]
     direction LR
-    k1["done"] ~~~ k2["active"] ~~~ k8["check"] ~~~ k3["blocked"] ~~~ k4["waiting"] ~~~ k5{{"gate"}} ~~~ k6["later"] ~~~ k7["<b>Updated 2026-10-12</b><br/>Base caps: RunPod $360, Tinker $130<br/>Extra $40 SHARED across both"]
+    k1["done"] ~~~ k2["active"] ~~~ k8["check"] ~~~ k3["blocked"] ~~~ k4["waiting"] ~~~ k5{{"gate"}} ~~~ k6["later"] ~~~ k7["<b>Updated 2026-10-13</b><br/>Base caps: RunPod $360, Tinker $130<br/>extra $40 shared across both<br/>user +$30 RunPod to the lead"]
   end
   IMPA ~~~ LEG
 
@@ -158,15 +177,15 @@ flowchart BT
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
   class VPD,ENG,PHI,W1,W3,I1,I2,T1,k1 done
-  class T2,T3,I4,W2,W4,TOY,REM,k2 active
-  class I3,TOOLS,k8 check
+  class T2,T3,T5,I4,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3,k2 active
+  class I3,k8 check
   class T4,GATEB,k3 blocked
-  class SFT,ORC,R1,R2,R3,R4,R5,k4 waiting
+  class S2,S3,ORC,R1,R2,R3,R4,R5,k4 waiting
   class LAT1,LAT2,UVPD,k6 later
   class GATEA,GATEC,GATED,k5 gate
   class C1,C2,C3,C4,DELIV goal
   class IMPA,IMPP impact
-  class TXT,k7 note
+  class TXT,SP4,SP5,k7 note
 
   linkStyle 0,1,2,3,4,5,6,7 stroke:#d93025,stroke-width:4px
   linkStyle 8,9,10,11,12,13,14,15,16,17,18,19 stroke:#8430ce,stroke-width:2.5px

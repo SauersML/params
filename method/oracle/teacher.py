@@ -113,6 +113,7 @@ import native
 
 RECOVERED = 0.9
 ROUNDS = 40
+RANK = "every"  # Descent.prune's ranking (--rank): "every" round, or "once" per level (kept while prefixes are admitted)
 CONVENTION = "live"   # the component reward's remainder convention (components.CONVENTION)
 N_TARGET = 0.99       # VPD's top-k: the smallest prefix of VPD's order with necessity N >= this, at most K_MAX
 K_MAX = 1024
@@ -172,15 +173,30 @@ class Descent:
         and accept's dict. With accept, the blocks between the largest admitted prefix and the smallest refused one (at
         most 4 ACCEPT_BATCH) are asked about alone, and those refused alone stay for the level (frozen): a block the KL
         ranks first can carry what accept measures (text9011: the target's L3 attention output, whose removal lowers
-        KL, takes s_track from 0.90 to 0.61 alone), and every prefix holds it."""
+        KL, takes s_track from 0.90 to 0.61 alone), and every prefix holds it. RANK "once": the level's blocks and their
+        ranking are those of its first round, later rounds measuring prefixes of the blocks still on in that order (the
+        ranking 93% of an arm-b teacher's time on a 4090, prefixes 2%); a round that admits nothing on a kept order
+        ranks afresh before the level ends."""
         fixed = getattr(self, "fixed", None)                 # units no removal may take (a kept block's subcomponents)
         frozen = fixed.clone() if fixed is not None else torch.zeros_like(self.on)
+        ranked = None                                        # RANK "once": the level's ranking, kept across rounds
         for r in range(rounds):
-            blocks = [b for b in self.blocks(level) if not bool(frozen[b].any())]
-            if len(blocks) <= 1:
-                return r
-            single = torch.tensor(self.without(blocks, ranking=True))
-            ranked = [blocks[i] for i in torch.argsort(single, stable=True).tolist()]
+            if RANK != "once" or ranked is None:
+                blocks = [b for b in self.blocks(level) if not bool(frozen[b].any())]
+                if len(blocks) <= 1:
+                    return r
+                single = torch.tensor(self.without(blocks, ranking=True))
+                order = torch.argsort(single, stable=True)
+                ranked, single, fresh = [blocks[i] for i in order.tolist()], single[order], True
+            else:                                            # the kept order, less the blocks removed or frozen since
+                ids = torch.cat(ranked)
+                seg = torch.repeat_interleave(torch.arange(len(ranked), device=ids.device),
+                                              torch.tensor([len(b) for b in ranked], device=ids.device))
+                gone = torch.zeros(len(ranked), device=ids.device).index_add_(0, seg, ((~self.on[ids]) | frozen[ids]).float())
+                keep = (gone == 0).nonzero().flatten()
+                ranked, single, fresh = [ranked[i] for i in keep.tolist()], single[keep.cpu()], False
+                if len(ranked) <= 1:
+                    return r
             sizes = [k for k in sorted({int(2 ** (e / 2)) for e in range(0, 60)}) if k <= len(ranked) - 1]
             if (single <= budget).any():
                 ok = [(k, x) for k, x in zip(sizes, self.without([torch.cat(ranked[:k]) for k in sizes])) if x <= budget]
@@ -214,6 +230,9 @@ class Descent:
                     if not ok and new:                       # nothing admitted, the culprits frozen: rank again
                         continue
                 if not ok:
+                    if not fresh:                            # a kept order: rank afresh before the level ends
+                        ranked = None
+                        continue
                     return r
                 k, x = max(ok)
                 drop = torch.cat(ranked[:k])
@@ -223,6 +242,9 @@ class Descent:
                 continue
             current = self.kl()
             if current <= budget or float(single.min()) >= current:
+                if not fresh:
+                    ranked = None
+                    continue
                 return r
             kl = self.without([torch.cat(ranked[:k]) for k in sizes])
             lower = sorted((j for j in range(len(sizes)) if kl[j] < current), key=lambda j: kl[j])
@@ -240,6 +262,9 @@ class Descent:
                         i, info = part[hit], got[hit]
                         break
             if i is None:
+                if not fresh:
+                    ranked = None
+                    continue
                 return r
             drop = torch.cat(ranked[:sizes[i]])
             self.on[drop] = False
@@ -1533,6 +1558,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
 
 def main():
+    global RANK
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--split", default="heldout")
     ap.add_argument("--n", type=int, default=20)
@@ -1585,7 +1611,10 @@ def main():
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the explainer's tokenizer (Hugging Face hub)")
     ap.add_argument("--tasks", type=Path, help="task ids, one per line, in place of the split's first n texts")
     ap.add_argument("--out", type=Path)
+    ap.add_argument("--rank", choices=("every", "once"), default=RANK, help="Descent.prune's ranking: every round, or once per "
+                    "level (re-ranked when a kept order admits nothing)")
     args = ap.parse_args()
+    RANK = args.rank
     if args.tasks:
         texts = [native.TEXTS / "vpd4l" / f"{t}.json" for t in args.tasks.read_text().split()]
     else:

@@ -80,7 +80,7 @@ for k in $(seq 0 $((P - 1))); do
     v=\$((v + 1));
   done; done; echo \"exit 0\" >> $O/vars_$k.log) &"
 done
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
 tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle; tar -xzf $F/circuits.tgz -C \$HOME;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd > /dev/null;

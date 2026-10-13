@@ -73,7 +73,7 @@ class Patcher:
             return st.register_forward_hook(f)
         hooks = [hook(n) for n in self.by]
         try:
-            logits = self.tg.hidden(torch.tensor([self.ids] * B, device=self.dev))[:, self.targets] @ self.tg.wte.T
+            logits = self.tg.unembed(self.tg.hidden(torch.tensor([self.ids] * B, device=self.dev))[:, self.targets])  # unembed: a behavior's mask too
         finally:
             for h in hooks:
                 h.remove()

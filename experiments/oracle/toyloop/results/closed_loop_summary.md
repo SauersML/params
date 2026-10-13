@@ -14,7 +14,7 @@ texts per split.
 | teacher search on zoo v1 | `experiments/oracle/toys/zoo_teacher.py` | selected teacher: unit F1 0.99, exact 0.96 |
 | Gate B controls on the planted toys | `experiments/oracle/toys/gate_b_toys.py` | see below |
 | oracle: render, parse, SFT, GRPO, evaluate | `experiments/oracle/toyloop/{render,circuit,train,evaluate}.py` | |
-| executable reward: (sufficiency + necessity)/2, minus 0.05 per unit, worst text counted | `experiments/oracle/toyloop/reward_exec.py` | truth first on 350/350 v1 toys and 247/273 v2 texts (the gate family is the gap) |
+| executable reward: (sufficiency + necessity)/2, minus 0.05 per unit, worst text counted | `experiments/oracle/toyloop/reward_exec.py` | reward v3 (default): truth first on 350/350 v1 toys and 181/181 texts of the 30-instance v2 check, gate included (v2 reward: 173/181, gate 18/26); `results/reward_check_v2_r3.json` |
 
 ## Findings
 
@@ -68,7 +68,7 @@ texts per split.
 
 - Weight reading. Give the oracle more capacity (360M, LoRA) or a staged curriculum (zoo v1, then v2). Score
   weight use only with the swapped control on weights-only prompts.
-- The gate-family reward gap: necessity saturates once one unit breaks the prediction.
+- (Closed) the gate-family reward gap: reward v3 adds log-odds sufficiency and credits counterweight units (the always-on NO neuron); `reward_exec.py --version 2` keeps the old reward.
 - RL on zoo v2: larger groups (k 8), more steps, and std-normalized advantages. The reward is noisy per text.
 - Edges and English. Unit F1 runs ahead of edge F1 (about 0.55). The English is not yet verified by execution
   here; the executable-English work in the main lane applies.

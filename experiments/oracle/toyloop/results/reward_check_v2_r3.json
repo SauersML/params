@@ -1,0 +1,106 @@
+{
+ "multihop": {
+  "texts": 8,
+  "gt": 0.844,
+  "wins": "8/8",
+  "minus_one": 0.44,
+  "plus_one": 0.273,
+  "empty": 0.838,
+  "union": 0.847,
+  "active": 0.598
+ },
+ "induction": {
+  "texts": 28,
+  "gt": 0.844,
+  "wins": "28/28",
+  "minus_one": 0.39,
+  "plus_one": 0.277,
+  "empty": 0.822,
+  "union": 0.55,
+  "active": 0.278
+ },
+ "additive_vote": {
+  "texts": 14,
+  "gt": 0.768,
+  "wins": "14/14",
+  "minus_one": 0.208,
+  "plus_one": 0.044,
+  "empty": 0.693,
+  "union": 0.35,
+  "active": 0.1
+ },
+ "bigram_mlp": {
+  "texts": 30,
+  "gt": 0.874,
+  "wins": "30/30",
+  "minus_one": 0.433,
+  "plus_one": 0.098,
+  "empty": 0.845,
+  "union": 0.25,
+  "active": 0.1
+ },
+ "detect": {
+  "texts": 8,
+  "gt": 0.899,
+  "wins": "8/8",
+  "minus_one": 0.448,
+  "plus_one": 0.411,
+  "empty": 0.896,
+  "union": 0.65,
+  "active": 0.3
+ },
+ "cancel": {
+  "texts": 16,
+  "gt": 0.894,
+  "wins": "16/16",
+  "minus_one": 0.439,
+  "plus_one": 0.279,
+  "empty": 0.885,
+  "union": 0.65,
+  "active": 0.195
+ },
+ "gate": {
+  "texts": 26,
+  "gt": 0.784,
+  "wins": "26/26",
+  "minus_one": 0.078,
+  "plus_one": 0.047,
+  "empty": 0.749,
+  "union": 0.1,
+  "active": 0.1
+ },
+ "redundant": {
+  "texts": 22,
+  "gt": 0.831,
+  "wins": "22/22",
+  "minus_one": 0.395,
+  "plus_one": 0.043,
+  "empty": 0.79,
+  "union": 0.3,
+  "active": 0.1
+ },
+ "copy_offset": {
+  "texts": 8,
+  "gt": 0.894,
+  "wins": "8/8",
+  "minus_one": 0.445,
+  "plus_one": 0.26,
+  "empty": 0.89,
+  "union": 0.598,
+  "active": 0.144
+ },
+ "binding_positional": {
+  "texts": 21,
+  "gt": 0.892,
+  "wins": "21/21",
+  "minus_one": 0.432,
+  "plus_one": 0.279,
+  "empty": 0.874,
+  "union": 0.742,
+  "active": 0.1
+ },
+ "_timing": {
+  "score_calls": 2699,
+  "seconds": 396.4
+ }
+}

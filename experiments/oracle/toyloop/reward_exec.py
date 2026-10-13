@@ -9,6 +9,8 @@ texts where the family claims them, else toy.texts. With U the predicted heads a
          (U's nodes: every VPD-active piece of U at every position, the simplest form of the zoo's gt rule)
   nec  = (mean + min) over texts / 2 of clip(KL(model || model with U ablated) / KL(model || model with every live unit ablated), 0, 1)
   reward = (suff + nec) / 2 - UNIT_COST * |U|;  0 for an unparseable answer.
+  version 3 (default; REWARD_VERSION, TOYLOOP_REWARD_VERSION=2 for the above): per text suff is also capped by
+  1 - |log-odds shift of the answer| / (the empty circuit's shift), and zoo2 necessity also counts _nec_margin.
 Sufficiency alone prefers one of several redundant routes (any one carries the answer); necessity credits stating all
 of them (ablating one route of two halves the copy, of all of them breaks it). The unit cost removes distractors (they
 add neither). The worst-text half makes a unit needed on one text in 30 (a lookup-table entry) worth its cost. The normalisers use no ground truth, so the same reward runs on toys without one.
@@ -28,6 +30,10 @@ import circuit  # noqa: E402
 import torch  # noqa: E402
 
 UNIT_COST = 0.05
+# 3 (default): sufficiency also on the answer's log-odds (score), zoo2 necessity also credits counterweights
+# (_nec_margin); fixes the zoo2 gate family (30-instance check: truth first on 26/26 gate texts, was 18/26). 2: the earlier reward.
+# Override per process with TOYLOOP_REWARD_VERSION=2, per call with score(..., version=2), or reward_exec_v2.
+REWARD_VERSION = int(__import__("os").environ.get("TOYLOOP_REWARD_VERSION", "3"))
 _CACHE: dict = {}
 _UNIT = re.compile(r"L(\d+)([HN])(\d+)")
 
@@ -106,10 +112,32 @@ def _state(toy) -> dict:
         live = all_units(toy.sd)
         if len(_CACHE) > 256:
             _CACHE.clear()
+        empty = [_circuit_logp(nat, ids, []) for ids in ts]
         _CACHE[toy.name] = {"nat": nat, "texts": ts, "ci": [nat.importance(ids) for ids in ts], "full": full,
-                            "empty": [zoo.node_kl(nat, ids, []) for ids in ts],
+                            "empty": [_kl(f, e)[0] for f, e in empty],
+                            "empty_margin": [_margin(f, e) for f, e in empty],
                             "abl_all": _kl(full, last_logits(zoo.ablate(toy.sd, live), ts)), "live": set(live)}
     return _CACHE[toy.name]
+
+
+@torch.no_grad()
+def _circuit_logp(nat, ids: list, nodes: list) -> tuple:
+    """zoo.node_kl's two runs, kept: (the native's full last-position log-probs, the run with only `nodes` on), [1, V]."""
+    T = len(ids)
+    x = torch.tensor([ids])
+    full = nat.vpd.target_forward(x)[:, -1].log_softmax(-1)
+    masks = {n: torch.zeros(1, T, nat.C[n]) for n in nat.names}
+    for n, t, c in nodes:
+        masks[n][0, t, c] = 1.0
+    return full, nat.vpd.masked(x, masks, {n: torch.ones(1, T) for n in nat.names})[:, -1].log_softmax(-1)
+
+
+def _margin(full, q) -> float:
+    """|m(model) - m(q)|, m = log-odds of the model's top token (logit minus logsumexp of the rest): does not saturate
+    once the top token's probability is ~1, unlike the KL."""
+    top = int(full[0].argmax())
+    m = lambda lp: float(lp[0, top] - torch.cat([lp[0, :top], lp[0, top + 1:]]).logsumexp(0))  # noqa: E731
+    return abs(m(full) - m(q))
 
 
 def unit_keys(units) -> set:
@@ -266,26 +294,73 @@ def _nec_same(toy, live: list) -> list:
     return [min(1.0, max(0.0, a / max(b, 1e-9))) for a, b in zip(abl, st["abl_all"])]
 
 
-def _nec_v2(toy, live: list) -> float:
-    """zoo2 necessity of a unit set: the largest of same-truth ablation (mean and worst), module-text ablation (mean)
-    and interchange with module texts of another answer (mean)."""
+MARGIN_FULL = 2.0   # nats of the answer's log-odds: moving them this much on a text is full necessity there (v3)
+
+
+def _log_odds(lp, top) -> torch.Tensor:
+    """Per row: log-odds of token top[i] (its log-prob minus the logsumexp of the others' log-probs)."""
+    i = torch.arange(len(top))
+    rest = lp.clone()
+    rest[i, top] = float("-inf")
+    return lp[i, top] - rest.logsumexp(-1)
+
+
+def _nec_margin(toy, live: list) -> float:
+    """v3, zoo2: necessity of a counterweight. Per same-truth text min(1, max(0, m(model with `live` ablated) -
+    m(model)) / MARGIN_FULL), m the log-odds of the model's answer, (mean + worst) over the texts: the ablation makes
+    the answer SURER. The KL terms cannot see that: the answer only gets more certain, KL ~0. An AND gate's
+    always-on NO default neuron on a YES text is such a unit (removing it raises YES's log-odds by its whole write,
+    ~8 nats); the KL terms gave it only the share of module texts answering NO (~0.5), so the truth lost to truth
+    plus a unit of another route, and (with the margin sufficiency in score) to truth minus it. Signed on purpose:
+    a drop in the log-odds is the KL terms' job, and counting it here would make each of two redundant routes fully
+    necessary (ablating one halves the copy: several nats). Dividing by the shift from ablating every non-critical
+    unit was also tried: a cancelling twin ablated alone shifts the log-odds as well, so that denominator is
+    mostly artefact."""
+    import zoo
+    st = _state(toy)
+    if not live:
+        return 0.0
+    if "top" not in st:
+        st["top"] = st["full"].argmax(-1)
+        st["log_odds"] = _log_odds(st["full"], st["top"])
+    lp = _model_fns(toy)[0](zoo.ablate(toy.sd, live), st["texts"])
+    r = ((_log_odds(lp, st["top"]) - st["log_odds"]) / MARGIN_FULL).clamp(0, 1).tolist()
+    return (sum(r) / len(r) + min(r)) / 2
+
+
+def _nec_v2(toy, live: list, version: int = 2) -> float:
+    """zoo2 necessity of a (non-critical) unit set: the largest of same-truth ablation (mean and worst), module-text
+    ablation (mean) and interchange with module texts of another answer (mean); version 3 adds _nec_margin."""
     import zoo
     v = _nec_same(toy, live)
     n = (sum(v) / len(v) + min(v)) / 2
     ms = _module_state(toy)
     mabl = _kl(ms["full"], _model_fns(toy)[0](zoo.ablate(toy.sd, live), ms["texts"]))
     n = max(n, sum(min(1.0, a / max(b, 1e-9)) for a, b in zip(mabl, ms["abl_all"])) / len(mabl))
+    if version >= 3:
+        n = max(n, _nec_margin(toy, live))
     sn = swap_necessity(toy, live)
     return max(n, sn) if sn is not None else n
 
 
-def score(toy, units: set) -> dict:
+def score(toy, units: set, version: int | None = None) -> dict:
+    """version 3 (default, REWARD_VERSION): per text, sufficiency is the smaller of the KL term and a logit-margin term
+    clip(1 - |m(model) - m(circuit)| / |m(model) - m(empty circuit)|, 0, 1), m the log-odds of the model's top token.
+    The KL saturates once the top token is certain: an AND gate's YES text is answered as surely without the NO
+    default neuron (KL ~0), so truth minus that neuron scored as high and was cheaper; its log-odds move by the
+    neuron's whole write. zoo2 necessity: see _nec_v2. version 2: the earlier reward, unchanged."""
     import zoo
+    version = REWARD_VERSION if version is None else version
     st = _state(toy)
     keys = unit_keys(units)
     zoo_names = [f"L{l}.{k}{i}" for l, k, i in sorted(keys)]
-    suff = [min(1.0, max(0.0, 1.0 - zoo.node_kl(st["nat"], ids, nodes_of(toy, units, i)) / max(e, 1e-9)))
-            for i, (ids, e) in enumerate(zip(st["texts"], st["empty"]))]
+    suff = []
+    for i, (ids, e) in enumerate(zip(st["texts"], st["empty"])):
+        full, q = _circuit_logp(st["nat"], ids, nodes_of(toy, units, i))
+        x = min(1.0, max(0.0, 1.0 - _kl(full, q)[0] / max(e, 1e-9)))
+        if version >= 3:
+            x = min(x, max(0.0, 1.0 - _margin(full, q) / max(st["empty_margin"][i], 1e-9)))
+        suff.append(x)
     live = [u for u in zoo_names if u in st["live"]]   # ablating a dead unit changes nothing
     agg = lambda v: (sum(v) / len(v) + min(v)) / 2   # noqa: E731  (mean and worst text: every text must be explained)
     s = agg(suff)
@@ -294,15 +369,20 @@ def score(toy, units: set) -> dict:
     else:   # zoo2: the predicted units minus the critical ones (see _critical) when any remain
         crit = _critical(toy)
         rest = [u for u in live if u not in crit]
-        n = _nec_v2(toy, rest) if rest else agg(_nec_same(toy, live))
+        n = _nec_v2(toy, rest, version) if rest else agg(_nec_same(toy, live))
     return {"suff": s, "nec": n, "n": len(keys), "reward": (s + n) / 2 - UNIT_COST * len(keys)}
 
 
-def reward_exec(meta: dict, completion: str) -> float:
+def reward_exec(meta: dict, completion: str, version: int | None = None) -> float:
     c = circuit.parse(completion)
     if not c.ok:
         return 0.0
-    return score(meta["toy"], c.units)["reward"]
+    return score(meta["toy"], c.units, version)["reward"]
+
+
+def reward_exec_v2(meta: dict, completion: str) -> float:
+    """The version-2 reward (before the gate fix), for runs that must stay comparable with it."""
+    return reward_exec(meta, completion, 2)
 
 
 def reward_wiring_suff(meta: dict, completion: str) -> float:
@@ -568,14 +648,14 @@ def reward_wiring_intervention_mdl(meta, completion):
         return -1.0
 
 
-def check(toys) -> dict:
+def check(toys, version: int | None = None) -> dict:
     """gt vs gt minus each unit, gt plus the distractors, distractors, empty: per family the worst margin."""
     import render
     fam = {}
     for toy in toys:
         gt = {u for u in toy.truth["units"] if _UNIT.fullmatch(u)}
         dis = {render.zoo_unit(u) for u in toy.meta["record"]["distractor_units"]}
-        r = lambda us: score(toy, us)["reward"]  # noqa: E731
+        r = lambda us: score(toy, us, version)["reward"]  # noqa: E731
         g = r(gt)
         minus = max((r(gt - {u}) for u in gt), default=-1)
         m = fam.setdefault(toy.meta["family"], {"n": 0, "gt": [], "gt_minus_one_margin": 9, "gt_plus_dis_margin": 9,
@@ -595,7 +675,7 @@ def check(toys) -> dict:
     return fam
 
 
-def check_v2(toys, n_plus: int = 8) -> dict:
+def check_v2(toys, n_plus: int = 8, version: int | None = None) -> dict:
     """zoo2, per text: the truth's reward against truth minus each unit, truth plus one other unit (distractors and
     other modules' units first, up to n_plus), empty, the instance union, and the units active at the last position.
     Per family: mean truth reward, worst margin over each alternative, share of texts where the truth wins all."""
@@ -605,7 +685,7 @@ def check_v2(toys, n_plus: int = 8) -> dict:
     for toy in toys:
         rec = toy.meta["record"]
         gt = {u for u in toy.truth["units"] if _UNIT.fullmatch(u)}
-        r = lambda us: score(toy, us)["reward"]  # noqa: E731
+        r = lambda us: score(toy, us, version)["reward"]  # noqa: E731
         g = r(gt)
         others = [render.zoo_unit(u) for u in rec["distractor_units"] + rec["gt_units"]]
         others = list(dict.fromkeys(u for u in others if u not in gt))
@@ -634,16 +714,21 @@ def check_v2(toys, n_plus: int = 8) -> dict:
 
 
 if __name__ == "__main__":
+    # --version N (default REWARD_VERSION) picks the reward version for either check
+    VERSION = int(sys.argv[sys.argv.index("--version") + 1]) if "--version" in sys.argv else None
+    if VERSION is not None:
+        i = sys.argv.index("--version")
+        del sys.argv[i:i + 2]
     if len(sys.argv) > 1 and sys.argv[1] == "v2":   # python3 -B reward_exec.py v2 [n_instances]: zoo2 margins
         import json
         import render
         import torch
-        torch.set_num_threads(2)
+        torch.set_num_threads(1)
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 30
         rows = [json.loads(x) for x in (Path.home() / "mpd-data/toy_zoo2/manifest.jsonl").read_text().splitlines() if x.strip()]
         step = max(1, len(rows) // n)
         toys = [t for r in rows[::step][:n] for t in render.from_zoo2(r, Path.home() / "mpd-data/toy_zoo2")]
-        print(json.dumps(check_v2(toys), indent=1))
+        print(json.dumps(check_v2(toys, version=VERSION), indent=1))
         sys.exit()   # python3 -B reward_exec.py [every-k-th instance]: margins of gt over its perturbations
     import json
     import time
@@ -654,7 +739,7 @@ if __name__ == "__main__":
     k = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     toys = render.load_zoo(Path.home() / "mpd-data/toy_zoo/manifest.jsonl")[::k]
     t0 = time.time()
-    res = check(toys)
+    res = check(toys, VERSION)
     print(json.dumps(res, indent=1))
     calls = sum(1 + len(t.truth["units"]) + 3 for t in toys)
     print(f"{len(toys)} toys, ~{calls} score calls, {time.time() - t0:.1f}s (incl. per-toy setup)")

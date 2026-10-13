@@ -1577,7 +1577,16 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             row["best_edges"]["tokens"] = [list(x[:2]) + ([list(x[2])] if len(x) > 2 else []) for x in row["best_edges"].get("tokens") or []]
             row["best_edges"]["bits"] = goal_eval.size_bits(stated, nat.positions(targets), sum(nat.C.values()), targets, tx.vpd)
             circuits[""] = goal_eval.to_json(stated, "")
-            if tokens is not None and max_tokens:            # over the answer budget: the node set, every connection
+            if phi_pool is not None:                         # the stated circuit against the reward's bar too (its cuts
+                bar = ge.tau(tx, phi_pool, "search")["phi_tau"]   # passed track_pp alone: text9002's search 0.35 got
+                nodes_g = native.Graph(sorted(stated.node_set()), complete=True)   # through): below it and below its
+                rows_ = ge.fidelity(tx, [stated, nodes_g], phi_pool, mode="reward", split="search")   # node set, the
+                row["phi_stated"], row["phi_nodes"] = (goal_eval.phi(r_, start=bar)[0] for r_ in rows_)   # node set
+                if row["phi_stated"] is None or (row["phi_nodes"] is not None and row["phi_stated"] < bar + PHI_SLACK
+                                                 and row["phi_stated"] < row["phi_nodes"]):
+                    circuits[""] = goal_eval.to_json(nodes_g, "")
+                    row["answer"] = "node set (phi)"
+            if tokens is not None and max_tokens and row.get("answer") is None:   # over the answer budget: the node set
                 row["answer_tokens_stated"] = tokens(components.render(circuits[""]))   # claimed (text9002's 351 nodes
                 if row["answer_tokens_stated"] > max_tokens:  # stated: 40,838 Qwen3 tokens, its node set 4,068)
                     circuits[""] = goal_eval.to_json(native.Graph(sorted(stated.node_set()), complete=True), "")

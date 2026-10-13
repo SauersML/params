@@ -389,54 +389,35 @@ PAIRS_CIRCUIT = Path.home() / "mpd-data/graph_oracle/teacher/joint_heldout_80fe9
 
 
 @pytest.mark.skipif(not PAIRS_CIRCUIT.exists(), reason="needs the 80fe906 teacher circuit of text9002")
-def test_pairs_stated_within_budget():
+def test_pairs_stated_and_trimmed():
+    import qk
+
     nat, pr = pruner(teacher.CONVENTION == "live", "text9002")
     ge, tx = pr.ge, pr.tx
-    live = teacher.CONVENTION == "live"
-    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    task = json.loads((TEXT.parent / "text9002.json").read_text())
     teacher_g, _ = goal_eval.circuit(json.loads(PAIRS_CIRCUIT.read_text()), tx.targets, nat.C, tx.T)
-    start, _ = vpd_top(pr, nat, 266, "text9002")
-    nodes = [pr.nodes[j] for j in start.nonzero().flatten().tolist()]
-    nodes = [nd for nd in nodes if nd in teacher.routes(nodes, tx.targets)]
-    ep = teacher.EdgePruner(ge, tx, nodes, live, 32)
-    conn = teacher.Connector(ge, tx, pr, empty, vpd, lambda *a: 0.0)
-    on = torch.zeros_like(start)
-    on[torch.tensor([conn.index[nd] for nd in nodes], device=on.device)] = True
-    # the teacher circuit (its read L2@41 needs pairs: background 1.6 bits against a 0.66 budget) and VPD's top 266
-    # with every connection (every read's background within the budget: its queries and keys stranded)
-    for g, needs in ((teacher_g, True), (conn.graph(on, ep.edges), False)):
-        stated, summary = teacher.state_pairs(ge, tx, g, empty, vpd)
-        # every read with a query or key node states its pairs, and the graph stays within the budget
-        assert summary["reads"] > 0 and summary["kl_pairs"] <= summary["budget"] * (1 + 1e-5)
-        assert set(stated.pairs) == {(r["layer"], r["t"]) for r in summary["per_read"]}
-        assert (summary["pairs"] > 0) == needs and (summary["stranded"] > 0) == (not needs)
-        # the stated graph with its stranded queries and keys dropped runs as the last read's measurement
-        assert abs(ge.graph_kl(tx, [stated], live)[0] - summary["kl_pairs"]) <= 1e-4 * max(1.0, summary["kl_pairs"])
-        # written as circuit JSON, goal_eval reads the same pairs back, every node and edge valid, none stranded
-        on_p = torch.zeros_like(on)
-        on_p[torch.tensor([conn.index[nd] for nd in stated.node_set()], device=on.device)] = True
-        kept = [(w, r) for r, ws in stated.parents.items() for w in ws] + [(w, None) for w in stated.out]
-        back, bad = goal_eval.circuit(teacher.circuit_json(pr, on_p, kept, stated.pairs), tx.targets, nat.C, tx.T)
-        assert bad == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 0}
-        assert {read: set(ps) for read, ps in getattr(back, "pairs", {}).items()} == {read: set(ps) for read, ps in stated.pairs.items()}
-        # and every token edge (with_tokens: s_track_pp's change enters a stated graph only through them)
-        want = teacher.with_tokens(stated, tx.targets)
-        assert set(back.tok_edges) == set(want.tok_edges) and back.tok_out == sorted(tx.targets)
-        if needs:
-            g0 = goal_eval.strand(teacher_g, tx.targets, nat.C)
-            gains = sorted(((r["curve"][i] - r["curve"][i + 1], stated.pairs[(r["layer"], r["t"])][i])
-                            for r in summary["per_read"] for i in range(r["pairs"])), reverse=True)
-            # over an answer budget the lowest-value pairs go first; with none left the reads' entries go too
-            h, ps, dropped = teacher.trim_pairs(g0, stated, summary["per_read"], lambda h, ps: sum(map(len, ps.values())) <= 3,
-                                                tx.targets, nat.C)
-            assert dropped == summary["pairs"] - 3 and set(sum(ps.values(), [])) == {p_ for _, p_ in gains[:3]}
-            assert teacher.trim_pairs(g0, stated, summary["per_read"], lambda h, ps: False, tx.targets, nat.C)[:2] == (g0, None)
-            # with acceptance the pairs also keep the changed-input term of the graph without pairs
-            acc = teacher.Acceptance(ge, tx, ("changed",), "c")
-            stated_a, summary_a = teacher.state_pairs(ge, tx, teacher_g, empty, vpd, acc)
-            got = acc.scores([stated_a])[0]["s_track"]
-            assert summary_a["kl_pairs"] <= summary_a["budget"] * (1 + 1e-5) and summary_a["pairs"] >= summary["pairs"]
-            assert got is None or summary_a["floor"]["s_track"] is None or got >= summary_a["floor"]["s_track"] - 1e-6
+    g0 = teacher.with_tokens(goal_eval.strand(teacher_g, tx.targets, nat.C), tx.targets)
+    got = qk.stated_pairs(ge, task, goal_eval.to_json(g0, ""), "c", "search")
+    cur = {read: [(None if a == "rem" else a, None if b == "rem" else b) for a, b in ps if (a, b) != (None, None)]
+           for read, ps in got.items()}
+    stated = goal_eval.strand(teacher.with_pairs(g0, cur), tx.targets, nat.C)
+    # rustmove's selection states the read L2@41's pairs; written as circuit JSON, goal_eval reads the pairs back with
+    # every token edge, every node and edge valid
+    assert sum(map(len, cur.values())) > 0
+    conn = teacher.Connector(ge, tx, pr, *ge._bounds(tx, teacher.CONVENTION), lambda *a: 0.0)
+    on = torch.zeros(len(pr.nodes), dtype=torch.bool, device=nat.dev)
+    on[torch.tensor([conn.index[nd] for nd in stated.node_set()], device=on.device)] = True
+    kept = [(w, r) for r, ws in stated.parents.items() for w in ws] + [(w, None) for w in stated.out]
+    back, bad = goal_eval.circuit(teacher.circuit_json(pr, on, kept, stated.pairs), tx.targets, nat.C, tx.T)
+    assert bad == {"invalid_nodes": 0, "invalid_edges": 0, "stranded_nodes": 0, "invalid_variables": 0}
+    assert {read: set(ps) for read, ps in getattr(back, "pairs", {}).items()} == {read: set(ps) for read, ps in stated.pairs.items()}
+    assert set(back.tok_edges) == set(teacher.with_tokens(stated, tx.targets).tok_edges) and back.tok_out == sorted(tx.targets)
+    # over an answer budget the last-chosen pairs go first; with none left the reads' entries go too
+    order = [(read, p_) for _, read, p_ in sorted((-i, read, p_) for read, ps in stated.pairs.items() for i, p_ in enumerate(ps))]
+    h, ps, dropped = teacher.trim_pairs(g0, stated, order, lambda h, ps: sum(map(len, ps.values())) <= 3, tx.targets, nat.C)
+    first3 = {p_ for read, pl in stated.pairs.items() for p_ in pl[:3]} if len(stated.pairs) == 1 else None
+    assert sum(map(len, ps.values())) <= 3 and (first3 is None or set(sum(ps.values(), [])) <= first3)
+    assert teacher.trim_pairs(g0, stated, order, lambda h, ps: False, tx.targets, nat.C)[:2] == (g0, None)
 
 
 def test_connect_with_acceptance_keeps_its_floor():

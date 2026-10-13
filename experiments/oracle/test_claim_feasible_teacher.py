@@ -23,4 +23,9 @@ class PolicyTest(unittest.TestCase):
   with self.assertRaises(ValueError):f.search_sites(('a','a'),{'a':1},{'a':2},None,None)
  def test_nonfinite_measurements_fail_closed(self):
   with self.assertRaises(RuntimeError):f.search_sites(('a',),{'a':1},{'a':2},lambda *a:[0,float('nan'),0,0],lambda *a:None)
+ def test_strict_reconstruction_control_stops_before_proposals(self):
+  labels=[]
+  def evaluate(m,label):labels.append(label);return [0,0,0,1e-6]
+  got=f.search_sites(('a',),{'a':(0,1)},{'a':(0,)},evaluate,lambda m:{'reachable_component_placements':sum(map(len,m.values()))},full_start_max=1e-7)
+  self.assertEqual(labels,['full_start']);self.assertIsNone(got['masks']);self.assertEqual(got['attempts'],[])
 if __name__=='__main__':unittest.main()

@@ -10,16 +10,18 @@ import math
 from pathlib import Path
 import sys
 import time
+import subprocess
 from claim_direct_teacher import SELECTED, SITE, sha
 MAX_SITES=24
 WORST_KL=.001
+FULL_INTEGRITY_MAX=1e-7
 
 def reachable_positions(site,length,targets,layers):
     """Architecture reachability, independent of weights/answers/importance."""
     layer=int(site.split('.')[1]);kind=site.split('.')[-1]
     return tuple(sorted(set(targets))) if layer==layers-1 and kind in ('q_proj','o_proj','c_fc','down_proj') else tuple(range(max(targets)+1))
 
-def search_sites(order,full,teacher,evaluate,count,emit=None):
+def search_sites(order,full,teacher,evaluate,count,emit=None,full_start_max=WORST_KL):
     order=tuple(order)
     if len(order)>MAX_SITES or len(set(order))!=len(order) or set(order)!=set(full) or set(full)!=set(teacher):raise ValueError('fixed unique site universe required')
     def measure(masks,label):
@@ -27,7 +29,7 @@ def search_sites(order,full,teacher,evaluate,count,emit=None):
         if len(values)!=4 or any(not math.isfinite(x) or x<0 for x in values):raise RuntimeError('four finite direct KL measurements required')
         return {'direct_kl_bits':values,'worst_direct_kl_bits':max(values),'counts':count(masks)}
     current=dict(full);start=measure(current,'full_start');attempts=[];accepted=[]
-    if start['worst_direct_kl_bits']>WORST_KL:return {'status':'infeasible_literal_full_start','masks':None,'start':start,'attempts':attempts,'accepted_sites':accepted}
+    if start['worst_direct_kl_bits']>full_start_max:return {'status':'infeasible_literal_full_start','full_start_max':full_start_max,'masks':None,'start':start,'attempts':attempts,'accepted_sites':accepted}
     selected=start
     for site in order:
         proposed={**current,site:teacher[site]};counts=count(proposed)
@@ -49,6 +51,15 @@ def run(repo,payload,out):
     import native,goal_eval,vpd_model,mech,weight_family
     if out.exists():raise ValueError('immutable new output required')
     contract=json.loads((payload/'protocol.json').read_text())
+    actual_executor=(repo/'.executor_commit').read_text().strip()
+    if actual_executor!=contract['executor_commit']:raise ValueError('executor commit mismatch')
+    runner_repo=Path(__file__).resolve().parents[2]
+    runner_commit=subprocess.check_output(['git','-C',str(runner_repo),'rev-parse','HEAD'],text=True).strip()
+    for module in (native,goal_eval,vpd_model,mech,weight_family):
+        path=Path(module.__file__).resolve()
+        relative=path.relative_to(repo.resolve()).as_posix()
+        original=subprocess.check_output(['git','-C',str(runner_repo),'show',actual_executor+':'+relative])
+        if original!=path.read_bytes():raise ValueError('executor source mismatch: '+relative)
     for name,expected in contract['files'].items():
         if Path(name).is_absolute() or '..' in Path(name).parts or sha(payload/name)!=expected:raise ValueError('frozen input mismatch')
     panel=json.loads((payload/'panel.json').read_text())
@@ -74,7 +85,7 @@ def run(repo,payload,out):
         prepared[task]=(ids,targets,fixed,report,len(answer.get('nodes',[])))
     out.mkdir();started=time.monotonic();calls={'dense':0,'sparse':0};summaries={}
     def write(name,value):(out/name).write_text(json.dumps(value,indent=2))
-    write('contract.json',{**contract,'runner_sha256':sha(__file__),'helper_sha256':sha(Path(__file__).with_name('claim_direct_teacher.py')),'selected_edits':SELECTED,'components_per_site':{n:int(nat.C[n]) for n in order},'source_sha256':{m.__name__:sha(m.__file__) for m in (native,goal_eval,vpd_model,weight_family)},'site_order':order,'max_sites_per_context':24,'max_forwards':336,'worst_direct_kl_max':WORST_KL,'live_remainders':True,'mask_links':'all architecture connections; own routing/norms; original teacher edges ignored','teacher_masks':'parsed executable fixed joint_train component nodes; stranded source nodes reported','count_scope':'mask-enabled and output-reachable rank-one placements; backend dense factor arithmetic is not pruned; all24 dense remainder sites stay on; no FLOP claim','remainder_off':'not measured; no remainder-free circuit certificate','original_state':original_state})
+    write('contract.json',{'input_provenance':contract,'executor_commit':actual_executor,'runner_commit':runner_commit,'runner_sha256':sha(__file__),'helper_sha256':sha(Path(__file__).with_name('claim_direct_teacher.py')),'selected_edits':SELECTED,'components_per_site':{n:int(nat.C[n]) for n in order},'source_sha256':{m.__name__:sha(m.__file__) for m in (native,goal_eval,vpd_model,weight_family)},'site_order':order,'max_sites_per_context':24,'max_forwards':336,'full_start_integrity_max':FULL_INTEGRITY_MAX,'worst_direct_kl_max':WORST_KL,'live_remainders':True,'mask_links':'all architecture connections; own routing/norms; original teacher edges ignored','teacher_masks':'parsed executable fixed joint_train component nodes; stranded source nodes reported','count_scope':'mask-enabled and output-reachable rank-one placements; backend dense factor arithmetic is not pruned; all24 dense remainder sites stay on; no FLOP claim','remainder_off':'not measured; no remainder-free circuit certificate','original_state':original_state})
     def clear():
         nat.vpd.clear();nat._refs.clear();nat._refs_bytes=0;nat._rec=(None,None,{});ge._xk.clear();nat.__dict__.pop('_sensitivity_kept',None)
     def kl(p,q):
@@ -111,13 +122,14 @@ def run(repo,payload,out):
             return errors
         attempts=[]
         def emit(row):attempts.append(row);write(task+'_attempts.json',attempts)
-        result=search_sites(order,full,fixed,evaluate,count,emit);masks=result.pop('masks')
+        result=search_sites(order,full,fixed,evaluate,count,emit,full_start_max=FULL_INTEGRITY_MAX);masks=result.pop('masks')
         result.update(parser_report=report,source_teacher_nodes=source_nodes,teacher_executable_placements=sum(int(m.sum()) for m in fixed.values()))
         if masks is not None:
             final=evaluate(masks,'uncached_final',True)
             if max(final)>WORST_KL:raise RuntimeError('final fidelity failed')
             result['final_direct_kl_bits']=final;result['recipe']={n:{'mode':'fixed_teacher' if n in result['accepted_sites'] else 'full','shape':list(m.shape),'fixed_teacher_nodes':[[int(p),int(c)] for p,c in fixed[n].nonzero().tolist()] if n in result['accepted_sites'] else None} for n,m in masks.items()}
         summaries[task]=result;write('results.json',summaries)
+        print(json.dumps({'task':task,'status':result['status'],'accepted_sites':result['accepted_sites'],'start':result['start'],'selected':result.get('selected'),'actual_forward_counts':dict(calls)}),flush=True)
     if state()!=original_state or {k:sha(p) for k,p in assets.items()}!=contract['model_content_sha256']:raise RuntimeError('final model/basis/assets changed')
     if sum(calls.values())>336:raise RuntimeError('forward cap exceeded')
     write('complete.json',{'actual_forward_counts':calls,'max_forwards':336,'restored_state':state(),'seconds':time.monotonic()-started,'scope':'adaptive TRAIN inputs and previously selected final-down edits only; live dense remainders remain on'})

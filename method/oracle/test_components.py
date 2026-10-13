@@ -275,7 +275,7 @@ def test_reward_on_tiny_model(tiny):
     bad = good.replace("  subgraph P7", "  subgraph P7", 1).replace("  end\n", '    zz["L0.v#0"]\n  end\n', 1).replace(
         "\n```\n", "\n  zz --> OUT\n```\n", 1)  # a value never writes the residual stream: dropped, charged
     missing = components.render(goal_eval.to_json(g, "writes at the target"))
-    got = components.reward(ge, task, ev, [good, bad, missing, good], truncated=[False, False, False, True], pool={})
+    got = components.reward(ge, task, ev, [good, bad, missing, good], tokens=[7000, None, None, 10000], pool={})
     assert got[0]["valid"] and invalid < got[0]["reward"]
     assert all(got[0][f"term_{k}"] is None or 0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("C", "F1", "N", "F3"))
     v = got[0]  # reward v3: phi - phi_tau + g x (0.5 compact + E2g + E4x + E1) + D
@@ -292,7 +292,11 @@ def test_reward_on_tiny_model(tiny):
     else:
         assert got[0]["term_E2"] is None
     assert got[1]["valid"] and got[1]["dropped_edges"] == 1 and got[1]["bits"] > got[0]["bits"]
-    assert (not got[2]["valid"]) == bool(ev["qa"]) and not got[3]["valid"] and got[3]["reward"] == invalid
+    assert (not got[2]["valid"]) == bool(ev["qa"])
+    # past the 8,000-token answer cap: scored as written, less 0.5 bits per 1,000 tokens over (here 2,000 over: 1 bit)
+    assert got[3]["valid"] and got[3]["overflow"] == pytest.approx(1.0) and got[0]["overflow"] == 0.0
+    assert got[3]["reward"] == pytest.approx(got[0]["reward"] - 1.0)
+    assert got[3]["circuit_reward"] == pytest.approx(got[0]["circuit_reward"] - 1.0)
     import edit_eval
 
     goals = [{"kind": "flip", "token_id": 5, "token": " the", "target": 7}]

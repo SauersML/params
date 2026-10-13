@@ -64,8 +64,8 @@ CONTEXT = 32768  # Qwen3-8B's native context: a question's generation limit is a
 LINE_WEIGHT = 0.5  # the per-line credit's weight in a token's advantage, A + 0.5 z(c_l) (the lead's v3)
 LINE_FLOOR = 0.05  # z's spread at least this (bits): on v1 answers every line's credit was -0.000 to -0.008 (pp effects 0,
 # only the compactness term), and z of such spreads would turn noise into +-1 per line, larger than A
-ANSWER_CAP = 8000  # reward v3's answer cap in tokens after the thinking (Mermaid: the 3,500 of the id grammar x ~1.66,
-# max 7,403 over the 444 v1 targets): an answer above it counts as cut, invalid
+ANSWER_CAP = 8000  # the answer cap in tokens after the thinking (components.ANSWER_TOKENS): the reward charges past it
+# (components.overflow, 0.5 bits per 1,000 tokens; the scorer gets each answer's "tokens")
 
 
 def fitting(tinker, params, prompt, limit: int):
@@ -553,8 +553,8 @@ def rl(a) -> None:
             texts, thinks = zip(*(answer_of(renderer, tokenizer, s.tokens) for s in res.sequences))
             texts = list(texts)
             t1 = time.time()
-            req = {"task": q["task"], "answers": texts, "lines": not a.no_lines, "truncated": [str(s.stop_reason) == "length" or len(s.tokens) - th > ANSWER_CAP
-                                                                    for s, th in zip(res.sequences, thinks)]}
+            req = {"task": q["task"], "answers": texts, "lines": not a.no_lines,  # tokens after the thinking: past the
+                   "tokens": [len(s.tokens) - th for s, th in zip(res.sequences, thinks)]}  # answer cap, charged per token
             if frozen is not None:
                 if q["task"] not in tasks:
                     tasks[q["task"]] = json.loads((a.texts_dir / f"{q['task']}.json").read_text())
@@ -574,7 +574,7 @@ def rl(a) -> None:
             if step == 0 and distinct == 1 and a.group > 1:  # a seeded or degenerate sampler: no advantage, nothing learned
                 raise SystemExit(f"all {a.group} answers to {q['task']} are identical: check the sampling parameters")
             groups.append({"task": q["task"], "distinct": distinct, "rewards": rewards, "valid": [s["valid"] for s in scores],
-                           "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "truncated")} for s in scores],
+                           "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "tokens", "overflow")} for s in scores],
                            "texts": texts, "thinking_tokens": list(thinks), "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
                            "terms": {k: [s.get(k) for s in scores] for k in ("phi", "phi_tau", "g", "compact", "bits", "D", "Q", "E2g",

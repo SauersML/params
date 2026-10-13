@@ -160,8 +160,13 @@ ATTENTION_TOP = 3  # positions listed per attention head at the target (measured
 POOL_HEADS = 0  # candidate_pool(): positions beyond the listed ones, each attention head's top POOL_HEADS at the target
 # (8 heads' top 8: +1% of held-out teacher nodes for 4x the question, 46k tokens)
 CONTEXT = 32768  # Qwen3-8B's native context, the question and the generation together
-ANSWER_TOKENS = 8000  # the answer cap after the thinking (tinker_train.ANSWER_CAP): over it an answer is invalid, in RL and
-# in every evaluation alike (samples_of: a sample's "tokens" past it counts as cut)
+ANSWER_TOKENS = 8000  # the answer cap after the thinking (tinker_train.ANSWER_CAP): past it an answer is scored less
+OVERFLOW_BITS = 0.5  # per 1,000 tokens (reward(), overflow()), in RL and every evaluation alike
+
+
+def overflow(tokens: int | None) -> float:
+    """The reward's charge for an answer past ANSWER_TOKENS (tokens after its thinking): OVERFLOW_BITS per 1,000 over."""
+    return OVERFLOW_BITS * max(0, (tokens or 0) - ANSWER_TOKENS) / 1000.0
 ROOM = 10240  # fit_pool(): the generation a question leaves at least (an answer of tinker_train.ANSWER_CAP, 8,000 tokens, and some thinking)
 WINDOW = 8  # a question numbers the tokens within this many positions of every position its evidence names
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
@@ -1640,7 +1645,7 @@ def calibration_evidence(row: dict, split: str | None) -> dict:
                     or isinstance(v, (int, float)) or v is None}}
 
 
-def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
+def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, tokens: list | None = None,
            convention: str = CONVENTION, cache: dict | None = None, ee=None, edit_best: dict | None = None,
            pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None,
            lines: bool = False, node_cap: int | None = None, retain_calibration: bool = False,
@@ -1666,8 +1671,10 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         circuit (teacher: its JSON; v2 teacher circuits only, which keep the context: beating a v1 teacher is easy; no
         v2 teacher, D = 0): 0 at parity, positive only where the answer beats it on both.
     An answer is invalid, R = V3_INVALID below every valid one, without a CIRCUIT section, a FINAL line per question
-    or an EDIT line per edit request, cut at the sampling cap or over it (truncated), or above node_cap nodes (None: no
-    cap, for references such as the influential start). A circuit with zero executable bits has no compactness,
+    or an EDIT line per edit request, or above node_cap nodes (None: no cap, for references such as the influential
+    start). An answer longer than ANSWER_TOKENS (tokens: each answer's after its thinking) is scored as written, its
+    parsed part, less OVERFLOW_BITS per 1,000 tokens over (the lead's 10-13: a -10 cliff flattened the group's
+    advantages), in R and the circuit reward alike. A circuit with zero executable bits has no compactness,
     including an empty circuit with charged discarded syntax; its D compares
     phi alone (its compactness counts as beating the teacher's), so D is continuous down to it.
     Reported beside R: phi, phi_tau, g, faithful (phi >= phi_tau), bits, bits_start, compact, D, Q, each term
@@ -1695,7 +1702,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         junk = p["malformed_nodes"] * math.log2(P * total)  # a line that does not parse: written, explains nothing
         defects.append((d["invalid_nodes"] + p["unknown_ids"], d["invalid_edges"], dropped_bits(p["answer"], g, d, P, total) + junk))
         valid.append(p["circuit"] and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1))
-                     and all(n in p["edits"] for n in range(1, len(ev.get("edits") or []) + 1)) and not (truncated and truncated[i])
+                     and all(n in p["edits"] for n in range(1, len(ev.get("edits") or []) + 1))
                      and (node_cap is None or g.count() <= node_cap))
     keep = [i for i, v in enumerate(valid) if v]  # an invalid answer's reward is fixed whatever it measures: not run
     pool = _pool() if pool is None else pool
@@ -1740,8 +1747,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             dc = comp - ref["compact"] if ref is not None and comp is not None else (math.inf if executable_bits <= 0 else None)
             m = None if ref is None or ph is None or dc is None else min(ph - ref["phi"], dc)
             D = 0.0 if m is None else (softplus(2.0 * m) - softplus(0.0)) / 2.0  # 0 at parity with the teacher
-            r = ct["term"] + D  # cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v) Q + tie-break: below 0 until faithful
-            circ = goal_eval.circuit_term(c, tau, b, 0.0, executable_bits)["term"] + D
+            over = overflow(tokens[i] if tokens else None)
+            r = ct["term"] + D - over  # cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v) Q + tie-break: below 0 until faithful
+            circ = goal_eval.circuit_term(c, tau, b, 0.0, executable_bits)["term"] + D - over
             terms |= {"C": c["c"], "C_rl": c.get("c_rl"), "F1": row[f"f1_{convention}"], "N": row[f"n_{convention}"], "F3": row["f3"],
                       "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}
             info = {"phi": ph, "phi_full": ph_full, "phi_tau": pt, "g": g, "v": ct["v"], "g_floor": ct["g_floor"], "tie": ct["tie"],
@@ -1760,7 +1768,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
                                             else {"executed": False, "reason": "invalid_answer"})
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **info, **{f"term_{k}": v for k, v in terms.items()},
                     "size": info.get("bits"), "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
-                    "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row, "variables": e4.get(i),
+                    "finals": len(p["finals"]), "tokens": tokens[i] if tokens else None, "overflow": overflow(tokens[i] if tokens else None),
+                    "row": row, "variables": e4.get(i),
                     "qa": qa_detail(ev["qa"], p["finals"], tok, prompt["model_top"][0][0][0]) if valid[i] else [],
                     "fidelity": {k: v for k, v in (c or {}).items()  # C's members and columns (s_track, context_share, eps, ...)
                                  if k in ("c_terms", "rl_terms") or isinstance(v, (int, float)) or v is None}})
@@ -2694,20 +2703,19 @@ def structure(ge, tx, g, order: list, convention: str = CONVENTION) -> dict:
 
 def samples_of(spec: Path) -> dict:
     """task -> [answer text, ...], first sample first, of an answer set: a sampler's JSONL ({"task", "sample", "text",
-    "finish", "tokens"}; a sample cut at the cap carries finish "length", and one whose answer after its thinking runs
-    past ANSWER_TOKENS counts as cut too) or a directory of <task>.txt and <task>.<k>.txt. Each text comes with whether
-    it was cut: [(text, truncated), ...]."""
+    "finish", "tokens"[, "thinking_tokens"]}) or a directory of <task>.txt and <task>.<k>.txt. Each text comes with its
+    answer's tokens after the thinking (reward()'s overflow charge; None for a directory): [(text, tokens), ...]."""
     out = {}
     if spec.is_dir():
         for f in sorted(spec.iterdir()):
             m = re.fullmatch(r"(.+?)(?:\.(\d+))?\.txt", f.name)
             if m:
-                out.setdefault(m[1], []).append((int(m[2] or 0), f.read_text(), False))
+                out.setdefault(m[1], []).append((int(m[2] or 0), f.read_text(), None))
     else:
         for r in map(json.loads, spec.read_text().splitlines()):
-            cut = r.get("finish") == "length" or (r.get("tokens") or 0) - (r.get("thinking_tokens") or 0) > ANSWER_TOKENS
-            out.setdefault(r["task"], []).append((int(r.get("sample", 0)), r["text"], cut))
-    return {t: [(x, cut) for _, x, cut in sorted(v, key=lambda e: e[0])] for t, v in out.items()}
+            n = r.get("tokens") - (r.get("thinking_tokens") or 0) if r.get("tokens") is not None else None
+            out.setdefault(r["task"], []).append((int(r.get("sample", 0)), r["text"], n))
+    return {t: [(x, n) for _, x, n in sorted(v, key=lambda e: e[0])] for t, v in out.items()}
 
 
 def matched_k(ge, tx, order: list, bits: float) -> int:
@@ -2875,7 +2883,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
             cache = {}
             t0 = time.perf_counter()
-            scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
+            scored = reward(ge, task, ev, [x for x, _ in got], tokens=[n for _, n in got], e1=bits, cache=cache,
                             ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None,
                             lines=lines, retain_calibration=retain_calibration, node_cap=node_cap, invariants=invariants)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}

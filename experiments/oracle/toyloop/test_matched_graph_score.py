@@ -44,6 +44,14 @@ class MatchedScoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scorer.summarize(rows, keys)
 
+    def test_retention_preserves_its_requested_english_and_token_annotations(self):
+        old_answer = {'finish': 'stop', 'completion': 'flowchart LR\ntokK --> L0H0\nL0H0 --> out\nEnglish: copied value.'}
+        self.assertIsNone(scorer.answer_error(old_answer, 'legacy_mermaid_english'))
+        self.assertIsNotNone(scorer.answer_error(old_answer, 'graph_only'))
+        self.assertIsNotNone(scorer.answer_error(dict(old_answer, finish='length'), 'legacy_mermaid_english'))
+        with self.assertRaises(ValueError):
+            scorer.answer_error(old_answer, 'anything_goes')
+
     def test_assets_cannot_escape_manifest_root(self):
         for path in ('/tmp/escape', '../escape', 'inside/../../escape'):
             with self.assertRaises(ValueError):

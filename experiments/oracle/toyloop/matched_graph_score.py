@@ -51,7 +51,9 @@ def bind_responses(panel, responses):
     return [found.get((row['stratum'], row['id'])) for row in panel]
 
 
-def answer_error(row):
+def answer_error(row, answer_format='graph_only'):
+    if answer_format not in ('graph_only', 'legacy_mermaid_english'):
+        raise ValueError('unknown frozen answer format')
     if row is None:
         return 'missing_first_response'
     if row.get('parse_error'):
@@ -61,6 +63,11 @@ def answer_error(row):
     text = row.get('completion')
     if not isinstance(text, str):
         return 'missing_completion'
+    # Retention prompts explicitly request the historical Mermaid + English
+    # format. Preserve their original circuit.parse validity contract; English
+    # and token arrows remain unexecuted annotations, not causal evidence.
+    if answer_format == 'legacy_mermaid_english':
+        return None
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     node = r'(?:L\d+[HN]\d+|out)'
     if (not lines or lines[0] != 'flowchart LR' or not any('-->' in x for x in lines[1:])
@@ -163,6 +170,9 @@ def run(args):
           'responses_sha256': sha(args.responses), 'forward_cap': max_forwards,
           'scorer_sha256': sha(__file__)})
     for case_index, item in enumerate(panel):
+        expected_format = 'graph_only' if item['stratum'] == 'new_model' else 'legacy_mermaid_english'
+        if item['answer_format'] != expected_format:
+            raise ValueError('answer format must match frozen prompt stratum')
         path = bound_path(args.payload, item['weights'])
         if sha(path) != item['weights_sha256']:
             raise ValueError('model weights changed')
@@ -184,7 +194,7 @@ def run(args):
         graphs = {}
         for arm in arms:
             sample = samples[arm][case_index]
-            error = answer_error(sample)
+            error = answer_error(sample, item['answer_format'])
             graphs[arm] = []
             sizes = []
             for ids in inputs:
@@ -199,7 +209,8 @@ def run(args):
                         reason = str(exc)
                 graphs[arm].append((graph, reason))
                 sizes.append({'input_positions': len(ids), 'valid': graph is not None,
-                              'declared_units': None if graph is None else len(parsed.units - {'out'}),
+                              'declared_units': None if graph is None else sum(u != 'out' and not u.startswith('tok') for u in parsed.units),
+                              'declared_token_annotations': None if graph is None else sum(u.startswith('tok') for u in parsed.units),
                               'declared_edges': None if graph is None else len(parsed.edges),
                               'executed_component_position_nodes': None if graph is None else graph.count(),
                               'executed_edges': None if graph is None else graph.edges(),

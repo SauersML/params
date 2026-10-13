@@ -1,5 +1,8 @@
-%% CLAIMGROUND joint followup:8fixed joint cases+16single controls on TRAINtext6034; four weight-geometry pairs from sameeightunits, donor494/504 roles swapped.
-%% Freeze paircosines before first forward; retain all outcomes, compare additive single effects and no-cross-RMS approximation against Native and independent hook. No paidtraining.
+%% CLAIMGROUND joint38412628238 COMPLETE:8fixed joint cases+16single controls on TRAINtext6034; geometry selected before firstforward; both donor494/504 assignments retained.
+%% All-case readback:Native/direct maxlogp2.861e-5;analytic gaperror8.345e-6;actualRMS cross-identity1.435e-7.
+%% Additive approximation fails3/8above1e-4,max.004006logodds; omitRMS cross-term fails3/8,max.007614. Noorderflips; smallconditionalinteraction, notwholemechanism/learnability proof.
+%% Same unitgeometry can have opposite physicalcross-term afterdonor-role swap: jointly verify claimedcomposition; stop formula-only training and do not blame prior3/42readerfailure solelyonRMS.
+%% Frozen sourceaeaf, four fullassetSHAs, U/Wbitwiserestored;33.63seccompute,2.230GiBpeak. Stable results gha/joint-lastdown-rms-cpu-aeaf-1013/joint/results.json SHAbf71d3b6d59d341d93fc42d9c701d77d599c1dea3724f0ca2f616a61facb7385.
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
 %% 2026-10-13 direct weight fidelity diagnostic7f81a95: same forwards now expose absolute unedited/edited KL alongside unchanged conditional reward.
 %% GHA38409624227 PASS, including independent-forward n/c checks and a wrong-baseline counterexample.
@@ -531,7 +534,7 @@ flowchart BT
   CLAIMFIT["<b>Carrier size remains the limit</b><br/>53% compression; further4.7% adds no rows;<br/>2 of15 exact rows fit training limits;<br/>next: smaller verified carrier sets<br/>AUDIT DONE · codex/variable_reward"]
   CLAIMQA["<b>Learn measured transplant effects</b><br/>147 fit with archived hints;16 hard rows;<br/>independent readback preserves all labels;<br/>partial coverage and ID limits explicit<br/>DATA READY · codex/variable_reward"]
   CLAIMCTRL["<b>Component identity changes behavior</b><br/>89 cases, counts and positions held fixed;<br/>permutations change 79/89 and 76/89 tops;<br/>use matched cases to test weight grounding<br/>MEASURED · codex/variable_reward"]
-  CLAIMGROUND["<b>Test actual two-unit VPD interaction</b><br/>48 single-unit checks agree exactly;<br/>next: geometry-fixed pairs, independent donors;<br/>compare joint effects and RMS cross-term<br/>FREE CHECK · codex/variable_reward"]
+  CLAIMGROUND["<b>Joint VPD effects need normalization</b><br/>3/8 cases reject additive single effects;<br/>Native, direct model and equation agree;<br/>next: jointly executable mechanism verification<br/>CONDITIONAL EVIDENCE · codex/variable_reward"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
   CAPABLE["<b>Fresh routing transfer: measuring</b><br/>8 paired routes: teacher controls pass;<br/>16 BASE/V8 responses frozen; input-only V baseline;<br/>Native score running; no further APIs<br/>MEASURED · codex/fork_review · $1.186"]
@@ -740,7 +743,7 @@ flowchart BT
   class FBASE check
   class CLAIMFIT done
   class CLAIMQA active
-  class CLAIMGROUND active
+  class CLAIMGROUND check
   class CLAIMCTRL done
   class CLAIMDATA,CLAIMREC done
   class ENGP done

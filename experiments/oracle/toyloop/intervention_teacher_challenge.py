@@ -41,6 +41,27 @@ def write(path, value):
         os.fsync(handle.fileno())
 
 
+def summarize(rows):
+    groups = {}
+    for row in rows:
+        kind = row["kind"]
+        if kind == "joint":
+            kind = "joint_mixed" if row["operations"][0][3] != row["operations"][1][3] else "joint_equal"
+        group = groups.setdefault((row["case"], kind), {"case": row["case"], "kind": kind,
+                    "worlds": 0, "valid": 0, "top_correct": 0, "nochange_correct": 0,
+                    "kl_failures_or_invalid": 0, "worst_valid_kl_bits": None, "active": 0})
+        group["worlds"] += 1
+        group["valid"] += int(row["valid"])
+        group["top_correct"] += int(row["valid"] and row["top"] == row["reference_top"])
+        group["nochange_correct"] += int(row["nochange_top"] == row["reference_top"])
+        group["active"] += int(row["active"])
+        group["kl_failures_or_invalid"] += int(not row["valid"] or row["kl_bits"] > .001)
+        if row["valid"]:
+            group["worst_valid_kl_bits"] = max(group["worst_valid_kl_bits"] or 0., row["kl_bits"])
+    return {"scope": "fixed post-freeze TRAIN diagnostic transfer; not pristine holdout or English proof",
+            "worlds": len(rows), "groups": [groups[key] for key in sorted(groups)]}
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ("source", "payload", "reward-source", "redundant", "extension", "out"):
@@ -203,6 +224,9 @@ def main():
             raise RuntimeError("frozen target changed during challenge")
     write(args.out / "complete.json", {"candidate_worlds": 3288, "forward_cap": 9864, "actual_forwards": actual_forwards,
           "target_repair": False, "scope": "post-freeze TRAIN diagnostic transfer"})
+    summary = summarize(final_rows)
+    write(args.out / "summary.json", summary)
+    print("TEACHER_CHALLENGE_SUMMARY=" + json.dumps(summary), flush=True)
 
 
 if __name__ == "__main__":

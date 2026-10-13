@@ -124,3 +124,29 @@ def test_pinned_target_without_optional_behavior_fields():
     for name in ("behavior", "behavior_tokens", "behavior_at"):
         delattr(nat.target, name)
     teacher.validate_cache(cache, toy, nat, texts, panel)
+
+
+def test_zero_mlp_requires_disjoint_support_not_cancelled_dot_product():
+    assert teacher.disjoint_coordinate_support(torch.tensor([1., 0.]), torch.tensor([0., 1.]))
+    assert not teacher.disjoint_coordinate_support(torch.tensor([1., 1.]), torch.tensor([1., -1.]))
+    assert not teacher.disjoint_coordinate_support(torch.tensor([1., 0.]), torch.tensor([1e-8, 1.]))
+
+
+def test_zero_mlp_checks_all_pairs_and_never_filters_residual_paths(monkeypatch):
+    import vpd_model
+    class ElementwiseTarget:
+        def act(self, x):
+            return x
+        def _steps(self):
+            return self.act
+        def site(self, name):
+            return sites[name]
+    monkeypatch.setattr(vpd_model, "Target", ElementwiseTarget)
+    sites = {"h.0.mlp.c_fc": SimpleNamespace(U=torch.tensor([[1., 0.], [0., 1.]])),
+             "h.0.mlp.down_proj": SimpleNamespace(V=torch.tensor([[1., 0.], [0., 1.]]))}
+    nat = SimpleNamespace(target=ElementwiseTarget(), units={name: torch.tensor([0, 1]) for name in sites})
+    assert teacher.zero_elementwise_mlp_route(nat, "L0N0", "L0N1")
+    assert not teacher.zero_elementwise_mlp_route(nat, "L0H0", "L0N1")
+    assert not teacher.zero_elementwise_mlp_route(nat, "L0N0", "L1N1")
+    nat.units["h.0.mlp.c_fc"][1] = 0  # Another writer piece has intersecting support.
+    assert not teacher.zero_elementwise_mlp_route(nat, "L0N0", "L0N1")

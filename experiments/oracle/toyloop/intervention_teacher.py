@@ -78,7 +78,42 @@ def validate_cache(cache, toy, nat, texts, panel):
             raise RuntimeError("invalid cached full-architecture integrity")
 
 
-def architecture_candidate(toy, nat, texts):
+def disjoint_coordinate_support(writer, reader):
+    """Exact support proof, not a dot-product cancellation or magnitude threshold."""
+    import torch
+    if writer.ndim != 1 or reader.ndim != 1 or writer.shape != reader.shape:
+        return False
+    if not bool(torch.isfinite(writer).all()) or not bool(torch.isfinite(reader).all()):
+        return False
+    return not bool((writer.ne(0) & reader.ne(0)).any())
+
+
+def zero_elementwise_mlp_route(nat, left, right):
+    """Only same-layer FC→down, with no normalization between the two.
+
+    Disjoint support means the writer cannot change any coordinate read after
+    elementwise GELU. Zero U·V alone does not prove this. Residual/RMS paths and
+    custom/TL architectures are deliberately outside this proof.
+    """
+    import vpd_model
+    a, b = re.fullmatch(r"L(\d+)N(\d+)", left), re.fullmatch(r"L(\d+)N(\d+)", right)
+    if not a or not b or a[1] != b[1] or left == right:
+        return False
+    if (type(nat.target) is not vpd_model.Target
+            or getattr(nat.target.act, "__func__", None) is not vpd_model.Target.act
+            or getattr(nat.target._steps, "__func__", None) is not vpd_model.Target._steps):
+        return False
+    fc, down = f"h.{a[1]}.mlp.c_fc", f"h.{a[1]}.mlp.down_proj"
+    writers = [index for index, owner in enumerate(nat.units[fc].tolist()) if owner == int(a[2])]
+    readers = [index for index, owner in enumerate(nat.units[down].tolist()) if owner == int(b[2])]
+    if not writers or not readers:
+        return False
+    return all(disjoint_coordinate_support(nat.target.site(fc).U[writer],
+                                           nat.target.site(down).V[:, reader])
+               for writer in writers for reader in readers)
+
+
+def architecture_candidate(toy, nat, texts, *, exclude_zero_mlp_routes=False):
     """Unit universe from actual original nonzero pieces, without teacher truth."""
     import native
     import circuit
@@ -103,7 +138,10 @@ def architecture_candidate(toy, nat, texts):
                  if owners[w] != owners[r]}
         edges |= {(owners[w], "out") for w in outputs}
         possible = edges if possible is None else possible & edges
-    return units, possible or set()
+    possible = possible or set()
+    if exclude_zero_mlp_routes:
+        possible = {edge for edge in possible if not zero_elementwise_mlp_route(nat, *edge)}
+    return units, possible
 
 
 def graph_text(units, edges):
@@ -111,12 +149,12 @@ def graph_text(units, edges):
         f"  {left} --> {right}\n" for left, right in sorted(edges))
 
 
-def prepare_reference_cache(toy, nat, texts, panel=None, evidence_sink=None):
+def prepare_reference_cache(toy, nat, texts, panel=None, evidence_sink=None, *, exclude_zero_mlp_routes=False):
     import native
     import goal_eval
     import reward_exec
     from head_counterfactual import raw_kl_bits
-    units, edges = architecture_candidate(toy, nat, texts)
+    units, edges = architecture_candidate(toy, nat, texts, exclude_zero_mlp_routes=exclude_zero_mlp_routes)
     references, integrities = [], []
     full = [native.Graph({(name, pos, piece) for name in nat.names for pos in range(len(ids))
                           for piece in range(int(nat.C[name]))}, complete=True) for ids in texts]
@@ -149,13 +187,15 @@ def prepare_reference_cache(toy, nat, texts, panel=None, evidence_sink=None):
     return cache, start, units, edges
 
 
-def search_teacher(toy, *, nat, texts, panel=None, attempt_sink=None, evidence_sink=None):
+def search_teacher(toy, *, nat, texts, panel=None, attempt_sink=None, evidence_sink=None,
+                   exclude_zero_mlp_routes=False):
     """Fixed-order greedy pruning; finite-panel feasibility, not exact optimization."""
     import reward_exec
     record = toy.meta.get("record", {})
     if record.get("split") != "train":
         raise RuntimeError("intervention teacher is TRAIN-only")
-    cache, start, units, edges = prepare_reference_cache(toy, nat, texts, panel, evidence_sink)
+    prepare_kwargs = {"exclude_zero_mlp_routes": True} if exclude_zero_mlp_routes else {}
+    cache, start, units, edges = prepare_reference_cache(toy, nat, texts, panel, evidence_sink, **prepare_kwargs)
     original = copy.deepcopy(cache["binding"])
     attempts = []
 
@@ -169,7 +209,8 @@ def search_teacher(toy, *, nat, texts, panel=None, attempt_sink=None, evidence_s
     current["completion_sha256"] = hashlib.sha256(current["completion"].encode()).hexdigest()
     if current["worst_kl_bits"] > WORST_KL_MAX:
         return {"status": "infeasible_full_standalone", "target": None, "start": current,
-                "attempts": attempts, "cache": cache, "worst_kl_max": WORST_KL_MAX}
+                "attempts": attempts, "cache": cache, "worst_kl_max": WORST_KL_MAX,
+                "exclude_zero_mlp_routes": exclude_zero_mlp_routes}
     while len(attempts) < MAX_ATTEMPTS:
         candidates = [("unit:" + unit, units - {unit}, {edge for edge in edges if unit not in edge})
                       for unit in sorted(units)]
@@ -209,6 +250,7 @@ def search_teacher(toy, *, nat, texts, panel=None, attempt_sink=None, evidence_s
     target = graph_text(units, edges)
     return {"status": "attempt_cap" if len(attempts) == MAX_ATTEMPTS else "greedy_fixed_point",
             "target": target, "target_sha256": hashlib.sha256(target.encode()).hexdigest(),
+            "exclude_zero_mlp_routes": exclude_zero_mlp_routes,
             "selected": current, "start": describe("full_standalone", start),
             "attempts": attempts, "cache": cache, "worst_kl_max": WORST_KL_MAX,
             "max_attempts": MAX_ATTEMPTS, "optimization": "incomplete fixed-order greedy search; no English target"}

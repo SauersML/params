@@ -1656,6 +1656,11 @@ def test_reward_v3_helpers(tiny):
     start = dict(row, s_point_c=0.95, s_nodes=0.95, n_spec=0.95, f1_flips_c={str(goal_eval.FLIP_TERM): 0.95})
     a, b = goal_eval.phi(row, start=start), goal_eval.phi(noisy, start=start)
     assert a[1] == b[1] and b[0] < a[0]  # one bar per text (the start's eps); an answer's own noise lowers only its phi
+    # an unscored family of the text counts 0; a weak start's bar sits at every family at 0.5
+    fams = ["point", "nodes", "flips", "N", "track_pp"]
+    assert abs(goal_eval.phi(row, families=fams)[0] - goal_eval._phi([(0.75, 0.05)] * 4 + [(0.0, 0.05)])) < 1e-12
+    weak = dict(row, s_point_c=0.1, s_nodes=0.1, n_spec=0.1, f1_flips_c={str(goal_eval.FLIP_TERM): 0.1})
+    assert abs(goal_eval.phi(row, start=weak)[1] - goal_eval._phi([(0.5, 0.05)] * 4)) < 1e-12
     pool = tiny_pool(nat, tx.ids)
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     empty, vpd = ge.fidelity(tx, [native.Graph(), native.Graph(masks=tx.vpd)], pool, draws=4, steps=2, restarts=2,
@@ -1681,7 +1686,10 @@ def test_reward_v3_helpers(tiny):
     assert b["n_vpd_k"] is not None
     t = ge.tau(tx, pool)  # the start set's bar and bits, kept on the text
     st = ge.start_set(tx)
-    assert t["nodes_start"] == st["graph"].count() and t["bits_start"] > 0 and t["phi_tau"] <= t["phi_start"] + 1e-12
+    assert t["nodes_start"] == st["graph"].count() and t["bits_start"] > 0
+    # the Gate B bar: max(min(start, every family at 0.9), every family at 0.5, the empty circuit + 1 bit)
+    assert abs(t["phi_tau"] - max(min(t["phi_start"], t["phi_09"]), t["phi_05"], t["phi_empty"] + 1)) < 1e-12
+    assert t["families"] and set(t["families"]) <= set(goal_eval.PHI_FAMILIES)
     assert ge.tau(tx, pool) is t
 
 

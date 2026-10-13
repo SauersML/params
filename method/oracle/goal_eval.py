@@ -565,27 +565,40 @@ def _eps(row: dict) -> dict:
     return eps if len(eps) == len(PHI_FAMILIES) else {**family_eps(row), **eps}
 
 
-def phi(row: dict, start: float | dict | None = None) -> tuple:
-    """(phi, phi_tau) of a row (the lead's reward v3): phi = -log2((mean_i (1 - s_i + eps_i)^4)^(1/4)) over the
-    families scored on the text (PHI_FAMILIES: point, nodes, edges, flips, track_pp, interchange_pp, donors near and
-    far, pattern, N), eps_i the row's eps_<family> (family_eps when absent): an answer's own noise only lowers its
-    phi. phi_tau is a constant of the text (the lead's 10-12: a noisier answer must not face a lower bar): min(phi of
-    the start set, the phi with every family the start scores at 0.9 under the start's eps), from start (the start
-    set's row; or its phi_tau, a number, as tau() gives it); without start the row's own phi_tau, else the row taken as
-    its own start. From the rows' fields alone."""
+def phi(row: dict, start: float | dict | None = None, families: list | None = None) -> tuple:
+    """(phi, phi_tau) of a row (the lead's reward v3): phi = -log2((mean_i (1 - s_i + eps_i)^4)^(1/4)) over the text's
+    families (families: those the text's start set scores, tau()'s "families"; PHI_FAMILIES: point, nodes, edges,
+    flips, track_pp, interchange_pp, patching near and far, pattern, N), a family the answer leaves unscored counting
+    s = 0 (the lead's Gate B repair 10-12: an answer never escapes a family by failing to be scored; a family the text
+    cannot score is left out for every answer on it, the start included); without families, the families the row
+    scores. eps_i the row's eps_<family> (family_eps when absent): an answer's own noise only lowers its phi.
+    phi_tau is a constant of the text: max(min(phi of the start, every family at 0.9), every family at 0.5) under the
+    start's eps over its families (the Gate B floor: a weak start never puts the bar within reach of a near-empty
+    circuit; tau() raises it to the empty circuit's phi + 1 as well), from start (the start set's row; or its phi_tau,
+    a number, as tau() gives it); without start the row's own phi_tau, else the row taken as its own start. From the
+    rows' fields alone."""
     eps = _eps(row)
-    got = _phi([(family_score(row, f), eps[f]) for f in PHI_FAMILIES if family_score(row, f) is not None])
+    fams = families if families is not None else (
+        [f for f in PHI_FAMILIES if family_score(start, f) is not None] if isinstance(start, dict) else
+        [f for f in PHI_FAMILIES if family_score(row, f) is not None])
+    got = _phi([(0.0 if family_score(row, f) is None else family_score(row, f), eps[f]) for f in fams])
     if isinstance(start, dict):
-        se = _eps(start)
-        sf = [f for f in PHI_FAMILIES if family_score(start, f) is not None]
-        at9, ps = _phi([(0.9, se[f]) for f in sf]), phi(start)[0]
-        return got, (at9 if ps is None else ps if at9 is None else min(ps, at9))
+        return got, _bar(start, fams)
     if start is not None:
         return got, float(start)
     if row.get("phi_tau") is not None:
         return got, row["phi_tau"]
-    at9 = _phi([(0.9, eps[f]) for f in PHI_FAMILIES if family_score(row, f) is not None])
-    return got, (at9 if got is None else got if at9 is None else min(got, at9))
+    return got, _bar(row, fams)
+
+
+def _bar(start: dict, families: list) -> float | None:
+    """max(min(phi of the start, every family at 0.9), every family at 0.5), under the start's eps (phi_tau)."""
+    se = _eps(start)
+    ps = _phi([(0.0 if family_score(start, f) is None else family_score(start, f), se[f]) for f in families])
+    at9, at5 = _phi([(0.9, se[f]) for f in families]), _phi([(0.5, se[f]) for f in families])
+    if ps is None:
+        return at9
+    return max(min(ps, at9), at5)
 
 
 def compact(bits: float, bits_start: float) -> float | None:
@@ -1190,7 +1203,8 @@ class GoalEval:
         at = [i for i, (kind, _) in enumerate(lines) if kind == "node"]  # N moves with the node set alone
         nsp = dict(zip(at, self.necessity_spec(tx, [flat[i] for i in at], split))) if at else {}
         bits = size_bits(g, P, S, tx.targets, active=tx.vpd)
-        ph = phi(base)[0]
+        fams = ((tx.__dict__.get("_tau") or {}).get(split) or {}).get("families")  # the text's (tau's), when scored
+        ph = phi(base, families=fams)[0]
         out = []
         for i, ((kind, x), h, pt, wd, a, b, c) in enumerate(zip(lines, variants, point, wired, tpp, ipp, pat)):
             row = dict(base)
@@ -1213,7 +1227,7 @@ class GoalEval:
                 row.pop(f"eps_{f}", None)  # the recomputed families' eps from their own draws
             row.update({f"eps_{f}": v for f, v in family_eps(row).items() if f not in self.LOO_HELD})
             bv = size_bits(h, P, S, tx.targets, active=tx.vpd)
-            pv = phi(row)[0]
+            pv = phi(row, families=fams)[0]
             out.append({"line": [list(x)] if kind == "node" else [list(y) if isinstance(y, tuple) else y for y in x],
                         "kind": kind, "phi": pv, "delta_phi": None if None in (ph, pv) else ph - pv, "bits": bv,
                         "delta_bits": bits - bv, "compact": compact(bv, bits_start) if bits_start else None})
@@ -3098,17 +3112,25 @@ class GoalEval:
 
     def tau(self, tx: Text, pool: dict | None, split: str = "search") -> dict:
         """The reward's per-text bar and start bits (the lead's 10-12, constrained form: faithful first, then small),
-        kept on tx: the influential start set's (start_set) reward-mode row on split, phi_start and phi_tau (phi: the
-        lower of the start's phi and every family at 0.9), c_start and c_rl_start (and tau = min(0.9, c_rl_start), the
+        kept on tx: the influential start set's (start_set) reward-mode row on split, families (those it scores: every
+        answer's phi on the text is over them, an unscored one at 0), phi_start, phi_empty (the empty circuit's) and
+        phi_tau (max(min(the start's phi, every family at 0.9), every family at 0.5, phi_empty + 1), the Gate B
+        floor), c_start and c_rl_start (and tau = min(0.9, c_rl_start), the
         earlier form), bits_start (its raw description bits, size_bits), and the start's m, nodes and positions."""
         kept = tx.__dict__.setdefault("_tau", {})
         if split in kept:
             return kept[split]
         st = self.start_set(tx, split)
-        row = self.fidelity(tx, [st["graph"]], pool, mode="reward", split=split)[0]
+        row, er = self.fidelity(tx, [st["graph"], native.Graph()], pool, mode="reward", split=split)
         nat = self.nat
-        ph, pt = phi(row, start=row)  # phi_tau: a constant of the text, from the start's own eps
-        kept[split] = {"phi_start": ph, "phi_tau": pt,
+        fams = [f for f in PHI_FAMILIES if family_score(row, f) is not None]  # the text's families
+        ph, pt = phi(row, start=row, families=fams)  # phi_tau: a constant of the text, from the start's own eps
+        pe = phi(er, families=fams)[0]  # the empty circuit's phi: the bar sits at least a bit above it
+        if pt is not None and pe is not None:
+            pt = max(pt, pe + 1.0)
+        se = _eps(row)
+        kept[split] = {"phi_start": ph, "phi_tau": pt, "phi_empty": pe, "families": fams,
+                       "phi_09": _phi([(0.9, se[f]) for f in fams]), "phi_05": _phi([(0.5, se[f]) for f in fams]),
                        "c_start": row["c"], "c_rl_start": row["c_rl"],
                        "tau": min(0.9, row["c_rl"]) if row["c_rl"] is not None else None,
                        "bits_start": size_bits(st["graph"], nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd),

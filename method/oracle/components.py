@@ -1607,7 +1607,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         row, c, terms, info = row_of.get(i), c_of.get(i), {}, {}
         r = circ = V3_INVALID
         if row is not None:
-            ph, _ = goal_eval.phi(c)
+            ph, _ = goal_eval.phi(c, families=tau.get("families"))  # the text's families, an unscored one at 0
             pt = tau.get("phi_tau")
             executable_bits = goal_eval.size_bits(graphs[i], P, total, targets, active=tx.vpd)
             b = executable_bits + d_bits
@@ -1649,9 +1649,10 @@ def _teacher_ref(ge, tx, teacher: dict, pool: dict, split: str | None, task: dic
         nat = ge.nat
         g, _ = goal_eval.circuit(teacher, tx.targets, nat.C, tx.T)
         row = ge.fidelity(tx, [g], pool, mode="reward", split=split)[0]
-        ph, _ = goal_eval.phi(row)
+        tau = ge.tau(tx, pool, split or "search")
+        ph, _ = goal_eval.phi(row, families=tau.get("families"))
         b = goal_eval.size_bits(g, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd)
-        comp = goal_eval.compact(b, ge.tau(tx, pool, split or "search").get("bits_start"))
+        comp = goal_eval.compact(b, tau.get("bits_start"))
         kept[split] = None if ph is None or comp is None else {"phi": ph, "compact": comp, "bits": b}
     return kept[split]
 

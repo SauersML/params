@@ -14,6 +14,7 @@ Baselines: confidence (the model's top probability at t), and linear probes on t
 2 (before the match is read) and at the end (the prediction's own input: an upper reference).
 AUC for predicting a failure, by 5-fold cross-validation grouped by text (logistic regression, standardized).
 
+  huang.py used         -> DATA/huang_used.json (the texts to leave out, for the pods)
   huang.py build [K P]  -> DATA/huang_positions_K.npz (GEN_OUT when set): shard K of P (the texts whose index is K mod P)
   huang.py report
 """
@@ -40,6 +41,19 @@ REAL = ["att1_a_to_o", "att2_t_to_a", "att2_rank_a"] + [f"ci_{s.split('.')[-1]}#
        ["log2_distance", "occurrences"]
 
 
+def used_texts() -> set:
+    """Every text this directory used (-> DATA/huang_used.json, which the pods read)."""
+    import json
+
+    held = json.loads((DATA / "copy_heldout.json").read_text())
+    fal = json.loads((DATA / "falsify_texts.json").read_text())
+    used = {x["task"] for x in held["copy"] + held["noncopy"]} | set(held.get("scanned", []))
+    used |= {e["task"] for e in fal["texts"] + fal["mistakes"]}
+    used |= {r["task"] for r in pickle.load(open(DATA / "rows.pkl", "rb"))}
+    (DATA / "huang_used.json").write_text(json.dumps(sorted(used)))
+    return used
+
+
 def build(k: int = 0, P: int = 1):
     import json
 
@@ -48,11 +62,7 @@ def build(k: int = 0, P: int = 1):
 
     nat = native.Native()
     tg = nat.target
-    held = json.loads((DATA / "copy_heldout.json").read_text())
-    fal = json.loads((DATA / "falsify_texts.json").read_text())
-    used = {x["task"] for x in held["copy"] + held["noncopy"]} | set(held.get("scanned", []))
-    used |= {e["task"] for e in fal["texts"] + fal["mistakes"]}
-    used |= {r["task"] for r in pickle.load(open(DATA / "rows.pkl", "rb"))}
+    used = set(json.loads((DATA / "huang_used.json").read_text())) if (DATA / "huang_used.json").exists() else used_texts()
     rng = np.random.default_rng(2951)
     feats, conf, mid, end, label, group = [], [], [], [], [], []
     for gi, p in enumerate(native.tasks("train")):
@@ -130,7 +140,7 @@ def report():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("build", "report"))
+    ap.add_argument("cmd", choices=("used", "build", "report"))
     ap.add_argument("args", nargs="*", type=int)
     a = ap.parse_args()
-    build(*a.args) if a.cmd == "build" else report()
+    {"used": used_texts, "build": lambda: build(*a.args), "report": report}[a.cmd]()

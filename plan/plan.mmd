@@ -825,3 +825,8 @@ flowchart BT
   MATCHPERM -- same behavior with renamed units --> MATCHDIAG
   MATCHDIAG -- identifies the next learning bottleneck --> C1
   class MATCHDIAG active
+
+%% CHUNKSCHED: reduce future oracle evaluation stragglers without dropping models/worlds; original runs immutable. Historical redundant_004 costs1163s; count*length^2 does not help.44b3fb case0 Native parity20037 passes2520forwards; positive-empty-bank guard is validation only. Next use explicit input chunks on a future authorized run and measure actual wall time, not claim speedup from parity.
+  CHUNKSCHED["<b>Spread slow scoring work across input banks</b><br/>One case took19.4min; length-squared scheduling did not help.<br/>Optional chunks retain all edits, policies and model-level metrics.<br/>12 tests pass; one real Native case,2520 forwards:<br/>all tensors, p0, tops, KL and restoration bitwise identical.<br/>Empty banks/edits fail closed; default case mode unchanged.<br/>Future runtime gain unmeasured · codex/variable_reward"]
+  MATCHLEARN -- faster faithful evaluation iterations --> CHUNKSCHED
+  class CHUNKSCHED check

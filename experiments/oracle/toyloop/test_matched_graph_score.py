@@ -96,6 +96,8 @@ class MatchedScoreTests(unittest.TestCase):
         for size in (-1, True, 1.5):
             with self.assertRaises(ValueError): scorer.input_partition(panel, 2, size)
         with self.assertRaises(ValueError): scorer.input_partition(panel, 7, 2)
+        for broken in (dict(panel[0], inputs=[]), dict(panel[0], edits=[])):
+            with self.assertRaises(ValueError): scorer.input_partition([broken, panel[1]], 2, 1)
         for record in ({'input_chunk_size': True, 'input_indices': {'0': [0]}},
                        {'input_chunk_size': 1, 'input_indices': {'0': [False]}}):
             with self.assertRaises(ValueError): scorer.check_input_contract(record, {0: [0]}, 1)

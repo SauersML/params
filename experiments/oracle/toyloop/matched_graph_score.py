@@ -137,6 +137,8 @@ def input_partition(panel, workers, chunk_size=0):
     if chunk_size == 0:
         return [{i: list(range(len(panel[i]['inputs']))) for i in group}
                 for group in partition(panel, workers)]
+    if any(not row['inputs'] or not row['edits'] for row in panel):
+        raise ValueError('input chunking requires nonempty banks and edits for every model')
     chunks = [(i, start, min(start+chunk_size, len(row['inputs'])))
               for i, row in enumerate(panel)
               for start in range(0, len(row['inputs']), chunk_size)]

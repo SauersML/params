@@ -735,8 +735,8 @@ class Acceptance:
             raise ValueError("discriminating draws score s_track_pp: mode pp")
 
     def _per_draw(self, graphs: list, prompts: list) -> list:
-        """Per graph its per-draw s_track_pp on prompts (None where VPD's answer is no nearer than no change), and the
-        draws' W: one engine.Engine.path_patched call with VPD's answer beside the graphs."""
+        """Per graph its per-draw records [prompt, KL_C, KL_VPD, W] on prompts (goal_eval's "weighted" draws, pooled by
+        goal_eval._ratio_pool): one engine.Engine.path_patched call with VPD's answer beside the graphs."""
         import engine
 
         tx, nat = self.tx, self.ge.nat
@@ -747,7 +747,7 @@ class Acceptance:
                                                     complete=True)
         lq = tx.__dict__["_pp_engine"].path_patched(list(graphs) + [tx.__dict__["_disc_vpd"]], [tuple(x) for x in prompts])
         refs = tx.__dict__.setdefault("_disc_refs", {})       # (p, z) -> (the model on x', W)
-        out, ws = [[None] * len(prompts) for _ in graphs], []
+        out = [[None] * len(prompts) for _ in graphs]
         for d, (p, z) in enumerate(prompts):
             if (p, z) not in refs:
                 x2 = list(tx.ids)
@@ -756,33 +756,34 @@ class Acceptance:
                 refs[(p, z)] = (r2, float(carry.kl(r2, tx.ref)[0]))
             ref, w = refs[(p, z)]
             kl = carry.kl(ref, lq[:, d]).tolist()             # [G + 1]
-            ws.append(w)
             for g in range(len(graphs)):
-                out[g][d] = goal_eval._fid(w, kl[g], kl[-1])
+                out[g][d] = [[int(p), int(z)], kl[g], kl[-1], w]
         native.free(nat.dev)
-        return out, ws
+        return out
 
     @staticmethod
-    def _pooled(s: list, ws: list, idx) -> float | None:
-        num = sum(ws[d] * s[d] for d in idx if s[d] is not None)
-        den = sum(ws[d] for d in idx if s[d] is not None)
-        return num / den if den > 0 else None
+    def _pooled(recs: list, idx) -> float | None:
+        """The records' score over idx as goal_eval pools track_pp (inframove's 71c66c3): the share of VPD's improvement
+        over no change the circuit makes."""
+        return goal_eval._ratio_pool([recs[d] for d in idx])
 
-    def ranked(self, s: list, ws: list, prompts: list, idx) -> tuple:
-        """(score, low) of per-draw scores s on prompts over idx: with fv draws, the model's likeliest alternatives
+    def ranked(self, recs: list, prompts: list, idx) -> tuple:
+        """(score, low) of per-draw records on prompts over idx: with fv draws, the model's likeliest alternatives
         (rank 0 in the acceptance's checks, rank 2 in the validation's) each against its own floor (rank_floor: floor_of
-        its score under the search's start) and the W-pooled score over the sampled draws alone; low lists the ranked
-        draws below their floors as [p, z, score, floor]. Pooled together, one plausible alternative's failure is
+        its share under the search's start) and the pooled score over the sampled draws alone; low lists the ranked
+        draws below their floors as [p, z, share, floor]. Pooled together, one plausible alternative's failure is
         averaged away among sampled tokens: text9000's 238 -> 72 site cut passed fv (validation 0.91) at search-split
         s_track_pp 0.56, the split eval's draws are like (the lead's 10-13). Other draws: the score over idx, low []."""
         if self.draws != "fv":
-            return self._pooled(s, ws, idx), []
+            return self._pooled(recs, idx), []
         top = set(self.fixed) | set(self.r2)
         rank = [d for d in idx if tuple(prompts[d]) in top]
-        low = [[int(prompts[d][0]), int(prompts[d][1]), s[d], self.rank_floor[tuple(prompts[d])]] for d in rank
-               if s[d] is not None and self.rank_floor.get(tuple(prompts[d])) is not None
-               and s[d] < self.rank_floor[tuple(prompts[d])]]
-        return self._pooled(s, ws, [d for d in idx if d not in set(rank)] or rank), low
+        low = []
+        for d in rank:
+            s, f = goal_eval._ratio_pool([recs[d]]), self.rank_floor.get(tuple(prompts[d]))
+            if s is not None and f is not None and s < f:
+                low.append([int(prompts[d][0]), int(prompts[d][1]), s, f])
+        return self._pooled(recs, [d for d in idx if d not in set(rank)] or rank), low
 
     def _halves(self) -> tuple:
         """The acceptance's draws and the validation's from search_pool: the model's likeliest alternatives in every
@@ -852,8 +853,7 @@ class Acceptance:
         val = self._halves()[1]
         if not val:
             return None, []
-        got, ws = self._per_draw([graph], val)
-        return self.ranked(got[0], ws, val, range(len(ws)))
+        return self.ranked(self._per_draw([graph], val)[0], val, range(len(val)))
 
     def scores(self, graphs: list, edges: tuple | None = None) -> list[dict]:
         """Per graph its terms; edges, (graph, ons [K, connections]): the graphs are those connection subsets of one
@@ -914,13 +914,13 @@ class Acceptance:
             base["phi"] = self.phi_of(graph_of(start), [graph_of(start)], bar)[0]
         if disc:                                             # the start on a fresh sample, every draw (and with fv the
             prompts = self._sample(start)                    # ranked draws' floors, the validation's too)
-            got, ws = self._per_draw([graph_of(start)], prompts)
-            base["s_track_pp"] = self.ranked(got[0], ws, prompts, range(len(ws)))[0]
+            got = self._per_draw([graph_of(start)], prompts)
+            base["s_track_pp"] = self.ranked(got[0], prompts, range(len(prompts)))[0]
             if self.draws == "fv":
                 val = self._halves()[1]
-                got_v = self._per_draw([graph_of(start)], val)[0] if val else [[]]
-                self.rank_floor = {tuple(pz): floor_of(x) for pz, x in zip(list(prompts) + list(val), got[0] + got_v[0])
-                                   if tuple(pz) in set(self.fixed) | set(self.r2)}
+                got_v = self._per_draw([graph_of(start)], val)[0] if val else []
+                self.rank_floor = {tuple(pz): floor_of(goal_eval._ratio_pool([r])) for pz, r in
+                                   zip(list(prompts) + list(val), got[0] + got_v) if tuple(pz) in set(self.fixed) | set(self.r2)}
         if floor is None:
             floor = {k: floor_of(v) for k, v in base.items()}
         if by_phi and base.get("phi") is not None:
@@ -929,19 +929,20 @@ class Acceptance:
         def judge(ons):                                      # the changed term on the draws each candidate is most at
             now = current()                                  # odds with the current circuit on
             prompts = self._sample(now)
-            got, ws = self._per_draw([graph_of(now)] + [graph_of(on) for on in ons], prompts)
+            got = self._per_draw([graph_of(now)] + [graph_of(on) for on in ons], prompts)
+            share = [[goal_eval._ratio_pool([r]) for r in g] for g in got]   # per draw
             out = []
             for i, on in enumerate(ons):
-                gap = [abs(a - b) if a is not None and b is not None else -1.0 for a, b in zip(got[i + 1], got[0])]
+                gap = [abs(a - b) if a is not None and b is not None else -1.0 for a, b in zip(share[i + 1], share[0])]
                 idx = [d for d in sorted(range(len(gap)), key=lambda d: -gap[d]) if gap[d] >= 0]
                 idx = idx[:DISC_DRAWS] if self.draws == "discriminating" else idx   # fresh: every draw of the sample
-                sc, low = self.ranked(got[i + 1], ws, prompts, idx)
+                sc, low = self.ranked(got[i + 1], prompts, idx)
                 f = floor.get("s_track_pp")
                 if (f is not None and sc is not None and sc < f) or low:
                     removed = (now & ~on).nonzero().flatten().tolist() if now.shape == on.shape else []
                     self.refused.append({"stage": label, "removed": names(removed) if names else removed, "draw_key": self.key(now),
                                          "draws": [[int(prompts[d][0]), int(prompts[d][1])] for d in idx],
-                                         "s_track_pp": sc, "s_current": self.ranked(got[0], ws, prompts, idx)[0], "floor": f,
+                                         "s_track_pp": sc, "s_current": self.ranked(got[0], prompts, idx)[0], "floor": f,
                                          "low": low})
                     out.append(None)
                 else:

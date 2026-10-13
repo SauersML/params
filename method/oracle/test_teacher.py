@@ -570,19 +570,26 @@ def test_block_search_phi_check_backs_off():
 
 def test_ranked_draws_each_hold_their_floor():
     # fv: the likeliest alternatives (rank 0 for acceptance, rank 2 for validation) each against their own floor, the
-    # sampled draws W-pooled apart from them
+    # sampled draws pooled apart from them (goal_eval's share of VPD's improvement over no change)
     acc = teacher.Acceptance(None, None, ("changed",), "pp", "fv")
     acc.fixed, acc.r2 = [(3, 11)], [(3, 12)]
-    acc.rank_floor = {(3, 11): teacher.floor_of(1.0), (3, 12): teacher.floor_of(-0.4)}
-    prompts, ws = [(3, 11), (5, 7)], [1.0, 20.0]                # one sampled draw standing for many
-    assert acc.ranked([0.5, 0.95], ws, prompts, range(2)) == (0.95, [[3, 11, 0.5, 0.9]])
-    acc.draws = "fresh"                                          # pooled, the failing alternative averaged away: 0.93
-    assert acc.ranked([0.5, 0.95], ws, prompts, range(2)) == (pytest.approx(19.5 / 21), [])
-    acc.draws = "fv"                                             # a floor below 0 from a start below 0: 5% of its size
-    prompts = [(3, 12), (5, 7)]
-    assert acc.ranked([-0.41, 0.95], ws, prompts, range(2))[1] == []
-    assert acc.ranked([-0.43, 0.95], ws, prompts, range(2))[1] == [[3, 12, -0.43, pytest.approx(-0.42)]]
+    acc.rank_floor = {(3, 11): teacher.floor_of(1.0), (3, 12): teacher.floor_of(0.8)}
+
+    def rec(pz, share, gap=1.0):                                # [prompt, KL_C, KL_VPD, W]: the circuit's share of
+        return [list(pz), gap * (1 - share), 0.0, gap]           # VPD's gap W - KL_VPD
+    prompts = [(3, 11)] + [(5, 7 + i) for i in range(9)]
+    recs = [rec((3, 11), 0.5)] + [rec(pz, 0.95) for pz in prompts[1:]]
+    sc, low = acc.ranked(recs, prompts, range(10))
+    assert sc == pytest.approx(0.95) and low == [[3, 11, pytest.approx(0.5), 0.9]]
+    acc.draws = "fresh"                                          # pooled, the failing alternative averaged away: 0.905
+    assert acc.ranked(recs, prompts, range(10)) == (pytest.approx(9.05 / 10), [])
+    acc.draws = "fv"
+    prompts = [(3, 12)] + prompts[1:]
+    assert acc.ranked([rec((3, 12), 0.77)] + recs[1:], prompts, range(10))[1] == []   # floor_of(0.8) = 0.76
+    assert acc.ranked([rec((3, 12), 0.75)] + recs[1:], prompts, range(10))[1] == [[3, 12, pytest.approx(0.75), pytest.approx(0.76)]]
+    # floors: 5% below the start's value, at most 0.9, below a value under 0 too
     assert teacher.floor_of(0.5) == pytest.approx(0.475) and teacher.floor_of(2.0) == 0.9
+    assert teacher.floor_of(-0.4) == pytest.approx(-0.42)
 
 
 def test_validated_backs_off_to_the_last_passing_set():

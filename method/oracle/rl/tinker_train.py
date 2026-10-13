@@ -506,7 +506,7 @@ def sft(a) -> None:
     spend = Spend(a.log, a.base)
     # the empty think block in the prompt, never trained; --thinking: targets that open with their thinking
     # (components.py dataset --traces), trained in Qwen3's thinking renderer, as rl --thinking samples
-    tinker, _, training, renderer, _ = clients(a.base, a.rank, None, a.thinking)
+    tinker, _, training, renderer, _ = clients(a.base, a.rank, a.init, a.thinking)  # --init: a warm start's weights
     rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
     whole = [conversation_to_datum(r["prompt"] + r["completion"], renderer, None, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
              for r in rows]
@@ -798,6 +798,8 @@ def main():
                                                                 "thinking; sft: targets with their thinking (dataset --traces) in "
                                                                 "the same renderer (without: the empty block in the prompt)")
     s = sub.choices["sft"]
+    s.add_argument("--init", help="a tinker:// state to continue from (an environment's warm start from the circuit policy); "
+                   "without, the base model")
     s.add_argument("--batch", type=int, default=8)
     s.add_argument("--lr", type=float, help="peak rate, linear decay to 0 (default: the cookbook's LoRA rate for the base)")
     s.add_argument("--max-length", type=int, default=16384)

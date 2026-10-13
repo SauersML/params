@@ -496,8 +496,11 @@ class Tools:
         ge, tx = self.ge, self.tx
         with torch.no_grad():
             ref2 = self.nat.reference([x2], self.targets)
-            lq = ge.pp_run(tx, x2, g)
-            vpd = ge.pp_run(tx, x2, native.Graph(masks=tx.vpd)) if tx.vpd is not None else None
+            pr = [(q, z) for q, (z, z0) in enumerate(zip(x2, self.ids)) if z != z0]  # pp_run's numbers, one engine call
+            gs = [g] + ([native.Graph(masks=tx.vpd)] if tx.vpd is not None else [])
+            lqs = ge._pp_engine(tx).path_patched(gs, [pr]) if pr else tx.ref[None].expand(len(gs), -1, -1, -1)
+            lq = lqs[0, 0][None]
+            vpd = lqs[1, 0][None] if tx.vpd is not None else None
         w, kc = float(carry.kl(ref2, tx.ref)[0]), float(carry.kl(ref2, lq)[0])
         kv = float(carry.kl(ref2, vpd)[0]) if vpd is not None else None
         return {**out, "model_top": self._top(ref2), "circuit_top": self._top(lq), "kl_bits": _r(kc),

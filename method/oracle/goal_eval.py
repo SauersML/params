@@ -534,6 +534,27 @@ def _pooled_raw(draws: list) -> float | None:
     return num / den if den > 0 else None
 
 
+def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: np.ndarray) -> list:
+    """_pooled of each resample of draws (idx [R, n], draw indices per resample), as arrays: a draw's own score
+    ("weighted") or KLs ("mean", "donor") computed once; "spec" one resample at a time."""
+    fid = _fid_raw if raw else _fid
+    if kind == "spec":
+        return [_spec([draws[i] for i in r], raw=raw) for r in idx]
+    if kind == "weighted":
+        sd = [fid(d[3], d[1], d[2]) for d in draws]
+        w = np.array([d[3] if x is not None else 0.0 for d, x in zip(draws, sd)], dtype=float)
+        sw = np.array([d[3] * x if x is not None else 0.0 for d, x in zip(draws, sd)], dtype=float)
+        num, den = sw[idx].sum(1), w[idx].sum(1)
+        return [float(a) / float(b) if b > 0 else None for a, b in zip(num, den)]
+    if kind == "mean":
+        if e0 is None:
+            return [None] * len(idx)
+        kc, kv = (np.array([d[j] for d in draws], dtype=float)[idx].mean(1) for j in (0, 1))
+        return [fid(e0, float(a), float(b)) for a, b in zip(kc, kv)]
+    k0, kc, kv = (np.array([d[j] for d in draws], dtype=float)[idx].mean(1) for j in (3, 1, 2))  # "donor"
+    return [fid(float(a), float(b), float(c)) for a, b, c in zip(k0, kc, kv)]
+
+
 def family_eps(row: dict) -> dict:
     """eps_<family> for phi (the lead's reward v3): twice the bootstrap standard error of each family's score over its
     draws in the row (EPS_BOOT resamples, a fixed seed: the same from the row alone), at least EPS_FLOOR; a family
@@ -545,9 +566,8 @@ def family_eps(row: dict) -> dict:
         if not kind or not draws or len(draws) < 2:
             out[fam] = EPS_FLOOR
             continue
-        got = [_pooled(kind, [draws[i] for i in rng.integers(len(draws), size=len(draws))], row.get("kl_empty_live"),
-                       raw=PHI_FAMILIES[fam][0] in row.get("rl_terms", {}))
-               for _ in range(EPS_BOOT)]
+        idx = rng.integers(len(draws), size=(EPS_BOOT, len(draws)))  # the same draws as one call per resample
+        got = _pooled_resamples(kind, draws, row.get("kl_empty_live"), PHI_FAMILIES[fam][0] in row.get("rl_terms", {}), idx)
         got = [x for x in got if x is not None]
         out[fam] = max(EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else EPS_FLOOR
     return out

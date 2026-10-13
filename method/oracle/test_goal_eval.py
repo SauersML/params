@@ -2601,3 +2601,35 @@ def test_pattern_family_engine_equals_graph_ref(tiny):
             assert abs(a - w) <= 1e-4 * (1 + abs(w)), (a, w)
             n += 1
     assert n >= 4
+
+
+def test_family_eps_resamples_as_arrays():
+    """family_eps' resamples as arrays (_pooled_resamples) give the per-resample loop's eps (the same draws: one
+    generator call per family) on random rows of every pooling kind, within float rounding."""
+    def loop(row):
+        rng = np.random.default_rng(0)
+        out = {}
+        for fam, (_, kind, key) in goal_eval.PHI_FAMILIES.items():
+            draws = row.get(key) if key else None
+            if not kind or not draws or len(draws) < 2:
+                out[fam] = goal_eval.EPS_FLOOR
+                continue
+            got = [goal_eval._pooled(kind, [draws[i] for i in rng.integers(len(draws), size=len(draws))], row.get("kl_empty_live"),
+                                     raw=goal_eval.PHI_FAMILIES[fam][0] in row.get("rl_terms", {})) for _ in range(goal_eval.EPS_BOOT)]
+            got = [x for x in got if x is not None]
+            out[fam] = max(goal_eval.EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else goal_eval.EPS_FLOOR
+        return out
+    r = np.random.default_rng(1)
+    u = lambda a, b: float(r.uniform(a, b))  # noqa: E731
+    for trial in range(20):
+        n = int(r.integers(2, 20))
+        row = {"kl_empty_live": u(2, 6),
+               "draws_nodes": [[[1], u(0, 3), u(0, 2), u(0.01, 3)] for _ in range(n)],
+               "draws_edges": [[u(0, 4), u(0, 3)] for _ in range(n)],
+               "draws_track_pp": [[[1, 2], u(0, 3), u(0, 2), u(0, 3) * (trial % 5 != 0)] for _ in range(n)],
+               "draws_patching_near": [["d", u(0, 3), u(0, 2), u(2, 5), 0.5] for _ in range(n)],
+               "draws_pattern": [[u(0, 4), u(0, 3)] for _ in range(n)],
+               "draws_n_spec": [[1, u(0, 1), u(0, 1), u(0, 3), u(1, 4)] for _ in range(n)],
+               "rl_terms": {"s_track_pp": 0.1} if trial % 2 else {}}
+        a, b = loop(row), goal_eval.family_eps(row)
+        assert all(abs(a[f] - b[f]) < 1e-12 for f in a), (a, b)

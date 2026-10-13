@@ -63,6 +63,24 @@ def validate_bank(root, expected_sha, worker):
     return manifest, selected
 
 
+def continuation_rows(manifest, rows, receipt, audit):
+    """Only the five infrastructure-incomplete original cases may be repeated."""
+    expected=('gate_3100501','induction_3100600','induction_3100601',
+              'redundant_3100700','redundant_3100701')
+    if tuple(receipt['new_cases'])!=expected:
+        raise ValueError('fixed infrastructure continuation case order required')
+    all_train={r['case'] for r in manifest['models'] if r['split']=='train'}
+    completed={r['id'] for r in audit['verified']}
+    if completed!=all_train-set(expected) or len(audit['verified'])!=11:
+        raise ValueError('all eleven original completed cases must be verified')
+    selected=[r for r in rows if r['case'] in expected]
+    if tuple(r['case'] for r in selected)!=expected or receipt['max_new_forwards']!=sum(r['teacher_bound']['forward_cap'] for r in selected):
+        raise ValueError('continuation worker/budget mismatch')
+    if receipt['old_forward_interval']!=audit['total_old_forward_interval']:
+        raise ValueError('all old measured/unresolved forwards must be retained')
+    return selected
+
+
 def execute_case(row, bank, out, modules):
     import torch
     from safetensors.torch import save_file
@@ -159,8 +177,16 @@ def main():
     p=argparse.ArgumentParser()
     for name in ('source','bank','out'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--bank-sha256',required=True);p.add_argument('--worker',type=int,required=True)
+    p.add_argument('--continuation',type=Path)
     args=p.parse_args()
     manifest,rows=validate_bank(args.bank,args.bank_sha256,args.worker)
+    continuation=None
+    if args.continuation is not None:
+        continuation=json.loads(args.continuation.read_text())
+        if continuation['bank_sha256']!=args.bank_sha256 or sha(continuation['audit_path'])!=continuation['audit_sha256']:
+            raise ValueError('frozen continuation audit/bank binding changed')
+        audit=json.loads(Path(continuation['audit_path']).read_text())
+        rows=continuation_rows(manifest,rows,continuation,audit)
     if args.out.exists():raise ValueError('fresh immutable worker output required')
     here=Path(__file__).resolve().parent
     sys.path[:0]=[str(here),str(args.source/'experiments/oracle/toys'),
@@ -179,6 +205,9 @@ def main():
                (planted,native,goal_eval,vpd_model,render,teacher,reward,head_counterfactual,reward_interventions,circuit)},
               'driver_sha256':sha(__file__),'exclude_zero_mlp_routes':True,'selection':'all fixed8 TRAIN cases; no replacements',
               'scope':'finite disclosed contexts/intervention-panel graph supervision; no English/heldout guarantee'}
+    if continuation is not None:
+        contract['continuation']={**continuation,'receipt_sha256':sha(args.continuation),
+            'selection':'only infrastructure-incomplete original cases; completed case bytes retained separately'}
     write(args.out/'contract.json',contract);statuses=[]
     for row in rows:
         status={'case':row['case'],'status':'error'}

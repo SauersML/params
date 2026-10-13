@@ -7,6 +7,20 @@ from learning_model_bank import GENERATOR_COMMIT, FAMILIES
 
 
 class ContractTest(unittest.TestCase):
+    def test_continuation_preserves_completed_cases_and_all_old_forwards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);digest=self.fixture(root)
+            manifest,rows=driver.validate_bank(root,digest,1)
+            names=['gate_3100501','induction_3100600','induction_3100601','redundant_3100700','redundant_3100701']
+            all_train={r['case'] for r in manifest['models'] if r['split']=='train'}
+            audit={'verified':[{'id':i} for i in all_train-set(names)],'total_old_forward_interval':[36860,36861]}
+            receipt={'new_cases':names,'max_new_forwards':5*5520,'old_forward_interval':[36860,36861]}
+            got=driver.continuation_rows(manifest,rows,receipt,audit)
+            self.assertEqual([r['case'] for r in got],names)
+            receipt['old_forward_interval']=[0,0]
+            with self.assertRaises(ValueError):driver.continuation_rows(manifest,rows,receipt,audit)
+            receipt['old_forward_interval']=audit['total_old_forward_interval'];receipt['new_cases']=names[::-1]
+            with self.assertRaises(ValueError):driver.continuation_rows(manifest,rows,receipt,audit)
     def test_append_journal_preserves_receipts_and_final_legacy_index(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);journal=root/'evidence.jsonl'

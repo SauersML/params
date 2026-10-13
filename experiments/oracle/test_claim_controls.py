@@ -1,5 +1,6 @@
 import collections
 import json
+import math
 from pathlib import Path
 import struct
 import sys
@@ -84,3 +85,49 @@ def test_reserved_claim_never_reads_its_task(tmp_path):
     checks, inputs, uv, row = fixture(tmp_path)
     with pytest.raises(ValueError, match='no eligible'):
         c.prepare(checks, tmp_path / 'DOES_NOT_EXIST', uv, {'text6001'})
+
+
+@pytest.mark.parametrize('position,token', [('-1', 0), ('2', 0), ('00', 0), ('0', -1), ('0', True), ('0', 16)])
+def test_recipient_and_donor_coordinates_cannot_silently_index_from_end(position, token):
+    p = {'token_ids': [0, 1], 'target_positions': [1]}
+    for recipient in (False, True):
+        iv = {'tokens': {position: token} if recipient else {}, 'transplants': [['V0', {} if recipient else {position: token}]]}
+        with pytest.raises(ValueError):
+            c.validate_inputs(p, iv, 16)
+
+
+@pytest.mark.parametrize('targets', [[], [-1], [2], [True]])
+def test_invalid_prediction_targets(targets):
+    with pytest.raises(ValueError):
+        c.validate_inputs({'token_ids': [0, 1], 'target_positions': targets}, {'transplants': [['V0', {}]]}, 16)
+
+
+def test_unknown_intervention_cannot_be_silently_ignored():
+    with pytest.raises(ValueError, match='unsupported'):
+        c.validate_inputs({'token_ids': [0, 1], 'target_positions': [1]}, {'transplants': [['V0', {}]], 'scale': 0}, 16)
+
+
+def test_executor_preflight_passes_identical_distributions():
+    q = [math.log(.1), math.log(.9)]
+    assert all(v == 0 for v in c.executor_preflight(q, q, q).values())
+
+
+def test_identity_low_probability_log_drift_cannot_hide_behind_small_kl():
+    q = [math.log(.001), math.log(.999)]
+    other = [math.log(.00101), math.log(.99899)]
+    assert sum(math.exp(a) * (a - b) for a, b in zip(q, other)) / math.log(2) < 1e-3
+    with pytest.raises(ValueError, match='fixed tolerance'):
+        c.executor_preflight(q, other, q)
+
+
+def test_independent_reference_failure_blocks_measurement():
+    q = [math.log(.1), math.log(.9)]
+    with pytest.raises(ValueError, match='fixed tolerance'):
+        c.executor_preflight(q, q, [math.log(.2), math.log(.8)])
+
+
+@pytest.mark.parametrize('bad', [[float('nan'), 0.], [0., 0.], [0.], []])
+def test_invalid_executor_distributions_rejected(bad):
+    q = [math.log(.1), math.log(.9)]
+    with pytest.raises(ValueError):
+        c.executor_preflight(q, bad, q)

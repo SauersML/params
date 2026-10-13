@@ -56,6 +56,54 @@ def registry(path):
     return counts, hashlib.sha256(raw).hexdigest()
 
 
+def validate_inputs(prompt, intervention, vocab_size=None):
+    ids, targets = prompt['token_ids'], prompt['target_positions']
+    valid_token = lambda z: type(z) is int and z >= 0 and (vocab_size is None or z < vocab_size)
+    if not ids or not targets or not all(valid_token(z) for z in ids):
+        raise ValueError('invalid input token IDs or empty target')
+    if any(type(p) is not int or not 0 <= p < len(ids) for p in targets):
+        raise ValueError('invalid prediction target')
+    if set(intervention) - {'tokens', 'transplants', 'remove'} or intervention.get('remove'):
+        raise ValueError('unsupported intervention fields/operator')
+    transplants = intervention.get('transplants')
+    if not isinstance(transplants, list) or not transplants:
+        raise ValueError('explicit transplants required')
+    changes = [intervention.get('tokens', {})]
+    for item in transplants:
+        if not isinstance(item, (list, tuple)) or len(item) != 2 or not isinstance(item[0], str):
+            raise ValueError('invalid transplant binding')
+        changes.append(item[1])
+    for change in changes:
+        if not isinstance(change, dict):
+            raise ValueError('invalid token changes')
+        for p, z in change.items():
+            if not re.fullmatch(r'0|[1-9]\d*', str(p)) or not 0 <= int(p) < len(ids) or not valid_token(z):
+                raise ValueError('invalid recipient/donor position or token')
+
+
+def executor_preflight(base, identity, reference):
+    """Check independent reproduction before measuring controls; inputs are log probs."""
+    if not base or any(len(v) != len(base) for v in (identity, reference)):
+        raise ValueError('executor preflight vocabulary shape mismatch')
+    for values in (base, identity, reference):
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError('nonfinite executor preflight distribution')
+        peak = max(values)
+        norm = peak + math.log(math.fsum(math.exp(v - peak) for v in values))
+        if abs(norm) > 1e-4:
+            raise ValueError('unnormalized executor preflight distribution')
+    kl = lambda a, b: math.fsum(math.exp(x) * (x - y) for x, y in zip(a, b)) / math.log(2)
+    result = {'full_engine_reference_kl_bits': kl(reference, base),
+              'identity_transplant_kl_bits': kl(base, identity),
+              'full_engine_reference_max_abs_logprob': max(abs(a - b) for a, b in zip(reference, base)),
+              'identity_transplant_max_abs_logprob': max(abs(a - b) for a, b in zip(base, identity))}
+    # Predeclared existing teacher reproduction bar; never retuned from these outcomes.
+    if (abs(result['full_engine_reference_kl_bits']) > 1e-3 or abs(result['identity_transplant_kl_bits']) > 1e-3
+            or result['identity_transplant_max_abs_logprob'] > 1e-3):
+        raise ValueError('executor reference/identity preflight exceeds fixed tolerance')
+    return result
+
+
 def permute(variables, counts, task, seed):
     """One bijection per matrix, shared across positions and all named carriers."""
     train_task(task)
@@ -117,6 +165,7 @@ def prepare(checks, inputs, uv, reserved, seeds=(0, 1)):
             tasks[tid] = {'token_ids': p['token_ids'], 'target_positions': p['target_positions'], 'task_sha256': row['task_sha256']}
         if tasks[tid]['task_sha256'] != row['task_sha256']:
             raise ValueError('inconsistent task source')
+        validate_inputs(tasks[tid], iv)
         length = len(tasks[tid]['token_ids'])
         all_members = [tuple(g) for v in selected for g in v['group']]
         if len(set(all_members)) != len(all_members):
@@ -165,6 +214,8 @@ def run(protocol_path, model_manifest, out, device, worker, workers):
     actual = {name: file_sha(path) for name, path in paths.items()}
     if actual != expected:
         raise ValueError('loader-selected model content differs from frozen manifest')
+    for case in protocol['cases']:
+        validate_inputs(protocol['tasks'][case['task']], case['intervention'], mech.tokenizer('vpd4l').get_vocab_size())
     torch.set_num_threads(4); torch.set_grad_enabled(False)
     started = time.monotonic()
     nat = native.Native(device)
@@ -196,6 +247,10 @@ def run(protocol_path, model_manifest, out, device, worker, workers):
                     distributions['independent_reference'] = nat.reference([recipient_ids], tx.targets)[0, -1].detach().float().cpu().clone()
                     identity = {'tokens': recipient_changes, 'transplants': [(v['name'], recipient_changes) for v in arm['variables']]}
                     distributions['identity_transplant'] = checker.run(identity).detach().float().cpu().clone()
+                    if any(value.ndim != 1 for value in distributions.values()):
+                        raise ValueError('executor preflight rank mismatch')
+                    preflight = executor_preflight(*(distributions[name].tolist() for name in
+                                                     ('recipient_baseline', 'identity_transplant', 'independent_reference')))
                 q = checker.run(case['intervention']).detach().float().cpu()
                 if q.ndim != 1 or not torch.isfinite(q).all() or abs(float(q.logsumexp(0))) > 1e-4:
                     raise ValueError('invalid normalized full-model log distribution')
@@ -212,13 +267,8 @@ def run(protocol_path, model_manifest, out, device, worker, workers):
         from safetensors.torch import save_file
         tensor_path = destination / (case['id'] + '.safetensors')
         save_file(distributions, str(tensor_path))
-        base, identity = distributions['recipient_baseline'], distributions['identity_transplant']
-        reference = distributions['independent_reference']
         record = {'case': case, 'measurements': summaries, 'distributions_sha256': file_sha(tensor_path),
-                  'identity_transplant_kl_bits': float((base.exp() * (base - identity)).sum()) / math.log(2),
-                  'identity_transplant_max_abs_logprob': float((base - identity).abs().max()),
-                  'full_engine_reference_kl_bits': float((reference.exp() * (reference - base)).sum()) / math.log(2),
-                  'full_engine_reference_max_abs_logprob': float((reference - base).abs().max())}
+                  **preflight}
         (destination / (case['id'] + '.json')).write_text(json.dumps(record) + '\n')
         print(case['task'], case['id'][:12], [r['top'] for r in summaries], flush=True)
     after = {n: file_sha(p) for n, p in paths.items()}

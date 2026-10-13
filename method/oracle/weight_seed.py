@@ -82,7 +82,7 @@ def propose(nodes, edges, ranked, protected=None):
                         'mandatory_edges':sum(not residual_route(e) for e in edges),'residual_kept':sum(k and residual_route(e) for k,e in zip(mask,edges)),
                         'signed_couplings':chosen,'scope':'static proposal; no causal or circuit-fidelity certificate'}
 
-def assess(full_mask, proposal_mask, budget, measure, admit=None):
+def assess(full_mask, proposal_mask, budget, measure, admit=None, validation=None):
     """Measured gate with unchanged full-start fallback and fixed original budget.
 
     Caller MUST create admit at the full start BEFORE calling this helper. The
@@ -100,9 +100,14 @@ def assess(full_mask, proposal_mask, budget, measure, admit=None):
     terms=admit(candidate) if admit is not None else {}
     if terms is None:
         return full,{**record,'reason':'original_acceptance_floors'}
-    return candidate,{**record,'admitted':True,'reason':'measured_admission','acceptance':terms}
+    val=validation(candidate) if validation is not None else None
+    if validation is not None and (not isinstance(val,dict) or type(val.get('passed')) is not bool):
+        raise ValueError('explicit validation admission required')
+    if val is not None and not val['passed']:
+        return full,{**record,'reason':'original_validation_floor','acceptance':terms,'validation':val}
+    return candidate,{**record,'admitted':True,'reason':'measured_admission','acceptance':terms,'validation':val}
 
-def initialise(ep, nodes, budget, admit=None, reference_terms=None, full_kl=None, blocks=False):
+def initialise(ep, nodes, budget, admit=None, reference_terms=None, full_kl=None, blocks=False, validation=None):
     """Try one proposal after the caller captured ordinary full-start gates.
 
     Unchanged fallback preserves ep.on object identity. Existing repair-subsets
@@ -125,6 +130,7 @@ def initialise(ep, nodes, budget, admit=None, reference_terms=None, full_kl=None
         if len(got)!=1: raise ValueError('one proposal acceptance result required')
         return got[0]
     chosen,gate=assess(ep.on.tolist(),candidate,budget,
-                      lambda mask:ep.kl_sets(tensor(mask))[0],acceptance if admit is not None else None)
+                      lambda mask:ep.kl_sets(tensor(mask))[0],acceptance if admit is not None else None,
+                      (lambda mask:validation(tensor(mask)[0])) if validation is not None else None)
     if gate['admitted']: ep.on=tensor(chosen)[0]
     return {**meta,**gate,'seconds':time.perf_counter()-t0,'measured_subsets':ep.measured-before}

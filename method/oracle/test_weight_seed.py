@@ -71,4 +71,29 @@ class LoadedSeedTest(unittest.TestCase):
   self.assertIs(ep.on,full);self.assertTrue(bool(ep.on.all()));self.assertFalse(row['admitted']);self.assertEqual(row['original_reference_terms'],{'changed':.95});self.assertEqual(row['original_budget'],.1);self.assertEqual(row['measured_subsets'],1);self.assertEqual(seen,[[[False,True]]])
   self.assertEqual(s.initialise(ep,[nd(0,'v_proj',i) for i in range(129)],.1)['reason'],'node_cap')
 
+
+class ValidationSeedTest(unittest.TestCase):
+ def test_point_search_pass_validation_fail_preserves_rollback_start(self):
+  import torch
+  from types import SimpleNamespace
+  from unittest.mock import patch
+  w,r=nd(0,'o_proj'),nd(1,'v_proj')
+  ep=SimpleNamespace(ge=SimpleNamespace(nat=None),edges=[(w,r),(r,None)],on=torch.ones(2,dtype=torch.bool),protected=torch.zeros(2,dtype=torch.bool),measured=0)
+  def measure(masks):ep.measured+=len(masks);return [.01]
+  ep.kl_sets=measure;full=ep.on;seen=[]
+  def validation(mask):
+   self.assertIs(ep.on,full);self.assertTrue(bool(ep.on.all()));seen.append(mask.tolist())
+   return {'score':.2,'floor':.9,'low':[],'passed':False}
+  with patch.object(s,'rank_loaded',return_value=([{'writer':w,'reader':r,'cosine':0.,'raw':0.}],{})):
+   row=s.initialise(ep,[w,r],.1,lambda masks:[{'s_track_pp':.95}],{'s_track_pp':.96},.001,validation=validation)
+  self.assertIs(ep.on,full);self.assertTrue(bool(ep.on.all()));self.assertEqual(row['reason'],'original_validation_floor');self.assertEqual(row['validation']['floor'],.9);self.assertEqual(seen,[[False,True]])
+  # Later normal validation can only capture the original full start as good.
+  import teacher
+  checked=teacher.Validated(ep,lambda mask:mask,SimpleNamespace(validation=lambda graph:(.96,[])),.9)
+  self.assertEqual(checked.good[0].tolist(),[True,True])
+ def test_low_draw_rejects_even_high_validation_mean(self):
+  full=(True,True);candidate=(False,True)
+  chosen,row=s.assess(full,candidate,.1,lambda mask:.01,lambda mask:{'s_track_pp':.95},lambda mask:{'passed':False,'score':.99,'floor':.9,'low':['bad draw']})
+  self.assertEqual(chosen,full);self.assertEqual(row['reason'],'original_validation_floor')
+
 if __name__=='__main__':unittest.main()

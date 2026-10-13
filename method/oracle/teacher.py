@@ -1517,11 +1517,16 @@ class Connector:
             st = self.size_term(on, int(e_on[:ep.inner].sum()), int(e_on[ep.inner:].sum()))
             return {"nodes": size, "edges": int(e_on.sum()), "removed": removed, "kl_graph": kl, "f1_graph": f1,
                     "n": n, "size_term": st, "reward": (f1 + n) / TERMS - SIZE_WEIGHT * st}
-        validate = None
+        validate = seed_validation = None
         if self.acceptance is not None and self.acceptance.draws == "fv" and base.get("s_track_pp") is not None:
             def validate(d, lg):                             # F+V: the connection levels under the validation set too
                 return Validated(d, lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]),
                                  self.acceptance, floor_of(base["s_track_pp"]), lg)
+            def seed_validation(e):
+                sc, low = self.acceptance.validation(self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]))
+                floor = floor_of(base["s_track_pp"])
+                return {"score": sc, "floor": floor, "low": low,
+                        "passed": not low and (sc is None or floor is None or sc >= floor)}
         full_start_kl = ep.kl()
         budget = max(self.budget, kl_budget(empty, full_start_kl, SET_RECOVERY))   # the nodes' rule: the F1 budget or 5% of the
         summary_budget = budget                              # node set's own log recovery lost
@@ -1535,7 +1540,7 @@ class Connector:
                 # Acceptance hooks, robust floors, validation and budget above all
                 # refer to the ORIGINAL full start. Never recapture them at a seed.
                 weight_seed_info = weight_seed.initialise(ep, nodes, budget, accept, start,
-                                                          full_start_kl, blocks=bool(self.blocks))
+                                                          full_start_kl, blocks=bool(self.blocks), validation=seed_validation)
         steps = edge_path(ep, budget, state, self.levels, accept=accept, validate=validate)
         steps[0].update(start)
         if weight_seed_info is not None and weight_seed_info.get("admitted"):

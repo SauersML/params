@@ -79,7 +79,7 @@ MAX_CALLS = 40  # tool calls per episode
 TEXTS_KEPT = 8  # texts whose Tools a process keeps (an RL group's episodes share one)
 LIST_TOP = 24  # list_active's default
 LIST_MAX = 400  # list_active's most
-REMOVE_EACH_MAX = 1024  # measure_removal(each=True)'s most nodes
+REMOVE_EACH_MAX = 4096  # measure_removal(each=True)'s most nodes (an influential start reaches 1,127 on text9001)
 COMPARE_DRAWS = goal_eval.CHANGED_DRAWS  # compare's changed inputs (track_pp's draws on the tools' split)
 OTHER = {"search": "eval", "eval": "search"}
 LN2 = math.log(2)

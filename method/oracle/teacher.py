@@ -909,13 +909,15 @@ class Validated:
 
 
 SET_LEVELS = ("site", "chunk16", "chunk4", "subcomponent")  # the influential set's levels, coarse first
+SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its own log recovery (fleet's 9004 finding)
 
 
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
                acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS) -> tuple:
     """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): goal_eval.GoalEval.start_set
     (VPD's active subcomponents at the targets and the m most influential positions, every connection; search split
-    s_track_pp 0.9) pruned within the F1 budget and the acceptance floors (min(0.9, the start's)) at levels, each level
+    s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
+    and the acceptance floors (min(0.9, the start's)) at levels, each level
     under Validated when the acceptance draws are "fv". (The circuit, its Pruner, the record) as block_search's (no
     group, no blocks)."""
     nat = ge.nat
@@ -925,8 +927,11 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
         start[n][t, c] = True
     pr = Pruner(ge, tx, start, live=CONVENTION == "live", B=B)
     graph_of = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
+    kl0 = pr.kl()
+    if kl0 > budget:                                         # a start above the F1 budget (text6011, text9004 pruned
+        budget = kl_budget(empty, kl0, SET_RECOVERY)          # nothing): at most 5% of its own log recovery lost
     rec = {"m": st["m"], "positions": st["positions"], "start_s_track_pp": st["s_track_pp"], "start_units": len(pr.nodes),
-           "stages": [], "validation": []}
+           "stages": [], "validation": [], "budget": budget}
 
     def stage(name, t0):
         kl = pr.kl()

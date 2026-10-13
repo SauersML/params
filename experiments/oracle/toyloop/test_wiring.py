@@ -11,6 +11,7 @@ sys.path[:0] = [str(Path(__file__).resolve().parent), str(ROOT / "method/oracle"
 
 import circuit
 import reward_exec
+import paired_wiring as paired
 from test_goal_eval import tiny_native
 
 
@@ -246,3 +247,50 @@ def test_mac_decomposition_uses_scipy_and_preserves_head_weights(monkeypatch):
                     expected[head * 2:(head + 1) * 2] = weight[head * 2:(head + 1) * 2]
                 selected = units == head
                 assert torch.allclose((v[:, selected] @ u[selected]).T, expected, atol=2e-6, rtol=2e-6)
+
+
+# Fresh paired-run contracts: no policy/model/data construction.
+
+
+def test_arms_are_identical_except_reward_and_destination(tmp_path):
+    args = SimpleNamespace(out=tmp_path, sft_steps=300, rl_steps=20, seed=0,
+                           max_len=3072, max_new=416)
+    unit = vars(paired.training_args(args, 'unit_suff', 'base', 'same-start', tmp_path / 'unit'))
+    wiring = vars(paired.training_args(args, 'wiring_suff', 'base', 'same-start', tmp_path / 'wiring'))
+    assert {key: value for key, value in unit.items() if key not in ('reward', 'out')} == {
+        key: value for key, value in wiring.items() if key not in ('reward', 'out')}
+    assert unit['steps'] == 20 and unit['k'] == 4 and unit['init'] == 'same-start'
+
+
+def test_panel_is_outcome_independent_and_reordered_stable():
+    rows = [{'id': f'{family}_{i:03d}', 'family': family, 'split': split, 'outcome': i % 2}
+            for split, families in [('train', range(8)), ('test_instance', range(8)), ('test_family', range(8, 10))]
+            for family in families for i in range(5)]
+    selected = paired.select_panel(rows)
+    assert len(selected) == 24
+    assert selected == paired.select_panel(list(reversed(rows)))
+    assert [row['id'] for row in selected] == [row['id'] for row in paired.select_panel(
+        [{**row, 'outcome': 999} for row in rows])]
+
+
+def test_completed_stage_hashes_and_partial_rejection(tmp_path):
+    directory = tmp_path / 'sft'
+    directory.mkdir()
+    (directory / 'weights').write_bytes(b'frozen')
+    paired.write(tmp_path / 'sft.done.json', {'files': paired.hashes(directory)})
+    assert paired.stage_done(tmp_path, 'sft')
+    (directory / 'weights').write_bytes(b'changed')
+    with pytest.raises(ValueError, match='changed'):
+        paired.stage_done(tmp_path, 'sft')
+    assert not paired.stage_done(tmp_path, 'unit_suff')
+    args = SimpleNamespace(out=tmp_path)
+    paired.write(tmp_path / 'unit_suff.started.json', {'unfinished': True})
+    with pytest.raises(ValueError, match='partial training'):
+        paired.learn(args, None, None, 'unit_suff', 'unit_suff')
+
+
+def test_deadline_does_not_launch_extra_work(monkeypatch):
+    monkeypatch.setenv('DEADLINE', '0')
+    with pytest.raises(SystemExit) as exc:
+        paired.require_time(1)
+    assert exc.value.code == 75

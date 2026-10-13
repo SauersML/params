@@ -1137,7 +1137,8 @@ def evaluate(split: str, n: int, src: Path, out: Path, sets=EVAL_SETS, derived: 
             seen[key] = kind
             graphs.append(g)
             kinds.append(kind)
-        log(f"{p.stem}: T {tx.T}, scoring {', '.join(f'{k} ({counts(g, nat.C, tx.vpd)['subcomponents']})' for k, g in zip(kinds, graphs))}")
+        sizes = ", ".join(f"{k} ({counts(g, nat.C, tx.vpd)['subcomponents']})" for k, g in zip(kinds, graphs))
+        log(f"{p.stem}: T {tx.T}, scoring {sizes}")
         fid = ge.fidelity(tx, graphs, pool, draws=draws, mode="reward", split="eval")
         start_row = fid[0]
         rows = {}

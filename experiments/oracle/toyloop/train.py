@@ -18,6 +18,7 @@ import argparse
 import copy
 import importlib
 import json
+import os
 import random
 import sys
 import time
@@ -80,7 +81,21 @@ def oracle_lm_tokenizer(name):
     return tok
 
 
+def explicit_device(name: str = "cpu"):
+    """An explicitly requested backend must be available; never silently fall back."""
+    if name not in ("cpu", "mps", "cuda"):
+        raise ValueError(f"unsupported policy device: {name}")
+    if name == "mps" and os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1":
+        raise ValueError("MPS CPU fallback is enabled; start with PYTORCH_ENABLE_MPS_FALLBACK=0")
+    if name == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("requested MPS device is unavailable")
+    if name == "cuda" and not torch.cuda.is_available():
+        raise ValueError("requested CUDA device is unavailable")
+    return torch.device(name)
+
+
 def load_policy(a):
+    device = explicit_device(getattr(a, "device", "cpu"))
     torch.set_num_threads(a.threads)
     if a.init:   # a directory saved by save(): a full model, or a LoRA adapter on its base
         p = Path(a.init)
@@ -90,10 +105,12 @@ def load_policy(a):
         else:
             from transformers import AutoModelForCausalLM
             m = AutoModelForCausalLM.from_pretrained(p, torch_dtype=torch.float32)
-        return m, oracle_lm_tokenizer(p)
-    if a.model == "tiny":
-        return tiny_model()
-    return oracle_lm.load(a.model, a.lora, a.threads)
+        tok = oracle_lm_tokenizer(p)
+    elif a.model == "tiny":
+        m, tok = tiny_model()
+    else:
+        m, tok = oracle_lm.load(a.model, a.lora, a.threads)
+    return m.to(device), tok
 
 
 def save(model, tok, out: Path, log: list):
@@ -103,7 +120,7 @@ def save(model, tok, out: Path, log: list):
     (out / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in log))
 
 
-def batch_ids(tok, pairs: list[tuple[str, str]], max_len: int):
+def batch_ids(tok, pairs: list[tuple[str, str]], max_len: int, device=None):
     """Left-padded ids [B, T], attention mask, and a mask over completion tokens (the scored positions, at the end)."""
     rows = []
     for p, c in pairs:
@@ -113,10 +130,10 @@ def batch_ids(tok, pairs: list[tuple[str, str]], max_len: int):
             ids, n = ids[cut:], max(1, n - cut)
         rows.append((ids, n))
     T = max(len(r) for r, _ in rows)
-    ids = torch.full((len(rows), T), tok.pad_token_id)
-    att, comp = torch.zeros(len(rows), T, dtype=torch.long), torch.zeros(len(rows), T)
+    ids = torch.full((len(rows), T), tok.pad_token_id, device=device)
+    att, comp = torch.zeros(len(rows), T, dtype=torch.long, device=device), torch.zeros(len(rows), T, device=device)
     for b, (r, n) in enumerate(rows):
-        ids[b, T - len(r):] = torch.tensor(r)
+        ids[b, T - len(r):] = torch.tensor(r, device=device)
         att[b, T - len(r):] = 1
         comp[b, T - len(r) + n:] = 1
     return ids, att, comp
@@ -138,12 +155,13 @@ def sft(a):
     torch.manual_seed(a.seed)  # initialization/dropout, as well as Python's prompt schedule below
     data = [e for e in examples(a.data, a.truth) if e["completion"]]
     model, tok = load_policy(a)
+    device = next(model.parameters()).device
     model.train()
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
     rng, log, t0 = random.Random(a.seed), [], time.time()
     for step in range(a.steps):
         batch = rng.sample(data, min(a.batch, len(data)))
-        ids, att, comp = batch_ids(tok, [(e["prompt"], e["completion"]) for e in batch], a.max_len)
+        ids, att, comp = batch_ids(tok, [(e["prompt"], e["completion"]) for e in batch], a.max_len, device=device)
         lp, m = token_logps(model, ids, att, comp)
         loss = -(lp * m).sum() / m.sum()
         loss.backward()
@@ -165,12 +183,12 @@ def sft(a):
 def sample(model, tok, prompt: str, k: int, a, greedy: bool = False) -> list[str]:
     model.eval()
     ids, _ = oracle_lm.chat_ids(tok, prompt)
-    ids = torch.tensor([ids[-a.max_len + a.max_new:]])
+    ids = torch.tensor([ids[-a.max_len + a.max_new:]], device=next(model.parameters()).device)
     out = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=a.max_new,
                          do_sample=not greedy, temperature=a.temp, top_p=1.0, num_return_sequences=1 if greedy else k,
                          pad_token_id=tok.pad_token_id)
     model.train()
-    return tok.batch_decode(out[:, ids.shape[1]:], skip_special_tokens=True)
+    return tok.batch_decode(out[:, ids.shape[1]:].cpu(), skip_special_tokens=True)
 
 
 def evaluate(model, tok, data, reward, a) -> float:
@@ -182,6 +200,7 @@ def rl(a):
     data = examples(a.data, a.truth)
     reward = get_reward(a.reward)
     model, tok = load_policy(a)
+    device = next(model.parameters()).device
     ref = None
     if a.beta > 0:
         ref = copy.deepcopy(model).eval()
@@ -195,7 +214,7 @@ def rl(a):
         pairs, adv, rs = [], [], []
         for e in batch:
             comps = sample(model, tok, e["prompt"], a.k, a)
-            r = torch.tensor([float(reward(e["meta"], c)) for c in comps])
+            r = torch.tensor([float(reward(e["meta"], c)) for c in comps], device=device)
             A = r - r.mean()
             if a.std:
                 A = A / (r.std() + 1e-4)
@@ -207,7 +226,7 @@ def rl(a):
         # on a 15 GB host
         n, loss_sum, kl_sum = len(pairs), 0.0, 0.0
         for i in range(n):
-            ids, att, comp = batch_ids(tok, pairs[i:i + 1], a.max_len)
+            ids, att, comp = batch_ids(tok, pairs[i:i + 1], a.max_len, device=device)
             lp, m = token_logps(model, ids, att, comp)
             per_seq = (lp * m).sum(1) / m.sum(1).clamp_min(1)
             loss = -(adv[i:i + 1] * per_seq).sum() / n
@@ -225,7 +244,7 @@ def rl(a):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             opt.zero_grad(set_to_none=True)
-        loss, kl = torch.tensor(loss_sum), torch.tensor(kl_sum)
+        loss, kl = torch.tensor(loss_sum, device=device), torch.tensor(kl_sum, device=device)
         log.append({"step": step, "reward": round(rs.mean().item(), 4), "reward_max": round(rs.max().item(), 4),
                     "loss": round(loss.item(), 4), "kl": round(kl.item(), 5), "sec": round(time.time() - t0, 1)})
         if step % a.log_every == 0 or step == a.steps - 1:
@@ -254,6 +273,7 @@ def parser():
     ap.add_argument("--std", action="store_true", help="divide advantages by the group std")
     ap.add_argument("--reward", default="f1")
     ap.add_argument("--eval", type=int, default=0, help="after SFT: greedy F1 on this many training prompts")
+    ap.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu", help="explicit policy backend; unavailable devices fail")
     ap.add_argument("--threads", type=int, default=2, help="1-2 on the shared box: 4 oversubscribes")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=10)

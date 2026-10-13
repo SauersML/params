@@ -6,7 +6,8 @@ Rows are {"prompt", "answer", "choices", "label", "meta"}; the model reads promp
 answer and an end token. Scoring, per held-out row:
   remove, cut, swap: the KL bin's probability, each of the four "KL <bin>;" choices' log-probability after the prompt,
                      normalized over them: log loss in bits (and accuracy); falls: P(" falls=yes;" against " falls=no;")
-                     after the true bin;
+                     after each bin, marginalized over the predicted bins (falls_logloss_bits; after the true bin alone,
+                     falls_given_bin_logloss_bits, which the true bin nearly decides);
   rank:              the first candidate's probability over the letters (top-1 log loss and accuracy) and the greedy
                      answer's order against the measured one (Kendall's tau).
 
@@ -316,23 +317,25 @@ def score(a) -> None:
             C.append(enc(ch))
             N.append(nodes)
             who.append(("bin", i))
-        head = enc(r["choices"][r["label"]])
-        for f in (" falls=yes;", " falls=no;"):
-            P.append(p + head)
-            C.append(enc(f))
-            N.append(nodes)
-            who.append(("falls", i))
+        for j, ch in enumerate(r["choices"]):  # falls after every bin, marginalized over the predicted bins below
+            for f in (" falls=yes;", " falls=no;"):
+                P.append(p + enc(ch))
+                C.append(enc(f))
+                N.append(nodes)
+                who.append(("falls", i, j))
     lps = _logp(model, tok, P, C, N, slots)
     got = {}
-    for (what, i), lp in zip(who, lps):
-        got.setdefault((what, i), []).append(lp)
+    for key, lp in zip(who, lps):
+        got.setdefault(key[:2] if key[0] == "bin" else key, []).append(lp)
     for i, r in enumerate(eff):
         b = torch.tensor(got[("bin", i)]).log_softmax(0)
-        f = torch.tensor(got[("falls", i)]).log_softmax(0)
+        fy = torch.stack([torch.tensor(got[("falls", i, j)]).log_softmax(0)[0] for j in range(len(b))])  # log P(yes | bin j)
         yes = r["meta"]["falls"]
+        p_yes = float((b.exp() * fy.exp()).sum().clamp(1e-6, 1 - 1e-6))
+        given = float(fy[r["label"]].exp().clamp(1e-6, 1 - 1e-6))
         out.write(json.dumps({"kind": r["meta"]["kind"], "label": r["label"], "logloss_bits": -float(b[r["label"]]) / math.log(2),
-                              "pred": int(b.argmax()), "falls_logloss_bits": -float(f[0 if yes else 1]) / math.log(2),
-                              "p_bins": b.exp().tolist()}) + "\n")
+                              "pred": int(b.argmax()), "falls_logloss_bits": -math.log2(p_yes if yes else 1 - p_yes), "falls_marginal": True,
+                              "falls_given_bin_logloss_bits": -math.log2(given if yes else 1 - given), "p_bins": b.exp().tolist()}) + "\n")
     letters = "abcdefgh"
     for r in (r for r in rows if r["meta"]["kind"] == "rank"):
         text, nodes = prompt(r)
@@ -405,7 +408,8 @@ def table(dirs: list[str], baselines: str | None = None) -> str:
     """The grid against the lead's decision rule: per arm and training size, the held-out KL-bin log loss (bits, the
     mean over remove, cut and swap questions, and per kind), falls log loss, rank top-1 and Kendall's tau, each with its
     standard error; at each size, each arm's paired difference in KL-bin log loss from the best arm there (the same
-    questions in the same order) with twice its standard error ("within noise" when the difference is below it); and
+    questions in the same order) with twice its standard error ("within noise" when the difference is below it), the
+    same for the falls log loss against the best falls arm; and
     the feature-only baselines on the same questions (learnability.py baselines' JSON)."""
     import re
     import statistics as st
@@ -417,12 +421,16 @@ def table(dirs: list[str], baselines: str | None = None) -> str:
             if m:
                 runs[(m.group(1), m.group(2))] = _rows(f)
     se = lambda xs: st.pstdev(xs) / math.sqrt(len(xs)) if len(xs) > 1 else float("nan")  # noqa: E731
-    lines = ["arm               size   KL-bin bits (se)   remove  cut    swap   falls  | rank top-1 (se)  tau (se)   | vs best at size"]
+    lines = ["arm               size   KL-bin bits (se)   remove  cut    swap   falls  | rank top-1 (se)  tau (se)   | vs best at size (KL bins; falls)"]
     eff = {k: [r["logloss_bits"] for r in v if r["kind"] != "rank"] for k, v in runs.items()}
-    best = {}
+    best, fbest = {}, {}
+    fal = {k: [r["falls_logloss_bits"] for r in v if r["kind"] != "rank"] for k, v in runs.items()
+           if all(r.get("falls_marginal") for r in v if r["kind"] != "rank")}  # rows scored before c4: falls given the true bin
     for (arm, n), xs in eff.items():
         if xs and (n not in best or st.mean(xs) < st.mean(eff[best[n]])):
             best[n] = (arm, n)
+        if xs and (arm, n) in fal and (n not in fbest or st.mean(fal[(arm, n)]) < st.mean(fal[fbest[n]])):
+            fbest[n] = (arm, n)
     order = sorted(runs, key=lambda k: (int(k[1]) if k[1] != "base" else -1, k[0]))
     for k in order:
         rs = runs[k]
@@ -433,14 +441,16 @@ def table(dirs: list[str], baselines: str | None = None) -> str:
         kind = lambda name, e=e: st.mean(r["logloss_bits"] for r in e if r["kind"] == name) if any(r["kind"] == name for r in e) else float("nan")  # noqa: E731
         top1 = [float(r["pred"] == r["label"]) for r in rk]
         tau = [r["tau"] for r in rk if r["tau"] == r["tau"]]
-        b = best[k[1]]
-        if b == k:
-            vs = "best"
-        else:
-            d = [x - y for x, y in zip(eff[k], eff[b])]
-            vs = f"+{st.mean(d):.3f} (2se {2 * se(d):.3f}) {'within noise' if st.mean(d) < 2 * se(d) else 'worse'}"
+        def versus(table, b, k=k):
+            if k not in table or b is None:
+                return "n/a (falls given the true bin)"
+            if b == k:
+                return "best"
+            d = [x - y for x, y in zip(table[k], table[b])]
+            return f"+{st.mean(d):.3f} (2se {2 * se(d):.3f}) {'within noise' if st.mean(d) < 2 * se(d) else 'worse'}"
+        vs = versus(eff, best[k[1]]) + "; falls " + versus(fal, fbest.get(k[1]))
         lines.append(f"{k[0]:17s} {k[1]:>5s}  {st.mean(eff[k]):.3f} ({se(eff[k]):.3f})      {kind('remove'):.2f}   {kind('cut'):.2f}   {kind('swap'):.2f}   "
-                     f"{st.mean(r['falls_logloss_bits'] for r in e):.2f}   | {st.mean(top1) if top1 else float('nan'):.3f} ({se(top1):.3f})    "
+                     f"{st.mean(fal[k]) if k in fal else float('nan'):.2f}   | {st.mean(top1) if top1 else float('nan'):.3f} ({se(top1):.3f})    "
                      f"{st.mean(tau) if tau else float('nan'):.3f} ({se(tau):.3f}) | {vs}")
     if baselines:
         bl = json.loads(Path(baselines).read_text())

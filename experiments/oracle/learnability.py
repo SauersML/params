@@ -677,7 +677,7 @@ def lookup(train: list[dict], held: list[dict]) -> dict:
             continue
         pb, pf = p_bins(m), p_falls(m)
         out["lookup"].append({"kind": m["kind"], "label": r["label"], "logloss_bits": -math.log2(pb[r["label"]]), "pred": int(np.argmax(pb)),
-                              "falls_logloss_bits": -math.log2(pf if m["falls"] else 1 - pf), "p_bins": pb.tolist()})
+                              "falls_logloss_bits": -math.log2(pf if m["falls"] else 1 - pf), "falls_marginal": True, "p_bins": pb.tolist()})
         sc, mb, mf = models[m["kind"]]
         x = sc.transform([lr_x(m)])
         P = np.zeros(K)
@@ -685,7 +685,7 @@ def lookup(train: list[dict], held: list[dict]) -> dict:
         P = np.clip(P, 1e-6, 1)
         q = float(np.clip(mf.predict_proba(x)[0][1], 1e-4, 1 - 1e-4)) if mf is not None else pf
         out["lookup_lr"].append({"kind": m["kind"], "label": r["label"], "logloss_bits": -math.log2(P[r["label"]]), "pred": int(np.argmax(P)),
-                                 "falls_logloss_bits": -math.log2(q if m["falls"] else 1 - q), "p_bins": P.tolist()})
+                                 "falls_logloss_bits": -math.log2(q if m["falls"] else 1 - q), "falls_marginal": True, "p_bins": P.tolist()})
     return out
 
 

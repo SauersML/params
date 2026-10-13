@@ -197,6 +197,256 @@ def pos_tag():
     print("wrote", OUT / "pos.npy")
 
 
+LEX = OUT / "lex"  # the public lexicons (README in each source): Brysbaert concreteness, Kuperman age of acquisition
+# (norare's Concepticon-linked subset), NRC VAD, Lancaster sensorimotor norms, SUBTLEX-US, WordNet and CMUdict (nltk)
+MORPH = ("Tense", "Number", "Person", "Case", "Degree", "VerbForm", "Mood", "PronType", "Aspect", "Voice")
+LANCASTER = ("Auditory", "Gustatory", "Haptic", "Interoceptive", "Olfactory", "Visual", "Foot_leg", "Hand_arm", "Head", "Mouth", "Torso")
+
+
+def _norms() -> dict:
+    """word (lower case) -> {norm: value} from the lexicons under LEX."""
+    import csv
+
+    out = {}
+
+    def put(w, k, v):
+        try:
+            out.setdefault(w.lower(), {})[k] = float(v)
+        except (TypeError, ValueError):
+            pass
+
+    for r in csv.DictReader(open(LEX / "Concreteness_ratings_Brysbaert_et_al_BRM.txt"), delimiter="\t"):
+        put(r["Word"], "concreteness", r["Conc.M"])
+    for r in csv.DictReader(open(LEX / "kuperman_norare.tsv"), delimiter="\t"):
+        put(r["ENGLISH"], "age of acquisition", r["ENGLISH_AOA_MEAN"])
+    for ln in open(LEX / "NRC-VAD-Lexicon-Aug2018Release/NRC-VAD-Lexicon.txt"):
+        w, v, a_, d = ln.rstrip("\n").split("\t")
+        put(w, "valence", v), put(w, "arousal", a_), put(w, "dominance", d)
+    for r in csv.DictReader(open(LEX / "lancaster.csv")):
+        for k in LANCASTER:
+            put(r["Word"], f"sensorimotor {k.lower().replace('_', ' and ')}", r[f"{k}.mean"])
+    for r in csv.DictReader(open(LEX / "SUBTLEXus74286wordstextversion.txt"), delimiter="\t"):
+        put(r["Word"], "SUBTLEX log frequency", r["Lg10WF"])
+    return out
+
+
+def annotate():
+    """(in spaCy's environment) per token of OUT/tokstr.json, the fields of the word holding it (spaCy en_core_web_sm,
+    WordNet and CMUdict through nltk, the norms) -> OUT/ann.npz: codes [rows, SEQ] per categorical field (with its
+    values), floats [rows, SEQ] (NaN where the word has none) per graded field, and flags."""
+    import spacy
+    import nltk
+
+    nltk.data.path.insert(0, str(LEX / "nltk"))
+    from nltk.corpus import cmudict, wordnet as wn
+
+    cmu = cmudict.dict()
+    norms = _norms()
+    nlp = spacy.load("en_core_web_sm")
+    rows = json.loads((OUT / "tokstr.json").read_text())
+    R = len(rows)
+    cat = {k: np.zeros((R, SEQ), np.int32) for k in ("tag", "dep", "entity", "supersense", "hypernym 2", "hypernym 3", "hypernym 4",
+                                                    "rhyme", "primary stress", *[f"morph {m}" for m in MORPH])}
+    vocab = {k: {"": 0} for k in cat}
+    flag = {k: np.zeros((R, SEQ), bool) for k in ("word-initial piece", "inside a word (not its first piece)", "sentence start",
+                                                  "inside a negation's scope", "in a question", "in a conditional clause",
+                                                  "in a relative clause", "in the subject", "in an object", "named entity start",
+                                                  "paragraph start")}
+    graded_names = ["head distance (words)", "syllables", "antecedent distance (words)", "concreteness", "age of acquisition", "valence",
+                    "arousal", "dominance", *[f"sensorimotor {k.lower().replace('_', ' and ')}" for k in LANCASTER], "SUBTLEX log frequency"]
+    graded = {k: np.full((R, SEQ), np.nan, np.float32) for k in graded_names}
+    POS_WN = {"NOUN": wn.NOUN, "VERB": wn.VERB, "ADJ": wn.ADJ, "ADV": wn.ADV}
+    wn_cache = {}
+
+    def code(k, v):
+        return vocab[k].setdefault(v, len(vocab[k]))
+
+    def wordnet(lemma, upos):
+        key = (lemma, upos)
+        if key not in wn_cache:
+            ss = wn.synsets(lemma, POS_WN[upos]) if upos in POS_WN else []
+            if not ss:
+                wn_cache[key] = None
+            else:
+                path = ss[0].hypernym_paths()[0] if ss[0].hypernym_paths() else [ss[0]]
+                wn_cache[key] = (ss[0].lexname(), *[path[d].name() if len(path) > d else "" for d in (2, 3, 4)])
+        return wn_cache[key]
+
+    for r, doc in enumerate(nlp.pipe(("".join(x) for x in rows), batch_size=32)):
+        owner = np.full(len(doc.text) + 1, -1, dtype=np.int64)
+        for j, t in enumerate(doc):
+            owner[t.idx:t.idx + len(t.text)] = j
+        word = {}  # spaCy token index -> its fields
+        neg, cond, rel, subj, obj = set(), set(), set(), set(), set()
+        for t in doc:
+            if t.dep_ == "neg":
+                neg |= {x.i for x in t.head.subtree if x.i > t.i}
+            if t.dep_ == "mark" and t.lower_ in ("if", "unless", "whether"):
+                cond |= {x.i for x in t.head.subtree}
+            if t.dep_ == "relcl":
+                rel |= {x.i for x in t.subtree}
+            if t.dep_ in ("nsubj", "nsubjpass", "csubj"):
+                subj |= {x.i for x in t.subtree}
+            if t.dep_ in ("dobj", "obj", "pobj", "iobj", "dative"):
+                obj |= {x.i for x in t.subtree}
+        question = set()
+        for sent in doc.sents:
+            if sent.text.rstrip().endswith("?"):
+                question |= {x.i for x in sent}
+        last_noun = -10 ** 9
+        ante = {}
+        for t in doc:
+            if t.pos_ == "PRON" and "Prs" in t.morph.get("PronType") and t.i - last_noun <= 50:
+                ante[t.i] = t.i - last_noun
+            if t.pos_ in ("NOUN", "PROPN"):
+                last_noun = t.i
+        c = 0
+        for t, piece in enumerate(rows[r]):
+            k = next((c + i for i, ch in enumerate(piece) if not ch.isspace()), None)
+            if (t == 0 or "\n\n" in rows[r][t - 1] or (piece.startswith("\n\n"))) and k is not None:
+                flag["paragraph start"][r, t] = True
+            if k is not None and owner[k] >= 0:
+                j = int(owner[k])
+                w = doc[j]
+                first = k == w.idx
+                flag["word-initial piece"][r, t] = first
+                flag["inside a word (not its first piece)"][r, t] = not first
+                flag["sentence start"][r, t] = first and bool(w.is_sent_start)
+                flag["inside a negation's scope"][r, t] = j in neg
+                flag["in a question"][r, t] = j in question
+                flag["in a conditional clause"][r, t] = j in cond
+                flag["in a relative clause"][r, t] = j in rel
+                flag["in the subject"][r, t] = j in subj
+                flag["in an object"][r, t] = j in obj
+                flag["named entity start"][r, t] = first and w.ent_iob_ == "B"
+                cat["tag"][r, t] = code("tag", w.tag_)
+                cat["dep"][r, t] = code("dep", w.dep_)
+                cat["entity"][r, t] = code("entity", w.ent_type_)
+                for m in MORPH:
+                    v = w.morph.get(m)
+                    cat[f"morph {m}"][r, t] = code(f"morph {m}", v[0] if v else "")
+                graded["head distance (words)"][r, t] = abs(w.head.i - w.i)
+                if j in ante:
+                    graded["antecedent distance (words)"][r, t] = ante[j]
+                wnr = wordnet(w.lemma_.lower(), w.pos_)
+                if wnr:
+                    for kk, v in zip(("supersense", "hypernym 2", "hypernym 3", "hypernym 4"), wnr):
+                        cat[kk][r, t] = code(kk, v)
+                pr = cmu.get(w.lower_)
+                if pr:
+                    ph = pr[0]
+                    vow = [i for i, p_ in enumerate(ph) if p_[-1].isdigit()]
+                    graded["syllables"][r, t] = len(vow)
+                    prim = [i for i in vow if ph[i].endswith("1")]
+                    if prim:
+                        cat["primary stress"][r, t] = code("primary stress", f"syllable {min(vow.index(prim[0]) + 1, 3)}" + ("+" if vow.index(prim[0]) >= 2 else ""))
+                        cat["rhyme"][r, t] = code("rhyme", " ".join(p_.rstrip("012") for p_ in ph[prim[-1]:]))
+                nv = norms.get(w.lower_) or norms.get(w.lemma_.lower()) or {}
+                for kk, v in nv.items():
+                    graded[kk][r, t] = v
+            c += len(piece)
+        if r % 200 == 0:
+            print("annotate rows", r, flush=True)
+    np.savez(OUT / "ann.npz", **{f"cat:{k}": v for k, v in cat.items()}, **{f"flag:{k}": v for k, v in flag.items()},
+             **{f"graded:{k}": v for k, v in graded.items()}, vocab=json.dumps(vocab))
+    print("wrote", OUT / "ann.npz", {k: len(v) for k, v in vocab.items()})
+
+
+INFINIGRAM = "https://api.infini-gram.io/"
+INDEX = "v4_piletrain_llama"  # infini-gram's index of the Pile's train split (its own Llama tokenizer; queries are text)
+NGRAM_SAMPLE, NGRAM_N, WORKERS = 50000, 4, 6
+
+
+def _ig(payload: dict, tries: int = 4) -> dict:
+    import time
+    import urllib.request
+
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(INFINIGRAM, data=json.dumps({"index": INDEX, **payload}).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as f:
+                return json.loads(f.read())
+        except Exception as e:  # noqa: BLE001 (the public API's transient errors: retried, then recorded)
+            err = repr(e)
+            time.sleep(2 * (i + 1))
+    return {"error": err}
+
+
+def _pool(jobs: list, fn, path: Path):
+    """fn over jobs on WORKERS threads, each result a JSONL line in path (jobs already there are skipped)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    done = {json.loads(x)["key"] for x in path.read_text().splitlines()} if path.exists() else set()
+    todo = [j for j in jobs if j["key"] not in done]
+    print(f"{len(todo)} queries ({len(done)} done)", flush=True)
+    with path.open("a") as fh, ThreadPoolExecutor(WORKERS) as ex:
+        for i, res in enumerate(ex.map(fn, todo)):
+            fh.write(json.dumps(res) + "\n")
+            if i % 500 == 0:
+                fh.flush()
+                print(f"  {i}/{len(todo)}", flush=True)
+
+
+def domain():
+    """Each document segment of the rows (split at <|endoftext|>) -> its Pile subset (infini-gram's search_docs on 12
+    tokens from the segment's middle, else from its quarters; the document's metadata pile_set_name) -> OUT/domain.jsonl."""
+    ids = np.concatenate([np.load(p)["ids"][:, :SEQ] for p in _geno()])
+    jobs = []
+    for r in range(len(ids)):
+        cuts = [0] + [int(t) + 1 for t in np.flatnonzero(ids[r] == EOS)] + [SEQ]
+        for a_, b_ in zip(cuts[:-1], cuts[1:]):
+            if b_ - a_ >= 8:
+                spans = []
+                for m in ((a_ + b_) // 2, a_ + (b_ - a_) // 4, a_ + 3 * (b_ - a_) // 4):  # the middle first, then quarters
+                    lo, hi = max(a_, m - 6), min(b_, m + 6)
+                    spans.append("".join(_decode(i) for i in ids[r, lo:hi]).strip())
+                jobs.append({"key": f"{r}:{a_}", "row": r, "start": a_, "end": b_, "spans": spans})
+
+    def one(j):
+        name, cnt = None, 0
+        for text in j["spans"]:
+            res = _ig({"query_type": "search_docs", "query": text, "maxnum": 1, "max_disp_len": 1})
+            try:
+                name = json.loads(res["documents"][0]["metadata"])["metadata"]["meta"]["pile_set_name"]
+                cnt = res.get("cnt")
+                break
+            except Exception:  # noqa: BLE001 (no document: the span meets the two tokenizers' whitespace differently)
+                continue
+        return {"key": j["key"], "row": j["row"], "start": j["start"], "end": j["end"], "subset": name, "count": cnt}
+
+    _pool(jobs, one, OUT / "domain.jsonl")
+
+
+def ngram():
+    """NGRAM_SAMPLE random tokens (position >= NGRAM_N): the Pile count of the NGRAM_N tokens ending at the token (the
+    context the model has just read) and the Pile's most frequent next token after them against the model's top token
+    (infini-gram count and ntd) -> OUT/ngram.jsonl."""
+    gs = [np.load(p) for p in _geno()]
+    ids = np.concatenate([g["ids"][:, :SEQ] for g in gs])
+    top1 = np.concatenate([g["top1"] for g in gs])
+    rng = np.random.default_rng(2951)
+    flat = rng.choice(len(ids) * (SEQ - NGRAM_N), NGRAM_SAMPLE, replace=False)
+    jobs = []
+    for f in flat:
+        r, t = int(f // (SEQ - NGRAM_N)), int(f % (SEQ - NGRAM_N)) + NGRAM_N
+        ctx = ids[r, t - NGRAM_N + 1:t + 1]
+        if (ctx == EOS).any():
+            continue
+        jobs.append({"key": f"{r}:{t}", "row": r, "t": t, "text": "".join(_decode(i) for i in ctx), "top": _decode(int(top1[r, t]))})
+
+    def one(j):
+        c = _ig({"query_type": "count", "query": j["text"]})
+        n = _ig({"query_type": "ntd", "query": j["text"]}) if c.get("count") else {}
+        best = None
+        if n.get("result_by_token_id"):
+            best = max(n["result_by_token_id"].values(), key=lambda v: v["cont_cnt"])["token"]
+        return {"key": j["key"], "row": j["row"], "t": j["t"], "count": c.get("count"), "prompt_cnt": n.get("prompt_cnt"),
+                "pile_top": best, "model_top": j["top"],
+                "same": None if best is None else best.replace("▁", " ").replace("<0x0A>", "\n").strip() == j["top"].strip() and bool(j["top"].strip())}
+
+    _pool(jobs, one, OUT / "ngram.jsonl")
+
+
 def _klass(s_: str) -> str:
     """A token's class by its text: newline, space, punctuation, digit, word start (capitalized or lowercase), word
     continuation, other."""
@@ -460,6 +710,110 @@ def conditional(top: int = 100, steps: int = 30):
         print(f"{name}: {len(hits)} hits, {len(chosen)} independent among the top {len(cand)}", flush=True)
     (OUT / "conditional.json").write_text(json.dumps({"z_threshold": zstar, "phenotypes": out}, indent=1))
     print("wrote", OUT / "conditional.json")
+
+
+MECH_SAMPLE, DEP_BACK = 6000, 32  # tokens whose mechanism is measured; positions back the dependency count tries
+
+
+def export():
+    """The corpus rows and the replication rows as arrays (OUT/corpus.npy, OUT/replicate.npy) for pods without the shard."""
+    np.save(OUT / "corpus.npy", np.concatenate([np.load(p)["ids"] for p in _geno()]).astype(np.int32))
+    np.save(OUT / "replicate.npy", corpus(*REPLICATE).astype(np.int32))
+    print("wrote", OUT / "corpus.npy", OUT / "replicate.npy")
+
+
+def mech(k: int = 0, P: int = 1):
+    """The measured mechanism at MECH_SAMPLE random tokens (position >= 24), mechdisc's interventions on the window of
+    the last 96 tokens, y the model's top token there: copy (the current token occurred earlier, y follows its latest
+    occurrence, and replacing that token takes y off the top), far context (no copy reading; one position 8+ back whose
+    replacement takes y off), local bigram (neither; replacing the current token takes y off while random context
+    replacements leave it), or none confirmed; and the dependency count, how many of the last DEP_BACK positions
+    lower log p(y) by at least 1 nat when replaced by the model's likeliest other token there.
+    -> GEN_OUT/mech_K.jsonl"""
+    import mechdisc as md
+    import native
+
+    nat = native.Native()
+    ids = np.load(OUT / "corpus.npy")[:, :SEQ]
+    rng = np.random.default_rng(2951)
+    flat = rng.choice(len(ids) * (SEQ - 24), MECH_SAMPLE, replace=False)
+    out = Path(os.environ.get("GEN_OUT", OUT)) / f"mech_{k}.jsonl"
+    done = {json.loads(x)["key"] for x in out.read_text().splitlines()} if out.exists() else set()
+    for f in flat[k::P]:
+        r, t = int(f // (SEQ - 24)), int(f % (SEQ - 24)) + 24
+        key = f"{r}:{t}"
+        if key in done:
+            continue
+        s0 = max(0, t - md.W + 1)
+        x = [int(v) for v in ids[r, s0:t + 1]]
+        tt = len(x) - 1
+        lpx = nat.reference([x], [tt])[0, 0]
+        y = int(lpx.argmax())
+        g = np.random.default_rng(int(f))
+        res = {"key": key, "row": r, "t": t, "y": y, "p_y": float(lpx[y].exp()), "mechanism": "none confirmed"}
+        occ = [j for j in range(tt) if x[j] == x[tt]]
+        if occ and occ[-1] + 1 < tt and x[occ[-1] + 1] == y:
+            a_ = occ[-1] + 1
+            off, drop = md._effect(nat, x, tt, y, [[(a_, z)] for z in md._alts(nat, x, a_, md.DRAWS, g)])
+            if off >= 0.5 and drop >= md.DROP:
+                res["mechanism"] = "copy"
+        elif not occ and y not in x[:tt]:
+            if tt > md.FAR + 1:
+                far = [int(p_) for p_ in g.choice(np.arange(1, tt - md.FAR + 1), size=min(16, tt - md.FAR), replace=False)]
+                _, drops = md._each(nat, x, tt, y, [[(p_, md._alts(nat, x, p_, 2, g)[0])] for p_ in far])
+                m = far[int(np.argmax(drops))]
+                off, drop = md._effect(nat, x, tt, y, [[(m, z)] for z in md._alts(nat, x, m, md.DRAWS, g)])
+                if off >= 0.5 and drop >= md.DROP:
+                    res["mechanism"] = "far context"
+            if res["mechanism"] == "none confirmed":
+                off_t, _ = md._effect(nat, x, tt, y, [[(tt, z)] for z in md._alts(nat, x, tt, md.DRAWS, g)])
+                ctx = [int(p_) for p_ in g.choice(np.arange(1, tt), size=min(md.DRAWS, tt - 1), replace=False)]
+                off_c, drop_c = md._effect(nat, x, tt, y, [[(p_, md._alts(nat, x, p_, 2, g)[0])] for p_ in ctx])
+                if off_t >= 0.5 and drop_c < md.QUIET and off_c == 0.0:
+                    res["mechanism"] = "local bigram"
+        back = list(range(max(0, tt - DEP_BACK + 1), tt + 1))
+        _, drops = md._each(nat, x, tt, y, [[(p_, md._alts(nat, x, p_, 2, g)[0])] for p_ in back])
+        res["dependencies"] = int((drops >= 1.0).sum())
+        res["depends_back"] = [int(tt - p_) for p_, d_ in zip(back, drops) if d_ >= 1.0]
+        with out.open("a") as fh:
+            fh.write(json.dumps(res) + "\n")
+    print("mech done", k, flush=True)
+
+
+def attention():
+    """Per token and layer, the attention (mean over heads) on the row's first token, on the previous token and on
+    tokens 8 or more back -> OUT/attention.npy [rows, SEQ, layers, 3]."""
+    import torch
+
+    import native
+
+    nat = native.Native()
+    ids = np.load(OUT / "corpus.npy")[:, :SEQ]
+    L = len({n.split(".")[1] for n in nat.names})
+    out = np.zeros((len(ids), SEQ, L, 3), np.float16)
+    T = torch.arange(SEQ, device=nat.dev)
+    far = (T[None, :] <= T[:, None] - 8).float()
+    for i in range(0, len(ids), 8):
+        x = torch.tensor(ids[i:i + 8], device=nat.dev, dtype=torch.long)
+        with torch.no_grad():
+            nat.vpd.clear()
+            for l_ in range(L):
+                for kd in ("q_proj", "k_proj"):
+                    nat.target.site(native.site_name(l_, kd)).cache_output = True
+            nat.target(x)
+            for l_ in range(L):
+                pat = nat.target.attention_pattern(nat.target.site(native.site_name(l_, "q_proj")).last_output,
+                                                   nat.target.site(native.site_name(l_, "k_proj")).last_output).float().mean(1)  # [B, T, T]
+                first = pat[:, :, 0]
+                prev = torch.cat([torch.zeros_like(pat[:, :1, 0]), pat[:, 1:, :].diagonal(offset=-1, dim1=1, dim2=2)], 1)
+                fb = (pat * far).sum(-1)
+                out[i:i + 8, :, l_] = torch.stack([first, prev, fb], -1).cpu().numpy()
+            for l_ in range(L):
+                for kd in ("q_proj", "k_proj"):
+                    nat.target.site(native.site_name(l_, kd)).cache_output = False
+            nat.vpd.clear()
+    np.save(OUT / "attention.npy", out)
+    print("wrote", OUT / "attention.npy")
 
 
 REPLICATE = (ROWS, 200)  # the causal follow-up's rows: the next 200 of the shard, none of them in the scan
@@ -726,10 +1080,11 @@ def _edit_test(run, rows: np.ndarray, name: str, kind: str, c: int, rng) -> dict
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "pheno", "assoc", "conditional", "causal"))
+    ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "annotate", "domain", "ngram", "export", "mech", "attention", "pheno", "assoc",
+                                    "conditional", "causal"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
-    if a.cmd == "extract":
-        extract(*(int(x) for x in a.args))
+    if a.cmd in ("extract", "mech"):
+        globals()[a.cmd](*(int(x) for x in a.args))
     else:
         globals()[a.cmd]()

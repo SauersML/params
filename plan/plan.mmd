@@ -799,3 +799,9 @@ flowchart BT
   class CAPENG check
 
   class AFFINEENGLISH check
+  INPUTRMS["<b>Expose normalization dependencies</b><br/>Linear link lists hide causal paths;<br/>opt-in RMS rule keeps numerical facts.<br/>Test counterexamples and prompt fit;<br/>then use identical inputs in both arms<br/>ACTIVE · codex · 18669b1"]
+  MDL -. input gap .-> INPUTRMS
+  INPUTRMS -. matched toy inputs .-> SUP
+  MDL -. finite-panel training rows .-> SUP
+  class INPUTRMS active
+  %% A circuit fitted to disclosed inputs need not cover every other input. Transfer diagnostics do not block valid finite-panel supervision.

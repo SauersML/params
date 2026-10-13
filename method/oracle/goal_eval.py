@@ -2764,7 +2764,8 @@ class GoalEval:
                 by = {}
                 for nd in nodes:
                     by.setdefault(nd[0], []).append(nd)
-                return {nd: got[n].view(len(drops), len(nds))[:, j].tolist() for n, nds in by.items() for j, nd in enumerate(nds)}
+                cols = {n: got[n].view(len(drops), len(nds)).T.cpu().tolist() for n, nds in by.items()}  # one transfer per site
+                return {nd: cols[n][j] for n, nds in by.items() for j, nd in enumerate(nds)}
 
             def run(f, *a, **k):  # (log q, reads or None)
                 got = f(*a, **k)
@@ -2781,8 +2782,9 @@ class GoalEval:
                 lc, rc = run(Ec.graph_log_probs, Ec.plan([_drop_nodes(g, set(d)) for d in drops], semantics="c"), reads=spec(at))
             pairs = {}  # the reads of the nodes each draw keeps, in the model and the circuit
             for b, d in enumerate(drops if reads else []):
+                ds = set(d)  # once per draw: a set per node made this quadratic (a block circuit's 46k nodes: hours)
                 for nd in nodes:
-                    if nd not in set(d):
+                    if nd not in ds:
                         pairs.setdefault(nd, []).append((rm[nd][b], rc[nd][b]))
             kc_, kv_ = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
             w_, claim = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()

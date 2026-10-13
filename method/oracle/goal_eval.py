@@ -76,6 +76,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -121,7 +122,7 @@ CHANGED_DRAWS = 32  # C's changed texts per circuit (32, the lead's 10-12: at 16
 INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
 # offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
-SEMANTICS = ("c", "x")  # GoalEval(semantics=): "x" runs every circuit and VPD's answer in C's families (point, nodes,
+SEMANTICS = ("c", "x")  # GoalEval(semantics=, default the SEMANTICS environment variable, else "c"): "x" runs every circuit and VPD's answer in C's families (point, nodes,
 # edges, flips, omitted, pattern, the bounds) with the query and key subcomponents outside the circuit at their
 # activations on the text and every RMSNorm, the final one included, at the model's scale on it (the lead's 10-13:
 # s_nodes 0.56 -> 0.93 on the dev starts, the pruned teachers' shortfall 0.068 -> 0.015); the real model's runs keep
@@ -1142,7 +1143,8 @@ class GoalEval:
 
     def __init__(self, nat: native.Native | None = None, *, changes: int = native.CHANGES, ranks=HELD_OUT_RANKS,
                  share_floor: float = SHARE_FLOOR, random_pairs: int = RANDOM_PAIRS, max_edges: int = MAX_EDGES, chunk: int = CHUNK,
-                 cut_chunk: int = CUT_CHUNK, semantics: str = "c"):
+                 cut_chunk: int = CUT_CHUNK, semantics: str | None = None):
+        semantics = semantics or os.environ.get("SEMANTICS") or "c"  # the knob (the lead's 10-13): scorer pods SEMANTICS=x
         if semantics not in SEMANTICS:
             raise ValueError(f"semantics is one of {SEMANTICS}")
         self.nat = nat or native.Native()

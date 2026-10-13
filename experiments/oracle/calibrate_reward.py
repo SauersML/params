@@ -52,15 +52,15 @@ def prepare(a):
             assert raw['finish'] in ('stop', 'length'), (t, raw['finish'])
             answer_tokens = raw['tokens'] - (raw.get('thinking_tokens') or 0)
             assert answer_tokens >= 0
-            text, truncated = canonical[t][0]
-            assert text == raw['text']
+            text, tokens = canonical[t][0]
+            assert text == raw['text'] and tokens == answer_tokens
             assert not text.lstrip().startswith('<think>'), 'Expected renderer-extracted answer text'
-            sets[name][t] = [(text, truncated or answer_tokens > ANSWER_CAP)]
+            sets[name][t] = [(text, answer_tokens)]  # reward's overflow charge past the cap (primerl's e5c4232)
             sample_metadata[name][t] = {'sample': raw.get('sample', 0), 'finish': raw['finish'],
                 'tokens': raw['tokens'], 'thinking_tokens': raw.get('thinking_tokens') or 0,
                 'answer_tokens': answer_tokens, 'answer_cap': ANSWER_CAP,
-                'truncated': sets[name][t][0][1]}
-    sets['teacher'] = {t: [((base / 'sft_v1full-q8/teacher_txt' / (t + '.txt')).read_text(), False)] for t in TASKS}
+                'over_cap': answer_tokens > ANSWER_CAP}
+    sets['teacher'] = {t: [((base / 'sft_v1full-q8/teacher_txt' / (t + '.txt')).read_text(), None)] for t in TASKS}
     comparisons = {}
     rows = {}
     for t in TASKS:
@@ -110,7 +110,7 @@ def worker(a):
     for task in tasks:
         started = time.monotonic()
         current = {task: data['rows'][task]}
-        sets = {name: {task: [(text, cut) for text, cut in samples[task]]} for name, samples in data['sets'].items()}
+        sets = {name: {task: [(text, tokens) for text, tokens in samples[task]]} for name, samples in data['sets'].items()}
         # n=2 + one-row dict makes each completed text a durable independent output.
         result = components.evaluate(ge, 'heldout', current, sets, 2, checkpoint=a.out/(task+'.checkpoint.jsonl'))
         save(a.out/(task+'.json'), result)

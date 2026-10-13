@@ -132,6 +132,31 @@ def test_weighted_score_is_the_raw_pool():
     assert goal_eval.shortfall(row, fl) == 0.0 and goal_eval.shortfall_soft(row, fl) < 0.002
 
 
+def test_the_start_scores_its_hard_term():
+    """The start set's soft circuit term equals its hard one at v = 0 within 0.01 (pymove's 2fdd1cf report: floors from
+    the floored estimators against a shortfall from the raw ones put the start near -0.5): its weighted family's raw
+    pool below its floored one, its floors and both shortfalls on the same score."""
+    eps = {f"eps_{f}": goal_eval.EPS_FLOOR for f in goal_eval.PHI_FAMILIES}
+    start = {"s_point_c": 0.8, "s_edges": 0.75, "s_nodes": 0.57, "s_nodes_raw": 0.30, "s_track_pp": 0.85, "s_track_pp_raw": 0.7,
+             "n_spec": 0.6, "rl_terms": {"s_point_c": 0.8, "s_edges": 0.75}, **eps}
+    fams = ["point", "edges", "nodes", "track_pp", "N"]
+    _, bar = goal_eval.phi(start, start=start, families=fams)
+    tau = {"families": fams, "phi_tau": bar, "floors": goal_eval.floors(start, fams), "bits_start": 300.0}
+    ct = goal_eval.circuit_term(start, tau, 300.0)
+    assert ct["v"] == 0.0 and abs(ct["term"]) < 0.01, ct
+
+
+def test_semantics_knob_from_the_environment(monkeypatch):
+    """GoalEval's semantics default: the SEMANTICS environment variable (scorer pods), else "c"."""
+    from test_goal_eval import tiny_native
+
+    nat = tiny_native()
+    monkeypatch.delenv("SEMANTICS", raising=False)
+    assert goal_eval.GoalEval(nat).semantics == "c"
+    monkeypatch.setenv("SEMANTICS", "x")
+    assert goal_eval.GoalEval(nat).semantics == "x" and goal_eval.GoalEval(nat, semantics="c").semantics == "c"
+
+
 def test_soft_pieces_are_smooth():
     """cap_phi: slope 1 well below the bar + PHI_CAP, PHI_SLOPE well above, its slope continuous between; the soft
     shortfall grows smoothly through a floor; the leaky floor is continuous at 0."""

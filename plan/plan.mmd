@@ -1,4 +1,11 @@
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
+%% 2026-10-13 English reader pilot finished:512 first Kimi responses,$0.272940696,zero unresolved calls.
+%% None/generated/shuffled/GT each0/12 changed-token answers correct; GT detects8/12 changes but11/96 inactive false changes.
+%% Positive-control SETUP is incomplete: frozen GT prose omits the residual fallback, not evidence reader cannot reason.
+%% Saved-world audit: active deletion16/16 predicts last input token; halfscale64/64 and inactive96/96 retain original top.
+%% Source supports fallback via identity embeddings, residual addition and tied readout; post-hoc128/128 rule is development-informed.
+%% Next independent open writer receives frozen generator source/params, no edited labels, to supply complete control prose.
+%% Preserve first pilot; no reward based on this uncalibrated reader and no global block on wiring/grounding work.
 %% 2026-10-13 controlled wiring pilot: a497153, GHA38397963195 six checks plus frozen-data preflight pass.
 %% Four fresh Qwen3-8B adapters clone one saved seed0 initialization and optimizer: K-control/V-support x loss1/8.
 %% Each gets original226 plus30 checked examples,64 updates; all24 first greedy answers retained, primary relation8.
@@ -476,7 +483,7 @@ flowchart BT
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
   CAPABLE["<b>Recover executable wiring in training</b><br/>4 matched runs: loss balance × V examples;<br/>same initialization,64 updates each;<br/>judge wiring and weight-edit fidelity<br/>LAUNCH AUTHORIZED · codex/fork_review · ≤$1.20"]
   CAPCF["<b>Base circuits predict weight edits</b><br/>4 toys, 448 affected input/edit pairs;<br/>base 448/448 tops, worst KL0.00015 bits;<br/>SFT 252/448; preserve this causal ability<br/>MEASURED · codex/eval_recovery"]
-  CAPENG["<b>Does the English predict edits?</b><br/>Generated, absent, shuffled, correct prose;<br/>independent reader on changed outputs;<br/>correct-prose control checks reader ability<br/>PREFLIGHT PASSED · codex/eval_recovery · ≤$0.68"]
+  CAPENG["<b>English control omits a causal path</b><br/>All conditions miss12 changed tokens;<br/>correct prose omits the residual fallback;<br/>test complete control before grading English<br/>DIAGNOSED · codex/eval_recovery · $0.273"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]

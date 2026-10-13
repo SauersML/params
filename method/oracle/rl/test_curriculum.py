@@ -1,5 +1,6 @@
 """The RL curriculum (tinker_train.STAGES): each stage's reward and line credits, and the advance on a held-out plateau."""
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -67,9 +68,12 @@ def test_environments_load_mix_by_weight_and_scale_by_their_own_spread(tmp_path)
                                                               "extra": {"part": "score"}, "weight": 1.0}}))
     a = SimpleNamespace(questions=tmp_path / "c.jsonl", scorer="http://x:8767/score", request_extra=None, env_name="circuit",
                         env_weight=3.0, expect_semantics="n", expect_source="d210d58", envs=str(tmp_path / "envs.json"),
-                        reward_clip_low=None)
+                        reward_floor=None, reward_floor_width=1.0)
     envs = tt.load_envs(a)
-    assert envs["circuit"]["clip_low"] is None and envs["edits"]["clip_low"] is None
+    assert envs["circuit"]["floor"] is None and envs["edits"]["floor"] is None and envs["edits"]["floor_width"] == 1.0
+    assert tt.floored(5.0, -1.0) == pytest.approx(5.0, abs=0.01) and tt.floored(-13.0, -1.0) == pytest.approx(-1.0, abs=1e-4)
+    assert tt.floored(-1.0, -1.0) == pytest.approx(-1.0 + math.log(2))  # smooth at the floor
+    assert tt.floored(-2.0, -1.0) < tt.floored(-1.9, -1.0)  # a gradient below it
     assert envs["edits"]["questions"][0]["task"] == "pref:0" and envs["edits"]["extra"] == {"part": "score"}
     assert envs["edits"]["expect_semantics"] is None and envs["circuit"]["expect_semantics"] == "n"
     got = tt.draw(envs, 4, random.Random(0))

@@ -26,6 +26,7 @@
 #     TEACHER_ARGS="..." zsh experiments/oracle/final_eval.sh
 set -e
 [ "${FINAL:-}" = "the recipe is frozen" ] || { echo "final_eval.sh: the sealed texts run once, after the recipe is frozen (FINAL)" >&2; exit 2; }
+export FINAL_EVAL=1   # rp-run's guard keeps the sealed texts off every pod except this run's
 : ${POLICY:?the oracle checkpoint (tinker://)} ${SRCREV:?the frozen source revision}
 F=/Users/user/mpd-data/graph_oracle/sealed
 [ ! -e $F/STAMP ] || { echo "final_eval.sh: already run ($(cat $F/STAMP))" >&2; exit 2; }

@@ -26,6 +26,8 @@ h.1.mlp.c_fc #2103 and h.2.attn.k_proj #206; at o, h.1.attn.k_proj #329 and #119
                               fv --phi-check --rank once --accept changed,floors, semantics n) -> OUT/mechdisc_teacher/
   mechdisc.py score [--answers JSONL]   per item and pair whether the circuits hold each mechanism, bootstrap intervals
 """
+from __future__ import annotations
+
 import argparse
 import collections
 import json
@@ -34,7 +36,10 @@ import re
 import sys
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # pairs() runs on the standard library alone (a Mac whose memory ledger is full)
+    np = None
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -158,11 +163,13 @@ def find(k: int = 0, P: int = 1):
 
 def pairs():
     """Confirmed items paired by y within each contrast (copy-bigram, context-bigram); task files for every paired
-    item."""
-    import templates
+    item. Standard library only."""
+    import random
 
     found = []
-    for p in [DATA / "mechdisc_found_0.jsonl"] + templates.run_outputs("mechdisc_found_*.jsonl"):
+    roots = [Path("/Users/user/mpd-data/runpod"), Path("/Users/user/mpd-data/cluster")]
+    runs = sorted(p for r in roots if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_found_*.jsonl"))
+    for p in [DATA / "mechdisc_found_0.jsonl"] + runs:
         if p.exists():
             found += [json.loads(x) for x in p.read_text().splitlines() if '"done"' not in x]
     seen, items = set(), []
@@ -171,7 +178,7 @@ def pairs():
         if r.get("confirmed") and key not in seen:
             seen.add(key)
             items.append(r)
-    rng = np.random.default_rng(2951)
+    rng = random.Random(2951)
     per_text = collections.Counter()
     used = set()
     out = []

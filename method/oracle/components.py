@@ -160,6 +160,8 @@ ATTENTION_TOP = 3  # positions listed per attention head at the target (measured
 POOL_HEADS = 0  # candidate_pool(): positions beyond the listed ones, each attention head's top POOL_HEADS at the target
 # (8 heads' top 8: +1% of held-out teacher nodes for 4x the question, 46k tokens)
 CONTEXT = 32768  # Qwen3-8B's native context, the question and the generation together
+ANSWER_TOKENS = 8000  # the answer cap after the thinking (tinker_train.ANSWER_CAP): over it an answer is invalid, in RL and
+# in every evaluation alike (samples_of: a sample's "tokens" past it counts as cut)
 ROOM = 10240  # fit_pool(): the generation a question leaves at least (an answer of tinker_train.ANSWER_CAP, 8,000 tokens, and some thinking)
 WINDOW = 8  # a question numbers the tokens within this many positions of every position its evidence names
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
@@ -2692,8 +2694,9 @@ def structure(ge, tx, g, order: list, convention: str = CONVENTION) -> dict:
 
 def samples_of(spec: Path) -> dict:
     """task -> [answer text, ...], first sample first, of an answer set: a sampler's JSONL ({"task", "sample", "text",
-    "finish"}; a sample cut at the cap carries finish "length") or a directory of <task>.txt and <task>.<k>.txt. Each
-    text comes with whether it was cut: [(text, truncated), ...]."""
+    "finish", "tokens"}; a sample cut at the cap carries finish "length", and one whose answer after its thinking runs
+    past ANSWER_TOKENS counts as cut too) or a directory of <task>.txt and <task>.<k>.txt. Each text comes with whether
+    it was cut: [(text, truncated), ...]."""
     out = {}
     if spec.is_dir():
         for f in sorted(spec.iterdir()):
@@ -2702,7 +2705,8 @@ def samples_of(spec: Path) -> dict:
                 out.setdefault(m[1], []).append((int(m[2] or 0), f.read_text(), False))
     else:
         for r in map(json.loads, spec.read_text().splitlines()):
-            out.setdefault(r["task"], []).append((int(r.get("sample", 0)), r["text"], r.get("finish") == "length"))
+            cut = r.get("finish") == "length" or (r.get("tokens") or 0) - (r.get("thinking_tokens") or 0) > ANSWER_TOKENS
+            out.setdefault(r["task"], []).append((int(r.get("sample", 0)), r["text"], cut))
     return {t: [(x, cut) for _, x, cut in sorted(v, key=lambda e: e[0])] for t, v in out.items()}
 
 

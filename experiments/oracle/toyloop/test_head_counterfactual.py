@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from head_counterfactual import scaled_head
+from head_counterfactual import digest, kl_bits, raw_kl_bits, save_distributions, scaled_head
 
 
 def tiny_native():
@@ -64,3 +64,58 @@ def test_nonfinite_scale_and_outside_head_rejected_before_mutation():
         with scaled_head(nat, 0, 2, 0.0):
             pass
     assert torch.equal(site.W, before)
+
+
+def test_reference_cache_rebuilt_and_positive_sparse_route_changes():
+    nat, site = tiny_native()
+    x = torch.tensor([[1., 2., 3., 4.]], dtype=torch.float64)
+
+    def reference():
+        if 'x' not in nat._refs:
+            nat._refs['x'] = x @ site.W.T
+        return nat._refs['x']
+
+    nat._refs.clear()
+    original = reference().clone()
+    route = (x @ site.V[:, 1:2]) @ site.U[1:2]
+    with scaled_head(nat, 0, 1, 0.5):
+        edited = reference()
+        assert not torch.equal(edited, original)
+        assert torch.equal(edited, x @ site.W.T)
+        edited_route = (x @ site.V[:, 1:2]) @ site.U[1:2]
+        assert not torch.equal(route, edited_route)
+        assert float(edited_route.norm()) < float(route.norm())
+    assert torch.equal(reference(), original)
+
+
+@pytest.mark.parametrize('bad', [float('nan'), float('inf')])
+def test_nonfinite_logprob_cannot_pass_kl_integrity(bad):
+    p = torch.log_softmax(torch.tensor([[1., 2.]]), -1)
+    q = p.clone()
+    q[0, 0] = bad
+    with pytest.raises(ValueError, match='finite'):
+        kl_bits(p, q)
+
+
+def test_kl_shape_normalization_and_signed_roundoff_contract():
+    p = torch.log_softmax(torch.tensor([[1., 2.]], dtype=torch.float64), -1)
+    with pytest.raises(ValueError, match='shapes'):
+        raw_kl_bits(p, p[:, :1])
+    with pytest.raises(ValueError, match='normalized'):
+        raw_kl_bits(p, p + 0.1)
+    q = p + 1e-9
+    assert raw_kl_bits(p, q) < 0
+    assert kl_bits(p, q) == 0
+
+
+def test_raw_distribution_archive_roundtrips_and_binds_hash(tmp_path):
+    import json
+    from safetensors.torch import load_file
+
+    tensors = {'p0': torch.log_softmax(torch.tensor([[1., 2.]]), -1),
+               'qe_base': torch.log_softmax(torch.tensor([[3., 1.]]), -1)}
+    binding = save_distributions(tmp_path, 'draw.safetensors', tensors)
+    saved = load_file(str(tmp_path / binding['file']))
+    assert all(torch.equal(saved[name], value) for name, value in tensors.items())
+    assert binding['sha256'] == digest(tmp_path / 'draw.safetensors')
+    assert json.loads((tmp_path / 'distribution_manifest.jsonl').read_text()) == binding

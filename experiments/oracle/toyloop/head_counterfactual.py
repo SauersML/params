@@ -73,9 +73,25 @@ def scaled_head(nat, layer, head, scale):
         assert torch.equal(nat.units[name], units)
 
 
+def raw_kl_bits(p, q):
+    """Signed FP64 accumulation, after validating finite normalized distributions."""
+    import torch
+    if p.shape != q.shape or not p.numel():
+        raise ValueError('KL requires equal nonempty shapes')
+    if not bool(torch.isfinite(p).all()) or not bool(torch.isfinite(q).all()):
+        raise ValueError('KL requires finite log probabilities')
+    for value in (p, q):
+        if float(value.double().logsumexp(-1).abs().max()) > 1e-5:
+            raise ValueError('KL requires normalized log probabilities')
+    raw = float((p.double().exp() * (p.double() - q.double())).sum()) / math.log(2)
+    if not math.isfinite(raw) or raw < -1e-6:
+        raise ValueError('invalid signed KL')
+    return raw
+
+
 def kl_bits(p, q):
-    # FP32 forwards; double precision accumulation avoids negative roundoff KL.
-    return max(0.0, float((p.double().exp() * (p.double() - q.double())).sum()) / math.log(2))
+    # Only a validated tiny negative roundoff is floored in diagnostic columns.
+    return max(0.0, raw_kl_bits(p, q))
 
 
 def tensor_hash(tensor):
@@ -88,6 +104,15 @@ def append(path, value):
         stream.write(json.dumps(value) + '\n')
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def save_distributions(out, name, tensors):
+    from safetensors.torch import save_file
+    path = out / name
+    save_file({key: value.detach().cpu().contiguous() for key, value in tensors.items()}, str(path))
+    binding = {'file': name, 'sha256': digest(path), 'keys': sorted(tensors)}
+    append(out / 'distribution_manifest.jsonl', binding)
+    return binding
 
 
 def run(source, inputs, trial, out):
@@ -156,11 +181,15 @@ def run(source, inputs, trial, out):
             p0 = nat.reference([ids], targets).clone()
             norms = {}
             integrity = ge.graph_ref(ids, targets, full[index], live=True, norms=norms)
-            assert kl_bits(p0, integrity) <= INTEGRITY_MAX, 'baseline full architecture mismatch'
             q0 = {arm: ge.graph_ref(ids, targets, graph, live=False).clone() for arm, graph in compiled[index].items()}
+            distributions = save_distributions(out, f'baseline_{ident}_{index}.safetensors',
+                    {'p0': p0, 'complete': integrity, **{'q0_' + arm: q for arm, q in q0.items()}})
+            raw_integrity = raw_kl_bits(p0, integrity)
+            assert raw_integrity <= INTEGRITY_MAX, 'baseline full architecture mismatch'
             baseline.append((p0, q0, norms))
             append(out / 'baseline.jsonl', {'task': ident, 'input': index,
                     'full_integrity_kl_bits': kl_bits(p0, integrity),
+                    'full_integrity_raw_kl_bits': raw_integrity, 'distributions': distributions,
                     'candidate_kl_bits': {arm: kl_bits(p0, q) for arm, q in q0.items()}})
         # Explicit no-op through the same edit/cache path; no new decomposition.
         with scaled_head(nat, 0, 0, 1.0):
@@ -183,24 +212,32 @@ def run(source, inputs, trial, out):
                             pe = nat.reference([ids], targets)
                             edited_norms = {}
                             complete = ge.graph_ref(ids, targets, full[index], live=True, norms=edited_norms)
+                            qe = {arm: ge.graph_ref(ids, targets, graph, live=False) for arm, graph in compiled[index].items()}
+                            moved = {arm: torch.log_softmax(p0 + q - q0[arm], -1) for arm, q in qe.items()}
+                            distributions = save_distributions(out, f'edit_{ident}_{layer}_{head}_{scale}_{index}.safetensors',
+                                    {'p0': p0, 'pe': pe, 'complete': complete,
+                                     **{'q0_' + arm: q for arm, q in q0.items()},
+                                     **{'qe_' + arm: q for arm, q in qe.items()},
+                                     **{'moved_' + arm: q for arm, q in moved.items()}})
+                            raw_integrity = raw_kl_bits(pe, complete)
                             integrity_kl = kl_bits(pe, complete)
                             damage = kl_bits(pe, p0)
                             result = {'task': ident, 'input': index, 'edit': edit,
                                       'model_damage_bits': damage, 'active_damage': damage >= DAMAGE_MIN,
                                       'full_integrity_kl_bits': integrity_kl,
+                                      'full_integrity_raw_kl_bits': raw_integrity, 'distributions': distributions,
                                       'norm_shift_l2': {str(k): float((edited_norms[k] - v).norm()) for k, v in original_norms.items()},
                                       'reference_top': int(pe[0, -1].argmax()), 'original_top': int(p0[0, -1].argmax()),
                                       'candidates': {}}
-                            for arm, graph in compiled[index].items():
-                                qe = ge.graph_ref(ids, targets, graph, live=False)
-                                moved = torch.log_softmax(p0 + qe - q0[arm], -1)
-                                result['candidates'][arm] = {'direct_kl_bits': kl_bits(pe, qe),
-                                    'no_change_error_bits': damage, 'gain_over_no_change_bits': damage - kl_bits(pe, qe),
-                                    'conditional_delta_kl_bits': kl_bits(pe, moved),
-                                    'prediction_shift_bits': kl_bits(qe, q0[arm]),
-                                    'top': int(qe[0, -1].argmax()), 'original_top': int(q0[arm][0, -1].argmax())}
+                            for arm, q in qe.items():
+                                result['candidates'][arm] = {'direct_kl_bits': kl_bits(pe, q),
+                                    'direct_raw_kl_bits': raw_kl_bits(pe, q),
+                                    'no_change_error_bits': damage, 'gain_over_no_change_bits': damage - kl_bits(pe, q),
+                                    'conditional_delta_kl_bits': kl_bits(pe, moved[arm]),
+                                    'prediction_shift_bits': kl_bits(q, q0[arm]),
+                                    'top': int(q[0, -1].argmax()), 'original_top': int(q0[arm][0, -1].argmax())}
                             append(out / 'draws.jsonl', result)
-                            assert integrity_kl <= INTEGRITY_MAX, 'edited full architecture mismatch (row retained)'
+                            assert raw_integrity <= INTEGRITY_MAX, 'edited full architecture mismatch (row retained)'
                     assert all(tensor_hash(nat.target.site(n).U) == basis[n]['U'] and
                                tensor_hash(nat.target.site(n).V) == basis[n]['V'] and
                                tensor_hash(nat.units[n]) == basis[n]['units'] for n in nat.names)
@@ -214,6 +251,7 @@ def run(source, inputs, trial, out):
     summary = {'draws': len(saved), 'active_damage': sum(row['active_damage'] for row in saved),
                'inactive_damage': sum(not row['active_damage'] for row in saved),
                'worst_full_integrity_kl_bits': max(row['full_integrity_kl_bits'] for row in saved),
+               'distribution_manifest_sha256': digest(out / 'distribution_manifest.jsonl'),
                'groups': {}}
     for task in CASES:
         subset = [row for row in saved if row['task'] == task]

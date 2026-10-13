@@ -822,7 +822,7 @@ def teacher_nodes(task_id: str, dirs=TEACHER_DIRS) -> list[tuple]:
     return list(dict.fromkeys(out))
 
 
-def candidates(ee: EditEval, task: dict, goal: dict, vpd_top: int = 64, dirs=TEACHER_DIRS) -> list[dict]:
+def candidates(ee: EditEval, task: dict, goal: dict, vpd_top: int = 64, dirs=TEACHER_DIRS, *, analytic_final_down: bool = False) -> list[dict]:
     """The search's single edits on a local goal: every node of the teacher's circuits and VPD's vpd_top most
     important subcomponents (and for detach the vpd_top most important at its position) scaled by NODE_SCALES, every
     connection the model has among them cut (into the prediction too), and for detach the position's token embedding
@@ -845,6 +845,9 @@ def candidates(ee: EditEval, task: dict, goal: dict, vpd_top: int = 64, dirs=TEA
         q = goal["position"]
         tok = ("tok", q, 0)
         ops += [cut_op(nd, tok) for nd in nodes if nd[1] == q and native._layer_kind(nd)[1] in mech.RESID_READERS]
+    if analytic_final_down:
+        import edit_affine
+        ops += edit_affine.candidates(ee, task, goal, nodes)
     return ops
 
 
@@ -983,13 +986,15 @@ def vpd_topk(ee: EditEval, task: dict, sizes) -> list[tuple[int, list[dict]]]:
 SIZES = (1, 2, 4, 8, 16, 32, 64)
 
 
-def teach_goal(ee: EditEval, task: dict, goal: dict, log=print, baselines: bool = True) -> dict:
+def teach_goal(ee: EditEval, task: dict, goal: dict, log=print, baselines: bool = True, *, analytic_final_down: bool = False) -> dict:
     """One goal: the edit teacher and (baselines) the native-unit search and VPD's top-k, each scored on the score's
     data."""
     t0 = time.perf_counter()
     score = lambda eds: ee.score_many(task, goal, eds, search=True)  # noqa: E731
     out = {"task": task["id"], "goal": goal, "units": {"ops": [], "edit": [], "score": None}}
-    methods = [("teacher", candidates(ee, task, goal))] + ([("units", unit_candidates(ee, task, goal))] if baselines else [])
+    methods = [("teacher", candidates(ee, task, goal, analytic_final_down=analytic_final_down))] + ([("units", unit_candidates(ee, task, goal))] if baselines else [])
+    if analytic_final_down:
+        out["analytic_final_down"] = {"enabled": True, "scope": "persistent all-position final-down scales", "bounds": [-1.0, 2.0]}
     for name, pool in methods:
         log(f"{task['id']} {goal['kind']} {name}: {len(pool)} candidates")
         res = search(score, pool, log=log)
@@ -1176,6 +1181,7 @@ def main():
     t = sub.add_parser("teach")
     t.add_argument("goals")
     t.add_argument("--teacher-only", action="store_true", help="no baselines (SFT targets)")
+    t.add_argument("--analytic-final-down", action="store_true", help="also propose bounded binary16 persistent final-down scales from unedited logits")
     t.add_argument("out")
     t.add_argument("--offset", type=int, default=0)
     t.add_argument("--stride", type=int, default=1)
@@ -1219,7 +1225,7 @@ def main():
                 continue
             if r["task"] not in tasks:
                 tasks = {r["task"]: json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())}
-            res = teach_goal(ee, tasks[r["task"]], r["goal"], log=lambda s: print(s, flush=True), baselines=not args.teacher_only)
+            res = teach_goal(ee, tasks[r["task"]], r["goal"], log=lambda s: print(s, flush=True), baselines=not args.teacher_only, analytic_final_down=args.analytic_final_down)
             with open(args.out, "a") as f:
                 f.write(json.dumps(res) + "\n")
     elif args.cmd == "rescore":

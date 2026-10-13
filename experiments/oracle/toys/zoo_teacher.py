@@ -3,8 +3,11 @@ as SFT targets.
 
 On real models the SFT targets come from search because there is no ground truth; on the zoo the truth is known
 (zoo.py), so this measures how good those targets are. Per instance and per example text of its record:
-  teacher   teacher.teach (the influential start, block-then-piece pruning, connections, --no-strand: run_planted's
-            "current" arm) on the exact decomposition (planted.native_of). Block nodes are expanded to the site's active
+  teacher   teacher.teach on the exact decomposition (planted.native_of), two arms (ARMS): f1_start "influential"
+            (run_planted's "current" arm: influential-blocks start, block-then-piece pruning) and "both" (teach's default
+            F1 search from VPD's answer at the target, then the whole answer); connections, --no-strand, max_nodes None,
+            both. The SFT target per text is select()'s pick, made without the ground truth: the smallest arm within the
+            teacher's own KL budget, else the lowest KL. Block nodes are expanded to the site's active
             pieces at that position; pieces map to units (a head's q/k/v/o pieces -> L{l}.H{h}, a neuron's c_fc/down
             pieces -> L{l}.N{n}); the circuit's connections map to unit edges (tok:@position -> unit -> OUT).
   greedy    unit-level greedy ablation on the same text: units ordered by their single-removal KL (smallest first),
@@ -86,11 +89,37 @@ def teacher_graph(nat, tx, circ: dict) -> tuple[list, list, list]:
         a, b = e
         for x in label.get(a, []):
             for y in (["OUT"] if b == "out" else label.get(b, [])):
-                if x != y:
+                if x != y and valid_edge(x, y):
                     edges.add((x, y))
     pieces = sorted(set(pieces), key=lambda x: (x[1], x[0], x[2]))
     toks = sorted({int(t) for m, c, t in raw if m == "tok"})
     return [list(p) for p in pieces], sorted(edges, key=_edge_key), toks
+
+
+def valid_edge(a: str, b: str) -> bool:
+    """A unit edge the architecture has: token -> anything; a unit -> OUT; a unit -> a unit of a later layer, or an
+    attention head -> an MLP neuron of its own layer. (The teacher's site-level connections, collapsed to units, also
+    pair same-layer heads, e.g. one head's key with another's output: not a path.)"""
+    if a.startswith("tok:") or b == "OUT":
+        return True
+    if b.startswith("tok:") or a == "OUT":
+        return False
+    (la, ka, _), (lb, kb, _) = zoo.parse_unit(a), zoo.parse_unit(b)
+    return la < lb or (la == lb and ka == "H" and kb == "N")
+
+
+def refilter(path: Path) -> int:
+    """Apply valid_edge to a teacher file written before the filter (edges and Mermaid); the count dropped."""
+    r = json.loads(path.read_text())
+    dropped = 0
+    for t in [r["teacher"]] + [a for e in r["examples"] for a in e["teacher"].values()]:
+        if "unit_edges" not in t:
+            continue
+        keep = [e for e in t["unit_edges"] if valid_edge(*e)]
+        dropped += len(t["unit_edges"]) - len(keep)
+        t["unit_edges"], t["mermaid"] = keep, (zoo.mermaid([tuple(e) for e in keep]) if keep else None)
+    path.write_text(json.dumps(r))
+    return dropped
 
 
 def _edge_key(e):
@@ -240,8 +269,8 @@ def write_instance(res: dict) -> None:
     (OUT / f"{res['id']}.json").write_text(json.dumps(res))
 
 
-def run(shard: str, only: str | None, redo: bool, order: str) -> None:
-    torch.set_num_threads(2)
+def run(shard: str, only: str | None, redo: bool, order: str, threads: int = 1) -> None:
+    torch.set_num_threads(threads)   # 1: the toys' matmuls are tiny; on a shared 4-core box 1 thread ran ~5x faster than 2
     i, k = map(int, shard.split("/"))
     man = [json.loads(x) for x in (ZOO / "manifest.jsonl").read_text().splitlines()]
     pri = {"train": 0, "test_instance": 1, "test_family": 2}
@@ -280,6 +309,9 @@ def f(x, nd=2):
     return f"{x:.{nd}f}" if abs(x) >= 10 ** -nd or x == 0 else f"{x:.1e}"
 
 
+LEAN = ("units", "n_nodes", "node_kl", "unit_kl", "budget_kl", "blocks_in_answer", "seconds", "score", "node_score", "modes", "error")
+
+
 def _methods():
     def arm(a):
         return lambda e: e["teacher"][a] if "units" in e["teacher"][a] else None
@@ -301,7 +333,7 @@ def summarize() -> None:
             for e in r["examples"]:
                 fh.write(json.dumps({"id": r["id"], "family": r["family"], "split": r["split"],
                                      **{k: v for k, v in e.items() if k not in ("teacher",)},
-                                     "teacher": {a: {k: v for k, v in t.items() if k not in ("nodes", "mermaid")} for a, t in e["teacher"].items()}}) + "\n")
+                                     "teacher": {a: {k: v for k, v in t.items() if k in LEAN} for a, t in e["teacher"].items()}}) + "\n")
     fams = list(zoo.FAMILIES)
     splits = ["train", "test_instance", "test_family"]
     methods = _methods()
@@ -358,6 +390,20 @@ def summarize() -> None:
         g = lambda b, k: mean(float(r["greedy_instance"]["budgets"][str(b)]["score"][k]) for r in rr)  # noqa: E731
         L.append(f"| {fam} | {len(rr)} | {f(mean(r['teacher']['score']['f1'] for r in rr))} | {f(mean(float(r['teacher']['score']['exact']) for r in rr))} | "
                  f"{f(g(0.05, 'f1'))} | {f(g(0.05, 'exact'))} | {f(g(0.001, 'f1'))} | {f(g(0.001, 'exact'))} |")
+    L += ["", "## Instance-level edges vs the record's unit_edges", "",
+          "Unit → unit and unit → OUT edges (token sources left out: the record names them by role, the teacher by "
+          "position). Teacher edges are the selected circuits' connections collapsed to units, after valid_edge.", "",
+          "| family | edge precision | edge recall | exact |", "|---|---|---|---|"]
+    for fam in fams + ["all"]:
+        rr = [r for r in res if fam == "all" or r["family"] == fam]
+        if not rr:
+            continue
+        sc = []
+        for r in rr:
+            gt_e = {tuple(e) for e in json.loads((ZOO / "instances" / f"{r['id']}.json").read_text())["unit_edges"] if not e[0].startswith("tok:")}
+            te = {tuple(e) for e in r["teacher"]["unit_edges"] if not e[0].startswith("tok:")}
+            sc.append(prf(te, gt_e))
+        L.append(f"| {fam} | {f(mean(x['precision'] for x in sc))} | {f(mean(x['recall'] for x in sc))} | {f(mean(float(x['exact']) for x in sc))} |")
     L += ["", "## KL and size (per text)", "",
           "KL at the target, model ‖ circuit only. Node KL: the circuit's pieces on, every other piece off (zoo.node_kl; the "
           "record's gt_nodes the same way). Unit KL: every unit outside the set zeroed (zoo.ablate). \"suff\" = share of texts "
@@ -421,7 +467,73 @@ def _role(r: dict, u: str) -> str:
     return f"L{l} {'head' if kind == 'H' else 'neuron'}"
 
 
-NOTES = ""
+NOTES = """
+## Where search misses known structure
+
+Numbers below are from the run above (1,470 texts, 350 instances).
+
+1. **The influential start misses content-addressed positions.** `block_search` keeps whole blocks at the target plus the
+   F2-probe positions, the fewest that reach s_track_pp ≥ 0.9. On **detect** (the head attends to wherever the trigger
+   tokens are) it keeps the target position alone in 104/140 texts. That start already sits at the empty-circuit KL
+   (median 5.15 nats), so no removal fits the budget and nothing gets pruned: the answer is every piece at the
+   target, the two distractor neurons included. The same thing happens, less severely, on **gate** (72/140 insufficient)
+   and **additive_vote** (99+7/140). In every text where the influential arm kept a distractor (285), its circuit was
+   over budget, apart from 2 multihop texts. Influential is within budget on 80% of texts; the `both` arm is within
+   budget on 100%.
+2. **Redundant routes: sufficiency keeps one route when the logit is saturated.** With 2 or 3 identical heads and
+   p(top) = 1.000000, dropping a route costs KL below the budget (about 1e-9, against budgets of 7e-9 to 1e-8). The
+   teacher's smallest-within-budget pick keeps only some routes on 38/140 texts. In the per-text "redundant" column,
+   the selected teacher keeps 2 of 3 routes or 1 of 2. The unit-level greedy keeps **exactly one** route on every text
+   at b = 0.05 (140/140), and at b = 0.001 on 90/140. The `both` arm keeps all routes on 140/140, but because of its
+   start rather than any search for necessity. Without the ground truth, a sufficiency-only search cannot tell
+   "redundant" from "unused". Instance-level redundant F1 is 1.00 for the teacher only because the union over texts
+   recovers the dropped routes.
+3. **Cancelling pairs.** The planted pair (two units writing exactly opposite vectors) is removable only *jointly*.
+   The unit-level greedy removes units one at a time, so it keeps both units on 95/140 texts (b = 0.05) and 134/140
+   (b = 0.001), and keeps one of the pair, a broken half, on 45 and 6. The teacher mostly gets this right
+   (selected: pair kept on 10/140, all of them heads-type pairs) because its first stage drops whole site blocks, and
+   removing a site block removes both members at once. The failures are head pairs in the same layer as the copy head,
+   where the attention block cannot be dropped whole (influential 28, both 15). Neuron pairs are dropped every time
+   by the influential arm; the `both` arm keeps a neuron pair on 9 texts. The opposite error also appears: **additive_vote** misses ≥1 voter on 11 texts, and in
+   every case checked the missed voters are a pair that cancels on that text (one votes yes, one votes no) or are
+   over-determined (4 yes against 1 no, saturated). On that text the circuit is faithful (node KL ≤ 6e-9), but it is
+   not the planted mechanism.
+4. **Distractors.** The distractors' writes are DUMP = 0.005 into residual directions nothing reads, which moves the
+   KL by about 1e-15. A sufficient search drops them, and the selected teacher keeps a distractor on only 2/1,470
+   texts (multihop). Every distractor kept by the influential arm comes from failure mode 1 (an over-budget start
+   that cannot be pruned), not from the distractors mattering.
+5. **Ground-truth artifact, not a search error: bigram_mlp at instance level.** The record's gt_units is the union
+   over its 4 example texts, so it lists only the lookup neurons those texts use. Greedy on 64 texts finds the rest
+   of the planted table, scoring "F1 0.71 / exact 0.03". Per text, every method is 1.00 on bigram_mlp except the
+   `both` arm, which adds other table neurons (F1 0.85). Instance-level scores for this family should be read
+   against the planted table (params.neurons), not gt_units.
+6. **Node level.** Selected-teacher pieces are nearly all inside the gt node set (precision 0.86–1.00, except
+   multihop 0.55), but recall is 0.22–0.84. The gt node sets list a positional head's key pieces at every position
+   and the value at the source, while the teacher keeps only the few keys that set the attention pattern. Both are
+   sufficient. The pieces differ, and the units agree.
+7. **Edges are over-connected.** Instance-level edge recall is 1.00 outside bigram_mlp, where the gt names only the
+   neurons its 4 texts use, so recall there is 0.53. Precision is lower: gate 0.61, multihop 0.66, additive_vote
+   0.85. The teacher's connections state direct paths the planted design does not route through, such as a layer-0
+   head → OUT next to its route via the layer-1 neurons, or a layer-0 head → the gate's bias neuron. With the exact
+   decomposition these paths carry tiny but nonzero signal, and the connection search keeps every connection whose
+   removal costs more than the 1e-8 budget. Site-level connections collapsed to units also produced 2,475 same-layer
+   head→head edges, which are not paths; `valid_edge` drops them.
+
+## Takeaways for SFT targets
+
+- Use **teacher selected** (written as the target in `~/mpd-data/toy_zoo/teacher/<id>.json`). Per text it has unit
+  precision 1.00 and recall 0.99 (exact 0.96, F1 0.99); train split F1 0.99 / exact 0.95; test_family 1.00 / 0.99.
+  Its node KL is at gt level (median 7e-10) with 7.5 pieces against gt's 19.7.
+- `teach(f1_start="influential")` alone, run_planted's arm, is not safe on the zoo. It is insufficient on 20% of
+  texts, and when it fails it fails silently: the answer is still emitted. Any teacher pipeline should check that
+  the final circuit's KL is within budget and fall back to the `both` arm.
+- The residual errors are structural (redundancy and saturation, text-level cancellation). They come from what
+  per-text sufficiency means, not from search noise. Scoring the oracle on multiple texts per instance, or adding a
+  necessity term, is what would expose them. An oracle SFT'd on these targets will learn "one route" on saturated
+  redundant texts.
+- The unit-level greedy is a weak baseline: F1 0.82–0.89 and exact 0.62–0.69. It is too coarse to drop cancelling
+  pairs, and at b = 0.05 per text it also drops real voters, because the vote is saturated.
+"""
 
 
 def main():
@@ -432,10 +544,14 @@ def main():
     a.add_argument("--only", default=None, help="families, comma-separated")
     a.add_argument("--redo", action="store_true")
     a.add_argument("--order", choices=("split", "manifest"), default="split", help="split: train first")
+    a.add_argument("--threads", type=int, default=1)
     sub.add_parser("summarize")
+    sub.add_parser("refilter", help="apply valid_edge to the written teacher files")
     args = ap.parse_args()
     if args.cmd == "run":
-        run(args.shard, args.only, args.redo, args.order)
+        run(args.shard, args.only, args.redo, args.order, args.threads)
+    elif args.cmd == "refilter":
+        print(sum(refilter(p) for p in sorted(OUT.glob("*.json"))), "invalid unit edges dropped")
     else:
         summarize()
 

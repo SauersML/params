@@ -19,6 +19,9 @@
 %% Forced-removal stress, donor activation patching, and weight edits support different claims: report separately.
 %% Real donor texts do not guarantee that a mixed activation state occurs on any real input.
 %% Reading creates no new gate. Keep the engine, semantic and teacher work; repair actual controls.
+%% Current tool-search results report original-output sufficiency separately from intervention tracking.
+%% A pass of the text-relative phi threshold is not a universal fidelity certificate; compare matched baselines.
+%% English verification must execute the complete claim: no dropped conditions or hidden assignments.
 %% Rendering: .github/workflows/plan-render.yml writes plan/plan.png and the image-only README block.
 %% Local preview: mem-lease 2 npx -y @mermaid-js/mermaid-cli@11.4.2 -i plan/plan.mmd -o /tmp/oracle-plan.png -c plan/mermaid.json -b white -s 2
 flowchart BT
@@ -91,10 +94,11 @@ flowchart BT
   PHI["<b>Faithfulness score Φ</b><br/>10 intervention families,<br/>32 draws per family<br/>DONE · inframove"]
   TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>reward v3: size breaks ties (1.05 vs 0.65)<br/>next: VPD fits, cancelling pair<br/>ACTIVE · fleet"]
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
+  SEM["<b>English matches execution</b><br/>reject silently dropped conditions;<br/>donor parser: 8 checks passed<br/>DONE · codex/variable_reward"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
-    TXT["<b>Text splits</b><br/>train 6000–7999 · dev 9000–9099<br/>donors 9150–9199<br/>sealed 9100–9149 stays closed"]
+    TXT["<b>Text splits</b><br/>train 6000–7999 · dev 9000–9099<br/>donors 9150–9199; sealed stays closed<br/>tool training guard: 26 checks passed<br/>codex · a47cb59"]
     ENG["<b>Executable-circuit engine</b><br/>path-patched, batched, held values,<br/>line deletions in one call<br/>DONE · monitorbench"]
   end
 
@@ -145,7 +149,7 @@ flowchart BT
   SFTS -. reports .-> GATEA
   I1 --> I2
   I2 --> I3
-  I3 --> S1
+  I3 -. audits each shard .-> SFTS
   I3 -. identifies missing observations .-> I5
   I5 --> TOOLS
   I4 -. sets the format .-> I1
@@ -155,6 +159,8 @@ flowchart BT
   W3 -. found the failure .-> W4
   W4 --> GATEB
   W5 -. checks predictive value .-> W4
+  SEM --> W1
+  SEM -. tests claims .-> C2
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
   T4 -. new circuits .-> TOOLS
@@ -208,11 +214,11 @@ flowchart BT
   classDef impact fill:#12233f,stroke:#12233f,stroke-width:2px,color:#ffffff
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
-  class VPD,ENG,PHI,W1,W3,I1,I2,T1 done
+  class VPD,ENG,PHI,W1,W3,I1,I2,T1,SEM done
   class T2,T3,T5,I4,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3 active
   class I5 done
   class I6,W5 done
-  class T4 active
+  class T4 blocked
   class I3,S2,SUP,LAT1 check
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting

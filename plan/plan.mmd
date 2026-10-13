@@ -409,7 +409,7 @@ flowchart BT
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
-  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 60/60;<br/>cond 2 untested: no pruned fv_dev<br/>teacher meets the floors; rerun on<br/>v2.3 teachers under x; toys full tier<br/>20/21 (c), 19/21 (x: one 0.0006 tie)"}}
+  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 44/44;<br/>cond 2: v2.3 teachers barely prune;<br/>6011 passes (C), 3 texts tie or<br/>teacher larger; toys full 20/21 (C),<br/>19/21 (x: one 0.0006 tie)"}}
 
   %% ===================== workstreams =====================
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
@@ -434,7 +434,7 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>14 families + copy, frequency-weighted:<br/>wrong context loses 0.61-0.74, padding 0.76;<br/>equal-bits target actives win 0.85;<br/>partition/parity E4 0.00-0.04 vs identity ~1;<br/>behavior mode (CausalGym): v2.1 teacher holds<br/>the subject 0.85 (plain 0.12), R prefers it 0.86;<br/>interchange_pp still blind · DONE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>floors, circuit_term b3937ed; blocks at<br/>active contents a076865; RL run 2: soft<br/>pieces + audit 2fdd1cf, interchange panel<br/>19d86e2, semantics x opt-in 2750fd8<br/>(s_nodes 0.56 → 0.93); next: cond 2 on<br/>v2.3 teachers, flip default to x<br/>ACTIVE · inframove"]
+    W4["<b>Reward repair</b><br/>RL run 2 reward fb33713: soft pieces,<br/>one family score (raw pool, leaky),<br/>audit fixes, interchange panel; checks:<br/>cond 1 44/44, soft vs hard Spearman 0.96;<br/>semantics x opt-in (s_nodes 0.56 → 0.93)<br/>ACTIVE · inframove"]
     W5["<b>What information does a circuit need?</b><br/>x mode consumes a full-model trace;<br/>weight diagnostic gets edited boundaries;<br/>standalone edit prediction unverified<br/>SCOPE AUDIT · codex/eval_recovery"]
     W6["<b>Diagnose fidelity failures</b><br/>retain draws and every family score;<br/>unchanged reward; export checks pass;<br/>separate response error from uncertainty<br/>IMPLEMENTED · codex · 3017b64"]
   end

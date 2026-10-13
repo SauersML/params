@@ -115,7 +115,8 @@ def run(args):
         raise ValueError('fixed 32-model, three-policy panel required')
     required_source = ('experiments/oracle/toyloop/circuit.py', 'experiments/oracle/toys/planted.py',
                        'method/oracle/native.py', 'method/oracle/native_units.py',
-                       'method/oracle/goal_eval.py', 'method/vpd/vpd_model.py')
+                       'method/oracle/goal_eval.py', 'method/oracle/carry.py',
+                       'method/oracle/mech.py', 'method/vpd/vpd_model.py')
     required_support = tuple('experiments/oracle/toyloop/' + name + '.py' for name in
                              ('head_counterfactual', 'reward_interventions', 'intervention_teacher'))
     for root, field, required in ((args.source, 'source_sha256', required_source),

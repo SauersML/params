@@ -63,7 +63,7 @@ def meaning(v: dict, toks: dict) -> tuple[str, str]:
             parts = [f"{{{', '.join(repr(t) for t in c['tokens'][:4])}{', ...' if len(c['tokens']) > 4 else ''}}} -> {c['predicts']!r}"
                      for c in cls[:4]]
             text += f"; at @{vm['position']} its values: " + "; ".join(parts)
-    return f"computed @{at}", text
+    return f"computed {at}", text
 
 
 def explanation(r: dict, ids: list[int]) -> dict:

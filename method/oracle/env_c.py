@@ -54,6 +54,7 @@ CREDIT_SCALE = 16.0
 W_REL = 0.5
 W_COV = 0.5
 DRAWS = 8
+MAX_CHARS = 24000  # an SFT target's longest rendering
 
 
 def teacher_le(ge, tx, task: str) -> dict | None:
@@ -241,6 +242,8 @@ def sft(a) -> None:
             t = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
             strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
             content = components.target(answer_of(r["task"], rec, ge), r, t["model"], {}, strings)
+            if len(content) > MAX_CHARS:  # past the trainer's answer cap (8,000 tokens, ~3 characters a token)
+                continue
             fh.write(json.dumps({"prompt": [{"role": "user", "content": components.question(t, r)}],
                                  "completion": [{"role": "assistant", "content": content}],
                                  "info": {"task": r["task"], "variables": len(rec["variables"]), "invariants": len(rec["invariants"]),

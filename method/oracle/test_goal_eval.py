@@ -1876,6 +1876,21 @@ def test_blocks_priced_and_drawn_as_units(tiny):
         assert got in (set(), set(range(nat.C[site])))
 
 
+def test_graph_ref_outside_held(tiny):
+    """graph_ref(outside=): every site's subcomponents outside the circuit at the model's activations on the text is the
+    model, whatever the circuit; the q/k sites held alone change only the attention."""
+    nat, ge, tx = tiny
+    rec = {}
+    nat.run(tx.ids, [tx.T - 1], nat._full_plan(tx.T, 1), *nat._one(), record=rec)
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    for g in (native.Graph(), native.Graph(every[::3], complete=True)):
+        lq = ge.graph_ref(tx.ids, tx.targets, g, outside={n: rec[n] for n in nat.names})
+        assert float(carry.kl(tx.ref, lq)[0]) < 1e-5
+    qk = {n: rec[n] for n in nat.names if native._name_layer_kind(n)[1] in ("q_proj", "k_proj")}
+    g = native.Graph(every[::3], complete=True)
+    assert not torch.allclose(ge.graph_ref(tx.ids, tx.targets, g, outside=qk), ge.graph_ref(tx.ids, tx.targets, g))
+
+
 def test_line_leave_one_out(tiny):
     """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row
     with point, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run and N from its

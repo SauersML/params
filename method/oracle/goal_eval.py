@@ -1068,7 +1068,7 @@ class GoalEval:
                   record: dict | None = None, patch: dict | None = None, cuts: dict | None = None,
                   reads: list | None = None, norms: dict | None = None, freeze: str = "",
                   rows: dict | None = None, rest: dict | None = None, hold: bool = False, units: dict | None = None,
-                  capture: dict | None = None) -> torch.Tensor:
+                  capture: dict | None = None, outside: dict | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of a stated graph's run in C's semantics (the lead's decision, 10-12):
         inside the circuit, graph semantics, each circuit node reading the full residual stream less the outputs of the
         circuit nodes that are not its stated parents (the background and its stated parents; a value's share through
@@ -1095,7 +1095,9 @@ class GoalEval:
         None)}: with values (a held head: {"q", "k", "v" before the rotation, "out" before the output matrix: [B or 1,
         layers, H, T, hd]}) the unit takes them, without them its output is 0 (a head's query, key and value stay its
         own). capture: receives those values of the run {"q", "k", "v", "out": [B, layers, H, T, hd], "neuron": [B,
-        layers, T, d_mlp]}."""
+        layers, T, d_mlp]}. outside: {site: activations [B or 1, T, C]}: that site's subcomponents outside the circuit
+        take these values at full strength (the model's on the text: the q/k sites held at x give the circuit the model's
+        attention instead of C's near-uniform one, rustmove's 10-13 measurement)."""
         import vpd_model
 
         nat, tg = self.nat, self.nat.target
@@ -1151,8 +1153,13 @@ class GoalEval:
                     A[:, r[1], r[2]] = restricted(r, ws) @ tg.site(n).V[:, r[2]]
                 for (t, c), v in fixed.get(n, {}).items():
                     A[:, t, c] = v
-            a[n] = A
-            out = (A * on[n]) @ tg.site(n).U
+            if outside is not None and n in outside:  # held outside the circuit: the circuit's computed, the rest given
+                A = torch.where(circ[n] > 0, A, outside[n])
+                a[n] = A
+                out = A @ tg.site(n).U
+            else:
+                a[n] = A
+                out = (A * on[n]) @ tg.site(n).U
             b = tg.site(n).b  # a bias, always on (vpd4l's matrices have none)
             if hold:
                 out = out + rest[n]

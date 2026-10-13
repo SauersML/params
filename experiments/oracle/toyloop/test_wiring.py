@@ -90,20 +90,55 @@ def test_training_wiring_reward_executes_edges_and_rejects_partial_invalid(pair,
     full = reward({"toy": toy}, FULL)
     cut = reward({"toy": toy}, CUT)
     assert full > .999 and 0 <= cut < full
+    unit_reward = train.get_reward("unit_suff")
+    assert unit_reward is reward_exec.reward_unit_suff
+    assert unit_reward({"toy": toy}, CUT) == pytest.approx(unit_reward({"toy": toy}, FULL), abs=1e-7)
+    assert unit_reward({"toy": toy}, CUT) > cut
     for answer in ("unparseable", FULL.replace("English:", "L0N999 --> out\nEnglish:"),
                    FULL.replace("English:", "unknown --> out\nEnglish:")):
         assert reward({"toy": toy}, answer) == -1 < cut
+        assert unit_reward({"toy": toy}, answer) == -1
 
 
 def test_training_wiring_reward_penalizes_one_failed_text(monkeypatch):
     toy = SimpleNamespace(texts=[[1], [2]], meta={})
     calls = []
-    def measured(got_toy, completion, *, texts):
+    def measured(got_toy, completion, *, texts, complete):
         calls.append((got_toy, texts))
         return {"per_text": [{"suff": 1.0}, {"suff": 0.0}]}
     monkeypatch.setattr(reward_exec, "score_wiring", measured)
     assert reward_exec.reward_wiring_suff({"toy": toy}, FULL) == .25
     assert calls == [(toy, toy.texts)]
+
+
+def test_training_seed_controls_initialization_and_sampled_completions(monkeypatch):
+    import train
+
+    initialized, sampled = [], []
+    def load_policy(args):
+        model = torch.nn.Linear(1, 1, bias=False)
+        initialized.append(model.weight.detach().clone())
+        return model, None
+    def sample(model, tok, prompt, k, args):
+        result = [str(float(torch.rand(()))) for _ in range(k)]
+        sampled.append(result)
+        return result
+    monkeypatch.setattr(train, "examples", lambda *a: [{"prompt": "x", "completion": "y", "meta": {}}])
+    monkeypatch.setattr(train, "load_policy", load_policy)
+    monkeypatch.setattr(train, "sample", sample)
+    monkeypatch.setattr(train, "get_reward", lambda spec: lambda meta, text: float(text))
+    monkeypatch.setattr(train, "batch_ids", lambda tok, pairs, cap: (torch.zeros(len(pairs), 1), None, torch.ones(len(pairs), 1)))
+    monkeypatch.setattr(train, "token_logps", lambda model, ids, att, comp: (model.weight.expand(len(ids), 1), comp))
+    monkeypatch.setattr(train, "save", lambda *a: None)
+    args = SimpleNamespace(data="mock", truth=None, seed=11, steps=1, batch=1, lr=.001,
+                           max_len=4, log_every=1, eval=0, out="unused", reward="mock", beta=0, k=2, std=False)
+    train.sft(args); train.sft(args)
+    assert torch.equal(initialized[0], initialized[1])
+    train.rl(args); train.rl(args)
+    assert torch.equal(initialized[2], initialized[3]) and sampled[0] == sampled[1]
+    args.seed = 12
+    train.rl(args)
+    assert sampled[2] != sampled[0]
 
 
 def test_wrong_direction_and_unknown_unit_rejected(pair):

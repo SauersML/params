@@ -112,11 +112,24 @@ def reward_wiring_suff(meta: dict, completion: str) -> float:
     never reuse the legacy name-keyed cache. Valid scores are in [0, 1], invalid
     circuits score -1. No size cost, English, necessity or intervention certificate.
     """
+    return _reward_suff(meta, completion, complete=False)
+
+
+def reward_unit_suff(meta: dict, completion: str) -> float:
+    """Matched wiring control: same pieces/texts/aggregation, every legal selected-unit connection on.
+
+    Still reject invalid stated syntax/architecture. No cost or necessity term; only
+    execution of connections differs from reward_wiring_suff (including output edges).
+    """
+    return _reward_suff(meta, completion, complete=True)
+
+
+def _reward_suff(meta: dict, completion: str, *, complete: bool) -> float:
     parsed = circuit.parse(completion)
     if not parsed.ok or parsed.bad:
         return -1.0
     try:
-        scored = score_wiring(meta["toy"], completion, texts=texts_of(meta["toy"]))
+        scored = score_wiring(meta["toy"], completion, texts=texts_of(meta["toy"]), complete=complete)
     except ValueError:
         return -1.0  # invalid wiring on any text invalidates the whole answer
     suff = [row["suff"] for row in scored["per_text"]]
@@ -125,13 +138,15 @@ def reward_wiring_suff(meta: dict, completion: str) -> float:
     return (sum(suff) / len(suff) + min(suff)) / 2
 
 
-def score_wiring(toy, completion: str, *, nat=None, texts=None) -> dict:
+def score_wiring(toy, completion: str, *, nat=None, texts=None, complete=False) -> dict:
     """Independent point-sufficiency diagnostic for the stated inter-unit wiring.
 
     Unlike the legacy unit-selection reward, actually execute Mermaid unit edges.
     Token-label arrows remain annotations, embeddings stay on, and remainders stay
     off. No English, token-role, necessity or intervention-fidelity certification.
     A supplied native must represent this toy; useful for reusing an existing load.
+    complete=True is the matched selection control: validate the stated graph first,
+    then execute every legal connection among exactly the same selected pieces.
     """
     import copy
     import torch
@@ -153,6 +168,8 @@ def score_wiring(toy, completion: str, *, nat=None, texts=None) -> dict:
     with torch.no_grad():
         for ids in texts:
             graph = circuit.unit_graph(parsed, bound, ids)
+            if complete:
+                graph = native.Graph(graph.nodes, complete=True)
             targets = [len(ids) - 1]
             ref = nat.reference([ids], targets)
             q = ge.graph_ref(ids, targets, graph, live=False)
@@ -162,8 +179,8 @@ def score_wiring(toy, completion: str, *, nat=None, texts=None) -> dict:
             rows.append({"kl_bits": error, "empty_kl_bits": null_error,
                          "top": int(q[0, -1].argmax()), "reference_top": int(ref[0, -1].argmax()),
                          "suff": min(1.0, max(0.0, 1.0 - error / max(null_error, 1e-9))),
-                         "nodes": graph.count(), "edges": graph.edges()})
-    return {"scope": "executed inter-unit/output wiring; token labels and English unverified",
+                         "nodes": graph.count(), "edges": sum(native.implied_edges(graph.nodes, targets)) if complete else graph.edges()})
+    return {"scope": ("complete same-unit connections" if complete else "executed inter-unit/output wiring") + "; token labels and English unverified",
             "remainders": "off", "embedding": "on", "texts": len(rows), "per_text": rows,
             "suff": sum(r["suff"] for r in rows) / len(rows),
             "kl_bits": sum(r["kl_bits"] for r in rows) / len(rows)}

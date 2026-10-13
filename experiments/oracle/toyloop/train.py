@@ -10,7 +10,7 @@ toy's name and truth). Sources: synthetic:N (render.synthetic), planted:DIR (toy
 RL: per prompt k samples; advantage = reward - group mean (divided by the group std with --std); loss = -mean over
 samples of advantage x mean completion-token log-prob, plus beta x KL(policy || frozen SFT policy) (the k3 estimator per
 token). One gradient step per batch of fresh samples (on-policy, so no ratio clipping). The reward is any
-reward(meta, completion) -> float: --reward f1 | f1_edges | exec | wiring_suff (reward_exec.py) | module:function.
+reward(meta, completion) -> float: --reward f1 | f1_edges | exec | wiring_suff | unit_suff (reward_exec.py) | module:function.
 """
 from __future__ import annotations
 
@@ -53,9 +53,9 @@ def examples(spec: str, truth_json: str | None = None) -> list[dict]:
 def get_reward(spec: str):
     if spec in ("f1", "f1_edges"):
         return getattr(circuit, "reward_" + spec)
-    if spec in ("exec", "wiring_suff"):
+    if spec in ("exec", "wiring_suff", "unit_suff"):
         import reward_exec
-        return reward_exec.reward_exec if spec == "exec" else reward_exec.reward_wiring_suff
+        return getattr(reward_exec, "reward_" + spec)
     mod, fn = spec.split(":")
     return getattr(importlib.import_module(mod), fn)
 
@@ -135,6 +135,7 @@ def token_logps(model, ids, att, comp):
 # ---------------------------------------------------------------- SFT
 
 def sft(a):
+    torch.manual_seed(a.seed)  # initialization/dropout, as well as Python's prompt schedule below
     data = [e for e in examples(a.data, a.truth) if e["completion"]]
     model, tok = load_policy(a)
     model.train()
@@ -177,6 +178,7 @@ def evaluate(model, tok, data, reward, a) -> float:
 
 
 def rl(a):
+    torch.manual_seed(a.seed)  # paired arms start from identical sampling/dropout RNG states
     data = examples(a.data, a.truth)
     reward = get_reward(a.reward)
     model, tok = load_policy(a)

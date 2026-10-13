@@ -90,6 +90,6 @@ def test_roundtrip_preserves_disconnected_ports_and_rejects_missing_contract():
     assert len([p for p in selected if p.port == 'Q']) == 2
     assert routes.to_mermaid(selected, edges, outputs, target=12) == text
     with pytest.raises(ValueError, match='header/contract'):
-        routes.parse_mermaid(text.replace('attention=original', 'attention=restricted'), target=12)
+        routes.parse_mermaid(text.replace('attention=causal_softmax', 'attention=restricted'), target=12)
     with pytest.raises(ValueError, match='duplicate selected'):
         routes.to_mermaid(spec[0] + [spec[0][0]], spec[1], spec[2], target=12)

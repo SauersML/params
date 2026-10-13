@@ -1,7 +1,9 @@
 """Opt-in exact-position head-port graph adapter; lexical embeddings stay on.
 
 This implements residual-write/value routing, never attention restriction or
-lexical ROOT removal. Intended for bounded frozen positional-copy/multihop
+lexical ROOT removal. Attention uses the original causal softmax operation,
+recomputed from graph-local Q/K; full-model attention probabilities are not frozen.
+Intended for bounded frozen positional-copy/multihop
 experiments; no change to the default Mermaid compiler or training rewards.
 """
 from dataclasses import dataclass
@@ -78,7 +80,7 @@ def compile_graph(nat, length, ports, edges, outputs):
 
 
 
-_CONTRACT = '%% typed_routes_v1 embeddings=on attention=original'
+_CONTRACT = '%% typed_routes_v1 embeddings=on attention=causal_softmax'
 _ID = re.compile(r'(L(?:0|[1-9]\d*)H(?:0|[1-9]\d*))_([QKVO])_p(0|[1-9]\d*)')
 
 
@@ -105,7 +107,7 @@ def to_mermaid(ports, edges, outputs, *, target):
 
     IDs are L0H3_Q_p10 etc.; OUT_p12 is the fixed prediction sink. Only one
     bare declaration or single --> edge per line is allowed. The mandatory
-    contract line declares embedding-on, original-softmax semantics. No labels,
+    contract line declares embedding-on, causal-softmax semantics. No labels,
     English, fences, selectors, ROOTs or attention restriction syntax is accepted.
     """
     if type(target) is not int or target < 0:

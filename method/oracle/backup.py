@@ -932,6 +932,8 @@ def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back",
 
 EVAL_SETS = ("fwd", "back", "b1", "rand", "allpos")  # run's sets the evaluation scores beside the start
 DERIVED = ("rand_fwd", "vpd_eq_fwd", "vpd_eq", "sub50", "sub90", "sub50_rand", "sub90_rand")  # derived_sets'
+EVAL_FLIP_ROWS = 40     # goal_eval's FLIP_ROWS (160) and CHANGED_ROWS (64) during the evaluation: rows per run only; at 160
+EVAL_CHANGED_ROWS = 32  # one process took 30.6 GB of a 48 GB card on text9000's 13 sets in adversary_flips (dev20be)
 TIMED = ("sufficiency", "_node_family", "adversary_flips", "_interchange_family", "changed_inputs", "track_pp",
          "interchange_pp", "pattern_family", "donors", "necessity_spec", "_sides")  # fidelity's families, timed in the log
 
@@ -1090,6 +1092,7 @@ def evaluate(split: str, n: int, src: Path, out: Path, sets=EVAL_SETS, derived: 
     ge = goal_eval.GoalEval()
     nat = ge.nat
     ge._node_family = lambda tx, graphs, draws, reads=False, units=None: node_family(ge, tx, graphs, draws, False, units)
+    goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = EVAL_FLIP_ROWS, EVAL_CHANGED_ROWS   # batch sizes only
     _time_families(ge, log)
     pool = torch.load(Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt")
     ge._edge_family = lambda tx, graphs, draws, reads=False: [{"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None}

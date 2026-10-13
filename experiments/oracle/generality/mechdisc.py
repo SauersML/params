@@ -319,15 +319,21 @@ def _mean(xs) -> float:
     return sum(map(float, xs)) / len(xs)
 
 
-def _boot(ws, B: int = 2000, seed: int = 2951):
+def _ci(ws, B: int = 2000, seed: int = 2951) -> dict | None:
+    """The mean and its 95% bootstrap interval over the items."""
     import random
 
     ws = [float(w) for w in ws if w is not None]
     if not ws:
-        return "-"
+        return None
     r = random.Random(seed)
     bs = sorted(_mean(r.choices(ws, k=len(ws))) for _ in range(B))
-    return f"{_mean(ws):.2f} [{bs[int(0.025 * B)]:.2f}, {bs[int(0.975 * B) - 1]:.2f}] (n={len(ws)})"
+    return {"mean": _mean(ws), "lo": bs[int(0.025 * B)], "hi": bs[int(0.975 * B) - 1], "n": len(ws)}
+
+
+def _boot(ws) -> str:
+    c = _ci(ws)
+    return "-" if c is None else f"{c['mean']:.2f} [{c['lo']:.2f}, {c['hi']:.2f}] (n={c['n']})"
 
 
 def score(answers: Path | None = None, tdirs: list | None = None):
@@ -352,6 +358,7 @@ def score(answers: Path | None = None, tdirs: list | None = None):
             ln = json.loads(x)
             s1[ln["task"]].append(components.parse(ln["text"])["answer"])
         sources["S1"] = s1
+    summary = {}
     for src, by in sources.items():
         print(f"== {src}")
         for contrast in sorted({p["contrast"] for p in pr}):
@@ -374,7 +381,13 @@ def score(answers: Path | None = None, tdirs: list | None = None):
         print("  per family, each item once: its mechanism's positions in the circuit and not the other mechanism's")
         for kd in ("copy", "bigram", "context"):
             js = [[judge(r, a) for a in by[nm]] for nm, r in sorted(items.items()) if r["kind"] == kd]
-            print(f"    {kd:8s} {_boot([_mean([j['right'] and not j['wrong'] for j in jj]) for jj in js])}")
+            ws = {f: [_mean([g(j) for j in jj]) for jj in js] for f, g in
+                  (("right_not_wrong", lambda j: j["right"] and not j["wrong"]), ("right", lambda j: j["right"]),
+                   ("wrong", lambda j: j["wrong"]), ("context_share", lambda j: j["context_share"]))}
+            summary.setdefault(src, {})[kd] = {f: _ci(w) for f, w in ws.items()}
+            print(f"    {kd:8s} {_boot(ws['right_not_wrong'])}")
+    (OUTROOT / "mechdisc_score.json").write_text(json.dumps(summary, indent=1))
+    print("wrote", OUTROOT / "mechdisc_score.json")
 
 
 if __name__ == "__main__":

@@ -53,3 +53,5 @@ def test_the_run_stops_on_a_scorer_outside_its_frozen_reward():
     assert tt.scorer_mismatch(ok, None, None) is None
     assert "semantics 'c'" in tt.scorer_mismatch([ok[0], {"semantics": "c", "source": "fb33713abc"}], "n", None)
     assert "source" in tt.scorer_mismatch([{"semantics": "n", "source": None}], "n", "fb33713")
+    assert tt.scorer_mismatch(ok, "n", "fb33713abc" + "0" * 30) is None  # a full revision against the pod's short one
+    assert "source" in tt.scorer_mismatch(ok, "n", "fb33714")

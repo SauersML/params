@@ -14,6 +14,7 @@ import time
 from claim_direct_teacher import SELECTED, SITE, sha
 
 EXECUTOR='aeaf7c1ff934d7b2be4225cd91a25ee86a1606de'
+CANONICAL_CONTRACT_SHA='fdee3231d5b85d48635b66bacc7dfe94d1a7950929e042225abf3a4f2731b425'
 
 
 def tasks_of(value):
@@ -56,15 +57,18 @@ def kl(p,q):
     return max(0.,result)
 
 
-def run(repo,payload,out,tasks,barrier=False):
+def run(repo,payload,out,tasks,canonical_contract,barrier=False):
     import torch
     from safetensors.torch import save_file
     if out.exists():raise ValueError('fresh immutable output required')
     if not torch.cuda.is_available():raise RuntimeError('CUDA required; no CPU fallback')
-    torch.set_num_threads(2);torch.set_grad_enabled(False)
+    torch.set_num_threads(4);torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=False
     torch.set_float32_matmul_precision('highest')
     protocol=json.loads((payload/'protocol.json').read_text())
+    if sha(canonical_contract)!=CANONICAL_CONTRACT_SHA:raise ValueError('frozen CPU construction contract mismatch')
+    canonical=json.loads(canonical_contract.read_text())
+    if canonical['input_provenance']!=protocol or canonical['executor_commit']!=EXECUTOR:raise ValueError('canonical input/executor provenance mismatch')
     if protocol['executor_commit']!=EXECUTOR or (repo/'.executor_commit').read_text().strip()!=EXECUTOR:raise ValueError('executor mismatch')
     for name,value in protocol['files'].items():
         if Path(name).is_absolute() or '..' in Path(name).parts or sha(payload/name)!=value:raise ValueError('payload mismatch')
@@ -77,6 +81,9 @@ def run(repo,payload,out,tasks,barrier=False):
     assets={'target':vpd_model.TARGET_DIR/'model_step_99999.safetensors','config':vpd_model.TARGET_DIR/'model_config.yaml','tokenizer':mech.VPD4L_TOKENIZER,'decomposition':native.UV}
     if vpd_model.VPD_PTH.exists() or {k:sha(p) for k,p in assets.items()}!=protocol['model_content_sha256']:raise ValueError('model source mismatch')
     panel=json.loads((payload/'panel.json').read_text());nat=native.Native('cpu');original=hashes(nat)
+    keys={n+':'+k for n in nat.names for k in ('W','U','V','delta_T')}
+    if set(canonical['original_state'])!=keys or {k:original[k] for k in keys}!=canonical['original_state']:raise RuntimeError('canonical CPU W/U/V/remainder bytes differ from frozen run')
+    torch.set_num_threads(2)
     prepared=[]
     for t in tasks:
         ids=panel['tasks'][t]['token_ids'];targets=panel['tasks'][t]['target_positions'];c,f=SELECTED[t]
@@ -110,6 +117,7 @@ def run(repo,payload,out,tasks,barrier=False):
         if hashes(nat)!=original:raise RuntimeError('CUDA edit restoration failed')
     result={'executor_commit':EXECUTOR,'runner_sha256':sha(__file__),'runner_commit':subprocess.check_output(['git','-C',str(runner_repo),'rev-parse','HEAD'],text=True).strip(),'input_protocol_sha256':sha(payload/'protocol.json'),'tasks':tasks,'worlds':len(rows),'forwards':3*len(rows),'rows':rows,'cpu_dense_seconds':cpu_times,'gpu_dense_plus_full_seconds':gpu_times,'cuda_peak_allocated_bytes':torch.cuda.max_memory_allocated(),'cuda_peak_reserved_bytes':torch.cuda.max_memory_reserved(),'cuda_device':torch.cuda.get_device_name(),'restored_tensor_hashes':hashes(nat),'original_tensor_hashes':original,'seconds':time.monotonic()-started,'pass':all(r['cpu_gpu_direct_kl_bits']<=1e-7 and r['full_start_direct_kl_bits']<=1e-7 and len(set(r['tops']))==1 for r in rows),'scope':'parity only; no search; original CPU-computed remainder bytes; TF32 disabled'}
     if {k:sha(p) for k,p in assets.items()}!=protocol['model_content_sha256']:raise RuntimeError('assets changed')
+    result['canonical_contract_sha256']=CANONICAL_CONTRACT_SHA
     (out/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps({k:v for k,v in result.items() if k not in ('rows','original_tensor_hashes','restored_tensor_hashes')}),flush=True)
     if not result['pass']:raise RuntimeError('CUDA parity/integrity gate failed; no search permitted')
 
@@ -118,4 +126,5 @@ if __name__=='__main__':
     for n in ('repo','payload','out'):p.add_argument('--'+n,type=Path,required=True)
     p.add_argument('--tasks',default=','.join(SELECTED))
     p.add_argument('--two-worker-barrier',action='store_true')
-    a=p.parse_args();run(a.repo,a.payload,a.out,tasks_of(a.tasks),a.two_worker_barrier)
+    p.add_argument('--canonical-contract',type=Path,required=True)
+    a=p.parse_args();run(a.repo,a.payload,a.out,tasks_of(a.tasks),a.canonical_contract,a.two_worker_barrier)

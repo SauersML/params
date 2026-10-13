@@ -44,7 +44,7 @@ def search_sites(order,full,teacher,evaluate,count,emit=None,full_start_max=WORS
         if emit:emit(row)
     return {'status':'full_model_no_compression' if not accepted else 'bounded_site_refinement','masks':current,'start':start,'selected':selected,'attempts':attempts,'accepted_sites':accepted}
 
-def run(repo,payload,out):
+def run(repo,payload,out,prior=None):
     import torch
     from safetensors.torch import save_file
     sys.path[:0]=[str(repo/'method/oracle'),str(repo/'method/vpd')]
@@ -83,9 +83,19 @@ def run(repo,payload,out):
         fixed={n:torch.zeros(len(ids),int(nat.C[n]),dtype=torch.bool) for n in order}
         for n,p,c in nodes:fixed[n][p,c]=True
         prepared[task]=(ids,targets,fixed,report,len(answer.get('nodes',[])))
+    hierarchy=None;prior_results=None;forward_cap=336
+    if prior is not None:
+        import claim_hierarchical_teacher as hierarchy
+        previous=json.loads((prior/'contract.json').read_text())
+        prior_results=json.loads((prior/'results.json').read_text())
+        completed=json.loads((prior/'complete.json').read_text())
+        if previous['input_provenance']!=contract or previous['executor_commit']!=actual_executor or previous['original_state']!=original_state or completed['restored_state']!=original_state or previous['selected_edits']!=json.loads(json.dumps(SELECTED)):
+            raise ValueError('prior ranking provenance mismatch')
+        if set(prior_results)!=set(SELECTED) or any(prior_results[t]['status']!='full_model_no_compression' or len(prior_results[t]['attempts'])!=24 for t in SELECTED):raise ValueError('complete rejected coarse run required')
+        forward_cap=432
     out.mkdir();started=time.monotonic();calls={'dense':0,'sparse':0};summaries={}
     def write(name,value):(out/name).write_text(json.dumps(value,indent=2))
-    write('contract.json',{'input_provenance':contract,'executor_commit':actual_executor,'runner_commit':runner_commit,'runner_sha256':sha(__file__),'helper_sha256':sha(Path(__file__).with_name('claim_direct_teacher.py')),'selected_edits':SELECTED,'components_per_site':{n:int(nat.C[n]) for n in order},'source_sha256':{m.__name__:sha(m.__file__) for m in (native,goal_eval,vpd_model,weight_family)},'site_order':order,'max_sites_per_context':24,'max_forwards':336,'full_start_integrity_max':FULL_INTEGRITY_MAX,'worst_direct_kl_max':WORST_KL,'live_remainders':True,'mask_links':'all architecture connections; own routing/norms; original teacher edges ignored','teacher_masks':'parsed executable fixed joint_train component nodes; stranded source nodes reported','count_scope':'mask-enabled and output-reachable rank-one placements; backend dense factor arithmetic is not pruned; all24 dense remainder sites stay on; no FLOP claim','remainder_off':'not measured; no remainder-free circuit certificate','original_state':original_state})
+    write('contract.json',{'input_provenance':contract,'executor_commit':actual_executor,'runner_commit':runner_commit,'runner_sha256':sha(__file__),'helper_sha256':sha(Path(__file__).with_name('claim_direct_teacher.py')),'selected_edits':SELECTED,'components_per_site':{n:int(nat.C[n]) for n in order},'source_sha256':{m.__name__:sha(m.__file__) for m in (native,goal_eval,vpd_model,weight_family)},'site_order':order,'max_sites_per_context':24,'max_forwards':forward_cap,'hierarchical_policy':None if hierarchy is None else {'sha256':sha(hierarchy.__file__),'max_new_proposals':32,'prior_contract_sha256':sha(prior/'contract.json'),'prior_results_sha256':sha(prior/'results.json'),'prior_complete_sha256':sha(prior/'complete.json'),'ranking':'inherited rejected direct error per eligible reachable removal; heuristic'},'full_start_integrity_max':FULL_INTEGRITY_MAX,'worst_direct_kl_max':WORST_KL,'live_remainders':True,'mask_links':'all architecture connections; own routing/norms; original teacher edges ignored','teacher_masks':'parsed executable fixed joint_train component nodes; stranded source nodes reported','count_scope':'mask-enabled and output-reachable rank-one placements; backend dense factor arithmetic is not pruned; all24 dense remainder sites stay on; no FLOP claim','remainder_off':'not measured; no remainder-free circuit certificate','original_state':original_state})
     def clear():
         nat.vpd.clear();nat._refs.clear();nat._refs_bytes=0;nat._rec=(None,None,{});ge._xk.clear();nat.__dict__.pop('_sensitivity_kept',None)
     def kl(p,q):
@@ -122,19 +132,28 @@ def run(repo,payload,out):
             return errors
         attempts=[]
         def emit(row):attempts.append(row);write(task+'_attempts.json',attempts)
-        result=search_sites(order,full,fixed,evaluate,count,emit,full_start_max=FULL_INTEGRITY_MAX);masks=result.pop('masks')
+        if hierarchy is None:
+            result=search_sites(order,full,fixed,evaluate,count,emit,full_start_max=FULL_INTEGRITY_MAX)
+        else:
+            rows=prior_results[task]['attempts'];errors={r['site']:r['worst_direct_kl_bits'] for r in rows}
+            if set(errors)!=set(order) or any(r['accepted'] or not math.isfinite(errors[r['site']]) or errors[r['site']]<=WORST_KL for r in rows):raise ValueError('invalid prior rejections')
+            positions={n:reachable_positions(n,len(ids),targets,nat.target.n_layer) for n in order}
+            result=hierarchy.tensor_refine(order,full,fixed,evaluate,count,emit,positions,errors)
+        masks=result.pop('masks')
         result.update(parser_report=report,source_teacher_nodes=source_nodes,teacher_executable_placements=sum(int(m.sum()) for m in fixed.values()))
         if masks is not None:
             final=evaluate(masks,'uncached_final',True)
             if max(final)>WORST_KL:raise RuntimeError('final fidelity failed')
-            result['final_direct_kl_bits']=final;result['recipe']={n:{'mode':'fixed_teacher' if n in result['accepted_sites'] else 'full','shape':list(m.shape),'fixed_teacher_nodes':[[int(p),int(c)] for p,c in fixed[n].nonzero().tolist()] if n in result['accepted_sites'] else None} for n,m in masks.items()}
+            result['final_direct_kl_bits']=final
+            if hierarchy is None:result['recipe']={n:{'mode':'fixed_teacher' if n in result['accepted_sites'] else 'full','shape':list(m.shape),'fixed_teacher_nodes':[[int(p),int(c)] for p,c in fixed[n].nonzero().tolist()] if n in result['accepted_sites'] else None} for n,m in masks.items()}
         summaries[task]=result;write('results.json',summaries)
         print(json.dumps({'task':task,'status':result['status'],'accepted_sites':result['accepted_sites'],'start':result['start'],'selected':result.get('selected'),'actual_forward_counts':dict(calls)}),flush=True)
     if state()!=original_state or {k:sha(p) for k,p in assets.items()}!=contract['model_content_sha256']:raise RuntimeError('final model/basis/assets changed')
-    if sum(calls.values())>336:raise RuntimeError('forward cap exceeded')
-    write('complete.json',{'actual_forward_counts':calls,'max_forwards':336,'restored_state':state(),'seconds':time.monotonic()-started,'scope':'adaptive TRAIN inputs and previously selected final-down edits only; live dense remainders remain on'})
+    if sum(calls.values())>forward_cap:raise RuntimeError('forward cap exceeded')
+    write('complete.json',{'actual_forward_counts':calls,'max_forwards':forward_cap,'restored_state':state(),'seconds':time.monotonic()-started,'scope':'adaptive TRAIN inputs and previously selected final-down edits only; live dense remainders remain on'})
 
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     for name in ('repo','payload','out'):p.add_argument('--'+name,type=Path,required=True)
-    a=p.parse_args();run(a.repo,a.payload,a.out)
+    p.add_argument('--prior',type=Path)
+    a=p.parse_args();run(a.repo,a.payload,a.out,a.prior)

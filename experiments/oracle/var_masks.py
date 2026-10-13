@@ -46,7 +46,7 @@ import var_teacher  # noqa: E402
 import variables  # noqa: E402
 
 def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tuple | None = None, log=print,
-                 depth: int | None = None, skip: tuple = ()) -> dict:
+                 depth: int | None = None, skip: tuple = (), pool: str = "family") -> dict:
     """at: the carrier positions (an intermediate variable's, after its inputs); the input positions when None. depth:
     candidates in layers <= depth only; skip: positions left out of the Iso donors."""
     nat = ge.nat
@@ -54,6 +54,9 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
     reach = nat.reachable(tx.T, tx.targets)
     every = [n for n in nat.names if all(bool(reach[n][q].any()) for q in at) and (depth is None or int(n.split(".")[1]) <= depth)]
     fam, _ = var_teacher.family(nat, tx, ins, every, at)
+    if pool == "all":  # every subcomponent at the carrier positions in the allowed layers, not only VPD's active ones
+        fam = [(n, q, c) for n in every for q in at for c in range(nat.C[n])]
+    blk = [(n, q, variables.BLOCK) for n in every for q in at]  # the allowed layers' whole outputs there
     N = sum(nat.C[n] for n in every) * len(at)
     bits = lambda k: var_controls.lbinom(N, k)  # noqa: E731
     A = {q: var_classes.alternatives(nat, tx.ids, q, int(tx.seed)) for q in ins}
@@ -97,7 +100,10 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
         return num / den if den > 0 else None
     out = {"task": task_id, "inputs": list(ins), "at": list(at), "depth": depth, "skip": list(skip), "iso_positions": iso_pos,
            "candidates": len(fam), "N": N, "family_bits": bits(len(fam)), "A": len(pzA), "iso_train": len(texts_I), "B": len(pzB),
-           "iso_B": len(pzI), "family_f_B": R.f_on(fam, pzB), "family_iso_B": f_off(fam), "masks": []}
+           "iso_B": len(pzI), "family_f_B": R.f_on(fam, pzB), "family_iso_B": f_off(fam),
+           "pool": pool, "blocks_f_B": R.f_on(blk, pzB), "blocks_iso_B": f_off(blk), "masks": []}
+    log(f"  candidates {len(fam)} ({pool}): Cause {out['family_f_B']}, Iso {out['family_iso_B']}; the layers' whole outputs: "
+        f"Cause {out['blocks_f_B']}, Iso {out['blocks_iso_B']}")
     perm = torch.randperm(len(pzA), generator=torch.Generator().manual_seed(int(tx.seed))).to(nat.dev)
     perm = torch.cat([perm, torch.arange(len(pzA), len(pzA) + len(texts_I), device=nat.dev)])  # Iso targets stay
     for lam in lams:
@@ -154,6 +160,8 @@ def main():
     ap.add_argument("--skip", help="positions left out of the Iso donors, comma-separated")
     ap.add_argument("--read", action="store_true", help="--copy texts' read carried at the target: inputs (o, a)")
     ap.add_argument("--depth", help="layer cuts, comma-separated: one run per cut, candidates in layers <= the cut")
+    ap.add_argument("--pool", choices=("family", "all"), default="family",
+                    help="the mask's candidates: VPD's active family, or every subcomponent at the carrier positions")
     ap.add_argument("--from-dir", type=Path, help="every kept intermediate variable in var_teacher's files there")
     ap.add_argument("--jobs", type=Path, help='JSON lines {"task", "inputs", "at"} (a pod uploads one file)')
     ap.add_argument("--lam", default="0.001,0.01,0.1")
@@ -187,7 +195,7 @@ def main():
         tx = ge.text(p["token_ids"], p["target_positions"], seed=native.task_seed(t), task=task)
         for d in depths:
             print(f"{t} inputs {list(ins)} at {list(at or ins)} layers <= {d} skip {list(skip)}", flush=True)
-            row = run_variable(ge, sc, tx, t, ins, lams, at, log=lambda s: print(s, flush=True), depth=d, skip=skip)
+            row = run_variable(ge, sc, tx, t, ins, lams, at, log=lambda s: print(s, flush=True), depth=d, skip=skip, pool=args.pool)
             with args.out.open("a") as f:
                 f.write(json.dumps(row) + "\n")
 

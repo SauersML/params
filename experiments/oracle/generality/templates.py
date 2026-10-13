@@ -7,7 +7,8 @@ A template (JSON, DATA/../mechanisms/<name>.json):
   edges: [[id, id or "out"], ...]; pairs: [[query id or "rest", key id or "rest", layer, query role], ...]
   connections: "stated" (the edges and pairs as written) or "all" (every connection the model has among the nodes, every
      token edge: a complete graph)
-instantiate(template, ids, t) gives goal_eval's circuit JSON (stated) or a complete native.Graph (all) on the text."""
+instantiate(template, ids, t) gives goal_eval's circuit JSON (stated) or a complete native.Graph (all) on the text;
+score(rule, texts, split) checks a template or a rules.py rule on a family's texts as reward v3 reads it."""
 import os
 import sys
 from pathlib import Path
@@ -69,6 +70,53 @@ def graph(tpl: dict, ids: list[int], targets: list[int], C: dict):
         return ans, {"missing_roles": missing}
     g, d = goal_eval.circuit(ans, targets, C, len(ids))
     return g, {**d, "missing_roles": missing}
+
+
+def as_template(rule: dict) -> dict:
+    """A rules.py rule (parts by role, reads, pairs) as a template (nodes, edges, pairs); a template as it is."""
+    if "nodes" in rule:
+        return rule
+    stated = rule.get("connections") == "stated" and isinstance(rule.get("reads"), list)
+    return {"nodes": rule["parts"], "edges": rule["reads"] if stated else [], "pairs": rule.get("pairs", []),
+            "connections": "stated" if stated else "all"}
+
+
+def score(rule: dict, texts: list[str], split: str = "eval", pool=None, ge=None) -> dict:
+    """An oracle-written or library mechanism (a template, or a rules.py rule) checked on texts of its family, as
+    reward v3 reads a circuit (primerl's behavior questions): per text (a task id under texts/vpd4l; a task carrying
+    "behavior" is scored in the behavior-targeted mode) the rule instantiated by role, fidelity in reward mode on split
+    (pool: the CI-pattern pool, ci_patterns_m.pt by default), goal_eval.circuit_term's R and phi, bits, faithful
+    (phi at the text's bar or above) and the roles the text lacks. {"texts": [...], "coverage": the share of texts
+    faithful, "phi" and "R": their means}. One text at a time (the behavior mode is the current text's)."""
+    import json
+
+    import numpy as np
+    import torch
+
+    tpl = as_template(rule)
+    ge = ge or goal_eval.GoalEval(native.Native())
+    nat = ge.nat
+    if pool is None:
+        p = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
+        pool = torch.load(p, weights_only=False) if p.exists() else None
+    out = []
+    for task in texts:
+        tj = json.loads((native.TEXTS / "vpd4l" / f"{task}.json").read_text())
+        pr = tj["prompts"][0]
+        t = pr["target_positions"][-1]
+        tx = ge.text(pr["token_ids"][:t + 1], [t], task=tj)
+        ans, missing = instantiate(tpl, list(tx.ids), t)
+        g = ans if isinstance(ans, native.Graph) else goal_eval.circuit(ans, tx.targets, nat.C, tx.T)[0]
+        tau = ge.tau(tx, pool, split)
+        row = ge.fidelity(tx, [g], pool=pool, mode="reward", split=split)[0]
+        bits = goal_eval.size_bits(g, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd)
+        ct = goal_eval.circuit_term(row, tau, bits)
+        out.append({"task": task, "phi": ct["phi_full"], "R": ct["term"], "phi_tau": tau["phi_tau"], "bits": bits,
+                    "faithful": ct["phi"] is not None and tau["phi_tau"] is not None and ct["phi"] >= tau["phi_tau"],
+                    "missing_roles": missing})
+        native.free(nat.dev)
+    mean = lambda k: float(np.mean([o[k] for o in out if o[k] is not None])) if out else None  # noqa: E731
+    return {"texts": out, "coverage": float(np.mean([o["faithful"] for o in out])) if out else None, "phi": mean("phi"), "R": mean("R")}
 
 
 class Builder:

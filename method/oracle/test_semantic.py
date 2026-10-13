@@ -228,9 +228,11 @@ def test_same_evidence_under_different_ids_cannot_multiply_credit(invariant_toke
     class FakeChecker:
         def __init__(self, *args):
             pass
-        def check(self, items):
-            assert len(items) == 1
-            return [{"holds": True, "credit": 3.0}]
+        def check(self, items):  # the lines once (one line: the same evidence), then a two-input line's inputs alone
+            if not hasattr(self, "lines"):
+                self.lines = items
+                assert len(items) == 1
+            return [{"holds": True, "credit": 3.0} for _ in items]
         def close(self):
             pass
     monkeypatch.setattr(semantic, "Checker", FakeChecker)
@@ -471,3 +473,23 @@ def test_rules_out_rewording_cannot_duplicate_execution_credit(invariant_tokeniz
     assert len(runs) == 1
     assert len(doubled["rules_out"]) == 1 and doubled["bad"] == 1
     assert doubled["credit"] < single["credit"]
+
+
+def test_two_input_lines_get_one_input_checks(invariant_tokenizer, monkeypatch):
+    """A line changing two inputs is checked with each input alone: "alone" per input, "joint" when the line holds and
+    no input alone gives its outcome."""
+    class FakeChecker:
+        def __init__(self, *args):
+            pass
+
+        def check(self, items):  # V1 alone already gives the outcome; V2 alone does not
+            return [{"holds": not (len(iv["transplants"]) == 1 and iv["transplants"][0][0] == "V2"), "credit": 1.0} for iv, _ in items]
+
+        def close(self):
+            pass
+    monkeypatch.setattr(semantic, "Checker", FakeChecker)
+    got = semantic.check_invariants(None, None, [{"name": "V1"}, {"name": "V2"}],
+                                    "I1: V1 from @0=' x', V2 from @1=' z' -> top ' y'\nI2: V1 from @0=' x' -> top ' y'")
+    two, one = got["invariants"]
+    assert two["alone"] == [True, False] and two["joint"] is False
+    assert "alone" not in one and "joint" not in one

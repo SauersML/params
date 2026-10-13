@@ -199,6 +199,22 @@ def test_headline_rules():
     assert abs(out["e4"] - (0.5 + 0.0 + 0.8 + 0.6 + 1.0) / 5) < 1e-12
 
 
+def test_relational_flip(case):
+    """Flipping one stated relation (a feeds b, then a apart from b) on the same carriers moves the relational score and
+    leaves the carriers' terms as they are: the scorer's draws are the same, only the feeds test's claim changes."""
+    nat, ge, tx, at, _ = case
+    blocks = [["block", n, 233] for n in nat.names]
+    late = [["block", n, 288] for n in nat.names if native._name_layer_kind(n)[0] == nat.target.n_layer - 1]
+    got = []
+    for feeds in (["b"], []):
+        vs = variables.parse([{"name": "a", "inputs": [233], "group": blocks, "feeds": feeds},
+                              {"name": "b", "inputs": [288], "group": late}], nat.C)
+        got.append(variables.Scorer(ge).score(tx, vs, "eval", 3))
+    (x, y) = got
+    assert x["carriers"] == y["carriers"], (x["carriers"], y["carriers"])
+    assert abs(x["relational"] - y["relational"]) > 0.25, (x["relational"], y["relational"])
+
+
 def test_blocks(case):
     """Blocks (["block", site, position]: the site's whole output there, every subcomponent and the remainder): every
     site's block at 233 reproduces a change at 233 to float32 rounding (the stream at 233 reaches later positions only

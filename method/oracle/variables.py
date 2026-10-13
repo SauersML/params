@@ -165,6 +165,11 @@ def headline(out: dict) -> dict:
                unresolved=sum(x["f_on"] is None for x in V))
     each = [0.0 if x["f_on"] is None else min(y for y in (x["f_on"], x["f_off"], x.get("f_same")) if y is not None) for x in V]
     out["e4"] = mean(each + [x["f_comp"] for x in P] + [x["f"] for x in F])
+    # reported apart (an external review, the lead's 10-13): the carriers' terms alone, and the relations' alone, every
+    # ordered pair's stated relation (the feeds test where V feeds W is stated, the apart test where it is not) and each
+    # pair's composition; two answers with the same carriers and different stated relations differ only in the second
+    out["carriers"] = mean(each)
+    out["relational"] = mean([x["f_comp"] for x in P] + [x["f"] for x in F])
     return out
 
 

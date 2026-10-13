@@ -392,6 +392,33 @@ def parse_invariants(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
     return out, bad
 
 
+def units(iv: dict) -> list[tuple]:
+    """An intervention's changed inputs one by one: ("tokens", None, p, z) per token change and ("transplant", V, p, z)
+    per position of each transplant's donor."""
+    out = [("tokens", None, int(p), int(z)) for p, z in (iv.get("tokens") or {}).items()]
+    return out + [("transplant", name, int(p), int(z)) for name, ch in iv.get("transplants") or [] for p, z in ch.items()]
+
+
+def alone(iv: dict, u: tuple) -> dict:
+    """The intervention with one changed input u alone (its removals kept)."""
+    kind, name, p, z = u
+    return {"tokens": {p: z} if kind == "tokens" else {}, "transplants": [(name, {p: z})] if kind == "transplant" else [],
+            "remove": list(iv.get("remove") or [])}
+
+
+def one_input_checks(ck: "Checker", lines: list[tuple[dict, tuple]], rows: list[dict]) -> None:
+    """For each line changing two or more inputs, its outcome checked with each input changed alone (rows get "alone",
+    the holds per input, and "joint": the line holds and no input alone gives its outcome): a pooled check can hide an
+    input that carries almost nothing (an external review, the lead's 10-13)."""
+    todo = [(k, u) for k, (iv, _) in enumerate(lines) if len(units(iv)) > 1 for u in units(iv)]
+    got = ck.check([(alone(lines[k][0], u), lines[k][1]) for k, u in todo]) if todo else []
+    for (k, _), r in zip(todo, got):
+        rows[k].setdefault("alone", []).append(bool(r["holds"]))
+    for k, r in enumerate(rows):
+        if "alone" in r:
+            r["joint"] = bool(r["holds"]) and not any(r["alone"])
+
+
 def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model: str = "vpd4l", fresh_mean: bool = False) -> dict:
     """The INVARIANTS lines checked in the real model: per line holds, surprise and credit; the total credit in bits
     and the share holding (lines naming a variable the answer lacks, or not parsing, count as failing bold claims of
@@ -403,6 +430,7 @@ def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model:
     ck = Checker(sc, tx, vs, fresh_mean=True) if fresh_mean else Checker(sc, tx, vs)
     try:
         rows = [{"id": x["id"], "line": x["line"], **r} for x, r in zip(ok, ck.check([(x["intervention"], x["outcome"]) for x in ok]))]
+        one_input_checks(ck, [(x["intervention"], x["outcome"]) for x in ok], rows)
     finally:
         ck.close()
     total = sum(r["credit"] for r in rows) - bad
@@ -577,6 +605,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                 if y != ck.y0:
                     items.append((a, {"transplants": [(a, {pa: za}), (b, {pb: zb})]}, ("top", y), [(a, pa, za), (b, pb, zb), y]))
         rows = ck.check([(iv, out) for _, iv, out, _ in items])
+        one_input_checks(ck, [(iv, out) for _, iv, out, _ in items], rows)
         # graded removals (the lead's 10-13: 'p(top) < 0.5' held on 36%): the drop d in bits of the top token's
         # probability with V at its mean over the usual alternatives, claimed at half (p(top) < 2^(-d/2) x base) when
         # d >= REMOVE_MIN, and checked with V at its mean over fresh tokens (none of the usual alternatives)
@@ -607,7 +636,8 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
             k += 1
         else:
             line = f"remove {name} -> p(top) < {outc[1]:g}"
-        row = {"line": line, **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")}}
+        row = {"line": line, **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")},
+               **{x: r[x] for x in ("alone", "joint") if x in r}}
         if structured:
             import copy
 

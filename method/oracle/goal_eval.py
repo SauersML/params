@@ -1131,8 +1131,12 @@ class GoalEval:
             circ = {n: m.float() for n, m in self.masks(graph, T).items()}
         else:
             circ = {n: torch.zeros(T, nat.C[n], device=dev) for n in nat.names}
+            ix = {}
             for n, t, c in nodes:
-                circ[n][t, c] = 1.0
+                ix.setdefault(n, ([], []))[0].append(t)
+                ix[n][1].append(c)
+            for n, (t, c) in ix.items():  # one indexed write per site
+                circ[n][torch.tensor(t, device=dev), torch.tensor(c, device=dev)] = 1.0
         on = {n: circ[n][None].expand(B, -1, -1) if u is None else u[n] * (1 - circ[n]) + circ[n] for n in nat.names}
         a = {}
 
@@ -2824,8 +2828,12 @@ class GoalEval:
         circ, lever = [], []
         for g in graphs:
             ci = {n: torch.zeros(T, len(cols[n]), device=dev) for n in nat.names}
+            ix = {}
             for n, t, c in g.node_set():
-                ci[n][t, inv[n][c]] = 1.0
+                ix.setdefault(n, ([], []))[0].append(t)
+                ix[n][1].append(inv[n][c])
+            for n, (t, c) in ix.items():  # one indexed write per site
+                ci[n][torch.tensor(t, device=dev), torch.tensor(c, device=dev)] = 1.0
             circ.append(ci)
             lever.append({n: (tx.vpd[n][:, cols[n]] & (ci[n] == 0) & where).nonzero(as_tuple=True) for n in nat.names})
         keep = {n: torch.stack([1 - ci[n] for ci in circ]) for n in nat.names}  # [circuits, T, columns]: the circuit off
@@ -3000,9 +3008,15 @@ class GoalEval:
 
             def without(base, d, where):  # [draws, T, K]: base with each draw's nodes off
                 m = {n: x[None].repeat(len(d), 1, 1) for n, x in base.items()}
+                idx = {}
                 for b, dd in enumerate(d):
                     for n, t, c in dd:
-                        m[n][b, t, where[n][c]] = 0.0
+                        x = idx.setdefault(n, ([], [], []))
+                        x[0].append(b)
+                        x[1].append(t)
+                        x[2].append(where[n][c])
+                for n, ix in idx.items():  # one indexed write per site (a write per node was a kernel launch each)
+                    m[n][tuple(torch.tensor(i, device=dev) for i in ix)] = 0.0
                 return m
 
             def spec(where):  # every draw's reads of the circuit's nodes over an engine's columns
@@ -3030,8 +3044,12 @@ class GoalEval:
             lv = Ev.log_probs(without(vpd, drops, vat))
             if g.complete:
                 gm = {n: torch.zeros(T, len(circ[n]), device=dev) for n in nat.names}
+                on = {}
                 for n, t, c in nodes:
-                    gm[n][t, at[n][c]] = 1.0
+                    on.setdefault(n, ([], []))[0].append(t)
+                    on[n][1].append(at[n][c])
+                for n, (t, c) in on.items():
+                    gm[n][torch.tensor(t, device=dev), torch.tensor(c, device=dev)] = 1.0
                 lc, rc = run(Ec.log_probs, without(gm, drops, at), reads=spec(at))
             else:  # C's semantics, each draw's graph without its nodes
                 lc, rc = run(Ec.graph_log_probs, Ec.plan([_drop_nodes(g, set(d)) for d in drops], semantics="c"), reads=spec(at))

@@ -78,7 +78,7 @@ MAX_CALLS = 40  # tool calls per episode
 TEXTS_KEPT = 8  # texts whose Tools a process keeps (an RL group's episodes share one)
 LIST_TOP = 24  # list_active's default
 LIST_MAX = 400  # list_active's most
-REMOVE_EACH_MAX = 256  # measure_removal(each=True)'s most nodes
+REMOVE_EACH_MAX = 1024  # measure_removal(each=True)'s most nodes
 COMPARE_DRAWS = goal_eval.CHANGED_DRAWS  # compare's changed inputs (track_pp's draws on the tools' split)
 OTHER = {"search": "eval", "eval": "search"}
 LN2 = math.log(2)
@@ -582,16 +582,21 @@ class Scripted:
     """The baseline policy on the tools alone: influence(); list_active() at the target and the positions moving the
     prediction by at least 1% of the total; the influential start, the actives at the target and the m most
     influential positions as a complete node set (%% complete), m the smallest whose run_circuit pp reaches FLOOR;
-    then nodes pruned in order of their measured removal (measure_removal each, smallest first): a chunk of half the
-    remaining candidates dropped when run_circuit keeps pp and point within TOLERANCE of the start's, else halved, until
-    a chunk of one fails or the calls run out. The answer: the pruned node set, complete."""
+    then nodes pruned in order of their measured removal (measure_removal each, smallest first): each turn tries
+    dropping the next chunk, half of it and a quarter of it at once (three run_circuit calls) and keeps the largest
+    drop whose pp and point stay within TOLERANCE of the start's; the chunk starts at half the start and halves after
+    a turn with no drop kept, until it is below 1/MIN_FRACTION of the start or the turns or calls run out (the
+    episode's MAX_TURNS and MAX_CALLS, one turn kept for the answer). The answer: the pruned node set, complete, cut
+    to components.NODE_CAP nodes (the most needed kept) when larger."""
 
     FLOOR = 0.9
     TOLERANCE = 0.05
     MAX_POSITIONS = 8
+    MIN_FRACTION = 32
+    TRIALS = (1, 2, 4)  # a turn's drops: the chunk over these
 
-    def __init__(self, budget: int = MAX_CALLS - 4):
-        self.budget, self.gen, self.trace = budget, None, []
+    def __init__(self, max_turns: int = MAX_TURNS, max_calls: int = MAX_CALLS):
+        self.max_turns, self.max_calls, self.gen, self.trace = max_turns, max_calls, None, []
 
     def __call__(self, messages: list, tools: list) -> dict:
         if self.gen is None:
@@ -614,49 +619,52 @@ class Scripted:
         return "\n".join(lines[1:-1])  # without the fence
 
     def plan(self, messages: list):
-        calls = 0
+        turns, calls = 1, 1
         (inf,) = yield self._msg(_call("influence", top=16))
-        calls += 1
         t = inf["target"]
         share = [(row[0], row[3]) for row in inf["positions"] if row[0] != t]
         cands = [p for p, s in share if s is not None and s >= goal_eval.SHARE_FLOOR][:self.MAX_POSITIONS]
-        lists = yield self._msg(*[_call("list_active", position=p, top=LIST_MAX) for p in [t] + cands])
-        calls += len(lists)
+        pages = [(p, 0) for p in [t] + cands]
         act = {}
-        for r in lists:
-            act[r["position"]] = [components.node_of(x[0]) for x in r.get("subcomponents", [])]
-        start, score = None, None
+        while pages:  # every page of each position's actives (list_active's next_offset)
+            lists = yield self._msg(*[_call("list_active", position=p, top=LIST_MAX, offset=o) for p, o in pages])
+            turns, calls = turns + 1, calls + len(lists)
+            for r in lists:
+                act.setdefault(r["position"], []).extend(components.node_of(x[0]) for x in r.get("subcomponents", []))
+            pages = [(r["position"], r["next_offset"]) for r in lists if r.get("next_offset") is not None]
+        start, score = [], {}
         for m in range(len(cands) + 1):
             nodes = [nd for p in [t] + cands[:m] for nd in act.get(p, [])]
             (score,) = yield self._msg(_call("run_circuit", circuit=self._circuit(nodes)))
-            calls += 1
-            start = nodes
+            turns, calls, start = turns + 1, calls + 1, nodes
             self.trace.append({"m": m, "nodes": len(nodes), "pp": score.get("pp"), "point": score.get("point"), "bits": score.get("bits")})
             if (score.get("pp") or 0) >= self.FLOOR:
                 break
         base_pp, base_pt = score.get("pp") or 0.0, score.get("point") or 0.0
         (rem,) = yield self._msg(_call("measure_removal", nodes=[components.node_text(nd) for nd in start[:REMOVE_EACH_MAX]], each=True))
-        calls += 1
+        turns, calls = turns + 1, calls + 1
         kl = {components.node_of(x[0]): x[1] for x in rem.get("removals", [])}
         order = sorted(start, key=lambda nd: kl.get(nd, float("inf")))  # least needed first; unmeasured last
         keep, i, chunk = list(start), 0, max(1, len(order) // 2)
-        while i < len(order) and calls < self.budget:
-            drop = set(order[i:i + chunk])
-            trial = [nd for nd in keep if nd not in drop]
-            if not trial:
-                chunk = max(1, chunk // 2)
-                continue
-            (sc,) = yield self._msg(_call("run_circuit", circuit=self._circuit(trial)))
-            calls += 1
-            ok = (sc.get("pp") or 0) >= base_pp - self.TOLERANCE and (sc.get("point") or 0) >= base_pt - self.TOLERANCE
-            self.trace.append({"drop": len(drop), "nodes": len(trial), "pp": sc.get("pp"), "point": sc.get("point"),
-                               "bits": sc.get("bits"), "kept": ok})
-            if ok:
-                keep, i = trial, i + len(drop)
-            elif chunk == 1:
-                i += 1
+        floor = max(1, len(order) // self.MIN_FRACTION)
+        while i < len(order) and chunk >= floor and turns < self.max_turns - 1 and calls + len(self.TRIALS) <= self.max_calls:
+            sizes = sorted({max(1, chunk // k) for k in self.TRIALS}, reverse=True)
+            trials = [[nd for nd in keep if nd not in set(order[i:i + n])] for n in sizes]
+            got = yield self._msg(*[_call("run_circuit", circuit=self._circuit(tr)) for tr in trials])
+            turns, calls = turns + 1, calls + len(trials)
+            kept = None
+            for n, tr, sc in zip(sizes, trials, got):
+                ok = (sc.get("pp") or 0) >= base_pp - self.TOLERANCE and (sc.get("point") or 0) >= base_pt - self.TOLERANCE
+                self.trace.append({"drop": n, "nodes": len(tr), "pp": sc.get("pp"), "point": sc.get("point"), "bits": sc.get("bits"), "kept": ok})
+                if ok and kept is None:
+                    kept = (n, tr)
+            if kept:
+                keep, i = kept[1], i + kept[0]
             else:
-                chunk = max(1, chunk // 2)
+                chunk //= 2
+        if len(keep) > components.NODE_CAP:  # the answer's cap: the most needed kept
+            keep = sorted(keep, key=lambda nd: -kl.get(nd, float("inf")))[:components.NODE_CAP]
+            self.trace.append({"cap": components.NODE_CAP})
         q = [m for m in messages if m["role"] == "user"][0]["content"]
         n_q, n_e = q.count("\nQuestion "), q.count("\nEdit ")
         top = TOP_RE.search(q)

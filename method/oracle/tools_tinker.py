@@ -126,6 +126,7 @@ async def make_env(client: httpx.AsyncClient, server: str, task: str, renderer, 
             answer = get_text_content(renderer.parse_response(out.tokens)[0]) or ""
             record["forced"] = {"prefill": prompt.length, "sampled": len(out.tokens)}
         turns = sum(1 for m in history if m.get("role") == "assistant")
+        record["answer"] = answer  # the text scored (a forced turn's is in no message)
         res = (await client.post(f"{server}/submit", json={"episode": eid, "answer": answer, "turns": turns}, timeout=None)).json()
         record["result"] = res
         return float(res.get("reward", INVALID)), {"calls": res.get("calls", 0), "answered": float(answer is not None)}
@@ -173,7 +174,8 @@ def traj_row(traj, record: dict, renderer) -> dict:
     return {"task": record["task"], "episode": record["episode"], "reward": res.get("reward", own), "answer_reward": res.get("answer_reward"),
             "calls": res.get("calls"), "turns": len(traj.transitions), "stop": traj.stop_reason, "answered": res.get("answered"),
             "scores": res.get("scores"), "observation_tokens": obs, "sampled_tokens": acts,
-            "final_context": (obs[-1] + acts[-1]) if obs else 0, "log": res.get("log"), "messages": msgs}
+            "final_context": (obs[-1] + acts[-1]) if obs else 0, "log": res.get("log"), "messages": msgs,
+            "answer": record.get("answer")}
 
 
 async def rollouts(policy, server: str, tasks: list[str], group: int, renderer, max_turns: int, max_tokens: int,

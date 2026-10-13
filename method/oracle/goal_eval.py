@@ -552,27 +552,27 @@ def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> f
 
 def _ratio_pool(draws: list, raw: bool = False) -> float | None:
     """The "weighted" families' score ([prompt, KL_C, KL_VPD, W] per draw: track_pp, interchange_pp, nodes, omitted):
-    each draw's ratio ln(W / KL_C) / ln(W / KL_VPD) clipped to [0, 1] (raw [-1, 1]), averaged with weights
-    ln(W / KL_VPD), over the draws where VPD's answer is nearer than no change (KL_VPD < W). The lead's 10-13: weighted
-    by W, a draw whose VPD run sits near the no-change bound flipped between 0 and 1 on tiny KL changes (s_track_pp on
-    text9002 between 0.21 and 0.85); an unclipped pooled ratio instead let one draw far past the bound swing it (text9002's
-    F+V circuit 0.68-1.00 over 4 seeds). None without such draws or unless the weights' sum exceeds twice its standard
-    error over them (sqrt(n) x their spread)."""
-    num, den = [], []
+    the share of VPD's improvement over no change the circuit makes, sum over draws of clip(W - KL_C, 0, W - KL_VPD) /
+    sum of (W - KL_VPD), over the draws where VPD's answer is nearer than no change (KL_VPD < W); raw: the clip from
+    -(W - KL_VPD), so in [-1, 1]. Each draw weighs its VPD gap W - KL_VPD in bits: one whose VPD run sits near the
+    bound weighs nothing, and no draw outweighs its own change. On text9002's F+V circuits over 4 draw seeds (the lead's
+    10-13 swing): spread 0.002-0.026, against 0.023-0.074 for per-draw log ratios weighted by W and 0.12-0.32 for
+    pooled or gap-weighted log ratios (ln(W / KL_VPD) grows without bound as VPD's KL nears 0). None without such draws
+    or unless the gaps' sum exceeds twice its standard error over them (sqrt(n) x their spread)."""
+    num, gap = [], []
     for d in draws or []:
         w, kc, kv = d[3], d[1], d[2]
         if kc is None or kv is None or not (w > 0 and kv < w):
             continue
-        den.append(math.log(w / max(kv, 1e-12)))
-        num.append(math.log(w / max(kc, 1e-12)))
-    if not den:
+        g = w - kv
+        gap.append(g)
+        num.append(min(g, max(-g if raw else 0.0, w - kc)))
+    if not gap:
         return None
-    total = float(sum(den))
-    if len(den) > 1 and not total > 2.0 * math.sqrt(len(den)) * float(np.std(den, ddof=1)):
+    total = float(sum(gap))
+    if len(gap) > 1 and not total > 2.0 * math.sqrt(len(gap)) * float(np.std(gap, ddof=1)):
         return None
-    lo = -1.0 if raw else 0.0
-    return float(sum(d_ * min(1.0, max(lo, n_ / d_)) for n_, d_ in zip(num, den))) / total
-
+    return float(sum(num)) / total
 
 def _spec(draws: list, raw: bool = False) -> float | None:
     """N (necessity_spec) from its records [control, D_c, D_c(VPD), D_t, D_t(VPD)]: (D_t - mean D_c) / (D_t(VPD) -
@@ -606,10 +606,9 @@ def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: 
         return [(float(v) if raw else max(0.0, float(v))) if ok else None for v, ok in zip(x, den > 0)]
     if kind == "weighted":  # _ratio_pool per resample (its standard-error guard is the point estimate's)
         ok = [d[1] is not None and d[2] is not None and d[3] > 0 and d[2] < d[3] for d in draws]
-        dn = np.array([math.log(d[3] / max(d[2], 1e-12)) if o else 0.0 for d, o in zip(draws, ok)], dtype=float)
-        nm = np.array([math.log(d[3] / max(d[1], 1e-12)) if o else 0.0 for d, o in zip(draws, ok)], dtype=float)
-        r = np.clip(nm / np.where(dn > 0, dn, 1.0), -1.0 if raw else 0.0, 1.0) * dn  # each draw's clipped ratio x its weight
-        num, den = r[idx].sum(1), dn[idx].sum(1)
+        gp = np.array([d[3] - d[2] if o else 0.0 for d, o in zip(draws, ok)], dtype=float)
+        nm = np.array([min(d[3] - d[2], max(-(d[3] - d[2]) if raw else 0.0, d[3] - d[1])) if o else 0.0 for d, o in zip(draws, ok)], dtype=float)
+        num, den = nm[idx].sum(1), gp[idx].sum(1)
         return [float(a) / float(b) if b > 0 else None for a, b in zip(num, den)]
     if kind == "mean":
         if e0 is None:

@@ -71,20 +71,14 @@ def test_eps_cap_and_n_guard():
 
 
 def test_pooled_ratio():
-    """The weighted families' score: each draw's ratio ln(W / KL_C) / ln(W / KL_VPD) clipped to [0, 1] (raw [-1, 1]),
-    averaged with weights ln(W / KL_VPD) over the draws where VPD is nearer than no change: a draw with VPD at the
-    bound weighs nothing, one far past the bound counts at most its clip; None when the weights' sum is within twice its
-    standard error."""
-    import math
+    """The weighted families' score: sum clip(W - KL_C, 0, W - KL_VPD) / sum (W - KL_VPD) over the draws where VPD is
+    nearer than no change (raw: clipped from below at -(W - KL_VPD)); a draw with VPD at the bound weighs nothing; None
+    when the gaps' sum is within twice its standard error."""
     d = [[0, 0.5, 0.2, 2.0], [1, 1.0, 0.4, 2.0], [2, 2.5, 0.3, 2.0], [3, 9.0, 3.0, 2.0]]  # the last: VPD past W, left out
-    w = [math.log(2.0 / 0.2), math.log(2.0 / 0.4), math.log(2.0 / 0.3)]
-    r = [min(1.0, max(0.0, math.log(2.0 / kc) / x)) for kc, x in zip((0.5, 1.0, 2.5), w)]
-    want = sum(a * b for a, b in zip(r, w)) / sum(w)
+    want = (1.5 + 1.0 + 0.0) / (1.8 + 1.6 + 1.7)
     assert abs(goal_eval._ratio_pool(d) - want) < 1e-12
-    assert abs(goal_eval._ratio_pool(d[:3] + [[4, 0.1, 1.9999, 2.0]]) - want) < 1e-3  # VPD at the bound weighs ~5e-5
-    assert goal_eval._ratio_pool(d[:3] + [[5, 500.0, 0.25, 2.0]]) >= 0.0  # far past the bound: 0, not ln(2 / 500)
+    assert abs(goal_eval._ratio_pool(d, raw=True) - (1.5 + 1.0 - 0.5) / 5.1) < 1e-12
+    assert abs(goal_eval._ratio_pool(d[:3] + [[4, 0.1, 1.9999, 2.0]]) - want) < 1e-4  # VPD at the bound weighs 1e-4 bits
     assert goal_eval._pooled("weighted", d, None) == goal_eval._ratio_pool(d)
     assert goal_eval._ratio_pool([[0, 50.0, 0.2, 2.0], [1, 40.0, 0.3, 2.0]], raw=True) == -1.0
-    noisy = [[j, 1.0, 2.0 * (1 - 0.999 * (j % 2)), 2.0] for j in range(6)]  # VPD at the bound on half the draws
-    assert goal_eval._ratio_pool(noisy) is not None
-    assert goal_eval._ratio_pool([[0, 1.0, 1.99, 2.0], [1, 1.0, 1.0, 2.0], [2, 1.0, 1.999, 2.0]]) is None
+    assert goal_eval._ratio_pool([[0, 1.0, 1.99, 2.0], [1, 1.0, 0.0, 2.0], [2, 1.0, 1.999, 2.0]]) is None

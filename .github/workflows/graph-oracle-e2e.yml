@@ -16,6 +16,13 @@ on:
       - "experiments/oracle/**"
       - ".github/workflows/graph-oracle-e2e.yml"
   workflow_dispatch:
+    inputs:
+      replay_saved_toy_wiring:
+        description: "Replay four fixed public toy truth/active completions with executed wiring (no policy generation)"
+        type: boolean
+        required: false
+        default: false
+
 
 concurrency:
   group: graph-oracle-e2e-${{ github.ref }}
@@ -70,3 +77,18 @@ jobs:
             -p no:cacheprovider -v --tb=short
           python -B method/oracle/rl/test_scorer.py
           python -B method/oracle/rl/test_train.py
+
+      - name: Replay saved toy teacher wiring
+        if: github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring
+        timeout-minutes: 8
+        run: |
+          git fetch --no-tags --depth=1 origin 9e3782861caa3e738d6b91122a527487157df349
+          python -u experiments/oracle/toyloop/replay_wiring.py --out "${{ runner.temp }}/toy-wiring-replay"
+
+      - name: Upload saved toy wiring replay
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring
+        uses: actions/upload-artifact@v4
+        with:
+          name: saved-toy-wiring-replay-${{ github.sha }}
+          path: ${{ runner.temp }}/toy-wiring-replay
+          if-no-files-found: warn

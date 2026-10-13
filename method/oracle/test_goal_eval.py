@@ -899,10 +899,38 @@ def test_node_family_is_the_masked_runs(tiny):
             assert abs(row[key] - want) < 1e-6 + 1e-4 * abs(want), (key, row[key], want)
 
 
-def test_adversary_batch_is_per_circuit(tiny):
+def test_adversary_batch_is_per_circuit(tiny, monkeypatch):
     """The adversary's batched objective (every circuit's rows in one run of each kind: stated graphs as a list, complete
     ones, VPD's answer) gives each circuit's own KLs and gradients within float32 rounding."""
+    import hashlib
+    import json
+    import platform
+
     nat, ge, tx = tiny
+    def difference(x, y, rtol, atol):
+        error = (x.detach() - y.detach()).abs()
+        bound = atol + rtol * y.detach().abs()
+        return {"max_abs": float(error.max()) if error.numel() else 0.,
+                "max_relative": float((error / y.detach().abs().clamp_min(1e-30)).max()) if error.numel() else 0.,
+                "max_tolerance_ratio": float((error / bound).max()) if error.numel() else 0.,
+                "norm_batch": float(x.detach().norm()), "norm_single": float(y.detach().norm()),
+                "passes": torch.allclose(x, y, rtol=rtol, atol=atol)}
+    diagnostics = {"torch": torch.__version__, "platform": platform.platform(), "threads": torch.get_num_threads(),
+                   "interop_threads": torch.get_num_interop_threads(), "mkldnn": torch.backends.mkldnn.enabled,
+                   "cpu_capability": torch.backends.cpu.get_cpu_capability(),
+                   "rng_sha256": hashlib.sha256(torch.get_rng_state().numpy().tobytes()).hexdigest(),
+                   "torch_build": torch.__config__.show(), "circuits": [], "forward_calls": [],
+                   "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                      for p in (Path(__file__), HERE / "goal_eval.py", HERE / "engine.py", HERE / "carry.py")}}
+    original_kl, scope = carry.kl, "batch"
+    def capture_kl(lp, lq):
+        result = original_kl(lp, lq)
+        diagnostics["forward_calls"].append({"scope": scope, "reference_logp": lp.detach().tolist(),
+                                              "candidate_logp": lq.detach().tolist(),
+                                              "kl_float32": result.detach().tolist(),
+                                              "kl_float64_from_same_logp": original_kl(lp.detach().double(), lq.detach().double()).tolist()})
+        return result
+    monkeypatch.setattr(carry, "kl", capture_kl)
     nodes = sorted(native.Graph(masks=tx.vpd).node_set())
     graphs = [native.Graph(nodes[::3], *native.all_edges(nodes[::3], tx.targets)), native.Graph(nodes[1::4], complete=True),
               native.Graph(nodes[::5], *native.all_edges(nodes[::5], tx.targets))]
@@ -918,13 +946,24 @@ def test_adversary_batch_is_per_circuit(tiny):
     gb = torch.autograd.grad(loss, leaves, allow_unused=True)
     k = 0
     for (i, w, b), (kc, kv) in zip(items, got):
+        scope = f"single{i}"
         wc, bc = w.detach().clone().requires_grad_(True), {n: x.detach().clone().requires_grad_(True) for n, x in b.items()}
         kc1, kv1 = problems[i][0](wc, bc)
-        assert torch.allclose(kc, kc1, rtol=1e-5, atol=1e-7) and torch.allclose(kv, kv1, rtol=1e-5, atol=1e-7)
         g1 = torch.autograd.grad((kc1.log() - kv1.log()).sum(), [wc] + [bc[n] for n in nat.names], allow_unused=True)
+        record = {"circuit": i, "kc_batch": kc.detach().tolist(), "kc_single": kc1.detach().tolist(),
+                  "kv_batch": kv.detach().tolist(), "kv_single": kv1.detach().tolist(),
+                  "kc": difference(kc, kc1, 1e-5, 1e-7), "kv": difference(kv, kv1, 1e-5, 1e-7),
+                  "objective_batch": float((kc.log() - kv.log()).sum().detach()),
+                  "objective_single": float((kc1.log() - kv1.log()).sum().detach()), "gradients": []}
         for x, y in zip(gb[k:k + len(g1)], g1):
-            assert (x is None) == (y is None) and (x is None or torch.allclose(x, y, rtol=1e-4, atol=1e-6))
+            record["gradients"].append({"passes": (x is None) == (y is None)} if x is None or y is None
+                                       else difference(x, y, 1e-4, 1e-6))
+        diagnostics["circuits"].append(record)
         k += len(g1)
+    # Collect gradients for every circuit before the first assertion, retaining the original tolerances.
+    print("ADVERSARY_BATCH_DIAGNOSTIC " + json.dumps(diagnostics, sort_keys=True))
+    assert all(r["kc"]["passes"] and r["kv"]["passes"] and all(g["passes"] for g in r["gradients"])
+               for r in diagnostics["circuits"]), diagnostics
 
 
 def test_fidelity_table_groups():

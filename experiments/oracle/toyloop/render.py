@@ -201,13 +201,15 @@ def behaviour_lines(toy: Toy, n_texts: int = 2) -> list[str]:
     return lines
 
 
-def render(toy: Toy, n_texts: int = 2) -> str:
+def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None) -> str:
+    """The prompt. weights_from: take the weight section from another toy (same architecture), keeping this toy's
+    behaviour section (the swapped-weights control: does the answer follow the weights?)."""
     L, H, hd = heads_of(toy.cfg)
     head = (f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
             f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.\n"
             "Weights (QK: query>key token pairs scored through the embedding; OV: source>written token pairs; "
             "comp: Q/K/V composition with an earlier head's output):")
-    return "\n".join([head, *weight_lines(toy), "Behaviour:", *behaviour_lines(toy, n_texts),
+    return "\n".join([head, *weight_lines(weights_from or toy), "Behaviour:", *behaviour_lines(toy, n_texts),
                       "Which units implement the prediction at the last position, and how?", FORMAT])
 
 

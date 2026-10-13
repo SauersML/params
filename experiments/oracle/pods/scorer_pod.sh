@@ -9,7 +9,9 @@
 #   experiments/oracle/pods/scorer_pod.sh ROWS.jsonl HOURS   (env: RUN, GPU, PRICE, VRAM, WORKERS, RP_OWNER, VARIABLES=1: E4,
 #                                                            SRCREV: the source revision, default origin/main,
 #                                                            TEACHER: the texts' teacher circuits (reward v3's dominance term))
-# Two scoring processes need a 48 GB card (the default): on 24 GB a long text ran out of memory (RL v1, 10-12).
+# Two scoring processes need a 48 GB card (the default): on 24 GB a long text ran out of memory (RL v1, 10-12). The scorer
+# waits on the policy's sampling between bursts (12% mean GPU over 15 minutes in RL from S1, 10-13), so rp-run's idle stop
+# is set at 3% (RP_IDLE_PCT) instead of 20%.
 #   bash experiments/oracle/pods/scorer_tunnel.sh $RUN   the tunnel (then --scorer http://127.0.0.1:8767/score)
 cd /Users/user/params
 ROWS=$1 H=${2:-6}
@@ -32,5 +34,5 @@ ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \
 cd $S/method/oracle; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 5 > $O/gpu.csv & \
 python rl/serve_components.py $I/rows.jsonl --port 8767 --workers ${WORKERS:-2} --device cuda ${VARIABLES:+--variables} ${TEACHER:+--teacher $I/teacher} > $O/serve.log 2>&1"
-RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-200} RP_OWNER=${RP_OWNER:-fleet} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-1.0} \
+RP_IDLE_PCT=${RP_IDLE_PCT:-3} RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-200} RP_OWNER=${RP_OWNER:-fleet} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-1.0} \
   RP_MIN_VRAM_GB=${VRAM:-44} experiments/infra/runpod/rp-run $N "${GPU:-RTX A6000,A40,L40S,L40}" $H -- bash -c "$CMD"

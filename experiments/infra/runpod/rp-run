@@ -3119,7 +3119,7 @@ idle_check() {
         (( now - started >= 900 )) || continue
         # On the pod's clock: the command's start is its run.pid file's time.
         mean=$(on_pod "$(declare -f idle_since); awk -v t=\$(idle_since \$(stat -c %Y $WS/run.pid) \$(date +%s)) '$IDLE_MEAN' /workspace/gpu-util.log" < /dev/null 2> /dev/null || true)
-        if [ -n "$mean" ] && (( mean < 20 )); then
+        if [ -n "$mean" ] && (( mean < ${RP_IDLE_PCT:-20} )); then  # RP_IDLE_PCT: a server answering bursts (the RL scorer) sets it lower
             say "GPU at $mean% over the last 15 minutes: stopping the run as idle"
             (( GUEST )) || echo idle-stopped > "$ACTIVE/.$POD.end"
             touch "$OUT/STOP"

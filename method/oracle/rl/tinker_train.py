@@ -409,8 +409,15 @@ def sft(a) -> None:
         nll = compute_mean_nll([o["logprobs"] for o in out.loss_fn_outputs], [d.loss_fn_inputs["weights"] for d in batch])
         print(json.dumps({"step": step, "nll": nll, "tokens": trained, "usd": usd, "total_usd": spend.total,
                           "seconds": time.time() - t0}), flush=True)
+        if a.save_every and (step + 1) % a.save_every == 0 and step + 1 < a.steps:  # the learning curve's checkpoints
+            path = training.save_state(f"{a.name}-{step + 1}").result().path
+            with (a.log / "checkpoints.jsonl").open("a") as f:
+                f.write(json.dumps({"step": step + 1, "state": path, "usd": spend.total, "base": a.base}) + "\n")
     saved = training.save_state(a.name).result()
     (a.log / "state.json").write_text(json.dumps({"state": saved.path, "base": a.base, "rank": a.rank}))
+    if a.save_every:
+        with (a.log / "checkpoints.jsonl").open("a") as f:
+            f.write(json.dumps({"step": a.steps, "state": saved.path, "usd": spend.total, "base": a.base}) + "\n")
     print(json.dumps({"saved": saved.path, "total_usd": spend.total}), flush=True)
 
 
@@ -577,6 +584,8 @@ def main():
     s.add_argument("--batch", type=int, default=8)
     s.add_argument("--lr", type=float, help="peak rate, linear decay to 0 (default: the cookbook's LoRA rate for the base)")
     s.add_argument("--max-length", type=int, default=16384)
+    s.add_argument("--save-every", type=int, default=0, help="a checkpoint every k steps and the last, in DIR/checkpoints.jsonl "
+                                                              "(rl_heldout.sh's input: the learning curve)")
     r = sub.choices["rl"]
     r.add_argument("--scorer", required=True)
     r.add_argument("--init", help="a tinker:// state path (sft's DIR/state.json)")

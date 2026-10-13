@@ -338,6 +338,8 @@ def test_cut_detail(tiny):
     assert d["top"] == [int(logq.argmax())]
     assert abs(d["logp_model_top"][0] - float(logq[int(full[last].argmax())])) < 1e-4
     assert abs(d["kl"] - ge.cuts(tx, [(w, None)])[0]) == 0
+    full = ge.cuts(tx, [(w, None)], detail=True, lq=True)[0]["lq"]  # the cut run's whole distribution (primerl's partial credit)
+    assert full.shape == (len(tx.targets), tx.ref.shape[-1]) and torch.allclose(full[0], logq.float().cpu(), atol=1e-4)
 
 
 def test_interchange_rule_b(tiny):

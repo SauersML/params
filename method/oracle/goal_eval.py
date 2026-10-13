@@ -1902,13 +1902,14 @@ class GoalEval:
     # ---- whole-model cuts (question answering, teachers)
 
     @torch.no_grad()
-    def cuts(self, tx: Text, pairs: list[tuple], detail: bool = False, mode: str = "full") -> list:
+    def cuts(self, tx: Text, pairs: list[tuple], detail: bool = False, mode: str = "full", lq: bool = False) -> list:
         """Per (writer, reader) pair (reader None: the prediction), the KL in bits of the model on the text from the
         model with that one connection cut: the reader's new activation is its input in the model without the
         writer's output alone (every other output and every remainder as in the model), and the model runs on with
         that one activation replaced (path patching of the connection, _patched); into the prediction, the final
         residual stream without the writer's output. detail: per pair {"kl", "top": the cut run's most likely token at
-        each target, "logp_model_top": its log-probability of the model's most likely token there}. mode (primerl's
+        each target, "logp_model_top": its log-probability of the model's most likely token there; with lq, "lq": the cut
+        run's log-probabilities at the targets [len(targets), V] on the CPU (primerl's partial credit)}. mode (primerl's
         normalization questions): "full" the cut as above; "direct" the reader reads its input without the writer's
         output but its RMSNorm scale is the uncut input's; "norm" the reader reads its uncut input under the RMSNorm
         scale of the input without the writer's output (an attention or MLP output reads no norm: "direct" is the full
@@ -1917,10 +1918,10 @@ class GoalEval:
             raise ValueError("mode is full, direct or norm")
         nat = self.nat
         key = (lambda e: e) if mode == "full" else (lambda e: (e, mode))
-        todo = [e for e in dict.fromkeys(pairs) if key(e) not in tx.cut_cache]
+        todo = [e for e in dict.fromkeys(pairs) if key(e) not in tx.cut_cache or (lq and "lq" not in tx.cut_cache[key(e)])]
         if todo:
             ctx = {"make": lambda B: (nat._full_plan(tx.T, B), nat._model_states(tx.ids, B)), "ablation": nat._one(),
-                   "ref": tx.ref, "flow": self.flow(tx), "rec": tx.rec, "ids": tx.ids, "mode": mode}
+                   "ref": tx.ref, "flow": self.flow(tx), "rec": tx.rec, "ids": tx.ids, "mode": mode, "lq": lq}
             for e, d in zip(todo, self._patched(tx, ctx, todo)):
                 tx.cut_cache[key(e)] = d
         return [tx.cut_cache[key(e)] if detail else tx.cut_cache[key(e)]["kl"] for e in pairs]
@@ -1938,10 +1939,10 @@ class GoalEval:
         ref = ctx["ref"]
         top = ref[0].argmax(-1)  # [len(targets)]
 
-        def summary(lq):
-            return [{"kl": k, "top": t, "logp_model_top": p} for k, t, p in
-                    zip(carry.kl(ref, lq).tolist(), lq.argmax(-1).tolist(),
-                        lq.gather(-1, top[None, :, None].expand(lq.shape[0], -1, 1))[..., 0].tolist())]
+        def summary(lq):  # (ctx["lq"]: each cut run's whole distribution at the targets kept too)
+            return [{"kl": k, "top": t, "logp_model_top": p, **({"lq": lq[b].float().cpu()} if ctx.get("lq") else {})}
+                    for b, (k, t, p) in enumerate(zip(carry.kl(ref, lq).tolist(), lq.argmax(-1).tolist(),
+                                                      lq.gather(-1, top[None, :, None].expand(lq.shape[0], -1, 1))[..., 0].tolist()))]
 
         inner = sorted((j for j, (_, r) in enumerate(pairs) if r is not None), key=lambda j: (pairs[j][1][1], pairs[j][0][1]))
         final = sorted((j for j, (_, r) in enumerate(pairs) if r is None), key=lambda j: pairs[j][0][1])

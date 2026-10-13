@@ -2611,7 +2611,9 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
             content = target(answer, r, task["model"], ops, token_strings(task["model"], prompt["token_ids"]))
             if traces:  # the teacher's search as the thinking before the answer (thinking_trace; Qwen3's thinking renderer)
                 pf = teacher_dir / f"{r['task']}.path.json"
-                path = {**(json.loads(pf.read_text()) if pf.exists() else {}), "repick": repicked.get(r["task"])}
+                rec = repicked.get(r["task"])  # a record of an earlier circuit (a rerun replaced it) says nothing about this one
+                rec = rec if rec and rec.get("new_size") == len([x for x in answer["nodes"] if x[0] != TOK]) else None
+                path = {**(json.loads(pf.read_text()) if pf.exists() else {}), "repick": rec}
                 trace = thinking_trace(path, task["model"], prompt["token_ids"], answer)
                 content = f"<think>\n{trace}\n</think>\n\n{content}"
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],

@@ -879,6 +879,27 @@ def test_dataset_preserves_checked_invariants_and_failed_provenance_opt_in(monke
     assert "INVARIANTS" not in legacy["completion"][0]["content"] and "invariant_supervision" not in legacy["info"]
 
 
+def test_dataset_traces_state_a_repick_only_for_the_circuit_it_describes(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    texts, teachers = tmp_path / "texts", tmp_path / "teachers"
+    (texts / "vpd4l").mkdir(parents=True)
+    teachers.mkdir()
+    (texts / "vpd4l/text6000.json").write_text(json.dumps({"id": "text6000", "model": "mock",
+                                                          "prompts": [{"token_ids": [1, 2], "target_positions": [1]}]}))
+    (teachers / "text6000.json").write_text(json.dumps({"nodes": [["h.0.attn.v_proj", 1, 0]], "edges": [], "complete": True}))
+    monkeypatch.setattr(native, "TEXTS", texts)
+    monkeypatch.setattr(components, "token_strings", lambda model, ids: [" x"] * len(ids))
+    ge = SimpleNamespace(nat=SimpleNamespace(C={"h.0.attn.v_proj": 4}))
+    source, out = tmp_path / "rows.jsonl", tmp_path / "sft.jsonl"
+    source.write_text(json.dumps({"task": "text6000", "question": "q", "qa": []}) + "\n")
+    rec = {"task": "text6000", "stage": "chunk4", "size": 1, "v": 0.03, "repicked": True, "new_stage": "start", "new_size": 1}
+    for size, said in ((1, True), (3, False)):  # 3: the record of a circuit a rerun has since replaced
+        (teachers / "repick.jsonl").write_text(json.dumps({**rec, "new_size": size}) + "\n")
+        assert components.dataset(source, teachers, out, ge, traces=True) == 1
+        assert ("Check: stage chunk4" in json.loads(out.read_text())["completion"][0]["content"]) == said
+
+
 def test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit(monkeypatch, tmp_path, capsys):
     from types import SimpleNamespace
 

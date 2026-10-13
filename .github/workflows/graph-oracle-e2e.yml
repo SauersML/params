@@ -82,7 +82,7 @@ jobs:
           python -B method/oracle/rl/test_train.py
 
       - name: Replay saved toy teacher wiring
-        if: github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring
         timeout-minutes: 8
         run: |
           git fetch --no-tags --depth=1 origin 9e3782861caa3e738d6b91122a527487157df349

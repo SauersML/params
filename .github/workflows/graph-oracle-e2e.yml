@@ -83,6 +83,7 @@ jobs:
             experiments/oracle/test_claim_donor_features.py experiments/oracle/test_claim_reader_probe.py \
             experiments/oracle/test_claim_lastdown_contract.py experiments/oracle/test_claim_joint_contract.py \
             method/oracle/test_edit_affine.py experiments/oracle/test_claim_affine_envelope.py experiments/oracle/test_claim_affine_english_probe.py \
+            experiments/oracle/toyloop/test_learning_model_bank.py experiments/oracle/toyloop/test_learning_bank_teacher.py \
             method/oracle/test_components.py::test_empty_like_answer_stays_below_zero method/oracle/test_reward_compactness.py \
             method/oracle/test_semantic.py method/oracle/test_task_data.py \
             method/oracle/test_tools_env.py::test_baselines_include_empty_and_same_batch_calibration \

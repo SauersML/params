@@ -50,7 +50,7 @@ def main():
     ax.set_ylim(0, 1.2)
     ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
     ax.set_ylabel("share of items")
-    ax.text(x[-1] + 0.45, 0.06, "dash: a random context\nposition in the circuit", ha="right", fontsize=12, color=figure.INK)
+    ax.text(x[-1] + 0.45, 1.12, "dash: a random context\nposition in the circuit", ha="right", va="top", fontsize=12, color=figure.INK)
     figure.clean(ax)
     ax.set_title("Circuits that include the item's measured mechanism and not the other mechanism")
     fig.tight_layout()

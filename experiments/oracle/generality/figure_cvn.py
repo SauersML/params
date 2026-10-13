@@ -25,10 +25,10 @@ RUNS = {"c": sorted(Path("/Users/user/mpd-data/runpod/oracle-graph-generality25a
         + sorted(Path("/Users/user/mpd-data/cluster/oracle-graph-generality-cgn/out").glob("causalgym_falsify_blocks_behavior_n_pod_*.jsonl"))}
 TERMS = [("R", "reward R"), ("phi", "Φ (fidelity)"), ("s_point", "prediction on the text\n(circuit alone)"),
          ("s_flips", "adversarial flips\n(circuit alone)"), ("s_nodes", "node removal"),
-         ("s_track_pp", "input changes\n(circuit patched from\nthe paired text)"),
-         ("s_interchange_pp", "interchange\n(circuit patched from\nthe paired text)")]
+         ("s_track_pp", "input changes\n(circuit patched\nfrom the\npaired text)"),
+         ("s_interchange_pp", "interchange\n(circuit patched\nfrom the\npaired text)")]
 LEGEND = {"c": "subcomponents outside the circuit removed in every term",
-          "n": "the same, except that node removal sets the norm scales and the query and key subcomponents outside "
+          "n": "a second run, where node removal sets the norm scales and the query and key subcomponents outside "
                "the circuit to their values on the text"}
 TASKS = ("agr_refl_num_obj-relc", "agr_refl_num_pp", "agr_refl_num_subj-relc", "agr_sv_num_obj-relc")
 
@@ -61,7 +61,7 @@ def main():
         hi = np.array([r[2] for r in res[sem]]) - v
         ax.bar(x + off, v, 0.34, color=col, yerr=[lo, hi], capsize=4, error_kw={"lw": 1.2}, label=LEGEND[sem])
     ax.axhline(0.5, color=figure.INK, lw=1, ls=":")
-    ax.text(len(TERMS) - 0.5, 0.52, "chance", ha="right", fontsize=13)
+    ax.text(-0.5, 0.52, "chance", ha="left", fontsize=13)
     ax.set_xticks(x, [lab for _, lab in TERMS])
     ax.set_ylim(0, 1.08)
     ax.set_ylabel("share of pairs where the\nsubject circuit scores higher")

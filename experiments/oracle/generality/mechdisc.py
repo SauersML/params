@@ -321,7 +321,9 @@ def judge(r: dict, ans: dict) -> dict:
         m = r["m"] - s
         out.update(holds_m=m in pos, right=m in pos, wrong=not (pos - {t, t - 1}), ctx_pair=ctx_pair)  # wrong: target-local only
     else:
-        out.update(right=not ctx_pair, wrong=ctx_pair)
+        # right: the measured local source (position t, whose token's replacement took y off the top) in the circuit and
+        # no previous-token pair in the context; right_one (the one-sided reading an empty circuit passes) beside it
+        out.update(right=(t in pos and not ctx_pair), right_one=not ctx_pair, wrong=ctx_pair)
     return out
 
 
@@ -349,7 +351,8 @@ def _boot(ws) -> str:
 def score(answers: list | None = None, tdirs: list | None = None):
     """Per contrast: the teacher's circuits (every run's mechdisc_teacher/) and S1's answers (answers: JSONL of
     {task, sample, text}, the circuit components.parse(text)["answer"]), each item's right (copy: holds a, the measured
-    position; context: holds m; bigram: no layer-1 previous-token pair at a context position) and wrong (copy and context:
+    position; context: holds m; bigram: holds t, the measured local source, and no layer-1 previous-token pair at a
+    context position) and wrong (copy and context:
     target-local only; bigram: that pair at a context position), and a pair right when both items are right; bootstrap 95% intervals over pairs."""
     pr = json.loads((DATA / "mechdisc_items.json").read_text())["pairs"]
     teach_ = {}
@@ -400,11 +403,13 @@ def score(answers: list | None = None, tdirs: list | None = None):
             ws = {f: [_mean([g(j) for j in jj]) for jj in js] for f, g in
                   (("right_not_wrong", lambda j: j["right"] and not j["wrong"]), ("right", lambda j: j["right"]),
                    ("wrong", lambda j: j["wrong"]), ("context_share", lambda j: j["context_share"]), ("chance", lambda j: j["chance"]),
-                   *((("right_ao", lambda j: j["right_ao"]), ("core_share", lambda j: j["core_share"])) if kd == "copy" else ()))}
+                   *((("right_ao", lambda j: j["right_ao"]), ("core_share", lambda j: j["core_share"])) if kd == "copy" else ()),
+                   *((("right_one", lambda j: j["right_one"]),) if kd == "bigram" else ()))}
             summary.setdefault(src, {})[kd] = {f: _ci(w) for f, w in ws.items()}
             print(f"    {kd:8s} {_boot(ws['right_not_wrong'])}; nodes at context positions {_boot(ws['context_share'])}; "
                   f"a random context position in the circuit {_boot(ws['chance'])}"
-                  + (f"; a and o both in the circuit {_boot(ws['right_ao'])}; core parts at a and o (share of 6) {_boot(ws['core_share'])}" if kd == "copy" else ""))
+                  + (f"; a and o both in the circuit {_boot(ws['right_ao'])}; core parts at a and o (share of 6) {_boot(ws['core_share'])}" if kd == "copy" else "")
+                  + (f"; no previous-token pair at a context position (one-sided) {_boot(ws['right_one'])}" if kd == "bigram" else ""))
     (OUTROOT / "mechdisc_score.json").write_text(json.dumps(summary, indent=1))
     print("wrote", OUTROOT / "mechdisc_score.json")
 

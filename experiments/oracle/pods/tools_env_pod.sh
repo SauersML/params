@@ -49,21 +49,21 @@ read -r -a SLICE <<< "$SLICES"
 STEPCMD=""
 for st in $STEPS; do
   case $st in
-    tests) STEPCMD="$STEPCMD python -u method/oracle/test_tools_env.py > $O/tests.log 2>&1; echo \"exit \$?\" >> $O/tests.log;" ;;
-    bench) STEPCMD="$STEPCMD python -u method/oracle/tools_env.py bench $I/rows.jsonl --tasks ${BENCH:-text9000,text9001} --score-split $SPL > $O/bench.log 2>&1; echo \"exit \$?\" >> $O/bench.log;" ;;
+    tests) STEPCMD="$STEPCMD python -u method/oracle/test_tools_env.py > $O/tests.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/tests.log; if [ \$rc -ne 0 ]; then exit \$rc; fi;" ;;
+    bench) STEPCMD="$STEPCMD python -u method/oracle/tools_env.py bench $I/rows.jsonl --tasks ${BENCH:-text9000,text9001} --score-split $SPL > $O/bench.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/bench.log; if [ \$rc -ne 0 ]; then exit \$rc; fi;" ;;
     scripted)
-      R=""
+      R="rm -f $O/scripted.jsonl $O/scripted.failure.txt; worker_pids=();"
       for k in $(seq 0 $((W - 1))); do
-        R="$R (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks ${SLICE[$k]} --out $O/scripted_$k.jsonl --score-split $SPL > $O/scripted_$k.log 2>&1; echo \"exit \$?\" >> $O/scripted_$k.log) &"
+        R="$R (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks ${SLICE[$k]} --out $O/scripted_$k.jsonl --score-split $SPL > $O/scripted_$k.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/scripted_$k.log; exit \$rc) & worker_pids+=(\$!);"
       done
-      STEPCMD="$STEPCMD $R wait; cat $O/scripted_*.jsonl > $O/scripted.jsonl;" ;;
-    tokens) STEPCMD="$STEPCMD python -u method/oracle/tools_env.py tokens $I/rows.jsonl --tasks $TASKS --episodes $O/scripted.jsonl --pool > $O/tokens.log 2>&1; echo \"exit \$?\" >> $O/tokens.log;" ;;
+      STEPCMD="$STEPCMD $R failed=0; for pid in \"\${worker_pids[@]}\"; do wait \"\$pid\"; rc=\$?; if [ \$rc -ne 0 ]; then failed=\$rc; fi; done; if [ \$failed -ne 0 ]; then echo \"scripted worker failure: exit \$failed; partial shard files retained, merged output not produced\" > $O/scripted.failure.txt; exit \$failed; fi; cat $O/scripted_*.jsonl > $O/scripted.jsonl || exit \$?;" ;;
+    tokens) STEPCMD="$STEPCMD python -u method/oracle/tools_env.py tokens $I/rows.jsonl --tasks $TASKS --episodes $O/scripted.jsonl --pool > $O/tokens.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/tokens.log; if [ \$rc -ne 0 ]; then exit \$rc; fi;" ;;
     baselines)
-      R=""
+      R="rm -f $O/baselines.jsonl $O/baselines.failure.txt; worker_pids=();"
       for k in $(seq 0 $((W - 1))); do
-        R="$R (awk 'NR % $W == $k' $O/scripted.jsonl > $O/episodes_$k.jsonl; python -u method/oracle/tools_env.py baselines $I/rows.jsonl --episodes $O/episodes_$k.jsonl --out $O/baselines_$k.jsonl --score-split $SPL > $O/baselines_$k.log 2>&1; echo \"exit \$?\" >> $O/baselines_$k.log) &"
+        R="$R (awk 'NR % $W == $k' $O/scripted.jsonl > $O/episodes_$k.jsonl || exit \$?; python -u method/oracle/tools_env.py baselines $I/rows.jsonl --episodes $O/episodes_$k.jsonl --out $O/baselines_$k.jsonl --score-split $SPL > $O/baselines_$k.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/baselines_$k.log; exit \$rc) & worker_pids+=(\$!);"
       done
-      STEPCMD="$STEPCMD $R wait; cat $O/baselines_*.jsonl > $O/baselines.jsonl;" ;;
+      STEPCMD="$STEPCMD $R failed=0; for pid in \"\${worker_pids[@]}\"; do wait \"\$pid\"; rc=\$?; if [ \$rc -ne 0 ]; then failed=\$rc; fi; done; if [ \$failed -ne 0 ]; then echo \"baselines worker failure: exit \$failed; partial shard files retained, merged output not produced\" > $O/baselines.failure.txt; exit \$failed; fi; cat $O/baselines_*.jsonl > $O/baselines.jsonl || exit \$?;" ;;
     *) echo "tools_env_pod.sh: unknown step $st" >&2; exit 2 ;;
   esac
 done

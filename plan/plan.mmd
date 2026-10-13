@@ -27,6 +27,11 @@
 %% manifest.json records source/input/tokenizer/cookbook/output hashes; original 250 length-only rows retained.
 %% Deterministic assembly from existing influential_v2 circuits and edit/teach_train_sft.jsonl, no model calls.
 %% This checks eligibility, not fidelity. These labels contain circuits, QA and edits, but no English or variables.
+%% Pilot: sft_codex-compatible97-q8-1012 excludes 8 reserved noncopy controls as well as all 40 copy tests.
+%% Tinker project 3f598f31-2ffa-4eb4-b302-909eb234fb7d; 49 steps x 8; $5 allowance incl. dev9020-9027 comparison.
+%% Distinct from primerl's full S1 arms. Judge on fixed development tasks, not falling training loss.
+%% Toolenv r5: only 16/20 baseline tasks completed (one worker OOM). Search beats random point fidelity 16/16,
+%% but VPD top-k aggregate phi only 8/16. Worker failure must propagate; partial data are never full completion.
 %% Rendering: .github/workflows/plan-render.yml writes plan/plan.png and the image-only README block.
 %% Local preview: mem-lease 2 npx -y @mermaid-js/mermaid-cli@11.4.2 -i plan/plan.mmd -o /tmp/oracle-plan.png -c plan/mermaid.json -b white -s 2
 flowchart BT
@@ -59,10 +64,10 @@ flowchart BT
   end
 
   TOOLS["<b>Search route, in parallel</b><br/>teacher circuits plus variables,<br/>English and executed answers;<br/>no learned oracle needed<br/>ACTIVE · primerl, varteach, codex"]
-  SUP["<b>Verified behavior supervision</b><br/>English, QA and edit targets from<br/>existing circuits or planted mechanisms;<br/>no trained circuit policy required<br/>READY · varteach, rustmove, primerl"]
+  SUP["<b>Verified behavior supervision</b><br/>QA and edit targets ready;<br/>grounded English join still empty;<br/>use existing carriers or planted mechanisms<br/>ACTIVE · varteach, rustmove, primerl, codex"]
   GATEC{{"<b>Check C</b> · does learning add value?<br/>SFT arms vs trivial baselines and<br/>the search route on dev texts;<br/>picks the RL starting point"}}
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
-    S1READY["<b>Usable SFT shard now</b><br/>105/300 assembled rows fit all caps;<br/>circuits, QA and edits; no English<br/>357-node median start exceeds cap 266<br/>READY · codex to primerl"]
+    S1READY["<b>Compatible SFT pilot</b><br/>97 rows; mechanism tests excluded;<br/>circuits, QA and edits; no English<br/>49 steps; fixed dev9020–9027<br/>TRAINING · codex · $5 allowance"]
     S1["<b>SFT · influential starts</b><br/>494 targets, held-out pp 0.965,<br/>median 357 nodes<br/>LAUNCHING · primerl"]
     S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
@@ -126,7 +131,8 @@ flowchart BT
 
   %% ===================== edges: the main chain (links 0-7, thick) =====================
   T1 --> S1
-  S1READY -- usable subset --> S1
+  T1 --> S1READY
+  S1READY --> GATEC
   T4 -- each passing shard --> S2
   T5 --> S3
   S1 --> GATEC
@@ -232,7 +238,8 @@ flowchart BT
   class I5 done
   class I6,W5 done
   class T4 blocked
-  class I3,S2,SUP,LAT1,W6,S1READY check
+  class I3,S2,SUP,LAT1,W6 check
+  class S1READY active
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting
   class LAT2,UVPD later

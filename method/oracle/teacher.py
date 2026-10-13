@@ -132,6 +132,8 @@ REPAIR_M = 4          # the omitted lever's budget the flip repair answers (goal
 EDGE_NODES = 6000     # the influential search wires circuits of at most this many subcomponents (a block's every one
 # counted): text9002's 31 blocks and 20,063 subcomponents overflowed the host's memory in EdgePruner
 ACCEPT_BATCH = 8      # Descent.prune's accept checks per call: the largest prefixes within the budget first
+PACK_FLIP_ROWS = 40   # goal_eval's FLIP_ROWS (160) and CHANGED_ROWS (64) in teacher runs, rows per run only: three
+PACK_CHANGED_ROWS = 32  # teachers per 48 GB card (the lead's packing) ran one out of memory in adversary_flips at 160
 FLOOR_SLACK = 0.95    # the phi check's slack: the residual within 1/0.95 of the bar's
 PHI_SLACK = math.log2(FLOOR_SLACK)  # --phi-check's: phi >= phi_tau + log2(0.95), the residual (2^-phi) within 1/0.95 of the
 # bar's (phi_tau is the start set's own phi on these texts: every pruned stage fell below it, the start itself by 2e-8)
@@ -2054,6 +2056,7 @@ def main():
     else:
         texts = native.tasks(args.split)[:args.n]
     ge = goal_eval.GoalEval(native.Native(), chunk=args.batch, semantics=args.semantics)
+    goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = PACK_FLIP_ROWS, PACK_CHANGED_ROWS   # batch sizes only (backup.py's)
     tokens = None
     if args.max_tokens and not args.save_vpd:
         from tokenizers import Tokenizer

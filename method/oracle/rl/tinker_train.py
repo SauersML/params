@@ -542,7 +542,7 @@ def rl(a) -> None:
     frozen = tinker_reader(service, a.reader_model, *renderer_for(a.reader_model), rspend) if a.reader else None
     tasks = {}
     rng = random.Random(a.seed + a.first_step)  # a resumed run draws new texts
-    params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=renderer.get_stop_sequences())
+    params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=a.temperature, stop=renderer.get_stop_sequences())
     adam = tinker.AdamParams(learning_rate=a.lr, beta1=0.9, beta2=0.95, eps=1e-8)
 
     def submit(sampler):
@@ -696,6 +696,8 @@ def main():
                    "scorer or added to the advantages (the first RL run, the audit 10-13)")
     r.add_argument("--curriculum", action="store_true", help="advance a stage when the held-out evaluations (rl_heldout.sh "
                    "beside the run) stop improving on its terms (PLATEAU checkpoints)")
+    r.add_argument("--temperature", type=float, default=1.0, help="the policy's sampling temperature (raise it when a group's "
+                   "answers stop differing: identical answers carry no advantage)")
     r.add_argument("--expect-semantics", help="stop unless every score comes from a scorer in this semantics (goal_eval.SEMANTICS)")
     r.add_argument("--expect-source", help="stop unless every score comes from a scorer built at this revision (a prefix)")
     r.add_argument("--first-step", type=int, default=0, help="resume: the step --init's state was saved at (its checkpoint "

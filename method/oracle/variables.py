@@ -21,6 +21,11 @@ text's seed, the position and the token, never the explanation; "search" for tea
      patched from x). A group at the last layer at the target passes on-target and fails here.
   composition: x' changes one input of each of two variables (at different positions); G_V1 and G_V2 patched together
      should give model(x'), scored as on-target.
+  values: a stated value map (E4 v2's value claim: per input position the classes of tokens the variable treats alike,
+     the text's own first) makes the on-target draws the listed tokens of the other classes (the prediction must
+     move as the model's does) and adds same-class draws: x' puts another token of the text's own class there, and
+     G_V patched from x' must leave model(x) (scored as off-target, s_same); each listed token falls in one split
+     (search or eval) by a key of the text's seed, the position and the token.
   feeds: on V's on-target draws, G_V patched from x' should move the reads of a group W it feeds as model(x') does,
      and leave those of a group it does not feed as model(x) has them: f = clip(1 - |r - r_target|^2 / |r_x - r_x'|^2,
      0, 1) over W's nodes outside G_V, r_target = r_x' or r_x (_feeds).
@@ -33,8 +38,9 @@ reproduces x' to ~1e-7 bits (the remainders there are small), so the log scale c
 resolution; beside s, f = clip(1 - D / D0, 0, 1), the share of the change reproduced (on-target) or kept out (off-
 target). A kind's score for a variable (or pair) is the D0-weighted mean over its scored draws; none without one.
 
-The headline, e4: in the real model, the mean of each variable's min(f on-target, s off-target) (a variable must carry
-its inputs and only them; a mean of the two would give a group carrying nothing 1/2), f in composition and f on the
+The headline, e4: in the real model, the mean of each variable's min(f on-target, s off-target, and s same-class with
+a value map) (a variable must carry its inputs and only them, and the value it claims; a mean of the two would give a
+group carrying nothing 1/2), f in composition and f on the
 feeds claims; a variable none of whose on-target draws is resolved counts 0 (its inputs do not move the output;
 headline()). With a circuit (score(graph=)), the same draws also run in its stated graph under C's semantics (graph
 inside, masked outside, as goal_eval scores it; engine.Engine on its subcomponents, tested equal to graph_ref), under
@@ -48,6 +54,7 @@ model and under "circuit".
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -68,8 +75,10 @@ BLOCK = -1  # a group item (site, position, BLOCK): the site's whole output at t
 
 def parse(variables: list[dict], C: dict) -> list[dict]:
     """Variables from JSON: {"name", "meaning", "inputs": [positions], "group": [[matrix, index, position] or ["block",
-    matrix, position], ...], "feeds": [names or "prediction"]}, a matrix native's name or "L.kind" (goal_eval.circuit's).
-    The group as (site, position, index) triples, a block's index BLOCK; a part outside the model raises."""
+    matrix, position], ...], "feeds": [names or "prediction"], "values" (optional, the value map: [{"position",
+    "classes": [{"token_ids": [...]}, ...]}], the first class holding the text's own token)}, a matrix native's name or
+    "L.kind" (goal_eval.circuit's). The group as (site, position, index) triples, a block's index BLOCK; the value map
+    as per position its classes' token ids; a part outside the model raises."""
     out = []
     for v in variables:
         group = []
@@ -86,23 +95,26 @@ def parse(variables: list[dict], C: dict) -> list[dict]:
                 raise ValueError(f"{v.get('name')}: {m, c, t} is not a subcomponent")
             group.append((n, int(t), int(c)))
         out.append({"name": v.get("name", ""), "meaning": v.get("meaning", ""), "inputs": sorted({int(p) for p in v["inputs"]}),
-                    "group": sorted(set(group)), "feeds": list(v.get("feeds", []))})
+                    "group": sorted(set(group)), "feeds": list(v.get("feeds", [])),
+                    "values": [{"position": int(vm["position"]), "classes": [[int(z) for z in c["token_ids"]] for c in vm["classes"]]}
+                               for vm in v.get("values") or []]})
     return out
 
 
 def headline(out: dict) -> dict:
     """A world's means and its headline e4 (the lead's rules) on score()'s per variable, pair and feeds rows: per
-    variable min(f on-target, s off-target), since a variable claims to carry its inputs and nothing else (a mean of the
+    variable min(f on-target, s off-target, s same-class when a value map is stated), since a variable claims to carry its inputs and nothing else (a mean of the
     two gave a group carrying nothing 1/2 for its off-target alone), and 0 for a variable none of whose on-target draws
     is resolved (its inputs do not move the output: the claim is empty; counted in "unresolved"); f in composition and f
     on the feeds claims; e4 the mean of all of them (each variable, pair and feeds claim a separate claim)."""
     mean = lambda xs: (lambda ys: sum(ys) / len(ys) if ys else None)([x for x in xs if x is not None])  # noqa: E731
     V, P, F = out["variables"], out["pairs"], out["feeds"]
     out.update(s_on=mean([x["s_on"] for x in V]), s_off=mean([x["s_off"] for x in V]), s_comp=mean([x["s_comp"] for x in P]),
+               s_same=mean([x.get("s_same") for x in V]),
                f_on=mean([x["f_on"] for x in V]), f_comp=mean([x["f_comp"] for x in P]),
                f_feeds=mean([x["f"] for x in F if x["feeds"]]), f_apart=mean([x["f"] for x in F if not x["feeds"]]),
                unresolved=sum(x["f_on"] is None for x in V))
-    each = [0.0 if a is None else (a if b is None else min(a, b)) for a, b in ((x["f_on"], x["s_off"]) for x in V)]
+    each = [0.0 if x["f_on"] is None else min(y for y in (x["f_on"], x["s_off"], x.get("s_same")) if y is not None) for x in V]
     out["e4"] = mean(each + [x["f_comp"] for x in P] + [x["f"] for x in F])
     return out
 
@@ -242,7 +254,11 @@ class Scorer:
         tests = []  # (kind, owner, changes ((p, z), ...), nodes)
         on = {}
         for i, v in enumerate(variables):
-            on[i] = ge._interchange_draws(tx, v["inputs"], split, draws) if v["inputs"] else []
+            if v.get("values"):  # a stated value map: on-target draws from the other classes, same-class draws beside
+                on[i], same = self._value_draws(tx, v, split, draws)
+                tests += [("same", i, ((p, z),), v["group"]) for p, z in same]
+            else:
+                on[i] = ge._interchange_draws(tx, v["inputs"], split, draws) if v["inputs"] else []
             tests += [("on", i, ((p, z),), v["group"]) for p, z in on[i]]
             off = [p for p in f2 if p not in v["inputs"]]
             for p, z in (ge._interchange_draws(tx, off, split, draws, first={p: -moved[p - 1] for p in off}) if off else []):
@@ -258,6 +274,18 @@ class Scorer:
             c = out["circuit"]["e4"]
             out["gap"] = None if c is None or out["e4"] is None else c - out["e4"]
         return out
+
+    @staticmethod
+    def _value_draws(tx, v: dict, split: str, draws: int) -> tuple[list, list]:
+        """(other-class draws, same-class draws) of a variable's stated value map: (position, token) pairs of the
+        listed tokens, the text's own left out, each token in one split (search or eval) by a key of the text's seed,
+        the position and the token, at most `draws` of each kind in an order keyed the same way."""
+        key = lambda p, z: hashlib.sha256(repr(("values", int(tx.seed), p, z)).encode()).digest()  # noqa: E731
+        mine = lambda p, z: (key(p, z)[0] % 2 == 0) == (split == "search")  # noqa: E731
+        diff = [(vm["position"], z) for vm in v["values"] for c in vm["classes"][1:] for z in c]
+        same = [(vm["position"], z) for vm in v["values"] for z in vm["classes"][0] if z != tx.ids[vm["position"]]]
+        pick = lambda xs: sorted((pz for pz in dict.fromkeys(xs) if mine(*pz)), key=lambda pz: key(*pz))[:draws]  # noqa: E731
+        return pick(diff), pick(same)
 
     def _world(self, tx, variables: list[dict], tests: list, graph: native.Graph | None) -> dict:
         changed = sorted({t[2] for t in tests})
@@ -279,7 +307,7 @@ class Scorer:
         got, floor_to = lq[:len(tests)], dict(zip(changed, lq[len(tests):len(tests) + len(changed)]))
         same = dict(zip(groups, lq[len(tests) + len(changed):-1]))
         floor_back = {ch: self._patched(texts[ch], [(mine, None)])[0]  # on x': every subcomponent at the
-                      for ch in sorted({t[2] for t in tests if t[0] == "off"})}   # targets from x (the off-target floors)
+                      for ch in sorted({t[2] for t in tests if t[0] in ("off", "same")})}  # targets from x (the off-target floors)
         kl = lambda p, q: float(carry.kl(p[None], q[None])[0])  # noqa: E731
         # float32 resolution: the largest disagreement between runs that agree in exact arithmetic (the run with
         # nothing patched in the patched runs' batch, each group set to its own values, the independent references),
@@ -289,7 +317,7 @@ class Scorer:
         rows = []
         for (kind, owner, ch, group), q in zip(tests, got):
             ref, res = texts[ch]["lq"], 2 * noise
-            if kind == "off":
+            if kind in ("off", "same"):  # the prediction must stay: a change outside the inputs, or one keeping the value
                 d0, d, fl = kl(base, ref), kl(base, q), kl(base, floor_back[ch])
             else:
                 d0, d, fl = kl(ref, base), kl(ref, q), kl(ref, floor_to[ch])
@@ -310,12 +338,14 @@ class Scorer:
         for i, v in enumerate(variables):
             mine_on = [r for r in rows if r["kind"] == "on" and r["owner"] == i]
             mine_off = [r for r in rows if r["kind"] == "off" and r["owner"] == i]
-            (s_on, n_on), (s_off, n_off) = pooled(mine_on), pooled(mine_off)
+            mine_same = [r for r in rows if r["kind"] == "same" and r["owner"] == i]
+            (s_on, n_on), (s_off, n_off), (s_same, n_same) = pooled(mine_on), pooled(mine_off), pooled(mine_same)
             out["variables"].append({"name": v["name"], "s_on": s_on, "s_off": s_off, "f_on": pooled(mine_on, "f")[0],
                                      "f_off": pooled(mine_off, "f")[0], "draws_on": n_on, "draws_off": n_off,
                                      "d0_on": max([r["d0"] for r in mine_on], default=None),
                                      "d0_off": max([r["d0"] for r in mine_off], default=None),
-                                     "group": len(v["group"]), "inputs": v["inputs"]})
+                                     "group": len(v["group"]), "inputs": v["inputs"], "s_same": s_same,
+                                     "f_same": pooled(mine_same, "f")[0], "draws_same": n_same})
         for i in range(len(variables)):
             for j in range(i + 1, len(variables)):
                 mine_c = [r for r in rows if r["kind"] == "comp" and r["owner"] == (i, j)]

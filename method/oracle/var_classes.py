@@ -11,9 +11,13 @@ move m_z = KL(model(x) || q_z), the distance left to the changed text's predicti
 share of z's change G_V carries f_z = clip(1 - r_z / D0_z, 0, 1) (variables.py's on-target f for that draw; None when
 D0_z is within the resolution) and q_z's likeliest token at the last target.
 
-The partition: z is alike the text's token (V does not tell them apart) when q_z is no farther from model(x) than
-from model(x'_z), m_z <= max(r_z, d_res), d_res the runs' float32 resolution (variables.Scorer's: twice the largest
-disagreement between runs that agree in exact arithmetic); otherwise z changes V's value. The alike tokens with the
+The partition: z is alike the text's token (V does not tell them apart) when patching V's carrier from x'_z leaves the
+prediction where it is in the scorer's own terms (variables.py's same-class and off-target test): s_same_z =
+clip(ln(D0_z / m_z) / ln(D0_z / D_floor), 0, 1) at least GOAL, D_floor = KL(model(x) || the model on x'_z with every
+subcomponent at the targets from x), or when the model itself does not tell them apart (D0_z within d_res, the runs'
+float32 resolution: twice the largest disagreement between runs that agree in exact arithmetic); otherwise z changes
+V's value. (Taken first as m_z <= max(r_z, d_res), nearer model(x) than model(x'_z), the classes failed variables.py's
+same-class test: on text6011 at 232 s_same 0.15.) The alike tokens with the
 text's form V's equivalence class at p; the others are grouped by the token their q_z predicts (where V's new value
 sends the prediction). The partition is the variable's value map ("values": class 0 the text's own, each class its
 tokens, their ids and the token its members' patched runs predict).
@@ -68,7 +72,7 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
     kl = lambda a, b: float(carry.kl(a[None], b[None])[0])  # noqa: E731
     own = sc._patched(mine, [(mine, v["group"]), (mine, [])])
     noise = max([mine["res"]] + [abs(kl(base, q)) for q in own])
-    q_z, ref_z = [], []
+    q_z, ref_z, floor_z = [], [], []
     for s0 in range(0, len(zs), sc.rows):  # a batch's changed texts at a time (each holds every activation)
         texts = []
         for z in zs[s0:s0 + sc.rows]:
@@ -78,6 +82,7 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
             noise = max(noise, texts[-1]["res"])
         q_z += list(sc._patched(mine, [(w, v["group"]) for w in texts]))
         ref_z += [w["lq"] for w in texts]
+        floor_z += [sc._patched(w, [(mine, None)])[0] for w in texts]  # on x': every subcomponent at the targets from x
         del texts
         gc.collect()  # the runs' tensors sit in reference cycles (var_teacher.release)
         native.free(nat.dev)
@@ -87,15 +92,16 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
     own_tok, alt_tok, pred = names[0], names[1:1 + len(zs)], names[1 + len(zs):]
     rows = []
     for i, z in enumerate(zs):
-        d0, m, left = kl(base, ref_z[i]), kl(base, q_z[i]), kl(ref_z[i], q_z[i])
+        d0, m, left, fl = kl(base, ref_z[i]), kl(base, q_z[i]), kl(ref_z[i], q_z[i]), kl(base, floor_z[i])
         rows.append({"token": alt_tok[i], "id": int(z), "p_model": None, "d0": d0, "move": m, "left": left,
-                     "f": min(1.0, max(0.0, 1 - left / d0)) if d0 > res else None, "predicts": pred[1 + i],
-                     "predicts_id": pred_ids[1 + i]})
+                     "f": min(1.0, max(0.0, 1 - left / d0)) if d0 > res else None,
+                     "s_same": goal_eval._fid(d0, max(m, 0.0), max(fl, res)) if d0 > res else None,
+                     "predicts": pred[1 + i], "predicts_id": pred_ids[1 + i]})
     lp = nat.reference([tx.ids[:p]], [p - 1])[0, 0]
     changed = {}
     for r in rows:
         r["p_model"] = float(lp[r["id"]].exp())
-        r["alike"] = r["move"] <= max(r["left"], res)
+        r["alike"] = r["s_same"] is None or r["s_same"] >= goal_eval.GOAL
         if not r["alike"]:
             changed.setdefault(r["predicts"], []).append(r)
     alike = [r for r in rows if r["alike"]]

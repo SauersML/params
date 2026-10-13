@@ -1066,6 +1066,47 @@ def attention_at(nat, ids: list[int], t: int, top: int) -> dict:
     return att
 
 
+CONTROLS = ("text-only", "shuffled", "random-ids")
+
+
+def control_evidence(ev: dict, kind: str, T: int, donor: dict | None = None, Td: int | None = None, C: dict | None = None,
+                     seed: int = 0) -> dict:
+    """A control question's evidence (the pre-registered evaluation's controls): "text-only", no measured evidence
+    (the text, its target and the model's top tokens alone); "shuffled", another text's evidence (donor, from a text Td
+    tokens long) put on this text end-aligned, a position p moved to p - Td + T (the donor's target on this one's) and
+    what falls before the text dropped; "random-ids", every listed subcomponent's index replaced through one random
+    permutation of its matrix's indices per text (C: matrix -> subcomponents; seed). The questions (qa, edits) are the
+    text's own; only what the oracle is shown changes."""
+    import random
+
+    if kind == "text-only":
+        return {**ev, "positions": [], "listed": [], "events": [], "components": {}, "wiring": {}, "switch_on": {},
+                "acts": {}, "attention": {}, "pool": {}}
+    if kind == "shuffled":
+        f = lambda p: int(p) - Td + T  # noqa: E731
+        node = lambda nd: [nd[0], f(nd[1]), nd[2]]  # noqa: E731
+        keep = lambda d: {str(f(q)): v for q, v in d.items() if f(q) >= 0}  # noqa: E731
+        return {**ev, "positions": [f(p) for p in donor["positions"] if f(p) >= 0],
+                "listed": [f(p) for p in donor["listed"] if f(p) >= 0],
+                "events": [{**e, "position": f(e["position"])} for e in donor["events"] if f(e["position"]) >= 0],
+                "components": keep({q: [[node(nd), c, x] for nd, c, x in cs if f(nd[1]) >= 0] for q, cs in donor["components"].items()}),
+                "wiring": keep({q: [[node(w), node(r), c] for w, r, c in ws if min(f(w[1]), f(r[1])) >= 0] for q, ws in donor["wiring"].items()}),
+                "switch_on": keep({q: [[node(nd), k] for nd, k in xs if f(nd[1]) >= 0] for q, xs in donor.get("switch_on", {}).items()}),
+                "acts": keep(donor.get("acts") or {}),
+                "attention": {layer: [[[f(p), w] for p, w in row if f(p) >= 0] for row in rows] for layer, rows in (donor.get("attention") or {}).items()},
+                "pool": keep(donor.get("pool") or {})}
+    if kind == "random-ids":
+        rng = random.Random(seed)
+        perm = {n: rng.sample(range(k), k) for n, k in sorted(C.items())}
+        node = lambda nd: [nd[0], nd[1], perm[nd[0]][nd[2]] if nd[0] in perm else nd[2]]  # noqa: E731
+        return {**ev, "components": {q: [[node(nd), c, x] for nd, c, x in cs] for q, cs in ev["components"].items()},
+                "wiring": {q: [[node(w), node(r), c] for w, r, c in ws] for q, ws in ev["wiring"].items()},
+                "switch_on": {q: [[node(nd), k] for nd, k in xs] for q, xs in ev.get("switch_on", {}).items()},
+                "pool": {q: {n: [[perm[n][c] if n in perm else c, v] for c, v in cs] for n, cs in per.items()}
+                         for q, per in (ev.get("pool") or {}).items()}}
+    raise ValueError(f"control is one of {CONTROLS}")
+
+
 def candidate_pool(nat, task: dict, ev: dict, heads: int = POOL_HEADS) -> dict:
     """The evidence with the full candidate pool (the lead's v2 question, 10-12: the v1 question listed 16% of the
     teacher's nodes, so choosing a circuit was guessing): every VPD-active subcomponent (causal importance above 0)
@@ -2334,10 +2375,34 @@ def samples_of(spec: Path) -> dict:
     return {t: [(x, cut) for _, x, cut in sorted(v, key=lambda e: e[0])] for t, v in out.items()}
 
 
-def baseline_texts(ge, task: dict, sizes: list[int], tx=None) -> dict:
+def matched_k(ge, tx, order: list, bits: float) -> int:
+    """The most subcomponents k of order whose complete node set costs at most bits (goal_eval.size_bits, as the reward
+    prices answers): a baseline at an answer's own description length."""
+    import goal_eval
+    import native
+
+    P, S = ge.nat.positions(tx.targets), sum(ge.nat.C.values())
+    cost = lambda k: goal_eval.size_bits(native.Graph(set(order[:k]), complete=True), P, S, tx.targets, active=tx.vpd)  # noqa: E731
+    lo, hi = 0, len(order)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if cost(mid) <= bits:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def recency_order(order: list) -> list:
+    """VPD's active subcomponents latest position first, VPD's order within a position (the recency baseline)."""
+    return sorted(order, key=lambda nd: -nd[1])
+
+
+def baseline_texts(ge, task: dict, sizes: list[int], tx=None, recency: list[int] = ()) -> dict:
     """name -> answer text of the search-free baselines, node sets claiming every connection and token edge among their
-    nodes: "empty", "vpd@k", VPD's first k active subcomponents in its order (Native._vpd_order) for each k, and with tx
-    "start", the influential start set (goal_eval.start_set on the eval split: reward v3's reference for compactness)."""
+    nodes: "empty", "vpd@k", VPD's first k active subcomponents in its order (Native._vpd_order) for each k in sizes,
+    "recency@k", the first k latest position first (recency_order) for each k in recency, and with tx "start", the
+    influential start set (goal_eval.start_set on the eval split: reward v3's reference for compactness)."""
     import goal_eval
     import native
 
@@ -2348,6 +2413,10 @@ def baseline_texts(ge, task: dict, sizes: list[int], tx=None) -> dict:
     for k in sorted(set(sizes)):
         if k > 0:
             out[f"vpd@{k}"] = render(goal_eval.to_json(native.Graph(set(order[:k]), complete=True)))
+    recent = recency_order(order)
+    for k in sorted(set(recency)):
+        if k > 0:
+            out[f"recency@{k}"] = render(goal_eval.to_json(native.Graph(set(recent[:k]), complete=True)))
     if tx is not None:
         out["start"] = render(goal_eval.to_json(ge.start_set(tx, "eval")["graph"]))
     return out
@@ -2413,17 +2482,18 @@ def _eval_checkpoint(path: Path, record: dict, *, create: bool = False) -> None:
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
              teachers: dict | None = None, lines: bool = False, checkpoint: Path | None = None,
-             retain_calibration: bool = False) -> dict:
+             retain_calibration: bool = False, node_cap: int | None = NODE_CAP) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
     the valid share, size, dropped nodes and edges), "best of N (upper bound)" (each question's best sample), and
-    paired comparisons with every other set (reward) and with the baselines (empty, and VPD's own answer at the first
-    sample's node count; circuit_reward, as they give no English or answers) on the same questions. A set with no answer on a question scores it as invalid. e1: set -> task ->
+    paired comparisons with every other set (reward) and with the baselines (empty, and VPD's top k and the recency
+    baseline at the first sample's own bits, matched_k; circuit_reward, as they give no English or answers) on the same
+    questions. A set with no answer on a question scores it as invalid. e1: set -> task ->
     {"own": [bits per sample], "shuffled": bits, "reader_b": bits} (tinker_train.py readers): the reward's E1 uses
     "own"; the controls are reported (no English is 0 bits by construction). labels: task -> locality() row: every
     figure is also reported for local and non-local texts apart. diagnostics: structure() of each first sample (a
-    second disjoint circuit, minimality), costly. matched_all: VPD's answer at every sample's node count, not only the
+    second disjoint circuit, minimality), costly. matched_all: the baselines at every sample's bits, not only the
     first's, so each sample is compared with VPD at its own size (verify-and-pick: whether any of N beats it on C).
     The baselines' v3 terms (phi, g, compact, bits, D) and C and N are kept beside their circuit reward
     ("baseline_terms"). teachers: task -> the text's teacher circuit (JSON), reward v3's teacher-dominance reference, for
@@ -2468,7 +2538,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             cache = {}
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
                             ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None,
-                            lines=lines, retain_calibration=retain_calibration)
+                            lines=lines, retain_calibration=retain_calibration, node_cap=node_cap)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -2478,8 +2548,15 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                 g, _ = goal_eval.circuit(parse(got[0][0])["answer"], prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
                 entry["structure"] = structure(ge, cache[task["id"]], g, ge.nat._vpd_order(prompt["token_ids"], prompt["target_positions"]))
             per[name].append(entry)
-        sizes = [y.get("nodes") or 0 for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1])]
-        names = baseline_texts(ge, task, sizes, cache.get(task["id"]))
+        tx = cache.get(task["id"])
+        matched = [y for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1]) if y.get("bits")]
+        if matched:  # VPD's top k and the recency baseline at the answer's own description length
+            tx = tx or ge.text(task["prompts"][0]["token_ids"], task["prompts"][0]["target_positions"], task=task)
+            order = ge.nat._vpd_order(tx.ids, tx.targets)
+            recent = recency_order(order)
+            for y in matched:
+                y["vpd_k"], y["recency_k"] = matched_k(ge, tx, order, y["bits"]), matched_k(ge, tx, recent, y["bits"])
+        names = baseline_texts(ge, task, [y["vpd_k"] for y in matched], tx, [y["recency_k"] for y in matched])
         for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": [], "edits": []}, list(names.values()), split="eval",
                                                       teacher=teachers.get(p.stem) if teachers else None, node_cap=None,
                                                       retain_calibration=retain_calibration)):
@@ -2523,6 +2600,7 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, b
         ok = [f for f in first if f["valid"]]
         report[name] = {
             "questions": len(qs), "valid": sum(f["valid"] for f in first) / max(len(first), 1),
+            "above NODE_CAP": sum((f.get("nodes") or 0) > NODE_CAP for f in first) / max(len(first), 1),
             "reward": sum(f["reward"] for f in first) / max(len(first), 1),
             **{f"v3 {k}": (sum(float(f[k]) for f in ok if f.get(k) is not None) / max(sum(f.get(k) is not None for f in ok), 1)
                            if any(f.get(k) is not None for f in ok) else None)
@@ -2541,10 +2619,13 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, b
         circ = [q["samples"][0].get("circuit_reward", q["samples"][0]["reward"]) for q in qs]  # baselines give no English or answers
         report[name]["circuit_reward"] = sum(circ) / max(len(circ), 1)
         report[name]["paired"]["empty (circuit reward)"] = _paired(circ, [base[q["task"]]["empty"] for q in qs])
-        matched = [(c, base[q["task"]].get(f"vpd@{q['samples'][0].get('nodes')}")) for c, q in zip(circ, qs)]
-        matched = [(a, b) for a, b in matched if b is not None]
-        if matched:
-            report[name]["paired"]["vpd@matched (circuit reward)"] = _paired([a for a, _ in matched], [b for _, b in matched])
+        for b in ("vpd", "recency"):  # the search-free baselines at each answer's own bits
+            matched = [(c, base[q["task"]].get(f"{b}@{q['samples'][0].get(b + '_k')}")) for c, q in zip(circ, qs)]
+            matched = [(x, y) for x, y in matched if y is not None]
+            if matched:
+                report[name]["paired"][f"{b}@equal bits (circuit reward)"] = _paired([x for x, _ in matched], [y for _, y in matched])
+        track = [f["fidelity"].get("s_track_pp") for f in ok if (f.get("fidelity") or {}).get("s_track_pp") is not None]
+        report[name]["s_track_pp"] = sum(track) / len(track) if track else None
         by = {}
         for f in first:
             for d in f.get("qa") or []:
@@ -2556,14 +2637,14 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, b
             pairs = [(q["samples"][0].get("term_E2") or 0.0, other[q["task"]].get("term_E2") or 0.0) for q in qs if q["task"] in other]
             if pairs:
                 report[name]["E2 circuit-ablation delta (with - without circuit)"] = _paired([a for a, _ in pairs], [b for _, b in pairs])
-        vpd = lambda x, q, k: ((base_terms or {}).get(q["task"], {}).get(f"vpd@{x.get('nodes')}") or {}).get(k)  # noqa: E731
+        vpd = lambda x, q, k: ((base_terms or {}).get(q["task"], {}).get(f"vpd@{x.get('vpd_k')}") or {}).get(k)  # noqa: E731
         vs_vpd = lambda x, q: vpd(x, q, "C") is not None and (x.get("term_C") or 0.0) > vpd(x, q, "C")  # noqa: E731
-        report[name]["phi beats VPD@matched: first sample"] = sum(
+        report[name]["phi beats VPD@equal bits: first sample"] = sum(
             q["samples"][0]["valid"] and vpd(q["samples"][0], q, "phi") is not None and q["samples"][0].get("phi") is not None
             and q["samples"][0]["phi"] > vpd(q["samples"][0], q, "phi") for q in qs) / max(len(qs), 1)
         report[name]["C, best of N"] = sum(max((x.get("term_C") or 0.0) if x["valid"] else 0.0 for x in q["samples"]) for q in qs) / max(len(qs), 1)
-        report[name]["C beats VPD@matched: first sample"] = sum(q["samples"][0]["valid"] and vs_vpd(q["samples"][0], q) for q in qs) / max(len(qs), 1)
-        report[name]["C beats VPD@matched: any sample"] = sum(any(x["valid"] and vs_vpd(x, q) for x in q["samples"]) for q in qs) / max(len(qs), 1)
+        report[name]["C beats VPD@equal bits: first sample"] = sum(q["samples"][0]["valid"] and vs_vpd(q["samples"][0], q) for q in qs) / max(len(qs), 1)
+        report[name]["C beats VPD@equal bits: any sample"] = sum(any(x["valid"] and vs_vpd(x, q) for x in q["samples"]) for q in qs) / max(len(qs), 1)
         if e1 and name in e1:
             ctl = [e1[name][q["task"]] for q in qs if q["task"] in e1[name]]
             report[name]["E1 controls"] = {k: sum(c[k] for c in ctl if c.get(k) is not None) / max(sum(c.get(k) is not None for c in ctl), 1)
@@ -2609,6 +2690,8 @@ def main():
     rr.add_argument("--pool", action="store_true", help="the full candidate pool (candidate_pool(): every VPD-active subcomponent at the "
                                                          "listed, target and most-attended positions), cut to leave ROOM (fit_pool())")
     rr.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the policy's tokenizer, which fit_pool() counts in")
+    rr.add_argument("--control", choices=CONTROLS, help="a control question (control_evidence): text-only, shuffled (the next "
+                    "row's evidence, end-aligned) or random-ids; applied last, to rows already rendered in the policy's format")
     rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
     rf.add_argument("rows", type=Path)
     rf.add_argument("teacher", type=Path, help="teacher.py's output directory (<task>.json, <task>.vpd_top<k>.edges.json)")
@@ -2688,7 +2771,9 @@ def main():
                    "must be a new file, never resumed (retain complete lines after interruption)")
     s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (scored with net): the best net per goal (E3)")
     s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
-    s.add_argument("--matched-all", action="store_true", help="VPD at every sample's node count (verify-and-pick against VPD@matched)")
+    s.add_argument("--matched-all", action="store_true", help="the baselines at every sample's bits (verify-and-pick against VPD@equal bits)")
+    s.add_argument("--node-cap", type=int, default=NODE_CAP, help="answers above it invalid (0: no cap, for targets such as the "
+                   "influential starts, often above 266 nodes; the share above NODE_CAP is reported)")
     s.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json): reward v3's teacher-dominance reference")
     s.add_argument("--lines", action="store_true", help="each sample's per-line credits (reward(lines=True), line_credit())")
     args = ap.parse_args()
@@ -2710,8 +2795,11 @@ def main():
 
             tk = AutoTokenizer.from_pretrained(args.tokenizer)
             count = lambda text: len(tk(text, add_special_tokens=False)["input_ids"])  # noqa: E731
+        rows_in = [json.loads(x) for x in args.rows.read_text().splitlines() if x.strip()]
+        length = lambda t: len(json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())["prompts"][0]["token_ids"])  # noqa: E731
+        C = (mnat if args.facts or args.measured or args.pool else native.Native()).C if args.control == "random-ids" else None
         with args.out.open("w") as f:
-            for r in map(json.loads, args.rows.read_text().splitlines()):
+            for i, r in enumerate(rows_in):
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
                 if args.variables:
                     r = {**r, "variables": True}
@@ -2727,6 +2815,10 @@ def main():
                         print(json.dumps({"event": "rerender_skip", "task": r["task"],
                                           "reason": "question_over_budget", **r["pool_fit"]}), file=sys.stderr, flush=True)
                         continue
+                if args.control:
+                    donor = rows_in[(i + 1) % len(rows_in)]
+                    r = {**control_evidence(r, args.control, len(task["prompts"][0]["token_ids"]), donor, length(donor["task"]), C,
+                                            native.task_seed(task["id"])), "control": args.control}
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
         return
 
@@ -2941,7 +3033,7 @@ def main():
     teachers = {f.stem: json.loads(f.read_text()) for t in rows if (f := args.teacher / f"{t}.json").exists()} if args.teacher else None
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
                    matched_all=args.matched_all, teachers=teachers, lines=args.lines,
-                   checkpoint=args.checkpoint, retain_calibration=args.calibration_evidence)
+                   checkpoint=args.checkpoint, retain_calibration=args.calibration_evidence, node_cap=args.node_cap or None)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

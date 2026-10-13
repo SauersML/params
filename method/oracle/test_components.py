@@ -373,6 +373,35 @@ def test_e4_is_the_scorers_e4_with_a_malformed_variable_scoring_zero():
     assert sc.split == "search"  # the RL reward's E4 on the same draws as C (variables.Scorer defaults to eval)
 
 
+def test_baselines_at_equal_bits_take_the_most_subcomponents_that_fit(tiny):
+    nat, ge, task, ev = tiny
+    prompt = task["prompts"][0]
+    tx = ge.text(prompt["token_ids"], prompt["target_positions"], task=task)
+    order = nat._vpd_order(tx.ids, tx.targets)
+    P, S = nat.positions(tx.targets), sum(nat.C.values())
+    cost = lambda k: goal_eval.size_bits(native.Graph(set(order[:k]), complete=True), P, S, tx.targets, active=tx.vpd)  # noqa: E731
+    k = components.matched_k(ge, tx, order, cost(5) + 0.5)
+    assert k >= 5 and cost(k) <= cost(5) + 0.5 and (k == len(order) or cost(k + 1) > cost(5) + 0.5)
+    recent = components.recency_order(order)
+    assert [nd[1] for nd in recent] == sorted((nd[1] for nd in order), reverse=True)
+
+
+def test_control_questions_hide_move_or_scramble_the_evidence():
+    ev = {"positions": [8, 9], "listed": [8], "events": [{"position": 8, "kl": 1.0}], "qa": [{"kind": "remove"}],
+          "components": {"8": [[["h.1.attn.v_proj", 8, 3], 0.5, ""]]}, "wiring": {"8": []}, "switch_on": {},
+          "pool": {"9": {"h.1.attn.v_proj": [[3, 0.5], [1, 0.2]]}}}
+    none = components.control_evidence(ev, "text-only", 10)
+    assert none["components"] == {} and none["events"] == [] and none["pool"] == {} and none["qa"] == ev["qa"]
+    donor = {"positions": [3, 5], "listed": [3], "events": [{"position": 3}], "components": {"3": [[["h.0.mlp.c_fc", 3, 7], 1.0, ""]],
+             "1": [[["h.0.mlp.c_fc", 1, 2], 1.0, ""]]}, "wiring": {}, "switch_on": {}, "pool": {"5": {"h.0.mlp.c_fc": [[7, 1.0]]}}}
+    moved = components.control_evidence(ev, "shuffled", 10, donor, 6)  # end-aligned: p -> p + 4
+    assert moved["positions"] == [7, 9] and moved["components"] == {"7": [[["h.0.mlp.c_fc", 7, 7], 1.0, ""]], "5": [[["h.0.mlp.c_fc", 5, 2], 1.0, ""]]}
+    assert moved["pool"] == {"9": {"h.0.mlp.c_fc": [[7, 1.0]]}} and moved["events"] == [{"position": 7}] and moved["qa"] == ev["qa"]
+    ids = components.control_evidence(ev, "random-ids", 10, C={"h.1.attn.v_proj": 16}, seed=1)
+    c = ids["components"]["8"][0][0][2]
+    assert ids["pool"]["9"]["h.1.attn.v_proj"][0][0] == c and sorted(x for x, _ in ids["pool"]["9"]["h.1.attn.v_proj"]) != [1, 3] or c != 3
+
+
 def test_a_variables_block_claims_every_circuit_node_of_its_site_there():
     nodes = [("h.1.attn.v_proj", 233, 4), ("h.1.attn.v_proj", 233, 9), ("h.1.attn.v_proj", 232, 4), ("h.2.attn.v_proj", 233, 1)]
     got = components.claimed_nodes([("h.1.attn.v_proj", 233, components.BLOCK), ("h.3.mlp.c_fc", 235, 7)], nodes)

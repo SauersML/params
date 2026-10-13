@@ -240,10 +240,11 @@ N_SWAP = 12
 
 
 def _critical(toy) -> set:
-    """zoo2: live units whose ablation alone breaks the prediction (mean KL over the texts at least half of ablating
-    every unit): the marker detector, which gates every module unit. Necessity ablates the predicted units minus these
-    (when any remain): otherwise any answer naming the detector is fully 'necessary' and redundant routes can be
-    dropped for free. No ground truth used."""
+    """zoo2: live units whose ablation alone breaks the prediction on this text's same-truth texts (mean KL at least half
+    of ablating every unit), e.g. the marker detector, which gates every module unit. Necessity ablates the predicted
+    units minus these (when any remain): otherwise any answer naming the detector is fully 'necessary' and redundant
+    routes can be dropped for free. No ground truth used. (Requiring 'critical on every module' was tried: then one
+    necessary module unit saturates the set's necessity and a gate's second feature head goes unrewarded.)"""
     st = _state(toy)
     if "critical" not in st:
         import zoo
@@ -255,6 +256,29 @@ def _critical(toy) -> set:
     return st["critical"]
 
 
+def _nec_same(toy, live: list) -> list:
+    """Per same-truth text: KL(model || model with `live` ablated) / KL(model || every live unit ablated), clipped."""
+    import zoo
+    st = _state(toy)
+    if not live:
+        return [0.0] * len(st["texts"])
+    abl = _kl(st["full"], _model_fns(toy)[0](zoo.ablate(toy.sd, live), st["texts"]))
+    return [min(1.0, max(0.0, a / max(b, 1e-9))) for a, b in zip(abl, st["abl_all"])]
+
+
+def _nec_v2(toy, live: list) -> float:
+    """zoo2 necessity of a unit set: the largest of same-truth ablation (mean and worst), module-text ablation (mean)
+    and interchange with module texts of another answer (mean)."""
+    import zoo
+    v = _nec_same(toy, live)
+    n = (sum(v) / len(v) + min(v)) / 2
+    ms = _module_state(toy)
+    mabl = _kl(ms["full"], _model_fns(toy)[0](zoo.ablate(toy.sd, live), ms["texts"]))
+    n = max(n, sum(min(1.0, a / max(b, 1e-9)) for a, b in zip(mabl, ms["abl_all"])) / len(mabl))
+    sn = swap_necessity(toy, live)
+    return max(n, sn) if sn is not None else n
+
+
 def score(toy, units: set) -> dict:
     import zoo
     st = _state(toy)
@@ -263,21 +287,14 @@ def score(toy, units: set) -> dict:
     suff = [min(1.0, max(0.0, 1.0 - zoo.node_kl(st["nat"], ids, nodes_of(toy, units, i)) / max(e, 1e-9)))
             for i, (ids, e) in enumerate(zip(st["texts"], st["empty"]))]
     live = [u for u in zoo_names if u in st["live"]]   # ablating a dead unit changes nothing
-    if toy.meta.get("version") == 2 and set(live) - _critical(toy):
-        live = [u for u in live if u not in _critical(toy)]   # see _critical
-    last_logits = _model_fns(toy)[0]
-    sd_abl = zoo.ablate(toy.sd, live) if live else None
-    abl = _kl(st["full"], last_logits(sd_abl, st["texts"])) if live else [0.0] * len(suff)
-    nec = [min(1.0, max(0.0, a / max(b, 1e-9))) for a, b in zip(abl, st["abl_all"])]
     agg = lambda v: (sum(v) / len(v) + min(v)) / 2   # noqa: E731  (mean and worst text: every text must be explained)
-    s, n = agg(suff), agg(nec)
-    if toy.meta.get("version") == 2 and live:   # see _module_state: necessity may show only on other module texts
-        ms = _module_state(toy)
-        mabl = _kl(ms["full"], last_logits(sd_abl, ms["texts"]))
-        n = max(n, sum(min(1.0, a / max(b, 1e-9)) for a, b in zip(mabl, ms["abl_all"])) / len(mabl))
-        sn = swap_necessity(toy, live)
-        if sn is not None:
-            n = max(n, sn)
+    s = agg(suff)
+    if toy.meta.get("version") != 2:
+        n = agg(_nec_same(toy, live))
+    else:   # zoo2: the predicted units minus the critical ones (see _critical) when any remain
+        crit = _critical(toy)
+        rest = [u for u in live if u not in crit]
+        n = _nec_v2(toy, rest) if rest else agg(_nec_same(toy, live))
     return {"suff": s, "nec": n, "n": len(keys), "reward": (s + n) / 2 - UNIT_COST * len(keys)}
 
 

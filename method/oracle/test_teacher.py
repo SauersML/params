@@ -546,6 +546,8 @@ def test_discriminating_draws_stay_off_eval(draws):
     floor = teacher.floor_of(base["s_track_pp"])
     # a check's sample is keyed by the state it judges: the same set draws the same sample, another set another one
     assert acc._sample(pr2.on.clone()) == acc._sample(pr2.on) != acc._sample(ons[0])
+    # every check holds the model's likeliest alternatives (the search split's ranks 0 and 2)
+    assert set(acc.fixed) == set(ge._interchange_draws(tx, positions, "search", 64)) <= set(acc._sample(ons[1]))
     # admitted removals keep the floor on their judged draws; each refusal kept with its 16 draws from the pool
     assert all(r is None or r["s_track_pp"] >= floor for r in got)
     assert len(acc.refused) == sum(r is None for r in got)

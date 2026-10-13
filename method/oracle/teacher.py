@@ -131,6 +131,8 @@ EDGE_NODES = 6000     # the influential search wires circuits of at most this ma
 # counted): text9002's 31 blocks and 20,063 subcomponents overflowed the host's memory in EdgePruner
 ACCEPT_BATCH = 8      # Descent.prune's accept checks per call: the largest prefixes within the budget first
 FLOOR_SLACK = 0.95    # an acceptance term's floor: min(0.9, 0.95 x the start's) (the lead's 10-12: a start below 0.9 keeps slack)
+PHI_SLACK = math.log2(FLOOR_SLACK)  # --phi-check's: phi >= phi_tau + log2(0.95), the residual (2^-phi) within 1/0.95 of the
+# bar's (phi_tau is the start set's own phi on these texts: every pruned stage fell below it, the start itself by 2e-8)
 KL_FLOOR = 1e-9       # a KL's floor before a fractional power (goal_eval.recovered_log's): a nearly exact answer's KL can
 # round below 0, and a negative base to a fractional power is complex (fleet's planted toys)
 
@@ -666,19 +668,20 @@ DISC_DRAWS = 16       # ... of which a candidate is judged on those where it and
 POOL_SEED = 7         # the search pool's sampled tokens' seed offset (eval's: goal_eval.INTERCHANGE_SPLITS["eval"])
 
 
-def search_pool(ge: goal_eval.GoalEval, tx: goal_eval.Text) -> list:
+def search_pool(ge: goal_eval.GoalEval, tx: goal_eval.Text, parts: bool = False) -> list | tuple:
     """The discriminating acceptance's changed texts, (position, token) at F2's positions: the search split's ranks 0
     and 2 of the model's alternatives and tokens sampled from the model's distribution on their own seed
     (_fresh_sources), leaving out every eval token (rank 1 and eval's samples): disjoint from the eval split's draws of
     changed_inputs and interchange (the lead's 10-12: pruning against one fixed set of 16 draws fitted them, text9002
-    search 0.88 against eval 0.34)."""
-    nat, pool = ge.nat, []
+    search 0.88 against eval 0.34). parts: (the rank-0 draws, the rank-2 draws, the sampled ones)."""
+    nat, r0, r2, sampled = ge.nat, [], [], []
     for p in sorted({p for p, _ in tx.f2}):
         alts = [x[p] for x in carry.alternatives(nat, tx.ids, p, (0, 1, 2))]
         held = {alts[1]} | set(ge._fresh_sources(tx, p, int(tx.seed) + goal_eval.INTERCHANGE_SPLITS["eval"][0]))
-        pool += [(p, alts[0]), (p, alts[2])]
-        pool += [(p, z) for z in ge._fresh_sources(tx, p, int(tx.seed) + POOL_SEED) if z not in held and z not in alts]
-    return pool
+        r0.append((p, alts[0]))
+        r2.append((p, alts[2]))
+        sampled += [(p, z) for z in ge._fresh_sources(tx, p, int(tx.seed) + POOL_SEED) if z not in held and z not in alts]
+    return (r0, r2, sampled) if parts else [x for pair in zip(r0, r2) for x in pair] + sampled
 
 
 class Acceptance:
@@ -744,18 +747,23 @@ class Acceptance:
         return num / den if den > 0 else None
 
     def _halves(self) -> tuple:
-        """search_pool split in two by a hash of (seed, position, token): the acceptance's half and the validation's
-        ("fv"; every draw the acceptance's otherwise)."""
+        """The acceptance's draws and the validation's from search_pool: the model's likeliest alternatives in every
+        check (they carry the largest changes, which dominate the W-pooled score; eval's rank 1 among them: text9002's
+        F+V on fresh samples alone scored 0.35 on the search split's ranks 0 and 2 and 0.78 on eval with its node set at
+        0.985), the sampled tokens split by a hash of (seed, position, token); "fv": rank 0 the acceptance's and rank 2
+        the validation's, otherwise both the acceptance's and no validation. (The acceptance's pool, the validation
+        set); self.fixed, the draws every check holds."""
         if self.pool is None:
-            pool = search_pool(self.ge, self.tx)
+            r0, r2, sampled = search_pool(self.ge, self.tx, parts=True)
             if self.draws != "fv":
-                self.pool, self.val = pool, []
+                self.fixed, self.pool, self.val = r0 + r2, r0 + r2 + sampled, []
             else:
-                side = [hashlib.sha256(repr((int(self.tx.seed), int(p), int(z))).encode()).digest()[0] & 1 for p, z in pool]
-                self.pool = [pz for pz, h in zip(pool, side) if not h]
-                val = [pz for pz, h in zip(pool, side) if h]
-                pick = np.random.default_rng([int(self.tx.seed), 29]).permutation(len(val))[:POOL_DRAWS]
-                self.val = [val[i] for i in sorted(pick.tolist())]
+                side = [hashlib.sha256(repr((int(self.tx.seed), int(p), int(z))).encode()).digest()[0] & 1 for p, z in sampled]
+                self.fixed = r0
+                self.pool = r0 + [pz for pz, h in zip(sampled, side) if not h]
+                val = [pz for pz, h in zip(sampled, side) if h]
+                pick = np.random.default_rng([int(self.tx.seed), 29]).permutation(len(val))[:max(0, POOL_DRAWS - len(r2))]
+                self.val = r2 + [val[i] for i in sorted(pick.tolist())]
         return self.pool, self.val
 
     def _sample(self, state: torch.Tensor | None = None) -> list:
@@ -764,8 +772,10 @@ class Acceptance:
         decision float noise flips near the floor does not shift every later sample (fleet: A4500 and A6000 runs
         diverged from the first check on)."""
         pool = self._halves()[0]
-        k = min(POOL_DRAWS, len(pool))
-        return [pool[i] for i in np.random.default_rng([int(self.tx.seed), 23, self.key(state)]).choice(len(pool), k, replace=False).tolist()]
+        rest = [pz for pz in pool if pz not in set(self.fixed)]
+        k = max(0, min(POOL_DRAWS - len(self.fixed), len(rest)))
+        pick = np.random.default_rng([int(self.tx.seed), 23, self.key(state)]).choice(len(rest), k, replace=False).tolist() if k else []
+        return list(self.fixed) + [rest[i] for i in pick]
 
     @staticmethod
     def key(state: torch.Tensor | None) -> int:
@@ -980,7 +990,7 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
             log(f"  set phi at {name}: {ph} (bar {bar})", flush=True)
             if ph is not None and (best is None or ph > best[0]):
                 best = (ph, name, on_s)
-            if ph is not None and bar is not None and ph >= bar:
+            if ph is not None and bar is not None and ph >= bar + PHI_SLACK:
                 break
         if best is not None:
             pr.on, rec["phi_stage"] = best[2].clone(), best[1]
@@ -1145,7 +1155,7 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
             log(f"  blocks phi at {name}: {ph} (bar {bar})", flush=True)
             if ph is not None and (best is None or ph > best[0]):
                 best = (ph, name, on_s, fl_s)
-            if ph is not None and bar is not None and ph >= bar:
+            if ph is not None and bar is not None and ph >= bar + PHI_SLACK:
                 break
         if best is not None:                                 # the first stage back that passes, else the best phi
             pr.on, rec["phi_stage"] = best[2].clone(), best[1]

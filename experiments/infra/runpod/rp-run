@@ -158,6 +158,10 @@
 # a run is in progress cannot change what that run executes next.
 {
 set -Eeuo pipefail
+case ${RP_COMMUNITY_ONLY:-0} in
+    0|1) ;;
+    *) echo "rp-run: RP_COMMUNITY_ONLY must be 0 or 1" >&2; exit 2 ;;
+esac
 REST=https://rest.runpod.io/v1 GRAPHQL=https://api.runpod.io/graphql
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 MAC_REPO=/Users/user/params MAC_DATA=/Users/user/mpd-data HF_HUB=/Users/user/.cache/huggingface/hub
@@ -1193,6 +1197,10 @@ rank_auto() {
 # (oracle-train-dir1 took an H100 SECURE at $3.49/h when every 48 GB offer below it failed). Drops
 # those offers from OFFERS and prints each dropped one.
 cap_offers() {
+    # Apply to explicit lists and every auto reranking, even without a price ceiling.
+    if [ "${RP_COMMUNITY_ONLY:-0}" = 1 ]; then
+        OFFERS=$(awk -F'|' '$1 == "COMMUNITY"' <<< "$OFFERS")
+    fi
     [ -n "${RP_MAX_PRICE:-}" ] || return 0
     awk -v c="$RP_MAX_PRICE" 'BEGIN { exit !(c + 0 > 0) }' || { echo "rp-run: RP_MAX_PRICE takes dollars per hour above 0, not '$RP_MAX_PRICE'" >&2; exit 2; }
     awk -F'|' -v c="$RP_MAX_PRICE" '$2 + 0 > c + 0 { printf "rp-run: dropped %s %s $%s/h: over RP_MAX_PRICE $%s/h\n", $3, $1, $2, c }' <<< "$OFFERS"
@@ -2169,6 +2177,8 @@ gpu_power() {
 }
 find_host() {
     local rec pod g dl ip port tmp user util free total disk best="" bestu="" now
+    # Packing bypasses offers and may reuse a secure/other-provider pod.
+    [ "${RP_COMMUNITY_ONLY:-0}" != 1 ] || return 0
     [ "$MODE" = run ] && [ -n "${RP_MIN_VRAM_GB:-}" ] && [ "${RP_PACK:-1}" != 0 ] || return 0
     now=$(date +%s)
     for rec in "$ACTIVE"/*; do

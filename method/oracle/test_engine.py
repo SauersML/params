@@ -518,6 +518,78 @@ def test_c_semantics_equal_graph_ref():
         assert rel(eng.graph_kl(eng.plan(less, semantics="c"), u0), eng.graph_kl(eng.plan(half, semantics="c"), u0, ew=ew)) < REL
 
 
+def test_held_at_x_and_frozen_norms_equal_graph_ref():
+    """at_x and frozen norms (C's semantics) equal goal_eval.GoalEval.graph_ref's outside= and norms= / freeze=, the
+    model's values on the text (x_values is the model's own: native's recorded activations, graph_ref's recorded
+    scales): the query and key sites outside the circuit at x, the layers' norms or every norm at the model's scales,
+    and both, on a stated graph (half its connections, some query-key pairs stated); its rows with a query node off (at
+    0, not at x: graph_ref's node patched to 0); a complete graph (graph_log_probs and log_probs, and a removal from it
+    passing held); an engine over a few columns (the others at x through their write); every site of a complete graph
+    at x is the model."""
+    nat, ids, targets, graph, _, _, _ = graph_case(B=1)
+    T = len(ids)
+    ge = goal_eval.GoalEval(nat)
+    ref = nat.reference([ids], targets)
+    eng = engine.Engine(nat, ids, targets, live=True)
+    close = lambda a, b: float((a.float() - b.float()).norm() / a.float().norm().clamp_min(1e-30))  # noqa: E731
+    rec, scales = {}, {}
+    model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+    with torch.no_grad():
+        nat.run(ids, [T - 1], nat._full_plan(T, 1), *nat._one(), record=rec)
+        ge.graph_ref(ids, targets, model, norms=scales)
+        xv = eng.x_values()
+    for n in nat.names:
+        assert close(rec[n].reshape(1, T, -1), xv["acts"][n]) < 1e-5
+    for key, sc in scales.items():
+        assert close(sc, xv["norms"][key][:, targets] if key == "final" else xv["norms"][key]) < 1e-5
+    qk = {n: rec[n] for n in nat.names if native._name_layer_kind(n)[1] in ("q_proj", "k_proj")}
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[::2])
+    half.pairs = stated_pairs(half, keep=0.5, seed=3)
+    assert any(half.pairs.values())
+    kinds = [{"outside": qk}, {"norms": scales, "freeze": "layers"}, {"norms": scales, "freeze": "all"},
+             {"outside": qk, "norms": scales, "freeze": "all"}]
+    kl = lambda lq: carry.kl(ref, lq)  # noqa: E731
+    xqs = [nd for nd in sorted(half.node_set()) if nd[0].endswith(("q_proj", "k_proj"))]  # (one alone barely moves it)
+    S = set(xqs)
+    atx = native.Graph([nd for nd in half.nodes if nd not in S], {r: [w for w in ws if w not in S] for r, ws in half.parents.items()
+                                                                 if r not in S}, [w for w in half.out if w not in S])
+    every = sorted(set(answer(nat, ids)))
+    comp = native.Graph(every[::3], complete=True)
+    cm = {n: m.float()[None] for n, m in ge.masks(comp, T).items()}
+    gone = [nd for nd in every[::3] if nd[0].endswith(("q_proj", "k_proj"))]
+    less = {n: m.clone() for n, m in cm.items()}
+    for n, t, c in gone:
+        less[n][0, t, c] = 0.0
+    cols = {n: torch.tensor(sorted({c for m, _, c in half.node_set() if m == n} | set(range(0, nat.C[n], 7))), dtype=torch.long)
+            for n in nat.names}
+    few = engine.Engine(nat, ids, targets, live=True, columns=cols)
+    with torch.no_grad():
+        plain = kl(ge.graph_ref(ids, targets, half))
+        for kw in kinds:
+            ref_kw = {k: (dict(v) if k == "norms" else v) for k, v in kw.items()}  # (graph_ref records the unfrozen final scale)
+            ekw = {"at_x": kw.get("outside"), "norms": kw.get("norms"), "freeze": kw.get("freeze", "")}
+            want = kl(ge.graph_ref(ids, targets, half, **ref_kw))
+            assert rel(plain, want) > 10 * REL  # the option moves the run
+            assert rel(want, kl(eng.graph_log_probs(eng.plan(half, semantics="c"), **ekw))) < REL, kw
+            assert rel(want, kl(few.graph_log_probs(few.plan(half, semantics="c"), **ekw))) < REL, kw
+            off = kl(eng.graph_log_probs(eng.plan([half, half], semantics="c"), off=[None, xqs], **ekw))
+            assert rel(want, off[:1]) < REL
+            zero = kl(ge.graph_ref(ids, targets, half, patch={x: 0.0 for x in xqs}, **{k: (dict(v) if k == "norms" else v)
+                                                                                    for k, v in kw.items()}))
+            assert rel(zero, off[1:]) < REL, kw
+            if list(kw) == ["outside"]:  # off at 0, not at x (the graph without them, its q/k outside it)
+                assert rel(zero, kl(ge.graph_ref(ids, targets, atx, outside=qk))) > 10 * REL
+            want = kl(ge.graph_ref(ids, targets, comp, **{k: (dict(v) if k == "norms" else v) for k, v in kw.items()}))
+            assert rel(want, kl(eng.graph_log_probs(eng.plan(comp, semantics="c"), cm, **ekw))) < REL, kw
+            assert rel(want, kl(eng.log_probs(cm, **ekw))) < REL, kw
+            held = {n: ~(m > 0) for n, m in cm.items()} if "outside" in kw else None
+            want = kl(ge.graph_ref(ids, targets, comp, patch={x: 0.0 for x in gone}, **{k: (dict(v) if k == "norms" else v)
+                                                                                       for k, v in kw.items()}))
+            assert rel(want, kl(eng.log_probs(less, held=held, **ekw))) < REL, kw
+        assert float(kl(eng.graph_log_probs(eng.plan(comp, semantics="c"), cm, at_x=rec))[0]) < 1e-5
+        assert float(kl(eng.log_probs(cm, at_x=rec))[0]) < 1e-5
+
+
 def test_c_semantics_cuts_in_the_model_and_patches():
     """C's semantics on a complete graph: the whole model with one connection cut (Engine(outside="on"), u = 1) is
     goal_eval's cut of that connection (path patching); and a circuit node patched to 0 with u = 0 is the graph

@@ -167,9 +167,9 @@ flowchart BT
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
     T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>494 texts, held-out pp 0.965 · DONE"]
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
-    T3["<b>Pruning, discriminating draws</b><br/>why: fixed-draw pruning overfit<br/>(held-out 0.34 vs 0.88)<br/>landed fe0f478; N floor 343c2a1<br/>eval check on 9002, 6011, 9013<br/>ACTIVE · pymove"]
-    T4["<b>Teacher circuits v2</b><br/>influential set, prune only, fresh draws<br/>+ validation backtracking (d149b8d);<br/>9004: eval 0.92 (VPD 0.50) but prunes nothing:<br/>C-semantics KL budget binds; fix = relative<br/>budget (≤ 5% of the start's recovery lost)<br/>launch at eval ≥ 0.85, beats VPD, real pruning<br/>BLOCKED · pymove, fleet"]
-    T5["<b>Context-blocks teacher</b><br/>keeps context as blocks, prunes<br/>only the target; test transfer<br/>to unseen changes · pymove"]
+    T3["<b>Pruning, discriminating draws</b><br/>worst 16 of 64 at 0.9 refuses<br/>nearly every removal: 20k-node<br/>circuits; superseded by T4<br/>DONE (negative) · pymove"]
+    T4["<b>Teacher circuits v2</b><br/>influential set, prune only, fresh draws<br/>+ validation backtracking (d149b8d);<br/>6011: 211 nodes, eval 0.93 (VPD 0.78);<br/>9002 rerun after token fix (a2d9348);<br/>start above KL budget: relative (9c2252d)<br/>ACTIVE · pymove, fleet"]
+    T5["<b>Context-blocks teacher</b><br/>eval holds (0.90-0.95) but<br/>10^6-10^8 bits; VPD top k at<br/>its size ties or beats it<br/>CHECK · pymove"]
   end
 
   subgraph INPUTS["ORACLE INPUT · codex, rustmove, primerl"]
@@ -347,10 +347,12 @@ flowchart BT
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
   class VPD,ENG,PHI,W1,W3,I1,I2,T1,SEM,REM done
-  class T2,T3,T5,I4,W2,W4,TOY,TOYLOOP,TOYB,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
+  class T2,I4,W2,W4,TOY,TOYLOOP,TOYB,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
   class I5 done
+  class T3 done
+  class T4 active
+  class T5 check
   class I6,W5 done
-  class T4 blocked
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
   class QAONLY,WIRING check

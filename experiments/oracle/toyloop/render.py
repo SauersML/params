@@ -34,6 +34,10 @@ English: L0H1 copies each key onto the next position; L1H0 matches the query key
 # matches the truth on most families (evaluate.py's 'active' baseline). TOYLOOP_SHOW_ACTIVE=0 drops it, so the
 # oracle has to find the units in the weights and attention patterns.
 SHOW_ACTIVE = os.environ.get("TOYLOOP_SHOW_ACTIVE", "1") != "0"
+# TOYLOOP_SECTIONS=weights: only what the weights say (weight_only_lines: positional offsets, token pairs, writer ->
+# reader gains, distractors visible as writing to nothing) plus the texts' tokens; nothing computed by running the
+# model. Default "all": the original weight section plus the behaviour section.
+SECTIONS = os.environ.get("TOYLOOP_SECTIONS", "all")
 
 
 @dataclass
@@ -166,6 +170,173 @@ def weight_lines(toy: Toy, top_neurons: int = 6, k: int = 3) -> list[str]:
     return lines
 
 
+# ---------------------------------------------------------------- weights only (TOYLOOP_SECTIONS=weights)
+
+def _eps(cfg):
+    return float(cfg.get("rms_norm_eps", 1e-6))
+
+
+def _rope_scores(q, k, cfg, maxd):
+    """Attention score q.k / sqrt(hd) for a key d positions before the query, d = 0..maxd (RoPE rotate-half)."""
+    _, _, hd = heads_of(cfg)
+    freq = float(cfg.get("rotary_base", 10000.0)) ** (torch.arange(hd // 2, dtype=torch.float32) / (hd / 2))
+    def rope(x, p):
+        ang = p / freq.repeat(2)
+        return x * ang.cos() + torch.cat([-x[hd // 2:], x[:hd // 2]]) * ang.sin()
+    P = float(maxd)
+    qr = rope(q, P)
+    return torch.stack([qr @ rope(k, P - d) for d in range(maxd + 1)]) / math.sqrt(hd)
+
+
+def units_of(toy) -> list:
+    """Every live unit: (name, layer, kind 'H'/'N', index), heads first per layer."""
+    sd, cfg = toy.sd, toy.cfg
+    L, H, _ = heads_of(cfg)
+    out = []
+    for i in range(L):
+        for j in range(H):
+            if max(float(w.norm()) for w in _blocks(sd, cfg, i, j)[2:]) > 1e-6:
+                out.append((f"L{i}H{j}", i, "H", j))
+        fc, down = sd[f"h.{i}.mlp.c_fc.weight"].float(), sd[f"h.{i}.mlp.down_proj.weight"].float()
+        for n in ((fc.norm(dim=1) * down.norm(dim=0)) > 1e-9).nonzero().flatten().tolist():
+            out.append((f"L{i}N{n}", i, "N", n))
+    return out
+
+
+def wiring(toy) -> dict:
+    """Weight-only connection strengths. writes[u] = {reader: gain}: the largest singular value of reader-input-map x
+    u's output map (RMSNorm weights folded in, the norm's scale ignored); readers are later heads' Q/K/V ("L1H0.K"),
+    MLP neurons of the same or later layer (heads) / later layers (neurons), and "logits" (the tied unembedding after
+    ln_f); writer "tok" is the token identity (embeddings minus their mean, scaled to unit norm per token). A unit whose every gain is ~0 writes only where nothing reads (a distractor's dump dims)."""
+    sd, cfg = toy.sd, toy.cfg
+    L, H, hd = heads_of(cfg)
+    E = sd["wte.weight"].float()
+    units = units_of(toy)
+    out_map = {}
+    for u, i, kind, j in units:
+        if kind == "H":
+            _, _, Wv, Wo = _blocks(sd, cfg, i, j)
+            out_map[u] = Wo @ Wv * sd[f"h.{i}.rms_1.weight"].float()[None, :]      # residual -> residual [D, D]
+        else:
+            out_map[u] = sd[f"h.{i}.mlp.down_proj.weight"].float()[:, j:j + 1]      # [D, 1]
+    readers = {"logits": E * sd["ln_f.weight"].float()[None, :]}
+    for u, i, kind, j in units:
+        if kind == "H":
+            Wq, Wk, Wv, _ = _blocks(sd, cfg, i, j)
+            g = sd[f"h.{i}.rms_1.weight"].float()[None, :]
+            readers.update({f"{u}.Q": (Wq * g, i), f"{u}.K": (Wk * g, i), f"{u}.V": (Wv * g, i)})
+        else:
+            readers[u] = (sd[f"h.{i}.mlp.c_fc.weight"].float()[j:j + 1] * sd[f"h.{i}.rms_2.weight"].float()[None, :], i)
+    Ec = E - E.mean(0, keepdim=True)        # token identity: the embedding minus what every token shares
+    out_map["tok"] = Ec.T / Ec.norm(dim=1).mean()   # [D, V], one token ~ unit norm (readers see RMS-normed input)
+    writes = {}
+    for u, i, kind, _ in [("tok", -1, "T", 0)] + units:
+        w = {}
+        for r, val in readers.items():
+            if r == "logits":
+                B = val
+            else:
+                B, ri = val
+                if not (ri > i or (ri == i and kind == "H" and "." not in r)):   # later layers; a head's own MLP
+                    continue
+            if r == "logits" and u == "tok":
+                continue
+            w[r] = float(torch.linalg.matrix_norm(B @ out_map[u], ord=2))
+        writes[u] = w
+    return writes
+
+
+def weight_only_lines(toy: Toy, k: int = 3, max_neurons: int = 16) -> list[str]:
+    """Per head: norms, positional preference (the query and key of the mean embedding through RoPE: best offset and its
+    margin over the next), QK and OV token pairs, where it reads from (earlier units, by gain) and writes to (logits,
+    later units). Per live neuron: the tokens it reads, the tokens it writes, its readers and writers."""
+    sd, cfg, voc = toy.sd, toy.cfg, toy.vocab
+    L, H, hd = heads_of(cfg)
+    E = sd["wte.weight"].float()
+    writes = wiring(toy)
+    top = max((g for u, w in writes.items() if u != "tok" for g in w.values()), default=1.0) or 1.0
+    reads = {}
+    for u, w in writes.items():
+        for r, g in w.items():
+            reads.setdefault(r, []).append((g, u))
+
+    def fmt(pairs):
+        pairs = sorted(pairs, reverse=True)
+        keep = [f"{n}:{g:.2g}" for g, n in pairs if g > 0.01 * top][:4]
+        return " ".join(keep) if keep else "nothing"
+
+    lines = [f"Gains are largest singular values of reader x writer maps (largest in this model {top:.2g}); "
+             "'writes to nothing' means no later unit and no logit reads the output."]
+    maxd = min(int(cfg.get("n_ctx", 32)) - 1, 15)
+    cancel = cancelling_pairs(toy)
+    for u, i, kind, j in units_of(toy):
+        if kind == "H":
+            Wq, Wk, Wv, Wo = _blocks(sd, cfg, i, j)
+            En = _rms(E, sd[f"h.{i}.rms_1.weight"].float(), _eps(cfg))
+            c = En.mean(0)
+            pos = _rope_scores(Wq @ c, Wk @ c, cfg, maxd)
+            best = pos.topk(2)
+            qk = (En @ Wq.T) @ (En @ Wk.T).T / math.sqrt(hd)
+            ov = (En @ Wv.T) @ Wo.T @ (E * sd["ln_f.weight"].float()[None, :]).T
+            line = (f"{u} |q|{float(Wq.norm()):.2g} |k|{float(Wk.norm()):.2g} |v|{float(Wv.norm()):.2g} "
+                    f"|o|{float(Wo.norm()):.2g} pos: offset -{int(best.indices[0])} (margin "
+                    f"{float(best.values[0] - best.values[1]):.2g}, range {float(pos.max() - pos.min()):.2g}) "
+                    f"QK {_top_pairs(qk, voc, k)} (spread {float(qk.std()):.2g}) OV {_top_pairs(ov, voc, k)}")
+            src = {r: fmt(reads.get(f"{u}.{r}", [])) for r in ("Q", "K", "V")}
+            line += " | Q reads " + src["Q"] + "; K reads " + src["K"] + "; V reads " + src["V"]
+        else:
+            fc, down = sd[f"h.{i}.mlp.c_fc.weight"].float()[j], sd[f"h.{i}.mlp.down_proj.weight"].float()[:, j]
+            En2 = _rms(E, sd[f"h.{i}.rms_2.weight"].float(), _eps(cfg))
+            line = (f"{u} |in|{float(fc.norm()):.2g} |out|{float(down.norm()):.2g} reads tokens "
+                    f"{_top_tokens(En2 @ fc, voc, k)} and units {fmt(reads.get(u, []))}; writes tokens "
+                    f"{_signed_tokens((E * sd['ln_f.weight'].float()[None, :]) @ down, voc)}")
+        line += " | writes to " + fmt([(g, r) for r, g in writes[u].items()])
+        if u in cancel:
+            line += f" | cancels {cancel[u]} (same input, opposite output)"
+        lines.append(line)
+    lines.insert(1, "tok (token identity) is read by " + fmt([(g, r) for r, g in writes["tok"].items()]))
+    n_neurons = sum(1 for x in units_of(toy) if x[2] == "N")
+    if n_neurons > max_neurons:   # keep the heads and the strongest-writing neurons
+        neu = [l for l in lines[1:] if re.match(r"L\d+N", l)]
+        keep = sorted(neu, key=lambda l: -max(writes[l.split()[0]].values(), default=0))[:max_neurons]
+        lines = [l for l in lines if not re.match(r"L\d+N", l) or l in keep]
+        lines.append(f"({n_neurons - max_neurons} weaker live neurons not shown)")
+    return lines
+
+
+def _signed_tokens(v, vocab, k=2):
+    """The k most raised and the most lowered tokens: '+t1:6 +t3:2 -t24:-8'."""
+    up = " ".join(f"+{vocab[int(i)]}:{float(v[i]):.2g}" for i in v.topk(k).indices if float(v[i]) > 1e-3)
+    i = int(v.argmin())
+    return (up + (f" -{vocab[i]}:{float(v[i]):.2g}" if float(v[i]) < -1e-3 else "")).strip() or "nothing"
+
+
+def cancelling_pairs(toy, tol: float = 0.98) -> dict:
+    """{unit: partner} for same-kind units in one layer that read the same input (cosine > tol of the concatenated input
+    weights) and write opposite outputs (cosine < -tol): their sum is zero whatever the input."""
+    sd, cfg = toy.sd, toy.cfg
+    sig = {}
+    for u, i, kind, j in units_of(toy):
+        if kind == "H":
+            Wq, Wk, Wv, Wo = _blocks(sd, cfg, i, j)
+            sig[u] = (i, kind, torch.cat([Wq.flatten(), Wk.flatten(), Wv.flatten()]), (Wo @ Wv).flatten())
+        else:
+            sig[u] = (i, kind, sd[f"h.{i}.mlp.c_fc.weight"].float()[j], sd[f"h.{i}.mlp.down_proj.weight"].float()[:, j])
+    cos = lambda a, b: float(a @ b / (a.norm() * b.norm()).clamp_min(1e-12))  # noqa: E731
+    out, us = {}, list(sig)
+    for x in range(len(us)):
+        for y in range(x + 1, len(us)):
+            a, b = sig[us[x]], sig[us[y]]
+            if a[:2] == b[:2] and cos(a[2], b[2]) > tol and cos(a[3], b[3]) < -tol:
+                out[us[x]], out[us[y]] = us[y], us[x]
+    return out
+
+
+def text_lines(toy: Toy, n_texts: int = 2) -> list[str]:
+    return [f"Text {ti}: {' '.join(toy.vocab[a] for a in ids)} (predict at position {len(ids) - 1})"
+            for ti, ids in enumerate(toy.texts[:n_texts])]
+
+
 # ---------------------------------------------------------------- behaviour on example texts
 
 def active_units(toy: Toy, r: dict, t: int, rel: float = 0.05) -> list[str]:
@@ -213,6 +384,13 @@ def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None) -> str:
     """The prompt. weights_from: take the weight section from another toy (same architecture), keeping this toy's
     behaviour section (the swapped-weights control: does the answer follow the weights?)."""
     L, H, hd = heads_of(toy.cfg)
+    if SECTIONS == "weights":
+        return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
+                          f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.",
+                          "Weights (pos: preferred key offset from the query by position alone; QK: query>key token "
+                          "pairs; OV: source>written token logit pairs):", *weight_only_lines(weights_from or toy),
+                          "Texts:", *text_lines(toy, n_texts),
+                          "Which units implement the prediction at the last position, and how?", FORMAT])
     head = (f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
             f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.\n"
             "Weights (QK: query>key token pairs scored through the embedding; OV: source>written token pairs; "

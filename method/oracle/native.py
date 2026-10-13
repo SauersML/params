@@ -361,7 +361,12 @@ class Native:
         model's own prediction there (vpd4l, a language model); uniform for a Target that is no language model
         (vpd_model.TLTarget: its outputs label positions)."""
         if getattr(self.target, "lm", True):
-            return self.reference([ids[:source]], [source - 1])[0, 0]
+            held = getattr(self.target, "behavior", None), getattr(self.target, "behavior_tokens", None)
+            self.target.behavior, self.target.behavior_tokens = None, None  # the source sampler reads the whole distribution
+            try:
+                return self.reference([ids[:source]], [source - 1])[0, 0]
+            finally:
+                self.target.behavior, self.target.behavior_tokens = held
         V = self.target.n_tokens
         return torch.full((V,), -math.log(V), device=self.dev)
 
@@ -487,7 +492,7 @@ class Native:
         """log p of the model at the targets of each sequence [B, len(targets), V]. When the model is plain(), a call
         repeated with the same sequences and targets returns the first call's tensor (the same numbers; callers never
         write to it), kept up to REFERENCE_BYTES."""
-        key = (tuple(map(tuple, ids)), tuple(targets)) if self.plain() else None
+        key = (tuple(map(tuple, ids)), tuple(targets), getattr(self.target, "behavior_tokens", None)) if self.plain() else None
         if key is not None and key in self._refs:
             self._refs.move_to_end(key)
             return self._refs[key]

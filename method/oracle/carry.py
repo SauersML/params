@@ -945,7 +945,7 @@ def _run_units(study, coefficients, embeddings, *, compact=False, activation_gra
         gelu = vpd_model.gelu_tanh(pre)
         x = (x + projection(nd, gelu)) + gelu @ tg.site(nd).delta_T
     final = selected_rows(x, [p-s for p in study.targets])
-    return torch.log_softmax((vpd_model.rms(final, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
+    return torch.log_softmax(tg.unembed(vpd_model.rms(final, tg.ln_f, tg.eps)).float(), -1)
 
 
 def _mixed_units(study, x, coefficients):

@@ -79,6 +79,9 @@ class Site(nn.Module):
         return out
 
 
+BEHAVIOR_OFF = 1e4  # set_behavior's logit offset outside a behavior's tokens (exp(-1e4) is 0 in float32)
+
+
 def rms(x: Tensor, w: Tensor, eps: float) -> Tensor:
     xf = x.float()
     return w * (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
@@ -101,6 +104,7 @@ class Target(nn.Module):
         self.eps = float(cfg["rms_norm_eps"])
         self.register_buffer("wte", sd["wte.weight"])
         self.register_buffer("ln_f", sd["ln_f.weight"])
+        self.behavior, self.behavior_tokens = None, None  # set_behavior's logit mask [V] and its tokens (None: off)
         self.norms = nn.ParameterList()
         self.sites = nn.ModuleDict()
         for i in range(self.n_layer):
@@ -168,8 +172,22 @@ class Target(nn.Module):
         return F.gelu(x, approximate="tanh") if fused else gelu_tanh(x)
 
     def unembed(self, h: Tensor) -> Tensor:
-        """Logits from the final normed residual stream (vpd4l: the tied embedding)."""
-        return h @ self.wte.T
+        """Logits from the final normed residual stream (vpd4l: the tied embedding), plus the behavior mask when one is
+        set (set_behavior)."""
+        out = h @ self.wte.T
+        return out if self.behavior is None else out + self.behavior
+
+    def set_behavior(self, tokens: list[int] | None) -> None:
+        """The behavior-targeted mode (#2951, the lead's 10-13: "why is over are?"): every logit outside tokens lowered
+        by BEHAVIOR_OFF, so each next-token distribution is the one over tokens alone (the others' probability 0 to
+        float32: every KL computed from them is the KL of the behavior's distribution, a divergence of its log-odds for
+        two tokens), shapes and token ids unchanged; None restores the whole distribution."""
+        if not tokens:
+            self.behavior, self.behavior_tokens = None, None
+            return
+        m = torch.full((self.wte.shape[0],), -BEHAVIOR_OFF, device=self.wte.device)
+        m[torch.tensor(sorted(set(int(z) for z in tokens)), device=self.wte.device)] = 0.0
+        self.behavior, self.behavior_tokens = m, tuple(sorted(set(int(z) for z in tokens)))
 
     def _rope(self, x: Tensor, T: int) -> Tensor:
         n = self.hd // 2

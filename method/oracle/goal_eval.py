@@ -978,6 +978,13 @@ class Text:
         nat = ge.nat
         t0 = time.perf_counter()
         self.ge, self.ids, self.targets, self.T, self.seed, self.task = ge, list(ids), list(targets), len(ids), seed, task
+        # the behavior-targeted mode (the lead's 10-13): a task's "behavior" {"tokens", "pairs"} makes every distribution
+        # at the targets the one over its tokens (Target.set_behavior, set here for this text: one text's mode at a
+        # time) and puts its minimal pairs [(position, source token)] first in every family's changed-text draws
+        beh = (task or {}).get("behavior") or {}
+        if hasattr(nat.target, "set_behavior"):
+            nat.target.set_behavior(beh.get("tokens"))
+        self.behavior_pairs = [(int(p), int(z)) for p, z in beh.get("pairs", [])]
         self.rec, self.states = nat._model_record(self.ids)
         self.ref = nat.reference([self.ids], self.targets)
         cap = carry._Remainders(nat)
@@ -997,6 +1004,19 @@ class Text:
         if self._probe is None:
             t0 = time.perf_counter()
             self._probe = self.ge.probe(self.ids, self.targets, self.seed)
+            if self.behavior_pairs:  # a behavior's minimal pairs are F2 positions, moved at least by their own change
+                prompts, f2, moved = self._probe
+                f2, moved, have = list(f2), np.array(moved, dtype=float), {p for p, _ in f2}
+                for p, z in self.behavior_pairs:
+                    x = list(self.ids)
+                    x[p] = z
+                    m = float(carry.kl(self.ref[:, -1:], self.ge.nat.reference([x], self.targets[-1:]))[0]) * math.log(2)  # nats
+                    if p not in have:
+                        f2.append((p, [x]))
+                        have.add(p)
+                    if 0 <= p - 1 < len(moved):
+                        moved[p - 1] = max(moved[p - 1], m)
+                self._probe = (prompts, f2, moved)
             self.seconds += time.perf_counter() - t0
         return self._probe
 
@@ -1041,7 +1061,7 @@ class GoalEval:
         """(the text's changed prompts (Native.changes), F2's [(position, held-out prompts)], the probe's moved per
         position), kept per text: the sensitivity probe behind them is most of their cost (16 s at T 395 on the Mac's
         GPU)."""
-        nat, key = self.nat, (tuple(ids), tuple(targets), seed)
+        nat, key = self.nat, (tuple(ids), tuple(targets), seed, getattr(self.nat.target, "behavior_tokens", None))
         if key not in self.probes:
             probe = {}
             prompts = nat.changes(ids, targets, n=self.changes, seed=seed, probe=probe)
@@ -3637,7 +3657,9 @@ class GoalEval:
             pairs += [(p, x[p]) for x in carry.alternatives(self.nat, tx.ids, p, ranks)]
             pairs += [(p, z) for z in (self._fresh_sources(tx, p, seed)[:f] if f else [])]
         first = first or {}
-        return sorted(pairs, key=lambda pz: (first.get(pz[0], 0), hashlib.sha256(repr((seed, pz)).encode()).digest()))[:draws]
+        own = [pz for pz in getattr(tx, "behavior_pairs", []) if 0 < pz[0] < tx.T]  # a behavior's minimal pairs, first
+        return (own + sorted((pz for pz in pairs if pz not in own),
+                             key=lambda pz: (first.get(pz[0], 0), hashlib.sha256(repr((seed, pz)).encode()).digest())))[:draws]
 
     @torch.no_grad()
     def _changed_logq(self, tx: Text, graphs: list[native.Graph], got: list, strengths: torch.Tensor | None = None,

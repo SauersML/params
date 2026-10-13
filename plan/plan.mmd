@@ -75,7 +75,7 @@ flowchart BT
     I3["<b>Coverage audit</b><br/>old prompts showed 14% of targets;<br/>all target IDs remain expressible;<br/>recheck each new rendered format<br/>codex, rustmove"]
     I4["<b>Learnability grid</b><br/>which input predicts actual effects?<br/>compare text, weights, features<br/>and cheap learned baselines<br/>ACTIVE · rustmove"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
-    I6["<b>Does the oracle use weights?</b><br/>shuffle distinct weight identities;<br/>a new position is not a new weight<br/>FIXED + CI passed · codex<br/>handoff: I4 comparisons on 6560772"]
+    I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
   end
 
   subgraph REWARD["REWARD · primerl, inframove, generality, codex"]

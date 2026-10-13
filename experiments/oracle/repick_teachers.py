@@ -39,14 +39,19 @@ def repick(row: dict, written: list, answer: dict | None, stage_nodes: dict | No
         known = {k: by_size[p[3]] for k, p in phi.items() if p[3] in by_size}
     ok = sorted((p for p in phi.values() if p[7] == 0), key=lambda p: -p[6])
     pick = next((p for p in ok if p[0] in known), None)
+    fallback = pick is None and "start" in known             # no stage at v = 0: the start, as set_search falls back
+    if fallback:                                             # (its own row can miss a floor by the estimators' noise:
+        pick = phi["start"]                                  # text6007 v 0.066, text6097 0.016 under n)
     rec = {"task": row["task"], "stage": cur[0], "size": cur[3], "term": cur[6], "v": cur[7],
            "best_v0": ok[0][0] if ok else None, "best_v0_size": ok[0][3] if ok else None, "best_v0_term": ok[0][6] if ok else None,
            "best_v0_recoverable": bool(ok) and ok[0][0] in known}
     if pick is None:
         return None, {**rec, "repicked": False, "reason": "no recoverable stage at v = 0"}
-    if pick[3] == cur[3] and cur[7] == 0:
-        return None, {**rec, "repicked": False, "reason": "written stage already the best at v = 0"}
-    return known[pick[0]], {**rec, "repicked": True, "new_stage": pick[0], "new_size": pick[3], "new_term": pick[6]}
+    if pick[3] == cur[3]:
+        return None, {**rec, "repicked": False, "reason": "no stage at v = 0: the start" if fallback
+                      else "written stage already the best at v = 0"}
+    return known[pick[0]], {**rec, "repicked": True, "new_stage": pick[0], "new_size": pick[3], "new_term": pick[6],
+                            **({"reason": "no stage at v = 0: the start"} if fallback else {})}
 
 
 def main():
@@ -70,7 +75,8 @@ def main():
                 continue
             written = sorted((x[0], int(x[2]), int(x[1])) for x in json.loads(circ.read_text())["nodes"])   # [site, c, t]
             old = recs.get(task)
-            if old is not None and (old["new_size"] if old["repicked"] else old["size"]) == len(written):
+            if old is not None and (old["new_size"] if old["repicked"] else old["size"]) == len(written) \
+                    and old.get("reason") != "no recoverable stage at v = 0":
                 continue                                     # the record describes this circuit (a rerun's does not)
             # the summary row of the run that wrote this circuit: its written stage's size (the latest such row)
             row = next((r for r in reversed(cands) if "phi" in (r.get("blocks") or {})

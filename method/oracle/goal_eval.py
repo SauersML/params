@@ -130,7 +130,8 @@ NEC_CONTROLS = 32  # N's matched control texts per text (necessity_spec: the spl
 # controls' spread, ~5 bits, gave eps_N a median 0.14 on the held-out influential sets)
 NEC_CONTROLS_LOO = 8  # line_loo's N controls (the answer's own N recomputed on the same 8, so a deletion's change in phi
 # compares like with like; 32 controls per deletion were 55% of line_loo on a 4090)
-REMOVAL_ROWS = 16  # real-model removal runs per batch (_removed_kl)
+REMOVAL_ROWS = {"cuda": 32, "other": 16}  # real-model removal sets per batch (_removed_kl), by device: a removal batch's
+# masks are [rows, T, C] floats at every site
 NEC_MIN_LEN = 64  # a control text's least length (end-aligned: a circuit's parts further back are not removed there)
 DONOR_POOLS = {"search": ("train", range(0, 400)),  # the far donors' texts per split: the reward's from training texts,
                "eval": ("donor", range(0, 50))}  # explicit text9150-9199 partition, independent of missing dev files
@@ -2331,7 +2332,7 @@ class GoalEval:
             ref = nat.run(ids, targets, nat._full_plan(T, 1), one_u, one_r)
         none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
         kls = []
-        rows = max(self.chunk, REMOVAL_ROWS)
+        rows = max(self.chunk, REMOVAL_ROWS["cuda" if str(nat.dev).startswith("cuda") else "other"])
         for s0 in range(0, len(sets), rows):
             part = sets[s0:s0 + rows]
             B = len(part)

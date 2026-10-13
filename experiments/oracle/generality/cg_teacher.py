@@ -31,6 +31,9 @@ sys.path.insert(0, str(ORACLE))
 
 DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/generality"))
 PER_TASK = 4
+SEM = os.environ.get("SEMANTICS") or "c"  # goal_eval's semantics for every run (GoalEval reads the same variable)
+SUF = "" if SEM == "c" else f"_{SEM}"  # each semantics' outputs apart ("c" the earlier ones)
+SEALED = __import__("re").compile(r"text91[0-4][0-9][.]json")
 
 
 def write(behavior: bool = False, per_task: int = PER_TASK):
@@ -145,7 +148,7 @@ def attractor(tdir: str, draws: int = 8):
     ge = goal_eval.GoalEval(native.Native())
     ge.nat.LENGTHS_KEPT = 1
     nat = ge.nat
-    out = DATA / "cg_attractor.jsonl"
+    out = DATA / f"cg_attractor{SUF}.jsonl"
     done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
     names = sorted(p.stem for p in tdir.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_"))
     for nm in names:
@@ -306,7 +309,7 @@ def moved(tdir: str):
     names = sorted(p.stem for p in tdir.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_"))
     nat = native.Native()
     ges = {sem: goal_eval.GoalEval(nat, semantics=sem) for sem in ("c", "x")}
-    out = DATA / "cg_moved.jsonl"
+    out = DATA / f"cg_moved{SUF}.jsonl"
     done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
     for nm in names:
         if nm in done:
@@ -371,7 +374,7 @@ def texts_root() -> Path:
     d.mkdir(parents=True, exist_ok=True)
     real = native.TEXTS / "vpd4l"
     for f in os.listdir(real):
-        if f.endswith(".json") and not (d / f).exists():
+        if f.endswith(".json") and not (d / f).exists() and not SEALED.fullmatch(f):  # never the sealed final test
             (d / f).symlink_to(real / f)
     for f in os.listdir(DATA / "causalgym_texts_b"):
         if not (d / f).exists():
@@ -379,7 +382,8 @@ def texts_root() -> Path:
     return root
 
 
-TEACH_DIR = DATA / "cg_teacher_b2"  # the behavior-mode v2.1 teacher circuits, every batch's (pods' copied in)
+OUTROOT = Path(os.environ["GEN_OUT"]) if os.environ.get("GEN_OUT") else DATA  # a pod's or MATS job's synced outputs
+TEACH_DIR = Path(os.environ.get("CG_TEACH_DIR") or OUTROOT / f"cg_teacher_b2{SUF}")  # the behavior-mode v2.1 teacher circuits
 
 
 def run_local(k: int = 0, P: int = 1, name: str | None = None):
@@ -411,7 +415,7 @@ def run_local(k: int = 0, P: int = 1, name: str | None = None):
 def test_local(k: int = 0, P: int = 1, name: str | None = None):
     """The circuit test (path-patched terms, reward v3's R against the variable moved to the attractor) on every circuit
     in TEACH_DIR, on the Mac, one leased process per prompt -> DATA/cg_teacher_b2_test.jsonl (resumable by name)."""
-    out = DATA / "cg_teacher_b2_test.jsonl"
+    out = OUTROOT / f"cg_teacher_b2_test{SUF}{os.environ.get('GEN_TAG', '')}.jsonl"
     done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
     names = sorted(p.stem for p in TEACH_DIR.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_")
                    and p.stem not in done and (name is None or p.stem == name))[k::P]
@@ -421,6 +425,13 @@ def test_local(k: int = 0, P: int = 1, name: str | None = None):
                             "test_local", "--name", nm], check=False)
         return
     test(names, TEACH_DIR, out, "_b")
+
+
+def one(name: str):
+    """One prompt end to end in this semantics (a MATS or pod line): its teacher circuit (run_local), then its circuit
+    test (test_local), each its own process."""
+    for cmd in ("run_local", "test_local"):
+        subprocess.run([sys.executable, "-B", str(HERE / "cg_teacher.py"), cmd, "--name", name], check=False)
 
 
 def _boot(xs, stat=np.mean, B: int = 2000, seed: int = 2951):
@@ -439,10 +450,13 @@ def report60():
     the reward's changed-input claims) or "standalone" (the circuit's masked run alone on each input; sufficiency)."""
     meta = json.loads((DATA / "causalgym_texts_b.json").read_text())
     rd = lambda f: [json.loads(x) for x in (DATA / f).read_text().splitlines()] if (DATA / f).exists() else []  # noqa: E731
-    att = {r["name"]: r for r in rd("cg_attractor.jsonl")}
-    mov = {r["name"]: r for r in rd("cg_moved.jsonl")}
+    att = {r["name"]: r for r in rd(f"cg_attractor{SUF}.jsonl")}
+    mov = {r["name"]: r for r in rd(f"cg_moved{SUF}.jsonl")}
     tst = {}
-    for r in rd("cg_teacher_b2_test.jsonl"):
+    import templates
+
+    tests = [DATA / f"cg_teacher_b2_test{SUF}.jsonl"] + templates.run_outputs(f"cg_teacher_b2_test{SUF}*.jsonl")
+    for r in (json.loads(x) for p in tests if p.exists() for x in p.read_text().splitlines()):
         tst.setdefault(r["name"], {})[r["variant"]] = r
     names = sorted(n for n in att if n in mov)
     real = [n for n in names if not meta[n]["attractor_is_target"] and meta[n]["task"] != "agr_gender"]
@@ -566,7 +580,7 @@ def report(behavior: bool = False, v2: bool = False):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("write", "run", "report", "masks", "test", "attractor", "gender_masks", "moved", "bounds",
-                                    "run_local", "test_local", "report60"))
+                                    "run_local", "test_local", "report60", "one"))
     ap.add_argument("--per-task", type=int, default=PER_TASK, help="write: pairs per task")
     ap.add_argument("--name", default=None, help="run_local: one prompt")
     ap.add_argument("--dir", help="attractor: the teacher circuits' directory")
@@ -574,5 +588,5 @@ if __name__ == "__main__":
     ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
     ap.add_argument("--v2", action="store_true", help="run, report: the v2.1 teacher (start set, acceptance, phi pick)")
     a = ap.parse_args()
-    {"write": lambda: write(a.behavior, a.per_task), "bounds": bounds_b, "test_local": lambda: test_local(*a.args, name=a.name), "report60": report60, "run_local": lambda: run_local(*a.args, name=a.name), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
+    {"write": lambda: write(a.behavior, a.per_task), "bounds": bounds_b, "one": lambda: one(a.name), "test_local": lambda: test_local(*a.args, name=a.name), "report60": report60, "run_local": lambda: run_local(*a.args, name=a.name), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
      "masks": lambda: masks_run(*a.args, behavior=a.behavior), "test": lambda: test_dir(*a.args, behavior=a.behavior), "attractor": lambda: attractor(a.dir), "gender_masks": gender_masks, "moved": lambda: moved(a.dir)}[a.cmd]()

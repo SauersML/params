@@ -31,6 +31,8 @@ sys.path.insert(0, os.environ.get("ORACLE") or str(HERE.parents[2] / "method" / 
 
 DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/generality"))  # inputs and outputs
 RAW = Path.home() / "mpd-data/causalgym/raw/test.json"
+SEM = os.environ.get("SEMANTICS") or "c"  # goal_eval's semantics (GoalEval reads the same variable); outputs apart per semantics
+SUF = "" if SEM == "c" else f"_{SEM}"
 KEEP = 0.8
 
 
@@ -211,7 +213,7 @@ def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = Fals
         goal_eval.FLIP_ROWS = 16
     pool_path = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
     pool = torch.load(pool_path, weights_only=False) if pool_path.exists() else None
-    stem = f"causalgym_falsify{'_blocks' if blocks else ''}{'_behavior' if behavior else ''}"
+    stem = f"causalgym_falsify{'_blocks' if blocks else ''}{'_behavior' if behavior else ''}{SUF}"
     out = Path(os.environ.get("GEN_OUT", DATA)) / f"{stem}{os.environ.get('GEN_TAG', '')}.jsonl"
     done = {(r["task"], r["pair"]) for r in map(json.loads, out.read_text().splitlines())} if out.exists() else set()
     kept = [t for t, v in tasks.items() if v["kept"]]
@@ -295,11 +297,13 @@ def report(blocks: bool = False, behavior: bool = False, run: str | None = None)
     rows = []
     import templates
 
-    stem = f"causalgym_falsify{'_blocks' if blocks else ''}{'_behavior' if behavior else ''}"
+    stem = f"causalgym_falsify{'_blocks' if blocks else ''}{'_behavior' if behavior else ''}{SUF}"
     paths = ([DATA / f"{stem}.jsonl"] + templates.run_outputs(f"{stem}*.jsonl") if run is None else
              sorted((Path("/Users/user/mpd-data/runpod") / run / "out").glob(f"{stem}*.jsonl")))
     for p in paths:
-        if p.exists() and ("_blocks" in p.name) == blocks and ("_behavior" in p.name) == behavior:
+        rest = p.name[len(stem):]  # a later suffix is another semantics' file (or a pod tag: _pod_K)
+        if p.exists() and ("_blocks" in p.name) == blocks and ("_behavior" in p.name) == behavior and \
+                (rest.startswith(".") or rest.startswith("_pod")):
             rows += [json.loads(x) for x in p.read_text().splitlines()]
     by = collections.defaultdict(dict)
     for r in rows:

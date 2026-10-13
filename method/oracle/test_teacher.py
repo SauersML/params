@@ -550,3 +550,21 @@ def test_discriminating_draws_stay_off_eval(draws):
     most = teacher.DISC_DRAWS if draws == "discriminating" else teacher.POOL_DRAWS
     assert all(len(x["draws"]) <= most and {tuple(d) for d in x["draws"]} <= set(pool) and x["s_track_pp"] < floor
                for x in acc.refused)
+
+
+@pytest.mark.skipif(DEVICE == "cpu", reason="needs a GPU")
+def test_block_search_phi_check_backs_off():
+    if not VPD_SAVED.exists() or not teacher.POOL.exists():
+        pytest.skip("needs VPD's answers and the adversary's pool")
+    nat, pr = pruner(teacher.CONVENTION == "live", "text9019")
+    ge, tx = pr.ge, pr.tx
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    acc = teacher.Acceptance(ge, tx, ("changed",), "pp", "fresh")
+    g, pb, group, flagged, rec = teacher.block_search(ge, tx, empty, vpd, teacher.kl_budget(empty, vpd), acc,
+                                                      levels=("inactive", "chunk64"), phi_pool=torch.load(teacher.POOL))
+    tried = rec["phi"]
+    # stages checked from the last back: stopped at the first that reaches the reward's bar, else every one tried and
+    # the best kept
+    passed = [x for x in tried if x[1] is not None and x[1] >= x[2]]
+    assert (passed and passed[0] is tried[-1] and rec["phi_stage"] == tried[-1][0]) or \
+        (not passed and rec["phi_stage"] == max((x for x in tried if x[1] is not None), key=lambda x: x[1])[0])

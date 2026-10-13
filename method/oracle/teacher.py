@@ -837,7 +837,8 @@ BLOCK_LEVELS = ("inactive", "chunk64", "chunk16", "chunk4", "subcomponent")  # a
 
 
 def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
-                 acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = BLOCK_LEVELS) -> tuple:
+                 acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = BLOCK_LEVELS,
+                 phi_pool: dict | None = None) -> tuple:
     """The influential-blocks search (the lead's 10-12): every site's whole output (a block, goal_eval.BLOCK) at the
     targets and the m most influential positions (F2's probe, by the share each moved), m the smallest whose node set
     keeps s_track_pp >= 0.9 on the search split (all of them when none does); then, every removal within the F1 budget
@@ -846,7 +847,9 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
     as blocks; the refined sites' subcomponents pruned (first those outside VPD's answer, per site and position, then
     chunks of 64, 16, 4, then single); then a refined site whose kept subcomponents outnumber VPD's active ones there
     (a block priced at its active contents, the lead's 10-12) is its block again where that keeps the budget and the
-    floors (text6011's copied token at 233 kept 1,420 subcomponents). Node sets throughout (every
+    floors (text6011's copied token at 233 kept 1,420 subcomponents). With phi_pool (the adversary's pool), the end
+    is checked against the reward's bar: goal_eval.phi of the circuit's reward-mode row on the search split >= phi_tau
+    (GoalEval.tau), else the set after the stage before, back to the start (the lead's 10-12). Node sets throughout (every
     connection, token edge and pair: complete graphs). (The circuit, the Pruner over every subcomponent at those
     positions with its final set, each unit's (site, position) group, the groups kept as blocks [S T], the record.)"""
     nat, targets, S = ge.nat, tx.targets, len(ge.nat.names)
@@ -875,7 +878,10 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
 
     rec = {"m": m, "positions": P, "tried": tried, "start_units": len(pr.nodes), "stages": []}
 
+    snaps = []                                               # (stage, its set, the kept blocks) for the phi check
+
     def stage(name, t0):
+        snaps.append((name, pr.on.clone(), flagged.clone()))
         g = graph_of(pr.on)
         kl = pr.kl()
         nb = sum(nd[2] == goal_eval.BLOCK for nd in g.node_set())
@@ -940,6 +946,21 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
         pr.on, flagged[k] = on2, True
         rec.setdefault("reblocked", []).append([pr.names[k % S], k // S, int(kept_n[k]), int(act_n[k])])
     stage("reblock", t0)
+    if phi_pool is not None:                                 # the reward's bar on the search split, backing off a stage
+        bar = ge.tau(tx, phi_pool, "search")["phi_tau"]      # at a time while the circuit falls below it
+        rec["phi"], best = [], None
+        for name, on_s, fl_s in reversed(snaps):
+            row = ge.fidelity(tx, [graph_of(on_s, fl_s)], phi_pool, mode="reward", split="search")[0]
+            ph = goal_eval.phi(row, start=bar)[0]
+            rec["phi"].append([name, ph, bar])
+            log(f"  blocks phi at {name}: {ph} (bar {bar})", flush=True)
+            if ph is not None and (best is None or ph > best[0]):
+                best = (ph, name, on_s, fl_s)
+            if ph is not None and bar is not None and ph >= bar:
+                break
+        if best is not None:                                 # the first stage back that passes, else the best phi
+            pr.on, rec["phi_stage"] = best[2].clone(), best[1]
+            flagged[:] = best[3]
     g = graph_of(pr.on)
     if acceptance is not None:
         rec["accept"] = acceptance.scores([g])[0]
@@ -1260,7 +1281,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
           accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
-          accept_draws: str = "fixed") -> tuple[dict, dict]:
+          accept_draws: str = "fixed", phi_pool: dict | None = None) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -1301,7 +1322,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
 
     if f1_start == "influential":                            # the influential-blocks search (block_search) and its wiring
-        g, pb, _, _, row["blocks"] = block_search(ge, tx, empty, vpd, budget, acceptance, B)
+        g, pb, _, _, row["blocks"] = block_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool)
         bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
         inside = set(g.node_set())
         minus = torch.tensor([not (nd in inside or (nd[0], nd[1]) in bl) for nd in pr.nodes], device=nat.dev)
@@ -1530,6 +1551,8 @@ def main():
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
     ap.add_argument("--accept-mode", choices=tuple(TRACK), default="pp", help="--accept changed's term: pp (s_track_pp, "
                     "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")
+    ap.add_argument("--phi-check", action="store_true", help="with --f1-start influential, the circuit checked against the "
+                    "reward's bar (goal_eval.phi >= phi_tau on the search split, the adversary's pool), backing off a stage at a time")
     ap.add_argument("--accept-draws", choices=("fixed", "discriminating", "fresh"), default="fixed",
                     help="--accept changed's draws in pp mode: the search split's fixed ones, or per check a fresh sample of "
                          "64 from a pool disjoint from eval, each candidate judged on the 16 where it and the current circuit "
@@ -1590,7 +1613,7 @@ def main():
             r = json.loads(line)
             labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
-    pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" else None
+    pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" or args.phi_check else None
     for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
             continue
@@ -1609,7 +1632,7 @@ def main():
                                          args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
                                          args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
-                                         args.accept_mode, native.task_seed(path.stem), args.accept_draws)
+                                         args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if args.phi_check else None)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

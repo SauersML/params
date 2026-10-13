@@ -3070,8 +3070,8 @@ class GoalEval:
                    if _fid_raw(e0, pt["kl_live"], v0) is not None else None,
                    "s_nodes": row.get("s_nodes_raw"),
                    "s_edges": _fid_raw(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
-                   "f1_flips_c": min(x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None)
-                   if kfl else None,
+                   "f1_flips_c": min((x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None),
+                                     default=None) if kfl else None,  # none where neither bound resolves (a behavior's KLs)
                    "s_track_pp": row.get("s_track_pp_raw"), "s_interchange_pp": row.get("s_interchange_pp_raw"),
                    "s_pattern": row.get("s_pattern_raw")}
             for pool_ in ("near", "far"):

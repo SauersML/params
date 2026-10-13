@@ -155,13 +155,13 @@ def test(names: list, tdir: Path, out: Path, b: str = ""):
                 ph = goal_eval.phi(r, families=fams)[0]
                 phc = goal_eval.cap_phi(ph, pt)
                 gate = None if phc is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (phc - pt)))
-                b = goal_eval.size_bits(graphs[v], P_, S_, tx.targets)
-                comp = goal_eval.compact(b, tau["bits_start"]) if b > 0 else None
+                nb = goal_eval.size_bits(graphs[v], P_, S_, tx.targets)
+                comp = goal_eval.compact(nb, tau["bits_start"]) if nb > 0 else None
                 f.write(json.dumps({"name": nm, "task": m["task"], "pair": m["pair"], "variant": v, "positions": held,
                                     "p": p, "attractor": pw, "t": t, "nodes": len(nodes),
                                     "at_variable": sum(q == p for _, q, _ in nodes), "at_attractor": sum(q == pw for _, q, _ in nodes),
                                     "phi": ph, "phi_tau": pt, "reward": None if None in (phc, pt, gate, comp) else phc - pt + gate * 0.5 * comp,
-                                    "bits": b, **{f"s_{fm}": goal_eval.family_score(r, fm) for fm in goal_eval.PHI_FAMILIES},
+                                    "bits": nb, **{f"s_{fm}": goal_eval.family_score(r, fm) for fm in goal_eval.PHI_FAMILIES},
                                     "moved_c": (c1[i] - c0[i]) / (m1 - m0) if abs(m1 - m0) > 1e-6 else None,
                                     "flip_c": bool((c1[i] > 0) != (c0[i] > 0)), "flip_model": bool((m1 > 0) != (m0 > 0))}) + "\n")
         native.free(nat.dev)

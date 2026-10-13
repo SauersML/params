@@ -7,7 +7,7 @@
 # experiments/oracle/figures_eval.py --rl reads. Run it while the RL runs or after; it skips what is done.
 #   zsh experiments/oracle/rl_heldout.sh DIR   (env: HELDOUT, DTEACHER (reward v3's teacher term: v2 circuits only), LABELS, NEVAL, SAMPLES,
 #                                               MAXTOK, EDIT_TEACH, SRC, RLNAME, READERS; the policy's input and sampling as
-#                                               in its SFT (sft.sh): POOL, MEASURED, THINKING)
+#                                               in its SFT (sft.sh): POOL, MEASURED, THINKING; ONLY=k: checkpoint k alone)
 # Then the RL figure (figures_eval.py --rl) as ~/mpd-data/graph_oracle/figures/rl_<DIR's name>_rl.png.
 set -e
 DIR=$1
@@ -31,6 +31,7 @@ for l in open('$DIR/checkpoints.jsonl'):
     r = json.loads(l); print(r['step'], r['state'], r['base'])
 " | while read -r STEP STATE BASE; do
   [ -f $DIR/heldout_$STEP.json ] && continue
+  [ -n "${ONLY:-}" ] && [ "$STEP" != "$ONLY" ] && continue  # ONLY=k: that checkpoint alone (one process per checkpoint at once)
   (cd $SRC/method/oracle/rl &&
    $TPY -u tinker_train.py sample $DIR/heldout.jsonl $DIR/heldout_${STEP}_samples.jsonl --init "$STATE" --base $BASE \
      --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK $TH &&

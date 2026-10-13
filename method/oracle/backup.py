@@ -87,7 +87,7 @@ class Backup:
     the measurements above. graph: a goal_eval node set (complete; blocks allowed, stranded nodes dropped first)."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, draws: int = SEARCH_DRAWS,
-                 rows: int = ROWS, family: str = "backup"):
+                 rows: int = ROWS, family: str = "backup", block_units: bool = True):
         import engine
 
         nat = ge.nat
@@ -97,25 +97,29 @@ class Backup:
             raise ValueError("backup expansion takes a node set (a complete graph): state connections after it")
         self.blocks0 = frozenset((n, t) for n, t, c in g.node_set() if c == BLOCK)
         self.subs0 = frozenset(nd for nd in g.node_set() if nd[2] != BLOCK)
-        self.nodes = sorted(goal_eval.expand_blocks(g, nat.C).node_set())  # the removal units: subcomponents
+        self.nodes = sorted(goal_eval.expand_blocks(g, nat.C).node_set())  # the circuit's subcomponents
         self.positions = sorted({t for _, t, _ in self.nodes})
+        # the removal units: the circuit's subcomponents, a block of the circuit's one unit (block_units: an answer's
+        # block node is one node; else its subcomponents, as goal_eval's node family expands it)
+        units = sorted(self.subs0) + sorted((n, t, BLOCK) for n, t in self.blocks0) if block_units else self.nodes
         self.T, self.P, self.S = tx.T, nat.positions(tx.targets), sum(nat.C.values())
         self.E = engine.Engine(nat, tx.ids, tx.targets, live=True)       # every column: blocks switch whole sites on
         self.e0, self.v0 = ge._bounds(tx, "live")
-        key = int(hashlib.sha256(repr((family, self.nodes)).encode()).hexdigest()[:15], 16)
+        key = int(hashlib.sha256(repr((family, units)).encode()).hexdigest()[:15], 16)
         rng = np.random.default_rng([tx.seed, key])
         self.drops = []
         for j in range(draws):
-            d = [nd for nd in self.nodes if rng.random() < (j + 0.5) / draws]
-            self.drops.append(d or [self.nodes[int(rng.integers(len(self.nodes)))]])
+            d = [nd for nd in units if rng.random() < (j + 0.5) / draws]
+            self.drops.append(d or [units[int(rng.integers(len(units)))]])
         dev = nat.dev
         self._drop_idx = []                                          # per draw {site: (positions, columns)}
         for d in self.drops:
             by = {}
             for n, t, c in d:
                 by.setdefault(n, ([], []))
-                by[n][0].append(t)
-                by[n][1].append(c)
+                cs = range(nat.C[n]) if c == BLOCK else [c]
+                by[n][0].extend([t] * len(cs))
+                by[n][1].extend(cs)
             self._drop_idx.append({n: (torch.tensor(t, device=dev), torch.tensor(c, device=dev)) for n, (t, c) in by.items()})
         ones = {n: torch.ones(self.T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
         self.lm = self._run([(ones, j) for j in range(draws)])           # the model less d
@@ -519,6 +523,30 @@ class Backup:
             E._site = orig
         return {L: tg.attention_pattern(got[native.site_name(L, "q_proj")], got[native.site_name(L, "k_proj")])[0]
                 for L in range(tg.n_layer)}
+
+
+def nodes_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, graphs: list, draws: int = SEARCH_DRAWS,
+                 block_units: bool = True) -> list[dict]:
+    """The node family on search draws for a teacher's acceptance (teacher.Acceptance's form: per graph a dict of
+    terms): per graph (a node set, blocks allowed) s_nodes in goal_eval's form, KL(model less d || circuit less d)
+    against W = KL(model less d || model) with VPD's answer less d the reference, pooled by W, on draws of the graph's
+    own nodes seeded apart from goal_eval's (the family "nodes_search"), a block one unit (block_units) or its
+    subcomponents; with s_nodes_raw (unfloored) and overstate_nodes. A graph with no node: None."""
+    out = []
+    for g in graphs:
+        if not g.count():
+            out.append({"s_nodes": None, "s_nodes_raw": None, "overstate_nodes": None})
+            continue
+        bk = Backup(ge, tx, g, draws=draws, family="nodes_search", block_units=block_units)
+        m = bk.masks()
+        lq = bk._run([(m, None)] + [(m, j) for j in range(len(bk.drops))])
+        f = bk._fields(lq)
+        kc = carry.kl(bk.lm, lq[1:]).tolist()
+        raw = goal_eval._pooled_raw([[j, a, b, w] for j, (a, b, w) in enumerate(zip(kc, bk.KV, bk.W))])
+        out.append({"s_nodes": f["s_search"], "s_nodes_raw": raw, "overstate_nodes": f["overstate"]})
+        del bk, lq
+        native.free(ge.nat.dev)
+    return out
 
 
 def expand_circuit(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, max_steps: int = MAX_STEPS,

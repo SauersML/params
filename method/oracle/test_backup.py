@@ -159,3 +159,19 @@ def test_expand_records_its_path(tiny):
         for row in rows:
             assert row["read_cos_comp"] is None or 0 <= row["read_cos_comp"] <= 1 + 1e-6
             assert ("heads_comp" in row) == (row["block"][0].split(".")[-1] in ("o_proj", "v_proj", "q_proj", "k_proj"))
+
+
+def test_block_units_and_nodes_search(tiny):
+    """A block of the circuit is one removal unit (block_units): a draw that removes it switches its site off at its
+    position, every subcomponent; nodes_search scores a graph as Backup's own score of it on the nodes_search draws."""
+    nat, ge, tx, circuit = tiny
+    n, t = nat.names[4], 9
+    g = native.Graph(sorted(circuit.node_set()) + [(n, t, goal_eval.BLOCK)], complete=True)
+    bk = backup.Backup(ge, tx, g, draws=8, family="nodes_search")
+    assert all(nd[2] != goal_eval.BLOCK or nd[:2] == (n, t) for d in bk.drops for nd in d)
+    hit = [j for j, d in enumerate(bk.drops) if (n, t, goal_eval.BLOCK) in d]
+    assert hit, "some draw removes the block (8 draws, probability up to 15/16)"
+    row = bk._row(bk.masks(), hit[0])
+    assert float(row[n][t].abs().sum()) == 0.0
+    got = backup.nodes_search(ge, tx, [g], draws=8)[0]
+    assert abs(got["s_nodes"] - bk.score([(frozenset(), frozenset())])[0]["s_search"]) < 1e-9

@@ -74,6 +74,18 @@
 %% Artifact: components/sft_codex-qa97-q8-1012 (state, contract, analysis, tokenIDs, finish, spend, content diagnostic).
 %% This is narrow outcome learning on8 development texts, not circuit faithfulness, English meaning or robust generalization.
 %% Next decision: independent outcome/weight-input evidence before scaling; do not repeat blind SFT on this tiny gain.
+%% Follow-up: trained policy sampled full vs observation-removed inputs on all22 texts9028–9049 (179 questions).
+%% Shared-library DEVELOPMENT overlap disclosed; new to this policy evaluation, never training or untouched final holdout.
+%% Both arms frozen before scoring,44 first samples, actual $.064117053; model-free analysis pending memory admission.
+%% QA inputs contain causal summaries/CI/activation/wiring cosines, NOT raw U/V vectors; ablation cannot establish weight use.
+%% Relation6011: actual VPD groups T77/O73/A140 from8 construction donors, independent relation donors, fixed sites.
+%% Eval carrier scores T.761/O.979/A.591 vs native .681/.995/.997; matching-restoration fails. No mechanism verified.
+%% This distinguishes T localization failure from A union-coverage/remainder failure; does not prove VPD cannot carry the role.
+%% Next A control: full3072 rank-one units vs sparse union vs block; no more free-prose sampling before adequate evidence.
+%% Toy-loop reward executes selected UNITS only; Mermaid edges previously affected structural F1, not executable reward.
+%% 9789f31 adds opt-in --wiring: architecture-constrained edges compile to native pieces, with all selected pieces retained.
+%% Token-role arrows remain annotations and English unverified; diagnostic is point sufficiency, not intervention certification.
+%% Four regression tests queued locally; a099e3e adds dedicated CI step. Preserve existing training reward while checking wiring.
 %% Literature consequence: measure outcome prediction before free prose; native carriers alone cannot certify meaning.
 %% Offline falsification: real node-response errors coexist with large uncertainty penalties; do not tune them away.
 %% Next reward evidence, if needed: saved candidates on9020/9026/9027 with retained draws, after scorer owner freezes it.
@@ -141,7 +153,7 @@ flowchart BT
     I2["<b>Context fit and explicit limits</b><br/>opt-in node cap before token fitting;<br/>log and skip only oversized rows;<br/>later rows continue<br/>DONE · codex/eval_recovery · 33419cd"]
     I3["<b>Coverage audit</b><br/>179/207-row snapshots: 81–84%<br/>of teacher nodes visible; edits join;<br/>retain pool inputs, check token fit<br/>HANDOFF · codex to primerl/rustmove"]
     I4["<b>Learnability and input controls</b><br/>cheap features beat full-circuit QA;<br/>test weights beyond visible facts;<br/>vectors real/random/id/permuted<br/>ACTIVE · rustmove, codex"]
-    QAONLY["<b>Outcome-only learning trial</b><br/>QA 73.53% vs cheap control 71.32%;<br/>three-field gain on8 development texts;<br/>needs independent outcome evidence<br/>CHECK · codex · $1.83 spent"]
+    QAONLY["<b>Outcome-only learning trial</b><br/>QA 73.53% vs cheap control 71.32%;<br/>22 more dev texts: full vs summaries off;<br/>sampling done; paired analysis pending<br/>ACTIVE · codex · $1.89 spent"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
     I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
   end
@@ -163,7 +175,8 @@ flowchart BT
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
   VAR["<b>Variables and invariants</b><br/>carriers, value maps, E4 v2 checker;<br/>nulls and triviality check running;<br/>influential_v2 variables next<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
-  ENGP["<b>VPD-bound English claims</b><br/>258 units; two predictions trivial;<br/>writer missed an 11.3% probability rise;<br/>typed binding ready; needs new evidence<br/>CHECK · codex/variable_reward"]
+  ENGP["<b>VPD relational mechanisms</b><br/>6011: only 1 of 3 carriers passes;<br/>joint matching restoration fails;<br/>separate coverage from remainder loss<br/>CHECK · codex/variable_reward"]
+  WIRING["<b>Execute the stated wiring</b><br/>toy reward checked units, not edges;<br/>new compiler respects architecture;<br/>opt-in diagnostic; validation pending<br/>ACTIVE · codex · 9789f31"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -269,6 +282,9 @@ flowchart BT
   TOYB -. "cap eps ≤0.05,<br/>clip family scores to 0–1" .-> W4
   TOYLOOP -. influential start misses<br/>content-addressed keys .-> T4
   TOYLOOP -. early answer .-> GATEC
+  ENG --> WIRING
+  WIRING -. tests executable relations .-> TOYLOOP
+  WIRING -. wiring evidence .-> C1
   REM -. tests .-> PHI
   VPD --> ENG
   TXT --> ENG
@@ -313,7 +329,7 @@ flowchart BT
   class T4 blocked
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
-  class QAONLY check
+  class QAONLY,WIRING active
   class ENGP check
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting

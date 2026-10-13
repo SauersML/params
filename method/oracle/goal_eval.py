@@ -1305,6 +1305,7 @@ class GoalEval:
         causal = torch.ones(T, T, dtype=torch.bool, device=self.nat.dev).tril()
         e0, v0 = self._bounds(tx, "live")
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
+        kept = tx.__dict__.setdefault("_pattern_vpd", {})  # (VPD's answer, reads given) -> its KL
         out = []
         for g in graphs:
             reads = sorted({(native._name_layer_kind(n)[0], t) for n, t, _ in g.node_set() if native._name_layer_kind(n)[1] == "o_proj"})
@@ -1314,7 +1315,12 @@ class GoalEval:
             real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
             draws = [real] + ([{r: real[r]} for r in reads] if len(reads) > 1 else [])
             kc = [float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, g, rows=d))[0]) for d in draws]
-            kv = [float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, vpd, rows=d))[0]) for d in draws]
+            kv = []
+            for d in draws:  # VPD's run with those reads given: the same for every circuit using them (kept on tx)
+                key = (id(tx.vpd), tuple(sorted(d)))
+                if key not in kept:
+                    kept[key] = float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, vpd, rows=d))[0])
+                kv.append(kept[key])
             native.free(self.nat.dev)
             c_, v_ = float(np.mean(kc)), float(np.mean(kv))
             out.append({"s_pattern": _fid(e0, c_, v_), "s_pattern_raw": _fid_raw(e0, c_, v_), "kl_pattern_c": c_,

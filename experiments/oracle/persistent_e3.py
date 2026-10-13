@@ -74,9 +74,9 @@ def _top_tokens(ee, rows: range, tokens) -> dict:
     return out
 
 
-def preferences(ee, src, k: int, decode, log=print) -> list[dict]:
+def preferences(ee, src, k: int, decode, log=print, min_pairs: int = MIN_PAIRS) -> list[dict]:
     """The k most frequent (a, b), both words (a space and three or more letters: a content preference such as " United"
-    -> " States", not punctuation or layout), with b the most likely token after a at least MIN_PAIRS times in the fit
+    -> " States", not punctuation or layout), with b the most likely token after a at least min_pairs times in the fit
     third and predicted after other tokens at least as often (controls exist), at most B_REPEAT sharing one b; each a
     behaviour (behaviours.py's dict: parts with instances, controls, rate)."""
     tops = _top_tokens(ee, range(*ROWS), src.tokens)
@@ -91,7 +91,7 @@ def preferences(ee, src, k: int, decode, log=print) -> list[dict]:
         return x.startswith(" ") and x[1:].isalpha() and len(x) >= 4
 
     ranked = sorted((n, a, b) for (a, b), n in pairs.items()
-                    if n >= MIN_PAIRS and a != b and b_count[b] - n >= MIN_PAIRS and word(a) and word(b))
+                    if n >= min_pairs and a != b and b_count[b] - n >= min_pairs and word(a) and word(b))
     out, used = [], {}
     for n, a, b in reversed(ranked):
         if used.get(b, 0) >= B_REPEAT or len(out) >= k:
@@ -788,6 +788,7 @@ def main():
     p.add_argument("--device", default="cpu")
     p.add_argument("--offset", type=int, default=0, help="the circuits of preferences offset, offset + stride, ... alone")
     p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--min-pairs", type=int, default=MIN_PAIRS, help="a preference's fit-third instances, at least")
     f = sub.add_parser("fit")
     f.add_argument("prefs")
     f.add_argument("out")
@@ -831,7 +832,7 @@ def main():
         ee = edit_eval.EditEval(nat)
         src = behaviours.Source()
         with open(args.out, "w") as fh:
-            for i, beh in enumerate(preferences(ee, src, args.k, decode, log=lambda s: print(s, flush=True))):
+            for i, beh in enumerate(preferences(ee, src, args.k, decode, log=lambda s: print(s, flush=True), min_pairs=args.min_pairs)):
                 if i % args.stride != args.offset:
                     continue
                 beh.update(circuit_sets(ee, src, beh, log=lambda s: print(s, flush=True)), order=i)

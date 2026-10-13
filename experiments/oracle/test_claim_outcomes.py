@@ -145,3 +145,143 @@ def test_original_display_text_is_audit_only_authoritative_decode_given(monkeypa
         assert 'OMITTED_SPECIAL_DISPLAY_TEXT' not in view['prompt'][0]['content']
         assert 'authoritative whole text<|endoftext|>' in view['prompt'][0]['content']
     assert row['original_task_text'] == 'OMITTED_SPECIAL_DISPLAY_TEXT'
+
+
+def observation_fixture(tmp_path, monkeypatch, record):
+    import struct
+    from types import SimpleNamespace
+    tokenizer = tmp_path/'tokenizer.json';tokenizer.write_text('tokenizer fixture')
+    monkeypatch.setitem(sys.modules, 'mech', SimpleNamespace(VPD4L_TOKENIZER=tokenizer, tokenizer=lambda model: SimpleNamespace(encode=lambda text, add_special_tokens=False: SimpleNamespace(ids=[1,2] if text==' token1 token2' else []), get_vocab=lambda: {'a':1,'b':2}, decode=lambda ids,skip_special_tokens=False: ' token'+str(ids[0]))))
+    registry = tmp_path/'registry.safetensors'
+    header = json.dumps({'h.0.mlp.c_fc.U': {'shape': [12, 2], 'dtype': 'F32', 'data_offsets': [0, 96]}}).encode()
+    registry.write_bytes(struct.pack('<Q', len(header)) + header)
+    archive = tmp_path/'rows.jsonl'
+    row = {'task': 'text6003', 'question': "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): [0]' token1 token2'\ntarget: position 1; baseline omitted", 'components': {'1': [
+        [['h.0.mlp.c_fc', 1, 3], .7, "routed lens at this position raises ' x'; active on ' the'"],
+        [['h.0.mlp.c_fc', 1, 7], .4, 'INSTANCE_ONLY_NOT_A_CARRIER'],
+        [['h.0.mlp.c_fc', 0, 3], .2, 'WRONG_POSITION'],
+        [['h.0.mlp.c_fc', 1, 9], .1, 'UNSELECTED_PIECE']]},
+        'wiring': {'1': [[['h.0.mlp.c_fc', 1, 3], ['h.0.mlp.c_fc', 1, 9], .3]]},
+        'events': ['PRIVATE_MEASURED_OUTCOME'], 'switch_on': ['PRIVATE_EVENT'],
+        'qa': ['PRIVATE_ANSWER'], 'values': ['PRIVATE_DONOR_OUTCOME']}
+    archive.write_text(json.dumps(row)+'\n')
+    manifest = {'schema': 1, 'model': 'vpd4l', 'selection_role': 'baseline_input_observations',
+                'checkpoint_tensor_content_verified': False, 'archive_sha256': c.file_sha(archive),
+                'tokenizer_sha256': c.file_sha(tokenizer), 'registry_path': str(registry),
+                'registry_header_sha256': hashlib.sha256(header).hexdigest(),
+                'producer_lineage': {'historical_producer_bytehash_retained': False, 'recipe': 'baseline recipient CI/lens'},
+                'tasks': {record['task']: {'task_sha256': record['task_sha256'], 'circuit_sha256': record['circuit_sha256'],
+                                          'variable_group_sha256': {v['name']: c.digest(v['group']) for v in record['variables']}}}}
+    manifest_path = tmp_path/'manifest.json';manifest_path.write_text(json.dumps(manifest))
+    return archive, manifest_path, manifest
+
+
+def test_observations_whitelist_tuple_order_and_partial_rank_coverage(tmp_path, monkeypatch):
+    record, task, claim = fixture(monkeypatch)
+    archive, manifest_path, _ = observation_fixture(tmp_path, monkeypatch, record)
+    catalog = c.ObservationArchive(archive, manifest_path, [record], task_inputs={record['task']: task})
+    base = c.render_row(record, task, claim, reserved=set())
+    row = c.render_row(record, task, claim, reserved=set(), observations=catalog)
+    given = json.loads(row['views']['actual_top']['prompt'][0]['content'].split('\n', 1)[1])
+    facts = given['baseline_component_observations']
+    assert len(facts['components']) == 1
+    assert facts['components'][0]['node_native'] == ['h.0.mlp.c_fc', 1, 3]
+    assert facts['components'][0]['baseline_ci'] == .7
+    assert facts['coverage']['requested_rank_one_members'] == 2
+    assert facts['coverage']['observed_requested_rank_one_members'] == 1
+    assert facts['coverage']['unobserved_rank_one_members'] == 1
+    assert facts['coverage']['partial'] is True
+    assert 'static_cosine' in facts['static_couplings'][0]
+    assert 'NOT activation' in facts['semantics'] and 'NOT causal effects' in facts['semantics']
+    for forbidden in ['PRIVATE_', 'INSTANCE_ONLY', 'WRONG_POSITION', 'UNSELECTED_PIECE']:
+        assert forbidden not in str(facts)
+    assert given['bindings'] == json.loads(base['views']['actual_top']['prompt'][0]['content'].split('\n', 1)[1])['bindings']
+    assert row['views']['actual_top']['completion'] == base['views']['actual_top']['completion']
+    assert row['views']['proposal_verdict']['completion'] == base['views']['proposal_verdict']['completion']
+    assert row['observation_provenance']['checkpoint_tensor_content_verified'] is False
+
+
+def test_block_observation_counts_are_not_full_block_coverage(tmp_path, monkeypatch):
+    record, task, claim = fixture(monkeypatch)
+    record['variables'][0]['group'] = [['block', 'h.0.mlp.c_fc', 1]]
+    claim['variable_group_sha256']['V3'] = c.digest(record['variables'][0]['group'])
+    archive, manifest_path, _ = observation_fixture(tmp_path, monkeypatch, record)
+    catalog = c.ObservationArchive(archive, manifest_path, [record], task_inputs={record['task']: task})
+    facts = catalog.select(record, ['V3'], input_length=2)
+    assert len(facts['components']) == 3  # Native block includes all three listed scalars at pos1, NOT pos0.
+    assert facts['coverage']['requested_rank_one_members'] == 0
+    assert facts['coverage']['requested_block_site_positions'] == 1
+    assert facts['coverage']['blocks_with_any_piece_observation'] == 1
+    assert facts['coverage']['block_remainder_observed'] is False
+    assert 'complete block-output coverage' in facts['semantics']
+
+
+@pytest.mark.parametrize('damage', ['archive', 'task', 'group', 'tokenizer', 'registry', 'tensor_claim'])
+def test_observation_source_and_task_binding_fail_closed(tmp_path, monkeypatch, damage):
+    record, task, claim = fixture(monkeypatch)
+    archive, manifest_path, manifest = observation_fixture(tmp_path, monkeypatch, record)
+    if damage == 'archive':archive.write_text(archive.read_text()+' ')
+    elif damage == 'task':manifest['tasks']['text6003']['task_sha256'] = '0'*64
+    elif damage == 'group':manifest['tasks']['text6003']['variable_group_sha256']['V3'] = '0'*64
+    elif damage == 'tokenizer':manifest['tokenizer_sha256'] = '0'*64
+    elif damage == 'registry':manifest['registry_header_sha256'] = '0'*64
+    else:manifest['checkpoint_tensor_content_verified'] = True
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):c.ObservationArchive(archive, manifest_path, [record], task_inputs={record['task']: task})
+
+
+@pytest.mark.parametrize('damage', ['empty_source', 'empty_targets'])
+def test_public_renderer_rejects_missing_provenance_or_prediction_target(monkeypatch, damage):
+    record, task, claim = fixture(monkeypatch)
+    if damage == 'empty_source':record['source_sha256'] = {}
+    else:task['prompts'][0]['target_positions'] = []
+    with pytest.raises(ValueError):c.render_row(record, task, claim, reserved=set())
+
+
+def test_unselected_static_endpoint_outside_input_rejected(tmp_path, monkeypatch):
+    record, task, claim = fixture(monkeypatch)
+    archive, manifest_path, manifest = observation_fixture(tmp_path, monkeypatch, record)
+    row = json.loads(archive.read_text())
+    row['wiring']['1'][0][1][1] = 2  # Adjacent, but outside the two-token executed input.
+    archive.write_text(json.dumps(row)+'\n')
+    manifest['archive_sha256'] = c.file_sha(archive);manifest_path.write_text(json.dumps(manifest))
+    catalog = c.ObservationArchive(archive, manifest_path, [record], task_inputs={record['task']: task})
+    with pytest.raises(ValueError, match='coordinate'):
+        c.render_row(record, task, claim, reserved=set(), observations=catalog)
+
+
+def test_archived_context_changed_token_same_taskname_rejected(tmp_path, monkeypatch):
+    record, task, claim = fixture(monkeypatch)
+    archive, manifest_path, manifest = observation_fixture(tmp_path, monkeypatch, record)
+    row = json.loads(archive.read_text());row['question'] = row['question'].replace('token2', 'WRONG_TOKEN')
+    archive.write_text(json.dumps(row)+'\n');manifest['archive_sha256'] = c.file_sha(archive)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='token content'):
+        c.ObservationArchive(archive, manifest_path, [record], task_inputs={record['task']: task})
+
+
+@pytest.mark.parametrize('taskname', ['text6008', 'text6012'])
+def test_context_retains_internal_eot_and_strict_target(monkeypatch, taskname):
+    from types import SimpleNamespace
+    task = {'model':'vpd4l','prompts':[{'token_ids':[1,2,3], 'target_positions':[2]}]}
+    strings = [' a', '<|endoftext|>', ' b']
+    monkeypatch.setattr(c.components, 'token_strings', lambda *args: strings)
+    monkeypatch.setitem(sys.modules, 'mech', SimpleNamespace(tokenizer=lambda model: SimpleNamespace(encode=lambda text, add_special_tokens=False: SimpleNamespace(ids=[1,2,3] if text==' a<|endoftext|> b' else []), get_vocab=lambda: {'a':1,'eot':2,'b':3}, decode=lambda ids,skip_special_tokens=False: strings[ids[0]-1])))
+    listing = c.components.escape('[0]'+repr(''.join(strings)))
+    row = {'task':taskname,'question':'tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): '+listing+'\ntarget: position 2; ignored'}
+    assert c.archive_context_matches(row,task)
+    row['question'] = row['question'].replace('target: position 2','target: position 1')
+    with pytest.raises(ValueError):c.archive_context_matches(row,task)
+
+
+def test_noncanonical_reencoding_is_reported_not_wrong_context(monkeypatch):
+    from types import SimpleNamespace
+    task = {'model':'fixture_noncanonical','prompts':[{'token_ids':[1,2], 'target_positions':[1]}]}
+    monkeypatch.setattr(c.components, 'token_strings', lambda *args: [' a',' b'])
+    tk = SimpleNamespace(encode=lambda *args,**kwargs: SimpleNamespace(ids=[3]), get_vocab=lambda: {'a':1,'b':2,'ab':3}, decode=lambda ids,**kwargs: {1:' a',2:' b',3:' a b'}[ids[0]])
+    monkeypatch.setitem(sys.modules, 'mech', SimpleNamespace(tokenizer=lambda model: tk))
+    row = {'question':"tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): [0]' a b'\ntarget: position 1; ignored"}
+    binding = c.archive_context_matches(row,task)
+    assert not binding['canonical_full_reencoding_matches_frozen_ids']
+    assert binding['level'] == 'exact_numbered_listing_match_noncanonical_ids_unverified'
+    assert not binding['native_id_certificate']

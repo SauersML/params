@@ -9,9 +9,11 @@ before reading task content. An explicit reserved-task file is mandatory.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import math
+import struct
 import re
 import sys
 from pathlib import Path
@@ -164,12 +166,161 @@ def execution_text(model, ids):
     return mech.tokenizer(model).decode(ids, skip_special_tokens=False)
 
 
-def render_row(record, task, claim, *, reserved):
+
+
+_DECODE_CANDIDATES = {}
+
+def archive_context_matches(row, task):
+    """Strict visible token projection and target binding; report ID ambiguity."""
+    import mech
+    prefix = 'tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): '
+    lines = row['question'].splitlines()
+    token_lines = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    targets = [re.fullmatch(r'target: position (\d+);.*', line) for line in lines if line.startswith('target: position ')]
+    p = task['prompts'][0]
+    if len(token_lines) != 1 or len(targets) != 1 or targets[0] is None or p['target_positions'] != [int(targets[0][1])]:
+        raise ValueError('archived execution target mismatch')
+    pattern = re.compile(r"(?:(\d+):|\[(\d+)\])('(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")")
+    text = token_lines[0]; matches = list(pattern.finditer(text))
+    if not matches:
+        raise ValueError('missing archived token listing')
+    strings = components.token_strings(task['model'], p['token_ids'])
+    tail, covered, decoded = 0, 0, []
+    for i, match in enumerate(matches):
+        if text[tail:match.start()].strip():
+            raise ValueError('unparsed archived token listing')
+        start = int(match[1] or match[2]); end = (int(matches[i+1][1] or matches[i+1][2]) if i+1 < len(matches) else len(strings))
+        if start != covered or not start < end <= len(strings) or (match[1] is not None and end != start + 1):
+            raise ValueError('archived token coverage/positions mismatch')
+        expected = ''.join(strings[start:end])
+        # escape() breaks oracle-added tokens AFTER repr serialization. Compare
+        # exact bytes to that known spelling; never fuzzy-strip backslashes.
+        if match[3] != components.escape(repr(expected)):
+            raise ValueError('archived token content mismatch')
+        decoded.append(ast.literal_eval(repr(expected)))
+        covered, tail = end, match.end()
+    if text[tail:].strip() or covered != len(strings):
+        raise ValueError('archived token listing incomplete')
+    canonical = mech.tokenizer(task['model']).encode(''.join(decoded), add_special_tokens=False).ids
+    model = task['model']
+    if model not in _DECODE_CANDIDATES:
+        candidates = {}
+        tk = mech.tokenizer(model)
+        for z in set(tk.get_vocab().values()):
+            candidates.setdefault(tk.decode([z], skip_special_tokens=False), set()).add(z)
+        _DECODE_CANDIDATES[model] = candidates
+    candidates = _DECODE_CANDIDATES[model]
+    singletons = [int(m[1]) for m in matches if m[1] is not None]
+    ambiguous = [i for i in singletons if candidates.get(strings[i]) != {p['token_ids'][i]}]
+    exact_ids = len(singletons) == len(strings) and not ambiguous
+    return {'level': 'exact_singleton_native_ID_reconstruction' if exact_ids else ('exact_numbered_listing_match_canonical_reencoding' if canonical == p['token_ids'] else 'exact_numbered_listing_match_noncanonical_ids_unverified'),
+            'complete_positions': len(strings), 'numbered_singleton_positions': len(singletons),
+            'numbered_singletons_with_nonunique_decode': ambiguous, 'range_chunks': len(matches)-len(singletons),
+            'canonical_full_reencoding_matches_frozen_ids': canonical == p['token_ids'],
+            'native_id_certificate': exact_ids,
+            'limitation': 'Ranges disclose concatenated piece strings and position boundaries, not each historical native ID. Canonical BPE may change at cuts/specials; noncanonical reencoding is not evidence of wrong visible context.'}
+
+
+class ObservationArchive:
+    """Checksummed historical recipient facts; header identity is NOT tensor identity."""
+    def __init__(self, path, manifest_path, records, *, task_inputs):
+        import mech
+        self.manifest = json.loads(Path(manifest_path).read_text())
+        m = self.manifest
+        if (m.get('schema') != 1 or m.get('model') != 'vpd4l'
+                or m.get('selection_role') != 'baseline_input_observations'
+                or m.get('checkpoint_tensor_content_verified') is not False):
+            raise ValueError('observations require explicit historical archive/header-only scope')
+        if file_sha(path) != m['archive_sha256']:
+            raise ValueError('observation archive checksum mismatch')
+        if file_sha(mech.VPD4L_TOKENIZER) != m['tokenizer_sha256']:
+            raise ValueError('observation tokenizer identity mismatch')
+        with Path(m['registry_path']).open('rb') as f:
+            size = struct.unpack('<Q', f.read(8))[0]
+            if size > 1 << 24:
+                raise ValueError('unreasonable component registry header')
+            header_bytes = f.read(size)
+        if hashlib.sha256(header_bytes).hexdigest() != m['registry_header_sha256']:
+            raise ValueError('observation registry header mismatch')
+        header = json.loads(header_bytes)
+        self.ranks = {k[:-2]: v['shape'][0] for k, v in header.items() if k.endswith('.U')}
+        if not m.get('producer_lineage'):
+            raise ValueError('observation producer/code lineage missing')
+        for record in records:
+            tid = task_id(record['task']); binding = m['tasks'].get(tid)
+            expected = {'task_sha256': record['task_sha256'], 'circuit_sha256': record['circuit_sha256'],
+                        'variable_group_sha256': {v['name']: digest(v['group']) for v in record['variables']}}
+            if binding != expected:
+                raise ValueError('observation task/carrier provenance mismatch')
+        selected = {record['task'] for record in records}
+        self.rows = {}
+        self.context_bindings = {}
+        with Path(path).open() as f:
+            for line in f:
+                row = json.loads(line); tid = task_id(row.get('task'))
+                if tid in selected:
+                    if tid in self.rows:
+                        raise ValueError('duplicate observation task')
+                    self.context_bindings[tid] = archive_context_matches(row, task_inputs[tid])
+                    self.rows[tid] = {'components': row['components'], 'wiring': row['wiring']}
+        if set(self.rows) != selected:
+            raise ValueError('missing observation task')
+        self.provenance = {'archive_sha256': m['archive_sha256'], 'manifest_sha256': file_sha(manifest_path),
+                           'tokenizer_sha256': m['tokenizer_sha256'], 'registry_header_sha256': m['registry_header_sha256'],
+                           'checkpoint_tensor_content_verified': False, 'producer_lineage': m['producer_lineage'],
+                           'archived_context_bindings': self.context_bindings}
+
+    def select(self, record, refs, *, input_length):
+        variables = {v['name']: v for v in record['variables']}
+        members = {tuple(g) for n in refs for g in variables[n]['group']}
+        scalar = {(s, t, c) for s, c, t in members if s != 'block'}
+        blocks = {(s, t) for kind, s, t in members if kind == 'block'}
+        def node(value):
+            if (not isinstance(value, (list, tuple)) or len(value) != 3
+                    or value[0] not in self.ranks or type(value[1]) is not int or not 0 <= value[1] < input_length
+                    or type(value[2]) is not int or not 0 <= value[2] < self.ranks[value[0]]):
+                raise ValueError('invalid archived component coordinate')
+            return tuple(value)
+        def matches(nd):
+            return nd in scalar or nd[:2] in blocks
+        facts, seen = [], set()
+        row = self.rows[record['task']]
+        for group in row['components'].values():
+            for fact in group:
+                if len(fact) != 3:
+                    raise ValueError('unexpected archived component fields')
+                nd = node(fact[0])
+                if not matches(nd):
+                    continue
+                if nd in seen or not isinstance(fact[2], str):
+                    raise ValueError('duplicate/invalid archived component fact')
+                seen.add(nd)
+                facts.append({'node_native': list(nd), 'baseline_ci': number(fact[1], 'baseline CI'),
+                              'recipient_routed_lens_and_pile_context_description': fact[2]})
+        wires = []
+        for group in row['wiring'].values():
+            for wire in group:
+                if len(wire) != 3:
+                    raise ValueError('unexpected archived static coupling fields')
+                w, r = node(wire[0]), node(wire[1])
+                if matches(w) or matches(r):
+                    wires.append({'writer_native': list(w), 'reader_native': list(r),
+                                  'static_cosine': number(wire[2], 'static cosine', -1.000001, 1.000001)})
+        return {'components': facts, 'static_couplings': wires,
+                'coverage': {'requested_rank_one_members': len(scalar), 'observed_requested_rank_one_members': len(scalar & seen),
+                             'unobserved_rank_one_members': len(scalar - seen), 'requested_block_site_positions': len(blocks),
+                             'blocks_with_any_piece_observation': sum(any(nd[:2] == b for nd in seen) for b in blocks),
+                             'partial': True, 'block_remainder_observed': False},
+                'semantics': 'Coordinates node_native/writer_native/reader_native are [site, token_position, decomposition_component_index]; the component index is neither a token position nor a vector coordinate. For example [h.0.mlp.c_fc,7,3] is L0.fc#3@7. Original-recipient baseline CI is NOT activation. Descriptions are recipient routed-lens linear readouts and Pile activation-context hints, NOT donor outcomes or mechanism labels. Couplings are static cosines, NOT causal effects. Missing observations do NOT mean zero; no block remainder or complete block-output coverage is claimed. Historical archive/registry coordinates are bound; checkpoint tensor-content identity was not retained.'}
+
+
+def render_row(record, task, claim, *, reserved, observations=None):
     """Return both tasks, preserving the original proposition only in verdict input."""
     task_id(record['task'])
     if task['id'] != record['task'] or task['model'] != record['model'] or task['split'] != 'train':
         raise ValueError('task identity mismatch')
-    if (not re.fullmatch(r'[0-9a-f]{40}', record.get('source_commit', ''))
+    if (not record.get('source_sha256')
+            or not re.fullmatch(r'[0-9a-f]{40}', record.get('source_commit', ''))
             or any(not isinstance(h, str) or not re.fullmatch(r'[0-9a-f]{64}', h) for h in record.get('source_sha256', {}).values())):
         raise ValueError('invalid pinned proof source provenance')
     variables = {v['name']: v for v in record['variables']}
@@ -179,7 +330,7 @@ def render_row(record, task, claim, *, reserved):
     normalized(claim['executed'])  # Reject nonfinite values anywhere in execution evidence.
     prompt = task['prompts'][0]
     ids, targets = prompt['token_ids'], prompt['target_positions']
-    if not ids or any(type(z) is not int or z < 0 for z in ids) or any(type(p) is not int or not 0 <= p < len(ids) for p in targets):
+    if not ids or not targets or any(type(z) is not int or z < 0 for z in ids) or any(type(p) is not int or not 0 <= p < len(ids) for p in targets):
         raise ValueError('invalid original token/target IDs')
     for name in refs:
         v = variables[name]
@@ -206,6 +357,9 @@ def render_row(record, task, claim, *, reserved):
     given = {'model': record['model'], 'source_text': execution_text(record['model'], ids),
              'tokens': [[p, z, tokens[p]] for p, z in enumerate(ids)], 'target_positions': targets,
              'bindings': bindings_for(variables, refs), 'intervention': iv, 'donor_tokens': donor_tokens}
+    selected_observations = observations.select(record, refs, input_length=len(ids)) if observations is not None else None
+    if selected_observations is not None:
+        given['baseline_component_observations'] = selected_observations
     base = (intervention_legend() + 'Predict the actual top next token of this fixed known model under the given exact carrier transplant. '
             'Tokens are [position, model token ID, decoded string]. Carried-by uses the existing oracle grammar; '
             'instances are informational. These IDs do not supply weights or activation observations. '
@@ -232,7 +386,7 @@ def render_row(record, task, claim, *, reserved):
         reasons.append('opaque_mean_removal_bank_not_retained_NOT_zero')
     if not iv['transplants']:
         reasons.append('not_explicit_transplant')
-    return {'numeric_top_truth_recomputed': claim['executed']['outcome'][0] == 'top',
+    row = {'numeric_top_truth_recomputed': claim['executed']['outcome'][0] == 'top',
             'drop_truth_recompute': 'not possible from retained exact base distribution; no inference from rounded task probability' if claim['executed']['outcome'][0] == 'drop' else None,
             'schema': 1, 'task': record['task'], 'split': 'train', 'training_allowed': not reasons,
             'overlapping_bindings': overlaps, 'excluded_reasons': reasons, 'refs': refs, 'views': views,
@@ -241,9 +395,12 @@ def render_row(record, task, claim, *, reserved):
             'circuit_sha256': record['circuit_sha256'], 'source_sha256': record['source_sha256'],
             'source_commit': record['source_commit'], 'original_task_text': prompt['text'], 'scope': 'Original full-model outcomes only, never circuit proofs.',
             'remove_operator': {'kind': 'alternative_activation_mean', 'bank_token_ids_retained': False} if iv['remove'] else None}
+    if observations is not None:
+        row['observation_provenance'] = observations.provenance
+    return row
 
 
-def export(proofs, inputs, out, reserved):
+def export(proofs, inputs, out, reserved, *, observations_path=None, observations_manifest=None):
     # Read proof metadata first; reject the complete task list BEFORE task content.
     records = [json.loads(Path(p).read_text()) for p in proofs]
     names = [task_id(r.get('task')) for r in records]
@@ -251,6 +408,9 @@ def export(proofs, inputs, out, reserved):
         raise ValueError('duplicate proof task')
     if out.exists():
         raise ValueError('output directory exists; preserve previous evidence')
+    if (observations_path is None) != (observations_manifest is None):
+        raise ValueError('observations and observations-manifest must be provided together')
+    catalog = ObservationArchive(observations_path, observations_manifest, records, task_inputs={r['task']: json.loads((inputs/r['task']/'task.json').read_text()) for r in records}) if observations_path is not None else None
     all_rows, rejected, source_files = [], [], []
     for record in records:
         tid = record['task']; d = inputs / tid
@@ -263,7 +423,7 @@ def export(proofs, inputs, out, reserved):
         seen = set()
         for i, claim in enumerate(record['claims']):
             try:
-                row = render_row(record, task, claim, reserved=reserved)
+                row = render_row(record, task, claim, reserved=reserved, observations=catalog)
                 key = normalized([row['bindings_sha256'], claim['executed']['intervention'], claim['executed']['outcome']])
                 if key in seen:
                     raise ValueError('duplicate original executable evidence')
@@ -288,6 +448,9 @@ def export(proofs, inputs, out, reserved):
                 'renderer_sha256': file_sha(__file__), 'components_sha256': file_sha(components.__file__),
                 'semantic_sha256': file_sha(semantic.__file__),
                 'files': {p.name: {'sha256': file_sha(p), 'bytes': p.stat().st_size} for p in out.glob('*.jsonl')}}
+    if catalog is not None:
+        manifest['observation_provenance'] = catalog.provenance
+        manifest['input_limit'] = 'Partial historical recipient CI/readout/static coupling hints; no complete weights or donor activations.'
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     return manifest
 
@@ -297,9 +460,11 @@ if __name__ == '__main__':
     parser.add_argument('--proof', type=Path, action='append', required=True)
     parser.add_argument('--inputs', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--observations', type=Path, help='Opt-in checksummed historical baseline rows; default remains ID/context-only')
+    parser.add_argument('--observations-manifest', type=Path)
     parser.add_argument('--reserved-tasks', type=Path, required=True, help='JSON list of reserved task IDs (mandatory)')
     args = parser.parse_args()
     reserved = json.loads(args.reserved_tasks.read_text())
     if not isinstance(reserved, list) or any(not isinstance(t, str) for t in reserved):
         raise ValueError('reserved tasks must be an explicit JSON list')
-    print(json.dumps(export(args.proof, args.inputs, args.out, set(reserved)), indent=2))
+    print(json.dumps(export(args.proof, args.inputs, args.out, set(reserved), observations_path=args.observations, observations_manifest=args.observations_manifest), indent=2))

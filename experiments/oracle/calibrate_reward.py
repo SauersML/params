@@ -173,7 +173,6 @@ def panel_worker(a):
     import goal_eval
     import native
     import intervention_panel
-    import reward_gate
 
     assert torch.cuda.is_available(), 'GPU panel worker requires CUDA'
     torch.cuda.set_per_process_memory_fraction(0.46)
@@ -189,7 +188,7 @@ def panel_worker(a):
         prior[t] = completed[0]
     names = ('sft', 'rl25', 'teacher')
     source_files = ('components.py', 'goal_eval.py', 'native.py', 'engine.py', 'carry.py',
-                    'intervention_panel.py', 'reward_gate.py')
+                    'intervention_panel.py')
     save(a.out / 'manifest.json', {
         'tasks': tasks, 'source_rev': a.rev, 'split': 'eval', 'draws': 32,
         'source_sha256': {f: hashlib.sha256((a.source/'method/oracle'/f).read_bytes()).hexdigest()
@@ -223,16 +222,17 @@ def panel_worker(a):
             modified['rl_terms'] = {**modified.get('rl_terms', {}), 's_nodes': panel['raw_score']}
             modified['eps_nodes'] = panel['eps']
             ph = goal_eval.phi(modified)[0]
-            qualification = reward_gate.qualify(goal_eval.family_score(modified, 'point'), ph,
-                                                old['phi_tau'], dominance=old.get('D') or 0.0)
+            # the production circuit term (reward_gate.qualify's prototype is gone: one definition), at the old bar and
+            # compactness (bits_start 2^compact against 1 bit), no floors
+            ct = goal_eval.circuit_term(modified, {'families': None, 'phi_tau': old['phi_tau'], 'floors': {},
+                                                   'bits_start': 2.0 ** (old.get('compact') or 0.0)}, 1.0)
             # Undefined common calibration is a shared evidence gap, never successful omission.
             comparable = panel['resolved'] and ph is not None
-            proposed = (ph + qualification['g'] * 0.5 * (old.get('compact') or 0.0)
-                        + qualification['D']) if comparable else None
+            proposed = ct['term'] + (old.get('D') or 0.0) if comparable else None
             rows.append({'policy': name, 'prior_circuit_reward': old['circuit_reward'],
                          'prior_phi': old['phi'], 'point_score': goal_eval.family_score(modified, 'point'),
                          'prospective_phi': ph if comparable else None,
-                         'prospective_circuit_reward': proposed, 'qualification': qualification, 'panel': panel})
+                         'prospective_circuit_reward': proposed, 'circuit_term': ct, 'panel': panel})
         save(a.out/(t+'.json'), {'task': t, 'rows': rows, 'empty': panels[-2], 'vpd': panels[-1],
              'seconds': time.monotonic()-started, 'gpu_peak_allocated_bytes': torch.cuda.max_memory_allocated(),
              'scope': 'Exploratory replacement of node family only; original tau retained, other families frozen.'})

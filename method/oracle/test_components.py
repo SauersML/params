@@ -280,9 +280,10 @@ def test_reward_on_tiny_model(tiny):
     assert all(got[0][f"term_{k}"] is None or 0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("C", "F1", "N", "F3"))
     v = got[0]  # reward v3: phi - phi_tau + g x (0.5 compact + E2g + E4x + E1) + D
     assert v["g"] is None or 0.0 <= v["g"] <= 1.0
-    tie = 0.02 * max(-2.0, min(2.0, v["compact"] or 0.0))
-    assert v["reward"] == pytest.approx((v["phi"] or 0.0) - (v["phi_tau"] or 0.0) - 4.0 * v["v"]
-                                        + (v["g"] or 0.0) * 2.0 ** (-20.0 * v["v"]) * v["Q"] + tie + v["D"])
+    tie = 0.04 * math.tanh((v["compact"] or 0.0) / 2.0)
+    assert v["reward"] == pytest.approx((v["phi"] or 0.0) - (v["phi_tau"] or 0.0) - 4.0 * v["v_soft"]
+                                        + (v["g"] or 0.0) * 2.0 ** (-20.0 * v["v_soft"]) * v["Q"] + tie + v["D"])
+    assert set(v["kl"]) >= {"point", "empty", "vpd", "nodes", "edges"} and v["kl"]["point"] is not None
     assert v["tie"] == pytest.approx(tie)
     assert v["Q"] == pytest.approx(0.5 * (v["compact"] or 0.0) + sum(v[f"term_{k}"] or 0.0 for k in ("E2g", "E4x", "E1")))
     tok = lambda xs: components.token_strings(task["model"], xs)  # noqa: E731
@@ -305,6 +306,33 @@ def test_reward_on_tiny_model(tiny):
     edited = good + "\nEDIT 1: scale " + good.split("subgraph P7", 1)[1].split("\n    ", 1)[1].split("[", 1)[0] + " 0"
     with_e3 = components.reward(ge, task, asked, [edited, good], ee=FakeEdits(), edit_best=best, pool={})
     assert with_e3[0]["term_E3"] == 0.5 and not with_e3[1]["valid"]  # 2 bits of the teacher's 4 (reported); no EDIT line: invalid
+
+
+def test_empty_like_answer_stays_below_zero(tiny, monkeypatch):
+    """The external audit's 9001 regression through the production entry point: an answer scoring nothing on the
+    point family with phi near 0 (0.0002 there) and a large compactness (9.5 there) against a start whose old unfloored
+    scores had put the bar at -2.5 earns R < 0 and is not faithful: the bar is at least every family at 0.5 and a bit
+    above the empty circuit's phi."""
+    nat, ge, task, ev = tiny
+    fams = list(goal_eval.PHI_FAMILIES)
+    base = {f"eps_{f}": goal_eval.EPS_FLOOR for f in fams} | {"c": 0.0, "c_rl": -1.0, "kl_point": 9.0}
+    start = base | {"s_point_c": 0.9, "s_nodes": 0.0, "s_nodes_raw": -1.0, "s_edges": 0.9, "f1_flips_c": {goal_eval.FLIP_TERM: 0.9},
+                    "s_track_pp": 0.9, "s_interchange_pp": 0.9, "n_spec": 0.0, "n_spec_raw": -1.0, "s_omitted": 1.0,
+                    "rl_terms": {"s_point_c": 0.9, "s_edges": 0.9, "f1_flips_c": 0.9}}
+    empty = base | {k: 0.0 for k in ("s_point_c", "s_nodes", "s_edges", "s_track_pp", "s_interchange_pp", "n_spec")} | {"s_omitted": 1.0}
+    near = base | {"s_point_c": 0.0, "s_nodes": 0.0, "s_edges": 0.0, "f1_flips_c": {goal_eval.FLIP_TERM: 0.0}, "s_track_pp": 0.01,
+                   "s_interchange_pp": 0.01, "n_spec": 0.0, "s_omitted": 0.0, "rl_terms": {"s_point_c": 0.0}}
+    assert abs(goal_eval.phi(near, families=fams)[0]) < 0.02
+
+    def fake(tx, graphs, pool=None, **kw):
+        return [start, empty] if len(graphs) == 2 and graphs[1].count() == 0 else [near] * len(graphs)
+
+    monkeypatch.setattr(ge, "fidelity", fake)
+    order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
+    g = native.Graph([order[0]], complete=True)  # one node: far smaller than the start
+    got = components.reward(ge, task, {**ev, "qa": []}, [components.render(goal_eval.to_json(g, "x"))], pool={})[0]
+    assert got["valid"] and got["compact"] > 0 and got["phi_tau"] >= 0.9
+    assert got["reward"] < 0 and got["faithful"] is False
 
 
 def test_invalid_below_every_valid_answer(tiny):

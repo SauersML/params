@@ -1651,10 +1651,12 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
            lines: bool = False, node_cap: int | None = None, retain_calibration: bool = False,
            invariants: bool = False) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
-    in bits, every term ranking, nothing clipped flat): R = goal_eval.circuit_term (cap_phi(phi) - phi_tau - 4 v +
-    g 2^(-20 v) Q + 0.02 clip(compact, -2, 2)) + D: against the text's bar, a constant of the text (below 0 for every
-    answer short of it, the empty and near-empty circuits included: the Gate B repair 10-13); v the worst shortfall below
-    the per-family floors (tau's "floors", the teacher's), the last term an ungated tie-break toward the smaller answer.
+    in bits, every term ranking, nothing clipped flat, every piece smooth): R = goal_eval.circuit_term (cap_phi(phi) -
+    phi_tau - 4 v + g 2^(-20 v) Q + 0.04 tanh(compact / 2)) + D: against the text's bar, a constant of the text (below 0
+    for every answer short of it, the empty and near-empty circuits included: the Gate B repair 10-13); v the soft
+    shortfall below the per-family floors (tau's "floors", the teacher's; goal_eval.shortfall_soft, reported as
+    v_soft beside the hard worst shortfall v that faithful reads), the last term an ungated tie-break toward the
+    smaller answer; kl the raw KLs in bits beside the scores (goal_eval.family_kls).
       phi: goal_eval.phi of the answer's reward-mode row, -log2 of the power-4 mean of the families' residuals
         (1 - s + eps over point, nodes, edges, flips, track_pp, interchange_pp, donors near and far, pattern, N):
         each halving of the worst residual is about a bit, and the empty circuit is at or below 0.
@@ -1748,12 +1750,13 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             m = None if ref is None or ph is None or dc is None else min(ph - ref["phi"], dc)
             D = 0.0 if m is None else (softplus(2.0 * m) - softplus(0.0)) / 2.0  # 0 at parity with the teacher
             over = overflow(tokens[i] if tokens else None)
-            r = ct["term"] + D - over  # cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v) Q + tie-break: below 0 until faithful
+            r = ct["term"] + D - over  # cap_phi(phi) - phi_tau - 4 v_soft + g 2^(-20 v_soft) Q + tie-break: below 0 until faithful
             circ = goal_eval.circuit_term(c, tau, b, 0.0, executable_bits)["term"] + D - over
             terms |= {"C": c["c"], "C_rl": c.get("c_rl"), "F1": row[f"f1_{convention}"], "N": row[f"n_{convention}"], "F3": row["f3"],
                       "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}
-            info = {"phi": ph, "phi_full": ph_full, "phi_tau": pt, "g": g, "v": ct["v"], "g_floor": ct["g_floor"], "tie": ct["tie"],
-                    "faithful": None if ph is None or pt is None else ph >= pt and ct["v"] == 0.0, "bits": b,
+            info = {"phi": ph, "phi_full": ph_full, "phi_tau": pt, "g": g, "v": ct["v"], "v_soft": ct["v_soft"], "g_floor": ct["g_floor"],
+                    "tie": ct["tie"], "faithful": None if ph is None or pt is None else ph >= pt and ct["v"] == 0.0, "bits": b,
+                    "kl": goal_eval.family_kls(c),  # raw KLs in bits beside the scores (the external audit)
                     "executable_bits": executable_bits,
                     "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,
                     "e2g": {k: v for k, v in (e2g.get(i) or {}).items() if k != "E2g"} or None}

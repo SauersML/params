@@ -1865,8 +1865,8 @@ def test_graph_kl_on_node_sets_and_blocks(tiny):
 
 
 def test_blocks_priced_and_drawn_as_units(tiny):
-    """A complete graph's block costs at least its active contents listed (connections counted over them); the node
-    family draws a block whole or not at all (with the text's VPD answer, its active contents)."""
+    """A complete graph's block costs exactly its active contents listed (connections counted over them: what it
+    executes); the node family draws a block whole or not at all (with the text's VPD answer, its active contents)."""
     import numpy as np
 
     nat, ge, tx = tiny
@@ -1878,7 +1878,7 @@ def test_blocks_priced_and_drawn_as_units(tiny):
     rest = [nd for nd in every if nd not in set(inside)]
     blk = native.Graph(rest + [(site, t, goal_eval.BLOCK)], complete=True)
     lst = native.Graph(rest + inside, complete=True)
-    assert goal_eval.size_bits(blk, P, S, tx.targets, active=tx.vpd) >= goal_eval.size_bits(lst, P, S, tx.targets) - 1e-9
+    assert abs(goal_eval.size_bits(blk, P, S, tx.targets, active=tx.vpd) - goal_eval.size_bits(lst, P, S, tx.targets)) < 1e-9
     units = sorted(rest[:5] + [(site, t, goal_eval.BLOCK)])
     for d in goal_eval._unit_draws(np.random.default_rng(0), units, 8, nat.C):
         got = {c for n, tt, c in d if (n, tt) == (site, t)}
@@ -1999,7 +1999,7 @@ def test_node_family_against_the_models_response(tiny):
     assert pos[0] == max(tx.targets) and pos == list(range(pos[0], pos[0] - len(pos), -1))
 
 def test_block_nodes(tiny):
-    """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
+    """["block", site, position] nodes: parsed and written back, a block costing what its explicit expansion costs,
     stranded by the same rules as a subcomponent of its site, and run by the families as the subcomponents of the
     site VPD's answer has on there (expand_blocks with the text's actives: what size_bits prices; without them every
     subcomponent of the site); a token edge into the prediction at a target is parsed and priced."""
@@ -2014,14 +2014,15 @@ def test_block_nodes(tiny):
     again, d2 = goal_eval.circuit(goal_eval.to_json(g), tx.targets, nat.C, tx.T)
     assert set(again.node_set()) == set(g.node_set()) and again.tok_out == g.tok_out and again.parents == g.parents
     P, S = max(tx.targets) + 1, sum(nat.C.values())
-    plain = native.Graph([(o1, 11, 0), ("h.1.attn.q_proj", 11, 0), (d0, 11, 0)], {("h.1.attn.q_proj", 11, 0): [(d0, 11, 0)]}, [(o1, 11, 0)])
-    plain.tok_edges, plain.tok_positions = list(g.tok_edges), list(g.tok_positions)
-    diff = goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd) - goal_eval.size_bits(plain, P, S, tx.targets)
-    held = int(tx.vpd[o1][11].sum()) + int(tx.vpd["h.1.attn.q_proj"][11].sum())  # the blocks' active contents
-    want = 2 * (math.log2(P * goal_eval.VPD4L_SITES) - math.log2(P * S)) + math.log2(3 + 1) + held * math.log2(P * S)
+    flat_g = goal_eval.expand_blocks(g, nat.C, tx.vpd)  # what the families run: the price is the same
+    assert abs(goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd) - goal_eval.size_bits(flat_g, P, S, tx.targets)) < 1e-9
     with pytest.raises(ValueError):
         goal_eval.size_bits(g, P, S, tx.targets)  # a block's price needs the text's active parts
-    assert abs(diff - want) < 1e-9, (diff, want)
+    last = native.site_name(nat.target.n_layer - 1, "down_proj")  # the audit's check: a final-layer down_proj block
+    blk1 = native.Graph([(last, 11, B)], {}, [(last, 11, B)])
+    ex1 = goal_eval.expand_blocks(blk1, nat.C, tx.vpd)
+    assert set(ex1.node_set()) == {(last, 11, c) for c in tx.vpd[last][11].nonzero().flatten().tolist()}
+    assert abs(goal_eval.size_bits(blk1, P, S, tx.targets, active=tx.vpd) - goal_eval.size_bits(ex1, P, S, tx.targets)) < 1e-9
     every = goal_eval.expand_blocks(g, nat.C)
     assert set(every.node_set()) == {(o1, 11, c) for c in range(nat.C[o1])} | {("h.1.attn.q_proj", 11, c) for c in range(nat.C["h.1.attn.q_proj"])} | {(d0, 11, 0)}
     on = {n: {(n, 11, c) for c in tx.vpd[n][11].nonzero().flatten().tolist()} for n in (o1, "h.1.attn.q_proj")}
@@ -2036,6 +2037,36 @@ def test_block_nodes(tiny):
     flat = native.Graph(sorted(on[o1]) + [(d0, 11, 0)], complete=True)
     assert set(goal_eval.expand_blocks(whole, nat.C, tx.vpd).node_set()) == set(flat.node_set())
     assert ge.fidelity(tx, [whole], None, draws=2, near_donors=0, far_donors=0)[0]["s_point"] ==         ge.fidelity(tx, [flat], None, draws=2, near_donors=0, far_donors=0)[0]["s_point"]
+
+
+def test_mask_backed_graph_round_trips(tiny):
+    """to_json of a mask-backed complete graph (the external audit: it fell through to the stated form, no nodes, no
+    "complete") writes its node set: the same nodes, run and size bits as the set-backed graph."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = every[::2]
+    masked = native.Graph(masks=ge.masks(native.Graph(sub, complete=True), tx.T))
+    listed = native.Graph(sub, complete=True)
+    js = goal_eval.to_json(masked)
+    assert js["complete"] and js == goal_eval.to_json(listed)
+    back, d = goal_eval.circuit(js, tx.targets, nat.C, tx.T)
+    assert back.complete and set(back.node_set()) == set(sub) and d["invalid_nodes"] == 0
+    P, S = max(tx.targets) + 1, sum(nat.C.values())
+    assert goal_eval.size_bits(masked, P, S, tx.targets) == goal_eval.size_bits(listed, P, S, tx.targets) == goal_eval.size_bits(back, P, S, tx.targets)
+    kl = [r["kl_live"] for r in ge.sufficiency(tx, [masked, listed, back])]
+    assert max(kl) - min(kl) < 1e-6
+
+
+def test_parsing_rejects_places_outside_the_node_list(tiny):
+    """A node place must be an int in range (the external audit: [-1, "out"] indexed the last node from the end)."""
+    nat, ge, tx = tiny
+    o1, d0 = "h.1.attn.o_proj", "h.0.mlp.down_proj"
+    nodes = [[d0, 0, 11], [o1, 1, 11], ["h.1.attn.q_proj", 0, 11]]
+    for bad in ([-1, "out"], [0, -2], [5, "out"], [True, "out"], [1.0, "out"], ["pair", -1, "rest", 1, 11]):
+        g, d = goal_eval.circuit({"nodes": nodes, "edges": [[1, "out"], bad]}, tx.targets, nat.C, tx.T)
+        assert d["invalid_edges"] == 1 and g.out == [(o1, 11, 1)], bad
+    g, d = goal_eval.circuit({"nodes": nodes, "edges": [[1, "out"], [0, 2], ["pair", 2, "rest", 1, 11]]}, tx.targets, nat.C, tx.T)
+    assert d["invalid_edges"] == 0
 
 
 def test_response_error():

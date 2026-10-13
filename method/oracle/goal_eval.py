@@ -122,7 +122,6 @@ INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # 
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
 BLOCK = -1  # a block node's index: (site, position, BLOCK), the site's whole output there (every subcomponent and the
 # remainder), ["block", site, position] in an answer (the lead's 10-12: a token's identity lives in thousands of parts)
-VPD4L_SITES = 24  # vpd4l's weight matrices (4 layers x 6), a block's name among them
 DONORS_NEAR = 32  # donor resampling's changed-input donors per text
 DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's answer)
 DONORS_FAR = 32  # donor resampling's other texts per text
@@ -158,8 +157,8 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
     query a node's place (a query node of that layer at that position) or "rest", key a node's place (a key node of
     that layer at or before it) or "rest"; ["pair", "rest", "rest", layer, position] states the read with no pair
     beyond the background. Nodes outside the model or
-    the text, edges the model does not have (mech.connects), and variables naming a part outside the model are dropped
-    and counted."""
+    the text, edges the model does not have (mech.connects) or naming a place outside the node list (_place: no
+    negative places), and variables naming a part outside the model are dropped and counted."""
     nodes, bad_nodes = [], 0
     for m, c, t in answer.get("nodes", []):
         if m == "block":  # a site's whole output at a position
@@ -203,8 +202,8 @@ def circuit(answer: dict, targets: list[int], C: dict, T: int) -> tuple[native.G
             continue
         try:
             up, down = e
-            w = nodes[up]
-            r = None if down == "out" else nodes[down]
+            w = nodes[_place(up, len(nodes))]
+            r = None if down == "out" else nodes[_place(down, len(nodes))]
         except (IndexError, TypeError, ValueError):
             bad_edges += 1
             continue
@@ -312,14 +311,22 @@ def strand(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
     return kept
 
 
+def _place(i, n: int) -> int:
+    """A node's place in an answer's node list: an int in [0, n) (a negative place, which Python would index from the
+    end, a bool or a float is a defect: the external audit, 10-13)."""
+    if isinstance(i, bool) or not isinstance(i, (int, np.integer)) or not 0 <= int(i) < n:
+        raise ValueError(f"node place {i!r} outside 0..{n - 1}")
+    return int(i)
+
+
 def _pair_entry(e: list, nodes: list, targets: list[int]):
     """((layer, position), (query or None, key or None)) of a JSON pair edge ["pair", query, key, layer, position]
     (circuit's), None when it is not one the model has."""
     try:
         _, qi, ki, layer, t = e
         layer, t = int(layer), int(t)
-        q = None if qi == "rest" else nodes[qi]
-        k = None if ki == "rest" else nodes[ki]
+        q = None if qi == "rest" else nodes[_place(qi, len(nodes))]
+        k = None if ki == "rest" else nodes[_place(ki, len(nodes))]
     except (IndexError, TypeError, ValueError):
         return None
     if not 0 <= t <= max(targets) or (qi != "rest" and q is None) or (ki != "rest" and k is None):
@@ -382,9 +389,10 @@ def _c_graph(g: native.Graph, targets: list[int], C: dict, active: dict | None =
 
 
 def to_json(g: native.Graph, explanation: str = "") -> dict:
-    """A Graph as an answer in JSON (circuit's format; a complete graph as its node set, "complete": true)."""
-    if g.complete and g.masks is None:
-        return {"nodes": [["block", n, t] if c == BLOCK else [n, c, t] for n, t, c in sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2]))],
+    """A Graph as an answer in JSON (circuit's format; a complete graph, set- or mask-backed, as its node set,
+    "complete": true; the external audit 10-13: a mask-backed one fell through to the stated form, empty)."""
+    if g.complete:
+        return {"nodes": [["block", n, t] if c == BLOCK else [n, c, t] for n, t, c in sorted(g.node_set(), key=lambda nd: (nd[1], nd[0], nd[2]))],
                 "edges": [], "complete": True, "explanation": explanation}
     tok = getattr(g, "tok_edges", [])
     nodes = sorted(g.nodes, key=lambda nd: (nd[1], nd[0], nd[2])) + [("tok", p, 0) for p in sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in tok} | set(getattr(g, "tok_out", [])))]
@@ -414,19 +422,18 @@ def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list
               _contents: bool = True) -> float:
     """An answer's description bits, raw (the lead's 10-12: no scale): native.Graph.bits with the answer's embedding
     nodes (each a choice among the positions, every edge's ends indexed among all the listed nodes, an embedding edge
-    priced like any other), the stated query-key pairs (_pair_bits), and each block node (BLOCK) at what naming its
-    contents would cost: its name among sites and positions plus, per subcomponent of its site VPD's answer has on at
-    its position (active: {site: bool [T, C]}, the text's), a subcomponent's bits, so a block is never cheaper than
-    listing its active parts (the lead's 10-12) and is worth it only where faithfulness needs it. A graph with blocks
-    needs active. A complete graph's blocks are priced the same way, and its implied connections are counted with each
-    block as its active contents (a block with none as one node; backup's report: every site at text9000's two
-    influential positions as blocks cost 2,576 bits against the 20,269 of the actives they hold, their connections
-    collapsed into one node per block)."""
+    priced like any other) and the stated query-key pairs (_pair_bits). A block node (BLOCK) costs what it executes
+    (the external audit, 10-13): the graph is priced as its explicit expansion, every block replaced by its active
+    contents (expand_blocks with active, {site: bool [T, C]}, the text's VPD answer; what the families run), its
+    connections, pairs and token edges with them, so a block and the subcomponents it holds always cost the same; a
+    stranded block its active contents' subcomponent bits. A graph with blocks needs active."""
+    if _contents and any(nd[2] == BLOCK for nd in g.node_set()):
+        if active is None:
+            raise ValueError("a graph with block nodes is priced at its blocks' active contents: pass active (the text's VPD answer)")
+        return size_bits(expand_blocks(g, {}, active), positions, subcomponents, targets, active)
     extra = getattr(g, "stranded_bits", 0.0) + _pair_bits(g)  # stranded nodes (strand): dropped, their bits still charged
-    blocks = [nd for nd in g.node_set() if nd[2] == BLOCK]
-    extra += len(blocks) * (math.log2(positions * VPD4L_SITES) - math.log2(positions * subcomponents))  # named among sites
     if _contents:
-        held = blocks + [nd for nd in getattr(g, "stranded", []) if nd[2] == BLOCK]
+        held = [nd for nd in getattr(g, "stranded", []) if nd[2] == BLOCK]
         if held and active is None:
             raise ValueError("a graph with block nodes is priced at its blocks' active contents: pass active (the text's VPD answer)")
         extra += sum(int(active[n][t].sum()) for n, t, _ in held) * math.log2(positions * subcomponents)
@@ -434,24 +441,15 @@ def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list
         extra += len(g.tok_out) * math.log2(g.count() + len(set(getattr(g, "tok_positions", [])) | set(g.tok_out)))
     pos = sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in getattr(g, "tok_edges", [])})
     n, k = g.count(), len(pos)
-    if g.complete and blocks and active is not None:  # connections over the blocks' active contents
-        flat = {nd for nd in g.node_set() if nd[2] != BLOCK}
-        for b, t, _ in blocks:
-            cs = active[b][t].nonzero().flatten().tolist()
-            flat |= {(b, t, c) for c in cs} if cs else {(b, t, BLOCK)}
-        inner, out = native.implied_edges(flat, targets)
-        m = len(flat)
-    elif g.complete:
+    if g.complete:
         inner, out = native.implied_edges(g.node_set(), targets)
-        m = n
     else:
         inner, out = sum(len(w) for w in g.parents.values()), len(g.out)
-        m = n
     if not n:
         return extra
     if not pos:
-        return n * math.log2(positions * subcomponents) + math.log2(m) * (2 * inner + out) + extra
-    return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(m + k) * (2 * (inner + len(g.tok_edges)) + out) + extra
+        return n * math.log2(positions * subcomponents) + math.log2(n) * (2 * inner + out) + extra
+    return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(n + k) * (2 * (inner + len(g.tok_edges)) + out) + extra
 
 
 def _unit_draws(rng: np.random.Generator, units: list, draws: int, C: dict, active: dict | None = None) -> list[list]:
@@ -528,19 +526,57 @@ EPS_CAP = 0.05  # eps's cap (the Gate B package, 10-13: the toy repair table pas
 EPS_BOOT = 200  # eps's bootstrap resamples
 PHI_CAP = 1.0  # phi counts in full up to the text's bar + PHI_CAP (cap_phi), PHI_SLOPE of it above
 PHI_SLOPE = 0.1
+PHI_CAP_WIDTH = 0.2  # cap_phi's join between the two slopes, in bits (a softplus: C1, the user's 10-13 softening)
+LEAK = 0.1  # phi's family scores below 0 count LEAK of themselves (the user's 10-13: a floor at 0 gives no gradient)
+PHI_RAW = {"point": "s_point_c", "nodes": "s_nodes_raw", "edges": "s_edges", "flips": "f1_flips_c",
+           "track_pp": "s_track_pp_raw", "interchange_pp": "s_interchange_pp_raw", "patching_near": "s_patching_near",
+           "patching_far": "s_patching_far", "pattern": "s_pattern_raw", "N": "n_spec_raw", "omitted": "s_omitted_raw"}
+# each family's unfloored score: a row field ending in _raw, else rl_terms' entry (point, edges, flips, patching)
 
 
 def family_score(row: dict, family: str) -> float | None:
-    """A row's score for one of phi's families, floored at 0 (PHI_FAMILIES' keys; flips at FLIP_TERM). phi reads the
-    floored scores, not rl_terms' unfloored ones (the Gate B table 10-13, held-out text9000-9019: unfloored s_nodes
-    and N reach -4.1 and -2.9 where VPD's own response sits near the no-change bound, a near-zero denominator, and
-    put the influential start below the empty circuit on 14 of 20 texts; floored, the start is above the empty
-    circuit on 20 of 20 and the fair sets keep their order). rl_terms stay C_rl's."""
+    """A row's score for one of phi's families, floored at 0 (PHI_FAMILIES' keys; flips at FLIP_TERM): the floors,
+    the hard shortfall and the teacher's acceptance read it. phi reads phi_score, the unfloored score with a leaky
+    floor: unbounded, unfloored s_nodes and N reached -4.1 and -2.9 where VPD's own response sat near the no-change
+    bound (the Gate B table 10-13), but the linear share and N's clip now keep them in [-1, 1]."""
     key = PHI_FAMILIES[family][0]
     if key == "f1_flips_c":
         fc = row.get("f1_flips_c") or {}
         return fc.get(str(FLIP_TERM), fc.get(FLIP_TERM))
     return row.get(key)
+
+
+def phi_score(row: dict, family: str) -> float | None:
+    """A family's score as phi counts it (the user's 10-13 softening of f5a1df2's floor at 0): the unfloored score
+    (PHI_RAW: the weighted families' linear share and N in [-1, 1], the log-scale ones clipped there), LEAK of it below
+    0, so a family under 0 still ranks answers; family_score's floored score where the row keeps no unfloored one."""
+    key = PHI_RAW[family]
+    raw = row.get(key) if key.endswith("_raw") else (row.get("rl_terms") or {}).get(key)
+    if raw is None:
+        return family_score(row, family)
+    raw = min(1.0, max(-1.0, float(raw)))
+    return raw if raw >= 0 else LEAK * raw
+
+
+def family_kls(row: dict) -> dict:
+    """The raw KLs in bits at the targets beside a row's scores (the external audit, 10-13: a normalized 0.9 can be
+    12 bits where the empty circuit's KL is large): "point" the circuit's own run, "empty" and "vpd" the bounds, and
+    per family the circuit's mean KL from the model under its interventions (nodes, edges, flips at FLIP_TERM, the
+    path-patched and omitted draws' mean KL_C, patching near and far, pattern; N reports the target damage D_t)."""
+    def mean(key, j=1):
+        d = [x[j] for x in row.get(key) or [] if x[j] is not None]
+        return float(np.mean(d)) if d else None
+
+    fl = row.get("kl_flips_omitted") or {}
+    kf = fl.get(FLIP_TERM, fl.get(str(FLIP_TERM)))
+    out = {"point": row.get("kl_point"), "empty": row.get("kl_empty_live"), "vpd": row.get("kl_vpd_live"),
+           "nodes": row.get("kl_nodes_c"), "edges": row.get("kl_edges_c"), "flips": kf[0] if kf else None,
+           "track_pp": mean("draws_track_pp"), "interchange_pp": mean("draws_interchange_pp"), "omitted": mean("draws_omitted"),
+           "pattern": row.get("kl_pattern_c"), "N": (row.get("draws_n_spec") or [[None] * 5])[0][3]}
+    for pool_ in ("near", "far"):
+        k3 = row.get(f"kl_patching_{pool_}")
+        out[f"patching_{pool_}"] = k3[0] if k3 else None
+    return out
 
 
 def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> float | None:
@@ -666,7 +702,8 @@ def _eps(row: dict) -> dict:
 GATE_SLOPE = 10.0  # the reward's gate g = 1 / (1 + 2^(-GATE_SLOPE (phi - phi_tau))) (components.GATE_SLOPE)
 FLOOR_TOP, FLOOR_MARGIN = 0.9, 0.05  # a family's floor: min(FLOOR_TOP, the start's score - FLOOR_MARGIN), at least 0
 SHORTFALL_COST, SHORTFALL_GATE = 4.0, 20.0  # R - SHORTFALL_COST v, the gate times 2^(-SHORTFALL_GATE v)
-TIE, TIE_CLIP = 0.02, 2.0  # the ungated compactness tie-break: TIE x clip(compact, -TIE_CLIP, TIE_CLIP)
+SHORTFALL_WIDTH = 0.02  # the soft shortfall's softplus width in score units (the user's 10-13 softening)
+TIE, TIE_SCALE = 0.02, 2.0  # the ungated compactness tie-break: TIE x TIE_SCALE tanh(compact / TIE_SCALE)
 
 
 def floors(start: dict, families: list) -> dict:
@@ -680,40 +717,58 @@ def floors(start: dict, families: list) -> dict:
 
 
 def shortfall(row: dict, floors_: dict) -> float:
-    """v = max_i (f_i - s_i)_+, the worst shortfall below a family's floor in score units (an unscored family at s = 0)."""
+    """v = max_i (f_i - s_i)_+, the worst shortfall below a family's floor in score units (an unscored family at s =
+    0): faithful's test (v = 0) and the teacher's acceptance; circuit_term charges shortfall_soft."""
     return max((max(0.0, f - (family_score(row, k) or 0.0)) for k, f in floors_.items()), default=0.0)
+
+
+def shortfall_soft(row: dict, floors_: dict) -> float:
+    """The reward's shortfall (the user's 10-13 softening: a hard max and hinge give one family any gradient):
+    (mean_i softplus_w(f_i - s_i)^4)^(1/4) with w = SHORTFALL_WIDTH, s_i phi's score (phi_score, an unscored family at
+    0), a power mean like phi's: every family near or under its floor counts, the worst the most. About 0.014 n^(-1/4)
+    per family exactly at its floor, 0.002 per one 0.05 above."""
+    if not floors_:
+        return 0.0
+    w = SHORTFALL_WIDTH
+    sp = [w * float(np.logaddexp(0.0, (f - (phi_score(row, k) or 0.0)) / w)) for k, f in floors_.items()]
+    return float(np.mean([x ** 4 for x in sp])) ** 0.25
 
 
 def circuit_term(row: dict, tau: dict, bits: float | None, quality: float = 0.0, executable_bits: float | None = None) -> dict:
     """Reward v3's circuit part, one function for components.reward and the teacher (circuit_score): term =
-    cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v) (0.5 compact + quality) + 0.02 clip(compact, -2, 2). phi over tau's
-    families; v the worst shortfall below tau's per-family floors (a single bad family can no longer hide in the power
-    mean: one at 0.45 among ten at 0.95 gave phi 1.67, above every family at 0.5); g the gate at the bar; compact =
-    log2(bits_start / bits) (None when executable_bits, default bits, is 0); the last term an ungated tie-break toward
-    the smaller answer (padding below the bar was free: generality's falsification set ranked it right on 0.59). quality:
-    the reward's other gated terms (E2g + E4x + E1). Returns the term and its pieces."""
+    cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v) (0.5 compact + quality) + 0.04 tanh(compact / 2), every piece smooth (the
+    user's 10-13 softening). phi over tau's families (phi_score's leaky floor); v = shortfall_soft against tau's
+    per-family floors (a single bad family can no longer hide in the power mean: one at 0.45 among ten at 0.95 gave phi
+    1.67, above every family at 0.5); g the gate at the bar; compact = log2(bits_start / bits) (None when
+    executable_bits, default bits, is 0); the last term an ungated tie-break toward the smaller answer (padding below
+    the bar was free: generality's falsification set ranked it right on 0.59). quality: the reward's other gated terms
+    (E2g + E4x + E1). Returns the term and its pieces; "v" is the hard worst shortfall (shortfall: faithful's and the
+    teacher's v = 0), "v_soft" the one the term charges."""
     fams, pt = tau.get("families"), tau.get("phi_tau")
     full = phi(row, families=fams)[0]
     ph = cap_phi(full, pt)
-    v = shortfall(row, tau.get("floors") or {})
+    fl = tau.get("floors") or {}
+    v, vs = shortfall(row, fl), shortfall_soft(row, fl)
     eb = bits if executable_bits is None else executable_bits
     comp = compact(bits, tau.get("bits_start")) if bits and eb and eb > 0 else None
     g = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-GATE_SLOPE * (ph - pt)))
-    ge_ = (g or 0.0) * 2.0 ** (-SHORTFALL_GATE * v)
-    tie = TIE * max(-TIE_CLIP, min(TIE_CLIP, comp or 0.0))
-    term = (ph or 0.0) - (pt or 0.0) - SHORTFALL_COST * v + ge_ * (0.5 * (comp or 0.0) + quality) + tie
-    return {"term": term, "phi_full": full, "phi": ph, "phi_tau": pt, "v": v, "floors": tau.get("floors"), "g": g,
-            "g_floor": ge_, "compact": comp, "tie": tie}
+    ge_ = (g or 0.0) * 2.0 ** (-SHORTFALL_GATE * vs)
+    tie = TIE * TIE_SCALE * math.tanh((comp or 0.0) / TIE_SCALE)
+    term = (ph or 0.0) - (pt or 0.0) - SHORTFALL_COST * vs + ge_ * (0.5 * (comp or 0.0) + quality) + tie
+    return {"term": term, "phi_full": full, "phi": ph, "phi_tau": pt, "v": v, "v_soft": vs, "floors": tau.get("floors"),
+            "g": g, "g_floor": ge_, "compact": comp, "tie": tie}
 
 
 def cap_phi(ph: float | None, tau: float | None) -> float | None:
-    """phi as the reward counts it (the Gate B package, 10-13): in full up to the text's bar + PHI_CAP, PHI_SLOPE of the
-    rest above (faithfulness past the bar is not worth size: a superset gaining 3 bits of phi was worth a 64x larger
-    circuit through compactness's 0.5 log2; the slope still breaks ties toward faithfulness)."""
+    """phi as the reward counts it (the Gate B package, 10-13; smooth since the user's 10-13 softening): phi - (1 -
+    PHI_SLOPE) w ln(1 + e^((phi - tau - PHI_CAP) / w)), w = PHI_CAP_WIDTH: slope 1 below the text's bar + PHI_CAP,
+    PHI_SLOPE above, a softplus join between (faithfulness past the bar is not worth size: a superset gaining 3 bits of
+    phi was worth a 64x larger circuit through compactness's 0.5 log2; the slope still breaks ties toward
+    faithfulness). At the bar itself it is phi less 0.001 bits."""
     if ph is None or tau is None:
         return ph
-    top = tau + PHI_CAP
-    return min(ph, top) + PHI_SLOPE * max(0.0, ph - top)
+    w = PHI_CAP_WIDTH
+    return ph - (1.0 - PHI_SLOPE) * w * float(np.logaddexp(0.0, (ph - tau - PHI_CAP) / w))
 
 
 def phi(row: dict, start: float | dict | None = None, families: list | None = None) -> tuple:
@@ -732,7 +787,7 @@ def phi(row: dict, start: float | dict | None = None, families: list | None = No
     fams = families if families is not None else (
         [f for f in PHI_FAMILIES if family_score(start, f) is not None] if isinstance(start, dict) else
         [f for f in PHI_FAMILIES if family_score(row, f) is not None])
-    got = _phi([(0.0 if family_score(row, f) is None else family_score(row, f), eps[f]) for f in fams])
+    got = _phi([(0.0 if phi_score(row, f) is None else phi_score(row, f), eps[f]) for f in fams])
     if isinstance(start, dict):
         return got, _bar(start, fams)
     if start is not None:
@@ -745,7 +800,7 @@ def phi(row: dict, start: float | dict | None = None, families: list | None = No
 def _bar(start: dict, families: list) -> float | None:
     """max(min(phi of the start, every family at 0.9), every family at 0.5), under the start's eps (phi_tau)."""
     se = _eps(start)
-    ps = _phi([(0.0 if family_score(start, f) is None else family_score(start, f), se[f]) for f in families])
+    ps = _phi([(0.0 if phi_score(start, f) is None else phi_score(start, f), se[f]) for f in families])
     at9, at5 = _phi([(0.9, se[f]) for f in families]), _phi([(0.5, se[f]) for f in families])
     if ps is None:
         return at9

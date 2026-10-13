@@ -30,6 +30,8 @@ positions from its first removal on, reading the set's keys and values before it
       the teacher's own search (teacher.py's levels, prefix rounds, F1 >= 0.9 rule and joint path) on native units
   native_units.py compare --native TEACH.jsonl --teacher TEACHER_DIR [--out ROWS.jsonl]
       native vs the teacher vs VPD's order at sizes 12 to 1,024: F1, N_VPD, N_real, local and non-local
+  native_units.py phi --vpd VPD.pt --influential DIR [--teach TEACH.jsonl ...] --out OUT.jsonl
+      native circuits against VPD's influential sets under phi's shared families at equal bits (NativePhi)
 """
 
 from __future__ import annotations
@@ -527,6 +529,445 @@ def teach_all(split: str, n: int, out: Path, offset: int = 0, stride: int = 1, v
             f"path to {row['path'][-1]['size']}, {row['measured_sets']} runs, {row['seconds']:.0f} s")
 
 
+# ---- native units under phi (the lead's 10-12: neurons and heads as nodes, the same phi, draws and size accounting)
+
+
+SHARED = ("point", "nodes", "track_pp", "interchange_pp", "patching_near", "patching_far", "pattern", "N")  # phi's
+# families with a native counterpart here (connection cuts and the omitted-lever flips have none yet)
+
+
+def native_bits(S: Mask, targets: list[int], positions: int, per_position: int) -> float:
+    """A native circuit's description bits, size_bits' form for a complete node set: each unit one choice among
+    positions x per_position, and every connection the model has among the units paid like a stated one (log2 n each
+    end, a connection into the prediction its writer's): a unit's reads from the units writing its position's residual
+    stream before it (a head reads at layer l, writes at l + 0.5; a neuron reads at l + 0.5, writes at l + 1, mech.stage),
+    a head's from the same head's units at earlier positions (its keys and values), the prediction from every unit at
+    the targets."""
+    import bisect
+
+    units = S.units()
+    n = len(units)
+    if not n:
+        return 0.0
+    writes, heads = {}, {}
+    for kind, l, t, j in units:
+        writes.setdefault(t, []).append(l + (0.5 if kind == "head" else 1.0))
+        if kind == "head":
+            heads.setdefault((l, j), []).append(t)
+    for v in (*writes.values(), *heads.values()):
+        v.sort()
+    inner = sum(bisect.bisect_right(writes[t], l + (0.0 if kind == "head" else 0.5)) for kind, l, t, j in units)
+    inner += sum(bisect.bisect_left(heads[(l, j)], t) for kind, l, t, j in units if kind == "head")
+    out = sum(1 for _, _, t, _ in units if t in targets)
+    return n * math.log2(positions * per_position) + math.log2(n) * (2 * inner + out)
+
+
+class NativePhi:
+    """Native-unit circuits (Mask) under phi's families on one text. Every run is goal_eval.graph_ref on the whole model
+    (every subcomponent on, the remainders live: the real model) with the model's units replaced (graph_ref(units=)):
+    in C's semantics (point, nodes, pattern, N) the circuit's units run and every other unit's output is 0 (its query,
+    key and value its own); in the path-patched families (track_pp, interchange_pp) and activation patching every
+    other unit, a head with its query, key and value, is held at its value on x or on the donor, the circuit's units
+    computing from the stream. Each draw's reference is VPD's whole answer under the same intervention, with the same
+    draws as VPD's families (the text's changed texts, donors and controls; for removals and holds of native units,
+    VPD's answer with those units removed or held); each bound the native circuit's own (its empty circuit, the
+    embedding alone; keep-nothing, every unit at the donor's). Rows carry the families' VPD-form records, rl_terms
+    (each without the floor at 0, as phi reads them) and eps."""
+
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, split: str = "eval"):
+        nat = ge.nat
+        self.ge, self.tx, self.nat, self.split = ge, tx, nat, split
+        tg = nat.target
+        self.L, self.H, self.hd = tg.n_layer, tg.n_head, tg.hd
+        self.Dm = tg.site(native.site_name(0, "c_fc")).W.shape[0]
+        T = tx.T
+        self.model = native.Graph(masks={n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+        self.vpd = native.Graph(masks=tx.vpd)
+        self._caps = {}
+
+    def capture(self, ids: list[int]) -> dict:
+        """The real model's units on ids (graph_ref's capture), kept by ids."""
+        key = tuple(ids)
+        if key not in self._caps:
+            c = {}
+            self.ge.graph_ref(list(ids), [len(ids) - 1], native.Graph(masks={n: torch.ones(len(ids), self.nat.C[n], dtype=torch.bool,
+                                                                                       device=self.nat.dev) for n in self.nat.names}), capture=c)
+            self._caps[key] = c
+        return self._caps[key]
+
+    def _units(self, heads: list, neurons: list, values: dict | None) -> dict:
+        """graph_ref's units from per-row masks ([layers, T, H], [layers, T, d_mlp]) and values (a capture, rows 1 or B)."""
+        hv = None if values is None else {k: values[k] for k in ("q", "k", "v", "out")}
+        return {"head": (torch.stack(heads), hv), "neuron": (torch.stack(neurons), None if values is None else values["neuron"])}
+
+    def _mix(self, a: dict, b: dict, hm: torch.Tensor, nm: torch.Tensor) -> dict:
+        """A capture with b's values where the masks ([layers, T, H], [layers, T, d_mlp]) are set, a's elsewhere."""
+        h = hm.permute(0, 2, 1)[None, :, :, :, None]  # [1, layers, H, T, 1]
+        out = {k: torch.where(h, b[k], a[k]) for k in ("q", "k", "v", "out")}
+        out["neuron"] = torch.where(nm[None], b["neuron"], a["neuron"])
+        return out
+
+    def _kl(self, ref: torch.Tensor, lq: torch.Tensor) -> list[float]:
+        return carry.kl(ref.expand_as(lq) if ref.shape[0] == 1 else ref, lq).tolist()
+
+    def _zeros(self, S: Mask) -> tuple:
+        return torch.zeros_like(S.heads), torch.zeros_like(S.neurons)
+
+    def point(self, sets: list[Mask]) -> list[dict]:
+        tx = self.tx
+        e0 = self.empty()
+        v0 = self.ge._bounds(tx, "live")[1]
+        lq = self.ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads for S in sets], [~S.neurons for S in sets], None))
+        out = []
+        for k in self._kl(tx.ref, lq):
+            out.append({"s_point": goal_eval._fid(e0, k, v0), "s_point_c": goal_eval._fid(e0, k, v0), "kl_point": k,
+                        "draws_point": [[k, v0]], "_raw_point": goal_eval._fid_raw(e0, k, v0)})
+        return out
+
+    def empty(self) -> float:
+        """The native empty circuit's KL (the embedding alone: every unit's output 0), kept on the text."""
+        if "_native_empty" not in self.tx.__dict__:
+            z = Mask(torch.ones(self.L, self.tx.T, self.H, dtype=torch.bool, device=self.nat.dev),
+                     torch.ones(self.L, self.tx.T, self.Dm, dtype=torch.bool, device=self.nat.dev))
+            lq = self.ge.graph_ref(self.tx.ids, self.tx.targets, self.model, units=self._units([z.heads], [z.neurons], None))
+            self.tx._native_empty = self._kl(self.tx.ref, lq)[0]
+        return self.tx._native_empty
+
+    def nodes(self, S: Mask, draws: int = goal_eval.DRAWS) -> dict:
+        """s_nodes: per draw d (each unit with probability (j + 0.5) / draws, at least one; seeded by the circuit), KL(model
+        less d || circuit less d) against W = KL(model less d || model), VPD's answer less d the reference, pooled by W."""
+        tx, ge = self.tx, self.ge
+        units = sorted(S.units())
+        if not units:
+            return {"s_nodes": None}
+        import hashlib
+
+        rng = np.random.default_rng([tx.seed, int(hashlib.sha256(repr(("native nodes", units)).encode()).hexdigest()[:15], 16)])
+        drops = []
+        for j in range(draws):
+            d = [u for u in units if rng.random() < (j + 0.5) / draws]
+            drops.append(d or [units[int(rng.integers(len(units)))]])
+        dm = [Mask(*self._zeros(S)) for _ in drops]
+        for m, d in zip(dm, drops):
+            for kind, l, t, j in d:
+                (m.heads if kind == "head" else m.neurons)[l, t, j] = True
+        lm = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([m.heads for m in dm], [m.neurons for m in dm], None))
+        lc = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads | m.heads for m in dm], [~S.neurons | m.neurons for m in dm], None))
+        lv = ge.graph_ref(tx.ids, tx.targets, self.vpd, units=self._units([m.heads for m in dm], [m.neurons for m in dm], None))
+        kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
+        w = carry.kl(lm, tx.ref.expand_as(lm)).tolist()
+        claim = carry.kl(tx.ref.expand_as(lc), lc).tolist()
+        rec = [[j, a, b, c, d] for j, (a, b, c, d) in enumerate(zip(kc, kv, w, claim))]
+        e0 = self.empty()
+        return {"s_nodes": goal_eval._pooled("weighted", rec, e0), "_raw_nodes": goal_eval._pooled_raw(rec), "draws_nodes": rec,
+                "kl_nodes_c": float(np.mean(kc)), "kl_nodes_vpd": float(np.mean(kv)),
+                "overstate_nodes": float(np.mean(claim)) / max(float(np.mean(w)), 1e-12)}
+
+    def _pp_prompts(self, draws: int) -> list:
+        """track_pp's changed texts (p, z), VPD's own (the text's draws), with each one's model run, W and VPD's KL."""
+        tx, ge = self.tx, self.ge
+        moved = np.asarray(tx.moved, dtype=float)
+        positions = [p for p, _ in tx.f2]
+        got = ge._interchange_draws(tx, positions, self.split, draws, first={p: -moved[p - 1] for p in positions}) \
+            if positions else []
+        kept = tx.__dict__.setdefault("_pp_prompts", {})
+        if any((p, z) not in kept for p, z in got):
+            ge.track_pp(tx, [native.Graph()], self.split, draws)  # VPD's side of every prompt, kept on the text
+        return [(p, z, *kept[(p, z)]) for p, z in got if (p, z) in kept]
+
+    def track_pp(self, sets: list[Mask], draws: int = goal_eval.CHANGED_DRAWS) -> list[dict]:
+        """s_track_pp: on each changed text x', the model on x' with every unit outside the circuit held at its value on
+        x (the change entering through the embedding into the circuit's units and the prediction) against the model on
+        x', VPD's path-patched answer the reference, bounded by no change (W), pooled by W."""
+        tx, ge = self.tx, self.ge
+        cx = self.capture(tx.ids)
+        recs = [[] for _ in sets]
+        for p, z, ref, w, kv in self._pp_prompts(draws):
+            x2 = list(tx.ids)
+            x2[p] = z
+            lq = ge.graph_ref(x2, tx.targets, self.model, units=self._units([~S.heads for S in sets], [~S.neurons for S in sets], cx))
+            for b, kc in enumerate(self._kl(ref, lq)):
+                recs[b].append([[p, z], kc, kv, w])
+            native.free(self.nat.dev)
+        return [{"s_track_pp": goal_eval._pooled("weighted", r, None), "_raw_track_pp": goal_eval._pooled_raw(r), "draws_track_pp": r}
+                for r in recs]
+
+    def interchange_pp(self, S: Mask, draws: int = goal_eval.INTERCHANGE_DRAWS) -> dict:
+        """s_interchange_pp: on the interchange draws of the circuit's positions (VPD's _interchange_draws), the circuit's
+        units at p held at their values in the model on x', the rest outside the circuit at x, the circuit's other units
+        computing; against the model with those units held (W = KL(model held || model)) and VPD's answer with them
+        held, pooled by W."""
+        tx, ge = self.tx, self.ge
+        positions = sorted({u[2] for u in S.units() if u[2] > 0})
+        got = ge._interchange_draws(tx, positions, self.split, draws) if positions else []
+        cx = self.capture(tx.ids)
+        rec = []
+        for p, z in got:
+            x2 = list(tx.ids)
+            x2[p] = z
+            c2 = self.capture(x2)
+            hp, np_ = torch.zeros_like(S.heads), torch.zeros_like(S.neurons)
+            hp[:, p], np_[:, p] = S.heads[:, p], S.neurons[:, p]
+            held = self._mix(cx, c2, hp, np_)
+            lm = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([hp], [np_], c2))
+            lc = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads | hp], [~S.neurons | np_], held))
+            lv = ge.graph_ref(tx.ids, tx.targets, self.vpd, units=self._units([hp], [np_], c2))
+            w = float(carry.kl(lm, tx.ref)[0])
+            rec.append([[p, z], float(carry.kl(lm, lc)[0]), float(carry.kl(lm, lv)[0]), w])
+            native.free(self.nat.dev)
+        return {"s_interchange_pp": goal_eval._pooled("weighted", rec, None), "_raw_interchange_pp": goal_eval._pooled_raw(rec),
+                "draws_interchange_pp": rec}
+
+    def _donor_capture(self, ids: list[int]) -> tuple[dict, int]:
+        """A donor's units aligned with the text at their ends (goal_eval.donor_activations' alignment): its last T
+        positions, or, a shorter donor, at the text's last positions with the first pad left unpatched."""
+        T = self.tx.T
+        c = self.capture(ids)
+        n = len(ids)
+        pad = max(0, T - n)
+        out = {}
+        for k in ("q", "k", "v", "out"):
+            x = c[k][:, :, :, max(0, n - T):]
+            out[k] = x if not pad else torch.cat([x.new_zeros(*x.shape[:3], pad, x.shape[4]), x], 3)
+        x = c["neuron"][:, :, max(0, n - T):]
+        out["neuron"] = x if not pad else torch.cat([x.new_zeros(x.shape[0], x.shape[1], pad, x.shape[3]), x], 2)
+        return out, pad
+
+    def patching(self, sets: list[Mask], near: int = goal_eval.DONORS_NEAR, far: int = goal_eval.DONORS_FAR) -> list[dict]:
+        """Activation patching (s_patching_near, _far): every unit outside the circuit at its value on a donor text
+        (VPD's donors: near the changed texts, far the split's far pool, end-aligned), the circuit's computing, from the
+        model on the text; bound the native keep-nothing run (every unit at the donor's), VPD's answer under the same
+        donor the reference (VPD's donors run)."""
+        tx, ge = self.tx, self.ge
+        far_texts = ge.far_donors(tx, ge.far_pool(self.split), far) if far else None
+        vrow = ge.donors(tx, [self.vpd], self.split, near, far_texts)[0]  # VPD's side per donor
+        texts = {}
+        if near:
+            moved = np.asarray(tx.moved, dtype=float)
+            positions = [p for p, _ in tx.f2]
+            for p, z in (ge._interchange_draws(tx, positions, self.split, near, first={p: -moved[p - 1] for p in positions}) if positions else []):
+                x = list(tx.ids)
+                x[p] = z
+                texts.setdefault("near", []).append(([p, z], x))
+        if far_texts:
+            texts["far"] = [(name, list(x)) for name, x in far_texts if list(x) != list(tx.ids)]
+        out = [{} for _ in sets]
+        full = Mask(torch.ones(self.L, tx.T, self.H, dtype=torch.bool, device=self.nat.dev),
+                    torch.ones(self.L, tx.T, self.Dm, dtype=torch.bool, device=self.nat.dev))
+        for pool, xs in texts.items():
+            kv_of = {json.dumps(d[0]): d[2] for d in vrow.get(f"draws_patching_{pool}") or []}
+            recs = [[] for _ in sets]
+            for name, x in xs:
+                cd, pad = self._donor_capture(x)
+                keep = torch.ones(tx.T, dtype=torch.bool, device=self.nat.dev)
+                keep[:pad] = False
+                rows = sets + [Mask(torch.zeros_like(full.heads), torch.zeros_like(full.neurons))]  # the circuits, nothing kept
+                hm = [(~S.heads) & keep[None, :, None] for S in rows]
+                nm = [(~S.neurons) & keep[None, :, None] for S in rows]
+                lq = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units(hm, nm, cd))
+                kl = self._kl(tx.ref, lq)
+                kv = kv_of.get(json.dumps(name))
+                for b in range(len(sets)):
+                    if kv is not None:
+                        recs[b].append([name, kl[b], kv, kl[-1], goal_eval._fid(kl[-1], kl[b], kv)])
+                native.free(self.nat.dev)
+            for b, r in enumerate(recs):
+                if r:
+                    kc, kv, k0 = (float(np.mean([d[i] for d in r])) for i in (1, 2, 3))
+                    out[b].update({f"s_patching_{pool}": goal_eval._fid(k0, kc, kv), f"_raw_patching_{pool}": goal_eval._fid_raw(k0, kc, kv),
+                                   f"kl_patching_{pool}": (kc, kv, k0), f"draws_patching_{pool}": r, f"donors_{pool}": len(r)})
+        return out
+
+    def pattern(self, S: Mask) -> dict:
+        """s_pattern: the circuit's C-semantics run with the reads it uses (a layer and position holding a circuit head)
+        given the real model's attention row, all at once and each alone, against VPD's answer the same (pattern_family),
+        on the native empty circuit's log scale."""
+        tx, ge = self.tx, self.ge
+        reads = sorted({(l, t) for l, t in S.heads.any(2).nonzero().tolist()})
+        if not reads:
+            return {"s_pattern": None, "reads_pattern": 0}
+        b = ge._pp_base(tx)
+        T = tx.T
+        causal = torch.ones(T, T, dtype=torch.bool, device=self.nat.dev).tril()
+        real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
+        draws = [real] + ([{r: real[r]} for r in reads] if len(reads) > 1 else [])
+        un = self._units([~S.heads], [~S.neurons], None)
+        kc = [float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, self.model, units=un, rows=d))[0]) for d in draws]
+        kept = tx.__dict__.setdefault("_pattern_vpd", {})
+        kv = []
+        for d in draws:
+            key = (id(tx.vpd), tuple(sorted(d)))
+            if key not in kept:
+                kept[key] = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, self.vpd, rows=d))[0])
+            kv.append(kept[key])
+        e0 = self.empty()
+        c_, v_ = float(np.mean(kc)), float(np.mean(kv))
+        return {"s_pattern": goal_eval._fid(e0, c_, v_), "_raw_pattern": goal_eval._fid_raw(e0, c_, v_), "kl_pattern_c": c_,
+                "kl_pattern_vpd": v_, "reads_pattern": len(reads), "draws_pattern": [list(x) for x in zip(kc, kv)]}
+
+    def necessity(self, sets: list[Mask]) -> list[dict]:
+        """N (necessity_spec's form): the circuit's units removed (output 0) from the real model, its damage at the
+        targets less its mean damage on necessity_spec's control texts (end-aligned), over VPD's whole answer's
+        (necessity_spec's numbers, the same controls)."""
+        tx, ge = self.tx, self.ge
+        vrow = ge.necessity_spec(tx, [native.Graph()], self.split)[0]
+        lq = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([S.heads for S in sets], [S.neurons for S in sets], None))
+        dt = self._kl(tx.ref, lq)
+        T, last = tx.T, max(tx.targets)
+        pool = [x for x in ge.far_pool(self.split) if len(x[1]) >= min(T, goal_eval.NEC_MIN_LEN) and list(x[1]) != list(tx.ids)]
+        ys = [pool[i][1] for i in np.random.default_rng([int(tx.seed), 13]).permutation(len(pool))[:goal_eval.NEC_CONTROLS]]
+        dc = []
+        for y in ys:
+            y = list(y[:last + 1])
+            d = last + 1 - len(y)
+            tg = [t - d for t in tx.targets if t >= d]
+            ones = {n: torch.ones(len(y), self.nat.C[n], dtype=torch.bool, device=self.nat.dev) for n in self.nat.names}
+            g = native.Graph(masks=ones)
+            ref = ge.graph_ref(y, tg, g)
+            lq = ge.graph_ref(y, tg, g, units=self._units([S.heads[:, d:last + 1] for S in sets], [S.neurons[:, d:last + 1] for S in sets], None))
+            dc.append(self._kl(ref, lq))
+            native.free(self.nat.dev)
+        vd = vrow["draws_n_spec"]
+        out = []
+        for b in range(len(sets)):
+            rec = [[j, c[b], v[2], dt[b], v[4]] for j, (c, v) in enumerate(zip(dc, vd))]
+            out.append({"n_spec": goal_eval._spec(rec), "_raw_n_spec": goal_eval._spec(rec, raw=True), "draws_n_spec": rec,
+                        "d_target": dt[b], "d_control": float(np.mean([r[1] for r in rec])) if rec else None,
+                        "d_target_vpd": vrow["d_target_vpd"], "d_control_vpd": vrow["d_control_vpd"]})
+        return out
+
+    def rows(self, sets: list[Mask]) -> list[dict]:
+        """Every shared family per circuit, with rl_terms (phi's unfloored scores), eps and phi over SHARED."""
+        pt, tp, pa, ns = self.point(sets), self.track_pp(sets), self.patching(sets), self.necessity(sets)
+        out = []
+        for i, S in enumerate(sets):
+            row = {"units": S.count(), "positions": len({u[2] for u in S.units()}), **pt[i], **tp[i], **pa[i], **ns[i],
+                   **self.nodes(S), **self.interchange_pp(S), **self.pattern(S), "kl_empty_live": self.empty()}
+            row["rl_terms"] = {"s_point_c": row.pop("_raw_point"), "s_nodes": row.pop("_raw_nodes", None),
+                               "s_track_pp": row.pop("_raw_track_pp", None), "s_interchange_pp": row.pop("_raw_interchange_pp", None),
+                               "s_patching_near": row.pop("_raw_patching_near", None), "s_patching_far": row.pop("_raw_patching_far", None),
+                               "s_pattern": row.pop("_raw_pattern", None), "n_spec": row.pop("_raw_n_spec", None)}
+            row.update({f"eps_{f}": v for f, v in goal_eval.family_eps(row).items()})
+            row["phi_shared"] = phi_shared(row)
+            out.append(row)
+        return out
+
+
+def phi_shared(row: dict) -> float | None:
+    """phi over the families both unit kinds have (SHARED), the row's eps."""
+    eps = goal_eval._eps(row)
+    return goal_eval._phi([(goal_eval.family_score(row, f), eps[f]) for f in SHARED if goal_eval.family_score(row, f) is not None])
+
+
+def prune_to_bits(nu: NativeUnits, positions, goals: list[float], P: int, log=None) -> dict:
+    """prune's measured pruning from every unit at the positions (each unit's measured removal from the set, least
+    first, a STEP-th at a time, rescreened as prune does), stopping at the largest set within each goal's bits
+    (native_bits): {goal: Mask}; a step never passes a goal (the fewest units that bring the set under it go)."""
+    per = nu.L * (nu.H + nu.Dm)
+    S = nu.at(positions)
+    kl = nu.kl(S)[0]
+    effect = screen(nu, S, kl, log)
+    rescreened = {n for n in RESCREEN if S.count() <= n}
+    out, todo = {}, sorted(goals, reverse=True)
+
+    def bits_of(m):
+        return native_bits(m, nu.targets, P, per)
+
+    while todo:
+        b = bits_of(S)
+        while todo and b <= todo[0]:
+            out[todo.pop(0)] = S
+        if not todo or S.count() == 0:
+            break
+        order = sorted(S.units(), key=lambda u: effect.get(u, -math.inf))
+        k = max(1, S.count() // STEP)
+        if bits_of(S.without(order[:k])) <= todo[0]:  # the fewest that bring it under the goal
+            lo, hi = 0, k
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                lo, hi = (lo, mid) if bits_of(S.without(order[:mid])) <= todo[0] else (mid, hi)
+            k = hi
+        S = S.without(order[:k])
+        kl = nu.kl(S)[0]
+        if log:
+            log(f"  {S.count():7d} units  {bits_of(S):.0f} bits  KL {kl:.4g}")
+        due = [t for t in RESCREEN if S.count() <= t and t not in rescreened]
+        if (due or S.count() <= FINE) and S.count() > 0:
+            rescreened |= set(due)
+            effect = screen(nu, S, kl, log)
+    return out
+
+
+def from_units(nu: NativeUnits, units: list) -> Mask:
+    m = Mask(torch.zeros(nu.L, nu.T, nu.H, dtype=torch.bool, device=nu.nat.dev),
+             torch.zeros(nu.L, nu.T, nu.Dm, dtype=torch.bool, device=nu.nat.dev))
+    for kind, l, t, j in units:
+        (m.heads if kind == "head" else m.neurons)[l, t, j] = True
+    return m
+
+
+def phi_report(split: str, n: int, vpd: Path, influential: Path, out: Path, teach: list[Path] = (), ratios=(0.5, 1.0, 2.0),
+               offset: int = 0, stride: int = 1, log=print) -> None:
+    """Native units against VPD's subcomponents under phi (the lead's 10-12) on the split's first n texts: the text's
+    influential set (a complete node set of VPD's subcomponents, scored by GoalEval.fidelity on the eval draws, flips
+    and the step adversary left out) and native circuits at its bits times each ratio (native_bits against
+    size_bits): the measured pruning at the influential set's positions (prune_to_bits) and, given native teacher rows
+    (teach_all's), the teacher path's step nearest in bits. One row per circuit appended to OUT: kind, units or
+    nodes, bits, every shared family with its records, phi_shared (phi over SHARED) and, for VPD's, its full phi."""
+    ge = goal_eval.GoalEval()
+    nat = ge.nat
+    saved = torch.load(vpd)
+    paths = {}
+    for f in teach:
+        for x in Path(f).read_text().splitlines():
+            if x.strip():
+                r = json.loads(x)
+                paths[r["task"]] = r["path"]
+    done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
+    S_total = sum(nat.C.values())
+    for p in native.tasks(split)[:n][offset::stride]:
+        if p.stem in done or not (influential / f"{p.stem}.json").exists():
+            continue
+        t0 = time.perf_counter()
+        ids, targets = native.text(p)
+        tx = ge.text(ids, targets, native.task_seed(p.stem), json.loads(p.read_text()))
+        tx.vpd = {m: torch.zeros(tx.T, nat.C[m], dtype=torch.bool, device=nat.dev) for m in nat.names}
+        for m, (t, c) in saved[p.stem]["answer"].items():
+            tx.vpd[m][t.long().to(nat.dev), c.long().to(nat.dev)] = True
+        g, _ = goal_eval.circuit(json.loads((influential / f"{p.stem}.json").read_text()), targets, nat.C, tx.T)
+        P = nat.positions(targets)
+        B = goal_eval.size_bits(g, P, S_total, targets, active=tx.vpd)
+        vrow = ge.fidelity(tx, [g], None, split="eval")[0]
+        rows = [{"kind": "vpd influential", "nodes": g.count(), "bits": B, **vrow, "phi": goal_eval.phi(vrow)[0],
+                 "phi_shared": phi_shared(vrow)}]
+        nu = NativeUnits(nat, ids, targets)
+        per = nu.L * (nu.H + nu.Dm)
+        positions = sorted({t for _, t, _ in g.node_set()})
+        got = prune_to_bits(nu, positions, [r * B for r in ratios], P)
+        sets, kinds = [], []
+        for r in ratios:
+            if r * B in got:
+                sets.append(got[r * B])
+                kinds.append(f"native positions x{r:g}")
+        if p.stem in paths:
+            steps = [(from_units(nu, [tuple(u) for u in s["units"]])) for s in paths[p.stem]]
+            sb = [native_bits(m, targets, P, per) for m in steps]
+            for r in ratios:
+                i = min(range(len(steps)), key=lambda j: abs(math.log(max(sb[j], 1.0) / (r * B))))
+                sets.append(steps[i])
+                kinds.append(f"native teacher x{r:g}")
+        if sets:
+            for kind, m, row in zip(kinds, sets, NativePhi(ge, tx, "eval").rows(sets)):
+                rows.append({"kind": kind, "bits": native_bits(m, targets, P, per), "units_list": m.units(), **row})
+        with open(out, "a") as fh:
+            for row in rows:
+                fh.write(json.dumps({"task": p.stem, **row}) + "\n")
+        if log:
+            log(f"{p.stem}: VPD {g.count()} nodes {B:.0f} bits phi_shared {rows[0]['phi_shared']}; "
+                + "; ".join(f"{r['kind']} {r.get('units')} units {r['bits']:.0f} bits phi_shared {r['phi_shared']}" for r in rows[1:])
+                + f"  ({time.perf_counter() - t0:.0f} s)")
+
+
 # ---- the comparison table
 
 
@@ -686,7 +1127,20 @@ def main():
     q.add_argument("--n", type=int, default=20)
     q.add_argument("--out", type=Path)
     q.add_argument("--reuse", type=Path, help="an earlier compare --out: its teacher and VPD order rows are kept")
+    f = sub.add_parser("phi", help="native units against VPD's influential sets under phi's shared families at equal bits")
+    f.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
+    f.add_argument("--n", type=int, default=20)
+    f.add_argument("--offset", type=int, default=0)
+    f.add_argument("--stride", type=int, default=1)
+    f.add_argument("--vpd", type=Path, required=True, help="VPD's answers saved by teacher.py --save-vpd")
+    f.add_argument("--influential", type=Path, required=True, help="the influential sets' directory (<task>.json)")
+    f.add_argument("--teach", type=Path, nargs="*", default=[], help="native teacher rows (teach's OUT.jsonl)")
+    f.add_argument("--ratios", type=float, nargs="*", default=[0.5, 1.0, 2.0])
+    f.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
+    if args.cmd == "phi":
+        phi_report(args.split, args.n, args.vpd, args.influential, args.out, args.teach, tuple(args.ratios), args.offset, args.stride)
+        return
     if args.cmd == "compare":
         rows = compare(args.native, args.teacher, args.split, args.n, reuse=args.reuse)
         if args.out:

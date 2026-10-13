@@ -953,7 +953,8 @@ class GoalEval:
     def graph_ref(self, ids: list[int], targets: list[int], graph: native.Graph, u: dict | None = None, live: bool = True,
                   record: dict | None = None, patch: dict | None = None, cuts: dict | None = None,
                   reads: list | None = None, norms: dict | None = None, freeze: str = "",
-                  rows: dict | None = None, rest: dict | None = None, hold: bool = False) -> torch.Tensor:
+                  rows: dict | None = None, rest: dict | None = None, hold: bool = False, units: dict | None = None,
+                  capture: dict | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of a stated graph's run in C's semantics (the lead's decision, 10-12):
         inside the circuit, graph semantics, each circuit node reading the full residual stream less the outputs of the
         circuit nodes that are not its stated parents (the background and its stated parents; a value's share through
@@ -974,7 +975,13 @@ class GoalEval:
         holds instead (a run recorded first: the norm diagnostic). rows: {(layer, t): [H, t + 1]} attention rows used
         in place of the run's own at those reads (pattern_family). rest: receives each site's remainder output {site:
         [B, T, d_out]} (live); with hold, every remainder outputs rest's values instead (a run of the whole model on the
-        text recorded first: the remainders held at their values on x, point_remainders)."""
+        text recorded first: the remainders held at their values on x, point_remainders). units: the model's own units
+        (native_units: an attention head at a position, a post-GELU neuron at a position) replaced, {"head": (mask [B,
+        layers, T, H], values or None), "neuron": (mask [B, layers, T, d_mlp], values [B or 1, layers, T, d_mlp] or
+        None)}: with values (a held head: {"q", "k", "v" before the rotation, "out" before the output matrix: [B or 1,
+        layers, H, T, hd]}) the unit takes them, without them its output is 0 (a head's query, key and value stay its
+        own). capture: receives those values of the run {"q", "k", "v", "out": [B, layers, H, T, hd], "neuron": [B,
+        layers, T, d_mlp]}."""
         import vpd_model
 
         nat, tg = self.nat, self.nat.target
@@ -1001,6 +1008,11 @@ class GoalEval:
         for (n, t, c), v in (patch or {}).items():
             fixed.setdefault(n, {})[(t, c)] = v
         B = 1 if u is None else next(iter(u.values())).shape[0]
+        if units:
+            B = max(B, max(m.shape[0] for m, _ in units.values()))
+        cap = {k: [] for k in ("q", "k", "v", "out", "neuron")} if capture is not None else None
+        hm, hv = units.get("head", (None, None)) if units else (None, None)
+        nmk, nv = units.get("neuron", (None, None)) if units else (None, None)
         if graph.complete:
             circ = {n: m.float() for n, m in self.masks(graph, T).items()}
         else:
@@ -1049,6 +1061,13 @@ class GoalEval:
             z = norm(x, tg.norms[2 * i], ("attn", i))
             resid = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i], ("attn", i), r[1])  # noqa: E731
             q, k, v = (site(nm[kk], z, resid).view(B, T, H, hd).transpose(1, 2) for kk in ("q_proj", "k_proj", "v_proj"))
+            if hm is not None:
+                mh = hm[:, i].transpose(1, 2)[..., None]  # [B, H, T, 1]
+                if hv is not None:
+                    q, k, v = (torch.where(mh, hv[kk][:, i], y) for kk, y in (("q", q), ("k", k), ("v", v)))
+            if cap is not None:
+                for kk, y in (("q", q), ("k", k), ("v", v)):
+                    cap[kk].append(y)
             q, k = tg._rope(q, T), tg._rope(k, T)
             S = (q @ k.transpose(-1, -2)) / math.sqrt(hd)
             sp = {} if graph.complete else (getattr(graph, "pairs", None) or {})
@@ -1068,14 +1087,24 @@ class GoalEval:
                 for (layer, t), row in rows.items():
                     if layer == i:
                         P[:, :, t, :t + 1] = row
-            att = (P @ v).transpose(1, 2).reshape(B, T, -1)
+            o = P @ v  # [B, H, T, hd]
+            if hm is not None:
+                o = torch.where(mh, hv["out"][:, i] if hv is not None else o.new_zeros(()), o)
+            if cap is not None:
+                cap["out"].append(o)
+            att = o.transpose(1, 2).reshape(B, T, -1)
             share = lambda r, ws, att=att, P=P: att[:, r[1]] - sum(  # noqa: E731
                 P[:, :, r[1], w[1]].repeat_interleave(hd, dim=1) * write(w) for w in ws)
             x = x + site(nm["o_proj"], att, share)
             z2 = norm(x, tg.norms[2 * i + 1], ("mlp", i))
             resid2 = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i + 1], ("mlp", i), r[1])  # noqa: E731
             pre = site(nm["c_fc"], z2, resid2)
-            x = x + site(nm["down_proj"], vpd_model.gelu_tanh(pre),
+            gl = vpd_model.gelu_tanh(pre)
+            if nmk is not None:
+                gl = torch.where(nmk[:, i], nv[:, i] if nv is not None else gl.new_zeros(()), gl)
+            if cap is not None:
+                cap["neuron"].append(gl)
+            x = x + site(nm["down_proj"], gl,
                          lambda r, ws, pre=pre: vpd_model.gelu_tanh(pre[:, r[1]] - sum(write(w) for w in ws)))
         xt = x[:, targets]
         if cut_out:
@@ -1087,6 +1116,8 @@ class GoalEval:
         if record is not None:
             for nd in (reads if reads is not None else (sorted(graph.node_set()) if not graph.complete else [])):
                 record[nd] = a[nd[0]][:, nd[1], nd[2]].detach()
+        if cap is not None:
+            capture.update({kk: torch.stack(v, 1).detach() for kk, v in cap.items()})
         return torch.log_softmax((norm(xt, tg.ln_f, "final") @ tg.wte.T).float(), -1)
 
 
@@ -2189,7 +2220,7 @@ class GoalEval:
         for y in ys:
             y = list(y[:last + 1])
             d = last + 1 - len(y)  # the shift
-            dc.append(self._removed_kl(y, [t - d for t in tx.targets if t >= d], [{n: m[n][d:] for n in nat.names} for m in sets]))
+            dc.append(self._removed_kl(y, [t - d for t in tx.targets if t >= d], [{n: m[n][d:last + 1] for n in nat.names} for m in sets]))
         out = []
         for i in range(len(graphs)):
             rec = [[j, d[i], d[-1], dt[i], dt[-1]] for j, d in enumerate(dc)]

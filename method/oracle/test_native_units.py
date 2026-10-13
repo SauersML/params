@@ -219,3 +219,87 @@ def test_compare_and_reuse(tiny, tmp_path, monkeypatch):
     out.write_text("".join(json.dumps(r) + "\n" for r in rows))
     monkeypatch.setattr(native_units, "_vpd_side", lambda *a, **k: pytest.fail("reuse ran the VPD side"))
     assert native_units.compare(nfile, tdir, "heldout", 1, sizes=(2, 8), ge=ge, reuse=out, log=None) == rows
+
+
+@pytest.fixture(scope="module")
+def phi_text(tiny):
+    nat, ids, targets, nu = tiny
+    ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
+    g = torch.Generator().manual_seed(1)
+    tx = ge.text(ids, targets, seed=5)
+    for split, n in (("search", 6), ("eval", 5)):  # far donors in the tiny vocabulary, some shorter than the text
+        ge.donor_pools[split] = [(f"{split}{i}", torch.randint(0, 40, (8 + 2 * i,), generator=g).tolist()) for i in range(n)]
+    return ge, tx
+
+
+def test_graph_ref_units_are_native_runs(tiny, phi_text):
+    """goal_eval.graph_ref on the whole model with the units outside a set zeroed is the set's native run (the model's
+    own forward with those heads and neurons zeroed); every unit held at its own run's values is the model."""
+    nat, ids, targets, nu = tiny
+    ge, tx = phi_text
+    ph = native_units.NativePhi(ge, tx)
+    for seed in (1, 2):
+        m = random_mask(nu, seed)
+        got = ge.graph_ref(ids, targets, ph.model, units=ph._units([~m.heads], [~m.neurons], None))
+        assert torch.allclose(got, site_hooked(nat, ids, targets, m), atol=1e-4)
+    full = nu.full()
+    held = ge.graph_ref(ids, targets, ph.model, units=ph._units([full.heads], [full.neurons], ph.capture(ids)))
+    assert float(carry.kl(tx.ref, held)[0]) < 1e-6
+
+
+def test_native_bits_count_every_connection(tiny):
+    """native_bits: the units' names plus every connection the model has among them, counted pair by pair."""
+    nat, ids, targets, nu = tiny
+    m = random_mask(nu, 4, keep=0.3)
+    units = m.units()
+    rd = {"head": 0.0, "neuron": 0.5}
+    wr = {"head": 0.5, "neuron": 1.0}
+    inner = sum(1 for r in units for w in units if w[2] == r[2] and w[1] + wr[w[0]] <= r[1] + rd[r[0]])
+    inner += sum(1 for r in units for w in units if r[0] == w[0] == "head" and (w[1], w[3]) == (r[1], r[3]) and w[2] < r[2])
+    out = sum(1 for u in units if u[2] in targets)
+    n, per = len(units), nu.L * (nu.H + nu.Dm)
+    want = n * math.log2(7 * per) + math.log2(n) * (2 * inner + out)
+    assert abs(native_units.native_bits(m, targets, 7, per) - want) < 1e-6
+
+
+def test_native_units_under_phi(tiny, phi_text):
+    """NativePhi: every unit is the model (point, track_pp, interchange_pp and patching at 1 where VPD's reference is
+    defined); the families take VPD's own draws (track_pp's changed texts, the donors and their VPD references, N's
+    controls); each score is goal_eval's pooling of its records; phi_shared over SHARED from rl_terms."""
+    nat, ids, targets, nu = tiny
+    ge, tx = phi_text
+    ph = native_units.NativePhi(ge, tx)
+    full, half = nu.full(), random_mask(nu, 5)
+    rows = ph.rows([full, half])
+    f, h = rows
+    assert f["kl_point"] < 1e-5
+    for k in ("s_track_pp", "s_interchange_pp", "s_patching_near", "s_patching_far"):
+        assert f[k] is None or abs(f[k] - 1) < 1e-6, (k, f[k])
+    vpd_tp = ge.track_pp(tx, [native.Graph()], "eval", goal_eval.CHANGED_DRAWS)[0]["draws_track_pp"]
+    assert [d[0] for d in h["draws_track_pp"]] == [d[0] for d in vpd_tp] and [d[2:] for d in h["draws_track_pp"]] == [d[2:] for d in vpd_tp]
+    vd = ge.donors(tx, [native.Graph(masks=tx.vpd)], "eval", goal_eval.DONORS_NEAR, ge.far_donors(tx, ge.far_pool("eval"), goal_eval.DONORS_FAR))[0]
+    for pool in ("near", "far"):
+        kv = {json.dumps(d[0]): d[2] for d in vd.get(f"draws_patching_{pool}") or []}
+        assert all(abs(d[2] - kv[json.dumps(d[0])]) < 1e-9 for d in h.get(f"draws_patching_{pool}") or [])
+    vn = ge.necessity_spec(tx, [native.Graph()], "eval")[0]["draws_n_spec"]
+    assert [(d[2], d[4]) for d in h["draws_n_spec"]] == [(d[2], d[4]) for d in vn]
+    assert h["s_nodes"] == goal_eval._pooled("weighted", h["draws_nodes"], None)
+    assert h["s_track_pp"] == goal_eval._pooled("weighted", h["draws_track_pp"], None)
+    assert h["n_spec"] == goal_eval._spec(h["draws_n_spec"])
+    assert set(h["rl_terms"]) >= {"s_point_c", "s_nodes", "s_track_pp", "n_spec"}
+    eps = goal_eval._eps(h)
+    want = goal_eval._phi([(goal_eval.family_score(h, x), eps[x]) for x in native_units.SHARED if goal_eval.family_score(h, x) is not None])
+    assert h["phi_shared"] == want
+
+
+def test_prune_to_bits(tiny):
+    """prune_to_bits: each goal's set is within its bits and the sets shrink with the goals."""
+    nat, ids, targets, nu = tiny
+    per = nu.L * (nu.H + nu.Dm)
+    start = native_units.native_bits(nu.at([9, 10, 11]), targets, 12, per)
+    goals = [start / 4, start / 2]
+    got = native_units.prune_to_bits(nu, [9, 10, 11], goals, 12)
+    assert set(got) == set(goals)
+    for gl, m in got.items():
+        assert native_units.native_bits(m, targets, 12, per) <= gl
+    assert set(got[goals[0]].units()) <= set(got[goals[1]].units())

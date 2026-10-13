@@ -457,7 +457,7 @@ flowchart BT
   CLAIMCTRL["<b>Isolate component identity</b><br/>change indices, preserve sizes and positions;<br/>measure full output distributions afresh;<br/>reference and identity checks required<br/>IMPLEMENTED · codex"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
-  CAPABLE["<b>Can a capable model learn wiring?</b><br/>same frozen weight inputs and circuits;<br/>base vs small SFT, first answers executed;<br/>separate capacity from objective dilution<br/>PREFLIGHT · codex/fork_review"]
+  CAPABLE["<b>Can a capable model learn wiring?</b><br/>freeze identical inputs for base and SFT;<br/>execute first answers, retain full English;<br/>record drift from earlier model inputs<br/>INPUT EXPORT · codex/fork_review + eval_recovery"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]

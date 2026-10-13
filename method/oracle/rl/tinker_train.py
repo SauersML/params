@@ -62,6 +62,8 @@ THINKING_RENDERER = "qwen3"  # sample/rl --thinking: Qwen3's own reasoning befor
 # the prompt, RENDERER's way, so the targets never train thinking away: the lead's 10-12)
 CONTEXT = 32768  # Qwen3-8B's native context: a question's generation limit is at most what it leaves
 LINE_WEIGHT = 0.5  # the per-line credit's weight in a token's advantage, A + 0.5 z(c_l) (the lead's v3)
+LINE_FLOOR = 0.05  # z's spread at least this (bits): on v1 answers every line's credit was -0.000 to -0.008 (pp effects 0,
+# only the compactness term), and z of such spreads would turn noise into +-1 per line, larger than A
 ANSWER_CAP = 8000  # reward v3's answer cap in tokens after the thinking (Mermaid: the 3,500 of the id grammar x ~1.66,
 # max 7,403 over the 444 v1 targets): an answer above it counts as cut, invalid
 
@@ -150,7 +152,8 @@ def renderer_for(base: str, thinking: bool = False):
 
 def line_advantages(tokenizer, tokens: list[int], text: str, credits: list, A: float, weight: float = LINE_WEIGHT) -> list[float]:
     """Per sampled token, its advantage with the per-line credit (the lead's v3): A + weight x z(c_l) over the tokens of
-    answer line l (credits: [[line number in the answer text, c], ...], z normalized over the answer's credited lines),
+    answer line l (credits: [[line number in the answer text, c], ...], z normalized over the answer's credited lines,
+    the spread at least LINE_FLOOR),
     A alone on the thinking and on lines without credit. Lines are found by decoding the tokens after the thinking and
     counting newlines, aligned to the answer text's start."""
     adv = [A] * len(tokens)
@@ -158,7 +161,7 @@ def line_advantages(tokenizer, tokens: list[int], text: str, credits: list, A: f
     if len(cs) < 2:
         return adv
     mu = sum(cs) / len(cs)
-    sd = (sum((c - mu) ** 2 for c in cs) / len(cs)) ** 0.5 or 1.0
+    sd = max((sum((c - mu) ** 2 for c in cs) / len(cs)) ** 0.5, LINE_FLOOR)
     z = {k: (c - mu) / sd for k, c in credits}
     end = tokenizer.convert_tokens_to_ids("</think>") if hasattr(tokenizer, "convert_tokens_to_ids") else None
     start = (len(tokens) - tokens[::-1].index(end)) if end is not None and end in tokens else 0

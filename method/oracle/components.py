@@ -145,7 +145,9 @@ QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")  # a token's repr
 
 V3_INVALID = -10.0  # reward v3 of an invalid answer: below every valid one (phi of a family at s = -100 is about -6.7)
 NODE_CAP = 266  # reward v3's hard cap on an answer's nodes (an answer above it is invalid)
-GATE_SLOPE = 4.0  # reward v3's gate g = 1 / (1 + 2^(-4 (phi - phi_tau))): 0.06 one bit short of the bar
+GATE_SLOPE = 10.0  # reward v3's gate g = 1 / (1 + 2^(-10 (phi - phi_tau))): 0.001 one bit short of the bar, 0.15 a quarter
+# bit short. At 4 (the first setting), v1 answers 1.3 bits short kept g = 0.03, and g x 0.5 compact (compact up to ~16
+# bits) gave them 0.10-0.13, more than the phi gaps between them: 3-node RL answers tied 42-node SFT ones (10-12)
 POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # C's flip adversary's pattern pool (goal_eval.fidelity)
 CONVENTION = "live"  # goal_eval's remainders convention for the reward's F1 and N: on, computing on the run's inputs
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
@@ -1498,7 +1500,7 @@ def softplus(x: float) -> float:
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            convention: str = CONVENTION, cache: dict | None = None, ee=None, edit_best: dict | None = None,
            pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None,
-           lines: bool = False) -> list[dict]:
+           lines: bool = False, node_cap: int | None = NODE_CAP) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
     in bits, every term ranking, nothing clipped flat): R = phi + g x Q + D.
       phi: goal_eval.phi of the answer's reward-mode row, -log2 of the power-4 mean of the families' residuals
@@ -1516,7 +1518,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
       D = softplus(2 m) / 2 with m = min(phi - phi_T, compact - compact_T) against the text's teacher circuit
         (teacher: its JSON): near 0 unless the answer beats it on both.
     An answer is invalid, R = V3_INVALID below every valid one, without a CIRCUIT section, a FINAL line per question
-    or an EDIT line per edit request, cut at the sampling cap or over it (truncated), or above NODE_CAP nodes.
+    or an EDIT line per edit request, cut at the sampling cap or over it (truncated), or above node_cap nodes (None: no
+    cap, for references such as the influential start). The empty circuit has no compactness (0 bits); its D compares
+    phi alone (its compactness counts as beating the teacher's), so D is continuous down to it.
     Reported beside R: phi, phi_tau, g, faithful (phi >= phi_tau), bits, bits_start, compact, D, Q, each term
     (term_E2g, term_E4x, term_E1), and goal_eval's C (term_C, c_rl as term_C_rl), F1, N, F3, the old E2 (qa_term:
     from the no-change answer), E3, E4 (the scorer's headline), the per-question detail (qa), and C's members and
@@ -1542,7 +1546,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         defects.append((d["invalid_nodes"] + p["unknown_ids"], d["invalid_edges"], dropped_bits(p["answer"], g, d, P, total) + junk))
         valid.append(p["circuit"] and all(n in p["finals"] for n in range(1, len(ev["qa"]) + 1))
                      and all(n in p["edits"] for n in range(1, len(ev.get("edits") or []) + 1)) and not (truncated and truncated[i])
-                     and g.count() <= NODE_CAP)
+                     and (node_cap is None or g.count() <= node_cap))
     keep = [i for i, v in enumerate(valid) if v]  # an invalid answer's reward is fixed whatever it measures: not run
     pool = _pool() if pool is None else pool
     if keep:
@@ -1583,7 +1587,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             g = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-GATE_SLOPE * (ph - pt)))
             terms = {"E2g": e2g[i]["E2g"] if i in e2g else None, "E4x": e4x.get(i), "E1": row["E1"]}
             Q = 0.5 * (comp or 0.0) + sum(v for v in terms.values() if v is not None)
-            m = None if ref is None or ph is None or comp is None else min(ph - ref["phi"], comp - ref["compact"])
+            dc = comp - ref["compact"] if ref is not None and comp is not None else (math.inf if b <= 0 else None)
+            m = None if ref is None or ph is None or dc is None else min(ph - ref["phi"], dc)
             D = 0.0 if m is None else softplus(2.0 * m) / 2.0
             r = (ph or 0.0) + (g or 0.0) * Q + D
             circ = (ph or 0.0) + (g or 0.0) * 0.5 * (comp or 0.0) + D
@@ -2443,7 +2448,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
         sizes = [y.get("nodes") or 0 for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1])]
         names = baseline_texts(ge, task, sizes, cache.get(task["id"]))
         for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()), split="eval",
-                                                      teacher=teachers.get(p.stem) if teachers else None)):
+                                                      teacher=teachers.get(p.stem) if teachers else None, node_cap=None)):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
             base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),
                                                     **{k: r.get(k) for k in ("phi", "phi_tau", "g", "compact", "bits", "D")}}

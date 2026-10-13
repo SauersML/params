@@ -75,6 +75,36 @@ def test_same_units_different_wiring_changes_execution(pair):
     assert full["per_text"][0]["edges"] > cut["per_text"][0]["edges"]
 
 
+def test_training_wiring_reward_executes_edges_and_rejects_partial_invalid(pair, monkeypatch):
+    import planted
+    import train
+
+    toy, nat = pair
+    monkeypatch.setattr(planted, "native_of", lambda sd, cfg: nat)
+    # Collision with legacy name cache must not select another model's decomposition.
+    toy.name = "same-name"
+    monkeypatch.setitem(reward_exec._CACHE, toy.name, {"nat": object()})
+    reward = train.get_reward("wiring_suff")
+    assert reward is reward_exec.reward_wiring_suff
+    assert train.get_reward("exec") is reward_exec.reward_exec
+    full = reward({"toy": toy}, FULL)
+    cut = reward({"toy": toy}, CUT)
+    assert full > .999 and 0 <= cut < full
+    for answer in ("unparseable", FULL + "\nL0N999 --> out", FULL + "\nunknown --> out"):
+        assert reward({"toy": toy}, answer) == -1 < cut
+
+
+def test_training_wiring_reward_penalizes_one_failed_text(monkeypatch):
+    toy = SimpleNamespace(texts=[[1], [2]], meta={})
+    calls = []
+    def measured(got_toy, completion, *, texts):
+        calls.append((got_toy, texts))
+        return {"per_text": [{"suff": 1.0}, {"suff": 0.0}]}
+    monkeypatch.setattr(reward_exec, "score_wiring", measured)
+    assert reward_exec.reward_wiring_suff({"toy": toy}, FULL) == .25
+    assert calls == [(toy, toy.texts)]
+
+
 def test_wrong_direction_and_unknown_unit_rejected(pair):
     toy, _ = pair
     for text in ("flowchart LR\nL1N0 --> L0N0\nL0N0 --> out",

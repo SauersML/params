@@ -105,6 +105,26 @@ def reward_exec(meta: dict, completion: str) -> float:
     return score(meta["toy"], c.units)["reward"]
 
 
+def reward_wiring_suff(meta: dict, completion: str) -> float:
+    """Opt-in stated-wiring prediction objective: half mean, half worst-text sufficiency.
+
+    Use texts_of's existing input bank and a fresh native for the exact toy weights;
+    never reuse the legacy name-keyed cache. Valid scores are in [0, 1], invalid
+    circuits score -1. No size cost, English, necessity or intervention certificate.
+    """
+    parsed = circuit.parse(completion)
+    if not parsed.ok or parsed.bad:
+        return -1.0
+    try:
+        scored = score_wiring(meta["toy"], completion, texts=texts_of(meta["toy"]))
+    except ValueError:
+        return -1.0  # invalid wiring on any text invalidates the whole answer
+    suff = [row["suff"] for row in scored["per_text"]]
+    if not suff or any(not math.isfinite(x) or not 0.0 <= x <= 1.0 for x in suff):
+        raise ValueError("wiring scorer returned invalid sufficiency measurements")
+    return (sum(suff) / len(suff) + min(suff)) / 2
+
+
 def score_wiring(toy, completion: str, *, nat=None, texts=None) -> dict:
     """Independent point-sufficiency diagnostic for the stated inter-unit wiring.
 

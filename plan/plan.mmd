@@ -1,4 +1,13 @@
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
+%% 2026-10-13 controlled wiring pilot: a497153, GHA38397963195 six checks plus frozen-data preflight pass.
+%% Four fresh Qwen3-8B adapters clone one saved seed0 initialization and optimizer: K-control/V-support x loss1/8.
+%% Each gets original226 plus30 checked examples,64 updates; all24 first greedy answers retained, primary relation8.
+%% Exact upper $1.19881788, root GO within existing shared40; local memory admission precedes API launch.
+%% Evaluate point fidelity AND fixed-basis deletion/half-scale KL. Deletion-only top accuracy concealed prior SFT failures.
+%% English diagnostic is independent:512 frozen prompts, Kimi nonthinking, generated/none/shuffled/GT-positive.
+%% Cost preflight $0.675792;12 changed-top cases per condition; no-change already116/128. Require GT reader control.
+%% Geometry inputs: all267 labels retained; exact-fact32k common fit is249 across83 complete triplets,42 DEV conditions.
+%% Lossless tables did not recover a complete triplet; no labels or members dropped to force fit. Training unlaunched.
 %% 2026-10-13 CAPCF: ec2ff4cf / GHA38393326675, fixed cd8d4a9 executor, four reused-development multihop toys.
 %% All 8 architectural heads x scales {0,0.5} x 28 inputs per toy = 1792 input/edit pairs, not 1792 independent weight edits.
 %% 448 pairs change dense output by >=1e-3 bits; base unit wiring gets448/448 tops, worstKL0.00014845; SFT252/448.
@@ -462,11 +471,12 @@ flowchart BT
   CLAIMFIT["<b>Carrier size remains the limit</b><br/>53% compression; further4.7% adds no rows;<br/>2 of15 exact rows fit training limits;<br/>next: smaller verified carrier sets<br/>AUDIT DONE · codex/variable_reward"]
   CLAIMQA["<b>Learn measured transplant effects</b><br/>147 fit with archived hints;16 hard rows;<br/>independent readback preserves all labels;<br/>partial coverage and ID limits explicit<br/>DATA READY · codex/variable_reward"]
   CLAIMCTRL["<b>Component identity changes behavior</b><br/>89 cases, counts and positions held fixed;<br/>permutations change 79/89 and 76/89 tops;<br/>use matched cases to test weight grounding<br/>MEASURED · codex/variable_reward"]
-  CLAIMGROUND["<b>Can the oracle use weight information?</b><br/>267 outcomes; keep text groups together;<br/>compare identical inputs with and without<br/>fresh weight and baseline activation facts<br/>BUILDING · codex/variable_reward"]
+  CLAIMGROUND["<b>Can the oracle use weight information?</b><br/>249 matched outcomes fit exact facts;<br/>42 held-out conditions, fixed text groups;<br/>compare facts, IDs and identical-input controls<br/>DATA READY · codex/variable_reward"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
-  CAPABLE["<b>Recover executable wiring in training</b><br/>SFT relation F1 .50 to .25; arrows get 4.1% loss;<br/>no positive V-route examples in TRAIN;<br/>prepare loss balance × routing support pilot<br/>PREPARING · codex/fork_review"]
+  CAPABLE["<b>Recover executable wiring in training</b><br/>4 matched runs: loss balance × V examples;<br/>same initialization,64 updates each;<br/>judge wiring and weight-edit fidelity<br/>LAUNCH AUTHORIZED · codex/fork_review · ≤$1.20"]
   CAPCF["<b>Base circuits predict weight edits</b><br/>4 toys, 448 affected input/edit pairs;<br/>base 448/448 tops, worst KL0.00015 bits;<br/>SFT 252/448; preserve this causal ability<br/>MEASURED · codex/eval_recovery"]
+  CAPENG["<b>Does the English predict edits?</b><br/>Generated, absent, shuffled, correct prose;<br/>independent reader on changed outputs;<br/>correct-prose control checks reader ability<br/>PREFLIGHT PASSED · codex/eval_recovery · ≤$0.68"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
@@ -609,6 +619,8 @@ flowchart BT
   CAPABLE -. executed circuits and cost .-> C1
   CAPABLE -. test retained base capability .-> CAPCF
   CAPCF -. intervention fidelity evidence .-> C1
+  CAPCF --> CAPENG
+  CAPENG -. explanation evidence .-> C2
   WIRING -. opt-in wiring objective .-> R1
   %% FEEDBACK: REM -. tests .-> PHI
   VPD --> ENG
@@ -682,3 +694,5 @@ flowchart BT
   class TXT,SP5,k0,k7 note
 
   %% Avoid link-number critical paths: new parallel edges must not recolor unrelated dependencies.
+
+  class CAPENG active

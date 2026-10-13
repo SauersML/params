@@ -12,6 +12,10 @@ Beside them, A's variables on A (their recorded eval-split scores) and B's own v
 
   var_transfer.py run FAMILY SOURCE   -> DATA/var_transfer.jsonl (both variable sets of SOURCE on every other member)
   var_transfer.py report
+  var_transfer.py run2 FAMILY SOURCE  -> var_transfer_v2.jsonl: varteach's influential_v2 variables, each scored alone
+                                         on up to 4 other members (the lead's keep rule: a variable is kept when its
+                                         carrier transfers within its family)
+  var_transfer.py report2             -> DATA/var_transfer_v2_keep.json, per variable whether it transfers
 """
 import argparse
 import collections
@@ -124,6 +128,115 @@ def run(family: str, source: str):
                                             if k in ("e4", "f_on", "s_off", "accuracy", "acc_alike", "acc_changed", "acc_named_token")}, flush=True)
 
 
+V2 = VARS / "influential_v2"  # varteach's variables on fleet's influential_v2 circuits (train and heldout)
+
+
+def mapped_values(var: dict, ta: int, tb: int, ids_b: list) -> list | None:
+    """var's value map moved to B by offset, with the class holding B's own token there first (the classes B's token
+    shares); None when B's token is in no class (the map says nothing about B there)."""
+    out = []
+    for vm in var.get("values") or []:
+        pos = tb - (ta - int(vm["position"]))
+        if pos < 1:
+            return None
+        cls = [[int(z) for z in c.get("token_ids", [])] for c in vm.get("classes", [])]
+        own = next((i for i, c in enumerate(cls) if ids_b[pos] in c), None)
+        if own is None:
+            return None
+        out.append({"position": pos, "classes": [{"token_ids": cls[own]}] + [{"token_ids": c} for i, c in enumerate(cls) if i != own]})
+    return out
+
+
+def run2(family: str, source: str, max_targets: int = 4):
+    """Each of SOURCE's influential_v2 variables mapped by offset onto up to max_targets other members of its family
+    and scored there one by one in the real model (variables.Scorer, eval split; the value map too when B's token falls
+    in one of its classes): per variable and target f_on, f_off, f_same and their min (its E4 term) -> var_transfer_v2.jsonl
+    (GEN_OUT when set). A variable transfers when its term holds on the family's other texts (report2)."""
+    import goal_eval
+    import variables
+
+    fams = json.loads((DATA / "families.json").read_text())
+    src_path = next((V2 / s / f"{source}.json" for s in ("train", "heldout") if (V2 / s / f"{source}.json").exists()), None)
+    if src_path is None:
+        return
+    members = [t for t in fams[family] if t != source][:max_targets]
+    out = Path(os.environ.get("GEN_OUT", DATA)) / f"var_transfer_v2{os.environ.get('GEN_TAG', '')}.jsonl"
+    done = {(r["source"], r["target"]) for r in map(json.loads, out.read_text().splitlines())} if out.exists() else set()
+    ge = goal_eval.GoalEval(native.Native())
+    ge.nat.LENGTHS_KEPT = 1
+    nat = ge.nat
+    sc = variables.Scorer(ge)
+    ta = target(source)
+    src = json.loads(src_path.read_text())["variables"]
+    for b in members:
+        if (source, b) in done:
+            continue
+        pb = TEXTS / f"{b}.json"
+        ids, targets = native.text(pb)
+        tb = targets[-1]
+        vs, meta = [], []
+        for v in src:
+            m = mapped(v, ta, tb)
+            if m is None:
+                continue
+            vals = mapped_values(v, ta, tb, ids) if v.get("values") else None
+            if vals:
+                m["values"] = vals
+            vs.append(m)
+            meta.append({"name": v["name"], "kind": v.get("kind"), "value_kind": v.get("value_kind"), "with_values": bool(vals),
+                         "source_eval": (v.get("measured") or {}).get("eval", {}).get("term"), "inputs_offset": [ta - int(p) for p in v["inputs"]]})
+        row = {"family": family, "source": source, "target": b, "variables": len(src), "mapped": len(vs), "per_variable": []}
+        if vs:
+            tx = ge.text(ids, targets, native.task_seed(b), json.loads(pb.read_text()))
+            res = sc.score(tx, variables.parse(vs, nat.C), "eval", 8)
+            for mt, x in zip(meta, res.get("variables", [])):
+                term = 0.0 if x.get("f_on") is None else min(y for y in (x["f_on"], x.get("f_off"), x.get("f_same")) if y is not None)
+                row["per_variable"].append({**mt, "f_on": x.get("f_on"), "f_off": x.get("f_off"), "f_same": x.get("f_same"), "term": term})
+            row["e4"] = res.get("e4")
+            ge.probes.clear()
+            native.free(nat.dev)
+        with out.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        print(family, source, b, "e4", row.get("e4"), flush=True)
+
+
+def report2(keep: float = 0.8):
+    """Per variable: its own eval term (varteach's) and its terms on the family's other texts; it transfers when the
+    median of those reaches keep. Summaries by kind (input, intermediate) and family."""
+    import templates
+
+    rows = []
+    for p in [DATA / "var_transfer_v2.jsonl"] + templates.run_outputs("var_transfer_v2*.jsonl"):
+        if p.exists():
+            rows += [json.loads(x) for x in p.read_text().splitlines()]
+    per = collections.defaultdict(list)
+    info = {}
+    for r in rows:
+        for x in r["per_variable"]:
+            key = (r["family"], r["source"], x["name"])
+            per[key].append(x["term"])
+            info[key] = x
+    out = []
+    for key, terms in per.items():
+        x = info[key]
+        out.append({"family": key[0], "source": key[1], "name": key[2], "kind": x["kind"], "value_kind": x["value_kind"],
+                    "own_eval": x["source_eval"], "transfer_median": float(np.median(terms)), "targets": len(terms),
+                    "transfers": float(np.median(terms)) >= keep})
+    (DATA / "var_transfer_v2_keep.json").write_text(json.dumps(out, indent=1))
+    print(f"{len(out)} variables from {len({(o['family'], o['source']) for o in out})} texts; a variable transfers when the median "
+          f"of its E4 term on its family's other texts is >= {keep}")
+    for kind in ("input", "intermediate"):
+        os_ = [o for o in out if o["kind"] == kind]
+        if os_:
+            print(f"  {kind:12s} {len(os_):4d}: transfer {np.mean([o['transfers'] for o in os_]):.2f}; own eval term median "
+                  f"{np.median([o['own_eval'] for o in os_ if o['own_eval'] is not None]):.2f}, on other texts median "
+                  f"{np.median([o['transfer_median'] for o in os_]):.2f}")
+    for f in sorted({o["family"] for o in out}):
+        os_ = [o for o in out if o["family"] == f]
+        print(f"  {f:22s} {len(os_):3d} variables, transfer {np.mean([o['transfers'] for o in os_]):.2f} "
+              f"(intermediate {np.mean([o['transfers'] for o in os_ if o['kind'] == 'intermediate']) if any(o['kind'] == 'intermediate' for o in os_) else float('nan'):.2f})")
+
+
 _TK = []
 
 
@@ -155,7 +268,7 @@ def report():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("run", "report"))
+    ap.add_argument("cmd", choices=("run", "report", "run2", "report2"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
-    run(*a.args) if a.cmd == "run" else report()
+    {"run": lambda: run(*a.args), "report": report, "run2": lambda: run2(*a.args), "report2": report2}[a.cmd]()

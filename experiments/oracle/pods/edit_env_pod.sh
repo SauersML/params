@@ -7,8 +7,8 @@
 # Everything comes back to ~/mpd-data/runpod/NAME/out (prefs.jsonl, goals.jsonl, edits.jsonl, gate.jsonl, sft.jsonl,
 # gate.txt).
 #   experiments/oracle/pods/edit_env_pod.sh [NAME] [HOURS]      env: K, P, CACHE, VRAM, STEPS, GPU, PRICE, PREFS
-# PREFS=FILE skips the preference stage (an earlier run's prefs.jsonl). The whole script is one block, so bash has read
-# all of it before it runs.
+# PREFS=FILE skips the preference stage (an earlier run's prefs.jsonl); EDITS=FILE with it skips the edit stage too (an
+# earlier run's edit rows: the gate alone). The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
 spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
@@ -32,6 +32,12 @@ if [ -n "${PREFS:-}" ]; then
 else
   PREF_STAGE="$PREF_RUNS wait; cat $(for k in $(seq 0 $((P - 1))); do printf '%s ' "$O/out/prefs_$k.jsonl"; done) > $O/out/prefs.jsonl;"
 fi
+if [ -n "${EDITS:-}" ]; then
+  cp "$EDITS" "$F/edits.jsonl"
+  EDIT_STAGE="cp $F/edits.jsonl $O/out/edits.jsonl;"
+else
+  EDIT_STAGE="$EDIT_RUNS wait; cat $(for k in $(seq 0 $((P - 1))); do printf '%s ' "$O/out/edit_$k.jsonl"; done) > $O/out/edits.jsonl;"
+fi
 ORDER='import json, sys
 g = [json.loads(x) for x in open(sys.argv[1])]
 with open(sys.argv[2], "w") as f:
@@ -45,8 +51,7 @@ cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,no
 set +e; $PREF_STAGE
 test -s $O/out/prefs.jsonl || { echo 'no preferences'; exit 1; };
 $ENV goals $O/out/prefs.jsonl $O/out/goals.jsonl; python -c '$ORDER' $O/out/goals.jsonl $O/out/prefs_ordered.jsonl;
-$EDIT_RUNS wait;
-cat $(for k in $(seq 0 $((P - 1))); do printf '%s ' "$O/out/edit_$k.jsonl"; done) > $O/out/edits.jsonl;
+$EDIT_STAGE
 $ENV gate $O/out/goals.jsonl $O/out/edits.jsonl $O/out/gate.jsonl --sft $O/out/sft.jsonl --device cuda > $O/out/gate.txt 2>&1; tail -n 12 $O/out/gate.txt; echo all stages done"
 RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-24} RP_MIN_RAM_GB=32 RP_DISK_GB=40 \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA GeForce RTX 4090,NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA RTX A4500,NVIDIA L4}" $H -- bash -c "$CMD"

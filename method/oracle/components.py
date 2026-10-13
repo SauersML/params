@@ -2151,7 +2151,7 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
             else:
                 continue
             task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
-            if answer.get("nodes") and not answer.get("edges"):
+            if answer.get("nodes") and not answer.get("edges") and not answer.get("complete"):  # a complete set's edges are implied
                 if ge is None:
                     raise ValueError(f"{js} states no edges: with_edges() needs the model (pass ge)")
                 answer = with_edges(ge, task, r, answer)

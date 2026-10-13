@@ -21,8 +21,11 @@
 #   of saved paths, teacher.py --from-path: only texts with a <task>.path.json there are taught, and each pod gets its
 #   texts' path, F1 and top-k files as one tar), EXTRA (more inputs the pod needs at their ~/mpd-data paths, e.g. the
 #   adversary's pool goal_eval/ci_patterns_train.pt for --repair), SELF_END_MIN (minutes after its teacher processes end
-#   that a pod deletes itself if the Mac has not reaped it: a Mac or network outage then stops the bill at the texts' end,
-#   not at HOURS; outputs not yet synced by then are lost)
+#   that a pod stops itself if the Mac has not reaped it: a Mac or network outage then stops the GPU bill at the texts'
+#   end, not at HOURS, and the circuits stay on /workspace until rp-run's reaper starts the pod, copies them and deletes
+#   it: RP_SELF_STOP, self_stop.sh). A community host may give the stopped pod's GPU away, and RunPod starts it again
+#   only when that host has a GPU free (10-13 test: "not enough free GPUs on the host machine"), so the copy can wait
+#   until then (rp-run stop NAME retries); the circuits are not lost meanwhile
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params
@@ -108,11 +111,11 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 $PRE
 ${FROM:+mkdir -p ~/from; tar -xzf $F/from_$j.tgz -C ~/from;}
 cd /Users/user/params/method/oracle; $LOC
-set +e; $RUNS wait; echo all teacher processes done; ${SELF_END_MIN:+(setsid nohup bash -c \"sleep $((SELF_END_MIN * 60)); runpodctl remove pod \\\"\\\$RUNPOD_POD_ID\\\" || runpodctl pod delete \\\"\\\$RUNPOD_POD_ID\\\"\" > /dev/null 2>&1 < /dev/null &);} F=0; $FAILED exit \$F"
+set +e; $RUNS wait; echo all teacher processes done; ${SELF_END_MIN:+(setsid nohup bash /Users/user/params/experiments/oracle/pods/self_stop.sh $SELF_END_MIN > /dev/null 2>&1 < /dev/null &);} F=0; $FAILED exit \$F"
   (  # community stock comes and goes: a launch that finds no card in stock, or a host whose download of the published
      # inputs came out corrupted, is retried every 3 minutes for WAIT minutes
     for try in $(seq 1 $(( ${WAIT:-180} / 3 ))); do
-      env ${REF:+RP_REF=$REF} RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=${RAM:-16} \
+      env ${REF:+RP_REF=$REF} ${SELF_END_MIN:+RP_SELF_STOP=1} RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=${RAM:-16} \
         experiments/infra/runpod/rp-run $NAME "$GPU" "$H" -- bash -c "$CMD" > "$F/rp_$j.log" 2>&1 && break
       grep -qE "in stock on a working host|differs from its sha256" "$F/rp_$j.log" || break
       cat "$F/rp_$j.log" >> "$F/rp_$j.nostock.log"; sleep 180

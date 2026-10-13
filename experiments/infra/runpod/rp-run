@@ -26,7 +26,9 @@
 # deletes the pod HOURS after the first pod's creation (a watcher process that outlives this one),
 # and each pod deletes itself when that time is up by its own clock (runpodctl with the pod's own
 # key; a Thunder or Nebius machine shuts down, which ends its GPU's bill), so a Mac that sleeps,
-# disconnects or dies still stops the bill.
+# disconnects or dies still stops the bill. A command may also end its pod itself by stopping it (runpodctl stop pod,
+# /workspace kept: teacher_pod.sh SELF_END_MIN) when the run sets RP_SELF_STOP=1; such a pod is started, its outputs
+# copied, and only then deleted (recover_stopped).
 #
 # A pod lost before COMMAND ends (a host that fails, a pod deleted elsewhere) is replaced while time
 # remains. The new pod gets the same source, binaries and inputs and the outputs synced so far, and
@@ -573,6 +575,51 @@ holders() {  # POD
 # cost in the ledger once. Safe to run twice at once (the run's exit and its watcher). A pod that is
 # not ours is never deleted: its record is dropped and the refusal printed. A pod another live run
 # still uses is kept for it (the last run to leave deletes it), except at the pod's cap (cap).
+# A run launched with RP_SELF_STOP=1 (teacher_pod.sh SELF_END_MIN) has a pod that stops itself, keeping /workspace, when
+# its command ends and the Mac has not reaped it (the Mac or its network down: 10-13, four hours). Before such a pod is
+# deleted, it is started and the run's outputs copied to the Mac; one that will not start stays stopped (storage only),
+# its record and key kept, and reap fails, so a later reap (rp-run stop NAME) tries again. Other pods are not touched.
+recover_stopped() {  # POD
+    local pod=$1 name keys user r b ip="" port="" t
+    [ -f "$ACTIVE/.$pod.selfstop" ] && [ "$(provider_of "$pod")" = runpod ] || return 0
+    [ "$(pod_state "$pod")" = OTHER ] || return 0
+    read -r name _ < "$ACTIVE/$pod" || return 0
+    read -r _ _ keys user < "$ACTIVE/.$pod.ssh" 2> /dev/null && [ -f "$keys/key" ] || { echo "rp-run: stopped pod $pod has no key left; deleting it without a copy" >&2; return 0; }
+    echo "rp-run: pod $pod ($name) stopped itself; starting it to copy its outputs before deleting it" >&2
+    # The ledger reads hours from the API's lastStartedAt, which a start moves: the first stretch, to now (the stopped
+    # time counted as running, an overcount), is kept for reap to add.
+    r=$(api GET "$REST/pods/$pod")
+    t=$(epoch_of "$(jq -r '.lastStartedAt // .createdAt // ""' <<< "$(body_of "$r")" 2> /dev/null)") || t=""
+    [ -z "$t" ] || echo $(( $(date +%s) - t )) > "$ACTIVE/.$pod.before_s"
+    api POST "$REST/pods/$pod/start" > /dev/null
+    for t in $(seq 40); do
+        r=$(api GET "$REST/pods/$pod")
+        if [ "$(status_of "$r")" = 200 ]; then
+            b=$(body_of "$r")
+            ip=$(jq -r '.publicIp // empty' <<< "$b")
+            port=$(jq -r '.portMappings["22"] // empty' <<< "$b")
+            [ -n "$ip" ] && [ -n "$port" ] && ssh -F none -i "$keys/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=/dev/null \
+                -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -p "$port" "${user:-root}@$ip" true < /dev/null 2> /dev/null && break
+        fi
+        ip="" port=""
+        sleep 15
+    done
+    if [ -z "$ip" ]; then
+        api POST "$REST/pods/$pod/stop" > /dev/null
+        echo "rp-run: pod $pod did not start; it stays stopped with $name's outputs on /workspace (storage only); rp-run stop $name tries again" >&2
+        return 1
+    fi
+    mkdir -p "$RP/$name"
+    if rsync -a -e "ssh -F none -i $keys/key -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR -p $port" \
+        "${user:-root}@$ip:/workspace/runs/$name/mpd-data/runpod/$name/" "$RP/$name/"; then
+        echo "rp-run: copied $name's outputs from pod $pod" >&2
+    else
+        api POST "$REST/pods/$pod/stop" > /dev/null
+        echo "rp-run: copying $name's outputs from pod $pod failed; it is stopped again for another try: rp-run stop $name" >&2
+        return 1
+    fi
+}
+
 reap() {  # POD [cap]
     local pod=$1 rec=$ACTIVE/$1 r code tries=0 gone=0
     [ -f "$rec" ] || return 0
@@ -593,6 +640,7 @@ reap() {  # POD [cap]
         rm -f "$rec" "$ACTIVE/.$pod".*
         return 0
     fi
+    recover_stopped "$pod" || return 1
     local name gpu cloud price created ended upload_s data_s wait_s end started_api=""
     read -r name gpu cloud price created _ _ _ upload_s data_s wait_s < "$rec"
     end=$(cat "$ACTIVE/.$pod.end" 2> /dev/null || echo deleted)
@@ -661,7 +709,7 @@ reap() {  # POD [cap]
         local hours dollars total line owner approval
         owner=$(cat "$ACTIVE/.$pod.owner" 2> /dev/null || echo -)
         approval=$(cat "$ACTIVE/.$pod.approval" 2> /dev/null || echo -)
-        hours=$(awk -v a="$created" -v b="$ended" 'BEGIN { printf "%.4f", (b - a) / 3600 }')
+        hours=$(awk -v a="$created" -v b="$ended" -v x="$(cat "$ACTIVE/.$pod.before_s" 2> /dev/null || echo 0)" 'BEGIN { printf "%.4f", (b - a + x) / 3600 }')
         dollars=$(awk -v h="$hours" -v p="$price" 'BEGIN { printf "%.4f", h * p }')
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" "${upload_s:--}" "${data_s:--}" "${wait_s:--}" "$end" "${owner:--}" "${approval:--}" >> "$LEDGER"
         total=$(awk -F'\t' 'NR > 1 { s += $6 } END { printf "%.2f", s }' "$LEDGER")
@@ -669,7 +717,7 @@ reap() {  # POD [cap]
         echo "rp-run: $line" >&2
         [ -d "$RP/$name" ] && echo "$(date '+%F %T') $line" >> "$RP/$name/cost.txt"
         drop_keys "$pod"
-        rm -f "$rec" "$ACTIVE/.$pod.deadline" "$ACTIVE/.$pod.owner" "$ACTIVE/.$pod.approval" "$ACTIVE/.$pod.ssh" "$ACTIVE/.$pod.end"
+        rm -f "$rec" "$ACTIVE/.$pod.deadline" "$ACTIVE/.$pod.owner" "$ACTIVE/.$pod.approval" "$ACTIVE/.$pod.ssh" "$ACTIVE/.$pod.end" "$ACTIVE/.$pod.selfstop" "$ACTIVE/.$pod.before_s"
         rm -rf "$ACTIVE/.$pod.guests"
     fi
     rmdir "$RP/.ledger.lock"
@@ -1739,12 +1787,16 @@ fi
 create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS
     local start="(echo \$BASHPID > /rp-watchdog.pid; sleep $3; runpodctl remove pod \"\$RUNPOD_POD_ID\" || runpodctl pod delete \"\$RUNPOD_POD_ID\") > /rp-watchdog.log 2>&1 & exec /start.sh"
     # Rust builds and the host half of a step want more than the default 2 vCPUs and 8 GB per GPU.
+    # A pod that may stop itself (RP_SELF_STOP) keeps /workspace on a volume disk, which survives a stop (the container
+    # disk does not); the others have no volume.
+    local vol=0 cdisk=$DISK
+    [ "${RP_SELF_STOP:-0}" != 1 ] || { vol=$DISK; cdisk=20; }
     jq -nc --arg name "mpd2951-$NAME" --arg image "$IMAGE" --arg gpu "$2" --arg cloud "${1%%:*}" \
-        --arg keys "$4" --argjson disk "$DISK" --arg start "$start" --argjson ram "${RP_MIN_RAM_GB:-32}" \
+        --arg keys "$4" --argjson disk "$cdisk" --argjson vol "$vol" --arg start "$start" --argjson ram "${RP_MIN_RAM_GB:-32}" \
         '{name: $name, imageName: $image, computeType: "GPU", gpuTypeIds: [$gpu], gpuCount: 1, cloudType: $cloud,
-          containerDiskInGb: $disk, volumeInGb: 0, ports: ["22/tcp"], supportPublicIp: true,
+          containerDiskInGb: $disk, volumeInGb: $vol, ports: ["22/tcp"], supportPublicIp: true,
           env: {PUBLIC_KEY: $keys}, dockerStartCmd: ["bash", "-c", $start],
-          minVCPUPerGPU: 8, minRAMPerGPU: $ram}'
+          minVCPUPerGPU: 8, minRAMPerGPU: $ram} + (if $vol > 0 then {volumeMountPath: "/workspace"} else {} end)'
 }
 
 # A batch prices its runs first (RP_ESTIMATE_ONLY) and checks the budget once for all of them; its
@@ -1979,6 +2031,7 @@ record() {  # GPU_ID KIND
     echo "${RP_OWNER:--}" > "$ACTIVE/.$POD.owner"
     echo "$APPROVAL" > "$ACTIVE/.$POD.approval"
     echo "$DEADLINE" > "$ACTIVE/.$POD.deadline"
+    [ "${RP_SELF_STOP:-0}" != 1 ] || : > "$ACTIVE/.$POD.selfstop"
     nohup "$SELF" --watch "$POD" "$$" "$DEADLINE" >> "$OUT/watch.log" 2>&1 &
 }
 

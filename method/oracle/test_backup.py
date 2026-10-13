@@ -246,11 +246,25 @@ def test_repair_shares(tiny):
 
 def test_frozen_counterfactual(tiny):
     """frozen: with every site at every position in the expansion nothing is held, so the frozen run is the model less
-    each draw (overstate_frozen 1, kl_frozen 0); with the circuit alone, the held outside writes its text activations."""
+    each draw (overstate_frozen the model's own, kl_frozen 0); with the circuit alone, the held outside writes its text
+    activations."""
     nat, ge, tx, circuit = tiny
     bk = backup.Backup(ge, tx, circuit, draws=4, rows=3)
     every = frozenset((n, t) for n in nat.names for t in range(tx.T))
     got = bk.frozen(blocks=every)
-    assert got["kl_frozen"] < 1e-5 and abs(got["overstate_frozen"] - 1.0) < 1e-4
+    assert got["kl_frozen"] < 1e-5 and abs(got["overstate_frozen"] - got["overstate_model"]) < 1e-4 * max(1.0, got["overstate_model"])
     got = bk.frozen()
     assert got["overstate_frozen"] >= 0 and len(got["draws"]) == 4
+
+
+def test_norm_frozen(tiny):
+    """norm_frozen: the whole model as blocks is the model, so with the norms held its point run is the model's (KL 0)
+    and its draws are the model's under the same held norms (equal overstates)."""
+    nat, ge, tx, circuit = tiny
+    bk = backup.Backup(ge, tx, circuit, draws=4, rows=3)
+    every = frozenset((n, t) for n in nat.names for t in range(tx.T))
+    got = bk.norm_frozen(blocks=every)
+    assert got["circuit"]["kl_point"] < 1e-5
+    assert abs(got["circuit"]["overstate"] - got["model"]["overstate"]) < 1e-4 * max(1.0, got["model"]["overstate"])
+    plain = bk.norm_frozen()
+    assert plain["circuit"]["overstate"] >= 0

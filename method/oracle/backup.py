@@ -326,10 +326,10 @@ class Backup:
         """The outside's response as a counterfactual on the model: per draw, the model less the draw with every
         subcomponent outside the circuit (and outside the expansion blocks, extra) held at its activation in the model
         on the text (the remainders live, as in C's semantics), against the model less the draw. overstate_frozen =
-        mean KL(frozen less d || model) / mean W (W = KL(model less d || model)): the circuit's overstate (its claimed
-        removal effect over the model's) when the outside cannot respond but still writes what it writes on the text;
-        kl_frozen, mean KL(model less d || frozen less d). Near the circuit's own overstate: the outside's response
-        is the gap; near 1: the outside's response is not it (then the gap is the outside's absence itself)."""
+        mean KL(model || frozen less d) / mean W (W = KL(model less d || model); goal_eval's overstate form): the
+        overstate when the outside cannot respond but still writes what it writes on the text, beside overstate_model,
+        the model's own in that form; kl_frozen, mean KL(model less d || frozen less d). Near the circuit's overstate:
+        the outside's response is the gap; near the model's: the gap is the outside's absence itself."""
         nat, E, dev = self.nat, self.E, self.nat.dev
         mx = self.masks(blocks, extra)
         clean: dict = {}
@@ -360,10 +360,59 @@ class Backup:
             E._site = orig
             native.free(dev)
         lf = torch.cat(out)
-        f = carry.kl(lf, self.tx.ref.expand_as(lf)).tolist()
+        f = carry.kl(self.tx.ref.expand_as(lf), lf).tolist()
         err = carry.kl(self.lm, lf).tolist()
-        return {"overstate_frozen": float(np.mean(f)) / max(float(np.mean(self.W)), EPS), "kl_frozen": float(np.mean(err)),
-                "w": float(np.mean(self.W)), "draws": [[w, a, b] for w, a, b in zip(self.W, f, err)]}
+        w = max(float(np.mean(self.W)), EPS)
+        return {"overstate_frozen": float(np.mean(f)) / w, "overstate_model": float(np.mean(self._claim_model())) / w,
+                "kl_frozen": float(np.mean(err)), "w": float(np.mean(self.W)), "draws": [[w_, a, b] for w_, a, b in zip(self.W, f, err)]}
+
+    def _claim_model(self) -> list:
+        """KL(model || model less d) per draw: the model's own removal effect in the orientation of the circuit's claim
+        (goal_eval's overstate divides KL(model || circuit less d) by W = KL(model less d || model)), so the model's
+        own overstate is this over W, near 1, not 1."""
+        return carry.kl(self.tx.ref.expand_as(self.lm), self.lm).tolist()
+
+    @torch.no_grad()
+    def norm_frozen(self, blocks=frozenset(), extra=frozenset()) -> dict:
+        """The circuit's runs (C's semantics: the circuit, its expansion blocks and extra on, everything else off) with
+        every RMS norm's scale held at the model's on the text (vpd_model.Target.norm_parts: each norm reads its
+        input with the statistics of the model's input there), at the point and under the search's draws, and the
+        model's runs less each draw the same way. Whether the circuit's claimed removal effect is a normalization
+        effect: an outside switched off shrinks the residual stream, each norm then scales the circuit's own writes up,
+        and a removed node's share of the normed stream grows. {"circuit": score fields (s_search, f1, j, kl_point,
+        overstate against the model's real W), "model": {"overstate": mean KL(model || model less d, norms held) / W,
+        "overstate_unheld": the model's own in that form}}."""
+        nat, E, dev, tg = self.nat, self.E, self.nat.dev, self.nat.target
+        clean: dict = {}
+        orig = E._steps
+
+        def record(fused):
+            norm, act = orig(fused)
+
+            def nrm(x, j):
+                clean[j] = x.detach()
+                return norm(x, j)
+            return nrm, act
+
+        def held(fused):
+            return (lambda x, j: tg.norm_parts(x, clean[j], j)), orig(fused)[1]
+
+        ones = {n: torch.ones(self.T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
+        D = len(self.drops)
+        try:
+            E._steps = record
+            E.log_probs({n: ones[n].float()[None] for n in nat.names})
+            E._steps = held
+            m = self.masks(blocks, extra)
+            lq = self._run([(m, None)] + [(m, j) for j in range(D)])
+            lm = self._run([(ones, j) for j in range(D)])
+        finally:
+            E._steps = orig
+            native.free(dev)
+        f = self._fields(lq)
+        model = carry.kl(self.tx.ref.expand_as(lm), lm).tolist()
+        w = max(float(np.mean(self.W)), EPS)
+        return {"circuit": f, "model": {"overstate": float(np.mean(model)) / w, "overstate_unheld": float(np.mean(self._claim_model())) / w}}
 
     # ---- the screen
 
@@ -805,7 +854,8 @@ def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back",
     """Backup.repair and Backup.frozen per text on the backup family's search draws: the outside's cancelling share of
     the circuit's change at the prediction (r, cos, per site) for src's circuit and the share each of out's sets holds
     ("held"); the overstate with the outside held at its activations on the text (frozen: start, and per set with only
-    the outside of the set held), beside the circuit's own overstate. Lines in out/repair.jsonl; texts already there
+    the outside of the set held), beside the circuit's own overstate; the circuit's and the model's scores with every
+    norm's scale held at the model's on the text (norm_frozen). Lines in out/repair.jsonl; texts already there
     skipped."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
@@ -820,7 +870,7 @@ def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back",
         g0, _ = goal_eval.circuit(json.loads(f0.read_text()), targets, nat.C, tx.T)
         bk = Backup(ge, tx, g0)
         row = {"task": p.stem, "start": bk.repair(), "held": {}, "frozen": {"start": bk.frozen()},
-               "overstate": bk.score([(frozenset(), frozenset())])[0]["overstate"]}
+               "overstate": bk.score([(frozenset(), frozenset())])[0]["overstate"], "norm_frozen": bk.norm_frozen()}
         for k in sets:
             f = out / k / f"{p.stem}.json"
             if f.exists():
@@ -830,7 +880,11 @@ def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back",
                 row["frozen"][k] = bk.frozen(b, x)["overstate_frozen"]
         with open(f_out, "a") as fh:
             fh.write(json.dumps(row) + "\n")
-        log(f"{p.stem}: r {row['start']['r']:.3f} cos {row['start']['cos']:.3f}, overstate {row['overstate']:.2f}, frozen "
+        nf = row["norm_frozen"]
+        log(f"{p.stem}: norms held: circuit overstate {nf['circuit']['overstate']:.2f} s {nf['circuit']['s_search']} "
+            f"F1 {nf['circuit']['f1']}, model {nf['model']['overstate']:.2f}")
+        log(f"{p.stem}: r {row['start']['r']:.3f} cos {row['start']['cos']:.3f}, overstate {row['overstate']:.2f} (the model's own "
+            f"{row['frozen']['start']['overstate_model']:.2f}), frozen "
             f"{row['frozen']['start']['overstate_frozen']:.2f}; held " + " ".join(f"{k} {v:.3f}" for k, v in row["held"].items())
             + "; frozen outside the set " + " ".join(f"{k} {v:.2f}" for k, v in row["frozen"].items() if k != "start"))
         del bk, tx

@@ -47,6 +47,9 @@
 %% English pilot uses whole native MLP blocks, not VPD rank-one units; prose itself remains unverified.
 %% Input-only follow-up: activation threshold fitted on the 97 training rows also gets dev8 QA 69.12%.
 %% It gets falls/top 46/48 correct versus trained 58/36; feature coverage 25/68, not an exhaustive learnability test.
+%% Stronger predeclared 11-feature logistic control: train-only grouped CV, then one dev8 evaluation, 71.32%.
+%% Falls/top49/48; seven intervention kinds plus visible CI/activation scalars and missing indicators; no weight-use claim.
+%% Artifact: sft_codex-compatible97-q8-1012/analysis/logistic_input_control; frozen predictions also apply to coherent QA inputs.
 %% Saved-draw analysis distinguishes response errors from removal specificity; uncertainty dominates texts9026/9027.
 %% b84253d adds opt-in --calibration-evidence: original scored draws and provenance, no score changes or new probes.
 %% VPD English successor: text6002 V5, exact 258 rank-one units, measured carrier eval .912; no block substitution.
@@ -64,13 +67,17 @@
 %% Use analysis/qa_task_control for a coherent task: same observations/questions, QA-only instructions, no EDIT requests.
 %% All97 train pairs fit; fixeddev8 has68 questions and no answers in generation inputs. No new generated labels.
 %% Changed instructions make this an isolated-skill trial, not proof of a matched-prompt causal effect.
-%% QA-only experiment authorized <=$4.15 total:49x8 steps, pinned LR/source, paired base/trained first samples on dev8.
-%% Judge falls and top separately against no-change and train-fitted visible-feature controls; report parse failures.
-%% Cheap-control strengthening runs offline in parallel with training, with feature/model choice confined to training.
+%% QA-only experiment COMPLETE:49x8 steps, pinned LR/source, paired base/trained first samples on dev8, actual $1.82731211.
+%% Trained parses68/68 without truncation: falls56/top44,100/136 fields=73.53%; logistic97/136=71.32%, only3-field gain.
+%% Base stops normally but wrong prefixes yield0 canonical coverage; separate prefix-only content check50.0%,
+%% equivalent-quotation diagnostic60.29%. Original outputs and canonical scores retained; no inflated latent-knowledge claim.
+%% Artifact: components/sft_codex-qa97-q8-1012 (state, contract, analysis, tokenIDs, finish, spend, content diagnostic).
+%% This is narrow outcome learning on8 development texts, not circuit faithfulness, English meaning or robust generalization.
+%% Next decision: independent outcome/weight-input evidence before scaling; do not repeat blind SFT on this tiny gain.
 %% Literature consequence: measure outcome prediction before free prose; native carriers alone cannot certify meaning.
 %% Offline falsification: real node-response errors coexist with large uncertainty penalties; do not tune them away.
 %% Next reward evidence, if needed: saved candidates on9020/9026/9027 with retained draws, after scorer owner freezes it.
-%% Total this pilot: Tinker $2.335328862 + RunPod $0.1826 = $2.517928862; no shared extra budget used.
+%% Combined codex pilots: Tinker $4.162640972 + RunPod $0.1826 = $4.345240972; no shared extra budget used.
 %% Existing dev8 immutable. New rerender --node-cap communicates explicit limits before fitting (33419cd).
 %% Successful SFT skills feed integration directly; RL is an optional improvement, not a prerequisite.
 %% Grounded-English pilot: train6002/6011, one eval-passing carrier per text; writer outcomes withheld.
@@ -133,8 +140,8 @@ flowchart BT
     I1["<b>Candidate list</b><br/>VPD actives at listed positions;<br/>coverage depends on task and trimming<br/>IMPLEMENTED"]
     I2["<b>Context fit and explicit limits</b><br/>opt-in node cap before token fitting;<br/>log and skip only oversized rows;<br/>later rows continue<br/>DONE · codex/eval_recovery · 33419cd"]
     I3["<b>Coverage audit</b><br/>179/207-row snapshots: 81–84%<br/>of teacher nodes visible; edits join;<br/>retain pool inputs, check token fit<br/>HANDOFF · codex to primerl/rustmove"]
-    I4["<b>Learnability and input controls</b><br/>cheap feature baseline matches SFT QA;<br/>test weights beyond visible facts;<br/>vectors real/random/id/permuted<br/>ACTIVE · rustmove, codex"]
-    QAONLY["<b>Outcome-only learning trial</b><br/>97 texts, 792 measured answers;<br/>same facts, QA-only instructions;<br/>beat cheap controls on dev outcomes<br/>ACTIVE · codex · cap $4.15"]
+    I4["<b>Learnability and input controls</b><br/>cheap features beat full-circuit QA;<br/>test weights beyond visible facts;<br/>vectors real/random/id/permuted<br/>ACTIVE · rustmove, codex"]
+    QAONLY["<b>Outcome-only learning trial</b><br/>QA 73.53% vs cheap control 71.32%;<br/>three-field gain on8 development texts;<br/>needs independent outcome evidence<br/>CHECK · codex · $1.83 spent"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
     I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
   end
@@ -219,7 +226,8 @@ flowchart BT
   S1READY -. tests need for better inputs .-> I4
   I6 -. weight-arm evidence only .-> I4
   SUP -. existing measured QA .-> QAONLY
-  QAONLY -. independent control arm .-> SFTS
+  QAONLY -. measured arm .-> GATEC
+  QAONLY -. candidate outcome skill .-> ORC
   QAONLY -. isolates learning burden .-> I4
   W1 --> GATEB
   W2 -. tests .-> GATEB
@@ -297,7 +305,7 @@ flowchart BT
   class T4 blocked
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
-  class QAONLY active
+  class QAONLY check
   class ENGP check
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting

@@ -7,7 +7,7 @@ the verified INVARIANTS lines (semantic.teacher_invariants) unless the file hold
 Files are rewritten in place (or, with --tar, a tar of the directories is unpacked under --out first: a pod uploads
 one file); a file with both done is skipped.
 
-  experiments/oracle/var_post.py DIR [DIR ...] [--tar FILE --out DIR] [--device mps]
+  experiments/oracle/var_post.py DIR [DIR ...] [--tar FILE --out DIR] [--part K/N] [--device mps]
 """
 from __future__ import annotations
 
@@ -72,6 +72,7 @@ def main():
     ap.add_argument("--tar", type=Path)
     ap.add_argument("--out", type=Path)
     ap.add_argument("--device")
+    ap.add_argument("--part", help="K/N: only every N-th file from the K-th (a cluster array's task)")
     args = ap.parse_args()
     dirs = list(args.dirs)
     if args.tar:
@@ -81,10 +82,13 @@ def main():
         with tarfile.open(args.tar) as t:
             t.extractall(args.out)
         dirs = sorted(x for x in args.out.iterdir() if x.is_dir())
+    files = [f for d in dirs for f in sorted(x for x in d.iterdir() if x.name.startswith("text") and x.suffix == ".json")]
+    if args.part:
+        k, n = map(int, args.part.split("/"))
+        files = files[k::n]
     ge = goal_eval.GoalEval(native.Native(args.device))
-    for d in dirs:
-        for f in sorted(x for x in d.iterdir() if x.name.startswith("text") and x.suffix == ".json"):
-            post(ge, f, log=lambda s: print(s, flush=True))
+    for f in files:
+        post(ge, f, log=lambda s: print(s, flush=True))
 
 
 if __name__ == "__main__":

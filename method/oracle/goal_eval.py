@@ -3635,34 +3635,38 @@ class GoalEval:
         every = sorted(set().union(*(g.node_set() for g in graphs))) if graphs else []
         nid = {nd: i for i, nd in enumerate(every)}
         N = len(every)
-        site = {n: np.array([i for i, nd in enumerate(every) if nd[0] == n], dtype=np.int64) for n in nat.names}
-        site = {n: x for n, x in site.items() if len(x)}
-        sidx = {n: torch.as_tensor(x, device=dev) for n, x in site.items()}
-        spos = {n: torch.tensor([every[i][1] for i in x], device=dev) for n, x in site.items()}
-        scol = {n: torch.tensor([at[n][every[i][2]] for i in x], device=dev) for n, x in site.items()}
-        svpd = {n: torch.tensor([vat[n][every[i][2]] for i in x], device=dev) for n, x in site.items()}
+        oc, ov, KC, KV = {}, {}, 0, 0  # each site's offset in the flat masks over every site's columns (circuits', VPD's)
+        for n in nat.names:
+            oc[n], ov[n] = KC, KV
+            KC, KV = KC + len(circ[n]), KV + len(vcols[n])
+        npos = np.array([nd[1] for nd in every], dtype=np.int64)
+        FT = torch.as_tensor(npos, device=dev)  # per node its position and its flat columns (circuits', VPD's)
+        FC = torch.tensor([oc[n] + at[n][c] for n, _, c in every], dtype=torch.long, device=dev)
+        FV = torch.tensor([ov[n] + vat[n][c] for n, _, c in every], dtype=torch.long, device=dev)
+
+        def views(flat, off, cols):  # a flat mask [R, T, KC or KV] as the engine's {site: [R, T, K]} (views)
+            return {n: flat[..., off[n]:off[n] + len(cols[n])] for n in nat.names}
         gnodes = [sorted(g.node_set()) for g in graphs]
         rows = []  # (graph, draw j, dropped node indices)
         for gi in range(len(graphs)):
             if gnodes[gi]:
                 for j, d in enumerate(self._node_draws(tx, sorted(units[gi]) if units is not None else gnodes[gi], draws, held=gnodes[gi])):
                     rows.append((gi, j, np.array([nid[x] for x in d], dtype=np.int64)))
-        first = min((every[i][1] for _, _, d in rows for i in d), default=T)
+        cat = np.concatenate([d for _, _, d in rows]) if rows else np.zeros(0, dtype=np.int64)
+        first = int(npos[cat].min()) if len(cat) else T
         kw = self._xkw(tx.ids, tx.targets, "nodes")  # at x: every position (no start), the removed nodes at 0, never at x
         start = 0 if reads or kw else min(first, min(tx.targets))  # before it every run is its base's (reads: every position)
         width = max(nat.C.values()) * (T - start) + sum(len(c) for c in vcols.values()) * T
         step = max(1, self.NODE_ENTRIES // max(1, width))
-        own, plans = {}, {}  # per complete circuit its masks [1, T, K]; per stated one its plan and entries' node indices
+        vflat = torch.cat([vbase[n] for n in nat.names], -1)  # [1, T, KV]
+        own, plans = {}, {}  # per complete circuit its flat masks [1, T, KC]; per stated one its plan and entries' node indices
         for gi, g in enumerate(graphs):
             if not gnodes[gi]:
                 continue
             if g.complete:
-                m = {n: torch.zeros(1, T, len(circ[n]), device=dev) for n in nat.names}
-                inn = torch.zeros(N, dtype=torch.bool, device=dev)
-                inn[torch.as_tensor([nid[x] for x in gnodes[gi]], device=dev)] = True
-                for n in site:
-                    k = inn[sidx[n]]
-                    m[n][0, spos[n][k], scol[n][k]] = 1.0
+                m = torch.zeros(1, T, KC, device=dev)
+                ii = torch.as_tensor([nid[x] for x in gnodes[gi]], device=dev)
+                m[0, FT[ii], FC[ii]] = 1.0
                 own[gi] = m
             else:  # the plan's entries per site: sorted by position, then column
                 order = {}
@@ -3699,13 +3703,12 @@ class GoalEval:
             rr = np.concatenate([np.full(len(d), r) for r, (_, _, d) in enumerate(part)])
             cc = np.concatenate([d for _, _, d in part])
             Dm = torch.zeros(R, N, dtype=torch.bool, device=dev)
-            Dm[torch.as_tensor(rr, device=dev), torch.as_tensor(cc, device=dev)] = True
-            mm = {n: torch.ones(R, T, len(circ[n]), device=dev) for n in nat.names}
-            mv = {n: vbase[n].repeat(R, 1, 1) for n in nat.names}
-            for n in site:  # each draw's nodes off: one indexed write per site and engine
-                r_, j_ = Dm[:, sidx[n]].nonzero(as_tuple=True)
-                mm[n][r_, spos[n][j_], scol[n][j_]] = 0.0
-                mv[n][r_, spos[n][j_], svpd[n][j_]] = 0.0
+            r_, j_ = torch.as_tensor(rr, device=dev), torch.as_tensor(cc, device=dev)
+            Dm[r_, j_] = True
+            mf, vf = torch.ones(R, T, KC, device=dev), vflat.repeat(R, 1, 1)  # each draw's nodes off: one indexed write
+            mf[r_, FT[j_], FC[j_]] = 0.0                                       # per engine, every site at once
+            vf[r_, FT[j_], FV[j_]] = 0.0
+            mm, mv = views(mf, oc, circ), views(vf, ov, vcols)
             if reads:
                 lm, got = Em.log_probs(mm, reads=spec(part))
                 rmod = split(got, part)
@@ -3719,15 +3722,15 @@ class GoalEval:
                 ixt = torch.as_tensor(ix, device=dev)
                 sub = [part[r] for r in ix]
                 if gi in own:
-                    mc = {n: own[gi][n].repeat(len(ix), 1, 1) for n in nat.names}
-                    for n in site:
-                        r_, j_ = Dm[ixt][:, sidx[n]].nonzero(as_tuple=True)
-                        mc[n][r_, spos[n][j_], scol[n][j_]] = 0.0
-                    kh = dict(kw, held={n: own[gi][n] == 0 for n in nat.names}) if kw else {}
+                    cf = own[gi].repeat(len(ix), 1, 1)
+                    r2, j2 = Dm[ixt].nonzero(as_tuple=True)
+                    cf[r2, FT[j2], FC[j2]] = 0.0
+                    mc, base_c = views(cf, oc, circ), views(own[gi], oc, circ)
+                    kh = dict(kw, held={n: base_c[n] == 0 for n in nat.names}) if kw else {}
                     if reads:
                         got, rc_ = Ec.log_probs(mc, reads=spec(sub), **kh)
                     else:
-                        got = Ec.log_probs(mc, start=start, base=own[gi]) if start else Ec.log_probs(mc, **kh)
+                        got = Ec.log_probs(mc, start=start, base=base_c) if start else Ec.log_probs(mc, **kh)
                 else:
                     plan, ent = plans[gi]
                     off = {n: Dm[ixt][:, e] for n, e in ent.items()}

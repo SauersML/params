@@ -1,4 +1,7 @@
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
+%% 2026-10-13 direct weight fidelity diagnostic7f81a95: same forwards now expose absolute unedited/edited KL alongside unchanged conditional reward.
+%% GHA38409624227 PASS, including independent-forward n/c checks and a wrong-baseline counterexample.
+%% This verifies metric plumbing; realVPD direct fidelity still requires measurements, and live remainders remain explicit.
 %% 2026-10-13 current-main scope REFRESH supersedes the historical2750fd8/x-mode audit below.
 %% e1a638a/3066855: SEMANTICS n holds dense Q/K and RMS scales only for node/omitted families; c holds none.
 %% Point, wiring, pattern and weight-family point runs recompute their own routing/norms from their edited vectors.
@@ -504,7 +507,7 @@ flowchart BT
     W2["<b>Falsification set</b><br/>14 families + copy, frequency-weighted:<br/>wrong context loses 0.61-0.74, padding 0.76;<br/>equal-bits target actives win 0.85;<br/>partition/parity E4 0.00-0.04 vs identity ~1;<br/>behavior mode (CausalGym): v2.1 teacher holds<br/>the subject 0.85 (plain 0.12), R prefers it 0.86;<br/>interchange_pp still blind · DONE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>run 2 REWARD_REV 8bd83fb: soft pieces, one<br/>family score, audit fixes, interchange panel,<br/>semantics n (nodes, omitted at x) the only<br/>default; toys = C, cond 2 on 3 texts, no<br/>family collapse · DONE · inframove"]
-    W5["<b>State what each score receives</b><br/>Point and edits use own routing/norms;<br/>node/omitted hold original boundaries;<br/>edit tracking still anchors full-model p<br/>SCOPE UPDATED · codex"]
+    W5["<b>Measure executable edit predictions</b><br/>Direct edited-output KL now accompanies<br/>baseline-anchored change scores;<br/>own routing/norms, live remainders;<br/>independent-forward tests + CI PASS · codex"]
     W6["<b>Diagnose fidelity failures</b><br/>retain draws and every family score;<br/>unchanged reward; export checks pass;<br/>separate response error from uncertainty<br/>IMPLEMENTED · codex · 3017b64"]
   end
 

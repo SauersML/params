@@ -665,6 +665,49 @@ def _checked_invariant_fixture(monkeypatch):
             "artifact_sha256": "d" * 64}
 
 
+def test_invariant_artifact_roundtrip_preserves_executed_failures(monkeypatch, tmp_path):
+    import copy
+    fixture = _checked_invariant_fixture(monkeypatch)
+    rows = copy.deepcopy(fixture["claims"])
+    rows[0]["executed"].update(holds=True, credit=2.0)
+    rows[0].update(holds=False, credit=-99)  # Only original executed evidence supplies labels.
+    rows[1]["executed"] = {"intervention": {"remove": ["V1"]}, "outcome": ["drop", 0.5],
+                           "holds": False, "credit": -1}
+    before = copy.deepcopy(rows)
+    record = components.invariant_artifact("text6000", "mock", fixture["variables"], rows,
+                                          task_sha256="b" * 64, circuit_sha256="c" * 64,
+                                          source_sha256=fixture["source_sha256"])
+    path = tmp_path / "claims.jsonl"
+    path.write_text(json.dumps(record) + "\n")
+    loaded = components.invariant_teach([path])["text6000"]
+    found, labels, provenance = components.checked_invariant_labels(loaded, fixture["variables"], "mock", "b" * 64, "c" * 64)
+    assert found == fixture["variables"] and labels == [rows[0]["line"]]
+    assert record["eligible_lines"] == labels and rows == before
+    assert len(provenance["checks"]) == 2 and provenance["checks"][1]["executed"] == rows[1]["executed"]
+    assert provenance["checks"][1]["eligible"] is False
+
+
+def test_invariant_artifact_rejects_mismatched_duplicate_or_unexecuted_claims(monkeypatch):
+    import copy
+    fixture = _checked_invariant_fixture(monkeypatch)
+    good = copy.deepcopy(fixture["claims"][0])
+    good["executed"].update(holds=True, credit=2.0)
+    def build(rows, task="text6000"):
+        return components.invariant_artifact(task, "mock", fixture["variables"], rows,
+                                             task_sha256="b" * 64, circuit_sha256="c" * 64,
+                                             source_sha256=fixture["source_sha256"])
+    bad = copy.deepcopy(good)
+    bad["executed"]["intervention"]["transplants"][0][1][0] = 8
+    with pytest.raises(ValueError, match="execution IDs"):
+        build([bad])
+    with pytest.raises(ValueError, match="duplicate or conflicting"):
+        build([good, {**good, "line": good["line"].replace("I1:", "I9:")}])
+    with pytest.raises(ValueError, match="original executed"):
+        build([{**good, "executed": {}}])
+    with pytest.raises(ValueError, match="training supervision"):
+        build([good], "text9000")
+
+
 def test_checked_invariants_reject_wrong_execution_or_group_and_holdout(monkeypatch, tmp_path):
     import copy
 

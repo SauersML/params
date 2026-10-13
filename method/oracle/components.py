@@ -2285,6 +2285,58 @@ def written_variables(text: str, variables: list[dict]) -> tuple[list[dict], str
     return out, " ".join(" ".join(prose).split())
 
 
+def invariant_artifact(task: str, model: str, raw_variables: list[dict], checked_rows: list[dict], *,
+                       task_sha256: str, circuit_sha256: str, source_sha256: dict) -> dict:
+    """Construct train-only supervision from retained Checker evidence, without executing or inventing claims.
+
+    Each row needs the original Checker record in ``executed``. Positive malformed, duplicated or
+    numerically mismatched claims are rejected; failed checks remain in the artifact for auditing.
+    """
+    import copy
+    import semantic
+
+    if not re.fullmatch(r"text(?:6\d{3}|7\d{3})", task):
+        raise ValueError("invariant artifact must be explicitly training supervision")
+    if any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h)
+           for h in (task_sha256, circuit_sha256, *source_sha256.values())) or not source_sha256:
+        raise ValueError("invariant supervision needs exact source hashes")
+    record = {"schema": 1, "task": task, "model": model, "split": "train", "selection_role": "supervision",
+              "task_sha256": task_sha256, "circuit_sha256": circuit_sha256,
+              "source_sha256": copy.deepcopy(source_sha256), "variables": copy.deepcopy(raw_variables), "claims": []}
+    groups = {v["name"]: hashlib.sha256(json.dumps(v["group"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+              for v in raw_variables}
+    normalized = lambda x: json.dumps(json.loads(json.dumps(x)), sort_keys=True)
+    for row in checked_rows:
+        claim = copy.deepcopy(row)
+        executed = claim.get("executed")
+        if not isinstance(executed, dict) or "holds" not in executed or "credit" not in executed:
+            raise ValueError("invariant artifact needs original executed check evidence")
+        for key in ("holds", "credit", "surprise", "top", "p_top", "logp"):
+            if key in executed:
+                claim[key] = copy.deepcopy(executed[key])
+        parsed, bad = semantic.parse_invariants(claim["line"], model)
+        claim["parsed"] = parsed[0] if len(parsed) == 1 else None
+        claim["parser_bad"] = bad
+        iv = executed.get("intervention")
+        iv = {"tokens": {}, "transplants": [], "remove": [], **iv} if isinstance(iv, dict) else None
+        matches = (not bad and len(parsed) == 1
+                   and normalized(parsed[0]["intervention"]) == normalized(iv)
+                   and normalized(parsed[0]["outcome"]) == normalized(executed.get("outcome")))
+        claim["roundtrip_ids_identical"] = bool(matches)
+        names = ({name for name, _ in parsed[0]["intervention"]["transplants"]}
+                 | set(parsed[0]["intervention"]["remove"])) if len(parsed) == 1 else set()
+        claim["variable_group_sha256"] = {name: groups.get(name) for name in names}
+        credit = claim["credit"]
+        claim["eligible"] = (claim["holds"] is True and isinstance(credit, (int, float))
+                             and math.isfinite(credit) and credit > 0)
+        record["claims"].append(claim)
+    # Reuse the consumer contract, including duplicate detection and exact carrier/ID binding.
+    _, labels, _ = checked_invariant_labels({**record, "artifact_sha256": "0" * 64}, None,
+                                           model, task_sha256, circuit_sha256, task)
+    record["eligible_lines"] = labels
+    return record
+
+
 def invariant_teach(paths: list[Path]) -> dict:
     """Checked training artifacts, never evaluation labels inferred from a commit message or prose."""
     out = {}

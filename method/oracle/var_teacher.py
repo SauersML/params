@@ -378,7 +378,9 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         release(nat.dev)
     M = sum(m.values())
     held = {nd[1] for nd in m if nd[0] != "tok" and nd[1] <= max(targets)}
-    positions = sorted({q for q, _ in tx.f2} | set(targets) | held)
+    # the first token is no input: the scorer's draws change a token from the model's prediction at it, and position 0
+    # has none (carry.alternatives; text6194's circuit sits at position 0 alone)
+    positions = sorted(q for q in {q for q, _ in tx.f2} | set(targets) | held if q > 0)
     sets = [((q,), (q,)) for q in positions] + [((a, b), (a, b)) for a, b in zip(positions, positions[1:]) if b == a + 1]
     sc = _Screen(ge)
     if m:  # intermediate variables: the circuit's nodes with a removal effect, at their own positions, whose reads depend

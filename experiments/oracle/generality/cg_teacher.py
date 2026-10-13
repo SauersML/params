@@ -287,6 +287,54 @@ def gender_masks(lams=(0.01, 0.1), steps: int = 300):
             native.free(nat.dev)
 
 
+def moved(tdir: str):
+    """The move each behavior-mode teacher circuit carries (the lead's 10-13: holding the subject while carrying 0.01 of
+    the swap looked like C's semantics thinning the circuit), in both of GoalEval's semantics: the circuit's masked run
+    (its subcomponents on, every other off, remainders live; GoalEval.runs) on the prompt and on its minimal-pair source,
+    "c" as stated and "x" with the query and key sites and every norm at the model's run on the input run (routing and
+    normalization at x); moved = the circuit's change of logit(source label) - logit(base label) over the model's; and
+    the same with the source's active parts at the variable's position added (its other value's parts: VPD writes a
+    token's identity in which subcomponents are on, so the base's parts alone cannot carry a swap). -> DATA/cg_moved.jsonl"""
+    import goal_eval
+    import native
+
+    tdir = Path(tdir)
+    meta = json.loads((DATA / "causalgym_texts_b.json").read_text())
+    names = sorted(p.stem for p in tdir.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_"))
+    nat = native.Native()
+    ges = {sem: goal_eval.GoalEval(nat, semantics=sem) for sem in ("c", "x")}
+    out = DATA / "cg_moved.jsonl"
+    for nm in names:
+        m = meta[nm]
+        tj = json.loads((DATA / "causalgym_texts_b" / f"{nm}.json").read_text())
+        ids = tj["prompts"][0]["token_ids"]
+        t, p = len(ids) - 1, m["p"]
+        src = list(ids)
+        src[p] = m["z"]
+        row = {"name": nm, "task": m["task"]}
+        for sem, ge in ges.items():
+            tx = ge.text(ids, [t], native.task_seed(nm), task=tj)
+            g, _ = goal_eval.circuit(json.loads((tdir / f"{nm}.json").read_text()), tx.targets, nat.C, tx.T)
+            g = goal_eval._c_graph(g, tx.targets, nat.C, tx.vpd)
+            nodes = sorted(g.node_set())
+            ci_src = nat.importance(src)  # the source's own parts at p: the variable's other value (a token's identity is
+            both = sorted(set(nodes) | {(n, p, int(c)) for n in nat.names for c in (ci_src[n][p] > 0).nonzero().flatten().tolist()})  # which parts are on)
+            bl, sl = m["base_label"], m["src_label"]
+            ld = lambda lq: float(lq[0, 0, sl] - lq[0, 0, bl])  # noqa: E731
+            m0, m1 = ld(tx.ref), ld(nat.reference([src], [t]))
+            for lab, ns in (("", nodes), ("_both_values", both)):
+                mask = ge.masks(native.Graph(ns, complete=True), tx.T)
+                c0, c1 = ld(ge.runs(ids, [t], [mask], True)), ld(ge.runs(src, [t], [mask], True))
+                row[f"moved_{sem}{lab}"] = (c1 - c0) / (m1 - m0) if abs(m1 - m0) > 1e-6 else None
+                row[f"ld_circuit_{sem}{lab}"] = [c0, c1]
+            row["ld_model"] = [m0, m1]
+            row["at_variable"] = sum(q == p for _, q, _ in g.node_set())
+        with out.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        print(nm, {k: (round(v, 3) if isinstance(v, float) else v) for k, v in row.items() if k.startswith("moved") or k == "at_variable"}, flush=True)
+        native.free(nat.dev)
+
+
 def test(names: list, tdir: Path, out: Path, b: str = ""):
     import components
     import goal_eval
@@ -380,11 +428,11 @@ def report(behavior: bool = False, v2: bool = False):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("write", "run", "report", "masks", "test", "attractor", "gender_masks"))
+    ap.add_argument("cmd", choices=("write", "run", "report", "masks", "test", "attractor", "gender_masks", "moved"))
     ap.add_argument("--dir", help="attractor: the teacher circuits' directory")
     ap.add_argument("args", nargs="*", type=int)
     ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
     ap.add_argument("--v2", action="store_true", help="run, report: the v2.1 teacher (start set, acceptance, phi pick)")
     a = ap.parse_args()
     {"write": lambda: write(a.behavior), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
-     "masks": lambda: masks_run(*a.args, behavior=a.behavior), "test": lambda: test_dir(*a.args, behavior=a.behavior), "attractor": lambda: attractor(a.dir), "gender_masks": gender_masks}[a.cmd]()
+     "masks": lambda: masks_run(*a.args, behavior=a.behavior), "test": lambda: test_dir(*a.args, behavior=a.behavior), "attractor": lambda: attractor(a.dir), "gender_masks": gender_masks, "moved": lambda: moved(a.dir)}[a.cmd]()

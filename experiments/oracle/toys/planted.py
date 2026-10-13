@@ -269,7 +269,14 @@ def decompose(sd: dict, cfg: dict) -> dict:
                     blk[:, h * hd:(h + 1) * hd] = W[:, h * hd:(h + 1) * hd]
                 else:
                     blk[h * hd:(h + 1) * hd] = W[h * hd:(h + 1) * hd]
-                A, S, Bt = torch.linalg.svd(blk.T, full_matrices=False)   # W.T = A S B^T
+                if sys.platform == "darwin":
+                    # Avoid torch's Accelerate SVD failure on the Mac. These are
+                    # inference-time pieces; carry them back to the input device.
+                    from scipy.linalg import svd
+                    factors = svd(blk.T.detach().cpu().numpy(), full_matrices=False)
+                    A, S, Bt = (torch.from_numpy(x.copy()).to(blk) for x in factors)
+                else:
+                    A, S, Bt = torch.linalg.svd(blk.T, full_matrices=False)   # W.T = A S B^T
                 for j in range(len(S)):
                     if S[j] > 1e-6 * max(float(W.abs().max()), 1e-30) and S[j] > 1e-8:
                         Vs.append(A[:, j] * S[j].sqrt())

@@ -149,3 +149,34 @@ def test_mixed_invalid_wiring_keeps_kl_conditional_without_zero_filling():
     assert summary['wiring_valid'] == .5 and summary['wiring_suff'] == .4
     assert summary['wiring_kl_bits'] == 2.  # conditional on measured KL, not 1 from invalid->0
     assert summary['swap_wiring_kl_bits_own'] == 3.
+
+
+def test_mac_decomposition_uses_scipy_and_preserves_head_weights(monkeypatch):
+    import planted
+
+    cfg = {"n_layer": 1, "n_embd": 4, "n_head": 2}
+    rng = torch.Generator().manual_seed(24)
+    sd = {f"h.0.attn.{kind}.weight": torch.randn(4, 4, generator=rng)
+          for kind in ("q_proj", "k_proj", "v_proj", "o_proj")}
+    sd["h.0.attn.k_proj.weight"].zero_()
+    sd["h.0.mlp.c_fc.weight"] = torch.randn(8, 4, generator=rng)
+    sd["h.0.mlp.down_proj.weight"] = torch.randn(4, 8, generator=rng)
+    monkeypatch.setattr(planted, "sys", SimpleNamespace(platform="darwin"))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Mac decomposition must not enter torch.linalg.svd")
+
+    monkeypatch.setattr(torch.linalg, "svd", forbidden)
+    for site, (u, v, units) in planted.decompose(sd, cfg).items():
+        weight = sd[f"{site}.weight"]
+        assert u.dtype == v.dtype == weight.dtype
+        assert torch.allclose((v @ u).T, weight, atol=2e-6, rtol=2e-6)
+        if ".attn." in site:
+            for head in range(2):
+                expected = torch.zeros_like(weight)
+                if site.endswith("o_proj"):
+                    expected[:, head * 2:(head + 1) * 2] = weight[:, head * 2:(head + 1) * 2]
+                else:
+                    expected[head * 2:(head + 1) * 2] = weight[head * 2:(head + 1) * 2]
+                selected = units == head
+                assert torch.allclose((v[:, selected] @ u[selected]).T, expected, atol=2e-6, rtol=2e-6)

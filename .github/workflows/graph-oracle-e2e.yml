@@ -41,7 +41,7 @@ jobs:
       - name: Install CPU torch and the test dependencies
         run: |
           python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -q 'pytest>=8' numpy safetensors transformers peft tokenizers huggingface_hub httpx
+          python -m pip install -q 'pytest>=8' numpy scipy safetensors transformers peft tokenizers huggingface_hub httpx
 
       - name: Check executed toy wiring
         run: python -m pytest experiments/oracle/toyloop/test_wiring.py -q --tb=short

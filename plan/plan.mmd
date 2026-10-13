@@ -30,6 +30,10 @@
 %% Pilot: sft_codex-compatible97-q8-1012 excludes 8 reserved noncopy controls as well as all 40 copy tests.
 %% Tinker project 3f598f31-2ffa-4eb4-b302-909eb234fb7d; 49 steps x 8; $5 allowance incl. dev9020-9027 comparison.
 %% Distinct from primerl's full S1 arms. Judge on fixed development tasks, not falling training loss.
+%% Pilot training completed for $2.2379104; paired base/trained dev8 samples are running.
+%% Successful SFT skills feed integration directly; RL is an optional improvement, not a prerequisite.
+%% Grounded-English pilot: train6002/6011, one eval-passing carrier per text; writer outcomes withheld.
+%% Require executable, nontrivial claims on unseen donor values; no model-generated prose counts before execution.
 %% Toolenv r5: only 16/20 baseline tasks completed (one worker OOM). Search beats random point fidelity 16/16,
 %% but VPD top-k aggregate phi only 8/16. Worker failure must propagate; partial data are never full completion.
 %% Rendering: .github/workflows/plan-render.yml writes plan/plan.png and the image-only README block.
@@ -67,7 +71,7 @@ flowchart BT
   SUP["<b>Verified behavior supervision</b><br/>QA and edit targets ready;<br/>grounded English join still empty;<br/>use existing carriers or planted mechanisms<br/>ACTIVE · varteach, rustmove, primerl, codex"]
   GATEC{{"<b>Check C</b> · does learning add value?<br/>SFT arms vs trivial baselines and<br/>the search route on dev texts;<br/>picks the RL starting point"}}
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
-    S1READY["<b>Compatible SFT pilot</b><br/>97 rows; mechanism tests excluded;<br/>circuits, QA and edits; no English<br/>49 steps; fixed dev9020–9027<br/>TRAINING · codex · $5 allowance"]
+    S1READY["<b>Compatible SFT pilot</b><br/>97 rows; mechanism tests excluded;<br/>49 steps trained for $2.24;<br/>base vs trained on dev9020–9027<br/>EVALUATING · codex · $5 allowance"]
     S1["<b>SFT · influential starts</b><br/>494 targets, held-out pp 0.965,<br/>median 357 nodes<br/>LAUNCHING · primerl"]
     S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
@@ -108,6 +112,7 @@ flowchart BT
   TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo of planted toys, small-LM oracle:<br/>SFT, then RL on executed reward;<br/>Gate B controls where truth is known<br/>ACTIVE · toyloop"]
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
+  ENGP["<b>Grounded English pilot</b><br/>two existing train-text carriers;<br/>writer predicts unseen donor values;<br/>execute claims before using labels<br/>PREPARING · codex/variable_reward"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -143,6 +148,7 @@ flowchart BT
 
   %% ===================== edges: to the top (links 8-19) =====================
   RLS -. each successful arm .-> ORC
+  SFTS -. each successful arm .-> ORC
   ORC --> C1
   ORC --> C2
   ORC --> C3
@@ -177,6 +183,9 @@ flowchart BT
   W6 -. falsifies reward rankings .-> GATEB
   SEM --> W1
   SEM -. tests claims .-> C2
+  SEM --> ENGP
+  ENG --> ENGP
+  ENGP -. verified claims only .-> SUP
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
   T4 -. new circuits .-> TOOLS
@@ -186,6 +195,7 @@ flowchart BT
   SUP --> C2
   SUP --> C3
   SUP -. ready-made supervision .-> RLS
+  SUP -. ready-made supervision .-> SFTS
   TOOLS --> C1
   TOOLS --> C2
   TOOLS --> C3
@@ -239,7 +249,7 @@ flowchart BT
   class I6,W5 done
   class T4 blocked
   class I3,S2,SUP,LAT1,W6 check
-  class S1READY active
+  class S1READY,ENGP active
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting
   class LAT2,UVPD later

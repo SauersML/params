@@ -43,6 +43,8 @@ import run_planted as rp  # noqa: E402
 TOYS = "binding_km,binding_fp,route1,route2,additive,interaction,cancel"
 RESULTS = HERE / "results"
 CHECKS = ("wrong_eq", "empty", "shuffled", "collapsed")
+RANDOM_OVERLAP = 0.75
+TIE = 1e-9
 
 
 def layer_kind(n: str) -> tuple[int, str]:
@@ -158,8 +160,10 @@ def candidates(name: str, nat, tx, rng) -> dict:
                 others["true - 1 + (+u neuron)"] = to_size(true, N - len(plus), [], rng) + plus
         for k, v in others.items():
             c[k] = ("wrong_eq", sorted(to_size(v, N, allact, rng)))
-        for s in range(3):
-            c[f"random actives #{s}"] = ("wrong_eq", sorted(to_size([], N, allact, np.random.default_rng(1000 + s))))
+        for s in range(3):   # random draws sharing at most RANDOM_OVERLAP of the true set (else not wrong: left out)
+            v = to_size([], N, allact, np.random.default_rng(1000 + s))
+            if len(set(v) & set(true)) <= RANDOM_OVERLAP * N:
+                c[f"random actives #{s}"] = ("wrong_eq", sorted(v))
         for frac in (0.5, 1.0):
             c[f"swap {int(frac * 100)}% to wrong unit"] = ("wrong_eq", swapped(nat, tx, true, frac, rng))
         c["empty"] = ("empty", [])
@@ -268,7 +272,7 @@ def verdicts(rows: list[dict]) -> dict:
             if cand:
                 best = max(cand, key=lambda r: r["circuit_reward"])
                 m = tr["circuit_reward"] - best["circuit_reward"]
-                v[ch] = (m > 0, m, best["candidate"])
+                v[ch] = (True if m > TIE else "tie" if m > -TIE else False, m, best["candidate"])
         te = [r for r in rows if (r["toy"], r["text"], r["category"]) == (toy, i, "teacher")]
         if te:
             v["teacher"] = (None, tr["circuit_reward"] - te[0]["circuit_reward"], "teacher")
@@ -332,11 +336,11 @@ def variant_table(rows: list[dict]) -> list[str]:
         cells = []
         for t in ("full", "core"):
             for ch in CHECKS:
-                got = [v[ch][0] for k, v in V.items() if k[1] == t and ch in v]
+                got = [v[ch][0] is not False for k, v in V.items() if k[1] == t and ch in v]
                 cells.append(f"{sum(got)}/{len(got)}")
         for t in ("full", "core"):
             vs = [v for k, v in V.items() if k[1] == t]
-            cells.append(f"{sum(all(v[ch][0] for ch in CHECKS if ch in v) for v in vs)}/{len(vs)}")
+            cells.append(f"{sum(all(v[ch][0] is not False for ch in CHECKS if ch in v) for v in vs)}/{len(vs)}")
         L.append(f"| {var} | " + " | ".join(cells) + " |")
     return L + [""]
 
@@ -350,7 +354,8 @@ def markdown(rows: list[dict], args, notes: str = "") -> str:
          f"lifted. Texts per toy: {len(set(r['text'] for r in rows))}. Rows: `{args.out.name}`. Tiers: **full** (true = every "
          "reachable active piece of the planted units) and **core** (true = the planted route's positions only, see core_of); "
          "each tier has its own equal-size wrong circuits and controls.", "",
-         "Gate B holds on a text when R(true) > max R over each control category. Cell: texts passing, and the worst margin "
+         "Gate B holds on a text when R(true) > max R over each control category (an exact tie, |margin| < 1e-9, a control "
+         "behaviourally identical to true, is counted apart and not as a failure). Cell: texts passing, and the worst margin "
          "R(true) − R(best control) with that control (positive = true wins).", "", notes, "## Verdict per toy and tier", "",
          "| toy | tier | wrong_eq | empty | shuffled | collapsed | R(true) − R(teacher) | Gate B |", "|---|---|---|---|---|---|---|---|"]
     for toy, tier in groups:
@@ -361,10 +366,12 @@ def markdown(rows: list[dict], args, notes: str = "") -> str:
             if not got:
                 cells.append("n/a")
                 continue
-            ok = sum(g[0] for g in got)
-            allok &= ok == len(got)
+            ok = sum(g[0] is True for g in got)
+            ties = sum(g[0] == "tie" for g in got)
+            allok &= ok + ties == len(got)
             worst = min(got, key=lambda g: g[1])
-            cells.append(f"{'PASS' if ok == len(got) else 'FAIL'} {ok}/{len(got)} ({worst[1]:+.2f}, {worst[2]})")
+            cells.append(f"{'PASS' if ok + ties == len(got) else 'FAIL'} {ok}/{len(got)}{f' +{ties} tie' if ties else ''} "
+                         f"({worst[1]:+.2f}, {worst[2]})")
         te = [V[k]["teacher"][1] for k in keys if "teacher" in V[k]]
         cells.append(f"{np.mean(te):+.2f}" if te else "—")
         L.append(f"| {toy} | {tier} | " + " | ".join(cells) + f" | {'**PASS**' if allok else '**FAIL**'} |")

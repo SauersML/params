@@ -51,7 +51,7 @@ LN2 = math.log(2)
 ROWS = (5000, 6000)  # behaviours.py's split B and thirds
 THIRDS = {"fit": (5000, 5333), "val": (5333, 5666), "score": (5666, 6000)}
 CAP = {"fit": 24, "val": 24, "score": 64}  # instances (and controls) per third
-MIN_PAIRS = 40  # a preference's instances in the fit third, at least
+MIN_PAIRS = 24  # a preference's instances in the fit third, at least
 POOL = 128  # subcomponents ranked by local effect
 K_SET = 8  # subcomponents per restricted set at a site
 DRAWS = 2
@@ -69,9 +69,10 @@ def _top_tokens(ee, rows: range, tokens) -> dict:
 
 
 def preferences(ee, src, k: int, decode, log=print) -> list[dict]:
-    """The k most frequent (a, b) with b the most likely token after a at least MIN_PAIRS times in the fit third and
-    predicted after other tokens about as often (controls exist), distinct b; each a behaviour (behaviours.py's dict:
-    parts with instances, controls, rate)."""
+    """The k most frequent (a, b), both words (a space and three or more letters: a content preference such as " United"
+    -> " States", not punctuation or layout), with b the most likely token after a at least MIN_PAIRS times in the fit
+    third and predicted after other tokens at least as often (controls exist), distinct b; each a behaviour
+    (behaviours.py's dict: parts with instances, controls, rate)."""
     tops = _top_tokens(ee, range(*ROWS), src.tokens)
     pairs, b_count = {}, {}
     for r in range(*THIRDS["fit"]):
@@ -79,7 +80,12 @@ def preferences(ee, src, k: int, decode, log=print) -> list[dict]:
         for p in range(1, len(ids)):
             pairs[(ids[p], top[p])] = pairs.get((ids[p], top[p]), 0) + 1
             b_count[top[p]] = b_count.get(top[p], 0) + 1
-    ranked = sorted((n, a, b) for (a, b), n in pairs.items() if n >= MIN_PAIRS and a != b and b_count[b] - n >= MIN_PAIRS)
+    def word(t: int) -> bool:
+        x = decode([t])
+        return x.startswith(" ") and x[1:].isalpha() and len(x) >= 4
+
+    ranked = sorted((n, a, b) for (a, b), n in pairs.items()
+                    if n >= MIN_PAIRS and a != b and b_count[b] - n >= MIN_PAIRS and word(a) and word(b))
     out, used = [], set()
     for n, a, b in reversed(ranked):
         if b in used or len(out) >= k:

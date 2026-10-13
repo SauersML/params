@@ -74,7 +74,7 @@ flowchart BT
     I1["<b>Candidate list</b><br/>VPD actives at listed positions;<br/>coverage depends on task and trimming<br/>IMPLEMENTED"]
     I2["<b>Context fit</b><br/>trims 52 of 444 questions,<br/>hiding 21% of their targets<br/>DONE"]
     I3["<b>Coverage audit</b><br/>old prompts showed 14% of targets;<br/>all target IDs remain expressible;<br/>recheck each new rendered format<br/>codex, rustmove"]
-    I4["<b>Learnability grid</b><br/>which input predicts actual effects?<br/>compare text, weights, features<br/>and cheap learned baselines<br/>ACTIVE · rustmove"]
+    I4["<b>Learnability grid</b><br/>decides the oracle's input format;<br/>ids, features, vocab, active, both;<br/>vectors real/random/id/permuted<br/>vs feature baselines, dev 9000-9099<br/>ACTIVE, pods launching · rustmove"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
     I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
   end

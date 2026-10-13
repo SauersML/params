@@ -33,13 +33,16 @@ DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/gene
 PER_TASK = 4
 
 
-def write(behavior: bool = False):
+def write(behavior: bool = False, per_task: int = PER_TASK):
+    """The kept tasks' first per_task one-token pairs as task files (a name is its task and example index: growing
+    per_task keeps every earlier file and its measurements in the meta file)."""
     import causalgym
 
     tasks = json.loads((DATA / "causalgym_tasks.json").read_text())
     b = "_b" if behavior else ""
     out = DATA / f"causalgym_texts{b}"
     out.mkdir(exist_ok=True)
+    old = json.loads((DATA / f"causalgym_texts{b}.json").read_text()) if (DATA / f"causalgym_texts{b}.json").exists() else {}
     ids, meta = [], {}
     for task, info in tasks.items():
         if not info["kept"]:
@@ -47,7 +50,7 @@ def write(behavior: bool = False):
         n = 0
         for k, ex in enumerate(info["examples"]):
             diff = [i for i, (x, y) in enumerate(zip(ex["base"], ex["src"])) if x != y]
-            if len(diff) != 1 or n >= PER_TASK:
+            if len(diff) != 1 or n >= per_task:
                 continue
             name = f"cg{'b' if behavior else ''}_{task.replace('-', '_')}_{k}"
             t = len(ex["base"]) - 1
@@ -57,8 +60,8 @@ def write(behavior: bool = False):
             if behavior:
                 tj["behavior"] = {"tokens": [ex["base_label"], ex["src_label"]], "pairs": [[diff[0], ex["src"][diff[0]]]]}
             (out / f"{name}.json").write_text(json.dumps(tj))
-            meta[name] = {"task": task, "pair": k, "p": diff[0], "z": ex["src"][diff[0]], "attractor": pw,
-                          "src": ex["src"], "base_label": ex["base_label"], "src_label": ex["src_label"]}
+            meta[name] = {**old.get(name, {}), "task": task, "pair": k, "p": diff[0], "z": ex["src"][diff[0]], "attractor": pw,
+                          "attractor_is_target": pw == t, "src": ex["src"], "base_label": ex["base_label"], "src_label": ex["src_label"]}
             ids.append(name)
             n += 1
     (DATA / f"causalgym_text_ids{b}.txt").write_text("\n".join(ids) + "\n")
@@ -335,6 +338,127 @@ def moved(tdir: str):
         native.free(nat.dev)
 
 
+def bounds_b():
+    """KL_empty and KL_VPD on the behavior (two-token KL, remainders live) for every cgb prompt the meta file lacks them
+    for: teacher.py's F1 is undefined where VPD's answer is no nearer the model than the empty circuit."""
+    import goal_eval
+    import native
+
+    meta = json.loads((DATA / "causalgym_texts_b.json").read_text())
+    ge = goal_eval.GoalEval(native.Native())
+    for nm in sorted(meta):
+        if meta[nm].get("kl_empty") is not None:
+            continue
+        tj = json.loads((DATA / "causalgym_texts_b" / f"{nm}.json").read_text())
+        pr = tj["prompts"][0]
+        tx = ge.text(pr["token_ids"], pr["target_positions"], native.task_seed(nm), task=tj)
+        e, v = ge._bounds(tx, "live")
+        meta[nm]["kl_empty"], meta[nm]["kl_vpd"] = float(e), float(v)
+        print(nm, round(float(e), 4), round(float(v), 4), flush=True)
+        (DATA / "causalgym_texts_b.json").write_text(json.dumps(meta))
+
+
+def texts_root() -> Path:
+    """A texts directory for local teacher runs: every vpd4l text linked and the cgb task files beside them (the shared
+    texts directory stays untouched)."""
+    import native
+
+    root = DATA / "texts_root"
+    d = root / "vpd4l"
+    d.mkdir(parents=True, exist_ok=True)
+    real = native.TEXTS / "vpd4l"
+    for f in os.listdir(real):
+        if f.endswith(".json") and not (d / f).exists():
+            (d / f).symlink_to(real / f)
+    for f in os.listdir(DATA / "causalgym_texts_b"):
+        if not (d / f).exists():
+            (d / f).symlink_to(DATA / "causalgym_texts_b" / f)
+    return root
+
+
+TEACH_DIR = DATA / "cg_teacher_b2"  # the behavior-mode v2.1 teacher circuits, every batch's (pods' copied in)
+
+
+def run_local(k: int = 0, P: int = 1):
+    """The v2.1 teacher in the behavior mode on the Mac for every usable cgb prompt without a circuit in TEACH_DIR:
+    teacher.py run in this process (runpy) with native.TEXTS on texts_root()."""
+    import runpy
+
+    import native
+
+    meta = json.loads((DATA / "causalgym_texts_b.json").read_text())
+    TEACH_DIR.mkdir(exist_ok=True)
+    names = [nm for nm, m in sorted(meta.items()) if m.get("kl_empty") is not None and m["kl_empty"] > m["kl_vpd"]
+             and not (TEACH_DIR / f"{nm}.json").exists()][k::P]
+    if not names:
+        return
+    native.TEXTS = texts_root()
+    lst = DATA / f"cg_ids_local_{k}.txt"
+    lst.write_text("\n".join(names) + "\n")
+    sys.argv = ["teacher.py", "--tasks", str(lst), "--f1-start", "set", "--accept", "changed,necessity,nodes", "--accept-draws", "fv",
+                "--phi-check", "--max-tokens", "0", "--out", str(TEACH_DIR)]
+    runpy.run_path(str(ORACLE / "teacher.py"), run_name="__main__")
+
+
+def test_local():
+    """The circuit test (path-patched terms, reward v3's R against the variable moved to the attractor) on every circuit
+    in TEACH_DIR, on the Mac -> DATA/cg_teacher_b2_test.jsonl (resumable by name)."""
+    out = DATA / "cg_teacher_b2_test.jsonl"
+    done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
+    names = sorted(p.stem for p in TEACH_DIR.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_")
+                   and p.stem not in done)
+    test(names, TEACH_DIR, out, "_b")
+
+
+def _boot(xs, stat=np.mean, B: int = 2000, seed: int = 2951):
+    """(statistic, 2.5th and 97.5th percentiles of its bootstrap over the items)."""
+    xs = np.asarray([x for x in xs if x is not None], dtype=float)
+    if len(xs) == 0:
+        return None, None, None
+    r = np.random.default_rng(seed)
+    bs = [stat(xs[r.integers(len(xs), size=len(xs))]) for _ in range(B)]
+    return float(stat(xs)), float(np.percentile(bs, 2.5)), float(np.percentile(bs, 97.5))
+
+
+def report60():
+    """The behavior-mode teacher on every usable prompt, with bootstrap 95% intervals over prompts. Rows say their mode:
+    "pp" (path-patched: the circuit's nodes given the real values on the changed text, everything else at the text's;
+    the reward's changed-input claims) or "standalone" (the circuit's masked run alone on each input; sufficiency)."""
+    meta = json.loads((DATA / "causalgym_texts_b.json").read_text())
+    rd = lambda f: [json.loads(x) for x in (DATA / f).read_text().splitlines()] if (DATA / f).exists() else []  # noqa: E731
+    att = {r["name"]: r for r in rd("cg_attractor.jsonl")}
+    mov = {r["name"]: r for r in rd("cg_moved.jsonl")}
+    tst = {}
+    for r in rd("cg_teacher_b2_test.jsonl"):
+        tst.setdefault(r["name"], {})[r["variant"]] = r
+    names = sorted(n for n in att if n in mov)
+    real = [n for n in names if not meta[n]["attractor_is_target"] and meta[n]["task"] != "agr_gender"]
+    fmt = lambda t: "-" if t[0] is None else f"{t[0]:.2f} [{t[1]:.2f}, {t[2]:.2f}]"  # noqa: E731
+    print(f"behavior-mode v2.1 teacher circuits: {len(names)} prompts over {len({meta[n]['task'] for n in names})} tasks "
+          f"({len(real)} with the attractor at a context position); 95% bootstrap intervals over prompts")
+    print(f"  subject position held                         {fmt(_boot([att[n]['at_variable'] > 0 for n in names]))}")
+    print(f"  attractor held (attractor a context position) {fmt(_boot([att[n]['at_attractor'] > 0 for n in real]))}")
+    kept = [n for n in real if att[n]["at_attractor"] > 0 and att[n].get("model_attractor") is not None]
+    used = [att[n]["model_attractor"] > max(att[n]["model_random_like_attractor"] or 0, 0.1) for n in kept]
+    print(f"  of the held attractors, used by the model (removal above random and 0.1 bits): {sum(used)} of {len(kept)}")
+    held = [n for n in names if att[n]["at_variable"] > 0]
+    print(f"  move carried, standalone (c), subject-holding circuits: median {fmt(_boot([mov[n]['moved_c'] for n in held], np.median))}, "
+          f"mean {fmt(_boot([mov[n]['moved_c'] for n in held]))}")
+    print(f"  move carried, standalone (x), subject-holding circuits: median {fmt(_boot([mov[n]['moved_x'] for n in held], np.median))}, "
+          f"mean {fmt(_boot([mov[n]['moved_x'] for n in held]))}")
+    pp = [tst[n]["teacher"].get("s_track_pp") for n in names if n in tst and "teacher" in tst[n]]
+    print(f"  pp: s_track_pp (the minimal pair first among the changes), median {fmt(_boot(pp, np.median))}")
+    pref = [tst[n]["teacher"]["reward"] > tst[n]["teacher_variable_at_attractor"]["reward"] for n in names
+            if n in tst and "teacher_variable_at_attractor" in tst[n] and tst[n]["teacher"].get("reward") is not None
+            and tst[n]["teacher_variable_at_attractor"].get("reward") is not None]
+    print(f"  R prefers the circuit over it with the subject's nodes moved to the attractor: {fmt(_boot(pref))} (n={len(pref)})")
+    for task in sorted({meta[n]["task"] for n in names}):
+        ns = [n for n in names if meta[n]["task"] == task]
+        print(f"    {task:24s} n {len(ns):2d}  subject {np.mean([att[n]['at_variable'] > 0 for n in ns]):.2f}  attractor "
+              f"{np.mean([att[n]['at_attractor'] > 0 for n in ns]) if not meta[ns[0]]['attractor_is_target'] else float('nan'):.2f}  "
+              f"standalone move median {np.median([mov[n]['moved_c'] for n in ns if mov[n]['moved_c'] is not None]):.2f}")
+
+
 def test(names: list, tdir: Path, out: Path, b: str = ""):
     import components
     import goal_eval
@@ -428,11 +552,13 @@ def report(behavior: bool = False, v2: bool = False):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("write", "run", "report", "masks", "test", "attractor", "gender_masks", "moved"))
+    ap.add_argument("cmd", choices=("write", "run", "report", "masks", "test", "attractor", "gender_masks", "moved", "bounds",
+                                    "run_local", "test_local", "report60"))
+    ap.add_argument("--per-task", type=int, default=PER_TASK, help="write: pairs per task")
     ap.add_argument("--dir", help="attractor: the teacher circuits' directory")
     ap.add_argument("args", nargs="*", type=int)
     ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
     ap.add_argument("--v2", action="store_true", help="run, report: the v2.1 teacher (start set, acceptance, phi pick)")
     a = ap.parse_args()
-    {"write": lambda: write(a.behavior), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
+    {"write": lambda: write(a.behavior, a.per_task), "bounds": bounds_b, "test_local": test_local, "report60": report60, "run_local": lambda: run_local(*a.args), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
      "masks": lambda: masks_run(*a.args, behavior=a.behavior), "test": lambda: test_dir(*a.args, behavior=a.behavior), "attractor": lambda: attractor(a.dir), "gender_masks": gender_masks, "moved": lambda: moved(a.dir)}[a.cmd]()

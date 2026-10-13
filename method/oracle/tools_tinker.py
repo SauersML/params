@@ -97,8 +97,15 @@ class HttpTool:
         return simple_tool_result(content, call_id=input.call_id or "", name=self.name)
 
 
-async def make_env(client: httpx.AsyncClient, server: str, task: str, renderer, max_turns: int, max_tokens: int):
-    """(the cookbook env of one episode on a text, the server's episode record {"episode", "result"})."""
+FORCE = ("Your tool budget is spent. Reply now with your final answer in the format the question asks for, with no tool "
+         "call: the CIRCUIT may be your best draft's id alone (CIRCUIT: d3).")
+
+
+async def make_env(client: httpx.AsyncClient, server: str, task: str, renderer, max_turns: int, max_tokens: int, policy=None):
+    """(the cookbook env of one episode on a text, the server's episode record {"episode", "result"}). With policy, an
+    episode that ends on a tool call (its turn budget spent) gets one forced final turn (the lead's 10-13 protocol fix
+    for the strong-agent baseline): FORCE as a user message and one sample whose text is the answer, tool calls in it
+    ignored; its tokens are kept in the record ("forced": prefill and sampled)."""
     from tinker_cookbook.renderers import get_text_content
     from tinker_cookbook.tool_use import build_agent_tool_env
 
@@ -113,6 +120,11 @@ async def make_env(client: httpx.AsyncClient, server: str, task: str, renderer, 
     async def reward_fn(history):
         last = history[-1] if history else {}
         answer = get_text_content(last) if last.get("role") == "assistant" and not last.get("tool_calls") else None
+        if answer is None and policy is not None:  # the forced final turn
+            prompt = renderer.build_generation_prompt(list(history) + [{"role": "user", "content": FORCE}])
+            out = await policy(prompt, renderer.get_stop_sequences())
+            answer = get_text_content(renderer.parse_response(out.tokens)[0]) or ""
+            record["forced"] = {"prefill": prompt.length, "sampled": len(out.tokens)}
         turns = sum(1 for m in history if m.get("role") == "assistant")
         res = (await client.post(f"{server}/submit", json={"episode": eid, "answer": answer, "turns": turns}, timeout=None)).json()
         record["result"] = res
@@ -164,11 +176,13 @@ def traj_row(traj, record: dict, renderer) -> dict:
             "final_context": (obs[-1] + acts[-1]) if obs else 0, "log": res.get("log"), "messages": msgs}
 
 
-async def rollouts(policy, server: str, tasks: list[str], group: int, renderer, max_turns: int, max_tokens: int):
+async def rollouts(policy, server: str, tasks: list[str], group: int, renderer, max_turns: int, max_tokens: int,
+                   force: bool = False):
     from tinker_cookbook.rl.rollout_runner import run_rollout
 
     async with httpx.AsyncClient() as client:
-        made = [await make_env(client, server, t, renderer, max_turns, max_tokens) for t in tasks for _ in range(group)]
+        made = [await make_env(client, server, t, renderer, max_turns, max_tokens, policy if force else None)
+                for t in tasks for _ in range(group)]
         trajs = await asyncio.gather(*[run_rollout(policy, env) for env, _ in made], return_exceptions=True)
     return [(tr, rec) for tr, (_, rec) in zip(trajs, made)]
 
@@ -202,7 +216,7 @@ def rollout(a) -> None:
     tasks = _tasks(a.tasks)
     for t in tasks:
         spend.check()
-        got = asyncio.run(rollouts(policy, a.server, [t], a.group, renderer, a.max_turns, a.max_tokens))
+        got = asyncio.run(rollouts(policy, a.server, [t], a.group, renderer, a.max_turns, a.max_tokens, a.force))
         with a.out.open("a") as f:
             for tr, rec in got:
                 if isinstance(tr, BaseException):
@@ -210,7 +224,10 @@ def rollout(a) -> None:
                     print(json.dumps({"task": t, "error": f"{type(tr).__name__}: {tr}"}), flush=True)
                     continue
                 row = traj_row(tr, rec, renderer)
-                spend.add("rollout", prefill=sum(row["observation_tokens"]), sampled=sum(row["sampled_tokens"]))
+                forced = rec.get("forced") or {}
+                row["forced"] = bool(forced)
+                spend.add("rollout", prefill=sum(row["observation_tokens"]) + forced.get("prefill", 0),
+                          sampled=sum(row["sampled_tokens"]) + forced.get("sampled", 0))
                 row["total_usd"] = spend.total
                 f.write(json.dumps(row) + "\n")
                 print(json.dumps({k: row[k] for k in ("task", "reward", "calls", "turns", "stop", "final_context", "total_usd")}), flush=True)
@@ -360,6 +377,8 @@ def main():
         p.add_argument("--max-turns", type=int, default=24)
         p.add_argument("--thinking", action="store_true", help="Qwen3's own reasoning before each turn")
         p.add_argument("--usd-cap", type=float, default=3.0)
+        p.add_argument("--force", action="store_true", help="rollout: a forced final answer turn when the budget runs out "
+                       "(FORCE; the strong-agent baseline's protocol, not RL's)")
         if name == "rollout":
             p.add_argument("--out", type=Path, required=True)
         else:

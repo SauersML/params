@@ -506,11 +506,11 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
             # RAVEL's names: Cause, the carrier moves the prediction as its inputs do (f on-target); Iso, off-target draws
             # that can reach the carrier (a change before it: one after it passes by construction, the model is causal)
             # leave the prediction; Disentangle their mean
-            reach = [d for d in got["draws"] if d["kind"] == "off" and d["s"] is not None and d["changes"][0][0] < min(r["at"])]
+            reach = [d for d in got["draws"] if d["kind"] == "off" and d["f"] is not None and d["changes"][0][0] < min(r["at"])]
             w = sum(d["d0"] for d in reach)
-            iso = sum(d["d0"] * d["s"] for d in reach) / w if w > 0 else None
+            iso = sum(d["d0"] * d["f"] for d in reach) / w if w > 0 else None  # f's scale, as Cause
             v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "f_off": x["f_off"], "s_off": x["s_off"], "cause": x["f_on"], "iso": iso,
-                                    "iso_draws": len(reach), "off_draws": x["draws_off"],
+                                    "iso_scale": "f", "iso_draws": len(reach), "off_draws": x["draws_off"],
                                     "disentangle": None if x["f_on"] is None or iso is None else (x["f_on"] + iso) / 2}
         tv = as_json("trivial", r["inputs"], r["trivial"]["group"])
         x = together(variables.Scorer(ge), tx, variables.parse([tv], nat.C), "eval", draws)["variables"][0]

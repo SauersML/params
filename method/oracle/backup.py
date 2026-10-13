@@ -377,9 +377,11 @@ class Backup:
         """The circuit's runs (C's semantics: the circuit, its expansion blocks and extra on, everything else off) with
         every RMS norm's scale held at the model's on the text (vpd_model.Target.norm_parts: each norm reads its
         input with the statistics of the model's input there), at the point and under the search's draws, and the
-        model's runs less each draw the same way. Whether the circuit's claimed removal effect is a normalization
-        effect: an outside switched off shrinks the residual stream, each norm then scales the circuit's own writes up,
-        and a removed node's share of the normed stream grows. {"circuit": score fields (s_search, f1, j, kl_point,
+        model's runs less each draw the same way: how much of the circuit's claimed removal effect goes through the
+        norms' response to the removal. (Measured on dev text9000-9019's influential starts: held norms bring the
+        circuit's overstate from 2.04 to 0.83, the model's own being 1.05, at a point-F1 cost, 0.79 -> 0.64; the
+        circuit's stream is not smaller than the model's, stream_ratio ~1 at the targets' norms and 1.1-7.6 at the
+        final norm, so it is not the norm scaling a smaller stream up.) {"circuit": score fields (s_search, f1, j, kl_point,
         overstate against the model's real W), "model": {"overstate": mean KL(model || model less d, norms held) / W,
         "overstate_unheld": the model's own in that form}}."""
         nat, E, dev, tg = self.nat, self.E, self.nat.dev, self.nat.target

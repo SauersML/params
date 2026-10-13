@@ -99,7 +99,7 @@ def train(P: Patcher, src: torch.Tensor, target: torch.Tensor, lam: float, steps
 
 def fit(nat, tx, ins: tuple, at: tuple, cands: list[tuple], lam: float = 0.1, steps: int = STEPS) -> list[tuple]:
     """A variable's mask over cands (subcomponents at the carrier positions at): Cause donors the 64 alternative tokens at
-    each input position (var_classes.alternatives), Iso donors 16 at each influential position before the carrier
+    each input position (var_classes.alternatives), Iso donors 16 at each influential position strictly before the carrier
     outside the inputs (a change there reaches the carrier but is not the variable's); the candidates kept."""
     import var_classes
 
@@ -109,7 +109,7 @@ def fit(nat, tx, ins: tuple, at: tuple, cands: list[tuple], lam: float = 0.1, st
             x = list(tx.ids)
             x[q] = z
             texts.append(x)
-    for q in [q for q, _ in tx.f2 if q <= min(at) and q not in ins]:
+    for q in [q for q, _ in tx.f2 if q < min(at) and q not in ins]:  # a change at the carrier passes through it
         for z in var_classes.alternatives(nat, tx.ids, q, int(tx.seed), top=8, sampled=8):
             x = list(tx.ids)
             x[q] = z

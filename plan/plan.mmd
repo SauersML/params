@@ -260,7 +260,7 @@ flowchart BT
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
     S1READY["<b>SFT pilot: format learned</b><br/>5/8 valid; QA near no-change;<br/>no advantage over matched VPD;<br/>feeds input and control ablations<br/>CHECK · codex · $2.51 total"]
     S1["<b>SFT · influential starts</b><br/>dev 9020-9049: phi 0.86→0.88→0.91 (bar 1.2),<br/>beats VPD top k 24/5; shuffled evidence<br/>phi 0.22: reads the text; below start 1.08<br/>DONE · primerl"]
-    S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
+    S2["<b>SFT · pruned v2</b><br/>trained on 148 v2.1 circuits ($3.83);<br/>curve and shuffled control on dev running;<br/>retrain on v2.2 when it lands<br/>ACTIVE · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
@@ -289,7 +289,7 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>40 copy + 20 mistake texts, reward v3 terms:<br/>wrong source loses 0.80-0.82; irrelevant parts 0.59<br/>(below the bar g≈0: extra parts free); equal-bits<br/>target actives beat the copy circuit 0.72;<br/>E4 value maps: identity 0.86, partition 0.04;<br/>CausalGym: variable vs attractor 0.50<br/>DONE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>package on main (aa79889): floor,<br/>eps cap, N guard, Φ cap, no node cap;<br/>toys core 8/15→pass but collapsed;<br/>DONE · inframove, primerl"]
+    W4["<b>Reward repair</b><br/>package aa79889; linear-share pooling 71c66c3;<br/>N with background on; omitted family;<br/>next: per-family floors (−4·shortfall),<br/>ungated tie-break, norm scales at x<br/>ACTIVE · inframove"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
     W6["<b>Diagnose fidelity failures</b><br/>retain draws and every family score;<br/>unchanged reward; export checks pass;<br/>separate response error from uncertainty<br/>IMPLEMENTED · codex · 3017b64"]
   end

@@ -575,11 +575,14 @@ ENV_SPREAD_FLOOR = 1e-3  # env_scales: an environment whose centred rewards all 
 def load_envs(a) -> dict:
     """The environments an rl run samples from, name -> {"rows": question rows (each with "task", or "id", and "question"),
     "scorer": URL[,URL...], "extra": fields added to every scoring request (e.g. edits' {"part": "score"}), "weight",
-    "expect_semantics", "expect_source"}: the positional questions with --scorer, --request-extra and --expect-* as
+    "expect_semantics", "expect_source", "clip_low": the trained reward's floor, for a reward without one (edits' removal
+    of a central subcomponent scores -13; groups.jsonl keeps the scorer's R)}: the positional questions with --scorer, --request-extra and --expect-* as
     --env-name, and every environment of --envs (a JSON file of the same fields, rows a path) beside it."""
     main = {"rows": a.questions, "scorer": a.scorer, "extra": json.loads(a.request_extra) if a.request_extra else {},
-            "weight": a.env_weight, "expect_semantics": a.expect_semantics, "expect_source": a.expect_source}
-    envs = {a.env_name: main} | ({k: {"extra": {}, "weight": 1.0, "expect_semantics": None, "expect_source": None, **v}
+            "weight": a.env_weight, "expect_semantics": a.expect_semantics, "expect_source": a.expect_source,
+            "clip_low": a.reward_clip_low}
+    envs = {a.env_name: main} | ({k: {"extra": {}, "weight": 1.0, "expect_semantics": None, "expect_source": None,
+                                      "clip_low": None, **v}
                                   for k, v in json.loads(Path(a.envs).read_text()).items()} if a.envs else {})
     for name, env in envs.items():
         rows = [json.loads(x) for x in Path(env["rows"]).read_text().splitlines() if x.strip()]
@@ -717,6 +720,8 @@ def rl(a) -> None:
             if why := scorer_mismatch(scores, envs[q["_env"]]["expect_semantics"], envs[q["_env"]]["expect_source"]):
                 raise SystemExit(f"step {step}, {q['task']}: {why}")
             rewards = [stage_reward(s, stage) for s in scores]
+            if (lo := envs[q["_env"]]["clip_low"]) is not None:  # an environment's floor on the trained reward
+                rewards = [max(lo, x) for x in rewards]
             if bad := reward_mismatches(q, scores, rewards):
                 (a.log / f"mismatch_{step}_{q['task']}.json").write_text(json.dumps({"rewards": rewards, "scores": scores, "answers": bad}))
                 raise SystemExit(f"step {step}, {q['task']}: trained reward is not the scorer's R for answers {bad} "
@@ -823,6 +828,8 @@ def main():
                    "beside the run) stop improving on its terms (PLATEAU checkpoints)")
     r.add_argument("--request-extra", help="JSON fields added to every scoring request of the positional questions' environment "
                    "(an environment's own server shape, e.g. edits' '{\"part\": \"score\"}')")
+    r.add_argument("--reward-clip-low", type=float, help="the trained reward's floor for the positional environment (a reward "
+                   "with no lower bound: one sample at -13 would set its group's advantages); the scorer's R is logged as is")
     r.add_argument("--env-name", default="main", help="the positional questions' environment name (logs, --envs mixes)")
     r.add_argument("--env-weight", type=float, default=1.0, help="its share of a step's texts when --envs adds others")
     r.add_argument("--envs", help="JSON file: more environments, name -> {rows, scorer, extra, weight, expect_semantics, "

@@ -66,8 +66,10 @@ def test_environments_load_mix_by_weight_and_scale_by_their_own_spread(tmp_path)
     (tmp_path / "envs.json").write_text(json.dumps({"edits": {"rows": str(tmp_path / "e.jsonl"), "scorer": "http://x:8766/score",
                                                               "extra": {"part": "score"}, "weight": 1.0}}))
     a = SimpleNamespace(questions=tmp_path / "c.jsonl", scorer="http://x:8767/score", request_extra=None, env_name="circuit",
-                        env_weight=3.0, expect_semantics="n", expect_source="d210d58", envs=str(tmp_path / "envs.json"))
+                        env_weight=3.0, expect_semantics="n", expect_source="d210d58", envs=str(tmp_path / "envs.json"),
+                        reward_clip_low=None)
     envs = tt.load_envs(a)
+    assert envs["circuit"]["clip_low"] is None and envs["edits"]["clip_low"] is None
     assert envs["edits"]["questions"][0]["task"] == "pref:0" and envs["edits"]["extra"] == {"part": "score"}
     assert envs["edits"]["expect_semantics"] is None and envs["circuit"]["expect_semantics"] == "n"
     got = tt.draw(envs, 4, random.Random(0))

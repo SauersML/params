@@ -1104,7 +1104,9 @@ def both(*accepts):
     return accept
 
 
-VAL_EVERY = 10        # F+V: removals between validation checks
+VAL_EVERY = 1         # F+V: removals between validation checks (--val-every): every removal, so a level keeps its
+# passing removals and ends at the first that fails (the lead's 10-13: at 10, text9015's levels made 3-15 removals
+# each, all reverted at the level-end check, 0.878-0.898 against a floor of about 0.90; a check costs about 0.1 s)
 
 
 class Validated:
@@ -1116,7 +1118,7 @@ class Validated:
     def __init__(self, desc: Descent, graph_of, acceptance: Acceptance, floor: float, log: list | None = None,
                  every: int | None = None):
         self.desc, self.graph_of, self.acc, self.floor, self.log = desc, graph_of, acceptance, floor, log
-        self.every = every or VAL_EVERY
+        self.every = every or VAL_EVERY                  # (the module's at construction: --val-every sets it)
         self.n, self.trace = 0, []
         self.good = (desc.on.clone(), len(log) if log is not None else 0)
 
@@ -2073,6 +2075,8 @@ def main():
                     "forward_start's set (F2's position groups, or one site at one position, added in order of phi until "
                     "the bar), beside the plain (and --backup) arms (implies --phi-check)")
     ap.add_argument("--phi-log", action="store_true", help="--phi-check (whose set search scores every stage)")
+    ap.add_argument("--val-every", type=int, default=VAL_EVERY, help="with fv draws: removals between validation checks "
+                    "(Validated; 1, every removal, keeps a level's passing removals)")
     ap.add_argument("--accept-draws", choices=("fixed", "discriminating", "fresh", "fv"), default="fixed",
                     help="--accept changed's draws in pp mode: the search split's fixed ones, or per check a fresh sample of "
                          "64 from a pool disjoint from eval, each candidate judged on the 16 where it and the current circuit "
@@ -2124,6 +2128,7 @@ def main():
         texts = [native.TEXTS / "vpd4l" / f"{t}.json" for t in args.tasks.read_text().split()]
     else:
         texts = native.tasks(args.split)[:args.n]
+    globals()["VAL_EVERY"] = args.val_every
     ge = goal_eval.GoalEval(native.Native(), chunk=args.batch, semantics=args.semantics)
     goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = PACK_FLIP_ROWS, PACK_CHANGED_ROWS   # batch sizes only (backup.py's)
     tokens = None

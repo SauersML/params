@@ -593,6 +593,24 @@ def test_ranked_draws_each_hold_their_floor():
     assert teacher.floor_of(0.8) == goal_eval.floors({"s_point_c": 0.8}, ["point"])["point"]
 
 
+def test_validated_keeps_each_passing_removal_by_default():
+    # every removal checked (VAL_EVERY 1): units 0 and 1 go (validation 0.8, then 0.6 < 0.7 on the second), so the level
+    # keeps the first removal and ends there, not reverting it with the failing one
+    assert teacher.VAL_EVERY == 1
+    toy, log = Toy([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]), []
+
+    class Val:
+        draws = "fv"
+
+        def validation(self, on):
+            return float(on[:5].float().mean()), []
+    v = teacher.Validated(toy, lambda on: on, Val(), 0.7, log)
+    for _ in range(8):
+        if toy.prune("unit", 0.115, rounds=1, log=log, after=v):
+            break
+    assert toy.on.tolist() == [False] + [True] * 7 and len(log) == 1
+
+
 def test_validated_backs_off_to_the_last_passing_set():
     # every removal admitted; the validation score is the share of units 0-4 still on: below 0.7 once two of them go
     toy, log = Toy([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]), []

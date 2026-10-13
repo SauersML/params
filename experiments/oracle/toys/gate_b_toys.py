@@ -289,43 +289,55 @@ def diagnose(tr: dict, w: dict) -> str:
 
 
 EPS_CAP = 0.05
-VARIANTS = {   # reward v3's circuit part recomputed from a row's family scores and eps (rescore): candidate repairs
-    "v3": "as is: phi over (1 - s + eps_own), g = sigmoid_2(4 (phi - phi_tau)), R = phi + g ½compact",
+PHI_HEADROOM = 2.0
+REPAIRS = {
     "eps_cap": f"each family's eps capped at {EPS_CAP} (a noisy family cannot push the residual above 1 - s + {EPS_CAP})",
+    "s_clip": "each family's raw score clipped to [0, 1] (the clipped estimators goal_eval keeps beside the raw ones; N's raw specificity ratio reaches -5 on a good circuit)",
     "gate_ramp": "g x clip(phi / phi_tau, 0, 1): compactness gets nothing at phi <= 0 (the empty and one-node circuits)",
-    "eps_cap+gate_ramp": "both",
+    "phi_cap": f"phi capped at phi_tau + {PHI_HEADROOM} (past the bar, faithfulness stops paying and compactness ranks)",
 }
+VARIANTS = ["v3", "eps_cap", "s_clip", "gate_ramp", "phi_cap", "eps_cap+s_clip", "eps_cap+s_clip+gate_ramp",
+            "eps_cap+s_clip+phi_cap", "eps_cap+s_clip+gate_ramp+phi_cap"]
 
 
 def rescore(r: dict, variant: str) -> float | None:
-    """R of a row under a variant (VARIANTS), from its family scores, eps, phi_tau and compact."""
+    """R of a row under a variant ("v3" or "+"-joined REPAIRS), from its family scores, eps, phi_tau and compact (the
+    bar phi_tau is kept as measured)."""
+    on = set(variant.split("+"))
     fam, eps, pt = r.get("family") or {}, r.get("eps") or {}, r.get("phi_tau")
     sc = [(s_, eps.get(f, goal_eval.EPS_FLOOR)) for f, s_ in fam.items() if s_ is not None]
-    if "eps_cap" in variant:
+    if "eps_cap" in on:
         sc = [(s_, min(e, EPS_CAP)) for s_, e in sc]
-    ph = goal_eval._phi(sc) if variant != "v3" else r.get("phi")
+    if "s_clip" in on:
+        sc = [(min(1.0, max(0.0, s_)), e) for s_, e in sc]
+    ph = goal_eval._phi(sc) if on & {"eps_cap", "s_clip"} else r.get("phi")
     if ph is None or pt is None:
         return r.get("circuit_reward")
+    if "phi_cap" in on:
+        ph = min(ph, pt + PHI_HEADROOM)
     g = 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (ph - pt)))
-    if "gate_ramp" in variant:
+    if "gate_ramp" in on:
         g *= min(1.0, max(0.0, ph / pt)) if pt > 0 else 1.0
     return ph + g * 0.5 * (r.get("compact") or 0.0)
 
 
 def variant_table(rows: list[dict]) -> list[str]:
-    L = ["## Candidate repairs, rescored from the same rows", "", "Gate B checks passed (texts × tiers) when R is recomputed "
-         "from each row's family scores and eps (no new measurement):", ""]
-    L += [f"- **{k}**: {v}" for k, v in VARIANTS.items()]
-    L += ["", "| variant | " + " | ".join(CHECKS) + " | all four |", "|---|" + "---|" * (len(CHECKS) + 1)]
+    L = ["## Candidate repairs, rescored from the same rows", "", "Gate B checks passed (texts) when R is recomputed from each "
+         "row's family scores and eps (no new measurement; phi_tau kept as measured):", ""]
+    L += [f"- **{k}**: {v}" for k, v in REPAIRS.items()]
+    L += ["", "| variant | " + " | ".join(f"{t}: {c}" for t in ("full", "core") for c in CHECKS) + " | full: all | core: all |",
+          "|---|" + "---|" * (2 * len(CHECKS) + 2)]
     for var in VARIANTS:
-        rr = [{**r, "circuit_reward": rescore(r, var)} for r in rows]
-        V = verdicts(rr)
+        V = verdicts([{**r, "circuit_reward": rescore(r, var)} for r in rows])
         cells = []
-        for ch in CHECKS:
-            got = [v[ch][0] for v in V.values() if ch in v]
-            cells.append(f"{sum(got)}/{len(got)}")
-        allp = sum(all(v[ch][0] for ch in CHECKS if ch in v) for v in V.values())
-        L.append(f"| {var} | " + " | ".join(cells) + f" | {allp}/{len(V)} |")
+        for t in ("full", "core"):
+            for ch in CHECKS:
+                got = [v[ch][0] for k, v in V.items() if k[1] == t and ch in v]
+                cells.append(f"{sum(got)}/{len(got)}")
+        for t in ("full", "core"):
+            vs = [v for k, v in V.items() if k[1] == t]
+            cells.append(f"{sum(all(v[ch][0] for ch in CHECKS if ch in v) for v in vs)}/{len(vs)}")
+        L.append(f"| {var} | " + " | ".join(cells) + " |")
     return L + [""]
 
 

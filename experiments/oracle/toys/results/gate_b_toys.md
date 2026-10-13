@@ -13,6 +13,8 @@ Gate B holds on a text when R(true) > max R over each control category. Cell: te
 | binding_km | core | FAIL 1/3 (-0.10, swap 50% to wrong unit) | PASS 3/3 (+0.07, empty) | FAIL 2/3 (-0.09, shuffled) | FAIL 0/3 (-6.11, all VPD actives) | -0.49 | **FAIL** |
 | binding_fp | full | PASS 3/3 (+5.62, other mechanism (padded/trimmed)) | PASS 3/3 (+6.54, empty) | PASS 3/3 (+6.44, shuffled) | PASS 3/3 (+1.33, all VPD actives) | +6.21 | **PASS** |
 | binding_fp | core | PASS 3/3 (+0.99, swap 50% to wrong unit) | PASS 3/3 (+1.16, empty) | PASS 3/3 (+1.32, shuffled) | FAIL 0/3 (-4.12, all VPD actives) | +1.09 | **FAIL** |
+| route1 | full | PASS 3/3 (+2.35, swap 50% to wrong unit) | PASS 3/3 (+2.43, empty) | PASS 3/3 (+2.42, shuffled) | PASS 3/3 (+2.43, single node) | +3.45 | **PASS** |
+| route1 | core | FAIL 2/3 (-1.21, random actives #2) | FAIL 2/3 (-2.99, empty) | FAIL 2/3 (-1.45, shuffled) | FAIL 0/3 (-9.20, all VPD actives) | -1.90 | **FAIL** |
 
 ## Mean over texts per candidate
 
@@ -71,21 +73,49 @@ Gate B holds on a text when R(true) > max R over each control category. Cell: te
 | ref | run_planted other (narrow) | ref | 251 | 0.908 | 1.518 | 1.321 | 0.659 | -1.883 | — |
 | teacher | teacher | teacher | 35 | 0.378 | 0.368 | 1.321 | 0.004 | 4.841 | — |
 
+### route1
+
+| tier | candidate | category | nodes | R | phi | phi_tau | g | compact | ≥ true (of texts) |
+|---|---|---|---|---|---|---|---|---|---|
+| full | **true** | true | 771 | 4.944 | 6.391 | 1.295 | 1.000 | -2.895 | — |
+| full | swap 50% to wrong unit | wrong_eq | 771 | -3.027 | -3.026 | 1.295 | 0.000 | -4.050 | 0/3 |
+| full | swap 100% to wrong unit | wrong_eq | 771 | -2.278 | -2.266 | 1.295 | 0.007 | -3.434 | 0/3 |
+| full | empty | empty | 0 | -0.008 | -0.008 | 1.295 | 0.004 | — | 0/3 |
+| full | shuffled | shuffled | 529 | -4.187 | -4.186 | 1.295 | 0.000 | -1.298 | 0/3 |
+| full | single node | collapsed | 1 | 0.017 | -0.004 | 1.295 | 0.004 | 10.502 | 0/3 |
+| core | **true** | true | 438 | -0.408 | -0.454 | 1.295 | 0.294 | 0.285 | — |
+| core | random actives #0 | wrong_eq | 438 | -2.243 | -2.242 | 1.295 | 0.001 | -1.400 | 0/3 |
+| core | random actives #1 | wrong_eq | 438 | -3.372 | -3.372 | 1.295 | 0.000 | -0.953 | 0/3 |
+| core | random actives #2 | wrong_eq | 438 | -0.436 | -0.420 | 1.295 | 0.022 | -1.472 | 1/3 |
+| core | swap 50% to wrong unit | wrong_eq | 438 | -2.901 | -2.901 | 1.295 | 0.000 | -1.719 | 0/3 |
+| core | swap 100% to wrong unit | wrong_eq | 438 | -3.552 | -3.552 | 1.295 | 0.000 | -3.142 | 0/3 |
+| core | empty | empty | 0 | -0.008 | -0.008 | 1.295 | 0.004 | — | 1/3 |
+| core | shuffled | shuffled | 303 | -0.920 | -0.920 | 1.295 | 0.000 | 1.209 | 1/3 |
+| core | single node | collapsed | 1 | 0.017 | -0.004 | 1.295 | 0.004 | 10.502 | 1/3 |
+| core | all VPD actives | collapsed | 771 | 4.944 | 6.391 | 1.295 | 1.000 | -2.895 | 3/3 |
+| ref | run_planted true (narrow) | ref | 771 | 4.944 | 6.391 | 1.295 | 1.000 | -2.895 | — |
+| teacher | teacher | teacher | 30 | 1.490 | 0.736 | 1.295 | 0.408 | 3.803 | — |
+
 ## Candidate repairs, rescored from the same rows
 
-Gate B checks passed (texts × tiers) when R is recomputed from each row's family scores and eps (no new measurement):
+Gate B checks passed (texts) when R is recomputed from each row's family scores and eps (no new measurement; phi_tau kept as measured):
 
-- **v3**: as is: phi over (1 - s + eps_own), g = sigmoid_2(4 (phi - phi_tau)), R = phi + g ½compact
 - **eps_cap**: each family's eps capped at 0.05 (a noisy family cannot push the residual above 1 - s + 0.05)
+- **s_clip**: each family's raw score clipped to [0, 1] (the clipped estimators goal_eval keeps beside the raw ones; N's raw specificity ratio reaches -5 on a good circuit)
 - **gate_ramp**: g x clip(phi / phi_tau, 0, 1): compactness gets nothing at phi <= 0 (the empty and one-node circuits)
-- **eps_cap+gate_ramp**: both
+- **phi_cap**: phi capped at phi_tau + 2.0 (past the bar, faithfulness stops paying and compactness ranks)
 
-| variant | wrong_eq | empty | shuffled | collapsed | all four |
-|---|---|---|---|---|---|
-| v3 | 10/12 | 12/12 | 11/12 | 6/12 | 6/12 |
-| eps_cap | 12/12 | 12/12 | 12/12 | 6/12 | 6/12 |
-| gate_ramp | 10/12 | 12/12 | 11/12 | 6/12 | 6/12 |
-| eps_cap+gate_ramp | 12/12 | 12/12 | 12/12 | 6/12 | 6/12 |
+| variant | full: wrong_eq | full: empty | full: shuffled | full: collapsed | core: wrong_eq | core: empty | core: shuffled | core: collapsed | full: all | core: all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| v3 | 9/9 | 9/9 | 9/9 | 9/9 | 6/9 | 8/9 | 7/9 | 0/9 | 9/9 | 0/9 |
+| eps_cap | 9/9 | 9/9 | 9/9 | 9/9 | 8/9 | 8/9 | 8/9 | 0/9 | 9/9 | 0/9 |
+| s_clip | 9/9 | 9/9 | 9/9 | 9/9 | 6/9 | 8/9 | 7/9 | 0/9 | 9/9 | 0/9 |
+| gate_ramp | 9/9 | 9/9 | 9/9 | 9/9 | 6/9 | 8/9 | 7/9 | 0/9 | 9/9 | 0/9 |
+| phi_cap | 9/9 | 9/9 | 9/9 | 8/9 | 6/9 | 8/9 | 7/9 | 3/9 | 8/9 | 3/9 |
+| eps_cap+s_clip | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 0/9 | 9/9 | 0/9 |
+| eps_cap+s_clip+gate_ramp | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 0/9 | 9/9 | 0/9 |
+| eps_cap+s_clip+phi_cap | 9/9 | 9/9 | 9/9 | 8/9 | 9/9 | 9/9 | 9/9 | 3/9 | 8/9 | 3/9 |
+| eps_cap+s_clip+gate_ramp+phi_cap | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 3/9 | 9/9 | 3/9 |
 
 ## Failures: which term lets the control win (per text)
 
@@ -98,3 +128,9 @@ Gate B checks passed (texts × tiers) when R is recomputed from each row's famil
 - binding_fp core text 0, collapsed: **all VPD actives** ≥ true by 4.12: Δphi +6.73, Δ(g·½compact) -2.61; families higher for it: patching_near +0.497, nodes +0.478, edges +0.454, pattern +0.285, point +0.285, track_pp +0.101
 - binding_fp core text 1, collapsed: **all VPD actives** ≥ true by 3.67: Δphi +6.39, Δ(g·½compact) -2.72; families higher for it: nodes +0.554, point +0.338, pattern +0.338, edges +0.334
 - binding_fp core text 2, collapsed: **all VPD actives** ≥ true by 3.52: Δphi +6.18, Δ(g·½compact) -2.66; families higher for it: nodes +0.371, edges +0.353, point +0.328, pattern +0.328, track_pp +0.072
+- route1 core text 0, wrong_eq: **random actives #2** ≥ true by 1.21: Δphi +1.21, Δ(g·½compact) -0.00; families higher for it: N +3.963
+- route1 core text 0, empty: **empty** ≥ true by 2.99: Δphi +2.99, Δ(g·½compact) -0.00; families higher for it: N +5.364
+- route1 core text 0, shuffled: **shuffled** ≥ true by 1.45: Δphi +1.45, Δ(g·½compact) +0.00; families higher for it: N +6.364
+- route1 core text 0, collapsed: **all VPD actives** ≥ true by 9.20: Δphi +10.64, Δ(g·½compact) -1.45; families higher for it: N +6.364, edges +0.596, nodes +0.322, point +0.018, pattern +0.017
+- route1 core text 1, collapsed: **all VPD actives** ≥ true by 5.62: Δphi +7.10, Δ(g·½compact) -1.48; families higher for it: edges +0.698, nodes +0.626, pattern +0.169, point +0.141
+- route1 core text 2, collapsed: **all VPD actives** ≥ true by 1.24: Δphi +2.79, Δ(g·½compact) -1.55; families higher for it: nodes +0.676, edges +0.221, pattern +0.171, point +0.155

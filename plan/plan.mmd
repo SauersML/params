@@ -556,7 +556,7 @@ flowchart BT
   WEIGHTSEED["<b>Weight-guided teacher proposal</b><br/>K32 residual links; <=128 scalar nodes;<br/>original KL/search/FV floors gate;<br/>1 matched TRAIN case: seed rejected;<br/>same214edges, no speedup; 2 incomplete<br/>MEASURED · codex/fork_review · $0"]
   COMPOSE["<b>Composition helps specificity, regresses capability</b><br/>Old8 exact3→8; new8 exact6→8,<br/>both64/64 top; old24 reward .973→.895;<br/>cancel topology + gate default failures retained;<br/>120 STOP · 0.661 USD ·38420458214<br/>MIXED · CF partial · codex/eval_recovery"]
   CAPCF["<b>Weight-edit ability recovered</b><br/>Best training and base:1792/1792 tops;<br/>worst KL0.00015 bits on4 toy models;<br/>half-strength edits expose weaker training<br/>MEASURED · codex/eval_recovery"]
-  CAPENG["<b>English reward is not calibrated</b><br/>Typed facts: 122/128; prose: 60/128.<br/>Reasoning scout: 2/4 finished correctly;<br/>both half-scale answers truncated.<br/>Next: complete the control explanation.<br/>CHECK · codex · no larger run"]
+  CAPENG["<b>Can English preserve the mechanism?</b><br/>Toy prose overgeneralized incomplete facts;<br/>new real-weight control covers all tested scales.<br/>Next: compare prose, typed facts, and context<br/>on the same18 verified edits.<br/>PREPARING · codex/variable_reward"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
@@ -657,6 +657,7 @@ flowchart BT
   CLAIMCTRL --> CLAIMGROUND
   CLAIMGROUND -. measured grounding ability .-> SUP
   CLAIMGROUND --> AFFINEENGLISH
+  CAPENG -. complete local control .-> AFFINEENGLISH
   CLAIMQA -. auxiliary intervention answers .-> SUP
   CLAIMFIT -. additional exact rows .-> SUP
   ENG --> TOOLS

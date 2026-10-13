@@ -156,7 +156,7 @@ flowchart BT
   GATEC{{"<b>Check C</b> · does this arm add value?<br/>each completed arm vs cheap controls<br/>and search on development texts;<br/>report without waiting for other arms"}}
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
     S1READY["<b>SFT pilot: format learned</b><br/>5/8 valid; QA near no-change;<br/>no advantage over matched VPD;<br/>feeds input and control ablations<br/>CHECK · codex · $2.51 total"]
-    S1["<b>SFT · influential starts</b><br/>494 targets, held-out pp 0.965,<br/>median 357 nodes<br/>LAUNCHING · primerl"]
+    S1["<b>SFT · influential starts</b><br/>411 of 444 fit 32k; 306 over 266 nodes,<br/>kept (eval uncapped + share);<br/>checkpoints 56/112/167, dev 9020-9049<br/>TRAINING · primerl"]
     S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end

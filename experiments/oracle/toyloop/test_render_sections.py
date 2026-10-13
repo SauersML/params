@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -55,19 +56,19 @@ def test_weights_mode_follows_the_weights(weights_mode):
 
 
 def test_units_and_distractors_visible(weights_mode):
-    """Every gt head or neuron is listed and writes somewhere; every distractor 'writes to nothing'; cancel pairs marked."""
+    """Every gt head or neuron is listed and writes somewhere; every distractor writes to nothing (out[]); cancel pairs marked."""
     for toy in zoo(20):
-        lines = {l.split()[0]: l for l in render.render(toy).splitlines() if l[:1] == "L" and " |" in l}
+        lines = {l.split()[0]: l for l in render.render(toy).splitlines() if re.match(r"L\d+[HN]\d+ ", l)}
         for u in toy.truth["units"]:
             if u[:1] == "L":
-                assert u in lines and "writes to nothing" not in lines[u], (toy.name, u)
+                assert u in lines and "out[]" not in lines[u], (toy.name, u)
         for u in toy.meta["record"]["distractor_units"]:
             u = render.zoo_unit(u)
             if u in lines:
-                assert "writes to nothing" in lines[u], (toy.name, u)
+                assert "out[]" in lines[u], (toy.name, u)
         if toy.meta["family"] == "cancel":
             for u in toy.meta["record"]["params"]["pair"]:
-                assert "cancels" in lines[render.zoo_unit(u)]
+                assert " ~L" in lines[render.zoo_unit(u)]
 
 
 def test_positional_offset_read_from_weights(weights_mode):
@@ -75,9 +76,29 @@ def test_positional_offset_read_from_weights(weights_mode):
         p = toy.meta["record"]["params"]
         u = f"L{p['head'][0]}H{p['head'][1]}"
         line = next(l for l in render.render(toy).splitlines() if l.startswith(u + " "))
-        assert f"pos: offset -{p['offset']} " in line, line
+        assert f" pos-{p['offset']} " in line, line
 
 
 def test_prompt_length(weights_mode):
     for toy in zoo(10):
         assert len(render.render(toy)) < 9000
+
+
+ZOO2 = Path.home() / "mpd-data/toy_zoo2/manifest.jsonl"
+
+
+def test_zoo2_weights_mode(weights_mode):
+    """Rotated residual basis: every gated unit of the text's module shows the text's marker as the token its gate
+    reads (through the embedding, not axis-aligned dims); the prompt stays near 2k tokens (~4 chars a token)."""
+    if not ZOO2.exists():
+        pytest.skip("no zoo2")
+    toys = render.load_zoo(ZOO2, limit=4)
+    for toy in toys:
+        p = render.render(toy)
+        assert not any(w in p for w in RUN_WORDS)
+        mod = toy.meta["record"]["params"]["modules"][toy.meta["module"]]
+        marker = toy.vocab[mod["marker"]]
+        lines = {l.split()[0]: l for l in p.splitlines() if re.match(r"L\d+[HN]\d+ ", l)}
+        gated = [render.zoo_unit(u) for u in mod["gated"] if render.zoo_unit(u) in toy.truth["units"]]
+        assert gated and all(f"<{marker}" in lines[u] for u in gated if u in lines), (toy.name, marker)
+        assert len(p) < 10000, len(p)

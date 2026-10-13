@@ -8,6 +8,7 @@ Predictors: a checkpoint directory (greedy decoding), or a baseline:
   empty   no unit ("tokX --> out")
   active  every unit the prompt lists as active at the last position, each feeding out (reads the behaviour section)
   prior   the circuit of the nearest training toy by TF-IDF prompt similarity, unit names unchanged
+  union   every unit of the instance (zoo2: all modules; the instance-level union, not the per-text truth)
   weights weights_heuristic.py: walk back from the logits through render.wiring's weight gains (no LM, no texts)
 With --swapped a checkpoint also runs on prompts whose weight section comes from another toy of the same family
 (same split) while the behaviour section stays: scored against both toys' truths. An oracle that reads the weights
@@ -46,15 +47,23 @@ UNIT = re.compile(r"L\d+[HN]\d+")
 # ---------------------------------------------------------------- data
 
 def load_splits(train_n: int, limit: int | None, seed: int = 0) -> dict:
+    """{split: toys}. zoo v1: one toy per instance; zoo2: one toy per example text (per-text truth), train_n and limit
+    then count texts, sampled across instances."""
     rows = [json.loads(l) for l in MANIFEST.read_text().splitlines() if l.strip()]
+    v2 = any(r.get("version") == 2 for r in rows)
     out = {}
     for split in ("train", "test_instance", "test_family"):
         rs = [r for r in rows if r["split"] == split]
-        if split == "train":
-            rs = random.Random(seed).sample(rs, min(train_n, len(rs)))
-        if limit:
-            rs = rs[:limit]
-        out[split] = [render.from_zoo(r, MANIFEST.parent) for r in rs]
+        if not v2:
+            if split == "train":
+                rs = random.Random(seed).sample(rs, min(train_n, len(rs)))
+            out[split] = [render.from_zoo(r, MANIFEST.parent) for r in rs[:limit]]
+            continue
+        n = min(train_n, limit or train_n) if split == "train" else limit
+        if n:   # about two texts per instance: load only the instances needed
+            rs = random.Random(seed).sample(rs, min(len(rs), max(1, n // 2 + 1)))
+        toys = [t for r in rs for t in render.from_zoo2(r, MANIFEST.parent)]
+        out[split] = random.Random(seed).sample(toys, min(n, len(toys))) if n else toys
     return out
 
 
@@ -69,14 +78,21 @@ def gt(toy, prompt):
 
 
 def active(toy, prompt):
+    """Units active at the last position of the toy's (first two) texts, computed from a run, whatever the prompt shows."""
     units = []
-    for line in prompt.splitlines():
-        if line.strip().startswith("active at last:"):
-            units += [u.split(":")[0] for u in line.split(":", 1)[1].split()]
+    for ids in toy.texts[:2]:
+        r = render.run(toy.sd, toy.cfg, ids)
+        units += [a.split(":")[0] for a in render.active_units(toy, r, len(ids) - 1)]
     units = list(dict.fromkeys(u for u in units if UNIT.fullmatch(u)))
     if not units:
         return empty(toy, prompt)
     return "flowchart LR\n" + "\n".join(f"  {u} --> out" for u in units) + "\nEnglish: The active units carry the prediction."
+
+
+def union(toy, prompt):
+    """Every unit of every module of the instance (the record's instance-level gt_units), each feeding out."""
+    units = sorted({render.zoo_unit(u) for u in toy.meta["record"]["gt_units"]})
+    return "flowchart LR\n" + "\n".join(f"  {u} --> out" for u in units) + "\nEnglish: Every mechanism's units."
 
 
 class Prior:
@@ -225,8 +241,9 @@ def markdown(res: dict) -> str:
 
 
 def main():
+    global MANIFEST
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("predictors", nargs="+", help="checkpoint dirs and/or baselines: gt empty active prior weights")
+    ap.add_argument("predictors", nargs="+", help="checkpoint dirs and/or baselines: gt empty active prior weights union")
     ap.add_argument("--train_n", type=int, default=40)
     ap.add_argument("--limit", type=int, default=None, help="at most this many toys per split")
     ap.add_argument("--swapped", action="store_true")
@@ -234,7 +251,14 @@ def main():
     ap.add_argument("--max_new", type=int, default=256)
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--out", type=Path, default=HERE / "results")
+    ap.add_argument("--zoo", type=Path, default=MANIFEST, help="a zoo manifest (v1 or zoo2)")
+    ap.add_argument("--suffix", default=None, help="appended to the result names (default: _v2 on zoo2, plus "
+                    "_weights under TOYLOOP_SECTIONS=weights)")
     a = ap.parse_args()
+    MANIFEST = a.zoo.expanduser()
+    if a.suffix is None:
+        v2 = '"version": 2' in MANIFEST.read_text()[:2000]
+        a.suffix = ("_v2" if v2 else "") + ("_weights" if render.SECTIONS == "weights" else "")
     torch.set_num_threads(a.threads)
     splits = load_splits(a.train_n, a.limit)
     a.out.mkdir(parents=True, exist_ok=True)
@@ -245,11 +269,11 @@ def main():
         elif name == "weights":
             import weights_heuristic
             pred = weights_heuristic.predict
-        elif name in ("gt", "empty", "active"):
+        elif name in ("gt", "empty", "active", "union"):
             pred = globals()[name]
         else:
             pred = Checkpoint(Path(name).expanduser(), a.max_new, a.threads)
-        tag = name if name in ("gt", "empty", "active", "prior", "weights") else Path(name).name
+        tag = (name if name in ("gt", "empty", "active", "prior", "weights", "union") else Path(name).name) + a.suffix
         res = run(tag, pred, splits, swapped=a.swapped and isinstance(pred, Checkpoint), wiring=a.wiring)
         (a.out / f"eval_{tag}.json").write_text(json.dumps(res, indent=1))
         (a.out / f"eval_{tag}.md").write_text(markdown(res))

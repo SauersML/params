@@ -42,9 +42,10 @@ def examples(spec: str, truth_json: str | None = None) -> list[dict]:
     elif kind == "planted":
         truth = json.loads(Path(truth_json).read_text()) if truth_json else {}
         toys = [render.from_planted(p, truth.get(p.stem)) for p in sorted(Path(arg).expanduser().glob("*.pt"))]
-    elif kind == "zoo":                              # zoo:MANIFEST or zoo:MANIFEST@split
+    elif kind == "zoo":       # zoo:MANIFEST[@split][#N instances]; a zoo2 manifest gives one example per text
+        arg, _, lim = arg.partition("#")
         path, _, split = arg.partition("@")
-        toys = render.load_zoo(Path(path).expanduser(), split or None)
+        toys = render.load_zoo(Path(path).expanduser(), split or None, int(lim) if lim else None)
     else:
         raise ValueError(spec)
     return [{"prompt": render.render(t), "completion": render.target_text(t.truth) if t.truth else None,

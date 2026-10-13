@@ -208,8 +208,34 @@ def wiring(toy) -> dict:
     u's output map (RMSNorm weights folded in, the norm's scale ignored); readers are later heads' Q/K/V ("L1H0.K"),
     MLP neurons of the same or later layer (heads) / later layers (neurons), and "logits" (the tied unembedding after
     ln_f); writer "tok" is the token identity (embeddings minus their mean, scaled to unit norm per token). A unit whose every gain is ~0 writes only where nothing reads (a distractor's dump dims)."""
+    units, out_map, readers = _maps(toy)
+    writes = {}
+    for u, i, kind, _ in [("tok", -1, "T", 0)] + units:
+        w = {}
+        for r, val in readers.items():
+            if r == "logits":
+                B = val
+            else:
+                B, ri = val
+                if not (ri > i or (ri == i and kind == "H" and "." not in r)):   # later layers; a head's own MLP
+                    continue
+            if r == "logits" and u == "tok":
+                continue
+            w[r] = float(torch.linalg.matrix_norm(B @ out_map[u], ord=2))
+        writes[u] = w
+    return writes
+
+
+_MAPS: dict = {}
+
+
+def _maps(toy):
+    """(live units, writer output maps {unit: [D, r]} plus "tok", reader input maps {reader: ([r, D], layer)} plus
+    "logits"), cached per state dict."""
+    key = id(toy.sd)
+    if key in _MAPS and _MAPS[key][0] is toy.sd:
+        return _MAPS[key][1]
     sd, cfg = toy.sd, toy.cfg
-    L, H, hd = heads_of(cfg)
     E = sd["wte.weight"].float()
     units = units_of(toy)
     out_map = {}
@@ -229,30 +255,35 @@ def wiring(toy) -> dict:
             readers[u] = (sd[f"h.{i}.mlp.c_fc.weight"].float()[j:j + 1] * sd[f"h.{i}.rms_2.weight"].float()[None, :], i)
     Ec = E - E.mean(0, keepdim=True)        # token identity: the embedding minus what every token shares
     out_map["tok"] = Ec.T / Ec.norm(dim=1).mean()   # [D, V], one token ~ unit norm (readers see RMS-normed input)
-    writes = {}
-    for u, i, kind, _ in [("tok", -1, "T", 0)] + units:
-        w = {}
-        for r, val in readers.items():
-            if r == "logits":
-                B = val
-            else:
-                B, ri = val
-                if not (ri > i or (ri == i and kind == "H" and "." not in r)):   # later layers; a head's own MLP
-                    continue
-            if r == "logits" and u == "tok":
-                continue
-            w[r] = float(torch.linalg.matrix_norm(B @ out_map[u], ord=2))
-        writes[u] = w
-    return writes
+    if len(_MAPS) > 64:
+        _MAPS.clear()
+    _MAPS[key] = (sd, (units, out_map, readers))
+    return units, out_map, readers
 
 
-def weight_only_lines(toy: Toy, k: int = 3, max_neurons: int = 16) -> list[str]:
-    """Per head: norms, positional preference (the query and key of the mean embedding through RoPE: best offset and its
-    margin over the next), QK and OV token pairs, where it reads from (earlier units, by gain) and writes to (logits,
-    later units). Per live neuron: the tokens it reads, the tokens it writes, its readers and writers."""
+def source_token(toy, writer: str, reader: str, ratio: float = 2.0) -> str | None:
+    """The token whose embedding, carried by head `writer`'s OV, reaches `reader`'s input most, when it dominates
+    (top over second > ratio): e.g. which marker token a detector head turns into the flag a gated unit reads."""
+    units, out_map, readers = _maps(toy)
+    if not re.fullmatch(r"L\d+H\d+", writer) or reader not in readers or reader == "logits":
+        return None
+    v = (readers[reader][0] @ out_map[writer] @ out_map["tok"]).norm(dim=0)
+    t = v.topk(2)
+    return toy.vocab[int(t.indices[0])] if float(t.values[0]) > ratio * float(t.values[1]) + 1e-9 else None
+
+
+def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int = 16, max_links: int = 3) -> list[str]:
+    """Compact, weights only. Per head: output norm, positional preference (the mean embedding's query and key through
+    RoPE: best key offset and its margin over the next, 'pos flat' when position barely matters), QK and OV token pairs
+    (through the embedding, so a rotated residual basis changes nothing), the units its Q, K and V read and the units
+    (or logits) that read its output, by gain. Per live neuron: its signed token reads (or 'const'), unit inputs, signed
+    token writes and readers. Cancelling pairs are marked '~X'. A unit with 'out[]' writes where nothing reads."""
     sd, cfg, voc = toy.sd, toy.cfg, toy.vocab
     L, H, hd = heads_of(cfg)
+    if len(units_of(toy)) > 24:          # big models (zoo2: 24 heads): shorter lists keep the prompt near 2k tokens
+        k, max_links = 1, 2
     E = sd["wte.weight"].float()
+    El = E * sd["ln_f.weight"].float()[None, :]
     writes = wiring(toy)
     top = max((g for u, w in writes.items() if u != "tok" for g in w.values()), default=1.0) or 1.0
     reads = {}
@@ -260,13 +291,23 @@ def weight_only_lines(toy: Toy, k: int = 3, max_neurons: int = 16) -> list[str]:
         for r, g in w.items():
             reads.setdefault(r, []).append((g, u))
 
-    def fmt(pairs):
-        pairs = sorted(pairs, reverse=True)
-        keep = [f"{n}:{g:.2g}" for g, n in pairs if g > 0.01 * top][:4]
-        return " ".join(keep) if keep else "nothing"
+    def fmt(pairs, reader=None):
+        keep = []
+        for g, n in sorted(pairs, reverse=True):
+            if g > 1e-3 * top and len(keep) < max_links:
+                src = source_token(toy, n, reader) if reader else None
+                keep.append(f"{n}:{g:.2g}" + (f"<{src}" if src else ""))
+        return ",".join(keep)
 
-    lines = [f"Gains are largest singular values of reader x writer maps (largest in this model {top:.2g}); "
-             "'writes to nothing' means no later unit and no logit reads the output."]
+    def pairs(M):
+        vals, idx = M.flatten().topk(k)
+        n = M.shape[1]
+        return ",".join(f"{voc[int(a) // n]}>{voc[int(a) % n]}:{float(v):.2g}" for v, a in zip(vals, idx))
+
+    lines = ["Legend: pos-d = prefers the key d positions back by position alone (m = margin); QK[query>key] and "
+             "OV[source>written logit] token pairs; in Q/K/V[writer:gain], out[reader:gain] (gain = largest singular "
+             "value of reader x writer map; out[] = nothing reads it; L0H5:33<t34 = mostly token t34 carried by L0H5); "
+             "~X = cancels X (same input, opposite output)."]
     maxd = min(int(cfg.get("n_ctx", 32)) - 1, 15)
     cancel = cancelling_pairs(toy)
     for u, i, kind, j in units_of(toy):
@@ -277,24 +318,27 @@ def weight_only_lines(toy: Toy, k: int = 3, max_neurons: int = 16) -> list[str]:
             pos = _rope_scores(Wq @ c, Wk @ c, cfg, maxd)
             best = pos.topk(2)
             qk = (En @ Wq.T) @ (En @ Wk.T).T / math.sqrt(hd)
-            ov = (En @ Wv.T) @ Wo.T @ (E * sd["ln_f.weight"].float()[None, :]).T
-            line = (f"{u} |q|{float(Wq.norm()):.2g} |k|{float(Wk.norm()):.2g} |v|{float(Wv.norm()):.2g} "
-                    f"|o|{float(Wo.norm()):.2g} pos: offset -{int(best.indices[0])} (margin "
-                    f"{float(best.values[0] - best.values[1]):.2g}, range {float(pos.max() - pos.min()):.2g}) "
-                    f"QK {_top_pairs(qk, voc, k)} (spread {float(qk.std()):.2g}) OV {_top_pairs(ov, voc, k)}")
-            src = {r: fmt(reads.get(f"{u}.{r}", [])) for r in ("Q", "K", "V")}
-            line += " | Q reads " + src["Q"] + "; K reads " + src["K"] + "; V reads " + src["V"]
+            ov = (En @ Wv.T) @ Wo.T @ El.T
+            line = f"{u} |o|{float(Wo.norm()):.2g} " + (
+                f"pos-{int(best.indices[0])} m{float(best.values[0] - best.values[1]):.2g}"
+                if float(pos.max() - pos.min()) > 1.0 else "pos flat")
+            line += f" QK[{pairs(qk)}]" if float(qk.std()) > 0.5 else " QK flat"
+            line += f" OV[{pairs(ov)}]" if float(ov.abs().max()) > 0.05 else " OV 0"
+            ins = [f"{r}[{fmt(reads.get(f'{u}.{r}', []), f'{u}.{r}')}]" for r in ("Q", "K", "V") if reads.get(f"{u}.{r}")]
+            ins = [x for x in ins if not x.endswith("[]")]
+            line += (" in " + " ".join(ins)) if ins else ""
         else:
             fc, down = sd[f"h.{i}.mlp.c_fc.weight"].float()[j], sd[f"h.{i}.mlp.down_proj.weight"].float()[:, j]
             En2 = _rms(E, sd[f"h.{i}.rms_2.weight"].float(), _eps(cfg))
-            line = (f"{u} |in|{float(fc.norm()):.2g} |out|{float(down.norm()):.2g} reads tokens "
-                    f"{_top_tokens(En2 @ fc, voc, k)} and units {fmt(reads.get(u, []))}; writes tokens "
-                    f"{_signed_tokens((E * sd['ln_f.weight'].float()[None, :]) @ down, voc)}")
-        line += " | writes to " + fmt([(g, r) for r, g in writes[u].items()])
+            rd = En2 @ fc
+            tokread = "const" if float(rd.std()) < 0.01 * float(rd.abs().mean()) + 1e-6 else _signed_tokens(rd, voc)
+            ins = fmt([x for x in reads.get(u, []) if x[1] != "tok"], u)
+            line = f"{u} reads {tokread}" + (f" in[{ins}]" if ins else "") + f" writes {_signed_tokens(El @ down, voc)}"
+        line += f" out[{fmt([(g, r) for r, g in writes[u].items()])}]"
         if u in cancel:
-            line += f" | cancels {cancel[u]} (same input, opposite output)"
+            line += f" ~{cancel[u]}"
         lines.append(line)
-    lines.insert(1, "tok (token identity) is read by " + fmt([(g, r) for r, g in writes["tok"].items()]))
+    lines.insert(1, f"tok (token identity) out[{fmt([(g, r) for r, g in writes['tok'].items()])}]")
     n_neurons = sum(1 for x in units_of(toy) if x[2] == "N")
     if n_neurons > max_neurons:   # keep the heads and the strongest-writing neurons
         neu = [l for l in lines[1:] if re.match(r"L\d+N", l)]
@@ -306,20 +350,21 @@ def weight_only_lines(toy: Toy, k: int = 3, max_neurons: int = 16) -> list[str]:
 
 def _signed_tokens(v, vocab, k=2):
     """The k most raised and the most lowered tokens: '+t1:6 +t3:2 -t24:-8'."""
-    up = " ".join(f"+{vocab[int(i)]}:{float(v[i]):.2g}" for i in v.topk(k).indices if float(v[i]) > 1e-3)
+    up = ",".join(f"+{vocab[int(i)]}:{float(v[i]):.2g}" for i in v.topk(k).indices if float(v[i]) > 1e-3)
     i = int(v.argmin())
-    return (up + (f" -{vocab[i]}:{float(v[i]):.2g}" if float(v[i]) < -1e-3 else "")).strip() or "nothing"
+    down = f"-{vocab[i]}:{float(v[i]):.2g}" if float(v[i]) < -1e-3 else ""
+    return ",".join(x for x in (up, down) if x) or "0"
 
 
 def cancelling_pairs(toy, tol: float = 0.98) -> dict:
-    """{unit: partner} for same-kind units in one layer that read the same input (cosine > tol of the concatenated input
-    weights) and write opposite outputs (cosine < -tol): their sum is zero whatever the input."""
+    """{unit: partner} for same-kind units in one layer that read the same input (cosine > tol of a head's Wq^T Wk, a
+    neuron's c_fc row) and write opposite outputs (cosine < -tol of Wo Wv / down_proj column): their sum is zero."""
     sd, cfg = toy.sd, toy.cfg
     sig = {}
     for u, i, kind, j in units_of(toy):
-        if kind == "H":
+        if kind == "H":   # Wq^T Wk and Wo Wv: unchanged by a rotation of the head's dims (twins rotated within planes)
             Wq, Wk, Wv, Wo = _blocks(sd, cfg, i, j)
-            sig[u] = (i, kind, torch.cat([Wq.flatten(), Wk.flatten(), Wv.flatten()]), (Wo @ Wv).flatten())
+            sig[u] = (i, kind, (Wq.T @ Wk).flatten(), (Wo @ Wv).flatten())
         else:
             sig[u] = (i, kind, sd[f"h.{i}.mlp.c_fc.weight"].float()[j], sd[f"h.{i}.mlp.down_proj.weight"].float()[:, j])
     cos = lambda a, b: float(a @ b / (a.norm() * b.norm()).clamp_min(1e-12))  # noqa: E731
@@ -355,7 +400,7 @@ def active_units(toy: Toy, r: dict, t: int, rel: float = 0.05) -> list[str]:
     return [f"{u}:{v / m:.2f}" for u, v in acts.items() if m > 1e-6 and v > rel * m]
 
 
-def behaviour_lines(toy: Toy, n_texts: int = 2) -> list[str]:
+def behaviour_lines(toy: Toy, n_texts: int = 2, compact: bool = False) -> list[str]:
     L, H, _ = heads_of(toy.cfg)
     lines = []
     for ti, ids in enumerate(toy.texts[:n_texts]):
@@ -373,8 +418,11 @@ def behaviour_lines(toy: Toy, n_texts: int = 2) -> list[str]:
                 mode = int(offs.mode().values) if len(offs) else 0
                 share = float((offs == mode).float().mean()) if len(offs) else 1.0
                 kl = int(arg[-1])
-                lines.append(f"  L{i}H{j}: offset {mode:+d} at {share:.0%} of positions; last attends "
-                             f"{toy.vocab[ids[kl]]}@{kl} {float(p[-1, kl]):.2f}")
+                if compact:   # "L0H2 -1:100% t10@12:1.0" = usual offset and its share; the last position's key
+                    lines.append(f"  L{i}H{j} {mode:+d}:{share:.0%} {toy.vocab[ids[kl]]}@{kl}:{float(p[-1, kl]):.2g}")
+                else:
+                    lines.append(f"  L{i}H{j}: offset {mode:+d} at {share:.0%} of positions; last attends "
+                                 f"{toy.vocab[ids[kl]]}@{kl} {float(p[-1, kl]):.2f}")
         if SHOW_ACTIVE:
             lines.append("  active at last: " + " ".join(active_units(toy, r, T - 1)))
     return lines
@@ -382,14 +430,22 @@ def behaviour_lines(toy: Toy, n_texts: int = 2) -> list[str]:
 
 def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None) -> str:
     """The prompt. weights_from: take the weight section from another toy (same architecture), keeping this toy's
-    behaviour section (the swapped-weights control: does the answer follow the weights?)."""
+    behaviour section (the swapped-weights control: does the answer follow the weights?). TOYLOOP_SECTIONS=weights:
+    the compact weight section and the texts' tokens only; default: weights and behaviour (zoo v1 toys keep the
+    legacy weight section, zoo2 toys get the compact one)."""
     L, H, hd = heads_of(toy.cfg)
     if SECTIONS == "weights":
         return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
                           f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.",
-                          "Weights (pos: preferred key offset from the query by position alone; QK: query>key token "
-                          "pairs; OV: source>written token logit pairs):", *weight_only_lines(weights_from or toy),
+                          "Weights:", *weight_only_lines(weights_from or toy),
                           "Texts:", *text_lines(toy, n_texts),
+                          "Which units implement the prediction at the last position, and how?", FORMAT])
+    if toy.meta.get("version") == 2:   # zoo2: the compact weight section (the legacy one is ~4k tokens there)
+        return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
+                          f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.",
+                          "Weights:", *weight_only_lines(weights_from or toy),
+                          "Behaviour (per head: usual attention offset:share of positions, key attended from the "
+                          "last position@position:weight):", *behaviour_lines(toy, n_texts, compact=True),
                           "Which units implement the prediction at the last position, and how?", FORMAT])
     head = (f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
             f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.\n"
@@ -449,11 +505,39 @@ def from_zoo(row: dict, root: str | Path | None = None, n_texts: int = 2) -> Toy
                                                                   "record": rec})
 
 
-def load_zoo(manifest: str | Path, split: str | None = None) -> list[Toy]:
-    """Every toy in a zoo manifest, or those of one split (train, test_instance, test_family)."""
+def from_zoo2(row: dict, root: str | Path | None = None) -> list[Toy]:
+    """A toys/zoo2.py manifest row -> one Toy per example text (the truth is per text: the detector plus the selected
+    module's units). Toy name "<id>#<k>"; texts [that text]; meta: split, family (the text's module family), module,
+    example index, version 2 and the shared record (params for zoo2.texts / gt_spec in reward_exec)."""
+    root = Path(root) if root else Path.home() / "mpd-data/toy_zoo2"
+    d = torch.load(root / row["weights"], map_location="cpu")
+    rec = json.loads((root / row["record"]).read_text())
+    V = d["sd"]["wte.weight"].shape[0]
+    vocab = ["BOS"] + [f"t{i}" for i in range(1, V)]
+    out = []
+    for k, e in enumerate(rec["examples"]):
+        edges = [[zoo_unit(a), zoo_unit(b)] for a, b in e["unit_edges"]]
+        units = sorted({u for x in edges for u in x} | {zoo_unit(u) for u in e["units"]})
+        truth = {"units": units, "edges": edges, "english": re.sub(r"\bL(\d+)\.([HN]\d+)", r"L\1\2", e["explanation"])}
+        out.append(Toy(f"{rec['id']}#{k}", d["sd"], d["cfg"], vocab, [e["ids"]], truth,
+                       {"split": rec["split"], "family": e["family"], "module": int(e["module"]), "example": k,
+                        "kind": e["kind"], "version": 2, "record": rec, "instance": rec["id"]}))
+    return out
+
+
+def load_zoo(manifest: str | Path, split: str | None = None, limit: int | None = None) -> list[Toy]:
+    """Every toy in a zoo manifest, or those of one split (train, test_instance, test_family); limit: at most this many
+    instances. A zoo2 manifest (rows with "version": 2) gives one Toy per example text."""
     m = Path(manifest)
     rows = [json.loads(l) for l in m.read_text().splitlines() if l.strip()]
-    return [from_zoo(r, m.parent) for r in rows if split is None or r.get("split") == split]
+    rows = [r for r in rows if split is None or r.get("split") == split][:limit]
+    out = []
+    for r in rows:
+        if r.get("version") == 2:
+            out += from_zoo2(r, m.parent)
+        else:
+            out.append(from_zoo(r, m.parent))
+    return out
 
 
 def synthetic(seed: int, L: int = 2, H: int = 2, D: int = 16, V: int = 12, T: int = 8) -> Toy:

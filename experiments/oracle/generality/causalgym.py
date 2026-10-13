@@ -173,7 +173,7 @@ def vartest(pairs_per_task: int = 32):
                            round(float(np.mean([r[f"flip_{lab}"] for r in rs])), 2)) for lab in ("variable", "wrong")}, flush=True)
 
 
-def falsify(per_task: int = 8, only_task: str | None = None):
+def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = False):
     """The scorecard on CausalGym's variables: per kept task's pairs that differ at one token (the variable's
     position p, the source's token z there), circuits on the base prompt (VPD's actives at the positions named, every
     connection among them): target (the last position alone), variable (and p), attractor (and the wrong variable's
@@ -186,6 +186,10 @@ def falsify(per_task: int = 8, only_task: str | None = None):
     C's semantics (the base's subcomponents, the source's tokens), the share of the model's base-to-source move of
     logit(source label) - logit(base label) it reproduces (moved_c), whether its preference flips, and s_track on that
     one change (the circuit's move applied to the model on the base, against VPD's answer's, bounded by no change).
+    With blocks: also the variable and the attractor as carriers, every site's whole output at the position as a block
+    (activation patching there: a block carries whichever subcomponents the token switches on), every circuit scored
+    with falsify.patch_ge's scorecard (no connection-cut family: a block circuit's connections are beyond memory)
+    -> causalgym_falsify_blocks.jsonl.
     -> DATA/causalgym_falsify.jsonl, one line per pair and circuit (resumable)."""
     import components
     import goal_eval
@@ -198,9 +202,14 @@ def falsify(per_task: int = 8, only_task: str | None = None):
     ge = goal_eval.GoalEval(native.Native())
     ge.nat.LENGTHS_KEPT = 1
     nat = ge.nat
+    if blocks:
+        import falsify as fz
+
+        fz.patch_ge(ge)
+        goal_eval.FLIP_ROWS = 16
     pool_path = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
     pool = torch.load(pool_path, weights_only=False) if pool_path.exists() else None
-    out = Path(os.environ.get("GEN_OUT", DATA)) / f"causalgym_falsify{os.environ.get('GEN_TAG', '')}.jsonl"
+    out = Path(os.environ.get("GEN_OUT", DATA)) / f"causalgym_falsify{'_blocks' if blocks else ''}{os.environ.get('GEN_TAG', '')}.jsonl"
     done = {(r["task"], r["pair"]) for r in map(json.loads, out.read_text().splitlines())} if out.exists() else set()
     kept = [t for t, v in tasks.items() if v["kept"]]
     dist = {}  # per task its variable's distance from the last position (the mismatched offsets)
@@ -227,6 +236,10 @@ def falsify(per_task: int = 8, only_task: str | None = None):
                         "variable_both_values": act(tx, [t, p]) + act(ts, [p])}
             if pw is not None:
                 variants["attractor"] = act(tx, [t, pw])
+            if blocks:
+                variants["variable_blocks"] = act(tx, [t]) + [(n, p, goal_eval.BLOCK) for n in nat.names]
+                if pw is not None:
+                    variants["attractor_blocks"] = act(tx, [t]) + [(n, pw, goal_eval.BLOCK) for n in nat.names]
             tau = ge.tau(tx, pool, "eval")
             variants["start"] = sorted(ge.start_set(tx, "eval")["graph"].node_set())
             names = list(variants)
@@ -251,7 +264,7 @@ def falsify(per_task: int = 8, only_task: str | None = None):
                     ph = goal_eval.phi(r, families=fams)[0]
                     phc = goal_eval.cap_phi(ph, pt)
                     gate = None if phc is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (phc - pt)))
-                    b = goal_eval.size_bits(g, P, S, tx.targets)
+                    b = goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd)
                     comp = goal_eval.compact(b, tau["bits_start"]) if b > 0 else None
                     f.write(json.dumps({
                         "task": task, "pair": k, "variant": v, "p": p, "attractor": pw, "t": t, "nodes": g.count(),
@@ -268,12 +281,13 @@ def falsify(per_task: int = 8, only_task: str | None = None):
                   flush=True)
 
 
-def report():
+def report(blocks: bool = False):
     rows = []
     import templates
 
-    for p in [DATA / "causalgym_falsify.jsonl"] + templates.run_outputs("causalgym_falsify*.jsonl"):
-        if p.exists():
+    stem = "causalgym_falsify_blocks" if blocks else "causalgym_falsify"
+    for p in [DATA / f"{stem}.jsonl"] + templates.run_outputs(f"{stem}*.jsonl"):
+        if p.exists() and ("_blocks" in p.name) == blocks:
             rows += [json.loads(x) for x in p.read_text().splitlines()]
     by = collections.defaultdict(dict)
     for r in rows:
@@ -283,14 +297,18 @@ def report():
     print(f"== {len(by)} pairs over {len({k[0] for k in by})} tasks; fraction of pairs where the first beats the second (ties half)")
     print("   " + " ".join(f"{m[:12]:>12s}" for m in terms))
     for a_, b_ in (("variable", "attractor"), ("variable", "mismatched_target"), ("variable", "target"), ("start", "variable"),
-                   ("variable_both_values", "variable"), ("variable_both_values", "attractor")):
+                   ("variable_both_values", "variable"), ("variable_both_values", "attractor"),
+                   ("variable_blocks", "attractor_blocks"), ("variable_blocks", "variable")):
         line = []
         for m in terms:
             vals = [1.0 if d[a_][m] > d[b_][m] + 1e-9 else 0.5 if abs(d[a_][m] - d[b_][m]) <= 1e-9 else 0.0
                     for d in by.values() if a_ in d and b_ in d and d[a_].get(m) is not None and d[b_].get(m) is not None]
             line.append(f"{np.mean(vals):12.2f}" if vals else f"{'-':>12s}")
         print(f"   {' '.join(line)}   {a_} > {b_}")
-    for v in ("target", "variable", "variable_both_values", "attractor", "mismatched_target", "start"):
+    for v in ("target", "variable", "variable_both_values", "attractor", "mismatched_target", "start", "variable_blocks",
+              "attractor_blocks"):
+        if not any(v in d for d in by.values()):
+            continue
         rs = [d[v] for d in by.values() if v in d]
         mean = lambda m: np.mean([r[m] for r in rs if r.get(m) is not None])  # noqa: E731
         print(f"   {v:18s} n {len(rs):3d} reward {mean('reward'):6.2f} phi {mean('phi'):5.2f} bits {mean('bits'):8.0f} "
@@ -303,5 +321,6 @@ if __name__ == "__main__":
     ap.add_argument("cmd", choices=("filter", "vartest", "falsify", "report"))
     ap.add_argument("--per-task", type=int, default=8)
     ap.add_argument("--task", default=None, help="falsify: one task only")
+    ap.add_argument("--blocks", action="store_true", help="falsify, report: the carrier-block variants (patched scorecard)")
     a = ap.parse_args()
-    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task), "report": report}[a.cmd]()
+    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task, a.blocks), "report": lambda: report(a.blocks)}[a.cmd]()

@@ -300,21 +300,22 @@ def vpd_top(pr, nat, k=61, name="text9000"):
     return start, order[:k]
 
 
-@pytest.mark.parametrize("kind", ["donors", "pp"])
+@pytest.mark.parametrize("kind", ["donors", "pp", "necessity"])
 def test_acceptance_admits_exactly_the_passing_sets(kind):
     nat, pr = pruner(teacher.CONVENTION == "live")
     ge, tx = pr.ge, pr.tx
     start, order = vpd_top(pr, nat)
     as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
-    acc = teacher.Acceptance(ge, tx, ("donors",) if kind == "donors" else ("changed",), "pp")
+    acc = teacher.Acceptance(ge, tx, ("changed",) if kind == "pp" else (kind,), "pp")
     hook, base = acc.hook(as_nodes, start)
-    assert set(base) == ({"s_donor_near", "s_donor_far"} if kind == "donors" else {"s_track_pp"})
+    assert set(base) == {"donors": {"s_donor_near", "s_donor_far"}, "pp": {"s_track_pp"}, "necessity": {"n_spec"}}[kind]
     ons = start[None].repeat(4, 1)
     for i, k in enumerate((1, 4, 16, 40)):                      # VPD's last k removed
         ons[i, order[-k:]] = False
     got = hook(ons)
     graphs = [as_nodes(on) for on in ons]
-    each = ge.donors_search(tx, graphs) if kind == "donors" else ge.changed_search(tx, graphs, mode="pp")
+    each = {"donors": lambda: ge.donors_search(tx, graphs), "pp": lambda: ge.changed_search(tx, graphs, mode="pp"),
+            "necessity": lambda: ge.necessity_spec(tx, graphs, split="search")}[kind]()
     for g, r in zip(got, each):
         passes = all(base[k] is None or r[k] is None or r[k] >= min(teacher.RECOVERED, base[k]) for k in base)
         # a set is admitted exactly when its terms keep their floors, with the family's own numbers

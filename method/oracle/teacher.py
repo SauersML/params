@@ -618,7 +618,7 @@ def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",
 
 
 ACCEPT = {"changed": ("changed_search", ("s_track",)), "interchange": ("interchange_search", ("s_interchange",)),
-          "donors": ("donors_search", ("s_donor_near", "s_donor_far"))}
+          "donors": ("donors_search", ("s_donor_near", "s_donor_far")), "necessity": ("necessity_spec", ("n_spec",))}
 TRACK = {"c": "s_track", "pp": "s_track_pp"}  # changed_search's mode -> its term
 POOL_DRAWS = 64       # discriminating acceptance: fresh search-pool changed texts scored per check
 DISC_DRAWS = 16       # ... of which a candidate is judged on those where it and the current circuit disagree most
@@ -645,7 +645,9 @@ class Acceptance:
     goal_eval.GoalEval.changed_search (texts changed at the sensitivity probe's positions: the circuit's change in
     prediction applied to the model's base prediction, against VPD's answer's, bounded by no change), and
     "interchange", s_interchange from interchange_search (the circuit's subcomponents at a position set to the
-    model's activations on a changed text, against VPD's answer under the same patches), and "donors", s_donor_near and
+    model's activations on a changed text, against VPD's answer under the same patches), "necessity", n_spec from
+    goal_eval.necessity_spec on the search split (the real model less the circuit's subcomponents, its damage on the
+    text less its damage on control texts, against VPD's answer: the lead's N floor 10-12), and "donors", s_donor_near and
     s_donor_far from donors_search (every subcomponent outside the circuit at its activation on a donor text: the
     changed texts, and training texts, against VPD's answer under the same donors, bounded by keeping nothing). A
     candidate passes while each term stays >= min(0.9, the search's start's); a term that is None (uninformative on
@@ -719,6 +721,8 @@ class Acceptance:
             elif k == "interchange":                         # the path-patched interchange in pp mode (C's term)
                 keys = ("s_interchange_pp" if self.mode == "pp" else "s_interchange",)
                 got = self.ge.interchange_search(self.tx, graphs, mode=self.mode)
+            elif k == "necessity":                           # phi's N: the real model less the circuit, specific to the
+                got = self.ge.necessity_spec(self.tx, graphs, split="search")   # text (controls: training texts)
             else:
                 got = getattr(self.ge, fn)(self.tx, graphs)
             for o, r in zip(out, got):
@@ -1528,7 +1532,7 @@ def main():
                     "(state_pairs: rustmove's greedy, read by read, within the F1 budget)")
     ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "
                     ">= min(0.9, the search's start's): changed (s_track, goal_eval.changed_search), interchange (s_interchange), "
-                    "donors (s_donor_near and s_donor_far, donors_search)")
+                    "donors (s_donor_near and s_donor_far, donors_search), necessity (n_spec, necessity_spec)")
     ap.add_argument("--no-strand", action="store_true",
                     help="with --edges, every non-query/key node keeps a stated connection (its most important; one the model connects "
                          "to no other node is dropped): the stated graph is the claim, a listed node needs a stated role")

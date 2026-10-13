@@ -183,10 +183,20 @@ class Backup:
 
     def _row(self, m: dict, j: int | None, dtype=torch.float32) -> dict:
         """One row's float masks: m with draw j's nodes off (None: no draw)."""
-        out = {n: x.to(dtype) for n, x in m.items()}
-        if j is not None:
-            for n, (t, c) in self._drop_idx[j].items():
-                out[n][t, c] = 0.0
+        return {n: x[0] for n, x in self._rows([(m, j)], dtype).items()}
+
+    def _rows(self, pairs: list, dtype=torch.float32) -> dict:
+        """Rows' float masks {site: [len(pairs), T, C]}: each (m, j) is m with draw j's nodes off (None: no draw), the
+        draws' nodes written off with one indexed write per site."""
+        out = {n: torch.stack([m[n] for m, _ in pairs]).to(dtype) for n in self.nat.names}
+        idx = {}
+        for r, (_, j) in enumerate(pairs):
+            if j is not None:
+                for n, (t, c) in self._drop_idx[j].items():
+                    idx.setdefault(n, []).append((r, t, c))
+        for n, lst in idx.items():
+            out[n][torch.cat([torch.full_like(t, r) for r, t, _ in lst]), torch.cat([t for _, t, _ in lst]),
+                   torch.cat([c for _, _, c in lst])] = 0.0
         return out
 
     def _run(self, rows: list) -> torch.Tensor:
@@ -194,9 +204,7 @@ class Backup:
         out = []
         with torch.no_grad():
             for s0 in range(0, len(rows), self.rows):
-                part = [self._row(m, j) for m, j in rows[s0:s0 + self.rows]]
-                out.append(self.E.log_probs({n: torch.stack([r[n] for r in part]) for n in self.nat.names}))
-                del part
+                out.append(self.E.log_probs(self._rows(rows[s0:s0 + self.rows])))
         return torch.cat(out) if out else torch.zeros(0)
 
     def _fields(self, lq: torch.Tensor) -> dict:
@@ -253,12 +261,12 @@ class Backup:
             D = len(self.drops)
             for s0 in range(0, D, self.rows):
                 js = list(range(s0, min(D, s0 + self.rows)))
-                part = [self._row(ones, j) for j in js]
-                E.log_probs({n: torch.stack([r[n] for r in part]) for n in nat.names})
+                part = self._rows([(ones, j) for j in js])
+                E.log_probs(part)
                 for n in nat.names:
                     o, i = got[n]
                     out["outside"][n] += ((o - base[n][0]) @ E.U[n]).norm(dim=-1).sum(0).cpu() / D
-                    keep = torch.stack([r[n] for r in part]) * m[n].float()   # the inside the draw keeps
+                    keep = part[n] * m[n].float()   # the inside the draw keeps
                     out["inside"][n] += (((i - base[n][1]) * keep) @ E.U[n]).norm(dim=-1).sum(0).cpu() / D
         finally:
             E._site = orig
@@ -300,7 +308,7 @@ class Backup:
             draws, D = [], len(self.drops)
             for s0 in range(0, D, self.rows):
                 js = list(range(s0, min(D, s0 + self.rows)))
-                E.log_probs({n: torch.stack([self._row(ones, j)[n] for j in js]) for n in nat.names})
+                E.log_probs(self._rows([(ones, j) for j in js]))
                 dc = sum(got[n][0] - base[n][0] for n in writers)                 # [B, targets, d]
                 per = {n: got[n][1] - base[n][1] for n in writers}
                 held = sum(got[n][2] - base[n][2] for n in writers)
@@ -355,7 +363,7 @@ class Backup:
             E._site = held
             for s0 in range(0, len(self.drops), self.rows):
                 js = list(range(s0, min(len(self.drops), s0 + self.rows)))
-                out.append(E.log_probs({n: torch.stack([self._row(ones, j)[n] for j in js]) for n in nat.names}))
+                out.append(E.log_probs(self._rows([(ones, j) for j in js])))
         finally:
             E._site = orig
             native.free(dev)
@@ -475,8 +483,8 @@ class Backup:
         rows = [r for r in rows if coef[r[1]] != 0.0]
         for s0 in range(0, len(rows), self.rows):
             part = rows[s0:s0 + self.rows]
-            base = [self._row(m, j) for j, _ in part]
-            mk = {n: torch.stack([b[n] for b in base]) + x[n] for n in nat.names}
+            base = self._rows([(m, j) for j, _ in part])
+            mk = {n: base[n] + x[n] for n in nat.names}
             lqp = self.E.log_probs(mk)
             refs = torch.cat([self.tx.ref if j is None else self.lm[j:j + 1] for j, _ in part])
             kl = carry.kl(refs, lqp).clamp_min(EPS)

@@ -1617,42 +1617,81 @@ class Engine:
         mask x U row, and the rest) and
         k_p the same; the rest-rest term (the background) and each stated pair's, rotary at t and p. q, k: the rotated
         queries (of the rows computed: rows_at, None for every position) and keys [B, H, T, hd]; aq, ak their sites'
-        activations ([B, rows, K], [B, T, K]); sq the query site's masks at the rows (query nodes at 1)."""
+        activations ([B, rows, K], [B, T, K]); sq the query site's masks at the rows (query nodes at 1). Every read at
+        once: its parts gathered, its keys' rest PAIR_ENTRIES floats of reads at a time."""
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
+        dev, sc = self.dev, 1 / math.sqrt(hd)
         nq, nk = native.site_name(i, "q_proj"), native.site_name(i, "k_proj")
         Uq, Uk = self._w(nq)[1].float(), self._w(nk)[1].float()
-        at = torch.arange(T, device=self.dev) if rows_at is None else rows_at
-        S = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(hd)
+        at = torch.arange(T, device=dev) if rows_at is None else rows_at
+        S = (q.float() @ k.float().transpose(-1, -2)) * sc
         sk = u[nk].expand(B, T, -1)
         if nk in p["qk"]:
-            sk = sk.index_put(p["qk"][nk], torch.ones((), device=self.dev))
+            sk = sk.index_put(p["qk"][nk], torch.ones((), device=dev))
         half = hd // 2
-
-        def rot(vec, pos):  # [H, hd] at position pos
-            return vec * tg.cos[pos] + torch.cat([-vec[..., half:], vec[..., :half]], -1) * tg.sin[pos]
         place = {int(t): r for r, t in enumerate(at.tolist())}
-        for b, t, stated, qs, ks in prs:
-            r = place.get(t)
-            if r is None:  # a read whose position this run does not compute (the last layer at the targets alone)
+        rb, rr, rt, qe, ke, pe = [], [], [], ([], []), ([], [], []), ([], [], [])
+        for b, t, stated, qs, ks in prs:  # (read, its query parts, its key parts, its stated pairs: indices into them)
+            if t not in place:  # a read whose position this run does not compute (the last layer at the targets alone)
                 continue
-            m = sq[b if sq.shape[0] > 1 else 0, r if sq.shape[1] > 1 else 0]
-            qpart = {c: rot((aq[b, r, c] * m[c] * Uq[c]).float().view(H, hd), t) for c in qs}
-            kpart = {(pk, c): rot((ak[b, pk, c] * sk[b if sk.shape[0] > 1 else 0, pk, c] * Uk[c]).float().view(H, hd), pk)
-                     for pk, c in ks}
-            q_rest = q[b, :, r].float() - sum(qpart.values()) if qpart else q[b, :, r].float()
-            k_rest = k[b, :, :t + 1].float().clone()
-            for (pk, c), kb in kpart.items():
-                k_rest[:, pk] -= kb
-            row = (q_rest[:, None] * k_rest).sum(-1) / math.sqrt(hd)
+            j = len(rb)
+            rb.append(b)
+            rr.append(place[t])
+            rt.append(t)
+            qi, ki = {}, {}
+            for c in qs:
+                qi[c] = len(qe[0])
+                qe[0].append(j)
+                qe[1].append(c)
+            for pk, c in ks:
+                ki[(pk, c)] = len(ke[0])
+                ke[0].append(j)
+                ke[1].append(pk)
+                ke[2].append(c)
             for qa, kb in stated:
-                qv = q_rest if qa is None else qpart[qa]
-                if kb is None:
-                    row = row + (qv[:, None] * k_rest).sum(-1) / math.sqrt(hd)
-                else:
-                    row = row.clone()
-                    row[:, kb[0]] = row[:, kb[0]] + (qv * kpart[kb]).sum(-1) / math.sqrt(hd)
-            S[b, :, r, :t + 1] = row
-        return S.masked_fill(torch.arange(T, device=self.dev)[None, :] > at[:, None], float("-inf")).softmax(-1)
+                pe[0].append(j)
+                pe[1].append(-1 if qa is None else qi[qa])
+                pe[2].append(-1 if kb is None else ki[tuple(kb)])
+        if rb:
+            ints = lambda v: torch.tensor(v, dtype=torch.long, device=dev)  # noqa: E731
+            RB, RR, RT = ints(rb), ints(rr), ints(rt)
+            qj, qc = (ints(x) for x in qe)
+            kj, kp, kc = (ints(x) for x in ke)
+            pj, pq, pk_ = (ints(x) for x in pe)
+
+            def rot(vec, pos):  # [n, H, hd] rotated at positions pos [n]
+                return vec * tg.cos[pos][:, None] + torch.cat([-vec[..., half:], vec[..., :half]], -1) * tg.sin[pos][:, None]
+            bq, rq = RB[qj], RR[qj]
+            mq = sq[bq if sq.shape[0] > 1 else torch.zeros_like(bq), rq if sq.shape[1] > 1 else torch.zeros_like(rq), qc]
+            Qp = rot(((aq[bq, rq, qc] * mq).float()[:, None] * Uq[qc]).view(-1, H, hd), RT[qj])  # the query parts [Eq, H, hd]
+            bk = RB[kj]
+            Kp = rot(((ak[bk, kp, kc] * sk[bk, kp, kc]).float()[:, None] * Uk[kc]).view(-1, H, hd), kp)  # the key parts
+            n = len(rb)
+            q_rest = q[RB, :, RR].float() - torch.zeros(n, H, hd, device=dev).index_add(0, qj, Qp)
+            kf = k.float()
+            both, qonly, konly = (pq >= 0) & (pk_ >= 0), (pq >= 0) & (pk_ < 0), (pq < 0) & (pk_ >= 0)
+            rest2 = torch.zeros(n, device=dev).index_add(0, pj[(pq < 0) & (pk_ < 0)],
+                                                         torch.ones(int(((pq < 0) & (pk_ < 0)).sum()), device=dev))
+            step = max(1, PAIR_ENTRIES // (H * T * hd))
+            for j0 in range(0, n, step):
+                j1 = min(n, j0 + step)
+                Kr = kf[RB[j0:j1]]  # [reads, H, T, hd]: each read's keys less its key parts
+                m = (kj >= j0) & (kj < j1)
+                Kr.permute(0, 2, 1, 3).index_put_((kj[m] - j0, kp[m]), -Kp[m], accumulate=True)
+                row = torch.einsum("chd,chtd->cht", q_rest[j0:j1], Kr) * sc * (1 + rest2[j0:j1])[:, None, None]  # the background
+                m = qonly & (pj >= j0) & (pj < j1)  # (a, None): q_a . k_rest
+                if bool(m.any()):
+                    qa = torch.zeros(j1 - j0, H, hd, device=dev).index_add(0, pj[m] - j0, Qp[pq[m]])
+                    row = row + torch.einsum("chd,chtd->cht", qa, Kr) * sc
+                rt_ = row.permute(0, 2, 1)  # [reads, T, H]
+                m = konly & (pj >= j0) & (pj < j1)  # (None, b): q_rest . k_b at b's position
+                if bool(m.any()):
+                    rt_.index_put_((pj[m] - j0, kp[pk_[m]]), (q_rest[pj[m]] * Kp[pk_[m]]).sum(-1) * sc, accumulate=True)
+                m = both & (pj >= j0) & (pj < j1)  # (a, b): q_a . k_b at b's position
+                if bool(m.any()):
+                    rt_.index_put_((pj[m] - j0, kp[pk_[m]]), (Qp[pq[m]] * Kp[pk_[m]]).sum(-1) * sc, accumulate=True)
+                S[RB[j0:j1], :, RR[j0:j1]] = row  # (positions after each read's query masked below)
+        return S.masked_fill(torch.arange(T, device=dev)[None, :] > at[:, None], float("-inf")).softmax(-1)
 
     def _resid_tables(self, p: dict, key: str, Wr: dict, Eg: dict, outs: dict) -> tuple:
         """The connections from residual writers (attention and MLP outputs) as one list per reader site and one into
@@ -2015,6 +2054,7 @@ def read_pairs(nodes, layer: int, t: int) -> list:
 
 ROWS = 1 << 24  # entries of a connection group's [connections, width] product made at once (64 MB in float32)
 PP_ENTRIES = 1 << 26  # floats in a path-patched batch's attention scores at once (256 MB in float32)
+PAIR_ENTRIES = 1 << 26  # floats of reads' keys at once in _pair_rows (each read's T x H x hd)
 PP_ROWS = 512  # rows (prompts x graphs) in a path-patched batch of stated graphs
 
 

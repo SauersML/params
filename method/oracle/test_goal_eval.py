@@ -1915,7 +1915,7 @@ def test_omitted_family(tiny):
     assert row["s_omitted"] == (1.0 if s is None else s)
     whole = native.Graph(every, complete=True)  # every VPD active: nothing left out at its positions
     assert ge._omitted_family(tx, [whole], k=6)[0]["s_omitted"] == 1.0
-    nb = ge.necessity_spec(tx, [g], "eval", background=True)[0]  # the background kept on: a valid N row either way
+    nb = ge.necessity_spec(tx, [g], "eval", background=False)[0]  # the background removed too: a valid N row either way
     assert set(nb) >= {"n_spec", "d_target", "d_control"}
 
 def test_line_leave_one_out(tiny):

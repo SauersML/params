@@ -2635,7 +2635,7 @@ class GoalEval:
         return kls
 
     def necessity_spec(self, tx: Text, graphs: list[native.Graph], split: str = "eval", controls: int = NEC_CONTROLS,
-                       background: bool = False) -> list[dict]:
+                       background: bool = True) -> list[dict]:
         """N, phi's necessity (the user's spec, the lead's 10-12: without the circuit's parts the real system breaks,
         and the break is this text's, not every text's). Per graph: D_t, the damage at the targets (KL from the model)
         of the real model less the circuit's subcomponents (every other subcomponent and every remainder on, as
@@ -2646,8 +2646,11 @@ class GoalEval:
         before a control's start are left out there; the same two for VPD's whole answer. n_spec = clip((D_t - D_c) / (D_t(VPD) - D_c(VPD)), 0, 1): parts whose removal
         damages every text's prediction there add to D_t and D_c alike and earn nothing, VPD's answer scores 1, None
         when VPD's removal damages the controls as much as the text; n_spec_raw unclipped below (c_rl's ranking).
-        draws_n_spec: per control [control, D_c, D_c(VPD), D_t, D_t(VPD)] (phi's eps). Damages in bits. background: the
-        background parts at the targets (GENERIC_TARGET) kept on in every removal (credited to no one)."""
+        draws_n_spec: per control [control, D_c, D_c(VPD), D_t, D_t(VPD)] (phi's eps). Damages in bits. background
+        (the default, the lead's 10-13): the background parts at the targets (GENERIC_TARGET) kept on in every removal,
+        credited to no one. Without it the 5 parts saturated the damage on text and controls alike (14-18 bits) and the
+        start's D_t - D_c fell to 0 or below on 9001, 9006, 9007 and 9015; kept on, it is 1.8-6.9 bits there and N on the
+        20 held-out starts goes from 0.62 (14 scored) to 0.92 (18 scored)."""
         nat, T = self.nat, tx.T
         sets = [self.masks(_c_graph(g, tx.targets, nat.C), T) for g in graphs]
         keep = None
@@ -4631,8 +4634,8 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             nf = ge._node_family(tx, [_c_graph(g, targets, nat.C) for g in graphs], draws,
                                  units=[sorted(strand(g, targets, nat.C).node_set()) for g in graphs]) if "nodes" in only else [{} for _ in graphs]
             ns = ge.necessity_spec(tx, graphs, "eval") if "necessity" in only else [{} for _ in graphs]
-            if "necessity_bg" in only:  # N with the background at the targets kept on
-                ns = [dict(a, **{f"{k}_bg": v for k, v in b.items()}) for a, b in zip(ns, ge.necessity_spec(tx, graphs, "eval", background=True))]
+            if "necessity_bg" in only:  # N without the background kept (background=False), the earlier definition
+                ns = [dict(a, **{f"{k}_nobg": v for k, v in b.items()}) for a, b in zip(ns, ge.necessity_spec(tx, graphs, "eval", background=False))]
             if "omitted" in only:
                 ns = [dict(a, **b) for a, b in zip(ns, ge._omitted_family(tx, [_c_graph(g, targets, nat.C) for g in graphs]))]
             if "remainders" in only:  # the point score with the remainders live, held at x and off

@@ -76,7 +76,10 @@
 %% Next decision: independent outcome/weight-input evidence before scaling; do not repeat blind SFT on this tiny gain.
 %% Follow-up: trained policy sampled full vs observation-removed inputs on all22 texts9028–9049 (179 questions).
 %% Shared-library DEVELOPMENT overlap disclosed; new to this policy evaluation, never training or untouched final holdout.
-%% Both arms frozen before scoring,44 first samples, actual $.064117053; model-free analysis pending memory admission.
+%% Both arms frozen before scoring,44 first samples, actual $.064117053; all44 valid,179/179 questions per arm.
+%% Full235/358=65.64%, summaries removed223/358=62.29%; best cheap activation231/358=64.53%.
+%% Full wins12/ties4/loses6 texts versus removal, but beats the best cheap control by only4 fields.
+%% Decision: no further blind SFT scaling; require useful unseen-intervention gains beyond frozen cheap controls.
 %% QA inputs contain causal summaries/CI/activation/wiring cosines, NOT raw U/V vectors; ablation cannot establish weight use.
 %% Relation6011: actual VPD groups T77/O73/A140 from8 construction donors, independent relation donors, fixed sites.
 %% Eval carrier scores T.761/O.979/A.591 vs native .681/.995/.997; matching-restoration fails. No mechanism verified.
@@ -85,11 +88,13 @@
 %% Toy-loop reward executes selected UNITS only; Mermaid edges previously affected structural F1, not executable reward.
 %% 9789f31 adds opt-in --wiring: architecture-constrained edges compile to native pieces, with all selected pieces retained.
 %% Token-role arrows remain annotations and English unverified; diagnostic is point sufficiency, not intervention certification.
-%% Four regression tests queued locally; a099e3e adds dedicated CI step. Preserve existing training reward while checking wiring.
+%% Four execution regressions pass: same units with a causal edge removed change predictions; full route reproduces model.
+%% Fixed active fixture f64be01 and legacy mock faf86cb; full graph-oracle CI38338224340 passes, including controls.
+%% Preserve existing training reward; next use opt-in wiring scores to test learned relations, not unit selection alone.
 %% Literature consequence: measure outcome prediction before free prose; native carriers alone cannot certify meaning.
 %% Offline falsification: real node-response errors coexist with large uncertainty penalties; do not tune them away.
 %% Next reward evidence, if needed: saved candidates on9020/9026/9027 with retained draws, after scorer owner freezes it.
-%% Combined codex pilots: Tinker $4.162640972 + RunPod $0.1826 = $4.345240972; no shared extra budget used.
+%% Combined codex pilots: Tinker $4.226758025 + RunPod $0.1826 = $4.409358025; no shared extra budget used.
 %% Existing dev8 immutable. New rerender --node-cap communicates explicit limits before fitting (33419cd).
 %% Successful SFT skills feed integration directly; RL is an optional improvement, not a prerequisite.
 %% Grounded-English pilot: train6002/6011, one eval-passing carrier per text; writer outcomes withheld.
@@ -153,7 +158,7 @@ flowchart BT
     I2["<b>Context fit and explicit limits</b><br/>opt-in node cap before token fitting;<br/>log and skip only oversized rows;<br/>later rows continue<br/>DONE · codex/eval_recovery · 33419cd"]
     I3["<b>Coverage audit</b><br/>179/207-row snapshots: 81–84%<br/>of teacher nodes visible; edits join;<br/>retain pool inputs, check token fit<br/>HANDOFF · codex to primerl/rustmove"]
     I4["<b>Learnability and input controls</b><br/>cheap features beat full-circuit QA;<br/>test weights beyond visible facts;<br/>vectors real/random/id/permuted<br/>ACTIVE · rustmove, codex"]
-    QAONLY["<b>Outcome-only learning trial</b><br/>QA 73.53% vs cheap control 71.32%;<br/>22 more dev texts: full vs summaries off;<br/>sampling done; paired analysis pending<br/>ACTIVE · codex · $1.89 spent"]
+    QAONLY["<b>Outcome-only learning trial</b><br/>22 dev texts: full 65.64%,<br/>summaries off 62.29%, cheap 64.53%;<br/>only 4-field gain: do not scale yet<br/>CHECK · codex · $1.89 spent"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
     I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
   end
@@ -176,7 +181,7 @@ flowchart BT
   VAR["<b>Variables and invariants</b><br/>carriers, value maps, E4 v2 checker;<br/>nulls and triviality check running;<br/>influential_v2 variables next<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
   ENGP["<b>VPD relational mechanisms</b><br/>6011: only 1 of 3 carriers passes;<br/>joint matching restoration fails;<br/>separate coverage from remainder loss<br/>CHECK · codex/variable_reward"]
-  WIRING["<b>Execute the stated wiring</b><br/>toy reward checked units, not edges;<br/>new compiler respects architecture;<br/>opt-in diagnostic; validation pending<br/>ACTIVE · codex · 9789f31"]
+  WIRING["<b>Execute the stated wiring</b><br/>architecture-constrained compiler;<br/>edge removal changes predictions;<br/>4 tests and full CI pass; score learned edges<br/>IMPLEMENTED · codex · f64be01"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -329,7 +334,7 @@ flowchart BT
   class T4 blocked
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
-  class QAONLY,WIRING active
+  class QAONLY,WIRING check
   class ENGP check
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting

@@ -610,3 +610,18 @@ def test_set_search_validation_holds_its_floor():
     f = rec["floor"]["s_track_pp"]
     assert rec["validation_end"] is None or rec["validation_end"] >= f - 1e-6
     assert g.count() == int(ps.on.sum()) <= rec["start_units"]
+
+
+def test_family_acceptance_scores_as_fidelity():
+    nat, pr = pruner(True, "text9002")
+    ge = pr.ge
+    ids, targets = native.text(TEXT.parent / "text9002.json")
+    tx = ge.text(ids, targets, native.task_seed("text9002"))
+    tx.vpd = pr.tx.vpd
+    start, _ = vpd_top(pr, nat, 61, "text9002")
+    g = native.Graph([pr.nodes[j] for j in start.nonzero().flatten().tolist()], complete=True)
+    got = teacher.Acceptance(ge, tx, ("nodes", "edges", "pattern"), "pp").scores([g])[0]
+    row = ge.fidelity(tx, [g], None, mode="reward", interchange=0, changed=0, near_donors=0, far_donors=0, controls=0)[0]
+    # phi's families in acceptance are fidelity's own numbers
+    for k in ("s_nodes", "s_edges", "s_pattern"):
+        assert (got[k] is None) == (row.get(k) is None) and (got[k] is None or abs(got[k] - row[k]) < 1e-5), (k, got[k], row.get(k))

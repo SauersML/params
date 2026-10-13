@@ -661,7 +661,8 @@ def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",
 
 
 ACCEPT = {"changed": ("changed_search", ("s_track",)), "interchange": ("interchange_search", ("s_interchange",)),
-          "donors": ("donors_search", ("s_patching_near", "s_patching_far")), "necessity": ("necessity_spec", ("n_spec",))}
+          "donors": ("donors_search", ("s_patching_near", "s_patching_far")), "necessity": ("necessity_spec", ("n_spec",)),
+          "nodes": ("_node_family", ("s_nodes",)), "edges": ("_edge_family", ("s_edges",)), "pattern": ("pattern_family", ("s_pattern",))}
 TRACK = {"c": "s_track", "pp": "s_track_pp"}  # changed_search's mode -> its term
 POOL_DRAWS = 64       # discriminating acceptance: fresh search-pool changed texts scored per check
 DISC_DRAWS = 16       # ... of which a candidate is judged on those where it and the current circuit disagree most
@@ -691,7 +692,9 @@ class Acceptance:
     "interchange", s_interchange from interchange_search (the circuit's subcomponents at a position set to the
     model's activations on a changed text, against VPD's answer under the same patches), "necessity", n_spec from
     goal_eval.necessity_spec on the search split (the real model less the circuit's subcomponents, its damage on the
-    text less its damage on control texts, against VPD's answer: the lead's N floor 10-12), and "donors", s_patching_near and
+    text less its damage on control texts, against VPD's answer: the lead's N floor 10-12), "nodes", "edges" and
+    "pattern", phi's families as goal_eval's fidelity scores them (s_nodes against the real model less the same
+    nodes, s_edges, s_pattern), and "donors", s_patching_near and
     s_patching_far from donors_search (every subcomponent outside the circuit at its activation on a donor text: the
     changed texts, and training texts, against VPD's answer under the same donors, bounded by keeping nothing). A
     candidate passes while each term stays >= min(0.9, the search's start's); a term that is None (uninformative on
@@ -806,6 +809,19 @@ class Acceptance:
                 got = self.ge.interchange_search(self.tx, graphs, mode=self.mode)
             elif k == "necessity":                           # phi's N: the real model less the circuit, specific to the
                 got = self.ge.necessity_spec(self.tx, graphs, split="search")   # text (controls: training texts)
+            elif k in ("nodes", "edges", "pattern"):         # phi's families as goal_eval.GoalEval.fidelity scores them
+                tx, C = self.tx, self.ge.nat.C
+                cg = [goal_eval._c_graph(g, tx.targets, C) for g in graphs]
+                e0 = self.ge._bounds(tx, "live")[0]
+                if k == "nodes":                             # (the real model less the nodes the reference, a block one unit)
+                    rows = self.ge._node_family(tx, cg, goal_eval.DRAWS, True,
+                                                units=[sorted(goal_eval.strand(g, tx.targets, C).node_set()) for g in graphs])
+                    got = [{"s_nodes": goal_eval._pooled("weighted", r.get("draws_nodes"), e0)} for r in rows]
+                elif k == "edges":
+                    got = [{"s_edges": goal_eval._fid(e0, r["kl_edges_c"], r["kl_edges_vpd"]) if r.get("kl_edges_c") is not None else None}
+                           for r in self.ge._edge_family(tx, cg, goal_eval.DRAWS, True)]
+                else:
+                    got = self.ge.pattern_family(tx, cg)
             else:
                 got = getattr(self.ge, fn)(self.tx, graphs)
             for o, r in zip(out, got):
@@ -1792,7 +1808,8 @@ def main():
                     "(state_pairs: rustmove's greedy, read by read, within the F1 budget)")
     ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "
                     ">= min(0.9, the search's start's): changed (s_track, goal_eval.changed_search), interchange (s_interchange), "
-                    "donors (s_patching_near and s_patching_far, donors_search), necessity (n_spec, necessity_spec)")
+                    "donors (s_patching_near and s_patching_far, donors_search), necessity (n_spec, necessity_spec), nodes, "
+                    "edges, pattern (s_nodes, s_edges, s_pattern: phi's families as fidelity scores them)")
     ap.add_argument("--no-strand", action="store_true",
                     help="with --edges, every non-query/key node keeps a stated connection (its most important; one the model connects "
                          "to no other node is dropped): the stated graph is the claim, a listed node needs a stated role")

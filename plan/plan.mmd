@@ -232,7 +232,7 @@ flowchart BT
   subgraph INSTR["INSTRUMENTAL · faster and cheaper everywhere"]
     SP1["<b>Engine speed</b><br/>4090: circuit run × 16 texts 0.06 s;<br/>737 line deletions 0.35 s;<br/>line_loo 65 s (was 454)<br/>ACTIVE · monitorbench"]
     SP2["<b>Teacher throughput</b><br/>influential start: 3 s and $0.0002 per text<br/>(494 texts, $0.11);<br/>block-search teacher: median 3–15 min,<br/>tails past 2 h, $0.14–0.25 per text<br/>ACTIVE · fleet, pymove"]
-    SP3["<b>Scorer throughput</b><br/>15.3 s per answer (median, 20-60 nodes);<br/>line_loo 73%: N per node deletion;<br/>complete sets: line_loo crash, re-time<br/>ACTIVE · inframove, primerl"]
+    SP3["<b>Scorer throughput</b><br/>10 s per RL sample with line credit<br/>(A40, 66 lines; was 21 s);<br/>left: pattern, N per deletion<br/>ACTIVE · inframove, primerl, monitorbench"]
     SP4["<b>GPU use and cost</b><br/>toy teacher runs leave the GPU idle:<br/>they run on the Mac; toy VPD fits<br/>run 2–3 per card; block search needs<br/>86 GB host memory on text9004<br/>ACTIVE · fleet"]
     SP5["<b>Tests on main</b><br/>wiring and input checks pass;<br/>investigate adversary-batch precision<br/>ACTIVE · codex, every owner"]
   end

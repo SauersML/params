@@ -26,6 +26,9 @@ def baseline_identity(edited,baseline):
 def audit(root):
     import torch
     from safetensors.torch import load_file
+    contract=json.loads((root/"contract.json").read_text())
+    required={"source":c.EXECUTOR,"driver_sha256":c.h.digest(c.__file__),"helpers_sha256":c.HELPER_SHA,"cases":list(c.CASES),"arms":list(c.ARMS),"scales":[0.,.5],"heads_per_case":8,"inputs_per_case":8,"edited_worlds":1024,"baseline_worlds":64,"candidate_live":False,"embedding":"on","frozen_boundary":False,"integrity_max_bits":.001,"damage_min_bits":.001}
+    if c.h.digest(c.h.__file__)!=c.HELPER_SHA or any(contract.get(k)!=v for k,v in required.items()):raise ValueError("advertised protocol mismatch")
     draws=c.h.rows(root/'draws.jsonl');baselines=c.h.rows(root/'baseline.jsonl');restores=c.h.rows(root/'restore.jsonl')
     c.verify_grid(draws,baselines,restores)
     manifest=c.h.rows(root/'distribution_manifest.jsonl')
@@ -37,6 +40,7 @@ def audit(root):
         used.add(name)
         if c.h.digest(root/name)!=b['sha256']:raise ValueError('distribution checksum')
         values=load_file(str(root/name))
+        if any(tuple(v.shape)!=(1,1,32) for v in values.values()):raise ValueError("frozen distribution shape")
         if sorted(values)!=b['keys']:raise ValueError('distribution keys')
         return values
     baseline={}
@@ -55,19 +59,21 @@ def audit(root):
         if max(0.,integrity)>1e-3:raise ValueError('edited full integrity')
         if int(v['pe'][0,-1].argmax())!=row['reference_top'] or int(v['p0'][0,-1].argmax())!=row['original_top']:raise ValueError('dense top')
         expected={'p0','pe','complete'}
+        if set(row["candidates"])!=set((*c.ARMS,"gt")):raise ValueError("candidate arm coverage")
         for a,item in row['candidates'].items():
             if item['valid']:
                 expected|={'q0_'+a,'qe_'+a}
                 raw=raw_kl(v['pe'],v['qe_'+a]);close(raw,item['direct_raw_kl_bits']);close(max(0.,raw),item['direct_kl_bits'])
                 close(max(0.,raw_kl(v['pe'],v['q0_'+a])),item['sparse_nochange_kl_bits'])
                 if int(v['qe_'+a][0,-1].argmax())!=item['top']:raise ValueError('candidate top')
-            elif any(item[k] is not None for k in ('direct_kl_bits','direct_raw_kl_bits','top','sparse_nochange_kl_bits')):raise ValueError('invalid metric fabrication')
+            elif not item.get("invalid_reason") or any(item[k] is not None for k in ('direct_kl_bits','direct_raw_kl_bits','top','sparse_nochange_kl_bits')):raise ValueError('invalid metric fabrication')
             if item['valid']!=(a not in next(r for r in baselines if r['case']==row['case'] and r['input']==row['input'])['invalid']):raise ValueError('candidate validity changed')
         if set(v)!=expected:raise ValueError('edited invalid coverage')
     if used!=set(bindings):raise ValueError('unused distribution arrays')
     if not all(r['all_weights_basis_bitwise'] and r['dense_bitwise'] for r in restores):raise ValueError('restoration failed')
     complete=json.loads((root/'complete.json').read_text())
     if complete['distribution_manifest_sha256']!=c.h.digest(root/'distribution_manifest.jsonl') or complete['groups']!=c.summarize(draws):raise ValueError('summary mismatch')
+    if complete.get("per_case")!={name:c.summarize([r for r in draws if r["case"]==name]) for name in c.CASES} or any(complete.get(k)!=v for k,v in {"edited_worlds":1024,"baseline_worlds":64,"restores":128}.items()):raise ValueError("per-case summary or counts mismatch")
     result={'edited_worlds':len(draws),'baseline_worlds':len(baselines),'restores':len(restores),'saved_arrays_verified':len(used),'baseline_arrays_exact':True,'groups':c.summarize(draws)}
     return result
 

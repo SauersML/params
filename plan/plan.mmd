@@ -197,7 +197,7 @@ flowchart BT
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
-  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · repair landed;<br/>teacher vs start rows pending"}}
+  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 60/60;<br/>cond 2 (teacher vs start) running"}}
 
   %% ===================== workstreams =====================
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
@@ -222,7 +222,7 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>40 copy + 20 model-mistake texts:<br/>correct vs 5 wrong copy circuits,<br/>equal-bits baselines; scoring on pods<br/>ACTIVE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>bar floor, unscored = 0 (3277f18);<br/>floored Φ, R − Φ_τ (f5a1df2):<br/>empty, near-empty R < 0 on 60/60<br/>ACTIVE · inframove, primerl"]
+    W4["<b>Reward repair</b><br/>package on main (aa79889): floor,<br/>eps cap, N guard, Φ cap, no node cap;<br/>toys core 8/15→pass but collapsed;<br/>DONE · inframove, primerl"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
     W6["<b>Matched reward controls</b><br/>null-syntax bonus fixed;<br/>retain scored draws to distinguish<br/>response errors from uncertainty<br/>IMPLEMENTED · codex · b84253d"]
   end

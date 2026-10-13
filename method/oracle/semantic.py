@@ -51,14 +51,15 @@ import native  # noqa: E402
 import variables  # noqa: E402
 
 LN2 = math.log(2.0)
+REMOVE_MIN = 0.5  # bits: a removal moving the top token's probability less than this makes no removal line
 BLOCK = variables.BLOCK
 
 
 class Checker:
     """Runs interventions on one text in the real model: check(items) with items [(intervention, outcome)]."""
 
-    def __init__(self, sc: variables.Scorer, tx, variables_: list[dict]):
-        self.sc, self.tx, self.nat = sc, tx, sc.nat
+    def __init__(self, sc: variables.Scorer, tx, variables_: list[dict], fresh_mean: bool = False):
+        self.sc, self.tx, self.nat, self.fresh_mean = sc, tx, sc.nat, fresh_mean
         self.vars = {v["name"]: v for v in variables_}
         self.base = sc._text(tx.ids, tx.targets, check=False)
         self.p0 = self.base["lq"][-1]
@@ -86,7 +87,11 @@ class Checker:
             v, acc, outs, n = self.vars[name], {}, {}, 0
             sites = {s for s, _, _ in v["group"]}
             for p in v["inputs"]:
-                for z in var_classes.alternatives(self.nat, self.tx.ids, p, int(self.tx.seed)):
+                zs = var_classes.alternatives(self.nat, self.tx.ids, p, int(self.tx.seed))
+                if self.fresh_mean:  # 64 other tokens sampled from the model's prediction there, none of the usual ones
+                    zs = [z for z in var_classes.alternatives(self.nat, self.tx.ids, p, int(self.tx.seed) + 1, top=0, sampled=96)
+                          if z not in set(zs)][:64]
+                for z in zs:
                     w = self.text({p: z})
                     for s in sites:
                         acc[s] = acc.get(s, 0) + w["act"][s]
@@ -385,7 +390,7 @@ def parse_invariants(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
     return out, bad
 
 
-def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model: str = "vpd4l") -> dict:
+def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model: str = "vpd4l", fresh_mean: bool = False) -> dict:
     """The INVARIANTS lines checked in the real model: per line holds, surprise and credit; the total credit in bits
     and the share holding (lines naming a variable the answer lacks, or not parsing, count as failing bold claims of
     one bit)."""
@@ -393,7 +398,7 @@ def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model:
     names = {v["name"] for v in vs}
     ok = [x for x in lines if all(n in names for n, _ in x["intervention"]["transplants"]) and all(n in names for n in x["intervention"]["remove"])]
     bad += len(lines) - len(ok)
-    ck = Checker(sc, tx, vs)
+    ck = Checker(sc, tx, vs, fresh_mean=True) if fresh_mean else Checker(sc, tx, vs)
     try:
         rows = [{"id": x["id"], "line": x["line"], **r} for x, r in zip(ok, ck.check([(x["intervention"], x["outcome"]) for x in ok]))]
     finally:
@@ -494,7 +499,9 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
     and input position p: fresh donor tokens the value map never saw (sampled from the model's prediction at p, the
     map's tokens and the text's own left out); a fresh token z whose changed text the model itself sends to a class's
     predicted token y (not the text's top) belongs to that class, and the explanation then predicts that the carrier
-    alone carries it: 'V from @p=z -> top y' (per_class tokens per class); per variable 'remove V -> p(top) < 0.5'; and
+    alone carries it: 'V from @p=z -> top y' (per_class tokens per class); per variable whose removal (V at its mean
+    over the usual alternatives) drops the top token's probability by d >= REMOVE_MIN bits, 'remove V -> p(top) < f'
+    with f = 2^(-d/2), checked with V at its mean over fresh tokens instead; and
     per pair of variables at different positions, both carriers from two donors (each one's first fresh token), the
     model's own prediction on the text with both changes as the claim (independent recombination). A variable marked
     "identity" with no value map (it carries its positions' tokens) gets, per input position, fresh tokens z whose
@@ -558,7 +565,6 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                         got[want[y]].append((z, y))
                 for pairs in got.values():
                     items += [(v["name"], {"transplants": [(v["name"], {p: z})]}, ("top", y), [(v["name"], p, z), y]) for z, y in pairs]
-            items.append((v["name"], {"remove": [v["name"]]}, ("drop", 0.5), None))
         names = [v["name"] for v in vs if v["name"] in first]
         for i, a in enumerate(names):  # independent recombination: two variables from two donors, the model's own
             for b in names[i + 1:]:     # prediction on the text with both changes as the claim
@@ -569,6 +575,22 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                 if y != ck.y0:
                     items.append((a, {"transplants": [(a, {pa: za}), (b, {pb: zb})]}, ("top", y), [(a, pa, za), (b, pb, zb), y]))
         rows = ck.check([(iv, out) for _, iv, out, _ in items])
+        # graded removals (the lead's 10-13: 'p(top) < 0.5' held on 36%): the drop d in bits of the top token's
+        # probability with V at its mean over the usual alternatives, claimed at half (p(top) < 2^(-d/2) x base) when
+        # d >= REMOVE_MIN, and checked with V at its mean over fresh tokens (none of the usual alternatives)
+        claims = []
+        for v in vs:
+            q = ck.run({"remove": [v["name"]]})
+            d = float(ck.p0[ck.y0] - q[ck.y0]) / LN2
+            if d >= REMOVE_MIN:
+                claims.append((v["name"], {"remove": [v["name"]]}, ("drop", min(0.99, max(0.01, round(2 ** (-d / 2), 2)))), None))
+        if claims:
+            fresh_ck = Checker(sc, tx, vs, fresh_mean=True)
+            try:
+                rows += fresh_ck.check([(iv, out) for _, iv, out, _ in claims])
+            finally:
+                fresh_ck.close()
+            items += claims
     finally:
         ck.close()
     toks = components.token_strings(model, [t for *_, e in items if e for t in [x[2] for x in e[:-1]] + [e[-1]]])
@@ -582,7 +604,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
             line = f"{', '.join(parts)} -> top {components.shown(toks[k])}"
             k += 1
         else:
-            line = f"remove {name} -> p(top) < 0.5"
+            line = f"remove {name} -> p(top) < {outc[1]:g}"
         row = {"line": line, **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")}}
         if structured:
             import copy

@@ -252,8 +252,11 @@ def teacher_checker(monkeypatch):
 
     state = {"calls": 0, "checks": []}
     class FakeChecker:
-        def __init__(self, *args):
+        def __init__(self, *args, **kw):
             self.y0 = 0
+            self.p0 = torch.full((4,), .25).log()
+        def run(self, iv):  # a removal drops the top token 0.25 -> 0.05: a graded removal line, checked by a fresh checker
+            return torch.tensor([.05, .25, .45, .25]).log()
         def text(self, changes):
             y = 2 if list(changes.values()) == [2] else 0
             return {"lq": torch.nn.functional.one_hot(torch.tensor([y]), 4).float()}
@@ -262,7 +265,8 @@ def teacher_checker(monkeypatch):
             rows = [{"intervention": copy.deepcopy(iv), "outcome": list(out), "holds": out[0] == "top",
                      "surprise": 2.0 if out[0] == "top" else 1.0, "credit": 2.0 if out[0] == "top" else -1.0,
                      "top": 2, "p_top": .75, "logp": -0.5} for iv, out in items]
-            state["checks"] = rows
+            if any("transplants" in iv for iv, _ in items):  # the lines' checker (not the graded removals' fresh one)
+                state["checks"] = rows
             return rows
         def close(self):
             pass
@@ -286,7 +290,7 @@ def test_teacher_structured_evidence_preserves_default_and_failed_checks(teacher
     sc, tx, vs, state = teacher_checker
     plain = semantic.teacher_invariants(sc, tx, vs, fresh=2)
     retained = semantic.teacher_invariants(sc, tx, vs, fresh=2, structured=True)
-    assert state["calls"] == 2  # one unchanged checker execution per invocation
+    assert state["calls"] == 4  # two checker executions per invocation: the lines, then the graded removal (fresh mean)
     assert [{k: v for k, v in row.items() if k != "executed"} for row in retained] == plain
     assert [row["holds"] for row in retained] == [True, False]
     assert retained[0]["executed"]["intervention"] == {"transplants": [("V1", {0: 2})]}

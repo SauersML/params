@@ -222,12 +222,12 @@ def check(a) -> None:
         teacher = "\n".join(x["line"] for x in r["invariants"])
         row = {"task": t, "variables": len(vs), "lines": len(r["invariants"])}
         sc = variables.Scorer(ge)
-        row["teacher"] = semantic.check_invariants(sc, tx, vs, teacher, task["model"])
-        row["shuffled"] = semantic.check_invariants(sc, tx, shuffled(vs, nat.C, native.task_seed(t)), teacher, task["model"])
+        row["teacher"] = semantic.check_invariants(sc, tx, vs, teacher, task["model"], fresh_mean=True)
+        row["shuffled"] = semantic.check_invariants(sc, tx, shuffled(vs, nat.C, native.task_seed(t)), teacher, task["model"], fresh_mean=True)
         for k, got in llm.items():
             if t in got:
                 text = llm_lines(prompts[t]["items"], got[t]["answer"])
-                row[k] = semantic.check_invariants(sc, tx, vs, text, task["model"])
+                row[k] = semantic.check_invariants(sc, tx, vs, text, task["model"], fresh_mean=True)
                 row[k]["answered"] = len(text.splitlines()) if text else 0
         var_teacher.release(nat.dev)
         for k in ("teacher", "shuffled", *LLM):

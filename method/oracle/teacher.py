@@ -1622,6 +1622,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets, seed)                         # (the task's seed: its draws keyed as the scorer's)
+    if vpd_order is not None:  # VPD's saved order (a pod has no causal-importance network: goal_eval's omitted family reads it)
+        tx.vpd_order = [(n, int(t), int(c)) for n, t, c in vpd_order]
     if vpd_answer is not None:                                # VPD's answer computed where the causal-importance network is
         tx.vpd = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
         for n, (t, c) in vpd_answer.items():

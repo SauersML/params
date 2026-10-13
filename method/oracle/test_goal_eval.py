@@ -2475,6 +2475,25 @@ def test_path_patched_held():
     assert moved >= len(mixed) * (len(graphs) + len(whole)) // 2
 
 
+def test_path_patched_holds_parts_a_masks_graph_lacks():
+    """A held prompt naming subcomponents of a site where a complete graph given as masks has none on (an answer's
+    parts inactive on the text, interchange_pp's references: primerl's planted sets crashed _pp_dense with an empty
+    site's columns) equals pp_run(fixed=)."""
+    nat, ge, tx, E, nodes, prompts = _pp_case(near=None)
+    g = torch.Generator().manual_seed(11)
+    masks = {n: (torch.rand(tx.T, nat.C[n], generator=g) < 0.5).to(nat.dev) for n in nat.names}
+    empty = nat.names[2]
+    masks[empty][:] = False
+    gm = native.Graph(masks=masks)
+    p, z = prompts[0]
+    held = _pp_holds(ge, tx, nat, [nd for nd in nodes if nd[0] == empty or bool(masks[nd[0]][nd[1], nd[2]])], p, z)
+    assert any(nd[0] == empty for nd in held)
+    with torch.no_grad():
+        got = E.path_patched([gm], [held])
+        want = ge.pp_run(tx, tx.ids, gm, fixed=held)[0]
+    assert float((got[0, 0] - want).abs().max()) < 1e-4, float((got[0, 0] - want).abs().max())
+
+
 def _pp_loop_check(ge, tx, rows, graphs, key, held=False):
     """Each draw of rows[b][key] ([[p, z], KL_C, KL_V, W]) against pp_run one graph and prompt at a time (the loop the
     engine call replaced): track_pp's on the changed text, or interchange_pp's held set in the model, the circuit and

@@ -743,7 +743,8 @@ class Engine:
             if g.masks is not None:
                 for n, m in g.masks.items():
                     t, c = m[s0:].to(dev).nonzero(as_tuple=True)
-                    parts.setdefault(n, []).append((torch.full_like(t, gi), t + s0, c))
+                    if len(t):  # (a site with nothing on from s0: no columns, so a part held there reads x's alone)
+                        parts.setdefault(n, []).append((torch.full_like(t, gi), t + s0, c))
                 continue
             keys.append(torch.tensor([(sid[n] * T + t) * CM + c + 1 for n, t, c in g.node_set()], dtype=torch.long))
             own.append(torch.full((len(keys[-1]),), gi, dtype=torch.long))

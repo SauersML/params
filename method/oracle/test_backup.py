@@ -242,3 +242,15 @@ def test_repair_shares(tiny):
     every = frozenset((n, t) for n in nat.names for t in range(tx.T))
     full = bk.repair(blocks=every)
     assert abs(full["held"] - full["r"]) < 1e-5 and abs(full["r"] - got["r"]) < 1e-9
+
+
+def test_frozen_counterfactual(tiny):
+    """frozen: with every site at every position in the expansion nothing is held, so the frozen run is the model less
+    each draw (overstate_frozen 1, kl_frozen 0); with the circuit alone, the held outside writes its text activations."""
+    nat, ge, tx, circuit = tiny
+    bk = backup.Backup(ge, tx, circuit, draws=4, rows=3)
+    every = frozenset((n, t) for n in nat.names for t in range(tx.T))
+    got = bk.frozen(blocks=every)
+    assert got["kl_frozen"] < 1e-5 and abs(got["overstate_frozen"] - 1.0) < 1e-4
+    got = bk.frozen()
+    assert got["overstate_frozen"] >= 0 and len(got["draws"]) == 4

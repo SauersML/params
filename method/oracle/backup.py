@@ -321,6 +321,50 @@ class Backup:
                 "sites": {n: sum(d[0] * d[4][n] for d in draws) / wsum for n in writers},
                 "draws": [d[:4] for d in draws]}
 
+    @torch.no_grad()
+    def frozen(self, blocks=frozenset(), extra=frozenset()) -> dict:
+        """The outside's response as a counterfactual on the model: per draw, the model less the draw with every
+        subcomponent outside the circuit (and outside the expansion blocks, extra) held at its activation in the model
+        on the text (the remainders live, as in C's semantics), against the model less the draw. overstate_frozen =
+        mean KL(frozen less d || model) / mean W (W = KL(model less d || model)): the circuit's overstate (its claimed
+        removal effect over the model's) when the outside cannot respond but still writes what it writes on the text;
+        kl_frozen, mean KL(model less d || frozen less d). Near the circuit's own overstate: the outside's response
+        is the gap; near 1: the outside's response is not it (then the gap is the outside's absence itself)."""
+        nat, E, dev = self.nat, self.E, self.nat.dev
+        mx = self.masks(blocks, extra)
+        clean: dict = {}
+        orig = E._site
+
+        def record(n, h, mask, rec=None):
+            V = E._w(n)[0]
+            clean[n] = (h.to(V.dtype) @ V)[0]
+            return orig(n, h, mask, rec)
+
+        def held(n, h, mask, rec=None):
+            V, U, Rw = E._w(n)
+            hh = h.to(V.dtype)
+            a = torch.where(mx[n][None], hh @ V, clean[n][None].to(V.dtype))
+            out = (a * mask.to(a.dtype)) @ U
+            return out + hh @ Rw if E.fixed else out
+
+        ones = {n: torch.ones(self.T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
+        out = []
+        try:
+            E._site = record
+            E.log_probs({n: ones[n].float()[None] for n in nat.names})
+            E._site = held
+            for s0 in range(0, len(self.drops), self.rows):
+                js = list(range(s0, min(len(self.drops), s0 + self.rows)))
+                out.append(E.log_probs({n: torch.stack([self._row(ones, j)[n] for j in js]) for n in nat.names}))
+        finally:
+            E._site = orig
+            native.free(dev)
+        lf = torch.cat(out)
+        f = carry.kl(lf, self.tx.ref.expand_as(lf)).tolist()
+        err = carry.kl(self.lm, lf).tolist()
+        return {"overstate_frozen": float(np.mean(f)) / max(float(np.mean(self.W)), EPS), "kl_frozen": float(np.mean(err)),
+                "w": float(np.mean(self.W)), "draws": [[w, a, b] for w, a, b in zip(self.W, f, err)]}
+
     # ---- the screen
 
     def screen(self, blocks=frozenset(), extra=frozenset()) -> dict:
@@ -758,9 +802,11 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
 
 def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back", "sub50", "sub90"), offset: int = 0,
             stride: int = 1, log=print) -> Path:
-    """Backup.repair per text on the backup family's search draws: the outside's cancelling share of the circuit's
-    change at the prediction (r, cos, per site) for src's circuit, and the share each of out's sets holds ("held").
-    Lines in out/repair.jsonl; texts already there skipped."""
+    """Backup.repair and Backup.frozen per text on the backup family's search draws: the outside's cancelling share of
+    the circuit's change at the prediction (r, cos, per site) for src's circuit and the share each of out's sets holds
+    ("held"); the overstate with the outside held at its activations on the text (frozen: start, and per set with only
+    the outside of the set held), beside the circuit's own overstate. Lines in out/repair.jsonl; texts already there
+    skipped."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
     f_out = out / "repair.jsonl"
@@ -773,15 +819,20 @@ def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back",
         tx = ge.text(ids, targets, native.task_seed(p.stem))
         g0, _ = goal_eval.circuit(json.loads(f0.read_text()), targets, nat.C, tx.T)
         bk = Backup(ge, tx, g0)
-        row = {"task": p.stem, "start": bk.repair(), "held": {}}
+        row = {"task": p.stem, "start": bk.repair(), "held": {}, "frozen": {"start": bk.frozen()},
+               "overstate": bk.score([(frozenset(), frozenset())])[0]["overstate"]}
         for k in sets:
             f = out / k / f"{p.stem}.json"
             if f.exists():
                 b, x = split_graph(goal_eval.circuit(json.loads(f.read_text()), targets, nat.C, tx.T)[0])
-                row["held"][k] = bk.repair(b - bk.blocks0, x - bk.subs0)["held"]
+                b, x = b - bk.blocks0, x - bk.subs0
+                row["held"][k] = bk.repair(b, x)["held"]
+                row["frozen"][k] = bk.frozen(b, x)["overstate_frozen"]
         with open(f_out, "a") as fh:
             fh.write(json.dumps(row) + "\n")
-        log(f"{p.stem}: r {row['start']['r']:.3f} cos {row['start']['cos']:.3f} held " + " ".join(f"{k} {v:.3f}" for k, v in row["held"].items()))
+        log(f"{p.stem}: r {row['start']['r']:.3f} cos {row['start']['cos']:.3f}, overstate {row['overstate']:.2f}, frozen "
+            f"{row['frozen']['start']['overstate_frozen']:.2f}; held " + " ".join(f"{k} {v:.3f}" for k, v in row["held"].items())
+            + "; frozen outside the set " + " ".join(f"{k} {v:.2f}" for k, v in row["frozen"].items() if k != "start"))
         del bk, tx
         native.free(nat.dev)
     return f_out

@@ -1972,6 +1972,24 @@ def test_semantics_x_runs_routing_and_norms_at_x(tiny):
         goal_eval.GoalEval(nat, semantics="y")
 
 
+def test_semantics_h_is_x_for_perturbations_and_c_for_point(tiny):
+    """GoalEval(semantics="h"): point and pattern (and their bounds) as stated, the node, edge, flip and omitted families
+    at x on their own bounds: point equals "c"'s, the node family's draws and the edge family's bound "x"'s."""
+    nat, ge, tx = tiny
+    kw = dict(changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    whole = native.Graph(every[::2], complete=True)
+    got = {}
+    for sem in ("c", "x", "h"):
+        g_ = goal_eval.GoalEval(nat, semantics=sem, **kw)
+        t_ = g_.text(tx.ids, tx.targets, seed=5)
+        got[sem] = (g_.sufficiency(t_, [whole], conventions=("live",))[0]["kl_live"], g_._node_family(t_, [whole], 4)[0]["draws_nodes"],
+                    g_._bounds(t_, "live", "edges"), g_._bounds(t_, "live"))
+    assert got["h"][0] == pytest.approx(got["c"][0], rel=1e-5) and got["h"][3] == pytest.approx(got["c"][3], rel=1e-5)
+    assert all(a[1] == pytest.approx(b[1], rel=1e-4, abs=1e-6) for a, b in zip(got["h"][1], got["x"][1]))
+    assert got["h"][2] == pytest.approx(got["x"][2], rel=1e-5) and abs(got["h"][2][0] - got["c"][2][0]) > 1e-3
+
+
 def test_fidelity_weight_column(tiny):
     """fidelity(weight=True) adds rustmove's weight-edit family as columns (s_weight, its draws), outside phi."""
     nat, ge, tx = tiny

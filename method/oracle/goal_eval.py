@@ -122,11 +122,14 @@ CHANGED_DRAWS = 32  # C's changed texts per circuit (32, the lead's 10-12: at 16
 INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
 # offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
-SEMANTICS = ("c", "x")  # GoalEval(semantics=, default the SEMANTICS environment variable, else "c"): "x" runs every circuit and VPD's answer in C's families (point, nodes,
-# edges, flips, omitted, pattern, the bounds) with the query and key subcomponents outside the circuit at their
-# activations on the text and every RMSNorm, the final one included, at the model's scale on it (the lead's 10-13:
-# s_nodes 0.56 -> 0.93 on the dev starts, the pruned teachers' shortfall 0.068 -> 0.015); the real model's runs keep
-# their own (engine at_x and norms, monitorbench's b6a3df3)
+SEMANTICS = {"c": (), "x": ("point", "pattern", "nodes", "edges", "flips", "omitted"), "h": ("nodes", "edges", "flips", "omitted")}
+# GoalEval(semantics=, default the SEMANTICS environment variable, else "c"): the C families whose circuit and VPD runs
+# hold the query and key subcomponents outside the circuit at their activations on the text and every RMSNorm, the
+# final one included, at the model's scale on it (engine at_x and norms, monitorbench's b6a3df3), each family on its
+# own bounds; the real model's runs keep their own. "x" every family (the lead's 10-13: s_nodes 0.56 -> 0.93 on the dev
+# starts, but point collapsed on a third of them and the bar moved 0.47-2.28x); "h" the hybrid (the lead's 10-13): the
+# families claiming to predict the model's response to a perturbation (nodes, edges, flips, omitted) at x, those
+# claiming standalone computation (point, pattern) as stated
 BLOCK = -1  # a block node's index: (site, position, BLOCK), the site's whole output there (every subcomponent and the
 # remainder), ["block", site, position] in an answer (the lead's 10-12: a token's identity lives in thousands of parts)
 DONORS_NEAR = 32  # donor resampling's changed-input donors per text
@@ -686,7 +689,8 @@ def family_eps(row: dict, only=None) -> dict:
         idx = rng.integers(len(draws), size=(EPS_BOOT, len(draws)))  # the same draws as one call per resample
         if only is not None and fam not in only:
             continue
-        got = _pooled_resamples(kind, draws, row.get("kl_empty_live"), True, idx)
+        e0 = row.get("kl_empty_edges", row.get("kl_empty_live")) if fam == "edges" else row.get("kl_empty_live")  # (each family's bound)
+        got = _pooled_resamples(kind, draws, e0, True, idx)
         got = [min(1.0, max(-1.0, x)) for x in got if x is not None]
         out[fam] = min(EPS_CAP, max(EPS_FLOOR, 2 * float(np.std(got, ddof=1)))) if len(got) > 1 else EPS_FLOOR
     return out
@@ -1148,7 +1152,7 @@ class GoalEval:
         if semantics not in SEMANTICS:
             raise ValueError(f"semantics is one of {SEMANTICS}")
         self.nat = nat or native.Native()
-        self.semantics = semantics  # C's runs of circuits and VPD's answer: "c" as stated, "x" routing and norms at x (_xkw)
+        self.semantics = semantics  # which C families run circuits and VPD's answer with routing and norms at x (_xkw)
         self._xk: dict = {}
         self.changes, self.ranks, self.share_floor = changes, tuple(ranks), share_floor
         self.random_pairs, self.max_edges, self.chunk, self.cut_chunk = random_pairs, max_edges, chunk, cut_chunk
@@ -1159,11 +1163,11 @@ class GoalEval:
     def text(self, ids: list[int], targets: list[int], seed: int | None = None, task: dict | None = None) -> Text:
         return Text(self, ids, targets, native.task_seed(str(ids[:8])) if seed is None else seed, task)
 
-    def _xkw(self, ids: list[int], targets: list[int]) -> dict:
-        """The engine's keywords for a circuit's or VPD's run in this GoalEval's semantics (SEMANTICS): none for "c";
-        for "x" the query and key sites' activations and every norm's scale on the model's run on ids (Engine.x_values),
-        every norm frozen, kept per text."""
-        if self.semantics == "c":
+    def _xkw(self, ids: list[int], targets: list[int], family: str = "point") -> dict:
+        """The engine's keywords for a circuit's or VPD's run in one of C's families under this GoalEval's semantics
+        (SEMANTICS): none where the family runs as stated; at x the query and key sites' activations and every norm's
+        scale on the model's run on ids (Engine.x_values), every norm frozen, kept per text."""
+        if family not in SEMANTICS[self.semantics]:
             return {}
         key = (tuple(ids), tuple(targets))
         if key not in self._xk:
@@ -1214,14 +1218,14 @@ class GoalEval:
         return carry.masks(self.nat, T, g.nodes)
 
     @torch.no_grad()
-    def runs(self, ids: list[int], targets: list[int], sets: list[dict], live: bool) -> torch.Tensor:
+    def runs(self, ids: list[int], targets: list[int], sets: list[dict], live: bool, family: str = "point") -> torch.Tensor:
         """log q at the targets [len(sets), len(targets), V] of VPD's masked forward pass (vpd_model's Site masks) with
-        each set's subcomponents on, every other off, remainders on (live) or off; in semantics "x" on the engine with
-        _xkw's routing and norms at x."""
+        each set's subcomponents on, every other off, remainders on (live) or off; where family runs at x (_xkw) on the
+        engine with routing and norms at x."""
         nat, tg = self.nat, self.nat.target
         T = len(ids)
         out = []
-        kw = self._xkw(ids, targets)
+        kw = self._xkw(ids, targets, family)
         if kw:
             import engine
 
@@ -1763,7 +1767,7 @@ class GoalEval:
         b = self._pp_base(tx)
         T = tx.T
         causal = torch.ones(T, T, dtype=torch.bool, device=self.nat.dev).tril()
-        e0, v0 = self._bounds(tx, "live")
+        e0, v0 = self._bounds(tx, "live", "pattern")
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
         kept = tx.__dict__.setdefault("_pattern_vpd", {})  # (VPD's answer, reads given) -> its KL
         plans, out = [], []
@@ -1818,7 +1822,7 @@ class GoalEval:
         plan's connections are not the graph's. Semantics "x" (_xkw): every position runs, a deleted line's nodes
         outside the variant at x (held), a node draw's at 0 (fidelity's numbers on each variant)."""
         nat, dev = self.nat, self.nat.dev
-        kx = self._xkw(tx.ids, tx.targets)
+        kx = self._xkw(tx.ids, tx.targets, "point")  # (point, wiring and pattern)
         edges = [] if g.complete else [(w, r) for r, ws in g.parents.items() for w in ws]
         outs = [] if g.complete else list(g.out)
         E = self._circuit_engine(tx.ids, tx.targets, [g])
@@ -2014,7 +2018,7 @@ class GoalEval:
         import engine
 
         nat, dev, T = self.nat, self.nat.dev, tx.T
-        kx = self._xkw(tx.ids, tx.targets)
+        kx = self._xkw(tx.ids, tx.targets, "nodes")
         circ = E.columns
         Em = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ, outside="on")
         vcols = {n: torch.unique(torch.cat([circ[n], tx.vpd[n].any(0).nonzero().flatten()])) for n in nat.names}
@@ -2133,7 +2137,7 @@ class GoalEval:
                         if idx:
                             u[n][tuple(torch.tensor(idx, device=dev).T)] = 1.0
                 lq = E.graph_log_probs(E.plan([flat[gi] for gi, _ in part], semantics="c"), u, rows=[d for _, d in part],
-                                       **self._xkw(tx.ids, tx.targets))
+                                       **self._xkw(tx.ids, tx.targets, "pattern"))
                 for (gi, _), k in zip(part, carry.kl(tx.ref, lq).tolist()):
                     out[gi].append(k)
                 native.free(dev)
@@ -2597,13 +2601,13 @@ class GoalEval:
                 row[:, :, kb[1]] = row[:, :, kb[1]] + (qv * kpart[kb]).sum(-1) * scale
         return row
 
-    def graph_kl(self, tx: Text, graphs: list[native.Graph], live: bool) -> list[float]:
-        """KL in bits at the targets of each stated graph's run on the text (_graph_kl)."""
-        return self._graph_kl(tx.ids, tx.targets, tx.ref, graphs, live, self._bounds(tx, "live" if live else "off")[0], tx.vpd)
+    def graph_kl(self, tx: Text, graphs: list[native.Graph], live: bool, family: str = "point") -> list[float]:
+        """KL in bits at the targets of each stated graph's run on the text (_graph_kl), in family's semantics."""
+        return self._graph_kl(tx.ids, tx.targets, tx.ref, graphs, live, self._bounds(tx, "live" if live else "off", family)[0], tx.vpd, family)
 
     @torch.no_grad()
     def _graph_kl(self, ids: list[int], targets: list[int], ref: torch.Tensor, graphs: list[native.Graph], live: bool,
-                  empty_kl: float, active: dict | None = None) -> list[float]:
+                  empty_kl: float, active: dict | None = None, family: str = "point") -> list[float]:
         """KL in bits at the targets, from the model's log probabilities ref, of each stated graph's run on ids in C's
         semantics (graph_ref: graph inside the circuit, masked outside, every other subcomponent off, remainders on
         (live) or off); a complete graph its masked run (runs, as sufficiency); a graph with no node is the empty circuit
@@ -2614,14 +2618,14 @@ class GoalEval:
         out = [empty_kl] * len(graphs)
         whole = [i for i, g in enumerate(graphs) if g.complete and g.node_set()]  # a complete graph: its masked run
         if whole:
-            got = carry.kl(ref, self.runs(ids, targets, [self.masks(graphs[i], len(ids)) for i in whole], live)).tolist()
+            got = carry.kl(ref, self.runs(ids, targets, [self.masks(graphs[i], len(ids)) for i in whole], live, family)).tolist()
             for i, k in zip(whole, got):
                 out[i] = k
         some = [i for i, g in enumerate(graphs) if not g.complete and g.node_set()]
         for s0 in range(0, len(some), self.chunk):
             idx = some[s0:s0 + self.chunk]
             E = self._circuit_engine(ids, targets, [graphs[i] for i in idx], live)
-            got = carry.kl(ref, E.graph_log_probs(E.plan([graphs[i] for i in idx], semantics="c"), **self._xkw(ids, targets))).tolist()
+            got = carry.kl(ref, E.graph_log_probs(E.plan([graphs[i] for i in idx], semantics="c"), **self._xkw(ids, targets, family))).tolist()
             for i, k in zip(idx, got):
                 out[i] = k
         native.free(self.nat.dev)
@@ -2641,15 +2645,16 @@ class GoalEval:
             cols[n] = c if extra is None else torch.unique(torch.cat([c, extra[n].to(dev)]))
         return engine.Engine(nat, ids, targets, live=live, columns=cols, outside=outside)
 
-    def _bounds(self, tx: Text, conv: str) -> tuple[float, float | None]:
-        """(KL_empty, KL_VPD) on the text under a convention, kept on tx."""
-        if conv not in tx.bounds:
+    def _bounds(self, tx: Text, conv: str, family: str = "point") -> tuple[float, float | None]:
+        """(KL_empty, KL_VPD) on the text under a convention, in family's semantics (_xkw), kept on tx."""
+        key = conv if not self._xkw(tx.ids, tx.targets, family) else (conv, "x")
+        if key not in tx.bounds:
             nat = self.nat
             empty = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
             sets = [empty] + ([tx.vpd] if tx.vpd is not None else [])
-            kl = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, sets, conv == "live")).tolist()
-            tx.bounds[conv] = (kl[0], kl[1] if tx.vpd is not None else None)
-        return tx.bounds[conv]
+            kl = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, sets, conv == "live", family)).tolist()
+            tx.bounds[key] = (kl[0], kl[1] if tx.vpd is not None else None)
+        return tx.bounds[key]
 
     def sufficiency(self, tx: Text, graphs: list[native.Graph], conventions: tuple = CONVENTIONS, vpd_minus: bool = True) -> list[dict]:
         """Per graph, per convention: F1 (KL_C of the stated graph's run, graph_kl; a complete graph's masked run),
@@ -3199,6 +3204,7 @@ class GoalEval:
         split = split or ("search" if reward else "eval")
         reads = reads or reward
         e0 = self._bounds(tx, "live")[0]
+        e0e, e0f = self._bounds(tx, "live", "edges")[0], self._bounds(tx, "live", "flips")[0]  # (their semantics' bounds)
         sides = self._sides(tx, graphs) if reads else None
         point = self.sufficiency(tx, graphs)
         whole = [native.Graph(sorted(g.node_set()), complete=True) if not g.complete else None for g in graphs]
@@ -3235,13 +3241,13 @@ class GoalEval:
             # W = KL(model less the nodes || model), pooled by W
             row["s_nodes"] = _pooled("weighted", nd.get("draws_nodes"), e0)
             row["s_nodes_raw"] = _pooled_raw(nd.get("draws_nodes"))
-            row["s_edges"] = _fid(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
+            row["s_edges"] = _fid(e0e, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None
             # a stated graph claims its unstated connections do not matter: C takes the lower of its graph run and the
             # run with every connection among its nodes restored, unattacked and under the same flips
             row["reliance_on_cuts"] = (row["s_point"] - row["s_wiring"]) if None not in (row["s_point"], row["s_wiring"]) else None
             row["s_point_c"] = min(x for x in (row["s_point"], row["s_wiring"]) if x is not None) if row["s_point"] is not None else None
             fg = row.get("f1_flips_omitted", {})
-            fw, fw_raw = self._flips_wiring(tx, g, fl, e0, both=True) if (i in wired and fg) else ({}, {})
+            fw, fw_raw = self._flips_wiring(tx, g, fl, e0f, both=True) if (i in wired and fg) else ({}, {})
             row["f1_flips_wiring"] = fw
             fc = {m: (min(v, fw[m]) if (m in fw and v is not None and fw[m] is not None) else v) for m, v in fg.items()}
             row["f1_flips_c"] = fc
@@ -3263,8 +3269,8 @@ class GoalEval:
                                                 _fid_raw(e0, wired[i]["kl_live"], v0) if i in wired else None) if x is not None)
                    if _fid_raw(e0, pt["kl_live"], v0) is not None else None,
                    "s_nodes": row.get("s_nodes_raw"),
-                   "s_edges": _fid_raw(e0, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
-                   "f1_flips_c": min((x for x in (_fid_raw(e0, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None),
+                   "s_edges": _fid_raw(e0e, ed["kl_edges_c"], ed["kl_edges_vpd"]) if ed["kl_edges_c"] is not None else None,
+                   "f1_flips_c": min((x for x in (_fid_raw(e0f, *kfl) if kfl else None, fw_raw.get(FLIP_TERM)) if x is not None),
                                      default=None) if kfl else None,  # none where neither bound resolves (a behavior's KLs)
                    "s_track_pp": row.get("s_track_pp_raw"), "s_interchange_pp": row.get("s_interchange_pp_raw"),
                    "s_pattern": row.get("s_pattern_raw")}
@@ -3279,6 +3285,7 @@ class GoalEval:
                 row.update(self.vpd_baseline(tx, g.count(), pool, split))
             row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") else None
             row["kl_empty_live"], row["kl_vpd_live"] = e0, self._bounds(tx, "live")[1]  # (phi's eps from the row alone)
+            row["kl_empty_edges"] = e0e  # (the edge family's bound: its own semantics')
             row["draws_point"] = [[pt["kl_live"], row["kl_vpd_live"]]]
             row.update({f"eps_{f}": v for f, v in family_eps(row).items()})
             if not reward:  # (the reward's flips stop at FLIP_TERM)
@@ -3323,7 +3330,7 @@ class GoalEval:
             ms.append(m)
         if not masks:
             return ({}, {}) if both else {}
-        kc = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, masks, True)).tolist()
+        kc = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, masks, True, "flips")).tolist()
         kv = {m: fl["kl_flips_omitted"][m][1] for m in ms}
         return {m: (_fid_raw if raw else _fid)(e0, k, kv[m]) for m, k in zip(ms, kc)} if not both else             ({m: _fid(e0, k, kv[m]) for m, k in zip(ms, kc)}, {m: _fid_raw(e0, k, kv[m]) for m, k in zip(ms, kc)})
 
@@ -3581,7 +3588,7 @@ class GoalEval:
             nodes = g.node_set()
             ones = {n: torch.ones(tx.T, len(circ[n]), device=dev) for n in nat.names}
             lm = Em.log_probs(without(ones, cs, at))
-            kw = self._xkw(tx.ids, tx.targets)  # (semantics "x": a removed candidate stays at 0, never at x)
+            kw = self._xkw(tx.ids, tx.targets, "omitted")  # (at x: a removed candidate stays at 0, never at x)
             lv = Ev.log_probs(without(vpd, cs, vat), **(dict(kw, held={n: (vpd[n] == 0)[None] for n in nat.names}) if kw else {}))
             if g.complete:  # the circuit's own run (no candidate is its): one row
                 gm = {n: torch.zeros(tx.T, len(circ[n]), device=dev) for n in nat.names}
@@ -3641,7 +3648,7 @@ class GoalEval:
                 for j, d in enumerate(self._node_draws(tx, sorted(units[gi]) if units is not None else gnodes[gi], draws, held=gnodes[gi])):
                     rows.append((gi, j, np.array([nid[x] for x in d], dtype=np.int64)))
         first = min((every[i][1] for _, _, d in rows for i in d), default=T)
-        kw = self._xkw(tx.ids, tx.targets)  # semantics "x": every position (no start), the removed nodes at 0, never at x
+        kw = self._xkw(tx.ids, tx.targets, "nodes")  # at x: every position (no start), the removed nodes at 0, never at x
         start = 0 if reads or kw else min(first, min(tx.targets))  # before it every run is its base's (reads: every position)
         width = max(nat.C.values()) * (T - start) + sum(len(c) for c in vcols.values()) * T
         step = max(1, self.NODE_ENTRIES // max(1, width))
@@ -3744,7 +3751,7 @@ class GoalEval:
         out = []
         for gi in range(len(graphs)):
             if not gnodes[gi]:
-                out.append({"kl_nodes_c": self._bounds(tx, "live")[0], "kl_nodes_vpd": self._bounds(tx, "live")[1], "reads_nodes": None})
+                out.append({"kl_nodes_c": self._bounds(tx, "live", "nodes")[0], "kl_nodes_vpd": self._bounds(tx, "live", "nodes")[1], "reads_nodes": None})
                 continue
             dr = res[gi]
             row = {"kl_nodes_c": float(np.mean([x[1] for x in dr])), "kl_nodes_vpd": float(np.mean([x[2] for x in dr])),
@@ -3894,7 +3901,7 @@ class GoalEval:
             nodes = sorted(g.node_set()) if reads else None
             lm = Em.graph_log_probs(Em.plan([model] * D, semantics="c", cuts=cuts), u_m, patch=patches(Em, patch),
                                     reads=spec(Em, nodes, D) if reads else None)
-            kw = self._xkw(tx.ids, tx.targets)
+            kw = self._xkw(tx.ids, tx.targets, "edges")
             lv = Ev.graph_log_probs(Ev.plan([vpd] * D, semantics="c", cuts=cuts), u_v, patch=patches(Ev, patch), **kw)
             u_c = None
             if g.complete:
@@ -4394,7 +4401,7 @@ class GoalEval:
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
-        xk = self._xkw(tx.ids, tx.targets)
+        xk = self._xkw(tx.ids, tx.targets, "flips")
         pick = torch.randperm(len(pool["sources"]), generator=gen)[:k].tolist()
         pats = [pattern(pool, i) for i in pick] if patterns else []  # (patterns off: drawn, never switched on)
         cache = tx.__dict__.setdefault("_adv", {})  # per text: VPD's columns, and the last columns' engine and layouts
@@ -4529,7 +4536,7 @@ class GoalEval:
         targets)."""
         nat, dev = self.nat, self.nat.dev
         graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
-        e0 = self._bounds(tx, "live")[0]
+        e0 = self._bounds(tx, "live", "flips")[0]
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True)
         search = _search(dev)  # the sign steps' and screens' precision (every reported number: float32)
@@ -4610,7 +4617,7 @@ class GoalEval:
         strengths: edge_flips)."""
         nat, dev = self.nat, self.nat.dev
         graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
-        e0 = self._bounds(tx, "live")[0]
+        e0 = self._bounds(tx, "live", "flips")[0]
         ms = FLIPS[lever] if ms is None else ms
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         omitted = lever == "omitted"  # the patterns stay off: VPD's paired run is VPD's answer alone, run once

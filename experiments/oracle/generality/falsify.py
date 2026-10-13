@@ -469,7 +469,8 @@ def report():
               ("copy, the model mixes (its prediction survives the broken match on half the draws or more)",
                lambda k: k[0] == "copy" and mixes.get(k) is True),
               ("copy, the model does not mix", lambda k: k[0] == "copy" and mixes.get(k) is False)]
-    mixes = {k: d["correct"]["mix"]["survive"] >= 0.5 for k, d in by.items() if "correct" in d and d["correct"].get("mix")}
+    mixes = {k: next(r["mix"]["survive"] >= 0.5 for r in d.values() if r.get("mix")) for k, d in by.items()
+             if any(r.get("mix") for r in d.values())}  # a text's label from any of its rows (an --only run holds it too)
     for kind, keep in groups:
         texts = [d for k, d in by.items() if keep(k)]
         if not texts:

@@ -24,6 +24,10 @@ on-target 0.36) where the position's whole site outputs carry all of it. Per inp
    site (3,781 subcomponents, 6% of the position's 61,440) carries f on-target 0.975 (eval split 0.974) where the
    values' block carries 0.79 and VPD's active set on the text 0.41. VPD's active set on the text alone is scored
    beside them (reported).
+3. Mask (intermediate variables whose blocks and families fall short): masks.fit, a learned mask over the family at the
+   carrier position trained to carry the inputs' changes and leave those of other positions reaching it (Cause and
+   Iso, RAVEL's multi-task masking); the carrier when it scores higher. On 17 failed intermediate candidates the
+   masks raised the off-target share from 0.08-0.66 to 0.84-0.98 on several, Cause kept.
 Pool (the lead's decision): the circuit's sites, its blocks and families at the (site, position) pairs holding its
 nodes ("circuit", the default with a circuit), or every site ("any"). Beside each carrier the trivial variable, every
 reachable site at the carrier positions as one block (all a position holds: a change at the position is carried
@@ -74,6 +78,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "vpd"))
 
 import goal_eval  # noqa: E402
+import masks  # noqa: E402
 import native  # noqa: E402
 import variables  # noqa: E402
 
@@ -414,9 +419,18 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
                "family": got.get(wide_how), "family_sites": got.get("family at the blocks' sites"), "active": got.get("active on the text"),
                "trivial": triv, "tried": len(rows)}
         use = min(ok, key=lambda r: r["size"]) if ok else b
+        if not ok and b["score"] < GOAL and rec["kind"] == "intermediate" and wide:
+            # a carrier at a later position mixes every position's change; a mask over the family there, trained to
+            # carry the inputs' changes and leave the others' (Cause and Iso, masks.fit), can isolate it
+            mk = masks.fit(nat, tx, ins, at, wide)
+            release(nat.dev)
+            if mk:
+                rec["mask"] = screen(sc, tx, ins, [(mk, "mask over the family")], draws)[0]
+                if rec["mask"]["score"] > use["score"]:
+                    use = rec["mask"]
         held = {n for n, _, _ in use["group"]}
         active = sorted(k for k in on_x if k[0] in held)
-        rec.update(carrier="family" if use is not b else "block", group=use["group"], score=use["score"],
+        rec.update(carrier="block" if use is b else ("mask" if use is rec.get("mask") else "family"), group=use["group"], score=use["score"],
                    instances=active, share={k: share.get(k, 0.0) for k in active},
                    circuit=[nd for nd in m if inside(set(use["group"]), nd)])
         rec["m"] = sum(m[nd] for nd in rec["circuit"])
@@ -443,8 +457,8 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         r["name"], r["_inputs"], r["_group"] = f"V{i + 1}", r["inputs"], r["group"]
     out = {"variables": [], "teacher": {"positions": positions, "sets": len(sets), "pool": pool, "circuit_m": M}}
     for r in chosen:
-        meas = {"score": r["score"], "carriers": {k: (None if r[k] is None else {x: r[k][x] for x in ("how", "size", "score", "f_on", "s_off")})
-                                                  for k in ("blocks", "family", "family_sites", "active", "trivial")}, "tried": r["tried"],
+        meas = {"score": r["score"], "carriers": {k: (None if r.get(k) is None else {x: r[k][x] for x in ("how", "size", "score", "f_on", "s_off")})
+                                                  for k in ("blocks", "family", "family_sites", "active", "trivial", "mask")}, "tried": r["tried"],
                 "tokens": components.token_strings(task["model"], [ids[q] for q in r["inputs"]])}
         out["variables"].append(as_json(
             r["name"], r["inputs"], r["group"], [], kind=r["kind"], carrier=r["carrier"], carried_at=r["at"],

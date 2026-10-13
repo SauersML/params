@@ -1,4 +1,5 @@
-"""Learned masks over VPD subcomponents as variable carriers (#2951 graph oracle, E4 v2; desiderata-based masking,
+"""Learned masks over VPD subcomponents as variable carriers, with their controls (#2951 graph oracle, E4 v2;
+method/oracle/masks.py holds the masking; desiderata-based masking,
 Davies et al. 2023, multi-task as RAVEL's MDBM, annealed boundaries as Boundless DAS): is a variable localized in VPD's
 units, and how small can its carrier be?
 
@@ -21,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -31,93 +31,13 @@ import torch
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parents[1] / "method/oracle"), str(HERE.parents[1] / "method/vpd")]
 
-import carry  # noqa: E402
 import goal_eval  # noqa: E402
+import masks  # noqa: E402
 import native  # noqa: E402
 import var_classes  # noqa: E402
 import var_controls  # noqa: E402
 import var_teacher  # noqa: E402
 import variables  # noqa: E402
-
-STEPS = 300
-BATCH = 8
-
-
-class Patcher:
-    """The target model on the text with candidates' activations interpolated toward a donor's: forward hooks on the
-    candidate sites add (m (a' - a)) U at the candidate positions."""
-
-    def __init__(self, nat, ids: list[int], targets: list[int], cands: list[tuple]):
-        self.nat, self.tg, self.dev = nat, nat.target, nat.dev
-        self.ids, self.targets = list(ids), list(targets)
-        self.by = {}
-        for j, (n, p, c) in enumerate(cands):
-            self.by.setdefault(n, []).append((j, p, c))
-        self.idx = {n: torch.tensor([j for j, _, _ in v], device=self.dev) for n, v in self.by.items()}
-        self.pos = {n: torch.tensor([p for _, p, _ in v], device=self.dev) for n, v in self.by.items()}
-        self.col = {n: torch.tensor([c for _, _, c in v], device=self.dev) for n, v in self.by.items()}
-        self.K = len(cands)
-
-    def acts(self, texts: list[list[int]]) -> torch.Tensor:
-        """Every candidate's activation (v . x) on each text [len(texts), K] (the model's own run)."""
-        out = torch.zeros(len(texts), self.K, device=self.dev)
-        for n in self.by:
-            self.tg.site(n).cache_input = True
-        with torch.no_grad():
-            for s0 in range(0, len(texts), BATCH):
-                part = texts[s0:s0 + BATCH]
-                self.tg(torch.tensor(part, device=self.dev))
-                for n in self.by:
-                    st = self.tg.site(n)
-                    x = st.last_input[:, self.pos[n]]  # [b, k, d_in]
-                    out[s0:s0 + len(part)][:, self.idx[n]] = (x * st.V[:, self.col[n]].T[None]).sum(-1)
-        for n in self.by:
-            self.tg.site(n).cache_input = False
-            self.tg.site(n).last_input = None
-        return out
-
-    def logq(self, m: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-        """log q at the targets [B, targets, V] on the text with each row's candidates moved by m toward src [B, K]."""
-        B = src.shape[0]
-        hooks = []
-
-        def hook(n):
-            st = self.tg.site(n)
-            V, U = st.V[:, self.col[n]], st.U[self.col[n]]  # [d_in, k], [k, d_out]
-
-            def f(mod, inp, out):
-                x = inp[0][:, self.pos[n]]  # [B, k, d_in]
-                a = (x * V.T[None]).sum(-1)  # [B, k]
-                d = (m[self.idx[n]][None] * (src[:, self.idx[n]] - a))[..., None] * U[None]  # [B, k, d_out]
-                out = out.clone()
-                out.index_add_(1, self.pos[n], d)
-                return out
-            return st.register_forward_hook(f)
-        hooks = [hook(n) for n in self.by]
-        try:
-            logits = self.tg.hidden(torch.tensor([self.ids] * B, device=self.dev))[:, self.targets] @ self.tg.wte.T
-        finally:
-            for h in hooks:
-                h.remove()
-        return torch.log_softmax(logits.float(), -1)
-
-
-def train(P: Patcher, src: torch.Tensor, target: torch.Tensor, lam: float, steps: int = STEPS, seed: int = 0) -> torch.Tensor:
-    """The mask's logits after Adam on mean KL(target || patched) + lam mean(m), tau annealed 1 -> 0.05."""
-    gen = torch.Generator(device="cpu").manual_seed(seed)
-    logit = torch.zeros(P.K, device=P.dev, requires_grad=True)
-    opt = torch.optim.Adam([logit], lr=0.1)
-    for step in range(steps):
-        tau = math.exp(math.log(1.0) + (math.log(0.05) - math.log(1.0)) * step / max(steps - 1, 1))
-        rows = torch.randperm(src.shape[0], generator=gen)[:BATCH].to(P.dev)
-        m = torch.sigmoid(logit / tau)
-        lq = P.logq(m, src[rows])
-        loss = carry.kl(target[rows], lq).mean() + lam * m.mean()
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-    return logit.detach()
-
 
 def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tuple | None = None, log=print) -> dict:
     """at: the carrier positions (an intermediate variable's, after its inputs); the input positions when None."""
@@ -144,10 +64,10 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
             x = list(tx.ids)
             x[q] = z
             texts_I.append(x)
-    P = Patcher(nat, tx.ids, tx.targets, fam)
+    P = masks.Patcher(nat, tx.ids, tx.targets, fam)
     srcA = P.acts(texts_A + texts_I)
     with torch.no_grad():
-        tgtA = torch.cat([nat.reference(texts_A[s:s + BATCH], tx.targets) for s in range(0, len(texts_A), BATCH)])
+        tgtA = torch.cat([nat.reference(texts_A[s:s + masks.BATCH], tx.targets) for s in range(0, len(texts_A), masks.BATCH)])
         base = nat.reference([list(tx.ids)], tx.targets)
     tgtA = torch.cat([tgtA, base.expand(len(texts_I), -1, -1)]) if texts_I else tgtA  # Iso: the prediction stays
     R = var_controls.Runs(sc, tx)
@@ -170,7 +90,7 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
     perm = torch.cat([perm, torch.arange(len(pzA), len(pzA) + len(texts_I), device=nat.dev)])  # Iso targets stay
     for lam in lams:
         for kind, tgt in (("real", tgtA), ("permuted", tgtA[perm])):
-            logit = train(P, srcA, tgt, lam)
+            logit = masks.train(P, srcA, tgt, lam)
             keep = [fam[j] for j in (logit > 0).nonzero().flatten().tolist()]
             scorer = {}
             if kind == "real":

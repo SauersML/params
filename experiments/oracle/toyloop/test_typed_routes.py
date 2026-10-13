@@ -34,7 +34,12 @@ def test_native_exact_routes_and_independent_equations(fixture):
         ref = nat.reference([ids], [12])[0, -1]
         for label, intermediate, port in [('correct', 10, 'V'), ('wrong_position', 11, 'V'), ('wrong_port', 10, 'K')]:
             spec = routes.multihop_ports('L0H3', 'L1H1', 9, intermediate, 12, downstream_port=port)
-            graph = routes.compile_graph(nat, len(ids), *spec)
+            text = routes.to_mermaid(*spec, target=12)
+            parsed = routes.parse_mermaid(text, target=12)
+            assert set(parsed[0]) == set(spec[0])
+            assert set(parsed[1]) == set(spec[1])
+            assert set(parsed[2]) == set(spec[2])
+            graph = routes.compile_mermaid(nat, len(ids), text)
             got = nat.run(ids, [12], nat._plan([graph], len(ids)), *nat._zero())[0, -1]
             independent = routes.independent_head_reference(nat, ids, graph)
             torch.testing.assert_close(got, independent, rtol=1e-6, atol=3e-5)
@@ -52,3 +57,39 @@ def test_root_and_cross_position_residual_edges_are_rejected(fixture):
     root = routes.Port('tok29', 'ROOT', 9)
     with pytest.raises(ValueError, match='unsupported head port'):
         routes.compile_graph(nat, len(ids), [root], [], [])
+
+
+@pytest.mark.parametrize('extra', [
+    'L0H3_Q_p10',  # duplicated disconnected Q declaration
+    'tok29_ROOT_p9',
+    'L0H3_V_p9 -->|restrict| L0H3_O_p10',
+    'L0H3_Q_p10 --> L0H3_O_p10',  # Q dependency is implicit, not a routing edge
+    'L0H3_V_p9 --> L0H3_O_p10 --> OUT_p12',
+    'English: copy this token',
+    '%% ignored claim',
+    'classDef hidden fill:red',
+    'L0H3_V_p8 --> L0H3_O_p10',  # undeclared endpoint
+    'L0H3_V_p9 --> L0H3_O_p10',  # duplicated edge
+    'OUT_p12 --> L0H3_Q_p10',
+    'L0H3_O_p10 --> OUT_p12',  # wrong output position
+    'L00H3_Q_p10',
+])
+def test_strict_text_rejects_unsupported_or_duplicate_syntax(extra):
+    spec = routes.multihop_ports('L0H3', 'L1H1', 9, 10, 12)
+    text = routes.to_mermaid(*spec, target=12)
+    with pytest.raises(ValueError):
+        routes.parse_mermaid(text + extra + '\n', target=12)
+
+
+def test_roundtrip_preserves_disconnected_ports_and_rejects_missing_contract():
+    spec = routes.multihop_ports('L0H3', 'L1H1', 9, 10, 12)
+    text = routes.to_mermaid(*spec, target=12)
+    selected, edges, outputs = routes.parse_mermaid(text, target=12)
+    # Q and every K remain selected even though they have no explicit incoming edges.
+    assert len([p for p in selected if p.port == 'K']) == 24
+    assert len([p for p in selected if p.port == 'Q']) == 2
+    assert routes.to_mermaid(selected, edges, outputs, target=12) == text
+    with pytest.raises(ValueError, match='header/contract'):
+        routes.parse_mermaid(text.replace('attention=original', 'attention=restricted'), target=12)
+    with pytest.raises(ValueError, match='duplicate selected'):
+        routes.to_mermaid(spec[0] + [spec[0][0]], spec[1], spec[2], target=12)

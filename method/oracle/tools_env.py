@@ -95,7 +95,8 @@ SYSTEM = ("You explain how a small language model, vpd4l (layers 0 to 3, each wi
           "as VPD's whole answer) and compare() to see where two drafts differ. A draft is given as positions=[...] "
           "(every VPD-active subcomponent there), nodes=[...] (with edges=[[writer, reader], ...], reader OUT for the "
           "prediction, or every connection among them when no edges are given) or Mermaid text, or as base=<draft id> "
-          "with add=[...] and drop=[...]; each run_circuit returns its draft id (d1, d2, ...), which compare() also "
+          "with add=[...], drop=[...] or drop_least=n (after measure_removal(draft=..., each=true)); each run_circuit "
+          "returns its draft id (d1, d2, ...), which compare() also "
           "takes. In your answer the CIRCUIT section may be a draft id alone (CIRCUIT: d3): its Mermaid is filled in. "
           "Each tool call costs a little reward: call what you need, then reply without a tool call. That reply is your "
           "answer, in the format the question asks for.")
@@ -172,6 +173,7 @@ TOOL_SPECS = [
          "base": {"type": "string", "description": "a draft id to start from"},
          "add": {"type": "array", "items": {"type": "string"}, "description": "nodes added to the base"},
          "drop": {"type": "array", "items": {"type": "string"}, "description": "nodes dropped from the base (with their edges)"},
+         "drop_least": {"type": "integer", "description": "drop the base's n least needed nodes, by measure_removal(draft=base, each=true)'s order (kept by later drafts)"},
          "changes": {"type": "array", "items": {"type": "array"},
                      "description": "[[position, token], ...], token as quoted in the question, e.g. \"' castle'\", or an id"}},
          "required": []}},
@@ -633,6 +635,8 @@ class Episode:
                          {"role": "user", "content": question(env.task(tid), env.rows[tid])}]
         self.calls, self.turns, self.answer, self.result = 0, 0, None, None
         self.drafts: dict = {}
+        self.order: dict = {}  # draft id -> its nodes least needed first (measure_removal each), drafts from it inherit it
+        self._inherit = None  # (base, dropped nodes) of the run_circuit call in progress
         self.asked: dict = {}  # (tool, resolved arguments) -> times asked in this episode
         self.log: list = []  # [tool, arguments, seconds, cached]
 
@@ -645,11 +649,22 @@ class Episode:
     def _resolve(self, name: str, args: dict) -> dict:
         """The arguments with draft ids replaced by their circuit JSON (base with add and drop applied)."""
         args = dict(args)
-        if name == "run_circuit" and (args.get("base") is not None or args.get("add") or args.get("drop")):
+        if name == "run_circuit" and (args.get("base") is not None or args.get("add") or args.get("drop") or args.get("drop_least")):
             if args.get("base") is None:
-                raise ToolError("add and drop need base, a draft id")
-            ans = json.loads(json.dumps(self._draft(args.pop("base"))))
-            drop = {nd for x in args.pop("drop", None) or [] for nd in (components.group_of(str(x)) or [])}
+                raise ToolError("add, drop and drop_least need base, a draft id")
+            base = str(args.pop("base")).strip()
+            ans = json.loads(json.dumps(self._draft(base)))
+            least = args.pop("drop_least", None)
+            dropped = list(args.pop("drop", None) or [])
+            if least:
+                if base not in self.order:
+                    raise ToolError(f"drop_least needs measure_removal(draft={base!r}, each=true) first")
+                try:
+                    dropped += self.order[base][:max(0, int(least))]
+                except (TypeError, ValueError):
+                    raise ToolError("drop_least must be an integer") from None
+            drop = {nd for x in dropped for nd in (components.group_of(str(x)) or [])}
+            self._inherit = (base, drop)
             for i in sorted((i for i, (m, c, t) in enumerate(ans["nodes"]) if (m if m != "block" else c, t, c if m != "block" else components.BLOCK) in drop
                              or (m == components.TOK and (components.TOK, t, 0) in drop)), reverse=True):
                 ans = components._without_part(ans, i)
@@ -674,6 +689,20 @@ class Episode:
             args["_json"] = self._draft(args["draft"])
         return args
 
+    def _ordered(self, name: str, args: dict, text: str, did: str | None) -> None:
+        """Keep a draft's least-needed order: from measure_removal(draft, each) of it, or its base's less what it
+        dropped (nodes it added last)."""
+        if name == "measure_removal" and args.get("each") and args.get("draft") is not None:
+            try:
+                self.order[str(args["draft"]).strip()] = [x[0] for x in json.loads(text).get("removals", [])][::-1]
+            except (ValueError, TypeError):
+                pass
+        inh = getattr(self, "_inherit", None)
+        if name == "run_circuit" and inh and did and inh[0] in self.order and did not in self.order:
+            have = {components.node_text((m, t, c)) for m, c, t in self.drafts[did]["nodes"] if m not in ("block", components.TOK)}
+            kept = [x for x in self.order[inh[0]] if components.node_of(x) not in inh[1] and x in have]
+            self.order[did] = kept + sorted(have - set(kept))
+
     def call(self, name: str, args) -> str:
         self.calls += 1
         if isinstance(args, str):
@@ -683,6 +712,7 @@ class Episode:
                 return json.dumps({"error": f"arguments are not JSON: {e}"})
         args = args if isinstance(args, dict) else {}
         t0 = time.perf_counter()
+        self._inherit = None
         try:
             full = self._resolve(name, args)
         except ToolError as e:
@@ -691,10 +721,13 @@ class Episode:
         key = (name, json.dumps(full, sort_keys=True))
         cached = key in self.tools.memo
         text, side = self.tools.call_full(name, full)
+        did = None
         if "_json" in side and text.endswith("}"):  # a scored draft: its id
             did = next((k for k, v in self.drafts.items() if v == side["_json"]), None) or f"d{len(self.drafts) + 1}"
             self.drafts[did] = side["_json"]
             text = text[:-1] + f',"draft":"{did}"}}'
+        self._ordered(name, args, text, did)
+        self._inherit = None
         self.asked[key] = self.asked.get(key, 0) + 1
         if self.asked[key] > 1 and text.endswith("}"):  # the same call again in this episode: the same result
             text = text[:-1] + f',"repeated":{self.asked[key] - 1}}}'
@@ -755,7 +788,7 @@ def run_episode(env: Env, tid: str, policy) -> dict:
         pass
     wall = time.perf_counter() - t0
     res = ep.finish()
-    return {**res, "episode_seconds": round(wall, 2), "log": ep.log, "messages": ep.messages}
+    return {**res, "episode_seconds": round(wall, 2), "log": ep.log, "messages": ep.messages, "tools": qwen3_tools()}
 
 
 # ---- the scripted baseline
@@ -774,7 +807,7 @@ class Scripted:
     m the smallest whose pp reaches FLOOR (positions moving the prediction by at least 1% of the total, at most
     MAX_POSITIONS); the start's nodes ordered by their measured removal (measure_removal(draft, each)); then each turn
     tries dropping the next chunk, half of it and a quarter of it from the current draft at once (three run_circuit
-    calls, base and drop) and keeps the largest drop whose pp and point stay within TOLERANCE of the start's; the chunk
+    calls, base and drop_least) and keeps the largest drop whose pp and point stay within TOLERANCE of the start's; the chunk
     starts at half the start and halves after a turn with no drop kept, until it is below 1/MIN_FRACTION of the start
     or the turns or calls run out (the episode's MAX_TURNS and MAX_CALLS, one turn kept for the answer). A draft above
     components.NODE_CAP drops its least needed nodes to the cap. The answer: CIRCUIT: <the last kept draft>."""
@@ -826,12 +859,12 @@ class Scripted:
         base_pp, base_pt = score.get("pp") or 0.0, score.get("point") or 0.0
         (rem,) = yield self._msg(_call("measure_removal", draft=draft, each=True))
         turns, calls = turns + 1, calls + 1
-        order = [x[0] for x in rem.get("removals", [])][::-1]  # least needed first
-        chunk = max(1, len(order) // 2)
-        floor = max(1, len(order) // self.MIN_FRACTION)
-        while order and chunk >= floor and turns < self.max_turns - 2 and calls + len(self.TRIALS) + 1 <= self.max_calls:
-            sizes = sorted({max(1, chunk // k) for k in self.TRIALS}, reverse=True)
-            got = yield self._msg(*[_call("run_circuit", base=draft, drop=order[:n]) for n in sizes])
+        left = len(rem.get("removals", []))  # the candidates, least needed first in the episode's order of the draft
+        chunk = max(1, left // 2)
+        floor = max(1, left // self.MIN_FRACTION)
+        while left and chunk >= floor and turns < self.max_turns - 2 and calls + len(self.TRIALS) + 1 <= self.max_calls:
+            sizes = sorted({max(1, min(left, chunk // k)) for k in self.TRIALS}, reverse=True)
+            got = yield self._msg(*[_call("run_circuit", base=draft, drop_least=n) for n in sizes])
             turns, calls = turns + 1, calls + len(sizes)
             kept = None
             for n, sc in zip(sizes, got):
@@ -841,11 +874,11 @@ class Scripted:
                 if ok and kept is None:
                     kept = (n, sc)
             if kept:
-                draft, size, order = kept[1]["draft"], kept[1]["nodes"], order[kept[0]:]
+                draft, size, left = kept[1]["draft"], kept[1]["nodes"], left - kept[0]
             else:
                 chunk //= 2
         if size > components.NODE_CAP:  # the answer's cap: the least needed go
-            (sc,) = yield self._msg(_call("run_circuit", base=draft, drop=order[:size - components.NODE_CAP]))
+            (sc,) = yield self._msg(_call("run_circuit", base=draft, drop_least=size - components.NODE_CAP))
             draft = sc.get("draft", draft)
             self.trace.append({"cap": components.NODE_CAP, "nodes": sc.get("nodes"), "pp": sc.get("pp"), "point": sc.get("point"), "draft": draft})
         q = [m for m in messages if m["role"] == "user"][0]["content"]
@@ -942,7 +975,7 @@ def scripted(env: Env, tids: list[str], out: Path, log=print) -> list[dict]:
         row = {**r, "trace": pol.trace,
                "start": {"phi": tau["phi_start"], "phi_tau": tau["phi_tau"], "bits": tau["bits_start"], "s_track_pp": st["s_track_pp"],
                          "nodes": tau["nodes_start"], "m": tau["m_start"]},
-               "answer": r["messages"][-1]["content"]}
+               "answer": r.get("answer_expanded") or r["messages"][-1]["content"]}
         res.append(row)
         with out.open("a") as f:
             f.write(json.dumps(row) + "\n")
@@ -967,7 +1000,7 @@ def baselines(env: Env, episodes: Path, out: Path, log=print) -> list[dict]:
         tools = env.text_tools(tid)
         tx = tools.tx
         P = nat.positions(tx.targets)
-        parsed = components.parse(ep["answer"])
+        parsed = components.parse(ep.get("answer_expanded") or ep["answer"])
         g, _ = goal_eval.circuit(parsed["answer"], tx.targets, nat.C, tx.T)
         k = g.count()
         st = ge.start_set(tx, env.score_split)["graph"]

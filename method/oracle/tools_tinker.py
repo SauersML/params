@@ -8,6 +8,9 @@ project comes from TINKER_PROJECT_ID (required, never the default) and the key f
                           [--max-tokens 4096] [--max-turns 24] [--usd-cap 3]
   tools_tinker.py rl TASKS --server URL --log DIR [--init STATE] [--steps N] [--texts P] [--group G] [--lr 4e-5]
                      [--usd-cap 3]
+  tools_tinker.py sft EPISODES.jsonl --log DIR [--steps N] [--batch B] [--lr 1e-4] [--rank 32] [--usd-cap 3]
+                     a warm start on whole episodes (tools_env.py scripted's lines on training texts: their messages and
+                     tool schemas), every assistant turn trained (tool calls and the answer), in the rollouts' rendering
 TASKS: text ids (text6000:text6009 for a range). rollout writes one line per episode: the task, its reward (the
 answer's reward v3 minus the calls' cost), calls, turns, why it stopped, each turn's observation and sampled tokens,
 and its messages. rl: per step P texts x G episodes, each episode's advantage its reward less its group's mean on
@@ -257,9 +260,82 @@ def rl(a) -> None:
     print(json.dumps({"saved": path, "total_usd": spend.total}), flush=True)
 
 
+def cookbook_messages(row: dict, renderer) -> list:
+    """An episode's messages (tools_env's form: tool calls as {"name", "arguments"}) in the cookbook's, the tool schemas
+    in the system prompt as the rollouts put them."""
+    from tinker_cookbook.renderers.base import ToolCall
+
+    msgs = row["messages"]
+    specs = [t["function"] for t in row["tools"]]
+    out = renderer.create_conversation_prefix_with_tools(specs, system_prompt=msgs[0]["content"])
+    n = 0
+    for m in msgs[1:]:
+        if m["role"] == "assistant":
+            mm = {"role": "assistant", "content": m.get("content") or ""}
+            if m.get("tool_calls"):
+                mm["tool_calls"] = []
+                for c in m["tool_calls"]:
+                    args = c["arguments"] if isinstance(c["arguments"], str) else json.dumps(c["arguments"])
+                    mm["tool_calls"].append(ToolCall(function=ToolCall.FunctionBody(name=c["name"], arguments=args), id=f"call_{n}"))
+                    n += 1
+            out.append(mm)
+        elif m["role"] == "tool":
+            out.append({"role": "tool", "content": m["content"], "name": m.get("name", "")})
+        else:
+            out.append({"role": m["role"], "content": m["content"]})
+    return out
+
+
+def sft(a) -> None:
+    import tinker
+    from tinker_cookbook import renderers
+    from tinker_cookbook.supervised.data import conversation_to_datum
+
+    a.log.mkdir(parents=True, exist_ok=True)
+    spend = Spend(a.base, a.usd_cap, a.log / "spend.jsonl")
+    service = service_client()
+    renderer, _ = episode_renderer(a.base, a.thinking)
+    rows = [json.loads(x) for x in a.episodes.read_text().splitlines() if x.strip()]
+    rows = [r for r in rows if r.get("messages") and r.get("tools") and r.get("answered")]
+    if any(9000 <= int(r["task"].removeprefix("text")) <= 9199 for r in rows):
+        raise SystemExit("held-out texts (text9000-9199) are never training data")
+    data = [conversation_to_datum(cookbook_messages(r, renderer), renderer, CONTEXT, renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES)
+            for r in rows]
+    print(json.dumps({"episodes": len(data), "tokens": [d.model_input.length for d in data]}), flush=True)
+    training = service.create_lora_training_client(base_model=a.base, rank=a.rank)
+    adam = tinker.AdamParams(learning_rate=a.lr, beta1=0.9, beta2=0.95, eps=1e-8)
+    rng = random.Random(a.seed)
+    for step in range(a.steps):
+        batch = rng.sample(data, min(a.batch, len(data)))
+        n = sum(d.model_input.length for d in batch)
+        spend.check(n * spend.prices[2] / 1e6)
+        out = training.forward_backward(batch, loss_fn="cross_entropy").result()
+        training.optim_step(adam).result()
+        spend.add("sft", trained=n)
+        loss = out.metrics.get("loss:sum") if hasattr(out, "metrics") else None
+        line = {"step": step, "tokens": n, "loss_sum": loss, "total_usd": spend.total}
+        print(json.dumps(line), flush=True)
+        with (a.log / "steps.jsonl").open("a") as f:
+            f.write(json.dumps(line) + "\n")
+    path = training.save_state(f"tools-sft-{a.steps}").result().path
+    (a.log / "state.json").write_text(json.dumps({"state": path, "base": a.base, "rank": a.rank, "total_usd": spend.total}))
+    print(json.dumps({"saved": path, "total_usd": spend.total}), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
+    q = sub.add_parser("sft")
+    q.add_argument("episodes", type=Path)
+    q.add_argument("--log", type=Path, required=True)
+    q.add_argument("--base", default="Qwen/Qwen3-8B")
+    q.add_argument("--steps", type=int, default=20)
+    q.add_argument("--batch", type=int, default=8)
+    q.add_argument("--lr", type=float, default=1e-4)
+    q.add_argument("--rank", type=int, default=32)
+    q.add_argument("--seed", type=int, default=0)
+    q.add_argument("--thinking", action="store_true")
+    q.add_argument("--usd-cap", type=float, default=3.0)
     for name in ("rollout", "rl"):
         p = sub.add_parser(name)
         p.add_argument("tasks", nargs="+")
@@ -285,7 +361,7 @@ def main():
         raise SystemExit(f"no prices for {a.base}")
     if not os.environ.get("TINKER_API_KEY"):
         raise SystemExit("TINKER_API_KEY is not set")
-    {"rollout": rollout, "rl": rl}[a.cmd](a)
+    {"rollout": rollout, "rl": rl, "sft": sft}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -160,8 +160,16 @@ def test_drafts_through_episode(env):
     back = json.loads(ep.call("run_circuit", {"base": b["draft"], "add": drop}))
     assert back["nodes"] == len(at11) and math.isclose(back["point"], a["point"], abs_tol=1e-9)
     assert "error" in json.loads(ep.call("run_circuit", {"base": "d99", "drop": drop}))
+    assert "error" in json.loads(ep.call("run_circuit", {"base": "d1", "drop_least": 2}))  # no order measured yet
     rem = json.loads(ep.call("measure_removal", {"draft": "d1", "each": True}))
     assert sorted(x[0] for x in rem["removals"]) == sorted(components.node_text(nd) for nd in at11)
+    least = [x[0] for x in rem["removals"]][::-1]
+    c = json.loads(ep.call("run_circuit", {"base": "d1", "drop_least": 3}))
+    want = json.loads(tools.call("run_circuit", {"nodes": [x for x in least[3:]]}))
+    assert c["nodes"] == len(at11) - 3 and math.isclose(c["point"], want["point"], abs_tol=1e-9)
+    c2 = json.loads(ep.call("run_circuit", {"base": c["draft"], "drop_least": 2}))  # the order carries over
+    want2 = json.loads(tools.call("run_circuit", {"nodes": [x for x in least[5:]]}))
+    assert c2["nodes"] == len(at11) - 5 and math.isclose(c2["point"], want2["point"], abs_tol=1e-9)
     cmp = json.loads(ep.call("compare", {"circuit_a": "d1", "circuit_b": b["draft"]}))
     assert "error" not in cmp or "nothing to change" in cmp["error"]
     again = json.loads(ep.call("run_circuit", {"positions": [11]}))

@@ -269,7 +269,7 @@ def annotate():
     beside them the same texts' influential-blocks start and VPD's top k at the template's listed size."""
     import copy_template
 
-    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_donor_near", "s_donor_far", "c5", "bits")
+    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_patching_near", "s_patching_far", "c5", "bits")
     mean = lambda rs, m: (float(np.mean([r[m] for r in rs if r.get(m) is not None])) if any(r.get(m) is not None for r in rs) else None)  # noqa: E731
     lib = json.loads((DATA / "library_texts.json").read_text())
     rows = []
@@ -323,7 +323,7 @@ def report():
                 if key not in seen:
                     seen.add(key)
                     rows.append(r)
-    terms = ("s_point_c", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "c5")
+    terms = ("s_point_c", "s_track_pp", "s_interchange_pp", "s_patching_near", "s_patching_far", "c5")
     for f, info in lib.items():
         if f.startswith("_"):
             continue

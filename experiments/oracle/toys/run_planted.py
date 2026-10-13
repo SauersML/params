@@ -177,7 +177,7 @@ def run(name: str, path: Path, out: Path, n_texts: int, arms: list, decomp: str 
                      "reward_v3": rv.get("circuit_reward"), "phi_reward_mode": rv.get("phi")}
                 rec = {"toy": name, "text": i, "decomp": decomp, "circuit": label, "nodes": len(v), "phi": ph, "phi_without_n": phi_without_n(r),
                        **{k: r.get(k) for k in ("s_point_c", "n_point", "s_track_pp", "s_interchange_pp", "s_nodes", "s_edges",
-                                                "s_donor_near", "s_donor_far", "c", "error", "bits", "compact", "phi_tau", "gate", "reward_v3",
+                                                "s_patching_near", "s_patching_far", "c", "error", "bits", "compact", "phi_tau", "gate", "reward_v3",
                                                 "phi_reward_mode")},
                        "f1_flips_c": (r.get("f1_flips_c") or {}), "flips_to_half": r.get("flips_to_half")}
                 fh.write(json.dumps(rec) + "\n")

@@ -308,7 +308,7 @@ def test_acceptance_admits_exactly_the_passing_sets(kind):
     as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
     acc = teacher.Acceptance(ge, tx, ("changed",) if kind == "pp" else (kind,), "pp")
     hook, base = acc.hook(as_nodes, start)
-    assert set(base) == {"donors": {"s_donor_near", "s_donor_far"}, "pp": {"s_track_pp"}, "necessity": {"n_spec"}}[kind]
+    assert set(base) == {"donors": {"s_patching_near", "s_patching_far"}, "pp": {"s_track_pp"}, "necessity": {"n_spec"}}[kind]
     ons = start[None].repeat(4, 1)
     for i, k in enumerate((1, 4, 16, 40)):                      # VPD's last k removed
         ons[i, order[-k:]] = False
@@ -505,7 +505,7 @@ def test_block_connections_keep_their_floors():
         assert bool(ep.on[member].all()) or not bool(ep.on[member].any())
     # the stated graph names the blocks, states every token edge, and keeps the floors the descent started from
     assert {(nd[0], nd[1]) for nd in stated.node_set() if nd[2] == goal_eval.BLOCK} <= bl
-    floor = {k: min(teacher.RECOVERED, steps[0][k]) for k in ("s_track_pp", "s_donor_near", "s_donor_far") if steps[0].get(k) is not None}
+    floor = {k: min(teacher.RECOVERED, steps[0][k]) for k in ("s_track_pp", "s_patching_near", "s_patching_far") if steps[0].get(k) is not None}
     got = acc.scores([stated])[0]
     assert all(got[k] is None or got[k] >= f - 1e-6 for k, f in floor.items())
     back, bad = goal_eval.circuit(goal_eval.to_json(stated, ""), tx.targets, nat.C, tx.T)

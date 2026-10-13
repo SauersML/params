@@ -227,7 +227,7 @@ def main():
         fields = ("flipc_1", "flipc_4", "flipc_16", "flipc_64", "flipc_256", "flips_to_half", "flips_to_break", "s_point_c", "n_point",
                   "n_real", "s_point", "s_wiring", "reliance_on_cuts", "flip_1", "flip_4", "dreads_edges", "dreads_nodes",
                   "dreads_interchange", "s_changed", "kl_changed_c", "context_share", "s_track", "s_interchange", "s_track_pp",
-                  "s_interchange_pp", "s_pattern", "s_donor_near", "s_donor_near_p90", "s_donor_far", "s_donor_far_p90", "c", "c_flips",
+                  "s_interchange_pp", "s_pattern", "s_patching_near", "s_patching_near_p90", "s_patching_far", "s_patching_far_p90", "c", "c_flips",
                   "phi", "stranded", "nodes", "positions", "size", "size_bits")
         for name, keep in (("all", lambda t: True), ("non-local", lambda t: local.get(t) is False), ("local", lambda t: local.get(t) is True)):
             ts = [t for t in set(FA) & set(FB) if keep(t)]
@@ -246,8 +246,8 @@ def main():
                     print(f"rule (guarded): flipc_1 and flipc_4 higher {'yes' if up else 'NO'}; s_point_c and point N not lower "
                           f"{'yes' if kept else 'NO'} -> {'PASS' if up and kept else 'FAIL'} (answers within the budget: answer_tokens.py)")
         vfields = ("flipc_1", "flipc_4", "flips_to_half", "s_nodes", "s_edges", "n_real", "s_point_c", "n_point", "s_point", "dreads_edges",
-                   "s_track", "s_track_pp", "s_changed", "s_interchange", "s_interchange_pp", "s_pattern", "s_donor_near", "s_donor_near_p90",
-                   "s_donor_far", "s_donor_far_p90", "c", "c_flips", "phi")
+                   "s_track", "s_track_pp", "s_changed", "s_interchange", "s_interchange_pp", "s_pattern", "s_patching_near", "s_patching_near_p90",
+                   "s_patching_far", "s_patching_far_p90", "c", "c_flips", "phi")
         for side, kind, F in ((args.a, args.a, FA), (args.b, args.b, FB)):
             V = fid(kind, vpd=True)
             ts = sorted(set(F) & set(V))

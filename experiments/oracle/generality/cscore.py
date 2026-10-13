@@ -1,7 +1,7 @@
 """goal_eval's families for answers with block nodes, token edges and stated pairs, on one text (eval split):
 s_point_c (min(graph F1, every-connection F1) in C's semantics, blocks expanded into their subcomponents), s_track_pp
 and s_interchange_pp (path-patched, blocks as blocks), s_interchange (C's semantics) and donor resampling (near and far
-donors); c5, the harmonic mean of s_point_c, s_track_pp, s_interchange_pp, s_donor_near and s_donor_far over those
+donors); c5, the harmonic mean of s_point_c, s_track_pp, s_interchange_pp, s_patching_near and s_patching_far over those
 defined (goal_eval's C without the node, edge and flip families)."""
 import json
 import os
@@ -18,7 +18,7 @@ TEXTS = Path.home() / "mpd-data/graph_oracle/texts/vpd4l"
 # engine spans tens of thousands of columns
 goal_eval.CHANGED_ROWS = int(os.environ.get("CHANGED_ROWS", 16))
 goal_eval.DONOR_ROWS = int(os.environ.get("DONOR_ROWS", 4))
-TERMS = ("s_point_c", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far")
+TERMS = ("s_point_c", "s_track_pp", "s_interchange_pp", "s_patching_near", "s_patching_far")
 
 
 def text(ge, task: str):
@@ -112,7 +112,7 @@ def score(ge, tx, graphs: list, draws: int = 16, near: int = goal_eval.DONORS_NE
                "s_interchange_pp": ipp[i]["s_interchange_pp"],
                "s_interchange": goal_eval._fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
                if it and it["kl_interchange_c"] is not None else None,
-               "s_donor_near": dns.get(i, {}).get("s_donor_near"), "s_donor_far": dns.get(i, {}).get("s_donor_far")}
+               "s_patching_near": dns.get(i, {}).get("s_patching_near"), "s_patching_far": dns.get(i, {}).get("s_patching_far")}
         row["bits_active"] = bits_active(ge, tx, gp)
         # the scorecard's size_bits (a block at its active contents) for a stated graph; a complete graph's blocks it
         # counts as one node each, so there the active expansion's (bits_active)

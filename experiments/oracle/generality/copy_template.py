@@ -268,7 +268,7 @@ def report():
                 key = r["name"] if r["kind"] in ("template", "vpd") else r["kind"]
                 by[r["task"]].setdefault(key, r)
     held = {x["task"] for x in json.loads((DATA / "copy_heldout.json").read_text())["copy"]}
-    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_donor_near", "s_donor_far", "c5", "bits")
+    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_patching_near", "s_patching_far", "c5", "bits")
     kinds = list(NAMES) + ["influential_blocks", "teacher", "vpd_listed", "vpd_expanded"]
     out = {}
     for group, tasks in (("held-out copy texts", [t for t in by if t in held]), ("copy texts with teacher circuits", [t for t in by if t not in held])):

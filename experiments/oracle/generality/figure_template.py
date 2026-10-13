@@ -85,7 +85,7 @@ def scores(ax):
              ("influential", "the text's own influential blocks", AMBER), ("vpd_listed", "VPD's top k, same listed size", RED),
              ("vpd_expanded", "VPD's top k, same subcomponent count", SOFT)]
     terms = [("s_point_c", "prediction"), ("s_track_pp", "follows changes"), ("s_interchange_pp", "interchange (path-patched)"),
-             ("s_donor_near", "near donors"), ("c5", "harmonic C")]
+             ("s_patching_near", "activation patching, near"), ("c5", "harmonic C")]
     for task, d in by.items():
         tpl = d.get("copy_columns")
         if tpl:

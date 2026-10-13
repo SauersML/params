@@ -126,7 +126,9 @@ VPD4L_SITES = 24  # vpd4l's weight matrices (4 layers x 6), a block's name among
 DONORS_NEAR = 32  # donor resampling's changed-input donors per text
 DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's answer)
 DONORS_FAR = 32  # donor resampling's other texts per text
-NEC_CONTROLS = 16  # N's matched control texts per text (necessity_spec: the split's far pool, DONOR_POOLS)
+NEC_CONTROLS = 32  # N's matched control texts per text (necessity_spec: the split's far pool, DONOR_POOLS; at 16 the
+# controls' spread, ~5 bits, gave eps_N a median 0.14 on the held-out influential sets)
+NEC_MIN_LEN = 64  # a control text's least length (end-aligned: a circuit's parts further back are not removed there)
 DONOR_POOLS = {"search": ("train", range(0, 400)),  # the far donors' texts per split: the reward's from training texts,
                "eval": ("donor", range(0, 50))}  # explicit text9150-9199 partition, independent of missing dev files
 
@@ -470,7 +472,7 @@ PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the sc
     "point": ("s_point_c", None, None), "nodes": ("s_nodes", "weighted", "draws_nodes"), "edges": ("s_edges", "mean", "draws_edges"),
     "flips": ("f1_flips_c", None, None), "track_pp": ("s_track_pp", "weighted", "draws_track_pp"),
     "interchange_pp": ("s_interchange_pp", "weighted", "draws_interchange_pp"),
-    "donors_near": ("s_donor_near", "donor", "draws_donor_near"), "donors_far": ("s_donor_far", "donor", "draws_donor_far"),
+    "patching_near": ("s_patching_near", "donor", "draws_patching_near"), "patching_far": ("s_patching_far", "donor", "draws_patching_far"),
     "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_spec", "spec", "draws_n_spec")}
 EPS_FLOOR = 0.005  # eps's floor
 EPS_BOOT = 200  # eps's bootstrap resamples
@@ -1088,7 +1090,7 @@ class GoalEval:
         return torch.log_softmax((norm(xt, tg.ln_f, "final") @ tg.wte.T).float(), -1)
 
 
-    LOO_HELD = ("nodes", "edges", "flips", "donors_near", "donors_far")  # line_loo's families held at the answer's values
+    LOO_HELD = ("nodes", "edges", "flips", "patching_near", "patching_far")  # line_loo's families held at the answer's values
 
     def line_loo(self, tx: Text, graph: native.Graph, pool: dict | None, split: str = "search", draws: int = 8,
                  bits_start: float | None = None, base: dict | None = None) -> dict:
@@ -2171,9 +2173,9 @@ class GoalEval:
         of the real model less the circuit's subcomponents (every other subcomponent and every remainder on, as
         real_removal); D_c, the same removal's damage on a matched control text, end-aligned (the control's last
         position takes the text's last target, every part shifted with it: the same relative positions, which are all
-        the model's attention sees), averaged over controls texts of the split's far pool (DONOR_POOLS) at least as
-        long as the circuits' span, drawn by the text's seed; the same two for VPD's whole answer (its parts before a
-        control's start left out there). n_spec = clip((D_t - D_c) / (D_t(VPD) - D_c(VPD)), 0, 1): parts whose removal
+        the model's attention sees), averaged over controls texts of the split's far pool (DONOR_POOLS) at least
+        NEC_MIN_LEN long (or the text's length), drawn by the text's seed, the same for every graph on the text; parts
+        before a control's start are left out there; the same two for VPD's whole answer. n_spec = clip((D_t - D_c) / (D_t(VPD) - D_c(VPD)), 0, 1): parts whose removal
         damages every text's prediction there add to D_t and D_c alike and earn nothing, VPD's answer scores 1, None
         when VPD's removal damages the controls as much as the text; n_spec_raw unclipped below (c_rl's ranking).
         draws_n_spec: per control [control, D_c, D_c(VPD), D_t, D_t(VPD)] (phi's eps). Damages in bits."""
@@ -2181,8 +2183,7 @@ class GoalEval:
         sets = [self.masks(_c_graph(g, tx.targets, nat.C), T) for g in graphs] + [tx.vpd]
         dt = self._removed_kl(tx.ids, tx.targets, sets, tx.ref)
         last = max(tx.targets)
-        first = min((int(m[n].any(1).nonzero().min()) for m in sets[:-1] for n in nat.names if m[n].any()), default=last)
-        pool = [x for x in self.far_pool(split) if len(x[1]) >= last - first + 1 and list(x[1]) != list(tx.ids)]
+        pool = [x for x in self.far_pool(split) if len(x[1]) >= min(T, NEC_MIN_LEN) and list(x[1]) != list(tx.ids)]
         ys = [pool[i][1] for i in np.random.default_rng([int(tx.seed), 13]).permutation(len(pool))[:controls]]
         dc = []
         for y in ys:
@@ -2222,10 +2223,10 @@ class GoalEval:
         parts switched on (adversary_flips, the omitted lever: f1_flips_omitted by m), "interchange" (_interchange_family:
         the circuit's nodes at one of its positions set to their values on a changed text, s_interchange) and "changed"
         (changed_inputs: the circuit run on changed texts, bounded by its own unchanged answer, s_changed, with
-        context_share, s_track) and "donors" (donors: everything outside the circuit at one donor text's values, near
-        donors the changed texts and far donors other texts, s_donor_near and s_donor_far); c, the harmonic mean of
+        context_share, s_track) and "donors" (donors, activation patching: everything outside the circuit at one donor text's values, near
+        donors the changed texts and far donors other texts, s_patching_near and s_patching_far); c, the harmonic mean of
         s_point_c, s_nodes, s_edges, f1_flips_c at FLIP_TERM (the reward's adversarial member), s_track, s_interchange,
-        s_donor_near and s_donor_far over those defined on the text (c_terms names them; the claim is agreement under
+        s_patching_near and s_patching_far over those defined on the text (c_terms names them; the claim is agreement under
         every family, so one failed family is not made up by the others, and near 0 c is linear in the lowest term, so
         float noise there stays noise: the lead's decisions 10-12; the step-budget f1_adv and s_changed are reported
         columns), the last four on split's draws (default: "search", the teachers' draws and training texts as far
@@ -2308,7 +2309,7 @@ class GoalEval:
             row.update(pat[i])
             row.update(dns[i])
             named = [(k, row.get(k)) for k in ("s_point_c", "s_nodes", "s_edges")] + [("f1_flips_c", fc.get(FLIP_TERM))]
-            named += [(k, row.get(k)) for k in ("s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "s_pattern")]
+            named += [(k, row.get(k)) for k in ("s_track_pp", "s_interchange_pp", "s_patching_near", "s_patching_far", "s_pattern")]
             row["c_terms"] = [k for k, v in named if v is not None]  # a family with nothing scored on the text is left out
             row["c"] = _harmonic([v for _, v in named if v is not None])
             # Unfloored families for phi in training and full evaluation alike.
@@ -2324,8 +2325,8 @@ class GoalEval:
                    "s_track_pp": row.get("s_track_pp_raw"), "s_interchange_pp": row.get("s_interchange_pp_raw"),
                    "s_pattern": row.get("s_pattern_raw")}
             for pool_ in ("near", "far"):
-                k3 = row.get(f"kl_donor_{pool_}")
-                raw[f"s_donor_{pool_}"] = _fid_raw(k3[2], k3[0], k3[1]) if k3 else None
+                k3 = row.get(f"kl_patching_{pool_}")
+                raw[f"s_patching_{pool_}"] = _fid_raw(k3[2], k3[0], k3[1]) if k3 else None
             row["rl_terms"] = {k: raw[k] for k in row["c_terms"]}
             row["c_rl"] = _c_rl([raw[k] for k in row["c_terms"] if raw[k] is not None])
             if ns:  # phi's N unfloored as well (not one of C's terms)
@@ -3079,7 +3080,9 @@ class GoalEval:
     @torch.no_grad()
     def donors(self, tx: Text, graphs: list[native.Graph], split: str = "eval", near: int = DONORS_NEAR,
                far: list | None = None, rows: int = DONOR_ROWS) -> list[dict]:
-        """Donor resampling (an evaluation column, the lead's decision 10-12; not in c): the circuit run in C's semantics
+        """Activation patching, the spec's data-distribution VPD sufficiency (columns s_patching_*, named so by the lead
+        10-12: the patched state mixes a donor's activations with the circuit's own, not a natural joint state of the
+        model, so it is donor replacement, not an in-distribution test): the circuit run in C's semantics
         with every subcomponent outside it at its activation on one donor text, every one from that donor, so parts that
         cancel on real text stay consistent (the remainders live); paired with VPD's answer under the same donors; the
         KL from the model on the text. Donors: "near", the changed-input texts of split (changed_inputs' draws), and
@@ -3087,14 +3090,15 @@ class GoalEval:
         leaving its first positions unresampled (their activations live). The bound is the run that keeps nothing,
         every subcomponent at the donor's (KL_0), not the empty circuit's KL: a near donor differs from the text at one
         position, so against KL_empty (~100 bits) every circuit would score near 1. Per circuit and pool:
-        s_donor_<pool> = clip(ln(KL_0 / KL_C) / ln(KL_0 / KL_VPD), 0, 1) on the mean KLs; s_donor_<pool>_worst, the
-        lowest donor's (a donor where VPD's answer is no nearer than KL_0 left out); s_donor_<pool>_p90, the donor at
-        the 90th percentile from the best (the 10th percentile of the donors' scores); kl_donor_<pool> (KL_C, KL_VPD,
-        KL_0); donors_<pool> (how many); draws_donor_<pool>, every donor's [name, KL_C, KL_VPD, KL_0, score]. Every
+        s_patching_<pool> = clip(ln(KL_0 / KL_C) / ln(KL_0 / KL_VPD), 0, 1) on the mean KLs; s_patching_<pool>_worst, the
+        lowest donor's (a donor where VPD's answer is no nearer than KL_0 left out); s_patching_<pool>_p90, the donor at
+        the 90th percentile from the best (the 10th percentile of the donors' scores); kl_patching_<pool> (KL_C, KL_VPD,
+        KL_0); donors_<pool> (how many); draws_patching_<pool>, every donor's [name, KL_C, KL_VPD, KL_0, score]. Every
         draw is the KL from the model's own output on the text, never a loss against the text's next token: it is never
         negative, so a circuit's errors on different donors add up instead of cancelling (Scheurer et al. 2023, causal
-        scrubbing's pitfalls). The flip adversary's in-distribution counterpart: a circuit that holds here but not
-        under the flips is charged there for combinations no real text makes."""
+        scrubbing's pitfalls). The flip adversary's donor-text counterpart: a circuit that holds here but not
+        under the flips is charged there for combinations no real text makes (though no patched state here is a real
+        text's either)."""
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
@@ -3142,12 +3146,12 @@ class GoalEval:
                 kc = [k[b] for k in kls]
                 per = [_fid(z, c, v) for z, c, v in zip(k0, kc, kv)]
                 each = [x for x in per if x is not None]
-                out[b].update({f"s_donor_{pool}": _fid(float(np.mean(k0)), float(np.mean(kc)), float(np.mean(kv))) if kc else None,
-                               f"s_donor_{pool}_worst": min(each) if each else None,
-                               f"s_donor_{pool}_p90": float(np.percentile(each, 10)) if each else None,
-                               f"kl_donor_{pool}": (float(np.mean(kc)), float(np.mean(kv)), float(np.mean(k0))) if kc else None,
+                out[b].update({f"s_patching_{pool}": _fid(float(np.mean(k0)), float(np.mean(kc)), float(np.mean(kv))) if kc else None,
+                               f"s_patching_{pool}_worst": min(each) if each else None,
+                               f"s_patching_{pool}_p90": float(np.percentile(each, 10)) if each else None,
+                               f"kl_patching_{pool}": (float(np.mean(kc)), float(np.mean(kv)), float(np.mean(k0))) if kc else None,
                                f"donors_{pool}": len(kc),
-                               f"draws_donor_{pool}": [[name, c, v, z, sd] for (name, _), c, v, z, sd in zip(xs, kc, kv, k0, per)]})
+                               f"draws_patching_{pool}": [[name, c, v, z, sd] for (name, _), c, v, z, sd in zip(xs, kc, kv, k0, per)]})
         return out
 
     def interchange_search(self, tx: Text, graphs: list[native.Graph], draws: int = 16, mode: str = "c") -> list[dict]:
@@ -4144,10 +4148,10 @@ def fidelity_table(rows: list[dict]) -> str:
     held += [(f"fresh pat{m}", lambda r, m=m: _curve_value(r.get("f1_flips_patterns_fresh"), m)) for m in fresh]
     held += [("N_real", lambda r: r.get("n_real")), ("N_real ceiling", lambda r: r.get("n_real_ceiling")),
              ("act/inact cos", lambda r: r.get("cancel_cosine")), ("C", lambda r: r.get("c")),
-             ("donor near", lambda r: r.get("s_donor_near")), ("donor near worst", lambda r: r.get("s_donor_near_worst")),
-             ("donor near p90", lambda r: r.get("s_donor_near_p90")),
-             ("donor far", lambda r: r.get("s_donor_far")), ("donor far p90", lambda r: r.get("s_donor_far_p90")),
-             ("donor far worst", lambda r: r.get("s_donor_far_worst")),
+             ("patching near", lambda r: r.get("s_patching_near")), ("patching near worst", lambda r: r.get("s_patching_near_worst")),
+             ("patching near p90", lambda r: r.get("s_patching_near_p90")),
+             ("patching far", lambda r: r.get("s_patching_far")), ("patching far p90", lambda r: r.get("s_patching_far_p90")),
+             ("patching far worst", lambda r: r.get("s_patching_far_worst")),
              ("tracks changes", lambda r: r.get("s_track")), ("changed inputs", lambda r: r.get("s_changed")),
              ("context share", lambda r: r.get("context_share"))]
     nflips = sorted({int(m) for r in rows for m in r.get("n_real_flips", {}) if int(m) > 0})

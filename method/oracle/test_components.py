@@ -1110,6 +1110,9 @@ def test_repeated_circuits_run_once(tiny, monkeypatch):
         assert got[i]["reward"] == pytest.approx(alone[j]["reward"], abs=1e-6), (i, j)
         assert [c for _, c in got[i]["lines"]] == pytest.approx([c for _, c in alone[j]["lines"]], abs=1e-6), (i, j)
     assert all(r["environment"] == goal_eval.environment() and r["donor_pool"] == ge.pool_id("search") for r in got)
+    off = components.reward(ge, task, ev, [a, b], pool={}, cache=cache)  # lines off (run 2's request): the same R, no line_loo
+    assert calls["line_loo"] == 2 and all("lines" not in r for r in off)
+    assert [r["reward"] for r in off] == pytest.approx([got[0]["reward"], got[1]["reward"]], abs=1e-6)
 
 
 def test_variable_text_batches_existing_index_list_syntax_losslessly():

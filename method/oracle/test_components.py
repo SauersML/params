@@ -1168,3 +1168,83 @@ def test_evaluate_shards_cover_every_text_once(tmp_path, monkeypatch):
     assert all(q["samples"][0]["score_seconds"] >= 0 for g in got for q in g["per_question"]["s"])
     assert set(got[0]["costs"]) == {"t_a", "t_c"} and set(got[0]["costs"]["t_a"]) == {"baseline_score_seconds", "start_seconds"}
     assert starts == [(("tx", "t_a"), "eval"), (("tx", "t_c"), "eval"), (("tx", "t_b"), "eval")]
+
+
+def _tiny_start(nat, ge, task):
+    """The tiny text's influential start (GoalEval.start_set, the reward's) as a start-relative row's "start"."""
+    p = task["prompts"][0]
+    tx = ge.text(p["token_ids"], p["target_positions"], task=task)
+    st = ge.start_set(tx, "search")
+    return {**components.start_of(sorted(st["graph"].node_set()), tx.ci), "m": st["m"], "positions": st["positions"]}
+
+
+def test_start_relative_answers_round_trip(tiny):
+    """start_answer() and parse_start(): a circuit inside the start comes back as itself (REMOVE: the rest); REMOVE:
+    alone is the whole start; an unknown id and an ADD item that does not parse are charged; ADD takes a node written
+    out (a start id there is a no-op)."""
+    nat, ge, task, ev = tiny
+    start = _tiny_start(nat, ge, task)
+    assert len(start["nodes"]) >= 4 and len(set(start["ids"])) == len(start["ids"])
+    sub = [x for i, x in enumerate(start["nodes"]) if i % 3]
+    text = components.start_answer(start, sub)
+    assert text.startswith("REMOVE: ") and "ADD" not in text
+    got = components.parse_start(text, start)
+    assert got["answer"]["nodes"] == sub and got["answer"]["complete"] and got["circuit"] and got["malformed_nodes"] == 0
+    whole = components.parse_start("REMOVE:", start)
+    assert whole["answer"]["nodes"] == start["nodes"] and whole["circuit"] and components.start_answer(start, start["nodes"]) == "REMOVE:"
+    assert not components.parse_start("I would keep everything.", start)["circuit"]
+    outside = next([n, c, 7] for n in nat.names for c in range(nat.C[n]) if [n, c, 7] not in start["nodes"])
+    x = components.parse_start(f"REMOVE: {start['ids'][0]}, zz9\nADD: {components.node_text((outside[0], 7, outside[1]))}, "
+                               f"{start['ids'][1]}, L9.q#1", start)
+    assert x["unknown_ids"] == 1 and x["malformed_nodes"] == 2 and x["removed"] == 1 and x["added"] == 1
+    assert x["answer"]["nodes"] == start["nodes"][1:] + [outside]
+    assert components.parse_start(components.start_answer(start, sub + [outside]), start)["answer"]["nodes"] == sub + [outside]
+
+
+def test_start_relative_question_lists_the_start(tiny):
+    nat, ge, task, ev = tiny
+    start = _tiny_start(nat, ge, task)
+    row = {**ev, "qa": [], "edits": [], "circuit_only": True, "start": start}
+    q = components.question(task, row)
+    assert "REMOVE:" in q and "Answer with CIRCUIT" not in q and f"START ({len(start['nodes'])} subcomponents" in q
+    for line in components.start_lines(start, components.token_strings(task["model"], task["prompts"][0]["token_ids"])):
+        assert line in q
+    n, c, t = start["nodes"][0]
+    pool = {str(t): {n: [[c, 1.0], [c + 1 if [n, c + 1, t] not in start["nodes"] else c, 0.5, "~"]]}}
+    shown = components.question(task, {**row, "pool": pool})
+    assert f"{c}:1" not in shown.split("candidates outside the START")[-1] or [n, c + 1, t] in start["nodes"]
+
+
+def test_start_relative_reward_is_the_full_circuits(tiny):
+    """reward() of a start-relative answer equals reward() of the same circuit written out in full, and REMOVE:
+    alone scores the start itself (its phi is the bar's phi_start)."""
+    nat, ge, task, ev = tiny
+    start = _tiny_start(nat, ge, task)
+    plain = {**ev, "qa": [], "edits": [], "circuit_only": True}
+    row = {**plain, "start": start}
+    sub = [x for i, x in enumerate(start["nodes"]) if i % 3]
+    for nodes in (sub, start["nodes"]):
+        rel = components.reward(ge, task, row, [components.start_answer(start, nodes)], pool={})[0]
+        full = components.reward(ge, task, plain, [components.render({"nodes": nodes, "edges": [], "complete": True})], pool={})[0]
+        assert rel["valid"] and full["valid"]
+        for k in ("reward", "phi", "phi_tau", "bits", "compact", "g"):
+            assert rel[k] == pytest.approx(full[k], abs=1e-6), k
+    cache = {}
+    empty = components.reward(ge, task, row, ["REMOVE:"], pool={}, cache=cache)[0]
+    tx = cache[task["id"]]
+    p = task["prompts"][0]
+    g, _ = goal_eval.circuit(components.parse_start("REMOVE:", start)["answer"], p["target_positions"], nat.C, len(p["token_ids"]))
+    assert g.complete and g.node_set() == ge.start_set(tx, "search")["graph"].node_set()  # exactly the start's circuit
+    tau = ge.tau(tx, {}, "search")  # (its row from another batch than the bar's: float32 rounding apart)
+    assert empty["phi"] == pytest.approx(tau["phi_start"], abs=1e-4) and empty["bits"] == pytest.approx(tau["bits_start"])
+
+
+def test_thinking_trace_names_a_small_removal_by_its_start_id():
+    path = {"blocks": {"positions": [7], "m": 0, "start_units": 3, "stages": []},
+            "refused": [{"stage": "set", "removed": [["h.0.mlp.c_fc", 7, 3]], "s_track_pp": 0.5, "floor": 0.8, "s_current": 0.9,
+                         "draws": [[2, 5]]}]}
+    ids = [3, 17, 5, 9, 22, 11, 30, 2]
+    answer = {"nodes": [["h.0.mlp.c_fc", 4, 7]]}
+    named = components.thinking_trace(path, "vpd4l", ids, answer, names={("h.0.mlp.c_fc", 7, 3): "b"})
+    assert "Refused: removing b drops changed-input tracking to 0.50" in named
+    assert "removing L0.fc#3@7 drops" in components.thinking_trace(path, "vpd4l", ids, answer)

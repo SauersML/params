@@ -986,6 +986,21 @@ ASK = ("How does {model} compute its prediction of the next token after the targ
        "weights on every text (nodes then written without a position).")
 
 
+ASK_START = ("How does {model} compute its prediction of the next token after the target of this text? Its circuit, in VPD "
+             "subcomponents (a subcomponent is one rank-one slice of a weight matrix at a position, "
+             "L<layer>.<kind>#<index>@<position>, kind q, k, v, o, fc or down), starts from the START listed below: VPD's "
+             "active subcomponents at the target{ctx}, with every connection among them. Say which of them can go: the "
+             "circuit is the START less the subcomponents you remove (and plus any you add), with every connection among "
+             "them. It should be what makes the prediction: with only its subcomponents on and every other one off, the "
+             "model should still predict what it does, and with them taken out of VPD's active subcomponents it should "
+             "not; fewer subcomponents are better. Answer with REMOVE: and the ids of the START's subcomponents to remove, "
+             "separated by commas (REMOVE: with nothing after it keeps the whole START), and optionally a line ADD: and "
+             "subcomponents of the candidate pool to add, written out (L<layer>.<kind>#<index>@<position>), separated by "
+             "commas.")
+START_MARK = re.compile(r"^\s*(REMOVE|ADD)\s*:", re.M | re.I)  # a start-relative answer's two parts
+START_ID = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+
 ASK_VARIABLES = ("Open the EXPLANATION with a line VARIABLES: and one line per variable the circuit computes, V<k> "
                  "\"<short name>\": <its meaning in plain English>; inputs: @<position> <token>, ... (the context tokens it "
                  "is computed from); carried by: <the ids of the circuit's subcomponents that carry it>; feeds: V<j>, ... "
@@ -1378,6 +1393,10 @@ def question(task: dict, ev: dict) -> str:
     ask = ASK.format(model=model)
     if ev.get("circuit_only"):  # an arm whose reward scores the circuit alone asks for nothing else (the audit, 10-13)
         ask = ask[:ask.index(" Answer with CIRCUIT:")] + " Answer with CIRCUIT: and its lines only."
+    st = ev.get("start")  # a start-relative row (start_rows()): the START listed, the answer REMOVE: and ADD:
+    if st:
+        m = st.get("m") or 0
+        ask = ASK_START.format(model=model, ctx=f" and its {m} most influential context position{'s' if m > 1 else ''}" if m else "")
     lines = [ask + constraint + (" " + ASK_VARIABLES if ev.get("variables") or ev.get("invariants") else "")
              + (ASK_INVARIANTS if ev.get("invariants") else ""),
              "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): "
@@ -1408,21 +1427,97 @@ def question(task: dict, ev: dict) -> str:
                          + ", ".join(f"{node_text(tuple(nd))} ({k}/3)" for nd, k in ev["switch_on"][q]))
         if ev["wiring"].get(q):
             lines.append("  wiring: " + ", ".join(f"{node_text(tuple(w))} -> {node_text(tuple(r))} ({c:+.2f})" for w, r, c in ev["wiring"][q]))
-    if ev.get("pool"):  # candidate_pool(): every VPD-active subcomponent at these positions
-        lines.append("every VPD-active subcomponent (causal importance above 0) at these positions, by position and matrix, "
+    if st:
+        lines.append(f"START ({len(st['nodes'])} subcomponents; by position and matrix, each id=index (causal importance)):")
+        lines += start_lines(st, strings)
+    pool = ev.get("pool")
+    if pool and st:  # a start-relative question's candidate pool: what the START does not hold
+        inside = {(m_, t_, c_) for m_, c_, t_ in st["nodes"]}
+        pool = {q: {n: [e for e in es if (n, int(q), int(e[0])) not in inside] for n, es in cs.items()} for q, cs in pool.items()}
+        pool = {q: {n: es for n, es in cs.items() if es} for q, cs in pool.items()}
+        pool = {q: cs for q, cs in pool.items() if cs}
+    if pool:  # candidate_pool(): every VPD-active subcomponent at these positions
+        lines.append(("candidates outside the START: " if st else "") +
+                     "every VPD-active subcomponent (causal importance above 0) at these positions, by position and matrix, "
                      "index:importance, most important first, then (index:~importance) those inactive on this text that a "
                      "changed token at a listed position switches on (any subcomponent of the circuit is one of these; a block "
                      "L<layer>.<kind>@<position> is a matrix's whole output at a position):")
         cell = lambda e: f"{e[0]}:{'~' if len(e) > 2 else ''}{e[1]:.1g}".replace(":0.", ":.").replace(":~0.", ":~.")  # noqa: E731
-        for q in sorted(ev["pool"], key=int):
+        for q in sorted(pool, key=int):
             lines.append(f"{q} ({strings[int(q)]!r}): " + "; ".join(
                 f"L{n.split('.')[1]}.{CODES[n.split('.')[-1]]} " + " ".join(cell(e) for e in cs)
-                for n, cs in sorted(ev["pool"][q].items(), key=lambda x: _place((x[0], int(q), 0)))))
+                for n, cs in sorted(pool[q].items(), key=lambda x: _place((x[0], int(q), 0)))))
     if ev["qa"]:
         tok = lambda ids: token_strings(model, ids)  # noqa: E731
         lines += [qa_text(q, n, strings, repr(top_tok), tok) for n, q in enumerate(ev["qa"], 1)]
     lines += [f"Edit {n}: {edit_goal_text(g, strings, repr(top_tok))}" for n, g in enumerate(ev.get("edits") or [], 1)]
     return escape("\n".join(lines))
+
+
+def start_lines(start: dict, strings: list[str]) -> list[str]:
+    """A start-relative question's START: per position (in text order), per matrix (layer, then q, k, v, o, fc, down),
+    each subcomponent as id=index (its causal importance on the text)."""
+    by = {}
+    for (m, c, t), k, ci in zip(start["nodes"], start["ids"], start["ci"]):
+        by.setdefault(t, {}).setdefault(m, []).append(f"{k}={c} ({ci:.2g})")
+    order = lambda m: (int(m.split(".")[1]), list(KINDS.values()).index(m.split(".")[-1]))  # noqa: E731
+    return [f"@{t} ({strings[t]!r}): " + "; ".join(f"L{m.split('.')[1]}.{CODES[m.split('.')[-1]]} " + ", ".join(xs)
+                                                   for m, xs in sorted(by[t].items(), key=lambda x: order(x[0])))
+            for t in sorted(by)]
+
+
+def start_of(nodes, ci) -> dict:
+    """A start-relative row's "start" from the start's nodes ((matrix, position, index)) and VPD's causal importance
+    ({matrix: [T, C]}): its nodes in goal_eval's JSON ([matrix, index, position]) in text order (position, layer, kind,
+    index), a short id each (a, b, ..., aa, ...), and each one's importance."""
+    order = sorted(nodes, key=lambda nd: (nd[1], int(nd[0].split(".")[1]), list(KINDS.values()).index(nd[0].split(".")[-1]), nd[2]))
+    return {"nodes": [[n, c, t] for n, t, c in order], "ids": _short_ids(len(order)),
+            "ci": [round(float(ci[n][t, c]), 4) for n, t, c in order]}
+
+
+def parse_start(text: str, start: dict) -> dict:
+    """A start-relative answer as parse() gives an answer: REMOVE: the ids of start's subcomponents that go, ADD: (if
+    any) subcomponents written out (L<layer>.<kind>#<index>[,<index>...]@<position>; a start id is already in). The
+    circuit is start's nodes less the removed plus the added, complete (every connection among them, as the start).
+    An id not in start is an unknown id and an ADD item that does not parse a malformed one, each charged as a node
+    outside the graph (as parse() charges an undefined id); "none" names nothing. "circuit": whether REMOVE: is there."""
+    text = MARKDOWN.sub("", text)
+    marks, body = list(START_MARK.finditer(text)), {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        other = SECTION.search(text, m.end(), end)  # (an EXPLANATION or other section after it ends it)
+        body.setdefault(m[1].upper(), text[m.end():other.start() if other else end])
+    of = {k: tuple(nd) for k, nd in zip(start["ids"], start["nodes"])}
+    gone, unknown = set(), 0
+    for k in START_ID.findall(body.get("REMOVE", "")):
+        if k in of:
+            gone.add(of[k])
+        elif k.lower() != "none":
+            unknown += 1
+    inside, added, junk = set(of.values()), [], 0
+    for item in (x.strip() for x in re.split(r"[,\n]", body.get("ADD", ""))):
+        if not item or item.lower() == "none" or item in of:
+            continue
+        g = group_of(item)
+        if not g or any(nd[0] == TOK or nd[2] == BLOCK for nd in g):
+            junk += 1
+            continue
+        added += [x for n, t, c in g if (x := (n, c, t)) not in inside and x not in added]
+    nodes = [list(nd) for nd in start["nodes"] if tuple(nd) not in gone] + [list(x) for x in added]
+    return {"explanation": "", "answer": {"nodes": nodes, "edges": [], "explanation": "", "complete": True}, "ids": {},
+            "malformed": junk, "malformed_nodes": junk + unknown, "unknown_ids": unknown, "circuit": "REMOVE" in body,
+            "finals": {}, "edits": {}, "variables_malformed": 0, "removed": len(gone), "added": len(added)}
+
+
+def start_answer(start: dict, nodes) -> str:
+    """The start-relative answer for a circuit (goal_eval's JSON nodes): REMOVE: start's ids it lacks, then ADD: its
+    subcomponents outside start written out (none for a teacher's circuit, a subset of its start)."""
+    keep, inside = {tuple(x) for x in nodes}, {tuple(x) for x in start["nodes"]}
+    text = "REMOVE: " + ", ".join(k for k, nd in zip(start["ids"], start["nodes"]) if tuple(nd) not in keep)
+    extra = [x for x in nodes if tuple(x) not in inside and x[0] not in (TOK, "block")]
+    if extra:
+        text += "\nADD: " + ", ".join(node_text((n, t, c)) for n, c, t in extra)
+    return escape(text.rstrip())
 
 
 def edit_goal_text(g: dict, strings: list[str], top: str) -> str:
@@ -1711,7 +1806,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
     total = sum(nat.C.values())
     P = nat.positions(targets)
-    parsed = [parse(x) for x in texts]
+    parsed = [parse_start(x, ev["start"]) if ev.get("start") else parse(x) for x in texts]
     graphs, defects, valid = [], [], []
     for i, p in enumerate(parsed):
         g, d = goal_eval.circuit(p["answer"], targets, nat.C, len(ids))
@@ -2189,14 +2284,15 @@ def edit_term(ee, task: dict, goals: list[dict], answers: list[dict], best: dict
 TRACE_CHARS = 7000  # thinking_trace(): about 2,000 Qwen3 tokens, beside a 3.5k-token answer within fit_pool's ROOM
 
 
-def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget: int = TRACE_CHARS) -> str:
+def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget: int = TRACE_CHARS, names: dict | None = None) -> str:
     """The teacher's search as a thinking trace for SFT targets (the lead's 10-12: failed hypotheses as thinking): the
     start (path.json "blocks": its positions and size), each stage's size, the refused removals (path.json "refused":
     what was tried, the score that refuted it against its floor, and the token changes it failed on): small removals
     (a few named subcomponents or connections) first by their shortfall below the floor, then at most two large ones
     (by site and count), shown in the order they were tried, within budget characters; then the result. path "repick"
     (repick_teachers.py's record, which dataset() adds): a written stage that fell under a family floor on its own
-    full-fidelity run and the stage picked instead, stated before the result."""
+    full-fidelity run and the stage picked instead, stated before the result. names: (matrix, position, index) -> its
+    id in a start-relative question's START: a small removal named by those ids."""
     strings = token_strings(model, ids)
     tok = lambda z: shown(token_strings(model, [int(z)])[0])  # noqa: E731
     b = path.get("blocks") or {}
@@ -2222,6 +2318,8 @@ def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget:
         for n, t, c in (tuple(x) for x in removed):
             by.setdefault((n, t), []).append((n, t, c))
         groups = sorted(by.values(), key=lambda g: (-len(g), g[0][1]))
+        if len(removed) <= 6 and names and all(tuple(x) in names for x in removed):  # by the START's ids
+            return ", ".join(names[tuple(x)] for x in removed)
         if len(removed) <= 6:  # a small removal by name
             return ", ".join(group_text(sorted(g, key=lambda x: x[2])) for g in groups)
         txt = ", ".join(f"{group_text([(g[0][0], g[0][1], BLOCK)])} ({len(g)})" for g in groups[:4])  # a large one by site and count
@@ -2633,19 +2731,61 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
             ops = teacher_edits(edits, r)
             if len(ops) < len(r.get("edits") or []):
                 continue  # an answer without an EDIT line for a request is invalid: no target for it
-            content = target(answer, r, task["model"], ops, token_strings(task["model"], prompt["token_ids"]))
+            st = r.get("start")  # a start-relative row (start_rows()): the answer is what goes from its START
+            if st:
+                inside = {tuple(x) for x in st["nodes"]}
+                info |= {"start": len(st["nodes"]), "removed": sum(tuple(x) not in {tuple(y) for y in answer["nodes"]} for x in st["nodes"]),
+                         "outside_start": sum(tuple(x) not in inside for x in answer["nodes"] if x[0] != TOK)}
+                content = start_answer(st, answer["nodes"])
+            else:
+                content = target(answer, r, task["model"], ops, token_strings(task["model"], prompt["token_ids"]))
             if traces:  # the teacher's search as the thinking before the answer (thinking_trace; Qwen3's thinking renderer)
                 pf = teacher_dir / f"{r['task']}.path.json"
                 rec = repicked.get(r["task"])  # a record of an earlier circuit (a rerun replaced it) says nothing about this one
                 rec = rec if rec and rec.get("new_size") == len([x for x in answer["nodes"] if x[0] != TOK]) else None
                 path = {**(json.loads(pf.read_text()) if pf.exists() else {}), "repick": rec}
-                trace = thinking_trace(path, task["model"], prompt["token_ids"], answer)
+                trace = thinking_trace(path, task["model"], prompt["token_ids"], answer,
+                                       names={(m, t, c): k for k, (m, c, t) in zip(st["ids"], st["nodes"])} if st else None)
                 content = f"<think>\n{trace}\n</think>\n\n{content}"
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
                                 "completion": [{"role": "assistant", "content": content}], "info": info}) + "\n")
             f.flush()
             n += 1
     return n
+
+
+def start_rows(ge, rows: Path, out: Path, teacher_dir: Path | None = None, shard: str = "0/1") -> dict:
+    """Start-relative question rows (the lead's 10-13: the oracle says which parts of the influential start can go,
+    which is what the teacher does): each row with its start (GoalEval.start_set on the search split: the teachers'
+    start and the reward's bar) as "start" (start_of(), with m and the positions) and its question rendered with it
+    (question(): ASK_START, the START listing, the candidate pool less the START). teacher_dir: per text whether the
+    teacher's circuit sits inside the start and whether its search began from the same one (path.json's positions and
+    size). shard k/n: every n-th row from the k-th. Returns the counts."""
+    import native
+
+    k, n = map(int, shard.split("/"))
+    stats = {"rows": 0, "teachers": 0, "inside": 0, "same_start": 0}
+    with out.open("w") as f:
+        for r in [json.loads(x) for x in rows.read_text().splitlines() if x.strip()][k::n]:
+            task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+            p = task["prompts"][0]
+            tx = ge.text(p["token_ids"], p["target_positions"], task=task)
+            st = ge.start_set(tx, "search")
+            start = {**start_of(sorted(st["graph"].node_set()), tx.ci), "m": st["m"], "positions": st["positions"]}
+            row = {**r, "start": start}
+            f.write(json.dumps({**row, "question": question(task, row)}) + "\n")
+            f.flush()
+            stats["rows"] += 1
+            js = teacher_dir / f"{r['task']}.json" if teacher_dir else None
+            if js is not None and js.exists():
+                inside = {tuple(x) for x in start["nodes"]}
+                stats["teachers"] += 1
+                stats["inside"] += all(tuple(x) in inside for x in json.loads(js.read_text())["nodes"] if x[0] not in (TOK, "block"))
+                pf = js.with_suffix(".path.json")
+                b = json.loads(pf.read_text()).get("blocks") or {} if pf.exists() else {}
+                stats["same_start"] += b.get("positions") == start["positions"] and b.get("start_units") == len(start["nodes"])
+            print(json.dumps({"task": r["task"], "start": len(start["nodes"]), "m": st["m"]}), flush=True)
+    return stats
 
 
 # ---- locality
@@ -3172,6 +3312,12 @@ def main():
     d.add_argument("--invariants-teach", type=Path, action="append", default=[], help="checked train-only artifact JSON/JSONL; only explicitly invariant-enabled rows receive positive verified labels")
     d.add_argument("--traces", action="store_true", help="each target opens with the teacher's search as thinking (thinking_trace, "
                    "TEACHER/<task>.path.json; train with tinker_train sft --thinking)")
+    sr = sub.add_parser("start-rows", help="start-relative question rows (start_rows()): each row's START and its question")
+    sr.add_argument("rows", type=Path)
+    sr.add_argument("out", type=Path)
+    sr.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json, .path.json): checked against each start")
+    sr.add_argument("--shard", default="0/1", help="k/n: every n-th row from the k-th")
+    sr.add_argument("--device")
     nz = sub.add_parser("noise", help="C's draw noise per answer (c_noise()): a check on goal_eval's eps")
     nz.add_argument("split", choices=("train", "heldout", "hard"))
     nz.add_argument("rows", type=Path)
@@ -3275,6 +3421,9 @@ def main():
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
         return
 
+    if args.cmd == "start-rows":
+        print(json.dumps(start_rows(goal_eval.GoalEval(native.Native(args.device)), args.rows, args.out, args.teacher, args.shard)), flush=True)
+        return
     if args.cmd == "dataset":
         english = {r["task"]: r["explanation"] for r in map(json.loads, args.english.read_text().splitlines())
                    if r.get("explanation")} if args.english else None

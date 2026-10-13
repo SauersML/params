@@ -451,7 +451,8 @@ class Engine:
                     single[k] = (len(single), self.plan(g, semantics, c))
             return self._stack([p for _, p in single.values()], [single[k][0] for k in keys])
         if semantics == "native" and any(g.complete for g in graphs):
-            raise ValueError("native.run's graph runs need stated connections (a complete graph is a masked run: kl)")
+            raise ValueError("native.run's graph runs need stated connections (a complete graph runs as its nodes with every "
+                             "connection among them stated, native.all_edges; as the masked run, kl, only at u in {0, 1})")
         dev, inv = self.dev, {}
 
         def col(n, c):

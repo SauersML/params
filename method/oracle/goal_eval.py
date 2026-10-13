@@ -1879,14 +1879,18 @@ class GoalEval:
 
         every = None if g.complete or not kx else {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kx["at_x"]}
 
-        def lq_rows(ix, given=None, tables=None, held=None):  # log q of rows ix of (ew, ow, off, sets), or of tables' rows (ew,
-            # ow and off for a stated graph, u for a complete one), optionally with given attention rows; "x": held (default:
-            # a deleted node held at x, outside the variant; a complete graph's at u 0)
+        def lq_rows(ix, given=None, tables=None, held=None, kw=None):  # log q of rows ix of (ew, ow, off, sets), or of tables'
+            # rows (ew, ow and off for a stated graph, u for a complete one), optionally with given attention rows; kw, the
+            # family's semantics (_xkw; default the point family's); at x held (default: a deleted node held at x, outside
+            # the variant; a complete graph's at u 0), every position
+            kw = kx if kw is None else kw
             if tables is None:
                 tables = (ew[ix], ow[ix], [off[i] for i in ix]) if not g.complete else urows([sets[i] for i in ix])
             R = next(iter(tables.values())).shape[0] if g.complete else len(tables[0])
-            reuse = (E.tile_states(kept, R), tx.ids, lo) if lo else None
-            hk = dict(kx, held=held if held is not None else every) if kx else {}
+            reuse = (E.tile_states(kept, R), tx.ids, lo) if lo and not kw else None
+            every_ = every if kw is kx else (None if g.complete or not kw else
+                                              {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kw["at_x"]})
+            hk = dict(kw, held=held if held is not None else every_) if kw else {}
             if g.complete:
                 return E.graph_log_probs(plan, tables, rows=given, reuse=reuse, **hk)
             e_, o_, f_ = tables
@@ -2032,9 +2036,18 @@ class GoalEval:
         order = {n: sorted((nd for nd in nodes if nd[0] == n), key=lambda nd, n=n: (nd[1], at[n][nd[2]])) for n in nat.names}
         order = {n: o for n, o in order.items() if o}  # per site its nodes in the plan's entry order
         sidx = {n: torch.tensor([nid[nd] for nd in o], device=dev) for n, o in order.items()}
-        spos = {n: torch.tensor([nd[1] for nd in o], device=dev) for n, o in order.items()}
-        scol = {n: torch.tensor([at[n][nd[2]] for nd in o], device=dev) for n, o in order.items()}
-        svpd = {n: torch.tensor([vat[n][nd[2]] for nd in o], device=dev) for n, o in order.items()}
+        oc, ov, KC, KV = {}, {}, 0, 0  # each site's offset in the flat masks over every site's columns (circuit's, VPD's)
+        for n in nat.names:
+            oc[n], ov[n] = KC, KV
+            KC, KV = KC + len(circ[n]), KV + len(vcols[n])
+        npos = np.array([nd[1] for nd in nodes], dtype=np.int64)
+        FT = torch.as_tensor(npos, device=dev)  # per node its position and its flat columns (circuit's, VPD's)
+        FC = torch.tensor([oc[n] + at[n][c] for n, _, c in nodes], dtype=torch.long, device=dev)
+        FV = torch.tensor([ov[n] + vat[n][c] for n, _, c in nodes], dtype=torch.long, device=dev)
+
+        def views(flat, off, cols):  # a flat mask [R, T, KC or KV] as the engine's {site: [R, T, K]} (views)
+            return {n: flat[..., off[n]:off[n] + len(cols[n])] for n in nat.names}
+        vflat = torch.cat([vbase[n] for n in nat.names], -1)  # [1, T, KV]
         vdel = torch.zeros(K, N, dtype=torch.bool, device=dev)
         for v, sv_ in enumerate(sets):
             if sv_:
@@ -2047,7 +2060,8 @@ class GoalEval:
                 owner.append((v, j))
         R = len(owner)
         res = [[] for _ in range(K)]
-        first = min((nodes[i][1] for d in drops for i in d), default=T)
+        cat = np.concatenate(drops) if drops else np.zeros(0, dtype=np.int64)
+        first = int(npos[cat].min()) if len(cat) else T
         start = min(first, min(tx.targets))  # every run's states before it: the model's, VPD's and the variants'
         step = max(8, min(step, self.LOO_ENTRIES // (T * max(1, sum(len(c) for c in vcols.values())))))  # (VPD's masks)
         for s0 in range(0, R, step):
@@ -2055,15 +2069,14 @@ class GoalEval:
             rr = np.concatenate([np.full(len(drops[k]), r) for r, k in enumerate(rows)])
             cc = np.concatenate([drops[k] for k in rows])
             Dm = torch.zeros(len(rows), N, dtype=torch.bool, device=dev)
-            Dm[torch.as_tensor(rr, device=dev), torch.as_tensor(cc, device=dev)] = True
+            r_, j_ = torch.as_tensor(rr, device=dev), torch.as_tensor(cc, device=dev)
+            Dm[r_, j_] = True
             vs = torch.tensor([owner[k][0] for k in rows], device=dev)
             gone = Dm | vdel[vs]  # the variant's deleted nodes and the draw's
-            mm = {n: torch.ones(len(rows), T, len(circ[n]), device=dev) for n in nat.names}
-            mv = {n: vbase[n].repeat(len(rows), 1, 1) for n in nat.names}
-            for n in order:  # each draw's nodes off: one indexed write per site and engine
-                r_, j_ = Dm[:, sidx[n]].nonzero(as_tuple=True)
-                mm[n][r_, spos[n][j_], scol[n][j_]] = 0.0
-                mv[n][r_, spos[n][j_], svpd[n][j_]] = 0.0
+            mf, vf = torch.ones(len(rows), T, KC, device=dev), vflat.repeat(len(rows), 1, 1)  # each draw's nodes off: one
+            mf[r_, FT[j_], FC[j_]] = 0.0                                                      # indexed write per engine
+            vf[r_, FT[j_], FV[j_]] = 0.0
+            mm, mv = views(mf, oc, circ), views(vf, ov, vcols)
             lm = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
             if kx:  # VPD's answer at x, its draw's nodes at 0
                 lv = Ev.log_probs(mv, **dict(kx, held={n: vbase[n] == 0 for n in kx["at_x"]}))
@@ -2071,19 +2084,17 @@ class GoalEval:
                 lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
             held = None
             if kx:  # the variant's deleted nodes at x, the draw's at 0
-                held = {n: torch.ones(len(rows), T, E.width(n), dtype=torch.bool, device=dev) for n in kx["at_x"]}
-                for n in order:
-                    if n in held:
-                        r_, j_ = Dm[:, sidx[n]].nonzero(as_tuple=True)
-                        held[n][r_, spos[n][j_], scol[n][j_]] = False
+                hf = torch.ones(len(rows), T, KC, dtype=torch.bool, device=dev)
+                hf[r_, FT[j_], FC[j_]] = False
+                held = {n: x for n, x in views(hf, oc, circ).items() if n in kx["at_x"]}
             if flat[0].complete:
-                u = {n: torch.zeros(len(rows), T, E.width(n), device=dev) for n in nat.names}
-                for n in order:
-                    r_, j_ = (~gone[:, sidx[n]]).nonzero(as_tuple=True)
-                    u[n][r_, spos[n][j_], scol[n][j_]] = 1.0
-                lc = lq_rows(None, tables=u, held=None if held is None else {n: h & (u[n] == 0) for n, h in held.items()})
+                uf = torch.zeros(len(rows), T, KC, device=dev)
+                r2, j2 = (~gone).nonzero(as_tuple=True)
+                uf[r2, FT[j2], FC[j2]] = 1.0
+                u = views(uf, oc, circ)
+                lc = lq_rows(None, tables=u, held=None if held is None else {n: h & (u[n] == 0) for n, h in held.items()}, kw=kx)
             else:  # the dropped nodes out of the circuit with their connections, as a deleted node
-                lc = lq_rows(None, tables=(ew.to(dev)[vs], ow.to(dev)[vs], {n: gone[:, sidx[n]] for n in order}), held=held)
+                lc = lq_rows(None, tables=(ew.to(dev)[vs], ow.to(dev)[vs], {n: gone[:, sidx[n]] for n in order}), held=held, kw=kx)
             kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
             w, claim = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()
             for r, k in enumerate(rows):

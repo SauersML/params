@@ -3014,34 +3014,38 @@ def test_phi_variants_multi_deletions(tiny, monkeypatch):
 
 
 def test_phi_variants_under_x_are_the_per_variant_paths(tiny, monkeypatch):
-    """Semantics "x" on phi_variants' one plan (_loo_c and _loo_nodes: every position, a deleted line's nodes held at x
-    outside the variant, a node draw's at 0): each variant's phi, point, wiring, pattern and node family equal the
-    per-variant path's (fidelity's families on each variant under "x"), on a stated graph with stated pairs and on a
-    complete set; and "x" moves them from "c"."""
+    """Semantics "x" and "h" on phi_variants' one plan (_loo_c at the point family's semantics, _loo_nodes at the node
+    family's: at x every position, a deleted line's nodes held at x outside the variant, a node draw's at 0): each
+    variant's phi, point, wiring, pattern and node family equal the per-variant path's (fidelity's families on each
+    variant), on a stated graph with stated pairs and on a complete set; "x" moves the point from "c", "h" the node
+    family alone."""
     nat, ge, tx = tiny
-    gx = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics="x")
-    gx.donor_pools.update(ge.donor_pools)
-    tx2 = gx.text(tx.ids, tx.targets, seed=5)
     every = sorted(native.Graph(masks=tx.vpd).node_set())
-    g = torch.Generator().manual_seed(31)
     pool = tiny_pool(nat, tx.ids)
-    for gr in (_pp_stated(_pp_nodes(every, g, 0.3, blocks=0.0), tx.targets, g, keep=0.8), native.Graph(every[::4], complete=True)):
-        gr = goal_eval.strand(gr, tx.targets, nat.C)
-        lines = gx.loo_lines(tx2, gr)
-        keep = torch.cat([torch.ones(1, len(lines), dtype=torch.bool), torch.rand(4, len(lines), generator=g) > 0.3])
-        base = gx.fidelity(tx2, [gr], pool, mode="reward", split="search", interchange=4, changed=4)[0]
-        fast = gx.phi_variants(tx2, gr, keep, pool, draws=4, base=base, recompute=("nodes",))
-        monkeypatch.setattr(goal_eval.GoalEval, "LOO_FAST", False)
-        slow = gx.phi_variants(tx2, gr, keep, pool, draws=4, base=base, recompute=("nodes",))
-        monkeypatch.setattr(goal_eval.GoalEval, "LOO_FAST", True)
-        for a, b in zip(fast["variants"], slow["variants"]):
-            assert abs(a["phi"] - b["phi"]) < 1e-4, (a["phi"], b["phi"])
-            for k in ("s_point", "s_wiring", "s_pattern", "s_nodes"):
-                x, y = a["row"].get(k), b["row"].get(k)
-                assert (x is None) == (y is None) and (x is None or abs(x - y) < 1e-4), (k, x, y)
-        c = ge.phi_variants(tx, gr, keep, pool, draws=4, base=ge.fidelity(tx, [gr], pool, mode="reward", split="search",
-                                                                          interchange=4, changed=4)[0], recompute=("nodes",))
-        assert any(abs(a["row"]["draws_point"][0][0] - b["row"]["draws_point"][0][0]) > 1e-4 for a, b in zip(fast["variants"], c["variants"]))
+    for sem in ("x", "h"):
+        gx = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics=sem)
+        gx.donor_pools.update(ge.donor_pools)
+        tx2 = gx.text(tx.ids, tx.targets, seed=5)
+        g = torch.Generator().manual_seed(31)
+        for gr in (_pp_stated(_pp_nodes(every, g, 0.3, blocks=0.0), tx.targets, g, keep=0.8), native.Graph(every[::4], complete=True)):
+            gr = goal_eval.strand(gr, tx.targets, nat.C)
+            lines = gx.loo_lines(tx2, gr)
+            keep = torch.cat([torch.ones(1, len(lines), dtype=torch.bool), torch.rand(4, len(lines), generator=g) > 0.3])
+            base = gx.fidelity(tx2, [gr], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+            fast = gx.phi_variants(tx2, gr, keep, pool, draws=4, base=base, recompute=("nodes",))
+            monkeypatch.setattr(goal_eval.GoalEval, "LOO_FAST", False)
+            slow = gx.phi_variants(tx2, gr, keep, pool, draws=4, base=base, recompute=("nodes",))
+            monkeypatch.setattr(goal_eval.GoalEval, "LOO_FAST", True)
+            for a, b in zip(fast["variants"], slow["variants"]):
+                assert abs(a["phi"] - b["phi"]) < 1e-4, (sem, a["phi"], b["phi"])
+                for k in ("s_point", "s_wiring", "s_pattern", "s_nodes"):
+                    x, y = a["row"].get(k), b["row"].get(k)
+                    assert (x is None) == (y is None) and (x is None or abs(x - y) < 1e-4), (sem, k, x, y)
+            c = ge.phi_variants(tx, gr, keep, pool, draws=4, base=ge.fidelity(tx, [gr], pool, mode="reward", split="search",
+                                                                              interchange=4, changed=4)[0], recompute=("nodes",))
+            point = [abs(a["row"]["draws_point"][0][0] - b["row"]["draws_point"][0][0]) for a, b in zip(fast["variants"], c["variants"])]
+            nodes = [abs(a["row"]["draws_nodes"][0][1] - b["row"]["draws_nodes"][0][1]) for a, b in zip(fast["variants"], c["variants"])]
+            assert max(nodes) > 1e-4 and (max(point) > 1e-4 if sem == "x" else max(point) < 1e-6), (sem, point, nodes)
 
 
 def test_one_plan_reuses_the_states_before_the_circuit(tiny, monkeypatch):

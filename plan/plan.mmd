@@ -425,7 +425,7 @@ flowchart BT
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
-  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 44/44;<br/>cond 2: v2.3 teachers barely prune;<br/>6011 passes (C), 3 texts tie or<br/>teacher larger; toys full 20/21 (C),<br/>19/21 (x: one 0.0006 tie)"}}
+  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed controls lose<br/>· cond 1 20/20; cond 2 under n passes on<br/>9003, 6011, 9008 (real prunes); toys full<br/>tier 20/21 (cancel by design)"}}
 
   %% ===================== workstreams =====================
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
@@ -450,7 +450,7 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>14 families + copy, frequency-weighted:<br/>wrong context loses 0.61-0.74, padding 0.76;<br/>equal-bits target actives win 0.85;<br/>partition/parity E4 0.00-0.04 vs identity ~1;<br/>behavior mode (CausalGym): v2.1 teacher holds<br/>the subject 0.85 (plain 0.12), R prefers it 0.86;<br/>interchange_pp still blind · DONE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>RL run 2 reward fb33713: soft pieces,<br/>one family score (raw pool, leaky),<br/>audit fixes, interchange panel; checks:<br/>cond 1 44/44, soft vs hard Spearman 0.96;<br/>semantics x opt-in (s_nodes 0.56 → 0.93)<br/>ACTIVE · inframove"]
+    W4["<b>Reward repair</b><br/>run 2 REWARD_REV 8bd83fb: soft pieces, one<br/>family score, audit fixes, interchange panel,<br/>semantics n (nodes, omitted at x) the only<br/>default; toys = C, cond 2 on 3 texts, no<br/>family collapse · DONE · inframove"]
     W5["<b>What information does a circuit need?</b><br/>x mode consumes a full-model trace;<br/>weight diagnostic gets edited boundaries;<br/>standalone edit prediction unverified<br/>SCOPE AUDIT · codex/eval_recovery"]
     W6["<b>Diagnose fidelity failures</b><br/>retain draws and every family score;<br/>unchanged reward; export checks pass;<br/>separate response error from uncertainty<br/>IMPLEMENTED · codex · 3017b64"]
   end
@@ -659,8 +659,8 @@ flowchart BT
   classDef impact fill:#12233f,stroke:#12233f,stroke-width:2px,color:#ffffff
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
-  class VPD,ENG,PHI,W1,W3,I1,I2,T1,SEM,REM,I4 done
-  class T2,W2,W4,TOY,IBENCH,TOYLOOP,TOYB,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
+  class VPD,ENG,PHI,W1,W3,I1,I2,T1,SEM,REM,I4,W4 done
+  class T2,W2,TOY,IBENCH,TOYLOOP,TOYB,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
   class I5 done
   class T3 done
   class T4 active
@@ -685,7 +685,7 @@ flowchart BT
   class ENGP done
   class S1AUDIT done
   class ENG209 waiting
-  class GATEB blocked
+  class GATEB done
   class S3,ORC,R1,R2,R3,R4,R5 waiting
   class LAT2,UVPD later
   class GATEA,GATEC,GATED gate

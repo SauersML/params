@@ -10,6 +10,8 @@ import importlib.util
 import json
 from pathlib import Path
 import random
+import re
+import math
 import sys
 
 SEEDS = (2300000, 2300001)
@@ -40,6 +42,30 @@ def design(seed, swapped=False, permuted=False):
                 correct=[edge(matching[j], j) for j in range(2)] + outputs,
                 wrong=[edge(1-matching[j], j) for j in range(2)] + outputs,
                 complete=[edge(i,j) for i in range(2) for j in range(2)] + outputs)
+
+def composition_baseline(prompt):
+    """Two-route baseline using only printed positive V-composition facts.
+
+    This bounded-fixture comparator ignores behaviour/output examples and never
+    reads teacher targets, weight files, case IDs or oracle responses.
+    """
+    edges = set()
+    for line in prompt.split('Behaviour:',1)[0].splitlines():
+        reader = re.match(r'^(L\d+H\d+)\b', line)
+        if not reader or ' comp ' not in line:
+            continue
+        for writer, gain in re.findall(r'\bV<(L\d+H\d+):([0-9.eE+\-]+)',line.split(' comp ',1)[1]):
+            gain=float(gain)
+            if not math.isfinite(gain) or gain<=0:
+                raise ValueError('finite positive composition required')
+            a,b=int(writer.split('H')[0][1:]),int(reader[1].split('H')[0][1:])
+            if a>=b:
+                raise ValueError('forward reader relation required')
+            edges.add((writer,reader[1]))
+    if len(edges)!=2 or len({x for x,y in edges})!=2 or len({y for x,y in edges})!=2:
+        raise ValueError('bounded baseline requires two independent visible V routes')
+    all_edges=edges|{(reader,'out') for _,reader in edges}
+    return 'flowchart LR\n'+'\n'.join(f'  {a} --> {b}' for a,b in sorted(all_edges))+'\nEnglish: Each reader receives the earlier writer named by its visible positive V-composition fact.\n'
 
 def load_renderer(path):
     spec = importlib.util.spec_from_file_location('fresh_route_renderer', path)

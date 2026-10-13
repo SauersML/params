@@ -10,6 +10,7 @@ import importlib.util
 import json
 import math
 from pathlib import Path
+import re
 import sys
 import types
 
@@ -67,6 +68,7 @@ def build(source, renderer_path, core_path, out):
             'core_sha256': sha(core_path), 'core_rows':256, 'rows_per_arm':288, 'epochs':2,
             'batch':8, 'updates':72, 'visits':576, 'relation_multiplier':8,
             'augmentation_target':'graph only; original256 prompts/English targets byte-identical',
+            'augmentation_loss_mass':'Both graph-only arms use common per-example mass equal to frozen original256 median supervised-token mass; core relation8 preserves each original mass. Fit records exact mass before any training.',
             'single_control':'one route constructed; retained branch alternates by seed/swap/permutation',
             'single_wrong_control':'same selected heads with bridge absent; complete is identical one legal bridge',
             'evaluation':'new8 frozen before validation; old8 development, original24 and20 core incidental-V negatives retained as separate evaluation strata; no refit or output selection',
@@ -74,6 +76,10 @@ def build(source, renderer_path, core_path, out):
             'scope':'Fresh frozen development comparison, finite bank verification; no universal certificate or new English labels',
             'sources':{str(p):sha(p) for p in [Path(__file__),Path(rt.__file__),renderer_path,source/'experiments/oracle/toys/zoo.py',source/'experiments/oracle/toys/planted.py',source/'experiments/oracle/toyloop/reward_exec.py']}}
     (out/'protocol.json').write_text(json.dumps(plan,indent=2)+'\n')
+    negatives=[r for r in core_rows if not r['id'].startswith('factorial_multihop_') and any(float(g)>0 for g in re.findall(r'V<L\d+H\d+:([0-9.eE+\-]+)',r['prompt']))]
+    if len(negatives)!=20:
+        raise ValueError('expected frozen20 incidental-V training negatives')
+    (out/'incidental_V_train_negatives.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in negatives))
     gold_rows = {'single':[], 'two':[], 'holdout':[]}
     all_checks = []
     (out/'instances').mkdir()

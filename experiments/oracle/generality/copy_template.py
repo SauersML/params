@@ -304,6 +304,54 @@ def predict(draws: int):
         print(f"  {k}: {v['accuracy']:.2f} of {v['n']}")
 
 
+def window(draws: int = 8):
+    """What the copy reads before the copied token: per held-out copy text, the w tokens ending at the earlier
+    occurrence o (positions o - w + 1 .. o, w = 1, 2, 4, 8) replaced by fresh tokens (samples from the model's prediction
+    at each, never the current token), and the same window ending at every earlier occurrence; the share of draws where
+    log p(old prediction) falls by at least 1 nat. -> DATA/copy_window.jsonl"""
+    from types import SimpleNamespace
+
+    import goal_eval
+    import native
+
+    nat = native.Native()
+    ge = goal_eval.GoalEval(nat)
+    out = DATA / "copy_window.jsonl"
+    done = {json.loads(x)["task"] for x in out.read_text().splitlines()} if out.exists() else set()
+    left = int(os.environ.get("MAXTEXTS", 8))
+    for x in json.loads((DATA / "copy_heldout.json").read_text())["copy"]:
+        task = x["task"]
+        if task in done:
+            continue
+        if left <= 0:
+            return
+        left -= 1
+        ids, targets = native.text(Path.home() / "mpd-data/graph_oracle/texts/vpd4l" / f"{task}.json")
+        t = targets[-1]
+        occ = [j for j in range(t) if ids[j] == ids[t]]
+        base = nat.reference([ids], [t])[0, 0]
+        y = int(base.argmax())
+        tx = SimpleNamespace(ids=ids, seed=native.task_seed(task))
+        rng = np.random.default_rng(int(tx.seed))
+        rec = {"task": task, "occurrences": len(occ)}
+        for w in (1, 2, 4, 8):
+            for scope, ends in (("latest", occ[-1:]), ("every", occ)):
+                xs = []
+                for d in range(draws):
+                    x2 = list(ids)
+                    for e in ends:
+                        for p in range(max(1, e - w + 1), e + 1):
+                            cand = [z for z in ge._fresh_sources(tx, p, int(tx.seed) + 31)[:16] if z != ids[t]]
+                            x2[p] = cand[int(rng.integers(len(cand)))] if cand else x2[p]
+                    xs.append(x2)
+                lp = nat.reference(xs, [t])[:, 0]
+                rec[f"{scope}_{w}"] = float(np.mean([float(base[y] - l[y]) >= 1.0 for l in lp]))
+        with out.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(rec, flush=True)
+        native.free(nat.dev)
+
+
 def acc_one(rec: dict) -> dict:
     """One text's prediction checks from its record."""
     one = "one" if rec.get("occurrences", 1) == 1 else "two or more"
@@ -373,7 +421,7 @@ def report():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("write", "score", "predict", "report"))
+    ap.add_argument("cmd", choices=("write", "score", "predict", "window", "report"))
     ap.add_argument("task", nargs="?")
     ap.add_argument("--draws", type=int, default=8)
     args = ap.parse_args()
@@ -383,5 +431,7 @@ if __name__ == "__main__":
         score(args.task)
     elif args.cmd == "predict":
         predict(args.draws)
+    elif args.cmd == "window":
+        window(args.draws)
     else:
         report()

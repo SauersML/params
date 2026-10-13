@@ -395,8 +395,11 @@ def report():
              ("correct", "d_irrelevant_parts"), ("correct", "g_mismatched"), ("correct", "template"),
              ("correct", "ref_vpd_correct_bits"), ("correct", "ref_recency_correct_bits")]
     out = {}
-    for kind in ("copy", "mistake"):
-        texts = [d for k, d in by.items() if k[0] == kind]
+    overlap = set(json.loads((DATA / "falsify_texts.json").read_text())["values"]["overlap"])
+    groups = [("copy", lambda k: k[0] == "copy"), ("mistake", lambda k: k[0] == "mistake"),
+              ("copy, copied token never in discovery", lambda k: k[0] == "copy" and k[1] not in overlap)]
+    for kind, keep in groups:
+        texts = [d for k, d in by.items() if keep(k)]
         if not texts:
             continue
         print(f"== {kind} texts: {len(texts)}; fraction of texts where the first beats the second (ties count half)")

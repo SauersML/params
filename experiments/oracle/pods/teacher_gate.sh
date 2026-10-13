@@ -7,7 +7,7 @@
 # answers from vpd_heldout20.pt) into ~/mpd-data/graph_oracle/teacher/gate/NAME/a or b, both at once. Then one pod scores
 # both sets with goal_eval.py score --diagnostics (VPD's checkpoint put back together on the pod: VPD's own answers, the
 # baselines) and goal_eval.py fidelity on both sets in one run (C, adversary_flips' omitted lever, the guarded scores,
-# VPD's top k at each circuit's size; the search pool goal_eval/ci_patterns_m.pt, the fresh pool for the evaluation-only
+# VPD's top k at each circuit's size; the search pool goal_eval/ci_patterns_train.pt, the fresh pool for the evaluation-only
 # pattern lever goal_eval/ci_patterns_fresh.pt), sharded over FIDP processes beside the score run, and
 # experiments/oracle/teacher_gate.py compares them. The scores come back to
 # ~/mpd-data/runpod/oracle-graph-teacher-gscore-NAME/ (score.json, fid_<k>.jsonl), the comparison to gate.txt.
@@ -38,7 +38,7 @@ for i in "${!sides[@]}"; do
   C=$(git rev-parse --verify "$ref^{commit}") || exit 2
   echo "$side: $script at ${C:0:10} $flags" | tee -a "$G/README.txt"
   SCRIPT=$script RUN=g$NAME$side REF=$C TEACHER_ARGS="$flags" SPLIT=heldout N=$N PODS=$pods P=$procs VRAM=${VRAM:-16} GPU="$GPU" \
-    EXTRA=/Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt \
+    EXTRA=/Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt \
     VPD=/Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt DEST=$G/$side experiments/oracle/pods/teacher_pod.sh 2.0 > "$F/teach_$side.log" 2>&1 &
   dirs+=("$G/$side")
 done
@@ -50,7 +50,7 @@ for i in "${!sides[@]}"; do
 done
 /usr/bin/python3 -I -c "import json, pathlib, sys; d = pathlib.Path('/Users/user/mpd-data/graph_oracle/texts/vpd4l'); f = [p for p in d.glob('*.json') if not p.name.startswith('.')]; print('\n'.join([p.stem for p in sorted(f, key=lambda p: int(p.stem[4:])) if json.loads(p.read_text())['split'] == 'heldout'][:int(sys.argv[1])]))" "$N" > "$F/in/tasks.txt"
 cp /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt "$F/vpd.pt"
-cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt "$F/pool.pt"
+cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt "$F/pool.pt"
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt "$F/fresh.pt"
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" "${sides[@]}" tasks.txt -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 rm -rf "$F/in"

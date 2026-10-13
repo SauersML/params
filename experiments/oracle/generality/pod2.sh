@@ -3,7 +3,7 @@
 # process each, P workers by the card's memory at GB_PER MiB each). The scripts, DATA's inputs, the mechanism templates,
 # the texts and the teacher circuits go up; outputs come back to ~/mpd-data/runpod/$NAME/out/ (the reports read them).
 #   experiments/oracle/generality/pod2.sh HOURS     env: NAME, GPU, PRICE, VRAM, RAM, GB_PER, RAM_PER, REF, TRIES, EXTRA
-# EXTRA: more inputs at their ~/mpd-data paths (falsify.py's CI-pattern pool: goal_eval/ci_patterns_m.pt).
+# EXTRA: more inputs at their ~/mpd-data paths (falsify.py's CI-pattern pool: goal_eval/ci_patterns_train.pt).
 # Workers: one per GB_PER MiB of the card and RAM_PER GiB of the host, whichever is fewer; rp-run stops a run whose GPU
 # stays under 20% for 15 minutes, and one process of these (small model, Python between runs) holds it near 15%.
 # The whole script is one block, so bash has read all of it before it runs.

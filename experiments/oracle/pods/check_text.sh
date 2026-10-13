@@ -29,11 +29,11 @@ N=$(( 10#${TEXT#text} - 9000 + 1 ))
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$RN/mpd-data ~/mpd-data; mkdir -p $O ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
 tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
-ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt > /dev/null;
+ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt > /dev/null;
 cd /Users/user/params/method/oracle; set +e;
 (while :; do cat /sys/fs/cgroup/memory.peak > $O/mem_peak.txt 2> /dev/null; nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >> $O/gpu_mem.txt; sleep 15; done) &
 $TEACH
-python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --only track_pp --out $O/eval.jsonl > $O/eval.log 2>&1; cat $O/eval.jsonl; echo \"host memory peak \$(cat $O/mem_peak.txt) bytes, card memory peak \$(sort -n $O/gpu_mem.txt | tail -1) MiB\""
+python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --only track_pp --out $O/eval.jsonl > $O/eval.log 2>&1; cat $O/eval.jsonl; echo \"host memory peak \$(cat $O/mem_peak.txt) bytes, card memory peak \$(sort -n $O/gpu_mem.txt | tail -1) MiB\""
 for try in $(seq 1 40); do
   RP_REF=$REF RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=${RAM:-48} \
     experiments/infra/runpod/rp-run $RN "${GPU:-NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA RTX A4500,NVIDIA GeForce RTX 4090,NVIDIA RTX A6000,NVIDIA A40}" "${HOURS:-2.0}" -- bash -c "$CMD" > "$F/rp.log" 2>&1 && break

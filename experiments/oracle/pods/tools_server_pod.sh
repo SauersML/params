@@ -27,7 +27,7 @@ V=/Users/user/mpd-data/vpd A=/Users/user/mpd-data/atlas/vpd4l PA='~/mpd-data/atl
 I='~/mpd-data/in'
 rm -rf "$F" && mkdir -p "$F" && cp "$ROWS" "$F/rows.jsonl" || exit 1
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$F/in.tar" -C "$F" rows.jsonl \
-  -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt || exit 1
+  -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_train.pt || exit 1
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "$F/lens.tar" -C /Users/user/mpd-data/atlas/vpd4l lens/jacobians.pt lens/routed.pt || exit 1
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $I ~/mpd-data/graph_oracle $PA; \
 tar -xf $F/in.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $F/lens.tar -C $PA; \

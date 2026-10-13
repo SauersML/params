@@ -20,7 +20,7 @@
 #   (minutes of retries while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all), FROM (a directory
 #   of saved paths, teacher.py --from-path: only texts with a <task>.path.json there are taught, and each pod gets its
 #   texts' path, F1 and top-k files as one tar), EXTRA (more inputs the pod needs at their ~/mpd-data paths, e.g. the
-#   adversary's pool goal_eval/ci_patterns_m.pt for --repair)
+#   adversary's pool goal_eval/ci_patterns_train.pt for --repair)
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params

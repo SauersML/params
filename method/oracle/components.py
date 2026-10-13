@@ -148,7 +148,7 @@ NODE_CAP = 266  # reward v3's hard cap on an answer's nodes (an answer above it 
 GATE_SLOPE = 10.0  # reward v3's gate g = 1 / (1 + 2^(-10 (phi - phi_tau))): 0.001 one bit short of the bar, 0.15 a quarter
 # bit short. At 4 (the first setting), v1 answers 1.3 bits short kept g = 0.03, and g x 0.5 compact (compact up to ~16
 # bits) gave them 0.10-0.13, more than the phi gaps between them: 3-node RL answers tied 42-node SFT ones (10-12)
-POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # C's flip adversary's pattern pool (goal_eval.fidelity)
+POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt"  # C's flip adversary's pattern pool (goal_eval.fidelity)
 CONVENTION = "live"  # goal_eval's remainders convention for the reward's F1 and N: on, computing on the run's inputs
 EVIDENCE_PER_POSITION = 12  # VPD's top active subcomponents listed per position (the target's: twice as many)
 WIRING_PER_POSITION = 6  # connectome pairs listed per position

@@ -29,7 +29,7 @@ rm -rf "$F" && mkdir -p "$F" && cp "$ROWS" "$F/rows.jsonl" || exit 1
 EP=""
 if [ -n "${EPISODES:-}" ]; then cp "$EPISODES" "$F/episodes.jsonl" || exit 1; EP=episodes.jsonl; fi
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$F/in.tar" -C "$F" rows.jsonl $EP \
-  -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt || exit 1
+  -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_train.pt || exit 1
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "$F/lens.tar" -C /Users/user/mpd-data/atlas/vpd4l lens/jacobians.pt lens/routed.pt || exit 1
 SLICES=$(/usr/bin/python3 -I - "$TASKS" "$W" <<'EOF'
 import sys

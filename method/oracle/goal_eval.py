@@ -4286,8 +4286,8 @@ def main():
                    "kind \"start\": its families, per-draw records and size bits beside the sets' (phi's start, compact's bits_start), "
                    "and the recency baseline, kind \"recency\" (VPD's actives at the targets and as many positions just before them)")
     q = sub.add_parser("patterns", help="the adversary's pattern pool from a range of held-out texts")
-    q.add_argument("--first", type=int, required=True, help="first text number, e.g. 9100")
-    q.add_argument("--last", type=int, required=True, help="last text number, e.g. 9149")
+    q.add_argument("--first", type=int, required=True, help="first text number, e.g. 7950 (training texts: 9100-9149 are sealed)")
+    q.add_argument("--last", type=int, required=True, help="last text number, e.g. 7999")
     q.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     if args.cmd == "fidelity":

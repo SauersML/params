@@ -23,7 +23,7 @@ for spec in "$@"; do
   echo "$name: $(find "$F/in/$name" -name 'text*.json' | wc -l | tr -d ' ') circuits from $dir"
   SETS="$SETS --set $name=\$HOME/fid_in/$name"
 done
-cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt "$F/pool.pt"
+cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt "$F/pool.pt"
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt "$F/fresh.pt"
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" . -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 rm -rf "$F/in"

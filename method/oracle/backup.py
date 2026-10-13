@@ -680,7 +680,7 @@ def evaluate(split: str, n: int, src: Path, out: Path, sets=("fwd", "back", "b1"
     skipped."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
-    pool = torch.load(Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt")
+    pool = torch.load(Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt")
     ge._edge_family = lambda tx, graphs, draws, reads=False: [{"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None}
                                                               for _ in graphs]
     f_out = out / "fidelity.jsonl"

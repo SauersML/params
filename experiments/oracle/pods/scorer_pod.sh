@@ -25,7 +25,7 @@ rm -rf "$IN" "$IN.tar" && mkdir -p "$IN" && cp "$ROWS" "$IN/rows.jsonl"
 TEACH=""  # TEACHER: the texts' teacher circuits, reward v3's teacher-dominance reference
 if [ -n "${TEACHER:-}" ]; then mkdir -p "$IN/teacher" && cp "$TEACHER"/text*.json "$IN/teacher/" && TEACH=teacher; fi
 # Exclude sealed text IDs before tar opens their contents (9100 through 9149).
-COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$IN.tar" -C "$IN" rows.jsonl $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_m.pt && rm -rf "$IN"
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$IN.tar" -C "$IN" rows.jsonl $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_train.pt && rm -rf "$IN"
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN.tar; a Mac path here would be uploaded file by file)
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \

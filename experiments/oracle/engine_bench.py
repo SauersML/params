@@ -42,7 +42,7 @@ import native  # noqa: E402
 DATA = Path.home() / "mpd-data/graph_oracle/teacher"
 SAVED = DATA / "vpd_heldout20.pt"
 CIRCUIT = DATA / "dev_engine_edges/text9002.json"
-POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # components.POOL
+POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt"  # components.POOL
 CASES = ("pp_run", "pp_nodesets", "pp_lines", "point", "track_pp", "interchange_pp", "line_loo")
 
 

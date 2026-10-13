@@ -51,7 +51,7 @@ sys.path.insert(0, os.environ.get("ORACLE") or str(HERE.parents[2] / "method" / 
 
 DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/generality"))  # inputs and outputs
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts/vpd4l"
-POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
+POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt"
 MISTAKES = 20
 SCAN = 2000  # train texts scanned for the mistakes slice (in order, until MISTAKES are found)
 L = lambda layer, kind: f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"  # noqa: E731

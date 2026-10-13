@@ -136,7 +136,7 @@ KL_FLOOR = 1e-9       # a KL's floor before a fractional power (goal_eval.recove
 def kl_budget(empty: float, kl: float, f: float = RECOVERED) -> float:
     """The KL at log-scale recovery f between empty and kl, KL_empty^(1 - f) KL^f, both floored at KL_FLOOR."""
     return max(empty, KL_FLOOR) ** (1 - f) * max(kl, KL_FLOOR) ** f
-POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"  # the shared adversary's pool (search side)
+POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt"  # the shared adversary's pool (search side)
 
 
 class Descent:

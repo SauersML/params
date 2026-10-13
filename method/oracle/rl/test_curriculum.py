@@ -55,3 +55,24 @@ def test_the_run_stops_on_a_scorer_outside_its_frozen_reward():
     assert "source" in tt.scorer_mismatch([{"semantics": "n", "source": None}], "n", "fb33713")
     assert tt.scorer_mismatch(ok, "n", "fb33713abc" + "0" * 30) is None  # a full revision against the pod's short one
     assert "source" in tt.scorer_mismatch(ok, "n", "fb33714")
+
+
+def test_environments_load_mix_by_weight_and_scale_by_their_own_spread(tmp_path):
+    import random
+    from types import SimpleNamespace
+
+    (tmp_path / "c.jsonl").write_text("".join(json.dumps({"task": f"t{i}", "question": "q"}) + "\n" for i in range(10)))
+    (tmp_path / "e.jsonl").write_text("".join(json.dumps({"id": f"pref:{i}", "question": "q"}) + "\n" for i in range(10)))
+    (tmp_path / "envs.json").write_text(json.dumps({"edits": {"rows": str(tmp_path / "e.jsonl"), "scorer": "http://x:8766/score",
+                                                              "extra": {"part": "score"}, "weight": 1.0}}))
+    a = SimpleNamespace(questions=tmp_path / "c.jsonl", scorer="http://x:8767/score", request_extra=None, env_name="circuit",
+                        env_weight=3.0, expect_semantics="n", expect_source="d210d58", envs=str(tmp_path / "envs.json"))
+    envs = tt.load_envs(a)
+    assert envs["edits"]["questions"][0]["task"] == "pref:0" and envs["edits"]["extra"] == {"part": "score"}
+    assert envs["edits"]["expect_semantics"] is None and envs["circuit"]["expect_semantics"] == "n"
+    got = tt.draw(envs, 4, random.Random(0))
+    assert sorted(q["_env"] for q in got) == ["circuit", "circuit", "circuit", "edits"]  # 3:1 by weight
+    one = {"circuit": envs["circuit"]}
+    assert tt.draw(one, 4, random.Random(0)) == random.Random(0).sample(envs["circuit"]["questions"], 4)  # as before envs
+    s = tt.env_scales([("circuit", [1.0, -1.0]), ("edits", [0.1, -0.1]), ("flat", [0.0, 0.0])])
+    assert s["circuit"] == pytest.approx(1.0) and s["edits"] == pytest.approx(10.0) and s["flat"] == 1.0

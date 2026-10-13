@@ -540,6 +540,55 @@ def score(a) -> None:
     print(json.dumps({"rows": len(rows), "total_usd": spend.total}), flush=True)
 
 
+ENV_SPREAD_FLOOR = 1e-3  # env_scales: an environment whose centred rewards all but agree this step keeps scale 1
+
+
+def load_envs(a) -> dict:
+    """The environments an rl run samples from, name -> {"rows": question rows (each with "task", or "id", and "question"),
+    "scorer": URL[,URL...], "extra": fields added to every scoring request (e.g. edits' {"part": "score"}), "weight",
+    "expect_semantics", "expect_source"}: the positional questions with --scorer, --request-extra and --expect-* as
+    --env-name, and every environment of --envs (a JSON file of the same fields, rows a path) beside it."""
+    main = {"rows": a.questions, "scorer": a.scorer, "extra": json.loads(a.request_extra) if a.request_extra else {},
+            "weight": a.env_weight, "expect_semantics": a.expect_semantics, "expect_source": a.expect_source}
+    envs = {a.env_name: main} | ({k: {"extra": {}, "weight": 1.0, "expect_semantics": None, "expect_source": None, **v}
+                                  for k, v in json.loads(Path(a.envs).read_text()).items()} if a.envs else {})
+    for name, env in envs.items():
+        rows = [json.loads(x) for x in Path(env["rows"]).read_text().splitlines() if x.strip()]
+        env["questions"] = [{**q, "task": q.get("task") or q["id"], "_env": name} for q in rows]
+    return envs
+
+
+def draw(envs: dict, n: int, rng) -> list:
+    """A step's n questions: with one environment rng.sample of its questions (as before environments); with several,
+    each environment's share of n by weight (largest remainders, at least one each with weight above 0), sampled
+    without replacement within it."""
+    if len(envs) == 1:
+        qs = next(iter(envs.values()))["questions"]
+        return rng.sample(qs, min(n, len(qs)))
+    live = {k: e for k, e in envs.items() if e["weight"] > 0}
+    total = sum(e["weight"] for e in live.values())
+    want = {k: max(1, int(n * e["weight"] / total)) for k, e in live.items()}
+    for k in sorted(live, key=lambda k: -(n * live[k]["weight"] / total % 1)):
+        if sum(want.values()) >= n:
+            break
+        want[k] += 1
+    return [q for k, e in live.items() for q in rng.sample(e["questions"], min(want[k], len(e["questions"])))]
+
+
+def env_scales(centred: list) -> dict:
+    """Per environment, 1 / the spread (population standard deviation) of its groups' centred rewards this step, so each
+    environment's advantages are on one scale however its reward is measured (the spec's multi-objective mix). centred:
+    [(environment, [reward - its group's mean, ...]), ...]."""
+    by = {}
+    for e, xs in centred:
+        by.setdefault(e, []).extend(xs)
+    out = {}
+    for e, xs in by.items():
+        sd = (sum(x * x for x in xs) / len(xs)) ** 0.5 if xs else 0.0
+        out[e] = 1.0 / sd if sd > ENV_SPREAD_FLOOR else 1.0
+    return out
+
+
 def rl(a) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
@@ -550,7 +599,7 @@ def rl(a) -> None:
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.log, a.base)
     tinker, service, training, renderer, tokenizer = clients(a.base, a.rank, a.init, a.thinking, optimizer=a.first_step > 0)
-    questions = [json.loads(x) for x in a.questions.read_text().splitlines() if x.strip()]
+    envs = load_envs(a)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import components
 
@@ -563,7 +612,7 @@ def rl(a) -> None:
 
     def submit(sampler):
         batch = []
-        for q in rng.sample(questions, min(a.texts, len(questions))):
+        for q in draw(envs, a.texts, rng):
             prompt = renderer.build_generation_prompt([{"role": "user", "content": q["question"]}])
             batch.append((q, prompt, sampler.sample(prompt=prompt, num_samples=a.group, sampling_params=fitting(tinker, params, prompt, a.max_tokens))))
         return batch
@@ -578,19 +627,21 @@ def rl(a) -> None:
     else:  # dollars go on from the resumed checkpoint's
         spend.total = next(r["usd"] for r in map(json.loads, (a.log / "checkpoints.jsonl").read_text().splitlines())
                            if r["step"] == a.first_step)
-    free = queue.Queue()  # the scorers without a request in flight: a step's groups go to the first free one
-    for url in a.scorer.split(","):
-        free.put(url)
-    scoring = ThreadPoolExecutor(free.qsize())
+    free = {}  # per environment, the scorers without a request in flight: a step's groups go to the first free one
+    for name, env in envs.items():
+        free[name] = queue.Queue()
+        for url in env["scorer"].split(","):
+            free[name].put(url)
+    scoring = ThreadPoolExecutor(sum(f.qsize() for f in free.values()))
 
-    def post(req):  # a group's scores and its request's seconds
-        url = free.get()
+    def post(name, req):  # a group's scores and its request's seconds, from one of its environment's scorers
+        url = free[name].get()
         try:
             t1 = time.time()
             r = httpx.post(url, json=req, timeout=None)
             return r, time.time() - t1
         finally:
-            free.put(url)
+            free[name].put(url)
 
     failed = 0
     sf = a.log / "stage.json"  # the curriculum's stage and the step it began, kept across resumes
@@ -603,7 +654,7 @@ def rl(a) -> None:
             stage, since = s2, step
             print(json.dumps({"step": step, "stage": stage, "terms": STAGES[stage]}), flush=True)
         sf.write_text(json.dumps({"stage": stage, "since": since}))
-        datums, groups, posted = [], [], []
+        datums, groups, posted, scored_groups = [], [], [], []
         for q, prompt, fut in pending:
             res = fut.result()
             n = prompt.length
@@ -612,13 +663,14 @@ def rl(a) -> None:
             spend.add("sample", prefill=n - hits, cached=hits + (a.group - 1) * n, sampled=sampled)
             texts, thinks = zip(*(answer_of(renderer, tokenizer, s.tokens) for s in res.sequences))
             texts = list(texts)
+            env = envs[q["_env"]]
             req = {"task": q["task"], "answers": texts, "lines": not a.no_lines,  # tokens after the thinking: past the
-                   "tokens": [len(s.tokens) - th for s, th in zip(res.sequences, thinks)]}  # answer cap, charged per token
+                   "tokens": [len(s.tokens) - th for s, th in zip(res.sequences, thinks)], **env["extra"]}  # answer cap
             if frozen is not None:
                 if q["task"] not in tasks:
                     tasks[q["task"]] = json.loads((a.texts_dir / f"{q['task']}.json").read_text())
                 req["e1"] = components.e1_bits(frozen, tasks[q["task"]], q, texts)
-            posted.append((q, prompt, res, texts, thinks, req, scoring.submit(post, req)))
+            posted.append((q, prompt, res, texts, thinks, req, scoring.submit(post, q["_env"], req)))
         t_score = time.time()
         if step + 1 < a.steps:  # the next step's samples while this one is scored and trained: from the same sampler as
             pending = submit(sampler)  # when submitted after the update was sent (one step behind)
@@ -633,7 +685,7 @@ def rl(a) -> None:
                     raise SystemExit(f"the scorer failed {failed} times (requests in {a.log}/failed_*.json)")
                 continue
             scores = r.json()["scores"]
-            if why := scorer_mismatch(scores, a.expect_semantics, a.expect_source):
+            if why := scorer_mismatch(scores, envs[q["_env"]]["expect_semantics"], envs[q["_env"]]["expect_source"]):
                 raise SystemExit(f"step {step}, {q['task']}: {why}")
             rewards = [stage_reward(s, stage) for s in scores]
             if bad := reward_mismatches(q, scores, rewards):
@@ -644,7 +696,7 @@ def rl(a) -> None:
             distinct = len({tuple(s.tokens) for s in res.sequences})
             if step == 0 and distinct == 1 and a.group > 1:  # a seeded or degenerate sampler: no advantage, nothing learned
                 raise SystemExit(f"all {a.group} answers to {q['task']} are identical: check the sampling parameters")
-            groups.append({"task": q["task"], "distinct": distinct, "rewards": rewards, "R": [s["reward"] for s in scores],
+            groups.append({"task": q["task"], "env": q["_env"], "distinct": distinct, "rewards": rewards, "R": [s["reward"] for s in scores],
                            "valid": [s["valid"] for s in scores],
                            "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "tokens", "overflow")} for s in scores],
                            "texts": texts, "thinking_tokens": list(thinks), "stop": [str(s.stop_reason) for s in res.sequences],
@@ -652,8 +704,13 @@ def rl(a) -> None:
                            "terms": {k: [s.get(k) if k in s else s.get("term_" + k) for s in scores]  # the scorer's names
                                      for k in ("phi", "phi_tau", "g", "compact", "bits", "D", "Q", "E2g", "E4x", "E1", "C", "N",
                                                "E2", "E3", "E4")}})
+            scored_groups.append((q["_env"], prompt, res, texts, scores, rewards, mean))
+        scale = env_scales([(e, [r - m for r in rw]) for e, _, _, _, _, rw, m in scored_groups]) if len(envs) > 1 else {}
+        for e, prompt, res, texts, scores, rewards, mean in scored_groups:  # each group centred on its own mean; with
+            n = prompt.length  # several environments, scaled by its environment's spread this step (env_scales)
             for s, rew, sc, text in zip(res.sequences, rewards, scores, texts):
-                adv = line_advantages(tokenizer, list(s.tokens), text, stage_lines(text, sc.get("lines") or [], stage), rew - mean)
+                adv = line_advantages(tokenizer, list(s.tokens), text, stage_lines(text, sc.get("lines") or [], stage),
+                                      (rew - mean) * scale.get(e, 1.0))
                 if not any(adv):
                     continue
                 ob = n - 1
@@ -678,6 +735,9 @@ def rl(a) -> None:
         flat = [x for g in groups for x in g["rewards"]] or [float("nan")]
         line = json.dumps({"step": step, "stage": stage, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
                            "distinct": [g["distinct"] for g in groups],
+                           **({"env_reward": {e: sum(x for g in groups if g["env"] == e for x in g["rewards"]) /
+                                                  max(sum(len(g["rewards"]) for g in groups if g["env"] == e), 1) for e in envs}}
+                              if len(envs) > 1 else {}),
                            "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],
                            "thinking_tokens": [t for g in groups for t in g["thinking_tokens"]],
                            "score_seconds": sum(g["score_seconds"] for g in groups), "score_wall": score_wall, "total_usd": spend.total + (rspend.total if rspend else 0.0),
@@ -730,6 +790,13 @@ def main():
                    "scorer or added to the advantages (the first RL run, the audit 10-13)")
     r.add_argument("--curriculum", action="store_true", help="advance a stage when the held-out evaluations (rl_heldout.sh "
                    "beside the run) stop improving on its terms (PLATEAU checkpoints)")
+    r.add_argument("--request-extra", help="JSON fields added to every scoring request of the positional questions' environment "
+                   "(an environment's own server shape, e.g. edits' '{\"part\": \"score\"}')")
+    r.add_argument("--env-name", default="main", help="the positional questions' environment name (logs, --envs mixes)")
+    r.add_argument("--env-weight", type=float, default=1.0, help="its share of a step's texts when --envs adds others")
+    r.add_argument("--envs", help="JSON file: more environments, name -> {rows, scorer, extra, weight, expect_semantics, "
+                   "expect_source}; one policy, each step's texts drawn from every environment by weight, advantages centred "
+                   "per group and scaled per environment (env_scales)")
     r.add_argument("--temperature", type=float, default=1.0, help="the policy's sampling temperature (raise it when a group's "
                    "answers stop differing: identical answers carry no advantage)")
     r.add_argument("--expect-semantics", help="stop unless every score comes from a scorer in this semantics (goal_eval.SEMANTICS)")

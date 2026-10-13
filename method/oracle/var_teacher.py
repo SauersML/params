@@ -36,14 +36,16 @@ chosen by the search term (those at GOAL first, single positions before pairs, e
 inside the carrier): carriers disjoint (a block holds every subcomponent of its site and position), so the
 variables' interventions commute, and variables carried at their own inputs with no input position in two.
 
-Per variable: "kept", "kind" (input or intermediate), "carrier" (block or family), "carried_at" (the carrier's
-positions), "group" (blocks ["block", site, position] or the family's subcomponents [site, index, position]), "instances" (VPD's active subcomponents on the text inside the carrier) and
+Per variable: "kept", "kind" (input or intermediate), "value_kind" (kept: "computed" when its own value class holds
+tokens other than the text's, an abstraction; "copies its inputs" when it holds the text's token alone: the
+decomposition check), "carrier" (block or family), "carried_at" (the carrier's positions), "group" (blocks ["block", site, position] or the family's subcomponents [site, index, position]), "instances" (VPD's active subcomponents on the text inside the carrier) and
 "instances_share" (the share of the text and its alternatives on which each is active: the core near 1), "circuit_nodes"
 (the circuit's nodes inside the carrier), "m" (their removal effect, goal_eval.line_effects in pp mode), "values" (the
 value map per input position, class 0 the text's own: var_classes.classes, kept variables), "feeds" (measured: each
 ordered pair of kept variables takes the claim, feeds or apart, its feeds test favours; a variable feeding no other
 feeds the prediction), "feeds_stated" (the circuit's stated paths through unnamed nodes), "measured" (the search and
-eval terms, the carriers compared). Per text, "teacher": the kept variables scored together (composition and feeds) on
+eval terms with RAVEL's Cause (f on-target), Iso (the off-target draws that can reach the carrier: changes before it)
+and Disentangle (their mean), the carriers compared). Per text, "teacher": the kept variables scored together (composition and feeds) on
 both splits, "m_share" (the share of the circuit's removal effect inside kept carriers) and "e4x" (reward v3's sum of
 (2 e4_v - 1) m_v / sum m over the kept variables, e4_v the eval term). Names V1, V2, ... in input order, meanings
 empty for the writer. Output ~/mpd-data/graph_oracle/variables/<split>/<task>.json.
@@ -442,8 +444,17 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
     # EVAL_KEEP (the lead's rule: a check on draws the choice never saw)
     for v, r in zip(out["variables"], chosen):
         for split in ("search", "eval"):
-            x = together(variables.Scorer(ge), tx, variables.parse([v], nat.C), split, draws)["variables"][0]
-            v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"]}
+            got = together(variables.Scorer(ge), tx, variables.parse([v], nat.C), split, draws)
+            x = got["variables"][0]
+            # RAVEL's names: Cause, the carrier moves the prediction as its inputs do (f on-target); Iso, off-target draws
+            # that can reach the carrier (a change before it: one after it passes by construction, the model is causal)
+            # leave the prediction; Disentangle their mean
+            reach = [d for d in got["draws"] if d["kind"] == "off" and d["s"] is not None and d["changes"][0][0] < min(r["at"])]
+            w = sum(d["d0"] for d in reach)
+            iso = sum(d["d0"] * d["s"] for d in reach) / w if w > 0 else None
+            v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"], "cause": x["f_on"], "iso": iso,
+                                    "iso_draws": len(reach), "off_draws": x["draws_off"],
+                                    "disentangle": None if x["f_on"] is None or iso is None else (x["f_on"] + iso) / 2}
         tv = as_json("trivial", r["inputs"], r["trivial"]["group"])
         x = together(variables.Scorer(ge), tx, variables.parse([tv], nat.C), "eval", draws)["variables"][0]
         v["measured"]["trivial_eval"] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"], "size": r["trivial"]["size"]}
@@ -464,8 +475,13 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
                 c = var_classes.classes(sc, tx, pv, q, task["model"])
                 v["values"].append({"position": q, "token": c["token"], "predicts": c["predicts"], "classes": c["values"]})
                 release(nat.dev)
+            # the decomposition check (Geiger, Wu et al. 2023): a variable whose own class holds other tokens keeps its
+            # value under them (computed, an abstraction); one whose own class is the text's token alone moves with every
+            # token change (it copies its inputs' identities)
+            v["value_kind"] = "computed" if any(len(vm["classes"][0]["token_ids"]) > 1 for vm in v["values"]) else "copies its inputs"
     out["teacher"].update(kept=len(kv), target=bool(kv), kinds={k: sum(v["kept"] and v["kind"] == k for v in out["variables"])
-                                                               for k in ("input", "intermediate")})
+                                                               for k in ("input", "intermediate")},
+                          value_kinds={k: sum(v.get("value_kind") == k for v in kv) for k in ("computed", "copies its inputs")})
     if M > 0:
         out["teacher"]["m_share"] = sum(v["m"] for v in kv) / M
         out["teacher"]["e4x"] = sum((2 * v["measured"]["eval"]["term"] - 1) * v["m"] for v in kv) / M

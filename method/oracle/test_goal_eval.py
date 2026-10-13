@@ -2731,3 +2731,28 @@ def test_removed_kl_engine_equals_masked_run(tiny):
     for a, b in zip(got, want):
         assert abs(a - b) < 1e-5 + 1e-5 * b, (a, b)
     assert got[-1] < 1e-6 and max(got[:-1]) > 1e-3
+
+
+def test_phi_variants_multi_deletions(tiny, monkeypatch):
+    """phi_variants (teacher acceptance's candidate removals): variants deleting several lines at once give the
+    per-variant path's phi on the one-plan path (stated graph and complete set, node subsets from keep_of among them),
+    and the variant keeping every line the answer's own phi."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    g = torch.Generator().manual_seed(31)
+    pool = tiny_pool(nat, tx.ids)
+    for gr in (_pp_stated(_pp_nodes(every, g, 0.3, blocks=0.0), tx.targets, g, keep=0.8), native.Graph(every[::4], complete=True)):
+        gr = goal_eval.strand(gr, tx.targets, nat.C)
+        lines = ge.loo_lines(tx, gr)
+        nodes = [x for kind, x in lines if kind == "node"]
+        keep = torch.rand(3, len(lines), generator=g) > 0.3
+        keep = torch.cat([torch.ones(1, len(lines), dtype=torch.bool), keep, ge.keep_of(tx, gr, [nodes[: len(nodes) // 2], nodes[1::2]])])
+        base = ge.fidelity(tx, [gr], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+        fast = ge.phi_variants(tx, gr, keep, pool, draws=4, base=base)
+        monkeypatch.setattr(goal_eval.GoalEval, "LOO_FAST", False)
+        slow = ge.phi_variants(tx, gr, keep, pool, draws=4, base=base)
+        monkeypatch.setattr(goal_eval.GoalEval, "LOO_FAST", True)
+        assert len(fast["variants"]) == len(keep)
+        for a, b in zip(fast["variants"], slow["variants"]):
+            assert abs(a["phi"] - b["phi"]) < 1e-4 and a["bits"] == b["bits"], (a["phi"], b["phi"])
+        assert abs(fast["variants"][0]["phi"] - fast["phi"]) < 1e-4, (fast["variants"][0]["phi"], fast["phi"])

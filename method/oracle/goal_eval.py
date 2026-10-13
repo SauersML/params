@@ -1224,54 +1224,91 @@ class GoalEval:
                  bits_start: float | None = None, base: dict | None = None) -> dict:
         """Each line's leave-one-out effect on the reward's phi and compact (the lead's reward v3, approved 10-12): the
         answer with that one line deleted (a node with its connections, token edges and pairs; a stated connection;
-        a stated token edge), nothing else re-stranded. Recomputed per deletion: point (s_point_c, sufficiency on every
-        deletion at once), track_pp, interchange_pp and pattern, on split's draws, and N (necessity_spec, per node
-        deletion: the other lines leave the node set as it is; on NEC_CONTROLS_LOO controls, the answer's own N recomputed
-        on them so a deletion's change compares like with like); held at the full answer's
-        values (its reward-mode row, base when given): LOO_HELD (nodes, edges, flips, donors near and far, the costly
-        families), so a line's effect on them is 0. phi per deletion from the answer's row with the recomputed terms
-        and their draws (eps re-bootstrapped); compact = log2(bits_start / bits) when bits_start is given. Returns
-        {"phi", "bits", "held", "lines": [{"line", "kind", "phi", "delta_phi", "bits", "delta_bits", "compact"}]}:
-        delta_phi = the answer's phi less the deletion's (above 0: the line helps)."""
-        nat, T = self.nat, tx.T
+        a stated token edge), nothing else re-stranded: phi_variants with one deletion a row. compact = log2(bits_start
+        / bits) when bits_start is given. Returns {"phi", "bits", "held", "lines": [{"line", "kind", "phi", "delta_phi",
+        "bits", "delta_bits", "compact"}]}: delta_phi = the answer's phi less the deletion's (above 0: the line helps)."""
+        lines = self.loo_lines(tx, graph)
+        got = self.phi_variants(tx, graph, ~torch.eye(len(lines), dtype=torch.bool), pool, split, draws, base)
+        ph, bits = got["phi"], got["bits"]
+        out = [{"line": [list(x)] if kind == "node" else [list(y) if isinstance(y, tuple) else y for y in x], "kind": kind,
+                "phi": v["phi"], "delta_phi": None if None in (ph, v["phi"]) else ph - v["phi"], "bits": v["bits"],
+                "delta_bits": bits - v["bits"], "compact": compact(v["bits"], bits_start) if bits_start else None}
+               for (kind, x), v in zip(lines, got["variants"])]
+        return {"phi": ph, "bits": bits, "compact": compact(bits, bits_start) if bits_start else None,
+                "held": list(self.LOO_HELD), "lines": out}
+
+    def loo_lines(self, tx: Text, graph: native.Graph) -> list:
+        """The lines of an answer (stranded on the text) that line_loo and phi_variants delete: ("node", node) per node,
+        then a stated graph's ("edge", (writer, reader or None)) per connection and ("token", (t, reader or None)) per
+        token edge."""
+        g = strand(graph, tx.targets, self.nat.C)
+        lines = [("node", nd) for nd in sorted(g.node_set())]
+        if not g.complete:
+            lines += [("edge", e) for e in _pairs(g)]
+            lines += [("token", e) for e in sorted(getattr(g, "tok_edges", []))] + [("token", (t, None)) for t in getattr(g, "tok_out", [])]
+        return lines
+
+    def keep_of(self, tx: Text, graph: native.Graph, subsets: list) -> torch.Tensor:
+        """phi_variants' keep [K, L] for node subsets of an answer: per subset its nodes kept, every other node deleted
+        (with its connections and token edges)."""
+        lines = self.loo_lines(tx, graph)
+        return torch.tensor([[kind != "node" or x in set(s) for kind, x in lines] for s in subsets], dtype=torch.bool)
+
+    def phi_variants(self, tx: Text, graph: native.Graph, keep: torch.Tensor, pool: dict | None, split: str = "search",
+                     draws: int = 8, base: dict | None = None, start=None) -> dict:
+        """phi of variants of an answer (teacher acceptance's candidate removals, line_loo's deletions): keep [K, L] over
+        loo_lines(tx, graph), per row the lines kept, the others deleted (a node with its connections, token edges and
+        pairs; a stated connection; a stated token edge), nothing else re-stranded. Recomputed per variant: point
+        (s_point_c), track_pp, interchange_pp and pattern, on split's draws, and N (necessity_spec per distinct node
+        set, on NEC_CONTROLS_LOO controls, the answer's own N recomputed on them so variants compare like with like);
+        held at the full answer's values (its reward-mode row, base when given): LOO_HELD (nodes, edges, flips,
+        patching near and far, the costly families). Every variant's runs at once: one C plan of the answer (_loo_c)
+        for a graph without blocks, one path-patched call per family (lines=). phi per variant from the answer's row with
+        the recomputed terms and their draws (eps re-bootstrapped), against start (phi's start: the start set's row or
+        its phi_tau). Returns {"phi", "phi_tau", "bits", "variants": [{"phi", "phi_tau", "bits", "row"}]}: the answer's
+        own (with N on the same controls) and each variant's."""
+        nat = self.nat
         g = strand(graph, tx.targets, nat.C)
         if base is None:
             base = self.fidelity(tx, [g], pool, mode="reward", split=split, interchange=draws, changed=draws)[0]
         P, S = nat.positions(tx.targets), sum(nat.C.values())
         nodes = sorted(g.node_set())
-        lines = [("node", nd) for nd in nodes]
-        if not g.complete:
-            lines += [("edge", e) for e in _pairs(g)]
-            lines += [("token", e) for e in sorted(getattr(g, "tok_edges", []))] + [("token", (t, None)) for t in getattr(g, "tok_out", [])]
+        lines = self.loo_lines(tx, graph)
+        keep = torch.as_tensor(keep, dtype=torch.bool).cpu()
+        if keep.dim() != 2 or keep.shape[1] != len(lines):
+            raise ValueError(f"keep is [variants, {len(lines)}] over loo_lines")
+        K = keep.shape[0]
+        gone = [[lines[j] for j in (~keep[i]).nonzero().flatten().tolist()] for i in range(K)]
 
-        def keep(h):
+        def kept(h):
             h.stranded, h.stranded_bits = [], 0.0
             for name in ("tok_edges", "tok_positions", "tok_out", "pairs"):
                 if hasattr(g, name) and not hasattr(h, name):
                     setattr(h, name, getattr(g, name))
             return h
 
-        def without(kind, x):
-            if kind == "node":
-                if g.complete:
-                    return keep(native.Graph([y for y in nodes if y != x], complete=True))
-                h = keep(_drop_nodes(g, {x}))
-                h.tok_edges = [(t, r) for t, r in getattr(g, "tok_edges", []) if r != x]
-                return h
-            if kind == "edge":
-                w, r = x
-                par = {rr: [y for y in ws if not (rr == r and y == w)] for rr, ws in g.parents.items()}
-                return keep(native.Graph(list(g.nodes), {rr: ws for rr, ws in par.items() if ws}, [y for y in g.out if not (r is None and y == w)]))
-            h = keep(native.Graph(list(g.nodes), dict(g.parents), list(g.out)))
-            h.tok_edges = [y for y in getattr(g, "tok_edges", []) if y != x]
-            h.tok_out = [t for t in getattr(g, "tok_out", []) if x != (t, None)]
+        def without(dels):  # the answer less a set of lines
+            dn = {x for kind, x in dels if kind == "node"}
+            de = {tuple(x) for kind, x in dels if kind == "edge"}
+            dt = {tuple(x) for kind, x in dels if kind == "token"}
+            if g.complete:
+                return kept(native.Graph([y for y in nodes if y not in dn], complete=True))
+            h = _drop_nodes(g, dn) if dn else native.Graph(list(g.nodes), dict(g.parents), list(g.out))
+            if de:
+                par = {r: [w for w in ws if (w, r) not in de] for r, ws in h.parents.items()}
+                h = native.Graph(list(h.nodes), {r: ws for r, ws in par.items() if ws}, [w for w in h.out if (w, None) not in de])
+                if getattr(g, "pairs", None):
+                    h.pairs = {read: [pr for pr in ps if not set(pr) & dn] for read, ps in g.pairs.items()}
+            h = kept(h)
+            h.tok_edges = [y for y in getattr(g, "tok_edges", []) if y[1] not in dn and tuple(y) not in dt]
+            h.tok_out = [t for t in getattr(g, "tok_out", []) if (t, None) not in dt]
             return h
 
-        variants = [without(k, x) for k, x in lines]
+        variants = [without(d) for d in gone]
         flat = [expand_blocks(h, nat.C) for h in variants]
         e0, v0 = self._bounds(tx, "live")
         fast = self.LOO_FAST and tx.vpd is not None and expand_blocks(g, nat.C) is g
-        got = self._loo_c(tx, g, lines) if fast else None  # every deletion on one plan of the answer (C's semantics)
+        got = self._loo_c(tx, g, lines, keep) if fast else None  # every variant on one plan of the answer (C's semantics)
         if got is None:
             point = self.sufficiency(tx, flat, conventions=("live",), vpd_minus=False)  # phi reads the live point alone
             stated = [i for i, h in enumerate(flat) if not h.complete]  # a complete variant's wiring is its point
@@ -1280,7 +1317,7 @@ class GoalEval:
             wired = [wired.get(i, point[i]) for i in range(len(flat))]
         else:
             point, wired, pattern_runs = got
-        cols = {k: j for j, k in enumerate(self._pp_engine(tx).pp_lines(g))}  # the path-patched families: every deletion
+        cols = {k: j for j, k in enumerate(self._pp_engine(tx).pp_lines(g))}  # the path-patched families: every variant
 
         def col(kind, x):  # in one engine call per family (lines=), each a column of Engine.pp_lines
             if kind == "node":
@@ -1288,30 +1325,27 @@ class GoalEval:
             if kind == "edge":
                 return cols[("o", x[0])] if x[1] is None else cols[("e", x[0], x[1])]
             return cols[("u", x[0])] if x[1] is None else cols[("t", x[0], x[1])]
-        mask = torch.ones(len(lines), len(cols))
-        mask[torch.arange(len(lines)), torch.tensor([col(k, x) for k, x in lines], dtype=torch.long)] = 0.0
+        at = torch.tensor([col(k, x) for k, x in lines], dtype=torch.long)
+        mask = torch.ones(K, len(cols))
+        mask[:, at] = keep.float()
         tpp = self.track_pp(tx, [g], split, draws, lines=mask)
         ipp = self.interchange_pp(tx, [g], split, draws, lines=mask)
         pat = self.pattern_family(tx, flat, runs=None if got is None else pattern_runs)
-        at = [i for i, (kind, _) in enumerate(lines) if kind == "node"]  # N moves with the node set alone
-        own = {}
-        if at:  # N on NEC_CONTROLS_LOO controls for the answer and each node deletion alike
-            got = self.necessity_spec(tx, [expand_blocks(g, nat.C)] + [flat[i] for i in at], split, NEC_CONTROLS_LOO)
-            own, nsp = got[0], dict(zip(at, got[1:]))
-        else:
-            nsp = {}
+        sets = [frozenset(x for kind, x in d if kind == "node") for d in gone]  # N moves with the node set alone
+        distinct = list(dict.fromkeys(s for s in sets if s))
+        first = {s: next(i for i in range(K) if sets[i] == s) for s in distinct}
+        got = self.necessity_spec(tx, [expand_blocks(g, nat.C)] + [flat[first[s]] for s in distinct], split, NEC_CONTROLS_LOO)
+        own, nsp = got[0], dict(zip(distinct, got[1:]))
         bits = size_bits(g, P, S, tx.targets, active=tx.vpd)
         fams = ((tx.__dict__.get("_tau") or {}).get(split) or {}).get("families")  # the text's (tau's), when scored
-        base = dict(base, **own, rl_terms={**base.get("rl_terms", {}), **({"n_spec": own["n_spec_raw"]} if own else {})}) \
-            if own else base
-        if own:
-            base.pop("eps_N", None)
-        ph = phi(base, families=fams)[0]
+        base = dict(base, **own, rl_terms={**base.get("rl_terms", {}), "n_spec": own["n_spec_raw"]})
+        base.pop("eps_N", None)
+        ph, ph_tau = phi(base, start, families=fams)
         redo = [f for f in PHI_FAMILIES if f not in self.LOO_HELD]  # the recomputed families (eps from their own draws)
         out = []
-        for i, ((kind, x), h, pt, wd, a, b, c) in enumerate(zip(lines, variants, point, wired, tpp, ipp, pat)):
+        for i, (h, pt, wd, a, b, c) in enumerate(zip(variants, point, wired, tpp, ipp, pat)):
             row = dict(base)
-            row.update(nsp.get(i, {}))
+            row.update(nsp.get(sets[i], own))
             row.update({"s_point": pt["f1_live"], "s_wiring": wd["f1_live"], "n_point": pt.get("n_live"),
                         "draws_point": [[pt["kl_live"], v0]]})
             row["s_point_c"] = min(y for y in (pt["f1_live"], wd["f1_live"]) if y is not None) if pt["f1_live"] is not None else None
@@ -1325,18 +1359,14 @@ class GoalEval:
                                    "s_track_pp": a.get("s_track_pp_raw"),
                                    "s_interchange_pp": b.get("s_interchange_pp_raw"),
                                    "s_pattern": c.get("s_pattern_raw"),
-                                   **({"n_spec": row.get("n_spec_raw")} if "n_spec" in row["rl_terms"] else {})}
+                                   "n_spec": row.get("n_spec_raw")}
             for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
                 row.pop(f"eps_{f}", None)  # the recomputed families' eps from their own draws
             row.update({f"eps_{f}": v for f, v in family_eps(row, only=redo).items()})
-            bv = size_bits(h, P, S, tx.targets, active=tx.vpd)
-            pv = phi(row, families=fams)[0]
-            out.append({"line": [list(x)] if kind == "node" else [list(y) if isinstance(y, tuple) else y for y in x],
-                        "kind": kind, "phi": pv, "delta_phi": None if None in (ph, pv) else ph - pv, "bits": bv,
-                        "delta_bits": bits - bv, "compact": compact(bv, bits_start) if bits_start else None})
+            pv, pt_tau = phi(row, start, families=fams)
+            out.append({"phi": pv, "phi_tau": pt_tau, "bits": size_bits(h, P, S, tx.targets, active=tx.vpd), "row": row})
             native.free(nat.dev)
-        return {"phi": ph, "bits": bits, "compact": compact(bits, bits_start) if bits_start else None,
-                "held": list(self.LOO_HELD), "lines": out}
+        return {"phi": ph, "phi_tau": ph_tau, "bits": bits, "variants": out}
 
     @torch.no_grad()
     def line_effects(self, tx: Text, graph: native.Graph, mode: str = "pp", split: str = "search", draws: int = 8,
@@ -1484,14 +1514,15 @@ class GoalEval:
     LOO_ROWS = 64  # _loo_c's engine rows a call
 
     @torch.no_grad()
-    def _loo_c(self, tx: Text, g: native.Graph, lines: list) -> tuple | None:
-        """line_loo's C-semantics families for every deletion of a graph without blocks on one plan of it (Engine.plan,
-        semantics "c"): a stated graph's deletion runs as the graph at per-row strengths (a connection deleted at 0; a
-        node deleted with every connection into or out of it at 0 and taken out of the circuit, graph_log_probs' off; a
-        token edge, which C's semantics does not have, the graph's own), a complete graph's as the graph at per-row u
-        (1 on its nodes, 0 at the deleted one): the same numbers as sufficiency on the deleted graphs; the wired runs
-        (a complete graph's: its point) per distinct node set (masked runs). (point and wired rows with sufficiency's
-        live keys, the pattern runs for pattern_family's runs); None when the plan's connections are not the graph's."""
+    def _loo_c(self, tx: Text, g: native.Graph, lines: list, keep: torch.Tensor) -> tuple | None:
+        """phi_variants' C-semantics families for every variant (keep [K, L] over lines) of a graph without blocks on
+        one plan of it (Engine.plan, semantics "c"): a stated graph's variant runs as the graph at per-row strengths
+        (a deleted connection at 0; a deleted node with every connection into or out of it at 0 and taken out of the
+        circuit, graph_log_probs' off; a token edge, which C's semantics does not have, the graph's own), a complete
+        graph's as the graph at per-row u (1 on its nodes, 0 at the deleted ones): the same numbers as sufficiency on
+        the variants; the wired runs (a complete graph's: its point) per distinct node set (masked runs). (point and
+        wired rows with sufficiency's live keys, the pattern runs for pattern_family's runs); None when the plan's
+        connections are not the graph's."""
         nat, dev = self.nat, self.nat.dev
         edges = [] if g.complete else [(w, r) for r, ws in g.parents.items() for w in ws]
         outs = [] if g.complete else list(g.out)
@@ -1508,25 +1539,28 @@ class GoalEval:
             touch.setdefault(w, []).append(j)
             touch.setdefault(r, []).append(j)
         eix, oix = {e: j for j, e in enumerate(edges)}, {w: j for j, w in enumerate(outs)}
-        K = len(lines)
-        ew, ow, off, sets = torch.ones(K, len(edges)), torch.ones(K, len(outs)), [None] * K, [None] * K
-        for i, (kind, x) in enumerate(lines):
-            if kind == "node":
-                ew[i, touch.get(x, [])] = 0.0
-                if x in oix:
-                    ow[i, oix[x]] = 0.0
-                off[i], sets[i] = [x], x
-            elif kind == "edge":
-                if x[1] is None:
-                    ow[i, oix[x[0]]] = 0.0
-                else:
-                    ew[i, eix[tuple(x)]] = 0.0
+        K = keep.shape[0]
+        ew, ow, off, sets = torch.ones(K, len(edges)), torch.ones(K, len(outs)), [None] * K, [frozenset()] * K
+        for i in range(K):
+            dn = []
+            for j in (~keep[i]).nonzero().flatten().tolist():
+                kind, x = lines[j]
+                if kind == "node":
+                    ew[i, touch.get(x, [])] = 0.0
+                    if x in oix:
+                        ow[i, oix[x]] = 0.0
+                    dn.append(x)
+                elif kind == "edge":
+                    if x[1] is None:
+                        ow[i, oix[x[0]]] = 0.0
+                    else:
+                        ew[i, eix[tuple(x)]] = 0.0
+            off[i], sets[i] = dn or None, frozenset(dn)
 
-        def urows(ix):  # a complete graph's u for rows ix: 0 at each one's deleted node
+        def urows(ix):  # a complete graph's u for rows ix: 0 at each one's deleted nodes
             u = {n: m.expand(len(ix), -1, -1).clone() for n, m in u1.items()}
             for r, i in enumerate(ix):
-                if sets[i] is not None:
-                    n, t, c = sets[i]
+                for n, t, c in sets[i]:
                     u[n][r, t, at[n][c]] = 0.0
             return u
 
@@ -1547,8 +1581,8 @@ class GoalEval:
             kw0 = {x: k for x, k in zip(sets, kl)}
         e, v = self._bounds(tx, "live")
         nodes = sorted(g.node_set())
-        keys = [None] + sorted({x for x in sets if x is not None})  # the node sets: the graph's, less each deleted node
-        masks = lambda drop: carry.masks(nat, tx.T, [nd for nd in nodes if nd != drop])  # noqa: E731
+        keys = list(dict.fromkeys(sets))  # the variants' node sets: the graph's less each one's deleted nodes
+        masks = lambda drop: carry.masks(nat, tx.T, [nd for nd in nodes if nd not in drop])  # noqa: E731
         kw = dict(kw0) if g.complete else {}
         for s0 in range(0, 0 if g.complete else len(keys), 8):  # a stated graph's wiring: the masked run of its node set
             part = keys[s0:s0 + 8]

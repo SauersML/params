@@ -20,7 +20,9 @@
 #   (minutes of retries while no card is in stock), ONLY (the pods j to launch, e.g. "0 3"; default all), FROM (a directory
 #   of saved paths, teacher.py --from-path: only texts with a <task>.path.json there are taught, and each pod gets its
 #   texts' path, F1 and top-k files as one tar), EXTRA (more inputs the pod needs at their ~/mpd-data paths, e.g. the
-#   adversary's pool goal_eval/ci_patterns_train.pt for --repair)
+#   adversary's pool goal_eval/ci_patterns_train.pt for --repair), SELF_END_MIN (minutes after its teacher processes end
+#   that a pod deletes itself if the Mac has not reaped it: a Mac or network outage then stops the bill at the texts' end,
+#   not at HOURS; outputs not yet synced by then are lost)
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params
@@ -106,7 +108,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 $PRE
 ${FROM:+mkdir -p ~/from; tar -xzf $F/from_$j.tgz -C ~/from;}
 cd /Users/user/params/method/oracle; $LOC
-set +e; $RUNS wait; echo all teacher processes done; F=0; $FAILED exit \$F"
+set +e; $RUNS wait; echo all teacher processes done; ${SELF_END_MIN:+(setsid nohup bash -c \"sleep $((SELF_END_MIN * 60)); runpodctl remove pod \\\"\\\$RUNPOD_POD_ID\\\" || runpodctl pod delete \\\"\\\$RUNPOD_POD_ID\\\"\" > /dev/null 2>&1 < /dev/null &);} F=0; $FAILED exit \$F"
   (  # community stock comes and goes: a launch that finds no card in stock, or a host whose download of the published
      # inputs came out corrupted, is retried every 3 minutes for WAIT minutes
     for try in $(seq 1 $(( ${WAIT:-180} / 3 ))); do

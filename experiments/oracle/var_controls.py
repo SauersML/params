@@ -248,13 +248,12 @@ def main():
     sc = var_teacher._Screen(ge)
     jobs = [(args.task, tuple(int(x) for x in args.inputs.split(",")))] if args.task else []
     if args.copy:
-        import semantic_copy
-
         for x in json.loads((native.TEXTS.parent / "generality" / "copy_heldout.json").read_text())["copy"][:args.copy]:
             p = json.loads((native.TEXTS / "vpd4l" / f"{x['task']}.json").read_text())["prompts"][0]
-            r = semantic_copy.roles(p["token_ids"], p["target_positions"][-1])
-            if r:
-                jobs.append((x["task"], (r["a"],)))
+            ids, t = p["token_ids"], p["target_positions"][-1]
+            occ = [j for j in range(t) if ids[j] == ids[t]]  # the copied token's position: after the earlier occurrence
+            if occ:
+                jobs.append((x["task"], (occ[-1] + 1,)))
     for t, ins in jobs:
         task = json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())
         p = task["prompts"][0]

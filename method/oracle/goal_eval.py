@@ -3135,15 +3135,21 @@ class GoalEval:
         def patches(E, patch):  # per draw {node: value} -> {site: (bool [D, T, K], values [D, T, K])}
             if patch is None:
                 return None
-            out = {}
-            for b, vals in enumerate(patch):
+            idx, val = {}, {}  # one indexed write per site (a write per node was a kernel launch each: a block's
+            for b, vals in enumerate(patch):  # thousands of subcomponents per draw kept the GPU idle)
                 for (n, t, c), v in vals.items():
-                    if n not in out:
-                        out[n] = (torch.zeros(len(patch), T, E.width(n), dtype=torch.bool, device=dev),
-                                  torch.zeros(len(patch), T, E.width(n), device=dev))
-                    k = at[id(E)][n][c]
-                    out[n][0][b, t, k] = True
-                    out[n][1][b, t, k] = v
+                    idx.setdefault(n, []).append((b, t, at[id(E)][n][c]))
+                    val.setdefault(n, []).append(v)
+            out = {}
+            for n, ix in idx.items():
+                m = torch.zeros(len(patch), T, E.width(n), dtype=torch.bool, device=dev)
+                x = torch.zeros(len(patch), T, E.width(n), device=dev)
+                i = torch.tensor(ix, device=dev).T
+                vs = val[n]
+                v = torch.stack([u.reshape(()) for u in vs]) if torch.is_tensor(vs[0]) else torch.tensor(vs)
+                m[i[0], i[1], i[2]] = True
+                x[i[0], i[1], i[2]] = v.to(device=dev, dtype=x.dtype)
+                out[n] = (m, x)
             return out
 
         def spec(E, nodes, D):  # every row's reads of nodes: {site: (rows, positions, columns)} (blocks have no activation)

@@ -569,10 +569,14 @@ def _pooled_raw(draws: list) -> float | None:
 
 def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: np.ndarray) -> list:
     """_pooled of each resample of draws (idx [R, n], draw indices per resample), as arrays: a draw's own score
-    ("weighted") or KLs ("mean", "donor") computed once; "spec" one resample at a time."""
+    ("weighted") or KLs ("mean", "donor", "spec") computed once."""
     fid = _fid_raw if raw else _fid
-    if kind == "spec":
-        return [_spec([draws[i] for i in r], raw=raw) for r in idx]
+    if kind == "spec":  # _spec per resample: D_t and D_t(VPD) its first record's, the controls' means
+        dc, dcv = (np.array([d[j] for d in draws], dtype=float)[idx].mean(1) for j in (1, 2))
+        dt, dtv = (np.array([d[j] for d in draws], dtype=float)[idx[:, 0]] for j in (3, 4))
+        den = dtv - dcv
+        x = np.minimum(1.0, (dt - dc) / np.where(den > 0, den, 1.0))
+        return [(float(v) if raw else max(0.0, float(v))) if ok else None for v, ok in zip(x, den > 0)]
     if kind == "weighted":
         sd = [fid(d[3], d[1], d[2]) for d in draws]
         w = np.array([d[3] if x is not None else 0.0 for d, x in zip(draws, sd)], dtype=float)
@@ -588,18 +592,22 @@ def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: 
     return [fid(float(a), float(b), float(c)) for a, b, c in zip(k0, kc, kv)]
 
 
-def family_eps(row: dict) -> dict:
+def family_eps(row: dict, only=None) -> dict:
     """eps_<family> for phi (the lead's reward v3): twice the bootstrap standard error of each family's score over its
     draws in the row (EPS_BOOT resamples, a fixed seed: the same from the row alone), at least EPS_FLOOR; a family
-    scored in one run (point, flips) the floor. The floored estimator, as family_score."""
+    scored in one run (point, flips) the floor. The floored estimator, as family_score. only: those families alone (the
+    others' resample indices still drawn: the same eps as with every family)."""
     rng = np.random.default_rng(0)
     out = {}
     for fam, (_, kind, key) in PHI_FAMILIES.items():
         draws = row.get(key) if key else None
         if not kind or not draws or len(draws) < 2:
-            out[fam] = EPS_FLOOR
+            if only is None or fam in only:
+                out[fam] = EPS_FLOOR
             continue
         idx = rng.integers(len(draws), size=(EPS_BOOT, len(draws)))  # the same draws as one call per resample
+        if only is not None and fam not in only:
+            continue
         got = _pooled_resamples(kind, draws, row.get("kl_empty_live"), False, idx)
         got = [x for x in got if x is not None]
         out[fam] = max(EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else EPS_FLOOR
@@ -1262,11 +1270,16 @@ class GoalEval:
         variants = [without(k, x) for k, x in lines]
         flat = [expand_blocks(h, nat.C) for h in variants]
         e0, v0 = self._bounds(tx, "live")
-        point = self.sufficiency(tx, flat, conventions=("live",), vpd_minus=False)  # phi reads the live point alone
-        stated = [i for i, h in enumerate(flat) if not h.complete]  # a complete variant's wiring is its point
-        wired = dict(zip(stated, self.sufficiency(tx, [native.Graph(sorted(flat[i].node_set()), complete=True) for i in stated],
-                                                  conventions=("live",), vpd_minus=False)))
-        wired = [wired.get(i, point[i]) for i in range(len(flat))]
+        fast = self.LOO_FAST and tx.vpd is not None and expand_blocks(g, nat.C) is g
+        got = self._loo_c(tx, g, lines) if fast else None  # every deletion on one plan of the answer (C's semantics)
+        if got is None:
+            point = self.sufficiency(tx, flat, conventions=("live",), vpd_minus=False)  # phi reads the live point alone
+            stated = [i for i, h in enumerate(flat) if not h.complete]  # a complete variant's wiring is its point
+            wired = dict(zip(stated, self.sufficiency(tx, [native.Graph(sorted(flat[i].node_set()), complete=True) for i in stated],
+                                                      conventions=("live",), vpd_minus=False)))
+            wired = [wired.get(i, point[i]) for i in range(len(flat))]
+        else:
+            point, wired, pattern_runs = got
         cols = {k: j for j, k in enumerate(self._pp_engine(tx).pp_lines(g))}  # the path-patched families: every deletion
 
         def col(kind, x):  # in one engine call per family (lines=), each a column of Engine.pp_lines
@@ -1279,7 +1292,7 @@ class GoalEval:
         mask[torch.arange(len(lines)), torch.tensor([col(k, x) for k, x in lines], dtype=torch.long)] = 0.0
         tpp = self.track_pp(tx, [g], split, draws, lines=mask)
         ipp = self.interchange_pp(tx, [g], split, draws, lines=mask)
-        pat = self.pattern_family(tx, flat)
+        pat = self.pattern_family(tx, flat, runs=None if got is None else pattern_runs)
         at = [i for i, (kind, _) in enumerate(lines) if kind == "node"]  # N moves with the node set alone
         own = {}
         if at:  # N on NEC_CONTROLS_LOO controls for the answer and each node deletion alike
@@ -1294,6 +1307,7 @@ class GoalEval:
         if own:
             base.pop("eps_N", None)
         ph = phi(base, families=fams)[0]
+        redo = [f for f in PHI_FAMILIES if f not in self.LOO_HELD]  # the recomputed families (eps from their own draws)
         out = []
         for i, ((kind, x), h, pt, wd, a, b, c) in enumerate(zip(lines, variants, point, wired, tpp, ipp, pat)):
             row = dict(base)
@@ -1314,7 +1328,7 @@ class GoalEval:
                                    **({"n_spec": row.get("n_spec_raw")} if "n_spec" in row["rl_terms"] else {})}
             for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
                 row.pop(f"eps_{f}", None)  # the recomputed families' eps from their own draws
-            row.update({f"eps_{f}": v for f, v in family_eps(row).items() if f not in self.LOO_HELD})
+            row.update({f"eps_{f}": v for f, v in family_eps(row, only=redo).items()})
             bv = size_bits(h, P, S, tx.targets, active=tx.vpd)
             pv = phi(row, families=fams)[0]
             out.append({"line": [list(x)] if kind == "node" else [list(y) if isinstance(y, tuple) else y for y in x],
@@ -1428,14 +1442,15 @@ class GoalEval:
                                "has_token_edge": q in tok_at or g.complete} for q in f2]}
 
     @torch.no_grad()
-    def pattern_family(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+    def pattern_family(self, tx: Text, graphs: list[native.Graph], runs=None) -> list[dict]:
         """s_pattern (the lead's 10-12, rustmove's 35f6ca0: C's semantics flatten attention, the q/k remainders
         about 1% of the scores, so circuits fit near-uniform rows): each circuit's run in C's semantics (graph_ref)
         with the reads it uses (a layer and position holding a circuit attention output) given the real model's
         attention row on the text, all of them at once and each alone; VPD's answer the same; the mean KLs from the
         model on C's log scale against KL_empty (s_pattern, _raw without the floor at 0). A circuit whose output
         survives the model's true pattern uses attention as the model does. None for a circuit without an attention
-        output. The circuits' runs batched on the engine (_pattern_runs), VPD's kept per read set."""
+        output. The circuits' runs batched on the engine (_pattern_runs; runs: another such function, line_loo's one
+        plan), VPD's kept per read set."""
         b = self._pp_base(tx)
         T = tx.T
         causal = torch.ones(T, T, dtype=torch.bool, device=self.nat.dev).tril()
@@ -1447,7 +1462,7 @@ class GoalEval:
             reads = sorted({(native._name_layer_kind(n)[0], t) for n, t, _ in g.node_set() if native._name_layer_kind(n)[1] == "o_proj"})
             real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
             plans.append((reads, [real] + ([{r: real[r]} for r in reads] if len(reads) > 1 else [])))
-        kcs = self._pattern_runs(tx, graphs, plans)
+        kcs = (runs or self._pattern_runs)(tx, graphs, plans)
         for g, (reads, draws), kc in zip(graphs, plans, kcs):
             if not reads or vpd is None:
                 out.append({"s_pattern": None, "s_pattern_raw": None, "kl_pattern_c": None, "kl_pattern_vpd": None, "reads_pattern": len(reads)})
@@ -1465,6 +1480,92 @@ class GoalEval:
         return out
 
     PATTERN_ROWS = 32  # pattern_family's engine rows (circuits x draws) a call
+    LOO_FAST = True  # line_loo's point, wiring and pattern from one plan of the answer (_loo_c); False: per deletion
+    LOO_ROWS = 64  # _loo_c's engine rows a call
+
+    @torch.no_grad()
+    def _loo_c(self, tx: Text, g: native.Graph, lines: list) -> tuple | None:
+        """line_loo's C-semantics families for every deletion of a graph without blocks on one plan of it (Engine.plan,
+        semantics "c"): a stated graph's deletion runs as the graph at per-row strengths (a connection deleted at 0; a
+        node deleted with every connection into or out of it at 0 and taken out of the circuit, graph_log_probs' off; a
+        token edge, which C's semantics does not have, the graph's own), a complete graph's as the graph at per-row u
+        (1 on its nodes, 0 at the deleted one): the same numbers as sufficiency on the deleted graphs; the wired runs
+        (a complete graph's: its point) per distinct node set (masked runs). (point and wired rows with sufficiency's
+        live keys, the pattern runs for pattern_family's runs); None when the plan's connections are not the graph's."""
+        nat, dev = self.nat, self.nat.dev
+        edges = [] if g.complete else [(w, r) for r, ws in g.parents.items() for w in ws]
+        outs = [] if g.complete else list(g.out)
+        E = self._circuit_engine(tx.ids, tx.targets, [g])
+        plan = E.plan(g, semantics="c")
+        if plan["E"] != len(edges) or plan["O"] != len(outs):
+            return None
+        at = {n: {c: i for i, c in enumerate(E.columns[n].tolist())} for n in nat.names}
+        u1 = {n: torch.zeros(1, tx.T, E.width(n), device=dev) for n in nat.names}  # a complete graph's u: its nodes at 1
+        for n, t, c in (g.node_set() if g.complete else ()):
+            u1[n][0, t, at[n][c]] = 1.0
+        touch = {}
+        for j, (w, r) in enumerate(edges):
+            touch.setdefault(w, []).append(j)
+            touch.setdefault(r, []).append(j)
+        eix, oix = {e: j for j, e in enumerate(edges)}, {w: j for j, w in enumerate(outs)}
+        K = len(lines)
+        ew, ow, off, sets = torch.ones(K, len(edges)), torch.ones(K, len(outs)), [None] * K, [None] * K
+        for i, (kind, x) in enumerate(lines):
+            if kind == "node":
+                ew[i, touch.get(x, [])] = 0.0
+                if x in oix:
+                    ow[i, oix[x]] = 0.0
+                off[i], sets[i] = [x], x
+            elif kind == "edge":
+                if x[1] is None:
+                    ow[i, oix[x[0]]] = 0.0
+                else:
+                    ew[i, eix[tuple(x)]] = 0.0
+
+        def urows(ix):  # a complete graph's u for rows ix: 0 at each one's deleted node
+            u = {n: m.expand(len(ix), -1, -1).clone() for n, m in u1.items()}
+            for r, i in enumerate(ix):
+                if sets[i] is not None:
+                    n, t, c = sets[i]
+                    u[n][r, t, at[n][c]] = 0.0
+            return u
+
+        def run(rows_of, extra=None):  # KLs of rows (line indices), optionally with given attention rows each
+            out = []
+            for s0 in range(0, len(rows_of), self.LOO_ROWS):
+                ix = rows_of[s0:s0 + self.LOO_ROWS]
+                given = None if extra is None else extra[s0:s0 + self.LOO_ROWS]
+                if g.complete:
+                    lq = E.graph_log_probs(plan, urows(ix), rows=given)
+                else:
+                    lq = E.graph_log_probs(plan, ew=ew[ix].to(dev), ow=ow[ix].to(dev), off=[off[i] for i in ix], rows=given)
+                out += carry.kl(tx.ref, lq).tolist()
+                native.free(dev)
+            return out
+        kl = run(list(range(K)))
+        if g.complete:  # its wiring is itself
+            kw0 = {x: k for x, k in zip(sets, kl)}
+        e, v = self._bounds(tx, "live")
+        nodes = sorted(g.node_set())
+        keys = [None] + sorted({x for x in sets if x is not None})  # the node sets: the graph's, less each deleted node
+        masks = lambda drop: carry.masks(nat, tx.T, [nd for nd in nodes if nd != drop])  # noqa: E731
+        kw = dict(kw0) if g.complete else {}
+        for s0 in range(0, 0 if g.complete else len(keys), 8):  # a stated graph's wiring: the masked run of its node set
+            part = keys[s0:s0 + 8]
+            got = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, [masks(k) for k in part], True)).tolist()
+            kw.update(zip(part, got))
+            native.free(dev)
+        point = [{"kl_live": kl[i], "f1_live": _clip01(recovered_log(e, kl[i], v))} for i in range(K)]
+        wired = [{"kl_live": kw[sets[i]], "f1_live": _clip01(recovered_log(e, kw[sets[i]], v))} for i in range(K)]
+
+        def pattern_runs(tx_, graphs, plans):  # pattern_family's circuit side on the same plan: row i's draws
+            todo = [(i, d) for i, (reads, draws) in enumerate(plans) if reads for d in draws]
+            got = run([i for i, _ in todo], [d for _, d in todo])
+            out = [[] for _ in graphs]
+            for (i, _), k in zip(todo, got):
+                out[i].append(k)
+            return out
+        return point, wired, pattern_runs
 
     @torch.no_grad()
     def _pattern_runs(self, tx: Text, graphs: list[native.Graph], plans: list) -> list[list[float]]:
@@ -2325,7 +2426,11 @@ class GoalEval:
         """Per set (matrix -> bool [len(ids), C]): KL at the targets from ref (the whole model's run on ids when None)
         of the real model on ids with the set's subcomponents removed (mask 0 at their positions, every other
         subcomponent and every remainder on). remainders_at_nodes False: each matrix's remainder W - V U removed too at
-        the positions the set holds. A batch reuses the model's states before its first removed subcomponent."""
+        the positions the set holds, the masked run over every subcomponent (a batch reuses the model's states before its
+        first removed subcomponent); otherwise the engine's (outside "on": the sets' subcomponents masked, every other
+        one folded into the remainder, float32-close to that run at the model's own cost: _removal_engine)."""
+        if remainders_at_nodes:
+            return self._removed_kl_on(self._removal_engine(ids, targets, sets), sets, ref)
         nat, T = self.nat, len(ids)
         one_u, one_r = nat._one()
         if ref is None:
@@ -2340,13 +2445,37 @@ class GoalEval:
             first = min((int(m[n].any(1).nonzero().min()) for m in part for n in nat.names if m[n].any()), default=0)
             base = _from(ids, min(first, min(targets)))
             plan = {**nat._full_plan(T, B), "G": none, "none": True}
-            ur = one_r
-            if not remainders_at_nodes:
-                held = torch.stack([sum(m[n].any(1).float() for n in nat.names) > 0 for m in part])  # [B, T]
-                ur = {n: 1.0 - held.float() for n in nat.names}
+            held = torch.stack([sum(m[n].any(1).float() for n in nat.names) > 0 for m in part])  # [B, T]
+            ur = {n: 1.0 - held.float() for n in nat.names}
             lq = nat.run(ids, targets, plan, u, ur, reuse=None if base is None else (nat._model_states(ids, B), base))
             kls += carry.kl(ref, lq).tolist()
             native.free(nat.dev)
+        return kls
+
+    NEC_ENTRIES = 1 << 27  # _removed_kl_on's rows a run: this many floats in its widest activations (sets x T x C)
+
+    def _removal_engine(self, ids: list[int], targets: list[int], sets: list[dict]):
+        """An engine on ids over the sets' subcomponents with every other one on (outside "on"; Engine.on moves it to
+        another text)."""
+        import engine
+
+        nat, dev = self.nat, self.nat.dev
+        none = torch.zeros(0, dtype=torch.long, device=dev)
+        cols = {n: torch.unique(torch.cat([m[n].nonzero()[:, 1] for m in sets] + [none])) for n in nat.names}
+        return engine.Engine(nat, ids, targets, live=True, columns=cols, outside="on")
+
+    @torch.no_grad()
+    def _removed_kl_on(self, E, sets: list[dict], ref: torch.Tensor | None = None) -> list[float]:
+        """_removed_kl with every remainder on, on E (_removal_engine of sets, or of sets they are a shift of)."""
+        nat = self.nat
+        rows = max(1, self.NEC_ENTRIES // (E.T * max(nat.C.values())))
+        ref = E.ref if ref is None else ref
+        kls = []
+        for s0 in range(0, len(sets), rows):
+            part = sets[s0:s0 + rows]
+            masks = {n: 1.0 - torch.stack([m[n][:, c] for m in part]).float() for n, c in E.columns.items()}
+            kls += carry.kl(ref, E.log_probs(masks)).tolist()
+        native.free(nat.dev)
         return kls
 
     def necessity_spec(self, tx: Text, graphs: list[native.Graph], split: str = "eval", controls: int = NEC_CONTROLS) -> list[dict]:
@@ -2362,16 +2491,25 @@ class GoalEval:
         when VPD's removal damages the controls as much as the text; n_spec_raw unclipped below (c_rl's ranking).
         draws_n_spec: per control [control, D_c, D_c(VPD), D_t, D_t(VPD)] (phi's eps). Damages in bits."""
         nat, T = self.nat, tx.T
-        sets = [self.masks(_c_graph(g, tx.targets, nat.C), T) for g in graphs] + [tx.vpd]
-        dt = self._removed_kl(tx.ids, tx.targets, sets, tx.ref)
+        sets = [self.masks(_c_graph(g, tx.targets, nat.C), T) for g in graphs]
         last = max(tx.targets)
         pool = [x for x in self.far_pool(split) if len(x[1]) >= min(T, NEC_MIN_LEN) and list(x[1]) != list(tx.ids)]
         ys = [pool[i][1] for i in np.random.default_rng([int(tx.seed), 13]).permutation(len(pool))[:controls]]
-        dc = []
-        for y in ys:
-            y = list(y[:last + 1])
-            d = last + 1 - len(y)  # the shift
-            dc.append(self._removed_kl(y, [t - d for t in tx.targets if t >= d], [{n: m[n][d:last + 1] for n in nat.names} for m in sets]))
+
+        def damages(sets):  # [D_t per set, per control [D_c per set]]: one engine, moved to each control (Engine.on)
+            E = self._removal_engine(tx.ids, tx.targets, sets)
+            dc = []
+            for y in ys:
+                y = list(y[:last + 1])
+                d = last + 1 - len(y)  # the shift
+                dc.append(self._removed_kl_on(E.on(y, [t - d for t in tx.targets if t >= d]), [{n: m[n][d:last + 1] for n in nat.names} for m in sets]))
+            return self._removed_kl_on(E, sets, tx.ref), dc
+        key = ("nec_vpd", last, tuple(tuple(y) for y in ys))  # VPD's damages on these controls: every graph's on the text
+        if key not in tx.__dict__:
+            tx.__dict__[key] = damages([tx.vpd])
+        dt, dc = damages(sets) if sets else ([], [[] for _ in ys])
+        dt = dt + tx.__dict__[key][0]
+        dc = [d + v for d, v in zip(dc, tx.__dict__[key][1])]
         out = []
         for i in range(len(graphs)):
             rec = [[j, d[i], d[-1], dt[i], dt[-1]] for j, d in enumerate(dc)]

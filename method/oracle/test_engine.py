@@ -641,3 +641,110 @@ def test_path_patched_equals_pp_run():
                 x2 = list(ids)
                 x2[p] = z
                 assert float((got[b, d] - ge.pp_run(tx, x2, g)[0]).abs().max()) < 2e-4, (b, d)
+
+
+def test_block_units():
+    """Blocks (site, t, BLOCK) as units in C's semantics: a stated graph with blocks and every connection at 1 is the
+    masked run with the blocks' sites fully on there; in the whole model, cuts naming blocks equal the run with the
+    reader's whole output (or one subcomponent's activation) recomputed from its input less the writer's output there,
+    written out from the model's own site outputs (residual, value through the pattern, inside the GELU, into the
+    prediction, block to subcomponent and back), every cut one row of a list plan; a graph's rows at other strengths
+    (tiled) are the same graph's runs one at a time."""
+    import vpd_model
+
+    nat, ids, targets, graph, _, _, _ = graph_case(B=1)
+    tg, T, BL = nat.target, len(ids), engine.BLOCK
+    t, s = targets[0], targets[0] - 2
+    blocks = [("h.0.attn.o_proj", t, BL), ("h.1.mlp.c_fc", t, BL), ("h.2.attn.v_proj", s, BL)]
+    nodes = sorted({nd for nd in graph.nodes if (nd[0], nd[1]) not in {(b[0], b[1]) for b in blocks}} | set(blocks))
+    g = native.Graph(nodes, *native.all_edges(nodes, targets))
+    assert any(w in blocks for ws in g.parents.values() for w in ws) and any(r in blocks for r in g.parents)
+    eng = engine.Engine(nat, ids, targets, live=True)
+    zero = {n: torch.zeros(1, 1, nat.C[n], device=nat.dev) for n in nat.names}
+    masks = {n: torch.zeros(1, T, nat.C[n], device=nat.dev) for n in nat.names}
+    for n, tt, c in nodes:
+        if c == BL:
+            masks[n][0, tt, :] = 1.0
+        else:
+            masks[n][0, tt, c] = 1.0
+    with torch.no_grad():
+        assert rel(eng.kl(masks), eng.graph_kl(eng.plan(g, semantics="c"), zero)) < REL
+        E = sum(len(ws) for ws in g.parents.values())
+        gen = torch.Generator().manual_seed(3)
+        ew, ow = torch.rand(3, E, generator=gen).to(nat.dev), torch.rand(3, len(g.out), generator=gen).to(nat.dev)
+        rows = eng.graph_kl(eng.plan(g, semantics="c"), zero, ew, ow)
+        for b in range(3):
+            assert rel(rows[b:b + 1], eng.graph_kl(eng.plan(g, semantics="c"), zero, ew[b:b + 1], ow[b:b + 1])) < REL
+
+    # the whole model, every site's output on the text
+    model = native.Graph(masks={n: torch.ones(1, 1, dtype=torch.bool, device=nat.dev) for n in nat.names})
+    ones = {n: torch.ones(1, 1, nat.C[n], device=nat.dev) for n in nat.names}
+    o = {}
+    with torch.no_grad():
+        base = eng.graph_log_probs(eng.plan(model, semantics="c"), ones, rec_out=o)
+    o = {n: v[0] for n, v in o.items()}
+    x = {0: eng.emb[0].clone()}  # the stream before each stage: (layer, 0) attention, (layer, 1) MLP
+    stream = eng.emb[0].clone()
+    for i in range(tg.n_layer):
+        x[(i, 0)] = stream.clone()
+        stream = stream + o[native.site_name(i, "o_proj")]
+        x[(i, 1)] = stream.clone()
+        stream = stream + o[native.site_name(i, "down_proj")]
+    final = stream
+    W = lambda n: tg.site(n).W.T  # noqa: E731
+    rms = lambda v, w: vpd_model.rms(v, w, tg.eps)  # noqa: E731
+
+    def patched(n, at, val):  # the model with site n's whole output at position at replaced
+        m = torch.zeros(1, T, dtype=torch.bool, device=nat.dev)
+        m[0, at] = True
+        full = o[n].clone()
+        full[at] = val
+        with torch.no_grad():
+            return eng.graph_log_probs(eng.plan(model, semantics="c"), ones, outputs={n: (m, full[None])})
+
+    o0, f1, d1 = "h.0.attn.o_proj", "h.1.mlp.c_fc", "h.1.mlp.down_proj"
+    cases, want = [], []
+    # residual block -> residual block
+    cases.append({(f1, t, BL): [(o0, t, BL)]})
+    want.append(patched(f1, t, rms(x[(1, 1)][t] - o[o0][t], tg.norms[3]) @ W(f1)))
+    # residual block -> one subcomponent, and one subcomponent -> block
+    st = tg.site(f1)
+    h_old, h_new = rms(x[(1, 1)][t], tg.norms[3]), rms(x[(1, 1)][t] - o[o0][t], tg.norms[3])
+    c = int((((h_new - h_old) @ st.V).abs() * st.U.norm(dim=1)).argmax())  # the subcomponent the cut moves most
+    cases.append({(f1, t, c): [(o0, t, BL)]})
+    want.append(patched(f1, t, o[f1][t] + ((h_new - h_old) @ st.V[:, c]) * st.U[c]))
+    so = tg.site(o0)  # layer 0's attention output at t, from its queries, keys and values
+    q, k, v = (o[native.site_name(0, kd)].view(T, tg.n_head, tg.hd).transpose(0, 1)[None] for kd in ("q_proj", "k_proj", "v_proj"))
+    P0 = ((tg._rope(q, T) @ tg._rope(k, T).transpose(-1, -2)) / tg.hd ** 0.5).masked_fill(~torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril(), float("-inf")).softmax(-1)
+    y0 = (P0 @ v)[0].transpose(0, 1).reshape(T, -1)
+    c7 = int(((y0[t] @ so.V).abs() * so.U.norm(dim=1)).argmax())  # layer 0's largest write at t
+    a_w = float(y0[t] @ so.V[:, c7])
+    cases.append({(f1, t, BL): [(o0, t, c7)]})
+    want.append(patched(f1, t, rms(x[(1, 1)][t] - a_w * so.U[c7], tg.norms[3]) @ W(f1)))
+    # inside the GELU: an MLP input block into its output block reads nothing of it
+    cases.append({(d1, t, BL): [(f1, t, BL)]})
+    want.append(patched(d1, t, torch.zeros_like(o[d1][t])))
+    # a value block through the pattern into an attention output block (layer 2)
+    v2, o2 = "h.2.attn.v_proj", "h.2.attn.o_proj"
+    q, k, v = (o[native.site_name(2, kd)].view(T, tg.n_head, tg.hd).transpose(0, 1)[None] for kd in ("q_proj", "k_proj", "v_proj"))
+    P2 = ((tg._rope(q, T) @ tg._rope(k, T).transpose(-1, -2)) / tg.hd ** 0.5).masked_fill(~torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril(), float("-inf")).softmax(-1)
+    y2 = (P2 @ v)[0].transpose(0, 1).reshape(T, -1)
+    yt = y2[t] - P2[0, :, t, s].repeat_interleave(tg.hd) * o[v2][s]
+    cases.append({(o2, t, BL): [(v2, s, BL)]})
+    want.append(patched(o2, t, yt @ W(o2)))
+    # a residual block into the prediction
+    d3 = "h.3.mlp.down_proj"
+    z = final[targets].clone()
+    z[targets.index(t)] -= o[d3][t]
+    cases.append({None: [(d3, t, BL)]})
+    want.append(torch.log_softmax(rms(z, tg.ln_f) @ tg.wte.T, -1)[None])
+    with torch.no_grad():
+        got = eng.graph_log_probs(eng.plan([model] * len(cases), semantics="c", cuts=cases), ones)
+    ref = nat.reference([ids], targets)
+    for j, w in enumerate(want):
+        a, b = float(carry.kl(ref, w)[0]), float(carry.kl(ref, got[j:j + 1])[0])
+        assert abs(a - b) < 1e-5 + REL * abs(a), (j, cases[j], a, b)
+        assert a > 1e-4 or j == 3, (j, a)  # each cut moves the model (the MLP case: only when its output there matters)
+    assert float(carry.kl(ref, base)[0]) < 1e-5
+    with pytest.raises(ValueError):
+        eng.plan(g, semantics="native")

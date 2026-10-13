@@ -2660,7 +2660,8 @@ def test_pattern_family_engine_equals_graph_ref(tiny):
 
 def test_family_eps_resamples_as_arrays():
     """family_eps' resamples as arrays (_pooled_resamples) give the per-resample loop's eps (the same draws: one
-    generator call per family) on random rows of every pooling kind, within float rounding."""
+    generator call per family) on random rows of every pooling kind, within float rounding; only= (line_loo's
+    recomputed families) gives those families' eps unchanged."""
     def loop(row):
         rng = np.random.default_rng(0)
         out = {}
@@ -2688,3 +2689,45 @@ def test_family_eps_resamples_as_arrays():
                "rl_terms": {"s_track_pp": 0.1} if trial % 2 else {}}
         a, b = loop(row), goal_eval.family_eps(row)
         assert all(abs(a[f] - b[f]) < 1e-12 for f in a), (a, b)
+        only = [f for f in goal_eval.PHI_FAMILIES if f not in goal_eval.GoalEval.LOO_HELD]  # line_loo's: the others' indices
+        assert goal_eval.family_eps(row, only=only) == {f: b[f] for f in only}  # still drawn, the same eps
+
+
+def test_line_loo_one_plan_equals_per_deletion(tiny, monkeypatch):
+    """line_loo's one-plan path (_loo_c: every deletion's point, wiring, N and pattern runs at per-row strengths, the
+    deleted nodes taken out of the circuit; a complete graph's at per-row u) gives the per-deletion path's phi on every
+    line, on stated graphs with and without stated pairs and on a complete graph, within 1e-4."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    g = torch.Generator().manual_seed(29)
+    pool = tiny_pool(nat, tx.ids)
+    for gr in (_pp_stated(_pp_nodes(every, g, 0.3, blocks=0.0), tx.targets, g, keep=0.8),
+               native.Graph(every[::6], *native.all_edges(every[::6], tx.targets)), native.Graph(every[::4], complete=True)):
+        gr = goal_eval.strand(gr, tx.targets, nat.C)
+        base = ge.fidelity(tx, [gr], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+        fast = ge.line_loo(tx, gr, pool, draws=4, bits_start=1000.0, base=base)
+        monkeypatch.setattr(goal_eval.GoalEval, "LOO_FAST", False)
+        slow = ge.line_loo(tx, gr, pool, draws=4, bits_start=1000.0, base=base)
+        monkeypatch.setattr(goal_eval.GoalEval, "LOO_FAST", True)
+        assert len(fast["lines"]) == len(slow["lines"]) > 5
+        for a, b in zip(fast["lines"], slow["lines"]):
+            assert a["line"] == b["line"] and abs(a["phi"] - b["phi"]) < 1e-4 and a["bits"] == b["bits"], (a, b)
+
+
+def test_removed_kl_engine_equals_masked_run(tiny):
+    """_removed_kl with the remainders on (N's and real_removal's runs) on the engine equals the masked run over every
+    subcomponent (native.run, u = 1 less each set) within 1e-5 bits relative, on sets at several positions and the
+    empty set."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(every[::3], complete=True), native.Graph(every[1::5], complete=True),
+              native.Graph([nd for nd in every if nd[1] >= max(tx.targets) - 2], complete=True), native.Graph()]
+    sets = [ge.masks(g, tx.T) for g in graphs]
+    got = ge._removed_kl(tx.ids, tx.targets, sets, tx.ref)
+    one_r = nat._one()[1]
+    none = {n: torch.zeros(1, tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+    u = {n: 1.0 - torch.stack([m[n] for m in sets]).float() for n in nat.names}
+    want = carry.kl(tx.ref, nat.run(tx.ids, tx.targets, {**nat._full_plan(tx.T, len(sets)), "G": none, "none": True}, u, one_r)).tolist()
+    for a, b in zip(got, want):
+        assert abs(a - b) < 1e-5 + 1e-5 * b, (a, b)
+    assert got[-1] < 1e-6 and max(got[:-1]) > 1e-3

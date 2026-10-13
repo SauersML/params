@@ -40,6 +40,7 @@ and u.
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 
 import torch
@@ -49,6 +50,8 @@ import carry
 import native
 
 PRECISIONS = ("score", "tf32", "bf16")
+BLOCK = -1  # a block node's index (goal_eval.BLOCK): (site, position, BLOCK), the site's whole output there as one unit
+BK = "#block"  # a plan's table key for a site's blocks: site + BK (its readers and writers tables the same rows)
 
 
 class Engine:
@@ -78,6 +81,29 @@ class Engine:
                 self.R[n] = ((st.W.T if live else st.V @ st.U) - self.V[n] @ self.U[n]).contiguous()
         self._dt, self._cast = None, {}  # the products' dtype in the current run (None: float32), the weights' casts
         self._search = torch.compile(self.hidden, dynamic=False) if compile else self.hidden
+
+    def _whole(self, n: str) -> torch.Tensor:
+        """Site n's whole matrix [d_in, d_out], a block's (every subcomponent and, with the remainders live, the
+        remainder: W; else V U), made once."""
+        whole = self.__dict__.setdefault("_wholes", {})
+        if n not in whole:
+            st = self.tg.site(n)
+            whole[n] = (st.W.T if self.live else st.V @ st.U).contiguous()
+        return whole[n]
+
+    def on(self, ids: list[int], targets: list[int]) -> Engine:
+        """This engine on another text (ids, targets): its columns, weights and settings shared, the text's own model
+        run (ref) and embedding made (goal_eval's N: one removal set on many control texts)."""
+        e = copy.copy(self)
+        e.ids, e.targets, e.T = list(ids), list(targets), len(ids)
+        with torch.no_grad():
+            e.ref = self.nat.reference([e.ids], e.targets)
+            e.emb = self.tg.embed(torch.tensor(e.ids, device=self.dev))[None]
+        e._targets = torch.tensor(e.targets, device=self.dev)
+        e._causal_targets = torch.arange(e.T, device=self.dev)[None, :] <= e._targets[:, None]
+        e.__dict__.pop("_xr", None)  # the text's own x run (path_patched), made when asked
+        e._search = e.hidden if self._search == self.hidden else torch.compile(e.hidden, dynamic=False)
+        return e
 
     def width(self, n: str) -> int:
         """The number of a site's columns (a mask's last dimension)."""
@@ -230,9 +256,12 @@ class Engine:
                 raise ValueError(f"node {(n, c)} is outside the engine's columns")
             return inv[n][c]
 
-        def row(table, b, nd):
-            rows = table.setdefault(nd[0], {})
-            return rows.setdefault((b, nd[1], col(nd[0], nd[2])), len(rows))
+        def key(nd):  # a node's table key: its site, a block's site + BK
+            return nd[0] + BK if nd[2] == BLOCK else nd[0]
+
+        def row(table, b, nd):  # a block's third field: 1 for one of the graph's own blocks, 0 for one only its cuts name
+            rows = table.setdefault(key(nd), {})
+            return rows.setdefault((b, nd[1], int(nd in own) if nd[2] == BLOCK else col(nd[0], nd[2])), len(rows))
 
         readers, writers, edges, outs, qk, nodes, E, O = {}, {}, {}, {}, {}, {}, 0, 0
         pairs = {}  # per layer, each read with stated pairs: (row, query position, [(query column | None, (key position, key
@@ -241,6 +270,13 @@ class Engine:
             pcut = {k[1:]: v for k, v in (cuts[b] or {}).items() if _pair_cut(k)}  # (layer, t): (split nodes, pairs removed)
             cuts[b] = {r: ws for r, ws in (cuts[b] or {}).items() if not _pair_cut(r)}
             cut = {(w, r) for r, ws in cuts[b].items() for w in ws}
+            own = {nd for nd in (g.node_set() if getattr(g, "masks", None) is None else ()) if nd[2] == BLOCK}
+            named = own | {nd for r, ws in cuts[b].items() for nd in (r, *ws) if nd is not None and nd[2] == BLOCK}
+            if named and semantics != "c":
+                raise ValueError("blocks run in C's semantics")
+            for nd in sorted(named):  # every block a reader and a writer, the same rows in both tables
+                row(readers, b, nd)
+                row(writers, b, nd)
             if g.complete:  # its subcomponents read each other in full (u): only the cuts are connections here
                 at, par = {}, {r: list(ws) for r, ws in (cuts[b] or {}).items() if r is not None}
                 out = list((cuts[b] or {}).get(None, []))
@@ -253,7 +289,7 @@ class Engine:
             for r, ws in par.items():
                 ri = row(readers, b, r)
                 for w in ws:
-                    lst = edges.setdefault((r[0], w[0]), ([], [], [], []))
+                    lst = edges.setdefault((key(r), key(w)), ([], [], [], []))
                     lst[0].append(ri)
                     lst[1].append(row(writers, b, w))
                     lst[2].append(at.get((w, r), 0))
@@ -261,7 +297,7 @@ class Engine:
             for w in out:
                 if w[1] not in self.targets:
                     raise ValueError(f"{w} writes into the prediction but is not at a target")
-                lst = outs.setdefault(w[0], ([], [], [], [], []))
+                lst = outs.setdefault(key(w), ([], [], [], [], []))
                 lst[0].append(b)
                 lst[1].append(self.targets.index(w[1]))
                 lst[2].append(row(writers, b, w))
@@ -277,6 +313,9 @@ class Engine:
                 if (layer, t) in pcut:
                     gone = set(pcut[(layer, t)][1])
                     keep = [x for x in keep if x not in gone]
+                if any(nd is not None and nd[2] == BLOCK for x in keep for nd in x):
+                    raise ValueError("query-key pairs name subcomponents, not blocks")
+                split = [nd for nd in split if nd[2] != BLOCK]  # a block query or key: the rest of its read
                 nq, nk = native.site_name(layer, "q_proj"), native.site_name(layer, "k_proj")
                 pairs.setdefault(layer, []).append((
                     b, t, [(None if qa is None else col(nq, qa[2]), None if kb is None else (kb[1], col(nk, kb[2]))) for qa, kb in keep],
@@ -284,6 +323,8 @@ class Engine:
             if g.complete:
                 continue
             for n, t, c in g.node_set():
+                if c == BLOCK:
+                    continue
                 nodes.setdefault(n, set()).add((b, t, col(n, c)))
                 if n.endswith(("q_proj", "k_proj")):
                     qk.setdefault(n, set()).add((b, t, col(n, c)))
@@ -395,7 +436,8 @@ class Engine:
     def graph_log_probs(self, plan: dict, u: dict | None = None, ew: torch.Tensor | None = None, ow: torch.Tensor | None = None,
                         precision: str = "score", patch: dict | None = None, reads: dict | None = None, keep: dict | None = None,
                         reuse: tuple | None = None, ewn: torch.Tensor | None = None, own: torch.Tensor | None = None,
-                        outputs: dict | None = None, rec_out: dict | None = None, rows: list | None = None):
+                        outputs: dict | None = None, rec_out: dict | None = None, rows: list | None = None,
+                        off: list | None = None):
         """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32. patch:
         {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange). reads as
         log_probs': (log q, {site: [n]}). keep, a dict, receives the run's states for reuse (each layer's keys and
@@ -412,7 +454,9 @@ class Engine:
         patching at a site and position; with patch's activations there, a block of variables.py); rec_out, a dict,
         receives every site's output [B, T, d_out] (float32 runs without reuse). rows: per row None or {(layer, t): [H,
         t + 1]}, attention rows used in place of the run's own at those reads (goal_eval.graph_ref's rows,
-        pattern_family; float32 runs of every position)."""
+        pattern_family; float32 runs of every position). off: per row None or a list of the plan's circuit nodes (site,
+        position, subcomponent) taken out of that row's circuit (C's semantics: outside it, at u; with their connections
+        at strength 0, the run of the graph without them: line deletions on one plan)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if (keep is not None or reuse is not None) and (precision != "score" or patch is not None or reads is not None):
@@ -427,6 +471,10 @@ class Engine:
             raise ValueError("reuse starts after position 0 and no later than the first target")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
         p = self._rows(plan, B)
+        if off is not None:
+            if p["semantics"] != "c":
+                raise ValueError("off takes C's semantics")
+            p = self._without(p, off)
         with _precision(precision, self.dev), self._dtype(precision):
             rec = None if reads is None else (reads, {})
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
@@ -435,6 +483,26 @@ class Engine:
                                    rows)
         lq = torch.log_softmax(self.tg.unembed(h.float()), -1)
         return lq if rec is None else (lq, rec[1])
+
+    def _without(self, p: dict, off: list) -> dict:
+        """A laid-out plan with some rows' circuit nodes dropped from its circuit and query-key tables (graph_log_probs'
+        off): those nodes then stand at u, outside the circuit, in their rows."""
+        T, drop = self.T, {}
+        for b, nds in enumerate(off):
+            for n, t, c in nds or []:
+                cols = self.columns[n]
+                k = c if cols is None else int((cols == c).nonzero().flatten()[0])
+                drop.setdefault(n, []).append((b * T + t) * self.width(n) + k)
+        out = dict(p)
+        for key in ("nodes", "qk"):
+            tab = {}
+            for n, (b, t, c) in p[key].items():
+                if n in drop:
+                    keep = ~torch.isin((b * T + t) * self.width(n) + c, torch.tensor(drop[n], device=self.dev))
+                    b, t, c = b[keep], t[keep], c[keep]
+                tab[n] = (b, t, c)
+            out[key] = tab
+        return out
 
     @staticmethod
     def tile_states(states: dict, times: int) -> dict:
@@ -1344,7 +1412,7 @@ class Engine:
                 if wn in off:
                     per.setdefault(rn, []).append((ri, off[wn] + wi, j, fx, coff[wn] + Wr[wn][2][wi]))
             cons = {rn: tuple(torch.cat(x) for x in zip(*lst)) for rn, lst in per.items()}
-            lst = [(b, ti, off[wn] + wi, j, fx, coff[wn] + Wr[wn][2][wi]) for wn, (b, ti, wi, j, fx) in outs.items()]
+            lst = [(b, ti, off[wn] + wi, j, fx, coff[wn] + Wr[wn][2][wi]) for wn, (b, ti, wi, j, fx) in outs.items() if wn in off]
             p[key] = (off, cons, tuple(torch.cat(x) for x in zip(*lst)) if lst else None)
         return p[key]
 
@@ -1366,6 +1434,10 @@ class Engine:
             one = torch.ones((), device=self.dev)
             u = {n: m.expand(B, T, -1).index_put(p["nodes"][n], one) if n in p["nodes"] else m for n, m in u.items()}
         narrow = fused and rec is None
+        blocks = {k[:-len(BK)] for k in R if k.endswith(BK)}  # sites with blocks (plan's keys site + BK)
+        if blocks and (fused or reuse is not None or keep is not None or ewn is not None or own is not None):
+            raise ValueError("blocks run in float32 runs of every position (no reuse, keep or norm strengths)")
+        bvec, bin_, zb = {}, {r for r, wk in Eg if wk.endswith(BK)}, {}  # blocks' outputs; readers fed by blocks; blocks' inputs
         sel, S = None, set()  # the last layer's positions (the targets) and its sites that run only there
         aw, sw = {}, {}  # per writer site, its writer rows' activations and 1 - u
         lo = 0 if reuse is None else reuse[2]  # the first position computed (reuse: every state before it the base's)
@@ -1410,8 +1482,54 @@ class Engine:
         def shares(rn, e_all=None):  # the connections into reader site rn: (writer site, reader rows, writer rows, share)
             e_all = ew if e_all is None else e_all
             for (r, wn), (ri, wi, j, fx) in Eg.items():
-                if r == rn:
+                if r == rn and not wn.endswith(BK):
                     yield wn, ri, wi, share(wn, wi, fx if e_all is None else e_all[j] * fx)
+
+        def bshares(rk):  # the connections into reader key rk from blocks: (writer site, reader rows, writer rows, e - 1)
+            for (r, wk), (ri, wi, j, fx) in Eg.items():
+                if r == rk and wk.endswith(BK):
+                    yield wk[:-len(BK)], ri, wi, (fx if ew is None else ew[j] * fx) - 1
+
+        def btop(rk, width):  # [rows of rk, width]: its connections from blocks, (e - 1) x each block's output (in the circuit)
+            out = torch.zeros(len(R[rk][0]), width, device=self.dev)
+            for wn, ri, wi, e1 in bshares(rk):
+                out = out.index_add(0, ri, e1[:, None] * bvec[wn][wi])
+            return out
+
+        def block_in(n, x, j):  # a residual reader site's blocks' inputs: their position's stream with their connections'
+            rk = n + BK  # shares (norm j)
+            b, t, _ = R[rk]
+            inp = x[b, t] + topup(rk, x.shape[-1])
+            return norm(inp + btop(rk, x.shape[-1]) if rk in bin_ else inp, j)
+
+        def block_out(n, z):  # a site's blocks' outputs [rows, d_out] from their inputs z: a graph's own block its whole
+            b, t, own_ = R[n + BK]  # output (every subcomponent and, live, the remainder), one its cuts name the run's own at u
+            V, U, Rw = self._w(n)
+            m = u[n][b if u[n].shape[0] > 1 else torch.zeros_like(b), t if u[n].shape[1] > 1 else torch.zeros_like(t)]
+            run = ((z @ V) * m) @ U
+            run = run + z @ Rw if self.fixed else run
+            o = torch.where(own_.bool()[:, None], z @ self._whole(n), run)
+            bvec[n] = o if self.b[n] is None else o + self.b[n]
+            return bvec[n]
+
+        def block_attn(no, nv, y, q, k, Pp):  # an attention output site's blocks' inputs: the attention output at their
+            b, t, _ = R[no + BK]  # positions with their connections' shares (values through the pattern)
+            inp = y[b, t].float()
+            if not any(r == no + BK for r, _ in Eg):
+                return inp
+            if Pp is not None:  # [rows, H, T]
+                P = Pp[b, :, t].float()
+            else:
+                pos, idx = torch.unique(t, return_inverse=True)
+                z = (q[:, :, pos] @ k.transpose(-1, -2)).float() / math.sqrt(hd)
+                P = z.masked_fill(torch.arange(T, device=self.dev)[None, :] > pos[:, None], float("-inf")).softmax(-1)[b, :, idx]
+            for wn, ri, wi, s_ in shares(no + BK):
+                pat = P[ri, :, Wr[wn][1][wi]]
+                inp = inp.index_add(0, ri, s_[:, None] * pat.repeat_interleave(hd, -1) * self.U[nv].index_select(0, Wr[wn][2][wi]))
+            for wn, ri, wi, e1 in bshares(no + BK):
+                pat = P[ri, :, R[wn + BK][1][wi]]
+                inp = inp.index_add(0, ri, e1[:, None] * pat.repeat_interleave(hd, -1) * bvec[wn][wi])
+            return inp
 
         def resid_share(gi, j, fx, e_all):  # residual connections' shares from their writers' places gi
             e = fx if e_all is None else e_all[j] * fx
@@ -1434,7 +1552,8 @@ class Engine:
         def resid_in(n, x, j):  # residual readers' inputs: their position's stream with their parents' extra shares (norm j)
             b, t, _ = R[n]
             if ewn is None:
-                return norm(x[b, t] + topup(n, x.shape[-1]), j)
+                inp = x[b, t] + topup(n, x.shape[-1])
+                return norm(inp + btop(n, x.shape[-1]) if n in bin_ else inp, j)
             num, den = x[b, t] + topup(n, x.shape[-1]), x[b, t] + topup(n, x.shape[-1], ewn).float()  # the read; the norm's scale
             return tg.norm_parts(num, den, j)
 
@@ -1458,6 +1577,8 @@ class Engine:
                 hn, xn = (h[:, sel], x[:, sel]) if n in S else (h, x)
                 a = self._mm(hn, self._w(n)[0])
                 A[kd] = done(n, read(n, a, resid_in(n, xn, n1)) if n in R else a)
+                if n in blocks:
+                    zb[n] = block_in(n, x, n1)
 
             def out(kd, z, scale):
                 n = name(kd)
@@ -1465,6 +1586,9 @@ class Engine:
                 o = (A[kd] * scale.to(A[kd].dtype)) @ U
                 o = o + self._mm(z, Rw) if self.fixed else o
                 o = o if self.b[n] is None else o + self.b[n]
+                if n in blocks:  # its blocks' outputs, from their inputs (zb: with their connections' shares)
+                    b, t, _ = p["readers"][n + BK]
+                    o = o.index_put((b, t), block_out(n, zb.pop(n) if n in zb else z[b, t]).to(o.dtype))
                 if outputs is not None and n in outputs:  # the site's whole output replaced at those positions
                     m, val = outputs[n]
                     o = torch.where(m[..., None], val.to(o.dtype), o)
@@ -1539,7 +1663,12 @@ class Engine:
                         pat = P[b[ri], :, idx[ri], Wr[wn][1][wi]]  # [n, H]: how much each reader's position attends to its writer's
                         inp = _add_rows(inp, ri, s, lambda k, pat=pat, wn=wn, wi=wi:
                                         pat[k].repeat_interleave(hd, -1) * self.U[nv].index_select(0, Wr[wn][2][wi[k]]))
+                    for wn, ri, wi, e1 in bshares(no):  # a value block's whole value through the pattern
+                        pat = P[b[ri], :, idx[ri], R[wn + BK][1][wi]]
+                        inp = inp.index_add(0, ri, e1[:, None] * pat.repeat_interleave(hd, -1) * bvec[wn][wi])
                 a = read(no, a, inp)
+            if no in blocks:
+                zb[no] = block_attn(no, nv, y, q, k, Pp)
             A["o_proj"] = done(no, a)
             if no in S:
                 x = x[:, sel]
@@ -1548,12 +1677,19 @@ class Engine:
             nf, nd = name("c_fc"), name("down_proj")
             a = self._mm(h, self._w(nf)[0])
             A["c_fc"] = done(nf, read(nf, a, resid_in(nf, x, n2)) if nf in R else a)
+            if nf in blocks:
+                zb[nf] = block_in(nf, x, n2)
             pre = out("c_fc", h, cut(nf, u[nf]))
             g = act(pre)
             a = self._mm(g, self._w(nd)[0])
             if nd in R:
                 b, t, _ = R[nd]
-                a = read(nd, a, act(pre[b, t] + topup(nd, pre.shape[-1])))
+                inp = pre[b, t] + topup(nd, pre.shape[-1])
+                a = read(nd, a, act(inp + btop(nd, pre.shape[-1]) if nd in bin_ else inp))
+            if nd in blocks:  # its blocks inside the GELU
+                b, t, _ = R[nd + BK]
+                inp = pre[b, t] + topup(nd + BK, pre.shape[-1])
+                zb[nd] = act(inp + btop(nd + BK, pre.shape[-1]) if nd + BK in bin_ else inp)
             A["down_proj"] = done(nd, a)
             x = x + out("down_proj", g, cut(nd, u[nd]))
         z = x if sel is not None else x[:, self._targets - lo]
@@ -1565,6 +1701,9 @@ class Engine:
         if cout is not None:  # the connections into the prediction, every writer site's at once
             b, ti, gi, j, fx, uc = cout
             z = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)
+        for wk, (b, ti, wi, j, fx) in outs.items():  # blocks into the prediction
+            if wk.endswith(BK):
+                z = z.index_put((b, ti), ((fx if ow is None else ow[j] * fx) - 1)[:, None] * bvec[wk[:-len(BK)]][wi], accumulate=True)
         return norm(z, -1)
 
 
@@ -1577,8 +1716,8 @@ def read_pairs(nodes, layer: int, t: int) -> list:
     """Every query-key pair of a read (layer, query position t) split by nodes: (a query node of the layer at t or None,
     a key node of the layer at or before t or None), not both None (the background, always in)."""
     nq, nk = native.site_name(layer, "q_proj"), native.site_name(layer, "k_proj")
-    qs = [nd for nd in sorted(nodes) if nd[0] == nq and nd[1] == t]
-    ks = [nd for nd in sorted(nodes) if nd[0] == nk and nd[1] <= t]
+    qs = [nd for nd in sorted(nodes) if nd[0] == nq and nd[1] == t and nd[2] != BLOCK]  # (a block: the read's rest)
+    ks = [nd for nd in sorted(nodes) if nd[0] == nk and nd[1] <= t and nd[2] != BLOCK]
     return [(a, b) for a in qs + [None] for b in ks + [None] if a is not None or b is not None]
 
 

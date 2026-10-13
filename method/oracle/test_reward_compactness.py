@@ -68,6 +68,8 @@ def test_opt_in_calibration_draws_roundtrip_without_scoring_changes(monkeypatch,
     row = {'c': .8, 'kl_empty_live': 2., 'rl_terms': {'s_point_c': .8,
            's_nodes': goal_eval._pooled_raw(draws), 'n_spec': goal_eval._spec(controls, raw=True)},
            'draws_nodes': draws, 'draws_n_spec': controls}
+    row.update({key: .6 for key, _, _ in goal_eval.PHI_FAMILIES.values()})
+    row['f1_flips_c'] = {1: .9, goal_eval.FLIP_TERM: .23, 8: .11}
     row.update({'eps_' + key: value for key, value in goal_eval.family_eps(row).items()})
     calls = []
 
@@ -89,6 +91,11 @@ def test_opt_in_calibration_draws_roundtrip_without_scoring_changes(monkeypatch,
     saved = json.loads(checkpoint.read_text())['calibration_evidence']
     assert saved['row']['draws_nodes'] == draws
     assert saved['row']['draws_n_spec'] == controls
+    assert saved['row']['f1_flips_c'] == {'1': .9, str(goal_eval.FLIP_TERM): .23, '8': .11}
+    for family in goal_eval.PHI_FAMILIES:
+        assert goal_eval.family_score(saved['row'], family) == goal_eval.family_score(row, family)
+    families = list(goal_eval.PHI_FAMILIES)
+    assert goal_eval.phi(saved['row'], families=families)[0] == pytest.approx(goal_eval.phi(row, families=families)[0])
     assert goal_eval.family_eps(saved['row']) == pytest.approx(goal_eval.family_eps(row))
-    assert goal_eval.phi(saved['row'])[0] == pytest.approx(normal['phi'])
+    assert goal_eval.phi(saved['row'])[0] == pytest.approx(normal['phi_full'])  # reward's phi additionally caps at the bar
     assert len(saved['scorer_sha256']) == 64

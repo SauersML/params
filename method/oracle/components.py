@@ -1595,12 +1595,13 @@ def calibration_evidence(row: dict, split: str | None) -> dict:
     import goal_eval
 
     keys = {key for _, _, key in goal_eval.PHI_FAMILIES.values() if key}
+    scores = {key for key, _, _ in goal_eval.PHI_FAMILIES.values()}
     return {"version": 1, "mode": "reward", "requested_split": split,
             "scorer_sha256": hashlib.sha256(Path(goal_eval.__file__).read_bytes()).hexdigest(),
             "families": goal_eval.PHI_FAMILIES, "eps_boot": goal_eval.EPS_BOOT,
             "eps_floor": goal_eval.EPS_FLOOR, "bootstrap_seed": 0,
             "draw_counts": {key: len(row.get(key) or []) for key in sorted(keys)},
-            "row": {k: v for k, v in row.items() if k in keys or k in ("c_terms", "rl_terms")
+            "row": {k: v for k, v in row.items() if k in keys or k in scores or k in ("c_terms", "rl_terms")
                     or isinstance(v, (int, float)) or v is None}}
 
 

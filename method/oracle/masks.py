@@ -97,10 +97,22 @@ def train(P: Patcher, src: torch.Tensor, target: torch.Tensor, lam: float, steps
     return logit.detach()
 
 
+RECENT = 8
+
+
+def iso_positions(tx, ins: tuple, at: tuple, skip: tuple = ()) -> list[int]:
+    """The Iso donors' positions: the influential ones (tx.f2) and the RECENT just before the carrier, strictly before it
+    (a change at or after the carrier passes through it by construction), outside the inputs and skip. The recent ones
+    because F2 can hold the inputs alone (text6011 on CUDA: [233]), which leaves no Iso donor."""
+    lo = min(at)
+    qs = {q for q, _ in tx.f2} | set(range(max(lo - RECENT, 0), lo))
+    return sorted(q for q in qs if q < lo and q not in ins and q not in skip)
+
+
 def fit(nat, tx, ins: tuple, at: tuple, cands: list[tuple], lam: float = 0.1, steps: int = STEPS) -> list[tuple]:
     """A variable's mask over cands (subcomponents at the carrier positions at): Cause donors the 64 alternative tokens at
-    each input position (var_classes.alternatives), Iso donors 16 at each influential position strictly before the carrier
-    outside the inputs (a change there reaches the carrier but is not the variable's); the candidates kept."""
+    each input position (var_classes.alternatives), Iso donors 16 at each of iso_positions (a change there reaches the
+    carrier but is not the variable's); the candidates kept."""
     import var_classes
 
     texts, iso = [], []
@@ -109,7 +121,7 @@ def fit(nat, tx, ins: tuple, at: tuple, cands: list[tuple], lam: float = 0.1, st
             x = list(tx.ids)
             x[q] = z
             texts.append(x)
-    for q in [q for q, _ in tx.f2 if q < min(at) and q not in ins]:  # a change at the carrier passes through it
+    for q in iso_positions(tx, ins, at):
         for z in var_classes.alternatives(nat, tx.ids, q, int(tx.seed), top=8, sampled=8):
             x = list(tx.ids)
             x[q] = z

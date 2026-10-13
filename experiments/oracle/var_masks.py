@@ -66,7 +66,7 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
             texts_A.append(x)
             pzA.append((q, z))
     # changes before the carrier (one at or after it passes by construction), not at its inputs or the skipped positions
-    iso_pos = [q for q, _ in tx.f2 if q < min(at) and q not in ins and q not in skip]
+    iso_pos = masks.iso_positions(tx, ins, at, skip)
     iso_A = {q: var_classes.alternatives(nat, tx.ids, q, int(tx.seed), top=8, sampled=8) for q in iso_pos}
     iso_B = {q: var_controls.b_tokens(nat, tx, q, iso_A[q], 4, int(tx.seed)) for q in iso_pos}
     texts_I = []

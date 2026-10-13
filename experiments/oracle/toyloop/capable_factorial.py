@@ -211,13 +211,13 @@ def run(manifest_path, out, tokenizer_path, cap):
                 record('errors.jsonl', {'cell': name, 'step': step, 'stage': 'submission', 'error_type': type(exc).__name__})
                 break  # Drain every submitted forward even when optimizer submission failed.
         for name, family, fb, op, tokens, reservation in pending:
-            if op is None:
-                continue
             try:
                 fb.result(); settle(name + '_sft', tokens, reservation)
             except Exception as exc:
                 errors.append(exc)
         for name, family, fb, op, tokens, reservation in pending:
+            if op is None:
+                continue
             try:
                 op.result(); record('steps.jsonl', {'cell': name, 'step': step, 'sample_ids': m['datasets'][family]['sample_ids'][step]})
             except Exception as exc:

@@ -10,6 +10,14 @@
 %% or evidence changes, update the box and what it feeds, then push main.
 %% Statuses: done, active, check (evidence still needed), blocked, waiting, later, gate.
 %% Preserve other agents' edits; merge, never overwrite.
+%% Evidence-led scope (supplied papers, 2026-10-12): VPD attribution graphs are not executable circuits.
+%% LoRAcles and Weight Oracles already demonstrate weight-input interpretation; our contribution needs
+%% executable relations and independently tested intervention predictions, not merely weight input or English.
+%% Sources: 2610.07334 sections 3-5; 2606.02609 sections 2-4; 2511.08579 section 5;
+%% 2507.08802 theorem 1 + limitations; revised VPD report sections 7.2-7.3.
+%% Keep native carriers and account for semantic-map complexity; test identity cases and unseen values.
+%% Forced-removal stress, input-attainable donors, and weight edits support different claims: report separately.
+%% Reading creates no new gate. Keep the engine, semantic and teacher work; repair actual controls.
 %% Rendering: .github/workflows/plan-render.yml writes plan/plan.png and the image-only README block.
 %% Local preview: mem-lease 2 npx -y @mermaid-js/mermaid-cli@11.4.2 -i plan/plan.mmd -o /tmp/oracle-plan.png -c plan/mermaid.json -b white -s 2
 flowchart BT
@@ -65,8 +73,9 @@ flowchart BT
     I1["<b>Candidate list</b><br/>VPD actives at listed positions;<br/>coverage depends on task and trimming<br/>IMPLEMENTED"]
     I2["<b>Context fit</b><br/>trims 52 of 444 questions,<br/>hiding 21% of their targets<br/>DONE"]
     I3["<b>Coverage audit</b><br/>old prompts showed 14% of targets;<br/>all target IDs remain expressible;<br/>recheck each new rendered format<br/>codex, rustmove"]
-    I4["<b>Learnability grid</b><br/>which input lets subcomponent<br/>effects be learned?<br/>ACTIVE · rustmove"]
+    I4["<b>Learnability grid</b><br/>which input predicts actual effects?<br/>compare text, weights, features<br/>and cheap learned baselines<br/>ACTIVE · rustmove"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
+    I6["<b>Does the oracle use weights?</b><br/>shuffle distinct weight identities;<br/>a new position is not a new weight<br/>FIXED + CI passed · codex<br/>handoff: I4 comparisons on 6560772"]
   end
 
   subgraph REWARD["REWARD · primerl, inframove, generality, codex"]
@@ -74,6 +83,7 @@ flowchart BT
     W2["<b>Falsification set</b><br/>correct copy circuits vs<br/>plausible wrong ones; algorithms<br/>the model does not run must fail<br/>ACTIVE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>common removal tests for all candidates;<br/>absolute sufficiency before size credit;<br/>gate leak shut: slope 10 (6f8a869)<br/>ACTIVE · codex, inframove, primerl"]
+    W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
   end
 
   %% ===================== verifier and foundations =====================
@@ -138,10 +148,12 @@ flowchart BT
   I3 -. identifies missing observations .-> I5
   I5 --> TOOLS
   I4 -. sets the format .-> I1
+  I6 -. validates the weight ablation .-> I4
   W1 --> GATEB
   W2 -. tests .-> GATEB
   W3 -. found the failure .-> W4
   W4 --> GATEB
+  W5 -. checks predictive value .-> W4
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
   T4 -. new circuits .-> TOOLS
@@ -197,8 +209,10 @@ flowchart BT
   class VPD,ENG,PHI,W1,W3,I1,I2,T1,k1 done
   class T2,T3,T5,I4,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3,k2 active
   class I5 done
+  class I6,W5 done
+  class T4 active
   class I3,S2,SUP,LAT1,k8 check
-  class T4,GATEB,k3 blocked
+  class GATEB,k3 blocked
   class S3,ORC,R1,R2,R3,R4,R5,k4 waiting
   class LAT2,UVPD,k6 later
   class GATEA,GATEC,GATED,k5 gate

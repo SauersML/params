@@ -81,6 +81,8 @@
 %% Full wins12/ties4/loses6 texts versus removal, but beats the best cheap control by only4 fields.
 %% Paired text-bootstrap95% intervals: full-minus-removed [-1.09,+7.54]pp; full-minus-activation [-3.01,+5.16]pp.
 %% Gains concentrate in token-change falls and connection cuts. Test displayed-effect controls using train-only fitting.
+%% Input-binding gap: displayed alt0 effects omitted the replacement identity, while QA asks other replacements too.
+%% 2ef5d49 binds future evidence to the measured replacement token/string; frozen prompts and outcomes stay unchanged.
 %% Decision: no further blind SFT scaling; require useful unseen-intervention gains beyond frozen cheap controls.
 %% QA inputs contain causal summaries/CI/activation/wiring cosines, NOT raw U/V vectors; ablation cannot establish weight use.
 %% Relation6011: actual VPD groups T77/O73/A140 from8 construction donors, independent relation donors, fixed sites.
@@ -95,6 +97,9 @@
 %% Token-role arrows remain annotations and English unverified; diagnostic is point sufficiency, not intervention certification.
 %% Four execution regressions pass: same units with a causal edge removed change predictions; full route reproduces model.
 %% Fixed active fixture f64be01 and legacy mock faf86cb; full graph-oracle CI38338224340 passes, including controls.
+%% 81f1e42 also executes --swapped --wiring on each model's own basis/texts; mixed invalid KL stays missing.
+%% Seven wiring tests pass in exact-commit CI38339194823. Later shared-main changes exposed separate graph-contract
+%% test failures; compare canonical graphs against independent references, keep tolerances, verify current integration.
 %% Preserve existing training reward; next use opt-in wiring scores to test learned relations, not unit selection alone.
 %% Literature consequence: measure outcome prediction before free prose; native carriers alone cannot certify meaning.
 %% Offline falsification: real node-response errors coexist with large uncertainty penalties; do not tune them away.
@@ -186,7 +191,7 @@ flowchart BT
   VAR["<b>Variables and invariants</b><br/>carriers, value maps, E4 v2 checker;<br/>nulls and triviality check running;<br/>influential_v2 variables next<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
   ENGP["<b>VPD relational mechanisms</b><br/>joint matching restoration fails;<br/>richer A carrier .903: test coverage;<br/>same-site coverage/remainder control ready<br/>CHECK · codex/variable_reward"]
-  WIRING["<b>Execute the stated wiring</b><br/>architecture-constrained compiler;<br/>edge removal changes predictions;<br/>4 tests and full CI pass; score learned edges<br/>IMPLEMENTED · codex · f64be01"]
+  WIRING["<b>Execute the stated wiring</b><br/>edge removal changes predictions;<br/>swap tests execute both models;<br/>7 checks pass; measure learned edges next<br/>IMPLEMENTED · codex · 81f1e42"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]

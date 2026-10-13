@@ -202,12 +202,21 @@
 %% Recovery freezes15 other tasks,194 original proposals and exact archived task/circuit/carrier hashes; no new labels yet.
 %% Re-execute these proposals on their original carriers, retain numeric outcomes and all failures; avoid new search/writer calls.
 %% Recovery bundle: scratch/variable_reward/claim_recovery;194 parser/binding checks and5 mocked contracts pass.
-%% Paid execution awaits current own-ledger/live-reservation reconciliation under the user-authorized shared40 allowance.
+%% Recovery launched on community L40S pod7tp3n5hs01drpz at$.79/h with15min lifetime, two workers, source6cb561c.
+%% Name: oracle-graph-codex-claim-recovery15-l40-1013. First A6000/A40 attempt ended no-stock, no pod and$0.
+%% Reserved at most$2 from authorized shared40, including setup failures; no further external retries planned.
+%% Fresh prelaunch ownRP settled+fullreservations387.2879 + conservative entireTinker130 + our2 =519.2879 <=530.
+%% Accounting snapshot root/budget.json is not a global launcher-enforced cap; provider-account balance is not our spend.
 %% 6cb561c prevents RULES OUT rewordings/alternative swaps from multiplying credit for the same executed prediction.
 %% Regression reproduced the duplicate execution;61 semantic tests now pass. Free prose is still not certified.
 %% Wiring experiment: old checkpoint is needed only to reproduce that run. A NEW shared frozen SFT start unblocks
 %% an independent matched unit_suff vs wiring_suff training comparison; same seeds/data/budget, SHOW_ACTIVE=0.
-%% Preparing a bounded free-GHA Smol135M run; reused toy families/splits are development evidence, never a pristine test.
+%% cd8d4a9 implements the bounded free-GHA Smol135M pilot; source/model/data/checkpoint/dependency hashes retained.
+%% Tokenizer-only1050-target check max392tokens: fixed416 generation cap/3072context, not old160-token truncation.
+%% First freeGHA job38350629770 builds one300-step SFT start; after completion20-step unit/wiring RL jobs run in parallel.
+%% Identical seeds/data/budget, fixed24-case panel, one greedy answer each; invalids retained, no best-of/checkpoint selection.
+%% Native teacher KL must be <=1e-3bits per input before learning. Partial training stages cannot silently restart.
+%% Reused toy families/splits are shared development evidence, never a pristine test or real-rank-one VPD claim.
 %% No new generation, no verified raw-weight-use claim, no complete policy-visible-text provenance or fresh-input claim.
 %% Explicitly requested replay runs independently of unrelated CI failures; preserve both measurement and failed status.
 %% ad865a3 uses SciPy for exact toy SVD on Mac only; per-head weight reconstruction passes, Linux backend unchanged.
@@ -306,8 +315,8 @@ flowchart BT
   ENGP["<b>Fresh carrier tests</b><br/>209 effects carried;181 unsupported;<br/>3 of7 claims verified for training;<br/>two-input mechanism not established<br/>DONE · codex/variable_reward"]
   ENG209["<b>Does the 209 carrier generalize?</b><br/>32 fresh donors × 3 input positions;<br/>test cause, isolation and worst cases;<br/>free MATS 19680 held; no release<br/>WAITING · codex/variable_reward"]
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
-  CLAIMREC["<b>Diversify checked claims</b><br/>15 training tasks, 194 proposals;<br/>re-execute exact original carriers;<br/>keep failures and numeric proof<br/>PREPARING · codex/variable_reward"]
-  WIRING["<b>Learn executable relations</b><br/>new shared frozen SFT start;<br/>matched unit vs wiring RL rewards;<br/>measure learned edges at fixed cost<br/>PREPARING free GHA · codex/eval_recovery"]
+  CLAIMREC["<b>Diversify checked claims</b><br/>15 training tasks, 194 proposals;<br/>re-execute exact original carriers;<br/>L40S launched, at most $2 reserved<br/>ACTIVE · codex/variable_reward"]
+  WIRING["<b>Learn executable relations</b><br/>shared-start job 38350629770;<br/>then unit vs wiring RL in parallel;<br/>fixed cost, raw outputs and failures<br/>ACTIVE free GHA · codex/eval_recovery"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]

@@ -8,7 +8,7 @@
 # The variables come back to ~/mpd-data/runpod/oracle-graph-vars-$RUN/out/ (var_teacher.py --root) and are copied into
 # ~/mpd-data/graph_oracle/variables/ every minute while the pod runs. HOURS caps the pod.
 #   experiments/oracle/pods/var_teacher_pod.sh HOURS
-#   env: RUN, SPLIT, N, TASKS, CIRCUITS, VARIANTS, P, REF, GPU, PRICE, VRAM, WAIT (minutes of retries while no card is
+#   env: RUN, SPLIT, N, TASKS, CIRCUITS, VARIANTS, DEST, P, REF, GPU, PRICE, VRAM, WAIT (minutes of retries while no card is
 #   in stock)
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
@@ -22,7 +22,7 @@ NAME=oracle-graph-vars-$RUN
 F=/Users/user/mpd-data/scratch/varteach/pod_$RUN
 V=/Users/user/mpd-data/vpd
 O=/Users/user/mpd-data/runpod/$NAME
-DEST=/Users/user/mpd-data/graph_oracle/variables
+DEST=${DEST:-/Users/user/mpd-data/graph_oracle/variables}
 mkdir -p "$F" "$DEST"
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 /usr/bin/python3 -I - "$SPLIT" "$N" "$F" "$CIRCUITS" "${TASKS:-}" <<'EOF' || exit 1

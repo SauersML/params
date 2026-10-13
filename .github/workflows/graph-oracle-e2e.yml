@@ -72,6 +72,8 @@ jobs:
             method/oracle/test_components.py::test_invariants_roundtrip_separate_prose_and_bind_numbered_variables \
             method/oracle/test_components.py::test_invariant_diagnostic_executes_decoded_groups_separately \
             method/oracle/test_components.py::test_invariants_renumber_noncontiguous_refs_after_variable_reordering \
+            method/oracle/test_components.py::test_checked_invariants_reject_wrong_execution_or_group_and_holdout \
+            method/oracle/test_components.py::test_dataset_preserves_checked_invariants_and_failed_provenance_opt_in \
             method/oracle/test_components.py::test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit -q --tb=short
 
       - name: Run the graph oracle's tests

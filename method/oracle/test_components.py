@@ -642,6 +642,81 @@ def test_invariants_renumber_noncontiguous_refs_after_variable_reordering():
     assert components.render(parsed) == rendered
 
 
+def _checked_invariant_fixture(monkeypatch):
+    import copy
+    import hashlib
+    import semantic
+
+    monkeypatch.setattr(components, "_token_of", lambda model, text: {"' donor'": 7, "' out'": 9}.get(text))
+    var = {"name": "V1", "meaning": "unverified gloss", "inputs": [0],
+           "group": [["h.0.attn.v_proj", 1, 0]], "feeds": ["prediction"], "kept": True}
+    line = "I1: V1 from @0=' donor' -> top ' out'"
+    parsed = semantic.parse_invariants(line, "mock")[0][0]
+    group_hash = hashlib.sha256(json.dumps(var["group"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    good = {"line": line, "parsed": parsed, "holds": True, "credit": 2.0,
+            "variable_group_sha256": {"V1": group_hash}, "roundtrip_ids_identical": True,
+            "executed": {"intervention": {"transplants": copy.deepcopy(parsed["intervention"]["transplants"])},
+                         "outcome": copy.deepcopy(parsed["outcome"])}}
+    return {"schema": 1, "task": "text6000", "model": "mock", "split": "train", "selection_role": "supervision",
+            "variables": [var], "claims": [good, {"line": "I2: remove V1 -> p(top) < 0.5", "holds": False, "credit": -1}],
+            "source_sha256": {"semantic": "a" * 64}, "task_sha256": "b" * 64, "circuit_sha256": "c" * 64,
+            "artifact_sha256": "d" * 64}
+
+
+def test_checked_invariants_reject_wrong_execution_or_group_and_holdout(monkeypatch, tmp_path):
+    import copy
+
+    record = _checked_invariant_fixture(monkeypatch)
+    found, labels, provenance = components.checked_invariant_labels(record, None, "mock", "b" * 64, "c" * 64)
+    assert labels == [record["claims"][0]["line"]] and found == record["variables"]
+    assert len(provenance["checks"]) == 2 and provenance["checks"][1]["holds"] is False
+    bad = copy.deepcopy(record)
+    bad["claims"][0]["executed"]["intervention"]["transplants"][0][1][0] = 8
+    with pytest.raises(ValueError, match="execution IDs"):
+        components.checked_invariant_labels(bad, None, "mock", "b" * 64, "c" * 64)
+    bad = copy.deepcopy(record)
+    bad["claims"][0]["variable_group_sha256"]["V1"] = "e" * 64
+    with pytest.raises(ValueError, match="carrier binding"):
+        components.checked_invariant_labels(bad, None, "mock", "b" * 64, "c" * 64)
+    held = tmp_path / "held.json"
+    held.write_text(json.dumps({**record, "task": "text9000", "split": "heldout"}))
+    with pytest.raises(ValueError, match="training supervision"):
+        components.invariant_teach([held])
+
+
+def test_dataset_preserves_checked_invariants_and_failed_provenance_opt_in(monkeypatch, tmp_path):
+    import hashlib
+    from types import SimpleNamespace
+
+    record = _checked_invariant_fixture(monkeypatch)
+    texts, teachers = tmp_path / "texts", tmp_path / "teachers"
+    (texts / "vpd4l").mkdir(parents=True)
+    teachers.mkdir()
+    task = texts / "vpd4l/text6000.json"
+    task.write_text(json.dumps({"id": "text6000", "model": "mock", "prompts": [{"token_ids": [1, 2], "target_positions": [1]}]}))
+    teacher = teachers / "text6000.json"
+    teacher.write_text(json.dumps({"nodes": [["h.0.attn.v_proj", 1, 0]], "edges": [], "complete": True}))
+    record |= {"task_sha256": hashlib.sha256(task.read_bytes()).hexdigest(), "circuit_sha256": hashlib.sha256(teacher.read_bytes()).hexdigest()}
+    monkeypatch.setattr(native, "TEXTS", texts)
+    monkeypatch.setattr(components, "token_strings", lambda model, ids: [" x"] * len(ids))
+    ge = SimpleNamespace(nat=SimpleNamespace(C={"h.0.attn.v_proj": 4}))
+    source, out = tmp_path / "rows.jsonl", tmp_path / "sft.jsonl"
+    row = {"task": "text6000", "question": "fixed input", "qa": [], "invariants": True}
+    source.write_text(json.dumps(row) + "\n")
+    assert components.dataset(source, teachers, out, ge, invariants={"text6000": record}) == 1
+    made = json.loads(out.read_text())
+    assert made["prompt"] == [{"role": "user", "content": "fixed input"}]
+    parsed = components.parse(made["completion"][0]["content"])["answer"]
+    assert parsed["invariants"] == [record["claims"][0]["line"]]
+    assert "I2:" not in made["completion"][0]["content"]
+    assert parsed["variables"][0]["group"] == record["variables"][0]["group"]
+    assert made["info"]["invariant_supervision"]["checks"] == json.loads(json.dumps(record["claims"]))
+    source.write_text(json.dumps({**row, "invariants": False}) + "\n")
+    assert components.dataset(source, teachers, out, ge, invariants={"text6000": record}) == 1
+    legacy = json.loads(out.read_text())
+    assert "INVARIANTS" not in legacy["completion"][0]["content"] and "invariant_supervision" not in legacy["info"]
+
+
 def test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit(monkeypatch, tmp_path, capsys):
     from types import SimpleNamespace
 

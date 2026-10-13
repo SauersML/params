@@ -93,6 +93,7 @@ charged. goal_eval's C, F1, N, F3, the old E2 (from the no-change answer), E3 an
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -2171,7 +2172,8 @@ def vpd_teacher(ge, task: dict, ev: dict, tokens, budget: int = ANSWER_BUDGET, c
                     "tokens": tokens(target(answer, ev, task["model"]))}
 
 
-def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_NODES, variables: list | None = None) -> dict:
+def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_NODES, variables: list | None = None,
+                  invariant_supervision: dict | None = None) -> dict:
     """What a teacher circuit's English may draw on: only what the oracle has or writes at inference, so supervised
     English never states what the oracle cannot know. From the question (evidence()): the text and its target, the
     model's top next tokens, the measured evidence at the listed positions (units.evidence; never the English reader's
@@ -2197,6 +2199,7 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_
             "circuit": circuit_text(render(goal_eval.to_json(g, ""))),  # what E1's reader reads with the English
             "answer": goal_eval.to_json(g, ""),
             **({"variables": variables, "tokens": {str(q): strings[q] for v in variables for q in v["inputs"]}} if variables else {}),
+            **({"invariant_supervision": invariant_supervision} if invariant_supervision is not None else {}),
             "evidence": units.evidence(ev["events"], ev["listed"], strings, tok) if ev.get("events") else [],
             "target_token": strings[max(targets)], "top": prompt["model_top"][0][:3], "nodes_total": len(nodes),
             "positions": sorted({nd[1] for nd in nodes}),
@@ -2279,8 +2282,77 @@ def written_variables(text: str, variables: list[dict]) -> tuple[list[dict], str
     return out, " ".join(" ".join(prose).split())
 
 
+def invariant_teach(paths: list[Path]) -> dict:
+    """Checked training artifacts, never evaluation labels inferred from a commit message or prose."""
+    out = {}
+    for path in paths:
+        raw = path.read_bytes()
+        records = [json.loads(line) for line in raw.splitlines() if line.strip()] if path.suffix == ".jsonl" else [json.loads(raw)]
+        for r in records:
+            task = r.get("task", "")
+            if (r.get("schema") != 1 or r.get("split") != "train" or r.get("selection_role") != "supervision"
+                    or not re.fullmatch(r"text(?:6\d{3}|7\d{3})", task)):
+                raise ValueError(f"invariant artifact must be explicitly training supervision: {task}")
+            if task in out:
+                raise ValueError(f"duplicate invariant artifact: {task}")
+            out[task] = {**r, "artifact_sha256": hashlib.sha256(raw).hexdigest()}
+    return out
+
+
+def checked_invariant_labels(record: dict, found: list[dict] | None, model: str,
+                             task_sha256: str, circuit_sha256: str, task_id: str | None = None) -> tuple[list[dict], list[str], dict]:
+    """Bind positive checked claims to exact carrier groups, donor IDs and source inputs; retain failures as metadata."""
+    import semantic
+
+    if (record.get("schema") != 1 or record.get("split") != "train" or record.get("selection_role") != "supervision"
+            or not re.fullmatch(r"text(?:6\d{3}|7\d{3})", record.get("task", ""))
+            or (task_id is not None and record.get("task") != task_id)):
+        raise ValueError("invariant artifact must be explicitly training supervision")
+    if (record.get("model") != model or record.get("task_sha256") != task_sha256
+            or record.get("circuit_sha256") != circuit_sha256 or not record.get("source_sha256")):
+        raise ValueError("invariant supervision input/source provenance mismatch")
+    if any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+           for value in record["source_sha256"].values()):
+        raise ValueError("invariant supervision needs exact source hashes")
+    digest = lambda group: hashlib.sha256(json.dumps(group, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    variables = record.get("variables") or []
+    groups = {v["name"]: digest(v["group"]) for v in variables}
+    if (not groups or len(groups) != len(variables) or any(not re.fullmatch(r"V\d+", name) for name in groups)
+            or any(not v.get("group") or v.get("kept") is False for v in variables)):
+        raise ValueError("invariant supervision needs distinct exact variable bindings")
+    if found is not None and {v["name"]: digest(v["group"]) for v in found} != groups:
+        raise ValueError("invariant supervision variable group mismatch")
+    normalized = lambda x: json.dumps(json.loads(json.dumps(x)), sort_keys=True)
+    labels = []
+    for claim in record.get("claims") or []:
+        credit = claim.get("credit")
+        if claim.get("holds") is not True or not isinstance(credit, (int, float)) or not math.isfinite(credit) or credit <= 0:
+            continue
+        parsed, bad = semantic.parse_invariants(claim["line"], model)
+        if bad or len(parsed) != 1 or normalized(parsed[0]) != normalized(claim.get("parsed")):
+            raise ValueError("verified invariant line/donor/outcome mismatch")
+        executed = claim.get("executed") or {}
+        original_iv = executed.get("intervention")
+        original_iv = {"tokens": {}, "transplants": [], "remove": [], **original_iv} if isinstance(original_iv, dict) else None
+        if (claim.get("roundtrip_ids_identical") is not True
+                or normalized(parsed[0]["intervention"]) != normalized(original_iv)
+                or normalized(parsed[0]["outcome"]) != normalized(executed.get("outcome"))):
+            raise ValueError("verified invariant execution IDs mismatch")
+        iv = parsed[0]["intervention"]
+        names = {name for name, _ in iv["transplants"]} | set(iv["remove"])
+        if not names or claim.get("variable_group_sha256") != {name: groups.get(name) for name in names} or not names <= groups.keys():
+            raise ValueError("verified invariant carrier binding mismatch")
+        labels.append(claim["line"])
+    _, bad = semantic.parse_invariants("\n".join(labels), model)
+    if bad:
+        raise ValueError("duplicate or conflicting verified invariant labels")
+    provenance = {k: record[k] for k in ("task", "split", "selection_role", "task_sha256", "circuit_sha256", "source_sha256", "artifact_sha256")}
+    provenance["checks"] = record.get("claims") or []  # failed checks remain available, never teacher labels
+    return variables, labels, provenance
+
+
 def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | None = None, edits: dict | None = None,
-            variables: dict | None = None) -> int:
+            variables: dict | None = None, invariants: dict | None = None) -> int:
     """SFT rows ({"prompt": [user message], "completion": [assistant message], "info": {"task"}}, units_sft.py's
     format) for the questions that have a teacher answer: TEACHER_DIR/<task>.json (goal_eval's circuit JSON; nodes
     without edges get with_edges(), which needs ge) or <task>.txt (this module's text). english: task -> the chosen
@@ -2297,6 +2369,10 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
     n = 0
     with out.open("w") as f:
         for r in map(json.loads, rows.read_text().splitlines()):
+            record = (invariants or {}).get(r["task"]) if r.get("invariants") else None
+            if r.get("invariants") and record is None:
+                print(json.dumps({"event": "dataset_skip", "task": r["task"], "reason": "no_invariant_supervision"}), file=sys.stderr)
+                continue
             js, txt = teacher_dir / f"{r['task']}.json", teacher_dir / f"{r['task']}.txt"
             if js.exists():
                 answer = json.loads(js.read_text())
@@ -2312,11 +2388,24 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
             prompt = task["prompts"][0]
             g, d = goal_eval.circuit(answer, prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
             found = (variables or {}).get(r["task"], answer.get("variables"))
+            labels, provenance = [], None
+            if record is not None:
+                source = js if js.exists() else txt
+                found, labels, provenance = checked_invariant_labels(record, found, task["model"],
+                    hashlib.sha256((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_bytes()).hexdigest(),
+                    hashlib.sha256(source.read_bytes()).hexdigest(), r["task"])
+                if not labels:
+                    print(json.dumps({"event": "dataset_skip", "task": r["task"], "reason": "no_positive_checked_invariants"}), file=sys.stderr)
+                    continue
             answer = goal_eval.to_json(g, answer.get("explanation", "")) | ({"variables": found} if found else {})
+            if labels:
+                answer["invariants"] = labels
             if r.get("variables") and not found:
                 continue  # the question asks for VARIABLES (rerender --variables): no target without them
             info = {"task": r["task"], "stranded": d["stranded_nodes"], "dropped_nodes": d["invalid_nodes"], "dropped_edges": d["invalid_edges"],
                     "variables": len(found or [])}
+            if provenance is not None:
+                info |= {"invariants": len(labels), "invariant_supervision": provenance}
             if english and r["task"] in english:
                 answer = {**answer, "explanation": english[r["task"]]}
             ops = teacher_edits(edits, r)
@@ -2826,6 +2915,7 @@ def main():
     fa.add_argument("--n", type=int, default=10)
     fa.add_argument("--device", help="cpu keeps it off a busy GPU (a few cuts per text)")
     fa.add_argument("--variables", type=Path, help="the teacher's variables: a directory of <task>.json, {\"variables\": [...]}")
+    fa.add_argument("--invariants-teach", type=Path, action="append", default=[], help="checked train-only invariant artifact JSON/JSONL; facts retain all checks and source provenance")
     d = sub.add_parser("dataset")
     d.add_argument("rows", type=Path)
     d.add_argument("teacher", type=Path)
@@ -2833,6 +2923,7 @@ def main():
     d.add_argument("--english", type=Path, help="tinker_train.py explain output: each text's chosen explanation")
     d.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (the edit teacher's edits)")
     d.add_argument("--variables", type=Path, help="a directory of <task>.json, {\"variables\": [...]} (variables.py's JSON, meanings written)")
+    d.add_argument("--invariants-teach", type=Path, action="append", default=[], help="checked train-only artifact JSON/JSONL; only explicitly invariant-enabled rows receive positive verified labels")
     nz = sub.add_parser("noise", help="C's draw noise per answer (c_noise()): a check on goal_eval's eps")
     nz.add_argument("split", choices=("train", "heldout", "hard"))
     nz.add_argument("rows", type=Path)
@@ -2925,10 +3016,12 @@ def main():
         if args.english:  # the writer's variables (meanings written) over the teacher's
             found |= {r["task"]: r["variables"] for r in map(json.loads, args.english.read_text().splitlines()) if r.get("variables")}
         print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval(), english,
-                      edit_teach(args.edit_teach) if args.edit_teach else None, found or None), "rows", flush=True)
+                      edit_teach(args.edit_teach) if args.edit_teach else None, found or None,
+                      invariant_teach(args.invariants_teach) if args.invariants_teach else None), "rows", flush=True)
         return
     if args.cmd == "facts":
         ge = goal_eval.GoalEval(native.Native(args.device))
+        invariant_records = invariant_teach(args.invariants_teach) if args.invariants_teach else {}
         n = 0
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
@@ -2940,7 +3033,14 @@ def main():
                 g, _ = goal_eval.circuit(json.loads(js.read_text()), prompt["target_positions"], ge.nat.C, len(prompt["token_ids"]))
                 vs = args.variables / f"{r['task']}.json" if args.variables else None
                 vs = json.loads(vs.read_text())["variables"] if vs and vs.exists() else None
-                f.write(json.dumps(teacher_facts(ge, task, r, goal_eval.to_json(g), variables=vs)) + "\n")
+                provenance = None
+                if r["task"] in invariant_records:
+                    vs, labels, provenance = checked_invariant_labels(invariant_records[r["task"]], vs, task["model"],
+                        hashlib.sha256((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_bytes()).hexdigest(),
+                        hashlib.sha256(js.read_bytes()).hexdigest(), r["task"])
+                    provenance = {**provenance, "verified_labels": labels}
+                f.write(json.dumps(teacher_facts(ge, task, r, goal_eval.to_json(g), variables=vs,
+                                               invariant_supervision=provenance)) + "\n")
                 f.flush()
                 n += 1
         return

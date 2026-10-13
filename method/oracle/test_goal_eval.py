@@ -3214,7 +3214,7 @@ def test_faithfulness_partial_draws_run_complete_graphs_as_the_masked_run(monkey
     seen, run = [], nat.run
 
     def spy(x, tg, plan, u, ur, *args, **kw):
-        if plan.get("B") == 2:
+        if "split" in plan:  # the graph side (the model side runs the full plan)
             seen.append({n: v.detach().clone() for n, v in u.items()})
         return run(x, tg, plan, u, ur, *args, **kw)
     monkeypatch.setattr(nat, "run", spy)

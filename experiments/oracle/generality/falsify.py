@@ -346,6 +346,23 @@ def variables_test(e: dict):
         res = sc.score(tx, variables.parse([v], nat.C), "eval", 8)
         row[f"e4_{lab}"] = res.get("e4")
         row[f"f_on_{lab}"], row[f"s_off_{lab}"] = res.get("f_on"), res.get("s_off")
+    # E4 v2 with a stated value map on the same a-column variable: the identity map (every token its own class) against
+    # algorithms the model does not run, a random balanced partition of the vocabulary and token-id parity (same-class
+    # tokens must leave the prediction where it is, other-class tokens move it as the model's does); classes of fresh
+    # tokens at a (goal_eval's sampled sources there), the text's own token in the first
+    V = nat.target.wte.shape[0]
+    part = rng_of("partition", e["task"]).integers(2, size=V)
+    za, own = ge._fresh_sources(tx, a, int(tx.seed) + 41), tx.ids[a]
+    maps = {"identity": [[own]] + [[z] for z in za],
+            "random_partition": [[own] + [z for z in za if part[z] == part[own]], [z for z in za if part[z] != part[own]]],
+            "parity": [[own] + [z for z in za if z % 2 == own % 2], [z for z in za if z % 2 != own % 2]]}
+    for name, classes in maps.items():
+        v = {"name": "copied token", "meaning": f"the copied token's {name.replace('_', ' ')} class", "inputs": [a],
+             "group": [["block", n, a] for n in A_SITES], "feeds": ["prediction"],
+             "values": [{"position": a, "classes": [{"token_ids": [int(z) for z in c]} for c in classes]}]}
+        res = sc.score(tx, variables.parse([v], nat.C), "eval", 8)
+        for m in ("e4", "f_on", "f_off", "f_same"):
+            row[f"{m}_map_{name}"] = res.get(m)
     # the value map's predictions on fresh tokens at a: identity map against a random balanced partition
     base = nat.reference([tx.ids], [t])[0, 0]
     y = int(base.argmax())
@@ -495,6 +512,15 @@ def report():
             print(f"== variables ({kind}, {len(rs)} texts): E4 correct {np.mean([r['e4_correct'] for r in both]):.2f} vs source moved "
                   f"{np.mean([r['e4_source_moved'] for r in both]):.2f}, correct higher on {win:.2f}; value map identity "
                   f"{np.mean([r['value_identity'] for r in rs]):.2f} vs random partition {np.mean([r['value_random_partition'] for r in rs]):.2f}")
+            mp = [r for r in rs if r.get("e4_map_identity") is not None]
+            if mp:
+                mean = lambda k: np.mean([r[k] for r in mp if r.get(k) is not None])  # noqa: E731
+                print("   E4 with a stated value map: " + "; ".join(
+                    f"{nm} e4 {mean(f'e4_map_{nm}'):.2f} (on {mean(f'f_on_map_{nm}'):.2f}, off {mean(f'f_off_map_{nm}'):.2f}"
+                    + (f", same class {mean(f'f_same_map_{nm}'):.2f}" if nm != "identity" else "") + ")"
+                    for nm in ("identity", "random_partition", "parity"))
+                    + f"; identity above partition on {np.mean([r['e4_map_identity'] > r['e4_map_random_partition'] for r in mp]):.2f}, "
+                    f"above parity on {np.mean([r['e4_map_identity'] > r['e4_map_parity'] for r in mp]):.2f} (n={len(mp)})")
     return out
 
 

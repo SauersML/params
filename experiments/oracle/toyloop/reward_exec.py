@@ -466,7 +466,8 @@ class InvalidInterventionCandidate(ValueError):
     """Only candidate grammar/architecture failures, not verifier failures."""
 
 
-def score_wiring_interventions(toy, completion, *, nat=None, texts=None, panel=None, evidence_sink=None):
+def score_wiring_interventions(toy, completion, *, nat=None, texts=None, panel=None, evidence_sink=None,
+                               reference_cache=None):
     """Original-basis head/MLP-output edits; sparse gets no dense trace.
 
     Every architecture head is edited, including omitted heads. No-edit and
@@ -510,6 +511,9 @@ def score_wiring_interventions(toy, completion, *, nat=None, texts=None, panel=N
     texts = list(texts_of(toy) if texts is None else texts)
     if not texts:
         raise RuntimeError("empty intervention input panel")
+    if reference_cache is not None:
+        from intervention_teacher import validate_cache
+        validate_cache(reference_cache, toy, nat, texts, panel)
     parsed = circuit.parse(completion)
     if not parsed.ok or parsed.bad:
         raise InvalidInterventionCandidate("invalid circuit grammar")
@@ -525,7 +529,8 @@ def score_wiring_interventions(toy, completion, *, nat=None, texts=None, panel=N
         ge = goal_eval.GoalEval(nat)
         for ids, graph, price in zip(texts, graphs, prices):
             targets = [len(ids) - 1]
-            p = nat.reference([ids], targets)
+            p = (nat.reference([ids], targets) if reference_cache is None
+                 else reference_cache["references"][len(rows)])
             q = ge.graph_ref(ids, targets, graph, live=False)
             try:
                 error = kl_bits(p, q)
@@ -546,7 +551,8 @@ def score_wiring_interventions(toy, completion, *, nat=None, texts=None, panel=N
                 measure(kind, layer, unit, scale)
             clear_intervention_caches(nat)
     return {"scope": "finite original-basis head/MLP-output panel only; own routing/norms; no live remainder; no arbitrary/joint/English certificate",
-            "panel": panel, "dense_calls": len(rows), "sparse_calls": len(rows),
+            "panel": panel, "dense_calls": len(rows) if reference_cache is None else 0,
+            "sparse_calls": len(rows), "cached_full_logp_only": reference_cache is not None,
             "per_world": rows, "reward": intervention_mdl_value(rows)}
 
 
@@ -555,7 +561,9 @@ def reward_wiring_intervention_mdl(meta, completion):
     if not parsed.ok or parsed.bad:
         return -1.0
     try:
-        return score_wiring_interventions(meta["toy"], completion, panel=meta.get("intervention_panel"))["reward"]
+        return score_wiring_interventions(meta["toy"], completion, panel=meta.get("intervention_panel"),
+                                         nat=meta.get("intervention_native"),
+                                         reference_cache=meta.get("intervention_reference_cache"))["reward"]
     except InvalidInterventionCandidate:
         return -1.0
 

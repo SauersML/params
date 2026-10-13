@@ -1342,7 +1342,7 @@ def test_changed_inputs(tiny):
     srch = ge.changed_search(tx, [g], draws=4)[0]
     assert not set(srch["draws_changed"]) & set(row["draws_changed"])
     assert ge.fidelity(tx, [g], None, draws=2, changed=4)[0]["s_changed"] == row["s_changed"]  # fidelity's: eval
-    moved = tx.moved
+    moved = np.asarray(tx.moved, dtype=np.float64)  # sum the reference in double precision, as context_share does
     want = sum(moved[t - 1] for t in {t for _, t, _ in sub} if t > 0) / moved.sum()
     assert abs(row["context_share"] - want) < 1e-9
     sw = sws = tw = tws = 0.0
@@ -1427,13 +1427,16 @@ def test_donor_resampling(tiny):
 def test_reward_terms_unclipped_for_ranking(tiny):
     """Reward mode's rl_terms: each C term without the floor at 0 (equal to it where it is above 0, at most 0 where it
     is 0; s_track, pooled over prompts, at most its clipped pool), and c_rl their harmonic mean when every term is
-    above 0, else the lowest; c stays the clipped harmonic."""
+    above 0, else the lowest; c stays the clipped harmonic. N's n_spec_raw is also exposed for phi, but is not a C
+    family and does not enter c_rl."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     graphs = [native.Graph(every[::3], *native.all_edges(every[::3], tx.targets)), native.Graph(every[1:3], complete=True)]
     pool = tiny_pool(nat, tx.ids)
     for row in ge.fidelity(tx, graphs, pool, draws=4, steps=3, restarts=2, mode="reward"):
-        assert set(row["rl_terms"]) == set(row["c_terms"])
+        assert set(row["rl_terms"]) == set(row["c_terms"]) | {"n_spec"}
+        assert "n_spec" not in row["c_terms"]
+        assert row["rl_terms"]["n_spec"] == row["n_spec_raw"]
         for k in row["c_terms"]:
             clipped = row["f1_flips_c"][goal_eval.FLIP_TERM] if k == "f1_flips_c" else row[k]
             raw = row["rl_terms"][k]
@@ -1441,7 +1444,7 @@ def test_reward_terms_unclipped_for_ranking(tiny):
                 assert raw <= clipped + 1e-9, (raw, clipped)
                 continue
             assert raw <= 1.0 and (abs(raw - clipped) < 1e-9 if clipped > 0 else raw <= 1e-12), (k, raw, clipped)
-        raws = list(row["rl_terms"].values())
+        raws = [row["rl_terms"][k] for k in row["c_terms"]]
         want = goal_eval._harmonic(raws) if min(raws) > 0 else min(raws)
         assert row["c_rl"] == want
     assert goal_eval._c_rl([0.5, -0.2, 0.9]) == -0.2 and goal_eval._c_rl([0.5, 0.5]) == 0.5
@@ -1555,7 +1558,8 @@ def test_interchange_path_patched(tiny):
     a, c = ge.pp_run(tx, tx.ids, stated, fixed=held), ge.pp_run(tx, tx.ids, native.Graph(sub, complete=True), fixed=held)
     assert float(carry.kl(c, a)[0]) < 1e-5
     rows = ge.interchange_pp(tx, [native.Graph(masks=tx.vpd), stated], draws=4)
-    assert rows[0]["s_interchange_pp"] is None or abs(rows[0]["s_interchange_pp"] - 1) < 1e-6
+    assert rows[0]["s_interchange_pp"] is None or abs(rows[0]["s_interchange_pp"] - 1) < 1e-6, (
+        rows[0]["s_interchange_pp"], rows[0]["draws_interchange_pp"])
     assert rows[1]["draws_interchange_pp"] and ge.interchange_search(tx, [stated], 4, mode="pp")[0]["draws_interchange_pp"]
     row = ge.fidelity(tx, [stated], None, draws=2, near_donors=0, far_donors=0, interchange=4, changed=4)[0]
     assert "s_interchange_pp" in row["c_terms"] or row["s_interchange_pp"] is None

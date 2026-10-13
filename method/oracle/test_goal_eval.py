@@ -2647,19 +2647,20 @@ def test_path_patched_holds_parts_a_masks_graph_lacks():
 
 def _pp_loop_check(ge, tx, rows, graphs, key, held=False):
     """Each draw of rows[b][key] ([[p, z], KL_C, KL_V, W]) against pp_run one graph and prompt at a time (the loop the
-    engine call replaced): track_pp's on the changed text, or interchange_pp's held set in the model, the circuit and
-    VPD's answer on the text; within 1e-4 relative."""
+    engine call replaced): track_pp's on the changed text, or interchange_pp's (the text's panel: the model on the
+    changed text, the circuit's nodes at p held on the text, VPD's actives at p held); within 1e-4 relative."""
     nat = ge.nat
     vpd = native.Graph(masks=tx.vpd)
-    model = native.Graph([(n, t, goal_eval.BLOCK) for n in nat.names for t in range(tx.T)], complete=True)
     close = lambda a, b: abs(a - b) <= 1e-4 * (1 + abs(b))  # noqa: E731
     n = 0
     for g, r in zip(graphs, rows):
         for (p, z), kc, kv, w in r[key]:
             if held:
-                h = _pp_holds(ge, tx, nat, sorted(g.node_set()), p, z)
-                m = ge.pp_run(tx, tx.ids, model, fixed=h)
-                want = (float(carry.kl(m, ge.pp_run(tx, tx.ids, g, fixed=h))[0]), float(carry.kl(m, ge.pp_run(tx, tx.ids, vpd, fixed=h))[0]),
+                x2 = list(tx.ids)
+                x2[p] = z
+                m = nat.reference([x2], tx.targets)
+                h, hv = (_pp_holds(ge, tx, nat, sorted(x.node_set()), p, z) for x in (g, vpd))
+                want = (float(carry.kl(m, ge.pp_run(tx, tx.ids, g, fixed=h))[0]), float(carry.kl(m, ge.pp_run(tx, tx.ids, vpd, fixed=hv))[0]),
                         float(carry.kl(m, tx.ref)[0]))
             else:
                 x2 = list(tx.ids)

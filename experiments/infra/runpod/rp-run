@@ -8,6 +8,8 @@
 #   rp-run stop NAME                                              end a run or a held pod now
 #   rp-run batch SPEC                                             launch every run SPEC lists, at once
 #   rp-run status                                                 one line per running pod
+#   rp-run recover                                                copy and delete every self-stopped pod whose host can start it
+#   rp-run drop NAME                                              delete a self-stopped pod without copying its outputs
 #   rp-run publish PATH...                                        publish public inputs for pods to download
 #
 # GPU_TYPE is a RunPod GPU id ("NVIDIA RTX A5000") or its display name ("RTX A5000"), a Thunder
@@ -581,6 +583,7 @@ holders() {  # POD
 # its record and key kept, and reap fails, so a later reap (rp-run stop NAME) tries again. Other pods are not touched.
 recover_stopped() {  # POD
     local pod=$1 name keys user r b ip="" port="" t
+    [ "${RP_DROP_OUTPUTS:-0}" != 1 ] || return 0   # (rp-run drop NAME: delete without the copy)
     [ -f "$ACTIVE/.$pod.selfstop" ] && [ "$(provider_of "$pod")" = runpod ] || return 0
     [ "$(pod_state "$pod")" = OTHER ] || return 0
     read -r name _ < "$ACTIVE/$pod" || return 0
@@ -618,6 +621,22 @@ recover_stopped() {  # POD
         echo "rp-run: copying $name's outputs from pod $pod failed; it is stopped again for another try: rp-run stop $name" >&2
         return 1
     fi
+}
+
+# A self-stopped pod whose copy could not run yet (its host had no GPU free) is retried every 30 minutes for as long as
+# its watcher lives (rp-run recover retries every one, e.g. after the Mac restarts); once it has waited 24 hours it gets
+# one line in LEDGER_NOTES.txt, which rp-run status prints, so a budget check sees it.
+reap_retry() {  # POD [cap]
+    local pod=$1 since noted=0
+    since=$(date +%s)
+    until reap "$@"; do
+        [ -f "$ACTIVE/.$pod.selfstop" ] && [ -f "$ACTIVE/$pod" ] || return 1
+        if (( ! noted && $(date +%s) - since > 86400 )); then
+            echo "$(date '+%F %T') pod $pod ($(cut -d' ' -f1 "$ACTIVE/$pod")) stopped itself over 24 h ago and its host has had no GPU free to copy its outputs; it costs storage only; rp-run recover retries, rp-run drop NAME deletes it with its outputs" >> "$RP/LEDGER_NOTES.txt"
+            noted=1
+        fi
+        sleep 1800
+    done
 }
 
 reap() {  # POD [cap]
@@ -764,10 +783,10 @@ if [ "${1:-}" = --watch ]; then
     if (( $(date +%s) >= $(due) )); then
         echo "rp-run: $pod reached its HOURS cap; deleting it" >&2
         [ -f "$ACTIVE/.$pod.end" ] || echo cap > "$ACTIVE/.$pod.end"
-        reap "$pod" cap
+        reap_retry "$pod" cap
         exit
     fi
-    reap "$pod"
+    reap_retry "$pod"
     exit
 fi
 
@@ -887,8 +906,36 @@ sweep_orphans() {
 MODE=run
 [ "${1:-}" = --watch ] || sweep_orphans
 case ${1:-} in
+    recover)
+        # Every self-stopped pod still recorded: started, its run's outputs copied, then deleted (reap); one whose host has
+        # no GPU free stays for the next try.
+        [ $# -eq 1 ] || usage
+        n=0
+        for f in "$ACTIVE"/.*.selfstop; do
+            [ -e "$f" ] || continue
+            pod=${f#"$ACTIVE"/.}; pod=${pod%.selfstop}
+            [ -f "$ACTIVE/$pod" ] || { rm -f "$f"; continue; }
+            n=$(( n + 1 ))
+            reap "$pod" cap || echo "rp-run: $pod stays stopped for now" >&2
+        done
+        echo "rp-run: $n self-stopped pods tried" >&2
+        exit 0 ;;
+    drop)
+        # A self-stopped pod deleted with the outputs on its /workspace (the copy given up).
+        [ $# -eq 2 ] || usage
+        h=$(held "$2") || { echo "rp-run: no pod held for $2" >&2; exit 2; }
+        read -r pod _ <<< "$h"
+        echo dropped > "$ACTIVE/.$pod.end"
+        RP_DROP_OUTPUTS=1 reap "$pod" cap
+        exit $? ;;
     status)
         [ $# -eq 1 ] || usage
+        if [ -s "$RP/LEDGER_NOTES.txt" ]; then
+            while IFS= read -r line; do
+                p=$(sed -E 's/.* pod ([a-z0-9]+) .*/\1/' <<< "$line")
+                [ -f "$ACTIVE/$p" ] && echo "rp-run: note: $line"
+            done < "$RP/LEDGER_NOTES.txt"
+        fi
         r=$(api GET "$REST/pods?includeMachine=true")
         [ "$(status_of "$r")" = 200 ] || { echo "rp-run: pod list failed: $(body_of "$r" | head -c 200)" >&2; exit 1; }
         pods=$(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, .name, (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // .cpuFlavorId // "?"), (.lastStartedAt // .createdAt // ""), (.publicIp // "-"), (.portMappings["22"] // "-")] | @tsv' <<< "$(body_of "$r")")

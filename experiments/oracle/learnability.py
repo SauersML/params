@@ -18,6 +18,7 @@ features() adds the atlas's and the routed lens's facts (the Mac) to those the q
   learnability.py measure --texts 6000:6100 OUT.jsonl [--split train] [--device cuda] [--offset K --stride S] [--only FILE]
   learnability.py questions TRAIN_MEASURED.jsonl HELDOUT_MEASURED.jsonl OUT_DIR [--held 2000]
   learnability.py baselines OUT_DIR/features/train_32000.jsonl OUT_DIR/features/heldout.jsonl
+  learnability.py lookup OUT_DIR SCORES_DIR      the per-subcomponent lookup baselines as score files (learn_sft.py table)
   learnability.py active --texts 6000:7000 ACTIVE.jsonl      arm "active"'s first stage (the Mac: VPD's importance)
 
 Questions (questions()): remove/cut/swap ask the KL bin (under 0.01, 0.01-0.1, 0.1-1, over 1 bit), falls and the new
@@ -554,6 +555,140 @@ def baselines(train: list[dict], held: list[dict]) -> dict:
     return out
 
 
+def _id(nd) -> tuple[str, int]:
+    return (nd[0], int(nd[2]))
+
+
+def _logkl(kl: float) -> float:
+    return math.log10(max(kl, 0.0) + 1e-4)
+
+
+def lookup(train: list[dict], held: list[dict]) -> dict:
+    """The lead's static per-subcomponent baselines, scored on the held-out questions in learn_sft.py score's form (rows
+    in the held-out order): {"lookup": rows, "lookup_lr": rows}. From the training questions alone, per subcomponent
+    (matrix, index: any position, any text) its KL-bin counts per question kind (remove, swap; a cut's from its two
+    ends, averaged), its falls rate and its mean log10 KL over every measured removal it appears in (remove questions and
+    rank candidates).
+      lookup     KL bin and falls: the subcomponent's counts smoothed toward the kind's prior (one question's weight);
+                 rank: candidates ordered by their mean log KL (unseen ones at the training mean).
+      lookup_lr  a multinomial logistic regression per kind on the feature-only baselines' inputs (_row_x) plus the
+                 lookup's bin probabilities, mean log KL and count; rank: a ridge regression of log KL on a removal's
+                 features plus its mean and count, fitted on the training remove questions and rank candidates; a
+                 training question's own label and KL left out of its lookup inputs (leave-one-out)."""
+    import numpy as np
+    from scipy.stats import kendalltau
+    from sklearn.linear_model import LogisticRegression, Ridge
+    from sklearn.preprocessing import StandardScaler
+
+    K = len(BINS) + 1
+    bins, falls, logs = {}, {}, {}
+    prior = {k: np.ones(K) for k in ("remove", "cut", "swap")}
+    fall0 = {k: [1.0, 2.0] for k in ("remove", "cut", "swap")}
+    for r in train:
+        m = r["meta"]
+        if m["kind"] == "rank":
+            for (_, nd), kl in zip(m["slots"], m["kls"]):
+                logs.setdefault(_id(nd), []).append(_logkl(kl))
+            continue
+        prior[m["kind"]][r["label"]] += 1
+        fall0[m["kind"]][0] += m["falls"]
+        fall0[m["kind"]][1] += 1
+        for _, nd in m["slots"]:
+            c = bins.setdefault((m["kind"], _id(nd)), np.zeros(K))
+            c[r["label"]] += 1
+            f = falls.setdefault((m["kind"], _id(nd)), [0.0, 0.0])
+            f[0] += m["falls"]
+            f[1] += 1
+        if m["kind"] == "remove":
+            logs.setdefault(_id(m["slots"][0][1]), []).append(_logkl(m["kl"]))
+    prior = {k: v / v.sum() for k, v in prior.items()}
+    mean_all = float(np.mean([x for v in logs.values() for x in v])) if logs else -2.0
+
+    def p_bins(m, own: int | None = None):
+        """own: a training question's label, left out of its own counts (leave-one-out: the regression sees what a
+        held-out question would)."""
+        ps = []
+        for _, nd in m["slots"]:
+            c = bins.get((m["kind"], _id(nd)), np.zeros(K)).copy()
+            if own is not None:
+                c[own] -= 1
+            ps.append((c + prior[m["kind"]]) / (c.sum() + 1))
+        return np.mean(ps, 0)
+
+    def p_falls(m):
+        fs = []
+        for _, nd in m["slots"]:
+            f = falls.get((m["kind"], _id(nd)), [0.0, 0.0])
+            base = fall0[m["kind"]][0] / fall0[m["kind"]][1]
+            fs.append((f[0] + base) / (f[1] + 1))
+        return float(np.clip(np.mean(fs), 1e-4, 1 - 1e-4))
+
+    def stat(nd, own: float | None = None):
+        """(mean log KL, count) of a subcomponent's training removals, own (a training removal's log KL) left out."""
+        xs = logs.get(_id(nd), [])
+        tot, n = sum(xs) - (own or 0.0), len(xs) - (own is not None)
+        return (tot / n if n > 0 else mean_all), n
+
+    def lr_x(m, train_row: bool = False, label: int | None = None):
+        own = _logkl(m["kl"]) if train_row and m["kind"] == "remove" else None
+        mu, n = stat(m["slots"][0][1], own)
+        return _row_x(m) + list(p_bins(m, label if train_row else None)) + [mu, math.log1p(n)]
+
+    models = {}
+    for kind in ("remove", "cut", "swap"):
+        tr = [r for r in train if r["meta"]["kind"] == kind]
+        if len(tr) < 10:
+            continue
+        X = [lr_x(r["meta"], True, r["label"]) for r in tr]
+        sc = StandardScaler().fit(X)
+        y = np.array([r["label"] for r in tr])
+        yf = np.array([int(r["meta"]["falls"]) for r in tr])
+        mb = LogisticRegression(max_iter=3000).fit(sc.transform(X), y)
+        mf = LogisticRegression(max_iter=3000).fit(sc.transform(X), yf) if len(set(yf)) > 1 else None
+        models[kind] = (sc, mb, mf)
+    # rank: ridge on removals' features (training remove questions and rank candidates)
+    Xr, yr = [], []
+    for r in train:
+        m = r["meta"]
+        if m["kind"] == "remove":
+            mu, n = stat(m["slots"][0][1], _logkl(m["kl"]))
+            Xr.append(_x(m["nodes"][0]) + [mu, math.log1p(n)])
+            yr.append(_logkl(m["kl"]))
+        elif m["kind"] == "rank":
+            for f, (_, nd), kl in zip(m["nodes"], m["slots"], m["kls"]):
+                mu, n = stat(nd, _logkl(kl))
+                Xr.append(_x(f) + [mu, math.log1p(n)])
+                yr.append(_logkl(kl))
+    rsc = StandardScaler().fit(Xr)
+    ridge = Ridge(alpha=1.0).fit(rsc.transform(Xr), yr)
+    out = {"lookup": [], "lookup_lr": []}
+    for r in held:
+        m = r["meta"]
+        if m["kind"] == "rank":
+            kls = m["kls"]
+            for name in out:
+                if name == "lookup":
+                    sc_ = [stat(nd)[0] for _, nd in m["slots"]]
+                else:
+                    sc_ = ridge.predict(rsc.transform([_x(f) + [stat(nd)[0], math.log1p(stat(nd)[1])] for f, (_, nd) in zip(m["nodes"], m["slots"])])).tolist()
+                pred = int(np.argmax(sc_))
+                out[name].append({"kind": "rank", "label": r["label"], "logloss_bits": float("nan"), "pred": pred,
+                                  "tau": float(kendalltau(sc_, kls).statistic)})
+            continue
+        pb, pf = p_bins(m), p_falls(m)
+        out["lookup"].append({"kind": m["kind"], "label": r["label"], "logloss_bits": -math.log2(pb[r["label"]]), "pred": int(np.argmax(pb)),
+                              "falls_logloss_bits": -math.log2(pf if m["falls"] else 1 - pf), "p_bins": pb.tolist()})
+        sc, mb, mf = models[m["kind"]]
+        x = sc.transform([lr_x(m)])
+        P = np.zeros(K)
+        P[mb.classes_] = mb.predict_proba(x)[0]
+        P = np.clip(P, 1e-6, 1)
+        q = float(np.clip(mf.predict_proba(x)[0][1], 1e-4, 1 - 1e-4)) if mf is not None else pf
+        out["lookup_lr"].append({"kind": m["kind"], "label": r["label"], "logloss_bits": -math.log2(P[r["label"]]), "pred": int(np.argmax(P)),
+                                 "falls_logloss_bits": -math.log2(q if m["falls"] else 1 - q), "p_bins": P.tolist()})
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -575,10 +710,22 @@ def main():
     ac.add_argument("--texts", required=True, help="A:B, text numbers")
     ac.add_argument("out")
     ac.add_argument("--split", default="train")
+    lk = sub.add_parser("lookup")
+    lk.add_argument("qdir", help="questions' output (features/train_<n>.jsonl, features/heldout.jsonl)")
+    lk.add_argument("out_dir", help="writes score_lookup_<n>.jsonl and score_lookup_lr_<n>.jsonl (learn_sft.py table reads them)")
     bs = sub.add_parser("baselines")
     bs.add_argument("train", help="questions' features/train_<n>.jsonl")
     bs.add_argument("heldout", help="questions' features/heldout.jsonl")
     args = ap.parse_args()
+    if args.cmd == "lookup":
+        read = lambda f: [json.loads(x) for x in Path(f).read_text().splitlines() if x.strip()]  # noqa: E731
+        held = read(Path(args.qdir) / "features" / "heldout.jsonl")
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+        for n in (2_000, 8_000, 32_000):
+            got = lookup(read(Path(args.qdir) / "features" / f"train_{n}.jsonl"), held)
+            for name, rows in got.items():
+                (Path(args.out_dir) / f"score_{name}_{n}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return
     if args.cmd == "baselines":
         read = lambda f: [json.loads(x) for x in Path(f).read_text().splitlines() if x.strip()]  # noqa: E731
         return print(json.dumps(baselines(read(args.train), read(args.heldout)), indent=1))

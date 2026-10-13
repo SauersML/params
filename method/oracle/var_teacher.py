@@ -17,10 +17,13 @@ on-target 0.36) where the position's whole site outputs carry all of it. Per inp
    every single site, every layer, layers 0 to L, scored together on the search split; the smallest (in
    subcomponents) at or above GOAL, else grown from the best single site one site at a time (the site adding most)
    until it reaches GOAL or stops gaining.
-2. Family at the chosen sites and positions: the union of VPD's active subcomponents (causal importance above zero)
-   on the text and on each alternative token at each input position (var_classes.alternatives, the 64 tokens the value
-   map uses): a shared core plus every token-specific part seen. It is the carrier when it reaches GOAL, else the
-   blocks are. VPD's active set on the text alone is scored beside them (reported).
+2. Family: the union of VPD's active subcomponents (causal importance above zero) at the carrier positions on the
+   text and on each alternative token at each input position (var_classes.alternatives, the 64 tokens the value map
+   uses): a shared core plus every token-specific part seen, at every site and at the chosen blocks' sites. The
+   smallest family at or above GOAL is the carrier, else the blocks are. On text6011 at 232-233 the family at every
+   site (3,781 subcomponents, 6% of the position's 61,440) carries f on-target 0.975 (eval split 0.974) where the
+   values' block carries 0.79 and VPD's active set on the text 0.41. VPD's active set on the text alone is scored
+   beside them (reported).
 A variable is kept when its term min(f on-target, s off-target) on the search split is at least GOAL, each on its own
 (the lead's rule); the others are listed unkept with their scores. Kept variables are taken first, single positions
 before pairs, each by the circuit's removal effect inside the carrier, then the unkept: carriers disjoint (a block
@@ -346,21 +349,29 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
     for ins, at in sets:
         b, rows = block_search(sc, tx, ins, draws, at)
         sites = sorted({n for n, _, _ in b["group"]})
-        fam, share = family(nat, tx, ins, sites, at)
-        on_x = {(n, q, c) for n in sites for q in at for c in (tx.ci[n][q] > 0).nonzero().flatten().tolist()}
-        active = sorted(k for k in fam if k in on_x)
-        fa = screen(sc, tx, ins, [(fam, "family"), (active, "active on the text")], draws) if fam else []
-        rec = {"inputs": list(ins), "at": list(at), "blocks": b, "family": fa[0] if fa else None, "active": fa[1] if fa else None,
-               "tried": len(rows)}
-        use = rec["family"] if fa and fa[0]["score"] >= GOAL else b
+        reach = nat.reachable(tx.T, tx.targets)
+        every = [n for n in nat.names if all(bool(reach[n][q].any()) for q in at)]
+        fam, share = family(nat, tx, ins, every, at)  # the family over every site; restricted to the blocks' sites
+        on_x = {(n, q, c) for n in every for q in at for c in (tx.ci[n][q] > 0).nonzero().flatten().tolist()}
+        mine = [k for k in fam if k[0] in sites]
+        cands = [(mine, "family at the blocks' sites"), (fam, "family at every site"), (sorted(k for k in fam if k in on_x), "active on the text")]
+        fa = screen(sc, tx, ins, [c for c in cands if c[0]], draws)
+        got = {r["how"]: r for r in fa}
+        ok = [got[h] for h in ("family at the blocks' sites", "family at every site") if h in got and got[h]["score"] >= GOAL]
+        rec = {"inputs": list(ins), "at": list(at), "blocks": b, "family": got.get("family at every site"),
+               "family_sites": got.get("family at the blocks' sites"), "active": got.get("active on the text"), "tried": len(rows)}
+        use = min(ok, key=lambda r: r["size"]) if ok else b
+        held = {n for n, _, _ in use["group"]}
+        active = sorted(k for k in on_x if k[0] in held)
         rec.update(carrier="family" if use is not b else "block", group=use["group"], score=use["score"],
-                   instances=active, share={k: share[k] for k in active},
+                   instances=active, share={k: share.get(k, 0.0) for k in active},
                    circuit=[nd for nd in m if inside(set(use["group"]), nd)])
         rec["m"] = sum(m[nd] for nd in rec["circuit"])
         best[(ins, at)] = rec
+        sz = lambda k: f"{rec[k]['size']} {rec[k]['score']:.3f}" if rec[k] else "none"  # noqa: E731
         log(f"  inputs {list(ins)} at {list(at)}: {rec['carrier']} {use['how']} ({use['size']} subcomponents) {use['score']:.3f}; "
-            f"blocks {b['how']} {b['score']:.3f}, family {fa[0]['size'] if fa else 0} {fa[0]['score'] if fa else 0:.3f}, "
-            f"active {fa[1]['size'] if fa else 0} {fa[1]['score'] if fa else 0:.3f}; m {rec['m']:.3f}")
+            f"blocks {b['how']} {b['score']:.3f}, family at the blocks' sites {sz('family_sites')}, at every site "
+            f"{sz('family')}, active {sz('active')}; m {rec['m']:.3f}")
     # kept first; at their inputs, single positions before pairs; by the circuit's removal effect inside; carriers
     # disjoint (a block holds every subcomponent of its site and position), and variables carried at their own
     # inputs with no input position in two
@@ -386,7 +397,7 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
     out = {"variables": [], "teacher": {"positions": positions, "sets": len(sets), "kept": len(kept), "circuit_m": M}}
     for r in chosen:
         meas = {k: r[k] for k in ("score",)} | {"carriers": {k: (None if r[k] is None else {x: r[k][x] for x in ("how", "size", "score", "f_on", "s_off")})
-                                                            for k in ("blocks", "family", "active")}, "tried": r["tried"]}
+                                                            for k in ("blocks", "family", "family_sites", "active")}, "tried": r["tried"]}
         meas["tokens"] = components.token_strings(task["model"], [ids[q] for q in r["inputs"]])
         out["variables"].append(as_json(
             r["name"], r["inputs"], r["group"], r["feeds"], kept=r["score"] >= GOAL, carrier=r["carrier"], carried_at=r["at"],

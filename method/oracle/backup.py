@@ -46,6 +46,8 @@ On one text, for a circuit given as a node set (goal_eval's complete graph, bloc
      forward blocks replaced by their shortest subcomponent prefixes holding 50% and 90% of their gain), every set by
      the same families (the connection-cut family left out: see evaluate), then a table with phi against each text's
      start row and size_bits (goal_eval's, blocks priced at their VPD-active contents since a699a8b).
+  backup.py repair --out OUT: Backup.repair per text (how much of the circuit's change at the prediction the outside
+     subcomponents cancel under the removals, by site, and the share each of OUT's sets holds), OUT/repair.jsonl.
 """
 from __future__ import annotations
 
@@ -262,6 +264,62 @@ class Backup:
             E._site = orig
             native.free(dev)
         return out
+
+    @torch.no_grad()
+    def repair(self, blocks=frozenset(), extra=frozenset()) -> dict:
+        """Self-repair at the prediction, a measurement of the model: per draw, the change of the attention and MLP
+        outputs written into the residual stream at the targets between the model and the model less the draw, split
+        into the circuit's subcomponents' (the removed ones off, the kept ones changed: dc) and the outside ones' (do);
+        r = -<do, dc> / |dc|^2, the share of the circuit's change that the outside cancels along it (0: no repair, 1:
+        the circuit's direct change cancelled), split by site (the shares sum to r) and into the part an expansion
+        (blocks, extra) holds ("held"); cos(do, -dc). Pooled over the draws by W (the node family's weights). The
+        remainders' change (live in every run, C's semantics) is in neither side. {"r", "cos", "held", "sites": {site:
+        share}, "draws": [[W, r, cos, held]]}."""
+        import mech
+
+        nat, E, dev = self.nat, self.E, self.nat.dev
+        m0, mx = self.masks(), self.masks(blocks, extra)
+        tg = torch.tensor(self.tx.targets, device=dev)
+        writers = [n for n in nat.names if native._name_layer_kind(n)[1] in mech.RESID_WRITERS]
+        got: dict = {}
+        orig = E._site
+
+        def site(n, h, mask, rec=None):
+            if n in writers:
+                V, U, _ = E._w(n)
+                a = (h.to(V.dtype) @ V)[:, tg] * mask.to(V.dtype)[:, tg]          # [B, targets, C] as written
+                inside, held = m0[n][tg].to(a.dtype), (mx[n][tg] & ~m0[n][tg]).to(a.dtype)
+                got[n] = ((a * inside) @ U, (a * (1 - inside)) @ U, (a * held) @ U)
+            return orig(n, h, mask, rec)
+
+        ones = {n: torch.ones(self.T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
+        E._site = site
+        try:
+            E.log_probs({n: ones[n].float()[None] for n in nat.names})
+            base = {n: tuple(x[0] for x in got[n]) for n in writers}
+            draws, D = [], len(self.drops)
+            for s0 in range(0, D, self.rows):
+                js = list(range(s0, min(D, s0 + self.rows)))
+                E.log_probs({n: torch.stack([self._row(ones, j)[n] for j in js]) for n in nat.names})
+                dc = sum(got[n][0] - base[n][0] for n in writers)                 # [B, targets, d]
+                per = {n: got[n][1] - base[n][1] for n in writers}
+                held = sum(got[n][2] - base[n][2] for n in writers)
+                do = sum(per.values())
+                for b, j in enumerate(js):
+                    c2 = float((dc[b] ** 2).sum())
+                    if c2 <= EPS:
+                        continue
+                    sh = {n: -float((per[n][b] * dc[b]).sum()) / c2 for n in writers}
+                    cos = -float((do[b] * dc[b]).sum()) / max(float(do[b].norm() * dc[b].norm()), EPS)
+                    draws.append([self.W[j], sum(sh.values()), cos, -float((held[b] * dc[b]).sum()) / c2, sh])
+        finally:
+            E._site = orig
+            native.free(dev)
+        wsum = sum(d[0] for d in draws) or 1.0
+        pool = lambda i: sum(d[0] * d[i] for d in draws) / wsum  # noqa: E731
+        return {"r": pool(1), "cos": pool(2), "held": pool(3),
+                "sites": {n: sum(d[0] * d[4][n] for d in draws) / wsum for n in writers},
+                "draws": [d[:4] for d in draws]}
 
     # ---- the screen
 
@@ -698,6 +756,37 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
         native.free(nat.dev)
 
 
+def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back", "sub50", "sub90"), offset: int = 0,
+            stride: int = 1, log=print) -> Path:
+    """Backup.repair per text on the backup family's search draws: the outside's cancelling share of the circuit's
+    change at the prediction (r, cos, per site) for src's circuit, and the share each of out's sets holds ("held").
+    Lines in out/repair.jsonl; texts already there skipped."""
+    ge = goal_eval.GoalEval()
+    nat = ge.nat
+    f_out = out / "repair.jsonl"
+    done = {json.loads(x)["task"] for x in f_out.read_text().splitlines() if x.strip()} if f_out.exists() else set()
+    for p in native.tasks(split)[:n][offset::stride]:
+        f0 = src / f"{p.stem}.json"
+        if p.stem in done or not f0.exists():
+            continue
+        ids, targets = native.text(p)
+        tx = ge.text(ids, targets, native.task_seed(p.stem))
+        g0, _ = goal_eval.circuit(json.loads(f0.read_text()), targets, nat.C, tx.T)
+        bk = Backup(ge, tx, g0)
+        row = {"task": p.stem, "start": bk.repair(), "held": {}}
+        for k in sets:
+            f = out / k / f"{p.stem}.json"
+            if f.exists():
+                b, x = split_graph(goal_eval.circuit(json.loads(f.read_text()), targets, nat.C, tx.T)[0])
+                row["held"][k] = bk.repair(b - bk.blocks0, x - bk.subs0)["held"]
+        with open(f_out, "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        log(f"{p.stem}: r {row['start']['r']:.3f} cos {row['start']['cos']:.3f} held " + " ".join(f"{k} {v:.3f}" for k, v in row["held"].items()))
+        del bk, tx
+        native.free(nat.dev)
+    return f_out
+
+
 EVAL_SETS = ("fwd", "back", "b1", "rand", "allpos")  # run's sets the evaluation scores beside the start
 DERIVED = ("rand_fwd", "vpd_eq_fwd", "vpd_eq", "sub50", "sub90", "sub50_rand", "sub90_rand")  # derived_sets'
 TIMED = ("sufficiency", "_node_family", "adversary_flips", "_interchange_family", "changed_inputs", "track_pp",
@@ -889,7 +978,7 @@ def table(out: Path) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("run", "eval", "table"))
+    ap.add_argument("cmd", choices=("run", "eval", "repair", "table"))
     ap.add_argument("--split", default="heldout")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--src", type=Path, default=Path.home() / "mpd-data/graph_oracle/teacher/influential_heldout")
@@ -906,6 +995,8 @@ def main():
         faulthandler.dump_traceback_later(900, repeat=True)  # a family holding the run shows in the log's stacks
         evaluate(a.split, a.n, a.src, a.out, offset=a.offset, stride=a.stride, log=lambda s: print(s, flush=True))
         faulthandler.cancel_dump_traceback_later()
+    elif a.cmd == "repair":
+        repairs(a.split, a.n, a.src, a.out, offset=a.offset, stride=a.stride, log=lambda s: print(s, flush=True))
     print(table(a.out) if (a.out / "fidelity.jsonl").exists() else "")
 
 

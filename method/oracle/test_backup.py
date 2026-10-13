@@ -228,3 +228,17 @@ def test_expand_circuit_subcomponents(tiny):
     bk = backup.Backup(ge, tx, circuit, draws=4)
     extra = frozenset(nd for nd in g.node_set() if nd[2] != goal_eval.BLOCK) - circuit.node_set()
     assert abs(bk.score([(frozenset(blocks), extra)])[0]["j"] - rec["final"]["j"]) < 1e-6
+
+
+def test_repair_shares(tiny):
+    """repair's shares: per draw r is the outside change's cancelling share of the circuit's change at the targets'
+    residual writes, the sites' shares sum to r, an expansion holding every site at every position holds all of it,
+    and the empty expansion none."""
+    nat, ge, tx, circuit = tiny
+    bk = backup.Backup(ge, tx, circuit, draws=4, rows=3)
+    got = bk.repair()
+    assert got["draws"] and abs(sum(got["sites"].values()) - got["r"]) < 1e-6 and got["held"] == 0.0
+    assert -1 - 1e-6 <= got["cos"] <= 1 + 1e-6
+    every = frozenset((n, t) for n in nat.names for t in range(tx.T))
+    full = bk.repair(blocks=every)
+    assert abs(full["held"] - full["r"]) < 1e-5 and abs(full["r"] - got["r"]) < 1e-9

@@ -54,7 +54,7 @@ flowchart BT
   SUP["<b>Verified behavior supervision</b><br/>English, QA and edit targets from<br/>existing circuits or planted mechanisms;<br/>no trained circuit policy required<br/>READY · varteach, rustmove, primerl"]
   GATEC{{"<b>Check C</b> · does learning add value?<br/>SFT arms vs trivial baselines and<br/>the search route on dev texts;<br/>picks the RL starting point"}}
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
-    S1["<b>SFT · influential starts</b><br/>targets that already hold<br/>on held-out changes<br/>STARTING"]
+    S1["<b>SFT · influential starts</b><br/>494 targets, held-out pp 0.965,<br/>median 357 nodes<br/>LAUNCHING · primerl"]
     S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
@@ -63,10 +63,10 @@ flowchart BT
 
   %% ===================== workstreams =====================
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
-    T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>held-out 0.99 · DONE"]
+    T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>494 texts, held-out pp 0.965 · DONE"]
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
     T3["<b>Pruning, discriminating draws</b><br/>why: fixed-draw pruning overfit<br/>(held-out 0.34 vs 0.88)<br/>landed fe0f478; N floor 343c2a1<br/>eval check on 9002, 6011, 9013<br/>ACTIVE · pymove"]
-    T4["<b>Teacher circuits v2</b><br/>444 train + 50 held-out texts<br/>discriminating draws landed (fe0f478);<br/>pymove's eval runs on 9002, 6011, 9013 decide;<br/>launches pm7 and v2 at eval pp ≥ 0.85<br/>and beats VPD top k at equal size;<br/>MATS 294 queued, influential starts<br/>for 494 texts running<br/>ACTIVE · fleet"]
+    T4["<b>Teacher circuits v2</b><br/>start from the influential set, prune only;<br/>fresh draws + validation backtracking;<br/>launches pm7 and v2 at eval pp ≥ 0.85<br/>and beats VPD top k at equal size;<br/>so far 9002: 175 nodes, eval 0.77 (VPD 0.62)<br/>BLOCKED · fleet, pymove"]
     T5["<b>Context-blocks teacher</b><br/>keeps context as blocks, prunes<br/>only the target; test transfer<br/>to unseen changes · pymove"]
   end
 

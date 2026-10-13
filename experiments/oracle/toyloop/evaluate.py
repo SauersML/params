@@ -145,8 +145,12 @@ def gt_reward(toy) -> float:
 
 
 def mean_rows(rows: list) -> dict:
-    keys = [k for k in rows[0] if isinstance(rows[0][k], (int, float))]
-    return {"n": len(rows), **{k: round(sum(r[k] for r in rows) / len(rows), 3) for k in keys}}
+    keys = list(dict.fromkeys(k for r in rows for k, v in r.items() if isinstance(v, (int, float))))
+    out = {"n": len(rows)}
+    for k in keys:   # swap_* exist only where a same-family donor was in the split
+        vs = [r[k] for r in rows if k in r]
+        out[k] = round(sum(vs) / len(vs), 3)
+    return out
 
 
 # ---------------------------------------------------------------- run

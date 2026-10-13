@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,12 @@ flowchart LR
   tokQ --> L1H0
   L1H0 --> out
 English: L0H1 copies each key onto the next position; L1H0 matches the query key to it and copies the value."""
+
+
+# The "active at last" line names the units that write at the prediction: on the zoo, listing them alone already
+# matches the truth on most families (evaluate.py's 'active' baseline). TOYLOOP_SHOW_ACTIVE=0 drops it, so the
+# oracle has to find the units in the weights and attention patterns.
+SHOW_ACTIVE = os.environ.get("TOYLOOP_SHOW_ACTIVE", "1") != "0"
 
 
 @dataclass
@@ -197,7 +204,8 @@ def behaviour_lines(toy: Toy, n_texts: int = 2) -> list[str]:
                 kl = int(arg[-1])
                 lines.append(f"  L{i}H{j}: offset {mode:+d} at {share:.0%} of positions; last attends "
                              f"{toy.vocab[ids[kl]]}@{kl} {float(p[-1, kl]):.2f}")
-        lines.append("  active at last: " + " ".join(active_units(toy, r, T - 1)))
+        if SHOW_ACTIVE:
+            lines.append("  active at last: " + " ".join(active_units(toy, r, T - 1)))
     return lines
 
 

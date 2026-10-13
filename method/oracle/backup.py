@@ -1198,6 +1198,47 @@ def table(out: Path) -> str:
     return "\n".join(lines)
 
 
+PAIRS = (("fwd", "start"), ("sub50", "start"), ("sub90", "start"), ("full", "start"), ("back", "start"),
+         ("vpd_eq_fwd", "start"), ("fwd", "rand_fwd"), ("sub50", "sub50_rand"), ("sub90", "sub90_rand"), ("full", "rand"))
+PAIR_KEYS = ("phi", "s_nodes", "s_track_pp", "s_point_c", "n_spec", "c", "size_bits", "subcomponents")
+
+
+def paired(out: Path, pairs=PAIRS, keys=PAIR_KEYS, boots: int = 2000) -> str:
+    """Paired differences over the texts between sets (each set against the start and against its equal-size trivial
+    control): the median difference with a 95% bootstrap interval over texts and the share of texts where the first is
+    higher; size_bits and subcomponents as log2 ratios. A null pair (vpd_eq_fwd, start: one subcomponent added) shows
+    the noise of goal_eval's node family, whose draws are seeded by each graph's node set."""
+    rows = [json.loads(x) for x in (out / "fidelity.jsonl").read_text().splitlines() if x.strip()]
+    chosen = {}
+    if (out / "summary.jsonl").exists():
+        chosen = {json.loads(x)["task"]: json.loads(x).get("chosen") for x in (out / "summary.jsonl").read_text().splitlines() if x.strip()}
+    by: dict = {}
+    for r in rows:
+        by.setdefault(r["kind"], {})[r["task"]] = r
+        if chosen.get(r["task"]) == r["kind"]:
+            by.setdefault("full", {})[r["task"]] = r
+    rng = np.random.default_rng(0)
+
+    def val(r, k):
+        v = r.get(k)
+        return None if v is None else (math.log2(max(v, EPS)) if k in ("size_bits", "subcomponents") else v)
+    lines = []
+    for a, b in pairs:
+        if a not in by or b not in by:
+            continue
+        lines.append(f"{a} - {b}")
+        for k in keys:
+            d = np.array([val(by[a][t], k) - val(by[b][t], k) for t in by[a] if t in by[b]
+                          and val(by[a][t], k) is not None and val(by[b][t], k) is not None])
+            if not len(d):
+                continue
+            bs = [float(np.median(rng.choice(d, len(d)))) for _ in range(boots)]
+            name = f"log2 {k}" if k in ("size_bits", "subcomponents") else k
+            lines.append(f"   {name:20s} {np.median(d):+.3f} [{np.percentile(bs, 2.5):+.3f}, {np.percentile(bs, 97.5):+.3f}]"
+                         f"  higher in {np.mean(d > 0):.2f} of {len(d)}")
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=("run", "eval", "repair", "table"))
@@ -1219,7 +1260,9 @@ def main():
         faulthandler.cancel_dump_traceback_later()
     elif a.cmd == "repair":
         repairs(a.split, a.n, a.src, a.out, offset=a.offset, stride=a.stride, log=lambda s: print(s, flush=True))
-    print(table(a.out) if (a.out / "fidelity.jsonl").exists() else "")
+    if (a.out / "fidelity.jsonl").exists():
+        print(table(a.out))
+        print(paired(a.out))
 
 
 if __name__ == "__main__":

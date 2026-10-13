@@ -104,7 +104,7 @@ def masks_run(k: int, P: int, behavior: bool = False):
     names = sorted(nm for nm, m in meta.items() if m["task"] in MASK_TASKS)
     for nm in names:
         shutil.copy(DATA / f"causalgym_texts{b}" / f"{nm}.json", native.TEXTS / "vpd4l" / f"{nm}.json")
-    jobs = [{"task": nm, "inputs": [meta[nm]["p"]], "at": at} for nm in names
+    jobs = [{"task": nm, "inputs": [meta[nm]["p"]], "at": at, "skip": [0]} for nm in names  # no Iso donor at 0 (nothing predicts it)
             for at in ([meta[nm]["p"]], [json.loads((DATA / f"causalgym_texts{b}" / f"{nm}.json").read_text())["prompts"][0]["target_positions"][-1]])]
     out = Path(os.environ.get("GEN_OUT", DATA))
     jf = out / f"cg_mask_jobs{b}_{k}.jsonl"

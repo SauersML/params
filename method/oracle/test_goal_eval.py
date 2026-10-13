@@ -2426,6 +2426,13 @@ def test_pp_terms_equal_pp_run_loop_vpd4l(real):
     p = native.TEXTS / "vpd4l" / "text9000.json"
     ids, targets = native.text(p)
     tx = ge.text(ids, targets, native.task_seed("text9000"), json.loads(p.read_text()))
+    if tx.vpd is None:  # a pod: VPD's answer saved (no causal-importance network there)
+        saved = Path.home() / "mpd-data/graph_oracle/teacher/vpd_heldout20.pt"
+        if not saved.exists():
+            pytest.skip("needs VPD's answer: the causal-importance network or " + str(saved))
+        tx.vpd = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+        for n, (ts, cs) in torch.load(saved)["text9000"]["answer"].items():
+            tx.vpd[n][ts.long().to(nat.dev), cs.long().to(nat.dev)] = True
     vpd = sorted(native.Graph(masks=tx.vpd).node_set())
     late = [nd for nd in vpd if nd[1] >= tx.T - 8]
     stated = native.Graph(late, *native.all_edges(late, targets))

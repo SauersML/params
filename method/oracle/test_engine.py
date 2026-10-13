@@ -624,6 +624,8 @@ def test_path_patched_equals_pp_run():
     ge = goal_eval.GoalEval(nat)
     ids, targets = native.text(TEXT)
     tx = ge.text(ids, targets, seed=0)
+    if tx.vpd is None:  # a pod: VPD's answer saved (answer())
+        tx.vpd = carry.masks(nat, len(ids), answer(nat, ids))
     E = engine.Engine(nat, ids, targets, live=True)
     vpd = native.Graph(masks=tx.vpd)
     late = [nd for nd in sorted(vpd.node_set()) if nd[1] >= tx.T - 8]

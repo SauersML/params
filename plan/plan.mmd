@@ -22,6 +22,11 @@
 %% Current tool-search results report original-output sufficiency separately from intervention tracking.
 %% A pass of the text-relative phi threshold is not a universal fidelity certificate; compare matched baselines.
 %% English verification must execute the complete claim: no dropped conditions or hidden assignments.
+%% S1 handoff: /private/tmp/claude-501/-Users-user/codex-oracle/reward_audit/s1_materialized/
+%% sft_32k_8k_266nodes.jsonl: 105/300 assembled examples satisfy current context, answer and node caps.
+%% manifest.json records source/input/tokenizer/cookbook/output hashes; original 250 length-only rows retained.
+%% Deterministic assembly from existing influential_v2 circuits and edit/teach_train_sft.jsonl, no model calls.
+%% This checks eligibility, not fidelity. These labels contain circuits, QA and edits, but no English or variables.
 %% Rendering: .github/workflows/plan-render.yml writes plan/plan.png and the image-only README block.
 %% Local preview: mem-lease 2 npx -y @mermaid-js/mermaid-cli@11.4.2 -i plan/plan.mmd -o /tmp/oracle-plan.png -c plan/mermaid.json -b white -s 2
 flowchart BT
@@ -57,6 +62,7 @@ flowchart BT
   SUP["<b>Verified behavior supervision</b><br/>English, QA and edit targets from<br/>existing circuits or planted mechanisms;<br/>no trained circuit policy required<br/>READY · varteach, rustmove, primerl"]
   GATEC{{"<b>Check C</b> · does learning add value?<br/>SFT arms vs trivial baselines and<br/>the search route on dev texts;<br/>picks the RL starting point"}}
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
+    S1READY["<b>Usable SFT shard now</b><br/>105/300 assembled rows fit all caps;<br/>circuits, QA and edits; no English<br/>357-node median start exceeds cap 266<br/>READY · codex to primerl"]
     S1["<b>SFT · influential starts</b><br/>494 targets, held-out pp 0.965,<br/>median 357 nodes<br/>LAUNCHING · primerl"]
     S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
@@ -75,7 +81,7 @@ flowchart BT
 
   subgraph INPUTS["ORACLE INPUT · codex, rustmove, primerl"]
     I1["<b>Candidate list</b><br/>VPD actives at listed positions;<br/>coverage depends on task and trimming<br/>IMPLEMENTED"]
-    I2["<b>Context fit</b><br/>trims 52 of 444 questions,<br/>hiding 21% of their targets<br/>DONE"]
+    I2["<b>Context fit</b><br/>measure final question including variables;<br/>log and skip only oversized rows;<br/>later rows continue · 2 checks passed<br/>DONE · codex/eval_recovery"]
     I3["<b>Coverage audit</b><br/>179/207-row snapshots: 81–84%<br/>of teacher nodes visible; edits join;<br/>retain pool inputs, check token fit<br/>HANDOFF · codex to primerl/rustmove"]
     I4["<b>Learnability grid</b><br/>decides the oracle's input format;<br/>ids, features, vocab, active, both;<br/>vectors real/random/id/permuted<br/>vs feature baselines, dev 9000-9099<br/>ACTIVE, pods launching · rustmove"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
@@ -120,6 +126,7 @@ flowchart BT
 
   %% ===================== edges: the main chain (links 0-7, thick) =====================
   T1 --> S1
+  S1READY -- usable subset --> S1
   T4 -- each passing shard --> S2
   T5 --> S3
   S1 --> GATEC
@@ -225,7 +232,7 @@ flowchart BT
   class I5 done
   class I6,W5 done
   class T4 blocked
-  class I3,S2,SUP,LAT1,W6 check
+  class I3,S2,SUP,LAT1,W6,S1READY check
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting
   class LAT2,UVPD later

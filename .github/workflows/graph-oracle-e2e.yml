@@ -47,7 +47,9 @@ jobs:
         run: |
           python -m pytest method/oracle/rl/test_inject.py method/oracle/test_intervention_panel.py \
             method/oracle/test_reward_gate.py method/oracle/test_semantic.py method/oracle/test_task_data.py \
-            method/oracle/test_tools_env.py::test_baselines_include_empty_and_same_batch_calibration -q --tb=short
+            method/oracle/test_tools_env.py::test_baselines_include_empty_and_same_batch_calibration \
+            method/oracle/test_components.py::test_fit_pool_reports_nonfit_and_later_fitting_row \
+            method/oracle/test_components.py::test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit -q --tb=short
 
       - name: Run the graph oracle's tests
         env:

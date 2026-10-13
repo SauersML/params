@@ -1096,9 +1096,14 @@ def fit_pool(task: dict, ev: dict, count, budget: int = CONTEXT - ROOM - 64) -> 
     (count: text -> Qwen3 tokens; the chat template's own tokens are in the 64), so its generation keeps at least ROOM
     of the context. The least important entries go first, across positions; "pool_cut" counts them. On the 444 v1
     train texts it cuts 52 questions (12 of them longer than the whole context uncut), which hides 21% of those texts'
-    teacher nodes; text6040 leaves 6,843 tokens with no pool at all; none of the 20 held-out questions is cut."""
-    if count(question(task, ev)) <= budget:
-        return ev
+    teacher nodes; text6040 leaves 6,843 tokens with no pool at all; none of the 20 held-out questions is cut.
+    pool_fit records tokens, budget and fits; even an empty pool may leave an oversized base question."""
+    def annotated(row, tokens):
+        return {**row, "pool_fit": {"tokens": tokens, "budget": budget, "fits": tokens <= budget}}
+
+    tokens = count(question(task, ev))
+    if tokens <= budget:
+        return annotated(ev, tokens)
     order = sorted((v, int(q), n, c) for q, per in ev["pool"].items() for n, cs in per.items() for c, v in cs)
 
     def drop(k):
@@ -1114,7 +1119,8 @@ def fit_pool(task: dict, ev: dict, count, budget: int = CONTEXT - ROOM - 64) -> 
             hi = mid
         else:
             lo = mid + 1
-    return drop(lo)
+    fitted = drop(lo)
+    return annotated(fitted, count(question(task, fitted)))
 
 
 def _atlas():
@@ -2674,14 +2680,18 @@ def main():
         with args.out.open("w") as f:
             for r in map(json.loads, args.rows.read_text().splitlines()):
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+                if args.variables:
+                    r = {**r, "variables": True}
                 if args.measured:
                     r = measured(mnat, task, r, atlas, lens)
                 elif args.facts:
                     r = refresh_facts(atlas, lens, task, r)
                 if args.pool:
                     r = fit_pool(task, candidate_pool(mnat, task, r), count)
-                if args.variables:
-                    r = {**r, "variables": True}
+                    if not r["pool_fit"]["fits"]:
+                        print(json.dumps({"event": "rerender_skip", "task": r["task"],
+                                          "reason": "question_over_budget", **r["pool_fit"]}), file=sys.stderr, flush=True)
+                        continue
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
         return
 

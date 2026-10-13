@@ -516,6 +516,57 @@ def test_fit_pool_drops_the_least_important_entries_until_the_question_fits(tiny
     assert components.fit_pool(task, {**ev, "pool": pool}, len, budget=0)["pool"] == {}
 
 
+def test_fit_pool_reports_nonfit_and_later_fitting_row(monkeypatch):
+    monkeypatch.setattr(components, "question", lambda task, row:
+                        "q" * (task["base"] + sum(len(cs) for per in row["pool"].values() for cs in per.values())))
+    row = {"pool": {"0": {"h.0.attn.v_proj": [[0, 0.1], [1, 0.9]]}}}
+    bad = components.fit_pool({"base": 6}, row, len, budget=5)
+    assert bad["pool"] == {} and bad["pool_cut"] == 2
+    assert bad["pool_fit"] == {"tokens": 6, "budget": 5, "fits": False}
+    later = components.fit_pool({"base": 2}, row, len, budget=5)
+    assert later["pool"] == row["pool"]
+    assert later["pool_fit"] == {"tokens": 4, "budget": 5, "fits": True}
+    cut = components.fit_pool({"base": 6}, row, len, budget=7)
+    assert cut["pool"]["0"]["h.0.attn.v_proj"] == [[1, 0.9]]
+    assert cut["pool_fit"] == {"tokens": 7, "budget": 7, "fits": True}
+    assert "pool_fit" not in row  # input evidence is not mutated
+
+
+def test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+
+    budget = components.CONTEXT - components.ROOM - 64
+    texts = tmp_path / "texts"
+    (texts / "vpd4l").mkdir(parents=True)
+    rows = [{"task": "mock_unfit", "base": budget - 1}, {"task": "mock_later", "base": budget - 3}]
+    for row in rows:
+        (texts / "vpd4l" / f"{row['task']}.json").write_text(json.dumps({"id": row["task"]}))
+    source, out = tmp_path / "rows.jsonl", tmp_path / "rendered.jsonl"
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(native, "TEXTS", texts)
+    monkeypatch.setattr(native, "Native", lambda: object())
+    monkeypatch.setattr(components, "_atlas", lambda: None)
+    monkeypatch.setattr(components, "_lens", lambda nat: None)
+    monkeypatch.setattr(components, "candidate_pool", lambda nat, task, row:
+                        {**row, "pool": {"0": {"h.0.attn.v_proj": [[0, 0.5]]}}})
+    monkeypatch.setattr(components, "question", lambda task, row:
+                        "q" * (row["base"] + (2 if row.get("variables") else 0)
+                               + sum(len(cs) for per in row["pool"].values() for cs in per.values())))
+    tokenizer = lambda text, **kwargs: {"input_ids": range(len(text))}
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=lambda name: tokenizer)))
+    monkeypatch.setattr(sys, "argv", ["components", "rerender", str(source), str(out), "--pool", "--variables"])
+    components.main()
+    got, = map(json.loads, out.read_text().splitlines())
+    assert got["task"] == "mock_later" and got["variables"] is True
+    assert got["pool_fit"] == {"tokens": budget, "budget": budget, "fits": True}
+    assert len(got["question"]) == budget
+    notice = json.loads(capsys.readouterr().err)
+    assert notice == {"event": "rerender_skip", "task": "mock_unfit", "reason": "question_over_budget",
+                      "tokens": budget + 1, "budget": budget, "fits": False}
+    assert source.read_text() == "".join(json.dumps(row) + "\n" for row in rows)
+
+
 def test_mermaid_circuit_is_read_strictly():
     """Mermaid is read strictly: a node declared outside its position's subgraph, a label that is no subcomponent, an id
     declared twice, an edge end declared inline, and a stray line are malformed; an edge naming an undeclared id is

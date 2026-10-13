@@ -155,6 +155,16 @@ async def rollouts(policy, server: str, tasks: list[str], group: int, renderer, 
     return [(tr, rec) for tr, (_, rec) in zip(trajs, made)]
 
 
+def episode_renderer(base: str, thinking: bool = False):
+    """(renderer, tokenizer) for episodes: tinker_train's, with every assistant turn rendered in history as it was
+    sampled (strip_thinking_from_history off), so each turn's observation extends the last and an episode trains as
+    one datum (the cookbook's extension property; with history stripped, every turn re-sends its whole context)."""
+    renderer, tokenizer = renderer_for(base, thinking)
+    if hasattr(renderer, "strip_thinking_from_history"):
+        renderer.strip_thinking_from_history = False
+    return renderer, tokenizer
+
+
 def _policy(a, tinker, service):
     from tinker_cookbook.completers import TinkerTokenCompleter
 
@@ -169,7 +179,7 @@ def rollout(a) -> None:
     a.out.parent.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.base, a.usd_cap, a.out.with_suffix(".spend.jsonl"))
     service = service_client()
-    renderer, _ = renderer_for(a.base, a.thinking)
+    renderer, _ = episode_renderer(a.base, a.thinking)
     policy = _policy(a, tinker, service)
     tasks = _tasks(a.tasks)
     for t in tasks:
@@ -196,7 +206,7 @@ def rl(a) -> None:
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.base, a.usd_cap, a.log / "spend.jsonl")
     service = service_client()
-    renderer, _ = renderer_for(a.base, a.thinking)
+    renderer, _ = episode_renderer(a.base, a.thinking)
     training = (service.create_training_client_from_state(a.init) if a.init
                 else service.create_lora_training_client(base_model=a.base, rank=a.rank))
     adam = tinker.AdamParams(learning_rate=a.lr, beta1=0.9, beta2=0.95, eps=1e-8)

@@ -84,7 +84,7 @@ def run(args):
  from head_counterfactual import scaled_head,raw_kl_bits
  from reward_interventions import scaled_neuron,clear_intervention_caches
  from intervention_teacher import tensor_digest
- from safetensors.torch import save_file
+ from safetensors.torch import save_file,load_file
  torch.set_num_threads(1);args.out.mkdir()
  write(args.out/'protocol.json',{'cases':list(CASES),'arms':manifest['arms'],'manifest_sha256':MANIFEST_SHA,
   'responses_sha256':RESPONSES_SHA,'prior_receipt_sha256':sha(args.prior/'receipt.json'),
@@ -94,6 +94,7 @@ def run(args):
   'reference_worlds':384,'candidate_worlds':1920,'forward_cap':2688,
   'selection':'post-hoc two exposed common failures; no answers or targets changed',
   'semantics':'same selected pieces; explicit all_edges completeFalse; sparse liveFalse own routing/norms',
+  'reference_parity':{'max_abs_logp':1e-5,'max_abs_KL_bits':1e-6,'equal_top_required':True},
   'interpretation':'success supports missing wiring; failure does not exclude another wiring on same units'})
  forwards=0;rows=[];graph_receipts=[]
  for case_index,item in enumerate(panel):
@@ -140,6 +141,13 @@ def run(args):
      integrity_kl=raw_kl_bits(p,integrity)
      if integrity_kl>.001:raise ValueError('full architecture integrity failed')
      if edit_index==0:baselines.append(p.clone())
+     oldworld=prior[item['id'],manifest['arms'][0],edit_index,index]
+     oldshard=next(s for s in oldreceipt['shards'] if s['artifact_root']==oldworld['artifact_root'])
+     oldfile=args.prior_states/('worker'+str(oldshard['worker']))/oldworld['file']
+     if sha(oldfile)!=oldworld['sha256']:raise ValueError('archived original distributions changed')
+     previous=load_file(str(oldfile))
+     reference_error=float((p-previous['p']).abs().max());reference_kl=raw_kl_bits(p,previous['p'])
+     if reference_error>1e-5 or abs(reference_kl)>1e-6 or int(p[0,-1].argmax())!=int(previous['p'][0,-1].argmax()):raise ValueError('archived/new literal reference differs')
      tensors={'p':p.contiguous(),'full':integrity.contiguous(),'p0':baselines[index].contiguous()};world=[]
      for arm in manifest['arms']:
       graph,error,size=graphs[arm][index];old=prior[item['id'],arm,edit_index,index]
@@ -150,7 +158,8 @@ def run(args):
       world.append({'case':item['id'],'arm':arm,'edit_index':edit_index,'input':index,
        'kind':edit['kind'],'operations':edit['operations'],'valid':q is not None,'invalid_reason':error,
        'raw_kl_bits':raw,'kl_bits':None if raw is None else max(0.,raw),'top':None if q is None else int(q[0,-1].argmax()),
-       'reference_top':int(p[0,-1].argmax()),'prior_row':old,'integrity_raw_kl_bits':integrity_kl,'size':size})
+       'reference_top':int(p[0,-1].argmax()),'reference_max_abs_logp':reference_error,'reference_raw_kl_bits':reference_kl,
+       'prior_recomputed_raw_kl_bits':None if not old['valid'] else raw_kl_bits(p,previous[arm]),'prior_row':old,'integrity_raw_kl_bits':integrity_kl,'size':size})
      name=f'{case_index}_{edit_index}_{index}.safetensors';save_file(tensors,str(args.out/name))
      for row in world:row.update(file=name,sha256=sha(args.out/name));rows.append(row)
      with (args.out/'results.jsonl').open('a') as f:

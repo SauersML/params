@@ -21,8 +21,18 @@ def pair():
     nat = tiny_native(seed=8, layers=2, d=8, heads=1, vocab=12, C=1)
     nat.units = {}
     with torch.no_grad():
+        # Guaranteed live path: input e0 -> neuron0 writes e1 -> neuron1 writes e2.
+        # Random test weights can leave both GELUs inactive and make the removed edge inert.
+        nat.target.wte.zero_()
+        nat.target.wte[1:7, 0] = 1
+        nat.target.wte[7, 1] = 1
+        nat.target.wte[8, 2] = 1
+        for norm in nat.target.norms:
+            norm.fill_(1)
+        nat.target.ln_f.fill_(1)
         for n in nat.names:
             st = nat.target.site(n)
+            layer = int(n.split(".")[1])
             if ".attn." in n:
                 st.U.zero_()
                 st.V.zero_()
@@ -30,10 +40,14 @@ def pair():
             elif n.endswith("c_fc"):
                 st.U.zero_()
                 st.U[0, 0] = 1
+                st.V.zero_()
+                st.V[layer, 0] = 1
                 nat.units[n] = torch.tensor([0])
             else:
                 st.V.zero_()
                 st.V[0, 0] = 1
+                st.U.zero_()
+                st.U[0, layer + 1] = 1 + layer
                 nat.units[n] = torch.tensor([0])
             st.W.copy_((st.V @ st.U).T)
             st.delta_T.zero_()
@@ -55,6 +69,8 @@ def test_same_units_different_wiring_changes_execution(pair):
     cut = reward_exec.score_wiring(toy, CUT, nat=nat)
     assert full["kl_bits"] < 1e-5, full
     assert cut["kl_bits"] > full["kl_bits"] + 1e-4, (full, cut)
+    assert all(r["top"] == r["reference_top"] == 8 for r in full["per_text"])
+    assert all(r["top"] == 7 for r in cut["per_text"])
     assert full["per_text"][0]["nodes"] == cut["per_text"][0]["nodes"]
     assert full["per_text"][0]["edges"] > cut["per_text"][0]["edges"]
 

@@ -140,6 +140,7 @@ def score_wiring(toy, completion: str, *, nat=None, texts=None) -> dict:
             kl = lambda x: max(0.0, float((ref.exp() * (ref - x)).sum()) / math.log(2))
             error, null_error = kl(q), kl(empty)
             rows.append({"kl_bits": error, "empty_kl_bits": null_error,
+                         "top": int(q[0, -1].argmax()), "reference_top": int(ref[0, -1].argmax()),
                          "suff": min(1.0, max(0.0, 1.0 - error / max(null_error, 1e-9))),
                          "nodes": graph.count(), "edges": graph.edges()})
     return {"scope": "executed inter-unit/output wiring; token labels and English unverified",

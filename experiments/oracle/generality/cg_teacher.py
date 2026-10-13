@@ -66,7 +66,7 @@ def write(behavior: bool = False):
     print(f"{len(ids)} texts over {len({m['task'] for m in meta.values()})} tasks")
 
 
-def run(k: int, P: int, behavior: bool = False):
+def run(k: int, P: int, behavior: bool = False, v2: bool = False):
     import native
 
     b = "_b" if behavior else ""
@@ -80,9 +80,14 @@ def run(k: int, P: int, behavior: bool = False):
     out = Path(os.environ.get("GEN_OUT", DATA))
     lst = out / f"cg_ids{b}_{k}.txt"
     lst.write_text("\n".join(names) + "\n")
-    subprocess.run([sys.executable, "-B", str(ORACLE / "teacher.py"), "--tasks", str(lst), "--edges", "--f1-start", "both",
-                    "--max-tokens", "0", "--out", str(out / f"cg_teacher{b}")], check=True)
-    test(names, out / f"cg_teacher{b}", out / f"cg_teacher{b}_test_{k}.jsonl", b)
+    # v2: the v2.1 teacher (plan T4: the influential start set pruned under changed-input, necessity and node acceptance
+    # with fresh validation draws, the pick by phi), which in the behavior mode reads the minimal pair among its changes
+    flags = (["--f1-start", "set", "--accept", "changed,necessity,nodes", "--accept-draws", "fv", "--phi-check"] if v2 else
+             ["--edges", "--f1-start", "both"])
+    tdir = out / f"cg_teacher{b}{'2' if v2 else ''}"
+    subprocess.run([sys.executable, "-B", str(ORACLE / "teacher.py"), "--tasks", str(lst), *flags, "--max-tokens", "0",
+                    "--out", str(tdir)], check=True)
+    test(names, tdir, out / f"cg_teacher{b}{'2' if v2 else ''}_test_{k}.jsonl", b)
 
 
 MASK_TASKS = ("agr_gender", "agr_sv_num_pp", "agr_sv_num_subj-relc")  # the lead's 10-13: gender and two number agreements
@@ -178,13 +183,13 @@ def test(names: list, tdir: Path, out: Path, b: str = ""):
               flush=True)
 
 
-def report(behavior: bool = False):
+def report(behavior: bool = False, v2: bool = False):
     import collections
 
     import templates
 
     rows = []
-    for p in templates.run_outputs(f"cg_teacher{'_b' if behavior else ''}_test_*.jsonl"):
+    for p in templates.run_outputs(f"cg_teacher{'_b' if behavior else ''}{'2' if v2 else ''}_test_*.jsonl"):
         rows += [json.loads(x) for x in p.read_text().splitlines()]
     t = [r for r in rows if r["variant"] == "teacher"]
     if not t:
@@ -214,6 +219,7 @@ if __name__ == "__main__":
     ap.add_argument("cmd", choices=("write", "run", "report", "masks", "test"))
     ap.add_argument("args", nargs="*", type=int)
     ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
+    ap.add_argument("--v2", action="store_true", help="run, report: the v2.1 teacher (start set, acceptance, phi pick)")
     a = ap.parse_args()
-    {"write": lambda: write(a.behavior), "run": lambda: run(*a.args, behavior=a.behavior), "report": lambda: report(a.behavior),
+    {"write": lambda: write(a.behavior), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
      "masks": lambda: masks_run(*a.args, behavior=a.behavior), "test": lambda: test_dir(*a.args, behavior=a.behavior)}[a.cmd]()

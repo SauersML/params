@@ -38,7 +38,7 @@ from pathlib import Path
 
 try:
     import numpy as np
-except ImportError:  # pairs() runs on the standard library alone (a Mac whose memory ledger is full)
+except ImportError:  # pairs() and score() run on the standard library alone (a Mac whose memory ledger is full)
     np = None
 
 HERE = Path(__file__).resolve().parent
@@ -52,6 +52,7 @@ TEXTS = Path.home() / "mpd-data/graph_oracle/texts/vpd4l"
 DEV = [f"text{i}" for i in range(9000, 9100)]  # the development texts (text9100-9149 is the sealed final test)
 SEALED = re.compile(r"text91[0-4][0-9][.]json")
 W, DRAWS, DROP, QUIET, FAR, P_MIN, PER_TEXT, CANDS = 96, 8, 1.0, 0.25, 8, 0.3, 4, 12
+RUNS = [Path("/Users/user/mpd-data/runpod"), Path("/Users/user/mpd-data/cluster")]  # the runs' synced outputs
 MAX_PAIRS = 40  # copy-bigram pairs taken into the teacher runs (of every confirmed pair)
 KINDS = tuple(os.environ.get("MD_KINDS", "copy,bigram,context").split(","))  # find: the kinds searched
 CANDS = int(os.environ.get("MD_CANDS", CANDS))  # find: candidates confirmed per text and kind
@@ -170,8 +171,7 @@ def pairs():
     import random
 
     found = []
-    roots = [Path("/Users/user/mpd-data/runpod"), Path("/Users/user/mpd-data/cluster")]
-    runs = sorted(p for r in roots if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_found_*.jsonl"))
+    runs = sorted(p for r in RUNS if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_found_*.jsonl"))
     for p in runs:
         if p.exists():
             found += [json.loads(x) for x in p.read_text().splitlines() if '"done"' not in x]
@@ -266,15 +266,22 @@ def teach(name: str):
 
 def _held(ans: dict) -> set:
     """An answer's (site, position, index) nodes, a block as (site, position, None)."""
-    import goal_eval
-
     out = set()
     for m, c, p in ans.get("nodes", []):
         if m == "block":
-            out.add((goal_eval._site(c), int(p), None))
+            out.add((_site(c), int(p), None))
         elif m != "tok":
-            out.add((goal_eval._site(m), int(p), int(c)))
+            out.add((_site(m), int(p), int(c)))
     return out
+
+
+def _site(name) -> str:
+    """goal_eval._site on the standard library: native's name ("h.2.attn.v_proj") or mech's short form ("2.v")."""
+    if isinstance(name, str) and name.startswith("h."):
+        return name
+    layer, kind = str(name).split(".")
+    kind = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj", "fc": "c_fc", "down": "down_proj"}[kind]
+    return f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"
 
 
 def _induction_anywhere(nodes: set) -> bool:
@@ -292,12 +299,12 @@ def judge(r: dict, ans: dict) -> dict:
     pos = {p for _, p, _ in nodes}
     blocks = {(n, p) for n, p, c in nodes if c is None}
     has = lambda n, p, c: (n, p, c) in nodes or (n, p) in blocks  # noqa: E731
-    out = {"nodes": len(nodes), "positions": len(pos), "context_share": float(np.mean([p < t - 1 for _, p, _ in nodes])) if nodes else 0.0,
+    out = {"nodes": len(nodes), "positions": len(pos), "context_share": _mean([p < t - 1 for _, p, _ in nodes]) if nodes else 0.0,
            "induction_anywhere": _induction_anywhere(nodes)}
     if r["kind"] == "copy":
         a, o = r["a"] - s, r["o"] - s
         core = [has(n, a, c) for n, c in CORE_A] + [has(n, o, c) for n, c in CORE_O]
-        out.update(holds_a=a in pos, holds_o=o in pos, core_share=float(np.mean(core)), core_any=any(core),
+        out.update(holds_a=a in pos, holds_o=o in pos, core_share=_mean(core), core_any=any(core),
                    right=(a in pos and o in pos), wrong=not (pos - {t, t - 1}))  # wrong: the bigram reading (target-local only)
     elif r["kind"] == "context":
         m = r["m"] - s
@@ -307,13 +314,19 @@ def judge(r: dict, ans: dict) -> dict:
     return out
 
 
+def _mean(xs) -> float:
+    return sum(map(float, xs)) / len(xs)
+
+
 def _boot(ws, B: int = 2000, seed: int = 2951):
-    ws = np.asarray([w for w in ws if w is not None], dtype=float)
-    if len(ws) == 0:
+    import random
+
+    ws = [float(w) for w in ws if w is not None]
+    if not ws:
         return "-"
-    r = np.random.default_rng(seed)
-    bs = ws[r.integers(len(ws), size=(B, len(ws)))].mean(1)
-    return f"{ws.mean():.2f} [{np.percentile(bs, 2.5):.2f}, {np.percentile(bs, 97.5):.2f}] (n={len(ws)})"
+    r = random.Random(seed)
+    bs = sorted(_mean(r.choices(ws, k=len(ws))) for _ in range(B))
+    return f"{_mean(ws):.2f} [{bs[int(0.025 * B)]:.2f}, {bs[int(0.975 * B) - 1]:.2f}] (n={len(ws)})"
 
 
 def score(answers: Path | None = None, tdirs: list | None = None):
@@ -321,11 +334,9 @@ def score(answers: Path | None = None, tdirs: list | None = None):
     {task, sample, text}, the circuit components.parse(text)["answer"]), each item's right (copy: holds a and o;
     context: holds m; bigram: no layer-1 induction pair) and wrong (copy: target-local only; context and bigram: an
     induction pair), and a pair right when both items are right; bootstrap 95% intervals over pairs."""
-    import templates
-
     pr = json.loads((DATA / "mechdisc_items.json").read_text())["pairs"]
     teach_ = {}
-    for d in (tdirs or []) + [p.parent for p in templates.run_outputs("mechdisc_teacher/md*.json")] + [OUTROOT / "mechdisc_teacher"]:
+    for d in (tdirs or []) + sorted({p.parent for r in RUNS if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_teacher/md*.json")}) + [OUTROOT / "mechdisc_teacher"]:
         d = Path(d)
         if d.exists():
             for f in d.iterdir():
@@ -345,22 +356,24 @@ def score(answers: Path | None = None, tdirs: list | None = None):
         for contrast in sorted({p["contrast"] for p in pr}):
             ps = [p for p in pr if p["contrast"] == contrast and all(r["name"] in by for r in p["items"])]
             js = [[[judge(r, a) for a in by[r["name"]]] for r in p["items"]] for p in ps]
-            mean = lambda xs: float(np.mean(xs)) if xs else None  # noqa: E731
-            right_a = [mean([j["right"] for j in jj[0]]) for jj in js]
-            right_b = [mean([j["right"] for j in jj[1]]) for jj in js]
-            wrong_a = [mean([j["wrong"] for j in jj[0]]) for jj in js]
-            wrong_b = [mean([j["wrong"] for j in jj[1]]) for jj in js]
-            both = [mean([ja["right"] and jb["right"] and not ja["wrong"] and not jb["wrong"] for ja in jj[0] for jb in jj[1]]) for jj in js]
+            mean = lambda xs: _mean(xs) if xs else None  # noqa: E731
             ka = contrast.split("-")[0]
-            print(f"  {contrast}: {len(ps)} pairs with circuits for both items")
-            print(f"    {ka} item holds its mechanism       {_boot(right_a)}")
-            print(f"    {ka} item holds the other reading   {_boot(wrong_a)}")
-            print(f"    bigram item holds its reading (no induction pair) {_boot(right_b)}")
-            print(f"    pair right (both right, neither wrong) {_boot(both)}")
-            if ka == "copy":
-                print(f"    copy item's core parts at their roles (share of 6) {_boot([mean([j['core_share'] for j in jj[0]]) for jj in js])}")
-            print(f"    context share of nodes: {ka} {_boot([mean([j['context_share'] for j in jj[0]]) for jj in js])}, bigram "
-                  f"{_boot([mean([j['context_share'] for j in jj[1]]) for jj in js])}")
+            print(f"  {contrast}: {len(ps)} {'pairs' if '-' in contrast else 'unpaired items'} with circuits for every item")
+            for i, kd in enumerate(([ka, "bigram"] if "-" in contrast else [ka])):
+                side = lambda f: [mean([f(j) for j in jj[i]]) for jj in js]  # noqa: E731
+                print(f"    {kd} item: its mechanism's positions in the circuit {_boot(side(lambda j: j['right']))}; "
+                      f"the other mechanism's {_boot(side(lambda j: j['wrong']))}; share of nodes at context positions "
+                      f"{_boot(side(lambda j: j['context_share']))}")
+                if kd == "copy":
+                    print(f"    copy item: core parts at their positions (share of 6) {_boot(side(lambda j: j['core_share']))}")
+            if "-" in contrast:
+                both = [mean([ja["right"] and jb["right"] and not ja["wrong"] and not jb["wrong"] for ja in jj[0] for jb in jj[1]]) for jj in js]
+                print(f"    pair right (both items right, neither wrong) {_boot(both)}")
+        items = {r["name"]: r for p in pr for r in p["items"] if r["name"] in by}
+        print("  per family, each item once: its mechanism's positions in the circuit and not the other mechanism's")
+        for kd in ("copy", "bigram", "context"):
+            js = [[judge(r, a) for a in by[nm]] for nm, r in sorted(items.items()) if r["kind"] == kd]
+            print(f"    {kd:8s} {_boot([_mean([j['right'] and not j['wrong'] for j in jj]) for jj in js])}")
 
 
 if __name__ == "__main__":

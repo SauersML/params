@@ -31,7 +31,7 @@
 %% Tinker project 3f598f31-2ffa-4eb4-b302-909eb234fb7d; 49 steps x 8; $5 allowance incl. dev9020-9027 comparison.
 %% Distinct from primerl's full S1 arms. Judge on fixed development tasks, not falling training loss.
 %% Pilot training $2.2379104 + paired dev8 sampling $0.085776342. Same 68 QA fields: base 2.94%, trained 69.12%.
-%% Canonical valid circuits base 2/8 (all empty), trained 5/8; 3 trained exceed node cap. Fidelity not yet measured.
+%% Full-answer canonical validity: base 2/8 (all empty), trained 5/8; 3 trained exceed node cap. Executed results below.
 %% Critical QA control: visible original-top/no-change gets 68.38%, trained 69.12% (+0.74 points only).
 %% Training improved formatting, not yet useful mechanistic QA: falls gains 13 correct fields, top-token loses 12.
 %% Do not scale SFT based on base-model QA gains alone; compare no-change and execute circuits first.
@@ -44,6 +44,15 @@
 %% English writer $0.00184896; initial GPU parser rejected all 4 claims (not 4 incorrect model predictions).
 %% Quote fix 7576011, 36 checks pass; exact-claim CPU replay: 2/4 correct, zero information credit, no training labels.
 %% English pilot uses whole native MLP blocks, not VPD rank-one units; prose itself remains unverified.
+%% Input-only follow-up: activation threshold fitted on the 97 training rows also gets dev8 QA 69.12%.
+%% It gets falls/top 46/48 correct versus trained 58/36; feature coverage 25/68, not an exhaustive learnability test.
+%% Saved-draw analysis distinguishes response errors from removal specificity; uncertainty dominates texts9026/9027.
+%% b84253d adds opt-in --calibration-evidence: original scored draws and provenance, no score changes or new probes.
+%% VPD English successor: text6002 V5, exact 258 rank-one units, measured carrier eval .912; no block substitution.
+%% Six observed donor transplants show probability ratios .996–1.123. Two fixed donor outcomes remain withheld.
+%% b84253d adds explicit p(top) > factor * base claims; 48 semantic checks pass, legacy decrease syntax unchanged.
+%% Open-writer comparison: full VPD features versus observed-facts-only, one response each, total cap $.06.
+%% Both predictions saved before executing withheld transplants; verified claims do not certify surrounding prose.
 %% Total this pilot: Tinker $2.325535302 + RunPod $0.1826 = $2.508135302; no shared extra budget used.
 %% Existing dev8 immutable. New rerender --node-cap communicates explicit limits before fitting (33419cd).
 %% Successful SFT skills feed integration directly; RL is an optional improvement, not a prerequisite.
@@ -107,7 +116,7 @@ flowchart BT
     I1["<b>Candidate list</b><br/>VPD actives at listed positions;<br/>coverage depends on task and trimming<br/>IMPLEMENTED"]
     I2["<b>Context fit and explicit limits</b><br/>opt-in node cap before token fitting;<br/>log and skip only oversized rows;<br/>later rows continue<br/>DONE · codex/eval_recovery · 33419cd"]
     I3["<b>Coverage audit</b><br/>179/207-row snapshots: 81–84%<br/>of teacher nodes visible; edits join;<br/>retain pool inputs, check token fit<br/>HANDOFF · codex to primerl/rustmove"]
-    I4["<b>Learnability grid</b><br/>decides the oracle's input format;<br/>ids, features, vocab, active, both;<br/>vectors real/random/id/permuted<br/>vs feature baselines, dev 9000-9099<br/>ACTIVE, pods launching · rustmove"]
+    I4["<b>Learnability and input controls</b><br/>cheap feature baseline matches SFT QA;<br/>test weights beyond visible facts;<br/>vectors real/random/id/permuted<br/>ACTIVE · rustmove, codex"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
     I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
   end
@@ -118,7 +127,7 @@ flowchart BT
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>common removal tests for all candidates;<br/>absolute sufficiency before size credit;<br/>gate leak shut: slope 10 (6f8a869)<br/>ACTIVE · codex, inframove, primerl"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
-    W6["<b>Matched reward controls</b><br/>dev8 found null-syntax size bonus;<br/>fixed with 3 regression checks;<br/>overall calibration still unproven<br/>CHECK · codex/reward_audit · 38b5039"]
+    W6["<b>Matched reward controls</b><br/>null-syntax bonus fixed;<br/>retain scored draws to distinguish<br/>response errors from uncertainty<br/>IMPLEMENTED · codex · b84253d"]
   end
 
   %% ===================== verifier and foundations =====================
@@ -127,7 +136,7 @@ flowchart BT
   TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo: 350 planted models, 10 families<br/>exec reward: truth beats truth ±1 unit<br/>on all 350 (71df37e); but listing active<br/>units scores F1 0.81–1.0: input leaks;<br/>SFT without the leak running · toyloop"]
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
-  ENGP["<b>English claim diagnostic</b><br/>native MLP blocks, not VPD units;<br/>2/4 predictions correct; zero credit;<br/>no verified training labels<br/>CHECK · codex/variable_reward"]
+  ENGP["<b>VPD-bound English claims</b><br/>258 rank-one units; carrier eval .912;<br/>full features vs observed facts;<br/>predict two withheld interventions<br/>ACTIVE · codex/variable_reward"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -265,7 +274,8 @@ flowchart BT
   class I6,W5 done
   class T4 blocked
   class I3,S2,SUP,LAT1,W6 check
-  class S1READY,ENGP check
+  class S1READY check
+  class ENGP active
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting
   class LAT2,UVPD later

@@ -593,7 +593,13 @@ def edit_op_text(o: dict, name: dict) -> str:
     head = "persistent " if o.get("persistent") else ""
     if o["op"] == "cut":
         return f"{head}cut {ref(tuple(o['reader']) if o['reader'] != 'out' else 'out')} <- {ref(tuple(o['writer']))}"
-    return f"{head}scale {ref(tuple(o['node']))} {o['k']:g}"
+    # The grammar accepts decimal literals, not exponents. Preserve the exact
+    # checked factor rather than rounding it to six significant digits.
+    from decimal import Decimal
+    factor = format(Decimal(repr(float(o["k"]))), "f")
+    if "." in factor:
+        factor = factor.rstrip("0").rstrip(".")
+    return f"{head}scale {ref(tuple(o['node']))} {factor}"
 
 
 def _short_ids(n: int) -> list[str]:

@@ -98,6 +98,17 @@ def test_short_ids():
     assert items["malformed"] == 1 and items["malformed_nodes"] == 3  # the line counted once, each bad item charged
 
 
+@pytest.mark.parametrize("factor", [1.5009765625, -0.000000059604644775390625, 0.0, -1.0, 2.0])
+def test_scale_factor_exact_text_roundtrip(factor):
+    operation = {"op": "scale", "node": ("h.3.mlp.down_proj", None, 7),
+                 "k": factor, "persistent": True}
+    literal = components.edit_op_text(operation, {})
+    parsed = components.parse("CIRCUIT:\nEDIT 1: " + literal + "\n")
+    assert parsed["edits"][1] == [operation]
+    if factor in (0.0, -1.0, 2.0):
+        assert literal.endswith(" " + format(factor, "g"))
+
+
 def test_edits():
     text = ("CIRCUIT:\n@9 a=L1.down#5 b=L1.fc#1\nOUT <- a\na <- b\nEDIT 1: cut a <- b; scale b 0\n"
             "EDIT 2: persistent scale L1.v#7 0; persistent cut L1.o#3 <- L1.v#7\nEDIT 3: cut out <- a; scale zz 2\n")

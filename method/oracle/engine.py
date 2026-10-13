@@ -483,7 +483,7 @@ class Engine:
     def path_patched(self, graphs: list, prompts: list, strengths: torch.Tensor | None = None, cuts: list | None = None,
                      lines: torch.Tensor | None = None) -> torch.Tensor:
         """log q at the targets [len(graphs), len(prompts), targets, V] of each graph's path-patched run on the engine's
-        text x with prompts[d] = (position p, token z) changed, or {node: value} held (s_track_pp's and interchange_pp's,
+        text x with prompts[d] = (position p, token z) changed (or a list of such changes), or {node: value} held (s_track_pp's and interchange_pp's,
         the lead's spec 10-12; goal_eval.pp_run, one graph and prompt at a time, the reference). x is the real model's run on x (_x_run); in the patched run P the
         change travels only along stated paths. A circuit node reads its stated parents' outputs from P and everything
         else from x (unstated writers, in the circuit or not, the remainders and the embeddings; the token at p only
@@ -529,11 +529,20 @@ class Engine:
                 out[i] = lq
         return torch.stack(out)
 
+    @staticmethod
+    def _pp_changes(pr) -> list:
+        """A prompt's changed tokens [(position, token)]: (p, z), or a list of them; a held set's, none."""
+        if isinstance(pr, dict):
+            return []
+        if len(pr) == 2 and not isinstance(pr[0], (list, tuple)):
+            return [(int(pr[0]), int(pr[1]))]
+        return [(int(p), int(z)) for p, z in pr]
+
     def _pp_pos(self, pr) -> int:
-        """A prompt's earliest change: a changed token's position, or a held set's earliest node."""
+        """A prompt's earliest change: its earliest changed token's position, or a held set's earliest node."""
         if isinstance(pr, dict):
             return min((nd[1] for nd in pr), default=self.T - 1)
-        return pr[0]
+        return min(p for p, _ in self._pp_changes(pr))
 
     def _pp_chunks(self, prompts: list, cost) -> list:
         """Prompt indices in batches, the latest change first, each batch's prompts times cost(its earliest change) at
@@ -548,12 +557,23 @@ class Engine:
         return out + [cur] if cur else out
 
     def _pp_token(self, part: list, G: int) -> tuple:
-        """(each row's changed token's position [D G] (-1: a held set's row), its embedding change [D G, d]): rows
-        prompt-major, graph-minor."""
+        """The batch's changed tokens: (per row and position the change's index or -1 [D G, T], each change's embedding
+        change [n, d]); rows prompt-major, graph-minor."""
         dev, wte = self.dev, self.tg.wte
-        tokens = [(-1, 0, 0) if isinstance(pr, dict) else (pr[0], pr[1], self.ids[pr[0]]) for pr in part]
-        p, z, x0 = (torch.tensor(c, device=dev).repeat_interleave(G) for c in zip(*tokens))
-        return p, (wte[z] - wte[x0]) * (p >= 0)[:, None]
+        rows, pos, z, x0 = [], [], [], []
+        for d, pr in enumerate(part):
+            for p, zz in self._pp_changes(pr):
+                rows.append(d)
+                pos.append(p)
+                z.append(zz)
+                x0.append(self.ids[p])
+        cidx = torch.full((len(part) * G, self.T), -1, dtype=torch.long, device=dev)
+        if not rows:
+            return cidx, torch.zeros(0, wte.shape[1], device=dev)
+        n = len(rows)
+        r = (torch.tensor(rows, device=dev)[:, None] * G + torch.arange(G, device=dev)).flatten()
+        cidx[r, torch.tensor(pos, device=dev).repeat_interleave(G)] = torch.arange(n, device=dev).repeat_interleave(G)
+        return cidx, wte[torch.tensor(z, device=dev)] - wte[torch.tensor(x0, device=dev)]
 
     def _pp_held(self, part: list, G: int, key) -> dict:
         """Per site the held nodes of the batch's prompts: (subcomponents, blocks), each None or (rows [n G], positions
@@ -650,12 +670,12 @@ class Engine:
         s = min(self._pp_pos(pr) for pr in part)
         Tn, D = T - s, len(part)
         B = D * G
-        p, dtok = self._pp_token(part, G)
-        tb = (p >= 0).nonzero().flatten()  # the rows with a changed token
+        cidx, dtoks = self._pp_token(part, G)
+        tb, tt = (cidx[:, s:] >= 0).nonzero(as_tuple=True)  # the changed tokens (row, position from s)
         tok = torch.zeros(B, Tn, tg.wte.shape[1], device=dev)
-        tok[tb, p[tb] - s] = dtok[tb]
+        tok[tb, tt] = dtoks[cidx[tb, tt + s]]
         chg = torch.zeros(B, Tn, dtype=torch.bool, device=dev)  # whether a residual reader's input changed
-        chg[tb, p[tb] - s] = True
+        chg[tb, tt] = True
         dS = torch.zeros_like(tok)  # the circuit's residual writers' change
         late = torch.arange(s, T, device=dev)[:, None] < torch.arange(T, device=dev)[None, :]  # keys after the query
         held = self._pp_held(part, G, lambda nd: nd[2] if nd[1] >= s else None)
@@ -928,7 +948,7 @@ class Engine:
         D = len(part)
         B = D * G
         gb = torch.arange(B, device=dev) % G
-        p, dtok = self._pp_token(part, G)
+        cidx, dtoks = self._pp_token(part, G)
         dlt = torch.zeros(B, un["N"], device=dev)  # a subcomponent's P activation minus x's; a block: 1 where it changed
         bv = {}  # per site with blocks [B, blocks, d_out]: P's whole output minus x's
         member, on = un["member"][gb], un["on"][gb]
@@ -1010,7 +1030,8 @@ class Engine:
                 hits.append((eb, st["reads"][2][ee]))
             if "toks" in st:
                 tp, tr, tj = st["toks"]
-                tb, tk = ((on[:, tj] > 0) & (tp[None, :] == p[:, None])).nonzero(as_tuple=True)
+                ci = cidx[:, tp]  # [B, token edges]: the change at each edge's position, or -1
+                tb, tk = ((on[:, tj] > 0) & (ci >= 0)).nonzero(as_tuple=True)
                 hits.append((tb, tr[tk]))
             bi, ri, rid = rows_of(st, hits)
             if len(bi) == 0:
@@ -1025,7 +1046,7 @@ class Engine:
             if "toks" in st:
                 rr = rid[tb, tr[tk]]
                 keep = rr >= 0
-                Dm.index_add_(0, rr[keep], dtok[tb[keep]])
+                Dm.index_add_(0, rr[keep], dtoks[ci[tb[keep], tk[keep]]])
             z = xin[st["t"][ri]] + Dm
             finish(n, st, bi, ri, self.rms(z, norm, self.eps) if norm is not None else self.gelu(z))
 
@@ -1183,8 +1204,9 @@ class Engine:
         z = z.view(B, nt, -1)
         if un["touts"] is not None:  # the changed token's embedding into the prediction at its target
             tp, ti, tj = un["touts"]
-            tb, tk = ((on[:, tj] > 0) & (tp[None, :] == p[:, None])).nonzero(as_tuple=True)
-            z[tb, ti[tk]] += dtok[tb]
+            ci = cidx[:, tp]
+            tb, tk = ((on[:, tj] > 0) & (ci >= 0)).nonzero(as_tuple=True)
+            z[tb, ti[tk]] += dtoks[ci[tb, tk]]
         return self._pp_predict(z)
 
     def _zeros(self) -> dict:

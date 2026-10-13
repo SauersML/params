@@ -2534,3 +2534,22 @@ def test_pp_families_of_line_deletions(tiny, monkeypatch):
             for x, y in zip(a[key], b[key]):
                 assert x[0] == y[0] and all(close(u, v) for u, v in zip(x[1:], y[1:])), (key, x, y)
         assert sum(len(r[key]) for r in got) > 0
+
+
+def test_path_patched_several_changes():
+    """A prompt changing several tokens ([(p, z), ...]) equals pp_run on the text with all of them changed, on random
+    stated graphs (token edges at each changed position) and complete graphs, beside single changes in one call."""
+    _, ge, tx, E, nodes, prompts = _pp_case(near=None)
+    g = torch.Generator().manual_seed(21)
+    graphs = [_pp_stated(_pp_nodes(nodes, g, f), tx.targets, g) for f in (0.5, 1.0)] + [native.Graph(_pp_nodes(nodes, g, 0.5), complete=True)]
+    multi = [[prompts[0], prompts[1]], [prompts[2], prompts[3], prompts[1]]]
+    mixed = multi + prompts[:1]
+    with torch.no_grad():
+        got = E.path_patched(graphs, mixed)
+        for b, gr in enumerate(graphs):
+            for d, pr in enumerate(mixed):
+                x2 = list(tx.ids)
+                for p, z in ([pr] if isinstance(pr, tuple) else pr):
+                    x2[p] = z
+                want = ge.pp_run(tx, x2, gr)[0]
+                assert float((got[b, d] - want).abs().max()) < 1e-4, (b, d)

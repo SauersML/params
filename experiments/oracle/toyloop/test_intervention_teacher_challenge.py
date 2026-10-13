@@ -42,10 +42,22 @@ def test_batch_input_selection_is_distinct_and_search_disjoint():
     assert batch.select_inputs(draws, [[0, 1]]) == [[0, i] for i in range(2, 10)]
 
 
-def test_batch_input_selection_rejects_insufficient_fixed_pool():
-    import pytest
+def test_batch_input_selection_retains_exhausted_finite_domain():
     import intervention_teacher_batch_challenge as batch
-    with pytest.raises(RuntimeError, match="fixed 64-draw"):
-        batch.select_inputs([[0, 1]] * 64, [[0, 1]])
+    assert batch.select_inputs([[0, 1]] * 64, [[0, 1]]) == []
+    assert batch.select_inputs([[0, 1], [0, 2]], [[0, 1]]) == [[0, 2]]
+
+
+def test_batch_summary_retains_invalid_point_gold_separately():
+    import intervention_teacher_batch_challenge as batch
+    common = {"case": "gate_003", "kind": "individual", "active": True,
+              "reference_top": 2, "nochange_top": 1}
+    rows = [dict(common, candidate="point_gold", valid=False, top=None, kl_bits=None),
+            dict(common, candidate="intervention_teacher", valid=True, top=2, kl_bits=.0001)]
+    groups = {row["candidate"]: row for row in batch.summarize(rows)["groups"]}
+    assert groups["point_gold"]["worlds"] == 1
+    assert groups["point_gold"]["valid"] == 0
+    assert groups["point_gold"]["kl_failures_or_invalid"] == 1
+    assert groups["intervention_teacher"]["top_correct"] == 1
 
 

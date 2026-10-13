@@ -34,7 +34,7 @@ def select_inputs(draws, fitted, count=8):
             seen.add(key)
         if len(selected) == count:
             return selected
-    raise RuntimeError("fixed 64-draw pool lacks eight distinct non-fitted inputs")
+    return selected  # Finite domains may have fewer than eight unseen inputs.
 
 
 def joint_pairs(case, units, count=6):
@@ -155,11 +155,18 @@ def main():
         pairs = joint_pairs(case, architecture)
         edits = fixed_edits(architecture, pairs)
         receipt = next(row for row in protocol["models"] if row["case"] == case)
-        expected_worlds = 8 * (receipt["worlds"] // 4 + 24)
+        expected_worlds = len(bank) * (receipt["worlds"] // 4 + 24)
         if len(edits) * len(bank) != expected_worlds:
             raise RuntimeError("predeclared challenge work bound changed")
         point_control = render.target_text(toy.truth).split("\nEnglish:", 1)[0]
-        control_graphs = [circuit.unit_graph(circuit.parse(point_control), bound, ids) for ids in bank]
+        control_graphs, control_invalid = [], []
+        for ids in bank:
+            try:
+                control_graphs.append(circuit.unit_graph(circuit.parse(point_control), bound, ids))
+                control_invalid.append(None)
+            except ValueError as exc:
+                control_graphs.append(None)
+                control_invalid.append(str(exc))
         graphs, invalid = [], []
         for ids in bank:
             try:
@@ -170,22 +177,24 @@ def main():
                 invalid.append(str(exc))
         full = [native.Graph({(name, pos, piece) for name in nat.names for pos in range(len(ids))
                               for piece in range(int(nat.C[name]))}, complete=True) for ids in bank]
-        prepared.append((case, nat, bank, graphs, full, edits, original, unit_ids, invalid, control_graphs))
+        prepared.append((case, nat, bank, graphs, full, edits, original, unit_ids, invalid, control_graphs, control_invalid))
         write(args.out / (case + ".plan.json"), {"case": case, "inputs": bank, "edits": edits,
               "target_sha256": expected, "original_basis": original, "original_unit_ids": unit_ids,
               "candidate_worlds": 2 * expected_worlds, "forward_cap": 4 * expected_worlds,
               "point_control": point_control, "point_control_sha256": hashlib.sha256(point_control.encode()).hexdigest(),
               "scope": "new-to-search inputs on existing TRAIN models; finite-context scope diagnosis, no admission gate/repair"})
-    if sum(len(row[2]) * len(row[5]) for row in prepared) != 3040:
+    planned_worlds = sum(len(row[2]) * len(row[5]) for row in prepared)
+    if planned_worlds > 3040:
         raise RuntimeError("frozen global work bound changed")
-    write(args.out / "protocol.json", {"targets": TARGETS, "candidate_worlds": 6080, "forward_cap": 12160,
+    write(args.out / "protocol.json", {"targets": TARGETS, "candidate_worlds": 2 * planned_worlds, "forward_cap": 12160,
           "acceptance": False, "repair": False, "bank_seed": 20261013, "pairs_per_case": 6,
           "joint_scale_combinations": [[0., 0.], [0., .5], [.5, 0.], [.5, .5]],
           "scales": [0., .5], "scope": "unseen by search; reused TRAIN diagnostic, not pristine heldout tasks",
           "source_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in
                             [Path(__file__), args.reward_source, here / "reward_interventions.py", here / "head_counterfactual.py"]}})
     actual_forwards = 0
-    for case, nat, bank, graphs, full, edits, original, unit_ids, invalid, control_graphs in prepared:
+    (args.out / "results.jsonl").touch(exist_ok=False)
+    for case, nat, bank, graphs, full, edits, original, unit_ids, invalid, control_graphs, control_invalid in prepared:
         baselines = []
         complete_rows = 0
         write(args.out / (case + ".progress.json"), {"planned": len(edits) * len(bank), "completed": 0})
@@ -209,8 +218,9 @@ def main():
                          goal_eval.GoalEval(nat).graph_ref(ids, [len(ids) - 1], graphs[index], live=False))
                     actual_forwards += int(q is not None)
                     clear_intervention_caches(nat)
-                    control_q = goal_eval.GoalEval(nat).graph_ref(ids, [len(ids) - 1], control_graphs[index], live=False)
-                    actual_forwards += 1
+                    control_q = (None if control_graphs[index] is None else
+                                 goal_eval.GoalEval(nat).graph_ref(ids, [len(ids) - 1], control_graphs[index], live=False))
+                    actual_forwards += int(control_q is not None)
                     if kind == "no_edit":
                         baselines.append(p.clone())
                     p0 = baselines[index]
@@ -218,7 +228,8 @@ def main():
                     tensors = {"p": p.contiguous(), "full": integrity.contiguous(), "p0": p0.contiguous()}
                     if q is not None:
                         tensors["q"] = q.contiguous()
-                    tensors["point_gold_q"] = control_q.contiguous()
+                    if control_q is not None:
+                        tensors["point_gold_q"] = control_q.contiguous()
                     save_file(tensors, str(args.out / filename))
                     raw = None if q is None else raw_kl_bits(p, q)
                     row = {"case": case, "candidate": "intervention_teacher", "input": index, "ids": ids, "edit_index": edit_index,
@@ -232,10 +243,11 @@ def main():
                     with (args.out / "results.jsonl").open("a") as handle:
                         handle.write(json.dumps(row) + "\n")
                         control_row = dict(row)
-                        control_raw = raw_kl_bits(p, control_q)
-                        control_row.update(candidate="point_gold", valid=True, invalid_reason=None,
-                                           raw_kl_bits=control_raw, kl_bits=max(0., control_raw),
-                                           top=int(control_q[0, -1].argmax()))
+                        control_raw = None if control_q is None else raw_kl_bits(p, control_q)
+                        control_row.update(candidate="point_gold", valid=control_q is not None,
+                                           invalid_reason=control_invalid[index], raw_kl_bits=control_raw,
+                                           kl_bits=None if control_raw is None else max(0., control_raw),
+                                           top=None if control_q is None else int(control_q[0, -1].argmax()))
                         handle.write(json.dumps(control_row) + "\n")
                         handle.flush()
                         os.fsync(handle.fileno())
@@ -250,7 +262,7 @@ def main():
                   "basis": restored, "unit_ids": {name: tensor_digest(nat.units[name]) for name in nat.names}})
         print(json.dumps({"case": case, "completed_worlds": complete_rows}), flush=True)
     final_rows = [json.loads(line) for line in (args.out / "results.jsonl").read_text().splitlines()]
-    expected_keys = {(case, candidate, edit_index, input_index) for case, _, bank, _, _, edits, _, _, _, _ in prepared
+    expected_keys = {(case, candidate, edit_index, input_index) for case, _, bank, _, _, edits, _, _, _, _, _ in prepared
                      for candidate in ("intervention_teacher", "point_gold")
                      for edit_index in range(len(edits)) for input_index in range(len(bank))}
     actual_keys = [(row["case"], row["candidate"], row["edit_index"], row["input"]) for row in final_rows]
@@ -261,7 +273,10 @@ def main():
             raise RuntimeError("frozen target changed during challenge")
     if actual_forwards > 12160:
         raise RuntimeError("frozen forward budget exceeded")
-    write(args.out / "complete.json", {"candidate_worlds": 6080, "unique_worlds": 3040, "forward_cap": 12160, "actual_forwards": actual_forwards,
+    write(args.out / "complete.json", {"candidate_worlds": 2 * planned_worlds, "unique_worlds": planned_worlds,
+          "cases": [{"case": row[0], "fresh_inputs": len(row[2]),
+                     "status": "measured" if row[2] else "finite_domain_no_fresh_inputs"} for row in prepared],
+          "forward_cap": 12160, "actual_forwards": actual_forwards,
           "target_repair": False, "scope": "post-freeze TRAIN diagnostic transfer"})
     summary = summarize(final_rows)
     write(args.out / "summary.json", summary)

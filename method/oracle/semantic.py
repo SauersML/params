@@ -525,8 +525,10 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
         return out
 
     def unseen(p: int, seen: set) -> list[int]:  # fresh donor tokens at p, sampled from the model's prediction there
-        lp = sc.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double()
-        w = lp.exp()
+        if p == 0:  # no prefix to predict from: every token alike
+            w = torch.ones(sc.nat.reference([tx.ids[:1]], [0]).shape[-1], dtype=torch.float64)
+        else:
+            w = sc.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double().exp()
         w[sorted(seen)] = 0.0
         gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(("invariants", int(tx.seed), p)).encode()).hexdigest()[:15], 16))
         return torch.multinomial(w, min(fresh, int((w > 0).sum())), replacement=False, generator=gen).tolist()

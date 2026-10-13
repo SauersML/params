@@ -51,8 +51,13 @@ SAMPLED = 32  # alternatives sampled from the model's prediction per position
 def alternatives(nat: native.Native, ids: list[int], p: int, seed: int, top: int = TOP, sampled: int = SAMPLED) -> list[int]:
     """The model's top likeliest tokens at p (from the tokens before p, the text's own left out), then sampled more
     from that prediction without replacement, keyed by seed and p."""
-    lp = nat.reference([ids[:p]], [p - 1])[0, 0].cpu().double()  # MPS has no float64
-    first = [int(z) for z in lp.topk(top + 1).indices.tolist() if z != ids[p]][:top]
+    if p == 0:  # no prefix to predict from: every token alike (the first ones then drawn like the sampled ones)
+        lp = torch.zeros(nat.reference([ids[:1]], [0]).shape[-1], dtype=torch.float64)
+        first = []
+        sampled += top
+    else:
+        lp = nat.reference([ids[:p]], [p - 1])[0, 0].cpu().double()  # MPS has no float64
+        first = [int(z) for z in lp.topk(top + 1).indices.tolist() if z != ids[p]][:top]
     w = lp.exp()
     w[[ids[p]] + first] = 0.0
     gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(("classes", seed, p)).encode()).hexdigest()[:15], 16))

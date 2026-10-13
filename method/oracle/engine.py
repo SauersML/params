@@ -797,17 +797,17 @@ class Engine:
     @torch.no_grad()
     def _x_run(self) -> dict:
         """The real model's run on the engine's text, kept (path_patched's x): per layer the residual stream entering the
-        attention and the MLP [T, d] and their norms, the rotated queries and keys and the values [H, T, hd], the scores
-        and the pattern [H, T, T], the attention output before o_proj [T, d], the MLP's pre-activation and GELU
-        [T, d_ff]; the final stream [T, d]; every site's whole output [T, d_out] (so; queries and keys unrotated).
-        float32, vpd_model's own norm and GELU, every matrix its full weight."""
+        attention and the MLP [T, d] and their norms, the rotated queries and keys and the values [H, T, hd], the
+        attention output before o_proj [T, d], the MLP's pre-activation and GELU [T, d_ff]; the final stream [T, d];
+        every site's whole output [T, d_out] (so; queries and keys unrotated). float32, vpd_model's own norm and GELU,
+        every matrix its full weight. The scores and pattern are not kept ([H, T, T] a layer): _x_rows makes the rows
+        asked for."""
         if not hasattr(self, "_xr"):
             tg, T, H, hd = self.tg, self.T, self.H, self.hd
             W = lambda i, kd: tg.site(native.site_name(i, kd)).W  # noqa: E731
             bias = lambda o, i, kd: o if tg.site(native.site_name(i, kd)).b is None else o + tg.site(native.site_name(i, kd)).b  # noqa: E731
-            causal = torch.ones(T, T, dtype=torch.bool, device=self.dev).tril()
             x = self.emb[0]
-            out = {k: [] for k in ("xa", "xm", "ha", "hm", "q", "k", "v", "S", "A", "y", "pre", "g")}
+            out = {k: [] for k in ("xa", "xm", "ha", "hm", "q", "k", "v", "y", "pre", "g")}
             so = out["so"] = {}
             for i in range(tg.n_layer):
                 nm = lambda kd, i=i: native.site_name(i, kd)  # noqa: E731
@@ -816,10 +816,8 @@ class Engine:
                     so[nm(kd)] = bias(h @ W(i, kd).T, i, kd)
                 q, k, v = (so[nm(kd)].view(T, H, hd).transpose(0, 1) for kd in ("q_proj", "k_proj", "v_proj"))
                 q, k = tg._rope(q, T), tg._rope(k, T)
-                S = (q @ k.transpose(-1, -2)) / math.sqrt(hd)
-                A = S.masked_fill(~causal, float("-inf")).softmax(-1)
-                y = (A @ v).transpose(0, 1).reshape(T, -1)
-                for key, val in (("xa", x), ("ha", h), ("q", q), ("k", k), ("v", v), ("S", S), ("A", A), ("y", y)):
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(0, 1).reshape(T, -1)
+                for key, val in (("xa", x), ("ha", h), ("q", q), ("k", k), ("v", v), ("y", y)):
                     out[key].append(val)
                 so[nm("o_proj")] = bias(y @ W(i, "o_proj").T, i, "o_proj")
                 x = x + so[nm("o_proj")]
@@ -833,6 +831,14 @@ class Engine:
             out["final"] = x
             self._xr = out
         return self._xr
+
+    def _x_rows(self, i: int, rows: torch.Tensor) -> tuple:
+        """Layer i's scores and pattern of the real model's run on the text at query positions rows ([H, len(rows), T]
+        each; _x_run's queries and keys)."""
+        xr = self._x_run()
+        S = (xr["q"][i][:, rows] @ xr["k"][i].transpose(-1, -2)) / math.sqrt(self.hd)
+        late = torch.arange(self.T, device=self.dev)[None, :] > rows[:, None]
+        return S, S.masked_fill(late, float("-inf")).softmax(-1)
 
     @torch.no_grad()
     def path_patched(self, graphs: list, prompts: list, strengths: torch.Tensor | None = None, cuts: list | None = None,
@@ -1509,7 +1515,7 @@ class Engine:
                             hi = torch.arange(H, device=dev)
                             dS.index_put_((arow[b2, pj[l2]][:, None].expand(-1, H), hi[None, :].expand(len(l2), -1),
                                            sk["t"][un["slot"][kb[l2]]][:, None].expand(-1, H)), val, accumulate=True)
-                S = xr["S"][i][:, ta].transpose(0, 1) + dS / math.sqrt(hd)
+                S = self._x_rows(i, ta)[0].transpose(0, 1) + dS / math.sqrt(hd)
                 Prow = S.masked_fill(torch.arange(T, device=dev)[None, None, :] > ta[:, None, None], float("-inf")).softmax(-1)
             hits = []
             rj = tj[st["t"]]
@@ -1524,7 +1530,7 @@ class Engine:
             bi, ri, rid = rows_of(st, hits)
             if len(bi) == 0:
                 return
-            Pr = xr["A"][i][:, st["t"][ri]].transpose(0, 1).clone()  # [R, H, T]: x's rows, the moved ones replaced
+            Pr = self._x_rows(i, st["t"][ri])[1].transpose(0, 1).clone()  # [R, H, T]: x's rows, the moved ones replaced
             if Prow is not None:
                 r2 = rj[ri]
                 a2 = torch.where(r2 >= 0, arow[bi, r2.clamp(min=0)], -1)

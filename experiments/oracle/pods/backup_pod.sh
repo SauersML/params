@@ -7,7 +7,10 @@
 # ~/mpd-data/runpod/oracle-graph-backup-RUN/out_<k>/ and are merged into OUT (sets, summary.jsonl, fidelity.jsonl).
 #   RUN=a N=20 P=2 experiments/oracle/pods/backup_pod.sh HOURS
 #   env: SRC, OUT (default ~/mpd-data/graph_oracle/backup/RUN), SPLIT (heldout), STEPS (backup.py --max-steps), TESTS=1
-#   (test_backup.py first, its log in tests.log), EVAL=0 (the expansion alone), REF, GPU, PRICE, VRAM
+#   (test_backup.py first, its log in tests.log), EVAL=0 (the expansion alone), FROM=DIR (an earlier run's OUT: its
+#   sets and summary.jsonl go up and each process starts from them, so run skips the texts it holds; OUT gets FROM's
+#   summary.jsonl and the new fidelity.jsonl), REF, GPU, PRICE, VRAM
+# The sealed texts (text9100-9149) are left out of the inputs before tar opens them.
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -22,9 +25,13 @@ V=/Users/user/mpd-data/vpd
 G=/Users/user/mpd-data/graph_oracle/goal_eval
 RN=oracle-graph-backup-$RUN
 O=/Users/user/mpd-data/runpod/$RN
-rm -rf "$F" && mkdir -p "$F/in/src"
-find "$SRC" -maxdepth 1 -name 'text*.json' | grep -E '/text[0-9]+\.json$' | while read -r f; do cp "$f" "$F/in/src/"; done
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" src -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+rm -rf "$F" && mkdir -p "$F/in/src" "$F/in/from"
+find "$SRC" -maxdepth 1 -name 'text*.json' | grep -E '/text[0-9]+\.json$' | grep -vE '/text91[0-4][0-9]\.json$' | while read -r f; do cp "$f" "$F/in/src/"; done
+if [ -n "${FROM:-}" ]; then
+  cp "$FROM/summary.jsonl" "$F/in/from/"
+  for d in "$FROM"/*/; do mkdir -p "$F/in/from/$(basename "$d")"; cp "$d"text*.json "$F/in/from/$(basename "$d")/" 2> /dev/null || true; done
+fi
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --exclude='texts/vpd4l/text91[0-4][0-9].json' -czf "$F/in.tgz" -C "$F/in" src from -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 rm -rf "$F/in"
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$RN/mpd-data ~/mpd-data; mkdir -p $O ~/mpd-data/graph_oracle ~/bk_in;
 tar -xzf $F/in.tgz -C ~/bk_in; mv ~/bk_in/texts ~/mpd-data/graph_oracle/;
@@ -34,7 +41,7 @@ cd /Users/user/params/method/oracle; nvidia-smi --query-gpu=name,memory.total --
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e;
 ${TESTS:+(python -m pytest --version || PATH=\$HOME/.local/bin:\$PATH uv pip install -q --python \$(command -v python) pytest) > $O/tests.log 2>&1; python -B -m pytest -q test_backup.py >> $O/tests.log 2>&1;}
-bk() { python -B backup.py run --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P --max-steps $STEPS > $O/run_\$1.log 2>&1; echo \"run exit \$?\" >> $O/run_\$1.log;
+bk() { mkdir -p $O/out_\$1; cp -r \$HOME/bk_in/from/. $O/out_\$1/; rm -f $O/out_\$1/fidelity.jsonl; python -B backup.py run --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P --max-steps $STEPS > $O/run_\$1.log 2>&1; echo \"run exit \$?\" >> $O/run_\$1.log;
   [ $EVAL = 1 ] && { python -B backup.py eval --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P >> $O/run_\$1.log 2>&1; echo \"eval exit \$?\" >> $O/run_\$1.log; }; };
 for k in \$(seq 0 $((P - 1))); do (bk \$k) & done; wait; echo all done"
 for try in $(seq 1 40); do
@@ -50,6 +57,7 @@ for k in $(seq 0 $((P - 1))); do
   for d in "$S"/*/; do [ -d "$d" ] && mkdir -p "$OUT/$(basename "$d")" && cp "$d"text*.json "$OUT/$(basename "$d")/" 2> /dev/null; done
 done
 for f in summary.jsonl fidelity.jsonl; do
+  if [ "$f" = summary.jsonl ] && [ -n "${FROM:-}" ]; then [ "$FROM/$f" -ef "$OUT/$f" ] || cp "$FROM/$f" "$OUT/$f"; continue; fi
   for k in $(seq 0 $((P - 1))); do cat "$O/out_$k/$f" 2> /dev/null; done > "$OUT/$f"
 done
 echo "backup $RUN done: $(wc -l < "$OUT/summary.jsonl" | tr -d ' ') texts expanded, $(wc -l < "$OUT/fidelity.jsonl" | tr -d ' ') fidelity rows in $OUT"

@@ -175,3 +175,37 @@ def test_block_units_and_nodes_search(tiny):
     assert float(row[n][t].abs().sum()) == 0.0
     got = backup.nodes_search(ge, tx, [g], draws=8)[0]
     assert abs(got["s_nodes"] - bk.score([(frozenset(), frozenset())])[0]["s_search"]) < 1e-9
+
+
+def test_derived_sets_and_pricing(tiny):
+    """derived_sets from a summary row: rand_fwd as many blocks as fwd at the circuit's positions, vpd_eq_fwd VPD's order
+    beyond the circuit as many as fwd's blocks add of VPD's active subcomponents, sub50 and sub90 a measured block's
+    shortest prefix holding that share of its gain (an unmeasured block kept); content_bits charges a block of a node
+    set its name among sites and its active contents, counts claims its site's every subcomponent."""
+    nat, ge, tx, circuit = tiny
+    bk = backup.Backup(ge, tx, circuit, draws=4, rows=4)
+    t = max(bk.positions)
+    fwd = [(nat.names[4], t), (nat.names[10], t)]
+    order = list(range(nat.C[nat.names[4]]))[::-1][:4]
+    pb = {"block": list(fwd[0]), "gain": 0.1, "j_without": 0.5, "order": order,
+          "prefixes": [{"k": 1, "j": 0.52}, {"k": 2, "j": 0.56}, {"k": 4, "j": 0.6}]}
+    row = {"sets": {"fwd": [[list(b) for b in fwd], []], "full": [[list(b) for b in fwd], []]}, "refine_fwd": [pb]}
+    got = backup.derived_sets(row, circuit, tx, nat, seed=3)
+    bl, ex = got["rand_fwd"]
+    assert len(bl) == 2 and not ex and all(tt in bk.positions for _, tt in bl)
+    nodes = set(circuit.node_set())
+    added = sum(int(tx.vpd[n][tt].sum()) - sum(1 for nd in nodes if nd[:2] == (n, tt) and bool(tx.vpd[n][tt, nd[2]])) for n, tt in fwd)
+    order_v = [tuple(nd) for nd in nat._vpd_order(tx.ids, tx.targets) if tuple(nd) not in nodes]
+    assert got["vpd_eq_fwd"] == ([], order_v[:max(1, added)]) and got["vpd_eq"] == got["vpd_eq_fwd"]
+    assert got["sub50"] == ([fwd[1]], [(fwd[0][0], t, c) for c in order[:2]])
+    assert got["sub90"] == ([fwd[1]], [(fwd[0][0], t, c) for c in order[:4]])
+    g = backup.expanded_graph(*backup.split_graph(circuit), [fwd[0]], [])
+    P, S = nat.positions(tx.targets), sum(nat.C.values())
+    one = np.log2(P * S)
+    want = np.log2(P * goal_eval.VPD4L_SITES) - one + int(tx.vpd[fwd[0][0]][t].sum()) * one
+    have = backup.content_bits(g, P, S, tx.targets, tx.vpd) - goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd)
+    assert abs(have - want) < 1e-9
+    c = backup.counts(g, nat.C, tx.vpd)
+    subs = [nd for nd in g.node_set() if nd[2] != goal_eval.BLOCK]
+    assert c["blocks"] == 1 and c["subcomponents"] == len(subs) + nat.C[fwd[0][0]]
+    assert c["active"] == sum(bool(tx.vpd[n][tt, cc]) for n, tt, cc in subs) + int(tx.vpd[fwd[0][0]][t].sum())

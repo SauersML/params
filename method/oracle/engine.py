@@ -644,10 +644,11 @@ class Engine:
         columns); rest: {site: (W [d_in, d_out], bool [B or 1, T])}, the site's input times W added where the mask is on
         (the columns left out of the engine live there); both float32 runs of every position. at_x: {site: [B or 1,
         T, C]} (the model's activations on the text: x_values), C's semantics: those sites' subcomponents outside each
-        row's circuit held there at full strength, u aside (goal_eval.GoalEval.graph_ref's outside=), a row's off
-        nodes still at u; held: {site: bool [B or 1, T or 1, K]} the columns held (None: where u is 0; a complete
-        graph's rows, which run as u, pass held when a removal sets u to 0 there), never a circuit or off node; the
-        site's columns outside an outside="off" engine held too. norms and freeze: every RMSNorm freeze holds
+        row's circuit held there at full strength, u aside (goal_eval.GoalEval.graph_ref's outside=); held: {site:
+        bool [B or 1, T or 1, K]} the columns held, a row's circuit nodes never (None: where u is 0, a row's off nodes
+        aside, which stay at u: a removal; a complete graph's rows, which run as u, pass held when a removal sets u to 0
+        there; a line deletion that leaves its nodes outside the circuit passes a held that holds them); the site's
+        columns outside an outside="off" engine held too. norms and freeze: every RMSNorm freeze holds
         ("layers": inside the layers; "all": the final one too) at norms' scale ({("attn" | "mlp", layer) or "final":
         [B or 1, T, 1]}, x_values'; the final one's at every position or at the targets) instead of its own
         (graph_ref's norms= and freeze=). Both float32 runs of every position (no reuse or keep), without blocks."""
@@ -1698,7 +1699,8 @@ class Engine:
             u = {n: m.expand(B, T, -1).index_put(p["nodes"][n], one) if n in p["nodes"] else m for n, m in u.items()}
         narrow = fused and rec is None
         blocks = {k[:-len(BK)] for k in R if k.endswith(BK)}  # sites with blocks (plan's keys site + BK)
-        xh = {} if hold is None or hold[0] is None else self._held_x(hold[0], hold[1], u, B, (p["nodes"], p.get("dropped", {})))
+        xh = {} if hold is None or hold[0] is None else self._held_x(  # (a given held may hold off nodes: line deletions)
+            hold[0], hold[1], u, B, (p["nodes"],) if hold[1] is not None else (p["nodes"], p.get("dropped", {})))
         if blocks and xh:
             raise ValueError("at_x runs graphs without blocks (expand them: goal_eval.expand_blocks)")
         if blocks and (fused or reuse is not None or keep is not None or ewn is not None or own is not None):

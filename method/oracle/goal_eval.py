@@ -1815,8 +1815,10 @@ class GoalEval:
         wired rows with sufficiency's live keys, the pattern runs for pattern_family's runs, and with flat (the variants'
         graphs) each variant's node family as _node_family gives it: its own draws of its nodes removed from the
         model, from VPD's answer and from the variant, every variant's draws on the same three engines); None when the
-        plan's connections are not the graph's."""
+        plan's connections are not the graph's. Semantics "x" (_xkw): every position runs, a deleted line's nodes
+        outside the variant at x (held), a node draw's at 0 (fidelity's numbers on each variant)."""
         nat, dev = self.nat, self.nat.dev
+        kx = self._xkw(tx.ids, tx.targets)
         edges = [] if g.complete else [(w, r) for r, ws in g.parents.items() for w in ws]
         outs = [] if g.complete else list(g.out)
         E = self._circuit_engine(tx.ids, tx.targets, [g])
@@ -1860,7 +1862,7 @@ class GoalEval:
                 u[n][tuple(torch.tensor(i, device=dev) for i in x)] = 0.0
             return u
 
-        lo = min((t for _, t, _ in g.node_set()), default=0) if self.LOO_REUSE else 0  # before the circuit's first position every
+        lo = min((t for _, t, _ in g.node_set()), default=0) if self.LOO_REUSE and not kx else 0  # before the circuit's first position every
         lo = lo if 0 < lo <= min(tx.targets) else 0                        # variant's run is the same: kept once, reused
         kept = {} if lo else None
         if lo:
@@ -1871,16 +1873,20 @@ class GoalEval:
         tg = nat.target  # engine rows a call: a row's widest activations from lo on and, reusing, its kept keys and values
         step = max(4, self.LOO_ENTRIES // ((tx.T - lo) * max(nat.C.values()) + (2 * tg.n_layer * tx.T * tg.d_model if lo else 0)))
 
-        def lq_rows(ix, given=None, tables=None):  # log q of rows ix of (ew, ow, off, sets), or of tables' rows (ew, ow and
-            # off for a stated graph, u for a complete one), optionally with given attention rows
+        every = None if g.complete or not kx else {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kx["at_x"]}
+
+        def lq_rows(ix, given=None, tables=None, held=None):  # log q of rows ix of (ew, ow, off, sets), or of tables' rows (ew,
+            # ow and off for a stated graph, u for a complete one), optionally with given attention rows; "x": held (default:
+            # a deleted node held at x, outside the variant; a complete graph's at u 0)
             if tables is None:
                 tables = (ew[ix], ow[ix], [off[i] for i in ix]) if not g.complete else urows([sets[i] for i in ix])
             R = next(iter(tables.values())).shape[0] if g.complete else len(tables[0])
             reuse = (E.tile_states(kept, R), tx.ids, lo) if lo else None
+            hk = dict(kx, held=held if held is not None else every) if kx else {}
             if g.complete:
-                return E.graph_log_probs(plan, tables, rows=given, reuse=reuse)
+                return E.graph_log_probs(plan, tables, rows=given, reuse=reuse, **hk)
             e_, o_, f_ = tables
-            return E.graph_log_probs(plan, ew=e_.to(dev), ow=o_.to(dev), off=f_, rows=given, reuse=reuse)
+            return E.graph_log_probs(plan, ew=e_.to(dev), ow=o_.to(dev), off=f_, rows=given, reuse=reuse, **hk)
 
         def run(rows_of, extra=None):  # KLs of rows (line indices), optionally with given attention rows each
             out = []
@@ -2003,10 +2009,12 @@ class GoalEval:
         common draws (_node_draws: each node's own uniforms, so a variant's draws are the answer's less its deleted
         nodes) of its nodes removed from the model (an outside-on engine from the draws' first position on), from VPD's answer (from there on, VPD's run before it)
         and from the variant (its row of _loo_c's plan with the draw's nodes taken out too: lq_rows), every variant's
-        draws on the same engines, each row's tables as matrices over the nodes."""
+        draws on the same engines, each row's tables as matrices over the nodes. Semantics "x" (_xkw): VPD's answer and
+        the variants at every position, a draw's nodes at 0, a variant's deleted lines' at x (outside it)."""
         import engine
 
         nat, dev, T = self.nat, self.nat.dev, tx.T
+        kx = self._xkw(tx.ids, tx.targets)
         circ = E.columns
         Em = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ, outside="on")
         vcols = {n: torch.unique(torch.cat([circ[n], tx.vpd[n].any(0).nonzero().flatten()])) for n in nat.names}
@@ -2053,15 +2061,25 @@ class GoalEval:
                 mm[n][r_, spos[n][j_], scol[n][j_]] = 0.0
                 mv[n][r_, spos[n][j_], svpd[n][j_]] = 0.0
             lm = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
-            lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
+            if kx:  # VPD's answer at x, its draw's nodes at 0
+                lv = Ev.log_probs(mv, **dict(kx, held={n: vbase[n] == 0 for n in kx["at_x"]}))
+            else:
+                lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
+            held = None
+            if kx:  # the variant's deleted nodes at x, the draw's at 0
+                held = {n: torch.ones(len(rows), T, E.width(n), dtype=torch.bool, device=dev) for n in kx["at_x"]}
+                for n in order:
+                    if n in held:
+                        r_, j_ = Dm[:, sidx[n]].nonzero(as_tuple=True)
+                        held[n][r_, spos[n][j_], scol[n][j_]] = False
             if flat[0].complete:
                 u = {n: torch.zeros(len(rows), T, E.width(n), device=dev) for n in nat.names}
                 for n in order:
                     r_, j_ = (~gone[:, sidx[n]]).nonzero(as_tuple=True)
                     u[n][r_, spos[n][j_], scol[n][j_]] = 1.0
-                lc = lq_rows(None, tables=u)
+                lc = lq_rows(None, tables=u, held=None if held is None else {n: h & (u[n] == 0) for n, h in held.items()})
             else:  # the dropped nodes out of the circuit with their connections, as a deleted node
-                lc = lq_rows(None, tables=(ew.to(dev)[vs], ow.to(dev)[vs], {n: gone[:, sidx[n]] for n in order}))
+                lc = lq_rows(None, tables=(ew.to(dev)[vs], ow.to(dev)[vs], {n: gone[:, sidx[n]] for n in order}), held=held)
             kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
             w, claim = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()
             for r, k in enumerate(rows):

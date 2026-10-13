@@ -601,8 +601,11 @@ def test_held_at_x_and_frozen_norms_equal_graph_ref():
             zero = kl(ge.graph_ref(ids, targets, half, patch={x: 0.0 for x in xqs}, **{k: (dict(v) if k == "norms" else v)
                                                                                     for k, v in kw.items()}))
             assert rel(zero, off[1:]) < REL, kw
-            if list(kw) == ["outside"]:  # off at 0, not at x (the graph without them, its q/k outside it)
-                assert rel(zero, kl(ge.graph_ref(ids, targets, atx, outside=qk))) > 10 * REL
+            if list(kw) == ["outside"]:  # off at 0, not at x (the graph without them, its q/k outside it); held at x
+                outx = kl(ge.graph_ref(ids, targets, atx, outside=qk))  # with a held that holds them
+                assert rel(zero, outx) > 10 * REL
+                every_col = {n: torch.ones(1, 1, eng.width(n), dtype=torch.bool, device=nat.dev) for n in qk}
+                assert rel(outx, kl(eng.graph_log_probs(eng.plan(half, semantics="c"), off=[xqs], held=every_col, **ekw))) < REL
             want = kl(ge.graph_ref(ids, targets, comp, **{k: (dict(v) if k == "norms" else v) for k, v in kw.items()}))
             assert rel(want, kl(eng.graph_log_probs(eng.plan(comp, semantics="c"), cm, **ekw))) < REL, kw
             assert rel(want, kl(eng.log_probs(cm, **ekw))) < REL, kw

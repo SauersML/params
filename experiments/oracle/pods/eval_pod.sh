@@ -44,8 +44,9 @@ for spec in "$@"; do  # each set under its own name, a file or a directory as it
   ARGS="$ARGS --set $name=$I/sets/$name"
   if [ -n "$e1" ]; then cp "$e1" "$IN/sets/$name.e1.jsonl" || exit 1; ARGS="$ARGS --e1 $name=$I/sets/$name.e1.jsonl"; fi
 done
-TEACH=""  # TEACHER: the texts' teacher circuits, reward v3's teacher-dominance reference
-if [ -n "${TEACHER:-}" ]; then mkdir -p "$IN/teacher" && cp "$TEACHER"/text*.json "$IN/teacher/" && TEACH=teacher; fi
+TEACH=""  # TEACHER: the texts' teacher circuits, reward v3's teacher-dominance reference (the circuits alone: v2's
+# directories also hold each search's text*.path.json, up to 8 MB a text)
+if [ -n "${TEACHER:-}" ]; then mkdir -p "$IN/teacher" && find "$TEACHER" -maxdepth 1 -name 'text*.json' ! -name '*.path.json' -exec cp {} "$IN/teacher/" ';' && TEACH=teacher; fi
 EDITS=""  # the edit teacher's rows for E3's best net per goal (edit_eval.bests), when the rows ask for edits
 if [ -n "${EDIT_EVAL:-}" ]; then cp "$EDIT_EVAL" "$IN/edit_eval.jsonl" && EDITS="edit_eval.jsonl"; fi
 # Exclude sealed text IDs before tar opens their contents (9100 through 9149); only the pre-registered final evaluation

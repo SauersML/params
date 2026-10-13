@@ -24,8 +24,9 @@ REV=${SRCREV:-origin/main}  # a resumed RL run keeps its reward's revision
 git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive "$REV" method/oracle method/vpd | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # rp-run uploads every existing path the command names: only the archives exist here
 rm -rf "$IN" "$IN.tar" && mkdir -p "$IN" && cp "$ROWS" "$IN/rows.jsonl"
-TEACH=""  # TEACHER: the texts' teacher circuits, reward v3's teacher-dominance reference
-if [ -n "${TEACHER:-}" ]; then mkdir -p "$IN/teacher" && cp "$TEACHER"/text*.json "$IN/teacher/" && TEACH=teacher; fi
+TEACH=""  # TEACHER: the texts' teacher circuits, reward v3's teacher-dominance reference (the circuits alone: v2's
+# directories also hold each search's text*.path.json, up to 8 MB a text)
+if [ -n "${TEACHER:-}" ]; then mkdir -p "$IN/teacher" && find "$TEACHER" -maxdepth 1 -name 'text*.json' ! -name '*.path.json' -exec cp {} "$IN/teacher/" ';' && TEACH=teacher; fi
 # Exclude sealed text IDs before tar opens their contents (9100 through 9149).
 COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$IN.tar" -C "$IN" rows.jsonl $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_train.pt && rm -rf "$IN"
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN.tar; a Mac path here would be uploaded file by file)

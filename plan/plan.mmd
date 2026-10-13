@@ -458,6 +458,7 @@ flowchart BT
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
   CAPABLE["<b>SFT improves format but loses wiring</b><br/>valid16 to24; relation-edge F1 .50 to.25;<br/>all4 multihops solved before SFT, lost after;<br/>audit target bias; no RL scale-up<br/>MEASURED · codex/fork_review"]
+  CAPCF["<b>Do the base circuits predict edits?</b><br/>4 multihops: scale or delete fixed units;<br/>compare full model and stated circuits;<br/>no edited full-model trace in prediction<br/>PROTOCOL REVIEW · codex/eval_recovery"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
@@ -596,6 +597,8 @@ flowchart BT
   RELTRAIN -. measured relation learning .-> C1
   RELTRAIN -. capacity remains unresolved .-> CAPABLE
   CAPABLE -. executed circuits and cost .-> C1
+  CAPABLE -. test retained base capability .-> CAPCF
+  CAPCF -. intervention fidelity evidence .-> C1
   WIRING -. opt-in wiring objective .-> R1
   %% FEEDBACK: REM -. tests .-> PHI
   VPD --> ENG

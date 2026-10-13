@@ -605,8 +605,8 @@ def circuits(answers_path: Path, out_path: Path, eps: float = CIRCUIT_EPS):
     """The final evaluation's falsification column (primerl's final_eval.sh): per answer line ({"task", "sample",
     "text"}; its circuit components.parse(text)["answer"]) on the task's text, the circuit and its general wrong
     variants (circuit_variants) scored by phi on the eval split (reward mode, the text's families from ge.tau, as
-    components.reward reads them; the CI-pattern pool POOL), and reward v3's circuit term R = cap_phi - phi_tau + g x
-    0.5 compact beside it. -> out_path (JSON): per answer the circuit's phi and R, each variant's, and beats_all: phi
+    components.reward reads them; the CI-pattern pool POOL), and reward v3's circuit term R (goal_eval.circuit_term)
+    beside it. -> out_path (JSON): per answer the circuit's phi and R, each variant's, and beats_all: phi
     above every variant's by more than eps; with a summary (the share of answers that beat all, per variant the share
     beaten). Resumable: answers already in out_path are kept."""
     import components
@@ -645,12 +645,9 @@ def circuits(answers_path: Path, out_path: Path, eps: float = CIRCUIT_EPS):
         P, S = nat.positions(tx.targets), sum(nat.C.values())
         res = {}
         for (v, g), r in zip(graphs.items(), rows):
-            ph = goal_eval.phi(r, families=fams)[0]
-            phc = goal_eval.cap_phi(ph, pt)
-            gate = None if phc is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (phc - pt)))
             b = goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd)
-            comp = goal_eval.compact(b, tau["bits_start"]) if b > 0 else None
-            res[v] = {"phi": ph, "R": None if None in (phc, pt, gate, comp) else phc - pt + gate * 0.5 * comp, "bits": b}
+            ct = goal_eval.circuit_term(r, tau, b)  # reward v3's circuit term, as components.reward and the teacher read it
+            res[v] = {"phi": ct["phi_full"], "R": ct["term"], "bits": b}
         ph0 = res["circuit"]["phi"]
         var = {v: x for v, x in res.items() if v != "circuit"}
         beats = {v: None if ph0 is None or x["phi"] is None else ph0 > x["phi"] + eps for v, x in var.items()}

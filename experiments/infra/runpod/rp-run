@@ -2078,7 +2078,9 @@ unit_risk() {  # HOST DC KIND PRICE GPU [ADDRESS [POWER]]
             Fn = (M[k] + 1) / (N[k] + 2); Vn = (U[k] + w0) / (M[k] + 1)
             fn = (mo[on] + 2 * Fn) / (no[on] + 2); Wn = (wo[on] + Vn) / (mo[on] + 1)
             this = c / pw * (1 + f / (1 - f) * W / L); other = cn * (1 + fn / (1 - fn) * Wn / L)
-            if (this > other) printf "%sfailure probability %.2f (host %d of %d attempts failed, data center %d of %d, address %d of %d) makes it cost %.4f against %.4f for the next offer, %s %s", (pw < 1 ? sprintf("at %.0f%% of its default power and ", 100 * pw) : ""), f, mh, nh, md, nd, ma, na, this, other, q[3], q[1]
+            # A pod in hand is kept unless the next offer is clearly cheaper: that offer may not be in stock (10-13: pods
+            # deleted for 0.5912 against 0.5912, then no card at all, over and over).
+            if (this > 1.1 * other) printf "%sfailure probability %.2f (host %d of %d attempts failed, data center %d of %d, address %d of %d) makes it cost %.4f against %.4f for the next offer, %s %s", (pw < 1 ? sprintf("at %.0f%% of its default power and ", 100 * pw) : ""), f, mh, nh, md, nd, ma, na, this, other, q[3], q[1]
         }' "$ATTEMPTS"
 }
 

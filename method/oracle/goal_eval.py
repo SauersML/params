@@ -1838,11 +1838,11 @@ class GoalEval:
         wired rows with sufficiency's live keys, the pattern runs for pattern_family's runs, and with flat (the variants'
         graphs) each variant's node family as _node_family gives it: its own draws of its nodes removed from the
         model, from VPD's answer and from the variant, every variant's draws on the same three engines); None when the
-        plan's connections are not the graph's. At x (_xkw of the point family; the node family's in _loo_nodes): a
-        deleted line's nodes outside the variant at x (held), a node draw's at 0 (fidelity's numbers on each variant),
-        the states before the circuit's first position kept from one run at each family's semantics, as in C (LOO_REUSE)."""
+        plan's connections are not the graph's. Point, wiring and pattern run as stated (no semantics holds them at x);
+        the node family at its own (_loo_nodes: at x under "n", a deleted line's nodes outside the variant held at x, a
+        node draw's at 0: fidelity's numbers on each variant); the states before the circuit's first position kept from
+        one run in each (LOO_REUSE)."""
         nat, dev = self.nat, self.nat.dev
-        kx = self._xkw(tx.ids, tx.targets, "point")  # (point, wiring and pattern)
         edges = [] if g.complete else [(w, r) for r, ws in g.parents.items() for w in ws]
         outs = [] if g.complete else list(g.out)
         E = self._circuit_engine(tx.ids, tx.targets, [g])
@@ -1888,40 +1888,30 @@ class GoalEval:
 
         lo = min((t for _, t, _ in g.node_set()), default=0) if self.LOO_REUSE else 0  # before the circuit's first position every
         lo = lo if 0 < lo <= min(tx.targets) else 0                        # variant's run is the same: kept once, reused
-        kn = self._xkw(tx.ids, tx.targets, "nodes") if flat is not None else kx  # (the node family's, when recomputed)
+        kn = self._xkw(tx.ids, tx.targets, "nodes") if flat is not None else {}  # the node family's semantics (x under "n")
 
-        def held_all(kw):  # a stated graph's held at x: every column outside the circuit (a deleted line's nodes too)
-            return None if g.complete or not kw else {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kw["at_x"]}
-
-        def keep_run(kw):  # the states of one run of the whole graph at kw's semantics (before lo every row's)
-            st = {}
+        def keep_run(kw):  # the states of one run of the whole graph at kw's semantics (before lo every row's; at x, a
+            st = {}        # stated graph's held: every column outside the circuit)
             if g.complete:
                 E.graph_log_probs(plan, u1, keep=st, **kw)
             else:
+                held = {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kw["at_x"]} if kw else None
                 E.graph_log_probs(plan, ew=torch.ones(1, len(edges), device=dev), ow=torch.ones(1, len(outs), device=dev), keep=st,
-                                  **(dict(kw, held=held_all(kw)) if kw else {}))
+                                  **(dict(kw, held=held) if kw else {}))
             return st
-        every = held_all(kx)
-        states = {}  # per semantics (the point family's, the node family's when it differs) its kept states
-        if lo:
-            states[id(kx)] = keep_run(kx)
-            if kn is not kx and (kn or kx):
-                states[id(kn)] = keep_run(kn)
+        states = {"c": keep_run({}), "nodes": keep_run(kn) if kn else None} if lo else {}  # (C's: point, wiring, pattern)
         tg = nat.target  # engine rows a call: a row's widest activations from lo on and, reusing, its kept keys and values
         step = max(4, self.LOO_ENTRIES // ((tx.T - lo) * max(nat.C.values()) + (2 * tg.n_layer * tx.T * tg.d_model if lo else 0)))
 
         def lq_rows(ix, given=None, tables=None, held=None, kw=None):  # log q of rows ix of (ew, ow, off, sets), or of tables'
-            # rows (ew, ow and off for a stated graph, u for a complete one), optionally with given attention rows; kw, the
-            # family's semantics (_xkw; default the point family's); at x held (default: a deleted node held at x, outside
-            # the variant; a complete graph's at u 0), every position
-            kw = kx if kw is None else kw
+            # rows (ew, ow and off for a stated graph, u for a complete one), optionally with given attention rows; kw: the
+            # node family's semantics (_loo_nodes) with its held at x, else as stated
             if tables is None:
                 tables = (ew[ix], ow[ix], [off[i] for i in ix]) if not g.complete else urows([sets[i] for i in ix])
             R = next(iter(tables.values())).shape[0] if g.complete else len(tables[0])
-            st = states.get(id(kx) if kw is kx or not (kw or kx) else id(kw))  # (the states kept at kw's semantics)
+            st = states.get("nodes" if kw else "c")  # (the states kept at kw's semantics)
             reuse = (E.tile_states(st, R), tx.ids, lo) if st is not None else None
-            every_ = every if kw is kx else held_all(kw)
-            hk = dict(kw, held=held if held is not None else every_) if kw else {}
+            hk = dict(kw, held=held) if kw else {}
             if g.complete:
                 return E.graph_log_probs(plan, tables, rows=given, reuse=reuse, **hk)
             e_, o_, f_ = tables

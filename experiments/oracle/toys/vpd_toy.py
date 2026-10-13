@@ -110,7 +110,7 @@ def nano_module():
     if not hasattr(typing, "override"):   # Python 3.11 (a pod image): typing.override is a decorator that changes nothing
         typing.override = lambda f: f
     for top, sub in (("wandb", None), ("matplotlib", "pyplot"), ("PIL", "Image")):
-        if importlib.util.find_spec(top) is None and top not in sys.modules:
+        if top not in sys.modules and importlib.util.find_spec(top) is None:   # (find_spec raises on a stub already there)
             sys.modules[top] = types.ModuleType(top)
             if sub:
                 sys.modules[f"{top}.{sub}"] = types.ModuleType(f"{top}.{sub}")

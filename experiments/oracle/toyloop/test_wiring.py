@@ -128,7 +128,7 @@ def test_training_seed_controls_initialization_and_sampled_completions(monkeypat
     monkeypatch.setattr(train, "load_policy", load_policy)
     monkeypatch.setattr(train, "sample", sample)
     monkeypatch.setattr(train, "get_reward", lambda spec: lambda meta, text: float(text))
-    monkeypatch.setattr(train, "batch_ids", lambda tok, pairs, cap: (torch.zeros(len(pairs), 1), None, torch.ones(len(pairs), 1)))
+    monkeypatch.setattr(train, "batch_ids", lambda tok, pairs, cap, device=None: (torch.zeros(len(pairs), 1, device=device), None, torch.ones(len(pairs), 1, device=device)))
     monkeypatch.setattr(train, "token_logps", lambda model, ids, att, comp: (model.weight.expand(len(ids), 1), comp))
     monkeypatch.setattr(train, "save", lambda *a: None)
     args = SimpleNamespace(data="mock", truth=None, seed=11, steps=1, batch=1, lr=.001,
@@ -294,3 +294,89 @@ def test_deadline_does_not_launch_extra_work(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         paired.require_time(1)
     assert exc.value.code == 75
+
+
+def _completed_sft_parent(tmp_path):
+    parent = tmp_path / 'parent'
+    parent.mkdir()
+    args = SimpleNamespace(out=tmp_path / 'fork', sft_steps=300, rl_steps=20,
+                           seed=0, max_len=3072, max_new=416, device='mps')
+    paired.write(parent / 'contract.json', dict(model=paired.MODEL, hf_revision=paired.REVISION,
+        sft_steps=300, rl_steps_per_arm=20, seed=0, max_len=3072, max_new=416,
+        show_active=False, batch=1, k=4, lr=2e-5, beta=0., threads=1, per_family=35))
+    (parent / 'sft').mkdir()
+    (parent / 'sft/model.safetensors').write_bytes(b'fixture checkpoint bytes; never loaded')
+    paired.write(parent / 'sft.done.json', {'files': paired.hashes(parent / 'sft')})
+    (parent / 'zoo').mkdir()
+    (parent / 'zoo/manifest.jsonl').write_text('{}\n')
+    panel = [{'id': f'case{i}'} for i in range(24)]
+    paired.write(parent / 'data.json', {'files': paired.hashes(parent / 'zoo'), 'evaluation_panel': panel})
+    (parent / 'train_inputs.jsonl').write_text('{"id":"train0","prompt":"input","completion":"truth"}\n')
+    paired.write(parent / 'token_fit.json', {'all_fit': True, 'context':3072, 'generation_cap':416,
+        'train_n':1, 'rows':[{'id':'train0'}], 'max_pair_tokens':5,
+        'max_prompt_tokens':3, 'max_completion_tokens':2})
+    records = [{'id':p['id'], 'valid':True, 'stated':{'per_text':[{'kl_bits':0.}]},
+                'policy_checkpoint_manifest_sha256':paired.digest(parent / 'sft.done.json')} for p in panel]
+    for name in ('gt', 'empty', 'sft'):
+        (parent / (name+'_eval.jsonl')).write_text(''.join(__import__('json').dumps(r)+'\n' for r in records))
+    paired.write(parent / 'teacher_integrity.json', {'predeclared_tolerance_bits':1e-3,
+        'rows':[{'id':p['id'], 'valid':True, 'max_stated_kl_bits':0.} for p in panel]})
+    paired.write(parent / 'base_model_hashes.json', {'files':{}})
+    (parent / 'dependency-lock.txt').write_text('original frozen packages\n')
+    return parent, args
+
+
+def test_fork_sft_preserves_frozen_parent_and_new_lineage(tmp_path):
+    import json
+    parent, args = _completed_sft_parent(tmp_path)
+    before = paired.hashes(parent)
+    paired.fork_sft(args, parent)
+    assert paired.hashes(parent) == before
+    assert not (args.out / 'contract.json').exists()  # prepare must make a new current contract
+    lineage = json.loads((args.out / 'sft_lineage.json').read_text())
+    assert lineage['parent_contract_sha256'] == paired.digest(parent / 'contract.json')
+    assert lineage['imported_files']['sft/model.safetensors'] == before['sft/model.safetensors']
+    assert (args.out / 'parent_evidence/dependency-lock.txt').read_bytes() == (parent / 'dependency-lock.txt').read_bytes()
+    assert not (args.out / 'sft_eval.jsonl').exists()
+    assert not (args.out / 'gt_eval.jsonl').exists()
+    assert not (args.out / 'empty_eval.jsonl').exists()
+    paired.verify_lineage(args.out)
+    (args.out / 'parent_evidence/sft_eval.jsonl').write_text('changed')
+    with pytest.raises(ValueError, match='immutable import'):
+        paired.verify_lineage(args.out)
+    assert paired.stage_done(args.out, 'sft')
+    args.out = tmp_path / 'other'
+    assert paired.training_args(args, 'wiring_suff', 'base', 'sft', 'out').device == 'mps'
+
+
+@pytest.mark.parametrize('failure', ['checkpoint', 'zoo', 'missing_record', 'wrong_config', 'rl_state', 'teacher'])
+def test_fork_sft_rejects_changed_or_incomplete_parent(tmp_path, failure):
+    import json
+    parent, args = _completed_sft_parent(tmp_path)
+    if failure == 'checkpoint':
+        (parent / 'sft/model.safetensors').write_bytes(b'changed')
+    elif failure == 'zoo':
+        (parent / 'zoo/manifest.jsonl').write_text('changed')
+    elif failure == 'missing_record':
+        (parent / 'sft_eval.jsonl').write_text('\n'.join((parent / 'sft_eval.jsonl').read_text().splitlines()[:-1])+'\n')
+    elif failure == 'wrong_config':
+        args.seed = 7
+    elif failure == 'rl_state':
+        paired.write(parent / 'unit_suff.started.json', {'step':0})
+    else:
+        integrity = json.loads((parent / 'teacher_integrity.json').read_text())
+        integrity['rows'][0]['max_stated_kl_bits'] = .2
+        paired.write(parent / 'teacher_integrity.json', integrity)
+    with pytest.raises(ValueError):
+        paired.fork_sft(args, parent)
+    assert not args.out.exists()
+
+
+def test_archive_source_revision_is_explicit_metadata(monkeypatch):
+    def no_git(*args, **kwargs):
+        raise AssertionError('source archive must not invoke git')
+    monkeypatch.setattr(paired.subprocess, 'check_output', no_git)
+    assert paired.source_revision('a' * 40) == 'a' * 40
+    for invalid in ('main', 'a' * 7, 'z' * 40):
+        with pytest.raises(ValueError, match='40-hex'):
+            paired.source_revision(invalid)

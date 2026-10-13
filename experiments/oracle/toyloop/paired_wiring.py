@@ -16,6 +16,9 @@ import os
 from pathlib import Path
 import sys
 import subprocess
+import shutil
+import platform
+import tempfile
 import time
 
 MODEL = 'HuggingFaceTB/SmolLM2-135M-Instruct'
@@ -61,7 +64,8 @@ def training_args(a, reward, model, init, out):
     return argparse.Namespace(data=f'zoo:{a.out / "zoo/manifest.jsonl"}@train', truth=None, model=str(model), init=init,
                               out=str(out), lora=0, steps=a.sft_steps if reward is None else a.rl_steps,
                               batch=1, lr=2e-5, max_len=a.max_len, max_new=a.max_new, k=4, temp=1., beta=0., std=False,
-                              reward=reward or 'f1', eval=0, threads=1, seed=a.seed, log_every=1)
+                              reward=reward or 'f1', eval=0, threads=1, seed=a.seed, log_every=1,
+                              device=getattr(a, 'device', 'cpu'))
 
 
 def require_time(seconds):
@@ -81,7 +85,125 @@ def stage_done(out, name):
     return True
 
 
+def fork_sft(a, parent):
+    """Import only a verified completed SFT, never optimizer/partial RL state.
+
+    The new directory receives a new source/package/platform contract in prepare;
+    the original contract and every imported byte remain separately attributable.
+    """
+    parent = Path(parent).resolve()
+    if a.out.exists() and any(a.out.iterdir()):
+        raise ValueError('fork requires a new empty output directory')
+    if not parent.is_dir() or a.out.resolve() == parent:
+        raise ValueError('fork parent must be a distinct completed run')
+    if any(p.name.startswith(('unit_suff', 'wiring_suff')) for p in parent.iterdir()):
+        raise ValueError('fork parent contains prior RL state; use the frozen SFT artifact')
+    validated_snapshot = hashes(parent)
+    contract = json.loads((parent / 'contract.json').read_text())
+    expected = {'model': MODEL, 'hf_revision': REVISION, 'sft_steps': a.sft_steps,
+                'rl_steps_per_arm': a.rl_steps, 'seed': a.seed, 'max_len': a.max_len,
+                'max_new': a.max_new, 'show_active': False, 'batch': 1, 'k': 4,
+                'lr': 2e-5, 'beta': 0., 'threads': 1, 'per_family': 35}
+    if any(contract.get(k) != v for k, v in expected.items()):
+        raise ValueError('fork SFT configuration mismatch')
+    if not stage_done(parent, 'sft'):
+        raise ValueError('fork requires a completed SFT manifest')
+    if not any(n.endswith('.safetensors') for n in hashes(parent / 'sft')):
+        raise ValueError('fork SFT has no model checkpoint')
+    data = json.loads((parent / 'data.json').read_text())
+    panel_ids = {r['id'] for r in data['evaluation_panel']}
+    if len(panel_ids) != 24 or len(data['evaluation_panel']) != 24 or data['files'] != hashes(parent / 'zoo'):
+        raise ValueError('fork frozen zoo/panel changed or incomplete')
+    fit = json.loads((parent / 'token_fit.json').read_text())
+    inputs = [json.loads(l) for l in (parent / 'train_inputs.jsonl').read_text().splitlines() if l.strip()]
+    if (not fit.get('all_fit') or fit['context'] != a.max_len or fit['generation_cap'] != a.max_new
+            or fit['train_n'] != len(inputs) or {r['id'] for r in fit['rows']} != {r['id'] for r in inputs}
+            or fit['max_pair_tokens'] > a.max_len or fit['max_prompt_tokens'] + a.max_new > a.max_len
+            or fit['max_completion_tokens'] > a.max_new):
+        raise ValueError('fork token/input fit mismatch')
+    evaluated = {}
+    for name in ('gt', 'empty', 'sft'):
+        rows = [json.loads(l) for l in (parent / (name + '_eval.jsonl')).read_text().splitlines() if l.strip()]
+        if len(rows) != 24 or {r['id'] for r in rows} != panel_ids:
+            raise ValueError('fork requires all 24 saved evaluation records')
+        if name == 'sft' and any(r['policy_checkpoint_manifest_sha256'] != digest(parent / 'sft.done.json') for r in rows):
+            raise ValueError('fork SFT evaluation checkpoint mismatch')
+        evaluated[name] = rows
+    integrity = json.loads((parent / 'teacher_integrity.json').read_text())
+    actual = [{'id': r['id'], 'valid': r['valid'],
+               'max_stated_kl_bits': max(t['kl_bits'] for t in r['stated']['per_text']) if r['valid'] else None}
+              for r in evaluated['gt']]
+    if (integrity['predeclared_tolerance_bits'] != 1e-3 or integrity['rows'] != actual
+            or any(not r['valid'] or not 0 <= r['max_stated_kl_bits'] <= 1e-3 for r in actual)):
+        raise ValueError('fork ground-truth integrity failed')
+    required = ['sft', 'sft.done.json', 'zoo', 'data.json', 'train_inputs.jsonl', 'token_fit.json',
+                'teacher_integrity.json', 'gt_eval.jsonl', 'empty_eval.jsonl', 'sft_eval.jsonl', 'base_model_hashes.json']
+    required += [n for n in ('sft.started.json', 'dependency-lock.txt') if (parent / n).exists()]
+    # Verify all paths before copying, then record exact import hashes (including old contract).
+    for n in required:
+        if not (parent / n).exists():
+            raise ValueError(f'fork missing immutable artifact: {n}')
+    # Freeze source identities before copying, compare every copied byte, then publish.
+    if hashes(parent) != validated_snapshot:
+        raise ValueError('fork parent changed during validation')
+    source_hashes = {n: hashes(parent / n) if (parent / n).is_dir() else digest(parent / n)
+                     for n in required + ['contract.json']}
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=a.out.name + '.fork-', dir=a.out.parent))
+    try:
+        evidence = staging / 'parent_evidence'
+        evidence.mkdir()
+        for n in required:
+            source = parent / n
+            # Only checkpoint and zoo become active artifacts. All old evaluation,
+            # fit/package/model reports remain immutable parent evidence.
+            destination = staging / n if n in ('sft', 'sft.done.json', 'zoo', 'data.json', 'train_inputs.jsonl') else evidence / n
+            shutil.copytree(source, destination) if source.is_dir() else shutil.copy2(source, destination)
+            copied = hashes(destination) if source.is_dir() else digest(destination)
+            if copied != source_hashes[n]:
+                raise ValueError(f'fork copy changed: {n}')
+        shutil.copy2(parent / 'contract.json', evidence / 'contract.json')
+        if digest(evidence / 'contract.json') != source_hashes['contract.json']:
+            raise ValueError('fork parent contract changed during copy')
+        after = {n: hashes(parent / n) if (parent / n).is_dir() else digest(parent / n)
+                 for n in required + ['contract.json']}
+        if after != source_hashes or hashes(parent) != validated_snapshot:
+            raise ValueError('fork parent changed during copy')
+        write(staging / 'sft_lineage.json', {'schema': 2, 'parent': str(parent),
+              'parent_contract_sha256': source_hashes['contract.json'], 'imported_files': hashes(staging),
+              'scope': 'new source/platform experiment sharing frozen SFT; parent evaluations archived; no backend bitwise equivalence claim'})
+        if a.out.exists():
+            a.out.rmdir()  # only an empty destination may be replaced
+        staging.rename(a.out)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
+def verify_lineage(out):
+    path = out / 'sft_lineage.json'
+    if not path.exists():
+        return
+    lineage = json.loads(path.read_text())
+    for name, expected in lineage['imported_files'].items():
+        target = out / name
+        if not target.is_file() or digest(target) != expected:
+            raise ValueError(f'fork immutable import changed: {name}')
+    if digest(out / 'parent_evidence/contract.json') != lineage['parent_contract_sha256']:
+        raise ValueError('fork parent contract identity mismatch')
+
+
+def source_revision(explicit=None):
+    """Archives have no .git; record their supplied revision alongside actual file hashes."""
+    if explicit is not None:
+        if len(explicit) != 40 or any(c not in '0123456789abcdef' for c in explicit):
+            raise ValueError('source revision must be a full lowercase 40-hex commit')
+        return explicit
+    return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+
+
 def prepare(a):
+    verify_lineage(a.out)
     import torch
     from huggingface_hub import snapshot_download
     sys.path[:0] = [str(HERE), str(ROOT / 'experiments/oracle/toys')]
@@ -95,7 +217,7 @@ def prepare(a):
                for p in sorted(base.glob('*.py'))}
     contract = {'schema': 1, 'scope': 'fresh policy experiment on shared-development zoo; reused procedural families/seeds are not pristine heldout',
                 'model': MODEL, 'hf_revision': REVISION, 'sources': sources,
-                'source_commit_metadata': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+                'source_commit_metadata': source_revision(getattr(a, 'source_commit', None)),
                 'python': sys.version,
                 'packages': {d.metadata['Name']: {'version': d.version,
                     'installed_RECORD_sha256': hashlib.sha256((d.read_text('RECORD') or '').encode()).hexdigest()}
@@ -106,6 +228,10 @@ def prepare(a):
                 'evaluation': 'fixed family-stratified panel; one greedy output each, invalid=-1; all rows retained',
                 'teacher_panel_max_kl_bits': 1e-3,
                 'resume': 'completed stages only; partial stages rejected, no optimizer-reset continuation'}
+    if (a.out / 'sft_lineage.json').exists() or getattr(a, 'device', 'cpu') != 'cpu':
+        contract.update(device=getattr(a, 'device', 'cpu'), platform=platform.platform())
+    if (a.out / 'sft_lineage.json').exists():
+        contract['sft_lineage_sha256'] = digest(a.out / 'sft_lineage.json')
     path = a.out / 'contract.json'
     if path.exists():
         if json.loads(path.read_text()) != contract:
@@ -165,6 +291,7 @@ def prepare(a):
 
 
 def learn(a, train, base, name, reward=None):
+    verify_lineage(a.out)
     if stage_done(a.out, name):
         return
     directory = a.out / name
@@ -216,7 +343,7 @@ def evaluate_policy(a, train, render, data, name):
             if len(ids) + a.max_new > a.max_len:
                 raise ValueError('evaluation prompt would truncate')
             with torch.no_grad():
-                inp = torch.tensor([ids])
+                inp = torch.tensor([ids], device=next(model.parameters()).device)
                 generated = model.generate(inp, attention_mask=torch.ones_like(inp), do_sample=False, max_new_tokens=a.max_new,
                                            pad_token_id=tok.pad_token_id)[0, len(ids):].tolist()
             token_ids = generated
@@ -268,7 +395,12 @@ def main(argv=None):
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--max-new', type=int, default=416)
     parser.add_argument('--max-len', type=int, default=3072)
+    parser.add_argument('--device', choices=['cpu', 'mps', 'cuda'], default='cpu')
+    parser.add_argument('--fork-sft', type=Path, help='verified completed SFT parent; requires a new empty --out')
+    parser.add_argument('--source-commit', help='full revision metadata for an exported source archive; actual files are also hashed')
     a = parser.parse_args(argv)
+    if a.fork_sft is not None:
+        fork_sft(a, a.fork_sft)
     train, render, base, data = prepare(a)
     if a.stage == 'preflight':
         return
@@ -285,6 +417,8 @@ def main(argv=None):
     if a.stage in ('all', 'sft'):
         learn(a, train, base, 'sft')
         evaluate_policy(a, train, render, data, 'sft')  # fixed format-readiness evidence, never select another checkpoint
+    if (a.out / 'sft_lineage.json').exists() and a.stage in ('all', 'unit', 'wiring'):
+        evaluate_policy(a, train, render, data, 'sft')
     if a.stage in ('all', 'unit'):
         learn(a, train, base, 'unit_suff', 'unit_suff')
         evaluate_policy(a, train, render, data, 'unit_suff')

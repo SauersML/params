@@ -392,9 +392,10 @@ def run_local(k: int = 0, P: int = 1, name: str | None = None):
              and not (TEACH_DIR / f"{nm}.json").exists() and (name is None or nm == name)][k::P]
     if not names:
         return
-    if len(names) > 1:  # one process per prompt: teacher.py's caches grow across texts past the Mac's 16 GiB cap
-        for nm in names:
-            subprocess.run([sys.executable, "-B", str(HERE / "cg_teacher.py"), "run_local", "--name", nm], check=False)
+    if len(names) > 1:  # one process per prompt, each under its own lease (teacher.py's caches grow across texts past the
+        for nm in names:  # Mac's 16 GiB cap; a prompt that alone needs more is left out, its failure in its log)
+            subprocess.run([str(Path.home() / ".local/bin/mem-lease"), "16", sys.executable, "-B", str(HERE / "cg_teacher.py"),
+                            "run_local", "--name", nm], check=False)
         return
     native.TEXTS = texts_root()
     lst = DATA / f"cg_ids_local_{names[0]}.txt"
@@ -404,13 +405,18 @@ def run_local(k: int = 0, P: int = 1, name: str | None = None):
     runpy.run_path(str(ORACLE / "teacher.py"), run_name="__main__")
 
 
-def test_local():
+def test_local(k: int = 0, P: int = 1, name: str | None = None):
     """The circuit test (path-patched terms, reward v3's R against the variable moved to the attractor) on every circuit
-    in TEACH_DIR, on the Mac -> DATA/cg_teacher_b2_test.jsonl (resumable by name)."""
+    in TEACH_DIR, on the Mac, one leased process per prompt -> DATA/cg_teacher_b2_test.jsonl (resumable by name)."""
     out = DATA / "cg_teacher_b2_test.jsonl"
     done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
     names = sorted(p.stem for p in TEACH_DIR.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_")
-                   and p.stem not in done)
+                   and p.stem not in done and (name is None or p.stem == name))[k::P]
+    if name is None:
+        for nm in names:
+            subprocess.run([str(Path.home() / ".local/bin/mem-lease"), "16", sys.executable, "-B", str(HERE / "cg_teacher.py"),
+                            "test_local", "--name", nm], check=False)
+        return
     test(names, TEACH_DIR, out, "_b")
 
 
@@ -565,5 +571,5 @@ if __name__ == "__main__":
     ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
     ap.add_argument("--v2", action="store_true", help="run, report: the v2.1 teacher (start set, acceptance, phi pick)")
     a = ap.parse_args()
-    {"write": lambda: write(a.behavior, a.per_task), "bounds": bounds_b, "test_local": test_local, "report60": report60, "run_local": lambda: run_local(*a.args, name=a.name), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
+    {"write": lambda: write(a.behavior, a.per_task), "bounds": bounds_b, "test_local": lambda: test_local(*a.args, name=a.name), "report60": report60, "run_local": lambda: run_local(*a.args, name=a.name), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
      "masks": lambda: masks_run(*a.args, behavior=a.behavior), "test": lambda: test_dir(*a.args, behavior=a.behavior), "attractor": lambda: attractor(a.dir), "gender_masks": gender_masks, "moved": lambda: moved(a.dir)}[a.cmd]()

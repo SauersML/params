@@ -82,7 +82,10 @@ def run(repo,payload,out,tasks,canonical_contract,barrier=False):
     if vpd_model.VPD_PTH.exists() or {k:sha(p) for k,p in assets.items()}!=protocol['model_content_sha256']:raise ValueError('model source mismatch')
     panel=json.loads((payload/'panel.json').read_text());nat=native.Native('cpu');original=hashes(nat)
     keys={n+':'+k for n in nat.names for k in ('W','U','V','delta_T')}
-    if set(canonical['original_state'])!=keys or {k:original[k] for k in keys}!=canonical['original_state']:raise RuntimeError('canonical CPU W/U/V/remainder bytes differ from frozen run')
+    if set(canonical['original_state'])!=keys or {k:original[k] for k in keys}!=canonical['original_state']:
+        out.mkdir()
+        (out/'construction_failure.json').write_text(json.dumps({'status':'canonical_CPU_construction_portability_failure','forwards':0,'expected_sha256':canonical['original_state'],'actual_sha256':{k:original[k] for k in keys},'canonical_contract_sha256':CANONICAL_CONTRACT_SHA,'runner_sha256':sha(__file__),'scope':'CPU kernel construction differs before CUDA transport/output parity; exact gate retained'},indent=2))
+        raise RuntimeError('canonical CPU W/U/V/remainder bytes differ from frozen run; no parity forwards')
     torch.set_num_threads(2)
     prepared=[]
     for t in tasks:

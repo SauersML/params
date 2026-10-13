@@ -35,9 +35,16 @@
 %% Critical QA control: visible original-top/no-change gets 68.38%, trained 69.12% (+0.74 points only).
 %% Training improved formatting, not yet useful mechanistic QA: falls gains 13 correct fields, top-token loses 12.
 %% Do not scale SFT based on base-model QA gains alone; compare no-change and execute circuits first.
-%% Running oracle-graph-codex-dev8-1012-pairedb: evaluator 859fd39, two workers, A100 80 GB, $1.125 bound.
+%% Completed oracle-graph-codex-dev8-1012-pairedb: evaluator 859fd39, all 8 tasks, $0.1826 incl. failed hosts; pods deleted.
 %% Compares the same fixed dev8 policies with actual empty/start/node-matched VPD; circuit-only, no teacher D.
-%% English writer cost $0.00184896; all four proposed donor effects are no-change, so no nontrivial label yet.
+%% Trained point score .435 counting invalids as zero, .696 over 5 valid; no demonstrated advantage over matched VPD.
+%% Frozen run exposed discarded-syntax compactness bonus on null graphs (9020 +4.91 vs actual empty -.008).
+%% Fixed 38b5039: executable bits, not discarded description, control compactness and null-graph teacher dominance.
+%% Three published-source regressions pass. Saved-score algebraic replay is labeled separately from GPU measurements.
+%% English writer $0.00184896; initial GPU parser rejected all 4 claims (not 4 incorrect model predictions).
+%% Quote fix 7576011, 36 checks pass; exact-claim CPU replay: 2/4 correct, zero information credit, no training labels.
+%% English pilot uses whole native MLP blocks, not VPD rank-one units; prose itself remains unverified.
+%% Total this pilot: Tinker $2.325535302 + RunPod $0.1826 = $2.508135302; no shared extra budget used.
 %% Existing dev8 immutable. New rerender --node-cap communicates explicit limits before fitting (33419cd).
 %% Successful SFT skills feed integration directly; RL is an optional improvement, not a prerequisite.
 %% Grounded-English pilot: train6002/6011, one eval-passing carrier per text; writer outcomes withheld.
@@ -79,7 +86,7 @@ flowchart BT
   SUP["<b>Verified behavior supervision</b><br/>QA and edit targets ready;<br/>grounded English join still empty;<br/>use existing carriers or planted mechanisms<br/>ACTIVE · varteach, rustmove, primerl, codex"]
   GATEC{{"<b>Check C</b> · does learning add value?<br/>SFT arms vs trivial baselines and<br/>the search route on dev texts;<br/>picks the RL starting point"}}
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
-    S1READY["<b>Compatible SFT pilot</b><br/>QA 69.1% vs no-change 68.4%;<br/>format learned; valid circuits 5/8;<br/>EXECUTING matched controls<br/>codex · two workers · $1.125 cap"]
+    S1READY["<b>SFT pilot: format learned</b><br/>5/8 valid; QA near no-change;<br/>no advantage over matched VPD;<br/>feeds input and control ablations<br/>CHECK · codex · $2.51 total"]
     S1["<b>SFT · influential starts</b><br/>494 targets, held-out pp 0.965,<br/>median 357 nodes<br/>LAUNCHING · primerl"]
     S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
@@ -111,7 +118,7 @@ flowchart BT
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>common removal tests for all candidates;<br/>absolute sufficiency before size credit;<br/>gate leak shut: slope 10 (6f8a869)<br/>ACTIVE · codex, inframove, primerl"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
-    W6["<b>Compare rewards fairly</b><br/>same-text empty and node controls;<br/>save thresholds, KL, bits, scorer hash<br/>IMPLEMENTED · codex/reward_audit<br/>NEXT baseline run · primerl"]
+    W6["<b>Matched reward controls</b><br/>dev8 found null-syntax size bonus;<br/>fixed with 3 regression checks;<br/>overall calibration still unproven<br/>CHECK · codex/reward_audit · 38b5039"]
   end
 
   %% ===================== verifier and foundations =====================
@@ -120,7 +127,7 @@ flowchart BT
   TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo: 350 planted models, 10 families,<br/>2 held out; known circuits (b62138e)<br/>Φ: all actives 7.6 vs true 2.1: size term<br/>must carry; teacher, Gate B, LM oracle next<br/>ACTIVE · toyloop"]
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
-  ENGP["<b>Grounded English pilot</b><br/>four open-writer donor claims;<br/>no nontrivial predictions yet;<br/>real-model checks on the same pod<br/>ACTIVE · codex/variable_reward"]
+  ENGP["<b>English claim diagnostic</b><br/>native MLP blocks, not VPD units;<br/>2/4 predictions correct; zero credit;<br/>no verified training labels<br/>CHECK · codex/variable_reward"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -182,6 +189,7 @@ flowchart BT
   I3 -. identifies missing observations .-> I5
   I5 --> TOOLS
   I4 -. sets the format .-> I1
+  S1READY -. tests need for better inputs .-> I4
   I6 -. validates the weight ablation .-> I4
   W1 --> GATEB
   W2 -. tests .-> GATEB
@@ -257,7 +265,7 @@ flowchart BT
   class I6,W5 done
   class T4 blocked
   class I3,S2,SUP,LAT1,W6 check
-  class S1READY,ENGP active
+  class S1READY,ENGP check
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting
   class LAT2,UVPD later

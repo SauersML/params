@@ -763,7 +763,8 @@ flowchart BT
   class COMPOSE active
   CAPABLE --> COMPOSE
   COMPOSE --> C1
-  MDL["<b>Executed size needs intervention checks</b><br/>TRAIN9:103 extras +52 nonredundant removals rank below gold;<br/>4 redundant removals cheaper at point fidelity;<br/>186 retained ·38443760200 · lambda .02 unchanged<br/>1624 fixed head+MLP worlds ·38447137804;<br/>redundant deletion KL7.44, cancellation gold19.95;<br/>both cancel heads KL1.1e-7; gate gold .00171<br/>Independent SF audit PASS38447736474;<br/>3 weight-search TRAIN targets · gate cap64 retained;<br/>38456342703 transfer3288/3288 tops, KL≤.000765;<br/>6 mixed-scale pairs · previously examined TRAIN bank;<br/>Exact zero-MLP-route cleanup next · finite-panel scope<br/>NO RL · codex/eval_recovery"]
+  %% MDL history: TRAIN9/186 point variants;103 extras+52 nonredundant removals below gold,4 redundant removals preferred. Intervention38447137804:1624 worlds; independent38447736474 PASS. Teacher38451355559+38452521930; challenge38456342703 raw artifacts in mpd-data/scratch/eval_recovery.
+  MDL["<b>Intervention-faithful TRAIN supervision</b><br/>3 frozen targets; gate search capped64;<br/>3288/3288 challenge tops, KL≤.000765;<br/>Reused TRAIN · finite single+mixed panel;<br/>NEXT exact-zero MLP routes → diverse models<br/>VERIFIED · codex/eval_recovery · no paid RL"]
   COMPOSE --> MDL
   MDL --> C1
   class CAPCF done

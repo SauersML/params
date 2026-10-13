@@ -129,7 +129,7 @@ def execute(prepared,proof_path,approval_path,out,api=None):
     prompts=[api.ModelInput.model_validate(p) for p in payload['prompts']]
     out.mkdir();append(out/'start.jsonl',{'prepared_sha256':sha(prepared),'preflight_sha256':sha(proof_path),'approval_sha256':sha(approval_path),'runner_sha256':sha(__file__),'sdk_version':SDK_VERSION,'cap_usd':str(cap),'project':PROJECT})
     rates=rates_of(proof['prices_per_million']);spent=Decimal(0);reserved=Decimal(0);seq=0
-    def journal(kind,**kw):append(out/'journal.jsonl',{'event':kind,**kw})
+    def journal(event,**kw):append(out/'journal.jsonl',{'event':event,**kw})
     def reserve(kind,counts,**where):
         nonlocal reserved,seq
         amount=sum((Decimal(n)*rates[k] for k,n in counts.items()),Decimal(0))/Decimal(1000000)

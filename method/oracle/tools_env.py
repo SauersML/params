@@ -864,6 +864,10 @@ class Episode:
                 break
             fn = c.get("function", c)
             self.messages.append({"role": "tool", "name": fn["name"], "content": self.call(fn["name"], fn.get("arguments"))})
+        left = min(MAX_TURNS - self.turns, MAX_CALLS - self.calls)
+        if 0 < left <= 3 and self.messages[-1]["role"] == "tool" and self.messages[-1]["content"].endswith("}"):
+            # the budget's end in sight (Qwen3.5-397B refined drafts to the turn cap twice, the cap stated in SYSTEM)
+            self.messages[-1]["content"] = self.messages[-1]["content"][:-1] + f',"turns_left":{left},"answer_now":true}}'
         return self.turns >= MAX_TURNS or self.calls >= MAX_CALLS
 
     def expand(self, text: str) -> str:

@@ -589,11 +589,16 @@ recover_stopped() {  # POD
     read -r name _ < "$ACTIVE/$pod" || return 0
     read -r _ _ keys user < "$ACTIVE/.$pod.ssh" 2> /dev/null && [ -f "$keys/key" ] || { echo "rp-run: stopped pod $pod has no key left; deleting it without a copy" >&2; return 0; }
     echo "rp-run: pod $pod ($name) stopped itself; starting it to copy its outputs before deleting it" >&2
-    # The ledger reads hours from the API's lastStartedAt, which a start moves: the first stretch, to now (the stopped
-    # time counted as running, an overcount), is kept for reap to add.
-    r=$(api GET "$REST/pods/$pod")
-    t=$(epoch_of "$(jq -r '.lastStartedAt // .createdAt // ""' <<< "$(body_of "$r")" 2> /dev/null)") || t=""
-    [ -z "$t" ] || echo $(( $(date +%s) - t )) > "$ACTIVE/.$pod.before_s"
+    # The ledger reads hours from the API's lastStartedAt, which a start moves: the first stretch, to its stop ("Exited by
+    # user: Tue Oct 13 2026 18:54:50 GMT+0000 ...", else now, an overcount), is kept for reap to add.
+    if [ ! -f "$ACTIVE/.$pod.before_s" ]; then
+        local st sp
+        r=$(api GET "$REST/pods/$pod")
+        t=$(epoch_of "$(jq -r '.lastStartedAt // .createdAt // ""' <<< "$(body_of "$r")" 2> /dev/null)") || t=""
+        st=$(jq -r '.lastStatusChange // ""' <<< "$(body_of "$r")" 2> /dev/null | sed -nE 's/^Exited by user: [A-Za-z]{3} ([A-Za-z]{3} [0-9]{1,2} [0-9]{4} [0-9:]{8}) GMT.*/\1/p')
+        sp=$( [ -n "$st" ] && date -j -u -f '%b %d %Y %H:%M:%S' "$st" +%s 2> /dev/null || date +%s)
+        [ -z "$t" ] || echo $(( sp - t )) > "$ACTIVE/.$pod.before_s"
+    fi
     api POST "$REST/pods/$pod/start" > /dev/null
     for t in $(seq 40); do
         r=$(api GET "$REST/pods/$pod")
@@ -1445,6 +1450,12 @@ for rec in "$ACTIVE"/*; do
     if [ -n "${owner:-}" ] && kill -0 "$owner" 2> /dev/null; then
         [ "${mode:-run}" = run ] && live+=("${rec##*/}")
     else
+        if [ -f "$ACTIVE/.${rec##*/}.selfstop" ] && [ "$(pod_state "${rec##*/}")" = OTHER ]; then
+            # A self-stopped pod waiting for its host to free a GPU: its watcher or rp-run recover copies and deletes it;
+            # a launch neither waits for it nor fails on it.
+            echo "rp-run: ${rec##*/} stopped itself and waits for its copy (rp-run recover); not touched here" >&2
+            continue
+        fi
         echo "rp-run: ${rec##*/} was left by a run that is gone; deleting it unless a run packed onto it still uses it" >&2
         reap "${rec##*/}" || exit 1
     fi

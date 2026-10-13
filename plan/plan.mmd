@@ -1,8 +1,10 @@
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
 %% Read bottom to top: foundations, workstreams, decision gates, training, capabilities, impact.
-%% Solid arrows are artifact dependencies; dashed arrows are feedback or optional inputs.
+%% Solid arrows are artifact dependencies; dashed arrows are optional inputs.
+%% Feedback is recorded beside the owning workstream below, not drawn as a false prerequisite.
 %% One unit per box. Never put a sequence or an arrow inside a box: split it into boxes and edges.
-%% Parallel by default: gate B blocks reward-based RL only; Check A/C report each ready arm independently.
+%% Parallel by default: gate B applies only to the reward used by each RL arm; A/C report each ready arm.
+%% Failed circuit rewards do not block verified QA/edit supervision, search or unrelated measurements.
 %% Keep real artifact prerequisites and the final sealed-evaluation freeze; remove portfolio-wide waits.
 %% Consume passing data shards immediately. No lane waits for all 444 teachers or every other skill.
 %% Each box: bold title, why or what it decides (1-2 lines), status and owner. About 34 characters
@@ -103,7 +105,10 @@
 %% Goal-driven next step: freeze exact carrier/value-map/source, test fresh donor predictions and preserve checked claims.
 %% Verified-invariant producer af5e5da exists, but current teacher artifacts have no saved invariants; never turn commit prose
 %% into labels or join A140 outcomes onto a different A1757 group. Add explicit parser/data/evaluation support in parallel.
-%% Free MATS stage proposed while Mac scoring slot is occupied; no duplicate Mac scorer or paid allocation.
+%% Free MATS stage approved: frozen6025 primary plus6011 coverage control,1GPU/4CPU/64GiB/15min calibration.
+%% Direct submission job19567 is held by the cluster: never release. No duplicate Mac scorer or paid allocation.
+%% Local producer/consumer implementation and free learned-wiring replay proceed without cluster admission.
+%% Formal INVARIANTS parse/render and opt-in execution landed1ebc568; strict train-only artifact join in progress.
 %% Toy-loop reward executes selected UNITS only; Mermaid edges previously affected structural F1, not executable reward.
 %% 9789f31 adds opt-in --wiring: architecture-constrained edges compile to native pieces, with all selected pieces retained.
 %% Token-role arrows remain annotations and English unverified; diagnostic is point sufficiency, not intervention certification.
@@ -117,8 +122,11 @@
 %% Subsequent full CI38339724289 and38339841972 pass with unchanged relevant engine/scoring/test code.
 %% Keep a bounded numerical-stability investigation; a later green run alone does not explain the intermittent failure.
 %% Preserve existing training reward; next use opt-in wiring scores to test learned relations, not unit selection alone.
-%% No saved learned toy-policy completions found yet. Replay existing measured gt/active circuits across four fixed families
-%% against same-unit complete wiring and edge-deletion controls; reconstruct original synthetic weights/texts, free GHA.
+%% Free replay38341843083 completed: all4 fixed-family truth circuits KL <=8.8e-6 bits; removed-output controls ~7.438.
+%% Active induction has5.584 bits even with complete same-unit wiring: missing units, not only missing edges.
+%% Artifact830010f now supplies saved learned answers. Frozen overlap: induction_000,gate_001,additive_vote_015.
+%% Execute those3 logged learned answers next; no new generation and no claim of verified raw-weight dependence.
+%% Explicitly requested replay runs independently of unrelated CI failures; preserve both measurement and failed status.
 %% ad865a3 uses SciPy for exact toy SVD on Mac only; per-head weight reconstruction passes, Linux backend unchanged.
 %% Literature consequence: measure outcome prediction before free prose; native carriers alone cannot certify meaning.
 %% Offline falsification: real node-response errors coexist with large uncertainty penalties; do not tune them away.
@@ -153,7 +161,7 @@ flowchart BT
   %% ===================== training =====================
   ORC["<b>Incremental skill integration</b><br/>add each successful arm when ready;<br/>compare with frozen SFT on dev texts;<br/>a rising reward alone is not success<br/>primerl"]
 
-  subgraph RLS["RL ARMS IN PARALLEL · primerl · blocked only by gate B"]
+  subgraph RLS["RL ARMS IN PARALLEL · primerl · validate each arm’s own reward"]
     R1["<b>RL · circuits</b><br/>faithfulness gate and size"]
     R2["<b>RL · + variables</b>"]
     R3["<b>RL · + answers</b>"]
@@ -210,8 +218,9 @@ flowchart BT
   REM["<b>Remainder check</b><br/>remainder carries nothing: point<br/>live = held = off; blocks = all parts<br/>(s_track_pp 0.914 = 0.914)<br/>DONE · inframove"]
   VAR["<b>Variables and invariants</b><br/>kept: 84 input (= whole position),<br/>7 intermediate of 127; m share 0.004;<br/>families beat equal-size nulls 9/9<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
-  ENGP["<b>VPD relational mechanisms</b><br/>6025: intermediate carrier .939;<br/>freeze and test fresh semantic predictions;<br/>join only traceable verified claims<br/>ACTIVE · codex/variable_reward"]
-  WIRING["<b>Execute the stated wiring</b><br/>edge and swap checks execute;<br/>replay stored teacher wiring on 4 families;<br/>compare identical units with changed edges<br/>ACTIVE · codex/reward_audit"]
+  ENGP["<b>Fresh carrier tests</b><br/>6025: 438 units, reported .939;<br/>fresh donors and matched controls;<br/>MATS19567 held · no release<br/>WAITING · codex/variable_reward"]
+  CLAIMDATA["<b>Checked claim supervision</b><br/>formal parser and execution landed;<br/>join exact groups, donors and outcomes;<br/>only verified train claims feed SFT<br/>ACTIVE · codex/eval_recovery"]
+  WIRING["<b>Execute the stated wiring</b><br/>4 truth circuits reproduce outputs;<br/>same-unit edge deletions change them;<br/>next: 3 frozen learned answers<br/>ACTIVE · codex/reward_audit"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -243,7 +252,7 @@ flowchart BT
   S2 -. each completed arm .-> GATEC
   S3 -. each completed arm .-> GATEC
   GATEC -. picks the start .-> RLS
-  GATEB -- pass --> RLS
+  GATEB -- per-arm reward passes --> RLS
 
   %% ===================== edges: to the top (links 8-19) =====================
   RLS -. each successful arm .-> ORC
@@ -270,30 +279,31 @@ flowchart BT
   I1 --> I2
   I2 --> I3
   I3 -. audits each shard .-> SFTS
-  I3 -. identifies missing observations .-> I5
+  %% FEEDBACK: I3 -. identifies missing observations .-> I5
   I5 --> TOOLS
-  I4 -. sets the format .-> I1
-  S1READY -. tests need for better inputs .-> I4
-  I6 -. weight-arm evidence only .-> I4
+  %% FEEDBACK: I4 -. sets the format .-> I1
+  %% FEEDBACK: S1READY -. tests need for better inputs .-> I4
+  %% FEEDBACK: I6 -. weight-arm evidence only .-> I4
   SUP -. existing measured QA .-> QAONLY
   QAONLY -. measured arm .-> GATEC
   QAONLY -. candidate outcome skill .-> ORC
-  QAONLY -. isolates learning burden .-> I4
+  %% FEEDBACK: QAONLY -. isolates learning burden .-> I4
   W1 --> GATEB
   W2 -. tests .-> GATEB
-  W3 -. found the failure .-> W4
+  %% FEEDBACK: W3 -. found the failure .-> W4
   W4 --> GATEB
-  W5 -. checks predictive value .-> W4
+  %% FEEDBACK: W5 -. checks predictive value .-> W4
   W6 -. falsifies reward rankings .-> GATEB
   SEM --> W1
-  SEM -. tests claims .-> C2
+  %% FEEDBACK: SEM -. tests claims .-> C2
   T1 --> VAR
   VAR --> C2
   VAR --> SUP
   VAR --> R2
   SEM --> ENGP
   ENG --> ENGP
-  ENGP -. verified claims only .-> SUP
+  ENGP --> CLAIMDATA
+  CLAIMDATA -- verified claims only --> SUP
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
   T4 -. new circuits .-> TOOLS
@@ -309,7 +319,7 @@ flowchart BT
   TOOLS --> C3
   PHI --> T3
   PHI --> W1
-  TOY -. tests .-> PHI
+  %% FEEDBACK: TOY -. tests .-> PHI
   IBENCH -. external ground truth .-> SUP
   IBENCH -. same scale as MIB .-> LAT2
   TOY -. tests .-> GATEB
@@ -317,12 +327,12 @@ flowchart BT
   TOYLOOP --> TOYB
   TOYB -. tests .-> GATEB
   TOYB -. "cap eps ≤0.05,<br/>clip family scores to 0–1" .-> W4
-  TOYLOOP -. influential start misses<br/>content-addressed keys .-> T4
+  %% FEEDBACK: TOYLOOP -. influential start misses<br/>content-addressed keys .-> T4
   TOYLOOP -. early answer .-> GATEC
   ENG --> WIRING
-  WIRING -. tests executable relations .-> TOYLOOP
+  %% FEEDBACK: WIRING -. tests executable relations .-> TOYLOOP
   WIRING -. wiring evidence .-> C1
-  REM -. tests .-> PHI
+  %% FEEDBACK: REM -. tests .-> PHI
   VPD --> ENG
   TXT --> ENG
   ENG --> PHI
@@ -331,11 +341,11 @@ flowchart BT
   ENG --> TOY
   ENG --> REM
   ENG --> LAT1
-  SP1 -. accelerates .-> ENG
-  SP2 -. accelerates .-> T4
-  SP3 -. lowers sample cost .-> RLS
-  SP4 -. stretches compute budget .-> TEACHER
-  SP5 -. validates execution .-> ENG
+  %% FEEDBACK: SP1 -. accelerates .-> ENG
+  %% FEEDBACK: SP2 -. accelerates .-> T4
+  %% FEEDBACK: SP3 -. lowers sample cost .-> RLS
+  %% FEEDBACK: SP4 -. stretches compute budget .-> TEACHER
+  %% FEEDBACK: SP5 -. validates execution .-> ENG
   UVPD --> LAT2
   LAT2 -.-> C4
 
@@ -369,7 +379,8 @@ flowchart BT
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
   class QAONLY check
-  class ENGP,WIRING active
+  class WIRING,CLAIMDATA active
+  class ENGP waiting
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting
   class LAT2,UVPD later

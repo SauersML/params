@@ -29,6 +29,6 @@ cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,no
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; $RUNS wait;
 cat $ROWS > $O/out/fit.jsonl; python -B experiments/oracle/persistent_e3.py table $O/out/fit.jsonl $([ "${MODE:-fit}" = edit ] && echo --edit) > $O/out/table.txt 2>&1; echo all stages done"
-RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=20 RP_MIN_RAM_GB=24 RP_DISK_GB=40 \
+RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=24 RP_DISK_GB=40 \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA GeForce RTX 4090,NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA RTX A4500,NVIDIA RTX 4000 Ada Generation,NVIDIA L4}" $H -- bash -c "$CMD"
 }

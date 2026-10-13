@@ -92,7 +92,8 @@ import mech  # noqa: E402
 import native  # noqa: E402
 
 HELD_OUT_RANKS = (3, 4, 5)  # carry.alternatives' ranks for F2; the carry search and its training answers use 0 to 2
-SHARE_FLOOR = 0.01  # F2's positions: those moving the prediction by at least this share of the text's total
+SHARE_FLOOR = 0.01  # F2's positions: those moving the prediction by about this share of the text's total (f2_cut)
+F2_BAND = 2.0  # f2_cut's window around SHARE_FLOOR: the cut falls between shares within a factor F2_BAND of it
 GOAL = 0.9  # completeness: the share of VPD's recovery that counts as complete
 RANDOM_PAIRS = 32  # F3's unstated pairs per answer
 MAX_EDGES = 64  # F3's stated edges per answer (a uniform draw when an answer states more)
@@ -869,6 +870,31 @@ class _Parts:
         return self.names[s], int(self.t[s][k]), int(self.c[s][k])
 
 
+def f2_cut(moved: np.ndarray, floor: float = SHARE_FLOOR) -> list[int]:
+    """F2's positions (0-based, ascending) from the sensitivity probe's moved: the positions sorted by their share of the
+    total, cut where consecutive shares fall by the largest ratio among cuts whose last kept share is at least floor /
+    F2_BAND and whose first dropped one is at most floor x F2_BAND (every share at or above floor when no cut lies in
+    that window). A hard cutoff at floor put text9019's position 306 in or out of F2 on a 3% difference (moved 0.1093
+    against 0.1128): a cut at the largest gap moves only when shares cross each other by that ratio."""
+    total = float(moved.sum())
+    if not total > 0:
+        return []
+    order = np.argsort(-moved, kind="stable")
+    s = moved[order] / total
+    best = None
+    for k in range(1, len(s) + 1):
+        hi, lo = float(s[k - 1]), float(s[k]) if k < len(s) else 0.0
+        if hi < floor / F2_BAND:
+            break
+        if lo > floor * F2_BAND:
+            continue
+        r = hi / max(lo, 1e-12)
+        if best is None or r > best[0]:
+            best = (r, k)
+    k = best[1] if best is not None else int((s >= floor).sum())
+    return sorted(int(j) for j in order[:k])
+
+
 def _fid(e0: float, kc: float, kv: float) -> float | None:
     """C's log scale: clip(ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD), 0, 1); None when VPD's own answer is no
     nearer the model than the empty circuit under the interventions."""
@@ -1158,7 +1184,8 @@ class GoalEval:
             if "moved" in probe:
                 moved = probe["moved"]
                 total = float(moved.sum())
-                for j in (moved >= self.share_floor * total).nonzero().flatten().tolist() if total > 0 else []:
+                for j in f2_cut(np.asarray(moved.cpu() if torch.is_tensor(moved) else moved, dtype=np.float64), self.share_floor) \
+                        if total > 0 else []:
                     f2.append((j + 1, np.asarray(carry.alternatives(nat, ids, j + 1, ranks=self.ranks), dtype=np.int32)))
                 moved = moved.cpu().numpy() if torch.is_tensor(moved) else np.asarray(moved)
             self.probes[key] = (np.asarray(prompts, dtype=np.int32), [getattr(x, "weight", 1.0) for x in prompts], f2, moved)
@@ -3838,8 +3865,12 @@ class GoalEval:
         others = [int(z) for z in lp.topk(4).indices.tolist() if z != tx.ids[p]][:3]
         w = lp.exp()
         w[[tx.ids[p]] + others] = 0.0
-        gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(("fresh", seed, p)).encode()).hexdigest()[:15], 16))
-        return torch.multinomial(w, min(FRESH_SOURCES, int((w > 0).sum())), replacement=False, generator=gen).tolist()
+        rng = np.random.default_rng(int(hashlib.sha256(repr(("fresh", seed, p)).encode()).hexdigest()[:15], 16))
+        wn = w.numpy()                                       # without replacement as an exponential race on numpy's
+        ok = wn > 0                                          # stream (torch.multinomial's draws changed between torch
+        keys = np.full(len(wn), np.inf)                      # versions: native.stable_rng)
+        keys[ok] = -np.log(1.0 - rng.random(int(ok.sum()))) / wn[ok]
+        return np.argsort(keys, kind="stable")[:min(FRESH_SOURCES, int(ok.sum()))].tolist()
 
     def _interchange_draws(self, tx: Text, positions: list[int], split: str, draws: int,
                            first: dict | None = None) -> list[tuple[int, int]]:
@@ -3954,7 +3985,7 @@ class GoalEval:
     def changed_inputs(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = 16,
                        strengths: torch.Tensor | None = None, cuts: list | None = None) -> list[dict]:
         """The changed-input family (paired F2, the lead's decision 10-12): the circuit's identities on changed texts.
-        Prompts: F2's positions (the sensitivity probe's, at least share_floor of its total), the most moved first, each
+        Prompts: F2's positions (the sensitivity probe's, f2_cut of its moved), the most moved first, each
         with the split's source tokens (_interchange_draws: search ranks 0 and 2, eval rank 1 and samples), up to draws.
         On a changed text x': KL_C = KL(model(x') || the circuit run on x' in C's semantics, its embedding reading x'),
         KL_V the same for VPD's answer on the text (its base identities: a part switching on in x' is missing from both),

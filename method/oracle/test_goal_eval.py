@@ -3056,3 +3056,30 @@ def test_line_loo_without_nodes(tiny):
     pool = tiny_pool(nat, tx.ids)
     out = ge.line_loo(tx, native.Graph(), pool, draws=4, bits_start=1000.0)
     assert out["lines"] == [] and out["phi"] is not None
+
+
+def test_f2_cut_at_the_largest_gap_near_the_floor():
+    # text9019's probe (one draw a position, CPU): the hard 1% cutoff (0.1128) left out 306 at 0.1093; the cut falls at
+    # the largest ratio between consecutive shares within a factor 2 of the floor (0.0722 -> 0.0156, a 4.6x fall)
+    moved = np.zeros(340)
+    for p, m in ((338, 9.2674), (337, 0.6925), (307, 0.5698), (287, 0.3667), (306, 0.1093), (286, 0.0882), (181, 0.0722),
+                 (121, 0.0156), (20, 0.0001)):
+        moved[p - 1] = m
+    assert [j + 1 for j in goal_eval.f2_cut(moved)] == [181, 286, 287, 306, 307, 337, 338]
+    # a 3% move of 306 across the old cutoff leaves the cut where it was
+    moved[305] = 0.1093 * 1.03
+    assert [j + 1 for j in goal_eval.f2_cut(moved)] == [181, 286, 287, 306, 307, 337, 338]
+    # no cut inside the window: every share at or above the floor; nothing moved: none
+    assert goal_eval.f2_cut(np.array([0.5, 0.5])) == [0, 1] and goal_eval.f2_cut(np.zeros(4)) == []
+
+
+def test_probe_draws_do_not_depend_on_torch_multinomial():
+    # draws by inverse CDF on numpy's stream, seeded by the generator's seed alone: the same for the same seed whatever
+    # the generator's state, a token with no mass never drawn
+    g1, g2 = torch.Generator().manual_seed(7), torch.Generator().manual_seed(7)
+    torch.rand(5, generator=g2)
+    p = torch.tensor([0.0, 0.25, 0.0, 0.5, 0.25])
+    a = [native.draw(p, u) for u in native.stable_rng(g1, 1).random(200)]
+    b = [native.draw(p, u) for u in native.stable_rng(g2, 1).random(200)]
+    assert a == b and set(a) <= {1, 3, 4} and abs(a.count(3) / 200 - 0.5) < 0.1
+    assert native.draw(p, 0.0) == 1 and native.draw(p, 0.999999) == 4

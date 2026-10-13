@@ -61,6 +61,7 @@ sys.path.insert(0, str(HERE.parent / "vpd"))
 import mech  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
+SENSITIVITY_DRAWS = 3  # replacement draws per position in the sensitivity probe, their KLs averaged into moved
 CHANGES = 16  # changed prompts per text: draws of the average that defines faithfulness (they set its precision, not what it is)
 MAX_CONNECTIONS = 150000  # the search's memory: the connections it ranks at once
 READ_POSITIONS, READ_PER = 16, 4  # nodes_from "vpd+reads": the positions where the prediction responds most, values/keys per layer there
@@ -73,6 +74,19 @@ def free(dev: str) -> None:
     """Return cached device memory (the Mac's shared memory fills with MPS's cache during the search's rankings)."""
     if str(dev).startswith("mps"):
         torch.mps.empty_cache()
+
+
+def stable_rng(g: torch.Generator, purpose: int) -> np.random.Generator:
+    """numpy's PCG64 seeded by g's seed and a purpose: the same draws on every torch version and device (torch.multinomial's
+    CPU algorithm changed between versions: torch 2.4 on the pods and 2.11 on the Mac drew 311 different replacements
+    of text9019's 338 from one seed and probabilities equal to 5e-5, so its F2 and start set differed by machine)."""
+    return np.random.default_rng([int(g.initial_seed()) % (1 << 63), purpose])
+
+
+def draw(p: torch.Tensor, u: float) -> int:
+    """The index of an unnormalized CPU vector p at uniform u in [0, 1) of its inverse CDF, in float64."""
+    c = np.cumsum(p.double().numpy())
+    return int(min(np.searchsorted(c, u * c[-1], side="right"), len(c) - 1))
 
 
 def device() -> str:
@@ -1029,13 +1043,14 @@ class Native:
         moved, other = self.sensitivity(ids, targets, g)  # 16 probes at a time: their full logits are ~1.6 GB
         if probe is not None:
             probe["moved"] = moved
-        uniform = torch.full((last,), 1.0 / last)
-        q = 0.5 * uniform + 0.5 * (moved / moved.sum() if moved.sum() > 0 else uniform)
+        uniform = torch.full((last,), 1.0 / last, dtype=torch.float64)
+        q = 0.5 * uniform + 0.5 * (moved.double() / moved.sum() if moved.sum() > 0 else uniform)
+        rng = stable_rng(g, 2)                               # (version-stable draws: stable_rng)
         out = []
         for _ in range(n):
-            j = int(torch.multinomial(q, 1, generator=g))
+            j = draw(q, rng.random())
             x = list(ids)
-            x[j + 1] = int(torch.multinomial(other[j], 1, generator=g))
+            x[j + 1] = draw(other[j], rng.random())
             out.append(Changed(x, 1.0))
         return out
 
@@ -1043,40 +1058,42 @@ class Native:
     # checked equal to the whole forward; on CUDA (an A40, bench_speed.py's window bench and events fingerprints) it is not
 
     def sensitivity(self, ids: list[int], targets: list[int], g: torch.Generator, chunk: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
-        """(moved [last], other [T - 1, V]): moved[p - 1], the KL (nats) of the model's prediction at the last target
-        after the token at position p is replaced by one draw from other[p - 1], the model's prediction for position p
-        without the text's token there (changes' probe: where the prediction responds to the text). On WINDOW_EXACT
-        devices a probe computes only from its changed position (Target.hidden's window): the same numbers. While the
-        model is plain(), the last two results are kept by text, targets, chunk and the generator's state, and a repeat
-        returns them and leaves the generator where the computation would (units.sensitive and changes() ask for the
-        same probe of a text); callers only read them."""
-        key = (tuple(ids), tuple(targets), chunk, g.get_state().numpy().tobytes()) if self.plain() else None
+        """(moved [last], other [T - 1, V]): moved[p - 1], the mean KL (nats) of the model's prediction at the last
+        target after the token at position p is replaced by each of SENSITIVITY_DRAWS draws from other[p - 1], the model's
+        prediction for position p without the text's token there, in float64 (changes' probe: where the prediction
+        responds to the text). The draws come from stable_rng(g, 1) by inverse CDF (draw): the same on every torch version
+        and device, and g itself is not advanced. On WINDOW_EXACT devices a probe computes only from its changed position
+        (Target.hidden's window): the same numbers. While the model is plain(), the last two results are kept by text,
+        targets, chunk and g's seed (units.sensitive and changes() ask for the same probe of a text); callers only read
+        them."""
+        key = (tuple(ids), tuple(targets), chunk, int(g.initial_seed())) if self.plain() else None
         kept = self.__dict__.setdefault("_sensitivity_kept", {})
         if key in kept:
-            moved, other, state = kept[key]
-            g.set_state(state)
+            moved, other = kept[key]
             return moved.clone(), other
         moved, other = self._sensitivity(ids, targets, g, chunk)
         if key is not None:
             if len(kept) >= 2:
                 kept.pop(next(iter(kept)))
-            kept[key] = (moved.clone(), other, g.get_state())
+            kept[key] = (moved.clone(), other)
         return moved, other
 
     def _sensitivity(self, ids: list[int], targets: list[int], g: torch.Generator, chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
-        last = max(targets)
-        probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0].float().softmax(-1).cpu()
-        base = torch.log(probs[last].clamp_min(1e-30))
+        last, D = max(targets), SENSITIVITY_DRAWS
+        probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0].float().cpu().double().softmax(-1)  # (MPS has
+        base = torch.log(probs[last].clamp_min(1e-30))      # no float64)
         if getattr(self.target, "lm", True):
             other = probs.clone()
         else:  # no language model: replacements uniform over the input vocabulary (replacement_logp)
-            other = torch.full((len(ids), self.target.n_tokens), 1.0 / self.target.n_tokens)
+            other = torch.full((len(ids), self.target.n_tokens), 1.0 / self.target.n_tokens, dtype=torch.float64)
         other[torch.arange(len(ids) - 1), torch.tensor(ids[1:])] = 0.0
+        rng = stable_rng(g, 1)
         probe = []
-        for p in range(1, last + 1):
-            x = list(ids)
-            x[p] = int(torch.multinomial(other[p - 1], 1, generator=g))
-            probe.append(x)
+        for p in range(1, last + 1):                         # D probes a position, consecutive
+            for _ in range(D):
+                x = list(ids)
+                x[p] = draw(other[p - 1], rng.random())
+                probe.append(x)
         lqs, prefix = [], {}
         window = str(self.dev).split(":")[0] in self.WINDOW_EXACT
         with torch.no_grad():
@@ -1084,9 +1101,9 @@ class Native:
                 batch = torch.tensor(probe[s0:s0 + chunk], device=self.dev)
                 if len(batch) > 1:  # the logits at the last target alone: the numbers they have in the whole sequence's
                     self.vpd.clear()
-                    # The chunk's probes change positions s0 + 1 on: before there (keeping at least 64 rows) they read
-                    # the text's own queries, keys and values, computed at the chunk's batch size
-                    start = max(0, min(s0 + 1, len(ids) - 64)) if window else 0
+                    # The chunk's probes change positions s0 // D + 1 on: before there (keeping at least 64 rows) they
+                    # read the text's own queries, keys and values, computed at the chunk's batch size
+                    start = max(0, min(s0 // D + 1, len(ids) - 64)) if window else 0
                     if start and len(batch) not in prefix:
                         prefix[len(batch)] = self.target.keys_values(torch.tensor([ids] * len(batch), device=self.dev))
                     h = self.target.hidden(batch, start, prefix.get(len(batch)))[:, last - start:last - start + 1]
@@ -1098,9 +1115,9 @@ class Native:
             lqs = torch.cat(lqs).cpu()  # one transfer
         moved = []
         for s0 in range(0, len(probe), chunk):
-            lq = lqs[s0:s0 + chunk]
+            lq = lqs[s0:s0 + chunk].double()
             moved.append((base.exp() * (base - lq)).sum(-1).clamp_min(0))
-        return torch.cat(moved), other
+        return torch.cat(moved).view(last, D).mean(1).float(), other.float()
 
     def faithfulness(self, ids: list[int], targets: list[int], graphs: list[Graph] | list[list[Graph]], prompts: list[list[int]], seed: int = 0,
                      chunk: int = 16) -> list[float]:

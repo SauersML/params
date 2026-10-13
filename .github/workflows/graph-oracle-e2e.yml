@@ -41,12 +41,12 @@ jobs:
       - name: Install CPU torch and the test dependencies
         run: |
           python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -q 'pytest>=8' numpy safetensors transformers peft tokenizers huggingface_hub
+          python -m pip install -q 'pytest>=8' numpy safetensors transformers peft tokenizers huggingface_hub httpx
 
-      - name: Check weight-use and intervention controls
+      - name: Check weight-use, intervention, English and data controls
         run: |
           python -m pytest method/oracle/rl/test_inject.py method/oracle/test_intervention_panel.py \
-            method/oracle/test_reward_gate.py -q --tb=short
+            method/oracle/test_reward_gate.py method/oracle/test_semantic.py method/oracle/test_task_data.py -q --tb=short
 
       - name: Run the graph oracle's tests
         env:

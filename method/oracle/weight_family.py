@@ -7,14 +7,17 @@ interventions"). Per text, draws of weight edits, each applied at every position
                 entry-wise: that column of W, of V's rows, of the remainder);
   head          one attention head's output scaled by k (o_proj's block of columns, the same way).
 Each edit is applied to the model's tensors (W, V, U, the remainder) and every run reads them: the real model's, the
-circuit's in the GoalEval's semantics (GoalEval._graph_kl's run: its subcomponents with the edited vectors, every other
-one off, the remainders live and edited; with semantics "x" the routing and norms read from the model as edited), VPD's
-whole answer the same. Per edit, with p the model's prediction at the targets, p_e
+circuit's in C's semantics (its subcomponents with the edited vectors, every other one off, the remainders live and
+edited, routing and norms recomputed by that circuit), VPD's whole answer the same. Current GoalEval semantics
+"n" and "c" both leave these point runs unfrozen; only the node and omitted families hold boundaries under "n".
+Per edit, with p the model's prediction at the targets, p_e
 the edited model's, W = KL(p_e || p) (how far the edit moves the model: the no-change answer's error), KL_C = KL(p_e ||
 p moved as the circuit's run moves under the edit: log_softmax(log p + log q_C,e - log q_C), s_track's transplant, so
 the circuit's error on the unedited text does not count), KL_V = the same for VPD's whole answer:
   s = clip(ln(W / KL_C) / ln(W / KL_V), 0, 1), none where KL_V >= W or W < W_MIN,
 pooled weighted by W (s_weight; s_weight_raw unclipped below 0). draws_weight: per edit [kind, what, k, W, KL_C, KL_V].
+A conditional change score does not establish small direct KL(p_e || q_C,e): its prediction uses the full-model
+baseline p. Report direct edited-distribution fidelity separately when claiming an independently executable circuit.
 A circuit predicts the edit only if the edit acts through it: a circuit that reproduces p while missing the parts the
 edit changes keeps predicting p, KL_C ~ W, s ~ 0.
 
@@ -81,8 +84,11 @@ def draw(nat, ids: list[int], targets: list[int], seed: int, order: list | None 
 
 
 def _clear(nat, ge=None) -> None:
-    """Native's kept runs (they would be the unedited model's), and GoalEval's x values (semantics "x": the routing and
-    norms of the model's run, read again from the model as edited)."""
+    """Discard Native reference runs and any cached GoalEval boundary values across a weight change.
+
+    The current weight-family point runs do not use held boundaries; clearing them also prevents stale values if
+    another family sharing this GoalEval requests its node/omitted boundary state while the edit is applied.
+    """
     nat._refs.clear()
     nat._refs_bytes = 0
     nat._rec = (None, None, {})

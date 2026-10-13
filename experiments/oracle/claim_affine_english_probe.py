@@ -33,6 +33,8 @@ def prediction(row):
  except (ValueError,TypeError):return None,'malformed'
 def reader_text(common,condition,evidence):
  return common+'\nExplanation condition: '+condition+'\nBEGIN EVIDENCE\n'+evidence+'\nEND EVIDENCE\nReturn ONLY JSON {"top_token":EXACT native token string,"changed":boolean}. Changed compares the argmax token against the SAME unedited model/context at k=1. Preserve leading/trailing whitespace in the string. No reasoning text.'
+def typed_facts(case,payload):
+ return {'case':case,'mechanism':{**payload['mechanism'],'segment_coordinates':'Each envelope segment line is numerator(k)=intercept+k*slope; intercept is the k=0 value, not the unedited base at k=1.'},'model_content_sha256':payload['model_content_sha256']}
 def prepare(evidence,tokenizer,prices,out):
  if out.exists():raise ValueError('immutable preparation')
  official=next(r for r in json.loads(prices.read_text()) if r['tinker_id']==MODEL)
@@ -48,7 +50,7 @@ def prepare(evidence,tokenizer,prices,out):
  if len(mapping)!=5:raise ValueError('fixed shared five-token mapping')
  rr=guarded.configure(tokenizer);reader_rr=reader_renderer();writers=[];readers=[];templates=[];gold=[]
  for task,case in payload['cases'].items():
-  facts={'case':case,'mechanism':payload['mechanism'],'model_content_sha256':payload['model_content_sha256']}
+  facts=typed_facts(case,payload)
   text='Write a short self-contained English explanation (at most250words) of this exact local persistent weight-edit mechanism and its argmax behavior over the entire declared scale range. Explain weight operation, unchanged site input, residual addition, positive shared final RMS and readout, numerical/boundary limitations and conditional scope. Preserve the winning token spellings/whitespace and quantitative intervals. Numeric boundaries/formulas are allowed; do not merely output JSON or a table. Do not claim full circuit fidelity, exact probabilities, or unseen generalization. These facts were derived from the unedited weights/activations; no edited-forward observations are supplied.\nTYPED FACTS\n'+json.dumps(facts,sort_keys=True)
   writers.append({'request_id':'writer|'+task,'task':task,'model':MODEL,'max_tokens':WRITER_CAP,**encoded(rr,text)})
   for k in protocol['scales']:

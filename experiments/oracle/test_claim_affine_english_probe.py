@@ -13,6 +13,12 @@ class Probe(unittest.TestCase):
   none=p.reader_text(common,'none','');typed=p.reader_text(common,'typed','SECRET_THRESHOLD')
   self.assertNotIn('SECRET_THRESHOLD',none);self.assertIn('SECRET_THRESHOLD',typed)
   self.assertIn(common,none);self.assertIn(common,typed)
+ def test_segment_coordinates_clear_without_mutating_frozen_payload(self):
+  payload={'mechanism':{'argmax':'base+(k-1)*slope'},'model_content_sha256':{'target':'frozen'}}
+  facts=p.typed_facts({'envelope':{'segments':[]}},payload)
+  self.assertIn('intercept+k*slope',facts['mechanism']['segment_coordinates'])
+  self.assertIn('k=0',facts['mechanism']['segment_coordinates'])
+  self.assertNotIn('segment_coordinates',payload['mechanism'])
  def test_costs_bind_independent_model_rates(self):
   self.assertAlmostEqual(p.cost(p.MODEL,1000,100),(.45*1000+1.335*100)/1e6)
   self.assertAlmostEqual(p.cost(p.READER,1000,100),(2.205*1000+5.49*100)/1e6)

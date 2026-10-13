@@ -2174,7 +2174,9 @@ def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget:
     start (path.json "blocks": its positions and size), each stage's size, the refused removals (path.json "refused":
     what was tried, the score that refuted it against its floor, and the token changes it failed on): small removals
     (a few named subcomponents or connections) first by their shortfall below the floor, then at most two large ones
-    (by site and count), shown in the order they were tried, within budget characters; then the result."""
+    (by site and count), shown in the order they were tried, within budget characters; then the result. path "repick"
+    (repick_teachers.py's record, which dataset() adds): a written stage that fell under a family floor on its own
+    full-fidelity run and the stage picked instead, stated before the result."""
     strings = token_strings(model, ids)
     tok = lambda z: shown(token_strings(model, [int(z)])[0])  # noqa: E731
     b = path.get("blocks") or {}
@@ -2213,7 +2215,11 @@ def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget:
         return (fl or 0.0) - (sc or 0.0), (f"removing {what(r['removed'])} drops changed-input tracking to {sc:.2f} (floor {fl:.2f}, "
                                           f"from {r.get('s_current', float('nan')):.2f}) on token changes such as {on}: kept.")
     rs = [(i, *refusal(r)) for i, r in enumerate(path.get("refused") or []) if r.get("removed")]
-    tail = f"Result: {len([n for n in answer['nodes'] if n[0] != TOK])} subcomponents at positions " + \
+    rp = path.get("repick") or {}
+    check = (f"Check: stage {rp['stage']} ({rp['size']} subcomponents) leaves a family below its floor on its own full-fidelity "
+             f"run (shortfall {rp['v']:.2f}); stage {rp['new_stage']} ({rp['new_size']}) keeps every family at its floor.") \
+        if rp.get("repicked") else ""
+    tail = (check + "\n" if check else "") + f"Result: {len([n for n in answer['nodes'] if n[0] != TOK])} subcomponents at positions " + \
            ", ".join(str(p) for p in sorted({n[2] for n in answer["nodes"] if n[0] != TOK})) + "."
     room = budget - sum(len(x) + 1 for x in out) - len(tail) - 1
     keep, seen, big = [], set(), 0
@@ -2554,6 +2560,8 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
     import native
 
     n = 0
+    rp = teacher_dir / "repick.jsonl"  # repick_teachers.py's records: a re-picked circuit's trace says why
+    repicked = {x["task"]: x for x in map(json.loads, rp.read_text().splitlines()) if x.get("repicked")} if rp.exists() else {}
     with out.open("w") as f:
         for r in map(json.loads, rows.read_text().splitlines()):
             record = (invariants or {}).get(r["task"]) if r.get("invariants") else None
@@ -2601,7 +2609,8 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
             content = target(answer, r, task["model"], ops, token_strings(task["model"], prompt["token_ids"]))
             if traces:  # the teacher's search as the thinking before the answer (thinking_trace; Qwen3's thinking renderer)
                 pf = teacher_dir / f"{r['task']}.path.json"
-                trace = thinking_trace(json.loads(pf.read_text()) if pf.exists() else {}, task["model"], prompt["token_ids"], answer)
+                path = {**(json.loads(pf.read_text()) if pf.exists() else {}), "repick": repicked.get(r["task"])}
+                trace = thinking_trace(path, task["model"], prompt["token_ids"], answer)
                 content = f"<think>\n{trace}\n</think>\n\n{content}"
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
                                 "completion": [{"role": "assistant", "content": content}], "info": info}) + "\n")

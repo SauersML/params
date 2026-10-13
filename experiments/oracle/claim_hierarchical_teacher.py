@@ -104,7 +104,7 @@ def refine(full, protected, reachable, roots, prior_errors, evaluate, emit=None)
     return {'status':'bounded_hierarchical_refinement' if accepted else 'full_model_no_compression','masks':current,'start':start,'selected':selected,'attempts':attempts,'accepted':accepted,'cap_hit':bool(queue) and len(attempts)==MAX_ATTEMPTS,'unfinished_queue':len(queue),'remaining_reachable_placements':sum(len(current[s]&reachable[s]) for s in sites),'recipe':{'mode':'full_minus_accepted_rectangles_with_protected_teacher_nodes','accepted_rectangles':[(s,list(r)) for s,r in accepted],'reachable_nodes':{s:sorted(v) for s,v in reachable.items()},'protected_nodes':{s:sorted(v) for s,v in protected.items()}}}
 
 
-def tensor_refine(order, full, protected, evaluate, count, emit, positions, prior):
+def tensor_refine(order, full, protected, evaluate, count, emit, positions, prior, history=None, expected_recipe=None):
     """Memory-bounded adapter: rectangles operate on original Boolean masks."""
     current={s:m.clone() for s,m in full.items()};accepted=[];attempts=[];queue=[]
     def measure(m,label):
@@ -126,7 +126,33 @@ def tensor_refine(order, full, protected, evaluate, count, emit, positions, prio
         ps=positions[s];root=(min(ps),max(ps)+1,0,full[s].shape[1])
         if tuple(ps)!=tuple(range(root[0],root[1])):raise ValueError('contiguous architecture reachability required')
         for r in split_rectangle(root):enqueue(s,r,1,prior[s])
-    while queue and len(attempts)<MAX_ATTEMPTS:
+    # Reconstruct the queue from the frozen complete decision history, including
+    # rejected splits. No old candidates are physically evaluated again.
+    for old in history or ():
+        if not queue:raise ValueError('history extends exhausted search')
+        queue.sort();_,_,s,r,d,e=queue.pop(0);removed=eligible(s,r);n=int(removed.sum())
+        values=old['direct_kl_bits']
+        if old['site']!=s or tuple(old['rectangle'])!=r or old['removed_reachable_placements']!=n or not n or len(values)!=4 or any(not math.isfinite(x) or x<0 for x in values) or old['worst_direct_kl_bits']!=max(values) or old['accepted']!=(max(values)<=DIRECT_MAX):
+            raise ValueError('history disagrees with deterministic decision queue')
+        if old['accepted']:
+            p0,p1,c0,c1=r;current[s][p0:p1,c0:c1] &= ~removed
+            accepted.append((s,r));selected=old
+        else:
+            for child in split_rectangle(r,d):enqueue(s,child,d+1,max(values))
+        if count(current) != (old['counts'] if old['accepted'] else selected['counts']):raise ValueError('history mask count mismatch')
+        attempts.append(old)
+    resumed_count=len(attempts)
+    def recipe():
+        return {'mode':'full_minus_rectangles_preserving_teacher','shapes':{s:list(m.shape) for s,m in full.items()},'accepted_rectangles':[[s,list(r)] for s,r in accepted],'protected_nodes':{s:protected[s].nonzero().tolist() for s in order},'reachable_position_spans':{s:[min(positions[s]),max(positions[s])+1] for s in order}}
+    if expected_recipe is not None and recipe()!=expected_recipe:raise ValueError('frozen accepted recipe differs from reconstructed history')
+    if history:
+        resumed=measure(current,'resumed_start')
+        if resumed['worst_direct_kl_bits']>DIRECT_MAX:
+            return {'status':'infeasible_resumed_start','masks':None,'start':start,'resumed_start':resumed,'attempts':attempts,'accepted_sites':sorted({s for s,r in accepted})}
+        selected=resumed
+    else:resumed=None
+    limit=resumed_count+MAX_ATTEMPTS
+    while queue and len(attempts)<limit:
         queue.sort();_,_,s,r,d,e=queue.pop(0);removed=eligible(s,r);n=int(removed.sum())
         if not n:continue
         p0,p1,c0,c1=r;changed=current[s].clone();changed[p0:p1,c0:c1] &= ~removed
@@ -141,4 +167,4 @@ def tensor_refine(order, full, protected, evaluate, count, emit, positions, prio
     for s,r in accepted:
         p0,p1,c0,c1=r;replayed[s][p0:p1,c0:c1] &= protected[s][p0:p1,c0:c1]
     if any(not __import__('torch').equal(current[s],replayed[s]) for s in order):raise RuntimeError('tensor recipe replay failed')
-    return {'status':'bounded_hierarchical_refinement' if accepted else 'full_model_no_compression','masks':current,'start':start,'selected':selected,'attempts':attempts,'accepted_sites':sorted({s for s,r in accepted}),'cap_hit':bool(queue) and len(attempts)==MAX_ATTEMPTS,'unfinished_queue':len(queue),'recipe':{'mode':'full_minus_rectangles_preserving_teacher','shapes':{s:list(m.shape) for s,m in full.items()},'accepted_rectangles':[(s,list(r)) for s,r in accepted],'protected_nodes':{s:protected[s].nonzero().tolist() for s in order},'reachable_position_spans':{s:[min(positions[s]),max(positions[s])+1] for s in order}}}
+    return {'status':'bounded_hierarchical_refinement' if accepted else 'full_model_no_compression','masks':current,'start':start,'resumed_start':resumed,'selected':selected,'attempts':attempts,'resumed_attempts':resumed_count,'new_attempts':len(attempts)-resumed_count,'accepted_sites':sorted({s for s,r in accepted}),'cap_hit':bool(queue) and len(attempts)==limit,'unfinished_queue':len(queue),'pending_queue':sorted(queue),'recipe':recipe()}

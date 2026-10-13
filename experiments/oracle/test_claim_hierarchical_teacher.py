@@ -48,4 +48,25 @@ class PolicyTest(unittest.TestCase):
   def ev(m,label):labels.append(label);return [0]*4 if label=='full_start' else [0,0,0,.003]
   got=h.tensor_refine(('a',),full,protected,ev,lambda m:{'reachable_component_placements':int(m['a'].sum())},None,{'a':tuple(range(8))},{'a':1.})
   self.assertEqual(len(got['attempts']),32);self.assertEqual(len(labels),33);self.assertTrue(got['cap_hit']);self.assertFalse(got['accepted_sites']);self.assertTrue(torch.equal(got['masks']['a'],full['a']))
+ def test_resume_preserves_failed_splits_and_never_repeats_proposals(self):
+  import torch
+  full={'a':torch.ones(16,16,dtype=torch.bool)};protected={'a':torch.zeros_like(full['a'])}
+  count=lambda m:{'reachable_component_placements':int(m['a'].sum())}
+  ev=lambda m,l:[0]*4 if l in ('full_start','resumed_start') else [0,0,0,.003]
+  a=h.tensor_refine(('a',),full,protected,ev,count,None,{'a':tuple(range(16))},{'a':1.})
+  labels=[]
+  def second(m,l):labels.append(l);return ev(m,l)
+  b=h.tensor_refine(('a',),full,protected,second,count,None,{'a':tuple(range(16))},{'a':1.},a['attempts'],a['recipe'])
+  self.assertEqual(b['attempts'][:32],a['attempts']);self.assertEqual(b['new_attempts'],32);self.assertEqual(len(labels),34)
+  self.assertFalse({tuple(x['rectangle']) for x in a['attempts']} & {tuple(x['rectangle']) for x in b['attempts'][32:]})
+  bad=[dict(x) for x in a['attempts']];bad[0]['rectangle']=[0,1,0,1]
+  with self.assertRaises(ValueError):h.tensor_refine(('a',),full,protected,ev,count,None,{'a':tuple(range(16))},{'a':1.},bad,a['recipe'])
+ def test_resume_fresh_failure_stops_before_new_proposals(self):
+  import torch
+  full={'a':torch.ones(8,8,dtype=torch.bool)};protected={'a':torch.zeros_like(full['a'])};count=lambda m:{'reachable_component_placements':int(m['a'].sum())}
+  a=h.tensor_refine(('a',),full,protected,lambda *x:[0]*4,count,None,{'a':tuple(range(8))},{'a':1.})
+  labels=[]
+  def ev(m,l):labels.append(l);return [0]*4 if l=='full_start' else [.002]*4
+  b=h.tensor_refine(('a',),full,protected,ev,count,None,{'a':tuple(range(8))},{'a':1.},a['attempts'],a['recipe'])
+  self.assertIsNone(b['masks']);self.assertEqual(labels,['full_start','resumed_start'])
 if __name__=='__main__':unittest.main()

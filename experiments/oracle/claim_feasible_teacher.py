@@ -44,7 +44,7 @@ def search_sites(order,full,teacher,evaluate,count,emit=None,full_start_max=WORS
         if emit:emit(row)
     return {'status':'full_model_no_compression' if not accepted else 'bounded_site_refinement','masks':current,'start':start,'selected':selected,'attempts':attempts,'accepted_sites':accepted}
 
-def run(repo,payload,out,prior=None):
+def run(repo,payload,out,prior=None,resume=None):
     import torch
     from safetensors.torch import save_file
     sys.path[:0]=[str(repo/'method/oracle'),str(repo/'method/vpd')]
@@ -83,7 +83,8 @@ def run(repo,payload,out,prior=None):
         fixed={n:torch.zeros(len(ids),int(nat.C[n]),dtype=torch.bool) for n in order}
         for n,p,c in nodes:fixed[n][p,c]=True
         prepared[task]=(ids,targets,fixed,report,len(answer.get('nodes',[])))
-    hierarchy=None;prior_results=None;forward_cap=336
+    hierarchy=None;prior_results=None;resume_results=None;forward_cap=336
+    if resume is not None and prior is None:raise ValueError('continuation requires original coarse ranking provenance')
     if prior is not None:
         import claim_hierarchical_teacher as hierarchy
         previous=json.loads((prior/'contract.json').read_text())
@@ -93,9 +94,16 @@ def run(repo,payload,out,prior=None):
             raise ValueError('prior ranking provenance mismatch')
         if set(prior_results)!=set(SELECTED) or any(prior_results[t]['status']!='full_model_no_compression' or len(prior_results[t]['attempts'])!=24 for t in SELECTED):raise ValueError('complete rejected coarse run required')
         forward_cap=432
+        if resume is not None:
+            rc=json.loads((resume/'contract.json').read_text());rd=json.loads((resume/'complete.json').read_text());resume_results=json.loads((resume/'results.json').read_text())
+            if rc['input_provenance']!=contract or rc['executor_commit']!=actual_executor or rc['original_state']!=original_state or rd['restored_state']!=original_state or rc['selected_edits']!=previous['selected_edits'] or rc['hierarchical_policy']['prior_results_sha256']!=sha(prior/'results.json') or set(resume_results)!=set(SELECTED):raise ValueError('continuation provenance mismatch')
+            if any(resume_results[t]['status']!='bounded_hierarchical_refinement' or not resume_results[t]['cap_hit'] or len(resume_results[t]['attempts'])!=32 or max(resume_results[t]['final_direct_kl_bits'])>WORST_KL for t in SELECTED):raise ValueError('first bounded hierarchy completion required')
+            forward_cap=444
     out.mkdir();started=time.monotonic();calls={'dense':0,'sparse':0};summaries={}
     def write(name,value):(out/name).write_text(json.dumps(value,indent=2))
     write('contract.json',{'input_provenance':contract,'executor_commit':actual_executor,'runner_commit':runner_commit,'runner_sha256':sha(__file__),'helper_sha256':sha(Path(__file__).with_name('claim_direct_teacher.py')),'selected_edits':SELECTED,'components_per_site':{n:int(nat.C[n]) for n in order},'source_sha256':{m.__name__:sha(m.__file__) for m in (native,goal_eval,vpd_model,weight_family)},'site_order':order,'max_sites_per_context':24,'max_forwards':forward_cap,'hierarchical_policy':None if hierarchy is None else {'sha256':sha(hierarchy.__file__),'max_new_proposals':32,'prior_contract_sha256':sha(prior/'contract.json'),'prior_results_sha256':sha(prior/'results.json'),'prior_complete_sha256':sha(prior/'complete.json'),'ranking':'inherited rejected direct error per eligible reachable removal; heuristic'},'full_start_integrity_max':FULL_INTEGRITY_MAX,'worst_direct_kl_max':WORST_KL,'live_remainders':True,'mask_links':'all architecture connections; own routing/norms; original teacher edges ignored','teacher_masks':'parsed executable fixed joint_train component nodes; stranded source nodes reported','count_scope':'mask-enabled and output-reachable rank-one placements; backend dense factor arithmetic is not pruned; all24 dense remainder sites stay on; no FLOP claim','remainder_off':'not measured; no remainder-free circuit certificate','original_state':original_state})
+    if resume is not None:
+        write('continuation.json',{'parent_contract_sha256':sha(resume/'contract.json'),'parent_results_sha256':sha(resume/'results.json'),'parent_complete_sha256':sha(resume/'complete.json'),'preserve_all_prior_decisions':True,'new_proposals_per_context':32,'max_forwards':444,'queue':'exact deterministic reconstruction from every accepted/rejected prior decision; no repeated proposals'})
     def clear():
         nat.vpd.clear();nat._refs.clear();nat._refs_bytes=0;nat._rec=(None,None,{});ge._xk.clear();nat.__dict__.pop('_sensitivity_kept',None)
     def kl(p,q):
@@ -138,7 +146,8 @@ def run(repo,payload,out,prior=None):
             rows=prior_results[task]['attempts'];errors={r['site']:r['worst_direct_kl_bits'] for r in rows}
             if set(errors)!=set(order) or any(r['accepted'] or not math.isfinite(errors[r['site']]) or errors[r['site']]<=WORST_KL for r in rows):raise ValueError('invalid prior rejections')
             positions={n:reachable_positions(n,len(ids),targets,nat.target.n_layer) for n in order}
-            result=hierarchy.tensor_refine(order,full,fixed,evaluate,count,emit,positions,errors)
+            previous_result=None if resume_results is None else resume_results[task]
+            result=hierarchy.tensor_refine(order,full,fixed,evaluate,count,emit,positions,errors,None if previous_result is None else previous_result['attempts'],None if previous_result is None else previous_result['recipe'])
         masks=result.pop('masks')
         result.update(parser_report=report,source_teacher_nodes=source_nodes,teacher_executable_placements=sum(int(m.sum()) for m in fixed.values()))
         if masks is not None:
@@ -156,4 +165,5 @@ if __name__=='__main__':
     p=argparse.ArgumentParser()
     for name in ('repo','payload','out'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--prior',type=Path)
-    a=p.parse_args();run(a.repo,a.payload,a.out,a.prior)
+    p.add_argument('--resume',type=Path)
+    a=p.parse_args();run(a.repo,a.payload,a.out,a.prior,a.resume)

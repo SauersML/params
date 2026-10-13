@@ -161,7 +161,7 @@ flowchart BT
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
-  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · FAILED, repair first"}}
+  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · repair landed;<br/>teacher vs start rows pending"}}
 
   %% ===================== workstreams =====================
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
@@ -186,7 +186,7 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>correct copy circuits vs<br/>plausible wrong ones; algorithms<br/>the model does not run must fail<br/>ACTIVE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>bar floor (≥ Φ_empty + 1); unscored = 0;<br/>N guard and clip; eps cap 0.05;<br/>scores clipped at −1; Φ capped at Φ_τ + 1;<br/>gate slope 10, D zero at parity<br/>evidence: toy Gate B repair table<br/>ACTIVE · inframove, primerl"]
+    W4["<b>Reward repair</b><br/>bar floor, unscored = 0 (3277f18);<br/>floored Φ, R − Φ_τ (f5a1df2):<br/>empty, near-empty R < 0 on 60/60<br/>ACTIVE · inframove, primerl"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
     W6["<b>Matched reward controls</b><br/>null-syntax bonus fixed;<br/>retain scored draws to distinguish<br/>response errors from uncertainty<br/>IMPLEMENTED · codex · b84253d"]
   end
@@ -196,7 +196,7 @@ flowchart BT
   TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>reward v3: size breaks ties (1.05 vs 0.65);<br/>VPD fits: 6 of 8 toys done;<br/>next: cancelling pair, mixed binding,<br/>InterpBench circuits<br/>ACTIVE · fleet"]
   TOYB["<b>Gate B on planted toys</b><br/>complete exact circuits pass; incomplete<br/>true routes fail (N ratio unbounded,<br/>own eps added, gate leak, all-actives<br/>at phi ceiling); eps cap + score clip<br/>fixes 3 of 4 (57e44c2) · toyloop"]
   TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo: 350 planted models, 10 families<br/>exec reward ranks truth first on all 350<br/>teacher recovers truth: unit F1 0.99<br/>but influential start alone fails 20%<br/>(content-addressed keys; check final KL)<br/>SFT without input leak running · toyloop"]
-  REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
+  REM["<b>Remainder check</b><br/>remainder carries nothing: point<br/>live = held = off; blocks = all parts<br/>(s_track_pp 0.914 = 0.914)<br/>DONE · inframove"]
   VAR["<b>Variables and invariants</b><br/>kept: 84 input (= whole position),<br/>7 intermediate of 127; m share 0.004;<br/>families beat equal-size nulls 9/9<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
   ENGP["<b>VPD relational mechanisms</b><br/>joint matching restoration fails;<br/>richer A carrier .903: test coverage;<br/>same-site coverage/remainder control ready<br/>CHECK · codex/variable_reward"]
@@ -346,8 +346,8 @@ flowchart BT
   classDef impact fill:#12233f,stroke:#12233f,stroke-width:2px,color:#ffffff
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
-  class VPD,ENG,PHI,W1,W3,I1,I2,T1,SEM done
-  class T2,T3,T5,I4,W2,W4,TOY,TOYLOOP,TOYB,REM,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
+  class VPD,ENG,PHI,W1,W3,I1,I2,T1,SEM,REM done
+  class T2,T3,T5,I4,W2,W4,TOY,TOYLOOP,TOYB,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
   class I5 done
   class I6,W5 done
   class T4 blocked

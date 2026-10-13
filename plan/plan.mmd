@@ -84,12 +84,12 @@ flowchart BT
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
     TXT["<b>Text splits</b><br/>train 6000–7999 · dev 9000–9099<br/>donors 9150–9199<br/>sealed 9100–9149 stays closed"]
-    ENG["<b>Executable-circuit engine</b><br/>path-patched, batched<br/>DONE · monitorbench"]
+    ENG["<b>Executable-circuit engine</b><br/>path-patched, batched, held values,<br/>line deletions in one call<br/>DONE · monitorbench"]
   end
 
   %% ===================== instrumental goals =====================
   subgraph INSTR["INSTRUMENTAL · faster and cheaper everywhere"]
-    SP1["<b>Engine speed</b><br/>seconds per circuit run<br/>and per line deletion<br/>ACTIVE · monitorbench"]
+    SP1["<b>Engine speed</b><br/>724 line deletions × 16 texts 0.28 s;<br/>now arm b's block search,<br/>1.4–1.9 ks per text<br/>ACTIVE · monitorbench"]
     SP2["<b>Teacher throughput</b><br/>minutes and dollars per text<br/>ACTIVE · fleet, pymove"]
     SP3["<b>Scorer throughput</b><br/>seconds per RL sample,<br/>target 20 s or less<br/>ACTIVE · inframove, primerl"]
     SP4["<b>GPU use and cost</b><br/>busy cards, cheapest that fit,<br/>idle pods stopped · fleet"]

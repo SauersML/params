@@ -239,3 +239,149 @@ def independent_head_reference(nat, ids, graph):
         final += write(w)
     logits = rms(final, tg.ln_f) @ tg.wte.T
     return logits.log_softmax(-1)
+
+
+_CONTRACT_V2 = ('%% typed_routes_v2 embeddings=on attention=causal_softmax '
+                'edges=all_architecture_pairs output=target_only')
+_SPAN_ID = re.compile(r'(L(?:0|[1-9]\d*)H(?:0|[1-9]\d*))_([QKVO])_p(0|[1-9]\d*)(?:to(0|[1-9]\d*))?')
+
+
+def _span_members(identifier, target):
+    match = _SPAN_ID.fullmatch(identifier)
+    if not match:
+        raise ValueError(f'unsupported span endpoint: {identifier}')
+    lo, hi = int(match[3]), int(match[4] or match[3])
+    if lo > hi or hi > target or (match[4] is not None and lo == hi):
+        raise ValueError('span must be canonical, increasing and inside input')
+    return tuple(Port(match[1], match[2], p) for p in range(lo, hi + 1))
+
+
+def _span_pairs(writers, readers):
+    # Validate the port relation before expanding: an empty intersection must
+    # never let an unsupported edge (e.g. Q->O) silently disappear.
+    writer, reader = writers[0], readers[0]
+    wl = int(writer.unit.split('H')[0][1:])
+    rl = int(reader.unit.split('H')[0][1:])
+    residual = writer.port == 'O' and reader.port in ('Q', 'K', 'V') and wl < rl
+    value = writer.port == 'V' and reader.port == 'O' and writer.unit == reader.unit
+    if not (residual or value):
+        raise ValueError('unsupported span port relation')
+    pairs = {(w, r) for w in writers for r in readers
+             if (residual and w.position == r.position) or (value and w.position <= r.position)}
+    if not pairs:
+        raise ValueError('span edge has no architecture-valid pairs')
+    return pairs
+
+
+def parse_mermaid_v2(text, *, target):
+    """Expand inclusive port spans losslessly with explicit all-valid-pairs edges.
+
+    Residual edges intersect equal positions; V->O edges retain every causal
+    source/reader pair. O-group->OUT includes only O at the fixed target. These
+    are graph compression operations, not attention restriction or selectors.
+    """
+    if type(target) is not int or target < 0:
+        raise ValueError('target must be a nonnegative integer')
+    lines = [line.strip() for line in text.splitlines()]
+    if len(lines) < 3 or lines[:2] != ['flowchart LR', _CONTRACT_V2]:
+        raise ValueError('missing exact typed v2 header/contract')
+    groups, raw_edges, occupied = {}, [], set()
+    sink = f'OUT_p{target}'
+    for line in lines[2:]:
+        if line == sink or _SPAN_ID.fullmatch(line):
+            if line in groups:
+                raise ValueError('duplicate endpoint declaration')
+            members = () if line == sink else _span_members(line, target)
+            if occupied.intersection(members):
+                raise ValueError('overlapping selected port spans')
+            occupied.update(members)
+            groups[line] = members
+        else:
+            edge = re.fullmatch(r'(\w+) --> (\w+)', line)
+            if not edge:
+                raise ValueError(f'unsupported span syntax: {line}')
+            raw_edges.append(edge.groups())
+    if sink not in groups:
+        raise ValueError('missing explicit output sink')
+    if len(raw_edges) != len(set(raw_edges)):
+        raise ValueError('duplicate span edge')
+    edges, outputs = set(), set()
+    for wid, rid in raw_edges:
+        if wid not in groups or rid not in groups:
+            raise ValueError('undeclared span endpoint')
+        if wid == sink:
+            raise ValueError('output sink cannot be a writer')
+        if rid == sink:
+            selected = {p for p in groups[wid] if p.port == 'O' and p.position == target}
+            if not selected:
+                raise ValueError('output group must include O at target')
+            if outputs.intersection(selected):
+                raise ValueError('duplicate expanded output')
+            outputs.update(selected)
+        else:
+            pairs = _span_pairs(groups[wid], groups[rid])
+            if edges.intersection(pairs):
+                raise ValueError('duplicate expanded edge')
+            edges.update(pairs)
+    key = lambda p: (p.unit, p.port, p.position)
+    return sorted(occupied, key=key), sorted(edges, key=lambda e: (key(e[0]), key(e[1]))), sorted(outputs, key=key)
+
+
+def to_mermaid_v2(ports, edges, outputs, *, target):
+    """Group consecutive positions only while preserving every declared edge.
+
+    Start with maximal spans. If an adjacency between two groups is partial,
+    split both implicated spans into singletons and repeat. This bounded
+    fallback adds no nodes/edges, even for a sparse or irregular input graph.
+    """
+    # Reuse v1's strict validation; v1 serialization preserves every selected port.
+    to_mermaid(ports, edges, outputs, target=target)
+    selected, wanted, out = set(ports), set(edges), set(outputs)
+    by_port = {}
+    for p in selected:
+        if p.position > target:
+            raise ValueError('selected port is outside input')
+        by_port.setdefault((p.unit, p.port), []).append(p)
+    groups = []
+    for key in sorted(by_port):
+        current = []
+        for p in sorted(by_port[key], key=lambda p: p.position):
+            if current and p.position != current[-1].position + 1:
+                groups.append(tuple(current))
+                current = []
+            current.append(p)
+        if current:
+            groups.append(tuple(current))
+    while True:
+        owner = {p: i for i, group in enumerate(groups) for p in group}
+        adjacency = {}
+        for w, r in wanted:
+            adjacency.setdefault((owner[w], owner[r]), set()).add((w, r))
+        split = set()
+        for (wi, ri), stated in adjacency.items():
+            if stated != _span_pairs(groups[wi], groups[ri]):
+                split.update(i for i in (wi, ri) if len(groups[i]) > 1)
+        if not split:
+            break
+        groups = [part for i, group in enumerate(groups)
+                  for part in ([(p,) for p in group] if i in split else [group])]
+    def name(group):
+        first, last = group[0], group[-1]
+        prefix = _port_id(first)
+        return prefix if len(group) == 1 else prefix + f'to{last.position}'
+    ids = [name(group) for group in groups]
+    sink = f'OUT_p{target}'
+    lines = ['flowchart LR', _CONTRACT_V2] + ids + [sink]
+    lines += [f'{ids[wi]} --> {ids[ri]}' for wi, ri in sorted(adjacency)]
+    owner = {p: i for i, group in enumerate(groups) for p in group}
+    lines += [f'{ids[owner[p]]} --> {sink}' for p in sorted(out, key=lambda p: (p.unit, p.port, p.position))]
+    text = '\n'.join(lines) + '\n'
+    expanded = parse_mermaid_v2(text, target=target)
+    if (set(expanded[0]), set(expanded[1]), set(expanded[2])) != (selected, wanted, out):
+        raise ValueError('span serialization cannot preserve exact graph')
+    return text
+
+
+def compile_mermaid_v2(nat, length, text):
+    """Compile explicit lossless spans for the actual input, preserving v1 API."""
+    return compile_graph(nat, length, *parse_mermaid_v2(text, target=length - 1))

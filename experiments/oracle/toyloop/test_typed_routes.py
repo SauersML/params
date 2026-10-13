@@ -143,3 +143,80 @@ def test_point_sufficient_route_can_fail_matched_literal_weight_edit(fixture):
             assert torch.equal(getattr(st, key), value), key
         torch.testing.assert_close(full(), baseline, atol=0, rtol=0)
         torch.testing.assert_close(nat.reference([ids], [target])[0, -1], baseline, atol=1e-6, rtol=1e-6)
+
+
+def test_v2_spans_exact_dense_on_path_roundtrip_and_execution(fixture):
+    import native
+    nat, ids = fixture
+    ports = [routes.Port('L0H3', kind, t) for kind in 'QKVO' for t in range(13)]
+    ports += [routes.Port('L1H1', kind, t) for kind in 'KV' for t in range(13)]
+    ports += [routes.Port('L1H1', kind, 12) for kind in 'QO']
+    edges = []
+    for w in ports:
+        for r in ports:
+            try:
+                routes._typed_edge(w, r)
+            except ValueError:
+                continue
+            edges.append((w, r))
+    outputs = [routes.Port(unit, 'O', 12) for unit in ('L0H3', 'L1H1')]
+    text = routes.to_mermaid_v2(ports, edges, outputs, target=12)
+    assert 'L0H3_K_p0to12' in text and 'L1H1_Q_p12' in text
+    assert len(text.splitlines()) <= 20
+    one = routes.compile_graph(nat, len(ids), ports, edges, outputs)
+    two = routes.compile_mermaid_v2(nat, len(ids), text)
+    assert set(one.nodes) == set(two.nodes)
+    assert {r: set(ws) for r, ws in one.parents.items()} == {r: set(ws) for r, ws in two.parents.items()}
+    assert set(one.out) == set(two.out)
+    assert one.count() == 400 and one.edges() == 9621
+    with torch.no_grad():
+        run = lambda graph: nat.run(ids, [12], nat._plan([graph], len(ids)), *nat._zero())
+        torch.testing.assert_close(run(one), run(two), atol=0, rtol=0)
+    # v1 sparse hypotheses also roundtrip: partial adjacency falls back losslessly.
+    for mid, port in [(10, 'V'), (11, 'V'), (10, 'K')]:
+        spec = routes.multihop_ports('L0H3', 'L1H1', 9, mid, 12, downstream_port=port)
+        expanded = routes.parse_mermaid_v2(routes.to_mermaid_v2(*spec, target=12), target=12)
+        assert tuple(map(set, expanded)) == tuple(map(set, spec))
+        graph = routes.compile_mermaid_v2(nat, len(ids), routes.to_mermaid_v2(*spec, target=12))
+        with torch.no_grad():
+            torch.testing.assert_close(run(graph), run(routes.compile_graph(nat, len(ids), *spec)), atol=0, rtol=0)
+
+
+def test_v2_partial_adjacency_falls_back_without_added_edges():
+    ports = [routes.Port('L0H3', 'V', t) for t in range(3)] + [routes.Port('L0H3', 'O', 2)]
+    edges = [(ports[1], ports[-1])]
+    text = routes.to_mermaid_v2(ports, edges, [ports[-1]], target=2)
+    got = routes.parse_mermaid_v2(text, target=2)
+    assert set(got[0]) == set(ports) and set(got[1]) == set(edges)
+    assert 'V_p0to2' not in text
+
+
+@pytest.mark.parametrize('extra', [
+    'L0H3_K_p1',  # overlap
+    'L0H3_K_p0to12',  # duplicate
+    'L0H3_K_p13',  # outside actual input
+    'L0H3_K_p12to0',
+    'L0H3_K_p2to2',
+    'tok29_ROOT_p9',
+    'L0H3_Q_p0to12 --> L0H3_O_p0to12',
+    'L1H1_O_p12 --> L0H3_K_p0to12',
+    'L0H3_V_p0to12 -->|restrict| L0H3_O_p0to12',
+])
+def test_v2_rejects_overlap_bounds_and_unsupported_relations(extra):
+    ports = [routes.Port('L0H3', kind, t) for kind in 'QKVO' for t in range(13)]
+    ports += [routes.Port('L1H1', 'O', 12)]
+    text = routes.to_mermaid_v2(ports, [], [], target=12)
+    with pytest.raises(ValueError):
+        routes.parse_mermaid_v2(text + extra + '\n', target=12)
+
+
+def test_v2_rejects_empty_pair_expansion_and_duplicate_edges():
+    header = 'flowchart LR\n' + routes._CONTRACT_V2 + '\n'
+    for text in [
+        header + 'L0H3_O_p0\nL1H1_V_p1\nOUT_p2\nL0H3_O_p0 --> L1H1_V_p1\n',
+        header + 'L0H3_Q_p0\nL0H3_O_p1\nOUT_p2\nL0H3_Q_p0 --> L0H3_O_p1\n',
+        header + 'L0H3_V_p0to1\nL0H3_O_p2\nOUT_p2\n'
+        + 'L0H3_V_p0to1 --> L0H3_O_p2\n' * 2,
+    ]:
+        with pytest.raises(ValueError):
+            routes.parse_mermaid_v2(text, target=2)

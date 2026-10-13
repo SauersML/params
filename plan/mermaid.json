@@ -1,4 +1,9 @@
 {
+  "layout": "elk",
+  "elk": {
+    "mergeEdges": false,
+    "nodePlacementStrategy": "NETWORK_SIMPLEX"
+  },
   "theme": "base",
   "themeVariables": {
     "fontFamily": "Inter, 'Helvetica Neue', 'DejaVu Sans', Arial, sans-serif",

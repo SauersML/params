@@ -66,7 +66,7 @@ flowchart BT
     I2["<b>Context fit</b><br/>trims 52 of 444 questions,<br/>hiding 21% of their targets<br/>DONE"]
     I3["<b>Coverage audit</b><br/>old prompts showed 14% of targets;<br/>all target IDs remain expressible;<br/>recheck each new rendered format<br/>codex, rustmove"]
     I4["<b>Learnability grid</b><br/>which input lets subcomponent<br/>effects be learned?<br/>ACTIVE · rustmove"]
-    I5["<b>Complete tool observations</b><br/>paginate candidate listings;<br/>no teacher-derived input hints<br/>ACTIVE · codex/eval_recovery"]
+    I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
   end
 
   subgraph REWARD["REWARD · primerl, inframove, generality, codex"]
@@ -84,12 +84,12 @@ flowchart BT
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
     TXT["<b>Text splits</b><br/>train 6000–7999 · dev 9000–9099<br/>donors 9150–9199<br/>sealed 9100–9149 stays closed"]
-    ENG["<b>Executable-circuit engine</b><br/>path-patched, batched, held values,<br/>line deletions in one call<br/>DONE · monitorbench"]
+    ENG["<b>Executable-circuit engine</b><br/>path-patched, batched<br/>DONE · monitorbench"]
   end
 
   %% ===================== instrumental goals =====================
   subgraph INSTR["INSTRUMENTAL · faster and cheaper everywhere"]
-    SP1["<b>Engine speed</b><br/>724 line deletions × 16 texts 0.28 s;<br/>now arm b's block search,<br/>1.4–1.9 ks per text<br/>ACTIVE · monitorbench"]
+    SP1["<b>Engine speed</b><br/>seconds per circuit run<br/>and per line deletion<br/>ACTIVE · monitorbench"]
     SP2["<b>Teacher throughput</b><br/>minutes and dollars per text<br/>ACTIVE · fleet, pymove"]
     SP3["<b>Scorer throughput</b><br/>seconds per RL sample,<br/>target 20 s or less<br/>ACTIVE · inframove, primerl"]
     SP4["<b>GPU use and cost</b><br/>busy cards, cheapest that fit,<br/>idle pods stopped · fleet"]
@@ -195,7 +195,8 @@ flowchart BT
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
   class VPD,ENG,PHI,W1,W3,I1,I2,T1,k1 done
-  class T2,T3,T5,I4,I5,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3,k2 active
+  class T2,T3,T5,I4,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3,k2 active
+  class I5 done
   class I3,S2,SUP,LAT1,k8 check
   class T4,GATEB,k3 blocked
   class S3,ORC,R1,R2,R3,R4,R5,k4 waiting

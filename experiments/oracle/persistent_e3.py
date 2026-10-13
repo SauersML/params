@@ -24,6 +24,7 @@ restricted net (as a share of the unconstrained net) above the random sets' and 
   persistent_e3.py edit PREFS.jsonl OUT.jsonl [--steps 200] [--device cuda] [--offset K --stride S]   delete the preference:
                      the circuit's edit, VPD's top k, a fine-tune of the same rank (practical())
   persistent_e3.py table OUT.jsonl [--edit]
+  persistent_e3.py summary ROWS.jsonl ... [--figure PNG]     means with 95% intervals, paired differences, the figure
 """
 from __future__ import annotations
 
@@ -648,6 +649,89 @@ def practical_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+T95 = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571, 7: 2.447, 8: 2.365, 9: 2.306, 10: 2.262, 11: 2.228, 12: 2.201,
+       13: 2.179, 14: 2.160, 15: 2.145, 16: 2.131, 20: 2.093, 30: 2.045}
+PAIRS = (("circuit_ft_spec", "circuit_ft"), ("circuit_ft_spec", "finetune_sites"), ("circuit_ft", "finetune_sites"),
+         ("circuit_ft", "finetune"), ("circuit_ft_spec", "finetune"), ("circuit_ft", "random_ft"), ("circuit_edit", "random_active"))
+
+
+def summary(rows: list[dict], figure: str | None = None) -> str:
+    """Per method over the preferences (several runs of one preference merged; a method's draws averaged): the mean and
+    95% t-interval of removal (flipped), Pile KL per token, KL on the rows and controls kept; per pair (PAIRS) the
+    paired differences (Pile KL as log10 ratios); figure: removal against Pile KL, a point per preference and each
+    method's mean with its 95% intervals."""
+    import statistics as st
+
+    prefs = {}
+    for r in rows:
+        prefs.setdefault((r["a"], r["b"]), {}).update(r["methods"])
+    keys = ("flipped", "pile_kl_per_token", "text_kl_per_token", "controls_kept")
+
+    def per(m):
+        out = {}
+        for pk, ms in prefs.items():
+            got = [v["score"] for k, v in ms.items() if k == m or (k.startswith(m + "_") and k[len(m) + 1:].isdigit())]
+            if got:
+                out[pk] = {x: st.mean((g[x] if g[x] is not None else 0.0) for g in got) for x in keys}
+        return out
+
+    def ci(xs):
+        n = len(xs)
+        h = T95.get(n, 2.0) * st.stdev(xs) / math.sqrt(n) if n > 1 else float("nan")
+        return st.mean(xs), h
+
+    methods = [m for m in ("circuit_ft_spec", "circuit_ft", "finetune_sites", "finetune", "circuit_edit", "circuit_scales", "random_ft",
+                           "random_scales", "random_active", "random_equal", "random_any", "vpd_topk") if per(m)]
+    lines = [f"{'method':16s} n   removed        Pile KL/token            text KL/token   controls kept"]
+    for m in methods:
+        d = per(m)
+        f, pk, tk, kp = (ci([v[x] for v in d.values()]) for x in keys)
+        lines.append(f"{m:16s} {len(d):2d}  {f[0]:.2f} ± {f[1]:.2f}   {pk[0]:.2e} ± {pk[1]:.1e}   {tk[0]:.1e}         {kp[0]:.2f} ± {kp[1]:.2f}")
+    lines.append("paired (first - second, 95% CI over preferences): removal; log10 Pile KL (ratio); controls kept")
+    for a, b in PAIRS:
+        da, db = per(a), per(b)
+        common = [k for k in da if k in db]
+        if len(common) < 2:
+            continue
+        fr = ci([da[k]["flipped"] - db[k]["flipped"] for k in common])
+        lp = ci([math.log10(max(da[k]["pile_kl_per_token"], 1e-6)) - math.log10(max(db[k]["pile_kl_per_token"], 1e-6)) for k in common])
+        kp = ci([da[k]["controls_kept"] - db[k]["controls_kept"] for k in common])
+        lines.append(f"  {a} - {b} (n {len(common)}): removal {fr[0]:+.2f} ± {fr[1]:.2f}; Pile log10 {lp[0]:+.2f} ± {lp[1]:.2f} "
+                     f"(x{10 ** lp[0]:.2f}); kept {kp[0]:+.2f} ± {kp[1]:.2f}")
+    if figure:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        style = {"circuit_ft_spec": ("fine-tune inside the circuit's span, controls' span removed", "#1a73e8", "o"),
+                 "circuit_ft": ("fine-tune inside the circuit's span", "#1e8e3e", "o"),
+                 "finetune_sites": ("fine-tune at the same matrices, unrestricted", "#202124", "s"),
+                 "finetune": ("fine-tune at one best matrix", "#80868b", "s"),
+                 "random_ft": ("fine-tune inside a random span", "#e37400", "o")}
+        plt.rcParams.update({"font.size": 15})
+        fig, ax = plt.subplots(figsize=(12, 7.5))
+        for m, (label, c, mk) in style.items():
+            d = per(m)
+            if not d:
+                continue
+            xs = [max(v["pile_kl_per_token"], 1e-5) for v in d.values()]
+            ys = [v["flipped"] for v in d.values()]
+            ax.scatter(xs, ys, color=c, marker=mk, s=36, alpha=0.3)
+            lx = [math.log10(x) for x in xs]
+            (mx, hx), (my, hy) = ci(lx), ci(ys)
+            ax.errorbar([10 ** mx], [my], yerr=[[hy], [hy]], xerr=[[10 ** mx - 10 ** (mx - hx)], [10 ** (mx + hx) - 10 ** mx]], color=c,
+                        marker=mk, ms=11, lw=2, capsize=4, label=label)
+        ax.set_xscale("log")
+        ax.set_xlabel("collateral: KL on held-out Pile text (bits per token)")
+        ax.set_ylabel("preference removed on held-out text (share)")
+        ax.set_ylim(0, 1.08)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(frameon=False, fontsize=12, loc="lower left")
+        fig.tight_layout()
+        fig.savefig(figure, dpi=150, facecolor="white")
+    return "\n".join(lines)
+
+
 def table(rows: list[dict]) -> str:
     """Per preference and site the score third's net (per position of text) of each set as a share of the
     unconstrained fit's, its flipped share and controls kept; then the gate: the circuit's share above every control's,
@@ -708,8 +792,13 @@ def main():
     t = sub.add_parser("table")
     t.add_argument("rows")
     t.add_argument("--edit", action="store_true", help="edit's rows (practical_table)")
+    su = sub.add_parser("summary")
+    su.add_argument("rows", nargs="+", help="edit runs' rows (several runs of one preference merged)")
+    su.add_argument("--figure")
     args = ap.parse_args()
     read = lambda x: [json.loads(y) for y in Path(x).read_text().splitlines() if y.strip()]  # noqa: E731
+    if args.cmd == "summary":
+        return print(summary([r for f in args.rows for r in read(f)], args.figure))
     if args.cmd == "table":
         return print(practical_table(read(args.rows)) if args.edit else table(read(args.rows)))
     import components

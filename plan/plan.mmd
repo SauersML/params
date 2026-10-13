@@ -1,8 +1,9 @@
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
 %% Read bottom to top: foundations, workstreams, decision gates, training, capabilities, impact.
-%% An arrow means "is needed for". Dashed arrows: a check feeds in, or a fallback route.
+%% Solid arrows are artifact dependencies; dashed arrows are feedback or optional inputs.
 %% One unit per box. Never put a sequence or an arrow inside a box: split it into boxes and edges.
 %% Parallel by default: only gate B (a trustworthy reward) blocks anything (RL). Checks compare, never wait.
+%% Consume passing data shards immediately. No lane waits for all 444 teachers or every other skill.
 %% Each box: bold title, why or what it decides (1-2 lines), status and owner. About 34 characters
 %% a line, explicit <br/> breaks, 3-5 lines.
 %% Before starting work: find its box, claim it (owner), set its class. When a gate passes or fails,
@@ -30,7 +31,7 @@ flowchart BT
   end
 
   %% ===================== training =====================
-  ORC["<b>Trained oracle</b><br/>must beat the frozen SFT model<br/>on independent dev texts;<br/>a rising reward alone is not success<br/>WAITING"]
+  ORC["<b>Incremental skill integration</b><br/>add each successful arm when ready;<br/>compare with frozen SFT on dev texts;<br/>a rising reward alone is not success<br/>primerl"]
 
   subgraph RLS["RL ARMS IN PARALLEL · primerl · blocked only by gate B"]
     R1["<b>RL · circuits</b><br/>faithfulness gate and size"]
@@ -41,10 +42,11 @@ flowchart BT
   end
 
   TOOLS["<b>Search route, in parallel</b><br/>teacher circuits plus variables,<br/>English and executed answers;<br/>no learned oracle needed<br/>ACTIVE · primerl, varteach, codex"]
+  SUP["<b>Verified behavior supervision</b><br/>English, QA and edit targets from<br/>existing circuits or planted mechanisms;<br/>no trained circuit policy required<br/>READY · varteach, rustmove, primerl"]
   GATEC{{"<b>Check C</b> · does learning add value?<br/>SFT arms vs trivial baselines and<br/>the search route on dev texts;<br/>picks the RL starting point"}}
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
     S1["<b>SFT · influential starts</b><br/>targets that already hold<br/>on held-out changes<br/>STARTING"]
-    S2["<b>SFT · pruned v2</b><br/>smaller targets from<br/>discriminating-draw pruning<br/>WAITING on T4"]
+    S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
@@ -56,14 +58,15 @@ flowchart BT
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
     T3["<b>Pruning, discriminating draws</b><br/>why: fixed-draw pruning overfit<br/>(held-out 0.34 vs 0.88)<br/>ACTIVE · pymove"]
     T4["<b>Teacher circuits v2</b><br/>444 train + 50 held-out texts<br/>waits on T3; launches pm7 and v2<br/>when text9002 eval pp ≥ 0.85<br/>BLOCKED · fleet"]
-    T5["<b>Context-blocks teacher</b><br/>keeps context as blocks, prunes<br/>only the target: cannot overfit<br/>context changes · pymove"]
+    T5["<b>Context-blocks teacher</b><br/>keeps context as blocks, prunes<br/>only the target; test transfer<br/>to unseen changes · pymove"]
   end
 
   subgraph INPUTS["ORACLE INPUT · codex, rustmove, primerl"]
-    I1["<b>Candidate list</b><br/>VPD actives at listed positions<br/>covers 96% of teacher nodes<br/>DONE"]
+    I1["<b>Candidate list</b><br/>VPD actives at listed positions;<br/>coverage depends on task and trimming<br/>IMPLEMENTED"]
     I2["<b>Context fit</b><br/>trims 52 of 444 questions,<br/>hiding 21% of their targets<br/>DONE"]
-    I3["<b>Coverage audit</b><br/>old prompts showed 14% of targets;<br/>measure coverage after fitting<br/>CHECK · codex, rustmove"]
+    I3["<b>Coverage audit</b><br/>old prompts showed 14% of targets;<br/>all target IDs remain expressible;<br/>recheck each new rendered format<br/>codex, rustmove"]
     I4["<b>Learnability grid</b><br/>which input lets subcomponent<br/>effects be learned?<br/>ACTIVE · rustmove"]
+    I5["<b>Complete tool observations</b><br/>paginate candidate listings;<br/>no teacher-derived input hints<br/>ACTIVE · codex/eval_recovery"]
   end
 
   subgraph REWARD["REWARD · primerl, inframove, generality, codex"]
@@ -94,13 +97,13 @@ flowchart BT
   end
 
   %% ===================== later =====================
-  LAT1["<b>After gate C</b><br/>native-units comparison<br/>weight-edit test<br/>mechanism-library coverage · MNIST"]
+  LAT1["<b>Parallel transfer diagnostics</b><br/>native units, libraries, weight edits;<br/>MNIST, latency and memory<br/>READY · generality, monitorbench"]
   UVPD["<b>The user's VPD of a real model</b><br/>not yet available"]
   LAT2["<b>Real-model track</b><br/>model organisms<br/>safety-relevant questions"]
 
   %% ===================== edges: the main chain (links 0-7, thick) =====================
   T1 --> S1
-  T4 --> S2
+  T4 -- each passing shard --> S2
   T5 --> S3
   S1 --> GATEC
   S2 --> GATEC
@@ -109,11 +112,11 @@ flowchart BT
   GATEB -- pass --> RLS
 
   %% ===================== edges: to the top (links 8-19) =====================
-  RLS --> ORC
+  RLS -. each successful arm .-> ORC
   ORC --> C1
   ORC --> C2
   ORC --> C3
-  C1 --> C4
+  LAT1 --> C4
   C1 --> GATED
   C2 --> GATED
   C3 --> GATED
@@ -132,12 +135,22 @@ flowchart BT
   I1 --> I2
   I2 --> I3
   I3 --> S1
+  I3 -. identifies missing observations .-> I5
+  I5 --> TOOLS
   I4 -. sets the format .-> I1
   W1 --> GATEB
   W2 -. tests .-> GATEB
   W3 -. found the failure .-> W4
   W4 --> GATEB
-  T4 --> TOOLS
+  ENG --> TOOLS
+  T1 -. available circuits .-> TOOLS
+  T4 -. new circuits .-> TOOLS
+  TOY -. planted circuits .-> SUP
+  T1 -. existing circuits .-> SUP
+  ENG --> SUP
+  SUP --> C2
+  SUP --> C3
+  SUP -. ready-made supervision .-> RLS
   TOOLS --> C1
   TOOLS --> C2
   TOOLS --> C3
@@ -153,7 +166,12 @@ flowchart BT
   ENG --> I4
   ENG --> TOY
   ENG --> REM
-  GATEC -.-> LAT1
+  ENG --> LAT1
+  SP1 -. accelerates .-> ENG
+  SP2 -. accelerates .-> T4
+  SP3 -. lowers sample cost .-> RLS
+  SP4 -. stretches compute budget .-> TEACHER
+  SP5 -. validates execution .-> ENG
   UVPD --> LAT2
   LAT2 -.-> C4
 
@@ -177,15 +195,14 @@ flowchart BT
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
   class VPD,ENG,PHI,W1,W3,I1,I2,T1,k1 done
-  class T2,T3,T5,I4,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3,k2 active
-  class I3,k8 check
+  class T2,T3,T5,I4,I5,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3,k2 active
+  class I3,S2,SUP,LAT1,k8 check
   class T4,GATEB,k3 blocked
-  class S2,S3,ORC,R1,R2,R3,R4,R5,k4 waiting
-  class LAT1,LAT2,UVPD,k6 later
+  class S3,ORC,R1,R2,R3,R4,R5,k4 waiting
+  class LAT2,UVPD,k6 later
   class GATEA,GATEC,GATED,k5 gate
   class C1,C2,C3,C4,DELIV goal
   class IMPA,IMPP impact
   class TXT,SP4,SP5,k7 note
 
-  linkStyle 0,1,2,3,4,5,6,7 stroke:#d93025,stroke-width:4px
-  linkStyle 8,9,10,11,12,13,14,15,16,17,18,19 stroke:#8430ce,stroke-width:2.5px
+  %% Avoid link-number critical paths: new parallel edges must not recolor unrelated dependencies.

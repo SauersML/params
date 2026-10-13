@@ -200,8 +200,10 @@ def predict(draws: int):
     template alone: (1) a new token z at a (a sample from the model's prediction there, never one of its three likeliest,
     which chose the texts) becomes the prediction (the model's likeliest token at t is z), and at least raises z's
     probability above the old prediction's; (2) a new token at o (the earlier occurrence of the current token) breaks
-    the copy: log p(old prediction) falls by at least 1 nat; (3) a new token at a position outside t, a and o (and
-    outside the template's roles) leaves the prediction: the likeliest token unchanged."""
+    the copy: log p(old prediction) falls by at least 1 nat, and so does a new token at every earlier occurrence of the
+    current token (a copy may read any of them); a new token after every earlier occurrence becomes the prediction; (3) a
+    new token at a position outside t, a and o (and outside the template's roles) leaves the prediction: the likeliest
+    token unchanged."""
     import goal_eval
     import native
     import torch
@@ -238,6 +240,37 @@ def predict(draws: int):
                     drop = float(base[y] - l[y])
                     rec["o"].append([z, drop])
                     acc["o: copy breaks (log p(y) falls >= 1 nat)"].append(drop >= 1.0)
+        occ = [j for j in range(t) if ids[j] == ids[t]]
+        rec["occurrences"] = len(occ)
+        zs = [z for z in ge._fresh_sources(tx, o, int(tx.seed) + 7) if z != ids[t]][:draws]
+        xs = []
+        for z in zs:  # every earlier occurrence of the current token replaced by z
+            x2 = list(ids)
+            for j in occ:
+                x2[j] = z
+            xs.append(x2)
+        lp = nat.reference(xs, [t])[:, 0] if xs else []
+        rec["o_all"] = []
+        for z, l in zip(zs, lp):
+            drop = float(base[y] - l[y])
+            rec["o_all"].append([z, drop])
+            acc["every earlier occurrence: copy breaks (log p(y) falls >= 1 nat)"].append(drop >= 1.0)
+            acc[f"every earlier occurrence, {'one' if len(occ) == 1 else 'two or more'} occurrence(s): copy breaks"].append(drop >= 1.0)
+        for z, d in rec["o"]:
+            acc[f"o, {'one' if len(occ) == 1 else 'two or more'} occurrence(s): copy breaks"].append(d >= 1.0)
+        aft = [j + 1 for j in occ if j + 1 < t]
+        zs = ge._fresh_sources(tx, a, int(tx.seed) + 9)[:draws]
+        xs = []
+        for z in zs:  # the token after every earlier occurrence replaced by z
+            x2 = list(ids)
+            for j in aft:
+                x2[j] = z
+            xs.append(x2)
+        lp = nat.reference(xs, [t])[:, 0]
+        rec["a_all"] = []
+        for z, l in zip(zs, lp):
+            rec["a_all"].append([z, int(l.argmax()) == z])
+            acc["after every earlier occurrence: prediction becomes z"].append(int(l.argmax()) == z)
         rng = np.random.default_rng(int(tx.seed))
         others = [q for q in range(1, t) if q not in (a, o)]
         for q in rng.choice(others, size=min(draws, len(others)), replace=False).tolist():
@@ -268,7 +301,7 @@ def report():
                 key = r["name"] if r["kind"] in ("template", "vpd") else r["kind"]
                 by[r["task"]].setdefault(key, r)
     held = {x["task"] for x in json.loads((DATA / "copy_heldout.json").read_text())["copy"]}
-    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_patching_near", "s_patching_far", "c5", "bits")
+    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_donor_near", "s_donor_far", "c5", "bits")
     kinds = list(NAMES) + ["influential_blocks", "teacher", "vpd_listed", "vpd_expanded"]
     out = {}
     for group, tasks in (("held-out copy texts", [t for t in by if t in held]), ("copy texts with teacher circuits", [t for t in by if t not in held])):

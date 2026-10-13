@@ -269,7 +269,7 @@ def annotate():
     beside them the same texts' influential-blocks start and VPD's top k at the template's listed size."""
     import copy_template
 
-    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_patching_near", "s_patching_far", "c5", "bits")
+    terms = ("s_point_c", "s_wiring", "s_track_pp", "s_interchange_pp", "s_interchange", "s_donor_near", "s_donor_far", "c5", "bits")
     mean = lambda rs, m: (float(np.mean([r[m] for r in rs if r.get(m) is not None])) if any(r.get(m) is not None for r in rs) else None)  # noqa: E731
     lib = json.loads((DATA / "library_texts.json").read_text())
     rows = []
@@ -323,7 +323,7 @@ def report():
                 if key not in seen:
                     seen.add(key)
                     rows.append(r)
-    terms = ("s_point_c", "s_track_pp", "s_interchange_pp", "s_patching_near", "s_patching_far", "c5")
+    terms = ("s_point_c", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far", "c5")
     for f, info in lib.items():
         if f.startswith("_"):
             continue
@@ -331,9 +331,16 @@ def report():
         if not rs:
             continue
         print(f"== {f}  rule {info['rule']}  held-out texts {len({r['task'] for r in rs})}")
+        big = {r["task"]: r for r in rs if r["kind"] == "template" and r["family"] == f and r["variant"] == "context"}
         for kind, variant in [("template", v) for v in ("core", "carriers", "context")] + [("influential_blocks", None), ("vpd", "listed"), ("vpd", "expanded")]:
-            sel = [r for r in rs if r["kind"] == kind and (kind != "template" or (r["family"] == f and r["variant"] == variant))
-                   and (kind != "vpd" or variant in r["variant"])]
+            if kind == "vpd":  # VPD's top k at this family's largest template's size on that text
+                size = "listed" if variant == "listed" else "nodes"
+                sel = [r for r in rs if r["kind"] == "vpd" and r["task"] in big and r["nodes"] == min(big[r["task"]][size], r["nodes"] + 0)
+                       and r["variant"].startswith(f"vpd@{big[r['task']][size]} ")]
+                sel = list({r["task"]: r for r in sel}.values())
+            else:
+                sel = [r for r in rs if r["kind"] == kind and (kind != "template" or (r["family"] == f and r["variant"] == variant))
+                       and r["task"] in big]
             if sel:
                 print(f"   {kind + (':' + variant if variant else ''):24s} " + "  ".join(
                     f"{m} {np.mean([r[m] for r in sel if r[m] is not None]):.2f}" for m in terms if any(r[m] is not None for r in sel))

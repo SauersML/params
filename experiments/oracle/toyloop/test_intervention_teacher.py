@@ -10,6 +10,24 @@ import intervention_teacher as teacher
 import reward_exec
 
 
+def test_batch_rejects_case_substitution_and_changed_work_bound():
+    import copy
+    import intervention_teacher_batch as batch
+    worlds = (76, 156, 76, 76, 92, 100, 92, 84)
+    protocol = {"models": [{"case": case, "worlds": count, "max_attempts": 64,
+                            "forward_cap": 69 * count}
+                           for case, count in zip(batch.CASES, worlds)]}
+    assert len(batch.validate_protocol(protocol)) == 8
+    changed = copy.deepcopy(protocol)
+    changed["models"][0]["case"] = "gate_000"
+    with pytest.raises(RuntimeError, match="IDs/order"):
+        batch.validate_protocol(changed)
+    changed = copy.deepcopy(protocol)
+    changed["models"][0]["max_attempts"] = 65
+    with pytest.raises(RuntimeError, match="work bounds"):
+        batch.validate_protocol(changed)
+
+
 def fixture_cache():
     weight = torch.tensor([[2., -2.]])
     site = SimpleNamespace(W=weight, U=weight.T.clone(), V=torch.eye(2),

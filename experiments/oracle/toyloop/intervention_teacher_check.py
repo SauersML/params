@@ -19,7 +19,9 @@ def main():
     parser = argparse.ArgumentParser()
     for name in ("source", "payload", "reward-source", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
-    parser.add_argument("--case", choices=("redundant_000", "cancel_001", "gate_000"), default="redundant_000")
+    parser.add_argument("--case", default="redundant_000")
+    parser.add_argument("--preflight", type=Path)
+    parser.add_argument("--exclude-zero-mlp-routes", action="store_true")
     args = parser.parse_args()
     if args.out.exists():
         raise RuntimeError("do not overwrite frozen search")
@@ -41,18 +43,34 @@ def main():
     spec.loader.exec_module(reward)
     sys.path.insert(0, str(here))
     import intervention_teacher as teacher
-    protocol = json.loads((args.payload / "protocol.json").read_text())
-    for name, expected in protocol["files"].items():
-        if hashlib.sha256((args.payload / name).read_bytes()).hexdigest() != expected:
-            raise RuntimeError("frozen TRAIN fixture changed")
     ident = args.case
-    expected_worlds = {"redundant_000": 84, "cancel_001": 76, "gate_000": 100}[ident]
+    if args.preflight:
+        protocol = json.loads(args.preflight.read_text())
+        matches = [row for row in protocol["models"] if row["case"] == ident]
+        if len(matches) != 1:
+            raise RuntimeError("case absent from frozen preflight")
+        receipt = matches[0]
+        root = args.payload / ident
+        for suffix, key in ((".pt", "weight_sha256"), (".json", "record_sha256")):
+            if hashlib.sha256((root / (ident + suffix)).read_bytes()).hexdigest() != receipt[key]:
+                raise RuntimeError("frozen batch fixture changed")
+        expected_worlds = receipt["worlds"]
+    else:
+        protocol = json.loads((args.payload / "protocol.json").read_text())
+        for name, expected in protocol["files"].items():
+            if hashlib.sha256((args.payload / name).read_bytes()).hexdigest() != expected:
+                raise RuntimeError("frozen TRAIN fixture changed")
+        expected_worlds = {"redundant_000": 84, "cancel_001": 76, "gate_000": 100}[ident]
+        root = args.payload / "cases" / ident
     forward_cap = 69 * expected_worlds  # 3 setup +64 candidate +2 final crosscheck.
-    root = args.payload / "cases" / ident
     record = json.loads((root / (ident + ".json")).read_text())
-    texts = [list(example["ids"]) for example in record["examples"]]
+    examples = ([example for example in record["examples"] if example["kind"] == "ordinary"][:4]
+                if args.preflight else record["examples"])
+    texts = [list(example["ids"]) for example in examples]
+    if args.preflight and texts != receipt["ordinary_inputs"]:
+        raise RuntimeError("frozen ordinary inputs changed")
     if record["split"] != "train" or len(texts) != 4 or any(
-            example["target"] != len(example["ids"]) - 1 for example in record["examples"]):
+            example["target"] != len(example["ids"]) - 1 for example in examples):
         raise RuntimeError("fixed TRAIN input scope changed")
     files = [Path(__file__), args.reward_source, here / "intervention_teacher.py",
              here / "reward_interventions.py", here / "head_counterfactual.py", here / "render.py"]
@@ -62,7 +80,8 @@ def main():
         "selection": "architecture-first original nonzero pieces; no teacher truth",
         "executor": "cd8d4a9c2dfc0d3b28bc6604e0549e16aceb3aa4",
         "source_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files},
-        "payload_protocol_sha256": hashlib.sha256((args.payload / "protocol.json").read_bytes()).hexdigest(),
+        "exclude_zero_mlp_routes": args.exclude_zero_mlp_routes,
+        "payload_protocol_sha256": hashlib.sha256((args.preflight or args.payload / "protocol.json").read_bytes()).hexdigest(),
     })
     toy = render.from_zoo({"weights": ident + ".pt", "record": ident + ".json"}, root)
     nat = planted.native_of(toy.sd, toy.cfg)
@@ -90,7 +109,8 @@ def main():
     def attempt(row):
         attempts.append(row)
         write_json(args.out / "attempts.json", attempts)
-    result = teacher.search_teacher(toy, nat=nat, texts=texts, attempt_sink=attempt, evidence_sink=retain)
+    result = teacher.search_teacher(toy, nat=nat, texts=texts, attempt_sink=attempt, evidence_sink=retain,
+                                    exclude_zero_mlp_routes=args.exclude_zero_mlp_routes)
     restored = teacher.binding(toy, nat, texts, [])
     if before != restored:
         raise RuntimeError("search did not restore source state")

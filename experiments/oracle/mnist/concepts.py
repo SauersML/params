@@ -12,8 +12,9 @@ Vocabulary: binary stroke features of an image, computed from its ink (pixels > 
 Naming: every subcomponent in the union of the circuits gets the feature and sign that best separate its activation
 a_c = h V_c within classes (the AUC of a_c for feature present vs absent, computed per class where both values have at
 least 20 of 20,000 training images, averaged over those classes with weights by count): "loop_top" when it is higher
-with the feature, "no loop_top" when lower. The within-class AUC keeps a name from being the class in disguise. A group
-is the circuit subcomponents of one layer sharing a name.
+with the feature, "no loop_top" when lower. The within-class AUC keeps a name from being the class in disguise. A
+subcomponent whose best within-class AUC is within MIN_SEP of 0.5 stays unnamed. A group is the named circuit
+subcomponents of one layer sharing a name (whole-layer block nodes are not grouped).
 
 Interchange (the real model, every subcomponent on, remainder live): on a base image x (test images 0-4999, the circuit
 pool), the group's activations are replaced by their values on a donor x' (test images 5000-9999) and the rest computes
@@ -24,7 +25,7 @@ log-probability change with the concept's prediction log P(y | f = f(x')) - log 
 the feature, 20,000 training images), averaged over differing donors where the prediction moved by at least 0.01 bits.
 Baseline: random groups of the same size from the same layer's subcomponents active in the circuits, same donors.
 
-  ~/mpd-data/venv/bin/python experiments/oracle/mnist/concepts.py --tag i5e-4 --tau 0.1
+  ~/mpd-data/venv/bin/python experiments/oracle/mnist/concepts.py --tag i5e-4 --circuits ~/mpd-data/mnist/circuits_X.json
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ FEATURES = (
     "ink_center",
     "wide",
 )
+MIN_SEP = 0.1  # |within-class AUC - 0.5| below this: unnamed
 CONCEPT_WORDS = {
     "loop_top": "closed loop at the top",
     "loop_bottom": "closed loop at the bottom",
@@ -135,14 +137,15 @@ def within_class_auc(a: np.ndarray, f: np.ndarray, y: np.ndarray, min_n: int = 2
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
-    ap.add_argument("--tau", type=float, default=0.1)
+    ap.add_argument("--circuits", required=True)
     ap.add_argument("--n-base", type=int, default=200)
     ap.add_argument("--n-donor", type=int, default=24)
     ap.add_argument("--n-random", type=int, default=5)
     args = ap.parse_args()
     torch.set_num_threads(3)
     dec = load_decomp(DATA / f"vpd_{args.tag}.pt")
-    circ = json.loads((DATA / f"circuits_{args.tag}_tau{args.tau}.json").read_text())["results"]
+    cpath = Path(args.circuits).expanduser()
+    circ = json.loads(cpath.read_text())["results"]
     xtr, ytr, xte, yte = load_mnist()
     g = np.random.default_rng(0)
     ntr = g.permutation(len(xtr))[:20000]
@@ -158,7 +161,9 @@ def main() -> None:
             p_y_f[k, v] = cnt / cnt.sum()
     a_tr, _, _ = dec.acts(xtr[ntr])
     a_tr = a_tr.numpy()
-    members = sorted({m for r in circ for m in r["members"]}, key=lambda s: (s.split("#")[0], int(s.split("#")[1])))
+    members = sorted(
+        {m for r in circ for m in r["members"] if "#" in m}, key=lambda s: (s.split("#")[0], int(s.split("#")[1]))
+    )
     name_to_j = {}
     for m in members:
         mod, c = m.split("#")
@@ -175,6 +180,8 @@ def main() -> None:
         named[m] = {"feature": f, "sign": "+" if w > 0.5 else "-", "auc_within": w, "auc_overall": overall}
     groups: dict[tuple[str, str, str], list[str]] = {}
     for m, v in named.items():
+        if abs(v["auc_within"] - 0.5) < MIN_SEP:
+            continue
         groups.setdefault((m.split("#")[0], v["feature"], v["sign"]), []).append(m)
     # interchange
     base_idx = g.permutation(5000)[: args.n_base]
@@ -259,8 +266,16 @@ def main() -> None:
             f"dir={row['direction_corr']} rand_ratio={row['random_ratio']}",
             flush=True,
         )
-    out = DATA / f"concepts_{args.tag}_tau{args.tau}.json"
-    out.write_text(json.dumps({"rates": rates, "named": named, "groups": out_groups}, indent=1))
+    out = DATA / cpath.name.replace("circuits_", "concepts_")
+    n_named = sum(abs(v["auc_within"] - 0.5) >= MIN_SEP for v in named.values())
+    out.write_text(
+        json.dumps(
+            {"circuits": str(cpath), "rates": rates, "n_members": len(named), "n_named": n_named, "named": named,
+             "groups": out_groups},
+            indent=1,
+        )
+    )
+    print(f"named {n_named} of {len(named)} circuit subcomponents")
     print(f"wrote {out}")
 
 

@@ -178,7 +178,7 @@ def score(fam: str, task: str):
         print(fam, task, v, "scored", round(time.perf_counter() - t0), "s", flush=True)
     # the context variable's value maps (E4 v2): identity against algorithms vpd4l does not run
     vals = {}
-    ctx = sorted({int(p) for _, _, p in answer["nodes"] if int(p) != t}, key=lambda p: t - p)
+    ctx = sorted({int(p) for _, _, p in answer["nodes"] if 0 < int(p) != t}, key=lambda p: t - p)  # a token at 0 has no prediction to draw from
     if ctx:
         c0 = ctx[0]
         sc = variables.Scorer(ge)

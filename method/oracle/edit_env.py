@@ -39,8 +39,10 @@ b everywhere earns nothing. The part defaults to "score" (never in the evidence)
       the teacher's edit is the candidate of circuit_edit and circuit_scales (their searches' steps and checkpoints)
       earning the most reward on the val third, the random side's the same among random_equal's and random_scales'
       (random subcomponents active at the instances, outside the circuit, ablated or given fitted scales); both written
-      as answers and scored by the verifier on the score third. --sft: train goals' teacher answers, as SFT rows
-      {"id", "question", "answer", "reward"}.
+      as answers and scored by the verifier on the score third; also against each kind alone: ablated (random_equal:
+      as many random active subcomponents as the circuit edit's operations, removed) and fitted (random_scales: 16 with
+      scales fitted by Adam on the fit third's objective, an optimization the oracle cannot run). --sft: train goals'
+      teacher answers, as SFT rows {"id", "question", "answer", "reward"}.
 """
 from __future__ import annotations
 
@@ -79,6 +81,7 @@ GATE = 0.8
 MIN_HELD = 8  # a goal's score-third instances and controls, at least (scorable)
 TEACHERS = ("circuit_edit", "circuit_scales")
 RANDOMS = ("random_equal_0", "random_equal_1", "random_scales")
+RANDOM_KINDS = {"ablated": ("random_equal_0", "random_equal_1"), "fitted": ("random_scales",)}  # the random side, by kind
 TOKENS = Path.home() / "mpd-data/atlas/vpd4l/tokens_0_6000.npy"  # the atlas's rows, split B 5000-5999
 BATCH_TOKENS = int(os.environ.get("EDIT_ENV_BATCH_TOKENS", "4096"))  # tokens per forward pass (padded)
 
@@ -348,7 +351,9 @@ def gate(ver: Verifier, goal_rows: list[dict], edit_rows: list[dict], log=print)
         if t is None or r is None:
             continue
         picks = {m: e["methods"][m] for m in TEACHERS + RANDOMS if e["methods"].get(m) and e["methods"][m].get("ops")}
-        answers = {"teacher": render(t[1]), "random": render(r[1]), **{m: render(scale_ops(x["ops"])) for m, x in picks.items()}}
+        sides = {f"random:{k}": best(e, ms) for k, ms in RANDOM_KINDS.items()}  # each kind of random edit alone, picked the same way
+        answers = {"teacher": render(t[1]), "random": render(r[1]), **{k: render(b[1]) for k, b in sides.items() if b},
+                   **{m: render(scale_ops(x["ops"])) for m, x in picks.items()}}
         names = list(answers)
         test = dict(zip(names, ver.answers(g["pref"], [answers[n] for n in names], "score")))
         first_t = max((m for m in TEACHERS if m in picks), key=lambda m: val_reward(picks[m]["validation"]), default=None)
@@ -356,6 +361,7 @@ def gate(ver: Verifier, goal_rows: list[dict], edit_rows: list[dict], log=print)
         row = {"id": g["id"], "split": g["split"], "teacher": t[0], "random": r[0], "teacher_reward": test["teacher"]["reward"],
                "random_reward": test["random"]["reward"], "win": test["teacher"]["reward"] > test["random"]["reward"],
                "first_win": bool(first_t and first_r) and test[first_t]["reward"] > max(first_r), "val": {"teacher": t[2], "random": r[2]},
+               "win_by_kind": {k: test["teacher"]["reward"] > test[f"random:{k}"]["reward"] for k in RANDOM_KINDS if f"random:{k}" in test},
                "score": test, "answers": answers}
         out.append(row)
         if g["split"] == "train":
@@ -378,7 +384,10 @@ def gate_summary(rows: list[dict]) -> str:
         lines.append(f"{split}: teacher above random on {wins}/{len(rs)} goals ({wins / len(rs):.0%}; gate {GATE:.0%}"
                      f"{': passed' if split == 'dev' and wins / len(rs) >= GATE else ''}); reward difference median "
                      f"{statistics.median(d):+.3f}; first definition {first}/{len(rs)}")
-        for m in ("teacher", "random") + TEACHERS + RANDOMS:
+        for k, ms in RANDOM_KINDS.items():
+            ws = [r["win_by_kind"][k] for r in rs if k in r.get("win_by_kind", {})]
+            lines.append(f"  teacher above {k} ({', '.join(ms)}) alone: {sum(ws)}/{len(ws)}")
+        for m in ("teacher", "random") + tuple(f"random:{k}" for k in RANDOM_KINDS) + TEACHERS + RANDOMS:
             xs = [r["score"][m] for r in rs if m in r["score"]]
             if xs:
                 mean = lambda k: statistics.fmean(x[k] for x in xs)  # noqa: E731

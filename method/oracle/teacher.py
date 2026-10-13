@@ -130,8 +130,14 @@ REPAIR_M = 4          # the omitted lever's budget the flip repair answers (goal
 EDGE_NODES = 6000     # the influential search wires circuits of at most this many subcomponents (a block's every one
 # counted): text9002's 31 blocks and 20,063 subcomponents overflowed the host's memory in EdgePruner
 ACCEPT_BATCH = 8      # Descent.prune's accept checks per call: the largest prefixes within the budget first
+FLOOR_SLACK = 0.95    # an acceptance term's floor: min(0.9, 0.95 x the start's) (the lead's 10-12: a start below 0.9 keeps slack)
 KL_FLOOR = 1e-9       # a KL's floor before a fractional power (goal_eval.recovered_log's): a nearly exact answer's KL can
 # round below 0, and a negative base to a fractional power is complex (fleet's planted toys)
+
+
+def floor_of(v: float | None) -> float | None:
+    """An acceptance term's floor from the start's value: min(0.9, FLOOR_SLACK x it) (None: no floor)."""
+    return None if v is None else min(RECOVERED, FLOOR_SLACK * v)
 
 
 def kl_budget(empty: float, kl: float, f: float = RECOVERED) -> float:
@@ -759,8 +765,12 @@ class Acceptance:
         diverged from the first check on)."""
         pool = self._halves()[0]
         k = min(POOL_DRAWS, len(pool))
-        key = 0 if state is None else int(hashlib.sha256(state.detach().to("cpu", torch.uint8).numpy().tobytes()).hexdigest()[:15], 16)
-        return [pool[i] for i in np.random.default_rng([int(self.tx.seed), 23, key]).choice(len(pool), k, replace=False).tolist()]
+        return [pool[i] for i in np.random.default_rng([int(self.tx.seed), 23, self.key(state)]).choice(len(pool), k, replace=False).tolist()]
+
+    @staticmethod
+    def key(state: torch.Tensor | None) -> int:
+        """A state's sample key (a hash of its unit set's bytes; with the text's seed and 23, the check's rng seed)."""
+        return 0 if state is None else int(hashlib.sha256(state.detach().to("cpu", torch.uint8).numpy().tobytes()).hexdigest()[:15], 16)
 
     def validation(self, graph: native.Graph) -> float | None:
         """A circuit's s_track_pp on the fixed validation draws (the other half of search_pool, at most POOL_DRAWS)."""
@@ -800,7 +810,7 @@ class Acceptance:
         edges_of(ons), for connection sets: (the node set's graph with every connection, ons) for scores' edges;
         floor, the floors (default min(0.9, the start's terms)). With discriminating draws: current() the unit set the
         candidates are removals from (default start), label and names(unit ids) naming a refused removal."""
-        disc = self.draws in ("discriminating", "fresh", "fv") and "changed" in self.kinds
+        disc = self.draws in ("discriminating", "fresh", "fv") and "changed" in self.kinds and bool(self._halves()[0])
         rest = Acceptance(self.ge, self.tx, [k for k in self.kinds if not (disc and k == "changed")], self.mode)
         current = current or (lambda: start)
 
@@ -812,7 +822,7 @@ class Acceptance:
             got, ws = self._per_draw([graph_of(start)], self._sample(start))
             base["s_track_pp"] = self._pooled(got[0], ws, range(len(ws)))
         if floor is None:
-            floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
+            floor = {k: floor_of(v) for k, v in base.items()}
 
         def judge(ons):                                      # the changed term on the draws each candidate is most at
             now = current()                                  # odds with the current circuit on
@@ -827,22 +837,22 @@ class Acceptance:
                 f = floor.get("s_track_pp")
                 if f is not None and sc is not None and sc < f:
                     removed = (now & ~on).nonzero().flatten().tolist() if now.shape == on.shape else []
-                    self.refused.append({"stage": label, "removed": names(removed) if names else removed,
+                    self.refused.append({"stage": label, "removed": names(removed) if names else removed, "draw_key": self.key(now),
                                          "draws": [[int(prompts[d][0]), int(prompts[d][1])] for d in idx],
                                          "s_track_pp": sc, "s_current": self._pooled(got[0], ws, idx), "floor": f})
                     out.append(None)
                 else:
-                    out.append({"s_track_pp": sc})
+                    out.append({"s_track_pp": sc, "draw_key": self.key(now)})
             return out
 
         def accept(ons):
             if not disc:
-                return [r if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r) else None for r in run(ons)]
+                return [r if all(floor.get(k) is None or r.get(k) is None or r[k] >= floor[k] for k in r) else None for r in run(ons)]
             first = judge(ons)
             alive = [i for i, r in enumerate(first) if r is not None]
             rows = run(ons[torch.tensor(alive, dtype=torch.long, device=ons.device)]) if alive else []
             for i, r in zip(alive, rows):
-                if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r):
+                if all(floor.get(k) is None or r.get(k) is None or r[k] >= floor[k] for k in r):
                     first[i].update(r)
                 else:
                     first[i] = None
@@ -883,8 +893,9 @@ class Validated:
     to the last that passed (log cut there) and the level ends. trace: [removals, units on, validation score]."""
 
     def __init__(self, desc: Descent, graph_of, acceptance: Acceptance, floor: float, log: list | None = None,
-                 every: int = VAL_EVERY):
-        self.desc, self.graph_of, self.acc, self.floor, self.log, self.every = desc, graph_of, acceptance, floor, log, every
+                 every: int | None = None):
+        self.desc, self.graph_of, self.acc, self.floor, self.log = desc, graph_of, acceptance, floor, log
+        self.every = every or VAL_EVERY
         self.n, self.trace = 0, []
         self.good = (desc.on.clone(), len(log) if log is not None else 0)
 
@@ -913,13 +924,14 @@ SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its o
 
 
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
-               acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS) -> tuple:
+               acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS,
+               phi_pool: dict | None = None) -> tuple:
     """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): goal_eval.GoalEval.start_set
     (VPD's active subcomponents at the targets and the m most influential positions, every connection; search split
     s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
     and the acceptance floors (min(0.9, the start's)) at levels, each level
-    under Validated when the acceptance draws are "fv". (The circuit, its Pruner, the record) as block_search's (no
-    group, no blocks)."""
+    under Validated when the acceptance draws are "fv"; with phi_pool, block_search's check against the reward's bar,
+    backing off a stage at a time. (The circuit, its Pruner, the record) as block_search's (no group, no blocks)."""
     nat = ge.nat
     st = ge.start_set(tx, "search")
     start = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
@@ -927,34 +939,51 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
         start[n][t, c] = True
     pr = Pruner(ge, tx, start, live=CONVENTION == "live", B=B)
     graph_of = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
-    kl0 = pr.kl()
-    if kl0 > budget:                                         # a start above the F1 budget (text6011, text9004 pruned
-        budget = kl_budget(empty, kl0, SET_RECOVERY)          # nothing): at most 5% of its own log recovery lost
+    kl0 = pr.kl()                                            # the F1 budget, or losing at most 5% of the start's log
+    budget = max(budget, kl_budget(empty, kl0, SET_RECOVERY))  # recovery (a start over it: text6011, 9004 pruned nothing)
     rec = {"m": st["m"], "positions": st["positions"], "start_s_track_pp": st["s_track_pp"], "start_units": len(pr.nodes),
            "stages": [], "validation": [], "budget": budget}
 
-    def stage(name, t0):
+    snaps = []
+
+    def stage(name, t0, rounds=0):
+        snaps.append((name, pr.on.clone()))
         kl = pr.kl()
         row = {"stage": name, "blocks": 0, "subcomponents": int(pr.on.sum()), "units": int(pr.on.sum()), "kl": kl,
-               "f1": goal_eval.recovered_log(empty, kl, vpd), "seconds": time.perf_counter() - t0}
+               "f1": goal_eval.recovered_log(empty, kl, vpd), "rounds": rounds, "seconds": time.perf_counter() - t0}
         rec["stages"].append(row)
-        log(f"  set {name}: {row['subcomponents']} subcomponents, KL {kl:.3g} (budget {budget:.3g}), {row['seconds']:.0f}s", flush=True)
+        log(f"  set {name}: {row['subcomponents']} subcomponents, KL {kl:.3g} (budget {budget:.3g}), {rounds} rounds, "
+            f"{row['seconds']:.0f}s", flush=True)
     t0 = time.perf_counter()
     hook, floor = None, {}
     if acceptance is not None:
         hook, base = acceptance.hook(graph_of, pr.on.clone(), current=lambda: pr.on, label="set",
                                      names=lambda ids: [pr.nodes[i] for i in ids])
-        floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
+        floor = {k: floor_of(v) for k, v in base.items()}
         rec["accept_start"], rec["floor"] = base, floor
     stage("start", t0)
     for level in levels:
         t0 = time.perf_counter()
         v = Validated(pr, graph_of, acceptance, floor.get("s_track_pp")) if acceptance is not None and acceptance.draws == "fv" else None
-        pr.prune(level, budget, accept=hook, after=v)
+        rounds = pr.prune(level, budget, accept=hook, after=v)
         if v is not None:
             v.finish()
             rec["validation"].append([level] + v.trace)
-        stage(level, t0)
+        stage(level, t0, rounds)
+    if phi_pool is not None:                                 # the reward's bar on the search split, backing off a stage
+        bar = ge.tau(tx, phi_pool, "search")["phi_tau"]      # at a time while the circuit falls below it
+        rec["phi"], best = [], None
+        for name, on_s in reversed(snaps):
+            row = ge.fidelity(tx, [graph_of(on_s)], phi_pool, mode="reward", split="search")[0]
+            ph = goal_eval.phi(row, start=bar)[0]
+            rec["phi"].append([name, ph, bar])
+            log(f"  set phi at {name}: {ph} (bar {bar})", flush=True)
+            if ph is not None and (best is None or ph > best[0]):
+                best = (ph, name, on_s)
+            if ph is not None and bar is not None and ph >= bar:
+                break
+        if best is not None:
+            pr.on, rec["phi_stage"] = best[2].clone(), best[1]
     g = graph_of(pr.on)
     if acceptance is not None:
         rec["accept"] = acceptance.scores([g])[0]
@@ -1053,11 +1082,11 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
     names = lambda ids: [pr.nodes[i] for i in ids]  # noqa: E731
     if acceptance is not None:
         hook, base = acceptance.hook(graph_of, pr.on.clone(), current=lambda: pr.on, label="blocks", names=names)
-        floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
+        floor = {k: floor_of(v) for k, v in base.items()}
         rec["accept_start"], rec["floor"] = base, floor
     stage("start", t0)
     t0 = time.perf_counter()
-    pr.prune("site", budget, accept=hook)                    # whole blocks
+    rec["rounds"] = {"site": pr.prune("site", budget, accept=hook)}   # whole blocks
     stage("site", t0)
     t0 = time.perf_counter()
     kept = (flagged & ~at_ctx & torch.isin(torch.arange(len(flagged), device=nat.dev), group[pr.on])).nonzero().flatten()
@@ -1084,7 +1113,7 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
         hook, _ = acceptance.hook(graph_of, pr.on.clone(), floor=floor, current=lambda: pr.on, label="subcomponents", names=names)
     for level in levels:
         t0 = time.perf_counter()
-        pr.prune(level, budget, accept=hook)
+        rec["rounds"][level] = pr.prune(level, budget, accept=hook)
         stage(level, t0)
     t0 = time.perf_counter()                                 # re-block: a refined site whose kept subcomponents outnumber
     act = torch.tensor([bool(tx.vpd[n][t, c]) for n, t, c in pr.nodes], device=nat.dev)   # VPD's active ones there (a
@@ -1197,16 +1226,18 @@ class Connector:
         if self.acceptance is not None and self.acceptance.draws == "fv" and base.get("s_track_pp") is not None:
             def validate(d, lg):                             # F+V: the connection levels under the validation set too
                 return Validated(d, lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]),
-                                 self.acceptance, min(RECOVERED, base["s_track_pp"]), lg)
-        steps = edge_path(ep, self.budget, state, self.levels, accept=accept, validate=validate)
+                                 self.acceptance, floor_of(base["s_track_pp"]), lg)
+        budget = max(self.budget, kl_budget(empty, ep.kl(), SET_RECOVERY))   # the nodes' rule: the F1 budget or 5% of the
+        summary_budget = budget                              # node set's own log recovery lost
+        steps = edge_path(ep, budget, state, self.levels, accept=accept, validate=validate)
         steps[0].update(start)
         summary = {**{k_: steps[-1][k_] for k_ in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term", "reward")},
-                   "all_edges": len(ep.edges), "sets": ep.measured, "unconnectable": len(dropped)}
+                   "all_edges": len(ep.edges), "sets": ep.measured, "unconnectable": len(dropped), "budget": summary_budget}
         for k_ in start:                                     # the last admitted step's F1 under the flips and acceptance
             summary[k_] = next(s_[k_] for s_ in reversed(steps) if k_ in s_)   # terms (the start's, steps[0]'s, if none)
         if self.acceptance is not None:                      # the token edges, under the same floors
             kept_now = [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_]
-            summary["tokens"] = self.tokens(on, kept_now, {k_: min(RECOVERED, v) for k_, v in base.items() if v is not None})
+            summary["tokens"] = self.tokens(on, kept_now, {k_: floor_of(v) for k_, v in base.items() if v is not None})
         print(f"  connections at {size} subcomponents: {summary['edges']} of {len(ep.edges)}, graph F1 {summary['f1_graph']:.3f} "
               f"(start {steps[0]['f1_graph']:.3f}), N {n:.3f}, {ep.measured} sets", flush=True)
         return [e for e, keep_ in zip(ep.edges, ep.on.tolist()) if keep_], summary, steps, ep, on
@@ -1342,7 +1373,7 @@ def state_pairs(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph,
     done, records = {}, []
     floor = None
     if acceptance is not None:
-        floor = {k: None if v is None else min(RECOVERED, v) for k, v in acceptance.scores([graph])[0].items()}
+        floor = {k: floor_of(v) for k, v in acceptance.scores([graph])[0].items()}
 
     def margin(r):                                           # the smallest margin over the floors (None: no floor)
         return min([r[k] - f for k, f in floor.items() if f is not None and r[k] is not None] or [0.0])
@@ -1492,7 +1523,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     if f1_start in ("influential", "set"):                   # the influential-blocks search (block_search) or the
         if f1_start == "set":                                # influential set pruned (set_search), and its wiring
-            g, pb, _, _, row["blocks"] = set_search(ge, tx, empty, vpd, budget, acceptance, B)
+            g, pb, _, _, row["blocks"] = set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool)
         else:
             g, pb, _, _, row["blocks"] = block_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, context=context)
         bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
@@ -1705,7 +1736,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
 
 def main():
-    global RANK
+    global RANK, VAL_EVERY
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--split", default="heldout")
     ap.add_argument("--n", type=int, default=20)
@@ -1716,12 +1747,13 @@ def main():
     ap.add_argument("--save-vpd", type=Path, help="save VPD's answers and orders on the texts to this file and stop")
     ap.add_argument("--labels", type=Path, help="locality JSONL (task, local)")
     ap.add_argument("--start-top", type=int, default=0, help="F1 search from VPD's top K at subcomponent level (0: from VPD's whole answer)")
-    ap.add_argument("--f1-start", choices=("targets", "whole", "both", "influential", "set"), default="both",
+    ap.add_argument("--f1-start", choices=("targets", "whole", "both", "influential", "set", "start_set"), default="both",
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both); "
                          "influential: block_search, every site's block at the targets and the most influential positions, "
                          "refined under the acceptance terms; set: goal_eval's influential start set (VPD's actives at the "
-                         "targets and influential positions) pruned, nothing expanded (set_search)")
+                         "targets and influential positions) pruned, nothing expanded (set_search; start_set the same)")
+    ap.add_argument("--validate", type=int, default=VAL_EVERY, help="with --accept-draws fv: removals between validation checks")
     ap.add_argument("--context", choices=("refine", "blocks"), default="refine", help="with --f1-start influential: "
                     "blocks keeps every context position's blocks whole and searches the targets' alone (T5)")
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
@@ -1766,6 +1798,9 @@ def main():
                     "level (re-ranked when a kept order admits nothing)")
     args = ap.parse_args()
     RANK = args.rank
+    VAL_EVERY = args.validate
+    if args.f1_start == "start_set":
+        args.f1_start = "set"
     if args.tasks:
         texts = [native.TEXTS / "vpd4l" / f"{t}.json" for t in args.tasks.read_text().split()]
     else:

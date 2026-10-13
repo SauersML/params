@@ -286,7 +286,7 @@ def test_changed_acceptance_keeps_its_floor():
     acc = teacher.Acceptance(ge, tx, ("changed",), "c")
     hook, base = acc.hook(lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True), start)
     path = teacher.joint_path(pr, start, empty, vpd, hook, base)
-    floor = None if base["s_track"] is None else min(teacher.RECOVERED, base["s_track"])
+    floor = teacher.floor_of(base["s_track"])
     # every step the path took kept the circuit's change in prediction on the changed texts at its floor
     assert floor is not None and len(path) > 1
     assert all(s["s_track"] is None or s["s_track"] >= floor for s in path[1:])
@@ -317,7 +317,7 @@ def test_acceptance_admits_exactly_the_passing_sets(kind):
     each = {"donors": lambda: ge.donors_search(tx, graphs), "pp": lambda: ge.changed_search(tx, graphs, mode="pp"),
             "necessity": lambda: ge.necessity_spec(tx, graphs, split="search")}[kind]()
     for g, r in zip(got, each):
-        passes = all(base[k] is None or r[k] is None or r[k] >= min(teacher.RECOVERED, base[k]) for k in base)
+        passes = all(base[k] is None or r[k] is None or r[k] >= teacher.floor_of(base[k]) for k in base)
         # a set is admitted exactly when its terms keep their floors, with the family's own numbers
         assert (g is not None) == passes
         if g is not None:
@@ -436,7 +436,7 @@ def test_connect_with_acceptance_keeps_its_floor():
                              acceptance=teacher.Acceptance(ge, tx, ("changed",), "c"))
     n = teacher.measure(pr, start[None], empty, vpd)[0]["n"]
     kept, summary, steps, _, _ = conn.connect(start, n)
-    floor = min(teacher.RECOVERED, steps[0]["s_track"])
+    floor = teacher.floor_of(steps[0]["s_track"])
     # the connection descent without the robust objective reports the last admitted step's s_track, at its floor
     assert "f1_flips" not in summary and summary["s_track"] >= floor and len(kept) == summary["edges"]
     assert all(s_.get("s_track") is None or s_["s_track"] >= floor for s_ in steps)
@@ -505,7 +505,7 @@ def test_block_connections_keep_their_floors():
         assert bool(ep.on[member].all()) or not bool(ep.on[member].any())
     # the stated graph names the blocks, states every token edge, and keeps the floors the descent started from
     assert {(nd[0], nd[1]) for nd in stated.node_set() if nd[2] == goal_eval.BLOCK} <= bl
-    floor = {k: min(teacher.RECOVERED, steps[0][k]) for k in ("s_track_pp", "s_patching_near", "s_patching_far") if steps[0].get(k) is not None}
+    floor = {k: teacher.floor_of(steps[0][k]) for k in ("s_track_pp", "s_patching_near", "s_patching_far") if steps[0].get(k) is not None}
     got = acc.scores([stated])[0]
     assert all(got[k] is None or got[k] >= f - 1e-6 for k, f in floor.items())
     back, bad = goal_eval.circuit(goal_eval.to_json(stated, ""), tx.targets, nat.C, tx.T)
@@ -543,7 +543,7 @@ def test_discriminating_draws_stay_off_eval(draws):
     for i, f in enumerate((0.02, 0.05, 0.1, 0.3, 0.6, 0.9)):     # random removals, light to heavy
         ons[i, torch.rand(len(pr2.nodes), generator=g).to(ons.device) < f] = False
     got = hook(ons)
-    floor = min(teacher.RECOVERED, base["s_track_pp"])
+    floor = teacher.floor_of(base["s_track_pp"])
     # a check's sample is keyed by the state it judges: the same set draws the same sample, another set another one
     assert acc._sample(pr2.on.clone()) == acc._sample(pr2.on) != acc._sample(ons[0])
     # admitted removals keep the floor on their judged draws; each refusal kept with its 16 draws from the pool

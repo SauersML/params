@@ -201,7 +201,11 @@ def main() -> None:
     T = dec.total
     ones = torch.ones(1, T)
 
+    lmove: dict[tuple, np.ndarray] = {}
+
     def interchange(js: list[int], b: int, donors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """KL bits from the real prediction per donor and the log-probability changes; the centered-logit movement
+        (||c(z) - c(z_ref)|| / ||c(z_ref)||) is kept in lmove under (js, b, donors)."""
         n = len(donors)
         sel = torch.zeros(n, T, dtype=torch.bool)
         sel[:, js] = True
@@ -210,7 +214,12 @@ def main() -> None:
         lg = dec.run(x, ones.expand(n, -1), 1.0, sel, val)
         ref = dec.run(xte[b][None], ones)
         dlogp = (F.log_softmax(lg, -1) - F.log_softmax(ref, -1)).numpy()
+        zc, zr = lg - lg.mean(-1, keepdim=True), ref - ref.mean(-1, keepdim=True)
+        lmove[(tuple(js), b, tuple(int(v) for v in donors))] = ((zc - zr).norm(dim=-1) / zr.norm(dim=-1)).numpy()
         return kl_bits(ref.expand(n, -1), lg).numpy(), dlogp
+
+    def lm(js: list[int], b: int, donors: np.ndarray) -> float:
+        return float(lmove[(tuple(js), b, tuple(int(v) for v in donors))].mean())
 
     def donors_for(b: int, k: int, gr) -> tuple[np.ndarray, np.ndarray] | None:
         fb = Fte[b]
@@ -261,7 +270,7 @@ def main() -> None:
                     rg = [int(j) for j in gr.choice(pool, size=len(js), replace=False)]
                     rkd, _ = interchange(rg, b, dd)
                     rks, _ = interchange(rg, b, ds)
-                    rr.append((float(rkd.mean()), float(rks.mean())))
+                    rr.append((float(rkd.mean()), float(rks.mean()), lm(rg, b, dd), lm(rg, b, ds)))
                 per.setdefault(key, []).append(
                     {
                         "image": b,
@@ -271,6 +280,10 @@ def main() -> None:
                         "control": float(ks.mean()),
                         "random_differ": float(np.mean([x[0] for x in rr])),
                         "random_control": float(np.mean([x[1] for x in rr])),
+                        "differ_logit": lm(js, b, dd),
+                        "control_logit": lm(js, b, ds),
+                        "random_differ_logit": float(np.mean([x[2] for x in rr])),
+                        "random_control_logit": float(np.mean([x[3] for x in rr])),
                         "direction": direction(k, b, dd, kd, dl),
                     }
                 )
@@ -295,6 +308,10 @@ def main() -> None:
                 "random_move_control": float(rc.mean()),
                 "random_ratio": float(rd.mean() / max(rc.mean(), 1e-9)),
                 "share_beats_random": float(np.mean(d_ / np.maximum(c_, 1e-9) > rd / np.maximum(rc, 1e-9))),
+                "move_differ_logit": float(np.mean([x["differ_logit"] for x in rows])),
+                "move_control_logit": float(np.mean([x["control_logit"] for x in rows])),
+                "random_differ_logit": float(np.mean([x["random_differ_logit"] for x in rows])),
+                "random_control_logit": float(np.mean([x["random_control_logit"] for x in rows])),
                 "direction_corr": float(np.mean(dirs)) if dirs else None,
                 "n_direction": len(dirs),
                 "per_circuit": rows,
@@ -303,7 +320,9 @@ def main() -> None:
             print(
                 f"{mod} {row['concept']!r} circuits={len(rows)} size={row['size']:.1f} differ={row['move_differ']:.4f} "
                 f"control={row['move_control']:.4f} ratio={row['ratio']:.2f} rand_ratio={row['random_ratio']:.2f} "
-                f"beats_random={row['share_beats_random']:.2f} dir={row['direction_corr']}",
+                f"beats_random={row['share_beats_random']:.2f} dir={row['direction_corr']} "
+                f"logit differ={row['move_differ_logit']:.3f} control={row['move_control_logit']:.3f} "
+                f"random {row['random_differ_logit']:.3f}/{row['random_control_logit']:.3f}",
                 flush=True,
             )
     active_by_layer = {mod: [name_to_j[m] for m in members if m.startswith(mod)] for mod in MODULES}

@@ -7,7 +7,7 @@ point family is also reported with it off). Every KL is in bits from the referen
   point:    S on, every other subcomponent off; reference: the real model on x.
   removal:  a random subset R of S removed both from the circuit run (S minus R on, the rest off) and from the real
             model (every subcomponent but R on); reference: the real model without R. R takes each member of S with
-            probability r, r ~ U(0, 1) per draw.
+            probability r, r ~ U(0, 1) per draw (whole-layer nodes are never removed).
   donor:    every subcomponent outside S takes its activation a_c = h V_c from the real model's run on a donor image,
             S computes on the run's own inputs; reference: the real model on x. Donors are near (test images 5000-9999
             of the class the model predicts on x, which it also predicts on them; in the acceptance) or far (of other
@@ -72,6 +72,8 @@ class Scorer:
         self.ref = dec.run(self.x, torch.ones(1, dec.total))
         self.G = None if G is None else G.float()
         self.n_nodes = dec.total if G is None else G.shape[0]
+        # a whole-layer node is never drawn for removal: removing a whole layer from both runs makes them agree trivially
+        self.removable = torch.ones(self.n_nodes, dtype=torch.bool) if G is None else G.sum(1) == 1
 
     def expand(self, M: torch.Tensor) -> torch.Tensor:
         return M if self.G is None else (M.float() @ self.G) > 0
@@ -79,7 +81,7 @@ class Scorer:
     def families(self, S_nodes: torch.Tensor, d: Draws, rem: float = 1.0) -> dict[str, torch.Tensor]:
         """KL bits per draw for each family. S_nodes [nodes] bool."""
         dec, n, T = self.dec, d.n, self.dec.total
-        R = self.expand((d.u_rem < d.r) & S_nodes[None, :])
+        R = self.expand((d.u_rem < d.r) & (S_nodes & self.removable)[None, :])
         Fl = self.expand((d.u_flip < d.q) & ~S_nodes[None, :])
         S = self.expand(S_nodes)
         Sf = S.float()[None, :]

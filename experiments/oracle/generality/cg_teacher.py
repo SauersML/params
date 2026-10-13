@@ -379,7 +379,7 @@ def texts_root() -> Path:
 TEACH_DIR = DATA / "cg_teacher_b2"  # the behavior-mode v2.1 teacher circuits, every batch's (pods' copied in)
 
 
-def run_local(k: int = 0, P: int = 1):
+def run_local(k: int = 0, P: int = 1, name: str | None = None):
     """The v2.1 teacher in the behavior mode on the Mac for every usable cgb prompt without a circuit in TEACH_DIR:
     teacher.py run in this process (runpy) with native.TEXTS on texts_root()."""
     import runpy
@@ -389,11 +389,15 @@ def run_local(k: int = 0, P: int = 1):
     meta = json.loads((DATA / "causalgym_texts_b.json").read_text())
     TEACH_DIR.mkdir(exist_ok=True)
     names = [nm for nm, m in sorted(meta.items()) if m.get("kl_empty") is not None and m["kl_empty"] > m["kl_vpd"]
-             and not (TEACH_DIR / f"{nm}.json").exists()][k::P]
+             and not (TEACH_DIR / f"{nm}.json").exists() and (name is None or nm == name)][k::P]
     if not names:
         return
+    if len(names) > 1:  # one process per prompt: teacher.py's caches grow across texts past the Mac's 16 GiB cap
+        for nm in names:
+            subprocess.run([sys.executable, "-B", str(HERE / "cg_teacher.py"), "run_local", "--name", nm], check=False)
+        return
     native.TEXTS = texts_root()
-    lst = DATA / f"cg_ids_local_{k}.txt"
+    lst = DATA / f"cg_ids_local_{names[0]}.txt"
     lst.write_text("\n".join(names) + "\n")
     sys.argv = ["teacher.py", "--tasks", str(lst), "--f1-start", "set", "--accept", "changed,necessity,nodes", "--accept-draws", "fv",
                 "--phi-check", "--max-tokens", "0", "--out", str(TEACH_DIR)]
@@ -555,10 +559,11 @@ if __name__ == "__main__":
     ap.add_argument("cmd", choices=("write", "run", "report", "masks", "test", "attractor", "gender_masks", "moved", "bounds",
                                     "run_local", "test_local", "report60"))
     ap.add_argument("--per-task", type=int, default=PER_TASK, help="write: pairs per task")
+    ap.add_argument("--name", default=None, help="run_local: one prompt")
     ap.add_argument("--dir", help="attractor: the teacher circuits' directory")
     ap.add_argument("args", nargs="*", type=int)
     ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
     ap.add_argument("--v2", action="store_true", help="run, report: the v2.1 teacher (start set, acceptance, phi pick)")
     a = ap.parse_args()
-    {"write": lambda: write(a.behavior, a.per_task), "bounds": bounds_b, "test_local": test_local, "report60": report60, "run_local": lambda: run_local(*a.args), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
+    {"write": lambda: write(a.behavior, a.per_task), "bounds": bounds_b, "test_local": test_local, "report60": report60, "run_local": lambda: run_local(*a.args, name=a.name), "run": lambda: run(*a.args, behavior=a.behavior, v2=a.v2), "report": lambda: report(a.behavior, a.v2),
      "masks": lambda: masks_run(*a.args, behavior=a.behavior), "test": lambda: test_dir(*a.args, behavior=a.behavior), "attractor": lambda: attractor(a.dir), "gender_masks": gender_masks, "moved": lambda: moved(a.dir)}[a.cmd]()

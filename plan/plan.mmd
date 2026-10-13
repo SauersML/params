@@ -19,13 +19,13 @@
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
 %% 2026-10-13 direct weight fidelity diagnostic7f81a95: same forwards now expose absolute unedited/edited KL alongside unchanged conditional reward.
 %% GHA38409624227 PASS, including independent-forward n/c checks and a wrong-baseline counterexample.
-%% This verifies metric plumbing; realVPD direct fidelity still requires measurements, and live remainders remain explicit.
+%% Real VPD run38451580911 and independent audit38452887197:48 conditions,3 TRAIN contexts; stated top10/12 per remainder mode, mean directKL1.45bits vs anchored .030. Pinned aeaf executor, finite final-down edits only.
 %% 2026-10-13 current-main scope REFRESH supersedes the historical2750fd8/x-mode audit below.
 %% e1a638a/3066855: SEMANTICS n holds dense Q/K and RMS scales only for node/omitted families; c holds none.
 %% Point, wiring, pattern and weight-family point runs recompute their own routing/norms from their edited vectors.
 %% weight_family still scores log_softmax(log p_full + log q_C,edited - log q_C,original): full-model baseline anchored.
 %% Therefore conditional edit tracking does not itself prove small direct KL(p_edited || q_C,edited). Toy CF reports both.
-%% No scoring behavior changed in this documentation correction. Direct realVPD edit fidelity remains a separate measurement.
+%% Decision: use actual edited-output fidelity to improve and compare teacher targets; anchored change scores remain conditional evidence. Other training arms continue independently.
 %% 2026-10-13 strong-open grounded-input probe COMPLETE:56 first Qwen3.6-35B-A3B responses,$0.27303027.
 %% Fixed42conditions: facts3/42,geometry3/42; both0/14complete triplets, allresponsesvalid. Recipient-only18/42.
 %% Exactgeometry prompts deduplicated14calls and boundto42conditions; facts42calls. No added-value signal; no four-view training GO.
@@ -634,7 +634,7 @@ flowchart BT
   W2 -. tests .-> GATEB
   %% FEEDBACK: W3 -. found the failure .-> W4
   W4 --> GATEB
-  %% FEEDBACK: W5 -. checks predictive value .-> W4
+  W5 -. direct-output evidence .-> W4
   W6 -. falsifies reward rankings .-> GATEB
   SEM --> W1
   %% FEEDBACK: SEM -. tests claims .-> C2

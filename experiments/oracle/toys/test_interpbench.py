@@ -119,7 +119,7 @@ def test_oracle_graph_runs_equal_the_engine(norm, biased):
     one = (native.site_name(0, "o_proj"), T - 2, 1)
     two = [(native.site_name(0, "o_proj"), T - 1, 0), (native.site_name(1, "c_fc"), T - 1, 1)]
     connected = native.Graph(two, *native.all_edges(two, targets))
-    assert connected.parents and connected.out == []
+    assert connected.parents and connected.out
     graphs = {"empty": native.Graph([]), "one": native.Graph([one]), "two": connected,
               "complete": native.Graph(two, complete=True)}
     g = torch.Generator().manual_seed(3)
@@ -148,14 +148,15 @@ def test_oracle_graph_runs_equal_the_engine(norm, biased):
                         torch.testing.assert_close(got.reshape(lp.shape), lp, atol=1e-5, rtol=1e-5)
         plan = nat._plan([connected], T)
         ew = torch.full((1, sum(len(w) for w in connected.parents.values())), 0.3)
+        ow = torch.full((1, len(connected.out)), 0.6)
         for un in ("zero", "zero anew", "random"):
             for rn, ur in urs.items():
                 eng = engines[rn == "live"]
                 got = nat.run(ids, targets, plan, us[un], ur, patch=patch)
                 want = eng.graph_log_probs(eng.plan(connected), full(us[un]), patch=patch).reshape(got.shape)
                 torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5, msg=lambda m: f"patch u {un} remainders {rn}: {m}")
-                got = nat.run(ids, targets, plan, us[un], ur, *nat.edge_weights(plan, ew.flatten()))
-                want = eng.graph_log_probs(eng.plan(connected), full(us[un]), ew, torch.zeros(1, 0)).reshape(got.shape)
+                got = nat.run(ids, targets, plan, us[un], ur, *nat.edge_weights(plan, torch.cat([ew, ow], 1).flatten()))
+                want = eng.graph_log_probs(eng.plan(connected), full(us[un]), ew, ow).reshape(got.shape)
                 torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5, msg=lambda m: f"strengths u {un} remainders {rn}: {m}")
 
 

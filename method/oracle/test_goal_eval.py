@@ -679,6 +679,19 @@ def _graph_checks(nat, ge, tx, nodes, rel):
     """Graph F1 on a node set: every connection stated is the complete run (rel: float32 between the reference forward
     and the masked one); no connection stated, remainders off, is the empty circuit; N does not depend on edges."""
     par, out = native.all_edges(nodes, tx.targets)
+    raw = native.Graph(nodes, par, out)
+    full, _ = naive(nat, tx.ids)
+    on = mask_of(nat, tx.T, nodes)
+    # Raw executor equivalence is independent of C's canonical preparation.
+    # A stranded node can affect the live background/remainder even without a
+    # stated path to the prediction; removing it changes that raw node set.
+    for live in (False, True):
+        E = ge._circuit_engine(tx.ids, tx.targets, [raw], live)
+        actual = float(carry.kl(tx.ref, E.graph_log_probs(E.plan([raw], semantics="c")))[0])
+        expected = _kl(full, naive(nat, tx.ids, on=on, live=live)[0], tx.targets)
+        assert abs(actual - expected) < rel * max(1.0, expected), (live, actual, expected)
+    nodes = sorted(goal_eval._c_graph(raw, tx.targets, nat.C).node_set())
+    par, out = native.all_edges(nodes, tx.targets)
     rows = ge.sufficiency(tx, [native.Graph(nodes, par, out), native.Graph(nodes, complete=True), native.Graph(nodes, {}, [])])
     every, whole, none = rows
     for conv in ("off", "live"):
@@ -703,7 +716,10 @@ def test_graph_f1_runs_the_stated_graph(tiny):
     for w, r in pairs[:6]:
         less = native.Graph(nodes, {rr: [x for x in ws if not (x == w and rr == r)] for rr, ws in par.items()},
                             [x for x in out if not (x == w and r is None)])
-        got = ge.graph_kl(tx, [less], live=False)[0]
+        # Keep the independent raw isolated-edge check, bypassing graph_kl's
+        # canonical preparation so its node mask matches naive's exactly.
+        E = ge._circuit_engine(tx.ids, tx.targets, [less], False)
+        got = float(carry.kl(tx.ref, E.graph_log_probs(E.plan([less], semantics="c")))[0])
         want = _kl(full, naive(nat, tx.ids, on=on, live=False, cut=(w, r))[0], tx.targets)
         assert abs(got - want) < 1e-4 + 1e-3 * abs(want), (w, r, got, want)
 
@@ -1055,7 +1071,8 @@ def test_families_on_the_engine_are_graph_ref(tiny):
                 assert float(carry.kl(y[None], x[None])[0]) < 1e-6
     stated = [g for g in graphs if not g.complete]
     for k, g in zip(ge._graph_kl(tx.ids, tx.targets, tx.ref, stated, True, 0.0), stated):
-        want = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, g, live=True))[0])
+        prepared = goal_eval._c_graph(g, tx.targets, nat.C)
+        want = float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, prepared, live=True))[0])
         assert abs(k - want) < 1e-6 + 1e-4 * abs(want)
 
 

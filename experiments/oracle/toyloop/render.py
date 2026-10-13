@@ -39,6 +39,22 @@ SHOW_ACTIVE = os.environ.get("TOYLOOP_SHOW_ACTIVE", "1") != "0"
 # model. Default "all": the original weight section plus the behaviour section.
 SECTIONS = os.environ.get("TOYLOOP_SECTIONS", "all")
 
+# Opt-in wording for future prompts; historical prompt bytes stay unchanged.
+SUMMARY_LIMITS = (
+    "Summary scope: token pairs and links are truncated, rounded weight summaries. "
+    "A missing link or out[] means no displayed above-threshold linear coupling, not no causal influence. "
+    "Neuron reads const describes isolated normalized embeddings, not arbitrary residual inputs. "
+    "~X marks approximate opposite weight-map directions; it does not verify equal magnitudes, "
+    "identical attention at every RoPE offset, or exact cancellation."
+)
+NORMALIZATION_RULE = (
+    "Executable rule: head and neuron writes enter the residual stream. Each head Q/K/V or neuron "
+    "input uses its retained residual inputs r, with RMSNorm gain*r/sqrt(mean(r*r)+eps) recomputed "
+    "before the linear read; neuron outputs also apply GELU. A write with zero direct linear "
+    "overlap can still change a reader through this denominator. The final readout likewise "
+    "normalizes the residual containing the declared out writers."
+)
+
 
 @dataclass
 class Toy:
@@ -278,7 +294,8 @@ def source_token(toy, writer: str, reader: str, ratio: float = 2.0) -> str | Non
     return toy.vocab[int(t.indices[0])] if float(t.values[0]) > ratio * float(t.values[1]) + 1e-9 else None
 
 
-def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_links: int = 3) -> list[str]:
+def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_links: int = 3,
+                      *, explain_summary_limits: bool = False) -> list[str]:
     """Compact, weights only. Per head: output norm, positional preference (the mean embedding's query and key through
     RoPE: best key offset and its margin over the next, 'pos flat' when position barely matters), QK and OV token pairs
     (through the embedding, so a rotated residual basis changes nothing), the units its Q, K and V read and the units
@@ -314,6 +331,13 @@ def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_li
              "OV[source>written logit] token pairs; in Q/K/V[writer:gain], out[reader:gain] (gain = largest singular "
              "value of reader x writer map; out[] = nothing reads it; L0H5:33<t34 = mostly token t34 carried by L0H5); "
              "~X = cancels X (same input, opposite output)."]
+    if explain_summary_limits:
+        lines = ["Legend: pos-d is the mean-embedding positional preference (m = margin); "
+                 "QK[query>key] and OV[source>written logit] are isolated-embedding token pairs; "
+                 "in Q/K/V[writer:gain], out[reader:gain] list linear map gains (largest singular value), "
+                 "with learned norm gains folded in but RMS denominators omitted. "
+                 "L0H5:33<t34 identifies the dominant isolated source token for that linear map.",
+                 SUMMARY_LIMITS, NORMALIZATION_RULE]
     maxd = min(int(cfg.get("n_ctx", 32)) - 1, 15)
     cancel = cancelling_pairs(toy)
     for u, i, kind, j in units_of(toy):
@@ -434,27 +458,35 @@ def behaviour_lines(toy: Toy, n_texts: int = 2, compact: bool = False) -> list[s
     return lines
 
 
-def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_live_neurons: bool = False) -> str:
+def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_live_neurons: bool = False,
+           explain_summary_limits: bool = False) -> str:
     """The prompt. weights_from: take the weight section from another toy (same architecture), keeping this toy's
     behaviour section (the swapped-weights control: does the answer follow the weights?). TOYLOOP_SECTIONS=weights:
     the compact weight section and the texts' tokens only; default: weights and behaviour (zoo v1 toys keep the
     legacy weight section, zoo2 toys get the compact one). all_live_neurons removes
     only the neuron-count cap in either format. Callers must reject a context-cap
     failure rather than truncate facts; token/connection summaries remain bounded.
+    explain_summary_limits corrects legacy shorthand and supplies the residual/RMS
+    execution rule, without changing any numerical facts or consulting targets.
+    It is opt-in so archived prompts and matched comparisons retain their bytes.
     """
     if type(all_live_neurons) is not bool:
         raise ValueError("all_live_neurons must be an explicit boolean")
+    if type(explain_summary_limits) is not bool:
+        raise ValueError("explain_summary_limits must be an explicit boolean")
     L, H, hd = heads_of(toy.cfg)
     if SECTIONS == "weights":
         return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
                           f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.",
-                          "Weights:", *weight_only_lines(weights_from or toy, max_neurons=None if all_live_neurons else 16),
+                          "Weights:", *weight_only_lines(weights_from or toy, max_neurons=None if all_live_neurons else 16,
+                                                        explain_summary_limits=explain_summary_limits),
                           "Texts:", *text_lines(toy, n_texts),
                           "Which units implement the prediction at the last position, and how?", FORMAT])
     if toy.meta.get("version") == 2:   # zoo2: the compact weight section (the legacy one is ~4k tokens there)
         return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
                           f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.",
-                          "Weights:", *weight_only_lines(weights_from or toy, max_neurons=None if all_live_neurons else 16),
+                          "Weights:", *weight_only_lines(weights_from or toy, max_neurons=None if all_live_neurons else 16,
+                                                        explain_summary_limits=explain_summary_limits),
                           "Behaviour (per head: usual attention offset:share of positions, key attended from the "
                           "last position@position:weight):", *behaviour_lines(toy, n_texts, compact=True),
                           "Which units implement the prediction at the last position, and how?", FORMAT])
@@ -462,7 +494,8 @@ def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_l
             f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.\n"
             "Weights (QK: query>key token pairs scored through the embedding; OV: source>written token pairs; "
             "comp: Q/K/V composition with an earlier head's output):")
-    return "\n".join([head, *weight_lines(weights_from or toy, top_neurons=None if all_live_neurons else 6), "Behaviour:", *behaviour_lines(toy, n_texts),
+    notes = [SUMMARY_LIMITS, NORMALIZATION_RULE] if explain_summary_limits else []
+    return "\n".join([head, *notes, *weight_lines(weights_from or toy, top_neurons=None if all_live_neurons else 6), "Behaviour:", *behaviour_lines(toy, n_texts),
                       "Which units implement the prediction at the last position, and how?", FORMAT])
 
 

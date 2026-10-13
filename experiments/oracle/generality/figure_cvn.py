@@ -23,10 +23,13 @@ G = Path("/Users/user/mpd-data/graph_oracle/generality")
 RUNS = {"c": sorted(Path("/Users/user/mpd-data/runpod/oracle-graph-generality25a/out").glob("causalgym_falsify_blocks_behavior_pod_*.jsonl")),
         "n": [G / "causalgym_falsify_blocks_behavior_n.jsonl"]
         + sorted(Path("/Users/user/mpd-data/cluster/oracle-graph-generality-cgn/out").glob("causalgym_falsify_blocks_behavior_n_pod_*.jsonl"))}
-TERMS = [("R", "reward R"), ("phi", "Φ"), ("s_point", "prediction on the text\n(circuit alone)"),
+TERMS = [("R", "reward R"), ("phi", "Φ (fidelity)"), ("s_point", "prediction on the text\n(circuit alone)"),
          ("s_flips", "adversarial flips\n(circuit alone)"), ("s_nodes", "node removal"),
          ("s_track_pp", "input changes\n(circuit patched from\nthe paired text)"),
          ("s_interchange_pp", "interchange\n(circuit patched from\nthe paired text)")]
+LEGEND = {"c": "subcomponents outside the circuit removed in every term",
+          "n": "the same, except that node removal sets the norm scales and the query and key subcomponents outside "
+               "the circuit to their values on the text"}
 TASKS = ("agr_refl_num_obj-relc", "agr_refl_num_pp", "agr_refl_num_subj-relc", "agr_sv_num_obj-relc")
 
 
@@ -50,23 +53,23 @@ def main():
                 by[(r["task"], r["pair"])].setdefault(r["variant"], {**r, "R": r.get("reward")})
         res[sem] = [share(by, m) for m, _ in TERMS]
     figure.setup()
-    fig, ax = plt.subplots(figsize=(15, 7))
+    fig, ax = plt.subplots(figsize=(15, 8))
     x = np.arange(len(TERMS))
     for off, (sem, col) in zip((-0.18, 0.18), (("c", figure.SOFT), ("n", figure.BLUE))):
         v = np.array([r[0] for r in res[sem]])
         lo = v - np.array([r[1] for r in res[sem]])
         hi = np.array([r[2] for r in res[sem]]) - v
-        ax.bar(x + off, v, 0.34, color=col, yerr=[lo, hi], capsize=4, error_kw={"lw": 1.2})
-        ax.text(x[0] + off, v[0] + hi[0] + 0.03, f"semantics {sem}", ha="center", fontsize=13, color=figure.INK)
+        ax.bar(x + off, v, 0.34, color=col, yerr=[lo, hi], capsize=4, error_kw={"lw": 1.2}, label=LEGEND[sem])
     ax.axhline(0.5, color=figure.INK, lw=1, ls=":")
     ax.text(len(TERMS) - 0.5, 0.52, "chance", ha="right", fontsize=13)
     ax.set_xticks(x, [lab for _, lab in TERMS])
     ax.set_ylim(0, 1.08)
-    ax.set_ylabel("share of minimal pairs")
+    ax.set_ylabel("share of pairs where the\nsubject circuit scores higher")
+    fig.legend(loc="lower center", ncol=1, frameon=False, fontsize=13)
     figure.clean(ax)
     n = res["n"][0][3]
     ax.set_title(f"How often each term scores the subject circuit above the attractor circuit ({n} agreement pairs)")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.12, 1, 1))
     OUT.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUT, dpi=150)
     print("wrote", OUT)

@@ -284,11 +284,11 @@ def _site(name) -> str:
     return f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"
 
 
-def _induction_anywhere(nodes: set) -> bool:
-    """The layer-1 induction pair anywhere: q #316 at some j with k #329 at j - 1."""
+def _induction_pairs(nodes: set) -> set:
+    """The positions j of the layer-1 previous-token pair (the copy core's first half): q #316 at j with k #329 at j - 1."""
     qs = {p for n, p, c in nodes if (n, c) == ("h.1.attn.q_proj", 316)}
     ks = {p for n, p, c in nodes if (n, c) == ("h.1.attn.k_proj", 329)}
-    return any(j - 1 in ks for j in qs)
+    return {j for j in qs if j - 1 in ks}
 
 
 def judge(r: dict, ans: dict) -> dict:
@@ -300,7 +300,8 @@ def judge(r: dict, ans: dict) -> dict:
     blocks = {(n, p) for n, p, c in nodes if c is None}
     has = lambda n, p, c: (n, p, c) in nodes or (n, p) in blocks  # noqa: E731
     out = {"nodes": len(nodes), "positions": len(pos), "context_share": _mean([p < t - 1 for _, p, _ in nodes]) if nodes else 0.0,
-           "induction_anywhere": _induction_anywhere(nodes)}
+           "induction_pairs": sorted(_induction_pairs(nodes))}
+    ctx_pair = any(j < t for j in out["induction_pairs"])  # the pair at a context position, where a copy reads it
     if r["kind"] == "copy":
         a, o = r["a"] - s, r["o"] - s
         core = [has(n, a, c) for n, c in CORE_A] + [has(n, o, c) for n, c in CORE_O]
@@ -308,9 +309,9 @@ def judge(r: dict, ans: dict) -> dict:
                    right=(a in pos and o in pos), wrong=not (pos - {t, t - 1}))  # wrong: the bigram reading (target-local only)
     elif r["kind"] == "context":
         m = r["m"] - s
-        out.update(holds_m=m in pos, right=m in pos, wrong=out["induction_anywhere"])
+        out.update(holds_m=m in pos, right=m in pos, wrong=ctx_pair)
     else:
-        out.update(right=not out["induction_anywhere"], wrong=out["induction_anywhere"])
+        out.update(right=not ctx_pair, wrong=ctx_pair)
     return out
 
 
@@ -332,8 +333,8 @@ def _boot(ws, B: int = 2000, seed: int = 2951):
 def score(answers: Path | None = None, tdirs: list | None = None):
     """Per contrast: the teacher's circuits (every run's mechdisc_teacher/) and S1's answers (answers: JSONL of
     {task, sample, text}, the circuit components.parse(text)["answer"]), each item's right (copy: holds a and o;
-    context: holds m; bigram: no layer-1 induction pair) and wrong (copy: target-local only; context and bigram: an
-    induction pair), and a pair right when both items are right; bootstrap 95% intervals over pairs."""
+    context: holds m; bigram: no layer-1 previous-token pair at a context position) and wrong (copy: target-local
+    only; context and bigram: that pair at a context position), and a pair right when both items are right; bootstrap 95% intervals over pairs."""
     pr = json.loads((DATA / "mechdisc_items.json").read_text())["pairs"]
     teach_ = {}
     for d in (tdirs or []) + sorted({p.parent for r in RUNS if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_teacher/md*.json")}) + [OUTROOT / "mechdisc_teacher"]:

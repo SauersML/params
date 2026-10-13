@@ -173,8 +173,131 @@ def vartest(pairs_per_task: int = 32):
                            round(float(np.mean([r[f"flip_{lab}"] for r in rs])), 2)) for lab in ("variable", "wrong")}, flush=True)
 
 
+def falsify(per_task: int = 8, only_task: str | None = None):
+    """The scorecard on CausalGym's variables: per kept task's pairs that differ at one token (the variable's
+    position p, the source's token z there), circuits on the base prompt (VPD's actives at the positions named, every
+    connection among them): target (the last position alone), variable (and p), attractor (and the wrong variable's
+    position), mismatched target (the variable circuit's positions with the source prompt's actives: a circuit built
+    for the other label), and the influential start (start_set). Per circuit reward v3's terms (phi over the text's
+    families, ge.tau on the eval split, cap_phi, the gate, size_bits, compactness against the start, the circuit reward
+    phi - phi_tau + g x 0.5 compact) and the minimal pair through the circuit: the circuit run on the source prompt in
+    C's semantics (the base's subcomponents, the source's tokens), the share of the model's base-to-source move of
+    logit(source label) - logit(base label) it reproduces (moved_c), whether its preference flips, and s_track on that
+    one change (the circuit's move applied to the model on the base, against VPD's answer's, bounded by no change).
+    -> DATA/causalgym_falsify.jsonl, one line per pair and circuit (resumable)."""
+    import components
+    import goal_eval
+    import native
+    import torch
+
+    import carry
+
+    tasks = json.loads((DATA / "causalgym_tasks.json").read_text())
+    ge = goal_eval.GoalEval(native.Native())
+    ge.nat.LENGTHS_KEPT = 1
+    nat = ge.nat
+    pool_path = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
+    pool = torch.load(pool_path, weights_only=False) if pool_path.exists() else None
+    out = Path(os.environ.get("GEN_OUT", DATA)) / f"causalgym_falsify{os.environ.get('GEN_TAG', '')}.jsonl"
+    done = {(r["task"], r["pair"]) for r in map(json.loads, out.read_text().splitlines())} if out.exists() else set()
+    kept = [t for t, v in tasks.items() if v["kept"]]
+    dist = {}  # per task its variable's distance from the last position (the mismatched offsets)
+    for task in kept:
+        ex = tasks[task]["examples"][0]
+        dist[task] = len(ex["base"]) - 1 - ex["ends"][ex["diff_spans"][0]]
+    for task in kept:
+        if only_task and task != only_task:
+            continue
+        info = tasks[task]
+        for k, ex in enumerate(info["examples"][:per_task]):
+            diff = [i for i, (x, y) in enumerate(zip(ex["base"], ex["src"])) if x != y]
+            if len(diff) != 1 or (task, k) in done:
+                continue
+            p, z = diff[0], ex["src"][diff[0]]
+            ids, t = ex["base"], len(ex["base"]) - 1
+            pw = ex["ends"][wrong_span(info["spans"], ex["diff_spans"][0])]
+            if pw in (p, t):
+                pw = next((q for q in range(t - 1, 0, -1) if q != p), None)
+            tx = ge.text(ids, [t], native.task_seed(f"causalgym:{task}:{k}"))
+            ts = ge.text(ex["src"], [t], native.task_seed(f"causalgym:{task}:{k}:src"))
+            act = lambda x, ps: [(n, q, int(c)) for n in nat.names for q in ps for c in x.vpd[n][q].nonzero().flatten().tolist()]  # noqa: E731
+            variants = {"target": act(tx, [t]), "variable": act(tx, [t, p]), "mismatched_target": act(ts, [t, p])}
+            if pw is not None:
+                variants["attractor"] = act(tx, [t, pw])
+            tau = ge.tau(tx, pool, "eval")
+            variants["start"] = sorted(ge.start_set(tx, "eval")["graph"].node_set())
+            names = list(variants)
+            graphs = [native.Graph(sorted(set(variants[v])), complete=True) for v in names]
+            P, S = nat.positions(tx.targets), sum(nat.C.values())
+            rows = ge.fidelity(tx, graphs, pool=pool, mode="reward", split="eval")
+            # the minimal pair through each circuit
+            cg = [goal_eval._c_graph(g, tx.targets, nat.C) for g in graphs]
+            q0, (lc,) = ge._changed_logq(tx, cg, [(p, z)])
+            v0, (lv,) = ge._changed_vpd(tx, [(p, z)])
+            bl, sl = ex["base_label"], ex["src_label"]
+            ref_src = nat.reference([ex["src"]], tx.targets)
+            ld = lambda lq: (lq[..., 0, sl] - lq[..., 0, bl]).flatten().tolist()  # noqa: E731
+            m0, m1 = ld(tx.ref)[0], ld(ref_src)[0]
+            c0, c1 = ld(q0), ld(lc)
+            w = float(carry.kl(ref_src, tx.ref)[0])
+            tv = float(carry.kl(ref_src, goal_eval._transplant(tx.ref, lv, v0))[0])
+            tc = carry.kl(ref_src, goal_eval._transplant(tx.ref, lc, q0)).tolist()
+            pt, fams = tau["phi_tau"], tau["families"]
+            with out.open("a") as f:
+                for i, (v, g, r) in enumerate(zip(names, graphs, rows)):
+                    ph = goal_eval.phi(r, families=fams)[0]
+                    phc = goal_eval.cap_phi(ph, pt)
+                    gate = None if phc is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (phc - pt)))
+                    b = goal_eval.size_bits(g, P, S, tx.targets)
+                    comp = goal_eval.compact(b, tau["bits_start"]) if b > 0 else None
+                    f.write(json.dumps({
+                        "task": task, "pair": k, "variant": v, "p": p, "attractor": pw, "t": t, "nodes": g.count(),
+                        "phi": ph, "phi_tau": pt, "phi_start": tau["phi_start"], "phi_empty": tau["phi_empty"], "g": gate,
+                        "reward": None if None in (phc, pt, gate, comp) else phc - pt + gate * 0.5 * comp, "bits": b,
+                        "compact": comp, **{f"s_{fm}": goal_eval.family_score(r, fm) for fm in goal_eval.PHI_FAMILIES},
+                        "ld_model": [m0, m1], "ld_circuit": [c0[i], c1[i]],
+                        "moved_c": (c1[i] - c0[i]) / (m1 - m0) if abs(m1 - m0) > 1e-6 else None,
+                        "flip_c": bool((c1[i] > 0) != (c0[i] > 0)), "flip_model": bool((m1 > 0) != (m0 > 0)),
+                        "s_track_pair": goal_eval._fid(w, tc[i], tv)}) + "\n")
+            native.free(nat.dev)
+            print(task, k, {v: round(goal_eval.phi(r, families=fams)[0] or 0, 2) for v, r in zip(names, rows)},
+                  "moved_c", {v: round((c1[i] - c0[i]) / (m1 - m0), 2) for i, v in enumerate(names)} if abs(m1 - m0) > 1e-6 else None,
+                  flush=True)
+
+
+def report():
+    rows = []
+    import templates
+
+    for p in [DATA / "causalgym_falsify.jsonl"] + templates.run_outputs("causalgym_falsify*.jsonl"):
+        if p.exists():
+            rows += [json.loads(x) for x in p.read_text().splitlines()]
+    by = collections.defaultdict(dict)
+    for r in rows:
+        by[(r["task"], r["pair"])].setdefault(r["variant"], r)
+    terms = ["reward", "phi", "s_point", "s_nodes", "s_flips", "s_track_pp", "s_interchange_pp", "s_patching_near", "s_N",
+             "s_track_pair", "moved_c"]
+    print(f"== {len(by)} pairs over {len({k[0] for k in by})} tasks; fraction of pairs where the first beats the second (ties half)")
+    print("   " + " ".join(f"{m[:12]:>12s}" for m in terms))
+    for a_, b_ in (("variable", "attractor"), ("variable", "mismatched_target"), ("variable", "target"), ("start", "variable")):
+        line = []
+        for m in terms:
+            vals = [1.0 if d[a_][m] > d[b_][m] + 1e-9 else 0.5 if abs(d[a_][m] - d[b_][m]) <= 1e-9 else 0.0
+                    for d in by.values() if a_ in d and b_ in d and d[a_].get(m) is not None and d[b_].get(m) is not None]
+            line.append(f"{np.mean(vals):12.2f}" if vals else f"{'-':>12s}")
+        print(f"   {' '.join(line)}   {a_} > {b_}")
+    for v in ("target", "variable", "attractor", "mismatched_target", "start"):
+        rs = [d[v] for d in by.values() if v in d]
+        mean = lambda m: np.mean([r[m] for r in rs if r.get(m) is not None])  # noqa: E731
+        print(f"   {v:18s} n {len(rs):3d} reward {mean('reward'):6.2f} phi {mean('phi'):5.2f} bits {mean('bits'):8.0f} "
+              f"moved_c {mean('moved_c'):5.2f} flips with the model {np.mean([r['flip_c'] == r['flip_model'] for r in rs]):.2f} "
+              f"s_track_pair {mean('s_track_pair'):.2f}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("filter", "vartest"))
+    ap.add_argument("cmd", choices=("filter", "vartest", "falsify", "report"))
+    ap.add_argument("--per-task", type=int, default=8)
+    ap.add_argument("--task", default=None, help="falsify: one task only")
     a = ap.parse_args()
-    filter_tasks() if a.cmd == "filter" else vartest()
+    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task), "report": report}[a.cmd]()

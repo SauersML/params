@@ -103,7 +103,10 @@ def nano_module():
     """nano_param_decomp.run, with wandb, matplotlib and PIL stubbed where the environment lacks them (logging and
     figures only)."""
     import importlib.util
+    import typing
 
+    if not hasattr(typing, "override"):   # Python 3.11 (a pod image): typing.override is a decorator that changes nothing
+        typing.override = lambda f: f
     for top, sub in (("wandb", None), ("matplotlib", "pyplot"), ("PIL", "Image")):
         if importlib.util.find_spec(top) is None and top not in sys.modules:
             sys.modules[top] = types.ModuleType(top)

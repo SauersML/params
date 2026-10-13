@@ -1066,7 +1066,7 @@ SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its o
 
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
                acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS,
-               phi_pool: dict | None = None, phi_log: bool = False, grow: bool = False) -> tuple:
+               phi_pool: dict | None = None, phi_log: bool = False, grow: bool = False, backup: bool = False) -> tuple:
     """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): goal_eval.GoalEval.start_set
     (VPD's active subcomponents at the targets and the m most influential positions, every connection; search split
     s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
@@ -1082,12 +1082,24 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     if grown is not None:
         for n, t, c in grown["added"]:
             start[n][t, c] = True
+    backed = None
+    if backup:                                               # the backup agent's expansion (backup.expand_circuit): the
+        import backup as backup_mod                          # compensators a removal of the start's nodes recruits in the
+                                                             # model, as subcomponents (s_nodes binds on 13 of 20 starts)
+        have = sorted(nd for n in nat.names for nd in ((n, int(t), int(c)) for t, c in start[n].nonzero().tolist()))
+        g_exp, brec = backup_mod.expand_circuit(ge, tx, native.Graph(have, complete=True), subcomponents=True)
+        for n, t, c in goal_eval.expand_blocks(g_exp, nat.C).node_set():
+            start[n][t, c] = True
+        backed = {"start": brec.get("start"), "final": brec.get("final"), "chosen": brec.get("chosen"),
+                  "added": int(sum(int(start[n].sum()) for n in nat.names)) - len(have)}
+        log(f"  backup: + {backed['added']} subcomponents ({brec.get('start')} -> {brec.get('final')})", flush=True)
     pr = Pruner(ge, tx, start, live=CONVENTION == "live", B=B)
     graph_of = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
     kl0 = pr.kl()                                            # the F1 budget, or losing at most 5% of the start's log
     budget = max(budget, kl_budget(empty, kl0, SET_RECOVERY))  # recovery (a start over it: text6011, 9004 pruned nothing)
     rec = {"m": st["m"], "positions": st["positions"], "start_s_track_pp": st["s_track_pp"], "start_units": len(pr.nodes),
-           "stages": [], "validation": [], "budget": budget, "grow": {k: v for k, v in (grown or {}).items() if k != "added"} or None}
+           "stages": [], "validation": [], "budget": budget, "grow": {k: v for k, v in (grown or {}).items() if k != "added"} or None,
+           "backup": backed}
 
     snaps = []
 
@@ -1563,7 +1575,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
           accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
           accept_draws: str = "fixed", phi_pool: dict | None = None, context: str = "refine",
-          phi_log: bool = False, grow: bool = False, task: dict | None = None) -> tuple[dict, dict]:
+          phi_log: bool = False, grow: bool = False, task: dict | None = None, backup: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -1606,7 +1618,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     if f1_start in ("influential", "set"):                   # the influential-blocks search (block_search) or the
         if f1_start == "set":                                # influential set pruned (set_search), and its wiring
             g, pb, _, _, row["blocks"] = set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, phi_log=phi_log,
-                                                    grow=grow)
+                                                    grow=grow, backup=backup)
         else:
             g, pb, _, _, row["blocks"] = block_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, context=context)
         bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
@@ -1868,6 +1880,8 @@ def main():
                     "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")
     ap.add_argument("--phi-check", action="store_true", help="with --f1-start influential, the circuit checked against the "
                     "reward's bar (goal_eval.phi >= phi_tau on the search split, the adversary's pool), backing off a stage at a time")
+    ap.add_argument("--backup", action="store_true", help="with --f1-start set: the start expanded by its compensators "
+                    "(the backup agent's backup.expand_circuit, as subcomponents) before the prune")
     ap.add_argument("--grow", action="store_true", help="with --f1-start set: a start below the reward's bar grows by the "
                     "family carrier (VPD's actives on changed texts at its positions) while phi rises (grow_start)")
     ap.add_argument("--phi-log", action="store_true", help="with --phi-check: every stage scored, each phi family's score "
@@ -1962,7 +1976,7 @@ def main():
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
                                          args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
                                          args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if phi_pool_needed else None,
-                                         args.context, args.phi_log, args.grow, json.loads(path.read_text()))
+                                         args.context, args.phi_log, args.grow, json.loads(path.read_text()), args.backup)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

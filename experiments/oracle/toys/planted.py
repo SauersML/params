@@ -8,6 +8,13 @@ neuron, remainders ~0, VPD's answer the pieces active on the text) so teacher.py
                             every pair with no MLP (it must match keys: a previous-token head then an induction head); fp on pair
                             FIXED only, its layer-0 queries and keys reading one constant embedding coordinate (attention
                             by position alone: a fixed offset), layer 1 zero.
+  binding_mixed             both routes in one model with known weights (Gur Arieh et al. 2025: real models mix binding
+                            mechanisms): two blocks, block-diagonal masks keeping them apart. fp's (residual dims 0-31
+                            with the constant coordinate, heads 0 and 1, layer 0 only, queries and keys by position) is
+                            trained first alone on pair FIXED; then km's (dims 32-63, heads 2 and 3, both layers) on texts
+                            asking pair FIXED (60%: both agree), another pair (20%: key match alone answers) and an absent
+                            key (20%: pair FIXED's value, position alone answers), fp frozen. The logits add through the
+                            tied unembedding. check() measures each route's share on each kind.
   route1 / route2           each token -> the token before it, one layer, no MLP. route1: head 1 zero (one head copies);
                             route2: trained with a random head kept alone (each head copies by itself), both on at use.
   additive / interaction    BOS x1 x2 SEP -> YES/NO, x1 in {a0, a1}, x2 in {b0, b1}. Ordinary inputs (a1, b1) YES, (a0, b1)
@@ -58,10 +65,11 @@ class ToyLM(nn.Module):
     constraint); const: embedding coordinate 0 is the constant c for every token and the other coordinates have a fixed
     norm (so a layer-0 query or key reading coordinate 0 alone is the same at every position: attention by position)."""
 
-    def __init__(self, layers: int, masks: dict | None = None, const: bool = False, seed: int = 0):
+    def __init__(self, layers: int, masks: dict | None = None, const: bool = False, seed: int = 0, width: int = D, heads: int = H):
         super().__init__()
         g = torch.Generator().manual_seed(seed)
         self.L, self.const, self.masks = layers, const, masks or {}
+        D, H = self.D, self.H = width, heads  # noqa: N806
         self.hd = D // H
         self.wte = nn.Parameter(torch.randn(VOCAB, D, generator=g) * 0.5)
         self.norm = nn.ParameterList([nn.Parameter(torch.ones(D)) for _ in range(2 * layers)])
@@ -83,8 +91,13 @@ class ToyLM(nn.Module):
     def emb(self) -> torch.Tensor:
         if not self.const:
             return self.wte
+        if self.D == 2 * D:   # binding_mixed's two blocks: each normalized apart (fp's dims 1..D-1, km's D..2D-1)
+            fp, km = self.wte[:, 1:D], self.wte[:, D:]
+            fp = fp / fp.norm(dim=1, keepdim=True) * math.sqrt(D - 1)
+            km = km / km.norm(dim=1, keepdim=True) * math.sqrt(D)
+            return torch.cat([torch.ones(VOCAB, 1, device=fp.device), fp, km], 1)
         rest = self.wte[:, 1:]
-        rest = rest / rest.norm(dim=1, keepdim=True) * math.sqrt(D - 1)
+        rest = rest / rest.norm(dim=1, keepdim=True) * math.sqrt(self.D - 1)
         return torch.cat([torch.ones(VOCAB, 1, device=rest.device), rest], 1)
 
     def rope(self, x: torch.Tensor, T: int) -> torch.Tensor:
@@ -99,11 +112,11 @@ class ToyLM(nn.Module):
         for i in range(self.L):
             h = vpd_model.rms(x, self.norm[2 * i], 1e-6)
             q, k, v = (h @ self.w(site_name(i, kk)).T for kk in ("q_proj", "k_proj", "v_proj"))
-            q, k, v = (t.view(B, T, H, self.hd).transpose(1, 2) for t in (q, k, v))
+            q, k, v = (t.view(B, T, self.H, self.hd).transpose(1, 2) for t in (q, k, v))
             y = F.scaled_dot_product_attention(self.rope(q, T), self.rope(k, T), v, is_causal=True)
             if keep is not None:
                 y = y * keep[:, :, None, None]
-            x = x + y.transpose(1, 2).reshape(B, T, D) @ self.w(site_name(i, "o_proj")).T
+            x = x + y.transpose(1, 2).reshape(B, T, self.D) @ self.w(site_name(i, "o_proj")).T
             h = vpd_model.rms(x, self.norm[2 * i + 1], 1e-6)
             x = x + vpd_model.gelu_tanh(h @ self.w(site_name(i, "c_fc")).T) @ self.w(site_name(i, "down_proj")).T
         return vpd_model.rms(x, self.ln_f, 1e-6) @ E.T
@@ -117,7 +130,7 @@ class ToyLM(nn.Module):
             sd[f"h.{i}.rms_2.weight"] = self.norm[2 * i + 1].detach().clone()
             for k in KINDS:
                 sd[f"{site_name(i, k)}.weight"] = self.w(site_name(i, k)).detach().clone()
-        cfg = {"n_layer": self.L, "n_head": H, "n_embd": D, "n_key_value_heads": H, "rotary_dim": D // H,
+        cfg = {"n_layer": self.L, "n_head": self.H, "n_embd": self.D, "n_key_value_heads": self.H, "rotary_dim": self.hd,
                "rms_norm_eps": 1e-6, "n_ctx": N_CTX, "rotary_base": 10000.0}
         return sd, cfg
 
@@ -135,6 +148,25 @@ def binding(B: int, g: torch.Generator, fixed_only: bool) -> tuple:
         x = FIXED if fixed_only else int(torch.randint(PAIRS, (1,), generator=g))
         ids[b, -2], ids[b, -1] = Q, ks[x]
         lab[b, -1] = vs[x]
+    return ids, lab, None
+
+
+MIX = (0.6, 0.2, 0.2)          # binding_mixed: pair FIXED asked, another pair asked, an absent key (pair FIXED answers)
+
+
+def binding_mix(B: int, g: torch.Generator, kind: int | None = None) -> tuple:
+    """binding_mixed's texts: kind 0 asks pair FIXED (both routes give its value), 1 another pair (key match alone),
+    2 a key absent from the text, answered by pair FIXED's value (position alone); None draws kinds at MIX's rates."""
+    ids, lab, _ = binding(B, g, True)
+    kinds = torch.multinomial(torch.tensor(MIX), B, replacement=True, generator=g) if kind is None else torch.full((B,), kind)
+    for b in range(B):
+        ks = ids[b, 1:2 * PAIRS + 1:2]
+        if kinds[b] == 1:
+            x = int(torch.tensor([p for p in range(PAIRS) if p != FIXED])[torch.randint(PAIRS - 1, (1,), generator=g)])
+            ids[b, -1], lab[b, -1] = ks[x], ids[b, 2 + 2 * x]
+        elif kinds[b] == 2:
+            absent = [k for k in KEYS if k not in ks.tolist()]
+            ids[b, -1] = absent[int(torch.randint(len(absent), (1,), generator=g))]
     return ids, lab, None
 
 
@@ -174,6 +206,8 @@ def ordinary(name: str, n: int, seed: int = 1) -> list[list[int]]:
 def counterfactual(name: str, n: int, seed: int = 2) -> list[list[int]]:
     """n texts where the pair's mechanisms disagree: binding asks for another pair, the gate pair (a0, b0)."""
     g = torch.Generator().manual_seed(seed)
+    if name == "binding_mixed":
+        return binding_mix(n, g, 1)[0].tolist()
     if name.startswith("binding"):
         ids, _, _ = binding(n, g, False)
         return ids.tolist()
@@ -206,6 +240,25 @@ def train(name: str, steps: int = 3000, seed: int = 0, log=print) -> ToyLM:
             m = torch.ones(D, D)
             m[:, hd:] = 0.0          # o_proj reads head 0 alone
             masks[site_name(0, "o_proj")] = m
+    elif name == "binding_mixed":   # two blocks in one model: block-diagonal masks keep the routes apart (known weights)
+        const, width, heads, hd = True, 2 * D, 2 * H, D // H
+        fp, km = slice(0, D), slice(D, 2 * D)            # the residual dimensions: fp's (with the constant coordinate 0), km's
+        hf, hk = slice(0, H * hd), slice(H * hd, 2 * H * hd)   # the heads' rows: fp's heads 0 and 1, km's 2 and 3
+        for i in range(2):
+            for k in ("q_proj", "k_proj", "v_proj"):
+                m = torch.zeros(width, width)
+                if i == 0:
+                    m[hf, fp] = 1.0
+                    if k != "v_proj":                    # fp's queries and keys: the constant coordinate alone (by position)
+                        m[hf, 1:D] = 0.0
+                m[hk, km] = 1.0
+                masks[site_name(i, k)] = m
+            m = torch.zeros(width, width)
+            if i == 0:
+                m[fp, hf] = 1.0
+            m[km, hk] = 1.0
+            masks[site_name(i, "o_proj")] = m
+            zero(i, "c_fc"), zero(i, "down_proj")
     elif name == "binding_km":   # attention only: the key match is the route (a previous-token head, then an induction head)
         for i in range(2):
             zero(i, "c_fc"), zero(i, "down_proj")
@@ -214,11 +267,33 @@ def train(name: str, steps: int = 3000, seed: int = 0, log=print) -> ToyLM:
             for i in range(2):
                 zero(i, "c_fc"), zero(i, "down_proj")
     masks = {k: (torch.tensor(v) if not torch.is_tensor(v) else v) for k, v in masks.items()}
-    model = ToyLM(layers, masks, const, seed)
+    model = ToyLM(layers, masks, const, seed, *((width, heads) if name == "binding_mixed" else ()))
     opt = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.01)
+    if name == "binding_mixed":   # phase 2's freeze: fp's weights, embedding columns and norm scales get no gradient
+        fp_dims = torch.zeros(2 * D)
+        fp_dims[:D] = 1.0
+        for nm_, prm in model.W.items():
+            m = torch.zeros_like(prm)
+            if nm_.startswith("h-0-attn"):
+                if nm_.endswith("o_proj"):
+                    m[:D, :H * (D // H)] = 1.0
+                else:
+                    m[:H * (D // H), :D] = 1.0
+            prm.register_hook(lambda gr, m=m: gr * (1 - m) * model.phase2 + gr * (1 - model.phase2))
+        model.wte.register_hook(lambda gr: gr * (1 - fp_dims) * model.phase2 + gr * (1 - model.phase2))
+        for prm in list(model.norm) + [model.ln_f]:
+            prm.register_hook(lambda gr: gr * (1 - fp_dims) * model.phase2 + gr * (1 - model.phase2))
+    model.phase2 = 0.0
     for step in range(steps):
         keep = None
-        if name == "binding_km":
+        if name == "binding_mixed":   # phase 1: fp alone (km's heads scaled to 0) on pair FIXED; phase 2: km on the mix, fp frozen
+            model.phase2 = float(step >= steps // 2)
+            if model.phase2:
+                ids, lab, _ = binding_mix(128, g)
+            else:
+                ids, lab, _ = binding(128, g, True)
+                keep = torch.tensor([[1.0, 1.0, 0.0, 0.0]]).expand(128, -1)
+        elif name == "binding_km":
             ids, lab, _ = binding(128, g, False)
         elif name == "binding_fp":
             ids, lab, _ = binding(128, g, True)
@@ -336,9 +411,9 @@ def logits_of(sd: dict, cfg: dict, ids: torch.Tensor) -> torch.Tensor:
     return vpd_model.Target(sd, cfg).eval()(ids)
 
 
-def ablate_head(sd: dict, layer: int, head: int) -> dict:
+def ablate_head(sd: dict, layer: int, head: int, cfg: dict | None = None) -> dict:
     """The weights with one head's attention output zeroed (its o_proj columns)."""
-    hd = D // H
+    hd = D // H if cfg is None else cfg["n_embd"] // cfg["n_head"]
     sd = dict(sd)
     W = sd[f"h.{layer}.attn.o_proj.weight"].clone()
     W[:, head * hd:(head + 1) * hd] = 0.0
@@ -353,6 +428,28 @@ def check(name: str, sd: dict, cfg: dict) -> dict:
     g = torch.Generator().manual_seed(5)
     acc = lambda s, ids, lab: float((logits_of(s, cfg, ids).argmax(-1) == lab)[lab != -100].float().mean())  # noqa: E731
     out = {}
+    if name == "binding_mixed":   # each route's share: accuracy and the answer's log-probability per kind, each head removed
+        def lp(s, ids, lab):
+            return float(logits_of(s, cfg, ids)[:, -1].log_softmax(-1).gather(1, lab[:, -1:]).mean())
+        Hc = cfg["n_head"]
+        for kind, label in enumerate(("ordinary", "key_only", "position_only")):
+            ids, lab, _ = binding_mix(512, g, kind)
+            out[label] = acc(sd, ids, lab)
+            out[f"{label}_logp"] = lp(sd, ids, lab)
+            for i in range(cfg["n_layer"]):
+                for h in range(Hc):
+                    if sd[f"h.{i}.attn.o_proj.weight"][:, h * (cfg["n_embd"] // Hc):(h + 1) * (cfg["n_embd"] // Hc)].abs().max() == 0:
+                        continue
+                    out[f"{label}_without_L{i}H{h}"] = acc(ablate_head(sd, i, h, cfg), ids, lab)
+                    out[f"{label}_logp_without_L{i}H{h}"] = lp(ablate_head(sd, i, h, cfg), ids, lab)
+            for route, heads in (("key_match", (2, 3)), ("position", (0, 1))):   # each block's every head at once
+                s2 = sd
+                for i in range(cfg["n_layer"]):
+                    for h in heads:
+                        s2 = ablate_head(s2, i, h, cfg)
+                out[f"{label}_without_{route}"] = acc(s2, ids, lab)
+                out[f"{label}_logp_without_{route}"] = lp(s2, ids, lab)
+        return out
     if name.startswith("binding"):
         ids, lab, _ = binding(512, g, True)
         cids, clab, _ = binding(512, g, False)

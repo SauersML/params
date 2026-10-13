@@ -58,6 +58,8 @@ def active(nat, tx, keep) -> list:
 
 def circuits(name: str, nat, tx) -> dict:
     """The true mechanism's circuit and the other mechanism's, as complete node sets of active pieces:
+      binding_mixed: both routes (true) against each alone: key match = km's heads (0 and 1) at the queried pair's key
+                 and value positions and the query's; position = fp's heads (2 and 3) at the value position and the query's.
       binding_*: true km = the queried pair's key and value positions and the query's (key matching); positional = its
                  value position and the query's alone; on km the positional circuit is the other mechanism, on fp the
                  key-matching one.
@@ -68,6 +70,11 @@ def circuits(name: str, nat, tx) -> dict:
     kpos, vpos, last = 2 * planted.FIXED + 1, 2 * planted.FIXED + 2, T - 1
     every = lambda n, t, u: True  # noqa: E731
     kind = lambda n: native._name_layer_kind(n)[1]  # noqa: E731
+    attn = lambda n: kind(n) in ("q_proj", "k_proj", "v_proj", "o_proj")  # noqa: E731
+    if name == "binding_mixed":
+        km = active(nat, tx, lambda n, t, u: attn(n) and u in (0, 1) and t in (kpos, vpos, T - 2, last))
+        pos = active(nat, tx, lambda n, t, u: attn(n) and u in (2, 3) and t in (vpos, last))
+        return {"true": sorted(set(km) | set(pos)), "key match alone": km, "position alone": pos}
     if name.startswith("binding"):
         km = active(nat, tx, lambda n, t, u: t in (kpos, vpos, T - 2, last))
         pos = active(nat, tx, lambda n, t, u: t in (vpos, last))
@@ -107,18 +114,14 @@ def phi_without_n(r: dict):
 def reward_v3(ge, tx, name: str, i: int, node_sets: list, pool: dict) -> list[dict]:
     """components.reward (v3, the reward RL uses) of complete node sets on one toy text, its circuit_reward = phi + g x
     0.5 compact (no teacher reference, so D = 0; g the smooth gate 1 / (1 + 2^(-4 (phi - phi_tau)))), on the eval draws
-    with the toy's pattern pool. reward's answer cap (NODE_CAP, the explainer's token budget) is lifted: the toys' exact
-    pieces put whole-mechanism circuits above 266 nodes."""
+    with the toy's pattern pool. reward's answer cap (node_cap, the explainer's token budget) is off: the toys' exact
+    pieces put whole-mechanism circuits above 266 nodes (setting components.NODE_CAP did not lift it: reward's default
+    argument holds the value it had at import, so every circuit above 266 nodes scored the invalid answer's -10)."""
     import components
 
     task = {"id": f"{name}_{i}", "model": "toy", "prompts": [{"token_ids": tx.ids, "target_positions": tx.targets, "model_top": [[["", 0.0]]]}]}
     texts = [components.render(goal_eval.to_json(native.Graph(v, complete=True))) for v in node_sets]
-    cap = components.NODE_CAP
-    components.NODE_CAP = 10 ** 9
-    try:
-        got = components.reward(ge, task, {"qa": []}, texts, pool=pool, split="eval", cache={task["id"]: tx})
-    finally:
-        components.NODE_CAP = cap
+    got = components.reward(ge, task, {"qa": []}, texts, pool=pool, split="eval", cache={task["id"]: tx}, node_cap=None)
     return [{k: r.get(k) for k in ("circuit_reward", "phi", "phi_tau", "g", "compact", "bits", "bits_start", "valid")} for r in got]
 
 
@@ -189,7 +192,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--toys", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--only", default="binding_km,binding_fp,route1,route2,additive,interaction,cancel,nothing")
+    ap.add_argument("--only", default="binding_km,binding_fp,binding_mixed,route1,route2,additive,interaction,cancel,nothing")
     ap.add_argument("--texts", type=int, default=6)
     ap.add_argument("--arms", default="current,changed")
     ap.add_argument("--decomp", choices=("exact", "vpd"), default="exact", help="exact: per-head and per-neuron pieces; vpd: vpd_toy.py's fit")

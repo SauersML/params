@@ -80,7 +80,9 @@ def loader(name: str, B: int, seed: int):
     """The toy's training distribution, [B, T] token batches."""
     g = torch.Generator().manual_seed(seed)
     while True:
-        if name == "binding_km":
+        if name == "binding_mixed":
+            yield planted.binding_mix(B, g)[0]
+        elif name == "binding_km":
             yield planted.binding(B, g, False)[0]
         elif name == "binding_fp":
             yield planted.binding(B, g, True)[0]
@@ -156,11 +158,14 @@ def donor_adversary(nano) -> tuple:
     return orig
 
 
-def fit(name: str, sd: dict, cfg: dict, steps: int, out: Path, log=print, adversary: str = "vpd") -> dict:
+def fit(name: str, sd: dict, cfg: dict, steps: int, out: Path, log=print, adversary: str = "vpd", model: nn.Module | None = None,
+        batches=None, C: dict | None = None) -> dict:
+    """VPD fitted with nano_param_decomp to a toy (TorchToy(sd, cfg) on loader(name)), or to model with batches(B, seed)
+    (an iterator of [B, T] token batches) and C pieces per matrix (interpbench.py's TransformerLens models)."""
     nano = nano_module()
-
-    T = int(next(loader(name, 2, 0)).shape[1])
-    C = sites(sd, cfg)
+    batches = batches or (lambda B, seed: loader(name, B, seed))
+    T = int(next(batches(2, 0)).shape[1])
+    C = C or sites(sd, cfg)
     ncfg = nano.Config(C_per_module=C, n_steps=steps, batch_size=64, seq_len=T, main_lr=1e-3, coeff_imp=1e-4,
                        ci_d_model=128, ci_n_blocks=2, ci_n_heads=4, ci_mlp_hidden=256, eval_freq=10 ** 9,
                        slow_eval_freq=10 ** 9, slow_eval_on_first_step=False, eval_batch_size=64, log_every=1000,
@@ -180,7 +185,7 @@ def fit(name: str, sd: dict, cfg: dict, steps: int, out: Path, log=print, advers
     orig = donor_adversary(nano) if adversary == "donor" else None
     t0 = time.perf_counter()
     try:
-        nano.decompose(TorchToy(sd, cfg), ncfg, loader(name, 64, 1), loader(name, 64, 2))
+        nano.decompose(model if model is not None else TorchToy(sd, cfg), ncfg, batches(64, 1), batches(64, 2))
     finally:
         nano.install_components, nano.CITransformer = install, CI
         if orig is not None:

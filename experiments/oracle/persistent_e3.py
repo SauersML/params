@@ -362,6 +362,7 @@ def search(net: Net, cands: list[tuple], lam: float, keep: list, log=print) -> N
     """The edit chosen from the circuit: greedy over persistent scales (k in EDIT_SCALES) of the candidates, each round
     the op that most raises the fit third's objective added, up to MAX_OPS; every step's validation metrics to keep."""
     nat = net.nat
+    seen = net.__dict__.setdefault("_fit_scores", {})  # an edit's fit-third scores, shared by the searches at each lam
     chosen, last = [], -math.inf
     for _ in range(MAX_OPS):
         best = (-math.inf, None)
@@ -369,7 +370,11 @@ def search(net: Net, cands: list[tuple], lam: float, keep: list, log=print) -> N
             if any(tuple(c[:2]) == tuple(o[:2]) for o in chosen):
                 continue
             for k in EDIT_SCALES:
-                v = _obj(_score(net, "fit", ops_deltas(nat, chosen + [(*c, k)])), lam)
+                ops = chosen + [(*c, k)]
+                key = tuple(map(tuple, ops))
+                if key not in seen:
+                    seen[key] = _score(net, "fit", ops_deltas(nat, ops))
+                v = _obj(seen[key], lam)
                 if v > best[0]:
                     best = (v, (*c, k))
         if best[1] is None or best[0] <= last:
@@ -779,6 +784,8 @@ def main():
     p.add_argument("out")
     p.add_argument("--k", type=int, default=6)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--offset", type=int, default=0, help="the circuits of preferences offset, offset + stride, ... alone")
+    p.add_argument("--stride", type=int, default=1)
     f = sub.add_parser("fit")
     f.add_argument("prefs")
     f.add_argument("out")
@@ -822,8 +829,10 @@ def main():
         ee = edit_eval.EditEval(nat)
         src = behaviours.Source()
         with open(args.out, "w") as fh:
-            for beh in preferences(ee, src, args.k, decode, log=lambda s: print(s, flush=True)):
-                beh.update(circuit_sets(ee, src, beh, log=lambda s: print(s, flush=True)))
+            for i, beh in enumerate(preferences(ee, src, args.k, decode, log=lambda s: print(s, flush=True))):
+                if i % args.stride != args.offset:
+                    continue
+                beh.update(circuit_sets(ee, src, beh, log=lambda s: print(s, flush=True)), order=i)
                 fh.write(json.dumps(beh) + "\n")
         return
     for q in nat.target.parameters():

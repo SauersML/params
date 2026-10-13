@@ -47,6 +47,9 @@ def refine(full, protected, reachable, roots, prior_errors, evaluate, emit=None)
     already rejected in the bound prior experiment; only children are proposed.
     evaluate returns four direct KL values, and must not use anchored outputs.
     """
+    # Independent reference for tiny fixtures only; real execution uses tensors.
+    if sum(len(v) for v in full.values()) > 10000:
+        raise ValueError('set reference is limited to 10000 fixture placements')
     sites = set(full)
     if sites != set(protected) or sites != set(reachable) or sites != set(roots) or sites != set(prior_errors):
         raise ValueError('identical explicit site universe required')

@@ -28,4 +28,24 @@ class PolicyTest(unittest.TestCase):
   args=list(self.fixture());args[-1]={'a':.0001}
   with self.assertRaises(ValueError):h.refine(*args,lambda *a:[0]*4)
   with self.assertRaises(RuntimeError):h.refine(*self.fixture(),lambda *a:[float('nan')]*4)
+ def test_tensor_physical_path_matches_reference_and_retains_unreachable(self):
+  import torch
+  full={'a':torch.ones(3,4,dtype=torch.bool)};protected={'a':torch.zeros_like(full['a'])};protected['a'][0,0]=True
+  count=lambda m:{'reachable_component_placements':int(m['a'][:2].sum())}
+  got=h.tensor_refine(('a',),full,protected,lambda *a:[0]*4,count,None,{'a':(0,1)},{'a':1.})
+  self.assertTrue(got['masks']['a'][2].all());self.assertTrue(got['masks']['a'][0,0]);self.assertEqual(count(got['masks'])['reachable_component_placements'],1)
+  self.assertTrue(full['a'].all())
+  replay=full['a'].clone()
+  for s,(p0,p1,c0,c1) in got['recipe']['accepted_rectangles']:replay[p0:p1,c0:c1] &= protected[s][p0:p1,c0:c1]
+  self.assertTrue(torch.equal(replay,got['masks']['a']))
+  args=self.fixture();args=list(args);args[3]={'a':(0,2,0,4)}
+  ref=h.refine(*args,lambda *a:[0]*4)
+  self.assertEqual(ref['masks']['a'],{tuple(x) for x in got['masks']['a'].nonzero().tolist()})
+ def test_tensor_physical_cap_and_worst_edit(self):
+  import torch
+  full={'a':torch.ones(8,8,dtype=torch.bool)};protected={'a':torch.zeros_like(full['a'])}
+  labels=[]
+  def ev(m,label):labels.append(label);return [0]*4 if label=='full_start' else [0,0,0,.003]
+  got=h.tensor_refine(('a',),full,protected,ev,lambda m:{'reachable_component_placements':int(m['a'].sum())},None,{'a':tuple(range(8))},{'a':1.})
+  self.assertEqual(len(got['attempts']),32);self.assertEqual(len(labels),33);self.assertTrue(got['cap_hit']);self.assertFalse(got['accepted_sites']);self.assertTrue(torch.equal(got['masks']['a'],full['a']))
 if __name__=='__main__':unittest.main()

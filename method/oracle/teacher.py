@@ -928,8 +928,8 @@ class Acceptance:
                     got = self.ge.pattern_family(tx, cg)
             else:
                 got = getattr(self.ge, fn)(self.tx, graphs)
-            for o, r in zip(out, got):
-                o.update({key: r[key] for key in keys})
+            for o, r in zip(out, got):                       # (a key the family leaves out, as s_patching_far
+                o.update({key: r.get(key) for key in keys})  # without far donors: None, which passes)
         self.calls += 1
         return out
 

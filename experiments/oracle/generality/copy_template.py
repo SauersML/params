@@ -307,8 +307,9 @@ def predict(draws: int):
 def window(draws: int = 8):
     """What the copy reads before the copied token: per held-out copy text, the w tokens ending at the earlier
     occurrence o (positions o - w + 1 .. o, w = 1, 2, 4, 8) replaced by fresh tokens (samples from the model's prediction
-    at each, never the current token), and the same window ending at every earlier occurrence; the share of draws where
-    log p(old prediction) falls by at least 1 nat. -> DATA/copy_window.jsonl"""
+    at each, never the current token; and, apart, uniform draws from the vocabulary: a sample from the model's prediction
+    can stay close to the token it replaces), and the same window ending at every earlier occurrence; the share of draws
+    where log p(old prediction) falls by at least 1 nat. -> DATA/copy_window.jsonl"""
     from types import SimpleNamespace
 
     import goal_eval
@@ -334,21 +335,88 @@ def window(draws: int = 8):
         tx = SimpleNamespace(ids=ids, seed=native.task_seed(task))
         rng = np.random.default_rng(int(tx.seed))
         rec = {"task": task, "occurrences": len(occ)}
+        V = base.shape[-1]
         for w in (1, 2, 4, 8):
             for scope, ends in (("latest", occ[-1:]), ("every", occ)):
-                xs = []
-                for d in range(draws):
-                    x2 = list(ids)
-                    for e in ends:
-                        for p in range(max(1, e - w + 1), e + 1):
-                            cand = [z for z in ge._fresh_sources(tx, p, int(tx.seed) + 31)[:16] if z != ids[t]]
-                            x2[p] = cand[int(rng.integers(len(cand)))] if cand else x2[p]
-                    xs.append(x2)
-                lp = nat.reference(xs, [t])[:, 0]
-                rec[f"{scope}_{w}"] = float(np.mean([float(base[y] - l[y]) >= 1.0 for l in lp]))
+                for src in ("model", "uniform"):  # samples from the model's prediction there, or uniform over the vocabulary
+                    xs = []
+                    for d in range(draws):
+                        x2 = list(ids)
+                        for e in ends:
+                            for p in range(max(1, e - w + 1), e + 1):
+                                if src == "model":
+                                    cand = [z for z in ge._fresh_sources(tx, p, int(tx.seed) + 31)[:16] if z != ids[t]]
+                                    x2[p] = cand[int(rng.integers(len(cand)))] if cand else x2[p]
+                                else:
+                                    z = int(rng.integers(V))
+                                    x2[p] = z if z != ids[t] else (z + 1) % V
+                        xs.append(x2)
+                    lp = nat.reference(xs, [t])[:, 0]
+                    key = f"{scope}_{w}" if src == "model" else f"{scope}_{w}_uniform"
+                    rec[key] = float(np.mean([float(base[y] - l[y]) >= 1.0 for l in lp]))
         with out.open("a") as f:
             f.write(json.dumps(rec) + "\n")
         print(rec, flush=True)
+        native.free(nat.dev)
+
+
+def routing(draws: int = 4):
+    """How layer 2 finds the copied token: per held-out copy text, the attention weight from the target to a in every
+    layer-2 head, on the text and on texts with (i) the 8 tokens ending at every earlier occurrence of the current token
+    replaced by uniform draws (no match left), (ii) the current token replaced, (iii) the copied token replaced, beside
+    log p(old prediction)'s fall. A copy whose head still finds a without the match routes by another signal.
+    -> DATA/copy_routing.jsonl"""
+    import math
+
+    import native
+    import torch
+
+    nat = native.Native()
+    tg = nat.target
+    out = DATA / "copy_routing.jsonl"
+    done = {json.loads(x)["task"] for x in out.read_text().splitlines()} if out.exists() else set()
+    left = int(os.environ.get("MAXTEXTS", 8))
+    for x in json.loads((DATA / "copy_heldout.json").read_text())["copy"]:
+        task = x["task"]
+        if task in done:
+            continue
+        if left <= 0:
+            return
+        left -= 1
+        ids, targets = native.text(Path.home() / "mpd-data/graph_oracle/texts/vpd4l" / f"{task}.json")
+        t = targets[-1]
+        occ = [j for j in range(t) if ids[j] == ids[t]]
+        a = occ[-1] + 1
+        rng = np.random.default_rng(native.task_seed(task))
+        V = tg.wte.shape[0]
+
+        def draw(pos):
+            x2 = list(ids)
+            for p in pos:
+                z = int(rng.integers(V))
+                x2[p] = z if z != ids[t] else (z + 1) % V
+            return x2
+        window = sorted({p for e in occ for p in range(max(1, e - 7), e + 1)})
+        variants = {"text": [list(ids)], "no match": [draw(window) for _ in range(draws)],
+                    "current token": [draw([t]) for _ in range(draws)], "copied token": [draw([a]) for _ in range(draws)]}
+        rec = {"task": task, "a": a, "t": t}
+        with torch.no_grad():
+            base = nat.reference([ids], [t])[0, 0]
+            y = int(base.argmax())
+            for name, xs in variants.items():
+                ws, falls = [], []
+                for x2 in xs:
+                    q, k = None, None
+                    for i, (qq, kk, vv, xx) in enumerate(tg.keys_values(torch.tensor([x2], device=nat.dev))):
+                        if i == 2:
+                            q, k = qq[0], kk[0]
+                    S = (q[:, t, None] @ k[:, :t + 1].transpose(-1, -2))[:, 0] / math.sqrt(tg.hd)  # [H, t + 1]
+                    ws.append(S.softmax(-1)[:, a].float().cpu().numpy())
+                    falls.append(float(base[y] - nat.reference([x2], [t])[0, 0][y]) >= 1.0)
+                rec[name] = {"weight": np.mean(ws, 0).round(3).tolist(), "copy_breaks": float(np.mean(falls))}
+        with out.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(task, {k: (v["weight"][4], v["copy_breaks"]) for k, v in rec.items() if isinstance(v, dict)}, flush=True)
         native.free(nat.dev)
 
 
@@ -421,7 +489,7 @@ def report():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("write", "score", "predict", "window", "report"))
+    ap.add_argument("cmd", choices=("write", "score", "predict", "window", "routing", "report"))
     ap.add_argument("task", nargs="?")
     ap.add_argument("--draws", type=int, default=8)
     args = ap.parse_args()
@@ -433,5 +501,7 @@ if __name__ == "__main__":
         predict(args.draws)
     elif args.cmd == "window":
         window(args.draws)
+    elif args.cmd == "routing":
+        routing()
     else:
         report()

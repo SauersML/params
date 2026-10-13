@@ -201,6 +201,30 @@ def equal_bits(ge, tx, bits: float, kind: str):
     return native.Graph(acts(lo), complete=True), lo
 
 
+def patch_ge(ge):
+    """The scorecard as falsify runs it on block circuits: the connection-cut family left out (every connection among
+    tens of thousands of block subcomponents is beyond memory) for every circuit alike, and the reward mode's node
+    reads off (a diagnostic outside phi: tens of thousands of nodes per draw)."""
+    ge._edge_family = lambda tx, graphs, draws, reads=False: [{"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None}
+                                                             for _ in graphs]
+    sides0 = ge._sides
+
+    def sides(tx_, graphs_):
+        f = sides0(tx_, graphs_)
+
+        def run(g, cuts=None, patch=None, reads=False):
+            got = f(g, cuts=cuts, patch=patch, reads=False)
+            return (*got, {}, {}) if reads else got
+        return run
+    ge._sides = sides
+    for fam in ("_node_family", "_interchange_family"):  # (tx, graphs, draws[, reads]) and keywords
+        f0 = getattr(ge, fam)
+
+        def wrap(*a, f0=f0, **k):
+            return f0(*a[:3], **{**k, "reads": False})
+        setattr(ge, fam, wrap)
+
+
 def score(e: dict):
     import faulthandler
     import signal
@@ -215,20 +239,8 @@ def score(e: dict):
     ge = goal_eval.GoalEval(native.Native())
     ge.nat.LENGTHS_KEPT = 1
     nat = ge.nat
-    # every circuit here is a node set with blocks: the connection-cut family would list every connection among tens
-    # of thousands of subcomponents; it is left out for all of them alike
-    ge._edge_family = lambda tx, graphs, draws, reads=False: [{"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None}
-                                                             for _ in graphs]
-    sides0 = ge._sides  # and the reward mode's node reads (a diagnostic outside phi): tens of thousands of nodes per draw
-
-    def sides(tx_, graphs_):
-        f = sides0(tx_, graphs_)
-
-        def run(g, cuts=None, patch=None, reads=False):
-            got = f(g, cuts=cuts, patch=patch, reads=False)
-            return (*got, {}, {}) if reads else got
-        return run
-    ge._sides = sides
+    goal_eval.FLIP_ROWS = int(os.environ.get("FLIP_ROWS", 16))  # the flips' rows per run: [rows, T, a block circuit's columns]
+    patch_ge(ge)
     t0 = time.perf_counter()
     tx = text_of(ge, e)
     t, a = e["t"], e["a"]

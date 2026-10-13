@@ -88,19 +88,34 @@ def run(source):
         nat.run(donor, [target], plan, *one, record=recorded)
         ref_baseline = reference(torch.tensor([base]))[:, [target]]
     cases = []
-    for kind, port, position in [('q_proj', 'q', 3), ('k_proj', 'k', 1), ('v_proj', 'v', 1),
-                                 ('v_proj', 'v', 2), ('c_fc', 'fc', 3)]:
+    specs = [('q_all', 'q_proj', 'q', 3, 3, [0, 1, 2]),
+             ('k_all', 'k_proj', 'k', 1, 1, [0, 1, 2]),
+             ('v_all', 'v_proj', 'v', 1, 1, [0, 1, 2]),
+             ('v_unchanged_position', 'v_proj', 'v', 2, 2, [0, 1, 2]),
+             ('fc_all', 'c_fc', 'fc', 3, 3, [0, 1, 2]),
+             ('v_single', 'v_proj', 'v', 1, 1, [0]),
+             ('v_wrong_component', 'v_proj', 'v', 1, 1, [1]),
+             ('v_wrong_base_position', 'v_proj', 'v', 1, 2, [0]),
+             ('v_subset_cross_position', 'v_proj', 'v', 3, 1, [0, 2]),
+             ('q_single_cross_position', 'q_proj', 'q', 1, 3, [2])]
+    for case_id, kind, port, source_position, base_position, components in specs:
         name = native.site_name(0, kind)
         mask = torch.zeros(1, 4, 3, dtype=torch.bool)
-        mask[:, position, :] = True
+        mask[:, base_position, components] = True
+        values = torch.zeros_like(recorded[name])
+        values[:, base_position, :] = recorded[name][:, source_position, :]
         with torch.no_grad():
-            expected = nat.run(base, [target], plan, *one, patch={name: (mask, recorded[name])})
-            hooked = pv.IntervenableModel({'component': f'ports.{port}.output', 'intervention': lambda b, s: s}, model=reference)
+            expected = nat.run(base, [target], plan, *one, patch={name: (mask, values)})
+            # Official VanillaIntervention performs component selection; no custom scatter.
+            hooked = pv.IntervenableModel({'component': f'ports.{port}.output',
+                                           'intervention': pv.VanillaIntervention(embed_dim=3)}, model=reference)
             _, got = hooked(base={'input_ids': torch.tensor([base])}, sources=[{'input_ids': torch.tensor([donor])}],
-                            unit_locations={'sources->base': ([[[position]]], [[[position]]])})
+                            unit_locations={'sources->base': ([[[source_position]]], [[[base_position]]])},
+                            subspaces=[[components]])
             got = got[:, [target]]
-        cases.append({'matrix': name, 'port': port, 'source_position': position, 'base_position': position,
-                      'scalar_components': list(range(3)), 'maxabs_logprob_error': float((expected - got).abs().max()),
+        cases.append({'id': case_id, 'matrix': name, 'port': port,
+                      'source_position': source_position, 'base_position': base_position,
+                      'scalar_components': components, 'maxabs_logprob_error': float((expected - got).abs().max()),
                       'intervention_maxabs_effect': float((baseline - expected).abs().max()),
                       'native_logprobs': expected.tolist(), 'pyvene_logprobs': got.tolist()})
     tolerance = 3e-5
@@ -109,6 +124,13 @@ def run(source):
         raise ValueError(f'independent execution parity failed: baseline={error}, cases={cases}')
     if cases[2]['intervention_maxabs_effect'] <= .1 or cases[3]['intervention_maxabs_effect'] >= tolerance:
         raise ValueError('wrong-position V control did not distinguish the predeclared positions')
+    controls = {}
+    selected = torch.tensor(cases[5]['native_logprobs'])
+    for index in (6, 7):
+        contrast = float((selected - torch.tensor(cases[index]['native_logprobs'])).abs().max())
+        if contrast <= .01 or cases[index]['intervention_maxabs_effect'] <= .01:
+            raise ValueError('component/position negative control is numerically ineffective')
+        controls[cases[index]['id']] = {'compared_to': 'v_single', 'maxabs_logprob_difference': contrast}
     h = hashlib.sha256()
     for name, tensor in sorted(nat.target.state_dict().items()):
         h.update(name.encode()); h.update(str(tuple(tensor.shape)).encode()); h.update(tensor.detach().numpy().tobytes())
@@ -120,7 +142,7 @@ def run(source):
     return {'schema': 1, 'pyvene_commit': PYVENE_COMMIT, 'pyvene_source': str(source), 'torch_version': torch.__version__,
             'fixture': {'seed': 23, 'layers': 1, 'd': 8, 'heads': 2, 'vocab': 16, 'C': 3, 'near': None},
             'weights_and_basis_sha256': h.hexdigest(), 'base_ids': base, 'donor_ids': donor, 'target_position': target,
-            'baseline_maxabs_logprob_error': error, 'tolerance': tolerance, 'cases': cases,
+            'baseline_maxabs_logprob_error': error, 'tolerance': tolerance, 'cases': cases, 'control_contrasts': controls,
             'source_sha256': {str(p.relative_to(ROOT)): file_sha(p) for p in
                               (Path(__file__), ROOT / 'method/oracle/native.py', ROOT / 'method/oracle/test_goal_eval.py',
                                ROOT / 'method/vpd/vpd_model.py')},

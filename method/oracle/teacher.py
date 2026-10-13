@@ -482,13 +482,32 @@ class EdgePruner(Descent):
 
     @torch.no_grad()
     def kl_sets(self, ons: torch.Tensor, precision: str = "score") -> list[float]:
-        """KL at the target of each connection subset's run, ons [K, E], in batches of B."""
+        """KL at the target of each connection subset's run, ons [K, E], in batches of B, each subset's stranded nodes
+        out of its run (stranded()), as the scorecard runs a stated graph (goal_eval's graph_kl and families take
+        _c_graph's stranded nodes out: test_connection_runs_are_the_scorecards, 83.12 against its 82.39 bits)."""
         kl = []
         for s0 in range(0, len(ons), self.B):
-            on = ons[s0:s0 + self.B].float()
-            kl += self.eng.graph_kl(self.plan, None, on[:, :self.inner], on[:, self.inner:], precision).tolist()
+            on = ons[s0:s0 + self.B]
+            f = on.float()
+            kl += carry.kl(self.eng.ref, self.eng.graph_log_probs(self.plan, None, f[:, :self.inner], f[:, self.inner:], precision,
+                                                                  off=self.stranded(on))).tolist()
         self.measured += len(ons)
         return kl
+
+    def stranded(self, ons: torch.Tensor) -> list:
+        """Per connection subset (a row of ons [K, E]) the nodes it strands (goal_eval.strand: no stated path to the
+        prediction), or None."""
+        out = []
+        for row in ons.tolist():
+            par, top = {}, []
+            for keep, (w, r) in zip(row, self.edges):
+                if keep and r is None:
+                    top.append(w)
+                elif keep:
+                    par.setdefault(r, []).append(w)
+            g = goal_eval.strand(native.Graph(self.graph.nodes, par, top), self.tx.targets, self.ge.nat.C)
+            out.append(list(g.stranded) or None)
+        return out
 
     def kl_rank(self, ons: torch.Tensor) -> list[float]:
         return self.kl_sets(ons, self.rank_precision)

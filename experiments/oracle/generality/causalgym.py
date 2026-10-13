@@ -299,7 +299,7 @@ def report(blocks: bool = False, behavior: bool = False, run: str | None = None)
 
     stem = f"causalgym_falsify{'_blocks' if blocks else ''}{'_behavior' if behavior else ''}{SUF}"
     paths = ([DATA / f"{stem}.jsonl"] + templates.run_outputs(f"{stem}*.jsonl") if run is None else
-             sorted((Path("/Users/user/mpd-data/runpod") / run / "out").glob(f"{stem}*.jsonl")))
+             sorted((Path(run) if Path(run).is_absolute() else Path("/Users/user/mpd-data/runpod") / run / "out").glob(f"{stem}*.jsonl")))
     for p in paths:
         rest = p.name[len(stem):]  # a later suffix is another semantics' file (or a pod tag: _pod_K)
         if p.exists() and ("_blocks" in p.name) == blocks and ("_behavior" in p.name) == behavior and \

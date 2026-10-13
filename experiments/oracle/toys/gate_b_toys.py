@@ -288,6 +288,47 @@ def diagnose(tr: dict, w: dict) -> str:
     return f"Δphi {dphi:+.2f}, Δ(g·½compact) {dq:+.2f}; families higher for it: {up or 'none'}"
 
 
+EPS_CAP = 0.05
+VARIANTS = {   # reward v3's circuit part recomputed from a row's family scores and eps (rescore): candidate repairs
+    "v3": "as is: phi over (1 - s + eps_own), g = sigmoid_2(4 (phi - phi_tau)), R = phi + g ½compact",
+    "eps_cap": f"each family's eps capped at {EPS_CAP} (a noisy family cannot push the residual above 1 - s + {EPS_CAP})",
+    "gate_ramp": "g x clip(phi / phi_tau, 0, 1): compactness gets nothing at phi <= 0 (the empty and one-node circuits)",
+    "eps_cap+gate_ramp": "both",
+}
+
+
+def rescore(r: dict, variant: str) -> float | None:
+    """R of a row under a variant (VARIANTS), from its family scores, eps, phi_tau and compact."""
+    fam, eps, pt = r.get("family") or {}, r.get("eps") or {}, r.get("phi_tau")
+    sc = [(s_, eps.get(f, goal_eval.EPS_FLOOR)) for f, s_ in fam.items() if s_ is not None]
+    if "eps_cap" in variant:
+        sc = [(s_, min(e, EPS_CAP)) for s_, e in sc]
+    ph = goal_eval._phi(sc) if variant != "v3" else r.get("phi")
+    if ph is None or pt is None:
+        return r.get("circuit_reward")
+    g = 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (ph - pt)))
+    if "gate_ramp" in variant:
+        g *= min(1.0, max(0.0, ph / pt)) if pt > 0 else 1.0
+    return ph + g * 0.5 * (r.get("compact") or 0.0)
+
+
+def variant_table(rows: list[dict]) -> list[str]:
+    L = ["## Candidate repairs, rescored from the same rows", "", "Gate B checks passed (texts × tiers) when R is recomputed "
+         "from each row's family scores and eps (no new measurement):", ""]
+    L += [f"- **{k}**: {v}" for k, v in VARIANTS.items()]
+    L += ["", "| variant | " + " | ".join(CHECKS) + " | all four |", "|---|" + "---|" * (len(CHECKS) + 1)]
+    for var in VARIANTS:
+        rr = [{**r, "circuit_reward": rescore(r, var)} for r in rows]
+        V = verdicts(rr)
+        cells = []
+        for ch in CHECKS:
+            got = [v[ch][0] for v in V.values() if ch in v]
+            cells.append(f"{sum(got)}/{len(got)}")
+        allp = sum(all(v[ch][0] for ch in CHECKS if ch in v) for v in V.values())
+        L.append(f"| {var} | " + " | ".join(cells) + f" | {allp}/{len(V)} |")
+    return L + [""]
+
+
 def markdown(rows: list[dict], args, notes: str = "") -> str:
     V = verdicts(rows)
     groups = list(dict.fromkeys(k[:2] for k in V))
@@ -332,6 +373,7 @@ def markdown(rows: list[dict], args, notes: str = "") -> str:
             L.append(f"| {tier} | {name} | {g[0]['category']} | {m('nodes'):.0f} | {fmt(m('circuit_reward'))} | {fmt(m('phi'))} | "
                      f"{fmt(m('phi_tau'))} | {fmt(m('g'))} | {fmt(m('compact'))} | {beats} |")
         L.append("")
+    L += variant_table(rows)
     L += ["## Failures: which term lets the control win (per text)", ""]
     for (toy, tier, i), v in V.items():
         rs = {r["candidate"]: r for r in rows if (r["toy"], r["tier"], r["text"]) == (toy, tier, i)}

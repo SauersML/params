@@ -1,0 +1,113 @@
+import copy
+from datetime import datetime,timezone,timedelta
+from decimal import Decimal
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import matched_diagnostic_sample as m
+
+
+def prepared():
+    p={'schema_version':1,'policies':m.MODELS,'calls':80,'output_cap':416,'context':32768,
+       'num_samples':1,'temperature':0.,'models':{},'checkpoint_receipt_sha256':{a:'hash' for a in ('point','intervention')},
+       'primary_prepared_sha256':'primary'}
+    ids=[str(i) for i in range(8)]+[str(i)+'__perm' for i in range(8)]
+    for name,(revision,renderer) in m.TOKENIZERS.items():
+        rows=[{'id':i,'prompt_tokens':2,'model_input':{'chunks':[{'type':'encoded_text','tokens':[1,2]}]},
+               'rendered_sha256':m.digest([1,2]),'prompt_sha256':'source'} for i in ids]
+        model={'tokenizer_revision':revision,'renderer':renderer,'inputs':rows,'stop_sequences':[3],
+               'rates_per_million':{'prefill':'$1','cached_prefill':'$.2','sample':'$2'}}
+        model['upper_per_policy_usd']=str(sum((m.charge(model,2,0,416) for _ in rows),Decimal(0)))
+        p['models'][name]=model
+    p['upper_usd_decimal']=str(sum((Decimal(p['models'][model]['upper_per_policy_usd']) for model in m.MODELS.values()),Decimal(0)))
+    return p
+
+
+class DiagnosticSampleTests(unittest.TestCase):
+    def test_validate_fit_tokens_cost_and_pair_order(self):
+        p=prepared();self.assertEqual(m.validate(p),Decimal(p['upper_usd_decimal']))
+        for mutate in (lambda p:p.update(calls=81),
+                       lambda p:p['models']['Qwen/Qwen3-8B']['inputs'][0].update(rendered_sha256='drift'),
+                       lambda p:p['models']['Qwen/Qwen3-8B'].update(upper_per_policy_usd='0')):
+            q=copy.deepcopy(p);mutate(q)
+            with self.assertRaises(ValueError):m.validate(q)
+
+    def test_cached_accounting_never_double_charges(self):
+        model=prepared()['models']['Qwen/Qwen3-8B']
+        self.assertEqual(m.charge(model,100,60,10),Decimal('72')/Decimal(1000000))
+        for hits,sampled in ((101,10),(0,417),(-1,10),(True,10)):
+            with self.assertRaises(ValueError):m.charge(model,100,hits,sampled)
+
+    def test_fresh_budget_rejects_queue_stale_and_overcap(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'budget'
+            for age,bound in ((121,529),(0,531)):
+                path.write_text(json.dumps({'asof_utc':(datetime.now(timezone.utc)-timedelta(seconds=age)).isoformat(),
+                                           'authorized_cap_usd':530,'combined_bound_usd':bound}))
+                with self.assertRaises(ValueError):m.fresh_budget(path)
+            path.write_text(json.dumps({'asof_utc':datetime.now(timezone.utc).isoformat(),
+                                       'authorized_cap_usd':530,'combined_bound_usd':529}))
+            self.assertEqual(m.fresh_budget(path),m.sha(path))
+
+    def run_mock(self,fail_at=None):
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);root=Path(tmp.name)
+        p=prepared();checkpoints=root/'parent';checkpoints.mkdir()
+        for arm in ('point','intervention'):
+            path=checkpoints/(arm+'_checkpoint.jsonl');path.write_text(json.dumps({'path':'tinker://private/'+arm})+'\n')
+            p['checkpoint_receipt_sha256'][arm]=m.sha(path)
+        (checkpoints/'start.jsonl').write_text(json.dumps({'prepared_sha256':'primary','project':m.PROJECT})+'\n')
+        (checkpoints/'complete.jsonl').write_text(json.dumps({'steps_per_arm':24,'remaining_reserved_usd':'0'})+'\n')
+        prep=root/'prepared';prep.write_text(json.dumps(p));proof=root/'proof';proof.write_text(json.dumps(m.preflight(prep)))
+        approval=root/'approval';approval.write_text(json.dumps({'execute_authorized':True,'project':m.PROJECT,
+            'prepared_sha256':m.sha(prep),'runner_sha256':m.sha(m.__file__),'preflight_sha256':m.sha(proof),'cap_usd':p['upper_usd_decimal']}))
+        budget=root/'budget';budget.write_text(json.dumps({'asof_utc':datetime.now(timezone.utc).isoformat(),'authorized_cap_usd':530,'combined_bound_usd':529}))
+        args=SimpleNamespace(prepared=prep,preflight=proof,approval=approval,fresh_budget=budget,checkpoints=checkpoints,out=root/'out')
+        submitted=[];drained=[];clones=[]
+        class Future:
+            def __init__(self,value,index=None):self.value=value;self.index=index
+            def result(self):
+                if self.index is not None:drained.append(self.index)
+                return self.value
+        class Client:
+            def sample(self,**kwargs):
+                index=len(submitted);submitted.append(index)
+                if index==fail_at:raise RuntimeError('uncertain submission')
+                return Future(SimpleNamespace(sequences=[SimpleNamespace(tokens=[7,3],stop_reason='stop')],prompt_cache_hit_tokens=1),index)
+            def get_info(self):return SimpleNamespace(model_dump=lambda **kwargs:{'is_lora':True,'lora_rank':32,'model_data':{'model_name':'Qwen/Qwen3-8B'}})
+            def save_weights_and_get_sampling_client(self):return self
+        class Service:
+            def __init__(self,**kwargs):self.project=kwargs['project_id']
+            def create_sampling_client(self,**kwargs):return Client()
+            def create_training_client_from_state_with_optimizer(self,path):clones.append(path);return Client()
+            def close(self,status):return Future(None)
+        api=SimpleNamespace(ServiceClient=Service,ModelInput=SimpleNamespace(model_validate=lambda x:x),SamplingParams=lambda **kw:kw)
+        with patch.dict(os.environ,{'TINKER_PROJECT_ID':m.PROJECT}):
+            if fail_at is None:m.execute(args,api)
+            else:
+                with self.assertRaises(RuntimeError):m.execute(args,api)
+        return args,submitted,drained,clones
+
+    def test_mock80_first_samples_restore_both_states_no_training(self):
+        args,submitted,drained,clones=self.run_mock()
+        self.assertEqual(len(submitted),80);self.assertEqual(drained,list(range(80)))
+        self.assertEqual(clones,['tinker://private/point','tinker://private/intervention'])
+        complete=json.loads((args.out/'complete.jsonl').read_text())
+        self.assertEqual(complete['first_responses'],80);self.assertEqual(complete['remaining_reserved_usd'],'0.000000')
+        self.assertEqual(complete['training_steps'],0)
+        for arm in m.POLICIES:self.assertEqual(len((args.out/(arm+'_raw.jsonl')).read_text().splitlines()),16)
+
+    def test_partial_submission_drains_and_retains_uncertain_bound(self):
+        args,submitted,drained,clones=self.run_mock(fail_at=3)
+        self.assertEqual(submitted,[0,1,2,3]);self.assertEqual(drained,[0,1,2])
+        failure=json.loads((args.out/'failure.jsonl').read_text())
+        self.assertGreater(Decimal(failure['uncertain_reserved_usd']),0)
+        self.assertFalse(failure['automatic_retry'])
+        self.assertFalse((args.out/'complete.jsonl').exists())
+
+
+if __name__=='__main__':unittest.main()

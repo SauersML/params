@@ -56,7 +56,7 @@ def kl(p,q):
     return max(0.,result)
 
 
-def run(repo,payload,out,tasks):
+def run(repo,payload,out,tasks,barrier=False):
     import torch
     from safetensors.torch import save_file
     if out.exists():raise ValueError('fresh immutable output required')
@@ -91,6 +91,13 @@ def run(repo,payload,out,tasks):
             clear();s=time.monotonic();p=torch.log_softmax(nat.vpd.target_forward(torch.tensor([ids]))[:,targets].float(),-1).clone();cpu_times.append(time.monotonic()-s);references.append(p)
         if hashes(nat)!=original:raise RuntimeError('CPU edit restoration failed')
     transfer(nat);ge=goal_eval.GoalEval(nat,semantics='c');torch.cuda.reset_peak_memory_stats()
+    if barrier:
+        if out.name not in ('worker0','worker1'):raise ValueError('two-worker named output required')
+        (out/'cuda_ready.json').write_text(json.dumps({'tensor_hashes':hashes(nat),'tasks':tasks}))
+        deadline=time.monotonic()+120
+        while not all((out.parent/name/'cuda_ready.json').exists() for name in ('worker0','worker1')):
+            if time.monotonic()>deadline:raise RuntimeError('other CUDA worker not ready; no continuation')
+            time.sleep(.1)
     for i,(t,ids,targets,c,scale) in enumerate(prepared):
         with weight_family.applied(nat,{'kind':'subcomponent','what':(SITE,c),'k':scale},ge):
             clear(ge);torch.cuda.synchronize();s=time.monotonic()
@@ -110,4 +117,5 @@ if __name__=='__main__':
     p=argparse.ArgumentParser()
     for n in ('repo','payload','out'):p.add_argument('--'+n,type=Path,required=True)
     p.add_argument('--tasks',default=','.join(SELECTED))
-    a=p.parse_args();run(a.repo,a.payload,a.out,tasks_of(a.tasks))
+    p.add_argument('--two-worker-barrier',action='store_true')
+    a=p.parse_args();run(a.repo,a.payload,a.out,tasks_of(a.tasks),a.two_worker_barrier)

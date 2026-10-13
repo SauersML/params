@@ -424,6 +424,15 @@ def _pairs(g: native.Graph) -> list[tuple]:
                   key=lambda e: (e[0], e[1] or ("", -1, -1)))
 
 
+def environment() -> str:
+    """The Python environment a score was computed in, named on every reward row and scorer score beside its semantics,
+    source and donor pool (the lead's 10-13): torch with its CUDA build, numpy, and the float32 matmul settings.
+    Between torch 2.4.1 and 2.10.0 the reward moved by at most 2e-4 (A6000, same answers), so an RL run pins it
+    (tinker_train) rather than relying on it."""
+    return (f"torch {torch.__version__} cuda {torch.version.cuda} numpy {np.__version__} "
+            f"matmul {torch.get_float32_matmul_precision()} tf32 {int(torch.backends.cuda.matmul.allow_tf32)}")
+
+
 def size_term(bits: float, scale: float) -> float:
     """The size term: an answer's description bits in orders of magnitude of the scale (size_scale, the bits of naming
     VPD's whole answer), log2(1 + bits) / log2(1 + scale), at most 1 (the lead's decision 10-12; components.size_term)."""
@@ -4353,6 +4362,14 @@ class GoalEval:
             V = self.nat.target.n_tokens  # a text in another vocabulary (a tiny test model's) is no donor
             self.donor_pools[split] = [(tasks[i].stem, x) for i in idx if i < len(tasks) for x in [native.text(tasks[i])[0]] if max(x) < V]
         return self.donor_pools[split]
+
+    def pool_id(self, split: str) -> str:
+        """The far-donor pool's identity, named on every reward row: the split, its size and a hash of its texts'
+        names (far_pool). The search split's pool is the first 400 train texts present on the machine, so a pod
+        without every train text draws other donors and scores other rewards (one train text added moved an answer
+        on text6323 by 0.13, 10-13)."""
+        names = [n for n, _ in self.far_pool(split)]
+        return f"{split}:{len(names)}:{hashlib.sha256(json.dumps(names).encode()).hexdigest()[:12]}"
 
     def donors_search(self, tx: Text, graphs: list[native.Graph], near: int = DONORS_NEAR, far: int = DONORS_FAR) -> list[dict]:
         """The teachers' donor resampling: donors on the search split (near: changed_search's texts; far: training

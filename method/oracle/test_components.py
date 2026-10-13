@@ -1109,6 +1109,7 @@ def test_repeated_circuits_run_once(tiny, monkeypatch):
     for i, j in ((0, 0), (1, 1), (2, 0), (3, 2), (4, 1)):
         assert got[i]["reward"] == pytest.approx(alone[j]["reward"], abs=1e-6), (i, j)
         assert [c for _, c in got[i]["lines"]] == pytest.approx([c for _, c in alone[j]["lines"]], abs=1e-6), (i, j)
+    assert all(r["environment"] == goal_eval.environment() and r["donor_pool"] == ge.pool_id("search") for r in got)
 
 
 def test_variable_text_batches_existing_index_list_syntax_losslessly():

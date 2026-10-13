@@ -48,6 +48,18 @@ def test_the_circuit_arm_trains_on_the_scorers_r_and_stops_otherwise():
     assert tt.reward_mismatches({}, leak, [tt.stage_reward(s, 0) for s in leak]) == []  # stage terms apply off the circuit arm
 
 
+def test_the_run_pins_its_scorers_environment_and_donor_pool():
+    pins = {}
+    a = [{"environment": "torch 2.10.0", "donor_pool": "search:400:abc"}] * 2
+    assert tt.pinned_check(pins, "circuit", a) is None
+    assert pins == {"circuit": {"environment": "torch 2.10.0", "donor_pool": "search:400:abc"}}
+    assert tt.pinned_check(pins, "circuit", a) is None
+    assert "donor_pool" in tt.pinned_check(pins, "circuit", [{"environment": "torch 2.10.0", "donor_pool": "search:399:def"}])
+    assert "environment" in tt.pinned_check(pins, "circuit", [{"environment": "torch 2.4.1", "donor_pool": "search:400:abc"}])
+    assert tt.pinned_check(pins, "edits", [{"reward": 1.0}]) is None and pins["edits"] == {}  # a scorer naming neither
+    assert "environment" in tt.pinned_check({}, "circuit", a, {"environment": "torch 2.4.1"})  # --expect-environment
+
+
 def test_the_run_stops_on_a_scorer_outside_its_frozen_reward():
     ok = [{"semantics": "n", "source": "fb33713abc"}] * 2
     assert tt.scorer_mismatch(ok, "n", "fb33713") is None

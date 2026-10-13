@@ -196,6 +196,28 @@ def scorer_mismatch(scores: list, semantics: str | None, source: str | None) -> 
     return None
 
 
+PINNED = ("environment", "donor_pool")  # score fields an rl run pins from its first score, per environment (scorer)
+
+
+def pinned_check(pins: dict, name: str, scores: list, expected: dict | None = None) -> str | None:
+    """Why scores are not from the run's pinned scorer, or None: each PINNED field of every score must equal what the
+    first score of that environment that names it gave (pins: name -> {field: value}, kept by rl in
+    LOG/scorer_pins.json across resumes), or expected's value for it (--expect-environment). A second scorer pod in
+    another Python environment, or with another set of texts (another far-donor pool: rewards up to 0.13 apart,
+    10-13), stops the run."""
+    have = pins.setdefault(name, {})
+    for f in PINNED:
+        want = (expected or {}).get(f) or have.get(f)
+        if want is None:
+            want = next((s[f] for s in scores if s.get(f)), None)
+            if want is None:
+                continue
+            have[f] = want
+        if bad := next((s for s in scores if s.get(f) != want), None):
+            return f"the scorer's {f} is {bad.get(f)!r}, not {want!r}"
+    return None
+
+
 def stage_lines(text: str, credits: list, stage: int) -> list:
     """The per-line credits the stage rewards: the circuit's lines always, the variable lines with E4x, the ANSWER and
     FINAL lines with E2g."""
@@ -576,14 +598,14 @@ ENV_SPREAD_FLOOR = 1e-3  # env_scales: an environment whose centred rewards all 
 def load_envs(a) -> dict:
     """The environments an rl run samples from, name -> {"rows": question rows (each with "task", or "id", and "question"),
     "scorer": URL[,URL...], "extra": fields added to every scoring request (e.g. edits' {"part": "score"}), "weight",
-    "expect_semantics", "expect_source", "floor", "floor_width": a smooth floor on the trained reward, for a reward without
+    "expect_semantics", "expect_source", "expect_environment", "floor", "floor_width": a smooth floor on the trained reward, for a reward without
     one (edits' removal of a central subcomponent scores -13): floored(); groups.jsonl keeps the scorer's R}: the positional questions with --scorer, --request-extra and --expect-* as
     --env-name, and every environment of --envs (a JSON file of the same fields, rows a path) beside it."""
     main = {"rows": a.questions, "scorer": a.scorer, "extra": json.loads(a.request_extra) if a.request_extra else {},
             "weight": a.env_weight, "expect_semantics": a.expect_semantics, "expect_source": a.expect_source,
-            "floor": a.reward_floor, "floor_width": a.reward_floor_width}
+            "expect_environment": getattr(a, "expect_environment", None), "floor": a.reward_floor, "floor_width": a.reward_floor_width}
     envs = {a.env_name: main} | ({k: {"extra": {}, "weight": 1.0, "expect_semantics": None, "expect_source": None,
-                                      "floor": None, "floor_width": 1.0, **v}
+                                      "expect_environment": None, "floor": None, "floor_width": 1.0, **v}
                                   for k, v in json.loads(Path(a.envs).read_text()).items()} if a.envs else {})
     for name, env in envs.items():
         rows = [json.loads(x) for x in Path(env["rows"]).read_text().splitlines() if x.strip()]
@@ -650,6 +672,8 @@ def rl(a) -> None:
     rspend = Spend(a.log, a.reader_model) if a.reader else None  # the reader's tokens, priced at its own rates
     frozen = tinker_reader(service, a.reader_model, *renderer_for(a.reader_model), rspend) if a.reader else None
     tasks = {}
+    pf = a.log / "scorer_pins.json"  # per environment its scorer's PINNED fields, from its first score
+    pins = json.loads(pf.read_text()) if pf.exists() else {}
     rng = random.Random(a.seed + a.first_step)  # a resumed run draws new texts
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=a.temperature, stop=renderer.get_stop_sequences())
     adam = tinker.AdamParams(learning_rate=a.lr, beta1=0.9, beta2=0.95, eps=1e-8)
@@ -729,8 +753,13 @@ def rl(a) -> None:
                     raise SystemExit(f"the scorer failed {failed} times (requests in {a.log}/failed_*.json)")
                 continue
             scores = r.json()["scores"]
-            if why := scorer_mismatch(scores, envs[q["_env"]]["expect_semantics"], envs[q["_env"]]["expect_source"]):
+            frozen_env = envs[q["_env"]]
+            known = json.dumps(pins)
+            if why := (scorer_mismatch(scores, frozen_env["expect_semantics"], frozen_env["expect_source"])
+                       or pinned_check(pins, q["_env"], scores, {"environment": frozen_env["expect_environment"]})):
                 raise SystemExit(f"step {step}, {q['task']}: {why}")
+            if json.dumps(pins) != known:
+                pf.write_text(json.dumps(pins))
             rewards = [stage_reward(s, stage) for s in scores]
             if envs[q["_env"]]["floor"] is not None:  # an environment's smooth floor on the trained reward
                 rewards = [floored(x, envs[q["_env"]]["floor"], envs[q["_env"]]["floor_width"]) for x in rewards]
@@ -853,6 +882,9 @@ def main():
                    "answers stop differing: identical answers carry no advantage)")
     r.add_argument("--expect-semantics", help="stop unless every score comes from a scorer in this semantics (goal_eval.SEMANTICS)")
     r.add_argument("--expect-source", help="stop unless every score comes from a scorer built at this revision (a prefix)")
+    r.add_argument("--expect-environment", help="stop unless every score comes from a scorer in this Python environment "
+                   "(goal_eval.environment()); without it the run's first score pins it, and the donor pool always "
+                   "(LOG/scorer_pins.json)")
     r.add_argument("--first-step", type=int, default=0, help="resume: the step --init's state was saved at (its checkpoint "
                                                                 "line kept; the run appends to the same --log)")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")

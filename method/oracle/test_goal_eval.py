@@ -3180,6 +3180,19 @@ def test_subset_draws_are_node_draws(tiny):
             assert [d.tolist() for d in ds] == [[nid[u] for u in w] for w in want] and all(d.dtype == np.int64 for d in ds)
 
 
+def test_pool_id_names_the_far_donor_texts(tiny):
+    """pool_id (on every reward row): the same pool the same id; one text fewer another."""
+    nat, ge, tx = tiny
+    a = ge.pool_id("search")
+    assert a.startswith("search:6:") and ge.pool_id("search") == a
+    kept = ge.donor_pools["search"]
+    try:
+        ge.donor_pools["search"] = kept[:-1]
+        assert ge.pool_id("search").startswith("search:5:")
+    finally:
+        ge.donor_pools["search"] = kept
+
+
 def test_line_loo_without_nodes(tiny):
     """line_loo on an answer with no nodes (S1 drops every node of some samples; primerl's crash at d2ff41b) returns
     its phi and no lines."""

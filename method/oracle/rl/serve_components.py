@@ -9,7 +9,8 @@ goal_eval.Text is kept for the group's later requests. A text's requests always 
                       [--edit-teach TEACH.jsonl ...] [--variables]
   POST /score {"task": TASK_ID, "answers": [TEXT, ...], "e1": [bits, ...], "tokens": [int, ...], "lines": bool}
       (e1 and tokens optional: each answer's tokens after its thinking, charged past the answer cap by components.overflow)
-      -> {"scores": [{"reward", "valid", "semantics", "source" (the scorer's GoalEval semantics and source revision),
+      -> {"scores": [{"reward", "valid", "semantics", "source", "environment", "donor_pool" (the scorer's GoalEval semantics,
+                      source revision, Python environment and far-donor pool: tinker_train rl checks them),
                       "phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q", "E2g", "E4x",
                       "E1", "C", "C_rl", "N", "F1", "F3", "E2", "E3", "E4", "nodes", "edges", "tok_edges", "malformed",
                       "dropped_nodes", "dropped_edges", "finals", "tokens", "overflow", "lines"}, ...]}  ("lines": each answer line's
@@ -55,7 +56,8 @@ def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url
 
     ge = goal_eval.GoalEval(native.Native(device))
     src = Path(__file__).resolve().parents[3] / "SOURCE"  # the pod's "python source <rev>" (scorer_pod.sh)
-    who = {"semantics": ge.semantics, "source": src.read_text().split()[-1] if src.exists() else None}  # on every score
+    who = {"semantics": ge.semantics, "source": src.read_text().split()[-1] if src.exists() else None,  # on every score
+           "environment": goal_eval.environment()}
     reader = components.http_reader(reader_url, reader_base) if reader_url else None
     vs = None
     if with_variables:
@@ -95,7 +97,7 @@ def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url
                 while len(cache) > TEXTS_KEPT:
                     cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **who, **{k[5:]: g[k] for k in g if k.startswith("term_")},
-                        **{k: g.get(k) for k in ("phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q", "lines")},
+                        **{k: g.get(k) for k in ("phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q", "lines", "donor_pool")},
                         **{k: (g["row"] or {}).get(k) for k in ("nodes", "edges", "tok_edges")},
                         **{k: g[k] for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "tokens", "overflow")}} for g in got]
                 err = None

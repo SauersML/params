@@ -173,7 +173,7 @@ def vartest(pairs_per_task: int = 32):
                            round(float(np.mean([r[f"flip_{lab}"] for r in rs])), 2)) for lab in ("variable", "wrong")}, flush=True)
 
 
-def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = False):
+def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = False, behavior: bool = False):
     """The scorecard on CausalGym's variables: per kept task's pairs that differ at one token (the variable's
     position p, the source's token z there), circuits on the base prompt (VPD's actives at the positions named, every
     connection among them): target (the last position alone), variable (and p), attractor (and the wrong variable's
@@ -189,7 +189,9 @@ def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = Fals
     With blocks: also the variable and the attractor as carriers, every site's whole output at the position as a block
     (activation patching there: a block carries whichever subcomponents the token switches on), every circuit scored
     with falsify.patch_ge's scorecard (no connection-cut family: a block circuit's connections are beyond memory)
-    -> causalgym_falsify_blocks.jsonl.
+    -> causalgym_falsify_blocks.jsonl. With behavior: the behavior-targeted mode (goal_eval.Text's task "behavior": every
+    distribution the one over the pair's two labels, the minimal pair first among every family's changed texts and
+    among F2's positions) -> causalgym_falsify[_blocks]_behavior.jsonl.
     -> DATA/causalgym_falsify.jsonl, one line per pair and circuit (resumable)."""
     import components
     import goal_eval
@@ -209,7 +211,8 @@ def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = Fals
         goal_eval.FLIP_ROWS = 16
     pool_path = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
     pool = torch.load(pool_path, weights_only=False) if pool_path.exists() else None
-    out = Path(os.environ.get("GEN_OUT", DATA)) / f"causalgym_falsify{'_blocks' if blocks else ''}{os.environ.get('GEN_TAG', '')}.jsonl"
+    stem = f"causalgym_falsify{'_blocks' if blocks else ''}{'_behavior' if behavior else ''}"
+    out = Path(os.environ.get("GEN_OUT", DATA)) / f"{stem}{os.environ.get('GEN_TAG', '')}.jsonl"
     done = {(r["task"], r["pair"]) for r in map(json.loads, out.read_text().splitlines())} if out.exists() else set()
     kept = [t for t, v in tasks.items() if v["kept"]]
     dist = {}  # per task its variable's distance from the last position (the mismatched offsets)
@@ -229,8 +232,9 @@ def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = Fals
             pw = ex["ends"][wrong_span(info["spans"], ex["diff_spans"][0])]
             if pw in (p, t):
                 pw = next((q for q in range(t - 1, 0, -1) if q != p), None)
-            tx = ge.text(ids, [t], native.task_seed(f"causalgym:{task}:{k}"))
-            ts = ge.text(ex["src"], [t], native.task_seed(f"causalgym:{task}:{k}:src"))
+            beh = lambda pair: {"behavior": {"tokens": [ex["base_label"], ex["src_label"]], "pairs": [pair]}} if behavior else None  # noqa: E731
+            ts = ge.text(ex["src"], [t], native.task_seed(f"causalgym:{task}:{k}:src"), task=beh([p, ex["base"][p]]))
+            tx = ge.text(ids, [t], native.task_seed(f"causalgym:{task}:{k}"), task=beh([p, z]))  # last: the mode is the base's
             act = lambda x, ps: [(n, q, int(c)) for n in nat.names for q in ps for c in x.vpd[n][q].nonzero().flatten().tolist()]  # noqa: E731
             variants = {"target": act(tx, [t]), "variable": act(tx, [t, p]), "mismatched_target": act(ts, [t, p]),
                         "variable_both_values": act(tx, [t, p]) + act(ts, [p])}
@@ -281,13 +285,13 @@ def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = Fals
                   flush=True)
 
 
-def report(blocks: bool = False):
+def report(blocks: bool = False, behavior: bool = False):
     rows = []
     import templates
 
-    stem = "causalgym_falsify_blocks" if blocks else "causalgym_falsify"
+    stem = f"causalgym_falsify{'_blocks' if blocks else ''}{'_behavior' if behavior else ''}"
     for p in [DATA / f"{stem}.jsonl"] + templates.run_outputs(f"{stem}*.jsonl"):
-        if p.exists() and ("_blocks" in p.name) == blocks:
+        if p.exists() and ("_blocks" in p.name) == blocks and ("_behavior" in p.name) == behavior:
             rows += [json.loads(x) for x in p.read_text().splitlines()]
     by = collections.defaultdict(dict)
     for r in rows:
@@ -322,5 +326,6 @@ if __name__ == "__main__":
     ap.add_argument("--per-task", type=int, default=8)
     ap.add_argument("--task", default=None, help="falsify: one task only")
     ap.add_argument("--blocks", action="store_true", help="falsify, report: the carrier-block variants (patched scorecard)")
+    ap.add_argument("--behavior", action="store_true", help="falsify, report: the behavior-targeted mode")
     a = ap.parse_args()
-    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task, a.blocks), "report": lambda: report(a.blocks)}[a.cmd]()
+    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task, a.blocks, a.behavior), "report": lambda: report(a.blocks, a.behavior)}[a.cmd]()

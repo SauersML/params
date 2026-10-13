@@ -9,6 +9,9 @@ C's semantics: the share of the model's move of logit(source label) - logit(base
   cg_teacher.py run K P      (on a pod) the texts copied into the texts directory; teacher.py on every P-th text from
                              the K-th -> GEN_OUT/cg_teacher/; then the test -> GEN_OUT/cg_teacher_test_K.jsonl
   cg_teacher.py report
+With --behavior, every step in the behavior-targeted mode (the task files carry "behavior": the pair's two labels and
+its minimal pair, so the teacher's start, acceptance and pick and every score are on that behavior): cgb_* texts in
+DATA/causalgym_texts_b/, GEN_OUT/cg_teacher_b/, cg_teacher_b_test_K.jsonl.
 """
 import argparse
 import json
@@ -29,11 +32,12 @@ DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/gene
 PER_TASK = 4
 
 
-def write():
+def write(behavior: bool = False):
     import causalgym
 
     tasks = json.loads((DATA / "causalgym_tasks.json").read_text())
-    out = DATA / "causalgym_texts"
+    b = "_b" if behavior else ""
+    out = DATA / f"causalgym_texts{b}"
     out.mkdir(exist_ok=True)
     ids, meta = [], {}
     for task, info in tasks.items():
@@ -44,38 +48,41 @@ def write():
             diff = [i for i, (x, y) in enumerate(zip(ex["base"], ex["src"])) if x != y]
             if len(diff) != 1 or n >= PER_TASK:
                 continue
-            name = f"cg_{task.replace('-', '_')}_{k}"
+            name = f"cg{'b' if behavior else ''}_{task.replace('-', '_')}_{k}"
             t = len(ex["base"]) - 1
             pw = ex["ends"][causalgym.wrong_span(info["spans"], ex["diff_spans"][0])]
-            (out / f"{name}.json").write_text(json.dumps({
-                "id": name, "model": "vpd4l", "family": "causalgym", "split": "causalgym", "description": task,
-                "prompts": [{"token_ids": ex["base"], "target_positions": [t]}]}))
+            tj = {"id": name, "model": "vpd4l", "family": "causalgym", "split": "causalgym", "description": task,
+                  "prompts": [{"token_ids": ex["base"], "target_positions": [t]}]}
+            if behavior:
+                tj["behavior"] = {"tokens": [ex["base_label"], ex["src_label"]], "pairs": [[diff[0], ex["src"][diff[0]]]]}
+            (out / f"{name}.json").write_text(json.dumps(tj))
             meta[name] = {"task": task, "pair": k, "p": diff[0], "z": ex["src"][diff[0]], "attractor": pw,
                           "src": ex["src"], "base_label": ex["base_label"], "src_label": ex["src_label"]}
             ids.append(name)
             n += 1
-    (DATA / "causalgym_text_ids.txt").write_text("\n".join(ids) + "\n")
-    (DATA / "causalgym_texts.json").write_text(json.dumps(meta))
+    (DATA / f"causalgym_text_ids{b}.txt").write_text("\n".join(ids) + "\n")
+    (DATA / f"causalgym_texts{b}.json").write_text(json.dumps(meta))
     print(f"{len(ids)} texts over {len({m['task'] for m in meta.values()})} tasks")
 
 
-def run(k: int, P: int):
+def run(k: int, P: int, behavior: bool = False):
     import native
 
-    meta = json.loads((DATA / "causalgym_texts.json").read_text())
+    b = "_b" if behavior else ""
+    meta = json.loads((DATA / f"causalgym_texts{b}.json").read_text())
     names = sorted(meta)[k::P]
     dest = native.TEXTS / "vpd4l"
     for nm in names:
-        shutil.copy(DATA / "causalgym_texts" / f"{nm}.json", dest / f"{nm}.json")
+        shutil.copy(DATA / f"causalgym_texts{b}" / f"{nm}.json", dest / f"{nm}.json")
     out = Path(os.environ.get("GEN_OUT", DATA))
-    lst = out / f"cg_ids_{k}.txt"
+    lst = out / f"cg_ids{b}_{k}.txt"
     lst.write_text("\n".join(names) + "\n")
     subprocess.run([sys.executable, "-B", str(ORACLE / "teacher.py"), "--tasks", str(lst), "--edges", "--f1-start", "both",
-                    "--max-tokens", "0", "--out", str(out / "cg_teacher")], check=True)
-    test(names, out / "cg_teacher", out / f"cg_teacher_test_{k}.jsonl")
+                    "--max-tokens", "0", "--out", str(out / f"cg_teacher{b}")], check=True)
+    test(names, out / f"cg_teacher{b}", out / f"cg_teacher{b}_test_{k}.jsonl", b)
 
 
-def test(names: list, tdir: Path, out: Path):
+def test(names: list, tdir: Path, out: Path, b: str = ""):
     import components
     import goal_eval
     import native
@@ -83,7 +90,7 @@ def test(names: list, tdir: Path, out: Path):
 
     import carry
 
-    meta = json.loads((DATA / "causalgym_texts.json").read_text())
+    meta = json.loads((DATA / f"causalgym_texts{b}.json").read_text())
     ge = goal_eval.GoalEval(native.Native())
     ge.nat.LENGTHS_KEPT = 1
     nat = ge.nat
@@ -93,9 +100,10 @@ def test(names: list, tdir: Path, out: Path):
         if not (tdir / f"{nm}.json").exists():
             continue
         m = meta[nm]
-        ids = json.loads((DATA / "causalgym_texts" / f"{nm}.json").read_text())["prompts"][0]["token_ids"]
+        tj = json.loads((DATA / f"causalgym_texts{b}" / f"{nm}.json").read_text())
+        ids = tj["prompts"][0]["token_ids"]
         t, p, pw = len(ids) - 1, m["p"], m["attractor"]
-        tx = ge.text(ids, [t], native.task_seed(nm))
+        tx = ge.text(ids, [t], native.task_seed(nm), task=tj)  # its behavior, when the file carries one
         g, _ = goal_eval.circuit(json.loads((tdir / f"{nm}.json").read_text()), tx.targets, nat.C, tx.T)
         nodes = sorted(g.node_set())
         held = sorted({q for _, q, _ in nodes})
@@ -134,13 +142,13 @@ def test(names: list, tdir: Path, out: Path):
               flush=True)
 
 
-def report():
+def report(behavior: bool = False):
     import collections
 
     import templates
 
     rows = []
-    for p in templates.run_outputs("cg_teacher_test_*.jsonl"):
+    for p in templates.run_outputs(f"cg_teacher{'_b' if behavior else ''}_test_*.jsonl"):
         rows += [json.loads(x) for x in p.read_text().splitlines()]
     t = [r for r in rows if r["variant"] == "teacher"]
     if not t:
@@ -169,5 +177,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("write", "run", "report"))
     ap.add_argument("args", nargs="*", type=int)
+    ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
     a = ap.parse_args()
-    {"write": write, "run": lambda: run(*a.args), "report": report}[a.cmd]()
+    {"write": lambda: write(a.behavior), "run": lambda: run(*a.args, behavior=a.behavior), "report": lambda: report(a.behavior)}[a.cmd]()

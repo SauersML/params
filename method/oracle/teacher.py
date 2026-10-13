@@ -1621,7 +1621,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     in place of the F1 search, top-k and joint path. tokens: text -> its token count, for the answer budget."""
     t0 = time.perf_counter()
     nat = ge.nat
-    tx = ge.text(ids, targets, seed)                         # (the task's seed: its draws keyed as the scorer's)
+    tx = ge.text(ids, targets, seed, task=task)              # (the task's seed: its draws keyed as the scorer's; its behavior)
     if vpd_order is not None:  # VPD's saved order (a pod has no causal-importance network: goal_eval's omitted family reads it)
         tx.vpd_order = [(n, int(t), int(c)) for n, t, c in vpd_order]
     if vpd_answer is not None:                                # VPD's answer computed where the causal-importance network is

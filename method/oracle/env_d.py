@@ -104,6 +104,40 @@ def make_reader(spec: str):
     return components.http_reader(url, base)
 
 
+EVIDENCE_RE = re.compile(r"(\d+) \((.*)\): prediction moves ([\d.]+) bits.*attention cut per layer (.*)$")
+
+
+def facts_english(f: dict, wrong: tuple[int, str] | None = None) -> str | None:
+    """English that states only measured facts (the question's evidence: units.evidence), a control whose every
+    claim holds: the positions whose changed token moves the prediction most, and the layer whose attention at the last
+    position most needs one of them. wrong: (position, token) put in place of the most important position (its
+    one-claim-changed version). None without evidence."""
+    rows = []
+    for e in f.get("evidence", []):
+        m = EVIDENCE_RE.match(e)
+        if m:
+            cuts = [(float(v), int(k[1:])) for k, v in (x.split() for x in re.findall(r"L\d+ [-+][\d.]+", m[4]))]
+            rows.append((float(m[3]), int(m[1]), m[2], min(cuts) if cuts else None))
+    if not rows:
+        return None
+    rows.sort(key=lambda r: -r[0])
+    name = {r[1]: (r[1], r[2]) for r in rows}
+    if wrong is not None:
+        name[rows[0][1]] = (wrong[0], repr(wrong[1]))
+    said = lambda p: f"position {name[p][0]} ({name[p][1]})"  # noqa: E731
+    top = rows[:3]
+    out = [f"The prediction depends most on the token at {said(top[0][1])}: changing it moves the prediction by "
+           f"{top[0][0]:.2f} bits."]
+    if len(top) > 1:
+        out.append("Next come " + " and ".join(f"{said(r[1])} ({r[0]:.2f} bits)" for r in top[1:]) + ".")
+    cut = min((r for r in rows if r[3] is not None), key=lambda r: r[3][0], default=None)
+    if cut is not None and cut[3][0] < 0:
+        out.append(f"At the last position, layer {cut[3][1]}'s attention reads {said(cut[1])}: keeping it from reading "
+                   f"there lowers the top token's log-probability by {-cut[3][0]:.2f}.")
+    out.append("Every other position moves the prediction by less than 1% of the total.")
+    return " ".join(out)
+
+
 def wrong_position(f: dict, ev: dict, seed: int) -> tuple[int, str] | None:
     """A position for the "position" edit: within the 48 before the target, outside the circuit's positions and the
     measured (listed) ones, a token with a letter or digit; drawn by the text's seed."""
@@ -182,6 +216,10 @@ def gate(a) -> None:
             names = ["correct", "shuffled"] + [k for k in ("position", "mechanism") if r.get(k)]
             texts = [r["correct"], eng[(i + 1) % len(eng)]["correct"]] + \
                 [r[k]["text"] if k == "position" else r[k] for k in names[2:]]
+            fe = facts_english(f)
+            if fe and r.get("position"):  # measured facts alone, and with their most important position swapped
+                names += ["facts", "facts_position"]
+                texts += [fe, facts_english(f, (r["position"]["position"], r["position"]["token"]))]
             got = score(reader, task_of(t), rows[t], f, texts)
             row = {"task": t, "e1": {k: s["e1"] for k, s in zip(names, got)}}
             out.append(row)
@@ -217,7 +255,7 @@ def summarize(rows: list[dict]) -> dict:
     """Per control, the texts where the correct English beats it and their share; every condition's mean E1 (no
     English 0); the gate: each one-claim-changed version beaten on >= GATE of its texts."""
     out = {"texts": len(rows), "mean_e1": {}, "beats": {}}
-    for k in ("correct", "shuffled", "position", "mechanism"):
+    for k in ("correct", "shuffled", "position", "mechanism", "facts", "facts_position"):
         xs = [r["e1"][k] for r in rows if r["e1"].get(k) is not None]
         out["mean_e1"][k] = sum(xs) / len(xs) if xs else None
     for k in ("shuffled", "position", "mechanism", "none"):
@@ -225,6 +263,10 @@ def summarize(rows: list[dict]) -> dict:
         pairs = [(c, x) for c, x in pairs if x is not None]
         out["beats"][k] = {"wins": sum(c > x for c, x in pairs), "of": len(pairs),
                            "share": sum(c > x for c, x in pairs) / len(pairs) if pairs else None}
+    pairs = [(r["e1"]["facts"], r["e1"]["facts_position"]) for r in rows
+             if r["e1"].get("facts") is not None and r["e1"].get("facts_position") is not None]
+    out["facts_beats_facts_position"] = {"wins": sum(a > b for a, b in pairs), "of": len(pairs),
+                                         "share": sum(a > b for a, b in pairs) / len(pairs) if pairs else None}
     out["mean_e1"]["none"] = 0.0
     out["gate"] = all(out["beats"][k]["share"] is not None and out["beats"][k]["share"] >= GATE for k in ("position", "mechanism")
                       if out["beats"][k]["of"])

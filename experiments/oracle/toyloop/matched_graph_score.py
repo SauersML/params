@@ -126,6 +126,54 @@ def partition(panel, workers):
     return [sorted(group) for group in groups]
 
 
+def input_partition(panel, workers, chunk_size=0):
+    """Assign complete input banks, retaining every edit and arm per input.
+
+    Zero keeps the published whole-case schedule. Positive sizes split only
+    execution work; they do not create additional statistical model samples.
+    """
+    if type(chunk_size) is not int or chunk_size < 0:
+        raise ValueError('input chunk size must be a nonnegative integer')
+    if chunk_size == 0:
+        return [{i: list(range(len(panel[i]['inputs']))) for i in group}
+                for group in partition(panel, workers)]
+    chunks = [(i, start, min(start+chunk_size, len(row['inputs'])))
+              for i, row in enumerate(panel)
+              for start in range(0, len(row['inputs']), chunk_size)]
+    if type(workers) is not int or not 1 <= workers <= len(chunks):
+        raise ValueError('worker count must be within input chunk count')
+    groups, loads = [{} for _ in range(workers)], [0] * workers
+    for i, start, end in sorted(chunks, key=lambda x: (
+            -(x[2]-x[1])*len(panel[x[0]]['edits']), x[0], x[1])):
+        worker = min(range(workers), key=lambda w: (loads[w], w))
+        groups[worker].setdefault(i, []).extend(range(start, end))
+        loads[worker] += (end-start)*len(panel[i]['edits'])
+    return [{i: sorted(banks) for i, banks in sorted(group.items())} for group in groups]
+
+
+def input_cartesian(panel, arms, selection):
+    return {(panel[i]['stratum'], panel[i]['id'], arm, edit, inp)
+            for i, banks in selection.items() for arm in arms
+            for edit in range(len(panel[i]['edits'])) for inp in banks}
+
+
+def input_contract(selection, chunk_size):
+    return {} if chunk_size == 0 else {
+        'input_chunk_size': chunk_size,
+        'input_indices': {str(i): banks for i, banks in selection.items()}}
+
+
+def check_input_contract(record, selection, chunk_size):
+    expected = input_contract(selection, chunk_size)
+    if chunk_size and (type(record.get('input_chunk_size')) is not int
+                       or not isinstance(record.get('input_indices'), dict)
+                       or any(not isinstance(banks, list) or any(type(i) is not int for i in banks)
+                              for banks in record['input_indices'].values())):
+        raise ValueError('invalid input chunk contract types')
+    if {k: record[k] for k in ('input_chunk_size', 'input_indices') if k in record} != expected:
+        raise ValueError('incompatible input chunk contract')
+
+
 def validate_panel(manifest, parent_path=None, parent_sha256=None, diagnostic_sha256=None):
     """A stronger baseline may only use the unchanged eight new-model cases."""
     if diagnostic_sha256 is not None:
@@ -186,7 +234,9 @@ def merge(args):
                        getattr(args, 'strong_baseline_parent_sha256', None),
                        args.manifest_sha256 if getattr(args, 'clarified_unit_permutation', False) else None)
     panel, arms = manifest['panel'], manifest['arms']
-    assignment = partition(panel, args.workers)
+    chunk_size = getattr(args, 'input_chunk_size', 0)
+    selections = input_partition(panel, args.workers, chunk_size)
+    assignment = [list(selection) for selection in selections]
     global_cap = sum(len(r['inputs']) * len(r['edits']) * (2 + len(arms)) for r in panel)
     if manifest['forward_cap'] != global_cap:
         raise ValueError('global forward cap mismatch')
@@ -194,6 +244,7 @@ def merge(args):
         raise ValueError('exactly one complete shard per worker required')
     rows, seen, receipts = [], set(), []
     actual_forwards = 0
+    model_states = {}
     for directory in args.shard:
         contract = json.loads((directory / 'contract.json').read_text())
         done = json.loads((directory / 'complete.json').read_text())
@@ -206,12 +257,16 @@ def merge(args):
                 or contract['case_indices'] != assignment[worker]):
             raise ValueError('duplicate or incompatible shard contract')
         seen.add(worker)
+        selection = selections[worker]
+        check_input_contract(contract, selection, chunk_size)
+        check_input_contract(done, selection, chunk_size)
         if contract['global_forward_cap'] != global_cap:
             raise ValueError('shard global cap mismatch')
         indices = assignment[worker]
-        cap = sum(len(panel[i]['inputs']) * len(panel[i]['edits']) * (2 + len(arms)) for i in indices)
+        cap = sum(len(banks) * len(panel[i]['edits']) * (2 + len(arms))
+                  for i, banks in selection.items())
         shard_rows = [json.loads(line) for line in (directory / 'results.jsonl').read_text().splitlines() if line.strip()]
-        summarize(shard_rows, cartesian(panel, arms, indices))
+        summarize(shard_rows, input_cartesian(panel, arms, selection))
         if (contract['forward_cap'] != cap or done['forward_cap'] != cap
                 or type(done['actual_forwards']) is not int
                 or done['actual_forwards'] != 2 * (cap // (2 + len(arms))) + sum(bool(r['valid']) for r in shard_rows)
@@ -227,6 +282,10 @@ def merge(args):
             restored = directory / f'{index}.restored.json'
             if json.loads(original.read_text()) != json.loads(restored.read_text()):
                 raise ValueError('shard model restoration failed')
+            state = json.loads(original.read_text())
+            if index in model_states and state != model_states[index]:
+                raise ValueError('input chunks used different original model/basis states')
+            model_states[index] = state
         files = {row['file']: row['sha256'] for row in shard_rows}
         if any(row['sha256'] != files[row['file']] for row in shard_rows):
             raise ValueError('conflicting tensor hashes')
@@ -245,7 +304,10 @@ def merge(args):
           'responses_sha256': args.responses_sha256, 'workers': args.workers,
           'partition': assignment, 'shards': sorted(receipts, key=lambda r: r['worker']),
           'candidate_worlds': len(rows), 'actual_forwards': actual_forwards,
-          'forward_cap': global_cap, 'scorer_sha256': sha(__file__)})
+          'forward_cap': global_cap, 'scorer_sha256': sha(__file__),
+          **({'input_chunk_size': chunk_size,
+              'input_assignments': [input_contract(s, chunk_size)['input_indices'] for s in selections]}
+             if chunk_size else {})})
     with (args.out / 'results.jsonl').open('x') as stream:
         for row in rows:
             stream.write(json.dumps(row, allow_nan=False) + '\n')
@@ -261,10 +323,12 @@ def run(args):
                    getattr(args, 'strong_baseline_parent_sha256', None),
                    args.manifest_sha256 if getattr(args, 'clarified_unit_permutation', False) else None)
     panel, arms = manifest['panel'], manifest['arms']
-    assignment = partition(panel, args.workers)
+    chunk_size = getattr(args, 'input_chunk_size', 0)
+    selections = input_partition(panel, args.workers, chunk_size)
     if type(args.worker) is not int or args.worker not in range(args.workers):
         raise ValueError('worker index out of range')
-    indices = assignment[args.worker]
+    selection = selections[args.worker]
+    indices = list(selection)
     required_source = ('experiments/oracle/toyloop/circuit.py', 'experiments/oracle/toys/planted.py',
                        'method/oracle/native.py', 'method/oracle/native_units.py',
                        'method/oracle/goal_eval.py', 'method/oracle/carry.py',
@@ -303,17 +367,19 @@ def run(args):
     from safetensors.torch import save_file
     torch.set_num_threads(1)
     args.out.mkdir()
-    expected_keys = cartesian(panel, arms, indices)
+    expected_keys = input_cartesian(panel, arms, selection)
     forwards = 0
     raw_rows = []
     global_cap = sum(len(row['inputs']) * len(row['edits']) * (2 + len(arms)) for row in panel)
-    max_forwards = sum(len(panel[i]['inputs']) * len(panel[i]['edits']) * (2 + len(arms)) for i in indices)
+    max_forwards = sum(len(banks) * len(panel[i]['edits']) * (2 + len(arms))
+                       for i, banks in selection.items())
     if global_cap != manifest['forward_cap']:
         raise ValueError('forward cap does not cover frozen Cartesian panel')
     write(args.out / 'contract.json', {'manifest_sha256': args.manifest_sha256,
           'responses_sha256': sha(args.responses), 'forward_cap': max_forwards,
           'global_forward_cap': global_cap, 'worker': args.worker, 'workers': args.workers,
-          'case_indices': indices, 'scorer_sha256': sha(__file__)})
+          'case_indices': indices, 'scorer_sha256': sha(__file__),
+          **input_contract(selection, chunk_size)})
     for case_index in indices:
         item = panel[case_index]
         expected_format = 'legacy_mermaid_english' if item['stratum'] == 'retention' else 'graph_only'
@@ -325,6 +391,7 @@ def run(args):
         blob = torch.load(path, map_location='cpu', weights_only=True)
         toy = SimpleNamespace(sd=blob['sd'], cfg=blob['cfg'], meta={})
         inputs, edits = item['inputs'], item['edits']
+        bank_indices = selection[case_index]
         if (not inputs or len(inputs) != len(item['input_roles']) or not edits
                 or edits[0] != {'kind': 'no_edit', 'operations': []}):
             raise ValueError('nonempty input panel and leading no-edit world required')
@@ -343,7 +410,8 @@ def run(args):
             error = answer_error(sample, item['answer_format'])
             graphs[arm] = []
             sizes = []
-            for ids in inputs:
+            for index in bank_indices:
+                ids = inputs[index]
                 graph, reason = None, error
                 if reason is None:
                     try:
@@ -363,10 +431,12 @@ def run(args):
                               'full_component_position_nodes': len(ids) * sum(int(nat.C[name]) for name in nat.names)})
             write(args.out / f'{case_index}.{arm}.size.json', {'case': item['id'], 'arm': arm,
                   'stratum': item['stratum'], 'per_input': sizes,
+                  **({'input_indices': bank_indices} if chunk_size else {}),
                   'scope': 'report complexity alongside fidelity; not a necessity or compute-speedup certificate'})
         full = [native.Graph({(name, pos, piece) for name in nat.names for pos in range(len(ids))
-                              for piece in range(int(nat.C[name]))}, complete=True) for ids in inputs]
-        baselines = []
+                              for piece in range(int(nat.C[name]))}, complete=True)
+                for ids in (inputs[index] for index in bank_indices)]
+        baselines = {}
         for edit_index, edit in enumerate(edits):
             kind, operations = edit['kind'], edit['operations']
             if kind not in ('no_edit', 'individual', 'joint') or len(operations) != {'no_edit': 0, 'individual': 1, 'joint': 2}[kind]:
@@ -376,20 +446,21 @@ def run(args):
                     if unit_kind not in ('head', 'neuron') or scale not in (0., .5):
                         raise ValueError('invalid frozen intervention')
                     stack.enter_context((scaled_head if unit_kind == 'head' else scaled_neuron)(nat, layer, unit, scale))
-                for index, ids in enumerate(inputs):
+                for local_index, index in enumerate(bank_indices):
+                    ids = inputs[index]
                     clear_intervention_caches(nat)
                     p = nat.reference([ids], [len(ids)-1]).detach().clone()
-                    integrity = goal_eval.GoalEval(nat).graph_ref(ids, [len(ids)-1], full[index], live=True, norms={})
+                    integrity = goal_eval.GoalEval(nat).graph_ref(ids, [len(ids)-1], full[local_index], live=True, norms={})
                     forwards += 2
                     integrity_kl = raw_kl_bits(p, integrity)
                     if integrity_kl > .001:
                         raise RuntimeError('full architecture integrity failure')
                     if edit_index == 0:
-                        baselines.append(p.clone())
+                        baselines[index] = p.clone()
                     tensors = {'p': p.contiguous(), 'full': integrity.contiguous(), 'p0': baselines[index].contiguous()}
                     world_rows = []
                     for arm in arms:
-                        graph, error = graphs[arm][index]
+                        graph, error = graphs[arm][local_index]
                         clear_intervention_caches(nat)
                         q = None if graph is None else goal_eval.GoalEval(nat).graph_ref(ids, [len(ids)-1], graph, live=False)
                         forwards += int(q is not None)
@@ -422,7 +493,7 @@ def run(args):
     write(args.out / 'summary.json', summary)
     write(args.out / 'complete.json', {'actual_forwards': forwards, 'forward_cap': max_forwards,
           'candidate_worlds': len(raw_rows), 'models': len(indices), 'arms': arms,
-          'case_indices': indices})
+          'case_indices': indices, **input_contract(selection, chunk_size)})
 
 
 if __name__ == '__main__':
@@ -430,6 +501,8 @@ if __name__ == '__main__':
     parser.add_argument('--merge', action='store_true')
     parser.add_argument('--worker', type=int, default=0)
     parser.add_argument('--workers', type=int, default=1)
+    parser.add_argument('--input-chunk-size', type=int, default=0,
+                        help='opt-in contiguous input-bank chunks; zero preserves whole-case scheduling')
     parser.add_argument('--shard', type=Path, action='append', default=[])
     parser.add_argument('--strong-baseline-parent', type=Path)
     parser.add_argument('--strong-baseline-parent-sha256')

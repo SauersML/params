@@ -826,10 +826,10 @@ flowchart BT
   MATCHDIAG -- identifies the next learning bottleneck --> C1
   class MATCHDIAG check
 
-  MATCHGAP["<b>Resolve shared failures before more training</b><br/>All five policies fail additive-vote and gate originals.<br/>Keep each answer's selected pieces unchanged;<br/>allow every architectural edge among those pieces.<br/>Recovery would identify missing wiring as a cause;<br/>failure would not prove the selected pieces insufficient.<br/>Two exposed models; all five policies and edits.<br/>At most 2688 free CPU forwards; no oracle calls.<br/>Separate posthoc diagnosis; primary answers stay fixed.<br/>Use the result to choose the next input or teacher fix.<br/>PREPARING · codex/fork_review + eval_recovery"]
+  MATCHGAP["<b>Localize shared wiring failures</b><br/>MATS20038 PASS4tests/2688forwards.<br/>Same selected pieces and explicit execution branch;<br/>all architecture-valid edges/output links added.<br/>9/10 case-policy controls become faithful;<br/>all5 additive and4/5 gate controls pass.<br/>Gate intervention arm remains12.38bits worstKL.<br/>Edges grow1.78–3.19x; nodes stay unchanged.<br/>1920worlds independently audited, original rows fixed.<br/>No eval-target training or primary repair.<br/>Success supports missing wiring; failure alone<br/>does not establish insufficient unit selection.<br/>Two exposed models, finite posthoc edit panel.<br/>MEASURED · codex/fork_review + eval_recovery"]
   MATCHDIAG -- common failure localization --> MATCHGAP
   MATCHGAP -- guides the next fidelity improvement --> C1
-  class MATCHGAP active
+  class MATCHGAP check
 
 %% CHUNKSCHED: reduce future oracle evaluation stragglers without dropping models/worlds; original runs immutable. Historical redundant_004 costs1163s; count*length^2 does not help.44b3fb case0 Native parity20037 passes2520forwards; positive-empty-bank guard is validation only. Next use explicit input chunks on a future authorized run and measure actual wall time, not claim speedup from parity.
   CHUNKSCHED["<b>Spread slow scoring work across input banks</b><br/>One case took19.4min; length-squared scheduling did not help.<br/>Optional chunks retain all edits, policies and model-level metrics.<br/>12 tests pass; one real Native case,2520 forwards:<br/>all tensors, p0, tops, KL and restoration bitwise identical.<br/>Empty banks/edits fail closed; default case mode unchanged.<br/>Future runtime gain unmeasured · codex/variable_reward"]

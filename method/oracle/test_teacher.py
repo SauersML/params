@@ -27,7 +27,6 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "vpd"))
 
 import carry  # noqa: E402
-import components  # noqa: E402
 import goal_eval  # noqa: E402
 import native  # noqa: E402
 import teacher  # noqa: E402
@@ -585,11 +584,11 @@ def test_ranked_draws_each_hold_their_floor():
     assert acc.ranked(recs, prompts, range(10)) == (pytest.approx(9.05 / 10), [])
     acc.draws = "fv"
     prompts = [(3, 12)] + prompts[1:]
-    assert acc.ranked([rec((3, 12), 0.77)] + recs[1:], prompts, range(10))[1] == []   # floor_of(0.8) = 0.76
-    assert acc.ranked([rec((3, 12), 0.75)] + recs[1:], prompts, range(10))[1] == [[3, 12, pytest.approx(0.75), pytest.approx(0.76)]]
-    # floors: 5% below the start's value, at most 0.9, below a value under 0 too
-    assert teacher.floor_of(0.5) == pytest.approx(0.475) and teacher.floor_of(2.0) == 0.9
-    assert teacher.floor_of(-0.4) == pytest.approx(-0.42)
+    assert acc.ranked([rec((3, 12), 0.76)] + recs[1:], prompts, range(10))[1] == []   # floor_of(0.8) = 0.75
+    assert acc.ranked([rec((3, 12), 0.74)] + recs[1:], prompts, range(10))[1] == [[3, 12, pytest.approx(0.74), pytest.approx(0.75)]]
+    # floors: the reward's per-family floors (goal_eval.floors), 0.05 below the start's value, in [0, 0.9]
+    assert teacher.floor_of(0.5) == pytest.approx(0.45) and teacher.floor_of(2.0) == 0.9 and teacher.floor_of(0.02) == 0.0
+    assert teacher.floor_of(0.8) == goal_eval.floors({"s_point_c": 0.8}, ["point"])["point"]
 
 
 def test_validated_backs_off_to_the_last_passing_set():
@@ -630,19 +629,6 @@ def test_set_search_validation_holds_its_floor():
     assert g.count() == int(ps.on.sum()) <= rec["start_units"]
 
 
-def test_circuit_score_is_the_rewards_circuit_term():
-    # at the bar with the start's bits 0; above it, compactness counts nearly in full; capped phi a tenth past bar + 1
-    assert teacher.circuit_score(1.5, 1.5, 1000.0, 1000.0) == 0.0
-    assert teacher.circuit_score(None, 1.5, 1000.0, 1000.0) is None
-    above = teacher.circuit_score(2.0, 1.5, 500.0, 1000.0)
-    g = 1 / (1 + 2 ** (-components.GATE_SLOPE * 0.5))
-    assert above == pytest.approx(0.5 + g * teacher.SIZE_WEIGHT * 1.0)
-    assert teacher.circuit_score(4.0, 1.5, 1000.0, 1000.0) == pytest.approx(1.0 + goal_eval.PHI_SLOPE * 1.5)
-    # text9002 under --backup: 536 subcomponents at phi 2.37 over a bar of 1.67 with 3.9x the start's bits scores below
-    # the start's 0
-    assert teacher.circuit_score(2.3745, 1.6675, 487867.0, 123945.0) < 0.0
-
-
 @pytest.mark.skipif(DEVICE == "cpu", reason="needs a GPU")
 def test_set_search_writes_the_highest_scoring_stage():
     if not teacher.POOL.exists():
@@ -654,15 +640,23 @@ def test_set_search_writes_the_highest_scoring_stage():
     tx.vpd = pr.tx.vpd
     empty, vpd = ge._bounds(tx, teacher.CONVENTION)
     acc = teacher.Acceptance(ge, tx, ("changed",), "pp", "fv")
-    g, ps, _, _, rec = teacher.set_search(ge, tx, empty, vpd, teacher.kl_budget(empty, vpd), acc, levels=("site", "chunk4"),
-                                          phi_pool=torch.load(teacher.POOL))
+    calls, term = [], goal_eval.circuit_term
+
+    def recorded(row, tau, bits, **kw):                         # the reward's own circuit term, each call kept
+        calls.append((tau, bits, term(row, tau, bits, **kw)))
+        return calls[-1][2]
+    goal_eval.circuit_term = recorded
+    try:
+        g, ps, _, _, rec = teacher.set_search(ge, tx, empty, vpd, teacher.kl_budget(empty, vpd), acc, levels=("site", "chunk4"),
+                                              phi_pool=torch.load(teacher.POOL))
+    finally:
+        goal_eval.circuit_term = term
     tau = ge.tau(tx, None, "search")
-    # every stage scored as the reward's circuit term (phi over the text's families against its bar, the start set's
-    # bits), the written one the highest
-    assert [x[0] for x in rec["phi"]] == ["chunk4", "site", "start"]
-    for name, ph, bar, n, fam, bits, score in rec["phi"]:
-        assert bar == tau["phi_tau"] and score == teacher.circuit_score(ph, bar, bits, tau["bits_start"])
-    best = max((x for x in rec["phi"] if x[6] is not None), key=lambda x: x[6])
+    # every stage scored by goal_eval.circuit_term against the text's tau with its own bits, the written one the highest
+    assert [x[0] for x in rec["phi"]] == ["chunk4", "site", "start"] and len(calls) == 3
+    for (name, ph, bar, n, fam, bits, score, v), (t, b, ct) in zip(rec["phi"], calls):
+        assert t is tau and b == bits and score == ct["term"] and v == ct["v"] and bar == tau["phi_tau"]
+    best = max(rec["phi"], key=lambda x: x[6])
     assert rec["phi_stage"] == best[0] and rec["score"] == best[6] and g.count() == best[3]
 
 
@@ -685,8 +679,9 @@ def test_forward_start_adds_positions_until_the_bar():
     sizes = [s[1] for s in got["steps"]]
     assert sizes == sorted(sizes) and got["steps"][0][0] is None and sizes[-1] == len(got["nodes"])
     f2 = {int(q) for q, _ in tx.f2} - set(tx.targets)
-    assert got["phi"] >= got["bar"] + teacher.PHI_SLACK or set(got["positions"]) >= f2
-    assert all(ph < got["bar"] + teacher.PHI_SLACK for _, _, ph in got["steps"][:-1])
+    faithful = lambda ph, v: ph >= got["bar"] + teacher.PHI_SLACK and v == 0   # noqa: E731
+    assert faithful(got["phi"], got["v"]) or set(got["positions"]) >= f2
+    assert not any(faithful(ph, v) for _, _, ph, v, _ in got["steps"][:-1])
 
 
 def test_family_acceptance_scores_as_fidelity():

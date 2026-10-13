@@ -132,28 +132,17 @@ REPAIR_M = 4          # the omitted lever's budget the flip repair answers (goal
 EDGE_NODES = 6000     # the influential search wires circuits of at most this many subcomponents (a block's every one
 # counted): text9002's 31 blocks and 20,063 subcomponents overflowed the host's memory in EdgePruner
 ACCEPT_BATCH = 8      # Descent.prune's accept checks per call: the largest prefixes within the budget first
-FLOOR_SLACK = 0.95    # an acceptance term's floor: min(0.9, 0.95 x the start's) (the lead's 10-12: a start below 0.9 keeps slack)
+FLOOR_SLACK = 0.95    # the phi check's slack: the residual within 1/0.95 of the bar's
 PHI_SLACK = math.log2(FLOOR_SLACK)  # --phi-check's: phi >= phi_tau + log2(0.95), the residual (2^-phi) within 1/0.95 of the
 # bar's (phi_tau is the start set's own phi on these texts: every pruned stage fell below it, the start itself by 2e-8)
 KL_FLOOR = 1e-9       # a KL's floor before a fractional power (goal_eval.recovered_log's): a nearly exact answer's KL can
 # round below 0, and a negative base to a fractional power is complex (fleet's planted toys)
 
 
-def circuit_score(ph: float | None, bar: float | None, bits: float, bits_start: float) -> float | None:
-    """components.reward's circuit_reward without teacher dominance (D, against this teacher itself): cap_phi(phi) less
-    the bar, plus the gate g = 1 / (1 + 2^(-GATE_SLOPE (phi - bar))) times SIZE_WEIGHT x compact (log2 of the start
-    set's bits over these)."""
-    if ph is None or bar is None:
-        return None
-    ph = goal_eval.cap_phi(ph, bar)
-    g = 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (ph - bar)))
-    return ph - bar + g * SIZE_WEIGHT * (goal_eval.compact(bits, bits_start) or 0.0)
-
-
 def floor_of(v: float | None) -> float | None:
-    """An acceptance term's floor from the start's value: min(0.9, it less (1 - FLOOR_SLACK) of its size), FLOOR_SLACK x
-    it when positive (a single draw's score can be below 0, where FLOOR_SLACK x it would be above it) (None: no floor)."""
-    return None if v is None else min(RECOVERED, v - (1 - FLOOR_SLACK) * abs(v))
+    """An acceptance term's floor from the start's value, the reward's per-family floor (goal_eval.floors): max(0,
+    min(FLOOR_TOP 0.9, it - FLOOR_MARGIN 0.05)) (None: no floor)."""
+    return None if v is None else max(0.0, min(goal_eval.FLOOR_TOP, v - goal_eval.FLOOR_MARGIN))
 
 
 def kl_budget(empty: float, kl: float, f: float = RECOVERED) -> float:
@@ -1050,15 +1039,19 @@ FORWARD_CHUNK = 8     # --forward: candidate sets per fidelity call (position gr
 def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=print, unit: str = "position") -> dict:
     """--forward (the lead's 10-13: is a start backward pruning cannot shrink minimal, or a local minimum of the
     acceptance rule?): from VPD's actives at the targets, groups of VPD's actives at F2's positions added one at a time,
-    each step the group whose addition gives the highest phi, until phi reaches the bar (phi_tau + PHI_SLACK) or every
-    group is in. unit "position": a group is a position's actives, each candidate scored by goal_eval's reward-mode
-    fidelity on the search split (FORWARD_CHUNK a call); "site": one site's actives at one position, every candidate of a
-    step scored at once by GoalEval.phi_variants as node subsets of the union of every group (each variant's nodes and
-    patching families its own, monitorbench's 8dafa65, with node draws common to every variant; edges, flips and
-    omitted held at the union's), a set passing there confirmed by fidelity before the search stops. {"nodes", "positions", "phi", "bar", "unit", "steps": [group, size, phi]}."""
+    each step the group whose addition gives the highest circuit term (goal_eval.circuit_term, the reward's own: phi
+    against the bar less 4x the worst shortfall below the per-family floors, then compactness), until the set is
+    faithful as the reward reads it (phi at the bar, phi_tau + PHI_SLACK, and no family below its floor) or every group
+    is in. unit "position": a group is a position's actives, each candidate's row from goal_eval's reward-mode fidelity
+    on the search split (FORWARD_CHUNK a call); "site": one site's actives at one position, every candidate of a step
+    scored at once by GoalEval.phi_variants as node subsets of the union of every group (each variant's nodes and
+    patching families its own, monitorbench's 8dafa65, with node draws common to every variant; edges, flips and omitted
+    held at the union's), a set faithful there confirmed by fidelity before the search stops. {"nodes", "positions",
+    "phi", "v", "bar", "unit", "steps": [group, size, phi, v, term]}."""
     nat = ge.nat
     tau = ge.tau(tx, pool, "search")
-    bar, fams = tau["phi_tau"], tau["families"]
+    bar = tau["phi_tau"]
+    P, total = nat.positions(tx.targets), sum(nat.C.values())
     act = [(n, int(t), int(c)) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()]
     cur = {nd for nd in act if nd[1] in set(tx.targets)}
     f2 = {int(q) for q, _ in tx.f2} - set(tx.targets)
@@ -1067,12 +1060,16 @@ def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=pr
         if nd[1] in f2:
             groups.setdefault(nd[1] if unit == "position" else (nd[0], nd[1]), []).append(nd)
 
+    def term(row, nodes):
+        g = native.Graph(sorted(nodes), complete=True)
+        return goal_eval.circuit_term(row, tau, goal_eval.size_bits(g, P, total, tx.targets, tx.vpd))
+
     def exact(sets):
         out = []
         for i in range(0, len(sets), FORWARD_CHUNK):
-            rows = ge.fidelity(tx, [native.Graph(sorted(s), complete=True) for s in sets[i:i + FORWARD_CHUNK]], pool,
-                               mode="reward", split="search")
-            out += [goal_eval.phi(r, families=fams)[0] for r in rows]
+            part = sets[i:i + FORWARD_CHUNK]
+            rows = ge.fidelity(tx, [native.Graph(sorted(s), complete=True) for s in part], pool, mode="reward", split="search")
+            out += [term(r, s) for r, s in zip(rows, part)]
         return out
     if unit == "site":                                       # the union's row once; every variant a node subset of it
         union = native.Graph(sorted(cur | {nd for g in groups.values() for nd in g}), complete=True)
@@ -1080,24 +1077,28 @@ def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=pr
 
         def score(sets):
             got = ge.phi_variants(tx, union, ge.keep_of(tx, union, [sorted(s) for s in sets]), pool, base=base, start=bar)
-            return [v["phi"] for v in got["variants"]]
+            return [term(v["row"], s) for v, s in zip(got["variants"], sets)]
     else:
         score = exact
-    ph = exact([cur])[0]
-    steps = [[None, len(cur), ph]]
-    log(f"  forward ({unit}): targets ({len(cur)} subcomponents) phi {ph} (bar {bar})", flush=True)
-    while groups and (ph is None or bar is None or ph < bar + PHI_SLACK):
+
+    def faithful(t):
+        return t["phi"] is not None and bar is not None and t["phi"] >= bar + PHI_SLACK and t["v"] == 0
+    t = exact([cur])[0]
+    steps = [[None, len(cur), t["phi"], t["v"], t["term"]]]
+    log(f"  forward ({unit}): targets ({len(cur)} subcomponents) phi {t['phi']} (bar {bar}), shortfall {t['v']}", flush=True)
+    while groups and not faithful(t):
         keys = sorted(groups)
         got = score([cur | set(groups[k]) for k in keys])
-        j = max(range(len(keys)), key=lambda i: -math.inf if got[i] is None else got[i])
+        j = max(range(len(keys)), key=lambda i: got[i]["term"])
         cur |= set(groups.pop(keys[j]))
-        ph = got[j]
-        if unit == "site" and ph is not None and bar is not None and ph >= bar + PHI_SLACK:
-            ph = exact([cur])[0]                             # phi_variants holds edges and flips: confirmed in full
-        steps.append([keys[j], len(cur), ph])
-        log(f"  forward: + {keys[j]} ({len(cur)} subcomponents) phi {ph} (bar {bar}), {len(keys)} tried", flush=True)
-    return {"nodes": sorted(cur), "positions": sorted({nd[1] for nd in cur}), "phi": ph, "bar": bar, "unit": unit,
-            "steps": steps}
+        t = got[j]
+        if unit == "site" and faithful(t):                   # phi_variants holds edges, flips and omitted: in full
+            t = exact([cur])[0]
+        steps.append([keys[j], len(cur), t["phi"], t["v"], t["term"]])
+        log(f"  forward: + {keys[j]} ({len(cur)} subcomponents) phi {t['phi']} (bar {bar}), shortfall {t['v']}, "
+            f"term {t['term']}, {len(keys)} tried", flush=True)
+    return {"nodes": sorted(cur), "positions": sorted({nd[1] for nd in cur}), "phi": t["phi"], "v": t["v"], "bar": bar,
+            "unit": unit, "steps": steps}
 
 
 SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its own log recovery (fleet's 9004 finding)
@@ -1111,7 +1112,7 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
     and the acceptance floors (min(0.9, the start's)) at levels, each level
     under Validated when the acceptance draws are "fv"; with phi_pool, every stage scored on the search split and the
-    one of the highest circuit_score written (the reward's circuit term: phi against the bar, then compactness).
+    one of the highest circuit term written (goal_eval.circuit_term, the reward's).
     forward: the start forward_start's at that unit instead (with phi_pool); backup: the start first expanded by its compensators
     (backup.expand_circuit). (The circuit, its Pruner, the record) as block_search's (no group, no blocks)."""
     nat = ge.nat
@@ -1166,21 +1167,21 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
             v.finish()
             rec["validation"].append([level] + v.trace)
         stage(level, t0, rounds)
-    if phi_pool is not None:                                 # every stage on the search split as the reward scores it
-        tau = ge.tau(tx, phi_pool, "search")                 # (the text's families, an unscored one at 0), the highest
-        bar = tau["phi_tau"]                                 # circuit_score written: text9003 under --backup passed the
-        rec["phi"], best = [], None                          # bar at 530 subcomponents and 1438, text9002 at 536 with 4x
-        for name, on_s in reversed(snaps):                   # the start's bits (below the start's own score of 0)
-            g_s = graph_of(on_s)
+    if phi_pool is not None:                                 # every stage on the search split, scored by the reward's
+        tau = ge.tau(tx, phi_pool, "search")                 # circuit term (goal_eval.circuit_term), the highest written:
+        rec["phi"], best = [], None                          # text9003 under --backup passed the bar at 530 subcomponents
+        for name, on_s in reversed(snaps):                   # and 1438, text9002 at 536 with 4x the start's bits (below
+            g_s = graph_of(on_s)                             # the start's own score of 0)
             row = ge.fidelity(tx, [g_s], phi_pool, mode="reward", split="search")[0]
-            ph = goal_eval.phi(row, families=tau["families"])[0]
             bits = goal_eval.size_bits(g_s, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, tx.vpd)
-            score = circuit_score(ph, bar, bits, tau["bits_start"])
+            ct = goal_eval.circuit_term(row, tau, bits)
+            score = ct["term"]
             fam = {f: goal_eval.family_score(row, f) for f in goal_eval.PHI_FAMILIES}
-            rec["phi"].append([name, ph, bar, int(on_s.sum()), fam, bits, score])
-            log(f"  set phi at {name} ({int(on_s.sum())} subcomponents, {bits:.0f} bits): {ph} (bar {bar}), score {score} "
+            rec["phi"].append([name, ct["phi_full"], ct["phi_tau"], int(on_s.sum()), fam, bits, score, ct["v"]])
+            log(f"  set phi at {name} ({int(on_s.sum())} subcomponents, {bits:.0f} bits): {ct['phi_full']} (bar "
+                f"{ct['phi_tau']}), shortfall {ct['v']}, score {score} "
                 + " ".join(f"{f} {v:.3f}" for f, v in fam.items() if v is not None), flush=True)
-            if score is not None and (best is None or score > best[0]):
+            if best is None or score > best[0]:
                 best = (score, name, on_s)                   # ties: the finer stage
         if best is not None:
             pr.on, rec["phi_stage"], rec["score"] = best[2].clone(), best[1], best[0]
@@ -1656,7 +1657,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     if f1_start in ("influential", "set"):                   # the influential-blocks search (block_search) or the
         if f1_start == "set":                                # influential set pruned (set_search), and its wiring
             # the plain start pruned, with --backup the expanded start and with --forward forward_start's too, the
-            # highest circuit_score written (text9000: backup's 165 subcomponents at 0.91)
+            # highest circuit term written (text9000: backup's 165 subcomponents at 0.91)
             arms = [set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, forward=f, backup=b)
                     for f, b in [(None, False)] + [(None, True)] * backup + [(forward, False)] * bool(forward)]
             g, pb, _, _, row["blocks"] = max(arms, key=lambda a: -math.inf if a[4].get("score") is None else a[4]["score"])
@@ -1925,10 +1926,10 @@ def main():
                     "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")
     ap.add_argument("--phi-check", action="store_true", help="with --f1-start influential, the circuit checked against the "
                     "reward's bar (goal_eval.phi >= phi_tau on the search split, the adversary's pool), backing off a stage at a "
-                    "time; with --f1-start set, every stage scored and the one of the highest circuit_score written")
+                    "time; with --f1-start set, every stage scored and the one of the highest circuit term written")
     ap.add_argument("--backup", action="store_true", help="with --f1-start set: the start as found and the start expanded "
                     "by its compensators (the backup agent's backup.expand_circuit, as subcomponents) each pruned, the higher "
-                    "circuit_score written (implies --phi-check)")
+                    "circuit term written (implies --phi-check)")
     ap.add_argument("--forward", choices=("position", "site"), default=None, help="with --f1-start set: an arm pruning "
                     "forward_start's set (F2's position groups, or one site at one position, added in order of phi until "
                     "the bar), beside the plain (and --backup) arms (implies --phi-check)")

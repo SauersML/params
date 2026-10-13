@@ -16,7 +16,16 @@ try:
     import pytest
 
     fixture = pytest.fixture(scope="module")
-except ImportError:  # a pod's environment without pytest: run as a script (main below)
+except ImportError:  # a pod's environment without pytest: run as a script (main below), test_goal_eval's decorators inert
+    import types
+
+    class _Inert:
+        def __getattr__(self, name):
+            return lambda *a, **k: (a[0] if len(a) == 1 and callable(a[0]) and not k else (lambda f: f))
+
+    pytest = types.ModuleType("pytest")
+    pytest.fixture, pytest.mark = _Inert().fixture, _Inert()
+    sys.modules["pytest"] = pytest
     fixture = lambda f: f  # noqa: E731
 
 HERE = Path(__file__).resolve().parent

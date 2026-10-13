@@ -1896,9 +1896,17 @@ class GoalEval:
                   empty_kl: float) -> list[float]:
         """KL in bits at the targets, from the model's log probabilities ref, of each stated graph's run on ids in C's
         semantics (graph_ref: graph inside the circuit, masked outside, every other subcomponent off, remainders on
-        (live) or off); a graph with no node is the empty circuit (empty_kl)."""
+        (live) or off); a complete graph its masked run (runs, as sufficiency); a graph with no node is the empty circuit
+        (empty_kl). Blocks run as their subcomponents and stranded nodes are dropped (_c_graph: complete node sets and
+        block circuits score as fidelity scores them; pymove's report: node sets returned KL_empty, blocks crashed)."""
+        graphs = [_c_graph(g, targets, self.nat.C) for g in graphs]
         out = [empty_kl] * len(graphs)
-        some = [i for i, g in enumerate(graphs) if g.count()]
+        whole = [i for i, g in enumerate(graphs) if g.complete and g.node_set()]  # a complete graph: its masked run
+        if whole:
+            got = carry.kl(ref, self.runs(ids, targets, [self.masks(graphs[i], len(ids)) for i in whole], live)).tolist()
+            for i, k in zip(whole, got):
+                out[i] = k
+        some = [i for i, g in enumerate(graphs) if not g.complete and g.node_set()]
         for s0 in range(0, len(some), self.chunk):
             idx = some[s0:s0 + self.chunk]
             E = self._circuit_engine(ids, targets, [graphs[i] for i in idx], live)

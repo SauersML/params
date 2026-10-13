@@ -1774,6 +1774,21 @@ def test_point_with_remainders_held(tiny):
     assert m["kl_point_live"] < 1e-4 and m["kl_point_held"] < 1e-4
 
 
+def test_graph_kl_on_node_sets_and_blocks(tiny):
+    """graph_kl (pymove's report): a complete node set is its C-semantics run (sufficiency's KL), not the empty circuit;
+    a block runs as its site's subcomponents there."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    sub = native.Graph(every[::2], complete=True)
+    t = tx.targets[0]
+    blk = native.Graph([nd for nd in every if not (nd[0] == "h.1.mlp.c_fc" and nd[1] == t)] + [("h.1.mlp.c_fc", t, goal_eval.BLOCK)], complete=True)
+    flat = native.Graph(sorted(goal_eval.expand_blocks(blk, nat.C).node_set()), complete=True)
+    got = ge.graph_kl(tx, [sub, blk, native.Graph()], True)
+    want = [r["kl_live"] for r in ge.sufficiency(tx, [sub, flat])]
+    assert abs(got[0] - want[0]) < 1e-4 + 1e-4 * want[0] and abs(got[1] - want[1]) < 1e-4 + 1e-4 * want[1], (got, want)
+    assert got[2] == ge._bounds(tx, "live")[0] and got[0] < got[2]
+
+
 def test_line_leave_one_out(tiny):
     """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row
     with point, N, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run (the held

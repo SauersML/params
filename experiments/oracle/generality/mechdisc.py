@@ -307,15 +307,19 @@ def judge(r: dict, ans: dict) -> dict:
     has = lambda n, p, c: (n, p, c) in nodes or (n, p) in blocks  # noqa: E731
     out = {"nodes": len(nodes), "positions": len(pos), "context_share": _mean([p < t - 1 for _, p, _ in nodes]) if nodes else 0.0,
            "induction_pairs": sorted(_induction_pairs(nodes))}
+    out["chance"] = len({p for p in pos if p < t - 1}) / max(t - 1, 1)  # a random context position's chance to be in the circuit
     ctx_pair = any(j < t for j in out["induction_pairs"])  # the pair at a context position, where a copy reads it
     if r["kind"] == "copy":
         a, o = r["a"] - s, r["o"] - s
         core = [has(n, a, c) for n, c in CORE_A] + [has(n, o, c) for n, c in CORE_O]
-        out.update(holds_a=a in pos, holds_o=o in pos, core_share=_mean(core), core_any=any(core),
-                   right=(a in pos and o in pos), wrong=not (pos - {t, t - 1}))  # wrong: the bigram reading (target-local only)
+        # right: the measured position a (whose replacement took y off the top) in the circuit; o's replacement was never
+        # measured, and under semantics n the key subcomponents outside the circuit sit at their values on the text,
+        # so a circuit need not hold o (right_ao, the stricter reading, reported beside it)
+        out.update(holds_a=a in pos, holds_o=o in pos, core_share=_mean(core), core_any=any(core), right_ao=(a in pos and o in pos),
+                   right=a in pos, wrong=not (pos - {t, t - 1}))  # wrong: the bigram reading (target-local only)
     elif r["kind"] == "context":
         m = r["m"] - s
-        out.update(holds_m=m in pos, right=m in pos, wrong=ctx_pair)
+        out.update(holds_m=m in pos, right=m in pos, wrong=not (pos - {t, t - 1}), ctx_pair=ctx_pair)  # wrong: target-local only
     else:
         out.update(right=not ctx_pair, wrong=ctx_pair)
     return out
@@ -344,9 +348,9 @@ def _boot(ws) -> str:
 
 def score(answers: Path | None = None, tdirs: list | None = None):
     """Per contrast: the teacher's circuits (every run's mechdisc_teacher/) and S1's answers (answers: JSONL of
-    {task, sample, text}, the circuit components.parse(text)["answer"]), each item's right (copy: holds a and o;
-    context: holds m; bigram: no layer-1 previous-token pair at a context position) and wrong (copy: target-local
-    only; context and bigram: that pair at a context position), and a pair right when both items are right; bootstrap 95% intervals over pairs."""
+    {task, sample, text}, the circuit components.parse(text)["answer"]), each item's right (copy: holds a, the measured
+    position; context: holds m; bigram: no layer-1 previous-token pair at a context position) and wrong (copy and context:
+    target-local only; bigram: that pair at a context position), and a pair right when both items are right; bootstrap 95% intervals over pairs."""
     pr = json.loads((DATA / "mechdisc_items.json").read_text())["pairs"]
     teach_ = {}
     for d in (tdirs or []) + sorted({p.parent for r in RUNS if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_teacher/md*.json")}) + [OUTROOT / "mechdisc_teacher"]:
@@ -357,6 +361,12 @@ def score(answers: Path | None = None, tdirs: list | None = None):
                     teach_.setdefault(f.stem, json.loads(f.read_text()))
     sources = {"teacher (v2.3)": {k: [v] for k, v in teach_.items()}}
     if answers:
+        try:
+            import native  # noqa: F401  (components.group_of names a site through native.site_name)
+        except ImportError:  # the standard library alone: native's site_name, the only part parse reads
+            import types
+
+            sys.modules["native"] = types.SimpleNamespace(site_name=lambda layer, kind: _site(f"{layer}.{dict(q_proj='q', k_proj='k', v_proj='v', o_proj='o', c_fc='fc', down_proj='down')[kind]}"))
         import components
 
         s1 = collections.defaultdict(list)
@@ -389,9 +399,12 @@ def score(answers: Path | None = None, tdirs: list | None = None):
             js = [[judge(r, a) for a in by[nm]] for nm, r in sorted(items.items()) if r["kind"] == kd]
             ws = {f: [_mean([g(j) for j in jj]) for jj in js] for f, g in
                   (("right_not_wrong", lambda j: j["right"] and not j["wrong"]), ("right", lambda j: j["right"]),
-                   ("wrong", lambda j: j["wrong"]), ("context_share", lambda j: j["context_share"]))}
+                   ("wrong", lambda j: j["wrong"]), ("context_share", lambda j: j["context_share"]), ("chance", lambda j: j["chance"]),
+                   *((("right_ao", lambda j: j["right_ao"]), ("core_share", lambda j: j["core_share"])) if kd == "copy" else ()))}
             summary.setdefault(src, {})[kd] = {f: _ci(w) for f, w in ws.items()}
-            print(f"    {kd:8s} {_boot(ws['right_not_wrong'])}")
+            print(f"    {kd:8s} {_boot(ws['right_not_wrong'])}; nodes at context positions {_boot(ws['context_share'])}; "
+                  f"a random context position in the circuit {_boot(ws['chance'])}"
+                  + (f"; a and o both in the circuit {_boot(ws['right_ao'])}; core parts at a and o (share of 6) {_boot(ws['core_share'])}" if kd == "copy" else ""))
     (OUTROOT / "mechdisc_score.json").write_text(json.dumps(summary, indent=1))
     print("wrote", OUTROOT / "mechdisc_score.json")
 

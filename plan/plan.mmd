@@ -456,7 +456,8 @@ flowchart BT
   CLAIMQA["<b>Learn measured transplant effects</b><br/>147 exact examples,49 failed proposals;<br/>archived hints bound to visible context;<br/>partial coverage and ID limits explicit<br/>EXPORT AUDIT · codex/variable_reward"]
   CLAIMCTRL["<b>Isolate component identity</b><br/>change indices, preserve sizes and positions;<br/>measure full output distributions afresh;<br/>reference and identity checks required<br/>IMPLEMENTED · codex"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
-  RELTRAIN["<b>Teach every relation example</b><br/>21 of68 never sampled by SFT;<br/>free300-step coverage run finished;<br/>compare executed relations on fixed24<br/>RESULT AUDIT · codex/eval_recovery"]
+  RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
+  CAPABLE["<b>Can a capable model learn wiring?</b><br/>same frozen weight inputs and circuits;<br/>base vs small SFT, first answers executed;<br/>separate capacity from objective dilution<br/>PREFLIGHT · codex/fork_review"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
@@ -593,6 +594,8 @@ flowchart BT
   WIRING -. wiring evidence .-> C1
   WIRING -. diagnoses missing relations .-> RELTRAIN
   RELTRAIN -. measured relation learning .-> C1
+  RELTRAIN -. capacity remains unresolved .-> CAPABLE
+  CAPABLE -. executed circuits and cost .-> C1
   WIRING -. opt-in wiring objective .-> R1
   %% FEEDBACK: REM -. tests .-> PHI
   VPD --> ENG
@@ -643,7 +646,8 @@ flowchart BT
   class S1READY check
   class QAONLY check
   class WIRING done
-  class RELTRAIN active
+  class RELTRAIN done
+  class CAPABLE active
   class ROUTE done
   class ROUTEEDIT check
   class PYV done

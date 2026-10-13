@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 ANSWER = "<answer> "
+LOSS_CHUNK = 1024  # answer tokens per output-layer chunk (long first-stage answers: 16 x 300 x 152k logits are 3 GB)
 
 
 def _dev() -> str:
@@ -207,11 +208,17 @@ def _loss(model, batch, pad: int, slots: Slots | None = None):
         labels[i, len(p):len(p) + len(c)] = torch.tensor(c)
         att[i, :len(p) + len(c)] = 1
     ids, labels, att = ids.to(_dev()), labels.to(_dev()), att.to(_dev())
+    from torch.utils.checkpoint import checkpoint
+
     h = _hidden(model, ids, att, slots, [n for _, _, n in batch])[:, :-1]
     tgt = labels[:, 1:]
     keep = tgt != -100  # the output layer at the answer's positions alone (the vocabulary is 152k wide)
-    logits = _head(model)(h[keep]).float()
-    loss = torch.nn.functional.cross_entropy(logits, tgt[keep], reduction="sum")
+    hk, tk = h[keep], tgt[keep]
+    head = _head(model)
+
+    def piece(x, t):  # a chunk's summed cross entropy; its logits recomputed in backward, never all held at once
+        return torch.nn.functional.cross_entropy(head(x).float(), t, reduction="sum")
+    loss = sum(checkpoint(piece, hk[a:a + LOSS_CHUNK], tk[a:a + LOSS_CHUNK], use_reentrant=False) for a in range(0, len(tk), LOSS_CHUNK))
     return loss, int(keep.sum())
 
 

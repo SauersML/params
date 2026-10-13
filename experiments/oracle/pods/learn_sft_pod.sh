@@ -9,7 +9,8 @@
 # back to ~/mpd-data/runpod/NAME/out.
 # EPOCHS: per training size, its epochs (SIZE:EPOCHS ...; smaller sets more passes, every size trained to a similar
 # number of row passes).
-# QSET: which of the four queues this pod runs (default all; "0 1" and "2 3" split them over two 24 GB cards, VRAM=24).
+# QSET: which of the four queues this pod runs (default all; "0 1" and "2 3" split them over two 24 GB cards, VRAM=24;
+# "4 5": the active and both arms alone, Q0's and Q2's first-stage parts).
 #   experiments/oracle/pods/learn_sft_pod.sh QDIR [NAME] [HOURS]      env: SIZES, BASE, EPOCHS, QSET, VRAM, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -59,7 +60,9 @@ Q0="$(first active 1) $CHECK $(task active ids $W/first_active/adapter) $(task i
 Q1="$(first vocab 2) $(task vocab ids $W/first_vocab/adapter) $(task features features) $BASES"
 Q2="$(first both 1) $(task both ids $W/first_both/adapter)"
 Q3="$(inject)"
-QS=("$Q0" "$Q1" "$Q2" "$Q3") RUNQ=""
+Q4="$(first active 1) $CHECK $(task active ids $W/first_active/adapter)"  # Q0 and Q2's first-stage arms alone (a rerun)
+Q5="$(first both 1) $(task both ids $W/first_both/adapter)"
+QS=("$Q0" "$Q1" "$Q2" "$Q3" "$Q4" "$Q5") RUNQ=""
 for i in ${QSET:-0 1 2 3}; do RUNQ="$RUNQ (${QS[$i]}) &"; done
 REPORT="$O/out/score_ids_base.jsonl $O/out/score_features_base.jsonl"
 for arm in active ids vocab both features; do for n in $SIZES; do REPORT="$REPORT $O/out/score_${arm}_$n.jsonl"; done; done

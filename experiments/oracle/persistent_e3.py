@@ -59,6 +59,7 @@ K_SET = 8  # subcomponents per restricted set at a site
 DRAWS = 2
 RANK = 1
 ROWS_STEP, HELD_STEP = 8, 2  # texts per training step (val and score use every text)
+CACHE_GB = float(__import__("os").environ.get("PE3_CACHE_GB", "4.5"))  # unedited runs kept per process (GPU memory)
 TOKENS = Path.home() / "mpd-data/atlas/vpd4l/tokens_0_6000.npy"
 
 
@@ -181,12 +182,21 @@ class Net:
         self.nat, self.b, self.rate = nat, beh["b"], {p: beh["parts"][p]["rate"] for p in THIRDS}
         self.texts = {p: _texts(beh, p, tokens) for p in THIRDS}
         self.held = {p: held["held" if p == "score" else "search"] for p in THIRDS}
+        self._cache, self._bytes = {}, 0
 
     def _ref(self, ids: list[int]) -> torch.Tensor:
-        """The unedited log probabilities of a text, recomputed (kept for every text they would fill a GPU: 512 x 50k
-        floats each)."""
+        """The unedited log probabilities of a text: kept up to CACHE_GB (the searches evaluate hundreds of edits on the
+        same texts; half precision would err by more than the collateral it measures), recomputed beyond it."""
+        key = tuple(ids)
+        got = self._cache.get(key)
+        if got is not None:
+            return got
         with torch.no_grad():
-            return finetune_edit.logq(self.nat, [ids])[0]
+            lp = finetune_edit.logq(self.nat, [ids])[0]
+        if self._bytes + lp.numel() * 4 <= CACHE_GB * 2**30:
+            self._cache[key] = lp
+            self._bytes += lp.numel() * 4
+        return lp
 
     def __call__(self, part: str, site: str | None, A=None, B=None, grad: bool = True, rng: random.Random | None = None,
                  deltas: list[tuple] | None = None) -> dict:

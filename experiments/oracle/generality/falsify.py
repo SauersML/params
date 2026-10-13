@@ -497,10 +497,14 @@ def report():
         for v in sorted({v for d in texts for v in d}):
             print(f"   {v:26s} reward {mean(v, 'reward'):7.2f}  phi {mean(v, 'phi'):6.2f}  bits {mean(v, 'bits'):9.0f}  "
                   f"compact {mean(v, 'compact'):6.2f}  faithful {np.mean([d[v]['phi_capped'] >= d[v]['phi_tau'] for d in texts if v in d]):.2f}")
-    vr = []
+    vr = {}  # one row per text: one from the current E4 (off-target and same-class on f's scale) over an older one
     for p in [DATA / "falsify_vars.jsonl"] + templates.run_outputs("falsify_vars*.jsonl"):
         if p.exists():
-            vr += [json.loads(line) for line in p.read_text().splitlines()]
+            for r in map(json.loads, p.read_text().splitlines()):
+                k = (r["kind"], r["task"], int(r["t"]))
+                if k not in vr or (r.get("f_same_map_random_partition") is not None and vr[k].get("f_same_map_random_partition") is None):
+                    vr[k] = r
+    vr = list(vr.values())
     if vr:
         for kind in ("copy", "mistake"):
             rs = [r for r in vr if r["kind"] == kind]

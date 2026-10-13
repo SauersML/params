@@ -239,6 +239,15 @@
 %% Induction also needs distinct Q/K/V reader ports. Define these explicitly before claiming token-route fidelity.
 %% Independent Pyvene scalar-interchange reference matches Native logprobs within1.91e-6; wrong-position control is zero.
 %% Scope: analytic full-background rank-one scalar swaps; no sparse-graph, English or learned-weight-use certificate.
+%% Lossless v2 spans aa0b118:29tests, v1 unchanged. Ranges expand only declared architecture-valid pairs;
+%% reject overlaps/bounds/unsupported edges, split partial adjacencies instead of silently adding connections.
+%% Independent actualfile audit: all6 v2 exports compile to exact original nodes/parents/outputs; published source verified.
+%% Exactonpath:3575graph tokens to304+EOS=305 (18lines/436bytes), same400nodes/9621edges; fits416output cap.
+%% Sparse216, recursive236, QKclosure286, full dense315 tokens including EOS, with frozenSmol tokenizer/no downloads.
+%% Artifact: mpd-data/scratch/variable_reward/typed_closure/v2/token_fit_v2.json and six .mmd targets.
+%% Existing32world results apply via exactgraphidentity and unchanged compile_graph/executor/basis; no rescoring/extra spend.
+%% This fixes output encoding, not fidelity or learning; full prompt/English budgets and non-toy transfer remain unverified.
+%% Next: use checked compacttargets in a diverse teacher corpus; keep current unit-vs-wiring pilot frozen until its results.
 %% Closure experiment: fixed architecture hierarchy (no panel optimization), same32editworlds; typed_closure artifacts.
 %% Recursive value routing:400nodes9486edges, maxKL1.0205e-4bits;4predeclared cyclic assignments max1.4843e-4.
 %% Exact native.on_path control:400nodes9621edges, numerical-precision KL. Approximate repair saves only135edges.
@@ -401,7 +410,7 @@ flowchart BT
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
   WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>two free CPU forks, lower-memory updates;<br/>matched20 steps; paired report ready<br/>ACTIVE · codex/eval_recovery"]
-  ROUTE["<b>Fit executable routing in output</b><br/>exact graph needs3575tokens;<br/>pilot output cap416, context3072;<br/>lossless spans, identical expanded graph<br/>ACTIVE · codex/fork_review"]
+  ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
   FBASE["<b>Matched QA baseline measured</b><br/>DeepSeek59.50%, Qwen65.64%;<br/>cheap features66.76% on same179 QA;<br/>prioritize circuit fidelity over QA scaling<br/>CHECK · codex · $0.145 spent"]
@@ -580,7 +589,7 @@ flowchart BT
   class S1READY check
   class QAONLY check
   class WIRING active
-  class ROUTE active
+  class ROUTE done
   class ROUTEEDIT check
   class PYV done
   class FBASE check

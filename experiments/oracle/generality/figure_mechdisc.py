@@ -1,8 +1,9 @@
 """Mechanism discrimination on vpd4l (mechdisc.py score's DATA/mechdisc_score.json): per mechanism family, the share of
 items whose circuit (the v2.3 teacher's; S1's answers) includes the item's measured mechanism and not the other
-mechanism, with 95% bootstrap intervals over items. Copy: positions a and o in the circuit, not only the target's two
-positions; bigram and far context: no layer-1 previous-token pair (q #316 at j, k #329 at j - 1) at a context position,
-and for far context the measured position m in the circuit."""
+mechanism, with 95% bootstrap intervals over items. Copy: the measured position a (whose replacement took the top token
+off) in the circuit, and not only the target's two positions; far context: the measured position m, likewise; bigram:
+no layer-1 previous-token pair (q #316 at j, k #329 at j - 1) at a context position. A dash marks a random context
+position's chance to be in the circuit."""
 import json
 import sys
 from pathlib import Path
@@ -40,6 +41,8 @@ def main():
         lo = v - np.array([c["lo"] if c else np.nan for c in cs])
         hi = np.array([c["hi"] if c else np.nan for c in cs]) - v
         ax.bar(x + off, v, w * 0.9, color=col, yerr=[lo, hi], capsize=4, error_kw={"lw": 1.2})
+        ch = [sc[key][f]["chance"] for f, _ in FAMILIES]
+        ax.scatter(x + off, [c["mean"] if c else np.nan for c in ch], marker="_", s=900, color=figure.INK, zorder=3)
         for xi, c in zip(x, cs):
             if c:
                 ax.text(xi + off, c["hi"] + 0.03, f"{lab}\nn = {c['n']}", ha="center", fontsize=12, color=col)
@@ -47,6 +50,7 @@ def main():
     ax.set_ylim(0, 1.2)
     ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
     ax.set_ylabel("share of items")
+    ax.text(x[-1] + 0.45, 0.06, "dash: a random context\nposition in the circuit", ha="right", fontsize=12, color=figure.INK)
     figure.clean(ax)
     ax.set_title("Circuits that include the item's measured mechanism and not the other mechanism")
     fig.tight_layout()

@@ -24,7 +24,7 @@ h.1.mlp.c_fc #2103 and h.2.attn.k_proj #206; at o, h.1.attn.k_proj #329 and #119
   mechdisc.py pairs           -> DATA/mechdisc_items.json (the pairs) and DATA/mechdisc_texts/<name>.json task files
   mechdisc.py teach --name N  the v2.3 teacher on one item (teacher.py: --f1-start set --accept-mode pp --accept-draws
                               fv --phi-check --rank once --accept changed,floors, semantics n) -> OUT/mechdisc_teacher/
-  mechdisc.py score [--answers JSONL]   per item and pair whether the circuits hold each mechanism, bootstrap intervals
+  mechdisc.py score [--answers JSONL ...]   per item and pair whether the circuits hold each mechanism, bootstrap intervals
 """
 from __future__ import annotations
 
@@ -346,7 +346,7 @@ def _boot(ws) -> str:
     return "-" if c is None else f"{c['mean']:.2f} [{c['lo']:.2f}, {c['hi']:.2f}] (n={c['n']})"
 
 
-def score(answers: Path | None = None, tdirs: list | None = None):
+def score(answers: list | None = None, tdirs: list | None = None):
     """Per contrast: the teacher's circuits (every run's mechdisc_teacher/) and S1's answers (answers: JSONL of
     {task, sample, text}, the circuit components.parse(text)["answer"]), each item's right (copy: holds a, the measured
     position; context: holds m; bigram: no layer-1 previous-token pair at a context position) and wrong (copy and context:
@@ -369,11 +369,11 @@ def score(answers: Path | None = None, tdirs: list | None = None):
             sys.modules["native"] = types.SimpleNamespace(site_name=lambda layer, kind: _site(f"{layer}.{dict(q_proj='q', k_proj='k', v_proj='v', o_proj='o', c_fc='fc', down_proj='down')[kind]}"))
         import components
 
-        s1 = collections.defaultdict(list)
-        for x in Path(answers).read_text().splitlines():
-            ln = json.loads(x)
-            s1[ln["task"]].append(components.parse(ln["text"])["answer"])
-        sources["S1"] = s1
+        for f in answers:  # a model's answers under DATA/mechdisc_<model>/ (mechdisc_s1, mechdisc_s2)
+            src = Path(f).parent.name.removeprefix("mechdisc_").upper()
+            for x in Path(f).read_text().splitlines():
+                ln = json.loads(x)
+                sources.setdefault(src, collections.defaultdict(list))[ln["task"]].append(components.parse(ln["text"])["answer"])
     summary = {}
     for src, by in sources.items():
         print(f"== {src}")
@@ -414,7 +414,7 @@ if __name__ == "__main__":
     ap.add_argument("cmd", choices=("find", "pairs", "teach", "score"))
     ap.add_argument("args", nargs="*")
     ap.add_argument("--name", default=None)
-    ap.add_argument("--answers", type=Path, default=None)
+    ap.add_argument("--answers", type=Path, action="append", default=None, help="score: answers JSONL (repeatable)")
     ap.add_argument("--kinds", default=None, help="find: the kinds searched (comma-separated)")
     ap.add_argument("--cands", type=int, default=None, help="find: candidates confirmed per text and kind")
     a = ap.parse_args()

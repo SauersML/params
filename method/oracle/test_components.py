@@ -470,9 +470,10 @@ def test_a_complete_node_set_round_trips_through_its_marker():
     assert sorted(map(tuple, p["answer"]["nodes"])) == sorted(map(tuple, a["nodes"]))
 
 
-def test_thinking_trace_names_specific_refutations_first_within_its_budget(tiny):
+def test_thinking_trace_names_specific_refutations_first_within_its_budget(tiny, monkeypatch):
     nat, ge, task, ev = tiny
     ids = task["prompts"][0]["token_ids"]
+    monkeypatch.setattr(components, "token_strings", lambda model, xs: [f" t{x}" for x in xs])  # no vpd4l tokenizer file (CI)
     small = {"stage": "set", "removed": [["h.1.attn.v_proj", 5, 1]], "draws": [[5, 3]], "s_track_pp": 0.6, "s_current": 0.95, "floor": 0.9}
     big = {"stage": "set", "removed": [["h.0.mlp.c_fc", 6, c] for c in range(10)], "draws": [[5, 2]], "s_track_pp": 0.1,
            "s_current": 0.95, "floor": 0.9}

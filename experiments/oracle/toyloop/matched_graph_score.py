@@ -185,6 +185,7 @@ def run(args):
             sample = samples[arm][case_index]
             error = answer_error(sample)
             graphs[arm] = []
+            sizes = []
             for ids in inputs:
                 graph, reason = None, error
                 if reason is None:
@@ -196,6 +197,15 @@ def run(args):
                     except ValueError as exc:
                         reason = str(exc)
                 graphs[arm].append((graph, reason))
+                sizes.append({'input_positions': len(ids), 'valid': graph is not None,
+                              'declared_units': None if graph is None else len(parsed.units - {'out'}),
+                              'declared_edges': None if graph is None else len(parsed.edges),
+                              'executed_component_position_nodes': None if graph is None else graph.count(),
+                              'executed_edges': None if graph is None else graph.edges(),
+                              'full_component_position_nodes': len(ids) * sum(int(nat.C[name]) for name in nat.names)})
+            write(args.out / f'{case_index}.{arm}.size.json', {'case': item['id'], 'arm': arm,
+                  'stratum': item['stratum'], 'per_input': sizes,
+                  'scope': 'report complexity alongside fidelity; not a necessity or compute-speedup certificate'})
         full = [native.Graph({(name, pos, piece) for name in nat.names for pos in range(len(ids))
                               for piece in range(int(nat.C[name]))}, complete=True) for ids in inputs]
         baselines = []

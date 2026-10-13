@@ -19,7 +19,7 @@ G=$S/method/oracle E=$S/experiments/oracle
 N=oracle-graph-search-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/graph_oracle/texts-search-$RUN.tar
-COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 STAGES=""
 [ -n "$RANKED" ] && STAGES="python native.py ranked --split train heldout hard --n 100000 --top $RANKED --out $O/vpd_ranked > $O/ranked.log 2>&1;"
 for entry in $SPLIT; do

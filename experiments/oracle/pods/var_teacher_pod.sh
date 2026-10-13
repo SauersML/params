@@ -10,6 +10,8 @@
 #   experiments/oracle/pods/var_teacher_pod.sh HOURS
 #   env: RUN, SPLIT, N, TASKS, CIRCUITS, VARIANTS, DEST, P, REF, GPU, PRICE, VRAM, WAIT (minutes of retries while no card is
 #   in stock)
+#   INVARIANTS_TEACH=1 exports train-only proofs in out/invariant_teach/variant_<v>_worker_<k>.jsonl; select one
+#   variant's sidecars whose groups match its retained variable files. Defaults do not emit supervision artifacts.
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params
@@ -17,6 +19,7 @@ H=${1:-2.0}
 RUN=${RUN:-a} SPLIT=${SPLIT:-heldout} N=${N:-20} P=${P:-3}
 CIRCUITS=${CIRCUITS:-/Users/user/mpd-data/graph_oracle/teacher/joint_$SPLIT}
 VARIANTS=${VARIANTS:-}
+INVARIANTS_TEACH=${INVARIANTS_TEACH:-0}
 GPU=${GPU:-NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090,NVIDIA RTX 4000 Ada Generation,NVIDIA RTX A4500,NVIDIA RTX A6000,NVIDIA A40}
 NAME=oracle-graph-vars-$RUN
 F=/Users/user/mpd-data/scratch/varteach/pod_$RUN
@@ -24,18 +27,45 @@ V=/Users/user/mpd-data/vpd
 O=/Users/user/mpd-data/runpod/$NAME
 DEST=${DEST:-/Users/user/mpd-data/graph_oracle/variables}
 mkdir -p "$F" "$DEST"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
-/usr/bin/python3 -I - "$SPLIT" "$N" "$F" "$CIRCUITS" "${TASKS:-}" <<'EOF' || exit 1
-import json, pathlib, sys, tarfile
-split, n, F, circuits, tasks = sys.argv[1], int(sys.argv[2]), pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]), sys.argv[5]
+/usr/bin/python3 -I - "$SPLIT" "$N" "$F" "$CIRCUITS" "${TASKS:-}" /Users/user/mpd-data/graph_oracle/texts/vpd4l "$INVARIANTS_TEACH" <<'EOF' || exit 1
+import json, pathlib, re, sys, tarfile
+split, n, F, circuits, tasks, text_root, proofs = sys.argv[1], int(sys.argv[2]), pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]), sys.argv[5], pathlib.Path(sys.argv[6]), sys.argv[7]
+if proofs not in ("0", "1"):
+    raise ValueError("INVARIANTS_TEACH must be 0 or 1")
+def permitted(t):
+    match = re.fullmatch(r"text(\d+)", t)
+    if not match:
+        raise ValueError(f"invalid numeric task ID: {t}")
+    if 9100 <= int(match[1]) <= 9149:
+        raise ValueError(f"sealed task is not a launcher input: {t}")
+def text_path(t):
+    p = text_root / f"{t}.json"
+    target = re.fullmatch(r"text(\d+)\.json", p.resolve().name)
+    if target and 9100 <= int(target[1]) <= 9149:
+        raise ValueError(f"task aliases a sealed text: {t}")
+    return p
 if tasks:
     ids = [x.strip() for x in open(tasks) if x.strip()]
+    for t in ids:  # validate every explicit ID before reading any text's contents
+        permitted(t)
+        text_path(t)
 else:
-    d = pathlib.Path("/Users/user/mpd-data/graph_oracle/texts/vpd4l")
-    files = [p for p in d.glob("*.json") if not p.name.startswith(".")]
+    # Filter by numeric filename metadata before reading split fields.
+    files = [p for p in text_root.glob("*.json") if re.fullmatch(r"text\d+\.json", p.name)
+             and not 9100 <= int(p.stem[4:]) <= 9149]
+    files = [text_path(p.stem) for p in files]
     ids = [p.stem for p in sorted(files, key=lambda p: int(p.stem[4:])) if json.loads(p.read_text())["split"] == split][:n]
 ids = [t for t in ids if (circuits / f"{t}.json").exists()]
+if proofs == "1":
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate task IDs cannot share invariant supervision output")
+    for t in ids:
+        if not re.fullmatch(r"text[67]\d{3}", t) or json.loads(text_path(t).read_text()).get("split") != "train":
+            raise ValueError("invariant supervision requires train text6000–7999")
 (F / "tasks.txt").write_text("".join(t + "\n" for t in ids))
+with tarfile.open(F / "texts.tgz", "w:gz", dereference=True) as tar:
+    for t in ids:
+        tar.add(text_path(t), arcname=f"texts/vpd4l/{t}.json", recursive=False)
 with tarfile.open(F / "circuits.tgz", "w:gz") as tar:
     for t in ids:
         tar.add(circuits / f"{t}.json", arcname=f"circuits/{t}.json")
@@ -44,8 +74,10 @@ EOF
 RUNS=""
 for k in $(seq 0 $((P - 1))); do
   MINE=$(awk "NR % $P == ($k + 1) % $P" "$F/tasks.txt" | tr '\n' ' ')  # process k's texts, named in the command
-  RUNS="$RUNS (for t in $MINE; do echo '$VARIANTS' | tr ';' '\n' | while read -r flags; do
-    python -B var_teacher.py \$t \$flags --circuits \$HOME/circuits --root $O/out < /dev/null >> $O/vars_$k.log 2>&1 || echo \"\$t \$flags failed \$?\" >> $O/vars_$k.log;
+  RUNS="$RUNS (for t in $MINE; do v=0; echo '$VARIANTS' | tr ';' '\n' | while read -r flags; do
+    proof=; if [ '$INVARIANTS_TEACH' = 1 ]; then proof=\"--invariants-teach-out $O/out/invariant_teach/variant_\${v}_worker_$k.jsonl\"; fi;
+    python -B var_teacher.py \$t \$flags \$proof --circuits \$HOME/circuits --root $O/out < /dev/null >> $O/vars_$k.log 2>&1 || echo \"\$t \$flags failed \$?\" >> $O/vars_$k.log;
+    v=\$((v + 1));
   done; done; echo \"exit 0\" >> $O/vars_$k.log) &"
 done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;

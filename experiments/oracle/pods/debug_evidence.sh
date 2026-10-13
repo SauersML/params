@@ -14,7 +14,7 @@ G=$S/method/oracle E=$S/experiments/oracle
 N=oracle-graph-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/graph_oracle/texts-$RUN.tar
-COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/search texts/search_heldout
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/search texts/search_heldout
 PT="~/mpd-data/graph_oracle/texts"
 BASE="--base Qwen/Qwen3-4B --model vpd4l --behaviors $PT --search $PT/search --search-heldout $PT/search_heldout --part-tokens /root/reg.safetensors --scorer native --score-workers 4 --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors ${QUESTIONS:-2} --samples ${SAMPLES:-2} --no-baselines"
 EV="--evidence --max-tokens 1024 --max-model-len 26624"

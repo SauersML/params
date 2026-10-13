@@ -15,7 +15,7 @@ git fetch -q origin main && rm -rf "$D" && mkdir -p "$D/after" "$D/before" || ex
 git archive origin/main method/oracle experiments/oracle method/vpd/vpd_model.py | tar -x -C "$D/after" \
   && echo "python source $(git rev-parse --short=10 origin/main)" > "$D/after/SOURCE" \
   && git archive "$BEFORE" method/oracle method/vpd/vpd_model.py | tar -x -C "$D/before" || exit 1
-COPYFILE_DISABLE=1 tar -cf "$D/src.tar" -C "$D" after before -C /Users/user/mpd-data/graph_oracle texts/vpd4l \
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$D/src.tar" -C "$D" after before -C /Users/user/mpd-data/graph_oracle texts/vpd4l \
   && rm -rf "$D/after" "$D/before"
 B="python experiments/oracle/bench_speed.py"
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $D ~/mpd-data/graph_oracle; \

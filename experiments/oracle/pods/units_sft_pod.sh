@@ -23,10 +23,21 @@ rm -rf "$IN" "$IN.tar" && mkdir -p "$IN"
 head -n "$(wc -l < "$TRAIN")" "$TRAIN" > "$IN/train_explain.jsonl"  # the complete rows written so far (the file may still be growing)
 cp "$HELD" "$IN/held_explain.jsonl"
 [ -n "${EVENTS_HELD:-}" ] && cp "$EVENTS_HELD" "$IN/held_events.jsonl"
+# Validate identifiers before units.dataset opens any original task contents.
+/usr/bin/python3 -I - "$IN/train_explain.jsonl" "$IN/held_explain.jsonl" <<'TASK_PREFLIGHT' || exit 1
+import json, re, sys
+for name in sys.argv[1:]:
+    with open(name) as rows:
+        for line in rows:
+            task = json.loads(line).get("task")
+            if (not isinstance(task, str) or not re.fullmatch(r"text[0-9]+", task)
+                    or 9100 <= int(task[4:]) <= 9149):
+                raise SystemExit("units SFT input contains an invalid or sealed text ID; no task contents were read")
+TASK_PREFLIGHT
 (cd method/oracle && /Users/user/mpd-data/venv/bin/python units.py dataset "$IN/train_explain.jsonl" "$IN/train_rows.jsonl" ${EVENTS_TRAIN:+--events "$EVENTS_TRAIN"} && \
   /Users/user/mpd-data/venv/bin/python units.py dataset "$IN/held_explain.jsonl" "$IN/held_rows.jsonl" ${EVENTS_HELD:+--events "$EVENTS_HELD"} && \
   /Users/user/mpd-data/venv/bin/python units.py targets "$IN/held_explain.jsonl" "$IN/teacher") || exit 1
-COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" train_rows.jsonl held_rows.jsonl held_explain.jsonl teacher ${EVENTS_HELD:+held_events.jsonl} -C /Users/user/mpd-data/graph_oracle texts/vpd4l && rm -rf "$IN"
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$IN.tar" -C "$IN" train_rows.jsonl held_rows.jsonl held_explain.jsonl teacher ${EVENTS_HELD:+held_events.jsonl} -C /Users/user/mpd-data/graph_oracle texts/vpd4l && rm -rf "$IN"
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN.tar; a Mac path here would be uploaded file by file)
 U="python rl/units_sft.py"
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \

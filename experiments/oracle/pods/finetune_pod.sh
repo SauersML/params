@@ -12,7 +12,7 @@ P=${P:-3} STEPS=${STEPS:-150} SCREEN=${SCREEN:-30}
 O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME V=/Users/user/mpd-data/vpd G=/Users/user/mpd-data/graph_oracle
 F=/Users/user/mpd-data/scratch/rustmove/edit/pod_$NAME
 mkdir -p "$F"
-COPYFILE_DISABLE=1 tar -czf "$F/texts.tgz" -C $G texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -czf "$F/texts.tgz" -C $G texts/vpd4l
 cp "$TEACH" "$F/teach.jsonl"
 RUN="run $F/teach.jsonl" TABLE=table
 if [ -n "$SETS" ]; then cp "$SETS" "$F/sets.jsonl"; RUN="loc $F/teach.jsonl $F/sets.jsonl" TABLE=loc-table; fi

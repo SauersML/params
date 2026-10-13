@@ -20,7 +20,7 @@ N=${N:-20} P=${P:-3} SPLIT=${SPLIT:-heldout}
 O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME V=/Users/user/mpd-data/vpd G=/Users/user/mpd-data/graph_oracle
 F=/Users/user/mpd-data/scratch/rustmove/edit/pod_$NAME  # per run: runs launched together keep their own inputs
 mkdir -p "$F"
-COPYFILE_DISABLE=1 tar -czf "$F/texts.tgz" -C $G texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -czf "$F/texts.tgz" -C $G texts/vpd4l
 COPYFILE_DISABLE=1 tar -czf "$F/teacher.tgz" -C $G teacher/joint_$SPLIT
 CP="(python -B edit_eval.py copy $O/out/copy.json > $O/copy.log 2>&1; echo \"exit \$?\" >> $O/copy.log) &"
 [ "${COPY:-1}" = 0 ] && CP=""

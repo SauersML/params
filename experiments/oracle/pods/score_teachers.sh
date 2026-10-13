@@ -15,7 +15,7 @@ F=/Users/user/mpd-data/scratch/fleet/score_$NAME
 rm -rf "$F" && mkdir -p "$F/in/t"
 find "$D" -maxdepth 1 -name 'text*.json' | grep -E '/text[0-9]+\.json$' | while read -r f; do cp "$f" "$F/in/t/"; done
 echo "$(ls "$F/in/t" | wc -l | tr -d ' ') circuits from $D"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" t -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" t -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 rm -rf "$F/in"
 V=/Users/user/mpd-data/vpd
 RN=oracle-graph-teacher-sc-$NAME

@@ -18,7 +18,7 @@ B=/Users/user/mpd-data/graph_oracle/texts
 N=oracle-graph-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/graph_oracle/texts-$RUN.tar  # the questions and search answers as one file: rp-run uploads a directory file by file (2,300 files took 17 minutes)
-COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/search_heldout $( [ -d $B/search_hard ] && echo texts/search_hard )
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/search_heldout $( [ -d $B/search_hard ] && echo texts/search_hard )
 RUNS=""  # one prompted.py per split in SPLITS (default heldout), into $O (held-out) or $O/<split>
 for split in ${SPLITS:-heldout}; do
   out=$O$([ "$split" = heldout ] || echo /$split)

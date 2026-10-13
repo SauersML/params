@@ -31,20 +31,24 @@ GPU=${GPU:-NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVID
 F=/Users/user/mpd-data/scratch/fleet/teacher_$RUN
 V=/Users/user/mpd-data/vpd
 mkdir -p "$F" "$DEST"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 /usr/bin/python3 -I - "$SPLIT" "$N" "$OFFSET" "$PODS" "$F" "$DEST" "${TASKS:-}" "${FROM:-}" <<'EOF' || exit 1
-import json, pathlib, sys, tarfile
+import json, pathlib, re, sys, tarfile
 split, n, off, pods, F, dest, tasks = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), pathlib.Path(sys.argv[5]), pathlib.Path(sys.argv[6]), sys.argv[7]
 source = pathlib.Path(sys.argv[8]) if sys.argv[8] else None
+def permitted(task):
+    return bool(re.fullmatch(r"text[0-9]+", task)) and not 9100 <= int(task[4:]) <= 9149
 labels = []
 if tasks:
     lines = [x.strip() for x in open(tasks) if x.strip()]
     rows = [json.loads(x) if x.startswith("{") else {"task": x} for x in lines]
     ids = [r["task"] for r in rows]
+    if not all(isinstance(t, str) and permitted(t) for t in ids):
+        raise SystemExit("TASKS contains an invalid or sealed text ID; no task contents were read")
     labels = [{"task": r["task"], "local": r["local"]} for r in rows if r.get("local") is not None]
 else:
     d = pathlib.Path("/Users/user/mpd-data/graph_oracle/texts/vpd4l")
-    files = [p for p in d.glob("*.json") if not p.name.startswith(".")]
+    files = [p for p in d.glob("*.json") if permitted(p.stem)]
     ids = [p.stem for p in sorted(files, key=lambda p: int(p.stem[4:])) if json.loads(p.read_text())["split"] == split][:n]
 todo = [t for t in ids[off:] if not (dest / f"{t}.json").exists() and (source is None or (source / f"{t}.path.json").exists())]
 for j in range(pods):

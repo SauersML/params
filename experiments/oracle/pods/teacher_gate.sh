@@ -48,11 +48,19 @@ for i in "${!sides[@]}"; do
   find "${dirs[$i]}" -maxdepth 1 -name 'text*.json' | grep -E '/text[0-9]+\.json$' | while read -r f; do cp "$f" "$F/in/$side/"; done
   echo "$side: $(ls "$F/in/$side" | wc -l | tr -d ' ') circuits from ${dirs[$i]}"
 done
-/usr/bin/python3 -I -c "import json, pathlib, sys; d = pathlib.Path('/Users/user/mpd-data/graph_oracle/texts/vpd4l'); f = [p for p in d.glob('*.json') if not p.name.startswith('.')]; print('\n'.join([p.stem for p in sorted(f, key=lambda p: int(p.stem[4:])) if json.loads(p.read_text())['split'] == 'heldout'][:int(sys.argv[1])]))" "$N" > "$F/in/tasks.txt"
+/usr/bin/python3 -I - "$N" > "$F/in/tasks.txt" <<'TASK_SELECTION' || exit 1
+import json, pathlib, re, sys
+d = pathlib.Path('/Users/user/mpd-data/graph_oracle/texts/vpd4l')
+files = [p for p in d.glob('*.json') if re.fullmatch(r'text[0-9]+', p.stem)
+         and not 9100 <= int(p.stem[4:]) <= 9149]
+ids = [p.stem for p in sorted(files, key=lambda p: int(p.stem[4:]))
+       if json.loads(p.read_text())['split'] == 'heldout'][:int(sys.argv[1])]
+print('\n'.join(ids))
+TASK_SELECTION
 cp /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt "$F/vpd.pt"
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt "$F/pool.pt"
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt "$F/fresh.pt"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" "${sides[@]}" tasks.txt -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" "${sides[@]}" tasks.txt -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 rm -rf "$F/in"
 V=/Users/user/mpd-data/vpd
 RN=oracle-graph-teacher-gscore-$NAME

@@ -26,7 +26,7 @@ B=/Users/user/mpd-data/graph_oracle/texts
 N=oracle-graph-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/graph_oracle/texts-$RUN.tar
-COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/$SEARCH texts/$HELD $( [ -d $B/$HARD ] && echo texts/$HARD ) ${VPD_LIST:+texts/vpd_ranked} ${RESPONSES:+texts/vpd_responses}
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/$SEARCH texts/$HELD $( [ -d $B/$HARD ] && echo texts/$HARD ) ${VPD_LIST:+texts/vpd_ranked} ${RESPONSES:+texts/vpd_responses}
 if [ -n "$EVIDENCE" ]; then LEN="--max-tokens 4096 --max-model-len 26624"; else LEN="--max-tokens 4096 --max-model-len 14336"; fi
 SHARE=$([ -n "$EVIDENCE" ] && echo "--gpu-memory 0.35 --score-workers 2" || echo "--gpu-memory 0.5 --score-workers 2")  # with evidence vLLM stays awake (train.py): a smaller fixed share  # a revision prompt holds the first answer
 VPD_IN=${VPD_IN-/Users/user/mpd-data/vpd/s-55ea3f9b/model_400000.pth}

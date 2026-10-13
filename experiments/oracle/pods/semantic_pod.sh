@@ -20,7 +20,7 @@ V=/Users/user/mpd-data/vpd
 O=/Users/user/mpd-data/runpod/$NAME
 DEST=/Users/user/mpd-data/graph_oracle/semantic
 mkdir -p "$F" "$DEST"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 RUNCMD=${CMD//\$OUT/$O/out}
 CMDS="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;

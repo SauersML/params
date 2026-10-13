@@ -25,7 +25,7 @@ for spec in "$@"; do
 done
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt "$F/pool.pt"
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt "$F/fresh.pt"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" . -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -czf "$F/in.tgz" -C "$F/in" . -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 rm -rf "$F/in"
 V=/Users/user/mpd-data/vpd
 S=$((PODS * P))

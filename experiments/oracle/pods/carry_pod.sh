@@ -20,7 +20,7 @@ O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/scratch/glead/v5/texts-carry-$RUN.tar
 SEEDS="carry/train200_matrix.jsonl carry/hard50_relays.jsonl carry/heldout50_relays.jsonl ${REUSE:+carry/$REUSE}"
 HAVE=""; for f in $SEEDS; do [ -f "$D/$f" ] && HAVE="$HAVE $f"; done
-COPYFILE_DISABLE=1 tar -cf "$T" -C "$D" texts/vpd4l $HAVE
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$T" -C "$D" texts/vpd4l $HAVE
 STAGES=""
 for entry in $JOBS; do
   split=$(echo "$entry" | cut -d: -f1); n=$(echo "$entry" | cut -d: -f2); flag=$(echo "$entry" | cut -d: -f3)

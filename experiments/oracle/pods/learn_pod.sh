@@ -17,7 +17,7 @@ P=${P:-3} RANGES=${RANGES:-"6000:6800 9000:9200"}
 O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME V=/Users/user/mpd-data/vpd G=/Users/user/mpd-data/graph_oracle
 F=/Users/user/mpd-data/scratch/rustmove/learn/pod_$NAME
 mkdir -p "$F"
-COPYFILE_DISABLE=1 tar -czf "$F/texts.tgz" -C $G texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -czf "$F/texts.tgz" -C $G texts/vpd4l
 SEL=""
 if [ -n "${ONLY:-}" ]; then cp "$ONLY" "$F/only.txt"; SEL="--only $F/only.txt"; fi
 RUNS=""

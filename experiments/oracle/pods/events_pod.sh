@@ -14,7 +14,7 @@ G=$S/method/oracle E=$S/experiments/oracle
 N=oracle-graph-events-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/scratch/glead/v5/texts-events-$RUN.tar
-COPYFILE_DISABLE=1 tar -cf "$T" -C "$D" texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$T" -C "$D" texts/vpd4l
 STAGES=""
 for entry in $JOBS; do
   split=$(echo "$entry" | cut -d: -f1); n=$(echo "$entry" | cut -d: -f2)

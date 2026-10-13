@@ -17,7 +17,7 @@ N=oracle-graph-score-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/graph_oracle/texts-score-$RUN.tar
 A=/Users/user/mpd-data/graph_oracle/answers-score-$RUN.tar
-COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 DIRS=""
 STAGES=""
 for pair in $PAIRS; do

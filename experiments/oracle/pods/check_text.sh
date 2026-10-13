@@ -16,7 +16,7 @@ O=/Users/user/mpd-data/runpod/$RN
 F=/Users/user/mpd-data/scratch/fleet/check_$RUN
 mkdir -p "$F"
 echo "$TEXT" > "$F/tasks.txt"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 V=/Users/user/mpd-data/vpd
 TEACH="" SETS=""
 for spec in "$@"; do

@@ -23,8 +23,11 @@ Circuits (node sets with every connection the model has among them, blocks a sit
 Scores: goal_eval.GoalEval.fidelity in the reward's mode on the eval split (point, nodes, flips at FLIP_TERM over the
 CI-pattern pool, track_pp, interchange_pp, donors near and far, pattern, N; 16 node draws, 8 changed-input and
 interchange draws, 8 near and 4 far donors), the connection-cut family left out for
-every circuit (every connection among tens of thousands of block subcomponents is beyond memory), Φ (goal_eval.phi),
-bits (blocks at their active contents, cscore.bits_active) and compactness against the correct circuit.
+every circuit (every connection among tens of thousands of block subcomponents is beyond memory), and reward v3's
+circuit terms as components.reward forms them: Φ over the text's families (those the influential start scores,
+ge.tau on the eval split; an unscored family at 0), capped at the text's bar Φ_τ + 1 (cap_phi), the gate g, bits
+(size_bits, blocks at their active contents), compactness against the start's bits, and the circuit reward
+Φ - Φ_τ + g x 0.5 compact (D left out: no teacher); every family's floored score and eps.
 Variables (vars): E4 (variables.Scorer, eval split) of the copied token's identity carried by the a column's blocks,
 correct at a and wrong at the source-moved position; the value map's predictions on fresh tokens at a: the identity
 map (the prediction becomes the new token) against a random balanced partition of the vocabulary (a mechanism the model
@@ -235,8 +238,6 @@ def score(e: dict):
     import native
     import torch
 
-    import cscore
-
     ge = goal_eval.GoalEval(native.Native())
     ge.nat.LENGTHS_KEPT = 1
     nat = ge.nat
@@ -257,7 +258,8 @@ def score(e: dict):
     if e.get("mismatch"):
         variants["g_mismatched"] = column_nodes(e["mismatch"]["a"], t) + tact
     graphs = {k: native.Graph(sorted(set(v)), complete=True) for k, v in variants.items()}
-    bits = {k: cscore.bits_active(ge, tx, g) for k, g in graphs.items()}
+    P, S = nat.positions(tx.targets), sum(nat.C.values())
+    bits = {k: goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd) for k, g in graphs.items()}  # the reward's bits
     stated = json.loads((Path(os.environ.get("MECH", Path.home() / "mpd-data/graph_oracle/mechanisms")) / "copy_columns.json").read_text())
     import templates
 
@@ -268,26 +270,38 @@ def score(e: dict):
         for kind in ("vpd", "recency"):
             g, k = equal_bits(ge, tx, target_bits, kind)
             graphs[f"ref_{kind}_{lab}_bits"] = g
-            bits[f"ref_{kind}_{lab}_bits"] = cscore.bits_active(ge, tx, g)
+            bits[f"ref_{kind}_{lab}_bits"] = goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd)
     names = list(graphs)
     print(e["task"], "circuits built", round(time.perf_counter() - t0), "s", flush=True)
     pool = torch.load(POOL, weights_only=False) if POOL.exists() else None
+    tau = ge.tau(tx, pool, "eval")  # the text's bar, families and start bits, as reward v3 reads them
+    print(e["task"], "tau", round(time.perf_counter() - t0), "s", flush=True)
     rows = []
     for k in names:  # one at a time: the engine spans its call's columns
         rows += ge.fidelity(tx, [graphs[k]], pool=pool, mode="reward", split="eval", draws=16, interchange=8, changed=8,
                             near_donors=8, far_donors=4)
         native.free(nat.dev)
         print(e["task"], k, "scored", round(time.perf_counter() - t0), "s", flush=True)
+    import components
+
+    pt, fams = tau["phi_tau"], tau["families"]
     with out_path("falsify").open("a") as f:
         for k, r in zip(names, rows):
-            ph = goal_eval.phi(r)[0]
-            keep = {m: r.get(m) for m in ("s_point_c", "s_nodes", "s_edges", "s_track_pp", "s_interchange_pp", "s_donor_near",
-                                          "s_donor_far", "s_pattern", "n_spec", "c", "c_rl")}
-            keep["f1_flips_c"] = goal_eval.family_score(r, "flips")
-            f.write(json.dumps({"kind": e["kind"], "task": e["task"], "t": t, "variant": k, "phi": ph, "bits": bits[k],
-                                "compact": goal_eval.compact(bits[k], bits["correct"]), "nodes": graphs[k].count(),
-                                **{m: (float(v) if v is not None else None) for m, v in keep.items()}}) + "\n")
-    print(e["task"], {k: round(goal_eval.phi(r)[0] or 0, 3) for k, r in zip(names, rows)}, flush=True)
+            ph = goal_eval.phi(r, families=fams)[0]  # over the text's families (the start's), an unscored one at 0
+            phc = goal_eval.cap_phi(ph, pt)
+            g = None if phc is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (phc - pt)))
+            comp = goal_eval.compact(bits[k], tau["bits_start"])
+            eps = goal_eval._eps(r)
+            f.write(json.dumps({"kind": e["kind"], "task": e["task"], "t": t, "variant": k, "phi": ph, "phi_capped": phc, "phi_tau": pt,
+                                "phi_start": tau["phi_start"], "phi_empty": tau["phi_empty"], "families": fams, "g": g,
+                                # reward v3's circuit alone, less D (no teacher here): phi - phi_tau + g x 0.5 compact
+                                "reward": None if None in (phc, pt, g, comp) else phc - pt + g * 0.5 * comp,
+                                "bits": bits[k], "bits_start": tau["bits_start"], "compact": comp,
+                                "compact_vs_correct": goal_eval.compact(bits[k], bits["correct"]), "nodes": graphs[k].count(),
+                                **{f"s_{fm}": goal_eval.family_score(r, fm) for fm in goal_eval.PHI_FAMILIES},
+                                **{f"eps_{fm}": eps.get(fm) for fm in goal_eval.PHI_FAMILIES},
+                                "c": r.get("c"), "c_rl": r.get("c_rl")}) + "\n")
+    print(e["task"], {k: round(goal_eval.phi(r, families=fams)[0] or 0, 3) for k, r in zip(names, rows)}, flush=True)
 
 
 def variables_test(e: dict):
@@ -400,11 +414,12 @@ def report():
     for p in [DATA / "falsify.jsonl"] + templates.run_outputs("falsify_pod*.jsonl") + templates.run_outputs("falsify.jsonl"):
         if p.exists() and p.name.startswith("falsify") and "vars" not in p.name:
             rows += [json.loads(line) for line in p.read_text().splitlines()]
+    rows = [r for r in rows if "phi_tau" in r]  # rows scored before reward v3's terms were kept are rescored
     by = collections.defaultdict(dict)
     for r in rows:
         by[(r["kind"], r["task"], r["t"])].setdefault(r["variant"], r)
-    terms = ["phi", "s_point_c", "s_nodes", "f1_flips_c", "s_track_pp", "s_interchange_pp", "s_donor_near", "s_donor_far",
-             "s_pattern", "n_spec", "compact"]
+    terms = ["reward", "phi", "s_point", "s_nodes", "s_flips", "s_track_pp", "s_interchange_pp", "s_patching_near",
+             "s_patching_far", "s_pattern", "s_N", "compact"]
     pairs = [("correct", "a_source_moved"), ("correct", "b_fixed_offset"), ("c_with_backup", "correct"),
              ("correct", "d_irrelevant_parts"), ("correct", "g_mismatched"), ("correct", "template"),
              ("correct", "ref_vpd_correct_bits"), ("correct", "ref_recency_correct_bits")]
@@ -433,8 +448,12 @@ def report():
                 out[(kind, a_, b_, m)] = (float(np.mean(vals)) if vals else None, len(vals))
                 line.append(f"{np.mean(vals):12.2f}" if vals else f"{'-':>12s}")
             print(f"   {' '.join(line)}   {a_} > {b_} (n={max(out[(kind, a_, b_, m)][1] for m in terms)})")
-        print("   means: " + "; ".join(f"{v}: phi {np.mean([d[v]['phi'] for d in texts if v in d and d[v]['phi'] is not None]):.3f}"
-                                     for v in sorted({v for d in texts for v in d})))
+        mean = lambda v, m: np.mean([d[v][m] for d in texts if v in d and d[v][m] is not None])  # noqa: E731
+        print(f"   bar phi_tau {np.mean([next(iter(d.values()))['phi_tau'] for d in texts]):.2f}, start phi "
+              f"{np.mean([next(iter(d.values()))['phi_start'] for d in texts]):.2f}, empty phi {np.mean([next(iter(d.values()))['phi_empty'] for d in texts]):.2f}")
+        for v in sorted({v for d in texts for v in d}):
+            print(f"   {v:26s} reward {mean(v, 'reward'):7.2f}  phi {mean(v, 'phi'):6.2f}  bits {mean(v, 'bits'):9.0f}  "
+                  f"compact {mean(v, 'compact'):6.2f}  faithful {np.mean([d[v]['phi_capped'] >= d[v]['phi_tau'] for d in texts if v in d]):.2f}")
     vr = []
     for p in [DATA / "falsify_vars.jsonl"] + templates.run_outputs("falsify_vars*.jsonl"):
         if p.exists():

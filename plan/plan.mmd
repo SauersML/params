@@ -159,7 +159,7 @@ flowchart BT
     T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>494 texts, held-out pp 0.965 · DONE"]
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
     T3["<b>Pruning, discriminating draws</b><br/>why: fixed-draw pruning overfit<br/>(held-out 0.34 vs 0.88)<br/>landed fe0f478; N floor 343c2a1<br/>eval check on 9002, 6011, 9013<br/>ACTIVE · pymove"]
-    T4["<b>Teacher circuits v2</b><br/>start from the influential set, prune only;<br/>fresh draws + validation backtracking;<br/>launches pm7 and v2 at eval pp ≥ 0.85<br/>and beats VPD top k at equal size;<br/>so far 9002: 175 nodes, eval 0.77 (VPD 0.62)<br/>BLOCKED · fleet, pymove"]
+    T4["<b>Teacher circuits v2</b><br/>influential set, prune only, fresh draws<br/>+ validation backtracking (d149b8d);<br/>9004: eval 0.92 (VPD 0.50) but prunes nothing:<br/>C-semantics KL budget binds; fix = relative<br/>budget (≤ 5% of the start's recovery lost)<br/>launch at eval ≥ 0.85, beats VPD, real pruning<br/>BLOCKED · pymove, fleet"]
     T5["<b>Context-blocks teacher</b><br/>keeps context as blocks, prunes<br/>only the target; test transfer<br/>to unseen changes · pymove"]
   end
 
@@ -177,7 +177,7 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>correct copy circuits vs<br/>plausible wrong ones; algorithms<br/>the model does not run must fail<br/>ACTIVE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>common removal tests for all candidates;<br/>absolute sufficiency before size credit;<br/>gate leak shut: slope 10 (6f8a869)<br/>ACTIVE · codex, inframove, primerl"]
+    W4["<b>Reward repair</b><br/>bar floor (≥ Φ_empty + 1); unscored = 0;<br/>N guard and clip; eps cap 0.05;<br/>scores clipped at −1; Φ capped at Φ_τ + 1;<br/>gate slope 10, D zero at parity<br/>evidence: toy Gate B repair table<br/>ACTIVE · inframove, primerl"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
     W6["<b>Matched reward controls</b><br/>null-syntax bonus fixed;<br/>retain scored draws to distinguish<br/>response errors from uncertainty<br/>IMPLEMENTED · codex · b84253d"]
   end

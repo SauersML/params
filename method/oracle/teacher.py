@@ -143,6 +143,25 @@ KL_FLOOR = 1e-9       # a KL's floor before a fractional power (goal_eval.recove
 # round below 0, and a negative base to a fractional power is complex (fleet's planted toys)
 
 
+REWARD_ROWS = 64  # node sets whose reward-mode rows reward_row keeps on a text
+
+
+def reward_row(ge: goal_eval.GoalEval, tx: goal_eval.Text, g: native.Graph, pool: dict) -> dict:
+    """GoalEval.fidelity's reward-mode row of a node set on the search split, kept on tx per node set and pool (the
+    latest REWARD_ROWS): the floors' current circuit, the acceptance's start and the stages' scoring ask for the same
+    sets again (text9015 at 211d3b8: 9 of 18 rows its unchanged start, 2.6 s each on a 4090, every level's removals
+    reverted by validation); a stated graph is run each time."""
+    if not g.complete or getattr(g, "masks", None) is not None:
+        return ge.fidelity(tx, [g], pool, mode="reward", split="search")[0]
+    kept = tx.__dict__.setdefault("_reward_rows", {})
+    key = (tuple(sorted(g.node_set())), id(pool))
+    if key not in kept:
+        while len(kept) >= REWARD_ROWS:
+            kept.pop(next(iter(kept)))
+        kept[key] = ge.fidelity(tx, [g], pool, mode="reward", split="search")[0]
+    return kept[key]
+
+
 def floor_of(v: float | None) -> float | None:
     """An acceptance term's floor from the start's value, the reward's per-family floor (goal_eval.floors): max(0,
     min(FLOOR_TOP 0.9, it - FLOOR_MARGIN 0.05)) (None: no floor)."""
@@ -743,7 +762,7 @@ class Acceptance:
         self.ge, self.tx, self.kinds, self.mode, self.calls, self.pool_adv = ge, tx, tuple(kinds), mode, 0, pool
         self._phi_base = {}                                  # (the current circuit's key) -> its reward-mode row
         self.draws, self.refused, self.pool, self.rank_floor = draws, [], None, {}
-        self._floor_base, self._screens = {}, {}            # "floors": the current circuit's row; flips' shortlists
+        self._screens = {}                                  # "floors": flips' shortlists
         if draws in ("discriminating", "fresh", "fv") and mode != "pp":
             raise ValueError("discriminating draws score s_track_pp: mode pp")
 
@@ -873,12 +892,9 @@ class Acceptance:
         (its first family under the floor recorded in refused)."""
         ge, tx, nat = self.ge, self.tx, self.ge.nat
         g_now = graph_of(now)
-        key = self.key(now)
-        if key not in self._floor_base:
-            self._floor_base = {key: ge.fidelity(tx, [g_now], self.pool_adv, mode="reward", split="search")[0]}
         graphs = [graph_of(on) for on in ons]
         got = ge.phi_variants(tx, g_now, ge.keep_of(tx, g_now, [sorted(h.node_set()) for h in graphs]), self.pool_adv,
-                              base=self._floor_base[key])["variants"]
+                              base=reward_row(ge, tx, g_now, self.pool_adv))["variants"]
         held = ("edges", "omitted", "flips")
         out = [{f: goal_eval.family_score(v["row"], f) for f in floors if f not in held} for v in got]
 
@@ -992,8 +1008,7 @@ class Acceptance:
             floor["phi"] = min(base["phi"], bar) + PHI_SLACK
         if by_floors:                                        # the reward's per-family floors, at most the search start's
             tau = self.ge.tau(self.tx, self.pool_adv, "search")   # own score (an expanded or forward start below a floor
-            row0 = self.ge.fidelity(self.tx, [graph_of(start)], self.pool_adv, mode="reward", split="search")[0]   # may still
-            self._floor_base = {self.key(start): row0}       # prune, never further down)
+            row0 = reward_row(self.ge, self.tx, graph_of(start), self.pool_adv)   # may still prune, never further down)
             fams = {f: min(v, goal_eval.family_score(row0, f) or 0.0) for f, v in (tau.get("floors") or {}).items()}
 
         def judge(ons):                                      # the changed term on the draws each candidate is most at
@@ -1267,7 +1282,7 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
         for name, on_s in reversed(snaps):                   # phi_variants rows (8 draws) passed 9 of fleet's 85 v2
             g_s = graph_of(on_s)                             # teachers that their own full rows put 0.02-0.03 under one
             rec["stage_nodes"][name] = [list(nd) for nd in sorted(g_s.node_set())]   # (each stage kept for re-picks)
-            row = ge.fidelity(tx, [g_s], phi_pool, mode="reward", split="search")[0]
+            row = reward_row(ge, tx, g_s, phi_pool)
             bits = goal_eval.size_bits(g_s, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, tx.vpd)
             ct = goal_eval.circuit_term(row, tau, bits)
             score = ct["term"]
@@ -1436,7 +1451,7 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
         bar = ge.tau(tx, phi_pool, "search")["phi_tau"]      # at a time while the circuit falls below it
         rec["phi"], best = [], None
         for name, on_s, fl_s in reversed(snaps):
-            row = ge.fidelity(tx, [graph_of(on_s, fl_s)], phi_pool, mode="reward", split="search")[0]
+            row = reward_row(ge, tx, graph_of(on_s, fl_s), phi_pool)
             ph = goal_eval.phi(row, start=bar)[0]
             rec["phi"].append([name, ph, bar])
             log(f"  blocks phi at {name}: {ph} (bar {bar})", flush=True)

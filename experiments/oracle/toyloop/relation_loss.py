@@ -79,11 +79,17 @@ def apply_to_datum(datum, completion, tokenizer, multiplier=1):
         mask[i] = selected
     changed = reweight(weights, mask, multiplier)
     inputs = dict(datum.loss_fn_inputs)
-    inputs['weights'] = TensorData.from_torch(torch.tensor(changed, dtype=tensor.dtype))
+    stored = torch.tensor(changed, dtype=tensor.dtype)
+    stored_weights = stored.tolist()
+    if (any(not math.isfinite(w) or (old > 0 and w <= 0) for old, w in zip(weights, stored_weights))
+            or abs(sum(stored_weights) - sum(weights)) > 1e-6 * sum(weights)):
+        raise ValueError('stored weight precision does not preserve positive supervision and mass')
+    inputs['weights'] = TensorData.from_torch(stored)
     out = tinker.Datum(model_input=datum.model_input, loss_fn_inputs=inputs)
     return out, {'multiplier': multiplier, 'changed': changed != weights,
                  'supervised_tokens': len(indices), 'relation_tokens': sum(local),
                  'old_relation_mass': sum(w for w, m in zip(weights, mask) if m),
                  'new_relation_mass': sum(w for w, m in zip(changed, mask) if m),
                  'old_total_mass': sum(weights), 'new_total_mass': sum(changed),
+                 'stored_total_mass': sum(stored_weights),
                  'boundary_rule': 'Token wholly contained in one relation line; crossing/zero-width tokens excluded.'}

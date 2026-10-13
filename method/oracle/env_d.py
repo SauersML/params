@@ -16,9 +16,14 @@ base sampling client on Tinker (tinker_train.tinker_reader); never a Claude or A
       E1 of the correct English, another text's (shuffled) and each one-claim-changed version, read with the text's
       circuit; no English is 0 by definition. Passes when the correct English beats each one-claim-changed version
       on >= GATE of the texts that have it (the lead's 10-13 gate before RL spend); the mean E1s reported
+  env_d.py write FACTS.jsonl ROWS.jsonl OUT.jsonl --samples N --no-edits
+      the SFT writer's N samples per text, {"task", "samples"}
+  env_d.py select FACTS.jsonl ROWS.jsonl SAMPLES.jsonl OUT.jsonl --reader R
+      tinker_train.py explain's selection on the reader R: E1 of each sample, the best kept when above 0 (it tells
+      the reader more than the neutral sentence), as {"task", "samples", "e1", "best", "explanation", "e1_best"}
   env_d.py questions FACTS.jsonl OUT.jsonl                     RL question rows {"task", "question"}
-  env_d.py sft ENGLISH.jsonl FACTS.jsonl OUT.jsonl            SFT rows (components.py dataset's format) from
-      tinker_train.py explain's output: the question, then the kept English (best of N by E1, above the neutral one)
+  env_d.py sft ENGLISH.jsonl FACTS.jsonl OUT.jsonl            SFT rows (components.py dataset's format) from select's
+      or tinker_train.py explain's output: the question, then the kept English
   env_d.py serve FACTS.jsonl ROWS.jsonl --reader R [--port 8772]
       POST /score {"task", "answers": [text, ...]} -> {"scores": [{"reward", "e1", "valid", "words", "named"}, ...]}
       (tinker_train.py rl's scorer: --no-lines); GET /health
@@ -143,7 +148,13 @@ def write(a) -> None:
 
     with a.out.open("w") as fh:
         for f in facts:
-            correct = next((e for e in ask(components.writer_prompt(f), 4) if e and not NAMES.search(e)), None)
+            if a.no_edits:
+                fh.write(json.dumps({"task": f["task"], "samples": [e for e in ask(components.writer_prompt(f), a.samples)
+                                                                     if e and not NAMES.search(e)]}) + "\n")
+                fh.flush()
+                print(json.dumps({"task": f["task"], "usd": round(spend.total, 4)}), flush=True)
+                continue
+            correct = next((e for e in ask(components.writer_prompt(f), a.samples) if e and not NAMES.search(e)), None)
             row = {"task": f["task"], "correct": correct, "position": None, "mechanism": None}
             wp = wrong_position(f, rows.get(f["task"], {}), native.task_seed(f["task"])) if correct else None
             if wp is not None:
@@ -178,6 +189,26 @@ def gate(a) -> None:
     summary = summarize(out)
     (a.out.parent / (a.out.stem + "_summary.json")).write_text(json.dumps(summary, indent=1))
     print(json.dumps(summary), flush=True)
+
+
+def select(a) -> None:
+    reader = make_reader(a.reader)
+    facts = {f["task"]: f for f in map(json.loads, a.facts.read_text().splitlines()) if f}
+    rows = {r["task"]: r for r in map(json.loads, a.rows.read_text().splitlines()) if r}
+    kept = n = 0
+    with a.out.open("w") as fh:
+        for r in map(json.loads, a.samples.read_text().splitlines()):
+            if r["task"] not in facts or not r["samples"]:
+                continue
+            e1 = [s["e1"] for s in score(reader, task_of(r["task"]), rows[r["task"]], facts[r["task"]], r["samples"])]
+            best = max(range(len(e1)), key=lambda i: -1e9 if e1[i] is None else e1[i])
+            keep = e1[best] is not None and e1[best] > 0
+            fh.write(json.dumps({"task": r["task"], "samples": r["samples"], "e1": e1, "best": best,
+                                 "explanation": r["samples"][best] if keep else "", "e1_best": e1[best]}) + "\n")
+            fh.flush()
+            n, kept = n + 1, kept + keep
+            print(json.dumps({"task": r["task"], "e1_best": e1[best], "kept": keep}), flush=True)
+    print(json.dumps({"texts": n, "kept": kept}), flush=True)
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -260,6 +291,15 @@ def main():
     w.add_argument("out", type=Path)
     w.add_argument("--writer", default=WRITER)
     w.add_argument("--max-tokens", type=int, default=1024)
+    w.add_argument("--samples", type=int, default=4, help="writer samples per text (the gate's correct English: the first "
+                   "that names no subcomponent)")
+    w.add_argument("--no-edits", action="store_true", help="the samples alone, for select (SFT data)")
+    se = sub.add_parser("select")
+    se.add_argument("facts", type=Path)
+    se.add_argument("rows", type=Path)
+    se.add_argument("samples", type=Path)
+    se.add_argument("out", type=Path)
+    se.add_argument("--reader", required=True)
     g = sub.add_parser("gate")
     g.add_argument("facts", type=Path)
     g.add_argument("rows", type=Path)
@@ -279,7 +319,7 @@ def main():
     v.add_argument("--reader", required=True)
     v.add_argument("--port", type=int, default=8772)
     a = ap.parse_args()
-    {"write": write, "gate": gate, "questions": questions, "sft": sft, "serve": serve}[a.cmd](a)
+    {"write": write, "gate": gate, "select": select, "questions": questions, "sft": sft, "serve": serve}[a.cmd](a)
 
 
 if __name__ == "__main__":

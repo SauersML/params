@@ -20,7 +20,10 @@ INSTRUCTION = ("Return only an executable Mermaid flowchart LR. State head/neuro
                "Do not include English or token annotations.")
 LEARNING_SCOPE = ("Within-family held-out-model transfer across the same eight generator templates; "
                   "not proof of weight use or generalization to new mechanisms. "
-                  "Model/parameter variation can preserve name-to-topology shortcuts.")
+                  "Model/parameter variation can preserve name-to-topology shortcuts. "
+                  "This compares bundled supervision recipes: analytic point targets versus "
+                  "context-specific compressed intervention-search targets. Differences cannot "
+                  "be attributed to intervention constraints alone.")
 
 
 def unit_name(name):

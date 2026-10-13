@@ -25,6 +25,9 @@ h.1.mlp.c_fc #2103 and h.2.attn.k_proj #206; at o, h.1.attn.k_proj #329 and #119
   mechdisc.py teach --name N  the v2.3 teacher on one item (teacher.py: --f1-start set --accept-mode pp --accept-draws
                               fv --phi-check --rank once --accept changed,floors, semantics n) -> OUT/mechdisc_teacher/
   mechdisc.py score [--answers JSONL ...]   per item and pair whether the circuits hold each mechanism, bootstrap intervals
+  mechdisc.py freeze --answers S1.jsonl ...  the fixed eval set (no later search changes it) and its reference rows
+  mechdisc.py eval ANSWERS.jsonl ... [--out F.json]   one answer set on the frozen items: per family the headline share,
+                              its paired difference to the teacher and S1, the secondary judgments
 """
 from __future__ import annotations
 
@@ -183,6 +186,8 @@ def pairs():
             items.append(r)
     # earlier pairs stay as they are (their teacher runs and S1 answers are keyed by item); a later search's items join
     prev = DATA / "mechdisc_items.json"
+    if prev.exists() and json.loads(prev.read_text()).get("frozen"):
+        sys.exit("mechdisc_items.json is frozen (the fixed eval set, mechdisc.py freeze); pairs leaves it as it is")
     out = json.loads(prev.read_text())["pairs"] if prev.exists() else []
     key = lambda r: (r["kind"], r["text"], r["t"])  # noqa: E731
     used = {key(r) for p_ in out for r in p_["items"]}
@@ -348,6 +353,122 @@ def _boot(ws) -> str:
     return "-" if c is None else f"{c['mean']:.2f} [{c['lo']:.2f}, {c['hi']:.2f}] (n={c['n']})"
 
 
+JUDGED = {"right_not_wrong": "headline: the item's measured mechanism in the circuit and not the other",
+          "right": "the measured mechanism in the circuit", "wrong": "the other mechanism in the circuit",
+          "context_share": "share of nodes at context positions", "chance": "a random context position in the circuit",
+          "right_ao": "copy: a and o both in the circuit", "core_share": "copy: core parts at a and o (share of 6)",
+          "right_one": "bigram: no previous-token pair at a context position (one-sided)"}
+
+
+def _families(by: dict, items: dict) -> tuple:
+    """Per family (copy, bigram, context): each judgment's mean and 95% bootstrap interval over the items (an item's
+    answers averaged), and per item the headline (right and not wrong)."""
+    out, head = {}, {}
+    for kd in ("copy", "bigram", "context"):
+        names = [nm for nm, r in sorted(items.items()) if r["kind"] == kd]
+        js = [[judge(items[nm], a) for a in by[nm]] for nm in names]
+        fs = ["right_not_wrong", "right", "wrong", "context_share", "chance"] + {"copy": ["right_ao", "core_share"], "bigram": ["right_one"]}.get(kd, [])
+        ws = {f: [_mean([(j["right"] and not j["wrong"]) if f == "right_not_wrong" else j[f] for j in jj]) for jj in js] for f in fs}
+        out[kd] = {f: _ci(w) for f, w in ws.items()}
+        head.update(zip(names, ws["right_not_wrong"]))
+    return out, head
+
+
+def _fmt(c) -> str:
+    return "-" if c is None else f"{c['mean']:.2f} [{c['lo']:.2f}, {c['hi']:.2f}] (n={c['n']})"
+
+
+def _answers(files: list) -> dict:
+    """task -> its answers' circuits from JSONL lines {task, text} (a model's raw output; components.parse reads its
+    CIRCUIT) or {task, answer: {nodes: ...}} (a circuit already in the answer format), several lines per task allowed."""
+    try:
+        import native  # noqa: F401  (components.group_of names a site through native.site_name)
+    except ImportError:  # the standard library alone: native's site_name, the only part parse reads
+        import types
+
+        sys.modules["native"] = types.SimpleNamespace(site_name=lambda layer, kind: _site(f"{layer}.{dict(q_proj='q', k_proj='k', v_proj='v', o_proj='o', c_fc='fc', down_proj='down')[kind]}"))
+    import components
+
+    by = collections.defaultdict(list)
+    for f in files:
+        for x in Path(f).read_text().splitlines():
+            if x.strip():
+                ln = json.loads(x)
+                by[ln["task"]].append(ln["answer"] if "answer" in ln else components.parse(ln.get("text") or "")["answer"])
+    return by
+
+
+def _items() -> dict:
+    return {r["name"]: r for p in json.loads((DATA / "mechdisc_items.json").read_text())["pairs"] for r in p["items"]}
+
+
+def freeze(s1: list):
+    """The fixed eval set: mechdisc_items.json marked frozen (pairs refuses to change it), its ids in
+    mechdisc_eval_ids.txt, and the reference rows (the v2.3 teacher's circuits, S1's answers) per item in
+    mechdisc_reference.json, which eval compares an answer set against item by item."""
+    d = json.loads((DATA / "mechdisc_items.json").read_text())
+    d["frozen"] = True
+    (DATA / "mechdisc_items.json").write_text(json.dumps(d, indent=1))
+    items = _items()
+    (DATA / "mechdisc_eval_ids.txt").write_text("\n".join(sorted(items)) + "\n")
+    teach_ = _teacher()
+    ref = {}
+    for src, by in (("teacher (v2.3)", {k: [v] for k, v in teach_.items()}), ("S1", _answers(s1))):
+        missing = [nm for nm in items if nm not in by]
+        full = collections.defaultdict(list, {nm: by.get(nm) or [{}] for nm in items})
+        ref[src] = {"families": _families(full, items)[0], "items": _families(full, items)[1], "missing": missing}
+        print(src, "missing", len(missing), {kd: _fmt(v["right_not_wrong"]) for kd, v in ref[src]["families"].items()})
+    (DATA / "mechdisc_reference.json").write_text(json.dumps(ref, indent=1))
+    print(f"froze {len(items)} items -> {DATA / 'mechdisc_eval_ids.txt'}, reference rows -> {DATA / 'mechdisc_reference.json'}")
+
+
+def evaluate(files: list, out: Path | None = None):
+    """One answer set on the frozen 167 items (DATA/mechdisc_eval_ids.txt; questions as S1's, primerl's
+    mechdisc_s1/rows*.jsonl): per family the headline share with its 95% bootstrap interval, an item without an
+    answer counted as an empty circuit (it fails), the paired difference to each reference row (the v2.3 teacher, S1)
+    over the same items, and the secondary judgments. out: the table as JSON."""
+    import random
+
+    items = _items()
+    by = _answers(files)
+    unknown = sorted(set(by) - set(items))
+    missing = sorted(nm for nm in items if not by.get(nm))
+    full = collections.defaultdict(list, {nm: by.get(nm) or [{}] for nm in items})
+    fam, head = _families(full, items)
+    ref = json.loads((DATA / "mechdisc_reference.json").read_text()) if (DATA / "mechdisc_reference.json").exists() else {}
+    print(f"mechdisc eval of {', '.join(map(str, files))}: {len(items)} items, {sum(len(v) for v in by.values())} answers, "
+          f"{len(missing)} items without an answer (counted as empty circuits){f', {len(unknown)} unknown task ids' if unknown else ''}")
+    res = {"files": [str(f) for f in files], "missing": missing, "families": fam, "vs": {}}
+    print(f"  {'family':8s} {'items':>5s}  {'headline [95% CI]':24s}" + "".join(f"  {'minus ' + k + ' (paired)':34s}" for k in ref))
+    for kd in ("copy", "bigram", "context"):
+        names = [nm for nm in sorted(items) if items[nm]["kind"] == kd]
+        row = f"  {kd:8s} {len(names):5d}  {_fmt(fam[kd]['right_not_wrong']):24s}"
+        for k, rv in ref.items():
+            d = [head[nm] - rv["items"][nm] for nm in names]
+            r = random.Random(2951)
+            bs = sorted(_mean(r.choices(d, k=len(d))) for _ in range(2000))
+            res["vs"].setdefault(k, {})[kd] = {"mean": _mean(d), "lo": bs[50], "hi": bs[1949], "n": len(d)}
+            row += f"  {_mean(d):+.2f} [{bs[50]:+.2f}, {bs[1949]:+.2f}]" + " " * 16
+        print(row)
+    print("  secondary:")
+    for kd in ("copy", "bigram", "context"):
+        print(f"    {kd:8s} " + "; ".join(f"{JUDGED[f]} {_fmt(c)}" for f, c in fam[kd].items() if f != "right_not_wrong"))
+    if out:
+        Path(out).write_text(json.dumps(res, indent=1))
+        print("wrote", out)
+    return res
+
+
+def _teacher() -> dict:
+    out = {}
+    for d in sorted({p.parent for r in RUNS if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_teacher/md*.json")}) + [OUTROOT / "mechdisc_teacher"]:
+        if d.exists():
+            for f in d.iterdir():
+                if f.suffix == ".json" and f.stem.count(".") == 0 and f.stem.startswith("md"):
+                    out.setdefault(f.stem, json.loads(f.read_text()))
+    return out
+
+
 def score(answers: list | None = None, tdirs: list | None = None):
     """Per contrast: the teacher's circuits (every run's mechdisc_teacher/) and S1's answers (answers: JSONL of
     {task, sample, text}, the circuit components.parse(text)["answer"]), each item's right (copy: holds a, the measured
@@ -355,28 +476,16 @@ def score(answers: list | None = None, tdirs: list | None = None):
     context position) and wrong (copy and context:
     target-local only; bigram: that pair at a context position), and a pair right when both items are right; bootstrap 95% intervals over pairs."""
     pr = json.loads((DATA / "mechdisc_items.json").read_text())["pairs"]
-    teach_ = {}
-    for d in (tdirs or []) + sorted({p.parent for r in RUNS if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_teacher/md*.json")}) + [OUTROOT / "mechdisc_teacher"]:
-        d = Path(d)
-        if d.exists():
-            for f in d.iterdir():
-                if f.suffix == ".json" and f.stem.count(".") == 0 and f.stem.startswith("md"):
-                    teach_.setdefault(f.stem, json.loads(f.read_text()))
+    teach_ = _teacher()
+    for d in tdirs or []:
+        for f in Path(d).iterdir():
+            if f.suffix == ".json" and f.stem.count(".") == 0 and f.stem.startswith("md"):
+                teach_.setdefault(f.stem, json.loads(f.read_text()))
     sources = {"teacher (v2.3)": {k: [v] for k, v in teach_.items()}}
-    if answers:
-        try:
-            import native  # noqa: F401  (components.group_of names a site through native.site_name)
-        except ImportError:  # the standard library alone: native's site_name, the only part parse reads
-            import types
-
-            sys.modules["native"] = types.SimpleNamespace(site_name=lambda layer, kind: _site(f"{layer}.{dict(q_proj='q', k_proj='k', v_proj='v', o_proj='o', c_fc='fc', down_proj='down')[kind]}"))
-        import components
-
-        for f in answers:  # a model's answers under DATA/mechdisc_<model>/ (mechdisc_s1, mechdisc_s2)
-            src = Path(f).parent.name.removeprefix("mechdisc_").upper()
-            for x in Path(f).read_text().splitlines():
-                ln = json.loads(x)
-                sources.setdefault(src, collections.defaultdict(list))[ln["task"]].append(components.parse(ln["text"])["answer"])
+    for f in answers or []:  # a model's answers under DATA/mechdisc_<model>/ (mechdisc_s1, mechdisc_s2)
+        src = Path(f).parent.name.removeprefix("mechdisc_").upper()
+        for k, v in _answers([f]).items():
+            sources.setdefault(src, collections.defaultdict(list))[k] += v
     summary = {}
     for src, by in sources.items():
         print(f"== {src}")
@@ -398,30 +507,22 @@ def score(answers: list | None = None, tdirs: list | None = None):
                 print(f"    pair right (both items right, neither wrong) {_boot(both)}")
         items = {r["name"]: r for p in pr for r in p["items"] if r["name"] in by}
         print("  per family, each item once: its mechanism's positions in the circuit and not the other mechanism's")
-        for kd in ("copy", "bigram", "context"):
-            js = [[judge(r, a) for a in by[nm]] for nm, r in sorted(items.items()) if r["kind"] == kd]
-            ws = {f: [_mean([g(j) for j in jj]) for jj in js] for f, g in
-                  (("right_not_wrong", lambda j: j["right"] and not j["wrong"]), ("right", lambda j: j["right"]),
-                   ("wrong", lambda j: j["wrong"]), ("context_share", lambda j: j["context_share"]), ("chance", lambda j: j["chance"]),
-                   *((("right_ao", lambda j: j["right_ao"]), ("core_share", lambda j: j["core_share"])) if kd == "copy" else ()),
-                   *((("right_one", lambda j: j["right_one"]),) if kd == "bigram" else ()))}
-            summary.setdefault(src, {})[kd] = {f: _ci(w) for f, w in ws.items()}
-            print(f"    {kd:8s} {_boot(ws['right_not_wrong'])}; nodes at context positions {_boot(ws['context_share'])}; "
-                  f"a random context position in the circuit {_boot(ws['chance'])}"
-                  + (f"; a and o both in the circuit {_boot(ws['right_ao'])}; core parts at a and o (share of 6) {_boot(ws['core_share'])}" if kd == "copy" else "")
-                  + (f"; no previous-token pair at a context position (one-sided) {_boot(ws['right_one'])}" if kd == "bigram" else ""))
+        summary[src] = _families(by, items)[0]
+        for kd, ws in summary[src].items():
+            print(f"    {kd:8s} " + "; ".join(f"{JUDGED[f]} {_fmt(c)}" for f, c in ws.items()))
     (OUTROOT / "mechdisc_score.json").write_text(json.dumps(summary, indent=1))
     print("wrote", OUTROOT / "mechdisc_score.json")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("find", "pairs", "teach", "score"))
+    ap.add_argument("cmd", choices=("find", "pairs", "teach", "score", "freeze", "eval"))
     ap.add_argument("args", nargs="*")
     ap.add_argument("--name", default=None)
     ap.add_argument("--answers", type=Path, action="append", default=None, help="score: answers JSONL (repeatable)")
     ap.add_argument("--kinds", default=None, help="find: the kinds searched (comma-separated)")
     ap.add_argument("--cands", type=int, default=None, help="find: candidates confirmed per text and kind")
+    ap.add_argument("--out", type=Path, default=None, help="eval: the table as JSON")
     a = ap.parse_args()
     if a.kinds:
         KINDS = tuple(a.kinds.split(","))
@@ -433,5 +534,9 @@ if __name__ == "__main__":
         pairs()
     elif a.cmd == "teach":
         teach(a.name)
+    elif a.cmd == "freeze":
+        freeze(a.answers or [])
+    elif a.cmd == "eval":
+        evaluate(a.args, a.out)
     else:
         score(a.answers, a.args)

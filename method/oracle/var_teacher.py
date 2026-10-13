@@ -165,17 +165,18 @@ def profiles(sc: variables.Scorer, tx, nodes: list[tuple], positions: list[int],
     subs = [i for i, nd in enumerate(nodes) if nd[2] != BLOCK]
     bi = [i for i, nd in enumerate(nodes) if nd[2] == BLOCK]
     where = _where([nodes[i] for i in subs], sc.nat.dev)
+    keep = sorted({nd[1] for nd in nodes})  # (each text's tables at the nodes' positions alone)
 
     def reads(w):  # (the subcomponents' activations [S], the blocks' outputs)
         return _gather(w["act"], where, len(subs)), [w["out"][nodes[i][0]][nodes[i][1]] for i in bi]
-    s0, b0 = reads(sc._text(tx.ids, tx.targets, None, check=False))
+    s0, b0 = reads(sc._text(tx.ids, tx.targets, None, check=False, positions=keep))
     out = np.zeros((len(nodes), len(positions)))
     for j, p in enumerate(positions):
         ds = ge._interchange_draws(tx, [p], "search", draws)
         for _, z in ds:
             x = list(tx.ids)
             x[p] = z
-            s1, b1 = reads(sc._text(x, tx.targets, None, check=False))
+            s1, b1 = reads(sc._text(x, tx.targets, None, check=False, positions=keep))
             out[subs, j] += np.abs(s1 - s0) / len(ds)
             if bi:
                 out[bi, j] += torch.stack([(o1 - o).norm() for o1, o in zip(b1, b0)]).cpu().double().numpy() / len(ds)

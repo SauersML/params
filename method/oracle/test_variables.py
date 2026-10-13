@@ -137,11 +137,37 @@ def test_feeds(case):
         assert (ab["f"] > 0.99) if claim else (ab["f"] < 0.01), ab
 
 
+def test_kept_positions_give_the_same_scores(case, monkeypatch):
+    """_world keeps each text's tables at the targets and its groups' positions alone, and patches by index: a score
+    with feeds, composition, blocks and a group inside a circuit's stated graph equals the one with every position
+    kept, to the bit; a position not kept raises."""
+    import json
+    nat, ge, tx, at, _ = case
+    late = [[n, c, 288] for n in nat.names if native._name_layer_kind(n)[0] >= nat.target.n_layer - 1 for c in range(nat.C[n])][::3]
+    vs = variables.parse([{"name": "a", "inputs": [233], "group": at(233)[::5] + [["block", nat.names[2], 232]], "feeds": ["b"]},
+                          {"name": "b", "inputs": [287], "group": late}], nat.C)
+    sc = variables.Scorer(ge)
+    model = sc._text(tx.ids, tx.targets, check=False, positions=[233, 288])
+    with pytest.raises(KeyError):
+        model["act"][nat.names[0]][5]
+    nodes = [(n, t, int(c)) for n in nat.names for t in (233, 288) for c in model["act"][n][t].abs().topk(2).indices.tolist()]
+    par, out = native.all_edges(nodes, tx.targets)
+    graph = native.Graph(nodes, {r: ws[::2] for r, ws in par.items()}, out[::2])
+    kept = sc.score(tx, vs, "eval", 2, graph=graph)
+    whole = variables.Scorer._text
+    monkeypatch.setattr(variables.Scorer, "_text", lambda self, ids, targets, graph=None, check=True, positions=None:
+                        whole(self, ids, targets, graph, check))
+    every = sc.score(tx, vs, "eval", 2, graph=graph)
+    assert every["variables"][0]["draws_on"] and every["feeds"]
+    assert json.dumps(kept, sort_keys=True) == json.dumps(every, sort_keys=True)
+
+
 def test_headline_rules():
-    """e4: per variable min(f on-target, s off-target); 0 for a variable with no resolved on-target draw (counted), its
+    """e4: per variable min(f on-target, f off-target); 0 for a variable with no resolved on-target draw (counted), its
     off-target not counted; composition and feeds as they are; a missing off-target leaves f on-target."""
-    out = variables.headline({"variables": [{"f_on": 0.9, "s_off": 0.5, "s_on": 0.2}, {"f_on": None, "s_off": 1.0, "s_on": None},
-                                            {"f_on": 0.8, "s_off": None, "s_on": 0.3}],
+    out = variables.headline({"variables": [{"f_on": 0.9, "f_off": 0.5, "s_off": 0.5, "s_on": 0.2},
+                                            {"f_on": None, "f_off": 1.0, "s_off": 1.0, "s_on": None},
+                                            {"f_on": 0.8, "f_off": None, "s_off": None, "s_on": 0.3}],
                               "pairs": [{"f_comp": 0.6, "s_comp": 0.1}], "feeds": [{"f": 1.0, "feeds": False}]})
     assert out["unresolved"] == 1
     assert abs(out["e4"] - (0.5 + 0.0 + 0.8 + 0.6 + 1.0) / 5) < 1e-12

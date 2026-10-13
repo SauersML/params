@@ -648,7 +648,8 @@ class Engine:
                         off: list | None = None, add: dict | None = None, rest: dict | None = None,
                         at_x: dict | None = None, held: dict | None = None, norms: dict | None = None, freeze: str = ""):
         """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32. patch:
-        {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange). reads as
+        {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange), or {site:
+        ((rows, positions, columns), values [n])}, the same as one indexed write (float32 runs). reads as
         log_probs': (log q, {site: [n]}). keep, a dict, receives the run's states for reuse (each layer's keys and
         values, every writer row's activation; float32). reuse = (keep's states of a run of the same plan, u, ew and ow
         on the engine's text, tokens, start): the run on tokens ([T] for every row or [B, T] per row, equal to the
@@ -682,6 +683,8 @@ class Engine:
         run made with the same at_x, held and norms, every row's held before reuse's start its."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
+        if patch is not None and precision != "score" and any(isinstance(v[0], tuple) for v in patch.values()):
+            raise ValueError("an indexed patch is a float32 run (score)")
         if (keep is not None or reuse is not None) and (precision != "score" or patch is not None or reads is not None):
             raise ValueError("keep and reuse are float32 runs without patch or reads")
         if (outputs is not None or rec_out is not None) and (precision != "score" or reuse is not None):
@@ -1802,7 +1805,10 @@ class Engine:
 
         def done(n, A):  # a site's activations [B, T, K], patched: its writer nodes' kept, the asked ones read
             if patch is not None and n in patch:
-                A = torch.where(cut(n, patch[n][0]), cut(n, patch[n][1]).to(A.dtype), A)
+                if isinstance(patch[n][0], tuple):  # (rows, positions, columns) and their values: one indexed write
+                    A = A.index_put(patch[n][0], patch[n][1].to(A.dtype))
+                else:
+                    A = torch.where(cut(n, patch[n][0]), cut(n, patch[n][1]).to(A.dtype), A)
             if n in xh:  # held at x (at_x): the model's activations
                 A = torch.where(cut(n, xh[n][0]), cut(n, xh[n][1]).to(A.dtype), A)
             if rec is not None and n in rec[0]:

@@ -69,8 +69,29 @@ import carry  # noqa: E402
 import goal_eval  # noqa: E402
 import native  # noqa: E402
 
-ROWS = 8  # patched runs a batch (every subcomponent addressable: [rows, T, C] patches per site)
+ROWS = 8  # patched runs a batch
 BLOCK = -1  # a group item (site, position, BLOCK): the site's whole output at the position, every subcomponent and the remainder
+
+
+class _AtPositions:
+    """A text's [T, ...] table kept at some positions alone (Scorer._text's positions=): indexed by position as the
+    whole table is (an int, or a list or tensor of positions, first); a position not kept raises KeyError."""
+
+    def __init__(self, data: torch.Tensor, rows: dict, row: torch.Tensor, T: int):
+        self.data, self.rows, self.row = data, rows, row
+        self.shape = (T,) + tuple(data.shape[1:])
+
+    def __getitem__(self, idx):
+        first, rest = (idx[0], tuple(idx[1:])) if isinstance(idx, tuple) else (idx, ())
+        if torch.is_tensor(first) and first.dim() > 0 or isinstance(first, (list, range)):
+            r = self.row[torch.as_tensor(first, device=self.row.device)]
+            if bool((r < 0).any()):
+                raise KeyError("a position not kept")
+        else:
+            r = self.rows.get(int(first))
+            if r is None:
+                raise KeyError(f"position {int(first)} not kept")
+        return self.data[(r,) + rest]
 
 
 def parse(variables: list[dict], C: dict) -> list[dict]:
@@ -129,13 +150,16 @@ class Scorer:
         self.ge, self.nat, self.rows = ge, ge.nat, rows
 
     @torch.no_grad()
-    def _text(self, ids: list[int], targets: list[int], graph: native.Graph | None = None, check: bool = True) -> dict:
+    def _text(self, ids: list[int], targets: list[int], graph: native.Graph | None = None, check: bool = True,
+              positions: list | None = None) -> dict:
         """A text in a world: the real model (graph None: engine.Engine's graph run of the whole model, every
         subcomponent addressable) or a circuit's stated graph in C's semantics (an engine on its subcomponents). Its
         engine, what each patched run runs ("run": the graph and u), log q at the targets, every addressable
-        subcomponent's activation {site: [T, K]} (K the engine's columns, "col" a subcomponent's column), and the
-        resolution: KL of an independent float32 run (native's reference, or goal_eval's graph_ref in C's semantics;
-        check False: 0) from the engine's."""
+        subcomponent's activation {site: [T, K]} (K the engine's columns, "col" a subcomponent's column) and every site's
+        output {site: [T, d_out]}, and the resolution: KL of an independent float32 run (native's reference, or
+        goal_eval's graph_ref in C's semantics; check False: 0) from the engine's. positions: the activations and outputs
+        kept at those positions alone (_AtPositions, indexed by position as the whole tables; _world keeps the targets
+        and its groups' positions: every changed text's whole tables took a 24 GB card at ~90 texts of 500 tokens)."""
         import engine
 
         nat, dev, T = self.nat, self.nat.dev, len(ids)
@@ -149,16 +173,24 @@ class Scorer:
             E = engine.Engine(nat, ids, targets, live=True, columns={n: torch.tensor(c, dtype=torch.long, device=dev) for n, c in cols.items()})
             run, col = (graph, None), {n: {c: k for k, c in enumerate(cs)} for n, cs in cols.items()}
         K = {n: E.width(n) for n in nat.names}
-        spec = {n: (torch.zeros(T * K[n], dtype=torch.long, device=dev), torch.arange(T, device=dev).repeat_interleave(K[n]),
-                    torch.arange(K[n], device=dev).repeat(T)) for n in nat.names if K[n]}
+        pos = torch.arange(T, device=dev) if positions is None else torch.tensor(sorted(set(int(p) for p in positions)), dtype=torch.long, device=dev)
+        P = len(pos)
+        spec = {n: (torch.zeros(P * K[n], dtype=torch.long, device=dev), pos.repeat_interleave(K[n]),
+                    torch.arange(K[n], device=dev).repeat(P)) for n in nat.names if K[n]}
         outs = {}
         lq, got = E.graph_log_probs(E.plan(run[0], semantics="c"), run[1], reads=spec, rec_out=outs)
         res = 0.0
         if check:
             ref = nat.reference([ids], targets) if graph is None else self.ge.graph_ref(ids, targets, graph)
             res = max(float(carry.kl(ref, lq)[0]), 0.0)
-        return {"E": E, "run": run, "col": col, "lq": lq[0], "act": {n: v.view(T, K[n]) for n, v in got.items()},
-                "out": {n: o[0] for n, o in outs.items()}, "res": res}
+        act, out = {n: v.view(P, K[n]) for n, v in got.items()}, {n: o[0] for n, o in outs.items()}
+        if positions is not None:
+            rows = {int(t): r for r, t in enumerate(pos.tolist())}
+            row = torch.full((T,), -1, dtype=torch.long, device=dev)
+            row[pos] = torch.arange(P, device=dev)
+            act = {n: _AtPositions(a, rows, row, T) for n, a in act.items()}
+            out = {n: _AtPositions(o[pos], rows, row, T) for n, o in out.items()}
+        return {"E": E, "run": run, "col": col, "lq": lq[0], "act": act, "out": out, "res": res}
 
     @staticmethod
     def _flat(text: dict, items: list) -> torch.Tensor:
@@ -187,27 +219,25 @@ class Scorer:
             x[2].append(c if w["col"] is None else w["col"][n][c])
         for s0 in range(0, len(rows), self.rows):
             part = rows[s0:s0 + self.rows]
-            R, patch, outputs = len(part), {}, {}
+            R, idx, outputs = len(part), {}, {}
 
-            def slot(n):
-                if n not in patch:
-                    patch[n] = (torch.zeros(R, T, E.width(n), dtype=torch.bool, device=dev), torch.zeros(R, T, E.width(n), device=dev))
-                return patch[n]
+            def put(n, b, t, k, v):  # patched (row, position, column)s of site n and their values, one write a site
+                x = idx.setdefault(n, ([], [], [], []))
+                for lst, val in zip(x, (torch.full_like(t, b), t, k, v)):
+                    lst.append(val)
             for b, (src, nodes) in enumerate(part):
                 if nodes is None:
                     for n in nat.names:
                         if E.width(n):
-                            m, v = slot(n)
-                            m[b, tg] = True
-                            v[b, tg] = src["act"][n][tg]
+                            K = E.width(n)
+                            put(n, b, tg.repeat_interleave(K), torch.arange(K, device=dev).repeat(len(tg)), src["act"][n][tg].reshape(-1))
                     continue
                 per = {}
                 for n, t, c in nodes:
                     if c == BLOCK:  # every addressable activation there, and the whole output
                         if E.width(n):
-                            m, v = slot(n)
-                            m[b, t] = True
-                            v[b, t] = src["act"][n][t]
+                            K = E.width(n)
+                            put(n, b, torch.full((K,), t, dtype=torch.long, device=dev), torch.arange(K, device=dev), src["act"][n][t])
                         if n not in outputs:
                             d = src["out"][n].shape[-1]
                             outputs[n] = (torch.zeros(R, T, dtype=torch.bool, device=dev), torch.zeros(R, T, d, device=dev))
@@ -220,10 +250,9 @@ class Scorer:
                         per[n][0].append(t)
                         per[n][1].append(k)
                 for n, (ts, ks) in per.items():
-                    m, v = slot(n)
                     t_, k_ = torch.tensor(ts, device=dev), torch.tensor(ks, device=dev)
-                    m[b, t_, k_] = True
-                    v[b, t_, k_] = src["act"][n][t_, k_]
+                    put(n, b, t_, k_, src["act"][n][t_, k_])
+            patch = {n: ((torch.cat(x[0]), torch.cat(x[1]), torch.cat(x[2])), torch.cat(x[3])) for n, x in idx.items()}
             spec = {n: (torch.arange(R, device=dev).repeat_interleave(len(ts)), torch.tensor(ts, device=dev).repeat(R),
                         torch.tensor(ks, device=dev).repeat(R)) for n, (_, ts, ks) in where.items()} if acts else None
             rec_out = {} if reads and len(acts) < len(reads) else None
@@ -292,13 +321,14 @@ class Scorer:
 
     def _world(self, tx, variables: list[dict], tests: list, graph: native.Graph | None) -> dict:
         changed = sorted({t[2] for t in tests})
+        keep = sorted(set(tx.targets) | {t for v in variables for _, t, _ in v["group"]})  # every patched or read position
         texts = {}
         for ch in changed:
             x = list(tx.ids)
             for p, z in ch:
                 x[p] = z
-            texts[ch] = self._text(x, tx.targets, graph, check=graph is None)
-        mine = self._text(tx.ids, tx.targets, graph)
+            texts[ch] = self._text(x, tx.targets, graph, check=graph is None, positions=keep)
+        mine = self._text(tx.ids, tx.targets, graph, positions=keep)
         base = mine["lq"]
         groups = sorted({tuple(t[3]) for t in tests})
         nodes = sorted({nd for v in variables for nd in v["group"] if graph is None or nd[2] == BLOCK or nd[2] in mine["col"][nd[0]]})

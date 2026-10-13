@@ -693,6 +693,29 @@ def test_c_semantics_cuts_in_the_model_and_patches():
     assert rel(a, b) < REL
 
 
+def test_indexed_patch_is_the_dense_patch():
+    """patch as ((rows, positions, columns), values), one indexed write a site, is the dense (mask, values) patch."""
+    nat, ids, targets, graph, _, _, _ = graph_case(B=1)
+    T, dev = len(ids), nat.dev
+    eng = engine.Engine(nat, ids, targets, live=True)
+    g = torch.Generator().manual_seed(9)
+    dense, index, per = {}, {}, {}
+    for i, (n, t, c) in enumerate(sorted(graph.node_set())[::3]):  # circuit nodes, alternate rows
+        per.setdefault(n, []).append((i % 2, t, c))
+    for n, xs in per.items():
+        b, t, c = (torch.tensor(x) for x in zip(*xs))
+        v = 3 * torch.randn(len(xs), generator=g)
+        m, val = torch.zeros(2, T, nat.C[n], dtype=torch.bool), torch.zeros(2, T, nat.C[n])
+        m[b, t, c], val[b, t, c] = True, v
+        dense[n], index[n] = (m.to(dev), val.to(dev)), ((b.to(dev), t.to(dev), c.to(dev)), v.to(dev))
+    plan = eng.plan([graph, graph], semantics="c")
+    with torch.no_grad():
+        a, b_ = eng.graph_kl(plan, patch=dense), eng.graph_kl(plan, patch=index)
+        assert rel(a, b_) < 1e-6 and rel(a, eng.graph_kl(plan)) > 1e-4
+    with pytest.raises(ValueError):
+        eng.graph_log_probs(plan, precision="bf16", patch=index)
+
+
 def test_graph_runs_in_slices(monkeypatch):
     """Without gradients a connection group's products run a slice at a time (engine.ROWS): the same numbers."""
     nat, ids, targets, graph, ew, ow, u = graph_case()

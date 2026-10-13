@@ -114,7 +114,8 @@ import native
 
 RECOVERED = 0.9
 ROUNDS = 400  # Descent.prune's rounds a level (at 40 v2's set_search ran out at most levels, freezing one block a round)
-RANK = "every"  # Descent.prune's ranking (--rank): "every" round, or "once" per level (kept while prefixes are admitted)
+RANK = "once"  # Descent.prune's ranking (--rank): "every" round, or "once" per level (kept while prefixes are admitted;
+# arm b on text9000 at 400 rounds: once 61 s, eval s_track_pp 0.81 +- 0.07, 62,580 bits; every 202 s, 0.83 +- 0.07, 55,010)
 CONVENTION = "live"   # the component reward's remainder convention (components.CONVENTION)
 N_TARGET = 0.99       # VPD's top-k: the smallest prefix of VPD's order with necessity N >= this, at most K_MAX
 K_MAX = 1024

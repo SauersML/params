@@ -305,7 +305,9 @@
 %% Diagnosis:68/226 TRAIN targets have211 component edges; SFT300 replacement draws visited160 targets,
 %% leaving21/68 relation examples unseen. Only79 updates had relations; relation lines6.2% of target tokens.
 %% All teacher answers fit416tokens; length alone cannot explain the missing relations. No typed ports/positions supervised.
-%% Coverage test38375772084 LAUNCHED freeGHA,300SFTsteps,seed0,one330-minute link,no RL or paidspend.
+%% Coverage test38375772084 failed BEFORE training: missing helper in separate provenance-check Python process.
+%% Fixed second process executed in offline dryrun with model entrypoints mocked; no forwards or training.
+%% One corrected freeGHA retry38376602629 LAUNCHED: originalparent,300SFTsteps,seed0,one330-minute link,noRL/paidspend.
 %% Sampler65fb2e2:35tests pass;defaultrandomunchanged,each TRAINrow seen before repeats in opt-in epochmode.
 %% Execution pins originalcd8d4a9 plus sampler-only patch; frozen226rows/zoo/base bytes,Python3.11.14 and
 %% exact dependencies checked beforetraining. Output epoch/ordering_manifest.json binds mixed-source provenance.

@@ -1822,8 +1822,9 @@ class GoalEval:
         wired rows with sufficiency's live keys, the pattern runs for pattern_family's runs, and with flat (the variants'
         graphs) each variant's node family as _node_family gives it: its own draws of its nodes removed from the
         model, from VPD's answer and from the variant, every variant's draws on the same three engines); None when the
-        plan's connections are not the graph's. Semantics "x" (_xkw): every position runs, a deleted line's nodes
-        outside the variant at x (held), a node draw's at 0 (fidelity's numbers on each variant)."""
+        plan's connections are not the graph's. At x (_xkw of the point family; the node family's in _loo_nodes): a
+        deleted line's nodes outside the variant at x (held), a node draw's at 0 (fidelity's numbers on each variant),
+        the states before the circuit's first position kept from one run at x as in C (LOO_REUSE)."""
         nat, dev = self.nat, self.nat.dev
         kx = self._xkw(tx.ids, tx.targets, "point")  # (point, wiring and pattern)
         edges = [] if g.complete else [(w, r) for r, ws in g.parents.items() for w in ws]
@@ -1869,18 +1870,18 @@ class GoalEval:
                 u[n][tuple(torch.tensor(i, device=dev) for i in x)] = 0.0
             return u
 
-        lo = min((t for _, t, _ in g.node_set()), default=0) if self.LOO_REUSE and not kx else 0  # before the circuit's first position every
+        lo = min((t for _, t, _ in g.node_set()), default=0) if self.LOO_REUSE else 0  # before the circuit's first position every
         lo = lo if 0 < lo <= min(tx.targets) else 0                        # variant's run is the same: kept once, reused
         kept = {} if lo else None
-        if lo:
+        every = None if g.complete or not kx else {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kx["at_x"]}
+        if lo:  # (at x with the rows' held: every column outside the circuit, before lo every row's)
             if g.complete:
-                E.graph_log_probs(plan, u1, keep=kept)
+                E.graph_log_probs(plan, u1, keep=kept, **kx)
             else:
-                E.graph_log_probs(plan, ew=torch.ones(1, len(edges), device=dev), ow=torch.ones(1, len(outs), device=dev), keep=kept)
+                E.graph_log_probs(plan, ew=torch.ones(1, len(edges), device=dev), ow=torch.ones(1, len(outs), device=dev), keep=kept,
+                                  **(dict(kx, held=every) if kx else {}))
         tg = nat.target  # engine rows a call: a row's widest activations from lo on and, reusing, its kept keys and values
         step = max(4, self.LOO_ENTRIES // ((tx.T - lo) * max(nat.C.values()) + (2 * tg.n_layer * tx.T * tg.d_model if lo else 0)))
-
-        every = None if g.complete or not kx else {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kx["at_x"]}
 
         def lq_rows(ix, given=None, tables=None, held=None, kw=None):  # log q of rows ix of (ew, ow, off, sets), or of tables'
             # rows (ew, ow and off for a stated graph, u for a complete one), optionally with given attention rows; kw, the
@@ -1890,7 +1891,7 @@ class GoalEval:
             if tables is None:
                 tables = (ew[ix], ow[ix], [off[i] for i in ix]) if not g.complete else urows([sets[i] for i in ix])
             R = next(iter(tables.values())).shape[0] if g.complete else len(tables[0])
-            reuse = (E.tile_states(kept, R), tx.ids, lo) if lo and not kw else None
+            reuse = (E.tile_states(kept, R), tx.ids, lo) if lo and (kw is kx or not (kw or kx)) else None  # (kept: the point family's)
             every_ = every if kw is kx else (None if g.complete or not kw else
                                               {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kw["at_x"]})
             hk = dict(kw, held=held if held is not None else every_) if kw else {}
@@ -2082,7 +2083,8 @@ class GoalEval:
             mm, mv = views(mf, oc, circ), views(vf, ov, vcols)
             lm = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
             if kx:  # VPD's answer at x, its draw's nodes at 0
-                lv = Ev.log_probs(mv, **dict(kx, held={n: vbase[n] == 0 for n in kx["at_x"]}))
+                vk = dict(kx, held={n: vbase[n] == 0 for n in kx["at_x"]})
+                lv = Ev.log_probs(mv, start=start, base=vbase, **vk) if start else Ev.log_probs(mv, **vk)
             else:
                 lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
             held = None
@@ -3668,8 +3670,8 @@ class GoalEval:
                     rows.append((gi, j, np.array([nid[x] for x in d], dtype=np.int64)))
         cat = np.concatenate([d for _, _, d in rows]) if rows else np.zeros(0, dtype=np.int64)
         first = int(npos[cat].min()) if len(cat) else T
-        kw = self._xkw(tx.ids, tx.targets, "nodes")  # at x: every position (no start), the removed nodes at 0, never at x
-        start = 0 if reads or kw else min(first, min(tx.targets))  # before it every run is its base's (reads: every position)
+        kw = self._xkw(tx.ids, tx.targets, "nodes")  # at x: the removed nodes at 0, never at x
+        start = 0 if reads else min(first, min(tx.targets))  # before it every run is its base's (reads: every position)
         width = max(nat.C.values()) * (T - start) + sum(len(c) for c in vcols.values()) * T
         step = max(1, self.NODE_ENTRIES // max(1, width))
         vflat = torch.cat([vbase[n] for n in nat.names], -1)  # [1, T, KV]
@@ -3728,7 +3730,8 @@ class GoalEval:
                 rmod = split(got, part)
             else:
                 lm = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
-            lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv, **(dict(kw, held={n: vbase[n] == 0 for n in nat.names}) if kw else {}))
+            vk = dict(kw, held={n: vbase[n] == 0 for n in nat.names}) if kw else {}
+            lv = Ev.log_probs(mv, start=start, base=vbase, **vk) if start else Ev.log_probs(mv, **vk)
             lc = torch.empty_like(lm)
             rcir = [None] * R
             for gi in dict.fromkeys(gi for gi, _, _ in part):  # each circuit's rows
@@ -3744,7 +3747,7 @@ class GoalEval:
                     if reads:
                         got, rc_ = Ec.log_probs(mc, reads=spec(sub), **kh)
                     else:
-                        got = Ec.log_probs(mc, start=start, base=base_c) if start else Ec.log_probs(mc, **kh)
+                        got = Ec.log_probs(mc, start=start, base=base_c, **kh) if start else Ec.log_probs(mc, **kh)
                 else:
                     plan, ent = plans[gi]
                     off = {n: Dm[ixt][:, e] for n, e in ent.items()}

@@ -617,6 +617,45 @@ def test_held_at_x_and_frozen_norms_equal_graph_ref():
         assert float(kl(eng.log_probs(cm, at_x=rec))[0]) < 1e-5
 
 
+def test_held_at_x_from_a_position():
+    """At x (q/k outside held at x, every norm frozen at x) a run from a position equals the whole run: a complete
+    graph's masked run less some nodes from the base's states (log_probs' start and base, held the base's), and a
+    stated graph's rows with nodes off reusing one run's states before its first node (graph_log_probs' keep and reuse,
+    held holding every column outside the circuit)."""
+    nat, ids, targets, graph, _, _, _ = graph_case(B=1)
+    T = len(ids)
+    eng = engine.Engine(nat, ids, targets, live=True)
+    xv = eng.x_values()
+    kw = {"at_x": {n: a for n, a in xv["acts"].items() if native._name_layer_kind(n)[1] in ("q_proj", "k_proj")},
+          "norms": xv["norms"], "freeze": "all"}
+    kl = lambda lq: carry.kl(nat.reference([ids], targets), lq)  # noqa: E731
+    every = sorted(set(answer(nat, ids)))
+    comp = native.Graph(every[::3], complete=True)
+    cm = {n: m.float()[None] for n, m in goal_eval.GoalEval(nat).masks(comp, T).items()}
+    late = sorted({t for _, t, _ in comp.node_set()})
+    s0 = late[len(late) // 2]
+    less = {n: m.repeat(2, 1, 1) for n, m in cm.items()}
+    for i, (n, t, c) in enumerate(nd for nd in sorted(comp.node_set()) if nd[1] >= s0):
+        less[n][i % 2, t, c] = 0.0
+    held = {n: ~(m > 0) for n, m in cm.items()}
+    half = native.Graph(graph.nodes, {r: ws[::2] for r, ws in graph.parents.items()}, graph.out[::2])
+    lo = min(t for _, t, _ in half.node_set())
+    qk = sorted(nd for nd in half.node_set() if nd[0].endswith(("q_proj", "k_proj")))
+    hall = {n: torch.ones(1, 1, eng.width(n), dtype=torch.bool, device=nat.dev) for n in kw["at_x"]}
+    with torch.no_grad():
+        whole = kl(eng.log_probs(less, held=held, **kw))
+        assert rel(whole, kl(eng.log_probs(less, start=s0, base=cm, held=held, **kw))) < REL
+        assert rel(whole, kl(eng.log_probs(less, held=held))) > 10 * REL  # (at x moves it)
+        plan = eng.plan(half, semantics="c")  # (_loo_c's: one plan, a row per variant)
+        ones = lambda b: {"ew": torch.ones(b, plan["E"], device=nat.dev), "ow": torch.ones(b, plan["O"], device=nat.dev)}  # noqa: E731
+        off = [qk[::2], qk[1::2]]
+        full = kl(eng.graph_log_probs(plan, off=off, held=hall, **ones(2), **kw))
+        st = {}
+        eng.graph_log_probs(plan, keep=st, held=hall, **ones(1), **kw)
+        got = kl(eng.graph_log_probs(plan, off=off, held=hall, reuse=(eng.tile_states(st, 2), ids, lo), **ones(2), **kw))
+        assert lo > 0 and rel(full, got) < REL
+
+
 def test_c_semantics_cuts_in_the_model_and_patches():
     """C's semantics on a complete graph: the whole model with one connection cut (Engine(outside="on"), u = 1) is
     goal_eval's cut of that connection (path patching); and a circuit node patched to 0 with u = 0 is the graph

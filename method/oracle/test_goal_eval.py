@@ -3070,6 +3070,32 @@ def test_one_plan_reuses_the_states_before_the_circuit(tiny, monkeypatch):
             assert abs(x["phi"] - y["phi"]) < 1e-5, (x["phi"], y["phi"])
 
 
+def test_one_plan_reuses_the_states_at_x(tiny, monkeypatch):
+    """Under "x" and "h", _loo_c's and _loo_nodes' runs from the circuit's first position on (LOO_REUSE: the states
+    before it kept from one run at the point family's semantics, the node family's own reused only when the same) give
+    the whole runs' phi and node family on every variant, on a stated graph with pairs and a complete set."""
+    nat, ge, tx = tiny
+    late = [nd for nd in sorted(native.Graph(masks=tx.vpd).node_set()) if nd[1] >= 5]
+    pool = tiny_pool(nat, tx.ids)
+    for sem in ("x", "h"):
+        gx = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics=sem)
+        gx.donor_pools.update(ge.donor_pools)
+        tx2 = gx.text(tx.ids, tx.targets, seed=5)
+        g = torch.Generator().manual_seed(37)
+        for gr in (_pp_stated(_pp_nodes(late, g, 0.1, blocks=0.0), tx.targets, g, keep=0.5), native.Graph(late[::6], complete=True)):
+            gr = goal_eval.strand(gr, tx.targets, nat.C)
+            keep = ~torch.eye(len(gx.loo_lines(tx2, gr)), dtype=torch.bool)
+            base = gx.fidelity(tx2, [gr], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+            a = gx.phi_variants(tx2, gr, keep, pool, draws=4, base=base, recompute=("nodes",))
+            monkeypatch.setattr(goal_eval.GoalEval, "LOO_REUSE", False)
+            b = gx.phi_variants(tx2, gr, keep, pool, draws=4, base=base, recompute=("nodes",))
+            monkeypatch.setattr(goal_eval.GoalEval, "LOO_REUSE", True)
+            for x, y in zip(a["variants"], b["variants"]):
+                assert abs(x["phi"] - y["phi"]) < 1e-5, (sem, x["phi"], y["phi"])
+                sx, sy = x["row"].get("s_nodes"), y["row"].get("s_nodes")
+                assert (sx is None) == (sy is None) and (sx is None or abs(sx - sy) < 1e-5), (sem, sx, sy)
+
+
 def test_phi_variants_nodes_and_patching_are_fidelitys(tiny):
     """phi_variants recomputes the node family and activation patching per variant (the lead's 10-13: s_nodes binds
     most starts): on node subsets of a complete set, each variant's s_nodes and s_patching_near/far equal fidelity's on

@@ -106,6 +106,7 @@ class Engine:
         e._causal_targets = torch.arange(e.T, device=self.dev)[None, :] <= e._targets[:, None]
         e.__dict__.pop("_xr", None)  # the text's own x run (path_patched) and prefix (log_probs' start), made when asked
         e.__dict__.pop("_pre", None)  # (per text)
+        e.__dict__.pop("_xcols", None)
         e._search = e.hidden if self._search == self.hidden else torch.compile(e.hidden, dynamic=False)
         return e
 
@@ -180,12 +181,15 @@ class Engine:
             for tab in never:
                 if n in tab:
                     hm = hm.index_put(tab[n], torch.zeros((), dtype=torch.bool, device=self.dev))
-            xo = None
-            if cols is not None and self.outside == "off" and K < self.nat.C[n]:
-                left = torch.ones(self.nat.C[n], dtype=torch.bool, device=self.dev)
-                left[cols] = False
-                xo = xv[..., left] @ self.tg.site(n).U[left]
-            out[n] = (hm, xv if cols is None else xv.index_select(-1, cols), xo)
+            kept = self.__dict__.setdefault("_xcols", {})  # per (site, values' object): (values at the columns, write)
+            if (n, id(at_x[n])) not in kept:
+                xo = None
+                if cols is not None and self.outside == "off" and K < self.nat.C[n]:
+                    left = torch.ones(self.nat.C[n], dtype=torch.bool, device=self.dev)
+                    left[cols] = False
+                    xo = xv[..., left] @ self.tg.site(n).U[left]
+                kept[(n, id(at_x[n]))] = (at_x[n], xv if cols is None else xv.index_select(-1, cols), xo)  # (values kept alive)
+            out[n] = (hm,) + kept[(n, id(at_x[n]))][1:]
         return out
 
     def _frozen(self, norms: dict | None, freeze: str):
@@ -248,50 +252,70 @@ class Engine:
             return norm(x[:, self._targets], -1)
         return norm(x, -1)[:, self._targets]  # the final norm over every position, as vpd_model.Target.hidden
 
-    def _prefix(self, base: dict | None = None) -> list:
+    def _prefix(self, base: dict | None = None, xh: dict | None = None, fz=None) -> list:
         """Each layer's rotated keys and values [1, H, T, hd] of the run with every column at 1, or at base's masks
-        ({site: [1, T or 1, K]}; kept per base object: log_probs' start)."""
+        ({site: [1, T or 1, K]}; kept per base object: log_probs' start). xh, fz: at_x (_held_x of the base, one row) and
+        frozen norms (_frozen), a run each call."""
+        if xh or fz is not None:
+            return self._prefix_run(base, xh or {}, fz)
         kept = self.__dict__.setdefault("_pre", {})
         if id(base) not in kept:
-            tg, T, H, hd = self.tg, self.T, self.H, self.hd
-            norm, act = self._steps(False)
-            ones = base if base is not None else {n: torch.ones(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
-            x, out = self.emb, []
-            with torch.no_grad():
-                for i in range(tg.n_layer):
-                    name = lambda k: native.site_name(i, k)  # noqa: E731
-                    h = norm(x, 2 * i)
-                    q, k, v = (self._site(name(kd), h, ones[name(kd)]).view(1, T, H, hd).transpose(1, 2) for kd in ("q_proj", "k_proj", "v_proj"))
-                    q, k = tg._rope(q, T).to(v.dtype), tg._rope(k, T).to(v.dtype)
-                    out.append((k, v))
-                    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-                    x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(1, T, -1), ones[name("o_proj")])
-                    h = norm(x, 2 * i + 1)
-                    x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, ones[name("c_fc")])), ones[name("down_proj")])
-            kept[id(base)] = (base, out)  # (base kept alive: its id names it)
+            kept[id(base)] = (base, self._prefix_run(base, {}, None))  # (base kept alive: its id names it)
         return kept[id(base)][1]
 
-    def _hidden_from(self, masks: dict, start: int, base: dict | None = None) -> torch.Tensor:
+    @torch.no_grad()
+    def _prefix_run(self, base: dict | None, xh: dict, fz) -> list:
+        tg, T, H, hd = self.tg, self.T, self.H, self.hd
+        norm, act = self._steps(False)
+        norm = self._norms(norm, fz)
+        ones = base if base is not None else {n: torch.ones(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
+
+        def site(n, hh):  # (_site's four-argument form without at_x: backup.Backup replaces _site with one)
+            return self._site(n, hh, ones[n], None, xh[n]) if n in xh else self._site(n, hh, ones[n])
+        x, out = self.emb, []
+        for i in range(tg.n_layer):
+            name = lambda k: native.site_name(i, k)  # noqa: E731
+            h = norm(x, 2 * i)
+            q, k, v = (site(name(kd), h).view(1, T, H, hd).transpose(1, 2) for kd in ("q_proj", "k_proj", "v_proj"))
+            q, k = tg._rope(q, T).to(v.dtype), tg._rope(k, T).to(v.dtype)
+            out.append((k, v))
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            x = x + site(name("o_proj"), y.transpose(1, 2).reshape(1, T, -1))
+            h = norm(x, 2 * i + 1)
+            x = x + site(name("down_proj"), act(site(name("c_fc"), h)))
+        return out
+
+    def _hidden_from(self, masks: dict, start: int, base: dict | None = None, xh: dict | None = None, fz=None,
+                     px: dict | None = None) -> torch.Tensor:
         """hidden()'s final normed stream at the targets with every mask 1 (or base's) before start: the positions from
-        start on, attending to _prefix's keys and values before it."""
+        start on, attending to _prefix's keys and values before it. xh, fz: log_probs' at_x (_held_x, every row's the
+        same before start) and frozen norms; px: _held_x of the base (the prefix's)."""
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         B = next(iter(masks.values())).shape[0]
         norm, act = self._steps(False)
-        pre, Tn = self._prefix(base), T - start
+        top = 2 * tg.n_layer
+        norm = self._norms(norm, None if fz is None else (lambda j: fz(j) if j in (-1, top) or fz(j) is None else fz(j)[:, start:]))
+        pre, Tn = self._prefix(base, px, fz), T - start
         causal = torch.arange(T, device=self.dev)[None, :] <= torch.arange(start, T, device=self.dev)[:, None]  # [Tn, T]
         cut = {n: (m[:, start:] if m.shape[1] > 1 else m) for n, m in masks.items()}
+        xc = {n: (h[:, start:], a[:, start:], None if o is None else o[:, start:]) for n, (h, a, o) in (xh or {}).items()}
+
+        def site(n, hh):  # (_site's four-argument form without at_x: backup.Backup replaces _site with one)
+            return self._site(n, hh, cut[n], None, xc[n]) if n in xc else self._site(n, hh, cut[n])
         x = self.emb[:, start:].expand(B, -1, -1)
         for i in range(tg.n_layer):
             name = lambda k: native.site_name(i, k)  # noqa: E731
             h = norm(x, 2 * i)
-            q, k, v = (self._site(name(kd), h, cut[name(kd)]).view(B, Tn, H, hd).transpose(1, 2) for kd in ("q_proj", "k_proj", "v_proj"))
+            q, k, v = (site(name(kd), h).view(B, Tn, H, hd).transpose(1, 2) for kd in ("q_proj", "k_proj", "v_proj"))
             q, k = tg._rope_from(q, start, T).to(v.dtype), tg._rope_from(k, start, T).to(v.dtype)
             k = torch.cat([pre[i][0][:, :, :start].expand(B, -1, -1, -1), k], 2)
             v = torch.cat([pre[i][1][:, :, :start].expand(B, -1, -1, -1), v], 2)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=causal)
-            x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, Tn, -1), cut[name("o_proj")])
+            x = x + site(name("o_proj"), y.transpose(1, 2).reshape(B, Tn, -1))
             h = norm(x, 2 * i + 1)
-            x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, cut[name("c_fc")])), cut[name("down_proj")])
+            x = x + site(name("down_proj"), act(site(name("c_fc"), h)))
+        if fz is not None:
+            return norm(x[:, self._targets - start], -1)
         return norm(x, -1)[:, self._targets - start]
 
     def log_probs_on(self, texts: list, masks: dict, start: int) -> torch.Tensor:
@@ -359,7 +383,8 @@ class Engine:
         passes held without it), and their columns outside an outside="off" engine's too; norms: {("attn" | "mlp",
         layer) or "final": [B or 1, T, 1]} (x_values'), every RMSNorm freeze holds ("layers": inside the layers;
         "all": the final norm too, its scale at every position or at the targets) at that scale instead of its own:
-        goal_eval.GoalEval.graph_ref's outside=, norms= and freeze= (float32 runs of every position, start 0)."""
+        goal_eval.GoalEval.graph_ref's outside=, norms= and freeze= (float32 runs; with start, every row's held and
+        masks base's before it)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if reads is not None and precision != "score":
@@ -367,14 +392,18 @@ class Engine:
         if start and (precision != "score" or reads is not None or not 0 < start <= min(self.targets)):
             raise ValueError("start is a float32 run without reads, after position 0 and no later than the first target")
         fz = self._frozen(norms, freeze)
-        if (at_x is not None or fz is not None) and (precision != "score" or start):
-            raise ValueError("at_x and frozen norms are float32 runs of every position (score, start 0)")
+        if (at_x is not None or fz is not None) and precision != "score":
+            raise ValueError("at_x and frozen norms are float32 runs (score)")
         B = next(iter(masks.values())).shape[0]
         xh = None if at_x is None else self._held_x(at_x, held, masks, B)
         rec = None if reads is None else (reads, {})
         with _precision(precision, self.dev), self._dtype(precision):
             if start:
-                h = self._hidden_from(masks, start, base)
+                px = None
+                if at_x is not None:  # the prefix's held: base's (every row's before start)
+                    b0 = base if base is not None else {n: torch.ones(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
+                    px = self._held_x(at_x, None if held is None else {n: h[:1] for n, h in held.items()}, b0, 1)
+                h = self._hidden_from(masks, start, base, xh, fz, px)
             elif xh is not None or fz is not None:
                 h = self.hidden(masks, search=False, rec=rec, xh=xh, fz=fz)
             else:
@@ -651,7 +680,8 @@ class Engine:
         columns outside an outside="off" engine held too. norms and freeze: every RMSNorm freeze holds
         ("layers": inside the layers; "all": the final one too) at norms' scale ({("attn" | "mlp", layer) or "final":
         [B or 1, T, 1]}, x_values'; the final one's at every position or at the targets) instead of its own
-        (graph_ref's norms= and freeze=). Both float32 runs of every position (no reuse or keep), without blocks."""
+        (graph_ref's norms= and freeze=). Both float32 runs without blocks; with reuse, keep's run made with the same
+        at_x, held and norms, every row's held before reuse's start its."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if (keep is not None or reuse is not None) and (precision != "score" or patch is not None or reads is not None):
@@ -667,8 +697,8 @@ class Engine:
         if reuse is not None and not 0 < reuse[2] <= min(self.targets):
             raise ValueError("reuse starts after position 0 and no later than the first target")
         fz = self._frozen(norms, freeze)
-        if (at_x is not None or fz is not None) and (precision != "score" or reuse is not None or keep is not None):
-            raise ValueError("at_x and frozen norms are float32 runs of every position (no reuse or keep)")
+        if (at_x is not None or fz is not None) and precision != "score":
+            raise ValueError("at_x and frozen norms are float32 runs (score)")
         if at_x is not None and plan["semantics"] != "c":
             raise ValueError("at_x takes C's semantics")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
@@ -1726,7 +1756,10 @@ class Engine:
         alone (with reads, every position). keep and reuse: graph_log_probs'; hold: (at_x, held, _frozen's scales)."""
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         norm, act = self._steps(fused)
-        norm = self._norms(norm, None if hold is None else hold[2])
+        fz, top = None if hold is None else hold[2], 2 * tg.n_layer
+        if fz is not None and reuse is not None:  # the layers' scales from reuse's start on
+            fz = (lambda j, f=fz, lo_=reuse[2]: f(j) if j in (-1, top) or f(j) is None else f(j)[:, lo_:])
+        norm = self._norms(norm, fz)
         R, Wr, Eg, outs = p["readers"], p["writers"], p["edges"], p["out"]
         c = p["semantics"] == "c"
         given = {}  # per layer the rows given in place of the run's own: (row, position, [H, t + 1])
@@ -1769,7 +1802,7 @@ class Engine:
             if patch is not None and n in patch:
                 A = torch.where(cut(n, patch[n][0]), cut(n, patch[n][1]).to(A.dtype), A)
             if n in xh:  # held at x (at_x): the model's activations
-                A = torch.where(xh[n][0], xh[n][1].to(A.dtype), A)
+                A = torch.where(cut(n, xh[n][0]), cut(n, xh[n][1]).to(A.dtype), A)
             if rec is not None and n in rec[0]:
                 rec[1][n] = A[rec[0][n]].float()
             if n in Wr:
@@ -1864,7 +1897,7 @@ class Engine:
                 inp = x[b, t] + topup(n, x.shape[-1])
                 return norm(inp + btop(n, x.shape[-1]) if n in bin_ else inp, j, (b, t))
             num, den = x[b, t] + topup(n, x.shape[-1]), x[b, t] + topup(n, x.shape[-1], ewn).float()  # the read; the norm's scale
-            return tg.norm_parts(num, den, j) if hold is None or hold[2] is None or hold[2](j) is None else norm(num, j, (b, t))
+            return tg.norm_parts(num, den, j) if fz is None or fz(j) is None else norm(num, j, (b, t))
 
         if lo:  # the tokens from lo on: every row's [T], or each row's [B, T]
             tok = (reuse[1] if torch.is_tensor(reuse[1]) else torch.tensor(reuse[1])).to(self.dev)
@@ -1893,9 +1926,9 @@ class Engine:
                 n = name(kd)
                 _, U, Rw = self._w(n)
                 if n in xh:  # held at x: at full strength, and the columns outside the engine's at x
-                    scale = torch.where(xh[n][0], torch.ones((), device=self.dev), scale)
+                    scale = torch.where(cut(n, xh[n][0]), torch.ones((), device=self.dev), scale)
                 o = (A[kd] * scale.to(A[kd].dtype)) @ U
-                o = o if n not in xh or xh[n][2] is None else o + xh[n][2].to(o.dtype)
+                o = o if n not in xh or xh[n][2] is None else o + cut(n, xh[n][2]).to(o.dtype)
                 o = o + self._mm(z, Rw) if self.fixed else o
                 o = o if self.b[n] is None else o + self.b[n]
                 if add is not None and n in add:  # fixed outside activations' writes
@@ -2013,7 +2046,7 @@ class Engine:
             b, ti, gi, j, fx, uc = cout
             num = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)
             den = z.index_put((b, ti), resid_share(gi, j, fx, own)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True).float()
-            return tg.norm_parts(num, den, -1) if hold is None or hold[2] is None or hold[2](-1) is None else norm(num, -1)
+            return tg.norm_parts(num, den, -1) if fz is None or fz(-1) is None else norm(num, -1)
         if cout is not None:  # the connections into the prediction, every writer site's at once
             b, ti, gi, j, fx, uc = cout
             z = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)

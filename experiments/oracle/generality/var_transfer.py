@@ -15,7 +15,7 @@ Beside them, A's variables on A (their recorded eval-split scores) and B's own v
   var_transfer.py run2 FAMILY SOURCE  -> var_transfer_v2.jsonl: varteach's influential_v2 variables, each scored alone
                                          on up to 4 other members (the lead's keep rule: a variable is kept when its
                                          carrier transfers within its family)
-  var_transfer.py report2             -> DATA/var_transfer_v2_keep.json, per variable whether it transfers
+  var_transfer.py report2 [KEEP]      -> DATA/var_transfer_v2_keep.json, per variable whether it transfers (median >= KEEP, 0.8)
 """
 import argparse
 import collections
@@ -272,4 +272,4 @@ if __name__ == "__main__":
     ap.add_argument("cmd", choices=("run", "report", "run2", "report2"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
-    {"run": lambda: run(*a.args), "report": report, "run2": lambda: run2(*a.args), "report2": report2}[a.cmd]()
+    {"run": lambda: run(*a.args), "report": report, "run2": lambda: run2(*a.args), "report2": lambda: report2(*(float(x) for x in a.args))}[a.cmd]()

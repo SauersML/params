@@ -13,6 +13,17 @@ for p in "$@"; do
     [ -e "$p" ] || { echo "mats-push: $p does not exist" >&2; exit 2; }
     rel+=("${p#"$MAC_DATA"/}")
 done
+# The sealed final test set (texts/vpd4l/text9100-9149) never goes up but through final_eval.sh (FINAL_EVAL=1), as in
+# rp-run: rsync leaves those files out, and a tarball holding any is refused.
+SEALED=(--exclude 'texts/vpd4l/text91[0-4][0-9].json')
+[ "${FINAL_EVAL:-0}" = 1 ] && SEALED=()
+for p in "${rel[@]}"; do
+    case $p in *.tgz|*.tar.gz|*.tar|*.tar.zst)
+        if [ ${#SEALED[@]} -gt 0 ] && tar -tf "$MAC_DATA/$p" 2> /dev/null | grep -qE '(^|/)texts/vpd4l/text91[0-4][0-9][.]json$'; then
+            echo "mats-push: $p holds sealed texts (text9100-9149); refused" >&2; exit 2
+        fi ;;
+    esac
+done
 # macOS's openrsync ignores the `/./` marker, so --relative gets paths relative to mpd-data.
-cd "$MAC_DATA" && rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/
+cd "$MAC_DATA" && rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' ${SEALED[@]+"${SEALED[@]}"} "${rel[@]}" mats:mpd-data/
 printf 'pushed ~/mpd-data/%s\n' "${rel[@]}"

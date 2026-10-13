@@ -152,16 +152,30 @@ if [ -n "${MATS_DRY:-}" ]; then
     echo "command: $cmd"
     exit 0
 fi
+# The sealed final test set (texts/vpd4l/text9100-9149) never goes up but through final_eval.sh (FINAL_EVAL=1), as in
+# rp-run: rsync leaves those files out, and a tarball holding any is refused.
+SEALED=(--exclude 'texts/vpd4l/text91[0-4][0-9].json')
+[ "${FINAL_EVAL:-0}" = 1 ] && SEALED=()
 if [ ${#uploads[@]} -gt 0 ] && [ -z "${MATS_NO_UPLOAD:-}" ]; then
     rel=()
-    for p in "${uploads[@]}"; do rel+=("${p#"$MAC_DATA"/}"); done
+    for p in "${uploads[@]}"; do
+        rel+=("${p#"$MAC_DATA"/}")
+        case $p in *.tgz|*.tar.gz|*.tar|*.tar.zst)
+            if [ ${#SEALED[@]} -gt 0 ] && tar -tf "$p" 2> /dev/null | grep -qE '(^|/)texts/vpd4l/text91[0-4][0-9][.]json$'; then
+                echo "mats-run: $p holds sealed texts (text9100-9149); refused" >&2; exit 2
+            fi ;;
+        esac
+        if [ ${#SEALED[@]} -gt 0 ] && [ -d "$p" ] && [ -n "$(find "$p" -path '*texts/vpd4l/text91[0-4][0-9].json' -print -quit)" ]; then
+            echo "mats-run: sealed texts (text9100-9149) under $p stay on the Mac" >&2
+        fi
+    done
     kb=$(du -sk "${uploads[@]}" | awk '{ s += $1 } END { print s }')
     if (( kb > 40 * 1024 * 1024 )) && [ -z "${MATS_UPLOAD_BIG:-}" ]; then
         echo "mats-run: inputs are $((kb / 1024 / 1024)) GB; set MATS_UPLOAD_BIG=1 to send them" >&2; exit 2
     fi
     echo "mats-run: syncing $((kb / 1024)) MB of inputs: ${uploads[*]#"$MAC_DATA"/}" >&2
     # macOS's openrsync ignores the `/./` marker, so --relative gets paths relative to mpd-data.
-    (cd "$MAC_DATA" && rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' "${rel[@]}" mats:mpd-data/)
+    (cd "$MAC_DATA" && rsync -a --relative --copy-unsafe-links --exclude '*.pem' --exclude '*.key' --exclude '.env' ${SEALED[@]+"${SEALED[@]}"} "${rel[@]}" mats:mpd-data/)
 fi
 
 if [ "${MATS_POOL:-0}" = 1 ]; then

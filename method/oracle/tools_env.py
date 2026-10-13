@@ -90,6 +90,7 @@ TEXTS_KEPT = 8  # texts whose Tools a process keeps (an RL group's episodes shar
 LIST_TOP = 24  # list_active's default
 LIST_MAX = 400  # list_active's most
 REMOVE_EACH_MAX = 4096  # measure_removal(each=True)'s most nodes (an influential start reaches 1,127 on text9001)
+REMOVE_CHUNK = 256  # measure_removal(each=True)'s removals per real_removal call
 EFFECTS_MAX = 4096  # node_effects' most nodes in a draft
 EFFECT_DRAWS = 8  # node_effects' changed inputs (line_effects' draws on the tools' split)
 COMPARE_DRAWS = goal_eval.CHANGED_DRAWS  # compare's changed inputs (track_pp's draws on the tools' split)
@@ -509,7 +510,16 @@ class Tools:
         if each:
             if len(nds) > REMOVE_EACH_MAX:
                 raise ToolError(f"each=true takes at most {REMOVE_EACH_MAX} nodes")
-            rows = self.ge.real_removal(tx, [native.Graph([nd], complete=True) for nd in nds])
+            rows, step, i = [], REMOVE_CHUNK, 0
+            while i < len(nds):  # real_removal in chunks, halved when one does not fit (t2: 798 nodes, 3 processes on 44 GB)
+                try:
+                    rows += self.ge.real_removal(tx, [native.Graph([nd], complete=True) for nd in nds[i:i + step]])
+                    i += step
+                except torch.OutOfMemoryError:
+                    native.free(self.nat.dev)
+                    if step == 1:
+                        raise
+                    step = max(1, step // 2)
             got = sorted(zip(nds, [r["kl_real_minus"] for r in rows]), key=lambda x: -x[1])
             page, offset, nxt = self._page(got, top, offset)
             return {"each": len(got), "offset": offset, "next_offset": nxt, "columns": ["node", "kl_bits"],
@@ -994,6 +1004,14 @@ class Scripted:
             (rk,) = yield self._msg(self._rank(draft))
             turns, calls = turns + 1, calls + 1
         ranked = "error" not in rk
+        if not ranked:  # no order at all: the best start candidate within the cap, unpruned
+            fit = [j for j, sc in enumerate(got) if sc.get("draft") and 0 < (sc.get("nodes") or 0) <= cap]
+            if fit:
+                j = (max(fit, key=lambda j: (-math.inf if got[j].get("phi") is None else got[j]["phi"], -j)) if self.accept == "reward"
+                     else max(fit, key=lambda j: ((got[j].get("pp") or 0), -j)))
+                score = got[j]
+                draft, size = score["draft"], score["nodes"]
+                self.trace.append({"fallback": "unranked", "m": j, "nodes": size, "draft": draft})
         # above the cap: backward elimination, re-ranked each step (a step, its ranking and a last drop to the cap
         # leave the answer's turn: Episode.step ends an episode at MAX_TURNS turns or MAX_CALLS calls)
         while ranked and size > cap and turns < self.max_turns - 3 and calls + 3 < self.max_calls:
@@ -1017,7 +1035,7 @@ class Scripted:
         ref_pp, ref_pt = score.get("pp") or 0.0, score.get("point") or 0.0
         chunk = max(1, size // 2)
         floor = max(1, size // self.MIN_FRACTION)
-        while size > 1 and chunk >= floor and turns < self.max_turns - 3 and calls + len(self.TRIALS) + 2 < self.max_calls:
+        while ranked and size > 1 and chunk >= floor and turns < self.max_turns - 3 and calls + len(self.TRIALS) + 2 < self.max_calls:
             sizes = sorted({max(1, min(size - 1, chunk // k)) for k in self.TRIALS}, reverse=True)
             got = yield self._msg(*[self._run(base=draft, drop_least=n) for n in sizes])
             turns, calls = turns + 1, calls + len(sizes)

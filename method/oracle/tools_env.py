@@ -8,10 +8,10 @@ from tools, measured on demand on the real model and VPD's decomposition (goal_e
   influence(top)                           context positions whose changed token moves the prediction (the sensitivity
                                            probe behind goal_eval.Text.moved: one draw from the model's own prediction
                                            per position), in bits, with their share of the total
-  list_active(position, site, top)         VPD-active subcomponents at a position (causal importance above 0 and able to
+  list_active(position, site, top, offset) VPD-active subcomponents at a position (causal importance above 0 and able to
                                            reach the targets: VPD's answer, goal_eval.Text.vpd), ranked by causal
                                            importance x |activation|, with the routed lens's raised tokens and the
-                                           atlas's top tokens (components.facts)
+                                           atlas's top tokens (components.facts); continue at next_offset until null
   attention(layer, position, head, top)    each head's most-read source positions at a position in the real model
   measure_removal(nodes, each)             KL in bits of the model's prediction with the nodes removed from the real
                                            model's weights at their positions (native.Native.without; each: one
@@ -87,7 +87,8 @@ SYSTEM = ("You explain how a small language model, vpd4l (4 layers, each with at
           "down)), computes its next-token prediction on a text, in VPD subcomponents: rank-one slices of its weight "
           "matrices, 38,912 in all, written L<layer>.<kind>#<index>@<position>. You do not know the subcomponents' roles "
           "in advance: measure them with the tools before you answer. Useful order: influence() for the context "
-          "positions the prediction reads; list_active() at the target and at those positions; attention() for where "
+          "positions the prediction reads; list_active() at the target and at those positions (pass next_offset as "
+          "offset to read further pages, until next_offset is null); attention() for where "
           "the heads at the target read; measure_removal() for which subcomponents the prediction needs; run_circuit() "
           "to score a draft circuit (point: graph F1 on the text; pp: path-patched agreement with the model on changed "
           "inputs; 1 is as faithful as VPD's whole answer) and compare() to see where two drafts differ. A circuit's "
@@ -119,11 +120,14 @@ TOOL_SPECS = [
     {"name": "list_active",
      "description": "VPD-active subcomponents (causal importance above 0) at a position, ranked by causal importance x "
                     "|activation|: each with ci, act, and facts (the tokens its write raises there by the routed lens, a "
-                    "linear reading, and the tokens it is most active on in Pile text). 'active' counts them all.",
+                    "linear reading, and the tokens it is most active on in Pile text). 'active' and 'total' count them "
+                    "all; pass next_offset as offset to continue, until next_offset is null. Equal scores retain native matrix "
+                    "order, then subcomponent index.",
      "parameters": {"type": "object", "properties": {
          "position": {"type": "integer"},
          "site": {"type": "string", "description": "only this matrix, L<layer>.<kind>, e.g. L2.v"},
-         "top": {"type": "integer", "description": f"subcomponents to list (default {LIST_TOP}, at most {LIST_MAX})"}},
+         "top": {"type": "integer", "description": f"subcomponents per page (default {LIST_TOP}, at most {LIST_MAX})"},
+         "offset": {"type": "integer", "minimum": 0, "description": "zero-based start in the ranked list (default 0)"}},
          "required": ["position"]}},
     {"name": "attention",
      "description": "Where the attention heads of a layer read at a position in the real model: per head its top source "
@@ -292,9 +296,12 @@ class Tools:
                 "over_1pct": int((moved >= goal_eval.SHARE_FLOOR * total).sum()) if total > 0 else 0,
                 "columns": ["position", "token", "bits", "share"], "positions": rows}
 
-    def list_active(self, position, site: str | None = None, top: int = LIST_TOP) -> dict:
+    def list_active(self, position, site: str | None = None, top: int = LIST_TOP, offset: int = 0) -> dict:
         p = self._pos(position)
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ToolError("offset must be a non-negative integer")
         top = max(1, min(int(top), LIST_MAX))
+        matrix_order = {n: i for i, n in enumerate(self.nat.names)}
         names = [_site_of(site)] if site else self.nat.names
         tx, nat = self.tx, self.nat
         ranked = []
@@ -305,10 +312,12 @@ class Tools:
             ci = tx.ci[n][p, cs].float().cpu().tolist()
             act = tx.rec[n][0, p, cs].float().cpu().tolist()
             ranked += [((n, p, c), a, b) for c, a, b in zip(cs, ci, act)]
-        ranked.sort(key=lambda x: -x[1] * abs(x[2]))
-        shown = ranked[:top]
+        ranked.sort(key=lambda x: (-x[1] * abs(x[2]), matrix_order[x[0][0]], x[0][2]))
+        shown = ranked[offset:offset + top]
         facts = self._facts([nd for nd, _, _ in shown])
         return {"position": p, "token": self._tok(p), "active": len(ranked), "shown": len(shown),
+                "total": len(ranked), "offset": offset,
+                "next_offset": offset + len(shown) if offset + len(shown) < len(ranked) else None,
                 "columns": ["node", "ci", "act", "facts"],
                 "subcomponents": [[components.node_text(nd), _r(c, 2), _r(a, 3), facts.get(nd, "")] for nd, c, a in shown]}
 

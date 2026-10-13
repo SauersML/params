@@ -454,11 +454,11 @@ flowchart BT
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Carrier size remains the limit</b><br/>53% compression; further4.7% adds no rows;<br/>2 of15 exact rows fit training limits;<br/>next: smaller verified carrier sets<br/>AUDIT DONE · codex/variable_reward"]
   CLAIMQA["<b>Learn measured transplant effects</b><br/>147 fit with archived hints;16 hard rows;<br/>independent readback preserves all labels;<br/>partial coverage and ID limits explicit<br/>DATA READY · codex/variable_reward"]
-  CLAIMCTRL["<b>Isolate component identity</b><br/>89 cases × 3 component selections;<br/>sizes and positions held constant;<br/>267 fresh distributions on free CPU<br/>RUNNING · codex/variable_reward"]
+  CLAIMCTRL["<b>Component identity changes behavior</b><br/>89 cases, counts and positions held fixed;<br/>permutations change 79/89 and 76/89 tops;<br/>use matched cases to test weight grounding<br/>MEASURED · codex/variable_reward"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
-  CAPABLE["<b>SFT improves format but loses wiring</b><br/>valid16 to24; relation-edge F1 .50 to.25;<br/>all4 multihops solved before SFT, lost after;<br/>audit target bias; no RL scale-up<br/>MEASURED · codex/fork_review"]
-  CAPCF["<b>Do the base circuits predict edits?</b><br/>4 multihops: scale or delete fixed units;<br/>compare full model and stated circuits;<br/>no edited full-model trace in prediction<br/>PROTOCOL REVIEW · codex/eval_recovery"]
+  CAPABLE["<b>Recover executable wiring in training</b><br/>SFT relation F1 .50 to .25; arrows get 4.1% loss;<br/>no positive V-route examples in TRAIN;<br/>prepare loss balance × routing support pilot<br/>PREPARING · codex/fork_review"]
+  CAPCF["<b>Do the base circuits predict edits?</b><br/>4 multihops: scale or delete fixed units;<br/>compare full model and stated circuits;<br/>own routing and norms; fixed original basis<br/>IMPLEMENTED · codex/eval_recovery"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
@@ -650,14 +650,14 @@ flowchart BT
   class QAONLY check
   class WIRING done
   class RELTRAIN done
-  class CAPABLE active
+  class CAPABLE,CAPCF active
   class ROUTE done
   class ROUTEEDIT check
   class PYV done
   class FBASE check
   class CLAIMFIT done
   class CLAIMQA active
-  class CLAIMCTRL check
+  class CLAIMCTRL done
   class CLAIMDATA,CLAIMREC done
   class ENGP done
   class S1AUDIT done

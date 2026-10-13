@@ -935,7 +935,7 @@ SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its o
 
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
                acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS,
-               phi_pool: dict | None = None) -> tuple:
+               phi_pool: dict | None = None, phi_log: bool = False) -> tuple:
     """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): goal_eval.GoalEval.start_set
     (VPD's active subcomponents at the targets and the m most influential positions, every connection; search split
     s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
@@ -983,14 +983,16 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     if phi_pool is not None:                                 # the reward's bar on the search split, backing off a stage
         bar = ge.tau(tx, phi_pool, "search")["phi_tau"]      # at a time while the circuit falls below it
         rec["phi"], best = [], None
-        for name, on_s in reversed(snaps):
+        for name, on_s in reversed(snaps):                   # (phi_log: every stage, each phi family's score kept)
             row = ge.fidelity(tx, [graph_of(on_s)], phi_pool, mode="reward", split="search")[0]
             ph = goal_eval.phi(row, start=bar)[0]
-            rec["phi"].append([name, ph, bar])
-            log(f"  set phi at {name}: {ph} (bar {bar})", flush=True)
+            fam = {f: goal_eval.family_score(row, f) for f in goal_eval.PHI_FAMILIES}
+            rec["phi"].append([name, ph, bar, int(on_s.sum()), fam])
+            log(f"  set phi at {name} ({int(on_s.sum())} subcomponents): {ph} (bar {bar}) "
+                + " ".join(f"{f} {v:.3f}" for f, v in fam.items() if v is not None), flush=True)
             if ph is not None and (best is None or ph > best[0]):
                 best = (ph, name, on_s)
-            if ph is not None and bar is not None and ph >= bar + PHI_SLACK:
+            if ph is not None and bar is not None and ph >= bar + PHI_SLACK and not phi_log:
                 break
         if best is not None:
             pr.on, rec["phi_stage"] = best[2].clone(), best[1]
@@ -1491,7 +1493,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
           accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
-          accept_draws: str = "fixed", phi_pool: dict | None = None, context: str = "refine") -> tuple[dict, dict]:
+          accept_draws: str = "fixed", phi_pool: dict | None = None, context: str = "refine",
+          phi_log: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -1533,7 +1536,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     if f1_start in ("influential", "set"):                   # the influential-blocks search (block_search) or the
         if f1_start == "set":                                # influential set pruned (set_search), and its wiring
-            g, pb, _, _, row["blocks"] = set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool)
+            g, pb, _, _, row["blocks"] = set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, phi_log=phi_log)
         else:
             g, pb, _, _, row["blocks"] = block_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, context=context)
         bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
@@ -1558,6 +1561,13 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             row["best_edges"]["tokens"] = [list(x[:2]) + ([list(x[2])] if len(x) > 2 else []) for x in row["best_edges"].get("tokens") or []]
             row["best_edges"]["bits"] = goal_eval.size_bits(stated, nat.positions(targets), sum(nat.C.values()), targets, tx.vpd)
             circuits[""] = goal_eval.to_json(stated, "")
+            if tokens is not None and max_tokens:            # over the answer budget: the node set, every connection
+                row["answer_tokens_stated"] = tokens(components.render(circuits[""]))   # claimed (text9002's 351 nodes
+                if row["answer_tokens_stated"] > max_tokens:  # stated: 40,838 Qwen3 tokens, its node set 4,068)
+                    circuits[""] = goal_eval.to_json(native.Graph(sorted(stated.node_set()), complete=True), "")
+                    row["answer"] = "node set"
+        if tokens is not None:
+            row["answer_tokens"] = tokens(components.render(circuits[""]))
         row["seconds"] = time.perf_counter() - t0
         print(f"  {tx.T} tokens: {len(bl)} blocks, {g.count() - len(bl)} subcomponents, F1 {f1_b}, N {n_b}, "
               f"{row['blocks'].get('accept')}, {row['blocks']['bits']:.0f} bits", flush=True)
@@ -1771,6 +1781,8 @@ def main():
                     "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")
     ap.add_argument("--phi-check", action="store_true", help="with --f1-start influential, the circuit checked against the "
                     "reward's bar (goal_eval.phi >= phi_tau on the search split, the adversary's pool), backing off a stage at a time")
+    ap.add_argument("--phi-log", action="store_true", help="with --phi-check: every stage scored, each phi family's score "
+                    "in the row (which families pruning lowers)")
     ap.add_argument("--accept-draws", choices=("fixed", "discriminating", "fresh", "fv"), default="fixed",
                     help="--accept changed's draws in pp mode: the search split's fixed ones, or per check a fresh sample of "
                          "64 from a pool disjoint from eval, each candidate judged on the 16 where it and the current circuit "
@@ -1838,6 +1850,7 @@ def main():
             r = json.loads(line)
             labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
+    args.phi_check = args.phi_check or args.phi_log
     pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" or args.phi_check else None
     for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
@@ -1858,7 +1871,7 @@ def main():
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
                                          args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
                                          args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if args.phi_check else None,
-                                         args.context)
+                                         args.context, args.phi_log)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

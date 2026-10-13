@@ -328,7 +328,7 @@ flowchart BT
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
     S1READY["<b>SFT pilot: format learned</b><br/>5/8 valid; QA near no-change;<br/>no advantage over matched VPD;<br/>feeds input and control ablations<br/>CHECK · codex · $2.51 total"]
     S1["<b>SFT · influential starts</b><br/>dev 9020-9049: phi 0.86→0.88→0.91 (bar 1.2),<br/>beats VPD top k 24/5; shuffled evidence<br/>phi 0.22: reads the text; below start 1.08<br/>DONE · primerl"]
-    S2["<b>SFT · pruned v2</b><br/>trained on 148 v2.1 circuits ($3.83);<br/>curve and shuffled control on dev running;<br/>retrain on v2.2 when it lands<br/>ACTIVE · primerl"]
+    S2["<b>SFT · pruned v2</b><br/>v2.1, 148 texts: phi 1.12→0.98→0.76 (S1 1.40),<br/>falls with training; start wins 1-4/30<br/>retry on v2.2 or more texts; +think traces<br/>CHECKED · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}

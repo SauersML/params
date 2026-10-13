@@ -313,7 +313,7 @@ flowchart BT
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
-  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 60/60;<br/>cond 2 (teacher vs start) running;<br/>falsification: below the bar extra parts<br/>are free; node, N, donor terms blind<br/>to misplaced parts"}}
+  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 60/60;<br/>cond 2 not passed: 6 of 7 pruned<br/>fv_dev teachers fall below a start<br/>floor (nodes on 4), 9005 above;<br/>toys full tier 20/21 (cancel by design)"}}
 
   %% ===================== workstreams =====================
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
@@ -338,13 +338,13 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>copy done (wrong source loses 0.8;<br/>padding free below the bar → tie-break);<br/>now: 14 behavior families + copy row,<br/>weighted by frequency; CausalGym in the<br/>behavior-targeted mode (777563f);<br/>falsify.py --circuits for the final eval<br/>ACTIVE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>package aa79889; linear-share pooling 71c66c3;<br/>N with background on; omitted family;<br/>next: per-family floors (−4·shortfall),<br/>ungated tie-break, norm scales at x<br/>ACTIVE · inframove"]
+    W4["<b>Reward repair</b><br/>package aa79889; linear-share pooling 71c66c3;<br/>N with background on; omitted family;<br/>floors, circuit_term, tie-break b3937ed;<br/>next: routing and norm scales at x<br/>(engine options asked), then cond 2 again<br/>ACTIVE · inframove"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
     W6["<b>Diagnose fidelity failures</b><br/>retain draws and every family score;<br/>unchanged reward; export checks pass;<br/>separate response error from uncertainty<br/>IMPLEMENTED · codex · 3017b64"]
   end
 
   %% ===================== verifier and foundations =====================
-  PHI["<b>Faithfulness score Φ</b><br/>11 families (+ omitted parts);<br/>gap-weighted pooling, N with<br/>background kept · DONE · inframove"]
+  PHI["<b>Faithfulness score Φ</b><br/>11 families (+ omitted parts);<br/>gap-weighted pooling, N with<br/>background kept; flips past the<br/>omitted count f929e58 · DONE · inframove"]
   TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>mixed binding: both routes carry it;<br/>cancelling pair: unnecessary under donor<br/>semantics (patching families), needed under<br/>weight edits on text 1 (0.97 bits: omitted,<br/>inframove); standard VPD keeps it as a candidate,<br/>donor VPD hides it; arms rerun when it lands<br/>ACTIVE · fleet"]
   IBENCH["<b>InterpBench ground truth</b><br/>TransformerLens models as a Target (61b88f0);<br/>exact decomposition, 28 of 60 Tracr cases:<br/>node AUROC median 1.0, edge median 0.985;<br/>MIB's IOI model next (MIB edge AUROC:<br/>EAP-IG 0.81, UGS 0.74, random 0.44)<br/>ACTIVE · fleet"]
   TOYB["<b>Gate B on planted toys</b><br/>complete exact circuits pass; incomplete<br/>true routes fail (N ratio unbounded,<br/>own eps added, gate leak, all-actives<br/>at phi ceiling); eps cap + score clip<br/>fixes 3 of 4 (57e44c2) · toyloop"]

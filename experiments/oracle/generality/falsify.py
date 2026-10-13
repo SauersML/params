@@ -678,12 +678,14 @@ def circuit_variants(answer: dict, t: int, T: int, key: tuple, other_offsets: li
     return out
 
 
-def circuits(answers_path: Path, out_path: Path, eps: float = CIRCUIT_EPS):
+def circuits(answers_path: Path, out_path: Path, eps: float | str = CIRCUIT_EPS, on: str = "phi"):
     """The final evaluation's falsification column (primerl's final_eval.sh): per answer line ({"task", "sample",
     "text"}; its circuit components.parse(text)["answer"]) on the task's text, the circuit and its general wrong
     variants (circuit_variants) scored by phi on the eval split (reward mode, the text's families from ge.tau, as
     components.reward reads them; the CI-pattern pool POOL), and reward v3's circuit term R (goal_eval.circuit_term)
-    beside it. -> out_path (JSON): per answer the circuit's phi and R, each variant's, and beats_all: phi
+    beside it. on: the term the answer must beat every variant on ("phi" or "R"); eps: its margin, a number or
+    "family" (per answer the mean over the text's families of the answer row's own eps, the noise phi already
+    discounts: goal_eval._eps, at most EPS_CAP). -> out_path (JSON): per answer the circuit's phi and R, each variant's, and beats_all: phi
     above every variant's by more than eps; with a summary (the share of answers that beat all, per variant the share
     beaten). Resumable: answers already in out_path are kept."""
     import components
@@ -727,15 +729,18 @@ def circuits(answers_path: Path, out_path: Path, eps: float = CIRCUIT_EPS):
             b = goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd)
             ct = goal_eval.circuit_term(r, tau, b)  # reward v3's circuit term, as components.reward and the teacher read it
             res[v] = {"phi": ct["phi_full"], "R": ct["term"], "bits": b}
-        ph0 = res["circuit"]["phi"]
+        fe = goal_eval._eps(rows[0])
+        eps_family = float(np.mean([fe[f] for f in fams if f in fe])) if fams else None
+        margin = eps_family if eps == "family" else float(eps)
+        x0 = res["circuit"][on]
         var = {v: x for v, x in res.items() if v != "circuit"}
-        beats = {v: None if ph0 is None or x["phi"] is None else ph0 > x["phi"] + eps for v, x in var.items()}
-        got["answers"].append({"task": ln["task"], "sample": ln["sample"], "phi": ph0, "R": res["circuit"]["R"],
-                               "bits": res["circuit"]["bits"], "phi_tau": pt, "variants": var, "beats": beats,
-                               "beats_all": bool(beats) and all(b is True for b in beats.values())})
+        beats = {v: None if x0 is None or x[on] is None or margin is None else x0 > x[on] + margin for v, x in var.items()}
+        got["answers"].append({"task": ln["task"], "sample": ln["sample"], "phi": res["circuit"]["phi"], "R": res["circuit"]["R"],
+                               "bits": res["circuit"]["bits"], "phi_tau": pt, "eps_family": eps_family, "margin": margin,
+                               "variants": var, "beats": beats, "beats_all": bool(beats) and all(b is True for b in beats.values())})
         A = got["answers"]
         names = sorted({v for a in A for v in a["beats"]})
-        got["summary"] = {"answers": len(A), "eps": eps, "beats_all": float(np.mean([a["beats_all"] for a in A])),
+        got["summary"] = {"answers": len(A), "on": on, "eps": eps, "beats_all": float(np.mean([a["beats_all"] for a in A])),
                           "beaten": {v: float(np.mean([a["beats"][v] is True for a in A if v in a["beats"]])) for v in names},
                           "with_variants": sum(bool(a["beats"]) for a in A)}
         out_path.write_text(json.dumps(got, indent=1))
@@ -750,10 +755,11 @@ if __name__ == "__main__":
     ap.add_argument("--only", default=None, help="score: these variants only (comma-separated)")
     ap.add_argument("--circuits", type=Path, help="oracle answers (JSONL: task, sample, text): the general falsification")
     ap.add_argument("--out", type=Path, help="--circuits: the JSON written")
-    ap.add_argument("--eps", type=float, default=CIRCUIT_EPS, help="--circuits: the phi margin over every variant")
+    ap.add_argument("--eps", default=str(CIRCUIT_EPS), help="--circuits: the margin over every variant, a number or family")
+    ap.add_argument("--on", choices=("phi", "R"), default="phi", help="--circuits: the term compared (phi or reward v3's R)")
     a = ap.parse_args()
     if a.circuits:
-        circuits(a.circuits, a.out, a.eps)
+        circuits(a.circuits, a.out, a.eps if a.eps == "family" else float(a.eps), a.on)
     elif a.cmd == "build":
         build()
     elif a.cmd == "score":

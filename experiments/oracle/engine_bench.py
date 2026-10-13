@@ -15,13 +15,14 @@ positions and into the prediction). Each case runs twice; the second (warm) time
   interchange_pp   interchange_pp of the teacher circuit (search split)
   line_loo         line_loo of the teacher circuit (search split, 8 draws), given its reward row
 
-  engine_bench.py [--cases a,b] [--out DIR]
+  engine_bench.py [--cases a,b] [--out DIR]     (BENCH_COMMIT: the commit to record where the tree has no git)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -93,7 +94,8 @@ def main():
     positions = [q for q, _ in t9002.f2]
     got = ge._interchange_draws(t9002, positions, "search", 16, first={q: -moved[q - 1] for q in positions})
     rec = {"device": torch.cuda.get_device_name() if torch.cuda.is_available() else str(dev),
-           "commit": subprocess.run(["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False).stdout.strip(),
+           "commit": os.environ.get("BENCH_COMMIT") or subprocess.run(["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"], capture_output=True,
+                                                                     text=True, check=False).stdout.strip(),
            "time": time.strftime("%Y-%m-%d %H:%M"), "nodes": g.count(), "connections": g.edges(), "changed_texts": len(got)}
     lines = len(E.pp_lines(g))
     rec["lines"] = lines

@@ -239,6 +239,19 @@
 %% Induction also needs distinct Q/K/V reader ports. Define these explicitly before claiming token-route fidelity.
 %% Independent Pyvene scalar-interchange reference matches Native logprobs within1.91e-6; wrong-position control is zero.
 %% Scope: analytic full-background rank-one scalar swaps; no sparse-graph, English or learned-weight-use certificate.
+%% Routing text e4d6c54/4db2f2f: strict opt-in Mermaid preserves isolated Q/K ports and exact positions;16tests pass.
+%% Contract attention=causal_softmax means recomputed graph-local Q/K, never frozen full-model attention probabilities.
+%% Matched edits: fixed multihop014/example2, lowest component per Q/K/V/O in each of2heads, scales0/.5/1/1.5.
+%% Same frozen basis/graph in32worlds; literal W += (s-1)*outer(Uc,Vc), circuit Uc *= s at all positions.
+%% Sparse ordinary KL5.07e-7bits; four informative Q/K deletions give0.8841/1.5358bits despite correct top token.
+%% No-change full-model predictions lose13.05/13.66bits: sparse circuit tracks much of the effect but is not exact.
+%% Dense same-two-head/all-position control maxKL1.84e-8bits; sparse independent-equation discrepancy below1e-6logprob.
+%% All32rows retained (28weak/noeffect); cached-reference primed then edit checked against direct target_forward; weights restored.
+%% Artifact: mpd-data/scratch/variable_reward/typed_weight_interventions/{manifest,results,raw_distributions}.json and run.py.
+%% This is one fixed analytical toy and prespecified component per port, not all components, fresh families or learned VPD.
+%% Dense control restores both value routes and residual reader parents; no attribution to softmax tails alone established.
+%% Decision: original-output reward cannot certify edit predictions. Add explicit edit fidelity alongside compactness;
+%% current paired RL point-sufficiency pilot continues unchanged and independent of this diagnostic.
 %% Next routing step: preserve exact head ports and token positions in strict Mermaid output; reject ignored syntax.
 %% In parallel, design same-basis rank-one weight edits on full model and circuit, checking intervention KL beyond baseline.
 %% Why: Python-only adapter cannot train an oracle; ordinary-output fidelity alone does not prove causal abstraction.
@@ -377,7 +390,8 @@ flowchart BT
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
   WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>two free CPU forks, lower-memory updates;<br/>matched20 steps; paired report ready<br/>ACTIVE · codex/eval_recovery"]
-  ROUTE["<b>Oracle-emittable token routing</b><br/>exact-position adapter validated;<br/>strict Mermaid output and roundtrip;<br/>then matched rank-one weight edits<br/>ACTIVE · codex/fork_review, variable_reward"]
+  ROUTE["<b>Oracle-emittable token routing</b><br/>strict Mermaid preserves exact ports;<br/>wrong positions and ports execute;<br/>graph-local causal softmax explicit<br/>DONE opt-in adapter · codex/fork_review"]
+  ROUTEEDIT["<b>Point fit misses weight effects</b><br/>sparse circuit: 1.54 bits after Q cut;<br/>dense same-head control below 2e-8;<br/>score edits separately from original fit<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
   FBASE["<b>Matched QA baseline measured</b><br/>DeepSeek59.50%, Qwen65.64%;<br/>cheap features66.76% on same179 QA;<br/>prioritize circuit fidelity over QA scaling<br/>CHECK · codex · $0.145 spent"]
 
@@ -501,6 +515,8 @@ flowchart BT
   ENG --> ROUTE
   PYV -. independent parity .-> ROUTE
   ROUTE -. richer executable hypotheses .-> C1
+  ROUTE --> ROUTEEDIT
+  ROUTEEDIT -. edit fidelity objective .-> R1
   FBASE -. specialization evidence .-> GATED
   %% FEEDBACK: WIRING -. tests executable relations .-> TOYLOOP
   WIRING -. wiring evidence .-> C1
@@ -553,7 +569,8 @@ flowchart BT
   class S1READY check
   class QAONLY check
   class WIRING active
-  class ROUTE active
+  class ROUTE done
+  class ROUTEEDIT check
   class PYV done
   class FBASE check
   class CLAIMFIT check

@@ -18,6 +18,9 @@ Circuits (node sets with every connection the model has among them, blocks a sit
      second-latest occurrence; the correct circuit is then the variant without the backup route;
   (d) irrelevant parts: the correct circuit plus the a column's blocks at two positions far from t, a and o;
   (g) mismatched: the a and o columns at another held-out copy text's offsets from its target;
+  (h) mixture: the correct circuit plus the influential start set's positions other than a, o and t (VPD's actives
+     there), against the correct circuit as the single-mechanism claim; per text whether the model mixes: with the
+     match broken (fresh tokens at o) the share of draws whose likeliest token stays the text's;
   references: VPD's top k and recency (VPD's actives at t and the m positions before it) at the correct circuit's bits,
      and at the stated copy template's bits.
 Scores: goal_eval.GoalEval.fidelity in the reward's mode on the eval split (point, nodes, flips at FLIP_TERM over the
@@ -231,7 +234,7 @@ def patch_ge(ge):
         setattr(ge, fam, wrap)
 
 
-def score(e: dict):
+def score(e: dict, only: list | None = None):
     import faulthandler
     import signal
 
@@ -278,6 +281,23 @@ def score(e: dict):
     pool = torch.load(POOL, weights_only=False) if POOL.exists() else None
     tau = ge.tau(tx, pool, "eval")  # the text's bar, families and start bits, as reward v3 reads them
     print(e["task"], "tau", round(time.perf_counter() - t0), "s", flush=True)
+    # (h) mixture: the single-mechanism claim (correct) against it plus the influential start's other positions (every
+    # position the start keeps besides a, o and t, VPD's actives there), and whether the model mixes on this text: the
+    # match broken (fresh tokens at o), how often its likeliest token stays what it was
+    st = ge.start_set(tx, "eval")["graph"]
+    extra = [nd for nd in st.node_set() if nd[1] not in (a, a - 1, t)]
+    if extra:
+        variants["h_mixture"] = variants["correct"] + extra
+        graphs["h_mixture"] = native.Graph(sorted(set(variants["h_mixture"])), complete=True)
+        bits["h_mixture"] = goal_eval.size_bits(graphs["h_mixture"], P, S, tx.targets, active=tx.vpd)
+        names.append("h_mixture")
+    base = nat.reference([tx.ids], [t])[0, 0]
+    zs = ge._fresh_sources(tx, a - 1, int(tx.seed) + 31)[:8]
+    lp = nat.reference([list(tx.ids[:a - 1]) + [z] + list(tx.ids[a:]) for z in zs], [t])[:, 0]
+    mix = {"survive": float((lp.argmax(-1) == base.argmax()).float().mean()),
+           "drop_copied": float(base[tx.ids[a]] - lp[:, tx.ids[a]].mean()), "copied_is_top": int(base.argmax()) == tx.ids[a],
+           "start_positions": sorted({nd[1] for nd in st.node_set()}), "extra_positions": sorted({nd[1] for nd in extra})}
+    names = [k for k in names if only is None or k in only]  # --only: some variants (added later) on a text scored before
     rows = []
     for k in names:  # one at a time: the engine spans its call's columns
         rows += ge.fidelity(tx, [graphs[k]], pool=pool, mode="reward", split="eval", draws=16, interchange=8, changed=8,
@@ -302,7 +322,7 @@ def score(e: dict):
                                 "compact_vs_correct": goal_eval.compact(bits[k], bits["correct"]), "nodes": graphs[k].count(),
                                 **{f"s_{fm}": goal_eval.family_score(r, fm) for fm in goal_eval.PHI_FAMILIES},
                                 **{f"eps_{fm}": eps.get(fm) for fm in goal_eval.PHI_FAMILIES},
-                                "c": r.get("c"), "c_rl": r.get("c_rl")}) + "\n")
+                                "c": r.get("c"), "c_rl": r.get("c_rl"), "mix": mix}) + "\n")
     print(e["task"], {k: round(goal_eval.phi(r, families=fams)[0] or 0, 3) for k, r in zip(names, rows)}, flush=True)
 
 
@@ -424,11 +444,15 @@ def report():
              "s_patching_far", "s_pattern", "s_N", "compact"]
     pairs = [("correct", "a_source_moved"), ("correct", "b_fixed_offset"), ("c_with_backup", "correct"),
              ("correct", "d_irrelevant_parts"), ("correct", "g_mismatched"), ("correct", "template"),
-             ("correct", "ref_vpd_correct_bits"), ("correct", "ref_recency_correct_bits")]
+             ("correct", "ref_vpd_correct_bits"), ("correct", "ref_recency_correct_bits"), ("h_mixture", "correct")]
     out = {}
     overlap = set(json.loads((DATA / "falsify_texts.json").read_text())["values"]["overlap"])
     groups = [("copy", lambda k: k[0] == "copy"), ("mistake", lambda k: k[0] == "mistake"),
-              ("copy, copied token never in discovery", lambda k: k[0] == "copy" and k[1] not in overlap)]
+              ("copy, copied token never in discovery", lambda k: k[0] == "copy" and k[1] not in overlap),
+              ("copy, the model mixes (its prediction survives the broken match on half the draws or more)",
+               lambda k: k[0] == "copy" and mixes.get(k) is True),
+              ("copy, the model does not mix", lambda k: k[0] == "copy" and mixes.get(k) is False)]
+    mixes = {k: d["correct"]["mix"]["survive"] >= 0.5 for k, d in by.items() if "correct" in d and d["correct"].get("mix")}
     for kind, keep in groups:
         texts = [d for k, d in by.items() if keep(k)]
         if not texts:
@@ -478,11 +502,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("build", "score", "vars", "values", "report"))
     ap.add_argument("args", nargs="*")
+    ap.add_argument("--only", default=None, help="score: these variants only (comma-separated)")
     a = ap.parse_args()
     if a.cmd == "build":
         build()
     elif a.cmd == "score":
-        score(find(*a.args))
+        score(find(*a.args), a.only.split(",") if a.only else None)
     elif a.cmd == "vars":
         variables_test(find(*a.args))
     elif a.cmd == "values":

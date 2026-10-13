@@ -1457,9 +1457,10 @@ class Connector:
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: Pruner, empty: float, vpd: float, size_term, B: int = 32,
                  robust: dict | None = None, no_strand: bool = False, levels: tuple = ("connection",),
-                 acceptance: Acceptance | None = None, blocks: set | None = None):
+                 acceptance: Acceptance | None = None, blocks: set | None = None, edge_seed: bool = False):
         self.ge, self.tx, self.pr, self.empty, self.vpd, self.size_term, self.B = ge, tx, pr, empty, vpd, size_term, B
         self.blocks = set(blocks or ())  # {(site, position)}: kept blocks, every subcomponent there among pr's nodes
+        self.edge_seed = edge_seed  # opt-in measured static-weight proposal; full-start floors stay authoritative
         self.acceptance = acceptance  # connection removals also keep the search-split terms (Acceptance)
         self.levels = levels      # edge_path's levels in turn (coarse ones first: "writer", "reader"; then "connection")
         self.robust = robust      # the adversary's pool: connection removals also keep F1 under the omitted lever's flips
@@ -1521,12 +1522,28 @@ class Connector:
             def validate(d, lg):                             # F+V: the connection levels under the validation set too
                 return Validated(d, lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]),
                                  self.acceptance, floor_of(base["s_track_pp"]), lg)
-        budget = max(self.budget, kl_budget(empty, ep.kl(), SET_RECOVERY))   # the nodes' rule: the F1 budget or 5% of the
+        full_start_kl = ep.kl()
+        budget = max(self.budget, kl_budget(empty, full_start_kl, SET_RECOVERY))   # the nodes' rule: the F1 budget or 5% of the
         summary_budget = budget                              # node set's own log recovery lost
+        weight_seed_info = None
+        if self.edge_seed:
+            if keep is not None:
+                weight_seed_info = {"status": "skipped", "reason": "existing_repair_connections"}
+            else:
+                import weight_seed
+
+                # Acceptance hooks, robust floors, validation and budget above all
+                # refer to the ORIGINAL full start. Never recapture them at a seed.
+                weight_seed_info = weight_seed.initialise(ep, nodes, budget, accept, start,
+                                                          full_start_kl, blocks=bool(self.blocks))
         steps = edge_path(ep, budget, state, self.levels, accept=accept, validate=validate)
         steps[0].update(start)
+        if weight_seed_info is not None and weight_seed_info.get("admitted"):
+            steps[0].update(weight_seed_info["acceptance"])
         summary = {**{k_: steps[-1][k_] for k_ in ("nodes", "edges", "kl_graph", "f1_graph", "n", "size_term", "reward")},
                    "all_edges": len(ep.edges), "sets": ep.measured, "unconnectable": len(dropped), "budget": summary_budget}
+        if weight_seed_info is not None:
+            summary["weight_seed"] = weight_seed_info
         for k_ in start:                                     # the last admitted step's F1 under the flips and acceptance
             summary[k_] = next(s_[k_] for s_ in reversed(steps) if k_ in s_)   # terms (the start's, steps[0]'s, if none)
         if self.acceptance is not None:                      # the token edges, under the same floors
@@ -1707,7 +1724,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
           accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
           accept_draws: str = "fixed", phi_pool: dict | None = None, context: str = "refine",
-          forward: str | None = None, task: dict | None = None, backup: bool = False) -> tuple[dict, dict]:
+          forward: str | None = None, task: dict | None = None, backup: bool = False,
+          edge_seed: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -1778,7 +1796,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
                 bits = n * node_bits + k_tok * math.log2(nat.positions(targets)) + (math.log2(n + k_tok) * (2 * inner + out) if n else 0.0)
                 return goal_eval.size_term(bits, scale)
             wiring = Connector(ge, tx, pb, empty, vpd, size_term_b, B, robust=robust_pool, no_strand=no_strand, levels=edge_levels,
-                               acceptance=acceptance, blocks=bl)
+                               acceptance=acceptance, blocks=bl, edge_seed=edge_seed)
             kept, row["best_edges"], _, _, on_w = wiring.connect(pb.on.clone(), n_b if n_b is not None else 0.0)
             stated = wiring.graph(on_w, kept, row["best_edges"].get("tokens"))
             row["best_edges"]["tokens"] = [list(x[:2]) + ([list(x[2])] if len(x) > 2 else []) for x in row["best_edges"].get("tokens") or []]
@@ -1895,7 +1913,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     wired, edge_paths, t2 = {}, [], time.perf_counter()     # node step -> (its last edge step's connections, its row)
 
     wiring = Connector(ge, tx, pr, empty, vpd, size_term, B, robust=robust_pool, no_strand=no_strand, levels=edge_levels,
-                       acceptance=acceptance)
+                       acceptance=acceptance, edge_seed=edge_seed)
 
     def wire(i):
         if i not in wired:
@@ -2057,6 +2075,9 @@ def main():
                     "its connections by the same search: <task>.vpd_top<k>.edges.json")
     ap.add_argument("--repair", action="store_true", help="with --edges, the flip repair after the pick (goal_eval.adversary_flips' "
                     "omitted lever at REPAIR_M, its flips joined and the connections pruned again while that improves; pool POOL)")
+    ap.add_argument("--edge-seed", choices=("full", "weights"), default="full",
+                    help="optional measured static-weight start for <=128 scalar nodes, K32 residual links; "
+                         "full-start KL budget/acceptance floors remain authoritative; rejected seed falls back")
     ap.add_argument("--edges-at", choices=("pick", "search"), default="pick",
                     help="connections at step 4's pick alone (pick), or the smallest point with N >= 0.9 whose connections reach "
                          "graph F1 >= 0.9 by bisection, and the points nearest 16, 32 and 64 (search)")
@@ -2070,6 +2091,8 @@ def main():
     ap.add_argument("--rank", choices=("every", "once"), default=RANK, help="Descent.prune's ranking: every round, or once per "
                     "level (re-ranked when a kept order admits nothing)")
     args = ap.parse_args()
+    if args.edge_seed != "full" and not args.edges:
+        ap.error("--edge-seed weights requires --edges")
     RANK = args.rank
     VAL_EVERY = args.validate
     if args.f1_start == "start_set":
@@ -2125,7 +2148,8 @@ def main():
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
                                          args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
                                          args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if phi_pool_needed else None,
-                                         args.context, args.forward, json.loads(path.read_text()), args.backup)
+                                         args.context, args.forward, json.loads(path.read_text()), args.backup,
+                                         args.edge_seed == "weights")
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

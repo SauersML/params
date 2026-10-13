@@ -78,7 +78,7 @@ jobs:
       - name: Check weight-use, intervention, English and data controls
         if: ${{ !inputs.adversary_batch_only }}
         run: |
-          python -m pytest method/oracle/rl/test_inject.py method/oracle/test_intervention_panel.py \
+          python -m pytest method/oracle/rl/test_inject.py method/oracle/test_intervention_panel.py method/oracle/test_weight_seed.py \
             experiments/oracle/pods/test_sealed_archives.py \
             experiments/oracle/test_claim_donor_features.py experiments/oracle/test_claim_reader_probe.py \
             experiments/oracle/test_claim_lastdown_contract.py experiments/oracle/test_claim_joint_contract.py \

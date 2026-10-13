@@ -39,4 +39,36 @@ class SeedTest(unittest.TestCase):
   with self.assertRaises(ValueError):s.propose([w,v],edges,[{'writer':w,'reader':nd(2,'v_proj'),'cosine':.9}])
   with self.assertRaises(ValueError):s.propose([w,v],edges,[{'writer':w,'reader':v,'cosine':.9}]*2)
   with self.assertRaises(ValueError):s.propose([nd(1,'v_proj',-1)],[],[])
+
+class LoadedSeedTest(unittest.TestCase):
+ def test_loaded_signed_norm_gain_and_fingerprint(self):
+  import torch
+  from types import SimpleNamespace
+  w,r=nd(0,'o_proj'),nd(1,'v_proj')
+  sites={w[0]:SimpleNamespace(U=torch.tensor([[1.,0.]])),r[0]:SimpleNamespace(V=torch.tensor([[-2.],[1.]]))}
+  target=SimpleNamespace(site=lambda name:sites[name],norms=[torch.ones(2),torch.ones(2),torch.tensor([1.,0.]),torch.ones(2)])
+  ranked,proof=s.rank_loaded(SimpleNamespace(target=target),[(w,r)])
+  self.assertEqual(ranked[0]['cosine'],-1.)
+  self.assertEqual(ranked[0]['raw'],-2.)
+  sites[w[0]].U[0,0]=2.
+  _,changed=s.rank_loaded(SimpleNamespace(target=target),[(w,r)])
+  self.assertNotEqual(proof,changed)
+ def test_initialiser_rejects_poor_seed_without_replacing_full_start(self):
+  import torch
+  from types import SimpleNamespace
+  from unittest.mock import patch
+  w,r=nd(0,'o_proj'),nd(1,'v_proj');edges=[(w,r),(r,None)]
+  class EP:
+   def __init__(self):
+    self.ge=SimpleNamespace(nat=None);self.edges=edges;self.on=torch.ones(2,dtype=torch.bool);self.protected=torch.zeros(2,dtype=torch.bool);self.measured=0
+   def kl_sets(self,masks):
+    self.measured+=len(masks);return [.01]*len(masks)
+  ep=EP();full=ep.on;seen=[];floor=.9
+  def admit(masks):
+   self.assertIs(ep.on,full);seen.append(masks.tolist());return [None] # .4 fails ORIGINAL .9, not reset to .4.
+  with patch.object(s,'rank_loaded',return_value=([{'writer':w,'reader':r,'cosine':0.,'raw':0.}],{})):
+   row=s.initialise(ep,[w,r],.1,admit,{'changed':.95},.001)
+  self.assertIs(ep.on,full);self.assertTrue(bool(ep.on.all()));self.assertFalse(row['admitted']);self.assertEqual(row['original_reference_terms'],{'changed':.95});self.assertEqual(row['original_budget'],.1);self.assertEqual(row['measured_subsets'],1);self.assertEqual(seen,[[[False,True]]])
+  self.assertEqual(s.initialise(ep,[nd(0,'v_proj',i) for i in range(129)],.1)['reason'],'node_cap')
+
 if __name__=='__main__':unittest.main()

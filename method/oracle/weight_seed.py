@@ -21,6 +21,8 @@ def rank_loaded(nat, edges):
     Input-dependent RMS denominators and nonlinear/routing effects are omitted;
     signs are retained, while ordering uses magnitude. Zero directions score zero.
     """
+    if len({n for edge in edges for n in edge if n is not None}) > MAX_NODES:
+        raise ValueError('loaded ranking exceeds 128-node cap')
     import torch
     vectors={}; fingerprints={}
     def vector(node,reader):
@@ -99,3 +101,30 @@ def assess(full_mask, proposal_mask, budget, measure, admit=None):
     if terms is None:
         return full,{**record,'reason':'original_acceptance_floors'}
     return candidate,{**record,'admitted':True,'reason':'measured_admission','acceptance':terms}
+
+def initialise(ep, nodes, budget, admit=None, reference_terms=None, full_kl=None, blocks=False):
+    """Try one proposal after the caller captured ordinary full-start gates.
+
+    Unchanged fallback preserves ep.on object identity. Existing repair-subsets
+    must not call this helper; expanded block starts are conservatively skipped.
+    """
+    import copy
+    import time
+    if blocks: return {'status':'skipped','reason':'blocks'}
+    if len(nodes)>MAX_NODES: return {'status':'skipped','reason':'node_cap','nodes':len(nodes)}
+    if not bool(ep.on.all()): return {'status':'skipped','reason':'nonfull_start'}
+    import torch
+    t0=time.perf_counter();before=ep.measured
+    ranked,fingerprints=rank_loaded(ep.ge.nat,ep.edges)
+    candidate,meta=propose(nodes,ep.edges,ranked,ep.protected.tolist())
+    meta.update(basis_fingerprints=fingerprints,original_reference_terms=copy.deepcopy(reference_terms or {}),full_start_kl=full_kl)
+    if candidate is None: return {**meta,'seconds':time.perf_counter()-t0,'measured_subsets':ep.measured-before}
+    tensor=lambda mask:torch.tensor(mask,dtype=torch.bool,device=ep.on.device)[None]
+    def acceptance(mask):
+        got=admit(tensor(mask))
+        if len(got)!=1: raise ValueError('one proposal acceptance result required')
+        return got[0]
+    chosen,gate=assess(ep.on.tolist(),candidate,budget,
+                      lambda mask:ep.kl_sets(tensor(mask))[0],acceptance if admit is not None else None)
+    if gate['admitted']: ep.on=tensor(chosen)[0]
+    return {**meta,**gate,'seconds':time.perf_counter()-t0,'measured_subsets':ep.measured-before}

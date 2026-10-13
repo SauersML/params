@@ -23,7 +23,7 @@ def fake_eval(monkeypatch, teacher=False):
     ge.fidelity = lambda tx, graphs, pool, **kw: [{'c': 0.} for g in graphs]
     ge.tau = lambda *a: {'phi_tau': -.7539940449122631, 'bits_start': 140923.08623763727}
     ge.line_loo = lambda tx, graph, *a, **kw: {'bits': goal_eval.size_bits(graph, 1, 2, [0]), 'lines': []}
-    monkeypatch.setattr(goal_eval, 'phi', lambda row: (-.007588067954579058, None))
+    monkeypatch.setattr(goal_eval, 'phi', lambda row, start=None, families=None: (-.007588067954579058, None))
     monkeypatch.setattr(components, '_teacher_ref', lambda *a: {'phi': .2, 'compact': 2.} if teacher else None)
     task = {'id': 'mock', 'model': 'vpd4l', 'prompts': [{'token_ids': [1], 'target_positions': [0], 'model_top': [[[0, 1.]]]}]}
     return ge, task

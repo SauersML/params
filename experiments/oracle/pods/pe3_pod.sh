@@ -3,7 +3,7 @@
 # PREFS (persistent_e3.py prefs' output), the atlas's split-B tokens and edit_eval's held texts as published inputs,
 # vpd4l's weights and VPD's subcomponents (UV) as for every pod. Rows come back to ~/mpd-data/runpod/NAME/out.
 # MODE=edit runs persistent_e3.py edit (delete the preference: circuit edit, VPD's top k, fine-tune) in place of fit.
-#   experiments/oracle/pods/pe3_pod.sh PREFS [NAME] [HOURS]      env: MODE, P, STEPS, SCREEN, GPU, PRICE
+#   experiments/oracle/pods/pe3_pod.sh PREFS [NAME] [HOURS]      env: MODE, METHODS, RANKS, CACHE, P, VRAM, STEPS, SCREEN, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -17,12 +17,15 @@ O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME
 F=/Users/user/mpd-data/scratch/rustmove/pe3/pod_$NAME
 mkdir -p "$F"
 cp "$PREFS" "$F/prefs.jsonl"
+EXTRA=""  # METHODS="a b": persistent_e3.py edit --methods; RANKS=FILE: --rank-from (an earlier edit run's rows)
+[ -n "${METHODS:-}" ] && EXTRA="--methods $METHODS"
+if [ -n "${RANKS:-}" ]; then cp "$RANKS" "$F/ranks.jsonl"; EXTRA="$EXTRA --rank-from $F/ranks.jsonl"; fi
 RUNS="" ROWS=""
 for k in $(seq 0 $((P - 1))); do
-  RUNS="$RUNS (python -B experiments/oracle/persistent_e3.py ${MODE:-fit} $F/prefs.jsonl $O/out/fit_$k.jsonl --device cuda --steps $STEPS --screen $SCREEN --offset $k --stride $P > $O/fit_$k.log 2>&1; echo \"exit \$?\" >> $O/fit_$k.log) &"
+  RUNS="$RUNS (python -B experiments/oracle/persistent_e3.py ${MODE:-fit} $F/prefs.jsonl $O/out/fit_$k.jsonl --device cuda --steps $STEPS --screen $SCREEN --offset $k --stride $P $EXTRA > $O/fit_$k.log 2>&1; echo \"exit \$?\" >> $O/fit_$k.log) &"
   ROWS="$ROWS $O/out/fit_$k.jsonl"
 done
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out;
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PE3_CACHE_GB=${CACHE:-4.5}; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/mpd-data/atlas/vpd4l/tokens_0_6000.npy /Users/user/mpd-data/graph_oracle/edit/tokens.npz /Users/user/params/method/vpd /Users/user/params/method/oracle /Users/user/params/experiments/oracle/persistent_e3.py /Users/user/params/experiments/oracle/finetune_edit.py > /dev/null;
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;

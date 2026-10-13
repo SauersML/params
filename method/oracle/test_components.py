@@ -402,6 +402,17 @@ def test_control_questions_hide_move_or_scramble_the_evidence():
     assert ids["pool"]["9"]["h.1.attn.v_proj"][0][0] == c and sorted(x for x, _ in ids["pool"]["9"]["h.1.attn.v_proj"]) != [1, 3] or c != 3
 
 
+def test_score_timing_reports_the_scorers_seconds_by_method(tiny):
+    nat, ge, task, ev = tiny
+    order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
+    at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:2]
+    finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
+    text = components.render(goal_eval.to_json(native.Graph(set(at_t), {}, at_t), ""), finals)
+    got = components.score_timing(ge, task, ev, [text])
+    assert got["answers"] == 1 and got["seconds"] > 0 and "fidelity" in got["methods"] and "line_loo" in got["methods"]
+    assert not any(n in vars(ge) for n in components.TIMED)  # the timers come off
+
+
 def test_a_variables_block_claims_every_circuit_node_of_its_site_there():
     nodes = [("h.1.attn.v_proj", 233, 4), ("h.1.attn.v_proj", 233, 9), ("h.1.attn.v_proj", 232, 4), ("h.2.attn.v_proj", 233, 1)]
     got = components.claimed_nodes([("h.1.attn.v_proj", 233, components.BLOCK), ("h.3.mlp.c_fc", 235, 7)], nodes)

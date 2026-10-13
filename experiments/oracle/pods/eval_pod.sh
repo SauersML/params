@@ -12,6 +12,7 @@
 #      EDIT_EVAL: the edit teacher's rows for the rows' edit requests (E3); TEACHER: teacher circuits (v3's dominance term);
 #      LINES=1: each sample's per-line credits (RL's per-line reward); NODE_CAP=k: the answers' node cap (0: none);
 #      NOISE=k: C's draw noise over k seeds per set's first answers (components.py noise) instead of the evaluation;
+#      TIMING=g: seconds to score groups of g answers as the RL scorer does (components.py timing, TIMING_N texts);
 #      LEDGER_OK=1 once the lead approved a launch past $290)
 cd /Users/user/params
 spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
@@ -46,7 +47,8 @@ if [ -n "${EDIT_EVAL:-}" ]; then cp "$EDIT_EVAL" "$IN/edit_eval.jsonl" && EDITS=
 # (final_eval.sh) sets EXCLUDE_TEXTS to a pattern that matches no text.
 COPYFILE_DISABLE=1 tar --exclude="${EXCLUDE_TEXTS:-texts/vpd4l/text91[0-4][0-9].json}" -cf "$IN.tar" -C "$IN" rows.jsonl labels.jsonl sets $EDITS $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_train.pt && rm -rf "$IN"
 WHAT="evaluate heldout $I/rows.jsonl --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} ${MATCHED_ALL:+--matched-all} ${TEACHER:+--teacher $I/teacher} ${EDIT_EVAL:+--edit-teach $I/edit_eval.jsonl} ${LINES:+--lines} ${NODE_CAP:+--node-cap $NODE_CAP}"
-if [ -n "${NOISE:-}" ]; then WHAT="noise heldout $I/rows.jsonl --seeds $NOISE"; fi  # C's draw noise (c_noise) instead of the evaluation
+if [ -n "${NOISE:-}" ]; then WHAT="noise heldout $I/rows.jsonl --seeds $NOISE"; fi
+if [ -n "${TIMING:-}" ]; then WHAT="timing heldout $I/rows.jsonl --group $TIMING --n ${TIMING_N:-4} ${TEACHER:+--teacher $I/teacher}"; fi  # C's draw noise (c_noise) instead of the evaluation
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \

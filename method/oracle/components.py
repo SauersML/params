@@ -1937,6 +1937,45 @@ def e4x_term(ge, tx, graph, e4: dict, split: str | None, le: dict | None = None)
     return sum((2.0 * score - 1.0) * m.get(nd, 0.0) for nd, score in claimed.items()) / M
 
 
+TIMED = ("fidelity", "line_loo", "line_effects", "score", "tau", "start_set", "track_pp", "interchange_pp", "pattern_family",
+         "necessity_spec", "sufficiency", "adversary_flips", "edge_flips", "donors", "far_donors", "cuts", "graph_ref", "pp_run")
+
+
+def score_timing(ge, task: dict, ev: dict, texts: list[str], teacher: dict | None = None) -> dict:
+    """Seconds to score one group of answers as the RL scorer does (reward(lines=True) on the search split, the
+    teacher term when given): the total, per answer, and inclusive seconds and calls per goal_eval method (TIMED; a
+    family's time includes the methods it calls) while it runs. The scorer-throughput number (SP3: 20 s or less per
+    sample)."""
+    import functools
+    import time
+
+    spent = {}
+
+    def timed(name, f):
+        @functools.wraps(f)
+        def run(*a, **k):
+            t0 = time.perf_counter()
+            try:
+                return f(*a, **k)
+            finally:
+                s_, n_ = spent.get(name, (0.0, 0))
+                spent[name] = (s_ + time.perf_counter() - t0, n_ + 1)
+        return run
+    saved = {n: getattr(ge, n) for n in TIMED if hasattr(ge, n)}
+    for n, f in saved.items():
+        setattr(ge, n, timed(n, f))
+    t0 = time.perf_counter()
+    try:
+        scored = reward(ge, task, ev, texts, split="search", lines=True, teacher=teacher)
+    finally:
+        for n in saved:
+            delattr(ge, n)  # the instance attribute goes: the class's method again
+    total = time.perf_counter() - t0
+    return {"task": task["id"], "answers": len(texts), "valid": sum(r["valid"] for r in scored), "seconds": total,
+            "seconds per answer": total / max(len(texts), 1),
+            "methods": {n: {"seconds": round(t, 2), "calls": c} for n, (t, c) in sorted(spent.items(), key=lambda x: -x[1][0])}}
+
+
 def c_noise(ge, task: dict, texts: list[str], seeds: int, pool: dict | None = None, split: str = "eval") -> list[dict]:
     """C's draw noise (a check on goal_eval's eps, the lead 10-12): each answer's reward-mode c and c_rl on the
     text under `seeds` seeds (the text's own and the next ones: fresh changed prompts, interchange, donor and flip
@@ -2760,6 +2799,14 @@ def main():
     nz.add_argument("--seeds", type=int, default=4)
     nz.add_argument("--n", type=int, default=20)
     nz.add_argument("--out", type=Path, required=True)
+    tm = sub.add_parser("timing", help="seconds to score answer groups as the RL scorer does (score_timing())")
+    tm.add_argument("split", choices=("train", "heldout", "hard"))
+    tm.add_argument("rows", type=Path)
+    tm.add_argument("--set", required=True, help="NAME=SAMPLES: each text's answers, one RL group")
+    tm.add_argument("--group", type=int, default=4, help="answers per text, as tinker_train rl's --group")
+    tm.add_argument("--n", type=int, default=4)
+    tm.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json): the D term's cost too")
+    tm.add_argument("--out", type=Path, required=True)
     s = sub.add_parser("evaluate")
     s.add_argument("split", choices=("train", "heldout", "hard"))
     s.add_argument("rows", type=Path, help="questions' JSONL (a fresh QA seed for a report, the discovery one for selection)")
@@ -2952,6 +2999,29 @@ def main():
                    "mean sd of c_rl": statistics.mean(sds) if sds else None,
                    "median sd of c": statistics.median([g["sd_c"] for g in got if g["sd_c"] is not None]) if got else None}
         args.out.write_text(json.dumps({"summary": summary, "answers": got}))
+        print(json.dumps(summary), flush=True)
+        return
+    if args.cmd == "timing":
+        import statistics
+
+        rows = {r["task"]: r for r in map(json.loads, args.rows.read_text().splitlines())}
+        samples = samples_of(Path(args.set.split("=", 1)[1]))
+        got = []
+        for p in native.tasks(args.split):
+            if len(got) >= args.n or p.stem not in rows or not samples.get(p.stem):
+                continue
+            teacher = json.loads((args.teacher / f"{p.stem}.json").read_text()) if args.teacher and (args.teacher / f"{p.stem}.json").exists() else None
+            got.append(score_timing(ge, json.loads(p.read_text()), rows[p.stem], [x for x, _ in samples[p.stem][:args.group]], teacher))
+            print(json.dumps(got[-1]), flush=True)
+        per = [g["seconds per answer"] for g in got]
+        methods = {}
+        for g in got:
+            for n, m in g["methods"].items():
+                methods[n] = methods.get(n, 0.0) + m["seconds"] / max(sum(x["answers"] for x in got), 1)
+        summary = {"groups": len(got), "median seconds per answer": statistics.median(per) if per else None,
+                   "mean seconds per answer": statistics.mean(per) if per else None,
+                   "seconds per answer by method (inclusive)": {n: round(v, 2) for n, v in sorted(methods.items(), key=lambda x: -x[1])}}
+        args.out.write_text(json.dumps({"summary": summary, "groups": got}))
         print(json.dumps(summary), flush=True)
         return
     if args.cmd == "references":

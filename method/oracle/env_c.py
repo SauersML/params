@@ -13,8 +13,11 @@ blocks "L1.v @232-233", the circuit's ids or subcomponents written out) and scor
   coverage: carrier coverage (components.e4x_term) of the text's teacher circuit (teacher/influential_v2/<task>.json):
     its nodes' measured removal effects (goal_eval.line_effects, pp, cached under LE) inside the variables' groups,
     each weighted 2 e4_v - 1 (e4_v the variable's own min(f on, f off, f same) on the split's draws).
-  reward = tanh(credit / CREDIT_SCALE) + W_REL relational + W_COV coverage (each term in [-1, 1] or [0, 1]; credit's
-    scale is the teacher's median per held-out text, 35 bits, halved).
+  selective: credit less the same lines' credit with each group replaced by random subcomponents (blocks by random
+    sites' blocks) at the same positions, as many: what the stated subcomponents add over their positions (most of a
+    position carries an input token's variable: the gate's shuffled answers tied the teacher on such texts).
+  reward = W_CREDIT tanh(credit / CREDIT_SCALE) + W_SEL tanh(selective / CREDIT_SCALE) + W_REL relational + W_COV
+    coverage (credit's scale is the teacher's median per held-out text, 35 bits, halved).
 The reward uses the search split's draws; evaluations the eval split's.
 
   env_c.py score TASK ANSWER.txt [--split eval] [--device D]
@@ -32,6 +35,7 @@ The reward uses the search split's draws; evaluations the eval split's.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -51,6 +55,8 @@ ROOT = native.TEXTS.parent
 TEACHER = ROOT / "teacher" / "influential_v2"
 LE = ROOT / "variables" / "envc" / "le"
 CREDIT_SCALE = 16.0
+W_CREDIT = 0.5
+W_SEL = 0.5
 W_REL = 0.5
 W_COV = 0.5
 DRAWS = 8
@@ -108,6 +114,7 @@ def score(ge, tx, task: str, text: str, split: str = "search", model: str = "vpd
     named = [c for c in claims if re.search(r"\bV\d+\b", c.split("->")[0])]  # a line about the variables
     sc = variables.Scorer(ge)
     credit = 0.0  # token-only lines count nothing
+    random_credit = 0.0
     if named:
         got = semantic.check_invariants(sc, tx, groups, "\n".join(named), model, fresh_mean=True)
         credit -= got["bad"]
@@ -120,7 +127,14 @@ def score(ge, tx, task: str, text: str, split: str = "search", model: str = "vpd
             credit += r["credit"]
             out["counted"] += 1
         out["bad"] += got["bad"]
+        # the same lines with each group replaced by random subcomponents (blocks by random sites' blocks) at the same
+        # positions: what the positions alone give (an input token's variable is carried by most of its position)
+        seed = int(hashlib.sha256(f"{task}|{text}".encode()).hexdigest()[:12], 16)
+        ctl = semantic.check_invariants(sc, tx, random_groups(groups, ge.nat.C, seed), "\n".join(named), model, fresh_mean=True)
+        random_credit = sum(r["credit"] for r in ctl["invariants"] if not (r["holds"] and r.get("joint") is False)) - ctl["bad"]
     out["credit"] = credit
+    out["credit_random"] = random_credit
+    out["selective"] = credit - random_credit
     got = sc.score(tx, groups, split=split, draws=DRAWS)
     out["relational"] = got.get("relational") or 0.0
     out["carriers"] = got.get("carriers")
@@ -131,7 +145,30 @@ def score(ge, tx, task: str, text: str, split: str = "search", model: str = "vpd
     le = teacher_le(ge, tx, task)
     cov = components.e4x_term(None, None, None, {"per_variable": per}, None, le) if le else None
     out["coverage"] = cov or 0.0
-    out["reward"] = math.tanh(credit / CREDIT_SCALE) + W_REL * out["relational"] + W_COV * out["coverage"]
+    out["reward"] = (W_CREDIT * math.tanh(credit / CREDIT_SCALE) + W_SEL * math.tanh(out["selective"] / CREDIT_SCALE)
+                     + W_REL * out["relational"] + W_COV * out["coverage"])
+    return out
+
+
+def random_groups(groups: list[dict], C: dict, seed: int) -> list[dict]:
+    """Each variable's group replaced by as many random items at the same positions: a block by a random site's block,
+    a subcomponent by a random subcomponent there."""
+    import variables
+
+    rng = random.Random(seed)
+    names = sorted(C)
+    out = []
+    for v in groups:
+        g = set()
+        for t in sorted({t for _, t, _ in v["group"]}):
+            mine = [c for _, tt, c in v["group"] if tt == t]
+            nb = sum(c == variables.BLOCK for c in mine)
+            for n in rng.sample(names, min(nb, len(names))):
+                g.add((n, t, variables.BLOCK))
+            while sum(1 for _, tt, c in g if tt == t and c != variables.BLOCK) < len(mine) - nb:
+                n = rng.choice(names)
+                g.add((n, t, rng.randrange(C[n])))
+        out.append({**v, "group": sorted(g)})
     return out
 
 

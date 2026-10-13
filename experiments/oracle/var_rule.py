@@ -83,7 +83,14 @@ def main():
     ap.add_argument("--fresh", type=int, default=16)
     ap.add_argument("--out", type=Path, default=native.TEXTS.parent / "variables" / "rule_check.jsonl")
     ap.add_argument("--device")
+    ap.add_argument("--tar", type=Path, help="a tar of DIR's train/ and heldout/, unpacked into --dir first (a pod uploads one file)")
     a = ap.parse_args()
+    if a.tar:
+        import tarfile
+
+        a.dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(a.tar) as t:
+            t.extractall(a.dir)
     jobs = []
     for split in ("train", "heldout"):
         for f in sorted((a.dir / split).iterdir()):

@@ -1141,8 +1141,18 @@ class GoalEval:
         e0, v0 = self._bounds(tx, "live")
         point = self.sufficiency(tx, flat)
         wired = self.sufficiency(tx, [native.Graph(sorted(h.node_set()), complete=True) for h in flat])
-        tpp = self.track_pp(tx, variants, split, draws)
-        ipp = self.interchange_pp(tx, variants, split, draws)
+        cols = {k: j for j, k in enumerate(self._pp_engine(tx).pp_lines(g))}  # the path-patched families: every deletion
+
+        def col(kind, x):  # in one engine call per family (lines=), each a column of Engine.pp_lines
+            if kind == "node":
+                return cols[("n", x)]
+            if kind == "edge":
+                return cols[("o", x[0])] if x[1] is None else cols[("e", x[0], x[1])]
+            return cols[("u", x[0])] if x[1] is None else cols[("t", x[0], x[1])]
+        mask = torch.ones(len(lines), len(cols))
+        mask[torch.arange(len(lines)), torch.tensor([col(k, x) for k, x in lines], dtype=torch.long)] = 0.0
+        tpp = self.track_pp(tx, [g], split, draws, lines=mask)
+        ipp = self.interchange_pp(tx, [g], split, draws, lines=mask)
         pat = self.pattern_family(tx, flat)
         at = [i for i, (kind, _) in enumerate(lines) if kind == "node"]  # N moves with the node set alone
         nsp = dict(zip(at, self.necessity_spec(tx, [flat[i] for i in at], split))) if at else {}
@@ -1637,8 +1647,11 @@ class GoalEval:
         graph_of_lines), its rows per variant, in one call (_interchange_lines)."""
         if lines is not None:
             return self._interchange_lines(tx, graphs[0], split, draws, lines)
+        return self._interchange_graphs(tx, [strand(g, tx.targets, self.nat.C) for g in graphs], split, draws)
+
+    def _interchange_graphs(self, tx: Text, graphs: list[native.Graph], split: str, draws: int) -> list[dict]:
+        """interchange_pp of graphs as given (stranding is the caller's)."""
         nat, T = self.nat, tx.T
-        graphs = [strand(g, tx.targets, nat.C) for g in graphs]
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
         model = native.Graph([(n, t, BLOCK) for n in nat.names for t in range(T)], complete=True)
         recs = {}
@@ -1694,8 +1707,8 @@ class GoalEval:
         empty = {"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
         out = [dict(empty) for _ in range(K)]
         alone = [k for k in range(K) if sorted({nodes[i][1] for i in range(N) if on[k, i] and nodes[i][1] > 0}) != positions]
-        for k in alone:
-            out[k] = self.interchange_pp(tx, [graph_of_lines(g, cols, lines[k])], split, draws)[0]
+        for k in alone:  # nothing re-stranded
+            out[k] = self._interchange_graphs(tx, [graph_of_lines(g, cols, lines[k])], split, draws)[0]
         rest = [k for k in range(K) if k not in set(alone)]
         got = self._interchange_draws(tx, positions, split, draws) if positions and vpd is not None and rest else []
         if not got:

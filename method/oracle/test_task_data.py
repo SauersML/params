@@ -61,7 +61,7 @@ def test_far_donors_use_explicit_ids_with_missing_development_files(texts, monke
             "split": "heldout", "prompts": [{"token_ids": [1, 2], "target_positions": [1]}],
         }))
     monkeypatch.setattr(native, "TEXTS", texts.parent)
-    nat = SimpleNamespace(target=SimpleNamespace(wte=SimpleNamespace(shape=(40, 8))))
+    nat = SimpleNamespace(target=SimpleNamespace(n_tokens=40))
     ge = goal_eval.GoalEval(nat)
     assert ge.far_pool("eval") == [("text9150", [1, 2]), ("text9199", [1, 2])]
 

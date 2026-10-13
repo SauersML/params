@@ -2564,3 +2564,32 @@ def test_path_patched_several_changes():
                     x2[p] = z
                 want = ge.pp_run(tx, x2, gr)[0]
                 assert float((got[b, d] - want).abs().max()) < 1e-4, (b, d)
+
+
+def test_pattern_family_engine_equals_graph_ref(tiny):
+    """pattern_family's circuit runs on the engine (C's semantics with the model's attention rows given at the reads,
+    Engine.graph_log_probs(rows=)) give graph_ref(rows=)'s KL on every draw: stated graphs with and without stated
+    pairs, within 1e-4."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    g = torch.Generator().manual_seed(23)
+    graphs = [_pp_stated(_pp_nodes(every, g, f, blocks=0.0), tx.targets, g, keep=k) for f, k in ((0.4, 0.7), (0.8, 1.0))]
+    graphs.append(native.Graph(every[::2], *native.all_edges(every[::2], tx.targets)))
+    graphs = [goal_eval.strand(x, tx.targets, nat.C) for x in graphs]
+    rows = ge.pattern_family(tx, graphs)
+    b = ge._pp_base(tx)
+    causal = torch.ones(tx.T, tx.T, dtype=torch.bool, device=nat.dev).tril()
+    n = 0
+    for x, r in zip(graphs, rows):
+        reads = sorted({(native._name_layer_kind(m)[0], t) for m, t, _ in x.node_set() if native._name_layer_kind(m)[1] == "o_proj"})
+        if not reads:
+            continue
+        real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
+        draws = [real] + ([{q: real[q]} for q in reads] if len(reads) > 1 else [])
+        want = [float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, x, rows=d))[0]) for d in draws]
+        got = [kc for kc, _ in r["draws_pattern"]]
+        assert len(got) == len(want)
+        for a, w in zip(got, want):
+            assert abs(a - w) <= 1e-4 * (1 + abs(w)), (a, w)
+            n += 1
+    assert n >= 4

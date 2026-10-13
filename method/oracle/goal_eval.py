@@ -1332,22 +1332,23 @@ class GoalEval:
         attention row on the text, all of them at once and each alone; VPD's answer the same; the mean KLs from the
         model on C's log scale against KL_empty (s_pattern, _raw without the floor at 0). A circuit whose output
         survives the model's true pattern uses attention as the model does. None for a circuit without an attention
-        output."""
+        output. The circuits' runs batched on the engine (_pattern_runs), VPD's kept per read set."""
         b = self._pp_base(tx)
         T = tx.T
         causal = torch.ones(T, T, dtype=torch.bool, device=self.nat.dev).tril()
         e0, v0 = self._bounds(tx, "live")
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
         kept = tx.__dict__.setdefault("_pattern_vpd", {})  # (VPD's answer, reads given) -> its KL
-        out = []
-        for g in graphs:
+        plans, out = [], []
+        for g in graphs:  # each circuit's draws: every read given the model's row, and each alone
             reads = sorted({(native._name_layer_kind(n)[0], t) for n, t, _ in g.node_set() if native._name_layer_kind(n)[1] == "o_proj"})
+            real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
+            plans.append((reads, [real] + ([{r: real[r]} for r in reads] if len(reads) > 1 else [])))
+        kcs = self._pattern_runs(tx, graphs, plans)
+        for g, (reads, draws), kc in zip(graphs, plans, kcs):
             if not reads or vpd is None:
                 out.append({"s_pattern": None, "s_pattern_raw": None, "kl_pattern_c": None, "kl_pattern_vpd": None, "reads_pattern": len(reads)})
                 continue
-            real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
-            draws = [real] + ([{r: real[r]} for r in reads] if len(reads) > 1 else [])
-            kc = [float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, g, rows=d))[0]) for d in draws]
             kv = []
             for d in draws:  # VPD's run with those reads given: the same for every circuit using them (kept on tx)
                 key = (id(tx.vpd), tuple(sorted(d)))
@@ -1358,6 +1359,33 @@ class GoalEval:
             c_, v_ = float(np.mean(kc)), float(np.mean(kv))
             out.append({"s_pattern": _fid(e0, c_, v_), "s_pattern_raw": _fid_raw(e0, c_, v_), "kl_pattern_c": c_,
                         "kl_pattern_vpd": v_, "reads_pattern": len(reads), "draws_pattern": [list(x) for x in zip(kc, kv)]})
+        return out
+
+    PATTERN_ROWS = 32  # pattern_family's engine rows (circuits x draws) a call
+
+    @torch.no_grad()
+    def _pattern_runs(self, tx: Text, graphs: list[native.Graph], plans: list) -> list[list[float]]:
+        """pattern_family's circuit side: per graph, each draw's KL from the model (graph_ref(rows=)'s numbers): the
+        stated graphs on the engine (C's semantics with the draws' attention rows given, PATTERN_ROWS a call), a
+        complete graph on graph_ref."""
+        out = [[] for _ in graphs]
+        todo = []
+        for gi, (g, (reads, draws)) in enumerate(zip(graphs, plans)):
+            if not reads or tx.vpd is None:
+                continue
+            if g.complete:
+                out[gi] = [float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, g, rows=d))[0]) for d in draws]
+            else:
+                todo += [(gi, d) for d in draws]
+        if todo:
+            flat = {gi: expand_blocks(graphs[gi], self.nat.C) for gi in {gi for gi, _ in todo}}
+            E = self._circuit_engine(tx.ids, tx.targets, list(flat.values()))
+            for s0 in range(0, len(todo), self.PATTERN_ROWS):
+                part = todo[s0:s0 + self.PATTERN_ROWS]
+                lq = E.graph_log_probs(E.plan([flat[gi] for gi, _ in part], semantics="c"), rows=[d for _, d in part])
+                for (gi, _), k in zip(part, carry.kl(tx.ref, lq).tolist()):
+                    out[gi].append(k)
+                native.free(self.nat.dev)
         return out
 
     @torch.no_grad()

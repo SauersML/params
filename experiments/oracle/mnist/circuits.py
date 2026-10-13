@@ -59,18 +59,27 @@ class Draws:
 
 
 class Scorer:
-    def __init__(self, dec: Decomp | Neurons, x: torch.Tensor) -> None:
+    """Runs the four families for sets of nodes. A node is one subcomponent, or with G [nodes, total] a group of them
+    (a whole layer as one block node); removals and flips draw nodes, and a node on is all its subcomponents on."""
+
+    def __init__(self, dec: Decomp | Neurons, x: torch.Tensor, G: torch.Tensor | None = None) -> None:
         self.dec = dec
         self.x = x[None, :]
         self.a, _, _ = dec.acts(self.x)
         self.ref = dec.run(self.x, torch.ones(1, dec.total))
+        self.G = None if G is None else G.float()
+        self.n_nodes = dec.total if G is None else G.shape[0]
 
-    def families(self, S: torch.Tensor, d: Draws, rem: float = 1.0) -> dict[str, torch.Tensor]:
-        """KL bits per draw for each family. S [total] bool."""
+    def expand(self, M: torch.Tensor) -> torch.Tensor:
+        return M if self.G is None else (M.float() @ self.G) > 0
+
+    def families(self, S_nodes: torch.Tensor, d: Draws, rem: float = 1.0) -> dict[str, torch.Tensor]:
+        """KL bits per draw for each family. S_nodes [nodes] bool."""
         dec, n, T = self.dec, d.n, self.dec.total
+        R = self.expand((d.u_rem < d.r) & S_nodes[None, :])
+        Fl = self.expand((d.u_flip < d.q) & ~S_nodes[None, :])
+        S = self.expand(S_nodes)
         Sf = S.float()[None, :]
-        R = (d.u_rem < d.r) & S[None, :]
-        Fl = (d.u_flip < d.q) & ~S[None, :]
         masks = torch.cat(
             [
                 Sf,  # point
@@ -145,7 +154,7 @@ def prune(sc: Scorer, order: torch.Tensor, d: Draws, tau: float, passes: int = 2
     """Greedy removal in the given order; a block of candidates is removed at once when the smaller set is accepted,
     else it is split in halves down to single subcomponents (the same accepted set as one-at-a-time removal whenever
     removals do not interact, at far fewer runs)."""
-    S = torch.ones(sc.dec.total, dtype=torch.bool)
+    S = torch.ones(sc.n_nodes, dtype=torch.bool)
 
     def try_remove(js: list[int]) -> bool:
         js = [j for j in js if S[j]]
@@ -198,6 +207,7 @@ def main() -> None:
     ap.add_argument("--eval-draws", type=int, default=64)
     ap.add_argument("--n-images", type=int, default=50)
     ap.add_argument("--random-sets", type=int, default=5)
+    ap.add_argument("--blocks", default="", help="layers kept as one whole-layer node each: fc1,fc2,fc3 (vpd), h1,h2 (neurons)")
     args = ap.parse_args()
     torch.set_num_threads(3)
     torch.manual_seed(0)
@@ -213,43 +223,69 @@ def main() -> None:
     # VPD's causal importance; for neurons the analog of "active" is a nonzero activation, ranked by its size
     ci_all = dec.ci(xte[imgs]) if args.units == "vpd" else a_imgs.abs()
     contrib_all = dec.contribution(xte[imgs])
+    blocks = [b for b in args.blocks.split(",") if b]
+    G = None
+    node_names = [dec.name(j) for j in range(dec.total)]
+    if blocks:
+        rows, node_names = [], []
+        for m, o, sz in zip(dec.layer_names, dec.offsets, dec.sizes, strict=True):
+            if m in blocks:
+                g = torch.zeros(dec.total, dtype=torch.bool)
+                g[o : o + sz] = True
+                rows.append(g)
+                node_names.append(f"{m}[whole]")
+            else:
+                for c in range(sz):
+                    g = torch.zeros(dec.total, dtype=torch.bool)
+                    g[o + c] = True
+                    rows.append(g)
+                    node_names.append(f"{m}#{c}")
+        G = torch.stack(rows)
+    n_nodes = dec.total if G is None else G.shape[0]
     results = []
     t0 = time.time()
     for ii, idx in enumerate(imgs):
         x = xte[idx]
-        sc = Scorer(dec, x)
+        sc = Scorer(dec, x, G)
         gs = torch.Generator().manual_seed(1000 + idx)
         ge = torch.Generator().manual_seed(2000 + idx)
         c = int(sc.ref.argmax())
         near = torch.nonzero((donor_y == c) & (donor_pred == c)).flatten()
         far = torch.nonzero(donor_y != c).flatten()
-        dsearch = Draws(args.draws, dec.total, a_donor_all[near[torch.randint(len(near), (args.draws,), generator=gs)]], gs)
+        dsearch = Draws(args.draws, n_nodes, a_donor_all[near[torch.randint(len(near), (args.draws,), generator=gs)]], gs)
         deval = Draws(
-            args.eval_draws, dec.total, a_donor_all[near[torch.randint(len(near), (args.eval_draws,), generator=ge)]], ge
+            args.eval_draws, n_nodes, a_donor_all[near[torch.randint(len(near), (args.eval_draws,), generator=ge)]], ge
         )
         dfar = Draws(
-            args.eval_draws, dec.total, a_donor_all[far[torch.randint(len(far), (args.eval_draws,), generator=ge)]], ge
+            args.eval_draws, n_nodes, a_donor_all[far[torch.randint(len(far), (args.eval_draws,), generator=ge)]], ge
         )
         noth = sc.nothing(deval)
         noth_far = sc.nothing(dfar)
         ci, contrib = ci_all[ii], contrib_all[ii]
-        S = prune(sc, contrib.argsort(), dsearch, tau_s)
+        # node scores: a block node counts as always active, ranked first by every baseline
+        is_block = torch.zeros(n_nodes, dtype=torch.bool) if G is None else G.sum(1) > 1
+        node_contrib = contrib if G is None else G.float() @ contrib
+        node_ci = ci if G is None else torch.where(is_block, torch.tensor(1e3), (G.float() @ ci))
+        S = prune(sc, node_contrib.argsort(), dsearch, tau_s)
         k = int(S.sum())
-        active = ci > 0
+        active = node_ci > 0
         methods = {
             "circuit": S,
-            "vpd_topk_ci": topk(ci, contrib, k),
-            "topk_write": topk(contrib, ci, k),
+            "vpd_topk_ci": topk(node_ci, node_contrib, k),
+            "topk_write": topk(torch.where(is_block, node_contrib.max() + 1, node_contrib), node_ci, k),
             "vpd_active": active,
         }
+        S_sub = sc.expand(S)
         row = {
             "image": idx,
             "label": int(yte[idx]),
             "pred": int(sc.ref.argmax()),
             "k": k,
             "n_active": int(active.sum()),
-            "members": [dec.name(j) for j in torch.nonzero(S).flatten().tolist()],
-            "members_ci": [float(ci[j]) for j in torch.nonzero(S).flatten().tolist()],
+            "members": [node_names[j] for j in torch.nonzero(S).flatten().tolist()],
+            "members_ci": [float(ci[sc.expand(torch.nn.functional.one_hot(torch.tensor(j), n_nodes).bool())].max())
+                           for j in torch.nonzero(S).flatten().tolist()],
+            "n_subcomponents": int(S_sub.sum()),
             "kl_nothing": float(noth.mean()),
             "kl_nothing_far": float(noth_far.mean()),
             "search": summarize(sc, S, dsearch, sc.nothing(dsearch), dfar, noth_far),
@@ -257,12 +293,16 @@ def main() -> None:
         }
         gr = torch.Generator().manual_seed(3000 + idx)
         rnd = []
-        pool = torch.nonzero(active).flatten() if k <= int(active.sum()) else torch.arange(dec.total)
+        nb = int(is_block.sum())
+        pool = torch.nonzero(active & ~is_block).flatten()
+        if k - nb > len(pool):
+            pool = torch.nonzero(~is_block).flatten()
         for _ in range(args.random_sets):
-            M = torch.zeros(dec.total, dtype=torch.bool)
-            M[pool[torch.randperm(len(pool), generator=gr)[:k]]] = True
+            M = is_block.clone()
+            M[pool[torch.randperm(len(pool), generator=gr)[: max(k - nb, 0)]]] = True
             rnd.append(summarize(sc, M, deval, noth, dfar, noth_far))
-        row["eval"]["random_active"] = {key: float(np.mean([r[key] for r in rnd])) for key in rnd[0]}
+        if rnd:
+            row["eval"]["random_active"] = {key: float(np.mean([r[key] for r in rnd])) for key in rnd[0]}
         results.append(row)
         ev = row["eval"]
         print(
@@ -272,7 +312,7 @@ def main() -> None:
             flush=True,
         )
     suffix = "" if args.tau_search is None else f"_s{args.tau_search}"
-    unit = "" if args.units == "vpd" else "_neurons"
+    unit = ("" if args.units == "vpd" else "_neurons") + ("" if not blocks else "_blocks-" + "-".join(blocks))
     out = DATA / f"circuits_{args.tag}{unit}_tau{args.tau}{suffix}.json"
     out.write_text(json.dumps({"args": vars(args), "results": results}, indent=1))
     agg = {}

@@ -95,6 +95,8 @@ class Decomp:
     b: dict[str, torch.Tensor]
     ci_fn: nn.Module | None
 
+    layer_names = MODULES
+
     @property
     def sizes(self) -> list[int]:
         return [self.V[m].shape[1] for m in MODULES]
@@ -201,9 +203,15 @@ class Neurons:
     b: dict[str, torch.Tensor]
     ci_fn: None = None
 
+    layer_names = ("h1", "h2")
+
     @property
     def sizes(self) -> list[int]:
         return [self.W["fc1"].shape[0], self.W["fc2"].shape[0]]
+
+    @property
+    def offsets(self) -> list[int]:
+        return [0, self.sizes[0]]
 
     @property
     def total(self) -> int:

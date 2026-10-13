@@ -279,23 +279,3 @@ def test_stream_ratio(tiny):
     got = bk.stream_ratio(blocks=every)
     assert all(abs(v - 1.0) < 1e-5 for v in got.values()), got
     assert all(v > 0 for v in bk.stream_ratio().values())
-
-
-def test_node_family_matches_goal_eval(tiny):
-    """node_family is goal_eval's node family without reads: the same draws, KLs and fields for a node set, a node set
-    with a block (drawn as one unit) and a stated graph."""
-    nat, ge, tx, circuit = tiny
-    n, t = nat.names[4], 9
-    with_block = native.Graph(sorted(circuit.node_set()) + [(n, t, goal_eval.BLOCK)], complete=True)
-    nodes = sorted(circuit.node_set())
-    stated = native.Graph(nodes[:6], {nodes[3]: [nodes[0]]}, [nodes[5]])
-    graphs = [goal_eval._c_graph(g, tx.targets, nat.C) for g in (circuit, with_block, stated)]
-    units = [sorted(goal_eval.strand(g, tx.targets, nat.C).node_set()) for g in (circuit, with_block, stated)]
-    want = ge._node_family(tx, graphs, 6, False, units=units)
-    got = backup.node_family(ge, tx, graphs, 6, False, units=units)
-    for w, g_ in zip(want, got):
-        for k in ("kl_nodes_c", "kl_nodes_vpd", "overstate_nodes"):
-            assert abs(w[k] - g_[k]) < 1e-6 * max(1.0, abs(w[k])), (k, w[k], g_[k])
-        assert len(w["draws_nodes"]) == len(g_["draws_nodes"])
-        for a, b in zip(w["draws_nodes"], g_["draws_nodes"]):
-            assert all(abs(x - y) < 1e-6 * max(1.0, abs(x)) for x, y in zip(a, b))

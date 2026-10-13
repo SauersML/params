@@ -390,7 +390,7 @@ flowchart BT
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
-  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 60/60;<br/>cond 2 not passed: 6 of 7 pruned<br/>fv_dev teachers fall below a start<br/>floor (nodes on 4), 9005 above;<br/>toys full tier 20/21 (cancel by design)"}}
+  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 60/60;<br/>cond 2 untested: no pruned fv_dev<br/>teacher meets the floors; rerun on<br/>v2.3 teachers under x; toys full tier<br/>20/21 (c), 19/21 (x: one 0.0006 tie)"}}
 
   %% ===================== workstreams =====================
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
@@ -415,13 +415,13 @@ flowchart BT
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
     W2["<b>Falsification set</b><br/>14 families + copy, frequency-weighted:<br/>wrong context loses 0.61-0.74, padding 0.76;<br/>equal-bits target actives win 0.85;<br/>partition/parity E4 0.00-0.04 vs identity ~1;<br/>behavior mode (CausalGym): v2.1 teacher holds<br/>the subject 0.85 (plain 0.12), R prefers it 0.86;<br/>interchange_pp still blind · DONE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
-    W4["<b>Reward repair</b><br/>package aa79889; linear-share pooling 71c66c3;<br/>N with background on; omitted family;<br/>floors, circuit_term, tie-break b3937ed;<br/>next: routing and norm scales at x<br/>(engine options asked), then cond 2 again<br/>ACTIVE · inframove"]
+    W4["<b>Reward repair</b><br/>floors, circuit_term b3937ed; blocks at<br/>active contents a076865; RL run 2: soft<br/>pieces + audit 2fdd1cf, interchange panel<br/>19d86e2, semantics x opt-in 2750fd8<br/>(s_nodes 0.56 → 0.93); next: cond 2 on<br/>v2.3 teachers, flip default to x<br/>ACTIVE · inframove"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
     W6["<b>Diagnose fidelity failures</b><br/>retain draws and every family score;<br/>unchanged reward; export checks pass;<br/>separate response error from uncertainty<br/>IMPLEMENTED · codex · 3017b64"]
   end
 
   %% ===================== verifier and foundations =====================
-  PHI["<b>Faithfulness score Φ</b><br/>11 families (+ omitted parts);<br/>gap-weighted pooling, N with<br/>background kept; flips past the<br/>omitted count f929e58 · DONE · inframove"]
+  PHI["<b>Faithfulness score Φ</b><br/>11 families (+ omitted parts);<br/>linear-share pooling, leaky floor;<br/>flips past the omitted count;<br/>raw KLs reported; s_weight a column<br/>DONE · inframove"]
   TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>mixed binding: both routes carry it;<br/>cancelling pair: unnecessary under donor<br/>semantics (patching families), needed under<br/>weight edits on text 1 (0.97 bits: omitted,<br/>inframove); standard VPD keeps it as a candidate,<br/>donor VPD hides it; omitted family scored the<br/>pair-free circuit 1.0 on text 1 (pool check<br/>rejects exhaustive candidates), 0.015 without<br/>it (fix with inframove); no arm keeps the pair<br/>ACTIVE · fleet"]
   IBENCH["<b>InterpBench ground truth</b><br/>TransformerLens models as a Target (61b88f0);<br/>exact decomposition, all 60 Tracr cases:<br/>node AUROC mean 0.97, edge mean 0.97<br/>(case 21 weakest: 0.67 / 0.79);<br/>VPD fits: cases 11/19/26 near exact,<br/>case 21 node 0.57, edge 0.74;<br/>MIB IOI on MIB's own model and scorer<br/>(reproduced exactly): EAP 0.73, EAP-IG-inp<br/>0.75, EAP-IG-act 0.71 (paper 0.81); VPD<br/>teacher on 32 test prompts next<br/>ACTIVE · fleet"]
   TOYB["<b>Gate B on planted toys</b><br/>complete exact circuits pass; incomplete<br/>true routes fail (N ratio unbounded,<br/>own eps added, gate leak, all-actives<br/>at phi ceiling); eps cap + score clip<br/>fixes 3 of 4 (57e44c2) · toyloop"]

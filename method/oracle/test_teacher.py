@@ -516,3 +516,34 @@ def test_kl_budget_takes_a_kl_rounded_below_zero():
     b = teacher.kl_budget(80.0, -3e-8)
     assert isinstance(b, float) and 0 < b < 1e-6
     assert abs(teacher.kl_budget(80.0, 0.05) - 80.0 ** 0.1 * 0.05 ** 0.9) < 1e-12
+
+
+def test_discriminating_draws_stay_off_eval():
+    nat, pr = pruner(True, "text9002")
+    ge = pr.ge
+    ids, targets = native.text(TEXT.parent / "text9002.json")
+    tx = ge.text(ids, targets, native.task_seed("text9002"))   # the scorer's seed
+    tx.vpd = pr.tx.vpd
+    pool = teacher.search_pool(ge, tx)
+    positions = [p for p, _ in tx.f2]
+    moved = [-float(tx.moved[p - 1]) for p in positions]
+    held = set(ge._interchange_draws(tx, positions, "eval", 64, first=dict(zip(positions, moved))))
+    held |= set(ge._interchange_draws(tx, positions, "eval", goal_eval.INTERCHANGE_DRAWS))
+    # the pool holds the search split's draws and never an eval draw
+    assert set(ge._interchange_draws(tx, positions, "search", 16)) <= set(pool) and not (set(pool) & held)
+    assert len(pool) >= teacher.POOL_DRAWS
+    pr2 = teacher.Pruner(ge, tx, tx.vpd, live=True, B=32)
+    as_nodes = lambda on: native.Graph([pr2.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
+    acc = teacher.Acceptance(ge, tx, ("changed",), "pp", "discriminating")
+    hook, base = acc.hook(as_nodes, pr2.on.clone(), current=lambda: pr2.on, label="t", names=lambda ids: ids)
+    g = torch.Generator().manual_seed(0)
+    ons = pr2.on[None].repeat(6, 1)
+    for i, f in enumerate((0.02, 0.05, 0.1, 0.3, 0.6, 0.9)):     # random removals, light to heavy
+        ons[i, torch.rand(len(pr2.nodes), generator=g).to(ons.device) < f] = False
+    got = hook(ons)
+    floor = min(teacher.RECOVERED, base["s_track_pp"])
+    # admitted removals keep the floor on their judged draws; each refusal kept with its 16 draws from the pool
+    assert all(r is None or r["s_track_pp"] >= floor for r in got)
+    assert len(acc.refused) == sum(r is None for r in got)
+    assert all(len(x["draws"]) <= teacher.DISC_DRAWS and {tuple(d) for d in x["draws"]} <= set(pool) and x["s_track_pp"] < floor
+               for x in acc.refused)

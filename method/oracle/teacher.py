@@ -620,6 +620,24 @@ def edge_path(ep: EdgePruner, budget: float, row, levels: tuple = ("connection",
 ACCEPT = {"changed": ("changed_search", ("s_track",)), "interchange": ("interchange_search", ("s_interchange",)),
           "donors": ("donors_search", ("s_donor_near", "s_donor_far"))}
 TRACK = {"c": "s_track", "pp": "s_track_pp"}  # changed_search's mode -> its term
+POOL_DRAWS = 64       # discriminating acceptance: fresh search-pool changed texts scored per check
+DISC_DRAWS = 16       # ... of which a candidate is judged on those where it and the current circuit disagree most
+POOL_SEED = 7         # the search pool's sampled tokens' seed offset (eval's: goal_eval.INTERCHANGE_SPLITS["eval"])
+
+
+def search_pool(ge: goal_eval.GoalEval, tx: goal_eval.Text) -> list:
+    """The discriminating acceptance's changed texts, (position, token) at F2's positions: the search split's ranks 0
+    and 2 of the model's alternatives and tokens sampled from the model's distribution on their own seed
+    (_fresh_sources), leaving out every eval token (rank 1 and eval's samples): disjoint from the eval split's draws of
+    changed_inputs and interchange (the lead's 10-12: pruning against one fixed set of 16 draws fitted them, text9002
+    search 0.88 against eval 0.34)."""
+    nat, pool = ge.nat, []
+    for p in sorted({p for p, _ in tx.f2}):
+        alts = [x[p] for x in carry.alternatives(nat, tx.ids, p, (0, 1, 2))]
+        held = {alts[1]} | set(ge._fresh_sources(tx, p, int(tx.seed) + goal_eval.INTERCHANGE_SPLITS["eval"][0]))
+        pool += [(p, alts[0]), (p, alts[2])]
+        pool += [(p, z) for z in ge._fresh_sources(tx, p, int(tx.seed) + POOL_SEED) if z not in held and z not in alts]
+    return pool
 
 
 class Acceptance:
@@ -634,10 +652,58 @@ class Acceptance:
     the text) passes. The splits' eval draws stay held out (gates, tables). mode, the changed family's: "pp" (the
     lead's decision 10-12), s_track_pp, the circuit path-patched (goal_eval.track_pp: everything outside it at its
     value on the text, so cutting distant positions does not switch their parts off), and interchange's
-    s_interchange_pp (interchange_pp); "c", s_track and s_interchange in C's semantics."""
+    s_interchange_pp (interchange_pp); "c", s_track and s_interchange in C's semantics. draws "discriminating" (pp
+    mode; the lead's 10-12): hook's changed term on a fresh sample of POOL_DRAWS changed texts from search_pool per
+    check, the current circuit and each candidate scored on all of them (engine.Engine.path_patched) and the candidate
+    judged on the DISC_DRAWS where the two disagree most (a removal must survive the draws it could be wrong on, not
+    one fixed set); each refused removal kept in refused with those draws."""
 
-    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds, mode: str = "pp"):
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds, mode: str = "pp", draws: str = "fixed"):
         self.ge, self.tx, self.kinds, self.mode, self.calls = ge, tx, tuple(kinds), mode, 0
+        self.draws, self.refused, self.pool = draws, [], None
+        if draws == "discriminating" and mode != "pp":
+            raise ValueError("discriminating draws score s_track_pp: mode pp")
+        self.rng = np.random.default_rng([int(tx.seed), 23])
+
+    def _per_draw(self, graphs: list, prompts: list) -> list:
+        """Per graph its per-draw s_track_pp on prompts (None where VPD's answer is no nearer than no change), and the
+        draws' W: one engine.Engine.path_patched call with VPD's answer beside the graphs."""
+        import engine
+
+        tx, nat = self.tx, self.ge.nat
+        if "_pp_engine" not in tx.__dict__:
+            tx.__dict__["_pp_engine"] = engine.Engine(nat, tx.ids, tx.targets, live=True)
+        if "_disc_vpd" not in tx.__dict__:
+            tx.__dict__["_disc_vpd"] = native.Graph([(n, int(t), int(c)) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()],
+                                                    complete=True)
+        lq = tx.__dict__["_pp_engine"].path_patched(list(graphs) + [tx.__dict__["_disc_vpd"]], [tuple(x) for x in prompts])
+        refs = tx.__dict__.setdefault("_disc_refs", {})       # (p, z) -> (the model on x', W)
+        out, ws = [[None] * len(prompts) for _ in graphs], []
+        for d, (p, z) in enumerate(prompts):
+            if (p, z) not in refs:
+                x2 = list(tx.ids)
+                x2[p] = z
+                r2 = nat.reference([x2], tx.targets)
+                refs[(p, z)] = (r2, float(carry.kl(r2, tx.ref)[0]))
+            ref, w = refs[(p, z)]
+            kl = carry.kl(ref, lq[:, d]).tolist()             # [G + 1]
+            ws.append(w)
+            for g in range(len(graphs)):
+                out[g][d] = goal_eval._fid(w, kl[g], kl[-1])
+        native.free(nat.dev)
+        return out, ws
+
+    @staticmethod
+    def _pooled(s: list, ws: list, idx) -> float | None:
+        num = sum(ws[d] * s[d] for d in idx if s[d] is not None)
+        den = sum(ws[d] for d in idx if s[d] is not None)
+        return num / den if den > 0 else None
+
+    def _sample(self) -> list:
+        if self.pool is None:
+            self.pool = search_pool(self.ge, self.tx)
+        k = min(POOL_DRAWS, len(self.pool))
+        return [self.pool[i] for i in self.rng.choice(len(self.pool), k, replace=False).tolist()]
 
     def scores(self, graphs: list, edges: tuple | None = None) -> list[dict]:
         """Per graph its terms; edges, (graph, ons [K, connections]): the graphs are those connection subsets of one
@@ -660,19 +726,58 @@ class Acceptance:
         self.calls += 1
         return out
 
-    def hook(self, graph_of, start: torch.Tensor, edges_of=None, floor: dict | None = None) -> tuple:
+    def hook(self, graph_of, start: torch.Tensor, edges_of=None, floor: dict | None = None, current=None,
+             label: str = "", names=None) -> tuple:
         """(accept(ons) for Descent.prune and joint_path: per candidate unit set [K, units], its terms when each is at or
         above its floor, else None; the start's terms). graph_of(on): a unit set's circuit as goal_eval runs it;
         edges_of(ons), for connection sets: (the node set's graph with every connection, ons) for scores' edges;
-        floor, the floors (default min(0.9, the start's terms))."""
+        floor, the floors (default min(0.9, the start's terms)). With discriminating draws: current() the unit set the
+        candidates are removals from (default start), label and names(unit ids) naming a refused removal."""
+        disc = self.draws == "discriminating" and "changed" in self.kinds
+        rest = Acceptance(self.ge, self.tx, [k for k in self.kinds if not (disc and k == "changed")], self.mode)
+        current = current or (lambda: start)
+
         def run(ons):
-            return self.scores([graph_of(on) for on in ons], None if edges_of is None else edges_of(ons))
+            return rest.scores([graph_of(on) for on in ons], None if edges_of is None else edges_of(ons)) if rest.kinds \
+                else [{} for _ in ons]
         base = run(start[None])[0]
+        if disc:                                             # the start on a fresh sample, every draw
+            got, ws = self._per_draw([graph_of(start)], self._sample())
+            base["s_track_pp"] = self._pooled(got[0], ws, range(len(ws)))
         if floor is None:
             floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
 
+        def judge(ons):                                      # the changed term on the draws each candidate is most at
+            now, prompts = current(), self._sample()         # odds with the current circuit on
+            got, ws = self._per_draw([graph_of(now)] + [graph_of(on) for on in ons], prompts)
+            out = []
+            for i, on in enumerate(ons):
+                gap = [abs(a - b) if a is not None and b is not None else -1.0 for a, b in zip(got[i + 1], got[0])]
+                idx = [d for d in sorted(range(len(gap)), key=lambda d: -gap[d]) if gap[d] >= 0][:DISC_DRAWS]
+                sc = self._pooled(got[i + 1], ws, idx)
+                f = floor.get("s_track_pp")
+                if f is not None and sc is not None and sc < f:
+                    removed = (now & ~on).nonzero().flatten().tolist() if now.shape == on.shape else []
+                    self.refused.append({"stage": label, "removed": names(removed) if names else removed,
+                                         "draws": [[int(prompts[d][0]), int(prompts[d][1])] for d in idx],
+                                         "s_track_pp": sc, "s_current": self._pooled(got[0], ws, idx), "floor": f})
+                    out.append(None)
+                else:
+                    out.append({"s_track_pp": sc})
+            return out
+
         def accept(ons):
-            return [r if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r) else None for r in run(ons)]
+            if not disc:
+                return [r if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r) else None for r in run(ons)]
+            first = judge(ons)
+            alive = [i for i, r in enumerate(first) if r is not None]
+            rows = run(ons[torch.tensor(alive, dtype=torch.long, device=ons.device)]) if alive else []
+            for i, r in zip(alive, rows):
+                if all(floor[k] is None or r[k] is None or r[k] >= floor[k] for k in r):
+                    first[i].update(r)
+                else:
+                    first[i] = None
+            return first
         return accept, base
 
 
@@ -773,8 +878,9 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
             f"{row['seconds']:.0f}s", flush=True)
     t0 = time.perf_counter()
     floor, hook = None, None
+    names = lambda ids: [pr.nodes[i] for i in ids]  # noqa: E731
     if acceptance is not None:
-        hook, base = acceptance.hook(graph_of, pr.on.clone())
+        hook, base = acceptance.hook(graph_of, pr.on.clone(), current=lambda: pr.on, label="blocks", names=names)
         floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
         rec["accept_start"], rec["floor"] = base, floor
     stage("start", t0)
@@ -793,7 +899,9 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
             got = acceptance.scores([graph_of(pr.on, f) for f in flags_of(ons)])
             return [-min([r[k] - f for k, f in floor.items() if f is not None and r[k] is not None] or [0.0]) for r in got]
         fl = Flags(len(kept), min(pr.kl(), budget), rank, ACCEPT_BATCH, nat.dev)   # (C's KL is not its business)
-        fhook, _ = acceptance.hook(lambda f: graph_of(pr.on, flags_of(f[None])[0]), fl.on.clone(), floor=floor)
+        fhook, _ = acceptance.hook(lambda f: graph_of(pr.on, flags_of(f[None])[0]), fl.on.clone(), floor=floor,
+                                   current=lambda: fl.on, label="refine",
+                                   names=lambda ids: [(pr.names[int(kept[i]) % S], int(kept[i]) // S) for i in ids])
         fl.prune("block", budget, rounds=len(kept) + 1, accept=fhook)
         flagged[kept[~fl.on]] = False
     else:
@@ -801,7 +909,7 @@ def block_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: 
     stage("refine", t0)
     pr.fixed = flagged[group]                                # a kept block's subcomponents stay whole
     if acceptance is not None:
-        hook, _ = acceptance.hook(graph_of, pr.on.clone(), floor=floor)
+        hook, _ = acceptance.hook(graph_of, pr.on.clone(), floor=floor, current=lambda: pr.on, label="subcomponents", names=names)
     for level in levels:
         t0 = time.perf_counter()
         pr.prune(level, budget, accept=hook)
@@ -887,7 +995,8 @@ class Connector:
         if self.acceptance is not None:                      # the search-split terms of the stated graph ("changed" from
             terms, base = self.acceptance.hook(              # one plan of the node set's, changed_edges; with blocks the
                 lambda e: self.graph(on, [x for x, k_ in zip(ep.edges, e.tolist()) if k_]), ep.on,   # graphs as stated:
-                None if self.blocks else (lambda ons: (ep.graph, ons)))   # ep.graph holds a block's subcomponents alone
+                None if self.blocks else (lambda ons: (ep.graph, ons)),   # ep.graph holds a block's subcomponents alone
+                current=lambda: ep.on, label="connections", names=lambda ids: [ep.edges[i] for i in ids])
             accept, start = both(accept, terms), {**start, **base}
 
         def state(kl, e_on, removed):
@@ -921,12 +1030,13 @@ class Connector:
 
         def graph_of(ton):
             return self.graph(on, kept, [toks[i] for i in ton.nonzero().flatten().tolist()])
-        hook, _ = self.acceptance.hook(graph_of, torch.ones(len(toks), dtype=torch.bool, device=on.device), floor=floor)
 
         def rank(ons):                                       # the smallest margin over the floors, largest first
             got = self.acceptance.scores([graph_of(x) for x in ons])
             return [-min([r[k] - f for k, f in floor.items() if r.get(k) is not None] or [0.0]) for r in got]
         td = Flags(len(toks), 0.0, rank, ACCEPT_BATCH, on.device)
+        hook, _ = self.acceptance.hook(graph_of, td.on.clone(), floor=floor, current=lambda: td.on, label="tokens",
+                                       names=lambda ids: [toks[i] for i in ids])
         single = td.blocks
         td.blocks = lambda level: ([td.on.nonzero().flatten()[pos[td.on] == p] for p in torch.unique(pos[td.on]).tolist()]
                                    if level == "position" else single(level))
@@ -1141,14 +1251,15 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           from_path: dict | None = None, edges_at: str = "pick", max_nodes: int | None = MAX_NODES, tokens=None,
           max_tokens: int = components.ANSWER_BUDGET, repair_pool: dict | None = None, vpd_edges: bool = False,
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
-          accept: tuple = (), pairs: bool = False, accept_mode: str = "pp") -> tuple[dict, dict]:
+          accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
+          accept_draws: str = "fixed") -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
     in place of the F1 search, top-k and joint path. tokens: text -> its token count, for the answer budget."""
     t0 = time.perf_counter()
     nat = ge.nat
-    tx = ge.text(ids, targets)
+    tx = ge.text(ids, targets, seed)                         # (the task's seed: its draws keyed as the scorer's)
     if vpd_answer is not None:                                # VPD's answer computed where the causal-importance network is
         tx.vpd = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
         for n, (t, c) in vpd_answer.items():
@@ -1178,7 +1289,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     row = {"T": tx.T, "convention": CONVENTION, "vpd_size": len(pr.nodes), "vpd_positions": int(torch.unique(pr.t).numel()),
            "kl_empty": empty, "kl_vpd": vpd, "budget_kl": budget, "active_scale": active, "levels": {}}
-    acceptance = Acceptance(ge, tx, accept, accept_mode) if accept else None
+    acceptance = Acceptance(ge, tx, accept, accept_mode, accept_draws) if accept else None
     as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
 
     if f1_start == "influential":                            # the influential-blocks search (block_search) and its wiring
@@ -1206,12 +1317,13 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         row["seconds"] = time.perf_counter() - t0
         print(f"  {tx.T} tokens: {len(bl)} blocks, {g.count() - len(bl)} subcomponents, F1 {f1_b}, N {n_b}, "
               f"{row['blocks'].get('accept')}, {row['blocks']['bits']:.0f} bits", flush=True)
-        return circuits, row, {"blocks": row["blocks"]}
+        return circuits, row, {"blocks": row["blocks"], "refused": acceptance.refused if acceptance is not None else []}
 
     def search(levels, label):
         hook = None
         if acceptance is not None:                           # the search-split terms, floors from this search's start
-            hook, row["levels"][f"{label}accept_start"] = acceptance.hook(as_nodes, pr.on.clone())
+            hook, row["levels"][f"{label}accept_start"] = acceptance.hook(as_nodes, pr.on.clone(), current=lambda: pr.on,
+                                                                          label=f"{label}nodes", names=lambda ids: [pr.nodes[i] for i in ids])
         for level in levels:
             t1 = time.perf_counter()
             rounds = pr.prune(level, budget, accept=hook)
@@ -1384,6 +1496,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
                  "f1_index": f1_on.nonzero().flatten().tolist(), "top_k": k}
     if edges:
         path_file["edge_paths"] = edge_paths
+    if acceptance is not None:
+        path_file["refused"] = acceptance.refused
     return circuits, row, path_file
 
 
@@ -1406,6 +1520,10 @@ def main():
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
     ap.add_argument("--accept-mode", choices=tuple(TRACK), default="pp", help="--accept changed's term: pp (s_track_pp, "
                     "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")
+    ap.add_argument("--accept-draws", choices=("fixed", "discriminating"), default="fixed",
+                    help="--accept changed's draws in pp mode: the search split's fixed ones, or per check a fresh sample of "
+                         "64 from a pool disjoint from eval, each candidate judged on the 16 where it and the current circuit "
+                         "disagree most (refused removals in <task>.path.json)")
     ap.add_argument("--pairs", action="store_true", help="with --edges, the written circuit states its query-key pairs "
                     "(state_pairs: rustmove's greedy, read by read, within the F1 budget)")
     ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "
@@ -1481,7 +1599,7 @@ def main():
                                          args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
                                          args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
-                                         args.accept_mode)
+                                         args.accept_mode, native.task_seed(path.stem), args.accept_draws)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

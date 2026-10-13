@@ -1717,7 +1717,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             if retain_calibration:
                 info["calibration_evidence"] = calibration_evidence(c, split)
             if lines:
-                loo = ge.line_loo(tx, graphs[i], pool, split=split or "search", bits_start=tau.get("bits_start"), base=c)
+                loo = (ge.line_loo(tx, graphs[i], pool, split=split or "search", bits_start=tau.get("bits_start"), base=c)
+                       if graphs[i].count() else {"bits": b, "lines": []})  # an empty circuit has no lines to credit
                 info["lines"] = line_credit(texts[i], p, loo, le.get(i), info, e2g.get(i), e4.get(i))
         if invariants:
             info["invariant_diagnostic"] = (invariant_diagnostic(ge, tx, p["answer"], task["model"]) if valid[i]

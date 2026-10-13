@@ -591,7 +591,9 @@ class Tools:
         pt = tau.get("phi_tau")
         comp = goal_eval.compact(bits, tau.get("bits_start"))
         gate = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (ph - pt)))
+        ct = goal_eval.circuit_term(row, tau, bits)          # the reward's own circuit term and its hard shortfall
         return {"phi": _r(ph), "bar": _r(pt), "gate": _r(gate, 2), "compact": _r(comp), "reward": _r((ph or 0.0) + (gate or 0.0) * 0.5 * (comp or 0.0)),
+                "term": _r(ct["term"]), "shortfall": _r(ct["v"], 4),
                 "families": {f: _r(goal_eval.family_score(row, f), 2) for f in (tau.get("families") or goal_eval.PHI_FAMILIES)}}
 
     def run_circuit(self, circuit=None, nodes=None, edges=None, positions=None, complete=None, changes=None, _json=None,
@@ -946,7 +948,10 @@ class Scripted:
     for every later draft, inherited, never re-measured). accept="reward" (the default) judges by the reward itself on
     the tools' draws (run_circuit families: phi, the bar, compactness): the start is the m with the best phi, and below
     the cap a turn keeps its drop with the highest circuit reward when that beats the current draft's; accept="pp"
-    keeps the pp and point tolerance above (FLOOR and TOLERANCE)."""
+    keeps the pp and point tolerance above (FLOOR and TOLERANCE); accept="teacher" (env F's scripted gate, the lead's
+    10-13) values a draft by the reward's own circuit term (goal_eval.circuit_term on the tools' draws) when no family
+    is under its floor (shortfall 0), else not at all: the start is the best such candidate, and a drop is kept when its
+    term beats the draft's, as teacher.set_search keeps a removal and picks a stage."""
 
     FLOOR = 0.9
     TOLERANCE = 0.05
@@ -959,13 +964,19 @@ class Scripted:
         self.max_turns, self.max_calls, self.rank, self.accept, self.gen, self.trace = max_turns, max_calls, rank, accept, None, []
 
     def _run(self, **args) -> dict:
-        return _call("run_circuit", **args, **({"families": True} if self.accept == "reward" else {}))
+        return _call("run_circuit", **args, **({"families": True} if self.accept in ("reward", "teacher") else {}))
 
-    @staticmethod
-    def _value(sc: dict) -> float:
-        """A draft's circuit reward on the tools' draws (families), -inf when it has none."""
+    def _value(self, sc: dict) -> float:
+        """A draft's value on the tools' draws (families), -inf when it has none: accept "reward", its circuit reward;
+        "teacher", the reward's own circuit term when no family is under its floor (shortfall 0), else -inf, as the
+        teacher keeps a removal (teacher.set_search's floors and pick)."""
+        if "error" in sc:
+            return -math.inf
+        if self.accept == "teacher":
+            t, v = sc.get("term"), sc.get("shortfall")
+            return -math.inf if t is None or v is None or v > 0 else float(t)
         v = sc.get("reward")
-        return -math.inf if v is None or "error" in sc else float(v)
+        return -math.inf if v is None else float(v)
 
     def _rank(self, draft: str) -> dict:
         return (_call("node_effects", draft=draft, top=8) if self.rank == "effects" else
@@ -1005,7 +1016,9 @@ class Scripted:
         turns, calls = turns + 1, calls + len(got)
         for m, sc in enumerate(got):
             self._keep(sc, m=m)
-        if self.accept == "reward":  # the start: the best phi on the tools' draws (above the cap it is pruned to it)
+        if self.accept == "teacher":  # the start: the best circuit term at shortfall 0, else the best term
+            m = max(range(len(got)), key=lambda j: (self._value(got[j]), -math.inf if got[j].get("term") is None else got[j]["term"], -j))
+        elif self.accept == "reward":  # the start: the best phi on the tools' draws (above the cap it is pruned to it)
             m = max(range(len(got)), key=lambda j: (-math.inf if got[j].get("phi") is None else got[j]["phi"], -j))
         else:
             ok = [m for m, sc in enumerate(got) if (sc.get("pp") or 0) >= self.FLOOR and sc.get("draft")]
@@ -1022,7 +1035,7 @@ class Scripted:
         if not ranked:  # no order at all: the best start candidate within the cap, unpruned
             fit = [j for j, sc in enumerate(got) if sc.get("draft") and 0 < (sc.get("nodes") or 0) <= cap]
             if fit:
-                j = (max(fit, key=lambda j: (-math.inf if got[j].get("phi") is None else got[j]["phi"], -j)) if self.accept == "reward"
+                j = (max(fit, key=lambda j: (-math.inf if got[j].get("phi") is None else got[j]["phi"], -j)) if self.accept in ("reward", "teacher")
                      else max(fit, key=lambda j: ((got[j].get("pp") or 0), -j)))
                 score = got[j]
                 draft, size = score["draft"], score["nodes"]
@@ -1055,7 +1068,7 @@ class Scripted:
             got = yield self._msg(*[self._run(base=draft, drop_least=n) for n in sizes])
             turns, calls = turns + 1, calls + len(sizes)
             kept = None
-            if self.accept == "reward":  # the drop with the best circuit reward on the tools' draws, when it beats the draft's
+            if self.accept in ("reward", "teacher"):  # the drop of the best value on the tools' draws, when it beats the draft's
                 best = max(range(len(got)), key=lambda j: (self._value(got[j]), sizes[j]))
                 if self._value(got[best]) > self._value(score) and got[best].get("draft"):
                     kept = (sizes[best], got[best])
@@ -1160,18 +1173,19 @@ def bench(env: Env, tids: list[str], log=print, score: bool = True) -> dict:
     return out
 
 
-def scripted(env: Env, tids: list[str], out: Path, log=print, rank: str = "effects", accept: str = "reward") -> list[dict]:
+def scripted(env: Env, tids: list[str], out: Path, log=print, rank: str = "effects", accept: str = "reward",
+             max_calls: int = MAX_CALLS) -> list[dict]:
     """The scripted baseline's episodes on texts, each beside the influential start on the score split (its phi from
-    tau, its s_track_pp and bits), one JSON line each."""
+    tau, its s_track_pp and bits), one JSON line each; max_calls, the policy's own call budget (R against calls)."""
     res = []
     for tid in tids:
-        pol = Scripted(rank=rank, accept=accept)
+        pol = Scripted(rank=rank, accept=accept, max_calls=max_calls)
         r = run_episode(env, tid, pol)
         tools = env.text_tools(tid)
         tx = tools.tx
         tau = env.ge.tau(tx, env.pool, env.score_split)
         st = env.ge.start_set(tx, env.score_split)
-        row = {**r, "rank": rank, "accept": accept, "trace": pol.trace,
+        row = {**r, "rank": rank, "accept": accept, "max_calls": max_calls, "trace": pol.trace,
                "start": {"phi": tau["phi_start"], "phi_tau": tau["phi_tau"], "bits": tau["bits_start"], "s_track_pp": st["s_track_pp"],
                          "nodes": tau["nodes_start"], "m": tau["m_start"]},
                "answer": r.get("answer_expanded") or r["messages"][-1]["content"]}
@@ -1366,7 +1380,9 @@ def main():
     s.add_argument("--out", required=True)
     s.add_argument("--score-split", default="eval")
     s.add_argument("--rank", default="effects", choices=["effects", "removal"], help="the scripted policy's node order")
-    s.add_argument("--accept", default="reward", choices=["reward", "pp"], help="the scripted policy's acceptance: the reward on the tools' draws, or pp/point tolerance")
+    s.add_argument("--accept", default="reward", choices=["reward", "pp", "teacher"], help="the scripted policy's acceptance: the "
+                   "reward on the tools' draws, pp/point tolerance, or teacher (the circuit term at shortfall 0)")
+    s.add_argument("--max-calls", type=int, default=MAX_CALLS, help="the scripted policy's own call budget (at most MAX_CALLS)")
     t = sub.add_parser("tokens")
     t.add_argument("rows")
     t.add_argument("--tasks", nargs="+", required=True)
@@ -1392,7 +1408,7 @@ def main():
     if a.cmd == "bench":
         bench(env, _tasks(a.tasks), score=not a.no_score)
     elif a.cmd == "scripted":
-        scripted(env, _tasks(a.tasks), Path(a.out), rank=a.rank, accept=a.accept)
+        scripted(env, _tasks(a.tasks), Path(a.out), rank=a.rank, accept=a.accept, max_calls=min(a.max_calls, MAX_CALLS))
     elif a.cmd == "baselines":
         baselines(env, Path(a.episodes), Path(a.out))
     else:

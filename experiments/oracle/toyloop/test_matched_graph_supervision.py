@@ -87,7 +87,7 @@ class PairedDataTest(unittest.TestCase):
         payload = json.loads(serialized)
         self.assertEqual(trial.digest(payload), digest)
         for arm in trial.ARMS:
-            restored = tinker.Datum.model_validate(payload["data"][arm][0])
+            restored = trial.restore_datum(payload["data"][arm][0])
             self.assertEqual(trial.datum_digest(restored), trial.datum_digest(data[arm][0]))
         restored_prompt = tinker.ModelInput.model_validate(payload["prompts"][0])
         self.assertEqual(restored_prompt.to_ints(), prompt.to_ints())

@@ -68,6 +68,28 @@ def datum_digest(datum):
                             for key, value in datum.loss_fn_inputs.items()}})
 
 
+def serialize_datum(datum):
+    # SDK 0.33.1 Datum/TensorData are dataclasses, while ModelInput is Pydantic.
+    if datum.model_input_spans is not None or datum.loss_fn_input_spans is not None:
+        raise ValueError("unexpected provenance spans in prepared supervision")
+    return {"model_input": datum.model_input.model_dump(mode="json"),
+            "loss_fn_inputs": {key: {"data": value.data, "dtype": value.dtype,
+                                     "shape": value.shape,
+                                     "sparse_crow_indices": value.sparse_crow_indices,
+                                     "sparse_col_indices": value.sparse_col_indices}
+                               for key, value in datum.loss_fn_inputs.items()}}
+
+
+def restore_datum(value):
+    import tinker
+    from tinker.types.tensor_data import TensorData
+    if set(value) != {"model_input", "loss_fn_inputs"}:
+        raise ValueError("unexpected serialized datum fields")
+    return tinker.Datum(model_input=tinker.ModelInput.model_validate(value["model_input"]),
+                        loss_fn_inputs={key: TensorData(**tensor)
+                                        for key, tensor in value["loss_fn_inputs"].items()})
+
+
 def serialize_prepared(prepared):
     """Freeze API inputs offline so the later client need not load a tokenizer.
 
@@ -85,7 +107,7 @@ def serialize_prepared(prepared):
     if [digest(p.to_ints()) for p in prompts] != [r["rendered_sha256"] for r in contract["panel"]]:
         raise ValueError("evaluation prompts changed after preparation")
     payload = {"schema_version": 1, "contract": contract,
-               "data": {arm: [d.model_dump(mode="json") for d in data[arm]] for arm in ARMS},
+               "data": {arm: [serialize_datum(d) for d in data[arm]] for arm in ARMS},
                "prompts": [p.model_dump(mode="json") for p in prompts],
                "batches": prepared["batches"],
                "stop_sequences": prepared["renderer"].get_stop_sequences()}

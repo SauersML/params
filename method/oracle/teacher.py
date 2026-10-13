@@ -712,8 +712,10 @@ class Acceptance:
     fitted); "fv", fresh draws from one half of search_pool with the other half's fixed sample the validation set
     (validation(), Validated); each refused removal kept in refused with those draws."""
 
-    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds, mode: str = "pp", draws: str = "fixed"):
-        self.ge, self.tx, self.kinds, self.mode, self.calls = ge, tx, tuple(kinds), mode, 0
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds, mode: str = "pp", draws: str = "fixed",
+                 pool: dict | None = None):
+        self.ge, self.tx, self.kinds, self.mode, self.calls, self.pool_adv = ge, tx, tuple(kinds), mode, 0, pool
+        self._phi_base = {}                                  # (the current circuit's key) -> its reward-mode row
         self.draws, self.refused, self.pool = draws, [], None
         if draws in ("discriminating", "fresh", "fv") and mode != "pp":
             raise ValueError("discriminating draws score s_track_pp: mode pp")
@@ -788,6 +790,31 @@ class Acceptance:
         """A state's sample key (a hash of its unit set's bytes; with the text's seed and 23, the check's rng seed)."""
         return 0 if state is None else int(hashlib.sha256(state.detach().to("cpu", torch.uint8).numpy().tobytes()).hexdigest()[:15], 16)
 
+    def phi_of(self, graph: native.Graph, variants: list, bar) -> list:
+        """Each variant's phi (goal_eval.GoalEval.phi_variants against the reward's bar): variants are subgraphs of graph
+        (a variant keeps graph's lines it holds: nodes, connections, token edges), graph's reward-mode row computed once
+        per graph (kept by the graph's lines)."""
+        ge, tx = self.ge, self.tx
+        lines = ge.loo_lines(tx, graph)
+        key = repr(lines)
+        if key not in self._phi_base:
+            self._phi_base = {key: ge.fidelity(tx, [goal_eval.strand(graph, tx.targets, ge.nat.C)], self.pool_adv, mode="reward",
+                                               split="search", interchange=8, changed=8)[0]}
+
+        def held(h):                                         # a variant's lines as sets
+            g_ = goal_eval.strand(h, tx.targets, ge.nat.C)
+            nodes = set(g_.node_set())
+            edges = set() if g_.complete else set(goal_eval._pairs(g_))
+            toks = set(getattr(g_, "tok_edges", [])) | {(t, None) for t in getattr(g_, "tok_out", [])}
+            return nodes, edges, toks, g_.complete
+        keep = []
+        for h in variants:
+            nodes, edges, toks, complete = held(h)
+            keep.append([x in nodes if kind == "node" else (complete or x in edges) if kind == "edge" else (complete or x in toks)
+                         for kind, x in lines])
+        got = ge.phi_variants(tx, graph, torch.tensor(keep, dtype=torch.bool), self.pool_adv, base=self._phi_base[key], start=bar)
+        return [v["phi"] for v in got["variants"]]
+
     def validation(self, graph: native.Graph) -> float | None:
         """A circuit's s_track_pp on the fixed validation draws (the other half of search_pool, at most POOL_DRAWS)."""
         val = self._halves()[1]
@@ -802,6 +829,8 @@ class Acceptance:
         engine.Engine.path_patched call)."""
         out = [{} for _ in graphs]
         for k in self.kinds:
+            if k == "phi":                                   # (hook's own: phi_variants against the current circuit)
+                continue
             fn, keys = ACCEPT[k]
             if k == "changed":
                 keys = (TRACK[self.mode],)
@@ -840,18 +869,24 @@ class Acceptance:
         floor, the floors (default min(0.9, the start's terms)). With discriminating draws: current() the unit set the
         candidates are removals from (default start), label and names(unit ids) naming a refused removal."""
         disc = self.draws in ("discriminating", "fresh", "fv") and "changed" in self.kinds and bool(self._halves()[0])
-        rest = Acceptance(self.ge, self.tx, [k for k in self.kinds if not (disc and k == "changed")], self.mode)
+        by_phi = "phi" in self.kinds
+        rest = Acceptance(self.ge, self.tx, [k for k in self.kinds if not (disc and k == "changed") and k != "phi"], self.mode)
         current = current or (lambda: start)
 
         def run(ons):
             return rest.scores([graph_of(on) for on in ons], None if edges_of is None else edges_of(ons)) if rest.kinds \
                 else [{} for _ in ons]
         base = run(start[None])[0]
+        if by_phi:                                           # phi itself (monitorbench's phi_variants): the start's
+            bar = self.ge.tau(self.tx, self.pool_adv, "search")["phi_tau"]   # phi, and floor min(it, the bar) + log2 0.95
+            base["phi"] = self.phi_of(graph_of(start), [graph_of(start)], bar)[0]
         if disc:                                             # the start on a fresh sample, every draw
             got, ws = self._per_draw([graph_of(start)], self._sample(start))
             base["s_track_pp"] = self._pooled(got[0], ws, range(len(ws)))
         if floor is None:
             floor = {k: floor_of(v) for k, v in base.items()}
+        if by_phi and base.get("phi") is not None:
+            floor["phi"] = min(base["phi"], bar) + PHI_SLACK
 
         def judge(ons):                                      # the changed term on the draws each candidate is most at
             now = current()                                  # odds with the current circuit on
@@ -875,6 +910,26 @@ class Acceptance:
             return out
 
         def accept(ons):
+            if by_phi:                                       # phi first, the other terms on the survivors
+                ph = self.phi_of(graph_of(current()), [graph_of(on) for on in ons], bar)
+                first = [{"phi": x} if x is not None and x >= floor["phi"] else None for x in ph]
+                for i, on in enumerate(ons):
+                    if first[i] is None:
+                        now = current()
+                        removed = (now & ~on).nonzero().flatten().tolist() if now.shape == on.shape else []
+                        self.refused.append({"stage": label, "removed": names(removed) if names else removed, "phi": ph[i],
+                                             "floor": floor["phi"]})
+                alive = [i for i, r in enumerate(first) if r is not None]
+                if not alive:
+                    return first
+                sub = ons[torch.tensor(alive, dtype=torch.long, device=ons.device)]
+                rows = judge(sub) if disc else run(sub)
+                for i, r in zip(alive, rows):
+                    if r is None or not all(floor.get(k) is None or r.get(k) is None or r[k] >= floor[k] for k in r):
+                        first[i] = None
+                    else:
+                        first[i].update(r)
+                return first
             if not disc:
                 return [r if all(floor.get(k) is None or r.get(k) is None or r[k] >= floor[k] for k in r) else None for r in run(ons)]
             first = judge(ons)
@@ -949,12 +1004,66 @@ class Validated:
 
 
 SET_LEVELS = ("site", "chunk16", "chunk4", "subcomponent")  # the influential set's levels, coarse first
+GROW_DRAWS = 16       # --grow: changed texts whose VPD actives at the start's positions are the candidates
+
+
+def grow_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, positions: list, pool: dict, log=print) -> dict | None:
+    """--grow (the lead's 10-12, v2.1: about 6 of 20 dev starts sit below the reward's bar and pruning cannot raise
+    them): a start below the bar (phi_tau) grows by the family carrier at its positions, VPD's active subcomponents
+    on the text and on GROW_DRAWS changed texts of the search split's pool (search_pool's ranked draws first: the
+    inactive-on-x responders inframove found among them), in groups of one site at one position, each step adding the
+    group that raises phi most (GoalEval.phi_variants over the union of the start and every candidate, one call a
+    step) while phi rises and stays below the bar. {"added": nodes, "phi_start", "phi", "bar", "groups", "candidates",
+    "inactive"} or None (the start at the bar, or no candidate)."""
+    nat, P = ge.nat, set(positions)
+    bar = ge.tau(tx, pool, "search")["phi_tau"]
+    have = set(nodes)
+    r0, r2, sampled = search_pool(ge, tx, parts=True)
+    draws = (r0 + r2 + sampled)[:GROW_DRAWS]
+    cand = set()
+    for p, z in draws:
+        x2 = list(tx.ids)
+        x2[p] = z
+        m = ge.vpd_answer(x2, tx.targets)
+        if m is None:
+            return None
+        cand |= {(n, int(t), int(c)) for n in nat.names for t, c in m[n].nonzero().tolist() if int(t) in P}
+    cand -= have
+    if not cand:
+        return None
+    union = native.Graph(sorted(have | cand), complete=True)
+    groups = {}
+    for nd in sorted(cand):
+        groups.setdefault((nd[0], nd[1]), []).append(nd)
+    keys = list(groups)
+    base = ge.fidelity(tx, [union], pool, mode="reward", split="search", interchange=8, changed=8)[0]
+    phi0 = ge.phi_variants(tx, union, ge.keep_of(tx, union, [sorted(have)]), pool, base=base, start=bar)["variants"][0]["phi"]
+    out = {"phi_start": phi0, "bar": bar, "candidates": len(cand), "groups": len(keys),
+           "inactive": sum(not bool(tx.vpd[n][t, c]) for n, t, c in cand), "added": [], "steps": []}
+    if phi0 is None or bar is None or phi0 >= bar + PHI_SLACK:
+        return None
+    cur, ph = set(have), phi0
+    while keys:
+        got = ge.phi_variants(tx, union, ge.keep_of(tx, union, [sorted(cur | set(groups[k])) for k in keys]), pool,
+                              base=base, start=bar)["variants"]
+        j = max(range(len(keys)), key=lambda i: got[i]["phi"] if got[i]["phi"] is not None else -1e9)
+        if got[j]["phi"] is None or got[j]["phi"] <= ph:
+            break
+        cur |= set(groups[keys[j]])
+        ph = got[j]["phi"]
+        out["steps"].append([keys[j][0], keys[j][1], len(groups[keys[j]]), ph])
+        log(f"  grow: + {keys[j][0]}@{keys[j][1]} ({len(groups[keys[j]])}), phi {ph:.3f} (bar {bar:.3f})", flush=True)
+        keys.pop(j)
+        if ph >= bar + PHI_SLACK:
+            break
+    out["added"], out["phi"] = sorted(cur - have), ph
+    return out
 SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its own log recovery (fleet's 9004 finding)
 
 
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
                acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS,
-               phi_pool: dict | None = None, phi_log: bool = False) -> tuple:
+               phi_pool: dict | None = None, phi_log: bool = False, grow: bool = False) -> tuple:
     """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): goal_eval.GoalEval.start_set
     (VPD's active subcomponents at the targets and the m most influential positions, every connection; search split
     s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
@@ -966,12 +1075,16 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     start = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
     for n, t, c in st["graph"].node_set():
         start[n][t, c] = True
+    grown = grow_start(ge, tx, sorted(st["graph"].node_set()), st["positions"], phi_pool, log) if grow and phi_pool is not None else None
+    if grown is not None:
+        for n, t, c in grown["added"]:
+            start[n][t, c] = True
     pr = Pruner(ge, tx, start, live=CONVENTION == "live", B=B)
     graph_of = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
     kl0 = pr.kl()                                            # the F1 budget, or losing at most 5% of the start's log
     budget = max(budget, kl_budget(empty, kl0, SET_RECOVERY))  # recovery (a start over it: text6011, 9004 pruned nothing)
     rec = {"m": st["m"], "positions": st["positions"], "start_s_track_pp": st["s_track_pp"], "start_units": len(pr.nodes),
-           "stages": [], "validation": [], "budget": budget}
+           "stages": [], "validation": [], "budget": budget, "grow": {k: v for k, v in (grown or {}).items() if k != "added"} or None}
 
     snaps = []
 
@@ -1513,7 +1626,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
           accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
           accept_draws: str = "fixed", phi_pool: dict | None = None, context: str = "refine",
-          phi_log: bool = False) -> tuple[dict, dict]:
+          phi_log: bool = False, grow: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -1550,12 +1663,13 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     row = {"T": tx.T, "convention": CONVENTION, "vpd_size": len(pr.nodes), "vpd_positions": int(torch.unique(pr.t).numel()),
            "kl_empty": empty, "kl_vpd": vpd, "budget_kl": budget, "active_scale": active, "levels": {}}
-    acceptance = Acceptance(ge, tx, accept, accept_mode, accept_draws) if accept else None
+    acceptance = Acceptance(ge, tx, accept, accept_mode, accept_draws, pool=phi_pool) if accept else None
     as_nodes = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
 
     if f1_start in ("influential", "set"):                   # the influential-blocks search (block_search) or the
         if f1_start == "set":                                # influential set pruned (set_search), and its wiring
-            g, pb, _, _, row["blocks"] = set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, phi_log=phi_log)
+            g, pb, _, _, row["blocks"] = set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, phi_log=phi_log,
+                                                    grow=grow)
         else:
             g, pb, _, _, row["blocks"] = block_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, context=context)
         bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
@@ -1809,6 +1923,8 @@ def main():
                     "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")
     ap.add_argument("--phi-check", action="store_true", help="with --f1-start influential, the circuit checked against the "
                     "reward's bar (goal_eval.phi >= phi_tau on the search split, the adversary's pool), backing off a stage at a time")
+    ap.add_argument("--grow", action="store_true", help="with --f1-start set: a start below the reward's bar grows by the "
+                    "family carrier (VPD's actives on changed texts at its positions) while phi rises (grow_start)")
     ap.add_argument("--phi-log", action="store_true", help="with --phi-check: every stage scored, each phi family's score "
                     "in the row (which families pruning lowers)")
     ap.add_argument("--accept-draws", choices=("fixed", "discriminating", "fresh", "fv"), default="fixed",
@@ -1879,8 +1995,9 @@ def main():
             r = json.loads(line)
             labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
+    phi_pool_needed = args.phi_check or args.phi_log or args.grow or "phi" in args.accept.split(",")
     args.phi_check = args.phi_check or args.phi_log
-    pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" or args.phi_check else None
+    pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" or phi_pool_needed else None
     for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
             continue
@@ -1899,8 +2016,8 @@ def main():
                                          args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
                                          args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
-                                         args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if args.phi_check else None,
-                                         args.context, args.phi_log)
+                                         args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if phi_pool_needed else None,
+                                         args.context, args.phi_log, args.grow)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

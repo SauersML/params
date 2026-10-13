@@ -41,6 +41,7 @@ import json
 import os
 import pickle
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -51,7 +52,7 @@ sys.path.insert(0, os.environ.get("ORACLE") or str(HERE.parents[2] / "method" / 
 
 DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/generality"))  # inputs and outputs
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts/vpd4l"
-POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt"
+POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
 MISTAKES = 20
 SCAN = 2000  # train texts scanned for the mistakes slice (in order, until MISTAKES are found)
 L = lambda layer, kind: f"h.{layer}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"  # noqa: E731
@@ -188,16 +189,23 @@ def equal_bits(ge, tx, bits: float, kind: str):
             mid = (lo + hi + 1) // 2
             lo, hi = (mid, hi) if cost(mid) <= bits else (lo, mid - 1)
         return native.Graph(order[:lo], complete=True), lo
-    acts = lambda m: [(n, p, int(c)) for p in range(max(0, t - m), t + 1) for n in nat.names  # noqa: E731
-                      for c in tx.vpd[n][p].nonzero().flatten().tolist()]
+    per = [[(n, p, int(c)) for n in nat.names for c in tx.vpd[n][p].nonzero().flatten().tolist()] for p in range(t + 1)]
+    acts = lambda m: [nd for p in range(max(0, t - m), t + 1) for nd in per[p]]  # noqa: E731
     cost = lambda m: goal_eval.size_bits(native.Graph(acts(m), complete=True), P, S, tx.targets)  # noqa: E731
-    m = 0
-    while m < t and cost(m + 1) <= bits:
-        m += 1
-    return native.Graph(acts(m), complete=True), m
+    lo, hi = 0, t  # the largest m whose bits are not above bits (bits grow with m)
+    if cost(hi) <= bits:
+        return native.Graph(acts(hi), complete=True), hi
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if cost(mid) <= bits else (lo, mid - 1)
+    return native.Graph(acts(lo), complete=True), lo
 
 
 def score(e: dict):
+    import faulthandler
+    import signal
+
+    faulthandler.register(signal.SIGUSR1)  # kill -USR1 PID prints every thread's stack
     import goal_eval
     import native
     import torch
@@ -211,6 +219,17 @@ def score(e: dict):
     # of thousands of subcomponents; it is left out for all of them alike
     ge._edge_family = lambda tx, graphs, draws, reads=False: [{"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None}
                                                              for _ in graphs]
+    sides0 = ge._sides  # and the reward mode's node reads (a diagnostic outside phi): tens of thousands of nodes per draw
+
+    def sides(tx_, graphs_):
+        f = sides0(tx_, graphs_)
+
+        def run(g, cuts=None, patch=None, reads=False):
+            got = f(g, cuts=cuts, patch=patch, reads=False)
+            return (*got, {}, {}) if reads else got
+        return run
+    ge._sides = sides
+    t0 = time.perf_counter()
     tx = text_of(ge, e)
     t, a = e["t"], e["a"]
     tact = [(n, t, int(c)) for n in nat.names for c in tx.vpd[n][t].nonzero().flatten().tolist()]
@@ -238,11 +257,13 @@ def score(e: dict):
             graphs[f"ref_{kind}_{lab}_bits"] = g
             bits[f"ref_{kind}_{lab}_bits"] = cscore.bits_active(ge, tx, g)
     names = list(graphs)
-    pool = torch.load(POOL) if POOL.exists() else None
+    print(e["task"], "circuits built", round(time.perf_counter() - t0), "s", flush=True)
+    pool = torch.load(POOL, weights_only=False) if POOL.exists() else None
     rows = []
     for k in names:  # one at a time: the engine spans its call's columns
         rows += ge.fidelity(tx, [graphs[k]], pool=pool, mode="reward", split="eval")
         native.free(nat.dev)
+        print(e["task"], k, "scored", round(time.perf_counter() - t0), "s", flush=True)
     with out_path("falsify").open("a") as f:
         for k, r in zip(names, rows):
             ph = goal_eval.phi(r)[0]
@@ -298,6 +319,52 @@ def variables_test(e: dict):
         f.write(json.dumps({k: (float(v) if isinstance(v, (int, float)) and v is not None and not isinstance(v, bool) else v)
                             for k, v in row.items()}) + "\n")
     print(e["task"], row, flush=True)
+
+
+def values_test(kind: str = "copy"):
+    """Value maps the model does not run, on the copy texts (model runs alone): for fresh tokens z at a (16 per text,
+    never the model's three likeliest there), the identity map (the prediction becomes z), a random balanced
+    partition of the vocabulary and token-id parity (same-class z leaves the prediction, other-class z moves it).
+    -> DATA/falsify_values.jsonl, one line per text."""
+    import goal_eval
+    import native
+
+    nat = native.Native()
+    ge = goal_eval.GoalEval(nat)
+    d = json.loads((DATA / "falsify_texts.json").read_text())
+    out = out_path("falsify_values")
+    done = {json.loads(line)["task"] for line in out.read_text().splitlines()} if out.exists() else set()
+    for e in d["texts"] if kind == "copy" else d["mistakes"]:
+        if e["task"] in done:
+            continue
+        ids, _ = native.text(TEXTS / f"{e['task']}.json")
+        ids = ids[:e["t"] + 1]
+        from types import SimpleNamespace
+
+        tx = SimpleNamespace(ids=ids, seed=native.task_seed(f"{e['task']}:{e['t']}"))  # _fresh_sources reads only these
+        t, a = e["t"], e["a"]
+        base = nat.reference([ids], [t])[0, 0]
+        y = int(base.argmax())
+        zs = ge._fresh_sources(tx, a, int(tx.seed) + 21)[:16]
+        xs = []
+        for z in zs:
+            x2 = list(ids)
+            x2[a] = z
+            xs.append(x2)
+        lp = nat.reference(xs, [t])[:, 0]
+        part = rng_of("partition", e["task"]).integers(2, size=lp.shape[-1])
+        rec = {"identity": [], "random_partition": [], "parity": []}
+        for z, l in zip(zs, lp):
+            new = int(l.argmax())
+            rec["identity"].append(new == z)
+            for name, cls in (("random_partition", lambda v: int(part[v])), ("parity", lambda v: v % 2)):
+                same = cls(z) == cls(ids[a])
+                rec[name].append((new == y) if same else (new != y))
+        row = {"kind": e["kind"], "task": e["task"], "t": t, **{k: float(np.mean(v)) for k, v in rec.items()}, "n": len(zs)}
+        with out.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        print(e["task"], row, flush=True)
+        native.free(nat.dev)
 
 
 def entries():
@@ -371,7 +438,7 @@ def report():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("build", "score", "vars", "report"))
+    ap.add_argument("cmd", choices=("build", "score", "vars", "values", "report"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     if a.cmd == "build":
@@ -380,5 +447,7 @@ if __name__ == "__main__":
         score(find(*a.args))
     elif a.cmd == "vars":
         variables_test(find(*a.args))
+    elif a.cmd == "values":
+        values_test(*a.args)
     else:
         report()

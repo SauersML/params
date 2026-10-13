@@ -53,7 +53,8 @@ LN2 = math.log(2)
 ROWS = (5000, 6000)  # behaviours.py's split B and thirds
 THIRDS = {"fit": (5000, 5333), "val": (5333, 5666), "score": (5666, 6000)}
 CAP = {"fit": 24, "val": 24, "score": 64}  # instances (and controls) per third
-MIN_PAIRS = 24  # a preference's instances in the fit third, at least
+MIN_PAIRS = 16  # a preference's instances in the fit third, at least
+B_REPEAT = 2  # preferences sharing one b, at most
 POOL = 128  # subcomponents ranked by local effect
 K_SET = 8  # subcomponents per restricted set at a site
 DRAWS = 2
@@ -75,8 +76,8 @@ def _top_tokens(ee, rows: range, tokens) -> dict:
 def preferences(ee, src, k: int, decode, log=print) -> list[dict]:
     """The k most frequent (a, b), both words (a space and three or more letters: a content preference such as " United"
     -> " States", not punctuation or layout), with b the most likely token after a at least MIN_PAIRS times in the fit
-    third and predicted after other tokens at least as often (controls exist), distinct b; each a behaviour
-    (behaviours.py's dict: parts with instances, controls, rate)."""
+    third and predicted after other tokens at least as often (controls exist), at most B_REPEAT sharing one b; each a
+    behaviour (behaviours.py's dict: parts with instances, controls, rate)."""
     tops = _top_tokens(ee, range(*ROWS), src.tokens)
     pairs, b_count = {}, {}
     for r in range(*THIRDS["fit"]):
@@ -90,11 +91,11 @@ def preferences(ee, src, k: int, decode, log=print) -> list[dict]:
 
     ranked = sorted((n, a, b) for (a, b), n in pairs.items()
                     if n >= MIN_PAIRS and a != b and b_count[b] - n >= MIN_PAIRS and word(a) and word(b))
-    out, used = [], set()
+    out, used = [], {}
     for n, a, b in reversed(ranked):
-        if b in used or len(out) >= k:
+        if used.get(b, 0) >= B_REPEAT or len(out) >= k:
             continue
-        used.add(b)
+        used[b] = used.get(b, 0) + 1
         beh = {"subcomponent": ["preference", f"{a}->{b}"], "a": a, "b": b, "S": [b], "describe": {"a": decode([a]), "b": decode([b])},
                "parts": {}}
         for part, (r0, r1) in THIRDS.items():
@@ -115,7 +116,8 @@ def preferences(ee, src, k: int, decode, log=print) -> list[dict]:
 
 def circuit_sets(ee, src, beh: dict, log=print) -> dict:
     """The behaviour's subcomponents by measured local ablation effect at fit instances (behaviours.BehaviourEval
-    .local_effects over those active at two or more), and VPD's by activity count there."""
+    .local_effects over those active at two or more), VPD's by activity count there, and the controls' circuit, the same
+    ranking at the fit third's controls (b predicted after other tokens; never the score third)."""
     import behaviours
 
     be = behaviours.BehaviourEval(ee, src, beh)
@@ -125,8 +127,17 @@ def circuit_sets(ee, src, beh: dict, log=print) -> dict:
     eff = be.local_effects(nodes, [])
     order = np.argsort(-eff, kind="stable")[:POOL]
     log(f"  {len(nodes)} subcomponents active at >= 2 fit instances; best local effect {eff[order[0]]:.3f} bits")
+    # the controls' circuit, by the same teacher: b's margin at the fit third's controls (b after other tokens)
+    fit_c = beh["parts"]["fit"]
+    bc = behaviours.BehaviourEval(ee, src, {**beh, "parts": {**beh["parts"], "fit": {"instances": fit_c["controls"], "controls": [],
+                                                                                    "rate": fit_c["rate"]}}})
+    count_c = src.active_at(fit_c["controls"])
+    nodes_c = [src.node(f) for f, n in sorted(count_c.items(), key=lambda x: -x[1]) if n >= 2]
+    eff_c = bc.local_effects(nodes_c, []) if nodes_c else np.zeros(0)
+    order_c = np.argsort(-eff_c, kind="stable")[:POOL]
     return {"circuit": [[nodes[i][0], int(nodes[i][1]), float(eff[i])] for i in order],
-            "active": [[s, int(i), int(count[src.flat(s, i)])] for s, i in nodes]}
+            "active": [[s, int(i), int(count[src.flat(s, i)])] for s, i in nodes],
+            "control_circuit": [[nodes_c[i][0], int(nodes_c[i][1]), float(eff_c[i])] for i in order_c]}
 
 
 # ---- the fits
@@ -415,14 +426,22 @@ def fit_scales(net: Net, cands: list[tuple], steps: int, lam: float, keep: list,
 def fit_multi(net: Net, bases: dict, steps: int, rank: int, lam: float, keep: list, lr: float = 0.01, seed: int = 0,
               every: int = 25) -> None:
     """A rank-`rank` update at every position at each of several matrices, each restricted to its basis (V_k, U_k):
-    A = V_k a, B = U_k b, step sizes matched to an unconstrained fit's (fit()), all trained together on the fit third's
+    A = V_k a, B = U_k b, step sizes matched to an unconstrained fit's (fit()); a basis None, unrestricted there (fit()'s
+    parameters and steps); all trained together on the fit third's
     objective goal_bits - lam x collateral per token; every `every` steps a checkpoint's validation metrics and deltas
     to keep."""
     nat = net.nat
     g = torch.Generator().manual_seed(seed)
     params, groups = {}, []
-    for site, (Vk, Uk) in bases.items():
+    for site, basis in bases.items():
         d_out, d_in = nat.target.site(site).W.shape
+        if basis is None:  # unrestricted at this matrix (fit()'s parameters and step sizes)
+            a = (torch.randn(d_in, rank, generator=g) / math.sqrt(d_in)).to(nat.dev).requires_grad_(True)
+            b = torch.zeros(d_out, rank, device=nat.dev, requires_grad=True)
+            params[site] = (None, None, a, b)
+            groups += [{"params": [a], "lr": lr}, {"params": [b], "lr": lr}]
+            continue
+        Vk, Uk = basis
         k = Vk.shape[1]
         r = min(rank, k)
         a = (torch.randn(k, r, generator=g) / math.sqrt(k)).to(nat.dev).requires_grad_(True)
@@ -433,7 +452,7 @@ def fit_multi(net: Net, bases: dict, steps: int, rank: int, lam: float, keep: li
     def deltas(detach: bool = False):
         out = []
         for site, (Vk, Uk, a, b) in params.items():
-            A, B = Vk @ a, Uk @ b
+            A, B = (a, b) if Vk is None else (Vk @ a, Uk @ b)
             out.append((site, A.detach().clone(), B.detach().clone()) if detach else (site, A, B))
         return out
 
@@ -442,8 +461,8 @@ def fit_multi(net: Net, bases: dict, steps: int, rank: int, lam: float, keep: li
     for step in range(steps + 1):
         if step and (step % every == 0 or step == steps):
             ds = deltas(detach=True)
-            keep.append((_score(net, "val", ds), ds, {"lam": lam, "step": step, "sites": {s_: v[0].shape[1] for s_, v in bases.items()},
-                                                     "rank": rank}))
+            keep.append((_score(net, "val", ds), ds, {"lam": lam, "step": step, "rank": rank,
+                                                     "sites": {s_: (v[0].shape[1] if v is not None else "all") for s_, v in bases.items()}}))
         if step == steps:
             break
         r = net("fit", None, rng=rng, deltas=deltas())
@@ -452,9 +471,41 @@ def fit_multi(net: Net, bases: dict, steps: int, rank: int, lam: float, keep: li
         opt.step()
 
 
+def _orth(X: torch.Tensor) -> torch.Tensor:
+    """An orthonormal basis of X's columns (modified Gram-Schmidt; torch's decompositions are avoided on the Mac)."""
+    out = []
+    for j in range(X.shape[1]):
+        v = X[:, j].clone()
+        for q in out:
+            v = v - (q @ v) * q
+        n = v.norm()
+        if n > 1e-6:
+            out.append(v / n)
+    return torch.stack(out, 1) if out else X[:, :0]
+
+
+SPEC_KEEP = 0.2  # a circuit direction keeps this share of its norm outside the controls' span, or it is dropped
+
+
+def spec_basis(nat, site: str, circ: list[int], ctrl: list[int]):
+    """The circuit's read and write directions at a matrix with the controls' circuit's projected out (each side
+    separately), renormalized; directions left with less than SPEC_KEEP of their norm dropped; None when none is left."""
+    Vk, Uk = finetune_edit.basis(nat, site, circ)
+    if ctrl:
+        Vc, Uc = finetune_edit.basis(nat, site, ctrl)
+        Qv, Qu = _orth(Vc), _orth(Uc)
+        Vk, Uk = Vk - Qv @ (Qv.T @ Vk), Uk - Qu @ (Qu.T @ Uk)
+    keep = (Vk.norm(dim=0) >= SPEC_KEEP) & (Uk.norm(dim=0) >= SPEC_KEEP)
+    if not bool(keep.any()):
+        return None
+    Vk, Uk = Vk[:, keep], Uk[:, keep]
+    return Vk / Vk.norm(dim=0, keepdim=True), Uk / Uk.norm(dim=0, keepdim=True)
+
+
 METHODS = ("circuit_edit", "random_active", "random_any", "random_equal", "vpd_topk", "finetune", "circuit_scales", "random_scales",
-           "circuit_ft", "random_ft")
+           "circuit_ft", "random_ft", "circuit_ft_spec", "finetune_sites")
 RANDOM_DRAWS = 2
+DENSE = ("finetune", "circuit_ft", "random_ft", "circuit_ft_spec", "finetune_sites")  # methods whose edits are (site, A, B) updates
 
 
 def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None,
@@ -475,7 +526,11 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
       circuit_ft     the fine-tune restricted to the circuit's span: at each matrix holding one of its EDIT_CANDS
                      subcomponents, a rank-r update within their read and write directions, trained together
                      (fit_multi), at each LAMS;
-      random_ft      the same within as many random active subcomponents at each of those matrices.
+      random_ft      the same within as many random active subcomponents at each of those matrices;
+      circuit_ft_spec  circuit_ft with the controls' circuit's read and write directions projected out at each
+                     matrix (spec_basis; the controls' circuit from the same teacher at the fit third's controls);
+      finetune_sites an unrestricted rank-r update at each of circuit_ft's matrices, trained together: the same
+                     matrices, objective, steps and selection as circuit_ft, only the restriction differs.
     rank: r given (an earlier run's circuit edit size) in place of the circuit edit's operation count.
     Scores: flipped (preference gone), goal bits, controls kept (b still predicted elsewhere), KL per token on the rows'
     other positions and on held Pile texts. The validation frontier (every candidate's flipped and collateral) is kept."""
@@ -526,10 +581,23 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
         keep["random_scales"] = []
         for lam in LAMS:
             fit_scales(net, pool, steps, lam, keep["random_scales"])
+    sites = {}
+    for site, c in circ:
+        sites.setdefault(site, []).append(c)
+    if "circuit_ft_spec" in methods:  # the circuit's span less the controls' circuit's at each of its matrices
+        ctrl = {}
+        for site, c, _ in beh.get("control_circuit", [])[:EDIT_CANDS]:
+            ctrl.setdefault(site, []).append(int(c))
+        sb = {site: spec_basis(nat, site, cs, ctrl.get(site, [])) for site, cs in sites.items()}
+        sb = {k_: v for k_, v in sb.items() if v is not None}
+        keep["circuit_ft_spec"] = []
+        for lam in LAMS:
+            fit_multi(net, sb, steps, r, lam, keep["circuit_ft_spec"])
+    if "finetune_sites" in methods:  # unrestricted at the same matrices as circuit_ft (only the restriction differs)
+        keep["finetune_sites"] = []
+        for lam in LAMS:
+            fit_multi(net, {site: None for site in sites}, steps, r, lam, keep["finetune_sites"])
     if "circuit_ft" in methods or "random_ft" in methods:  # the fine-tune restricted to the circuit's span at its sites
-        sites = {}
-        for site, c in circ:
-            sites.setdefault(site, []).append(c)
         if "circuit_ft" in methods:
             keep["circuit_ft"] = []
             for lam in LAMS:
@@ -555,8 +623,8 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
         if not cs:
             continue
         val, edit, info = select(cs)
-        deltas = edit if name in ("finetune", "circuit_ft", "random_ft") else ops_deltas(nat, edit)
-        out["methods"][name] = {"info": info, "ops": None if name in ("finetune", "circuit_ft", "random_ft") else [list(o) for o in edit], "validation": val,
+        deltas = edit if name in DENSE else ops_deltas(nat, edit)
+        out["methods"][name] = {"info": info, "ops": None if name in DENSE else [list(o) for o in edit], "validation": val,
                                 "score": _score(net, "score", deltas), "frontier": [[c[0]["flipped"], c[0]["collateral_per_token"], c[2]] for c in cs]}
         v = out["methods"][name]["score"]
         log(f"{beh['describe']['a']!r}->{beh['describe']['b']!r} {name} {info}: flipped {v['flipped']:.2f}, goal {v['goal_bits']:.2f} bits, "
@@ -573,7 +641,7 @@ def practical_table(rows: list[dict]) -> str:
         for name, x in sorted(r["methods"].items(), key=lambda kv: [m in kv[0] for m in METHODS].index(True)):
             v, i = x["score"], x["info"]
             what = (f"r{i['rank']} {i['site'].replace('h.', 'L').replace('.mlp', '').replace('.attn', '')}" if name == "finetune"
-                    else f"r{i['rank']} {len(i['sites'])} sites" if name in ("circuit_ft", "random_ft")
+                    else f"r{i['rank']} {len(i['sites'])} sites" if name in DENSE
                     else f"k {i['k']}" if "k" in i else f"{len(x['ops'])} ops")
             lines.append(f"{r['preference']['a']!r:>9s}->{r['preference']['b']!r:<11s} {name:15s} {what:14s} {v['flipped']:7.2f}  {v['goal_bits']:9.2f}  "
                          f"{v['controls_kept'] or 0:5.2f}  {v['text_kl_per_token']:11.2e}  {v['pile_kl_per_token']:11.2e}")

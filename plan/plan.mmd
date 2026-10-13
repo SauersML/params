@@ -239,6 +239,9 @@
 %% Induction also needs distinct Q/K/V reader ports. Define these explicitly before claiming token-route fidelity.
 %% Independent Pyvene scalar-interchange reference matches Native logprobs within1.91e-6; wrong-position control is zero.
 %% Scope: analytic full-background rank-one scalar swaps; no sparse-graph, English or learned-weight-use certificate.
+%% Next routing step: preserve exact head ports and token positions in strict Mermaid output; reject ignored syntax.
+%% In parallel, design same-basis rank-one weight edits on full model and circuit, checking intervention KL beyond baseline.
+%% Why: Python-only adapter cannot train an oracle; ordinary-output fidelity alone does not prove causal abstraction.
 %% Typed routing and independent intervention parity proceed beside the existing unit-vs-wiring RL comparison.
 %% Follow-through9476e8: optional typed head-port adapter uses existing Native.Graph at exact positions; default unchanged.
 %% Frozen multihop014: correct route KL5.13e-7bits; wrong intermediate or downstream port7.4376bits.
@@ -374,7 +377,7 @@ flowchart BT
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
   WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>two free CPU forks, lower-memory updates;<br/>matched20 steps; paired report ready<br/>ACTIVE · codex/eval_recovery"]
-  ROUTE["<b>Execute exact token routing</b><br/>correct multihop KL below 1e-6bits;<br/>wrong position or port:7.44bits;<br/>embeddings on; ROOT masks unsupported<br/>DONE adapter · codex/fork_review"]
+  ROUTE["<b>Oracle-emittable token routing</b><br/>exact-position adapter validated;<br/>strict Mermaid output and roundtrip;<br/>then matched rank-one weight edits<br/>ACTIVE · codex/fork_review, variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
   FBASE["<b>Matched QA baseline measured</b><br/>DeepSeek59.50%, Qwen65.64%;<br/>cheap features66.76% on same179 QA;<br/>prioritize circuit fidelity over QA scaling<br/>CHECK · codex · $0.145 spent"]
 
@@ -550,7 +553,8 @@ flowchart BT
   class S1READY check
   class QAONLY check
   class WIRING active
-  class ROUTE,PYV done
+  class ROUTE active
+  class PYV done
   class FBASE check
   class CLAIMFIT check
   class CLAIMDATA,CLAIMREC done

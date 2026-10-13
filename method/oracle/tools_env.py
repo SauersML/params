@@ -84,6 +84,8 @@ import goal_eval  # noqa: E402
 import native  # noqa: E402
 
 COST = 0.02  # reward bits per tool call (a run_circuit costs the policy as much as a cheap one: calls are the budget)
+COST_F = 0.005  # env F's (the lead's 10-13, fixed before its gate): a teacher-like scripted policy makes 15-35 calls, the
+# teacher's median circuit-term gain over the start is about 0.3, so 30 calls cost half of it (--cost)
 MAX_TURNS = 24  # assistant turns per episode
 MAX_CALLS = 40  # tool calls per episode
 TEXTS_KEPT = 8  # texts whose Tools a process keeps (an RL group's episodes share one)
@@ -1399,12 +1401,15 @@ def main():
     v.add_argument("--host", default="127.0.0.1")
     v.add_argument("--score-split", default="search")
     v.add_argument("--device")
+    for sp in (s, v):
+        sp.add_argument("--cost", type=float, default=COST, help=f"reward per tool call (env F: {COST_F})")
     a = ap.parse_args()
     rows = _rows(a.rows)
     if a.cmd == "tokens":
         tokens(rows, _tasks(a.tasks), Path(a.episodes) if a.episodes else None, pool=a.pool)
         return
-    env = Env(rows, goal_eval.GoalEval(native.Native(getattr(a, "device", None))), score_split=a.score_split)
+    env = Env(rows, goal_eval.GoalEval(native.Native(getattr(a, "device", None))), score_split=a.score_split,
+              cost=getattr(a, "cost", COST))
     if a.cmd == "bench":
         bench(env, _tasks(a.tasks), score=not a.no_score)
     elif a.cmd == "scripted":

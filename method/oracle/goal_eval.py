@@ -2413,120 +2413,103 @@ class GoalEval:
     @torch.no_grad()
     def interchange_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval",
                        draws: int = INTERCHANGE_DRAWS, lines: torch.Tensor | None = None) -> list[dict]:
-        """The interchange family in path-patched semantics (the lead's 10-12, C's interchange term): on the
-        interchange draws of a circuit's positions (_interchange_draws), the circuit's nodes at p held at their values
-        in the real model on the changed text x' (a block: the site's whole output there), their stated paths carrying
-        them in the path-patched run on the text (pp_run, fixed), everything else at x; against the real model with the
-        same nodes held (every site a block, complete: the model's own response) and VPD's whole answer's run with them
-        held, bounded by no change: per draw clip(ln(W / KL_C) / ln(W / KL_V), 0, 1), W = KL(model held || model), none
-        where VPD's run is no nearer than W, pooled weighted by W. Per circuit s_interchange_pp (and _raw, the pool
-        without the floor at 0), prompts_interchange_pp, draws_interchange_pp ([[p, z], KL_C, KL_V, W] each). Per
-        circuit one engine.Engine.path_patched call: its draws' held sets in the model, the circuit and VPD's answer.
-        lines [K, L]: graphs[0] (stranded) with the lines each row turns off removed (Engine.pp_lines' columns;
-        graph_of_lines), its rows per variant, in one call (_interchange_lines)."""
+        """The interchange family in path-patched semantics (the lead's 10-12, C's interchange term) on a panel of the
+        text's own (the lead's 10-13: drawn at each circuit's positions, a circuit placed where the behavior does not
+        read matched the unmoved model trivially; CausalGym's attractor scored above the variable on 0.91 of pairs):
+        the interchange draws (_interchange_draws) at the panel's positions (_interchange_panel: the start's and the
+        task's minimal pairs'), the same for every circuit; per draw (p, z) the model's response is the real model on
+        the changed text x' (no circuit in it), VPD's prediction its whole answer's run with its actives at p at their
+        values on x', and the circuit's its nodes at p held there (a block: the site's whole output), their stated paths
+        carrying them in the path-patched run on the text (pp_run, fixed), everything else at x: a circuit with no node
+        at p predicts no change. Per draw clip from the linear share (_ratio_pool: [[p, z], KL_C, KL_V, W], W =
+        KL(model on x' || model)), pooled weighted by W's gap. Per circuit s_interchange_pp (and _raw),
+        prompts_interchange_pp (draws where VPD is nearer than no change), draws_interchange_pp. lines [K, L]:
+        graphs[0] (stranded) with the lines each row turns off removed (Engine.pp_lines' columns; graph_of_lines), its
+        rows per variant, in one call (_interchange_lines)."""
         if lines is not None:
             return self._interchange_lines(tx, graphs[0], split, draws, lines)
         return self._interchange_graphs(tx, [strand(g, tx.targets, self.nat.C) for g in graphs], split, draws)
 
+    def _interchange_panel(self, tx: Text, split: str) -> list[int]:
+        """interchange_pp's positions on a text, whatever the circuit: the start set's (start_set: the targets and the
+        most influential positions) and a behavior's minimal pairs' (tx.behavior_pairs), position 0 aside."""
+        own = {p for p, _ in getattr(tx, "behavior_pairs", [])}
+        return sorted(t for t in set(self.start_set(tx, split)["positions"]) | own if 0 < t < tx.T)
+
+    def _interchange_refs(self, tx: Text, split: str, draws: int) -> tuple:
+        """interchange_pp's draws and references on a text (kept on tx): (draws [(p, z)], the changed texts' records
+        {(p, z): _pp_record}, the real model on each changed text [D, targets, V], W per draw, KL_V per draw (VPD's
+        answer with its actives at p at their values on x'))."""
+        kept = tx.__dict__.setdefault("_ipp_refs", {})
+        if (split, draws) not in kept:
+            nat = self.nat
+            pos = self._interchange_panel(tx, split) if tx.vpd is not None else []
+            got = self._interchange_draws(tx, pos, split, draws) if pos else []
+            recs, lm, vh = {}, [], []
+            for p, z in got:
+                x2 = list(tx.ids)
+                x2[p] = z
+                recs[(p, z)] = r2 = self._pp_record(x2)
+                lm.append(nat.reference([x2], tx.targets))
+                vh.append({(n, p, c): r2["a"][n][p, c] for n in nat.names for c in tx.vpd[n][p].nonzero().flatten().tolist()})
+            W = KV = []
+            if got:
+                lm = torch.cat(lm)
+                lv = self._pp_engine(tx).path_patched([native.Graph(masks=tx.vpd)], vh)[0]
+                W, KV = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(lm, lv).tolist()
+                native.free(nat.dev)
+            kept[(split, draws)] = (got, recs, lm, W, KV)
+        return kept[(split, draws)]
+
+    @staticmethod
+    def _interchange_row(got: list, kc: list, kv: list, w: list) -> dict:
+        rec = [[[p, z], a, b, c] for (p, z), a, b, c in zip(got, kc, kv, w)]
+        n = sum(1 for _, a, b, c in rec if c > 0 and b < c)
+        return {"s_interchange_pp": _ratio_pool(rec), "prompts_interchange_pp": n, "draws_interchange_pp": rec,
+                "s_interchange_pp_raw": _ratio_pool(rec, raw=True)}
+
     def _interchange_graphs(self, tx: Text, graphs: list[native.Graph], split: str, draws: int) -> list[dict]:
-        """interchange_pp of graphs as given (stranding is the caller's)."""
-        nat, T = self.nat, tx.T
-        vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
-        model = native.Graph([(n, t, BLOCK) for n in nat.names for t in range(T)], complete=True)
-        recs = {}
+        """interchange_pp of graphs as given (stranding is the caller's), every graph on the text's panel draws."""
+        nat = self.nat
+        got, recs, lm, W, KV = self._interchange_refs(tx, split, draws)
+        empty = {"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
+        if not got:
+            return [dict(empty) for _ in graphs]
         out = []
         for g in graphs:
             nodes = sorted(g.node_set())
-            positions = sorted({t for _, t, _ in nodes if t > 0})
-            a = [0.0, 0.0, 0, [], 0.0]
-            got = self._interchange_draws(tx, positions, split, draws) if positions and vpd is not None else []
             helds = []
             for p, z in got:
-                if (p, z) not in recs:
-                    x2 = list(tx.ids)
-                    x2[p] = z
-                    recs[(p, z)] = self._pp_record(x2)
                 r2 = recs[(p, z)]
-                held = {}
-                for n, t, c in nodes:
-                    if t == p:
-                        site_ = nat.target.site(n)
-                        held[(n, t, c)] = r2["a"][n][t] @ site_.U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c]
-                helds.append(held)
-            lq = self._pp_engine(tx).path_patched([model, g, vpd], helds) if helds else None  # pp_run(fixed=)'s numbers
-            for d, (p, z) in enumerate(got):
-                m = lq[0, d][None]
-                w = float(carry.kl(m, tx.ref)[0])
-                kc = float(carry.kl(m, lq[1, d][None])[0])
-                kv = float(carry.kl(m, lq[2, d][None])[0])
-                a[3].append([[p, z], kc, kv, w])
-                sb = _fid(w, kc, kv)
-                if sb is not None:
-                    a[0], a[1], a[2], a[4] = a[0] + w * sb, a[1] + w, a[2] + 1, a[4] + w * _fid_raw(w, kc, kv)
+                helds.append({(n, t, c): (r2["a"][n][t] @ nat.target.site(n).U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c])
+                              for n, t, c in nodes if t == p})
+            lc = self._pp_engine(tx).path_patched([g], helds)[0]  # pp_run(fixed=)'s numbers
+            out.append(self._interchange_row(got, carry.kl(lm, lc).tolist(), KV, W))
             native.free(nat.dev)
-            out.append({"s_interchange_pp": _ratio_pool(a[3]), "prompts_interchange_pp": a[2],
-                        "draws_interchange_pp": a[3], "s_interchange_pp_raw": _ratio_pool(a[3], raw=True)})
         return out
 
     def _interchange_lines(self, tx: Text, graph: native.Graph, split: str, draws: int, lines: torch.Tensor) -> list[dict]:
         """interchange_pp of graph's line deletions (lines [K, L], Engine.pp_lines' columns of the stranded graph):
-        every variant on the answer's draws, its circuit runs in one Engine.path_patched(lines=) call holding the
-        answer's nodes at p (a deleted node is no longer the graph's, so its value drops out) and the references (the
-        model and VPD's answer with the variant's own nodes at p held) once per distinct held set; a variant whose nodes
-        cover other positions than the answer's (its draws differ) runs as its own graph."""
-        nat, T = self.nat, tx.T
+        every variant on the text's panel draws (the references are the text's), its circuit runs in one
+        Engine.path_patched(lines=) call holding the answer's nodes at p (a deleted node is no longer the graph's, so its
+        value drops out)."""
+        nat = self.nat
         g = strand(graph, tx.targets, nat.C)
-        E = self._pp_engine(tx)
-        cols = E.pp_lines(g)
-        nodes = [k[1] for k in cols if k[0] == "n"]
-        K, N = len(lines), len(nodes)
-        on = (lines[:, :N] > 0).cpu().numpy()
-        pos = np.array([t for _, t, _ in nodes], dtype=np.int64)
-        positions = sorted({t for _, t, _ in nodes if t > 0})
-        vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
-        empty = {"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
-        out = [dict(empty) for _ in range(K)]
-        at_p = (pos[None, :] == np.array(positions, dtype=np.int64)[:, None]) if positions else np.zeros((0, N), dtype=bool)  # [P, N]
-        alone = [k for k in range(K) if not (on[k][None, :] & at_p).any(1).all()]  # a variant leaving a position empty
-        for k in alone:  # nothing re-stranded
-            out[k] = self._interchange_graphs(tx, [graph_of_lines(g, cols, lines[k])], split, draws)[0]
-        rest = [k for k in range(K) if k not in set(alone)]
-        got = self._interchange_draws(tx, positions, split, draws) if positions and vpd is not None and rest else []
+        got, recs, lm, W, KV = self._interchange_refs(tx, split, draws)
         if not got:
-            return out
-        model = native.Graph([(n, t, BLOCK) for n in nat.names for t in range(T)], complete=True)
+            return [{"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
+                    for _ in range(len(lines))]
+        E = self._pp_engine(tx)
+        nodes = [k[1] for k in E.pp_lines(g) if k[0] == "n"]
         helds = []
         for p, z in got:
-            x2 = list(tx.ids)
-            x2[p] = z
-            r2 = self._pp_record(x2)
+            r2 = recs[(p, z)]
             helds.append({(n, t, c): (r2["a"][n][t] @ nat.target.site(n).U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c])
                           for n, t, c in nodes if t == p})
-        sel = torch.tensor(rest, device=lines.device)
-        circ = E.path_patched([g], helds, lines=lines[sel])  # [len(rest), D, targets, V]
-        refs, at, ridx = [], {}, np.zeros((len(rest), len(got)), dtype=np.int64)  # the references' held sets: per draw the
-        for j, k in enumerate(rest):                                              # answer's nodes at p less the variant's deleted
-            for d, (p, _) in enumerate(got):
-                off = tuple(np.nonzero((pos == p) & ~on[k])[0].tolist())
-                if (d, off) not in at:
-                    at[(d, off)] = len(refs)
-                    refs.append({nd: v for nd, v in helds[d].items() if nd not in {nodes[i] for i in off}})
-                ridx[j, d] = at[(d, off)]
-        rl = E.path_patched([model, vpd], refs)  # [2, R, targets, V]
-        W, KV = carry.kl(rl[0], tx.ref).tolist(), carry.kl(rl[0], rl[1]).tolist()  # per reference
-        ri = torch.as_tensor(ridx, device=rl.device)
-        KC = torch.cat([carry.kl(rl[0][ri[s0:s0 + 64]], circ[s0:s0 + 64]) for s0 in range(0, len(rest), 64)]).tolist()  # [J, D]
-        for j, k in enumerate(rest):
-            a = [0.0, 0.0, 0, [], 0.0]
-            for d, (p, z) in enumerate(got):
-                r = int(ridx[j, d])
-                w, kc, kv = W[r], KC[j][d], KV[r]
-                a[3].append([[p, z], kc, kv, w])
-                sb = _fid(w, kc, kv)
-                if sb is not None:
-                    a[0], a[1], a[2], a[4] = a[0] + w * sb, a[1] + w, a[2] + 1, a[4] + w * _fid_raw(w, kc, kv)
-            out[k] = {"s_interchange_pp": _ratio_pool(a[3]), "prompts_interchange_pp": a[2],
-                      "draws_interchange_pp": a[3], "s_interchange_pp_raw": _ratio_pool(a[3], raw=True)}
+        circ = E.path_patched([g], helds, lines=lines)  # [K, D, targets, V]
+        out = []
+        for k in range(len(lines)):
+            out.append(self._interchange_row(got, carry.kl(lm, circ[k]).tolist(), KV, W))
         native.free(nat.dev)
         return out
 

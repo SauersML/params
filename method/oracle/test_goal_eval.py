@@ -1637,6 +1637,25 @@ def test_interchange_path_patched(tiny):
     assert "s_track" not in row["c_terms"] and "s_interchange" not in row["c_terms"]
 
 
+def test_interchange_panel_is_the_texts(tiny):
+    """interchange_pp draws at the text's panel (the start's positions and a behavior's minimal pairs), the same for
+    every circuit; the model's response is the real model on the changed text; a circuit with no node at a draw's
+    position predicts no change there (KL_C = W)."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    panel = ge._interchange_panel(tx, "search")
+    assert panel == sorted(t for t in ge.start_set(tx, "search")["positions"] if t > 0)
+    far = [nd for nd in every if nd[1] not in panel][:4] or every[:1]
+    rows = ge.interchange_pp(tx, [native.Graph(masks=tx.vpd), native.Graph(far, complete=True)], "search", 4)
+    assert [d[0] for d in rows[0]["draws_interchange_pp"]] == [d[0] for d in rows[1]["draws_interchange_pp"]]
+    for (p, z), kc, kv, w in rows[1]["draws_interchange_pp"]:
+        x2 = list(tx.ids)
+        x2[p] = z
+        assert abs(w - float(carry.kl(nat.reference([x2], tx.targets), tx.ref)[0])) < 1e-4 * max(1.0, w)
+        if not any(nd[1] == p for nd in far):
+            assert abs(kc - w) < 1e-4 * max(1.0, w)
+
+
 def test_true_pattern_family(tiny):
     """pattern_family: the whole model with its own attention rows put back is the model; VPD's answer scores 1; a
     circuit without an attention output has no reads to replace; fidelity reports s_pattern."""
@@ -1708,7 +1727,7 @@ def test_line_effects(tiny):
 def test_reward_v3_helpers(tiny):
     """phi: -log2(r) when every family has 1 - s + eps = r, the empty circuit below VPD's answer, phi_tau the lower of
     the start's and every family at 0.9; eps_<family> from the row's draws alone (at least the floor, the floor for a
-    family scored in one run); compact; a block is never cheaper than listing its active parts; n_vpd_k."""
+    family scored in one run); compact; a block costs what listing its active parts costs; n_vpd_k."""
     nat, ge, tx = tiny
     r = 0.27
     row = {"s_point_c": 0.75, "s_nodes": 0.75, "f1_flips_c": {str(goal_eval.FLIP_TERM): 0.75}, "n_spec": 0.75,
@@ -1726,8 +1745,10 @@ def test_reward_v3_helpers(tiny):
     weak = dict(row, s_point_c=0.1, s_nodes=0.1, n_spec=0.1, f1_flips_c={str(goal_eval.FLIP_TERM): 0.1})
     assert abs(goal_eval.phi(row, start=weak)[1] - goal_eval._phi([(0.5, 0.02)] * 4)) < 1e-12
     assert abs(goal_eval.phi(noisy)[0] - goal_eval._phi([(0.75, goal_eval.EPS_CAP)] * 4)) < 1e-12  # eps at most EPS_CAP
-    # the reward's phi: in full to the bar + PHI_CAP, PHI_SLOPE above
-    assert goal_eval.cap_phi(1.5, 1.0) == 1.5 and abs(goal_eval.cap_phi(4.0, 1.0) - (2.0 + 0.1 * 2.0)) < 1e-12
+    # the reward's phi: slope 1 to the bar + PHI_CAP, PHI_SLOPE above, a softplus join of PHI_CAP_WIDTH between
+    w = goal_eval.PHI_CAP_WIDTH
+    assert abs(goal_eval.cap_phi(1.5, 1.0) - (1.5 - 0.9 * w * math.log1p(math.exp(-0.5 / w)))) < 1e-12
+    assert abs(goal_eval.cap_phi(4.0, 1.0) - (2.0 + 0.1 * 2.0)) < 1e-4
     assert goal_eval.cap_phi(None, 1.0) is None and goal_eval.cap_phi(3.0, None) == 3.0
     pool = tiny_pool(nat, tx.ids)
     every = sorted(native.Graph(masks=tx.vpd).node_set())
@@ -1749,7 +1770,7 @@ def test_reward_v3_helpers(tiny):
                 blk.stranded, blk.stranded_bits = [], 0.0
                 lst = native.Graph(parts, {}, [])
                 lst.stranded, lst.stranded_bits = [], 0.0
-                assert goal_eval.size_bits(blk, P, S, tx.targets, active=tx.vpd) >= goal_eval.size_bits(lst, P, S, tx.targets)
+                assert abs(goal_eval.size_bits(blk, P, S, tx.targets, active=tx.vpd) - goal_eval.size_bits(lst, P, S, tx.targets)) < 1e-9
     b = ge.vpd_baseline(tx, 3, pool)
     assert b["n_vpd_k"] is not None
     t = ge.tau(tx, pool)  # the start set's bar and bits, kept on the text
@@ -2791,8 +2812,8 @@ def test_line_effects_pp_engine(tiny):
 def test_pp_families_of_line_deletions(tiny, monkeypatch):
     """track_pp and interchange_pp with lines= (an answer's line deletions in one call, nothing re-stranded) give per
     variant the family's rows on graph_of_lines' graph of it: every draw's KL_C, KL_V and W within 1e-4, for node,
-    connection, token-edge and pair deletions, and every node at a position (interchange's draws then the variant's
-    own)."""
+    connection, token-edge and pair deletions, and every node at a position (interchange's draws the text's panel,
+    the same)."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     g = torch.Generator().manual_seed(17)

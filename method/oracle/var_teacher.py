@@ -367,7 +367,16 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
             sig = signature(prof[i], positions)
             if sig and sig != (nd[1],):
                 mid[(sig, (nd[1],))] = mid.get((sig, (nd[1],)), 0.0) + m[nd]
-        sets += sorted(mid, key=lambda k: -mid[k])
+        for t in sorted({k[1][0] for k in mid}):  # per carrier position the signatures holding most of the removal
+            # effect of its nodes that depend on other positions, the fewest past half of it (the signature's own rule;
+            # nodes there differ in small ways)
+            got = sorted((k for k in mid if k[1] == (t,)), key=lambda k: -mid[k])
+            total, acc = sum(mid[k] for k in got), 0.0
+            for k in got:
+                sets.append(k)
+                acc += mid[k]
+                if acc > total / 2:
+                    break
     log(f"{task['id']}: positions {positions} ({len(m)} circuit nodes, removal effect {M:.3f} bits), {len(sets)} input sets; "
         f"{time.time() - t0:.0f} s")
     allowed = None if pool == "any" or not m else {(n, t) for n, t, _ in m if n != "tok"}

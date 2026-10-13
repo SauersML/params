@@ -899,7 +899,7 @@ class Acceptance:
         engine.Engine.path_patched call)."""
         out = [{} for _ in graphs]
         for k in self.kinds:
-            if k == "phi":                                   # (hook's own: phi_variants against the current circuit)
+            if k in ("phi", "floors"):                       # (hook's own: phi_variants against the current circuit)
                 continue
             fn, keys = ACCEPT[k]
             if k == "changed":
@@ -1195,8 +1195,8 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
                                                              # model, as subcomponents (s_nodes binds on 13 of 20 starts)
         have = sorted(nd for n in nat.names for nd in ((n, int(t), int(c)) for t, c in start[n].nonzero().tolist()))
         g_exp, brec = backup_mod.expand_circuit(ge, tx, native.Graph(have, complete=True), subcomponents=True)
-        for n, t, c in goal_eval.expand_blocks(g_exp, nat.C).node_set():
-            start[n][t, c] = True
+        for n, t, c in goal_eval.expand_blocks(g_exp, nat.C, tx.vpd).node_set():   # a block as its VPD-active contents,
+            start[n][t, c] = True                            # as the reward prices and scores it (inframove's a076865)
         backed = {"start": brec.get("start"), "final": brec.get("final"), "chosen": brec.get("chosen"),
                   "added": int(sum(int(start[n].sum()) for n in nat.names)) - len(have), "start_size": len(have)}
         log(f"  backup: + {backed['added']} subcomponents ({brec.get('start')} -> {brec.get('final')})", flush=True)

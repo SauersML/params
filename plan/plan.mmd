@@ -1,4 +1,15 @@
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
+%% Auxiliary claim task: full model on, exact declared component scalars transplanted/removed.
+%% Give only the involved original groups and intervention; never shrink a group and inherit its old proof.
+%% Keep archived false predictions as labeled measured outcomes, not positive-only always-true supervision.
+%% Existing checked_invariant_labels validates positives only; new negative labels require equally strict binding checks.
+%% Same-text/same-donor different-group cases test shortcuts; fits and baselines audited before any new training.
+%% This may teach component-intervention QA; it is neither a smaller sufficient circuit nor verified free English.
+%% Current-main scope audit (2750fd8/19d86e2/b6a3df3): fixed-text x uses original Q/K and norm boundaries,
+%% requiring a dense _x_run. Across-prompts recomputes boundaries from each full-model prompt run.
+%% weight_family explicitly recomputes Q/K/norms under each edited full model: conditional on supplied edited
+%% boundary state, not standalone prediction from original weights/observations. Weight column stays outside Phi.
+%% No stale-cache defect established; retain the measurement and distinguish this claim from independent edit prediction.
 %% Read bottom to top: foundations, workstreams, decision gates, training, capabilities, impact.
 %% Solid arrows are artifact dependencies; dashed arrows are optional inputs.
 %% Feedback is recorded beside the owning workstream below, not drawn as a false prerequisite.
@@ -416,7 +427,7 @@ flowchart BT
     W2["<b>Falsification set</b><br/>14 families + copy, frequency-weighted:<br/>wrong context loses 0.61-0.74, padding 0.76;<br/>equal-bits target actives win 0.85;<br/>partition/parity E4 0.00-0.04 vs identity ~1;<br/>behavior mode (CausalGym): v2.1 teacher holds<br/>the subject 0.85 (plain 0.12), R prefers it 0.86;<br/>interchange_pp still blind · DONE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>floors, circuit_term b3937ed; blocks at<br/>active contents a076865; RL run 2: soft<br/>pieces + audit 2fdd1cf, interchange panel<br/>19d86e2, semantics x opt-in 2750fd8<br/>(s_nodes 0.56 → 0.93); next: cond 2 on<br/>v2.3 teachers, flip default to x<br/>ACTIVE · inframove"]
-    W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
+    W5["<b>What information does a circuit need?</b><br/>x mode consumes a full-model trace;<br/>weight diagnostic gets edited boundaries;<br/>standalone edit prediction unverified<br/>SCOPE AUDIT · codex/eval_recovery"]
     W6["<b>Diagnose fidelity failures</b><br/>retain draws and every family score;<br/>unchanged reward; export checks pass;<br/>separate response error from uncertainty<br/>IMPLEMENTED · codex · 3017b64"]
   end
 
@@ -434,6 +445,7 @@ flowchart BT
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Carrier size remains the limit</b><br/>53% compression; further4.7% adds no rows;<br/>2 of15 exact rows fit training limits;<br/>next: smaller verified carrier sets<br/>AUDIT DONE · codex/variable_reward"]
+  CLAIMQA["<b>Predict a specific transplant</b><br/>give exact components, ask their effect;<br/>same donor across different groups;<br/>retain true and false checked claims<br/>ACTIVE · codex/variable_reward"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Teach every relation example</b><br/>21 of68 never sampled by SFT;<br/>free300-step coverage test launched;<br/>same data, base model and dependencies<br/>RUNNING · codex/eval_recovery"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
@@ -530,6 +542,8 @@ flowchart BT
   VAR -. existing proposals .-> CLAIMREC
   CLAIMREC -- 2 fitting rows,11 claims --> SUP
   CLAIMREC --> CLAIMFIT
+  CLAIMREC --> CLAIMQA
+  CLAIMQA -. auxiliary intervention answers .-> SUP
   CLAIMFIT -. additional exact rows .-> SUP
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
@@ -612,7 +626,8 @@ flowchart BT
   class T3 done
   class T4 active
   class T5 check
-  class I6,W5 done
+  class I6 done
+  class W5 check
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
   class QAONLY check
@@ -623,6 +638,7 @@ flowchart BT
   class PYV done
   class FBASE check
   class CLAIMFIT done
+  class CLAIMQA active
   class CLAIMDATA,CLAIMREC done
   class ENGP done
   class S1AUDIT done

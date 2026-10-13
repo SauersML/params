@@ -253,6 +253,18 @@
 %% Existing1cd2654 var_explain_llm supplies a strong-open text-only control; retain it, do not duplicate its calls.
 %% It does not yet answer the matched-evidence comparison. Compare same inputs, output format, tool budget and cost;
 %% report a cheap-context control separately, and never use Claude/Sol/Codex for oracle/baseline data.
+%% Free CPU forks now running38366405014/38366408116 from b53639e, exact same verified SFT and parent dependency lock.
+%% New sequential gradient accumulation replaces the old batched update; previous shutdown cause remains unproven.
+%% Each arm has one330-minute link,20scheduled updates, k4,416generation/3072context; no automatic extension.
+%% c2dbbc4 offline paired report requires complete24-case outputs and matching sources/data/checkpoints, retains invalids,
+%% and reports each arm against its own fresh baseline plus absolute KL/top1 with explicit valid-row coverage.
+%% All paid attempts ended, no pods remain, nine failed allocations cost$0.0175; unused$1.9825 released.
+%% Strong QA baseline prepared/authorized: DeepSeek-V4.1-Flash, same22 texts9028-9049 and179questions as learned Qwen.
+%% Match temperature1, one first sample,1000 output tokens, thinking disabled, exact full user prompts; no best-of.
+%% OfficialTinker rates .60/3.60 dollars perM plus exact229024 rendered inputs give no-cache upper$0.2166144;
+%% allowance$.50 inside existingTinker130cap, same requiredproject. Scorer must reproduce frozen235/358 before calls.
+%% Compare learned235/358 and development-informed train-fit effect baseline239/358; do not substitute older231/358.
+%% Decision: whether a stronger starting model improves this QA module under equal evidence, not proof of a full oracle.
 %% Matched scheduled updates/samples/token caps, not identical realized compute; final raw outputs and failures retained.
 %% Identical seeds/data/budget, fixed24-case panel, one greedy answer each; invalids retained, no best-of/checkpoint selection.
 %% Native teacher KL must be <=1e-3bits per input before learning. Partial training stages cannot silently restart.
@@ -357,10 +369,10 @@ flowchart BT
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
-  WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>GPU hosts failing; MPS update fits12GB;<br/>paired report readying; $2 total cap<br/>ACTIVE · codex"]
+  WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>two free CPU forks, lower-memory updates;<br/>matched20 steps; paired report ready<br/>ACTIVE · codex/eval_recovery"]
   ROUTE["<b>Execute exact token routing</b><br/>correct multihop KL below 1e-6bits;<br/>wrong position or port:7.44bits;<br/>embeddings on; ROOT masks unsupported<br/>DONE adapter · codex/fork_review"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
-  FBASE["<b>Value beyond a strong model</b><br/>text-only open-model control exists;<br/>next compare matched evidence and tools;<br/>report fidelity, latency and cost<br/>CHECK · codex + varteach"]
+  FBASE["<b>Value beyond a strong model</b><br/>same179 QA,22texts,full evidence;<br/>DeepSeek vs trained Qwen and cheap control;<br/>one response each; estimate at most $0.22<br/>ACTIVE · codex/reward_audit"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -535,7 +547,7 @@ flowchart BT
   class QAONLY check
   class WIRING active
   class ROUTE,PYV done
-  class FBASE check
+  class FBASE active
   class CLAIMFIT check
   class CLAIMDATA,CLAIMREC done
   class ENGP done

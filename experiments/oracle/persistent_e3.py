@@ -56,6 +56,7 @@ POOL = 128  # subcomponents ranked by local effect
 K_SET = 8  # subcomponents per restricted set at a site
 DRAWS = 2
 RANK = 1
+ROWS_STEP, HELD_STEP = 8, 2  # texts per training step (val and score use every text)
 TOKENS = Path.home() / "mpd-data/atlas/vpd4l/tokens_0_6000.npy"
 
 
@@ -151,15 +152,25 @@ class Net:
         self.nat, self.b, self.rate = nat, beh["b"], {p: beh["parts"][p]["rate"] for p in THIRDS}
         self.texts = {p: _texts(beh, p, tokens) for p in THIRDS}
         self.held = {p: held["held" if p == "score" else "search"] for p in THIRDS}
-        with torch.no_grad():
-            self.ref = {p: [finetune_edit.logq(nat, [ids])[0] for ids, _, _ in self.texts[p]] for p in THIRDS}
-            self.ref_held = {p: [finetune_edit.logq(nat, [ids])[0] for ids in self.held[p]] for p in THIRDS}
 
-    def __call__(self, part: str, site: str | None, A=None, B=None, grad: bool = True) -> dict:
+    def _ref(self, ids: list[int]) -> torch.Tensor:
+        """The unedited log probabilities of a text, recomputed (kept for every text they would fill a GPU: 512 x 50k
+        floats each)."""
+        with torch.no_grad():
+            return finetune_edit.logq(self.nat, [ids])[0]
+
+    def __call__(self, part: str, site: str | None, A=None, B=None, grad: bool = True, rng: random.Random | None = None) -> dict:
+        """rng: a training step's sample, ROWS_STEP of the part's texts and HELD_STEP held texts (the expectation of
+        the full net, at a fraction of the cost)."""
         nat = self.nat
+        texts, helds = self.texts[part], self.held[part]
+        if rng is not None:
+            texts = rng.sample(texts, min(ROWS_STEP, len(texts)))
+            helds = rng.sample(helds, min(HELD_STEP, len(helds)))
         goal, n, coll, kept, nc, flipped = 0.0, 0, 0.0, 0.0, 0, 0.0
         with torch.set_grad_enabled(grad):
-            for (ids, inst, ctrl), lp in zip(self.texts[part], self.ref[part]):
+            for ids, inst, ctrl in texts:
+                lp = self._ref(ids)
                 lq = finetune_edit.logq(nat, [ids], site, A, B, torch.ones(len(ids), device=nat.dev))[0] if site else lp
                 kl = finetune_edit.kl_bits(lp, lq)
                 if inst:
@@ -173,13 +184,14 @@ class Net:
                 if ctrl:
                     kept += float((lq[ctrl].argmax(-1) == self.b).float().sum())
                     nc += len(ctrl)
-            rows = len(self.texts[part])
+            rows = len(texts)
             held = 0.0
-            for ids, lp in zip(self.held[part], self.ref_held[part]):
+            for ids in helds:
+                lp = self._ref(ids)
                 lq = finetune_edit.logq(nat, [ids], site, A, B, torch.ones(len(ids), device=nat.dev))[0] if site else lp
                 held = held + finetune_edit.kl_bits(lp, lq).sum() / len(ids)
             gb = goal / max(1, n)
-            ct = coll / max(1, rows) + held / max(1, len(self.held[part]))
+            ct = coll / max(1, rows) + held / max(1, len(helds))
             net = self.rate[part] * gb - ct
         f = lambda x: float(x.detach()) if torch.is_tensor(x) else float(x)  # noqa: E731
         return {"net": net, "goal_bits": f(gb), "goal_per_token": self.rate[part] * f(gb), "collateral_per_token": f(ct),
@@ -206,6 +218,7 @@ def fit(net: Net, site: str, steps: int, basis=None, lr: float = 0.01, seed: int
         AB = lambda: (Vk @ a, Uk @ b)  # noqa: E731
         la, lb = lr * math.sqrt(d_in / k), lr * math.sqrt(d_out / k)
     opt = torch.optim.Adam([{"params": [a], "lr": la}, {"params": [b], "lr": lb}])
+    rng = random.Random(seed)
     best = (-math.inf, None, -1)
     for step in range(steps + 1):
         if step % every == 0 or step == steps:
@@ -216,7 +229,7 @@ def fit(net: Net, site: str, steps: int, basis=None, lr: float = 0.01, seed: int
         if step == steps:
             break
         A, B = AB()
-        r = net("fit", site, A, B)
+        r = net("fit", site, A, B, rng=rng)
         opt.zero_grad()
         (-r["net"]).backward()
         opt.step()

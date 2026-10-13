@@ -24,14 +24,20 @@ on-target 0.36) where the position's whole site outputs carry all of it. Per inp
    site (3,781 subcomponents, 6% of the position's 61,440) carries f on-target 0.975 (eval split 0.974) where the
    values' block carries 0.79 and VPD's active set on the text 0.41. VPD's active set on the text alone is scored
    beside them (reported).
-A variable is kept when its term min(f on-target, s off-target) on the search split is at least GOAL, each on its own
-(the lead's rule); the others are listed unkept with their scores. Kept variables are taken first, single positions
-before pairs, each by the circuit's removal effect inside the carrier, then the unkept: carriers disjoint (a block
-holds every subcomponent of its site and position), so the variables' interventions commute, and variables carried
-at their own inputs with no input position in two.
+Pool (the lead's decision): the circuit's sites, its blocks and families at the (site, position) pairs holding its
+nodes ("circuit", the default with a circuit), or every site ("any"). Beside each carrier the trivial variable, every
+reachable site at the carrier positions as one block (all a position holds: a change at the position is carried
+almost by construction), is scored on both splits, and each variable is labelled "input" (carried at its own input
+positions) or "intermediate" (carried at another position, a combined value): the informative ones are intermediate.
+A variable is kept when its term min(f on-target, s off-target) is at least GOAL on the search split and at least
+EVAL_KEEP on the eval split's draws, which the choice never saw (the lead's rule), each on its own; the others are
+listed unkept with their scores, and a text with none has no VARIABLES target ("target": false). Variables are
+chosen by the search term (those at GOAL first, single positions before pairs, each by the circuit's removal effect
+inside the carrier): carriers disjoint (a block holds every subcomponent of its site and position), so the
+variables' interventions commute, and variables carried at their own inputs with no input position in two.
 
-Per variable: "kept", "carrier" (block or family), "carried_at" (the carrier's positions), "group" (blocks ["block", site, position] or the family's
-subcomponents [site, index, position]), "instances" (VPD's active subcomponents on the text inside the carrier) and
+Per variable: "kept", "kind" (input or intermediate), "carrier" (block or family), "carried_at" (the carrier's
+positions), "group" (blocks ["block", site, position] or the family's subcomponents [site, index, position]), "instances" (VPD's active subcomponents on the text inside the carrier) and
 "instances_share" (the share of the text and its alternatives on which each is active: the core near 1), "circuit_nodes"
 (the circuit's nodes inside the carrier), "m" (their removal effect, goal_eval.line_effects in pp mode), "values" (the
 value map per input position, class 0 the text's own: var_classes.classes, kept variables), "feeds" (measured: each
@@ -42,7 +48,7 @@ both splits, "m_share" (the share of the circuit's removal effect inside kept ca
 (2 e4_v - 1) m_v / sum m over the kept variables, e4_v the eval term). Names V1, V2, ... in input order, meanings
 empty for the writer. Output ~/mpd-data/graph_oracle/variables/<split>/<task>.json.
 
-  var_teacher.py [TASK ...] --circuits DIR [--root DIR | --out DIR] [--device mps] [--draws 8]
+  var_teacher.py [TASK ...] --circuits DIR [--pool circuit|any] [--root DIR | --out DIR] [--device mps] [--draws 8]
   (no TASK: every textN.json in DIR)
 """
 from __future__ import annotations
@@ -67,6 +73,7 @@ import native  # noqa: E402
 import variables  # noqa: E402
 
 GOAL = goal_eval.GOAL
+EVAL_KEEP = 0.8  # the lead's keep rule: the search term at GOAL and the eval split's (draws the choice never saw) at this
 OUT = native.TEXTS.parent / "variables"
 BLOCK = variables.BLOCK
 
@@ -174,25 +181,43 @@ def signature(row: np.ndarray, positions: list[int]) -> tuple:
     return tuple(sorted(got))
 
 
-def block_search(sc: _Screen, tx, ins: tuple, draws: int, at: tuple | None = None) -> tuple[dict, list[dict]]:
-    """(the chosen blocks' row, every row tried): blocks at the carrier positions (at; the input positions when None)
-    of every single site, every layer and layers 0 to L, the smallest at or above GOAL; else grown from the best single
-    site, one site at a time."""
+def block_search(sc: _Screen, tx, ins: tuple, draws: int, at: tuple | None = None, allowed: set | None = None
+                 ) -> tuple[dict | None, list[dict], dict]:
+    """(the chosen blocks' row or None, every row tried, the trivial row): blocks at the carrier positions (at; the
+    input positions when None) of every single site, every layer and layers 0 to L, the smallest at or above GOAL;
+    else grown from the best single site, one site at a time. allowed: the (site, position) pairs a block may take
+    (the circuit's, pool "circuit"); None, every site that reaches the targets. The trivial row, every reachable site
+    at the positions as one block (all a position holds), is scored beside them and is a candidate only without
+    allowed."""
     nat = sc.nat
     at = at or ins
     reach = nat.reachable(tx.T, tx.targets)
-    sites = [n for n in nat.names if all(bool(reach[n][p].any()) for p in at)]
-    blocks = lambda ns: [(n, p, BLOCK) for n in ns for p in at]  # noqa: E731
+    every = [n for n in nat.names if all(bool(reach[n][p].any()) for p in at)]
+    ok_at = (lambda n, p: True) if allowed is None else (lambda n, p: (n, p) in allowed)  # noqa: E731
+    sites = [n for n in every if any(ok_at(n, p) for p in at)]
+    blocks = lambda ns: [(n, p, BLOCK) for n in ns for p in at if ok_at(n, p)]  # noqa: E731
     layers = sorted({_layer(n) for n in sites})
     cands = [(blocks([n]), f"site {n}") for n in sites]
     cands += [(blocks([n for n in sites if _layer(n) == L]), f"layer {L}") for L in layers]
     cands += [(blocks([n for n in sites if _layer(n) <= L]), f"layers {layers[0]}-{L}") for L in layers[1:]]
-    rows = screen(sc, tx, ins, cands, draws)
+    seen, uniq = set(), []
+    for g, how in cands:
+        if g and tuple(g) not in seen:
+            seen.add(tuple(g))
+            uniq.append((g, how))
+    trivial = ([(n, p, BLOCK) for n in every for p in at], "every site at the positions (trivial)")
+    rows = screen(sc, tx, ins, uniq + [trivial], draws)
+    triv, rows = rows[-1], rows[:-1]
+    if allowed is None:
+        rows.append(triv)
+    if not rows:
+        return None, [], triv
     ok = [r for r in rows if r["score"] >= GOAL]
     if ok:
-        return min(ok, key=lambda r: (r["size"], -r["score"])), rows
-    cur = max(rows[:len(sites)], key=lambda r: r["score"])
-    have = [cur["group"][0][0]]
+        return min(ok, key=lambda r: (r["size"], -r["score"])), rows, triv
+    singles = [r for r in rows if r["how"].startswith("site ")]
+    cur = max(singles or rows, key=lambda r: r["score"])
+    have = sorted({n for n, _, _ in cur["group"]})
     while cur["score"] < GOAL and len(have) < len(sites):
         rest = [n for n in sites if n not in have]
         got = screen(sc, tx, ins, [(blocks(have + [n]), "sites " + ", ".join(have + [n])) for n in rest], draws)
@@ -201,7 +226,7 @@ def block_search(sc: _Screen, tx, ins: tuple, draws: int, at: tuple | None = Non
         if b["score"] <= cur["score"]:
             break
         cur, have = b, have + [rest[got.index(b)]]
-    return max([cur] + [r for r in rows if r["score"] > cur["score"]], key=lambda r: r["score"]), rows
+    return max([cur] + [r for r in rows if r["score"] > cur["score"]], key=lambda r: r["score"]), rows, triv
 
 
 def family(nat: native.Native, tx, ins: tuple, sites: list[str], at: tuple | None = None) -> tuple[list, dict]:
@@ -313,7 +338,7 @@ def overlaps(used: set, group: list) -> bool:
     return any((n, t) in sites if c == BLOCK else ((n, t, c) in used or (n, t) in whole) for n, t, c in group)
 
 
-def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 8, log=print) -> dict:
+def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 8, pool: str = "circuit", log=print) -> dict:
     import components
     import var_classes
 
@@ -345,21 +370,28 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         sets += sorted(mid, key=lambda k: -mid[k])
     log(f"{task['id']}: positions {positions} ({len(m)} circuit nodes, removal effect {M:.3f} bits), {len(sets)} input sets; "
         f"{time.time() - t0:.0f} s")
+    allowed = None if pool == "any" or not m else {(n, t) for n, t, _ in m if n != "tok"}
     best = {}
     for ins, at in sets:
-        b, rows = block_search(sc, tx, ins, draws, at)
+        b, rows, triv = block_search(sc, tx, ins, draws, at, allowed)
+        if b is None:  # the circuit holds no site at these positions
+            continue
         sites = sorted({n for n, _, _ in b["group"]})
         reach = nat.reachable(tx.T, tx.targets)
         every = [n for n in nat.names if all(bool(reach[n][q].any()) for q in at)]
-        fam, share = family(nat, tx, ins, every, at)  # the family over every site; restricted to the blocks' sites
+        fam, share = family(nat, tx, ins, every, at)  # the family over every site, then restricted
         on_x = {(n, q, c) for n in every for q in at for c in (tx.ci[n][q] > 0).nonzero().flatten().tolist()}
-        mine = [k for k in fam if k[0] in sites]
-        cands = [(mine, "family at the blocks' sites"), (fam, "family at every site"), (sorted(k for k in fam if k in on_x), "active on the text")]
+        wide = fam if allowed is None else [k for k in fam if (k[0], k[1]) in allowed]
+        cands = [([k for k in fam if k[0] in sites and (allowed is None or (k[0], k[1]) in allowed)], "family at the blocks' sites"),
+                 (wide, "family at every site" if allowed is None else "family at the circuit's sites"),
+                 (sorted(k for k in wide if k in on_x), "active on the text")]
         fa = screen(sc, tx, ins, [c for c in cands if c[0]], draws)
         got = {r["how"]: r for r in fa}
-        ok = [got[h] for h in ("family at the blocks' sites", "family at every site") if h in got and got[h]["score"] >= GOAL]
-        rec = {"inputs": list(ins), "at": list(at), "blocks": b, "family": got.get("family at every site"),
-               "family_sites": got.get("family at the blocks' sites"), "active": got.get("active on the text"), "tried": len(rows)}
+        wide_how = cands[1][1]
+        ok = [got[h] for h in ("family at the blocks' sites", wide_how) if h in got and got[h]["score"] >= GOAL]
+        rec = {"inputs": list(ins), "at": list(at), "kind": "input" if tuple(at) == tuple(ins) else "intermediate", "blocks": b,
+               "family": got.get(wide_how), "family_sites": got.get("family at the blocks' sites"), "active": got.get("active on the text"),
+               "trivial": triv, "tried": len(rows)}
         use = min(ok, key=lambda r: r["size"]) if ok else b
         held = {n for n, _, _ in use["group"]}
         active = sorted(k for k in on_x if k[0] in held)
@@ -369,12 +401,12 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         rec["m"] = sum(m[nd] for nd in rec["circuit"])
         best[(ins, at)] = rec
         sz = lambda k: f"{rec[k]['size']} {rec[k]['score']:.3f}" if rec[k] else "none"  # noqa: E731
-        log(f"  inputs {list(ins)} at {list(at)}: {rec['carrier']} {use['how']} ({use['size']} subcomponents) {use['score']:.3f}; "
-            f"blocks {b['how']} {b['score']:.3f}, family at the blocks' sites {sz('family_sites')}, at every site "
-            f"{sz('family')}, active {sz('active')}; m {rec['m']:.3f}")
-    # kept first; at their inputs, single positions before pairs; by the circuit's removal effect inside; carriers
-    # disjoint (a block holds every subcomponent of its site and position), and variables carried at their own
-    # inputs with no input position in two
+        log(f"  inputs {list(ins)} at {list(at)} ({rec['kind']}): {rec['carrier']} {use['how']} ({use['size']} subcomponents) "
+            f"{use['score']:.3f}; blocks {b['how']} {b['score']:.3f}, family at the blocks' sites {sz('family_sites')}, "
+            f"{wide_how} {sz('family')}, active {sz('active')}; trivial {sz('trivial')}; m {rec['m']:.3f}")
+    # by the search term, at their inputs single positions before pairs, by the circuit's removal effect inside;
+    # carriers disjoint (a block holds every subcomponent of its site and position), and variables carried at their
+    # own inputs with no input position in two
     chosen, used, taken = [], set(), set()
     order = sorted(best.values(), key=lambda r: (r["score"] < GOAL, r["at"] == r["inputs"] and len(r["inputs"]) > 1, -r["m"], -r["score"]))
     for r in order:
@@ -386,48 +418,51 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
             taken |= set(r["inputs"])
         chosen.append(r)
     chosen.sort(key=lambda r: (r["at"], r["inputs"]))
-    kept = [r for r in chosen if r["score"] >= GOAL]
     for i, r in enumerate(chosen):  # names for the feeds; the writer names them
         r["name"], r["_inputs"], r["_group"] = f"V{i + 1}", r["inputs"], r["group"]
-    stated = stated_feeds(graph, chosen) if graph is not None else {}
+    out = {"variables": [], "teacher": {"positions": positions, "sets": len(sets), "pool": pool, "circuit_m": M}}
     for r in chosen:
-        r["feeds"] = []
-    if kept:
-        measured_feeds(variables.Scorer(ge), tx, kept, draws)
-    out = {"variables": [], "teacher": {"positions": positions, "sets": len(sets), "kept": len(kept), "circuit_m": M}}
-    for r in chosen:
-        meas = {k: r[k] for k in ("score",)} | {"carriers": {k: (None if r[k] is None else {x: r[k][x] for x in ("how", "size", "score", "f_on", "s_off")})
-                                                            for k in ("blocks", "family", "family_sites", "active")}, "tried": r["tried"]}
-        meas["tokens"] = components.token_strings(task["model"], [ids[q] for q in r["inputs"]])
+        meas = {"score": r["score"], "carriers": {k: (None if r[k] is None else {x: r[k][x] for x in ("how", "size", "score", "f_on", "s_off")})
+                                                  for k in ("blocks", "family", "family_sites", "active", "trivial")}, "tried": r["tried"],
+                "tokens": components.token_strings(task["model"], [ids[q] for q in r["inputs"]])}
         out["variables"].append(as_json(
-            r["name"], r["inputs"], r["group"], r["feeds"], kept=r["score"] >= GOAL, carrier=r["carrier"], carried_at=r["at"],
+            r["name"], r["inputs"], r["group"], [], kind=r["kind"], carrier=r["carrier"], carried_at=r["at"],
             instances=[[n, c, t] for n, t, c in r["instances"]], instances_share=[round(r["share"][k], 4) for k in r["instances"]],
-            circuit_nodes=[["block", n, t] if c == BLOCK else [n, c, t] for n, t, c in r["circuit"]], m=r["m"],
-            feeds_stated=stated.get(r["name"], []), measured=meas))
-    js = {v["name"]: v for v in out["variables"]}
-    kv = [js[r["name"]] for r in kept]
-    for split, key in (("search", "together"), ("eval", "eval")):  # the kept variables together; each unkept alone
-        if kv:
+            circuit_nodes=[["block", n, t] if c == BLOCK else [n, c, t] for n, t, c in r["circuit"]], m=r["m"], measured=meas))
+    # each variable alone on both splits, and its position's trivial block on eval; kept: search at GOAL and eval at
+    # EVAL_KEEP (the lead's rule: a check on draws the choice never saw)
+    for v, r in zip(out["variables"], chosen):
+        for split in ("search", "eval"):
+            x = together(variables.Scorer(ge), tx, variables.parse([v], nat.C), split, draws)["variables"][0]
+            v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"]}
+        tv = as_json("trivial", r["inputs"], r["trivial"]["group"])
+        x = together(variables.Scorer(ge), tx, variables.parse([tv], nat.C), "eval", draws)["variables"][0]
+        v["measured"]["trivial_eval"] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"], "size": r["trivial"]["size"]}
+        v["kept"] = v["measured"]["search"]["term"] >= GOAL and v["measured"]["eval"]["term"] >= EVAL_KEEP
+    kv = [v for v in out["variables"] if v["kept"]]
+    stated = stated_feeds(graph, [r for r, v in zip(chosen, out["variables"]) if v["kept"]]) if graph is not None else {}
+    if kv:
+        ks = [r for r, v in zip(chosen, out["variables"]) if v["kept"]]
+        measured_feeds(variables.Scorer(ge), tx, ks, draws)
+        for v, r in zip(kv, ks):
+            v["feeds"], v["feeds_stated"] = r["feeds"], stated.get(r["name"], [])
+        for split, key in (("search", "together"), ("eval", "eval")):  # the kept variables together
             got = together(variables.Scorer(ge), tx, variables.parse(kv, nat.C), split, draws)
             out["teacher"][key] = {k: got[k] for k in ("e4", "f_on", "s_off", "f_comp", "f_feeds", "f_apart", "unresolved")}
-            for v, x in zip(kv, got["variables"]):
-                v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"]}
-        for v in out["variables"]:
-            if not v["kept"]:
-                x = together(variables.Scorer(ge), tx, variables.parse([v], nat.C), split, draws)["variables"][0]
-                v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"]}
-    for v, pv in zip(kv, variables.parse(kv, nat.C)):  # the value maps, for the writer
-        v["values"] = []
-        for q in pv["inputs"]:
-            c = var_classes.classes(sc, tx, pv, q, task["model"])
-            v["values"].append({"position": q, "token": c["token"], "predicts": c["predicts"], "classes": c["values"]})
-            release(nat.dev)
+        for v, pv in zip(kv, variables.parse(kv, nat.C)):  # the value maps, for the writer
+            v["values"] = []
+            for q in pv["inputs"]:
+                c = var_classes.classes(sc, tx, pv, q, task["model"])
+                v["values"].append({"position": q, "token": c["token"], "predicts": c["predicts"], "classes": c["values"]})
+                release(nat.dev)
+    out["teacher"].update(kept=len(kv), target=bool(kv), kinds={k: sum(v["kept"] and v["kind"] == k for v in out["variables"])
+                                                               for k in ("input", "intermediate")})
     if M > 0:
         out["teacher"]["m_share"] = sum(v["m"] for v in kv) / M
         out["teacher"]["e4x"] = sum((2 * v["measured"]["eval"]["term"] - 1) * v["m"] for v in kv) / M
     out["teacher"]["seconds"] = time.time() - t0
-    log(f"{task['id']}: {len(kept)} of {len(chosen)} variables kept, eval {out['teacher'].get('eval')}, m share "
-        f"{out['teacher'].get('m_share')}, e4x {out['teacher'].get('e4x')}, {time.time() - t0:.0f} s")
+    log(f"{task['id']}: {len(kv)} of {len(chosen)} variables kept ({out['teacher']['kinds']}), eval {out['teacher'].get('eval')}, "
+        f"m share {out['teacher'].get('m_share')}, e4x {out['teacher'].get('e4x')}, {time.time() - t0:.0f} s")
     return out
 
 
@@ -439,6 +474,8 @@ def main():
     ap.add_argument("--out", type=Path, help="outputs in OUT instead")
     ap.add_argument("--device")
     ap.add_argument("--draws", type=int, default=8)
+    ap.add_argument("--pool", choices=("circuit", "any"), default="circuit",
+                    help="carriers among the circuit's sites (its blocks and families there) or every site")
     args = ap.parse_args()
     ge = goal_eval.GoalEval(native.Native(args.device))
     tasks = args.tasks or sorted((f.stem for f in args.circuits.iterdir() if re.fullmatch(r"text\d+\.json", f.name)),
@@ -448,7 +485,7 @@ def main():
         out = args.out or (args.root / task["split"])
         out.mkdir(parents=True, exist_ok=True)
         f = args.circuits / f"{t}.json"
-        res = teach(ge, task, json.loads(f.read_text()) if f.exists() else None, args.draws, log=lambda s: print(s, flush=True))
+        res = teach(ge, task, json.loads(f.read_text()) if f.exists() else None, args.draws, args.pool, log=lambda s: print(s, flush=True))
         (out / f"{t}.json").write_text(json.dumps(res, indent=1))
 
 

@@ -65,7 +65,7 @@ def run_text(ge, sc, task_id: str, draws: int) -> dict | None:
     nat = ge.nat
     vs, carriers = [], {}
     for name, key in (("T", "t"), ("O", "o"), ("A", "a")):
-        b, rows = var_teacher.block_search(sc, tx, (r[key],), draws)
+        b, rows, _ = var_teacher.block_search(sc, tx, (r[key],), draws)
         carriers[name] = {"how": b["how"], "score": b["score"], "f_on": b["f_on"], "s_off": b["s_off"], "size": b["size"]}
         vs.append({"name": name, "inputs": [r[key]], "group": b["group"]})
     alt = lambda q, bad: next(z for z in var_classes.alternatives(nat, ids, q, int(tx.seed)) if z not in bad)  # noqa: E731

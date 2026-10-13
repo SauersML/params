@@ -285,12 +285,20 @@ def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = Fals
                   flush=True)
 
 
-def report(blocks: bool = False, behavior: bool = False):
+ATTRACTOR_IS_TARGET = {"agr_sv_num_pp", "agr_sv_num_subj-relc"}  # the attractor noun is the prompt's last token: the
+# attractor variant there falls back to t - 1 (" the")
+
+
+def report(blocks: bool = False, behavior: bool = False, run: str | None = None):
+    """The falsification table (every run's rows, or run's alone: a pod run's name), over every pair and over the pairs
+    whose attractor is a context position (ATTRACTOR_IS_TARGET's tasks left out)."""
     rows = []
     import templates
 
     stem = f"causalgym_falsify{'_blocks' if blocks else ''}{'_behavior' if behavior else ''}"
-    for p in [DATA / f"{stem}.jsonl"] + templates.run_outputs(f"{stem}*.jsonl"):
+    paths = ([DATA / f"{stem}.jsonl"] + templates.run_outputs(f"{stem}*.jsonl") if run is None else
+             sorted((Path("/Users/user/mpd-data/runpod") / run / "out").glob(f"{stem}*.jsonl")))
+    for p in paths:
         if p.exists() and ("_blocks" in p.name) == blocks and ("_behavior" in p.name) == behavior:
             rows += [json.loads(x) for x in p.read_text().splitlines()]
     by = collections.defaultdict(dict)
@@ -298,17 +306,20 @@ def report(blocks: bool = False, behavior: bool = False):
         by[(r["task"], r["pair"])].setdefault(r["variant"], r)
     terms = ["reward", "phi", "s_point", "s_nodes", "s_flips", "s_track_pp", "s_interchange_pp", "s_patching_near", "s_N",
              "s_track_pair", "moved_c"]
-    print(f"== {len(by)} pairs over {len({k[0] for k in by})} tasks; fraction of pairs where the first beats the second (ties half)")
-    print("   " + " ".join(f"{m[:12]:>12s}" for m in terms))
-    for a_, b_ in (("variable", "attractor"), ("variable", "mismatched_target"), ("variable", "target"), ("start", "variable"),
-                   ("variable_both_values", "variable"), ("variable_both_values", "attractor"),
-                   ("variable_blocks", "attractor_blocks"), ("variable_blocks", "variable")):
-        line = []
-        for m in terms:
-            vals = [1.0 if d[a_][m] > d[b_][m] + 1e-9 else 0.5 if abs(d[a_][m] - d[b_][m]) <= 1e-9 else 0.0
-                    for d in by.values() if a_ in d and b_ in d and d[a_].get(m) is not None and d[b_].get(m) is not None]
-            line.append(f"{np.mean(vals):12.2f}" if vals else f"{'-':>12s}")
-        print(f"   {' '.join(line)}   {a_} > {b_}")
+    for lab, keep in (("every pair", lambda k: True), ("attractor a context position", lambda k: k[0] not in ATTRACTOR_IS_TARGET)):
+        sel = {k: d for k, d in by.items() if keep(k)}
+        print(f"== {lab}: {len(sel)} pairs over {len({k[0] for k in sel})} tasks; share of pairs where the first beats the second (ties half)")
+        print("   " + " ".join(f"{m[:12]:>12s}" for m in terms))
+        for a_, b_ in (("variable", "attractor"), ("variable", "mismatched_target"), ("variable", "target"), ("start", "variable"),
+                       ("variable_both_values", "variable"), ("variable_both_values", "attractor"),
+                       ("variable_blocks", "attractor_blocks"), ("variable_blocks", "variable")):
+            line = []
+            for m in terms:
+                vals = [1.0 if d[a_][m] > d[b_][m] + 1e-9 else 0.5 if abs(d[a_][m] - d[b_][m]) <= 1e-9 else 0.0
+                        for d in sel.values() if a_ in d and b_ in d and d[a_].get(m) is not None and d[b_].get(m) is not None]
+                line.append(f"{np.mean(vals):12.2f}" if vals else f"{'-':>12s}")
+            if any(x.strip() != "-" for x in line):
+                print(f"   {' '.join(line)}   {a_} > {b_}")
     for v in ("target", "variable", "variable_both_values", "attractor", "mismatched_target", "start", "variable_blocks",
               "attractor_blocks"):
         if not any(v in d for d in by.values()):
@@ -327,5 +338,6 @@ if __name__ == "__main__":
     ap.add_argument("--task", default=None, help="falsify: one task only")
     ap.add_argument("--blocks", action="store_true", help="falsify, report: the carrier-block variants (patched scorecard)")
     ap.add_argument("--behavior", action="store_true", help="falsify, report: the behavior-targeted mode")
+    ap.add_argument("--run", default=None, help="report: one pod run's rows alone (its name)")
     a = ap.parse_args()
-    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task, a.blocks, a.behavior), "report": lambda: report(a.blocks, a.behavior)}[a.cmd]()
+    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task, a.blocks, a.behavior), "report": lambda: report(a.blocks, a.behavior, a.run)}[a.cmd]()

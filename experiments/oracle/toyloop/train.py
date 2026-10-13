@@ -203,22 +203,29 @@ def rl(a):
             adv.append(A)
             rs.append(r)
         adv, rs = torch.cat(adv), torch.cat(rs)
-        ids, att, comp = batch_ids(tok, pairs, a.max_len)
-        lp, m = token_logps(model, ids, att, comp)
-        per_seq = (lp * m).sum(1) / m.sum(1).clamp_min(1)
-        loss = -(adv * per_seq).mean()
-        kl = torch.tensor(0.0)
-        if ref is not None:
-            with torch.no_grad():
-                rlp, _ = token_logps(ref, ids, att, comp)
-            d = rlp - lp
-            kl = ((d.exp() - d - 1) * m).sum() / m.sum()
-            loss = loss + a.beta * kl
+        # one sequence at a time, gradients accumulated: a batch of 8 ~2k-token sequences at once is killed for memory
+        # on a 15 GB host
+        n, loss_sum, kl_sum = len(pairs), 0.0, 0.0
+        for i in range(n):
+            ids, att, comp = batch_ids(tok, pairs[i:i + 1], a.max_len)
+            lp, m = token_logps(model, ids, att, comp)
+            per_seq = (lp * m).sum(1) / m.sum(1).clamp_min(1)
+            loss = -(adv[i:i + 1] * per_seq).sum() / n
+            if ref is not None:
+                with torch.no_grad():
+                    rlp, _ = token_logps(ref, ids, att, comp)
+                d = rlp - lp
+                kl_i = ((d.exp() - d - 1) * m).sum() / m.sum()
+                loss = loss + a.beta * kl_i / n
+                kl_sum += kl_i.item() / n
+            if adv.abs().sum() > 0 or ref is not None:
+                loss.backward()
+            loss_sum += loss.item()
         if adv.abs().sum() > 0 or ref is not None:
-            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             opt.zero_grad(set_to_none=True)
+        loss, kl = torch.tensor(loss_sum), torch.tensor(kl_sum)
         log.append({"step": step, "reward": round(rs.mean().item(), 4), "reward_max": round(rs.max().item(), 4),
                     "loss": round(loss.item(), 4), "kl": round(kl.item(), 5), "sec": round(time.time() - t0, 1)})
         if step % a.log_every == 0 or step == a.steps - 1:

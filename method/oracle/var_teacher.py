@@ -38,17 +38,20 @@ variables' interventions commute, and variables carried at their own inputs with
 
 Per variable: "kept", "kind" (input or intermediate), "value_kind" (kept: "computed" when its own value class holds
 tokens other than the text's, an abstraction; "copies its inputs" when it holds the text's token alone: the
-decomposition check), "carrier" (block or family), "carried_at" (the carrier's positions), "group" (blocks ["block", site, position] or the family's subcomponents [site, index, position]), "instances" (VPD's active subcomponents on the text inside the carrier) and
-"instances_share" (the share of the text and its alternatives on which each is active: the core near 1), "circuit_nodes"
-(the circuit's nodes inside the carrier), "m" (their removal effect, goal_eval.line_effects in pp mode), "values" (the
-value map per input position, class 0 the text's own: var_classes.classes, kept variables), "feeds" (measured: each
-ordered pair of kept variables takes the claim, feeds or apart, its feeds test favours; a variable feeding no other
-feeds the prediction), "feeds_stated" (the circuit's stated paths through unnamed nodes), "measured" (the search and
-eval terms with RAVEL's Cause (f on-target), Iso (the off-target draws that can reach the carrier: changes before it)
-and Disentangle (their mean), the carriers compared). Per text, "teacher": the kept variables scored together (composition and feeds) on
-both splits, "m_share" (the share of the circuit's removal effect inside kept carriers) and "e4x" (reward v3's sum of
-(2 e4_v - 1) m_v / sum m over the kept variables, e4_v the eval term). Names V1, V2, ... in input order, meanings
-empty for the writer. Output ~/mpd-data/graph_oracle/variables/<split>/<task>.json.
+decomposition check), "carrier" (block or family), "carried_at" (the carrier's positions), "group" (blocks ["block",
+site, position] or the family's subcomponents [site, index, position]), "instances" (VPD's active subcomponents on the
+text inside the carrier) and "instances_share" (the share of the text and its alternatives on which each is active: the
+core near 1), "circuit_nodes" (the circuit's nodes inside the carrier), "m" (their removal effect,
+goal_eval.line_effects in pp mode), "values" (the value map per input position, class 0 the text's own:
+var_classes.classes, kept variables), "feeds" (measured: each ordered pair of kept variables takes the claim, feeds or
+apart, its feeds test favours; a variable feeding no other feeds the prediction), "feeds_stated" (the circuit's stated
+paths through unnamed nodes), "measured" (the search and eval terms with RAVEL's Cause (f on-target), Iso (the off-
+target draws that can reach the carrier: changes before it) and Disentangle (their mean), the carriers compared). Per
+text, "invariants": semantic.teacher_invariants' verified INVARIANTS lines from the kept variables' value maps (a fresh
+token the model sends to a class's token, carried by the carrier alone; removals), and "teacher": the kept variables
+scored together (composition and feeds) on both splits, "m_share" (the share of the circuit's removal effect inside kept
+carriers) and "e4x" (reward v3's sum of (2 e4_v - 1) m_v / sum m over the kept variables, e4_v the eval term). Names V1,
+V2, ... in input order, meanings empty for the writer. Output ~/mpd-data/graph_oracle/variables/<split>/<task>.json.
 
   var_teacher.py [TASK ...] --circuits DIR [--pool circuit|any] [--root DIR | --out DIR] [--device mps] [--draws 8]
   (no TASK: every textN.json in DIR)
@@ -479,6 +482,11 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
             # value under them (computed, an abstraction); one whose own class is the text's token alone moves with every
             # token change (it copies its inputs' identities)
             v["value_kind"] = "computed" if any(len(vm["classes"][0]["token_ids"]) > 1 for vm in v["values"]) else "copies its inputs"
+        import semantic  # verified INVARIANTS lines from the kept variables' value maps (fresh donors), for the writer
+
+        sv = [{"name": v["name"], "inputs": v["inputs"], "group": pv["group"], "values": v["values"]} for v, pv in zip(kv, variables.parse(kv, nat.C))]
+        out["invariants"] = semantic.teacher_invariants(variables.Scorer(ge), tx, sv, task["model"])
+        release(nat.dev)
     out["teacher"].update(kept=len(kv), target=bool(kv), kinds={k: sum(v["kept"] and v["kind"] == k for v in out["variables"])
                                                                for k in ("input", "intermediate")},
                           value_kinds={k: sum(v.get("value_kind") == k for v in kv) for k in ("computed", "copies its inputs")})

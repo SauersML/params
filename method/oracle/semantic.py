@@ -398,3 +398,56 @@ def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model:
         ck.close()
     total = sum(r["credit"] for r in rows) - bad
     return {"invariants": rows, "bad": bad, "credit": total, "holds": sum(r["holds"] for r in rows) / max(len(rows) + bad, 1)}
+
+
+def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "vpd4l", per_class: int = 1, fresh: int = 16) -> list[dict]:
+    """Verified INVARIANTS lines from a text's kept variables, training targets for the writer. vs: variables with
+    "name", "group" (parsed) and "values" (var_classes' value maps: classes with token_ids and predicts_id). Per variable
+    and input position p: fresh donor tokens the value map never saw (sampled from the model's prediction at p, the
+    map's tokens and the text's own left out); a fresh token z whose changed text the model itself sends to a class's
+    predicted token y (not the text's top) belongs to that class, and the explanation then predicts that the carrier
+    alone carries it: 'V from @p=z -> top y' (per_class tokens per class); and per variable 'remove V -> p(top) < 0.5'.
+    Each line checked in the real model (Checker.outcome: holds, surprise against the no-change prediction, credit),
+    the lines that hold first."""
+    import hashlib
+
+    import components
+
+    ck = Checker(sc, tx, vs)
+    items = []
+    try:
+        for v in vs:
+            for vm in v.get("values") or []:
+                p = int(vm["position"])
+                seen = {int(z) for c in vm["classes"] for z in c["token_ids"]} | {int(tx.ids[p])}
+                lp = sc.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double()
+                w = lp.exp()
+                w[sorted(seen)] = 0.0
+                gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(("invariants", int(tx.seed), p)).encode()).hexdigest()[:15], 16))
+                zs = torch.multinomial(w, min(fresh, int((w > 0).sum())), replacement=False, generator=gen).tolist()
+                want = {int(c["predicts_id"]): c["id"] for c in vm["classes"][1:] if c.get("predicts_id") is not None}
+                got = {}
+                for z in zs:
+                    y = int(ck.text({p: z})["lq"][-1].argmax())
+                    if y != ck.y0 and y in want and len(got.setdefault(want[y], [])) < per_class:
+                        got[want[y]].append((z, y))
+                for pairs in got.values():
+                    items += [(v["name"], {"transplants": [(v["name"], {p: z})]}, ("top", y), (p, z, y)) for z, y in pairs]
+            items.append((v["name"], {"remove": [v["name"]]}, ("drop", 0.5), None))
+        rows = ck.check([(iv, out) for _, iv, out, _ in items])
+    finally:
+        ck.close()
+    toks = components.token_strings(model, [t for *_, e in items if e for t in e[1:]])
+    out, k = [], 0
+    for (name, iv, outc, e), r in zip(items, rows):
+        if e:
+            z, y = toks[k], toks[k + 1]
+            k += 2
+            line = f"{name} from @{e[0]}={components.shown(z)} -> top {components.shown(y)}"
+        else:
+            line = f"remove {name} -> p(top) < 0.5"
+        out.append({"line": line, **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")}})
+    out.sort(key=lambda r: (not r["holds"], -r["surprise"]))
+    for i, r in enumerate(out):
+        r["line"] = f"I{i + 1}: {r['line']}"
+    return out

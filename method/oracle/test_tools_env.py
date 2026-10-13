@@ -117,7 +117,7 @@ def test_run_circuit_reports_goal_eval(env):
     g = native.Graph(vpd, complete=True)
     pt = env.ge.sufficiency(tx, [g])[0]
     pp = env.ge.track_pp(tx, [g], tools.split)[0]
-    assert r["nodes"] == len(vpd) and r["dropped_nodes"] == 0
+    assert r["nodes"] == len(vpd) and r.get("dropped_nodes", 0) == 0
     assert math.isclose(r["point"], pt["f1_live"], abs_tol=2e-3)
     if pp["s_track_pp"] is not None:
         assert math.isclose(r["pp"], pp["s_track_pp"], abs_tol=2e-3)
@@ -134,6 +134,9 @@ def test_errors_go_back_to_the_policy(env):
     assert "error" in call(tools, "list_active", position=99)
     assert "error" in call(tools, "list_active", position=3, site="L9.zz")
     assert "error" in call(tools, "measure_removal", nodes=["L0.q#999@3"])
+    assert "error" in call(tools, "measure_removal", nodes=["L7.q#1@3"])
+    assert "error" in call(tools, "node_effects", draft="d1")  # no draft outside an episode
+    assert "error" in call(tools, "measure_removal", nodes=["L0.q#1@3"], each=True, offset=-2)
     assert "error" in call(tools, "run_circuit", circuit="flowchart LR")
     assert "error" in call(tools, "attention", layer=7, position=3)
     assert "error" in json.loads(tools.call("nope", {}))
@@ -161,8 +164,11 @@ def test_drafts_through_episode(env):
     assert back["nodes"] == len(at11) and math.isclose(back["point"], a["point"], abs_tol=1e-9)
     assert "error" in json.loads(ep.call("run_circuit", {"base": "d99", "drop": drop}))
     assert "error" in json.loads(ep.call("run_circuit", {"base": "d1", "drop_least": 2}))  # no order measured yet
-    rem = json.loads(ep.call("measure_removal", {"draft": "d1", "each": True}))
+    rem = json.loads(ep.call("measure_removal", {"draft": "d1", "each": True, "top": 400}))
     assert sorted(x[0] for x in rem["removals"]) == sorted(components.node_text(nd) for nd in at11)
+    assert rem["each"] == len(at11) and rem["next_offset"] is None and "_order" not in rem
+    page = json.loads(ep.call("measure_removal", {"draft": "d1", "each": True, "top": 2, "offset": 1}))
+    assert [x[0] for x in page["removals"]] == [x[0] for x in rem["removals"]][1:3]
     least = [x[0] for x in rem["removals"]][::-1]
     c = json.loads(ep.call("run_circuit", {"base": "d1", "drop_least": 3}))
     want = json.loads(tools.call("run_circuit", {"nodes": [x for x in least[3:]]}))
@@ -170,6 +176,22 @@ def test_drafts_through_episode(env):
     c2 = json.loads(ep.call("run_circuit", {"base": c["draft"], "drop_least": 2}))  # the order carries over
     want2 = json.loads(tools.call("run_circuit", {"nodes": [x for x in least[5:]]}))
     assert c2["nodes"] == len(at11) - 5 and math.isclose(c2["point"], want2["point"], abs_tol=1e-9)
+    eff = json.loads(ep.call("node_effects", {"draft": "d1", "top": 400}))
+    g1 = goal_eval.strand(native.Graph(at11, complete=True), tools.targets, nat.C)
+    pt = {tuple(r["node"]): r["delta_kl"] for r in env.ge.line_effects(tools.tx, g1, mode="c")["nodes"]}
+    pp = ({tuple(r["node"]): r["delta_kl"] for r in env.ge.line_effects(tools.tx, g1, mode="pp", split=tools.split,
+                                                                       draws=tools_env.EFFECT_DRAWS)["nodes"]} if tools.tx.f2 else {})
+    assert eff["nodes"] == len(at11) and sorted(x[0] for x in eff["effects"]) == sorted(components.node_text(nd) for nd in at11)
+    for x in eff["effects"]:
+        nd = components.node_of(x[0])
+        assert math.isclose(x[2], pt[nd], rel_tol=1e-2, abs_tol=1e-3)
+        if pp:
+            assert math.isclose(x[1], pp[nd], rel_tol=1e-2, abs_tol=1e-3)
+    worst = [max(v for v in (x[1], x[2]) if v is not None) for x in eff["effects"]]
+    assert all(a >= b - 2e-3 for a, b in zip(worst, worst[1:]))
+    e2 = json.loads(ep.call("run_circuit", {"base": "d1", "drop_least": 2}))  # node_effects' order now
+    want3 = json.loads(tools.call("run_circuit", {"nodes": [x[0] for x in eff["effects"]][:-2]}))
+    assert e2["nodes"] == len(at11) - 2 and math.isclose(e2["point"], want3["point"], abs_tol=1e-9)
     cmp = json.loads(ep.call("compare", {"circuit_a": "d1", "circuit_b": b["draft"]}))
     assert "error" not in cmp or "nothing to change" in cmp["error"]
     again = json.loads(ep.call("run_circuit", {"positions": [11]}))

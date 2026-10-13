@@ -15,7 +15,12 @@ from tools, measured on demand on the real model and VPD's decomposition (goal_e
   attention(layer, position, head, top)    each head's most-read source positions at a position in the real model
   measure_removal(nodes, each)             KL in bits of the model's prediction with the nodes removed from the real
                                            model's weights at their positions (native.Native.without; each: one
-                                           removal per node, goal_eval.GoalEval.real_removal)
+                                           removal per node, goal_eval.GoalEval.real_removal, most needed first, a page
+                                           of top at offset)
+  node_effects(draft, top, offset)         per node of a draft, the KL change in bits when that node alone leaves the
+                                           draft: path-patched on changed inputs (GoalEval.line_effects "pp") and on
+                                           the text in C's semantics (line_effects "c"), most needed first; its order
+                                           (least needed first by the larger of the two) is what drop_least drops
   run_circuit(circuit, changes)            a draft CIRCUIT (Mermaid, parsed by components.parse, checked by
                                            goal_eval.circuit): its point score on the text (graph F1 in C's semantics,
                                            GoalEval.sufficiency), its path-patched score on changed inputs
@@ -80,6 +85,8 @@ TEXTS_KEPT = 8  # texts whose Tools a process keeps (an RL group's episodes shar
 LIST_TOP = 24  # list_active's default
 LIST_MAX = 400  # list_active's most
 REMOVE_EACH_MAX = 4096  # measure_removal(each=True)'s most nodes (an influential start reaches 1,127 on text9001)
+EFFECTS_MAX = 4096  # node_effects' most nodes in a draft
+EFFECT_DRAWS = 8  # node_effects' changed inputs (line_effects' draws on the tools' split)
 COMPARE_DRAWS = goal_eval.CHANGED_DRAWS  # compare's changed inputs (track_pp's draws on the tools' split)
 OTHER = {"search": "eval", "eval": "search"}
 LN2 = math.log(2)
@@ -90,14 +97,15 @@ SYSTEM = ("You explain how a small language model, vpd4l (layers 0 to 3, each wi
           "in advance: measure them with the tools before you answer. Useful order: influence() for the context "
           "positions the prediction reads; list_active() at the target and at those positions (facts=false for long "
           "lists; next_offset as offset for further pages); attention() for where the heads at the target read; "
-          "measure_removal() for which subcomponents the prediction needs; run_circuit() to score a draft circuit "
+          "measure_removal() for which subcomponents the real model needs; run_circuit() to score a draft circuit "
           "(point: graph F1 on the text; pp: path-patched agreement with the model on changed inputs; 1 is as faithful "
           "as VPD's whole answer) and compare() to see where two drafts differ. A draft is given as positions=[...] "
           "(every VPD-active subcomponent there), nodes=[...] (with edges=[[writer, reader], ...], reader OUT for the "
           "prediction, or every connection among them when no edges are given) or Mermaid text, or as base=<draft id> "
-          "with add=[...], drop=[...] or drop_least=n (after measure_removal(draft=..., each=true)); each run_circuit "
-          "returns its draft id (d1, d2, ...), which compare() also "
-          "takes. In your answer the CIRCUIT section may be a draft id alone (CIRCUIT: d3): its Mermaid is filled in. "
+          "with add=[...], drop=[...] or drop_least=n (after node_effects(draft=...) or measure_removal(draft=..., "
+          "each=true): the n least needed by the latest of them); each run_circuit returns its draft id (d1, d2, ...), "
+          "which compare(), node_effects() and measure_removal() also take. In your answer the CIRCUIT section may be a "
+          "draft id alone (CIRCUIT: d3): its Mermaid is filled in. "
           "Each tool call costs a little reward: call what you need, then reply without a tool call. That reply is your "
           "answer, in the format the question asks for.")
 
@@ -152,11 +160,25 @@ TOOL_SPECS = [
      "description": "Remove subcomponents (L<layer>.<kind>#<index>@<position>) from the real model's weights at their "
                     "positions, everything else unchanged: the KL in bits of the prediction at the target from the "
                     "model's, and the new top tokens. each=true: one removal per subcomponent instead of all at once, "
-                    "most needed first. draft: a draft's subcomponents in place of nodes.",
+                    "most needed first, top per page from offset (next_offset until null); the whole order is kept for "
+                    "drop_least. draft: a draft's subcomponents in place of nodes.",
      "parameters": {"type": "object", "properties": {
          "nodes": {"type": "array", "items": {"type": "string"}},
          "draft": {"type": "string", "description": "a draft id from run_circuit"},
-         "each": {"type": "boolean"}}, "required": []}},
+         "each": {"type": "boolean"},
+         "top": {"type": "integer", "description": f"each=true: removals per page (default {LIST_TOP}, at most {LIST_MAX})"},
+         "offset": {"type": "integer", "minimum": 0, "description": "each=true: zero-based start in the order (default 0)"}},
+         "required": []}},
+    {"name": "node_effects",
+     "description": "Per subcomponent of a draft circuit, how much the draft needs it: the KL change in bits at the target "
+                    "when that node alone leaves the draft, path-patched on changed inputs (pp_bits, weighted by how far "
+                    "each change moves the model) and on the text (point_bits); above 0: the draft needs it. Most needed "
+                    "first by the larger of the two, top per page from offset; the whole order is kept for drop_least.",
+     "parameters": {"type": "object", "properties": {
+         "draft": {"type": "string", "description": "a draft id from run_circuit"},
+         "top": {"type": "integer", "description": f"nodes per page (default {LIST_TOP}, at most {LIST_MAX})"},
+         "offset": {"type": "integer", "minimum": 0, "description": "zero-based start in the order (default 0)"}},
+         "required": ["draft"]}},
     {"name": "run_circuit",
      "description": "Score a draft circuit: point (its graph F1 on the text, 1 = as close to the model as VPD's whole "
                     "answer, on a log scale from the empty circuit), pp (its path-patched agreement with the model on "
@@ -173,7 +195,7 @@ TOOL_SPECS = [
          "base": {"type": "string", "description": "a draft id to start from"},
          "add": {"type": "array", "items": {"type": "string"}, "description": "nodes added to the base"},
          "drop": {"type": "array", "items": {"type": "string"}, "description": "nodes dropped from the base (with their edges)"},
-         "drop_least": {"type": "integer", "description": "drop the base's n least needed nodes, by measure_removal(draft=base, each=true)'s order (kept by later drafts)"},
+         "drop_least": {"type": "integer", "description": "drop the base's n least needed nodes, by the latest node_effects(draft=base) or measure_removal(draft=base, each=true) order (kept by later drafts)"},
          "changes": {"type": "array", "items": {"type": "array"},
                      "description": "[[position, token], ...], token as quoted in the question, e.g. \"' castle'\", or an id"}},
          "required": []}},
@@ -284,6 +306,8 @@ class Tools:
             for nd in g:
                 if nd[0] == components.TOK or nd[2] == components.BLOCK:
                     raise ToolError(f"{x!r}: only subcomponents can be removed (no tok or block)")
+                if nd[0] not in self.nat.C:
+                    raise ToolError(f"{x!r}: no such matrix (layers 0 to {self.nat.target.n_layer - 1}, kinds q, k, v, o, fc, down)")
                 if not 0 <= nd[2] < self.nat.C[nd[0]]:
                     raise ToolError(f"{x!r}: index outside the matrix's {self.nat.C[nd[0]]} subcomponents")
                 self._pos(nd[1])
@@ -452,7 +476,19 @@ class Tools:
         return {"layer": layer, "position": p, "columns": ["position", "token", "weight"],
                 "heads": {f"h{h}": [[int(a), self._tok(int(a)), _r(b, 2)] for a, b in zip(at[h].tolist(), w[h].tolist())] for h in heads}}
 
-    def measure_removal(self, nodes=None, each: bool = False, draft=None, _json=None) -> dict:
+    @staticmethod
+    def _page(rows: list, top, offset) -> tuple[list, int, int | None]:
+        """(rows[offset:offset + top], offset, the next page's offset or None): top within 1 to LIST_MAX."""
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ToolError("offset must be a non-negative integer")
+        try:
+            top = max(1, min(int(top), LIST_MAX))
+        except (TypeError, ValueError):
+            raise ToolError("top must be an integer") from None
+        page = rows[offset:offset + top]
+        return page, offset, offset + len(page) if offset + len(page) < len(rows) else None
+
+    def measure_removal(self, nodes=None, each: bool = False, draft=None, top: int = LIST_TOP, offset: int = 0, _json=None) -> dict:
         if draft is not None and _json is None:
             raise ToolError(f"no draft {draft!r} in this episode")
         if _json is not None:
@@ -464,11 +500,37 @@ class Tools:
                 raise ToolError(f"each=true takes at most {REMOVE_EACH_MAX} nodes")
             rows = self.ge.real_removal(tx, [native.Graph([nd], complete=True) for nd in nds])
             got = sorted(zip(nds, [r["kl_real_minus"] for r in rows]), key=lambda x: -x[1])
-            return {"columns": ["node", "kl_bits"], "removals": [[components.node_text(nd), _r(k)] for nd, k in got]}
+            page, offset, nxt = self._page(got, top, offset)
+            return {"each": len(got), "offset": offset, "next_offset": nxt, "columns": ["node", "kl_bits"],
+                    "removals": [[components.node_text(nd), _r(k)] for nd, k in page],
+                    "_order": [components.node_text(nd) for nd, _ in got[::-1]]}
         with torch.no_grad():
             lq = self.nat.without(self.ids, self.targets, nds)
         kl = float(carry.kl(tx.ref, lq)[0])
         return {"removed": len(nds), "kl_bits": _r(kl), "model_top": self._top(tx.ref), "top_after": self._top(lq)}
+
+    def node_effects(self, draft=None, top: int = LIST_TOP, offset: int = 0, _json=None) -> dict:
+        if _json is None:
+            raise ToolError(f"no draft {draft!r} in this episode" if draft is not None else "node_effects needs draft, a draft id from run_circuit")
+        g, _, _ = self._graph(_json=_json)
+        g = goal_eval.strand(g, self.targets, self.nat.C)
+        if not g.count():
+            raise ToolError("the draft has no valid node")
+        if g.count() > EFFECTS_MAX:
+            raise ToolError(f"node_effects takes drafts of at most {EFFECTS_MAX} nodes")
+        if offset != 0:
+            self._page([], top, offset)  # the arguments' checks before the runs
+        pp = self.ge.line_effects(self.tx, g, mode="pp", split=self.split, draws=EFFECT_DRAWS) if self.tx.f2 else None
+        pt = self.ge.line_effects(self.tx, g, mode="c")
+        d_pp = {tuple(r["node"]): r["delta_kl"] for r in pp["nodes"]} if pp else {}  # carry.kl's bits
+        rows = [(tuple(r["node"]), d_pp.get(tuple(r["node"])), r["delta_kl"]) for r in pt["nodes"]]
+        worst = lambda r: max(x for x in (r[1], r[2], -math.inf) if x is not None)  # noqa: E731
+        rows.sort(key=lambda r: (-worst(r), r[0]))
+        page, offset, nxt = self._page(rows, top, offset)
+        return {"nodes": len(rows), "pp_kl_bits": _r(pp["base_kl"]) if pp else None, "point_kl_bits": _r(pt["base_kl"]),
+                "offset": offset, "next_offset": nxt, "columns": ["node", "pp_bits", "point_bits"],
+                "effects": [[components.node_text(nd), _r(a), _r(b)] for nd, a, b in page],
+                "_order": [components.node_text(nd) for nd, _, _ in rows[::-1]]}
 
     def _score(self, g) -> dict:
         ge, tx = self.ge, self.tx
@@ -484,10 +546,10 @@ class Tools:
             raise ToolError("base, add and drop need an episode's drafts (the environment resolves them)")
         g, d, p = self._graph(circuit, nodes=nodes, edges=edges, positions=positions, complete=complete, _json=_json)
         g = goal_eval.strand(g, self.targets, self.nat.C)
+        defects = {"dropped_nodes": d["invalid_nodes"] + d["unknown_ids"] + p.get("malformed_nodes", 0) * (_json is None and circuit is None),
+                   "dropped_edges": d["invalid_edges"], "stranded_nodes": d["stranded_nodes"], "bad_lines": d["malformed_lines"]}
         out = {"nodes": g.count(), "edges": native.count_edges(g.node_set(), self.targets) if g.complete else g.edges(),
-               "bits": _r(self._bits(g, p, d)), "dropped_nodes": d["invalid_nodes"] + d["unknown_ids"] + p.get("malformed_nodes", 0) * (_json is None and circuit is None),
-               "dropped_edges": d["invalid_edges"], "stranded_nodes": d["stranded_nodes"], "bad_lines": d["malformed_lines"],
-               "_json": p["answer"]}
+               "bits": _r(self._bits(g, p, d)), **{k: v for k, v in defects.items() if v}, "_json": p["answer"]}  # defects when any
         if p.get("bad_examples"):
             out |= {"bad_examples": p["bad_examples"], "hint": MERMAID_HINT}
         if not g.count():
@@ -685,18 +747,15 @@ class Episode:
             for k in ("circuit_a", "circuit_b"):
                 if isinstance(args.get(k), str) and DRAFT_RE.fullmatch(args[k].strip()):
                     args[k] = {"_json": self._draft(args[k])}
-        if name == "measure_removal" and args.get("draft") is not None:
+        if name in ("measure_removal", "node_effects") and args.get("draft") is not None:
             args["_json"] = self._draft(args["draft"])
         return args
 
-    def _ordered(self, name: str, args: dict, text: str, did: str | None) -> None:
-        """Keep a draft's least-needed order: from measure_removal(draft, each) of it, or its base's less what it
-        dropped (nodes it added last)."""
-        if name == "measure_removal" and args.get("each") and args.get("draft") is not None:
-            try:
-                self.order[str(args["draft"]).strip()] = [x[0] for x in json.loads(text).get("removals", [])][::-1]
-            except (ValueError, TypeError):
-                pass
+    def _ordered(self, name: str, args: dict, side: dict, did: str | None) -> None:
+        """Keep a draft's least-needed order: the latest node_effects(draft) or measure_removal(draft, each) of it (the
+        tool's whole order, side data), or its base's less what it dropped (nodes it added last)."""
+        if name in ("measure_removal", "node_effects") and args.get("draft") is not None and side.get("_order") is not None:
+            self.order[str(args["draft"]).strip()] = list(side["_order"])
         inh = getattr(self, "_inherit", None)
         if name == "run_circuit" and inh and did and inh[0] in self.order and did not in self.order:
             have = {components.node_text((m, t, c)) for m, c, t in self.drafts[did]["nodes"] if m not in ("block", components.TOK)}
@@ -726,7 +785,7 @@ class Episode:
             did = next((k for k, v in self.drafts.items() if v == side["_json"]), None) or f"d{len(self.drafts) + 1}"
             self.drafts[did] = side["_json"]
             text = text[:-1] + f',"draft":"{did}"}}'
-        self._ordered(name, args, text, did)
+        self._ordered(name, args, side, did)
         self._inherit = None
         self.asked[key] = self.asked.get(key, 0) + 1
         if self.asked[key] > 1 and text.endswith("}"):  # the same call again in this episode: the same result
@@ -805,12 +864,14 @@ class Scripted:
     """The baseline policy on the tools alone, in drafts: influence(); the influential start, every VPD-active
     subcomponent at the target and the m most influential positions (run_circuit(positions=...), a complete node set),
     m the smallest whose pp reaches FLOOR (positions moving the prediction by at least 1% of the total, at most
-    MAX_POSITIONS); the start's nodes ordered by their measured removal (measure_removal(draft, each)); then each turn
-    tries dropping the next chunk, half of it and a quarter of it from the current draft at once (three run_circuit
-    calls, base and drop_least) and keeps the largest drop whose pp and point stay within TOLERANCE of the start's; the chunk
-    starts at half the start and halves after a turn with no drop kept, until it is below 1/MIN_FRACTION of the start
-    or the turns or calls run out (the episode's MAX_TURNS and MAX_CALLS, one turn kept for the answer). A draft above
-    components.NODE_CAP drops its least needed nodes to the cap. The answer: CIRCUIT: <the last kept draft>."""
+    MAX_POSITIONS); the start's nodes ranked by node_effects (each node's own effect on the draft, path-patched and on
+    the text); then each turn tries dropping the next chunk, half of it and a quarter of it from the current draft at
+    once (three run_circuit calls, base and drop_least) and keeps the largest drop whose pp and point stay within
+    TOLERANCE of the start's, re-ranking the kept draft by node_effects; the chunk starts at half the start and halves
+    after a turn with no drop kept, until it is below 1/MIN_FRACTION of the start or the turns or calls run out (the
+    episode's MAX_TURNS and MAX_CALLS, one turn kept for the answer). A draft above components.NODE_CAP drops its least
+    needed nodes to the cap. The answer: CIRCUIT: <the last kept draft>. rank="removal" ranks by measure_removal(draft,
+    each) instead (each node's removal from the real model, not from the draft: the first version's order)."""
 
     FLOOR = 0.9
     TOLERANCE = 0.05
@@ -818,8 +879,12 @@ class Scripted:
     MIN_FRACTION = 32
     TRIALS = (1, 2, 4)  # a turn's drops: the chunk over these
 
-    def __init__(self, max_turns: int = MAX_TURNS, max_calls: int = MAX_CALLS):
-        self.max_turns, self.max_calls, self.gen, self.trace = max_turns, max_calls, None, []
+    def __init__(self, max_turns: int = MAX_TURNS, max_calls: int = MAX_CALLS, rank: str = "effects"):
+        self.max_turns, self.max_calls, self.rank, self.gen, self.trace = max_turns, max_calls, rank, None, []
+
+    def _rank(self, draft: str) -> dict:
+        return (_call("node_effects", draft=draft, top=8) if self.rank == "effects" else
+                _call("measure_removal", draft=draft, each=True, top=8))
 
     def __call__(self, messages: list, tools: list) -> dict:
         if self.gen is None:
@@ -857,13 +922,15 @@ class Scripted:
                 break
         draft, size = score.get("draft"), score.get("nodes") or 0
         base_pp, base_pt = score.get("pp") or 0.0, score.get("point") or 0.0
-        (rem,) = yield self._msg(_call("measure_removal", draft=draft, each=True))
+        (rk,) = yield self._msg(self._rank(draft))
         turns, calls = turns + 1, calls + 1
-        left = len(rem.get("removals", []))  # the candidates, least needed first in the episode's order of the draft
+        left = size if "error" not in rk else 0  # the candidates: every node of the current draft, least needed first in its order
         chunk = max(1, left // 2)
         floor = max(1, left // self.MIN_FRACTION)
-        while left and chunk >= floor and turns < self.max_turns - 2 and calls + len(self.TRIALS) + 1 <= self.max_calls:
-            sizes = sorted({max(1, min(left, chunk // k)) for k in self.TRIALS}, reverse=True)
+        # a turn of drops, the kept draft's ranking and the cap's drop must leave the answer's turn (Episode.step ends
+        # an episode at MAX_TURNS turns or MAX_CALLS calls)
+        while left > 1 and chunk >= floor and turns < self.max_turns - 3 and calls + len(self.TRIALS) + 2 < self.max_calls:
+            sizes = sorted({max(1, min(left - 1, chunk // k)) for k in self.TRIALS}, reverse=True)
             got = yield self._msg(*[_call("run_circuit", base=draft, drop_least=n) for n in sizes])
             turns, calls = turns + 1, calls + len(sizes)
             kept = None
@@ -874,7 +941,12 @@ class Scripted:
                 if ok and kept is None:
                     kept = (n, sc)
             if kept:
-                draft, size, left = kept[1]["draft"], kept[1]["nodes"], left - kept[0]
+                draft, size = kept[1]["draft"], kept[1]["nodes"]
+                left = size
+                (rk,) = yield self._msg(self._rank(draft))  # the kept draft's own order
+                turns, calls = turns + 1, calls + 1
+                if "error" in rk:
+                    break
             else:
                 chunk //= 2
         if size > components.NODE_CAP:  # the answer's cap: the least needed go

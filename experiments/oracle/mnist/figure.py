@@ -11,6 +11,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import textwrap
 
 import matplotlib
 
@@ -21,9 +22,10 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
+from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DATA, MODULES, load_decomp, load_mnist  # noqa: E402
+from common import DATA, MODULES, RAW, _idx, load_decomp, load_mnist  # noqa: E402
 
 BLUE, RED, GREEN, AMBER, PURPLE = "#2F6DB5", "#D1495B", "#2E8B57", "#E09F3E", "#7B5EA7"
 SOFT = "#9DB9DD"
@@ -93,6 +95,89 @@ def concept_name(info: dict | None) -> str | None:
     return ("" if info["sign"] == "+" else "no ") + SHORT[info["feature"]]
 
 
+def circuit_panel(V, x, ex, named):
+    """Full input read directions, not image-masked contributions; no model execution."""
+    members = [m for m in ex["members"] if m.startswith("fc1#")]
+    ranked = sorted(
+        (m for m in members if concept_name(named.get(m))),
+        key=lambda m: -float(np.abs(x * V[:, int(m.split("#")[1])]).sum()),
+    )
+    pick, seen = [], set()
+    for m in ranked:
+        name = concept_name(named[m])
+        if name not in seen:
+            pick.append(m)
+            seen.add(name)
+    pick = (pick + [m for m in ranked if m not in pick])[:8]
+    if len(pick) != 8:
+        raise ValueError(f"Image {ex['image']} has fewer than eight named circuit members")
+
+    fig = plt.figure(figsize=(16, 8.1), facecolor="#fafbfD")
+    fig.text(.045, .945, "One digit’s circuit", fontsize=29, weight="bold", color="#192B43")
+    fig.text(.045, .894, f"{len(members)} input-layer subcomponents · later layers whole", fontsize=19)
+    fig.text(.045, .847, "Eight selected subcomponents, named by their best-predicting stroke feature", fontsize=15,
+             color="#526174")
+    gs = fig.add_gridspec(2, 6, left=.045, right=.97, bottom=.23, top=.755,
+                          width_ratios=[1.15, .14, 1, 1, 1, 1], wspace=.32, hspace=.72)
+    digit = fig.add_subplot(gs[:, 0])
+    digit.imshow(x.reshape(28, 28), cmap="gray_r", vmin=0, vmax=1, interpolation="nearest")
+    digit.set_title(f"Test digit\nlabel {ex['label']}", fontsize=17, loc="center", pad=14)
+    digit.text(.5, -.12, f"image {ex['image']}", transform=digit.transAxes, ha="center", fontsize=11, color="#68778A")
+    axes = [digit]
+    cmap = LinearSegmentedColormap.from_list("full_input_weights", ["#2467A6", "#F4F3EF", "#BF3D48"])
+    for i, m in enumerate(pick):
+        a = fig.add_subplot(gs[i // 4, 2 + i % 4])
+        weights = V[:, int(m.split("#")[1])].reshape(28, 28)
+        limit = float(np.abs(weights).max())
+        if not np.isfinite(weights).all() or limit == 0:
+            raise ValueError(f"Invalid input weights for {m}")
+        im = a.imshow(weights / limit, cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
+        a.set_title(textwrap.fill(concept_name(named[m]), width=22), fontsize=13, weight="medium",
+                    loc="center", pad=9, linespacing=1.12)
+        a.text(.5, -.09, m, transform=a.transAxes, ha="center", va="top", fontsize=10, color="#68778A")
+        axes.append(a)
+    for a in axes:
+        a.set_xticks([])
+        a.set_yticks([])
+        for sp in a.spines.values():
+            sp.set_visible(True)
+            sp.set_color("#C8D0DA")
+            sp.set_linewidth(.8)
+    cax = fig.add_axes([.445, .125, .31, .018])
+    cb = fig.colorbar(im, cax=cax, orientation="horizontal", ticks=[-1, 0, 1])
+    cb.ax.set_xticklabels(["negative", "zero", "positive"], fontsize=11)
+    cb.ax.tick_params(length=0, pad=5)
+    cb.outline.set_visible(False)
+    fig.text(.045, .073, "Full 28 × 28 input weights · each square scaled to its own maximum absolute weight",
+             fontsize=12, color="#526174")
+    fig.text(.045, .037, "Blue ink lowers the component’s read; red ink raises it. Names describe associations with stroke features.",
+             fontsize=12, color="#526174")
+    return fig
+
+
+def save_circuit_panels(args) -> None:
+    """Write the requested panel and a PDF with optional additional test examples."""
+    suffix = f"tau{args.tau}_s{args.tau / 2}"
+    rows = load(f"circuits_{args.tag}_blocks-fc2-fc3_{suffix}.json")
+    named = json.loads((DATA / f"concepts_{args.tag}_blocks-fc2-fc3_{suffix}.json").read_text())["named"]
+    V = torch.load(DATA / f"vpd_{args.tag}.pt", map_location="cpu", weights_only=False)["V"]["fc1"].numpy()
+    images = _idx(RAW / "t10k-images-idx3-ubyte.gz").reshape(-1, 784).astype(np.float32) / 255
+    example = args.example if args.example is not None else sorted(rows, key=units)[len(rows) // 2]["image"]
+    indices = [example] + [i for i in args.extra_examples if i != example]
+    output = args.output or Path.home() / "Downloads" / "mnist_circuit_full_heatmaps.png"
+    output = output.with_suffix(".png")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with PdfPages(output.with_suffix(".pdf")) as pdf:
+        for i, index in enumerate(dict.fromkeys(indices)):
+            ex = next(r for r in rows if r["image"] == index)
+            fig = circuit_panel(V, images[index], ex, named)
+            if i == 0:
+                fig.savefig(output, dpi=220, facecolor=fig.get_facecolor())
+            pdf.savefig(fig, facecolor=fig.get_facecolor())
+            plt.close(fig)
+    print(f"Wrote {output} and {output.with_suffix('.pdf')} (examples {indices})")
+
+
 @torch.no_grad()
 def active_only(dec, x: torch.Tensor) -> list[float]:
     """VPD's active subcomponents alone (mask 1[CI > 0], remainder off, each layer on the masked model's own input):
@@ -120,8 +205,14 @@ def main() -> None:
     ap.add_argument("--tag", default="i5e-4")
     ap.add_argument("--tau", type=float, default=0.1)
     ap.add_argument("--example", type=int, default=None, help="test image index for panel A")
+    ap.add_argument("--panel-only", action="store_true", help="export full-square input weight heatmaps only")
+    ap.add_argument("--output", type=Path, help="panel PNG path; also writes a PDF alongside it")
+    ap.add_argument("--extra-examples", type=int, nargs="*", default=[], help="additional test-image pages in the panel PDF")
     args = ap.parse_args()
     setup()
+    if args.panel_only:
+        save_circuit_panels(args)
+        return
     t, tau = args.tag, args.tau
     s = f"tau{tau}_s{tau / 2}"
     dec = load_decomp(DATA / f"vpd_{t}.pt")

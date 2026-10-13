@@ -163,7 +163,10 @@ def family(ge, tx, graphs: list[native.Graph], seed: int | None = None, edits: l
     """Per graph (C's semantics, remainders live): s_weight, s_weight_raw, kl_weight_c (the mean KL_C) and draws_weight
     (module docstring); one set of edits per text, the same for every graph. A run's prediction under an edit is
     compared as its change (_moved: the model's prediction moved by log q_e - log q), so a circuit's or VPD's own error
-    on the unedited text does not count against it."""
+    on the unedited text does not count against it. Separate direct diagnostics retain that error: kl_weight_unedited
+    is KL(p || q_C), kl_weight_direct is mean KL(p_e || q_C,e), and draws_weight_direct has the same edit identifiers
+    and W as draws_weight but direct candidate/VPD KLs. These diagnostics use the same live remainders and do not
+    change s_weight or its pooling. With no edits, kl_weight_direct is None rather than a measured zero."""
     nat = ge.nat
     ids, targets = tx.ids, tx.targets
     if edits is None:
@@ -173,6 +176,8 @@ def family(ge, tx, graphs: list[native.Graph], seed: int | None = None, edits: l
     vpd = [native.Graph(masks=tx.vpd)] if tx.vpd is not None else []
     allg = list(graphs) + vpd
     before = _lqs(ge, ids, targets, allg)
+    original_kl = carry.kl(p0[None].expand(len(allg), -1, -1), before).tolist()
+    direct_draws = [[] for _ in graphs]
     acc = [[0.0, 0.0, 0.0, 0.0, []] for _ in graphs]  # sum W s, sum W, sum W s_raw, sum KL_C, draws
     for e in edits:
         with applied(nat, e, ge):
@@ -180,6 +185,10 @@ def family(ge, tx, graphs: list[native.Graph], seed: int | None = None, edits: l
             after = _lqs(ge, ids, targets, allg)
         W = float(carry.kl(pe[None], p0[None])[0])
         kls = carry.kl(pe[None].expand(len(allg), -1, -1), _moved(p0[None], before, after)).tolist()
+        direct_kls = carry.kl(pe[None].expand(len(allg), -1, -1), after).tolist()
+        direct_vpd = direct_kls[-1] if vpd else None
+        for rows, k in zip(direct_draws, direct_kls):
+            rows.append([e["kind"], e["what"], e["k"], W, k, direct_vpd])
         kv = kls[-1] if vpd else None
         for a, k in zip(acc, kls):
             a[3] += k
@@ -191,7 +200,11 @@ def family(ge, tx, graphs: list[native.Graph], seed: int | None = None, edits: l
             a[1] += W
             a[2] += W * min(raw, 1.0)
     return [{"s_weight": a[0] / a[1] if a[1] else None, "s_weight_raw": a[2] / a[1] if a[1] else None,
-             "kl_weight_c": a[3] / max(1, len(edits)), "draws_weight": a[4]} for a in acc]
+             "kl_weight_c": a[3] / max(1, len(edits)), "draws_weight": a[4],
+             "kl_weight_unedited": original_kl[i],
+             "kl_weight_direct": sum(d[4] for d in direct_draws[i]) / len(edits) if edits else None,
+             "draws_weight_direct": direct_draws[i], "weight_direct_remainders": "live"}
+            for i, a in enumerate(acc)]
 
 
 def main():
@@ -215,7 +228,8 @@ def main():
     graphs = {"answer": g, "vpd": native.Graph(masks=tx.vpd), "empty": native.Graph()}
     rows = family(ge, tx, list(graphs.values()))
     for (name, _), r in zip(graphs.items(), rows):
-        print(f"{name}: s_weight {r['s_weight']}, raw {r['s_weight_raw']}, mean KL_C {r['kl_weight_c']:.4f}")
+        print(f"{name}: s_weight {r['s_weight']}, raw {r['s_weight_raw']}, mean KL_C {r['kl_weight_c']:.4f}, "
+              f"unedited KL {r['kl_weight_unedited']:.4f}, mean direct edited KL {r['kl_weight_direct']}")
     for d in rows[0]["draws_weight"]:
         print("  ", d[:3], f"W {d[3]:.4f} KL_C {d[4]:.4f} KL_V {d[5]:.4f}" if d[5] is not None else d)
 

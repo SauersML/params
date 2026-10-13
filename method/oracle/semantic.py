@@ -51,6 +51,7 @@ import native  # noqa: E402
 import variables  # noqa: E402
 
 LN2 = math.log(2.0)
+KEEP = 8  # changed texts a Checker keeps
 REMOVE_MIN = 0.5  # bits: a removal moving the top token's probability less than this makes no removal line
 BLOCK = variables.BLOCK
 
@@ -68,7 +69,8 @@ class Checker:
         self._means: dict = {}
 
     def text(self, changes: dict) -> dict:
-        """The real model's run on x with the changes (kept while the checker lives)."""
+        """The real model's run on x with the changes (the KEEP latest kept: each holds the engine's tables, ~0.2 GB on a
+        long text, and a text with 16 variables checks ~90 lines; var_post went past 16 GiB keeping them all)."""
         key = tuple(sorted((int(p), int(z)) for p, z in changes.items()))
         if not key:
             return self.base
@@ -76,6 +78,8 @@ class Checker:
             x = list(self.tx.ids)
             for p, z in key:
                 x[p] = z
+            while len(self._texts) >= KEEP:
+                self._texts.pop(next(iter(self._texts)))
             self._texts[key] = self.sc._text(x, self.tx.targets, check=False)
         return self._texts[key]
 

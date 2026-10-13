@@ -178,7 +178,9 @@ def falsify(per_task: int = 8, only_task: str | None = None):
     position p, the source's token z there), circuits on the base prompt (VPD's actives at the positions named, every
     connection among them): target (the last position alone), variable (and p), attractor (and the wrong variable's
     position), mismatched target (the variable circuit's positions with the source prompt's actives: a circuit built
-    for the other label), and the influential start (start_set). Per circuit reward v3's terms (phi over the text's
+    for the other label), the variable with both its values' parts (VPD's actives at p on the base and on the source:
+    VPD writes a token's identity in which subcomponents are active, so one value's parts cannot carry the change), and
+    the influential start (start_set). Per circuit reward v3's terms (phi over the text's
     families, ge.tau on the eval split, cap_phi, the gate, size_bits, compactness against the start, the circuit reward
     phi - phi_tau + g x 0.5 compact) and the minimal pair through the circuit: the circuit run on the source prompt in
     C's semantics (the base's subcomponents, the source's tokens), the share of the model's base-to-source move of
@@ -221,7 +223,8 @@ def falsify(per_task: int = 8, only_task: str | None = None):
             tx = ge.text(ids, [t], native.task_seed(f"causalgym:{task}:{k}"))
             ts = ge.text(ex["src"], [t], native.task_seed(f"causalgym:{task}:{k}:src"))
             act = lambda x, ps: [(n, q, int(c)) for n in nat.names for q in ps for c in x.vpd[n][q].nonzero().flatten().tolist()]  # noqa: E731
-            variants = {"target": act(tx, [t]), "variable": act(tx, [t, p]), "mismatched_target": act(ts, [t, p])}
+            variants = {"target": act(tx, [t]), "variable": act(tx, [t, p]), "mismatched_target": act(ts, [t, p]),
+                        "variable_both_values": act(tx, [t, p]) + act(ts, [p])}
             if pw is not None:
                 variants["attractor"] = act(tx, [t, pw])
             tau = ge.tau(tx, pool, "eval")
@@ -279,14 +282,15 @@ def report():
              "s_track_pair", "moved_c"]
     print(f"== {len(by)} pairs over {len({k[0] for k in by})} tasks; fraction of pairs where the first beats the second (ties half)")
     print("   " + " ".join(f"{m[:12]:>12s}" for m in terms))
-    for a_, b_ in (("variable", "attractor"), ("variable", "mismatched_target"), ("variable", "target"), ("start", "variable")):
+    for a_, b_ in (("variable", "attractor"), ("variable", "mismatched_target"), ("variable", "target"), ("start", "variable"),
+                   ("variable_both_values", "variable"), ("variable_both_values", "attractor")):
         line = []
         for m in terms:
             vals = [1.0 if d[a_][m] > d[b_][m] + 1e-9 else 0.5 if abs(d[a_][m] - d[b_][m]) <= 1e-9 else 0.0
                     for d in by.values() if a_ in d and b_ in d and d[a_].get(m) is not None and d[b_].get(m) is not None]
             line.append(f"{np.mean(vals):12.2f}" if vals else f"{'-':>12s}")
         print(f"   {' '.join(line)}   {a_} > {b_}")
-    for v in ("target", "variable", "attractor", "mismatched_target", "start"):
+    for v in ("target", "variable", "variable_both_values", "attractor", "mismatched_target", "start"):
         rs = [d[v] for d in by.values() if v in d]
         mean = lambda m: np.mean([r[m] for r in rs if r.get(m) is not None])  # noqa: E731
         print(f"   {v:18s} n {len(rs):3d} reward {mean('reward'):6.2f} phi {mean('phi'):5.2f} bits {mean('bits'):8.0f} "

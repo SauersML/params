@@ -168,6 +168,17 @@ def stage_reward(score: dict, stage: int) -> float:
     return score["reward"] - gate * sum(term(t) or 0.0 for t in QUALITY if t not in STAGES[stage])
 
 
+R_TOL = 1e-6  # trained reward against the scorer's R on a circuit-only question (the lead's guard, 10-13)
+
+
+def reward_mismatches(q: dict, scores: list, rewards: list) -> list:
+    """The answers to a circuit-only question (no stage term applies) whose trained reward is not the scorer's R within
+    R_TOL: rl stops on any."""
+    if not q.get("circuit_only"):
+        return []
+    return [i for i, (s, r) in enumerate(zip(scores, rewards)) if not abs(r - s["reward"]) <= R_TOL]
+
+
 def stage_lines(text: str, credits: list, stage: int) -> list:
     """The per-line credits the stage rewards: the circuit's lines always, the variable lines with E4x, the ANSWER and
     FINAL lines with E2g."""
@@ -415,13 +426,15 @@ def explain(a) -> None:
                       "reader_b": mean([o["reader_b"] for o in kept if o.get("reader_b") is not None]), "spend_usd": total}), flush=True)
 
 
-def clients(base: str, rank: int, init: str | None, thinking: bool = False):
+def clients(base: str, rank: int, init: str | None, thinking: bool = False, optimizer: bool = False):
+    """optimizer: the state's Adam moments too (a resumed rl run), else its weights alone."""
     import tinker
     from tinker_cookbook import renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
     service = service_client()
-    training = (service.create_training_client_from_state(init) if init
+    training = (service.create_training_client_from_state_with_optimizer(init) if init and optimizer
+                else service.create_training_client_from_state(init) if init
                 else service.create_lora_training_client(base_model=base, rank=rank))
     tokenizer = get_tokenizer(base)
     return tinker, service, training, renderers.get_renderer(THINKING_RENDERER if thinking else RENDERER, tokenizer), tokenizer
@@ -506,7 +519,7 @@ def rl(a) -> None:
 
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.log, a.base)
-    tinker, service, training, renderer, tokenizer = clients(a.base, a.rank, a.init, a.thinking)
+    tinker, service, training, renderer, tokenizer = clients(a.base, a.rank, a.init, a.thinking, optimizer=a.first_step > 0)
     questions = [json.loads(x) for x in a.questions.read_text().splitlines() if x.strip()]
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import components
@@ -572,16 +585,22 @@ def rl(a) -> None:
                 continue
             scores = r.json()["scores"]
             rewards = [stage_reward(s, stage) for s in scores]
+            if bad := reward_mismatches(q, scores, rewards):
+                (a.log / f"mismatch_{step}_{q['task']}.json").write_text(json.dumps({"rewards": rewards, "scores": scores, "answers": bad}))
+                raise SystemExit(f"step {step}, {q['task']}: trained reward is not the scorer's R for answers {bad} "
+                                 f"(in {a.log}/mismatch_{step}_{q['task']}.json)")
             mean = sum(rewards) / len(rewards)
             distinct = len({tuple(s.tokens) for s in res.sequences})
             if step == 0 and distinct == 1 and a.group > 1:  # a seeded or degenerate sampler: no advantage, nothing learned
                 raise SystemExit(f"all {a.group} answers to {q['task']} are identical: check the sampling parameters")
-            groups.append({"task": q["task"], "distinct": distinct, "rewards": rewards, "valid": [s["valid"] for s in scores],
+            groups.append({"task": q["task"], "distinct": distinct, "rewards": rewards, "R": [s["reward"] for s in scores],
+                           "valid": [s["valid"] for s in scores],
                            "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "tokens", "overflow")} for s in scores],
                            "texts": texts, "thinking_tokens": list(thinks), "stop": [str(s.stop_reason) for s in res.sequences],
                            "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
-                           "terms": {k: [s.get(k) for s in scores] for k in ("phi", "phi_tau", "g", "compact", "bits", "D", "Q", "E2g",
-                                                                              "E4x", "E1", "C", "N", "E2", "E3", "E4")}})
+                           "terms": {k: [s.get(k) if k in s else s.get("term_" + k) for s in scores]  # the scorer's names
+                                     for k in ("phi", "phi_tau", "g", "compact", "bits", "D", "Q", "E2g", "E4x", "E1", "C", "N",
+                                               "E2", "E3", "E4")}})
             for s, rew, sc, text in zip(res.sequences, rewards, scores, texts):
                 adv = line_advantages(tokenizer, list(s.tokens), text, stage_lines(text, sc.get("lines") or [], stage), rew - mean)
                 if not any(adv):

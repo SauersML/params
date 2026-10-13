@@ -34,3 +34,14 @@ def test_the_curriculum_advances_when_the_held_out_evaluations_stop_improving(tm
     assert tt.next_stage(tmp_path, 0, 0) == 1  # 75 and 100 below 50's 0.6
     assert tt.next_stage(tmp_path, 0, 75) == 0  # too few evaluations in the stage
     assert tt.next_stage(tmp_path, len(tt.STAGES) - 1, 0) == len(tt.STAGES) - 1
+
+
+def test_the_circuit_arm_trains_on_the_scorers_r_and_stops_otherwise():
+    q = {"circuit_only": True}
+    scores = [{"valid": True, "reward": 0.7, "g": 0.5, "term_E2g": None, "term_E4x": None, "term_E1": None},
+              {"valid": False, "reward": -10.0}]
+    assert tt.reward_mismatches(q, scores, [tt.stage_reward(s, 0) for s in scores]) == []
+    leak = [{**scores[0], "term_E4x": 0.4}, scores[1]]  # a left-out term on a circuit-only answer: the trained reward moves
+    assert tt.reward_mismatches(q, leak, [tt.stage_reward(s, 0) for s in leak]) == [0]
+    assert tt.reward_mismatches(q, scores, [float("nan"), -10.0]) == [0]
+    assert tt.reward_mismatches({}, leak, [tt.stage_reward(s, 0) for s in leak]) == []  # stage terms apply off the circuit arm

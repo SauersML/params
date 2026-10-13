@@ -9,7 +9,8 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import train
+sys.path.append(str(Path(__file__).resolve().parents[3]))
+from experiments.oracle.toyloop import train  # package-qualified: method/oracle/rl's train.py imports as "train" too
 
 
 @pytest.mark.parametrize('batch', [1, 3, 8])

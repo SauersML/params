@@ -95,6 +95,70 @@ def test_oracle_runs_reproduce_the_model(norm):
     assert ge.track_pp(tx, [everything], "eval")[0]["s_track_pp"] > 0.999
 
 
+@pytest.mark.parametrize("norm", [None, "LN"])
+@pytest.mark.parametrize("biased", [True, False])
+def test_oracle_graph_runs_equal_the_engine(norm, biased):
+    """native.Native.run against engine.Engine's graph runs (written apart) on the TL target with and without its
+    biases: every subcomponent on and off, one node, two connected nodes, the empty and a complete graph, the
+    remainders live and off, a patch and declared connections at partial strength (the norm's strength tied to the
+    read's). The masks run() keeps (_zero(), _one()) give the numbers of equal masks built anew: a bias writes at
+    every u, a value bias through every attention row, so a biased target never takes _zero()'s shortcut."""
+    import engine
+    import native
+
+    sd, cfg = random_tl(norm)
+    if not biased:
+        sd = {k: v for k, v in sd.items() if not (k.startswith("blocks.") and ".b_" in k)}
+    nat = interpbench.native_of(sd, cfg)
+    assert nat._biased() == biased
+    ids = torch.randint(cfg["d_vocab"], (cfg["n_ctx"],), generator=torch.Generator().manual_seed(2)).tolist()
+    targets = [cfg["n_ctx"] - 1]
+    T = len(ids)
+    with torch.no_grad():
+        lp = torch.log_softmax(nat.target(torch.tensor([ids]))[0, targets].float(), -1)
+    one = (native.site_name(0, "o_proj"), T - 2, 1)
+    two = [(native.site_name(0, "o_proj"), T - 1, 0), (native.site_name(1, "c_fc"), T - 1, 1)]
+    connected = native.Graph(two, *native.all_edges(two, targets))
+    assert connected.parents and connected.out == []
+    graphs = {"empty": native.Graph([]), "one": native.Graph([one]), "two": connected,
+              "complete": native.Graph(two, complete=True)}
+    g = torch.Generator().manual_seed(3)
+    zu, zur = nat._zero()
+    ou, our = nat._one()
+    us = {"zero": zu, "zero anew": {n: m.clone() for n, m in zu.items()}, "one": ou, "one anew": {n: m.clone() for n, m in ou.items()},
+          "random": {n: torch.rand(1, T, nat.C[n], generator=g) for n in nat.names}}
+    urs = {"off": zur, "off anew": {n: m.clone() for n, m in zur.items()}, "live": our}
+    engines = {live: engine.Engine(nat, ids, targets, live=live) for live in (True, False)}
+    full = lambda u: {n: m.expand(1, T, -1) for n, m in u.items()}  # noqa: E731
+    site = native.site_name(0, "c_fc")
+    patch = {site: (torch.zeros(1, T, nat.C[site], dtype=torch.bool), torch.zeros(1, T, nat.C[site]))}
+    patch[site][0][0, T - 2, 2], patch[site][1][0, T - 2, 2] = True, 1.5
+    with torch.no_grad():
+        for gn, graph in graphs.items():
+            plan = nat._plan([graph], T)
+            for un, u in us.items():
+                for rn, ur in urs.items():
+                    eng = engines[rn == "live"]
+                    got = nat.run(ids, targets, plan, u, ur)
+                    want = eng.graph_log_probs(eng.plan(graph), full(u)).reshape(got.shape)
+                    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5, msg=lambda m: f"{gn} u {un} remainders {rn}: {m}")
+                    anew = nat.run(ids, targets, plan, {n: m.clone() for n, m in u.items()}, {n: m.clone() for n, m in ur.items()})
+                    torch.testing.assert_close(got, anew, atol=1e-6, rtol=1e-6, msg=lambda m: f"{gn} u {un} remainders {rn}: {m}")
+                    if un.startswith("one") and rn == "live" and gn != "complete":
+                        torch.testing.assert_close(got.reshape(lp.shape), lp, atol=1e-5, rtol=1e-5)
+        plan = nat._plan([connected], T)
+        ew = torch.full((1, sum(len(w) for w in connected.parents.values())), 0.3)
+        for un in ("zero", "zero anew", "random"):
+            for rn, ur in urs.items():
+                eng = engines[rn == "live"]
+                got = nat.run(ids, targets, plan, us[un], ur, patch=patch)
+                want = eng.graph_log_probs(eng.plan(connected), full(us[un]), patch=patch).reshape(got.shape)
+                torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5, msg=lambda m: f"patch u {un} remainders {rn}: {m}")
+                got = nat.run(ids, targets, plan, us[un], ur, *nat.edge_weights(plan, ew.flatten()))
+                want = eng.graph_log_probs(eng.plan(connected), full(us[un]), ew, torch.zeros(1, 0)).reshape(got.shape)
+                torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5, msg=lambda m: f"strengths u {un} remainders {rn}: {m}")
+
+
 def mib_reference(L=2, H=2, truth=()):
     """A reference graph in MIB's form (EAP-IG's Graph.to_json: its edges with in_graph flags, the model's shape)."""
     cfg = {"n_layers": L, "n_heads": H, "parallel_attn_mlp": False}

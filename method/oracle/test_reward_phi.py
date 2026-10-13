@@ -4,6 +4,7 @@ is smooth."""
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,16 +30,20 @@ def test_phi_reads_leaky_scores():
 
 
 @pytest.mark.parametrize("kind,draws", [
-    ("mean", [[2.0, 0.1], [100.0, 0.1]]),
-    ("donor", [[0, 2.0, 0.1, 1.0], [1, 100.0, 0.1, 1.0]]),
-    ("weighted", [[0, 2.0, 0.1, 1.0], [1, 100.0, 0.1, 1.0]]),
+    ("mean", [[2.0, 0.1], [4.0, 0.1], [100.0, 0.1]]),
+    ("donor", [[0, 2.0, 0.1, 1.0], [1, 4.0, 0.1, 1.0], [2, 100.0, 0.1, 1.0]]),
+    ("weighted", [[0, 1.5, 0.1, 1.0], [1, 1.8, 0.1, 1.0], [2, 100.0, 0.1, 1.0]]),
 ])
 def test_raw_bootstrap_pooling_retains_variation_below_zero(kind, draws):
+    """The score family_eps resamples and family_score reads: the unfloored estimator clipped to [-1, 1]. Below the
+    bound, where the floored score is 0 for every draw, it still orders draws by how far the circuit is; a draw far
+    past the bound stops at -1."""
+    clip = lambda x: min(1.0, max(-1.0, x))  # noqa: E731
     assert goal_eval._pooled(kind, draws, 1.0) == 0.0
-    assert goal_eval._pooled(kind, draws, 1.0, raw=True) < 0.0
-    a = goal_eval._pooled(kind, [draws[0]] * 2, 1.0, raw=True)
-    b = goal_eval._pooled(kind, [draws[1]] * 2, 1.0, raw=True)
-    assert a >= b  # (the weighted families' raw score stops at -1: both draws far past the bound)
+    s = [clip(goal_eval._pooled(kind, [d] * 2, 1.0, raw=True)) for d in draws]
+    assert 0.0 > s[0] > s[1] > s[2] == -1.0
+    idx = np.array([[0, 0], [1, 1], [2, 2]])
+    assert [clip(x) for x in goal_eval._pooled_resamples(kind, draws, 1.0, True, idx)] == pytest.approx(s)
 
 
 def test_family_noise_is_bootstrapped_from_the_score_phi_reads():

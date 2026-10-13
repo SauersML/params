@@ -704,9 +704,10 @@ class Native:
         """_stream for a batch of complete graphs or of others. Two residual streams: x, every output at its scale, and
         xg, a complete graph's nodes' outputs in full. Only complete graphs read xg; when every graph is complete and
         each node's scale is its u (u = 1 everywhere, or no node held: plan "none") the two are the same numbers and one
-        is computed. With u = 0 and the remainders off (the _zero() ablation) and no complete graph, nothing outside a
-        graph writes to x: it stays the embedding, the same for every graph, and only the graphs' nodes and the
-        queries and keys are computed; the numbers left out are exact zeros.
+        is computed. With u = 0 and the remainders off (the _zero() ablation), no complete graph and no biases (vpd4l's
+        matrices have none), nothing outside a graph writes to x: it stays the embedding, the same for every graph, and
+        only the graphs' nodes and the queries and keys are computed; the numbers left out are exact zeros. A biased
+        target (TLTarget) takes the whole run: its biases write at every u (a value bias through every attention row).
 
         With reuse, the products and the MLP run on the positions from s on only (s: the first that differs, moved
         earlier to keep at least 64 rows per product, whose rows then come out as in the whole batch). Attention reads
@@ -723,7 +724,7 @@ class Native:
         gelu = tg.act
         zu, zur = self._zero()
         no_rest = ur is zur  # remainders at 0: they add exact zeros
-        empty = u is zu and no_rest and not plan["any_complete"]
+        empty = u is zu and no_rest and not plan["any_complete"] and not self._biased()
         same = plan["all_complete"] and qk is None and (u is self._one()[0] or plan.get("none", False))
         both = plan["any_complete"] and not same
         s = 0
@@ -780,8 +781,8 @@ class Native:
         def rest(n, z):
             return None if no_rest else win(ur[n]).expand(B, L)[..., None] * (z @ tg.site(n).delta_T)
 
-        def plus(a, r):
-            return a if r is None else a + r
+        def plus(a, r):  # a + r, None for an exact zero
+            return a if r is None else r if a is None else a + r
 
         def bias(n):  # a matrix's bias, always on like the embedding (None: vpd4l's have none)
             return tg.site(n).b
@@ -945,9 +946,14 @@ class Native:
         return (logp.exp() * (logp - logq)).sum(-1).sum(-1) / LN2
 
     def _zero(self) -> tuple[dict, dict]:
-        """The ablation u = 0, remainders at 0 (the same objects every call: run() takes its shortcut for them)."""
+        """The ablation u = 0, remainders at 0 (the same objects every call: run() takes its shortcut for them on a target
+        without biases)."""
         return self._const("zero", lambda: ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in self.names},
                                             {n: torch.zeros(1, 1, device=self.dev) for n in self.names}))
+
+    def _biased(self) -> bool:
+        """Whether any matrix has a bias (TLTarget's; vpd4l's have none)."""
+        return self._const("biased", lambda: any(self.target.site(n).b is not None for n in self.names))
 
     def _one(self) -> tuple[dict, dict]:
         """The ablation u = 1, remainders at 1: the whole model (the same objects every call)."""

@@ -8,6 +8,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path[:0] = [str(Path(__file__).resolve().parent), str(ROOT / "method/oracle"), str(ROOT / "method/vpd")]
+sys.path.append(str(ROOT))  # for the package-qualified toyloop train (method/oracle/rl's train.py imports as "train" too)
 
 import circuit
 import reward_exec
@@ -78,7 +79,7 @@ def test_same_units_different_wiring_changes_execution(pair):
 
 def test_training_wiring_reward_executes_edges_and_rejects_partial_invalid(pair, monkeypatch):
     import planted
-    import train
+    from experiments.oracle.toyloop import train
 
     toy, nat = pair
     monkeypatch.setattr(planted, "native_of", lambda sd, cfg: nat)
@@ -113,7 +114,7 @@ def test_training_wiring_reward_penalizes_one_failed_text(monkeypatch):
 
 
 def test_training_seed_controls_initialization_and_sampled_completions(monkeypatch):
-    import train
+    from experiments.oracle.toyloop import train
 
     initialized, sampled = [], []
     def load_policy(args):

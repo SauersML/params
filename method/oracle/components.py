@@ -1765,7 +1765,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             m = None if ref is None or ph is None or dc is None else min(ph - ref["phi"], dc)
             D = 0.0 if m is None else (softplus(2.0 * m) - softplus(0.0)) / 2.0  # 0 at parity with the teacher
             over = overflow(tokens[i] if tokens else None)
-            r = ct["term"] + D - over  # cap_phi(phi) - phi_tau - 4 v_soft + g 2^(-20 v_soft) Q + tie-break: below 0 until faithful
+            # cap_phi(phi) - phi_tau - 4 v_soft + g 2^(-20 v_soft) Q + tie-break, then D and the overflow. Its sign is no test
+            # of faithfulness: g is 1/2 at the bar, so Q can make r positive just below it (the soft gate, by design)
+            r = ct["term"] + D - over
             circ = goal_eval.circuit_term(c, tau, b, 0.0, executable_bits)["term"] + D - over
             terms |= {"C": c["c"], "C_rl": c.get("c_rl"), "F1": row[f"f1_{convention}"], "N": row[f"n_{convention}"], "F3": row["f3"],
                       "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}

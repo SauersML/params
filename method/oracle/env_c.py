@@ -24,6 +24,7 @@ The reward uses the search split's draws; evaluations the eval split's.
       same interventions (var_explain's llm.jsonl and llm_hint.jsonl from the text alone; the better of the two)
   env_c.py sft ROWS.jsonl OUT.jsonl [--split train]   SFT rows (components.dataset's format): the question with
       VARIABLES and INVARIANTS asked, the teacher circuit with its block-form variables and its holding joint lines
+  env_c.py rows ROWS.jsonl OUT.jsonl   the question rows (the circuit environment's, asking for VARIABLES and INVARIANTS)
   env_c.py serve [--port 8771] [--device D]
       POST /score {"task", "answers": [text, ...], "split": "search"} -> {"scores": [{"reward", "credit", "relational",
       "coverage", "valid", "lines", "holds", "counted", "joint_dropped", "bad", "variables"}, ...]}; GET /health
@@ -65,8 +66,19 @@ def teacher_le(ge, tx, task: str) -> dict | None:
     tf = TEACHER / f"{task}.json"
     if not tf.exists():
         return None
+    import torch
+    import var_teacher
+
     graph = goal_eval.strand(goal_eval.circuit(json.loads(tf.read_text()), tx.targets, ge.nat.C, tx.T)[0], tx.targets, ge.nat.C)
-    le = ge.line_effects(tx, graph, mode="pp", split="search")
+    var_teacher.release(ge.nat.dev)
+    for d in (DRAWS, DRAWS // 2, DRAWS // 4, 1):  # a large circuit's pp runs can take more than a 24 GB card holds
+        try:
+            le = ge.line_effects(tx, graph, mode="pp", split="search", draws=d)
+            break
+        except torch.OutOfMemoryError:
+            var_teacher.release(ge.nat.dev)
+    else:
+        return None
     out = {"nodes": [{"node": list(x["node"]), "delta_kl": x["delta_kl"]} for x in le["nodes"]]}
     LE.mkdir(parents=True, exist_ok=True)
     f.write_text(json.dumps(out))
@@ -198,6 +210,20 @@ def gate(a) -> None:
         print(task, {k: round(row[k]["reward"], 3) for k in ("teacher", "shuffled", "llm", "llm_hint") if k in row}, best_llm, flush=True)
 
 
+def rows(a) -> None:
+    """Env C's question rows: each circuit-environment row marked "variables" and "invariants", its "question" rendered
+    again with ASK_VARIABLES and ASK_INVARIANTS (components.question); every other field passed through."""
+    n = 0
+    with a.out.open("w") as fh:
+        for r in map(json.loads, a.rows.read_text().splitlines()):
+            r = {**r, "variables": True, "invariants": True}
+            t = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
+            r["question"] = components.question(t, r)
+            fh.write(json.dumps(r) + "\n")
+            n += 1
+    print(n, "rows to", a.out)
+
+
 def sft(a) -> None:
     """SFT rows: components.dataset's format, the question asking for VARIABLES and INVARIANTS, the target the
     teacher's circuit with its block-form variables and holding joint lines (components.target: its FINAL lines too)."""
@@ -223,25 +249,52 @@ def sft(a) -> None:
     print(n, "rows to", a.out)
 
 
+def source() -> str:
+    """The scorer's revision: the pod's SOURCE file (rp-run's "python source <rev>") when there is one, else a hash of
+    the scoring code (this module and what it calls), so a trainer can freeze it (REWARD_REV)."""
+    import hashlib
+
+    f = HERE.parents[1] / "SOURCE"
+    if f.exists():
+        return f.read_text().split()[-1]
+    h = hashlib.sha256()
+    for name in ("env_c.py", "semantic.py", "variables.py", "components.py", "goal_eval.py", "engine.py", "native.py"):
+        h.update((HERE / name).read_bytes())
+    return "code-" + h.hexdigest()[:12]
+
+
 def serve(a) -> None:
+    """The reward service (primerl's contract): POST /score {"task" (or "id"), "answers": [text, ...], "split" (default
+    search), any other fields ignored ("lines", "tokens")} -> {"scores": [score() per answer in order, with
+    "semantics" and "source"]}; GET /health."""
+    import traceback
+
     import goal_eval
 
     ge = goal_eval.GoalEval(native.Native(a.device))
+    who = {"semantics": ge.semantics, "source": source()}
     lock, texts = threading.Lock(), {}
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            self._send({"ok": True, "texts": len(texts)})
+            self._send({"ok": True, "alive": True, "texts": len(texts), **who})
 
         def do_POST(self):
             req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            task = req.get("task") or req.get("id")
+            got = []
             with lock:
-                if req["task"] not in texts:
+                if task not in texts:
                     if len(texts) >= 8:
                         texts.pop(next(iter(texts)))
-                    texts[req["task"]] = text_of(ge, req["task"])
-                t, tx = texts[req["task"]]
-                got = [score(ge, tx, req["task"], x, req.get("split", "search"), t["model"]) for x in req["answers"]]
+                    texts[task] = text_of(ge, task)
+                t, tx = texts[task]
+                for x in req["answers"]:
+                    try:
+                        got.append({**score(ge, tx, task, x, req.get("split", "search"), t["model"]), **who})
+                    except Exception as e:  # an answer that breaks the scorer is invalid, never a crashed group
+                        got.append({"reward": -1.0, "valid": False, "error": f"{type(e).__name__}: {e}"[:300], **who})
+                        traceback.print_exc()
             self._send({"scores": got})
 
         def _send(self, obj):
@@ -276,7 +329,10 @@ def main():
     f.add_argument("--split", default="train")
     v = sub.add_parser("serve")
     v.add_argument("--port", type=int, default=8771)
-    for p in (s, g, f, v):
+    q = sub.add_parser("rows")
+    q.add_argument("rows", type=Path)
+    q.add_argument("out", type=Path)
+    for p in (s, g, f, v, q):
         p.add_argument("--device")
     a = ap.parse_args()
     if a.what == "score":
@@ -286,7 +342,7 @@ def main():
         t, tx = text_of(ge, a.task)
         print(json.dumps(score(ge, tx, a.task, a.answer.read_text(), a.split, t["model"]), indent=1))
     else:
-        {"gate": gate, "sft": sft, "serve": serve}[a.what](a)
+        {"gate": gate, "sft": sft, "serve": serve, "rows": rows}[a.what](a)
 
 
 if __name__ == "__main__":

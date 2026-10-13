@@ -1829,8 +1829,9 @@ def test_blocks_priced_and_drawn_as_units(tiny):
 
 def test_line_leave_one_out(tiny):
     """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row
-    with point, N, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run (the held
-    families, LOO_HELD, at the answer's), its bits size_bits of the deleted graph, compact against bits_start."""
+    with point, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run and N from its
+    necessity_spec on NEC_CONTROLS_LOO controls (the held families, LOO_HELD, at the answer's), its bits size_bits of the
+    deleted graph, compact against bits_start."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     sub = every[::8]
@@ -1849,6 +1850,7 @@ def test_line_leave_one_out(tiny):
     h.tok_edges = [(t, r) for t, r in g.tok_edges if r != nd]
     h.tok_positions = list(getattr(g, "tok_positions", []))
     own = ge.fidelity(tx, [h], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+    own.update(ge.necessity_spec(tx, [h], "search", goal_eval.NEC_CONTROLS_LOO)[0])
     row = dict(base)
     for k in ("s_point", "s_wiring", "s_point_c", "n_point", "draws_point", "s_track_pp", "draws_track_pp", "s_interchange_pp",
               "draws_interchange_pp", "s_pattern", "draws_pattern", "n_spec", "n_spec_raw", "draws_n_spec", "d_target", "d_control",

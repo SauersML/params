@@ -128,6 +128,9 @@ DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's 
 DONORS_FAR = 32  # donor resampling's other texts per text
 NEC_CONTROLS = 32  # N's matched control texts per text (necessity_spec: the split's far pool, DONOR_POOLS; at 16 the
 # controls' spread, ~5 bits, gave eps_N a median 0.14 on the held-out influential sets)
+NEC_CONTROLS_LOO = 8  # line_loo's N controls (the answer's own N recomputed on the same 8, so a deletion's change in phi
+# compares like with like; 32 controls per deletion were 55% of line_loo on a 4090)
+REMOVAL_ROWS = 16  # real-model removal runs per batch (_removed_kl)
 NEC_MIN_LEN = 64  # a control text's least length (end-aligned: a circuit's parts further back are not removed there)
 DONOR_POOLS = {"search": ("train", range(0, 400)),  # the far donors' texts per split: the reward's from training texts,
                "eval": ("donor", range(0, 50))}  # explicit text9150-9199 partition, independent of missing dev files
@@ -1214,7 +1217,8 @@ class GoalEval:
         answer with that one line deleted (a node with its connections, token edges and pairs; a stated connection;
         a stated token edge), nothing else re-stranded. Recomputed per deletion: point (s_point_c, sufficiency on every
         deletion at once), track_pp, interchange_pp and pattern, on split's draws, and N (necessity_spec, per node
-        deletion: the other lines leave the node set as it is); held at the full answer's
+        deletion: the other lines leave the node set as it is; on NEC_CONTROLS_LOO controls, the answer's own N recomputed
+        on them so a deletion's change compares like with like); held at the full answer's
         values (its reward-mode row, base when given): LOO_HELD (nodes, edges, flips, donors near and far, the costly
         families), so a line's effect on them is 0. phi per deletion from the answer's row with the recomputed terms
         and their draws (eps re-bootstrapped); compact = log2(bits_start / bits) when bits_start is given. Returns
@@ -1257,8 +1261,11 @@ class GoalEval:
         variants = [without(k, x) for k, x in lines]
         flat = [expand_blocks(h, nat.C) for h in variants]
         e0, v0 = self._bounds(tx, "live")
-        point = self.sufficiency(tx, flat)
-        wired = self.sufficiency(tx, [native.Graph(sorted(h.node_set()), complete=True) for h in flat])
+        point = self.sufficiency(tx, flat, conventions=("live",), vpd_minus=False)  # phi reads the live point alone
+        stated = [i for i, h in enumerate(flat) if not h.complete]  # a complete variant's wiring is its point
+        wired = dict(zip(stated, self.sufficiency(tx, [native.Graph(sorted(flat[i].node_set()), complete=True) for i in stated],
+                                                  conventions=("live",), vpd_minus=False)))
+        wired = [wired.get(i, point[i]) for i in range(len(flat))]
         cols = {k: j for j, k in enumerate(self._pp_engine(tx).pp_lines(g))}  # the path-patched families: every deletion
 
         def col(kind, x):  # in one engine call per family (lines=), each a column of Engine.pp_lines
@@ -1273,15 +1280,24 @@ class GoalEval:
         ipp = self.interchange_pp(tx, [g], split, draws, lines=mask)
         pat = self.pattern_family(tx, flat)
         at = [i for i, (kind, _) in enumerate(lines) if kind == "node"]  # N moves with the node set alone
-        nsp = dict(zip(at, self.necessity_spec(tx, [flat[i] for i in at], split))) if at else {}
+        own = {}
+        if at:  # N on NEC_CONTROLS_LOO controls for the answer and each node deletion alike
+            got = self.necessity_spec(tx, [expand_blocks(g, nat.C)] + [flat[i] for i in at], split, NEC_CONTROLS_LOO)
+            own, nsp = got[0], dict(zip(at, got[1:]))
+        else:
+            nsp = {}
         bits = size_bits(g, P, S, tx.targets, active=tx.vpd)
         fams = ((tx.__dict__.get("_tau") or {}).get(split) or {}).get("families")  # the text's (tau's), when scored
+        base = dict(base, **own, rl_terms={**base.get("rl_terms", {}), **({"n_spec": own["n_spec_raw"]} if own else {})}) \
+            if own else base
+        if own:
+            base.pop("eps_N", None)
         ph = phi(base, families=fams)[0]
         out = []
         for i, ((kind, x), h, pt, wd, a, b, c) in enumerate(zip(lines, variants, point, wired, tpp, ipp, pat)):
             row = dict(base)
             row.update(nsp.get(i, {}))
-            row.update({"s_point": pt["f1_live"], "s_wiring": wd["f1_live"], "n_point": pt["n_live"],
+            row.update({"s_point": pt["f1_live"], "s_wiring": wd["f1_live"], "n_point": pt.get("n_live"),
                         "draws_point": [[pt["kl_live"], v0]]})
             row["s_point_c"] = min(y for y in (pt["f1_live"], wd["f1_live"]) if y is not None) if pt["f1_live"] is not None else None
             row.update(a)
@@ -1999,16 +2015,18 @@ class GoalEval:
             tx.bounds[conv] = (kl[0], kl[1] if tx.vpd is not None else None)
         return tx.bounds[conv]
 
-    def sufficiency(self, tx: Text, graphs: list[native.Graph]) -> list[dict]:
+    def sufficiency(self, tx: Text, graphs: list[native.Graph], conventions: tuple = CONVENTIONS, vpd_minus: bool = True) -> list[dict]:
         """Per graph, per convention: F1 (KL_C of the stated graph's run, graph_kl; a complete graph's masked run),
-        recovered, completeness, and N (node removal from VPD's answer) on the text, with the bounds."""
+        recovered, completeness, and N (node removal from VPD's answer; vpd_minus False leaves it out) on the text,
+        with the bounds."""
         rows = [{} for _ in graphs]
         stated = [i for i, g in enumerate(graphs) if not g.complete]
         whole = [i for i, g in enumerate(graphs) if g.complete]
         sets = [self.masks(graphs[i], tx.T) for i in whole]
-        if tx.vpd is not None:
+        vpd_minus = vpd_minus and tx.vpd is not None
+        if vpd_minus:
             sets += [{n: tx.vpd[n] & ~m[n] for n in self.nat.names} for m in (self.masks(g, tx.T) for g in graphs)]
-        for conv in CONVENTIONS:
+        for conv in conventions:
             e, v = self._bounds(tx, conv)
             got = carry.kl(tx.ref, self.runs(tx.ids, tx.targets, sets, conv == "live")).tolist() if sets else []
             kl = [0.0] * len(graphs) + got[len(whole):]
@@ -2022,7 +2040,7 @@ class GoalEval:
                 rl = recovered_log(e, c, v) if v is not None else None
                 row.update({f"kl_{conv}": c, f"kl_empty_{conv}": e, f"kl_vpd_{conv}": v, f"f1_{conv}": _clip01(rl),
                             f"recovered_log_{conv}": rl, f"recovered_{conv}": r, f"completeness_{conv}": completeness(r)})
-                if v is not None:
+                if v is not None and vpd_minus:
                     m = kl[len(graphs) + b]
                     row.update({f"kl_vpd_minus_{conv}": m, f"n_{conv}": necessity_log(e, m, v), f"necessity_{conv}": necessity(e, m, v)})
                 else:
@@ -2313,8 +2331,9 @@ class GoalEval:
             ref = nat.run(ids, targets, nat._full_plan(T, 1), one_u, one_r)
         none = nat._const(("goal_none", T), lambda: {n: torch.zeros(1, T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
         kls = []
-        for s0 in range(0, len(sets), self.chunk):
-            part = sets[s0:s0 + self.chunk]
+        rows = max(self.chunk, REMOVAL_ROWS)
+        for s0 in range(0, len(sets), rows):
+            part = sets[s0:s0 + rows]
             B = len(part)
             u = {n: 1.0 - torch.stack([m[n] for m in part]).float() for n in nat.names}
             first = min((int(m[n].any(1).nonzero().min()) for m in part for n in nat.names if m[n].any()), default=0)

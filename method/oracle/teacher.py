@@ -1261,10 +1261,12 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
             rec["validation"].append([level] + v.trace)
         stage(level, t0, rounds)
     if phi_pool is not None:                                 # every stage on the search split, scored by the reward's
-        tau = ge.tau(tx, phi_pool, "search")                 # circuit term (goal_eval.circuit_term), the highest written:
-        rec["phi"], best = [], None                          # text9003 under --backup passed the bar at 530 subcomponents
-        for name, on_s in reversed(snaps):                   # and 1438, text9002 at 536 with 4x the start's bits (below
-            g_s = graph_of(on_s)                             # the start's own score of 0)
+        tau = ge.tau(tx, phi_pool, "search")                 # circuit term (goal_eval.circuit_term); written: the highest
+        rec["phi"], best = [], None                          # among the stages whose full row has no family under its
+        rec["stage_nodes"] = {}                              # floor (v = 0), else the start: the floors acceptance's
+        for name, on_s in reversed(snaps):                   # phi_variants rows (8 draws) passed 9 of fleet's 85 v2
+            g_s = graph_of(on_s)                             # teachers that their own full rows put 0.02-0.03 under one
+            rec["stage_nodes"][name] = [list(nd) for nd in sorted(g_s.node_set())]   # (each stage kept for re-picks)
             row = ge.fidelity(tx, [g_s], phi_pool, mode="reward", split="search")[0]
             bits = goal_eval.size_bits(g_s, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, tx.vpd)
             ct = goal_eval.circuit_term(row, tau, bits)
@@ -1274,10 +1276,11 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
             log(f"  set phi at {name} ({int(on_s.sum())} subcomponents, {bits:.0f} bits): {ct['phi_full']} (bar "
                 f"{ct['phi_tau']}), shortfall {ct['v']}, score {score} "
                 + " ".join(f"{f} {v:.3f}" for f, v in fam.items() if v is not None), flush=True)
-            if best is None or score > best[0]:
+            if ct["v"] == 0 and (best is None or score > best[0]):
                 best = (score, name, on_s)                   # ties: the finer stage
-        if best is not None:
-            pr.on, rec["phi_stage"], rec["score"] = best[2].clone(), best[1], best[0]
+        if best is None:                                     # (no stage at its floors: the start)
+            best = next((r[6], r[0], on_s) for r, (_, on_s) in zip(reversed(rec["phi"]), snaps) if r[0] == "start")
+        pr.on, rec["phi_stage"], rec["score"] = best[2].clone(), best[1], best[0]
     g = graph_of(pr.on)
     if acceptance is not None:
         rec["accept"] = acceptance.scores([g])[0]

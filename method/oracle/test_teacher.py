@@ -658,8 +658,12 @@ def test_set_search_writes_the_highest_scoring_stage():
     assert [x[0] for x in rec["phi"]] == ["chunk4", "site", "start"] and len(calls) == 3
     for (name, ph, bar, n, fam, bits, score, v), (t, b, ct) in zip(rec["phi"], calls):
         assert t is tau and b == bits and score == ct["term"] and v == ct["v"] and bar == tau["phi_tau"]
-    best = max(rec["phi"], key=lambda x: x[6])
+    # written: the highest among the stages with no family under its floor on their full row (v = 0), else the start;
+    # every stage's node set kept for re-picks
+    ok = [x for x in rec["phi"] if x[7] == 0]
+    best = max(ok, key=lambda x: x[6]) if ok else next(x for x in rec["phi"] if x[0] == "start")
     assert rec["phi_stage"] == best[0] and rec["score"] == best[6] and g.count() == best[3]
+    assert {k: len(v) for k, v in rec["stage_nodes"].items()} == {x[0]: x[3] for x in rec["phi"]}
 
 
 @pytest.mark.skipif(DEVICE == "cpu", reason="needs a GPU")

@@ -21,7 +21,9 @@ restricted net (as a share of the unconstrained net) above the random sets' and 
 
   persistent_e3.py prefs OUT.jsonl [--k 6]        the Mac (the atlas's activity): preferences, thirds, circuits, sets
   persistent_e3.py fit PREFS.jsonl OUT.jsonl [--steps 200] [--screen 25] [--device cuda] [--offset K --stride S]   a pod
-  persistent_e3.py table OUT.jsonl
+  persistent_e3.py edit PREFS.jsonl OUT.jsonl [--steps 200] [--device cuda] [--offset K --stride S]   delete the preference:
+                     the circuit's edit, VPD's top k, a fine-tune of the same rank (practical())
+  persistent_e3.py table OUT.jsonl [--edit]
 """
 from __future__ import annotations
 
@@ -138,6 +140,33 @@ def _texts(beh: dict, part: str, tokens) -> list[tuple[list[int], list[int], lis
     return [(tokens[r, :max(i + c) + 1].astype(np.int64).tolist(), i, c) for r, (i, c) in sorted(by.items())]
 
 
+def _logq(nat, ids: list[int], deltas: list[tuple]) -> torch.Tensor:
+    """log q (natural) [T, V] of the model with every (site, A, B) update applied at every position."""
+    import contextlib
+
+    tg = nat.target
+    ones = torch.ones(len(ids), device=nat.dev)
+    with contextlib.ExitStack() as stack:
+        for site, A, B in deltas:
+            stack.enter_context(finetune_edit.Delta(tg.site(site), A, B, ones))
+        return torch.log_softmax(tg.hidden(torch.tensor([ids], device=nat.dev)) @ tg.wte.T, -1)[0]
+
+
+def ops_deltas(nat, ops: list[tuple]) -> list[tuple]:
+    """Persistent subcomponent edits (site, index, k: the subcomponent's activation times k at every position, W - (1 -
+    k) u v^T) as updates (site, A [d_in, m], B [d_out, m]) per site: (x A) B^T = sum of -(1 - k) (x . v) u."""
+    by = {}
+    for site, c, k in ops:
+        by.setdefault(site, []).append((int(c), float(k)))
+    out = []
+    for site, cs in by.items():
+        st = nat.target.site(site)
+        idx = torch.tensor([c for c, _ in cs], device=nat.dev)
+        w = torch.tensor([-(1 - k) for _, k in cs], device=nat.dev)
+        out.append((site, st.V[:, idx], (st.U[idx] * w[:, None]).T))
+    return out
+
+
 def _margin(lq: torch.Tensor, b: int) -> torch.Tensor:
     other = lq.clone()
     other[..., b] = -math.inf
@@ -159,10 +188,14 @@ class Net:
         with torch.no_grad():
             return finetune_edit.logq(self.nat, [ids])[0]
 
-    def __call__(self, part: str, site: str | None, A=None, B=None, grad: bool = True, rng: random.Random | None = None) -> dict:
+    def __call__(self, part: str, site: str | None, A=None, B=None, grad: bool = True, rng: random.Random | None = None,
+                 deltas: list[tuple] | None = None) -> dict:
         """rng: a training step's sample, ROWS_STEP of the part's texts and HELD_STEP held texts (the expectation of
-        the full net, at a fraction of the cost)."""
+        the full net, at a fraction of the cost). deltas: [(site, A, B)] applied together (ops_deltas), in place of
+        site, A, B."""
         nat = self.nat
+        if deltas is None:
+            deltas = [(site, A, B)] if site else []
         texts, helds = self.texts[part], self.held[part]
         if rng is not None:
             texts = rng.sample(texts, min(ROWS_STEP, len(texts)))
@@ -171,7 +204,7 @@ class Net:
         with torch.set_grad_enabled(grad):
             for ids, inst, ctrl in texts:
                 lp = self._ref(ids)
-                lq = finetune_edit.logq(nat, [ids], site, A, B, torch.ones(len(ids), device=nat.dev))[0] if site else lp
+                lq = _logq(nat, ids, deltas) if deltas else lp
                 kl = finetune_edit.kl_bits(lp, lq)
                 if inst:
                     m0, m = _margin(lp[inst], self.b), _margin(lq[inst], self.b)
@@ -188,33 +221,37 @@ class Net:
             held = 0.0
             for ids in helds:
                 lp = self._ref(ids)
-                lq = finetune_edit.logq(nat, [ids], site, A, B, torch.ones(len(ids), device=nat.dev))[0] if site else lp
+                lq = _logq(nat, ids, deltas) if deltas else lp
                 held = held + finetune_edit.kl_bits(lp, lq).sum() / len(ids)
             gb = goal / max(1, n)
             ct = coll / max(1, rows) + held / max(1, len(helds))
             net = self.rate[part] * gb - ct
         f = lambda x: float(x.detach()) if torch.is_tensor(x) else float(x)  # noqa: E731
-        return {"net": net, "goal_bits": f(gb), "goal_per_token": self.rate[part] * f(gb), "collateral_per_token": f(ct),
+        return {"net": net, "_gb": gb, "_ct": ct, "goal_bits": f(gb), "goal_per_token": self.rate[part] * f(gb), "collateral_per_token": f(ct),
+                "text_kl_per_token": f(coll) / max(1, rows), "pile_kl_per_token": f(held) / max(1, len(helds)),
                 "flipped": flipped / max(1, n), "controls_kept": kept / nc if nc else None}
 
 
-def fit(net: Net, site: str, steps: int, basis=None, lr: float = 0.01, seed: int = 0, every: int = 25) -> dict:
+def fit(net: Net, site: str, steps: int, basis=None, lr: float = 0.01, seed: int = 0, every: int = 25, rank: int = RANK,
+        lam: float | None = None, keep: list | None = None) -> dict:
     """A, B by Adam on the fit third's net, the step with the best validation net (every `every` steps) scored on the
-    score third. basis (V_k, U_k): restricted, step sizes matched to the unconstrained fit's (finetune_edit.fit)."""
+    score third. basis (V_k, U_k): restricted, step sizes matched to the unconstrained fit's (finetune_edit.fit). lam:
+    the objective goal_bits - lam x collateral per token in place of the net (practical()); keep, a list, receives every
+    checkpoint's (validation metrics, deltas)."""
     nat = net.nat
     st = nat.target.site(site)
     d_out, d_in = st.W.shape
     g = torch.Generator().manual_seed(seed)
     if basis is None:
-        a = (torch.randn(d_in, RANK, generator=g) / math.sqrt(d_in)).to(nat.dev).requires_grad_(True)
-        b = torch.zeros(d_out, RANK, device=nat.dev, requires_grad=True)
+        a = (torch.randn(d_in, rank, generator=g) / math.sqrt(d_in)).to(nat.dev).requires_grad_(True)
+        b = torch.zeros(d_out, rank, device=nat.dev, requires_grad=True)
         AB = lambda: (a, b)  # noqa: E731
         la, lb = lr, lr
     else:
         Vk, Uk = basis
         k = Vk.shape[1]
-        a = (torch.randn(k, RANK, generator=g) / math.sqrt(k)).to(nat.dev).requires_grad_(True)
-        b = torch.zeros(k, RANK, device=nat.dev, requires_grad=True)
+        a = (torch.randn(k, rank, generator=g) / math.sqrt(k)).to(nat.dev).requires_grad_(True)
+        b = torch.zeros(k, rank, device=nat.dev, requires_grad=True)
         AB = lambda: (Vk @ a, Uk @ b)  # noqa: E731
         la, lb = lr * math.sqrt(d_in / k), lr * math.sqrt(d_out / k)
     opt = torch.optim.Adam([{"params": [a], "lr": la}, {"params": [b], "lr": lb}])
@@ -223,20 +260,24 @@ def fit(net: Net, site: str, steps: int, basis=None, lr: float = 0.01, seed: int
     for step in range(steps + 1):
         if step % every == 0 or step == steps:
             A, B = AB()
-            v = net("val", site, A.detach(), B.detach(), grad=False)["net"]
+            rv = net("val", site, A.detach(), B.detach(), grad=False)
+            v = rv["net"] if lam is None else rv["_gb"] - lam * rv["_ct"]
             if float(v) > best[0]:
                 best = (float(v), (A.detach().clone(), B.detach().clone()), step)
+            if keep is not None and step:
+                keep.append(({k: float(x) if torch.is_tensor(x) else x for k, x in rv.items() if not k.startswith("_")},
+                             [(site, A.detach().clone(), B.detach().clone())], {"site": site, "rank": rank, "lam": lam, "step": step}))
         if step == steps:
             break
         A, B = AB()
         r = net("fit", site, A, B, rng=rng)
         opt.zero_grad()
-        (-r["net"]).backward()
+        (-(r["net"] if lam is None else r["_gb"] - lam * r["_ct"])).backward()
         opt.step()
     A1, B1 = best[1]
     sc = net("score", site, A1, B1, grad=False)
-    return {"site": site, "k": None if basis is None else basis[0].shape[1], "val_net": best[0], "best_step": best[2],
-            **{k: float(v) if torch.is_tensor(v) else v for k, v in sc.items()}}
+    return {"site": site, "rank": rank, "k": None if basis is None else basis[0].shape[1], "val_net": best[0], "best_step": best[2],
+            **{k: float(v) if torch.is_tensor(v) else v for k, v in sc.items() if not k.startswith("_")}}
 
 
 def run(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None) -> dict:
@@ -276,6 +317,114 @@ def run(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names:
         log(f"{beh['describe']['a']!r}->{beh['describe']['b']!r} {msg}")
     out["seconds"] = time.time() - t0
     return out
+
+
+EDIT_CANDS = 24  # the circuit's subcomponents (by local effect) the edit search draws from
+EDIT_SCALES = (0.0, -1.0)
+MAX_OPS = 6
+TOPK = (1, 2, 4, 8, 16)
+LAMS = (2.0, 8.0, 32.0)  # objective goal_bits - lam x collateral per token: removal against collateral
+FLIP = 0.9  # removal target: the share of instances where b is no longer the most likely token
+
+
+def _score(net: Net, part: str, deltas: list[tuple]) -> dict:
+    r = net(part, None, grad=False, deltas=deltas)
+    return {k: float(v) if torch.is_tensor(v) else v for k, v in r.items() if not k.startswith("_")}
+
+
+def _obj(r: dict, lam: float) -> float:
+    return r["goal_bits"] - lam * r["collateral_per_token"]
+
+
+def search(net: Net, cands: list[tuple], lam: float, keep: list, log=print) -> None:
+    """The edit chosen from the circuit: greedy over persistent scales (k in EDIT_SCALES) of the candidates, each round
+    the op that most raises the fit third's objective added, up to MAX_OPS; every step's validation metrics to keep."""
+    nat = net.nat
+    chosen, last = [], -math.inf
+    for _ in range(MAX_OPS):
+        best = (-math.inf, None)
+        for c in cands:
+            if any(tuple(c[:2]) == tuple(o[:2]) for o in chosen):
+                continue
+            for k in EDIT_SCALES:
+                v = _obj(_score(net, "fit", ops_deltas(nat, chosen + [(*c, k)])), lam)
+                if v > best[0]:
+                    best = (v, (*c, k))
+        if best[1] is None or best[0] <= last:
+            break
+        chosen.append(best[1])
+        last = best[0]
+        val = _score(net, "val", ops_deltas(nat, chosen))
+        keep.append((val, list(chosen), {"lam": lam, "ops": len(chosen)}))
+        log(f"  lam {lam}: edit step {len(chosen)} {best[1]}: validation flipped {val['flipped']:.2f}, collateral {val['collateral_per_token']:.2e}")
+
+
+def select(cands: list) -> tuple:
+    """The rule every method's edit is picked by, on validation: among those removing the preference (flipped >= FLIP)
+    the one with the least collateral per token; when none does, the most flipped (then the least collateral)."""
+    ok = [c for c in cands if c[0]["flipped"] >= FLIP]
+    if ok:
+        return min(ok, key=lambda c: c[0]["collateral_per_token"])
+    return max(cands, key=lambda c: (c[0]["flipped"], -c[0]["collateral_per_token"]))
+
+
+def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None) -> dict:
+    """Delete a preference (the lead's practical edit): three methods, each giving candidate edits on the fit third,
+    one picked by the same rule on validation (select()), scored on the score third:
+      circuit_edit  persistent scales of the circuit's subcomponents (greedy search(), at each objective weight LAMS);
+      vpd_topk      VPD's top k by attribution (the subcomponents most often active at the fit instances) ablated;
+      finetune      an unconstrained update at every position of rank = the circuit edit's operation count, at the
+                    matrix whose short fit is best, Adam on the objective at each LAMS, checkpoints every 25 steps.
+    Scores: flipped (preference gone), goal bits, controls kept (b still predicted elsewhere), KL per token on the rows'
+    other positions and on held Pile texts. The validation frontier (every candidate's flipped and collateral) is kept."""
+    t0 = time.time()
+    net = Net(nat, beh, tokens, held)
+    out = {"preference": beh["describe"], "a": beh["a"], "b": beh["b"], "rate": beh["parts"]["score"]["rate"], "methods": {}}
+    cands = [(s, int(i)) for s, i, _ in beh["circuit"][:EDIT_CANDS]]
+    keep = {"circuit_edit": [], "vpd_topk": [], "finetune": []}
+    for lam in LAMS:
+        search(net, cands, lam, keep["circuit_edit"], log)
+    act = [(s, int(i)) for s, i, _ in sorted(beh["active"], key=lambda x: -x[2])]
+    for k in TOPK:
+        if k <= len(act):
+            ops = [(*c, 0.0) for c in act[:k]]
+            keep["vpd_topk"].append((_score(net, "val", ops_deltas(nat, ops)), ops, {"k": k}))
+    ce = select(keep["circuit_edit"]) if keep["circuit_edit"] else None
+    r = max(1, len(ce[1]) if ce else 1)
+    shots = {n: fit(net, n, screen, rank=r, lam=LAMS[1])["val_net"] for n in (names or nat.names)}
+    top = max(shots, key=shots.get)
+    for lam in LAMS:
+        fit(net, top, steps, rank=r, lam=lam, keep=keep["finetune"])
+    for name, cs in keep.items():
+        if not cs:
+            continue
+        val, edit, info = select(cs)
+        deltas = edit if name == "finetune" else ops_deltas(nat, edit)
+        out["methods"][name] = {"info": info, "ops": None if name == "finetune" else [list(o) for o in edit], "validation": val,
+                                "score": _score(net, "score", deltas), "frontier": [[c[0]["flipped"], c[0]["collateral_per_token"], c[2]] for c in cs]}
+        v = out["methods"][name]["score"]
+        log(f"{beh['describe']['a']!r}->{beh['describe']['b']!r} {name} {info}: flipped {v['flipped']:.2f}, goal {v['goal_bits']:.2f} bits, "
+            f"kept {v['controls_kept'] or 0:.2f}, text KL {v['text_kl_per_token']:.2e}, Pile KL {v['pile_kl_per_token']:.2e}/token")
+    out["finetune_screen"] = shots
+    out["seconds"] = time.time() - t0
+    return out
+
+
+def practical_table(rows: list[dict]) -> str:
+    """Per preference and method on the score third: flipped (preference gone), goal bits, controls kept, KL per token on
+    the rows' other positions and on Pile."""
+    lines = ["preference              method         edit           flipped  goal bits  kept   text KL/tok  Pile KL/tok"]
+    for r in rows:
+        for name in ("circuit_edit", "vpd_topk", "finetune"):
+            x = r["methods"].get(name)
+            if not x:
+                continue
+            v, i = x["score"], x["info"]
+            what = (f"{len(x['ops'])} ops" if name == "circuit_edit" else f"k {i['k']}" if name == "vpd_topk"
+                    else f"r{i['rank']} {i['site'].replace('h.', 'L').replace('.mlp', '').replace('.attn', '')}")
+            lines.append(f"{r['preference']['a']!r:>9s}->{r['preference']['b']!r:<11s} {name:13s} {what:14s} {v['flipped']:7.2f}  {v['goal_bits']:9.2f}  "
+                         f"{v['controls_kept'] or 0:5.2f}  {v['text_kl_per_token']:11.2e}  {v['pile_kl_per_token']:11.2e}")
+    return "\n".join(lines)
 
 
 def table(rows: list[dict]) -> str:
@@ -324,12 +473,22 @@ def main():
     f.add_argument("--offset", type=int, default=0)
     f.add_argument("--stride", type=int, default=1)
     f.add_argument("--sites", nargs="*", help="screen these matrices only (a smoke test)")
+    e = sub.add_parser("edit")
+    e.add_argument("prefs")
+    e.add_argument("out")
+    e.add_argument("--steps", type=int, default=200)
+    e.add_argument("--screen", type=int, default=25)
+    e.add_argument("--device", default="cpu")
+    e.add_argument("--offset", type=int, default=0)
+    e.add_argument("--stride", type=int, default=1)
+    e.add_argument("--sites", nargs="*")
     t = sub.add_parser("table")
     t.add_argument("rows")
+    t.add_argument("--edit", action="store_true", help="edit's rows (practical_table)")
     args = ap.parse_args()
     read = lambda x: [json.loads(y) for y in Path(x).read_text().splitlines() if y.strip()]  # noqa: E731
     if args.cmd == "table":
-        return print(table(read(args.rows)))
+        return print(practical_table(read(args.rows)) if args.edit else table(read(args.rows)))
     import components
 
     decode = lambda xs: "".join(components.token_strings("vpd4l", xs))  # noqa: E731
@@ -352,7 +511,8 @@ def main():
     for i, beh in enumerate(read(args.prefs)):
         if i % args.stride != args.offset:
             continue
-        r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
+        go = practical if args.cmd == "edit" else run
+        r = go(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
         with open(args.out, "a") as fh:
             fh.write(json.dumps(r) + "\n")
 

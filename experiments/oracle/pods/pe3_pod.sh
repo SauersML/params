@@ -2,7 +2,8 @@
 # Persistent E3's fits (experiments/oracle/persistent_e3.py fit) on one rented GPU: P processes over the preferences of
 # PREFS (persistent_e3.py prefs' output), the atlas's split-B tokens and edit_eval's held texts as published inputs,
 # vpd4l's weights and VPD's subcomponents (UV) as for every pod. Rows come back to ~/mpd-data/runpod/NAME/out.
-#   experiments/oracle/pods/pe3_pod.sh PREFS [NAME] [HOURS]      env: P, STEPS, SCREEN, GPU, PRICE
+# MODE=edit runs persistent_e3.py edit (delete the preference: circuit edit, VPD's top k, fine-tune) in place of fit.
+#   experiments/oracle/pods/pe3_pod.sh PREFS [NAME] [HOURS]      env: MODE, P, STEPS, SCREEN, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -18,7 +19,7 @@ mkdir -p "$F"
 cp "$PREFS" "$F/prefs.jsonl"
 RUNS="" ROWS=""
 for k in $(seq 0 $((P - 1))); do
-  RUNS="$RUNS (python -B experiments/oracle/persistent_e3.py fit $F/prefs.jsonl $O/out/fit_$k.jsonl --device cuda --steps $STEPS --screen $SCREEN --offset $k --stride $P > $O/fit_$k.log 2>&1; echo \"exit \$?\" >> $O/fit_$k.log) &"
+  RUNS="$RUNS (python -B experiments/oracle/persistent_e3.py ${MODE:-fit} $F/prefs.jsonl $O/out/fit_$k.jsonl --device cuda --steps $STEPS --screen $SCREEN --offset $k --stride $P > $O/fit_$k.log 2>&1; echo \"exit \$?\" >> $O/fit_$k.log) &"
   ROWS="$ROWS $O/out/fit_$k.jsonl"
 done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out;
@@ -27,7 +28,7 @@ ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; $RUNS wait;
-cat $ROWS > $O/out/fit.jsonl; python -B experiments/oracle/persistent_e3.py table $O/out/fit.jsonl > $O/out/table.txt 2>&1; echo all stages done"
+cat $ROWS > $O/out/fit.jsonl; python -B experiments/oracle/persistent_e3.py table $O/out/fit.jsonl $([ "${MODE:-fit}" = edit ] && echo --edit) > $O/out/table.txt 2>&1; echo all stages done"
 RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=20 RP_MIN_RAM_GB=24 RP_DISK_GB=40 \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA GeForce RTX 4090,NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA RTX A4500,NVIDIA RTX 4000 Ada Generation,NVIDIA L4}" $H -- bash -c "$CMD"
 }

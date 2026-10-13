@@ -58,8 +58,11 @@ def test_tl_target_equals_transformerlens(norm):
     sd, cfg = random_tl(norm)
     tg = vpd_model.TLTarget(sd, cfg).eval()
     ids = torch.randint(cfg["d_vocab"], (4, cfg["n_ctx"]), generator=torch.Generator().manual_seed(1))
+    # In float64: without a norm the logits reach ~55, where float32's rounding alone differs by 2-3e-5 between
+    # platforms (GHA's Linux CPU against the Mac); float64 agrees to 1e-13.
+    sd64 = {k: v.double() for k, v in sd.items()}
     with torch.no_grad():
-        torch.testing.assert_close(tg(ids), tl_forward(sd, cfg, ids), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(vpd_model.TLTarget(sd64, cfg).double().eval()(ids), tl_forward(sd64, cfg, ids), atol=1e-9, rtol=1e-9)
     with pytest.raises(AttributeError):
         tg.wte  # noqa: B018  (vpd4l's attributes raise: a caller still reading them fails)
     with pytest.raises(ValueError):

@@ -2037,7 +2037,9 @@ class GoalEval:
         common draws (_node_draws: each node's own uniforms, so a variant's draws are the answer's less its deleted
         nodes) of its nodes removed from the model (an outside-on engine from the draws' first position on), from VPD's answer (from there on, VPD's run before it)
         and from the variant (its row of _loo_c's plan with the draw's nodes taken out too: lq_rows), every variant's
-        draws on the same engines, each row's tables as matrices over the nodes. Semantics "x" (_xkw): VPD's answer and
+        draws on the same engines, each row's tables as matrices over the nodes. The model's run once per distinct
+        dropped set, VPD's once per distinct dropped set within its answer (a node outside VPD's answer at its position
+        is 0 in VPD's run already). Semantics "x" (_xkw): VPD's answer and
         the variants at every position, a draw's nodes at 0, a variant's deleted lines' at x (outside it)."""
         import engine
 
@@ -2072,10 +2074,10 @@ class GoalEval:
         for v, sv_ in enumerate(sets):
             if sv_:
                 vdel[v, [nid[nd] for nd in sv_]] = True
-        uniq, uv = {}, []  # the variants' distinct node sets (a deleted connection or token edge keeps the answer's), each
-        for h in flat:     # one _node_draws call
+        uniq, uv = {}, []  # the variants' distinct node sets (a deleted connection or token edge keeps the answer's)
+        for h in flat:
             uv.append(uniq.setdefault(tuple(sorted(h.node_set())), len(uniq)))
-        udrops = [[np.array([nid[nd] for nd in d], dtype=np.int64) for d in self._node_draws(tx, list(ns), draws)] for ns in uniq]
+        udrops = self._subset_draws(tx, nodes, nid, list(uniq), draws)
         drops, owner = [], []  # every row's dropped node indices, and its (variant, draw): _node_draws' common draws
         for v in range(len(flat)):
             for j, d in enumerate(udrops[uv[v]]):
@@ -2092,6 +2094,11 @@ class GoalEval:
         for x in keys_all:                            # less its deleted node, so the variants whose node a draw leaves alone
             seen_n[x] = seen_n.get(x, 0) + 1          # share it), a set asked by several rows kept across chunks
         shared = {}  # dropped set -> (log q of the model's run [targets, V], KL_VPD, W)
+        act = (vflat[0, FT, FV] > 0).cpu().numpy()  # per node: in VPD's answer at its position
+        vkey = {x: tuple(i for i in x if act[i]) for x in seen_n}  # VPD's run sees a dropped set's nodes in its answer alone
+        vleft, vshared = {}, {}  # per VPD set: the distinct dropped sets still to run with it; its log q, while asked for
+        for x in seen_n:
+            vleft[vkey[x]] = vleft.get(vkey[x], 0) + 1
         for s0 in range(0, R, step):
             rows = range(s0, min(R, s0 + step))
             rr = np.concatenate([np.full(len(drops[k]), r) for r, k in enumerate(rows)])
@@ -2107,16 +2114,33 @@ class GoalEval:
                 ur = np.concatenate([np.full(len(x), r) for r, x in enumerate(fresh)])
                 uc = np.concatenate([np.array(x, dtype=np.int64) for x in fresh])
                 ur_, uj_ = torch.as_tensor(ur, device=dev), torch.as_tensor(uc, device=dev)
-                mf, vf = torch.ones(len(fresh), T, KC, device=dev), vflat.repeat(len(fresh), 1, 1)  # each draw's nodes off: one
-                mf[ur_, FT[uj_], FC[uj_]] = 0.0                                                     # indexed write per engine
-                vf[ur_, FT[uj_], FV[uj_]] = 0.0
-                mm, mv = views(mf, oc, circ), views(vf, ov, vcols)
-                lm_f = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
-                if kx:  # VPD's answer at x, its draw's nodes at 0
-                    vk = dict(kx, held={n: vbase[n] == 0 for n in kx["at_x"]})
-                    lv_f = Ev.log_probs(mv, start=start, base=vbase, **vk) if start else Ev.log_probs(mv, **vk)
-                else:
-                    lv_f = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
+                mf = torch.ones(len(fresh), T, KC, device=dev)  # each draw's nodes off: one indexed write
+                mf[ur_, FT[uj_], FC[uj_]] = 0.0
+                lm_f = Em.log_probs(views(mf, oc, circ), start=start) if start else Em.log_probs(views(mf, oc, circ))
+                want = [vkey[x] for x in fresh]  # VPD's runs: one per distinct VPD set (dropped sets that differ only
+                vnew = [y for y in dict.fromkeys(want) if y not in vshared]  # outside its answer run it alike)
+                if vnew:
+                    vr = np.concatenate([np.full(len(y), r, dtype=np.int64) for r, y in enumerate(vnew)])
+                    vc = np.concatenate([np.array(y, dtype=np.int64) for y in vnew])
+                    vr_, vj_ = torch.as_tensor(vr, device=dev), torch.as_tensor(vc, device=dev)
+                    vf = vflat.repeat(len(vnew), 1, 1)
+                    vf[vr_, FT[vj_], FV[vj_]] = 0.0
+                    mv = views(vf, ov, vcols)
+                    if kx:  # VPD's answer at x, its draw's nodes at 0
+                        vk = dict(kx, held={n: vbase[n] == 0 for n in kx["at_x"]})
+                        lv_n = Ev.log_probs(mv, start=start, base=vbase, **vk) if start else Ev.log_probs(mv, **vk)
+                    else:
+                        lv_n = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
+                at_v = {y: i for i, y in enumerate(vnew)}
+                lv_f = torch.stack([vshared[y] if y in vshared else lv_n[at_v[y]] for y in want])
+                for y in want:
+                    vleft[y] -= 1
+                for y, i in at_v.items():
+                    if vleft[y] > 0:
+                        vshared[y] = lv_n[i]
+                for y in set(want):
+                    if not vleft[y]:
+                        vshared.pop(y, None)
                 kv_f, w_f = carry.kl(lm_f, lv_f), carry.kl(lm_f, tx.ref.expand_as(lm_f))
             at_f = {x: i for i, x in enumerate(fresh)}
             for x, i in at_f.items():
@@ -3562,6 +3586,25 @@ class GoalEval:
             du = [units[i] for i in (pick if len(pick) else [int(np.argmin(r[j]))])]
             out.append([x for u in du for x in ((inside.get(u[:2], []) if held is not None else
                                                  [(u[0], u[1], c) for c in block_contents(u[0], u[1], self.nat.C, tx.vpd)]) if u[2] == BLOCK else [u])])
+        return out
+
+    def _subset_draws(self, tx: Text, nodes: list, nid: dict, sets: list, draws: int) -> list[list]:
+        """_node_draws of each node set in sets (sorted tuples of nodes, sorted), as arrays of indices into nodes: the
+        uniforms of nodes stacked once, each set's draws by one comparison (line credit's variants, a node set each)."""
+        if any(nd[2] == BLOCK for nd in nodes):
+            return [[np.array([nid[nd] for nd in d], dtype=np.int64) for d in self._node_draws(tx, list(ns), draws)] for ns in sets]
+        self._node_draws(tx, nodes, draws)  # (every node's uniforms kept on tx)
+        kept = tx.__dict__["_node_uniforms"]
+        U = np.stack([kept[(u, draws)] for u in nodes], 1) if nodes else np.zeros((draws, 0))  # [draws, nodes]
+        below = U < ((np.arange(draws) + 0.5) / draws)[:, None]
+        out = []
+        for ns in sets:
+            ids = np.array([nid[nd] for nd in ns], dtype=np.int64)
+            if not len(ids):
+                out.append([])
+                continue
+            b = below[:, ids]
+            out.append([ids[b[j]] if b[j].any() else ids[[int(np.argmin(U[j, ids]))]] for j in range(draws)])
         return out
 
     def _rng(self, tx: Text, g: native.Graph, family: str) -> np.random.Generator:

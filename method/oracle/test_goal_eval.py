@@ -3167,6 +3167,19 @@ def test_node_draws_are_common_across_subsets(tiny):
     assert ge._node_draws(tx, units, 16) == full
 
 
+def test_subset_draws_are_node_draws(tiny):
+    """_subset_draws (line credit's variants' draws at once) gives each node set _node_draws' draws, as indices into
+    the union: a draw left empty takes the set's smallest uniform, an empty set has none."""
+    nat, ge, tx = tiny
+    units = sorted(native.Graph(masks=tx.vpd).node_set())[::2]
+    nid = {u: i for i, u in enumerate(units)}
+    sets = [tuple(units)] + [tuple(u for u in units if u != x) for x in units[:6]] + [tuple(units[:2]), (units[3],), ()]
+    for draws in (8, 16):
+        for ns, ds in zip(sets, ge._subset_draws(tx, units, nid, sets, draws)):
+            want = ge._node_draws(tx, list(ns), draws)
+            assert [d.tolist() for d in ds] == [[nid[u] for u in w] for w in want] and all(d.dtype == np.int64 for d in ds)
+
+
 def test_line_loo_without_nodes(tiny):
     """line_loo on an answer with no nodes (S1 drops every node of some samples; primerl's crash at d2ff41b) returns
     its phi and no lines."""

@@ -123,7 +123,7 @@ MARKDOWN = re.compile(r"\*\*|^[ \t]*(?:#+|[-*])[ \t]+", re.M)
 ADDED = re.compile(r"<(?=\||/?(?:think|tool_call|tool_response|tts_[a-z_]+)>)")  # the explainers' added tokens (EXPLAINERS): <|...|>, <think>, <tool_call>, <tts_pad>, ...
 EXPLAINERS = ("Qwen/Qwen3-8B", "Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.5-4B")  # policies and readers whose added tokens escape() breaks
 FINAL_RE = re.compile(r"^\s*FINAL\s+(\d+)\s*:\s*falls\s*=\s*(yes|no)\s+top\s*=\s*(.+?)\s*$", re.M | re.I)
-SECTION = re.compile(r"^\s*(EXPLANATION|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+|EDIT\s+\d+)\s*:", re.M | re.I)
+SECTION = re.compile(r"^\s*(EXPLANATION|INVARIANTS|CIRCUIT|ANSWER\s+\d+|FINAL\s+\d+|EDIT\s+\d+)\s*:", re.M | re.I)
 EDIT_RE = re.compile(r"^\s*EDIT\s+(\d+)\s*:(.*)$", re.M | re.I)
 OP_RE = re.compile(r"\s*(persistent\s+)?(?:cut\s+(\S+)\s*<-\s*(\S+)|scale\s+(\S+)\s+(-?\d+(?:\.\d+)?))\s*", re.I)
 MM_SUB = re.compile(r"subgraph\s+P(\d+)\b.*")  # the Mermaid CIRCUIT (circuit_lines(), _parse_mermaid())
@@ -361,6 +361,11 @@ def parse(text: str) -> dict:
         answer["complete"] = True
     if variables:
         answer["variables"] = variables
+    if "INVARIANTS" in sec:
+        answer["invariants"] = [line.strip() for line in sec["INVARIANTS"].splitlines() if line.strip()]
+        refs = {m[2]: f"V{m[1]}" for m in VAR_RE.finditer(explanation)}
+        for v in variables:
+            v["ref"] = refs.get(v["name"], v["name"])
     return {"explanation": explanation, "answer": answer, "ids": ids, "malformed": malformed, "malformed_nodes": junk + unknown,
             "unknown_ids": unknown, "circuit": "CIRCUIT" in sec, "finals": finals, "edits": edits, "variables_malformed": bad_vars}
 
@@ -510,6 +515,11 @@ def render(answer: dict, finals: dict | None = None, reasons: dict | None = None
         text += [answer["explanation"]] if answer.get("explanation") else []
     elif answer.get("explanation"):
         text.append(f"EXPLANATION: {answer['explanation']}")
+    if answer.get("invariants"):
+        numbers = {v["name"]: f"V{i}" for i, v in enumerate(answer.get("variables") or [], 1)}
+        numbers.update({v["ref"]: f"V{i}" for i, v in enumerate(answer.get("variables") or [], 1) if v.get("ref")})
+        names = re.compile(r''' '(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\bV\d+\b'''.lstrip())
+        text += ["INVARIANTS:"] + [names.sub(lambda m: numbers.get(m[0], m[0]), line) for line in answer["invariants"]]
     for k in sorted(finals or {}):
         falls, top = finals[k]
         text += [f"ANSWER {k}: {(reasons or {}).get(k, '')}".rstrip(), f"FINAL {k}: falls={'yes' if falls else 'no'} top={top}"]
@@ -1298,6 +1308,12 @@ def listing(strings: list[str], numbered: set[int], every: int = MARK_EVERY) -> 
     return " ".join(out)
 
 
+ASK_INVARIANTS = (" Add a separate INVARIANTS: section of executable predictions, one per line: "
+                  "I1: V1 from @322=' donor' -> top ' outcome', or I2: remove V1 -> p(top) < 0.5. "
+                  "Reference the numbered V1, V2 variable definitions; name each donor position and exact token. "
+                  "These formal predictions are distinct from the free English explanation.")
+
+
 def question(task: dict, ev: dict) -> str:
     """The oracle's question for one text from its evidence(); a row marked "variables" (rerender --variables) also
     asks for the VARIABLES block (ASK_VARIABLES)."""
@@ -1313,7 +1329,8 @@ def question(task: dict, ev: dict) -> str:
     cap = ev.get("node_cap")  # opt-in: legacy teacher questions may exceed the evaluation default
     constraint = (f" Use at most {cap} circuit nodes across all positions; larger circuits are invalid."
                   if cap else "")
-    lines = [ASK.format(model=model) + constraint + (" " + ASK_VARIABLES if ev.get("variables") else ""),
+    lines = [ASK.format(model=model) + constraint + (" " + ASK_VARIABLES if ev.get("variables") or ev.get("invariants") else "")
+             + (ASK_INVARIANTS if ev.get("invariants") else ""),
              "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): "
              + listing(strings, windows(task, ev)),
              f"target: position {t}; the model's most probable next tokens there: {top}",
@@ -1545,6 +1562,24 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict, split: str
             "circuit": (got.get("circuit") or {}).get("e4"), "gap": got.get("gap"), "per_variable": per}
 
 
+def invariant_diagnostic(ge, tx, answer: dict, model: str) -> dict:
+    """Execute formal claims on their decoded real-model carrier groups, separately from reward and free prose."""
+    import semantic
+    import variables
+
+    claims = answer.get("invariants") or []
+    if not claims:
+        return {"executed": False, "reason": "no_invariants"}
+    bound = [{**v, "name": v.get("ref", f"V{i}")} for i, v in enumerate(answer.get("variables") or [], 1)]
+    if len({v["name"] for v in bound}) != len(bound):
+        return {"executed": False, "reason": "ambiguous_variable_refs"}
+    try:
+        groups = variables.parse(bound, ge.nat.C)
+    except (ValueError, KeyError, TypeError):
+        return {"executed": False, "reason": "invalid_variable_groups"}
+    return {"executed": True, **semantic.check_invariants(variables.Scorer(ge), tx, groups, "\n".join(claims), model)}
+
+
 def softplus(x: float) -> float:
     return max(x, 0.0) + math.log1p(math.exp(-abs(x)))
 
@@ -1567,7 +1602,8 @@ def calibration_evidence(row: dict, split: str | None) -> dict:
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            convention: str = CONVENTION, cache: dict | None = None, ee=None, edit_best: dict | None = None,
            pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None,
-           lines: bool = False, node_cap: int | None = NODE_CAP, retain_calibration: bool = False) -> list[dict]:
+           lines: bool = False, node_cap: int | None = NODE_CAP, retain_calibration: bool = False,
+           invariants: bool = False) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
     in bits, every term ranking, nothing clipped flat): R = phi - phi_tau + g x Q + D (against the text's bar, a constant
     of the text, so a group's ranking is phi + g x Q + D's; below 0 for every answer short of the bar, the empty and
@@ -1676,6 +1712,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             if lines:
                 loo = ge.line_loo(tx, graphs[i], pool, split=split or "search", bits_start=tau.get("bits_start"), base=c)
                 info["lines"] = line_credit(texts[i], p, loo, le.get(i), info, e2g.get(i), e4.get(i))
+        if invariants:
+            info["invariant_diagnostic"] = (invariant_diagnostic(ge, tx, p["answer"], task["model"]) if valid[i]
+                                            else {"executed": False, "reason": "invalid_answer"})
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **info, **{f"term_{k}": v for k, v in terms.items()},
                     "size": info.get("bits"), "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
                     "finals": len(p["finals"]), "truncated": bool(truncated and truncated[i]), "row": row, "variables": e4.get(i),
@@ -2525,7 +2564,7 @@ def _eval_checkpoint(path: Path, record: dict, *, create: bool = False) -> None:
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
              teachers: dict | None = None, lines: bool = False, checkpoint: Path | None = None,
-             retain_calibration: bool = False, node_cap: int | None = NODE_CAP) -> dict:
+             retain_calibration: bool = False, node_cap: int | None = NODE_CAP, invariants: bool = False) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -2553,6 +2592,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                                      "sets": list(sets), "diagnostics": diagnostics, "matched_all": matched_all,
                                      "lines": lines, "edits": ee is not None, "variables": vs is not None,
                                      **({"calibration_evidence": True} if retain_calibration else {}),
+                                     **({"invariants": True} if invariants else {}),
                                      "resume": False,
                                      "input_sha256": {k: digest(v) for k, v in
                                                       {"rows": rows, "sets": sets, "e1": e1, "labels": labels,
@@ -2581,7 +2621,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             cache = {}
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
                             ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None,
-                            lines=lines, retain_calibration=retain_calibration, node_cap=node_cap)
+                            lines=lines, retain_calibration=retain_calibration, node_cap=node_cap, invariants=invariants)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
             if diagnostics and scored[0]["valid"]:
@@ -2726,6 +2766,7 @@ def main():
     rr.add_argument("--facts", action="store_true", help="read each listed subcomponent's facts again (refresh_facts: the routed lens "
                                                           "at its position, one forward pass per text)")
     rr.add_argument("--variables", action="store_true", help="ask for the EXPLANATION's VARIABLES block (ASK_VARIABLES)")
+    rr.add_argument("--invariants", action="store_true", help="ask for executable INVARIANTS and VARIABLES; opt-in before token fitting")
     rr.add_argument("--node-cap", type=int, help="explicit circuit-node limit communicated in the question and saved per row; "
                     "0 disables the instruction; omitted preserves each row's setting")
     rr.add_argument("--measured", action="store_true", help="the measured input arm (measured(): subcomponents ranked by importance x "
@@ -2822,6 +2863,7 @@ def main():
                    "must be a new file, never resumed (retain complete lines after interruption)")
     s.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (scored with net): the best net per goal (E3)")
     s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
+    s.add_argument("--invariants", action="store_true", help="execute formal INVARIANTS on decoded carrier groups; separate diagnostic, no reward change")
     s.add_argument("--matched-all", action="store_true", help="the baselines at every sample's bits (verify-and-pick against VPD@equal bits)")
     s.add_argument("--node-cap", type=int, default=NODE_CAP, help="answers above it invalid (0: no cap, for targets such as the "
                    "influential starts, often above 266 nodes; the share above NODE_CAP is reported)")
@@ -2852,8 +2894,10 @@ def main():
         with args.out.open("w") as f:
             for i, r in enumerate(rows_in):
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
-                if args.variables:
+                if args.variables or args.invariants:
                     r = {**r, "variables": True}
+                if args.invariants:
+                    r = {**r, "invariants": True}
                 if args.node_cap is not None:
                     r = {**r, "node_cap": args.node_cap}
                 if args.measured:
@@ -3107,7 +3151,8 @@ def main():
     teachers = {f.stem: json.loads(f.read_text()) for t in rows if (f := args.teacher / f"{t}.json").exists()} if args.teacher else None
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
                    matched_all=args.matched_all, teachers=teachers, lines=args.lines,
-                   checkpoint=args.checkpoint, retain_calibration=args.calibration_evidence, node_cap=args.node_cap or None)
+                   checkpoint=args.checkpoint, retain_calibration=args.calibration_evidence, node_cap=args.node_cap or None,
+                   invariants=args.invariants)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

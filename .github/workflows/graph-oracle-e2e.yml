@@ -63,6 +63,9 @@ jobs:
             method/oracle/test_components.py::test_question_node_cap_is_opt_in_and_included_in_fit \
             method/oracle/test_units.py::test_evidence_binds_selected_replacement_without_new_measurements \
             method/oracle/test_units.py::test_evidence_without_token_change_does_not_decode_or_add_a_donor \
+            method/oracle/test_components.py::test_invariants_roundtrip_separate_prose_and_bind_numbered_variables \
+            method/oracle/test_components.py::test_invariant_diagnostic_executes_decoded_groups_separately \
+            method/oracle/test_components.py::test_invariants_renumber_noncontiguous_refs_after_variable_reordering \
             method/oracle/test_components.py::test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit -q --tb=short
 
       - name: Run the graph oracle's tests

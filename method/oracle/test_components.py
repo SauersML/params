@@ -592,6 +592,56 @@ def test_fit_pool_reports_nonfit_and_later_fitting_row(monkeypatch):
     assert "pool_fit" not in row  # input evidence is not mutated
 
 
+def test_invariants_roundtrip_separate_prose_and_bind_numbered_variables():
+    answer = {"nodes": [["h.1.attn.v_proj", 2, 3]], "edges": [[0, "out"]], "explanation": "Free English prose.",
+              "variables": [{"name": "V9", "meaning": "the donor", "inputs": [2],
+                             "group": [["h.1.attn.v_proj", 2, 3]], "feeds": ["prediction"]}]}
+    legacy = components.render(answer)
+    assert "INVARIANTS" not in legacy and "ref" not in components.parse(legacy)["answer"]["variables"][0]
+    text = components.render({**answer, "invariants": ["I1: V9 from @2='V9' -> top ' out'", "I2: remove V9 -> p(top) < 0.5"]})
+    parsed = components.parse(text)["answer"]
+    assert parsed["explanation"] == "Free English prose."
+    assert components.english(text).endswith("Free English prose.") and "I1:" not in components.english(text)
+    assert parsed["variables"][0]["ref"] == "V1"
+    assert parsed["invariants"] == ["I1: V1 from @2='V9' -> top ' out'", "I2: remove V1 -> p(top) < 0.5"]
+    assert components.render(parsed) == text
+
+
+def test_invariant_diagnostic_executes_decoded_groups_separately(monkeypatch):
+    from types import SimpleNamespace
+    import semantic
+    import variables
+
+    calls = []
+    monkeypatch.setattr(variables, "parse", lambda vs, C: calls.append((vs, C)) or [{"name": vs[0]["name"], "group": [("site", 3, 2)]}])
+    monkeypatch.setattr(variables, "Scorer", lambda ge: "scorer")
+    monkeypatch.setattr(semantic, "check_invariants", lambda sc, tx, vs, text, model:
+                        calls.append((sc, tx, vs, text, model)) or {"holds": 1.0, "credit": 2.0, "bad": 0})
+    ge = SimpleNamespace(nat=SimpleNamespace(C={"site": 4}))
+    assert components.invariant_diagnostic(ge, "tx", {}, "mock") == {"executed": False, "reason": "no_invariants"}
+    assert calls == []
+    answer = {"variables": [{"name": "human name", "ref": "V1", "group": [["site", 2, 3]]}],
+              "invariants": ["I1: remove V1 -> p(top) < 0.5"]}
+    got = components.invariant_diagnostic(ge, "tx", answer, "mock")
+    assert got == {"executed": True, "holds": 1.0, "credit": 2.0, "bad": 0}
+    assert calls[0][0][0]["name"] == "V1" and calls[0][0][0]["group"] == [["site", 2, 3]]
+    assert calls[1] == ("scorer", "tx", [{"name": "V1", "group": [("site", 3, 2)]}], answer["invariants"][0], "mock")
+
+
+def test_invariants_renumber_noncontiguous_refs_after_variable_reordering():
+    text = "\n".join(["CIRCUIT:", "@3 a=L1.v#2 b=L1.v#4", "OUT <- a,b", "EXPLANATION:", "VARIABLES:",
+                      'V3 "alpha": first; inputs: @2; carried by: a; feeds: PREDICTION',
+                      'V7 "beta": second; inputs: @2; carried by: b; feeds: PREDICTION',
+                      "INVARIANTS:", "I1: V3 from @2='V3' -> top ' out'", "I2: remove V7 -> p(top) < 0.5"])
+    answer = components.parse(text)["answer"]
+    answer["variables"].reverse()
+    rendered = components.render(answer)
+    parsed = components.parse(rendered)["answer"]
+    assert [(v["name"], v["ref"]) for v in parsed["variables"]] == [("beta", "V1"), ("alpha", "V2")]
+    assert parsed["invariants"] == ["I1: V2 from @2='V3' -> top ' out'", "I2: remove V1 -> p(top) < 0.5"]
+    assert components.render(parsed) == rendered
+
+
 def test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit(monkeypatch, tmp_path, capsys):
     from types import SimpleNamespace
 

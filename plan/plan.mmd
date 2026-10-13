@@ -305,7 +305,13 @@
 %% Diagnosis:68/226 TRAIN targets have211 component edges; SFT300 replacement draws visited160 targets,
 %% leaving21/68 relation examples unseen. Only79 updates had relations; relation lines6.2% of target tokens.
 %% All teacher answers fit416tokens; length alone cannot explain the missing relations. No typed ports/positions supervised.
-%% Next controlled test: opt-in shuffled coverage before repeats, same data/loss/300steps; evaluate relations before more RL.
+%% Coverage test38375772084 LAUNCHED freeGHA,300SFTsteps,seed0,one330-minute link,no RL or paidspend.
+%% Sampler65fb2e2:35tests pass;defaultrandomunchanged,each TRAINrow seen before repeats in opt-in epochmode.
+%% Execution pins originalcd8d4a9 plus sampler-only patch; frozen226rows/zoo/base bytes,Python3.11.14 and
+%% exact dependencies checked beforetraining. Output epoch/ordering_manifest.json binds mixed-source provenance.
+%% Compare24firstgreedy cases and8predeclared gold-relation cases withoriginalSFT; retain failures and sampledIDs.
+%% Original gold-relation component-edge F1 is0; empty-gold agreement inflates all-panel F1. No success from edges alone.
+%% Require executed relation-case gains and no overallregression before more RL; this is not a faithfulness certificate.
 %% Compact typed targets are a separate intervention and require diverse execution-verified teachers; do not conflate pilots.
 %% New sequential gradient accumulation replaces the old batched update; previous shutdown cause remains unproven.
 %% Each arm has one330-minute link,20scheduled updates, k4,416generation/3072context; no automatic extension.
@@ -427,7 +433,7 @@ flowchart BT
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Carrier size remains the limit</b><br/>53% compression; further4.7% adds no rows;<br/>2 of15 exact rows fit training limits;<br/>next: smaller verified carrier sets<br/>AUDIT DONE · codex/variable_reward"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
-  RELTRAIN["<b>Teach every relation example</b><br/>21 of68 never sampled by SFT;<br/>test coverage before repetition;<br/>same targets, steps and token limits<br/>ACTIVE · codex/fork_review"]
+  RELTRAIN["<b>Teach every relation example</b><br/>21 of68 never sampled by SFT;<br/>free300-step coverage test launched;<br/>same data, base model and dependencies<br/>RUNNING · codex/eval_recovery"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]

@@ -213,8 +213,16 @@ def predict(draws: int):
     held = json.loads((DATA / "copy_heldout.json").read_text())["copy"]
     out = {"texts": [], "summary": {}}
     acc = collections.defaultdict(list)
+    lines = DATA / "copy_predict.jsonl"  # one text per line: a process stops after MAXTEXTS (its memory grows per text)
+    done = {json.loads(x)["task"] for x in lines.read_text().splitlines()} if lines.exists() else set()
+    left = int(os.environ.get("MAXTEXTS", 8))
     for x in held:
         task = x["task"]
+        if task in done:
+            continue
+        if left <= 0:
+            return
+        left -= 1
         ids, targets = native.text(Path.home() / "mpd-data/graph_oracle/texts/vpd4l" / f"{task}.json")
         t = targets[-1]
         r = templates.role_positions(ids, t)
@@ -282,12 +290,31 @@ def predict(draws: int):
             rec["other"].append([q, z, same, float(base[y] - l[y])])
             acc["other: prediction unchanged"].append(same)
         out["texts"].append(rec)
+        with lines.open("a") as f:
+            f.write(json.dumps({**rec, "acc": {k: [bool(b) for b in v] for k, v in acc_one(rec).items()}}) + "\n")
         torch.mps.empty_cache() if str(nat.dev).startswith("mps") else None
         print(task, {k: round(float(np.mean(v)), 2) for k, v in acc.items()}, flush=True)
-    out["summary"] = {k: {"accuracy": float(np.mean(v)), "n": len(v)} for k, v in acc.items()}
-    (DATA / "copy_predict.json").write_text(json.dumps(out))
+    allacc = collections.defaultdict(list)
+    for x in lines.read_text().splitlines():
+        for k, v in json.loads(x)["acc"].items():
+            allacc[k] += v
+    out["summary"] = {k: {"accuracy": float(np.mean(v)), "n": len(v)} for k, v in allacc.items()}
+    (DATA / "copy_predict.json").write_text(json.dumps(out["summary"]))
     for k, v in out["summary"].items():
         print(f"  {k}: {v['accuracy']:.2f} of {v['n']}")
+
+
+def acc_one(rec: dict) -> dict:
+    """One text's prediction checks from its record."""
+    one = "one" if rec.get("occurrences", 1) == 1 else "two or more"
+    d = {"a: prediction becomes z": [b for _, b, _ in rec["a"]], "a: z above the old prediction": [c for _, _, c in rec["a"]],
+         "o: copy breaks (log p(y) falls >= 1 nat)": [dr >= 1.0 for _, dr in rec["o"]],
+         f"o, {one} occurrence(s): copy breaks": [dr >= 1.0 for _, dr in rec["o"]],
+         "every earlier occurrence: copy breaks (log p(y) falls >= 1 nat)": [dr >= 1.0 for _, dr in rec.get("o_all", [])],
+         f"every earlier occurrence, {one} occurrence(s): copy breaks": [dr >= 1.0 for _, dr in rec.get("o_all", [])],
+         "after every earlier occurrence: prediction becomes z": [b for _, b in rec.get("a_all", [])],
+         "other: prediction unchanged": [b for _, _, b, _ in rec["other"]]}
+    return d
 
 
 def report():

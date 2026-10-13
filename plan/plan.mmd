@@ -554,8 +554,8 @@ flowchart BT
   CLAIMREC --> CLAIMFIT
   CLAIMREC --> CLAIMQA
   CLAIMREC --> CLAIMCTRL
-  CLAIMCTRL["<b>Isolate component identity</b><br/>89 cases × 3 identity-matched arms;<br/>sizes and positions held constant;<br/>267 fresh distributions; checks before scoring<br/>LAUNCH PREP · codex/variable_reward"]
-  CLAIMQA["<b>Learn measured transplant effects</b><br/>147 fit with archived hints;16 hard rows;<br/>independent readback preserves all labels;<br/>partial coverage and ID limits explicit<br/>DATA READY · codex/variable_reward"]
+  CLAIMCTRL -. component specificity control .-> SUP
+  CLAIMQA -. auxiliary intervention answers .-> SUP
   CLAIMFIT -. additional exact rows .-> SUP
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
@@ -595,7 +595,7 @@ flowchart BT
   WIRING -. diagnoses missing relations .-> RELTRAIN
   RELTRAIN -. measured relation learning .-> C1
   RELTRAIN -. capacity remains unresolved .-> CAPABLE
-  CAPABLE["<b>Can a capable model learn wiring?</b><br/>226 complete targets;2 epochs; cap $0.35;<br/>base vs SFT on identical frozen inputs;<br/>score executed edges, not format alone<br/>RUNNING · codex/fork_review + eval_recovery"]
+  CAPABLE -. executed circuits and cost .-> C1
   WIRING -. opt-in wiring objective .-> R1
   %% FEEDBACK: REM -. tests .-> PHI
   VPD --> ENG

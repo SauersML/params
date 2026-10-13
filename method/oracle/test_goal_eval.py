@@ -1851,13 +1851,13 @@ def test_point_with_remainders_held(tiny):
 
 def test_graph_kl_on_node_sets_and_blocks(tiny):
     """graph_kl (pymove's report): a complete node set is its C-semantics run (sufficiency's KL), not the empty circuit;
-    a block runs as its site's subcomponents there."""
+    a block runs as its site's subcomponents VPD has on there."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     sub = native.Graph(every[::2], complete=True)
     t = tx.targets[0]
     blk = native.Graph([nd for nd in every if not (nd[0] == "h.1.mlp.c_fc" and nd[1] == t)] + [("h.1.mlp.c_fc", t, goal_eval.BLOCK)], complete=True)
-    flat = native.Graph(sorted(goal_eval.expand_blocks(blk, nat.C).node_set()), complete=True)
+    flat = native.Graph(sorted(goal_eval.expand_blocks(blk, nat.C, tx.vpd).node_set()), complete=True)
     got = ge.graph_kl(tx, [sub, blk, native.Graph()], True)
     want = [r["kl_live"] for r in ge.sufficiency(tx, [sub, flat])]
     assert abs(got[0] - want[0]) < 1e-4 + 1e-4 * want[0] and abs(got[1] - want[1]) < 1e-4 + 1e-4 * want[1], (got, want)
@@ -1866,7 +1866,7 @@ def test_graph_kl_on_node_sets_and_blocks(tiny):
 
 def test_blocks_priced_and_drawn_as_units(tiny):
     """A complete graph's block costs at least its active contents listed (connections counted over them); the node
-    family draws a block whole or not at all."""
+    family draws a block whole or not at all (with the text's VPD answer, its active contents)."""
     import numpy as np
 
     nat, ge, tx = tiny
@@ -1883,6 +1883,9 @@ def test_blocks_priced_and_drawn_as_units(tiny):
     for d in goal_eval._unit_draws(np.random.default_rng(0), units, 8, nat.C):
         got = {c for n, tt, c in d if (n, tt) == (site, t)}
         assert got in (set(), set(range(nat.C[site])))
+    for d in goal_eval._unit_draws(np.random.default_rng(0), units, 8, nat.C, tx.vpd):
+        got = {c for n, tt, c in d if (n, tt) == (site, t)}
+        assert got in (set(), {c for _, _, c in inside})
 
 
 def test_graph_ref_outside_held(tiny):
@@ -1997,8 +2000,9 @@ def test_node_family_against_the_models_response(tiny):
 
 def test_block_nodes(tiny):
     """["block", site, position] nodes: parsed and written back, a block costing its name among sites and positions,
-    stranded by the same rules as a subcomponent of its site, and run by C's families as every subcomponent of the
-    site there (expand_blocks); a token edge into the prediction at a target is parsed and priced."""
+    stranded by the same rules as a subcomponent of its site, and run by the families as the subcomponents of the
+    site VPD's answer has on there (expand_blocks with the text's actives: what size_bits prices; without them every
+    subcomponent of the site); a token edge into the prediction at a target is parsed and priced."""
     nat, ge, tx = tiny
     o1, d0 = "h.1.attn.o_proj", "h.0.mlp.down_proj"
     answer = {"nodes": [["block", o1, 11], ["block", "1.q", 11], ["h.0.mlp.down_proj", 0, 11], ["tok", 0, 11], ["block", "h.9.mlp.c_fc", 3]],
@@ -2018,17 +2022,19 @@ def test_block_nodes(tiny):
     with pytest.raises(ValueError):
         goal_eval.size_bits(g, P, S, tx.targets)  # a block's price needs the text's active parts
     assert abs(diff - want) < 1e-9, (diff, want)
-    ex = goal_eval.expand_blocks(g, nat.C)
-    assert set(ex.node_set()) == {(o1, 11, c) for c in range(nat.C[o1])} | {("h.1.attn.q_proj", 11, c) for c in range(nat.C["h.1.attn.q_proj"])} | {(d0, 11, 0)}
-    assert set(ex.out) == {(o1, 11, c) for c in range(nat.C[o1])}
+    every = goal_eval.expand_blocks(g, nat.C)
+    assert set(every.node_set()) == {(o1, 11, c) for c in range(nat.C[o1])} | {("h.1.attn.q_proj", 11, c) for c in range(nat.C["h.1.attn.q_proj"])} | {(d0, 11, 0)}
+    on = {n: {(n, 11, c) for c in tx.vpd[n][11].nonzero().flatten().tolist()} for n in (o1, "h.1.attn.q_proj")}
+    ex = goal_eval.expand_blocks(g, nat.C, tx.vpd)
+    assert set(ex.node_set()) == on[o1] | on["h.1.attn.q_proj"] | {(d0, 11, 0)} and set(ex.out) == on[o1]
     a = ge.fidelity(tx, [g], None, draws=2, near_donors=0, far_donors=0)[0]
     b = ge.fidelity(tx, [ex], None, draws=2, near_donors=0, far_donors=0)[0]
     assert a["s_point"] == b["s_point"]  # (the node family draws a block as one unit, its expansion part by part: a699a8b)
     whole = native.Graph([(o1, 11, B), (d0, 11, 0)], complete=True)  # a node set with a block: its site's parts there
     back, _ = goal_eval.circuit(goal_eval.to_json(whole), tx.targets, nat.C, tx.T)  # a node set's JSON ("complete")
     assert back.complete and set(back.node_set()) == set(whole.node_set())
-    flat = native.Graph([(o1, 11, c) for c in range(nat.C[o1])] + [(d0, 11, 0)], complete=True)
-    assert set(goal_eval.expand_blocks(whole, nat.C).node_set()) == set(flat.node_set())
+    flat = native.Graph(sorted(on[o1]) + [(d0, 11, 0)], complete=True)
+    assert set(goal_eval.expand_blocks(whole, nat.C, tx.vpd).node_set()) == set(flat.node_set())
     assert ge.fidelity(tx, [whole], None, draws=2, near_donors=0, far_donors=0)[0]["s_point"] ==         ge.fidelity(tx, [flat], None, draws=2, near_donors=0, far_donors=0)[0]["s_point"]
 
 

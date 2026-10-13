@@ -331,15 +331,25 @@ def _pair_entry(e: list, nodes: list, targets: list[int]):
     return (layer, t), (q, k)
 
 
-def expand_blocks(g: native.Graph, C: dict) -> native.Graph:
-    """A graph with its block nodes (BLOCK) replaced by every subcomponent of the site at the position, each in the
-    block's connections and pairs: C's semantics already run the remainders live, so this is the block's claim there
-    (the families on the engine take subcomponents). A graph without blocks is returned as it is."""
+def block_contents(n: str, t: int, C: dict, active: dict | None = None) -> list[int]:
+    """A block node's subcomponents (site n at position t): those VPD's answer has on there (active: {site: bool [T,
+    C]}, the text's), every one of the site without active. Scored at its active contents, a block holds what size_bits
+    prices it at; its inactive contents rode free inside it (the block's name about 13 bits, where backup measured about
+    1.5k bits for 6 inactive subcomponents listed with their connections) and could carry compensators (backup's 10-13
+    pricing hole; the lead's rule: no block where listed inactive subcomponents would be needed)."""
+    return list(range(C[n])) if active is None else active[n][t].nonzero().flatten().tolist()
+
+
+def expand_blocks(g: native.Graph, C: dict, active: dict | None = None) -> native.Graph:
+    """A graph with its block nodes (BLOCK) replaced by their subcomponents (block_contents: with active, the text's
+    VPD answer, those on at the position; else every one of the site), each in the block's connections and pairs:
+    C's semantics already run the remainders live, so this is the block's claim there (the families on the engine
+    take subcomponents). A graph without blocks is returned as it is."""
     if g.masks is not None or not any(nd[2] == BLOCK for nd in g.node_set()):
         return g
 
     def ex(nd):
-        return [(nd[0], nd[1], c) for c in range(C[nd[0]])] if nd is not None and nd[2] == BLOCK else [nd]
+        return [(nd[0], nd[1], c) for c in block_contents(nd[0], nd[1], C, active)] if nd is not None and nd[2] == BLOCK else [nd]
 
     if g.complete:
         out = native.Graph(list(dict.fromkeys(x for nd in g.nodes for x in ex(nd))), complete=True)
@@ -365,10 +375,10 @@ def expand_blocks(g: native.Graph, C: dict) -> native.Graph:
     return out
 
 
-def _c_graph(g: native.Graph, targets: list[int], C: dict) -> native.Graph:
+def _c_graph(g: native.Graph, targets: list[int], C: dict, active: dict | None = None) -> native.Graph:
     """A graph as C's families run it: stranded nodes dropped (strand), block nodes as their subcomponents
-    (expand_blocks)."""
-    return expand_blocks(strand(g, targets, C), C)
+    (expand_blocks; with active, the text's VPD answer, its active contents)."""
+    return expand_blocks(strand(g, targets, C), C, active)
 
 
 def to_json(g: native.Graph, explanation: str = "") -> dict:
@@ -444,13 +454,13 @@ def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list
     return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(m + k) * (2 * (inner + len(g.tok_edges)) + out) + extra
 
 
-def _unit_draws(rng: np.random.Generator, units: list, draws: int, C: dict) -> list[list]:
+def _unit_draws(rng: np.random.Generator, units: list, draws: int, C: dict, active: dict | None = None) -> list[list]:
     """The node family's removal draws: draw j takes each unit with probability (j + 0.5) / draws (at least one), a
     block unit (site, t, BLOCK) as every subcomponent of its site at t."""
     out = []
     for j in range(draws):
         du = [u for u in units if rng.random() < (j + 0.5) / draws] or [units[int(rng.integers(len(units)))]]
-        out.append([x for u in du for x in ([(u[0], u[1], c) for c in range(C[u[0]])] if u[2] == BLOCK else [u])])
+        out.append([x for u in du for x in ([(u[0], u[1], c) for c in block_contents(u[0], u[1], C, active)] if u[2] == BLOCK else [u])])
     return out
 
 
@@ -1434,9 +1444,9 @@ class GoalEval:
             return h
 
         variants = [without(d) for d in gone]
-        flat = [expand_blocks(h, nat.C) for h in variants]
+        flat = [expand_blocks(h, nat.C, tx.vpd) for h in variants]
         e0, v0 = self._bounds(tx, "live")
-        fast = self.LOO_FAST and tx.vpd is not None and expand_blocks(g, nat.C) is g
+        fast = self.LOO_FAST and tx.vpd is not None and expand_blocks(g, nat.C, tx.vpd) is g
         held = [f for f in self.HELD if not (f == "nodes" and "nodes" in recompute) and not (f.startswith("patching") and "patching" in recompute)]
         got = self._loo_c(tx, g, lines, keep, flat if "nodes" in recompute else None,
                           patching=(split, base) if "patching" in recompute else None) if fast else None  # one plan
@@ -1473,7 +1483,7 @@ class GoalEval:
         first = {s: next(i for i in range(K) if sets[i] == s) for s in distinct}
         again = NEC_CONTROLS_LOO != NEC_CONTROLS or not base.get("draws_n_spec")  # the answer's own N on the variants'
         # controls (else its row's, on the same controls)
-        got = self.necessity_spec(tx, ([expand_blocks(g, nat.C)] if again else []) + [flat[first[s]] for s in distinct], split,
+        got = self.necessity_spec(tx, ([expand_blocks(g, nat.C, tx.vpd)] if again else []) + [flat[first[s]] for s in distinct], split,
                                   NEC_CONTROLS_LOO) if again or distinct else []
         own, nsp = (got[0], dict(zip(distinct, got[1:]))) if again else ({}, dict(zip(distinct, got)))
         bits = size_bits(g, P, S, tx.targets, active=tx.vpd)
@@ -1565,7 +1575,7 @@ class GoalEval:
         if mode == "c":
             kl = []
             for s0 in range(0, len(variants), chunk):
-                part = [expand_blocks(h, nat.C) for h in variants[s0:s0 + chunk]]
+                part = [expand_blocks(h, nat.C, tx.vpd) for h in variants[s0:s0 + chunk]]
                 whole = [i for i, h in enumerate(part) if h.complete]
                 stated = [i for i, h in enumerate(part) if not h.complete]
                 got = [None] * len(part)
@@ -1960,7 +1970,7 @@ class GoalEval:
         todo = [(gi, d) for gi, (g, (reads, draws)) in enumerate(zip(graphs, plans)) if reads and tx.vpd is not None for d in draws]
         if todo:
             nat, dev = self.nat, self.nat.dev
-            flat = {gi: expand_blocks(graphs[gi], nat.C) for gi in {gi for gi, _ in todo}}
+            flat = {gi: expand_blocks(graphs[gi], nat.C, tx.vpd) for gi in {gi for gi, _ in todo}}
             E = self._circuit_engine(tx.ids, tx.targets, list(flat.values()))
             at = {n: {c: i for i, c in enumerate(E.columns[n].tolist())} for n in nat.names}
             whole = {}  # a complete graph's nodes per site: (positions, columns)
@@ -2468,17 +2478,18 @@ class GoalEval:
 
     def graph_kl(self, tx: Text, graphs: list[native.Graph], live: bool) -> list[float]:
         """KL in bits at the targets of each stated graph's run on the text (_graph_kl)."""
-        return self._graph_kl(tx.ids, tx.targets, tx.ref, graphs, live, self._bounds(tx, "live" if live else "off")[0])
+        return self._graph_kl(tx.ids, tx.targets, tx.ref, graphs, live, self._bounds(tx, "live" if live else "off")[0], tx.vpd)
 
     @torch.no_grad()
     def _graph_kl(self, ids: list[int], targets: list[int], ref: torch.Tensor, graphs: list[native.Graph], live: bool,
-                  empty_kl: float) -> list[float]:
+                  empty_kl: float, active: dict | None = None) -> list[float]:
         """KL in bits at the targets, from the model's log probabilities ref, of each stated graph's run on ids in C's
         semantics (graph_ref: graph inside the circuit, masked outside, every other subcomponent off, remainders on
         (live) or off); a complete graph its masked run (runs, as sufficiency); a graph with no node is the empty circuit
-        (empty_kl). Blocks run as their subcomponents and stranded nodes are dropped (_c_graph: complete node sets and
-        block circuits score as fidelity scores them; pymove's report: node sets returned KL_empty, blocks crashed)."""
-        graphs = [_c_graph(g, targets, self.nat.C) for g in graphs]
+        (empty_kl). Blocks run as their subcomponents (with active, the text's VPD answer, their active contents) and
+        stranded nodes are dropped (_c_graph: complete node sets and block circuits score as fidelity scores them;
+        pymove's report: node sets returned KL_empty, blocks crashed)."""
+        graphs = [_c_graph(g, targets, self.nat.C, active) for g in graphs]
         out = [empty_kl] * len(graphs)
         whole = [i for i, g in enumerate(graphs) if g.complete and g.node_set()]  # a complete graph: its masked run
         if whole:
@@ -2782,7 +2793,7 @@ class GoalEval:
         matrix's remainder W - V U removed too at each position holding one of the graph's subcomponents. A batch
         reuses the model's states before its first removed subcomponent."""
         nat, T = self.nat, tx.T
-        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
+        graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         kls = self._removed_kl(tx.ids, tx.targets, [self.masks(g, T) for g in graphs], tx.ref, remainders_at_nodes)
         out = []
         for k in kls:
@@ -2812,7 +2823,7 @@ class GoalEval:
         bounds = {x: (kl(native.Graph(), kw), kl(native.Graph(masks=tx.vpd), kw)) for x, kw in how.items()}
         out = []
         for g in graphs:
-            g = _c_graph(g, tx.targets, nat.C)
+            g = _c_graph(g, tx.targets, nat.C, tx.vpd)
             row = {}
             for x, kw in how.items():
                 kc = kl(g, kw)
@@ -2913,7 +2924,7 @@ class GoalEval:
         start's D_t - D_c fell to 0 or below on 9001, 9006, 9007 and 9015; kept on, it is 1.8-6.9 bits there and N on the
         20 held-out starts goes from 0.62 (14 scored) to 0.92 (18 scored)."""
         nat, T = self.nat, tx.T
-        sets = [self.masks(_c_graph(g, tx.targets, nat.C), T) for g in graphs]
+        sets = [self.masks(_c_graph(g, tx.targets, nat.C, tx.vpd), T) for g in graphs]
         keep = None
         if background:  # the background parts at the targets never removed, the circuits' and VPD's alike
             keep = {n: torch.zeros(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
@@ -3000,7 +3011,9 @@ class GoalEval:
         if mode not in ("full", "reward"):
             raise ValueError("mode is full or reward")
         pp_graphs = [strand(g, tx.targets, self.nat.C) for g in graphs]  # the path-patched terms take blocks as blocks
-        graphs = [_c_graph(g, tx.targets, self.nat.C) for g in graphs]  # stranded nodes dropped before every family
+        if tx.vpd is not None:  # (at their active contents, block_contents)
+            pp_graphs = [expand_blocks(g, self.nat.C, tx.vpd) for g in pp_graphs]
+        graphs = [_c_graph(g, tx.targets, self.nat.C, tx.vpd) for g in graphs]  # stranded nodes dropped before every family
         reward = mode == "reward"
         split = split or ("search" if reward else "eval")
         reads = reads or reward
@@ -3144,7 +3157,7 @@ class GoalEval:
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
-        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
+        graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         ms = FLIPS["omitted"] if ms is None else ms
         e0, v0 = self._bounds(tx, "live")
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63) + 1)
@@ -3283,12 +3296,16 @@ class GoalEval:
         return rows_out
 
 
-    def _node_draws(self, tx: Text, units: list, draws: int) -> list[list]:
+    def _node_draws(self, tx: Text, units: list, draws: int, held: list | None = None) -> list[list]:
         """The node family's removal draws with common random numbers (the lead's 10-13: draws re-seeded by the node
         set moved s_nodes by about 0.08 for one added subcomponent): each unit's uniforms its own, one a draw, seeded by
         the text and the unit alone (kept on tx), so a circuit's subsets share their draws, a deleted unit dropping out
         of each. Draw j takes the units whose uniform is below (j + 0.5) / draws, at least one (the smallest); a block
-        unit (site, t, BLOCK) is every subcomponent of its site at t."""
+        unit (site, t, BLOCK) is the subcomponents of its site at t that held (the scored graph's nodes) has, or without
+        held its contents (block_contents: the text's actives)."""
+        inside = {}
+        for nd in held or ():
+            inside.setdefault(nd[:2], []).append(nd)
         kept = tx.__dict__.setdefault("_node_uniforms", {})
         for u in units:
             if (u, draws) not in kept:
@@ -3301,7 +3318,8 @@ class GoalEval:
         for j in range(draws):
             pick = np.nonzero(r[j] < (j + 0.5) / draws)[0]
             du = [units[i] for i in (pick if len(pick) else [int(np.argmin(r[j]))])]
-            out.append([x for u in du for x in ([(u[0], u[1], c) for c in range(self.nat.C[u[0]])] if u[2] == BLOCK else [u])])
+            out.append([x for u in du for x in ((inside.get(u[:2], []) if held is not None else
+                                                 [(u[0], u[1], c) for c in block_contents(u[0], u[1], self.nat.C, tx.vpd)]) if u[2] == BLOCK else [u])])
         return out
 
     def _rng(self, tx: Text, g: native.Graph, family: str) -> np.random.Generator:
@@ -3421,7 +3439,7 @@ class GoalEval:
             if not nodes:
                 out.append({"kl_nodes_c": self._bounds(tx, "live")[0], "kl_nodes_vpd": self._bounds(tx, "live")[1], "reads_nodes": None})
                 continue
-            drops = self._node_draws(tx, sorted(units[len(out)]) if units is not None else nodes, draws)
+            drops = self._node_draws(tx, sorted(units[len(out)]) if units is not None else nodes, draws, held=nodes)
 
             def without(base, d, where):  # [draws, T, K]: base with each draw's nodes off
                 m = {n: x[None].repeat(len(d), 1, 1) for n, x in base.items()}
@@ -3769,7 +3787,7 @@ class GoalEval:
         (KL_C, weighted the same), prompts_changed (those scored), s_track, kl_track_c, prompts_track, context_share
         (the share of the probe's moved at the circuit's positions) and draws_changed."""
         nat = self.nat
-        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]
+        graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]
         moved = np.asarray(tx.moved, dtype=float)
         total = float(moved.sum())
         share = [sum(moved[t - 1] for t in {t for _, t, _ in g.node_set()} if 0 < t <= len(moved)) / total
@@ -3973,7 +3991,7 @@ class GoalEval:
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
-        graphs = [_c_graph(g, tx.targets, nat.C) if restrand else expand_blocks(g, nat.C) for g in graphs]  # (restrand
+        graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) if restrand else expand_blocks(g, nat.C, tx.vpd) for g in graphs]  # (restrand
         texts = self._donor_texts(tx, split, near, far)  # False: as given, phi_variants' variants)
         E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=None)
         u = {n: torch.ones(1, 1, nat.C[n], device=dev) for n in nat.names}
@@ -4239,7 +4257,7 @@ class GoalEval:
         adv_mask (the patterns on, as pool indices, the count of the circuit's omissions switched on and those at the
         targets)."""
         nat, dev = self.nat, self.nat.dev
-        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
+        graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         e0 = self._bounds(tx, "live")[0]
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True)
@@ -4320,7 +4338,7 @@ class GoalEval:
         shortlist measured on it alone. strengths: _adv_problem's (one stated graph at each circuit's connection
         strengths: edge_flips)."""
         nat, dev = self.nat, self.nat.dev
-        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
+        graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]  # the claim fidelity scores: stranded nodes dropped (a no-op on its graphs)
         e0 = self._bounds(tx, "live")[0]
         ms = FLIPS[lever] if ms is None else ms
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
@@ -4464,7 +4482,7 @@ class GoalEval:
         two partial cuts (the lead's decision 10-12): they need not add up to the cut. edges: those connections alone
         ((writer, reader or None), in the graph's order; None: every one)."""
         nat, dev = self.nat, self.nat.dev
-        g = _c_graph(graph, tx.targets, nat.C)
+        g = _c_graph(graph, tx.targets, nat.C, tx.vpd)
         every = [(w, r) for r, ws in g.parents.items() for w in ws] + [(w, None) for w in g.out]
         want = None if edges is None else set(edges)
         ks = [k for k, e in enumerate(every) if want is None or e in want]
@@ -4499,7 +4517,7 @@ class GoalEval:
         """(graph with its stranded nodes dropped, None), or with a subset of ons (edge_flips', in graph's order) that
         strands a node, or a graph that strands one itself (its plan's connections are fewer than ons' columns), (that,
         each subset's graph as stated with its stranded nodes dropped)."""
-        base = _c_graph(graph, tx.targets, self.nat.C)  # nodes no path of graph reaches the prediction from: stranded in every subset
+        base = _c_graph(graph, tx.targets, self.nat.C, tx.vpd)  # nodes no path of graph reaches the prediction from: stranded in every subset
         edges = [(w, r) for r, ws in graph.parents.items() for w in ws] + [(w, None) for w in graph.out]
         nodes = sorted(graph.node_set())
         subs = []
@@ -4629,7 +4647,7 @@ class GoalEval:
         real model's necessity ("n_real_*", "kl_real_minus")."""
         t0 = time.perf_counter()
         nat = self.nat
-        graphs = [_c_graph(g, tx.targets, nat.C) for g in graphs]  # stranded nodes dropped before every measure
+        graphs = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]  # stranded nodes dropped before every measure
         rows = self.sufficiency(tx, graphs)
         f3 = self.edges(tx, graphs)
         total = sum(nat.C.values())
@@ -4930,15 +4948,15 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             dn = ge.donors(tx, graphs, far=ge.far_donors(tx, far)) if "donors" in only else [{} for _ in graphs]
             tp = ge.track_pp(tx, graphs, "eval", changed) if "track_pp" in only else [{} for _ in graphs]
             if "pattern" in only:  # the true-pattern family, merged into the same rows
-                tp = [dict(a, **c) for a, c in zip(tp, ge.pattern_family(tx, [_c_graph(g, targets, nat.C) for g in graphs]))]
+                tp = [dict(a, **c) for a, c in zip(tp, ge.pattern_family(tx, [_c_graph(g, targets, nat.C, tx.vpd) for g in graphs]))]
             ip = ge.interchange_pp(tx, graphs, "eval", interchange) if "interchange_pp" in only else [{} for _ in graphs]
-            nf = ge._node_family(tx, [_c_graph(g, targets, nat.C) for g in graphs], draws,
+            nf = ge._node_family(tx, [_c_graph(g, targets, nat.C, tx.vpd) for g in graphs], draws,
                                  units=[sorted(strand(g, targets, nat.C).node_set()) for g in graphs]) if "nodes" in only else [{} for _ in graphs]
             ns = ge.necessity_spec(tx, graphs, "eval") if "necessity" in only else [{} for _ in graphs]
             if "necessity_bg" in only:  # N without the background kept (background=False), the earlier definition
                 ns = [dict(a, **{f"{k}_nobg": v for k, v in b.items()}) for a, b in zip(ns, ge.necessity_spec(tx, graphs, "eval", background=False))]
             if "omitted" in only:
-                ns = [dict(a, **b) for a, b in zip(ns, ge._omitted_family(tx, [_c_graph(g, targets, nat.C) for g in graphs]))]
+                ns = [dict(a, **b) for a, b in zip(ns, ge._omitted_family(tx, [_c_graph(g, targets, nat.C, tx.vpd) for g in graphs]))]
             if "remainders" in only:  # the point score with the remainders live, held at x and off
                 ns = [dict(a, **b) for a, b in zip(ns, ge.point_remainders(tx, graphs))]
             scale = ge.size_scale(tx)

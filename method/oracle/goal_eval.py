@@ -1822,7 +1822,7 @@ class GoalEval:
         model, from VPD's answer and from the variant, every variant's draws on the same three engines); None when the
         plan's connections are not the graph's. At x (_xkw of the point family; the node family's in _loo_nodes): a
         deleted line's nodes outside the variant at x (held), a node draw's at 0 (fidelity's numbers on each variant),
-        the states before the circuit's first position kept from one run at x as in C (LOO_REUSE)."""
+        the states before the circuit's first position kept from one run at each family's semantics, as in C (LOO_REUSE)."""
         nat, dev = self.nat, self.nat.dev
         kx = self._xkw(tx.ids, tx.targets, "point")  # (point, wiring and pattern)
         edges = [] if g.complete else [(w, r) for r, ws in g.parents.items() for w in ws]
@@ -1870,14 +1870,25 @@ class GoalEval:
 
         lo = min((t for _, t, _ in g.node_set()), default=0) if self.LOO_REUSE else 0  # before the circuit's first position every
         lo = lo if 0 < lo <= min(tx.targets) else 0                        # variant's run is the same: kept once, reused
-        kept = {} if lo else None
-        every = None if g.complete or not kx else {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kx["at_x"]}
-        if lo:  # (at x with the rows' held: every column outside the circuit, before lo every row's)
+        kn = self._xkw(tx.ids, tx.targets, "nodes") if flat is not None else kx  # (the node family's, when recomputed)
+
+        def held_all(kw):  # a stated graph's held at x: every column outside the circuit (a deleted line's nodes too)
+            return None if g.complete or not kw else {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kw["at_x"]}
+
+        def keep_run(kw):  # the states of one run of the whole graph at kw's semantics (before lo every row's)
+            st = {}
             if g.complete:
-                E.graph_log_probs(plan, u1, keep=kept, **kx)
+                E.graph_log_probs(plan, u1, keep=st, **kw)
             else:
-                E.graph_log_probs(plan, ew=torch.ones(1, len(edges), device=dev), ow=torch.ones(1, len(outs), device=dev), keep=kept,
-                                  **(dict(kx, held=every) if kx else {}))
+                E.graph_log_probs(plan, ew=torch.ones(1, len(edges), device=dev), ow=torch.ones(1, len(outs), device=dev), keep=st,
+                                  **(dict(kw, held=held_all(kw)) if kw else {}))
+            return st
+        every = held_all(kx)
+        states = {}  # per semantics (the point family's, the node family's when it differs) its kept states
+        if lo:
+            states[id(kx)] = keep_run(kx)
+            if kn is not kx and (kn or kx):
+                states[id(kn)] = keep_run(kn)
         tg = nat.target  # engine rows a call: a row's widest activations from lo on and, reusing, its kept keys and values
         step = max(4, self.LOO_ENTRIES // ((tx.T - lo) * max(nat.C.values()) + (2 * tg.n_layer * tx.T * tg.d_model if lo else 0)))
 
@@ -1889,9 +1900,9 @@ class GoalEval:
             if tables is None:
                 tables = (ew[ix], ow[ix], [off[i] for i in ix]) if not g.complete else urows([sets[i] for i in ix])
             R = next(iter(tables.values())).shape[0] if g.complete else len(tables[0])
-            reuse = (E.tile_states(kept, R), tx.ids, lo) if lo and (kw is kx or not (kw or kx)) else None  # (kept: the point family's)
-            every_ = every if kw is kx else (None if g.complete or not kw else
-                                              {n: torch.ones(1, 1, E.width(n), dtype=torch.bool, device=dev) for n in kw["at_x"]})
+            st = states.get(id(kx) if kw is kx or not (kw or kx) else id(kw))  # (the states kept at kw's semantics)
+            reuse = (E.tile_states(st, R), tx.ids, lo) if st is not None else None
+            every_ = every if kw is kx else held_all(kw)
             hk = dict(kw, held=held if held is not None else every_) if kw else {}
             if g.complete:
                 return E.graph_log_probs(plan, tables, rows=given, reuse=reuse, **hk)

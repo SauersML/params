@@ -21,6 +21,31 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def allocation_equal(actual, frozen):
+    """Only precast binary64 sums tolerate reduction-order roundoff.
+
+    Python 3.12 improves float summation over 3.11. Four gamma_N bounds cover
+    weighted-sum normalization and two summaries. Stored FP32 masses, counts,
+    masks, and all other fields remain exact comparisons.
+    """
+    if actual.keys() != frozen.keys():
+        return False
+    n = actual.get('supervised_tokens')
+    if type(n) is not int or not 0 < n <= 416:
+        return False
+    u = 2. ** -53
+    gamma = n * u / (1 - n * u)
+    for key, value in actual.items():
+        expected = frozen[key]
+        if key in ('new_total_mass', 'new_relation_mass'):
+            if (not math.isfinite(value) or not math.isfinite(expected)
+                    or abs(value - expected) > 4 * gamma * max(abs(value), abs(expected))):
+                return False
+        elif value != expected:
+            return False
+    return True
+
+
 def prepare(root, panel, base_samples, protocol, out):
     """Freeze already physically checked/free-tokenizer-fit data; no data selection."""
     import capable_wiring as pilot
@@ -137,7 +162,7 @@ def run(manifest_path, out, tokenizer_path, cap):
         balanced, stats = [], []
         for row, d, frozen in zip(rows, ordinary, fit[family]['stats']):
             edited, stat = relation_loss.apply_to_datum(d, row['completion'], tok, 8)
-            if stat != {k: v for k, v in frozen.items() if k not in ('id', 'pair_tokens')}:
+            if not allocation_equal(stat, {k: v for k, v in frozen.items() if k not in ('id', 'pair_tokens')}):
                 raise ValueError('exact relation-token allocation changed')
             if d.model_input.length != frozen['pair_tokens']:
                 raise ValueError('TRAIN rendering length changed')

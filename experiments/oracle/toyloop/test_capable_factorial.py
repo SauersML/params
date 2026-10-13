@@ -11,6 +11,18 @@ import capable_factorial as cf
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_binary64_summaries_tolerate_drift_but_exact_fields_do_not(self):
+        frozen={'supervised_tokens':406,'relation_tokens':10,'new_total_mass':1.,
+                'new_relation_mass':.5,'stored_total_mass':1.,'old_total_mass':1.,
+                'token_binding':'exact'}
+        actual=dict(frozen,new_total_mass=1.+1e-14,new_relation_mass=.5+1e-14)
+        self.assertTrue(cf.allocation_equal(actual,frozen))
+        for field,value in (('stored_total_mass',1.+1e-14),('old_total_mass',1.+1e-14),
+                            ('relation_tokens',11),('token_binding','changed')):
+            changed=dict(actual); changed[field]=value
+            self.assertFalse(cf.allocation_equal(changed,frozen))
+        self.assertFalse(cf.allocation_equal(dict(actual,new_total_mass=1.+1e-8),frozen))
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name); self.data=self.root/'data'; self.data.mkdir()

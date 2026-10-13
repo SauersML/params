@@ -91,3 +91,29 @@ def test_cli_rejects_default_checkpoint_before_loading_model(tmp_path, monkeypat
     assert exc.value.code == 2
     assert "choose a new --checkpoint path" in capsys.readouterr().err
     assert checkpoint.read_text() == "prior results\n"
+
+
+def test_circuit_baselines_clear_edit_requests_without_changing_policy(tmp_path, monkeypatch):
+    rows, sets = setup_eval(tmp_path, monkeypatch)
+    for task in rows:
+        rows[task] = {"qa": [{"question": "measured QA"}], "edits": [{"kind": "flip"}]}
+        (tmp_path / (task + ".json")).write_text(json.dumps({
+            "id": task, "prompts": [{"token_ids": [1], "target_positions": [0]}]}))
+    tx = SimpleNamespace(ids=[1], targets=[0])
+    ge = SimpleNamespace(text=lambda *a, **k: tx, nat=SimpleNamespace(_vpd_order=lambda *a: []))
+    calls = []
+
+    def check_reward(ge, task, ev, texts, **kwargs):
+        calls.append(ev)
+        if texts == ["baseline"]:
+            assert ev["qa"] == [] and ev["edits"] == []
+            assert kwargs["node_cap"] is None
+            raise RuntimeError("baseline contract checked")
+        assert ev is rows[task["id"]]  # the policy retains its requested QA and edits
+        return [{"reward": 0.4, "valid": True, "row": {"nodes": 3}}]
+
+    monkeypatch.setattr(components, "reward", check_reward)
+    with pytest.raises(RuntimeError, match="baseline contract checked"):
+        components.evaluate(ge, "heldout", rows, sets, 2, log=lambda *a, **k: None)
+    assert len(calls) == 2
+    assert rows["mock_a"]["edits"] == [{"kind": "flip"}]

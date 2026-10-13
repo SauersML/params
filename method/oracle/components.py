@@ -2454,7 +2454,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             per[name].append(entry)
         sizes = [y.get("nodes") or 0 for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1])]
         names = baseline_texts(ge, task, sizes, cache.get(task["id"]))
-        for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": []}, list(names.values()), split="eval",
+        for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": [], "edits": []}, list(names.values()), split="eval",
                                                       teacher=teachers.get(p.stem) if teachers else None, node_cap=None)):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
             base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),

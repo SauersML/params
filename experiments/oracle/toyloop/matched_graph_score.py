@@ -124,6 +124,28 @@ def partition(panel, workers):
     return [sorted(group) for group in groups]
 
 
+def validate_panel(manifest, parent_path=None, parent_sha256=None):
+    """A stronger baseline may only use the unchanged eight new-model cases."""
+    if parent_path is None:
+        if (parent_sha256 is not None or 'parent_manifest_sha256' in manifest
+                or manifest['schema_version'] != 1
+                or manifest['arms'] != ['base', 'point', 'intervention']
+                or Counter(r['stratum'] for r in manifest['panel']) != {'new_model': 8, 'retention': 24}):
+            raise ValueError('fixed 32-model, three-policy panel required')
+        return
+    if parent_sha256 is None or sha(parent_path) != parent_sha256:
+        raise ValueError('strong baseline parent digest required')
+    parent = json.loads(Path(parent_path).read_text())
+    validate_panel(parent)
+    expected = dict(parent)
+    expected['panel'] = [row for row in parent['panel'] if row['stratum'] == 'new_model']
+    expected['arms'] = ['strong']
+    expected['forward_cap'] = 3 * sum(len(row['inputs']) * len(row['edits']) for row in expected['panel'])
+    expected['parent_manifest_sha256'] = parent_sha256
+    if manifest != expected:
+        raise ValueError('strong baseline must preserve every original new-model world and source')
+
+
 def cartesian(panel, arms, indices):
     return {(panel[i]['stratum'], panel[i]['id'], arm, edit, inp)
             for i in indices for arm in arms for edit in range(len(panel[i]['edits']))
@@ -135,6 +157,9 @@ def merge(args):
     if sha(args.manifest) != args.manifest_sha256 or args.out.exists():
         raise ValueError('frozen manifest and fresh output required')
     manifest = json.loads(args.manifest.read_text())
+    if 'parent_manifest_sha256' in manifest or getattr(args, 'strong_baseline_parent', None) is not None:
+        validate_panel(manifest, getattr(args, 'strong_baseline_parent', None),
+                       getattr(args, 'strong_baseline_parent_sha256', None))
     panel, arms = manifest['panel'], manifest['arms']
     assignment = partition(panel, args.workers)
     global_cap = sum(len(r['inputs']) * len(r['edits']) * (2 + len(arms)) for r in panel)
@@ -207,14 +232,13 @@ def run(args):
             or args.out.exists()):
         raise ValueError('frozen manifest and fresh output required')
     manifest = json.loads(args.manifest.read_text())
+    validate_panel(manifest, getattr(args, 'strong_baseline_parent', None),
+                   getattr(args, 'strong_baseline_parent_sha256', None))
     panel, arms = manifest['panel'], manifest['arms']
     assignment = partition(panel, args.workers)
     if type(args.worker) is not int or args.worker not in range(args.workers):
         raise ValueError('worker index out of range')
     indices = assignment[args.worker]
-    if (manifest['schema_version'] != 1 or arms != ['base', 'point', 'intervention']
-            or Counter(r['stratum'] for r in panel) != {'new_model': 8, 'retention': 24}):
-        raise ValueError('fixed 32-model, three-policy panel required')
     required_source = ('experiments/oracle/toyloop/circuit.py', 'experiments/oracle/toys/planted.py',
                        'method/oracle/native.py', 'method/oracle/native_units.py',
                        'method/oracle/goal_eval.py', 'method/oracle/carry.py',
@@ -381,6 +405,8 @@ if __name__ == '__main__':
     parser.add_argument('--worker', type=int, default=0)
     parser.add_argument('--workers', type=int, default=1)
     parser.add_argument('--shard', type=Path, action='append', default=[])
+    parser.add_argument('--strong-baseline-parent', type=Path)
+    parser.add_argument('--strong-baseline-parent-sha256')
     for name in ('manifest', 'out'):
         parser.add_argument('--'+name, type=Path, required=True)
     parser.add_argument('--manifest-sha256', required=True)

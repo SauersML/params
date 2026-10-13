@@ -105,6 +105,26 @@ class MatchedScoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 scorer.bound_path('/payload', path)
 
+    def test_strong_baseline_keeps_exact_original_worlds_and_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = {'schema_version': 1, 'arms': ['base', 'point', 'intervention'],
+                      'panel': [{'id': str(i), 'stratum': 'new_model' if i < 8 else 'retention',
+                                 'inputs': [[i]], 'edits': [[]]} for i in range(32)],
+                      'source_sha256': {'executor': 'fixed'}, 'forward_cap': 160}
+            path = Path(tmp) / 'parent.json'; path.write_text(json.dumps(parent))
+            digest = scorer.sha(path)
+            derived = dict(parent, arms=['strong'], panel=parent['panel'][:8],
+                           forward_cap=24, parent_manifest_sha256=digest)
+            scorer.validate_panel(parent)
+            scorer.validate_panel(derived, path, digest)
+            for changed in (dict(derived, panel=derived['panel'][:-1]),
+                            dict(derived, source_sha256={'executor': 'different'}),
+                            dict(derived, arms=['base']), dict(derived, forward_cap=23),
+                            dict(derived, extra='unbound')):
+                with self.assertRaises(ValueError): scorer.validate_panel(changed, path, digest)
+            with self.assertRaises(ValueError): scorer.validate_panel(derived)
+            with self.assertRaises(ValueError): scorer.validate_panel(derived, path, 'wrong')
+
 
 if __name__ == '__main__':
     unittest.main()

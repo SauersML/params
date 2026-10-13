@@ -44,7 +44,7 @@ def propose(base,slope,kind,token,*,bounds=BOUNDS,margin=MARGIN):
  k=min(choices,key=lambda k:(abs(k-1),k));z=b+(k-1)*s;actual=float(z[token]-z[other].max()) if kind=='raise' else float(z[other].max()-z[token])
  return {'k':k,'predicted_winner':int(z.argmax()),'predicted_numerator_margin':actual,'intervals':intervals,'bounds':[lo,hi],'margin':margin,'scope':'Argmax shared finalRMS cancels; full forward/collateral verification required'}
 
-def coefficients(nat,ids,target,site_name):
+def coefficients(nat,ids,target,site_name,*,retain=None):
  """Exactly one unedited full forward; retain raw scalar activation, pre-final-RMS logits."""
  import torch,types,vpd_model
  tg=nat.target
@@ -58,6 +58,7 @@ def coefficients(nat,ids,target,site_name):
   with torch.no_grad():
    tg.hidden(torch.tensor([ids],device=nat.dev));r=captured['r'];activation=(site.last_input[0,target]@site.V).detach().float().clone();base=(r*tg.ln_f.float())@tg.wte.float().T
  finally:tg.norm=original_norm;nat.vpd.clear();site.cache_input=old_cache
+ if retain is not None:retain['residual_pre_final_rms']=r.detach().clone()
  return base.detach(),activation
 
 def candidates(ee,task,goal,nodes):

@@ -8,6 +8,10 @@
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
+spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
+if awk -v s="$spent" 'BEGIN {exit !(s > 370)}' && [ -z "${LEDGER_OK:-}" ]; then  # the lead's standing approval ends at $370
+  echo "$0: the team's RunPod ledger is at \$$spent (> \$370): ask the lead, then rerun with LEDGER_OK=1" >&2; exit 2
+fi
 NAME=${1:-oracle-graph-learn} H=${2:-2}
 P=${P:-3} RANGES=${RANGES:-"6000:6800 9000:9200"}
 O=/Users/user/mpd-data/runpod/$NAME W=/workspace/runs/$NAME V=/Users/user/mpd-data/vpd G=/Users/user/mpd-data/graph_oracle

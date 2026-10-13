@@ -220,9 +220,8 @@ def _fit(model, tok, enc: list, epochs: int, lr: float, batch: int, log, tag: st
     import torch
 
     rng = random.Random(seed)
-    params = [p for p in model.parameters() if p.requires_grad]
-    groups = [{"params": params, "lr": lr}] + (slots.param_groups(rank, lr) if slots else [])
-    params += [p for g in groups[1:] for p in g["params"]]
+    groups = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": lr}] + (slots.param_groups(rank, lr) if slots else [])
+    params = [p for g in groups for p in g["params"]]  # all of them clipped together
     opt = torch.optim.AdamW(groups, lr=lr, weight_decay=0.0)
     steps = epochs * math.ceil(len(enc) / batch)
     warm = max(1, steps // 20)

@@ -516,6 +516,26 @@ def test_fit_pool_drops_the_least_important_entries_until_the_question_fits(tiny
     assert components.fit_pool(task, {**ev, "pool": pool}, len, budget=0)["pool"] == {}
 
 
+def test_question_node_cap_is_opt_in_and_included_in_fit(monkeypatch):
+    monkeypatch.setattr(components, "token_strings", lambda model, ids: [" x"] * len(ids))
+    monkeypatch.setattr(components, "windows", lambda task, ev: [])
+    monkeypatch.setattr(components, "listing", lambda strings, windows: " x")
+    task = {"model": "mock", "prompts": [{"token_ids": [0], "target_positions": [0],
+                                           "model_top": [[[" x", 1.0]]]}]}
+    row = {"positions": [], "events": [], "components": {}, "wiring": {}, "qa": [], "pool": {}}
+    legacy = components.question(task, row)
+    assert "circuit nodes across all positions" not in legacy
+    for disabled in (None, 0):
+        assert components.question(task, {**row, "node_cap": disabled}) == legacy
+    capped = {**row, "node_cap": 266}
+    rendered = components.question(task, capped)
+    assert "Use at most 266 circuit nodes across all positions; larger circuits are invalid." in rendered
+    fitted = components.fit_pool(task, capped, len, budget=len(legacy))
+    assert fitted["node_cap"] == 266
+    assert fitted["pool_fit"] == {"tokens": len(rendered), "budget": len(legacy), "fits": False}
+    assert "node_cap" not in row
+
+
 def test_fit_pool_reports_nonfit_and_later_fitting_row(monkeypatch):
     monkeypatch.setattr(components, "question", lambda task, row:
                         "q" * (task["base"] + sum(len(cs) for per in row["pool"].values() for cs in per.values())))
@@ -547,18 +567,21 @@ def test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit(monkeypa
     monkeypatch.setattr(native, "Native", lambda: object())
     monkeypatch.setattr(components, "_atlas", lambda: None)
     monkeypatch.setattr(components, "_lens", lambda nat: None)
-    monkeypatch.setattr(components, "candidate_pool", lambda nat, task, row:
-                        {**row, "pool": {"0": {"h.0.attn.v_proj": [[0, 0.5]]}}})
+    def candidate_pool(nat, task, row):
+        assert row["node_cap"] == 266  # setting precedes both pool construction and fitting
+        return {**row, "pool": {"0": {"h.0.attn.v_proj": [[0, 0.5]]}}}
+    monkeypatch.setattr(components, "candidate_pool", candidate_pool)
     monkeypatch.setattr(components, "question", lambda task, row:
                         "q" * (row["base"] + (2 if row.get("variables") else 0)
                                + sum(len(cs) for per in row["pool"].values() for cs in per.values())))
     tokenizer = lambda text, **kwargs: {"input_ids": range(len(text))}
     monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=lambda name: tokenizer)))
-    monkeypatch.setattr(sys, "argv", ["components", "rerender", str(source), str(out), "--pool", "--variables"])
+    monkeypatch.setattr(sys, "argv", ["components", "rerender", str(source), str(out), "--pool", "--variables", "--node-cap", "266"])
     components.main()
     got, = map(json.loads, out.read_text().splitlines())
     assert got["task"] == "mock_later" and got["variables"] is True
+    assert got["node_cap"] == 266
     assert got["pool_fit"] == {"tokens": budget, "budget": budget, "fits": True}
     assert len(got["question"]) == budget
     notice = json.loads(capsys.readouterr().err)

@@ -1269,7 +1269,10 @@ def question(task: dict, ev: dict) -> str:
     t = max(targets)
     top_tok = p["model_top"][0][0][0]
     top = ", ".join(f"{tok!r} {q:.2f}" for tok, q in p["model_top"][0][:3])
-    lines = [ASK.format(model=model) + (" " + ASK_VARIABLES if ev.get("variables") else ""),
+    cap = ev.get("node_cap")  # opt-in: legacy teacher questions may exceed the evaluation default
+    constraint = (f" Use at most {cap} circuit nodes across all positions; larger circuits are invalid."
+                  if cap else "")
+    lines = [ASK.format(model=model) + constraint + (" " + ASK_VARIABLES if ev.get("variables") else ""),
              "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): "
              + listing(strings, windows(task, ev)),
              f"target: position {t}; the model's most probable next tokens there: {top}",
@@ -2573,6 +2576,8 @@ def main():
     rr.add_argument("--facts", action="store_true", help="read each listed subcomponent's facts again (refresh_facts: the routed lens "
                                                           "at its position, one forward pass per text)")
     rr.add_argument("--variables", action="store_true", help="ask for the EXPLANATION's VARIABLES block (ASK_VARIABLES)")
+    rr.add_argument("--node-cap", type=int, help="explicit circuit-node limit communicated in the question and saved per row; "
+                    "0 disables the instruction; omitted preserves each row's setting")
     rr.add_argument("--measured", action="store_true", help="the measured input arm (measured(): subcomponents ranked by importance x "
                                                              "|activation| with activations, attention heads' top positions)")
     rr.add_argument("--pool", action="store_true", help="the full candidate pool (candidate_pool(): every VPD-active subcomponent at the "
@@ -2682,6 +2687,8 @@ def main():
                 task = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
                 if args.variables:
                     r = {**r, "variables": True}
+                if args.node_cap is not None:
+                    r = {**r, "node_cap": args.node_cap}
                 if args.measured:
                     r = measured(mnat, task, r, atlas, lens)
                 elif args.facts:

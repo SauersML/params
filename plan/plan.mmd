@@ -481,7 +481,7 @@ flowchart BT
   subgraph CAPS["CAPABILITIES THE ORACLE MUST SHOW"]
     C1["<b>Executable circuits</b><br/>predict outputs and unseen<br/>interventions; report sufficiency,<br/>necessity, remainder robustness"]
     C2["<b>Tested English</b><br/>bind concepts to actual components;<br/>beat shuffled meanings, vague text,<br/>no explanation and matched groups;<br/>new values + routing contexts · varteach"]
-    C3["<b>Answers and edits</b><br/>delete a preference, 5 prefs: circuit span<br/>beats random 5/5 (collateral x0.18);<br/>ties plain fine-tune, keeps fewer controls<br/>rustmove"]
+    C3["<b>Answers and edits</b><br/>delete a preference, 15 prefs: circuit span<br/>localizes (Pile KL x0.02 vs unrestricted at<br/>the same matrices) but no circuit arm beats<br/>plain fine-tune on both collateral and controls<br/>DONE · rustmove"]
     C4["<b>Transfer and cost</b><br/>other mechanisms, long contexts,<br/>latency, memory, sample cost<br/>generality · monitorbench"]
   end
 
@@ -493,7 +493,7 @@ flowchart BT
     R2["<b>RL · + variables</b>"]
     R3["<b>RL · + answers</b>"]
     R4["<b>RL · English (env D)</b><br/>English for a given circuit; reward E1:<br/>reader log loss without minus with it;<br/>gate: correct beats one-claim-changed<br/>on ≥80% of dev, shuffled and none lose<br/>ACTIVE · inframove"]
-    R5["<b>RL · + edits</b>"]
+    R5["<b>RL · + edits</b><br/>env E (7b13df6): goal = stop b after a, keep b elsewhere;<br/>answer = scale / rank-one update lines on subcomponents;<br/>verifier edits W, scores held-out text: reward = removal<br/>− collateral bits/token − controls lost (λ = μ = 1, fixed);<br/>gate: teacher > random edits on ≥80% of dev goals<br/>RUNNING · rustmove (env), primerl (RL)"]
   end
 
   TOOLS["<b>Search route, in parallel</b><br/>teacher circuits plus variables,<br/>English and executed answers;<br/>no learned oracle needed<br/>ACTIVE · primerl, varteach, codex"]

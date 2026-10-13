@@ -152,6 +152,35 @@ def token_logps(model, ids, att, comp):
 
 # ---------------------------------------------------------------- SFT
 
+
+def sft_batches(data, batch_size, rng, mode="random"):
+    """Infinite TRAIN-only batches; epoch mode covers every row before repeats.
+
+    Epoch boundaries may occur inside a fixed-size batch. Shuffle index copies,
+    never the caller's data. The default yields the original rng.sample calls.
+    """
+    if mode not in ("random", "epoch"):
+        raise ValueError(f"unsupported SFT sampler: {mode}")
+    if not data or batch_size < 1:
+        raise ValueError("SFT requires nonempty data and positive batch size")
+    count = min(batch_size, len(data))
+    if mode == "random":
+        while True:
+            yield rng.sample(data, count)
+    else:
+        order, cursor = [], 0
+        while True:
+            batch = []
+            while len(batch) < count:
+                if cursor == len(order):
+                    order = list(range(len(data)))
+                    rng.shuffle(order)
+                    cursor = 0
+                take = min(count - len(batch), len(order) - cursor)
+                batch.extend(data[i] for i in order[cursor:cursor + take])
+                cursor += take
+            yield batch
+
 def sft(a):
     torch.manual_seed(a.seed)  # initialization/dropout, as well as Python's prompt schedule below
     data = [e for e in examples(a.data, a.truth) if e["completion"]]
@@ -160,8 +189,10 @@ def sft(a):
     model.train()
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
     rng, log, t0 = random.Random(a.seed), [], time.time()
+    mode = getattr(a, "sft_sampler", "random")
+    batches = sft_batches(data, a.batch, rng, mode)
     for step in range(a.steps):
-        batch = rng.sample(data, min(a.batch, len(data)))
+        batch = next(batches)
         ids, att, comp = batch_ids(tok, [(e["prompt"], e["completion"]) for e in batch], a.max_len, device=device)
         lp, m = token_logps(model, ids, att, comp)
         loss = -(lp * m).sum() / m.sum()
@@ -170,6 +201,8 @@ def sft(a):
         opt.step()
         opt.zero_grad(set_to_none=True)
         log.append({"step": step, "loss": round(loss.item(), 4), "sec": round(time.time() - t0, 1)})
+        if mode == "epoch":
+            log[-1].update(sft_sampler=mode, sample_ids=[e["meta"]["name"] for e in batch])
         if step % a.log_every == 0 or step == a.steps - 1:
             print(json.dumps(log[-1]), flush=True)
     if a.eval:
@@ -263,6 +296,8 @@ def parser():
     ap.add_argument("--init", default=None, help="a saved checkpoint directory to start from")
     ap.add_argument("--lora", type=int, default=0, help="LoRA rank (0 = full fine-tune)")
     ap.add_argument("--out", default="ckpt/toyloop")
+    ap.add_argument("--sft-sampler", choices=("random", "epoch"), default="random",
+                    help="SFT only: epoch visits every training row before repeating; default preserves random sampling")
     ap.add_argument("--steps", type=int, default=100)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--lr", type=float, default=2e-5)

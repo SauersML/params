@@ -65,7 +65,7 @@ def training_args(a, reward, model, init, out):
                               out=str(out), lora=0, steps=a.sft_steps if reward is None else a.rl_steps,
                               batch=1, lr=2e-5, max_len=a.max_len, max_new=a.max_new, k=4, temp=1., beta=0., std=False,
                               reward=reward or 'f1', eval=0, threads=1, seed=a.seed, log_every=1,
-                              device=getattr(a, 'device', 'cpu'))
+                              device=getattr(a, 'device', 'cpu'), sft_sampler=getattr(a, 'sft_sampler', 'random'))
 
 
 def require_time(seconds):
@@ -100,6 +100,8 @@ def fork_sft(a, parent):
         raise ValueError('fork parent contains prior RL state; use the frozen SFT artifact')
     validated_snapshot = hashes(parent)
     contract = json.loads((parent / 'contract.json').read_text())
+    if contract.get('sft_sampler', 'random') != getattr(a, 'sft_sampler', 'random'):
+        raise ValueError('fork SFT sampler mismatch')
     expected = {'model': MODEL, 'hf_revision': REVISION, 'sft_steps': a.sft_steps,
                 'rl_steps_per_arm': a.rl_steps, 'seed': a.seed, 'max_len': a.max_len,
                 'max_new': a.max_new, 'show_active': False, 'batch': 1, 'k': 4,
@@ -232,6 +234,8 @@ def prepare(a):
         contract.update(device=getattr(a, 'device', 'cpu'), platform=platform.platform())
     if (a.out / 'sft_lineage.json').exists():
         contract['sft_lineage_sha256'] = digest(a.out / 'sft_lineage.json')
+    if getattr(a, 'sft_sampler', 'random') != 'random':
+        contract['sft_sampler'] = a.sft_sampler
     path = a.out / 'contract.json'
     if path.exists():
         if json.loads(path.read_text()) != contract:
@@ -391,6 +395,7 @@ def main(argv=None):
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--stage', choices=['all', 'preflight', 'sft', 'unit', 'wiring', 'eval'], default='all')
     parser.add_argument('--sft-steps', type=int, default=300)
+    parser.add_argument('--sft-sampler', choices=['random', 'epoch'], default='random')
     parser.add_argument('--rl-steps', type=int, default=20)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--max-new', type=int, default=416)

@@ -18,6 +18,7 @@
 #      both flags apply only to evaluate, not NOISE or TIMING;
 #      NOISE=k: C's draw noise over k seeds per set's first answers (components.py noise) instead of the evaluation;
 #      TIMING=g: seconds to score groups of g answers as the RL scorer does (components.py timing, TIMING_N texts);
+#      SEMANTICS=c|x: GoalEval's semantics default on the pod (inframove's a4b0852 knob), the code's default without it;
 #      LEDGER_OK=1 once the lead approved a launch past $290)
 cd /Users/user/params
 spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
@@ -57,7 +58,7 @@ if [ "${INVARIANTS:-0}" = 1 ]; then WHAT="$WHAT --invariants"; fi
 if [ -n "${SHARD:-}" ]; then WHAT="$WHAT --shard $SHARD"; fi
 if [ -n "${NOISE:-}" ]; then WHAT="noise heldout $I/rows.jsonl --seeds $NOISE"; fi
 if [ -n "${TIMING:-}" ]; then WHAT="timing heldout $I/rows.jsonl --group $TIMING --n ${TIMING_N:-4} ${TEACHER:+--teacher $I/teacher}"; fi  # C's draw noise (c_noise) instead of the evaluation
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4${SEMANTICS:+ SEMANTICS=$SEMANTICS}; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \
 cd $S; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 5 > $O/gpu.csv & "

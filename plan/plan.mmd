@@ -37,7 +37,9 @@
 %% New prose still wrong (head identities/residual fallback); all12 changed-token answers still fail. This is not a calibrated positive control.
 %% Preserve both failed controls.40328c7 checked typed source facts against4actual toy arrays;7regressions passed.
 %% Typed facts reader128stops:top122/128, changed top8/12 and change12/12, inactive94/96;actual$.21983328 settled.
-%% Facts→English first-writer4+reader128 prepared; no new paid calls until bounded protocol GO; English remains unverified.
+%% Facts→English4first writers+128reader complete:top60/128,changed12/12,inactive40/96,half34/64;actual$.173395872 settled.
+%% Writer002 falsely generalizes last-token fallback; other3 scoped deletion prose still overapplied by reader. Preserve all first responses; no further prose tuning.
+%% Exact journals and failure rows: scratch/eval_recovery/english_facts_translation_20261013/{analysis,translation_audit}.json.
 %% Direct-facts reader calibration PREPARING: same128frozen questions/cached no-English control; natural-language English remains unverified.
 %% Donor features38403877507 COMPLETE:71 unmodified worlds,87.46 seconds,2.045GiB peak; no edited outcomes used.
 %% Fixed83 triplets remain. Replace coordinate dumps with typed native-token readouts and donor activation deltas;
@@ -532,7 +534,7 @@ flowchart BT
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
   CAPABLE["<b>Wiring repaired; fresh routes checking</b><br/>V+8: relation top1; 2 extra gate edges;<br/>all-live facts + CI tests published;<br/>8 paired routes: free integrity/fit running<br/>MEASURED · codex/fork_review · $1.182"]
   CAPCF["<b>Weight-edit ability recovered</b><br/>Best training and base:1792/1792 tops;<br/>worst KL0.00015 bits on4 toy models;<br/>half-strength edits expose weaker training<br/>MEASURED · codex/eval_recovery"]
-  CAPENG["<b>Separate writer and reader failures</b><br/>Source facts checked on4 toy models;<br/>Typed reader122/128; changed top8/12;<br/>change12/12, inactive94/96;128stops;<br/>natural-language English still unverified<br/>FACTS→ENGLISH PREPARED · codex/eval_recovery"]
+  CAPENG["<b>Separate writer and reader failures</b><br/>Source facts checked on4 toy models;<br/>Typed reader122/128; changed top8/12;<br/>change12/12, inactive94/96;128stops;<br/>Prose60/128; changed12/12, inactive40/96;<br/>writer error + reader overapplication retained<br/>TRANSLATION FAILED · codex/eval_recovery"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]

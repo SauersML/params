@@ -9,6 +9,7 @@ C's semantics: the share of the model's move of logit(source label) - logit(base
   cg_teacher.py run K P      (on a pod) the texts copied into the texts directory; teacher.py on every P-th text from
                              the K-th -> GEN_OUT/cg_teacher/; then the test -> GEN_OUT/cg_teacher_test_K.jsonl
   cg_teacher.py report
+  cg_teacher.py masks K P    varteach's mask core on three tasks' prompts (masks_run) -> GEN_OUT/cg_masks_K.jsonl
 With --behavior, every step in the behavior-targeted mode (the task files carry "behavior": the pair's two labels and
 its minimal pair, so the teacher's start, acceptance and pick and every score are on that behavior): cgb_* texts in
 DATA/causalgym_texts_b/, GEN_OUT/cg_teacher_b/, cg_teacher_b_test_K.jsonl.
@@ -70,7 +71,9 @@ def run(k: int, P: int, behavior: bool = False):
 
     b = "_b" if behavior else ""
     meta = json.loads((DATA / f"causalgym_texts{b}.json").read_text())
-    names = sorted(meta)[k::P]
+    # a prompt where VPD's answer is no nearer the model than the empty circuit (the behavior's KL; measured on the Mac
+    # into the meta file) has nothing for a circuit to recover: teacher.py's F1 is undefined there
+    names = sorted(nm for nm, m in meta.items() if m.get("kl_empty") is None or m["kl_empty"] > m["kl_vpd"])[k::P]
     dest = native.TEXTS / "vpd4l"
     for nm in names:
         shutil.copy(DATA / f"causalgym_texts{b}" / f"{nm}.json", dest / f"{nm}.json")
@@ -80,6 +83,30 @@ def run(k: int, P: int, behavior: bool = False):
     subprocess.run([sys.executable, "-B", str(ORACLE / "teacher.py"), "--tasks", str(lst), "--edges", "--f1-start", "both",
                     "--max-tokens", "0", "--out", str(out / f"cg_teacher{b}")], check=True)
     test(names, out / f"cg_teacher{b}", out / f"cg_teacher{b}_test_{k}.jsonl", b)
+
+
+MASK_TASKS = ("agr_gender", "agr_sv_num_pp", "agr_sv_num_subj-relc")  # the lead's 10-13: gender and two number agreements
+
+
+def masks_run(k: int, P: int, behavior: bool = False):
+    """varteach's mask core (experiments/oracle/var_masks.py: Cause and Iso donors, the permuted-target control, disjoint
+    values) on MASK_TASKS' prompts, the variable's position as the input and the carrier at that position and at the
+    target, every P-th job from the K-th -> GEN_OUT/cg_masks_K.jsonl. With behavior every KL is the pair's labels'."""
+    import native
+
+    b = "_b" if behavior else ""
+    meta = json.loads((DATA / f"causalgym_texts{b}.json").read_text())
+    names = sorted(nm for nm, m in meta.items() if m["task"] in MASK_TASKS)
+    for nm in names:
+        shutil.copy(DATA / f"causalgym_texts{b}" / f"{nm}.json", native.TEXTS / "vpd4l" / f"{nm}.json")
+    jobs = [{"task": nm, "inputs": [meta[nm]["p"]], "at": at} for nm in names
+            for at in ([meta[nm]["p"]], [json.loads((DATA / f"causalgym_texts{b}" / f"{nm}.json").read_text())["prompts"][0]["target_positions"][-1]])]
+    out = Path(os.environ.get("GEN_OUT", DATA))
+    jf = out / f"cg_mask_jobs{b}_{k}.jsonl"
+    jf.write_text("".join(json.dumps(j) + "\n" for j in jobs[k::P]))
+    env = {**os.environ, "PYTHONPATH": f"{ORACLE}:{ORACLE.parent / 'vpd'}"}
+    subprocess.run([sys.executable, "-B", str(HERE / "var_masks.py"), "--jobs", str(jf), "--out", str(out / f"cg_masks{b}_{k}.jsonl")],
+                   check=True, env=env)
 
 
 def test(names: list, tdir: Path, out: Path, b: str = ""):
@@ -175,8 +202,9 @@ def report(behavior: bool = False):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("write", "run", "report"))
+    ap.add_argument("cmd", choices=("write", "run", "report", "masks"))
     ap.add_argument("args", nargs="*", type=int)
     ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
     a = ap.parse_args()
-    {"write": lambda: write(a.behavior), "run": lambda: run(*a.args, behavior=a.behavior), "report": lambda: report(a.behavior)}[a.cmd]()
+    {"write": lambda: write(a.behavior), "run": lambda: run(*a.args, behavior=a.behavior), "report": lambda: report(a.behavior),
+     "masks": lambda: masks_run(*a.args, behavior=a.behavior)}[a.cmd]()

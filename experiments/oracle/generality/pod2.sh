@@ -24,7 +24,7 @@ mkdir -p "$G"
 TODO=${TODO:-todo2.tsv}
 [ -s "$D/$TODO" ] || { echo "no $D/$TODO"; exit 1; }
 echo "$(wc -l < "$D/$TODO") commands"
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$G/code_$NAME.tgz" -C "$S" templates.py cscore.py copy_template.py library.py transfer.py falsify.py causalgym.py huang.py cg_teacher.py falsify_families.py var_transfer.py pod_worker2.py \
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$G/code_$NAME.tgz" -C "$S" templates.py cscore.py copy_template.py library.py transfer.py falsify.py causalgym.py huang.py cg_teacher.py falsify_families.py var_transfer.py pod_worker2.py -C ../ var_masks.py var_controls.py \
   -C "$D" families.json copy_heldout.json copytest.json library_texts.json falsify_texts.json causalgym_tasks.json huang_used.json causalgym_texts.json causalgym_texts causalgym_texts_b.json causalgym_texts_b ffam_texts.json "$TODO" -C "$(dirname "$M")" "$(basename "$M")"
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$G/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 (cd /Users/user/mpd-data/graph_oracle && find teacher/joint_train teacher/joint_heldout -maxdepth 1 -name 'text[0-9]*.json' ! -name '*.*.json' > "$G/teacher_files.txt")

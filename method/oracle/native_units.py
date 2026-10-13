@@ -30,8 +30,9 @@ positions from its first removal on, reading the set's keys and values before it
       the teacher's own search (teacher.py's levels, prefix rounds, F1 >= 0.9 rule and joint path) on native units
   native_units.py compare --native TEACH.jsonl --teacher TEACHER_DIR [--out ROWS.jsonl]
       native vs the teacher vs VPD's order at sizes 12 to 1,024: F1, N_VPD, N_real, local and non-local
-  native_units.py phi --vpd VPD.pt --influential DIR [--teach TEACH.jsonl ...] --out OUT.jsonl
-      native circuits against VPD's influential sets under phi's shared families at equal bits (NativePhi)
+  native_units.py phi --circuits DIR [--vpd VPD.pt] [--texts TEXTS_DIR] [--teach TEACH.jsonl ...] --out OUT.jsonl
+      native circuits against circuits in VPD's subcomponents (influential sets, teacher circuits, oracle answers) under
+      phi's shared families at equal bits (NativePhi)
 """
 
 from __future__ import annotations
@@ -906,17 +907,20 @@ def from_units(nu: NativeUnits, units: list) -> Mask:
     return m
 
 
-def phi_report(split: str, n: int, vpd: Path, influential: Path, out: Path, teach: list[Path] = (), ratios=(0.5, 1.0, 2.0),
-               offset: int = 0, stride: int = 1, log=print) -> None:
-    """Native units against VPD's subcomponents under phi (the lead's 10-12) on the split's first n texts: the text's
-    influential set (a complete node set of VPD's subcomponents, scored by GoalEval.fidelity on the eval draws, flips
-    and the step adversary left out) and native circuits at its bits times each ratio (native_bits against
-    size_bits): the measured pruning at the influential set's positions (prune_to_bits) and, given native teacher rows
-    (teach_all's), the teacher path's step nearest in bits. One row per circuit appended to OUT: kind, units or
-    nodes, bits, every shared family with its records, phi_shared (phi over SHARED) and, for VPD's, its full phi."""
+def phi_report(split: str, n: int, vpd: Path | None, influential: Path, out: Path, teach: list[Path] = (), ratios=(0.5, 1.0, 2.0),
+               offset: int = 0, stride: int = 1, log=print, texts: Path | None = None) -> None:
+    """Native units against VPD's subcomponents under phi (the lead's 10-12) on the split's first n texts (or, given
+    texts, a directory of <task>.json texts, on every task with a circuit): the text's circuit in VPD's subcomponents
+    from influential (a directory of <task>.json circuits: the influential sets, teacher circuits or oracle answers;
+    scored by GoalEval.fidelity on the eval draws, flips and the step adversary left out) and native circuits at its
+    bits times each ratio (native_bits against size_bits): the measured pruning at the circuit's positions
+    (prune_to_bits) and, given native teacher rows (teach_all's), the teacher path's step nearest in bits. vpd: VPD's
+    answers saved by teacher.py --save-vpd (None: the causal-importance network's, where it is present). One row per
+    circuit appended to OUT: kind, units or nodes, bits, every shared family with its records, phi_shared (phi over
+    SHARED) and, for VPD's, its full phi."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
-    saved = torch.load(vpd)
+    saved = torch.load(vpd) if vpd else {}
     paths = {}
     for f in teach:
         for x in Path(f).read_text().splitlines():
@@ -925,20 +929,23 @@ def phi_report(split: str, n: int, vpd: Path, influential: Path, out: Path, teac
                 paths[r["task"]] = r["path"]
     done = {json.loads(x)["task"] for x in out.read_text().splitlines() if x.strip()} if out.exists() else set()
     S_total = sum(nat.C.values())
-    for p in native.tasks(split)[:n][offset::stride]:
-        if p.stem in done or not (influential / f"{p.stem}.json").exists():
+    todo = ([Path(texts) / f.name for f in sorted(Path(influential).iterdir()) if f.suffix == ".json" and f.stem.count(".") == 0]
+            if texts else native.tasks(split)[:n])[offset::stride]
+    for p in todo:
+        if p.stem in done or not (influential / f"{p.stem}.json").exists() or not p.exists():
             continue
         t0 = time.perf_counter()
         ids, targets = native.text(p)
         tx = ge.text(ids, targets, native.task_seed(p.stem), json.loads(p.read_text()))
-        tx.vpd = {m: torch.zeros(tx.T, nat.C[m], dtype=torch.bool, device=nat.dev) for m in nat.names}
-        for m, (t, c) in saved[p.stem]["answer"].items():
-            tx.vpd[m][t.long().to(nat.dev), c.long().to(nat.dev)] = True
+        if p.stem in saved:
+            tx.vpd = {m: torch.zeros(tx.T, nat.C[m], dtype=torch.bool, device=nat.dev) for m in nat.names}
+            for m, (t, c) in saved[p.stem]["answer"].items():
+                tx.vpd[m][t.long().to(nat.dev), c.long().to(nat.dev)] = True
         g, _ = goal_eval.circuit(json.loads((influential / f"{p.stem}.json").read_text()), targets, nat.C, tx.T)
         P = nat.positions(targets)
         B = goal_eval.size_bits(g, P, S_total, targets, active=tx.vpd)
         vrow = ge.fidelity(tx, [g], None, split="eval")[0]
-        rows = [{"kind": "vpd influential", "nodes": g.count(), "bits": B, **vrow, "phi": goal_eval.phi(vrow)[0],
+        rows = [{"kind": "vpd circuit", "nodes": g.count(), "bits": B, **vrow, "phi": goal_eval.phi(vrow)[0],
                  "phi_shared": phi_shared(vrow)}]
         nu = NativeUnits(nat, ids, targets)
         per = nu.L * (nu.H + nu.Dm)
@@ -1127,19 +1134,22 @@ def main():
     q.add_argument("--n", type=int, default=20)
     q.add_argument("--out", type=Path)
     q.add_argument("--reuse", type=Path, help="an earlier compare --out: its teacher and VPD order rows are kept")
-    f = sub.add_parser("phi", help="native units against VPD's influential sets under phi's shared families at equal bits")
+    f = sub.add_parser("phi", help="native units against circuits in VPD's subcomponents under phi's shared families at equal bits")
     f.add_argument("--split", choices=("train", "heldout", "hard"), default="heldout")
     f.add_argument("--n", type=int, default=20)
     f.add_argument("--offset", type=int, default=0)
     f.add_argument("--stride", type=int, default=1)
-    f.add_argument("--vpd", type=Path, required=True, help="VPD's answers saved by teacher.py --save-vpd")
-    f.add_argument("--influential", type=Path, required=True, help="the influential sets' directory (<task>.json)")
+    f.add_argument("--vpd", type=Path, help="VPD's answers saved by teacher.py --save-vpd (default: the causal-importance network's)")
+    f.add_argument("--circuits", "--influential", dest="influential", type=Path, required=True,
+                   help="circuits in VPD's subcomponents, <task>.json each (influential sets, teacher circuits, oracle answers)")
+    f.add_argument("--texts", type=Path, help="a directory of <task>.json texts: every task with a circuit (in place of --split/--n)")
     f.add_argument("--teach", type=Path, nargs="*", default=[], help="native teacher rows (teach's OUT.jsonl)")
     f.add_argument("--ratios", type=float, nargs="*", default=[0.5, 1.0, 2.0])
     f.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     if args.cmd == "phi":
-        phi_report(args.split, args.n, args.vpd, args.influential, args.out, args.teach, tuple(args.ratios), args.offset, args.stride)
+        phi_report(args.split, args.n, args.vpd, args.influential, args.out, args.teach, tuple(args.ratios), args.offset, args.stride,
+                   texts=args.texts)
         return
     if args.cmd == "compare":
         rows = compare(args.native, args.teacher, args.split, args.n, reuse=args.reuse)

@@ -203,7 +203,8 @@ flowchart BT
 
   %% ===================== verifier and foundations =====================
   PHI["<b>Faithfulness score Φ</b><br/>10 intervention families,<br/>32 draws per family<br/>DONE · inframove"]
-  TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>reward v3: size breaks ties (1.05 vs 0.65);<br/>VPD fits: 6 of 8 toys done;<br/>next: cancelling pair, mixed binding,<br/>InterpBench circuits<br/>ACTIVE · fleet"]
+  TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>mixed binding: both routes carry it<br/>(each alone 0.72–0.78 on ordinary texts);<br/>VPD keeps the cancelling pair (exact weights);<br/>reward v3 cap bug fixed (e391117)<br/>ACTIVE · fleet"]
+  IBENCH["<b>InterpBench ground truth</b><br/>TransformerLens models as a Target (61b88f0);<br/>exact decomposition, 28 of 60 Tracr cases:<br/>node AUROC median 1.0, edge median 0.985;<br/>MIB's IOI model next (MIB edge AUROC:<br/>EAP-IG 0.81, UGS 0.74, random 0.44)<br/>ACTIVE · fleet"]
   TOYB["<b>Gate B on planted toys</b><br/>complete exact circuits pass; incomplete<br/>true routes fail (N ratio unbounded,<br/>own eps added, gate leak, all-actives<br/>at phi ceiling); eps cap + score clip<br/>fixes 3 of 4 (57e44c2) · toyloop"]
   TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo: 350 planted models, 10 families<br/>exec reward ranks truth first on all 350<br/>teacher recovers truth: unit F1 0.99<br/>but influential start alone fails 20%<br/>(content-addressed keys; check final KL)<br/>SFT without input leak running · toyloop"]
   REM["<b>Remainder check</b><br/>remainder carries nothing: point<br/>live = held = off; blocks = all parts<br/>(s_track_pp 0.914 = 0.914)<br/>DONE · inframove"]
@@ -309,6 +310,8 @@ flowchart BT
   PHI --> T3
   PHI --> W1
   TOY -. tests .-> PHI
+  IBENCH -. external ground truth .-> SUP
+  IBENCH -. same scale as MIB .-> LAT2
   TOY -. tests .-> GATEB
   TOY --> TOYLOOP
   TOYLOOP --> TOYB
@@ -357,7 +360,7 @@ flowchart BT
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
   class VPD,ENG,PHI,W1,W3,I1,I2,T1,SEM,REM done
-  class T2,I4,W2,W4,TOY,TOYLOOP,TOYB,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
+  class T2,I4,W2,W4,TOY,IBENCH,TOYLOOP,TOYB,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
   class I5 done
   class T3 done
   class T4 active

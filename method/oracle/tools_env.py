@@ -861,22 +861,25 @@ def _call(name: str, **args) -> dict:
 
 
 class Scripted:
-    """The baseline policy on the tools alone, in drafts: influence(); the influential start, every VPD-active
-    subcomponent at the target and the m most influential positions (run_circuit(positions=...), a complete node set),
-    m the smallest whose pp reaches FLOOR (positions moving the prediction by at least 1% of the total, at most
-    MAX_POSITIONS); the start's nodes ranked by node_effects (each node's own effect on the draft, path-patched and on
-    the text); then each turn tries dropping the next chunk, half of it and a quarter of it from the current draft at
-    once (three run_circuit calls, base and drop_least) and keeps the largest drop whose pp and point stay within
-    TOLERANCE of the start's, re-ranking the kept draft by node_effects; the chunk starts at half the start and halves
-    after a turn with no drop kept, until it is below 1/MIN_FRACTION of the start or the turns or calls run out (the
-    episode's MAX_TURNS and MAX_CALLS, one turn kept for the answer). A draft above components.NODE_CAP drops its least
-    needed nodes to the cap. The answer: CIRCUIT: <the last kept draft>. rank="removal" ranks by measure_removal(draft,
-    each) instead (each node's removal from the real model, not from the draft: the first version's order)."""
+    """The baseline policy on the tools alone, in drafts. influence(); in one turn run_circuit(positions=...) for every
+    m, the influential start candidates (every VPD-active subcomponent at the target and the m most influential
+    positions, those moving the prediction by at least 1% of the total, at most MAX_POSITIONS; complete node sets),
+    keeping the smallest m whose pp reaches FLOOR (else the best pp); its nodes ranked (node_effects: each node's own
+    effect on the draft, path-patched and on the text). Then, above components.NODE_CAP, backward elimination to the
+    cap: each turn drops the STEP least needed (never below the cap) and re-ranks the result. Then, at or below the cap,
+    each turn tries dropping the next chunk, half of it and a quarter of it at once (three run_circuit calls, base and
+    drop_least) and keeps the largest drop whose pp and point stay within TOLERANCE of the draft that entered this
+    phase, re-ranking the kept draft; after a turn with no drop kept the chunk restarts below the smallest drop tried;
+    until the chunk is below 1/MIN_FRACTION of that draft or the turns or calls run out (the episode's MAX_TURNS and
+    MAX_CALLS, the answer's turn kept). The answer: CIRCUIT: <the last kept draft>. rank="removal" ranks once by
+    measure_removal(draft, each) instead (each node's removal from the real model, not from the draft: the same order
+    for every later draft, inherited, never re-measured)."""
 
     FLOOR = 0.9
     TOLERANCE = 0.05
     MAX_POSITIONS = 8
     MIN_FRACTION = 32
+    STEP = 0.25  # backward elimination's share of the draft per turn above the cap
     TRIALS = (1, 2, 4)  # a turn's drops: the chunk over these
 
     def __init__(self, max_turns: int = MAX_TURNS, max_calls: int = MAX_CALLS, rank: str = "effects"):
@@ -906,53 +909,69 @@ class Scripted:
         lines, _ = components.circuit_lines(sorted(nodes, key=components._place), [], None, complete=True)
         return "\n".join(lines[1:-1])  # without the fence
 
+    def _keep(self, sc: dict, **kw) -> None:
+        self.trace.append({**kw, "nodes": sc.get("nodes"), "pp": sc.get("pp"), "point": sc.get("point"), "bits": sc.get("bits"),
+                           "draft": sc.get("draft")})
+
     def plan(self, messages: list):
-        turns, calls = 1, 1
+        turns, calls, cap = 1, 1, components.NODE_CAP
         (inf,) = yield self._msg(_call("influence", top=16))
         t = inf["target"]
         share = [(row[0], row[3]) for row in inf["positions"] if row[0] != t]
         cands = [p for p, s in share if s is not None and s >= goal_eval.SHARE_FLOOR][:self.MAX_POSITIONS]
-        score = {}
-        for m in range(len(cands) + 1):
-            (score,) = yield self._msg(_call("run_circuit", positions=[t] + cands[:m]))
-            turns, calls = turns + 1, calls + 1
-            self.trace.append({"m": m, "nodes": score.get("nodes"), "pp": score.get("pp"), "point": score.get("point"), "bits": score.get("bits"),
-                               "draft": score.get("draft")})
-            if (score.get("pp") or 0) >= self.FLOOR:
-                break
+        got = yield self._msg(*[_call("run_circuit", positions=[t] + cands[:m]) for m in range(len(cands) + 1)])
+        turns, calls = turns + 1, calls + len(got)
+        for m, sc in enumerate(got):
+            self._keep(sc, m=m)
+        ok = [m for m, sc in enumerate(got) if (sc.get("pp") or 0) >= self.FLOOR and sc.get("draft")]
+        m = ok[0] if ok else max(range(len(got)), key=lambda j: ((got[j].get("pp") or 0), -j))
+        score = got[m]
         draft, size = score.get("draft"), score.get("nodes") or 0
-        base_pp, base_pt = score.get("pp") or 0.0, score.get("point") or 0.0
         (rk,) = yield self._msg(self._rank(draft))
         turns, calls = turns + 1, calls + 1
-        left = size if "error" not in rk else 0  # the candidates: every node of the current draft, least needed first in its order
-        chunk = max(1, left // 2)
-        floor = max(1, left // self.MIN_FRACTION)
-        # a turn of drops, the kept draft's ranking and the cap's drop must leave the answer's turn (Episode.step ends
-        # an episode at MAX_TURNS turns or MAX_CALLS calls)
-        while left > 1 and chunk >= floor and turns < self.max_turns - 3 and calls + len(self.TRIALS) + 2 < self.max_calls:
-            sizes = sorted({max(1, min(left - 1, chunk // k)) for k in self.TRIALS}, reverse=True)
+        ranked = "error" not in rk
+        # above the cap: backward elimination, re-ranked each step (a step, its ranking and a last drop to the cap
+        # leave the answer's turn: Episode.step ends an episode at MAX_TURNS turns or MAX_CALLS calls)
+        while ranked and size > cap and turns < self.max_turns - 3 and calls + 3 < self.max_calls:
+            n = min(size - cap, max(1, math.ceil(self.STEP * size)))
+            (sc,) = yield self._msg(_call("run_circuit", base=draft, drop_least=n))
+            turns, calls = turns + 1, calls + 1
+            self._keep(sc, drop=n, phase="cap")
+            if "error" in sc or not sc.get("draft"):
+                break
+            draft, size, score = sc["draft"], sc["nodes"], sc
+            if self.rank == "effects":  # a removal order is the draft's whatever the draft: inherited, not re-measured
+                (rk,) = yield self._msg(self._rank(draft))
+                turns, calls = turns + 1, calls + 1
+                ranked = "error" not in rk
+        if size > cap and ranked:  # out of turns above the cap: the least needed go at once
+            (sc,) = yield self._msg(_call("run_circuit", base=draft, drop_least=size - cap))
+            turns, calls = turns + 1, calls + 1
+            self._keep(sc, drop=size - cap, phase="cap_last")
+            draft, size, score = sc.get("draft", draft), sc.get("nodes", size), sc  # its order: its base's, inherited
+        # at or below the cap: drops within TOLERANCE of the draft entering here
+        ref_pp, ref_pt = score.get("pp") or 0.0, score.get("point") or 0.0
+        chunk = max(1, size // 2)
+        floor = max(1, size // self.MIN_FRACTION)
+        while size > 1 and chunk >= floor and turns < self.max_turns - 3 and calls + len(self.TRIALS) + 2 < self.max_calls:
+            sizes = sorted({max(1, min(size - 1, chunk // k)) for k in self.TRIALS}, reverse=True)
             got = yield self._msg(*[_call("run_circuit", base=draft, drop_least=n) for n in sizes])
             turns, calls = turns + 1, calls + len(sizes)
             kept = None
             for n, sc in zip(sizes, got):
-                ok = (sc.get("pp") or 0) >= base_pp - self.TOLERANCE and (sc.get("point") or 0) >= base_pt - self.TOLERANCE
-                self.trace.append({"drop": n, "nodes": sc.get("nodes"), "pp": sc.get("pp"), "point": sc.get("point"), "bits": sc.get("bits"),
-                                   "kept": ok, "draft": sc.get("draft")})
-                if ok and kept is None:
+                ok = (sc.get("pp") or 0) >= ref_pp - self.TOLERANCE and (sc.get("point") or 0) >= ref_pt - self.TOLERANCE
+                self._keep(sc, drop=n, kept=ok)
+                if ok and kept is None and sc.get("draft"):
                     kept = (n, sc)
             if kept:
                 draft, size = kept[1]["draft"], kept[1]["nodes"]
-                left = size
-                (rk,) = yield self._msg(self._rank(draft))  # the kept draft's own order
-                turns, calls = turns + 1, calls + 1
-                if "error" in rk:
-                    break
+                if self.rank == "effects":
+                    (rk,) = yield self._msg(self._rank(draft))  # the kept draft's own order
+                    turns, calls = turns + 1, calls + 1
+                    if "error" in rk:
+                        break
             else:
-                chunk //= 2
-        if size > components.NODE_CAP:  # the answer's cap: the least needed go
-            (sc,) = yield self._msg(_call("run_circuit", base=draft, drop_least=size - components.NODE_CAP))
-            draft = sc.get("draft", draft)
-            self.trace.append({"cap": components.NODE_CAP, "nodes": sc.get("nodes"), "pp": sc.get("pp"), "point": sc.get("point"), "draft": draft})
+                chunk = min(sizes) // 2
         q = [m for m in messages if m["role"] == "user"][0]["content"]
         n_q, n_e = q.count("\nQuestion "), q.count("\nEdit ")
         top = TOP_RE.search(q)

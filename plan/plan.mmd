@@ -30,7 +30,8 @@
 %% Pilot: sft_codex-compatible97-q8-1012 excludes 8 reserved noncopy controls as well as all 40 copy tests.
 %% Tinker project 3f598f31-2ffa-4eb4-b302-909eb234fb7d; 49 steps x 8; $5 allowance incl. dev9020-9027 comparison.
 %% Distinct from primerl's full S1 arms. Judge on fixed development tasks, not falling training loss.
-%% Pilot training completed for $2.2379104; paired base/trained dev8 samples are running.
+%% Pilot training $2.2379104 + paired dev8 sampling $0.085776342. Same 68 QA fields: base 2.94%, trained 69.12%.
+%% Canonical valid circuits base 2/8 (all empty), trained 5/8; 3 trained exceed node cap. Fidelity not yet measured.
 %% Successful SFT skills feed integration directly; RL is an optional improvement, not a prerequisite.
 %% Grounded-English pilot: train6002/6011, one eval-passing carrier per text; writer outcomes withheld.
 %% Require executable, nontrivial claims on unseen donor values; no model-generated prose counts before execution.
@@ -71,7 +72,7 @@ flowchart BT
   SUP["<b>Verified behavior supervision</b><br/>QA and edit targets ready;<br/>grounded English join still empty;<br/>use existing carriers or planted mechanisms<br/>ACTIVE · varteach, rustmove, primerl, codex"]
   GATEC{{"<b>Check C</b> · does learning add value?<br/>SFT arms vs trivial baselines and<br/>the search route on dev texts;<br/>picks the RL starting point"}}
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
-    S1READY["<b>Compatible SFT pilot</b><br/>97 rows; mechanism tests excluded;<br/>49 steps trained for $2.24;<br/>base vs trained on dev9020–9027<br/>EVALUATING · codex · $5 allowance"]
+    S1READY["<b>Compatible SFT pilot</b><br/>dev8 QA: 2.9% to 69.1%;<br/>valid circuits: 2/8 to 5/8;<br/>NEXT execution against controls<br/>ACTIVE · codex · $2.32 spent"]
     S1["<b>SFT · influential starts</b><br/>494 targets, held-out pp 0.965,<br/>median 357 nodes<br/>LAUNCHING · primerl"]
     S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]

@@ -195,7 +195,7 @@ flowchart BT
   TOYB["<b>Gate B on planted toys</b><br/>complete exact circuits pass; incomplete<br/>true routes fail (N ratio unbounded,<br/>own eps added, gate leak, all-actives<br/>at phi ceiling); eps cap + score clip<br/>fixes 3 of 4 (57e44c2) · toyloop"]
   TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo: 350 planted models, 10 families<br/>exec reward ranks truth first on all 350<br/>teacher recovers truth: unit F1 0.99<br/>but influential start alone fails 20%<br/>(content-addressed keys; check final KL)<br/>SFT without input leak running · toyloop"]
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
-  VAR["<b>Variables and invariants</b><br/>carriers, value maps, E4 v2 checker;<br/>nulls and triviality check running;<br/>influential_v2 variables next<br/>ACTIVE · varteach"]
+  VAR["<b>Variables and invariants</b><br/>kept: 84 input (= whole position),<br/>7 intermediate of 127; m share 0.004;<br/>families beat equal-size nulls 9/9<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
   ENGP["<b>VPD relational mechanisms</b><br/>joint matching restoration fails;<br/>richer A carrier .903: test coverage;<br/>same-site coverage/remainder control ready<br/>CHECK · codex/variable_reward"]
   WIRING["<b>Execute the stated wiring</b><br/>edge removal changes predictions;<br/>swap tests execute both models;<br/>7 checks pass; measure learned edges next<br/>IMPLEMENTED · codex · 81f1e42"]

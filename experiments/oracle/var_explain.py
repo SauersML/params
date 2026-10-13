@@ -208,10 +208,16 @@ def check(a) -> None:
     llm = {k: {x["task"]: x for x in map(json.loads, (a.out / f"{k}.jsonl").read_text().splitlines())}
            for k in LLM if (a.out / f"{k}.jsonl").exists()}
     prompts = {x["task"]: x for x in map(json.loads, (a.out / "prompts.jsonl").read_text().splitlines())}
+    result = a.result or a.out / "check.jsonl"
     done = set()
-    if (a.out / "check.jsonl").exists():
-        done = {json.loads(x)["task"] for x in (a.out / "check.jsonl").read_text().splitlines()}
-    for t in sorted(prompts):
+    if result.exists():
+        done = {json.loads(x)["task"] for x in result.read_text().splitlines()}
+    tasks = sorted(prompts)
+    if a.part:
+        k, n = map(int, a.part.split("/"))
+        tasks = tasks[k::n]
+    result.parent.mkdir(parents=True, exist_ok=True)
+    for t in tasks:
         if t in done:
             continue
         r = json.loads((a.dir / f"{t}.json").read_text())
@@ -235,7 +241,7 @@ def check(a) -> None:
             if k in row:
                 for x in row[k]["invariants"]:
                     x.pop("intervention", None)
-        with (a.out / "check.jsonl").open("a") as fh:
+        with result.open("a") as fh:
             fh.write(json.dumps(row) + "\n")
         print(t, {k: (round(row[k]["holds"], 3), round(row[k]["credit"], 1)) for k in ("teacher", "shuffled", *LLM) if k in row}, flush=True)
 
@@ -287,6 +293,8 @@ def main():
     ap.add_argument("--dir", type=Path, default=DIR)
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--device")
+    ap.add_argument("--part", help="check: K/N, every N-th text from the K-th (a cluster array's task)")
+    ap.add_argument("--result", type=Path, help="check: the rows' file (default OUT/check.jsonl)")
     a = ap.parse_args()
     {"write": write, "check": check, "targets": targets}[a.what](a)
 

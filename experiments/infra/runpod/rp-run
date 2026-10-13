@@ -1613,12 +1613,17 @@ for f in "${files[@]}"; do
 done
 # The source's Python compiled with the image's interpreter (IMAGE's pyX.Y, through uv) before any pod
 # exists: syntax newer than it (3.12's nested same-quote f-strings in backup.py) ran on the Mac and
-# failed at import on every pod. Skipped when uv has no such interpreter.
+# failed at import on every pod. Skipped when uv has no such interpreter. RP_PYCHECK_SKIP="REL ..." leaves
+# those files out of the check, for a run pinned (RP_REF) to an older commit whose broken file it never imports
+# (5946614's backup.py under the teacher).
 PYV=$(sed -nE 's/.*-py([0-9]+\.[0-9]+)-.*/\1/p' <<< "$IMAGE")
 PYPOD=$( [ -n "$PYV" ] && uv python find "$PYV" 2> /dev/null || true)
 if [ -n "$PYPOD" ] && [ -n "$C" ] && [ ${#srcpaths[@]} -gt 0 ]; then
     pyc=$(mktemp -d)
     git -C "$MAC_REPO" archive "$C" "${srcpaths[@]}" | tar -x -C "$pyc"
+    for f in ${RP_PYCHECK_SKIP:-}; do
+        [ -f "$pyc/$f" ] && rm -f "$pyc/$f" && echo "rp-run: $f left out of the Python $PYV check (RP_PYCHECK_SKIP)" >&2
+    done
     if ! out=$("$PYPOD" -m compileall -q "$pyc" 2>&1); then
         echo "rp-run: the source at ${C:0:12} does not compile under Python $PYV (the pod's interpreter):" >&2
         sed "s|$pyc/||g" <<< "$out" >&2

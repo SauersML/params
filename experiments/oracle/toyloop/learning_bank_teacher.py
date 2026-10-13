@@ -185,6 +185,8 @@ def main():
         continuation=json.loads(args.continuation.read_text())
         if continuation['bank_sha256']!=args.bank_sha256 or sha(continuation['audit_path'])!=continuation['audit_sha256']:
             raise ValueError('frozen continuation audit/bank binding changed')
+        if any(sha(item['path'])!=item['sha256'] for item in continuation['old_archives']):
+            raise ValueError('original partial/completed proof archive changed')
         audit=json.loads(Path(continuation['audit_path']).read_text())
         rows=continuation_rows(manifest,rows,continuation,audit)
     if args.out.exists():raise ValueError('fresh immutable worker output required')

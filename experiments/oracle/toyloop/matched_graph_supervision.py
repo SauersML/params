@@ -68,6 +68,32 @@ def datum_digest(datum):
                             for key, value in datum.loss_fn_inputs.items()}})
 
 
+def serialize_prepared(prepared):
+    """Freeze API inputs offline so the later client need not load a tokenizer.
+
+    JSON is sufficient to restore Tinker Datum and ModelInput objects. The caller
+    stores the returned SHA separately before any API call; it is an integrity
+    binding, not proof that targets are faithful or a paid-run authorization.
+    Responses can be preserved as raw tokens and decoded offline afterwards.
+    """
+    contract, data = prepared["contract"], prepared["data"]
+    if digest(prepared["batches"]) != contract["batches_sha256"]:
+        raise ValueError("training schedule changed after preparation")
+    if {arm: [datum_digest(d) for d in data[arm]] for arm in ARMS} != contract["rendered_training_sha256"]:
+        raise ValueError("training tensors changed after preparation")
+    prompts = prepared["prompts"]
+    if [digest(p.to_ints()) for p in prompts] != [r["rendered_sha256"] for r in contract["panel"]]:
+        raise ValueError("evaluation prompts changed after preparation")
+    payload = {"schema_version": 1, "contract": contract,
+               "data": {arm: [d.model_dump(mode="json") for d in data[arm]] for arm in ARMS},
+               "prompts": [p.model_dump(mode="json") for p in prompts],
+               "batches": prepared["batches"],
+               "stop_sequences": prepared["renderer"].get_stop_sequences()}
+    # Reject non-JSON/nonfinite data here, before it reaches a service client.
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return encoded, hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def expected_ids():
     train = list(CASES) + [f"{family}_{3100000 + 100 * i + variant}"
                           for i, family in enumerate(FAMILIES) for variant in (0, 1)]
@@ -166,6 +192,7 @@ def prepare(train, panel, tokenizer_path):
                 "updates_per_arm": len(batches), "output_cap": OUTPUT_CAP,
                 "train_tokens_per_arm": train_tokens, "training": stats,
                 "recipe": training_recipe(batches, [r["id"] for r in train]),
+                "batches_sha256": digest(batches),
                 "rendered_training_sha256": {arm: [datum_digest(d) for d in data[arm]] for arm in ARMS},
                 "panel": [{"id": r["id"], "stratum": r["stratum"], "prompt_tokens": p.length,
                            "rendered_sha256": digest(p.to_ints())} for r, p in zip(panel, prompts)],

@@ -1,7 +1,9 @@
 import copy
+import json
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import matched_graph_supervision as trial
@@ -72,6 +74,26 @@ class PairedDataTest(unittest.TestCase):
             self.assertTrue(torch.equal(old.loss_fn_inputs["target_tokens"].to_torch(),
                                         new.loss_fn_inputs["target_tokens"].to_torch()))
         self.assertEqual([float(d.loss_fn_inputs["weights"].to_torch().sum()) for d in datums], [2., 4.])
+
+        data = dict(zip(trial.ARMS, ([paired[0]], [paired[1]])))
+        prompt = tinker.ModelInput.from_ints([1, 2, 3])
+        prepared = {"data": data, "prompts": [prompt], "batches": [[0]],
+                    "renderer": SimpleNamespace(get_stop_sequences=lambda: ["<|im_end|>"]),
+                    "contract": {"batches_sha256": trial.digest([[0]]),
+                                 "rendered_training_sha256": {arm: [trial.datum_digest(d) for d in rows]
+                                                               for arm, rows in data.items()},
+                                 "panel": [{"rendered_sha256": trial.digest(prompt.to_ints())}]}}
+        serialized, digest = trial.serialize_prepared(prepared)
+        payload = json.loads(serialized)
+        self.assertEqual(trial.digest(payload), digest)
+        for arm in trial.ARMS:
+            restored = tinker.Datum.model_validate(payload["data"][arm][0])
+            self.assertEqual(trial.datum_digest(restored), trial.datum_digest(data[arm][0]))
+        restored_prompt = tinker.ModelInput.model_validate(payload["prompts"][0])
+        self.assertEqual(restored_prompt.to_ints(), prompt.to_ints())
+        prepared["prompts"] = [tinker.ModelInput.from_ints([3, 2, 1])]
+        with self.assertRaisesRegex(ValueError, "prompts changed"):
+            trial.serialize_prepared(prepared)
 
 
 if __name__ == "__main__":

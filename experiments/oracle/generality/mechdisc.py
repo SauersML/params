@@ -217,7 +217,7 @@ def pairs():
     names = set()
     for pr in out:
         for r in pr["items"]:
-            r["name"] = f"md{r['kind'][0]}_{r['text']}_{r['t']}"
+            r["name"] = f"md{dict(copy='c', bigram='b', context='x')[r['kind']]}_{r['text']}_{r['t']}"
             if r["name"] in names:
                 continue
             names.add(r["name"])

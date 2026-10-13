@@ -575,6 +575,19 @@ def test_question_lists_the_candidate_pool_when_present(tiny):
     shown = components.question(task, {**ev, "pool": pool})
     assert "every VPD-active subcomponent" in shown and "7 (" in shown and "L3.fc 5:1 2:.4" in shown and "L0.q 1:.06" in shown
     assert "every VPD-active subcomponent" not in components.question(task, ev)
+    switched = {"7": {"h.3.mlp.c_fc": [[5, 1.0], [9, 0.3, 0]]}}  # [index, importance, 0]: inactive on the text
+    assert "L3.fc 5:1 9:~.3" in components.question(task, {**ev, "pool": switched})
+
+
+def test_the_pool_adds_what_a_changed_token_switches_on(tiny):
+    nat, ge, task, ev = tiny
+    got = components.candidate_pool(nat, task, ev)["pool"]
+    plain = components.candidate_pool(nat, task, ev, switched=False)["pool"]
+    ci = nat.importance(task["prompts"][0]["token_ids"])
+    for q, per in got.items():
+        for n, cs in per.items():
+            assert [e for e in cs if len(e) == 2] == plain.get(q, {}).get(n, [])  # the actives first, as before
+            assert all(float(ci[n][int(q), e[0]]) == 0.0 and e[2] == 0 for e in cs if len(e) > 2)
 
 
 def test_fit_pool_drops_the_least_important_entries_until_the_question_fits(tiny):
@@ -806,7 +819,7 @@ def test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit(monkeypa
     monkeypatch.setattr(native, "Native", lambda: object())
     monkeypatch.setattr(components, "_atlas", lambda: None)
     monkeypatch.setattr(components, "_lens", lambda nat: None)
-    def candidate_pool(nat, task, row):
+    def candidate_pool(nat, task, row, **kw):
         assert row["node_cap"] == 266  # setting precedes both pool construction and fitting
         return {**row, "pool": {"0": {"h.0.attn.v_proj": [[0, 0.5]]}}}
     monkeypatch.setattr(components, "candidate_pool", candidate_pool)

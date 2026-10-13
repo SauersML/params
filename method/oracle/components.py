@@ -1125,19 +1125,23 @@ def control_evidence(ev: dict, kind: str, T: int, donor: dict | None = None, Td:
         return {**ev, "components": {q: [[node(nd), c, x] for nd, c, x in cs] for q, cs in ev["components"].items()},
                 "wiring": {q: [[node(w), node(r), c] for w, r, c in ws] for q, ws in ev["wiring"].items()},
                 "switch_on": {q: [[node(nd), k] for nd, k in xs] for q, xs in ev.get("switch_on", {}).items()},
-                "pool": {q: {n: [[perm[n][c] if n in perm else c, v] for c, v in cs] for n, cs in per.items()}
+                "pool": {q: {n: [[perm[n][e[0]] if n in perm else e[0], *e[1:]] for e in cs] for n, cs in per.items()}
                          for q, per in (ev.get("pool") or {}).items()}}
     raise ValueError(f"control is one of {CONTROLS}")
 
 
-def candidate_pool(nat, task: dict, ev: dict, heads: int = POOL_HEADS) -> dict:
+def candidate_pool(nat, task: dict, ev: dict, heads: int = POOL_HEADS, switched: bool = True) -> dict:
     """The evidence with the full candidate pool (the lead's v2 question, 10-12: the v1 question listed 16% of the
     teacher's nodes, so choosing a circuit was guessing): every VPD-active subcomponent (causal importance above 0)
     at the listed positions and the targets, and with heads > 0 at the positions each attention head at the target
     reads most (its top `heads`). Every v1 teacher node is VPD-active; the listed positions and targets hold 96% of the
     20 held-out teachers' nodes (81% of 60 train teachers'), the question then ~11k Qwen3 tokens (median; max 18k);
     adding each head's top 8 positions reaches 97% at ~46k. "pool": position -> matrix -> [[index, importance], ...],
-    most important first."""
+    most important first. switched (the lead's 10-13: faithful circuits on changed inputs use subcomponents inactive on
+    x, 9% of a pp-accepted teacher's on 9002, and compensators are VPD-inactive on the text): also those inactive on
+    x that a change of a listed position's token switches on at that position or a later listed one (the model's 3
+    likeliest other tokens there, carry.alternatives), [index, their highest importance on the changes, 0] after the
+    actives, the 0 marking "inactive on the text"."""
     prompt = task["prompts"][0]
     ids, targets = prompt["token_ids"], prompt["target_positions"]
     ci = nat.importance(ids)
@@ -1152,6 +1156,19 @@ def candidate_pool(nat, task: dict, ev: dict, heads: int = POOL_HEADS) -> dict:
                 per[n] = [[c, round(v, 2)] for c, v in got]
         if per:
             pool[str(p)] = per
+    if switched:
+        import carry
+
+        extra = {}
+        for p in sorted(where):
+            for x in carry.alternatives(nat, ids, p):
+                cx = nat.importance(x)
+                for q in (q for q in sorted(where) if q >= p):
+                    for n in nat.names:
+                        for c in ((cx[n][q] > 0) & ~(ci[n][q] > 0)).nonzero().flatten().tolist():
+                            extra[(q, n, c)] = max(extra.get((q, n, c), 0.0), float(cx[n][q, c]))
+        for (q, n, c), v in sorted(extra.items(), key=lambda x: -x[1]):
+            pool.setdefault(str(q), {}).setdefault(n, []).append([c, round(v, 2), 0])
     return {**ev, "pool": pool}
 
 
@@ -1168,11 +1185,12 @@ def fit_pool(task: dict, ev: dict, count, budget: int = CONTEXT - ROOM - 64) -> 
     tokens = count(question(task, ev))
     if tokens <= budget:
         return annotated(ev, tokens)
-    order = sorted((v, int(q), n, c) for q, per in ev["pool"].items() for n, cs in per.items() for c, v in cs)
+    # the subcomponents inactive on the text (candidate_pool's switched) go before any active one, least important first
+    order = [x[1:] for x in sorted((len(e) <= 2, e[1], int(q), n, e[0]) for q, per in ev["pool"].items() for n, cs in per.items() for e in cs)]
 
     def drop(k):
         gone = {(q, n, c) for _, q, n, c in order[:k]}
-        pool = {q: {n: [[c, v] for c, v in cs if (int(q), n, c) not in gone] for n, cs in per.items()} for q, per in ev["pool"].items()}
+        pool = {q: {n: [e for e in cs if (int(q), n, e[0]) not in gone] for n, cs in per.items()} for q, per in ev["pool"].items()}
         pool = {q: {n: cs for n, cs in per.items() if cs} for q, per in pool.items()}
         return {**ev, "pool": {q: per for q, per in pool.items() if per}, "pool_cut": k}
 
@@ -1374,11 +1392,13 @@ def question(task: dict, ev: dict) -> str:
             lines.append("  wiring: " + ", ".join(f"{node_text(tuple(w))} -> {node_text(tuple(r))} ({c:+.2f})" for w, r, c in ev["wiring"][q]))
     if ev.get("pool"):  # candidate_pool(): every VPD-active subcomponent at these positions
         lines.append("every VPD-active subcomponent (causal importance above 0) at these positions, by position and matrix, "
-                     "index:importance, most important first (any subcomponent of the circuit is one of these; a block "
+                     "index:importance, most important first, then (index:~importance) those inactive on this text that a "
+                     "changed token at a listed position switches on (any subcomponent of the circuit is one of these; a block "
                      "L<layer>.<kind>@<position> is a matrix's whole output at a position):")
+        cell = lambda e: f"{e[0]}:{'~' if len(e) > 2 else ''}{e[1]:.1g}".replace(":0.", ":.").replace(":~0.", ":~.")  # noqa: E731
         for q in sorted(ev["pool"], key=int):
             lines.append(f"{q} ({strings[int(q)]!r}): " + "; ".join(
-                f"L{n.split('.')[1]}.{CODES[n.split('.')[-1]]} " + " ".join(f"{c}:{v:.1g}".replace(":0.", ":.") for c, v in cs)
+                f"L{n.split('.')[1]}.{CODES[n.split('.')[-1]]} " + " ".join(cell(e) for e in cs)
                 for n, cs in sorted(ev["pool"][q].items(), key=lambda x: _place((x[0], int(q), 0)))))
     if ev["qa"]:
         tok = lambda ids: token_strings(model, ids)  # noqa: E731
@@ -3007,6 +3027,8 @@ def main():
     rr.add_argument("--pool", action="store_true", help="the full candidate pool (candidate_pool(): every VPD-active subcomponent at the "
                                                          "listed, target and most-attended positions), cut to leave ROOM (fit_pool())")
     rr.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the policy's tokenizer, which fit_pool() counts in")
+    rr.add_argument("--actives-only", action="store_true", help="the pool without the subcomponents a changed token switches on "
+                    "(candidate_pool's switched; S1 and S2 were trained on it)")
     rr.add_argument("--control", choices=CONTROLS, help="a control question (control_evidence): text-only, shuffled (the next "
                     "row's evidence, end-aligned) or random-ids; applied last, to rows already rendered in the policy's format")
     rf = sub.add_parser("references", help="VPD at each teacher's size, with every connection and with pruned ones (references())")
@@ -3159,7 +3181,7 @@ def main():
                 elif args.facts:
                     r = refresh_facts(atlas, lens, task, r)
                 if args.pool:
-                    r = fit_pool(task, candidate_pool(mnat, task, r), count)
+                    r = fit_pool(task, candidate_pool(mnat, task, r, switched=not args.actives_only), count)
                     if not r["pool_fit"]["fits"]:
                         print(json.dumps({"event": "rerender_skip", "task": r["task"],
                                           "reason": "question_over_budget", **r["pool_fit"]}), file=sys.stderr, flush=True)

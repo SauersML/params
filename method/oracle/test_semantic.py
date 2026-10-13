@@ -425,8 +425,41 @@ def test_rules_out_credit(invariant_tokenizer, monkeypatch):
             pass
     monkeypatch.setattr(semantic, "Checker", FakeChecker)
     text = "\n".join(["RULES OUT: a | V1 from @0=' x' -> top ' y' vs unchanged",
-                      "RULES OUT: b | V1 from @0=' x' -> top ' y' vs not ' z'",
+                      "RULES OUT: b | V1 from @1=' x' -> top ' y' vs not ' z'",
                       "RULES OUT: c | V2 from @0=' x' -> top ' y' vs unchanged"])
     got = semantic.check_rules_out(None, None, [{"name": "V1"}], text)
     assert [r["ruled_out"] for r in got["rules_out"]] == [True, False] and got["bad"] == 2
     assert got["credit"] == 1.0 - 2 and abs(got["rules_out"][0]["margin"] - 2.8) < 1e-9
+
+
+def test_rules_out_rewording_cannot_duplicate_execution_credit(invariant_tokenizer, monkeypatch):
+    runs = []
+
+    class FakeChecker:
+        y0 = 1
+
+        def __init__(self, *args):
+            pass
+
+        def run(self, iv):
+            runs.append(iv)
+            return None
+
+        def outcome(self, q, out):
+            return {"holds": out[0] == "top", "top": 2, "p_top": .9,
+                    "logp": -.2 if out[0] == "top" else -3.}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(semantic, "Checker", FakeChecker)
+    first = "RULES OUT: a | V1 from @0=' x', remove V2 -> top ' y' vs unchanged"
+    # Wording, quoting, clause order, and a different excluded alternative are not new evidence for this prediction.
+    repeat = 'RULES OUT: renamed | remove V2, V1 from @0=" x" -> top " y" vs not " y"'
+    variables = [{"name": "V1"}, {"name": "V2"}]
+    single = semantic.check_rules_out(None, None, variables, first)
+    runs.clear()
+    doubled = semantic.check_rules_out(None, None, variables, first + "\n" + repeat)
+    assert len(runs) == 1
+    assert len(doubled["rules_out"]) == 1 and doubled["bad"] == 1
+    assert doubled["credit"] < single["credit"]

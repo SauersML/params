@@ -427,8 +427,9 @@ def parse_rules_out(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
     """(the RULES OUT lines as {"alternative", "intervention", "h", "alt", "line"}, the count that do not parse). A line
     is 'RULES OUT: <the alternative in words> | <intervention> -> <outcome under the explanation> vs <outcome under the
     alternative>', intervention and outcomes in the INVARIANTS grammar (parse_invariants). The alternative carries no
-    carrier of its own: its consequence is the outcome it predicts under the same intervention, run in the real model."""
-    out, bad = [], 0
+    carrier of its own: its consequence is the outcome it predicts under the same intervention, run in the real model.
+    Repeating the same intervention and explanation prediction is not new evidence, even against another alternative."""
+    out, bad, seen = [], 0, set()
     for line in text.splitlines():
         if not line.strip().startswith("RULES OUT"):
             continue
@@ -441,6 +442,14 @@ def parse_rules_out(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
         if b1 or b2 or not h or not a:
             bad += 1
             continue
+        iv = h[0]["intervention"]
+        key = (tuple(sorted(iv["tokens"].items())),
+               tuple(sorted((name, tuple(sorted(ch.items()))) for name, ch in iv["transplants"])),
+               tuple(sorted(iv["remove"])), h[0]["outcome"])
+        if key in seen:
+            bad += 1
+            continue
+        seen.add(key)
         out.append({"alternative": m.group(1), "intervention": h[0]["intervention"], "h": h[0]["outcome"], "alt": a[0]["outcome"],
                     "line": line.strip()})
     return out, bad

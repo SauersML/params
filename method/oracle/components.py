@@ -543,7 +543,17 @@ def variable_text(v: dict, k: int, numbers: dict, name: dict, strings: list[str]
         if it[0] == "block":
             blocks.setdefault(goal_eval._site(it[1]), []).append(int(it[2]))
     group = sorted(((goal_eval._site(m), t, c) for m, c, t in (it for it in v["group"] if it[0] != "block")), key=_place)
-    ref = lambda nd: name[nd] if nd in name else node_text(nd)  # noqa: E731
+    def refs(nds):
+        # Keep short circuit ids; share the existing site/position prefix for
+        # other members. group_of and _carriers already read comma index lists.
+        outside = {}
+        text = []
+        for nd in nds:
+            if nd in name:
+                text.append(name[nd])
+            else:
+                outside.setdefault(nd[:2], []).append(nd)
+        return text + [group_text(group) for group in outside.values()]
     items = []
     for site in sorted(blocks, key=lambda n: _place((n, max(blocks[n]), 0))):
         ts = sorted(set(blocks[site]))
@@ -555,9 +565,9 @@ def variable_text(v: dict, k: int, numbers: dict, name: dict, strings: list[str]
                 runs.append([t, t])
         short = f"L{site.split('.')[1]}.{CODES[site.split('.')[-1]]}"
         items += [f"{short} @{a}" + (f"-{b}" if b > a else "") for a, b in sorted(runs, reverse=True)]
-    items += [ref(nd) for nd in group]
+    items += refs(group)
     inst = sorted(((goal_eval._site(m), t, c) for m, c, t in v.get("instances") or []), key=_place)
-    carried = ", ".join(items) + (" (instances: " + ",".join(ref(nd) for nd in inst) + ")" if inst else "")
+    carried = ", ".join(items) + (" (instances: " + ",".join(refs(inst)) + ")" if inst else "")
     inputs = ", ".join(f"@{p} {shown(strings[p])}" if strings else f"@{p}" for p in v["inputs"])
     feeds = ", ".join("PREDICTION" if f == "prediction" else numbers.get(f, f) for f in v["feeds"]) or "PREDICTION"
     return f'V{k} "{v["name"]}": {v["meaning"]}; inputs: {inputs}; carried by: {carried}; feeds: {feeds}'

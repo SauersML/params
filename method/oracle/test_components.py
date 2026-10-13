@@ -964,3 +964,32 @@ def test_line_credit_gives_each_circuit_line_its_leave_one_out_effect(tiny):
             assert k in credit, row  # every declaration and edge line
     if ev["qa"]:
         assert credit[rows.index("FINAL 1: " + text.split("FINAL 1: ", 1)[1].split("\n", 1)[0])] == got["e2g"]["per_question"][0]["credit"]
+
+
+def test_variable_text_batches_existing_index_list_syntax_losslessly():
+    import components
+    v = {"name": "V3", "meaning": "kept", "inputs": [7], "feeds": ["prediction"],
+         "group": [["h.0.mlp.c_fc", c, 8] for c in [1, 3, 8]]
+                  + [["h.1.attn.v_proj", 4, 8], ["h.0.mlp.c_fc", 2, 9]],
+         "instances": [["h.0.mlp.c_fc", c, 8] for c in [10, 12, 15]]}
+    name = {("h.0.mlp.c_fc", 8, 1): "a"}
+    line = components.variable_text(v, 1, {"V3": "V1"}, name)
+    assert "L0.fc#3,8@8" in line and "L0.fc#10,12,15@8" in line
+    got, _, bad = components._variables(line, {"a": ("h.0.mlp.c_fc", 8, 1)})
+    assert bad == 0
+    assert len(got) == 1
+    assert set(map(tuple, got[0]["group"])) == set(map(tuple, v["group"]))
+    assert set(map(tuple, got[0]["instances"])) == set(map(tuple, v["instances"]))
+    assert got[0]["inputs"] == [7] and got[0]["feeds"] == ["prediction"]
+
+
+def test_variable_text_batches_members_without_changing_block_ranges():
+    import components
+    v = {"name": "V1", "meaning": "", "inputs": [5], "feeds": [],
+         "group": [["block", "h.0.mlp.c_fc", t] for t in [5, 6, 8]]
+                  + [["h.1.mlp.down_proj", c, 8] for c in [2, 9, 20]]}
+    line = components.variable_text(v, 1, {"V1": "V1"}, {})
+    assert "L0.fc @5-6" in line and "L0.fc @8" in line
+    got, _, bad = components._variables(line, {})
+    assert bad == 0
+    assert set(map(tuple, got[0]["group"])) == set(map(tuple, v["group"]))

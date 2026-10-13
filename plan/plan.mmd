@@ -197,16 +197,23 @@
 %% Single209 job19680: free MATS,1L40/4CPU/11GiB/15min, source919bf8; HELD JobHeldUser, no release/retry and no measurements.
 %% Protocol/artifacts: scratch/variable_reward/6025_single209. A pass would support local transport, not English or circuit closure.
 %% This held measurement has no dependency edge to training-data plumbing, offline audits, wiring work or other teams' jobs.
-%% Current claim inventory:45 distinct permitted TRAIN tasks,970 textual checks across103 files (copies counted),
-%% no original numeric execution records; only6025's existing7-check/3-label artifact passes proof-bound supervision.
-%% Recovery freezes15 other tasks,194 original proposals and exact archived task/circuit/carrier hashes; no new labels yet.
-%% Re-execute these proposals on their original carriers, retain numeric outcomes and all failures; avoid new search/writer calls.
-%% Recovery bundle: scratch/variable_reward/claim_recovery;194 parser/binding checks and5 mocked contracts pass.
-%% Recovery launched on community L40S pod7tp3n5hs01drpz at$.79/h with15min lifetime, two workers, source6cb561c.
-%% Name: oracle-graph-codex-claim-recovery15-l40-1013. First A6000/A40 attempt ended no-stock, no pod and$0.
-%% Reserved at most$2 from authorized shared40, including setup failures; no further external retries planned.
-%% Fresh prelaunch ownRP settled+fullreservations387.2879 + conservative entireTinker130 + our2 =519.2879 <=530.
-%% Accounting snapshot root/budget.json is not a global launcher-enforced cap; provider-account balance is not our spend.
+%% Recovery COMPLETE:15 permitted TRAIN tasks,194 exact archived proposals executed on their original carriers.
+%% Strict proof loader accepts123 positive claims;71failed checks and all numeric outcomes retained, zero parser rejections.
+%% 46 positives use solely rank-one intermediate carriers;16 multi-variable transplants overlap carrier strata.
+%% Successful two-worker L40 run uses6cb561c; numeric checks took41.1/32.7s, GPU reserved5.13/5.00GiB per worker.
+%% Name oracle-graph-codex-claim-recovery15-l40-1013; all six allocated pods verified deleted, including five failed hosts.
+%% Own ledger actual$0.0448 includes setup failures. Released unused$1.9552 of prior$2 reservation; no live commitment.
+%% Exact carriers joined to existing measured QA/edits in15 rows. All123 claims retain intervention and outcome identities
+%% after canonical variable renumbering. These proofs certify individual formal claims, not prose or whole circuits.
+%% Current32k/8k/266-node protocol fits2 rows (6001,6022),11 claims including10 rank-one intermediate and1 input block.
+%% Other13 are retained with all targets; no truncation or cap relaxation. Text6016 overlaps one old development control
+%% and remains excluded from the eligible training shard. None overlaps the reserved copy40 set.
+%% Artifacts: scratch/variable_reward/claim_recovery/materialized_v2 (analysis, strict proofs, rows, join_validation).
+%% Lossless existing-syntax carrier batching reduces15 answers559057 to263209tokens; every graph relation,
+%% member, instance, claim, QA and edit survives roundtrip.51 tests pass,1 skipped. Still only2 of15 rows fit.
+%% Eleven exceed266nodes independently; sparse carrier sets dominate the other two overflowing answers.
+%% Index ranges would save under1%, so no new parser grammar. Smaller token count alone does not make a mechanism simple.
+%% Ready rows feed supervision now. Compression, held MATS19680, and independent wiring RL do not gate one another.
 %% 6cb561c prevents RULES OUT rewordings/alternative swaps from multiplying credit for the same executed prediction.
 %% Regression reproduced the duplicate execution;61 semantic tests now pass. Free prose is still not certified.
 %% Wiring experiment: old checkpoint is needed only to reproduce that run. A NEW shared frozen SFT start unblocks
@@ -263,7 +270,7 @@ flowchart BT
   end
 
   TOOLS["<b>Search route, in parallel</b><br/>teacher circuits plus variables,<br/>English and executed answers;<br/>no learned oracle needed<br/>ACTIVE · primerl, varteach, codex"]
-  SUP["<b>Verified behavior supervision</b><br/>QA, edits and3 formal claims ready;<br/>consume checked shards as they arrive;<br/>free English remains unverified<br/>ACTIVE · varteach, rustmove, primerl, codex"]
+  SUP["<b>Verified behavior supervision</b><br/>QA, edits and2 new claim rows ready;<br/>consume checked shards as they arrive;<br/>free English remains unverified<br/>ACTIVE · varteach, rustmove, primerl, codex"]
   GATEC{{"<b>Check C</b> · does this arm add value?<br/>each completed arm vs cheap controls<br/>and search on development texts;<br/>report without waiting for other arms"}}
   S1AUDIT["<b>Does more SFT help?</b><br/>steps 56/112: faithful 5/30, 2/30;<br/>valid-only VPD gains; no clear trend;<br/>prioritize interventions and reliability<br/>AUDIT DONE · codex/eval_recovery"]
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
@@ -315,7 +322,8 @@ flowchart BT
   ENGP["<b>Fresh carrier tests</b><br/>209 effects carried;181 unsupported;<br/>3 of7 claims verified for training;<br/>two-input mechanism not established<br/>DONE · codex/variable_reward"]
   ENG209["<b>Does the 209 carrier generalize?</b><br/>32 fresh donors × 3 input positions;<br/>test cause, isolation and worst cases;<br/>free MATS 19680 held; no release<br/>WAITING · codex/variable_reward"]
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
-  CLAIMREC["<b>Diversify checked claims</b><br/>15 training tasks, 194 proposals;<br/>re-execute exact original carriers;<br/>L40S launched, at most $2 reserved<br/>ACTIVE · codex/variable_reward"]
+  CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
+  CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
   WIRING["<b>Learn executable relations</b><br/>shared-start job 38350629770;<br/>then unit vs wiring RL in parallel;<br/>fixed cost, raw outputs and failures<br/>ACTIVE free GHA · codex/eval_recovery"]
 
   subgraph BASE["FOUNDATIONS"]
@@ -405,7 +413,9 @@ flowchart BT
   ENG209 -. carrier evidence only .-> C2
   CLAIMDATA -- verified claims only --> SUP
   VAR -. existing proposals .-> CLAIMREC
-  CLAIMREC -- newly executed claims --> SUP
+  CLAIMREC -- 2 fitting rows,11 claims --> SUP
+  CLAIMREC --> CLAIMFIT
+  CLAIMFIT -. additional exact rows .-> SUP
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
   T4 -. new circuits .-> TOOLS
@@ -482,8 +492,9 @@ flowchart BT
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
   class QAONLY check
-  class WIRING,CLAIMREC active
-  class CLAIMDATA done
+  class WIRING active
+  class CLAIMFIT check
+  class CLAIMDATA,CLAIMREC done
   class ENGP done
   class S1AUDIT done
   class ENG209 waiting

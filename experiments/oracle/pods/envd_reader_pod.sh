@@ -24,7 +24,7 @@ rm -rf "$IN" "$IN.tar" && mkdir -p "$IN/vpd4l"
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN.tar)
 case $MODE in
   gate) cp "$1/facts30.jsonl" "$IN/facts.jsonl"; cp "$1/rows30.jsonl" "$IN/rows.jsonl"; cp "$1/english30.jsonl" "$IN/english.jsonl"; H=$2
-        RUNCMD="python -u method/oracle/env_d.py gate $I/facts.jsonl $I/rows.jsonl $I/english.jsonl $O/gate.jsonl --reader \"\$R\"" ;;
+        RUNCMD="python -u method/oracle/env_d.py gate $I/facts.jsonl $I/rows.jsonl $I/english.jsonl $O/gate.jsonl --reader \"\$R\" ${EVENTS:+--events $EVENTS}" ;;
   select) cp "$1" "$IN/facts.jsonl"; cp "$2" "$IN/rows.jsonl"; cp "$3" "$IN/samples.jsonl"; H=$4
         RUNCMD="python -u method/oracle/env_d.py select $I/facts.jsonl $I/rows.jsonl $I/samples.jsonl $O/english.jsonl --reader \"\$R\"" ;;
   serve) cp "$1" "$IN/facts.jsonl"; cp "$2" "$IN/rows.jsonl"; H=$3

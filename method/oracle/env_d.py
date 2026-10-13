@@ -169,6 +169,8 @@ def write(a) -> None:
 
 
 def gate(a) -> None:
+    if a.events:
+        components.E1_EVENTS = a.events  # (a probe of the reward's event count; the reward keeps components'.)
     reader = make_reader(a.reader)
     facts = {f["task"]: f for f in map(json.loads, a.facts.read_text().splitlines()) if f}
     rows = {r["task"]: r for r in map(json.loads, a.rows.read_text().splitlines()) if r}
@@ -306,6 +308,7 @@ def main():
     g.add_argument("english", type=Path)
     g.add_argument("out", type=Path)
     g.add_argument("--reader", required=True)
+    g.add_argument("--events", type=int, default=0, help="E1's events per text and circuit (default components.E1_EVENTS)")
     q = sub.add_parser("questions")
     q.add_argument("facts", type=Path)
     q.add_argument("out", type=Path)

@@ -34,10 +34,12 @@ b everywhere earns nothing. The part defaults to "score" (never in the evidence)
   edit_env.py goals PREFS.jsonl OUT.jsonl [--dev 0.3]   the goals: id, split, question, the preference
   edit_env.py score GOALS.jsonl ANSWERS.jsonl OUT.jsonl  each answer {"goal", "answer"} scored
   edit_env.py gate GOALS.jsonl EDITS.jsonl OUT.jsonl [--sft SFT.jsonl]
-      the gate (teacher edits above random-subcomponent edits on >= GATE of dev goals): persistent_e3.py edit's rows,
-      each arm's picked edit written as an answer and scored by the verifier; the teacher (circuit_edit or
-      circuit_scales, whichever earns more on the val third) against the best of the random arms (random_equal draws,
-      random_scales) on the score third. --sft: train goals' teacher answers, as SFT rows {"id", "question", "answer"}.
+      the gate (teacher edits above random-subcomponent edits on >= GATE of dev goals) on persistent_e3.py edit's rows:
+      the teacher's edit is the candidate of circuit_edit and circuit_scales (their searches' steps and checkpoints)
+      earning the most reward on the val third, the random side's the same among random_equal's and random_scales'
+      (random subcomponents active at the instances, outside the circuit, ablated or given fitted scales); both written
+      as answers and scored by the verifier on the score third. --sft: train goals' teacher answers, as SFT rows
+      {"id", "question", "answer", "reward"}.
 """
 from __future__ import annotations
 
@@ -300,37 +302,58 @@ def load(device: str | None = None):
     return nat, Verifier(nat, tokens, held)
 
 
-def teacher_ops(m: dict) -> list[tuple] | None:
-    """A persistent_e3 edit row's picked subcomponent operations (site, index, k) as scale operations."""
-    return [("scale", s, int(c), min(max(float(k), -COEF), COEF)) for s, c, k in m["ops"]] if m and m.get("ops") else None
+def scale_ops(ops: list) -> list[tuple]:
+    """persistent_e3 subcomponent operations (site, index, k) as scale operations."""
+    return [("scale", s, int(c), min(max(float(k), -COEF), COEF)) for s, c, k in ops]
+
+
+def val_reward(v: dict) -> float:
+    """The reward of persistent_e3's validation metrics of an edit (the verifier's own quantities on the val third)."""
+    kept = 1.0 if v.get("controls_kept") is None else v["controls_kept"]
+    return v["flipped"] - LAM * v["collateral_per_token"] - MU * (1 - kept)
+
+
+def best(e: dict, methods: tuple) -> tuple | None:
+    """(method, operations, val reward) of the candidate edit earning the most on the val third among the methods'
+    candidates (persistent_e3 rows' "candidates"; a row without them offers its pick alone)."""
+    out = None
+    for m in methods:
+        r = e["methods"].get(m)
+        for ops, val, _ in (r.get("candidates") or [[r["ops"], r["validation"], r["info"]]]) if r else []:
+            if ops and (out is None or val_reward(val) > out[2]):
+                out = (m, scale_ops(ops), val_reward(val))
+    return out
 
 
 def gate(ver: Verifier, goal_rows: list[dict], edit_rows: list[dict], log=print) -> tuple[list[dict], list[dict]]:
-    """(per goal: each arm's score-third result, the teacher picked on the val third, win; train goals' SFT rows)."""
+    """(per goal: the teacher's and the random side's edits, each the candidate earning the most on the val third, and
+    every arm's own pick, scored on the score third; train goals' SFT rows). win: the teacher above the random side;
+    first_win, the first definition: the arm picks (persistent_e3.select), the teacher the arm earning more on the val
+    third, above the best random arm on the score third."""
     by = {(r["a"], r["b"]): r for r in edit_rows}
     out, sft = [], []
     for g in goal_rows:
         e = by.get((g["pref"]["a"], g["pref"]["b"]))
-        if e is None:
+        t, r = (best(e, ms) for ms in (TEACHERS, RANDOMS)) if e else (None, None)
+        if t is None or r is None:
             continue
-        arms = {m: teacher_ops(e["methods"].get(m)) for m in TEACHERS + RANDOMS}
-        arms = {m: render(ops) for m, ops in arms.items() if ops}
-        names = list(arms)
-        val = dict(zip(names, ver.answers(g["pref"], [arms[m] for m in names], "val")))
-        test = dict(zip(names, ver.answers(g["pref"], [arms[m] for m in names], "score")))
-        teach = [m for m in TEACHERS if m in arms]
-        rand = [m for m in RANDOMS if m in arms]
-        if not teach or not rand:
-            continue
-        t = max(teach, key=lambda m: val[m]["reward"])
-        best_rand = max(test[m]["reward"] for m in rand)
-        row = {"id": g["id"], "split": g["split"], "teacher": t, "teacher_reward": test[t]["reward"], "best_random_reward": best_rand,
-               "win": test[t]["reward"] > best_rand, "val": val, "score": test, "answers": arms}
+        picks = {m: e["methods"][m] for m in TEACHERS + RANDOMS if e["methods"].get(m) and e["methods"][m].get("ops")}
+        answers = {"teacher": render(t[1]), "random": render(r[1]), **{m: render(scale_ops(x["ops"])) for m, x in picks.items()}}
+        names = list(answers)
+        test = dict(zip(names, ver.answers(g["pref"], [answers[n] for n in names], "score")))
+        first_t = max((m for m in TEACHERS if m in picks), key=lambda m: val_reward(picks[m]["validation"]), default=None)
+        first_r = [test[m]["reward"] for m in RANDOMS if m in picks]
+        row = {"id": g["id"], "split": g["split"], "teacher": t[0], "random": r[0], "teacher_reward": test["teacher"]["reward"],
+               "random_reward": test["random"]["reward"], "win": test["teacher"]["reward"] > test["random"]["reward"],
+               "first_win": bool(first_t and first_r) and test[first_t]["reward"] > max(first_r), "val": {"teacher": t[2], "random": r[2]},
+               "score": test, "answers": answers}
         out.append(row)
         if g["split"] == "train":
-            sft.append({"id": g["id"], "question": g["question"], "answer": arms[t], "reward": test[t]["reward"]})
-        log(f"{g['id']} [{g['split']}] teacher {t} {test[t]['reward']:+.3f} (removal {test[t]['removal']:.2f}, kept "
-            f"{test[t]['controls_kept']:.2f}, collateral {test[t]['collateral']:.2e}) vs best random {best_rand:+.3f}")
+            sft.append({"id": g["id"], "question": g["question"], "answer": answers["teacher"], "reward": row["teacher_reward"]})
+        x = test["teacher"]
+        log(f"{g['id']} [{g['split']}] teacher ({t[0]}) {x['reward']:+.3f} (removal {x['removal']:.2f}, kept {x['controls_kept']:.2f}, "
+            f"collateral {x['collateral']:.2e}) vs random ({r[0]}) {row['random_reward']:+.3f}; first definition "
+            f"{'won' if row['first_win'] else 'lost'}")
     return out, sft
 
 
@@ -340,12 +363,12 @@ def gate_summary(rows: list[dict]) -> str:
         rs = [r for r in rows if r["split"] == split]
         if not rs:
             continue
-        wins = sum(r["win"] for r in rs)
-        d = [r["teacher_reward"] - r["best_random_reward"] for r in rs]
-        lines.append(f"{split}: teacher above the best random edit on {wins}/{len(rs)} goals ({wins / len(rs):.0%}; gate {GATE:.0%}"
+        wins, first = sum(r["win"] for r in rs), sum(r["first_win"] for r in rs)
+        d = [r["teacher_reward"] - r["random_reward"] for r in rs]
+        lines.append(f"{split}: teacher above random on {wins}/{len(rs)} goals ({wins / len(rs):.0%}; gate {GATE:.0%}"
                      f"{': passed' if split == 'dev' and wins / len(rs) >= GATE else ''}); reward difference median "
-                     f"{statistics.median(d):+.3f}")
-        for m in TEACHERS + RANDOMS:
+                     f"{statistics.median(d):+.3f}; first definition {first}/{len(rs)}")
+        for m in ("teacher", "random") + TEACHERS + RANDOMS:
             xs = [r["score"][m] for r in rs if m in r["score"]]
             if xs:
                 mean = lambda k: statistics.fmean(x[k] for x in xs)  # noqa: E731

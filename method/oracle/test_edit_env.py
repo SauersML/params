@@ -72,3 +72,16 @@ def test_verifier_counts_on_a_tiny_model():
     alone = ver._lp([tokens[0, :10].tolist()])[0]
     batched = ver._lp([tokens[0, :10].tolist(), tokens[1].tolist()])[0, :10]
     assert torch.allclose(alone, batched, atol=1e-5)
+
+
+def test_best_picks_the_candidate_earning_most_on_val():
+    v = lambda f, c, k: {"flipped": f, "collateral_per_token": c, "controls_kept": k}  # noqa: E731
+    row = {"methods": {
+        "circuit_edit": {"ops": [["h.0.mlp.c_fc", 1, 0.0]], "validation": v(0.95, 0.01, 0.1), "info": {},
+                         "candidates": [[[["h.0.mlp.c_fc", 1, 0.0]], v(0.95, 0.01, 0.1), {}],
+                                        [[["h.0.mlp.c_fc", 2, -1.0]], v(0.80, 0.01, 0.9), {}]]},
+        "circuit_scales": {"ops": [["h.1.mlp.c_fc", 3, 0.5]], "validation": v(0.5, 0.0, 1.0), "info": {}}}}
+    m, ops, r = edit_env.best(row, edit_env.TEACHERS)
+    assert (m, ops) == ("circuit_edit", [("scale", "h.0.mlp.c_fc", 2, -1.0)])
+    assert abs(r - (0.80 - edit_env.LAM * 0.01 - edit_env.MU * 0.1)) < 1e-12
+    assert edit_env.best(row, edit_env.RANDOMS) is None

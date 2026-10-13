@@ -640,6 +640,8 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
         deltas = edit if name in DENSE else ops_deltas(nat, edit)
         out["methods"][name] = {"info": info, "ops": None if name in DENSE else [list(o) for o in edit], "validation": val,
                                 "score": _score(net, "score", deltas), "frontier": [[c[0]["flipped"], c[0]["collateral_per_token"], c[2]] for c in cs]}
+        if name not in DENSE:  # every candidate edit and its validation metrics (a different rule can pick among them)
+            out["methods"][name]["candidates"] = [[[list(o) for o in c[1]], c[0], c[2]] for c in cs]
         v = out["methods"][name]["score"]
         log(f"{beh['describe']['a']!r}->{beh['describe']['b']!r} {name} {info}: flipped {v['flipped']:.2f}, goal {v['goal_bits']:.2f} bits, "
             f"kept {v['controls_kept'] or 0:.2f}, text KL {v['text_kl_per_token']:.2e}, Pile KL {v['pile_kl_per_token']:.2e}/token")

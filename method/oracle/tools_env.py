@@ -26,7 +26,11 @@ from tools, measured on demand on the real model and VPD's decomposition (goal_e
                                            GoalEval.sufficiency), its path-patched score on changed inputs
                                            (GoalEval.track_pp: s_track_pp) and its description bits (size_bits); with
                                            changes, the circuit's path-patched prediction on that changed text
-                                           (GoalEval.pp_run) beside the model's
+                                           (GoalEval.pp_run) beside the model's; families: the reward's own families
+                                           (GoalEval.fidelity in reward mode), phi, the text's bar (tau's phi_tau)
+                                           and the circuit reward phi + g x 0.5 compact, all on the tools' draws (a
+                                           Text copy with its seed shifted by SEED_SHIFT: the circuit-seeded draws
+                                           differ from the score's too)
   compare(circuit_a, circuit_b, top)       the changed inputs (track_pp's draws) on which two drafts' path-patched
                                            predictions disagree most, each beside the model's
 
@@ -57,6 +61,7 @@ ROWS: components.py questions rows (each text's evidence: its intervention quest
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import re
@@ -89,6 +94,7 @@ EFFECTS_MAX = 4096  # node_effects' most nodes in a draft
 EFFECT_DRAWS = 8  # node_effects' changed inputs (line_effects' draws on the tools' split)
 COMPARE_DRAWS = goal_eval.CHANGED_DRAWS  # compare's changed inputs (track_pp's draws on the tools' split)
 OTHER = {"search": "eval", "eval": "search"}
+SEED_SHIFT = 7919  # the families' Text copy's seed offset: circuit-seeded draws (nodes, edges, flips) unlike the score's
 LN2 = math.log(2)
 
 SYSTEM = ("You explain how a small language model, vpd4l (layers 0 to 3, each with attention (q, k, v, o) and an MLP "
@@ -185,7 +191,8 @@ TOOL_SPECS = [
                     "changed inputs, the same scale), its size in bits, the nodes and edges dropped as invalid or "
                     "stranded, and its draft id. Give positions, nodes (with edges, or every connection among them), "
                     "Mermaid text (circuit), or base with add and drop. changes: [[position, token], ...] runs the "
-                    "circuit path-patched on that changed text instead and gives its top tokens beside the model's.",
+                    "circuit path-patched on that changed text instead and gives its top tokens beside the model's. "
+                    "families=true adds the reward's own measures (see families).",
      "parameters": {"type": "object", "properties": {
          "positions": {"type": "array", "items": {"type": "integer"}, "description": "every VPD-active subcomponent at these positions"},
          "nodes": {"type": "array", "items": {"type": "string"}, "description": "L<layer>.<kind>#<index>@<position> (tok@<position>: the token embedding)"},
@@ -197,7 +204,10 @@ TOOL_SPECS = [
          "drop": {"type": "array", "items": {"type": "string"}, "description": "nodes dropped from the base (with their edges)"},
          "drop_least": {"type": "integer", "description": "drop the base's n least needed nodes, by the latest node_effects(draft=base) or measure_removal(draft=base, each=true) order (kept by later drafts)"},
          "changes": {"type": "array", "items": {"type": "array"},
-                     "description": "[[position, token], ...], token as quoted in the question, e.g. \"' castle'\", or an id"}},
+                     "description": "[[position, token], ...], token as quoted in the question, e.g. \"' castle'\", or an id"},
+         "families": {"type": "boolean", "description": "also the reward's own measures on independent draws (slower, about "
+                                                        "6 s): each family's score, phi, the bar phi must reach before size "
+                                                        "counts, and the circuit's reward phi + gate x 0.5 log2(start bits / bits)"}},
          "required": []}},
     {"name": "compare",
      "description": "The changed inputs on which two draft circuits' path-patched predictions disagree most: per input "
@@ -232,8 +242,9 @@ class Tools:
     """The tools on one text: goal_eval's Text (the model's run, VPD's answer, the probe), shared with the reward, and
     every result kept by tool and arguments."""
 
-    def __init__(self, ge: goal_eval.GoalEval, task: dict, split: str = "search", lens=None, atlas=None):
-        self.ge, self.nat, self.task, self.split = ge, ge.nat, task, split
+    def __init__(self, ge: goal_eval.GoalEval, task: dict, split: str = "search", lens=None, atlas=None, pool: dict | None = None):
+        self.ge, self.nat, self.task, self.split, self.pool = ge, ge.nat, task, split, ({} if pool is None else pool)
+        self._px = None  # the families' Text copy
         p = task["prompts"][0]
         self.ids, self.targets = list(p["token_ids"]), list(p["target_positions"])
         self.T, self.t = len(self.ids), max(self.targets)
@@ -520,14 +531,20 @@ class Tools:
             raise ToolError(f"node_effects takes drafts of at most {EFFECTS_MAX} nodes")
         if offset != 0:
             self._page([], top, offset)  # the arguments' checks before the runs
-        pp = self.ge.line_effects(self.tx, g, mode="pp", split=self.split, draws=EFFECT_DRAWS) if self.tx.f2 else None
+        pp, draws = None, 0
+        for draws in (EFFECT_DRAWS, 2) if self.tx.f2 else ():  # every removal in one engine call: fewer draws when it
+            try:                                               # does not fit (r6: 1,127 nodes on a shared 48 GB card)
+                pp = self.ge.line_effects(self.tx, g, mode="pp", split=self.split, draws=draws)
+                break
+            except torch.OutOfMemoryError:
+                native.free(self.nat.dev)
         pt = self.ge.line_effects(self.tx, g, mode="c")
         d_pp = {tuple(r["node"]): r["delta_kl"] for r in pp["nodes"]} if pp else {}  # carry.kl's bits
         rows = [(tuple(r["node"]), d_pp.get(tuple(r["node"])), r["delta_kl"]) for r in pt["nodes"]]
         worst = lambda r: max(x for x in (r[1], r[2], -math.inf) if x is not None)  # noqa: E731
         rows.sort(key=lambda r: (-worst(r), r[0]))
         page, offset, nxt = self._page(rows, top, offset)
-        return {"nodes": len(rows), "pp_kl_bits": _r(pp["base_kl"]) if pp else None, "point_kl_bits": _r(pt["base_kl"]),
+        return {"nodes": len(rows), "pp_kl_bits": _r(pp["base_kl"]) if pp else None, "pp_draws": draws if pp else 0, "point_kl_bits": _r(pt["base_kl"]),
                 "offset": offset, "next_offset": nxt, "columns": ["node", "pp_bits", "point_bits"],
                 "effects": [[components.node_text(nd), _r(a), _r(b)] for nd, a, b in page],
                 "_order": [components.node_text(nd) for nd, _, _ in rows[::-1]]}
@@ -540,8 +557,33 @@ class Tools:
         return {"point": _r(pt["f1_live"]), "point_kl_bits": _r(pt["kl_live"]), "necessity": _r(pt["n_live"]),
                 "pp": _r(pp["s_track_pp"]), "pp_kl_bits": _r(pp["kl_track_pp_c"]), "pp_inputs": pp["prompts_track_pp"]}
 
+    def _proxy(self):
+        """The Text the families run on: the tools' Text (its model runs, VPD's answer, its probe: F2's positions)
+        with its seed shifted by SEED_SHIFT and its own tau, start, adversary and VPD-baseline caches, so the reward's
+        circuit-seeded draws differ from the score's; caches without a seed (cuts, bounds, the changed texts' model
+        runs, the path-patching engine) shared."""
+        if self._px is None:
+            self.tx._probed()
+            px = copy.copy(self.tx)
+            px.seed = int(self.tx.seed) + SEED_SHIFT
+            for k in ("_tau", "_start", "_adv", "_vpd_c"):  # kept per split or holding seeded draws: the copy's own
+                px.__dict__.pop(k, None)
+            self._px = px
+        return self._px
+
+    def _families(self, g, bits: float) -> dict:
+        ge, px = self.ge, self._proxy()
+        row = ge.fidelity(px, [g], self.pool, mode="reward", split=self.split)[0]
+        tau = ge.tau(px, self.pool, self.split)
+        ph, _ = goal_eval.phi(row, families=tau.get("families"))
+        pt = tau.get("phi_tau")
+        comp = goal_eval.compact(bits, tau.get("bits_start"))
+        gate = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (ph - pt)))
+        return {"phi": _r(ph), "bar": _r(pt), "gate": _r(gate, 2), "compact": _r(comp), "reward": _r((ph or 0.0) + (gate or 0.0) * 0.5 * (comp or 0.0)),
+                "families": {f: _r(goal_eval.family_score(row, f), 2) for f in (tau.get("families") or goal_eval.PHI_FAMILIES)}}
+
     def run_circuit(self, circuit=None, nodes=None, edges=None, positions=None, complete=None, changes=None, _json=None,
-                    base=None, add=None, drop=None) -> dict:
+                    base=None, add=None, drop=None, families: bool = False) -> dict:
         if base is not None or add or drop:
             raise ToolError("base, add and drop need an episode's drafts (the environment resolves them)")
         g, d, p = self._graph(circuit, nodes=nodes, edges=edges, positions=positions, complete=complete, _json=_json)
@@ -555,7 +597,10 @@ class Tools:
         if not g.count():
             return {**out, "error": "no valid node left"}
         if changes is None:
-            return {**out, **self._score(g)}
+            got = {**out, **self._score(g)}
+            if families:
+                got |= self._families(g, self._bits(g, p, d))
+            return got
         x2 = self._changed(changes)
         ge, tx = self.ge, self.tx
         with torch.no_grad():
@@ -665,7 +710,7 @@ class Env:
 
     def text_tools(self, tid: str) -> Tools:
         if tid not in self.tools:
-            self.tools[tid] = Tools(self.ge, self.task(tid), self.tool_split, self.lens, self.atlas)
+            self.tools[tid] = Tools(self.ge, self.task(tid), self.tool_split, self.lens, self.atlas, self.pool)
             while len(self.tools) > TEXTS_KEPT:
                 self.tools.popitem(last=False)
         self.tools.move_to_end(tid)
@@ -873,7 +918,10 @@ class Scripted:
     until the chunk is below 1/MIN_FRACTION of that draft or the turns or calls run out (the episode's MAX_TURNS and
     MAX_CALLS, the answer's turn kept). The answer: CIRCUIT: <the last kept draft>. rank="removal" ranks once by
     measure_removal(draft, each) instead (each node's removal from the real model, not from the draft: the same order
-    for every later draft, inherited, never re-measured)."""
+    for every later draft, inherited, never re-measured). accept="reward" (the default) judges by the reward itself on
+    the tools' draws (run_circuit families: phi, the bar, compactness): the start is the m with the best phi, and below
+    the cap a turn keeps its drop with the highest circuit reward when that beats the current draft's; accept="pp"
+    keeps the pp and point tolerance above (FLOOR and TOLERANCE)."""
 
     FLOOR = 0.9
     TOLERANCE = 0.05
@@ -882,8 +930,17 @@ class Scripted:
     STEP = 0.25  # backward elimination's share of the draft per turn above the cap
     TRIALS = (1, 2, 4)  # a turn's drops: the chunk over these
 
-    def __init__(self, max_turns: int = MAX_TURNS, max_calls: int = MAX_CALLS, rank: str = "effects"):
-        self.max_turns, self.max_calls, self.rank, self.gen, self.trace = max_turns, max_calls, rank, None, []
+    def __init__(self, max_turns: int = MAX_TURNS, max_calls: int = MAX_CALLS, rank: str = "effects", accept: str = "reward"):
+        self.max_turns, self.max_calls, self.rank, self.accept, self.gen, self.trace = max_turns, max_calls, rank, accept, None, []
+
+    def _run(self, **args) -> dict:
+        return _call("run_circuit", **args, **({"families": True} if self.accept == "reward" else {}))
+
+    @staticmethod
+    def _value(sc: dict) -> float:
+        """A draft's circuit reward on the tools' draws (families), -inf when it has none."""
+        v = sc.get("reward")
+        return -math.inf if v is None or "error" in sc else float(v)
 
     def _rank(self, draft: str) -> dict:
         return (_call("node_effects", draft=draft, top=8) if self.rank == "effects" else
@@ -911,7 +968,7 @@ class Scripted:
 
     def _keep(self, sc: dict, **kw) -> None:
         self.trace.append({**kw, "nodes": sc.get("nodes"), "pp": sc.get("pp"), "point": sc.get("point"), "bits": sc.get("bits"),
-                           "draft": sc.get("draft")})
+                           "phi": sc.get("phi"), "reward": sc.get("reward"), "draft": sc.get("draft")})
 
     def plan(self, messages: list):
         turns, calls, cap = 1, 1, components.NODE_CAP
@@ -919,22 +976,29 @@ class Scripted:
         t = inf["target"]
         share = [(row[0], row[3]) for row in inf["positions"] if row[0] != t]
         cands = [p for p, s in share if s is not None and s >= goal_eval.SHARE_FLOOR][:self.MAX_POSITIONS]
-        got = yield self._msg(*[_call("run_circuit", positions=[t] + cands[:m]) for m in range(len(cands) + 1)])
+        got = yield self._msg(*[self._run(positions=[t] + cands[:m]) for m in range(len(cands) + 1)])
         turns, calls = turns + 1, calls + len(got)
         for m, sc in enumerate(got):
             self._keep(sc, m=m)
-        ok = [m for m, sc in enumerate(got) if (sc.get("pp") or 0) >= self.FLOOR and sc.get("draft")]
-        m = ok[0] if ok else max(range(len(got)), key=lambda j: ((got[j].get("pp") or 0), -j))
+        if self.accept == "reward":  # the start: the best phi on the tools' draws (above the cap it is pruned to it)
+            m = max(range(len(got)), key=lambda j: (-math.inf if got[j].get("phi") is None else got[j]["phi"], -j))
+        else:
+            ok = [m for m, sc in enumerate(got) if (sc.get("pp") or 0) >= self.FLOOR and sc.get("draft")]
+            m = ok[0] if ok else max(range(len(got)), key=lambda j: ((got[j].get("pp") or 0), -j))
         score = got[m]
         draft, size = score.get("draft"), score.get("nodes") or 0
         (rk,) = yield self._msg(self._rank(draft))
         turns, calls = turns + 1, calls + 1
+        if "error" in rk and self.rank == "effects":  # node_effects failed (e.g. out of memory): the removal order
+            self.rank = "removal"
+            (rk,) = yield self._msg(self._rank(draft))
+            turns, calls = turns + 1, calls + 1
         ranked = "error" not in rk
         # above the cap: backward elimination, re-ranked each step (a step, its ranking and a last drop to the cap
         # leave the answer's turn: Episode.step ends an episode at MAX_TURNS turns or MAX_CALLS calls)
         while ranked and size > cap and turns < self.max_turns - 3 and calls + 3 < self.max_calls:
             n = min(size - cap, max(1, math.ceil(self.STEP * size)))
-            (sc,) = yield self._msg(_call("run_circuit", base=draft, drop_least=n))
+            (sc,) = yield self._msg(self._run(base=draft, drop_least=n))
             turns, calls = turns + 1, calls + 1
             self._keep(sc, drop=n, phase="cap")
             if "error" in sc or not sc.get("draft"):
@@ -945,7 +1009,7 @@ class Scripted:
                 turns, calls = turns + 1, calls + 1
                 ranked = "error" not in rk
         if size > cap and ranked:  # out of turns above the cap: the least needed go at once
-            (sc,) = yield self._msg(_call("run_circuit", base=draft, drop_least=size - cap))
+            (sc,) = yield self._msg(self._run(base=draft, drop_least=size - cap))
             turns, calls = turns + 1, calls + 1
             self._keep(sc, drop=size - cap, phase="cap_last")
             draft, size, score = sc.get("draft", draft), sc.get("nodes", size), sc  # its order: its base's, inherited
@@ -955,16 +1019,23 @@ class Scripted:
         floor = max(1, size // self.MIN_FRACTION)
         while size > 1 and chunk >= floor and turns < self.max_turns - 3 and calls + len(self.TRIALS) + 2 < self.max_calls:
             sizes = sorted({max(1, min(size - 1, chunk // k)) for k in self.TRIALS}, reverse=True)
-            got = yield self._msg(*[_call("run_circuit", base=draft, drop_least=n) for n in sizes])
+            got = yield self._msg(*[self._run(base=draft, drop_least=n) for n in sizes])
             turns, calls = turns + 1, calls + len(sizes)
             kept = None
-            for n, sc in zip(sizes, got):
-                ok = (sc.get("pp") or 0) >= ref_pp - self.TOLERANCE and (sc.get("point") or 0) >= ref_pt - self.TOLERANCE
-                self._keep(sc, drop=n, kept=ok)
-                if ok and kept is None and sc.get("draft"):
-                    kept = (n, sc)
+            if self.accept == "reward":  # the drop with the best circuit reward on the tools' draws, when it beats the draft's
+                best = max(range(len(got)), key=lambda j: (self._value(got[j]), sizes[j]))
+                if self._value(got[best]) > self._value(score) and got[best].get("draft"):
+                    kept = (sizes[best], got[best])
+                for n, sc in zip(sizes, got):
+                    self._keep(sc, drop=n, kept=kept is not None and sc is kept[1])
+            else:
+                for n, sc in zip(sizes, got):
+                    ok = (sc.get("pp") or 0) >= ref_pp - self.TOLERANCE and (sc.get("point") or 0) >= ref_pt - self.TOLERANCE
+                    self._keep(sc, drop=n, kept=ok)
+                    if ok and kept is None and sc.get("draft"):
+                        kept = (n, sc)
             if kept:
-                draft, size = kept[1]["draft"], kept[1]["nodes"]
+                draft, size, score = kept[1]["draft"], kept[1]["nodes"], kept[1]
                 if self.rank == "effects":
                     (rk,) = yield self._msg(self._rank(draft))  # the kept draft's own order
                     turns, calls = turns + 1, calls + 1
@@ -1056,18 +1127,18 @@ def bench(env: Env, tids: list[str], log=print, score: bool = True) -> dict:
     return out
 
 
-def scripted(env: Env, tids: list[str], out: Path, log=print, rank: str = "effects") -> list[dict]:
+def scripted(env: Env, tids: list[str], out: Path, log=print, rank: str = "effects", accept: str = "reward") -> list[dict]:
     """The scripted baseline's episodes on texts, each beside the influential start on the score split (its phi from
     tau, its s_track_pp and bits), one JSON line each."""
     res = []
     for tid in tids:
-        pol = Scripted(rank=rank)
+        pol = Scripted(rank=rank, accept=accept)
         r = run_episode(env, tid, pol)
         tools = env.text_tools(tid)
         tx = tools.tx
         tau = env.ge.tau(tx, env.pool, env.score_split)
         st = env.ge.start_set(tx, env.score_split)
-        row = {**r, "rank": rank, "trace": pol.trace,
+        row = {**r, "rank": rank, "accept": accept, "trace": pol.trace,
                "start": {"phi": tau["phi_start"], "phi_tau": tau["phi_tau"], "bits": tau["bits_start"], "s_track_pp": st["s_track_pp"],
                          "nodes": tau["nodes_start"], "m": tau["m_start"]},
                "answer": r.get("answer_expanded") or r["messages"][-1]["content"]}
@@ -1261,6 +1332,7 @@ def main():
     s.add_argument("--out", required=True)
     s.add_argument("--score-split", default="eval")
     s.add_argument("--rank", default="effects", choices=["effects", "removal"], help="the scripted policy's node order")
+    s.add_argument("--accept", default="reward", choices=["reward", "pp"], help="the scripted policy's acceptance: the reward on the tools' draws, or pp/point tolerance")
     t = sub.add_parser("tokens")
     t.add_argument("rows")
     t.add_argument("--tasks", nargs="+", required=True)
@@ -1286,7 +1358,7 @@ def main():
     if a.cmd == "bench":
         bench(env, _tasks(a.tasks), score=not a.no_score)
     elif a.cmd == "scripted":
-        scripted(env, _tasks(a.tasks), Path(a.out), rank=a.rank)
+        scripted(env, _tasks(a.tasks), Path(a.out), rank=a.rank, accept=a.accept)
     elif a.cmd == "baselines":
         baselines(env, Path(a.episodes), Path(a.out))
     else:

@@ -9,7 +9,8 @@
 #   bash experiments/oracle/pods/tools_env_pod.sh RUN ROWS.jsonl TASKS   (TASKS e.g. text9000:text9019)
 #     env: HOURS (cap, default 1.5), GPU, PRICE, VRAM, SPLIT (the score split, default eval), BENCH (texts, default
 #     text9000,text9001), WORKERS (processes sharing the GPU, default 2), BWORKERS (baselines' processes, default 1: two
-#     OOMed a 48 GB card in r5), RANK (the scripted policy's order: effects, the default, or removal), STEPS (default
+#     OOMed a 48 GB card in r5), RANK (the scripted policy's order: effects, the default, or removal), ACCEPT (its
+#     acceptance: reward, the default, the reward's families on the tools' draws, or pp), STEPS (default
 #     "tests bench scripted tokens baselines"), EPISODES (an earlier run's scripted.jsonl, taken in place of running the
 #     episodes)
 {
@@ -57,7 +58,7 @@ for st in $STEPS; do
     scripted)
       R="rm -f $O/scripted.jsonl $O/scripted.failure.txt; worker_pids=();"
       for k in $(seq 0 $((W - 1))); do
-        R="$R (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks ${SLICE[$k]} --out $O/scripted_$k.jsonl --score-split $SPL --rank ${RANK:-effects} > $O/scripted_$k.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/scripted_$k.log; exit \$rc) & worker_pids+=(\$!);"
+        R="$R (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks ${SLICE[$k]} --out $O/scripted_$k.jsonl --score-split $SPL --rank ${RANK:-effects} --accept ${ACCEPT:-reward} > $O/scripted_$k.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/scripted_$k.log; exit \$rc) & worker_pids+=(\$!);"
       done
       STEPCMD="$STEPCMD $R failed=0; for pid in \"\${worker_pids[@]}\"; do wait \"\$pid\"; rc=\$?; if [ \$rc -ne 0 ]; then failed=\$rc; fi; done; if [ \$failed -ne 0 ]; then echo \"scripted worker failure: exit \$failed; partial shard files retained, merged output not produced\" > $O/scripted.failure.txt; exit \$failed; fi; cat $O/scripted_*.jsonl > $O/scripted.jsonl || exit \$?;" ;;
     tokens) STEPCMD="$STEPCMD python -u method/oracle/tools_env.py tokens $I/rows.jsonl --tasks $TASKS --episodes $O/scripted.jsonl --pool > $O/tokens.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/tokens.log; if [ \$rc -ne 0 ]; then exit \$rc; fi;" ;;
@@ -70,7 +71,7 @@ for st in $STEPS; do
     *) echo "tools_env_pod.sh: unknown step $st" >&2; exit 2 ;;
   esac
 done
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $I ~/mpd-data/graph_oracle $PA; \
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $I ~/mpd-data/graph_oracle $PA; \
 tar -xf $F/in.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $F/lens.tar -C $PA; \
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors $A/atlas.json $A/atlas.safetensors $A/tokens_0_6000.npy /Users/user/params/method/vpd /Users/user/params/method/oracle > /dev/null; \
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('$V/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('$V/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \

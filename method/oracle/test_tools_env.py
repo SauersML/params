@@ -129,6 +129,25 @@ def test_run_circuit_reports_goal_eval(env):
         assert d == sorted(d, reverse=True)
 
 
+def test_families_on_shifted_draws(env):
+    tools = env.text_tools(TID)
+    tx, nat = tools.tx, env.ge.nat
+    vpd = sorted((n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist())
+    r = call(tools, "run_circuit", nodes=[components.node_text(nd) for nd in vpd], families=True)
+    px = tools._proxy()
+    assert px.seed == tx.seed + tools_env.SEED_SHIFT and px.ids == tx.ids and px.f2 == tx.f2
+    g = goal_eval.strand(native.Graph(vpd, complete=True), tools.targets, nat.C)
+    row = env.ge.fidelity(px, [g], tools.pool, mode="reward", split=tools.split)[0]
+    tau = env.ge.tau(px, tools.pool, tools.split)
+    ph, _ = goal_eval.phi(row, families=tau.get("families"))
+    if ph is not None:
+        assert math.isclose(r["phi"], ph, rel_tol=1e-2, abs_tol=1e-3)
+    assert r["bar"] == tools_env._r(tau.get("phi_tau"))
+    assert tools.split not in (tx.__dict__.get("_tau") or {})  # the tools' tau lives on the copy alone
+    plain = call(tools, "run_circuit", nodes=[components.node_text(nd) for nd in vpd])
+    assert "phi" not in plain and math.isclose(plain["point"], r["point"], abs_tol=1e-9)
+
+
 def test_errors_go_back_to_the_policy(env):
     tools = env.text_tools(TID)
     assert "error" in call(tools, "list_active", position=99)
@@ -264,6 +283,13 @@ def test_baselines_include_empty_and_same_batch_calibration(_unused_env=None):
         assert row["start"]["node_cap_eligible"] is False
         assert row["start"]["circuit_reward_qa_free_d0"] == components.V3_INVALID
         assert row["start"]["formula_circuit_reward_qa_free_d0"] > 0
+
+
+def test_scripted_episode_pp(env):
+    pol = tools_env.Scripted(rank="removal", accept="pp")
+    r = tools_env.run_episode(env, TID, pol)
+    assert r["answered"] and r["scores"]["valid"], r
+    assert not any(c.get("arguments", {}).get("families") for m in r["messages"] for c in m.get("tool_calls") or [])
 
 
 def test_scripted_episode(env):

@@ -103,13 +103,13 @@ cd /Users/user/params/method/oracle; python -B teacher.py --tasks $L --batch $BA
   done
   CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 ${POD_ENV:-}; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
-tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
+tar --no-same-owner -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd ${EXTRA:-} > /dev/null;
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 (while :; do cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes > $O/mem_peak.txt 2> /dev/null; sleep 30; done > /dev/null 2>&1 &);
 $PRE
-${FROM:+mkdir -p ~/from; tar -xzf $F/from_$j.tgz -C ~/from;}
+${FROM:+mkdir -p ~/from; tar --no-same-owner -xzf $F/from_$j.tgz -C ~/from;}
 cd /Users/user/params/method/oracle; $LOC
 set +e; $RUNS wait; echo all teacher processes done; ${SELF_END_MIN:+(setsid nohup bash /Users/user/params/experiments/oracle/pods/self_stop.sh $SELF_END_MIN > /dev/null 2>&1 < /dev/null &);} F=0; $FAILED exit \$F"
   (  # community stock comes and goes: a launch that finds no card in stock, or a host whose download of the published

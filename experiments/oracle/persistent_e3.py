@@ -846,13 +846,18 @@ def main():
     for i, beh in enumerate(read(args.prefs)):
         if i % args.stride != args.offset:
             continue
-        if args.cmd == "edit":
-            ranks = {(x["a"], x["b"]): len(x["methods"]["circuit_edit"]["ops"]) for x in read(args.rank_from)
-                     if x["methods"].get("circuit_edit")} if args.rank_from else {}
-            r = practical(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites,
-                          methods=tuple(args.methods), rank=args.rank or ranks.get((beh["a"], beh["b"])))
-        else:
-            r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
+        try:
+            if args.cmd == "edit":
+                ranks = {(x["a"], x["b"]): len(x["methods"]["circuit_edit"]["ops"]) for x in read(args.rank_from)
+                         if x["methods"].get("circuit_edit")} if args.rank_from else {}
+                r = practical(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites,
+                              methods=tuple(args.methods), rank=args.rank or ranks.get((beh["a"], beh["b"])))
+            else:
+                r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
+        except torch.OutOfMemoryError:  # the preference skipped and reported, the process going on to the next
+            print(f"{beh['describe']['a']!r}->{beh['describe']['b']!r}: out of GPU memory, skipped", flush=True)
+            torch.cuda.empty_cache()
+            continue
         with open(args.out, "a") as fh:
             fh.write(json.dumps(r) + "\n")
 

@@ -121,6 +121,12 @@
 %% Shared invariant_artifact builder retains failed checks and rejects binding/provenance errors; duplicate tasks fail before loading.
 %% Producer58 tests and builder2 focused tests pass; default outputs unchanged. Consume checked shards, not commit prose.
 %% This one outcome-selected training row proves the data path, not diversity, learned English or independent generalization.
+%% Handoff closed:7a385c1 SFT launcher accepts INVARIANTS_TEACH=/path/checked.jsonl and requests claims before fitting.
+%% Stale pre-rendered instructions are rejected; heldout prompts/default behavior unchanged. Real6025 preflight passes.
+%% Producer launcher8aa2701 accepts INVARIANTS_TEACH=1 on train tasks, with separate worker/variant artifacts.
+%% Combine only one variant's matching groups for training. Failed checks remain in provenance; no extra model calls.
+%% New copy-read metadata6011: depth1 cause ~.003; depth2 ~.72 with uninformative/missing isolation. No new mechanism yet.
+%% Existing varteach jobs own the follow-up: no duplicate scoring or treating null isolation as a pass.
 %% Outcome-selected training claims are not independent evaluation or certification of free English.
 %% Toy-loop reward executes selected UNITS only; Mermaid edges previously affected structural F1, not executable reward.
 %% 9789f31 adds opt-in --wiring: architecture-constrained edges compile to native pieces, with all selected pieces retained.
@@ -149,12 +155,23 @@
 %% Mean+worst point fidelity, invalid=-1, no size/necessity/English claim; default and legacy reward unchanged, no training yet.
 %% Two tiny execution regressions pass: cut/restored path, invalid graph, worst-text penalty and fresh native identity.
 %% Durable90 replay: graph_oracle/goal_eval/toy_wiring_all90_20261012 (report, summary, frozen tasks, interpretation).
-%% Next useful wiring experiment: fixed-budget legacy vs wiring_suff, matched model/data/seeds; judge held-out mechanisms.
+%% Next useful wiring experiment: fixed-budget unit_suff vs wiring_suff; match model/data/seeds and held-out mechanisms.
+%% 671c28f adds matched unit_suff: identical selected pieces, input bank, mean+worst fidelity and invalid=-1;
+%% only connection execution differs. Legacy exec also changes necessity/size, so is not an isolated wiring comparison.
+%% Torch sampling/initialization now obey --seed in SFT/RL; three focused live-path/invalid/RNG checks pass.
+%% Artifact dependency: saved noleak completions exist, but original checkpoint/tokenizer/train manifest are absent here.
+%% Requested producer handoff; do not retrain a different start and label it the same experiment. No RL launched.
+%% Future run freezes SHOW_ACTIVE=0, train-only task IDs, checkpoint/source hashes; reports tokens, updates and wall time.
+%% The90 inspected outcomes are development evidence; neither they nor regenerated texts become a pristine test.
 %% Reward availability does not itself demonstrate better learning. Keep that comparison independent of English work.
 %% Bounded numerical checks38344783019/38345271260 both pass unchanged tolerances; latter32 pass/3 skip with module prefix.
 %% Float32 forward drift remains; neither module order nor global RNG explains the recurring failure on this AVX2 host.
 %% No production change or loosened tolerance justified. Collection-only failure38345063168 is retained separately.
 %% Diagnostic archive: graph_oracle/goal_eval/adversary_batch_diagnostic_20261012; no further runs planned.
+%% 8aa2701 repairs20 pod launchers:19 bulk archives exclude sealed9100-9149 before tar opens contents;
+%% variable launcher archives only selected permitted tasks. Teacher/gate/unit selectors also filter before content reads.
+%% 22 synthetic regression cases pass; CI includes them. No real sealed files or existing archives opened or altered.
+%% This protects the independence of final evaluation; it is not a retrospective claim about other owners' earlier archives.
 %% No new generation, no verified raw-weight-use claim, no complete policy-visible-text provenance or fresh-input claim.
 %% Explicitly requested replay runs independently of unrelated CI failures; preserve both measurement and failed status.
 %% ad865a3 uses SciPy for exact toy SVD on Mac only; per-head weight reconstruction passes, Linux backend unchanged.
@@ -250,12 +267,12 @@ flowchart BT
   VAR["<b>Variables and invariants</b><br/>kept: 84 input (= whole position),<br/>7 intermediate of 127; m share 0.004;<br/>families beat equal-size nulls 9/9<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
   ENGP["<b>Fresh carrier tests</b><br/>209 effects carried;181 unsupported;<br/>3 of7 claims verified for training;<br/>two-input mechanism not established<br/>DONE · codex/variable_reward"]
-  CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>prompt9259 / answer7230 tokens;<br/>producer exports executed evidence<br/>DONE · codex/eval_recovery, variable_reward"]
-  WIRING["<b>Learn executable relations</b><br/>3 multihop failures need missing edges;<br/>wiring reward ready;2 tests pass;<br/>next: controlled RL, same budget<br/>HANDOFF · codex to toyloop, primerl"]
+  CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
+  WIRING["<b>Learn executable relations</b><br/>matched unit vs wiring rewards ready;<br/>next: same-budget RL on same start;<br/>original checkpoint and data needed<br/>WAITING for artifact · codex, toyloop"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
-    TXT["<b>Text splits</b><br/>train 6000–7999 · dev 9000–9099<br/>donors 9150–9199; sealed stays closed<br/>tool training guard: 26 checks passed<br/>codex · a47cb59"]
+    TXT["<b>Text splits</b><br/>train 6000–7999 · dev 9000–9099<br/>donors 9150–9199; sealed stays closed<br/>22 launch checks;26 tool checks pass<br/>codex · 8aa2701, a47cb59"]
     ENG["<b>Executable-circuit engine</b><br/>path-patched, batched, held values,<br/>line deletions in one call; block units<br/>DONE · monitorbench"]
   end
 
@@ -411,7 +428,7 @@ flowchart BT
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
   class QAONLY check
-  class WIRING check
+  class WIRING waiting
   class CLAIMDATA done
   class ENGP done
   class GATEB blocked

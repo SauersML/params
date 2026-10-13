@@ -39,7 +39,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DATA, MODULES, Decomp, kl_bits, load_decomp, load_mnist  # noqa: E402
+from common import DATA, Decomp, Neurons, kl_bits, load_decomp, load_mnist, load_neurons  # noqa: E402
 
 FAMILIES = ("point", "removal", "donor", "flips")
 CIRCUIT_POOL = 5000  # test images 0-4999 hold the circuit images; 5000-9999 are donors only
@@ -59,7 +59,7 @@ class Draws:
 
 
 class Scorer:
-    def __init__(self, dec: Decomp, x: torch.Tensor) -> None:
+    def __init__(self, dec: Decomp | Neurons, x: torch.Tensor) -> None:
         self.dec = dec
         self.x = x[None, :]
         self.a, _, _ = dec.acts(self.x)
@@ -192,21 +192,26 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
     ap.add_argument("--tau", type=float, default=0.1)
-    ap.add_argument("--draws", type=int, default=16)
+    ap.add_argument("--tau-search", type=float, default=None, help="the acceptance bound in the search (default: tau)")
+    ap.add_argument("--units", choices=("vpd", "neurons"), default="vpd")
+    ap.add_argument("--draws", type=int, default=32)
     ap.add_argument("--eval-draws", type=int, default=64)
     ap.add_argument("--n-images", type=int, default=50)
     ap.add_argument("--random-sets", type=int, default=5)
     args = ap.parse_args()
     torch.set_num_threads(3)
     torch.manual_seed(0)
-    dec = load_decomp(DATA / f"vpd_{args.tag}.pt")
+    tau_s = args.tau if args.tau_search is None else args.tau_search
+    dec = load_decomp(DATA / f"vpd_{args.tag}.pt") if args.units == "vpd" else load_neurons()
     _, _, xte, yte = load_mnist()
     imgs = choose_images(yte)[: args.n_images]
     donor_pool = torch.arange(CIRCUIT_POOL, len(xte))
     a_donor_all, _, _ = dec.acts(xte[donor_pool])
     donor_pred = dec.run(xte[donor_pool], torch.ones(len(donor_pool), dec.total)).argmax(-1)
     donor_y = yte[donor_pool]
-    ci_all = dec.ci(xte[imgs])
+    a_imgs, _, _ = dec.acts(xte[imgs])
+    # VPD's causal importance; for neurons the analog of "active" is a nonzero activation, ranked by its size
+    ci_all = dec.ci(xte[imgs]) if args.units == "vpd" else a_imgs.abs()
     contrib_all = dec.contribution(xte[imgs])
     results = []
     t0 = time.time()
@@ -228,7 +233,7 @@ def main() -> None:
         noth = sc.nothing(deval)
         noth_far = sc.nothing(dfar)
         ci, contrib = ci_all[ii], contrib_all[ii]
-        S = prune(sc, contrib.argsort(), dsearch, args.tau)
+        S = prune(sc, contrib.argsort(), dsearch, tau_s)
         k = int(S.sum())
         active = ci > 0
         methods = {
@@ -266,7 +271,9 @@ def main() -> None:
             + f" ({time.time() - t0:.0f}s)",
             flush=True,
         )
-    out = DATA / f"circuits_{args.tag}_tau{args.tau}.json"
+    suffix = "" if args.tau_search is None else f"_s{args.tau_search}"
+    unit = "" if args.units == "vpd" else "_neurons"
+    out = DATA / f"circuits_{args.tag}{unit}_tau{args.tau}{suffix}.json"
     out.write_text(json.dumps({"args": vars(args), "results": results}, indent=1))
     agg = {}
     for m in results[0]["eval"]:

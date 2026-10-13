@@ -189,3 +189,66 @@ def load_decomp(path: Path) -> Decomp:
     ci_fn.load_state_dict(blob["ci_fn"])
     ci_fn.eval()
     return Decomp(V=blob["V"], U=blob["U"], W=blob["W"], b=blob["b"], ci_fn=ci_fn)
+
+
+@dataclass
+class Neurons:
+    """The native-unit baseline: the MLP's hidden neurons (fc1's 256 outputs after ReLU, then fc2's), with the same run
+    interface as Decomp. A neuron's mask scales its post-ReLU activation; patching replaces that activation. The
+    logits have no units to mask (fc3's output is the prediction)."""
+
+    W: dict[str, torch.Tensor]
+    b: dict[str, torch.Tensor]
+    ci_fn: None = None
+
+    @property
+    def sizes(self) -> list[int]:
+        return [self.W["fc1"].shape[0], self.W["fc2"].shape[0]]
+
+    @property
+    def total(self) -> int:
+        return sum(self.sizes)
+
+    def name(self, j: int) -> str:
+        n1 = self.sizes[0]
+        return f"h1#{j}" if j < n1 else f"h2#{j - n1}"
+
+    @torch.no_grad()
+    def run(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        rem: torch.Tensor | float = 1.0,
+        patch_sel: torch.Tensor | None = None,
+        patch_val: torch.Tensor | None = None,
+        rem_patch: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        n1 = self.sizes[0]
+        h = x
+        for i, m in enumerate(("fc1", "fc2")):
+            h = F.relu(h @ self.W[m].T + self.b[m])
+            sl = slice(0, n1) if i == 0 else slice(n1, self.total)
+            if patch_sel is not None and patch_val is not None:
+                h = torch.where(patch_sel[:, sl], patch_val[:, sl], h)
+            h = h * mask[:, sl]
+        return h @ self.W["fc3"].T + self.b["fc3"]
+
+    @torch.no_grad()
+    def acts(self, x: torch.Tensor) -> tuple[torch.Tensor, dict, dict]:
+        h1 = F.relu(x @ self.W["fc1"].T + self.b["fc1"])
+        h2 = F.relu(h1 @ self.W["fc2"].T + self.b["fc2"])
+        return torch.cat([h1, h2], -1), {}, {}
+
+    def contribution(self, x: torch.Tensor) -> torch.Tensor:
+        """|h_j| * ||W_out[:, j]||: the size of each neuron's write into the next layer."""
+        a, _, _ = self.acts(x)
+        wn = torch.cat([self.W["fc2"].norm(dim=0), self.W["fc3"].norm(dim=0)])
+        return a.abs() * wn
+
+
+def load_neurons(path: Path = DATA / "mlp.pt") -> Neurons:
+    sd = torch.load(path, map_location="cpu")
+    return Neurons(
+        W={m: sd[f"{m}.weight"] for m in MODULES},
+        b={m: sd[f"{m}.bias"] for m in MODULES},
+    )

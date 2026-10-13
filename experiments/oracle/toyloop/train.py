@@ -2,9 +2,9 @@
 
 Data: examples {"prompt", "completion", "meta"} built from toys (render.render + render.target_text; meta carries the
 toy's name and truth). Sources: synthetic:N (render.synthetic), planted:DIR (toys/planted.py checkpoints with truth from
---truth JSON {name: truth}), zoo:MANIFEST (render.load_zoo).
+--truth JSON {name: truth}), zoo:MANIFEST[@split] (render.load_zoo; split train, test_instance, test_family).
 
-  python3 -B experiments/oracle/toyloop/train.py sft --data zoo:$HOME/mpd-data/toy_zoo/manifest.jsonl --out ckpt/sft --steps 500
+  python3 -B experiments/oracle/toyloop/train.py sft --data zoo:$HOME/mpd-data/toy_zoo/manifest.jsonl@train --out ckpt/sft --steps 500
   python3 -B experiments/oracle/toyloop/train.py rl  --data zoo:... --init ckpt/sft --out ckpt/rl --steps 200 --k 4 --reward f1
 
 RL: per prompt k samples; advantage = reward - group mean (divided by the group std with --std); loss = -mean over
@@ -41,8 +41,9 @@ def examples(spec: str, truth_json: str | None = None) -> list[dict]:
     elif kind == "planted":
         truth = json.loads(Path(truth_json).read_text()) if truth_json else {}
         toys = [render.from_planted(p, truth.get(p.stem)) for p in sorted(Path(arg).expanduser().glob("*.pt"))]
-    elif kind == "zoo":
-        toys = render.load_zoo(Path(arg).expanduser())
+    elif kind == "zoo":                              # zoo:MANIFEST or zoo:MANIFEST@split
+        path, _, split = arg.partition("@")
+        toys = render.load_zoo(Path(path).expanduser(), split or None)
     else:
         raise ValueError(spec)
     return [{"prompt": render.render(t), "completion": render.target_text(t.truth) if t.truth else None,

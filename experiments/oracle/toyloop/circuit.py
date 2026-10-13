@@ -94,7 +94,8 @@ def units_to_answer(c: Circuit, toy, positions: list[int] | None = None, text: i
     """goal_eval.circuit's answer JSON for a unit circuit on toy.texts[text]: every piece of every unit at every position
     in `positions` (default: all of the text; a head's pieces at the positions where they act are a subset), the token
     units as ["tok", 0, position] at the positions holding that token, complete=True (the unit edges are kept under
-    "unit_edges" for an edge-level scorer)."""
+    "unit_edges" for an edge-level scorer). Node order is goal_eval's JSON [site, piece, position]; native.Graph and the
+    zoo's gt_nodes use (site, position, piece). On zoo copy_offset instances the truth's units cover every gt node."""
     ids = toy.texts[text]
     pos = positions if positions is not None else list(range(len(ids)))
     nodes = []

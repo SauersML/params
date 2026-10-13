@@ -2228,7 +2228,9 @@ def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget:
 
     def refusal(r) -> tuple[float, str]:
         if "family" in r:  # the floors acceptance (--accept changed,floors): one family's score under its floor
-            return (r.get("floor") or 0.0) - (r.get("score") or 0.0), (
+            if r.get("score") is None:  # the family could not be scored without the removed units (96 of 16,230 in S2's)
+                return r.get("floor") or 0.0, f"removing {what(r['removed'])} leaves the {r['family']} family unscored: kept."
+            return (r.get("floor") or 0.0) - r["score"], (
                 f"removing {what(r['removed'])} drops the {r['family']} family to {r['score']:.2f}, below its floor {r['floor']:.2f}: kept.")
         if "phi" in r:
             short = (r.get("floor") or 0.0) - (r.get("phi") or 0.0)

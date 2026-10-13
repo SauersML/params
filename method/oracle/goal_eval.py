@@ -983,7 +983,7 @@ class Text:
         # time) and puts its minimal pairs [(position, source token)] first in every family's changed-text draws
         beh = (task or {}).get("behavior") or {}
         if hasattr(nat.target, "set_behavior"):
-            nat.target.set_behavior(beh.get("tokens"))
+            nat.target.set_behavior(beh.get("tokens"), self.targets)
         self.behavior_pairs = [(int(p), int(z)) for p, z in beh.get("pairs", [])]
         self.rec, self.states = nat._model_record(self.ids)
         self.ref = nat.reference([self.ids], self.targets)

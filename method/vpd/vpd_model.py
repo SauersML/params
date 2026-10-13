@@ -104,7 +104,7 @@ class Target(nn.Module):
         self.eps = float(cfg["rms_norm_eps"])
         self.register_buffer("wte", sd["wte.weight"])
         self.register_buffer("ln_f", sd["ln_f.weight"])
-        self.behavior, self.behavior_tokens = None, None  # set_behavior's logit mask [V] and its tokens (None: off)
+        self.behavior, self.behavior_tokens, self.behavior_at = None, None, None  # set_behavior's mask [V], tokens, positions
         self.norms = nn.ParameterList()
         self.sites = nn.ModuleDict()
         for i in range(self.n_layer):
@@ -177,11 +177,14 @@ class Target(nn.Module):
         out = h @ self.wte.T
         return out if self.behavior is None else out + self.behavior
 
-    def set_behavior(self, tokens: list[int] | None) -> None:
+    def set_behavior(self, tokens: list[int] | None, at: list[int] | None = None) -> None:
         """The behavior-targeted mode (#2951, the lead's 10-13: "why is over are?"): every logit outside tokens lowered
         by BEHAVIOR_OFF, so each next-token distribution is the one over tokens alone (the others' probability 0 to
         float32: every KL computed from them is the KL of the behavior's distribution, a divergence of its log-odds for
-        two tokens), shapes and token ids unchanged; None restores the whole distribution."""
+        two tokens), shapes and token ids unchanged; None restores the whole distribution. at: the text's target positions,
+        the predictions the behavior is about (Native.reference reads every other position's whole distribution: the
+        changed-input samplers' predictions at a context position)."""
+        self.behavior_at = frozenset(int(p) for p in at) if at else None
         if not tokens:
             self.behavior, self.behavior_tokens = None, None
             return

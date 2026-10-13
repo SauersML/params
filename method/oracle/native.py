@@ -492,6 +492,14 @@ class Native:
         """log p of the model at the targets of each sequence [B, len(targets), V]. When the model is plain(), a call
         repeated with the same sequences and targets returns the first call's tensor (the same numbers; callers never
         write to it), kept up to REFERENCE_BYTES."""
+        at = getattr(self.target, "behavior_at", None)
+        if getattr(self.target, "behavior", None) is not None and at is not None and not set(targets) <= at:
+            held = self.target.behavior, self.target.behavior_tokens  # a prediction the behavior is not about: the whole one
+            self.target.behavior, self.target.behavior_tokens = None, None
+            try:
+                return self.reference(ids, targets)
+            finally:
+                self.target.behavior, self.target.behavior_tokens = held
         key = (tuple(map(tuple, ids)), tuple(targets), getattr(self.target, "behavior_tokens", None)) if self.plain() else None
         if key is not None and key in self._refs:
             self._refs.move_to_end(key)

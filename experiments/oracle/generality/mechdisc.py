@@ -52,6 +52,9 @@ TEXTS = Path.home() / "mpd-data/graph_oracle/texts/vpd4l"
 DEV = [f"text{i}" for i in range(9000, 9100)]  # the development texts (text9100-9149 is the sealed final test)
 SEALED = re.compile(r"text91[0-4][0-9][.]json")
 W, DRAWS, DROP, QUIET, FAR, P_MIN, PER_TEXT, CANDS = 96, 8, 1.0, 0.25, 8, 0.3, 4, 12
+MAX_PAIRS = 40  # copy-bigram pairs taken into the teacher runs (of every confirmed pair)
+KINDS = tuple(os.environ.get("MD_KINDS", "copy,bigram,context").split(","))  # find: the kinds searched
+CANDS = int(os.environ.get("MD_CANDS", CANDS))  # find: candidates confirmed per text and kind
 CORE_A = [("h.1.attn.q_proj", 316), ("h.0.mlp.c_fc", 53), ("h.1.mlp.c_fc", 2103), ("h.2.attn.k_proj", 206)]
 CORE_O = [("h.1.attn.k_proj", 329), ("h.1.attn.k_proj", 119)]
 TEACHER_FLAGS = ["--f1-start", "set", "--accept-mode", "pp", "--accept-draws", "fv", "--phi-check", "--rank", "once",
@@ -95,7 +98,7 @@ def find(k: int = 0, P: int = 1):
     import native
 
     nat = native.Native()
-    out = OUTROOT / f"mechdisc_found_{k}{os.environ.get('GEN_TAG', '')}.jsonl"
+    out = OUTROOT / f"mechdisc_found_{k}{'_' + '_'.join(KINDS) if KINDS != ('copy', 'bigram', 'context') else ''}{os.environ.get('GEN_TAG', '')}.jsonl"
     done = {json.loads(x)["text"] for x in out.read_text().splitlines() if '"done"' in x} if out.exists() else set()
     for name in DEV[k::P]:
         if name in done or not (TEXTS / f"{name}.json").exists():
@@ -118,7 +121,7 @@ def find(k: int = 0, P: int = 1):
                 cands["bigram"].append(t)
                 cands["context"].append(t)
         rows = []
-        for kind in ("copy", "bigram", "context"):
+        for kind in KINDS:
             pick = [cands[kind][i] for i in rng.permutation(len(cands[kind]))[:CANDS]]
             for t in sorted(pick):
                 s = max(0, t - W + 1)
@@ -169,7 +172,7 @@ def pairs():
     found = []
     roots = [Path("/Users/user/mpd-data/runpod"), Path("/Users/user/mpd-data/cluster")]
     runs = sorted(p for r in roots if r.exists() for p in r.glob("oracle-graph-generality*/out/mechdisc_found_*.jsonl"))
-    for p in [DATA / "mechdisc_found_0.jsonl"] + runs:
+    for p in runs:
         if p.exists():
             found += [json.loads(x) for x in p.read_text().splitlines() if '"done"' not in x]
     seen, items = set(), []
@@ -203,6 +206,12 @@ def pairs():
                     used.add((r["kind"], r["text"], r["t"]))
                     per_text[r["text"]] += 1
                 out.append({"contrast": f"{a_kind}-bigram", "y": y, "items": [ra, rb]})
+    cb = [p_ for p_ in out if p_["contrast"] == "copy-bigram"]
+    rng.shuffle(cb)
+    paired = {(r["kind"], r["text"], r["t"]) for p_ in out if p_["contrast"] == "context-bigram" for r in p_["items"]}
+    solo = [{"contrast": "context", "y": r["y"], "items": [r]} for r in items
+            if r["kind"] == "context" and (r["kind"], r["text"], r["t"]) not in paired]
+    out = cb[:MAX_PAIRS] + [p_ for p_ in out if p_["contrast"] == "context-bigram"] + solo
     tdir = DATA / "mechdisc_texts"
     tdir.mkdir(exist_ok=True)
     names = set()
@@ -226,7 +235,7 @@ def pairs():
 def texts_root() -> Path:
     import native
 
-    root = OUTROOT / "mechdisc_root"
+    root = DATA / "mechdisc_root"  # (not under the synced outputs: it links every text)
     d = root / "vpd4l"
     d.mkdir(parents=True, exist_ok=True)
     real = native.TEXTS / "vpd4l"
@@ -360,7 +369,13 @@ if __name__ == "__main__":
     ap.add_argument("args", nargs="*")
     ap.add_argument("--name", default=None)
     ap.add_argument("--answers", type=Path, default=None)
+    ap.add_argument("--kinds", default=None, help="find: the kinds searched (comma-separated)")
+    ap.add_argument("--cands", type=int, default=None, help="find: candidates confirmed per text and kind")
     a = ap.parse_args()
+    if a.kinds:
+        KINDS = tuple(a.kinds.split(","))
+    if a.cands:
+        CANDS = a.cands
     if a.cmd == "find":
         find(*(int(x) for x in a.args))
     elif a.cmd == "pairs":

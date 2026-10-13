@@ -40,6 +40,8 @@ does not run: same-class tokens leave the prediction, other-class tokens move it
   falsify.py score KIND TASK [T]  -> DATA/falsify.jsonl (KIND copy or mistake; T the mistake's target position)
   falsify.py vars KIND TASK [T]   -> DATA/falsify_vars.jsonl
   falsify.py report
+  falsify.py background KIND TASK [T]  -> falsify_bg.jsonl: the copy core with the generic target parts as background
+  falsify.py background_report
 """
 import argparse
 import collections
@@ -529,6 +531,81 @@ def report():
     return out
 
 
+GENERIC_T = [("h.1.mlp.c_fc", 2103), ("h.3.mlp.down_proj", 3532), ("h.3.attn.o_proj", 806), ("h.1.attn.q_proj", 316),
+             ("h.0.mlp.c_fc", 53)]  # inframove's always-on parts at the target (94% of the influential sets' control damage)
+CORE_A = [("h.1.attn.q_proj", 316), ("h.0.mlp.c_fc", 53), ("h.1.mlp.c_fc", 2103)]  # the copy core at a
+CORE_O = [("h.1.attn.k_proj", 329), ("h.1.attn.k_proj", 119)]  # and at o
+T_READS = ["h.2.attn.q_proj", "h.2.attn.o_proj"]  # the target's reads of a (layer 2's query and output there)
+
+
+def background(e: dict):
+    """The copy core's transfer with the generic target parts held as background (the lead's 10-13): the five
+    always-on parts at the target (GENERIC_T) are in every circuit and credited to no mechanism; copying is credited
+    with the core at a and o (CORE_A, CORE_O) and the target's reads (VPD's actives at t in T_READS). Circuits
+    (complete): background; background + core; background + the core at the source-moved position (falsify's (a));
+    background + every active at t (the target's own computation). Each scored alone by fidelity in reward mode on
+    the eval split and goal_eval.circuit_term -> falsify_bg.jsonl."""
+    import goal_eval
+    import native
+    import torch
+
+    ge = goal_eval.GoalEval(native.Native())
+    ge.nat.LENGTHS_KEPT = 1
+    nat = ge.nat
+    tx = text_of(ge, e)
+    t, a = e["t"], e["a"]
+    reads = [(n, t, int(c)) for n in T_READS for c in tx.vpd[n][t].nonzero().flatten().tolist()]
+    bg = [(n, t, c) for n, c in GENERIC_T]
+    core = lambda q: [(n, q, c) for n, c in CORE_A] + [(n, q - 1, c) for n, c in CORE_O] + reads  # noqa: E731
+    acts = [(n, t, int(c)) for n in nat.names for c in tx.vpd[n][t].nonzero().flatten().tolist()]
+    variants = {"background": bg, "background_core": bg + core(a), "background_target_actives": bg + acts}
+    if e.get("moved"):
+        variants["background_core_moved"] = bg + core(e["moved"])
+    graphs = {k: native.Graph(sorted(set(v)), complete=True) for k, v in variants.items()}
+    P, S = nat.positions(tx.targets), sum(nat.C.values())
+    pool = torch.load(POOL, weights_only=False) if POOL.exists() else None
+    tau = ge.tau(tx, pool, "eval")
+    with out_path("falsify_bg").open("a") as f:
+        for k, g in graphs.items():
+            r = ge.fidelity(tx, [g], pool=pool, mode="reward", split="eval")[0]
+            native.free(nat.dev)
+            b = goal_eval.size_bits(g, P, S, tx.targets)
+            ct = goal_eval.circuit_term(r, tau, b)
+            f.write(json.dumps({"kind": e["kind"], "task": e["task"], "t": t, "variant": k, "R": ct["term"], "phi": ct["phi_full"],
+                                "phi_tau": tau["phi_tau"], "bits": b, "nodes": g.count(),
+                                **{f"s_{fm}": goal_eval.family_score(r, fm) for fm in goal_eval.PHI_FAMILIES}}) + "\n")
+            print(e["task"], k, round(ct["term"], 3), round(ct["phi_full"] or 0, 3), flush=True)
+
+
+def background_report():
+    import templates
+
+    rows = []
+    for p in [DATA / "falsify_bg.jsonl"] + templates.run_outputs("falsify_bg*.jsonl"):
+        if p.exists():
+            rows += [json.loads(x) for x in p.read_text().splitlines()]
+    by = collections.defaultdict(dict)
+    for r in rows:
+        by[(r["kind"], r["task"])].setdefault(r["variant"], r)
+    for kind in ("copy", "mistake"):
+        ds = [d for k, d in by.items() if k[0] == kind]
+        if not ds:
+            continue
+        print(f"== {kind} texts: {len(ds)}")
+        for v in ("background", "background_core", "background_core_moved", "background_target_actives"):
+            xs = [d[v] for d in ds if v in d]
+            if xs:
+                print(f"   {v:28s} R {np.mean([x['R'] for x in xs]):6.2f}  phi {np.mean([x['phi'] for x in xs]):5.2f}  point "
+                      f"{np.mean([x['s_point'] or 0 for x in xs]):.2f}  track_pp {np.mean([x['s_track_pp'] or 0 for x in xs]):.2f}  "
+                      f"bits {np.mean([x['bits'] for x in xs]):8.0f}")
+        for a_, b_ in (("background_core", "background"), ("background_core", "background_core_moved")):
+            for m in ("R", "phi", "s_point", "s_track_pp"):
+                w = [1.0 if d[a_][m] > d[b_][m] + 1e-9 else 0.5 if abs(d[a_][m] - d[b_][m]) <= 1e-9 else 0.0
+                     for d in ds if a_ in d and b_ in d and d[a_].get(m) is not None and d[b_].get(m) is not None]
+                gain = [d[a_][m] - d[b_][m] for d in ds if a_ in d and b_ in d and d[a_].get(m) is not None and d[b_].get(m) is not None]
+                print(f"   {a_} > {b_} on {m}: {np.mean(w):.2f} (mean gain {np.mean(gain):+.3f}, n={len(w)})")
+
+
 CIRCUIT_EPS = 0.1  # bits of phi an oracle circuit must beat every variant by (the final evaluation's margin)
 
 
@@ -666,7 +743,7 @@ def circuits(answers_path: Path, out_path: Path, eps: float = CIRCUIT_EPS):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", nargs="?", choices=("build", "score", "vars", "values", "report"))
+    ap.add_argument("cmd", nargs="?", choices=("build", "score", "vars", "values", "report", "background", "background_report"))
     ap.add_argument("args", nargs="*")
     ap.add_argument("--only", default=None, help="score: these variants only (comma-separated)")
     ap.add_argument("--circuits", type=Path, help="oracle answers (JSONL: task, sample, text): the general falsification")
@@ -681,6 +758,10 @@ if __name__ == "__main__":
         score(find(*a.args), a.only.split(",") if a.only else None)
     elif a.cmd == "vars":
         variables_test(find(*a.args))
+    elif a.cmd == "background":
+        background(find(*a.args))
+    elif a.cmd == "background_report":
+        background_report()
     elif a.cmd == "values":
         values_test(*a.args)
     else:

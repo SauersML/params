@@ -40,8 +40,9 @@ On one text, for a circuit given as a node set (goal_eval's complete graph, bloc
      node search and before its connections; see expand_circuit).
   backup.py run --split heldout --n 20 --src DIR --out OUT: expand each text's circuit in DIR, writing OUT/<set>/<task>.json
      for the path points, the refined circuit and the equal-size trivial baselines, and OUT/summary.jsonl.
-  backup.py eval --out OUT: goal_eval.fidelity_report (full mode, eval draws) on OUT's sets and the source set, then a
-     table with phi against the source (start) row of each text.
+  backup.py eval --out OUT: C's families in the reward's form on the eval split's draws (goal_eval.GoalEval.fidelity) for
+     the source set (the start) and OUT's sets, every set by the same families (the connection-cut family left out:
+     see evaluate), then a table with phi against each text's start row.
 """
 from __future__ import annotations
 
@@ -396,15 +397,17 @@ class Backup:
         rec["seconds"] = time.perf_counter() - t0
         return rec
 
-    def refine(self, blocks: list, keep: float = KEEP, log=None) -> dict:
-        """Each taken block (in the order taken) replaced by the circuit's subcomponents there and the block's outside
-        subcomponents in the screen's order (at the expansion without that block), the shortest prefix of 1, 2, 4, ...
-        whose J keeps at least keep x the block's gain, taken when it costs fewer bits than the block. {"blocks": the
-        blocks kept, "extra": the subcomponents taken for the others, "per_block": [per block its prefixes' sizes, J
-        and bits, the choice]}."""
+    def refine(self, blocks: list, keep: float = KEEP, only=None, log=None) -> dict:
+        """Each taken block (in the order taken; with only, those in it) replaced by the circuit's subcomponents there
+        and the block's outside subcomponents in the screen's order (at the expansion without that block), the shortest
+        prefix of 1, 2, 4, ... whose J keeps at least keep x the block's gain, taken when it costs fewer bits than the
+        block. {"blocks": the blocks kept, "extra": the subcomponents taken for the others, "per_block": [per block its
+        prefixes' sizes, J and bits, the choice]}. At a circuit position whose members are VPD's actives there (an
+        influential set) no prefix is cheaper: the block costs its name and those actives, a prefix the actives and
+        each subcomponent it adds; refine pays off at other positions."""
         nat = self.nat
         kept, extra, per = list(map(tuple, blocks)), set(), []
-        for b in list(map(tuple, blocks)):
+        for b in [x for x in map(tuple, blocks) if only is None or x in set(map(tuple, only))]:
             others = frozenset(x for x in kept if x != b)
             full = self.score([(frozenset(kept), frozenset(extra))])[0]
             without = self.score([(others, frozenset(extra))])[0]
@@ -538,7 +541,7 @@ def expand_circuit(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Gra
         if (rec["prune"]["final"]["j"] or 0.0) > (jf or 0.0):
             blocks, rec["chosen"] = [tuple(b) for b in rec["prune"]["blocks"]], "back"
     if refine and blocks:
-        rec["refine"] = bk.refine(blocks, log=log)
+        rec["refine"] = bk.refine(blocks, only=[b for b in blocks if b[1] not in set(bk.positions)], log=log)
         blocks, extra = [tuple(b) for b in rec["refine"]["blocks"]], [tuple(x) for x in rec["refine"]["extra"]]
     rec["start"] = rec["expand"]["start"]
     rec["final"] = bk.score([(frozenset(blocks), frozenset(extra))])[0]
@@ -603,8 +606,10 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
         fwd = [tuple(b) for b in ex["blocks"]]
         jf = ex["steps"][-1]["j"] if ex["steps"] else ex["start"]["j"]
         blocks = [tuple(b) for b in back["blocks"]] if (back["final"]["j"] or 0.0) > (jf or 0.0) else fwd
-        rf = bk.refine(blocks, log=lambda s: log(s)) if blocks else {"blocks": [], "extra": [], "per_block": []}
-        interp = bk.interpret(rf["per_block"]) if rf["per_block"] else []
+        far = [b for b in blocks if b[1] not in set(bk.positions)]   # refine replaces only blocks off the circuit's positions
+        rf = bk.refine(blocks, only=far, log=lambda s: log(s)) if far else {"blocks": list(blocks), "extra": [], "per_block": []}
+        diag = bk.refine(fwd[:4], log=lambda s: log(s)) if fwd else {"per_block": []}   # forward's first blocks: what carries them
+        interp = bk.interpret(diag["per_block"] + rf["per_block"]) if diag["per_block"] + rf["per_block"] else []
         sets = {f"b{k}": ([tuple(b) for b in ex["step_blocks"][k - 1]], []) for k in (1, 2, 4) if k <= len(ex["step_blocks"])}
         sets["fwd"] = (fwd, [])
         sets["back"] = ([tuple(b) for b in back["blocks"]], [])
@@ -624,7 +629,7 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
             (out / name).mkdir(exist_ok=True)
             (out / name / f"{p.stem}.json").write_text(json.dumps(goal_eval.to_json(bk.graph(frozenset(b), frozenset(x)))))
         row = {"task": p.stem, "T": tx.T, "nodes": len(bk.nodes), "positions": bk.positions, "bits_start": bk.bits(),
-               "expand": ex, "prune": back, "chosen": "back" if blocks != fwd else "fwd", "refine": rf, "interpret": interp, "search": scores, "eval_units": units, "sets": {k: [list(map(list, b)), list(map(list, x))] for k, (b, x) in sets.items()},
+               "expand": ex, "prune": back, "chosen": "back" if blocks != fwd else "fwd", "refine": rf, "refine_fwd": diag["per_block"], "interpret": interp, "search": scores, "eval_units": units, "sets": {k: [list(map(list, b)), list(map(list, x))] for k, (b, x) in sets.items()},
                "measured": bk.measured, "seconds": time.perf_counter() - t0}
         with open(out / "summary.jsonl", "a") as fh:
             fh.write(json.dumps(row) + "\n")
@@ -635,38 +640,92 @@ def run(split: str, n: int, src: Path, out: Path, offset: int = 0, stride: int =
 
 
 def evaluate(split: str, n: int, src: Path, out: Path, sets=("fwd", "back", "b1", "rand", "allpos", "vpdbits"),
-             offset: int = 0, stride: int = 1, log=print) -> Path:
-    """goal_eval.fidelity_report in full mode on the eval split's draws for the source set ("start") and out's sets,
-    appended to out/fidelity.jsonl (VPD's top k at each size added by the report; "full" is fwd or back, per the
-    summary's "chosen")."""
-    pool = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt"
-    fresh = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt"
-    have = {"start": src} | {s: out / s for s in sets if (out / s).is_dir()}
-    goal_eval.fidelity_report(split, n, have, pool, out / "fidelity.jsonl", fresh=fresh, offset=offset, stride=stride, log=log)
-    return out / "fidelity.jsonl"
+             offset: int = 0, stride: int = 1, draws: int = goal_eval.DRAWS, log=print) -> Path:
+    """C's families as the reward scores them, on the eval split's draws (goal_eval.GoalEval.fidelity, mode "reward",
+    split "eval": point, nodes, flips at FLIP_TERM, track_pp, interchange_pp, donors near and far, pattern and phi's N,
+    n_spec), for the start (src's circuit) and out's sets, one fidelity call per text so every set meets the same
+    draws; a set whose node set equals an earlier one's is scored once and its row copied ("same_as"). The
+    connection-cut family is left out for every set: on a complete graph it lists every connection among its nodes
+    (native.all_edges), and a block's thousands of subcomponents make that list hundreds of millions long (as full
+    mode's leak diagnostic, a stated graph of the nodes with no edge). Rows (task, kind, nodes, blocks, size_bits,
+    phi and phi_tau against the start's row, the fidelity fields) appended to out/fidelity.jsonl; texts already there
+    skipped."""
+    ge = goal_eval.GoalEval()
+    nat = ge.nat
+    pool = torch.load(Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt")
+    ge._edge_family = lambda tx, graphs, draws, reads=False: [{"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None}
+                                                              for _ in graphs]
+    f_out = out / "fidelity.jsonl"
+    done = {json.loads(x)["task"] for x in f_out.read_text().splitlines() if x.strip()} if f_out.exists() else set()
+    for p in native.tasks(split)[:n][offset::stride]:
+        files = {"start": src / f"{p.stem}.json"} | {k: out / k / f"{p.stem}.json" for k in sets}
+        files = {k: f for k, f in files.items() if f.exists()}
+        if p.stem in done or "start" not in files or len(files) < 2:
+            continue
+        t0 = time.perf_counter()
+        ids, targets = native.text(p)
+        tx = ge.text(ids, targets, native.task_seed(p.stem))
+        graphs, kinds, alias, seen = [], [], {}, {}
+        for kind, f in files.items():
+            g, _ = goal_eval.circuit(json.loads(f.read_text()), targets, nat.C, tx.T)
+            key = frozenset(goal_eval.expand_blocks(g, nat.C).node_set())
+            if key in seen:
+                alias[kind] = seen[key]
+                continue
+            seen[key] = kind
+            graphs.append(g)
+            kinds.append(kind)
+        fid = ge.fidelity(tx, graphs, pool, draws=draws, mode="reward", split="eval")
+        start_row = fid[0]
+        rows = {}
+        for kind, g, f in zip(kinds, graphs, fid):
+            row = {"task": p.stem, "kind": kind, "nodes": g.count(), "blocks": sum(nd[2] == BLOCK for nd in g.node_set()),
+                   "size_bits": goal_eval.size_bits(g, nat.positions(targets), sum(nat.C.values()), targets, active=tx.vpd), **f}
+            row["phi"], row["phi_tau"] = goal_eval.phi(row, start=start_row)
+            rows[kind] = row
+        for kind, same in alias.items():
+            rows[kind] = {**rows[same], "kind": kind, "same_as": same}
+        with open(f_out, "a") as fh:
+            for row in rows.values():
+                fh.write(json.dumps(row, default=float) + "\n")
+        if log:
+            log(f"{p.stem}: {len(graphs)} circuits ({len(alias)} the same as another), {time.perf_counter() - t0:.0f} s")
+        del tx
+        native.free(nat.dev)
+    return f_out
 
 
 def table(out: Path) -> str:
-    """Per set, medians over the texts of s_nodes, overstate_nodes, phi (goal_eval.phi with the text's start row),
-    s_track_pp, s_point_c, c and size_bits, beside the start's; and the paired difference from the start."""
+    """Per set, medians over the texts of s_nodes, overstate_nodes, phi (against the text's start row), s_track_pp,
+    s_point_c, c and size_bits, with the paired median differences from the start; "full" is each text's chosen
+    expansion (fwd or back, the summary's "chosen")."""
     rows = [json.loads(x) for x in (out / "fidelity.jsonl").read_text().splitlines() if x.strip()]
+    chosen = {}
+    if (out / "summary.jsonl").exists():
+        chosen = {json.loads(x)["task"]: json.loads(x).get("chosen") for x in (out / "summary.jsonl").read_text().splitlines() if x.strip()}
     start = {r["task"]: r for r in rows if r["kind"] == "start"}
-    keys = ("s_nodes", "overstate_nodes", "phi", "s_track_pp", "s_point_c", "c", "size_bits", "nodes")
     by: dict = {}
     for r in rows:
-        if r["task"] not in start:
+        if r["task"] in start:
+            by.setdefault(r["kind"], []).append(r)
+            if chosen.get(r["task"]) == r["kind"]:
+                by.setdefault("full", []).append(r)
+    keys = ("s_nodes", "overstate_nodes", "phi", "s_track_pp", "s_point_c", "c", "size_bits", "nodes")
+    lines = ["set".ljust(9) + "".join(k[:11].rjust(12) for k in keys) + "   d_s_nodes   d_phi   d_bits  texts"]
+    for kind in ["start", "full", "fwd", "back", "b1", "rand", "allpos", "vpdbits"] + sorted(set(by) - {"start", "full", "fwd", "back", "b1", "rand", "allpos", "vpdbits"}):
+        rs = by.get(kind)
+        if not rs:
             continue
-        r = dict(r)
-        r["phi"] = goal_eval.phi(r, start=start[r["task"]])[0]
-        kind = r["kind"] if not r["kind"].startswith("VPD top") else "VPD top k"
-        by.setdefault(kind, []).append(r)
-    lines = ["set".ljust(12) + "".join(k[:10].rjust(12) for k in keys) + "   d_s_nodes  d_phi  texts"]
-    for kind, rs in sorted(by.items()):
-        med = [np.median([x[k] for x in rs if x.get(k) is not None]) if any(x.get(k) is not None for x in rs) else float("nan") for k in keys]
-        ds = [x["s_nodes"] - start[x["task"]]["s_nodes"] for x in rs if x.get("s_nodes") is not None and start[x["task"]].get("s_nodes") is not None]
-        dp = [x["phi"] - goal_eval.phi(start[x["task"]], start=start[x["task"]])[0] for x in rs if x.get("phi") is not None]
-        lines.append(kind[:12].ljust(12) + "".join(f"{v:12.3f}" if abs(v) < 1e5 else f"{v:12.0f}" for v in med)
-                     + f"   {np.median(ds) if ds else float('nan'):+.3f}  {np.median(dp) if dp else float('nan'):+.3f}  {len(rs)}")
+        med = []
+        for k in keys:
+            xs = [x[k] for x in rs if x.get(k) is not None]
+            med.append(float(np.median(xs)) if xs else float("nan"))
+
+        def d(k):
+            xs = [x[k] - start[x["task"]][k] for x in rs if x.get(k) is not None and start[x["task"]].get(k) is not None]
+            return float(np.median(xs)) if xs else float("nan")
+        lines.append(kind[:9].ljust(9) + "".join(f"{v:12.3f}" if abs(v) < 1e4 else f"{v:12.0f}" for v in med)
+                     + f"   {d('s_nodes'):+9.3f} {d('phi'):+7.3f} {d('size_bits'):+8.0f}  {len(rs)}")
     return "\n".join(lines)
 
 

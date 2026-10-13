@@ -151,9 +151,11 @@ def test_expand_records_its_path(tiny):
     bk2 = backup.Backup(ge, tx, circuit, draws=4)
     extra = frozenset(nd for nd in g.node_set() if nd[2] != goal_eval.BLOCK) - circuit.node_set()
     assert abs(bk2.score([(frozenset(blocks), extra)])[0]["j"] - r2["final"]["j"]) < 1e-6
-    if r2["refine"]:  # interpret's rows: one per refined block, cosines in [0, 1], heads only for attention sites
-        rows = bk2.interpret(r2["refine"]["per_block"], top=4)
-        assert len(rows) == len(r2["refine"]["per_block"])
+    if rec["blocks"]:  # interpret's rows: one per refined block, cosines in [0, 1], heads only for attention sites
+        diag = bk.refine(rec["blocks"][:2])
+        assert len(diag["per_block"]) == len(rec["blocks"][:2])
+        rows = bk.interpret(diag["per_block"], top=4)
+        assert len(rows) == len(diag["per_block"])
         for row in rows:
             assert row["read_cos_comp"] is None or 0 <= row["read_cos_comp"] <= 1 + 1e-6
             assert ("heads_comp" in row) == (row["block"][0].split(".")[-1] in ("o_proj", "v_proj", "q_proj", "k_proj"))

@@ -322,6 +322,35 @@ def sample(a) -> None:
                       "wall_seconds": round(time.perf_counter() - t0, 1)}), flush=True)
 
 
+def devscore(a) -> None:
+    """Each checkpoint of an RL run (LOG/checkpoints.jsonl) without LOG/devscore_<step>.json: one answer to each of the
+    first --n dev questions (sample()), each question's answers posted to the environment's scorer (--scorer, with
+    --request-extra), {"step", "reward": the mean (an invalid answer at its scored reward), "valid", "per_question":
+    [{"task", "reward", "valid"}]} written: the dev monitor of an environment without components' evaluation."""
+    import argparse as _argparse
+
+    extra = json.loads(a.request_extra) if a.request_extra else {}
+    for ck in map(json.loads, (a.log / "checkpoints.jsonl").read_text().splitlines()):
+        out = a.log / f"devscore_{ck['step']}.json"
+        if out.exists():
+            continue
+        got = a.log / f"devscore_{ck['step']}_samples.jsonl"
+        sample(_argparse.Namespace(questions=a.questions, out=got, init=ck["state"], base=ck.get("base", a.base), n=a.n,
+                                   samples=1, max_tokens=a.max_tokens, thinking=a.thinking, prefix=""))
+        by = {}
+        for r in map(json.loads, got.read_text().splitlines()):
+            by.setdefault(r["task"], []).append(r)
+        per = []
+        for task, rs in by.items():
+            req = {"task": task, "answers": [r["text"] for r in rs], "lines": False,
+                   "tokens": [r["tokens"] - (r.get("thinking_tokens") or 0) for r in rs], **extra}
+            for sc in httpx.post(a.scorer, json=req, timeout=None).json()["scores"]:
+                per.append({"task": task, "reward": sc["reward"], "valid": sc.get("valid")})
+        out.write_text(json.dumps({"step": ck["step"], "reward": sum(x["reward"] for x in per) / max(len(per), 1),
+                                   "valid": sum(bool(x["valid"]) for x in per) / max(len(per), 1), "per_question": per}))
+        print(json.dumps({"step": ck["step"], "dev_reward": json.loads(out.read_text())["reward"]}), flush=True)
+
+
 def readers(a) -> None:
     """E1 of every sample with reader A (the reward's), and the evaluation's controls on each question's first sample:
     another question's English read on this text with this sample's circuit (shuffled; each question takes the next
@@ -822,6 +851,15 @@ def main():
     m.add_argument("--max-tokens", type=int, default=4096)
     m.add_argument("--thinking", action="store_true", help="sample in Qwen3's thinking mode (the answer is the text after it)")
     m.add_argument("--prefix", default="", help="the answer's opening text, given (an ablation's: \"CIRCUIT:\\nANSWER 1:\\n\")")
+    v = sub.add_parser("devscore", help="each RL checkpoint's mean reward on dev questions, scored by the environment's scorer")
+    v.add_argument("questions", type=Path, help="the environment's dev question rows")
+    v.add_argument("--log", type=Path, required=True, help="the RL run's directory (checkpoints.jsonl)")
+    v.add_argument("--scorer", required=True)
+    v.add_argument("--request-extra", help="JSON fields added to every scoring request")
+    v.add_argument("--base", default="Qwen/Qwen3-8B")
+    v.add_argument("--n", type=int, default=50, help="dev questions")
+    v.add_argument("--max-tokens", type=int, default=8192)
+    v.add_argument("--thinking", action="store_true")
     e = sub.add_parser("readers")
     e.add_argument("samples", type=Path)
     e.add_argument("questions", type=Path)
@@ -841,7 +879,7 @@ def main():
     x.add_argument("--max-tokens", type=int, default=400)
     x.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     a = ap.parse_args()
-    {"sft": sft, "rl": rl, "sample": sample, "readers": readers, "explain": explain, "score": score}[a.cmd](a)
+    {"sft": sft, "rl": rl, "sample": sample, "readers": readers, "explain": explain, "score": score, "devscore": devscore}[a.cmd](a)
 
 
 if __name__ == "__main__":

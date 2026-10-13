@@ -76,3 +76,31 @@ def test_environments_load_mix_by_weight_and_scale_by_their_own_spread(tmp_path)
     assert tt.draw(one, 4, random.Random(0)) == random.Random(0).sample(envs["circuit"]["questions"], 4)  # as before envs
     s = tt.env_scales([("circuit", [1.0, -1.0]), ("edits", [0.1, -0.1]), ("flat", [0.0, 0.0])])
     assert s["circuit"] == pytest.approx(1.0) and s["edits"] == pytest.approx(10.0) and s["flat"] == 1.0
+
+
+def test_devscore_scores_each_new_checkpoint_once_with_the_environments_request(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    (tmp_path / "checkpoints.jsonl").write_text(json.dumps({"step": 0, "state": "s0", "base": "b"}) + "\n" +
+                                                json.dumps({"step": 5, "state": "s5", "base": "b"}) + "\n")
+    (tmp_path / "devscore_0.json").write_text(json.dumps({"step": 0, "reward": 0.0}))
+    sampled, posted = [], []
+
+    def fake_sample(ns):
+        sampled.append(ns.init)
+        ns.out.write_text(json.dumps({"task": "g1", "sample": 0, "text": "scale L0.fc#1 0", "tokens": 9, "thinking_tokens": 2}) + "\n")
+
+    class Reply:
+        def __init__(self, req):
+            self.req = req
+
+        def json(self):
+            return {"scores": [{"reward": 0.4, "valid": True}]}
+
+    monkeypatch.setattr(tt, "sample", fake_sample)
+    monkeypatch.setattr(tt.httpx, "post", lambda url, json, timeout: posted.append(json) or Reply(json))
+    a = SimpleNamespace(log=tmp_path, questions=tmp_path / "dev.jsonl", scorer="http://x/score", request_extra='{"part": "score"}',
+                        base="b", n=3, max_tokens=64, thinking=False)
+    tt.devscore(a)
+    assert sampled == ["s5"] and posted == [{"task": "g1", "answers": ["scale L0.fc#1 0"], "lines": False, "tokens": [7], "part": "score"}]
+    assert json.loads((tmp_path / "devscore_5.json").read_text())["reward"] == 0.4

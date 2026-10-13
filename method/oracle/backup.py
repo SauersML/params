@@ -425,11 +425,11 @@ class Backup:
         rec["seconds"] = time.perf_counter() - t0
         return rec
 
-    def refine(self, blocks: list, keep: float = KEEP, only=None, log=None) -> dict:
+    def refine(self, blocks: list, keep: float = KEEP, only=None, log=None, cheaper: bool = True) -> dict:
         """Each taken block (in the order taken; with only, those in it) replaced by the circuit's subcomponents there
         and the block's outside subcomponents in the screen's order (at the expansion without that block), the shortest
         prefix of 1, 2, 4, ... whose J keeps at least keep x the block's gain, taken when it costs fewer bits than the
-        block. {"blocks": the blocks kept, "extra": the subcomponents taken for the others, "per_block": [per block its
+        block (cheaper=False: whatever it costs, for a teacher that must list subcomponents to state connections). {"blocks": the blocks kept, "extra": the subcomponents taken for the others, "per_block": [per block its
         prefixes' sizes, J and bits, the choice]}. At a circuit position whose members are VPD's actives there (an
         influential set) no prefix is cheaper: the block costs its name and those actives, a prefix the actives and
         each subcomponent it adds; refine pays off at other positions."""
@@ -454,7 +454,7 @@ class Backup:
             pts = [{"k": k, "j": r["j"], "bits": r["bits"], "s_search": r["s_search"], "f1": r["f1"]} for k, r in zip(sizes, got)]
             choice = None
             for k, r in zip(sizes, got):
-                if (r["j"] or 0.0) - (without["j"] or 0.0) >= keep * gain and r["bits"] < full["bits"]:
+                if (r["j"] or 0.0) - (without["j"] or 0.0) >= keep * gain and (r["bits"] < full["bits"] or not cheaper):
                     choice = k
                     break
             row = {"block": [n, t], "gain": gain, "block_bits": full["bits"], "without_bits": without["bits"],
@@ -575,25 +575,32 @@ def nodes_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, graphs: list, draws
 
 def expand_circuit(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, max_steps: int = MAX_STEPS,
                    min_gain: float = MIN_GAIN, backward: bool = True, refine: bool = True, draws: int = SEARCH_DRAWS,
-                   log=None) -> tuple:
+                   subcomponents: bool = False, keep: float = KEEP, log=None) -> tuple:
     """The teacher's call: (the expanded node set, its record). graph: a node set on tx (goal_eval's complete graph,
     blocks allowed), e.g. block_search's circuit before its connections are stated. The expansion is the better by J on
     the backup family's search draws of expand's forward greedy and (backward) prune's search down from every site at
     the circuit's positions as blocks, each block subsuming the circuit's subcomponents at its site and position; with
-    refine, a block a cheaper prefix of subcomponents keeps (refine's rule) is replaced by it. A teacher states
-    connections afterwards over the returned node set (its blocks are blocks: Connector's `blocks`). record:
+    refine, a block a cheaper prefix of subcomponents keeps (refine's rule) is replaced by it. With subcomponents (the
+    forward greedy alone), every taken block is replaced by its shortest prefix of outside subcomponents in the screen's
+    order keeping keep x its gain in J, whatever it costs, a block no prefix keeps staying a block: an answer a teacher
+    can wire (teacher.EDGE_NODES counts a block's every subcomponent; a forward block is 512 to 3,584 of them). A
+    teacher states connections afterwards over the returned node set (its blocks are blocks: Connector's `blocks`).
+    record:
     {"expand", "prune" (or None), "chosen", "refine" (or None), "start", "final": the expansion's score, "measured"}."""
     bk = Backup(ge, tx, graph, draws=draws)
     rec = {"expand": bk.expand(max_steps=max_steps, min_gain=min_gain, log=log), "prune": None, "refine": None, "chosen": "fwd"}
     blocks, extra = [tuple(b) for b in rec["expand"]["blocks"]], []
-    if backward:
+    if backward and not subcomponents:
         allpos = [(n, t) for t in bk.positions for n in ge.nat.names if (n, t) not in bk.blocks0]
         rec["prune"] = bk.prune(allpos, min_gain=min_gain, log=log)
         jf = rec["expand"]["steps"][-1]["j"] if rec["expand"]["steps"] else rec["expand"]["start"]["j"]
         if (rec["prune"]["final"]["j"] or 0.0) > (jf or 0.0):
             blocks, rec["chosen"] = [tuple(b) for b in rec["prune"]["blocks"]], "back"
-    if refine and blocks:
-        rec["refine"] = bk.refine(blocks, only=[b for b in blocks if b[1] not in set(bk.positions)], log=log)
+    if subcomponents and blocks:
+        rec["refine"] = bk.refine(blocks, keep=keep, log=log, cheaper=False)
+        blocks, extra = [tuple(b) for b in rec["refine"]["blocks"]], [tuple(x) for x in rec["refine"]["extra"]]
+    elif refine and blocks:
+        rec["refine"] = bk.refine(blocks, keep=keep, only=[b for b in blocks if b[1] not in set(bk.positions)], log=log)
         blocks, extra = [tuple(b) for b in rec["refine"]["blocks"]], [tuple(x) for x in rec["refine"]["extra"]]
     rec["start"] = rec["expand"]["start"]
     rec["final"] = bk.score([(frozenset(blocks), frozenset(extra))])[0]

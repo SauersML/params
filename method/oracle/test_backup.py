@@ -206,3 +206,25 @@ def test_derived_sets_and_pricing(tiny):
     subs = [nd for nd in g.node_set() if nd[2] != goal_eval.BLOCK]
     assert c["blocks"] == 1 and c["subcomponents"] == len(subs) + nat.C[fwd[0][0]]
     assert c["active"] == sum(bool(tx.vpd[n][tt, cc]) for n, tt, cc in subs) + int(tx.vpd[fwd[0][0]][t].sum())
+
+
+def test_expand_circuit_subcomponents(tiny):
+    """expand_circuit(subcomponents=True), the teacher's wireable call: the forward greedy's blocks each replaced by
+    refine's shortest prefix keeping keep x its gain (cheaper=False), a block no prefix keeps staying a block; the
+    answer holds the circuit, its blocks are refine's kept ones, and its score is the record's."""
+    nat, ge, tx, circuit = tiny
+    g, rec = backup.expand_circuit(ge, tx, circuit, max_steps=3, min_gain=1e-4, draws=4, subcomponents=True, keep=0.5)
+    assert rec["prune"] is None and rec["chosen"] == "fwd"
+    assert circuit.node_set() <= goal_eval.expand_blocks(g, nat.C).node_set()
+    blocks = {nd[:2] for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
+    if rec["expand"]["blocks"]:
+        per = rec["refine"]["per_block"]
+        assert [tuple(r["block"]) for r in per] == [tuple(b) for b in rec["expand"]["blocks"]]
+        assert blocks == {tuple(r["block"]) for r in per if r["choice"] is None}
+        for r in per:
+            if r["choice"] is not None:
+                x = next(q for q in r["prefixes"] if q["k"] == r["choice"])
+                assert (x["j"] or 0.0) - (r["j_without"] or 0.0) >= 0.5 * r["gain"] - 1e-12
+    bk = backup.Backup(ge, tx, circuit, draws=4)
+    extra = frozenset(nd for nd in g.node_set() if nd[2] != goal_eval.BLOCK) - circuit.node_set()
+    assert abs(bk.score([(frozenset(blocks), extra)])[0]["j"] - rec["final"]["j"]) < 1e-6

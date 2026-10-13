@@ -13,7 +13,7 @@
 #                                        arm, subcomponents ranked by importance x |activation|, attention heads' top positions;
 #                                        POOL=1: every VPD-active subcomponent at the listed positions in the question;
 #                                        THINKING=1: Qwen3's thinking mode, generation limit 16384; MAXLEN: SFT length cap;
-#                                        RENDERED=1: ROWS are already rerendered with these flags, used as they are)
+#                                        RENDERED=1: ROWS and HELDOUT are already rerendered with these flags, used as they are)
 set -e
 RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
@@ -32,7 +32,8 @@ if [ -n "${RENDERED:-}" ]; then cp $ROWS $S/rows.jsonl  # rendered once for seve
 else ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $ROWS $S/rows.jsonl; fi  # questions in the current format
 MPD_MEM_GIB=8 $PY $SRC/method/oracle/components.py dataset $S/rows.jsonl $TEACHER $S/sft.jsonl \
   ${ENGLISH:+--english $ENGLISH} ${EDIT_TEACH:+--edit-teach $EDIT_TEACH}
-~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $HELDOUT $S/heldout.jsonl
+if [ -n "${RENDERED:-}" ]; then cp $HELDOUT $S/heldout.jsonl
+else ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $HELDOUT $S/heldout.jsonl; fi
 $PY - $SRC/method/oracle $S/heldout.jsonl $HELDOUT_TEACHER $S/teacher_txt ${EDIT_EVAL:-} <<'PYEOF'
 import json, sys
 from pathlib import Path
@@ -70,9 +71,9 @@ for x in ${=EXTRA:-}; do XSETS+=(--set "${x%%=*}=$S/eval.json:${x%%=*}"); done
 if [ -d $S/ref/vpd_pruned ]; then
   PRUNED=(vpd_pruned=$S/ref/vpd_pruned) REFS+=(--ref "VPD, pruned connections=$S/eval.json:vpd_pruned")
 fi
-# C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh), with the held-out
-# teachers as reward v3's teacher-dominance reference
-EDIT_EVAL=${EDIT_EVAL:-} TEACHER=$HELDOUT_TEACHER bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S sft_nocircuit=$S/samples_nocircuit.jsonl \
+# C's families are too slow and too large for the Mac: the evaluation runs on a rented GPU (eval_pod.sh); DTEACHER: reward
+# v3's teacher-dominance reference, v2 teacher circuits only (none: D = 0)
+EDIT_EVAL=${EDIT_EVAL:-} TEACHER=${DTEACHER:-} bash experiments/oracle/pods/eval_pod.sh sft-$RUN $S/heldout.jsonl $LABELS sft=$S/samples.jsonl$E1S sft_nocircuit=$S/samples_nocircuit.jsonl \
   zeroshot=$S/zeroshot_first.jsonl$E1Z teacher=$S/teacher_txt vpd_complete=$S/ref/vpd_complete "${PRUNED[@]}" ${=EXTRA:-} > $S/eval_pod.log 2>&1
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.json $S/eval.json
 cp ~/mpd-data/runpod/oracle-graph-eval-sft-$RUN/eval.log $S/eval.log

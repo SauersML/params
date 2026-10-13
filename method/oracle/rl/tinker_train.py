@@ -386,8 +386,11 @@ def sft(a) -> None:
     spend = Spend(a.log, a.base)
     tinker, _, training, renderer, _ = clients(a.base, a.rank, None)  # the empty think block in the prompt, never trained
     rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
-    data = [conversation_to_datum(r["prompt"] + r["completion"], renderer, a.max_length, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
-            for r in rows]
+    whole = [conversation_to_datum(r["prompt"] + r["completion"], renderer, None, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
+             for r in rows]
+    data = [d for d in whole if d.model_input.length <= a.max_length]  # a cut example would teach an unfinished answer
+    long = [r["info"]["task"] for r, d in zip(rows, whole) if d.model_input.length > a.max_length]
+    print(json.dumps({"examples": len(data), "dropped over max_length": long}), flush=True)
     rng = random.Random(a.seed)
     if a.lr is None:
         from tinker_cookbook.hyperparam_utils import get_lr

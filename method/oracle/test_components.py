@@ -351,10 +351,10 @@ class FakeScorer:
     """variables.Scorer's score: e4 0.6 in the model, 0.9 in the stated graph."""
 
     def __init__(self):
-        self.asked = None
+        self.asked = self.split = None
 
-    def score(self, tx, vs, graph=None):
-        self.asked = vs
+    def score(self, tx, vs, split="eval", graph=None):
+        self.asked, self.split = vs, split
         return {"e4": 0.6, "circuit": {"e4": 0.9}, "gap": 0.3, "variables": [{"f_on": 0.7, "s_off": 0.5} for _ in vs]}
 
 
@@ -369,6 +369,39 @@ def test_e4_is_the_scorers_e4_with_a_malformed_variable_scoring_zero():
     outside = {**two, "group": [["h.2.attn.o_proj", 99, 7]]}  # no such subcomponent; and one line that did not parse
     assert components.e4_term(sc, None, None, {"variables": [one, outside]}, 1, C)["E4"] == pytest.approx(0.6 / 3)
     assert components.e4_term(sc, None, None, {}, 0, C)["E4"] == 0.0
+    components.e4_term(sc, None, None, {"variables": [one]}, 0, C, "search")
+    assert sc.split == "search"  # the RL reward's E4 on the same draws as C (variables.Scorer defaults to eval)
+
+
+def test_a_variables_block_claims_every_circuit_node_of_its_site_there():
+    nodes = [("h.1.attn.v_proj", 233, 4), ("h.1.attn.v_proj", 233, 9), ("h.1.attn.v_proj", 232, 4), ("h.2.attn.v_proj", 233, 1)]
+    got = components.claimed_nodes([("h.1.attn.v_proj", 233, components.BLOCK), ("h.3.mlp.c_fc", 235, 7)], nodes)
+    assert got == [("h.1.attn.v_proj", 233, 4), ("h.1.attn.v_proj", 233, 9), ("h.3.mlp.c_fc", 235, 7)]
+
+
+def test_line_credit_is_each_lines_leave_one_out_change_of_phi_and_compactness():
+    """c = delta_phi + g x 0.5 x log2(bits without the line / bits) (goal_eval.line_loo's deletions); a token node's
+    declaration 0; a FINAL line its question's E2g credit."""
+    down, v = ("h.3.mlp.down_proj", 7, 2), ("h.1.attn.v_proj", 5, 1)
+    answer = {"nodes": [[down[0], down[2], down[1]], [v[0], v[2], v[1]], ["tok", 0, 5]], "edges": [[1, 0], [0, "out"], [2, 1]]}
+    text = components.render(answer, {1: (True, "' x'")})
+    p = components.parse(text)
+    name = {nd: k for k, nd in p["ids"].items()}
+    loo = {"bits": 40.0, "lines": [{"kind": "node", "line": [list(down)], "delta_phi": 0.5, "bits": 20.0},
+                                   {"kind": "node", "line": [list(v)], "delta_phi": 0.0, "bits": 20.0},
+                                   {"kind": "edge", "line": [list(v), list(down)], "delta_phi": 0.1, "bits": 30.0},
+                                   {"kind": "edge", "line": [list(down), None], "delta_phi": 0.2, "bits": 30.0},
+                                   {"kind": "token", "line": [5, list(v)], "delta_phi": 0.3, "bits": 39.0}]}
+    e2g = {"per_question": [{"credit": 0.75}]}
+    got = dict(map(tuple, components.line_credit(text, p, loo, None, {"g": 0.5}, e2g, None)))
+    rows = [r.strip() for r in text.split("\n")]
+    at = lambda s: next(k for k, r in enumerate(rows) if r.startswith(s))  # noqa: E731
+    assert got[at(f'{name[down]}["')] == pytest.approx(0.5 + 0.25 * math.log2(20 / 40))
+    assert got[at(f'{name[v]}["')] == pytest.approx(0.25 * math.log2(20 / 40))  # inert: negative
+    assert got[at(f"{name[v]} --> {name[down]}")] == pytest.approx(0.1 + 0.25 * math.log2(30 / 40))
+    assert got[at(f"{name[down]} --> OUT")] == pytest.approx(0.2 + 0.25 * math.log2(30 / 40))
+    assert got[at(f"t5 --> {name[v]}")] == pytest.approx(0.3 + 0.25 * math.log2(39 / 40))
+    assert got[at("t5[tok]")] == 0.0 and got[at("FINAL 1:")] == 0.75
 
 
 def test_question_asks_for_variables_only_when_the_row_does(tiny):

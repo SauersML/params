@@ -205,6 +205,11 @@ def sft(a):
             log[-1].update(sft_sampler=mode, sample_ids=[e["meta"]["name"] for e in batch])
         if step % a.log_every == 0 or step == a.steps - 1:
             print(json.dumps(log[-1]), flush=True)
+        if a.save_every and (step + 1) % a.save_every == 0 and step < a.steps - 1:
+            save(model, tok, Path(a.out), log)  # a background job can be killed at its time limit
+        if a.minutes and time.time() - t0 > 60 * a.minutes:
+            print(json.dumps({"stopped": "minutes", "step": step}), flush=True)
+            break
     if a.eval:
         print(json.dumps({"eval": evaluate(model, tok, data[:a.eval], circuit.reward_f1, a)}), flush=True)
     save(model, tok, Path(a.out), log)
@@ -283,6 +288,11 @@ def rl(a):
                     "loss": round(loss.item(), 4), "kl": round(kl.item(), 5), "sec": round(time.time() - t0, 1)})
         if step % a.log_every == 0 or step == a.steps - 1:
             print(json.dumps(log[-1]), flush=True)
+        if a.save_every and (step + 1) % a.save_every == 0 and step < a.steps - 1:
+            save(model, tok, Path(a.out), log)  # a background job can be killed at its time limit
+        if a.minutes and time.time() - t0 > 60 * a.minutes:
+            print(json.dumps({"stopped": "minutes", "step": step}), flush=True)
+            break
     save(model, tok, Path(a.out), log)
     return log
 
@@ -313,6 +323,8 @@ def parser():
     ap.add_argument("--threads", type=int, default=2, help="1-2 on the shared box: 4 oversubscribes")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=10)
+    ap.add_argument("--save_every", type=int, default=0, help="also save the checkpoint every N steps (0 = only at the end)")
+    ap.add_argument("--minutes", type=float, default=0, help="stop (and save) after this many minutes (0 = no limit)")
     return ap
 
 

@@ -2642,13 +2642,14 @@ def test_path_patched_several_changes():
 def test_pattern_family_engine_equals_graph_ref(tiny):
     """pattern_family's circuit runs on the engine (C's semantics with the model's attention rows given at the reads,
     Engine.graph_log_probs(rows=)) give graph_ref(rows=)'s KL on every draw: stated graphs with and without stated
-    pairs, within 1e-4."""
+    pairs and complete sets (at u, 1 on their nodes), within 1e-4; VPD's draws (its runs on one engine) too."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     g = torch.Generator().manual_seed(23)
     graphs = [_pp_stated(_pp_nodes(every, g, f, blocks=0.0), tx.targets, g, keep=k) for f, k in ((0.4, 0.7), (0.8, 1.0))]
     graphs.append(native.Graph(every[::2], *native.all_edges(every[::2], tx.targets)))
-    graphs = [goal_eval.strand(x, tx.targets, nat.C) for x in graphs]
+    graphs = [goal_eval.strand(x, tx.targets, nat.C) for x in graphs] + [native.Graph(every[::3], complete=True)]
+    tx.__dict__.pop("_pattern_vpd", None)
     rows = ge.pattern_family(tx, graphs)
     b = ge._pp_base(tx)
     causal = torch.ones(tx.T, tx.T, dtype=torch.bool, device=nat.dev).tril()
@@ -2660,10 +2661,11 @@ def test_pattern_family_engine_equals_graph_ref(tiny):
         real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
         draws = [real] + ([{q: real[q]} for q in reads] if len(reads) > 1 else [])
         want = [float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, x, rows=d))[0]) for d in draws]
+        wv = [float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, native.Graph(masks=tx.vpd), rows=d))[0]) for d in draws]
         got = [kc for kc, _ in r["draws_pattern"]]
         assert len(got) == len(want)
-        for a, w in zip(got, want):
-            assert abs(a - w) <= 1e-4 * (1 + abs(w)), (a, w)
+        for a, w, (_, av), v in zip(got, want, r["draws_pattern"], wv):
+            assert abs(a - w) <= 1e-4 * (1 + abs(w)) and abs(av - v) <= 1e-4 * (1 + abs(v)), (a, w, av, v)
             n += 1
     assert n >= 4
 

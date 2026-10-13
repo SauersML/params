@@ -128,8 +128,8 @@ DONOR_ROWS = 16  # donor resampling's rows per run (donors x circuits and VPD's 
 DONORS_FAR = 32  # donor resampling's other texts per text
 NEC_CONTROLS = 32  # N's matched control texts per text (necessity_spec: the split's far pool, DONOR_POOLS; at 16 the
 # controls' spread, ~5 bits, gave eps_N a median 0.14 on the held-out influential sets)
-NEC_CONTROLS_LOO = 8  # line_loo's N controls (the answer's own N recomputed on the same 8, so a deletion's change in phi
-# compares like with like; 32 controls per deletion were 55% of line_loo on a 4090)
+NEC_CONTROLS_LOO = NEC_CONTROLS  # line_loo's and phi_variants' N controls: the answer's own (its reward row's N, no rerun;
+# 8 when N per deletion was 55% of line_loo, before it ran on one engine: 2bc1ddd)
 REMOVAL_ROWS = {"cuda": 32, "other": 16}  # real-model removal sets per batch (_removed_kl), by device: a removal batch's
 # masks are [rows, T, C] floats at every site
 NEC_MIN_LEN = 64  # a control text's least length (end-aligned: a circuit's parts further back are not removed there)
@@ -1244,13 +1244,19 @@ class GoalEval:
         answer with that one line deleted (a node with its connections, token edges and pairs; a stated connection;
         a stated token edge), nothing else re-stranded: phi_variants with one deletion a row. compact = log2(bits_start
         / bits) when bits_start is given. Returns {"phi", "bits", "held", "lines": [{"line", "kind", "phi", "delta_phi",
-        "bits", "delta_bits", "compact"}]}: delta_phi = the answer's phi less the deletion's (above 0: the line helps)."""
+        "delta_phi_uncapped", "bits", "delta_bits", "compact"}]}: delta_phi = the answer's phi less the deletion's as the
+        reward counts phi (cap_phi at the text's bar once tau() scored it; above 0: the line helps), _uncapped without
+        the cap."""
         lines = self.loo_lines(tx, graph)
         got = self.phi_variants(tx, graph, ~torch.eye(len(lines), dtype=torch.bool), pool, split, draws, base)
         ph, bits = got["phi"], got["bits"]
+        tau = ((tx.__dict__.get("_tau") or {}).get(split) or {}).get("phi_tau")  # the text's bar, when scored
+
+        def delta(v):  # the answer's phi less the variant's, as the reward counts phi (cap_phi at the bar)
+            return None if None in (ph, v) else cap_phi(ph, tau) - cap_phi(v, tau)
         out = [{"line": [list(x)] if kind == "node" else [list(y) if isinstance(y, tuple) else y for y in x], "kind": kind,
-                "phi": v["phi"], "delta_phi": None if None in (ph, v["phi"]) else ph - v["phi"], "bits": v["bits"],
-                "delta_bits": bits - v["bits"], "compact": compact(v["bits"], bits_start) if bits_start else None}
+                "phi": v["phi"], "delta_phi": delta(v["phi"]), "delta_phi_uncapped": None if None in (ph, v["phi"]) else ph - v["phi"],
+                "bits": v["bits"], "delta_bits": bits - v["bits"], "compact": compact(v["bits"], bits_start) if bits_start else None}
                for (kind, x), v in zip(lines, got["variants"])]
         return {"phi": ph, "bits": bits, "compact": compact(bits, bits_start) if bits_start else None,
                 "held": list(self.LOO_HELD), "lines": out}
@@ -1352,12 +1358,16 @@ class GoalEval:
         sets = [frozenset(x for kind, x in d if kind == "node") for d in gone]  # N moves with the node set alone
         distinct = list(dict.fromkeys(s for s in sets if s))
         first = {s: next(i for i in range(K) if sets[i] == s) for s in distinct}
-        got = self.necessity_spec(tx, [expand_blocks(g, nat.C)] + [flat[first[s]] for s in distinct], split, NEC_CONTROLS_LOO)
-        own, nsp = got[0], dict(zip(distinct, got[1:]))
+        again = NEC_CONTROLS_LOO != NEC_CONTROLS or not base.get("draws_n_spec")  # the answer's own N on the variants'
+        # controls (else its row's, on the same controls)
+        got = self.necessity_spec(tx, ([expand_blocks(g, nat.C)] if again else []) + [flat[first[s]] for s in distinct], split,
+                                  NEC_CONTROLS_LOO) if again or distinct else []
+        own, nsp = (got[0], dict(zip(distinct, got[1:]))) if again else ({}, dict(zip(distinct, got)))
         bits = size_bits(g, P, S, tx.targets, active=tx.vpd)
         fams = ((tx.__dict__.get("_tau") or {}).get(split) or {}).get("families")  # the text's (tau's), when scored
-        base = dict(base, **own, rl_terms={**base.get("rl_terms", {}), "n_spec": own["n_spec_raw"]})
-        base.pop("eps_N", None)
+        if own:
+            base = dict(base, **own, rl_terms={**base.get("rl_terms", {}), "n_spec": own["n_spec_raw"]})
+            base.pop("eps_N", None)
         ph, ph_tau = phi(base, start, families=fams)
         redo = [f for f in PHI_FAMILIES if f not in self.LOO_HELD]  # the recomputed families (eps from their own draws)
         out = []
@@ -1511,17 +1521,27 @@ class GoalEval:
             real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
             plans.append((reads, [real] + ([{r: real[r]} for r in reads] if len(reads) > 1 else [])))
         kcs = (runs or self._pattern_runs)(tx, graphs, plans)
+        new = {}  # VPD's runs with those reads given: the same for every circuit using them (kept on tx), the new ones
+        for reads, draws in plans:  # at once on an engine over its subcomponents (graph_ref's numbers)
+            for d in (draws if reads and vpd is not None else ()):
+                key = (id(tx.vpd), tuple(sorted(d)))
+                if key not in kept:
+                    new.setdefault(key, d)
+        if new:
+            nat, dev = self.nat, self.nat.dev
+            E = self._circuit_engine(tx.ids, tx.targets, [], extra={n: tx.vpd[n].any(0).nonzero().flatten() for n in nat.names})
+            u = {n: tx.vpd[n][:, E.columns[n]].float()[None] for n in nat.names}
+            keys = list(new)
+            for s0 in range(0, len(keys), self.PATTERN_ROWS):
+                part = keys[s0:s0 + self.PATTERN_ROWS]
+                lq = E.graph_log_probs(E.plan([vpd] * len(part), semantics="c"), u, rows=[new[k] for k in part])
+                kept.update(zip(part, carry.kl(tx.ref, lq).tolist()))
+                native.free(dev)
         for g, (reads, draws), kc in zip(graphs, plans, kcs):
             if not reads or vpd is None:
                 out.append({"s_pattern": None, "s_pattern_raw": None, "kl_pattern_c": None, "kl_pattern_vpd": None, "reads_pattern": len(reads)})
                 continue
-            kv = []
-            for d in draws:  # VPD's run with those reads given: the same for every circuit using them (kept on tx)
-                key = (id(tx.vpd), tuple(sorted(d)))
-                if key not in kept:
-                    kept[key] = float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, vpd, rows=d))[0])
-                kv.append(kept[key])
-            native.free(self.nat.dev)
+            kv = [kept[(id(tx.vpd), tuple(sorted(d)))] for d in draws]
             c_, v_ = float(np.mean(kc)), float(np.mean(kv))
             out.append({"s_pattern": _fid(e0, c_, v_), "s_pattern_raw": _fid_raw(e0, c_, v_), "kl_pattern_c": c_,
                         "kl_pattern_vpd": v_, "reads_pattern": len(reads), "draws_pattern": [list(x) for x in zip(kc, kv)]})
@@ -1529,7 +1549,7 @@ class GoalEval:
 
     PATTERN_ROWS = 32  # pattern_family's engine rows (circuits x draws) a call
     LOO_FAST = True  # line_loo's point, wiring and pattern from one plan of the answer (_loo_c); False: per deletion
-    LOO_ROWS = 64  # _loo_c's engine rows a call
+    LOO_ENTRIES = 1 << 27  # _loo_c's engine rows a call: this many floats in a run's widest activations (rows x T x C)
 
     @torch.no_grad()
     def _loo_c(self, tx: Text, g: native.Graph, lines: list, keep: torch.Tensor) -> tuple | None:
@@ -1584,9 +1604,10 @@ class GoalEval:
 
         def run(rows_of, extra=None):  # KLs of rows (line indices), optionally with given attention rows each
             out = []
-            for s0 in range(0, len(rows_of), self.LOO_ROWS):
-                ix = rows_of[s0:s0 + self.LOO_ROWS]
-                given = None if extra is None else extra[s0:s0 + self.LOO_ROWS]
+            step = max(16, self.LOO_ENTRIES // (tx.T * max(nat.C.values())))
+            for s0 in range(0, len(rows_of), step):
+                ix = rows_of[s0:s0 + step]
+                given = None if extra is None else extra[s0:s0 + step]
                 if g.complete:
                     lq = E.graph_log_probs(plan, urows(ix), rows=given)
                 else:
@@ -1600,7 +1621,13 @@ class GoalEval:
         e, v = self._bounds(tx, "live")
         nodes = sorted(g.node_set())
         keys = list(dict.fromkeys(sets))  # the variants' node sets: the graph's less each one's deleted nodes
-        masks = lambda drop: carry.masks(nat, tx.T, [nd for nd in nodes if nd not in drop])  # noqa: E731
+        full = carry.masks(nat, tx.T, nodes)
+
+        def masks(drop):  # the graph's node set less drop, as masks
+            m = {n: v.clone() for n, v in full.items()}
+            for n, t, c in drop:
+                m[n][t, c] = False
+            return m
         kw = dict(kw0) if g.complete else {}
         for s0 in range(0, 0 if g.complete else len(keys), 8):  # a stated graph's wiring: the masked run of its node set
             part = keys[s0:s0 + 8]
@@ -1621,27 +1648,42 @@ class GoalEval:
 
     @torch.no_grad()
     def _pattern_runs(self, tx: Text, graphs: list[native.Graph], plans: list) -> list[list[float]]:
-        """pattern_family's circuit side: per graph, each draw's KL from the model (graph_ref(rows=)'s numbers): the
-        stated graphs on the engine (C's semantics with the draws' attention rows given, PATTERN_ROWS a call), a
-        complete graph on graph_ref."""
+        """pattern_family's circuit side: per graph, each draw's KL from the model (graph_ref(rows=)'s numbers), on the
+        engine (C's semantics with the draws' attention rows given, PATTERN_ROWS a call; a complete graph at u, 1 on its
+        nodes)."""
         out = [[] for _ in graphs]
-        todo = []
-        for gi, (g, (reads, draws)) in enumerate(zip(graphs, plans)):
-            if not reads or tx.vpd is None:
-                continue
-            if g.complete:
-                out[gi] = [float(carry.kl(tx.ref, self.graph_ref(tx.ids, tx.targets, g, rows=d))[0]) for d in draws]
-            else:
-                todo += [(gi, d) for d in draws]
+        todo = [(gi, d) for gi, (g, (reads, draws)) in enumerate(zip(graphs, plans)) if reads and tx.vpd is not None for d in draws]
         if todo:
-            flat = {gi: expand_blocks(graphs[gi], self.nat.C) for gi in {gi for gi, _ in todo}}
+            nat, dev = self.nat, self.nat.dev
+            flat = {gi: expand_blocks(graphs[gi], nat.C) for gi in {gi for gi, _ in todo}}
             E = self._circuit_engine(tx.ids, tx.targets, list(flat.values()))
-            for s0 in range(0, len(todo), self.PATTERN_ROWS):
-                part = todo[s0:s0 + self.PATTERN_ROWS]
-                lq = E.graph_log_probs(E.plan([flat[gi] for gi, _ in part], semantics="c"), rows=[d for _, d in part])
+            at = {n: {c: i for i, c in enumerate(E.columns[n].tolist())} for n in nat.names}
+            whole = {}  # a complete graph's nodes per site: (positions, columns)
+            for gi, h in flat.items():
+                if h.complete:
+                    per = {}
+                    for n, t, c in h.node_set():
+                        per.setdefault(n, ([], []))
+                        per[n][0].append(t)
+                        per[n][1].append(at[n][c])
+                    whole[gi] = per
+            todo = [x for x in todo if x[0] not in whole] + [x for x in todo if x[0] in whole]  # (each kind its own batches:
+            cut = sum(x[0] not in whole for x in todo)                                         # a stated graph's numbers
+            starts = list(range(0, cut, self.PATTERN_ROWS)) + list(range(cut, len(todo), self.PATTERN_ROWS))  # as alone)
+            for s0 in starts:
+                part = todo[s0:min(s0 + self.PATTERN_ROWS, cut if s0 < cut else len(todo))]
+                u = None
+                if any(gi in whole for gi, _ in part):  # complete graphs run as u: 1 on their nodes
+                    u = {}
+                    for n in nat.names:
+                        idx = [(r, t, k) for r, (gi, _) in enumerate(part) for t, k in zip(*whole.get(gi, {}).get(n, ([], [])))]
+                        u[n] = torch.zeros(len(part), tx.T, E.width(n), device=dev)
+                        if idx:
+                            u[n][tuple(torch.tensor(idx, device=dev).T)] = 1.0
+                lq = E.graph_log_probs(E.plan([flat[gi] for gi, _ in part], semantics="c"), u, rows=[d for _, d in part])
                 for (gi, _), k in zip(part, carry.kl(tx.ref, lq).tolist()):
                     out[gi].append(k)
-                native.free(self.nat.dev)
+                native.free(dev)
         return out
 
     @torch.no_grad()
@@ -2032,12 +2074,14 @@ class GoalEval:
         cols = E.pp_lines(g)
         nodes = [k[1] for k in cols if k[0] == "n"]
         K, N = len(lines), len(nodes)
-        on = (lines[:, :N] > 0).cpu()
+        on = (lines[:, :N] > 0).cpu().numpy()
+        pos = np.array([t for _, t, _ in nodes], dtype=np.int64)
         positions = sorted({t for _, t, _ in nodes if t > 0})
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
         empty = {"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
         out = [dict(empty) for _ in range(K)]
-        alone = [k for k in range(K) if sorted({nodes[i][1] for i in range(N) if on[k, i] and nodes[i][1] > 0}) != positions]
+        at_p = (pos[None, :] == np.array(positions, dtype=np.int64)[:, None]) if positions else np.zeros((0, N), dtype=bool)  # [P, N]
+        alone = [k for k in range(K) if not (on[k][None, :] & at_p).any(1).all()]  # a variant leaving a position empty
         for k in alone:  # nothing re-stranded
             out[k] = self._interchange_graphs(tx, [graph_of_lines(g, cols, lines[k])], split, draws)[0]
         rest = [k for k in range(K) if k not in set(alone)]
@@ -2054,23 +2098,23 @@ class GoalEval:
                           for n, t, c in nodes if t == p})
         sel = torch.tensor(rest, device=lines.device)
         circ = E.path_patched([g], helds, lines=lines[sel])  # [len(rest), D, targets, V]
-        refs, at = [], {}  # the references' held sets: per draw the answer's nodes at p less those the variant deletes
-        for k in rest:
+        refs, at, ridx = [], {}, np.zeros((len(rest), len(got)), dtype=np.int64)  # the references' held sets: per draw the
+        for j, k in enumerate(rest):                                              # answer's nodes at p less the variant's deleted
             for d, (p, _) in enumerate(got):
-                off = tuple(i for i in range(N) if nodes[i][1] == p and not on[k, i])
+                off = tuple(np.nonzero((pos == p) & ~on[k])[0].tolist())
                 if (d, off) not in at:
                     at[(d, off)] = len(refs)
                     refs.append({nd: v for nd, v in helds[d].items() if nd not in {nodes[i] for i in off}})
+                ridx[j, d] = at[(d, off)]
         rl = E.path_patched([model, vpd], refs)  # [2, R, targets, V]
+        W, KV = carry.kl(rl[0], tx.ref).tolist(), carry.kl(rl[0], rl[1]).tolist()  # per reference
+        ri = torch.as_tensor(ridx, device=rl.device)
+        KC = torch.cat([carry.kl(rl[0][ri[s0:s0 + 64]], circ[s0:s0 + 64]) for s0 in range(0, len(rest), 64)]).tolist()  # [J, D]
         for j, k in enumerate(rest):
             a = [0.0, 0.0, 0, [], 0.0]
             for d, (p, z) in enumerate(got):
-                off = tuple(i for i in range(N) if nodes[i][1] == p and not on[k, i])
-                r = at[(d, off)]
-                m = rl[0, r][None]
-                w = float(carry.kl(m, tx.ref)[0])
-                kc = float(carry.kl(m, circ[j, d][None])[0])
-                kv = float(carry.kl(m, rl[1, r][None])[0])
+                r = int(ridx[j, d])
+                w, kc, kv = W[r], KC[j][d], KV[r]
                 a[3].append([[p, z], kc, kv, w])
                 sb = _fid(w, kc, kv)
                 if sb is not None:
@@ -2148,14 +2192,15 @@ class GoalEval:
 
     def _circuit_engine(self, ids: list[int], targets: list[int], graphs: list[native.Graph], live: bool = True, outside: str = "off",
                         extra: dict | None = None):
-        """engine.Engine on ids over the graphs' subcomponents (and extra's {site: columns}): C's semantics run there
-        (Engine.plan(semantics="c"), tested equal to graph_ref) on those columns alone."""
+        """engine.Engine on ids over the graphs' subcomponents (and extra's {site: columns}; a block node is a unit of
+        the plan, no column): C's semantics run there (Engine.plan(semantics="c"), tested equal to graph_ref) on those
+        columns alone."""
         import engine
 
         nat, dev = self.nat, self.nat.dev
         cols = {}
         for n in nat.names:
-            c = torch.tensor(sorted({c for g in graphs for m, _, c in g.node_set() if m == n}), dtype=torch.long, device=dev)
+            c = torch.tensor(sorted({c for g in graphs for m, _, c in g.node_set() if m == n and c != BLOCK}), dtype=torch.long, device=dev)
             cols[n] = c if extra is None else torch.unique(torch.cat([c, extra[n].to(dev)]))
         return engine.Engine(nat, ids, targets, live=live, columns=cols, outside=outside)
 
@@ -3101,9 +3146,9 @@ class GoalEval:
                     out[n][1][b, t, k] = v
             return out
 
-        def spec(E, nodes, D):  # every row's reads of nodes: {site: (rows, positions, columns)}
+        def spec(E, nodes, D):  # every row's reads of nodes: {site: (rows, positions, columns)} (blocks have no activation)
             out = {}
-            for n, t, c in nodes:
+            for n, t, c in (nd for nd in nodes if nd[2] != BLOCK):
                 x = out.setdefault(n, ([], [], []))
                 x[1].append(t)
                 x[2].append(at[id(E)][n][c])
@@ -3112,7 +3157,7 @@ class GoalEval:
 
         def split(got, nodes, D):  # {site: [D * k]} -> {node: [D]}
             out, k = {}, {}
-            for n, t, c in nodes:
+            for n, t, c in (nd for nd in nodes if nd[2] != BLOCK):
                 k.setdefault(n, []).append((n, t, c))
             for n, nds in k.items():
                 v = got[n].view(D, len(nds))
@@ -3132,7 +3177,8 @@ class GoalEval:
             if g.complete:
                 u_c = {n: torch.zeros(1, T, Ec.width(n), device=dev) for n in nat.names}
                 for n, t, c in g.node_set():
-                    u_c[n][0, t, at[id(Ec)][n][c]] = 1.0
+                    if c != BLOCK:  # (a block is the plan's unit: its whole output)
+                        u_c[n][0, t, at[id(Ec)][n][c]] = 1.0
             lc = Ec.graph_log_probs(Ec.plan([g] * D, semantics="c", cuts=cuts), u_c, patch=patches(Ec, patch),
                                     reads=spec(Ec, nodes, D) if reads else None)
             if not reads:

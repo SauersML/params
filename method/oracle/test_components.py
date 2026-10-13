@@ -415,6 +415,32 @@ def test_score_timing_reports_the_scorers_seconds_by_method(tiny):
     assert not any(n in vars(ge) for n in components.TIMED)  # the timers come off
 
 
+def test_a_complete_node_set_round_trips_through_its_marker():
+    a = {"nodes": [["h.3.mlp.down_proj", 2, 7], ["h.1.attn.v_proj", 1, 5], ["block", "h.2.attn.v_proj", 5]], "edges": [],
+         "complete": True, "explanation": ""}
+    text = components.render(a)
+    p = components.parse(text)
+    assert "  %% complete" in text and p["answer"]["complete"] and p["malformed"] == 0
+    assert sorted(map(tuple, p["answer"]["nodes"])) == sorted(map(tuple, a["nodes"]))
+
+
+def test_thinking_trace_names_specific_refutations_first_within_its_budget(tiny):
+    nat, ge, task, ev = tiny
+    ids = task["prompts"][0]["token_ids"]
+    small = {"stage": "set", "removed": [["h.1.attn.v_proj", 5, 1]], "draws": [[5, 3]], "s_track_pp": 0.6, "s_current": 0.95, "floor": 0.9}
+    big = {"stage": "set", "removed": [["h.0.mlp.c_fc", 6, c] for c in range(10)], "draws": [[5, 2]], "s_track_pp": 0.1,
+           "s_current": 0.95, "floor": 0.9}
+    path = {"blocks": {"m": 1, "positions": [5], "start_units": 40, "stages": [{"stage": "start"}, {"stage": "site", "units": 12}]},
+            "refused": [big, small, small, {"stage": "set", "removed": [["h.2.mlp.c_fc", 6, 4]], "phi": 0.7, "floor": 0.8}]}
+    answer = {"nodes": [["h.1.attn.v_proj", 1, 5], ["h.3.mlp.down_proj", 2, 7]], "edges": []}
+    t = components.thinking_trace(path, task["model"], ids, answer)
+    lines = t.splitlines()
+    assert lines[0].startswith("Start:") and lines[-1].startswith("Result: 2 subcomponents at positions 5, 7")
+    refused = [x for x in lines if x.startswith("Refused:")]
+    assert len(refused) == 3 and "L1.v#1@5" in refused[1] and "10 subcomponents (L0.fc@6 (10))" in refused[0]  # tried order; once each
+    assert len(components.thinking_trace(path, task["model"], ids, answer, budget=200)) <= 200 + 60
+
+
 def test_a_variables_block_claims_every_circuit_node_of_its_site_there():
     nodes = [("h.1.attn.v_proj", 233, 4), ("h.1.attn.v_proj", 233, 9), ("h.1.attn.v_proj", 232, 4), ("h.2.attn.v_proj", 233, 1)]
     got = components.claimed_nodes([("h.1.attn.v_proj", 233, components.BLOCK), ("h.3.mlp.c_fc", 235, 7)], nodes)

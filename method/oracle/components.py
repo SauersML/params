@@ -2100,6 +2100,69 @@ def edit_term(ee, task: dict, goals: list[dict], answers: list[dict], best: dict
 # ---- supervised targets
 
 
+TRACE_CHARS = 7000  # thinking_trace(): about 2,000 Qwen3 tokens, beside a 3.5k-token answer within fit_pool's ROOM
+
+
+def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget: int = TRACE_CHARS) -> str:
+    """The teacher's search as a thinking trace for SFT targets (the lead's 10-12: failed hypotheses as thinking): the
+    start (path.json "blocks": its positions and size), each stage's size, the refused removals (path.json "refused":
+    what was tried, the score that refuted it against its floor, and the token changes it failed on): small removals
+    (a few named subcomponents or connections) first by their shortfall below the floor, then at most two large ones
+    (by site and count), shown in the order they were tried, within budget characters; then the result."""
+    strings = token_strings(model, ids)
+    tok = lambda z: shown(token_strings(model, [int(z)])[0])  # noqa: E731
+    b = path.get("blocks") or {}
+    out = []
+    if b.get("positions"):
+        ps = ", ".join(f"{p} ({strings[p]!r})" for p in b["positions"] if p < len(strings))
+        out.append(f"Start: VPD's active subcomponents at the target and the {b.get('m', len(b['positions']))} most influential "
+                   f"positions, {ps}: {b.get('start_units', '?')} subcomponents.")
+    for st in b.get("stages") or []:
+        if st.get("stage") != "start":
+            out.append(f"Stage {st['stage']}: {st.get('units', '?')} units ({st.get('blocks', 0)} blocks, {st.get('subcomponents', 0)} "
+                       f"subcomponents) after {st.get('rounds', 0)} rounds.")
+
+    def what(removed) -> str:
+        if removed and isinstance(removed[0][0], list):  # connections: [[writer], [reader]]
+            parts = [f"{node_text(tuple(w))} -> {node_text(tuple(r)) if r else 'the prediction'}" for w, r in removed[:3]]
+            return ("the connection " if len(removed) == 1 else "the connections ") + "; ".join(parts) + \
+                (f" (+{len(removed) - 3} more)" if len(removed) > 3 else "")
+        by = {}
+        for n, t, c in (tuple(x) for x in removed):
+            by.setdefault((n, t), []).append((n, t, c))
+        groups = sorted(by.values(), key=lambda g: (-len(g), g[0][1]))
+        if len(removed) <= 6:  # a small removal by name
+            return ", ".join(group_text(sorted(g, key=lambda x: x[2])) for g in groups)
+        txt = ", ".join(f"{group_text([(g[0][0], g[0][1], BLOCK)])} ({len(g)})" for g in groups[:4])  # a large one by site and count
+        return f"{len(removed)} subcomponents ({txt}{', ...' if len(groups) > 4 else ''})"
+
+    def refusal(r) -> tuple[float, str]:
+        if "phi" in r:
+            short = (r.get("floor") or 0.0) - (r.get("phi") or 0.0)
+            return short, f"removing {what(r['removed'])} drops phi to {r['phi']:.2f}, below the bar {r['floor']:.2f}: kept."
+        sc, fl = r.get("s_track_pp"), r.get("floor")
+        changes = sorted({(p, z) for p, z in (r.get("draws") or [])})[:3]
+        on = ", ".join(f"{p}→{tok(z)}" for p, z in changes)
+        return (fl or 0.0) - (sc or 0.0), (f"removing {what(r['removed'])} drops changed-input tracking to {sc:.2f} (floor {fl:.2f}, "
+                                          f"from {r.get('s_current', float('nan')):.2f}) on token changes such as {on}: kept.")
+    rs = [(i, *refusal(r)) for i, r in enumerate(path.get("refused") or []) if r.get("removed")]
+    tail = f"Result: {len([n for n in answer['nodes'] if n[0] != TOK])} subcomponents at positions " + \
+           ", ".join(str(p) for p in sorted({n[2] for n in answer["nodes"] if n[0] != TOK})) + "."
+    room = budget - sum(len(x) + 1 for x in out) - len(tail) - 1
+    keep, seen, big = [], set(), 0
+    size = lambda i: len((path.get("refused") or [])[i]["removed"])  # noqa: E731
+    for i, short, line in sorted(rs, key=lambda x: (size(x[0]) > 6, -x[1])):  # specific (small) refutations first, then at most
+        sig = tuple(sorted(json.dumps(x) for x in (path.get("refused") or [])[i]["removed"]))  # a removal refused twice: once
+        if sig in seen or len(line) + 9 > room or short <= 0.0 or (size(i) > 6 and big >= 2):  # two coarse ones
+            continue
+        big += size(i) > 6
+        seen.add(sig)
+        keep.append((i, line))
+        room -= len(line) + 10
+    out += ["Refused: " + line for _, line in sorted(keep)]
+    return "\n".join(out + [tail])
+
+
 def target(answer: dict, ev: dict, model: str, edits: dict | None = None, strings: list[str] | None = None) -> str:
     """The supervised answer to a question: the teacher's circuit (goal_eval's JSON), variables and explanation, for
     each question the model's measured answer (no reasoning: the teacher has none to give), and for each edit request
@@ -2409,7 +2472,7 @@ def checked_invariant_labels(record: dict, found: list[dict] | None, model: str,
 
 
 def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | None = None, edits: dict | None = None,
-            variables: dict | None = None, invariants: dict | None = None) -> int:
+            variables: dict | None = None, invariants: dict | None = None, traces: bool = False) -> int:
     """SFT rows ({"prompt": [user message], "completion": [assistant message], "info": {"task"}}, units_sft.py's
     format) for the questions that have a teacher answer: TEACHER_DIR/<task>.json (goal_eval's circuit JSON; nodes
     without edges get with_edges(), which needs ge) or <task>.txt (this module's text). english: task -> the chosen
@@ -2468,10 +2531,13 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
             ops = teacher_edits(edits, r)
             if len(ops) < len(r.get("edits") or []):
                 continue  # an answer without an EDIT line for a request is invalid: no target for it
+            content = target(answer, r, task["model"], ops, token_strings(task["model"], prompt["token_ids"]))
+            if traces:  # the teacher's search as the thinking before the answer (thinking_trace; Qwen3's thinking renderer)
+                pf = teacher_dir / f"{r['task']}.path.json"
+                trace = thinking_trace(json.loads(pf.read_text()) if pf.exists() else {}, task["model"], prompt["token_ids"], answer)
+                content = f"<think>\n{trace}\n</think>\n\n{content}"
             f.write(json.dumps({"prompt": [{"role": "user", "content": r["question"]}],
-                                "completion": [{"role": "assistant", "content": target(answer, r, task["model"], ops,
-                                                                                        token_strings(task["model"], prompt["token_ids"]))}],
-                                "info": info}) + "\n")
+                                "completion": [{"role": "assistant", "content": content}], "info": info}) + "\n")
             f.flush()
             n += 1
     return n
@@ -2981,6 +3047,8 @@ def main():
     d.add_argument("--edit-teach", type=Path, action="append", default=[], help="edit_eval.py teach output (the edit teacher's edits)")
     d.add_argument("--variables", type=Path, help="a directory of <task>.json, {\"variables\": [...]} (variables.py's JSON, meanings written)")
     d.add_argument("--invariants-teach", type=Path, action="append", default=[], help="checked train-only artifact JSON/JSONL; only explicitly invariant-enabled rows receive positive verified labels")
+    d.add_argument("--traces", action="store_true", help="each target opens with the teacher's search as thinking (thinking_trace, "
+                   "TEACHER/<task>.path.json; train with tinker_train sft --thinking)")
     nz = sub.add_parser("noise", help="C's draw noise per answer (c_noise()): a check on goal_eval's eps")
     nz.add_argument("split", choices=("train", "heldout", "hard"))
     nz.add_argument("rows", type=Path)
@@ -3074,7 +3142,7 @@ def main():
             found |= {r["task"]: r["variables"] for r in map(json.loads, args.english.read_text().splitlines()) if r.get("variables")}
         print(dataset(args.rows, args.teacher, args.out, goal_eval.GoalEval(), english,
                       edit_teach(args.edit_teach) if args.edit_teach else None, found or None,
-                      invariant_teach(args.invariants_teach) if args.invariants_teach else None), "rows", flush=True)
+                      invariant_teach(args.invariants_teach) if args.invariants_teach else None, args.traces), "rows", flush=True)
         return
     if args.cmd == "facts":
         ge = goal_eval.GoalEval(native.Native(args.device))

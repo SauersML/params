@@ -431,7 +431,9 @@ def sft(a) -> None:
 
     a.log.mkdir(parents=True, exist_ok=True)
     spend = Spend(a.log, a.base)
-    tinker, _, training, renderer, _ = clients(a.base, a.rank, None)  # the empty think block in the prompt, never trained
+    # the empty think block in the prompt, never trained; --thinking: targets that open with their thinking
+    # (components.py dataset --traces), trained in Qwen3's thinking renderer, as rl --thinking samples
+    tinker, _, training, renderer, _ = clients(a.base, a.rank, None, a.thinking)
     rows = [json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
     whole = [conversation_to_datum(r["prompt"] + r["completion"], renderer, None, renderers.TrainOnWhat.LAST_ASSISTANT_MESSAGE)
              for r in rows]
@@ -632,7 +634,8 @@ def main():
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--name", default="components")
         p.add_argument("--thinking", action="store_true", help="rl: Qwen3's thinking mode (renderer qwen3), the policy's own "
-                                                                "thinking; sft: no effect (the empty block stays in the prompt)")
+                                                                "thinking; sft: targets with their thinking (dataset --traces) in "
+                                                                "the same renderer (without: the empty block in the prompt)")
     s = sub.choices["sft"]
     s.add_argument("--batch", type=int, default=8)
     s.add_argument("--lr", type=float, help="peak rate, linear decay to 0 (default: the cookbook's LoRA rate for the base)")

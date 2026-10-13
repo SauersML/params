@@ -50,7 +50,7 @@ if not joined or any(not r.get("invariants") or components.ASK_INVARIANTS.strip(
 PYEOF
 fi
 MPD_MEM_GIB=8 $PY $SRC/method/oracle/components.py dataset $S/rows.jsonl $TEACHER $S/sft.jsonl \
-  ${=ENGLISH:+--english $ENGLISH} ${=EDIT_TEACH:+--edit-teach $EDIT_TEACH} $IT
+  ${=ENGLISH:+--english $ENGLISH} ${=EDIT_TEACH:+--edit-teach $EDIT_TEACH} $IT ${TRACES:+--traces}  # TRACES=1: the teacher's search as thinking
 if [ -n "${RENDERED:-}" ]; then cp $HELDOUT $S/heldout.jsonl
 else ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $HELDOUT $S/heldout.jsonl; fi
 $PY - $SRC/method/oracle $S/heldout.jsonl $HELDOUT_TEACHER $S/teacher_txt ${EDIT_EVAL:-} <<'PYEOF'
@@ -69,7 +69,7 @@ PYEOF
 export TINKER_API_KEY="$(security find-generic-password -s tinker-api-key -w)" TINKER_PROJECT_ID=3f598f31-2ffa-4eb4-b302-909eb234fb7d
 cd $SRC/method/oracle/rl
 $TPY -u tinker_train.py sft $S/sft.jsonl --log $S/sft --base $BASE --steps $STEPS --batch $BATCH ${=LR:+--lr $LR} --name sft-$RUN \
-  --max-length ${MAXLEN:-32768} ${=SAVE_EVERY:+--save-every $SAVE_EVERY}  # the empty think block in the prompt (tinker_train sft)
+  --max-length ${MAXLEN:-32768} ${=SAVE_EVERY:+--save-every $SAVE_EVERY} ${TRACES:+--thinking}  # TRACES: trained thinking (sample with THINKING=1)
 STATE=$($PY -c "import json; print(json.load(open('$S/sft/state.json'))['state'])")
 $TPY -u tinker_train.py sample $S/heldout.jsonl $S/samples.jsonl --init "$STATE" --base $BASE --n $NEVAL --samples $SAMPLES --max-tokens $MAXTOK $TH
 # the circuit-ablation column: the same policy answering the questions with an empty circuit (E2 with - without)

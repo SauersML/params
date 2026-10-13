@@ -17,6 +17,11 @@ on:
       - ".github/workflows/graph-oracle-e2e.yml"
   workflow_dispatch:
     inputs:
+      adversary_batch_only:
+        description: "Diagnose only the tiny adversary batch value/gradient guard on Linux CPU"
+        type: boolean
+        required: false
+        default: false
       replay_saved_toy_wiring:
         description: "Replay four fixed public toy truth/active completions with executed wiring (no policy generation)"
         type: boolean
@@ -36,7 +41,7 @@ on:
         default: false
 
 concurrency:
-  group: graph-oracle-e2e-${{ github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring && github.run_id || github.ref }}
+  group: graph-oracle-e2e-${{ github.event_name == 'workflow_dispatch' && (inputs.replay_saved_toy_wiring || inputs.adversary_batch_only) && github.run_id || github.ref }}
   cancel-in-progress: false  # pushes come every few minutes: finish the running check, keep only the newest pending one
 
 permissions:
@@ -62,9 +67,11 @@ jobs:
           python -m pip install -q 'pytest>=8' numpy scipy safetensors transformers peft tokenizers huggingface_hub httpx
 
       - name: Check executed toy wiring
+        if: ${{ !inputs.adversary_batch_only }}
         run: python -m pytest experiments/oracle/toyloop/test_wiring.py -q --tb=short
 
       - name: Check weight-use, intervention, English and data controls
+        if: ${{ !inputs.adversary_batch_only }}
         run: |
           python -m pytest method/oracle/rl/test_inject.py method/oracle/test_intervention_panel.py \
             method/oracle/test_reward_gate.py method/oracle/test_reward_compactness.py \
@@ -82,6 +89,7 @@ jobs:
             method/oracle/test_components.py::test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit -q --tb=short
 
       - name: Run the graph oracle's tests
+        if: ${{ !inputs.adversary_batch_only }}
         env:
           MEM_LEASE_GIB: "1"
           MPD_MEM_GIB: "1"
@@ -94,8 +102,24 @@ jobs:
           python -B method/oracle/rl/test_scorer.py
           python -B method/oracle/rl/test_train.py
 
+      - name: Diagnose adversary batch on Linux CPU
+        if: github.event_name == 'workflow_dispatch' && inputs.adversary_batch_only
+        timeout-minutes: 3
+        run: |
+          mkdir -p "${{ runner.temp }}/adversary-batch-diagnostic"
+          python -m pytest method/oracle/test_goal_eval.py::test_adversary_batch_is_per_circuit -s -q --tb=short \
+            | tee "${{ runner.temp }}/adversary-batch-diagnostic/pytest.log"
+
+      - name: Upload adversary batch diagnostic
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.adversary_batch_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: adversary-batch-diagnostic-${{ github.sha }}
+          path: ${{ runner.temp }}/adversary-batch-diagnostic
+          if-no-files-found: warn
+
       - name: Replay saved toy teacher wiring
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring && !inputs.adversary_batch_only
         timeout-minutes: 8
         run: |
           git fetch --no-tags --depth=1 origin 9e3782861caa3e738d6b91122a527487157df349
@@ -112,7 +136,7 @@ jobs:
             --out "${{ runner.temp }}/toy-wiring-replay" "${policy_args[@]}"
 
       - name: Upload saved toy wiring replay
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring && !inputs.adversary_batch_only
         uses: actions/upload-artifact@v4
         with:
           name: saved-toy-wiring-replay-${{ github.sha }}

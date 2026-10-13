@@ -3,7 +3,8 @@ predicting b after a while it keeps predicting b after other tokens", and measur
 weight edit; the verifier applies the edit to the model's weights and measures it on held-out text.
 
 Goals come from measured preferences (experiments/oracle/persistent_e3.py prefs: content-word pairs a -> b on split B
-of the atlas's Pile rows, thirds fit / val / score), split train / dev by preference (a hash of a and b). The evidence
+of the atlas's Pile rows, thirds fit / val / score; those with MIN_HELD instances and controls in the score third),
+split train / dev by preference (a hash of a and b). 10-13: 152 preferences at --min-pairs 8, 83 goals (25 dev). The evidence
 is the fit third's alone (the learnability grid's decision: the text plus measured facts): example contexts, the
 subcomponents whose ablation at such a position most lowers b's margin there (the circuit, by measured local effect)
 and the same ranking at the controls (b predicted after other tokens: the controls' circuit), with their effects in
@@ -75,6 +76,7 @@ EVIDENCE_TOP = 24  # subcomponents listed per circuit (persistent_e3.EDIT_CANDS:
 EXAMPLES = 4
 CONTEXT = 12  # tokens before a shown in an example
 GATE = 0.8
+MIN_HELD = 8  # a goal's score-third instances and controls, at least (scorable)
 TEACHERS = ("circuit_edit", "circuit_scales")
 RANDOMS = ("random_equal_0", "random_equal_1", "random_scales")
 TOKENS = Path.home() / "mpd-data/atlas/vpd4l/tokens_0_6000.npy"  # the atlas's rows, split B 5000-5999
@@ -153,7 +155,15 @@ def question(pref: dict, decode, tokens) -> str:
             f"kind is q, k, v, o, fc or down; numbers between {-COEF:g} and {COEF:g}.")
 
 
+def scorable(pref: dict) -> bool:
+    """At least MIN_HELD instances and controls in the score third and MIN_HELD / 2 instances in the val third (the
+    preference's MIN_PAIRS counts the fit third alone): removal measured to 1/MIN_HELD at least."""
+    sc, val = pref["parts"]["score"], pref["parts"]["val"]
+    return len(sc["instances"]) >= MIN_HELD and len(sc["controls"]) >= MIN_HELD and len(val["instances"]) >= MIN_HELD // 2
+
+
 def goals(prefs: list[dict], dev: float) -> list[dict]:
+    """The goals of the scorable preferences, in the preference builder's order."""
     import numpy as np
 
     import components
@@ -161,7 +171,7 @@ def goals(prefs: list[dict], dev: float) -> list[dict]:
     tokens = np.load(TOKENS, mmap_mode="r")
     decode = lambda xs: "".join(components.token_strings("vpd4l", xs))  # noqa: E731
     return [{"id": f"pref:{p['a']}->{p['b']}", "split": split_of(p["a"], p["b"], dev), "question": question(p, decode, tokens),
-             "pref": p} for p in sorted(prefs, key=lambda p: p.get("order", 0))]
+             "pref": p} for p in sorted(prefs, key=lambda p: p.get("order", 0)) if scorable(p)]
 
 
 @contextlib.contextmanager
@@ -401,7 +411,7 @@ def main():
     if args.cmd == "goals":
         rows = goals(read(args.prefs), args.dev)
         Path(args.out).write_text("".join(json.dumps(r) + "\n" for r in rows))
-        return print(f"{len(rows)} goals, {sum(r['split'] == 'dev' for r in rows)} dev")
+        return print(f"{len(rows)} goals of {len(read(args.prefs))} preferences, {sum(r['split'] == 'dev' for r in rows)} dev")
     _, ver = load(args.device)
     gs = read(args.goals)
     if args.cmd == "gate":

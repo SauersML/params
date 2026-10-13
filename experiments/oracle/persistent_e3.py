@@ -1,0 +1,342 @@
+"""Persistent E3 (#2951 graph oracle, the lead's 10-12): does a behaviour's circuit say where the model would change?
+
+A preference stated without any subcomponent, "after token a the model predicts b", is a behaviour in behaviours.py's
+form on split B of the atlas's Pile rows, in thirds (fit, validation, score):
+  instances   positions whose token is a and whose most likely next token is b;
+  controls    positions where b is the most likely next token after another token (the same knowledge elsewhere).
+Defined in advance:
+  intended change   at the instances, b's margin (log2 of b over the best other token) falls, at most to crossing
+                    (goal_bits = min(m0, m0 - m), at least 0; flipped: m < 0);
+  collateral        the KL in bits at every other position of the rows and on the held Pile texts (edit_eval's
+                    HELD_ROWS), and the controls kept (b still the most likely token there).
+Net per position of text, as behaviours.py: rate x goal_bits - collateral per position.
+
+The edit: a rank-r update B A^T to one weight matrix, applied at every position of every text (a weight edit), fitted
+by Adam to the fit third's net (and the search's held texts), the step with the best validation net kept, scored on the
+score third. At a site, the same fit restricted to a set of subcomponents' read directions v and write directions u
+(A = V_k a, B = U_k b, step sizes matched to the unconstrained fit's): the circuit's (the subcomponents with the largest
+measured local ablation effect on the margin at fit instances, behaviours.py's ranking), as many random subcomponents
+active at the instances, as many random ones of the matrix, and VPD's most active ones there. Gate: the circuit's
+restricted net (as a share of the unconstrained net) above the random sets' and VPD's on the score third.
+
+  persistent_e3.py prefs OUT.jsonl [--k 6]        the Mac (the atlas's activity): preferences, thirds, circuits, sets
+  persistent_e3.py fit PREFS.jsonl OUT.jsonl [--steps 200] [--screen 25] [--device cuda] [--offset K --stride S]   a pod
+  persistent_e3.py table OUT.jsonl
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "method" / "oracle"))
+sys.path.insert(0, str(ROOT / "method" / "vpd"))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import edit_eval  # noqa: E402
+import native  # noqa: E402
+
+import finetune_edit  # noqa: E402
+
+LN2 = math.log(2)
+ROWS = (5000, 6000)  # behaviours.py's split B and thirds
+THIRDS = {"fit": (5000, 5333), "val": (5333, 5666), "score": (5666, 6000)}
+CAP = {"fit": 24, "val": 24, "score": 64}  # instances (and controls) per third
+MIN_PAIRS = 40  # a preference's instances in the fit third, at least
+POOL = 128  # subcomponents ranked by local effect
+K_SET = 8  # subcomponents per restricted set at a site
+DRAWS = 2
+RANK = 1
+TOKENS = Path.home() / "mpd-data/atlas/vpd4l/tokens_0_6000.npy"
+
+
+def _top_tokens(ee, rows: range, tokens) -> dict:
+    """row -> (ids [T], the most likely next token at each position)."""
+    out = {}
+    for r in rows:
+        ids = tokens[r, :512].astype(np.int64).tolist()
+        out[r] = (ids, ee.reference(ids).argmax(-1).tolist())
+    return out
+
+
+def preferences(ee, src, k: int, decode, log=print) -> list[dict]:
+    """The k most frequent (a, b) with b the most likely token after a at least MIN_PAIRS times in the fit third and
+    predicted after other tokens about as often (controls exist), distinct b; each a behaviour (behaviours.py's dict:
+    parts with instances, controls, rate)."""
+    tops = _top_tokens(ee, range(*ROWS), src.tokens)
+    pairs, b_count = {}, {}
+    for r in range(*THIRDS["fit"]):
+        ids, top = tops[r]
+        for p in range(1, len(ids)):
+            pairs[(ids[p], top[p])] = pairs.get((ids[p], top[p]), 0) + 1
+            b_count[top[p]] = b_count.get(top[p], 0) + 1
+    ranked = sorted((n, a, b) for (a, b), n in pairs.items() if n >= MIN_PAIRS and a != b and b_count[b] - n >= MIN_PAIRS)
+    out, used = [], set()
+    for n, a, b in reversed(ranked):
+        if b in used or len(out) >= k:
+            continue
+        used.add(b)
+        beh = {"subcomponent": ["preference", f"{a}->{b}"], "a": a, "b": b, "S": [b], "describe": {"a": decode([a]), "b": decode([b])},
+               "parts": {}}
+        for part, (r0, r1) in THIRDS.items():
+            inst, ctrl = [], []
+            for r in range(r0, r1):
+                ids, top = tops[r]
+                inst += [(r, p) for p in range(1, len(ids)) if ids[p] == a and top[p] == b]
+                ctrl += [(r, p) for p in range(1, len(ids)) if ids[p] != a and top[p] == b]
+            rate = len(inst) / ((r1 - r0) * 511)
+            rng = random.Random(f"{a}-{b}-{part}")
+            rng.shuffle(inst)
+            rng.shuffle(ctrl)
+            beh["parts"][part] = {"instances": inst[:CAP[part]], "controls": ctrl[:CAP[part]], "rate": rate}
+        out.append(beh)
+        log(f"preference {decode([a])!r} -> {decode([b])!r}: {n} fit pairs, rate {beh['parts']['fit']['rate']:.2e}")
+    return out
+
+
+def circuit_sets(ee, src, beh: dict, log=print) -> dict:
+    """The behaviour's subcomponents by measured local ablation effect at fit instances (behaviours.BehaviourEval
+    .local_effects over those active at two or more), and VPD's by activity count there."""
+    import behaviours
+
+    be = behaviours.BehaviourEval(ee, src, beh)
+    fit = [(r, p) for r, _, v in be.texts["fit"] for p in v["instances"]]
+    count = src.active_at(fit)
+    nodes = [src.node(f) for f, n in sorted(count.items(), key=lambda x: -x[1]) if n >= 2]
+    eff = be.local_effects(nodes, [])
+    order = np.argsort(-eff, kind="stable")[:POOL]
+    log(f"  {len(nodes)} subcomponents active at >= 2 fit instances; best local effect {eff[order[0]]:.3f} bits")
+    return {"circuit": [[nodes[i][0], int(nodes[i][1]), float(eff[i])] for i in order],
+            "active": [[s, int(i), int(count[src.flat(s, i)])] for s, i in nodes]}
+
+
+# ---- the fits
+
+
+def _texts(beh: dict, part: str, tokens) -> list[tuple[list[int], list[int], list[int]]]:
+    """(ids, instance positions, control positions) per row of the third holding either."""
+    by = {}
+    for kind in ("instances", "controls"):
+        for r, p in beh["parts"][part][kind]:
+            by.setdefault(r, ([], []))[kind == "controls"].append(p)
+    return [(tokens[r, :max(i + c) + 1].astype(np.int64).tolist(), i, c) for r, (i, c) in sorted(by.items())]
+
+
+def _margin(lq: torch.Tensor, b: int) -> torch.Tensor:
+    other = lq.clone()
+    other[..., b] = -math.inf
+    return (lq[..., b] - other.max(-1).values) / LN2
+
+
+class Net:
+    """The behaviour's net per position of text (module docstring) for a dense update at a site, differentiable."""
+
+    def __init__(self, nat, beh: dict, tokens, held: dict):
+        """held: {"search": texts for the fit and validation thirds, "held": texts for the score third} (edit_eval's)."""
+        self.nat, self.b, self.rate = nat, beh["b"], {p: beh["parts"][p]["rate"] for p in THIRDS}
+        self.texts = {p: _texts(beh, p, tokens) for p in THIRDS}
+        self.held = {p: held["held" if p == "score" else "search"] for p in THIRDS}
+        with torch.no_grad():
+            self.ref = {p: [finetune_edit.logq(nat, [ids])[0] for ids, _, _ in self.texts[p]] for p in THIRDS}
+            self.ref_held = {p: [finetune_edit.logq(nat, [ids])[0] for ids in self.held[p]] for p in THIRDS}
+
+    def __call__(self, part: str, site: str | None, A=None, B=None, grad: bool = True) -> dict:
+        nat = self.nat
+        goal, n, coll, kept, nc, flipped = 0.0, 0, 0.0, 0.0, 0, 0.0
+        with torch.set_grad_enabled(grad):
+            for (ids, inst, ctrl), lp in zip(self.texts[part], self.ref[part]):
+                lq = finetune_edit.logq(nat, [ids], site, A, B, torch.ones(len(ids), device=nat.dev))[0] if site else lp
+                kl = finetune_edit.kl_bits(lp, lq)
+                if inst:
+                    m0, m = _margin(lp[inst], self.b), _margin(lq[inst], self.b)
+                    goal = goal + torch.minimum(m0, m0 - m).clamp_min(0).sum()
+                    flipped += float((m < 0).float().sum())
+                    n += len(inst)
+                rest = torch.ones(len(ids), dtype=torch.bool, device=kl.device)
+                rest[inst] = False
+                coll = coll + kl[rest].sum() / max(1, int(rest.sum()))
+                if ctrl:
+                    kept += float((lq[ctrl].argmax(-1) == self.b).float().sum())
+                    nc += len(ctrl)
+            rows = len(self.texts[part])
+            held = 0.0
+            for ids, lp in zip(self.held[part], self.ref_held[part]):
+                lq = finetune_edit.logq(nat, [ids], site, A, B, torch.ones(len(ids), device=nat.dev))[0] if site else lp
+                held = held + finetune_edit.kl_bits(lp, lq).sum() / len(ids)
+            gb = goal / max(1, n)
+            ct = coll / max(1, rows) + held / max(1, len(self.held[part]))
+            net = self.rate[part] * gb - ct
+        f = lambda x: float(x.detach()) if torch.is_tensor(x) else float(x)  # noqa: E731
+        return {"net": net, "goal_bits": f(gb), "goal_per_token": self.rate[part] * f(gb), "collateral_per_token": f(ct),
+                "flipped": flipped / max(1, n), "controls_kept": kept / nc if nc else None}
+
+
+def fit(net: Net, site: str, steps: int, basis=None, lr: float = 0.01, seed: int = 0, every: int = 25) -> dict:
+    """A, B by Adam on the fit third's net, the step with the best validation net (every `every` steps) scored on the
+    score third. basis (V_k, U_k): restricted, step sizes matched to the unconstrained fit's (finetune_edit.fit)."""
+    nat = net.nat
+    st = nat.target.site(site)
+    d_out, d_in = st.W.shape
+    g = torch.Generator().manual_seed(seed)
+    if basis is None:
+        a = (torch.randn(d_in, RANK, generator=g) / math.sqrt(d_in)).to(nat.dev).requires_grad_(True)
+        b = torch.zeros(d_out, RANK, device=nat.dev, requires_grad=True)
+        AB = lambda: (a, b)  # noqa: E731
+        la, lb = lr, lr
+    else:
+        Vk, Uk = basis
+        k = Vk.shape[1]
+        a = (torch.randn(k, RANK, generator=g) / math.sqrt(k)).to(nat.dev).requires_grad_(True)
+        b = torch.zeros(k, RANK, device=nat.dev, requires_grad=True)
+        AB = lambda: (Vk @ a, Uk @ b)  # noqa: E731
+        la, lb = lr * math.sqrt(d_in / k), lr * math.sqrt(d_out / k)
+    opt = torch.optim.Adam([{"params": [a], "lr": la}, {"params": [b], "lr": lb}])
+    best = (-math.inf, None, -1)
+    for step in range(steps + 1):
+        if step % every == 0 or step == steps:
+            A, B = AB()
+            v = net("val", site, A.detach(), B.detach(), grad=False)["net"]
+            if float(v) > best[0]:
+                best = (float(v), (A.detach().clone(), B.detach().clone()), step)
+        if step == steps:
+            break
+        A, B = AB()
+        r = net("fit", site, A, B)
+        opt.zero_grad()
+        (-r["net"]).backward()
+        opt.step()
+    A1, B1 = best[1]
+    sc = net("score", site, A1, B1, grad=False)
+    return {"site": site, "k": None if basis is None else basis[0].shape[1], "val_net": best[0], "best_step": best[2],
+            **{k: float(v) if torch.is_tensor(v) else v for k, v in sc.items()}}
+
+
+def run(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None) -> dict:
+    """One preference: the unconstrained fit screened over the 24 matrices (screen steps, validation net), at the best
+    one and at the circuit's most populated matrix every restricted set (module docstring)."""
+    t0 = time.time()
+    net = Net(nat, beh, tokens, held)
+    base = net("score", None, grad=False)
+    shots = {n: fit(net, n, screen)["val_net"] for n in (names or nat.names)}
+    top = max(shots, key=shots.get)
+    circ = [tuple(c[:2]) for c in beh["circuit"]]
+    by_site = {}
+    for s, i in circ[:32]:
+        by_site[s] = by_site.get(s, 0) + 1
+    sites = list(dict.fromkeys([top, max(by_site, key=by_site.get)]))
+    out = {"preference": beh["describe"], "a": beh["a"], "b": beh["b"], "rate": beh["parts"]["score"]["rate"], "unedited": base,
+           "screen": shots, "sites": {}}
+    for site in sites:
+        C = nat.target.site(site).V.shape[1]
+        mine = [i for s, i in circ if s == site][:K_SET]
+        rec = {"free": fit(net, site, steps)}
+        if mine:
+            k = len(mine)
+            g = torch.Generator().manual_seed(native.task_seed(f"{beh['a']}-{beh['b']}-{site}"))
+            act = [i for s, i, _ in sorted(beh["active"], key=lambda x: -x[2]) if s == site]
+            others = [i for i in act if i not in mine]
+            draws = [[others[j] for j in torch.randperm(len(others), generator=g)[:k].tolist()] for _ in range(DRAWS)] if others else []
+            rand = [torch.randperm(C, generator=g)[:k].tolist() for _ in range(DRAWS)]
+            sets = {"circuit": [mine], "active": draws, "random": rand, "vpd_top": [act[:k]] if act else []}
+            for name, ss in sets.items():
+                rec[name] = [dict(fit(net, site, steps, basis=finetune_edit.basis(nat, site, s_)), set=s_) for s_ in ss if s_]
+        out["sites"][site] = rec
+        msg = f"{site}: free {rec['free']['net']:.2e}"
+        for name in ("circuit", "active", "random", "vpd_top"):
+            if rec.get(name):
+                msg += f", {name} " + "/".join(f"{x['net']:.2e}" for x in rec[name])
+        log(f"{beh['describe']['a']!r}->{beh['describe']['b']!r} {msg}")
+    out["seconds"] = time.time() - t0
+    return out
+
+
+def table(rows: list[dict]) -> str:
+    """Per preference and site the score third's net (per position of text) of each set as a share of the
+    unconstrained fit's, its flipped share and controls kept; then the gate: the circuit's share above every control's,
+    per preference, and the medians."""
+    import statistics as st
+
+    lines = ["preference              site               free net  circuit  active  random  vpd_top | flipped c/f  kept c/f"]
+    wins = {"active": 0, "random": 0, "vpd_top": 0}
+    shares = {k: [] for k in ("circuit", "active", "random", "vpd_top")}
+    n = 0
+    for r in rows:
+        for site, rec in r["sites"].items():
+            f = rec["free"]["net"]
+            if f <= 0 or not rec.get("circuit"):
+                continue
+            n += 1
+            sh = {k: st.median(x["net"] for x in rec[k]) / f for k in shares if rec.get(k)}
+            for k, v in sh.items():
+                shares[k].append(v)
+            for k in wins:
+                wins[k] += k in sh and sh["circuit"] > sh[k]
+            c = rec["circuit"][0]
+            lines.append(f"{r['preference']['a']!r:>9s}->{r['preference']['b']!r:<11s} {site:18s} {f:9.2e}  "
+                         + "  ".join(f"{sh.get(k, float('nan')):6.2f}" for k in shares)
+                         + f" | {c['flipped']:.2f}/{rec['free']['flipped']:.2f}  {c['controls_kept'] or 0:.2f}/{rec['free']['controls_kept'] or 0:.2f}")
+    lines.append("medians: " + ", ".join(f"{k} {st.median(v):.2f}" for k, v in shares.items() if v)
+                 + "; circuit above " + ", ".join(f"{k} in {w}/{n}" for k, w in wins.items()))
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("prefs")
+    p.add_argument("out")
+    p.add_argument("--k", type=int, default=6)
+    p.add_argument("--device", default="cpu")
+    f = sub.add_parser("fit")
+    f.add_argument("prefs")
+    f.add_argument("out")
+    f.add_argument("--steps", type=int, default=200)
+    f.add_argument("--screen", type=int, default=25)
+    f.add_argument("--device", default="cpu")
+    f.add_argument("--offset", type=int, default=0)
+    f.add_argument("--stride", type=int, default=1)
+    f.add_argument("--sites", nargs="*", help="screen these matrices only (a smoke test)")
+    t = sub.add_parser("table")
+    t.add_argument("rows")
+    args = ap.parse_args()
+    read = lambda x: [json.loads(y) for y in Path(x).read_text().splitlines() if y.strip()]  # noqa: E731
+    if args.cmd == "table":
+        return print(table(read(args.rows)))
+    import components
+
+    decode = lambda xs: "".join(components.token_strings("vpd4l", xs))  # noqa: E731
+    nat = native.Native(args.device)
+    if args.cmd == "prefs":
+        import behaviours
+
+        ee = edit_eval.EditEval(nat)
+        src = behaviours.Source()
+        with open(args.out, "w") as fh:
+            for beh in preferences(ee, src, args.k, decode, log=lambda s: print(s, flush=True)):
+                beh.update(circuit_sets(ee, src, beh, log=lambda s: print(s, flush=True)))
+                fh.write(json.dumps(beh) + "\n")
+        return
+    for q in nat.target.parameters():
+        q.requires_grad_(False)
+    tokens = np.load(TOKENS, mmap_mode="r")
+    tk = np.load(edit_eval.TOKENS)
+    held = {k: [list(map(int, x)) for x in tk[k]] for k in ("search", "held")}
+    for i, beh in enumerate(read(args.prefs)):
+        if i % args.stride != args.offset:
+            continue
+        r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
+        with open(args.out, "a") as fh:
+            fh.write(json.dumps(r) + "\n")
+
+
+if __name__ == "__main__":
+    main()

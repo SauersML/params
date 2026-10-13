@@ -19,6 +19,7 @@ def main():
     parser = argparse.ArgumentParser()
     for name in ("source", "payload", "reward-source", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--case", choices=("redundant_000", "cancel_001", "gate_000"), default="redundant_000")
     args = parser.parse_args()
     if args.out.exists():
         raise RuntimeError("do not overwrite frozen search")
@@ -44,7 +45,9 @@ def main():
     for name, expected in protocol["files"].items():
         if hashlib.sha256((args.payload / name).read_bytes()).hexdigest() != expected:
             raise RuntimeError("frozen TRAIN fixture changed")
-    ident = "redundant_000"
+    ident = args.case
+    expected_worlds = {"redundant_000": 84, "cancel_001": 76, "gate_000": 100}[ident]
+    forward_cap = 69 * expected_worlds  # 3 setup +64 candidate +2 final crosscheck.
     root = args.payload / "cases" / ident
     record = json.loads((root / (ident + ".json")).read_text())
     texts = [list(example["ids"]) for example in record["examples"]]
@@ -54,8 +57,8 @@ def main():
     files = [Path(__file__), args.reward_source, here / "intervention_teacher.py",
              here / "reward_interventions.py", here / "head_counterfactual.py", here / "render.py"]
     write_json(args.out / "pre_native_contract.json", {
-        "case": ident, "inputs": texts, "max_attempts": 64, "worlds": 84,
-        "forward_cap": 5796, "worst_kl_max": .001,
+        "case": ident, "inputs": texts, "max_attempts": 64, "worlds": expected_worlds,
+        "forward_cap": forward_cap, "worst_kl_max": .001,
         "selection": "architecture-first original nonzero pieces; no teacher truth",
         "executor": "cd8d4a9c2dfc0d3b28bc6604e0549e16aceb3aa4",
         "source_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files},
@@ -66,7 +69,7 @@ def main():
     neuron_count = sum(int(nat.target.site(f"h.{layer}.mlp.down_proj").W.ne(0).any(dim=0).sum())
                        for layer in range(nat.target.n_layer))
     planned_worlds = len(texts) * (1 + 2 * (nat.target.n_layer * nat.target.n_head + neuron_count))
-    if planned_worlds != 84 or teacher.MAX_ATTEMPTS != 64 or teacher.WORST_KL_MAX != .001:
+    if planned_worlds != expected_worlds or teacher.MAX_ATTEMPTS != 64 or teacher.WORST_KL_MAX != .001:
         raise RuntimeError("predeclared work/feasibility bound changed before scoring")
     before = teacher.binding(toy, nat, texts, [])
     write_json(args.out / "original_source_binding.json", before)
@@ -94,7 +97,7 @@ def main():
     write_json(args.out / "restored_source_binding.json", restored)
     cache = result.pop("cache")
     worlds = len(cache["references"])
-    if worlds != 84 or teacher.MAX_ATTEMPTS != 64:
+    if worlds != expected_worlds or teacher.MAX_ATTEMPTS != 64:
         raise RuntimeError("predeclared world/attempt bound changed")
     # First search result is frozen before any truth interpretation or crosscheck.
     write_json(args.out / "frozen_search_result.json", result)
@@ -107,6 +110,7 @@ def main():
               str(args.out / "cached_references.safetensors"))
     write_json(args.out / "reference_cache.json", {key: value for key, value in cache.items() if key != "references"})
     if result["target"] is None:
+        write_json(args.out / "training_row.json", teacher.training_row(toy, result, nat=nat))
         write_json(args.out / "complete.json", {"status": result["status"], "target": None,
                    "forward_upper_bound_used": 3 * worlds + worlds * len(attempts),
                    "actual_forwards": sum(3 if row["stage"] == "reference" else 1 for row in evidence)})
@@ -145,7 +149,7 @@ def main():
                                        2 if item["stage"] == "uncached_final" else 1 for item in evidence),
                 "target_sha256": result["target_sha256"], "usable_training_row": row["usable"],
                 "worst_kl_bits": max(r["kl_bits"] for r in uncached["per_world"])}
-    if complete["forward_upper_bound_used"] > 5796:
+    if complete["forward_upper_bound_used"] > forward_cap:
         raise RuntimeError("forward cap exceeded")
     write_json(args.out / "complete.json", complete)
     print(json.dumps(complete), flush=True)

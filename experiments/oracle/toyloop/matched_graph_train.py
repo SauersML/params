@@ -19,6 +19,8 @@ MODEL='Qwen/Qwen3-8B'
 ARMS=('point','intervention')
 SDK_VERSION='0.33.1'
 LR=.00047297908091376354
+FAMILIES=('additive_vote','bigram_mlp','binding_positional','cancel','copy_offset','gate','induction','redundant')
+OLD_TRAIN=('additive_vote_000','bigram_mlp_000','binding_positional_001','cancel_002','copy_offset_000','gate_003','induction_001','redundant_001')
 
 
 def encoded(value):return json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False)
@@ -68,7 +70,8 @@ def validate(payload):
     expected_optim=[{'learning_rate':LR*(1-step/24),'beta1':.9,'beta2':.95,'eps':1e-8} for step in range(24)]
     if recipe['initialization']!=expected_init or recipe['optimizer']!=expected_optim or recipe['loss_fn']!='cross_entropy' or recipe['sampling']!={'temperature':0.,'max_tokens':416,'num_samples':1} or recipe['evaluation_arms']!=['base',*ARMS]:raise ValueError('explicit optimizer/init/sample recipe changed')
     ids=[r['id'] for r in c['training']]
-    if len(ids)!=24 or len(set(ids))!=24 or recipe['sample_ids']!=[[ids[i] for i in b] for b in batches]:raise ValueError('training sample IDs/schedule disagree')
+    expected_ids=list(OLD_TRAIN)+[f'{f}_{3100000+100*i+v}' for i,f in enumerate(FAMILIES) for v in (0,1)]
+    if ids!=expected_ids or recipe['sample_ids']!=[[ids[i] for i in b] for b in batches]:raise ValueError('training sample IDs/schedule disagree')
     lengths={};masses={}
     for a in ARMS:
         parsed=[datum_values(d) for d in payload['data'][a]]
@@ -79,6 +82,7 @@ def validate(payload):
     if any(abs(x-y)>2e-6*max(x,y) for x,y in zip(masses['point'],masses['intervention'])):raise ValueError('paired row mass changed')
     prompts=[tokens(p) for p in payload['prompts']]
     if len(prompts)!=32 or len(c['panel'])!=32 or len({(r['stratum'],r['id']) for r in c['panel']})!=32:raise ValueError('fixed 32-case first-response panel required')
+    if [r['id'] for r in c['panel'] if r['stratum']=='new_model']!=[f'{f}_{3200000+100*i}' for i,f in enumerate(FAMILIES)] or sum(r['stratum']=='retention' for r in c['panel'])!=24:raise ValueError('new-model/retention panel coverage changed')
     if any(len(p)+416+16>32768 or len(p)!=r['prompt_tokens'] or digest(p)!=r['rendered_sha256'] for p,r in zip(prompts,c['panel'])):raise ValueError('panel tokens/fit changed')
     stops=payload['stop_sequences']
     if not isinstance(stops,list) or not stops or not (all(type(x)is str for x in stops) or all(type(x)is int for x in stops)):raise ValueError('explicit homogeneous stop sequences required')
@@ -136,7 +140,7 @@ def execute(prepared,proof_path,approval_path,out,api=None):
         nonlocal spent,reserved
         call_id,reservation=ticket;amount=sum((Decimal(n)*rates[k] for k,n in counts.items()),Decimal(0))/Decimal(1000000)
         if amount>reservation:raise ValueError('provider accounting exceeds reservation')
-        spent+=amount;reserved-=reservation;journal('settled',call_id=call_id,counts=counts,usd=str(amount),actual_usd=str(spent),remaining_reserved_usd=str(reserved))
+        spent+=amount;reserved-=reservation;journal('settled',call_id=call_id,counts=counts,usd=str(amount),accounted_upper_usd=str(spent),remaining_reserved_usd=str(reserved))
     service=None
     try:
         journal('service_create_intent',project=PROJECT);service=api.ServiceClient(project_id=PROJECT)
@@ -182,9 +186,9 @@ def execute(prepared,proof_path,approval_path,out,api=None):
             journal('trained_checkpoint_intent',arm=a);path=clients[a].save_state(a+'-matched-graph-eight-epoch').result().path
             append(out/(a+'_checkpoint.jsonl'),{'path':path});journal('trained_sampler_intent',arm=a)
             sample(clients[a].save_weights_and_get_sampling_client(),a)
-        append(out/'complete.jsonl',{'actual_usd':str(spent),'remaining_reserved_usd':str(reserved),'steps_per_arm':24,'first_responses_per_arm':32})
+        append(out/'complete.jsonl',{'accounted_upper_usd':str(spent),'remaining_reserved_usd':str(reserved),'steps_per_arm':24,'first_responses_per_arm':32})
     except BaseException as exc:
-        append(out/'failure.jsonl',{'error':type(exc).__name__,'actual_usd':str(spent),'uncertain_reserved_usd':str(reserved),'automatic_retry':False});raise
+        append(out/'failure.jsonl',{'error':type(exc).__name__,'accounted_upper_usd':str(spent),'uncertain_reserved_usd':str(reserved),'automatic_retry':False});raise
     finally:
         if service is not None:
             try:service.close('success' if (out/'complete.jsonl').exists() else 'errored').result()

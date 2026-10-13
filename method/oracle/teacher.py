@@ -720,6 +720,7 @@ class Acceptance:
         self.ge, self.tx, self.kinds, self.mode, self.calls, self.pool_adv = ge, tx, tuple(kinds), mode, 0, pool
         self._phi_base = {}                                  # (the current circuit's key) -> its reward-mode row
         self.draws, self.refused, self.pool, self.rank_floor = draws, [], None, {}
+        self._floor_base, self._screens = {}, {}            # "floors": the current circuit's row; flips' shortlists
         if draws in ("discriminating", "fresh", "fv") and mode != "pp":
             raise ValueError("discriminating draws score s_track_pp: mode pp")
 
@@ -836,6 +837,54 @@ class Acceptance:
         got = ge.phi_variants(tx, graph, torch.tensor(keep, dtype=torch.bool), self.pool_adv, base=self._phi_base[key], start=bar)
         return [v["phi"] for v in got["variants"]]
 
+    def floor_rows(self, graph_of, now: torch.Tensor, ons: torch.Tensor, floors: dict) -> list:
+        """The "floors" kind (the lead's v2.3, 10-13: pruning stops at the first removal that puts a family under the
+        reward's floor, not at the stage scoring after it): per candidate (a removal from the current set now), its
+        families as the reward reads them, against floors ({family: floor}); the families GoalEval.phi_variants
+        recomputes from one plan of the current circuit (point, nodes, track_pp, interchange_pp, patching near and far,
+        pattern, N, on the current circuit's reward-mode row), then, on the candidates still at their floors, each
+        family it holds run on those alone: edges (_edge_family), omitted (_omitted_family), flips (adversary_flips to
+        FLIP_TERM, the measured shortlist shared by the search's candidates). Per candidate {family: score} or None
+        (its first family under the floor recorded in refused)."""
+        ge, tx, nat = self.ge, self.tx, self.ge.nat
+        g_now = graph_of(now)
+        key = self.key(now)
+        if key not in self._floor_base:
+            self._floor_base = {key: ge.fidelity(tx, [g_now], self.pool_adv, mode="reward", split="search")[0]}
+        graphs = [graph_of(on) for on in ons]
+        got = ge.phi_variants(tx, g_now, ge.keep_of(tx, g_now, [sorted(h.node_set()) for h in graphs]), self.pool_adv,
+                              base=self._floor_base[key])["variants"]
+        held = ("edges", "omitted", "flips")
+        out = [{f: goal_eval.family_score(v["row"], f) for f in floors if f not in held} for v in got]
+
+        def under(i):                                        # the first family under its floor (unscored: 0)
+            return next((f for f, s in out[i].items() if (s or 0.0) < floors[f] - 1e-9), None)
+        e0 = ge._bounds(tx, "live")[0]
+        for fam in held:                                     # the costly families on the survivors only
+            alive = [i for i in range(len(out)) if under(i) is None]
+            if fam not in floors or not alive:
+                continue
+            cg = [goal_eval._c_graph(graphs[i], tx.targets, nat.C) for i in alive]
+            if fam == "edges":
+                rows = [{"s_edges": goal_eval._fid(e0, r["kl_edges_c"], r["kl_edges_vpd"]) if r.get("kl_edges_c") is not None else None}
+                        for r in ge._edge_family(tx, cg, goal_eval.DRAWS, True)]
+            elif fam == "omitted":
+                rows = ge._omitted_family(tx, cg)
+            else:
+                rows = [{"f1_flips_c": r.get("f1_flips_omitted", {})} for r in
+                        ge.adversary_flips(tx, cg, self.pool_adv, "omitted", upto=goal_eval.FLIP_TERM, screens=self._screens)]
+            for i, r in zip(alive, rows):
+                out[i][fam] = goal_eval.family_score(r, fam)
+        for i, on in enumerate(ons):
+            f = under(i)
+            if f is not None:
+                removed = (now & ~on).nonzero().flatten().tolist() if now.shape == on.shape else []
+                self.refused.append({"stage": "floors", "removed": removed, "family": f, "score": out[i].get(f),
+                                     "floor": floors[f]})
+                out[i] = None
+        native.free(nat.dev)
+        return out
+
     def validation(self, graph: native.Graph) -> tuple:
         """A circuit's (s_track_pp, low) on the fixed validation draws (the other half of search_pool, at most
         POOL_DRAWS) as ranked() judges them."""
@@ -891,7 +940,9 @@ class Acceptance:
         candidates are removals from (default start), label and names(unit ids) naming a refused removal."""
         disc = self.draws in ("discriminating", "fresh", "fv") and "changed" in self.kinds and bool(self._halves()[0])
         by_phi = "phi" in self.kinds
-        rest = Acceptance(self.ge, self.tx, [k for k in self.kinds if not (disc and k == "changed") and k != "phi"], self.mode)
+        by_floors = "floors" in self.kinds and self.pool_adv is not None
+        rest = Acceptance(self.ge, self.tx, [k for k in self.kinds if not (disc and k == "changed") and k not in ("phi", "floors")],
+                          self.mode)
         current = current or (lambda: start)
 
         def run(ons):
@@ -914,6 +965,11 @@ class Acceptance:
             floor = {k: floor_of(v) for k, v in base.items()}
         if by_phi and base.get("phi") is not None:
             floor["phi"] = min(base["phi"], bar) + PHI_SLACK
+        if by_floors:                                        # the reward's per-family floors, at most the search start's
+            tau = self.ge.tau(self.tx, self.pool_adv, "search")   # own score (an expanded or forward start below a floor
+            row0 = self.ge.fidelity(self.tx, [graph_of(start)], self.pool_adv, mode="reward", split="search")[0]   # may still
+            self._floor_base = {self.key(start): row0}       # prune, never further down)
+            fams = {f: min(v, goal_eval.family_score(row0, f) or 0.0) for f, v in (tau.get("floors") or {}).items()}
 
         def judge(ons):                                      # the changed term on the draws each candidate is most at
             now = current()                                  # odds with the current circuit on
@@ -939,6 +995,18 @@ class Acceptance:
             return out
 
         def accept(ons):
+            out = accept_terms(ons)
+            if not by_floors:
+                return out
+            alive = [i for i, r in enumerate(out) if r is not None]   # the floors last, on the candidates the cheap
+            if not alive:                                    # terms admit
+                return out
+            sub = ons[torch.tensor(alive, dtype=torch.long, device=ons.device)]
+            for i, r in zip(alive, self.floor_rows(graph_of, current(), sub, fams)):
+                out[i] = None if r is None else {**out[i], **{f"floor_{k}": v for k, v in r.items()}}
+            return out
+
+        def accept_terms(ons):
             if by_phi:                                       # phi first, the other terms on the survivors
                 ph = self.phi_of(graph_of(current()), [graph_of(on) for on in ons], bar)
                 first = [{"phi": x} if x is not None and x >= floor["phi"] else None for x in ph]
@@ -1946,7 +2014,8 @@ def main():
     ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "
                     ">= min(0.9, the search's start's): changed (s_track, goal_eval.changed_search), interchange (s_interchange), "
                     "donors (s_patching_near and s_patching_far, donors_search), necessity (n_spec, necessity_spec), nodes, "
-                    "edges, pattern (s_nodes, s_edges, s_pattern: phi's families as fidelity scores them)")
+                    "edges, pattern (s_nodes, s_edges, s_pattern: phi's families as fidelity scores them), floors (every "
+                    "family the reward floors at or above its floor, Acceptance.floor_rows; needs the phi pool, implied)")
     ap.add_argument("--no-strand", action="store_true",
                     help="with --edges, every non-query/key node keeps a stated connection (its most important; one the model connects "
                          "to no other node is dropped): the stated graph is the claim, a listed node needs a stated role")
@@ -2004,7 +2073,8 @@ def main():
             r = json.loads(line)
             labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
-    phi_pool_needed = args.phi_check or args.phi_log or bool(args.forward) or args.backup or "phi" in args.accept.split(",")
+    phi_pool_needed = args.phi_check or args.phi_log or bool(args.forward) or args.backup or \
+        bool({"phi", "floors"} & set(args.accept.split(",")))
     args.phi_check = args.phi_check or args.phi_log or args.backup or bool(args.forward)
     pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" or phi_pool_needed else None
     for path in texts[args.offset::args.stride]:

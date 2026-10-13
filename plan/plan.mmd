@@ -552,6 +552,7 @@ flowchart BT
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
   CAPABLE["<b>Fresh two-route transfer fails</b><br/>V+8 faithful 2/8; BASE 3/8;<br/>input-only V-facts baseline 8/8;<br/>multi-route TRAIN support: 0/256<br/>MEASURED · codex/fork_review · $1.186"]
+  COMPOSECF["<b>Composition head edits: partial check</b><br/>20min timeout:6/8 cases complete;<br/>both policies768/768 tops, KL≤0.000031;<br/>823 saved worlds independently checked;<br/>2 cases incomplete · no full-panel claim<br/>PARTIAL · codex/fork_review · $0"]
   WEIGHTSEED["<b>Weight-guided teacher proposal</b><br/>K32 residual links; <=128 scalar nodes;<br/>original KL/search/FV floors gate;<br/>1 matched TRAIN case: seed rejected;<br/>same214edges, no speedup; 2 incomplete<br/>MEASURED · codex/fork_review · $0"]
   COMPOSE["<b>Composition helps specificity, regresses capability</b><br/>Old8 exact3→8; new8 exact6→8,<br/>both64/64 top; old24 reward .973→.895;<br/>cancel topology + gate default failures retained;<br/>120 STOP · 0.661 USD ·38420458214<br/>MIXED · CF next · codex/eval_recovery"]
   CAPCF["<b>Weight-edit ability recovered</b><br/>Best training and base:1792/1792 tops;<br/>worst KL0.00015 bits on4 toy models;<br/>half-strength edits expose weaker training<br/>MEASURED · codex/eval_recovery"]
@@ -697,6 +698,7 @@ flowchart BT
   RELTRAIN -. measured relation learning .-> C1
   RELTRAIN -. capacity remains unresolved .-> CAPABLE
   CAPABLE -. executed circuits and cost .-> C1
+  COMPOSE -. frozen head edits .-> COMPOSECF
   CAPABLE -. visible facts as measured proposals .-> WEIGHTSEED
   WEIGHTSEED -. ordinary teacher acceptance .-> C1
   CAPABLE -. test retained base capability .-> CAPCF
@@ -755,6 +757,7 @@ flowchart BT
   class WIRING done
   class RELTRAIN done
   class CAPABLE active
+  class COMPOSECF measured
   class WEIGHTSEED measured
   class COMPOSE active
   CAPABLE --> COMPOSE

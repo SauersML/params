@@ -85,10 +85,11 @@ def main():
     b.add_argument("--lora", default="0,16", help="comma list of LoRA ranks (0 = full fine-tune)")
     b.add_argument("--seq", type=int, default=1024)
     b.add_argument("--steps", type=int, default=3)
+    b.add_argument("--threads", type=int, default=4)
     a = ap.parse_args()
     for m in a.models.split(","):
         for r in a.lora.split(","):
-            print(json.dumps(bench(m, int(r), a.seq, steps=a.steps)), flush=True)
+            print(json.dumps({**bench(m, int(r), a.seq, steps=a.steps, threads=a.threads), "threads": a.threads}), flush=True)
 
 
 if __name__ == "__main__":

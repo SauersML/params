@@ -10,7 +10,7 @@ toy's name and truth). Sources: synthetic:N (render.synthetic), planted:DIR (toy
 RL: per prompt k samples; advantage = reward - group mean (divided by the group std with --std); loss = -mean over
 samples of advantage x mean completion-token log-prob, plus beta x KL(policy || frozen SFT policy) (the k3 estimator per
 token). One gradient step per batch of fresh samples (on-policy, so no ratio clipping). The reward is any
-reward(meta, completion) -> float: --reward f1 | f1_edges | module:function.
+reward(meta, completion) -> float: --reward f1 | f1_edges | exec (reward_exec.py) | module:function.
 """
 from __future__ import annotations
 
@@ -47,12 +47,15 @@ def examples(spec: str, truth_json: str | None = None) -> list[dict]:
     else:
         raise ValueError(spec)
     return [{"prompt": render.render(t), "completion": render.target_text(t.truth) if t.truth else None,
-             "meta": {"name": t.name, "truth": t.truth}} for t in toys]
+             "meta": {"name": t.name, "truth": t.truth, "toy": t}} for t in toys]
 
 
 def get_reward(spec: str):
     if spec in ("f1", "f1_edges"):
         return getattr(circuit, "reward_" + spec)
+    if spec == "exec":                 # executed sufficiency minus a per-unit cost (zoo / planted toys)
+        import reward_exec
+        return reward_exec.reward_exec
     mod, fn = spec.split(":")
     return getattr(importlib.import_module(mod), fn)
 

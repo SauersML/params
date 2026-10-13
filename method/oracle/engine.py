@@ -230,19 +230,20 @@ class Engine:
         B = next(iter(masks.values())).shape[0]
         norm, act = self._steps(search)
         norm, xh = self._norms(norm, fz), xh or {}
+
+        def site(n, hh):  # (_site's four-argument form without at_x: backup.Backup replaces _site with one)
+            return self._site(n, hh, masks[n], rec, xh[n]) if n in xh else self._site(n, hh, masks[n], rec)
         x = self.emb if search else self.emb.expand(B, -1, -1)
         for i in range(tg.n_layer):
             name = lambda k: native.site_name(i, k)  # noqa: E731
             h = norm(x, 2 * i)
             if search and i == tg.n_layer - 1:
                 return self._last(masks, x, h, name, norm, act, B)
-            q, k, v = (self._site(name(kd), h, masks[name(kd)], rec, xh.get(name(kd))).view(B, T, H, hd).transpose(1, 2)
-                       for kd in ("q_proj", "k_proj", "v_proj"))
+            q, k, v = (site(name(kd), h).view(B, T, H, hd).transpose(1, 2) for kd in ("q_proj", "k_proj", "v_proj"))
             y = F.scaled_dot_product_attention(tg._rope(q, T).to(v.dtype), tg._rope(k, T).to(v.dtype), v, is_causal=True)
-            x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, T, -1), masks[name("o_proj")], rec, xh.get(name("o_proj")))
+            x = x + site(name("o_proj"), y.transpose(1, 2).reshape(B, T, -1))
             h = norm(x, 2 * i + 1)
-            g = act(self._site(name("c_fc"), h, masks[name("c_fc")], rec, xh.get(name("c_fc"))))
-            x = x + self._site(name("down_proj"), g, masks[name("down_proj")], rec, xh.get(name("down_proj")))
+            x = x + site(name("down_proj"), act(site(name("c_fc"), h)))
         if fz is not None:
             return norm(x[:, self._targets], -1)
         return norm(x, -1)[:, self._targets]  # the final norm over every position, as vpd_model.Target.hidden

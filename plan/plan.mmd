@@ -178,7 +178,7 @@ flowchart BT
     T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>494 texts, held-out pp 0.965 · DONE"]
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
     T3["<b>Pruning, discriminating draws</b><br/>worst 16 of 64 at 0.9 refuses<br/>nearly every removal: 20k-node<br/>circuits; superseded by T4<br/>DONE (negative) · pymove"]
-    T4["<b>Teacher circuits v2</b><br/>influential set, prune only, fresh draws<br/>+ validation backtracking (d149b8d);<br/>6011: 211 nodes, eval 0.93 (VPD 0.78);<br/>9002 rerun after token fix (a2d9348);<br/>start above KL budget: relative (9c2252d)<br/>ACTIVE · pymove, fleet"]
+    T4["<b>Teacher circuits v2</b><br/>influential set, validated prune, phi-check,<br/>rank once (60655bd)<br/>6011: 211 → 81, eval 0.89 (VPD 0.44)<br/>9002: eval 0.985 (VPD 0.64)<br/>running: 180 texts on RunPod, 294 on MATS,<br/>dev 9000–9019 for Gate B<br/>ACTIVE · fleet, pymove"]
     T5["<b>Context-blocks teacher</b><br/>eval holds (0.90-0.95) but<br/>10^6-10^8 bits; VPD top k at<br/>its size ties or beats it<br/>CHECK · pymove"]
   end
 

@@ -378,12 +378,87 @@ def select(cands: list) -> tuple:
     return max(cands, key=lambda c: (c[0]["flipped"], -c[0]["collateral_per_token"]))
 
 
-METHODS = ("circuit_edit", "random_active", "random_any", "random_equal", "vpd_topk", "finetune")
+SCALE_CANDS = 16  # subcomponents whose activations circuit_scales learns a continuous scale for
+
+
+def fit_scales(net: Net, cands: list[tuple], steps: int, lam: float, keep: list, lr: float = 0.05, seed: int = 0,
+               every: int = 25) -> None:
+    """Continuous persistent scales of the candidates' activations (W - sum a_c u_c v_c^T, a learned): Adam on the fit
+    third's objective goal_bits - lam x collateral per token, every `every` steps a checkpoint's validation metrics and
+    its scales (as ops: (site, index, 1 - a)) to keep."""
+    nat = net.nat
+    by = {}
+    for j, (site, c) in enumerate(cands):
+        by.setdefault(site, []).append((j, int(c)))
+    alpha = torch.zeros(len(cands), device=nat.dev, requires_grad=True)
+    fixed = {site: (torch.tensor([j for j, _ in js], device=nat.dev), nat.target.site(site).V[:, [c for _, c in js]],
+                    nat.target.site(site).U[[c for _, c in js]].T) for site, js in by.items()}
+
+    def deltas(a):
+        return [(site, V, -U * a[idx][None, :]) for site, (idx, V, U) in fixed.items()]
+
+    opt = torch.optim.Adam([alpha], lr=lr)
+    rng = random.Random(seed)
+    for step in range(steps + 1):
+        if step and (step % every == 0 or step == steps):
+            a = alpha.detach().clone()
+            val = _score(net, "val", deltas(a))
+            keep.append((val, [(site, c, 1.0 - float(a[j])) for j, (site, c) in enumerate(cands)], {"lam": lam, "step": step}))
+        if step == steps:
+            break
+        r = net("fit", None, rng=rng, deltas=deltas(alpha))
+        opt.zero_grad()
+        (-(r["_gb"] - lam * r["_ct"])).backward()
+        opt.step()
+
+
+def fit_multi(net: Net, bases: dict, steps: int, rank: int, lam: float, keep: list, lr: float = 0.01, seed: int = 0,
+              every: int = 25) -> None:
+    """A rank-`rank` update at every position at each of several matrices, each restricted to its basis (V_k, U_k):
+    A = V_k a, B = U_k b, step sizes matched to an unconstrained fit's (fit()), all trained together on the fit third's
+    objective goal_bits - lam x collateral per token; every `every` steps a checkpoint's validation metrics and deltas
+    to keep."""
+    nat = net.nat
+    g = torch.Generator().manual_seed(seed)
+    params, groups = {}, []
+    for site, (Vk, Uk) in bases.items():
+        d_out, d_in = nat.target.site(site).W.shape
+        k = Vk.shape[1]
+        r = min(rank, k)
+        a = (torch.randn(k, r, generator=g) / math.sqrt(k)).to(nat.dev).requires_grad_(True)
+        b = torch.zeros(k, r, device=nat.dev, requires_grad=True)
+        params[site] = (Vk, Uk, a, b)
+        groups += [{"params": [a], "lr": lr * math.sqrt(d_in / k)}, {"params": [b], "lr": lr * math.sqrt(d_out / k)}]
+
+    def deltas(detach: bool = False):
+        out = []
+        for site, (Vk, Uk, a, b) in params.items():
+            A, B = Vk @ a, Uk @ b
+            out.append((site, A.detach().clone(), B.detach().clone()) if detach else (site, A, B))
+        return out
+
+    opt = torch.optim.Adam(groups)
+    rng = random.Random(seed)
+    for step in range(steps + 1):
+        if step and (step % every == 0 or step == steps):
+            ds = deltas(detach=True)
+            keep.append((_score(net, "val", ds), ds, {"lam": lam, "step": step, "sites": {s_: v[0].shape[1] for s_, v in bases.items()},
+                                                     "rank": rank}))
+        if step == steps:
+            break
+        r = net("fit", None, rng=rng, deltas=deltas())
+        opt.zero_grad()
+        (-(r["_gb"] - lam * r["_ct"])).backward()
+        opt.step()
+
+
+METHODS = ("circuit_edit", "random_active", "random_any", "random_equal", "vpd_topk", "finetune", "circuit_scales", "random_scales",
+           "circuit_ft", "random_ft")
 RANDOM_DRAWS = 2
 
 
 def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None,
-              methods: tuple = METHODS) -> dict:
+              methods: tuple = METHODS, rank: int | None = None) -> dict:
     """Delete a preference (the lead's practical edit): each method gives candidate edits on the fit third, one picked by
     the same rule on validation (select()), scored on the score third:
       circuit_edit   persistent scales of the circuit's subcomponents (greedy search() over its EDIT_CANDS by local
@@ -394,7 +469,14 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
       random_equal   as many random active subcomponents as the circuit edit's operations, ablated (RANDOM_DRAWS draws);
       vpd_topk       VPD's top k by attribution (the subcomponents most often active at the fit instances) ablated;
       finetune       an unconstrained update at every position of rank = the circuit edit's operation count, at the
-                     matrix whose short fit is best, Adam on the objective at each LAMS, checkpoints every 25 steps.
+                     matrix whose short fit is best, Adam on the objective at each LAMS, checkpoints every 25 steps;
+      circuit_scales continuous scales of the circuit's top SCALE_CANDS subcomponents (fit_scales), at each LAMS;
+      random_scales  the same for as many random active subcomponents outside the circuit's;
+      circuit_ft     the fine-tune restricted to the circuit's span: at each matrix holding one of its EDIT_CANDS
+                     subcomponents, a rank-r update within their read and write directions, trained together
+                     (fit_multi), at each LAMS;
+      random_ft      the same within as many random active subcomponents at each of those matrices.
+    rank: r given (an earlier run's circuit edit size) in place of the circuit edit's operation count.
     Scores: flipped (preference gone), goal bits, controls kept (b still predicted elsewhere), KL per token on the rows'
     other positions and on held Pile texts. The validation frontier (every candidate's flipped and collateral) is kept."""
     t0 = time.time()
@@ -421,7 +503,8 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
         for lam in LAMS:
             search(net, pool, lam, keep[name], lambda m, name=name: log(f"  [{name}]{m}"))
     ce = select(keep["circuit_edit"]) if keep.get("circuit_edit") else None
-    r = max(1, len(ce[1]) if ce else 1)
+    r = rank or max(1, len(ce[1]) if ce else 1)
+    out["rank"] = r
     if "random_equal" in methods:
         others = [c for c in act if c not in set(circ)]
         for d in range(RANDOM_DRAWS):
@@ -433,6 +516,34 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
             if k <= len(act):
                 ops = [(*c, 0.0) for c in act[:k]]
                 keep["vpd_topk"].append((_score(net, "val", ops_deltas(nat, ops)), ops, {"k": k}))
+    if "circuit_scales" in methods:
+        keep["circuit_scales"] = []
+        for lam in LAMS:
+            fit_scales(net, circ[:SCALE_CANDS], steps, lam, keep["circuit_scales"])
+    if "random_scales" in methods:
+        others = [c for c in act if c not in set(circ)]
+        pool = rng.sample(others, min(SCALE_CANDS, len(others)))
+        keep["random_scales"] = []
+        for lam in LAMS:
+            fit_scales(net, pool, steps, lam, keep["random_scales"])
+    if "circuit_ft" in methods or "random_ft" in methods:  # the fine-tune restricted to the circuit's span at its sites
+        sites = {}
+        for site, c in circ:
+            sites.setdefault(site, []).append(c)
+        if "circuit_ft" in methods:
+            keep["circuit_ft"] = []
+            for lam in LAMS:
+                fit_multi(net, {site: finetune_edit.basis(nat, site, cs) for site, cs in sites.items()}, steps, r, lam, keep["circuit_ft"])
+        if "random_ft" in methods:  # as many random active subcomponents at each of those sites, outside the circuit's
+            rb = {}
+            for site, cs in sites.items():
+                others = [c for s_, c in act if s_ == site and (s_, c) not in set(circ)]
+                if not others:
+                    others = [c for c in range(nat.target.site(site).V.shape[1]) if c not in cs]
+                rb[site] = finetune_edit.basis(nat, site, rng.sample(others, min(len(cs), len(others))))
+            keep["random_ft"] = []
+            for lam in LAMS:
+                fit_multi(net, rb, steps, r, lam, keep["random_ft"])
     if "finetune" in methods:
         shots = {n: fit(net, n, screen, rank=r, lam=LAMS[1])["val_net"] for n in (names or nat.names)}
         top = max(shots, key=shots.get)
@@ -444,8 +555,8 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
         if not cs:
             continue
         val, edit, info = select(cs)
-        deltas = edit if name == "finetune" else ops_deltas(nat, edit)
-        out["methods"][name] = {"info": info, "ops": None if name == "finetune" else [list(o) for o in edit], "validation": val,
+        deltas = edit if name in ("finetune", "circuit_ft", "random_ft") else ops_deltas(nat, edit)
+        out["methods"][name] = {"info": info, "ops": None if name in ("finetune", "circuit_ft", "random_ft") else [list(o) for o in edit], "validation": val,
                                 "score": _score(net, "score", deltas), "frontier": [[c[0]["flipped"], c[0]["collateral_per_token"], c[2]] for c in cs]}
         v = out["methods"][name]["score"]
         log(f"{beh['describe']['a']!r}->{beh['describe']['b']!r} {name} {info}: flipped {v['flipped']:.2f}, goal {v['goal_bits']:.2f} bits, "
@@ -462,6 +573,7 @@ def practical_table(rows: list[dict]) -> str:
         for name, x in sorted(r["methods"].items(), key=lambda kv: [m in kv[0] for m in METHODS].index(True)):
             v, i = x["score"], x["info"]
             what = (f"r{i['rank']} {i['site'].replace('h.', 'L').replace('.mlp', '').replace('.attn', '')}" if name == "finetune"
+                    else f"r{i['rank']} {len(i['sites'])} sites" if name in ("circuit_ft", "random_ft")
                     else f"k {i['k']}" if "k" in i else f"{len(x['ops'])} ops")
             lines.append(f"{r['preference']['a']!r:>9s}->{r['preference']['b']!r:<11s} {name:15s} {what:14s} {v['flipped']:7.2f}  {v['goal_bits']:9.2f}  "
                          f"{v['controls_kept'] or 0:5.2f}  {v['text_kl_per_token']:11.2e}  {v['pile_kl_per_token']:11.2e}")
@@ -524,6 +636,7 @@ def main():
     e.add_argument("--stride", type=int, default=1)
     e.add_argument("--sites", nargs="*")
     e.add_argument("--methods", nargs="*", default=list(METHODS))
+    e.add_argument("--rank-from", help="an earlier edit run's rows: each preference's r from its circuit edit")
     t = sub.add_parser("table")
     t.add_argument("rows")
     t.add_argument("--edit", action="store_true", help="edit's rows (practical_table)")
@@ -554,8 +667,10 @@ def main():
         if i % args.stride != args.offset:
             continue
         if args.cmd == "edit":
+            ranks = {(x["a"], x["b"]): len(x["methods"]["circuit_edit"]["ops"]) for x in read(args.rank_from)
+                     if x["methods"].get("circuit_edit")} if args.rank_from else {}
             r = practical(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites,
-                          methods=tuple(args.methods))
+                          methods=tuple(args.methods), rank=ranks.get((beh["a"], beh["b"])))
         else:
             r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
         with open(args.out, "a") as fh:

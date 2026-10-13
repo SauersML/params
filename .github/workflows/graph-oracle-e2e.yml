@@ -29,6 +29,11 @@ on:
         type: boolean
         required: false
         default: false
+      all_saved_toy_policy:
+        description: "Execute all 90 frozen saved policy answers and matched controls (no generation)"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: graph-oracle-e2e-${{ github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring && github.run_id || github.ref }}
@@ -98,9 +103,10 @@ jobs:
           git worktree add --detach "${{ runner.temp }}/toy-replay-scorer" b2fd915944c0589dabc9295805f37bbabe30439f
           cp experiments/oracle/toyloop/replay_wiring.py "${{ runner.temp }}/toy-replay-scorer/experiments/oracle/toyloop/replay_wiring.py"
           policy_args=()
-          if [ '${{ inputs.include_saved_toy_policy }}' = 'true' ]; then
+          if [ '${{ inputs.include_saved_toy_policy }}' = 'true' ] || [ '${{ inputs.all_saved_toy_policy }}' = 'true' ]; then
             git fetch --no-tags --depth=1 origin 830010f2f4f534d628c51610fa1632774d0e02f6
             policy_args=(--policy-file experiments/oracle/toyloop/results/eval_sft_noleak.json --policy-source 830010f2f4f534d628c51610fa1632774d0e02f6)
+            if [ '${{ inputs.all_saved_toy_policy }}' = 'true' ]; then policy_args+=(--all-policy-cases); fi
           fi
           TOY_REPLAY_DRIVER_COMMIT="${{ github.sha }}" python -u "${{ runner.temp }}/toy-replay-scorer/experiments/oracle/toyloop/replay_wiring.py" \
             --out "${{ runner.temp }}/toy-wiring-replay" "${policy_args[@]}"

@@ -54,6 +54,7 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--policy-file", type=Path, help="existing public saved learned completions; never generate")
     ap.add_argument("--policy-source", help="full commit SHA holding the exact policy artifact")
+    ap.add_argument("--all-policy-cases", action="store_true", help="freeze every saved policy row, not the four-case intersection")
     args = ap.parse_args()
     if sys.platform == "darwin":
         ap.error("This replay is reserved for the Linux CPU runner; do not occupy the Mac scoring slot")
@@ -89,10 +90,12 @@ def main():
         assert hashlib.sha256(original).hexdigest() == sha(path), "saved policy artifact changed"
         learned = {r["id"]: r for r in json.loads(path.read_text())["rows"]}
         # The original four-case protocol remains fixed; absent completions are declared, not selected by outcomes.
-        cases = [case for case in CASES if case in learned]
+        cases = sorted(learned) if args.all_policy_cases else [case for case in CASES if case in learned]
         assert cases, "no policy completions intersect the fixed protocol"
+        assert all(case in saved[n] for case in cases for n in saved), "missing matched reference answers"
         saved["learned"] = learned
         policy_provenance = {"file": str(relative), "source": args.policy_source, "sha256": sha(path),
+                             "inclusion": "all saved policy rows" if args.all_policy_cases else "fixed four-case intersection",
                              "eligible_fixed_cases": cases, "absent_fixed_cases": [c for c in CASES if c not in learned],
                              "scope": "execution of logged learned answers; original policy checkpoint/generation hashes absent"}
     checkpoint = args.out / "tasks.jsonl"
@@ -116,7 +119,7 @@ def main():
             params, sd = zoo.make(family, int(seed))  # replay the saved ID, not a newly sampled model
             expected = {(render.zoo_unit(a), render.zoo_unit(b)) for a, b in zoo.FAMILIES[family].edges(params)}
             assert circuit.parse(saved["gt"][case]["completion"]).edges == expected, "saved circuit/generator mismatch"
-            assert all(saved[n][case]["split"] == zoo.split_of(family, int(seed)) == "test_instance" for n in saved)
+            assert all(saved[n][case]["split"] == zoo.split_of(family, int(seed)) for n in saved)
             texts = original_ordinary_texts(zoo, params)
             nat = planted.native_of(sd, zoo.CFG)
             bound = SimpleNamespace(name=case, cfg=zoo.CFG, sd=sd, texts=texts,
@@ -130,7 +133,7 @@ def main():
                 basis.update(name.encode())
                 for tensor in (nat.target.site(name).U, nat.target.site(name).V, nat.units[name]):
                     basis.update(tensor.cpu().contiguous().numpy().tobytes())
-            row = {"type": "task", "id": case, "family": family, "seed": int(seed), "params": params,
+            row = {"type": "task", "id": case, "family": family, "split": zoo.split_of(family, int(seed)), "seed": int(seed), "params": params,
                    "weights_sha256": fingerprint.hexdigest(), "native_basis_sha256": basis.hexdigest(),
                    "cfg": zoo.CFG, "ordinary_texts": texts, "candidates": {}}
             for name in saved:
@@ -151,6 +154,31 @@ def main():
                     within = {reader: [writer for writer in writers if owners[writer] == owners[reader]]
                               for reader, writers in graph.parents.items()}
                     variants["wrong_no_interunit"] = native.Graph(graph.nodes, within, graph.out, complete=False)
+                    # Fixed output and intra-unit wiring; one pair swap preserves unit-edge and native-edge counts.
+                    legal, _ = native.all_edges(graph.nodes, [len(ids) - 1])
+                    groups = {}
+                    for reader, writers in legal.items():
+                        for writer in writers:
+                            pair = (owners[writer], owners[reader])
+                            if pair[0] != pair[1]:
+                                groups.setdefault(pair, []).append((reader, writer))
+                    selected = {pair for pair in groups if pair in circuit.parse(completion).edges}
+                    missing = set(groups) - selected
+                    swaps = sorted((old, new) for old in selected for new in missing
+                                   if len(groups[old]) == len(groups[new]))
+                    topology = {"legal_interunit_pairs": len(groups), "selected_interunit_pairs": len(selected),
+                                "equal_size_single_pair_swaps": len(swaps), "scope": "single unit-pair swaps; no claim of exhaustive multi-pair alternatives"}
+                    if swaps:
+                        rng_seed = int(hashlib.sha256(("wiring-swap-v1:" + case + ":" + name).encode()).hexdigest()[:16], 16)
+                        old, new = random.Random(rng_seed).choice(swaps)
+                        changed = (selected - {old}) | {new}
+                        alternative = {r: [w for w in ws if owners[w] == owners[r] or (owners[w], owners[r]) in changed]
+                                       for r, ws in legal.items()}
+                        variants["same_count_alternative"] = native.Graph(graph.nodes, alternative, graph.out, complete=False)
+                        assert variants["same_count_alternative"].edges() == graph.edges()
+                        topology.update(status="eligible", seed=rng_seed, removed_pair=old, added_pair=new)
+                    else:
+                        topology["status"] = "no_cross_edges" if not selected else "all_legal_pairs_selected" if not missing else "no_equal_size_single_pair_swap"
                     assert len({frozenset(g.nodes) for g in variants.values()}) == 1
                     target = [len(ids) - 1]; ref = nat.reference([ids], target)
                     null = ge.graph_ref(ids, target, native.Graph(), live=False)
@@ -163,10 +191,15 @@ def main():
                                    for key, g in variants.items()}
                     measurements.append({"ids": ids, "empty_kl_bits": empty_error, "kl_bits": errors,
                                          "point_scores": point, "point_resolved": empty_error > 1e-9,
-                                         "nodes": graph.count(), "edges": edge_counts})
-                means = {key: sum(m["kl_bits"][key] for m in measurements) / len(measurements) for key in variants}
+                                         "nodes": graph.count(), "edges": edge_counts, "topology_control": topology})
+                keys = sorted({key for m in measurements for key in m["kl_bits"]})
+                coverage = {key: sum(key in m["kl_bits"] for m in measurements) for key in keys}
+                means = {key: sum(m["kl_bits"][key] for m in measurements if key in m["kl_bits"]) / coverage[key] for key in keys}
                 row["candidates"][name] = {"valid": True, "completion": completion, "per_text": measurements,
-                                           "mean_kl_bits": means, "stated_minus_complete_bits": means["stated"] - means["same_units_complete"],
+                                           "mean_kl_bits": means, "variant_text_counts": coverage,
+                                           "selected_unit_count": len({u for u in circuit.parse(completion).units if u != "out" and not u.startswith("tok")}),
+                                           "granularity": "saved head/MLP units expanded into their own native rank-one pieces; not individual-piece selection",
+                                           "stated_minus_complete_bits": means["stated"] - means["same_units_complete"],
                                            "wrong_minus_stated_bits": means["wrong_no_output"] - means["stated"]}
             append(checkpoint, row); results.append(row)
             print(case, {n: r.get("mean_kl_bits", r.get("error")) for n, r in row["candidates"].items()}, flush=True)

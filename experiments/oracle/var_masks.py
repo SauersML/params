@@ -17,9 +17,9 @@ target distributions permuted among them (a mapping the model does not compute),
 targets; and equal-size random subsets of the candidates. A mask counts by its selectivity, f real minus f permuted.
 Each mask's bits: log2 C(N, k), k of the N subcomponents at the carrier positions in the candidates' sites (the
 family's the same with k its size). --depth D keeps the candidates in layers <= D (the lead's 10-13 copy read: the
-target position's stage before the output parts); --read with --copy N carries each copy text's copied token (input
-a, after the earlier occurrence o of the target's token t) at the target position, o left out of the Iso donors
-(changing it changes what the read finds; t is the carrier's own position).
+target position's stage before the output parts); --read with --copy N carries each copy text's read at the target
+position t: inputs the earlier occurrence o of t's token and the token a after it (the read depends on the match at
+o and copies a; the lead's 10-13), Iso donors at other positions before t.
 
   experiments/oracle/var_masks.py text6011 232,233 [--at POSITIONS] [--skip POSITIONS] [--copy N [--read]] [--depth 1,2]
       [--from-dir DIR] [--lam 1e-3,1e-2] [--out FILE]
@@ -152,7 +152,7 @@ def main():
     ap.add_argument("--copy", type=int, default=0)
     ap.add_argument("--at", help="the carrier positions (an intermediate variable's), comma-separated")
     ap.add_argument("--skip", help="positions left out of the Iso donors, comma-separated")
-    ap.add_argument("--read", action="store_true", help="--copy texts' copied token carried at the target (o skipped)")
+    ap.add_argument("--read", action="store_true", help="--copy texts' read carried at the target: inputs (o, a)")
     ap.add_argument("--depth", help="layer cuts, comma-separated: one run per cut, candidates in layers <= the cut")
     ap.add_argument("--from-dir", type=Path, help="every kept intermediate variable in var_teacher's files there")
     ap.add_argument("--jobs", type=Path, help='JSON lines {"task", "inputs", "at"} (a pod uploads one file)')
@@ -179,7 +179,7 @@ def main():
             ids, t = p["token_ids"], p["target_positions"][-1]
             occ = [j for j in range(t) if ids[j] == ids[t]]  # the copied token's position: after the earlier occurrence
             if occ:
-                jobs.append((x["task"], (occ[-1] + 1,), (t,), (occ[-1],)) if args.read else (x["task"], (occ[-1] + 1,), None, ()))
+                jobs.append((x["task"], (occ[-1], occ[-1] + 1), (t,), ()) if args.read else (x["task"], (occ[-1] + 1,), None, ()))
     depths = [int(x) for x in args.depth.split(",")] if args.depth else [None]
     for t, ins, at, skip in jobs:
         task = json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())

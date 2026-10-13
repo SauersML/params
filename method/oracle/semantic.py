@@ -509,6 +509,21 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
 
     ck = Checker(sc, tx, vs)
     items, first = [], {}
+    def tops(changes: list[dict]) -> list[int]:
+        # the model's top token at the last target on x with each set of changes: native's reference runs, batched and
+        # kept nowhere (Checker.text cached each scanned text's engine tables, 16 per input position, and filled 24 GB
+        # cards on influential_v2: 33 of 494 texts out of memory)
+        out = []
+        for s in range(0, len(changes), 8):
+            texts = []
+            for ch in changes[s:s + 8]:
+                x = list(tx.ids)
+                for q, z in ch.items():
+                    x[q] = z
+                texts.append(x)
+            out += [int(r[-1].argmax()) for r in sc.nat.reference(texts, tx.targets)]
+        return out
+
     def unseen(p: int, seen: set) -> list[int]:  # fresh donor tokens at p, sampled from the model's prediction there
         lp = sc.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double()
         w = lp.exp()
@@ -524,8 +539,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                     if zs:
                         first.setdefault(v["name"], (p, int(zs[0])))
                     ys = {}
-                    for z in zs:
-                        y = int(ck.text({p: z})["lq"][-1].argmax())
+                    for z, y in zip(zs, tops([{p: z} for z in zs])):
                         if y != ck.y0 and y not in ys and len(ys) < 2 * per_class:
                             ys[y] = z
                     items += [(v["name"], {"transplants": [(v["name"], {p: z})]}, ("top", y), [(v["name"], p, z), y]) for y, z in ys.items()]
@@ -537,8 +551,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                 got = {}
                 if zs:
                     first.setdefault(v["name"], (p, int(zs[0])))
-                for z in zs:
-                    y = int(ck.text({p: z})["lq"][-1].argmax())
+                for z, y in zip(zs, tops([{p: z} for z in zs])):
                     if y != ck.y0 and y in want and len(got.setdefault(want[y], [])) < per_class:
                         got[want[y]].append((z, y))
                 for pairs in got.values():
@@ -550,7 +563,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                 (pa, za), (pb, zb) = first[a], first[b]
                 if pa == pb:
                     continue
-                y = int(ck.text({pa: za, pb: zb})["lq"][-1].argmax())
+                y = tops([{pa: za, pb: zb}])[0]
                 if y != ck.y0:
                     items.append((a, {"transplants": [(a, {pa: za}), (b, {pb: zb})]}, ("top", y), [(a, pa, za), (b, pb, zb), y]))
         rows = ck.check([(iv, out) for _, iv, out, _ in items])

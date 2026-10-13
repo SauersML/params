@@ -270,8 +270,12 @@ def teacher_checker(monkeypatch):
     monkeypatch.setattr(torch, "multinomial", lambda *args, **kw: torch.tensor([2, 3]))
     monkeypatch.setattr(components, "token_strings", lambda model, ids: [" x" if z == 2 else " y" for z in ids])
     monkeypatch.setattr(components, "_token_of", lambda model, text: {"' x'": 2, "' y'": 3}.get(text))
-    sc = SimpleNamespace(nat=SimpleNamespace(reference=lambda *args: torch.full((1, 1, 4), .25).log()))
-    tx = SimpleNamespace(ids=[0], seed=1)
+    def reference(texts, positions):  # unseen's prediction (an empty prefix) uniform; a scanned text's top 2 when it holds 2
+        if len(texts) == 1 and not texts[0]:
+            return torch.full((1, 1, 4), .25).log()
+        return torch.nn.functional.one_hot(torch.tensor([2 if t[0] == 2 else 0 for t in texts]), 4).float().log()[:, None]
+    sc = SimpleNamespace(nat=SimpleNamespace(reference=reference))
+    tx = SimpleNamespace(ids=[0], seed=1, targets=[0])
     vs = [{"name": "V1", "inputs": [0], "group": [("h.0.mlp.c_fc", 0, 0)],
            "values": [{"position": 0, "classes": [{"id": 0, "token_ids": [0]},
                       {"id": 1, "token_ids": [1], "predicts_id": 2}]}]}]

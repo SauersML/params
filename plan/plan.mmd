@@ -383,7 +383,7 @@ flowchart BT
   ORC["<b>Incremental skill integration</b><br/>add each successful arm when ready;<br/>compare with frozen SFT on dev texts;<br/>a rising reward alone is not success<br/>primerl"]
 
   subgraph RLS["RL ARMS IN PARALLEL · primerl · validate each arm’s own reward"]
-    R1["<b>RL · circuits</b><br/>faithfulness gate and size"]
+    R1["<b>RL · circuits</b><br/>from S1, circuit-only, sequence reward;<br/>reward frozen e5c4232 (overflow charge);<br/>8x8 per step, up to 30 steps, dev every 5<br/>RUNNING · primerl"]
     R2["<b>RL · + variables</b>"]
     R3["<b>RL · + answers</b>"]
     R4["<b>RL · + English</b>"]

@@ -8,6 +8,24 @@ import matched_graph_score as scorer
 
 
 class MatchedScoreTests(unittest.TestCase):
+    def test_clarified_diagnostic_is_explicit_bound_and_paired(self):
+        originals = [dict(id=str(i), original_id=str(i), condition='original',
+                          stratum='diagnostic_original', inputs=[[i]], input_roles=['disclosed'])
+                     for i in range(8)]
+        permuted = [dict(row, id=row['id']+'__perm', condition='permuted',
+                         stratum='diagnostic_permuted') for row in originals]
+        manifest = dict(diagnostic='clarified_unit_permutation_v1',
+                        arms=['base', 'point', 'intervention', 'qwen35', 'kimi'],
+                        panel=originals+permuted, forward_cap=20944)
+        scorer.validate_panel(manifest, diagnostic_sha256=scorer.DIAGNOSTIC_MANIFEST_SHA)
+        with self.assertRaises(ValueError): scorer.validate_panel(manifest)
+        with self.assertRaises(ValueError): scorer.validate_panel(manifest, diagnostic_sha256='other')
+        with self.assertRaises(ValueError):
+            scorer.validate_panel(manifest, parent_path='mixed-mode', diagnostic_sha256=scorer.DIAGNOSTIC_MANIFEST_SHA)
+        permuted[0]['inputs'] = [[123]]
+        with self.assertRaises(ValueError):
+            scorer.validate_panel(manifest, diagnostic_sha256=scorer.DIAGNOSTIC_MANIFEST_SHA)
+
     def test_missing_response_retained_and_duplicates_rejected(self):
         panel = [{'id': name, 'stratum': 'new_model', 'prompt_sha256': name} for name in ('a', 'b')]
         sample = dict(panel[0], sample=0)

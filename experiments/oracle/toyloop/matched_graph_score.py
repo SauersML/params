@@ -17,6 +17,8 @@ import re
 import sys
 from types import SimpleNamespace
 
+DIAGNOSTIC_MANIFEST_SHA = '2a2e657f77f577bc106b5be718122545f6cc2a8d6c5707009547778ef5c4ab8d'
+
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -124,10 +126,30 @@ def partition(panel, workers):
     return [sorted(group) for group in groups]
 
 
-def validate_panel(manifest, parent_path=None, parent_sha256=None):
+def validate_panel(manifest, parent_path=None, parent_sha256=None, diagnostic_sha256=None):
     """A stronger baseline may only use the unchanged eight new-model cases."""
+    if diagnostic_sha256 is not None:
+        # This opt-in is the separately frozen, exposed-model follow-up. Both
+        # callers already verify actual manifest bytes against this digest.
+        if (diagnostic_sha256 != DIAGNOSTIC_MANIFEST_SHA
+                or parent_path is not None or parent_sha256 is not None
+                or manifest.get('diagnostic') != 'clarified_unit_permutation_v1'
+                or manifest['arms'] != ['base', 'point', 'intervention', 'qwen35', 'kimi']
+                or Counter(r['stratum'] for r in manifest['panel']) != {
+                    'diagnostic_original': 8, 'diagnostic_permuted': 8}
+                or manifest['forward_cap'] != 20944):
+            raise ValueError('exact frozen clarified/permuted diagnostic required')
+        for original, permuted in zip(manifest['panel'][:8], manifest['panel'][8:]):
+            if (original['condition'] != 'original' or permuted['condition'] != 'permuted'
+                    or original['id'] != original['original_id']
+                    or permuted['id'] != original['id']+'__perm'
+                    or permuted['original_id'] != original['id']
+                    or original['inputs'] != permuted['inputs']
+                    or original['input_roles'] != permuted['input_roles']):
+                raise ValueError('paired diagnostic case identity changed')
+        return
     if parent_path is None:
-        if (parent_sha256 is not None or 'parent_manifest_sha256' in manifest
+        if (parent_sha256 is not None or 'parent_manifest_sha256' in manifest or 'diagnostic' in manifest
                 or manifest['schema_version'] != 1
                 or manifest['arms'] != ['base', 'point', 'intervention']
                 or Counter(r['stratum'] for r in manifest['panel']) != {'new_model': 8, 'retention': 24}):
@@ -157,9 +179,12 @@ def merge(args):
     if sha(args.manifest) != args.manifest_sha256 or args.out.exists():
         raise ValueError('frozen manifest and fresh output required')
     manifest = json.loads(args.manifest.read_text())
-    if 'parent_manifest_sha256' in manifest or getattr(args, 'strong_baseline_parent', None) is not None:
+    if ('parent_manifest_sha256' in manifest or 'diagnostic' in manifest
+            or getattr(args, 'strong_baseline_parent', None) is not None
+            or getattr(args, 'clarified_unit_permutation', False)):
         validate_panel(manifest, getattr(args, 'strong_baseline_parent', None),
-                       getattr(args, 'strong_baseline_parent_sha256', None))
+                       getattr(args, 'strong_baseline_parent_sha256', None),
+                       args.manifest_sha256 if getattr(args, 'clarified_unit_permutation', False) else None)
     panel, arms = manifest['panel'], manifest['arms']
     assignment = partition(panel, args.workers)
     global_cap = sum(len(r['inputs']) * len(r['edits']) * (2 + len(arms)) for r in panel)
@@ -233,7 +258,8 @@ def run(args):
         raise ValueError('frozen manifest and fresh output required')
     manifest = json.loads(args.manifest.read_text())
     validate_panel(manifest, getattr(args, 'strong_baseline_parent', None),
-                   getattr(args, 'strong_baseline_parent_sha256', None))
+                   getattr(args, 'strong_baseline_parent_sha256', None),
+                   args.manifest_sha256 if getattr(args, 'clarified_unit_permutation', False) else None)
     panel, arms = manifest['panel'], manifest['arms']
     assignment = partition(panel, args.workers)
     if type(args.worker) is not int or args.worker not in range(args.workers):
@@ -290,7 +316,7 @@ def run(args):
           'case_indices': indices, 'scorer_sha256': sha(__file__)})
     for case_index in indices:
         item = panel[case_index]
-        expected_format = 'graph_only' if item['stratum'] == 'new_model' else 'legacy_mermaid_english'
+        expected_format = 'legacy_mermaid_english' if item['stratum'] == 'retention' else 'graph_only'
         if item['answer_format'] != expected_format:
             raise ValueError('answer format must match frozen prompt stratum')
         path = bound_path(args.payload, item['weights'])
@@ -407,6 +433,7 @@ if __name__ == '__main__':
     parser.add_argument('--shard', type=Path, action='append', default=[])
     parser.add_argument('--strong-baseline-parent', type=Path)
     parser.add_argument('--strong-baseline-parent-sha256')
+    parser.add_argument('--clarified-unit-permutation', action='store_true')
     for name in ('manifest', 'out'):
         parser.add_argument('--'+name, type=Path, required=True)
     parser.add_argument('--manifest-sha256', required=True)

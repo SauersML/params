@@ -1892,32 +1892,31 @@ def test_graph_ref_outside_held(tiny):
 
 
 def test_omitted_family(tiny):
-    """The omitted family: candidates are VPD's first actives at the circuit's positions and the targets (the
-    background left out); a candidate the circuit lacks is predicted by its own run, one it holds by its run less it;
-    W the real model's response to the removal, VPD's answer less it the reference, the pooled ratio over them."""
+    """The omitted family: candidates are VPD's first actives at the circuit's positions and the targets that it leaves
+    out (the background aside); each predicted by the circuit's own run, W the real model's response to the removal,
+    VPD's answer less it the reference, the pooled score over them; nothing left out scores 1."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     g = native.Graph(every[::2], complete=True)
     row = ge._omitted_family(tx, [g], k=6)[0]
     order = getattr(tx, "vpd_order", None) or nat._vpd_order(tx.ids, tx.targets)
     pos = {t for _, t, _ in g.node_set()} | set(tx.targets)
-    cands = [tuple(nd) for nd in order if nd[1] in pos and tuple(nd) not in ge.background(tx)][:6]
-    assert [tuple(d[0]) for d in row["draws_omitted"]] == cands and row["omitted_left"] == sum(nd not in g.node_set() for nd in cands)
+    cands = [tuple(nd) for nd in order if nd[1] in pos and tuple(nd) not in ge.background(tx) and tuple(nd) not in g.node_set()][:6]
+    assert [tuple(d[0]) for d in row["draws_omitted"]] == cands and row["omitted_left"] == len(cands)
     full, _ = naive(nat, tx.ids)
+    circ = naive(nat, tx.ids, on=ge.masks(g, tx.T))[0]
     for (nd, kc, kv, w), c in zip(row["draws_omitted"], cands):
         on = {n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
         on[c[0]][c[1], c[2]] = False
         removed = naive(nat, tx.ids, on=on)[0]
         assert abs(w - _kl(removed, full, tx.targets)) < 1e-4 + 1e-4 * w
-        mine = ge.masks(g, tx.T)
-        mine = {n: m.clone() for n, m in mine.items()}
-        mine[c[0]][c[1], c[2]] = False  # a held candidate leaves the circuit; a lacking one changes nothing
-        circ = naive(nat, tx.ids, on=mine)[0]
-        assert abs(kc - _kl(removed, circ, tx.targets)) < 1e-3 + 1e-3 * kc, (c, kc, _kl(removed, circ, tx.targets))
-    assert row["s_omitted"] == goal_eval._ratio_pool(row["draws_omitted"])
+        assert abs(kc - _kl(removed, circ, tx.targets)) < 1e-3 + 1e-3 * kc
+    s = goal_eval._ratio_pool(row["draws_omitted"])
+    assert row["s_omitted"] == (1.0 if s is None else s)
+    whole = native.Graph(every, complete=True)  # every VPD active: nothing left out at its positions
+    assert ge._omitted_family(tx, [whole], k=6)[0]["s_omitted"] == 1.0
     nb = ge.necessity_spec(tx, [g], "eval", background=True)[0]  # the background kept on: a valid N row either way
     assert set(nb) >= {"n_spec", "d_target", "d_control"}
-
 
 def test_line_leave_one_out(tiny):
     """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row

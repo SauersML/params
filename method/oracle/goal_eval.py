@@ -3049,13 +3049,15 @@ class GoalEval:
     @torch.no_grad()
     def _omitted_family(self, tx: Text, graphs: list[native.Graph], k: int = OMITTED_K) -> list[dict]:
         """The omitted family (the lead's 10-13, the spec's interventions on parts a circuit leaves out; the mirror of
-        the node family): per circuit, the first k of VPD's actives in its order (causal importance x write) at the
-        circuit's positions and the targets, the background (GENERIC_TARGET) left out; each removed alone from the real
-        model (W = KL(model less it || model)); the circuit's prediction is its own run, less the candidate where it holds
-        it (as the node family's); VPD's answer less it the reference; s_omitted pools the candidates as the weighted
-        families do (_ratio_pool: KL(model less it || circuit's) against W). A circuit that leaves out a part whose
-        removal moves the model predicts no change and scores 0 there. draws_omitted: per candidate [candidate, KL_C,
-        KL_VPD, W]; omitted_left: how many of them the circuit leaves out."""
+        the node family, which removes the parts it holds): per circuit, the first k of VPD's actives in its order
+        (causal importance x write) at the circuit's positions and the targets that the circuit leaves out, the
+        background (GENERIC_TARGET) left out; each removed alone from the real model (W = KL(model less it || model));
+        the circuit's prediction is its own run (no change); VPD's answer less it the reference; s_omitted pools the
+        candidates as the weighted families do (_ratio_pool). A circuit that leaves out a part whose removal moves the
+        model as VPD predicts scores 0 there; with nothing left out, or nothing whose removal VPD predicts better than
+        no change, s_omitted = 1. (Candidates the circuit holds are the node family's: scored here too, held parts
+        made masked complete sets score 0, the node family's overstated removals again: influential sets 0.16 on 11 of 20
+        held-out texts.) draws_omitted: per candidate [candidate, KL_C, KL_VPD, W]; omitted_left: how many."""
         import engine
 
         nat, dev = self.nat, self.nat.dev
@@ -3063,8 +3065,9 @@ class GoalEval:
         bg = self.background(tx)
         cands = []
         for g in graphs:
-            pos = {t for _, t, _ in g.node_set()} | set(tx.targets)
-            cands.append([tuple(nd) for nd in order if nd[1] in pos and tuple(nd) not in bg][:k])
+            nodes = g.node_set()
+            pos = {t for _, t, _ in nodes} | set(tx.targets)
+            cands.append([tuple(nd) for nd in order if nd[1] in pos and tuple(nd) not in bg and tuple(nd) not in nodes][:k])
         cols = {n: {c for g, cs in zip(graphs, cands) for m, _, c in list(g.node_set()) + cs if m == n} for n in nat.names}
         circ = {n: torch.tensor(sorted(cols[n]), dtype=torch.long, device=dev) for n in nat.names}
         vcols = {n: torch.unique(torch.cat([circ[n], tx.vpd[n].any(0).nonzero().flatten()])) for n in nat.names}
@@ -3084,25 +3087,26 @@ class GoalEval:
         out = []
         for g, cs in zip(graphs, cands):
             if not cs:
-                out.append({"s_omitted": None, "draws_omitted": [], "omitted_left": 0})
+                out.append({"s_omitted": 1.0, "s_omitted_raw": 1.0, "draws_omitted": [], "omitted_left": 0})
                 continue
             nodes = g.node_set()
             ones = {n: torch.ones(tx.T, len(circ[n]), device=dev) for n in nat.names}
             lm = Em.log_probs(without(ones, cs, at))
             lv = Ev.log_probs(without(vpd, cs, vat))
-            held = [nd for nd in cs if nd in nodes]
-            if g.complete:
+            if g.complete:  # the circuit's own run (no candidate is its): one row
                 gm = {n: torch.zeros(tx.T, len(circ[n]), device=dev) for n in nat.names}
                 for n, t, c in nodes:
                     gm[n][t, at[n][c]] = 1.0
-                lc = Ec.log_probs(without(gm, cs, at))  # a candidate the circuit lacks: its row is the circuit itself
+                lc = Ec.log_probs({n: x[None] for n, x in gm.items()})
             else:
-                lc = Ec.graph_log_probs(Ec.plan([_drop_nodes(g, {nd}) if nd in nodes else g for nd in cs], semantics="c"))
+                lc = Ec.graph_log_probs(Ec.plan([g], semantics="c"))
+            lc = lc.expand(len(cs), *lc.shape[1:])
             w = carry.kl(lm, tx.ref.expand_as(lm)).tolist()
             kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
             rec = [[list(nd), a, b_, c_] for nd, a, b_, c_ in zip(cs, kc, kv, w)]
-            out.append({"s_omitted": _ratio_pool(rec), "s_omitted_raw": _ratio_pool(rec, raw=True), "draws_omitted": rec,
-                        "omitted_left": len(cs) - len(held)})
+            s_, r_ = _ratio_pool(rec), _ratio_pool(rec, raw=True)
+            out.append({"s_omitted": 1.0 if s_ is None else s_, "s_omitted_raw": 1.0 if r_ is None else r_, "draws_omitted": rec,
+                        "omitted_left": len(cs)})
             native.free(dev)
         return out
 

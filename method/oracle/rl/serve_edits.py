@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import queue
+import signal
 import sys
 from pathlib import Path
 
@@ -89,6 +90,13 @@ def main():
     ap.add_argument("--goals", default=str(GOALS))
     a = ap.parse_args()
     pool = Pool(a.workers, a.device, a.goals)
+
+    def stop(*_):  # SIGTERM: the scoring processes go too (only a normal exit ends daemon processes)
+        for p in pool.procs:
+            p.terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):

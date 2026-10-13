@@ -383,7 +383,7 @@ flowchart BT
   subgraph CAPS["CAPABILITIES THE ORACLE MUST SHOW"]
     C1["<b>Executable circuits</b><br/>predict outputs and unseen<br/>interventions; report sufficiency,<br/>necessity, remainder robustness"]
     C2["<b>Tested English</b><br/>bind concepts to actual components;<br/>beat shuffled meanings, vague text,<br/>no explanation and matched groups;<br/>new values + routing contexts · varteach"]
-    C3["<b>Answers and edits</b><br/>predicted effects and<br/>collateral effects<br/>rustmove"]
+    C3["<b>Answers and edits</b><br/>delete a preference, 5 prefs: circuit span<br/>beats random 5/5 (collateral x0.18);<br/>ties plain fine-tune, keeps fewer controls<br/>rustmove"]
     C4["<b>Transfer and cost</b><br/>other mechanisms, long contexts,<br/>latency, memory, sample cost<br/>generality · monitorbench"]
   end
 
@@ -427,7 +427,7 @@ flowchart BT
     I4["<b>Learnability grid: input decided</b><br/>text + measured facts beats a facts<br/>regression at 32k (tau .80 vs .74);<br/>vectors = IDs, memorized facts lose<br/>DONE · rustmove"]
     QAONLY["<b>Outcome-only learning trial</b><br/>22 dev texts: trained 65.64%,<br/>summaries off 62.29%, cheap 66.76%;<br/>follow-up control removes the gain<br/>CHECK · codex · $1.89 spent"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
-    I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
+    I6["<b>Does the oracle use weights?</b><br/>no: real v/u = fixed random = learned ID<br/>(1.43-1.44 bits at 32k); vectors act as IDs<br/>DONE · rustmove 00fea89, codex 6560772"]
   end
 
   subgraph REWARD["REWARD · primerl, inframove, generality, codex"]

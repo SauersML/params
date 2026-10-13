@@ -2822,3 +2822,25 @@ def test_phi_variants_multi_deletions(tiny, monkeypatch):
         for a, b in zip(fast["variants"], slow["variants"]):
             assert abs(a["phi"] - b["phi"]) < 1e-4 and a["bits"] == b["bits"], (a["phi"], b["phi"])
         assert abs(fast["variants"][0]["phi"] - fast["phi"]) < 1e-4, (fast["variants"][0]["phi"], fast["phi"])
+
+
+def test_one_plan_reuses_the_states_before_the_circuit(tiny, monkeypatch):
+    """_loo_c's runs from the circuit's first position on (LOO_REUSE: the states before it kept from one run and reused,
+    the pattern draws' rows given there too) give the whole runs' phi on every variant: a stated graph with stated pairs
+    and a complete set, both starting after position 0, and removal runs (N) from the first removed position likewise."""
+    nat, ge, tx = tiny
+    late = [nd for nd in sorted(native.Graph(masks=tx.vpd).node_set()) if nd[1] >= 5]
+    g = torch.Generator().manual_seed(37)
+    pool = tiny_pool(nat, tx.ids)
+    for gr in (_pp_stated(_pp_nodes(late, g, 0.1, blocks=0.0), tx.targets, g, keep=0.5), native.Graph(late[::6], complete=True)):
+        gr = goal_eval.strand(gr, tx.targets, nat.C)
+        assert min(t for _, t, _ in gr.node_set()) > 0
+        keep = ~torch.eye(len(ge.loo_lines(tx, gr)), dtype=torch.bool)
+        assert 5 < len(keep) < 400, len(keep)
+        base = ge.fidelity(tx, [gr], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+        a = ge.phi_variants(tx, gr, keep, pool, draws=4, base=base)
+        monkeypatch.setattr(goal_eval.GoalEval, "LOO_REUSE", False)
+        b = ge.phi_variants(tx, gr, keep, pool, draws=4, base=base)
+        monkeypatch.setattr(goal_eval.GoalEval, "LOO_REUSE", True)
+        for x, y in zip(a["variants"], b["variants"]):
+            assert abs(x["phi"] - y["phi"]) < 1e-5, (x["phi"], y["phi"])

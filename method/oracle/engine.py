@@ -101,7 +101,8 @@ class Engine:
             e.emb = self.tg.embed(torch.tensor(e.ids, device=self.dev))[None]
         e._targets = torch.tensor(e.targets, device=self.dev)
         e._causal_targets = torch.arange(e.T, device=self.dev)[None, :] <= e._targets[:, None]
-        e.__dict__.pop("_xr", None)  # the text's own x run (path_patched), made when asked
+        e.__dict__.pop("_xr", None)  # the text's own x run (path_patched) and prefix (log_probs' start), made when asked
+        e.__dict__.pop("_pre", None)
         e._search = e.hidden if self._search == self.hidden else torch.compile(e.hidden, dynamic=False)
         return e
 
@@ -168,6 +169,51 @@ class Engine:
             x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, masks[name("c_fc")], rec)), masks[name("down_proj")], rec)
         return norm(x, -1)[:, self._targets]  # the final norm over every position, as vpd_model.Target.hidden
 
+    def _prefix(self) -> list:
+        """Each layer's rotated keys and values [1, H, T, hd] of the run with every column at 1 (kept: log_probs'
+        start)."""
+        if "_pre" not in self.__dict__:
+            tg, T, H, hd = self.tg, self.T, self.H, self.hd
+            norm, act = self._steps(False)
+            ones = {n: torch.ones(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
+            x, out = self.emb, []
+            with torch.no_grad():
+                for i in range(tg.n_layer):
+                    name = lambda k: native.site_name(i, k)  # noqa: E731
+                    h = norm(x, 2 * i)
+                    q, k, v = (self._site(name(kd), h, ones[name(kd)]).view(1, T, H, hd).transpose(1, 2) for kd in ("q_proj", "k_proj", "v_proj"))
+                    q, k = tg._rope(q, T).to(v.dtype), tg._rope(k, T).to(v.dtype)
+                    out.append((k, v))
+                    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                    x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(1, T, -1), ones[name("o_proj")])
+                    h = norm(x, 2 * i + 1)
+                    x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, ones[name("c_fc")])), ones[name("down_proj")])
+            self._pre = out
+        return self._pre
+
+    def _hidden_from(self, masks: dict, start: int) -> torch.Tensor:
+        """hidden()'s final normed stream at the targets with every mask 1 before start: the positions from start on,
+        attending to _prefix's keys and values before it."""
+        tg, T, H, hd = self.tg, self.T, self.H, self.hd
+        B = next(iter(masks.values())).shape[0]
+        norm, act = self._steps(False)
+        pre, Tn = self._prefix(), T - start
+        causal = torch.arange(T, device=self.dev)[None, :] <= torch.arange(start, T, device=self.dev)[:, None]  # [Tn, T]
+        cut = {n: (m[:, start:] if m.shape[1] > 1 else m) for n, m in masks.items()}
+        x = self.emb[:, start:].expand(B, -1, -1)
+        for i in range(tg.n_layer):
+            name = lambda k: native.site_name(i, k)  # noqa: E731
+            h = norm(x, 2 * i)
+            q, k, v = (self._site(name(kd), h, cut[name(kd)]).view(B, Tn, H, hd).transpose(1, 2) for kd in ("q_proj", "k_proj", "v_proj"))
+            q, k = tg._rope_from(q, start, T).to(v.dtype), tg._rope_from(k, start, T).to(v.dtype)
+            k = torch.cat([pre[i][0][:, :, :start].expand(B, -1, -1, -1), k], 2)
+            v = torch.cat([pre[i][1][:, :, :start].expand(B, -1, -1, -1), v], 2)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=causal)
+            x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, Tn, -1), cut[name("o_proj")])
+            h = norm(x, 2 * i + 1)
+            x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, cut[name("c_fc")])), cut[name("down_proj")])
+        return norm(x, -1)[:, self._targets - start]
+
     def _last(self, masks, x, h, name, norm, act, B):
         """The last layer at the targets: keys and values at every position, the rest at the targets."""
         tg, T, H, hd, sel = self.tg, self.T, self.H, self.hd, self._targets
@@ -187,17 +233,24 @@ class Engine:
         """KL in bits of the model at the targets from each row's masked run [B] (summed over the targets)."""
         return carry.kl(self.ref, self.log_probs(masks, precision))
 
-    def log_probs(self, masks: dict, precision: str = "score", reads: dict | None = None):
+    def log_probs(self, masks: dict, precision: str = "score", reads: dict | None = None, start: int = 0):
         """Each row's masked run's next-token log probabilities at the targets [B, len(targets), V], float32. reads:
         {site: (rows, positions, columns)} (columns the engine's): also those subcomponents' activations, (log q,
-        {site: [n]}) ("score" only)."""
+        {site: [n]}) ("score" only). start: every mask is 1 before this position (no later than the first target), so
+        those positions are the run with every column at 1 (_prefix, kept): only the positions from start on are
+        computed (float32, no reads; goal_eval's real-model removals)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if reads is not None and precision != "score":
             raise ValueError("reads come from the float32 run (score)")
+        if start and (precision != "score" or reads is not None or not 0 < start <= min(self.targets)):
+            raise ValueError("start is a float32 run without reads, after position 0 and no later than the first target")
         rec = None if reads is None else (reads, {})
         with _precision(precision, self.dev), self._dtype(precision):
-            h = self.hidden(masks, search=False, rec=rec) if precision == "score" else self._search(masks, search=True)
+            if start:
+                h = self._hidden_from(masks, start)
+            else:
+                h = self.hidden(masks, search=False, rec=rec) if precision == "score" else self._search(masks, search=True)
         lq = torch.log_softmax(self.tg.unembed(h.float()), -1)  # the logits in float32 at every precision
         return lq if rec is None else (lq, rec[1])
 
@@ -454,7 +507,7 @@ class Engine:
         patching at a site and position; with patch's activations there, a block of variables.py); rec_out, a dict,
         receives every site's output [B, T, d_out] (float32 runs without reuse). rows: per row None or {(layer, t): [H,
         t + 1]}, attention rows used in place of the run's own at those reads (goal_eval.graph_ref's rows,
-        pattern_family; float32 runs of every position). off: per row None or a list of the plan's circuit nodes (site,
+        pattern_family; float32 runs, with reuse at reads from its start on). off: per row None or a list of the plan's circuit nodes (site,
         position, subcomponent) taken out of that row's circuit (C's semantics: outside it, at u; with their connections
         at strength 0, the run of the graph without them: line deletions on one plan)."""
         if precision not in PRECISIONS:
@@ -465,8 +518,8 @@ class Engine:
             raise ValueError("outputs and rec_out are float32 runs of every position")
         if (ewn is not None or own is not None) and precision != "score":
             raise ValueError("separate norm strengths are float32 runs (vpd_model's own norm)")
-        if rows is not None and (precision != "score" or reuse is not None):
-            raise ValueError("rows are float32 runs of every position")
+        if rows is not None and (precision != "score" or (reuse is not None and any(t < reuse[2] for d in rows for _, t in (d or {})))):
+            raise ValueError("rows are float32 runs, at reads from reuse's start on")
         if reuse is not None and not 0 < reuse[2] <= min(self.targets):
             raise ValueError("reuse starts after position 0 and no later than the first target")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
@@ -1636,12 +1689,12 @@ class Engine:
                 y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._causal_targets)
             else:
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            if i in given:  # rows given at some reads (every position runs): the pattern explicit, those rows replaced
+            if i in given:  # rows given at some reads: the pattern explicit (its query rows from lo), those rows replaced
                 P = Pp.float() if Pp is not None else ((q @ k.transpose(-1, -2)).float() / math.sqrt(hd)).masked_fill(
-                    ~torch.ones(T, T, dtype=torch.bool, device=self.dev).tril(), float("-inf")).softmax(-1)
+                    ~(causal if lo else torch.ones(T, T, dtype=torch.bool, device=self.dev).tril()), float("-inf")).softmax(-1)
                 P = P.clone()
                 for b, t, row in given[i]:
-                    P[b, :, t, :t + 1] = row
+                    P[b, :, t - lo, :t + 1] = row
                 Pp = P
                 y = P.to(v.dtype) @ v
             y = y.transpose(1, 2).reshape(B, y.shape[2], -1)

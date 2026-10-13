@@ -1560,6 +1560,7 @@ class GoalEval:
 
     PATTERN_ROWS = 32  # pattern_family's engine rows (circuits x draws) a call
     LOO_FAST = True  # line_loo's point, wiring and pattern from one plan of the answer (_loo_c); False: per deletion
+    LOO_REUSE = True  # _loo_c's runs from the circuit's first position on (the states before it kept once: Engine reuse)
     LOO_ENTRIES = 1 << 27  # _loo_c's engine rows a call: this many floats in a run's widest activations (rows x T x C)
 
     @torch.no_grad()
@@ -1613,16 +1614,26 @@ class GoalEval:
                     u[n][r, t, at[n][c]] = 0.0
             return u
 
+        lo = min(t for _, t, _ in g.node_set()) if self.LOO_REUSE else 0  # before the circuit's first position every
+        lo = lo if 0 < lo <= min(tx.targets) else 0                        # variant's run is the same: kept once, reused
+        keep = {} if lo else None
+        if lo:
+            if g.complete:
+                E.graph_log_probs(plan, u1, keep=keep)
+            else:
+                E.graph_log_probs(plan, ew=torch.ones(1, len(edges), device=dev), ow=torch.ones(1, len(outs), device=dev), keep=keep)
+
         def run(rows_of, extra=None):  # KLs of rows (line indices), optionally with given attention rows each
             out = []
-            step = max(16, self.LOO_ENTRIES // (tx.T * max(nat.C.values())))
+            step = max(16, self.LOO_ENTRIES // ((tx.T - lo) * max(nat.C.values())))
             for s0 in range(0, len(rows_of), step):
                 ix = rows_of[s0:s0 + step]
                 given = None if extra is None else extra[s0:s0 + step]
+                reuse = (E.tile_states(keep, len(ix)), tx.ids, lo) if lo else None
                 if g.complete:
-                    lq = E.graph_log_probs(plan, urows(ix), rows=given)
+                    lq = E.graph_log_probs(plan, urows(ix), rows=given, reuse=reuse)
                 else:
-                    lq = E.graph_log_probs(plan, ew=ew[ix].to(dev), ow=ow[ix].to(dev), off=[off[i] for i in ix], rows=given)
+                    lq = E.graph_log_probs(plan, ew=ew[ix].to(dev), ow=ow[ix].to(dev), off=[off[i] for i in ix], rows=given, reuse=reuse)
                 out += carry.kl(tx.ref, lq).tolist()
                 native.free(dev)
             return out
@@ -2538,7 +2549,10 @@ class GoalEval:
         first removed subcomponent); otherwise the engine's (outside "on": the sets' subcomponents masked, every other
         one folded into the remainder, float32-close to that run at the model's own cost: _removal_engine)."""
         if remainders_at_nodes:
-            return self._removed_kl_on(self._removal_engine(ids, targets, sets), sets, ref)
+            if not sets:
+                return []
+            E = self._removal_engine(ids, targets, sets)
+            return self._removed_kl_on(E, self._stacked(E, sets), ref)
         nat, T = self.nat, len(ids)
         one_u, one_r = nat._one()
         if ref is None:
@@ -2572,17 +2586,29 @@ class GoalEval:
         cols = {n: torch.unique(torch.cat([m[n].nonzero()[:, 1] for m in sets] + [none])) for n in nat.names}
         return engine.Engine(nat, ids, targets, live=True, columns=cols, outside="on")
 
+    @staticmethod
+    def _stacked(E, sets: list[dict]) -> dict:
+        """Sets (matrix -> bool [T, C]) on E's columns, stacked: {matrix: bool [sets, T, K]}."""
+        return {n: torch.stack([m[n][:, c] for m in sets]) for n, c in E.columns.items()}
+
     @torch.no_grad()
-    def _removed_kl_on(self, E, sets: list[dict], ref: torch.Tensor | None = None) -> list[float]:
-        """_removed_kl with every remainder on, on E (_removal_engine of sets, or of sets they are a shift of)."""
+    def _removed_kl_on(self, E, M: dict, ref: torch.Tensor | None = None) -> list[float]:
+        """_removed_kl with every remainder on, on E (_removal_engine of the sets, or of sets they are a shift of), M
+        the sets on its columns ({matrix: bool [sets, T, K]}, _stacked): the positions from the first any set removes
+        something at (or the first target) on, the model's states before it (Engine.log_probs' start)."""
         nat = self.nat
-        rows = max(1, self.NEC_ENTRIES // (E.T * max(nat.C.values())))
         ref = E.ref if ref is None else ref
+        S = next(iter(M.values())).shape[0]
+        hit = torch.zeros(E.T, dtype=torch.bool, device=nat.dev)  # positions any set removes something at
+        for m in M.values():
+            hit |= m.any(2).any(0)
+        first = int(hit.nonzero().min()) if bool(hit.any()) else E.T
+        start = min(first, min(E.targets))  # before it every set's run is the model's (Engine.log_probs' start)
+        rows = max(1, self.NEC_ENTRIES // ((E.T - start) * max(nat.C.values())))
         kls = []
-        for s0 in range(0, len(sets), rows):
-            part = sets[s0:s0 + rows]
-            masks = {n: 1.0 - torch.stack([m[n][:, c] for m in part]).float() for n, c in E.columns.items()}
-            kls += carry.kl(ref, E.log_probs(masks)).tolist()
+        for s0 in range(0, S, rows):
+            masks = {n: 1.0 - m[s0:s0 + rows].float() for n, m in M.items()}
+            kls += carry.kl(ref, E.log_probs(masks, start=start)).tolist()
         native.free(nat.dev)
         return kls
 
@@ -2606,12 +2632,13 @@ class GoalEval:
 
         def damages(sets):  # [D_t per set, per control [D_c per set]]: one engine, moved to each control (Engine.on)
             E = self._removal_engine(tx.ids, tx.targets, sets)
+            M = self._stacked(E, sets)  # once; a control's its shift
             dc = []
             for y in ys:
                 y = list(y[:last + 1])
                 d = last + 1 - len(y)  # the shift
-                dc.append(self._removed_kl_on(E.on(y, [t - d for t in tx.targets if t >= d]), [{n: m[n][d:last + 1] for n in nat.names} for m in sets]))
-            return self._removed_kl_on(E, sets, tx.ref), dc
+                dc.append(self._removed_kl_on(E.on(y, [t - d for t in tx.targets if t >= d]), {n: m[:, d:last + 1] for n, m in M.items()}))
+            return self._removed_kl_on(E, M, tx.ref), dc
         key = ("nec_vpd", last, tuple(tuple(y) for y in ys))  # VPD's damages on these controls: every graph's on the text
         if key not in tx.__dict__:
             tx.__dict__[key] = damages([tx.vpd])

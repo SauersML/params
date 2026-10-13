@@ -116,6 +116,17 @@ def test_outside_on(live):
         want, got = whole.kl(full), on.kl({n: m.index_select(-1, cols[n].to(m.device)) for n, m in masks.items()})
     assert rel(want[1:], got[1:]) < REL
     assert abs(float(want[0] - got[0])) < 1e-6   # every subcomponent on: the model itself, KL ~0 bits
+    # masks at 1 before a position: the run from there on (log_probs' start, the model's states before it) is the whole run
+    s = min(targets) - 3
+    late = {n: m.index_select(-1, cols[n].to(m.device)).clone() for n, m in masks.items()}
+    for m in late.values():
+        m[:, :s] = 1.0
+    with torch.no_grad():
+        whole_run = on.kl(late)
+        moved = on.on(ids, targets)  # Engine.on: the same weights on a text, its own prefix
+        for e in (on, moved):
+            got = carry.kl(e.ref, e.log_probs(late, start=s))
+            assert rel(whole_run[1:], got[1:]) < REL and abs(float(whole_run[0] - got[0])) < 1e-6  # (row 0: the model)
 
 
 def answer(nat, ids) -> list:

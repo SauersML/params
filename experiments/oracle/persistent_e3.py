@@ -231,7 +231,7 @@ def run(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names:
     one and at the circuit's most populated matrix every restricted set (module docstring)."""
     t0 = time.time()
     net = Net(nat, beh, tokens, held)
-    base = net("score", None, grad=False)
+    base = {k: float(v) if torch.is_tensor(v) else v for k, v in net("score", None, grad=False).items()}
     shots = {n: fit(net, n, screen)["val_net"] for n in (names or nat.names)}
     top = max(shots, key=shots.get)
     circ = [tuple(c[:2]) for c in beh["circuit"]]

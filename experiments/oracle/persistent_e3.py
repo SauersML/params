@@ -711,30 +711,32 @@ def summary(rows: list[dict], figure: str | None = None) -> str:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        style = {"circuit_ft_spec": ("fine-tune inside the circuit's span, controls' span removed", "#1a73e8", "o"),
-                 "circuit_ft": ("fine-tune inside the circuit's span", "#1e8e3e", "o"),
-                 "finetune_sites": ("fine-tune at the same matrices, unrestricted", "#202124", "s"),
-                 "finetune": ("fine-tune at one best matrix", "#80868b", "s"),
-                 "random_ft": ("fine-tune inside a random span", "#e37400", "o")}
+        style = {"circuit_ft_spec": ("fine-tune restricted to the circuit's read/write directions,\nwith the controls' circuit directions projected out", "#1a73e8", "o"),
+                 "circuit_ft": ("fine-tune restricted to the circuit's read/write directions", "#1e8e3e", "o"),
+                 "finetune_sites": ("unrestricted fine-tune at the same weight matrices", "#202124", "s"),
+                 "finetune": ("unrestricted fine-tune at the one best weight matrix", "#80868b", "s"),
+                 "random_ft": ("fine-tune restricted to random subcomponents' read/write directions", "#e37400", "o")}
         plt.rcParams.update({"font.size": 15})
-        fig, ax = plt.subplots(figsize=(12, 7.5))
-        for m, (label, c, mk) in style.items():
-            d = per(m)
-            if not d:
-                continue
-            xs = [max(v["pile_kl_per_token"], 1e-5) for v in d.values()]
-            ys = [v["flipped"] for v in d.values()]
-            ax.scatter(xs, ys, color=c, marker=mk, s=36, alpha=0.3)
-            lx = [math.log10(x) for x in xs]
-            (mx, hx), (my, hy) = ci(lx), ci(ys)
-            ax.errorbar([10 ** mx], [my], yerr=[[hy], [hy]], xerr=[[10 ** mx - 10 ** (mx - hx)], [10 ** (mx + hx) - 10 ** mx]], color=c,
-                        marker=mk, ms=11, lw=2, capsize=4, label=label)
-        ax.set_xscale("log")
-        ax.set_xlabel("collateral: KL on held-out Pile text (bits per token)")
-        ax.set_ylabel("preference removed on held-out text (share)")
-        ax.set_ylim(0, 1.08)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(frameon=False, fontsize=12, loc="lower left")
+        fig, axes = plt.subplots(1, 2, figsize=(17, 7.5))
+        for ax, key, ylabel in ((axes[0], "flipped", "share of held-out instances where the preference is gone"),
+                                (axes[1], "controls_kept", "share of held-out control instances where\nthe preferred token is still predicted")):
+            for m, (label, c, mk) in style.items():
+                d = per(m)
+                if not d:
+                    continue
+                xs = [max(v["pile_kl_per_token"], 1e-5) for v in d.values()]
+                ys = [v[key] for v in d.values()]
+                ax.scatter(xs, ys, color=c, marker=mk, s=36, alpha=0.3)
+                lx = [math.log10(x) for x in xs]
+                (mx, hx), (my, hy) = ci(lx), ci(ys)
+                ax.errorbar([10 ** mx], [my], yerr=[[hy], [hy]], xerr=[[10 ** mx - 10 ** (mx - hx)], [10 ** (mx + hx) - 10 ** mx]], color=c,
+                            marker=mk, ms=11, lw=2, capsize=4, label=label)
+            ax.set_xscale("log")
+            ax.set_xlabel("KL on held-out Pile text after the edit (bits per token)")
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(0, 1.08)
+            ax.spines[["top", "right"]].set_visible(False)
+        axes[0].legend(frameon=False, fontsize=11, loc="lower left")
         fig.tight_layout()
         fig.savefig(figure, dpi=150, facecolor="white")
     return "\n".join(lines)

@@ -123,7 +123,8 @@ MIN_SIZE = 4
 SIZE_WEIGHT = 0.5     # components.SIZE_WEIGHT
 TERMS = 5             # components.reward's quality terms: F1, N, F3, E1, E2
 SIZES = (16, 32, 64, 128, 256)  # path points also written
-MAX_NODES = 266       # the answer budget in nodes: components.ANSWER_BUDGET (3,500 tokens) over 8.65 tokens per node and
+MAX_NODES = 8_000 * 266 // 3_500  # 608, the answer budget in nodes (the lead's 10-13: from the 8,000-token answer cap,
+# components.NODE_CAP; was 266 at 3,500 tokens): components.ANSWER_BUDGET (3,500 tokens) over 8.65 tokens per node and
                       # 1.5 connections per node at 3.0 tokens each (primerl's measurements with Qwen3-8B's tokenizer)
 LEVELS = ("position", "site", "chunk64", "chunk16", "chunk4", "subcomponent")  # blocks, coarse to fine
 REPAIR_M = 4          # the omitted lever's budget the flip repair answers (goal_eval.adversary_flips; the reward's term)

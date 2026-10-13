@@ -1663,21 +1663,25 @@ def test_reward_v3_helpers(tiny):
     the start's and every family at 0.9; eps_<family> from the row's draws alone (at least the floor, the floor for a
     family scored in one run); compact; a block is never cheaper than listing its active parts; n_vpd_k."""
     nat, ge, tx = tiny
-    r = 0.3
+    r = 0.27
     row = {"s_point_c": 0.75, "s_nodes": 0.75, "f1_flips_c": {str(goal_eval.FLIP_TERM): 0.75}, "n_spec": 0.75,
-           **{f"eps_{f}": 0.05 for f in goal_eval.PHI_FAMILIES}}
+           **{f"eps_{f}": 0.02 for f in goal_eval.PHI_FAMILIES}}
     got, tau = goal_eval.phi(row)
     assert abs(got - (-math.log2(r))) < 1e-12 and abs(tau - got) < 1e-12  # the row as its own start: min(its phi, at 0.9)
     assert goal_eval.phi(row, start=1.0)[1] == 1.0
-    noisy = dict(row, **{f"eps_{f}": 0.25 for f in goal_eval.PHI_FAMILIES})  # the same scores, noisier
+    noisy = dict(row, **{f"eps_{f}": 0.25 for f in goal_eval.PHI_FAMILIES})  # the same scores, noisier (eps capped at 0.05)
     start = dict(row, s_point_c=0.95, s_nodes=0.95, n_spec=0.95, f1_flips_c={str(goal_eval.FLIP_TERM): 0.95})
     a, b = goal_eval.phi(row, start=start), goal_eval.phi(noisy, start=start)
     assert a[1] == b[1] and b[0] < a[0]  # one bar per text (the start's eps); an answer's own noise lowers only its phi
     # an unscored family of the text counts 0; a weak start's bar sits at every family at 0.5
     fams = ["point", "nodes", "flips", "N", "track_pp"]
-    assert abs(goal_eval.phi(row, families=fams)[0] - goal_eval._phi([(0.75, 0.05)] * 4 + [(0.0, 0.05)])) < 1e-12
+    assert abs(goal_eval.phi(row, families=fams)[0] - goal_eval._phi([(0.75, 0.02)] * 4 + [(0.0, 0.02)])) < 1e-12
     weak = dict(row, s_point_c=0.1, s_nodes=0.1, n_spec=0.1, f1_flips_c={str(goal_eval.FLIP_TERM): 0.1})
-    assert abs(goal_eval.phi(row, start=weak)[1] - goal_eval._phi([(0.5, 0.05)] * 4)) < 1e-12
+    assert abs(goal_eval.phi(row, start=weak)[1] - goal_eval._phi([(0.5, 0.02)] * 4)) < 1e-12
+    assert abs(goal_eval.phi(noisy)[0] - goal_eval._phi([(0.75, goal_eval.EPS_CAP)] * 4)) < 1e-12  # eps at most EPS_CAP
+    # the reward's phi: in full to the bar + PHI_CAP, PHI_SLOPE above
+    assert goal_eval.cap_phi(1.5, 1.0) == 1.5 and abs(goal_eval.cap_phi(4.0, 1.0) - (2.0 + 0.1 * 2.0)) < 1e-12
+    assert goal_eval.cap_phi(None, 1.0) is None and goal_eval.cap_phi(3.0, None) == 3.0
     pool = tiny_pool(nat, tx.ids)
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     empty, vpd = ge.fidelity(tx, [native.Graph(), native.Graph(masks=tx.vpd)], pool, draws=4, steps=2, restarts=2,
@@ -1765,8 +1769,14 @@ def test_necessity_with_specificity(tiny, monkeypatch):
     # answer 1; None when VPD's removal is no more damaging on the text than on the controls (the random tiny model's)
     rec = [[0, 1.0, 2.0, 5.0, 10.0], [1, 3.0, 4.0, 5.0, 10.0]]
     assert abs(goal_eval._spec(rec) - 3 / 7) < 1e-12
-    assert goal_eval._spec([[0, 5.0, 2.0, 5.0, 10.0]]) == 0.0 and goal_eval._spec([[0, 9.0, 2.0, 5.0, 10.0]], raw=True) < 0
-    assert goal_eval._spec([[0, 2.0, 2.0, 10.0, 10.0]]) == 1.0 and goal_eval._spec([[0, 1.0, 10.0, 5.0, 10.0]]) is None
+    two = lambda dc, dv, dt, dtv: [[0, dc, dv - 0.1, dt, dtv], [1, dc, dv + 0.1, dt, dtv]]  # noqa: E731
+    assert goal_eval._spec(two(5.0, 2.0, 5.0, 10.0)) == 0.0 and goal_eval._spec(two(9.0, 2.0, 5.0, 10.0), raw=True) < 0
+    assert goal_eval._spec(two(2.0, 2.0, 10.0, 10.0)) == 1.0 and goal_eval._spec(two(1.0, 10.0, 5.0, 10.0)) is None
+    # the guard: VPD's denominator within twice its standard error over the controls, or one control, gives None;
+    # raw N stays in [-1, 1]
+    assert goal_eval._spec([[0, 1.0, 1.0, 5.0, 2.0], [1, 1.0, 2.0, 5.0, 2.0]]) is None
+    assert goal_eval._spec([[0, 5.0, 2.0, 5.0, 10.0]]) is None
+    assert goal_eval._spec(two(60.0, 2.0, 5.0, 10.0), raw=True) == -1.0
 
 
 def test_point_with_remainders_held(tiny):
@@ -2673,7 +2683,7 @@ def test_family_eps_resamples_as_arrays():
             got = [goal_eval._pooled(kind, [draws[i] for i in rng.integers(len(draws), size=len(draws))], row.get("kl_empty_live"))
                    for _ in range(goal_eval.EPS_BOOT)]  # the floored estimator phi reads
             got = [x for x in got if x is not None]
-            out[fam] = max(goal_eval.EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else goal_eval.EPS_FLOOR
+            out[fam] = min(goal_eval.EPS_CAP, max(goal_eval.EPS_FLOOR, 2 * float(np.std(got, ddof=1)))) if len(got) > 1 else goal_eval.EPS_FLOOR
         return out
     r = np.random.default_rng(1)
     u = lambda a, b: float(r.uniform(a, b))  # noqa: E731

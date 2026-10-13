@@ -67,7 +67,7 @@ bits: R = phi + g x Q + D, phi (goal_eval.phi) -log2 of the power-4 mean of the 
 (point, node removals, connection cuts, flips, path-patched changed inputs and interchange, near and far donors,
 attention patterns, necessity), g a gate at the text's bar (ge.tau), Q = 0.5 compact (log2 of the influential start's
 description bits over the answer's) + E2g + E4x + E1, D the teacher-dominance term; an invalid answer (no CIRCUIT
-section, a missing FINAL or EDIT line, cut at the sampling cap, more than NODE_CAP nodes) earns V3_INVALID, below every
+section, a missing FINAL or EDIT line, cut at the sampling cap; a node cap only when asked) earns V3_INVALID, below every
 valid one. Nodes and edges the model does not have, and circuit lines that do not parse, are dropped and their bits
 charged. goal_eval's C, F1, N, F3, the old E2 (from the no-change answer), E3 and E4 are reported beside it.
 
@@ -145,7 +145,9 @@ INSTANCES_RE = re.compile(r"\(\s*instances\s*:\s*(.*?)\s*\)\s*$", re.I)
 QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")  # a token's repr in an inputs list
 
 V3_INVALID = -10.0  # reward v3 of an invalid answer: below every valid one (phi of a family at s = -100 is about -6.7)
-NODE_CAP = 266  # reward v3's hard cap on an answer's nodes (an answer above it is invalid)
+NODE_CAP = 8_000 * 266 // 3_500  # 608: the nodes an answer at the 8,000-token cap holds at the id grammar's 13.2 tokens a
+# node (the old 266 at 3,500). Informational and opt-in (node_cap=): no validity rule (the lead's 10-13: faithful circuits
+# under changed inputs run 200-1,000 subcomponents; an answer is invalid only over the token cap or unparsed)
 GATE_SLOPE = 10.0  # reward v3's gate g = 1 / (1 + 2^(-10 (phi - phi_tau))): 0.001 one bit short of the bar, 0.15 a quarter
 # bit short. At 4 (the first setting), v1 answers 1.3 bits short kept g = 0.03, and g x 0.5 compact (compact up to ~16
 # bits) gave them 0.10-0.13, more than the phi gaps between them: 3-node RL answers tied 42-node SFT ones (10-12)
@@ -1603,7 +1605,7 @@ def calibration_evidence(row: dict, split: str | None) -> dict:
 def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list | None = None, truncated: list | None = None,
            convention: str = CONVENTION, cache: dict | None = None, ee=None, edit_best: dict | None = None,
            pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None,
-           lines: bool = False, node_cap: int | None = NODE_CAP, retain_calibration: bool = False,
+           lines: bool = False, node_cap: int | None = None, retain_calibration: bool = False,
            invariants: bool = False) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
     in bits, every term ranking, nothing clipped flat): R = phi - phi_tau + g x Q + D (against the text's bar, a constant
@@ -1689,8 +1691,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         row, c, terms, info = row_of.get(i), c_of.get(i), {}, {}
         r = circ = V3_INVALID
         if row is not None:
-            ph, _ = goal_eval.phi(c, families=tau.get("families"))  # the text's families, an unscored one at 0
+            ph_full, _ = goal_eval.phi(c, families=tau.get("families"))  # the text's families, an unscored one at 0
             pt = tau.get("phi_tau")
+            ph = goal_eval.cap_phi(ph_full, pt)  # in full to the bar + 1, a tenth above
             executable_bits = goal_eval.size_bits(graphs[i], P, total, targets, active=tx.vpd)
             b = executable_bits + d_bits
             comp = goal_eval.compact(b, tau.get("bits_start")) if executable_bits > 0 else None
@@ -1704,7 +1707,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             circ = (ph or 0.0) - (pt or 0.0) + (g or 0.0) * 0.5 * (comp or 0.0) + D
             terms |= {"C": c["c"], "C_rl": c.get("c_rl"), "F1": row[f"f1_{convention}"], "N": row[f"n_{convention}"], "F3": row["f3"],
                       "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}
-            info = {"phi": ph, "phi_tau": pt, "g": g, "faithful": None if ph is None or pt is None else ph >= pt, "bits": b,
+            info = {"phi": ph, "phi_full": ph_full, "phi_tau": pt, "g": g, "faithful": None if ph is None or pt is None else ph >= pt, "bits": b,
                     "executable_bits": executable_bits,
                     "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,
                     "e2g": {k: v for k, v in (e2g.get(i) or {}).items() if k != "E2g"} or None}
@@ -1735,7 +1738,7 @@ def _teacher_ref(ge, tx, teacher: dict, pool: dict, split: str | None, task: dic
         g, _ = goal_eval.circuit(teacher, tx.targets, nat.C, tx.T)
         row = ge.fidelity(tx, [g], pool, mode="reward", split=split)[0]
         tau = ge.tau(tx, pool, split or "search")
-        ph, _ = goal_eval.phi(row, families=tau.get("families"))
+        ph = goal_eval.cap_phi(goal_eval.phi(row, families=tau.get("families"))[0], tau.get("phi_tau"))
         b = goal_eval.size_bits(g, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd)
         comp = goal_eval.compact(b, tau.get("bits_start"))
         kept[split] = None if ph is None or comp is None else {"phi": ph, "compact": comp, "bits": b}
@@ -2653,7 +2656,7 @@ def _eval_checkpoint(path: Path, record: dict, *, create: bool = False) -> None:
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
              teachers: dict | None = None, lines: bool = False, checkpoint: Path | None = None,
-             retain_calibration: bool = False, node_cap: int | None = NODE_CAP, invariants: bool = False) -> dict:
+             retain_calibration: bool = False, node_cap: int | None = None, invariants: bool = False) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -2956,7 +2959,7 @@ def main():
     s.add_argument("--variables", action="store_true", help="E4: each answer's VARIABLES block by interchange (variables.Scorer)")
     s.add_argument("--invariants", action="store_true", help="execute formal INVARIANTS on decoded carrier groups; separate diagnostic, no reward change")
     s.add_argument("--matched-all", action="store_true", help="the baselines at every sample's bits (verify-and-pick against VPD@equal bits)")
-    s.add_argument("--node-cap", type=int, default=NODE_CAP, help="answers above it invalid (0: no cap, for targets such as the "
+    s.add_argument("--node-cap", type=int, default=None, help="answers above it invalid (0: no cap, for targets such as the "
                    "influential starts, often above 266 nodes; the share above NODE_CAP is reported)")
     s.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json): reward v3's teacher-dominance reference")
     s.add_argument("--lines", action="store_true", help="each sample's per-line credits (reward(lines=True), line_credit())")

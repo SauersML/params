@@ -506,7 +506,11 @@ PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the sc
     "patching_near": ("s_patching_near", "donor", "draws_patching_near"), "patching_far": ("s_patching_far", "donor", "draws_patching_far"),
     "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_spec", "spec", "draws_n_spec")}
 EPS_FLOOR = 0.005  # eps's floor
+EPS_CAP = 0.05  # eps's cap (the Gate B package, 10-13: the toy repair table passes every non-collapsed check with it;
+# uncapped, one noisy family's eps alone put every-family-at-0.5 below 0 on held-out texts)
 EPS_BOOT = 200  # eps's bootstrap resamples
+PHI_CAP = 1.0  # phi counts in full up to the text's bar + PHI_CAP (cap_phi), PHI_SLOPE of it above
+PHI_SLOPE = 0.1
 
 
 def family_score(row: dict, family: str) -> float | None:
@@ -546,14 +550,16 @@ def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> f
 
 def _spec(draws: list, raw: bool = False) -> float | None:
     """N (necessity_spec) from its records [control, D_c, D_c(VPD), D_t, D_t(VPD)]: (D_t - mean D_c) / (D_t(VPD) -
-    mean D_c(VPD)), at most 1 and clipped at 0 unless raw; None without controls or when VPD's answer's removal damages
-    the controls as much as the text."""
-    if not draws:
+    mean D_c(VPD)) in [0, 1], or [-1, 1] raw; None with fewer than 2 controls or unless VPD's denominator exceeds
+    twice its standard error over the controls (the Gate B package, 10-13: near a zero denominator raw N reached -5
+    on a good toy circuit and -2.9 on held-out text9014)."""
+    if not draws or len(draws) < 2:
         return None
-    den = draws[0][4] - float(np.mean([d[2] for d in draws]))
-    if not den > 0:
+    dv = np.array([d[2] for d in draws], dtype=float)
+    den = draws[0][4] - float(dv.mean())
+    if not den > 2.0 * float(dv.std(ddof=1)) / math.sqrt(len(dv)):
         return None
-    x = min(1.0, (draws[0][3] - float(np.mean([d[1] for d in draws]))) / den)
+    x = min(1.0, max(-1.0, (draws[0][3] - float(np.mean([d[1] for d in draws]))) / den))
     return x if raw else max(0.0, x)
 
 
@@ -610,7 +616,7 @@ def family_eps(row: dict, only=None) -> dict:
             continue
         got = _pooled_resamples(kind, draws, row.get("kl_empty_live"), False, idx)
         got = [x for x in got if x is not None]
-        out[fam] = max(EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else EPS_FLOOR
+        out[fam] = min(EPS_CAP, max(EPS_FLOOR, 2 * float(np.std(got, ddof=1)))) if len(got) > 1 else EPS_FLOOR
     return out
 
 
@@ -622,8 +628,20 @@ def _phi(scores: list) -> float | None:
 
 
 def _eps(row: dict) -> dict:
+    """The row's eps per family (family_eps where absent), at most EPS_CAP (rows stored before the cap too)."""
     eps = {f: row[f"eps_{f}"] for f in PHI_FAMILIES if row.get(f"eps_{f}") is not None}
-    return eps if len(eps) == len(PHI_FAMILIES) else {**family_eps(row), **eps}
+    eps = eps if len(eps) == len(PHI_FAMILIES) else {**family_eps(row), **eps}
+    return {f: min(EPS_CAP, v) for f, v in eps.items()}
+
+
+def cap_phi(ph: float | None, tau: float | None) -> float | None:
+    """phi as the reward counts it (the Gate B package, 10-13): in full up to the text's bar + PHI_CAP, PHI_SLOPE of the
+    rest above (faithfulness past the bar is not worth size: a superset gaining 3 bits of phi was worth a 64x larger
+    circuit through compactness's 0.5 log2; the slope still breaks ties toward faithfulness)."""
+    if ph is None or tau is None:
+        return ph
+    top = tau + PHI_CAP
+    return min(ph, top) + PHI_SLOPE * max(0.0, ph - top)
 
 
 def phi(row: dict, start: float | dict | None = None, families: list | None = None) -> tuple:

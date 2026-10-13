@@ -60,3 +60,11 @@ def test_full_and_reward_fidelity_use_the_same_raw_phi_families():
     full = ge.fidelity(tx, [g], mode="full", **opts)[0]
     assert reward["rl_terms"] == full["rl_terms"]
     assert goal_eval.phi(reward)[0] == pytest.approx(goal_eval.phi(full)[0])
+
+
+def test_eps_cap_and_n_guard():
+    """eps at most EPS_CAP from the bootstrap; N None where VPD's denominator is within twice its standard error."""
+    row = {"s_nodes": 0.5, "draws_nodes": [[0, 0.1, 0.05, 1.0], [1, 3.0, 0.05, 1.0], [2, 0.2, 0.05, 2.0]], "kl_empty_live": 1.0}
+    assert goal_eval.family_eps(row)["nodes"] <= goal_eval.EPS_CAP
+    noisy = [[j, 1.0, 1.0 + (-1) ** j * 5.0, 3.0, 2.5] for j in range(8)]  # denominator 1.5, its SE ~1.9
+    assert goal_eval._spec(noisy) is None and goal_eval._spec(noisy, raw=True) is None

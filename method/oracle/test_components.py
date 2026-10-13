@@ -301,7 +301,8 @@ def test_reward_on_tiny_model(tiny):
 
 
 def test_invalid_below_every_valid_answer(tiny):
-    """However badly a valid answer does, it earns more than an invalid one; an answer above NODE_CAP nodes is invalid."""
+    """However badly a valid answer does, it earns more than an invalid one; a node cap invalidates only when asked for
+    (node_cap=): by default size is priced by compactness alone."""
     nat, ge, task, ev = tiny
     T = len(task["prompts"][0]["token_ids"])
     every = native.Graph({(n, t, c) for n in nat.names for t in range(T) for c in range(nat.C[n])})
@@ -313,8 +314,9 @@ def test_invalid_below_every_valid_answer(tiny):
     garbage = "\n".join(["Reader: L1.o#1@3 <- Writer: L0.down#2@3", "the attention reads the previous token"] * 200)
     texts = [components.render(goal_eval.to_json(huge, ""), wrong), components.render(junk, wrong),
              components.render({"nodes": [], "edges": []}, wrong).replace("flowchart LR", "flowchart LR\n" + garbage)]
-    got = components.reward(ge, task, ev, texts, pool={})
-    assert huge.count() > components.NODE_CAP and not got[0]["valid"] and got[0]["reward"] == components.V3_INVALID
+    got = components.reward(ge, task, ev, texts, pool={}, node_cap=10)
+    assert huge.count() > 10 and not got[0]["valid"] and got[0]["reward"] == components.V3_INVALID
+    assert components.reward(ge, task, ev, texts[:1], pool={})[0]["valid"]  # no cap by default
     assert got[1]["valid"] and got[2]["valid"]  # lines that do not parse are dropped and charged, not fatal
     assert got[1]["dropped_edges"] == 5 * T and got[2]["malformed"] == 400 and got[2]["bits"] > got[1]["bits"] > 0
     assert min(r["reward"] for r in got[1:]) > components.V3_INVALID

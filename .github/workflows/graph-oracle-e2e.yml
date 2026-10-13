@@ -71,9 +71,9 @@ jobs:
           python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -q 'pytest>=8' numpy scipy safetensors transformers peft tokenizers huggingface_hub httpx
 
-      - name: Check executed toy wiring
+      - name: Check toy wiring, fixed-basis edits and SFT weighting
         if: ${{ !inputs.adversary_batch_only }}
-        run: python -m pytest experiments/oracle/toyloop/test_wiring.py -q --tb=short
+        run: python -m pytest experiments/oracle/toyloop/test_wiring.py experiments/oracle/toyloop/test_head_counterfactual.py experiments/oracle/toyloop/test_relation_loss.py -q --tb=short
 
       - name: Check weight-use, intervention, English and data controls
         if: ${{ !inputs.adversary_batch_only }}

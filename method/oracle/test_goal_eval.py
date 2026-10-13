@@ -1924,7 +1924,8 @@ def test_line_leave_one_out(tiny):
                        for k in ("s_point_c", "s_track_pp", "s_interchange_pp", "s_pattern", "n_spec")}}
     for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
         row.pop(f"eps_{f}", None)
-    want = goal_eval.phi(row)[0]
+    fams = ((tx.__dict__.get("_tau") or {}).get("search") or {}).get("families")  # line_loo's: the text's, once tau is scored
+    want = goal_eval.phi(row, families=fams)[0]
     assert abs(first["phi"] - want) < 1e-4, (first["phi"], want)
     P, S = max(tx.targets) + 1, sum(nat.C.values())
     assert abs(first["bits"] - goal_eval.size_bits(h, nat.positions(tx.targets), S, tx.targets)) < 1e-9
@@ -1951,7 +1952,7 @@ def test_node_family_against_the_models_response(tiny):
     assert abs(row["draws_nodes"][0][3] - w0) < 1e-4 + 1e-4 * w0, (row["draws_nodes"][0][3], w0)
     s = goal_eval._pooled("weighted", row["draws_nodes"], None)
     f = ge.fidelity(tx, [g], None, draws=4, near_donors=0, far_donors=0, interchange=0, changed=0, pattern=False)[0]
-    assert abs(f["s_nodes"] - s) < 1e-9
+    assert (f["s_nodes"] is None and s is None) or abs(f["s_nodes"] - s) < 1e-9
     claim = np.mean([d[4] for d in row["draws_nodes"]])
     assert abs(row["overstate_nodes"] - claim / np.mean([d[3] for d in row["draws_nodes"]])) < 1e-9
     k = 7

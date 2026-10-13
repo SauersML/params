@@ -68,3 +68,22 @@ def test_eps_cap_and_n_guard():
     assert goal_eval.family_eps(row)["nodes"] <= goal_eval.EPS_CAP
     noisy = [[j, 1.0, 1.0 + (-1) ** j * 5.0, 3.0, 2.5] for j in range(8)]  # denominator 1.5, its SE ~1.9
     assert goal_eval._spec(noisy) is None and goal_eval._spec(noisy, raw=True) is None
+
+
+def test_pooled_ratio():
+    """The weighted families' score: sum ln(W / KL_C) / sum ln(W / KL_VPD) over the draws where VPD is nearer than no
+    change, in [0, 1] (raw [-1, 1]); a draw with VPD barely under W no longer swings it; None when the denominator is
+    within twice its standard error."""
+    import math
+    d = [[0, 0.5, 0.2, 2.0], [1, 1.0, 0.4, 2.0], [2, 2.5, 0.3, 2.0], [3, 9.0, 3.0, 2.0]]  # the last: VPD past W, left out
+    num = math.log(2.0 / 0.5) + math.log(2.0 / 1.0) + math.log(2.0 / 2.5)
+    den = math.log(2.0 / 0.2) + math.log(2.0 / 0.4) + math.log(2.0 / 0.3)
+    swing = d[:3] + [[4, 1.9, 1.9999, 2.0]]  # VPD at the bound: its per-draw ratio would be about 1e3, here it adds ~nothing
+    want = min(1.0, (num + math.log(2.0 / 1.9)) / (den + math.log(2.0 / 1.9999)))
+    assert abs(goal_eval._ratio_pool(swing) - want) < 1e-12 and abs(want - num / den) < 0.02
+    assert abs(goal_eval._ratio_pool(d) - num / den) < 1e-12
+    assert goal_eval._pooled("weighted", d, None) == goal_eval._ratio_pool(d)
+    assert goal_eval._ratio_pool([[0, 50.0, 0.2, 2.0], [1, 40.0, 0.3, 2.0]], raw=True) == -1.0
+    noisy = [[j, 1.0, 2.0 * (1 - 0.999 * (j % 2)), 2.0] for j in range(6)]  # VPD at the bound on half the draws
+    assert goal_eval._ratio_pool(noisy) is not None
+    assert goal_eval._ratio_pool([[0, 1.0, 1.99, 2.0], [1, 1.0, 1.0, 2.0], [2, 1.0, 1.999, 2.0]]) is None

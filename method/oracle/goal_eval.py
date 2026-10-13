@@ -528,7 +528,7 @@ def family_score(row: dict, family: str) -> float | None:
 
 def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> float | None:
     """A family's score from some of its draws, as the family pools them: "mean" on the mean KLs ([KL_C, KL_VPD] each,
-    against KL_empty e0), "weighted" per draw against its bound W ([prompt, KL_C, KL_VPD, W]) pooled by W, "donor" on
+    against KL_empty e0), "weighted" a pooled log ratio against each draw's bound W ([prompt, KL_C, KL_VPD, W]; _ratio_pool), "donor" on
     the mean KLs against the mean keep-nothing KL ([donor, KL_C, KL_VPD, KL_0, score]), "spec" N's specificity form
     (_spec: [control, D_c, D_c of VPD's answer, D_t, D_t of VPD's answer])."""
     if not draws:
@@ -540,12 +540,30 @@ def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> f
         return None if e0 is None else fid(e0, float(np.mean([d[0] for d in draws])), float(np.mean([d[1] for d in draws])))
     if kind == "donor":
         return fid(float(np.mean([d[3] for d in draws])), float(np.mean([d[1] for d in draws])), float(np.mean([d[2] for d in draws])))
-    num = den = 0.0
-    for d in draws:
-        sd = fid(d[3], d[1], d[2])
-        if sd is not None:
-            num, den = num + d[3] * sd, den + d[3]
-    return num / den if den > 0 else None
+    return _ratio_pool(draws, raw)
+
+
+def _ratio_pool(draws: list, raw: bool = False) -> float | None:
+    """The "weighted" families' score ([prompt, KL_C, KL_VPD, W] per draw: track_pp, interchange_pp, nodes), a pooled
+    ratio (the lead's 10-13: per-draw ratios swung s_track_pp on text9002 between 0.21 and 0.85 while the KLs barely
+    moved, from draws where VPD's own run sits near the no-change bound): over the draws where VPD's answer is nearer
+    than no change (KL_VPD < W), sum ln(W / KL_C) / sum ln(W / KL_VPD), in [0, 1], raw in [-1, 1]; None without such
+    draws or unless the denominator exceeds twice its standard error over them (sqrt(n) x the spread of the draws'
+    ln(W / KL_VPD))."""
+    num, den = [], []
+    for d in draws or []:
+        w, kc, kv = d[3], d[1], d[2]
+        if kc is None or kv is None or not (w > 0 and kv < w):
+            continue
+        den.append(math.log(w / max(kv, 1e-12)))
+        num.append(math.log(w / max(kc, 1e-12)))
+    if not den:
+        return None
+    total = float(sum(den))
+    if len(den) > 1 and not total > 2.0 * math.sqrt(len(den)) * float(np.std(den, ddof=1)):
+        return None
+    x = min(1.0, float(sum(num)) / total)
+    return max(-1.0, x) if raw else max(0.0, x)
 
 
 def _spec(draws: list, raw: bool = False) -> float | None:
@@ -564,13 +582,8 @@ def _spec(draws: list, raw: bool = False) -> float | None:
 
 
 def _pooled_raw(draws: list) -> float | None:
-    """_pooled's "weighted" form without the floor at 0 (c_rl's terms)."""
-    num = den = 0.0
-    for d in draws or []:
-        sd = _fid_raw(d[3], d[1], d[2])
-        if sd is not None:
-            num, den = num + d[3] * sd, den + d[3]
-    return num / den if den > 0 else None
+    """_pooled's "weighted" form without the floor at 0 (c_rl's terms; at least -1)."""
+    return _ratio_pool(draws, raw=True)
 
 
 def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: np.ndarray) -> list:
@@ -583,12 +596,13 @@ def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: 
         den = dtv - dcv
         x = np.minimum(1.0, (dt - dc) / np.where(den > 0, den, 1.0))
         return [(float(v) if raw else max(0.0, float(v))) if ok else None for v, ok in zip(x, den > 0)]
-    if kind == "weighted":
-        sd = [fid(d[3], d[1], d[2]) for d in draws]
-        w = np.array([d[3] if x is not None else 0.0 for d, x in zip(draws, sd)], dtype=float)
-        sw = np.array([d[3] * x if x is not None else 0.0 for d, x in zip(draws, sd)], dtype=float)
-        num, den = sw[idx].sum(1), w[idx].sum(1)
-        return [float(a) / float(b) if b > 0 else None for a, b in zip(num, den)]
+    if kind == "weighted":  # _ratio_pool per resample (its standard-error guard is the point estimate's)
+        ok = [d[1] is not None and d[2] is not None and d[3] > 0 and d[2] < d[3] for d in draws]
+        dn = np.array([math.log(d[3] / max(d[2], 1e-12)) if o else 0.0 for d, o in zip(draws, ok)], dtype=float)
+        nm = np.array([math.log(d[3] / max(d[1], 1e-12)) if o else 0.0 for d, o in zip(draws, ok)], dtype=float)
+        num, den = nm[idx].sum(1), dn[idx].sum(1)
+        x = np.minimum(1.0, num / np.where(den > 0, den, 1.0))
+        return [(max(-1.0, float(v)) if raw else max(0.0, float(v))) if d_ > 0 else None for v, d_ in zip(x, den)]
     if kind == "mean":
         if e0 is None:
             return [None] * len(idx)
@@ -2022,9 +2036,9 @@ class GoalEval:
                 if sb is not None:
                     a[0], a[1], a[2], a[3], a[5] = a[0] + w * sb, a[1] + w, a[2] + w * kc, a[3] + 1, a[5] + w * _fid_raw(w, kc, kv)
             native.free(nat.dev)
-        return [{"s_track_pp": a[0] / a[1] if a[1] > 0 else None, "kl_track_pp_c": a[2] / a[1] if a[1] > 0 else None,
-                 "prompts_track_pp": a[3], "draws_track_pp": a[4], "s_track_pp_raw": a[5] / a[1] if a[1] > 0 else None}
-                for a in acc]
+        return [{"s_track_pp": _ratio_pool(a[4]), "kl_track_pp_c": a[2] / a[1] if a[1] > 0 else None,
+                 "prompts_track_pp": a[3], "draws_track_pp": a[4], "s_track_pp_raw": _ratio_pool(a[4], raw=True)}
+                for a in acc]  # a pooled ratio over the draws (_ratio_pool)
 
     @torch.no_grad()
     def interchange_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval",
@@ -2080,8 +2094,8 @@ class GoalEval:
                 if sb is not None:
                     a[0], a[1], a[2], a[4] = a[0] + w * sb, a[1] + w, a[2] + 1, a[4] + w * _fid_raw(w, kc, kv)
             native.free(nat.dev)
-            out.append({"s_interchange_pp": a[0] / a[1] if a[1] > 0 else None, "prompts_interchange_pp": a[2],
-                        "draws_interchange_pp": a[3], "s_interchange_pp_raw": a[4] / a[1] if a[1] > 0 else None})
+            out.append({"s_interchange_pp": _ratio_pool(a[3]), "prompts_interchange_pp": a[2],
+                        "draws_interchange_pp": a[3], "s_interchange_pp_raw": _ratio_pool(a[3], raw=True)})
         return out
 
     def _interchange_lines(self, tx: Text, graph: native.Graph, split: str, draws: int, lines: torch.Tensor) -> list[dict]:
@@ -2141,8 +2155,8 @@ class GoalEval:
                 sb = _fid(w, kc, kv)
                 if sb is not None:
                     a[0], a[1], a[2], a[4] = a[0] + w * sb, a[1] + w, a[2] + 1, a[4] + w * _fid_raw(w, kc, kv)
-            out[k] = {"s_interchange_pp": a[0] / a[1] if a[1] > 0 else None, "prompts_interchange_pp": a[2],
-                      "draws_interchange_pp": a[3], "s_interchange_pp_raw": a[4] / a[1] if a[1] > 0 else None}
+            out[k] = {"s_interchange_pp": _ratio_pool(a[3]), "prompts_interchange_pp": a[2],
+                      "draws_interchange_pp": a[3], "s_interchange_pp_raw": _ratio_pool(a[3], raw=True)}
         native.free(nat.dev)
         return out
 

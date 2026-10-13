@@ -1349,6 +1349,8 @@ def listing(strings: list[str], numbered: set[int], every: int = MARK_EVERY) -> 
 ASK_INVARIANTS = (" Add a separate INVARIANTS: section of executable predictions, one per line: "
                   "I1: V1 from @322=' donor' -> top ' outcome', or I2: remove V1 -> p(top) < 0.5. "
                   "Reference the numbered V1, V2 variable definitions; name each donor position and exact token. "
+                  "End it with one RULES OUT: line, the likeliest other mechanism and the intervention that tells the two "
+                  "apart: RULES OUT: <the alternative in words> | <intervention> -> <outcome> vs <the alternative's outcome>. "
                   "These formal predictions are distinct from the free English explanation.")
 
 
@@ -1608,7 +1610,9 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict, split: str
 
 
 def invariant_diagnostic(ge, tx, answer: dict, model: str) -> dict:
-    """Execute formal claims on their decoded real-model carrier groups, separately from reward and free prose."""
+    """Execute formal claims on their decoded real-model carrier groups, separately from reward and free prose; the
+    RULES OUT lines among them (semantic.check_rules_out: the alternative's outcome under the same intervention) as
+    "rules_out" when there are any."""
     import semantic
     import variables
 
@@ -1622,7 +1626,12 @@ def invariant_diagnostic(ge, tx, answer: dict, model: str) -> dict:
         groups = variables.parse(bound, ge.nat.C)
     except (ValueError, KeyError, TypeError):
         return {"executed": False, "reason": "invalid_variable_groups"}
-    return {"executed": True, **semantic.check_invariants(variables.Scorer(ge), tx, groups, "\n".join(claims), model)}
+    sc = variables.Scorer(ge)
+    out = {"executed": True, **semantic.check_invariants(sc, tx, groups, "\n".join(claims), model)}
+    rules = [c for c in claims if c.startswith("RULES OUT")]
+    if rules:
+        out["rules_out"] = semantic.check_rules_out(sc, tx, groups, "\n".join(rules), model)
+    return out
 
 
 def softplus(x: float) -> float:

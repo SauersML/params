@@ -712,6 +712,26 @@ def test_invariant_diagnostic_executes_decoded_groups_separately(monkeypatch):
     assert calls[1] == ("scorer", "tx", [{"name": "V1", "group": [("site", 3, 2)]}], answer["invariants"][0], "mock")
 
 
+def test_invariant_diagnostic_checks_the_rules_out_line_on_the_same_groups(monkeypatch):
+    from types import SimpleNamespace
+    import semantic
+    import variables
+
+    calls = []
+    monkeypatch.setattr(variables, "parse", lambda vs, C: [{"name": vs[0]["name"], "group": [("site", 3, 2)]}])
+    monkeypatch.setattr(variables, "Scorer", lambda ge: "scorer")
+    monkeypatch.setattr(semantic, "check_invariants", lambda sc, tx, vs, text, model: {"holds": 1.0, "credit": 1.0, "bad": 0})
+    monkeypatch.setattr(semantic, "check_rules_out", lambda sc, tx, vs, text, model:
+                        calls.append((sc, vs, text)) or {"ruled_out": 1.0, "credit": 1.0, "bad": 0})
+    rule = "RULES OUT: the previous token alone | remove V1 -> p(top) < 0.5 vs unchanged"
+    answer = {"variables": [{"name": "copied name", "ref": "V1", "group": [["site", 2, 3]]}],
+              "invariants": ["I1: remove V1 -> p(top) < 0.5", rule]}
+    got = components.invariant_diagnostic(SimpleNamespace(nat=SimpleNamespace(C={"site": 4})), "tx", answer, "mock")
+    assert got["rules_out"] == {"ruled_out": 1.0, "credit": 1.0, "bad": 0}
+    assert calls == [("scorer", [{"name": "V1", "group": [("site", 3, 2)]}], rule)]
+    assert "RULES OUT:" in components.ASK_INVARIANTS
+
+
 def test_invariants_renumber_noncontiguous_refs_after_variable_reordering():
     text = "\n".join(["CIRCUIT:", "@3 a=L1.v#2 b=L1.v#4", "OUT <- a,b", "EXPLANATION:", "VARIABLES:",
                       'V3 "alpha": first; inputs: @2; carried by: a; feeds: PREDICTION',

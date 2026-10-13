@@ -26,6 +26,9 @@
 %% weight_family still scores log_softmax(log p_full + log q_C,edited - log q_C,original): full-model baseline anchored.
 %% Therefore conditional edit tracking does not itself prove small direct KL(p_edited || q_C,edited). Toy CF reports both.
 %% Decision: use actual edited-output fidelity to improve and compare teacher targets; anchored change scores remain conditional evidence. Other training arms continue independently.
+%% Full-start search38458577313: all72 whole-site teacher-mask proposals rejected at .001bits; all3 outputs remain full-model. Reconstruction max1.05e-11bits; six tests passed,336 forwards,356.62s.
+%% This rejects coarse removal of almost all nonteacher components at a site, not faithful compression in general. Smallest failed worst KL by context: .484,.124,.783bits.
+%% Next: split removals by position/component while keeping the same fidelity check; retain continuous KL-versus-reachable-size measurements, including failures. Count live dense remainders explicitly.
 %% 2026-10-13 strong-open grounded-input probe COMPLETE:56 first Qwen3.6-35B-A3B responses,$0.27303027.
 %% Fixed42conditions: facts3/42,geometry3/42; both0/14complete triplets, allresponsesvalid. Recipient-only18/42.
 %% Exactgeometry prompts deduplicated14calls and boundto42conditions; facts42calls. No added-value signal; no four-view training GO.

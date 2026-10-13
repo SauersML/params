@@ -1,4 +1,13 @@
 %% TEAM COORDINATION MAP. Edit this source, never plan.png. Every agent may edit it.
+%% 2026-10-13 factorial point38404681408 and edit38404715500 COMPLETE; saved-array independent audit passes1904 files.
+%% Relation8 top agreement K1/K8/V1/V8 =31.25/43.75/77.68/100%; V8 meanKL2.056e-6bits, edgeF1.975.
+%% All24 V8 top98.81%, valid24/24; one bigram task misses8/28inputs. V8 includes2extra gate edges.
+%% Weight edits: V8 and BASE both1792/1792 tops; worstKL0.00014845bits. This preserves base ability, not superiority.
+%% Affected half-scale224: K1/K8 28correct(meanKL5.37844),V1 180(1.21458),V8 224(0.00002562).
+%% Affected deletion224: ALL four224correct; deletion-only accuracy would miss the training failure.
+%% Four reused toy models,64 parameter edits,1792 input/edit pairs; not1792 independent interventions or novel-family transfer.
+%% Next freeze V8 and compare fresh route-discrimination/compositional cases to BASE; inspect topology specificity before more training.
+%% RealVPD feature packing now249/249fit without drops; static token facts remain approximate. Paired strong-open ability probe next.
 %% 2026-10-13 factorial COMPLETE:256 updates and96 first answers, actual$1.181507448; zero unresolved paid calls.
 %% Free point38404681408 and weight-edit38404715500 execute in parallel; same frozen96 answers and cd8 executor.
 %% Compare relation8 plus all24, retain invalids, and separate deletion/half-scale KL on all1792 fixed input/edit pairs.
@@ -493,11 +502,11 @@ flowchart BT
   CLAIMFIT["<b>Carrier size remains the limit</b><br/>53% compression; further4.7% adds no rows;<br/>2 of15 exact rows fit training limits;<br/>next: smaller verified carrier sets<br/>AUDIT DONE · codex/variable_reward"]
   CLAIMQA["<b>Learn measured transplant effects</b><br/>147 fit with archived hints;16 hard rows;<br/>independent readback preserves all labels;<br/>partial coverage and ID limits explicit<br/>DATA READY · codex/variable_reward"]
   CLAIMCTRL["<b>Component identity changes behavior</b><br/>89 cases, counts and positions held fixed;<br/>permutations change 79/89 and 76/89 tops;<br/>use matched cases to test weight grounding<br/>MEASURED · codex/variable_reward"]
-  CLAIMGROUND["<b>Make weight information interpretable</b><br/>71 donor worlds measured; add activation<br/>changes and typed token readouts;<br/>check useful information before training<br/>INPUT AUDIT · codex/variable_reward"]
+  CLAIMGROUND["<b>Can a model use grounded inputs?</b><br/>Donor changes + token readouts fit249 cases;<br/>compare strong-open predictions with and<br/>without these facts before more training<br/>PROBE PREPARATION · codex/variable_reward"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
-  CAPABLE["<b>Does training preserve causal wiring?</b><br/>4 matched variants trained,96 answers;<br/>execute circuits and weight edits in parallel;<br/>valid syntax alone cannot establish progress<br/>SCORING · codex/fork_review · $1.182"]
-  CAPCF["<b>Base circuits predict weight edits</b><br/>4 toys, 448 affected input/edit pairs;<br/>base 448/448 tops, worst KL0.00015 bits;<br/>SFT 252/448; preserve this causal ability<br/>MEASURED · codex/eval_recovery"]
+  CAPABLE["<b>Training can preserve toy wiring</b><br/>Support examples + edge loss: relation<br/>top31% to100%; all-case top99%;<br/>next test fresh routes and compositions<br/>MEASURED · codex/fork_review · $1.182"]
+  CAPCF["<b>Weight-edit ability recovered</b><br/>Best training and base:1792/1792 tops;<br/>worst KL0.00015 bits on4 toy models;<br/>half-strength edits expose weaker training<br/>MEASURED · codex/eval_recovery"]
   CAPENG["<b>Separate writer and reader failures</b><br/>Both English controls miss causal details;<br/>verify source facts before reader calibration;<br/>no faithful-English claim yet<br/>REPAIRING CONTROL · codex/eval_recovery"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]

@@ -245,16 +245,15 @@
 %% Same frozen basis/graph in32worlds; literal W += (s-1)*outer(Uc,Vc), circuit Uc *= s at all positions.
 %% Sparse ordinary KL5.07e-7bits; four informative Q/K deletions give0.8841/1.5358bits despite correct top token.
 %% No-change full-model predictions lose13.05/13.66bits: sparse circuit tracks much of the effect but is not exact.
-%% Dense same-two-head/all-position control maxKL1.84e-8bits; sparse independent-equation discrepancy below1e-6logprob.
+%% Dense same-two-head/all-position control maxABS numericKL6.69e-8bits; sparse independent discrepancy below1e-6logprob.
+%% Sparse62nodes/252edges; dense520nodes/16047edges. Dense fidelity is costly; do not present it as a simple solution.
+%% Regression37c8478 protects same-edit/cache/restoration semantics and this counterexample;17tests pass.
 %% All32rows retained (28weak/noeffect); cached-reference primed then edit checked against direct target_forward; weights restored.
 %% Artifact: mpd-data/scratch/variable_reward/typed_weight_interventions/{manifest,results,raw_distributions}.json and run.py.
 %% This is one fixed analytical toy and prespecified component per port, not all components, fresh families or learned VPD.
 %% Dense control restores both value routes and residual reader parents; no attribution to softmax tails alone established.
 %% Decision: original-output reward cannot certify edit predictions. Add explicit edit fidelity alongside compactness;
 %% current paired RL point-sufficiency pilot continues unchanged and independent of this diagnostic.
-%% Next routing step: preserve exact head ports and token positions in strict Mermaid output; reject ignored syntax.
-%% In parallel, design same-basis rank-one weight edits on full model and circuit, checking intervention KL beyond baseline.
-%% Why: Python-only adapter cannot train an oracle; ordinary-output fidelity alone does not prove causal abstraction.
 %% Typed routing and independent intervention parity proceed beside the existing unit-vs-wiring RL comparison.
 %% Follow-through9476e8: optional typed head-port adapter uses existing Native.Graph at exact positions; default unchanged.
 %% Frozen multihop014: correct route KL5.13e-7bits; wrong intermediate or downstream port7.4376bits.
@@ -391,7 +390,7 @@ flowchart BT
   CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
   WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>two free CPU forks, lower-memory updates;<br/>matched20 steps; paired report ready<br/>ACTIVE · codex/eval_recovery"]
   ROUTE["<b>Oracle-emittable token routing</b><br/>strict Mermaid preserves exact ports;<br/>wrong positions and ports execute;<br/>graph-local causal softmax explicit<br/>DONE opt-in adapter · codex/fork_review"]
-  ROUTEEDIT["<b>Point fit misses weight effects</b><br/>sparse circuit: 1.54 bits after Q cut;<br/>dense same-head control below 2e-8;<br/>score edits separately from original fit<br/>CHECK · codex/variable_reward"]
+  ROUTEEDIT["<b>Point fit misses weight effects</b><br/>sparse circuit: 1.54 bits after Q cut;<br/>dense predicts edits, costs64x edges;<br/>optimize compactness and edit fidelity<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
   FBASE["<b>Matched QA baseline measured</b><br/>DeepSeek59.50%, Qwen65.64%;<br/>cheap features66.76% on same179 QA;<br/>prioritize circuit fidelity over QA scaling<br/>CHECK · codex · $0.145 spent"]
 

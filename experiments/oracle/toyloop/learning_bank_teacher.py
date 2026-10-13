@@ -89,6 +89,12 @@ def execute_case(row, bank, out, modules):
     if len(cache['references'])!=worlds:raise RuntimeError('world receipt differs')
     # Freeze target before any point-control metadata is exposed to this process.
     write(out/'search.json',result)
+    if result['target'] is not None:
+        import os
+        with (out/'final_target.txt').open('w') as handle:
+            handle.write(result['target']);handle.flush();os.fsync(handle.fileno())
+        if sha(out/'final_target.txt') != result['target_sha256']:
+            raise RuntimeError('written target differs from frozen search receipt')
     write(out/'reference_cache.json',{k:v for k,v in cache.items() if k!='references'})
     save_file({f'reference_{i}':v.contiguous() for i,v in enumerate(cache['references'])},
               str(out/'references.safetensors'))
@@ -163,6 +169,8 @@ def main():
         statuses.append(status);write(args.out/'status.json',statuses)
         print(json.dumps(status),flush=True)
     write(args.out/'complete.json',{'cases':statuses,'forward_cap':contract['forward_cap']})
+    if any(r['status'] in ('error','construction_error') for r in statuses):
+        raise RuntimeError('retained case failures; no substitution or retry')
 
 
 if __name__=='__main__':main()

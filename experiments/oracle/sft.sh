@@ -19,7 +19,8 @@ RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
 ROWS=${ROWS:?question rows: components.py prepare output, several joined}
 TEACHER=${TEACHER:?teacher circuits (<task>.json)}
-BASE=${BASE:-Qwen/Qwen3-8B} STEPS=${STEPS:-100} BATCH=${BATCH:-8} NEVAL=${NEVAL:-20} SAMPLES=${SAMPLES:-4} MAXTOK=${MAXTOK:-4096}
+# Match tinker_train.ANSWER_CAP: 4096 cuts many current Mermaid teacher answers before their FINAL/EDIT lines.
+BASE=${BASE:-Qwen/Qwen3-8B} STEPS=${STEPS:-100} BATCH=${BATCH:-8} NEVAL=${NEVAL:-20} SAMPLES=${SAMPLES:-4} MAXTOK=${MAXTOK:-8000}
 HELDOUT=${HELDOUT:-$O/zeroshot_heldout20/fresh20_rt_st.jsonl} HELDOUT_TEACHER=${HELDOUT_TEACHER:-~/mpd-data/graph_oracle/teacher/joint_heldout}
 LABELS=${LABELS:-$O/heldout50_locality_frozen.jsonl}  # frozen once: never relabel per teacher version
 SRC=${SRC:-/Users/user/params}  # a source tree (a clean copy of main while others edit the shared tree)

@@ -1115,7 +1115,7 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
         stage(level, t0, rounds)
     if phi_pool is not None:                                 # the reward's bar on the search split, backing off a stage
         bar = ge.tau(tx, phi_pool, "search")["phi_tau"]      # at a time while the circuit falls below it
-        rec["phi"], best = [], None
+        rec["phi"], best, passed = [], None, None
         for name, on_s in reversed(snaps):                   # (phi_log: every stage, each phi family's score kept)
             row = ge.fidelity(tx, [graph_of(on_s)], phi_pool, mode="reward", split="search")[0]
             ph = goal_eval.phi(row, start=bar)[0]
@@ -1125,10 +1125,13 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
                 + " ".join(f"{f} {v:.3f}" for f, v in fam.items() if v is not None), flush=True)
             if ph is not None and (best is None or ph > best[0]):
                 best = (ph, name, on_s)
-            if ph is not None and bar is not None and ph >= bar + PHI_SLACK and not phi_log:
-                break
-        if best is not None:
-            pr.on, rec["phi_stage"] = best[2].clone(), best[1]
+            if ph is not None and bar is not None and ph >= bar + PHI_SLACK:
+                passed = passed or (ph, name, on_s)          # the latest stage that passes (phi_log goes on scoring)
+                if not phi_log:
+                    break
+        pick = passed or best                                # that, else the best phi
+        if pick is not None:
+            pr.on, rec["phi_stage"] = pick[2].clone(), pick[1]
     g = graph_of(pr.on)
     if acceptance is not None:
         rec["accept"] = acceptance.scores([g])[0]

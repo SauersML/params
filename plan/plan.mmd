@@ -190,7 +190,8 @@ flowchart BT
   %% ===================== legend and operating agreement =====================
   subgraph LEG["LEGEND"]
     direction LR
-    k1["done"] ~~~ k2["active"] ~~~ k8["check"] ~~~ k3["blocked"] ~~~ k4["waiting"] ~~~ k5{{"gate"}} ~~~ k6["later"] ~~~ k7["<b>Updated 2026-10-13</b><br/>Base caps: RunPod $360, Tinker $130<br/>extra $40 shared across both<br/>user +$30 RunPod to the lead"]
+    k0["<b>Status colors</b><br/>Green: done · Blue: active or check<br/>Red: blocked · Gray: waiting or later<br/>Gold: gate · Purple: capability"]
+    k7["<b>Updated 2026-10-13</b><br/>Base caps: RunPod $360, Tinker $130<br/>extra $40 shared across both<br/>user +$30 RunPod to the lead"]
   end
   IMPA ~~~ LEG
 
@@ -206,18 +207,18 @@ flowchart BT
   classDef impact fill:#12233f,stroke:#12233f,stroke-width:2px,color:#ffffff
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
-  class VPD,ENG,PHI,W1,W3,I1,I2,T1,k1 done
-  class T2,T3,T5,I4,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3,k2 active
+  class VPD,ENG,PHI,W1,W3,I1,I2,T1 done
+  class T2,T3,T5,I4,W2,W4,TOY,REM,TOOLS,S1,SP1,SP2,SP3 active
   class I5 done
   class I6,W5 done
   class T4 active
-  class I3,S2,SUP,LAT1,k8 check
-  class GATEB,k3 blocked
-  class S3,ORC,R1,R2,R3,R4,R5,k4 waiting
-  class LAT2,UVPD,k6 later
-  class GATEA,GATEC,GATED,k5 gate
+  class I3,S2,SUP,LAT1 check
+  class GATEB blocked
+  class S3,ORC,R1,R2,R3,R4,R5 waiting
+  class LAT2,UVPD later
+  class GATEA,GATEC,GATED gate
   class C1,C2,C3,C4,DELIV goal
   class IMPA,IMPP impact
-  class TXT,SP4,SP5,k7 note
+  class TXT,SP4,SP5,k0,k7 note
 
   %% Avoid link-number critical paths: new parallel edges must not recolor unrelated dependencies.

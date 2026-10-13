@@ -194,6 +194,18 @@ def test_accept_admits_exactly_the_passing_prefix():
     assert free.on.tolist() == [False] * 5 + [True] * 5
 
 
+@pytest.mark.parametrize("rank", ["every", "once"])
+def test_guards_ranked_first_freeze_in_one_round(rank, monkeypatch):
+    # three guards the KL ranks first (their removals lower KL), each refused alone: every prefix holds the first, so the
+    # first round admits nothing and asks the first 4 ACCEPT_BATCH blocks alone, freezing all three at once (asked only
+    # up to the smallest refused prefix, one block, it froze one guard a round); the second round removes
+    monkeypatch.setattr(teacher, "RANK", rank)
+    w = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03, 0.04, 0.05, 0.5, 0.6]
+    toy, log = Toy(w), []
+    toy.prune("unit", 0.4, rounds=2, log=log, accept=lambda ons: [{} if bool(on[:3].all()) else None for on in ons])
+    assert log and all(bool(toy.on[i]) for i in range(3)) and not bool(toy.on[3])
+
+
 @pytest.mark.skipif(not TEXT.exists() or DEVICE == "cpu", reason="needs vpd4l's texts and a GPU")
 def test_no_strand_leaves_no_node_unconnected():
     if not VPD_SAVED.exists():

@@ -113,7 +113,7 @@ import mech
 import native
 
 RECOVERED = 0.9
-ROUNDS = 40
+ROUNDS = 400  # Descent.prune's rounds a level (at 40 v2's set_search ran out at most levels, freezing one block a round)
 RANK = "every"  # Descent.prune's ranking (--rank): "every" round, or "once" per level (kept while prefixes are admitted)
 CONVENTION = "live"   # the component reward's remainder convention (components.CONVENTION)
 N_TARGET = 0.99       # VPD's top-k: the smallest prefix of VPD's order with necessity N >= this, at most K_MAX
@@ -180,7 +180,8 @@ class Descent:
         measured KL_C, when that is lower than the circuit's. The blocks are ranked by kl_rank; the prefixes are
         measured by kl_sets. log, a list, receives each round's {"removed": unit ids, "kl": the KL measured after it}
         and accept's dict. after(), called after each removal: True ends the level (Validated). With accept, the blocks between the largest admitted prefix and the smallest refused one (at
-        most 4 ACCEPT_BATCH) are asked about alone, and those refused alone stay for the level (frozen): a block the KL
+        most 4 ACCEPT_BATCH; when nothing is admitted and the smallest refused prefix is one block, the first 4 ACCEPT_BATCH:
+        v2's set_search froze one block a round there) are asked about alone, and those refused alone stay for the level (frozen): a block the KL
         ranks first can carry what accept measures (text9011: the target's L3 attention output, whose removal lowers
         KL, takes s_track from 0.90 to 0.61 alone), and every prefix holds it. RANK "once": the level's blocks and their
         ranking are those of its first round, later rounds measuring prefixes of the blocks still on in that order (the
@@ -227,7 +228,8 @@ class Descent:
                     hi = min((k for k in refused if k > lo), default=None)
                     new = 0
                     if hi is not None:                       # the culprits: blocks refused alone stay for the level
-                        window = ranked[lo:hi][:4 * ACCEPT_BATCH]
+                        stop = lo + 4 * ACCEPT_BATCH if not ok and hi == lo + 1 else hi   # the first refused: the next too
+                        window = ranked[lo:stop][:4 * ACCEPT_BATCH]
                         ons = self.on[None].repeat(len(window), 1)
                         for i, b in enumerate(window):
                             ons[i, b] = False

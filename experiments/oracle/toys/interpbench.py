@@ -202,6 +202,38 @@ def batches(cfg: dict, bos: int):
     return make
 
 
+def mib_ioi(split: str = "test", n: int | None = None, path: Path = Path.home() / "mpd-data/interpbench/mib_ioi") -> list[dict]:
+    """MIB's IOI split (Hugging Face mib-bench/ioi, <split>.json; the circuit track's data): rows with the prompt as GPT-2
+    token ids after BOS (TransformerLens' to_tokens, default_prepend_bos), the two choices' token ids (the answer first) and
+    the counterfactuals' prompts likewise."""
+    from tokenizers import Tokenizer
+    import json
+
+    tk = Tokenizer.from_pretrained("gpt2")
+    enc = lambda text: [50256] + tk.encode(text).ids  # noqa: E731
+    out = []
+    for r in json.loads((path / f"{split}.json").read_text())[:n]:
+        ch = [tk.encode(" " + c).ids[0] for c in r["choices"]]
+        if r["answerKey"] == 1:
+            ch = ch[::-1]
+        out.append({"ids": enc(r["prompt"]), "answer": ch[0], "other": ch[1],
+                    "counterfactuals": {k: enc(v["prompt"]) for k, v in r.items() if k.endswith("counterfactual")}})
+    return out
+
+
+def text_batches(texts: list[list[int]], pad: int = 50256, T: int | None = None):
+    """batches(B, seed) over given texts (MIB's IOI prompts), each padded at its end to T (default the longest) with pad
+    (positions after a prompt's last token change nothing before it in a causal model)."""
+    T = T or max(len(x) for x in texts)
+    data = torch.tensor([x + [pad] * (T - len(x)) for x in texts])
+
+    def make(B: int, seed: int):
+        g = torch.Generator().manual_seed(seed)
+        while True:
+            yield data[torch.randint(len(data), (B,), generator=g)]
+    return make
+
+
 def pieces(cfg: dict) -> dict:
     """Overcomplete piece counts per matrix: twice the residual width for attention's, 1.5 times the MLP's neurons."""
     out = {}
@@ -210,9 +242,9 @@ def pieces(cfg: dict) -> dict:
     return out
 
 
-def fit_vpd(name: str, sd: dict, cfg: dict, bos: int, steps: int, out: Path, log=print) -> dict:
-    """vpd_toy.fit on TorchTL with batches(cfg, bos) and pieces(cfg). nano's next-token cross-entropy (an evaluation
-    figure for language models) is off: the case's outputs are labels, not its input vocabulary."""
+def fit_vpd(name: str, sd: dict, cfg: dict, bos: int, steps: int, out: Path, log=print, data=None) -> dict:
+    """vpd_toy.fit on TorchTL with batches(cfg, bos) (or data, a batches function: text_batches) and pieces(cfg). nano's
+    next-token cross-entropy (an evaluation figure for language models) is off: a Tracr case's outputs are labels."""
     import vpd_toy
 
     out.mkdir(parents=True, exist_ok=True)
@@ -220,7 +252,7 @@ def fit_vpd(name: str, sd: dict, cfg: dict, bos: int, steps: int, out: Path, log
     ce = nano._ce_next_token
     nano._ce_next_token = lambda *a, **k: float("nan")
     try:
-        return vpd_toy.fit(name, sd, cfg, steps, out, log, model=TorchTL(sd, cfg), batches=batches(cfg, bos), C=pieces(cfg))
+        return vpd_toy.fit(name, sd, cfg, steps, out, log, model=TorchTL(sd, cfg), batches=data or batches(cfg, bos), C=pieces(cfg))
     finally:
         nano._ce_next_token = ce
 

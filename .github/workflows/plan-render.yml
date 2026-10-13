@@ -47,7 +47,7 @@ jobs:
             git reset --hard origin/main
             "$RUNNER_TEMP/plan-render/node_modules/.bin/mmdc" \
               -p "$RUNNER_TEMP/puppeteer.json" -i plan/plan.mmd \
-              -o plan/plan.png -c plan/mermaid.json -b white -s 2
+              -o plan/plan.png -c plan/mermaid.json -b white -s 1
             printf '%s\n' '![Oracle team coordination map](plan/plan.png)' > README.md
             git add plan/plan.png README.md
             if git diff --cached --quiet; then

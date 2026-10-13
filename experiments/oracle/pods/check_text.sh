@@ -4,7 +4,7 @@
 # that fits its search draws shows before anything is launched on it. Each ARM is NAME=FLAGS with commas for spaces
 # (a comma inside a flag value written ::). Rows to ~/mpd-data/runpod/oracle-graph-check-RUN-0/eval.jsonl, a line per arm.
 #   RUN=c9002 REF=COMMIT TEXT=text9002 experiments/oracle/pods/check_text.sh b=--f1-start,influential,--edges,--no-strand,--accept,changed ...
-#   (env: GPU, PRICE, HOURS, RAM: GB of host memory, default 48)
+#   (env: GPU, PRICE, HOURS, RAM: GB of host memory, default 48, VRAM: GB of card memory, default 20)
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -32,7 +32,7 @@ ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V
 cd /Users/user/params/method/oracle; set +e; $TEACH
 python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --only track_pp --out $O/eval.jsonl > $O/eval.log 2>&1; cat $O/eval.jsonl"
 for try in $(seq 1 40); do
-  RP_REF=$REF RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=20 RP_MIN_RAM_GB=${RAM:-48} \
+  RP_REF=$REF RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=${RAM:-48} \
     experiments/infra/runpod/rp-run $RN "${GPU:-NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA RTX A4500,NVIDIA GeForce RTX 4090,NVIDIA RTX A6000,NVIDIA A40}" "${HOURS:-2.0}" -- bash -c "$CMD" > "$F/rp.log" 2>&1 && break
   grep -qE "in stock on a working host|differs from its sha256" "$F/rp.log" || break
   sleep 180

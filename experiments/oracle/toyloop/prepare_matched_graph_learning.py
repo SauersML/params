@@ -20,6 +20,18 @@ def checked(path, expected):
     return Path(path)
 
 
+def retention_bank(root, receipt, file_hashes):
+    """Exporter records both byte SHA and historical default-JSON content SHA."""
+    relative = "cases/" + receipt["id"] + "/bank.json"
+    path = checked(root / relative, file_hashes[relative])
+    inputs = json.loads(path.read_text())
+    if hashlib.sha256(json.dumps(inputs).encode()).hexdigest() != receipt["input_bank_sha256"]:
+        raise RuntimeError("retention bank content differs from historical scoring receipt")
+    if len(inputs) != receipt["input_bank_count"]:
+        raise RuntimeError("retention bank count changed")
+    return inputs
+
+
 def dump(path, value):
     Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
@@ -161,7 +173,7 @@ def main():
         prompt = question["prompt"]
         if hashlib.sha256(prompt.encode()).hexdigest() != receipt["prompt_sha256"]:
             raise RuntimeError("retention prompt changed")
-        inputs = json.loads(checked(root / "bank.json", receipt["input_bank_sha256"]).read_text())
+        inputs = retention_bank(args.retention, receipt, retained["files"])
         disclosed = toy.texts[:2]
         add_panel(toy, root / (ident + ".pt"), prompt, inputs,
                   ["disclosed" if ids in disclosed else "extra_diagnostic" for ids in inputs],

@@ -570,7 +570,7 @@ flowchart BT
 
   %% ===================== instrumental goals =====================
   subgraph INSTR["INSTRUMENTAL · faster and cheaper everywhere"]
-    SP1["<b>Engine speed</b><br/>4090: S1 complete sets 8.9 s per answer<br/>(72 sets, 93–1,054 subcomponents, no OOM);<br/>under n the same cost as C (0281e7a; was 1.5x);<br/>teacher text9002 286 → 125 s (N's controls,<br/>node family, pair rows, backup batched);<br/>scale blockers (audit): [H, T, T] scores kept<br/>per layer (8·L·H·T² B); variables.py full traces<br/>per donor; gradient path unchunked<br/>ACTIVE · monitorbench"]
+    SP1["<b>Engine speed</b><br/>4090: S1 complete sets 8.9 s per answer<br/>(72 sets, 93–1,054 subcomponents, no OOM);<br/>under n the same cost as C (0281e7a; was 1.5x);<br/>teacher text9015 51 → 41 s, same answer<br/>(reward-row cache, floors rows, batched edges);<br/>scale: no [H, T, T] kept; variables/Checker<br/>tables at kept positions; gradient path unchunked;<br/>queued for the next reward revision: flips steps<br/>in float32 from the first omitted position<br/>now: RL run 2 scorer seconds per step<br/>ACTIVE · monitorbench"]
     SP2["<b>Teacher throughput</b><br/>influential start: 3 s and $0.0002 per text<br/>(494 texts, $0.11);<br/>block-search teacher: median 3–15 min,<br/>tails past 2 h, $0.14–0.25 per text<br/>ACTIVE · fleet, pymove"]
     SP3["<b>Scorer throughput</b><br/>10 s per RL sample with line credit<br/>(A40, 66 lines; was 21 s);<br/>left: pattern, N per deletion<br/>ACTIVE · inframove, primerl, monitorbench"]
     SP4["<b>GPU use and cost</b><br/>toy teacher runs leave the GPU idle:<br/>they run on the Mac; toy VPD fits<br/>run 2–3 per card; block search needs<br/>86 GB host memory on text9004<br/>ACTIVE · fleet"]

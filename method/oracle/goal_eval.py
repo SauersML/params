@@ -120,6 +120,11 @@ CHANGED_DRAWS = 32  # C's changed texts per circuit (32, the lead's 10-12: at 16
 INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
 # offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
+SEMANTICS = ("c", "x")  # GoalEval(semantics=): "x" runs every circuit and VPD's answer in C's families (point, nodes,
+# edges, flips, omitted, pattern, the bounds) with the query and key subcomponents outside the circuit at their
+# activations on the text and every RMSNorm, the final one included, at the model's scale on it (the lead's 10-13:
+# s_nodes 0.56 -> 0.93 on the dev starts, the pruned teachers' shortfall 0.068 -> 0.015); the real model's runs keep
+# their own (engine at_x and norms, monitorbench's b6a3df3)
 BLOCK = -1  # a block node's index: (site, position, BLOCK), the site's whole output there (every subcomponent and the
 # remainder), ["block", site, position] in an answer (the lead's 10-12: a token's identity lives in thousands of parts)
 DONORS_NEAR = 32  # donor resampling's changed-input donors per text
@@ -1111,8 +1116,12 @@ class GoalEval:
 
     def __init__(self, nat: native.Native | None = None, *, changes: int = native.CHANGES, ranks=HELD_OUT_RANKS,
                  share_floor: float = SHARE_FLOOR, random_pairs: int = RANDOM_PAIRS, max_edges: int = MAX_EDGES, chunk: int = CHUNK,
-                 cut_chunk: int = CUT_CHUNK):
+                 cut_chunk: int = CUT_CHUNK, semantics: str = "c"):
+        if semantics not in SEMANTICS:
+            raise ValueError(f"semantics is one of {SEMANTICS}")
         self.nat = nat or native.Native()
+        self.semantics = semantics  # C's runs of circuits and VPD's answer: "c" as stated, "x" routing and norms at x (_xkw)
+        self._xk: dict = {}
         self.changes, self.ranks, self.share_floor = changes, tuple(ranks), share_floor
         self.random_pairs, self.max_edges, self.chunk, self.cut_chunk = random_pairs, max_edges, chunk, cut_chunk
         self.hooks: dict = {"E1": None, "E2": None, "E4": None}  # E4: fn(tx, graph, split) -> float or None (fidelity's e4)
@@ -1121,6 +1130,21 @@ class GoalEval:
 
     def text(self, ids: list[int], targets: list[int], seed: int | None = None, task: dict | None = None) -> Text:
         return Text(self, ids, targets, native.task_seed(str(ids[:8])) if seed is None else seed, task)
+
+    def _xkw(self, ids: list[int], targets: list[int]) -> dict:
+        """The engine's keywords for a circuit's or VPD's run in this GoalEval's semantics (SEMANTICS): none for "c";
+        for "x" the query and key sites' activations and every norm's scale on the model's run on ids (Engine.x_values),
+        every norm frozen, kept per text."""
+        if self.semantics == "c":
+            return {}
+        key = (tuple(ids), tuple(targets))
+        if key not in self._xk:
+            import engine
+
+            E = engine.Engine(self.nat, ids, targets, live=True, columns={n: torch.zeros(0, dtype=torch.long, device=self.nat.dev) for n in self.nat.names})
+            xv = E.x_values([n for n in self.nat.names if native._name_layer_kind(n)[1] in ("q_proj", "k_proj")])
+            self._xk[key] = {"at_x": xv["acts"], "norms": xv["norms"], "freeze": "all"}
+        return self._xk[key]
 
     def probe(self, ids: list[int], targets: list[int], seed: int) -> tuple[list, list, np.ndarray]:
         """(the text's changed prompts (Native.changes), F2's [(position, held-out prompts)], the probe's moved per
@@ -1163,10 +1187,21 @@ class GoalEval:
     @torch.no_grad()
     def runs(self, ids: list[int], targets: list[int], sets: list[dict], live: bool) -> torch.Tensor:
         """log q at the targets [len(sets), len(targets), V] of VPD's masked forward pass (vpd_model's Site masks) with
-        each set's subcomponents on, every other off, remainders on (live) or off."""
+        each set's subcomponents on, every other off, remainders on (live) or off; in semantics "x" on the engine with
+        _xkw's routing and norms at x."""
         nat, tg = self.nat, self.nat.target
         T = len(ids)
         out = []
+        kw = self._xkw(ids, targets)
+        if kw:
+            import engine
+
+            E = engine.Engine(nat, ids, targets, live=live, columns=None)
+            for s0 in range(0, len(sets), self.chunk):
+                part = sets[s0:s0 + self.chunk]
+                out.append(E.log_probs({n: torch.stack([m[n] for m in part]).float() for n in nat.names}, **kw))
+                native.free(nat.dev)
+            return torch.cat(out)
         for s0 in range(0, len(sets), self.chunk):
             part = sets[s0:s0 + self.chunk]
             B = len(part)
@@ -2050,7 +2085,8 @@ class GoalEval:
                         u[n] = torch.zeros(len(part), tx.T, E.width(n), device=dev)
                         if idx:
                             u[n][tuple(torch.tensor(idx, device=dev).T)] = 1.0
-                lq = E.graph_log_probs(E.plan([flat[gi] for gi, _ in part], semantics="c"), u, rows=[d for _, d in part])
+                lq = E.graph_log_probs(E.plan([flat[gi] for gi, _ in part], semantics="c"), u, rows=[d for _, d in part],
+                                       **self._xkw(tx.ids, tx.targets))
                 for (gi, _), k in zip(part, carry.kl(tx.ref, lq).tolist()):
                     out[gi].append(k)
                 native.free(dev)
@@ -2555,7 +2591,7 @@ class GoalEval:
         for s0 in range(0, len(some), self.chunk):
             idx = some[s0:s0 + self.chunk]
             E = self._circuit_engine(ids, targets, [graphs[i] for i in idx], live)
-            got = carry.kl(ref, E.graph_log_probs(E.plan([graphs[i] for i in idx], semantics="c"))).tolist()
+            got = carry.kl(ref, E.graph_log_probs(E.plan([graphs[i] for i in idx], semantics="c"), **self._xkw(ids, targets))).tolist()
             for i, k in zip(idx, got):
                 out[i] = k
         native.free(self.nat.dev)
@@ -3045,7 +3081,7 @@ class GoalEval:
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
                  changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
                  far_donors: int = DONORS_FAR, baseline: bool = False, pattern: bool = True,
-                 controls: int = NEC_CONTROLS) -> list[dict]:
+                 controls: int = NEC_CONTROLS, weight: bool = False) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -3077,6 +3113,8 @@ class GoalEval:
         slower). interchange, changed: draws per circuit for those two families (0: left out of c). Evaluation only,
         never in the reward or a teacher's objective:
         fresh, a pool none of the searches drew from: the pattern lever's flips over it (f1_flips_patterns_fresh);
+        weight: the weight-edit family (weight_family.family: s_weight, s_weight_raw, kl_weight_c, draws_weight; in
+        this GoalEval's semantics, out of phi until it passes falsification, the lead's 10-13);
         real: N_real (real_removal,
         n_real) and its adversary (necessity_flips, n_real_flips). leak: graph F1 of the circuit's nodes stating no
         edge (live remainders carrying their outputs to the prediction). mode="reward": the training family alone, what
@@ -3197,6 +3235,11 @@ class GoalEval:
             for fam in ("nodes", "edges", "interchange"):
                 row.pop(f"_pairs_{fam}", None)
             out.append(row)
+        if weight:  # weight: rustmove's weight-edit family (weight_family, e5228b0), a reported column, not in phi
+            import weight_family
+
+            for row, wr in zip(out, weight_family.family(self, tx, graphs)):
+                row.update(wr)
         return out
 
     @torch.no_grad()
@@ -3473,14 +3516,15 @@ class GoalEval:
             nodes = g.node_set()
             ones = {n: torch.ones(tx.T, len(circ[n]), device=dev) for n in nat.names}
             lm = Em.log_probs(without(ones, cs, at))
-            lv = Ev.log_probs(without(vpd, cs, vat))
+            kw = self._xkw(tx.ids, tx.targets)  # (semantics "x": a removed candidate stays at 0, never at x)
+            lv = Ev.log_probs(without(vpd, cs, vat), **(dict(kw, held={n: (vpd[n] == 0)[None] for n in nat.names}) if kw else {}))
             if g.complete:  # the circuit's own run (no candidate is its): one row
                 gm = {n: torch.zeros(tx.T, len(circ[n]), device=dev) for n in nat.names}
                 for n, t, c in nodes:
                     gm[n][t, at[n][c]] = 1.0
-                lc = Ec.log_probs({n: x[None] for n, x in gm.items()})
+                lc = Ec.log_probs({n: x[None] for n, x in gm.items()}, **kw)
             else:
-                lc = Ec.graph_log_probs(Ec.plan([g], semantics="c"))
+                lc = Ec.graph_log_probs(Ec.plan([g], semantics="c"), **kw)
             lc = lc.expand(len(cs), *lc.shape[1:])
             w = carry.kl(lm, tx.ref.expand_as(lm)).tolist()
             kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
@@ -3532,7 +3576,8 @@ class GoalEval:
                 for j, d in enumerate(self._node_draws(tx, sorted(units[gi]) if units is not None else gnodes[gi], draws, held=gnodes[gi])):
                     rows.append((gi, j, np.array([nid[x] for x in d], dtype=np.int64)))
         first = min((every[i][1] for _, _, d in rows for i in d), default=T)
-        start = 0 if reads else min(first, min(tx.targets))  # before it every run is its base's (reads: every position)
+        kw = self._xkw(tx.ids, tx.targets)  # semantics "x": every position (no start), the removed nodes at 0, never at x
+        start = 0 if reads or kw else min(first, min(tx.targets))  # before it every run is its base's (reads: every position)
         width = max(nat.C.values()) * (T - start) + sum(len(c) for c in vcols.values()) * T
         step = max(1, self.NODE_ENTRIES // max(1, width))
         own, plans = {}, {}  # per complete circuit its masks [1, T, K]; per stated one its plan and entries' node indices
@@ -3594,7 +3639,7 @@ class GoalEval:
                 rmod = split(got, part)
             else:
                 lm = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
-            lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
+            lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv, **(dict(kw, held={n: vbase[n] == 0 for n in nat.names}) if kw else {}))
             lc = torch.empty_like(lm)
             rcir = [None] * R
             for gi in dict.fromkeys(gi for gi, _, _ in part):  # each circuit's rows
@@ -3606,18 +3651,19 @@ class GoalEval:
                     for n in site:
                         r_, j_ = Dm[ixt][:, sidx[n]].nonzero(as_tuple=True)
                         mc[n][r_, spos[n][j_], scol[n][j_]] = 0.0
+                    kh = dict(kw, held={n: own[gi][n] == 0 for n in nat.names}) if kw else {}
                     if reads:
-                        got, rc_ = Ec.log_probs(mc, reads=spec(sub))
+                        got, rc_ = Ec.log_probs(mc, reads=spec(sub), **kh)
                     else:
-                        got = Ec.log_probs(mc, start=start, base=own[gi]) if start else Ec.log_probs(mc)
+                        got = Ec.log_probs(mc, start=start, base=own[gi]) if start else Ec.log_probs(mc, **kh)
                 else:
                     plan, ent = plans[gi]
                     off = {n: Dm[ixt][:, e] for n, e in ent.items()}
                     zero = {n: torch.zeros(len(ix), 1, Ec.width(n), device=dev) for n in nat.names}  # (B rows: u's)
                     if reads:
-                        got, rc_ = Ec.graph_log_probs(plan, zero, off=off, reads=spec(sub))
+                        got, rc_ = Ec.graph_log_probs(plan, zero, off=off, reads=spec(sub), **kw)
                     else:
-                        got = Ec.graph_log_probs(plan, zero, off=off)
+                        got = Ec.graph_log_probs(plan, zero, off=off, **kw)
                 lc[ixt] = got
                 if reads:
                     for r, x in zip(ix, split(rc_, sub)):
@@ -3783,7 +3829,8 @@ class GoalEval:
             nodes = sorted(g.node_set()) if reads else None
             lm = Em.graph_log_probs(Em.plan([model] * D, semantics="c", cuts=cuts), u_m, patch=patches(Em, patch),
                                     reads=spec(Em, nodes, D) if reads else None)
-            lv = Ev.graph_log_probs(Ev.plan([vpd] * D, semantics="c", cuts=cuts), u_v, patch=patches(Ev, patch))
+            kw = self._xkw(tx.ids, tx.targets)
+            lv = Ev.graph_log_probs(Ev.plan([vpd] * D, semantics="c", cuts=cuts), u_v, patch=patches(Ev, patch), **kw)
             u_c = None
             if g.complete:
                 u_c = {n: torch.zeros(1, T, Ec.width(n), device=dev) for n in nat.names}
@@ -3791,7 +3838,7 @@ class GoalEval:
                     if c != BLOCK:  # (a block is the plan's unit: its whole output)
                         u_c[n][0, t, at[id(Ec)][n][c]] = 1.0
             lc = Ec.graph_log_probs(Ec.plan([g] * D, semantics="c", cuts=cuts), u_c, patch=patches(Ec, patch),
-                                    reads=spec(Ec, nodes, D) if reads else None)
+                                    reads=spec(Ec, nodes, D) if reads else None, **kw)
             if not reads:
                 return lm, lv, lc
             return lm[0], lv, lc[0], split(lm[1], nodes, D), split(lc[1], nodes, D)
@@ -4278,6 +4325,7 @@ class GoalEval:
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
+        xk = self._xkw(tx.ids, tx.targets)
         pick = torch.randperm(len(pool["sources"]), generator=gen)[:k].tolist()
         pats = [pattern(pool, i) for i in pick] if patterns else []  # (patterns off: drawn, never switched on)
         cache = tx.__dict__.setdefault("_adv", {})  # per text: VPD's columns, and the last columns' engine and layouts
@@ -4376,19 +4424,21 @@ class GoalEval:
                 if vpd:
                     mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :] if patterns else vpd_on[n].float().expand(len(circ), -1, -1)
             kc = []
+            if xk:  # semantics "x": float32 runs with routing and norms at x
+                precision = "score"
             if ns and one is not None:  # one stated graph, each row at its circuit's strengths
                 s = strengths[circ[:ns]]
-                kc.append(E.graph_kl(one, u={n: uc[n][:ns] for n in nat.names}, ew=s[:, :one["E"]], ow=s[:, one["E"]:],
-                                     precision=precision))
+                kc.append(carry.kl(E.ref, E.graph_log_probs(one, {n: uc[n][:ns] for n in nat.names}, s[:, :one["E"]], s[:, one["E"]:],
+                                                             precision, **xk)))
             elif ns:  # C's semantics (graph inside, masked outside): the stated circuits as one list of graphs
                 sk = key[:sum(1 for i, _ in key if not graphs[i].complete)]
                 if sk not in plans:
                     plans[sk] = E.plan([graphs[i] for i, r in sk for _ in range(r)], semantics="c")
-                kc.append(E.graph_kl(plans[sk], u={n: uc[n][:ns] for n in nat.names}, precision=precision))
+                kc.append(carry.kl(E.ref, E.graph_log_probs(plans[sk], {n: uc[n][:ns] for n in nat.names}, precision=precision, **xk)))
             if ns < len(circ):
-                kc.append(E.kl({n: onf[n][at_slot[circ[ns:]]] + uc[n][ns:] for n in nat.names}, precision))
+                kc.append(carry.kl(E.ref, E.log_probs({n: onf[n][at_slot[circ[ns:]]] + uc[n][ns:] for n in nat.names}, precision, **xk)))
             kc = torch.cat(kc).split([r for _, r in key])
-            kv = E.kl(mv, precision).split([r for _, r in key]) if vpd else [None] * len(its)
+            kv = carry.kl(E.ref, E.log_probs(mv, precision, **xk)).split([r for _, r in key]) if vpd else [None] * len(its)
             at = {j: k for k, j in enumerate(order)}
             return [(kc[at[j]], kv[at[j]]) for j in range(len(items))]
 

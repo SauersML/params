@@ -1903,6 +1903,64 @@ def test_graph_ref_outside_held(tiny):
     assert not torch.allclose(ge.graph_ref(tx.ids, tx.targets, g, outside=qk), ge.graph_ref(tx.ids, tx.targets, g))
 
 
+def test_semantics_x_runs_routing_and_norms_at_x(tiny):
+    """GoalEval(semantics="x"): a circuit's and VPD's runs hold the query and key subcomponents outside the circuit at
+    their activations on x and every norm at x's scale (graph_ref's outside=, norms=, freeze="all"), the real model's
+    runs their own: point (stated, complete, the bounds), a draw of the node family against graph_ref (the removed nodes
+    at 0), and the reward-mode families all scored."""
+    nat, ge, tx = tiny
+    gx = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics="x")
+    gx.donor_pools.update(ge.donor_pools)
+    tx2 = gx.text(tx.ids, tx.targets, seed=5)
+    rec, nx = {}, {}
+    nat.run(tx.ids, [tx.T - 1], nat._full_plan(tx.T, 1), *nat._one(), record=rec)
+    qk = {n: rec[n] for n in nat.names if native._name_layer_kind(n)[1] in ("q_proj", "k_proj")}
+    ones = {n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+    ge.graph_ref(tx.ids, tx.targets, native.Graph(masks=ones), norms=nx)
+
+    def ref(g, **kw):
+        return float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, goal_eval._c_graph(g, tx.targets, nat.C), outside=qk,
+                                                   norms=dict(nx), freeze="all", **kw))[0])
+
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    stated = native.Graph(every[:6], *native.all_edges(every[:6], tx.targets))
+    whole = native.Graph(every[::2], complete=True)
+    got = [r["kl_live"] for r in gx.sufficiency(tx2, [stated, whole], conventions=("live",))]
+    want = [ref(stated), ref(whole)]
+    assert all(abs(a - b) < 1e-4 * max(1.0, b) for a, b in zip(got, want)), (got, want)
+    e0, v0 = gx._bounds(tx2, "live")
+    assert abs(e0 - ref(native.Graph())) < 1e-4 * max(1.0, e0) and abs(v0 - ref(native.Graph(masks=tx.vpd))) < 1e-4 * max(1.0, v0)
+    assert abs(e0 - ge._bounds(tx, "live")[0]) > 1e-3  # (not C's)
+    row = gx._node_family(tx2, [whole], 4)[0]
+    d = gx._node_draws(tx2, sorted(whole.node_set()), 4, held=sorted(whole.node_set()))[0]
+    model_less = native.Graph(masks={n: m.clone() for n, m in ones.items()})
+    for n, t, c in d:
+        model_less.masks[n][t, c] = False
+    lm = ge.graph_ref(tx.ids, tx.targets, model_less)
+    zero = {n: x.clone() for n, x in qk.items()}
+    for n, t, c in d:
+        if n in zero:
+            zero[n][..., t, c] = 0.0
+    gl = native.Graph(sorted(set(whole.node_set()) - set(d)), complete=True)
+    kc = float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, gl, outside=zero, norms=dict(nx), freeze="all"))[0])
+    assert abs(row["draws_nodes"][0][1] - kc) < 1e-4 * max(1.0, kc), (row["draws_nodes"][0], kc)
+    full = gx.fidelity(tx2, [stated, whole], None, draws=2, near_donors=0, far_donors=0, mode="reward", interchange=2, changed=2)
+    for r in full:
+        assert all(r.get(k) is None or -1e-9 <= r[k] <= 1 + 1e-9 for k in ("s_point_c", "s_nodes", "s_edges", "s_omitted"))
+    with pytest.raises(ValueError):
+        goal_eval.GoalEval(nat, semantics="y")
+
+
+def test_fidelity_weight_column(tiny):
+    """fidelity(weight=True) adds rustmove's weight-edit family as columns (s_weight, its draws), outside phi."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    rows = ge.fidelity(tx, [native.Graph(every[::2], complete=True), native.Graph()], None, draws=2, near_donors=0, far_donors=0,
+                       weight=True)
+    assert all("s_weight" in r and "draws_weight" in r for r in rows)
+    assert "weight" not in goal_eval.PHI_FAMILIES
+
+
 def test_omitted_family(tiny):
     """The omitted family: candidates are VPD's first actives at the circuit's positions and the targets that it leaves
     out (the background aside); each predicted by the circuit's own run, W the real model's response to the removal,

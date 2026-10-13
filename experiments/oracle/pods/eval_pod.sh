@@ -11,6 +11,9 @@
 #      VARIABLES=1: E4, each answer's VARIABLES block; MATCHED_ALL=1: VPD at every sample's size (verify-and-pick);
 #      EDIT_EVAL: the edit teacher's rows for the rows' edit requests (E3); TEACHER: teacher circuits (v3's dominance term);
 #      LINES=1: each sample's per-line credits (RL's per-line reward); NODE_CAP=k: the answers' node cap (0: none);
+#      CALIBRATION_EVIDENCE=1: retain existing scored draws/uncertainty evidence without extra probes;
+#      INVARIANTS=1: execute decoded formal claims on their carrier groups as separate diagnostics;
+#      both flags apply only to evaluate, not NOISE or TIMING;
 #      NOISE=k: C's draw noise over k seeds per set's first answers (components.py noise) instead of the evaluation;
 #      TIMING=g: seconds to score groups of g answers as the RL scorer does (components.py timing, TIMING_N texts);
 #      LEDGER_OK=1 once the lead approved a launch past $290)
@@ -47,6 +50,8 @@ if [ -n "${EDIT_EVAL:-}" ]; then cp "$EDIT_EVAL" "$IN/edit_eval.jsonl" && EDITS=
 # (final_eval.sh) sets EXCLUDE_TEXTS to a pattern that matches no text.
 COPYFILE_DISABLE=1 tar --exclude="${EXCLUDE_TEXTS:-texts/vpd4l/text91[0-4][0-9].json}" -cf "$IN.tar" -C "$IN" rows.jsonl labels.jsonl sets $EDITS $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_train.pt && rm -rf "$IN"
 WHAT="evaluate heldout $I/rows.jsonl --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} ${MATCHED_ALL:+--matched-all} ${TEACHER:+--teacher $I/teacher} ${EDIT_EVAL:+--edit-teach $I/edit_eval.jsonl} ${LINES:+--lines} ${NODE_CAP:+--node-cap $NODE_CAP}"
+if [ "${CALIBRATION_EVIDENCE:-0}" = 1 ]; then WHAT="$WHAT --calibration-evidence"; fi
+if [ "${INVARIANTS:-0}" = 1 ]; then WHAT="$WHAT --invariants"; fi
 if [ -n "${NOISE:-}" ]; then WHAT="noise heldout $I/rows.jsonl --seeds $NOISE"; fi
 if [ -n "${TIMING:-}" ]; then WHAT="timing heldout $I/rows.jsonl --group $TIMING --n ${TIMING_N:-4} ${TEACHER:+--teacher $I/teacher}"; fi  # C's draw noise (c_noise) instead of the evaluation
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \

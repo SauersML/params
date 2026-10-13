@@ -8,6 +8,27 @@ import matched_graph_supervision as trial
 
 
 class PairedDataTest(unittest.TestCase):
+    def test_cost_covers_both_training_arms_and_all_first_responses(self):
+        contract = {"train_tokens_per_arm": {"point": 100, "intervention": 200},
+                    "panel": [{"prompt_tokens": 10}] * 32, "output_cap": 416}
+        result = trial.cost_bound(contract, {"trained": 2., "prefill": 3., "sampled": 5.})
+        self.assertEqual(result["tokens"], {"trained": 300, "prefill": 960, "sampled": 39936})
+        self.assertEqual(result["sampling_calls"], 96)
+        self.assertAlmostEqual(result["upper_usd"], .20316)
+        for bad in (float("nan"), float("inf"), -1., True):
+            with self.assertRaises(ValueError):
+                trial.cost_bound(contract, {"trained": bad, "prefill": 3., "sampled": 5.})
+
+    def test_one_fixed_schedule_and_seed_for_both_arms(self):
+        ids, _ = trial.expected_ids()
+        batches = trial.pilot.schedule(len(ids), trial.EPOCHS, trial.BATCH, trial.SEED)
+        recipe = trial.training_recipe(batches, ids)
+        self.assertEqual(recipe["initialization"]["seed"], 0)
+        self.assertEqual(len(recipe["optimizer"]), 24)
+        self.assertEqual(recipe["evaluation_arms"], ["base", "point", "intervention"])
+        for offset in range(0, len(batches), 3):
+            self.assertEqual(sorted(i for batch in recipe["sample_ids"][offset:offset+3] for i in batch), sorted(ids))
+
     def rows(self):
         train, evaluation = trial.expected_ids()
         graph = "flowchart LR\n  L0H0 --> out\n"

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 
 import capable_wiring as pilot
@@ -18,6 +19,53 @@ ARMS = ("point", "intervention")
 EPOCHS, BATCH, SEED, OUTPUT_CAP, CONTEXT = 8, 8, 0, 416, 32768
 NODE = r"(?:L\d+[HN]\d+|out)"
 GRAPH_LINE = re.compile(rf"{NODE}(?:\s+-->\s+{NODE})?")
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                    allow_nan=False).encode()).hexdigest()
+
+
+def training_recipe(batches, train_ids):
+    """Freeze both arms' initialization and updates before observing outcomes.
+
+    A provider seed requests matched initialization; it does not certify identical
+    weights. A runner must preserve provider model/config receipts for both arms.
+    """
+    return {"initialization": {"base_model": pilot.MODEL, "rank": 32, "seed": SEED,
+                               "train_mlp": True, "train_attn": True, "train_unembed": True},
+            "loss_fn": "cross_entropy", "sample_ids": [[train_ids[i] for i in b] for b in batches],
+            "optimizer": [{"learning_rate": pilot.LR * (1 - step / len(batches)),
+                           "beta1": .9, "beta2": .95, "eps": 1e-8}
+                          for step in range(len(batches))],
+            "sampling": {"temperature": 0., "max_tokens": OUTPUT_CAP, "num_samples": 1},
+            "evaluation_arms": ["base", *ARMS]}
+
+
+def cost_bound(contract, prices):
+    """Full-output, uncached upper bound using externally verified quoted rates.
+
+    Never uses old hardcoded prices, creates a client, or authorizes a purchase.
+    An optional stronger baseline needs its own model-specific token preflight.
+    """
+    required = {"trained", "prefill", "sampled"}
+    if set(prices) != required or any(type(v) not in (int, float) or not math.isfinite(v)
+                                     or v < 0 for v in prices.values()):
+        raise ValueError("three finite nonnegative quoted per-million rates required")
+    counts = {"trained": sum(contract["train_tokens_per_arm"].values()),
+              "prefill": 3 * sum(r["prompt_tokens"] for r in contract["panel"]),
+              "sampled": 3 * len(contract["panel"]) * contract["output_cap"]}
+    if any(type(v) is not int or v < 0 for v in counts.values()):
+        raise ValueError("invalid token counts")
+    return {"tokens": counts, "prices_per_million": dict(prices),
+            "upper_usd": sum(counts[k] * prices[k] for k in required) / 1e6,
+            "sampling_calls": 3 * len(contract["panel"]), "cached_tokens_assumed": 0}
+
+
+def datum_digest(datum):
+    return digest({"input": datum.model_input.to_ints(),
+                   "loss": {key: value.to_torch().tolist()
+                            for key, value in datum.loss_fn_inputs.items()}})
 
 
 def expected_ids():
@@ -113,11 +161,12 @@ def prepare(train, panel, tokenizer_path):
     batches = pilot.schedule(len(train), EPOCHS, BATCH, SEED)
     train_tokens = {arm: sum(data[arm][i].model_input.length for batch in batches for i in batch)
                     for arm in ARMS}
-    digest = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     contract = {"model": pilot.MODEL, "project": pilot.PROJECT, "train_sha256": digest(train),
                 "panel_sha256": digest(panel), "epochs": EPOCHS, "batch": BATCH, "seed": SEED,
                 "updates_per_arm": len(batches), "output_cap": OUTPUT_CAP,
                 "train_tokens_per_arm": train_tokens, "training": stats,
+                "recipe": training_recipe(batches, [r["id"] for r in train]),
+                "rendered_training_sha256": {arm: [datum_digest(d) for d in data[arm]] for arm in ARMS},
                 "panel": [{"id": r["id"], "stratum": r["stratum"], "prompt_tokens": p.length,
                            "rendered_sha256": digest(p.to_ints())} for r, p in zip(panel, prompts)],
                 "scope": "paired token-fit preflight only; physical proof and paid reservation remain separate"}

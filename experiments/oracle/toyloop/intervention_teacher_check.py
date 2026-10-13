@@ -88,6 +88,10 @@ def main():
         attempts.append(row)
         write_json(args.out / "attempts.json", attempts)
     result = teacher.search_teacher(toy, nat=nat, texts=texts, attempt_sink=attempt, evidence_sink=retain)
+    restored = teacher.binding(toy, nat, texts, [])
+    if before != restored:
+        raise RuntimeError("search did not restore source state")
+    write_json(args.out / "restored_source_binding.json", restored)
     cache = result.pop("cache")
     worlds = len(cache["references"])
     if worlds != 84 or teacher.MAX_ATTEMPTS != 64:

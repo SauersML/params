@@ -1582,6 +1582,22 @@ for f in "${files[@]}"; do
         Mach-O*) echo "rp-run: $MAC_DATA/$f is a Mac binary, which cannot run on a Linux pod; name the example as method/target/release/examples/${f##*/} (built on GitHub Actions)" >&2; exit 2 ;;
     esac
 done
+# The source's Python compiled with the image's interpreter (IMAGE's pyX.Y, through uv) before any pod
+# exists: syntax newer than it (3.12's nested same-quote f-strings in backup.py) ran on the Mac and
+# failed at import on every pod. Skipped when uv has no such interpreter.
+PYV=$(sed -nE 's/.*-py([0-9]+\.[0-9]+)-.*/\1/p' <<< "$IMAGE")
+PYPOD=$( [ -n "$PYV" ] && uv python find "$PYV" 2> /dev/null || true)
+if [ -n "$PYPOD" ] && [ -n "$C" ] && [ ${#srcpaths[@]} -gt 0 ]; then
+    pyc=$(mktemp -d)
+    git -C "$MAC_REPO" archive "$C" "${srcpaths[@]}" | tar -x -C "$pyc"
+    if ! out=$("$PYPOD" -m compileall -q "$pyc" 2>&1); then
+        echo "rp-run: the source at ${C:0:12} does not compile under Python $PYV (the pod's interpreter):" >&2
+        sed "s|$pyc/||g" <<< "$out" >&2
+        rm -rf "$pyc"
+        exit 2
+    fi
+    rm -rf "$pyc"
+fi
 # Published inputs ("SHA256 REL") are downloaded by the pod; the rest go up from the Mac, at most
 # UPLOAD_MAX_MB of them.
 fetched=() unpublished_kb=0 FETCH_BYTES=0

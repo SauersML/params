@@ -1,0 +1,34 @@
+name: pod python
+
+# The repository's Python compiled with the pods' interpreter, 3.11 (rp-run's IMAGE, runpod/pytorch's
+# py3.11): syntax newer than it (3.12's nested same-quote f-strings in backup.py) passed on the Mac and
+# failed at import on every pod. rp-run refuses such a source before renting a pod; this flags it on push.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.py"
+      - ".github/workflows/pod-python.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pod-python
+  cancel-in-progress: true
+
+jobs:
+  compile:
+    name: compiles under Python 3.11
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m compileall -q method experiments theory

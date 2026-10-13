@@ -8,8 +8,10 @@
 # the routed lens come as inputs. Outputs: ~/mpd-data/runpod/oracle-graph-toolenv-RUN/.
 #   bash experiments/oracle/pods/tools_env_pod.sh RUN ROWS.jsonl TASKS   (TASKS e.g. text9000:text9019)
 #     env: HOURS (cap, default 1.5), GPU, PRICE, VRAM, SPLIT (the score split, default eval), BENCH (texts, default
-#     text9000,text9001), WORKERS (processes sharing the GPU, default 2), STEPS (default "tests bench scripted tokens
-#     baselines"), EPISODES (an earlier run's scripted.jsonl, taken in place of running the episodes)
+#     text9000,text9001), WORKERS (processes sharing the GPU, default 2), BWORKERS (baselines' processes, default 1: two
+#     OOMed a 48 GB card in r5), RANK (the scripted policy's order: effects, the default, or removal), STEPS (default
+#     "tests bench scripted tokens baselines"), EPISODES (an earlier run's scripted.jsonl, taken in place of running the
+#     episodes)
 {
 cd /Users/user/params
 spent=$(awk -F'\t' '{s += $6} END {printf "%.2f", s}' /Users/user/mpd-data/runpod/LEDGER.tsv)
@@ -23,6 +25,7 @@ F=/Users/user/mpd-data/scratch/toolenv/in_$RUN
 V=/Users/user/mpd-data/vpd A=/Users/user/mpd-data/atlas/vpd4l PA='~/mpd-data/atlas/vpd4l'  # PA: the atlas directory on the pod (naming the Mac's would upload all of it)
 I='~/mpd-data/in'
 W=${WORKERS:-2}
+BW=${BWORKERS:-1}
 SPL=${SPLIT:-eval}
 STEPS=${STEPS:-tests bench scripted tokens baselines}
 rm -rf "$F" && mkdir -p "$F" && cp "$ROWS" "$F/rows.jsonl" || exit 1
@@ -54,14 +57,14 @@ for st in $STEPS; do
     scripted)
       R="rm -f $O/scripted.jsonl $O/scripted.failure.txt; worker_pids=();"
       for k in $(seq 0 $((W - 1))); do
-        R="$R (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks ${SLICE[$k]} --out $O/scripted_$k.jsonl --score-split $SPL > $O/scripted_$k.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/scripted_$k.log; exit \$rc) & worker_pids+=(\$!);"
+        R="$R (python -u method/oracle/tools_env.py scripted $I/rows.jsonl --tasks ${SLICE[$k]} --out $O/scripted_$k.jsonl --score-split $SPL --rank ${RANK:-effects} > $O/scripted_$k.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/scripted_$k.log; exit \$rc) & worker_pids+=(\$!);"
       done
       STEPCMD="$STEPCMD $R failed=0; for pid in \"\${worker_pids[@]}\"; do wait \"\$pid\"; rc=\$?; if [ \$rc -ne 0 ]; then failed=\$rc; fi; done; if [ \$failed -ne 0 ]; then echo \"scripted worker failure: exit \$failed; partial shard files retained, merged output not produced\" > $O/scripted.failure.txt; exit \$failed; fi; cat $O/scripted_*.jsonl > $O/scripted.jsonl || exit \$?;" ;;
     tokens) STEPCMD="$STEPCMD python -u method/oracle/tools_env.py tokens $I/rows.jsonl --tasks $TASKS --episodes $O/scripted.jsonl --pool > $O/tokens.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/tokens.log; if [ \$rc -ne 0 ]; then exit \$rc; fi;" ;;
     baselines)
       R="rm -f $O/baselines.jsonl $O/baselines.failure.txt; worker_pids=();"
-      for k in $(seq 0 $((W - 1))); do
-        R="$R (awk 'NR % $W == $k' $O/scripted.jsonl > $O/episodes_$k.jsonl || exit \$?; python -u method/oracle/tools_env.py baselines $I/rows.jsonl --episodes $O/episodes_$k.jsonl --out $O/baselines_$k.jsonl --score-split $SPL > $O/baselines_$k.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/baselines_$k.log; exit \$rc) & worker_pids+=(\$!);"
+      for k in $(seq 0 $((BW - 1))); do
+        R="$R (awk 'NR % $BW == $k' $O/scripted.jsonl > $O/episodes_$k.jsonl || exit \$?; python -u method/oracle/tools_env.py baselines $I/rows.jsonl --episodes $O/episodes_$k.jsonl --out $O/baselines_$k.jsonl --score-split $SPL > $O/baselines_$k.log 2>&1; rc=\$?; echo \"exit \$rc\" >> $O/baselines_$k.log; exit \$rc) & worker_pids+=(\$!);"
       done
       STEPCMD="$STEPCMD $R failed=0; for pid in \"\${worker_pids[@]}\"; do wait \"\$pid\"; rc=\$?; if [ \$rc -ne 0 ]; then failed=\$rc; fi; done; if [ \$failed -ne 0 ]; then echo \"baselines worker failure: exit \$failed; partial shard files retained, merged output not produced\" > $O/baselines.failure.txt; exit \$failed; fi; cat $O/baselines_*.jsonl > $O/baselines.jsonl || exit \$?;" ;;
     *) echo "tools_env_pod.sh: unknown step $st" >&2; exit 2 ;;

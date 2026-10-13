@@ -985,8 +985,8 @@ def _tasks(spec: list[str]) -> list[str]:
     return out
 
 
-def bench(env: Env, tids: list[str], log=print) -> dict:
-    """Each tool's latency on its first (uncached) call per text, with Text's setup and a scoring call."""
+def bench(env: Env, tids: list[str], log=print, score: bool = True) -> dict:
+    """Each tool's latency on its first (uncached) call per text, with Text's setup and (score) a scoring call."""
     out = {}
     for tid in tids:
         t0 = time.perf_counter()
@@ -1017,34 +1017,38 @@ def bench(env: Env, tids: list[str], log=print) -> dict:
         big = Scripted._circuit([components.node_of(x) for x in nodes] + [components.node_of(x[0]) for x in
                                  json.loads(ep.call("list_active", {"position": p1, "top": 400}))["subcomponents"]])
         ep.call("run_circuit", {"circuit": small})
-        ep.call("run_circuit", {"circuit": big})
+        d_big = json.loads(ep.call("run_circuit", {"circuit": big})).get("draft")
         ep.call("run_circuit", {"circuit": small, "changes": [[p1, 13]]})
         ep.call("compare", {"circuit_a": small, "circuit_b": big})
-        t1 = time.perf_counter()
-        tx = tools.tx
-        tau = env.ge.tau(tx, env.pool, env.score_split)
-        tau_s = time.perf_counter() - t1
-        t1 = time.perf_counter()
-        r = env.score(tid, "CIRCUIT:\n```mermaid\n" + big + "\n```\nEXPLANATION: x")
-        score_s = time.perf_counter() - t1
-        out[tid] = {"T": tools.T, "setup_s": round(setup, 2), "tools_s": {k: [round(x, 2) for x in v] for k, v in tools.seconds.items()},
-                    "tau_s": round(tau_s, 2), "score_s": round(score_s, 2), "phi_start": tau.get("phi_start"), "phi": r.get("phi")}
+        d_pos = json.loads(ep.call("run_circuit", {"positions": [t, p1]})).get("draft")
+        for d in (d_big, d_pos):
+            if d:
+                ep.call("node_effects", {"draft": d})
+                ep.call("run_circuit", {"base": d, "drop_least": 16})
+        out[tid] = {"T": tools.T, "setup_s": round(setup, 2), "tools_s": {k: [round(x, 2) for x in v] for k, v in tools.seconds.items()}}
+        if score:
+            t1 = time.perf_counter()
+            tau = env.ge.tau(tools.tx, env.pool, env.score_split)
+            tau_s = time.perf_counter() - t1
+            t1 = time.perf_counter()
+            r = env.score(tid, "CIRCUIT:\n```mermaid\n" + big + "\n```\nEXPLANATION: x")
+            out[tid] |= {"tau_s": round(tau_s, 2), "score_s": round(time.perf_counter() - t1, 2), "phi_start": tau.get("phi_start"), "phi": r.get("phi")}
         log(json.dumps({tid: out[tid]}), flush=True)
     return out
 
 
-def scripted(env: Env, tids: list[str], out: Path, log=print) -> list[dict]:
+def scripted(env: Env, tids: list[str], out: Path, log=print, rank: str = "effects") -> list[dict]:
     """The scripted baseline's episodes on texts, each beside the influential start on the score split (its phi from
     tau, its s_track_pp and bits), one JSON line each."""
     res = []
     for tid in tids:
-        pol = Scripted()
+        pol = Scripted(rank=rank)
         r = run_episode(env, tid, pol)
         tools = env.text_tools(tid)
         tx = tools.tx
         tau = env.ge.tau(tx, env.pool, env.score_split)
         st = env.ge.start_set(tx, env.score_split)
-        row = {**r, "trace": pol.trace,
+        row = {**r, "rank": rank, "trace": pol.trace,
                "start": {"phi": tau["phi_start"], "phi_tau": tau["phi_tau"], "bits": tau["bits_start"], "s_track_pp": st["s_track_pp"],
                          "nodes": tau["nodes_start"], "m": tau["m_start"]},
                "answer": r.get("answer_expanded") or r["messages"][-1]["content"]}
@@ -1230,11 +1234,14 @@ def main():
     b.add_argument("rows")
     b.add_argument("--tasks", nargs="+", default=["text9000"])
     b.add_argument("--score-split", default="eval")
+    b.add_argument("--no-score", action="store_true", help="the tools only (no reward call: C is large on the Mac)")
+    b.add_argument("--device")
     s = sub.add_parser("scripted")
     s.add_argument("rows")
     s.add_argument("--tasks", nargs="+", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--score-split", default="eval")
+    s.add_argument("--rank", default="effects", choices=["effects", "removal"], help="the scripted policy's node order")
     t = sub.add_parser("tokens")
     t.add_argument("rows")
     t.add_argument("--tasks", nargs="+", required=True)
@@ -1258,9 +1265,9 @@ def main():
         return
     env = Env(rows, goal_eval.GoalEval(native.Native(getattr(a, "device", None))), score_split=a.score_split)
     if a.cmd == "bench":
-        bench(env, _tasks(a.tasks))
+        bench(env, _tasks(a.tasks), score=not a.no_score)
     elif a.cmd == "scripted":
-        scripted(env, _tasks(a.tasks), Path(a.out))
+        scripted(env, _tasks(a.tasks), Path(a.out), rank=a.rank)
     elif a.cmd == "baselines":
         baselines(env, Path(a.episodes), Path(a.out))
     else:

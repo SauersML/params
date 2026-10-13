@@ -1360,7 +1360,10 @@ def question(task: dict, ev: dict) -> str:
     cap = ev.get("node_cap")  # opt-in: legacy teacher questions may exceed the evaluation default
     constraint = (f" Use at most {cap} circuit nodes across all positions; larger circuits are invalid."
                   if cap else "")
-    lines = [ASK.format(model=model) + constraint + (" " + ASK_VARIABLES if ev.get("variables") or ev.get("invariants") else "")
+    ask = ASK.format(model=model)
+    if ev.get("circuit_only"):  # an arm whose reward scores the circuit alone asks for nothing else (the audit, 10-13)
+        ask = ask[:ask.index(" Answer with CIRCUIT:")] + " Answer with CIRCUIT: and its lines only."
+    lines = [ask + constraint + (" " + ASK_VARIABLES if ev.get("variables") or ev.get("invariants") else "")
              + (ASK_INVARIANTS if ev.get("invariants") else ""),
              "tokens (numbered near the positions below; elsewhere plain text, [n] marking position n): "
              + listing(strings, windows(task, ev)),
@@ -3027,6 +3030,8 @@ def main():
     rr.add_argument("--pool", action="store_true", help="the full candidate pool (candidate_pool(): every VPD-active subcomponent at the "
                                                          "listed, target and most-attended positions), cut to leave ROOM (fit_pool())")
     rr.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the policy's tokenizer, which fit_pool() counts in")
+    rr.add_argument("--circuit-only", action="store_true", help="the question asks for the CIRCUIT alone, its questions and edit "
+                    "requests dropped (an RL arm whose reward scores only the circuit)")
     rr.add_argument("--actives-only", action="store_true", help="the pool without the subcomponents a changed token switches on "
                     "(candidate_pool's switched; S1 and S2 were trained on it)")
     rr.add_argument("--control", choices=CONTROLS, help="a control question (control_evidence): text-only, shuffled (the next "
@@ -3190,6 +3195,8 @@ def main():
                     donor = rows_in[(i + 1) % len(rows_in)]
                     r = {**control_evidence(r, args.control, len(task["prompts"][0]["token_ids"]), donor, length(donor["task"]), C,
                                             native.task_seed(task["id"])), "control": args.control}
+                if args.circuit_only:  # no questions or edit requests: reward() then requires no FINAL or EDIT lines
+                    r = {**r, "qa": [], "edits": [], "circuit_only": True}
                 f.write(json.dumps({**r, "question": question(task, r)}) + "\n")
         return
 

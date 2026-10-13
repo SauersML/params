@@ -553,7 +553,7 @@ def rl(a) -> None:
             texts, thinks = zip(*(answer_of(renderer, tokenizer, s.tokens) for s in res.sequences))
             texts = list(texts)
             t1 = time.time()
-            req = {"task": q["task"], "answers": texts, "lines": True, "truncated": [str(s.stop_reason) == "length" or len(s.tokens) - th > ANSWER_CAP
+            req = {"task": q["task"], "answers": texts, "lines": not a.no_lines, "truncated": [str(s.stop_reason) == "length" or len(s.tokens) - th > ANSWER_CAP
                                                                     for s, th in zip(res.sequences, thinks)]}
             if frozen is not None:
                 if q["task"] not in tasks:
@@ -654,6 +654,8 @@ def main():
     r.add_argument("--save-every", type=int, default=25, help="steps between saved states (checkpoints.jsonl)")
     r.add_argument("--stage", type=int, default=0, help="the curriculum stage to start in (STAGES: 0 phi and compact, then "
                    "E4x, E2g, E1, E3); stage.json in --log takes over on a resume")
+    r.add_argument("--no-lines", action="store_true", help="the sequence-level reward alone: no per-line credit asked of the "
+                   "scorer or added to the advantages (the first RL run, the audit 10-13)")
     r.add_argument("--curriculum", action="store_true", help="advance a stage when the held-out evaluations (rl_heldout.sh "
                    "beside the run) stop improving on its terms (PLATEAU checkpoints)")
     r.add_argument("--first-step", type=int, default=0, help="resume: the step --init's state was saved at (its checkpoint "

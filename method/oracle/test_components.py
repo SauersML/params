@@ -579,6 +579,14 @@ def test_question_lists_the_candidate_pool_when_present(tiny):
     assert "L3.fc 5:1 9:~.3" in components.question(task, {**ev, "pool": switched})
 
 
+def test_a_circuit_only_question_asks_for_the_circuit_alone(tiny):
+    nat, ge, task, ev = tiny
+    full = components.question(task, ev)
+    only = components.question(task, {**ev, "qa": [], "edits": [], "circuit_only": True})
+    assert "Answer with CIRCUIT: and its lines only." in only and "FINAL <n>" not in only and "EDIT <n>" not in only
+    assert "FINAL <n>" in full
+
+
 def test_the_pool_adds_what_a_changed_token_switches_on(tiny):
     nat, ge, task, ev = tiny
     got = components.candidate_pool(nat, task, ev)["pool"]

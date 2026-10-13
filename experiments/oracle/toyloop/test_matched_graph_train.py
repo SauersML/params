@@ -61,6 +61,17 @@ class API:
  def close(self,status):self.calls.append(('close',status));return Future()
 
 class RunnerTest(unittest.TestCase):
+ def test_loss_diagnostic_respects_mask_and_paired_loss_mass(self):
+  data=[S(loss_fn_inputs={'weights':S(data=[0.,.25,.75])}),S(loss_fn_inputs={'weights':S(data=[1.])})]
+  result=S(loss_fn_outputs=[{'logprobs':S(data=[float('nan'),-2.,-4.])},{'logprobs':S(data=[-1.])}])
+  diagnostic=m.training_diagnostics(result,data)
+  self.assertEqual(diagnostic['weighted_nll_nats'],2.25)
+  self.assertEqual(diagnostic['loss_weight_mass'],2.)
+  self.assertEqual(diagnostic['supervised_tokens'],3)
+  self.assertIsNone(diagnostic['diagnostic_error'])
+  result.loss_fn_outputs[1]['logprobs'].data=[float('nan')]
+  self.assertIsNone(m.training_diagnostics(result,data)['weighted_nll_nats'])
+  self.assertIsNotNone(m.training_diagnostics(result,data)['diagnostic_error'])
  def files(self,root):
   prepared=root/'prepared.json';prepared.write_text(m.encoded(fixture()))
   proof=root/'preflight.json';proof.write_text(m.encoded(m.preflight(prepared,{'trained':1,'prefill':1,'sampled':1})))
@@ -82,6 +93,7 @@ class RunnerTest(unittest.TestCase):
    self.assertEqual(api.clones,['saved/common','saved/common']);self.assertEqual(api.drained,48)
    self.assertEqual([p['learning_rate'] for a,p in api.optimizers if a=='point'],[m.LR*(1-i/24) for i in range(24)])
    self.assertEqual(len((root/'run/steps.jsonl').read_text().splitlines()),48)
+   self.assertEqual(len((root/'run/training_diagnostics.jsonl').read_text().splitlines()),48)
    for arm in ('base',*m.ARMS):self.assertEqual(len((root/'run'/f'{arm}_raw.jsonl').read_text().splitlines()),32)
    self.assertEqual(api.calls[-1],('close','success'))
    with self.assertRaisesRegex(ValueError,'no restart'):m.execute(*self.files(root),root/'run',api)

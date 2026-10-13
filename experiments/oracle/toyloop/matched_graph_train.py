@@ -111,6 +111,28 @@ def append(path,value):
     with Path(path).open('a') as f:f.write(encoded(value)+'\n');f.flush();os.fsync(f.fileno())
 
 
+def training_diagnostics(result,selected):
+    """Observe optimization without adding calls or changing loss weights."""
+    try:
+        outputs=result.loss_fn_outputs
+        if len(outputs)!=len(selected):raise ValueError('loss output count changed')
+        numerator=mass=0.;supervised=0
+        for output,datum in zip(outputs,selected):
+            logp=output['logprobs'].data;weights=datum.loss_fn_inputs['weights'].data
+            if len(logp)!=len(weights):raise ValueError('loss output length changed')
+            for value,weight in zip(logp,weights):
+                if weight<=0:continue
+                if not math.isfinite(value):raise ValueError('nonfinite supervised log probability')
+                numerator-=value*weight;mass+=weight;supervised+=1
+        if not mass:raise ValueError('missing positive loss mass')
+        return {'weighted_nll_nats':numerator/mass,'loss_weight_mass':mass,
+                'supervised_tokens':supervised,'diagnostic_error':None}
+    except (AttributeError,KeyError,TypeError,ValueError) as exc:
+        # Paid work already happened. Preserve diagnostic failure separately;
+        # never resubmit an update merely because optional telemetry changed.
+        return {'weighted_nll_nats':None,'diagnostic_error':type(exc).__name__+': '+str(exc)}
+
+
 def execute(prepared,proof_path,approval_path,out,api=None):
     proof=json.loads(Path(proof_path).read_text());approval=json.loads(Path(approval_path).read_text())
     if proof!=preflight(prepared,proof['prices_per_million']):raise ValueError('offline preflight changed')
@@ -175,7 +197,10 @@ def execute(prepared,proof_path,approval_path,out,api=None):
                     pending[-1][2]=clients[a].optim_step(api.AdamParams(**c['recipe']['optimizer'][step]))
                 except Exception as exc:errors.append(exc);journal('submission_error',arm=a,step=step,error=type(exc).__name__);break
             for a,fb,op,ticket,counts in pending:
-                try:fb.result();settle(ticket,counts)
+                try:
+                    result=fb.result();settle(ticket,counts)
+                    append(out/'training_diagnostics.jsonl',{'arm':a,'step':step,
+                        **training_diagnostics(result,[data[a][i] for i in batch])})
                 except Exception as exc:errors.append(exc);journal('fb_error',arm=a,step=step,error=type(exc).__name__)
             for a,fb,op,ticket,counts in pending:
                 if op is None:continue

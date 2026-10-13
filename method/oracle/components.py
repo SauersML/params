@@ -1621,9 +1621,10 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
            lines: bool = False, node_cap: int | None = None, retain_calibration: bool = False,
            invariants: bool = False) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
-    in bits, every term ranking, nothing clipped flat): R = phi - phi_tau + g x Q + D (against the text's bar, a constant
-    of the text, so a group's ranking is phi + g x Q + D's; below 0 for every answer short of the bar, the empty and
-    near-empty circuits included: the Gate B repair 10-13).
+    in bits, every term ranking, nothing clipped flat): R = goal_eval.circuit_term (cap_phi(phi) - phi_tau - 4 v +
+    g 2^(-20 v) Q + 0.02 clip(compact, -2, 2)) + D: against the text's bar, a constant of the text (below 0 for every
+    answer short of it, the empty and near-empty circuits included: the Gate B repair 10-13); v the worst shortfall below
+    the per-family floors (tau's "floors", the teacher's), the last term an ungated tie-break toward the smaller answer.
       phi: goal_eval.phi of the answer's reward-mode row, -log2 of the power-4 mean of the families' residuals
         (1 - s + eps over point, nodes, edges, flips, track_pp, interchange_pp, donors near and far, pattern, N):
         each halving of the worst residual is about a bit, and the empty circuit is at or below 0.
@@ -1704,23 +1705,22 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         row, c, terms, info = row_of.get(i), c_of.get(i), {}, {}
         r = circ = V3_INVALID
         if row is not None:
-            ph_full, _ = goal_eval.phi(c, families=tau.get("families"))  # the text's families, an unscored one at 0
-            pt = tau.get("phi_tau")
-            ph = goal_eval.cap_phi(ph_full, pt)  # in full to the bar + 1, a tenth above
             executable_bits = goal_eval.size_bits(graphs[i], P, total, targets, active=tx.vpd)
             b = executable_bits + d_bits
-            comp = goal_eval.compact(b, tau.get("bits_start")) if executable_bits > 0 else None
-            g = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-GATE_SLOPE * (ph - pt)))
             terms = {"E2g": e2g[i]["E2g"] if i in e2g else None, "E4x": e4x.get(i), "E1": row["E1"]}
-            Q = 0.5 * (comp or 0.0) + sum(v for v in terms.values() if v is not None)
+            quality = sum(v for v in terms.values() if v is not None)
+            ct = goal_eval.circuit_term(c, tau, b, quality, executable_bits)  # the teacher's circuit_score calls it too
+            ph, ph_full, pt, g, comp = ct["phi"], ct["phi_full"], ct["phi_tau"], ct["g"], ct["compact"]
+            Q = 0.5 * (comp or 0.0) + quality
             dc = comp - ref["compact"] if ref is not None and comp is not None else (math.inf if executable_bits <= 0 else None)
             m = None if ref is None or ph is None or dc is None else min(ph - ref["phi"], dc)
             D = 0.0 if m is None else (softplus(2.0 * m) - softplus(0.0)) / 2.0  # 0 at parity with the teacher
-            r = (ph or 0.0) - (pt or 0.0) + (g or 0.0) * Q + D  # against the text's bar: below 0 until faithful
-            circ = (ph or 0.0) - (pt or 0.0) + (g or 0.0) * 0.5 * (comp or 0.0) + D
+            r = ct["term"] + D  # cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v) Q + tie-break: below 0 until faithful
+            circ = goal_eval.circuit_term(c, tau, b, 0.0, executable_bits)["term"] + D
             terms |= {"C": c["c"], "C_rl": c.get("c_rl"), "F1": row[f"f1_{convention}"], "N": row[f"n_{convention}"], "F3": row["f3"],
                       "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}
-            info = {"phi": ph, "phi_full": ph_full, "phi_tau": pt, "g": g, "faithful": None if ph is None or pt is None else ph >= pt, "bits": b,
+            info = {"phi": ph, "phi_full": ph_full, "phi_tau": pt, "g": g, "v": ct["v"], "g_floor": ct["g_floor"], "tie": ct["tie"],
+                    "faithful": None if ph is None or pt is None else ph >= pt and ct["v"] == 0.0, "bits": b,
                     "executable_bits": executable_bits,
                     "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,
                     "e2g": {k: v for k, v in (e2g.get(i) or {}).items() if k != "E2g"} or None}

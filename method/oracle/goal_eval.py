@@ -557,8 +557,9 @@ def _ratio_pool(draws: list, raw: bool = False) -> float | None:
     -(W - KL_VPD), so in [-1, 1]. Each draw weighs its VPD gap W - KL_VPD in bits: one whose VPD run sits near the
     bound weighs nothing, and no draw outweighs its own change. On text9002's F+V circuits over 4 draw seeds (the lead's
     10-13 swing): spread 0.002-0.026, against 0.023-0.074 for per-draw log ratios weighted by W and 0.12-0.32 for
-    pooled or gap-weighted log ratios (ln(W / KL_VPD) grows without bound as VPD's KL nears 0). None without such draws
-    or unless the gaps' sum exceeds twice its standard error over them (sqrt(n) x their spread)."""
+    pooled or gap-weighted log ratios (ln(W / KL_VPD) grows without bound as VPD's KL nears 0). None without such draws.
+    (No standard-error guard: each draw counts at most its own gap, so nothing blows up; 71c66c3's guard on the gaps'
+    sum dropped track_pp from text9002's search split, whose fixed ranked draws carry the change unevenly: pymove.)"""
     num, gap = [], []
     for d in draws or []:
         w, kc, kv = d[3], d[1], d[2]
@@ -569,10 +570,7 @@ def _ratio_pool(draws: list, raw: bool = False) -> float | None:
         num.append(min(g, max(-g if raw else 0.0, w - kc)))
     if not gap:
         return None
-    total = float(sum(gap))
-    if len(gap) > 1 and not total > 2.0 * math.sqrt(len(gap)) * float(np.std(gap, ddof=1)):
-        return None
-    return float(sum(num)) / total
+    return float(sum(num)) / float(sum(gap))
 
 def _spec(draws: list, raw: bool = False) -> float | None:
     """N (necessity_spec) from its records [control, D_c, D_c(VPD), D_t, D_t(VPD)]: (D_t - mean D_c) / (D_t(VPD) -
@@ -629,8 +627,8 @@ def family_eps(row: dict, only=None) -> dict:
     for fam, (_, kind, key) in PHI_FAMILIES.items():
         draws = row.get(key) if key else None
         if not kind or not draws or len(draws) < 2:
-            if only is None or fam in only:
-                out[fam] = EPS_FLOOR
+            if only is None or fam in only:  # nothing omitted: s_omitted 1, exactly (the lead's 10-13)
+                out[fam] = 0.0 if fam == "omitted" and not draws and row.get("s_omitted") == 1.0 else EPS_FLOOR
             continue
         idx = rng.integers(len(draws), size=(EPS_BOOT, len(draws)))  # the same draws as one call per resample
         if only is not None and fam not in only:
@@ -653,6 +651,49 @@ def _eps(row: dict) -> dict:
     eps = {f: row[f"eps_{f}"] for f in PHI_FAMILIES if row.get(f"eps_{f}") is not None}
     eps = eps if len(eps) == len(PHI_FAMILIES) else {**family_eps(row), **eps}
     return {f: min(EPS_CAP, v) for f, v in eps.items()}
+
+
+GATE_SLOPE = 10.0  # the reward's gate g = 1 / (1 + 2^(-GATE_SLOPE (phi - phi_tau))) (components.GATE_SLOPE)
+FLOOR_TOP, FLOOR_MARGIN = 0.9, 0.05  # a family's floor: min(FLOOR_TOP, the start's score - FLOOR_MARGIN), at least 0
+SHORTFALL_COST, SHORTFALL_GATE = 4.0, 20.0  # R - SHORTFALL_COST v, the gate times 2^(-SHORTFALL_GATE v)
+TIE, TIE_CLIP = 0.02, 2.0  # the ungated compactness tie-break: TIE x clip(compact, -TIE_CLIP, TIE_CLIP)
+
+
+def floors(start: dict, families: list) -> dict:
+    """Per-family floors (the lead's 10-13: the teacher's acceptance floors, so reward and teacher agree on what
+    faithful means): max(0, min(0.9, s_i(start) - 0.05)) for each family the start scores, 0 for the rest."""
+    out = {}
+    for f in families:
+        s = family_score(start, f)
+        out[f] = 0.0 if s is None else max(0.0, min(FLOOR_TOP, s - FLOOR_MARGIN))
+    return out
+
+
+def shortfall(row: dict, floors_: dict) -> float:
+    """v = max_i (f_i - s_i)_+, the worst shortfall below a family's floor in score units (an unscored family at s = 0)."""
+    return max((max(0.0, f - (family_score(row, k) or 0.0)) for k, f in floors_.items()), default=0.0)
+
+
+def circuit_term(row: dict, tau: dict, bits: float | None, quality: float = 0.0, executable_bits: float | None = None) -> dict:
+    """Reward v3's circuit part, one function for components.reward and the teacher (circuit_score): term =
+    cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v) (0.5 compact + quality) + 0.02 clip(compact, -2, 2). phi over tau's
+    families; v the worst shortfall below tau's per-family floors (a single bad family can no longer hide in the power
+    mean: one at 0.45 among ten at 0.95 gave phi 1.67, above every family at 0.5); g the gate at the bar; compact =
+    log2(bits_start / bits) (None when executable_bits, default bits, is 0); the last term an ungated tie-break toward
+    the smaller answer (padding below the bar was free: generality's falsification set ranked it right on 0.59). quality:
+    the reward's other gated terms (E2g + E4x + E1). Returns the term and its pieces."""
+    fams, pt = tau.get("families"), tau.get("phi_tau")
+    full = phi(row, families=fams)[0]
+    ph = cap_phi(full, pt)
+    v = shortfall(row, tau.get("floors") or {})
+    eb = bits if executable_bits is None else executable_bits
+    comp = compact(bits, tau.get("bits_start")) if bits and eb and eb > 0 else None
+    g = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-GATE_SLOPE * (ph - pt)))
+    ge_ = (g or 0.0) * 2.0 ** (-SHORTFALL_GATE * v)
+    tie = TIE * max(-TIE_CLIP, min(TIE_CLIP, comp or 0.0))
+    term = (ph or 0.0) - (pt or 0.0) - SHORTFALL_COST * v + ge_ * (0.5 * (comp or 0.0) + quality) + tie
+    return {"term": term, "phi_full": full, "phi": ph, "phi_tau": pt, "v": v, "floors": tau.get("floors"), "g": g,
+            "g_floor": ge_, "compact": comp, "tie": tie}
 
 
 def cap_phi(ph: float | None, tau: float | None) -> float | None:
@@ -3856,7 +3897,7 @@ class GoalEval:
         if pt is not None and pe is not None:
             pt = max(pt, pe + 1.0)
         se = _eps(row)
-        kept[split] = {"phi_start": ph, "phi_tau": pt, "phi_empty": pe, "families": fams,
+        kept[split] = {"phi_start": ph, "phi_tau": pt, "phi_empty": pe, "families": fams, "floors": floors(row, fams),
                        "phi_09": _phi([(0.9, se[f]) for f in fams]), "phi_05": _phi([(0.5, se[f]) for f in fams]),
                        "c_start": row["c"], "c_rl_start": row["c_rl"],
                        "tau": min(0.9, row["c_rl"]) if row["c_rl"] is not None else None,

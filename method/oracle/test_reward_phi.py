@@ -33,7 +33,7 @@ def test_raw_bootstrap_pooling_retains_variation_below_zero(kind, draws):
     assert goal_eval._pooled(kind, draws, 1.0, raw=True) < 0.0
     a = goal_eval._pooled(kind, [draws[0]] * 2, 1.0, raw=True)
     b = goal_eval._pooled(kind, [draws[1]] * 2, 1.0, raw=True)
-    assert a > b
+    assert a >= b  # (the weighted families' raw score stops at -1: both draws far past the bound)
 
 
 def test_family_noise_is_bootstrapped_from_floored_scores():
@@ -81,4 +81,31 @@ def test_pooled_ratio():
     assert abs(goal_eval._ratio_pool(d[:3] + [[4, 0.1, 1.9999, 2.0]]) - want) < 1e-4  # VPD at the bound weighs 1e-4 bits
     assert goal_eval._pooled("weighted", d, None) == goal_eval._ratio_pool(d)
     assert goal_eval._ratio_pool([[0, 50.0, 0.2, 2.0], [1, 40.0, 0.3, 2.0]], raw=True) == -1.0
-    assert goal_eval._ratio_pool([[0, 1.0, 1.99, 2.0], [1, 1.0, 0.0, 2.0], [2, 1.0, 1.999, 2.0]]) is None
+    assert goal_eval._ratio_pool([[0, 3.0, 2.5, 2.0]]) is None  # no draw where VPD is nearer than no change
+    uneven = [[0, 1.0, 1.99, 2.0], [1, 1.0, 0.0, 2.0], [2, 1.0, 1.999, 2.0]]  # one draw carries the change: still scored
+    assert abs(goal_eval._ratio_pool(uneven) - (0.01 + 1.0 + 0.001) / (0.01 + 2.0 + 0.001)) < 1e-12
+
+
+def test_floors_and_circuit_term():
+    """Per-family floors from the start (min(0.9, s - 0.05), at least 0; 0 where the start scores nothing), v the worst
+    shortfall below them (an unscored family at 0), and circuit_term = cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v)
+    (0.5 compact + quality) + 0.02 clip(compact, -2, 2)."""
+    import math
+    start = {"s_point_c": 0.95, "s_nodes": 0.5, "s_track_pp": None, "n_spec": 0.02,
+             **{f"eps_{f}": goal_eval.EPS_FLOOR for f in goal_eval.PHI_FAMILIES}}
+    fams = ["point", "nodes", "track_pp", "N"]
+    fl = goal_eval.floors(start, fams)
+    want = {"point": 0.9, "nodes": 0.45, "track_pp": 0.0, "N": 0.0}
+    assert set(fl) == set(want) and all(abs(fl[k] - want[k]) < 1e-12 for k in want)
+    row = dict(start, s_point_c=0.85, s_nodes=0.5)
+    assert abs(goal_eval.shortfall(row, fl) - 0.05) < 1e-12
+    assert goal_eval.shortfall(dict(row, s_nodes=None), fl) == 0.45  # an unscored family at 0
+    tau = {"families": fams, "phi_tau": 1.0, "floors": fl, "bits_start": 400.0}
+    ct = goal_eval.circuit_term(row, tau, 100.0, quality=0.3)
+    ph = goal_eval.cap_phi(goal_eval.phi(row, families=fams)[0], 1.0)
+    g = 1.0 / (1.0 + 2.0 ** (-goal_eval.GATE_SLOPE * (ph - 1.0)))
+    want = ph - 1.0 - 4 * 0.05 + g * 2.0 ** (-20 * 0.05) * (0.5 * 2.0 + 0.3) + 0.02 * 2.0
+    assert abs(ct["term"] - want) < 1e-12 and ct["v"] == ct["v"] and abs(ct["compact"] - 2.0) < 1e-12
+    big = goal_eval.circuit_term(row, tau, 400.0 * 2 ** 5)  # 32x the start: the tie-break clipped at -0.04
+    assert abs(big["tie"] + 0.04) < 1e-12
+    assert goal_eval.circuit_term(row, tau, 0.0)["compact"] is None and goal_eval.circuit_term(row, tau, 0.0)["tie"] == 0.0

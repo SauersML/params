@@ -280,7 +280,10 @@ def test_reward_on_tiny_model(tiny):
     assert all(got[0][f"term_{k}"] is None or 0.0 <= got[0][f"term_{k}"] <= 1.0 for k in ("C", "F1", "N", "F3"))
     v = got[0]  # reward v3: phi - phi_tau + g x (0.5 compact + E2g + E4x + E1) + D
     assert v["g"] is None or 0.0 <= v["g"] <= 1.0
-    assert v["reward"] == pytest.approx((v["phi"] or 0.0) - (v["phi_tau"] or 0.0) + (v["g"] or 0.0) * v["Q"] + v["D"])
+    tie = 0.02 * max(-2.0, min(2.0, v["compact"] or 0.0))
+    assert v["reward"] == pytest.approx((v["phi"] or 0.0) - (v["phi_tau"] or 0.0) - 4.0 * v["v"]
+                                        + (v["g"] or 0.0) * 2.0 ** (-20.0 * v["v"]) * v["Q"] + tie + v["D"])
+    assert v["tie"] == pytest.approx(tie)
     assert v["Q"] == pytest.approx(0.5 * (v["compact"] or 0.0) + sum(v[f"term_{k}"] or 0.0 for k in ("E2g", "E4x", "E1")))
     tok = lambda xs: components.token_strings(task["model"], xs)  # noqa: E731
     right0 = sum(0.5 * (not q["falls"]) + 0.5 * (tok([q["top"]])[0] == " the") for q in ev["qa"]) / max(len(ev["qa"]), 1)

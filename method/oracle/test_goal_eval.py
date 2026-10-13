@@ -1743,6 +1743,7 @@ def test_reward_v3_helpers(tiny):
     # the Gate B bar: max(min(start, every family at 0.9), every family at 0.5, the empty circuit + 1 bit)
     assert abs(t["phi_tau"] - max(min(t["phi_start"], t["phi_09"]), t["phi_05"], t["phi_empty"] + 1)) < 1e-12
     assert t["families"] and set(t["families"]) <= set(goal_eval.PHI_FAMILIES)
+    assert set(t["floors"]) == set(t["families"]) and all(0.0 <= f <= 0.9 for f in t["floors"].values())
     assert ge.tau(tx, pool) is t
 
 
@@ -2007,7 +2008,7 @@ def test_block_nodes(tiny):
     assert set(ex.out) == {(o1, 11, c) for c in range(nat.C[o1])}
     a = ge.fidelity(tx, [g], None, draws=2, near_donors=0, far_donors=0)[0]
     b = ge.fidelity(tx, [ex], None, draws=2, near_donors=0, far_donors=0)[0]
-    assert a["s_point"] == b["s_point"] and a["s_nodes"] == b["s_nodes"]
+    assert a["s_point"] == b["s_point"]  # (the node family draws a block as one unit, its expansion part by part: a699a8b)
     whole = native.Graph([(o1, 11, B), (d0, 11, 0)], complete=True)  # a node set with a block: its site's parts there
     back, _ = goal_eval.circuit(goal_eval.to_json(whole), tx.targets, nat.C, tx.T)  # a node set's JSON ("complete")
     assert back.complete and set(back.node_set()) == set(whole.node_set())

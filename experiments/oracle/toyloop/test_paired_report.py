@@ -22,7 +22,7 @@ def make_arm(path, name):
     (path / 'zoo').mkdir()
     (path / 'zoo/manifest.jsonl').write_text('synthetic frozen zoo')
     panel = [{'id': f'case{i:02d}', 'split': ['train', 'test_instance', 'test_family'][i // 8],
-              'family': f'family{i // 8}'} for i in range(24)]
+              'family': f'family{i // 8}', 'gt_units': ['L0.H1', 'L1.N2']} for i in range(24)]
     write(path / 'data.json', {'evaluation_panel': panel, 'files': report.files(path / 'zoo')})
     write(path / 'sft.done.json', {'files': report.files(path / 'sft')})
     write(path / 'parent_evidence/contract.json', {'parent': 'identical frozen CPU SFT'})
@@ -45,7 +45,9 @@ def make_arm(path, name):
             kl = 0.000001 if label == 'gt' else .2
             measured = {'per_text': [{'suff': 1. - kl, 'kl_bits': kl, 'top': 1, 'reference_top': 1}]}
             rows.append({**entry, 'valid': True, 'prompt_sha256': 'same', 'input_bank_sha256': 'same',
-                         'completion': 'synthetic circuit', 'edge_f1': .5, 'unit_f1': .8, 'unit_count': 2, 'edge_count': 3,
+                         'completion': 'synthetic circuit', 'edge_f1': .5, 'unit_f1': .8, 'unit_count': 4, 'edge_count': 3,
+                         'units': ['tok_input', 'L0H1', 'L1N2', 'out'],
+                         'edges': [['tok_input', 'L0H1'], ['L0H1', 'L1N2'], ['L1N2', 'out']],
                          'stated': measured, 'same_units_complete': measured, 'stated_reward': 1. - kl,
                          'same_units_complete_reward': 1. - kl,
                          'policy_checkpoint_manifest_sha256': report.digest(path / (label + '.done.json')) if label in ('sft', name) else None})
@@ -104,3 +106,16 @@ def test_partial_training_and_baseline_drift_are_not_hidden(arms):
     write(wiring / 'wiring_suff.done.json', done)
     with pytest.raises(ValueError, match='partial'):
         report.compare(unit, wiring, resamples=0)
+
+
+
+def test_component_metrics_exclude_token_and_output_graph_nodes(arms):
+    unit, wiring = arms
+    result = report.compare(unit, wiring, resamples=0)
+    metrics = result['cases'][0]['unit']
+    assert metrics['unit_count'] == 4  # legacy graph-node count is retained
+    assert metrics['component_count'] == 2
+    assert metrics['intercomponent_edge_count'] == 1
+    assert metrics['unit_f1'] == metrics['graph_node_f1'] == .8
+    assert metrics['component_f1'] == 1.
+    assert 'including tok/out' in result['metric_naming']

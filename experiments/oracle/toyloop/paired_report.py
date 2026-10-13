@@ -13,6 +13,7 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 import statistics
 
 
@@ -45,6 +46,9 @@ def load_rows(path, panel):
     for ident, row in by_id.items():
         require((row['split'], row['family']) == (panel[ident]['split'], panel[ident]['family']), 'case split/family changed')
         require(isinstance(row['valid'], bool), 'evaluation lacks explicit validity')
+        gold = panel[ident].get('gt_units')
+        row['_gold_components'] = ([re.sub(r'^(L\d+)\.([HN]\d+)$', r'\1\2', name) for name in gold]
+                                   if gold is not None else None)
         if not row['valid']:
             require(row['stated_reward'] == row['same_units_complete_reward'] == -1, 'invalid evaluation penalty changed')
         else:
@@ -103,7 +107,15 @@ def load_arm(path, name):
 
 def measures(row):
     """Invalid reward is -1; invalid top/F1 is zero; KL remains unmeasured, never fabricated."""
-    result = {'valid': int(row['valid']), 'stated_reward': row['stated_reward'],
+    components = {name for name in row['units'] if re.fullmatch(r'L\d+[HN]\d+', name)}
+    gold = row.get('_gold_components')
+    component_f1 = (2 * len(components & set(gold)) / max(len(components) + len(set(gold)), 1)
+                    if gold is not None else None)
+    result = {'component_count': len(components),
+              'intercomponent_edge_count': sum(a in components and b in components for a, b in row['edges']),
+              'component_f1': component_f1 if row['valid'] else 0. if gold is not None else None,
+              'graph_node_f1': row['unit_f1'] if row['valid'] else 0.,
+              'valid': int(row['valid']), 'stated_reward': row['stated_reward'],
               'complete_reward': row['same_units_complete_reward'],
               'wiring_gap': row['same_units_complete_reward'] - row['stated_reward'],
               'edge_f1': row['edge_f1'] if row['valid'] else 0., 'unit_f1': row['unit_f1'] if row['valid'] else 0.,
@@ -122,6 +134,8 @@ def summary(rows):
     for key in ms[0]:
         values = [r[key] for r in ms if r[key] is not None]
         result[key + '_mean'] = statistics.mean(values) if values else None
+        if key == 'component_f1':
+            result['component_f1_coverage_n'] = len(values)
         if key == 'kl_bits':
             result['kl_valid_n'] = len(values)
             result['kl_worst_valid'] = max(values) if values else None
@@ -167,6 +181,7 @@ def compare(unit_path, wiring_path, resamples=10000, seed=20261013):
                       'wiring_minus_unit': {key: wm[key] - um[key] if wm[key] is not None and um[key] is not None else None for key in um}})
     by_id = {r['id']: r for r in cases}
     report = {'scope': 'shared-development planted toy point-wiring prediction; English, token annotations, necessity and real VPD fidelity unverified',
+              'metric_naming': 'Legacy unit_count/unit_f1 are graph-node metrics including tok/out. component_count/component_f1 and intercomponent_edge_count filter head/neuron IDs only; component gold comes from frozen panel gt_units.',
               'caps': 'matched scheduled updates/sample/context/generation caps, not equal actual compute or sampled tokens',
               'bootstrap_scope': 'exploratory paired case resampling; fixed chosen panel, not fresh heldout or family-level uncertainty',
               'seed': seed, 'resamples': resamples, 'cases': cases, 'by_split': {}, 'baseline_differences': {}, 'training': {}, 'provenance': {}}
@@ -175,13 +190,13 @@ def compare(unit_path, wiring_path, resamples=10000, seed=20261013):
                                      'wiring': summary([wiring['rows']['wiring_suff'][i] for i in ids]), 'paired_wiring_minus_unit': {}}
         for arm, tag in ((unit, 'unit'), (wiring, 'wiring')):
             improvement = {}
-            for key in ('stated_reward', 'complete_reward', 'wiring_gap', 'edge_f1', 'unit_f1', 'top1', 'kl_bits'):
+            for key in ('stated_reward', 'complete_reward', 'wiring_gap', 'edge_f1', 'unit_f1', 'component_f1', 'component_count', 'intercomponent_edge_count', 'top1', 'kl_bits'):
                 pairs = [(measures(arm['rows'][arm['name']][i]), measures(arm['rows']['sft'][i])) for i in ids]
                 changes = [after[key] - before[key] for after, before in pairs
                            if after[key] is not None and before[key] is not None]
                 improvement[key] = delta(changes, resamples, seed)
             report['by_split'][group][tag + '_minus_own_sft'] = improvement
-        for key in ('stated_reward', 'complete_reward', 'wiring_gap', 'edge_f1', 'unit_f1', 'top1', 'kl_bits'):
+        for key in ('stated_reward', 'complete_reward', 'wiring_gap', 'edge_f1', 'unit_f1', 'component_f1', 'component_count', 'intercomponent_edge_count', 'top1', 'kl_bits'):
             values = [by_id[i]['wiring_minus_unit'][key] for i in ids if by_id[i]['wiring_minus_unit'][key] is not None]
             report['by_split'][group]['paired_wiring_minus_unit'][key] = delta(values, resamples, seed)
     for label in ('gt', 'empty', 'sft'):

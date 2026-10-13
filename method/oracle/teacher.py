@@ -401,7 +401,7 @@ class Pruner(Descent):
             start = max(0, min(min(first[s0:s0 + valid]), T - 64, min(self.tx.targets))) if reuse else 0
             layer = min(lowest[s0], tg.n_layer - 1) if reuse else 0
             hidden = self._run(self._site_masks(on), B, start, prefix if reuse else None, layer)
-            lq = torch.log_softmax((hidden[:, [t - start for t in self.tx.targets]] @ tg.wte.T).float(), -1)
+            lq = torch.log_softmax(tg.unembed(hidden[:, [t - start for t in self.tx.targets]]).float(), -1)
             for i, x in zip(idx.tolist(), carry.kl(self.tx.ref, lq).tolist()[:valid]):
                 kl[i] = x
         self.measured += K

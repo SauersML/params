@@ -356,6 +356,15 @@ class Native:
         self.vpd.clear()
         return out
 
+    def replacement_logp(self, ids: list[int], source: int) -> torch.Tensor:
+        """Log-probabilities over the input vocabulary for the token at position source (a changed text's draw): the
+        model's own prediction there (vpd4l, a language model); uniform for a Target that is no language model
+        (vpd_model.TLTarget: its outputs label positions)."""
+        if getattr(self.target, "lm", True):
+            return self.reference([ids[:source]], [source - 1])[0, 0]
+        V = self.target.n_tokens
+        return torch.full((V,), -math.log(V), device=self.dev)
+
     @property
     def has_importance(self) -> bool:
         """Whether VPD's causal-importance network is loaded (a pod has only the subcomponents, UV)."""
@@ -626,11 +635,8 @@ class Native:
         ablation on other tokens base, base): the model is causal, so before the first position where ids differ
         from base every state is that run's (a patch there must give that run's values), and only the positions from
         there on are computed (_stream1)."""
-        import vpd_model
-
         tg = self.target
-        return torch.log_softmax((vpd_model.rms(self._stream(ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep, fill, reuse), tg.ln_f, tg.eps)
-                                  @ tg.wte.T).float(), -1)
+        return torch.log_softmax(tg.unembed(tg.norm(self._stream(ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep, fill, reuse), -1)).float(), -1)
 
     def _stream(self, ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep, fill=None, reuse=None) -> torch.Tensor:
         """run()'s residual stream at the targets [B, len(targets), d], before the final norm; a split plan's two batches
@@ -685,8 +691,8 @@ class Native:
         G, comp, R, Wr, E, O = plan["G"], plan["complete"], plan["readers"], plan["writers"], plan["edges"], plan["out"]
         B = plan["B"]
         T = len(ids)
-        H, hd, eps = tg.n_head, tg.hd, tg.eps
-        rms, gelu = vpd_model.rms, vpd_model.gelu_tanh
+        H, hd = tg.n_head, tg.hd
+        gelu = tg.act
         zu, zur = self._zero()
         no_rest = ur is zur  # remainders at 0: they add exact zeros
         empty = u is zu and no_rest and not plan["any_complete"]
@@ -749,6 +755,9 @@ class Native:
         def plus(a, r):
             return a if r is None else a + r
 
+        def bias(n):  # a matrix's bias, always on like the embedding (None: vpd4l's have none)
+            return tg.site(n).b
+
         def strength(key, w, table):
             return 1.0 if table is None or key not in table else table[key]
 
@@ -760,7 +769,7 @@ class Native:
             return A
 
         tok = torch.tensor(ids, device=dev)
-        emb = tg.wte[tok if s == 0 else tok[s:]]
+        emb = tg.embed(tok if s == 0 else tok[s:], s)
         x = emb[None] if empty else emb[None].expand(B, L, -1).clone()  # every output at its scale
         xg = x.clone() if both else x  # complete graphs: their nodes' outputs in full
         causal = self._const(("causal", T), lambda: torch.ones(T, T, dtype=torch.bool, device=dev).tril())
@@ -807,28 +816,28 @@ class Native:
             A = torch.where(win(G[n]) & comp, zg @ V, z @ V) if both else (z @ V).expand(B, L, -1)
             if n in R:
                 b, t, c = R[n][0], R[n][1], R[n][2]
-                inp = rms(xs.expand(B, -1, -1)[b, at(t)] + topup(n, xs.shape[-1], resid_contrib), norm, eps)
+                inp = tg.norm(xs.expand(B, -1, -1)[b, at(t)] + topup(n, xs.shape[-1], resid_contrib), norm)
                 A = put(n, A, (inp * V.T[c]).sum(-1))
             return A
 
-        def normed(x, norm):  # (the stream at every position (zeros before s), its norm at the positions computed)
-            xf = padded(x)
+        def normed(x, norm):  # (the stream at every position (zeros before s), its norm (Target.norm's number) at the
+            xf = padded(x)    # positions computed)
             if empty:  # one row for every graph; the norm over all of them, as each graph's
-                return xf, rms(xf.expand(B, T, -1).contiguous(), norm, eps)[:1]
-            z = rms(xf, norm, eps)
+                return xf, tg.norm(xf.expand(B, T, -1).contiguous(), norm)[:1]
+            z = tg.norm(xf, norm)
             return xf, (z if s == 0 else z[:, o:].contiguous())
 
         for i in range(tg.n_layer):
             nm = {k: site_name(i, k) for k in vpd_model.KINDS}
-            n1, n2 = tg.norms[2 * i], tg.norms[2 * i + 1]
+            n1, n2 = 2 * i, 2 * i + 1
             xf, z = normed(x, n1)
             zg = normed(xg, n1)[1] if both else None
             for k in ("q_proj", "k_proj", "v_proj"):
                 acts[nm[k]] = fixed(nm[k], read_resid(nm[k], n1, z, zg, xf))
-            qv = full(("qv", i), plus((acts[nm["q_proj"]] * scale(nm["q_proj"])) @ tg.site(nm["q_proj"]).U, rest(nm["q_proj"], z)))
-            kv = full(("kv", i), plus((acts[nm["k_proj"]] * scale(nm["k_proj"])) @ tg.site(nm["k_proj"]).U, rest(nm["k_proj"], z)))
+            qv = full(("qv", i), plus(plus((acts[nm["q_proj"]] * scale(nm["q_proj"])) @ tg.site(nm["q_proj"]).U, rest(nm["q_proj"], z)), bias(nm["q_proj"])))
+            kv = full(("kv", i), plus(plus((acts[nm["k_proj"]] * scale(nm["k_proj"])) @ tg.site(nm["k_proj"]).U, rest(nm["k_proj"], z)), bias(nm["k_proj"])))
             Uv = tg.site(nm["v_proj"]).U
-            rv = rest(nm["v_proj"], z)
+            rv = plus(rest(nm["v_proj"], z), bias(nm["v_proj"]))
             vs = None if empty else full(("vs", i), plus((acts[nm["v_proj"]] * ux(nm["v_proj"])) @ Uv, rv))  # empty: u = 0, the values write nothing
             vg = full(("vg", i), plus((acts[nm["v_proj"]] * scale(nm["v_proj"])) @ Uv, rv)) if both else vs
             heads = lambda y: y.view(B, T, H, hd).transpose(1, 2)  # noqa: E731
@@ -858,7 +867,7 @@ class Native:
                 Ao = put(no, Ao, (((torch.zeros(len(b), Vo.shape[0], device=dev) if empty else att_s[b, at(t)]) + extra) * Vo.T[c]).sum(-1))
             acts[no] = Ao = fixed(no, Ao)
             Uo = tg.site(no).U
-            ro = rest(no, att_sw)
+            ro = plus(rest(no, att_sw), bias(no))
             if not empty:
                 x = plus(x + (Ao * ux(no)) @ Uo, ro)
             xg = plus(xg + (Ao * scale(no)) @ Uo, ro) if both else x
@@ -867,7 +876,7 @@ class Native:
             nf, nd = nm["c_fc"], nm["down_proj"]
             acts[nf] = fixed(nf, read_resid(nf, n2, z2, zg2, xf2))
             Uf = tg.site(nf).U
-            rf = rest(nf, z2)
+            rf = plus(rest(nf, z2), bias(nf))
             pre_s = None if empty else plus((acts[nf] * ux(nf)) @ Uf, rf)
             pre_g = plus((acts[nf] * scale(nf)) @ Uf, rf) if both else pre_s
             gs = None if empty else gelu(pre_s)
@@ -886,7 +895,7 @@ class Native:
                 Ad = put(nd, Ad, (gelu(pre + topup(nd, Uf.shape[1], mlp_contrib)) * Vd.T[c]).sum(-1))
             acts[nd] = Ad = fixed(nd, Ad)
             Ud = tg.site(nd).U
-            rd = rest(nd, gs)
+            rd = plus(rest(nd, gs), bias(nd))
             if not empty:
                 x = plus(x + (Ad * ux(nd)) @ Ud, rd)
             xg = plus(xg + (Ad * scale(nd)) @ Ud, rd) if both else x
@@ -1044,7 +1053,10 @@ class Native:
         last = max(targets)
         probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0].float().softmax(-1).cpu()
         base = torch.log(probs[last].clamp_min(1e-30))
-        other = probs.clone()
+        if getattr(self.target, "lm", True):
+            other = probs.clone()
+        else:  # no language model: replacements uniform over the input vocabulary (replacement_logp)
+            other = torch.full((len(ids), self.target.n_tokens), 1.0 / self.target.n_tokens)
         other[torch.arange(len(ids) - 1), torch.tensor(ids[1:])] = 0.0
         probe = []
         for p in range(1, last + 1):
@@ -1064,7 +1076,7 @@ class Native:
                     if start and len(batch) not in prefix:
                         prefix[len(batch)] = self.target.keys_values(torch.tensor([ids] * len(batch), device=self.dev))
                     h = self.target.hidden(batch, start, prefix.get(len(batch)))[:, last - start:last - start + 1]
-                    logits = (h @ self.target.wte.T)[:, 0]
+                    logits = self.target.unembed(h)[:, 0]
                 else:
                     logits = self.vpd.target_forward(batch)[:, last]
                 lqs.append(torch.log_softmax(logits.float(), -1))

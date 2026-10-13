@@ -54,23 +54,21 @@ PRECISIONS = ("score", "tf32", "bf16")
 class Engine:
     def __init__(self, nat: native.Native, ids: list[int], targets: list[int], live: bool = True, columns: dict | None = None,
                  compile: bool = False, outside: str = "off"):
-        import vpd_model
-
         if outside not in ("off", "on"):
             raise ValueError("outside is off or on")
         self.nat, self.ids, self.targets, self.live = nat, list(ids), list(targets), live
         self.fixed = live or outside == "on"  # whether every run adds x R (the remainder, and with outside on the rest)
         tg = nat.target
         self.tg, self.T, self.dev = tg, len(ids), nat.dev
-        self.H, self.hd, self.eps = tg.n_head, tg.hd, tg.eps
-        self.rms, self.gelu = vpd_model.rms, vpd_model.gelu_tanh
+        self.H, self.hd = tg.n_head, tg.hd
         with torch.no_grad():
             self.ref = nat.reference([self.ids], self.targets)
-            self.emb = tg.wte[torch.tensor(self.ids, device=self.dev)][None]  # [1, T, d]
+            self.emb = tg.embed(torch.tensor(self.ids, device=self.dev))[None]  # [1, T, d]
         self._targets = torch.tensor(self.targets, device=self.dev)  # (indexing by a list copies it to the device: a synchronization)
         self._causal_targets = torch.arange(self.T, device=self.dev)[None, :] <= self._targets[:, None]  # [targets, T]
         self.columns = {n: (None if columns is None or columns.get(n) is None else columns[n].to(self.dev)) for n in nat.names}
         self.V, self.U, self.R = {}, {}, {}
+        self.b = {n: tg.site(n).b for n in nat.names}  # each site's bias, always on (None: vpd4l's have none)
         for n in nat.names:
             st, cols = tg.site(n), self.columns[n]
             self.V[n] = st.V if cols is None else st.V.index_select(1, cols).contiguous()  # [d_in, K]
@@ -113,13 +111,13 @@ class Engine:
         if rec is not None and n in rec[0]:  # reads: the activations at the asked (row, position, column)s
             rec[1][n] = a[rec[0][n]]
         out = (a * m.to(a.dtype)) @ U
-        return out + h @ Rw if self.fixed else out
+        out = out + h @ Rw if self.fixed else out
+        return out if self.b[n] is None else out + self.b[n]
 
     def _steps(self, fused: bool):
-        """(norm, activation): torch's fused kernels, or vpd_model's own."""
-        if fused:
-            return (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, self.eps)), (lambda x: F.gelu(x, approximate="tanh"))
-        return (lambda x, w: self.rms(x, w, self.eps)), self.gelu
+        """(norm(x, j), activation): the Target's, torch's fused kernels or vpd_model's own (Target.norm's numbering)."""
+        tg = self.tg
+        return (lambda x, j: tg.norm(x, j, fused)), (lambda x: tg.act(x, fused))
 
     def hidden(self, masks: dict, search: bool, rec: tuple | None = None) -> torch.Tensor:
         """The final normed residual stream at the targets [B, len(targets), d] of the masked run. search: torch's
@@ -133,16 +131,16 @@ class Engine:
         x = self.emb if search else self.emb.expand(B, -1, -1)
         for i in range(tg.n_layer):
             name = lambda k: native.site_name(i, k)  # noqa: E731
-            h = norm(x, tg.norms[2 * i])
+            h = norm(x, 2 * i)
             if search and i == tg.n_layer - 1:
                 return self._last(masks, x, h, name, norm, act, B)
             q, k, v = (self._site(name(kd), h, masks[name(kd)], rec).view(B, T, H, hd).transpose(1, 2)
                        for kd in ("q_proj", "k_proj", "v_proj"))
             y = F.scaled_dot_product_attention(tg._rope(q, T).to(v.dtype), tg._rope(k, T).to(v.dtype), v, is_causal=True)
             x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, T, -1), masks[name("o_proj")], rec)
-            h = norm(x, tg.norms[2 * i + 1])
+            h = norm(x, 2 * i + 1)
             x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, masks[name("c_fc")], rec)), masks[name("down_proj")], rec)
-        return norm(x, tg.ln_f)[:, self._targets]  # the final norm over every position, as vpd_model.Target.hidden
+        return norm(x, -1)[:, self._targets]  # the final norm over every position, as vpd_model.Target.hidden
 
     def _last(self, masks, x, h, name, norm, act, B):
         """The last layer at the targets: keys and values at every position, the rest at the targets."""
@@ -155,9 +153,9 @@ class Engine:
         q = (q * tg.cos[sel] + torch.cat([-q[..., half:], q[..., :half]], dim=-1) * tg.sin[sel]).to(v.dtype)  # _rope at the targets
         y = F.scaled_dot_product_attention(q, tg._rope(k, T).to(v.dtype), v, attn_mask=self._causal_targets)
         x = x[:, sel] + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, n, -1), at(masks[name("o_proj")]))
-        h = norm(x, tg.norms[2 * tg.n_layer - 1])
+        h = norm(x, 2 * tg.n_layer - 1)
         x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, at(masks[name("c_fc")]))), at(masks[name("down_proj")]))
-        return norm(x, tg.ln_f)
+        return norm(x, -1)
 
     def kl(self, masks: dict, precision: str = "score") -> torch.Tensor:
         """KL in bits of the model at the targets from each row's masked run [B] (summed over the targets)."""
@@ -174,7 +172,7 @@ class Engine:
         rec = None if reads is None else (reads, {})
         with _precision(precision, self.dev), self._dtype(precision):
             h = self.hidden(masks, search=False, rec=rec) if precision == "score" else self._search(masks, search=True)
-        lq = torch.log_softmax(h.float() @ self.tg.wte.T, -1)  # the logits in float32 at every precision
+        lq = torch.log_softmax(self.tg.unembed(h.float()), -1)  # the logits in float32 at every precision
         return lq if rec is None else (lq, rec[1])
 
     def full(self, masks: dict) -> dict:
@@ -435,7 +433,7 @@ class Engine:
                                    None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec, keep, reuse,
                                    None if ewn is None else ewn.reshape(-1), None if own is None else own.reshape(-1), outputs, rec_out,
                                    rows)
-        lq = torch.log_softmax(h.float() @ self.tg.wte.T, -1)
+        lq = torch.log_softmax(self.tg.unembed(h.float()), -1)
         return lq if rec is None else (lq, rec[1])
 
     @staticmethod
@@ -455,15 +453,16 @@ class Engine:
         if not hasattr(self, "_xr"):
             tg, T, H, hd = self.tg, self.T, self.H, self.hd
             W = lambda i, kd: tg.site(native.site_name(i, kd)).W  # noqa: E731
+            bias = lambda o, i, kd: o if tg.site(native.site_name(i, kd)).b is None else o + tg.site(native.site_name(i, kd)).b  # noqa: E731
             causal = torch.ones(T, T, dtype=torch.bool, device=self.dev).tril()
             x = self.emb[0]
             out = {k: [] for k in ("xa", "xm", "ha", "hm", "q", "k", "v", "S", "A", "y", "pre", "g")}
             so = out["so"] = {}
             for i in range(tg.n_layer):
                 nm = lambda kd, i=i: native.site_name(i, kd)  # noqa: E731
-                h = self.rms(x, tg.norms[2 * i], self.eps)
+                h = tg.norm(x, 2 * i)
                 for kd in ("q_proj", "k_proj", "v_proj"):
-                    so[nm(kd)] = h @ W(i, kd).T
+                    so[nm(kd)] = bias(h @ W(i, kd).T, i, kd)
                 q, k, v = (so[nm(kd)].view(T, H, hd).transpose(0, 1) for kd in ("q_proj", "k_proj", "v_proj"))
                 q, k = tg._rope(q, T), tg._rope(k, T)
                 S = (q @ k.transpose(-1, -2)) / math.sqrt(hd)
@@ -471,14 +470,14 @@ class Engine:
                 y = (A @ v).transpose(0, 1).reshape(T, -1)
                 for key, val in (("xa", x), ("ha", h), ("q", q), ("k", k), ("v", v), ("S", S), ("A", A), ("y", y)):
                     out[key].append(val)
-                so[nm("o_proj")] = y @ W(i, "o_proj").T
+                so[nm("o_proj")] = bias(y @ W(i, "o_proj").T, i, "o_proj")
                 x = x + so[nm("o_proj")]
-                h2 = self.rms(x, tg.norms[2 * i + 1], self.eps)
-                pre = so[nm("c_fc")] = h2 @ W(i, "c_fc").T
-                g = self.gelu(pre)
+                h2 = tg.norm(x, 2 * i + 1)
+                pre = so[nm("c_fc")] = bias(h2 @ W(i, "c_fc").T, i, "c_fc")
+                g = tg.act(pre)
                 for key, val in (("xm", x), ("hm", h2), ("pre", pre), ("g", g)):
                     out[key].append(val)
-                so[nm("down_proj")] = g @ W(i, "down_proj").T
+                so[nm("down_proj")] = bias(g @ W(i, "down_proj").T, i, "down_proj")
                 x = x + so[nm("down_proj")]
             out["final"] = x
             self._xr = out
@@ -564,7 +563,7 @@ class Engine:
     def _pp_token(self, part: list, G: int) -> tuple:
         """The batch's changed tokens: (per row and position the change's index or -1 [D G, T], each change's embedding
         change [n, d]); rows prompt-major, graph-minor."""
-        dev, wte = self.dev, self.tg.wte
+        dev, emb = self.dev, self.tg.token_embed
         rows, pos, z, x0 = [], [], [], []
         for d, pr in enumerate(part):
             for p, zz in self._pp_changes(pr):
@@ -574,11 +573,11 @@ class Engine:
                 x0.append(self.ids[p])
         cidx = torch.full((len(part) * G, self.T), -1, dtype=torch.long, device=dev)
         if not rows:
-            return cidx, torch.zeros(0, wte.shape[1], device=dev)
+            return cidx, torch.zeros(0, self.tg.d_model, device=dev)
         n = len(rows)
         r = (torch.tensor(rows, device=dev)[:, None] * G + torch.arange(G, device=dev)).flatten()
         cidx[r, torch.tensor(pos, device=dev).repeat_interleave(G)] = torch.arange(n, device=dev).repeat_interleave(G)
-        return cidx, wte[torch.tensor(z, device=dev)] - wte[torch.tensor(x0, device=dev)]
+        return cidx, emb(torch.tensor(z, device=dev)) - emb(torch.tensor(x0, device=dev))
 
     def _pp_held(self, part: list, G: int, key) -> dict:
         """Per site the held nodes of the batch's prompts: (subcomponents, blocks), each None or (rows [n G], positions
@@ -607,7 +606,7 @@ class Engine:
         return res
 
     def _pp_predict(self, z: torch.Tensor) -> torch.Tensor:
-        return torch.log_softmax(self.rms(z, self.tg.ln_f, self.eps) @ self.tg.wte.T, -1)
+        return torch.log_softmax(self.tg.unembed(self.tg.norm(z, -1)), -1)
 
     def _pp_dense(self, graphs: list, prompts: list, cuts: list | None = None) -> torch.Tensor:
         """path_patched of complete graphs: per prompt batch one run of the stream's change from its earliest change on,
@@ -663,7 +662,7 @@ class Engine:
             for (layer, t), srcs in (cg or {}).items():
                 if srcs and t >= s0:
                     cm.setdefault(layer, torch.zeros(G, T - s0, T, dtype=torch.bool, device=dev))[gi, t - s0, sorted(srcs)] = True
-        res = torch.empty(G, len(prompts), len(self.targets), tg.wte.shape[0], device=dev)
+        res = torch.empty(G, len(prompts), len(self.targets), tg.vocab, device=dev)
         for chunk in self._pp_chunks(prompts, lambda s: G * H * (T - s) * T):
             part = [prompts[d] for d in chunk]
             lq = self._pp_dense_run(sites, cm, G, part, xr, s0)
@@ -677,7 +676,7 @@ class Engine:
         B = D * G
         cidx, dtoks = self._pp_token(part, G)
         tb, tt = (cidx[:, s:] >= 0).nonzero(as_tuple=True)  # the changed tokens (row, position from s)
-        tok = torch.zeros(B, Tn, tg.wte.shape[1], device=dev)
+        tok = torch.zeros(B, Tn, tg.d_model, device=dev)
         tok[tb, tt] = dtoks[cidx[tb, tt + s]]
         chg = torch.zeros(B, Tn, dtype=torch.bool, device=dev)  # whether a residual reader's input changed
         chg[tb, tt] = True
@@ -724,7 +723,7 @@ class Engine:
             return z.view(B, Tn, H, hd).transpose(1, 2)
         for i in range(tg.n_layer):
             nm = lambda kd, i=i: native.site_name(i, kd)  # noqa: E731
-            hP = self.rms(xr["xa"][i][s:] + dS + tok, tg.norms[2 * i], self.eps)
+            hP = tg.norm(xr["xa"][i][s:] + dS + tok, 2 * i)
             dq, dk, dv = (delta(nm(kd), hP, xr["ha"][i][s:], chg) for kd in ("q_proj", "k_proj", "v_proj"))
             q, k, v = (xr[x][i].expand(B, -1, -1, -1) for x in ("q", "k", "v"))
             q = q[:, :, s:]
@@ -754,11 +753,11 @@ class Engine:
                 dS = dS + do
                 chg |= (do != 0).any(-1)
             if nm("down_proj") in sites or nm("down_proj") in held:
-                hP = self.rms(xr["xm"][i][s:] + dS + tok, tg.norms[2 * i + 1], self.eps)
+                hP = tg.norm(xr["xm"][i][s:] + dS + tok, 2 * i + 1)
                 dp = delta(nm("c_fc"), hP, xr["hm"][i][s:], chg)
                 pre = xr["pre"][i][s:] + (0.0 if dp is None else dp)
                 rows = torch.zeros(B, Tn, dtype=torch.bool, device=dev) if dp is None else (dp != 0).any(-1)
-                dd = delta(nm("down_proj"), self.gelu(pre.expand(B, -1, -1)), xr["g"][i][s:], rows)
+                dd = delta(nm("down_proj"), tg.act(pre.expand(B, -1, -1)), xr["g"][i][s:], rows)
                 dS = dS + dd
                 chg |= (dd != 0).any(-1)
         z = xr["final"][self._targets].expand(B, -1, -1).clone()
@@ -863,7 +862,7 @@ class Engine:
         names = sorted(by)
         slot = [0] * N
         sites, ax = {}, torch.zeros(N, device=dev)
-        Ures = torch.zeros(N, tg.wte.shape[1], device=dev)  # residual writers' write vectors (zero at blocks)
+        Ures = torch.zeros(N, tg.d_model, device=dev)  # residual writers' write vectors (zero at blocks)
         half = hd // 2
 
         def rot(u, t):  # [R, H, hd] rotated at positions t [R]
@@ -936,7 +935,7 @@ class Engine:
         J = max([len(r[0]) for r in un["reads"].values()], default=0)
         per = max(un["N"] + un["on"].shape[1], J * H * T, max((len(st["i"]) * st["Vt"].shape[1] for st in un["sites"].values()), default=1))
         step = max(1, PP_ENTRIES // per)
-        res = torch.empty(G, len(prompts), len(self.targets), self.tg.wte.shape[0], device=self.dev)
+        res = torch.empty(G, len(prompts), len(self.targets), self.tg.vocab, device=self.dev)
         for g0 in range(0, G, step):
             u = un if step >= G else dict(un, G=min(step, G - g0), member=un["member"][g0:g0 + step], on=un["on"][g0:g0 + step],
                                           reads={L: (ts, ent[g0:g0 + step], rows) for L, (ts, ent, rows) in un["reads"].items()})
@@ -1053,7 +1052,7 @@ class Engine:
                 keep = rr >= 0
                 Dm.index_add_(0, rr[keep], dtoks[ci[tb[keep], tk[keep]]])
             z = xin[st["t"][ri]] + Dm
-            finish(n, st, bi, ri, self.rms(z, norm, self.eps) if norm is not None else self.gelu(z))
+            finish(n, st, bi, ri, self.tg.norm(z, norm) if norm is not None else self.tg.act(z))
 
         def qk_changes(n):  # a query or key site's blocks' changes rotated [B, blocks, H, hd] (None: no block changed)
             st = sites.get(n)
@@ -1190,11 +1189,11 @@ class Engine:
 
         for i in range(tg.n_layer):
             for kd in ("q_proj", "k_proj", "v_proj"):
-                read(native.site_name(i, kd), xr["xa"][i], tg.norms[2 * i])
+                read(native.site_name(i, kd), xr["xa"][i], 2 * i)
                 hold(native.site_name(i, kd))
             attend(i)
             hold(native.site_name(i, "o_proj"))
-            read(native.site_name(i, "c_fc"), xr["xm"][i], tg.norms[2 * i + 1])
+            read(native.site_name(i, "c_fc"), xr["xm"][i], 2 * i + 1)
             hold(native.site_name(i, "c_fc"))
             read(native.site_name(i, "down_proj"), xr["pre"][i], None)
             hold(native.site_name(i, "down_proj"))
@@ -1432,16 +1431,16 @@ class Engine:
         def read(n, A, inp):  # reader nodes' activations, from their inputs [readers, d_in], into A
             return A.index_put(R[n], ((inp * self.V[n].index_select(1, R[n][2]).T).sum(-1)).to(A.dtype))
 
-        def resid_in(n, x, w):  # residual readers' inputs: their position's stream with their parents' extra shares
+        def resid_in(n, x, j):  # residual readers' inputs: their position's stream with their parents' extra shares (norm j)
             b, t, _ = R[n]
             if ewn is None:
-                return norm(x[b, t] + topup(n, x.shape[-1]), w)
+                return norm(x[b, t] + topup(n, x.shape[-1]), j)
             num, den = x[b, t] + topup(n, x.shape[-1]), x[b, t] + topup(n, x.shape[-1], ewn).float()  # the read; the norm's scale
-            return w * (num.float() * torch.rsqrt(den.pow(2).mean(-1, keepdim=True) + self.eps)).to(num.dtype)
+            return tg.norm_parts(num, den, j)
 
         if lo:  # the tokens from lo on: every row's [T], or each row's [B, T]
             tok = (reuse[1] if torch.is_tensor(reuse[1]) else torch.tensor(reuse[1])).to(self.dev)
-            x = tg.wte[tok[lo:]][None].expand(B, -1, -1) if tok.dim() == 1 else tg.wte[tok[:, lo:]]
+            x = tg.embed(tok[lo:], lo)[None].expand(B, -1, -1) if tok.dim() == 1 else tg.embed(tok[:, lo:], lo)
             causal = torch.arange(T, device=self.dev)[None, :] <= torch.arange(lo, T, device=self.dev)[:, None]  # [T - lo, T]
         else:
             x = self.emb.expand(B, -1, -1)
@@ -1451,7 +1450,7 @@ class Engine:
                 R, Wr, Eg, outs, S = self._last_tables(p)
                 sel = self._targets
                 off, cons, cout = self._resid_tables(p, "_resid_last", Wr, Eg, outs)
-            n1, n2 = tg.norms[2 * i], tg.norms[2 * i + 1]
+            n1, n2 = 2 * i, 2 * i + 1
             h = norm(x, n1)
             A = {}
             for kd in ("q_proj", "k_proj", "v_proj"):
@@ -1465,6 +1464,7 @@ class Engine:
                 _, U, Rw = self._w(n)
                 o = (A[kd] * scale.to(A[kd].dtype)) @ U
                 o = o + self._mm(z, Rw) if self.fixed else o
+                o = o if self.b[n] is None else o + self.b[n]
                 if outputs is not None and n in outputs:  # the site's whole output replaced at those positions
                     m, val = outputs[n]
                     o = torch.where(m[..., None], val.to(o.dtype), o)
@@ -1561,11 +1561,11 @@ class Engine:
             b, ti, gi, j, fx, uc = cout
             num = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)
             den = z.index_put((b, ti), resid_share(gi, j, fx, own)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True).float()
-            return tg.ln_f * (num.float() * torch.rsqrt(den.pow(2).mean(-1, keepdim=True) + self.eps)).to(num.dtype)
+            return tg.norm_parts(num, den, -1)
         if cout is not None:  # the connections into the prediction, every writer site's at once
             b, ti, gi, j, fx, uc = cout
             z = z.index_put((b, ti), resid_share(gi, j, fx, ow)[:, None] * self._Ures[0].index_select(0, uc), accumulate=True)
-        return norm(z, tg.ln_f)
+        return norm(z, -1)
 
 
 def _pair_cut(key) -> bool:

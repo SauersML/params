@@ -54,6 +54,7 @@ class Site(nn.Module):
         self.cache_input = False
         self.cache_output = False
         self.in_fn = None  # optional input transform (pruning baselines ablate neurons / heads here)
+        self.register_buffer("b", None)  # the bias added to the output (TLTarget's; vpd4l's matrices have none)
 
     def forward(self, x: Tensor) -> Tensor:
         if self.in_fn is not None:
@@ -61,6 +62,8 @@ class Site(nn.Module):
         if self.cache_input:
             self.last_input = x.detach()
         out = self._forward(x)
+        if self.b is not None:
+            out = out + self.b
         if self.cache_output:
             self.last_output = out.detach()
         return out
@@ -117,6 +120,57 @@ class Target(nn.Module):
     def site(self, name: str) -> Site:
         return self.sites[name.replace(".", "-")]  # type: ignore[return-value]
 
+    # The architecture as the oracle code uses it (native, engine, goal_eval, teacher): the embedding, the norms, the
+    # MLP's activation and the unembedding. vpd4l's are its own operations (bit for bit what the callers computed before);
+    # TLTarget (a TransformerLens model: no norm or LayerNorm, learned positions, biases, untied unembedding) has its own.
+    norm_kind = "rms"
+    lm = True  # a language model: a changed text's token is drawn from its own prediction there (native.replacement_logp)
+
+    @property
+    def vocab(self) -> int:
+        """The logits' size."""
+        return self.wte.shape[0]
+
+    @property
+    def n_tokens(self) -> int:
+        """The input vocabulary's size (vpd4l: the logits' too)."""
+        return self.wte.shape[0]
+
+    @property
+    def d_model(self) -> int:
+        return self.wte.shape[1]
+
+    def embed(self, ids: Tensor, start: int = 0) -> Tensor:
+        """The residual stream entering layer 0 for tokens ids [..., T] standing at positions start.. ."""
+        return self.wte[ids]
+
+    def token_embed(self, ids: Tensor) -> Tensor:
+        """The tokens' own embeddings, without positions (a changed token's embedding change is a difference of these)."""
+        return self.wte[ids]
+
+    def norm_weight(self, j: int) -> Tensor:
+        """The norm j's scale: 2 i before layer i's attention, 2 i + 1 before its MLP, 2 n_layer (or -1) the final one."""
+        return self.ln_f if j in (-1, 2 * self.n_layer) else self.norms[j]
+
+    def norm(self, x: Tensor, j: int, fused: bool = False) -> Tensor:
+        """Norm j of x (norm_weight's numbering); fused: torch's single kernel (equal within float32 rounding)."""
+        w = self.norm_weight(j)
+        return F.rms_norm(x, (x.shape[-1],), w, self.eps) if fused else rms(x, w, self.eps)
+
+    def norm_parts(self, read: Tensor, scale: Tensor, j: int) -> Tensor:
+        """Norm j applied to the vector read with the statistics of the vector scale (a cut's partial input: read is a
+        share of scale); vpd4l: w * read / rms(scale)."""
+        w = self.norm_weight(j)
+        return w * (read.float() * torch.rsqrt(scale.float().pow(2).mean(-1, keepdim=True) + self.eps)).to(read.dtype)
+
+    def act(self, x: Tensor, fused: bool = False) -> Tensor:
+        """The MLP's activation (vpd4l: GELU with the tanh approximation)."""
+        return F.gelu(x, approximate="tanh") if fused else gelu_tanh(x)
+
+    def unembed(self, h: Tensor) -> Tensor:
+        """Logits from the final normed residual stream (vpd4l: the tied embedding)."""
+        return h @ self.wte.T
+
     def _rope(self, x: Tensor, T: int) -> Tensor:
         n = self.hd // 2
         rot = torch.cat([-x[..., n:], x[..., :n]], dim=-1)
@@ -132,7 +186,7 @@ class Target(nn.Module):
         return z.masked_fill(~causal, float("-inf")).softmax(-1)
 
     def forward(self, ids: Tensor) -> Tensor:
-        return self.hidden(ids) @ self.wte.T
+        return self.unembed(self.hidden(ids))
 
     def hidden(self, ids: Tensor, start: int = 0, prefix: list | None = None, layer: int = 0, fused: bool = False) -> Tensor:
         """The final normed residual stream [B, T, d]; the logits are it times the tied embedding. With start > 0 and
@@ -145,10 +199,10 @@ class Target(nn.Module):
         B, T = ids.shape
         L = T - start
         norm, act = self._steps(fused)
-        x = self.wte[ids[:, start:]] if layer == 0 else prefix[layer][3][:, start:]
+        x = self.embed(ids[:, start:], start) if layer == 0 else prefix[layer][3][:, start:]
         for i in range(layer, self.n_layer):
             s = lambda k: self.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
-            h = norm(x, self.norms[2 * i])
+            h = norm(x, 2 * i)
             q = s("q_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
             k = s("k_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
             v = s("v_proj")(h).view(B, L, self.n_head, self.hd).transpose(1, 2)
@@ -160,16 +214,15 @@ class Target(nn.Module):
                 q, k = self._rope(q, T), self._rope(k, T)
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             x = x + s("o_proj")(y.transpose(1, 2).reshape(B, L, -1))
-            h = norm(x, self.norms[2 * i + 1])
+            h = norm(x, 2 * i + 1)
             x = x + s("down_proj")(act(s("c_fc")(h)))
-        return norm(x, self.ln_f)
+        return norm(x, 2 * self.n_layer)
 
     def _steps(self, fused: bool):
-        """(norm(x, w), GELU(x)): vpd_model's own rms and gelu_tanh, or torch's fused RMS norm and tanh GELU (the same
-        functions in one kernel each: on MPS the GELU of a [32, 395, 3072] batch takes 3 ms instead of 55)."""
-        if fused:
-            return (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, self.eps)), (lambda x: F.gelu(x, approximate="tanh"))
-        return (lambda x, w: rms(x, w, self.eps)), gelu_tanh
+        """(norm(x, j), activation(x)) as norm and act with fused: vpd_model's own rms and gelu_tanh, or torch's fused RMS
+        norm and tanh GELU (the same functions in one kernel each: on MPS the GELU of a [32, 395, 3072] batch takes 3 ms
+        instead of 55)."""
+        return (lambda x, j: self.norm(x, j, fused)), (lambda x: self.act(x, fused))
 
     def _rope_from(self, x: Tensor, start: int, T: int) -> Tensor:
         """_rope of positions start..T-1."""
@@ -182,11 +235,11 @@ class Target(nn.Module):
         on sequences [B, T] (hidden()'s prefix; fused as there)."""
         B, T = ids.shape
         norm, act = self._steps(fused)
-        x = self.wte[ids]
+        x = self.embed(ids)
         out = []
         for i in range(self.n_layer):
             s = lambda k: self.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
-            h = norm(x, self.norms[2 * i])
+            h = norm(x, 2 * i)
             q = s("q_proj")(h).view(B, T, self.n_head, self.hd).transpose(1, 2)
             k = s("k_proj")(h).view(B, T, self.n_head, self.hd).transpose(1, 2)
             v = s("v_proj")(h).view(B, T, self.n_head, self.hd).transpose(1, 2)
@@ -194,9 +247,145 @@ class Target(nn.Module):
             out.append((q, k, v, x))
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             x = x + s("o_proj")(y.transpose(1, 2).reshape(B, T, -1))
-            h = norm(x, self.norms[2 * i + 1])
+            h = norm(x, 2 * i + 1)
             x = x + s("down_proj")(act(s("c_fc")(h)))
         return out
+
+
+class TLTarget(Target):
+    """A TransformerLens HookedTransformer as a Target (InterpBench's models, MIB's GPT-2): its sites the same six
+    matrices per layer, with biases (Site.b); no norm, LayerNorm or RMSNorm (normalization_type None, "LN" or "RMS");
+    learned position embeddings; an untied unembedding with its bias; GELU exact ("gelu"), tanh ("gelu_new") or ReLU.
+    LNPre (LayerNorm with its scale and offset folded into the next matrices) is LayerNorm at scale 1 and offset 0. A model
+    whose outputs are its inputs' vocabulary (InterpBench's IOI, GPT-2) is a language model (lm).
+    Rotary is off: cos 1 and sin 0, so _rope and every caller's inlined rotation leave queries and keys as they are.
+    vpd4l's attributes that would mean something else here (wte, ln_f, norms, eps) raise, so a caller still reading
+    them fails instead of computing with the wrong architecture.
+
+    sd: the HookedTransformer's state dict; cfg: its config's fields (n_layers, n_heads, d_model, d_head, n_ctx,
+    d_vocab, act_fn, normalization_type, eps)."""
+
+    lm = False  # InterpBench's Tracr models label positions: a changed token is drawn uniformly from the input vocabulary
+
+    def __init__(self, sd: dict[str, Tensor], cfg: dict):
+        nn.Module.__init__(self)
+        if cfg.get("attention_dir", "causal") != "causal":
+            raise ValueError("TLTarget runs causal attention (the oracle's runs are causal throughout)")
+        L, H, d, hd = cfg["n_layers"], cfg["n_heads"], cfg["d_model"], cfg["d_head"]
+        self.cfg = {"n_layer": L, "n_head": H, "n_embd": d, "d_head": hd, "n_ctx": cfg["n_ctx"], "tl": dict(cfg)}
+        self.n_layer, self.n_head, self.hd = L, H, hd
+        self.norm_kind = {None: "none", "LN": "ln", "LNPre": "ln", "RMS": "tl_rms"}[cfg.get("normalization_type")]   # (not vpd4l's "rms")
+        self.lm = cfg.get("d_vocab_out", cfg["d_vocab"]) == cfg["d_vocab"]   # its outputs are its own inputs' vocabulary
+        self.tl_eps = float(cfg.get("eps", 1e-5))
+        self.act_fn = cfg.get("act_fn", "gelu")
+        f = lambda k: sd[k].float()  # noqa: E731
+        self.register_buffer("W_E", f("embed.W_E"))
+        self.register_buffer("W_pos", f("pos_embed.W_pos"))
+        self.register_buffer("W_U", f("unembed.W_U"))
+        self.register_buffer("b_U", f("unembed.b_U") if "unembed.b_U" in sd else torch.zeros(sd["unembed.W_U"].shape[1]))
+        self.sites = nn.ModuleDict()
+        for i in range(L):
+            pre = f"blocks.{i}."
+            mats = {"q_proj": (f(pre + "attn.W_Q").permute(0, 2, 1).reshape(H * hd, d), pre + "attn.b_Q"),
+                    "k_proj": (f(pre + "attn.W_K").permute(0, 2, 1).reshape(H * hd, d), pre + "attn.b_K"),
+                    "v_proj": (f(pre + "attn.W_V").permute(0, 2, 1).reshape(H * hd, d), pre + "attn.b_V"),
+                    "o_proj": (f(pre + "attn.W_O").reshape(H * hd, d).T.contiguous(), pre + "attn.b_O"),
+                    "c_fc": (f(pre + "mlp.W_in").T.contiguous(), pre + "mlp.b_in"),
+                    "down_proj": (f(pre + "mlp.W_out").T.contiguous(), pre + "mlp.b_out")}
+            for kind, (W, bk) in mats.items():
+                st = Site(W.contiguous())
+                if bk in sd:
+                    st.b = f(bk).reshape(-1).contiguous()
+                self.sites[f"h-{i}-{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}-{kind}"] = st
+        self.ln = nn.ParameterList()   # LayerNorm (or RMS) scales and offsets: 2 i, 2 i + 1, then the final one
+        self.ln_b = nn.ParameterList()
+        if self.norm_kind in ("ln", "tl_rms"):
+            for i in range(L):
+                for k in ("ln1", "ln2"):
+                    self.ln.append(nn.Parameter(f(f"blocks.{i}.{k}.w") if f"blocks.{i}.{k}.w" in sd else torch.ones(d), requires_grad=False))
+                    self.ln_b.append(nn.Parameter(f(f"blocks.{i}.{k}.b") if f"blocks.{i}.{k}.b" in sd else torch.zeros(d), requires_grad=False))
+            self.ln.append(nn.Parameter(f("ln_final.w") if "ln_final.w" in sd else torch.ones(d), requires_grad=False))
+            self.ln_b.append(nn.Parameter(f("ln_final.b") if "ln_final.b" in sd else torch.zeros(d), requires_grad=False))
+        self.register_buffer("cos", torch.ones(cfg["n_ctx"], hd))
+        self.register_buffer("sin", torch.zeros(cfg["n_ctx"], hd))
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def __getattr__(self, name: str):
+        if name in ("wte", "ln_f", "norms", "eps"):
+            raise AttributeError(f"TLTarget has no {name}: use embed, norm, norm_parts, act, unembed (vpd_model.Target)")
+        return super().__getattr__(name)
+
+    @property
+    def vocab(self) -> int:
+        return self.W_U.shape[1]
+
+    @property
+    def n_tokens(self) -> int:
+        return self.W_E.shape[0]
+
+    @property
+    def d_model(self) -> int:
+        return self.W_E.shape[1]
+
+    def embed(self, ids: Tensor, start: int = 0) -> Tensor:
+        return self.W_E[ids] + self.W_pos[start:start + ids.shape[-1]]
+
+    def token_embed(self, ids: Tensor) -> Tensor:
+        return self.W_E[ids]
+
+    def norm_weight(self, j: int) -> Tensor:
+        if self.norm_kind == "none":
+            raise AttributeError("TLTarget without normalization has no norm scales")
+        return self.ln[2 * self.n_layer if j == -1 else j]
+
+    def norm(self, x: Tensor, j: int, fused: bool = False) -> Tensor:
+        if self.norm_kind == "none":
+            return x
+        j = 2 * self.n_layer if j == -1 else j
+        if self.norm_kind == "tl_rms":
+            return rms(x, self.ln[j], self.tl_eps)
+        return F.layer_norm(x, (x.shape[-1],), self.ln[j], self.ln_b[j], self.tl_eps)
+
+    def norm_parts(self, read: Tensor, scale: Tensor, j: int) -> Tensor:
+        """No norm: read itself. LayerNorm: w (read - mean(read)) / std(scale), the offset b left to the remainder (a
+        share of the input carries none of it); RMS: w read / rms(scale)."""
+        if self.norm_kind == "none":
+            return read
+        j = 2 * self.n_layer if j == -1 else j
+        sf = scale.float()
+        if self.norm_kind == "tl_rms":
+            return self.ln[j] * (read.float() * torch.rsqrt(sf.pow(2).mean(-1, keepdim=True) + self.tl_eps)).to(read.dtype)
+        rf = read.float()
+        var = (sf - sf.mean(-1, keepdim=True)).pow(2).mean(-1, keepdim=True)
+        return self.ln[j] * ((rf - rf.mean(-1, keepdim=True)) * torch.rsqrt(var + self.tl_eps)).to(read.dtype)
+
+    def norm_stat(self, x: Tensor) -> Tensor:
+        """The norm's scale statistic of x (a frozen norm keeps it): 1 / std(x) (LayerNorm), 1 / rms(x), 1 (no norm)."""
+        xf = x.float()
+        if self.norm_kind == "none":
+            return torch.ones(*x.shape[:-1], 1, device=x.device)
+        if self.norm_kind == "tl_rms":
+            return torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.tl_eps)
+        return torch.rsqrt((xf - xf.mean(-1, keepdim=True)).pow(2).mean(-1, keepdim=True) + self.tl_eps)
+
+    def norm_with(self, x: Tensor, sc: Tensor, j: int) -> Tensor:
+        """Norm j of x at the scale statistic sc (norm_stat's): LayerNorm w (x - mean(x)) sc + b; RMS w x sc; none x."""
+        if self.norm_kind == "none":
+            return x
+        j = 2 * self.n_layer if j == -1 else j
+        xf = x.float()
+        if self.norm_kind == "tl_rms":
+            return self.ln[j] * (xf * sc).to(x.dtype)
+        return self.ln[j] * ((xf - xf.mean(-1, keepdim=True)) * sc).to(x.dtype) + self.ln_b[j]
+
+    def act(self, x: Tensor, fused: bool = False) -> Tensor:
+        if self.act_fn == "relu":
+            return F.relu(x)
+        return F.gelu(x, approximate="tanh" if self.act_fn in ("gelu_new", "gelu_pytorch_tanh") else "none")
+
+    def unembed(self, h: Tensor) -> Tensor:
+        return h @ self.W_U + self.b_U
 
 
 def load_target(device: str = "mps") -> Target:

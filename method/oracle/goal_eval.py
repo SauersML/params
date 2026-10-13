@@ -662,6 +662,28 @@ def _rms_parts(read: torch.Tensor, scale: torch.Tensor, w: torch.Tensor, eps: fl
     return w * read * torch.rsqrt(scale.float().pow(2).mean(-1, keepdim=True) + eps).to(read.dtype)
 
 
+def _parts(tg, read: torch.Tensor, scale: torch.Tensor, j: int) -> torch.Tensor:
+    """Norm j (vpd_model.Target.norm's numbering) of the vector read at the vector scale's statistics: vpd4l's in
+    _rms_parts' order, another Target's (vpd_model.TLTarget) by its norm_parts."""
+    if tg.norm_kind == "rms":
+        return _rms_parts(read, scale, tg.norm_weight(j), tg.eps)
+    return tg.norm_parts(read, scale, j)
+
+
+def _norm_stat(tg, x: torch.Tensor) -> torch.Tensor:
+    """Norm's scale statistic of x (graph_ref's recorded or frozen scale): vpd4l's 1 / rms(x); a TLTarget's its own."""
+    if tg.norm_kind == "rms":
+        return torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + tg.eps)
+    return tg.norm_stat(x)
+
+
+def _norm_with(tg, x: torch.Tensor, sc: torch.Tensor, j: int) -> torch.Tensor:
+    """Norm j of x at the scale statistic sc (_norm_stat's): vpd4l's w * x * sc."""
+    if tg.norm_kind == "rms":
+        return tg.norm_weight(j) * (x.float() * sc).to(x.dtype)
+    return tg.norm_with(x, sc, j)
+
+
 def _harmonic(terms: list) -> float | None:
     """C's combination: the harmonic mean k / sum(1 / s), 0 when a term is 0 (None for no terms)."""
     if not terms:
@@ -979,7 +1001,7 @@ class GoalEval:
                 hidden = tg.hidden(torch.tensor([ids], device=nat.dev).expand(B, -1))
             finally:
                 nat.vpd.clear()
-            out.append(torch.log_softmax((hidden[:, targets] @ tg.wte.T).float(), -1))
+            out.append(torch.log_softmax(tg.unembed(hidden[:, targets]).float(), -1))
         return torch.cat(out)
 
     @torch.no_grad()
@@ -990,7 +1012,7 @@ class GoalEval:
         actives overshoot and the inactives cancel them, which caps the real model's necessity of any part of the
         answer). The embedding, both sums and the remainders add up to the stream."""
         nat, tg, t = self.nat, self.nat.target, tx.targets[-1]
-        act = torch.zeros(tg.wte.shape[1], device=nat.dev)
+        act = torch.zeros(tg.d_model, device=nat.dev)
         ina = torch.zeros_like(act)
         for n in nat.names:
             if n.endswith(("o_proj", "down_proj")):
@@ -1097,31 +1119,32 @@ class GoalEval:
                     A[:, t, c] = v
             a[n] = A
             out = (A * on[n]) @ tg.site(n).U
+            b = tg.site(n).b  # a bias, always on (vpd4l's matrices have none)
             if hold:
-                return out + rest[n]
-            if not live:
-                return out
-            r_ = inp @ tg.site(n).delta_T
-            if rest is not None:
-                rest[n] = r_.detach()
-            return out + r_
+                out = out + rest[n]
+            elif live:
+                r_ = inp @ tg.site(n).delta_T
+                if rest is not None:
+                    rest[n] = r_.detach()
+                out = out + r_
+            return out if b is None else out + b
 
-        def norm(xx, w, key, pos=None):  # vpd_model.rms, its scale recorded into norms or taken from it (freeze)
+        def norm(xx, j, key, pos=None):  # norm j, its scale recorded into norms or taken from it (freeze)
             frozen = norms is not None and freeze and (freeze == "all" or key != "final")
             if frozen:
                 sc = norms[key] if pos is None else norms[key][:, pos]
             else:
-                sc = torch.rsqrt(xx.float().pow(2).mean(-1, keepdim=True) + tg.eps)
+                sc = _norm_stat(tg, xx)
                 if norms is not None and pos is None:
                     norms[key] = sc.detach()
-            return w * (xx.float() * sc).to(xx.dtype)
+            return _norm_with(tg, xx, sc, j)
 
-        x = tg.wte[torch.tensor(ids, device=dev)][None].expand(B, -1, -1)
+        x = tg.embed(torch.tensor(ids, device=dev))[None].expand(B, -1, -1)
         causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
         for i in range(tg.n_layer):
             nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
-            z = norm(x, tg.norms[2 * i], ("attn", i))
-            resid = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i], ("attn", i), r[1])  # noqa: E731
+            z = norm(x, 2 * i, ("attn", i))
+            resid = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), 2 * i, ("attn", i), r[1])  # noqa: E731
             q, k, v = (site(nm[kk], z, resid).view(B, T, H, hd).transpose(1, 2) for kk in ("q_proj", "k_proj", "v_proj"))
             if hm is not None:
                 mh = hm[:, i].transpose(1, 2)[..., None]  # [B, H, T, 1]
@@ -1158,16 +1181,16 @@ class GoalEval:
             share = lambda r, ws, att=att, P=P: att[:, r[1]] - sum(  # noqa: E731
                 P[:, :, r[1], w[1]].repeat_interleave(hd, dim=1) * write(w) for w in ws)
             x = x + site(nm["o_proj"], att, share)
-            z2 = norm(x, tg.norms[2 * i + 1], ("mlp", i))
-            resid2 = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), tg.norms[2 * i + 1], ("mlp", i), r[1])  # noqa: E731
+            z2 = norm(x, 2 * i + 1, ("mlp", i))
+            resid2 = lambda r, ws, x=x, i=i: norm(x[:, r[1]] - sum(write(w) for w in ws), 2 * i + 1, ("mlp", i), r[1])  # noqa: E731
             pre = site(nm["c_fc"], z2, resid2)
-            gl = vpd_model.gelu_tanh(pre)
+            gl = tg.act(pre)
             if nmk is not None:
                 gl = torch.where(nmk[:, i], nv[:, i] if nv is not None else gl.new_zeros(()), gl)
             if cap is not None:
                 cap["neuron"].append(gl)
             x = x + site(nm["down_proj"], gl,
-                         lambda r, ws, pre=pre: vpd_model.gelu_tanh(pre[:, r[1]] - sum(write(w) for w in ws)))
+                         lambda r, ws, pre=pre: tg.act(pre[:, r[1]] - sum(write(w) for w in ws)))
         xt = x[:, targets]
         if cut_out:
             xt = xt.clone()
@@ -1180,7 +1203,7 @@ class GoalEval:
                 record[nd] = a[nd[0]][:, nd[1], nd[2]].detach()
         if cap is not None:
             capture.update({kk: torch.stack(v, 1).detach() for kk, v in cap.items()})
-        return torch.log_softmax((norm(xt, tg.ln_f, "final") @ tg.wte.T).float(), -1)
+        return torch.log_softmax(tg.unembed(norm(xt, -1, "final")).float(), -1)
 
 
     LOO_HELD = ("nodes", "edges", "flips", "patching_near", "patching_far")  # line_loo's families held at the answer's values
@@ -1472,14 +1495,15 @@ class GoalEval:
         def site(n, inp):
             A, rem = inp @ tg.site(n).V, inp @ tg.site(n).delta_T
             b["a"][n], b["rem"][n] = A, rem
-            return A @ tg.site(n).U + rem
+            out = A @ tg.site(n).U + rem
+            return out if tg.site(n).b is None else out + tg.site(n).b  # a bias, always on (vpd4l: none)
 
-        x = tg.wte[torch.tensor(ids, device=nat.dev)].float()
+        x = tg.embed(torch.tensor(ids, device=nat.dev)).float()
         causal = torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril()
         for i in range(tg.n_layer):
             nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
             b["Xa"].append(x)
-            z = vpd_model.rms(x, tg.norms[2 * i], tg.eps)
+            z = tg.norm(x, 2 * i)
             q, k, v = (site(nm[kk], z) for kk in ("q_proj", "k_proj", "v_proj"))
             qr, kr = (tg._rope(m.view(1, T, H, hd).transpose(1, 2), T)[0] for m in (q, k))
             S = (qr @ kr.transpose(-1, -2)) / math.sqrt(hd)
@@ -1491,9 +1515,9 @@ class GoalEval:
             att = (P @ v.view(T, H, hd).transpose(0, 1)).transpose(0, 1).reshape(T, -1)
             x = x + site(nm["o_proj"], att)
             b["Xm"].append(x)
-            pre = site(nm["c_fc"], vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps))
+            pre = site(nm["c_fc"], tg.norm(x, 2 * i + 1))
             b["pre"].append(pre)
-            x = x + site(nm["down_proj"], vpd_model.gelu_tanh(pre))
+            x = x + site(nm["down_proj"], tg.act(pre))
         b["Xf"] = x
         return b
 
@@ -1525,7 +1549,8 @@ class GoalEval:
         tg, T, dev = self.nat.target, tx.T, self.nat.dev
         H, hd = tg.n_head, tg.hd
         b = self._pp_base(tx)
-        demb = {t: (tg.wte[x2[t]] - tg.wte[tx.ids[t]]).float() for t in range(T) if x2[t] != tx.ids[t]}
+        demb = {t: (tg.token_embed(torch.tensor(x2[t], device=dev)) - tg.token_embed(torch.tensor(tx.ids[t], device=dev))).float()
+                for t in range(T) if x2[t] != tx.ids[t]}
         causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
         if graph.complete:
             if graph.masks is not None:
@@ -1562,16 +1587,18 @@ class GoalEval:
                         A[t, c] = val
                 rem = torch.where(Mb[n], inp @ tg.site(n).delta_T, b["rem"][n]) if n in Mb else b["rem"][n]
                 out = A @ tg.site(n).U + rem
+                if tg.site(n).b is not None:  # a bias, always on (vpd4l: none)
+                    out = out + tg.site(n).b
                 if n in held_out:
                     out = out.clone()
                     for t, _, val in held_out[n]:
                         out[t] = val
                 return out
 
-            x = tg.wte[torch.tensor(x2, device=dev)].float()
+            x = tg.embed(torch.tensor(x2, device=dev)).float()
             for i in range(tg.n_layer):
                 nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
-                z = vpd_model.rms(x, tg.norms[2 * i], tg.eps)
+                z = tg.norm(x, 2 * i)
                 q, k, v = (site(nm[kk], z) for kk in ("q_proj", "k_proj", "v_proj"))
                 qr, kr = (tg._rope(m.view(1, T, H, hd).transpose(1, 2), T)[0] for m in (q, k))
                 P = ((qr @ kr.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
@@ -1583,8 +1610,8 @@ class GoalEval:
                         att = att.clone()
                         att[t] = att[t] + (P[:, t, s_][:, :, None] * dv.transpose(0, 1)).sum(1).reshape(-1)
                 x = x + site(nm["o_proj"], att)
-                x = x + site(nm["down_proj"], vpd_model.gelu_tanh(site(nm["c_fc"], vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps))))
-            return torch.log_softmax(vpd_model.rms(x[tx.targets], tg.ln_f, tg.eps) @ tg.wte.T.float(), -1)[None]
+                x = x + site(nm["down_proj"], tg.act(site(nm["c_fc"], tg.norm(x, 2 * i + 1))))
+            return torch.log_softmax(tg.unembed(tg.norm(x[tx.targets], -1)), -1)[None]
         order = {k: j for j, k in enumerate(vpd_model.KINDS)}
         nodes = sorted(graph.node_set(), key=lambda nd: (native._name_layer_kind(nd[0])[0],
                                                           order[native._name_layer_kind(nd[0])[1]], nd[1], nd[2]))
@@ -1598,12 +1625,16 @@ class GoalEval:
         aP = {}  # each circuit node's patched value: a subcomponent's activation, a block's whole output
         held = dict(fixed or {})
 
-        def full(n, z):  # a site's whole linear map (every subcomponent and the remainder)
-            return (z @ tg.site(n).V) @ tg.site(n).U + z @ tg.site(n).delta_T
+        def full(n, z):  # a site's whole map (every subcomponent, the remainder and any bias)
+            out = (z @ tg.site(n).V) @ tg.site(n).U + z @ tg.site(n).delta_T
+            return out if tg.site(n).b is None else out + tg.site(n).b
 
         def x_out(w):  # a circuit writer's output on the text
             n, t, c = w
-            return b["a"][n][t] @ tg.site(n).U + b["rem"][n][t] if c == BLOCK else b["a"][n][t, c] * tg.site(n).U[c]
+            if c != BLOCK:
+                return b["a"][n][t, c] * tg.site(n).U[c]
+            out = b["a"][n][t] @ tg.site(n).U + b["rem"][n][t]
+            return out if tg.site(n).b is None else out + tg.site(n).b
 
         def delta(w):  # a circuit writer's output change, out^P - out^x, in its site's output space
             n, t, c = w
@@ -1612,14 +1643,14 @@ class GoalEval:
         def apply(r, z):  # a node's patched value from its patched input z
             return full(r[0], z) if r[2] == BLOCK else z @ tg.site(r[0]).V[:, r[2]]
 
-        def resid(r, X, wn):  # a residual reader's patched value
+        def resid(r, X, j):  # a residual reader's patched value (norm j)
             inp = X[r[1]].clone()
             for w in par.get(r, []):
                 if w in aP:
                     inp = inp + delta(w)
             if r in tok:
                 inp = inp + tok[r]
-            return apply(r, vpd_model.rms(inp, wn, tg.eps))
+            return apply(r, tg.norm(inp, j))
 
         def rot(vec, p):  # a query or key vector [H hd] rotated at position p -> [H, hd]
             v = vec.view(H, hd)
@@ -1640,7 +1671,7 @@ class GoalEval:
             kind = {nd: native._name_layer_kind(nd[0])[1] for nd in here}
             for r in here:
                 if kind[r] in ("q_proj", "k_proj", "v_proj"):
-                    aP[r] = held[r] if r in held else resid(r, b["Xa"][i], tg.norms[2 * i])
+                    aP[r] = held[r] if r in held else resid(r, b["Xa"][i], 2 * i)
             qs = [nd for nd in here if kind[nd] == "q_proj"]
             ks = [nd for nd in here if kind[nd] == "k_proj"]
             rows = {}
@@ -1682,14 +1713,14 @@ class GoalEval:
                     aP[r] = held[r] if r in held else apply(r, att)
             for r in here:
                 if kind[r] == "c_fc":
-                    aP[r] = held[r] if r in held else resid(r, b["Xm"][i], tg.norms[2 * i + 1])
+                    aP[r] = held[r] if r in held else resid(r, b["Xm"][i], 2 * i + 1)
             for r in here:
                 if kind[r] == "down_proj":
                     pre = b["pre"][i][r[1]].clone()
                     for w in par.get(r, []):
                         if w in aP and kind.get(w) == "c_fc":
                             pre = pre + delta(w)
-                    aP[r] = held[r] if r in held else apply(r, vpd_model.gelu_tanh(pre))
+                    aP[r] = held[r] if r in held else apply(r, tg.act(pre))
         f = b["Xf"][tx.targets].clone()
         for j, t in enumerate(tx.targets):
             for w in graph.out:
@@ -1697,7 +1728,7 @@ class GoalEval:
                     f[j] = f[j] + delta(w)
             if t in demb and t in getattr(graph, "tok_out", []):  # the token's embedding into the prediction, stated
                 f[j] = f[j] + demb[t]
-        return torch.log_softmax(vpd_model.rms(f, tg.ln_f, tg.eps) @ tg.wte.T.float(), -1)[None]
+        return torch.log_softmax(tg.unembed(tg.norm(f, -1)), -1)[None]
 
     def _pp_engine(self, tx: Text):
         """The text's engine for path-patched runs (engine.Engine.path_patched: pp_run's numbers for many graphs and
@@ -2132,7 +2163,7 @@ class GoalEval:
                 sel = torch.tensor([b for b, j in enumerate(final) if pairs[j][0][0] == wn], device=nat.dev)
                 x[sel, row[sel]] -= ctx["rec"][wn][0, t[sel], c[sel]][:, None] * tg.site(wn).U[c[sel]]
             read, scale = {"full": (x, x), "direct": (x, x0), "norm": (x0, x)}[ctx.get("mode", "full")]
-            lq = torch.log_softmax((_rms_parts(read, scale, tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
+            lq = torch.log_softmax(tg.unembed(_parts(tg, read, scale, -1)).float(), -1)
             for b, d in enumerate(summary(lq)):
                 res[final[b]] = d
         return res
@@ -2153,13 +2184,14 @@ class GoalEval:
 
         nat, tg, T = self.nat, self.nat.target, len(ids)
         H, hd = tg.n_head, tg.hd
-        x = tg.wte[torch.tensor(ids, device=nat.dev)][None]
+        x = tg.embed(torch.tensor(ids, device=nat.dev))[None]
         causal = torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril()
         fl = {"attn": [], "mlp": [], "P": [], "att": [], "pre": []}
 
-        def write(n):
+        def write(n):  # the subcomponents' write and any bias (always on; vpd4l: none)
             a = rec[n] if masks is None else rec[n] * masks[n]
-            return a @ tg.site(n).U
+            out = a @ tg.site(n).U
+            return out if tg.site(n).b is None else out + tg.site(n).b
 
         def plus(y, n):
             return y if rem is None else y + rem[n]
@@ -2196,7 +2228,7 @@ class GoalEval:
             js = [j for j, (w, _) in enumerate(pairs) if w[0] == wn]
             t, c = nat._ints([[pairs[j][0][1] for j in js], [pairs[j][0][2] for j in js]])
             if wn == "tok":  # the token's embedding at its position
-                wv = tg.wte[torch.tensor([ctx["ids"][p] for p in t.tolist()], device=nat.dev)]
+                wv = tg.token_embed(torch.tensor([ctx["ids"][p] for p in t.tolist()], device=nat.dev))
             else:
                 wv = rec[wn][0, t, c][:, None] * tg.site(wn).U[c]
             for k, j in enumerate(js):
@@ -2212,11 +2244,11 @@ class GoalEval:
             if kind in ("q_proj", "k_proj", "v_proj", "c_fc"):
                 xr = fl["attn" if kind != "c_fc" else "mlp"][layer][t]
                 read, scale = {"full": (xr - wv, xr - wv), "direct": (xr - wv, xr), "norm": (xr, xr - wv)}[mode]
-                inp = _rms_parts(read, scale, tg.norms[2 * layer + (kind == "c_fc")], tg.eps)
+                inp = _parts(tg, read, scale, 2 * layer + (kind == "c_fc"))
             elif kind == "o_proj":  # no norm: "norm" changes nothing
                 inp = fl["att"][layer][t] - (0 if mode == "norm" else fl["P"][layer][:, t, tw].T.repeat_interleave(tg.hd, dim=1) * wv)
             else:
-                inp = vpd_model.gelu_tanh(fl["pre"][layer][t] - (0 if mode == "norm" else wv))
+                inp = tg.act(fl["pre"][layer][t] - (0 if mode == "norm" else wv))
             out[torch.tensor(js, device=nat.dev)] = (inp * V.T[c]).sum(-1)
         return out
 
@@ -2670,7 +2702,7 @@ class GoalEval:
         graph_ref within float32 rounding); ew_rows: per graph a 0/1 vector over its connections (graph.parents reader
         by reader, then graph.out), the connections at 0 cut."""
         if not graphs:
-            return torch.zeros(0, len(targets), self.nat.target.wte.shape[0], device=self.nat.dev)
+            return torch.zeros(0, len(targets), self.nat.target.vocab, device=self.nat.dev)
         E = self._circuit_engine(ids, targets, graphs)
         ew = ow = None
         if ew_rows is not None:
@@ -2903,7 +2935,7 @@ class GoalEval:
         """FRESH_SOURCES tokens for position p sampled without replacement from the model's distribution there, the
         text's token and the three likeliest others (every split's carry.alternatives ranks) left out; keyed by seed and
         p alone."""
-        lp = self.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double()  # MPS has no float64
+        lp = self.nat.replacement_logp(tx.ids, p).cpu().double()  # MPS has no float64
         others = [int(z) for z in lp.topk(4).indices.tolist() if z != tx.ids[p]][:3]
         w = lp.exp()
         w[[tx.ids[p]] + others] = 0.0
@@ -3199,7 +3231,7 @@ class GoalEval:
         if split not in self.donor_pools:
             which, idx = DONOR_POOLS[split]
             tasks = native.tasks(which)
-            V = self.nat.target.wte.shape[0]  # a text in another vocabulary (a tiny test model's) is no donor
+            V = self.nat.target.n_tokens  # a text in another vocabulary (a tiny test model's) is no donor
             self.donor_pools[split] = [(tasks[i].stem, x) for i in idx if i < len(tasks) for x in [native.text(tasks[i])[0]] if max(x) < V]
         return self.donor_pools[split]
 

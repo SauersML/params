@@ -264,7 +264,7 @@ class _Remainders(TorchFunctionMode):
         self.values = {} if values is None else values
         self.capture = values is None
         self.embedding = embedding
-        self.wte = nat.target.wte
+        self.wte = nat.target.wte if embedding is not None else None  # (vpd4l's embedding, replaced at its lookup)
         self.seen = set()
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
@@ -536,12 +536,14 @@ def diagnostics(study):
 def alternatives(nat, ids, source, ranks=(0, 1, 2)):
     if not 0 < source < len(ids):
         raise ValueError("source must have a preceding prediction position")
-    lp = nat.reference([ids[:source]], [source - 1])[0, 0]
+    lp = nat.replacement_logp(ids, source) if hasattr(nat, "replacement_logp") else nat.reference([ids[:source]], [source - 1])[0, 0]
     ranks = tuple(ranks)
     if not ranks or any(not isinstance(r, int) or r < 0 for r in ranks):
         raise ValueError("ranks must be nonempty nonnegative integers")
-    if max(ranks) >= lp.numel() - 1:
-        raise ValueError("alternative rank outside vocabulary")
+    if max(ranks) >= lp.numel() - 1:   # a small vocabulary (an InterpBench model's): the ranks it has
+        ranks = tuple(r for r in ranks if r < lp.numel() - 1)
+        if not ranks:
+            raise ValueError("alternative rank outside vocabulary")
     order = lp.topk(min(lp.numel(), max(ranks) + 2)).indices.tolist()
     others = [int(z) for z in order if z != ids[source]]
     alts = [others[r] for r in ranks]

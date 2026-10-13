@@ -1593,12 +1593,13 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         if row is not None:
             ph, _ = goal_eval.phi(c)
             pt = tau.get("phi_tau")
-            b = goal_eval.size_bits(graphs[i], P, total, targets, active=tx.vpd) + d_bits
-            comp = goal_eval.compact(b, tau.get("bits_start"))
+            executable_bits = goal_eval.size_bits(graphs[i], P, total, targets, active=tx.vpd)
+            b = executable_bits + d_bits
+            comp = goal_eval.compact(b, tau.get("bits_start")) if executable_bits > 0 else None
             g = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-GATE_SLOPE * (ph - pt)))
             terms = {"E2g": e2g[i]["E2g"] if i in e2g else None, "E4x": e4x.get(i), "E1": row["E1"]}
             Q = 0.5 * (comp or 0.0) + sum(v for v in terms.values() if v is not None)
-            dc = comp - ref["compact"] if ref is not None and comp is not None else (math.inf if b <= 0 else None)
+            dc = comp - ref["compact"] if ref is not None and comp is not None else (math.inf if executable_bits <= 0 else None)
             m = None if ref is None or ph is None or dc is None else min(ph - ref["phi"], dc)
             D = 0.0 if m is None else (softplus(2.0 * m) - softplus(0.0)) / 2.0  # 0 at parity with the teacher
             r = (ph or 0.0) + (g or 0.0) * Q + D
@@ -1606,6 +1607,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             terms |= {"C": c["c"], "C_rl": c.get("c_rl"), "F1": row[f"f1_{convention}"], "N": row[f"n_{convention}"], "F3": row["f3"],
                       "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}
             info = {"phi": ph, "phi_tau": pt, "g": g, "faithful": None if ph is None or pt is None else ph >= pt, "bits": b,
+                    "executable_bits": executable_bits,
                     "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,
                     "e2g": {k: v for k, v in (e2g.get(i) or {}).items() if k != "E2g"} or None}
             if lines:

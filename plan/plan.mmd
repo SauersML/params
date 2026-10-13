@@ -247,7 +247,7 @@ flowchart BT
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end
   GATEA{{"<b>Check A</b> · trainable targets?<br/>targets pass unseen interventions;<br/>needed parts visible in the input;<br/>reported with each SFT arm"}}
-  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 60/60;<br/>cond 2 (teacher vs start) running"}}
+  GATEB{{"<b>Gate B</b> · trustworthy reward?<br/>faithful beats wrong at equal size;<br/>empty, shuffled and collapsed<br/>controls lose · cond 1 passes 60/60;<br/>cond 2 (teacher vs start) running;<br/>falsification: below the bar extra parts<br/>are free; node, N, donor terms blind<br/>to misplaced parts"}}
 
   %% ===================== workstreams =====================
   subgraph TEACHER["TEACHER CIRCUITS · pymove, fleet"]
@@ -270,7 +270,7 @@ flowchart BT
 
   subgraph REWARD["REWARD · primerl, inframove, generality, codex"]
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
-    W2["<b>Falsification set</b><br/>40 copy + 20 model-mistake texts:<br/>correct vs 5 wrong copy circuits,<br/>equal-bits baselines; scoring on pods<br/>ACTIVE · generality"]
+    W2["<b>Falsification set</b><br/>40 copy + 20 mistake texts, reward v3 terms:<br/>wrong source loses 0.8; irrelevant parts 0.59<br/>(below the bar g≈0, Φ never penalizes extras);<br/>equal-bits start beats copy circuit 0.71;<br/>value maps: identity E4 0.76, partition 0.00<br/>FINAL TABLE PENDING · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>package on main (aa79889): floor,<br/>eps cap, N guard, Φ cap, no node cap;<br/>toys core 8/15→pass but collapsed;<br/>DONE · inframove, primerl"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]

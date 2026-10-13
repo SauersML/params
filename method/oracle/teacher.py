@@ -916,12 +916,12 @@ class Acceptance:
                 cg = [goal_eval._c_graph(g, tx.targets, C) for g in graphs]
                 e0 = self.ge._bounds(tx, "live")[0]
                 if k == "nodes":                             # (the real model less the nodes the reference, a block one unit)
-                    rows = self.ge._node_family(tx, cg, goal_eval.DRAWS, True,
+                    rows = self.ge._node_family(tx, cg, goal_eval.DRAWS, False,   # (s_nodes alone: no reads)
                                                 units=[sorted(goal_eval.strand(g, tx.targets, C).node_set()) for g in graphs])
                     got = [{"s_nodes": goal_eval._pooled("weighted", r.get("draws_nodes"), e0)} for r in rows]
                 elif k == "edges":
                     got = [{"s_edges": goal_eval._fid(e0, r["kl_edges_c"], r["kl_edges_vpd"]) if r.get("kl_edges_c") is not None else None}
-                           for r in self.ge._edge_family(tx, cg, goal_eval.DRAWS, True)]
+                           for r in self.ge._edge_family(tx, cg, goal_eval.DRAWS, False)]  # (s_edges alone: no reads)
                 else:
                     got = self.ge.pattern_family(tx, cg)
             else:

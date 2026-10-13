@@ -504,7 +504,8 @@ class Native:
         if key is not None and key in self._refs:
             self._refs.move_to_end(key)
             return self._refs[key]
-        logits = self.vpd.target_forward(torch.tensor(ids, device=self.dev))[:, targets]
+        self.vpd.clear()  # (target_forward's) the stream at the targets alone unembedded, not every position's [B, T, V]
+        logits = self.target.unembed(self.target.hidden(torch.tensor(ids, device=self.dev))[:, targets])
         out = torch.log_softmax(logits.float(), -1)
         if key is not None:
             self._refs[key] = out
@@ -1091,7 +1092,8 @@ class Native:
                     h = self.target.hidden(batch, start, prefix.get(len(batch)))[:, last - start:last - start + 1]
                     logits = self.target.unembed(h)[:, 0]
                 else:
-                    logits = self.vpd.target_forward(batch)[:, last]
+                    self.vpd.clear()  # (the last position alone unembedded)
+                    logits = self.target.unembed(self.target.hidden(batch)[:, last])
                 lqs.append(torch.log_softmax(logits.float(), -1))
             lqs = torch.cat(lqs).cpu()  # one transfer
         moved = []

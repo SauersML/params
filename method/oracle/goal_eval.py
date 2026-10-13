@@ -2923,6 +2923,7 @@ class GoalEval:
             native.free(nat.dev)
         return kls
 
+    NODE_ENTRIES = 1 << 27  # _node_family's rows a batch: this many floats in its widest activations and masks
     NEC_ENTRIES = 1 << 27  # _removed_kl_on's rows a run: this many floats in its widest activations (sets x T x C)
 
     def _removal_engine(self, ids: list[int], targets: list[int], sets: list[dict]):
@@ -2978,31 +2979,53 @@ class GoalEval:
         credited to no one. Without it the 5 parts saturated the damage on text and controls alike (14-18 bits) and the
         start's D_t - D_c fell to 0 or below on 9001, 9006, 9007 and 9015; kept on, it is 1.8-6.9 bits there and N on the
         20 held-out starts goes from 0.62 (14 scored) to 0.92 (18 scored)."""
-        nat, T = self.nat, tx.T
-        sets = [self.masks(_c_graph(g, tx.targets, nat.C, tx.vpd), T) for g in graphs]
+        import engine
+
+        nat, T, dev = self.nat, tx.T, self.nat.dev
+        cg = [_c_graph(g, tx.targets, nat.C, tx.vpd) for g in graphs]
         keep = None
         if background:  # the background parts at the targets never removed, the circuits' and VPD's alike
-            keep = {n: torch.zeros(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+            keep = {n: torch.zeros(T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
             for n, t, c in self.background(tx):
                 keep[n][t, c] = True
-            sets = [{n: m[n] & ~keep[n] for n in nat.names} for m in sets]
         last = max(tx.targets)
         pool = [x for x in self.far_pool(split) if len(x[1]) >= min(T, NEC_MIN_LEN) and list(x[1]) != list(tx.ids)]
         ys = [pool[i][1] for i in np.random.default_rng([int(tx.seed), 13]).permutation(len(pool))[:controls]]
 
-        def damages(sets):  # [D_t per set, per control [D_c per set]]: one engine, moved to each control (Engine.on)
-            E = self._removal_engine(tx.ids, tx.targets, sets)
-            M = self._stacked(E, sets)  # once; a control's its shift
+        def damages(cols, M):  # [D_t per set, per control [D_c per set]] of the sets M ({site: bool [sets, T, K]} over
+            key_e = tuple(tuple(c.tolist()) for c in cols.values())  # cols): one engine, moved to each control
+            kept = tx.__dict__.setdefault("_nec_engines", {})        # (Engine.on), kept on tx for the same columns (a
+            if key_e not in kept:                                    # teacher's candidates share them: no remaking of
+                kept.clear()                                         # each control's run before the circuit)
+                kept[key_e] = (engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on"), {})
+            E, ons = kept[key_e]
+            if keep is not None:
+                M = {n: m & ~keep[n][:, cols[n]][None] for n, m in M.items()}
             dc = []
             for y in ys:
                 y = list(y[:last + 1])
                 d = last + 1 - len(y)  # the shift
-                dc.append(self._removed_kl_on(E.on(y, [t - d for t in tx.targets if t >= d]), {n: m[:, d:last + 1] for n, m in M.items()}))
+                if tuple(y) not in ons:
+                    ons[tuple(y)] = E.on(y, [t - d for t in tx.targets if t >= d])
+                dc.append(self._removed_kl_on(ons[tuple(y)], {n: m[:, d:last + 1] for n, m in M.items()}))
             return self._removed_kl_on(E, M, tx.ref), dc
         key = ("nec_vpd", last, tuple(tuple(y) for y in ys), background)  # VPD's damages on these controls: every graph's on the text
         if key not in tx.__dict__:
-            tx.__dict__[key] = damages([tx.vpd if keep is None else {n: tx.vpd[n] & ~keep[n] for n in nat.names}])
-        dt, dc = damages(sets) if sets else ([], [[] for _ in ys])
+            vc = {n: tx.vpd[n].any(0).nonzero().flatten() for n in nat.names}
+            tx.__dict__[key] = damages(vc, {n: tx.vpd[n][:, vc[n]][None] for n in nat.names})
+        per = {n: ([], [], []) for n in nat.names}  # the sets on their columns, written straight into [sets, T, K] (a
+        for i, h in enumerate(cg):                 # mask [T, C] per set: 13 GB for line_loo on a 798-node set)
+            for n, t, c in h.node_set():
+                per[n][0].append(i)
+                per[n][1].append(t)
+                per[n][2].append(c)
+        cols = {n: torch.unique(torch.tensor(per[n][2], dtype=torch.long, device=dev)) for n in nat.names}
+        M = {n: torch.zeros(len(cg), T, len(cols[n]), dtype=torch.bool, device=dev) for n in nat.names}
+        for n, (i_, t_, c_) in per.items():
+            if i_:
+                M[n][torch.tensor(i_, device=dev), torch.tensor(t_, device=dev),
+                     torch.searchsorted(cols[n], torch.tensor(c_, device=dev))] = True
+        dt, dc = damages(cols, M) if cg else ([], [[] for _ in ys])
         dt = dt + tx.__dict__[key][0]
         dc = [d + v for d, v in zip(dc, tx.__dict__[key][1])]
         out = []
@@ -3468,6 +3491,7 @@ class GoalEval:
             native.free(dev)
         return out
 
+    @torch.no_grad()
     def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int, reads: bool = False,
                      units: list | None = None) -> list[dict]:
         """Per circuit, the node-removal family: draws of its nodes removed from the model, from VPD's answer and from
@@ -3475,7 +3499,11 @@ class GoalEval:
         graph its removal units (default its nodes): a block (site, t, BLOCK) is one unit, every subcomponent of its site
         there removed together (backup's report: a block's 3,072 subcomponents drawn one by one took 96% of every draw). The runs
         multiply only the circuits' and VPD's subcomponents (engine.Engine's columns; the model's run with every other
-        subcomponent folded into its remainder, outside="on"): float32-close to the masked forward over every column."""
+        subcomponent folded into its remainder, outside="on"): float32-close to the masked forward over every column.
+        Every circuit's draws (_node_draws' common draws) run together, NODE_ENTRIES floats a batch, each row's masks
+        written as matrices over the circuits' nodes: without reads the model and VPD's answer from the draws' first
+        position on (Engine.log_probs' start), a complete circuit from there at its own masks; a stated circuit on its
+        one plan with each draw's nodes out (graph_log_probs' off)."""
         import engine
 
         nat, T, dev = self.nat, tx.T, self.nat.dev
@@ -3487,77 +3515,146 @@ class GoalEval:
         Ec = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ)                # the circuits
         at = {n: {c: i for i, c in enumerate(circ[n].tolist())} for n in nat.names}
         vat = {n: {c: i for i, c in enumerate(vcols[n].tolist())} for n in nat.names}
-        vpd = {n: tx.vpd[n][:, vcols[n]].float() for n in nat.names}
+        vbase = {n: tx.vpd[n][:, vcols[n]].float()[None] for n in nat.names}
+        every = sorted(set().union(*(g.node_set() for g in graphs))) if graphs else []
+        nid = {nd: i for i, nd in enumerate(every)}
+        N = len(every)
+        site = {n: np.array([i for i, nd in enumerate(every) if nd[0] == n], dtype=np.int64) for n in nat.names}
+        site = {n: x for n, x in site.items() if len(x)}
+        sidx = {n: torch.as_tensor(x, device=dev) for n, x in site.items()}
+        spos = {n: torch.tensor([every[i][1] for i in x], device=dev) for n, x in site.items()}
+        scol = {n: torch.tensor([at[n][every[i][2]] for i in x], device=dev) for n, x in site.items()}
+        svpd = {n: torch.tensor([vat[n][every[i][2]] for i in x], device=dev) for n, x in site.items()}
+        gnodes = [sorted(g.node_set()) for g in graphs]
+        rows = []  # (graph, draw j, dropped node indices)
+        for gi in range(len(graphs)):
+            if gnodes[gi]:
+                for j, d in enumerate(self._node_draws(tx, sorted(units[gi]) if units is not None else gnodes[gi], draws, held=gnodes[gi])):
+                    rows.append((gi, j, np.array([nid[x] for x in d], dtype=np.int64)))
+        first = min((every[i][1] for _, _, d in rows for i in d), default=T)
+        start = 0 if reads else min(first, min(tx.targets))  # before it every run is its base's (reads: every position)
+        width = max(nat.C.values()) * (T - start) + sum(len(c) for c in vcols.values()) * T
+        step = max(1, self.NODE_ENTRIES // max(1, width))
+        own, plans = {}, {}  # per complete circuit its masks [1, T, K]; per stated one its plan and entries' node indices
+        for gi, g in enumerate(graphs):
+            if not gnodes[gi]:
+                continue
+            if g.complete:
+                m = {n: torch.zeros(1, T, len(circ[n]), device=dev) for n in nat.names}
+                inn = torch.zeros(N, dtype=torch.bool, device=dev)
+                inn[torch.as_tensor([nid[x] for x in gnodes[gi]], device=dev)] = True
+                for n in site:
+                    k = inn[sidx[n]]
+                    m[n][0, spos[n][k], scol[n][k]] = 1.0
+                own[gi] = m
+            else:  # the plan's entries per site: sorted by position, then column
+                order = {}
+                for n, t, c in gnodes[gi]:
+                    order.setdefault(n, []).append((t, at[n][c], nid[(n, t, c)]))
+                plans[gi] = (Ec.plan(g, semantics="c"), {n: torch.as_tensor([x[2] for x in sorted(v)], device=dev) for n, v in order.items()})
+        res = {gi: [] for gi in range(len(graphs))}  # per graph per draw [j, kc, kv, w, claim]
+        rd = {gi: ([], []) for gi in range(len(graphs))}  # per graph per draw its nodes' reads in the model and the circuit
+
+        def spec(part):  # the reads of each row's circuit nodes: {site: (rows, positions, columns)}
+            out_ = {}
+            for r, (gi, _, _) in enumerate(part):
+                for n, t, c in gnodes[gi]:
+                    x = out_.setdefault(n, ([], [], []))
+                    x[0].append(r)
+                    x[1].append(t)
+                    x[2].append(at[n][c])
+            return {n: tuple(torch.tensor(v, device=dev) for v in x) for n, x in out_.items()}
+
+        def split(got, part):  # {site: [k]} in spec's order -> per row its nodes' reads
+            vals = {n: v.tolist() for n, v in got.items()}
+            pos, per = {}, []
+            for gi, _, _ in part:
+                row = {}
+                for nd in gnodes[gi]:
+                    k = pos.get(nd[0], 0)
+                    row[nd] = vals[nd[0]][k]
+                    pos[nd[0]] = k + 1
+                per.append(row)
+            return per
+        for s0 in range(0, len(rows), step):
+            part = rows[s0:s0 + step]
+            R = len(part)
+            rr = np.concatenate([np.full(len(d), r) for r, (_, _, d) in enumerate(part)])
+            cc = np.concatenate([d for _, _, d in part])
+            Dm = torch.zeros(R, N, dtype=torch.bool, device=dev)
+            Dm[torch.as_tensor(rr, device=dev), torch.as_tensor(cc, device=dev)] = True
+            mm = {n: torch.ones(R, T, len(circ[n]), device=dev) for n in nat.names}
+            mv = {n: vbase[n].repeat(R, 1, 1) for n in nat.names}
+            for n in site:  # each draw's nodes off: one indexed write per site and engine
+                r_, j_ = Dm[:, sidx[n]].nonzero(as_tuple=True)
+                mm[n][r_, spos[n][j_], scol[n][j_]] = 0.0
+                mv[n][r_, spos[n][j_], svpd[n][j_]] = 0.0
+            if reads:
+                lm, got = Em.log_probs(mm, reads=spec(part))
+                rmod = split(got, part)
+            else:
+                lm = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
+            lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
+            lc = torch.empty_like(lm)
+            rcir = [None] * R
+            for gi in dict.fromkeys(gi for gi, _, _ in part):  # each circuit's rows
+                ix = [r for r, x in enumerate(part) if x[0] == gi]
+                ixt = torch.as_tensor(ix, device=dev)
+                sub = [part[r] for r in ix]
+                if gi in own:
+                    mc = {n: own[gi][n].repeat(len(ix), 1, 1) for n in nat.names}
+                    for n in site:
+                        r_, j_ = Dm[ixt][:, sidx[n]].nonzero(as_tuple=True)
+                        mc[n][r_, spos[n][j_], scol[n][j_]] = 0.0
+                    if reads:
+                        got, rc_ = Ec.log_probs(mc, reads=spec(sub))
+                    else:
+                        got = Ec.log_probs(mc, start=start, base=own[gi]) if start else Ec.log_probs(mc)
+                else:
+                    plan, ent = plans[gi]
+                    off = {n: Dm[ixt][:, e] for n, e in ent.items()}
+                    zero = {n: torch.zeros(len(ix), 1, Ec.width(n), device=dev) for n in nat.names}  # (B rows: u's)
+                    if reads:
+                        got, rc_ = Ec.graph_log_probs(plan, zero, off=off, reads=spec(sub))
+                    else:
+                        got = Ec.graph_log_probs(plan, zero, off=off)
+                lc[ixt] = got
+                if reads:
+                    for r, x in zip(ix, split(rc_, sub)):
+                        rcir[r] = x
+            kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
+            w, claim = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()
+            for r, (gi, j, _) in enumerate(part):
+                res[gi].append([j, kc[r], kv[r], w[r], claim[r]])
+                if reads:
+                    rd[gi][0].append(rmod[r])
+                    rd[gi][1].append(rcir[r])
+            native.free(dev)
         out = []
-        for g in graphs:
-            nodes = sorted(g.node_set())
-            if not nodes:
+        for gi in range(len(graphs)):
+            if not gnodes[gi]:
                 out.append({"kl_nodes_c": self._bounds(tx, "live")[0], "kl_nodes_vpd": self._bounds(tx, "live")[1], "reads_nodes": None})
                 continue
-            drops = self._node_draws(tx, sorted(units[len(out)]) if units is not None else nodes, draws, held=nodes)
-
-            def without(base, d, where):  # [draws, T, K]: base with each draw's nodes off
-                m = {n: x[None].repeat(len(d), 1, 1) for n, x in base.items()}
-                idx = {}
-                for b, dd in enumerate(d):
-                    for n, t, c in dd:
-                        x = idx.setdefault(n, ([], [], []))
-                        x[0].append(b)
-                        x[1].append(t)
-                        x[2].append(where[n][c])
-                for n, ix in idx.items():  # one indexed write per site (a write per node was a kernel launch each)
-                    m[n][tuple(torch.tensor(i, device=dev) for i in ix)] = 0.0
-                return m
-
-            def spec(where):  # every draw's reads of the circuit's nodes over an engine's columns
-                out_ = {}
-                for n, t, c in nodes:
-                    x = out_.setdefault(n, ([], []))
-                    x[0].append(t)
-                    x[1].append(where[n][c])
-                return None if not reads else {n: (torch.arange(len(drops), device=dev).repeat_interleave(len(t)),
-                                                   torch.tensor(t, device=dev).repeat(len(drops)), torch.tensor(c, device=dev).repeat(len(drops)))
-                                               for n, (t, c) in out_.items()}
-
-            def split(got):  # {site: [draws * k]} -> {node: [draws]}, the nodes in spec's order
-                by = {}
-                for nd in nodes:
-                    by.setdefault(nd[0], []).append(nd)
-                cols = {n: got[n].view(len(drops), len(nds)).T.cpu().tolist() for n, nds in by.items()}  # one transfer per site
-                return {nd: cols[n][j] for n, nds in by.items() for j, nd in enumerate(nds)}
-
-            def run(f, *a, **k):  # (log q, reads or None)
-                got = f(*a, **k)
-                return (got[0], split(got[1])) if reads else (got, None)
-
-            lm, rm = run(Em.log_probs, without({n: torch.ones(T, len(circ[n]), device=dev) for n in nat.names}, drops, at), reads=spec(at))
-            lv = Ev.log_probs(without(vpd, drops, vat))
-            if g.complete:
-                gm = {n: torch.zeros(T, len(circ[n]), device=dev) for n in nat.names}
-                on = {}
-                for n, t, c in nodes:
-                    on.setdefault(n, ([], []))[0].append(t)
-                    on[n][1].append(at[n][c])
-                for n, (t, c) in on.items():
-                    gm[n][torch.tensor(t, device=dev), torch.tensor(c, device=dev)] = 1.0
-                lc, rc = run(Ec.log_probs, without(gm, drops, at), reads=spec(at))
-            else:  # C's semantics, each draw's graph without its nodes
-                lc, rc = run(Ec.graph_log_probs, Ec.plan([_drop_nodes(g, set(d)) for d in drops], semantics="c"), reads=spec(at))
-            pairs = {}  # the reads of the nodes each draw keeps, in the model and the circuit
-            for b, d in enumerate(drops if reads else []):
-                ds = set(d)  # once per draw: a set per node made this quadratic (a block circuit's 46k nodes: hours)
-                for nd in nodes:
-                    if nd not in ds:
-                        pairs.setdefault(nd, []).append((rm[nd][b], rc[nd][b]))
-            kc_, kv_ = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
-            w_, claim = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()
-            out.append({"kl_nodes_c": float(np.mean(kc_)), "kl_nodes_vpd": float(np.mean(kv_)),
-                        # per draw [draw, KL(model less d || circuit less d), KL(model less d || VPD less d),
-                        # W = KL(model less d || model), KL(model || circuit less d)]
-                        "draws_nodes": [[j, a, b_, c, d] for j, (a, b_, c, d) in enumerate(zip(kc_, kv_, w_, claim))],
-                        "overstate_nodes": float(np.mean(claim)) / max(float(np.mean(w_)), 1e-12),
-                        "reads_nodes": _read_error(pairs) if reads else None, "_pairs_nodes": pairs})
-            native.free(dev)
+            dr = res[gi]
+            row = {"kl_nodes_c": float(np.mean([x[1] for x in dr])), "kl_nodes_vpd": float(np.mean([x[2] for x in dr])),
+                   # per draw [draw, KL(model less d || circuit less d), KL(model less d || VPD less d),
+                   # W = KL(model less d || model), KL(model || circuit less d)]
+                   "draws_nodes": dr, "overstate_nodes": float(np.mean([x[4] for x in dr])) / max(float(np.mean([x[3] for x in dr])), 1e-12),
+                   "reads_nodes": None, "_pairs_nodes": {}}
+            if reads:  # the reads of the nodes each draw keeps, in the model and the circuit
+                gn = gnodes[gi]
+                gi_rows = [d for g_, _, d in rows if g_ == gi]
+                kept = ~np.stack([np.isin(np.array([nid[nd] for nd in gn]), d) for d in gi_rows])  # [draws, n]
+                M = np.array([[x[nd] for nd in gn] for x in rd[gi][0]], dtype=float)
+                Cc = np.array([[x[nd] for nd in gn] for x in rd[gi][1]], dtype=float)
+                row["_pairs_nodes"] = {nd: list(zip(M[kept[:, k], k].tolist(), Cc[kept[:, k], k].tolist()))
+                                       for k, nd in enumerate(gn) if kept[:, k].any()}
+                cnt = kept.sum(0)  # _read_error on the arrays: per node over the draws keeping it
+                msq = np.where(kept, M ** 2, 0.0).sum(0) / np.maximum(cnt, 1)
+                err = np.where(kept, (M - Cc) ** 2, 0.0).sum(0) / np.maximum(cnt, 1)
+                ok = (cnt > 0) & (msq > 0)
+                row["reads_nodes"] = float(np.mean(np.sqrt(err[ok] / msq[ok]))) if ok.any() else None
+            out.append(row)
         return out
 
     @torch.no_grad()

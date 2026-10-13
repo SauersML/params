@@ -14,6 +14,7 @@ answer and an end token. Scoring, per held-out row:
   learn_sft.py score ARM_DIR/heldout.jsonl OUT.jsonl [--adapter OUT_DIR/adapter] [--inject [--permute]] [--base ...]
   learn_sft.py active-score HELD_ACTIVE.jsonl OUT.jsonl [--adapter FIRST_STAGE_DIR/adapter] [--n 300]
   learn_sft.py report SCORES.jsonl ...
+  learn_sft.py table OUT_DIR ... [--baselines BASELINES.json]   the grid against the decision rule
 """
 from __future__ import annotations
 
@@ -396,6 +397,61 @@ def report(paths: list[str]) -> None:
             print(line)
 
 
+def table(dirs: list[str], baselines: str | None = None) -> str:
+    """The grid against the lead's decision rule: per arm and training size, the held-out KL-bin log loss (bits, the
+    mean over remove, cut and swap questions, and per kind), falls log loss, rank top-1 and Kendall's tau, each with its
+    standard error; at each size, each arm's paired difference in KL-bin log loss from the best arm there (the same
+    questions in the same order) with twice its standard error ("within noise" when the difference is below it); and
+    the feature-only baselines on the same questions (learnability.py baselines' JSON)."""
+    import re
+    import statistics as st
+
+    runs = {}
+    for d in dirs:
+        for f in sorted(Path(d).iterdir()):
+            m = re.fullmatch(r"score_(.+)_(\d+|base)\.jsonl", f.name)
+            if m:
+                runs[(m.group(1), m.group(2))] = _rows(f)
+    se = lambda xs: st.pstdev(xs) / math.sqrt(len(xs)) if len(xs) > 1 else float("nan")  # noqa: E731
+    lines = ["arm               size   KL-bin bits (se)   remove  cut    swap   falls  | rank top-1 (se)  tau (se)   | vs best at size"]
+    eff = {k: [r["logloss_bits"] for r in v if r["kind"] != "rank"] for k, v in runs.items()}
+    best = {}
+    for (arm, n), xs in eff.items():
+        if xs and (n not in best or st.mean(xs) < st.mean(eff[best[n]])):
+            best[n] = (arm, n)
+    order = sorted(runs, key=lambda k: (int(k[1]) if k[1] != "base" else -1, k[0]))
+    for k in order:
+        rs = runs[k]
+        e = [r for r in rs if r["kind"] != "rank"]
+        rk = [r for r in rs if r["kind"] == "rank"]
+        if not e:
+            continue
+        kind = lambda name, e=e: st.mean(r["logloss_bits"] for r in e if r["kind"] == name) if any(r["kind"] == name for r in e) else float("nan")  # noqa: E731
+        top1 = [float(r["pred"] == r["label"]) for r in rk]
+        tau = [r["tau"] for r in rk if r["tau"] == r["tau"]]
+        b = best[k[1]]
+        if b == k:
+            vs = "best"
+        else:
+            d = [x - y for x, y in zip(eff[k], eff[b])]
+            vs = f"+{st.mean(d):.3f} (2se {2 * se(d):.3f}) {'within noise' if st.mean(d) < 2 * se(d) else 'worse'}"
+        lines.append(f"{k[0]:17s} {k[1]:>5s}  {st.mean(eff[k]):.3f} ({se(eff[k]):.3f})      {kind('remove'):.2f}   {kind('cut'):.2f}   {kind('swap'):.2f}   "
+                     f"{st.mean(r['falls_logloss_bits'] for r in e):.2f}   | {st.mean(top1) if top1 else float('nan'):.3f} ({se(top1):.3f})    "
+                     f"{st.mean(tau) if tau else float('nan'):.3f} ({se(tau):.3f}) | {vs}")
+    if baselines:
+        bl = json.loads(Path(baselines).read_text())
+        n = sum(bl[k]["n"] for k in ("remove", "cut", "swap") if k in bl)
+        lr = sum(bl[k]["logloss_features"] * bl[k]["n"] for k in ("remove", "cut", "swap") if k in bl) / n
+        prior = sum(bl[k]["logloss_prior"] * bl[k]["n"] for k in ("remove", "cut", "swap") if k in bl) / n
+        lines.append(f"baseline: logistic regression on the features {lr:.3f} bits (remove {bl['remove']['logloss_features']:.2f}, cut "
+                     f"{bl['cut']['logloss_features']:.2f}, swap {bl['swap']['logloss_features']:.2f}); training prior {prior:.3f}")
+        r = bl.get("rank", {})
+        lines.append(f"baseline rank: importance x |activation| top-1 {r.get('importance x activation', {}).get('top1', float('nan')):.3f}, tau "
+                     f"{r.get('importance x activation', {}).get('kendall_tau', float('nan')):.3f}; logit lens top-1 "
+                     f"{r.get('logit lens', {}).get('top1', float('nan')):.3f}; chance {r.get('chance top1', float('nan')):.3f}")
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -423,10 +479,14 @@ def main():
     ac.add_argument("--base", default="Qwen/Qwen3-1.7B")
     ac.add_argument("--n", type=int, default=300)
     ac.add_argument("--max-tokens", type=int, default=400)
+    tb = sub.add_parser("table")
+    tb.add_argument("dirs", nargs="+", help="directories holding score_<arm>_<size>.jsonl")
+    tb.add_argument("--baselines")
     r = sub.add_parser("report")
     r.add_argument("scores", nargs="+")
     a = ap.parse_args()
-    {"train": train, "score": score, "active-score": active_score, "report": lambda a: report(a.scores)}[a.cmd](a)
+    {"train": train, "score": score, "active-score": active_score, "report": lambda a: report(a.scores),
+     "table": lambda a: print(table(a.dirs, a.baselines))}[a.cmd](a)
 
 
 if __name__ == "__main__":

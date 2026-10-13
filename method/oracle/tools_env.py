@@ -44,6 +44,7 @@ elsewhere (tools_tinker.py: Tinker's cookbook, multi-turn).
   tools_env.py bench --task text9000 [--task ...]              each tool's latency on the device
   tools_env.py scripted ROWS.jsonl --tasks text9000:text9019 --out OUT.jsonl [--score-split eval]
   tools_env.py tokens ROWS.jsonl --tasks text9000:text9019 [--episodes OUT.jsonl]   Qwen3 tokens: one-shot vs episode
+  tools_env.py baselines ROWS.jsonl --episodes OUT.jsonl --out BASE.jsonl   the scripted answers beside equal-size sets
   tools_env.py serve ROWS.jsonl [--port 8771] [--score-split search]
 ROWS: components.py questions rows (each text's evidence: its intervention questions and edit requests).
 """
@@ -769,6 +770,47 @@ def scripted(env: Env, tids: list[str], out: Path, log=print) -> list[dict]:
     return res
 
 
+def baselines(env: Env, episodes: Path, out: Path, log=print) -> list[dict]:
+    """Each scripted answer (episodes: scripted's output) beside trivial node sets of its size on the score split, all
+    complete node sets scored by the reward's families (GoalEval.fidelity in reward mode): the influential start,
+    VPD's first k by causal importance (Native._vpd_order), the start's k most important by causal importance x
+    |activation| (the scripted policy's measured pruning left out), and k of the start's nodes drawn at random (seed 0);
+    per set phi (goal_eval.phi), its families' scores, s_track_pp and size_bits. One JSON line per text."""
+    ge, nat = env.ge, env.ge.nat
+    P, S = None, sum(nat.C.values())
+    res = []
+    for line in episodes.read_text().splitlines():
+        ep = json.loads(line)
+        tid = ep["task"]
+        tools = env.text_tools(tid)
+        tx = tools.tx
+        P = nat.positions(tx.targets)
+        parsed = components.parse(ep["answer"])
+        g, _ = goal_eval.circuit(parsed["answer"], tx.targets, nat.C, tx.T)
+        k = g.count()
+        st = ge.start_set(tx, env.score_split)["graph"]
+        snodes = sorted(st.node_set())
+        key = {nd: float(tx.ci[nd[0]][nd[1], nd[2]]) * abs(float(tx.rec[nd[0]][0, nd[1], nd[2]])) for nd in snodes}
+        rng = np.random.default_rng(0)
+        sets = {"scripted": g, "start": st,
+                "vpd_top_k": native.Graph(nat._vpd_order(tx.ids, tx.targets)[:k], complete=True),
+                "start_ci_act_k": native.Graph(sorted(snodes, key=lambda nd: -key[nd])[:k], complete=True),
+                "start_random_k": native.Graph([snodes[i] for i in rng.choice(len(snodes), size=min(k, len(snodes)), replace=False)], complete=True)}
+        t0 = time.perf_counter()
+        rows = ge.fidelity(tx, list(sets.values()), env.pool, mode="reward", split=env.score_split)
+        row = {"task": tid, "k": k, "seconds": round(time.perf_counter() - t0, 1)}
+        for (name, gg), r in zip(sets.items(), rows):
+            ph, _ = goal_eval.phi(r)
+            row[name] = {"phi": ph, "nodes": gg.count(), "bits": goal_eval.size_bits(gg, P, S, tx.targets, active=tx.vpd),
+                         "families": {f: goal_eval.family_score(r, f) for f in goal_eval.PHI_FAMILIES}}
+        res.append(row)
+        with out.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        log(f"{tid} k={k}: " + "; ".join(f"{n} phi {row[n]['phi']:.3f} pp {row[n]['families']['track_pp']}" if row[n]["phi"] is not None
+                                       else f"{n} phi None" for n in sets), flush=True)
+    return res
+
+
 def tokens(rows: dict, tids: list[str], episodes: Path | None, base: str = "Qwen/Qwen3-8B", pool: bool = False, log=print) -> dict:
     """Qwen3 tokens: the one-shot question (the rows' question in Qwen3's chat template; pool: also the v2 question
     with every VPD-active subcomponent at its positions, components.candidate_pool, needing the causal-importance
@@ -878,6 +920,11 @@ def main():
     t.add_argument("--tasks", nargs="+", required=True)
     t.add_argument("--episodes")
     t.add_argument("--pool", action="store_true", help="also the v2 question listing every VPD-active subcomponent")
+    bl = sub.add_parser("baselines")
+    bl.add_argument("rows")
+    bl.add_argument("--episodes", required=True)
+    bl.add_argument("--out", required=True)
+    bl.add_argument("--score-split", default="eval")
     v = sub.add_parser("serve")
     v.add_argument("rows")
     v.add_argument("--port", type=int, default=8771)
@@ -894,6 +941,8 @@ def main():
         bench(env, _tasks(a.tasks))
     elif a.cmd == "scripted":
         scripted(env, _tasks(a.tasks), Path(a.out))
+    elif a.cmd == "baselines":
+        baselines(env, Path(a.episodes), Path(a.out))
     else:
         serve(env, a.host, a.port)
 

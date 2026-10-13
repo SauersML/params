@@ -114,7 +114,9 @@ SYSTEM = ("You explain how a small language model, vpd4l (layers 0 to 3, each wi
           "which compare(), node_effects() and measure_removal() also take. In your answer the CIRCUIT section may be a "
           "draft id alone (CIRCUIT: d3): its Mermaid is filled in. "
           "Each tool call costs a little reward: call what you need, then reply without a tool call. That reply is your "
-          "answer, in the format the question asks for.")
+          "answer, in the format the question asks for. You have at most 24 turns and 40 tool calls: an episode that "
+          "runs out of either without that reply scores nothing, so answer before then, naming your best draft "
+          "(CIRCUIT: d3) if you have one.")
 
 
 MERMAID_HINT = ("Declare each node on its own line inside its position's subgraph, a[\"L3.fc#2304\"] (no @position in the "

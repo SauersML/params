@@ -1043,15 +1043,19 @@ class Validated:
 
 
 SET_LEVELS = ("site", "chunk16", "chunk4", "subcomponent")  # the influential set's levels, coarse first
-FORWARD_CHUNK = 8     # --forward: candidate sets per fidelity call
+FORWARD_CHUNK = 8     # --forward: candidate sets per fidelity call (position groups)
 
 
-def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=print) -> dict:
+def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=print, unit: str = "position") -> dict:
     """--forward (the lead's 10-13: is a start backward pruning cannot shrink minimal, or a local minimum of the
-    acceptance rule?): from VPD's actives at the targets, F2's positions added one position group at a time (VPD's
-    actives there), each step the group whose addition gives the highest phi (goal_eval's reward-mode fidelity on the
-    search split, every family recomputed for each candidate; FORWARD_CHUNK candidates a call), until phi reaches the
-    bar (phi_tau + PHI_SLACK) or every group is in. {"nodes", "positions", "phi", "bar", "steps": [position, size, phi]}."""
+    acceptance rule?): from VPD's actives at the targets, groups of VPD's actives at F2's positions added one at a time,
+    each step the group whose addition gives the highest phi, until phi reaches the bar (phi_tau + PHI_SLACK) or every
+    group is in. unit "position": a group is a position's actives, each candidate scored by goal_eval's reward-mode
+    fidelity on the search split (FORWARD_CHUNK a call); "site": one site's actives at one position, every candidate of a
+    step scored at once by GoalEval.phi_variants as node subsets of the union of every group, a set passing there
+    confirmed by fidelity before the search stops. "site" needs monitorbench's per-variant recompute of the nodes and
+    patching families in phi_variants (landing 10-13; until then it holds them at the union's values, as --grow did, and
+    ranks groups only by point, track_pp, interchange_pp, pattern and N); edges and flips stay held at the union's. {"nodes", "positions", "phi", "bar", "unit", "steps": [group, size, phi]}."""
     nat = ge.nat
     tau = ge.tau(tx, pool, "search")
     bar, fams = tau["phi_tau"], tau["families"]
@@ -1061,27 +1065,39 @@ def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=pr
     groups = {}
     for nd in act:
         if nd[1] in f2:
-            groups.setdefault(nd[1], []).append(nd)
+            groups.setdefault(nd[1] if unit == "position" else (nd[0], nd[1]), []).append(nd)
 
-    def phis(sets):
+    def exact(sets):
         out = []
         for i in range(0, len(sets), FORWARD_CHUNK):
             rows = ge.fidelity(tx, [native.Graph(sorted(s), complete=True) for s in sets[i:i + FORWARD_CHUNK]], pool,
                                mode="reward", split="search")
             out += [goal_eval.phi(r, families=fams)[0] for r in rows]
         return out
-    ph = phis([cur])[0]
+    if unit == "site":                                       # the union's row once; every variant a node subset of it
+        union = native.Graph(sorted(cur | {nd for g in groups.values() for nd in g}), complete=True)
+        base = ge.fidelity(tx, [union], pool, mode="reward", split="search", interchange=8, changed=8)[0]
+
+        def score(sets):
+            got = ge.phi_variants(tx, union, ge.keep_of(tx, union, [sorted(s) for s in sets]), pool, base=base, start=bar)
+            return [v["phi"] for v in got["variants"]]
+    else:
+        score = exact
+    ph = exact([cur])[0]
     steps = [[None, len(cur), ph]]
-    log(f"  forward: targets ({len(cur)} subcomponents) phi {ph} (bar {bar})", flush=True)
+    log(f"  forward ({unit}): targets ({len(cur)} subcomponents) phi {ph} (bar {bar})", flush=True)
     while groups and (ph is None or bar is None or ph < bar + PHI_SLACK):
         keys = sorted(groups)
-        got = phis([cur | set(groups[k]) for k in keys])
+        got = score([cur | set(groups[k]) for k in keys])
         j = max(range(len(keys)), key=lambda i: -math.inf if got[i] is None else got[i])
         cur |= set(groups.pop(keys[j]))
         ph = got[j]
+        if unit == "site" and ph is not None and bar is not None and ph >= bar + PHI_SLACK:
+            ph = exact([cur])[0]                             # phi_variants holds edges and flips: confirmed in full
         steps.append([keys[j], len(cur), ph])
-        log(f"  forward: + position {keys[j]} ({len(cur)} subcomponents) phi {ph} (bar {bar}), {len(keys)} tried", flush=True)
-    return {"nodes": sorted(cur), "positions": sorted({nd[1] for nd in cur}), "phi": ph, "bar": bar, "steps": steps}
+        log(f"  forward: + {keys[j]} ({len(cur)} subcomponents) phi {ph} (bar {bar}), {len(keys)} tried", flush=True)
+    return {"nodes": sorted(cur), "positions": sorted({nd[1] for nd in cur}), "phi": ph, "bar": bar, "unit": unit,
+            "steps": steps}
 
 
 SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its own log recovery (fleet's 9004 finding)
@@ -1089,18 +1105,18 @@ SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its o
 
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
                acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS,
-               phi_pool: dict | None = None, forward: bool = False, backup: bool = False) -> tuple:
+               phi_pool: dict | None = None, forward: str | None = None, backup: bool = False) -> tuple:
     """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): goal_eval.GoalEval.start_set
     (VPD's active subcomponents at the targets and the m most influential positions, every connection; search split
     s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
     and the acceptance floors (min(0.9, the start's)) at levels, each level
     under Validated when the acceptance draws are "fv"; with phi_pool, every stage scored on the search split and the
     one of the highest circuit_score written (the reward's circuit term: phi against the bar, then compactness).
-    forward: the start forward_start's instead (with phi_pool); backup: the start first expanded by its compensators
+    forward: the start forward_start's at that unit instead (with phi_pool); backup: the start first expanded by its compensators
     (backup.expand_circuit). (The circuit, its Pruner, the record) as block_search's (no group, no blocks)."""
     nat = ge.nat
     st = ge.start_set(tx, "search")
-    fwd = forward_start(ge, tx, phi_pool, log) if forward and phi_pool is not None else None
+    fwd = forward_start(ge, tx, phi_pool, log, forward) if forward and phi_pool is not None else None
     start = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
     for n, t, c in (fwd["nodes"] if fwd is not None else st["graph"].node_set()):
         start[n][t, c] = True
@@ -1597,7 +1613,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
           accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
           accept_draws: str = "fixed", phi_pool: dict | None = None, context: str = "refine",
-          forward: bool = False, task: dict | None = None, backup: bool = False) -> tuple[dict, dict]:
+          forward: str | None = None, task: dict | None = None, backup: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -1642,7 +1658,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
             # the plain start pruned, with --backup the expanded start and with --forward forward_start's too, the
             # highest circuit_score written (text9000: backup's 165 subcomponents at 0.91)
             arms = [set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, forward=f, backup=b)
-                    for f, b in [(False, False)] + [(False, True)] * backup + [(True, False)] * forward]
+                    for f, b in [(None, False)] + [(None, True)] * backup + [(forward, False)] * bool(forward)]
             g, pb, _, _, row["blocks"] = max(arms, key=lambda a: -math.inf if a[4].get("score") is None else a[4]["score"])
             if backup or forward:
                 row["blocks"]["arms"] = [{"arm": "backup" if a[4]["backup"] else "forward" if a[4]["forward"] else "plain",
@@ -1913,8 +1929,9 @@ def main():
     ap.add_argument("--backup", action="store_true", help="with --f1-start set: the start as found and the start expanded "
                     "by its compensators (the backup agent's backup.expand_circuit, as subcomponents) each pruned, the higher "
                     "circuit_score written (implies --phi-check)")
-    ap.add_argument("--forward", action="store_true", help="with --f1-start set: an arm pruning forward_start's set (F2's "
-                    "positions added in order of phi until the bar), beside the plain (and --backup) arms (implies --phi-check)")
+    ap.add_argument("--forward", choices=("position", "site"), default=None, help="with --f1-start set: an arm pruning "
+                    "forward_start's set (F2's position groups, or one site at one position, added in order of phi until "
+                    "the bar), beside the plain (and --backup) arms (implies --phi-check)")
     ap.add_argument("--phi-log", action="store_true", help="--phi-check (whose set search scores every stage)")
     ap.add_argument("--accept-draws", choices=("fixed", "discriminating", "fresh", "fv"), default="fixed",
                     help="--accept changed's draws in pp mode: the search split's fixed ones, or per check a fresh sample of "
@@ -1984,8 +2001,8 @@ def main():
             r = json.loads(line)
             labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
-    phi_pool_needed = args.phi_check or args.phi_log or args.forward or args.backup or "phi" in args.accept.split(",")
-    args.phi_check = args.phi_check or args.phi_log or args.backup or args.forward
+    phi_pool_needed = args.phi_check or args.phi_log or bool(args.forward) or args.backup or "phi" in args.accept.split(",")
+    args.phi_check = args.phi_check or args.phi_log or args.backup or bool(args.forward)
     pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" or phi_pool_needed else None
     for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():

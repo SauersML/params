@@ -268,3 +268,14 @@ def test_norm_frozen(tiny):
     assert abs(got["circuit"]["overstate"] - got["model"]["overstate"]) < 1e-4 * max(1.0, got["model"]["overstate"])
     plain = bk.norm_frozen()
     assert plain["circuit"]["overstate"] >= 0
+
+
+def test_stream_ratio(tiny):
+    """stream_ratio: the whole model as blocks has the model's stream (ratio 1 at every norm); the circuit's is a
+    positive ratio."""
+    nat, ge, tx, circuit = tiny
+    bk = backup.Backup(ge, tx, circuit, draws=4, rows=3)
+    every = frozenset((n, t) for n in nat.names for t in range(tx.T))
+    got = bk.stream_ratio(blocks=every)
+    assert all(abs(v - 1.0) < 1e-5 for v in got.values()), got
+    assert all(v > 0 for v in bk.stream_ratio().values())

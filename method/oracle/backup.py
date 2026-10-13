@@ -414,6 +414,38 @@ class Backup:
         w = max(float(np.mean(self.W)), EPS)
         return {"circuit": f, "model": {"overstate": float(np.mean(model)) / w, "overstate_unheld": float(np.mean(self._claim_model())) / w}}
 
+    @torch.no_grad()
+    def stream_ratio(self, blocks=frozenset(), extra=frozenset()) -> dict:
+        """The circuit's residual stream against the model's at the point (no removal), at each RMS norm's input:
+        rms(circuit's) / rms(model's), the median over the norms (every layer's two and the final one) at the targets
+        ("targets") and over every norm and circuit position ("positions"), and the final norm's at the targets
+        ("final"). Below 1: the circuit's stream is smaller, so the norms scale its writes up."""
+        nat, E, dev = self.nat, self.E, self.nat.dev
+        got: dict = {}
+        orig = E._steps
+
+        def record(fused):
+            norm, act = orig(fused)
+
+            def nrm(x, j):
+                got.setdefault(j, []).append(x.detach().float().pow(2).mean(-1).sqrt())   # [B, T]
+                return norm(x, j)
+            return nrm, act
+
+        ones = {n: torch.ones(self.T, nat.C[n], device=dev) for n in nat.names}
+        m = {n: x.float() for n, x in self.masks(blocks, extra).items()}
+        try:
+            E._steps = record
+            E.log_probs({n: torch.stack([ones[n], m[n]]) for n in nat.names})
+        finally:
+            E._steps = orig
+            native.free(dev)
+        tg, P = list(self.tx.targets), self.positions
+        r = {j: (v[0][1] / v[0][0].clamp_min(EPS)).cpu() for j, v in got.items()}    # [T] per norm
+        return {"targets": float(np.median([float(x[t]) for x in r.values() for t in tg])),
+                "positions": float(np.median([float(x[t]) for x in r.values() for t in P])),
+                "final": float(np.median([float(r[-1][t]) for t in tg]))}
+
     # ---- the screen
 
     def screen(self, blocks=frozenset(), extra=frozenset()) -> dict:
@@ -855,7 +887,8 @@ def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back",
     the circuit's change at the prediction (r, cos, per site) for src's circuit and the share each of out's sets holds
     ("held"); the overstate with the outside held at its activations on the text (frozen: start, and per set with only
     the outside of the set held), beside the circuit's own overstate; the circuit's and the model's scores with every
-    norm's scale held at the model's on the text (norm_frozen). Lines in out/repair.jsonl; texts already there
+    norm's scale held at the model's on the text (norm_frozen); the circuit's stream against the model's at the norms
+    (stream_ratio) and each set's overstate on the same draws. Lines in out/repair.jsonl; texts already there
     skipped."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
@@ -870,7 +903,8 @@ def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back",
         g0, _ = goal_eval.circuit(json.loads(f0.read_text()), targets, nat.C, tx.T)
         bk = Backup(ge, tx, g0)
         row = {"task": p.stem, "start": bk.repair(), "held": {}, "frozen": {"start": bk.frozen()},
-               "overstate": bk.score([(frozenset(), frozenset())])[0]["overstate"], "norm_frozen": bk.norm_frozen()}
+               "overstate": bk.score([(frozenset(), frozenset())])[0]["overstate"], "norm_frozen": bk.norm_frozen(),
+               "stream": {"start": bk.stream_ratio()}, "overstate_set": {}}
         for k in sets:
             f = out / k / f"{p.stem}.json"
             if f.exists():
@@ -878,9 +912,13 @@ def repairs(split: str, n: int, src: Path, out: Path, sets=("fwd", "b1", "back",
                 b, x = b - bk.blocks0, x - bk.subs0
                 row["held"][k] = bk.repair(b, x)["held"]
                 row["frozen"][k] = bk.frozen(b, x)["overstate_frozen"]
+                row["stream"][k] = bk.stream_ratio(b, x)
+                row["overstate_set"][k] = bk.score([(frozenset(b), frozenset(x))])[0]["overstate"]
         with open(f_out, "a") as fh:
             fh.write(json.dumps(row) + "\n")
         nf = row["norm_frozen"]
+        log(f"{p.stem}: stream rms circuit/model at the targets " + " ".join(f"{k} {v['targets']:.2f}" for k, v in row["stream"].items())
+            + "; overstate " + " ".join(f"{k} {v:.2f}" for k, v in row["overstate_set"].items()))
         log(f"{p.stem}: norms held: circuit overstate {nf['circuit']['overstate']:.2f} s {nf['circuit']['s_search']} "
             f"F1 {nf['circuit']['f1']}, model {nf['model']['overstate']:.2f}")
         log(f"{p.stem}: r {row['start']['r']:.3f} cos {row['start']['cos']:.3f}, overstate {row['overstate']:.2f} (the model's own "

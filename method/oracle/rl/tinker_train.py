@@ -150,6 +150,53 @@ def renderer_for(base: str, thinking: bool = False):
     return renderers.get_renderer(name, tokenizer), tokenizer
 
 
+STAGES = (("compact",), ("compact", "E4x"), ("compact", "E4x", "E2g"), ("compact", "E4x", "E2g", "E1"),
+          ("compact", "E4x", "E2g", "E1", "E3"))  # the RL curriculum's active reward terms (the user's spec, 10-12)
+PLATEAU = 2  # held-out checkpoints in a stage without improvement on its terms before the next stage
+
+
+def stage_reward(score: dict, stage: int) -> float:
+    """Reward v3 with only the curriculum stage's terms: phi + g x (0.5 compact + the stage's other terms) + D; every
+    stage keeps the gate. An invalid answer keeps its fixed reward."""
+    if not score.get("valid"):
+        return score["reward"]
+    term = lambda t: score.get(t) if t in score else score.get("term_" + t)  # the scorer's names, or evaluate's term_ ones  # noqa: E731
+    q = sum((0.5 if t == "compact" else 1.0) * (term(t) or 0.0) for t in STAGES[stage])
+    return (score.get("phi") or 0.0) + (score.get("g") or 0.0) * q + (score.get("D") or 0.0)
+
+
+def stage_lines(text: str, credits: list, stage: int) -> list:
+    """The per-line credits the stage rewards: the circuit's lines always, the variable lines with E4x, the ANSWER and
+    FINAL lines with E2g."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import components
+
+    kind, sec = {}, None
+    for k, line in enumerate(text.split("\n")):
+        head = components.SECTION.match(line)
+        if head:
+            sec = head[1].split()[0].upper()
+        kind[k] = "E2g" if sec in ("ANSWER", "FINAL") else "E4x" if sec == "EXPLANATION" else "circuit"
+    return [[k, c] for k, c in credits if kind.get(k) == "circuit" or kind.get(k) in STAGES[stage]]
+
+
+def next_stage(log: Path, stage: int, since: int) -> int:
+    """The curriculum stage after the held-out evaluations so far (rl_heldout.sh's LOG/heldout_<step>.json): the next one
+    when the last PLATEAU checkpoints since the stage began (step since) score no better on its terms than its best
+    before them; else the same."""
+    got = []
+    for f in log.glob("heldout_*.json"):
+        m = re.fullmatch(r"heldout_(\d+)\.json", f.name)
+        if m and int(m[1]) >= since:
+            per = json.loads(f.read_text())["per_question"]["rl"]
+            got.append((int(m[1]), sum(stage_reward(q["samples"][0], stage) for q in per) / max(len(per), 1)))
+    got.sort()
+    if stage + 1 >= len(STAGES) or len(got) <= PLATEAU:
+        return stage
+    best = max(v for _, v in got[:-PLATEAU])
+    return stage + 1 if all(v <= best for _, v in got[-PLATEAU:]) else stage
+
+
 def line_advantages(tokenizer, tokens: list[int], text: str, credits: list, A: float, weight: float = LINE_WEIGHT) -> list[float]:
     """Per sampled token, its advantage with the per-line credit (the lead's v3): A + weight x z(c_l) over the tokens of
     answer line l (credits: [[line number in the answer text, c], ...], z normalized over the answer's credited lines,
@@ -484,10 +531,16 @@ def rl(a) -> None:
         spend.total = next(r["usd"] for r in map(json.loads, (a.log / "checkpoints.jsonl").read_text().splitlines())
                            if r["step"] == a.first_step)
     failed = 0
+    sf = a.log / "stage.json"  # the curriculum's stage and the step it began, kept across resumes
+    stage, since = (json.loads(sf.read_text())[k] for k in ("stage", "since")) if sf.exists() else (a.stage, a.first_step)
     sampler = training.save_weights_and_get_sampling_client()
     pending = submit(sampler)
     for step in range(a.first_step, a.steps):
         t0 = time.time()
+        if a.curriculum and (s2 := next_stage(a.log, stage, since)) != stage:
+            stage, since = s2, step
+            print(json.dumps({"step": step, "stage": stage, "terms": STAGES[stage]}), flush=True)
+        sf.write_text(json.dumps({"stage": stage, "since": since}))
         datums, groups = [], []
         for q, prompt, fut in pending:
             res = fut.result()
@@ -513,7 +566,7 @@ def rl(a) -> None:
                     raise SystemExit(f"the scorer failed {failed} times (requests in {a.log}/failed_*.json)")
                 continue
             scores = r.json()["scores"]
-            rewards = [s["reward"] for s in scores]
+            rewards = [stage_reward(s, stage) for s in scores]
             mean = sum(rewards) / len(rewards)
             distinct = len({tuple(s.tokens) for s in res.sequences})
             if step == 0 and distinct == 1 and a.group > 1:  # a seeded or degenerate sampler: no advantage, nothing learned
@@ -525,7 +578,7 @@ def rl(a) -> None:
                            "terms": {k: [s.get(k) for s in scores] for k in ("phi", "phi_tau", "g", "compact", "bits", "D", "Q", "E2g",
                                                                               "E4x", "E1", "C", "N", "E2", "E3", "E4")}})
             for s, rew, sc, text in zip(res.sequences, rewards, scores, texts):
-                adv = line_advantages(tokenizer, list(s.tokens), text, sc.get("lines") or [], rew - mean)
+                adv = line_advantages(tokenizer, list(s.tokens), text, stage_lines(text, sc.get("lines") or [], stage), rew - mean)
                 if not any(adv):
                     continue
                 ob = n - 1
@@ -549,7 +602,7 @@ def rl(a) -> None:
             spend.add("rl", trained=sum(d.model_input.length for d in datums))
             sampler = training.save_weights_and_get_sampling_client()
         flat = [x for g in groups for x in g["rewards"]] or [float("nan")]
-        line = json.dumps({"step": step, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
+        line = json.dumps({"step": step, "stage": stage, "reward": sum(flat) / len(flat), "valid": sum(v for g in groups for v in g["valid"]) / len(flat),
                            "distinct": [g["distinct"] for g in groups],
                            "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],
                            "thinking_tokens": [t for g in groups for t in g["thinking_tokens"]],
@@ -596,6 +649,10 @@ def main():
     r.add_argument("--reader", action="store_true", help="E1 from a frozen reader on Tinker (--reader-model)")
     r.add_argument("--reader-model", default=REWARD_READER, help="the reward's E1 reader")
     r.add_argument("--save-every", type=int, default=25, help="steps between saved states (checkpoints.jsonl)")
+    r.add_argument("--stage", type=int, default=0, help="the curriculum stage to start in (STAGES: 0 phi and compact, then "
+                   "E4x, E2g, E1, E3); stage.json in --log takes over on a resume")
+    r.add_argument("--curriculum", action="store_true", help="advance a stage when the held-out evaluations (rl_heldout.sh "
+                   "beside the run) stop improving on its terms (PLATEAU checkpoints)")
     r.add_argument("--first-step", type=int, default=0, help="resume: the step --init's state was saved at (its checkpoint "
                                                                 "line kept; the run appends to the same --log)")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")

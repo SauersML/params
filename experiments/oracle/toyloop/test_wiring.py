@@ -90,7 +90,8 @@ def test_training_wiring_reward_executes_edges_and_rejects_partial_invalid(pair,
     full = reward({"toy": toy}, FULL)
     cut = reward({"toy": toy}, CUT)
     assert full > .999 and 0 <= cut < full
-    for answer in ("unparseable", FULL + "\nL0N999 --> out", FULL + "\nunknown --> out"):
+    for answer in ("unparseable", FULL.replace("English:", "L0N999 --> out\nEnglish:"),
+                   FULL.replace("English:", "unknown --> out\nEnglish:")):
         assert reward({"toy": toy}, answer) == -1 < cut
 
 

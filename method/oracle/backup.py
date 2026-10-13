@@ -983,6 +983,78 @@ def derived_sets(row: dict, g0: native.Graph, tx: goal_eval.Text, nat, seed: int
     return out
 
 
+@torch.no_grad()
+def node_family(ge: goal_eval.GoalEval, tx: goal_eval.Text, graphs: list, draws: int, reads: bool = False,
+                units: list | None = None) -> list[dict]:
+    """goal_eval.GoalEval._node_family without reads (reads must be False), its draws (GoalEval._rng, _unit_draws),
+    engines and fields, with each draw's removals written as one indexed assignment per site instead of one scalar
+    assignment per removed subcomponent: on block-expanded node sets (every site at a circuit position, ~150,000
+    subcomponents) goal_eval's loop spent 15+ minutes in those writes on dev20b's first text. The same masks, so the
+    same numbers (test_backup checks them against goal_eval's)."""
+    import engine
+
+    if reads:
+        raise ValueError("node_family reproduces goal_eval's node family without reads")
+    nat, T, dev = ge.nat, tx.T, ge.nat.dev
+    cols = {n: {c for g in graphs for m, _, c in g.node_set() if m == n} for n in nat.names}
+    circ = {n: torch.tensor(sorted(cols[n]), dtype=torch.long, device=dev) for n in nat.names}
+    vcols = {n: torch.unique(torch.cat([circ[n], tx.vpd[n].any(0).nonzero().flatten()])) for n in nat.names}
+    Em = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ, outside="on")
+    Ev = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=vcols)
+    Ec = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ)
+
+    def lut(cs):  # subcomponent index -> the engine's column
+        return {n: torch.full((nat.C[n],), -1, dtype=torch.long, device=dev).index_put_((cs[n],), torch.arange(len(cs[n]), device=dev))
+                for n in nat.names}
+    at, vat = lut(circ), lut(vcols)
+    vpd = {n: tx.vpd[n][:, vcols[n]].float() for n in nat.names}
+    out = []
+    for g in graphs:
+        nodes = sorted(g.node_set())
+        if not nodes:
+            out.append({"kl_nodes_c": ge._bounds(tx, "live")[0], "kl_nodes_vpd": ge._bounds(tx, "live")[1], "reads_nodes": None})
+            continue
+        rng = ge._rng(tx, g, "nodes")
+        drops = goal_eval._unit_draws(rng, sorted(units[len(out)]) if units is not None else nodes, draws, nat.C)
+        per: dict = {}
+        for b, dd in enumerate(drops):
+            for n, t, c in dd:
+                x = per.setdefault(n, ([], [], []))
+                x[0].append(b)
+                x[1].append(t)
+                x[2].append(c)
+        per = {n: tuple(torch.tensor(v, dtype=torch.long, device=dev) for v in x) for n, x in per.items()}
+
+        def without(base, where):
+            m = {n: x[None].repeat(len(drops), 1, 1) for n, x in base.items()}
+            for n, (b, t, c) in per.items():
+                m[n][b, t, where[n][c]] = 0.0
+            return m
+
+        lm = Em.log_probs(without({n: torch.ones(T, len(circ[n]), device=dev) for n in nat.names}, at))
+        lv = Ev.log_probs(without(vpd, vat))
+        if g.complete:
+            gm = {n: torch.zeros(T, len(circ[n]), device=dev) for n in nat.names}
+            by: dict = {}
+            for n, t, c in nodes:
+                by.setdefault(n, ([], []))
+                by[n][0].append(t)
+                by[n][1].append(c)
+            for n, (t, c) in by.items():
+                gm[n][torch.tensor(t, device=dev), at[n][torch.tensor(c, device=dev)]] = 1.0
+            lc = Ec.log_probs(without(gm, at))
+        else:
+            lc = Ec.graph_log_probs(Ec.plan([goal_eval._drop_nodes(g, set(d)) for d in drops], semantics="c"))
+        kc_, kv_ = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
+        w_, claim = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()
+        out.append({"kl_nodes_c": float(np.mean(kc_)), "kl_nodes_vpd": float(np.mean(kv_)),
+                    "draws_nodes": [[j, a, b_, c, d] for j, (a, b_, c, d) in enumerate(zip(kc_, kv_, w_, claim))],
+                    "overstate_nodes": float(np.mean(claim)) / max(float(np.mean(w_)), 1e-12),
+                    "reads_nodes": None, "_pairs_nodes": {}})
+        native.free(dev)
+    return out
+
+
 def _time_families(ge: goal_eval.GoalEval, log) -> None:
     """Each of fidelity's families (TIMED) logs its seconds: the pod log names a family that holds a run. The node and
     interchange families run without their read pairs (reads=False; the reads_* and dreads_* diagnostics, none of
@@ -1017,6 +1089,7 @@ def evaluate(split: str, n: int, src: Path, out: Path, sets=EVAL_SETS, derived: 
     the fidelity fields) appended to out/fidelity.jsonl; texts already there skipped."""
     ge = goal_eval.GoalEval()
     nat = ge.nat
+    ge._node_family = lambda tx, graphs, draws, reads=False, units=None: node_family(ge, tx, graphs, draws, False, units)
     _time_families(ge, log)
     pool = torch.load(Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt")
     ge._edge_family = lambda tx, graphs, draws, reads=False: [{"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None}

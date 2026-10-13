@@ -211,7 +211,11 @@
 %% Artifacts: scratch/variable_reward/claim_recovery/materialized_v2 (analysis, strict proofs, rows, join_validation).
 %% Lossless existing-syntax carrier batching reduces15 answers559057 to263209tokens; every graph relation,
 %% member, instance, claim, QA and edit survives roundtrip.51 tests pass,1 skipped. Still only2 of15 rows fit.
-%% Eleven exceed266nodes independently; sparse carrier sets dominate the other two overflowing answers.
+%% Ten exceed266nodes independently;6016 is a separate reserved exclusion, not an eleventh node-limit failure.
+%% Audit of immutable old/current counts agrees:6011 has262nodes,6027 has169; both still exceed output tokens.
+%% Further existing-syntax rendering saves4.66% (263209 to250956 answer tokens), exact parse identity on15rows,
+%% but eligible rows remain6001/6022. No production change warranted; prioritize smaller verified carriers.
+%% Evidence: scratch/variable_reward/real_mermaid_compression; original artifacts retained unchanged.
 %% Index ranges would save under1%, so no new parser grammar. Smaller token count alone does not make a mechanism simple.
 %% Compact train shard: scratch/variable_reward/claim_recovery/compact_training_v1;6001/6022,11 claims,
 %% actual written-row roundtrip passes;59846bytes, SHA38c585f6bf340d2a5bcb6ac3979d597d1b2e15b505f13d11c51b89b794c26e39.
@@ -421,7 +425,7 @@ flowchart BT
   ENG209["<b>Does the 209 carrier generalize?</b><br/>32 fresh donors × 3 input positions;<br/>test cause, isolation and worst cases;<br/>free MATS 19680 held; no release<br/>WAITING · codex/variable_reward"]
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
-  CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
+  CLAIMFIT["<b>Carrier size remains the limit</b><br/>53% compression; further4.7% adds no rows;<br/>2 of15 exact rows fit training limits;<br/>next: smaller verified carrier sets<br/>AUDIT DONE · codex/variable_reward"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Teach every relation example</b><br/>21 of68 never sampled by SFT;<br/>test coverage before repetition;<br/>same targets, steps and token limits<br/>ACTIVE · codex/fork_review"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
@@ -610,7 +614,7 @@ flowchart BT
   class ROUTEEDIT check
   class PYV done
   class FBASE check
-  class CLAIMFIT check
+  class CLAIMFIT done
   class CLAIMDATA,CLAIMREC done
   class ENGP done
   class S1AUDIT done

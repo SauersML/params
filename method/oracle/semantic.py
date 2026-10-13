@@ -406,7 +406,9 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
     and input position p: fresh donor tokens the value map never saw (sampled from the model's prediction at p, the
     map's tokens and the text's own left out); a fresh token z whose changed text the model itself sends to a class's
     predicted token y (not the text's top) belongs to that class, and the explanation then predicts that the carrier
-    alone carries it: 'V from @p=z -> top y' (per_class tokens per class); and per variable 'remove V -> p(top) < 0.5'.
+    alone carries it: 'V from @p=z -> top y' (per_class tokens per class); per variable 'remove V -> p(top) < 0.5'; and
+    per pair of variables at different positions, both carriers from two donors (each one's first fresh token), the
+    model's own prediction on the text with both changes as the claim (independent recombination).
     Each line checked in the real model (Checker.outcome: holds, surprise against the no-change prediction, credit),
     the lines that hold first."""
     import hashlib
@@ -414,7 +416,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
     import components
 
     ck = Checker(sc, tx, vs)
-    items = []
+    items, first = [], {}
     try:
         for v in vs:
             for vm in v.get("values") or []:
@@ -427,23 +429,37 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                 zs = torch.multinomial(w, min(fresh, int((w > 0).sum())), replacement=False, generator=gen).tolist()
                 want = {int(c["predicts_id"]): c["id"] for c in vm["classes"][1:] if c.get("predicts_id") is not None}
                 got = {}
+                if zs:
+                    first.setdefault(v["name"], (p, int(zs[0])))
                 for z in zs:
                     y = int(ck.text({p: z})["lq"][-1].argmax())
                     if y != ck.y0 and y in want and len(got.setdefault(want[y], [])) < per_class:
                         got[want[y]].append((z, y))
                 for pairs in got.values():
-                    items += [(v["name"], {"transplants": [(v["name"], {p: z})]}, ("top", y), (p, z, y)) for z, y in pairs]
+                    items += [(v["name"], {"transplants": [(v["name"], {p: z})]}, ("top", y), [(v["name"], p, z), y]) for z, y in pairs]
             items.append((v["name"], {"remove": [v["name"]]}, ("drop", 0.5), None))
+        names = [v["name"] for v in vs if v["name"] in first]
+        for i, a in enumerate(names):  # independent recombination: two variables from two donors, the model's own
+            for b in names[i + 1:]:     # prediction on the text with both changes as the claim
+                (pa, za), (pb, zb) = first[a], first[b]
+                if pa == pb:
+                    continue
+                y = int(ck.text({pa: za, pb: zb})["lq"][-1].argmax())
+                if y != ck.y0:
+                    items.append((a, {"transplants": [(a, {pa: za}), (b, {pb: zb})]}, ("top", y), [(a, pa, za), (b, pb, zb), y]))
         rows = ck.check([(iv, out) for _, iv, out, _ in items])
     finally:
         ck.close()
-    toks = components.token_strings(model, [t for *_, e in items if e for t in e[1:]])
+    toks = components.token_strings(model, [t for *_, e in items if e for t in [x[2] for x in e[:-1]] + [e[-1]]])
     out, k = [], 0
     for (name, iv, outc, e), r in zip(items, rows):
         if e:
-            z, y = toks[k], toks[k + 1]
-            k += 2
-            line = f"{name} from @{e[0]}={components.shown(z)} -> top {components.shown(y)}"
+            parts = []
+            for nm, q, _ in e[:-1]:
+                parts.append(f"{nm} from @{q}={components.shown(toks[k])}")
+                k += 1
+            line = f"{', '.join(parts)} -> top {components.shown(toks[k])}"
+            k += 1
         else:
             line = f"remove {name} -> p(top) < 0.5"
         out.append({"line": line, **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")}})

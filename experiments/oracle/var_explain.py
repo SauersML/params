@@ -17,6 +17,7 @@ Every line is rechecked here on one device under three conditions, with its hold
   experiments/oracle/var_explain.py write [--dir DIR] [--out DIR]   explanations and the LLM's prompts (prompts.jsonl)
   (tinker venv) experiments/oracle/var_explain_llm.py OUT/prompts.jsonl OUT/llm.jsonl [--hint, to OUT/llm_hint.jsonl]
   experiments/oracle/var_explain.py check [--dir DIR] [--out DIR] [--device D]   the three conditions, OUT/check.jsonl
+  experiments/oracle/var_explain.py targets --dir influential_v2 --out DIR   the English SFT arm's targets (targets())
 """
 from __future__ import annotations
 
@@ -239,14 +240,55 @@ def check(a) -> None:
         print(t, {k: (round(row[k]["holds"], 3), round(row[k]["credit"], 1)) for k in ("teacher", "shuffled", *LLM) if k in row}, flush=True)
 
 
+def targets(a) -> None:
+    """The English SFT arm's targets (the lead's 10-13): per text of influential_v2 with kept variables, the teacher
+    circuit's path, the kept variables (names, meanings, carriers, and generality's transfer field: the median E4 term
+    on other members of the text's family and whether it is at least 0.8; none outside the families), the INVARIANTS
+    lines that held on fresh tokens (renumbered), and the rendered VARIABLES and INVARIANTS blocks; one JSON line per
+    text to OUT/<split>.jsonl. Texts are listed by their variables' transfer share (the share of kept variables that
+    transfer, none outside the families) for picking targets."""
+    tr = {}
+    for x in json.loads((native.TEXTS.parent / "generality" / "var_transfer_v2_keep.json").read_text()):
+        tr[(x["source"], x["name"])] = {"family": x["family"], "median": x["transfer_median"], "transfers": x["transfers"],
+                                        "targets": x["targets"]}
+    root = a.dir.parent if a.dir.name in ("train", "heldout") else a.dir
+    a.out.mkdir(parents=True, exist_ok=True)
+    for split in ("train", "heldout"):
+        rows = []
+        for f in sorted((root / split).iterdir()):
+            if f.suffix != ".json" or not f.name.startswith("text"):
+                continue
+            r = json.loads(f.read_text())
+            if not any(v.get("kept") for v in r["variables"]):
+                continue
+            ids = json.loads((native.TEXTS / "vpd4l" / f"{f.stem}.json").read_text())["prompts"][0]["token_ids"]
+            holding = [x for x in r.get("invariants") or [] if x["holds"]]
+            for k, x in enumerate(holding, 1):  # holding lines only, renumbered
+                x["line"] = re.sub(r"^I\d+:", f"I{k}:", x["line"])
+            ex = explanation({**r, "invariants": holding}, ids)
+            for v in ex["variables"]:
+                v["transfer"] = tr.get((f.stem, v["name"]))
+            known = [v["transfer"]["transfers"] for v in ex["variables"] if v["transfer"]]
+            rows.append({"task": f.stem, "split": split, "circuit": str(native.TEXTS.parent / "teacher" / "influential_v2" / f"{f.stem}.json"),
+                         "variables": ex["variables"], "invariants": [x["line"] for x in holding],
+                         "invariants_version": r["teacher"].get("invariants_version"), "text": ex["text"],
+                         "transfer_share": sum(known) / len(known) if known else None})
+        rows.sort(key=lambda x: (x["transfer_share"] is None, -(x["transfer_share"] or 0), x["task"]))
+        with (a.out / f"{split}.jsonl").open("w") as fh:
+            for x in rows:
+                fh.write(json.dumps(x) + "\n")
+        print(split, len(rows), "texts;", sum(len(x["invariants"]) for x in rows), "holding lines;",
+              sum(x["transfer_share"] is not None for x in rows), "in a family")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("what", choices=("write", "check"))
+    ap.add_argument("what", choices=("write", "check", "targets"))
     ap.add_argument("--dir", type=Path, default=DIR)
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--device")
     a = ap.parse_args()
-    (write if a.what == "write" else check)(a)
+    {"write": write, "check": check, "targets": targets}[a.what](a)
 
 
 if __name__ == "__main__":

@@ -8,10 +8,34 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 import random
 
 VERSION = "common-node-panel-v1"
+
+
+def no_change_control(draws: list[dict], floor: float = 1e-9) -> dict:
+    """Compare paired prediction error to always predicting the original model.
+
+    W is KL(intervened model || original model). W - candidate KL is the
+    expected log-score improvement in bits. The separate log-error reduction
+    measures halvings of pooled KL, with a numerical floor for inert worlds.
+    This diagnostic does not establish mechanistic validity or alter reward.
+    """
+    if not draws or not math.isfinite(floor) or floor <= 0:
+        raise ValueError("nonempty paired draws and a positive finite floor required")
+    pairs = [(float(d["W"]), float(d["kl_candidate"])) for d in draws]
+    if any(not math.isfinite(value) for pair in pairs for value in pair):
+        raise ValueError("paired KLs must be finite")
+    w = math.fsum(x for x, _ in pairs) / len(pairs)
+    k = math.fsum(y for _, y in pairs) / len(pairs)
+    return {"predictor": "original_model_no_change", "draws": len(pairs),
+            "kl_no_change": w, "kl_candidate": k,
+            "prediction_gain_bits": w - k,
+            "log_error_reduction_bits": math.log2((max(w, 0.0) + floor) / (max(k, 0.0) + floor)),
+            "beats_no_change": k < w,
+            "draw_win_fraction": sum(kc < wc for wc, kc in pairs) / len(pairs)}
 
 
 def bank(tx, split: str = "eval", draws: int = 32) -> dict:
@@ -135,16 +159,17 @@ def evaluate(ge, tx, graphs, split: str = "eval", draws: int = 32) -> list[dict]
             k = float(np.mean(kc))
             raw = _score(goal_eval, k, e, v) if resolved else None
             eps, boots = _eps(goal_eval, kc, ref["empty"], ref["vpd"]) if resolved else (None, 0)
+            paired = [{"index": j, "removed": panel["removed"][j], "kl_candidate": float(kc[j]),
+                       "kl_empty": float(ref["empty"][j]), "kl_vpd": float(ref["vpd"][j]),
+                       "W": float(ref["W"][j]), "model_top": ref["model"][j].argmax(-1).tolist()}
+                      for j in range(draws)]
             out.append({"version": VERSION, "split": split, "bank_sha256": panel["bank_sha256"],
                 "resolved": resolved, "unresolved_reason": None if resolved else "common empty does not exceed VPD error",
                 "score": None if raw is None else min(1.0, max(0.0, raw)), "raw_score": raw, "eps": eps,
                 "bootstrap_resolved": boots, "bootstrap_total": goal_eval.EPS_BOOT,
                 "kl_candidate": k, "kl_empty": e, "kl_vpd": v, "W": float(np.mean(ref["W"])),
                 "source_sha256": sources,
-                "draws": [{"index": j, "removed": panel["removed"][j], "kl_candidate": float(kc[j]),
-                           "kl_empty": float(ref["empty"][j]), "kl_vpd": float(ref["vpd"][j]),
-                           "W": float(ref["W"][j]), "model_top": ref["model"][j].argmax(-1).tolist()}
-                          for j in range(draws)]})
+                "no_change_control": no_change_control(paired), "draws": paired})
             del E, lc
             native.free(nat.dev)
     return out

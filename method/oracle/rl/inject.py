@@ -222,14 +222,23 @@ class Explainer:
 
 
 def derange(nodes: list[tuple], rng: random.Random) -> list[tuple]:
-    """The vectors' owners shuffled so none keeps its own (where there are two or more)."""
-    if len(nodes) < 2:
-        return nodes
-    while True:
-        p = nodes[:]
-        rng.shuffle(p)
-        if all(a != b for a, b in zip(p, nodes)):
-            return p
+    """Permute weight identities within each kind; positions cannot make identical vectors distinct.
+
+    Permute unique owners, using one donor for every position of the same weight.
+    Preserve receiving positions; a kind with only one owner cannot supply this control.
+    """
+    kinds = {}
+    for site, _, component in nodes:
+        kinds.setdefault(site.split(".")[-1], set()).add((site, component))
+    assigned = {}
+    for kind, owners in kinds.items():
+        order = sorted(owners)
+        if len(order) < 2:
+            raise ValueError(f"cannot derange distinct weight components of kind {kind}")
+        rng.shuffle(order)
+        assigned.update(zip(order, order[1:] + order[:1]))
+    return [(assigned[(site, component)][0], position, assigned[(site, component)][1])
+            for site, position, component in nodes]
 
 
 def device() -> torch.device:
@@ -324,7 +333,8 @@ def sample(a) -> None:
         question, nds = slotted(r["question"], r)
         prompts.append(ex.prompt_ids(question))
         nodes.append(derange(nds, rng) if a.shuffle else nds)
-        shuffled.append(derange(nds, rng))
+        if a.shuffled_out:
+            shuffled.append(derange(nds, rng))
     sets = [(a.out, nodes)] + ([(a.shuffled_out, shuffled)] if a.shuffled_out else [])
     t0 = time.time()
     tok = ex.tok

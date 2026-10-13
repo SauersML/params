@@ -42,8 +42,8 @@ class Slots:
     """Arm "inject": two placeholder tokens after each subcomponent a question names (meta["slots"]), their input
     embeddings its read vector v and write vector u through method/oracle/rl/inject.py's Injector (per site kind and
     side a linear map to the width, at the token embeddings' RMS, plus its log |u||v|), trained with the LoRA. shuffle:
-    each named subcomponent gets the vectors of another of the same kind named in some question (pool), the ablation
-    that shows whether they are read."""
+    each named subcomponent gets a distinct weight component's vectors of the same kind from the question pool.
+    Positions do not change a component's vectors; a pool without a distinct donor cannot supply this control."""
 
     def __init__(self, model, tok, init: Path | None = None, shuffle: bool = False):
         import sys
@@ -64,10 +64,11 @@ class Slots:
         self.pool = {}
 
     def pool_from(self, rows: list[dict]) -> None:
+        pool = {}
         for r in rows:
             for _, nd in r["meta"].get("slots", []):
-                self.pool.setdefault(nd[0].split(".")[-1], set()).add(tuple(nd))
-        self.pool = {k: sorted(v) for k, v in self.pool.items()}
+                pool.setdefault(nd[0].split(".")[-1], set()).add((nd[0], nd[2]))
+        self.pool = {k: sorted(v) for k, v in pool.items()}
 
     def prompt(self, r: dict) -> tuple[str, list[tuple]]:
         text, at, nodes = r["prompt"], 0, []
@@ -79,9 +80,19 @@ class Slots:
             text = text[:cut] + " " + self.inject.SLOT * 2 + text[cut:]
             at = cut + 1 + 2 * len(self.inject.SLOT)
             nodes.append(tuple(nd))
-        if self.shuffle:  # another subcomponent's vectors of the same kind (its maps' widths), from any question
+        if self.shuffle:  # another weight component of the same kind (its maps' widths), from any question
             rng = random.Random(text)
-            nodes = [rng.choice([x for x in self.pool[nd[0].split(".")[-1]] if x != nd] or [nd]) for nd in nodes]
+            shuffled, assigned = [], {}
+            for site, position, component in nodes:
+                identity = (site, component)
+                if identity not in assigned:
+                    donors = [x for x in self.pool.get(site.split(".")[-1], []) if x != identity]
+                    if not donors:
+                        raise ValueError(f"shuffle has no distinct weight component for {site}#{component}")
+                    assigned[identity] = rng.choice(donors)
+                other_site, other_component = assigned[identity]
+                shuffled.append((other_site, position, other_component))
+            nodes = shuffled
         return text, nodes
 
     def embeds(self, model, ids, nodes: list[list[tuple]]):
@@ -369,7 +380,7 @@ def main():
     s.add_argument("out")
     s.add_argument("--adapter")
     s.add_argument("--inject", action="store_true")
-    s.add_argument("--shuffle", action="store_true", help="with --inject: the vectors deranged within each question")
+    s.add_argument("--shuffle", action="store_true", help="with --inject: distinct same-kind weight components from the question pool")
     s.add_argument("--base", default="Qwen/Qwen3-1.7B")
     ac = sub.add_parser("active-score")
     ac.add_argument("rows")

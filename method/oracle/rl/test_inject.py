@@ -1,5 +1,6 @@
 """inject.py on a tiny random Qwen3 and small vectors: the slots, the embeddings at them, a training step, sampling."""
 
+import ast
 import random
 import sys
 from pathlib import Path
@@ -10,7 +11,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import inject  # noqa: E402
+import inject
 
 QUESTION = ("1 ('a'): L0.fc#3@1 (0.90; routed lens at this position raises 'x'), L1.k#2@1 (1.00)\n"
             "  wiring: L0.fc#3@1 -> L1.k#2@1 (+0.20)\n2 ('b'): L0.fc#3@2 (0.50)")
@@ -64,7 +65,7 @@ def test_slot_embeddings_are_the_vectors_and_train(tiny):
     v, u, scale = ex.vectors(nodes[0])
     assert abs(float(v.norm()) - 1) < 1e-5 and abs(float(u.norm()) - 1) < 1e-5 and scale > 0  # unit directions, the scale apart
     assert torch.allclose(emb[0, pos], want) and len(pos) == 2 * len(nodes)
-    other = inject.derange(nodes, random.Random(0))
+    other = [("h.0.mlp.c_fc", 1, 4), ("h.1.attn.k_proj", 1, 3), ("h.0.mlp.c_fc", 2, 4)]
     assert not torch.allclose(ex.embed(ids, [other])[0, pos], want)  # shuffled vectors change what the slots carry
     opt = torch.optim.AdamW(ex.param_groups(1e-2))
     before = [p.detach().clone() for p in ex.injector.parameters()]
@@ -83,3 +84,112 @@ def test_sample_returns_tokens(tiny):
     ex.save(d / "run")
     again = inject.Explainer(str(d / "model"), 4, torch.device("cpu"), ex.vectors, init=d / "run")
     assert torch.allclose(again.embed(torch.tensor([ex.prompt_ids(q)]), [nodes]), ex.embed(torch.tensor([ex.prompt_ids(q)]), [nodes]))
+
+
+@pytest.fixture
+def learn_slots():
+    # The production Slots selection methods need no model, checkpoint, or tokenizer.
+    source = Path(__file__).resolve().parents[3] / "experiments" / "oracle" / "learn_sft.py"
+    tree = ast.parse(source.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Slots")
+    namespace = {"Path": Path, "random": random}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)  # noqa: S102
+    slots = namespace["Slots"].__new__(namespace["Slots"])
+    slots.inject, slots.shuffle, slots.pool = inject, True, {}
+    return slots
+
+
+def test_learn_shuffle_rejects_position_aliases_as_donors(learn_slots):
+    row = {"prompt": "a b", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]],
+                                                ["b", ["h.0.mlp.c_fc", 2, 3]]]}}
+    learn_slots.pool_from([row])
+    assert learn_slots.pool == {"c_fc": [("h.0.mlp.c_fc", 3)]}
+    with pytest.raises(ValueError, match="no distinct weight component"):
+        learn_slots.prompt(row)
+
+
+def test_learn_shuffle_changes_weight_identity_and_preserves_position(learn_slots):
+    row = {"prompt": "a b", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]],
+                                                ["b", ["h.0.mlp.c_fc", 2, 3]]]}}
+    donor = {"meta": {"slots": [["c", ["h.1.mlp.c_fc", 5, 7]], ["d", ["h.1.attn.k_proj", 5, 9]]]}}
+    learn_slots.pool_from([row, donor])
+    _, nodes = learn_slots.prompt(row)
+    assert nodes == [("h.1.mlp.c_fc", 1, 7), ("h.1.mlp.c_fc", 2, 7)]
+    assert learn_slots.prompt(row) == learn_slots.prompt(row)
+
+
+def test_learn_shuffle_missing_kind_does_not_silently_keep_vectors(learn_slots):
+    row = {"prompt": "a", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]]]}}
+    learn_slots.pool_from([])
+    with pytest.raises(ValueError, match="no distinct weight component"):
+        learn_slots.prompt(row)
+
+
+def test_learn_shuffle_one_donor_per_repeated_weight_identity(learn_slots):
+    row = {"prompt": "a b", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]],
+                                                ["b", ["h.0.mlp.c_fc", 2, 3]]]}}
+    donors = {"meta": {"slots": [["c", ["h.1.mlp.c_fc", 5, 7]], ["d", ["h.2.mlp.c_fc", 6, 9]]]}}
+    learn_slots.pool_from([row, donors])
+    learn_slots.pool_from([row, donors])
+    for seed in range(20):
+        _, nodes = learn_slots.prompt({**row, "prompt": f'{seed} a b'})
+        assert (nodes[0][0], nodes[0][2]) == (nodes[1][0], nodes[1][2])
+        assert nodes[0][2] in {7, 9}
+
+
+@pytest.mark.parametrize("nodes", [[("s", 0, 1)], [("s", 0, 1), ("s", 1, 1)],
+                                    [("h.0.attn.q_proj", 0, 1), ("h.0.attn.k_proj", 0, 2)]])
+def test_derangement_rejects_impossible_weight_control(nodes):
+    with pytest.raises(ValueError, match="cannot derange distinct weight components"):
+        inject.derange(nodes, random.Random(0))
+
+
+def test_derangement_preserves_kinds_positions_and_unique_weight_permutation():
+    nodes = [("h.0.mlp.c_fc", 0, 1), ("h.0.mlp.c_fc", 1, 1),
+             ("h.0.mlp.c_fc", 2, 2), ("h.1.mlp.c_fc", 3, 3),
+             ("h.0.attn.k_proj", 4, 1), ("h.1.attn.k_proj", 5, 2)]
+    for seed in range(20):
+        shuffled = inject.derange(nodes, random.Random(seed))
+        assert {(n, c) for n, _, c in shuffled} == {(n, c) for n, _, c in nodes}
+        assert [p for _, p, _ in shuffled] == [p for _, p, _ in nodes]
+        assert all(a[0].split(".")[-1] == b[0].split(".")[-1] and (a[0], a[2]) != (b[0], b[2])
+                   for a, b in zip(nodes, shuffled))
+        assert shuffled == inject.derange(nodes, random.Random(seed))
+        assert (shuffled[0][0], shuffled[0][2]) == (shuffled[1][0], shuffled[1][2])
+
+
+def test_derangement_of_no_slots_is_empty():
+    assert inject.derange([], random.Random(0)) == []
+
+
+def test_derangement_unequal_occurrences_share_one_donor():
+    nodes = [("s", 0, 1), ("s", 1, 1), ("s", 2, 2)]
+    assert inject.derange(nodes, random.Random(0)) == [("s", 0, 2), ("s", 1, 2), ("s", 2, 1)]
+
+
+def test_sampling_without_shuffle_does_not_build_a_control(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    row = {"task": "toy", "question": "q"}
+    rows = tmp_path / "rows.jsonl"
+    import json
+    rows.write_text(json.dumps(row) + "\n")
+    class FakeExplainer:
+        tok = SimpleNamespace(decode=lambda tokens: "answer")
+        def __init__(self, *args):
+            pass
+        def prompt_ids(self, question):
+            return [1]
+        def sample(self, prompts, nodes, n, max_tokens, batch):
+            return [[([2], False)]]
+    monkeypatch.setattr(inject, "Explainer", FakeExplainer)
+    monkeypatch.setattr(inject, "Vectors", lambda: None)
+    monkeypatch.setattr(inject, "device", lambda: "cpu")
+    monkeypatch.setattr(inject, "slotted", lambda question, row: (question, [("s", 0, 1)]))
+    def reject_unused(*args):
+        raise AssertionError("ordinary sampling must not request a weight control")
+    monkeypatch.setattr(inject, "derange", reject_unused)
+    args = SimpleNamespace(rows=rows, n=1, base="mock", init=None, seed=0, shuffle=False, shuffled_out=None,
+                           out=tmp_path / "out.jsonl", vllm=False, samples=1, max_tokens=1, batch=1)
+    inject.sample(args)
+    assert json.loads(args.out.read_text())["text"] == "answer"

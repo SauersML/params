@@ -15,6 +15,36 @@ import native
 from test_goal_eval import tiny_native
 
 
+@pytest.mark.parametrize('candidate,expected_gain,beats', [(2., 0., False), (1., 1., True), (4., -2., False)])
+def test_no_change_control_compares_paired_prediction_errors(candidate, expected_gain, beats):
+    got = intervention_panel.no_change_control([{'W': 1., 'kl_candidate': candidate/2},
+                                               {'W': 3., 'kl_candidate': candidate*1.5}])
+    assert got['prediction_gain_bits'] == expected_gain
+    assert got['beats_no_change'] is beats
+    assert (got['log_error_reduction_bits'] > 0) is beats
+    assert got['draw_win_fraction'] == float(beats)
+
+
+def test_no_change_control_handles_inert_worlds_without_undefined_reference():
+    zero = intervention_panel.no_change_control([{'W': 0., 'kl_candidate': 0.}])
+    wrong = intervention_panel.no_change_control([{'W': 0., 'kl_candidate': 1.}])
+    assert zero['prediction_gain_bits'] == zero['log_error_reduction_bits'] == 0.
+    assert wrong['prediction_gain_bits'] == -1.
+    assert wrong['log_error_reduction_bits'] < 0
+    with pytest.raises(ValueError):
+        intervention_panel.no_change_control([])
+    with pytest.raises(ValueError):
+        intervention_panel.no_change_control([{'W': float('nan'), 'kl_candidate': 0.}])
+
+
+def test_no_change_control_keeps_draw_pairing_and_distinguishes_pooled_gain():
+    draws = [{'W': 0., 'kl_candidate': 1.}, {'W': 4., 'kl_candidate': 0.}]
+    got = intervention_panel.no_change_control(draws)
+    assert got['prediction_gain_bits'] == 1.5
+    assert got['draw_win_fraction'] == .5
+    assert got == intervention_panel.no_change_control(draws[::-1])
+
+
 @pytest.fixture
 def panel_tiny():
     # The existing default toy avoids SVD/Accelerate. A dense reachable active

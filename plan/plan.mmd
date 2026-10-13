@@ -501,7 +501,7 @@ flowchart BT
     SP2["<b>Teacher throughput</b><br/>influential start: 3 s and $0.0002 per text<br/>(494 texts, $0.11);<br/>block-search teacher: median 3–15 min,<br/>tails past 2 h, $0.14–0.25 per text<br/>ACTIVE · fleet, pymove"]
     SP3["<b>Scorer throughput</b><br/>10 s per RL sample with line credit<br/>(A40, 66 lines; was 21 s);<br/>left: pattern, N per deletion<br/>ACTIVE · inframove, primerl, monitorbench"]
     SP4["<b>GPU use and cost</b><br/>toy teacher runs leave the GPU idle:<br/>they run on the Mac; toy VPD fits<br/>run 2–3 per card; block search needs<br/>86 GB host memory on text9004<br/>ACTIVE · fleet"]
-    SP5["<b>Tests on main</b><br/>wiring and evidence checks pass;<br/>2 bounded numerical runs pass;<br/>intermittent drift still unexplained<br/>CHECK · codex, every owner"]
+    SP5["<b>Tests on main</b><br/>337 checks pass;8 skipped;<br/>float32 mass drift audited separately;<br/>production KL and gradients unchanged<br/>PASS · codex · GHA38400511147"]
   end
 
   %% ===================== later =====================

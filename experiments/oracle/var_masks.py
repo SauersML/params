@@ -37,6 +37,7 @@ import native  # noqa: E402
 import var_classes  # noqa: E402
 import var_controls  # noqa: E402
 import var_teacher  # noqa: E402
+import variables  # noqa: E402
 
 STEPS = 300
 BATCH = 8
@@ -171,6 +172,7 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
         for kind, tgt in (("real", tgtA), ("permuted", tgtA[perm])):
             logit = train(P, srcA, tgt, lam)
             keep = [fam[j] for j in (logit > 0).nonzero().flatten().tolist()]
+            scorer = {}
             if kind == "real":
                 f = R.f_on(keep, pzB)
             else:  # scored against the permuted targets: each B donor's target swapped with another B donor's
@@ -190,11 +192,17 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
             for _ in range(8):
                 pick = [fam[i] for i in rng.choice(len(fam), size=len(keep), replace=False)] if keep else []
                 rnd.append(R.f_on(pick, pzB))
+            if kind == "real" and keep:  # the teacher's yardstick: variables.Scorer's term min(f on-target, s off-target)
+                vj = var_teacher.as_json("mask", ins, keep)
+                for split in ("search", "eval"):
+                    x = var_teacher.together(variables.Scorer(ge), tx, variables.parse([vj], nat.C), split, 8)["variables"][0]
+                    scorer[split] = {"term": var_teacher.term(x), "f_on": x["f_on"], "s_off": x["s_off"]}
             row = {"lam": lam, "targets": kind, "size": len(keep), "f_B": f, "iso_B": f_off(keep) if kind == "real" else None,
+                   "scorer": dict(scorer) if kind == "real" else None,
                    "random_same_size": float(np.mean([x for x in rnd if x is not None])) if any(x is not None for x in rnd) else None}
             out["masks"].append(row)
             log(f"  lam {lam} {kind}: {len(keep)} of {len(fam)} candidates, f on B {f} (Cause), Iso {row['iso_B']}, random same "
-                f"size {row['random_same_size']}")
+                f"size {row['random_same_size']}, scorer {row['scorer']}")
             var_teacher.release(nat.dev)
     for lam in lams:
         r = next(x for x in out["masks"] if x["lam"] == lam and x["targets"] == "real")

@@ -355,8 +355,15 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
     graph, m = None, {}
     if answer is not None:
         graph = goal_eval.strand(goal_eval.circuit(answer, targets, nat.C, len(ids))[0], targets, nat.C)
-        le = ge.line_effects(tx, graph, mode="pp", split="search", draws=draws)
-        m = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in le["nodes"]}
+        for d in (draws, draws // 2, draws // 4, 1):  # a large circuit's line effects can take more than a card holds
+            try:
+                le = ge.line_effects(tx, graph, mode="pp", split="search", draws=max(d, 1))
+                m = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in le["nodes"]}
+                break
+            except torch.OutOfMemoryError:
+                le = None
+                release(nat.dev)
+                log(f"{task['id']}: line effects out of memory at {d} changed texts")
         release(nat.dev)
     M = sum(m.values())
     held = {nd[1] for nd in m if nd[0] != "tok" and nd[1] <= max(targets)}

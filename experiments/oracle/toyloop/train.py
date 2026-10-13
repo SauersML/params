@@ -245,7 +245,7 @@ def parser():
     ap.add_argument("--std", action="store_true", help="divide advantages by the group std")
     ap.add_argument("--reward", default="f1")
     ap.add_argument("--eval", type=int, default=0, help="after SFT: greedy F1 on this many training prompts")
-    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--threads", type=int, default=2, help="1-2 on the shared box: 4 oversubscribes")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=10)
     return ap

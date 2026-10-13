@@ -3,7 +3,15 @@
   python3 -B experiments/oracle/toyloop/oracle_lm.py bench            # tokens/s, forward+backward, seq 1024, 4 threads
   python3 -B experiments/oracle/toyloop/oracle_lm.py bench --models HuggingFaceTB/SmolLM2-135M-Instruct --lora 0
 
-Default model: SmolLM2-135M-Instruct, full fine-tune (see BENCH below for the measured numbers that chose it).
+Default model: SmolLM2-135M-Instruct. Measured 2026-10-13 on the shared 4-core box (load average 7-9 from other jobs),
+seq 1024, batch 1, float32, forward+backward+AdamW step; generation: one sequence after a 512-token prompt:
+  SmolLM2-135M  full     1 thread   76 tok/s train   9.4 tok/s gen
+  SmolLM2-135M  LoRA16   1 thread  107 tok/s train   7.8 tok/s gen   (2 threads: 110 / 9.1)
+  SmolLM2-360M  LoRA16   1 thread   38 tok/s train   3.9 tok/s gen
+  Qwen2.5-0.5B  LoRA16   1 thread   23 tok/s train   3.4 tok/s gen
+With 4 threads on the loaded box the same 135M step was ~13x SLOWER (thread oversubscription): use 1-2 threads while
+other jobs run. 135M is the only candidate fast enough for RL sampling on CPU; a zoo prompt is ~0.9-1.2k tokens, so an
+SFT example costs ~10-15 s (226 train toys x 3 epochs ~ 2-3 h), full fine-tune for capacity, LoRA when time-bound.
 """
 from __future__ import annotations
 

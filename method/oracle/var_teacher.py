@@ -534,7 +534,7 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
                "identity": v["kind"] == "input"} for v, pv in zip(kv, variables.parse(kv, nat.C))]
         out["invariants"] = semantic.teacher_invariants(variables.Scorer(ge), tx, sv, task["model"],
                                                       structured=retain_invariant_evidence)
-        out["teacher"]["invariants_version"] = "graded removals"  # var_post.INVARIANTS
+        out["teacher"]["invariants_version"] = "graded removals, one-input checks"  # var_post.INVARIANTS
         release(nat.dev)
     out["teacher"].update(kept=len(kv), target=bool(kv), kinds={k: sum(v["kept"] and v["kind"] == k for v in out["variables"])
                                                                for k in ("input", "intermediate")},

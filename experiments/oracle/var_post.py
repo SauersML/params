@@ -26,8 +26,9 @@ import var_teacher  # noqa: E402
 import variables  # noqa: E402
 
 
-INVARIANTS = "graded removals"  # teacher_invariants' version (10-13: removal lines claim half the measured drop, checked
-# with a mean over fresh tokens); a file holding another version gets its lines written again
+INVARIANTS = "graded removals, one-input checks"  # teacher_invariants' version (10-13: removal lines claim half the
+# measured drop, checked with a mean over fresh tokens; a line changing two inputs also checked with each alone): a file
+# holding "graded removals" gets the one-input checks on its lines, an older one its lines written again
 
 
 def post(ge, path: Path, draws: int = 8, log=print) -> None:
@@ -54,7 +55,22 @@ def post(ge, path: Path, draws: int = 8, log=print) -> None:
             f = got["variables"][0]["f_on"]
             v["measured"].setdefault(split, {}).update(cause=f, iso=iso, iso_scale="f", iso_draws=len(reach), off_draws=got["variables"][0]["draws_off"],
                                                        disentangle=None if f is None or iso is None else (f + iso) / 2)
-    if r["teacher"].get("invariants_version") != INVARIANTS:
+    if r["teacher"].get("invariants_version") == "graded removals" and r.get("invariants"):  # the one-input checks alone
+        sv = [{"name": v["name"], "inputs": v["inputs"], "group": pv["group"]} for v, pv in zip(kv, variables.parse(kv, nat.C))]
+        lines, _ = semantic.parse_invariants("\n".join(x["line"] for x in r["invariants"]), task["model"])
+        by = {x["line"]: x for x in lines}
+        todo = [(x, by[x["line"]]) for x in r["invariants"] if x["line"] in by and len(semantic.units(by[x["line"]]["intervention"])) > 1]
+        if todo:
+            ck = semantic.Checker(variables.Scorer(ge), tx, sv, fresh_mean=True)
+            try:
+                rows = [{"holds": x["holds"]} for x, _ in todo]
+                semantic.one_input_checks(ck, [(y["intervention"], y["outcome"]) for _, y in todo], rows)
+            finally:
+                ck.close()
+            for (x, _), row in zip(todo, rows):
+                x.update(alone=row["alone"], joint=row["joint"])
+        r["teacher"]["invariants_version"] = INVARIANTS
+    elif r["teacher"].get("invariants_version") != INVARIANTS:
         sv = [{"name": v["name"], "inputs": v["inputs"], "group": pv["group"], "values": v.get("values") or [],
                "identity": v.get("kind") == "input"} for v, pv in zip(kv, variables.parse(kv, nat.C))]
         r["invariants"] = semantic.teacher_invariants(variables.Scorer(ge), tx, sv, task["model"]) if sv else []

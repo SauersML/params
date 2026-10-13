@@ -268,7 +268,8 @@ def targets(a) -> None:
             if not any(v.get("kept") for v in r["variables"]):
                 continue
             ids = json.loads((native.TEXTS / "vpd4l" / f"{f.stem}.json").read_text())["prompts"][0]["token_ids"]
-            holding = [x for x in r.get("invariants") or [] if x["holds"]]
+            # holding lines; a line changing two inputs only when no input alone gives its outcome ("joint")
+            holding = [x for x in r.get("invariants") or [] if x["holds"] and x.get("joint", True)]
             for k, x in enumerate(holding, 1):  # holding lines only, renumbered
                 x["line"] = re.sub(r"^I\d+:", f"I{k}:", x["line"])
             ex = explanation({**r, "invariants": holding}, ids)

@@ -54,7 +54,9 @@ def main():
         root = args.payload / "cases" / ident
         toy = render.from_zoo({"weights": ident + ".pt", "record": ident + ".json"}, root)
         assert toy.meta["record"]["split"] == "train"
-        texts = reward.texts_of(toy)
+        # Frozen before any outcomes: all existing record examples, without new
+        # generated inputs. This transport/counterexample audit is not generalization.
+        texts = [list(example["ids"]) for example in toy.meta["record"]["examples"]]
         target = (root / "target.txt").read_text()
         parsed = circuit.parse(target)
         if not parsed.ok or parsed.bad:
@@ -113,6 +115,13 @@ def main():
                 (args.out / "results.json").write_text(json.dumps(result, indent=2))
                 continue
             counter = [0]
+            def state_hashes():
+                return {site_name + ":" + key: hashlib.sha256(value.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+                        for site_name in nat.names
+                        for key, value in [(key, getattr(nat.target.site(site_name), key))
+                                           for key in ("W", "U", "V", "delta_T")]
+                        + [("units", nat.units[site_name])]}
+            original_state = state_hashes()
             baselines = []
             progress = {"case": ident, "variant": name, "planned_worlds": planned["worlds_per_variant"], "completed_worlds": 0}
             progress_path = args.out / (ident + "_" + name + ".progress.json")
@@ -122,13 +131,14 @@ def main():
                 integrity = goal_eval.GoalEval(current).graph_ref(ids, [len(ids) - 1], full[index], live=True, norms={})
                 signed = raw_kl_bits(p, integrity)
                 filename = f"{ident}_{name}_{counter[0]}.safetensors"
-                save_file({"dense": p.contiguous(), "sparse": q.contiguous(), "full": integrity.contiguous()}, str(args.out / filename))
-                row["distributions"] = filename
-                row["distributions_sha256"] = hashlib.sha256((args.out / filename).read_bytes()).hexdigest()
-                row["integrity_raw_kl_bits"] = signed
                 if row["kind"] == "none":
                     baselines.append(p.clone())
                 p0 = baselines[index]
+                save_file({"dense": p.contiguous(), "sparse": q.contiguous(), "full": integrity.contiguous(),
+                           "p0": p0.contiguous()}, str(args.out / filename))
+                row["distributions"] = filename
+                row["distributions_sha256"] = hashlib.sha256((args.out / filename).read_bytes()).hexdigest()
+                row["integrity_raw_kl_bits"] = signed
                 row["original_reference_top"] = int(p0[0, -1].argmax())
                 row["nochange_kl_bits"] = max(0., raw_kl_bits(p, p0))
                 row["nochange_top_correct"] = row["reference_top"] == row["original_reference_top"]
@@ -140,6 +150,11 @@ def main():
                     raise RuntimeError("full architecture edited parity failed")
             measured = reward.score_wiring_interventions(toy, completion, nat=nat, texts=texts,
                                                          panel=panel, evidence_sink=sink)
+            restored_state = state_hashes()
+            if original_state != restored_state:
+                raise RuntimeError("original weights/basis/unit IDs were not restored")
+            measured["original_state_sha256"] = original_state
+            measured["restored_state_sha256"] = restored_state
             result.append({"case": ident, "variant": name, "completion": completion, "valid": True, **measured})
             (args.out / "results.json").write_text(json.dumps(result, indent=2))
             print(json.dumps({"case": ident, "variant": name, "reward": measured["reward"],

@@ -180,8 +180,8 @@ def test_block_units_and_nodes_search(tiny):
 def test_derived_sets_and_pricing(tiny):
     """derived_sets from a summary row: rand_fwd as many blocks as fwd at the circuit's positions, vpd_eq_fwd VPD's order
     beyond the circuit as many as fwd's blocks add of VPD's active subcomponents, sub50 and sub90 a measured block's
-    shortest prefix holding that share of its gain (an unmeasured block kept); content_bits charges a block of a node
-    set its name among sites and its active contents, counts claims its site's every subcomponent."""
+    shortest prefix holding that share of its gain (an unmeasured block kept); counts claims a block's every
+    subcomponent and its VPD-active ones."""
     nat, ge, tx, circuit = tiny
     bk = backup.Backup(ge, tx, circuit, draws=4, rows=4)
     t = max(bk.positions)
@@ -199,12 +199,9 @@ def test_derived_sets_and_pricing(tiny):
     assert got["vpd_eq_fwd"] == ([], order_v[:max(1, added)]) and got["vpd_eq"] == got["vpd_eq_fwd"]
     assert got["sub50"] == ([fwd[1]], [(fwd[0][0], t, c) for c in order[:2]])
     assert got["sub90"] == ([fwd[1]], [(fwd[0][0], t, c) for c in order[:4]])
+    bl, ex = got["sub90_rand"]
+    assert bl == [fwd[1]] and len(ex) == 4 and all(nd[:2] == fwd[0] and nd not in nodes for nd in ex)
     g = backup.expanded_graph(*backup.split_graph(circuit), [fwd[0]], [])
-    P, S = nat.positions(tx.targets), sum(nat.C.values())
-    one = np.log2(P * S)
-    want = np.log2(P * goal_eval.VPD4L_SITES) - one + int(tx.vpd[fwd[0][0]][t].sum()) * one
-    have = backup.content_bits(g, P, S, tx.targets, tx.vpd) - goal_eval.size_bits(g, P, S, tx.targets, active=tx.vpd)
-    assert abs(have - want) < 1e-9
     c = backup.counts(g, nat.C, tx.vpd)
     subs = [nd for nd in g.node_set() if nd[2] != goal_eval.BLOCK]
     assert c["blocks"] == 1 and c["subcomponents"] == len(subs) + nat.C[fwd[0][0]]

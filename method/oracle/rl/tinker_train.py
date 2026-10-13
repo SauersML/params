@@ -153,16 +153,19 @@ def renderer_for(base: str, thinking: bool = False):
 STAGES = (("compact",), ("compact", "E4x"), ("compact", "E4x", "E2g"), ("compact", "E4x", "E2g", "E1"),
           ("compact", "E4x", "E2g", "E1", "E3"))  # the RL curriculum's active reward terms (the user's spec, 10-12)
 PLATEAU = 2  # held-out checkpoints in a stage without improvement on its terms before the next stage
+QUALITY = ("E4x", "E2g", "E1", "E3")  # the gated terms the stages add (R holds every one the scorer computed)
 
 
 def stage_reward(score: dict, stage: int) -> float:
-    """Reward v3 with only the curriculum stage's terms: phi + g x (0.5 compact + the stage's other terms) + D; every
-    stage keeps the gate. An invalid answer keeps its fixed reward."""
+    """The scorer's reward with only the curriculum stage's gated terms: R (components.reward: the circuit term against
+    the bar, its shortfall cost, gate, tie-break, D and the overflow charge, all as scored) less the gated quality terms
+    the stage leaves out (g_floor x each, g where the scorer gives no g_floor). An invalid answer keeps its fixed reward.
+    (It recomputed R from phi, g and the terms with v3's first form before: no bar, shortfall, tie-break or overflow.)"""
     if not score.get("valid"):
         return score["reward"]
-    term = lambda t: score.get(t) if t in score else score.get("term_" + t)  # the scorer's names, or evaluate's term_ ones  # noqa: E731
-    q = sum((0.5 if t == "compact" else 1.0) * (term(t) or 0.0) for t in STAGES[stage])
-    return (score.get("phi") or 0.0) + (score.get("g") or 0.0) * q + (score.get("D") or 0.0)
+    term = lambda t: score.get(t) if t in score else score.get("term_" + t)  # noqa: E731  (the scorer's names, or evaluate's)
+    gate = score.get("g_floor", score.get("g")) or 0.0
+    return score["reward"] - gate * sum(term(t) or 0.0 for t in QUALITY if t not in STAGES[stage])
 
 
 def stage_lines(text: str, credits: list, stage: int) -> list:

@@ -10,10 +10,12 @@ import tinker_train as tt
 
 
 def test_a_stage_rewards_only_its_terms_and_keeps_the_gate():
-    s = {"valid": True, "phi": 1.0, "g": 0.5, "compact": 2.0, "D": 0.1, "E4x": 0.4, "E2g": 0.2}
-    assert tt.stage_reward(s, 0) == pytest.approx(1.0 + 0.5 * 1.0 + 0.1)
-    assert tt.stage_reward(s, 2) == pytest.approx(1.0 + 0.5 * (1.0 + 0.4 + 0.2) + 0.1)
-    assert tt.stage_reward({"valid": True, "phi": 1.0, "g": 0.5, "compact": 2.0, "term_E4x": 0.4}, 1) == pytest.approx(1.0 + 0.5 * 1.4)
+    s = {"valid": True, "reward": 0.7, "g": 0.5, "g_floor": 0.4, "E4x": 0.4, "E2g": 0.2}
+    assert tt.stage_reward(s, 0) == pytest.approx(0.7 - 0.4 * (0.4 + 0.2))  # the scorer's R less the left-out terms
+    assert tt.stage_reward(s, 1) == pytest.approx(0.7 - 0.4 * 0.2)
+    assert tt.stage_reward(s, 2) == pytest.approx(0.7)
+    assert tt.stage_reward({"valid": True, "reward": 0.7, "g": 0.5}, 0) == pytest.approx(0.7)  # the circuit arm: R as scored
+    assert tt.stage_reward({"valid": True, "reward": 0.7, "g": 0.5, "term_E4x": 0.4}, 1) == pytest.approx(0.7)
     assert tt.stage_reward({"valid": False, "reward": -10.0}, 3) == -10.0
 
 
@@ -27,7 +29,7 @@ def test_a_stage_credits_the_lines_of_its_terms():
 
 def test_the_curriculum_advances_when_the_held_out_evaluations_stop_improving(tmp_path):
     for step, v in ((25, 0.5), (50, 0.6), (75, 0.55), (100, 0.58)):
-        rows = [{"samples": [{"valid": True, "phi": v, "g": 0.0, "D": 0.0}]}]
+        rows = [{"samples": [{"valid": True, "reward": v, "g": 0.0}]}]
         (tmp_path / f"heldout_{step}.json").write_text(json.dumps({"per_question": {"rl": rows}}))
     assert tt.next_stage(tmp_path, 0, 0) == 1  # 75 and 100 below 50's 0.6
     assert tt.next_stage(tmp_path, 0, 75) == 0  # too few evaluations in the stage

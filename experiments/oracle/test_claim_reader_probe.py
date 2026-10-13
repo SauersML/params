@@ -19,7 +19,7 @@ class Tests(unittest.TestCase):
     for case in range(14):
      for arm in ('original','permutation0','permutation1'):rows.append({'prompt':[{'role':'user','content':str(case)+(arm if view==probe.VIEWS[0] else '')}],'completion':[{'content':'PRIVATEGOLD'}],'info':{'case_id':str(case),'condition_private':arm,'split':'internal_dev','task':('text6136','text6012','text6045')[case%3]}})
     (data/(view+'_internal_dev_matched_fit.jsonl')).write_text(''.join(json.dumps(r)+'\n' for r in rows))
-   with patch.object(probe,'configure',return_value=Renderer()):m=probe.prepare(data,tok,d/'prep',prices)
+   with patch.object(probe,'configure',return_value=Renderer()),patch.object(probe.importlib.metadata,'version',return_value='model-free-test'):m=probe.prepare(data,tok,d/'prep',prices)
    self.assertEqual(m['unique_calls'],56);self.assertEqual(len(m['bindings']),84);self.assertNotIn('PRIVATEGOLD',(d/'prep/requests.jsonl').read_text())
    with self.assertRaisesRegex(ValueError,'unexpected/duplicate'):
     paid=d/'paid';paid.mkdir();(paid/'responses.jsonl').write_text(json.dumps({'request_id':'unexpected'})+'\n');ev.evaluate(d/'prep/manifest.json',paid,d/'report')

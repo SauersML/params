@@ -80,6 +80,8 @@ jobs:
         run: |
           python -m pytest method/oracle/rl/test_inject.py method/oracle/test_intervention_panel.py \
             experiments/oracle/pods/test_sealed_archives.py \
+            experiments/oracle/test_claim_donor_features.py experiments/oracle/test_claim_reader_probe.py \
+            experiments/oracle/test_claim_lastdown_contract.py experiments/oracle/test_claim_joint_contract.py \
             method/oracle/test_components.py::test_empty_like_answer_stays_below_zero method/oracle/test_reward_compactness.py \
             method/oracle/test_semantic.py method/oracle/test_task_data.py \
             method/oracle/test_tools_env.py::test_baselines_include_empty_and_same_batch_calibration \

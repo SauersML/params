@@ -23,7 +23,10 @@ def parse(row):
         return None
 
 
-def score(labels, samples):
+def score(labels, samples, conditions=None):
+    conditions = tuple(conditions or ('none', 'generated', 'shuffled', 'gt_positive'))
+    if len(conditions) != len(set(conditions)) or not {r['condition'] for r in labels} <= set(conditions):
+        raise ValueError('declare every unique reader condition before scoring')
     assert len({r['id'] for r in samples}) == len(samples), 'Duplicate first-sample output'
     expected = {r['id'] for r in labels}
     assert all(r['id'] in expected for r in samples), 'Unexpected response ID'
@@ -37,7 +40,7 @@ def score(labels, samples):
                        'change_right': predicted is not None and predicted[1] == truth['changed'],
                        'no_change_top_right': truth['original_top'] == truth['top']})
     groups = {}
-    for condition in ('none', 'generated', 'shuffled', 'gt_positive'):
+    for condition in conditions:
         selected = [r for r in detail if r['condition'] == condition]
         subsets = {'all': selected, 'delete': [r for r in selected if r['scale'] == 0.],
                    'half': [r for r in selected if r['scale'] == .5],
@@ -65,7 +68,8 @@ if __name__ == '__main__':
     ap.add_argument('labels', type=Path)
     ap.add_argument('samples', type=Path)
     ap.add_argument('output', type=Path)
+    ap.add_argument('--condition', action='append', help='Explicit condition name; repeat for a new frozen diagnostic. Historical four-condition defaults unchanged.')
     a = ap.parse_args()
     load = lambda p: [json.loads(s) for s in p.read_text().splitlines() if s.strip()]
     assert not a.output.exists(), 'Do not overwrite an existing result'
-    a.output.write_text(json.dumps(score(load(a.labels), load(a.samples)), indent=2) + '\n')
+    a.output.write_text(json.dumps(score(load(a.labels), load(a.samples), a.condition), indent=2) + '\n')

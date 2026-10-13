@@ -32,6 +32,15 @@ class Contract(unittest.TestCase):
         result = score([label], [])['groups']['none/all']
         self.assertEqual(result, {'n': 1, 'valid': 0, 'top_correct': 0, 'change_correct': 0, 'no_change_top_correct': 0})
 
+    def test_new_condition_is_explicit_not_silently_discarded(self):
+        label = {'id': 'a', 'case': 'a', 'condition': 'gt_complete', 'task': 'x', 'input': 2,
+                 'layer': 0, 'head': 0, 'scale': 0., 'active': True, 'changed': True, 'top': 1, 'original_top': 0}
+        with self.assertRaises(ValueError):
+            score([label], [])
+        result = score([label], [], ['none', 'gt_complete'])['groups']['gt_complete/all']
+        self.assertEqual(result['n'], 1)
+        self.assertEqual(result['top_correct'], 0)
+
     def test_parse_error_is_wrong(self):
         self.assertIsNone(parse({'finish': 'stop', 'parse_error': 'ValueError', 'completion': None}))
 

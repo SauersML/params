@@ -4,7 +4,7 @@ local GPU) over HTTP. Runs in ~/mpd-data/tinker-venv. The project comes from TIN
 default) and the key from TINKER_API_KEY (read from the Keychain at launch, never written anywhere).
 
   tinker_train.py sft SFT.jsonl --log DIR [--base Qwen/Qwen3-8B] [--steps N] [--batch B] [--lr LR] [--rank 32]
-  tinker_train.py rl QUESTIONS.jsonl --log DIR --scorer http://127.0.0.1:8767/score [--init STATE_PATH] [--steps N]
+  tinker_train.py rl QUESTIONS.jsonl --log DIR --scorer http://127.0.0.1:8767/score[,URL ...] [--init STATE_PATH] [--steps N]
                      [--texts P] [--group G] [--max-tokens 4096] [--lr 4e-5] [--reader] [--save-every 25]
                      [--first-step K]   (resume from the state saved at step K)
   tinker_train.py sample QUESTIONS.jsonl OUT.jsonl [--init STATE_PATH] [--n 50] [--samples 4]    answers to evaluate
@@ -18,10 +18,11 @@ SFT.jsonl: components.py dataset rows; QUESTIONS.jsonl: components.py questions 
 message only (Qwen3's template with thinking disabled) and saves its state (DIR/state.json holds the tinker:// path).
 rl samples G answers per question with one call (the prompt's prefill shared), scores them with the scorer (whether each
 was cut at the cap goes with it), centres the rewards within each group, and trains with
-Tinker's "cispo" loss on the sampled tokens' log-probabilities. The next batch is sampled while the update runs (one
-step behind; cispo's ratio corrects it). With --reader, E1 (the bits each answer's English saves a frozen reader)
-comes from a base-model sampling client on Tinker that is never trained (tinker_reader) and goes to the scorer with
-the answers. Each step's figures go to DIR/steps.jsonl; every --save-every steps (and at step 0, the starting state, and
+Tinker's "cispo" loss on the sampled tokens' log-probabilities. With several scorers (--scorer, comma-separated: each
+a scorer pod at the frozen revision), a step's groups go to the first free one, one request in flight per scorer. The
+next batch is sampled while this one is scored and the update runs (one step behind; cispo's ratio corrects it).
+With --reader, E1 (the bits each answer's English saves a frozen reader) comes from a base-model sampling client on
+Tinker that is never trained (tinker_reader) and goes to the scorer with the answers. Each step's figures go to DIR/steps.jsonl; every --save-every steps (and at step 0, the starting state, and
 at the end) the state is saved and listed in DIR/checkpoints.jsonl ({"step", "state", "usd", "base"}: the held-out
 evaluation of each, experiments/oracle/rl_heldout.sh).
 Every call's tokens are counted and priced (PRICES, $ per million tokens:
@@ -33,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import random
 import re
 import sys
@@ -539,6 +541,8 @@ def score(a) -> None:
 
 
 def rl(a) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
     import torch
     from tinker.types.tensor_data import TensorData
     from tinker_cookbook import renderers
@@ -574,6 +578,20 @@ def rl(a) -> None:
     else:  # dollars go on from the resumed checkpoint's
         spend.total = next(r["usd"] for r in map(json.loads, (a.log / "checkpoints.jsonl").read_text().splitlines())
                            if r["step"] == a.first_step)
+    free = queue.Queue()  # the scorers without a request in flight: a step's groups go to the first free one
+    for url in a.scorer.split(","):
+        free.put(url)
+    scoring = ThreadPoolExecutor(free.qsize())
+
+    def post(req):  # a group's scores and its request's seconds
+        url = free.get()
+        try:
+            t1 = time.time()
+            r = httpx.post(url, json=req, timeout=None)
+            return r, time.time() - t1
+        finally:
+            free.put(url)
+
     failed = 0
     sf = a.log / "stage.json"  # the curriculum's stage and the step it began, kept across resumes
     stage, since = (json.loads(sf.read_text())[k] for k in ("stage", "since")) if sf.exists() else (a.stage, a.first_step)
@@ -585,7 +603,7 @@ def rl(a) -> None:
             stage, since = s2, step
             print(json.dumps({"step": step, "stage": stage, "terms": STAGES[stage]}), flush=True)
         sf.write_text(json.dumps({"stage": stage, "since": since}))
-        datums, groups = [], []
+        datums, groups, posted = [], [], []
         for q, prompt, fut in pending:
             res = fut.result()
             n = prompt.length
@@ -594,14 +612,19 @@ def rl(a) -> None:
             spend.add("sample", prefill=n - hits, cached=hits + (a.group - 1) * n, sampled=sampled)
             texts, thinks = zip(*(answer_of(renderer, tokenizer, s.tokens) for s in res.sequences))
             texts = list(texts)
-            t1 = time.time()
             req = {"task": q["task"], "answers": texts, "lines": not a.no_lines,  # tokens after the thinking: past the
                    "tokens": [len(s.tokens) - th for s, th in zip(res.sequences, thinks)]}  # answer cap, charged per token
             if frozen is not None:
                 if q["task"] not in tasks:
                     tasks[q["task"]] = json.loads((a.texts_dir / f"{q['task']}.json").read_text())
                 req["e1"] = components.e1_bits(frozen, tasks[q["task"]], q, texts)
-            r = httpx.post(a.scorer, json=req, timeout=None)
+            posted.append((q, prompt, res, texts, thinks, req, scoring.submit(post, req)))
+        t_score = time.time()
+        if step + 1 < a.steps:  # the next step's samples while this one is scored and trained: from the same sampler as
+            pending = submit(sampler)  # when submitted after the update was sent (one step behind)
+        for q, prompt, res, texts, thinks, req, scored in posted:
+            n = prompt.length
+            r, secs = scored.result()
             if r.status_code != 200:  # the request is kept to reproduce the scorer's error; the group sits this step out
                 failed += 1
                 (a.log / f"failed_{step}_{q['task']}.json").write_text(json.dumps(req))
@@ -625,7 +648,7 @@ def rl(a) -> None:
                            "valid": [s["valid"] for s in scores],
                            "defects": [{k: s.get(k) for k in ("malformed", "dropped_nodes", "dropped_edges", "finals", "tokens", "overflow")} for s in scores],
                            "texts": texts, "thinking_tokens": list(thinks), "stop": [str(s.stop_reason) for s in res.sequences],
-                           "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": time.time() - t1,
+                           "tokens": [len(s.tokens) for s in res.sequences], "score_seconds": secs,
                            "terms": {k: [s.get(k) if k in s else s.get("term_" + k) for s in scores]  # the scorer's names
                                      for k in ("phi", "phi_tau", "g", "compact", "bits", "D", "Q", "E2g", "E4x", "E1", "C", "N",
                                                "E2", "E3", "E4")}})
@@ -642,12 +665,11 @@ def rl(a) -> None:
         with (a.log / "groups.jsonl").open("a") as f:
             for g in groups:
                 f.write(json.dumps({"step": step, **g}) + "\n")
+        score_wall = time.time() - t_score
         fb = op = None
         if datums:
             fb = training.forward_backward(datums, loss_fn="cispo")
             op = training.optim_step(adam)
-        if step + 1 < a.steps:
-            pending = submit(sampler)  # sampled while this update runs: one step behind
         if fb is not None:
             fb.result()
             op.result()
@@ -658,7 +680,7 @@ def rl(a) -> None:
                            "distinct": [g["distinct"] for g in groups],
                            "datums": len(datums), "tokens": [t for g in groups for t in g["tokens"]],
                            "thinking_tokens": [t for g in groups for t in g["thinking_tokens"]],
-                           "score_seconds": sum(g["score_seconds"] for g in groups), "total_usd": spend.total + (rspend.total if rspend else 0.0),
+                           "score_seconds": sum(g["score_seconds"] for g in groups), "score_wall": score_wall, "total_usd": spend.total + (rspend.total if rspend else 0.0),
                            "seconds": time.time() - t0})
         print(line, flush=True)
         with (a.log / "steps.jsonl").open("a") as f:
@@ -693,7 +715,7 @@ def main():
     s.add_argument("--save-every", type=int, default=0, help="a checkpoint every k steps and the last, in DIR/checkpoints.jsonl "
                                                               "(rl_heldout.sh's input: the learning curve)")
     r = sub.choices["rl"]
-    r.add_argument("--scorer", required=True)
+    r.add_argument("--scorer", required=True, help="the scorer's URL, or several comma-separated (pods at the same revision)")
     r.add_argument("--init", help="a tinker:// state path (sft's DIR/state.json)")
     r.add_argument("--texts", type=int, default=2)
     r.add_argument("--group", type=int, default=4)

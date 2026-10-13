@@ -287,24 +287,35 @@ def _split(s: str) -> list[str]:
 
 def parse_invariants(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
     """(the INVARIANTS lines as {"id", "intervention", "outcome", "line"}, the count of lines that do not parse or name
-    a token the model does not have)."""
+    a token the model does not have). Conflicting intervention targets, invalid drop fractions and repeated claim
+    IDs or executable evidence count as bad; changing IDs or clause order cannot duplicate verified credit."""
     import components
 
     tok = lambda s: components._token_of(model, s)  # noqa: E731
-    out, bad = [], 0
+    out, bad, seen, evidence = [], 0, set(), set()
     for line in text.splitlines():
         m = _LINE.match(line)
         if not m:
             bad += bool(line.strip().startswith("I") and "->" in line)
             continue
         try:
+            ident = int(m.group(1))
+            if ident in seen:
+                raise ValueError(line)
             iv = {"tokens": {}, "transplants": [], "remove": []}
+            carriers = set()
             for part in _split(m.group(2)):
                 r = re.match(r"^remove\s+(V\d+)$", part)
                 t = re.match(r"^(V\d+)\s+from\s+(.+)$", part)
                 if r:
+                    if r.group(1) in carriers:
+                        raise ValueError(part)
+                    carriers.add(r.group(1))
                     iv["remove"].append(r.group(1))
                 elif t:
+                    if t.group(1) in carriers:
+                        raise ValueError(part)
+                    carriers.add(t.group(1))
                     donor, ch, end = t.group(2), {}, 0
                     for change in _CHANGE.finditer(donor):
                         if donor[end:change.start()].strip():
@@ -323,12 +334,17 @@ def parse_invariants(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
                     ch = _CHANGE.fullmatch(part)
                     if not ch or tok(ch.group(2)) is None:
                         raise ValueError(part)
-                    iv["tokens"][int(ch.group(1))] = tok(ch.group(2))
+                    p = int(ch.group(1))
+                    if p in iv["tokens"]:
+                        raise ValueError(part)
+                    iv["tokens"][p] = tok(ch.group(2))
             o = m.group(3)
             if o == "unchanged":
                 outc = ("unchanged",)
             elif re.match(r"^p\(top\)\s*<\s*[0-9.]+$", o):
                 outc = ("drop", float(o.split("<")[1]))
+                if not 0.0 < outc[1] < 1.0:
+                    raise ValueError(o)
             elif re.match(r"^(top|not)\s+" + _TOKEN + "$", o):
                 kind, s = o.split(None, 1)
                 y = tok(s)
@@ -337,7 +353,14 @@ def parse_invariants(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
                 outc = (kind, y)
             else:
                 raise ValueError(o)
-            out.append({"id": int(m.group(1)), "intervention": iv, "outcome": outc, "line": line.strip()})
+            key = (tuple(sorted(iv["tokens"].items())),
+                   tuple(sorted((name, tuple(sorted(ch.items()))) for name, ch in iv["transplants"])),
+                   tuple(sorted(iv["remove"])), outc)
+            if key in evidence:
+                raise ValueError(line)
+            out.append({"id": ident, "intervention": iv, "outcome": outc, "line": line.strip()})
+            seen.add(ident)
+            evidence.add(key)
         except (ValueError, SyntaxError):
             bad += 1
     return out, bad

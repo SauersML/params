@@ -104,3 +104,78 @@ def test_unexecuted_condition_cannot_earn_verified_english_credit(invariant_toke
     result = semantic.check_invariants(None, None, [{"name": "V1"}], unsupported)
     assert result["bad"] == 1 and result["holds"] == 0.0 and result["credit"] == -1.0
     assert result["invariants"] == [] and executed == []
+
+
+@pytest.mark.parametrize("intervention", ["@0=' x', @0=' z'", "@0=' x', @0=' x'",
+                                          "V1 from @0=' x', V1 from @0=' z'",
+                                          "V1 from @0=' x', remove V1", "remove V1, V1 from @0=' x'",
+                                          "remove V1, remove V1"])
+def test_invariant_cannot_overwrite_a_stated_intervention(invariant_tokenizer, intervention):
+    got, bad = semantic.parse_invariants(f"I1: {intervention} -> top ' y'")
+    assert got == [] and bad == 1
+
+
+def test_distinct_carriers_can_use_different_donors_at_the_same_position(invariant_tokenizer):
+    got, bad = semantic.parse_invariants("I1: V1 from @0=' x', V2 from @0=' z' -> top ' y'")
+    assert bad == 0
+    assert got[0]["intervention"]["transplants"] == [("V1", {0: 1}), ("V2", {0: 3})]
+
+
+@pytest.mark.parametrize("copies", [2, 10])
+def test_repeated_invariant_ids_cannot_inflate_evidence_credit(invariant_tokenizer, monkeypatch, copies):
+    class FakeChecker:
+        def __init__(self, *args):
+            pass
+        def check(self, items):
+            assert len(items) == 1
+            return [{"holds": True, "credit": 3.0}]
+        def close(self):
+            pass
+    monkeypatch.setattr(semantic, "Checker", FakeChecker)
+    claim = "I1: V1 from @0=' x' -> top ' y'"
+    result = semantic.check_invariants(None, None, [{"name": "V1"}], "\n".join([claim] * copies))
+    assert len(result["invariants"]) == 1
+    assert result["bad"] == copies - 1
+    assert result["credit"] == 3.0 - (copies - 1)
+
+
+@pytest.mark.parametrize("fraction", ["0", "1", "2", "9999999999999999999999999999999999999999"])
+def test_drop_claim_requires_a_strict_probability_reduction(invariant_tokenizer, fraction):
+    got, bad = semantic.parse_invariants(f"I1: remove V1 -> p(top) < {fraction}")
+    assert got == [] and bad == 1
+
+
+def test_valid_drop_fraction_keeps_priced_outcome(invariant_tokenizer):
+    got, bad = semantic.parse_invariants("I1: remove V1 -> p(top) < 0.5")
+    assert bad == 0
+    assert got[0]["outcome"] == ("drop", 0.5)
+
+
+@pytest.mark.parametrize("claims", [
+    ["I1: V1 from @0=' x' -> top ' y'", "I2: V1 from @0=' x' -> top ' y'"],
+    ["I1: V1 from @0=' x', V2 from @1=' z' -> top ' y'",
+     "I2: V2 from @1=' z', V1 from @0=' x' -> top ' y'"],
+    ["I1: V1 from @0=' x' @1=' z' -> top ' y'", "I2: V1 from @1=' z' @0=' x' -> top ' y'"],
+    ["I1: @0=' x', @1=' z', remove V1, remove V2 -> top ' y'",
+     "I2: remove V2, @1=' z', remove V1, @0=' x' -> top ' y'"],
+])
+def test_same_evidence_under_different_ids_cannot_multiply_credit(invariant_tokenizer, monkeypatch, claims):
+    class FakeChecker:
+        def __init__(self, *args):
+            pass
+        def check(self, items):
+            assert len(items) == 1
+            return [{"holds": True, "credit": 3.0}]
+        def close(self):
+            pass
+    monkeypatch.setattr(semantic, "Checker", FakeChecker)
+    result = semantic.check_invariants(None, None, [{"name": "V1"}, {"name": "V2"}], "\n".join(claims))
+    assert len(result["invariants"]) == 1
+    assert result["bad"] == 1 and result["credit"] == 2.0
+
+
+def test_different_outcomes_and_values_are_distinct_evidence(invariant_tokenizer):
+    text = "\n".join(["I1: V1 from @0=' x' -> top ' y'", "I2: V1 from @0=' x' -> not ' y'",
+                       "I3: V1 from @0=' z' -> top ' y'", "I4: V2 from @0=' x' -> top ' y'"])
+    got, bad = semantic.parse_invariants(text)
+    assert bad == 0 and len(got) == 4

@@ -1776,8 +1776,9 @@ def _token_of(model: str, text: str) -> int | None:
 
 def _moved_answer(answer: dict, where: list[int]) -> dict:
     """An answer's JSON with every node's and pair's position moved by where (old -> new)."""
-    nodes = [[m, c, where[t]] for m, c, t in answer["nodes"]]
-    edges = [["pair", e[1], e[2], e[3], where[e[4]]] if e[0] == "pair" else e for e in answer["edges"]]
+    at = lambda t: where[t] if 0 <= t < len(where) else t  # noqa: E731  (a position past the text: dropped when scored)
+    nodes = [[m, c, at(t)] for m, c, t in answer["nodes"]]
+    edges = [["pair", e[1], e[2], e[3], at(e[4])] if e[0] == "pair" else e for e in answer["edges"]]
     return {**answer, "nodes": nodes, "edges": edges}
 
 
@@ -2789,7 +2790,8 @@ def _eval_checkpoint(path: Path, record: dict, *, create: bool = False) -> None:
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
              teachers: dict | None = None, lines: bool = False, checkpoint: Path | None = None,
-             retain_calibration: bool = False, node_cap: int | None = None, invariants: bool = False) -> dict:
+             retain_calibration: bool = False, node_cap: int | None = None, invariants: bool = False,
+             shard: tuple[int, int] | None = None) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -2828,12 +2830,13 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                                                                   "edit_eval.py", "variables.py", "engine.py",
                                                                   "carry.py", "task_data.py")) if p.exists()}}, create=True)
 
+    import time
+
     invalid = V3_INVALID
     per = {s: [] for s in sets}
     base, base_terms = {}, {}
-    for p in native.tasks(split)[:n]:
-        if p.stem not in rows:
-            continue
+    mine = [p for p in native.tasks(split)[:n] if p.stem in rows]
+    for p in mine[shard[0]::shard[1]] if shard else mine:  # shard (k, n): every n-th text from the k-th (one of n processes)
         task = json.loads(p.read_text())
         ev = rows[p.stem]
         cache = {}
@@ -2844,11 +2847,14 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                 continue
             bits = (e1 or {}).get(name, {}).get(p.stem, {}).get("own")
             cache = {}
+            t0 = time.perf_counter()
             scored = reward(ge, task, ev, [x for x, _ in got], truncated=[cut for _, cut in got], e1=bits, cache=cache,
                             ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None,
                             lines=lines, retain_calibration=retain_calibration, node_cap=node_cap, invariants=invariants)
             entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
                                                  for r in scored]}
+            log(f"  {p.stem} {name}: {len(got)} answers, nodes {[x['nodes'] for x in entry['samples']]}, "
+                f"{time.perf_counter() - t0:.0f} s", flush=True)
             if diagnostics and scored[0]["valid"]:
                 import goal_eval
 
@@ -2865,9 +2871,11 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             for y in matched:
                 y["vpd_k"], y["recency_k"] = matched_k(ge, tx, order, y["bits"]), matched_k(ge, tx, recent, y["bits"])
         names = baseline_texts(ge, task, [y["vpd_k"] for y in matched], tx, [y["recency_k"] for y in matched])
-        for (b, text), r in zip(names.items(), reward(ge, task, {**ev, "qa": [], "edits": []}, list(names.values()), split="eval",
-                                                      teacher=teachers.get(p.stem) if teachers else None, node_cap=None,
-                                                      retain_calibration=retain_calibration)):
+        t0 = time.perf_counter()
+        scored_base = reward(ge, task, {**ev, "qa": [], "edits": []}, list(names.values()), split="eval",
+                             teacher=teachers.get(p.stem) if teachers else None, node_cap=None, retain_calibration=retain_calibration)
+        log(f"  {p.stem} baselines: {list(names)}, {time.perf_counter() - t0:.0f} s", flush=True)
+        for (b, text), r in zip(names.items(), scored_base):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
             base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),
                                                     **{k: r.get(k) for k in ("phi", "phi_tau", "g", "compact", "bits", "D")}}
@@ -3098,7 +3106,24 @@ def main():
                    "influential starts, often above 266 nodes; the share above NODE_CAP is reported)")
     s.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json): reward v3's teacher-dominance reference")
     s.add_argument("--lines", action="store_true", help="each sample's per-line credits (reward(lines=True), line_credit())")
+    s.add_argument("--shard", help="K/N: every N-th text from the K-th (N processes on one card; merge their outputs with merge)")
+    mg = sub.add_parser("merge", help="evaluate outputs of the shards of one evaluation (--shard) as one, the report computed again")
+    mg.add_argument("out", type=Path)
+    mg.add_argument("parts", type=Path, nargs="+")
+    mg.add_argument("--labels", type=Path, help="locality JSONL, as evaluate's")
     args = ap.parse_args()
+    if args.cmd == "merge":
+        parts = [json.loads(p.read_text()) for p in args.parts]
+        per = {s: [q for x in parts for q in x["per_question"].get(s, [])] for s in parts[0]["per_question"]}
+        base = {t: v for x in parts for t, v in x["baselines"].items()}
+        bt = {t: v for x in parts for t, v in x["baseline_terms"].items()}
+        labels = {r["task"]: r for r in map(json.loads, args.labels.read_text().splitlines())} if args.labels else None
+        groups = {"all": None} | ({"local": True, "non-local": False} if labels else {})
+        out = {"report": {g: _report(per, base, None, labels, w, bt) for g, w in groups.items()}, "per_question": per,
+               "baselines": base, "baseline_terms": bt}
+        args.out.write_text(json.dumps(out))
+        print(json.dumps(out["report"], indent=1), flush=True)
+        return
     if args.cmd == "evaluate":
         args.checkpoint = args.checkpoint or (Path(str(args.out) + ".tasks.jsonl") if args.out else None)
         if args.checkpoint is not None and args.checkpoint.exists():
@@ -3390,7 +3415,7 @@ def main():
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
                    matched_all=args.matched_all, teachers=teachers, lines=args.lines,
                    checkpoint=args.checkpoint, retain_calibration=args.calibration_evidence, node_cap=args.node_cap or None,
-                   invariants=args.invariants)
+                   invariants=args.invariants, shard=tuple(map(int, args.shard.split("/"))) if args.shard else None)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

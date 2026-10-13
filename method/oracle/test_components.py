@@ -993,3 +993,23 @@ def test_variable_text_batches_members_without_changing_block_ranges():
     got, _, bad = components._variables(line, {})
     assert bad == 0
     assert set(map(tuple, got[0]["group"])) == set(map(tuple, v["group"]))
+
+
+def test_evaluate_shards_cover_every_text_once(tmp_path, monkeypatch):
+    """--shard k/n: every n-th text from the k-th, so n processes split the texts with none twice."""
+    from types import SimpleNamespace
+
+    paths = []
+    for name in ("t_a", "t_b", "t_c"):
+        p = tmp_path / (name + ".json")
+        p.write_text(json.dumps({"id": name}))
+        paths.append(p)
+    monkeypatch.setitem(sys.modules, "native", SimpleNamespace(tasks=lambda split: paths))
+    monkeypatch.setattr(components, "baseline_texts", lambda *a: {"empty": "baseline"})
+    monkeypatch.setattr(components, "reward", lambda ge, task, ev, texts, **kw: [
+        {"reward": 0.1, "valid": True, "row": {"nodes": 1}, "circuit_reward": 0.1, "phi": 0.0} for _ in texts])
+    rows = {p.stem: {"qa": []} for p in paths}
+    sets = {"s": {p.stem: [("x", False)] for p in paths}}
+    quiet = lambda *a, **k: None  # noqa: E731
+    got = [components.evaluate(None, "heldout", rows, sets, 3, log=quiet, shard=(k, 2)) for k in (0, 1)]
+    assert [[q["task"] for q in g["per_question"]["s"]] for g in got] == [["t_a", "t_c"], ["t_b"]]

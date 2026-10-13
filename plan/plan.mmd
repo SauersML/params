@@ -289,7 +289,20 @@
 %% Existing1cd2654 var_explain_llm supplies a strong-open text-only control; retain it, do not duplicate its calls.
 %% It does not yet answer the matched-evidence comparison. Compare same inputs, output format, tool budget and cost;
 %% report a cheap-context control separately, and never use Claude/Sol/Codex for oracle/baseline data.
-%% Free CPU forks now running38366405014/38366408116 from b53639e, exact same verified SFT and parent dependency lock.
+%% Free CPU forks38366405014/38366408116 COMPLETE from b53639e; exact same verified SFT and parent lock.
+%% Paired offline provenance passes: identical baseline completions, checkpoint/data/prompt/input-bank contracts.
+%% 24 shared-development cases: unit16valid/stated reward-.22675/top1 .15030; wiring23/.35480/.43750.
+%% Shared SFT20valid/.24972/.44345. Wiring-minus-unit reward+.58154, exploratory case-bootstrap95%[.24461,.95246].
+%% Wiring-minus-own-SFT+.10508 [-.19061,.38335]; common-valid19 contributes+.01867 to all24 mean,
+%% fixed-invalid4+.16974, newly-invalid1-.08333. Most net gain is validity repair, not established fidelity improvement.
+%% All23valid wiring answers equal complete-same-units execution; zero component-to-component edges.
+%% Legacy unit metrics include token/out nodes; report true head/neuron structure separately. English remains unchecked.
+%% Artifact: scratch/eval_recovery/paired_cpu_wiring_38366408116/paired_report.json; both20scheduled RL steps retained.
+%% Diagnosis:68/226 TRAIN targets have211 component edges; SFT300 replacement draws visited160 targets,
+%% leaving21/68 relation examples unseen. Only79 updates had relations; relation lines6.2% of target tokens.
+%% All teacher answers fit416tokens; length alone cannot explain the missing relations. No typed ports/positions supervised.
+%% Next controlled test: opt-in shuffled coverage before repeats, same data/loss/300steps; evaluate relations before more RL.
+%% Compact typed targets are a separate intervention and require diverse execution-verified teachers; do not conflate pilots.
 %% New sequential gradient accumulation replaces the old batched update; previous shutdown cause remains unproven.
 %% Each arm has one330-minute link,20scheduled updates, k4,416generation/3072context; no automatic extension.
 %% c2dbbc4 offline paired report requires complete24-case outputs and matching sources/data/checkpoints, retains invalids,
@@ -409,7 +422,8 @@ flowchart BT
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
-  WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>two free CPU forks, lower-memory updates;<br/>matched20 steps; paired report ready<br/>ACTIVE · codex/eval_recovery"]
+  WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
+  RELTRAIN["<b>Teach every relation example</b><br/>21 of68 never sampled by SFT;<br/>test coverage before repetition;<br/>same targets, steps and token limits<br/>ACTIVE · codex/fork_review"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
@@ -540,6 +554,8 @@ flowchart BT
   FBASE -. specialization evidence .-> GATED
   %% FEEDBACK: WIRING -. tests executable relations .-> TOYLOOP
   WIRING -. wiring evidence .-> C1
+  WIRING -. diagnoses missing relations .-> RELTRAIN
+  RELTRAIN -. measured relation learning .-> C1
   WIRING -. opt-in wiring objective .-> R1
   %% FEEDBACK: REM -. tests .-> PHI
   VPD --> ENG
@@ -588,7 +604,8 @@ flowchart BT
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
   class QAONLY check
-  class WIRING active
+  class WIRING done
+  class RELTRAIN active
   class ROUTE done
   class ROUTEEDIT check
   class PYV done

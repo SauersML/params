@@ -175,7 +175,8 @@ def vartest(pairs_per_task: int = 32):
                            round(float(np.mean([r[f"flip_{lab}"] for r in rs])), 2)) for lab in ("variable", "wrong")}, flush=True)
 
 
-def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = False, behavior: bool = False):
+def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = False, behavior: bool = False,
+            only_pair: int | None = None):
     """The scorecard on CausalGym's variables: per kept task's pairs that differ at one token (the variable's
     position p, the source's token z there), circuits on the base prompt (VPD's actives at the positions named, every
     connection among them): target (the last position alone), variable (and p), attractor (and the wrong variable's
@@ -227,7 +228,7 @@ def falsify(per_task: int = 8, only_task: str | None = None, blocks: bool = Fals
         info = tasks[task]
         for k, ex in enumerate(info["examples"][:per_task]):
             diff = [i for i, (x, y) in enumerate(zip(ex["base"], ex["src"])) if x != y]
-            if len(diff) != 1 or (task, k) in done:
+            if len(diff) != 1 or (task, k) in done or (only_pair is not None and k != only_pair):
                 continue
             p, z = diff[0], ex["src"][diff[0]]
             ids, t = ex["base"], len(ex["base"]) - 1
@@ -343,5 +344,6 @@ if __name__ == "__main__":
     ap.add_argument("--blocks", action="store_true", help="falsify, report: the carrier-block variants (patched scorecard)")
     ap.add_argument("--behavior", action="store_true", help="falsify, report: the behavior-targeted mode")
     ap.add_argument("--run", default=None, help="report: one pod run's rows alone (its name)")
+    ap.add_argument("--pair", type=int, default=None, help="falsify: one pair (its example index) only: a process per pair")
     a = ap.parse_args()
-    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task, a.blocks, a.behavior), "report": lambda: report(a.blocks, a.behavior, a.run)}[a.cmd]()
+    {"filter": filter_tasks, "vartest": vartest, "falsify": lambda: falsify(a.per_task, a.task, a.blocks, a.behavior, a.pair), "report": lambda: report(a.blocks, a.behavior, a.run)}[a.cmd]()

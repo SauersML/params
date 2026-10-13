@@ -396,3 +396,37 @@ def test_teacher_supervision_duplicate_requested_ids_reject_before_model(monkeyp
     with pytest.raises(SystemExit) as error:
         var_teacher.main()
     assert error.value.code == 2 and not labels.exists()
+
+
+def test_rules_out_parse_and_exclusive(invariant_tokenizer):
+    good = "RULES OUT: the copy reads position 3 | V1 from @0=' x' -> top ' y' vs unchanged"
+    got, bad = semantic.parse_rules_out("\n".join([good, "RULES OUT: no bar here -> top ' y' vs unchanged",
+                                                   "RULES OUT: words | @0=' q' -> top ' y' vs unchanged"]))
+    assert bad == 2 and got[0]["h"] == ("top", 2) and got[0]["alt"] == ("unchanged",) and got[0]["alternative"] == "the copy reads position 3"
+    assert semantic.exclusive(("top", 2), ("unchanged",), y0=1) and not semantic.exclusive(("top", 1), ("unchanged",), y0=1)
+    assert semantic.exclusive(("top", 2), ("top", 3), 1) and semantic.exclusive(("not", 2), ("top", 2), 1)
+    assert semantic.exclusive(("drop", 0.5), ("rise", 2.0), 1) and not semantic.exclusive(("drop", 0.5), ("unchanged",), 1)
+
+
+def test_rules_out_credit(invariant_tokenizer, monkeypatch):
+    class FakeChecker:
+        y0 = 1
+
+        def __init__(self, *args):
+            pass
+
+        def run(self, iv):
+            return None
+
+        def outcome(self, q, out):
+            return {"holds": out[0] == "top", "top": 2, "p_top": 0.9, "logp": -0.2 if out[0] == "top" else -3.0}
+
+        def close(self):
+            pass
+    monkeypatch.setattr(semantic, "Checker", FakeChecker)
+    text = "\n".join(["RULES OUT: a | V1 from @0=' x' -> top ' y' vs unchanged",
+                      "RULES OUT: b | V1 from @0=' x' -> top ' y' vs not ' z'",
+                      "RULES OUT: c | V2 from @0=' x' -> top ' y' vs unchanged"])
+    got = semantic.check_rules_out(None, None, [{"name": "V1"}], text)
+    assert [r["ruled_out"] for r in got["rules_out"]] == [True, False] and got["bad"] == 2
+    assert got["credit"] == 1.0 - 2 and abs(got["rules_out"][0]["margin"] - 2.8) < 1e-9

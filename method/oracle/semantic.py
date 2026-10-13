@@ -29,6 +29,8 @@ never run in place of the network, that counts when its predictions on held-out 
 INVARIANTS lines (parse_invariants): I<k>: <intervention> -> <outcome>, the intervention's parts separated by commas
 (@<p>=<token>; V<j> from @<p>=<token> [@<q>=<token> ...]; remove V<j>), the outcome top <token>, unchanged,
 not <token>, p(top) < <f>, or p(top) > <f> * base; tokens as FINAL lines write them (components.shown).
+RULES OUT lines (parse_rules_out, check_rules_out): RULES OUT: <alternative in words> | <intervention> -> <outcome> vs
+<the alternative's outcome>, the two outcomes exclusive; the line holds when the first holds and the second fails.
 """
 from __future__ import annotations
 
@@ -398,6 +400,82 @@ def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model:
         ck.close()
     total = sum(r["credit"] for r in rows) - bad
     return {"invariants": rows, "bad": bad, "credit": total, "holds": sum(r["holds"] for r in rows) / max(len(rows) + bad, 1)}
+
+
+_RULE = re.compile(r"^\s*RULES OUT\s*:\s*(.+?)\s*\|\s*(.+?)\s*->\s*(.+?)\s+vs\s+(.+?)\s*$")
+
+
+def exclusive(a: tuple, b: tuple, y0: int) -> bool:
+    """Whether two outcomes about one run cannot both hold (y0 the base top token): a RULES OUT line must predict, under
+    its intervention, something its alternative's outcome excludes."""
+    for a, b in ((a, b), (b, a)):
+        ka, kb = a[0], b[0]
+        if ka == "top" and kb == "top":
+            return int(a[1]) != int(b[1])
+        if ka == "top" and kb == "unchanged":
+            return int(a[1]) != y0
+        if ka == "top" and kb == "not":
+            return int(a[1]) == int(b[1])
+        if ka == "unchanged" and kb == "not":
+            return int(b[1]) == y0
+        if ka == "drop" and kb == "rise":
+            return True
+    return False
+
+
+def parse_rules_out(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
+    """(the RULES OUT lines as {"alternative", "intervention", "h", "alt", "line"}, the count that do not parse). A line
+    is 'RULES OUT: <the alternative in words> | <intervention> -> <outcome under the explanation> vs <outcome under the
+    alternative>', intervention and outcomes in the INVARIANTS grammar (parse_invariants). The alternative carries no
+    carrier of its own: its consequence is the outcome it predicts under the same intervention, run in the real model."""
+    out, bad = [], 0
+    for line in text.splitlines():
+        if not line.strip().startswith("RULES OUT"):
+            continue
+        m = _RULE.match(line)
+        if not m:
+            bad += 1
+            continue
+        h, b1 = parse_invariants(f"I1: {m.group(2)} -> {m.group(3)}", model)
+        a, b2 = parse_invariants(f"I1: {m.group(2)} -> {m.group(4)}", model)
+        if b1 or b2 or not h or not a:
+            bad += 1
+            continue
+        out.append({"alternative": m.group(1), "intervention": h[0]["intervention"], "h": h[0]["outcome"], "alt": a[0]["outcome"],
+                    "line": line.strip()})
+    return out, bad
+
+
+def check_rules_out(sc: variables.Scorer, tx, vs: list[dict], text: str, model: str = "vpd4l") -> dict:
+    """The RULES OUT lines checked in the real model: per line the intervention run once, the explanation's outcome and
+    the alternative's each checked there (Checker.outcome), exclusive (the two cannot both hold, else the line rules
+    nothing out and counts as bad), ruled_out (the explanation's holds and the alternative's fails) and margin, log2 of
+    the run's probability of the explanation's event over the alternative's (None for p(top) outcomes). credit +1 per
+    line ruling its alternative out, -1 otherwise (bad lines too): the alternative is free text, so a line earns a fixed
+    bit rather than the alternative's improbability, which a straw alternative would inflate."""
+    lines, bad = parse_rules_out(text, model)
+    names = {v["name"] for v in vs}
+    ok = [x for x in lines if all(n in names for n, _ in x["intervention"]["transplants"]) and all(n in names for n in x["intervention"]["remove"])]
+    bad += len(lines) - len(ok)
+    rows = []
+    if ok:
+        ck = Checker(sc, tx, vs)
+        try:
+            for x in ok:
+                q = ck.run(x["intervention"])
+                h, a = ck.outcome(q, x["h"]), ck.outcome(q, x["alt"])
+                ex = exclusive(x["h"], x["alt"], ck.y0)
+                ruled = ex and h["holds"] and not a["holds"]
+                rows.append({"line": x["line"], "alternative": x["alternative"], "exclusive": ex, "holds": h["holds"],
+                             "alt_holds": a["holds"], "ruled_out": ruled, "top": h["top"], "p_top": h["p_top"],
+                             "margin": None if h["logp"] is None or a["logp"] is None else h["logp"] - a["logp"],
+                             "credit": 1.0 if ruled else -1.0})
+        finally:
+            ck.close()
+    bad += sum(not r["exclusive"] for r in rows)
+    rows_ok = [r for r in rows if r["exclusive"]]
+    return {"rules_out": rows, "bad": bad, "credit": sum(r["credit"] for r in rows_ok) - bad,
+            "ruled_out": sum(r["ruled_out"] for r in rows_ok) / max(len(rows_ok) + bad, 1)}
 
 
 def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "vpd4l", per_class: int = 1, fresh: int = 16,

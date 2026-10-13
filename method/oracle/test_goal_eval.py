@@ -1540,7 +1540,8 @@ def test_track_pp_engine_matches_pp_run(tiny):
 def test_interchange_path_patched(tiny):
     """interchange_pp: the circuit's nodes at p held at their values on the changed text, their stated paths carrying
     them, everything else at x; the model's side is the real model with those activations replaced (naive()), a
-    stated graph with every connection its complete graph's run, VPD's answer scores 1, and it is C's term."""
+    stated graph with every connection its complete graph's run, VPD's candidate and reference KL agree within FP32
+    rounding, and it is C's term."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     sub = every[::2]
@@ -1558,8 +1559,12 @@ def test_interchange_path_patched(tiny):
     a, c = ge.pp_run(tx, tx.ids, stated, fixed=held), ge.pp_run(tx, tx.ids, native.Graph(sub, complete=True), fixed=held)
     assert float(carry.kl(c, a)[0]) < 1e-5
     rows = ge.interchange_pp(tx, [native.Graph(masks=tx.vpd), stated], draws=4)
-    assert rows[0]["s_interchange_pp"] is None or abs(rows[0]["s_interchange_pp"] - 1) < 1e-6, (
-        rows[0]["s_interchange_pp"], rows[0]["draws_interchange_pp"])
+    vpd_draws = rows[0]["draws_interchange_pp"]
+    assert vpd_draws
+    # Compare the actual identity invariant before ln(W/KL_C)/ln(W/KL_VPD): a small denominator can amplify FP32
+    # batch-rounding differences. About 17 FP32 eps relative / 9 eps absolute; execution checks above stay at 1e-5.
+    np.testing.assert_allclose([d[1] for d in vpd_draws], [d[2] for d in vpd_draws], rtol=2e-6, atol=1e-6,
+                               err_msg=f"VPD candidate/reference KL disagree: {vpd_draws}")
     assert rows[1]["draws_interchange_pp"] and ge.interchange_search(tx, [stated], 4, mode="pp")[0]["draws_interchange_pp"]
     row = ge.fidelity(tx, [stated], None, draws=2, near_donors=0, far_donors=0, interchange=4, changed=4)[0]
     assert "s_interchange_pp" in row["c_terms"] or row["s_interchange_pp"] is None

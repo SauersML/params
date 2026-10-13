@@ -7,6 +7,22 @@ from learning_model_bank import GENERATOR_COMMIT, FAMILIES
 
 
 class ContractTest(unittest.TestCase):
+    def test_append_journal_preserves_receipts_and_final_legacy_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);journal=root/'evidence.jsonl'
+            first={'file':'a.safetensors','sha256':'first','index':0}
+            second={'file':'b.safetensors','sha256':'second','index':1}
+            driver.append_evidence(journal,first);prefix=journal.read_bytes()
+            driver.append_evidence(journal,second)
+            self.assertTrue(journal.read_bytes().startswith(prefix))
+            self.assertFalse((root/'evidence.json').exists())
+            driver.finalize_evidence(root)
+            self.assertEqual(json.loads((root/'evidence.json').read_text()),[first,second])
+            self.assertEqual(journal.read_bytes().count(b'\n'),2)
+            with journal.open('a') as handle:handle.write('{incomplete')
+            before=(root/'evidence.json').read_bytes()
+            with self.assertRaises(json.JSONDecodeError):driver.finalize_evidence(root)
+            self.assertEqual((root/'evidence.json').read_bytes(),before)
     def fixture(self, root):
         rows=[]
         for split,base,variants in [('train',3100000,(0,1)),('evaluation',3200000,(0,))]:

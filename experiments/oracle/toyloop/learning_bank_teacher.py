@@ -6,6 +6,7 @@ Every fixed case has an explicit outcome; failures cannot be replaced.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import types
@@ -19,6 +20,25 @@ def sha(path):
 
 def write(path, value):
     path.write_text(json.dumps(value, indent=2)+'\n')
+
+
+def append_evidence(path, value):
+    """Durable per-world journal; partial runs retain every completed receipt."""
+    with path.open('a') as handle:
+        handle.write(json.dumps(value,allow_nan=False)+'\n')
+        handle.flush();os.fsync(handle.fileno())
+
+
+def finalize_evidence(root):
+    """Create the legacy index once; a malformed partial journal fails closed."""
+    journal=root/'evidence.jsonl'
+    if not journal.exists():return
+    values=[json.loads(line) for line in journal.read_text().splitlines()]
+    temporary=root/'evidence.json.tmp'
+    with temporary.open('w') as handle:
+        handle.write(json.dumps(values,indent=2,allow_nan=False)+'\n')
+        handle.flush();os.fsync(handle.fileno())
+    os.replace(temporary,root/'evidence.json')
 
 
 def validate_bank(root, expected_sha, worker):
@@ -79,8 +99,8 @@ def execute_case(row, bank, out, modules):
         name=f'{stage}_{index}.safetensors'; tensors={'dense':p.contiguous(),'candidate':q.contiguous()}
         if complete is not None:tensors['full_integrity']=complete.contiguous()
         save_file(tensors,str(out/name))
-        evidence.append({'stage':stage,'index':index,'world':world,'file':name,'sha256':sha(out/name)})
-        write(out/'evidence.json',evidence)
+        entry={'stage':stage,'index':index,'world':world,'file':name,'sha256':sha(out/name)}
+        append_evidence(out/'evidence.jsonl',entry);evidence.append(entry)
     def attempt(value):
         attempts.append(value);write(out/'attempts.json',attempts)
     result=teacher.search_teacher(toy,nat=nat,texts=inputs,attempt_sink=attempt,
@@ -166,6 +186,10 @@ def main():
             if row['status']!='constructed_unmeasured':status.update(status='construction_error',original=row)
             else:status=execute_case(row,args.bank,args.out/row['case'],(render,planted,teacher,reward))
         except Exception as exc:status.update(error_type=type(exc).__name__,error=str(exc))
+        dest=args.out/row['case']
+        if dest.exists():
+            try:finalize_evidence(dest)
+            except Exception as exc:status.update(status='error',journal_error=type(exc).__name__)
         statuses.append(status);write(args.out/'status.json',statuses)
         print(json.dumps(status),flush=True)
     write(args.out/'complete.json',{'cases':statuses,'forward_cap':contract['forward_cap']})

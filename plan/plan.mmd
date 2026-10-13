@@ -60,7 +60,10 @@
 %% Binding audit found unlabeled group triples/coordinates. Separate future typed payload preserves exact units,
 %% distinguishes token position/component index/vector coordinate, and declares the full 258-unit group.
 %% Offline contracts pass; no new writer call or demonstrated improvement: scratch/variable_reward/vpd_english_future_typed.
-%% QA-only control uses existing97 training labels and identical prompts; no new model-generated targets.
+%% QA-only artifacts: pilot analysis/response_only_control preserves97 original prompts and792 measured FINAL targets.
+%% Use analysis/qa_task_control for a coherent task: same observations/questions, QA-only instructions, no EDIT requests.
+%% All97 train pairs fit; fixeddev8 has68 questions and no answers in generation inputs. No new labels or training call.
+%% Changed instructions make this an isolated-skill trial, not proof of a matched-prompt causal effect.
 %% Literature consequence: measure outcome prediction before free prose; native carriers alone cannot certify meaning.
 %% Offline falsification: real node-response errors coexist with large uncertainty penalties; do not tune them away.
 %% Next reward evidence, if needed: saved candidates on9020/9026/9027 with retained draws, after scorer owner freezes it.
@@ -128,7 +131,7 @@ flowchart BT
     I2["<b>Context fit and explicit limits</b><br/>opt-in node cap before token fitting;<br/>log and skip only oversized rows;<br/>later rows continue<br/>DONE · codex/eval_recovery · 33419cd"]
     I3["<b>Coverage audit</b><br/>179/207-row snapshots: 81–84%<br/>of teacher nodes visible; edits join;<br/>retain pool inputs, check token fit<br/>HANDOFF · codex to primerl/rustmove"]
     I4["<b>Learnability and input controls</b><br/>cheap feature baseline matches SFT QA;<br/>test weights beyond visible facts;<br/>vectors real/random/id/permuted<br/>ACTIVE · rustmove, codex"]
-    QAONLY["<b>Outcome-only learning control</b><br/>same 97 prompts and measured QA;<br/>is full-circuit training a distraction?<br/>prepare data; no new paid training<br/>ACTIVE · codex/eval_recovery"]
+    QAONLY["<b>Outcome-only control data</b><br/>97 texts, 792 measured answers;<br/>same facts, QA-only instructions;<br/>fits trainer; compare falls/top separately<br/>READY · codex/eval_recovery"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
     I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
   end
@@ -290,7 +293,7 @@ flowchart BT
   class T4 blocked
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
-  class QAONLY active
+  class QAONLY check
   class ENGP check
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting

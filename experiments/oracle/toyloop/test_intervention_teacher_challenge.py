@@ -36,3 +36,16 @@ def test_summary_retains_invalids_and_distinguishes_mixed_interventions():
     group = summarize([row, invalid])["groups"][0]
     assert group["kind"] == "joint_mixed"
     assert (group["worlds"], group["valid"], group["top_correct"], group["kl_failures_or_invalid"]) == (2, 1, 1, 1)
+def test_batch_input_selection_is_distinct_and_search_disjoint():
+    import intervention_teacher_batch_challenge as batch
+    draws = [[0, 1], [0, 2], [0, 2]] + [[0, i] for i in range(3, 10)]
+    assert batch.select_inputs(draws, [[0, 1]]) == [[0, i] for i in range(2, 10)]
+
+
+def test_batch_input_selection_rejects_insufficient_fixed_pool():
+    import pytest
+    import intervention_teacher_batch_challenge as batch
+    with pytest.raises(RuntimeError, match="fixed 64-draw"):
+        batch.select_inputs([[0, 1]] * 64, [[0, 1]])
+
+

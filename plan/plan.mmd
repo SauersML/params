@@ -464,12 +464,12 @@ flowchart BT
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
     TXT["<b>Text splits</b><br/>train 6000–7999 · dev 9000–9099<br/>donors 9150–9199; sealed stays closed<br/>22 launch checks;26 tool checks pass<br/>codex · 8aa2701, a47cb59"]
-    ENG["<b>Executable-circuit engine</b><br/>path-patched, batched, held values,<br/>line deletions in one call; block units<br/>DONE · monitorbench"]
+    ENG["<b>Executable-circuit engine</b><br/>path-patched, batched, held values,<br/>line deletions in one call; block units;<br/>q/k outside held at x, norms frozen at x<br/>(= graph_ref outside=/freeze=, b6a3df3)<br/>DONE · monitorbench"]
   end
 
   %% ===================== instrumental goals =====================
   subgraph INSTR["INSTRUMENTAL · faster and cheaper everywhere"]
-    SP1["<b>Engine speed</b><br/>4090: line_loo with nodes per line 9.3 s, 737 lines;<br/>S1 complete sets 8.7 s per answer scored;<br/>phi_variants: nodes + patching per variant;<br/>now: teacher GPU use (pods at ~30%)<br/>scale blockers (audit): [H, T, T] scores kept<br/>per layer (8·L·H·T² B); variables.py full traces<br/>per donor; gradient path unchunked<br/>ACTIVE · monitorbench"]
+    SP1["<b>Engine speed</b><br/>4090: S1 complete sets 8.9 s per answer<br/>(72 sets, 93–1,054 subcomponents, no OOM);<br/>teacher text9002 286 → 139 s (N's controls<br/>batched, node family batched);<br/>now: x semantics in line_loo, node family cost<br/>scale blockers (audit): [H, T, T] scores kept<br/>per layer (8·L·H·T² B); variables.py full traces<br/>per donor; gradient path unchunked<br/>ACTIVE · monitorbench"]
     SP2["<b>Teacher throughput</b><br/>influential start: 3 s and $0.0002 per text<br/>(494 texts, $0.11);<br/>block-search teacher: median 3–15 min,<br/>tails past 2 h, $0.14–0.25 per text<br/>ACTIVE · fleet, pymove"]
     SP3["<b>Scorer throughput</b><br/>10 s per RL sample with line credit<br/>(A40, 66 lines; was 21 s);<br/>left: pattern, N per deletion<br/>ACTIVE · inframove, primerl, monitorbench"]
     SP4["<b>GPU use and cost</b><br/>toy teacher runs leave the GPU idle:<br/>they run on the Mac; toy VPD fits<br/>run 2–3 per card; block search needs<br/>86 GB host memory on text9004<br/>ACTIVE · fleet"]

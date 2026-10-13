@@ -1043,85 +1043,67 @@ class Validated:
 
 
 SET_LEVELS = ("site", "chunk16", "chunk4", "subcomponent")  # the influential set's levels, coarse first
-GROW_DRAWS = 16       # --grow: changed texts whose VPD actives at the start's positions are the candidates
-GROW_MIN = 0.01       # --grow: a group joins only for a phi gain at least this (text6011 grew by 0.001-a-group noise)
+FORWARD_CHUNK = 8     # --forward: candidate sets per fidelity call
 
 
-def grow_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, positions: list, pool: dict, log=print) -> dict | None:
-    """--grow (the lead's 10-12, v2.1: about 6 of 20 dev starts sit below the reward's bar and pruning cannot raise
-    them): a start below the bar (phi_tau) grows by the family carrier at its positions, VPD's active subcomponents
-    on the text and on GROW_DRAWS changed texts of the search split's pool (search_pool's ranked draws first: the
-    inactive-on-x responders inframove found among them), in groups of one site at one position, each step adding the
-    group that raises phi most (GoalEval.phi_variants over the union of the start and every candidate, one call a
-    step) while phi rises by GROW_MIN and stays below the bar (phi_variants holds the nodes, edges, flips and patching
-    families at the union's values, so a group earns only through point, track_pp, interchange_pp, pattern and N). {"added": nodes, "phi_start", "phi", "bar", "groups", "candidates",
-    "inactive"} or None (the start at the bar, or no candidate)."""
-    nat, P = ge.nat, set(positions)
-    bar = ge.tau(tx, pool, "search")["phi_tau"]
-    have = set(nodes)
-    r0, r2, sampled = search_pool(ge, tx, parts=True)
-    draws = (r0 + r2 + sampled)[:GROW_DRAWS]
-    cand = set()
-    for p, z in draws:
-        x2 = list(tx.ids)
-        x2[p] = z
-        m = ge.vpd_answer(x2, tx.targets)
-        if m is None:
-            return None
-        cand |= {(n, int(t), int(c)) for n in nat.names for t, c in m[n].nonzero().tolist() if int(t) in P}
-    cand -= have
-    if not cand:
-        return None
-    union = native.Graph(sorted(have | cand), complete=True)
+def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=print) -> dict:
+    """--forward (the lead's 10-13: is a start backward pruning cannot shrink minimal, or a local minimum of the
+    acceptance rule?): from VPD's actives at the targets, F2's positions added one position group at a time (VPD's
+    actives there), each step the group whose addition gives the highest phi (goal_eval's reward-mode fidelity on the
+    search split, every family recomputed for each candidate; FORWARD_CHUNK candidates a call), until phi reaches the
+    bar (phi_tau + PHI_SLACK) or every group is in. {"nodes", "positions", "phi", "bar", "steps": [position, size, phi]}."""
+    nat = ge.nat
+    tau = ge.tau(tx, pool, "search")
+    bar, fams = tau["phi_tau"], tau["families"]
+    act = [(n, int(t), int(c)) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()]
+    cur = {nd for nd in act if nd[1] in set(tx.targets)}
+    f2 = {int(q) for q, _ in tx.f2} - set(tx.targets)
     groups = {}
-    for nd in sorted(cand):
-        groups.setdefault((nd[0], nd[1]), []).append(nd)
-    keys = list(groups)
-    base = ge.fidelity(tx, [union], pool, mode="reward", split="search", interchange=8, changed=8)[0]
-    phi0 = ge.phi_variants(tx, union, ge.keep_of(tx, union, [sorted(have)]), pool, base=base, start=bar)["variants"][0]["phi"]
-    out = {"phi_start": phi0, "bar": bar, "candidates": len(cand), "groups": len(keys),
-           "inactive": sum(not bool(tx.vpd[n][t, c]) for n, t, c in cand), "added": [], "steps": []}
-    if phi0 is None or bar is None or phi0 >= bar + PHI_SLACK:
-        return None
-    cur, ph = set(have), phi0
-    while keys:
-        got = ge.phi_variants(tx, union, ge.keep_of(tx, union, [sorted(cur | set(groups[k])) for k in keys]), pool,
-                              base=base, start=bar)["variants"]
-        j = max(range(len(keys)), key=lambda i: got[i]["phi"] if got[i]["phi"] is not None else -1e9)
-        if got[j]["phi"] is None or got[j]["phi"] < ph + GROW_MIN:
-            break
-        cur |= set(groups[keys[j]])
-        ph = got[j]["phi"]
-        out["steps"].append([keys[j][0], keys[j][1], len(groups[keys[j]]), ph])
-        log(f"  grow: + {keys[j][0]}@{keys[j][1]} ({len(groups[keys[j]])}), phi {ph:.3f} (bar {bar:.3f})", flush=True)
-        keys.pop(j)
-        if ph >= bar + PHI_SLACK:
-            break
-    out["added"], out["phi"] = sorted(cur - have), ph
-    return out
+    for nd in act:
+        if nd[1] in f2:
+            groups.setdefault(nd[1], []).append(nd)
+
+    def phis(sets):
+        out = []
+        for i in range(0, len(sets), FORWARD_CHUNK):
+            rows = ge.fidelity(tx, [native.Graph(sorted(s), complete=True) for s in sets[i:i + FORWARD_CHUNK]], pool,
+                               mode="reward", split="search")
+            out += [goal_eval.phi(r, families=fams)[0] for r in rows]
+        return out
+    ph = phis([cur])[0]
+    steps = [[None, len(cur), ph]]
+    log(f"  forward: targets ({len(cur)} subcomponents) phi {ph} (bar {bar})", flush=True)
+    while groups and (ph is None or bar is None or ph < bar + PHI_SLACK):
+        keys = sorted(groups)
+        got = phis([cur | set(groups[k]) for k in keys])
+        j = max(range(len(keys)), key=lambda i: -math.inf if got[i] is None else got[i])
+        cur |= set(groups.pop(keys[j]))
+        ph = got[j]
+        steps.append([keys[j], len(cur), ph])
+        log(f"  forward: + position {keys[j]} ({len(cur)} subcomponents) phi {ph} (bar {bar}), {len(keys)} tried", flush=True)
+    return {"nodes": sorted(cur), "positions": sorted({nd[1] for nd in cur}), "phi": ph, "bar": bar, "steps": steps}
+
+
 SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its own log recovery (fleet's 9004 finding)
 
 
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
                acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS,
-               phi_pool: dict | None = None, grow: bool = False, backup: bool = False) -> tuple:
+               phi_pool: dict | None = None, forward: bool = False, backup: bool = False) -> tuple:
     """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): goal_eval.GoalEval.start_set
     (VPD's active subcomponents at the targets and the m most influential positions, every connection; search split
     s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
     and the acceptance floors (min(0.9, the start's)) at levels, each level
     under Validated when the acceptance draws are "fv"; with phi_pool, every stage scored on the search split and the
     one of the highest circuit_score written (the reward's circuit term: phi against the bar, then compactness).
-    backup: the start first expanded by its compensators (backup.expand_circuit). (The circuit, its Pruner, the
-    record) as block_search's (no group, no blocks)."""
+    forward: the start forward_start's instead (with phi_pool); backup: the start first expanded by its compensators
+    (backup.expand_circuit). (The circuit, its Pruner, the record) as block_search's (no group, no blocks)."""
     nat = ge.nat
     st = ge.start_set(tx, "search")
+    fwd = forward_start(ge, tx, phi_pool, log) if forward and phi_pool is not None else None
     start = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
-    for n, t, c in st["graph"].node_set():
+    for n, t, c in (fwd["nodes"] if fwd is not None else st["graph"].node_set()):
         start[n][t, c] = True
-    grown = grow_start(ge, tx, sorted(st["graph"].node_set()), st["positions"], phi_pool, log) if grow and phi_pool is not None else None
-    if grown is not None:
-        for n, t, c in grown["added"]:
-            start[n][t, c] = True
     backed = None
     if backup:                                               # the backup agent's expansion (backup.expand_circuit): the
         import backup as backup_mod                          # compensators a removal of the start's nodes recruits in the
@@ -1137,8 +1119,9 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     graph_of = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
     kl0 = pr.kl()                                            # the F1 budget, or losing at most 5% of the start's log
     budget = max(budget, kl_budget(empty, kl0, SET_RECOVERY))  # recovery (a start over it: text6011, 9004 pruned nothing)
-    rec = {"m": st["m"], "positions": st["positions"], "start_s_track_pp": st["s_track_pp"], "start_units": len(pr.nodes),
-           "stages": [], "validation": [], "budget": budget, "grow": {k: v for k, v in (grown or {}).items() if k != "added"} or None,
+    rec = {"m": st["m"], "positions": fwd["positions"] if fwd is not None else st["positions"],
+           "start_s_track_pp": st["s_track_pp"], "start_units": len(pr.nodes), "stages": [], "validation": [],
+           "budget": budget, "forward": {k: v for k, v in fwd.items() if k != "nodes"} if fwd is not None else None,
            "backup": backed}
 
     snaps = []
@@ -1614,7 +1597,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           robust_pool: dict | None = None, no_strand: bool = False, edge_levels: tuple = ("connection",),
           accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
           accept_draws: str = "fixed", phi_pool: dict | None = None, context: str = "refine",
-          grow: bool = False, task: dict | None = None, backup: bool = False) -> tuple[dict, dict]:
+          forward: bool = False, task: dict | None = None, backup: bool = False) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
@@ -1656,13 +1639,15 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
 
     if f1_start in ("influential", "set"):                   # the influential-blocks search (block_search) or the
         if f1_start == "set":                                # influential set pruned (set_search), and its wiring
-            arms = [set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, grow=grow, backup=b)
-                    for b in ((False, True) if backup else (False,))]   # with --backup, the plain and the expanded start
+            # the plain start pruned, with --backup the expanded start and with --forward forward_start's too, the
+            # highest circuit_score written (text9000: backup's 165 subcomponents at 0.91)
+            arms = [set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, forward=f, backup=b)
+                    for f, b in [(False, False)] + [(False, True)] * backup + [(True, False)] * forward]
             g, pb, _, _, row["blocks"] = max(arms, key=lambda a: -math.inf if a[4].get("score") is None else a[4]["score"])
-            if backup:                                       # pruned, the higher circuit_score written (text9000: 165
-                row["blocks"]["arms"] = [{"backup": a[4]["backup"] is not None, "score": a[4].get("score"),   # at 0.91,
-                                          "stage": a[4].get("phi_stage"), "subcomponents": int(a[1].on.sum()),   # 9002:
-                                          "bits": a[4]["bits"]} for a in arms]   # the start, 536 at -0.27)
+            if backup or forward:
+                row["blocks"]["arms"] = [{"arm": "backup" if a[4]["backup"] else "forward" if a[4]["forward"] else "plain",
+                                          "score": a[4].get("score"), "stage": a[4].get("phi_stage"),
+                                          "subcomponents": int(a[1].on.sum()), "bits": a[4]["bits"]} for a in arms]
         else:
             g, pb, _, _, row["blocks"] = block_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, context=context)
         bl = {(nd[0], nd[1]) for nd in g.node_set() if nd[2] == goal_eval.BLOCK}
@@ -1928,8 +1913,8 @@ def main():
     ap.add_argument("--backup", action="store_true", help="with --f1-start set: the start as found and the start expanded "
                     "by its compensators (the backup agent's backup.expand_circuit, as subcomponents) each pruned, the higher "
                     "circuit_score written (implies --phi-check)")
-    ap.add_argument("--grow", action="store_true", help="with --f1-start set: a start below the reward's bar grows by the "
-                    "family carrier (VPD's actives on changed texts at its positions) while phi rises (grow_start)")
+    ap.add_argument("--forward", action="store_true", help="with --f1-start set: an arm pruning forward_start's set (F2's "
+                    "positions added in order of phi until the bar), beside the plain (and --backup) arms (implies --phi-check)")
     ap.add_argument("--phi-log", action="store_true", help="--phi-check (whose set search scores every stage)")
     ap.add_argument("--accept-draws", choices=("fixed", "discriminating", "fresh", "fv"), default="fixed",
                     help="--accept changed's draws in pp mode: the search split's fixed ones, or per check a fresh sample of "
@@ -1999,8 +1984,8 @@ def main():
             r = json.loads(line)
             labels[r["task"]] = r.get("local")
     args.out.mkdir(parents=True, exist_ok=True)
-    phi_pool_needed = args.phi_check or args.phi_log or args.grow or args.backup or "phi" in args.accept.split(",")
-    args.phi_check = args.phi_check or args.phi_log or args.backup
+    phi_pool_needed = args.phi_check or args.phi_log or args.forward or args.backup or "phi" in args.accept.split(",")
+    args.phi_check = args.phi_check or args.phi_log or args.backup or args.forward
     pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" or phi_pool_needed else None
     for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
@@ -2021,7 +2006,7 @@ def main():
                                          pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
                                          args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
                                          args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if phi_pool_needed else None,
-                                         args.context, args.grow, json.loads(path.read_text()), args.backup)
+                                         args.context, args.forward, json.loads(path.read_text()), args.backup)
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

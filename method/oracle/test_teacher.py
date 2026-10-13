@@ -659,6 +659,29 @@ def test_set_search_writes_the_highest_scoring_stage():
     assert rec["phi_stage"] == best[0] and rec["score"] == best[6] and g.count() == best[3]
 
 
+@pytest.mark.skipif(DEVICE == "cpu", reason="needs a GPU")
+def test_forward_start_adds_positions_until_the_bar():
+    if not teacher.POOL.exists():
+        pytest.skip("needs the adversary's pool")
+    nat, pr = pruner(True, "text9002")
+    ge = pr.ge
+    ids, targets = native.text(TEXT.parent / "text9002.json")
+    tx = ge.text(ids, targets, native.task_seed("text9002"))
+    tx.vpd = pr.tx.vpd
+    pool = torch.load(teacher.POOL)
+    got = teacher.forward_start(ge, tx, pool)
+    tau = ge.tau(tx, pool, "search")
+    # VPD's actives at the targets first, then one F2 position's actives a step, until phi reaches the bar or every
+    # position is in; the set is VPD's actives at its positions
+    act = {(n, int(t), int(c)) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()}
+    assert got["bar"] == tau["phi_tau"] and set(got["nodes"]) == {nd for nd in act if nd[1] in set(got["positions"])}
+    sizes = [s[1] for s in got["steps"]]
+    assert sizes == sorted(sizes) and got["steps"][0][0] is None and sizes[-1] == len(got["nodes"])
+    f2 = {int(q) for q, _ in tx.f2} - set(tx.targets)
+    assert got["phi"] >= got["bar"] + teacher.PHI_SLACK or set(got["positions"]) >= f2
+    assert all(ph < got["bar"] + teacher.PHI_SLACK for _, _, ph in got["steps"][:-1])
+
+
 def test_family_acceptance_scores_as_fidelity():
     nat, pr = pruner(True, "text9002")
     ge = pr.ge

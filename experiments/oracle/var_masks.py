@@ -88,15 +88,23 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
     pzB = [(q, z) for q in ins for z in B[q]]
     pzI = [(q, z) for q in iso_pos for z in iso_B[q]]
 
-    def f_off(group):  # Iso on B-like donors before the carrier: 1 - KL(model(x) || patched) / KL(model(x) || model(x'))
+    def f_off(group, by_position: dict | None = None):
+        # Iso on B-like donors before the carrier: 1 - KL(model(x) || patched) / KL(model(x) || model(x')), KL-weighted;
+        # by_position (when given) gets each position's own (f, weight)
         if not pzI:
             return None
         num = den = 0.0
+        per = {}
         for (q, z), qq in zip(pzI, R.patched(group, pzI)):
             d0 = var_controls.kl(R.base, R.donor(q, z)["lq"])
             if d0 > 1e-6:
-                num += d0 * min(1.0, max(0.0, 1.0 - max(var_controls.kl(R.base, qq), 0.0) / d0))
+                f = min(1.0, max(0.0, 1.0 - max(var_controls.kl(R.base, qq), 0.0) / d0))
+                num += d0 * f
                 den += d0
+                a, b = per.get(q, (0.0, 0.0))
+                per[q] = (a + d0 * f, b + d0)
+        if by_position is not None:
+            by_position.update({q: {"f": a / b, "weight": b} for q, (a, b) in per.items()})
         return num / den if den > 0 else None
     out = {"task": task_id, "inputs": list(ins), "at": list(at), "depth": depth, "skip": list(skip), "iso_positions": iso_pos,
            "candidates": len(fam), "N": N, "family_bits": bits(len(fam)), "A": len(pzA), "iso_train": len(texts_I), "B": len(pzB),
@@ -136,7 +144,8 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tu
                     x = var_teacher.together(variables.Scorer(ge), tx, variables.parse([vj], nat.C), split, 8)["variables"][0]
                     scorer[split] = {"term": var_teacher.term(x), "f_on": x["f_on"], "f_off": x["f_off"], "s_off": x["s_off"]}
             row = {"lam": lam, "targets": kind, "size": len(keep), "bits": bits(len(keep)), "f_B": f,
-                   "iso_B": f_off(keep) if kind == "real" else None,
+                   "iso_B": f_off(keep, per_q := {}) if kind == "real" else None,
+                   "iso_by_position": per_q if kind == "real" else None,
                    "scorer": dict(scorer) if kind == "real" else None,
                    "random_same_size": float(np.mean([x for x in rnd if x is not None])) if any(x is not None for x in rnd) else None}
             out["masks"].append(row)

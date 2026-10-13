@@ -73,7 +73,7 @@ jobs:
 
       - name: Check toy wiring, fixed-basis edits and SFT weighting
         if: ${{ !inputs.adversary_batch_only }}
-        run: python -m pytest experiments/oracle/toyloop/test_wiring.py experiments/oracle/toyloop/test_head_counterfactual.py experiments/oracle/toyloop/test_relation_loss.py experiments/oracle/toyloop/test_render_observability.py experiments/oracle/toyloop/test_factorial_report.py -q --tb=short
+        run: python -m pytest experiments/oracle/toyloop/test_wiring.py experiments/oracle/toyloop/test_head_counterfactual.py experiments/oracle/toyloop/test_relation_loss.py experiments/oracle/toyloop/test_render_observability.py experiments/oracle/toyloop/test_factorial_report.py experiments/oracle/toyloop/test_route_transfer.py experiments/oracle/toyloop/test_capable_transfer.py -q --tb=short
 
       - name: Check weight-use, intervention, English and data controls
         if: ${{ !inputs.adversary_batch_only }}

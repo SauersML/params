@@ -442,13 +442,13 @@ def fit_multi(net: Net, bases: dict, steps: int, rank: int, lam: float, keep: li
             params[site] = (None, None, a, b)
             groups += [{"params": [a], "lr": lr}, {"params": [b], "lr": lr}]
             continue
-        Vk, Uk = basis
-        k = Vk.shape[1]
-        r = min(rank, k)
-        a = (torch.randn(k, r, generator=g) / math.sqrt(k)).to(nat.dev).requires_grad_(True)
-        b = torch.zeros(k, r, device=nat.dev, requires_grad=True)
+        Vk, Uk = basis[0], basis[1]
+        kv, ku = Vk.shape[1], Uk.shape[1]  # read and write spans may differ in dimension (spec_basis)
+        r = min(rank, kv, ku)
+        a = (torch.randn(kv, r, generator=g) / math.sqrt(kv)).to(nat.dev).requires_grad_(True)
+        b = torch.zeros(ku, r, device=nat.dev, requires_grad=True)
         params[site] = (Vk, Uk, a, b)
-        groups += [{"params": [a], "lr": lr * math.sqrt(d_in / k)}, {"params": [b], "lr": lr * math.sqrt(d_out / k)}]
+        groups += [{"params": [a], "lr": lr * math.sqrt(d_in / kv)}, {"params": [b], "lr": lr * math.sqrt(d_out / ku)}]
 
     def deltas(detach: bool = False):
         out = []
@@ -472,35 +472,41 @@ def fit_multi(net: Net, bases: dict, steps: int, rank: int, lam: float, keep: li
         opt.step()
 
 
-def _orth(X: torch.Tensor) -> torch.Tensor:
-    """An orthonormal basis of X's columns (modified Gram-Schmidt; torch's decompositions are avoided on the Mac)."""
-    out = []
-    for j in range(X.shape[1]):
-        v = X[:, j].clone()
-        for q in out:
-            v = v - (q @ v) * q
-        n = v.norm()
-        if n > 1e-6:
-            out.append(v / n)
-    return torch.stack(out, 1) if out else X[:, :0]
+RANK_TOL = 1e-6  # numerical rank: singular values above this share of the largest
 
 
-SPEC_KEEP = 0.2  # a circuit direction keeps this share of its norm outside the controls' span, or it is dropped
+def _span(X: torch.Tensor, scale: float | None = None) -> tuple[torch.Tensor, float]:
+    """(an orthonormal basis of X's column span at numerical rank, X's largest singular value): singular values above
+    RANK_TOL x scale (X's own largest when scale is None; a projected matrix is measured against the unprojected one's,
+    or a direction projected to rounding would count); scipy's SVD on the CPU (torch's decompositions are unreliable
+    on the Mac), torch's on a GPU."""
+    if X.shape[1] == 0:
+        return X, 0.0
+    if X.device.type == "cpu":
+        import numpy as np
+        from scipy.linalg import svd
+
+        U, sv, _ = svd(X.double().numpy(), full_matrices=False)
+        keep = sv > RANK_TOL * (sv.max() if scale is None else scale)
+        return torch.from_numpy(np.ascontiguousarray(U[:, keep])).to(X.dtype), float(sv.max())
+    U, sv, _ = torch.linalg.svd(X.double(), full_matrices=False)
+    return U[:, sv > RANK_TOL * (float(sv.max()) if scale is None else scale)].to(X.dtype), float(sv.max())
 
 
 def spec_basis(nat, site: str, circ: list[int], ctrl: list[int]):
-    """The circuit's read and write directions at a matrix with the controls' circuit's projected out (each side
-    separately), renormalized; directions left with less than SPEC_KEEP of their norm dropped; None when none is left."""
+    """(read basis, write basis, counts) at a matrix: the span of the circuit's read directions v with the controls'
+    circuit's read span projected out, the same for the write directions u, each an orthonormal basis at numerical
+    rank relative to the unprojected directions' largest singular value (no threshold on what counts as the circuit);
+    counts = [circuit read rank, write rank, after projection read, write]. None when either side is left empty."""
     Vk, Uk = finetune_edit.basis(nat, site, circ)
+    (Bv, sv), (Bu, su) = _span(Vk), _span(Uk)
+    counts = [Bv.shape[1], Bu.shape[1]]
     if ctrl:
         Vc, Uc = finetune_edit.basis(nat, site, ctrl)
-        Qv, Qu = _orth(Vc), _orth(Uc)
-        Vk, Uk = Vk - Qv @ (Qv.T @ Vk), Uk - Qu @ (Qu.T @ Uk)
-    keep = (Vk.norm(dim=0) >= SPEC_KEEP) & (Uk.norm(dim=0) >= SPEC_KEEP)
-    if not bool(keep.any()):
-        return None
-    Vk, Uk = Vk[:, keep], Uk[:, keep]
-    return Vk / Vk.norm(dim=0, keepdim=True), Uk / Uk.norm(dim=0, keepdim=True)
+        Qv, Qu = _span(Vc)[0], _span(Uc)[0]
+        Bv, Bu = _span(Vk - Qv @ (Qv.T @ Vk), sv)[0], _span(Uk - Qu @ (Qu.T @ Uk), su)[0]
+    counts += [Bv.shape[1], Bu.shape[1]]
+    return (Bv, Bu, counts) if Bv.shape[1] and Bu.shape[1] else (None, None, counts)
 
 
 METHODS = ("circuit_edit", "random_active", "random_any", "random_equal", "vpd_topk", "finetune", "circuit_scales", "random_scales",
@@ -528,8 +534,9 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
                      subcomponents, a rank-r update within their read and write directions, trained together
                      (fit_multi), at each LAMS;
       random_ft      the same within as many random active subcomponents at each of those matrices;
-      circuit_ft_spec  circuit_ft with the controls' circuit's read and write directions projected out at each
-                     matrix (spec_basis; the controls' circuit from the same teacher at the fit third's controls);
+      circuit_ft_spec  circuit_ft with the controls' circuit's read and write spans projected out at each matrix
+                     (spec_basis, at numerical rank; the controls' circuit from the same teacher at the fit third's
+                     controls); out["spec_ranks"] the ranks kept per matrix without and with the projection;
       finetune_sites an unrestricted rank-r update at each of circuit_ft's matrices, trained together: the same
                      matrices, objective, steps and selection as circuit_ft, only the restriction differs.
     rank: r given (an earlier run's circuit edit size) in place of the circuit edit's operation count.
@@ -589,8 +596,9 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
         ctrl = {}
         for site, c, _ in beh.get("control_circuit", [])[:EDIT_CANDS]:
             ctrl.setdefault(site, []).append(int(c))
-        sb = {site: spec_basis(nat, site, cs, ctrl.get(site, [])) for site, cs in sites.items()}
-        sb = {k_: v for k_, v in sb.items() if v is not None}
+        got = {site: spec_basis(nat, site, cs, ctrl.get(site, [])) for site, cs in sites.items()}
+        out["spec_ranks"] = {site: g_[2] for site, g_ in got.items()}  # [read, write] ranks without and with the projection
+        sb = {site: (g_[0], g_[1]) for site, g_ in got.items() if g_[0] is not None}
         keep["circuit_ft_spec"] = []
         for lam in LAMS:
             fit_multi(net, sb, steps, r, lam, keep["circuit_ft_spec"])
@@ -789,6 +797,7 @@ def main():
     e.add_argument("--sites", nargs="*")
     e.add_argument("--methods", nargs="*", default=list(METHODS))
     e.add_argument("--rank-from", help="an earlier edit run's rows: each preference's r from its circuit edit")
+    e.add_argument("--rank", type=int, help="one r for every preference (over --rank-from and the circuit edit)")
     t = sub.add_parser("table")
     t.add_argument("rows")
     t.add_argument("--edit", action="store_true", help="edit's rows (practical_table)")
@@ -827,7 +836,7 @@ def main():
             ranks = {(x["a"], x["b"]): len(x["methods"]["circuit_edit"]["ops"]) for x in read(args.rank_from)
                      if x["methods"].get("circuit_edit")} if args.rank_from else {}
             r = practical(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites,
-                          methods=tuple(args.methods), rank=ranks.get((beh["a"], beh["b"])))
+                          methods=tuple(args.methods), rank=args.rank or ranks.get((beh["a"], beh["b"])))
         else:
             r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
         with open(args.out, "a") as fh:

@@ -3,7 +3,7 @@
 # PREFS (persistent_e3.py prefs' output), the atlas's split-B tokens and edit_eval's held texts as published inputs,
 # vpd4l's weights and VPD's subcomponents (UV) as for every pod. Rows come back to ~/mpd-data/runpod/NAME/out.
 # MODE=edit runs persistent_e3.py edit (delete the preference: circuit edit, VPD's top k, fine-tune) in place of fit.
-#   experiments/oracle/pods/pe3_pod.sh PREFS [NAME] [HOURS]      env: MODE, METHODS, RANKS, CACHE, P, VRAM, STEPS, SCREEN, GPU, PRICE
+#   experiments/oracle/pods/pe3_pod.sh PREFS [NAME] [HOURS]      env: MODE, METHODS, RANKS, RANK, CACHE, P, VRAM, STEPS, SCREEN, GPU, PRICE
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -20,6 +20,7 @@ cp "$PREFS" "$F/prefs.jsonl"
 EXTRA=""  # METHODS="a b": persistent_e3.py edit --methods; RANKS=FILE: --rank-from (an earlier edit run's rows)
 [ -n "${METHODS:-}" ] && EXTRA="--methods $METHODS"
 if [ -n "${RANKS:-}" ]; then cp "$RANKS" "$F/ranks.jsonl"; EXTRA="$EXTRA --rank-from $F/ranks.jsonl"; fi
+[ -n "${RANK:-}" ] && EXTRA="$EXTRA --rank $RANK"  # one r for every preference
 RUNS="" ROWS=""
 for k in $(seq 0 $((P - 1))); do
   RUNS="$RUNS (python -B experiments/oracle/persistent_e3.py ${MODE:-fit} $F/prefs.jsonl $O/out/fit_$k.jsonl --device cuda --steps $STEPS --screen $SCREEN --offset $k --stride $P $EXTRA > $O/fit_$k.log 2>&1; echo \"exit \$?\" >> $O/fit_$k.log) &"

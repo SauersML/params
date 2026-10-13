@@ -16,6 +16,9 @@ with the feature, "no loop_top" when lower. The within-class AUC keeps a name fr
 subcomponent whose best within-class AUC is within MIN_SEP of 0.5 stays unnamed. A group is the named circuit
 subcomponents of one layer sharing a name (whole-layer block nodes are not grouped).
 
+Groups are formed per circuit (default, --mode circuit: the oracle's setting, one image's circuit and its variables;
+the base image is the circuit's own image) or over the union of all circuits (--mode union, tested on 200 base images).
+
 Interchange (the real model, every subcomponent on, remainder live): on a base image x (test images 0-4999, the circuit
 pool), the group's activations are replaced by their values on a donor x' (test images 5000-9999) and the rest computes
 on the run's own inputs. Donors that differ: f(x') != f(x). Control donors: f(x') = f(x) and at least two other features
@@ -23,7 +26,9 @@ differ. Each condition draws donors from the whole pool (any class). Per group: 
 prediction on x, for each condition, and the ratio; direction: across the 10 classes, the Pearson correlation of the
 log-probability change with the concept's prediction log P(y | f = f(x')) - log P(y | f = f(x)) (class frequencies given
 the feature, 20,000 training images), averaged over differing donors where the prediction moved by at least 0.01 bits.
-Baseline: random groups of the same size from the same layer's subcomponents active in the circuits, same donors.
+Baseline: random groups of the same size from the same layer's circuit subcomponents outside the group (per circuit:
+that circuit's; when too few, the layer's subcomponents active on x), same donors. Per concept, the share of circuits
+where the named group's ratio exceeds the random groups' is reported.
 
   ~/mpd-data/venv/bin/python experiments/oracle/mnist/concepts.py --tag i5e-4 --circuits ~/mpd-data/mnist/circuits_X.json
 """
@@ -141,6 +146,7 @@ def main() -> None:
     ap.add_argument("--n-base", type=int, default=200)
     ap.add_argument("--n-donor", type=int, default=24)
     ap.add_argument("--n-random", type=int, default=5)
+    ap.add_argument("--mode", choices=("circuit", "union"), default="circuit")
     args = ap.parse_args()
     torch.set_num_threads(3)
     dec = load_decomp(DATA / f"vpd_{args.tag}.pt")
@@ -149,9 +155,14 @@ def main() -> None:
     xtr, ytr, xte, yte = load_mnist()
     g = np.random.default_rng(0)
     ntr = g.permutation(len(xtr))[:20000]
-    Ftr = feature_matrix(xtr[ntr])
+    fcache = DATA / "features.npz"
+    if fcache.exists():
+        z = np.load(fcache)
+        Ftr, Fte = z["Ftr"], z["Fte"]
+    else:
+        Ftr, Fte = feature_matrix(xtr[ntr]), feature_matrix(xte)
+        np.savez(fcache, Ftr=Ftr, Fte=Fte)
     ytr_n = ytr[ntr].numpy()
-    Fte = feature_matrix(xte)
     rates = {FEATURES[k]: float(Ftr[:, k].mean()) for k in range(len(FEATURES))}
     # P(y | f) from the training images, add-one smoothed
     p_y_f = np.zeros((len(FEATURES), 2, 10))
@@ -201,9 +212,102 @@ def main() -> None:
         dlogp = (F.log_softmax(lg, -1) - F.log_softmax(ref, -1)).numpy()
         return kl_bits(ref.expand(n, -1), lg).numpy(), dlogp
 
-    active_by_layer = {mod: [name_to_j[m] for m in members if m.startswith(mod)] for mod in MODULES}
+    def donors_for(b: int, k: int, gr) -> tuple[np.ndarray, np.ndarray] | None:
+        fb = Fte[b]
+        diff = donor_pool[Fte[donor_pool, k] != fb[k]]
+        others = (Fte[donor_pool] != fb).sum(1) - (Fte[donor_pool, k] != fb[k])
+        same = donor_pool[(Fte[donor_pool, k] == fb[k]) & (others >= 2)]
+        if len(diff) < args.n_donor or len(same) < args.n_donor:
+            return None
+        return gr.choice(diff, args.n_donor, replace=False), gr.choice(same, args.n_donor, replace=False)
+
+    def direction(k: int, b: int, dd: np.ndarray, kd: np.ndarray, dl: np.ndarray) -> list[float]:
+        out = []
+        for i, dn in enumerate(dd):
+            if kd[i] < 0.01:
+                continue
+            r = np.log(p_y_f[k, int(Fte[dn, k])]) - np.log(p_y_f[k, int(Fte[b, k])])
+            out.append(float(np.corrcoef(dl[i], r)[0, 1]))
+        return out
+
     out_groups = []
-    for (mod, f, sign), ms in sorted(groups.items(), key=lambda t: -len(t[1])):
+    if args.mode == "circuit":
+        per: dict[tuple[str, str, str], list[dict]] = {}
+        for r in circ:
+            b = int(r["image"])
+            mem = [m for m in r["members"] if "#" in m and abs(named[m]["auc_within"] - 0.5) >= MIN_SEP]
+            gx: dict[tuple[str, str, str], list[str]] = {}
+            for m in mem:
+                gx.setdefault((m.split("#")[0], named[m]["feature"], named[m]["sign"]), []).append(m)
+            a_b = a_te[b]
+            for key, ms in gx.items():
+                mod, f, sign = key
+                k = FEATURES.index(f)
+                gr = np.random.default_rng(b * 1000 + k * 2 + (sign == "+"))
+                dn = donors_for(b, k, gr)
+                if dn is None:
+                    continue
+                dd, ds = dn
+                js = [name_to_j[m] for m in ms]
+                pool = [name_to_j[m] for m in r["members"] if m.startswith(mod + "#") and m not in ms]
+                if len(pool) < len(js):
+                    o = dec.offsets[MODULES.index(mod)]
+                    sz = dec.sizes[MODULES.index(mod)]
+                    pool = [j for j in range(o, o + sz) if j not in js and abs(float(a_b[j])) > 0]
+                kd, dl = interchange(js, b, dd)
+                ks, _ = interchange(js, b, ds)
+                rr = []
+                for _ in range(args.n_random):
+                    rg = [int(j) for j in gr.choice(pool, size=len(js), replace=False)]
+                    rkd, _ = interchange(rg, b, dd)
+                    rks, _ = interchange(rg, b, ds)
+                    rr.append((float(rkd.mean()), float(rks.mean())))
+                per.setdefault(key, []).append(
+                    {
+                        "image": b,
+                        "size": len(js),
+                        "members": ms,
+                        "differ": float(kd.mean()),
+                        "control": float(ks.mean()),
+                        "random_differ": float(np.mean([x[0] for x in rr])),
+                        "random_control": float(np.mean([x[1] for x in rr])),
+                        "direction": direction(k, b, dd, kd, dl),
+                    }
+                )
+        for (mod, f, sign), rows in sorted(per.items(), key=lambda t: -len(t[1])):
+            d_ = np.array([x["differ"] for x in rows])
+            c_ = np.array([x["control"] for x in rows])
+            rd = np.array([x["random_differ"] for x in rows])
+            rc = np.array([x["random_control"] for x in rows])
+            dirs = [v for x in rows for v in x["direction"]]
+            row = {
+                "layer": mod,
+                "feature": f,
+                "sign": sign,
+                "concept": ("" if sign == "+" else "no ") + CONCEPT_WORDS[f],
+                "circuits": len(rows),
+                "bases": len(rows),
+                "size": float(np.mean([x["size"] for x in rows])),
+                "move_differ": float(d_.mean()),
+                "move_control": float(c_.mean()),
+                "ratio": float(d_.mean() / max(c_.mean(), 1e-9)),
+                "random_move_differ": float(rd.mean()),
+                "random_move_control": float(rc.mean()),
+                "random_ratio": float(rd.mean() / max(rc.mean(), 1e-9)),
+                "share_beats_random": float(np.mean(d_ / np.maximum(c_, 1e-9) > rd / np.maximum(rc, 1e-9))),
+                "direction_corr": float(np.mean(dirs)) if dirs else None,
+                "n_direction": len(dirs),
+                "per_circuit": rows,
+            }
+            out_groups.append(row)
+            print(
+                f"{mod} {row['concept']!r} circuits={len(rows)} size={row['size']:.1f} differ={row['move_differ']:.4f} "
+                f"control={row['move_control']:.4f} ratio={row['ratio']:.2f} rand_ratio={row['random_ratio']:.2f} "
+                f"beats_random={row['share_beats_random']:.2f} dir={row['direction_corr']}",
+                flush=True,
+            )
+    active_by_layer = {mod: [name_to_j[m] for m in members if m.startswith(mod)] for mod in MODULES}
+    for (mod, f, sign), ms in sorted(groups.items(), key=lambda t: -len(t[1])) if args.mode == "union" else []:
         k = FEATURES.index(f)
         js = [name_to_j[m] for m in ms]
         md, ms_, dirs, used = [], [], [], 0
@@ -266,7 +370,7 @@ def main() -> None:
             f"dir={row['direction_corr']} rand_ratio={row['random_ratio']}",
             flush=True,
         )
-    out = DATA / cpath.name.replace("circuits_", "concepts_")
+    out = DATA / cpath.name.replace("circuits_", "concepts_" if args.mode == "circuit" else "concepts-union_")
     n_named = sum(abs(v["auc_within"] - 0.5) >= MIN_SEP for v in named.values())
     out.write_text(
         json.dumps(

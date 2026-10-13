@@ -259,12 +259,16 @@
 %% c2dbbc4 offline paired report requires complete24-case outputs and matching sources/data/checkpoints, retains invalids,
 %% and reports each arm against its own fresh baseline plus absolute KL/top1 with explicit valid-row coverage.
 %% All paid attempts ended, no pods remain, nine failed allocations cost$0.0175; unused$1.9825 released.
-%% Strong QA baseline prepared/authorized: DeepSeek-V4.1-Flash, same22 texts9028-9049 and179questions as learned Qwen.
-%% Match temperature1, one first sample,1000 output tokens, thinking disabled, exact full user prompts; no best-of.
-%% OfficialTinker rates .60/3.60 dollars perM plus exact229024 rendered inputs give no-cache upper$0.2166144;
-%% allowance$.50 inside existingTinker130cap, same requiredproject. Scorer must reproduce frozen235/358 before calls.
-%% Compare learned235/358 and development-informed train-fit effect baseline239/358; do not substitute older231/358.
-%% Decision: whether a stronger starting model improves this QA module under equal evidence, not proof of a full oracle.
+%% Matched QA baseline complete: DeepSeek-V4.1-Flash213/358=59.50%, trained Qwen235/358=65.64%, cheap239/358=66.76%.
+%% Same22 development texts9028-9049 and179questions; full prompts, temperature1, first sample,1000token cap, thinking off.
+%% All22 strict; no retries/truncation. Strong-minus-Qwen -6.15points, text-bootstrap95%[-11.73,-1.07].
+%% Conditional on shared development and one response per model: not pristine holdout or model-sampling uncertainty.
+%% Cheap feature choice development-informed, threshold fitted on97 training rows; not the older231/358control.
+%% Cost$0.14521536 settled inside existingTinker130; unused$0.35478464 released, no shared40 draw.
+%% Artifact: graph_oracle/components/sft_codex-qa97-q8-1012/independent_dev/strong_open_deepseek_v41_flash_20261013/.
+%% Decision: do not scale QA training from these gains; neither model beats cheap measured features on this panel.
+%% Test executable wiring and improve mechanistic evidence/targets. This one base model does not settle all frontier models,
+%% reasoning budgets, circuit fidelity or weight use. Broader matched-input/tool comparison remains required at GATED.
 %% Matched scheduled updates/samples/token caps, not identical realized compute; final raw outputs and failures retained.
 %% Identical seeds/data/budget, fixed24-case panel, one greedy answer each; invalids retained, no best-of/checkpoint selection.
 %% Native teacher KL must be <=1e-3bits per input before learning. Partial training stages cannot silently restart.
@@ -372,7 +376,7 @@ flowchart BT
   WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>two free CPU forks, lower-memory updates;<br/>matched20 steps; paired report ready<br/>ACTIVE · codex/eval_recovery"]
   ROUTE["<b>Execute exact token routing</b><br/>correct multihop KL below 1e-6bits;<br/>wrong position or port:7.44bits;<br/>embeddings on; ROOT masks unsupported<br/>DONE adapter · codex/fork_review"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
-  FBASE["<b>Value beyond a strong model</b><br/>same179 QA,22texts,full evidence;<br/>DeepSeek vs trained Qwen and cheap control;<br/>one response each; estimate at most $0.22<br/>ACTIVE · codex/reward_audit"]
+  FBASE["<b>Matched QA baseline measured</b><br/>DeepSeek59.50%, Qwen65.64%;<br/>cheap features66.76% on same179 QA;<br/>prioritize circuit fidelity over QA scaling<br/>CHECK · codex · $0.145 spent"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -547,7 +551,7 @@ flowchart BT
   class QAONLY check
   class WIRING active
   class ROUTE,PYV done
-  class FBASE active
+  class FBASE check
   class CLAIMFIT check
   class CLAIMDATA,CLAIMREC done
   class ENGP done

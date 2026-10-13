@@ -46,6 +46,12 @@ step needs a decision on what a complete-but-large circuit should earn against a
 binds the default when the function is defined, so the lift has no effect. Every circuit above 266 nodes comes out
 invalid (R = -10). Fix: pass `node_cap=None` (gate_b_toys does this).
 
+**Final run (all 7 toys, 3 texts each).** Full tier: every toy passes except cancel. There, "true minus one node plus
+the uncancelled +u neuron" ties true or beats it by under 0.01 on one text. That neuron is not active at the target on
+those texts, so the swap barely changes behaviour; it is a near-tie, not a term failure. Core tier, with eps_cap +
+s_clip: wrong_eq 13/15, empty 15/15, shuffled 15/15. The two remaining wrong_eq failures are the +u-neuron swap on
+cancel. Collapsed-vs-incomplete stays at 0-6/15 under every repair.
+
 
 ## Verdict per toy and tier
 
@@ -59,7 +65,10 @@ invalid (R = -10). Fix: pass `node_cap=None` (gate_b_toys does this).
 | route1 | core | FAIL 2/3 (-1.21, random actives #2) | FAIL 2/3 (-2.99, empty) | FAIL 2/3 (-1.45, shuffled) | FAIL 0/3 (-9.20, all VPD actives) | -1.90 | **FAIL** |
 | route2 | full | PASS 3/3 (+3.36, swap 50% to wrong unit) | PASS 3/3 (+3.49, empty) | PASS 3/3 (+3.48, shuffled) | PASS 3/3 (+3.46, single node) | +4.66 | **PASS** |
 | route2 | core | FAIL 2/3 (-0.07, head0 alone (padded)) | PASS 3/3 (+0.31, empty) | PASS 3/3 (+0.32, shuffled) | FAIL 0/3 (-5.11, all VPD actives) | +0.23 | **FAIL** |
-| additive | full | PASS 1/1 (+6.84, swap 50% to wrong unit) | PASS 1/1 (+6.98, empty) | PASS 1/1 (+6.95, shuffled) | PASS 1/1 (+6.05, single node) | +6.29 | **PASS** |
+| additive | full | PASS 3/3 (+6.77, swap 50% to wrong unit) | PASS 3/3 (+6.97, empty) | PASS 3/3 (+6.95, shuffled) | PASS 3/3 (+6.05, single node) | +6.53 | **PASS** |
+| interaction | full | PASS 3/3 (+7.08, swap 100% to wrong unit) | PASS 3/3 (+7.24, empty) | PASS 3/3 (+7.11, shuffled) | PASS 3/3 (+6.29, single node) | +6.44 | **PASS** |
+| cancel | full | FAIL 2/3 (-0.00, true - 1 + (+u neuron)) | PASS 3/3 (+2.45, empty) | PASS 3/3 (+2.47, shuffled) | PASS 3/3 (+0.00, all VPD actives) | +3.06 | **FAIL** |
+| cancel | core | FAIL 1/3 (-4.04, true - 1 + (+u neuron)) | FAIL 2/3 (-2.99, empty) | PASS 3/3 (+0.67, shuffled) | FAIL 0/3 (-9.21, all VPD actives) | -2.30 | **FAIL** |
 
 ## Mean over texts per candidate
 
@@ -172,14 +181,58 @@ invalid (R = -10). Fix: pass `node_cap=None` (gate_b_toys does this).
 
 | tier | candidate | category | nodes | R | phi | phi_tau | g | compact | ≥ true (of texts) |
 |---|---|---|---|---|---|---|---|---|---|
-| full | **true** | true | 793 | 6.972 | 7.644 | 0.264 | 1.000 | -1.344 | — |
-| full | swap 50% to wrong unit | wrong_eq | 793 | 0.130 | 0.693 | 0.264 | 0.951 | -1.183 | 0/1 |
-| full | swap 100% to wrong unit | wrong_eq | 793 | 0.048 | 0.326 | 0.264 | 0.607 | -0.917 | 0/1 |
-| full | empty | empty | 0 | -0.007 | -0.007 | 0.264 | 0.133 | — | 0/1 |
-| full | shuffled | shuffled | 573 | 0.026 | 0.048 | 0.264 | 0.183 | -0.242 | 0/1 |
-| full | single node | collapsed | 1 | 0.924 | -0.007 | 0.264 | 0.133 | 14.043 | 0/1 |
-| ref | run_planted true (narrow) | ref | 793 | 6.972 | 7.644 | 0.264 | 1.000 | -1.344 | — |
-| teacher | teacher | teacher | 312 | 0.680 | 0.380 | 0.264 | 0.692 | 0.866 | — |
+| full | **true** | true | 795 | 6.979 | 7.644 | 0.488 | 1.000 | -1.330 | — |
+| full | swap 50% to wrong unit | wrong_eq | 795 | -3.965 | -3.662 | 0.488 | 0.494 | -1.225 | 0/3 |
+| full | swap 100% to wrong unit | wrong_eq | 795 | -2.901 | -2.802 | 0.488 | 0.214 | -0.915 | 0/3 |
+| full | empty | empty | 0 | -0.004 | -0.004 | 0.488 | 0.056 | — | 0/3 |
+| full | shuffled | shuffled | 568 | -4.793 | -4.786 | 0.488 | 0.062 | -0.228 | 0/3 |
+| full | single node | collapsed | 1 | -0.406 | -0.717 | 0.488 | 0.044 | 14.049 | 0/3 |
+| ref | run_planted true (narrow) | ref | 795 | 6.979 | 7.644 | 0.488 | 1.000 | -1.330 | — |
+| teacher | teacher | teacher | 199 | 0.447 | 0.263 | 0.488 | 0.273 | 3.065 | — |
+
+### interaction
+
+| tier | candidate | category | nodes | R | phi | phi_tau | g | compact | ≥ true (of texts) |
+|---|---|---|---|---|---|---|---|---|---|
+| full | **true** | true | 2006 | 7.233 | 7.644 | 0.322 | 1.000 | -0.822 | — |
+| full | swap 50% to wrong unit | wrong_eq | 2006 | -0.451 | -0.348 | 0.322 | 0.270 | -0.771 | 0/3 |
+| full | swap 100% to wrong unit | wrong_eq | 2006 | 0.098 | 0.232 | 0.322 | 0.385 | -0.702 | 0/3 |
+| full | empty | empty | 0 | -0.005 | -0.005 | 0.322 | 0.097 | — | 0/3 |
+| full | shuffled | shuffled | 1466 | -1.139 | -1.152 | 0.322 | 0.092 | 0.282 | 0/3 |
+| full | single node | collapsed | 1 | -1.613 | -1.912 | 0.322 | 0.034 | 17.445 | 0/3 |
+| ref | run_planted true (narrow) | ref | 2006 | 7.233 | 7.644 | 0.322 | 1.000 | -0.822 | — |
+| ref | run_planted attention alone (narrow) | ref | 795 | 0.097 | -0.012 | 0.322 | 0.096 | 2.265 | — |
+| teacher | teacher | teacher | 233 | 0.794 | 0.188 | 0.322 | 0.283 | 4.273 | — |
+
+### cancel
+
+| tier | candidate | category | nodes | R | phi | phi_tau | g | compact | ≥ true (of texts) |
+|---|---|---|---|---|---|---|---|---|---|
+| full | **true** | true | 771 | 4.968 | 6.390 | 0.644 | 1.000 | -2.844 | — |
+| full | true - 1 + (+u neuron) | wrong_eq | 771 | 2.999 | 3.958 | 0.644 | 0.669 | -2.843 | 1/3 |
+| full | swap 50% to wrong unit | wrong_eq | 771 | -0.081 | -0.058 | 0.644 | 0.011 | -3.955 | 0/3 |
+| full | swap 100% to wrong unit | wrong_eq | 771 | -1.758 | -1.581 | 0.644 | 0.110 | -2.956 | 0/3 |
+| full | empty | empty | 0 | -0.007 | -0.007 | 0.644 | 0.068 | — | 0/3 |
+| full | shuffled | shuffled | 518 | -0.039 | 0.021 | 0.644 | 0.079 | -1.331 | 0/3 |
+| full | single node | collapsed | 1 | 0.363 | 0.007 | 0.644 | 0.068 | 10.549 | 0/3 |
+| full | all VPD actives | collapsed | 774 | 4.965 | 6.391 | 0.644 | 1.000 | -2.853 | 0/3 |
+| full | true + both cancelling neurons | ref | 774 | 4.965 | 6.391 | 0.644 | 1.000 | -2.853 | 0/3 |
+| core | **true** | true | 438 | -0.396 | -0.454 | 0.644 | 0.324 | 0.334 | — |
+| core | true - 1 + (+u neuron) | wrong_eq | 438 | 0.877 | 0.783 | 0.644 | 0.653 | 0.303 | 2/3 |
+| core | random actives #0 | wrong_eq | 438 | 0.079 | 0.184 | 0.644 | 0.162 | -1.431 | 1/3 |
+| core | random actives #1 | wrong_eq | 438 | -1.049 | -0.914 | 0.644 | 0.270 | -0.861 | 1/3 |
+| core | random actives #2 | wrong_eq | 438 | -0.982 | -0.977 | 0.644 | 0.007 | -1.603 | 0/3 |
+| core | swap 50% to wrong unit | wrong_eq | 438 | -1.727 | -1.644 | 0.644 | 0.096 | -1.665 | 1/3 |
+| core | swap 100% to wrong unit | wrong_eq | 438 | -1.624 | -1.621 | 0.644 | 0.002 | -2.956 | 0/3 |
+| core | empty | empty | 0 | -0.007 | -0.007 | 0.644 | 0.068 | — | 1/3 |
+| core | shuffled | shuffled | 303 | -2.821 | -2.823 | 0.644 | 0.003 | 1.105 | 0/3 |
+| core | single node | collapsed | 1 | 0.361 | 0.005 | 0.644 | 0.068 | 10.549 | 1/3 |
+| core | all VPD actives | collapsed | 774 | 4.965 | 6.391 | 0.644 | 1.000 | -2.853 | 3/3 |
+| core | true + both cancelling neurons | ref | 441 | -0.311 | -0.364 | 0.644 | 0.365 | 0.267 | 2/3 |
+| ref | run_planted true (narrow) | ref | 771 | 4.968 | 6.390 | 0.644 | 1.000 | -2.844 | — |
+| ref | run_planted with +u neuron (narrow) | ref | 773 | 2.989 | 3.948 | 0.644 | 0.669 | -2.849 | — |
+| ref | run_planted with both (narrow) | ref | 774 | 4.965 | 6.391 | 0.644 | 1.000 | -2.853 | — |
+| teacher | teacher | teacher | 30 | 1.905 | 0.733 | 0.644 | 0.621 | 3.853 | — |
 
 ## Candidate repairs, rescored from the same rows
 
@@ -192,15 +245,15 @@ Gate B checks passed (texts) when R is recomputed from each row's family scores 
 
 | variant | full: wrong_eq | full: empty | full: shuffled | full: collapsed | core: wrong_eq | core: empty | core: shuffled | core: collapsed | full: all | core: all |
 |---|---|---|---|---|---|---|---|---|---|---|
-| v3 | 13/13 | 13/13 | 13/13 | 13/13 | 8/12 | 11/12 | 10/12 | 0/12 | 13/13 | 0/12 |
-| eps_cap | 13/13 | 13/13 | 13/13 | 13/13 | 11/12 | 11/12 | 11/12 | 0/12 | 13/13 | 0/12 |
-| s_clip | 13/13 | 13/13 | 13/13 | 13/13 | 8/12 | 11/12 | 10/12 | 0/12 | 13/13 | 0/12 |
-| gate_ramp | 13/13 | 13/13 | 13/13 | 13/13 | 8/12 | 11/12 | 10/12 | 0/12 | 13/13 | 0/12 |
-| phi_cap | 13/13 | 13/13 | 13/13 | 12/13 | 8/12 | 11/12 | 10/12 | 3/12 | 12/13 | 3/12 |
-| eps_cap+s_clip | 13/13 | 13/13 | 13/13 | 13/13 | 12/12 | 12/12 | 12/12 | 0/12 | 13/13 | 0/12 |
-| eps_cap+s_clip+gate_ramp | 13/13 | 13/13 | 13/13 | 13/13 | 12/12 | 12/12 | 12/12 | 0/12 | 13/13 | 0/12 |
-| eps_cap+s_clip+phi_cap | 13/13 | 13/13 | 13/13 | 12/13 | 12/12 | 12/12 | 12/12 | 4/12 | 12/13 | 4/12 |
-| eps_cap+s_clip+gate_ramp+phi_cap | 13/13 | 13/13 | 13/13 | 13/13 | 12/12 | 12/12 | 12/12 | 4/12 | 13/13 | 4/12 |
+| v3 | 20/21 | 21/21 | 21/21 | 21/21 | 9/15 | 13/15 | 13/15 | 0/15 | 20/21 | 0/15 |
+| eps_cap | 20/21 | 21/21 | 21/21 | 21/21 | 12/15 | 13/15 | 14/15 | 0/15 | 20/21 | 0/15 |
+| s_clip | 20/21 | 21/21 | 21/21 | 21/21 | 9/15 | 13/15 | 13/15 | 0/15 | 20/21 | 0/15 |
+| gate_ramp | 20/21 | 21/21 | 21/21 | 21/21 | 9/15 | 13/15 | 13/15 | 0/15 | 20/21 | 0/15 |
+| phi_cap | 21/21 | 21/21 | 21/21 | 19/21 | 9/15 | 13/15 | 13/15 | 4/15 | 19/21 | 3/15 |
+| eps_cap+s_clip | 20/21 | 21/21 | 21/21 | 21/21 | 13/15 | 15/15 | 15/15 | 0/15 | 20/21 | 0/15 |
+| eps_cap+s_clip+gate_ramp | 20/21 | 21/21 | 21/21 | 21/21 | 13/15 | 15/15 | 15/15 | 0/15 | 20/21 | 0/15 |
+| eps_cap+s_clip+phi_cap | 21/21 | 21/21 | 21/21 | 19/21 | 13/15 | 15/15 | 15/15 | 5/15 | 19/21 | 4/15 |
+| eps_cap+s_clip+gate_ramp+phi_cap | 21/21 | 21/21 | 21/21 | 21/21 | 13/15 | 15/15 | 15/15 | 6/15 | 21/21 | 4/15 |
 
 ## Failures: which term lets the control win (per text)
 
@@ -223,3 +276,10 @@ Gate B checks passed (texts) when R is recomputed from each row's family scores 
 - route2 core text 1, collapsed: **all VPD actives** ≥ true by 5.11: Δphi +6.74, Δ(g·½compact) -1.64; families higher for it: nodes +0.633, edges +0.597, pattern +0.540, point +0.539
 - route2 core text 2, wrong_eq: **head0 alone (padded)** ≥ true by 0.07: Δphi +0.08, Δ(g·½compact) -0.01; families higher for it: edges +0.088
 - route2 core text 2, collapsed: **all VPD actives** ≥ true by 3.18: Δphi +4.60, Δ(g·½compact) -1.42; families higher for it: edges +0.812, nodes +0.797
+- cancel core text 0, wrong_eq: **true - 1 + (+u neuron)** ≥ true by 4.04: Δphi +3.92, Δ(g·½compact) +0.12; families higher for it: N +6.364, edges +0.055
+- cancel core text 0, empty: **empty** ≥ true by 2.99: Δphi +2.99, Δ(g·½compact) -0.00; families higher for it: N +5.364
+- cancel core text 0, collapsed: **all VPD actives** ≥ true by 9.21: Δphi +10.64, Δ(g·½compact) -1.43; families higher for it: N +6.364, edges +0.596, nodes +0.322, point +0.018, pattern +0.017
+- cancel core text 1, collapsed: **all VPD actives** ≥ true by 5.69: Δphi +7.10, Δ(g·½compact) -1.41; families higher for it: edges +0.698, nodes +0.626, pattern +0.169, point +0.141
+- cancel full text 2, wrong_eq: **true - 1 + (+u neuron)** ≥ true by 0.00: Δphi +0.00, Δ(g·½compact) -0.00; families higher for it: none
+- cancel core text 2, wrong_eq: **true - 1 + (+u neuron)** ≥ true by 0.05: Δphi +0.06, Δ(g·½compact) -0.01; families higher for it: nodes +0.092
+- cancel core text 2, collapsed: **all VPD actives** ≥ true by 1.18: Δphi +2.79, Δ(g·½compact) -1.61; families higher for it: nodes +0.676, edges +0.221, pattern +0.171, point +0.155

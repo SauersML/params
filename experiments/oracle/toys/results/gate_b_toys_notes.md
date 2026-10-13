@@ -39,3 +39,9 @@ step needs a decision on what a complete-but-large circuit should earn against a
 **Also found:** run_planted.reward_v3 sets `components.NODE_CAP = 10**9` to lift the cap, but `reward(..., node_cap=NODE_CAP)`
 binds the default when the function is defined, so the lift has no effect. Every circuit above 266 nodes comes out
 invalid (R = -10). Fix: pass `node_cap=None` (gate_b_toys does this).
+
+**Final run (all 7 toys, 3 texts each).** Full tier: every toy passes except cancel. There, "true minus one node plus
+the uncancelled +u neuron" ties true or beats it by under 0.01 on one text. That neuron is not active at the target on
+those texts, so the swap barely changes behaviour; it is a near-tie, not a term failure. Core tier, with eps_cap +
+s_clip: wrong_eq 13/15, empty 15/15, shuffled 15/15. The two remaining wrong_eq failures are the +u-neuron swap on
+cancel. Collapsed-vs-incomplete stays at 0-6/15 under every repair.

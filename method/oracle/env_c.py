@@ -185,10 +185,13 @@ def blocks(group: list) -> list:
     return [["block", n, t] for n, t in sorted({(it[1], int(it[2])) if it[0] == "block" else (it[0], int(it[2])) for it in group})]
 
 
-def answer_of(task: str, record: dict, ge, lines: list[str] | None = None, shuffle: int | None = None) -> dict:
-    """The teacher's answer in goal_eval's JSON: its circuit, its kept variables as blocks (names and meanings from
-    var_explain's targets record), and lines (default the record's holding joint lines); shuffle (a seed): each
-    variable's blocks replaced by as many random sites' blocks at the same positions."""
+def answer_of(task: str, record: dict, ge, lines: list[str] | None = None, shuffle: int | None = None,
+              compact: dict | None = None) -> dict:
+    """The teacher's answer in goal_eval's JSON: its circuit, its kept variables (names and meanings from var_explain's
+    targets record) as blocks, or as their compact families (compact: (task, name) -> var_compact.py's subcomponent
+    items; a variable without one stays blocks), and lines (default the record's holding joint lines); shuffle (a seed):
+    each group replaced by as many random items at the same positions (a block by a random site's block, a
+    subcomponent by a random subcomponent there)."""
     import goal_eval
 
     t = json.loads((native.TEXTS / "vpd4l" / f"{task}.json").read_text())
@@ -198,18 +201,33 @@ def answer_of(task: str, record: dict, ge, lines: list[str] | None = None, shuff
     short = {v["name"]: v["short"].replace('"', "'") for v in record["variables"]}
     rng = random.Random(shuffle)
     vs = []
+    names = sorted(ge.nat.C)
     for v in record["variables"]:
-        grp = blocks(v["group"])
+        grp = (compact or {}).get((task, v["name"])) or blocks(v["group"])
         if shuffle is not None:
-            by = {}
-            for _, n, q in grp:
-                by.setdefault(q, []).append(n)
-            grp = [["block", n, q] for q, ns in sorted(by.items()) for n in rng.sample(sorted(ge.nat.C), len(ns))]
+            new = set()
+            for it in grp:
+                if it[0] == "block":
+                    n = rng.choice(names)
+                    while ("block", n, it[2]) in new:
+                        n = rng.choice(names)
+                    new.add(("block", n, it[2]))
+                else:
+                    n = rng.choice(names)
+                    new.add((n, rng.randrange(ge.nat.C[n]), it[2]))
+            grp = [list(x) for x in sorted(new, key=str)]
         vs.append({"name": short[v["name"]], "ref": v["name"], "meaning": v["meaning"].replace('"', "'"), "inputs": v["inputs"],
                    "group": grp, "feeds": [short[f] if f in short else "prediction" for f in (v.get("feeds") or []) if f in short or f == "prediction"]})
     ans["variables"] = vs
     ans["invariants"] = list(record["invariants"] if lines is None else lines)
     return ans
+
+
+def load_compact(path: Path | None) -> dict | None:
+    """var_compact.py's rows as (task, name) -> subcomponent items ([matrix, index, position])."""
+    if not path:
+        return None
+    return {(x["task"], x["name"]): x["group"] for x in map(json.loads, path.read_text().splitlines()) if x.get("group")}
 
 
 def gate(a) -> None:
@@ -226,13 +244,14 @@ def gate(a) -> None:
     if a.part:
         k, n = map(int, a.part.split("/"))
         recs = recs[k::n]
+    cp = load_compact(a.compact)
     a.out.parent.mkdir(parents=True, exist_ok=True)
     for rec in recs:
         task = rec["task"]
         t, tx = text_of(ge, task)
         strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
-        teacher = components.render(answer_of(task, rec, ge), strings=strings)
-        shuffled = components.render(answer_of(task, rec, ge, shuffle=native.task_seed(task)), strings=strings)
+        teacher = components.render(answer_of(task, rec, ge, compact=cp), strings=strings)
+        shuffled = components.render(answer_of(task, rec, ge, shuffle=native.task_seed(task), compact=cp), strings=strings)
         row = {"task": task, "teacher": score(ge, tx, task, teacher, a.split, t["model"]),
                "shuffled": score(ge, tx, task, shuffled, a.split, t["model"])}
         body = lambda line: line.split(":", 1)[1].split("->")[0].strip()  # noqa: E731
@@ -241,7 +260,7 @@ def gate(a) -> None:
                 continue
             theirs = {body(x): x.split("->", 1)[1].strip() for x in var_explain.llm_lines(prompts[task]["items"], llm[k][task]["answer"]).splitlines()}
             lines = [f"I{i}: {body(x)} -> {theirs[body(x)]}" for i, x in enumerate(rec["invariants"], 1) if body(x) in theirs]
-            row[k] = score(ge, tx, task, components.render(answer_of(task, rec, ge, lines=lines), strings=strings), a.split, t["model"])
+            row[k] = score(ge, tx, task, components.render(answer_of(task, rec, ge, lines=lines, compact=cp), strings=strings), a.split, t["model"])
         with a.out.open("a") as fh:
             fh.write(json.dumps(row) + "\n")
         best_llm = max((row[k]["reward"] for k in ("llm", "llm_hint") if k in row), default=None)
@@ -269,6 +288,7 @@ def sft(a) -> None:
 
     ge = goal_eval.GoalEval(native.Native(a.device))
     recs = {x["task"]: x for x in map(json.loads, (ROOT / "variables" / "sft_targets" / f"{a.split}.jsonl").read_text().splitlines())}
+    cp = load_compact(a.compact)
     n = 0
     with a.out.open("w") as fh:
         for r in map(json.loads, a.rows.read_text().splitlines()):
@@ -278,7 +298,7 @@ def sft(a) -> None:
             r = {**r, "variables": True, "invariants": True}
             t = json.loads((native.TEXTS / "vpd4l" / f"{r['task']}.json").read_text())
             strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
-            content = components.target(answer_of(r["task"], rec, ge), r, t["model"], {}, strings)
+            content = components.target(answer_of(r["task"], rec, ge, compact=cp), r, t["model"], {}, strings)
             if len(content) > MAX_CHARS:  # past the trainer's answer cap (8,000 tokens, ~3 characters a token)
                 continue
             fh.write(json.dumps({"prompt": [{"role": "user", "content": components.question(t, r)}],
@@ -363,10 +383,12 @@ def main():
     g.add_argument("--split", default="eval")
     g.add_argument("--part")
     g.add_argument("--out", type=Path, default=ROOT / "variables" / "envc" / "gate.jsonl")
+    g.add_argument("--compact", type=Path, help="var_compact.py's rows: variables written as compact families, not blocks")
     f = sub.add_parser("sft")
     f.add_argument("rows", type=Path)
     f.add_argument("out", type=Path)
     f.add_argument("--split", default="train")
+    f.add_argument("--compact", type=Path, help="var_compact.py's rows: variables written as compact families, not blocks")
     v = sub.add_parser("serve")
     v.add_argument("--port", type=int, default=8771)
     q = sub.add_parser("rows")

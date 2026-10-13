@@ -21,8 +21,10 @@ the base image is the circuit's own image) or over the union of all circuits (--
 
 Interchange (the real model, every subcomponent on, remainder live): on a base image x (test images 0-4999, the circuit
 pool), the group's activations are replaced by their values on a donor x' (test images 5000-9999) and the rest computes
-on the run's own inputs. Donors that differ: f(x') != f(x). Control donors: f(x') = f(x) and at least two other features
-differ. Each condition draws donors from the whole pool (any class). Per group: movement = mean KL in bits from the real
+on the run's own inputs. Donors that differ: f(x') != f(x), drawn from the whole pool (any class). Control donors:
+f(x') = f(x), each matched to one differing donor on the number of features that differ from x (the differing donor's
+count, all of them other features here), so both conditions change the image equally; the share of donors the model
+gives x's class is reported per condition. Per group: movement = mean KL in bits from the real
 prediction on x, for each condition, and the ratio; direction: across the 10 classes, the Pearson correlation of the
 log-probability change with the concept's prediction log P(y | f = f(x')) - log P(y | f = f(x)) (class frequencies given
 the feature, 20,000 training images), averaged over differing donors where the prediction moved by at least 0.01 bits.
@@ -200,6 +202,7 @@ def main() -> None:
     a_te, _, _ = dec.acts(xte)
     T = dec.total
     ones = torch.ones(1, T)
+    pred_te = dec.run(xte, ones.expand(len(xte), -1)).argmax(-1).numpy()
 
     lmove: dict[tuple, np.ndarray] = {}
 
@@ -222,13 +225,25 @@ def main() -> None:
         return float(lmove[(tuple(js), b, tuple(int(v) for v in donors))].mean())
 
     def donors_for(b: int, k: int, gr) -> tuple[np.ndarray, np.ndarray] | None:
+        """Differing donors (feature k differs) and control donors (feature k equal) matched one to one on how many
+        features differ from the base: each control differs in as many other features as its differing donor does
+        in all (nearest count when none is left at that count), so the two conditions change the image equally."""
         fb = Fte[b]
-        diff = donor_pool[Fte[donor_pool, k] != fb[k]]
-        others = (Fte[donor_pool] != fb).sum(1) - (Fte[donor_pool, k] != fb[k])
-        same = donor_pool[(Fte[donor_pool, k] == fb[k]) & (others >= 2)]
-        if len(diff) < args.n_donor or len(same) < args.n_donor:
+        ham = (Fte[donor_pool] != fb).sum(1)
+        is_diff = Fte[donor_pool, k] != fb[k]
+        diff = donor_pool[is_diff]
+        if len(diff) < args.n_donor or (~is_diff & (ham >= 1)).sum() < args.n_donor:
             return None
-        return gr.choice(diff, args.n_donor, replace=False), gr.choice(same, args.n_donor, replace=False)
+        dd = gr.choice(diff, args.n_donor, replace=False)
+        left = {h: list(gr.permutation(donor_pool[~is_diff & (ham == h)])) for h in range(1, len(FEATURES))}
+        ds = []
+        for dn in dd:
+            h = int((Fte[dn] != fb).sum())
+            for hh in sorted(left, key=lambda v: (abs(v - h), -v)):
+                if left[hh]:
+                    ds.append(int(left[hh].pop()))
+                    break
+        return dd, np.array(ds)
 
     def direction(k: int, b: int, dd: np.ndarray, kd: np.ndarray, dl: np.ndarray) -> list[float]:
         out = []
@@ -285,6 +300,8 @@ def main() -> None:
                         "random_differ_logit": float(np.mean([x[2] for x in rr])),
                         "random_control_logit": float(np.mean([x[3] for x in rr])),
                         "direction": direction(k, b, dd, kd, dl),
+                        "differ_same_class": float(np.mean(pred_te[dd] == pred_te[b])),
+                        "control_same_class": float(np.mean(pred_te[ds] == pred_te[b])),
                     }
                 )
         for (mod, f, sign), rows in sorted(per.items(), key=lambda t: -len(t[1])):
@@ -314,6 +331,8 @@ def main() -> None:
                 "random_control_logit": float(np.mean([x["random_control_logit"] for x in rows])),
                 "direction_corr": float(np.mean(dirs)) if dirs else None,
                 "n_direction": len(dirs),
+                "differ_same_class": float(np.mean([x["differ_same_class"] for x in rows])),
+                "control_same_class": float(np.mean([x["control_same_class"] for x in rows])),
                 "per_circuit": rows,
             }
             out_groups.append(row)
@@ -321,6 +340,7 @@ def main() -> None:
                 f"{mod} {row['concept']!r} circuits={len(rows)} size={row['size']:.1f} differ={row['move_differ']:.4f} "
                 f"control={row['move_control']:.4f} ratio={row['ratio']:.2f} rand_ratio={row['random_ratio']:.2f} "
                 f"beats_random={row['share_beats_random']:.2f} dir={row['direction_corr']} "
+                f"same_class {row['differ_same_class']:.2f}/{row['control_same_class']:.2f} "
                 f"logit differ={row['move_differ_logit']:.3f} control={row['move_control_logit']:.3f} "
                 f"random {row['random_differ_logit']:.3f}/{row['random_control_logit']:.3f}",
                 flush=True,
@@ -331,7 +351,7 @@ def main() -> None:
         js = [name_to_j[m] for m in ms]
         md, ms_, dirs, used = [], [], [], 0
         rand_md, rand_ms = [], []
-        gr = np.random.default_rng(hash((mod, f, sign)) % (2**32))
+        gr = np.random.default_rng(MODULES.index(mod) * 1000 + FEATURES.index(f) * 2 + (sign == "+"))
         rgroups = [
             list(gr.choice(active_by_layer[mod], size=len(js), replace=False))
             for _ in range(args.n_random)
@@ -339,14 +359,11 @@ def main() -> None:
         ]
         for b in base_idx:
             fb = Fte[b]
-            diff = donor_pool[Fte[donor_pool, k] != fb[k]]
-            others = (Fte[donor_pool] != fb).sum(1) - (Fte[donor_pool, k] != fb[k])
-            same = donor_pool[(Fte[donor_pool, k] == fb[k]) & (others >= 2)]
-            if len(diff) < args.n_donor or len(same) < args.n_donor:
+            dn = donors_for(int(b), k, gr)
+            if dn is None:
                 continue
             used += 1
-            dd = gr.choice(diff, args.n_donor, replace=False)
-            ds = gr.choice(same, args.n_donor, replace=False)
+            dd, ds = dn
             kd, dl = interchange(js, int(b), dd)
             ks, _ = interchange(js, int(b), ds)
             md.append(kd.mean())

@@ -84,12 +84,13 @@ cd /Users/user/params/method/oracle; python -B teacher.py --tasks $L --batch $BA
     fi
     LOC="$LOC rm -f \$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth;"
   fi
-  RUNS=""
+  RUNS="" FAILED=""
   for k in $(seq 0 $((P - 1))); do
     B="$A"
     [ -n "${LOCALITY:-}" ] && [ -z "${VPD:-}" ] && B="$B --labels $O/out/locality_$k.jsonl"
     [ -n "${FROM:-}" ] && B="$B --from-path \$HOME/from"
     RUNS="$RUNS (python -B $SCRIPT --tasks $L --offset $k --stride $P $B --out $O/out > $O/teacher_$k.log 2>&1; echo \"exit \$?\" >> $O/teacher_$k.log) &"
+    FAILED="$FAILED grep -q '^exit [1-9]' $O/teacher_$k.log && F=1;"
   done
   CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
@@ -100,7 +101,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 $PRE
 ${FROM:+mkdir -p ~/from; tar -xzf $F/from_$j.tgz -C ~/from;}
 cd /Users/user/params/method/oracle; $LOC
-set +e; $RUNS wait; echo all teacher processes done"
+set +e; $RUNS wait; echo all teacher processes done; F=0; $FAILED exit \$F"
   (  # community stock comes and goes: a launch that finds no card in stock, or a host whose download of the published
      # inputs came out corrupted, is retried every 3 minutes for WAIT minutes
     for try in $(seq 1 $(( ${WAIT:-180} / 3 ))); do

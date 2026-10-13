@@ -22,7 +22,7 @@ TEACH="" SETS=""
 for spec in "$@"; do
   name=${spec%%=*} flags=${spec#*=}
   flags=${flags//,/ } flags=${flags//::/,}
-  TEACH="$TEACH python -B teacher.py --tasks $F/tasks.txt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt $flags --max-tokens 0 --batch 32 --out $O/$name > $O/teach_$name.log 2>&1 || echo \"$name failed\";"
+  TEACH="$TEACH python -B teacher.py --tasks $F/tasks.txt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt $flags --max-tokens 0 --batch 32 --out $O/$name > $O/teach_$name.log 2>&1 || { echo \"$name failed\"; FAIL=1; };"
   SETS="$SETS --set $name=$O/$name"
 done
 N=$(( 10#${TEXT#text} - 9000 + 1 ))
@@ -33,7 +33,7 @@ ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V
 cd /Users/user/params/method/oracle; set +e;
 (while :; do cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes > $O/mem_peak.txt 2> /dev/null; nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >> $O/gpu_mem.txt; sleep 15; done) &
 $TEACH
-python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --only track_pp --out $O/eval.jsonl > $O/eval.log 2>&1; cat $O/eval.jsonl; echo \"host memory peak \$(cat $O/mem_peak.txt) bytes, card memory peak \$(sort -n $O/gpu_mem.txt | tail -1) MiB\""
+python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --only track_pp --out $O/eval.jsonl > $O/eval.log 2>&1 || FAIL=1; cat $O/eval.jsonl; echo \"host memory peak \$(cat $O/mem_peak.txt) bytes, card memory peak \$(sort -n $O/gpu_mem.txt | tail -1) MiB\"; exit \${FAIL:-0}"
 for try in $(seq 1 40); do
   RP_REF=$REF RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=${RAM:-48} \
     experiments/infra/runpod/rp-run $RN "${GPU:-NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA RTX A4500,NVIDIA GeForce RTX 4090,NVIDIA RTX A6000,NVIDIA A40}" "${HOURS:-2.0}" -- bash -c "$CMD" > "$F/rp.log" 2>&1 && break

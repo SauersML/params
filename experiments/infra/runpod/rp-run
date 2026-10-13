@@ -1754,7 +1754,17 @@ finish() {
     [ -n "$SYNC" ] && kill $SYNC 2> /dev/null
     # The log stream, the idle check and other helpers end with the run.
     kill $(jobs -p) 2> /dev/null
-    if (( RUN_STARTED )); then attempt_end worked "command ran"; else attempt_end ended "runner ended before the command (status $rc)"; fi
+    if (( RUN_STARTED )); then
+        # A command that failed with a GPU fault in any of its logs counts against the host (fleet's 10-12: two dev pods on
+        # one A5000 host died of "unspecified launch failure" while the host kept its clean record); any other ending is
+        # the command's own business.
+        local fault=""
+        if [ -n "${RC:-}" ] && [ "${RC:-0}" != 0 ]; then
+            fault=$(grep -rhoE "CUDA error: (unspecified launch failure|uncorrectable ECC error encountered|an illegal instruction was encountered)|no CUDA-capable device is detected|CUDA-capable device\(s\) is/are busy or unavailable" \
+                    --include='*.log' "$OUT" 2> /dev/null | grep -v '^$' | head -n 1)
+        fi
+        if [ -n "$fault" ]; then attempt_end "gpu fault" "$fault (exit $RC)"; else attempt_end worked "command ran"; fi
+    else attempt_end ended "runner ended before the command (status $rc)"; fi
     if [ -n "$POD" ] && [ ! -f "$ACTIVE/.$POD.end" ] && (( ! GUEST )); then
         if [ -f "$OUT/STOP" ]; then echo stopped; elif [ -n "${RC:-}" ]; then echo "exit $RC"; else echo "exit $rc"; fi > "$ACTIVE/.$POD.end"
     fi

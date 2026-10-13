@@ -2,6 +2,7 @@
 TransformerLens' own equations, and the oracle's runs on it with every subcomponent kept against the model."""
 import math
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -92,3 +93,45 @@ def test_oracle_runs_reproduce_the_model(norm):
         lp2 = torch.log_softmax(nat.target(torch.tensor([x2]))[0, targets].float(), -1)
     torch.testing.assert_close(ge.pp_run(tx, x2, everything)[0].reshape(lp2.shape), lp2, atol=1e-4, rtol=1e-4)
     assert ge.track_pp(tx, [everything], "eval")[0]["s_track_pp"] > 0.999
+
+
+def mib_reference(L=2, H=2, truth=()):
+    """A reference graph in MIB's form (EAP-IG's Graph.to_json: every edge from a node into a later node's input, a head's
+    query, key and value inputs apart)."""
+    fwd = ["input"] + [x for i in range(L) for x in [f"a{i}.h{h}" for h in range(H)] + [f"m{i}"]]
+    layer = lambda x: -1 if x == "input" else int(x[1:].split(".")[0])  # noqa: E731
+    edges = {}
+    for a in fwd:
+        for i in range(L):
+            for h in range(H):
+                if layer(a) < i:
+                    for q in "qkv":
+                        edges[f"{a}->a{i}.h{h}<{q}>"] = {"in_graph": False}
+            if layer(a) < i or (layer(a) == i and a.startswith("a")):
+                edges[f"{a}->m{i}"] = {"in_graph": False}
+        edges[f"{a}->logits"] = {"in_graph": False}
+    for e in truth:
+        edges[e]["in_graph"] = True
+    return {"edges": edges}
+
+
+def test_mib_auroc_ranks():
+    """A score that ranks the reference circuit's edges first scores 1 (plain) and near 1 under MIB's greedy curve; the
+    reverse ranking scores 0 and lower."""
+    truth = ["input->m0", "m0->a1.h1<v>", "a1.h1->logits"]
+    ref = mib_reference(truth=truth)
+    good = interpbench.mib_auroc(ref, {e: 1.0 for e in truth})
+    assert good["plain"] == 1.0 and good["mib"] > 0.95 and good["tpr"][-1] == 1.0 and good["fpr"][-1] == 1.0
+    bad = interpbench.mib_auroc(ref, {e: 0.0 if e in truth else 1.0 for e in ref["edges"]})
+    assert bad["plain"] == 0.0 and bad["mib"] < good["mib"]
+
+
+def test_mib_edge_names():
+    """Circuit connections as MIB's edge names: the token into a head's value input, a head into an MLP, an MLP into the
+    logits; a head's own value into its output is none."""
+    nat = types.SimpleNamespace(units={"h.0.attn.o_proj": torch.tensor([0, 1]), "h.1.attn.v_proj": torch.tensor([1, 0]),
+                                       "h.1.attn.o_proj": torch.tensor([1, 0]), "h.1.mlp.c_fc": torch.tensor([0, 0])})
+    assert interpbench.mib_edge(nat, ("tok", 3), ("h.1.attn.v_proj", 0)) == "input->a1.h1<v>"
+    assert interpbench.mib_edge(nat, ("h.0.attn.o_proj", 1), ("h.1.mlp.c_fc", 0)) == "a0.h1->m1"
+    assert interpbench.mib_edge(nat, ("h.1.mlp.down_proj", 5), "out") == "m1->logits"
+    assert interpbench.mib_edge(nat, ("h.1.attn.v_proj", 1), ("h.1.attn.o_proj", 1)) is None

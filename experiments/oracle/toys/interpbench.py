@@ -203,16 +203,20 @@ def batches(cfg: dict, bos: int):
 
 
 def mib_ioi(split: str = "test", n: int | None = None, path: Path = Path.home() / "mpd-data/interpbench/mib_ioi") -> list[dict]:
-    """MIB's IOI split (Hugging Face mib-bench/ioi, <split>.json; the circuit track's data): rows with the prompt as GPT-2
-    token ids after BOS (TransformerLens' to_tokens, default_prepend_bos), the two choices' token ids (the answer first) and
-    the counterfactuals' prompts likewise."""
+    """MIB's IOI split (Hugging Face mib-bench/ioi, <split>.json; the circuit track's data) after MIB's filter (HFEAPDataset:
+    the indirect object, the subject and random_c the same number of tokens): rows with the prompt as GPT-2 token ids after
+    BOS (TransformerLens' to_tokens, default_prepend_bos), the two choices' token ids (the answer first) and the
+    counterfactuals' prompts likewise."""
     from tokenizers import Tokenizer
     import json
 
     tk = Tokenizer.from_pretrained("gpt2")
     enc = lambda text: [50256] + tk.encode(text).ids  # noqa: E731
+    size = lambda name: len(tk.encode(" " + name).ids)  # noqa: E731
+    rows = [r for r in json.loads((path / f"{split}.json").read_text())
+            if size(r["metadata"]["indirect_object"]) == size(r["metadata"]["subject"]) == size(r["metadata"]["random_c"])]
     out = []
-    for r in json.loads((path / f"{split}.json").read_text())[:n]:
+    for r in rows[:n]:
         ch = [tk.encode(" " + c).ids[0] for c in r["choices"]]
         if r["answerKey"] == 1:
             ch = ch[::-1]
@@ -302,37 +306,94 @@ def native_of_fit(sd: dict, cfg: dict, res: dict, dev: str = "cpu"):
     return nat
 
 
-# ---- the IOI case's texts (Wang et al. 2022's templates; GPT-2's tokenizer)
-
-IOI_TEMPLATES = ["Then, {B} and {A} went to the {P}. {B} gave a {O} to", "When {B} and {A} got a {O} at the {P}, {B} decided to give it to",
-                 "Then, {B} and {A} had a long argument, and afterwards {B} said to", "After {B} and {A} went to the {P}, {B} gave a {O} to",
-                 "While {B} and {A} were working at the {P}, {B} gave a {O} to", "Friends {B} and {A} found a {O} at the {P}. {B} gave it to"]
-IOI_NAMES = ["Michael", "Christopher", "Jessica", "Matthew", "Ashley", "Jennifer", "Joshua", "Amanda", "Daniel", "David", "James",
-             "Robert", "John", "Joseph", "Andrew", "Ryan", "Brandon", "Jason", "Justin", "Sarah", "William", "Jonathan", "Stephanie",
-             "Brian", "Nicole", "Nicholas", "Anthony", "Heather", "Eric", "Elizabeth", "Adam", "Megan", "Melissa", "Kevin", "Steven",
-             "Thomas", "Timothy", "Christina", "Kyle", "Rachel", "Laura", "Lauren", "Amber", "Brittany", "Danielle", "Richard",
-             "Kimberly", "Jeffrey", "Amy", "Crystal", "Michelle", "Tiffany", "Jeremy", "Benjamin", "Mark", "Emily", "Aaron", "Charles",
-             "Rebecca", "Jacob", "Stephen", "Patrick", "Sean", "Erin", "Jamie", "Kelly", "Samantha", "Nathan", "Sara", "Dustin",
-             "Paul", "Angela", "Tyler", "Scott", "Katherine", "Andrea", "Gregory", "Erica", "Mary", "Travis", "Lisa", "Kenneth"]
-# (the IOI dataset's names, Wang et al. 2022 / ACDC's ioi_dataset: InterpBench's IOI model predicts these)
-IOI_PLACES = ["store", "garden", "restaurant", "school", "hospital", "office", "house", "station"]
-IOI_OBJECTS = ["ring", "kiss", "bone", "basketball", "computer", "necklace", "drink", "snack"]
+# ---- MIB's InterpBench IOI comparison: the model MIB scores (Hugging Face mib-bench/interpbench: ll_model_cfg.pkl,
+# ioi_all_splits/ll_model_100_100_80.pth as ll_model.pth, edges.pkl; run_attribution.load_interpbench_model) and its
+# reference circuit interpbench_graph.json (EAP-IG's graph: nodes input, aL.hH, mL, logits; an edge into a head names the
+# query, key or value input it enters, "m0->a1.h1<v>"). cybershiptrooper/InterpBench's ioi case is another model: at chance
+# on MIB's prompts.
 
 
-def ioi_texts(n: int, seed: int = 0) -> list[tuple[list[int], int]]:
-    """n IOI prompts (token ids, the indirect object's token id), GPT-2's tokenizer, names that are one token with their space."""
-    from tokenizers import Tokenizer
+def mib_edge(nat, w: tuple, r) -> str | None:
+    """A circuit connection, writer (matrix, subcomponent) or ("tok", position) into reader (matrix, subcomponent) or "out",
+    as MIB's edge name; None inside one head or one MLP."""
+    import native
 
-    tk = Tokenizer.from_pretrained("gpt2")
-    one = lambda w: len(tk.encode(" " + w).ids) == 1  # noqa: E731
-    names = [x for x in IOI_NAMES if one(x)]
-    g = torch.Generator().manual_seed(seed)
-    pick = lambda xs: xs[int(torch.randint(len(xs), (1,), generator=g))]  # noqa: E731
-    out = []
-    while len(out) < n:
-        a, b = pick(names), pick(names)
-        if a == b:
-            continue
-        text = pick(IOI_TEMPLATES).format(A=a, B=b, P=pick(IOI_PLACES), O=pick(IOI_OBJECTS))
-        out.append((tk.encode(text).ids, tk.encode(" " + a).ids[0]))
-    return out
+    def node(n, c):
+        if n == "tok":
+            return "input"
+        layer, kind = native._name_layer_kind(n)
+        return f"m{layer}" if kind in ("c_fc", "down_proj") else f"a{layer}.h{int(nat.units[n][c])}"
+
+    a = node(*w)
+    if r == "out":
+        return f"{a}->logits"
+    b = node(*r)
+    if a == b:
+        return None
+    kind = native._name_layer_kind(r[0])[1]
+    if kind in ("q_proj", "k_proj", "v_proj"):
+        return f"{a}->{b}<{kind[0]}>"
+    return None if kind == "o_proj" else f"{a}->{b}"
+
+
+def mib_edges(nat, circ: dict, targets: list[int]) -> set:
+    """A teacher circuit's connections as MIB's edge names (mib_edge): its edges, or a complete answer's every implied
+    connection (native.all_edges)."""
+    import native
+
+    nodes = [tuple(x) for x in circ["nodes"]]
+    if circ.get("complete"):
+        sub = [(n, t, c) for n, c, t in nodes if n not in ("tok", "block")]
+        par, outs = native.all_edges(sub, targets)
+        pairs = [((w[0], w[2]), (r[0], r[2])) for r, ws in par.items() for w in ws] + [((w[0], w[2]), "out") for w in outs]
+    else:
+        pairs = [((nodes[e[0]][0], nodes[e[0]][1]), "out" if e[1] == "out" else (nodes[e[1]][0], nodes[e[1]][1]))
+                 for e in circ["edges"] if e[0] != "pair"]
+    return {x for x in (mib_edge(nat, w, r) for w, r in pairs) if x is not None}
+
+
+def mib_auroc(reference: dict, score: dict) -> dict:
+    """Edge scores (MIB edge name -> score; absent: 0) against MIB's reference graph: "mib", the circuit track's area
+    under the ROC (evaluation.evaluate_area_under_roc: EAP-IG's apply_greedy at 0.1% ... 100% of the edges, absolute
+    scores, from the logits up, then prune; print_results.area_under_curve's trapezoids over FPR / its last value), and
+    "plain", the AUROC over every edge (ties count half)."""
+    import heapq
+    import math
+
+    edges = list(reference["edges"])
+    truth = {e for e, v in reference["edges"].items() if v["in_graph"]}
+    parent = {e: e.split("->")[0] for e in edges}
+    child = {e: re.sub(r"<[qkv]>$", "", e.split("->")[1]) for e in edges}
+    into = {}
+    for e in edges:
+        into.setdefault(child[e], []).append(e)
+    key = lambda e: abs(score.get(e, 0.0))  # noqa: E731
+
+    def greedy(n: int) -> set:
+        nodes, chosen = {"logits"}, set()
+        heap = heapq.merge(sorted(into["logits"], key=key, reverse=True), key=key, reverse=True)
+        for _ in range(n):
+            e = next(heap)
+            chosen.add(e)
+            if parent[e] not in nodes:
+                nodes.add(parent[e])
+                heap = heapq.merge(heap, sorted(into.get(parent[e], []), key=key, reverse=True), key=key, reverse=True)
+        while True:   # Graph.prune: nodes without an outgoing or (but the input) an incoming edge, then their edges
+            keep = {x for x in nodes if x == "logits" or (any(parent[e] == x for e in chosen)
+                                                          and (x == "input" or any(child[e] == x for e in chosen)))}
+            kept = {e for e in chosen if parent[e] in keep and child[e] in keep}
+            if keep == nodes and kept == chosen:
+                return chosen
+            nodes, chosen = keep, kept
+
+    tpr, fpr = [], []
+    for pct in (.001, .002, .005, .01, .02, .05, .1, .2, .5, 1):
+        got = greedy(math.ceil(pct * len(edges)))
+        tp, fp = len(got & truth), len(got - truth)
+        tpr.append(tp / len(truth))
+        fpr.append(fp / (len(edges) - len(truth)))
+    mib = sum((fpr[i + 1] - fpr[i]) / fpr[-1] * (tpr[i + 1] + tpr[i]) / 2 for i in range(len(fpr) - 1))
+    pos = [score.get(e, 0.0) for e in edges if e in truth]
+    neg = [score.get(e, 0.0) for e in edges if e not in truth]
+    plain = sum((p > q) + 0.5 * (p == q) for p in pos for q in neg) / (len(pos) * len(neg))
+    return {"mib": mib, "plain": plain, "tpr": tpr, "fpr": fpr}

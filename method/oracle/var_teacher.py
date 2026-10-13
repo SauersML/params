@@ -113,9 +113,12 @@ def as_json(name: str, inputs, group, feeds=(), **extra) -> dict:
 
 
 def term(got: dict) -> float:
-    """The headline's per-variable term: min(f on-target, s off-target), 0 without a resolved on-target draw."""
-    f_on, s_off = got["f_on"], got["s_off"]
-    return 0.0 if f_on is None else (f_on if s_off is None else min(f_on, s_off))
+    """The headline's per-variable term: min(f on-target, f off-target), 0 without a resolved on-target draw. Off-target
+    on the f scale, the share of the change kept out, as on-target (the lead's 10-13): the log scale floored at float32
+    resolution asked isolation good to 1e-7, which only causal zeros meet (carriers at their own inputs), so it passed
+    trivial input variables and failed the informative ones."""
+    f_on, f_off = got["f_on"], got.get("f_off")
+    return 0.0 if f_on is None else (f_on if f_off is None else min(f_on, f_off))
 
 
 def size(C: dict, group) -> int:
@@ -401,27 +404,47 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         f"{time.time() - t0:.0f} s")
     allowed = None if pool == "any" or not m else {(n, t) for n, t, _ in m if n != "tok"}
     best = {}
+    reach = nat.reachable(tx.T, tx.targets)
     for ins, at in sets:
-        b, rows, triv = block_search(sc, tx, ins, draws, at, allowed)
-        if b is None:  # the circuit holds no site at these positions
-            continue
-        sites = sorted({n for n, _, _ in b["group"]})
-        reach = nat.reachable(tx.T, tx.targets)
         every = [n for n in nat.names if all(bool(reach[n][q].any()) for q in at)]
+        here = [(n, q) for n in every for q in at if allowed is None or (n, q) in allowed]
+        if not here:  # the circuit holds no site at these positions
+            continue
         fam, share = family(nat, tx, ins, every, at)  # the family over every site, then restricted
         on_x = {(n, q, c) for n in every for q in at for c in (tx.ci[n][q] > 0).nonzero().flatten().tolist()}
         wide = fam if allowed is None else [k for k in fam if (k[0], k[1]) in allowed]
-        cands = [([k for k in fam if k[0] in sites and (allowed is None or (k[0], k[1]) in allowed)], "family at the blocks' sites"),
-                 (wide, "family at every site" if allowed is None else "family at the circuit's sites"),
-                 (sorted(k for k in wide if k in on_x), "active on the text")]
-        fa = screen(sc, tx, ins, [c for c in cands if c[0]], draws)
-        got = {r["how"]: r for r in fa}
-        wide_how = cands[1][1]
-        ok = [got[h] for h in ("family at the blocks' sites", wide_how) if h in got and got[h]["score"] >= GOAL]
-        rec = {"inputs": list(ins), "at": list(at), "kind": "input" if tuple(at) == tuple(ins) else "intermediate", "blocks": b,
-               "family": got.get(wide_how), "family_sites": got.get("family at the blocks' sites"), "active": got.get("active on the text"),
-               "trivial": triv, "tried": len(rows)}
-        use = min(ok, key=lambda r: r["size"]) if ok else b
+        wide_how = "family at every site" if allowed is None else "family at the circuit's sites"
+        if tuple(at) == tuple(ins):  # a position holding its own token, an identity: the family or the blocks there, no
+            # search (the lead's 10-13: input variables are identities the whole position nearly matches, 0.93 vs 0.96;
+            # the search goes to the intermediate ones)
+            blk = [(n, q, BLOCK) for n, q in here]
+            triv_g = [(n, q, BLOCK) for n in every for q in at]
+            cands = [(wide, wide_how), (blk, "blocks at the circuit's sites" if allowed is not None else "every site"),
+                     (sorted(k for k in wide if k in on_x), "active on the text")]
+            if allowed is not None:
+                cands.append((triv_g, "every site at the positions (trivial)"))
+            fa = screen(sc, tx, ins, [c for c in cands if c[0]], draws)
+            got = {r["how"]: r for r in fa}
+            b = got[cands[1][1]]
+            triv = got.get("every site at the positions (trivial)", b)
+            ok = [got[h] for h in (wide_how, cands[1][1]) if h in got and got[h]["score"] >= GOAL]
+            rec = {"inputs": list(ins), "at": list(at), "kind": "input", "blocks": b, "family": got.get(wide_how), "family_sites": None,
+                   "active": got.get("active on the text"), "trivial": triv, "tried": len(fa)}
+            use = min(ok, key=lambda r: r["size"]) if ok else max((r for r in (got.get(wide_how), b) if r), key=lambda r: r["score"])
+        else:
+            b, rows, triv = block_search(sc, tx, ins, draws, at, allowed)
+            if b is None:
+                continue
+            sites = sorted({n for n, _, _ in b["group"]})
+            cands = [([k for k in fam if k[0] in sites and (allowed is None or (k[0], k[1]) in allowed)], "family at the blocks' sites"),
+                     (wide, wide_how), (sorted(k for k in wide if k in on_x), "active on the text")]
+            fa = screen(sc, tx, ins, [c for c in cands if c[0]], draws)
+            got = {r["how"]: r for r in fa}
+            ok = [got[h] for h in ("family at the blocks' sites", wide_how) if h in got and got[h]["score"] >= GOAL]
+            rec = {"inputs": list(ins), "at": list(at), "kind": "intermediate", "blocks": b, "family": got.get(wide_how),
+                   "family_sites": got.get("family at the blocks' sites"), "active": got.get("active on the text"),
+                   "trivial": triv, "tried": len(rows)}
+            use = min(ok, key=lambda r: r["size"]) if ok else b
         if not ok and b["score"] < GOAL and rec["kind"] == "intermediate" and wide:
             # a carrier at a later position mixes every position's change; a mask over the family there, trained to
             # carry the inputs' changes and leave the others' (Cause and Iso, masks.fit), can isolate it
@@ -434,6 +457,7 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         held = {n for n, _, _ in use["group"]}
         active = sorted(k for k in on_x if k[0] in held)
         rec.update(carrier="block" if use is b else ("mask" if use is rec.get("mask") else "family"), group=use["group"], score=use["score"],
+                   f_on=use["f_on"], f_off=use.get("f_off"), s_off=use["s_off"], size=use["size"],
                    instances=active, share={k: share.get(k, 0.0) for k in active},
                    circuit=[nd for nd in m if inside(set(use["group"]), nd)])
         rec["m"] = sum(m[nd] for nd in rec["circuit"])
@@ -459,8 +483,14 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
     for i, r in enumerate(chosen):  # names for the feeds; the writer names them
         r["name"], r["_inputs"], r["_group"] = f"V{i + 1}", r["inputs"], r["group"]
     out = {"variables": [], "teacher": {"positions": positions, "sets": len(sets), "pool": pool, "circuit_m": M}}
+    pick = lambda r: None if r is None else {x: r.get(x) for x in ("how", "size", "score", "f_on", "f_off", "s_off")}  # noqa: E731
+    out["candidates"] = [{"inputs": r["inputs"], "at": r["at"], "kind": r["kind"], "carrier": r["carrier"], "size": r["size"],
+                          "score": r["score"], "f_on": r["f_on"], "f_off": r["f_off"], "s_off": r["s_off"], "m": r["m"],
+                          "chosen": any(r is c for c in chosen),
+                          **{k: pick(r.get(k)) for k in ("blocks", "family", "family_sites", "active", "trivial", "mask")}}
+                         for r in best.values()]  # every input set's carriers on the search split, the failed ones too
     for r in chosen:
-        meas = {"score": r["score"], "carriers": {k: (None if r.get(k) is None else {x: r[k][x] for x in ("how", "size", "score", "f_on", "s_off")})
+        meas = {"score": r["score"], "carriers": {k: (None if r.get(k) is None else {x: r[k].get(x) for x in ("how", "size", "score", "f_on", "f_off", "s_off")})
                                                   for k in ("blocks", "family", "family_sites", "active", "trivial", "mask")}, "tried": r["tried"],
                 "tokens": components.token_strings(task["model"], [ids[q] for q in r["inputs"]])}
         out["variables"].append(as_json(
@@ -479,12 +509,12 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
             reach = [d for d in got["draws"] if d["kind"] == "off" and d["s"] is not None and d["changes"][0][0] < min(r["at"])]
             w = sum(d["d0"] for d in reach)
             iso = sum(d["d0"] * d["s"] for d in reach) / w if w > 0 else None
-            v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"], "cause": x["f_on"], "iso": iso,
+            v["measured"][split] = {"term": term(x), "f_on": x["f_on"], "f_off": x["f_off"], "s_off": x["s_off"], "cause": x["f_on"], "iso": iso,
                                     "iso_draws": len(reach), "off_draws": x["draws_off"],
                                     "disentangle": None if x["f_on"] is None or iso is None else (x["f_on"] + iso) / 2}
         tv = as_json("trivial", r["inputs"], r["trivial"]["group"])
         x = together(variables.Scorer(ge), tx, variables.parse([tv], nat.C), "eval", draws)["variables"][0]
-        v["measured"]["trivial_eval"] = {"term": term(x), "f_on": x["f_on"], "s_off": x["s_off"], "size": r["trivial"]["size"]}
+        v["measured"]["trivial_eval"] = {"term": term(x), "f_on": x["f_on"], "f_off": x["f_off"], "s_off": x["s_off"], "size": r["trivial"]["size"]}
         v["kept"] = v["measured"]["search"]["term"] >= GOAL and v["measured"]["eval"]["term"] >= EVAL_KEEP
     kv = [v for v in out["variables"] if v["kept"]]
     stated = stated_feeds(graph, [r for r, v in zip(chosen, out["variables"]) if v["kept"]]) if graph is not None else {}
@@ -495,8 +525,11 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
             v["feeds"], v["feeds_stated"] = r["feeds"], stated.get(r["name"], [])
         for split, key in (("search", "together"), ("eval", "eval")):  # the kept variables together
             got = together(variables.Scorer(ge), tx, variables.parse(kv, nat.C), split, draws)
-            out["teacher"][key] = {k: got[k] for k in ("e4", "f_on", "s_off", "f_comp", "f_feeds", "f_apart", "unresolved")}
+            out["teacher"][key] = {k: got[k] for k in ("e4", "f_on", "f_off", "s_off", "f_comp", "f_feeds", "f_apart", "unresolved")}
         for v, pv in zip(kv, variables.parse(kv, nat.C)):  # the value maps, for the writer
+            if v["kind"] == "input":  # an identity: the token at the position is the value
+                v["value_kind"] = "identity"
+                continue
             v["values"] = []
             for q in pv["inputs"]:
                 c = var_classes.classes(sc, tx, pv, q, task["model"])
@@ -508,13 +541,14 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
             v["value_kind"] = "computed" if any(len(vm["classes"][0]["token_ids"]) > 1 for vm in v["values"]) else "copies its inputs"
         import semantic  # verified INVARIANTS lines from the kept variables' value maps (fresh donors), for the writer
 
-        sv = [{"name": v["name"], "inputs": v["inputs"], "group": pv["group"], "values": v["values"]} for v, pv in zip(kv, variables.parse(kv, nat.C))]
+        sv = [{"name": v["name"], "inputs": v["inputs"], "group": pv["group"], "values": v.get("values") or [],
+               "identity": v["kind"] == "input"} for v, pv in zip(kv, variables.parse(kv, nat.C))]
         out["invariants"] = semantic.teacher_invariants(variables.Scorer(ge), tx, sv, task["model"],
                                                       structured=retain_invariant_evidence)
         release(nat.dev)
     out["teacher"].update(kept=len(kv), target=bool(kv), kinds={k: sum(v["kept"] and v["kind"] == k for v in out["variables"])
                                                                for k in ("input", "intermediate")},
-                          value_kinds={k: sum(v.get("value_kind") == k for v in kv) for k in ("computed", "copies its inputs")})
+                          value_kinds={k: sum(v.get("value_kind") == k for v in kv) for k in ("identity", "computed", "copies its inputs")})
     if M > 0:
         out["teacher"]["m_share"] = sum(v["m"] for v in kv) / M
         out["teacher"]["e4x"] = sum((2 * v["measured"]["eval"]["term"] - 1) * v["m"] for v in kv) / M

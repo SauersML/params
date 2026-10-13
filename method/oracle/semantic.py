@@ -409,7 +409,9 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
     predicted token y (not the text's top) belongs to that class, and the explanation then predicts that the carrier
     alone carries it: 'V from @p=z -> top y' (per_class tokens per class); per variable 'remove V -> p(top) < 0.5'; and
     per pair of variables at different positions, both carriers from two donors (each one's first fresh token), the
-    model's own prediction on the text with both changes as the claim (independent recombination).
+    model's own prediction on the text with both changes as the claim (independent recombination). A variable marked
+    "identity" with no value map (it carries its positions' tokens) gets, per input position, fresh tokens z whose
+    changed text the model sends to a new top y: 'V from @p=z -> top y' (2 per_class per position, distinct y).
     Each line checked in the real model (Checker.outcome: holds, surprise against the no-change prediction, credit),
     the lines that hold first. structured=True also retains each original Checker.check record in "executed",
     including numeric intervention/outcome IDs and failed checks, for exact proof-bound supervision artifacts.
@@ -420,16 +422,30 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
 
     ck = Checker(sc, tx, vs)
     items, first = [], {}
+    def unseen(p: int, seen: set) -> list[int]:  # fresh donor tokens at p, sampled from the model's prediction there
+        lp = sc.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double()
+        w = lp.exp()
+        w[sorted(seen)] = 0.0
+        gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(("invariants", int(tx.seed), p)).encode()).hexdigest()[:15], 16))
+        return torch.multinomial(w, min(fresh, int((w > 0).sum())), replacement=False, generator=gen).tolist()
+
     try:
         for v in vs:
+            if v.get("identity") and not v.get("values"):
+                for p in map(int, v["inputs"]):
+                    zs = unseen(p, {int(tx.ids[p])})
+                    if zs:
+                        first.setdefault(v["name"], (p, int(zs[0])))
+                    ys = {}
+                    for z in zs:
+                        y = int(ck.text({p: z})["lq"][-1].argmax())
+                        if y != ck.y0 and y not in ys and len(ys) < 2 * per_class:
+                            ys[y] = z
+                    items += [(v["name"], {"transplants": [(v["name"], {p: z})]}, ("top", y), [(v["name"], p, z), y]) for y, z in ys.items()]
             for vm in v.get("values") or []:
                 p = int(vm["position"])
                 seen = {int(z) for c in vm["classes"] for z in c["token_ids"]} | {int(tx.ids[p])}
-                lp = sc.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double()
-                w = lp.exp()
-                w[sorted(seen)] = 0.0
-                gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(("invariants", int(tx.seed), p)).encode()).hexdigest()[:15], 16))
-                zs = torch.multinomial(w, min(fresh, int((w > 0).sum())), replacement=False, generator=gen).tolist()
+                zs = unseen(p, seen)
                 want = {int(c["predicts_id"]): c["id"] for c in vm["classes"][1:] if c.get("predicts_id") is not None}
                 got = {}
                 if zs:

@@ -103,18 +103,21 @@ def parse(variables: list[dict], C: dict) -> list[dict]:
 
 def headline(out: dict) -> dict:
     """A world's means and its headline e4 (the lead's rules) on score()'s per variable, pair and feeds rows: per
-    variable min(f on-target, s off-target, s same-class when a value map is stated), since a variable claims to carry its inputs and nothing else (a mean of the
-    two gave a group carrying nothing 1/2 for its off-target alone), and 0 for a variable none of whose on-target draws
+    variable min(f on-target, f off-target, f same-class when a value map is stated), since a variable claims to carry its inputs and nothing else (a mean of the
+    two gave a group carrying nothing 1/2 for its off-target alone), off-target and same-class on f's scale, the share of
+    the change kept out (the lead's 10-13: s's log scale floored at float32 resolution asked isolation good to 1e-7,
+    which only a carrier at its own inputs meets, a causal zero), and 0 for a variable none of whose on-target draws
     is resolved (its inputs do not move the output: the claim is empty; counted in "unresolved"); f in composition and f
     on the feeds claims; e4 the mean of all of them (each variable, pair and feeds claim a separate claim)."""
     mean = lambda xs: (lambda ys: sum(ys) / len(ys) if ys else None)([x for x in xs if x is not None])  # noqa: E731
     V, P, F = out["variables"], out["pairs"], out["feeds"]
     out.update(s_on=mean([x["s_on"] for x in V]), s_off=mean([x["s_off"] for x in V]), s_comp=mean([x["s_comp"] for x in P]),
                s_same=mean([x.get("s_same") for x in V]),
-               f_on=mean([x["f_on"] for x in V]), f_comp=mean([x["f_comp"] for x in P]),
+               f_on=mean([x["f_on"] for x in V]), f_off=mean([x["f_off"] for x in V]), f_same=mean([x.get("f_same") for x in V]),
+               f_comp=mean([x["f_comp"] for x in P]),
                f_feeds=mean([x["f"] for x in F if x["feeds"]]), f_apart=mean([x["f"] for x in F if not x["feeds"]]),
                unresolved=sum(x["f_on"] is None for x in V))
-    each = [0.0 if x["f_on"] is None else min(y for y in (x["f_on"], x["s_off"], x.get("s_same")) if y is not None) for x in V]
+    each = [0.0 if x["f_on"] is None else min(y for y in (x["f_on"], x["f_off"], x.get("f_same")) if y is not None) for x in V]
     out["e4"] = mean(each + [x["f_comp"] for x in P] + [x["f"] for x in F])
     return out
 

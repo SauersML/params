@@ -438,18 +438,27 @@ def active_rows(nat, task: dict, tok, rng: random.Random) -> list[dict]:
 
 
 def questions(recs_train: list[dict], recs_held: list[dict], out_dir: Path, sizes=(2_000, 8_000, 32_000), held: int = 2_000,
-              seed: int = 0) -> None:
+              seed: int = 0, held_only: bool = False) -> None:
     """Per arm, the training sets of each size (nested: the smaller a prefix of the larger), the held-out set, and
-    the vocabulary stage's rows (out_dir/<arm>/train_<n>.jsonl, heldout.jsonl; vocab.jsonl)."""
+    the vocabulary stage's rows (out_dir/<arm>/train_<n>.jsonl, heldout.jsonl; vocab.jsonl). held_only: the held-out
+    set alone, the training sets already in out_dir kept (vocab.jsonl from both). Held-out texts must be development
+    texts (text9000-9099; text9100-9149 are sealed, 9150-9199 the far donors)."""
+    bad = [r["task"] for r in recs_held if not 9000 <= int(r["task"][4:]) <= 9099]
+    if bad:
+        raise ValueError(f"held-out texts outside the development range text9000-9099: {bad[:5]}")
     import components
 
     sys.path.insert(0, str(ROOT))
     nat = native.Native("cpu")
     atlas, lens = components._atlas(), components._lens(nat)
     tok = lambda xs: components.token_strings("vpd4l", xs)  # noqa: E731
-    sets = {"heldout": (draw(recs_held, held, seed + 1), {r["task"]: r for r in recs_held}),
-            "train": (draw(recs_train, max(sizes), seed), {r["task"]: r for r in recs_train})}
+    sets = {"heldout": (draw(recs_held, held, seed + 1), {r["task"]: r for r in recs_held})}
     vocab = set()
+    if held_only:
+        for x in (out_dir / "ids" / f"train_{max(sizes)}.jsonl").read_text().splitlines():
+            vocab |= {(nd[0], nd[2]) for _, nd in json.loads(x)["meta"]["slots"]}
+    else:
+        sets["train"] = (draw(recs_train, max(sizes), seed), {r["task"]: r for r in recs_train})
     for split, (qs, by) in sets.items():
         of = {}
         for i, q in enumerate(qs):
@@ -561,6 +570,7 @@ def main():
     qa.add_argument("heldout", help="measure's output on held-out texts")
     qa.add_argument("out_dir")
     qa.add_argument("--held", type=int, default=2_000)
+    qa.add_argument("--held-only", action="store_true", help="the held-out set (and vocab.jsonl) alone, the training sets kept")
     ac = sub.add_parser("active")
     ac.add_argument("--texts", required=True, help="A:B, text numbers")
     ac.add_argument("out")
@@ -592,7 +602,8 @@ def main():
         return print(f"{len(rows)} rows, {sum(r['meta']['active'] for r in rows)} active labels")
     if args.cmd == "questions":
         read = lambda f: [json.loads(x) for x in Path(f).read_text().splitlines() if x.strip()]  # noqa: E731
-        return questions(read(args.train), read(args.heldout), Path(args.out_dir), held=args.held)
+        return questions([] if args.held_only else read(args.train), read(args.heldout), Path(args.out_dir), held=args.held,
+                         held_only=args.held_only)
     ge = goal_eval.GoalEval(native.Native(args.device))
     lo, hi = map(int, args.texts.split(":"))
     only = {int(x) for x in Path(args.only).read_text().split()} if args.only else None

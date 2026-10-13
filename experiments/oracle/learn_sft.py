@@ -10,8 +10,8 @@ answer and an end token. Scoring, per held-out row:
   rank:              the first candidate's probability over the letters (top-1 log loss and accuracy) and the greedy
                      answer's order against the measured one (Kendall's tau).
 
-  learn_sft.py train ROWS.jsonl OUT_DIR [--init FIRST_STAGE_DIR/adapter] [--inject] [--base Qwen/Qwen3-1.7B] [--epochs 2]
-  learn_sft.py score ARM_DIR/heldout.jsonl OUT.jsonl [--adapter OUT_DIR/adapter] [--inject [--shuffle]] [--base ...]
+  learn_sft.py train ROWS.jsonl OUT_DIR [--init FIRST_STAGE_DIR/adapter] [--inject real|random|id] [--base Qwen/Qwen3-1.7B] [--epochs 2]
+  learn_sft.py score ARM_DIR/heldout.jsonl OUT.jsonl [--adapter OUT_DIR/adapter] [--inject [--permute]] [--base ...]
   learn_sft.py active-score HELD_ACTIVE.jsonl OUT.jsonl [--adapter FIRST_STAGE_DIR/adapter] [--n 300]
   learn_sft.py report SCORES.jsonl ...
 """
@@ -38,14 +38,24 @@ def _rows(path) -> list[dict]:
     return [json.loads(x) for x in Path(path).read_text().splitlines() if x.strip()]
 
 
-class Slots:
-    """Arm "inject": two placeholder tokens after each subcomponent a question names (meta["slots"]), their input
-    embeddings its read vector v and write vector u through method/oracle/rl/inject.py's Injector (per site kind and
-    side a linear map to the width, at the token embeddings' RMS, plus its log |u||v|), trained with the LoRA. shuffle:
-    each named subcomponent gets a distinct weight component's vectors of the same kind from the question pool.
-    Positions do not change a component's vectors; a pool without a distinct donor cannot supply this control."""
+MODES = ("real", "random", "id")
+ID_DIM = 64
 
-    def __init__(self, model, tok, init: Path | None = None, shuffle: bool = False):
+
+class Slots:
+    """Arm "inject": two placeholder tokens after each subcomponent a question names (meta["slots"]), whose input
+    embeddings carry it. mode:
+      real    its read vector v and write vector u through method/oracle/rl/inject.py's Injector (per site kind and side
+              a linear map to the width, at the token embeddings' RMS, plus its log |u||v|), trained with the LoRA;
+      random  the same Injector on fixed random unit vectors of the same widths, one pair per subcomponent (seeded by
+              its matrix and index), with its true log |u||v|: the subcomponent's identity without its geometry;
+      id      a learned embedding per subcomponent (ID_DIM per slot, a shared linear map to the width at the RMS).
+    permute (scoring a real-mode model): every subcomponent gets the vectors of one fixed other subcomponent of its own
+    matrix (index shifted by half the matrix's count, the same wrong vectors in every question). Positions never change
+    a subcomponent's vectors. The model reads geometry only if real beats random and permuted."""
+
+    def __init__(self, model, tok, init: Path | None = None, mode: str = "real", permute: bool = False):
+        import json as _json
         import sys
 
         import torch
@@ -53,22 +63,32 @@ class Slots:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "method" / "oracle" / "rl"))
         import inject
 
-        self.inject, self.shuffle = inject, shuffle
+        if init is not None and (Path(init) / "slots.json").exists():
+            mode = _json.loads((Path(init) / "slots.json").read_text())["mode"]
+        self.inject, self.mode, self.permute = inject, mode, permute
         self.vectors = inject.Vectors()
         emb = model.get_input_embeddings().weight.detach().float()
-        self.injector = inject.Injector(self.vectors.dims(), emb.shape[1], float(emb.pow(2).mean(-1).sqrt().mean()),
-                                        self.vectors.logn_mean, self.vectors.logn_std).to(_dev())
+        width, self.rms = emb.shape[1], float(emb.pow(2).mean(-1).sqrt().mean())
+        t = self.vectors.uv.t
+        self.count = {k.rsplit(".", 1)[0]: v.shape[0] for k, v in t.items() if k.endswith(".U")}
+        sites = sorted(self.count)
+        self.offset = dict(zip(sites, [sum(self.count[x] for x in sites[:i]) for i in range(len(sites))]))
+        self.net = torch.nn.ModuleDict({"injector": inject.Injector(self.vectors.dims(), width, self.rms, self.vectors.logn_mean,
+                                                                    self.vectors.logn_std)})
+        if mode == "id":
+            self.net["ids"] = torch.nn.Embedding(sum(self.count.values()), 2 * ID_DIM)
+            self.net["up"] = torch.nn.Linear(ID_DIM, width)
+        self.net.to(_dev())
         if init is not None:
-            self.injector.load_state_dict(torch.load(Path(init) / "injector.pt", map_location=_dev()))
+            state = torch.load(Path(init) / "injector.pt", map_location=_dev())
+            self.net.load_state_dict(state if any(k.startswith("injector.") for k in state) else {f"injector.{k}": v for k, v in state.items()})
         self.slot = tok.convert_tokens_to_ids(inject.SLOT)
-        self.pool = {}
 
-    def pool_from(self, rows: list[dict]) -> None:
-        pool = {}
-        for r in rows:
-            for _, nd in r["meta"].get("slots", []):
-                pool.setdefault(nd[0].split(".")[-1], set()).add((nd[0], nd[2]))
-        self.pool = {k: sorted(v) for k, v in pool.items()}
+    def save(self, out: Path) -> None:
+        import torch
+
+        torch.save(self.net.state_dict(), out / "injector.pt")
+        (out / "slots.json").write_text(json.dumps({"mode": self.mode}))
 
     def prompt(self, r: dict) -> tuple[str, list[tuple]]:
         text, at, nodes = r["prompt"], 0, []
@@ -80,37 +100,46 @@ class Slots:
             text = text[:cut] + " " + self.inject.SLOT * 2 + text[cut:]
             at = cut + 1 + 2 * len(self.inject.SLOT)
             nodes.append(tuple(nd))
-        if self.shuffle:  # another weight component of the same kind (its maps' widths), from any question
-            rng = random.Random(text)
-            shuffled, assigned = [], {}
-            for site, position, component in nodes:
-                identity = (site, component)
-                if identity not in assigned:
-                    donors = [x for x in self.pool.get(site.split(".")[-1], []) if x != identity]
-                    if not donors:
-                        raise ValueError(f"shuffle has no distinct weight component for {site}#{component}")
-                    assigned[identity] = rng.choice(donors)
-                other_site, other_component = assigned[identity]
-                shuffled.append((other_site, position, other_component))
-            nodes = shuffled
+        if self.permute:
+            nodes = [(n, q, (c + self.count[n] // 2 + 1) % self.count[n]) for n, q, c in nodes]
         return text, nodes
 
+    def _random(self, nd: tuple):
+        import torch
+
+        v, u, scale = self.vectors(nd)
+        g = torch.Generator().manual_seed(self.offset[nd[0]] + nd[2] + 1)
+        rv, ru = torch.randn(v.shape, generator=g), torch.randn(u.shape, generator=g)
+        return rv / rv.norm(), ru / ru.norm(), scale
+
     def embeds(self, model, ids, nodes: list[list[tuple]]):
+        import torch
+
         emb = model.get_input_embeddings()(ids)
         for r, nds in enumerate(nodes):
             pos = (ids[r] == self.slot).nonzero().flatten()
             if not len(pos):
                 continue
-            vec = self.injector([(nd[0].split(".")[-1], *self.vectors(nd)) for nd in nds])
+            if self.mode == "id":
+                flat = torch.tensor([self.offset[n] + c for n, _, c in nds], device=ids.device)
+                m = self.net["up"](self.net["ids"](flat).view(-1, ID_DIM))  # [2 N, width]: read slot, write slot
+                vec = self.rms * m / m.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+            else:
+                get = self.vectors if self.mode == "real" else self._random
+                vec = self.net["injector"]([(nd[0].split(".")[-1], *get(nd)) for nd in nds])
             emb = emb.index_put((pos.new_full(pos.shape, r), pos), vec.to(emb.dtype))
         return emb
 
     def param_groups(self, rank: int, lr: float) -> list[dict]:
-        """The maps at lr x rank / fan_in (inject.Explainer.param_groups: their outputs then move per step as the LoRA's)."""
+        """The maps at lr x rank / fan_in (inject.Explainer.param_groups: their outputs then move per step as the LoRA's);
+        the ID embeddings at 1e-3 (each row is updated only when its subcomponent is named)."""
         import torch
 
-        return [{"params": list(m.parameters()), "lr": lr * rank / m.in_features} for m in self.injector.modules()
-                if isinstance(m, torch.nn.Linear)]
+        out = [{"params": list(m.parameters()), "lr": lr * rank / m.in_features} for m in self.net.modules()
+               if isinstance(m, torch.nn.Linear)]
+        if self.mode == "id":
+            out.append({"params": list(self.net["ids"].parameters()), "lr": 1e-3})
+        return out
 
 
 def _encode(tok, rows: list[dict], slots: Slots | None = None) -> list[tuple[list[int], list[int], list[tuple]]]:
@@ -223,13 +252,14 @@ def train(a) -> None:
 
     torch.manual_seed(0)
     tok, model = _model(a.base, adapter=a.init, rank=a.rank, trainable=True)
-    slots = Slots(model, tok, init=Path(a.init) if a.init and (Path(a.init) / "injector.pt").exists() else None) if a.inject else None
+    slots = (Slots(model, tok, init=Path(a.init) if a.init and (Path(a.init) / "injector.pt").exists() else None, mode=a.inject)
+             if a.inject else None)
     a.out.mkdir(parents=True, exist_ok=True)
     log = open(a.out / "train.jsonl", "a")
     _fit(model, tok, _encode(tok, _rows(a.rows), slots), a.epochs, a.lr, a.batch, log, Path(a.rows).stem, slots=slots, rank=a.rank)
     model.save_pretrained(a.out / "adapter")
     if slots:
-        torch.save(slots.injector.state_dict(), a.out / "adapter" / "injector.pt")
+        slots.save(a.out / "adapter")
 
 
 def _logp(model, tok, prompts: list[list[int]], conts: list[list[int]], nodes: list | None = None, slots: Slots | None = None) -> list[float]:
@@ -260,10 +290,8 @@ def score(a) -> None:
 
     tok, model = _model(a.base, adapter=a.adapter)
     model.eval()
-    slots = Slots(model, tok, init=Path(a.adapter), shuffle=a.shuffle) if a.inject else None
+    slots = Slots(model, tok, init=Path(a.adapter), permute=a.permute) if a.inject else None
     rows = _rows(a.rows)
-    if slots:
-        slots.pool_from(rows)
     enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]  # noqa: E731
     prompt = lambda r: slots.prompt(r) if slots else (r["prompt"], [])  # noqa: E731
     out = open(a.out, "w")
@@ -369,7 +397,7 @@ def main():
     t.add_argument("rows")
     t.add_argument("out", type=Path)
     t.add_argument("--init", help="an adapter to go on from (a first stage's)")
-    t.add_argument("--inject", action="store_true", help="the subcomponents' vectors in slots (Slots)")
+    t.add_argument("--inject", choices=MODES, help="the subcomponents in slots: their vectors (real), fixed random vectors, or learned IDs (Slots)")
     t.add_argument("--base", default="Qwen/Qwen3-1.7B")
     t.add_argument("--epochs", type=int, default=2)
     t.add_argument("--lr", type=float, default=2e-4)
@@ -379,8 +407,8 @@ def main():
     s.add_argument("rows")
     s.add_argument("out")
     s.add_argument("--adapter")
-    s.add_argument("--inject", action="store_true")
-    s.add_argument("--shuffle", action="store_true", help="with --inject: distinct same-kind weight components from the question pool")
+    s.add_argument("--inject", action="store_true", help="the adapter's slots (its mode from slots.json)")
+    s.add_argument("--permute", action="store_true", help="with --inject: each subcomponent gets one fixed other subcomponent's vectors")
     s.add_argument("--base", default="Qwen/Qwen3-1.7B")
     ac = sub.add_parser("active-score")
     ac.add_argument("rows")

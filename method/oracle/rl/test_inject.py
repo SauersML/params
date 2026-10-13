@@ -95,46 +95,29 @@ def learn_slots():
     namespace = {"Path": Path, "random": random}
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)  # noqa: S102
     slots = namespace["Slots"].__new__(namespace["Slots"])
-    slots.inject, slots.shuffle, slots.pool = inject, True, {}
+    slots.inject, slots.permute, slots.count = inject, True, {"h.0.mlp.c_fc": 10, "h.1.attn.k_proj": 7}
     return slots
 
 
-def test_learn_shuffle_rejects_position_aliases_as_donors(learn_slots):
-    row = {"prompt": "a b", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]],
-                                                ["b", ["h.0.mlp.c_fc", 2, 3]]]}}
-    learn_slots.pool_from([row])
-    assert learn_slots.pool == {"c_fc": [("h.0.mlp.c_fc", 3)]}
-    with pytest.raises(ValueError, match="no distinct weight component"):
-        learn_slots.prompt(row)
-
-
-def test_learn_shuffle_changes_weight_identity_and_preserves_position(learn_slots):
-    row = {"prompt": "a b", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]],
-                                                ["b", ["h.0.mlp.c_fc", 2, 3]]]}}
-    donor = {"meta": {"slots": [["c", ["h.1.mlp.c_fc", 5, 7]], ["d", ["h.1.attn.k_proj", 5, 9]]]}}
-    learn_slots.pool_from([row, donor])
+def test_learn_permute_changes_weight_identity_and_preserves_site_and_position(learn_slots):
+    row = {"prompt": "a b", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]], ["b", ["h.1.attn.k_proj", 2, 4]]]}}
     _, nodes = learn_slots.prompt(row)
-    assert nodes == [("h.1.mlp.c_fc", 1, 7), ("h.1.mlp.c_fc", 2, 7)]
-    assert learn_slots.prompt(row) == learn_slots.prompt(row)
+    assert [(n, q) for n, q, _ in nodes] == [("h.0.mlp.c_fc", 1), ("h.1.attn.k_proj", 2)]
+    assert nodes[0][2] != 3 and nodes[1][2] != 4
 
 
-def test_learn_shuffle_missing_kind_does_not_silently_keep_vectors(learn_slots):
-    row = {"prompt": "a", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]]]}}
-    learn_slots.pool_from([])
-    with pytest.raises(ValueError, match="no distinct weight component"):
-        learn_slots.prompt(row)
+def test_learn_permute_is_one_fixed_wrong_vector_per_subcomponent(learn_slots):
+    # the same subcomponent gets the same donor at every position and in every question
+    rows = [{"prompt": f"{k} a b", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1 + k, 3]], ["b", ["h.0.mlp.c_fc", 9, 3]]]}}
+            for k in range(5)]
+    donors = {learn_slots.prompt(r)[1][j][2] for r in rows for j in range(2)}
+    assert len(donors) == 1 and donors != {3}
 
 
-def test_learn_shuffle_one_donor_per_repeated_weight_identity(learn_slots):
-    row = {"prompt": "a b", "meta": {"slots": [["a", ["h.0.mlp.c_fc", 1, 3]],
-                                                ["b", ["h.0.mlp.c_fc", 2, 3]]]}}
-    donors = {"meta": {"slots": [["c", ["h.1.mlp.c_fc", 5, 7]], ["d", ["h.2.mlp.c_fc", 6, 9]]]}}
-    learn_slots.pool_from([row, donors])
-    learn_slots.pool_from([row, donors])
-    for seed in range(20):
-        _, nodes = learn_slots.prompt({**row, "prompt": f'{seed} a b'})
-        assert (nodes[0][0], nodes[0][2]) == (nodes[1][0], nodes[1][2])
-        assert nodes[0][2] in {7, 9}
+@pytest.mark.parametrize("site,count", [("h.0.mlp.c_fc", 10), ("h.1.attn.k_proj", 7)])
+def test_learn_permute_is_a_derangement_of_each_matrix(learn_slots, site, count):
+    got = [learn_slots.prompt({"prompt": "a", "meta": {"slots": [["a", [site, 0, c]]]}})[1][0][2] for c in range(count)]
+    assert sorted(got) == list(range(count)) and all(g != c for c, g in enumerate(got))
 
 
 @pytest.mark.parametrize("nodes", [[("s", 0, 1)], [("s", 0, 1), ("s", 1, 1)],

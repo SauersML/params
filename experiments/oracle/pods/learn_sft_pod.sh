@@ -2,10 +2,10 @@
 # The learnability experiment's SFT runs (experiments/oracle/learn_sft.py) on one rented GPU. QDIR is learnability.py
 # questions' output plus the first stages' rows (vocab.jsonl, active.jsonl, both.jsonl) and active_heldout.jsonl (the
 # active stage's check on held-out texts, learn_sft.py active-score). Arms: ids and features
-# (their own rows from the base model), vocab, active and both (the ids rows after that first stage's adapter), inject
-# (the ids rows with the subcomponents' vectors in slots, also scored with other subcomponents' vectors); each at every
-# training size, scored on its held-out rows; the base model scored on the ids and features held-out rows. Four queues
-# share the GPU; a smoke stage (64 rows, 32 scored) runs first and stops the pod when it fails. Everything comes
+# (their own rows from the base model), vocab, active and both (the ids rows after that first stage's adapter), each at
+# every training size; inject (the ids rows with each named subcomponent in slots: its vectors, also scored with one
+# fixed other subcomponent's vectors; fixed random vectors; learned IDs) at INJECT_SIZES (default 8k and 32k); every
+# arm scored on its held-out rows, and the base model on the ids and features held-out rows. Four queues; a smoke stage (64 rows, 32 scored) runs first and stops the pod when it fails. Everything comes
 # back to ~/mpd-data/runpod/NAME/out.
 # EPOCHS: per training size, its epochs (SIZE:EPOCHS ...; smaller sets more passes, every size trained to a similar
 # number of row passes).
@@ -35,25 +35,31 @@ task() {  # task ARM ROWS_ARM [INIT]: train at every size, score each
 first() {  # first STAGE EPOCHS: the first stage's adapter at $W/first_STAGE/adapter
   echo "$S train $Q/$1.jsonl $W/first_$1 --base $BASE --epochs $2 >> $O/first_$1.log 2>&1; cp $W/first_$1/train.jsonl $O/out/first_$1.jsonl;"
 }
-inject() {  # the ids rows with the subcomponents' vectors in slots, scored with them and with other subcomponents' vectors
+inject() {  # the ids rows with each named subcomponent in slots, per mode (learn_sft.py Slots): its vectors (also scored
+            # with one fixed other subcomponent's vectors), fixed random vectors, learned IDs; at INJECT_SIZES
   local out=""
-  for n in $SIZES; do
-    out="$out $S train $Q/ids/train_$n.jsonl $W/sft_inject_$n --base $BASE --epochs $(epochs $n) --inject >> $O/train_inject_$n.log 2>&1;"
-    out="$out $S score $Q/ids/heldout.jsonl $O/out/score_inject_$n.jsonl --base $BASE --adapter $W/sft_inject_$n/adapter --inject >> $O/train_inject_$n.log 2>&1;"
-    out="$out $S score $Q/ids/heldout.jsonl $O/out/score_inject_shuffled_$n.jsonl --base $BASE --adapter $W/sft_inject_$n/adapter --inject --shuffle >> $O/train_inject_$n.log 2>&1;"
-    out="$out cp $W/sft_inject_$n/train.jsonl $O/out/train_inject_$n.jsonl;"
+  for mode in real random id; do
+    for n in ${INJECT_SIZES:-8000 32000}; do
+      local d=$W/sft_inject_${mode}_$n
+      out="$out $S train $Q/ids/train_$n.jsonl $d --base $BASE --epochs $(epochs $n) --inject $mode >> $O/train_inject_${mode}_$n.log 2>&1;"
+      out="$out $S score $Q/ids/heldout.jsonl $O/out/score_inject_${mode}_$n.jsonl --base $BASE --adapter $d/adapter --inject >> $O/train_inject_${mode}_$n.log 2>&1;"
+      [ $mode = real ] && out="$out $S score $Q/ids/heldout.jsonl $O/out/score_inject_permuted_$n.jsonl --base $BASE --adapter $d/adapter --inject --permute >> $O/train_inject_${mode}_$n.log 2>&1;"
+      out="$out cp $d/train.jsonl $O/out/train_inject_${mode}_$n.jsonl;"
+    done
   done
   echo "$out"
 }
 CHECK="$S active-score $Q/active_heldout.jsonl $O/out/active_check.jsonl --base $BASE --adapter $W/first_active/adapter >> $O/first_active.log 2>&1; $S active-score $Q/active_heldout.jsonl $O/out/active_check_base.jsonl --base $BASE --n 100 >> $O/first_active.log 2>&1;"
+BASES="$S score $Q/ids/heldout.jsonl $O/out/score_ids_base.jsonl --base $BASE >> $O/base.log 2>&1; $S score $Q/features/heldout.jsonl $O/out/score_features_base.jsonl --base $BASE >> $O/base.log 2>&1;"
 Q0="$(first active 1) $CHECK $(task active ids $W/first_active/adapter) $(task ids ids)"
-Q1="$(first vocab 2) $(task vocab ids $W/first_vocab/adapter) $S score $Q/ids/heldout.jsonl $O/out/score_ids_base.jsonl --base $BASE >> $O/base.log 2>&1; $S score $Q/features/heldout.jsonl $O/out/score_features_base.jsonl --base $BASE >> $O/base.log 2>&1;"
-Q2="$(first both 1) $(task both ids $W/first_both/adapter) $(task features features)"
+Q1="$(first vocab 2) $(task vocab ids $W/first_vocab/adapter) $(task features features) $BASES"
+Q2="$(first both 1) $(task both ids $W/first_both/adapter)"
 Q3="$(inject)"
 QS=("$Q0" "$Q1" "$Q2" "$Q3") RUNQ=""
 for i in ${QSET:-0 1 2 3}; do RUNQ="$RUNQ (${QS[$i]}) &"; done
 REPORT="$O/out/score_ids_base.jsonl $O/out/score_features_base.jsonl"
-for arm in active ids vocab both features inject inject_shuffled; do for n in $SIZES; do REPORT="$REPORT $O/out/score_${arm}_$n.jsonl"; done; done
+for arm in active ids vocab both features; do for n in $SIZES; do REPORT="$REPORT $O/out/score_${arm}_$n.jsonl"; done; done
+for arm in inject_real inject_permuted inject_random inject_id; do for n in ${INJECT_SIZES:-8000 32000}; do REPORT="$REPORT $O/out/score_${arm}_$n.jsonl"; done; done
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out $Q;
 tar -xzf $F/q.tgz -C $Q; ls /Users/user/params/experiments/oracle/learn_sft.py /Users/user/params/method/oracle/rl/inject.py /Users/user/params/method/vpd /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/mpd-data/atlas/vpd4l/atlas.json /Users/user/mpd-data/atlas/vpd4l/atlas.safetensors > /dev/null;
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
@@ -61,8 +67,10 @@ cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,no
 head -64 $Q/ids/train_2000.jsonl > $W/smoke_train.jsonl; head -32 $Q/ids/heldout.jsonl > $W/smoke_held.jsonl;
 $S train $W/smoke_train.jsonl $W/smoke --base $BASE --epochs 1 > $O/smoke.log 2>&1;
 $S score $W/smoke_held.jsonl $O/out/smoke_score.jsonl --base $BASE --adapter $W/smoke/adapter >> $O/smoke.log 2>&1;
-$S train $W/smoke_train.jsonl $W/smoke_inject --base $BASE --epochs 1 --inject --init $W/smoke/adapter >> $O/smoke.log 2>&1;
-$S score $W/smoke_held.jsonl $O/out/smoke_score_inject.jsonl --base $BASE --adapter $W/smoke_inject/adapter --inject --shuffle >> $O/smoke.log 2>&1;
+$S train $W/smoke_train.jsonl $W/smoke_inject --base $BASE --epochs 1 --inject random --init $W/smoke/adapter >> $O/smoke.log 2>&1;
+$S score $W/smoke_held.jsonl $O/out/smoke_score_inject.jsonl --base $BASE --adapter $W/smoke_inject/adapter --inject --permute >> $O/smoke.log 2>&1;
+$S train $W/smoke_train.jsonl $W/smoke_id --base $BASE --epochs 1 --inject id >> $O/smoke.log 2>&1;
+$S score $W/smoke_held.jsonl $O/out/smoke_score_id.jsonl --base $BASE --adapter $W/smoke_id/adapter --inject >> $O/smoke.log 2>&1;
 set +e; $RUNQ wait; $S report $REPORT > $O/out/report.txt 2>&1; echo all stages done"
 RP_OWNER=rustmove RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.45} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=48 RP_DISK_GB=100 \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA L40,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD"

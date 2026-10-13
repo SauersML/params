@@ -702,7 +702,6 @@ class Acceptance:
         self.draws, self.refused, self.pool = draws, [], None
         if draws in ("discriminating", "fresh", "fv") and mode != "pp":
             raise ValueError("discriminating draws score s_track_pp: mode pp")
-        self.rng = np.random.default_rng([int(tx.seed), 23])
 
     def _per_draw(self, graphs: list, prompts: list) -> list:
         """Per graph its per-draw s_track_pp on prompts (None where VPD's answer is no nearer than no change), and the
@@ -753,10 +752,15 @@ class Acceptance:
                 self.val = [val[i] for i in sorted(pick.tolist())]
         return self.pool, self.val
 
-    def _sample(self) -> list:
+    def _sample(self, state: torch.Tensor | None = None) -> list:
+        """A check's draws from the acceptance's half of search_pool, keyed by the text's seed and the state the
+        candidates are removals from (its unit set's bytes): the same state draws the same sample on any card, so a
+        decision float noise flips near the floor does not shift every later sample (fleet: A4500 and A6000 runs
+        diverged from the first check on)."""
         pool = self._halves()[0]
         k = min(POOL_DRAWS, len(pool))
-        return [pool[i] for i in self.rng.choice(len(pool), k, replace=False).tolist()]
+        key = 0 if state is None else int(hashlib.sha256(state.detach().to("cpu", torch.uint8).numpy().tobytes()).hexdigest()[:15], 16)
+        return [pool[i] for i in np.random.default_rng([int(self.tx.seed), 23, key]).choice(len(pool), k, replace=False).tolist()]
 
     def validation(self, graph: native.Graph) -> float | None:
         """A circuit's s_track_pp on the fixed validation draws (the other half of search_pool, at most POOL_DRAWS)."""
@@ -805,13 +809,14 @@ class Acceptance:
                 else [{} for _ in ons]
         base = run(start[None])[0]
         if disc:                                             # the start on a fresh sample, every draw
-            got, ws = self._per_draw([graph_of(start)], self._sample())
+            got, ws = self._per_draw([graph_of(start)], self._sample(start))
             base["s_track_pp"] = self._pooled(got[0], ws, range(len(ws)))
         if floor is None:
             floor = {k: None if v is None else min(RECOVERED, v) for k, v in base.items()}
 
         def judge(ons):                                      # the changed term on the draws each candidate is most at
-            now, prompts = current(), self._sample()         # odds with the current circuit on
+            now = current()                                  # odds with the current circuit on
+            prompts = self._sample(now)
             got, ws = self._per_draw([graph_of(now)] + [graph_of(on) for on in ons], prompts)
             out = []
             for i, on in enumerate(ons):
@@ -1203,7 +1208,9 @@ class Connector:
 
     def tokens(self, on: torch.Tensor, kept: list, floor: dict) -> list:
         """The token edges a stated graph keeps (the lead's 10-12: pruned like other connections): from every one
-        (with_tokens), those of a position together and then single ones dropped where acceptance admits it at floor;
+        (with_tokens), those of a position together and then single ones dropped where acceptance admits it at floor,
+        every one at a position the changed texts change (F2's) kept: dropping such an entry claims the change there
+        does nothing, which a sample of draws can pass while held-out ones fail;
         C's KL does not read them (the change enters through them in the path-patched families alone). [("e",
         position, reader) | ("o", target)]."""
         g = self.graph(on, kept)
@@ -1219,6 +1226,8 @@ class Connector:
             got = self.acceptance.scores([graph_of(x) for x in ons])
             return [-min([r[k] - f for k, f in floor.items() if r.get(k) is not None] or [0.0]) for r in got]
         td = Flags(len(toks), 0.0, rank, ACCEPT_BATCH, on.device)
+        changed = {p for p, _ in self.tx.f2}                 # where the changed texts change a token: those entries stay
+        td.fixed = torch.tensor([x[1] in changed for x in toks], device=on.device)   # (text9002's F+V lost position 28's)
         hook, _ = self.acceptance.hook(graph_of, td.on.clone(), floor=floor, current=lambda: td.on, label="tokens",
                                        names=lambda ids: [toks[i] for i in ids])
         single = td.blocks

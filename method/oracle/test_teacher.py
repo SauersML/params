@@ -544,6 +544,8 @@ def test_discriminating_draws_stay_off_eval(draws):
         ons[i, torch.rand(len(pr2.nodes), generator=g).to(ons.device) < f] = False
     got = hook(ons)
     floor = min(teacher.RECOVERED, base["s_track_pp"])
+    # a check's sample is keyed by the state it judges: the same set draws the same sample, another set another one
+    assert acc._sample(pr2.on.clone()) == acc._sample(pr2.on) != acc._sample(ons[0])
     # admitted removals keep the floor on their judged draws; each refusal kept with its 16 draws from the pool
     assert all(r is None or r["s_track_pp"] >= floor for r in got)
     assert len(acc.refused) == sum(r is None for r in got)

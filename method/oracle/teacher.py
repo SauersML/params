@@ -1006,6 +1006,7 @@ class Validated:
 
 SET_LEVELS = ("site", "chunk16", "chunk4", "subcomponent")  # the influential set's levels, coarse first
 GROW_DRAWS = 16       # --grow: changed texts whose VPD actives at the start's positions are the candidates
+GROW_MIN = 0.01       # --grow: a group joins only for a phi gain at least this (text6011 grew by 0.001-a-group noise)
 
 
 def grow_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, positions: list, pool: dict, log=print) -> dict | None:
@@ -1014,7 +1015,8 @@ def grow_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, position
     on the text and on GROW_DRAWS changed texts of the search split's pool (search_pool's ranked draws first: the
     inactive-on-x responders inframove found among them), in groups of one site at one position, each step adding the
     group that raises phi most (GoalEval.phi_variants over the union of the start and every candidate, one call a
-    step) while phi rises and stays below the bar. {"added": nodes, "phi_start", "phi", "bar", "groups", "candidates",
+    step) while phi rises by GROW_MIN and stays below the bar (phi_variants holds the nodes, edges, flips and patching
+    families at the union's values, so a group earns only through point, track_pp, interchange_pp, pattern and N). {"added": nodes, "phi_start", "phi", "bar", "groups", "candidates",
     "inactive"} or None (the start at the bar, or no candidate)."""
     nat, P = ge.nat, set(positions)
     bar = ge.tau(tx, pool, "search")["phi_tau"]
@@ -1048,7 +1050,7 @@ def grow_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, position
         got = ge.phi_variants(tx, union, ge.keep_of(tx, union, [sorted(cur | set(groups[k])) for k in keys]), pool,
                               base=base, start=bar)["variants"]
         j = max(range(len(keys)), key=lambda i: got[i]["phi"] if got[i]["phi"] is not None else -1e9)
-        if got[j]["phi"] is None or got[j]["phi"] <= ph:
+        if got[j]["phi"] is None or got[j]["phi"] < ph + GROW_MIN:
             break
         cur |= set(groups[keys[j]])
         ph = got[j]["phi"]

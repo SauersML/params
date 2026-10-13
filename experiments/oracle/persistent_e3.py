@@ -368,33 +368,68 @@ def select(cands: list) -> tuple:
     return max(cands, key=lambda c: (c[0]["flipped"], -c[0]["collateral_per_token"]))
 
 
-def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None) -> dict:
-    """Delete a preference (the lead's practical edit): three methods, each giving candidate edits on the fit third,
-    one picked by the same rule on validation (select()), scored on the score third:
-      circuit_edit  persistent scales of the circuit's subcomponents (greedy search(), at each objective weight LAMS);
-      vpd_topk      VPD's top k by attribution (the subcomponents most often active at the fit instances) ablated;
-      finetune      an unconstrained update at every position of rank = the circuit edit's operation count, at the
-                    matrix whose short fit is best, Adam on the objective at each LAMS, checkpoints every 25 steps.
+METHODS = ("circuit_edit", "random_active", "random_any", "random_equal", "vpd_topk", "finetune")
+RANDOM_DRAWS = 2
+
+
+def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None,
+              methods: tuple = METHODS) -> dict:
+    """Delete a preference (the lead's practical edit): each method gives candidate edits on the fit third, one picked by
+    the same rule on validation (select()), scored on the score third:
+      circuit_edit   persistent scales of the circuit's subcomponents (greedy search() over its EDIT_CANDS by local
+                     effect, at each objective weight LAMS);
+      random_active  the same search over EDIT_CANDS random subcomponents active at the fit instances, outside the
+                     circuit's (RANDOM_DRAWS draws: the circuit's pool against a pool of equal size);
+      random_any     the same over EDIT_CANDS random subcomponents of the model;
+      random_equal   as many random active subcomponents as the circuit edit's operations, ablated (RANDOM_DRAWS draws);
+      vpd_topk       VPD's top k by attribution (the subcomponents most often active at the fit instances) ablated;
+      finetune       an unconstrained update at every position of rank = the circuit edit's operation count, at the
+                     matrix whose short fit is best, Adam on the objective at each LAMS, checkpoints every 25 steps.
     Scores: flipped (preference gone), goal bits, controls kept (b still predicted elsewhere), KL per token on the rows'
     other positions and on held Pile texts. The validation frontier (every candidate's flipped and collateral) is kept."""
     t0 = time.time()
     net = Net(nat, beh, tokens, held)
     out = {"preference": beh["describe"], "a": beh["a"], "b": beh["b"], "rate": beh["parts"]["score"]["rate"], "methods": {}}
-    cands = [(s, int(i)) for s, i, _ in beh["circuit"][:EDIT_CANDS]]
-    keep = {"circuit_edit": [], "vpd_topk": [], "finetune": []}
-    for lam in LAMS:
-        search(net, cands, lam, keep["circuit_edit"], log)
+    circ = [(s, int(i)) for s, i, _ in beh["circuit"][:EDIT_CANDS]]
     act = [(s, int(i)) for s, i, _ in sorted(beh["active"], key=lambda x: -x[2])]
-    for k in TOPK:
-        if k <= len(act):
-            ops = [(*c, 0.0) for c in act[:k]]
-            keep["vpd_topk"].append((_score(net, "val", ops_deltas(nat, ops)), ops, {"k": k}))
-    ce = select(keep["circuit_edit"]) if keep["circuit_edit"] else None
+    rng = random.Random(f"{beh['a']}-{beh['b']}")
+    keep = {}
+    if "circuit_edit" in methods:
+        keep["circuit_edit"] = []
+        for lam in LAMS:
+            search(net, circ, lam, keep["circuit_edit"], log)
+    pools = {}
+    if "random_active" in methods:
+        others = [c for c in act if c not in set(circ)]
+        for d in range(RANDOM_DRAWS):
+            pools[f"random_active_{d}"] = rng.sample(others, min(EDIT_CANDS, len(others)))
+    if "random_any" in methods:
+        tg = nat.target
+        pools["random_any"] = [(n, rng.randrange(tg.site(n).V.shape[1])) for n in rng.choices(nat.names, k=EDIT_CANDS)]
+    for name, pool in pools.items():
+        keep[name] = []
+        for lam in LAMS:
+            search(net, pool, lam, keep[name], lambda m, name=name: log(f"  [{name}]{m}"))
+    ce = select(keep["circuit_edit"]) if keep.get("circuit_edit") else None
     r = max(1, len(ce[1]) if ce else 1)
-    shots = {n: fit(net, n, screen, rank=r, lam=LAMS[1])["val_net"] for n in (names or nat.names)}
-    top = max(shots, key=shots.get)
-    for lam in LAMS:
-        fit(net, top, steps, rank=r, lam=lam, keep=keep["finetune"])
+    if "random_equal" in methods:
+        others = [c for c in act if c not in set(circ)]
+        for d in range(RANDOM_DRAWS):
+            ops = [(*c, 0.0) for c in rng.sample(others, min(r, len(others)))]
+            keep[f"random_equal_{d}"] = [(_score(net, "val", ops_deltas(nat, ops)), ops, {"k": len(ops)})]
+    if "vpd_topk" in methods:
+        keep["vpd_topk"] = []
+        for k in TOPK:
+            if k <= len(act):
+                ops = [(*c, 0.0) for c in act[:k]]
+                keep["vpd_topk"].append((_score(net, "val", ops_deltas(nat, ops)), ops, {"k": k}))
+    if "finetune" in methods:
+        shots = {n: fit(net, n, screen, rank=r, lam=LAMS[1])["val_net"] for n in (names or nat.names)}
+        top = max(shots, key=shots.get)
+        keep["finetune"] = []
+        for lam in LAMS:
+            fit(net, top, steps, rank=r, lam=lam, keep=keep["finetune"])
+        out["finetune_screen"] = shots
     for name, cs in keep.items():
         if not cs:
             continue
@@ -405,7 +440,6 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
         v = out["methods"][name]["score"]
         log(f"{beh['describe']['a']!r}->{beh['describe']['b']!r} {name} {info}: flipped {v['flipped']:.2f}, goal {v['goal_bits']:.2f} bits, "
             f"kept {v['controls_kept'] or 0:.2f}, text KL {v['text_kl_per_token']:.2e}, Pile KL {v['pile_kl_per_token']:.2e}/token")
-    out["finetune_screen"] = shots
     out["seconds"] = time.time() - t0
     return out
 
@@ -413,16 +447,13 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
 def practical_table(rows: list[dict]) -> str:
     """Per preference and method on the score third: flipped (preference gone), goal bits, controls kept, KL per token on
     the rows' other positions and on Pile."""
-    lines = ["preference              method         edit           flipped  goal bits  kept   text KL/tok  Pile KL/tok"]
+    lines = ["preference              method          edit           flipped  goal bits  kept   text KL/tok  Pile KL/tok"]
     for r in rows:
-        for name in ("circuit_edit", "vpd_topk", "finetune"):
-            x = r["methods"].get(name)
-            if not x:
-                continue
+        for name, x in sorted(r["methods"].items(), key=lambda kv: [m in kv[0] for m in METHODS].index(True)):
             v, i = x["score"], x["info"]
-            what = (f"{len(x['ops'])} ops" if name == "circuit_edit" else f"k {i['k']}" if name == "vpd_topk"
-                    else f"r{i['rank']} {i['site'].replace('h.', 'L').replace('.mlp', '').replace('.attn', '')}")
-            lines.append(f"{r['preference']['a']!r:>9s}->{r['preference']['b']!r:<11s} {name:13s} {what:14s} {v['flipped']:7.2f}  {v['goal_bits']:9.2f}  "
+            what = (f"r{i['rank']} {i['site'].replace('h.', 'L').replace('.mlp', '').replace('.attn', '')}" if name == "finetune"
+                    else f"k {i['k']}" if "k" in i else f"{len(x['ops'])} ops")
+            lines.append(f"{r['preference']['a']!r:>9s}->{r['preference']['b']!r:<11s} {name:15s} {what:14s} {v['flipped']:7.2f}  {v['goal_bits']:9.2f}  "
                          f"{v['controls_kept'] or 0:5.2f}  {v['text_kl_per_token']:11.2e}  {v['pile_kl_per_token']:11.2e}")
     return "\n".join(lines)
 
@@ -482,6 +513,7 @@ def main():
     e.add_argument("--offset", type=int, default=0)
     e.add_argument("--stride", type=int, default=1)
     e.add_argument("--sites", nargs="*")
+    e.add_argument("--methods", nargs="*", default=list(METHODS))
     t = sub.add_parser("table")
     t.add_argument("rows")
     t.add_argument("--edit", action="store_true", help="edit's rows (practical_table)")
@@ -511,8 +543,11 @@ def main():
     for i, beh in enumerate(read(args.prefs)):
         if i % args.stride != args.offset:
             continue
-        go = practical if args.cmd == "edit" else run
-        r = go(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
+        if args.cmd == "edit":
+            r = practical(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites,
+                          methods=tuple(args.methods))
+        else:
+            r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
         with open(args.out, "a") as fh:
             fh.write(json.dumps(r) + "\n")
 

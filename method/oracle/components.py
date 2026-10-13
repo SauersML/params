@@ -2117,8 +2117,9 @@ def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget:
     out = []
     if b.get("positions"):
         ps = ", ".join(f"{p} ({strings[p]!r})" for p in b["positions"] if p < len(strings))
-        out.append(f"Start: VPD's active subcomponents at the target and the {b.get('m', len(b['positions']))} most influential "
-                   f"positions, {ps}: {b.get('start_units', '?')} subcomponents.")
+        m = b.get("m", len(b["positions"]) - 1)
+        out.append(f"Start: VPD's active subcomponents at {ps} (the target" + (f" and its {m} most influential context positions"
+                   if m else "") + f"): {b.get('start_units', '?')} subcomponents.")
     for st in b.get("stages") or []:
         if st.get("stage") != "start":
             out.append(f"Stage {st['stage']}: {st.get('units', '?')} units ({st.get('blocks', 0)} blocks, {st.get('subcomponents', 0)} "

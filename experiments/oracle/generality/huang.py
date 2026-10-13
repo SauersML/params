@@ -131,6 +131,18 @@ def report():
             m.fit(X[tr], fail[tr])
             pred[te] = m.predict_proba(X[te])[:, 1]
         print(f"   {name:36s} AUC {roc_auc_score(fail, pred):.3f}")
+    for lo in (0.5, 0.8):  # confident positions alone: does realization find the failures confidence misses?
+        keep = d["conf"] >= lo
+        y, X, grp = fail[keep], d["real"][keep], d["group"][keep]
+        if y.sum() < 10:
+            continue
+        pred = np.zeros(len(y))
+        for tr, te in GroupKFold(5).split(X, y, grp):
+            m = make_pipeline(StandardScaler(), LogisticRegression(max_iter=4000))
+            m.fit(X[tr], y[tr])
+            pred[te] = m.predict_proba(X[te])[:, 1]
+        print(f"   confidence >= {lo}: {keep.sum()} positions, {y.sum()} failures; realization AUC {roc_auc_score(y, pred):.3f}, "
+              f"confidence AUC {roc_auc_score(y, -d['conf'][keep]):.3f}, attention t->a alone {roc_auc_score(y, -X[:, 1]):.3f}")
     print("   single realization features (AUC of each alone, sign chosen on all positions):")
     for j, nm in enumerate(REAL):
         a = roc_auc_score(fail, d["real"][:, j])

@@ -3816,13 +3816,16 @@ class GoalEval:
         read the split; a read with circuit queries and no stated pairs, every pair of its row, engine.read_pairs:
         monitorbench's 10-12; _edge_draws); the mean KLs from the model's. A circuit without connections or pairs: None. Every draw of a side runs in one batch on the engine (_sides)."""
         sides = self._sides(tx, graphs)
+        draws_of = [self._edge_draws(tx, g, draws) for g in graphs]
+        if not reads:  # every circuit's draws in one run of each side
+            items = [(g, c) for g, c in zip(graphs, draws_of) if c is not None]
+            got_all = iter(sides.many(items)) if items else iter(())
         out = []
-        for g in graphs:
-            cuts = self._edge_draws(tx, g, draws)
+        for g, cuts in zip(graphs, draws_of):
             if cuts is None:
                 out.append({"kl_edges_c": None, "kl_edges_vpd": None, "reads_edges": None})
                 continue
-            got = sides(g, cuts=cuts, reads=reads)
+            got = sides(g, cuts=cuts, reads=reads) if reads else next(got_all)
             lm, lv, lc = got[:3]
             row = {"kl_edges_c": float(carry.kl(lm, lc).mean()), "kl_edges_vpd": float(carry.kl(lm, lv).mean()), "reads_edges": None,
                    "draws_edges": [list(x) for x in zip(carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist())]}
@@ -3946,7 +3949,34 @@ class GoalEval:
                 return lm, lv, lc
             return lm[0], lv, lc[0], split(lm[1], nodes, D), split(lc[1], nodes, D)
 
-        sides.spec, sides.split, sides.engines, sides.at = spec, split, (Em, Ev, Ec), at
+        def many(items):  # [(circuit, its cuts per draw)] -> per circuit (log q of the model, VPD's answer, the circuit), every
+            G = [g for g, c in items for _ in c]  # circuit's draws in one run of each side
+            C = [x for _, c in items for x in c]
+            R = len(C)
+            lm = Em.graph_log_probs(Em.plan([model] * R, semantics="c", cuts=C), u_m)
+            lv = Ev.graph_log_probs(Ev.plan([vpd] * R, semantics="c", cuts=C), u_v)
+            u_c = None
+            if any(g.complete for g in G):  # complete circuits run as u: 1 on each row's circuit's nodes
+                idx = {}
+                for r, g in enumerate(G):
+                    if g.complete:
+                        for n, t, c in g.node_set():
+                            if c != BLOCK:
+                                x = idx.setdefault(n, ([], [], []))
+                                x[0].append(r)
+                                x[1].append(t)
+                                x[2].append(at[id(Ec)][n][c])
+                u_c = {n: torch.zeros(R, T, Ec.width(n), device=dev) for n in nat.names}
+                for n, x in idx.items():
+                    u_c[n][tuple(torch.tensor(v, device=dev) for v in x)] = 1.0
+            lc = Ec.graph_log_probs(Ec.plan(G, semantics="c", cuts=C), u_c)
+            out, r0 = [], 0
+            for _, c in items:
+                out.append((lm[r0:r0 + len(c)], lv[r0:r0 + len(c)], lc[r0:r0 + len(c)]))
+                r0 += len(c)
+            return out
+
+        sides.spec, sides.split, sides.engines, sides.at, sides.many = spec, split, (Em, Ev, Ec), at, many
         return sides
 
     @torch.no_grad()

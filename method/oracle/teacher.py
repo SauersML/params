@@ -762,7 +762,7 @@ class Acceptance:
         self.ge, self.tx, self.kinds, self.mode, self.calls, self.pool_adv = ge, tx, tuple(kinds), mode, 0, pool
         self._phi_base = {}                                  # (the current circuit's key) -> its reward-mode row
         self.draws, self.refused, self.pool, self.rank_floor = draws, [], None, {}
-        self._screens = {}                                  # "floors": flips' shortlists
+        self._screens, self._held_rows = {}, {}             # "floors": flips' shortlists; (family, node set) -> row
         if draws in ("discriminating", "fresh", "fv") and mode != "pp":
             raise ValueError("discriminating draws score s_track_pp: mode pp")
 
@@ -905,17 +905,23 @@ class Acceptance:
             alive = [i for i in range(len(out)) if under(i) is None]
             if fam not in floors or not alive:
                 continue
-            cg = [goal_eval._c_graph(graphs[i], tx.targets, nat.C) for i in alive]
-            if fam == "edges":
+            keys = [(fam, tuple(sorted(graphs[i].node_set()))) for i in alive]  # a candidate node set's rows kept: a later
+            todo = [i for i, k in zip(alive, keys) if k not in self._held_rows]  # round asks again for 1 in 5
+            cg = [goal_eval._c_graph(graphs[i], tx.targets, nat.C) for i in todo]
+            if not cg:
+                rows = []
+            elif fam == "edges":
                 rows = [{"s_edges": goal_eval._fid(e0, r["kl_edges_c"], r["kl_edges_vpd"]) if r.get("kl_edges_c") is not None else None}
-                        for r in ge._edge_family(tx, cg, goal_eval.DRAWS, True)]
+                        for r in ge._edge_family(tx, cg, goal_eval.DRAWS)]   # (KLs alone: no reads)
             elif fam == "omitted":
                 rows = ge._omitted_family(tx, cg)
             else:
                 rows = [{"f1_flips_c": r.get("f1_flips_omitted", {})} for r in
                         ge.adversary_flips(tx, cg, self.pool_adv, "omitted", upto=goal_eval.FLIP_TERM, screens=self._screens)]
-            for i, r in zip(alive, rows):
-                out[i][fam] = goal_eval.family_score(r, fam)
+            for i, r in zip(todo, rows):
+                self._held_rows[(fam, tuple(sorted(graphs[i].node_set())))] = goal_eval.family_score(r, fam)
+            for i, k in zip(alive, keys):
+                out[i][fam] = self._held_rows[k]
         for i, on in enumerate(ons):
             f = under(i)
             if f is not None:

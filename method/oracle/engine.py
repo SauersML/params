@@ -102,7 +102,7 @@ class Engine:
         e._targets = torch.tensor(e.targets, device=self.dev)
         e._causal_targets = torch.arange(e.T, device=self.dev)[None, :] <= e._targets[:, None]
         e.__dict__.pop("_xr", None)  # the text's own x run (path_patched) and prefix (log_probs' start), made when asked
-        e.__dict__.pop("_pre", None)
+        e.__dict__.pop("_pre", None)  # (per text)
         e._search = e.hidden if self._search == self.hidden else torch.compile(e.hidden, dynamic=False)
         return e
 
@@ -169,13 +169,14 @@ class Engine:
             x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, masks[name("c_fc")], rec)), masks[name("down_proj")], rec)
         return norm(x, -1)[:, self._targets]  # the final norm over every position, as vpd_model.Target.hidden
 
-    def _prefix(self) -> list:
-        """Each layer's rotated keys and values [1, H, T, hd] of the run with every column at 1 (kept: log_probs'
-        start)."""
-        if "_pre" not in self.__dict__:
+    def _prefix(self, base: dict | None = None) -> list:
+        """Each layer's rotated keys and values [1, H, T, hd] of the run with every column at 1, or at base's masks
+        ({site: [1, T or 1, K]}; kept per base object: log_probs' start)."""
+        kept = self.__dict__.setdefault("_pre", {})
+        if id(base) not in kept:
             tg, T, H, hd = self.tg, self.T, self.H, self.hd
             norm, act = self._steps(False)
-            ones = {n: torch.ones(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
+            ones = base if base is not None else {n: torch.ones(1, 1, self.width(n), device=self.dev) for n in self.nat.names}
             x, out = self.emb, []
             with torch.no_grad():
                 for i in range(tg.n_layer):
@@ -188,16 +189,16 @@ class Engine:
                     x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(1, T, -1), ones[name("o_proj")])
                     h = norm(x, 2 * i + 1)
                     x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, ones[name("c_fc")])), ones[name("down_proj")])
-            self._pre = out
-        return self._pre
+            kept[id(base)] = (base, out)  # (base kept alive: its id names it)
+        return kept[id(base)][1]
 
-    def _hidden_from(self, masks: dict, start: int) -> torch.Tensor:
-        """hidden()'s final normed stream at the targets with every mask 1 before start: the positions from start on,
-        attending to _prefix's keys and values before it."""
+    def _hidden_from(self, masks: dict, start: int, base: dict | None = None) -> torch.Tensor:
+        """hidden()'s final normed stream at the targets with every mask 1 (or base's) before start: the positions from
+        start on, attending to _prefix's keys and values before it."""
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
         B = next(iter(masks.values())).shape[0]
         norm, act = self._steps(False)
-        pre, Tn = self._prefix(), T - start
+        pre, Tn = self._prefix(base), T - start
         causal = torch.arange(T, device=self.dev)[None, :] <= torch.arange(start, T, device=self.dev)[:, None]  # [Tn, T]
         cut = {n: (m[:, start:] if m.shape[1] > 1 else m) for n, m in masks.items()}
         x = self.emb[:, start:].expand(B, -1, -1)
@@ -233,12 +234,14 @@ class Engine:
         """KL in bits of the model at the targets from each row's masked run [B] (summed over the targets)."""
         return carry.kl(self.ref, self.log_probs(masks, precision))
 
-    def log_probs(self, masks: dict, precision: str = "score", reads: dict | None = None, start: int = 0):
+    def log_probs(self, masks: dict, precision: str = "score", reads: dict | None = None, start: int = 0,
+                  base: dict | None = None):
         """Each row's masked run's next-token log probabilities at the targets [B, len(targets), V], float32. reads:
         {site: (rows, positions, columns)} (columns the engine's): also those subcomponents' activations, (log q,
         {site: [n]}) ("score" only). start: every mask is 1 before this position (no later than the first target), so
         those positions are the run with every column at 1 (_prefix, kept): only the positions from start on are
-        computed (float32, no reads; goal_eval's real-model removals)."""
+        computed (float32, no reads; goal_eval's real-model removals). base: the masks every row has before start
+        ({site: [1, T or 1, K]}, in place of 1; the same object for runs sharing its prefix)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if reads is not None and precision != "score":
@@ -248,7 +251,7 @@ class Engine:
         rec = None if reads is None else (reads, {})
         with _precision(precision, self.dev), self._dtype(precision):
             if start:
-                h = self._hidden_from(masks, start)
+                h = self._hidden_from(masks, start, base)
             else:
                 h = self.hidden(masks, search=False, rec=rec) if precision == "score" else self._search(masks, search=True)
         lq = torch.log_softmax(self.tg.unembed(h.float()), -1)  # the logits in float32 at every precision
@@ -490,7 +493,7 @@ class Engine:
                         precision: str = "score", patch: dict | None = None, reads: dict | None = None, keep: dict | None = None,
                         reuse: tuple | None = None, ewn: torch.Tensor | None = None, own: torch.Tensor | None = None,
                         outputs: dict | None = None, rec_out: dict | None = None, rows: list | None = None,
-                        off: list | None = None):
+                        off: list | None = None, add: dict | None = None, rest: dict | None = None):
         """Each row's graph run's next-token log probabilities at the targets [B, len(targets), V], float32. patch:
         {site: (bool [B, T, K], values [B, T, K])}, those subcomponents' activations fixed (an interchange). reads as
         log_probs': (log q, {site: [n]}). keep, a dict, receives the run's states for reuse (each layer's keys and
@@ -509,7 +512,11 @@ class Engine:
         t + 1]}, attention rows used in place of the run's own at those reads (goal_eval.graph_ref's rows,
         pattern_family; float32 runs, with reuse at reads from its start on). off: per row None or a list of the plan's circuit nodes (site,
         position, subcomponent) taken out of that row's circuit (C's semantics: outside it, at u; with their connections
-        at strength 0, the run of the graph without them: line deletions on one plan)."""
+        at strength 0, the run of the graph without them: line deletions on one plan), or for a one-graph plan {site:
+        bool [B, k]} over its entries of that site (_without). add: {site: [B or 1, T, d_out]}
+        added to the site's output (outside subcomponents fixed at given activations: goal_eval's donors on a few
+        columns); rest: {site: (W [d_in, d_out], bool [B or 1, T])}, the site's input times W added where the mask is on
+        (the columns left out of the engine live there); both float32 runs of every position."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if (keep is not None or reuse is not None) and (precision != "score" or patch is not None or reads is not None):
@@ -518,6 +525,8 @@ class Engine:
             raise ValueError("outputs and rec_out are float32 runs of every position")
         if (ewn is not None or own is not None) and precision != "score":
             raise ValueError("separate norm strengths are float32 runs (vpd_model's own norm)")
+        if (add is not None or rest is not None) and (precision != "score" or reuse is not None):
+            raise ValueError("add and rest are float32 runs of every position")
         if rows is not None and (precision != "score" or (reuse is not None and any(t < reuse[2] for d in rows for _, t in (d or {})))):
             raise ValueError("rows are float32 runs, at reads from reuse's start on")
         if reuse is not None and not 0 < reuse[2] <= min(self.targets):
@@ -533,28 +542,80 @@ class Engine:
             h = self._graph_hidden(p, self._zeros() if u is None else u, None if ew is None else ew.reshape(-1),
                                    None if ow is None else ow.reshape(-1), B, precision != "score", patch, rec, keep, reuse,
                                    None if ewn is None else ewn.reshape(-1), None if own is None else own.reshape(-1), outputs, rec_out,
-                                   rows)
+                                   rows, add, rest)
         lq = torch.log_softmax(self.tg.unembed(h.float()), -1)
         return lq if rec is None else (lq, rec[1])
 
-    def _without(self, p: dict, off: list) -> dict:
-        """A laid-out plan with some rows' circuit nodes dropped from its circuit and query-key tables (graph_log_probs'
-        off): those nodes then stand at u, outside the circuit, in their rows."""
-        T, drop = self.T, {}
-        for b, nds in enumerate(off):
-            for n, t, c in nds or []:
-                cols = self.columns[n]
-                k = c if cols is None else int((cols == c).nonzero().flatten()[0])
-                drop.setdefault(n, []).append((b * T + t) * self.width(n) + k)
-        out = dict(p)
+    def _without(self, p: dict, off) -> dict:
+        """A laid-out plan with some rows' circuit nodes dropped (graph_log_probs' off): out of its circuit and
+        query-key tables, so they stand at u outside the circuit in their rows; their connections, stated or not, gone
+        (a reader takes nothing from them, as from any outside writer); a stated query-key pair naming one gone too,
+        its read's split without it (the read keeps its entry): _drop_nodes' graph. off: per row None or a list of
+        nodes, or {site: bool [B, k]} over a one-graph plan's entries of that site (its nodes in the plan's order:
+        sorted by position, then column; the same order in the query-key table), row by row."""
+        T = self.T
+        base = ("B", "E", "O", "semantics", "qk", "nodes", "readers", "writers", "edges", "out", "pairs", "positions")
+        out = {k: v for k, v in p.items() if k in base}  # (tables derived from the old ones are made again)
+        packed = {}  # per site the dropped (row, position, column)s, packed (b T + t) width + c
+        if isinstance(off, dict):
+            for n, (b, t, c) in p["nodes"].items():
+                if n in off:
+                    drop = off[n].to(self.dev).reshape(-1)
+                    if bool(drop.any()):
+                        packed[n] = ((b[drop] * T + t[drop]) * self.width(n) + c[drop])
+        else:
+            at = {}  # per site, a subcomponent's column (made once a call: no device read per node)
+            lists = {}
+            for b, nds in enumerate(off):
+                for n, t, c in nds or []:
+                    cols = self.columns[n]
+                    if cols is not None and n not in at:
+                        at[n] = {x: i for i, x in enumerate(cols.tolist())}
+                    lists.setdefault(n, []).append((b * T + t) * self.width(n) + (c if cols is None else at[n][c]))
+            packed = {n: torch.tensor(v, device=self.dev) for n, v in lists.items()}
+        if not packed:
+            return out
+
+        def hit(n, tab):  # bool over a table's rows of site n: the dropped ones
+            b, t, c = tab
+            return torch.isin((b * T + t) * self.width(n) + c, packed[n]) if n in packed else None
         for key in ("nodes", "qk"):
-            tab = {}
-            for n, (b, t, c) in p[key].items():
-                if n in drop:
-                    keep = ~torch.isin((b * T + t) * self.width(n) + c, torch.tensor(drop[n], device=self.dev))
-                    b, t, c = b[keep], t[keep], c[keep]
-                tab[n] = (b, t, c)
-            out[key] = tab
+            out[key] = {}
+            for n, tab in p[key].items():
+                h = hit(n, tab)
+                out[key][n] = tab if h is None else tuple(x[~h] for x in tab)
+        dw = {n: hit(n, tab) for n, tab in p["writers"].items() if n in packed}
+        dr = {n: hit(n, tab) for n, tab in p["readers"].items() if n in packed}
+        edges = {}
+        for (rn, wn), (ri, wi, j, fx) in p["edges"].items():
+            keep = torch.ones(len(ri), dtype=torch.bool, device=self.dev)
+            if rn in dr:
+                keep &= ~dr[rn][ri]
+            if wn in dw:
+                keep &= ~dw[wn][wi]
+            edges[(rn, wn)] = (ri[keep], wi[keep], j[keep], fx[keep])
+        out["edges"] = edges
+        out["out"] = {wn: (tuple(x[~dw[wn][v[2]]] for x in v) if wn in dw else v) for wn, v in p["out"].items()}
+        if p.get("pairs"):
+            gone = {}  # per (row, query or key site) the dropped (position, column)s
+            for n, v in packed.items():
+                if n.endswith(("q_proj", "k_proj")):
+                    W = self.width(n)
+                    for x in v.tolist():
+                        gone.setdefault((x // W // T, n), set()).add(((x // W) % T, x % W))
+            pairs = {}
+            for layer, lst in p["pairs"].items():
+                nq, nk = native.site_name(layer, "q_proj"), native.site_name(layer, "k_proj")
+                new = []
+                for b, t, stated, qs, ks in lst:
+                    gq, gk = gone.get((b, nq), set()), gone.get((b, nk), set())
+                    if gq or gk:
+                        stated = [(qa, kb) for qa, kb in stated if (qa is None or (t, qa) not in gq) and (kb is None or tuple(kb) not in gk)]
+                        qs = [c for c in qs if (t, c) not in gq]
+                        ks = [(tt, c) for tt, c in ks if (tt, c) not in gk]
+                    new.append((b, t, stated, qs, ks))
+                pairs[layer] = new
+            out["pairs"] = pairs
         return out
 
     @staticmethod
@@ -1472,7 +1533,7 @@ class Engine:
 
     def _graph_hidden(self, p: dict, u: dict, ew, ow, B: int, fused: bool, patch: dict | None = None, rec: tuple | None = None,
                       keep: dict | None = None, reuse: tuple | None = None, ewn=None, own=None, outputs=None,
-                      rec_out=None, rows: list | None = None) -> torch.Tensor:
+                      rec_out=None, rows: list | None = None, add: dict | None = None, rest: dict | None = None) -> torch.Tensor:
         """The final normed residual stream at the targets [B, len(targets), d] of the graph runs. fused (a search's
         steps): torch's fused norms and GELU, and the last layer's queries, attention output and MLP at the targets
         alone (with reads, every position). keep and reuse: graph_log_probs'."""
@@ -1640,6 +1701,10 @@ class Engine:
                 o = (A[kd] * scale.to(A[kd].dtype)) @ U
                 o = o + self._mm(z, Rw) if self.fixed else o
                 o = o if self.b[n] is None else o + self.b[n]
+                if add is not None and n in add:  # fixed outside activations' writes
+                    o = o + add[n].to(o.dtype)
+                if rest is not None and n in rest:  # the columns left out, live where the mask is on
+                    o = o + self._mm(z, rest[n][0]) * rest[n][1][..., None].to(o.dtype)
                 if n in blocks:  # its blocks' outputs, from their inputs (zb: with their connections' shares)
                     b, t, _ = p["readers"][n + BK]
                     o = o.index_put((b, t), block_out(n, zb.pop(n) if n in zb else z[b, t]).to(o.dtype))

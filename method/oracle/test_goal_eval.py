@@ -875,12 +875,7 @@ def test_node_family_is_the_masked_runs(tiny):
     draws = 3
     got = ge._node_family(tx, graphs, draws)
     for g, row in zip(graphs, got):
-        gn = sorted(g.node_set())
-        rng = ge._rng(tx, g, "nodes")
-        drops = []
-        for j in range(draws):
-            d = [nd for nd in gn if rng.random() < (j + 0.5) / draws]
-            drops.append(d or [gn[int(rng.integers(len(gn)))]])
+        drops = ge._node_draws(tx, sorted(g.node_set()), draws)  # (common random numbers)
 
         def without(base, d):
             m = {n: base[n].clone() for n in nat.names}
@@ -1139,10 +1134,8 @@ def test_family_reads_are_graph_ref(tiny):
 
     for g, row in zip(graphs, ge._node_family(tx, graphs, draws, reads=True)):
         gn = sorted(g.node_set())
-        rng = ge._rng(tx, g, "nodes")
         runs = []
-        for j in range(draws):
-            d = [nd for nd in gn if rng.random() < (j + 0.5) / draws] or [gn[int(rng.integers(len(gn)))]]
+        for d in ge._node_draws(tx, gn, draws):  # (common random numbers)
             ones = {n: torch.ones(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
             gm = ge.masks(g, T) if g.complete else None
             for n, t, c in d:
@@ -1920,9 +1913,9 @@ def test_omitted_family(tiny):
 
 def test_line_leave_one_out(tiny):
     """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row
-    with point, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run and N from its
-    necessity_spec on NEC_CONTROLS_LOO controls (the held families, LOO_HELD, at the answer's), its bits size_bits of the
-    deleted graph, compact against bits_start."""
+    with point, nodes, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run and N
+    from its necessity_spec on NEC_CONTROLS_LOO controls (the held families, LOO_HELD, at the answer's), its bits
+    size_bits of the deleted graph, compact against bits_start."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     sub = every[::8]
@@ -1945,11 +1938,11 @@ def test_line_leave_one_out(tiny):
     row = dict(base)
     for k in ("s_point", "s_wiring", "s_point_c", "n_point", "draws_point", "s_track_pp", "draws_track_pp", "s_interchange_pp",
               "draws_interchange_pp", "s_pattern", "draws_pattern", "n_spec", "n_spec_raw", "draws_n_spec", "d_target", "d_control",
-              "d_target_vpd", "d_control_vpd"):
+              "d_target_vpd", "d_control_vpd", "s_nodes", "s_nodes_raw", "draws_nodes", "kl_nodes_c", "kl_nodes_vpd"):
         row[k] = own.get(k)
     row["rl_terms"] = {**base["rl_terms"], **{k: own["rl_terms"].get(k)
-                       for k in ("s_point_c", "s_track_pp", "s_interchange_pp", "s_pattern", "n_spec")}}
-    for f in ("point", "track_pp", "interchange_pp", "pattern", "N"):
+                       for k in ("s_point_c", "s_track_pp", "s_interchange_pp", "s_pattern", "n_spec", "s_nodes")}}
+    for f in ("point", "nodes", "track_pp", "interchange_pp", "pattern", "N"):
         row.pop(f"eps_{f}", None)
     fams = ((tx.__dict__.get("_tau") or {}).get("search") or {}).get("families")  # line_loo's: the text's, once tau is scored
     want = goal_eval.phi(row, families=fams)[0]
@@ -1967,9 +1960,7 @@ def test_node_family_against_the_models_response(tiny):
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     g = native.Graph(every[::3], complete=True)
     row = ge._node_family(tx, [g], 4)[0]
-    rng = ge._rng(tx, g, "nodes")
-    gn = sorted(g.node_set())
-    d0 = [nd for nd in gn if rng.random() < 0.5 / 4] or [gn[int(rng.integers(len(gn)))]]
+    d0 = ge._node_draws(tx, sorted(g.node_set()), 4)[0]
     full, _ = naive(nat, tx.ids)
     on = {n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
     for n, t, c in d0:
@@ -2130,7 +2121,7 @@ def test_c_takes_the_lower_of_graph_and_every_connection(tiny):
         kc = float(carry.kl(tx.ref, ge.runs(tx.ids, tx.targets, [on], True))[0])
         assert abs(f - goal_eval._fid(e0, kc, row["kl_flips_omitted"][m][1])) < 1e-6
         assert row["f1_flips_c"][m] == min(row["f1_flips_omitted"][m], f)
-    terms = [row["s_point_c"], row["s_nodes"], row["s_edges"], row["f1_flips_c"][goal_eval.FLIP_TERM]]
+    terms = [x for x in (row["s_point_c"], row["s_nodes"], row["s_edges"], row["f1_flips_c"][goal_eval.FLIP_TERM]) if x is not None]
     terms += [row[k] for k in ("s_track_pp", "s_interchange_pp", "s_patching_near", "s_patching_far", "s_pattern") if row[k] is not None]
     assert row["c"] == goal_eval._harmonic(terms)
 
@@ -2891,3 +2882,45 @@ def test_one_plan_reuses_the_states_before_the_circuit(tiny, monkeypatch):
         monkeypatch.setattr(goal_eval.GoalEval, "LOO_REUSE", True)
         for x, y in zip(a["variants"], b["variants"]):
             assert abs(x["phi"] - y["phi"]) < 1e-5, (x["phi"], y["phi"])
+
+
+def test_phi_variants_nodes_and_patching_are_fidelitys(tiny):
+    """phi_variants recomputes the node family and activation patching per variant (the lead's 10-13: s_nodes binds
+    most starts): on node subsets of a complete set, each variant's s_nodes and s_patching_near/far equal fidelity's on
+    the variant graph itself (its own draws, the same donors), within 1e-5."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    pool = tiny_pool(nat, tx.ids)
+    gr = native.Graph(every[::4], complete=True)
+    nodes = sorted(gr.node_set())
+    subsets = [nodes, nodes[::2], nodes[1::3], nodes[: len(nodes) // 2]]
+    base = ge.fidelity(tx, [gr], pool, mode="reward", split="search", interchange=4, changed=4)[0]
+    got = ge.phi_variants(tx, gr, ge.keep_of(tx, gr, subsets), pool, draws=4, base=base)
+    rows = ge.fidelity(tx, [native.Graph(s, complete=True) for s in subsets], pool, mode="reward", split="search", interchange=4, changed=4)
+    for v, r in zip(got["variants"], rows):
+        for k in ("s_nodes", "s_patching_near", "s_patching_far"):
+            a, b = v["row"].get(k), r.get(k)
+            assert (a is None) == (b is None) and (a is None or abs(a - b) < 1e-5), (k, a, b)
+
+
+def test_node_draws_are_common_across_subsets(tiny):
+    """The node family's draws use common random numbers (_node_draws): a subset of a circuit's nodes draws the
+    circuit's draws less its missing nodes (a draw left empty takes one unit), and the same call gives the same draws."""
+    nat, ge, tx = tiny
+    units = sorted(native.Graph(masks=tx.vpd).node_set())[::3]
+    full = ge._node_draws(tx, units, 16)
+    sub = [u for i, u in enumerate(units) if i % 4]
+    part = ge._node_draws(tx, sub, 16)
+    for a, b in zip(full, part):
+        kept = [x for x in a if x in set(sub)]
+        assert b == kept or (not kept and len(b) == 1 and b[0] in set(sub)), (a, b)
+    assert ge._node_draws(tx, units, 16) == full
+
+
+def test_line_loo_without_nodes(tiny):
+    """line_loo on an answer with no nodes (S1 drops every node of some samples; primerl's crash at d2ff41b) returns
+    its phi and no lines."""
+    nat, ge, tx = tiny
+    pool = tiny_pool(nat, tx.ids)
+    out = ge.line_loo(tx, native.Graph(), pool, draws=4, bits_start=1000.0)
+    assert out["lines"] == [] and out["phi"] is not None

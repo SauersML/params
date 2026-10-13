@@ -1093,14 +1093,20 @@ def test_evaluate_shards_cover_every_text_once(tmp_path, monkeypatch):
     paths = []
     for name in ("t_a", "t_b", "t_c"):
         p = tmp_path / (name + ".json")
-        p.write_text(json.dumps({"id": name}))
+        p.write_text(json.dumps({"id": name, "prompts": [{"token_ids": [1, 2], "target_positions": [1]}]}))
         paths.append(p)
     monkeypatch.setitem(sys.modules, "native", SimpleNamespace(tasks=lambda split: paths))
+    starts = []
+    ge = SimpleNamespace(text=lambda ids, targets, task: ("tx", task["id"]), start_set=lambda tx, split: starts.append((tx, split)))
     monkeypatch.setattr(components, "baseline_texts", lambda *a: {"empty": "baseline"})
     monkeypatch.setattr(components, "reward", lambda ge, task, ev, texts, **kw: [
         {"reward": 0.1, "valid": True, "row": {"nodes": 1}, "circuit_reward": 0.1, "phi": 0.0} for _ in texts])
     rows = {p.stem: {"qa": []} for p in paths}
     sets = {"s": {p.stem: [("x", False)] for p in paths}}
     quiet = lambda *a, **k: None  # noqa: E731
-    got = [components.evaluate(None, "heldout", rows, sets, 3, log=quiet, shard=(k, 2)) for k in (0, 1)]
+    got = [components.evaluate(ge, "heldout", rows, sets, 3, log=quiet, shard=(k, 2)) for k in (0, 1)]
     assert [[q["task"] for q in g["per_question"]["s"]] for g in got] == [["t_a", "t_c"], ["t_b"]]
+    # the cost columns: each answer's verification seconds, each text's start built from a fresh Text on the eval split
+    assert all(q["samples"][0]["score_seconds"] >= 0 for g in got for q in g["per_question"]["s"])
+    assert set(got[0]["costs"]) == {"t_a", "t_c"} and set(got[0]["costs"]["t_a"]) == {"baseline_score_seconds", "start_seconds"}
+    assert starts == [(("tx", "t_a"), "eval"), (("tx", "t_c"), "eval"), (("tx", "t_b"), "eval")]

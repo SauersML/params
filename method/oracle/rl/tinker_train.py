@@ -276,7 +276,8 @@ def service_client():
 
 def sample(a) -> None:
     """N answers per question from a trained state (--init) or the base model alone, one sampling call per question:
-    {"task", "sample", "text", "finish", "tokens"} per answer. --prefix: the answer starts with this text (its tokens
+    {"task", "sample", "text", "finish", "tokens", "seconds"} per answer, seconds from its call's submission to its result
+    (every question's call in flight at once, so a text's wait in the shared queue counts; the cost columns' oracle time). --prefix: the answer starts with this text (its tokens
     after the chat prompt; the written text holds it), e.g. "CIRCUIT:\nANSWER 1:" for answers without a circuit."""
     import tinker
     from tinker_cookbook import renderers
@@ -293,19 +294,30 @@ def sample(a) -> None:
     futs = [(q, renderer.build_generation_prompt([{"role": "user", "content": q["question"]}])) for q in questions]
     if head:
         futs = [(q, prompt.append(tinker.types.EncodedTextChunk(tokens=head))) for q, prompt in futs]
-    futs = [(q, prompt, sampler.sample(prompt=prompt, num_samples=a.samples, sampling_params=fitting(tinker, params, prompt, a.max_tokens)))
-            for q, prompt in futs]
+    from concurrent.futures import ThreadPoolExecutor
+
+    t0 = time.perf_counter()
+    futs = [(q, prompt, sampler.sample(prompt=prompt, num_samples=a.samples, sampling_params=fitting(tinker, params, prompt, a.max_tokens)),
+             time.perf_counter()) for q, prompt in futs]
+
+    def done(fut, sent):  # each call's own result time, not the order they are read in
+        res = fut.result()
+        return res, time.perf_counter() - sent
+
+    with ThreadPoolExecutor(max(len(futs), 1)) as pool:
+        waits = [pool.submit(done, fut, sent) for _, _, fut, sent in futs]
     with a.out.open("w") as f:
-        for q, prompt, fut in futs:
-            res = fut.result()
+        for (q, prompt, _, _), w in zip(futs, waits):
+            res, secs = w.result()
             hits = res.prompt_cache_hit_tokens
             spend.add("sample", prefill=prompt.length - hits, cached=hits + (a.samples - 1) * prompt.length,
                       sampled=sum(len(s.tokens) for s in res.sequences))
             for k, s in enumerate(res.sequences):
                 text, think = answer_of(renderer, tokenizer, s.tokens)
                 f.write(json.dumps({"task": q["task"], "sample": k, "text": a.prefix + text, "thinking_tokens": think,
-                                    "finish": str(s.stop_reason), "tokens": len(s.tokens)}) + "\n")
-    print(json.dumps({"questions": len(questions), "samples": a.samples, "total_usd": spend.total}), flush=True)
+                                    "finish": str(s.stop_reason), "tokens": len(s.tokens), "seconds": round(secs, 2)}) + "\n")
+    print(json.dumps({"questions": len(questions), "samples": a.samples, "total_usd": spend.total,
+                      "wall_seconds": round(time.perf_counter() - t0, 1)}), flush=True)
 
 
 def readers(a) -> None:

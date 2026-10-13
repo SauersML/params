@@ -2899,7 +2899,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
 
     invalid = V3_INVALID
     per = {s: [] for s in sets}
-    base, base_terms = {}, {}
+    base, base_terms, costs = {}, {}, {}
     mine = [p for p in native.tasks(split)[:n] if p.stem in rows]
     for p in mine[shard[0]::shard[1]] if shard else mine:  # shard (k, n): every n-th text from the k-th (one of n processes)
         task = json.loads(p.read_text())
@@ -2916,7 +2916,9 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
             scored = reward(ge, task, ev, [x for x, _ in got], tokens=[n for _, n in got], e1=bits, cache=cache,
                             ee=ee, edit_best=edit_best, vs=vs, split="eval", teacher=teachers.get(p.stem) if teachers else None,
                             lines=lines, retain_calibration=retain_calibration, node_cap=node_cap, invariants=invariants)
-            entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes")}
+            verify = (time.perf_counter() - t0) / len(got)  # the verification's cost per answer (the set's own Text built too)
+            entry = {"task": p.stem, "samples": [{k: v for k, v in r.items() if k != "row"} | {"nodes": (r["row"] or {}).get("nodes"),
+                                                                                               "score_seconds": round(verify, 2)}
                                                  for r in scored]}
             log(f"  {p.stem} {name}: {len(got)} answers, nodes {[x['nodes'] for x in entry['samples']]}, "
                 f"{time.perf_counter() - t0:.0f} s", flush=True)
@@ -2940,6 +2942,10 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
         scored_base = reward(ge, task, {**ev, "qa": [], "edits": []}, list(names.values()), split="eval",
                              teacher=teachers.get(p.stem) if teachers else None, node_cap=None, retain_calibration=retain_calibration)
         log(f"  {p.stem} baselines: {list(names)}, {time.perf_counter() - t0:.0f} s", flush=True)
+        costs[p.stem] = {"baseline_score_seconds": round((time.perf_counter() - t0) / max(len(names), 1), 2)}
+        t0 = time.perf_counter()  # the start's own cost from the text alone: a fresh Text's probe and changed-input draws
+        ge.start_set(ge.text(task["prompts"][0]["token_ids"], task["prompts"][0]["target_positions"], task=task), "eval")
+        costs[p.stem]["start_seconds"] = round(time.perf_counter() - t0, 2)
         for (b, text), r in zip(names.items(), scored_base):
             base.setdefault(p.stem, {})[b] = r["circuit_reward"]
             base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),
@@ -2951,7 +2957,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                                          "task_input_sha256": digest(task),
                                          "per_question": {s: per[s][-1] for s in sets},
                                          "baselines": base.get(p.stem, {}),
-                                         "baseline_terms": base_terms.get(p.stem, {})})
+                                         "baseline_terms": base_terms.get(p.stem, {}), "costs": costs[p.stem]})
         log(p.stem + ": " + ", ".join(f"{s} {per[s][-1]['samples'][0]['reward']:+.3f}" for s in sets), flush=True)
     report = {}
     groups = {"all": None}
@@ -2965,7 +2971,7 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
 
             log(traceback.format_exc(), flush=True)
             report[group] = {"error": repr(e)}
-    return {"report": report, "per_question": per, "baselines": base, "baseline_terms": base_terms}
+    return {"report": report, "per_question": per, "baselines": base, "baseline_terms": base_terms, "costs": costs}
 
 
 def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, base_terms: dict | None = None) -> dict:
@@ -3189,7 +3195,7 @@ def main():
         labels = {r["task"]: r for r in map(json.loads, args.labels.read_text().splitlines())} if args.labels else None
         groups = {"all": None} | ({"local": True, "non-local": False} if labels else {})
         out = {"report": {g: _report(per, base, None, labels, w, bt) for g, w in groups.items()}, "per_question": per,
-               "baselines": base, "baseline_terms": bt}
+               "baselines": base, "baseline_terms": bt, "costs": {t: v for x in parts for t, v in (x.get("costs") or {}).items()}}
         args.out.write_text(json.dumps(out))
         print(json.dumps(out["report"], indent=1), flush=True)
         return

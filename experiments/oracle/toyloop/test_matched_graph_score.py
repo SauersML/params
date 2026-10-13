@@ -1,4 +1,8 @@
 import unittest
+import json
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
 
 import matched_graph_score as scorer
 
@@ -51,6 +55,48 @@ class MatchedScoreTests(unittest.TestCase):
         self.assertIsNotNone(scorer.answer_error(dict(old_answer, finish='length'), 'legacy_mermaid_english'))
         with self.assertRaises(ValueError):
             scorer.answer_error(old_answer, 'anything_goes')
+
+    def test_partition_is_stable_balanced_and_case_disjoint(self):
+        panel = [{'inputs': [0] * count, 'edits': [0]} for count in (1, 9, 3, 9, 2)]
+        self.assertEqual(scorer.partition(panel, 2), [[1, 2], [0, 3, 4]])
+        self.assertEqual(sorted(sum(scorer.partition(panel, 4), [])), list(range(5)))
+        for workers in (0, 6, True):
+            with self.assertRaises(ValueError):
+                scorer.partition(panel, workers)
+
+    def test_merge_requires_disjoint_complete_worlds_and_binds_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            panel = [{'id': str(i), 'stratum': 'new_model', 'inputs': [0], 'edits': [0]} for i in range(2)]
+            manifest = root / 'manifest.json'
+            manifest.write_text(json.dumps({'panel': panel, 'arms': ['point'], 'forward_cap': 6}))
+            shards = []
+            for i in range(2):
+                shard = root / str(i); shard.mkdir(); shards.append(shard)
+                (shard / 'tensor').write_bytes(b'opaque offline fixture')
+                row = {'stratum': 'new_model', 'case': str(i), 'arm': 'point',
+                       'edit_index': 0, 'input': 0, 'kind': 'no_edit', 'input_role': 'disclosed',
+                       'valid': False, 'kl_bits': None, 'top': None, 'reference_top': 1,
+                       'file': 'tensor', 'sha256': scorer.sha(shard / 'tensor')}
+                (shard / 'results.jsonl').write_text(json.dumps(row)+'\n')
+                scorer.write(shard / 'contract.json', {'worker': i, 'workers': 2,
+                    'case_indices': [i], 'manifest_sha256': scorer.sha(manifest),
+                    'responses_sha256': 'response', 'scorer_sha256': scorer.sha(scorer.__file__),
+                    'forward_cap': 3, 'global_forward_cap': 6})
+                scorer.write(shard / 'complete.json', {'forward_cap': 3, 'actual_forwards': 2,
+                    'candidate_worlds': 1, 'models': 1, 'arms': ['point'], 'case_indices': [i]})
+            args = SimpleNamespace(manifest=manifest, manifest_sha256=scorer.sha(manifest),
+                responses_sha256='response', workers=2, shard=shards, out=root/'merged')
+            scorer.merge(args)
+            self.assertEqual(json.loads((args.out/'receipt.json').read_text())['candidate_worlds'], 2)
+            self.assertTrue(all('artifact_root' in json.loads(x) for x in (args.out/'results.jsonl').read_text().splitlines()))
+            args.out = root/'bad'; args.shard = [shards[0], shards[0]]
+            with self.assertRaises(ValueError): scorer.merge(args)
+            args.shard = shards[:1]
+            with self.assertRaises(ValueError): scorer.merge(args)
+            args.shard = shards
+            (shards[1]/'results.jsonl').write_text('')
+            with self.assertRaises(ValueError): scorer.merge(args)
 
     def test_assets_cannot_escape_manifest_root(self):
         for path in ('/tmp/escape', '../escape', 'inside/../../escape'):

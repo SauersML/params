@@ -111,12 +111,101 @@ def summarize(rows, expected_keys):
             'groups': result}
 
 
+def partition(panel, workers):
+    """Largest-first greedy world balancing; stable original-index ties."""
+    if type(workers) is not int or not 1 <= workers <= len(panel):
+        raise ValueError('worker count must be within panel size')
+    groups, loads = [[] for _ in range(workers)], [0] * workers
+    counts = [len(row['inputs']) * len(row['edits']) for row in panel]
+    for index in sorted(range(len(panel)), key=lambda i: (-counts[i], i)):
+        worker = min(range(workers), key=lambda w: (loads[w], w))
+        groups[worker].append(index)
+        loads[worker] += counts[index]
+    return [sorted(group) for group in groups]
+
+
+def cartesian(panel, arms, indices):
+    return {(panel[i]['stratum'], panel[i]['id'], arm, edit, inp)
+            for i in indices for arm in arms for edit in range(len(panel[i]['edits']))
+            for inp in range(len(panel[i]['inputs']))}
+
+
+def merge(args):
+    """Read shard metadata/rows in place; tensor files stay in their shards."""
+    if sha(args.manifest) != args.manifest_sha256 or args.out.exists():
+        raise ValueError('frozen manifest and fresh output required')
+    manifest = json.loads(args.manifest.read_text())
+    panel, arms = manifest['panel'], manifest['arms']
+    assignment = partition(panel, args.workers)
+    global_cap = sum(len(r['inputs']) * len(r['edits']) * (2 + len(arms)) for r in panel)
+    if manifest['forward_cap'] != global_cap:
+        raise ValueError('global forward cap mismatch')
+    if len(args.shard) != args.workers:
+        raise ValueError('exactly one complete shard per worker required')
+    rows, seen, receipts = [], set(), []
+    actual_forwards = 0
+    for directory in args.shard:
+        contract = json.loads((directory / 'contract.json').read_text())
+        done = json.loads((directory / 'complete.json').read_text())
+        worker = contract['worker']
+        if (type(worker) is not int or worker not in range(args.workers) or worker in seen
+                or contract['workers'] != args.workers
+                or contract['manifest_sha256'] != args.manifest_sha256
+                or contract['responses_sha256'] != args.responses_sha256
+                or contract['scorer_sha256'] != sha(__file__)
+                or contract['case_indices'] != assignment[worker]):
+            raise ValueError('duplicate or incompatible shard contract')
+        seen.add(worker)
+        if contract['global_forward_cap'] != global_cap:
+            raise ValueError('shard global cap mismatch')
+        indices = assignment[worker]
+        cap = sum(len(panel[i]['inputs']) * len(panel[i]['edits']) * (2 + len(arms)) for i in indices)
+        shard_rows = [json.loads(line) for line in (directory / 'results.jsonl').read_text().splitlines() if line.strip()]
+        summarize(shard_rows, cartesian(panel, arms, indices))
+        if (contract['forward_cap'] != cap or done['forward_cap'] != cap
+                or type(done['actual_forwards']) is not int or not 0 <= done['actual_forwards'] <= cap
+                or done['candidate_worlds'] != len(shard_rows) or done['models'] != len(indices)
+                or done['arms'] != arms or done['case_indices'] != indices):
+            raise ValueError('incomplete shard receipt')
+        actual_forwards += done['actual_forwards']
+        for row in shard_rows:
+            # Verify each tensor once without copying it across shared storage.
+            row['artifact_root'] = str(directory.resolve())
+        files = {row['file']: row['sha256'] for row in shard_rows}
+        if any(row['sha256'] != files[row['file']] for row in shard_rows):
+            raise ValueError('conflicting tensor hashes')
+        for name, digest in files.items():
+            if sha(bound_path(directory, name)) != digest:
+                raise ValueError('shard tensor changed')
+        rows.extend(shard_rows)
+        receipts.append({'worker': worker, 'artifact_root': str(directory.resolve()),
+                         'contract_sha256': sha(directory / 'contract.json'),
+                         'complete_sha256': sha(directory / 'complete.json'),
+                         'results_sha256': sha(directory / 'results.jsonl')})
+    summary = summarize(rows, cartesian(panel, arms, range(len(panel))))
+    args.out.mkdir()
+    write(args.out / 'summary.json', summary)
+    write(args.out / 'receipt.json', {'manifest_sha256': args.manifest_sha256,
+          'responses_sha256': args.responses_sha256, 'workers': args.workers,
+          'partition': assignment, 'shards': sorted(receipts, key=lambda r: r['worker']),
+          'candidate_worlds': len(rows), 'actual_forwards': actual_forwards,
+          'forward_cap': global_cap, 'scorer_sha256': sha(__file__)})
+    with (args.out / 'results.jsonl').open('x') as stream:
+        for row in rows:
+            stream.write(json.dumps(row, allow_nan=False) + '\n')
+        stream.flush(); os.fsync(stream.fileno())
+
+
 def run(args):
     if (sha(args.manifest) != args.manifest_sha256 or sha(args.responses) != args.responses_sha256
             or args.out.exists()):
         raise ValueError('frozen manifest and fresh output required')
     manifest = json.loads(args.manifest.read_text())
     panel, arms = manifest['panel'], manifest['arms']
+    assignment = partition(panel, args.workers)
+    if type(args.worker) is not int or args.worker not in range(args.workers):
+        raise ValueError('worker index out of range')
+    indices = assignment[args.worker]
     if (manifest['schema_version'] != 1 or arms != ['base', 'point', 'intervention']
             or Counter(r['stratum'] for r in panel) != {'new_model': 8, 'retention': 24}):
         raise ValueError('fixed 32-model, three-policy panel required')
@@ -158,18 +247,19 @@ def run(args):
     from safetensors.torch import save_file
     torch.set_num_threads(1)
     args.out.mkdir()
-    expected_keys = {(row['stratum'], row['id'], arm, edit_index, index)
-                     for row in panel for arm in arms for edit_index in range(len(row['edits']))
-                     for index in range(len(row['inputs']))}
+    expected_keys = cartesian(panel, arms, indices)
     forwards = 0
     raw_rows = []
-    max_forwards = sum(len(row['inputs']) * len(row['edits']) * (2 + len(arms)) for row in panel)
-    if max_forwards != manifest['forward_cap']:
+    global_cap = sum(len(row['inputs']) * len(row['edits']) * (2 + len(arms)) for row in panel)
+    max_forwards = sum(len(panel[i]['inputs']) * len(panel[i]['edits']) * (2 + len(arms)) for i in indices)
+    if global_cap != manifest['forward_cap']:
         raise ValueError('forward cap does not cover frozen Cartesian panel')
     write(args.out / 'contract.json', {'manifest_sha256': args.manifest_sha256,
           'responses_sha256': sha(args.responses), 'forward_cap': max_forwards,
-          'scorer_sha256': sha(__file__)})
-    for case_index, item in enumerate(panel):
+          'global_forward_cap': global_cap, 'worker': args.worker, 'workers': args.workers,
+          'case_indices': indices, 'scorer_sha256': sha(__file__)})
+    for case_index in indices:
+        item = panel[case_index]
         expected_format = 'graph_only' if item['stratum'] == 'new_model' else 'legacy_mermaid_english'
         if item['answer_format'] != expected_format:
             raise ValueError('answer format must match frozen prompt stratum')
@@ -275,13 +365,26 @@ def run(args):
     summary = summarize(raw_rows, expected_keys)
     write(args.out / 'summary.json', summary)
     write(args.out / 'complete.json', {'actual_forwards': forwards, 'forward_cap': max_forwards,
-          'candidate_worlds': len(raw_rows), 'models': len(panel), 'arms': arms})
+          'candidate_worlds': len(raw_rows), 'models': len(indices), 'arms': arms,
+          'case_indices': indices})
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    for name in ('manifest', 'payload', 'source', 'support', 'responses', 'out'):
+    parser.add_argument('--merge', action='store_true')
+    parser.add_argument('--worker', type=int, default=0)
+    parser.add_argument('--workers', type=int, default=1)
+    parser.add_argument('--shard', type=Path, action='append', default=[])
+    for name in ('manifest', 'out'):
         parser.add_argument('--'+name, type=Path, required=True)
     parser.add_argument('--manifest-sha256', required=True)
     parser.add_argument('--responses-sha256', required=True)
-    run(parser.parse_args())
+    for name in ('payload', 'source', 'support', 'responses'):
+        parser.add_argument('--'+name, type=Path)
+    args = parser.parse_args()
+    if args.merge:
+        merge(args)
+    else:
+        if any(getattr(args, name) is None for name in ('payload', 'source', 'support', 'responses')):
+            parser.error('scoring requires payload/source/support/responses')
+        run(args)

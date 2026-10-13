@@ -76,7 +76,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import re
 import sys
 import time
@@ -122,17 +121,17 @@ CHANGED_DRAWS = 32  # C's changed texts per circuit (32, the lead's 10-12: at 16
 INTERCHANGE_SPLITS = {"search": (1, (0, 2), False), "eval": (2, (1,), True)}  # interchange draws: the text's seed
 # offset, carry.alternatives' ranks, and whether samples from the model's distribution (no split's ranks) fill the budget
 FRESH_SOURCES = 64  # sampled source tokens kept per position (the first ones fill a budget)
-SEMANTICS = {"c": (), "x": ("point", "pattern", "nodes", "edges", "flips", "omitted"), "h": ("nodes", "edges", "flips", "omitted"),
-             "n": ("nodes", "omitted")}
-# GoalEval(semantics=, default the SEMANTICS environment variable, else "c"): the C families whose circuit and VPD runs
+SEMANTICS = {"n": ("nodes", "omitted"), "c": ()}
+# GoalEval(semantics=, default "n", the reward's: the lead's 10-13, run 2): the C families whose circuit and VPD runs
 # hold the query and key subcomponents outside the circuit at their activations on the text and every RMSNorm, the
 # final one included, at the model's scale on it (engine at_x and norms, monitorbench's b6a3df3), each family on its
-# own bounds; the real model's runs keep their own. "x" every family (the lead's 10-13: s_nodes 0.56 -> 0.93 on the dev
-# starts, but point collapsed on a third of them and the bar moved 0.47-2.28x); "h" the hybrid (the lead's 10-13): the
-# families claiming to predict the model's response to a perturbation (nodes, edges, flips, omitted) at x, those
-# claiming standalone computation (point, pattern) as stated; "n" the two whose score is the response relative to the
-# model's own (nodes, omitted: pooled against W) at x, the rest as stated (under "h" edges and flips, absolute KLs under
-# the intervention, carried point's collapse: 0.2-0.4 on 6 of the 20 dev starts)
+# own bounds; the real model's runs keep their own. "n": the node and omitted families, whose scores pool the circuit's
+# prediction of the model's response against the model's own (W), the rest as stated: in C's semantics a thinned stream
+# renormalized itself and inflated every removal effect (s_nodes 0.36 on the dev starts, 16 of 20 bars set by it; 0.90
+# under "n"), and toys, controls and every other family stay C's. "c": every family as stated (the engine checks against
+# graph_ref, generality's comparisons). Holding point, pattern, edges or flips at x (2750fd8's "x", bd68101's "h")
+# collapsed them to 0.2-0.4 on 6 of the 20 dev starts: they score absolute KLs, which carry the circuit's standalone
+# error.
 BLOCK = -1  # a block node's index: (site, position, BLOCK), the site's whole output there (every subcomponent and the
 # remainder), ["block", site, position] in an answer (the lead's 10-12: a token's identity lives in thousands of parts)
 DONORS_NEAR = 32  # donor resampling's changed-input donors per text
@@ -1150,8 +1149,7 @@ class GoalEval:
 
     def __init__(self, nat: native.Native | None = None, *, changes: int = native.CHANGES, ranks=HELD_OUT_RANKS,
                  share_floor: float = SHARE_FLOOR, random_pairs: int = RANDOM_PAIRS, max_edges: int = MAX_EDGES, chunk: int = CHUNK,
-                 cut_chunk: int = CUT_CHUNK, semantics: str | None = None):
-        semantics = semantics or os.environ.get("SEMANTICS") or "c"  # the knob (the lead's 10-13): scorer pods SEMANTICS=x
+                 cut_chunk: int = CUT_CHUNK, semantics: str = "n"):
         if semantics not in SEMANTICS:
             raise ValueError(f"semantics is one of {SEMANTICS}")
         self.nat = nat or native.Native()

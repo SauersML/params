@@ -31,7 +31,7 @@ sys.path.insert(0, str(ORACLE))
 
 DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/generality"))
 PER_TASK = 4
-SEM = os.environ.get("SEMANTICS") or "c"  # goal_eval's semantics for every run (GoalEval reads the same variable)
+SEM = "n"  # goal_eval's semantics, its only default since the cutover (no environment variable); outputs apart per semantics
 SUF = "" if SEM == "c" else f"_{SEM}"  # each semantics' outputs apart ("c" the earlier ones)
 SEALED = __import__("re").compile(r"text91[0-4][0-9][.]json")
 
@@ -295,10 +295,10 @@ def gender_masks(lams=(0.01, 0.1), steps: int = 300):
 
 def moved(tdir: str):
     """The move each behavior-mode teacher circuit carries (the lead's 10-13: holding the subject while carrying 0.01 of
-    the swap looked like C's semantics thinning the circuit), in both of GoalEval's semantics: the circuit's masked run
-    (its subcomponents on, every other off, remainders live; GoalEval.runs) on the prompt and on its minimal-pair source,
-    "c" as stated and "x" with the query and key sites and every norm at the model's run on the input run (routing and
-    normalization at x); moved = the circuit's change of logit(source label) - logit(base label) over the model's; and
+    the swap looked like C's semantics thinning the circuit): the circuit's masked run (its subcomponents on, every other
+    off, remainders live; GoalEval.runs, as stated: the routing-and-norms-at-x arm went with semantics "x", which held
+    point at x and collapsed it on a third of the dev texts) on the prompt and on its minimal-pair source; moved = the
+    circuit's change of logit(source label) - logit(base label) over the model's; and
     the same with the source's active parts at the variable's position added (its other value's parts: VPD writes a
     token's identity in which subcomponents are on, so the base's parts alone cannot carry a swap). -> DATA/cg_moved.jsonl"""
     import goal_eval
@@ -308,7 +308,7 @@ def moved(tdir: str):
     meta = json.loads((DATA / "causalgym_texts_b.json").read_text())
     names = sorted(p.stem for p in tdir.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_"))
     nat = native.Native()
-    ges = {sem: goal_eval.GoalEval(nat, semantics=sem) for sem in ("c", "x")}
+    ges = {"c": goal_eval.GoalEval(nat, semantics="c")}
     out = DATA / f"cg_moved{SUF}.jsonl"
     done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
     for nm in names:

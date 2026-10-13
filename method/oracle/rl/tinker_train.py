@@ -182,8 +182,8 @@ def reward_mismatches(q: dict, scores: list, rewards: list) -> list:
 def scorer_mismatch(scores: list, semantics: str | None, source: str | None) -> str | None:
     """Why the scorer is not the run's frozen reward, or None: every score's semantics (the scorer's GoalEval) must be
     semantics and its source revision (the scorer pod's SOURCE) be source, when given (as prefixes of one another). reward_mismatches checks
-    the trainer against the scorer; this checks the scorer itself (a pod started without SEMANTICS scores under the
-    code's default, a pod built at origin/main under the newest reward)."""
+    the trainer against the scorer; this checks the scorer itself (a pod built at an older commit scores under that
+    commit's semantics, one built at origin/main under the newest reward)."""
     for s in scores:
         if semantics is not None and s.get("semantics") != semantics:
             return f"the scorer runs semantics {s.get('semantics')!r}, not {semantics!r}"

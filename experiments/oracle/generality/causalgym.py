@@ -31,7 +31,7 @@ sys.path.insert(0, os.environ.get("ORACLE") or str(HERE.parents[2] / "method" / 
 
 DATA = Path(os.environ.get("GEN_DATA", Path.home() / "mpd-data/graph_oracle/generality"))  # inputs and outputs
 RAW = Path.home() / "mpd-data/causalgym/raw/test.json"
-SEM = os.environ.get("SEMANTICS") or "c"  # goal_eval's semantics (GoalEval reads the same variable); outputs apart per semantics
+SEM = "n"  # goal_eval's semantics, its only default since the cutover (no environment variable); outputs apart per semantics
 SUF = "" if SEM == "c" else f"_{SEM}"
 KEEP = 0.8
 

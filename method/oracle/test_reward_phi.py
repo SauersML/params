@@ -146,15 +146,17 @@ def test_the_start_scores_its_hard_term():
     assert ct["v"] == 0.0 and abs(ct["term"]) < 0.01, ct
 
 
-def test_semantics_knob_from_the_environment(monkeypatch):
-    """GoalEval's semantics default: the SEMANTICS environment variable (scorer pods), else "c"."""
+def test_semantics_default_is_the_rewards(monkeypatch):
+    """GoalEval's semantics: "n" by default, whatever the environment says (a pod missing a variable scored under "c"
+    silently: primerl's e5b8b03); "c" only when asked; nothing else exists."""
     from test_goal_eval import tiny_native
 
     nat = tiny_native()
-    monkeypatch.delenv("SEMANTICS", raising=False)
-    assert goal_eval.GoalEval(nat).semantics == "c"
-    monkeypatch.setenv("SEMANTICS", "x")
-    assert goal_eval.GoalEval(nat).semantics == "x" and goal_eval.GoalEval(nat, semantics="c").semantics == "c"
+    monkeypatch.setenv("SEMANTICS", "c")
+    assert goal_eval.GoalEval(nat).semantics == "n" and goal_eval.GoalEval(nat, semantics="c").semantics == "c"
+    assert set(goal_eval.SEMANTICS) == {"n", "c"} and goal_eval.SEMANTICS["n"] == ("nodes", "omitted")
+    with pytest.raises(ValueError):
+        goal_eval.GoalEval(nat, semantics="x")
 
 
 def test_soft_pieces_are_smooth():

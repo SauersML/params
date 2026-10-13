@@ -180,8 +180,8 @@ def mask_of(nat, T, nodes):
 @pytest.fixture(scope="module")
 def tiny():
     nat = tiny_native(near=0.1)
-    ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
-    g = torch.Generator().manual_seed(1)
+    ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics="c")  # (the engine's checks
+    g = torch.Generator().manual_seed(1)                                                                # against graph_ref)
     ids = torch.randint(0, 40, (12,), generator=g).tolist()
     tx = ge.text(ids, [11], seed=5)
     for split, n in (("search", 6), ("eval", 5)):  # far donors in the tiny vocabulary, some shorter than the text
@@ -1924,14 +1924,15 @@ def test_graph_ref_outside_held(tiny):
     assert not torch.allclose(ge.graph_ref(tx.ids, tx.targets, g, outside=qk), ge.graph_ref(tx.ids, tx.targets, g))
 
 
-def test_semantics_x_runs_routing_and_norms_at_x(tiny):
-    """GoalEval(semantics="x"): a circuit's and VPD's runs hold the query and key subcomponents outside the circuit at
-    their activations on x and every norm at x's scale (graph_ref's outside=, norms=, freeze="all"), the real model's
-    runs their own: point (stated, complete, the bounds), a draw of the node family against graph_ref (the removed nodes
-    at 0), and the reward-mode families all scored."""
+def test_semantics_n_holds_the_response_families_at_x(tiny):
+    """GoalEval(semantics="n"), the default: point and its bounds as stated (plain graph_ref), the node and omitted
+    families' circuit and VPD runs with the query and key subcomponents outside the circuit at their activations on x
+    and every norm at x's scale (graph_ref's outside=, norms=, freeze="all"), the real model's runs their own: a node
+    draw (its removed nodes at 0) and an omitted candidate's prediction against graph_ref; "c" holds nothing."""
     nat, ge, tx = tiny
-    gx = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics="x")
-    gx.donor_pools.update(ge.donor_pools)
+    kw = dict(changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
+    gx, gc = goal_eval.GoalEval(nat, **kw), goal_eval.GoalEval(nat, semantics="c", **kw)
+    assert gx.semantics == "n"
     tx2 = gx.text(tx.ids, tx.targets, seed=5)
     rec, nx = {}, {}
     nat.run(tx.ids, [tx.T - 1], nat._full_plan(tx.T, 1), *nat._one(), record=rec)
@@ -1939,55 +1940,65 @@ def test_semantics_x_runs_routing_and_norms_at_x(tiny):
     ones = {n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
     ge.graph_ref(tx.ids, tx.targets, native.Graph(masks=ones), norms=nx)
 
-    def ref(g, **kw):
-        return float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, goal_eval._c_graph(g, tx.targets, nat.C), outside=qk,
-                                                   norms=dict(nx), freeze="all", **kw))[0])
+    def kl(g, at_x, ref=None, outside=None):
+        g = goal_eval._c_graph(g, tx.targets, nat.C) if not g.masks else g
+        kw_ = {"outside": outside if outside is not None else qk, "norms": dict(nx), "freeze": "all"} if at_x else {}
+        return float(carry.kl(tx.ref if ref is None else ref, ge.graph_ref(tx.ids, tx.targets, g, **kw_))[0])
 
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     stated = native.Graph(every[:6], *native.all_edges(every[:6], tx.targets))
     whole = native.Graph(every[::2], complete=True)
     got = [r["kl_live"] for r in gx.sufficiency(tx2, [stated, whole], conventions=("live",))]
-    want = [ref(stated), ref(whole)]
+    want = [kl(stated, False), kl(whole, False)]
     assert all(abs(a - b) < 1e-4 * max(1.0, b) for a, b in zip(got, want)), (got, want)
     e0, v0 = gx._bounds(tx2, "live")
-    assert abs(e0 - ref(native.Graph())) < 1e-4 * max(1.0, e0) and abs(v0 - ref(native.Graph(masks=tx.vpd))) < 1e-4 * max(1.0, v0)
-    assert abs(e0 - ge._bounds(tx, "live")[0]) > 1e-3  # (not C's)
+    assert abs(e0 - kl(native.Graph(), False)) < 1e-4 * max(1.0, e0) and abs(v0 - kl(native.Graph(masks=tx.vpd), False)) < 1e-4 * max(1.0, v0)
     row = gx._node_family(tx2, [whole], 4)[0]
     d = gx._node_draws(tx2, sorted(whole.node_set()), 4, held=sorted(whole.node_set()))[0]
-    model_less = native.Graph(masks={n: m.clone() for n, m in ones.items()})
+    less = native.Graph(masks={n: m.clone() for n, m in ones.items()})
     for n, t, c in d:
-        model_less.masks[n][t, c] = False
-    lm = ge.graph_ref(tx.ids, tx.targets, model_less)
+        less.masks[n][t, c] = False
+    lm = ge.graph_ref(tx.ids, tx.targets, less)
     zero = {n: x.clone() for n, x in qk.items()}
     for n, t, c in d:
         if n in zero:
             zero[n][..., t, c] = 0.0
-    gl = native.Graph(sorted(set(whole.node_set()) - set(d)), complete=True)
-    kc = float(carry.kl(lm, ge.graph_ref(tx.ids, tx.targets, gl, outside=zero, norms=dict(nx), freeze="all"))[0])
+    kc = kl(native.Graph(sorted(set(whole.node_set()) - set(d)), complete=True), True, lm, zero)
     assert abs(row["draws_nodes"][0][1] - kc) < 1e-4 * max(1.0, kc), (row["draws_nodes"][0], kc)
-    full = gx.fidelity(tx2, [stated, whole], None, draws=2, near_donors=0, far_donors=0, mode="reward", interchange=2, changed=2)
-    for r in full:
-        assert all(r.get(k) is None or -1e-9 <= r[k] <= 1 + 1e-9 for k in ("s_point_c", "s_nodes", "s_edges", "s_omitted"))
-    with pytest.raises(ValueError):
-        goal_eval.GoalEval(nat, semantics="y")
+    assert abs(gc._node_family(gc.text(tx.ids, tx.targets, seed=5), [whole], 4)[0]["draws_nodes"][0][1] - kc) > 1e-4  # ("c": not at x)
+    om = gx._omitted_family(tx2, [whole], k=6)[0]["draws_omitted"]
+    cand = tuple(om[0][0])
+    less = native.Graph(masks={n: m.clone() for n, m in ones.items()})
+    less.masks[cand[0]][cand[1], cand[2]] = False
+    lm = ge.graph_ref(tx.ids, tx.targets, less)
+    assert abs(om[0][1] - kl(whole, True, lm)) < 1e-4 * max(1.0, om[0][1]), (om[0], kl(whole, True, lm))
 
 
-def test_semantics_h_is_x_for_perturbations_and_c_for_point(tiny):
-    """GoalEval(semantics="h"): point and pattern (and their bounds) as stated, the node, edge, flip and omitted families
-    at x on their own bounds: point equals "c"'s, the node family's draws and the edge family's bound "x"'s."""
-    nat, ge, tx = tiny
-    kw = dict(changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
+def test_cutover_scores_as_the_frozen_line():
+    """The default semantics scores as run 2's frozen line, c2e0f80 with SEMANTICS=n: the tiny fixture's reward-mode
+    families on a node set and a stated graph equal the numbers c2e0f80 gave under SEMANTICS=n (GitHub Actions, CPU),
+    within 1e-4."""
+    nat = tiny_native(near=0.1)
+    ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
+    g = torch.Generator().manual_seed(1)
+    ids = torch.randint(0, 40, (12,), generator=g).tolist()
+    tx = ge.text(ids, [11], seed=5)
+    for split, n in (("search", 6), ("eval", 5)):
+        ge.donor_pools[split] = [(f"{split}{i}", torch.randint(0, 40, (8 + 2 * i,), generator=g).tolist()) for i in range(n)]
     every = sorted(native.Graph(masks=tx.vpd).node_set())
-    whole = native.Graph(every[::2], complete=True)
-    got = {}
-    for sem in ("c", "x", "h"):
-        g_ = goal_eval.GoalEval(nat, semantics=sem, **kw)
-        t_ = g_.text(tx.ids, tx.targets, seed=5)
-        got[sem] = (g_.sufficiency(t_, [whole], conventions=("live",))[0]["kl_live"], g_._node_family(t_, [whole], 4)[0]["draws_nodes"],
-                    g_._bounds(t_, "live", "edges"), g_._bounds(t_, "live"))
-    assert got["h"][0] == pytest.approx(got["c"][0], rel=1e-5) and got["h"][3] == pytest.approx(got["c"][3], rel=1e-5)
-    assert all(a[1] == pytest.approx(b[1], rel=1e-4, abs=1e-6) for a, b in zip(got["h"][1], got["x"][1]))
-    assert got["h"][2] == pytest.approx(got["x"][2], rel=1e-5) and abs(got["h"][2][0] - got["c"][2][0]) > 1e-3
+    graphs = [native.Graph(every[::2], complete=True), native.Graph(every[:6], *native.all_edges(every[:6], tx.targets))]
+    rows = ge.fidelity(tx, graphs, None, draws=2, near_donors=0, far_donors=0, mode="reward", interchange=2, changed=2)
+    want = [{"s_point_c": 0.00035079477585422774, "s_nodes": 0.7945694641006256, "s_nodes_raw": 0.7945694641006256,
+             "kl_nodes_c": 4.207161903381348, "s_edges": 0.0015720574266129155, "s_omitted": 0.36393087311141814,
+             "s_omitted_raw": 0.09792910144777334, "kl_point": 13.841683387756348, "phi": 0.15705154894395465},
+            {"s_point_c": 0.0, "s_nodes": None, "s_nodes_raw": None, "kl_nodes_c": 4.313782215118408, "s_edges": None,
+             "s_omitted": 0.5857890529978118, "s_omitted_raw": 0.3602883742448587, "kl_point": 13.87414264678955,
+             "phi": 0.07083523967454304}]
+    assert ge.semantics == "n"
+    for r, w in zip(rows, want):
+        got = {k: r.get(k) for k in w if k != "phi"} | {"phi": goal_eval.phi(r)[0]}
+        for k, v in w.items():
+            assert (v is None) == (got[k] is None) and (v is None or abs(got[k] - v) < 1e-4 * max(1.0, abs(v))), (k, got[k], v)
 
 
 def test_fidelity_weight_column(tiny):
@@ -3014,15 +3025,15 @@ def test_phi_variants_multi_deletions(tiny, monkeypatch):
 
 
 def test_phi_variants_under_x_are_the_per_variant_paths(tiny, monkeypatch):
-    """Semantics "x" and "h" on phi_variants' one plan (_loo_c at the point family's semantics, _loo_nodes at the node
+    """Semantics "n" on phi_variants' one plan (_loo_c at the point family's semantics, as stated, _loo_nodes at the node
     family's: at x every position, a deleted line's nodes held at x outside the variant, a node draw's at 0): each
     variant's phi, point, wiring, pattern and node family equal the per-variant path's (fidelity's families on each
-    variant), on a stated graph with stated pairs and on a complete set; "x" moves the point from "c", "h" the node
-    family alone."""
+    variant), on a stated graph with stated pairs and on a complete set; against "c" the node family moves and the
+    point does not."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     pool = tiny_pool(nat, tx.ids)
-    for sem in ("x", "h"):
+    for sem in ("n",):
         gx = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics=sem)
         gx.donor_pools.update(ge.donor_pools)
         tx2 = gx.text(tx.ids, tx.targets, seed=5)
@@ -3045,7 +3056,7 @@ def test_phi_variants_under_x_are_the_per_variant_paths(tiny, monkeypatch):
                                                                               interchange=4, changed=4)[0], recompute=("nodes",))
             point = [abs(a["row"]["draws_point"][0][0] - b["row"]["draws_point"][0][0]) for a, b in zip(fast["variants"], c["variants"])]
             nodes = [abs(a["row"]["draws_nodes"][0][1] - b["row"]["draws_nodes"][0][1]) for a, b in zip(fast["variants"], c["variants"])]
-            assert max(nodes) > 1e-4 and (max(point) > 1e-4 if sem == "x" else max(point) < 1e-6), (sem, point, nodes)
+            assert max(nodes) > 1e-4 and max(point) < 1e-6, (sem, point, nodes)
 
 
 def test_one_plan_reuses_the_states_before_the_circuit(tiny, monkeypatch):
@@ -3071,13 +3082,13 @@ def test_one_plan_reuses_the_states_before_the_circuit(tiny, monkeypatch):
 
 
 def test_one_plan_reuses_the_states_at_x(tiny, monkeypatch):
-    """Under "x" and "h", _loo_c's and _loo_nodes' runs from the circuit's first position on (LOO_REUSE: the states
-    before it kept from one run at the point family's semantics, the node family's own reused only when the same) give
-    the whole runs' phi and node family on every variant, on a stated graph with pairs and a complete set."""
+    """Under "n", _loo_c's and _loo_nodes' runs from the circuit's first position on (LOO_REUSE: the states before it
+    kept from one run at the point family's semantics, the node family's own reused only when the same) give the whole
+    runs' phi and node family on every variant, on a stated graph with pairs and a complete set."""
     nat, ge, tx = tiny
     late = [nd for nd in sorted(native.Graph(masks=tx.vpd).node_set()) if nd[1] >= 5]
     pool = tiny_pool(nat, tx.ids)
-    for sem in ("x", "h"):
+    for sem in ("n",):
         gx = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics=sem)
         gx.donor_pools.update(ge.donor_pools)
         tx2 = gx.text(tx.ids, tx.targets, seed=5)

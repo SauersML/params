@@ -27,7 +27,7 @@ from test_goal_eval import tiny_native  # noqa: E402
 @pytest.fixture(scope="module")
 def tiny():
     nat = tiny_native(near=0.1)
-    ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
+    ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4, semantics="c")  # (backup.node_family: C's)
     g = torch.Generator().manual_seed(1)
     ids = torch.randint(0, 40, (12,), generator=g).tolist()
     tx = ge.text(ids, [11], seed=5)

@@ -1778,7 +1778,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         if invariants:
             info["invariant_diagnostic"] = (invariant_diagnostic(ge, tx, p["answer"], task["model"]) if valid[i]
                                             else {"executed": False, "reason": "invalid_answer"})
-        out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], **info, **{f"term_{k}": v for k, v in terms.items()},
+        out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], "semantics": ge.semantics, **info,
+                    **{f"term_{k}": v for k, v in terms.items()},
                     "size": info.get("bits"), "malformed": p["malformed"], "dropped_nodes": d_nodes, "dropped_edges": d_edges,
                     "finals": len(p["finals"]), "tokens": tokens[i] if tokens else None, "overflow": overflow(tokens[i] if tokens else None),
                     "row": row, "variables": e4.get(i),

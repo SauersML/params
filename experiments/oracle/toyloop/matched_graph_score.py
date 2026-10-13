@@ -163,7 +163,8 @@ def merge(args):
         shard_rows = [json.loads(line) for line in (directory / 'results.jsonl').read_text().splitlines() if line.strip()]
         summarize(shard_rows, cartesian(panel, arms, indices))
         if (contract['forward_cap'] != cap or done['forward_cap'] != cap
-                or type(done['actual_forwards']) is not int or not 0 <= done['actual_forwards'] <= cap
+                or type(done['actual_forwards']) is not int
+                or done['actual_forwards'] != 2 * (cap // (2 + len(arms))) + sum(bool(r['valid']) for r in shard_rows)
                 or done['candidate_worlds'] != len(shard_rows) or done['models'] != len(indices)
                 or done['arms'] != arms or done['case_indices'] != indices):
             raise ValueError('incomplete shard receipt')
@@ -171,6 +172,11 @@ def merge(args):
         for row in shard_rows:
             # Verify each tensor once without copying it across shared storage.
             row['artifact_root'] = str(directory.resolve())
+        for index in indices:
+            original = directory / f'{index}.original.json'
+            restored = directory / f'{index}.restored.json'
+            if json.loads(original.read_text()) != json.loads(restored.read_text()):
+                raise ValueError('shard model restoration failed')
         files = {row['file']: row['sha256'] for row in shard_rows}
         if any(row['sha256'] != files[row['file']] for row in shard_rows):
             raise ValueError('conflicting tensor hashes')

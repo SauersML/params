@@ -74,6 +74,8 @@ class MatchedScoreTests(unittest.TestCase):
             for i in range(2):
                 shard = root / str(i); shard.mkdir(); shards.append(shard)
                 (shard / 'tensor').write_bytes(b'opaque offline fixture')
+                scorer.write(shard / f'{i}.original.json', {'weights': 'fixed'})
+                scorer.write(shard / f'{i}.restored.json', {'weights': 'fixed'})
                 row = {'stratum': 'new_model', 'case': str(i), 'arm': 'point',
                        'edit_index': 0, 'input': 0, 'kind': 'no_edit', 'input_role': 'disclosed',
                        'valid': False, 'kl_bits': None, 'top': None, 'reference_top': 1,

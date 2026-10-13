@@ -125,7 +125,12 @@ def _cos_comp(A, B):
     return float((B @ A).norm() / d) if d > 1e-9 else 0.0
 
 
-def weight_lines(toy: Toy, top_neurons: int = 6, k: int = 3) -> list[str]:
+def weight_lines(toy: Toy, top_neurons: int | None = 6, k: int = 3) -> list[str]:
+    """Signed weight summaries; None lists every neuron above the live threshold.
+
+    Listing all live neurons removes the count cap, not token-summary compression
+    or the declared strength threshold. It does not expose complete raw tensors.
+    """
     sd, cfg, voc = toy.sd, toy.cfg, toy.vocab
     L, H, hd = heads_of(cfg)
     E = sd["wte.weight"].float()
@@ -162,8 +167,9 @@ def weight_lines(toy: Toy, top_neurons: int = 6, k: int = 3) -> list[str]:
         if live == 0:
             lines.append(f"L{i} MLP (zero)")
             continue
-        top = strength.topk(min(top_neurons, live)).indices.tolist()
-        lines.append(f"L{i} MLP: {live} live neurons, strongest {len(top)}:")
+        top = strength.topk(live if top_neurons is None else min(top_neurons, live)).indices.tolist()
+        detail = f"all {live}" if top_neurons is None else f"strongest {len(top)}"
+        lines.append(f"L{i} MLP: {live} live neurons, {detail}:")
         for n in top:
             lines.append(f"  L{i}N{n} w{float(strength[n]):.2g} reads {_top_tokens(En2 @ fc[n], voc, k)}"
                          f" writes {_top_tokens(E @ down[:, n], voc, k)}")
@@ -272,7 +278,7 @@ def source_token(toy, writer: str, reader: str, ratio: float = 2.0) -> str | Non
     return toy.vocab[int(t.indices[0])] if float(t.values[0]) > ratio * float(t.values[1]) + 1e-9 else None
 
 
-def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int = 16, max_links: int = 3) -> list[str]:
+def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_links: int = 3) -> list[str]:
     """Compact, weights only. Per head: output norm, positional preference (the mean embedding's query and key through
     RoPE: best key offset and its margin over the next, 'pos flat' when position barely matters), QK and OV token pairs
     (through the embedding, so a rotated residual basis changes nothing), the units its Q, K and V read and the units
@@ -340,7 +346,7 @@ def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int = 16, max_links: in
         lines.append(line)
     lines.insert(1, f"tok (token identity) out[{fmt([(g, r) for r, g in writes['tok'].items()])}]")
     n_neurons = sum(1 for x in units_of(toy) if x[2] == "N")
-    if n_neurons > max_neurons:   # keep the heads and the strongest-writing neurons
+    if max_neurons is not None and n_neurons > max_neurons:   # keep the heads and the strongest-writing neurons
         neu = [l for l in lines[1:] if re.match(r"L\d+N", l)]
         keep = sorted(neu, key=lambda l: -max(writes[l.split()[0]].values(), default=0))[:max_neurons]
         lines = [l for l in lines if not re.match(r"L\d+N", l) or l in keep]
@@ -428,22 +434,27 @@ def behaviour_lines(toy: Toy, n_texts: int = 2, compact: bool = False) -> list[s
     return lines
 
 
-def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None) -> str:
+def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_live_neurons: bool = False) -> str:
     """The prompt. weights_from: take the weight section from another toy (same architecture), keeping this toy's
     behaviour section (the swapped-weights control: does the answer follow the weights?). TOYLOOP_SECTIONS=weights:
     the compact weight section and the texts' tokens only; default: weights and behaviour (zoo v1 toys keep the
-    legacy weight section, zoo2 toys get the compact one)."""
+    legacy weight section, zoo2 toys get the compact one). all_live_neurons removes
+    only the neuron-count cap in either format. Callers must reject a context-cap
+    failure rather than truncate facts; token/connection summaries remain bounded.
+    """
+    if type(all_live_neurons) is not bool:
+        raise ValueError("all_live_neurons must be an explicit boolean")
     L, H, hd = heads_of(toy.cfg)
     if SECTIONS == "weights":
         return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
                           f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.",
-                          "Weights:", *weight_only_lines(weights_from or toy),
+                          "Weights:", *weight_only_lines(weights_from or toy, max_neurons=None if all_live_neurons else 16),
                           "Texts:", *text_lines(toy, n_texts),
                           "Which units implement the prediction at the last position, and how?", FORMAT])
     if toy.meta.get("version") == 2:   # zoo2: the compact weight section (the legacy one is ~4k tokens there)
         return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
                           f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.",
-                          "Weights:", *weight_only_lines(weights_from or toy),
+                          "Weights:", *weight_only_lines(weights_from or toy, max_neurons=None if all_live_neurons else 16),
                           "Behaviour (per head: usual attention offset:share of positions, key attended from the "
                           "last position@position:weight):", *behaviour_lines(toy, n_texts, compact=True),
                           "Which units implement the prediction at the last position, and how?", FORMAT])
@@ -451,7 +462,7 @@ def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None) -> str:
             f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.\n"
             "Weights (QK: query>key token pairs scored through the embedding; OV: source>written token pairs; "
             "comp: Q/K/V composition with an earlier head's output):")
-    return "\n".join([head, *weight_lines(weights_from or toy), "Behaviour:", *behaviour_lines(toy, n_texts),
+    return "\n".join([head, *weight_lines(weights_from or toy, top_neurons=None if all_live_neurons else 6), "Behaviour:", *behaviour_lines(toy, n_texts),
                       "Which units implement the prediction at the last position, and how?", FORMAT])
 
 

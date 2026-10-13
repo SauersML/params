@@ -14,7 +14,8 @@
 #                                        POOL=1: every VPD-active subcomponent at the listed positions in the question;
 #                                        THINKING=1: Qwen3's thinking mode, generation limit 16384; MAXLEN: SFT length cap;
 #                                        RENDERED=1: ROWS and HELDOUT are already rerendered with these flags, used as they are;
-#                                        SAVE_EVERY=k: checkpoints every k steps for the learning curve, rl_heldout.sh on $S/sft)
+#                                        SAVE_EVERY=k: checkpoints every k steps for the learning curve, rl_heldout.sh on $S/sft;
+#                                        INVARIANTS_TEACH: checked train-only artifact JSON/JSONL; ask for formal claims before fitting)
 set -e
 RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
@@ -28,12 +29,28 @@ SRC=${SRC:-/Users/user/params}  # a source tree (a clean copy of main while othe
 PY=/Users/user/mpd-data/venv/bin/python; TPY=/Users/user/mpd-data/tinker-venv/bin/python
 export HF_HUB_OFFLINE=1 PYTORCH_MPS_PREFER_METAL=1
 RR=(rerender ${MEASURED:+--measured} ${POOL:+--pool})  # MEASURED: the measured input arm (components.measured()); POOL: the full candidate pool (candidate_pool())
+TRAIN_RR=($RR ${INVARIANTS_TEACH:+--invariants})  # Train instructions only; held-out behavior is unchanged.
+IT=()
+[ -n "${INVARIANTS_TEACH:-}" ] && IT=(--invariants-teach "$INVARIANTS_TEACH")
 TH=(${THINKING:+--thinking})  # THINKING: Qwen3's thinking mode in sampling (the SFT keeps the empty think block in the prompt)
 [ -n "${THINKING:-}" ] && MAXTOK=${MAXTOK_THINKING:-16384}  # one generation limit, thinking included (no thinking budget)
 if [ -n "${RENDERED:-}" ]; then cp $ROWS $S/rows.jsonl  # rendered once for several runs (the pool's render: ~10 s a text)
-else ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $ROWS $S/rows.jsonl; fi  # questions in the current format
+else ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $TRAIN_RR $ROWS $S/rows.jsonl; fi  # questions in the current format
+if [ -n "${INVARIANTS_TEACH:-}" ]; then
+  # Already-rendered rows must have requested claims; changing a metadata flag would leave stale instructions.
+  ~/.local/bin/mem-lease 2 $PY - $SRC/method/oracle $S/rows.jsonl "$INVARIANTS_TEACH" <<'PYEOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import components
+records = components.invariant_teach([Path(sys.argv[3])])
+joined = [r for r in map(json.loads, Path(sys.argv[2]).read_text().splitlines()) if r["task"] in records]
+if not joined or any(not r.get("invariants") or components.ASK_INVARIANTS.strip() not in r.get("question", "") for r in joined):
+    raise SystemExit("INVARIANTS_TEACH needs matching invariant-enabled rows; rerender with --invariants before fitting")
+PYEOF
+fi
 MPD_MEM_GIB=8 $PY $SRC/method/oracle/components.py dataset $S/rows.jsonl $TEACHER $S/sft.jsonl \
-  ${=ENGLISH:+--english $ENGLISH} ${=EDIT_TEACH:+--edit-teach $EDIT_TEACH}
+  ${=ENGLISH:+--english $ENGLISH} ${=EDIT_TEACH:+--edit-teach $EDIT_TEACH} $IT
 if [ -n "${RENDERED:-}" ]; then cp $HELDOUT $S/heldout.jsonl
 else ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $HELDOUT $S/heldout.jsonl; fi
 $PY - $SRC/method/oracle $S/heldout.jsonl $HELDOUT_TEACHER $S/teacher_txt ${EDIT_EVAL:-} <<'PYEOF'

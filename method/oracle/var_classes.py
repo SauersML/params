@@ -82,13 +82,15 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
         gc.collect()  # the runs' tensors sit in reference cycles (var_teacher.release)
         native.free(nat.dev)
     res = 2 * noise
-    names = components.token_strings(model, [tx.ids[p]] + zs + [int(i) for q in [base] + q_z for i in q[-1].topk(1).indices])
+    pred_ids = [int(q[-1].argmax()) for q in [base] + q_z]
+    names = components.token_strings(model, [tx.ids[p]] + zs + pred_ids)
     own_tok, alt_tok, pred = names[0], names[1:1 + len(zs)], names[1 + len(zs):]
     rows = []
     for i, z in enumerate(zs):
         d0, m, left = kl(base, ref_z[i]), kl(base, q_z[i]), kl(ref_z[i], q_z[i])
         rows.append({"token": alt_tok[i], "id": int(z), "p_model": None, "d0": d0, "move": m, "left": left,
-                     "f": min(1.0, max(0.0, 1 - left / d0)) if d0 > res else None, "predicts": pred[1 + i]})
+                     "f": min(1.0, max(0.0, 1 - left / d0)) if d0 > res else None, "predicts": pred[1 + i],
+                     "predicts_id": pred_ids[1 + i]})
     lp = nat.reference([tx.ids[:p]], [p - 1])[0, 0]
     changed = {}
     for r in rows:
@@ -99,9 +101,9 @@ def classes(sc: variables.Scorer, tx, v: dict, p: int, model: str = "vpd4l", top
     alike = [r for r in rows if r["alike"]]
     moved = sorted(changed.items(), key=lambda kv: -len(kv[1]))
     values = [{"id": 0, "tokens": [own_tok] + [r["token"] for r in alike], "token_ids": [int(tx.ids[p])] + [r["id"] for r in alike],
-               "predicts": pred[0]}]
-    values += [{"id": k + 1, "tokens": [r["token"] for r in rs], "token_ids": [r["id"] for r in rs], "predicts": tok}
-               for k, (tok, rs) in enumerate(moved)]
+               "predicts": pred[0], "predicts_id": pred_ids[0]}]
+    values += [{"id": k + 1, "tokens": [r["token"] for r in rs], "token_ids": [r["id"] for r in rs], "predicts": tok,
+                "predicts_id": rs[0]["predicts_id"]} for k, (tok, rs) in enumerate(moved)]
     for c in values:
         for i in c["token_ids"][1 if c["id"] == 0 else 0:]:
             next(r for r in rows if r["id"] == i)["class"] = c["id"]

@@ -4,15 +4,19 @@ earlier occurrence of t's token, a = o + 1 the copied token's position. Variable
 their positions (var_teacher.block_search: the smallest site set whose term min(f on-target, s off-target) reaches
 GOAL on the search split, else the best). Two stated algorithms predict the outcome of each intervention from the
 variables' values (read off the donors, semantic.values_under):
-  match:  the token after an earlier occurrence of the current token is copied: top = A if T = O, else not the
-          copied token;
-  fixed:  the token at a fixed position is copied, whatever matches: top = A.
+  match:        the token after an earlier occurrence of the current token is copied: top = A if T = O, else not
+                the copied token;
+  class match:  the same with the match taken on value classes: T and O match when their tokens are equal or one
+                is the text's and the other is in the class O's value map (var_classes.classes at o) gives o's own
+                token (the model's match is not exact: on text6011 ' between' or ' with' at o keeps the copy);
+  fixed:        the token at a fixed position is copied, whatever matches: top = A.
 Interventions (z an alternative token at a, w one at o other than t's token; semantic.Checker): A from a donor with
 z (both: top z); O from a donor with w (match: not A; fixed: top A); T from a donor with w at t (match: not A; fixed:
 top A); O and T from two donors with the same w at o and at t (match restored: both top A, the recombination test);
 A from z and O from w (match: not z; fixed: top z); and the plain token change w at o (match: not A). Each prediction
-is priced in the real model (holds, surprise against the no-change prediction, credit (2 holds - 1) x surprise); per
-algorithm the total credit in bits and the share holding.
+is priced in the real model (holds, surprise against the no-change prediction, credit (2 holds - 1) x surprise, and
+logp, the real run's log2 probability of the predicted event, which gives no free pass for predicting no change); per
+algorithm the totals, on every test and on the discriminating ones (where the algorithms' predictions differ).
 
   experiments/oracle/semantic_copy.py [--n 40] [--out FILE]   (default ~/mpd-data/graph_oracle/semantic/copy.jsonl, one
   JSON line per text, resumable)
@@ -42,9 +46,12 @@ def roles(ids: list[int], t: int) -> dict:
     return {"t": t, "o": occ[-1], "a": occ[-1] + 1} if occ else None
 
 
-def predictions(v: dict, ids: list[int], r: dict) -> dict:
-    """Each algorithm's outcome from the variables' values v (token ids) on the text ids with roles r."""
-    return {"match": ("top", v["A"]) if v["T"] == v["O"] else ("not", v["A"]), "fixed": ("top", v["A"])}
+def predictions(v: dict, ids: list[int], r: dict, alike: set) -> dict:
+    """Each algorithm's outcome from the variables' values v (token ids) on the text ids with roles r; alike: the
+    tokens O's value map puts in the class of o's own token."""
+    same = v["T"] == v["O"] or (v["O"] in alike and v["T"] == ids[r["t"]]) or (v["T"] in alike and v["O"] == ids[r["o"]])
+    return {"match": ("top", v["A"]) if v["T"] == v["O"] else ("not", v["A"]),
+            "class match": ("top", v["A"]) if same else ("not", v["A"]), "fixed": ("top", v["A"])}
 
 
 def run_text(ge, sc, task_id: str, draws: int) -> dict | None:
@@ -71,11 +78,14 @@ def run_text(ge, sc, task_id: str, draws: int) -> dict | None:
            ("A from z, O from w", {"transplants": [("A", {r["a"]: z}), ("O", {r["o"]: w})]}),
            ("token w at o", {"tokens": {r["o"]: w}})]
     named = {v["name"]: v for v in vs}
+    vm = var_classes.classes(sc, tx, named["O"], r["o"])  # O's value map: the tokens at o it treats as o's own
+    alike = set(vm["values"][0]["token_ids"])
+    var_teacher.release(nat.dev)
     ck = semantic.Checker(sc, tx, vs)
     tests = []
     try:
         for label, iv in ivs:
-            pred = predictions(semantic.values_under(named, ids, iv), ids, r)
+            pred = predictions(semantic.values_under(named, ids, iv), ids, r, alike)
             q = ck.run(iv)
             got = {k: ck.outcome(q, o) | {"outcome": [o[0], int(o[1])]} for k, o in pred.items()}
             tests.append({"test": label, "top": int(q.argmax()), **got})
@@ -83,7 +93,7 @@ def run_text(ge, sc, task_id: str, draws: int) -> dict | None:
         ck.close()
     toks = components.token_strings("vpd4l", [ids[r["t"]], ids[r["a"]], z, w])
     return {"task": task_id, "roles": r, "tokens": {"t": toks[0], "a": toks[1], "z": toks[2], "w": toks[3]},
-            "carriers": carriers, "tests": tests}
+            "w_alike": w in alike, "alike": vm["values"][0]["tokens"], "carriers": carriers, "tests": tests}
 
 
 def main():
@@ -107,11 +117,15 @@ def main():
         with args.out.open("a") as f:
             f.write(json.dumps(row) + "\n")
         print(t, {k: round(v["score"], 3) for k, v in row["carriers"].items()},
-              [(x["test"], x["match"]["holds"], x["fixed"]["holds"]) for x in row["tests"]], flush=True)
+              [(x["test"], x["match"]["holds"], x["class match"]["holds"], x["fixed"]["holds"]) for x in row["tests"]], flush=True)
     rows = [json.loads(x) for x in args.out.read_text().splitlines()]
-    for alg in ("match", "fixed"):
+    algs = ("match", "class match", "fixed")
+    for alg in algs:  # every test, and the tests on which the algorithms' predictions differ (discriminating)
         xs = [x[alg] for r in rows for x in r["tests"]]
-        print(f"{alg}: credit {sum(x['credit'] for x in xs):.1f} bits over {len(rows)} texts, holds {sum(x['holds'] for x in xs)} of {len(xs)}")
+        ds = [x[alg] for r in rows for x in r["tests"] if len({tuple(x[a]["outcome"]) for a in algs}) > 1]
+        print(f"{alg}: credit {sum(x['credit'] for x in xs):.1f} bits, holds {sum(x['holds'] for x in xs)} of {len(xs)}, "
+              f"log2 p of the predicted events {sum(x['logp'] for x in xs):.1f}; discriminating: holds {sum(x['holds'] for x in ds)} "
+              f"of {len(ds)}, log2 p {sum(x['logp'] for x in ds):.1f}")
 
 
 if __name__ == "__main__":

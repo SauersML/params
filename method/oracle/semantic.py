@@ -13,7 +13,9 @@ Outcomes, about the prediction at the last target: ("top", y), ("unchanged",), (
 token's probability below f times its base value). Each is checked in the real model (holds, 0 or 1) and priced by its
 surprise against the no-change prediction: top y with y not the base top y0, -log2 p_base(y) bits; not y0 (the base
 top displaced), -log2(1 - p_base(y0)); drop f, log2(1 / f); unchanged, and not y with y not y0, 0. credit = (2 holds -
-1) x surprise: trivial claims earn nothing and a wrong bold one costs what a right one earns.
+1) x surprise: trivial claims earn nothing and a wrong bold one costs what a right one earns. Beside it logp, log2 of
+the real run's probability of the predicted event (q(y), 1 - q(y), q(y0)), which compares stated algorithms with no
+free pass for predicting no change.
 
 The semantic model predicts outcomes from variable values. A variable's value under an intervention is read off the
 text it sees (the donor for a transplant, x with the intervention's tokens otherwise): the token at its first input
@@ -137,8 +139,13 @@ class Checker:
             holds, surprise = float(q[y0]) < float(p0[y0]) + math.log(f), math.log2(1.0 / f)
         else:
             raise ValueError(f"outcome {out}")
+        # logp: log2 of the real run's probability of the predicted event (top y: q(y); not y: 1 - q(y); unchanged:
+        # q(y0)), a score with no free pass for agreeing with the no-change prediction, for comparing stated algorithms
+        pe = {"top": lambda: float(q[int(out[1])].exp()), "not": lambda: 1.0 - float(q[int(out[1])].exp()),
+              "unchanged": lambda: float(q[y0].exp())}.get(kind)
         return {"holds": bool(holds), "surprise": surprise, "credit": (2.0 * holds - 1.0) * surprise, "top": top,
-                "p_top": float(q[top].exp()), "p_base_top": float(q[y0].exp())}
+                "p_top": float(q[top].exp()), "p_base_top": float(q[y0].exp()),
+                "logp": math.log2(max(pe(), 1e-30)) if pe else None}
 
     def check(self, items: list[tuple[dict, tuple]]) -> list[dict]:
         rows = []
@@ -183,6 +190,57 @@ def values_under(vs: dict, ids: list[int], iv: dict, mode: str = "token") -> dic
     for name in iv.get("remove") or []:
         out[name] = None
     return out
+
+
+def value_claims(sc: variables.Scorer, tx, v: dict, per_class: int = 8) -> dict:
+    """A variable's value map checked in the real model (E4 v2's value claim): at each input position with stated
+    classes ("values": [{"position", "classes": [{"id", "token_ids", "predicts"?}]}], class 0 holding the text's own
+    token), each listed token z (up to per_class a class, in an order keyed by the text's seed, the position and the
+    token) as a donor x' for V's carrier alone. A token of the text's own class must leave the prediction where it is,
+    f_same = clip(1 - KL(model(x) || patched) / KL(model(x) || model(x')), 0, 1); a token of another class must move
+    it as the model on x' does, f_diff = clip(1 - KL(model(x') || patched) / KL(model(x') || model(x)), 0, 1); a class
+    stating the token it predicts makes that a top-token outcome, priced as the INVARIANTS are (Checker.outcome).
+    Per kind the KL-weighted mean over draws whose change is resolved (KL above the runs' float32 disagreement)."""
+    import hashlib
+
+    import carry
+
+    ck = Checker(sc, tx, [v])
+    kl = lambda a, b: float(carry.kl(a[None, None], b[None, None])[0])  # noqa: E731
+    noise = max(abs(kl(ck.p0, ck.run({"transplants": [(v["name"], {})]}))), 1e-9)
+    rows = []
+    try:
+        for vm in v.get("values") or []:
+            q = int(vm["position"])
+            own = int(tx.ids[q])
+            for c in vm["classes"]:
+                zs = [int(z) for z in c["token_ids"] if int(z) != own]
+                zs.sort(key=lambda z: hashlib.sha256(repr(("values", int(tx.seed), q, z)).encode()).digest())
+                for z in zs[:per_class]:
+                    ref = ck.text({q: z})["lq"][-1]
+                    patched = ck.run({"transplants": [(v["name"], {q: z})]})
+                    if c["id"] == 0:
+                        d0, d = kl(ck.p0, ref), kl(ck.p0, patched)
+                        kind = "same"
+                    else:
+                        d0, d = kl(ref, ck.p0), kl(ref, patched)
+                        kind = "diff"
+                    row = {"position": q, "token": z, "class": c["id"], "kind": kind, "d0": d0, "d": d,
+                           "f": min(1.0, max(0.0, 1.0 - max(d, 0.0) / d0)) if d0 > 2 * noise else None}
+                    if c["id"] != 0 and c.get("predicts_id") is not None:
+                        row["predicts"] = ck.outcome(patched, ("top", int(c["predicts_id"])))
+                    rows.append(row)
+    finally:
+        ck.close()
+
+    def pooled(kind):
+        ok = [r for r in rows if r["kind"] == kind and r["f"] is not None]
+        w = sum(r["d0"] for r in ok)
+        return (sum(r["d0"] * r["f"] for r in ok) / w if w > 0 else None), len(ok)
+    (fs, ns), (fd, nd) = pooled("same"), pooled("diff")
+    pr = [r["predicts"] for r in rows if "predicts" in r]
+    return {"f_same": fs, "draws_same": ns, "f_diff": fd, "draws_diff": nd, "rows": rows,
+            "predicts_holds": (sum(x["holds"] for x in pr) / len(pr)) if pr else None, "predicts_credit": sum(x["credit"] for x in pr)}
 
 
 GATES = {"AND": lambda a, b: a and b, "OR": lambda a, b: a or b, "XNOR": lambda a, b: a == b, "XOR": lambda a, b: a != b,

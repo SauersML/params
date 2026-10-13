@@ -18,6 +18,9 @@ INSTRUCTION = ("Return only an executable Mermaid flowchart LR. State head/neuro
                "Verification uses these displayed inputs under individual head-output "
                "and original nonzero MLP-output neuron deletion/half-scaling. "
                "Do not include English or token annotations.")
+LEARNING_SCOPE = ("Within-family held-out-model transfer across the same eight generator templates; "
+                  "not proof of weight use or generalization to new mechanisms. "
+                  "Model/parameter variation can preserve name-to-topology shortcuts.")
 
 
 def unit_name(name):
@@ -107,8 +110,9 @@ def read_bundle(root):
     if len(paths) != 1:
         raise RuntimeError("exactly one frozen teacher result required")
     result = json.loads(paths[0].read_text())
+    contract = json.loads((root / "pre_native_contract.json").read_text())
     if result.get("target") is None:
-        return {"target": None, "status": result["status"]}
+        return {"target": None, "status": result["status"], "contract": contract}
     files = {"cache": "reference_cache.json", "original": "original_source_binding.json",
              "restored": "restored_source_binding.json", "uncached": "uncached_final.json",
              "contract": "pre_native_contract.json"}
@@ -144,6 +148,8 @@ def assemble_one(toy, bundle, point_control, renderer, *, point_binding):
     if record["split"] != "train" or record["id"] != toy.name:
         raise RuntimeError("supervision is exact-identity TRAIN only")
     if bundle is None or bundle.get("target") is None:
+        if bundle is not None and bundle["contract"]["case"] != toy.name:
+            raise RuntimeError("infeasible teacher case identity mismatch")
         return {"id": toy.name, "status": "missing_or_infeasible_teacher", "usable": False,
                 "teacher_status": None if bundle is None else bundle.get("status")}
     from intervention_teacher import tensor_digest
@@ -169,7 +175,8 @@ def assemble_one(toy, bundle, point_control, renderer, *, point_binding):
             "point_source_binding": point_binding,
             "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
             "renderer_sha256": hashlib.sha256(Path(renderer.__file__).read_bytes()).hexdigest(),
-            "scope": "matched graph-only context-specific supervision; no English/general-intervention certificate"}
+            "scope": "matched graph-only context-specific supervision; no English/general-intervention certificate",
+            "eventual_learning_scope": LEARNING_SCOPE}
 
 
 def assemble_catalog(entries, renderer):
@@ -196,4 +203,5 @@ def assemble_catalog(entries, renderer):
             rows.append({"id": ident, "status": "assembly_error", "usable": False,
                          "error_type": type(exc).__name__, "error": str(exc)})
     return {"rows": rows, "complete_pairing": all(row["usable"] for row in rows),
-            "scope": "all24 predeclared TRAIN IDs retained; no silent dropping or replacements"}
+            "scope": "all24 predeclared TRAIN IDs retained; no silent dropping or replacements",
+            "eventual_learning_scope": LEARNING_SCOPE}

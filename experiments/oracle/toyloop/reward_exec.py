@@ -324,6 +324,62 @@ def reward_unit_suff(meta: dict, completion: str) -> float:
     return _reward_suff(meta, completion, complete=True)
 
 
+WIRING_MDL_LAMBDA = 0.02
+
+
+def reward_wiring_mdl(meta: dict, completion: str) -> float:
+    """Opt-in point fidelity minus an executed-description proxy, not English simplicity.
+
+    Generic entrypoint: reward_exec:reward_wiring_mdl. Price compiled rank-one
+    nodes/connections, normalized by the same toy's full architecture; ignore
+    discarded token annotations and prose. No gold edges or extra full forwards.
+    """
+    parsed = circuit.parse(completion)
+    if not parsed.ok or parsed.bad:
+        return -1.0
+    try:
+        scored = score_wiring(meta["toy"], completion, texts=texts_of(meta["toy"]), description=True)
+    except ValueError:
+        return -1.0
+    return wiring_mdl_value(scored)
+
+
+def wiring_mdl_value(scored: dict) -> float:
+    """Fixed objective, with all inputs retained and no teacher-dependent pricing."""
+    rows = scored["per_text"]
+    if not rows or any(not math.isfinite(r["suff"]) or not 0 <= r["suff"] <= 1
+                       or not math.isfinite(r["description_cost"]) or not 0 <= r["description_cost"] <= 1
+                       for r in rows):
+        raise ValueError("invalid fidelity/description measurements")
+    fidelity = (sum(r["suff"] for r in rows) / len(rows) + min(r["suff"] for r in rows)) / 2
+    cost = sum(r["description_cost"] for r in rows) / len(rows)
+    return fidelity - WIRING_MDL_LAMBDA * cost
+
+
+def executed_description(graph, nat, positions: int, targets: list[int], full_bits=None) -> dict:
+    """Native graph description only; fixed architecture budget needs no execution."""
+    import native
+    try:
+        counts = [int(nat.C[name]) for name in nat.names]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("invalid executed-description architecture dimensions") from exc
+    if any(count < 0 or count != nat.C[name] for name, count in zip(nat.names, counts)):
+        raise RuntimeError("executed-description component counts must be nonnegative integers")
+    components = sum(counts)
+    if positions <= 0 or components <= 0:
+        raise RuntimeError("executed-description architecture must have positive dimensions")
+    bits = graph.bits(positions, components, targets)
+    if full_bits is None:
+        nodes = {(name, pos, piece) for name in nat.names for pos in range(positions)
+                 for piece in range(int(nat.C[name]))}
+        full_bits = native.Graph(nodes, complete=True).bits(positions, components, targets)
+    if (not math.isfinite(bits) or not math.isfinite(full_bits) or full_bits <= 0
+            or bits < 0 or bits > full_bits):
+        raise RuntimeError("compiled description is outside its architecture budget")
+    return {"description_bits": bits, "full_architecture_bits": full_bits,
+            "description_cost": bits / full_bits}
+
+
 def _reward_suff(meta: dict, completion: str, *, complete: bool) -> float:
     parsed = circuit.parse(completion)
     if not parsed.ok or parsed.bad:
@@ -338,7 +394,7 @@ def _reward_suff(meta: dict, completion: str, *, complete: bool) -> float:
     return (sum(suff) / len(suff) + min(suff)) / 2
 
 
-def score_wiring(toy, completion: str, *, nat=None, texts=None, complete=False) -> dict:
+def score_wiring(toy, completion: str, *, nat=None, texts=None, complete=False, description=False) -> dict:
     """Independent point-sufficiency diagnostic for the stated inter-unit wiring.
 
     Unlike the legacy unit-selection reward, actually execute Mermaid unit edges.
@@ -365,6 +421,7 @@ def score_wiring(toy, completion: str, *, nat=None, texts=None, complete=False) 
     if not texts:
         raise ValueError("wiring evaluation requires at least one input")
     ge, rows = goal_eval.GoalEval(nat), []
+    budgets = {}
     with torch.no_grad():
         for ids in texts:
             graph = circuit.unit_graph(parsed, bound, ids)
@@ -380,6 +437,10 @@ def score_wiring(toy, completion: str, *, nat=None, texts=None, complete=False) 
                          "top": int(q[0, -1].argmax()), "reference_top": int(ref[0, -1].argmax()),
                          "suff": min(1.0, max(0.0, 1.0 - error / max(null_error, 1e-9))),
                          "nodes": graph.count(), "edges": sum(native.implied_edges(graph.nodes, targets)) if complete else graph.edges()})
+            if description:
+                priced = executed_description(graph, nat, len(ids), targets, budgets.get(len(ids)))
+                budgets[len(ids)] = priced["full_architecture_bits"]
+                rows[-1].update(priced)
     return {"scope": ("complete same-unit connections" if complete else "executed inter-unit/output wiring") + "; token labels and English unverified",
             "remainders": "off", "embedding": "on", "texts": len(rows), "per_text": rows,
             "suff": sum(r["suff"] for r in rows) / len(rows),

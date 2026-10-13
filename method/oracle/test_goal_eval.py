@@ -1012,6 +1012,21 @@ def test_adversary_flips_finds_the_worst_single(tiny):
     assert len(row["mask_flips_omitted"][1]) == 1
 
 
+def test_adversary_flips_past_the_omitted(tiny):
+    """A budget past what a circuit leaves out switches every omission on (no weaker than a smaller budget), and VPD's
+    complete answer, leaving nothing out, scores 1 at every budget with nothing switched on."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    pool = tiny_pool(nat, tx.ids)
+    full, = ge.adversary_flips(tx, [native.Graph(every, complete=True)], pool, "omitted", ms=(1, 4), steps=2, restarts=2, k=6)
+    assert all(abs(full["f1_flips_omitted"][m] - 1.0) < 1e-6 and full["mask_flips_omitted"][m] == [] for m in (1, 4)), full
+    held = [nd for nd in every if nd[1] <= max(tx.targets)]
+    two = native.Graph(held[2:], complete=True)
+    row, = ge.adversary_flips(tx, [two], pool, "omitted", ms=(1, 4), steps=2, restarts=2, k=6)
+    assert sorted(row["mask_flips_omitted"][4]) == sorted(held[:2]) or row["f1_flips_omitted"][4] == row["f1_flips_omitted"][1]
+    assert row["f1_flips_omitted"][4] <= row["f1_flips_omitted"][1]
+
+
 def test_graph_ref_is_graph_inside_masked_outside(tiny):
     """C's semantics (graph_ref): every connection stated is the masked run of the circuit and the mask u (with no u
     and with a random one, remainders live and off); all but one connection is the independent forward with that

@@ -4286,7 +4286,9 @@ class GoalEval:
         restarts starts (one the gradient's top m at nothing switched on, the others random), then the top m
         switched on and scored in float32, beside the m best of a measured shortlist (SCREEN parts with the largest
         gradient either way, each switched on alone, in the search precision: the screens only rank which parts are
-        tried; every reported number is a float32 run); the worst of them, at most m (no weaker than a smaller budget). Per circuit {f"f1_flips_{lever}": {m: f1_adv},
+        tried; every reported number is a float32 run); the worst of them, at most m (no weaker than a smaller budget).
+        A budget past the lever's parts (a circuit leaving out fewer than m VPD actives) switches every one on, and a
+        circuit leaving out none scores its own run there (VPD's complete answer: 1). Per circuit {f"f1_flips_{lever}": {m: f1_adv},
         f"kl_flips_{lever}": {m: (KL_C, KL_VPD)}, f"mask_flips_{lever}": {m: the parts switched on, (site, position,
         subcomponent) or pool index}}. upto: only the budgets up to it are searched, every budget's starts still
         drawn (the same numbers as the full search at those budgets). screens: a caller's dict of measured shortlist
@@ -4394,6 +4396,16 @@ class GoalEval:
                     out[i][f"kl_flips_{lever}"][m] = (float(kc[r]), float(kv[r]))
                     out[i][f"mask_flips_{lever}"][m] = [flat[i][j] for j in xb[(i, m)][r].nonzero().flatten().tolist()]
             native.free(dev)
+        past = [(i, [m for m in ms if m > N[i] and (upto is None or m <= upto)]) for i in range(len(problems))]
+        past = [(i, mm) for i, mm in past if mm]
+        if past:  # a budget past the lever's parts: every one switched on (a circuit leaving nothing out: its own run)
+            with torch.no_grad():
+                for (i, mm), (kc, kv) in zip(past, batch(items([(i, torch.ones(1, N[i], device=dev)) for i, _ in past]), vpd=not omitted)):
+                    kv = kv0.expand_as(kc) if kv is None else kv
+                    for m in mm:
+                        out[i][f"f1_flips_{lever}"][m] = _fid(e0, float(kc[0]), float(kv[0]))
+                        out[i][f"kl_flips_{lever}"][m] = (float(kc[0]), float(kv[0]))
+                        out[i][f"mask_flips_{lever}"][m] = [flat[i][j] for j in range(N[i])]
         for row in out:  # at most m: a budget's attack is no weaker than a smaller budget's
             f, kl_, mask = row[f"f1_flips_{lever}"], row[f"kl_flips_{lever}"], row[f"mask_flips_{lever}"]
             prev = None

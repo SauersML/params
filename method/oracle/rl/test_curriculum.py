@@ -45,3 +45,11 @@ def test_the_circuit_arm_trains_on_the_scorers_r_and_stops_otherwise():
     assert tt.reward_mismatches(q, leak, [tt.stage_reward(s, 0) for s in leak]) == [0]
     assert tt.reward_mismatches(q, scores, [float("nan"), -10.0]) == [0]
     assert tt.reward_mismatches({}, leak, [tt.stage_reward(s, 0) for s in leak]) == []  # stage terms apply off the circuit arm
+
+
+def test_the_run_stops_on_a_scorer_outside_its_frozen_reward():
+    ok = [{"semantics": "n", "source": "fb33713abc"}] * 2
+    assert tt.scorer_mismatch(ok, "n", "fb33713") is None
+    assert tt.scorer_mismatch(ok, None, None) is None
+    assert "semantics 'c'" in tt.scorer_mismatch([ok[0], {"semantics": "c", "source": "fb33713abc"}], "n", None)
+    assert "source" in tt.scorer_mismatch([{"semantics": "n", "source": None}], "n", "fb33713")

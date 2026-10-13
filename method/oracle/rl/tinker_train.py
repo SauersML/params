@@ -179,6 +179,19 @@ def reward_mismatches(q: dict, scores: list, rewards: list) -> list:
     return [i for i, (s, r) in enumerate(zip(scores, rewards)) if not abs(r - s["reward"]) <= R_TOL]
 
 
+def scorer_mismatch(scores: list, semantics: str | None, source: str | None) -> str | None:
+    """Why the scorer is not the run's frozen reward, or None: every score's semantics (the scorer's GoalEval) must be
+    semantics and its source revision (the scorer pod's SOURCE) start with source, when given. reward_mismatches checks
+    the trainer against the scorer; this checks the scorer itself (a pod started without SEMANTICS scores under the
+    code's default, a pod built at origin/main under the newest reward)."""
+    for s in scores:
+        if semantics is not None and s.get("semantics") != semantics:
+            return f"the scorer runs semantics {s.get('semantics')!r}, not {semantics!r}"
+        if source is not None and not str(s.get("source") or "").startswith(source):
+            return f"the scorer's source is {s.get('source')!r}, not {source}"
+    return None
+
+
 def stage_lines(text: str, credits: list, stage: int) -> list:
     """The per-line credits the stage rewards: the circuit's lines always, the variable lines with E4x, the ANSWER and
     FINAL lines with E2g."""
@@ -584,6 +597,8 @@ def rl(a) -> None:
                     raise SystemExit(f"the scorer failed {failed} times (requests in {a.log}/failed_*.json)")
                 continue
             scores = r.json()["scores"]
+            if why := scorer_mismatch(scores, a.expect_semantics, a.expect_source):
+                raise SystemExit(f"step {step}, {q['task']}: {why}")
             rewards = [stage_reward(s, stage) for s in scores]
             if bad := reward_mismatches(q, scores, rewards):
                 (a.log / f"mismatch_{step}_{q['task']}.json").write_text(json.dumps({"rewards": rewards, "scores": scores, "answers": bad}))
@@ -680,6 +695,8 @@ def main():
                    "scorer or added to the advantages (the first RL run, the audit 10-13)")
     r.add_argument("--curriculum", action="store_true", help="advance a stage when the held-out evaluations (rl_heldout.sh "
                    "beside the run) stop improving on its terms (PLATEAU checkpoints)")
+    r.add_argument("--expect-semantics", help="stop unless every score comes from a scorer in this semantics (goal_eval.SEMANTICS)")
+    r.add_argument("--expect-source", help="stop unless every score comes from a scorer built at this revision (a prefix)")
     r.add_argument("--first-step", type=int, default=0, help="resume: the step --init's state was saved at (its checkpoint "
                                                                 "line kept; the run appends to the same --log)")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")

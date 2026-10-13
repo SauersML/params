@@ -400,7 +400,8 @@ def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model:
     return {"invariants": rows, "bad": bad, "credit": total, "holds": sum(r["holds"] for r in rows) / max(len(rows) + bad, 1)}
 
 
-def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "vpd4l", per_class: int = 1, fresh: int = 16) -> list[dict]:
+def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "vpd4l", per_class: int = 1, fresh: int = 16,
+                       structured: bool = False) -> list[dict]:
     """Verified INVARIANTS lines from a text's kept variables, training targets for the writer. vs: variables with
     "name", "group" (parsed) and "values" (var_classes' value maps: classes with token_ids and predicts_id). Per variable
     and input position p: fresh donor tokens the value map never saw (sampled from the model's prediction at p, the
@@ -410,7 +411,9 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
     per pair of variables at different positions, both carriers from two donors (each one's first fresh token), the
     model's own prediction on the text with both changes as the claim (independent recombination).
     Each line checked in the real model (Checker.outcome: holds, surprise against the no-change prediction, credit),
-    the lines that hold first."""
+    the lines that hold first. structured=True also retains each original Checker.check record in "executed",
+    including numeric intervention/outcome IDs and failed checks, for exact proof-bound supervision artifacts.
+    The default rows and number of model calls are unchanged."""
     import hashlib
 
     import components
@@ -462,7 +465,12 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
             k += 1
         else:
             line = f"remove {name} -> p(top) < 0.5"
-        out.append({"line": line, **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")}})
+        row = {"line": line, **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")}}
+        if structured:
+            import copy
+
+            row["executed"] = copy.deepcopy(r)
+        out.append(row)
     out.sort(key=lambda r: (not r["holds"], -r["surprise"]))
     for i, r in enumerate(out):
         r["line"] = f"I{i + 1}: {r['line']}"

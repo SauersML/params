@@ -58,12 +58,14 @@ carriers) and "e4x" (reward v3's sum of (2 e4_v - 1) m_v / sum m over the kept v
 V2, ... in input order, meanings empty for the writer. Output ~/mpd-data/graph_oracle/variables/<split>/<task>.json.
 
   var_teacher.py [TASK ...] --circuits DIR [--pool circuit|any] [--root DIR | --out DIR] [--device mps] [--draws 8]
+    [--invariants-teach-out FILE.jsonl]  (opt-in proof-bound training supervision; keeps original execution IDs)
   (no TASK: every textN.json in DIR)
 """
 from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import re
 import sys
@@ -348,7 +350,8 @@ def overlaps(used: set, group: list) -> bool:
     return any((n, t) in sites if c == BLOCK else ((n, t, c) in used or (n, t) in whole) for n, t, c in group)
 
 
-def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 8, pool: str = "circuit", log=print) -> dict:
+def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 8, pool: str = "circuit", log=print,
+          retain_invariant_evidence: bool = False) -> dict:
     import components
     import var_classes
 
@@ -506,7 +509,8 @@ def teach(ge: goal_eval.GoalEval, task: dict, answer: dict | None, draws: int = 
         import semantic  # verified INVARIANTS lines from the kept variables' value maps (fresh donors), for the writer
 
         sv = [{"name": v["name"], "inputs": v["inputs"], "group": pv["group"], "values": v["values"]} for v, pv in zip(kv, variables.parse(kv, nat.C))]
-        out["invariants"] = semantic.teacher_invariants(variables.Scorer(ge), tx, sv, task["model"])
+        out["invariants"] = semantic.teacher_invariants(variables.Scorer(ge), tx, sv, task["model"],
+                                                      structured=retain_invariant_evidence)
         release(nat.dev)
     out["teacher"].update(kept=len(kv), target=bool(kv), kinds={k: sum(v["kept"] and v["kind"] == k for v in out["variables"])
                                                                for k in ("input", "intermediate")},
@@ -530,17 +534,61 @@ def main():
     ap.add_argument("--draws", type=int, default=8)
     ap.add_argument("--pool", choices=("circuit", "any"), default="circuit",
                     help="carriers among the circuit's sites (its blocks and families there) or every site")
+    ap.add_argument("--invariants-teach-out", type=Path,
+                    help="append proof-bound supervised INVARIANTS artifacts (train text6000–7999 only)")
     args = ap.parse_args()
-    ge = goal_eval.GoalEval(native.Native(args.device))
     tasks = args.tasks or sorted((f.stem for f in args.circuits.iterdir() if re.fullmatch(r"text\d+\.json", f.name)),
                                  key=lambda s: int(s[4:]))
+    if args.invariants_teach_out:
+        import components
+
+        if len(tasks) != len(set(tasks)):
+            ap.error("invariant supervision requested duplicate tasks")
+        if args.invariants_teach_out.exists():
+            try:
+                existing = components.invariant_teach([args.invariants_teach_out])
+            except (OSError, ValueError) as error:
+                ap.error(f"existing invariant supervision file is invalid: {error}")
+            overlap = sorted(set(tasks) & existing.keys())
+            if overlap:
+                ap.error(f"invariant supervision already contains requested tasks: {', '.join(overlap)}")
+        for t in tasks:
+            if not re.fullmatch(r"text(?:6\d{3}|7\d{3})", t):
+                ap.error("invariant supervision accepts train text6000–7999 only")
+            task = json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())
+            if task.get("split") != "train" or task.get("id") != t or not (args.circuits / f"{t}.json").is_file():
+                ap.error("invariant supervision requires a training task and exact circuit file")
+    ge = goal_eval.GoalEval(native.Native(args.device))
     for t in tasks:
-        task = json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())
+        task_bytes = (native.TEXTS / "vpd4l" / f"{t}.json").read_bytes()
+        task = json.loads(task_bytes)
         out = args.out or (args.root / task["split"])
         out.mkdir(parents=True, exist_ok=True)
         f = args.circuits / f"{t}.json"
-        res = teach(ge, task, json.loads(f.read_text()) if f.exists() else None, args.draws, args.pool, log=lambda s: print(s, flush=True))
-        (out / f"{t}.json").write_text(json.dumps(res, indent=1))
+        circuit_bytes = f.read_bytes() if f.exists() else None
+        if args.invariants_teach_out:
+            if task.get("split") != "train" or task.get("id") != t or circuit_bytes is None:
+                raise ValueError("invariant supervision input changed after preflight")
+            import components
+            import semantic
+
+            source_hashes = {name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                             for name, path in (("semantic", semantic.__file__), ("var_teacher", __file__),
+                                                ("variables", variables.__file__), ("goal_eval", goal_eval.__file__),
+                                                ("native", native.__file__), ("components", components.__file__))}
+        res = teach(ge, task, json.loads(circuit_bytes) if circuit_bytes is not None else None, args.draws, args.pool,
+                    log=lambda s: print(s, flush=True), retain_invariant_evidence=bool(args.invariants_teach_out))
+        variable_file = out / f"{t}.json"
+        variable_file.write_text(json.dumps(res, indent=1))
+        if args.invariants_teach_out and (kept := [v for v in res["variables"] if v.get("kept")]):
+            source_hashes["variable_file"] = hashlib.sha256(variable_file.read_bytes()).hexdigest()
+            record = components.invariant_artifact(t, task["model"], kept, res.get("invariants") or [],
+                                                   task_sha256=hashlib.sha256(task_bytes).hexdigest(),
+                                                   circuit_sha256=hashlib.sha256(circuit_bytes).hexdigest(),
+                                                   source_sha256=source_hashes)
+            args.invariants_teach_out.parent.mkdir(parents=True, exist_ok=True)
+            with args.invariants_teach_out.open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
 
 
 if __name__ == "__main__":

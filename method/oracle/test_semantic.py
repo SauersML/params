@@ -6,6 +6,9 @@ right one earns -log2 p_base(y), a bold wrong one loses it), and fit_gate finds 
 """
 
 import math
+import copy
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -241,3 +244,155 @@ def test_different_outcomes_and_values_are_distinct_evidence(invariant_tokenizer
                        "I3: V1 from @0=' z' -> top ' y'", "I4: V2 from @0=' x' -> top ' y'"])
     got, bad = semantic.parse_invariants(text)
     assert bad == 0 and len(got) == 4
+
+
+@pytest.fixture
+def teacher_checker(monkeypatch):
+    from types import SimpleNamespace
+
+    state = {"calls": 0, "checks": []}
+    class FakeChecker:
+        def __init__(self, *args):
+            self.y0 = 0
+        def text(self, changes):
+            y = 2 if list(changes.values()) == [2] else 0
+            return {"lq": torch.nn.functional.one_hot(torch.tensor([y]), 4).float()}
+        def check(self, items):
+            state["calls"] += 1
+            rows = [{"intervention": copy.deepcopy(iv), "outcome": list(out), "holds": out[0] == "top",
+                     "surprise": 2.0 if out[0] == "top" else 1.0, "credit": 2.0 if out[0] == "top" else -1.0,
+                     "top": 2, "p_top": .75, "logp": -0.5} for iv, out in items]
+            state["checks"] = rows
+            return rows
+        def close(self):
+            pass
+    monkeypatch.setattr(semantic, "Checker", FakeChecker)
+    monkeypatch.setattr(torch, "multinomial", lambda *args, **kw: torch.tensor([2, 3]))
+    monkeypatch.setattr(components, "token_strings", lambda model, ids: [" x" if z == 2 else " y" for z in ids])
+    monkeypatch.setattr(components, "_token_of", lambda model, text: {"' x'": 2, "' y'": 3}.get(text))
+    sc = SimpleNamespace(nat=SimpleNamespace(reference=lambda *args: torch.full((1, 1, 4), .25).log()))
+    tx = SimpleNamespace(ids=[0], seed=1)
+    vs = [{"name": "V1", "inputs": [0], "group": [("h.0.mlp.c_fc", 0, 0)],
+           "values": [{"position": 0, "classes": [{"id": 0, "token_ids": [0]},
+                      {"id": 1, "token_ids": [1], "predicts_id": 2}]}]}]
+    return sc, tx, vs, state
+
+
+def test_teacher_structured_evidence_preserves_default_and_failed_checks(teacher_checker):
+    sc, tx, vs, state = teacher_checker
+    plain = semantic.teacher_invariants(sc, tx, vs, fresh=2)
+    retained = semantic.teacher_invariants(sc, tx, vs, fresh=2, structured=True)
+    assert state["calls"] == 2  # one unchanged checker execution per invocation
+    assert [{k: v for k, v in row.items() if k != "executed"} for row in retained] == plain
+    assert [row["holds"] for row in retained] == [True, False]
+    assert retained[0]["executed"]["intervention"] == {"transplants": [("V1", {0: 2})]}
+    assert retained[0]["executed"]["outcome"] == ["top", 2]
+    state["checks"][0]["intervention"]["transplants"][0][1][0] = 3
+    assert retained[0]["executed"]["intervention"]["transplants"][0][1][0] == 2
+
+
+def test_teacher_nonroundtripping_render_cannot_become_supervision(teacher_checker, monkeypatch):
+    sc, tx, vs, _ = teacher_checker
+    rows = semantic.teacher_invariants(sc, tx, vs, fresh=2, structured=True)
+    monkeypatch.setattr(components, "_token_of", lambda model, text: 1 if text == "' x'" else None)
+    raw = [{"name": "V1", "kept": True, "inputs": [0], "group": [["h.0.mlp.c_fc", 0, 0]], "feeds": []}]
+    with pytest.raises(ValueError, match="execution IDs"):
+        components.invariant_artifact("text6002", "vpd4l", raw, rows, task_sha256="a" * 64,
+                                      circuit_sha256="b" * 64, source_sha256={"semantic": "c" * 64})
+
+
+@pytest.mark.parametrize("task", ["text5999", "text8000", "text9000", "text9100"])
+def test_teacher_supervision_rejects_nontraining_ids_before_model(monkeypatch, tmp_path, task):
+    import var_teacher
+
+    monkeypatch.setattr(var_teacher.native, "Native", lambda *args: pytest.fail("model loaded for forbidden supervision"))
+    monkeypatch.setattr(sys, "argv", ["var_teacher", task, "--circuits", str(tmp_path),
+                                      "--invariants-teach-out", str(tmp_path / "labels.jsonl")])
+    with pytest.raises(SystemExit) as error:
+        var_teacher.main()
+    assert error.value.code == 2
+
+
+def test_teacher_cli_emits_bound_artifact_without_extra_checks(monkeypatch, tmp_path):
+    import var_teacher
+
+    task = {"id": "text6002", "model": "vpd4l", "split": "train"}
+    texts = tmp_path / "texts" / "vpd4l"; texts.mkdir(parents=True)
+    task_file = texts / "text6002.json"; task_file.write_text(json.dumps(task))
+    circuits = tmp_path / "circuits"; circuits.mkdir()
+    circuit_file = circuits / "text6002.json"; circuit_file.write_text('{"nodes": [], "edges": []}')
+    original_circuit = circuit_file.read_bytes()
+    calls = []
+    variable = {"name": "V1", "kept": True, "inputs": [0], "group": [["h.0.mlp.c_fc", 0, 0]], "feeds": []}
+    row = {"line": "I1: remove V1 -> p(top) < 0.5", "executed": {"intervention": {"remove": ["V1"]},
+           "outcome": ["drop", .5], "holds": True, "credit": 1.0, "surprise": 1.0}}
+    def fake_teach(ge, passed_task, answer, *args, **kwargs):
+        assert passed_task == task and kwargs["retain_invariant_evidence"] is True
+        calls.append(True)
+        circuit_file.write_text('{"changed_after_scoring_input": true}')
+        return {"variables": [variable], "invariants": [row]}
+    monkeypatch.setattr(var_teacher, "teach", fake_teach)
+    monkeypatch.setattr(var_teacher.native, "TEXTS", texts.parent)
+    monkeypatch.setattr(var_teacher.native, "Native", lambda *args: object())
+    monkeypatch.setattr(var_teacher.goal_eval, "GoalEval", lambda nat: object())
+    labels = tmp_path / "labels.jsonl"
+    monkeypatch.setattr(sys, "argv", ["var_teacher", "text6002", "--circuits", str(circuits), "--out", str(tmp_path / "out"),
+                                      "--invariants-teach-out", str(labels)])
+    var_teacher.main()
+    record = json.loads(labels.read_text())
+    assert calls == [True] and record["variables"] == [variable]
+    assert record["task_sha256"] == hashlib.sha256(task_file.read_bytes()).hexdigest()
+    assert record["circuit_sha256"] == hashlib.sha256(original_circuit).hexdigest()
+    assert record["eligible_lines"] == [row["line"]]
+
+
+def test_teacher_default_cli_does_not_construct_supervision(monkeypatch, tmp_path):
+    import var_teacher
+
+    texts = tmp_path / "texts" / "vpd4l"; texts.mkdir(parents=True)
+    (texts / "text9000.json").write_text(json.dumps({"id": "text9000", "model": "vpd4l", "split": "heldout"}))
+    calls = []
+    def fake_teach(*args, **kwargs):
+        calls.append(kwargs["retain_invariant_evidence"])
+        return {"variables": [], "invariants": []}
+    monkeypatch.setattr(var_teacher, "teach", fake_teach)
+    monkeypatch.setattr(var_teacher.native, "TEXTS", texts.parent)
+    monkeypatch.setattr(var_teacher.native, "Native", lambda *args: object())
+    monkeypatch.setattr(var_teacher.goal_eval, "GoalEval", lambda nat: object())
+    monkeypatch.setattr(components, "invariant_artifact", lambda *a, **k: pytest.fail("default CLI constructed supervision"))
+    monkeypatch.setattr(sys, "argv", ["var_teacher", "text9000", "--circuits", str(tmp_path), "--out", str(tmp_path / "out")])
+    var_teacher.main()
+    assert calls == [False]
+    assert json.loads((tmp_path / "out/text9000.json").read_text()) == {"variables": [], "invariants": []}
+
+
+def test_teacher_supervision_overlap_preserves_existing_file_before_model(monkeypatch, tmp_path):
+    import var_teacher
+
+    raw = [{"name": "V1", "kept": True, "group": [["h.0.mlp.c_fc", 0, 0]], "inputs": [0], "feeds": []}]
+    row = {"line": "I1: remove V1 -> p(top) < 0.5", "executed": {"intervention": {"remove": ["V1"]},
+           "outcome": ["drop", .5], "holds": True, "credit": 1.0, "surprise": 1.0}}
+    record = components.invariant_artifact("text6002", "vpd4l", raw, [row], task_sha256="a" * 64,
+                                          circuit_sha256="b" * 64, source_sha256={"semantic": "c" * 64})
+    labels = tmp_path / "labels.jsonl"; labels.write_text(json.dumps(record) + "\n")
+    before = labels.read_bytes()
+    monkeypatch.setattr(var_teacher.native, "Native", lambda *args: pytest.fail("overlap loaded model"))
+    monkeypatch.setattr(var_teacher, "teach", lambda *a, **k: pytest.fail("overlap scored task"))
+    monkeypatch.setattr(sys, "argv", ["var_teacher", "text6002", "--circuits", str(tmp_path),
+                                      "--invariants-teach-out", str(labels)])
+    with pytest.raises(SystemExit) as error:
+        var_teacher.main()
+    assert error.value.code == 2 and labels.read_bytes() == before
+
+
+def test_teacher_supervision_duplicate_requested_ids_reject_before_model(monkeypatch, tmp_path):
+    import var_teacher
+
+    labels = tmp_path / "labels.jsonl"
+    monkeypatch.setattr(var_teacher.native, "Native", lambda *args: pytest.fail("duplicate loaded model"))
+    monkeypatch.setattr(var_teacher, "teach", lambda *a, **k: pytest.fail("duplicate scored task"))
+    monkeypatch.setattr(sys, "argv", ["var_teacher", "text6002", "text6002", "--circuits", str(tmp_path),
+                                      "--invariants-teach-out", str(labels)])
+    with pytest.raises(SystemExit) as error:
+        var_teacher.main()
+    assert error.value.code == 2 and not labels.exists()

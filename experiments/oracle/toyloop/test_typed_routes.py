@@ -93,3 +93,53 @@ def test_roundtrip_preserves_disconnected_ports_and_rejects_missing_contract():
         routes.parse_mermaid(text.replace('attention=causal_softmax', 'attention=restricted'), target=12)
     with pytest.raises(ValueError, match='duplicate selected'):
         routes.to_mermaid(spec[0] + [spec[0][0]], spec[1], spec[2], target=12)
+
+
+def test_point_sufficient_route_can_fail_matched_literal_weight_edit(fixture):
+    """One fixed analytic counterexample; point KL is not intervention fidelity."""
+    import native
+    import weight_family
+
+    nat, ids = fixture
+    target = len(ids) - 1
+    spec = routes.multihop_ports('L0H3', 'L1H1', 9, 10, target)
+    sparse = routes.compile_mermaid(nat, len(ids), routes.to_mermaid(*spec, target=target))
+    # Same two heads, all positions, all architecture connections. Both graph
+    # selections are fixed before editing: no activation or importance reselection.
+    nodes = {(n, t, c) for n in nat.names if '.attn.' in n
+             for c in range(nat.C[n])
+             if int(nat.units[n][c]) == {0: 3, 1: 1}[int(n.split('.')[1])]
+             for t in range(len(ids))}
+    parents, outputs = native.all_edges(sorted(nodes), [target])
+    dense = native.Graph(nodes, parents, outputs, complete=False)
+    run = lambda graph: nat.run(ids, [target], nat._plan([graph], len(ids)), *nat._zero())[0, -1]
+    full = lambda: nat.vpd.target_forward(torch.tensor([ids]))[0, target].log_softmax(-1)
+    kl = lambda p, q: float((p.exp() * (p-q)).sum()) / math.log(2)
+    site = 'h.0.attn.q_proj'
+    piece = int((nat.units[site] == 3).nonzero().flatten().min())
+    st = nat.target.site(site)
+    saved = {key: getattr(st, key).clone() for key in ('W', 'U', 'V', 'delta_T')}
+    edit = {'kind': 'subcomponent', 'what': [site, piece], 'k': 0.}
+    with torch.no_grad():
+        baseline = full()
+        assert kl(baseline, run(sparse)) < 1e-3
+        # Prime the full-reference cache before the edit; applied must invalidate it.
+        torch.testing.assert_close(nat.reference([ids], [target])[0, -1], baseline)
+        with weight_family.applied(nat, edit):
+            expected = saved['W'] - torch.outer(saved['U'][piece], saved['V'][:, piece])
+            torch.testing.assert_close(st.W, expected, atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(st.U[piece], saved['U'][piece] * 0., atol=0, rtol=0)
+            assert torch.equal(st.V, saved['V']) and torch.equal(st.delta_T, saved['delta_T'])
+            edited = full()
+            torch.testing.assert_close(nat.reference([ids], [target])[0, -1], edited, atol=1e-6, rtol=1e-6)
+            # Sparse positional path loses sufficiency after this exact matched edit;
+            # dense same-head control captures the alternative attention contributions.
+            assert kl(edited, baseline) > 10.
+            assert kl(edited, run(sparse)) > 1.
+            assert kl(edited, run(dense)) < 1e-3
+            torch.testing.assert_close(run(sparse), routes.independent_head_reference(nat, ids, sparse),
+                                       atol=3e-5, rtol=1e-6)
+        for key, value in saved.items():
+            assert torch.equal(getattr(st, key), value), key
+        torch.testing.assert_close(full(), baseline, atol=0, rtol=0)
+        torch.testing.assert_close(nat.reference([ids], [target])[0, -1], baseline, atol=1e-6, rtol=1e-6)

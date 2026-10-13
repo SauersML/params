@@ -246,7 +246,10 @@
 %% Sparse ordinary KL5.07e-7bits; four informative Q/K deletions give0.8841/1.5358bits despite correct top token.
 %% No-change full-model predictions lose13.05/13.66bits: sparse circuit tracks much of the effect but is not exact.
 %% Dense same-two-head/all-position control maxABS numericKL6.69e-8bits; sparse independent discrepancy below1e-6logprob.
-%% Sparse62nodes/252edges; dense520nodes/16047edges. Dense fidelity is costly; do not present it as a simple solution.
+%% Sparse62nodes/252edges; dense520nodes/16047edges. These count expanded structure, not runtime or literal description length.
+%% Next: bounded architecture-derived value/RMS closures; reuse native.on_path for dead computations and compare complete=True.
+%% Why: determine whether smaller faithful executable teacher targets exist; benchmark implicit versus explicit dense execution.
+%% Graph.bits is a structural complexity proxy charging implied edges, not a measured Mermaid description length.
 %% Regression37c8478 protects same-edit/cache/restoration semantics and this counterexample;17tests pass.
 %% All32rows retained (28weak/noeffect); cached-reference primed then edit checked against direct target_forward; weights restored.
 %% Artifact: mpd-data/scratch/variable_reward/typed_weight_interventions/{manifest,results,raw_distributions}.json and run.py.
@@ -390,7 +393,7 @@ flowchart BT
   CLAIMFIT["<b>Fit exact carrier descriptions</b><br/>53% fewer tokens; exact roundtrip;<br/>2 of15 full rows still fit limits;<br/>remaining cost is large carrier sets<br/>CHECK · codex/variable_reward"]
   WIRING["<b>Learn executable relations</b><br/>135M shared-start feasibility pilot;<br/>two free CPU forks, lower-memory updates;<br/>matched20 steps; paired report ready<br/>ACTIVE · codex/eval_recovery"]
   ROUTE["<b>Oracle-emittable token routing</b><br/>strict Mermaid preserves exact ports;<br/>wrong positions and ports execute;<br/>graph-local causal softmax explicit<br/>DONE opt-in adapter · codex/fork_review"]
-  ROUTEEDIT["<b>Point fit misses weight effects</b><br/>sparse circuit: 1.54 bits after Q cut;<br/>dense predicts edits, costs64x edges;<br/>optimize compactness and edit fidelity<br/>CHECK · codex/variable_reward"]
+  ROUTEEDIT["<b>Compact, edit-faithful targets</b><br/>repair the sparse routing failure;<br/>test dependency closure and dead pruning;<br/>measure latency, not just expanded edges<br/>ACTIVE · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
   FBASE["<b>Matched QA baseline measured</b><br/>DeepSeek59.50%, Qwen65.64%;<br/>cheap features66.76% on same179 QA;<br/>prioritize circuit fidelity over QA scaling<br/>CHECK · codex · $0.145 spent"]
 
@@ -569,7 +572,7 @@ flowchart BT
   class QAONLY check
   class WIRING active
   class ROUTE done
-  class ROUTEEDIT check
+  class ROUTEEDIT active
   class PYV done
   class FBASE check
   class CLAIMFIT check

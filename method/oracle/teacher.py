@@ -1087,11 +1087,19 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
         import backup as backup_mod                          # compensators a removal of the start's nodes recruits in the
                                                              # model, as subcomponents (s_nodes binds on 13 of 20 starts)
         have = sorted(nd for n in nat.names for nd in ((n, int(t), int(c)) for t, c in start[n].nonzero().tolist()))
+        before = None                                        # the unexpanded start's phi against the bar (the report's
+        if phi_pool is not None:                             # start -> expanded -> pruned)
+            row = ge.fidelity(tx, [native.Graph(have, complete=True)], phi_pool, mode="reward", split="search")[0]
+            before = goal_eval.phi(row, start=ge.tau(tx, phi_pool, "search")["phi_tau"])
+            fam = {f: goal_eval.family_score(row, f) for f in goal_eval.PHI_FAMILIES}
+            log(f"  backup: start ({len(have)} subcomponents) phi {before[0]} (bar {before[1]}) "
+                + " ".join(f"{f} {s:.3f}" for f, s in fam.items() if s is not None), flush=True)
         g_exp, brec = backup_mod.expand_circuit(ge, tx, native.Graph(have, complete=True), subcomponents=True)
         for n, t, c in goal_eval.expand_blocks(g_exp, nat.C).node_set():
             start[n][t, c] = True
         backed = {"start": brec.get("start"), "final": brec.get("final"), "chosen": brec.get("chosen"),
-                  "added": int(sum(int(start[n].sum()) for n in nat.names)) - len(have)}
+                  "added": int(sum(int(start[n].sum()) for n in nat.names)) - len(have), "start_size": len(have),
+                  "phi_start": before and before[0], "bar": before and before[1]}
         log(f"  backup: + {backed['added']} subcomponents ({brec.get('start')} -> {brec.get('final')})", flush=True)
     pr = Pruner(ge, tx, start, live=CONVENTION == "live", B=B)
     graph_of = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
@@ -1984,8 +1992,9 @@ def main():
         with (args.out / f"summary_{args.offset}.jsonl").open("a") as f:
             f.write(json.dumps(row) + "\n")
         if "blocks" in row:                                  # the influential-blocks search (block_search)
-            k = row["blocks"]
-            print(f"{path.stem}: {k['stages'][-1]['blocks']} blocks, {k['stages'][-1]['subcomponents']} subcomponents at "
+            k = row["blocks"]                                # the stage written (the phi check's pick, else the last)
+            w = next((s for s in k["stages"] if s["stage"] == k.get("phi_stage")), k["stages"][-1])
+            print(f"{path.stem}: {w['blocks']} blocks, {w['subcomponents']} subcomponents at "
                   f"{len(k['positions'])} positions (m {k['m']}), F1 {k['f1']:.3f}, N {k['n']}, {k.get('accept')}, {k['bits']:.0f} bits"
                   + (f"; with connections {row['best_edges']['edges']} of {row['best_edges']['all_edges']}, graph F1 "
                      f"{row['best_edges']['f1_graph']:.3f}" if "best_edges" in row else "") + f", {row['seconds']:.0f}s", flush=True)

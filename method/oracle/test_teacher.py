@@ -239,7 +239,7 @@ def test_no_strand_leaves_no_node_unconnected():
 def test_edge_levels():
     """--edge-levels: the default ("connection") keeps exactly the connections of edge_path's single-connection rounds
     run directly at connect's budget (the F1 budget or 5% of the node set's own log recovery, 92b074f; Connector.connect
-    before the flag); writer blocks first end no farther from the model than the start or the F1 budget, and measure
+    before the flag); writer blocks first end no farther from the model than the start or that budget, and measure
     fewer subsets."""
     nat, pr = pruner(teacher.CONVENTION == "live")
     ge, tx = pr.ge, pr.tx
@@ -253,7 +253,7 @@ def test_edge_levels():
     assert kept == [e for e, k in zip(direct.edges, direct.on.tolist()) if k]
     coarse = teacher.Connector(ge, tx, pr, empty, vpd, lambda on, inner=0, out=0: 0.0, 32, levels=("writer", "connection"))
     _, s2, steps2, ep2 = coarse.connect(on, 0.0)[:4]
-    assert s2["kl_graph"] <= max(plain.budget, steps2[0]["kl_graph"]) * (1 + REL)
+    assert s2["kl_graph"] <= max(s2["budget"], steps2[0]["kl_graph"]) * (1 + REL)
     assert ep2.measured < ep.measured
 
 

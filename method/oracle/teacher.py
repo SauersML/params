@@ -132,6 +132,8 @@ REPAIR_M = 4          # the omitted lever's budget the flip repair answers (goal
 EDGE_NODES = 6000     # the influential search wires circuits of at most this many subcomponents (a block's every one
 # counted): text9002's 31 blocks and 20,063 subcomponents overflowed the host's memory in EdgePruner
 ACCEPT_BATCH = 8      # Descent.prune's accept checks per call: the largest prefixes within the budget first
+PP_PROMPTS = 16       # Acceptance._per_draw's prompts per path-patched call: v23q's text9000 ran out of memory at its 64
+# (the current circuit, 8 candidates and VPD's answer over a check's 64 changed texts in one dense run, 3 teachers a card)
 PACK_FLIP_ROWS = 40   # goal_eval's FLIP_ROWS (160) and CHANGED_ROWS (64) in teacher runs, rows per run only: three
 PACK_CHANGED_ROWS = 32  # teachers per 48 GB card (the lead's packing) ran one out of memory in adversary_flips at 160
 FLOOR_SLACK = 0.95    # the phi check's slack: the residual within 1/0.95 of the bar's
@@ -747,7 +749,8 @@ class Acceptance:
 
     def _per_draw(self, graphs: list, prompts: list) -> list:
         """Per graph its per-draw records [prompt, KL_C, KL_VPD, W] on prompts (goal_eval's "weighted" draws, pooled by
-        goal_eval._ratio_pool): one engine.Engine.path_patched call with VPD's answer beside the graphs."""
+        goal_eval._ratio_pool): engine.Engine.path_patched calls with VPD's answer beside the graphs, PP_PROMPTS prompts
+        a call."""
         import engine
 
         tx, nat = self.tx, self.ge.nat
@@ -756,7 +759,8 @@ class Acceptance:
         if "_disc_vpd" not in tx.__dict__:
             tx.__dict__["_disc_vpd"] = native.Graph([(n, int(t), int(c)) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()],
                                                     complete=True)
-        lq = tx.__dict__["_pp_engine"].path_patched(list(graphs) + [tx.__dict__["_disc_vpd"]], [tuple(x) for x in prompts])
+        gs, E = list(graphs) + [tx.__dict__["_disc_vpd"]], tx.__dict__["_pp_engine"]
+        lq = torch.cat([E.path_patched(gs, [tuple(x) for x in prompts[s0:s0 + PP_PROMPTS]]) for s0 in range(0, len(prompts), PP_PROMPTS)], 1)
         refs = tx.__dict__.setdefault("_disc_refs", {})       # (p, z) -> (the model on x', W)
         out = [[None] * len(prompts) for _ in graphs]
         for d, (p, z) in enumerate(prompts):

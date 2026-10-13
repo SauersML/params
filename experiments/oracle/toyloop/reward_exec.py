@@ -447,6 +447,119 @@ def score_wiring(toy, completion: str, *, nat=None, texts=None, complete=False, 
             "kl_bits": sum(r["kl_bits"] for r in rows) / len(rows)}
 
 
+def intervention_mdl_value(rows):
+    """Direct distribution agreement, including the worst fixed intervention."""
+    if not rows:
+        raise RuntimeError("empty intervention panel")
+    fidelities = []
+    costs = []
+    for row in rows:
+        kl, cost = row["kl_bits"], row["description_cost"]
+        if not math.isfinite(kl) or kl < 0 or not math.isfinite(cost) or not 0 <= cost <= 1:
+            raise RuntimeError("invalid intervention measurement")
+        fidelities.append(math.exp(-kl))
+        costs.append(cost)
+    return (sum(fidelities) / len(fidelities) + min(fidelities)) / 2 - WIRING_MDL_LAMBDA * sum(costs) / len(costs)
+
+
+class InvalidInterventionCandidate(ValueError):
+    """Only candidate grammar/architecture failures, not verifier failures."""
+
+
+def score_wiring_interventions(toy, completion, *, nat=None, texts=None, panel=None, evidence_sink=None):
+    """Original-basis head/MLP-output edits; sparse gets no dense trace.
+
+    Every architecture head is edited, including omitted heads. No-edit and
+    deletion/half-scale worlds are fixed independently of the candidate.
+    """
+    import copy
+    import goal_eval
+    import planted
+    from head_counterfactual import scaled_head, kl_bits
+    from reward_interventions import scaled_neuron, clear_intervention_caches
+
+    nat = planted.native_of(toy.sd, toy.cfg) if nat is None else nat
+    panel = ([("head", layer, head, scale) for layer in range(nat.target.n_layer)
+              for head in range(nat.target.n_head) for scale in (0.0, 0.5)]
+             + [("neuron", layer, neuron, scale) for layer in range(nat.target.n_layer)
+                for neuron in range(nat.target.site(f"h.{layer}.mlp.down_proj").W.shape[1])
+                if bool(nat.target.site(f"h.{layer}.mlp.down_proj").W[:, neuron].ne(0).any())
+                for scale in (0.0, 0.5)]
+             if panel is None else list(panel))
+    if not panel:
+        raise RuntimeError("intervention panel must be nonempty")
+    for entry in panel:
+        if not isinstance(entry, (tuple, list)) or len(entry) != 4:
+            raise RuntimeError("invalid fixed intervention entry")
+        kind, layer, head, scale = entry
+        if (kind not in ("head", "neuron") or type(layer) is not int
+                or type(head) is not int or not 0 <= layer < nat.target.n_layer
+                or scale not in (0.0, 0.5)):
+            raise RuntimeError("invalid fixed head/MLP intervention panel")
+        limit = (nat.target.n_head if kind == "head" else
+                 nat.target.site(f"h.{layer}.mlp.down_proj").W.shape[1]
+                 if kind == "neuron" and 0 <= layer < nat.target.n_layer else 0)
+        if not 0 <= head < limit:
+            raise RuntimeError("invalid fixed head intervention panel")
+    panel = [tuple(entry) for entry in panel]
+    if len(set(panel)) != len(panel):
+        raise RuntimeError("intervention panel must be unique")
+    bound = copy.copy(toy)
+    bound.meta = dict(toy.meta)
+    bound.meta["decomposition"] = {n: (nat.target.site(n).U, nat.target.site(n).V, nat.units[n]) for n in nat.names}
+    texts = list(texts_of(toy) if texts is None else texts)
+    if not texts:
+        raise RuntimeError("empty intervention input panel")
+    parsed = circuit.parse(completion)
+    if not parsed.ok or parsed.bad:
+        raise InvalidInterventionCandidate("invalid circuit grammar")
+    try:
+        graphs = [circuit.unit_graph(parsed, bound, ids) for ids in texts]
+    except ValueError as exc:
+        raise InvalidInterventionCandidate(str(exc)) from exc
+    prices = [executed_description(g, nat, len(ids), [len(ids) - 1]) for g, ids in zip(graphs, texts)]
+    rows = []
+
+    def measure(kind="none", layer=None, head=None, scale=1.0):
+        clear_intervention_caches(nat)
+        ge = goal_eval.GoalEval(nat)
+        for ids, graph, price in zip(texts, graphs, prices):
+            targets = [len(ids) - 1]
+            p = nat.reference([ids], targets)
+            q = ge.graph_ref(ids, targets, graph, live=False)
+            try:
+                error = kl_bits(p, q)
+            except ValueError as exc:
+                raise RuntimeError("invalid intervention distributions") from exc
+            rows.append({"kind": kind, "layer": layer, "unit": head, "scale": scale,
+                         "ids": list(ids), "kl_bits": error,
+                         "reference_top": int(p[0, -1].argmax()),
+                         "top": int(q[0, -1].argmax()), **price})
+            if evidence_sink is not None:
+                evidence_sink(nat, ids, rows[-1], p, q)
+
+    with torch.no_grad():
+        measure()
+        for kind, layer, unit, scale in panel:
+            edit = scaled_head if kind == "head" else scaled_neuron
+            with edit(nat, layer, unit, scale):
+                measure(kind, layer, unit, scale)
+            clear_intervention_caches(nat)
+    return {"scope": "finite original-basis head/MLP-output panel only; own routing/norms; no live remainder; no arbitrary/joint/English certificate",
+            "panel": panel, "dense_calls": len(rows), "sparse_calls": len(rows),
+            "per_world": rows, "reward": intervention_mdl_value(rows)}
+
+
+def reward_wiring_intervention_mdl(meta, completion):
+    parsed = circuit.parse(completion)
+    if not parsed.ok or parsed.bad:
+        return -1.0
+    try:
+        return score_wiring_interventions(meta["toy"], completion, panel=meta.get("intervention_panel"))["reward"]
+    except InvalidInterventionCandidate:
+        return -1.0
+
+
 def check(toys) -> dict:
     """gt vs gt minus each unit, gt plus the distractors, distractors, empty: per family the worst margin."""
     import render

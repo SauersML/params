@@ -148,7 +148,7 @@ def attractor(tdir: str, draws: int = 8):
     ge = goal_eval.GoalEval(native.Native())
     ge.nat.LENGTHS_KEPT = 1
     nat = ge.nat
-    out = DATA / f"cg_attractor{SUF}.jsonl"
+    out = OUTROOT / f"cg_attractor{SUF}{os.environ.get('GEN_TAG', '')}.jsonl"
     done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
     names = sorted(p.stem for p in tdir.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_"))
     for nm in names:
@@ -309,7 +309,7 @@ def moved(tdir: str):
     names = sorted(p.stem for p in tdir.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cgb_"))
     nat = native.Native()
     ges = {"c": goal_eval.GoalEval(nat, semantics="c")}
-    out = DATA / f"cg_moved{SUF}.jsonl"
+    out = OUTROOT / f"cg_moved{SUF}{os.environ.get('GEN_TAG', '')}.jsonl"
     done = {json.loads(x)["name"] for x in out.read_text().splitlines()} if out.exists() else set()
     for nm in names:
         if nm in done:
@@ -450,8 +450,11 @@ def report60():
     the reward's changed-input claims) or "standalone" (the circuit's masked run alone on each input; sufficiency)."""
     meta = json.loads((DATA / "causalgym_texts_b.json").read_text())
     rd = lambda f: [json.loads(x) for x in (DATA / f).read_text().splitlines()] if (DATA / f).exists() else []  # noqa: E731
-    att = {r["name"]: r for r in rd(f"cg_attractor{SUF}.jsonl")}
-    mov = {r["name"]: r for r in rd(f"cg_moved{SUF}.jsonl")}
+    import templates
+
+    more = lambda stem: [json.loads(x) for p in templates.run_outputs(f"{stem}*.jsonl") for x in p.read_text().splitlines()]  # noqa: E731
+    att = {r["name"]: r for r in rd(f"cg_attractor{SUF}.jsonl") + more(f"cg_attractor{SUF}")}
+    mov = {r["name"]: r for r in rd(f"cg_moved{SUF}.jsonl") + more(f"cg_moved{SUF}")}
     tst = {}
     import templates
 
@@ -471,8 +474,10 @@ def report60():
     held = [n for n in names if att[n]["at_variable"] > 0]
     print(f"  move carried, standalone (c), subject-holding circuits: median {fmt(_boot([mov[n]['moved_c'] for n in held], np.median))}, "
           f"mean {fmt(_boot([mov[n]['moved_c'] for n in held]))}")
-    print(f"  move carried, standalone (x), subject-holding circuits: median {fmt(_boot([mov[n]['moved_x'] for n in held], np.median))}, "
-          f"mean {fmt(_boot([mov[n]['moved_x'] for n in held]))}")
+    hx = [n for n in held if mov[n].get("moved_x") is not None]
+    if hx:
+        print(f"  move carried, standalone (x, the {len(hx)} circuits measured before the cutover): median "
+              f"{fmt(_boot([mov[n]['moved_x'] for n in hx], np.median))}, mean {fmt(_boot([mov[n]['moved_x'] for n in hx]))}")
     pp = [tst[n]["teacher"].get("s_track_pp") for n in names if n in tst and "teacher" in tst[n]]
     print(f"  pp: s_track_pp (the minimal pair first among the changes), median {fmt(_boot(pp, np.median))}")
     pref = [tst[n]["teacher"]["reward"] > tst[n]["teacher_variable_at_attractor"]["reward"] for n in names

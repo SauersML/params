@@ -125,6 +125,8 @@ MAX_NODES = 266       # the answer budget in nodes: components.ANSWER_BUDGET (3,
                       # 1.5 connections per node at 3.0 tokens each (primerl's measurements with Qwen3-8B's tokenizer)
 LEVELS = ("position", "site", "chunk64", "chunk16", "chunk4", "subcomponent")  # blocks, coarse to fine
 REPAIR_M = 4          # the omitted lever's budget the flip repair answers (goal_eval.adversary_flips; the reward's term)
+EDGE_NODES = 6000     # the influential search wires circuits of at most this many subcomponents (a block's every one
+# counted): text9002's 31 blocks and 20,063 subcomponents overflowed the host's memory in EdgePruner
 ACCEPT_BATCH = 8      # Descent.prune's accept checks per call: the largest prefixes within the budget first
 KL_FLOOR = 1e-9       # a KL's floor before a fractional power (goal_eval.recovered_log's): a nearly exact answer's KL can
 # round below 0, and a negative base to a fractional power is complex (fleet's planted toys)
@@ -658,12 +660,13 @@ class Acceptance:
     mode; the lead's 10-12): hook's changed term on a fresh sample of POOL_DRAWS changed texts from search_pool per
     check, the current circuit and each candidate scored on all of them (engine.Engine.path_patched) and the candidate
     judged on the DISC_DRAWS where the two disagree most (a removal must survive the draws it could be wrong on, not
-    one fixed set); each refused removal kept in refused with those draws."""
+    one fixed set); "fresh", judged on every draw of the check's sample (resampled per check, so no fixed set is
+    fitted); each refused removal kept in refused with those draws."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds, mode: str = "pp", draws: str = "fixed"):
         self.ge, self.tx, self.kinds, self.mode, self.calls = ge, tx, tuple(kinds), mode, 0
         self.draws, self.refused, self.pool = draws, [], None
-        if draws == "discriminating" and mode != "pp":
+        if draws in ("discriminating", "fresh") and mode != "pp":
             raise ValueError("discriminating draws score s_track_pp: mode pp")
         self.rng = np.random.default_rng([int(tx.seed), 23])
 
@@ -737,7 +740,7 @@ class Acceptance:
         edges_of(ons), for connection sets: (the node set's graph with every connection, ons) for scores' edges;
         floor, the floors (default min(0.9, the start's terms)). With discriminating draws: current() the unit set the
         candidates are removals from (default start), label and names(unit ids) naming a refused removal."""
-        disc = self.draws == "discriminating" and "changed" in self.kinds
+        disc = self.draws in ("discriminating", "fresh") and "changed" in self.kinds
         rest = Acceptance(self.ge, self.tx, [k for k in self.kinds if not (disc and k == "changed")], self.mode)
         current = current or (lambda: start)
 
@@ -757,7 +760,8 @@ class Acceptance:
             out = []
             for i, on in enumerate(ons):
                 gap = [abs(a - b) if a is not None and b is not None else -1.0 for a, b in zip(got[i + 1], got[0])]
-                idx = [d for d in sorted(range(len(gap)), key=lambda d: -gap[d]) if gap[d] >= 0][:DISC_DRAWS]
+                idx = [d for d in sorted(range(len(gap)), key=lambda d: -gap[d]) if gap[d] >= 0]
+                idx = idx[:DISC_DRAWS] if self.draws == "discriminating" else idx   # fresh: every draw of the sample
                 sc = self._pooled(got[i + 1], ws, idx)
                 f = floor.get("s_track_pp")
                 if f is not None and sc is not None and sc < f:
@@ -1305,7 +1309,9 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         f1_b, n_b, _ = scores(empty, vpd, kl_c, kl_minus)
         row["blocks"].update(kl_c=kl_c, kl_minus=kl_minus, f1=f1_b, n=n_b)
         circuits = {"": goal_eval.to_json(g, "")}
-        if edges:                                            # its connections stated (a block's: all of its subcomponents')
+        if edges and int(pb.on.sum()) > EDGE_NODES:          # too large to wire: the node set as found
+            row["edges_skipped"] = f"{int(pb.on.sum())} subcomponents"
+        elif edges:                                          # its connections stated (a block's: all of its subcomponents')
 
             def size_term_b(on, inner=0, out=0):
                 n, k_tok = int(on.sum()), int(torch.unique(pb.t[on]).numel())
@@ -1524,10 +1530,10 @@ def main():
     ap.add_argument("--edges", action="store_true", help="prune the teacher circuit's connections (graph semantics)")
     ap.add_argument("--accept-mode", choices=tuple(TRACK), default="pp", help="--accept changed's term: pp (s_track_pp, "
                     "the circuit path-patched, everything outside it at its value on the text) or c (s_track in C's semantics)")
-    ap.add_argument("--accept-draws", choices=("fixed", "discriminating"), default="fixed",
+    ap.add_argument("--accept-draws", choices=("fixed", "discriminating", "fresh"), default="fixed",
                     help="--accept changed's draws in pp mode: the search split's fixed ones, or per check a fresh sample of "
                          "64 from a pool disjoint from eval, each candidate judged on the 16 where it and the current circuit "
-                         "disagree most (refused removals in <task>.path.json)")
+                         "disagree most, or fresh, on every one of the sample (refused removals in <task>.path.json)")
     ap.add_argument("--pairs", action="store_true", help="with --edges, the written circuit states its query-key pairs "
                     "(state_pairs: rustmove's greedy, read by read, within the F1 budget)")
     ap.add_argument("--accept", default="", help="comma-separated search-split terms every node and connection removal keeps "

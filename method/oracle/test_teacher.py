@@ -519,7 +519,8 @@ def test_kl_budget_takes_a_kl_rounded_below_zero():
     assert abs(teacher.kl_budget(80.0, 0.05) - 80.0 ** 0.1 * 0.05 ** 0.9) < 1e-12
 
 
-def test_discriminating_draws_stay_off_eval():
+@pytest.mark.parametrize("draws", ["discriminating", "fresh"])
+def test_discriminating_draws_stay_off_eval(draws):
     nat, pr = pruner(True, "text9002")
     ge = pr.ge
     ids, targets = native.text(TEXT.parent / "text9002.json")
@@ -535,7 +536,7 @@ def test_discriminating_draws_stay_off_eval():
     assert len(pool) >= teacher.POOL_DRAWS
     pr2 = teacher.Pruner(ge, tx, tx.vpd, live=True, B=32)
     as_nodes = lambda on: native.Graph([pr2.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
-    acc = teacher.Acceptance(ge, tx, ("changed",), "pp", "discriminating")
+    acc = teacher.Acceptance(ge, tx, ("changed",), "pp", draws)
     hook, base = acc.hook(as_nodes, pr2.on.clone(), current=lambda: pr2.on, label="t", names=lambda ids: ids)
     g = torch.Generator().manual_seed(0)
     ons = pr2.on[None].repeat(6, 1)
@@ -546,5 +547,6 @@ def test_discriminating_draws_stay_off_eval():
     # admitted removals keep the floor on their judged draws; each refusal kept with its 16 draws from the pool
     assert all(r is None or r["s_track_pp"] >= floor for r in got)
     assert len(acc.refused) == sum(r is None for r in got)
-    assert all(len(x["draws"]) <= teacher.DISC_DRAWS and {tuple(d) for d in x["draws"]} <= set(pool) and x["s_track_pp"] < floor
+    most = teacher.DISC_DRAWS if draws == "discriminating" else teacher.POOL_DRAWS
+    assert all(len(x["draws"]) <= most and {tuple(d) for d in x["draws"]} <= set(pool) and x["s_track_pp"] < floor
                for x in acc.refused)

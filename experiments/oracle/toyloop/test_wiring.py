@@ -17,6 +17,7 @@ from test_goal_eval import tiny_native
 @pytest.fixture
 def pair():
     # Two exact rank-one MLP neurons. No matrix decomposition or model download.
+    torch.set_num_threads(1)
     nat = tiny_native(seed=8, layers=2, d=8, heads=1, vocab=12, C=1)
     nat.units = {}
     with torch.no_grad():

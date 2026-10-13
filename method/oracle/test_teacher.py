@@ -568,3 +568,41 @@ def test_block_search_phi_check_backs_off():
     passed = [x for x in tried if x[1] is not None and x[1] >= x[2]]
     assert (passed and passed[0] is tried[-1] and rec["phi_stage"] == tried[-1][0]) or \
         (not passed and rec["phi_stage"] == max((x for x in tried if x[1] is not None), key=lambda x: x[1])[0])
+
+
+def test_validated_backs_off_to_the_last_passing_set():
+    # every removal admitted; the validation score is the share of units 0-4 still on: below 0.7 once two of them go
+    toy, log = Toy([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]), []
+
+    class Val:
+        draws = "fv"
+
+        def validation(self, on):
+            return float(on[:5].float().mean())
+    v = teacher.Validated(toy, lambda on: on, Val(), 0.7, log, every=1)
+    toy.prune("unit", 10.0, rounds=1, log=log, after=v)          # one round: the largest prefix, units 0-6, refused
+    assert toy.on.all() and log == [] and v.trace[-1][2] < 0.7
+    toy2, log2 = Toy([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]), []
+    v2 = teacher.Validated(toy2, lambda on: on, Val(), 0.7, log2, every=1)
+    for _ in range(8):                                          # single removals in KL order: 0 passes (0.8), 1 not
+        if toy2.prune("unit", 0.115, rounds=1, log=log2, after=v2):
+            break
+    assert toy2.on.tolist() == [False] + [True] * 7 and len(log2) == 1
+
+
+def test_set_search_validation_holds_its_floor():
+    nat, pr = pruner(True, "text9002")
+    ge = pr.ge
+    ids, targets = native.text(TEXT.parent / "text9002.json")
+    tx = ge.text(ids, targets, native.task_seed("text9002"))
+    tx.vpd = pr.tx.vpd
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    acc = teacher.Acceptance(ge, tx, ("changed",), "pp", "fv")
+    g, ps, _, _, rec = teacher.set_search(ge, tx, empty, vpd, teacher.kl_budget(empty, vpd), acc, levels=("site", "chunk4"))
+    pool, val = acc._halves()
+    # the halves are disjoint, and the circuit that comes out holds the validation floor (each level backs off to the
+    # last set that passed)
+    assert not (set(pool) & set(val)) and val
+    f = rec["floor"]["s_track_pp"]
+    assert rec["validation_end"] is None or rec["validation_end"] >= f - 1e-6
+    assert g.count() == int(ps.on.sum()) <= rec["start_units"]

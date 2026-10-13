@@ -124,7 +124,7 @@ flowchart BT
   %% ===================== verifier and foundations =====================
   PHI["<b>Faithfulness score Φ</b><br/>10 intervention families,<br/>32 draws per family<br/>DONE · inframove"]
   TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>reward v3: size breaks ties (1.05 vs 0.65)<br/>next: VPD fits, cancelling pair<br/>ACTIVE · fleet"]
-  TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo: 350 planted models, 10 families,<br/>2 held out; known circuits (b62138e)<br/>Φ: all actives 7.6 vs true 2.1: size term<br/>must carry; teacher, Gate B, LM oracle next<br/>ACTIVE · toyloop"]
+  TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo: 350 planted models, 10 families<br/>exec reward: truth beats truth ±1 unit<br/>on all 350 (71df37e); but listing active<br/>units scores F1 0.81–1.0: input leaks;<br/>SFT without the leak running · toyloop"]
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
   ENGP["<b>English claim diagnostic</b><br/>native MLP blocks, not VPD units;<br/>2/4 predictions correct; zero credit;<br/>no verified training labels<br/>CHECK · codex/variable_reward"]

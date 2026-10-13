@@ -2211,6 +2211,8 @@ def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget:
                        f"subcomponents) after {st.get('rounds', 0)} rounds.")
 
     def what(removed) -> str:
+        if removed and isinstance(removed[0], int):  # the floors acceptance's units by their index in the stage (v2.3)
+            return f"{len(removed)} unit" + ("s" if len(removed) > 1 else "") + " of the stage"
         if removed and isinstance(removed[0][0], list):  # connections: [[writer], [reader]]
             parts = [f"{node_text(tuple(w))} -> {node_text(tuple(r)) if r else 'the prediction'}" for w, r in removed[:3]]
             return ("the connection " if len(removed) == 1 else "the connections ") + "; ".join(parts) + \
@@ -2225,6 +2227,9 @@ def thinking_trace(path: dict, model: str, ids: list[int], answer: dict, budget:
         return f"{len(removed)} subcomponents ({txt}{', ...' if len(groups) > 4 else ''})"
 
     def refusal(r) -> tuple[float, str]:
+        if "family" in r:  # the floors acceptance (--accept changed,floors): one family's score under its floor
+            return (r.get("floor") or 0.0) - (r.get("score") or 0.0), (
+                f"removing {what(r['removed'])} drops the {r['family']} family to {r['score']:.2f}, below its floor {r['floor']:.2f}: kept.")
         if "phi" in r:
             short = (r.get("floor") or 0.0) - (r.get("phi") or 0.0)
             return short, f"removing {what(r['removed'])} drops phi to {r['phi']:.2f}, below the bar {r['floor']:.2f}: kept."

@@ -486,6 +486,9 @@ def test_thinking_trace_names_specific_refutations_first_within_its_budget(tiny,
     refused = [x for x in lines if x.startswith("Refused:")]
     assert len(refused) == 3 and "L1.v#1@5" in refused[1] and "10 subcomponents (L0.fc@6 (10))" in refused[0]  # tried order; once each
     assert len(components.thinking_trace(path, task["model"], ids, answer, budget=200)) <= 200 + 60
+    floors = {"stage": "floors", "removed": [0, 3], "family": "patching_near", "score": 0.85, "floor": 0.9}  # v2.3's acceptance
+    got = components.thinking_trace({**path, "refused": [floors]}, task["model"], ids, answer).splitlines()
+    assert "Refused: removing 2 units of the stage drops the patching_near family to 0.85, below its floor 0.90: kept." in got
     rp = {"task": "t", "stage": "chunk4", "size": 30, "v": 0.03, "repicked": True, "new_stage": "start", "new_size": 40}
     lines = components.thinking_trace({**path, "repick": rp}, task["model"], ids, answer).splitlines()
     assert lines[-2] == ("Check: stage chunk4 (30 subcomponents) leaves a family below its floor on its own full-fidelity run "

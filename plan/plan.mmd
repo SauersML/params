@@ -770,7 +770,7 @@ flowchart BT
   CAPABLE --> COMPOSE
   COMPOSE --> C1
   %% MDL history: TRAIN9/186 point variants;103 extras+52 nonredundant removals below gold,4 redundant removals preferred. Intervention38447137804:1624 worlds; independent38447736474 PASS. Teacher38451355559+38452521930; challenge38456342703 raw artifacts in mpd-data/scratch/eval_recovery.
-  MDL["<b>Intervention-faithful TRAIN supervision</b><br/>8-family batch:8 usable frozen targets;<br/>752 fitted-panel tops; gate capped64;<br/>Transfer vs point-gold QUEUED38464785596;<br/>NEXT tokenizer fit + matched oracle learning<br/>codex/eval_recovery · finite context scope · no paid"]
+  MDL["<b>Intervention-faithful TRAIN supervision</b><br/>8 frozen targets; original8 tokenizer PASS;<br/>Transfer all-pass: teacher7/8 vs point5/8;<br/>Mean KL pass95.49/95.91%, top95.49/98.18%;<br/>Bigram fresh-context omissions182/504<br/>DONE19978 · raw audit pending · codex/eval_recovery"]
   COMPOSE --> MDL
   MDL --> C1
   class CAPCF done

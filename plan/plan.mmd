@@ -25,7 +25,7 @@ flowchart BT
 
   subgraph CAPS["CAPABILITIES THE ORACLE MUST SHOW"]
     C1["<b>Executable circuits</b><br/>predict outputs and unseen<br/>interventions; report sufficiency,<br/>necessity, remainder robustness"]
-    C2["<b>Tested English</b><br/>concepts bound to subcomponents;<br/>beats shuffled, vague and<br/>no-explanation controls<br/>varteach"]
+    C2["<b>Tested English</b><br/>concepts bound to subcomponents;<br/>beats shuffled, vague and<br/>no-explanation controls, random groups<br/>of equal size, wrong variables;<br/>holds on unseen token values<br/>varteach"]
     C3["<b>Answers and edits</b><br/>predicted effects and<br/>collateral effects<br/>rustmove"]
     C4["<b>Transfer and cost</b><br/>other mechanisms, long contexts,<br/>latency, memory, sample cost<br/>generality · monitorbench"]
   end
@@ -57,7 +57,7 @@ flowchart BT
     T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>held-out 0.99 · DONE"]
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
     T3["<b>Pruning, discriminating draws</b><br/>why: fixed-draw pruning overfit<br/>(held-out 0.34 vs 0.88)<br/>landed fe0f478; N floor 343c2a1<br/>eval check on 9002, 6011, 9013<br/>ACTIVE · pymove"]
-    T4["<b>Teacher circuits v2</b><br/>444 train + 50 held-out texts<br/>discriminating draws landed (fe0f478);<br/>text9002 checks a / b / c running;<br/>launches pm7 and v2 at eval pp ≥ 0.85<br/>and beats VPD top k at equal size;<br/>MATS 294 queued, influential starts<br/>for 494 texts running<br/>ACTIVE · fleet"]
+    T4["<b>Teacher circuits v2</b><br/>444 train + 50 held-out texts<br/>discriminating draws landed (fe0f478);<br/>pymove's eval runs on 9002, 6011, 9013 decide;<br/>launches pm7 and v2 at eval pp ≥ 0.85<br/>and beats VPD top k at equal size;<br/>MATS 294 queued, influential starts<br/>for 494 texts running<br/>ACTIVE · fleet"]
     T5["<b>Context-blocks teacher</b><br/>keeps context as blocks, prunes<br/>only the target; test transfer<br/>to unseen changes · pymove"]
   end
 
@@ -71,7 +71,7 @@ flowchart BT
 
   subgraph REWARD["REWARD · primerl, inframove, generality, codex"]
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
-    W2["<b>Falsification set</b><br/>correct copy circuits vs<br/>plausible wrong ones<br/>ACTIVE · generality"]
+    W2["<b>Falsification set</b><br/>correct copy circuits vs<br/>plausible wrong ones; algorithms<br/>the model does not run must fail<br/>ACTIVE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>common removal tests for all candidates;<br/>absolute sufficiency before size credit;<br/>gate leak shut: slope 10 (6f8a869)<br/>ACTIVE · codex, inframove, primerl"]
   end

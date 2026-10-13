@@ -161,6 +161,7 @@ flowchart BT
   TOYB["<b>Gate B on planted toys</b><br/>complete exact circuits pass; incomplete<br/>true routes fail (N ratio unbounded,<br/>own eps added, gate leak, all-actives<br/>at phi ceiling); eps cap + score clip<br/>fixes 3 of 4 (57e44c2) · toyloop"]
   TOYLOOP["<b>Toy closed loop, CPU</b><br/>zoo: 350 planted models, 10 families<br/>exec reward ranks truth first on all 350<br/>teacher recovers truth: unit F1 0.99<br/>but influential start alone fails 20%<br/>(content-addressed keys; check final KL)<br/>SFT without input leak running · toyloop"]
   REM["<b>Remainder check</b><br/>do sufficient circuits lean<br/>on VPD's leftover terms?<br/>ACTIVE · inframove"]
+  VAR["<b>Variables and invariants</b><br/>carriers, value maps, E4 v2 checker;<br/>nulls and triviality check running;<br/>influential_v2 variables next<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
   ENGP["<b>VPD-bound English claims</b><br/>258 units; two predictions trivial;<br/>writer missed an 11.3% probability rise;<br/>typed binding ready; needs new evidence<br/>CHECK · codex/variable_reward"]
 
@@ -238,6 +239,10 @@ flowchart BT
   W6 -. falsifies reward rankings .-> GATEB
   SEM --> W1
   SEM -. tests claims .-> C2
+  T1 --> VAR
+  VAR --> C2
+  VAR --> SUP
+  VAR --> R2
   SEM --> ENGP
   ENG --> ENGP
   ENGP -. verified claims only .-> SUP
@@ -261,7 +266,7 @@ flowchart BT
   TOY --> TOYLOOP
   TOYLOOP --> TOYB
   TOYB -. tests .-> GATEB
-  TOYB -. cap eps ≤0.05,<br/>clip family scores to 0–1 .-> W4
+  TOYB -. "cap eps ≤0.05,<br/>clip family scores to 0–1" .-> W4
   TOYLOOP -. influential start misses<br/>content-addressed keys .-> T4
   TOYLOOP -. early answer .-> GATEC
   REM -. tests .-> PHI
@@ -302,7 +307,7 @@ flowchart BT
   classDef note fill:#ffffff,stroke:#dadce0,stroke-width:1px,color:#3c4043
 
   class VPD,ENG,PHI,W1,W3,I1,I2,T1,SEM done
-  class T2,T3,T5,I4,W2,W4,TOY,TOYLOOP,TOYB,REM,TOOLS,S1,SP1,SP2,SP3,SP4 active
+  class T2,T3,T5,I4,W2,W4,TOY,TOYLOOP,TOYB,REM,TOOLS,S1,SP1,SP2,SP3,SP4,VAR active
   class I5 done
   class I6,W5 done
   class T4 blocked

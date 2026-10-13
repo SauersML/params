@@ -157,7 +157,7 @@ def mean_rows(rows: list) -> dict:
     keys = list(dict.fromkeys(k for r in rows for k, v in r.items() if isinstance(v, (int, float))))
     out = {"n": len(rows)}
     for k in keys:   # swap_* exist only where a same-family donor was in the split
-        vs = [r[k] for r in rows if k in r]
+        vs = [r[k] for r in rows if isinstance(r.get(k), (int, float))]
         out[k] = round(sum(vs) / len(vs), 3)
     return out
 
@@ -180,10 +180,16 @@ def run(name: str, predict, splits: dict, swapped: bool = False, log=print, *, w
                 if donors:
                     donor = donors[i % len(donors)]
                     sc = predict(toy, render.render(toy, weights_from=donor))
-                    own, don = metrics(toy, sc), metrics(donor, sc)
+                    own, don = metrics(toy, sc, wiring=wiring), metrics(donor, sc, wiring=wiring)
                     row.update(swap_donor=donor.name, swap_f1_own=own["unit_f1"], swap_f1_donor=don["unit_f1"],
                                swap_edge_f1_own=own["edge_f1"], swap_edge_f1_donor=don["edge_f1"],
                                swap_completion=sc)
+                    if wiring:
+                        # Execute each completion against that model's own native basis/texts.
+                        for label, measured in (("own", own), ("donor", don)):
+                            for key in ("wiring_valid", "wiring_suff", "wiring_kl_bits", "wiring_scope", "wiring_error"):
+                                if key in measured:
+                                    row[f"swap_{key}_{label}"] = measured[key]
             per.append(row)
             log(f"{name} {split} {toy.name}: unit_f1 {row['unit_f1']:.2f} reward {row['reward']:.2f} "
                 f"(gt {row['gt_reward']:.2f}) {time.time() - t0:.0f}s")
@@ -205,6 +211,9 @@ SWAP = ["swap_f1_own", "swap_f1_donor", "swap_edge_f1_own", "swap_edge_f1_donor"
 def markdown(res: dict) -> str:
     cols = COLS + [c for c in SWAP if any(c in r for r in res["rows"])]
     cols += [c for c in ("wiring_valid", "wiring_suff", "wiring_kl_bits") if any(c in r for r in res["rows"])]
+    cols += [f"swap_{key}_{label}" for label in ("own", "donor")
+             for key in ("wiring_valid", "wiring_suff", "wiring_kl_bits")
+             if any(f"swap_{key}_{label}" in r for r in res["rows"])]
     lines = [f"# Toy-loop eval: {res['name']}", "", "| split | family | " + " | ".join(cols) + " |",
              "|" + "---|" * (len(cols) + 2)]
     for split, fams in res["summary"].items():

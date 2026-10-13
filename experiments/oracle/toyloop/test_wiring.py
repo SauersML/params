@@ -100,3 +100,52 @@ def test_all_pieces_do_not_depend_on_activation_or_truth(pair):
     assert g.count() == 2 * 2 * len(toy.texts[0])  # input/output pieces for both neurons
     with pytest.raises(ValueError):
         circuit.unit_graph(circuit.parse(FULL), toy, [])
+
+
+@pytest.mark.parametrize('wiring', [False, True])
+def test_swapped_completion_executes_each_models_own_basis_and_texts(monkeypatch, wiring):
+    import evaluate
+
+    toys = [SimpleNamespace(name=name, meta={'family': 'mock'}, texts=[[i]],
+                           truth={'units': ['L0N0'], 'edges': [('L0N0', 'out')]})
+            for i, name in enumerate(['own', 'other'], 1)]
+    natives = {toy.name: SimpleNamespace(owner=toy.name) for toy in toys}
+    monkeypatch.setattr(evaluate.render, 'render', lambda toy, **kw: toy.name)
+    monkeypatch.setattr(reward_exec, 'score', lambda *a: {'reward': .5, 'suff': .6, 'nec': .4})
+    monkeypatch.setattr(reward_exec, '_state', lambda toy: {'nat': natives[toy.name]})
+    monkeypatch.setattr(reward_exec, 'texts_of', lambda toy: toy.texts)
+    executed = []
+
+    def score_wiring(toy, completion, *, nat, texts):
+        assert nat is natives[toy.name] and texts is toy.texts
+        executed.append((toy.name, tuple(map(tuple, texts))))
+        return {'suff': .7 if toy.name == 'own' else .2, 'kl_bits': 1. if toy.name == 'own' else 4.,
+                'scope': 'point wiring only; embeddings on; token labels unverified'}
+
+    monkeypatch.setattr(reward_exec, 'score_wiring', score_wiring)
+    result = evaluate.run('mock', lambda *a: FULL, {'test': toys}, swapped=True,
+                          wiring=wiring, log=lambda *a: None)
+    first = result['rows'][0]
+    if wiring:
+        assert len(executed) == 6  # normal + own/donor swap checks for each toy
+        assert first['swap_wiring_kl_bits_own'] == 1.
+        assert first['swap_wiring_kl_bits_donor'] == 4.
+        assert first['swap_wiring_valid_own'] == first['swap_wiring_valid_donor'] == 1.
+        assert 'token labels unverified' in first['swap_wiring_scope_donor']
+        assert 'swap_wiring_kl_bits_donor' in evaluate.markdown(result)
+    else:
+        assert executed == []
+        assert not any('wiring' in key for key in first)
+
+
+def test_mixed_invalid_wiring_keeps_kl_conditional_without_zero_filling():
+    import evaluate
+
+    summary = evaluate.mean_rows([
+        {'wiring_valid': 1., 'wiring_suff': .8, 'wiring_kl_bits': 2., 'swap_wiring_kl_bits_own': 3.},
+        {'wiring_valid': 0., 'wiring_suff': 0., 'wiring_kl_bits': None, 'swap_wiring_kl_bits_own': None},
+    ])
+    assert summary['n'] == 2
+    assert summary['wiring_valid'] == .5 and summary['wiring_suff'] == .4
+    assert summary['wiring_kl_bits'] == 2.  # conditional on measured KL, not 1 from invalid->0
+    assert summary['swap_wiring_kl_bits_own'] == 3.

@@ -1320,7 +1320,8 @@ def question(task: dict, ev: dict) -> str:
              "positions where a changed token moves the prediction by at least 1% of the total, most first: "
              + ", ".join(f"{q} ({strings[q]!r})" for q in ev["positions"])]
     if ev["events"]:
-        lines += ["measured at those positions (log2 change of the top token's probability):"] + units.evidence(ev["events"], ev["listed"], strings)
+        lines += ["measured at those positions (log2 change of the top token's probability):"] + units.evidence(
+            ev["events"], ev["listed"], strings, lambda ids: token_strings(model, ids))
     if ev.get("attention"):  # measured(): each head's most-read positions at the target
         lines.append(f"attention at the target ({t}), the positions each head reads most (weight):")
         lines += [f"L{layer}: " + "; ".join(f"h{h} " + ", ".join(f"{q} {w:.2f}" for q, w in row) for h, row in enumerate(rows))
@@ -2115,7 +2116,7 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_
             "circuit": circuit_text(render(goal_eval.to_json(g, ""))),  # what E1's reader reads with the English
             "answer": goal_eval.to_json(g, ""),
             **({"variables": variables, "tokens": {str(q): strings[q] for v in variables for q in v["inputs"]}} if variables else {}),
-            "evidence": units.evidence(ev["events"], ev["listed"], strings) if ev.get("events") else [],
+            "evidence": units.evidence(ev["events"], ev["listed"], strings, tok) if ev.get("events") else [],
             "target_token": strings[max(targets)], "top": prompt["model_top"][0][:3], "nodes_total": len(nodes),
             "positions": sorted({nd[1] for nd in nodes}),
             "nodes": [{"node": node_text(nd), "token": strings[nd[1]], "facts": shown_facts.get(nd, "")} for nd in nodes[:max_nodes]],

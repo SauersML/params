@@ -421,7 +421,7 @@ def reader_events(events: list[dict]) -> list[dict]:
     return [e for e in events if (not e.get("listed") or e.get("alt") == 1) and "kl" not in e]
 
 
-def evidence(events: list[dict], positions: list[int], strings: list[str]) -> list[str]:
+def evidence(events: list[dict], positions: list[int], strings: list[str], tokens_of=None) -> list[str]:
     """The measurements the oracle reads for each listed position (events() at those positions): how the log2
     probability of the model's most likely next token moves when the token there changes to the model's likeliest
     other token, and when each layer's attention at the target is kept from reading the position. The English reader is
@@ -442,6 +442,10 @@ def evidence(events: list[dict], positions: list[int], strings: list[str]) -> li
             line += f" prediction moves {kl:.2f} bits;"
         if change is not None:
             line += f" changed token {change['bits']:+.2f}"
+            donor = f"token id {change['new']}"
+            if tokens_of is not None:
+                donor = f"{tokens_of([change['new']])[0]!r} ({donor})"
+            line += f" when replaced by {donor}"
         if cuts:
             line += "; attention cut per layer " + " ".join(f"L{e['layer']} {e['bits']:+.2f}" for e in cuts)
         out.append(line)
@@ -464,7 +468,8 @@ def question(task: dict, positions: list[int], events: list[dict] | None = None)
              "positions where a changed token moves the prediction most, most first: "
              + ", ".join(f"{q} ({strings[q]!r})" for q in positions)]
     if events:
-        lines += ["measured at those positions (log2 change of the top token's probability):"] + evidence(events, positions, strings)
+        lines += ["measured at those positions (log2 change of the top token's probability):"] + evidence(
+            events, positions, strings, lambda ids: tokens_of(model, ids))
     return "\n".join(lines)
 
 

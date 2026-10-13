@@ -54,6 +54,8 @@ jobs:
             method/oracle/test_tools_env.py::test_baselines_include_empty_and_same_batch_calibration \
             method/oracle/test_components.py::test_fit_pool_reports_nonfit_and_later_fitting_row \
             method/oracle/test_components.py::test_question_node_cap_is_opt_in_and_included_in_fit \
+            method/oracle/test_units.py::test_evidence_binds_selected_replacement_without_new_measurements \
+            method/oracle/test_units.py::test_evidence_without_token_change_does_not_decode_or_add_a_donor \
             method/oracle/test_components.py::test_rerender_skips_nonfit_pool_row_and_counts_variables_before_fit -q --tb=short
 
       - name: Run the graph oracle's tests

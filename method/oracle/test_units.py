@@ -12,6 +12,33 @@ import native
 import units
 
 
+def test_evidence_binds_selected_replacement_without_new_measurements():
+    events = [{"position": 1, "new": 7, "alt": 0, "bits": -1.25},
+              {"position": 1, "new": 8, "alt": 1, "bits": -9.0},
+              {"position": 1, "kl": 2.0}, {"position": 1, "layer": 0, "bits": 0.1}]
+    decoded = []
+
+    def tokens_of(ids):
+        decoded.append(ids)
+        return ["\n' donor"]
+
+    line, = units.evidence(events, [1], ["", " old"], tokens_of)
+    assert "changed token -1.25 when replaced by " + repr("\n' donor") + " (token id 7)" in line
+    assert "prediction moves 2.00 bits" in line and "attention cut per layer L0 +0.10" in line
+    assert decoded == [[7]]  # alt1's measurement is not attributed to alt0
+    fallback, = units.evidence(events, [1], ["", " old"])
+    assert "changed token -1.25 when replaced by token id 7" in fallback
+    assert "token id 8" not in fallback
+
+
+def test_evidence_without_token_change_does_not_decode_or_add_a_donor():
+    def unexpected(ids):
+        raise AssertionError("No replacement token exists")
+
+    line, = units.evidence([{"position": 0, "layer": 2, "bits": -0.5}], [0], [" x"], unexpected)
+    assert line == "0 (' x'):; attention cut per layer L2 -0.50"
+
+
 def test_subcomponent_roundtrip():
     text = "EXPLANATION: copy digits\nPOSITION 322: L0 322:fc#12,fc#901,down#77 | L2 322:v#1514 -> 332:o#77\nPOSITION 4: none"
     explanation, circuits = units.parse(text)

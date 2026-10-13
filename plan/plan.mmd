@@ -295,7 +295,7 @@ flowchart BT
   end
 
   %% ===================== verifier and foundations =====================
-  PHI["<b>Faithfulness score Φ</b><br/>10 intervention families,<br/>32 draws per family<br/>DONE · inframove"]
+  PHI["<b>Faithfulness score Φ</b><br/>11 families (+ omitted parts);<br/>gap-weighted pooling, N with<br/>background kept · DONE · inframove"]
   TOY["<b>Planted toys</b><br/>4 of 4 planted routes recovered;<br/>mixed binding: both routes carry it;<br/>cancelling pair: unnecessary under donor<br/>semantics (patching families), needed under<br/>weight edits on text 1 (0.97 bits: omitted,<br/>inframove); standard VPD keeps it as a candidate,<br/>donor VPD hides it; arms rerun when it lands<br/>ACTIVE · fleet"]
   IBENCH["<b>InterpBench ground truth</b><br/>TransformerLens models as a Target (61b88f0);<br/>exact decomposition, 28 of 60 Tracr cases:<br/>node AUROC median 1.0, edge median 0.985;<br/>MIB's IOI model next (MIB edge AUROC:<br/>EAP-IG 0.81, UGS 0.74, random 0.44)<br/>ACTIVE · fleet"]
   TOYB["<b>Gate B on planted toys</b><br/>complete exact circuits pass; incomplete<br/>true routes fail (N ratio unbounded,<br/>own eps added, gate leak, all-actives<br/>at phi ceiling); eps cap + score clip<br/>fixes 3 of 4 (57e44c2) · toyloop"]

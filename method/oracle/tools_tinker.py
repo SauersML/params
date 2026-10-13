@@ -55,6 +55,18 @@ def _tasks(spec: list[str]) -> list[str]:
     return out
 
 
+def _training_tasks(tasks: list[str]) -> list[str]:
+    """Only the declared training partition may supply gradient updates."""
+    if not tasks:
+        raise SystemExit("no training tasks")
+    for task in tasks:
+        number = task.removeprefix("text") if isinstance(task, str) else ""
+        if not (isinstance(task, str) and task.startswith("text") and number.isascii()
+                and number.isdigit() and 6000 <= int(number) <= 7999):
+            raise SystemExit(f"training requires text6000-7999; rejected {task!r}")
+    return tasks
+
+
 class HttpTool:
     """One of tools_env's tools in one episode (tinker_cookbook's Tool protocol): its call goes to the server."""
 
@@ -205,6 +217,7 @@ def rollout(a) -> None:
 
 
 def rl(a) -> None:
+    tasks = _training_tasks(_tasks(a.tasks))
     import tinker
     import torch  # noqa: F401
     from tinker_cookbook.rl.data_processing import trajectory_to_data
@@ -216,7 +229,6 @@ def rl(a) -> None:
     training = (service.create_training_client_from_state(a.init) if a.init
                 else service.create_lora_training_client(base_model=a.base, rank=a.rank))
     adam = tinker.AdamParams(learning_rate=a.lr, beta1=0.9, beta2=0.95, eps=1e-8)
-    tasks = _tasks(a.tasks)
     rng = random.Random(a.seed)
     from tinker_cookbook.completers import TinkerTokenCompleter
 
@@ -287,6 +299,11 @@ def cookbook_messages(row: dict, renderer) -> list:
 
 
 def sft(a) -> None:
+    rows = [json.loads(x) for x in a.episodes.read_text().splitlines() if x.strip()]
+    _training_tasks([r.get("task") for r in rows])
+    rows = [r for r in rows if r.get("messages") and r.get("tools") and r.get("answered")]
+    if not rows:
+        raise SystemExit("no answered training episodes with messages and tool schemas")
     import tinker
     from tinker_cookbook import renderers
     from tinker_cookbook.supervised.data import conversation_to_datum
@@ -295,10 +312,6 @@ def sft(a) -> None:
     spend = Spend(a.base, a.usd_cap, a.log / "spend.jsonl")
     service = service_client()
     renderer, _ = episode_renderer(a.base, a.thinking)
-    rows = [json.loads(x) for x in a.episodes.read_text().splitlines() if x.strip()]
-    rows = [r for r in rows if r.get("messages") and r.get("tools") and r.get("answered")]
-    if any(9000 <= int(r["task"].removeprefix("text")) <= 9199 for r in rows):
-        raise SystemExit("held-out texts (text9000-9199) are never training data")
     data = [conversation_to_datum(cookbook_messages(r, renderer), renderer, CONTEXT, renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES)
             for r in rows]
     print(json.dumps({"episodes": len(data), "tokens": [d.model_input.length for d in data]}), flush=True)

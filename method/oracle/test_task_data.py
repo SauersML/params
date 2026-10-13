@@ -64,3 +64,42 @@ def test_far_donors_use_explicit_ids_with_missing_development_files(texts, monke
     nat = SimpleNamespace(target=SimpleNamespace(wte=SimpleNamespace(shape=(40, 8))))
     ge = goal_eval.GoalEval(nat)
     assert ge.far_pool("eval") == [("text9150", [1, 2]), ("text9199", [1, 2])]
+
+
+@pytest.mark.parametrize("task", ["text5999", "text8000", "text9000", "text9099", "text9100",
+                                  "text9149", "text9150", "text9199", "text9300", "hard9300",
+                                  "6000", "textoops", None])
+def test_tool_training_rejects_other_partitions_before_service(task, tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import tools_tinker
+
+    monkeypatch.setattr(tools_tinker, "service_client", lambda: pytest.fail("created paid client"))
+    episodes = tmp_path / "episodes.jsonl"
+    episodes.write_text(json.dumps({"task": task, "messages": [{}], "tools": [{}], "answered": True}) + "\n")
+    with pytest.raises(SystemExit, match="training requires"):
+        tools_tinker.sft(SimpleNamespace(episodes=episodes))
+    if task is not None:
+        with pytest.raises(SystemExit, match="training requires|sealed final"):
+            tools_tinker.rl(SimpleNamespace(tasks=[task]))
+
+
+def test_tool_training_accepts_train_boundaries_and_keeps_dev_evaluation():
+    import tools_tinker
+
+    tasks = tools_tinker._tasks(["text6000:text6001", "text7999"])
+    assert tools_tinker._training_tasks(tasks) == ["text6000", "text6001", "text7999"]
+    assert tools_tinker._tasks(["text9000:text9001"]) == ["text9000", "text9001"]
+
+
+def test_tool_training_rejects_empty_input_before_service(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import tools_tinker
+
+    monkeypatch.setattr(tools_tinker, "service_client", lambda: pytest.fail("created paid client"))
+    episodes = tmp_path / "episodes.jsonl"
+    episodes.write_text("")
+    with pytest.raises(SystemExit, match="no training tasks"):
+        tools_tinker.sft(SimpleNamespace(episodes=episodes))
+    with pytest.raises(SystemExit, match="no training tasks"):
+        tools_tinker.rl(SimpleNamespace(tasks=[]))

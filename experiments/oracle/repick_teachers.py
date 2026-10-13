@@ -3,7 +3,9 @@ circuit term among those whose own full-fidelity row has no family under its flo
 since 262897d, from the stages whose node set can be recovered: every stage when the path file keeps stage_nodes
 (262897d on); before that, the written stage (TEXT.json), the start (VPD's actives at the start's positions, from the
 saved answers) and any stage of the same size as either (the stages are nested). The original goes to DIR/prerepick/,
-one record per text to DIR/repick.jsonl (texts already there are skipped).
+one record per text to DIR/repick.jsonl. A text is skipped while its record describes its current circuit; a rerun's
+circuit (fleet's reruns replace TEXT.json) is re-picked from the summary row whose written stage it is, and its record
+replaces the old one.
   repick_teachers.py VPD_ANSWERS.pt DIR [DIR ...]   (DIR: a teacher output, summary_*.jsonl beside TEXT.json files)"""
 import glob, json, os, shutil, sys
 from pathlib import Path
@@ -47,19 +49,31 @@ def repick(row: dict, written: list, answer: dict | None, stage_nodes: dict | No
 def main():
     vpd = torch.load(sys.argv[1], weights_only=False)
     for d in map(Path, sys.argv[2:]):
-        rows = {}
+        rows = {}                                            # every summary row per text (a rerun's beside the first)
         for f in sorted(d.glob("summary_*.jsonl")):
             for line in f.read_text().splitlines():
                 r = json.loads(line)
-                rows[r["task"]] = r
+                rows.setdefault(r["task"], []).append(r)
         log = d / "repick.jsonl"
-        done = {json.loads(x)["task"] for x in log.read_text().splitlines()} if log.exists() else set()
+        recs = {}
+        for x in log.read_text().splitlines() if log.exists() else []:
+            r = json.loads(x)
+            recs[r["task"]] = r
         n = changed = 0
-        for task, row in sorted(rows.items()):
+        for task, cands in sorted(rows.items()):
             circ = d / f"{task}.json"
-            if task in done or not circ.exists() or "phi" not in (row.get("blocks") or {}):
+            if not circ.exists():
                 continue
             written = sorted((x[0], int(x[2]), int(x[1])) for x in json.loads(circ.read_text())["nodes"])   # [site, c, t]
+            old = recs.get(task)
+            if old is not None and (old["new_size"] if old["repicked"] else old["size"]) == len(written):
+                continue                                     # the record describes this circuit (a rerun's does not)
+            # the summary row of the run that wrote this circuit: its written stage's size (the latest such row)
+            row = next((r for r in reversed(cands) if "phi" in (r.get("blocks") or {})
+                        and {p[0]: p for p in r["blocks"]["phi"]}[r["blocks"]["phi_stage"]][3] == len(written)), None)
+            if row is None:                                  # (its run's summary not here yet: no record, not a stale one)
+                recs.pop(task, None)
+                continue
             path = d / f"{task}.path.json"
             stage_nodes = (json.loads(path.read_text()).get("blocks") or {}).get("stage_nodes") if path.exists() else None
             nodes, rec = repick(row, written, (vpd.get(task) or {}).get("answer"), stage_nodes)
@@ -69,10 +83,12 @@ def main():
                     shutil.copy2(circ, d / "prerepick" / circ.name)
                 circ.write_text(json.dumps(goal_eval.to_json(native.Graph(nodes, complete=True), "")))
                 changed += 1
-            with log.open("a") as f:
-                f.write(json.dumps(rec) + "\n")
+            recs[task] = rec
             n += 1
-        print(f"{d}: {n} texts, {changed} re-picked", flush=True)
+        tmp = log.with_suffix(".jsonl.tmp")                  # one record per text, a rerun's replacing the old one
+        tmp.write_text("".join(json.dumps(r) + "\n" for _, r in sorted(recs.items())))
+        tmp.replace(log)
+        print(f"{d}: {n} texts (re)checked, {changed} re-picked", flush=True)
 
 
 if __name__ == "__main__":

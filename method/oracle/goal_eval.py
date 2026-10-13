@@ -506,10 +506,12 @@ EPS_BOOT = 200  # eps's bootstrap resamples
 
 
 def family_score(row: dict, family: str) -> float | None:
-    """Phi's unfloored family score when present; legacy rows use clipped fields. Flips at FLIP_TERM."""
+    """A row's score for one of phi's families, floored at 0 (PHI_FAMILIES' keys; flips at FLIP_TERM). phi reads the
+    floored scores, not rl_terms' unfloored ones (the Gate B table 10-13, held-out text9000-9019: unfloored s_nodes
+    and N reach -4.1 and -2.9 where VPD's own response sits near the no-change bound, a near-zero denominator, and
+    put the influential start below the empty circuit on 14 of 20 texts; floored, the start is above the empty
+    circuit on 20 of 20 and the fair sets keep their order). rl_terms stay C_rl's."""
     key = PHI_FAMILIES[family][0]
-    if key in row.get("rl_terms", {}):
-        return row["rl_terms"][key]
     if key == "f1_flips_c":
         fc = row.get("f1_flips_c") or {}
         return fc.get(str(FLIP_TERM), fc.get(FLIP_TERM))
@@ -585,7 +587,7 @@ def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: 
 def family_eps(row: dict) -> dict:
     """eps_<family> for phi (the lead's reward v3): twice the bootstrap standard error of each family's score over its
     draws in the row (EPS_BOOT resamples, a fixed seed: the same from the row alone), at least EPS_FLOOR; a family
-    scored in one run (point, flips, N) the floor. Bootstrap the same raw or clipped estimator as family_score."""
+    scored in one run (point, flips) the floor. The floored estimator, as family_score."""
     rng = np.random.default_rng(0)
     out = {}
     for fam, (_, kind, key) in PHI_FAMILIES.items():
@@ -594,7 +596,7 @@ def family_eps(row: dict) -> dict:
             out[fam] = EPS_FLOOR
             continue
         idx = rng.integers(len(draws), size=(EPS_BOOT, len(draws)))  # the same draws as one call per resample
-        got = _pooled_resamples(kind, draws, row.get("kl_empty_live"), PHI_FAMILIES[fam][0] in row.get("rl_terms", {}), idx)
+        got = _pooled_resamples(kind, draws, row.get("kl_empty_live"), False, idx)
         got = [x for x in got if x is not None]
         out[fam] = max(EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else EPS_FLOOR
     return out

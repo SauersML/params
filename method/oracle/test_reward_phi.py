@@ -1,4 +1,5 @@
-"""Synthetic regressions for below-bound faithfulness in reward v3."""
+"""Synthetic regressions for below-bound faithfulness in reward v3: phi reads floored family scores (the Gate B table
+10-13), the unfloored ones stay C_rl's and keep their pooling."""
 import sys
 from pathlib import Path
 
@@ -8,20 +9,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import goal_eval
 
 
-def test_phi_ranks_below_empty_circuits_and_preserves_clipped_reporting():
+def test_phi_reads_floored_scores():
+    """Below the bound every answer scores 0 on that family in phi, whatever its unfloored score (rl_terms, C_rl's)."""
     rows = []
     for kl in (1.0, 2.0, 100.0):
         rows.append({"s_point_c": goal_eval._fid(1.0, kl, 0.1), "n_point": 0.0,
                      "rl_terms": {"s_point_c": goal_eval._fid_raw(1.0, kl, 0.1)},
                      **{f"eps_{f}": goal_eval.EPS_FLOOR for f in goal_eval.PHI_FAMILIES}})
     ph = [goal_eval.phi(row)[0] for row in rows]
-    assert all(row["s_point_c"] == 0.0 for row in rows)
-    assert ph[0] > ph[1] > ph[2]
-    rewards = [p + 2.0 / (1.0 + 2.0 ** (-4.0 * (p - 1.0))) for p in ph]
-    assert rewards[0] > rewards[1] > rewards[2]
-    # Stored diagnostic rows lacking raw families retain their historical semantics.
+    assert all(row["s_point_c"] == 0.0 for row in rows) and ph[0] == ph[1] == ph[2]
+    assert rows[0]["rl_terms"]["s_point_c"] > rows[2]["rl_terms"]["s_point_c"]
     assert goal_eval.family_score({"s_point_c": 0.25}, "point") == 0.25
-    assert goal_eval.family_score({"s_point_c": 0.0, "rl_terms": {"s_point_c": None}}, "point") is None
+    assert goal_eval.family_score({"s_point_c": 0.0, "rl_terms": {"s_point_c": None}}, "point") == 0.0
 
 
 @pytest.mark.parametrize("kind,draws", [
@@ -37,13 +36,14 @@ def test_raw_bootstrap_pooling_retains_variation_below_zero(kind, draws):
     assert a > b
 
 
-def test_raw_family_noise_is_bootstrapped_from_raw_scores():
+def test_family_noise_is_bootstrapped_from_floored_scores():
+    """eps from the floored estimator phi reads: unfloored rl_terms change neither eps nor phi."""
     row = {"s_nodes": 0.0, "draws_nodes": [[0, 2.0, 0.1, 1.0], [1, 100.0, 0.1, 1.0]],
            "kl_empty_live": 1.0}
     assert goal_eval.family_eps(row)["nodes"] == goal_eval.EPS_FLOOR
     raw = {**row, "rl_terms": {"s_nodes": goal_eval._pooled_raw(row["draws_nodes"])}}
-    assert goal_eval.family_eps(raw)["nodes"] > goal_eval.EPS_FLOOR
-    assert goal_eval.phi(raw)[0] < goal_eval.phi(row)[0]
+    assert goal_eval.family_eps(raw) == goal_eval.family_eps(row)
+    assert goal_eval.phi(raw)[0] == goal_eval.phi(row)[0]
 
 
 def test_full_and_reward_fidelity_use_the_same_raw_phi_families():

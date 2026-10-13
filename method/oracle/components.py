@@ -1569,7 +1569,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
            pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None,
            lines: bool = False, node_cap: int | None = NODE_CAP, retain_calibration: bool = False) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
-    in bits, every term ranking, nothing clipped flat): R = phi + g x Q + D.
+    in bits, every term ranking, nothing clipped flat): R = phi - phi_tau + g x Q + D (against the text's bar, a constant
+    of the text, so a group's ranking is phi + g x Q + D's; below 0 for every answer short of the bar, the empty and
+    near-empty circuits included: the Gate B repair 10-13).
       phi: goal_eval.phi of the answer's reward-mode row, -log2 of the power-4 mean of the families' residuals
         (1 - s + eps over point, nodes, edges, flips, track_pp, interchange_pp, donors near and far, pattern, N):
         each halving of the worst residual is about a bit, and the empty circuit is at or below 0.
@@ -1593,7 +1595,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     Reported beside R: phi, phi_tau, g, faithful (phi >= phi_tau), bits, bits_start, compact, D, Q, each term
     (term_E2g, term_E4x, term_E1), and goal_eval's C (term_C, c_rl as term_C_rl), F1, N, F3, the old E2 (qa_term:
     from the no-change answer), E3, E4 (the scorer's headline), the per-question detail (qa), and C's members and
-    columns (fidelity); circuit_reward = phi + g x 0.5 compact + D (the circuit alone, for references without answers).
+    columns (fidelity); circuit_reward = phi - phi_tau + g x 0.5 compact + D (the circuit alone, for references without
+    answers).
     split: the draws of C's changed-input, interchange and donor families, "search" (the RL reward on training texts)
     or "eval" (every evaluation, evaluate()); pool: the flip adversary's pattern pool (POOL; {} leaves it out); cache:
     task -> goal_eval.Text, kept between calls. lines: each answer line's credit too ("lines", line_credit(): the
@@ -1660,8 +1663,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             dc = comp - ref["compact"] if ref is not None and comp is not None else (math.inf if executable_bits <= 0 else None)
             m = None if ref is None or ph is None or dc is None else min(ph - ref["phi"], dc)
             D = 0.0 if m is None else (softplus(2.0 * m) - softplus(0.0)) / 2.0  # 0 at parity with the teacher
-            r = (ph or 0.0) + (g or 0.0) * Q + D
-            circ = (ph or 0.0) + (g or 0.0) * 0.5 * (comp or 0.0) + D
+            r = (ph or 0.0) - (pt or 0.0) + (g or 0.0) * Q + D  # against the text's bar: below 0 until faithful
+            circ = (ph or 0.0) - (pt or 0.0) + (g or 0.0) * 0.5 * (comp or 0.0) + D
             terms |= {"C": c["c"], "C_rl": c.get("c_rl"), "F1": row[f"f1_{convention}"], "N": row[f"n_{convention}"], "F3": row["f3"],
                       "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}
             info = {"phi": ph, "phi_tau": pt, "g": g, "faithful": None if ph is None or pt is None else ph >= pt, "bits": b,

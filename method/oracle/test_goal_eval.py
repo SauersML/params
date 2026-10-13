@@ -2667,8 +2667,8 @@ def test_family_eps_resamples_as_arrays():
             if not kind or not draws or len(draws) < 2:
                 out[fam] = goal_eval.EPS_FLOOR
                 continue
-            got = [goal_eval._pooled(kind, [draws[i] for i in rng.integers(len(draws), size=len(draws))], row.get("kl_empty_live"),
-                                     raw=goal_eval.PHI_FAMILIES[fam][0] in row.get("rl_terms", {})) for _ in range(goal_eval.EPS_BOOT)]
+            got = [goal_eval._pooled(kind, [draws[i] for i in rng.integers(len(draws), size=len(draws))], row.get("kl_empty_live"))
+                   for _ in range(goal_eval.EPS_BOOT)]  # the floored estimator phi reads
             got = [x for x in got if x is not None]
             out[fam] = max(goal_eval.EPS_FLOOR, 2 * float(np.std(got, ddof=1))) if len(got) > 1 else goal_eval.EPS_FLOOR
         return out

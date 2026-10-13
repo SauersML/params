@@ -1053,10 +1053,9 @@ def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=pr
     each step the group whose addition gives the highest phi, until phi reaches the bar (phi_tau + PHI_SLACK) or every
     group is in. unit "position": a group is a position's actives, each candidate scored by goal_eval's reward-mode
     fidelity on the search split (FORWARD_CHUNK a call); "site": one site's actives at one position, every candidate of a
-    step scored at once by GoalEval.phi_variants as node subsets of the union of every group, a set passing there
-    confirmed by fidelity before the search stops. "site" needs monitorbench's per-variant recompute of the nodes and
-    patching families in phi_variants (landing 10-13; until then it holds them at the union's values, as --grow did, and
-    ranks groups only by point, track_pp, interchange_pp, pattern and N); edges and flips stay held at the union's. {"nodes", "positions", "phi", "bar", "unit", "steps": [group, size, phi]}."""
+    step scored at once by GoalEval.phi_variants as node subsets of the union of every group (each variant's nodes and
+    patching families its own, monitorbench's 8dafa65, with node draws common to every variant; edges, flips and
+    omitted held at the union's), a set passing there confirmed by fidelity before the search stops. {"nodes", "positions", "phi", "bar", "unit", "steps": [group, size, phi]}."""
     nat = ge.nat
     tau = ge.tau(tx, pool, "search")
     bar, fams = tau["phi_tau"], tau["families"]

@@ -568,6 +568,23 @@ def test_block_search_phi_check_backs_off():
         (not passed and rec["phi_stage"] == max((x for x in tried if x[1] is not None), key=lambda x: x[1])[0])
 
 
+def test_ranked_draws_each_hold_their_floor():
+    # fv: the likeliest alternatives (rank 0 for acceptance, rank 2 for validation) each against their own floor, the
+    # sampled draws W-pooled apart from them
+    acc = teacher.Acceptance(None, None, ("changed",), "pp", "fv")
+    acc.fixed, acc.r2 = [(3, 11)], [(3, 12)]
+    acc.rank_floor = {(3, 11): teacher.floor_of(1.0), (3, 12): teacher.floor_of(-0.4)}
+    prompts, ws = [(3, 11), (5, 7)], [1.0, 20.0]                # one sampled draw standing for many
+    assert acc.ranked([0.5, 0.95], ws, prompts, range(2)) == (0.95, [[3, 11, 0.5, 0.9]])
+    acc.draws = "fresh"                                          # pooled, the failing alternative averaged away: 0.93
+    assert acc.ranked([0.5, 0.95], ws, prompts, range(2)) == (pytest.approx(19.5 / 21), [])
+    acc.draws = "fv"                                             # a floor below 0 from a start below 0: 5% of its size
+    prompts = [(3, 12), (5, 7)]
+    assert acc.ranked([-0.41, 0.95], ws, prompts, range(2))[1] == []
+    assert acc.ranked([-0.43, 0.95], ws, prompts, range(2))[1] == [[3, 12, -0.43, pytest.approx(-0.42)]]
+    assert teacher.floor_of(0.5) == pytest.approx(0.475) and teacher.floor_of(2.0) == 0.9
+
+
 def test_validated_backs_off_to_the_last_passing_set():
     # every removal admitted; the validation score is the share of units 0-4 still on: below 0.7 once two of them go
     toy, log = Toy([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]), []
@@ -576,7 +593,7 @@ def test_validated_backs_off_to_the_last_passing_set():
         draws = "fv"
 
         def validation(self, on):
-            return float(on[:5].float().mean())
+            return float(on[:5].float().mean()), []
     v = teacher.Validated(toy, lambda on: on, Val(), 0.7, log, every=1)
     toy.prune("unit", 10.0, rounds=1, log=log, after=v)          # one round: the largest prefix, units 0-6, refused
     assert toy.on.all() and log == [] and v.trace[-1][2] < 0.7

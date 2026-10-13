@@ -1997,6 +1997,9 @@ def main():
     ap.add_argument("--phi-check", action="store_true", help="with --f1-start influential, the circuit checked against the "
                     "reward's bar (goal_eval.phi >= phi_tau on the search split, the adversary's pool), backing off a stage at a "
                     "time; with --f1-start set, every stage scored and the one of the highest circuit term written")
+    ap.add_argument("--semantics", choices=goal_eval.SEMANTICS, default="c", help="goal_eval's semantics for every run: c "
+                    "(as stated) or x (the query and key subcomponents outside the circuit and every norm at the text's "
+                    "activations, inframove's 2750fd8)")
     ap.add_argument("--backup", action="store_true", help="with --f1-start set: the start as found and the start expanded "
                     "by its compensators (the backup agent's backup.expand_circuit, as subcomponents) each pruned, the higher "
                     "circuit term written (implies --phi-check)")
@@ -2050,7 +2053,7 @@ def main():
         texts = [native.TEXTS / "vpd4l" / f"{t}.json" for t in args.tasks.read_text().split()]
     else:
         texts = native.tasks(args.split)[:args.n]
-    ge = goal_eval.GoalEval(native.Native(), chunk=args.batch)
+    ge = goal_eval.GoalEval(native.Native(), chunk=args.batch, semantics=args.semantics)
     tokens = None
     if args.max_tokens and not args.save_vpd:
         from tokenizers import Tokenizer

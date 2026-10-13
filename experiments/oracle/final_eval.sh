@@ -11,7 +11,7 @@
 # - Columns (components.py evaluate's report): phi against phi_tau, compact, s_track_pp, the reward, the valid share;
 #   E4 (variables.Scorer, v2 once varteach lands it), E1's gain over no explanation by the reward reader and by Kimi
 #   (tinker_train.py readers); generality's falsification check (the oracle's circuit against plausible wrong
-#   variants of it).
+#   variants of it: beats every variant on R by more than the text's family eps).
 # - Baselines: the influential start (evaluate's "start"), recency and VPD top k at each answer's own bits
 #   (matched_k), native units at equal bits (native_units.py phi), and the teacher (teacher.py on these texts with the
 #   frozen recipe's flags, TEACHER_ARGS), which is also reward v3's D reference.
@@ -70,8 +70,21 @@ EXCLUDE_TEXTS=no-text-excluded SRCREV=$SRCREV LEDGER_OK=1 TEACHER=$F/teacher VAR
   teacher=$F/teacher > $F/eval.log 2>&1
 cp /Users/user/mpd-data/runpod/oracle-graph-eval-sealed/eval.json $F/eval.json
 # 5. Native units at equal bits, generality's falsification of the oracle's circuits, and amortization.
-~/.local/bin/mem-lease 12 env HF_HUB_OFFLINE=1 $PY $SRC/method/oracle/native_units.py phi --influential $F/teacher --out $F/native.jsonl > $F/native.log 2>&1
-~/.local/bin/mem-lease 12 env HF_HUB_OFFLINE=1 $PY $SRC/experiments/oracle/generality/falsify.py --circuits $F/oracle.jsonl --out $F/falsify.json > $F/falsify.log 2>&1
+# Both need a GPU (a 480-token text takes more than 16 GiB on the Mac): the same commands on a rented card.
+$PY - $SRC/method/oracle $F/oracle.jsonl $F/oracle_circuits <<'PYEOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import components
+out = Path(sys.argv[3]); out.mkdir(exist_ok=True)
+for r in map(json.loads, open(sys.argv[2])):  # the oracle's answers as circuit JSON, native units' input
+    (out / f"{r['task']}.json").write_text(json.dumps(components.parse(r["text"])["answer"]))
+PYEOF
+~/.local/bin/mem-lease 12 env HF_HUB_OFFLINE=1 $PY $SRC/method/oracle/native_units.py phi --circuits $F/oracle_circuits \
+  --texts /Users/user/mpd-data/graph_oracle/texts/vpd4l --out $F/native.jsonl > $F/native.log 2>&1  # native units at the oracle's bits
+# falsification: beats every variant on R by more than the text's family eps (the lead's 10-13 rule)
+~/.local/bin/mem-lease 12 env HF_HUB_OFFLINE=1 $PY $SRC/experiments/oracle/generality/falsify.py --circuits $F/oracle.jsonl --out $F/falsify.json \
+  --on R --eps family > $F/falsify.log 2>&1
 $PY - $F <<'PYEOF'
 import json, sys
 from pathlib import Path

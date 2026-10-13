@@ -10,11 +10,14 @@ replaces the old one.
 import glob, json, os, shutil, sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parents[2] / "method" / "oracle"
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "vpd"))
 import torch  # noqa: E402
-import goal_eval, native  # noqa: E402
+
+
+def to_json(nodes: list) -> dict:
+    """A complete node set as goal_eval.to_json writes it (nodes [site, subcomponent, position] sorted by position, site,
+    subcomponent; no edges): written here so the re-pick runs on torch alone, inside the Mac's 1 GiB lane."""
+    return {"nodes": [[n, c, t] for n, t, c in sorted(nodes, key=lambda nd: (nd[1], nd[0], nd[2]))], "edges": [],
+            "complete": True, "explanation": ""}
 
 
 def start_nodes(answer: dict, positions: set) -> list:
@@ -47,7 +50,8 @@ def repick(row: dict, written: list, answer: dict | None, stage_nodes: dict | No
 
 
 def main():
-    vpd = torch.load(sys.argv[1], weights_only=False)
+    vpd = torch.load(sys.argv[1], weights_only=False, mmap=True)   # mapped: a text's answer read when re-picked (whole,
+    # the 494 texts' answers held about 4 GB per process: the Mac's oomkill took a run at 12:30, 10-13)
     for d in map(Path, sys.argv[2:]):
         rows = {}                                            # every summary row per text (a rerun's beside the first)
         for f in sorted(d.glob("summary_*.jsonl")):
@@ -81,7 +85,7 @@ def main():
                 (d / "prerepick").mkdir(exist_ok=True)
                 if not (d / "prerepick" / circ.name).exists():
                     shutil.copy2(circ, d / "prerepick" / circ.name)
-                circ.write_text(json.dumps(goal_eval.to_json(native.Graph(nodes, complete=True), "")))
+                circ.write_text(json.dumps(to_json(nodes)))
                 changed += 1
             recs[task] = rec
             n += 1

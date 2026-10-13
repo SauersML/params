@@ -990,7 +990,7 @@ def derived_sets(row: dict, g0: native.Graph, tx: goal_eval.Text, nat, seed: int
 @torch.no_grad()
 def node_family(ge: goal_eval.GoalEval, tx: goal_eval.Text, graphs: list, draws: int, reads: bool = False,
                 units: list | None = None) -> list[dict]:
-    """goal_eval.GoalEval._node_family without reads (reads must be False), its draws (GoalEval._rng, _unit_draws),
+    """goal_eval.GoalEval._node_family without reads (reads must be False), its draws (GoalEval._node_draws' common draws),
     engines and fields, with each draw's removals written as one indexed assignment per site instead of one scalar
     assignment per removed subcomponent: on block-expanded node sets (every site at a circuit position, ~150,000
     subcomponents) goal_eval's loop spent 15+ minutes in those writes on dev20b's first text. The same masks, so the
@@ -1018,8 +1018,7 @@ def node_family(ge: goal_eval.GoalEval, tx: goal_eval.Text, graphs: list, draws:
         if not nodes:
             out.append({"kl_nodes_c": ge._bounds(tx, "live")[0], "kl_nodes_vpd": ge._bounds(tx, "live")[1], "reads_nodes": None})
             continue
-        rng = ge._rng(tx, g, "nodes")
-        drops = goal_eval._unit_draws(rng, sorted(units[len(out)]) if units is not None else nodes, draws, nat.C)
+        drops = ge._node_draws(tx, sorted(units[len(out)]) if units is not None else nodes, draws, held=nodes)  # (goal_eval's)
         per: dict = {}
         for b, dd in enumerate(drops):
             for n, t, c in dd:

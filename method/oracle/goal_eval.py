@@ -404,9 +404,12 @@ def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list
     contents would cost: its name among sites and positions plus, per subcomponent of its site VPD's answer has on at
     its position (active: {site: bool [T, C]}, the text's), a subcomponent's bits, so a block is never cheaper than
     listing its active parts (the lead's 10-12) and is worth it only where faithfulness needs it. A graph with blocks
-    needs active."""
+    needs active. A complete graph's blocks are priced the same way, and its implied connections are counted with each
+    block as its active contents (a block with none as one node; backup's report: every site at text9000's two
+    influential positions as blocks cost 2,576 bits against the 20,269 of the actives they hold, their connections
+    collapsed into one node per block)."""
     extra = getattr(g, "stranded_bits", 0.0) + _pair_bits(g)  # stranded nodes (strand): dropped, their bits still charged
-    blocks = [nd for nd in (g.node_set() if not g.complete else ()) if nd[2] == BLOCK]
+    blocks = [nd for nd in g.node_set() if nd[2] == BLOCK]
     extra += len(blocks) * (math.log2(positions * VPD4L_SITES) - math.log2(positions * subcomponents))  # named among sites
     if _contents:
         held = blocks + [nd for nd in getattr(g, "stranded", []) if nd[2] == BLOCK]
@@ -416,11 +419,35 @@ def size_bits(g: native.Graph, positions: int, subcomponents: int, targets: list
     if getattr(g, "tok_out", None):  # an embedding into the prediction priced like an edge into it: its writer named
         extra += len(g.tok_out) * math.log2(g.count() + len(set(getattr(g, "tok_positions", [])) | set(g.tok_out)))
     pos = sorted(set(getattr(g, "tok_positions", [])) | {p for p, _ in getattr(g, "tok_edges", [])})
-    if not pos:
-        return g.bits(positions, subcomponents, targets) + extra
     n, k = g.count(), len(pos)
-    inner, out = native.implied_edges(g.node_set(), targets) if g.complete else (sum(len(w) for w in g.parents.values()), len(g.out))
-    return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(n + k) * (2 * (inner + len(g.tok_edges)) + out) + extra
+    if g.complete and blocks and active is not None:  # connections over the blocks' active contents
+        flat = {nd for nd in g.node_set() if nd[2] != BLOCK}
+        for b, t, _ in blocks:
+            cs = active[b][t].nonzero().flatten().tolist()
+            flat |= {(b, t, c) for c in cs} if cs else {(b, t, BLOCK)}
+        inner, out = native.implied_edges(flat, targets)
+        m = len(flat)
+    elif g.complete:
+        inner, out = native.implied_edges(g.node_set(), targets)
+        m = n
+    else:
+        inner, out = sum(len(w) for w in g.parents.values()), len(g.out)
+        m = n
+    if not n:
+        return extra
+    if not pos:
+        return n * math.log2(positions * subcomponents) + math.log2(m) * (2 * inner + out) + extra
+    return n * math.log2(positions * subcomponents) + k * math.log2(positions) + math.log2(m + k) * (2 * (inner + len(g.tok_edges)) + out) + extra
+
+
+def _unit_draws(rng: np.random.Generator, units: list, draws: int, C: dict) -> list[list]:
+    """The node family's removal draws: draw j takes each unit with probability (j + 0.5) / draws (at least one), a
+    block unit (site, t, BLOCK) as every subcomponent of its site at t."""
+    out = []
+    for j in range(draws):
+        du = [u for u in units if rng.random() < (j + 0.5) / draws] or [units[int(rng.integers(len(units)))]]
+        out.append([x for u in du for x in ([(u[0], u[1], c) for c in range(C[u[0]])] if u[2] == BLOCK else [u])])
+    return out
 
 
 def _pair_bits(g: native.Graph) -> float:
@@ -2362,7 +2389,7 @@ class GoalEval:
         whole = [native.Graph(sorted(g.node_set()), complete=True) if not g.complete else None for g in graphs]
         wired = dict(zip([i for i, w in enumerate(whole) if w is not None],
                          self.sufficiency(tx, [w for w in whole if w is not None])))
-        nodes = self._node_family(tx, graphs, draws, reads)
+        nodes = self._node_family(tx, graphs, draws, reads, units=[sorted(h.node_set()) for h in pp_graphs])  # a block one unit
         edges = self._edge_family(tx, graphs, draws, reads)
         none = [{} for _ in graphs]
         adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool and not reward else none
@@ -2653,9 +2680,12 @@ class GoalEval:
         return out
 
     @torch.no_grad()
-    def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int, reads: bool = False) -> list[dict]:
+    def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int, reads: bool = False,
+                     units: list | None = None) -> list[dict]:
         """Per circuit, the node-removal family: draws of its nodes removed from the model, from VPD's answer and from
-        the circuit (a stated graph keeps its connections among the rest), the mean KLs from the model's. The runs
+        the circuit (a stated graph keeps its connections among the rest), the mean KLs from the model's. units: per
+        graph its removal units (default its nodes): a block (site, t, BLOCK) is one unit, every subcomponent of its site
+        there removed together (backup's report: a block's 3,072 subcomponents drawn one by one took 96% of every draw). The runs
         multiply only the circuits' and VPD's subcomponents (engine.Engine's columns; the model's run with every other
         subcomponent folded into its remainder, outside="on"): float32-close to the masked forward over every column."""
         import engine
@@ -2677,10 +2707,7 @@ class GoalEval:
                 out.append({"kl_nodes_c": self._bounds(tx, "live")[0], "kl_nodes_vpd": self._bounds(tx, "live")[1], "reads_nodes": None})
                 continue
             rng = self._rng(tx, g, "nodes")
-            drops = []
-            for j in range(draws):
-                d = [nd for nd in nodes if rng.random() < (j + 0.5) / draws]
-                drops.append(d or [nodes[int(rng.integers(len(nodes)))]])
+            drops = _unit_draws(rng, sorted(units[len(out)]) if units is not None else nodes, draws, nat.C)
 
             def without(base, d, where):  # [draws, T, K]: base with each draw's nodes off
                 m = {n: x[None].repeat(len(d), 1, 1) for n, x in base.items()}
@@ -4152,7 +4179,8 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             if "pattern" in only:  # the true-pattern family, merged into the same rows
                 tp = [dict(a, **c) for a, c in zip(tp, ge.pattern_family(tx, [_c_graph(g, targets, nat.C) for g in graphs]))]
             ip = ge.interchange_pp(tx, graphs, "eval", interchange) if "interchange_pp" in only else [{} for _ in graphs]
-            nf = ge._node_family(tx, [_c_graph(g, targets, nat.C) for g in graphs], draws) if "nodes" in only else [{} for _ in graphs]
+            nf = ge._node_family(tx, [_c_graph(g, targets, nat.C) for g in graphs], draws,
+                                 units=[sorted(strand(g, targets, nat.C).node_set()) for g in graphs]) if "nodes" in only else [{} for _ in graphs]
             ns = ge.necessity_spec(tx, graphs, "eval") if "necessity" in only else [{} for _ in graphs]
             if "remainders" in only:  # the point score with the remainders live, held at x and off
                 ns = [dict(a, **b) for a, b in zip(ns, ge.point_remainders(tx, graphs))]

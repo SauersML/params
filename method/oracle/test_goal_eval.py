@@ -1789,6 +1789,27 @@ def test_graph_kl_on_node_sets_and_blocks(tiny):
     assert got[2] == ge._bounds(tx, "live")[0] and got[0] < got[2]
 
 
+def test_blocks_priced_and_drawn_as_units(tiny):
+    """A complete graph's block costs at least its active contents listed (connections counted over them); the node
+    family draws a block whole or not at all."""
+    import numpy as np
+
+    nat, ge, tx = tiny
+    P, S = max(tx.targets) + 1, sum(nat.C.values())
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    t = tx.targets[0]
+    site = next(n for n, tt, _ in every if tt == t)
+    inside = [nd for nd in every if nd[0] == site and nd[1] == t]
+    rest = [nd for nd in every if nd not in set(inside)]
+    blk = native.Graph(rest + [(site, t, goal_eval.BLOCK)], complete=True)
+    lst = native.Graph(rest + inside, complete=True)
+    assert goal_eval.size_bits(blk, P, S, tx.targets, active=tx.vpd) >= goal_eval.size_bits(lst, P, S, tx.targets) - 1e-9
+    units = sorted(rest[:5] + [(site, t, goal_eval.BLOCK)])
+    for d in goal_eval._unit_draws(np.random.default_rng(0), units, 8, nat.C):
+        got = {c for n, tt, c in d if (n, tt) == (site, t)}
+        assert got in (set(), set(range(nat.C[site])))
+
+
 def test_line_leave_one_out(tiny):
     """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row
     with point, N, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run (the held

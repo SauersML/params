@@ -10,7 +10,7 @@
 # network), saves VPD's answers on its texts with one process (teacher.py --save-vpd), and with LOCALITY=1 labels them
 # local or not with P processes (components.py locality --tasks); then it deletes the checkpoint, so the teacher processes
 # hold only the subcomponents (3 of them with the network overflowed a 16 GB card).
-# Pod j's circuits come back to ~/mpd-data/runpod/oracle-graph-teacher-$RUN-$j/out/ and are copied into DEST every minute
+# Pod j's circuits come back to ~/mpd-data/runpod/oracle-graph-teacher-$RUN-$j/out/ (gpu.log, and mem_peak.txt the pod's cgroup memory peak in bytes, beside it) and are copied into DEST every minute
 # while the pods run (a <task>... file DEST already holds is kept; summary_<k>.jsonl and locality_<k>.jsonl arrive as
 # summary_<RUN>-<j>_<k>.jsonl and locality_<RUN>-<j>_<k>.jsonl). A pod ends when its texts are done; HOURS caps each pod.
 #   experiments/oracle/pods/teacher_pod.sh HOURS
@@ -102,6 +102,7 @@ tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd ${EXTRA:-} > /dev/null;
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
+(while :; do cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes > $O/mem_peak.txt 2> /dev/null; sleep 30; done > /dev/null 2>&1 &);
 $PRE
 ${FROM:+mkdir -p ~/from; tar -xzf $F/from_$j.tgz -C ~/from;}
 cd /Users/user/params/method/oracle; $LOC

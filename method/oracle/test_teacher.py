@@ -27,6 +27,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "vpd"))
 
 import carry  # noqa: E402
+import components  # noqa: E402
 import goal_eval  # noqa: E402
 import native  # noqa: E402
 import teacher  # noqa: E402
@@ -603,6 +604,42 @@ def test_set_search_validation_holds_its_floor():
     f = rec["floor"]["s_track_pp"]
     assert rec["validation_end"] is None or rec["validation_end"] >= f - 1e-6
     assert g.count() == int(ps.on.sum()) <= rec["start_units"]
+
+
+def test_circuit_score_is_the_rewards_circuit_term():
+    # at the bar with the start's bits 0; above it, compactness counts nearly in full; capped phi a tenth past bar + 1
+    assert teacher.circuit_score(1.5, 1.5, 1000.0, 1000.0) == 0.0
+    assert teacher.circuit_score(None, 1.5, 1000.0, 1000.0) is None
+    above = teacher.circuit_score(2.0, 1.5, 500.0, 1000.0)
+    g = 1 / (1 + 2 ** (-components.GATE_SLOPE * 0.5))
+    assert above == pytest.approx(0.5 + g * teacher.SIZE_WEIGHT * 1.0)
+    assert teacher.circuit_score(4.0, 1.5, 1000.0, 1000.0) == pytest.approx(1.0 + goal_eval.PHI_SLOPE * 1.5)
+    # text9002 under --backup: 536 subcomponents at phi 2.37 over a bar of 1.67 with 3.9x the start's bits scores below
+    # the start's 0
+    assert teacher.circuit_score(2.3745, 1.6675, 487867.0, 123945.0) < 0.0
+
+
+@pytest.mark.skipif(DEVICE == "cpu", reason="needs a GPU")
+def test_set_search_writes_the_highest_scoring_stage():
+    if not teacher.POOL.exists():
+        pytest.skip("needs the adversary's pool")
+    nat, pr = pruner(True, "text9002")
+    ge = pr.ge
+    ids, targets = native.text(TEXT.parent / "text9002.json")
+    tx = ge.text(ids, targets, native.task_seed("text9002"))
+    tx.vpd = pr.tx.vpd
+    empty, vpd = ge._bounds(tx, teacher.CONVENTION)
+    acc = teacher.Acceptance(ge, tx, ("changed",), "pp", "fv")
+    g, ps, _, _, rec = teacher.set_search(ge, tx, empty, vpd, teacher.kl_budget(empty, vpd), acc, levels=("site", "chunk4"),
+                                          phi_pool=torch.load(teacher.POOL))
+    tau = ge.tau(tx, None, "search")
+    # every stage scored as the reward's circuit term (phi over the text's families against its bar, the start set's
+    # bits), the written one the highest
+    assert [x[0] for x in rec["phi"]] == ["chunk4", "site", "start"]
+    for name, ph, bar, n, fam, bits, score in rec["phi"]:
+        assert bar == tau["phi_tau"] and score == teacher.circuit_score(ph, bar, bits, tau["bits_start"])
+    best = max((x for x in rec["phi"] if x[6] is not None), key=lambda x: x[6])
+    assert rec["phi_stage"] == best[0] and rec["score"] == best[6] and g.count() == best[3]
 
 
 def test_family_acceptance_scores_as_fidelity():

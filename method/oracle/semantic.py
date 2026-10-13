@@ -62,15 +62,16 @@ class Checker:
     def __init__(self, sc: variables.Scorer, tx, variables_: list[dict], fresh_mean: bool = False):
         self.sc, self.tx, self.nat, self.fresh_mean = sc, tx, sc.nat, fresh_mean
         self.vars = {v["name"]: v for v in variables_}
-        self.base = sc._text(tx.ids, tx.targets, check=False)
+        self.keep = sorted(set(tx.targets) | {t for v in variables_ for _, t, _ in v["group"]})  # every patched position:
+        self.base = sc._text(tx.ids, tx.targets, check=False, positions=self.keep)  # the tables kept there alone
         self.p0 = self.base["lq"][-1]
         self.y0 = int(self.p0.argmax())
         self._texts: dict = {}
         self._means: dict = {}
 
     def text(self, changes: dict) -> dict:
-        """The real model's run on x with the changes (the KEEP latest kept: each holds the engine's tables, ~0.2 GB on a
-        long text, and a text with 16 variables checks ~90 lines; var_post went past 16 GiB keeping them all)."""
+        """The real model's run on x with the changes (the KEEP latest kept, each with its tables at the variables'
+        positions alone: whole tables were ~0.2 GB a text on a long text, and var_post went past 16 GiB)."""
         key = tuple(sorted((int(p), int(z)) for p, z in changes.items()))
         if not key:
             return self.base
@@ -80,7 +81,7 @@ class Checker:
                 x[p] = z
             while len(self._texts) >= KEEP:
                 self._texts.pop(next(iter(self._texts)))
-            self._texts[key] = self.sc._text(x, self.tx.targets, check=False)
+            self._texts[key] = self.sc._text(x, self.tx.targets, check=False, positions=self.keep)
         return self._texts[key]
 
     def mean(self, name: str) -> dict:

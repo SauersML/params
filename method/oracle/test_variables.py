@@ -162,6 +162,32 @@ def test_kept_positions_give_the_same_scores(case, monkeypatch):
     assert json.dumps(kept, sort_keys=True) == json.dumps(every, sort_keys=True)
 
 
+def test_checker_keeps_positions_with_the_same_outcomes(case, monkeypatch):
+    """semantic.Checker keeps its texts' tables at the targets and its variables' positions alone: token changes,
+    transplants (two donors), removals (a carrier at its mean) and their outcomes equal those with every position
+    kept, to the bit."""
+    import semantic
+    nat, ge, tx, at, _ = case
+    raw = [{"name": "V1", "inputs": [233], "group": at(233)[::9] + [["block", nat.names[5], 233]]},
+           {"name": "V2", "inputs": [287], "group": at(287)[::11]}]
+    vs = variables.parse(raw, nat.C)
+    items = [({"tokens": {233: 512}}, ("unchanged",)), ({"transplants": [("V1", {233: 512})]}, ("top", 13)),
+             ({"transplants": [("V1", {233: 512}), ("V2", {287: 300})]}, ("not", 13)), ({"remove": ["V1"]}, ("drop", 0.5)),
+             ({"tokens": {287: 300}, "remove": ["V2"]}, ("rise", 2.0))]
+
+    def rows():
+        ck = semantic.Checker(variables.Scorer(ge), tx, vs)
+        got = ck.check(items)
+        ck.close()
+        return got
+    kept = rows()
+    whole = variables.Scorer._text
+    monkeypatch.setattr(variables.Scorer, "_text", lambda self, ids, targets, graph=None, check=True, positions=None:
+                        whole(self, ids, targets, graph, check))
+    every = rows()
+    assert kept == every, (kept, every)
+
+
 def test_headline_rules():
     """e4: per variable min(f on-target, f off-target); 0 for a variable with no resolved on-target draw (counted), its
     off-target not counted; composition and feeds as they are; a missing off-target leaves f on-target."""

@@ -74,14 +74,15 @@ BLOCK = -1  # a group item (site, position, BLOCK): the site's whole output at t
 
 
 class _AtPositions:
-    """A text's [T, ...] table kept at some positions alone (Scorer._text's positions=): indexed by position as the
-    whole table is (an int, or a list or tensor of positions, first); a position not kept raises KeyError."""
+    """A text's [T, ...] table kept at some positions alone (Scorer._text's positions=): indexed and assigned by
+    position as the whole table is (an int, or a list or tensor of positions, first; a position not kept raises
+    KeyError), cloned, and added to or divided as one (semantic.Checker's means: tables kept at the same positions)."""
 
     def __init__(self, data: torch.Tensor, rows: dict, row: torch.Tensor, T: int):
         self.data, self.rows, self.row = data, rows, row
         self.shape = (T,) + tuple(data.shape[1:])
 
-    def __getitem__(self, idx):
+    def _at(self, idx) -> tuple:
         first, rest = (idx[0], tuple(idx[1:])) if isinstance(idx, tuple) else (idx, ())
         if torch.is_tensor(first) and first.dim() > 0 or isinstance(first, (list, range)):
             r = self.row[torch.as_tensor(first, device=self.row.device)]
@@ -91,7 +92,31 @@ class _AtPositions:
             r = self.rows.get(int(first))
             if r is None:
                 raise KeyError(f"position {int(first)} not kept")
-        return self.data[(r,) + rest]
+        return (r,) + rest
+
+    def __getitem__(self, idx):
+        return self.data[self._at(idx)]
+
+    def __setitem__(self, idx, value):
+        self.data[self._at(idx)] = value.data if isinstance(value, _AtPositions) else value
+
+    def _like(self, data: torch.Tensor):
+        return _AtPositions(data, self.rows, self.row, self.shape[0])
+
+    def clone(self):
+        return self._like(self.data.clone())
+
+    def __add__(self, other):
+        if isinstance(other, _AtPositions):
+            if other.rows != self.rows:
+                raise ValueError("tables kept at different positions")
+            return self._like(self.data + other.data)
+        return self._like(self.data + other)
+
+    __radd__ = __add__
+
+    def __truediv__(self, k):
+        return self._like(self.data / k)
 
 
 def parse(variables: list[dict], C: dict) -> list[dict]:

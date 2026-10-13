@@ -33,8 +33,8 @@ class ToyEval(goal_eval.GoalEval):
     """GoalEval with VPD's bound held above 0: an exact decomposition's KL_VPD is ~1e-6 and can round below 0, which
     teacher.py's budget KL_empty^0.1 KL_VPD^0.9 turns complex."""
 
-    def _bounds(self, tx, conv):
-        e, v = super()._bounds(tx, conv)
+    def _bounds(self, tx, conv, family="point"):
+        e, v = super()._bounds(tx, conv, family)
         return e, (None if v is None else max(v, 1e-9))
 
 

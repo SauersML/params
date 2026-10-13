@@ -738,6 +738,15 @@ class Env:
                                  split=self.score_split, pool=self.pool)[0]
 
 
+def free_text(env: Env, tid: str) -> None:
+    """Drop a text's Tools (its Text's GPU tensors) and return the memory to the device."""
+    env.tools.pop(tid, None)
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 DRAFT_RE = re.compile(r"\bd\d+\b")
 CIRCUIT_DRAFT = re.compile(r"(CIRCUIT\s*:)\s*(?:```(?:mermaid)?\s*)?(d\d+)\s*(?:```)?[ \t]*(?=\n|$)", re.I)
 
@@ -1169,6 +1178,7 @@ def scripted(env: Env, tids: list[str], out: Path, log=print, rank: str = "effec
         res.append(row)
         with out.open("a") as f:
             f.write(json.dumps(row) + "\n")
+        free_text(env, tid)  # each text runs once here: TEXTS_KEPT texts' GPU state OOMed a 48 GB card at the 6th (10-13)
         s = r["scores"] or {}
         log(f"{tid}: reward {r['reward']:.3f} ({r['calls']} calls, {r['episode_seconds']:.0f} s + score {r['score_seconds']:.0f} s) "
             f"phi {s.get('phi')} vs start {tau['phi_start']}; pp {s.get('s_track_pp')} vs {st['s_track_pp']}; bits {s.get('bits')} vs {tau['bits_start']}")

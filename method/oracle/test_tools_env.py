@@ -292,6 +292,13 @@ def test_scripted_episode_pp(env):
     assert not any(c.get("arguments", {}).get("families") for m in r["messages"] for c in m.get("tool_calls") or [])
 
 
+def test_free_text_drops_a_texts_tools(env):
+    env.text_tools(TID)
+    tools_env.free_text(env, TID)
+    assert TID not in env.tools
+    assert env.text_tools(TID).tx is not None  # built again on the next use
+
+
 def test_scripted_episode(env):
     pol = tools_env.Scripted()
     r = tools_env.run_episode(env, TID, pol)

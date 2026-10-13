@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 import sys
 
@@ -115,7 +116,59 @@ def save_distributions(out, name, tensors):
     return binding
 
 
-def run(source, inputs, trial, out):
+def candidate_specs(values):
+    if values is None:
+        return {'base': 'base.jsonl', 'trained': 'trained.jsonl'}
+    result = {}
+    for value in values:
+        name, separator, filename = value.partition('=')
+        if (not separator or not re.fullmatch(r'[a-z][a-z0-9_]*', name) or name == 'gt'
+                or name in result or Path(filename).name != filename or not filename.endswith('.jsonl')):
+            raise ValueError('candidate requires a unique non-gt name and local JSONL filename: name=file.jsonl')
+        result[name] = filename
+    if 'base' not in result:
+        raise ValueError('named candidates must include the shared base')
+    return result
+
+
+def compile_candidates(texts, bank, parse, compile_graph, preinvalid=None):
+    """Freeze original topology per input; retain only expected format/architecture failures."""
+    errors = dict(preinvalid or {})
+    parsed = {}
+    for name, text in texts.items():
+        if name not in errors:
+            try:
+                parsed[name] = parse(text)
+            except ValueError as exc:
+                errors[name] = str(exc)
+    compiled, invalid = [], []
+    for ids in bank:
+        graphs, reasons = {}, dict(errors)
+        for name, graph in parsed.items():
+            try:
+                graphs[name] = compile_graph(graph, ids)
+            except ValueError as exc:
+                reasons[name] = str(exc)
+        compiled.append(graphs)
+        invalid.append(reasons)
+    return compiled, invalid
+
+
+def candidate_summary(selected, arm):
+    scores = [row['candidates'][arm] for row in selected]
+    defined = [(score, row) for score, row in zip(scores, selected) if score.get('valid', True)]
+    values = [score for score, _ in defined]
+    return {'n': len(scores), 'valid': len(values), 'invalid': len(scores) - len(values),
+            'kl_denominator': len(values), 'undefined_kl': len(scores) - len(values),
+            'mean_direct_kl_bits': sum(s['direct_kl_bits'] for s in values) / len(values) if values else None,
+            'worst_direct_kl_bits': max((s['direct_kl_bits'] for s in values), default=None),
+            'mean_conditional_delta_kl_bits': sum(s['conditional_delta_kl_bits'] for s in values) / len(values) if values else None,
+            'beats_no_change': sum(s['direct_kl_bits'] < s['no_change_error_bits'] for s in values),
+            'top_correct': sum(s['top'] == row['reference_top'] for s, row in defined),
+            'top_accuracy_all': sum(s['top'] == row['reference_top'] for s, row in defined) / len(scores) if scores else None}
+
+
+def run(source, inputs, trial, out, candidates=None):
     sys.path.insert(0, str(source / 'experiments/oracle/toyloop'))
     import torch
     import render
@@ -134,16 +187,24 @@ def run(source, inputs, trial, out):
     payload = json.loads((trial / 'payload_contract.json').read_text())
     for name, expected in payload['files'].items():
         assert Path(name).name == name and digest(trial / name) == expected
-    samples = {arm: {row['id']: row for row in rows(trial / (arm + '.jsonl'))} for arm in ('base', 'trained')}
-    assert all(len(value) == 24 for value in samples.values())
+    specs = candidate_specs(candidates)
+    samples = {}
+    for arm, filename in specs.items():
+        assert filename in payload['files'], ('candidate not bound by payload', filename)
+        records = rows(trial / filename)
+        samples[arm] = {row['id']: row for row in records}
+        assert len(records) == len(samples[arm]) == 24, 'requires all 24 unique first samples'
     truth = {row['id']: row for row in rows(inputs / 'panel_truth.jsonl')}
     bindings = {row['id']: row for row in manifest['panel']}
+    assert all(set(value) == set(bindings) for value in samples.values()), 'candidate panel mismatch'
     out.mkdir()
     contract = {'schema': 1, 'cases': CASES, 'scales': SCALES, 'heads': 'all architectural heads',
                 'damage_min_bits': DAMAGE_MIN, 'integrity_max_bits': INTEGRITY_MAX,
                 'source': manifest['execution_source'], 'driver_sha256': digest(__file__),
                 'inputs_manifest_sha256': digest(inputs / 'manifest.json'),
                 'trial_payload_contract_sha256': digest(trial / 'payload_contract.json'),
+                'candidates': {arm: {'file': filename, 'sha256': digest(trial / filename)} for arm, filename in specs.items()},
+                'invalid_retention': candidates is not None,
                 'sparse': 'C, live=False, own routing/norms; no dense trace or edited norms supplied',
                 'integrity': 'ALL original pieces/all legal connections + remainder vs dense edited model',
                 'gt': 'reported candidate; edited GT failure is not an integrity failure',
@@ -165,14 +226,21 @@ def run(source, inputs, trial, out):
         bound.meta = dict(toy.meta)
         bound.meta['decomposition'] = {n: (nat.target.site(n).U, nat.target.site(n).V, nat.units[n]) for n in nat.names}
         texts = {'gt': truth[ident]['completion']}
-        for arm in ('base', 'trained'):
+        preinvalid = {}
+        for arm in specs:
             sample = samples[arm][ident]
-            assert sample['sample'] == 0 and sample['finish'] == 'stop' and not sample.get('parse_error')
+            assert sample['sample'] == 0
             assert sample['prompt_sha256'] == binding['prompt_sha256']
-            texts[arm] = sample['completion']
-        parsed = {arm: circuit.parse(text) for arm, text in texts.items()}
+            if sample.get('finish') != 'stop':
+                preinvalid[arm] = 'non-stop finish: ' + str(sample.get('finish'))
+            elif sample.get('parse_error') or not isinstance(sample.get('completion'), str):
+                preinvalid[arm] = 'missing or parse-error response'
+            texts[arm] = sample.get('completion')
         # Compile every topology before ANY edited world; no recarving under edits.
-        compiled = [{arm: circuit.unit_graph(graph, bound, ids) for arm, graph in parsed.items()} for ids in bank]
+        compiled, invalid = compile_candidates(texts, bank, circuit.parse,
+                                               lambda graph, ids: circuit.unit_graph(graph, bound, ids), preinvalid)
+        if candidates is None:
+            assert not any(invalid), ('legacy strict candidate failure', invalid)
         full = [native.Graph(masks={n: torch.ones(len(ids), nat.C[n], dtype=torch.bool) for n in nat.names}) for ids in bank]
         baseline = []
         for index, ids in enumerate(bank):
@@ -190,6 +258,7 @@ def run(source, inputs, trial, out):
             append(out / 'baseline.jsonl', {'task': ident, 'input': index,
                     'full_integrity_kl_bits': kl_bits(p0, integrity),
                     'full_integrity_raw_kl_bits': raw_integrity, 'distributions': distributions,
+                    'candidate_invalid': invalid[index],
                     'candidate_kl_bits': {arm: kl_bits(p0, q) for arm, q in q0.items()}})
         # Explicit no-op through the same edit/cache path; no new decomposition.
         with scaled_head(nat, 0, 0, 1.0):
@@ -229,8 +298,12 @@ def run(source, inputs, trial, out):
                                       'norm_shift_l2': {str(k): float((edited_norms[k] - v).norm()) for k, v in original_norms.items()},
                                       'reference_top': int(pe[0, -1].argmax()), 'original_top': int(p0[0, -1].argmax()),
                                       'candidates': {}}
+                            for arm, reason in invalid[index].items():
+                                result['candidates'][arm] = {'valid': False, 'invalid_reason': reason,
+                                    'direct_kl_bits': None, 'direct_raw_kl_bits': None, 'conditional_delta_kl_bits': None,
+                                    'top': None, 'no_change_error_bits': damage}
                             for arm, q in qe.items():
-                                result['candidates'][arm] = {'direct_kl_bits': kl_bits(pe, q),
+                                result['candidates'][arm] = {'valid': True, 'direct_kl_bits': kl_bits(pe, q),
                                     'direct_raw_kl_bits': raw_kl_bits(pe, q),
                                     'no_change_error_bits': damage, 'gain_over_no_change_bits': damage - kl_bits(pe, q),
                                     'conditional_delta_kl_bits': kl_bits(pe, moved[arm]),
@@ -260,13 +333,7 @@ def run(source, inputs, trial, out):
             selected = [row for row in subset if damage_group == 'all' or row['active_damage'] == (damage_group == 'active')]
             summary['groups'][task][damage_group] = {'n': len(selected), 'arms': {}}
             for arm in texts:
-                scores = [row['candidates'][arm] for row in selected]
-                summary['groups'][task][damage_group]['arms'][arm] = {
-                    'mean_direct_kl_bits': sum(s['direct_kl_bits'] for s in scores) / len(scores) if scores else None,
-                    'worst_direct_kl_bits': max((s['direct_kl_bits'] for s in scores), default=None),
-                    'mean_conditional_delta_kl_bits': sum(s['conditional_delta_kl_bits'] for s in scores) / len(scores) if scores else None,
-                    'beats_no_change': sum(s['direct_kl_bits'] < s['no_change_error_bits'] for s in scores),
-                    'top_correct': sum(s['top'] == row['reference_top'] for s, row in zip(scores, selected))}
+                summary['groups'][task][damage_group]['arms'][arm] = candidate_summary(selected, arm)
     (out / 'complete.json').write_text(json.dumps(summary, indent=2) + '\n')
     print('HEAD_COUNTERFACTUAL_JSON=' + json.dumps(summary, sort_keys=True))
 
@@ -275,5 +342,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     for name in ('source', 'inputs', 'trial', 'out'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--candidate', action='append', help='Opt-in named first-sample file: name=file.jsonl; repeat, including shared base. Invalid predictions retained with undefined KL.')
     args = parser.parse_args()
-    run(args.source, args.inputs, args.trial, args.out)
+    run(args.source, args.inputs, args.trial, args.out, args.candidate)

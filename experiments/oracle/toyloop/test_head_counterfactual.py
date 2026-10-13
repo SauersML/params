@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from head_counterfactual import digest, kl_bits, raw_kl_bits, save_distributions, scaled_head
+from head_counterfactual import (candidate_specs, candidate_summary, compile_candidates, digest,
+                                 kl_bits, raw_kl_bits, save_distributions, scaled_head)
 
 
 def tiny_native():
@@ -18,6 +19,54 @@ def tiny_native():
                           _refs={'old': 1}, _refs_bytes=1, _rec=('old', 'old', {}),
                           _sensitivity_kept={'old': 1})
     return nat, site
+
+
+def test_named_candidates_keep_default_and_reject_unbound_names():
+    assert candidate_specs(None) == {'base': 'base.jsonl', 'trained': 'trained.jsonl'}
+    assert candidate_specs(['base=base.jsonl', 'multihop_m8=cell.jsonl']) == {
+        'base': 'base.jsonl', 'multihop_m8': 'cell.jsonl'}
+    for values in (['base=../base.jsonl'], ['base=base.jsonl', 'base=again.jsonl'],
+                   ['base=base.jsonl', 'gt=gt.jsonl'], ['cell=cell.jsonl']):
+        with pytest.raises(ValueError):
+            candidate_specs(values)
+
+
+def test_invalid_candidates_do_not_recompile_or_remove_common_worlds():
+    calls = []
+
+    def compile_graph(graph, ids):
+        calls.append((graph, tuple(ids)))
+        if graph == 'bad_edge':
+            raise ValueError('non-executable edge')
+        return (graph, tuple(ids))
+
+    bank = [[0, 1], [0, 2, 3]]
+    compiled, invalid = compile_candidates({'base': 'ok', 'bad': 'bad_edge', 'length': None}, bank,
+                                          lambda value: value, compile_graph, {'length': 'length stop'})
+    assert len(compiled) == len(invalid) == len(bank)
+    assert all(set(graphs) == {'base'} for graphs in compiled)
+    assert all(reasons == {'length': 'length stop', 'bad': 'non-executable edge'} for reasons in invalid)
+    assert len(calls) == 4  # Each original graph once per input; truncated graph never parsed/compiled.
+
+
+def test_invalid_cf_stays_denominator_and_kl_is_undefined():
+    valid = {'valid': True, 'direct_kl_bits': .2, 'conditional_delta_kl_bits': .1,
+             'no_change_error_bits': .4, 'top': 3}
+    invalid = {'valid': False, 'direct_kl_bits': None, 'top': None}
+    selected = [{'reference_top': 3, 'candidates': {'cell': value}} for value in (valid, invalid)]
+    result = candidate_summary(selected, 'cell')
+    assert result['n'] == 2 and result['valid'] == result['undefined_kl'] == 1
+    assert result['mean_direct_kl_bits'] == .2 and result['top_accuracy_all'] == .5
+    undefined = candidate_summary(selected[1:], 'cell')
+    assert undefined['mean_direct_kl_bits'] is None and undefined['top_accuracy_all'] == 0.
+
+
+def test_unexpected_executor_failure_is_not_silently_candidate_invalid():
+    def broken(graph, ids):
+        raise RuntimeError('executor bug')
+
+    with pytest.raises(RuntimeError, match='executor bug'):
+        compile_candidates({'base': 'ok'}, [[0, 1]], lambda value: value, broken)
 
 
 @pytest.mark.parametrize('scale', [0.0, 0.5, 1.0])

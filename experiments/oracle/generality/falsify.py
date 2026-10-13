@@ -21,7 +21,8 @@ Circuits (node sets with every connection the model has among them, blocks a sit
   references: VPD's top k and recency (VPD's actives at t and the m positions before it) at the correct circuit's bits,
      and at the stated copy template's bits.
 Scores: goal_eval.GoalEval.fidelity in the reward's mode on the eval split (point, nodes, flips at FLIP_TERM over the
-CI-pattern pool, track_pp, interchange_pp, donors near and far, pattern, N), the connection-cut family left out for
+CI-pattern pool, track_pp, interchange_pp, donors near and far, pattern, N; 16 node draws, 8 changed-input and
+interchange draws, 8 near and 4 far donors), the connection-cut family left out for
 every circuit (every connection among tens of thousands of block subcomponents is beyond memory), Φ (goal_eval.phi),
 bits (blocks at their active contents, cscore.bits_active) and compactness against the correct circuit.
 Variables (vars): E4 (variables.Scorer, eval split) of the copied token's identity carried by the a column's blocks,
@@ -273,7 +274,8 @@ def score(e: dict):
     pool = torch.load(POOL, weights_only=False) if POOL.exists() else None
     rows = []
     for k in names:  # one at a time: the engine spans its call's columns
-        rows += ge.fidelity(tx, [graphs[k]], pool=pool, mode="reward", split="eval")
+        rows += ge.fidelity(tx, [graphs[k]], pool=pool, mode="reward", split="eval", draws=16, interchange=8, changed=8,
+                            near_donors=8, far_donors=4)
         native.free(nat.dev)
         print(e["task"], k, "scored", round(time.perf_counter() - t0), "s", flush=True)
     with out_path("falsify").open("a") as f:

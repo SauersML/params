@@ -1,4 +1,6 @@
 %% CLAIMGROUND joint38412628238 COMPLETE:8fixed joint cases+16single controls on TRAINtext6034; geometry selected before firstforward; both donor494/504 assignments retained.
+%% 2026-10-13 optional weight-seed804e1a4: loaded signed vectors; unchanged original KL/search/FV gates, nine tests pass.
+%% Free38418663035 compares three pre-existing TRAIN graphs; direct KL/timing pending, no static-cos fidelity claim.
 %% CLAIMGROUND affine38417423651 LIVE: three fixed TRAIN contexts,four units each,24flip/raise proposal slots; persistent grid and analytic, full Editor plus independent literalW verification.
 %% Helper six model-free tests PASS; teacher default unchanged, opt-in --analytic-final-down only. TRAIN-proxy collateral explicitly not official held score; no other corpus read, no paid inference.
 %% 2026-10-13 reasoning diagnostic terminal0:128firstresponses,127length/1stop,1valid/correct;$.878226822 settledonce, nooutstanding.
@@ -545,6 +547,7 @@ flowchart BT
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
   CAPABLE["<b>Fresh two-route transfer fails</b><br/>V+8 faithful 2/8; BASE 3/8;<br/>input-only V-facts baseline 8/8;<br/>multi-route TRAIN support: 0/256<br/>MEASURED · codex/fork_review · $1.186"]
+  WEIGHTSEED["<b>Weight-guided teacher proposal</b><br/>K32 residual links; <=128 scalar nodes;<br/>original KL/search/FV floors gate;<br/>3 existing TRAIN graphs: free check running<br/>CHECKING · codex/fork_review · $0"]
   COMPOSE["<b>Learn independent V-route composition</b><br/>32 fresh single vs32 two-path supports;<br/>original256 retained; new8 frozen;<br/>72 variants verified · 0.6844 USD upper<br/>PREFLIGHT PASS · codex/eval_recovery"]
   CAPCF["<b>Weight-edit ability recovered</b><br/>Best training and base:1792/1792 tops;<br/>worst KL0.00015 bits on4 toy models;<br/>half-strength edits expose weaker training<br/>MEASURED · codex/eval_recovery"]
   CAPENG["<b>Calibrate the English verifier</b><br/>Verified facts122/128; prose60/128;<br/>writer error and reader overapplication;<br/>reasoning1024 truncated127/128;<br/>calibrate completion budget on small pilots<br/>ENGLISH UNVERIFIED · codex"]
@@ -688,6 +691,8 @@ flowchart BT
   RELTRAIN -. measured relation learning .-> C1
   RELTRAIN -. capacity remains unresolved .-> CAPABLE
   CAPABLE -. executed circuits and cost .-> C1
+  CAPABLE -. visible facts as measured proposals .-> WEIGHTSEED
+  WEIGHTSEED -. ordinary teacher acceptance .-> C1
   CAPABLE -. test retained base capability .-> CAPCF
   CAPCF -. intervention fidelity evidence .-> C1
   CAPCF --> CAPENG
@@ -744,6 +749,7 @@ flowchart BT
   class WIRING done
   class RELTRAIN done
   class CAPABLE active
+  class WEIGHTSEED active
   class COMPOSE active
   CAPABLE --> COMPOSE
   COMPOSE --> C1

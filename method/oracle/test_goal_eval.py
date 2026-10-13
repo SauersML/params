@@ -3201,3 +3201,31 @@ def test_probe_draws_do_not_depend_on_torch_multinomial():
     b = [native.draw(p, u) for u in native.stable_rng(g2, 1).random(200)]
     assert a == b and set(a) <= {1, 3, 4} and abs(a.count(3) / 200 - 0.5) < 0.1
     assert native.draw(p, 0.0) == 1 and native.draw(p, 0.999999) == 4
+
+
+def test_faithfulness_partial_draws_run_complete_graphs_as_the_masked_run(monkeypatch):
+    """Native.faithfulness's partial draws (everything outside a graph at uniform levels): a complete graph's nodes at 1
+    for every reader (its claim, the masked run), a stated graph's own nodes left at the drawn level outside its stated
+    connections (native.run's semantics). Both rows of a mixed (split) plan."""
+    nat = tiny_native()
+    ids, targets = [2, 5, 3, 7, 4, 6, 8, 9], [7]
+    a, b = (nat.names[0], 6, 0), (nat.names[5], 7, 1)
+    stated, comp = native.Graph([a]), native.Graph([a, b], complete=True)
+    seen, run = [], nat.run
+
+    def spy(x, tg, plan, u, ur, *args, **kw):
+        if plan.get("B") == 2:
+            seen.append({n: v.detach().clone() for n, v in u.items()})
+        return run(x, tg, plan, u, ur, *args, **kw)
+    monkeypatch.setattr(nat, "run", spy)
+    prompts = [ids[:3] + [t] + ids[4:] for t in (1, 0, 10, 11, 12, 13)]
+    nat.faithfulness(ids, targets, [stated, comp], prompts, seed=0)
+    drawn = [u for u in seen if any(float(v.abs().max()) > 0 for v in u.values())]
+    assert drawn and len(drawn) < len(seen)  # both kinds of experiment ran
+    for u in drawn:
+        assert float(u[a[0]][1, a[1], a[2]]) == 1.0 and float(u[b[0]][1, b[1], b[2]]) == 1.0
+        assert float(u[a[0]][0, a[1], a[2]]) < 1.0 and float(u[b[0]][1, b[1], b[2] + 1]) < 1.0
+    split = nat._plan([stated, comp], len(ids))
+    cn = nat._complete_nodes(split)
+    assert int(sum(int(m.sum()) for m in cn.values())) == 2 and bool(cn[a[0]][1, a[1], a[2]]) and not bool(cn[a[0]][0].any())
+    assert nat._complete_nodes(nat._plan([stated], len(ids))) is None

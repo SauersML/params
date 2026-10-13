@@ -36,7 +36,7 @@ COMMON="$BASIC --search-heldout $PT/$HELD"
 SFT="mkdir -p $O/sft; python rl/train.py --mode sft $COMMON --samples 4 --sft-steps ${SFT_STEPS:-80} --batch 8 ${SFT_FROM:+--init $SFT_FROM} --out $O/sft --run-name graphsft > $O/sft/log 2>&1"
 if [ -n "$REVISE" ]; then LOOP="--revise"; else LOOP="--async"; fi
 RL="mkdir -p $O/rl; python rl/train.py --mode rl2 $LOOP --reader $COMMON --init $O/sft/adapter --samples ${SAMPLES:-8} --behaviors-per-step ${BPS:-4} --credit ${CREDIT:-16} --credit-answers ${CREDIT_ANSWERS:-2} --refine ${REFINE:-1} --steps 1000 --hours $RH --out $O/rl --run-name graphrl > $O/rl/log 2>&1"
-EVAL="mkdir -p $O/eval_rl $O/eval_hard $O/eval_swap; python rl/train.py --mode eval $COMMON ${REVISE:+--revise} --necessity --adversarial --transfer --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name graphrl > $O/eval_rl/log 2>&1; \
+EVAL="mkdir -p $O/eval_rl $O/eval_hard $O/eval_swap; python rl/train.py --mode eval $COMMON ${REVISE:+--revise} --necessity --transfer --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name graphrl > $O/eval_rl/log 2>&1; \
 python rl/train.py --mode eval $BASIC --search-heldout $PT/$HARD --eval-split hard ${REVISE:+--revise} --necessity --init $O/rl/adapter --samples 4 --out $O/eval_hard --run-name graphrl_hard > $O/eval_hard/log 2>&1"
 SWAP="python rl/train.py --mode eval $COMMON --init $O/rl/adapter --samples 4 --swap-evidence --no-baselines --out $O/eval_swap --run-name graphrl_swap > $O/eval_swap/log 2>&1"
 if [ -n "$NO_RL" ]; then  # no RL: the evaluations read the SFT adapter (INIT's when given, with no SFT)

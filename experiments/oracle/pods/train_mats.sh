@@ -39,7 +39,7 @@ CMD="mkdir -p $T $O/sft $O/eval_sft $O/rl $O/eval_rl $O/eval_swap; export TMPDIR
 { $SFT; }; \
 $PY rl/train.py --mode eval $COMMON --revise --necessity --init $A --samples 4 --out $O/eval_sft --run-name ${N}_sft > $O/eval_sft/log 2>&1; \
 $PY rl/train.py --mode rl2 --revise --reader $COMMON --init $A --samples ${SAMPLES:-6} --behaviors-per-step ${BPS:-2} --credit 8 --credit-answers 1 --refine 0 --steps 1000 --hours $RH --out $O/rl --run-name ${N}_rl > $O/rl/log 2>&1; \
-$PY rl/train.py --mode eval $COMMON --revise --necessity --adversarial --transfer --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name ${N}_rl > $O/eval_rl/log 2>&1; \
+$PY rl/train.py --mode eval $COMMON --revise --necessity --transfer --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name ${N}_rl > $O/eval_rl/log 2>&1; \
 $EVAL_HARD ${EVIDENCE:+$SWAP} echo done"
 for i in $(seq 1 ${COPIES:-1}); do
   MATS_GPUS=1 MATS_BUILD=0 experiments/infra/mats/mats-run $N$([ "${COPIES:-1}" -gt 1 ] && echo "-$i") 8 ${MEM:-40} $(python3 -c "print(round($RH + 4.0 + $WAIT, 2))") -- bash -c "$CMD"

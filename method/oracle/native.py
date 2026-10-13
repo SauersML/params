@@ -66,7 +66,6 @@ CHANGES = 16  # changed prompts per text: draws of the average that defines fait
 MAX_CONNECTIONS = 150000  # the search's memory: the connections it ranks at once
 READ_POSITIONS, READ_PER = 16, 4  # nodes_from "vpd+reads": the positions where the prediction responds most, values/keys per layer there
 IG_STEPS = 16  # the search's integration points along each ranking's path
-ADV_STEPS, ADV_STEP = 20, 0.1  # Native.adversarial (evaluation only): VPD's headline setting is 20 steps shared across its batch
 LN2 = math.log(2)
 
 
@@ -1004,6 +1003,16 @@ class Native:
                 kept[id(g)] = (g, {n: (np.array(ts, dtype=np.int64), np.array(cs, dtype=np.int64)) for n, (ts, cs) in per.items()})
         return kept[id(g)][1]
 
+    def _complete_nodes(self, plan: dict) -> dict | None:
+        """Per matrix bool [B, T, C], the nodes of a plan's complete graphs (None without one)."""
+        if "split" in plan:  # (the complete graphs second)
+            idx, sub = plan["split"][1]
+            out = {n: torch.zeros(plan["B"], *sub["G"][n].shape[1:], dtype=torch.bool, device=self.dev) for n in self.names}
+            for n in self.names:
+                out[n][idx] = sub["G"][n]
+            return out
+        return {n: plan["G"][n] & plan["complete"] for n in self.names} if plan["any_complete"] else None
+
     def _held(self, graphs: list[Graph], T: int, seed: int, i: int, kept: dict) -> dict:
         """faithfulness' holds on prompt i: per matrix with any, the [B, T, C] mask of the graphs' subcomponents held at
         their values on the text; (matrix j, position t, index c) is held when torch.rand(1) under the CPU generator
@@ -1137,10 +1146,12 @@ class Native:
         with probability 1/2, so how an answer groups them into steps changes nothing; (2) whether what lies outside the
         graph is removed or set to an independent uniform level per subcomponent and position (VPD's stochastic test),
         with probability 1/2 each. Graph side: the graph runs on x' with the rest as drawn, the held subcomponents at
-        their values when it runs so on the text. Model side: the whole model on x', the same subcomponents at their
-        values in the whole model on the text. Every experiment tests that nothing outside the graph matters, at any
-        level (the model side has it whole, the graph side not or partly), and holds test that the graph computes from
-        its parts what the model computes from the same parts (interchange interventions)."""
+        their values when it runs so on the text; a complete graph's nodes at 1 for every reader (its claim, the masked
+        run: run() would give the readers outside the graph its nodes at the drawn level). Model side: the whole model on
+        x', the same subcomponents at their values in the whole model on the text. Every experiment tests that nothing
+        outside the graph matters, at any level (the model side has it whole, the graph side not or partly), and holds
+        test that the graph computes from its parts what the model computes from the same parts (interchange
+        interventions)."""
         if not graphs:
             return []
         per_prompt = isinstance(graphs[0], list)
@@ -1169,13 +1180,15 @@ class Native:
                     plans[s0] = (key, part, self._plan(part, T))
                 plan = plans[s0][2]
                 mask = self._held(part, T, seed, i, kept)
+                cn = self._complete_nodes(plan) if partial else None
+                rows = rest if cn is None else ({n: torch.where(cn[n], 1.0, rest[0][n]) for n in self.names}, rest[1])
                 with torch.no_grad():
                     if not mask:
-                        total[s0:s0 + B] += w * self._kl(logp, self.run(x, targets, plan, *rest))
+                        total[s0:s0 + B] += w * self._kl(logp, self.run(x, targets, plan, *rows))
                         continue
                     rec_g, states = {}, {}
-                    self.run(ids, targets, plan, *rest, record=rec_g, keep=set(mask), fill=states)
-                    lq = self.run(x, targets, plan, *rest, patch={n: (m, rec_g[n]) for n, m in mask.items()}, reuse=(states, ids))
+                    self.run(ids, targets, plan, *rows, record=rec_g, keep=set(mask), fill=states)
+                    lq = self.run(x, targets, plan, *rows, patch={n: (m, rec_g[n]) for n, m in mask.items()}, reuse=(states, ids))
                     lp = self.run(x, targets, self._full_plan(T, B), *one, patch={n: (m, rec_m[n].expand(B, -1, -1)) for n, m in mask.items()},
                                   reuse=(self._model_states(ids, B), ids))
                     del states
@@ -1266,42 +1279,6 @@ class Native:
         [T, C]."""
         rec = self._model_record(ids)[0]
         return {n: rec[n][0].abs() * self.target.site(n).U.norm(dim=-1) for n in self.names}
-
-    def adversarial(self, cases: list[tuple], steps: int = ADV_STEPS, step_size: float = ADV_STEP, seed: int = 0) -> list[float]:
-        """VPD's adversarial test of graphs, an evaluation measure: every subcomponent outside a graph (and every
-        remainder) at a mask in [0, 1] chosen to maximize the summed KL in bits of the model's next-token distribution at
-        the targets from the graph's, one mask per subcomponent shared by every position and every case (VPD's tying
-        across a batch: the adversary must exploit systematic weaknesses), by `steps` signed-gradient steps of size
-        step_size projected onto [0, 1] from a uniform draw (VPD's PGD). cases: (ids, targets, graph). The KL of each case
-        at the final masks. Compare graphs only against others under the same adversary (VPD's own answer): no
-        decomposition survives it outright."""
-        g = torch.Generator(device="cpu").manual_seed(seed)
-        u = {n: torch.rand(self.C[n], generator=g).to(self.dev) for n in self.names}
-        ur = {n: torch.rand(1, generator=g).to(self.dev) for n in self.names}
-        prepared = [(ids, targets, self._plan([gr], len(ids)), self.reference([ids], targets)) for ids, targets, gr in cases]
-
-        def kls(grad: bool):
-            out = []
-            for ids, targets, plan, logp in prepared:
-                uu = {n: u[n].view(1, 1, -1) for n in self.names}
-                rr = {n: ur[n].view(1, 1) for n in self.names}
-                with torch.set_grad_enabled(grad):
-                    k = self._kl(logp, self.run(ids, targets, plan, uu, rr))[0]
-                    if grad:
-                        k.backward()
-                out.append(float(k.detach()))
-            return out
-
-        for _ in range(steps):
-            for n in self.names:
-                u[n].requires_grad_(True)
-                ur[n].requires_grad_(True)
-            kls(True)
-            with torch.no_grad():
-                for n in self.names:
-                    u[n] = (u[n] + step_size * u[n].grad.sign()).clamp(0, 1).detach()
-                    ur[n] = (ur[n] + step_size * ur[n].grad.sign()).clamp(0, 1).detach()
-        return kls(False)
 
     def positions(self, targets: list[int]) -> int:
         """The positions a graph's nodes can sit at: 0 to the last target."""

@@ -196,17 +196,18 @@ def scorer_mismatch(scores: list, semantics: str | None, source: str | None) -> 
     return None
 
 
-PINNED = ("environment", "donor_pool")  # score fields an rl run pins from its first score, per environment (scorer)
+PINNED = {"donor_pool": True, "environment": False}  # score fields an rl run pins from its first score, per environment
+# (scorer): a different far-donor pool stops the run (rewards up to 0.13 apart), a different Python environment is
+# reported (float-level: at most 2e-4 between torch 2.4.1 and 2.10.0)
 
 
-def pinned_check(pins: dict, name: str, scores: list, expected: dict | None = None) -> str | None:
+def pinned_check(pins: dict, name: str, scores: list, expected: dict | None = None, warn=None) -> str | None:
     """Why scores are not from the run's pinned scorer, or None: each PINNED field of every score must equal what the
     first score of that environment that names it gave (pins: name -> {field: value}, kept by rl in
-    LOG/scorer_pins.json across resumes), or expected's value for it (--expect-environment). A second scorer pod in
-    another Python environment, or with another set of texts (another far-donor pool: rewards up to 0.13 apart,
-    10-13), stops the run."""
+    LOG/scorer_pins.json across resumes), or expected's value for it (--expect-environment). A field that stops
+    (PINNED) returns the reason; the others go to warn (a callable taking the message) and the run goes on."""
     have = pins.setdefault(name, {})
-    for f in PINNED:
+    for f, stops in PINNED.items():
         want = (expected or {}).get(f) or have.get(f)
         if want is None:
             want = next((s[f] for s in scores if s.get(f)), None)
@@ -214,7 +215,11 @@ def pinned_check(pins: dict, name: str, scores: list, expected: dict | None = No
                 continue
             have[f] = want
         if bad := next((s for s in scores if s.get(f) != want), None):
-            return f"the scorer's {f} is {bad.get(f)!r}, not {want!r}"
+            why = f"the scorer's {f} is {bad.get(f)!r}, not {want!r}"
+            if stops:
+                return why
+            if warn is not None:
+                warn(why)
     return None
 
 
@@ -756,7 +761,8 @@ def rl(a) -> None:
             frozen_env = envs[q["_env"]]
             known = json.dumps(pins)
             if why := (scorer_mismatch(scores, frozen_env["expect_semantics"], frozen_env["expect_source"])
-                       or pinned_check(pins, q["_env"], scores, {"environment": frozen_env["expect_environment"]})):
+                       or pinned_check(pins, q["_env"], scores, {"environment": frozen_env["expect_environment"]},
+                                       warn=lambda w: print(json.dumps({"step": step, "task": q["task"], "warning": w}), flush=True))):
                 raise SystemExit(f"step {step}, {q['task']}: {why}")
             if json.dumps(pins) != known:
                 pf.write_text(json.dumps(pins))
@@ -882,9 +888,9 @@ def main():
                    "answers stop differing: identical answers carry no advantage)")
     r.add_argument("--expect-semantics", help="stop unless every score comes from a scorer in this semantics (goal_eval.SEMANTICS)")
     r.add_argument("--expect-source", help="stop unless every score comes from a scorer built at this revision (a prefix)")
-    r.add_argument("--expect-environment", help="stop unless every score comes from a scorer in this Python environment "
-                   "(goal_eval.environment()); without it the run's first score pins it, and the donor pool always "
-                   "(LOG/scorer_pins.json)")
+    r.add_argument("--expect-environment", help="warn when a score comes from a scorer in another Python environment "
+                   "(goal_eval.environment()); without it the run's first score pins it. The far-donor pool is always "
+                   "pinned and stops the run (LOG/scorer_pins.json)")
     r.add_argument("--first-step", type=int, default=0, help="resume: the step --init's state was saved at (its checkpoint "
                                                                 "line kept; the run appends to the same --log)")
     r.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")

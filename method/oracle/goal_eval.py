@@ -144,8 +144,10 @@ NEC_CONTROLS_LOO = NEC_CONTROLS  # line_loo's and phi_variants' N controls: the 
 REMOVAL_ROWS = {"cuda": 32, "other": 16}  # real-model removal sets per batch (_removed_kl), by device: a removal batch's
 # masks are [rows, T, C] floats at every site
 NEC_MIN_LEN = 64  # a control text's least length (end-aligned: a circuit's parts further back are not removed there)
-DONOR_POOLS = {"search": ("train", range(0, 400)),  # the far donors' texts per split: the reward's from training texts,
-               "eval": ("donor", range(0, 50))}  # explicit text9150-9199 partition, independent of missing dev files
+DONOR_POOLS = {"search": ("train", range(6000, 6400), True),  # the far donors' texts per split by text number, frozen
+               "eval": ("donor", range(9150, 9200), False)}  # (the lead's 10-13): the reward's text6000-6399, which a pod
+# missing any refuses (the first 400 train files present before, so a pod holding fewer texts drew other donors: rewards
+# up to 0.13 apart); the evaluations' text9150-9199 partition, its missing files left out
 
 
 # ---- answers
@@ -4357,10 +4359,14 @@ class GoalEval:
     def far_pool(self, split: str) -> list:
         """The far donors' texts of a split, [(name, token ids)] (DONOR_POOLS) in the model's vocabulary, loaded once."""
         if split not in self.donor_pools:
-            which, idx = DONOR_POOLS[split]
-            tasks = native.tasks(which)
+            which, rows, strict = DONOR_POOLS[split]
+            have = {int(re.sub(r"\D", "", p.stem)): p for p in native.tasks(which)}  # the partition's files here, by number
+            missing = [n for n in rows if n not in have]
+            if strict and missing:
+                raise FileNotFoundError(f"the {split} split's far donors are text{rows.start}-text{rows.stop - 1}; {len(missing)} of "
+                                        f"them are not in {native.TEXTS / 'vpd4l'} (text{missing[0]} first): its rewards need every one")
             V = self.nat.target.n_tokens  # a text in another vocabulary (a tiny test model's) is no donor
-            self.donor_pools[split] = [(tasks[i].stem, x) for i in idx if i < len(tasks) for x in [native.text(tasks[i])[0]] if max(x) < V]
+            self.donor_pools[split] = [(have[n].stem, x) for n in rows if n in have for x in [native.text(have[n])[0]] if max(x) < V]
         return self.donor_pools[split]
 
     def pool_id(self, split: str) -> str:

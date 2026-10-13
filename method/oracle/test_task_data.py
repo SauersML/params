@@ -49,6 +49,29 @@ def test_native_loader_uses_partition_without_reading(texts, monkeypatch):
     assert [p.stem for p in native.tasks("heldout")] == ["text9000", "text9099"]
 
 
+def test_search_donors_are_text6000_to_6399_or_refused(tmp_path, monkeypatch):
+    """The reward's far donors are text6000-6399 whatever else is present (the 400 production pods drew as the first
+    train files: their rewards unchanged), and a machine missing one refuses rather than draw others."""
+    import json
+    from types import SimpleNamespace
+
+    import goal_eval
+    import native
+
+    directory = tmp_path / "vpd4l"
+    directory.mkdir()
+    for n in list(range(6000, 6450)) + [9000, 9150]:
+        (directory / f"text{n}.json").write_text(json.dumps({"prompts": [{"token_ids": [1, n % 7], "target_positions": [1]}]}))
+    monkeypatch.setattr(native, "TEXTS", tmp_path)
+    nat = SimpleNamespace(target=SimpleNamespace(n_tokens=40))
+    got = goal_eval.GoalEval(nat).far_pool("search")
+    old = [p.stem for p in native.tasks("train")][0:400]  # the pool before: the first 400 train files present
+    assert [n for n, _ in got] == old == [f"text{n}" for n in range(6000, 6400)] and got[5][1] == [1, 6005 % 7]
+    (directory / "text6123.json").unlink()
+    with pytest.raises(FileNotFoundError, match="text6123"):
+        goal_eval.GoalEval(nat).far_pool("search")
+
+
 def test_far_donors_use_explicit_ids_with_missing_development_files(texts, monkeypatch):
     import json
     from types import SimpleNamespace

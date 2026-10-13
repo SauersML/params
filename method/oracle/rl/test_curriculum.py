@@ -55,9 +55,12 @@ def test_the_run_pins_its_scorers_environment_and_donor_pool():
     assert pins == {"circuit": {"environment": "torch 2.10.0", "donor_pool": "search:400:abc"}}
     assert tt.pinned_check(pins, "circuit", a) is None
     assert "donor_pool" in tt.pinned_check(pins, "circuit", [{"environment": "torch 2.10.0", "donor_pool": "search:399:def"}])
-    assert "environment" in tt.pinned_check(pins, "circuit", [{"environment": "torch 2.4.1", "donor_pool": "search:400:abc"}])
+    said = []
+    assert tt.pinned_check(pins, "circuit", [{"environment": "torch 2.4.1", "donor_pool": "search:400:abc"}], warn=said.append) is None
+    assert len(said) == 1 and "environment" in said[0]  # another Python environment: reported, the run goes on
     assert tt.pinned_check(pins, "edits", [{"reward": 1.0}]) is None and pins["edits"] == {}  # a scorer naming neither
-    assert "environment" in tt.pinned_check({}, "circuit", a, {"environment": "torch 2.4.1"})  # --expect-environment
+    said = []
+    assert tt.pinned_check({}, "circuit", a, {"environment": "torch 2.4.1"}, warn=said.append) is None and len(said) == 1
 
 
 def test_the_run_stops_on_a_scorer_outside_its_frozen_reward():

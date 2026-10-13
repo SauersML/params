@@ -108,6 +108,59 @@ def units_to_answer(c: Circuit, toy, positions: list[int] | None = None, text: i
     return {"nodes": nodes, "complete": True, "unit_edges": sorted(c.edges), "explanation": c.english}
 
 
+def unit_graph(c: Circuit, toy, ids: list[int] | None = None):
+    """Compile unit wiring into an explicit native graph over rank-one pieces.
+
+    Preserve architecture connections inside each head/neuron. Between units, keep only
+    declared edges; into the prediction, keep only declared unit -> out edges. All pieces
+    of selected units run at every position, without an activation/ground-truth selector.
+    Token-label arrows are INPUT ANNOTATIONS: native execution always receives embeddings.
+    This function does not execute token-label meanings or certify the English paragraph.
+    Reverse/non-architectural unit edges and invalid unit IDs raise rather than disappear.
+    """
+    if not c.ok or c.bad:
+        raise ValueError("wiring requires a parsed circuit without unknown identifiers")
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[3]
+    sys.path[:0] = [str(root / "method/oracle"), str(root / "method/vpd")]
+    import native
+
+    ids = toy.texts[0] if ids is None else ids
+    if not ids:
+        raise ValueError("wiring requires a nonempty input")
+    units = sorted(u for u in c.units if u != "out" and not u.startswith("tok"))
+    owner = {}
+    for unit in units:
+        match = re.fullmatch(r"L(\d+)([HN])(\d+)", unit)
+        if not match:
+            raise ValueError(f"invalid unit {unit}")
+        layer, kind, index = int(match[1]), match[2], int(match[3])
+        if layer >= toy.cfg["n_layer"]:
+            raise ValueError(f"invalid layer in {unit}")
+        count = toy.cfg["n_head"] if kind == "H" else toy.sd[f"h.{layer}.mlp.c_fc.weight"].shape[0]
+        if index >= count:
+            raise ValueError(f"invalid index in {unit}")
+        for site, piece in unit_pieces(toy, unit):
+            for pos in range(len(ids)):
+                node = (site, pos, piece)
+                if node in owner and owner[node] != unit:
+                    raise ValueError(f"overlapping unit decomposition at {node}")
+                owner[node] = unit
+    candidates, outputs = native.all_edges(sorted(owner), [len(ids) - 1])
+    possible = {(owner[w], owner[r]) for r, ws in candidates.items() for w in ws if owner[w] != owner[r]}
+    possible |= {(owner[w], "out") for w in outputs}
+    for a, b in c.edges:
+        if a.startswith("tok") and (b in units or b == "out"):
+            continue  # annotation only, never interpreted as an embedding mask
+        if (a, b) not in possible:
+            raise ValueError(f"edge {a} -> {b} has no executable connection in these pieces")
+    parents = {r: [w for w in ws if owner[w] == owner[r] or (owner[w], owner[r]) in c.edges]
+               for r, ws in candidates.items()}
+    return native.Graph(nodes=owner, parents={r: ws for r, ws in parents.items() if ws},
+                        out=[w for w in outputs if (owner[w], "out") in c.edges], complete=False)
+
+
 # ---------------------------------------------------------------- rewards
 
 def f1(pred: set, gold: set) -> float:

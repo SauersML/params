@@ -15,6 +15,7 @@ add neither). The worst-text half makes a unit needed on one text in 30 (a looku
 """
 from __future__ import annotations
 
+import math
 import re
 import sys
 from pathlib import Path
@@ -102,6 +103,49 @@ def reward_exec(meta: dict, completion: str) -> float:
     if not c.ok:
         return 0.0
     return score(meta["toy"], c.units)["reward"]
+
+
+def score_wiring(toy, completion: str, *, nat=None, texts=None) -> dict:
+    """Independent point-sufficiency diagnostic for the stated inter-unit wiring.
+
+    Unlike the legacy unit-selection reward, actually execute Mermaid unit edges.
+    Token-label arrows remain annotations, embeddings stay on, and remainders stay
+    off. No English, token-role, necessity or intervention-fidelity certification.
+    A supplied native must represent this toy; useful for reusing an existing load.
+    """
+    import copy
+    import torch
+    import goal_eval
+    import native
+    import planted
+
+    parsed = circuit.parse(completion)
+    nat = planted.native_of(toy.sd, toy.cfg) if nat is None else nat
+    bound = copy.copy(toy)
+    bound.meta = dict(toy.meta)
+    # Compile against the exact pieces the executor loaded, never a fresh SVD basis.
+    bound.meta["decomposition"] = {n: (nat.target.site(n).U, nat.target.site(n).V, nat.units[n])
+                                    for n in nat.names}
+    texts = list(toy.texts if texts is None else texts)
+    if not texts:
+        raise ValueError("wiring evaluation requires at least one input")
+    ge, rows = goal_eval.GoalEval(nat), []
+    with torch.no_grad():
+        for ids in texts:
+            graph = circuit.unit_graph(parsed, bound, ids)
+            targets = [len(ids) - 1]
+            ref = nat.reference([ids], targets)
+            q = ge.graph_ref(ids, targets, graph, live=False)
+            empty = ge.graph_ref(ids, targets, native.Graph(), live=False)
+            kl = lambda x: max(0.0, float((ref.exp() * (ref - x)).sum()) / math.log(2))
+            error, null_error = kl(q), kl(empty)
+            rows.append({"kl_bits": error, "empty_kl_bits": null_error,
+                         "suff": min(1.0, max(0.0, 1.0 - error / max(null_error, 1e-9))),
+                         "nodes": graph.count(), "edges": graph.edges()})
+    return {"scope": "executed inter-unit/output wiring; token labels and English unverified",
+            "remainders": "off", "embedding": "on", "texts": len(rows), "per_text": rows,
+            "suff": sum(r["suff"] for r in rows) / len(rows),
+            "kl_bits": sum(r["kl_bits"] for r in rows) / len(rows)}
 
 
 def check(toys) -> dict:

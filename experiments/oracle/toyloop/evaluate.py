@@ -127,7 +127,7 @@ def prf(pred: set, gold: set) -> tuple:
     return p, r, (2 * p * r / (p + r) if p + r else 0.0)
 
 
-def metrics(toy, completion: str, truth: dict | None = None) -> dict:
+def metrics(toy, completion: str, truth: dict | None = None, *, wiring: bool = False) -> dict:
     truth = truth or toy.truth
     c = circuit.parse(completion)
     pu = {u for u in c.units if UNIT.fullmatch(u)}
@@ -135,9 +135,18 @@ def metrics(toy, completion: str, truth: dict | None = None) -> dict:
     p, r, f = prf(pu, gu)
     ge = {tuple(e) for e in truth["edges"]}
     s = reward_exec.score(toy, pu) if c.ok else {"reward": 0.0, "suff": 0.0, "nec": 0.0}
-    return {"parse": float(c.ok), "unit_p": p, "unit_r": r, "unit_f1": f, "exact": float(pu == gu),
+    result = {"parse": float(c.ok), "unit_p": p, "unit_r": r, "unit_f1": f, "exact": float(pu == gu),
             "edge_f1": prf(c.edges, ge)[2], "reward": s["reward"], "suff": s["suff"], "nec": s["nec"],
             "n_units": len(pu)}
+    if wiring:
+        try:
+            got = reward_exec.score_wiring(toy, completion, nat=reward_exec._state(toy)["nat"],
+                                          texts=reward_exec.texts_of(toy))
+            result.update(wiring_valid=1.0, wiring_suff=got["suff"], wiring_kl_bits=got["kl_bits"],
+                          wiring_scope=got["scope"])
+        except ValueError as exc:
+            result.update(wiring_valid=0.0, wiring_suff=0.0, wiring_kl_bits=None, wiring_error=str(exc))
+    return result
 
 
 def gt_reward(toy) -> float:
@@ -155,7 +164,7 @@ def mean_rows(rows: list) -> dict:
 
 # ---------------------------------------------------------------- run
 
-def run(name: str, predict, splits: dict, swapped: bool = False, log=print) -> dict:
+def run(name: str, predict, splits: dict, swapped: bool = False, log=print, *, wiring: bool = False) -> dict:
     per, t0 = [], time.time()
     for split, toys in splits.items():
         by_fam = defaultdict(list)
@@ -164,7 +173,7 @@ def run(name: str, predict, splits: dict, swapped: bool = False, log=print) -> d
         for i, toy in enumerate(toys):
             prompt = render.render(toy)
             comp = predict(toy, prompt)
-            row = {"split": split, "family": toy.meta["family"], "id": toy.name, **metrics(toy, comp),
+            row = {"split": split, "family": toy.meta["family"], "id": toy.name, **metrics(toy, comp, wiring=wiring),
                    "gt_reward": gt_reward(toy), "completion": comp}
             if swapped:   # weights from another toy of the family, behaviour from this one
                 donors = [d for d in by_fam[toy.meta["family"]] if d.name != toy.name]
@@ -195,6 +204,7 @@ SWAP = ["swap_f1_own", "swap_f1_donor", "swap_edge_f1_own", "swap_edge_f1_donor"
 
 def markdown(res: dict) -> str:
     cols = COLS + [c for c in SWAP if any(c in r for r in res["rows"])]
+    cols += [c for c in ("wiring_valid", "wiring_suff", "wiring_kl_bits") if any(c in r for r in res["rows"])]
     lines = [f"# Toy-loop eval: {res['name']}", "", "| split | family | " + " | ".join(cols) + " |",
              "|" + "---|" * (len(cols) + 2)]
     for split, fams in res["summary"].items():
@@ -210,6 +220,7 @@ def main():
     ap.add_argument("--train_n", type=int, default=40)
     ap.add_argument("--limit", type=int, default=None, help="at most this many toys per split")
     ap.add_argument("--swapped", action="store_true")
+    ap.add_argument("--wiring", action="store_true", help="also execute inter-unit/output edges; token roles and English remain unverified")
     ap.add_argument("--max_new", type=int, default=256)
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--out", type=Path, default=HERE / "results")
@@ -226,7 +237,7 @@ def main():
         else:
             pred = Checkpoint(Path(name).expanduser(), a.max_new, a.threads)
         tag = name if name in ("gt", "empty", "active", "prior") else Path(name).name
-        res = run(tag, pred, splits, swapped=a.swapped and isinstance(pred, Checkpoint))
+        res = run(tag, pred, splits, swapped=a.swapped and isinstance(pred, Checkpoint), wiring=a.wiring)
         (a.out / f"eval_{tag}.json").write_text(json.dumps(res, indent=1))
         (a.out / f"eval_{tag}.md").write_text(markdown(res))
         print(markdown(res), flush=True)

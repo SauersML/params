@@ -1891,6 +1891,34 @@ def test_graph_ref_outside_held(tiny):
     assert not torch.allclose(ge.graph_ref(tx.ids, tx.targets, g, outside=qk), ge.graph_ref(tx.ids, tx.targets, g))
 
 
+def test_omitted_family(tiny):
+    """The omitted family: candidates are VPD's first actives at the circuit's positions and the targets (the
+    background left out); a candidate the circuit lacks is predicted by its own run, one it holds by its run less it;
+    W the real model's response to the removal, VPD's answer less it the reference, the pooled ratio over them."""
+    nat, ge, tx = tiny
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    g = native.Graph(every[::2], complete=True)
+    row = ge._omitted_family(tx, [g], k=6)[0]
+    order = getattr(tx, "vpd_order", None) or nat._vpd_order(tx.ids, tx.targets)
+    pos = {t for _, t, _ in g.node_set()} | set(tx.targets)
+    cands = [tuple(nd) for nd in order if nd[1] in pos and tuple(nd) not in ge.background(tx)][:6]
+    assert [tuple(d[0]) for d in row["draws_omitted"]] == cands and row["omitted_left"] == sum(nd not in g.node_set() for nd in cands)
+    full, _ = naive(nat, tx.ids)
+    for (nd, kc, kv, w), c in zip(row["draws_omitted"], cands):
+        on = {n: torch.ones(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+        on[c[0]][c[1], c[2]] = False
+        removed = naive(nat, tx.ids, on=on)[0]
+        assert abs(w - _kl(removed, full, tx.targets)) < 1e-4 + 1e-4 * w
+        mine = ge.masks(g, tx.T)
+        mine = {n: m.clone() for n, m in mine.items()}
+        mine[c[0]][c[1], c[2]] = False  # a held candidate leaves the circuit; a lacking one changes nothing
+        circ = naive(nat, tx.ids, on=mine)[0]
+        assert abs(kc - _kl(removed, circ, tx.targets)) < 1e-3 + 1e-3 * kc, (c, kc, _kl(removed, circ, tx.targets))
+    assert row["s_omitted"] == goal_eval._ratio_pool(row["draws_omitted"])
+    nb = ge.necessity_spec(tx, [g], "eval", background=True)[0]  # the background kept on: a valid N row either way
+    assert set(nb) >= {"n_spec", "d_target", "d_control"}
+
+
 def test_line_leave_one_out(tiny):
     """line_loo: one deletion per node, stated connection and token edge; a deletion's phi is the answer's reward row
     with point, track_pp, interchange_pp and pattern taken from the deleted graph's own reward-mode run and N from its

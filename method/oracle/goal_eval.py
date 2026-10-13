@@ -504,7 +504,14 @@ PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the sc
     "flips": ("f1_flips_c", None, None), "track_pp": ("s_track_pp", "weighted", "draws_track_pp"),
     "interchange_pp": ("s_interchange_pp", "weighted", "draws_interchange_pp"),
     "patching_near": ("s_patching_near", "donor", "draws_patching_near"), "patching_far": ("s_patching_far", "donor", "draws_patching_far"),
-    "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_spec", "spec", "draws_n_spec")}
+    "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_spec", "spec", "draws_n_spec"),
+    "omitted": ("s_omitted", "weighted", "draws_omitted")}
+OMITTED_K = 32  # the omitted family's candidates per circuit (_omitted_family)
+GENERIC_TARGET = (("h.1.mlp.c_fc", 2103), ("h.3.mlp.down_proj", 3532), ("h.3.attn.o_proj", 806), ("h.1.attn.q_proj", 316),
+                  ("h.0.mlp.c_fc", 53))  # vpd4l's background at the targets (the lead's 10-13): the 5 parts whose removal
+# makes about 94% of an influential set's damage on control texts (in the top 5 on 20, 19, 14, 11 and 10 of the 20
+# held-out texts, generic_parts.jsonl); at the targets only (at a copied position c_fc #2103, q #316 and #53 are
+# copy-specific). Always present: never an omitted candidate; kept on in N's removals when background=True
 EPS_FLOOR = 0.005  # eps's floor
 EPS_CAP = 0.05  # eps's cap (the Gate B package, 10-13: the toy repair table passes every non-collapsed check with it;
 # uncapped, one noisy family's eps alone put every-family-at-0.5 below 0 on held-out texts)
@@ -1261,7 +1268,7 @@ class GoalEval:
         return torch.log_softmax(tg.unembed(norm(xt, -1, "final")).float(), -1)
 
 
-    LOO_HELD = ("nodes", "edges", "flips", "patching_near", "patching_far")  # line_loo's families held at the answer's values
+    LOO_HELD = ("nodes", "edges", "flips", "patching_near", "patching_far", "omitted")  # line_loo's families held at the answer's values
 
     def line_loo(self, tx: Text, graph: native.Graph, pool: dict | None, split: str = "search", draws: int = 8,
                  bits_start: float | None = None, base: dict | None = None) -> dict:
@@ -2626,7 +2633,8 @@ class GoalEval:
         native.free(nat.dev)
         return kls
 
-    def necessity_spec(self, tx: Text, graphs: list[native.Graph], split: str = "eval", controls: int = NEC_CONTROLS) -> list[dict]:
+    def necessity_spec(self, tx: Text, graphs: list[native.Graph], split: str = "eval", controls: int = NEC_CONTROLS,
+                       background: bool = False) -> list[dict]:
         """N, phi's necessity (the user's spec, the lead's 10-12: without the circuit's parts the real system breaks,
         and the break is this text's, not every text's). Per graph: D_t, the damage at the targets (KL from the model)
         of the real model less the circuit's subcomponents (every other subcomponent and every remainder on, as
@@ -2637,9 +2645,16 @@ class GoalEval:
         before a control's start are left out there; the same two for VPD's whole answer. n_spec = clip((D_t - D_c) / (D_t(VPD) - D_c(VPD)), 0, 1): parts whose removal
         damages every text's prediction there add to D_t and D_c alike and earn nothing, VPD's answer scores 1, None
         when VPD's removal damages the controls as much as the text; n_spec_raw unclipped below (c_rl's ranking).
-        draws_n_spec: per control [control, D_c, D_c(VPD), D_t, D_t(VPD)] (phi's eps). Damages in bits."""
+        draws_n_spec: per control [control, D_c, D_c(VPD), D_t, D_t(VPD)] (phi's eps). Damages in bits. background: the
+        background parts at the targets (GENERIC_TARGET) kept on in every removal (credited to no one)."""
         nat, T = self.nat, tx.T
         sets = [self.masks(_c_graph(g, tx.targets, nat.C), T) for g in graphs]
+        keep = None
+        if background:  # the background parts at the targets never removed, the circuits' and VPD's alike
+            keep = {n: torch.zeros(T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
+            for n, t, c in self.background(tx):
+                keep[n][t, c] = True
+            sets = [{n: m[n] & ~keep[n] for n in nat.names} for m in sets]
         last = max(tx.targets)
         pool = [x for x in self.far_pool(split) if len(x[1]) >= min(T, NEC_MIN_LEN) and list(x[1]) != list(tx.ids)]
         ys = [pool[i][1] for i in np.random.default_rng([int(tx.seed), 13]).permutation(len(pool))[:controls]]
@@ -2653,9 +2668,9 @@ class GoalEval:
                 d = last + 1 - len(y)  # the shift
                 dc.append(self._removed_kl_on(E.on(y, [t - d for t in tx.targets if t >= d]), {n: m[:, d:last + 1] for n, m in M.items()}))
             return self._removed_kl_on(E, M, tx.ref), dc
-        key = ("nec_vpd", last, tuple(tuple(y) for y in ys))  # VPD's damages on these controls: every graph's on the text
+        key = ("nec_vpd", last, tuple(tuple(y) for y in ys), background)  # VPD's damages on these controls: every graph's on the text
         if key not in tx.__dict__:
-            tx.__dict__[key] = damages([tx.vpd])
+            tx.__dict__[key] = damages([tx.vpd if keep is None else {n: tx.vpd[n] & ~keep[n] for n in nat.names}])
         dt, dc = damages(sets) if sets else ([], [[] for _ in ys])
         dt = dt + tx.__dict__[key][0]
         dc = [d + v for d, v in zip(dc, tx.__dict__[key][1])]
@@ -2731,6 +2746,7 @@ class GoalEval:
         wired = dict(zip([i for i, w in enumerate(whole) if w is not None],
                          self.sufficiency(tx, [w for w in whole if w is not None])))
         nodes = self._node_family(tx, graphs, draws, reads, units=[sorted(h.node_set()) for h in pp_graphs])  # a block one unit
+        omitted = self._omitted_family(tx, graphs) if tx.vpd is not None else [{} for _ in graphs]  # phi's omitted family
         edges = self._edge_family(tx, graphs, draws, reads)
         none = [{} for _ in graphs]
         adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool and not reward else none
@@ -2749,10 +2765,10 @@ class GoalEval:
         nspec = self.necessity_spec(tx, graphs, split, controls) if controls else none  # phi's N
         leak = none if reward else self.sufficiency(tx, [native.Graph(sorted(g.node_set()), {}, []) for g in graphs])
         out = []
-        for g, pt, nd, ed, ad, fl, fr, it, rr, nf, lk, ns in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals,
-                                                                 nflips, leak, nspec):
+        for g, pt, nd, ed, ad, fl, fr, it, rr, nf, lk, ns, om in zip(graphs, point, nodes, edges, adv, flips, fresh_rows, inter, reals,
+                                                                     nflips, leak, nspec, omitted):
             i = len(out)
-            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf, **ns,
+            row = {"s_point": pt["f1_live"], "kl_point": pt["kl_live"], "n_point": pt["n_live"], **nd, **ed, **ad, **fl, **it, **nf, **ns, **om,
                    "s_wiring": wired[i]["f1_live"] if i in wired else pt["f1_live"]}
             if lk:
                 row["leak"] = lk["f1_live"]
@@ -3025,6 +3041,70 @@ class GoalEval:
         return out
 
     @torch.no_grad()
+    def background(self, tx: Text) -> set:
+        """GENERIC_TARGET's parts at the text's targets (those of the model's sites)."""
+        return {(n, t, c) for t in tx.targets for n, c in GENERIC_TARGET if n in self.nat.C and c < self.nat.C[n]}
+
+    @torch.no_grad()
+    def _omitted_family(self, tx: Text, graphs: list[native.Graph], k: int = OMITTED_K) -> list[dict]:
+        """The omitted family (the lead's 10-13, the spec's interventions on parts a circuit leaves out; the mirror of
+        the node family): per circuit, the first k of VPD's actives in its order (causal importance x write) at the
+        circuit's positions and the targets, the background (GENERIC_TARGET) left out; each removed alone from the real
+        model (W = KL(model less it || model)); the circuit's prediction is its own run, less the candidate where it holds
+        it (as the node family's); VPD's answer less it the reference; s_omitted pools the candidates as the weighted
+        families do (_ratio_pool: KL(model less it || circuit's) against W). A circuit that leaves out a part whose
+        removal moves the model predicts no change and scores 0 there. draws_omitted: per candidate [candidate, KL_C,
+        KL_VPD, W]; omitted_left: how many of them the circuit leaves out."""
+        import engine
+
+        nat, dev = self.nat, self.nat.dev
+        order = getattr(tx, "vpd_order", None) or nat._vpd_order(tx.ids, tx.targets)
+        bg = self.background(tx)
+        cands = []
+        for g in graphs:
+            pos = {t for _, t, _ in g.node_set()} | set(tx.targets)
+            cands.append([tuple(nd) for nd in order if nd[1] in pos and tuple(nd) not in bg][:k])
+        cols = {n: {c for g, cs in zip(graphs, cands) for m, _, c in list(g.node_set()) + cs if m == n} for n in nat.names}
+        circ = {n: torch.tensor(sorted(cols[n]), dtype=torch.long, device=dev) for n in nat.names}
+        vcols = {n: torch.unique(torch.cat([circ[n], tx.vpd[n].any(0).nonzero().flatten()])) for n in nat.names}
+        Em = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ, outside="on")  # the model
+        Ev = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=vcols)               # VPD's answer
+        Ec = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ)                # the circuits
+        at = {n: {c: i for i, c in enumerate(circ[n].tolist())} for n in nat.names}
+        vat = {n: {c: i for i, c in enumerate(vcols[n].tolist())} for n in nat.names}
+        vpd = {n: tx.vpd[n][:, vcols[n]].float() for n in nat.names}
+
+        def without(base, cs, where):  # [len(cs), T, K]: base with each candidate off in its row
+            m = {n: x[None].repeat(len(cs), 1, 1).clone() for n, x in base.items()}
+            for b, (n, t, c) in enumerate(cs):
+                m[n][b, t, where[n][c]] = 0.0
+            return m
+
+        out = []
+        for g, cs in zip(graphs, cands):
+            if not cs:
+                out.append({"s_omitted": None, "draws_omitted": [], "omitted_left": 0})
+                continue
+            nodes = g.node_set()
+            ones = {n: torch.ones(tx.T, len(circ[n]), device=dev) for n in nat.names}
+            lm = Em.log_probs(without(ones, cs, at))
+            lv = Ev.log_probs(without(vpd, cs, vat))
+            held = [nd for nd in cs if nd in nodes]
+            if g.complete:
+                gm = {n: torch.zeros(tx.T, len(circ[n]), device=dev) for n in nat.names}
+                for n, t, c in nodes:
+                    gm[n][t, at[n][c]] = 1.0
+                lc = Ec.log_probs(without(gm, cs, at))  # a candidate the circuit lacks: its row is the circuit itself
+            else:
+                lc = Ec.graph_log_probs(Ec.plan([_drop_nodes(g, {nd}) if nd in nodes else g for nd in cs], semantics="c"))
+            w = carry.kl(lm, tx.ref.expand_as(lm)).tolist()
+            kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
+            rec = [[list(nd), a, b_, c_] for nd, a, b_, c_ in zip(cs, kc, kv, w)]
+            out.append({"s_omitted": _ratio_pool(rec), "s_omitted_raw": _ratio_pool(rec, raw=True), "draws_omitted": rec,
+                        "omitted_left": len(cs) - len(held)})
+            native.free(dev)
+        return out
+
     def _node_family(self, tx: Text, graphs: list[native.Graph], draws: int, reads: bool = False,
                      units: list | None = None) -> list[dict]:
         """Per circuit, the node-removal family: draws of its nodes removed from the model, from VPD's answer and from
@@ -4546,6 +4626,10 @@ def fidelity_report(split: str, n: int, sets: dict, pool: Path, out: Path, draws
             nf = ge._node_family(tx, [_c_graph(g, targets, nat.C) for g in graphs], draws,
                                  units=[sorted(strand(g, targets, nat.C).node_set()) for g in graphs]) if "nodes" in only else [{} for _ in graphs]
             ns = ge.necessity_spec(tx, graphs, "eval") if "necessity" in only else [{} for _ in graphs]
+            if "necessity_bg" in only:  # N with the background at the targets kept on
+                ns = [dict(a, **{f"{k}_bg": v for k, v in b.items()}) for a, b in zip(ns, ge.necessity_spec(tx, graphs, "eval", background=True))]
+            if "omitted" in only:
+                ns = [dict(a, **b) for a, b in zip(ns, ge._omitted_family(tx, [_c_graph(g, targets, nat.C) for g in graphs]))]
             if "remainders" in only:  # the point score with the remainders live, held at x and off
                 ns = [dict(a, **b) for a, b in zip(ns, ge.point_remainders(tx, graphs))]
             scale = ge.size_scale(tx)
@@ -4691,7 +4775,7 @@ def main():
     f.add_argument("--fresh", type=Path, help="a pattern pool no search drew from (evaluation only)")
     f.add_argument("--interchange", type=int, default=INTERCHANGE_DRAWS)
     f.add_argument("--changed", type=int, default=CHANGED_DRAWS, help="changed texts per circuit (changed_inputs' eval split)")
-    f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp,pattern,nodes,necessity,remainders: those families alone, eval split (rows to merge by task and kind)")
+    f.add_argument("--only", default="", help="changed,interchange,donors,track_pp,interchange_pp,pattern,nodes,necessity,necessity_bg,omitted,remainders: those families alone, eval split (rows to merge by task and kind)")
     f.add_argument("--curve", default=",".join(str(x) for x in ADV_CURVE), help="the step adversary's budgets, e.g. 0,4,20,40,80,160,320")
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--draws", type=int, default=DRAWS)

@@ -1509,6 +1509,13 @@ def parse_start(text: str, start: dict) -> dict:
             "finals": {}, "edits": {}, "variables_malformed": 0, "removed": len(gone), "added": len(added)}
 
 
+def parse_answer(text: str, ev: dict) -> dict:
+    """An answer as reward() reads it: on a start-relative row (ev "start") a REMOVE:/ADD: answer by parse_start, any
+    other (a CIRCUIT block: the search-free baselines, the teachers' circuits, an answer written out in full) by parse(),
+    so the same circuit scores the same in either form; on any other row parse()."""
+    return parse_start(text, ev["start"]) if ev.get("start") and START_MARK.search(MARKDOWN.sub("", text)) else parse(text)
+
+
 def start_answer(start: dict, nodes) -> str:
     """The start-relative answer for a circuit (goal_eval's JSON nodes): REMOVE: start's ids it lacks, then ADD: its
     subcomponents outside start written out (none for a teacher's circuit, a subset of its start)."""
@@ -1806,7 +1813,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
     total = sum(nat.C.values())
     P = nat.positions(targets)
-    parsed = [parse_start(x, ev["start"]) if ev.get("start") else parse(x) for x in texts]
+    parsed = [parse_answer(x, ev) for x in texts]
     graphs, defects, valid = [], [], []
     for i, p in enumerate(parsed):
         g, d = goal_eval.circuit(p["answer"], targets, nat.C, len(ids))

@@ -1199,6 +1199,12 @@ def test_start_relative_answers_round_trip(tiny):
     assert x["unknown_ids"] == 1 and x["malformed_nodes"] == 2 and x["removed"] == 1 and x["added"] == 1
     assert x["answer"]["nodes"] == start["nodes"][1:] + [outside]
     assert components.parse_start(components.start_answer(start, sub + [outside]), start)["answer"]["nodes"] == sub + [outside]
+    # on a start-relative row a CIRCUIT block (the baselines, the teachers) is read as written, a REMOVE: answer from the start
+    row = {"start": start}
+    block = components.render({"nodes": sub, "edges": [], "complete": True})
+    assert components.parse_answer(block, row)["circuit"] and sorted(map(tuple, components.parse_answer(block, row)["answer"]["nodes"])) == \
+        sorted(map(tuple, sub))
+    assert components.parse_answer(text, row)["answer"]["nodes"] == sub and not components.parse_answer(text, {})["circuit"]
 
 
 def test_start_relative_question_lists_the_start(tiny):

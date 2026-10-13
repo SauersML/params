@@ -172,6 +172,25 @@
 %% variable launcher archives only selected permitted tasks. Teacher/gate/unit selectors also filter before content reads.
 %% 22 synthetic regression cases pass; CI includes them. No real sealed files or existing archives opened or altered.
 %% This protects the independence of final evaluation; it is not a retrospective claim about other owners' earlier archives.
+%% S1b curve audit: frozen dev9020-9049, all30 first samples at steps56/112; second samples separate, no best-of.
+%% Actual evaluation headers have identical eight scorer hashes and row/label hashes; training SOURCE_REV is not the scorer.
+%% Step56: valid27/30, recorded faithful5/30; VPD comparison on27 valid only: reward delta+.1543, text-bootstrap95 [.026,.297].
+%% Step112: valid28/30, faithful2/30; valid-only VPD delta+.1415 [.036,.257]. Neither establishes a reliable complete oracle.
+%% All30 reward delta112-minus56 +.3719 [-.985,1.759]; includes invalid=-10. No clear later-checkpoint improvement.
+%% Available-family bottlenecks: N and node removal. Missing draws/flip map prevent complete attribution or within-text uncertainty.
+%% Three step56 failures omit required QA; step112 has a437-surplus-answer loop and an unrecoverably malformed graph.
+%% Keep original failures; diagnostic prefix content is not a repaired or rescored valid answer. Baseline size matching is discrete.
+%% Artifact: graph_oracle/goal_eval/s1b_curve_audit_20261012; frozen inputs/headers verify hashes; offline replay byte-identical.
+%% Decision: prioritize intervention fidelity and answer reliability; valid-only VPD gains do not justify blind SFT scaling.
+%% 34a0258 exposes CALIBRATION_EVIDENCE=1 and INVARIANTS=1 on evaluation pods, not noise/timing; five command checks pass.
+%% 3017b64 retains every family score, including flip dictionaries; JSON-roundtrip scores/Phi and unchanged reward: four tests pass.
+%% Future exports can distinguish uncertainty from response errors; these fixes do not reconstruct missing historical draws.
+%% Fresh single209 protocol: same438 units as6025, new declared input209; original two-input claim and its failure stay intact.
+%% Freeze32 fresh donors each at209/181/126 before scoring, excluding217 prior tokens plus construction pools and originals.
+%% Test209 cause and181/126 isolation against native block and two fixed same-size nulls; raw KL, worst cases, paired intervals.
+%% Single209 job19680: free MATS,1L40/4CPU/11GiB/15min, source919bf8; HELD JobHeldUser, no release/retry and no measurements.
+%% Protocol/artifacts: scratch/variable_reward/6025_single209. A pass would support local transport, not English or circuit closure.
+%% This held measurement has no dependency edge to training-data plumbing, offline audits, wiring work or other teams' jobs.
 %% No new generation, no verified raw-weight-use claim, no complete policy-visible-text provenance or fresh-input claim.
 %% Explicitly requested replay runs independently of unrelated CI failures; preserve both measurement and failed status.
 %% ad865a3 uses SciPy for exact toy SVD on Mac only; per-head weight reconstruction passes, Linux backend unchanged.
@@ -220,6 +239,7 @@ flowchart BT
   TOOLS["<b>Search route, in parallel</b><br/>teacher circuits plus variables,<br/>English and executed answers;<br/>no learned oracle needed<br/>ACTIVE · primerl, varteach, codex"]
   SUP["<b>Verified behavior supervision</b><br/>QA, edits and3 formal claims ready;<br/>consume checked shards as they arrive;<br/>free English remains unverified<br/>ACTIVE · varteach, rustmove, primerl, codex"]
   GATEC{{"<b>Check C</b> · does this arm add value?<br/>each completed arm vs cheap controls<br/>and search on development texts;<br/>report without waiting for other arms"}}
+  S1AUDIT["<b>Does more SFT help?</b><br/>steps 56/112: faithful 5/30, 2/30;<br/>valid-only VPD gains; no clear trend;<br/>prioritize interventions and reliability<br/>AUDIT DONE · codex/eval_recovery"]
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
     S1READY["<b>SFT pilot: format learned</b><br/>5/8 valid; QA near no-change;<br/>no advantage over matched VPD;<br/>feeds input and control ablations<br/>CHECK · codex · $2.51 total"]
     S1["<b>SFT · influential starts</b><br/>dev 9020-9049, step 56, no thinking:<br/>valid 27/30, phi 0.89 (bar 1.0-1.2),<br/>beats VPD top k at equal bits 18/9<br/>EVALUATING 112/167 · primerl"]
@@ -254,7 +274,7 @@ flowchart BT
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>package on main (aa79889): floor,<br/>eps cap, N guard, Φ cap, no node cap;<br/>toys core 8/15→pass but collapsed;<br/>DONE · inframove, primerl"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]
-    W6["<b>Matched reward controls</b><br/>null-syntax bonus fixed;<br/>retain scored draws to distinguish<br/>response errors from uncertainty<br/>IMPLEMENTED · codex · b84253d"]
+    W6["<b>Diagnose fidelity failures</b><br/>retain draws and every family score;<br/>unchanged reward; export checks pass;<br/>separate response error from uncertainty<br/>IMPLEMENTED · codex · 3017b64"]
   end
 
   %% ===================== verifier and foundations =====================
@@ -267,6 +287,7 @@ flowchart BT
   VAR["<b>Variables and invariants</b><br/>kept: 84 input (= whole position),<br/>7 intermediate of 127; m share 0.004;<br/>families beat equal-size nulls 9/9<br/>ACTIVE · varteach"]
   SEM["<b>English matches execution</b><br/>no dropped conditions, contradictions<br/>or duplicated evidence credit;<br/>29 checks passed · 1964b43<br/>DONE · codex/variable_reward"]
   ENGP["<b>Fresh carrier tests</b><br/>209 effects carried;181 unsupported;<br/>3 of7 claims verified for training;<br/>two-input mechanism not established<br/>DONE · codex/variable_reward"]
+  ENG209["<b>Does the 209 carrier generalize?</b><br/>32 fresh donors × 3 input positions;<br/>test cause, isolation and worst cases;<br/>free MATS 19680 held; no release<br/>WAITING · codex/variable_reward"]
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
   WIRING["<b>Learn executable relations</b><br/>matched unit vs wiring rewards ready;<br/>next: same-budget RL on same start;<br/>original checkpoint and data needed<br/>WAITING for artifact · codex, toyloop"]
 
@@ -297,6 +318,8 @@ flowchart BT
   T4 -- each passing shard --> S2
   T5 --> S3
   S1 -. each completed arm .-> GATEC
+  S1 -. saved evaluations .-> S1AUDIT
+  S1AUDIT -. limits and next experiment .-> GATEC
   S2 -. each completed arm .-> GATEC
   S3 -. each completed arm .-> GATEC
   GATEC -. picks the start .-> RLS
@@ -351,6 +374,8 @@ flowchart BT
   SEM --> ENGP
   ENG --> ENGP
   ENGP --> CLAIMDATA
+  ENGP -- frozen carrier --> ENG209
+  ENG209 -. carrier evidence only .-> C2
   CLAIMDATA -- verified claims only --> SUP
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
@@ -431,6 +456,8 @@ flowchart BT
   class WIRING waiting
   class CLAIMDATA done
   class ENGP done
+  class S1AUDIT done
+  class ENG209 waiting
   class GATEB blocked
   class S3,ORC,R1,R2,R3,R4,R5 waiting
   class LAT2,UVPD later

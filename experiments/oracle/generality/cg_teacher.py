@@ -109,6 +109,15 @@ def masks_run(k: int, P: int, behavior: bool = False):
                    check=True, env=env)
 
 
+def test_dir(k: int, P: int, behavior: bool = False):
+    """The test on teacher circuits made elsewhere (unpacked into ~/mpd-data/graph_oracle/cg_teacher[_b]/), every P-th
+    from the K-th -> GEN_OUT/cg_teacher[_b]_test_<10 + K>.jsonl."""
+    b = "_b" if behavior else ""
+    tdir = Path.home() / "mpd-data/graph_oracle" / f"cg_teacher{b}"
+    names = sorted(p.stem for p in tdir.iterdir() if p.suffix == ".json" and "." not in p.stem and p.stem.startswith("cg"))[k::P]
+    test(names, tdir, Path(os.environ.get("GEN_OUT", DATA)) / f"cg_teacher{b}_test_{10 + k}.jsonl", b)
+
+
 def test(names: list, tdir: Path, out: Path, b: str = ""):
     import components
     import goal_eval
@@ -202,9 +211,9 @@ def report(behavior: bool = False):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("write", "run", "report", "masks"))
+    ap.add_argument("cmd", choices=("write", "run", "report", "masks", "test"))
     ap.add_argument("args", nargs="*", type=int)
     ap.add_argument("--behavior", action="store_true", help="the behavior-targeted mode")
     a = ap.parse_args()
     {"write": lambda: write(a.behavior), "run": lambda: run(*a.args, behavior=a.behavior), "report": lambda: report(a.behavior),
-     "masks": lambda: masks_run(*a.args, behavior=a.behavior)}[a.cmd]()
+     "masks": lambda: masks_run(*a.args, behavior=a.behavior), "test": lambda: test_dir(*a.args, behavior=a.behavior)}[a.cmd]()

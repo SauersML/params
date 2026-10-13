@@ -101,7 +101,7 @@ cd /Users/user/params/method/oracle; python -B teacher.py --tasks $L --batch $BA
     RUNS="$RUNS (python -B $SCRIPT --tasks $L --offset $k --stride $P $B --out $O/out > $O/teacher_$k.log 2>&1; echo \"exit \$?\" >> $O/teacher_$k.log) &"
     FAILED="$FAILED grep -q '^exit [1-9]' $O/teacher_$k.log && F=1;"
   done
-  CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
+  CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 ${POD_ENV:-}; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out ~/mpd-data/graph_oracle;
 python -m pip install -q safetensors pyyaml tokenizers scipy;
 tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd ${EXTRA:-} > /dev/null;

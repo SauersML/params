@@ -4520,8 +4520,6 @@ class GoalEval:
                 if vpd:
                     mv[n] = vpd_on[n].float() + vfree[n] * a[:, None, :] if patterns else vpd_on[n].float().expand(len(circ), -1, -1)
             kc = []
-            if xk:  # semantics "x": float32 runs with routing and norms at x
-                precision = "score"
             if ns and one is not None:  # one stated graph, each row at its circuit's strengths
                 s = strengths[circ[:ns]]
                 kc.append(carry.kl(E.ref, E.graph_log_probs(one, {n: uc[n][:ns] for n in nat.names}, s[:, :one["E"]], s[:, one["E"]:],

@@ -654,6 +654,11 @@ def test_held_at_x_from_a_position():
         eng.graph_log_probs(plan, keep=st, held=hall, **ones(1), **kw)
         got = kl(eng.graph_log_probs(plan, off=off, held=hall, reuse=(eng.tile_states(st, 2), ids, lo), **ones(2), **kw))
         assert lo > 0 and rel(full, got) < REL
+        for prec, tol in (("tf32", REL_TF32), ("bf16", REL_BF16)):  # a search's steps at x: its precision, every position
+            if prec == "tf32" and not str(nat.dev).startswith("cuda"):
+                continue
+            assert rel(whole, kl(eng.log_probs(less, prec, held=held, **kw))) < tol, prec
+            assert rel(full, kl(eng.graph_log_probs(plan, precision=prec, off=off, held=hall, **ones(2), **kw))) < tol, prec
 
 
 def test_c_semantics_cuts_in_the_model_and_patches():

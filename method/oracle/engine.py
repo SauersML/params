@@ -383,8 +383,8 @@ class Engine:
         passes held without it), and their columns outside an outside="off" engine's too; norms: {("attn" | "mlp",
         layer) or "final": [B or 1, T, 1]} (x_values'), every RMSNorm freeze holds ("layers": inside the layers;
         "all": the final norm too, its scale at every position or at the targets) at that scale instead of its own:
-        goal_eval.GoalEval.graph_ref's outside=, norms= and freeze= (float32 runs; with start, every row's held and
-        masks base's before it)."""
+        goal_eval.GoalEval.graph_ref's outside=, norms= and freeze= (a search precision runs every position in its
+        products, uncompiled; with start, a float32 run, every row's held and masks base's before it)."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if reads is not None and precision != "score":
@@ -392,8 +392,6 @@ class Engine:
         if start and (precision != "score" or reads is not None or not 0 < start <= min(self.targets)):
             raise ValueError("start is a float32 run without reads, after position 0 and no later than the first target")
         fz = self._frozen(norms, freeze)
-        if (at_x is not None or fz is not None) and precision != "score":
-            raise ValueError("at_x and frozen norms are float32 runs (score)")
         B = next(iter(masks.values())).shape[0]
         xh = None if at_x is None else self._held_x(at_x, held, masks, B)
         rec = None if reads is None else (reads, {})
@@ -680,8 +678,8 @@ class Engine:
         columns outside an outside="off" engine held too. norms and freeze: every RMSNorm freeze holds
         ("layers": inside the layers; "all": the final one too) at norms' scale ({("attn" | "mlp", layer) or "final":
         [B or 1, T, 1]}, x_values'; the final one's at every position or at the targets) instead of its own
-        (graph_ref's norms= and freeze=). Both float32 runs without blocks; with reuse, keep's run made with the same
-        at_x, held and norms, every row's held before reuse's start its."""
+        (graph_ref's norms= and freeze=). Both without blocks, a search precision at every position; with reuse, keep's
+        run made with the same at_x, held and norms, every row's held before reuse's start its."""
         if precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if (keep is not None or reuse is not None) and (precision != "score" or patch is not None or reads is not None):
@@ -697,8 +695,6 @@ class Engine:
         if reuse is not None and not 0 < reuse[2] <= min(self.targets):
             raise ValueError("reuse starts after position 0 and no later than the first target")
         fz = self._frozen(norms, freeze)
-        if (at_x is not None or fz is not None) and precision != "score":
-            raise ValueError("at_x and frozen norms are float32 runs (score)")
         if at_x is not None and plan["semantics"] != "c":
             raise ValueError("at_x takes C's semantics")
         B = plan["B"] or max([1] + [t.shape[0] for t in (ew, ow) if t is not None] + [m.shape[0] for m in (u or {}).values()])
@@ -1769,7 +1765,7 @@ class Engine:
         if c:  # the circuit's nodes at 1 in the stream, every other subcomponent at u
             one = torch.ones((), device=self.dev)
             u = {n: m.expand(B, T, -1).index_put(p["nodes"][n], one) if n in p["nodes"] else m for n, m in u.items()}
-        narrow = fused and rec is None
+        narrow = fused and rec is None and hold is None  # (at x every position: the frozen scales are per position)
         blocks = {k[:-len(BK)] for k in R if k.endswith(BK)}  # sites with blocks (plan's keys site + BK)
         xh = {} if hold is None or hold[0] is None else self._held_x(  # (a given held may hold off nodes: line deletions)
             hold[0], hold[1], u, B, (p["nodes"],) if hold[1] is not None else (p["nodes"], p.get("dropped", {})))

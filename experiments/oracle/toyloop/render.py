@@ -4,13 +4,14 @@ writes; then attention patterns and VPD-active units on 1-2 example texts. Forma
 
 A toy is the Toy dataclass below: a vpd_model.Target state dict + config (pre-RMSNorm, rotate-half RoPE, GELU(tanh)
 MLP, tied embedding), token names, example texts, optional ground truth. Adapters: from_planted (toys/planted.py's
-.pt files), from_zoo (a manifest row; the zoo schema is guessed tolerantly), synthetic (random toys with heads and
+.pt files), from_zoo / load_zoo (toys/zoo.py's manifest rows and records), synthetic (random toys with heads and
 neurons planted on/off, for smoke tests).
 """
 from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 FORMAT = """Answer with the circuit as a Mermaid flowchart over units, then one line starting "English:".
-Units: tok<NAME> (a token's embedding), L<i>H<j> (head j of layer i), L<i>N<j> (MLP neuron j of layer i), out (the prediction).
+Units: tok<NAME> (a token input, by name or role), L<i>H<j> (head j of layer i), L<i>N<j> (MLP neuron j of layer i), out (the prediction).
 Example:
 flowchart LR
   tokK --> L0H1
@@ -123,7 +124,7 @@ def weight_lines(toy: Toy, top_neurons: int = 6, k: int = 3) -> list[str]:
         for j in range(H):
             Wq, Wk, Wv, Wo = _blocks(sd, cfg, i, j)
             nq, nk, nv, no = (float(w.norm()) for w in (Wq, Wk, Wv, Wo))
-            head = f"L{i}H{j} |q|{nq:.1f} |k|{nk:.1f} |v|{nv:.1f} |o|{no:.1f}"
+            head = f"L{i}H{j} |q|{nq:.2g} |k|{nk:.2g} |v|{nv:.2g} |o|{no:.2g}"
             if min(nv, no) < 1e-3 and min(nq, nk) < 1e-3:
                 lines.append(head + " (zero)")
                 continue
@@ -153,7 +154,7 @@ def weight_lines(toy: Toy, top_neurons: int = 6, k: int = 3) -> list[str]:
         top = strength.topk(min(top_neurons, live)).indices.tolist()
         lines.append(f"L{i} MLP: {live} live neurons, strongest {len(top)}:")
         for n in top:
-            lines.append(f"  L{i}N{n} w{float(strength[n]):.1f} reads {_top_tokens(En2 @ fc[n], voc, k)}"
+            lines.append(f"  L{i}N{n} w{float(strength[n]):.2g} reads {_top_tokens(En2 @ fc[n], voc, k)}"
                          f" writes {_top_tokens(E @ down[:, n], voc, k)}")
     return lines
 
@@ -186,6 +187,8 @@ def behaviour_lines(toy: Toy, n_texts: int = 2) -> list[str]:
         lines.append(f"Text {ti}: {' '.join(f'{toy.vocab[a]}' for a in ids)} -> predicts {pred}")
         for i in range(L):
             for j in range(H):
+                if all(float(w.norm()) < 1e-3 for w in _blocks(toy.sd, toy.cfg, i, j)):
+                    continue                                                # a zero head: nothing to see
                 p = r["attn"][i][j]
                 arg = p.argmax(-1)                                          # [T] the key each query position attends most
                 offs = (arg - torch.arange(T))[1:]
@@ -232,28 +235,37 @@ def from_planted(path: str | Path, truth: dict | None = None, n_texts: int = 2) 
     return Toy(name, d["sd"], d["cfg"], PLANTED_VOCAB, planted.ordinary(name, n_texts), truth, {"path": str(path)})
 
 
-def from_zoo(row: dict, root: str | Path | None = None) -> Toy:
-    """A zoo manifest row. Tolerant of the schema: the checkpoint under "path"/"ckpt"/"file" ({"sd", "cfg"} or a bare
-    state dict with "cfg" in the row), token names under "vocab"/"tokens", texts under "texts"/"examples"/"ordinary",
-    truth under "truth"/"circuit" ({"units", "edges", "english"}) or top-level "units"/"edges"/"english"."""
+def zoo_unit(u: str) -> str:
+    """The zoo's unit names to the oracle's: 'L1.H3' -> 'L1H3', 'tok:offset-3' -> 'tok_offset_3', 'OUT' -> 'out'."""
+    if u == "OUT":
+        return "out"
+    if u.startswith("tok:"):
+        return "tok_" + re.sub(r"\W", "_", u[4:])
+    return u.replace(".", "")
+
+
+def from_zoo(row: dict, root: str | Path | None = None, n_texts: int = 2) -> Toy:
+    """A toys/zoo.py manifest row ({"id", "weights": .pt {"sd", "cfg"}, "record": .json with "unit_edges",
+    "explanation", "examples" [{"ids", "gt_nodes", ...}]}, paths relative to the manifest's directory). The record
+    goes into meta (gt_nodes per example for node-level scoring); truth is the record's unit edges, renamed by zoo_unit."""
     root = Path(root) if root else Path.home() / "mpd-data/toy_zoo"
-    p = next(row[k] for k in ("path", "ckpt", "file", "checkpoint") if k in row)
-    p = Path(p) if Path(p).is_absolute() else root / p
-    d = torch.load(p, map_location="cpu")
-    sd, cfg = (d["sd"], d["cfg"]) if "sd" in d else (d, row["cfg"])
-    V = sd["wte.weight"].shape[0]
-    vocab = next((row[k] for k in ("vocab", "tokens", "token_names") if k in row), None) or d.get("vocab") or [f"t{i}" for i in range(V)]
-    texts = next((row[k] for k in ("texts", "examples", "ordinary") if k in row), None) or d.get("texts") or [list(range(min(V, 8)))]
-    truth = row.get("truth") or row.get("circuit") or ({k: row[k] for k in ("units", "edges", "english") if k in row} or None)
-    if truth and "units" not in truth:
-        truth["units"] = sorted({u for e in truth["edges"] for u in e})
-    name = row.get("name") or row.get("id") or p.stem
-    return Toy(name, sd, cfg, [str(v).replace(" ", "_") for v in vocab], texts, truth, row)
+    d = torch.load(root / row["weights"], map_location="cpu")
+    rec = json.loads((root / row["record"]).read_text())
+    V = d["sd"]["wte.weight"].shape[0]
+    vocab = ["BOS"] + [f"t{i}" for i in range(1, V)]
+    edges = [[zoo_unit(a), zoo_unit(b)] for a, b in rec["unit_edges"]]
+    units = sorted({u for e in edges for u in e} | {zoo_unit(u) for u in rec["gt_units"]})
+    truth = {"units": units, "edges": edges, "english": re.sub(r"\bL(\d+)\.([HN]\d+)", r"L\1\2", rec["explanation"])}
+    texts = [e["ids"] for e in rec["examples"] if e["kind"] == "ordinary"][:n_texts]
+    return Toy(rec["id"], d["sd"], d["cfg"], vocab, texts, truth, {"split": rec["split"], "family": rec["family"],
+                                                                  "record": rec})
 
 
-def load_zoo(manifest: str | Path) -> list[Toy]:
+def load_zoo(manifest: str | Path, split: str | None = None) -> list[Toy]:
+    """Every toy in a zoo manifest, or those of one split (train, test_instance, test_family)."""
     m = Path(manifest)
-    return [from_zoo(json.loads(l), m.parent) for l in m.read_text().splitlines() if l.strip()]
+    rows = [json.loads(l) for l in m.read_text().splitlines() if l.strip()]
+    return [from_zoo(r, m.parent) for r in rows if split is None or r.get("split") == split]
 
 
 def synthetic(seed: int, L: int = 2, H: int = 2, D: int = 16, V: int = 12, T: int = 8) -> Toy:

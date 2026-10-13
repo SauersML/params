@@ -233,7 +233,7 @@ def parser():
     ap.add_argument("--steps", type=int, default=100)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--max_len", type=int, default=1536)
+    ap.add_argument("--max_len", type=int, default=2048)
     ap.add_argument("--max_new", type=int, default=160)
     ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--temp", type=float, default=1.0)

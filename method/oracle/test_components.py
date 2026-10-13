@@ -357,7 +357,7 @@ class FakeScorer:
 
     def score(self, tx, vs, split="eval", graph=None):
         self.asked, self.split = vs, split
-        return {"e4": 0.6, "circuit": {"e4": 0.9}, "gap": 0.3, "variables": [{"f_on": 0.7, "s_off": 0.5} for _ in vs]}
+        return {"e4": 0.6, "circuit": {"e4": 0.9}, "gap": 0.3, "variables": [{"f_on": 0.7, "f_off": 0.5, "s_off": 0.99} for _ in vs]}
 
 
 def test_e4_is_the_scorers_e4_with_a_malformed_variable_scoring_zero():
@@ -367,7 +367,7 @@ def test_e4_is_the_scorers_e4_with_a_malformed_variable_scoring_zero():
     sc = FakeScorer()
     out = components.e4_term(sc, None, None, {"variables": [one, two]}, 0, C)
     assert {k: out[k] for k in ("E4", "model", "circuit", "gap")} == {"E4": 0.6, "model": 0.6, "circuit": 0.9, "gap": 0.3}
-    assert [v["name"] for v in sc.asked] == ["a", "b"] and [x["e4"] for x in out["per_variable"]] == [0.5, 0.5]  # min(f_on, s_off)
+    assert [v["name"] for v in sc.asked] == ["a", "b"] and [x["e4"] for x in out["per_variable"]] == [0.5, 0.5]  # min(f_on, f_off): f's scale
     outside = {**two, "group": [["h.2.attn.o_proj", 99, 7]]}  # no such subcomponent; and one line that did not parse
     assert components.e4_term(sc, None, None, {"variables": [one, outside]}, 1, C)["E4"] == pytest.approx(0.6 / 3)
     assert components.e4_term(sc, None, None, {}, 0, C)["E4"] == 0.0

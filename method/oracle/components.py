@@ -1545,7 +1545,9 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict, split: str
     stated variables that are well-formed (a line that does not parse, or names no subcomponent of the model, counts
     as a variable scoring 0). No VARIABLES block, or nothing resolved: 0. {"E4", "model" (e4), "circuit" (the stated
     graph's e4, a diagnostic), "gap"}. split: the interchange draws, reward()'s (search for the RL reward, eval in
-    evaluations), the same as C's."""
+    evaluations), the same as C's. Each variable is scored with its stated group (and stated value map, when the
+    answer gives one), never a carrier searched for the claim (the lead's rule, 10-12: searched carriers let wrong
+    maps score 0.48-0.85); per variable min(f on-target, f off-target, f same-class), variables.headline's scale."""
     import variables
 
     ok, bad = [], malformed
@@ -1558,8 +1560,8 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict, split: str
         return {"E4": 0.0, "model": None, "circuit": None, "gap": None}
     got = scorer.score(tx, ok, split=split, graph=graph)
     per = []
-    for v, x in zip(ok, got["variables"]):  # each variable's headline: min(f on-target, s off-target), 0 unresolved
-        e = 0.0 if x.get("f_on") is None else (x["f_on"] if x.get("s_off") is None else min(x["f_on"], x["s_off"]))
+    for v, x in zip(ok, got["variables"]):  # each variable's headline: min(f on, f off, f same-class), 0 unresolved
+        e = 0.0 if x.get("f_on") is None else min(y for y in (x["f_on"], x.get("f_off"), x.get("f_same")) if y is not None)
         per.append({"name": v["name"], "e4": e, "nodes": [list(nd) for nd in v["group"]]})
     return {"E4": (got["e4"] or 0.0) * len(ok) / (len(ok) + bad), "model": got["e4"],
             "circuit": (got.get("circuit") or {}).get("e4"), "gap": got.get("gap"), "per_variable": per}

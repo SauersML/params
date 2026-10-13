@@ -310,25 +310,11 @@ def stated_feeds(graph: native.Graph, chosen: list[dict]) -> dict:
 
 
 def together(sc: variables.Scorer, tx, vs: list[dict], split: str, draws: int) -> dict:
-    """variables.Scorer.score of several variables, by pairs when there are more than two: a call keeps every changed
-    text's whole activations, and four variables' on-target, off-target and composition texts (~90 at 500 tokens) took
-    a 24 GB card. Each variable's draws, each pair's composition and feeds tests are the same in any call holding them
-    (keyed by the text and the positions), so the pairs' calls give every term of the joint call (each variable's from
-    the first call holding it; the float32 resolution is each call's own)."""
-    if len(vs) <= 2:
-        got = sc.score(tx, vs, split=split, draws=draws)
-        release(sc.nat.dev)
-        return got
-    first, pairs, feeds = {}, [], []
-    for i in range(len(vs)):
-        for j in range(i + 1, len(vs)):
-            got = sc.score(tx, [vs[i], vs[j]], split=split, draws=draws)
-            release(sc.nat.dev)
-            first.setdefault(i, got["variables"][0])
-            first.setdefault(j, got["variables"][1])
-            pairs += got["pairs"]
-            feeds += got["feeds"]
-    return variables.headline({"variables": [first[i] for i in range(len(vs))], "pairs": pairs, "feeds": feeds})
+    """variables.Scorer.score of several variables in one call (the Scorer keeps each changed text's tables only at the
+    positions it patches or reads since bfa71ce, so the pairs path a 24 GB card needed for four variables is gone)."""
+    got = sc.score(tx, vs, split=split, draws=draws)
+    release(sc.nat.dev)
+    return got
 
 
 def measured_feeds(sc: variables.Scorer, tx, chosen: list[dict], draws: int) -> None:

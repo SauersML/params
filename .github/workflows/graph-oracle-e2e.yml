@@ -112,12 +112,14 @@ jobs:
       - name: Diagnose adversary batch on Linux CPU
         if: github.event_name == 'workflow_dispatch' && inputs.adversary_batch_only
         timeout-minutes: 3
+        shell: bash
         run: |
           mkdir -p "${{ runner.temp }}/adversary-batch-diagnostic"
           cases=(method/oracle/test_goal_eval.py::test_adversary_batch_is_per_circuit)
           if [ '${{ inputs.adversary_prefix }}' = 'true' ]; then
             python -m pytest method/oracle/test_goal_eval.py --collect-only -q > "${{ runner.temp }}/adversary-batch-diagnostic/collection.log"
-            mapfile -t cases < <(sed '/::test_adversary_batch_is_per_circuit$/q' "${{ runner.temp }}/adversary-batch-diagnostic/collection.log" | rg '^method/oracle/test_goal_eval.py::')
+            mapfile -t cases < <(sed -n '/::test_adversary_batch_is_per_circuit$/ {p;q;}; /^method\/oracle\/test_goal_eval.py::/p' "${{ runner.temp }}/adversary-batch-diagnostic/collection.log")
+            [ "${#cases[@]}" -gt 0 ]
             [ "${cases[-1]}" = 'method/oracle/test_goal_eval.py::test_adversary_batch_is_per_circuit' ]
           fi
           python -m pytest "${cases[@]}" -s -q --tb=short \

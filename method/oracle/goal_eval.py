@@ -5178,20 +5178,23 @@ def tails(split: str, n: int, teachers: dict, top: int = 64, ps=(0.9, 0.99), ge:
 # ---- the adversary's pattern pool (C's M)
 
 
-def build_patterns(texts: list[Path], out: Path, nat: native.Native | None = None) -> dict:
+def build_patterns(texts: list, out: Path | None = None, nat: native.Native | None = None, lengths: list[int] | None = None) -> dict:
     """The pool M of the paired adversary: every position of the texts, the set of subcomponents VPD's causal
-    importance switches on there (CI > 0), one pattern each. Saved as {"names", "sources": [(task, position)],
-    "site": int16 index into names, "c": int32, "offsets": int64 [patterns + 1]}, a pattern's (site, c) pairs between
-    consecutive offsets."""
+    importance switches on there (CI > 0), one pattern each. texts: vpd4l text files or token id lists (another
+    target's texts, nat its native); lengths: per text the positions kept, the rest padding the causal importance still
+    reads (MIB's prompts padded as its fit's batches). Saved to out when given, as {"names", "sources": [(task,
+    position)], "site": int16 index into names, "c": int32, "offsets": int64 [patterns + 1]}, a pattern's (site, c)
+    pairs between consecutive offsets."""
     nat = nat or native.Native()
     sites, cols, counts, sources = [], [], [], []
     with torch.no_grad():
-        for p in texts:
-            ids, _ = native.text(p)
+        for k, p in enumerate(texts):
+            ids = native.text(p)[0] if isinstance(p, Path) else list(p)
+            T = len(ids) if lengths is None else lengths[k]
             ci = nat.importance(ids)
             ts, ss, cs = [], [], []
             for i, n in enumerate(nat.names):
-                t, c = (ci[n] > 0).nonzero(as_tuple=True)
+                t, c = (ci[n][:T] > 0).nonzero(as_tuple=True)
                 ts.append(t.cpu())
                 ss.append(torch.full((len(t),), i, dtype=torch.int16))
                 cs.append(c.cpu().to(torch.int32))
@@ -5199,12 +5202,13 @@ def build_patterns(texts: list[Path], out: Path, nat: native.Native | None = Non
             order = torch.argsort(t * len(nat.names) + site.long(), stable=True)  # by position, then site
             sites.append(site[order])
             cols.append(c[order])
-            counts.append(torch.bincount(t, minlength=len(ids)))
-            sources += [(p.stem, i) for i in range(len(ids))]
+            counts.append(torch.bincount(t, minlength=T))
+            sources += [(p.stem if isinstance(p, Path) else f"text{k}", i) for i in range(T)]
             native.free(nat.dev)
     offsets = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cat(counts).cumsum(0)])
     pool = {"names": list(nat.names), "sources": sources, "site": torch.cat(sites), "c": torch.cat(cols), "offsets": offsets}
-    torch.save(pool, out)
+    if out is not None:
+        torch.save(pool, out)
     return pool
 
 

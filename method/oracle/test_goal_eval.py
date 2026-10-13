@@ -3229,3 +3229,15 @@ def test_faithfulness_partial_draws_run_complete_graphs_as_the_masked_run(monkey
     cn = nat._complete_nodes(split)
     assert int(sum(int(m.sum()) for m in cn.values())) == 2 and bool(cn[a[0]][1, a[1], a[2]]) and not bool(cn[a[0]][0].any())
     assert nat._complete_nodes(nat._plan([stated], len(ids))) is None
+
+
+def test_patterns_from_token_lists_keep_the_real_positions():
+    """build_patterns on another target's token lists (ib_teacher's pool): lengths keep a padded text's real
+    positions, whose patterns (a causal importance) are the unpadded text's."""
+    nat = tiny_native()
+    padded = goal_eval.build_patterns([[2, 5, 3, 7, 4, 6], [1, 2, 3, 4, 0, 0]], None, nat, [6, 4])
+    whole = goal_eval.build_patterns([[1, 2, 3, 4, 0, 0]], None, nat)
+    assert len(padded["sources"]) == 10 and padded["sources"][6] == ("text1", 0) and padded["names"] == list(nat.names)
+    for i in range(4):
+        a, b = goal_eval.pattern(padded, 6 + i), goal_eval.pattern(whole, i)
+        assert a.keys() == b.keys() and all(torch.equal(a[n], b[n]) for n in a)

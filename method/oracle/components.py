@@ -1530,7 +1530,8 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
         v2 teacher, D = 0): 0 at parity, positive only where the answer beats it on both.
     An answer is invalid, R = V3_INVALID below every valid one, without a CIRCUIT section, a FINAL line per question
     or an EDIT line per edit request, cut at the sampling cap or over it (truncated), or above node_cap nodes (None: no
-    cap, for references such as the influential start). The empty circuit has no compactness (0 bits); its D compares
+    cap, for references such as the influential start). A circuit with zero executable bits has no compactness,
+    including an empty circuit with charged discarded syntax; its D compares
     phi alone (its compactness counts as beating the teacher's), so D is continuous down to it.
     Reported beside R: phi, phi_tau, g, faithful (phi >= phi_tau), bits, bits_start, compact, D, Q, each term
     (term_E2g, term_E4x, term_E1), and goal_eval's C (term_C, c_rl as term_C_rl), F1, N, F3, the old E2 (qa_term:

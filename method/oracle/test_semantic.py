@@ -72,6 +72,36 @@ def invariant_tokenizer(monkeypatch):
     monkeypatch.setattr(components, "_token_of", lambda model, text: tokens.get(text))
 
 
+def test_invariant_quote_styles_resolve_identical_tokens(invariant_tokenizer):
+    single, bad = semantic.parse_invariants("I1: V1 from @0=' x' -> top ' y'")
+    double, other_bad = semantic.parse_invariants('I1: V1 from @0=" x" -> top " y"')
+    assert bad == other_bad == 0
+    assert single[0]["intervention"] == double[0]["intervention"]
+    assert single[0]["outcome"] == double[0]["outcome"]
+    assert double[0]["line"] == 'I1: V1 from @0=" x" -> top " y"'
+
+
+@pytest.mark.parametrize("literal", ['"x"', '" missing"', '" x "'])
+def test_invariant_quote_normalization_keeps_exact_token_text(invariant_tokenizer, literal):
+    got, bad = semantic.parse_invariants(f'I1: @0={literal} -> top " y"')
+    assert got == [] and bad == 1
+
+
+def test_invariant_quote_normalization_preserves_shown_escaping(monkeypatch):
+    token = '<|endoftext|>'
+    spelling = components.shown(token)
+    monkeypatch.setattr(components, "_token_of", lambda model, text: 7 if text == spelling else None)
+    for literal in (spelling, '"<|endoftext|>"'):
+        got, bad = semantic.parse_invariants(f'I1: @0={literal} -> top {literal}')
+        assert bad == 0 and got[0]["intervention"]["tokens"] == {0: 7}
+        assert got[0]["outcome"] == ("top", 7)
+
+
+def test_invariant_equivalent_quotes_cannot_duplicate_credit(invariant_tokenizer):
+    got, bad = semantic.parse_invariants('I1: @0=\' x\' -> top \' y\'\nI2: @0=" x" -> top " y"')
+    assert len(got) == 1 and bad == 1
+
+
 @pytest.mark.parametrize("donor", ["@0=' x' unless V2 is false", "if V2 @0=' x'",
                                    "@0=' x' and @1=' z'", "@0=' x' @0=' z'",
                                    "@0=' x' @0=' x'", "@0=' missing'"])

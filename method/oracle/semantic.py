@@ -32,6 +32,7 @@ not <token> or p(top) < <f>; tokens as FINAL lines write them (components.shown)
 from __future__ import annotations
 
 import gc
+import ast
 import math
 import re
 import sys
@@ -291,7 +292,14 @@ def parse_invariants(text: str, model: str = "vpd4l") -> tuple[list[dict], int]:
     IDs or executable evidence count as bad; changing IDs or clause order cannot duplicate verified credit."""
     import components
 
-    tok = lambda s: components._token_of(model, s)  # noqa: E731
+    def tok(s):
+        # Keep FINAL's escaped spelling valid, then resolve equivalent Python
+        # string literals through the same exact token spelling (no trimming).
+        ident = components._token_of(model, s)
+        if ident is not None:
+            return ident
+        value = ast.literal_eval(s)
+        return components._token_of(model, components.shown(value)) if isinstance(value, str) else None
     out, bad, seen, evidence = [], 0, set(), set()
     for line in text.splitlines():
         m = _LINE.match(line)

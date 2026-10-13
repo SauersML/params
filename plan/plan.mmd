@@ -83,6 +83,11 @@
 %% Gains concentrate in token-change falls and connection cuts. Test displayed-effect controls using train-only fitting.
 %% Input-binding gap: displayed alt0 effects omitted the replacement identity, while QA asks other replacements too.
 %% 2ef5d49 binds future evidence to the measured replacement token/string; frozen prompts and outcomes stay unchanged.
+%% Follow-up displayed-effect baseline: threshold fit on97 training texts only, frozen before rescoring dev8/dev22.
+%% Signed alt0 effect at the question's position, not KL or hidden outcome; exact donor identity absent in old prompts.
+%% Dev22 calibrated effect+activation gets239/358=66.76%, above trained235/358=65.64%; feature covers16/43 token questions.
+%% This is a development-informed follow-up, not a fresh holdout claim. It removes the observed overall cheap-control gain.
+%% Artifact: sft_codex-qa97-q8-1012/analysis/displayed_effect_control; no new model calls or spending.
 %% Decision: no further blind SFT scaling; require useful unseen-intervention gains beyond frozen cheap controls.
 %% QA inputs contain causal summaries/CI/activation/wiring cosines, NOT raw U/V vectors; ablation cannot establish weight use.
 %% Relation6011: actual VPD groups T77/O73/A140 from8 construction donors, independent relation donors, fixed sites.
@@ -100,6 +105,8 @@
 %% 81f1e42 also executes --swapped --wiring on each model's own basis/texts; mixed invalid KL stays missing.
 %% Seven wiring tests pass in exact-commit CI38339194823. Later shared-main changes exposed separate graph-contract
 %% test failures; compare canonical graphs against independent references, keep tolerances, verify current integration.
+%% eb0b402 fixes the two test-contract mismatches with independent raw-forward checks retained; both pass in CI.
+%% Latest integration38339561469:124 pass, one separate adversary-batch precision failure under investigation.
 %% Preserve existing training reward; next use opt-in wiring scores to test learned relations, not unit selection alone.
 %% Literature consequence: measure outcome prediction before free prose; native carriers alone cannot certify meaning.
 %% Offline falsification: real node-response errors coexist with large uncertainty penalties; do not tune them away.
@@ -168,7 +175,7 @@ flowchart BT
     I2["<b>Context fit and explicit limits</b><br/>opt-in node cap before token fitting;<br/>log and skip only oversized rows;<br/>later rows continue<br/>DONE · codex/eval_recovery · 33419cd"]
     I3["<b>Coverage audit</b><br/>179/207-row snapshots: 81–84%<br/>of teacher nodes visible; edits join;<br/>retain pool inputs, check token fit<br/>HANDOFF · codex to primerl/rustmove"]
     I4["<b>Learnability and input controls</b><br/>cheap features beat full-circuit QA;<br/>test weights beyond visible facts;<br/>vectors real/random/id/permuted<br/>ACTIVE · rustmove, codex"]
-    QAONLY["<b>Outcome-only learning trial</b><br/>22 dev texts: full 65.64%,<br/>summaries off 62.29%, cheap 64.53%;<br/>only 4-field gain: do not scale yet<br/>CHECK · codex · $1.89 spent"]
+    QAONLY["<b>Outcome-only learning trial</b><br/>22 dev texts: trained 65.64%,<br/>summaries off 62.29%, cheap 66.76%;<br/>follow-up control removes the gain<br/>CHECK · codex · $1.89 spent"]
     I5["<b>Complete tool observations</b><br/>candidate pages; 13 tests passed<br/>no teacher-derived input hints<br/>handoff: tool rollout on e1af39b<br/>DONE · codex/eval_recovery"]
     I6["<b>Does the oracle use weights?</b><br/>distinct weight identities fixed;<br/>60 control checks passed (6560772)<br/>handoff: real/random/ID comparisons<br/>rustmove · 00fea89"]
   end
@@ -205,7 +212,7 @@ flowchart BT
     SP2["<b>Teacher throughput</b><br/>influential start: 3 s and $0.0002 per text<br/>(494 texts, $0.11);<br/>block-search teacher: median 3–15 min,<br/>tails past 2 h, $0.14–0.25 per text<br/>ACTIVE · fleet, pymove"]
     SP3["<b>Scorer throughput</b><br/>seconds per RL sample,<br/>target 20 s or less<br/>ACTIVE · inframove, primerl"]
     SP4["<b>GPU use and cost</b><br/>toy teacher runs leave the GPU idle:<br/>they run on the Mac; toy VPD fits<br/>run 2–3 per card; block search needs<br/>86 GB host memory on text9004<br/>ACTIVE · fleet"]
-    SP5["<b>Tests on main</b><br/>goal_eval and engine<br/>suites green · every owner"]
+    SP5["<b>Tests on main</b><br/>wiring and input checks pass;<br/>investigate adversary-batch precision<br/>ACTIVE · codex, every owner"]
   end
 
   %% ===================== later =====================

@@ -540,11 +540,8 @@ PHI_RAW = {"point": "s_point_c", "nodes": "s_nodes_raw", "edges": "s_edges", "fl
 # each family's unfloored score: a row field ending in _raw, else rl_terms' entry (point, edges, flips, patching)
 
 
-def family_score(row: dict, family: str) -> float | None:
-    """A row's score for one of phi's families, floored at 0 (PHI_FAMILIES' keys; flips at FLIP_TERM): the floors,
-    the hard shortfall and the teacher's acceptance read it. phi reads phi_score, the unfloored score with a leaky
-    floor: unbounded, unfloored s_nodes and N reached -4.1 and -2.9 where VPD's own response sat near the no-change
-    bound (the Gate B table 10-13), but the linear share and N's clip now keep them in [-1, 1]."""
+def _floored_score(row: dict, family: str) -> float | None:
+    """A row's floored score for one of phi's families (PHI_FAMILIES' keys; flips at FLIP_TERM)."""
     key = PHI_FAMILIES[family][0]
     if key == "f1_flips_c":
         fc = row.get("f1_flips_c") or {}
@@ -552,14 +549,17 @@ def family_score(row: dict, family: str) -> float | None:
     return row.get(key)
 
 
-def phi_score(row: dict, family: str) -> float | None:
-    """A family's score as phi counts it (the user's 10-13 softening of f5a1df2's floor at 0): the unfloored score
-    (PHI_RAW: the weighted families' linear share and N in [-1, 1], the log-scale ones clipped there), LEAK of it below
-    0, so a family under 0 still ranks answers; family_score's floored score where the row keeps no unfloored one."""
+def family_score(row: dict, family: str) -> float | None:
+    """A row's score for one of phi's families, the one definition phi, the bar, the floors, both shortfalls and the
+    teacher's acceptance read (the user's 10-13 softening of f5a1df2's floor at 0): the unfloored score (PHI_RAW: the
+    weighted families' linear share, each draw counting from -(its gap), and N in [-1, 1], the log-scale ones clipped
+    there), LEAK of it below 0, so a family under 0 still ranks answers; the floored score where the row keeps no
+    unfloored one. A weighted family's score is its raw pool even above 0 (a draw where the circuit is farther than no
+    change counts against it), so floors and shortfalls compare like with like."""
     key = PHI_RAW[family]
     raw = row.get(key) if key.endswith("_raw") else (row.get("rl_terms") or {}).get(key)
     if raw is None:
-        return family_score(row, family)
+        return _floored_score(row, family)
     raw = min(1.0, max(-1.0, float(raw)))
     return raw if raw >= 0 else LEAK * raw
 
@@ -672,7 +672,7 @@ def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: 
 def family_eps(row: dict, only=None) -> dict:
     """eps_<family> for phi (the lead's reward v3): twice the bootstrap standard error of each family's score over its
     draws in the row (EPS_BOOT resamples, a fixed seed: the same from the row alone), at least EPS_FLOOR; a family
-    scored in one run (point, flips) the floor. The floored estimator, as family_score. only: those families alone (the
+    scored in one run (point, flips) the floor. The unfloored estimator clipped to [-1, 1], as family_score reads it. only: those families alone (the
     others' resample indices still drawn: the same eps as with every family)."""
     rng = np.random.default_rng(0)
     out = {}
@@ -685,8 +685,8 @@ def family_eps(row: dict, only=None) -> dict:
         idx = rng.integers(len(draws), size=(EPS_BOOT, len(draws)))  # the same draws as one call per resample
         if only is not None and fam not in only:
             continue
-        got = _pooled_resamples(kind, draws, row.get("kl_empty_live"), False, idx)
-        got = [x for x in got if x is not None]
+        got = _pooled_resamples(kind, draws, row.get("kl_empty_live"), True, idx)
+        got = [min(1.0, max(-1.0, x)) for x in got if x is not None]
         out[fam] = min(EPS_CAP, max(EPS_FLOOR, 2 * float(np.std(got, ddof=1)))) if len(got) > 1 else EPS_FLOOR
     return out
 
@@ -730,20 +730,20 @@ def shortfall(row: dict, floors_: dict) -> float:
 
 def shortfall_soft(row: dict, floors_: dict) -> float:
     """The reward's shortfall (the user's 10-13 softening: a hard max and hinge give one family any gradient):
-    (mean_i softplus_w(f_i - s_i)^4)^(1/4) with w = SHORTFALL_WIDTH, s_i phi's score (phi_score, an unscored family at
+    (mean_i softplus_w(f_i - s_i)^4)^(1/4) with w = SHORTFALL_WIDTH, s_i phi's score (family_score, an unscored family at
     0), a power mean like phi's: every family near or under its floor counts, the worst the most. About 0.014 n^(-1/4)
     per family exactly at its floor, 0.002 per one 0.05 above."""
     if not floors_:
         return 0.0
     w = SHORTFALL_WIDTH
-    sp = [w * float(np.logaddexp(0.0, (f - (phi_score(row, k) or 0.0)) / w)) for k, f in floors_.items()]
+    sp = [w * float(np.logaddexp(0.0, (f - (family_score(row, k) or 0.0)) / w)) for k, f in floors_.items()]
     return float(np.mean([x ** 4 for x in sp])) ** 0.25
 
 
 def circuit_term(row: dict, tau: dict, bits: float | None, quality: float = 0.0, executable_bits: float | None = None) -> dict:
     """Reward v3's circuit part, one function for components.reward and the teacher (circuit_score): term =
     cap_phi(phi) - phi_tau - 4 v + g 2^(-20 v) (0.5 compact + quality) + 0.04 tanh(compact / 2), every piece smooth (the
-    user's 10-13 softening). phi over tau's families (phi_score's leaky floor); v = shortfall_soft against tau's
+    user's 10-13 softening). phi over tau's families (family_score's leaky floor); v = shortfall_soft against tau's
     per-family floors (a single bad family can no longer hide in the power mean: one at 0.45 among ten at 0.95 gave phi
     1.67, above every family at 0.5); g the gate at the bar; compact = log2(bits_start / bits) (None when
     executable_bits, default bits, is 0); the last term an ungated tie-break toward the smaller answer (padding below
@@ -793,7 +793,7 @@ def phi(row: dict, start: float | dict | None = None, families: list | None = No
     fams = families if families is not None else (
         [f for f in PHI_FAMILIES if family_score(start, f) is not None] if isinstance(start, dict) else
         [f for f in PHI_FAMILIES if family_score(row, f) is not None])
-    got = _phi([(0.0 if phi_score(row, f) is None else phi_score(row, f), eps[f]) for f in fams])
+    got = _phi([(0.0 if family_score(row, f) is None else family_score(row, f), eps[f]) for f in fams])
     if isinstance(start, dict):
         return got, _bar(start, fams)
     if start is not None:
@@ -806,7 +806,7 @@ def phi(row: dict, start: float | dict | None = None, families: list | None = No
 def _bar(start: dict, families: list) -> float | None:
     """max(min(phi of the start, every family at 0.9), every family at 0.5), under the start's eps (phi_tau)."""
     se = _eps(start)
-    ps = _phi([(0.0 if phi_score(start, f) is None else phi_score(start, f), se[f]) for f in families])
+    ps = _phi([(0.0 if family_score(start, f) is None else family_score(start, f), se[f]) for f in families])
     at9, at5 = _phi([(0.9, se[f]) for f in families]), _phi([(0.5, se[f]) for f in families])
     if ps is None:
         return at9

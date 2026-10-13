@@ -20,10 +20,10 @@ def test_phi_reads_leaky_scores():
                      **{f"eps_{f}": goal_eval.EPS_FLOOR for f in goal_eval.PHI_FAMILIES}})
     ph = [goal_eval.phi(row)[0] for row in rows]
     assert all(row["s_point_c"] == 0.0 for row in rows) and ph[0] > ph[1] > ph[2]
-    assert goal_eval.phi_score(rows[2], "point") == pytest.approx(-goal_eval.LEAK)  # raw -2, clipped to -1
-    assert goal_eval.phi_score(rows[1], "point") == pytest.approx(goal_eval.LEAK * goal_eval._fid_raw(1.0, 2.0, 0.1))
-    assert goal_eval.phi_score({"s_nodes": 0.0, "s_nodes_raw": -0.4}, "nodes") == pytest.approx(-0.04)
-    assert goal_eval.phi_score({"s_point_c": 0.25}, "point") == 0.25 and goal_eval.phi_score({}, "point") is None
+    assert goal_eval.family_score(rows[2], "point") == pytest.approx(-goal_eval.LEAK)  # raw -2, clipped to -1
+    assert goal_eval.family_score(rows[1], "point") == pytest.approx(goal_eval.LEAK * goal_eval._fid_raw(1.0, 2.0, 0.1))
+    assert goal_eval.family_score({"s_nodes": 0.0, "s_nodes_raw": -0.4}, "nodes") == pytest.approx(-0.04)
+    assert goal_eval.family_score({"s_point_c": 0.25}, "point") == 0.25 and goal_eval.family_score({}, "point") is None
     assert goal_eval.family_score({"s_point_c": 0.25}, "point") == 0.25
     assert goal_eval.family_score({"s_point_c": 0.0, "rl_terms": {"s_point_c": None}}, "point") == 0.0
 
@@ -41,8 +41,8 @@ def test_raw_bootstrap_pooling_retains_variation_below_zero(kind, draws):
     assert a >= b  # (the weighted families' raw score stops at -1: both draws far past the bound)
 
 
-def test_family_noise_is_bootstrapped_from_floored_scores():
-    """eps from the floored estimator: the unfloored score moves phi (leaky) but not eps."""
+def test_family_noise_is_bootstrapped_from_the_score_phi_reads():
+    """eps from the unfloored estimator phi reads (clipped to [-1, 1]); the unfloored score moves phi (leaky)."""
     row = {"s_nodes": 0.0, "draws_nodes": [[0, 2.0, 0.1, 1.0], [1, 100.0, 0.1, 1.0]],
            "kl_empty_live": 1.0}
     assert goal_eval.family_eps(row)["nodes"] == goal_eval.EPS_FLOOR
@@ -121,6 +121,17 @@ def test_floors_and_circuit_term():
     assert goal_eval.circuit_term(row, tau, 0.0)["compact"] is None and goal_eval.circuit_term(row, tau, 0.0)["tie"] == 0.0
 
 
+def test_weighted_score_is_the_raw_pool():
+    """A weighted family's score is its raw pool above 0 too (a draw farther than no change counts against it), and
+    the floors and both shortfalls read the same score: the start sits at its own floors with no shortfall."""
+    draws = [[0, 0.5, 0.2, 2.0], [1, 3.0, 0.4, 2.0]]  # the second draw farther than no change
+    row = {"s_nodes": goal_eval._pooled("weighted", draws, None), "s_nodes_raw": goal_eval._pooled_raw(draws)}
+    assert row["s_nodes_raw"] < row["s_nodes"] and goal_eval.family_score(row, "nodes") == pytest.approx(row["s_nodes_raw"])
+    fl = goal_eval.floors(row, ["nodes"])
+    assert fl["nodes"] == pytest.approx(row["s_nodes_raw"] - goal_eval.FLOOR_MARGIN)
+    assert goal_eval.shortfall(row, fl) == 0.0 and goal_eval.shortfall_soft(row, fl) < 0.002
+
+
 def test_soft_pieces_are_smooth():
     """cap_phi: slope 1 well below the bar + PHI_CAP, PHI_SLOPE well above, its slope continuous between; the soft
     shortfall grows smoothly through a floor; the leaky floor is continuous at 0."""
@@ -133,7 +144,7 @@ def test_soft_pieces_are_smooth():
     fl = {"point": 0.5}
     v = [goal_eval.shortfall_soft({"s_point_c": s}, fl) for s in (0.6, 0.52, 0.5, 0.48, 0.4)]
     assert all(a < b for a, b in zip(v, v[1:])) and v[-1] == pytest.approx(0.1, abs=1e-3)
-    assert goal_eval.phi_score({"s_point_c": 0.0, "rl_terms": {"s_point_c": -1e-9}}, "point") == pytest.approx(0.0, abs=1e-9)
+    assert goal_eval.family_score({"s_point_c": 0.0, "rl_terms": {"s_point_c": -1e-9}}, "point") == pytest.approx(0.0, abs=1e-9)
 
 
 def test_family_kls_report_the_raw_kls():

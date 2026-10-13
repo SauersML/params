@@ -197,6 +197,17 @@
 %% Single209 job19680: free MATS,1L40/4CPU/11GiB/15min, source919bf8; HELD JobHeldUser, no release/retry and no measurements.
 %% Protocol/artifacts: scratch/variable_reward/6025_single209. A pass would support local transport, not English or circuit closure.
 %% This held measurement has no dependency edge to training-data plumbing, offline audits, wiring work or other teams' jobs.
+%% Current claim inventory:45 distinct permitted TRAIN tasks,970 textual checks across103 files (copies counted),
+%% no original numeric execution records; only6025's existing7-check/3-label artifact passes proof-bound supervision.
+%% Recovery freezes15 other tasks,194 original proposals and exact archived task/circuit/carrier hashes; no new labels yet.
+%% Re-execute these proposals on their original carriers, retain numeric outcomes and all failures; avoid new search/writer calls.
+%% Recovery bundle: scratch/variable_reward/claim_recovery;194 parser/binding checks and5 mocked contracts pass.
+%% Paid execution awaits current own-ledger/live-reservation reconciliation under the user-authorized shared40 allowance.
+%% 6cb561c prevents RULES OUT rewordings/alternative swaps from multiplying credit for the same executed prediction.
+%% Regression reproduced the duplicate execution;61 semantic tests now pass. Free prose is still not certified.
+%% Wiring experiment: old checkpoint is needed only to reproduce that run. A NEW shared frozen SFT start unblocks
+%% an independent matched unit_suff vs wiring_suff training comparison; same seeds/data/budget, SHOW_ACTIVE=0.
+%% Preparing a bounded free-GHA Smol135M run; reused toy families/splits are development evidence, never a pristine test.
 %% No new generation, no verified raw-weight-use claim, no complete policy-visible-text provenance or fresh-input claim.
 %% Explicitly requested replay runs independently of unrelated CI failures; preserve both measurement and failed status.
 %% ad865a3 uses SciPy for exact toy SVD on Mac only; per-head weight reconstruction passes, Linux backend unchanged.
@@ -295,7 +306,8 @@ flowchart BT
   ENGP["<b>Fresh carrier tests</b><br/>209 effects carried;181 unsupported;<br/>3 of7 claims verified for training;<br/>two-input mechanism not established<br/>DONE · codex/variable_reward"]
   ENG209["<b>Does the 209 carrier generalize?</b><br/>32 fresh donors × 3 input positions;<br/>test cause, isolation and worst cases;<br/>free MATS 19680 held; no release<br/>WAITING · codex/variable_reward"]
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
-  WIRING["<b>Learn executable relations</b><br/>matched unit vs wiring rewards ready;<br/>next: same-budget RL on same start;<br/>original checkpoint and data needed<br/>WAITING for artifact · codex, toyloop"]
+  CLAIMREC["<b>Diversify checked claims</b><br/>15 training tasks, 194 proposals;<br/>re-execute exact original carriers;<br/>keep failures and numeric proof<br/>PREPARING · codex/variable_reward"]
+  WIRING["<b>Learn executable relations</b><br/>new shared frozen SFT start;<br/>matched unit vs wiring RL rewards;<br/>measure learned edges at fixed cost<br/>PREPARING free GHA · codex/eval_recovery"]
 
   subgraph BASE["FOUNDATIONS"]
     VPD["<b>VPD of vpd4l</b><br/>38,912 rank-one<br/>subcomponents<br/>DONE"]
@@ -383,6 +395,8 @@ flowchart BT
   ENGP -- frozen carrier --> ENG209
   ENG209 -. carrier evidence only .-> C2
   CLAIMDATA -- verified claims only --> SUP
+  VAR -. existing proposals .-> CLAIMREC
+  CLAIMREC -- newly executed claims --> SUP
   ENG --> TOOLS
   T1 -. available circuits .-> TOOLS
   T4 -. new circuits .-> TOOLS
@@ -459,7 +473,7 @@ flowchart BT
   class I3,S2,SUP,LAT1,W6 check
   class S1READY check
   class QAONLY check
-  class WIRING waiting
+  class WIRING,CLAIMREC active
   class CLAIMDATA done
   class ENGP done
   class S1AUDIT done

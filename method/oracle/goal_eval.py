@@ -2973,6 +2973,7 @@ class GoalEval:
 
     NODE_ENTRIES = 1 << 27  # _node_family's rows a batch: this many floats in its widest activations and masks
     NEC_ENTRIES = 1 << 27  # _removed_kl_on's rows a run: this many floats in its widest activations (sets x T x C)
+    NEC_ENGINES = 3  # necessity_spec's removal engines kept on a text (VPD's, a teacher's start's, the latest)
 
     def _removal_engine(self, ids: list[int], targets: list[int], sets: list[dict]):
         """An engine on ids over the sets' subcomponents with every other one on (outside "on"; Engine.on moves it to
@@ -3010,6 +3011,32 @@ class GoalEval:
         native.free(nat.dev)
         return kls
 
+    @torch.no_grad()
+    def _removed_kl_many(self, es: list, M: dict) -> list[list[float]]:
+        """_removed_kl_on on several texts at once (necessity's controls): es, one removal engine moved to texts of one
+        length and targets (Engine.on), M the sets on its columns; per text the sets' KLs from its model, in runs of
+        several texts (Engine.log_probs_on)."""
+        nat, e0 = self.nat, es[0]
+        S = next(iter(M.values())).shape[0]
+        hit = torch.zeros(e0.T, dtype=torch.bool, device=nat.dev)
+        for m in M.values():
+            hit |= m.any(2).any(0)
+        first = int(hit.nonzero().min()) if bool(hit.any()) else e0.T
+        start = min(first, min(e0.targets))
+        rows = max(1, self.NEC_ENTRIES // ((e0.T - start) * max(nat.C.values())))  # (text, set) rows a run
+        per, step = (rows // S, S) if rows >= S else (1, rows)  # texts a run, each with every set; or one in slices
+        out = [[] for _ in es]
+        for j0 in range(0, len(es), per):
+            grp = es[j0:j0 + per]
+            for s0 in range(0, S, step):
+                masks = {n: 1.0 - m[s0:s0 + step].float() for n, m in M.items()}
+                k = next(iter(masks.values())).shape[0]
+                ref = torch.cat([e.ref.expand(k, -1, -1) for e in grp])
+                for j, row in enumerate(carry.kl(ref, e0.log_probs_on(grp, masks, start)).view(len(grp), k).tolist()):
+                    out[j0 + j] += row
+        native.free(nat.dev)
+        return out
+
     def necessity_spec(self, tx: Text, graphs: list[native.Graph], split: str = "eval", controls: int = NEC_CONTROLS,
                        background: bool = True) -> list[dict]:
         """N, phi's necessity (the user's spec, the lead's 10-12: without the circuit's parts the real system breaks,
@@ -3041,22 +3068,30 @@ class GoalEval:
         ys = [pool[i][1] for i in np.random.default_rng([int(tx.seed), 13]).permutation(len(pool))[:controls]]
 
         def damages(cols, M):  # [D_t per set, per control [D_c per set]] of the sets M ({site: bool [sets, T, K]} over
-            key_e = tuple(tuple(c.tolist()) for c in cols.values())  # cols): one engine, moved to each control
-            kept = tx.__dict__.setdefault("_nec_engines", {})        # (Engine.on), kept on tx for the same columns (a
-            if key_e not in kept:                                    # teacher's candidates share them: no remaking of
-                kept.clear()                                         # each control's run before the circuit)
-                kept[key_e] = (engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on"), {})
-            E, ons = kept[key_e]
+            kept = tx.__dict__.setdefault("_nec_engines", [])  # cols) on one engine moved to each control (Engine.on): the
+            for j, x in enumerate(kept):  # latest NEC_ENGINES kept on tx, one whose columns hold cols reused (a teacher's
+                if all(bool(torch.isin(cols[n], x[0][n]).all()) for n in cols):  # candidates, subsets of its start: no
+                    kept.append(kept.pop(j))                                      # remaking of each control's run before
+                    break                                                         # the circuit)
+            else:
+                kept.append((cols, engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on"), {}))
+                del kept[:-self.NEC_ENGINES]
+            ce, E, ons = kept[-1]
+            M = {n: m if ce[n] is cols[n] else m.new_zeros(*m.shape[:2], len(ce[n])).index_copy_(2, torch.searchsorted(ce[n], cols[n]), m)
+                 for n, m in M.items()}  # the sets on E's columns
             if keep is not None:
-                M = {n: m & ~keep[n][:, cols[n]][None] for n, m in M.items()}
-            dc = []
+                M = {n: m & ~keep[n][:, ce[n]][None] for n, m in M.items()}
+            groups = {}  # the controls by their shift (one length and targets: one run of them, _removed_kl_many)
             for y in ys:
-                y = list(y[:last + 1])
+                y = tuple(y[:last + 1])
                 d = last + 1 - len(y)  # the shift
-                if tuple(y) not in ons:
-                    ons[tuple(y)] = E.on(y, [t - d for t in tx.targets if t >= d])
-                dc.append(self._removed_kl_on(ons[tuple(y)], {n: m[:, d:last + 1] for n, m in M.items()}))
-            return self._removed_kl_on(E, M, tx.ref), dc
+                if y not in ons:
+                    ons[y] = E.on(list(y), [t - d for t in tx.targets if t >= d])
+                groups.setdefault(d, []).append(y)
+            got = {}
+            for d, yl in groups.items():
+                got.update(zip(yl, self._removed_kl_many([ons[y] for y in yl], {n: m[:, d:last + 1] for n, m in M.items()})))
+            return self._removed_kl_on(E, M, tx.ref), [got[tuple(y[:last + 1])] for y in ys]
         key = ("nec_vpd", last, tuple(tuple(y) for y in ys), background)  # VPD's damages on these controls: every graph's on the text
         if key not in tx.__dict__:
             vc = {n: tx.vpd[n].any(0).nonzero().flatten() for n in nat.names}

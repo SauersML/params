@@ -344,6 +344,30 @@ def test_runs_from_a_position_reuse_the_base():
             assert rel(carry.kl(ref, want), carry.kl(ref, got[2 * d:2 * d + 2])) < REL, d
 
 
+def test_runs_on_several_texts_at_once():
+    """log_probs_on: one removal engine (outside "on") moved to several texts of one length runs them all at once, each
+    text's rows its masks' run from start (and from position 0) on that text's own engine."""
+    nat = native.Native(DEVICE)
+    texts = [native.text(TEXT.parent / f"text{k}.json")[0] for k in (9000, 9002, 9016)]
+    L = min(len(x) for x in texts)
+    texts = [x[:L] for x in texts]
+    targets = [L - 3, L - 1]
+    g = torch.Generator().manual_seed(4)
+    cols = {n: torch.randperm(nat.C[n], generator=g)[:24].sort().values for n in nat.names}
+    E = engine.Engine(nat, texts[0], targets, live=True, columns=cols, outside="on")
+    es = [E.on(x, targets) for x in texts]
+    masks = {n: (torch.rand(3, L, 24, generator=g) < 0.6).float().to(nat.dev) for n in nat.names}
+    for start in (L // 2, 0):
+        if start:
+            for n in masks:
+                masks[n][:, :start] = 1.0
+        with torch.no_grad():
+            got = E.log_probs_on(es, masks, start)
+            for j, e in enumerate(es):
+                want = e.log_probs(masks, start=start) if start else e.log_probs(masks)
+                assert rel(carry.kl(e.ref.expand(3, -1, -1), want), carry.kl(e.ref.expand(3, -1, -1), got[3 * j:3 * j + 3])) < REL
+
+
 def test_read_and_norm_strengths():
     """ewn and own, a connection's strength in its reader's RMSNorm scale apart from its read: given equal to ew and ow
     they are the run without them; a connection at 0 in both is the plain cut; the strongest residual reader's and

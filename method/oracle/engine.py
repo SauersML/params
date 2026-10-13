@@ -294,6 +294,38 @@ class Engine:
             x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, cut[name("c_fc")])), cut[name("down_proj")])
         return norm(x, -1)[:, self._targets - start]
 
+    def log_probs_on(self, texts: list, masks: dict, start: int) -> torch.Tensor:
+        """log_probs(masks, start=start) of this engine's columns on several texts at once [len(texts) S, len(targets),
+        V]: texts, this engine moved to each (Engine.on), all of one length and one targets; rows text-major, each
+        text's S rows those of masks ({site: [S, T or 1, K]}), every mask 1 before start (float32; goal_eval's N on its
+        control texts: one run in place of one per text)."""
+        e0 = texts[0]
+        if any(e.T != e0.T or e.targets != e0.targets for e in texts) or not 0 <= start <= min(e0.targets):
+            raise ValueError("texts of one length and targets, start no later than the first target")
+        tg, T, H, hd = self.tg, e0.T, self.H, self.hd
+        S, E = next(iter(masks.values())).shape[0], len(texts)
+        B, Tn = E * S, T - start
+        causal = torch.arange(T, device=self.dev)[None, :] <= torch.arange(start, T, device=self.dev)[:, None]  # [Tn, T]
+        with _precision("score", self.dev), self._dtype("score"):
+            norm, act = self._steps(False)
+            pre = [e._prefix() for e in texts] if start else None
+            cut = {n: (m[:, start:] if m.shape[1] > 1 else m).repeat(E, 1, 1) for n, m in masks.items()}
+            x = torch.cat([e.emb[:, start:] for e in texts]).repeat_interleave(S, 0)
+            for i in range(tg.n_layer):
+                name = lambda k: native.site_name(i, k)  # noqa: E731
+                h = norm(x, 2 * i)
+                q, k, v = (self._site(name(kd), h, cut[name(kd)]).view(B, Tn, H, hd).transpose(1, 2) for kd in ("q_proj", "k_proj", "v_proj"))
+                q, k = tg._rope_from(q, start, T).to(v.dtype), tg._rope_from(k, start, T).to(v.dtype)
+                if start:
+                    k = torch.cat([torch.cat([p[i][0][:, :, :start] for p in pre]).repeat_interleave(S, 0), k], 2)
+                    v = torch.cat([torch.cat([p[i][1][:, :, :start] for p in pre]).repeat_interleave(S, 0), v], 2)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=causal)
+                x = x + self._site(name("o_proj"), y.transpose(1, 2).reshape(B, Tn, -1), cut[name("o_proj")])
+                h = norm(x, 2 * i + 1)
+                x = x + self._site(name("down_proj"), act(self._site(name("c_fc"), h, cut[name("c_fc")])), cut[name("down_proj")])
+            h = norm(x, -1)[:, e0._targets - start]
+        return torch.log_softmax(self.tg.unembed(h.float()), -1)
+
     def _last(self, masks, x, h, name, norm, act, B):
         """The last layer at the targets: keys and values at every position, the rest at the targets."""
         tg, T, H, hd, sel = self.tg, self.T, self.H, self.hd, self._targets
@@ -996,17 +1028,21 @@ class Engine:
             if out is None:
                 out = torch.zeros(B, Tn, site.W.shape[0], device=dev)
             sub, blk = hs
-            if sub is not None:  # a held activation: its write at the held value in place of the computed one
+            if sub is not None and len(sub[2]):  # a held activation: its write at the held value in place of the computed one
                 rb, tt, c, v = sub
                 tt = tt - s
-                Vc = site.V[:, c].T
-                now = (hx[tt] * Vc).sum(-1)  # x's
+                step = max(1, PP_ENTRIES // max(site.V.shape[0], site.U.shape[1]))  # entries at once ([entries, d] products)
+                now = torch.cat([(hx[tt[a:a + step]] * site.V[:, c[a:a + step]].T).sum(-1) for a in range(0, len(c), step)])  # x's
                 if st is not None and da is not None:
                     ci = cp[c]
                     now = now + torch.where(ci >= 0, da[rb, tt, ci.clamp(min=0)], 0.0)
                 if st is not None and bm is not None:
-                    now = now + bmr[rb, tt] * ((hP[rb, tt] - hx[tt]) * Vc).sum(-1)
-                out = out.index_put((rb, tt), (v - now)[:, None] * site.U[c], accumulate=True)
+                    now = now + torch.cat([bmr[rb[a:a + step], tt[a:a + step]] * ((hP[rb[a:a + step], tt[a:a + step]] - hx[tt[a:a + step]])
+                                                                                  * site.V[:, c[a:a + step]].T).sum(-1)
+                                           for a in range(0, len(c), step)])
+                for a in range(0, len(c), step):
+                    out = out.index_put((rb[a:a + step], tt[a:a + step]), (v[a:a + step] - now[a:a + step])[:, None] * site.U[c[a:a + step]],
+                                        accumulate=True)
             if blk is not None:  # a held block: the site's whole output there
                 rb, tt, _, v = blk
                 out = out.index_put((rb, tt - s), v - xr["so"][n][tt])

@@ -132,7 +132,8 @@ def test_training_seed_controls_initialization_and_sampled_completions(monkeypat
     monkeypatch.setattr(train, "token_logps", lambda model, ids, att, comp: (model.weight.expand(len(ids), 1), comp))
     monkeypatch.setattr(train, "save", lambda *a: None)
     args = SimpleNamespace(data="mock", truth=None, seed=11, steps=1, batch=1, lr=.001,
-                           max_len=4, log_every=1, eval=0, out="unused", reward="mock", beta=0, k=2, std=False)
+                           max_len=4, log_every=1, eval=0, out="unused", reward="mock", beta=0, k=2, std=False,
+                           save_every=0, minutes=0)
     train.sft(args); train.sft(args)
     assert torch.equal(initialized[0], initialized[1])
     train.rl(args); train.rl(args)

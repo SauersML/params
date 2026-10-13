@@ -96,23 +96,18 @@ def test_oracle_runs_reproduce_the_model(norm):
 
 
 def mib_reference(L=2, H=2, truth=()):
-    """A reference graph in MIB's form (EAP-IG's Graph.to_json: every edge from a node into a later node's input, a head's
-    query, key and value inputs apart)."""
-    fwd = ["input"] + [x for i in range(L) for x in [f"a{i}.h{h}" for h in range(H)] + [f"m{i}"]]
-    layer = lambda x: -1 if x == "input" else int(x[1:].split(".")[0])  # noqa: E731
-    edges = {}
-    for a in fwd:
-        for i in range(L):
-            for h in range(H):
-                if layer(a) < i:
-                    for q in "qkv":
-                        edges[f"{a}->a{i}.h{h}<{q}>"] = {"in_graph": False}
-            if layer(a) < i or (layer(a) == i and a.startswith("a")):
-                edges[f"{a}->m{i}"] = {"in_graph": False}
-        edges[f"{a}->logits"] = {"in_graph": False}
-    for e in truth:
-        edges[e]["in_graph"] = True
-    return {"edges": edges}
+    """A reference graph in MIB's form (EAP-IG's Graph.to_json: its edges with in_graph flags, the model's shape)."""
+    cfg = {"n_layers": L, "n_heads": H, "parallel_attn_mlp": False}
+    return {"cfg": cfg, "edges": {e: {"in_graph": e in truth} for e in interpbench.mib_graph_edges(cfg)}}
+
+
+def test_mib_graph_edges():
+    """EAP-IG's edge set and order for MIB's InterpBench shape (6 layers, 4 heads; its published importances): 1108 edges,
+    the input into layer 0's queries, keys and values first, the last MLP into the logits last."""
+    E = interpbench.mib_graph_edges({"n_layers": 6, "n_heads": 4, "parallel_attn_mlp": False})
+    assert len(E) == len(set(E)) == 1108
+    assert E[:4] == ["input->a0.h0<q>", "input->a0.h0<k>", "input->a0.h0<v>", "input->a0.h1<q>"]
+    assert E[12:14] == ["input->m0", "a0.h0->m0"] and E[-1] == "m5->logits"
 
 
 def test_mib_auroc_ranks():

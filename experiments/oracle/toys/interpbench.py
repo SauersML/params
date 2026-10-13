@@ -352,22 +352,42 @@ def mib_edges(nat, circ: dict, targets: list[int]) -> set:
     return {x for x in (mib_edge(nat, w, r) for w, r in pairs) if x is not None}
 
 
+def mib_graph_edges(cfg: dict) -> list[str]:
+    """Every edge of EAP-IG's graph for a model (Graph.from_model, its insertion order, which breaks apply_greedy's ties):
+    from the input and each earlier node into each head's query, key and value inputs, into each MLP (a layer's heads
+    before its MLP unless parallel_attn_mlp) and into the logits."""
+    out, stream = [], ["input"]
+    for i in range(cfg["n_layers"]):
+        heads = [f"a{i}.h{h}" for h in range(cfg["n_heads"])]
+        out += [f"{a}->{b}<{q}>" for a in stream for b in heads for q in "qkv"]
+        if not cfg.get("parallel_attn_mlp"):
+            stream = stream + heads
+        out += [f"{a}->m{i}" for a in stream]
+        stream = stream + (heads if cfg.get("parallel_attn_mlp") else []) + [f"m{i}"]
+    return out + [f"{a}->logits" for a in stream]
+
+
 def mib_auroc(reference: dict, score: dict) -> dict:
     """Edge scores (MIB edge name -> score; absent: 0) against MIB's reference graph: "mib", the circuit track's area
-    under the ROC (evaluation.evaluate_area_under_roc: EAP-IG's apply_greedy at 0.1% ... 100% of the edges, absolute
-    scores, from the logits up, then prune; print_results.area_under_curve's trapezoids over FPR / its last value), and
-    "plain", the AUROC over every edge (ties count half)."""
+    under the ROC (evaluation.evaluate_area_under_roc: EAP-IG's apply_greedy over the model's whole graph, mib_graph_edges,
+    at 0.1% ... 100% of its edges, absolute float32 scores, from the logits up, then prune; true and false positives over
+    every edge, the reference's Graph.from_json holding the edges its file leaves out, a layer's heads into its own MLP, as
+    negatives; print_results.area_under_curve's trapezoids over FPR / its last value), and "plain", the AUROC over every
+    edge (ties count half). MIB's own code on random controls (scores uniform in [-1, 1]) and on its published example
+    importances agrees to 0.03; the random control varies widely with its seed, 7 true edges of 1108 (the paper's 0.44
+    is a mean over 3 seeds)."""
     import heapq
     import math
 
-    edges = list(reference["edges"])
+    edges = mib_graph_edges(reference["cfg"])
     truth = {e for e, v in reference["edges"].items() if v["in_graph"]}
+    s32 = dict(zip(edges, torch.tensor([float(score.get(e, 0.0)) for e in edges], dtype=torch.float32).abs().tolist()))
     parent = {e: e.split("->")[0] for e in edges}
     child = {e: re.sub(r"<[qkv]>$", "", e.split("->")[1]) for e in edges}
     into = {}
     for e in edges:
         into.setdefault(child[e], []).append(e)
-    key = lambda e: abs(score.get(e, 0.0))  # noqa: E731
+    key = s32.__getitem__
 
     def greedy(n: int) -> set:
         nodes, chosen = {"logits"}, set()
@@ -389,9 +409,8 @@ def mib_auroc(reference: dict, score: dict) -> dict:
     tpr, fpr = [], []
     for pct in (.001, .002, .005, .01, .02, .05, .1, .2, .5, 1):
         got = greedy(math.ceil(pct * len(edges)))
-        tp, fp = len(got & truth), len(got - truth)
-        tpr.append(tp / len(truth))
-        fpr.append(fp / (len(edges) - len(truth)))
+        tpr.append(len(got & truth) / len(truth))
+        fpr.append(len(got - truth) / (len(edges) - len(truth)))
     mib = sum((fpr[i + 1] - fpr[i]) / fpr[-1] * (tpr[i + 1] + tpr[i]) / 2 for i in range(len(fpr) - 1))
     pos = [score.get(e, 0.0) for e in edges if e in truth]
     neg = [score.get(e, 0.0) for e in edges if e not in truth]

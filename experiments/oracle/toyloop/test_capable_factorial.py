@@ -62,6 +62,12 @@ class ProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'archived base'): self.prepare()
 
     def test_mock_sdk_common_state_full_schedule_and_paid_parse_failure(self):
+        self._mock_run()
+
+    def test_optimizer_submission_failure_drains_paid_forward_without_retry(self):
+        self._mock_run(fail_submission=True)
+
+    def _mock_run(self, fail_submission=False):
         import capable_wiring as pilot
         import relation_loss
         events=[]
@@ -78,7 +84,10 @@ class ProtocolTest(unittest.TestCase):
             def get_info(self): return SimpleNamespace(model_dump=lambda **kw:{'is_lora':True,'lora_rank':32,'model_data':{'model_name':pilot.MODEL}})
             def save_state(self,name): events.append(('save',name)); return future(SimpleNamespace(path='shared-init' if 'init' in name else name))
             def forward_backward(self,data,**kw): events.append(('fb',len(data))); return future(None)
-            def optim_step(self,*args): events.append(('op',)); return future(None)
+            def optim_step(self,*args):
+                events.append(('op',))
+                if fail_submission: raise RuntimeError('optimizer submission failed')
+                return future(None)
             def save_weights_and_get_sampling_client(self): return self
             def sample(self,**kw): return future(SimpleNamespace(prompt_cache_hit_tokens=0,sequences=[SimpleNamespace(tokens=[1],stop_reason='stop')]))
         class Service:
@@ -93,9 +102,20 @@ class ProtocolTest(unittest.TestCase):
         def changed(d,completion,tokenizer,multiplier):
             return d,{'supervised_tokens':1,'old_total_mass':1.,'stored_total_mass':1.}
         with patch.dict('os.environ',{'TINKER_PROJECT_ID':cf.PROJECT}), patch.dict(sys.modules,{'tinker':fake,'tinker_cookbook.renderers':SimpleNamespace(get_text_content=lambda x:x)}), patch.object(pilot,'renderer',return_value=(rr,None)), patch.object(pilot,'datum',side_effect=lambda row,renderer:SimpleNamespace(model_input=SimpleNamespace(length=1))), patch.object(pilot,'generation_prompt',return_value=SimpleNamespace(length=1)), patch.object(relation_loss,'apply_to_datum',side_effect=changed), patch('importlib.metadata.version',return_value='test'):
-            cf.run(self.root/'out',destination,tok,m['cost_upper_usd'])
+            if fail_submission:
+                with self.assertRaisesRegex(RuntimeError,'optimizer submission'):
+                    cf.run(self.root/'out',destination,tok,m['cost_upper_usd'])
+            else:
+                cf.run(self.root/'out',destination,tok,m['cost_upper_usd'])
         self.assertEqual(events.count(('init',0)),1)
         self.assertEqual(events.count(('clone','shared-init')),4)
+        if fail_submission:
+            self.assertEqual(sum(e[0]=='fb' for e in events),1)
+            self.assertEqual(sum(e[0]=='op' for e in events),1)
+            paid=[json.loads(x) for x in (destination/'spend.jsonl').read_text().splitlines()]
+            self.assertEqual(len(paid),1); self.assertEqual(paid[0]['trained'],8)
+            self.assertFalse((destination/'complete.json').exists())
+            return
         self.assertEqual(sum(e[0]=='fb' for e in events),256)
         self.assertEqual(sum(e[0]=='op' for e in events),256)
         self.assertEqual(len((destination/'steps.jsonl').read_text().splitlines()),256)

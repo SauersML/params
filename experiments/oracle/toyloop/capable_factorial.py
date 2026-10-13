@@ -9,6 +9,7 @@ Preparation is offline; paid run requires the root's separate authorization.
 from __future__ import annotations
 import hashlib
 import json
+import math
 from pathlib import Path
 
 CORE_SHA = '98ebba8b9e874d3c96f6bc1af64a4624b3f088fbf726e84eb99a83dcfcc965ee'
@@ -51,7 +52,9 @@ def prepare(root, panel, base_samples, protocol, out):
         if len({r['id'] for r in rows}) != 256 or [r['id'] for r in rows] != [s['id'] for s in stats]:
             raise ValueError('token fit does not bind ordered256 distinct rows')
         for s in stats:
-            if (not 0 < s['supervised_tokens'] <= 416 or not 0 < s['pair_tokens'] <= 32768
+            if (not all(math.isfinite(s[k]) for k in ('old_total_mass', 'stored_total_mass'))
+                    or not s['old_total_mass'] > 0
+                    or not 0 < s['supervised_tokens'] <= 416 or not 0 < s['pair_tokens'] <= 32768
                     or abs(s['old_total_mass'] - s['stored_total_mass']) > 1e-6 * s['old_total_mass']):
                 raise ValueError('stored supervision/fit invalid')
         evidence = [e for e in build['augmentation'] if e['family'] == family]
@@ -60,7 +63,8 @@ def prepare(root, panel, base_samples, protocol, out):
         for e in evidence:
             if not all(digest(root / p) == h for p, h in e['files'].items()):
                 raise ValueError('physical teacher artifact changed')
-            if max(r['kl_bits'] for r in e['teacher_score']['per_text']) > 1e-3:
+            measured = [r['kl_bits'] for r in e['teacher_score']['per_text']]
+            if not measured or any(not math.isfinite(x) or not 0 <= x <= 1e-3 for x in measured):
                 raise ValueError('physical teacher exceeds frozen tolerance')
         batches = pilot.schedule(256, 2, 8, 0)
         train_tokens = sum(stats[i]['pair_tokens'] for batch in batches for i in batch)
@@ -173,7 +177,8 @@ def run(manifest_path, out, tokenizer_path, cap):
         if usd > reservation + 1e-12:
             raise ValueError('provider charge exceeds reserved call')
         reserved -= reservation; spend += usd
-        record('spend.jsonl', {'kind': kind, **tokens, 'usd': usd, 'total_usd': spend})
+        record('spend.jsonl', {'kind': kind, **tokens, 'usd': usd, 'total_usd': spend,
+                              'released_reservation_usd': reservation, 'remaining_reserved_usd': reserved})
 
     initial = service.create_lora_training_client(base_model=pilot.MODEL, rank=32, seed=0)
     initial_state = initial.save_state('factorial-common-seed0-init').result().path
@@ -190,17 +195,24 @@ def run(manifest_path, out, tokenizer_path, cap):
             raise ValueError('provider model/rank contract differs')
     # Reserve each call before dispatch. Four independent streams overlap one update round.
     for step, batch in enumerate(batches):
-        pending = []
+        pending, errors = [], []
         for cell, client in clients.items():
             family, multiplier = cell; name = f'{family}_m{multiplier}'
             selected = [data[cell][i] for i in batch]
             tokens = {'trained': sum(d.model_input.length for d in selected)}
-            reservation = reserve(name + '_sft', tokens)
-            fb = client.forward_backward(selected, loss_fn='cross_entropy')
-            op = client.optim_step(tinker.AdamParams(learning_rate=pilot.LR * (1 - step / 64), beta1=.9, beta2=.95, eps=1e-8))
-            pending.append((name, family, fb, op, tokens, reservation))
-        errors = []
+            try:
+                reservation = reserve(name + '_sft', tokens)
+                fb = client.forward_backward(selected, loss_fn='cross_entropy')
+                pending.append((name, family, fb, None, tokens, reservation))
+                op = client.optim_step(tinker.AdamParams(learning_rate=pilot.LR * (1 - step / 64), beta1=.9, beta2=.95, eps=1e-8))
+                pending[-1] = (name, family, fb, op, tokens, reservation)
+            except Exception as exc:
+                errors.append(exc)
+                record('errors.jsonl', {'cell': name, 'step': step, 'stage': 'submission', 'error_type': type(exc).__name__})
+                break  # Drain every submitted forward even when optimizer submission failed.
         for name, family, fb, op, tokens, reservation in pending:
+            if op is None:
+                continue
             try:
                 fb.result(); settle(name + '_sft', tokens, reservation)
             except Exception as exc:
@@ -211,6 +223,7 @@ def run(manifest_path, out, tokenizer_path, cap):
             except Exception as exc:
                 errors.append(exc)
         if errors:
+            record('errors.jsonl', {'stage': 'drained_round', 'step': step, 'remaining_reserved_usd': reserved})
             raise errors[0]  # Unsettled reservations remain visible; never retry paid calls.
     params = tinker.SamplingParams(max_tokens=416, temperature=0., stop=rr.get_stop_sequences())
     for cell, client in clients.items():
@@ -237,3 +250,21 @@ def run(manifest_path, out, tokenizer_path, cap):
                 raw.update(completion=None, parse_error=type(exc).__name__ + ': ' + str(exc))
             record(name + '.jsonl', raw)
     (out / 'complete.json').write_text(json.dumps({'actual_usd': spend, 'reserved_usd': reserved, 'upper_usd': upper}))
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    preflight = commands.add_parser('prepare')
+    for argument in ('root', 'panel', 'base-samples', 'protocol', 'out'):
+        preflight.add_argument('--' + argument, required=True)
+    paid = commands.add_parser('run')
+    for argument in ('manifest', 'out', 'tokenizer'):
+        paid.add_argument('--' + argument, required=True)
+    paid.add_argument('--cap', type=float, required=True)
+    args = parser.parse_args()
+    if args.command == 'prepare':
+        print(json.dumps(prepare(args.root, args.panel, args.base_samples, args.protocol, args.out)))
+    else:
+        run(args.manifest, args.out, args.tokenizer, args.cap)

@@ -46,7 +46,8 @@ jobs:
       - name: Check weight-use, intervention, English and data controls
         run: |
           python -m pytest method/oracle/rl/test_inject.py method/oracle/test_intervention_panel.py \
-            method/oracle/test_reward_gate.py method/oracle/test_semantic.py method/oracle/test_task_data.py -q --tb=short
+            method/oracle/test_reward_gate.py method/oracle/test_semantic.py method/oracle/test_task_data.py \
+            method/oracle/test_tools_env.py::test_baselines_include_empty_and_same_batch_calibration -q --tb=short
 
       - name: Run the graph oracle's tests
         env:

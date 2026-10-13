@@ -182,6 +182,68 @@ def test_drafts_through_episode(env):
     assert ep.expand("CIRCUIT: d42\nEXPLANATION: x") == "CIRCUIT: d42\nEXPLANATION: x"
 
 
+def test_baselines_include_empty_and_same_batch_calibration(_unused_env=None):
+    """One fake fidelity batch supplies empty control, reference, KL and exact score; no model/tau call."""
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    site = native.site_name(0, "down_proj")
+    nodes = [(site, 1, 0), (site, 1, 1)]
+    start = native.Graph(nodes, complete=True)
+    tx = SimpleNamespace(ids=[2, 3], targets=[1], T=2, vpd={site: torch.ones(2, 2, dtype=torch.bool)},
+                         ci={site: torch.ones(2, 2)}, rec={site: torch.ones(1, 2, 2)})
+    nat = SimpleNamespace(C={site: 2}, positions=lambda targets: 2, _vpd_order=lambda ids, targets: nodes)
+    calls = []
+
+    def fidelity(got_tx, graphs, pool, *, mode, split):
+        calls.append(graphs)
+        assert got_tx is tx and mode == "reward" and split == "eval" and pool == {}
+        assert len(graphs) == 6 and not graphs[1].complete and graphs[1].count() == 0
+        assert not getattr(graphs[1], "tok_out", []) and not getattr(graphs[1], "tok_edges", [])
+        parsed_empty = components.parse(components.render({"nodes": [], "edges": []}))
+        actual_empty, _ = goal_eval.circuit(parsed_empty["answer"], tx.targets, nat.C, tx.T)
+        assert actual_empty.complete == graphs[1].complete and actual_empty.node_set() == graphs[1].node_set()
+        return [{"s_point_c": .8 if g.count() == 2 else .6 if g.count() else 0.,
+                 "kl_point": 2. if g.count() else 9., "kl_empty_live": 9., "kl_vpd_live": .1,
+                 "eps_point": .005, "eps_N": .025, "draws_n_spec": []} for g in graphs]
+
+    def no_tau(*args, **kwargs):
+        raise AssertionError("baseline threshold must use its existing start row")
+
+    ge = SimpleNamespace(nat=nat, start_set=lambda tx, split: {"graph": start}, fidelity=fidelity, tau=no_tau)
+    fake = SimpleNamespace(ge=ge, score_split="eval", pool={}, text_tools=lambda tid: SimpleNamespace(tx=tx))
+    expanded = components.render({"nodes": [[site, 0, 1]], "edges": [], "complete": True})
+    episode = {"task": "text9000", "answer": "CIRCUIT: d1", "answer_expanded": expanded,
+               "start": {"phi_tau": -99., "bits": 1.}}
+    with TemporaryDirectory() as tmp, patch.object(goal_eval, "size_bits", lambda g, *a, **k: g.count() * 20.), \
+            patch.object(components, "NODE_CAP", 1):
+        episodes, output = Path(tmp) / "episodes.jsonl", Path(tmp) / "baseline.jsonl"
+        episodes.write_text(json.dumps(episode) + "\n")
+        rows = tools_env.baselines(fake, episodes, output, log=lambda *a, **k: None)
+        assert len(calls) == 1
+        row = rows[0]
+        assert json.loads(output.read_text()) == row
+        assert row["task"] == "text9000" and row["score_split"] == "eval" and row["k"] == 1
+        assert row["threshold_source"] == "same_batch_start" and row["bits_start"] == 40.
+        assert math.isclose(row["phi_tau"], -math.log2(.205), abs_tol=1e-12)
+        assert len(row["source_sha256"]["tools_env.py"]) == len(row["episode_sha256"]) == 64
+        empty = row["empty"]
+        assert empty["bits"] == 0. and empty["compact"] is None and empty["kl_point"] == 9.
+        assert empty["complete"] is False and empty["tok_out"] == []
+        assert empty["circuit_reward_qa_free_d0"] == empty["phi"]
+        assert "nodes" in empty["missing_families"] and "N" in empty["missing_families"]
+        assert empty["eps"]["N"] == .025 and empty["draw_counts"]["N"] == 0
+        scripted = row["scripted"]
+        assert scripted["kl_point"] == 2. and scripted["compact"] == 1.
+        gate = 1. / (1. + 2. ** (-components.GATE_SLOPE * (scripted["phi"] - row["phi_tau"])))
+        assert scripted["g"] == gate
+        assert scripted["circuit_reward_qa_free_d0"] == scripted["phi"] + gate * .5
+        assert row["start"]["node_cap_eligible"] is False
+        assert row["start"]["circuit_reward_qa_free_d0"] == components.V3_INVALID
+        assert row["start"]["formula_circuit_reward_qa_free_d0"] > 0
+
+
 def test_scripted_episode(env):
     pol = tools_env.Scripted()
     r = tools_env.run_episode(env, TID, pol)

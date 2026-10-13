@@ -987,12 +987,23 @@ def scripted(env: Env, tids: list[str], out: Path, log=print) -> list[dict]:
 
 def baselines(env: Env, episodes: Path, out: Path, log=print) -> list[dict]:
     """Each scripted answer (episodes: scripted's output) beside trivial node sets of its size on the score split, all
-    complete node sets scored by the reward's families (GoalEval.fidelity in reward mode): the influential start,
+    scored by the reward's families (GoalEval.fidelity in reward mode): complete node sets for the influential start,
     VPD's first k by causal importance (Native._vpd_order), the start's k most important by causal importance x
-    |activation| (the scripted policy's measured pruning left out), and k of the start's nodes drawn at random (seed 0);
-    per set phi (goal_eval.phi), its families' scores, s_track_pp and size_bits. One JSON line per text."""
+    |activation| (the scripted policy's measured pruning left out), k of the start's nodes drawn at random (seed 0),
+    and an empty graph declaring no token edges. Description bits are explicit: matching node counts need not match bits. The same batch's start row
+    supplies phi_tau and bits_start, without another model pass. Per graph: point KL, phi, family scores/eps and
+    canonical QA-free D=0 circuit reward, without tool costs. This excludes answer defects and token truncation;
+    the answer node cap still applies. One JSON line per text with scorer and episode provenance."""
+    import hashlib
+
     ge, nat = env.ge, env.ge.nat
     P, S = None, sum(nat.C.values())
+    source_hashes = {name: hashlib.sha256((HERE / name).read_bytes()).hexdigest() for name in
+                     ("tools_env.py", "components.py", "goal_eval.py", "native.py", "engine.py", "carry.py",
+                      "mech.py", "task_data.py") if (HERE / name).exists()}
+    vpd_source = HERE.parent / "vpd" / "vpd_model.py"
+    if vpd_source.exists():
+        source_hashes["vpd/vpd_model.py"] = hashlib.sha256(vpd_source.read_bytes()).hexdigest()
     res = []
     for line in episodes.read_text().splitlines():
         ep = json.loads(line)
@@ -1007,17 +1018,38 @@ def baselines(env: Env, episodes: Path, out: Path, log=print) -> list[dict]:
         snodes = sorted(st.node_set())
         key = {nd: float(tx.ci[nd[0]][nd[1], nd[2]]) * abs(float(tx.rec[nd[0]][0, nd[1], nd[2]])) for nd in snodes}
         rng = np.random.default_rng(0)
-        sets = {"scripted": g, "start": st,
+        # An actual empty answer states no token edges; complete=True would imply them in pp semantics.
+        sets = {"scripted": g, "empty": native.Graph(), "start": st,
                 "vpd_top_k": native.Graph(nat._vpd_order(tx.ids, tx.targets)[:k], complete=True),
                 "start_ci_act_k": native.Graph(sorted(snodes, key=lambda nd: -key[nd])[:k], complete=True),
                 "start_random_k": native.Graph([snodes[i] for i in rng.choice(len(snodes), size=min(k, len(snodes)), replace=False)], complete=True)}
         t0 = time.perf_counter()
         rows = ge.fidelity(tx, list(sets.values()), env.pool, mode="reward", split=env.score_split)
-        row = {"task": tid, "k": k, "seconds": round(time.perf_counter() - t0, 1)}
+        phi_start, phi_tau = goal_eval.phi(rows[list(sets).index("start")], start=rows[list(sets).index("start")])
+        bits_start = goal_eval.size_bits(st, P, S, tx.targets, active=tx.vpd)
+        row = {"task": tid, "k": k, "seconds": round(time.perf_counter() - t0, 1), "artifact_version": 2,
+               "score_split": env.score_split, "source_sha256": source_hashes,
+               "episode_sha256": hashlib.sha256(json.dumps(ep, sort_keys=True).encode()).hexdigest(),
+               "threshold_source": "same_batch_start", "phi_start": phi_start, "phi_tau": phi_tau,
+               "bits_start": bits_start, "gate_slope": components.GATE_SLOPE,
+               "score_scope": "canonical QA-free D=0; node cap applied; no answer-defect, truncation or tool costs"}
         for (name, gg), r in zip(sets.items(), rows):
             ph, _ = goal_eval.phi(r)
-            row[name] = {"phi": ph, "nodes": gg.count(), "bits": goal_eval.size_bits(gg, P, S, tx.targets, active=tx.vpd),
-                         "families": {f: goal_eval.family_score(r, f) for f in goal_eval.PHI_FAMILIES}}
+            bits = goal_eval.size_bits(gg, P, S, tx.targets, active=tx.vpd)
+            compact = goal_eval.compact(bits, bits_start)
+            gate = None if ph is None or phi_tau is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (ph - phi_tau)))
+            formula_score = (ph or 0.0) + (gate or 0.0) * 0.5 * (compact or 0.0)
+            eligible = gg.count() <= components.NODE_CAP
+            families = {f: goal_eval.family_score(r, f) for f in goal_eval.PHI_FAMILIES}
+            row[name] = {"phi": ph, "nodes": gg.count(), "bits": bits, "compact": compact, "g": gate,
+                         "complete": gg.complete, "tok_out": list(getattr(gg, "tok_out", [])),
+                         "node_cap_eligible": eligible, "formula_circuit_reward_qa_free_d0": formula_score,
+                         "circuit_reward_qa_free_d0": formula_score if eligible else components.V3_INVALID,
+                         "families": families, "missing_families": [f for f, value in families.items() if value is None],
+                         "eps": {f: r[f"eps_{f}"] for f in goal_eval.PHI_FAMILIES if r.get(f"eps_{f}") is not None},
+                         "draw_counts": {f: len(r.get(key) or []) for f, (_, _, key) in goal_eval.PHI_FAMILIES.items() if key},
+                         "kl_point": r.get("kl_point"), "kl_empty_live": r.get("kl_empty_live"),
+                         "kl_vpd_live": r.get("kl_vpd_live")}
         res.append(row)
         with out.open("a") as f:
             f.write(json.dumps(row) + "\n")

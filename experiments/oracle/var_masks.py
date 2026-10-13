@@ -15,7 +15,7 @@ off-target. Controls (CausalGym's selectivity, the Hewitt and Liang control task
 target distributions permuted among them (a mapping the model does not compute), scored on B against the permuted
 targets; and equal-size random subsets of the candidates. A mask counts by its selectivity, f real minus f permuted.
 
-  experiments/oracle/var_masks.py text6011 232,233 [--copy N] [--lam 1e-3,1e-2] [--out FILE]
+  experiments/oracle/var_masks.py text6011 232,233 [--at POSITIONS] [--copy N] [--from-dir DIR] [--lam 1e-3,1e-2] [--out FILE]
 """
 from __future__ import annotations
 
@@ -118,11 +118,13 @@ def train(P: Patcher, src: torch.Tensor, target: torch.Tensor, lam: float, steps
     return logit.detach()
 
 
-def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], log=print) -> dict:
+def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], at: tuple | None = None, log=print) -> dict:
+    """at: the carrier positions (an intermediate variable's, after its inputs); the input positions when None."""
     nat = ge.nat
+    at = at or ins
     reach = nat.reachable(tx.T, tx.targets)
-    every = [n for n in nat.names if all(bool(reach[n][q].any()) for q in ins)]
-    fam, _ = var_teacher.family(nat, tx, ins, every, ins)
+    every = [n for n in nat.names if all(bool(reach[n][q].any()) for q in at)]
+    fam, _ = var_teacher.family(nat, tx, ins, every, at)
     A = {q: var_classes.alternatives(nat, tx.ids, q, int(tx.seed)) for q in ins}
     B = {q: var_controls.b_tokens(nat, tx, q, A[q], max(4, var_controls.B_PER // len(ins)), int(tx.seed)) for q in ins}
     texts_A, pzA = [], []
@@ -132,7 +134,7 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], log=pr
             x[q] = z
             texts_A.append(x)
             pzA.append((q, z))
-    iso_pos = [q for q, _ in tx.f2 if q < min(ins)]  # changes that can reach the carrier without being its inputs
+    iso_pos = [q for q, _ in tx.f2 if q <= min(at) and q not in ins]  # changes that can reach the carrier, not its inputs
     iso_A = {q: var_classes.alternatives(nat, tx.ids, q, int(tx.seed), top=8, sampled=8) for q in iso_pos}
     iso_B = {q: var_controls.b_tokens(nat, tx, q, iso_A[q], 4, int(tx.seed)) for q in iso_pos}
     texts_I = []
@@ -161,7 +163,7 @@ def run_variable(ge, sc, tx, task_id: str, ins: tuple, lams: list[float], log=pr
                 num += d0 * min(1.0, max(0.0, 1.0 - max(var_controls.kl(R.base, qq), 0.0) / d0))
                 den += d0
         return num / den if den > 0 else None
-    out = {"task": task_id, "inputs": list(ins), "candidates": len(fam), "A": len(pzA), "iso_train": len(texts_I), "B": len(pzB),
+    out = {"task": task_id, "inputs": list(ins), "at": list(at), "candidates": len(fam), "A": len(pzA), "iso_train": len(texts_I), "B": len(pzB),
            "iso_B": len(pzI), "family_f_B": R.f_on(fam, pzB), "family_iso_B": f_off(fam), "masks": []}
     perm = torch.randperm(len(pzA), generator=torch.Generator().manual_seed(int(tx.seed))).to(nat.dev)
     perm = torch.cat([perm, torch.arange(len(pzA), len(pzA) + len(texts_I), device=nat.dev)])  # Iso targets stay
@@ -207,6 +209,9 @@ def main():
     ap.add_argument("task", nargs="?", default="text6011")
     ap.add_argument("inputs", nargs="?", default="232,233")
     ap.add_argument("--copy", type=int, default=0)
+    ap.add_argument("--at", help="the carrier positions (an intermediate variable's), comma-separated")
+    ap.add_argument("--from-dir", type=Path, help="every kept intermediate variable in var_teacher's files there")
+    ap.add_argument("--jobs", type=Path, help='JSON lines {"task", "inputs", "at"} (a pod uploads one file)')
     ap.add_argument("--lam", default="0.001,0.01,0.1")
     ap.add_argument("--out", type=Path, default=native.TEXTS.parent / "semantic" / "masks.jsonl")
     ap.add_argument("--device")
@@ -215,20 +220,28 @@ def main():
     ge = goal_eval.GoalEval(native.Native(args.device))
     sc = var_teacher._Screen(ge)
     lams = [float(x) for x in args.lam.split(",")]
-    jobs = [(args.task, tuple(int(x) for x in args.inputs.split(",")))] if args.task else []
+    jobs = [(args.task, tuple(int(x) for x in args.inputs.split(",")), tuple(int(x) for x in args.at.split(",")) if args.at else None)] \
+        if args.task and not (args.from_dir or args.jobs) else []
+    for x in map(json.loads, args.jobs.read_text().splitlines()) if args.jobs else []:
+        jobs.append((x["task"], tuple(x["inputs"]), tuple(x["at"]) if x.get("at") else None))
+    for f in sorted(args.from_dir.iterdir()) if args.from_dir else []:
+        if f.name.startswith("text") and f.suffix == ".json":
+            for v in json.loads(f.read_text())["variables"]:
+                if v.get("kept") and v.get("kind") == "intermediate":
+                    jobs.append((f.stem, tuple(v["inputs"]), tuple(v["carried_at"])))
     if args.copy:
         for x in json.loads((native.TEXTS.parent / "generality" / "copy_heldout.json").read_text())["copy"][:args.copy]:
             p = json.loads((native.TEXTS / "vpd4l" / f"{x['task']}.json").read_text())["prompts"][0]
             ids, t = p["token_ids"], p["target_positions"][-1]
             occ = [j for j in range(t) if ids[j] == ids[t]]  # the copied token's position: after the earlier occurrence
             if occ:
-                jobs.append((x["task"], (occ[-1] + 1,)))
-    for t, ins in jobs:
+                jobs.append((x["task"], (occ[-1] + 1,), None))
+    for t, ins, at in jobs:
         task = json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())
         p = task["prompts"][0]
         tx = ge.text(p["token_ids"], p["target_positions"], seed=native.task_seed(t), task=task)
-        print(f"{t} inputs {list(ins)}", flush=True)
-        row = run_variable(ge, sc, tx, t, ins, lams, log=lambda s: print(s, flush=True))
+        print(f"{t} inputs {list(ins)} at {list(at or ins)}", flush=True)
+        row = run_variable(ge, sc, tx, t, ins, lams, at, log=lambda s: print(s, flush=True))
         with args.out.open("a") as f:
             f.write(json.dumps(row) + "\n")
 

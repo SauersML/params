@@ -181,37 +181,43 @@ def pairs():
         if r.get("confirmed") and key not in seen:
             seen.add(key)
             items.append(r)
-    rng = random.Random(2951)
-    per_text = collections.Counter()
-    used = set()
-    out = []
+    # earlier pairs stay as they are (their teacher runs and S1 answers are keyed by item); a later search's items join
+    prev = DATA / "mechdisc_items.json"
+    out = json.loads(prev.read_text())["pairs"] if prev.exists() else []
+    key = lambda r: (r["kind"], r["text"], r["t"])  # noqa: E731
+    used = {key(r) for p_ in out for r in p_["items"]}
+    per_text = collections.Counter(r["text"] for p_ in out for r in p_["items"])
+    rng = random.Random(2951 + len(out))
     for a_kind in ("copy", "context"):
+        if a_kind == "copy" and any(p_["contrast"] == "copy-bigram" for p_ in out):
+            continue
         by_y = collections.defaultdict(lambda: collections.defaultdict(list))
         for r in items:
-            if r["kind"] in (a_kind, "bigram"):
+            if r["kind"] in (a_kind, "bigram") and key(r) not in used:
                 by_y[r["y"]][r["kind"]].append(r)
+        new = []
         for y in sorted(by_y):
             A = [r for r in by_y[y][a_kind]]
             B = [r for r in by_y[y]["bigram"]]
             rng.shuffle(A)
             rng.shuffle(B)
             for ra in A:
-                if (ra["kind"], ra["text"], ra["t"]) in used or per_text[ra["text"]] >= PER_TEXT:
+                if key(ra) in used or per_text[ra["text"]] >= PER_TEXT:
                     continue
-                rb = next((r for r in B if ("bigram", r["text"], r["t"]) not in used and per_text[r["text"]] < PER_TEXT
-                           and r["text"] != ra["text"]), None)
+                rb = next((r for r in B if key(r) not in used and per_text[r["text"]] < PER_TEXT and r["text"] != ra["text"]), None)
                 if rb is None:
                     continue
                 for r in (ra, rb):
-                    used.add((r["kind"], r["text"], r["t"]))
+                    used.add(key(r))
                     per_text[r["text"]] += 1
-                out.append({"contrast": f"{a_kind}-bigram", "y": y, "items": [ra, rb]})
-    cb = [p_ for p_ in out if p_["contrast"] == "copy-bigram"]
-    rng.shuffle(cb)
-    paired = {(r["kind"], r["text"], r["t"]) for p_ in out if p_["contrast"] == "context-bigram" for r in p_["items"]}
-    solo = [{"contrast": "context", "y": r["y"], "items": [r]} for r in items
-            if r["kind"] == "context" and (r["kind"], r["text"], r["t"]) not in paired]
-    out = cb[:MAX_PAIRS] + [p_ for p_ in out if p_["contrast"] == "context-bigram"] + solo
+                new.append({"contrast": f"{a_kind}-bigram", "y": y, "items": [ra, rb]})
+        if a_kind == "copy":
+            rng.shuffle(new)
+            new = new[:MAX_PAIRS]
+            used = {key(r) for p_ in new for r in p_["items"]}  # (the copy pairs left out free their bigram items)
+            per_text = collections.Counter(r["text"] for p_ in new for r in p_["items"])
+        out += new
+    out += [{"contrast": "context", "y": r["y"], "items": [r]} for r in items if r["kind"] == "context" and key(r) not in used]
     tdir = DATA / "mechdisc_texts"
     tdir.mkdir(exist_ok=True)
     names = set()

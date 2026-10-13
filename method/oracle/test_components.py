@@ -1079,6 +1079,33 @@ def test_line_credit_gives_each_circuit_line_its_leave_one_out_effect(tiny):
         assert credit[rows.index("FINAL 1: " + text.split("FINAL 1: ", 1)[1].split("\n", 1)[0])] == got["e2g"]["per_question"][0]["credit"]
 
 
+def test_repeated_circuits_run_once(tiny, monkeypatch):
+    """An RL group's repeated circuits (the same circuit, its answer written again or with other English) are scored
+    once: one fidelity row and one line_loo per distinct circuit; each answer's reward and line credits equal those of
+    a group without the repeats."""
+    nat, ge, task, ev = tiny
+    order = nat._vpd_order(task["prompts"][0]["token_ids"], [7])
+    at_t = [nd for nd in order if nd[1] == 7 and nd[0].endswith(("o_proj", "down_proj"))][:3]
+    finals = {n: (q["falls"], "'x'") for n, q in enumerate(ev["qa"], 1)}
+    a = components.render(goal_eval.to_json(native.Graph(set(at_t), {}, at_t), "one"), finals)
+    a2 = components.render(goal_eval.to_json(native.Graph(set(at_t), {}, at_t), "the same circuit, other words"), finals)
+    b = components.render(goal_eval.to_json(native.Graph(set(at_t[:2]), {}, at_t[:2]), "two"), finals)
+    alone = [components.reward(ge, task, ev, [x], pool={}, lines=True)[0] for x in (a, b, a2)]
+    cache = {}  # (the text's bar computed first: tau runs fidelity too)
+    components.reward(ge, task, ev, [b], pool={}, cache=cache)
+    calls = {"line_loo": 0}
+    loo = ge.line_loo
+    monkeypatch.setattr(ge, "line_loo", lambda *x, **k: calls.__setitem__("line_loo", calls["line_loo"] + 1) or loo(*x, **k))
+    graphs = []
+    real = ge.fidelity
+    monkeypatch.setattr(ge, "fidelity", lambda tx, gs, *x, **k: graphs.append(len(gs)) or real(tx, gs, *x, **k))
+    got = components.reward(ge, task, ev, [a, b, a, a2, b], pool={}, lines=True, cache=cache)
+    assert graphs == [2] and calls["line_loo"] == 2
+    for i, j in ((0, 0), (1, 1), (2, 0), (3, 2), (4, 1)):
+        assert got[i]["reward"] == pytest.approx(alone[j]["reward"], abs=1e-6), (i, j)
+        assert [c for _, c in got[i]["lines"]] == pytest.approx([c for _, c in alone[j]["lines"]], abs=1e-6), (i, j)
+
+
 def test_variable_text_batches_existing_index_list_syntax_losslessly():
     import components
     v = {"name": "V3", "meaning": "kept", "inputs": [7], "feeds": ["prediction"],

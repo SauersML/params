@@ -1738,7 +1738,14 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
     ge.hooks = {"E1": (lambda task, g, x: bits.get(x)) if (reader is not None or e1 is not None) else None,
                 "E2": lambda task, g, x: qa_term(ev["qa"], parse(x)["finals"], tok, prompt["model_top"][0][0][0])}
     row_of = dict(zip(keep, ge.score(tx, [graphs[i] for i in keep], [texts[i] for i in keep]))) if keep else {}
-    c_of = dict(zip(keep, ge.fidelity(tx, [graphs[i] for i in keep], pool, mode="reward", split=split))) if keep else {}
+    same = {i: _circuit_key(graphs[i]) for i in keep}  # an RL group repeats answers (5.4 distinct of 8 in RL from S1): each
+    first = {}                                          # distinct circuit's fidelity row and line deletions run once
+    for i in keep:
+        first.setdefault(same[i], i)
+    once = list(first.values())
+    c_once = dict(zip(once, ge.fidelity(tx, [graphs[i] for i in once], pool, mode="reward", split=split))) if once else {}
+    c_of = {i: c_once[first[same[i]]] for i in keep}
+    loo_of = {}  # a distinct circuit's line_loo
     e4 = ({i: e4_term(vs, tx, graphs[i], parsed[i]["answer"], parsed[i]["variables_malformed"], nat.C, split or "search") for i in keep}
           if vs is not None else {})
     le = {i: ge.line_effects(tx, graphs[i], mode="pp", split=split or "search") for i in keep if i in e4 and e4[i].get("per_variable")}
@@ -1780,8 +1787,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
             if retain_calibration:
                 info["calibration_evidence"] = calibration_evidence(c, split)
             if lines:
-                loo = (ge.line_loo(tx, graphs[i], pool, split=split or "search", bits_start=tau.get("bits_start"), base=c)
-                       if graphs[i].count() else {"bits": b, "lines": []})  # an empty circuit has no lines to credit
+                if graphs[i].count() and same[i] not in loo_of:
+                    loo_of[same[i]] = ge.line_loo(tx, graphs[i], pool, split=split or "search", bits_start=tau.get("bits_start"), base=c)
+                loo = loo_of[same[i]] if graphs[i].count() else {"bits": b, "lines": []}  # an empty circuit has no lines to credit
                 info["lines"] = line_credit(texts[i], p, loo, le.get(i), info, e2g.get(i), e4.get(i))
         if invariants:
             info["invariant_diagnostic"] = (invariant_diagnostic(ge, tx, p["answer"], task["model"]) if valid[i]
@@ -1795,6 +1803,15 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
                     "fidelity": {k: v for k, v in (c or {}).items()  # C's members and columns (s_track, context_share, eps, ...)
                                  if k in ("c_terms", "rl_terms") or isinstance(v, (int, float)) or v is None}})
     return out
+
+
+def _circuit_key(g) -> str:
+    """A circuit as everything goal_eval runs of it reads (nodes, blocks, connections, pairs, token edges; not its
+    explanation): equal for two answers that write the same circuit."""
+    import goal_eval
+
+    j = goal_eval.to_json(g)
+    return json.dumps([j.get("complete", False), j["nodes"], sorted(json.dumps(e) for e in j["edges"])])
 
 
 def _teacher_ref(ge, tx, teacher: dict, pool: dict, split: str | None, task: dict) -> dict | None:

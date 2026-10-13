@@ -2072,11 +2072,14 @@ class GoalEval:
         for v, sv_ in enumerate(sets):
             if sv_:
                 vdel[v, [nid[nd] for nd in sv_]] = True
+        uniq, uv = {}, []  # the variants' distinct node sets (a deleted connection or token edge keeps the answer's), each
+        for h in flat:     # one _node_draws call
+            uv.append(uniq.setdefault(tuple(sorted(h.node_set())), len(uniq)))
+        udrops = [[np.array([nid[nd] for nd in d], dtype=np.int64) for d in self._node_draws(tx, list(ns), draws)] for ns in uniq]
         drops, owner = [], []  # every row's dropped node indices, and its (variant, draw): _node_draws' common draws
-        for v, h in enumerate(flat):
-            hn = sorted(h.node_set())
-            for j, d in enumerate(self._node_draws(tx, hn, draws)):
-                drops.append(np.array([nid[nd] for nd in d]))
+        for v in range(len(flat)):
+            for j, d in enumerate(udrops[uv[v]]):
+                drops.append(d)
                 owner.append((v, j))
         R = len(owner)
         res = [[] for _ in range(K)]
@@ -2084,6 +2087,11 @@ class GoalEval:
         first = int(npos[cat].min()) if len(cat) else T
         start = min(first, min(tx.targets))  # every run's states before it: the model's, VPD's and the variants'
         step = max(8, min(step, self.LOO_ENTRIES // (T * max(1, sum(len(c) for c in vcols.values())))))  # (VPD's masks)
+        keys_all = [tuple(d.tolist()) for d in drops]  # the model's and VPD's runs depend on a row's dropped nodes alone: one
+        seen_n = {}                                   # run per distinct set (common draws: a variant's draw is the answer's
+        for x in keys_all:                            # less its deleted node, so the variants whose node a draw leaves alone
+            seen_n[x] = seen_n.get(x, 0) + 1          # share it), a set asked by several rows kept across chunks
+        shared = {}  # dropped set -> (log q of the model's run [targets, V], KL_VPD, W)
         for s0 in range(0, R, step):
             rows = range(s0, min(R, s0 + step))
             rr = np.concatenate([np.full(len(drops[k]), r) for r, k in enumerate(rows)])
@@ -2093,16 +2101,29 @@ class GoalEval:
             Dm[r_, j_] = True
             vs = torch.tensor([owner[k][0] for k in rows], device=dev)
             gone = Dm | vdel[vs]  # the variant's deleted nodes and the draw's
-            mf, vf = torch.ones(len(rows), T, KC, device=dev), vflat.repeat(len(rows), 1, 1)  # each draw's nodes off: one
-            mf[r_, FT[j_], FC[j_]] = 0.0                                                      # indexed write per engine
-            vf[r_, FT[j_], FV[j_]] = 0.0
-            mm, mv = views(mf, oc, circ), views(vf, ov, vcols)
-            lm = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
-            if kx:  # VPD's answer at x, its draw's nodes at 0
-                vk = dict(kx, held={n: vbase[n] == 0 for n in kx["at_x"]})
-                lv = Ev.log_probs(mv, start=start, base=vbase, **vk) if start else Ev.log_probs(mv, **vk)
-            else:
-                lv = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
+            keys = [keys_all[k] for k in rows]
+            fresh = [x for x in dict.fromkeys(keys) if x not in shared]
+            if fresh:
+                ur = np.concatenate([np.full(len(x), r) for r, x in enumerate(fresh)])
+                uc = np.concatenate([np.array(x, dtype=np.int64) for x in fresh])
+                ur_, uj_ = torch.as_tensor(ur, device=dev), torch.as_tensor(uc, device=dev)
+                mf, vf = torch.ones(len(fresh), T, KC, device=dev), vflat.repeat(len(fresh), 1, 1)  # each draw's nodes off: one
+                mf[ur_, FT[uj_], FC[uj_]] = 0.0                                                     # indexed write per engine
+                vf[ur_, FT[uj_], FV[uj_]] = 0.0
+                mm, mv = views(mf, oc, circ), views(vf, ov, vcols)
+                lm_f = Em.log_probs(mm, start=start) if start else Em.log_probs(mm)
+                if kx:  # VPD's answer at x, its draw's nodes at 0
+                    vk = dict(kx, held={n: vbase[n] == 0 for n in kx["at_x"]})
+                    lv_f = Ev.log_probs(mv, start=start, base=vbase, **vk) if start else Ev.log_probs(mv, **vk)
+                else:
+                    lv_f = Ev.log_probs(mv, start=start, base=vbase) if start else Ev.log_probs(mv)
+                kv_f, w_f = carry.kl(lm_f, lv_f), carry.kl(lm_f, tx.ref.expand_as(lm_f))
+            at_f = {x: i for i, x in enumerate(fresh)}
+            for x, i in at_f.items():
+                if seen_n[x] > 1:
+                    shared[x] = (lm_f[i], kv_f[i], w_f[i])
+            got = [shared[x] if x in shared else (lm_f[at_f[x]], kv_f[at_f[x]], w_f[at_f[x]]) for x in keys]
+            lm = torch.stack([g_[0] for g_ in got])
             held = None
             if kx:  # the variant's deleted nodes at x, the draw's at 0
                 hf = torch.ones(len(rows), T, KC, dtype=torch.bool, device=dev)
@@ -2116,8 +2137,8 @@ class GoalEval:
                 lc = lq_rows(None, tables=u, held=None if held is None else {n: h & (u[n] == 0) for n, h in held.items()}, kw=kx)
             else:  # the dropped nodes out of the circuit with their connections, as a deleted node
                 lc = lq_rows(None, tables=(ew.to(dev)[vs], ow.to(dev)[vs], {n: gone[:, sidx[n]] for n in order}), held=held, kw=kx)
-            kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
-            w, claim = carry.kl(lm, tx.ref.expand_as(lm)).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()
+            kc, kv = carry.kl(lm, lc).tolist(), torch.stack([g_[1] for g_ in got]).tolist()
+            w, claim = torch.stack([g_[2] for g_ in got]).tolist(), carry.kl(tx.ref.expand_as(lc), lc).tolist()
             for r, k in enumerate(rows):
                 v, j = owner[k]
                 res[v].append([j, kc[r], kv[r], w[r], claim[r]])

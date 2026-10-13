@@ -57,6 +57,9 @@ def main():
         # Frozen before any outcomes: all existing record examples, without new
         # generated inputs. This transport/counterexample audit is not generalization.
         texts = [list(example["ids"]) for example in toy.meta["record"]["examples"]]
+        if any(example["target"] != len(example["ids"]) - 1
+               for example in toy.meta["record"]["examples"]):
+            raise RuntimeError("record target is not the frozen last-position evaluation")
         target = (root / "target.txt").read_text()
         parsed = circuit.parse(target)
         if not parsed.ok or parsed.bad:

@@ -692,6 +692,8 @@ def circuits(answers_path: Path, out_path: Path, eps: float = CIRCUIT_EPS):
     import torch
 
     lines = [json.loads(x) for x in answers_path.read_text().splitlines() if x.strip()]
+    if not out_path.is_absolute():  # a relative --out lands in GEN_OUT (a pod's synced outputs) when set
+        out_path = Path(os.environ.get("GEN_OUT", ".")) / out_path
     got = json.loads(out_path.read_text()) if out_path.exists() else {"answers": []}
     done = {(a["task"], a["sample"]) for a in got["answers"]}
     ge = goal_eval.GoalEval(native.Native())

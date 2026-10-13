@@ -165,6 +165,7 @@ def run2(family: str, source: str, max_targets: int = 4):
     ge = goal_eval.GoalEval(native.Native())
     ge.nat.LENGTHS_KEPT = 1
     nat = ge.nat
+    variables.ROWS = int(os.environ.get("VAR_ROWS", 2))  # patched runs a batch: 8 overflowed a 24 GB card on long texts
     sc = variables.Scorer(ge)
     ta = target(source)
     src = json.loads(src_path.read_text())["variables"]

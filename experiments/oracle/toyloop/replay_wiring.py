@@ -3,9 +3,10 @@
 The four cases are fixed existing test-instance IDs, selected before execution. Reconstruct
 only their original deterministic zoo weights and first four recorded ordinary texts.
 One native decomposition is shared by stated edges, architecture-complete same-unit edges,
-and the same-unit stated graph with every output edge removed. Token arrows remain
+and same-unit controls with output or inter-unit edges removed. Token arrows remain
 annotations; embeddings stay on and remainders off. This is teacher/baseline point-fidelity
-evidence, not learned-policy, English or intervention-fidelity evidence.
+evidence; optional saved learned answers are replayed without policy generation.
+It does not certify English, raw-weight use or intervention fidelity.
 """
 from __future__ import annotations
 
@@ -51,6 +52,8 @@ def original_ordinary_texts(zoo, params):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--policy-file", type=Path, help="existing public saved learned completions; never generate")
+    ap.add_argument("--policy-source", help="full commit SHA holding the exact policy artifact")
     args = ap.parse_args()
     if sys.platform == "darwin":
         ap.error("This replay is reserved for the Linux CPU runner; do not occupy the Mac scoring slot")
@@ -75,20 +78,40 @@ def main():
     for path in files.values():
         old = subprocess.check_output(["git", "show", f"{BASELINE_SOURCE}:{path.relative_to(ROOT)}"], cwd=ROOT)
         assert hashlib.sha256(old).hexdigest() == sha(path), path
+    cases = list(CASES)
+    policy_provenance = None
+    if args.policy_file is not None:
+        if args.policy_source is None or len(args.policy_source) != 40:
+            ap.error("--policy-file requires its full --policy-source commit")
+        path = (ROOT / args.policy_file).resolve()
+        relative = path.relative_to(ROOT)
+        original = subprocess.check_output(["git", "show", f"{args.policy_source}:{relative}"], cwd=ROOT)
+        assert hashlib.sha256(original).hexdigest() == sha(path), "saved policy artifact changed"
+        learned = {r["id"]: r for r in json.loads(path.read_text())["rows"]}
+        # The original four-case protocol remains fixed; absent completions are declared, not selected by outcomes.
+        cases = [case for case in CASES if case in learned]
+        assert cases, "no policy completions intersect the fixed protocol"
+        saved["learned"] = learned
+        policy_provenance = {"file": str(relative), "source": args.policy_source, "sha256": sha(path),
+                             "eligible_fixed_cases": cases, "absent_fixed_cases": [c for c in CASES if c not in learned],
+                             "scope": "execution of logged learned answers; original policy checkpoint/generation hashes absent"}
     checkpoint = args.out / "tasks.jsonl"
     source_paths = [Path(__file__), ROOT / "experiments/oracle/toys/zoo.py", ROOT / "experiments/oracle/toys/planted.py",
                     ROOT / "experiments/oracle/toyloop/circuit.py", ROOT / "method/oracle/goal_eval.py", ROOT / "method/oracle/native.py"]
-    header = {"type": "replay", "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-              "saved_completion_source": BASELINE_SOURCE, "fixed_cases": CASES, "torch": torch.__version__,
+    header = {"type": "replay", "checkout_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+              "source_state": "pinned execution checkout; replay driver may be copied from dispatch commit, source_sha256 identifies actual files",
+              "replay_driver_origin_commit": os.environ.get("TOY_REPLAY_DRIVER_COMMIT"),
+              "saved_completion_source": BASELINE_SOURCE, "fixed_cases": CASES, "executed_cases": cases,
+              "policy_provenance": policy_provenance, "torch": torch.__version__,
               "scoring": "point KL in bits; embeddings on; remainders off; all selected pieces at all positions",
-              "scope": "existing planted teacher/active completions; no learned-policy or intervention/English claim",
+              "scope": "saved completion point-wiring execution; no new policy generation or intervention/English claim",
               "provenance_limit": "original external tensor files absent; deterministic original generator/seed reconstruction, not a byte comparison to missing original tensors",
               "inputs_sha256": {str(p.relative_to(ROOT)): sha(p) for p in files.values()},
               "source_sha256": {str(p.relative_to(ROOT)): sha(p) for p in source_paths}}
     append(checkpoint, header)
     results = []
     with torch.no_grad():
-        for case in CASES:
+        for case in cases:
             family, seed = case.rsplit("_", 1)
             params, sd = zoo.make(family, int(seed))  # replay the saved ID, not a newly sampled model
             expected = {(render.zoo_unit(a), render.zoo_unit(b)) for a, b in zoo.FAMILIES[family].edges(params)}
@@ -110,7 +133,7 @@ def main():
             row = {"type": "task", "id": case, "family": family, "seed": int(seed), "params": params,
                    "weights_sha256": fingerprint.hexdigest(), "native_basis_sha256": basis.hexdigest(),
                    "cfg": zoo.CFG, "ordinary_texts": texts, "candidates": {}}
-            for name in ("gt", "active"):
+            for name in saved:
                 completion = saved[name][case]["completion"]
                 try:
                     graph = circuit.unit_graph(circuit.parse(completion), bound, texts[0])
@@ -122,6 +145,12 @@ def main():
                     graph = circuit.unit_graph(circuit.parse(completion), bound, ids)
                     variants = {"stated": graph, "same_units_complete": native.Graph(graph.nodes, complete=True),
                                 "wrong_no_output": native.Graph(graph.nodes, graph.parents, [], complete=False)}
+                    owners = {(site, pos, piece): unit for unit in circuit.parse(completion).units
+                              if unit != "out" and not unit.startswith("tok")
+                              for site, piece in circuit.unit_pieces(bound, unit) for pos in range(len(ids))}
+                    within = {reader: [writer for writer in writers if owners[writer] == owners[reader]]
+                              for reader, writers in graph.parents.items()}
+                    variants["wrong_no_interunit"] = native.Graph(graph.nodes, within, graph.out, complete=False)
                     assert len({frozenset(g.nodes) for g in variants.values()}) == 1
                     target = [len(ids) - 1]; ref = nat.reference([ids], target)
                     null = ge.graph_ref(ids, target, native.Graph(), live=False)
@@ -141,7 +170,8 @@ def main():
                                            "wrong_minus_stated_bits": means["wrong_no_output"] - means["stated"]}
             append(checkpoint, row); results.append(row)
             print(case, {n: r.get("mean_kl_bits", r.get("error")) for n, r in row["candidates"].items()}, flush=True)
-    complete = len(results) == 4 and all(c["valid"] for r in results for c in r["candidates"].values())
+    complete = len(results) == len(cases) and all(r["candidates"][name]["valid"] for r in results for name in ("gt", "active"))
+    # Invalid learned wiring is a policy outcome, retained with no fabricated KL; reference failure is incomplete replay.
     (args.out / "report.json").write_text(json.dumps({"provenance": header, "complete": complete, "tasks": results}, indent=2) + "\n")
     if not complete:
         raise RuntimeError("Replay incomplete: inspect retained materialization/baseline failures before interpreting scores")

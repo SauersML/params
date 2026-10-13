@@ -24,6 +24,12 @@ on:
         default: false
 
 
+      include_saved_toy_policy:
+        description: "Also replay the frozen three-case intersection with public SFT completions (no generation)"
+        type: boolean
+        required: false
+        default: false
+
 concurrency:
   group: graph-oracle-e2e-${{ github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring && github.run_id || github.ref }}
   cancel-in-progress: false  # pushes come every few minutes: finish the running check, keep only the newest pending one
@@ -86,7 +92,16 @@ jobs:
         timeout-minutes: 8
         run: |
           git fetch --no-tags --depth=1 origin 9e3782861caa3e738d6b91122a527487157df349
-          python -u experiments/oracle/toyloop/replay_wiring.py --out "${{ runner.temp }}/toy-wiring-replay"
+          git fetch --no-tags --depth=1 origin b2fd915944c0589dabc9295805f37bbabe30439f
+          git worktree add --detach "${{ runner.temp }}/toy-replay-scorer" b2fd915944c0589dabc9295805f37bbabe30439f
+          cp experiments/oracle/toyloop/replay_wiring.py "${{ runner.temp }}/toy-replay-scorer/experiments/oracle/toyloop/replay_wiring.py"
+          policy_args=()
+          if [ '${{ inputs.include_saved_toy_policy }}' = 'true' ]; then
+            git fetch --no-tags --depth=1 origin 830010f2f4f534d628c51610fa1632774d0e02f6
+            policy_args=(--policy-file experiments/oracle/toyloop/results/eval_sft_noleak.json --policy-source 830010f2f4f534d628c51610fa1632774d0e02f6)
+          fi
+          TOY_REPLAY_DRIVER_COMMIT="${{ github.sha }}" python -u "${{ runner.temp }}/toy-replay-scorer/experiments/oracle/toyloop/replay_wiring.py" \
+            --out "${{ runner.temp }}/toy-wiring-replay" "${policy_args[@]}"
 
       - name: Upload saved toy wiring replay
         if: always() && github.event_name == 'workflow_dispatch' && inputs.replay_saved_toy_wiring

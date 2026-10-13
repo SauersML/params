@@ -2,7 +2,8 @@
 # The pre-launch check (#2951 graph oracle, the lead's 10-12 rule): teacher.py arms on one held-out text on one cheap pod, then
 # each arm's circuit scored by goal_eval.py fidelity --only track_pp on the eval split (the draws no search saw), so an arm
 # that fits its search draws shows before anything is launched on it. Each ARM is NAME=FLAGS with commas for spaces
-# (a comma inside a flag value written ::). Rows to ~/mpd-data/runpod/oracle-graph-check-RUN-0/eval.jsonl, a line per arm.
+# (a comma inside a flag value written ::). Rows to ~/mpd-data/runpod/oracle-graph-check-RUN-0/eval.jsonl, a line per arm; the
+# container's host memory peak (cgroup memory.peak) and the card's memory every 15 s beside it.
 #   RUN=c9002 REF=COMMIT TEXT=text9002 experiments/oracle/pods/check_text.sh b=--f1-start,influential,--edges,--no-strand,--accept,changed ...
 #   (env: GPU, PRICE, HOURS, RAM: GB of host memory, default 48, VRAM: GB of card memory, default 20)
 # The whole script is one block, so bash has read all of it before it runs.
@@ -29,8 +30,10 @@ CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; set -e; ln -sfn /workspace/runs
 python -m pip install -q safetensors pyyaml tokenizers scipy;
 tar -xzf $F/texts.tgz -C ~/mpd-data/graph_oracle;
 ls $V/t-9d2b8f02/model_step_99999.safetensors $V/t-9d2b8f02/model_config.yaml $V/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/params/method/vpd /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt > /dev/null;
-cd /Users/user/params/method/oracle; set +e; $TEACH
-python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --only track_pp --out $O/eval.jsonl > $O/eval.log 2>&1; cat $O/eval.jsonl"
+cd /Users/user/params/method/oracle; set +e;
+(while :; do cat /sys/fs/cgroup/memory.peak > $O/mem_peak.txt 2> /dev/null; nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >> $O/gpu_mem.txt; sleep 15; done) &
+$TEACH
+python -B goal_eval.py fidelity --split heldout --n $N $SETS --pool /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_m.pt --vpd /Users/user/mpd-data/graph_oracle/teacher/vpd_heldout20.pt --only track_pp --out $O/eval.jsonl > $O/eval.log 2>&1; cat $O/eval.jsonl; echo \"host memory peak \$(cat $O/mem_peak.txt) bytes, card memory peak \$(sort -n $O/gpu_mem.txt | tail -1) MiB\""
 for try in $(seq 1 40); do
   RP_REF=$REF RP_OWNER=fleet RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-20} RP_MIN_RAM_GB=${RAM:-48} \
     experiments/infra/runpod/rp-run $RN "${GPU:-NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVIDIA RTX A4500,NVIDIA GeForce RTX 4090,NVIDIA RTX A6000,NVIDIA A40}" "${HOURS:-2.0}" -- bash -c "$CMD" > "$F/rp.log" 2>&1 && break

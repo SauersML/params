@@ -453,9 +453,10 @@ flowchart BT
   CLAIMDATA["<b>Checked claim supervision</b><br/>3 claims joined with exact carriers;<br/>producer and SFT launchers connected;<br/>reject stale prompts; preserve failures<br/>DONE · codex/eval_recovery, variable_reward"]
   CLAIMREC["<b>Diverse claims executed</b><br/>15 tasks:123 pass,71 fail;<br/>46 rank-one intermediate claims;<br/>proofs and failures retained · $0.0448<br/>DONE · codex/variable_reward"]
   CLAIMFIT["<b>Carrier size remains the limit</b><br/>53% compression; further4.7% adds no rows;<br/>2 of15 exact rows fit training limits;<br/>next: smaller verified carrier sets<br/>AUDIT DONE · codex/variable_reward"]
-  CLAIMQA["<b>Learn measured transplant effects</b><br/>147 exact examples,49 failed proposals;<br/>8 carrier-sensitive pairs; geometry shortcuts;<br/>add archived component observations<br/>ACTIVE · codex/variable_reward"]
+  CLAIMQA["<b>Learn measured transplant effects</b><br/>147 exact examples,49 failed proposals;<br/>archived hints bound to visible context;<br/>partial coverage and ID limits explicit<br/>EXPORT AUDIT · codex/variable_reward"]
+  CLAIMCTRL["<b>Isolate component identity</b><br/>change indices, preserve sizes and positions;<br/>measure full output distributions afresh;<br/>reference and identity checks required<br/>IMPLEMENTED · codex"]
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
-  RELTRAIN["<b>Teach every relation example</b><br/>21 of68 never sampled by SFT;<br/>free300-step coverage test launched;<br/>same data, base model and dependencies<br/>RUNNING · codex/eval_recovery"]
+  RELTRAIN["<b>Teach every relation example</b><br/>21 of68 never sampled by SFT;<br/>free300-step coverage run finished;<br/>compare executed relations on fixed24<br/>RESULT AUDIT · codex/eval_recovery"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
   ROUTEEDIT["<b>Routing repair and actual cost</b><br/>repaired maxKL0.00015bits;<br/>exact dead-pruned graph nearly same size;<br/>implicit dense0.34ms, repair1.19ms<br/>CHECK · codex/variable_reward"]
   PYV["<b>Independent intervention check</b><br/>10 Pyvene/Native cases agree to 2e-6;<br/>single components and cross-position swaps;<br/>wrong-component controls distinguish;<br/>DONE optional checker · codex/reward_audit"]
@@ -551,6 +552,8 @@ flowchart BT
   CLAIMREC -- 2 fitting rows,11 claims --> SUP
   CLAIMREC --> CLAIMFIT
   CLAIMREC --> CLAIMQA
+  CLAIMREC --> CLAIMCTRL
+  CLAIMCTRL -. component specificity control .-> SUP
   CLAIMQA -. auxiliary intervention answers .-> SUP
   CLAIMFIT -. additional exact rows .-> SUP
   ENG --> TOOLS
@@ -647,6 +650,7 @@ flowchart BT
   class FBASE check
   class CLAIMFIT done
   class CLAIMQA active
+  class CLAIMCTRL check
   class CLAIMDATA,CLAIMREC done
   class ENGP done
   class S1AUDIT done

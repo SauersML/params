@@ -323,7 +323,7 @@ flowchart BT
 
   subgraph REWARD["REWARD · primerl, inframove, generality, codex"]
     W1["<b>Reward v3</b><br/>faithfulness gate, size, answers,<br/>variables, English;<br/>per-line credit · DONE"]
-    W2["<b>Falsification set</b><br/>40 copy + 20 mistake texts, reward v3 terms:<br/>wrong source loses 0.80-0.82; irrelevant parts 0.59<br/>(below the bar g≈0: extra parts free); equal-bits<br/>target actives beat the copy circuit 0.72;<br/>E4 value maps: identity 0.86, partition 0.04;<br/>CausalGym: variable vs attractor 0.50<br/>DONE · generality"]
+    W2["<b>Falsification set</b><br/>copy done (wrong source loses 0.8;<br/>padding free below the bar → tie-break);<br/>now: 14 behavior families + copy row,<br/>weighted by frequency; CausalGym in the<br/>behavior-targeted mode (777563f);<br/>falsify.py --circuits for the final eval<br/>ACTIVE · generality"]
     W3["<b>Calibration pilot</b><br/>text9001: a 5-node circuit that predicts<br/>like the empty one earns +4.75<br/>DONE · codex, inframove"]
     W4["<b>Reward repair</b><br/>package aa79889; linear-share pooling 71c66c3;<br/>N with background on; omitted family;<br/>next: per-family floors (−4·shortfall),<br/>ungated tie-break, norm scales at x<br/>ACTIVE · inframove"]
     W5["<b>Predict intervention effects</b><br/>common-panel pilot: even VPD loses<br/>to no-change prediction on 4/4 texts;<br/>not a causal-response certificate<br/>DIAGNOSTIC + CI passed · codex"]

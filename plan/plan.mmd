@@ -543,6 +543,7 @@ flowchart BT
   WIRING["<b>Wiring reward pilot measured</b><br/>valid23/24 vs unit-only16/24;<br/>top accuracy44% vs SFT44%;<br/>no learned cross-component edges<br/>DONE · codex/eval_recovery"]
   RELTRAIN["<b>Coverage alone did not fix wiring</b><br/>all226 examples seen; valid19 vs20;<br/>overall top43% vs44%; relation8 improved;<br/>uncertain gains; no RL scale-up<br/>DONE · codex/eval_recovery"]
   CAPABLE["<b>Fresh two-route transfer fails</b><br/>V+8 faithful 2/8; BASE 3/8;<br/>input-only V-facts baseline 8/8;<br/>multi-route TRAIN support: 0/256<br/>MEASURED · codex/fork_review · $1.186"]
+  COMPOSE["<b>Learn independent V-route composition</b><br/>32 fresh single vs32 two-path supports;<br/>original256 retained; new8 frozen;<br/>72 variants verified · 16844 upper<br/>PREFLIGHT PASS · codex/eval_recovery"]
   CAPCF["<b>Weight-edit ability recovered</b><br/>Best training and base:1792/1792 tops;<br/>worst KL0.00015 bits on4 toy models;<br/>half-strength edits expose weaker training<br/>MEASURED · codex/eval_recovery"]
   CAPENG["<b>Calibrate the English verifier</b><br/>Verified facts122/128; prose60/128;<br/>writer error and reader overapplication;<br/>reasoning1024 truncated127/128;<br/>calibrate completion budget on small pilots<br/>ENGLISH UNVERIFIED · codex"]
   ROUTE["<b>Exact routing fits oracle output</b><br/>3575 to305 tokens including EOS;<br/>same400 nodes and9621edges;<br/>all6 exports fit416;29tests pass<br/>DONE opt-in codec · codex"]
@@ -741,6 +742,9 @@ flowchart BT
   class WIRING done
   class RELTRAIN done
   class CAPABLE active
+  class COMPOSE active
+  CAPABLE --> COMPOSE
+  COMPOSE --> C1
   class CAPCF done
   class ROUTE done
   class ROUTEEDIT check

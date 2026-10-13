@@ -31,6 +31,35 @@ class Probe(unittest.TestCase):
    response={'request_id':'prose|'+gold[0]['id'],'model':p.READER,'upstream_invalid':True}
    (paid/'responses.jsonl').write_text(json.dumps(response)+'\n');report=p.evaluate(m,paid,root/'report.json')
    self.assertEqual(report['prose']['rows'],18);self.assertEqual(report['prose']['both_correct'],0);self.assertEqual(report['typed']['all6_joint_cases'],0)
+   extended=p.evaluate(m,paid,root/'extended.json',derive_changes=True)
+   for c in p.CONDITIONS:
+    diagnostic=extended[c].pop('outcome_consistency')
+    self.assertEqual(diagnostic['rows'],18);self.assertEqual(diagnostic['comparable'],0);self.assertEqual(diagnostic['both_outcomes_correct'],0)
+   self.assertEqual(extended,report)
    (paid/'responses.jsonl').write_text((json.dumps(response)+'\n')*2)
    with self.assertRaisesRegex(ValueError,'duplicate'):p.evaluate(m,paid,root/'bad.json')
+ def test_consistent_wrong_outcomes_cannot_earn_pair_credit(self):
+  gold=[{'id':'base','task':'a','k':1.,'top_token':' x','changed':False},
+        {'id':'edited','task':'a','k':0.,'top_token':' x','changed':False}]
+  wrong={i:{'top_token':' wrong','changed':False} for i in ('base','edited')}
+  result=p.outcome_consistency(gold,wrong)
+  self.assertEqual(result['derived_changed_correct'],2)
+  self.assertEqual(result['both_outcomes_correct'],0)
+  self.assertEqual(result['raw_flag_self_contradiction'],0)
+ def test_pair_uses_own_predicted_baseline_and_preserves_wrong_flags(self):
+  gold=[{'id':'b','task':'a','k':1.,'top_token':' x','changed':False},
+        {'id':'e','task':'a','k':0.,'top_token':' y','changed':True},
+        {'id':'b2','task':'different','k':1.,'top_token':' y','changed':False}]
+  pred={'b':{'top_token':' x','changed':True},'e':{'top_token':' y','changed':False},'b2':{'top_token':' y','changed':False}}
+  before=json.dumps(pred,sort_keys=True);r=p.outcome_consistency(gold,pred)
+  self.assertEqual(r['both_outcomes_correct'],3);self.assertEqual(r['raw_flag_self_contradiction'],2)
+  self.assertEqual(json.dumps(pred,sort_keys=True),before)
+  del pred['b'];r=p.outcome_consistency(gold,pred)
+  self.assertEqual(r['rows'],3);self.assertEqual(r['comparable'],1);self.assertEqual(r['both_outcomes_correct'],1)
+ def test_outcome_panel_rejects_ambiguous_or_inconsistent_gold(self):
+  baseline={'id':'b','task':'a','k':1.,'top_token':' x','changed':False}
+  for rows in ([],[baseline,baseline],[dict(baseline,k=0.)],[dict(baseline,changed=True)],
+               [baseline,dict(baseline,id='alias')]):
+   with self.assertRaises(ValueError):p.outcome_consistency(rows,{})
+  with self.assertRaisesRegex(ValueError,'unexpected'):p.outcome_consistency([baseline],{'other':None})
 if __name__=='__main__':unittest.main()

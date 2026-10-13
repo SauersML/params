@@ -135,30 +135,63 @@ def run(manifest,out):
  samplers[READER]=service.create_sampling_client(base_model=READER)
  for req in readers:sample(req)
  (out/'complete.json').write_text(json.dumps({'spend_usd':spend,'writer_requests':3,'reader_requests':len(readers),'invalid_upstream_rows':54-len(readers)})+'\n')
-def evaluate(manifest,paid,out):
+def outcome_consistency(gold_rows,predictions):
+ """Posthoc paired-outcome diagnostic; never repairs the raw changed flag.
+
+ A correct derived change alone is insufficient: two wrong tokens can agree.
+ both_outcomes_correct also requires the SAME task's k=1 prediction to be right.
+ Missing/invalid baselines stay in the denominator and cannot earn pair credit.
+ """
+ gold={};coordinates=set();baselines={}
+ for g in gold_rows:
+  if g['id'] in gold or (g['task'],g['k']) in coordinates:raise ValueError('duplicate gold identity/coordinate')
+  if type(g['k']) not in (int,float) or not math.isfinite(g['k']) or not isinstance(g['top_token'],str) or type(g['changed']) is not bool:raise ValueError('invalid gold outcome')
+  gold[g['id']]=g;coordinates.add((g['task'],g['k']))
+  if g['k']==1:baselines[g['task']]=g
+ if not gold or set(baselines)!={g['task'] for g in gold.values()}:raise ValueError('one k=1 baseline required per task')
+ if set(predictions)-set(gold):raise ValueError('unexpected prediction identity')
+ for p in predictions.values():
+  if p is not None and (set(p)!={'top_token','changed'} or not isinstance(p['top_token'],str) or type(p['changed']) is not bool):raise ValueError('invalid parsed prediction')
+ checks=[]
+ for i,g in gold.items():
+  baseline=baselines[g['task']]
+  if g['changed']!=(g['top_token']!=baseline['top_token']):raise ValueError('gold changed flag disagrees with outcomes')
+  p=predictions.get(i);b=predictions.get(baseline['id']);comparable=p is not None and b is not None
+  derived=p['top_token']!=b['top_token'] if comparable else None
+  checks.append({'id':i,'task':g['task'],'baseline_id':baseline['id'],'comparable':comparable,
+   'derived_changed':derived,'derived_changed_correct':comparable and derived==g['changed'],
+   'both_outcomes_correct':comparable and p['top_token']==g['top_token'] and b['top_token']==baseline['top_token'],
+   'raw_flag_self_contradiction':comparable and p['changed']!=derived})
+ return {'rows':len(checks),**{k:sum(r[k] for r in checks) for k in ('comparable','derived_changed_correct','both_outcomes_correct','raw_flag_self_contradiction')},
+  'scope':'Posthoc paired predictions, not repaired primary scores. Correct change alone can arise from two wrong outcomes; require both outcomes for pair credit.', 'scored':checks}
+def evaluate(manifest,paid,out,*,derive_changes=False):
  base=manifest.parent;m=json.loads(manifest.read_text())
  if sha(base/'private_gold.jsonl')!=m['files']['private_gold.jsonl']:raise ValueError('gold changed')
- gold={r['id']:r for r in [json.loads(x) for x in (base/'private_gold.jsonl').read_text().splitlines()]};allowed={c+'|'+i for c in CONDITIONS for i in gold}|{'writer|'+t for t in {r['task'] for r in gold.values()}};responses={}
+ gold_rows=[json.loads(x) for x in (base/'private_gold.jsonl').read_text().splitlines()]
+ gold={r['id']:r for r in gold_rows};allowed={c+'|'+i for c in CONDITIONS for i in gold}|{'writer|'+t for t in {r['task'] for r in gold.values()}};responses={}
  for line in (paid/'responses.jsonl').read_text().splitlines():
   r=json.loads(line);i=r['request_id']
   if i not in allowed or i in responses:raise ValueError('unexpected/duplicate response')
   responses[i]=r
  report={}
  for c in CONDITIONS:
-  scored=[]
+  scored=[];predictions={}
   for i,g in gold.items():
    writer=responses.get('writer|'+g['task'])
    if c=='prose' and (writer is None or not stopped(writer) or len(writer['completion'].encode())>PROSE_BYTES):p,reason=None,'writer_invalid'
    else:p,reason=prediction(responses.get(c+'|'+i))
+   predictions[i]=p
    scored.append({'id':i,'task':g['task'],'reason':reason,'top_correct':p is not None and p['top_token']==g['top_token'],'changed_correct':p is not None and p['changed']==g['changed'],'both_correct':p=={'top_token':g['top_token'],'changed':g['changed']}})
   report[c]={'rows':18,'top_correct':sum(r['top_correct'] for r in scored),'changed_correct':sum(r['changed_correct'] for r in scored),'both_correct':sum(r['both_correct'] for r in scored),'all6_joint_cases':sum(all(r['both_correct'] for r in scored if r['task']==t) for t in {g['task'] for g in gold.values()}),'scored':scored}
+  if derive_changes:report[c]['outcome_consistency']=outcome_consistency(gold_rows,predictions)
  report['scope']=m['scope'];out.write_text(json.dumps(report,indent=2)+'\n');return report
 if __name__=='__main__':
  ap=argparse.ArgumentParser();sub=ap.add_subparsers(dest='command',required=True)
  for cmd,keys in [('prepare',('evidence','tokenizer','prices','out')),('run',('manifest','out')),('evaluate',('manifest','paid','out'))]:
   p=sub.add_parser(cmd)
   for k in keys:p.add_argument('--'+k,type=Path,required=True)
+  if cmd=='evaluate':p.add_argument('--derive-changes',action='store_true',help='Add separately labeled paired-outcome diagnostics; raw scores stay unchanged')
  a=ap.parse_args()
  if a.command=='prepare':print(json.dumps(prepare(a.evidence,a.tokenizer,a.prices,a.out),indent=2))
  elif a.command=='run':run(a.manifest,a.out)
- else:print(json.dumps(evaluate(a.manifest,a.paid,a.out),indent=2))
+ else:print(json.dumps(evaluate(a.manifest,a.paid,a.out,derive_changes=a.derive_changes),indent=2))

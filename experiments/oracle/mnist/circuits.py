@@ -16,7 +16,10 @@ point family is also reported with it off). Every KL is in bits from the referen
             donor's activation (keep nothing): donor_norm = 1 - KL_S / KL_nothing.
   flips:    S on, each subcomponent outside S switched on independently with probability q, q ~ U(0, 1) per draw;
             reference: the real model on x.
-A circuit is accepted when every family's mean KL over its draws is at most TAU bits. The search: start from every
+A circuit is accepted when every family's mean KL over its draws is at most TAU bits. Each family is also reported in
+logit space (<family>_logit, not in the acceptance): the relative error of the run's centered logits from the reference
+run's, ||c(z) - c(z_ref)|| / ||c(z_ref)|| with c removing the mean over classes. The network is confident (median top
+probability 0.99998 on test images), so a KL near zero can hide a halved logit margin. The search: start from every
 subcomponent, try removing each in ascending order of its write on x (|a_c| ||U_c||), keep a removal when the smaller
 set is still accepted on the search draws; two passes. Scores are then measured on fresh draws and fresh donors.
 
@@ -101,7 +104,17 @@ class Scorer:
         remv[1 + 3 * n :] = rem
         lg = dec.run(self.x.expand(rows, -1), masks, remv, sel, val)
         ref = self.ref.expand(rows, -1)
+
+        def lerr(zr: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            zr = zr - zr.mean(-1, keepdim=True)
+            z = z - z.mean(-1, keepdim=True)
+            return (z - zr).norm(dim=-1) / zr.norm(dim=-1)
+
         return {
+            "point_logit": lerr(ref[:1], lg[:1]),
+            "removal_logit": lerr(lg[1 : 1 + n], lg[1 + n : 1 + 2 * n]),
+            "donor_logit": lerr(ref[o : o + n], lg[o : o + n]),
+            "flips_logit": lerr(ref[o + n :], lg[o + n :]),
             "point": kl_bits(ref[:1], lg[:1]),
             "removal": kl_bits(lg[1 : 1 + n], lg[1 + n : 1 + 2 * n]),
             "donor": kl_bits(ref[o : o + n], lg[o : o + n]),
@@ -132,6 +145,9 @@ def summarize(sc: Scorer, S: torch.Tensor, d: Draws, nothing: torch.Tensor, far:
     ag = fam["_agree"]
     out = {f: float(fam[f].mean()) for f in FAMILIES}
     out["worst"] = max(out[f] for f in FAMILIES)
+    for f in FAMILIES:
+        out[f"{f}_logit"] = float(fam[f"{f}_logit"].mean())
+    out["donor_far_logit"] = float(fam_far["donor_logit"].mean())
     out["agree_point"] = float(ag[0])
     out["agree_removal"] = float(ag[1 : 1 + n].mean())
     out["agree_donor"] = float(ag[1 + n : 1 + 2 * n].mean())
@@ -145,12 +161,18 @@ def summarize(sc: Scorer, S: torch.Tensor, d: Draws, nothing: torch.Tensor, far:
     return out
 
 
-def accepted(sc: Scorer, S: torch.Tensor, d: Draws, tau: float) -> bool:
+def accepted(sc: Scorer, S: torch.Tensor, d: Draws, tau: float, tau_logit: float | None = None) -> bool:
+    """Every family's mean KL at most tau bits; with tau_logit, also every family's mean logit error at most it."""
     fam = sc.families(S, d)
-    return all(float(fam[f].mean()) <= tau for f in FAMILIES)
+    ok = all(float(fam[f].mean()) <= tau for f in FAMILIES)
+    if tau_logit is not None:
+        ok = ok and all(float(fam[f"{f}_logit"].mean()) <= tau_logit for f in FAMILIES)
+    return ok
 
 
-def prune(sc: Scorer, order: torch.Tensor, d: Draws, tau: float, passes: int = 2, block: int = 64) -> torch.Tensor:
+def prune(
+    sc: Scorer, order: torch.Tensor, d: Draws, tau: float, passes: int = 2, block: int = 64, tau_logit: float | None = None
+) -> torch.Tensor:
     """Greedy removal in the given order; a block of candidates is removed at once when the smaller set is accepted,
     else it is split in halves down to single subcomponents (the same accepted set as one-at-a-time removal whenever
     removals do not interact, at far fewer runs)."""
@@ -161,7 +183,7 @@ def prune(sc: Scorer, order: torch.Tensor, d: Draws, tau: float, passes: int = 2
         if not js:
             return False
         S[js] = False
-        if accepted(sc, S, d, tau):
+        if accepted(sc, S, d, tau, tau_logit):
             return True
         S[js] = True
         if len(js) == 1:
@@ -207,8 +229,18 @@ def main() -> None:
     ap.add_argument("--eval-draws", type=int, default=64)
     ap.add_argument("--n-images", type=int, default=50)
     ap.add_argument("--random-sets", type=int, default=5)
+    ap.add_argument("--tau-logit", type=float, default=None, help="also bound each family's mean logit error (search)")
+    ap.add_argument("--rescore", default=None, help="a saved circuits file: score its circuits again, no search")
     ap.add_argument("--blocks", default="", help="layers kept as one whole-layer node each: fc1,fc2,fc3 (vpd), h1,h2 (neurons)")
     args = ap.parse_args()
+    saved = None
+    if args.rescore is not None:
+        blob = json.loads(Path(args.rescore).expanduser().read_text())
+        for key in ("tag", "tau", "tau_search", "tau_logit", "units", "draws", "eval_draws", "n_images", "random_sets",
+                    "blocks"):
+            if key in blob["args"]:
+                setattr(args, key, blob["args"][key])
+        saved = {r["image"]: r for r in blob["results"]}
     torch.set_num_threads(3)
     torch.manual_seed(0)
     tau_s = args.tau if args.tau_search is None else args.tau_search
@@ -266,7 +298,11 @@ def main() -> None:
         is_block = torch.zeros(n_nodes, dtype=torch.bool) if G is None else G.sum(1) > 1
         node_contrib = contrib if G is None else G.float() @ contrib
         node_ci = ci if G is None else torch.where(is_block, torch.tensor(1e3), (G.float() @ ci))
-        S = prune(sc, node_contrib.argsort(), dsearch, tau_s)
+        if saved is None:
+            S = prune(sc, node_contrib.argsort(), dsearch, tau_s, tau_logit=args.tau_logit)
+        else:
+            S = torch.zeros(n_nodes, dtype=torch.bool)
+            S[[node_names.index(m) for m in saved[idx]["members"]]] = True
         k = int(S.sum())
         active = node_ci > 0
         methods = {
@@ -311,10 +347,15 @@ def main() -> None:
             + f" ({time.time() - t0:.0f}s)",
             flush=True,
         )
-    suffix = "" if args.tau_search is None else f"_s{args.tau_search}"
+    suffix = ("" if args.tau_search is None else f"_s{args.tau_search}") + (
+        "" if args.tau_logit is None else f"_logit{args.tau_logit}"
+    )
     unit = ("" if args.units == "vpd" else "_neurons") + ("" if not blocks else "_blocks-" + "-".join(blocks))
     out = DATA / f"circuits_{args.tag}{unit}_tau{args.tau}{suffix}.json"
-    out.write_text(json.dumps({"args": vars(args), "results": results}, indent=1))
+    if args.rescore is not None:
+        assert out == Path(args.rescore).expanduser(), (out, args.rescore)
+    args_out = {k: v for k, v in vars(args).items() if k != "rescore"}
+    out.write_text(json.dumps({"args": args_out, "results": results}, indent=1))
     agg = {}
     for m in results[0]["eval"]:
         agg[m] = {

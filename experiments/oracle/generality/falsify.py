@@ -145,7 +145,9 @@ def roles_entry(kind, task, ids, t, D):
     r = rng_of("moved", task, t)
     pool = [q for q in range(2, t) if q not in taken and q - 1 not in taken]
     moved = int(pool[int(r.integers(len(pool)))]) if pool else None
-    fixed = t - D if t - D != a and t - D >= 2 else t - D - 1
+    fixed = max(2, t - D)  # a text shorter than D: the nearest position with an earlier one (its o column)
+    if fixed == a:
+        fixed = fixed - 1 if fixed - 1 >= 2 else fixed + 1
     far = [q for q in range(2, t) if min(abs(q - a), abs(q - o), abs(q - t)) >= 10 and q not in taken]
     far = sorted(int(x) for x in r.choice(far, size=min(2, len(far)), replace=False)) if far else []
     e = {"kind": kind, "task": task, "t": t, "a": a, "o": o, "occurrences": occ, "moved": moved, "fixed": fixed, "far": far,

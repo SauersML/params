@@ -84,18 +84,26 @@ COMPARE_DRAWS = goal_eval.CHANGED_DRAWS  # compare's changed inputs (track_pp's 
 OTHER = {"search": "eval", "eval": "search"}
 LN2 = math.log(2)
 
-SYSTEM = ("You explain how a small language model, vpd4l (4 layers, each with attention (q, k, v, o) and an MLP (fc, "
-          "down)), computes its next-token prediction on a text, in VPD subcomponents: rank-one slices of its weight "
+SYSTEM = ("You explain how a small language model, vpd4l (layers 0 to 3, each with attention (q, k, v, o) and an MLP "
+          "(fc, down)), computes its next-token prediction on a text, in VPD subcomponents: rank-one slices of its weight "
           "matrices, 38,912 in all, written L<layer>.<kind>#<index>@<position>. You do not know the subcomponents' roles "
           "in advance: measure them with the tools before you answer. Useful order: influence() for the context "
-          "positions the prediction reads; list_active() at the target and at those positions (pass next_offset as "
-          "offset to read further pages, until next_offset is null); attention() for where "
-          "the heads at the target read; measure_removal() for which subcomponents the prediction needs; run_circuit() "
-          "to score a draft circuit (point: graph F1 on the text; pp: path-patched agreement with the model on changed "
-          "inputs; 1 is as faithful as VPD's whole answer) and compare() to see where two drafts differ. A circuit's "
-          "first Mermaid line after flowchart LR may be %% complete: its nodes then claim every connection the model has "
-          "among them, and it needs no edge lines. Each tool call costs a little reward: call what you need, then reply "
-          "without a tool call. That reply is your answer, in the format the question asks for.")
+          "positions the prediction reads; list_active() at the target and at those positions (facts=false for long "
+          "lists; next_offset as offset for further pages); attention() for where the heads at the target read; "
+          "measure_removal() for which subcomponents the prediction needs; run_circuit() to score a draft circuit "
+          "(point: graph F1 on the text; pp: path-patched agreement with the model on changed inputs; 1 is as faithful "
+          "as VPD's whole answer) and compare() to see where two drafts differ. A draft is given as positions=[...] "
+          "(every VPD-active subcomponent there), nodes=[...] (with edges=[[writer, reader], ...], reader OUT for the "
+          "prediction, or every connection among them when no edges are given) or Mermaid text, or as base=<draft id> "
+          "with add=[...] and drop=[...]; each run_circuit returns its draft id (d1, d2, ...), which compare() also "
+          "takes. In your answer the CIRCUIT section may be a draft id alone (CIRCUIT: d3): its Mermaid is filled in. "
+          "Each tool call costs a little reward: call what you need, then reply without a tool call. That reply is your "
+          "answer, in the format the question asks for.")
+
+
+MERMAID_HINT = ("Declare each node on its own line inside its position's subgraph, a[\"L3.fc#2304\"] (no @position in the "
+                "label: the subgraph P<position> gives it), then the edges by id on their own lines, a --> b and a --> OUT; "
+                "or pass nodes=[...] (and edges) or positions=[...] instead of Mermaid.")
 
 
 def _r(x, k: int = 3):
@@ -128,7 +136,8 @@ TOOL_SPECS = [
          "position": {"type": "integer"},
          "site": {"type": "string", "description": "only this matrix, L<layer>.<kind>, e.g. L2.v"},
          "top": {"type": "integer", "description": f"subcomponents per page (default {LIST_TOP}, at most {LIST_MAX})"},
-         "offset": {"type": "integer", "minimum": 0, "description": "zero-based start in the ranked list (default 0)"}},
+         "offset": {"type": "integer", "minimum": 0, "description": "zero-based start in the ranked list (default 0)"},
+         "facts": {"type": "boolean", "description": "each subcomponent's lens and Pile tokens (default true)"}},
          "required": ["position"]}},
     {"name": "attention",
      "description": "Where the attention heads of a layer read at a position in the real model: per head its top source "
@@ -141,24 +150,35 @@ TOOL_SPECS = [
     {"name": "measure_removal",
      "description": "Remove subcomponents (L<layer>.<kind>#<index>@<position>) from the real model's weights at their "
                     "positions, everything else unchanged: the KL in bits of the prediction at the target from the "
-                    "model's, and the new top tokens. each=true: one removal per subcomponent instead of all at once.",
+                    "model's, and the new top tokens. each=true: one removal per subcomponent instead of all at once, "
+                    "most needed first. draft: a draft's subcomponents in place of nodes.",
      "parameters": {"type": "object", "properties": {
          "nodes": {"type": "array", "items": {"type": "string"}},
-         "each": {"type": "boolean"}}, "required": ["nodes"]}},
+         "draft": {"type": "string", "description": "a draft id from run_circuit"},
+         "each": {"type": "boolean"}}, "required": []}},
     {"name": "run_circuit",
-     "description": "Score a draft CIRCUIT (the Mermaid flowchart of the answer format): point (its graph F1 on the "
-                    "text, 1 = as close to the model as VPD's whole answer, on a log scale from the empty circuit), pp "
-                    "(its path-patched agreement with the model on changed inputs, the same scale), its size in bits, "
-                    "and the nodes and edges dropped as invalid or stranded. changes: [[position, token], ...] runs the "
+     "description": "Score a draft circuit: point (its graph F1 on the text, 1 = as close to the model as VPD's whole "
+                    "answer, on a log scale from the empty circuit), pp (its path-patched agreement with the model on "
+                    "changed inputs, the same scale), its size in bits, the nodes and edges dropped as invalid or "
+                    "stranded, and its draft id. Give positions, nodes (with edges, or every connection among them), "
+                    "Mermaid text (circuit), or base with add and drop. changes: [[position, token], ...] runs the "
                     "circuit path-patched on that changed text instead and gives its top tokens beside the model's.",
      "parameters": {"type": "object", "properties": {
-         "circuit": {"type": "string", "description": "the Mermaid flowchart"},
+         "positions": {"type": "array", "items": {"type": "integer"}, "description": "every VPD-active subcomponent at these positions"},
+         "nodes": {"type": "array", "items": {"type": "string"}, "description": "L<layer>.<kind>#<index>@<position> (tok@<position>: the token embedding)"},
+         "edges": {"type": "array", "items": {"type": "array", "items": {"type": "string"}},
+                   "description": "[[writer, reader], ...] by node, reader OUT for the prediction (none: every connection among the nodes)"},
+         "circuit": {"type": "string", "description": "the Mermaid flowchart of the answer format"},
+         "base": {"type": "string", "description": "a draft id to start from"},
+         "add": {"type": "array", "items": {"type": "string"}, "description": "nodes added to the base"},
+         "drop": {"type": "array", "items": {"type": "string"}, "description": "nodes dropped from the base (with their edges)"},
          "changes": {"type": "array", "items": {"type": "array"},
                      "description": "[[position, token], ...], token as quoted in the question, e.g. \"' castle'\", or an id"}},
-         "required": ["circuit"]}},
+         "required": []}},
     {"name": "compare",
      "description": "The changed inputs on which two draft circuits' path-patched predictions disagree most: per input "
-                    "the change, the model's top token, each draft's top token and KL from the model.",
+                    "the change, the model's top token, each draft's top token and KL from the model. Each circuit a "
+                    "draft id (d3) or Mermaid text.",
      "parameters": {"type": "object", "properties": {
          "circuit_a": {"type": "string"}, "circuit_b": {"type": "string"},
          "top": {"type": "integer", "description": "inputs to list (default 5)"}}, "required": ["circuit_a", "circuit_b"]}},
@@ -171,14 +191,17 @@ def qwen3_tools() -> list[dict]:
     return [{"type": "function", "function": s} for s in TOOL_SPECS]
 
 
-def _site_of(text: str) -> str:
-    """A matrix from L<layer>.<kind> (or goal_eval._site's forms)."""
-    t = text.strip()
+def _site_of(text: str, names=None) -> str:
+    """A matrix from L<layer>.<kind> (or goal_eval._site's forms), one of names when given (vpd4l's otherwise)."""
+    t = str(text).strip()
     t = t[1:] if t[:1] in ("L", "l") else t
     try:
-        return goal_eval._site(t)
+        n = goal_eval._site(t)
     except (ValueError, KeyError):
-        raise ToolError(f"site {text!r}: write L<layer>.<kind>, kind one of q, k, v, o, fc, down") from None
+        n = None
+    if n is None or (names is not None and n not in names):
+        raise ToolError(f"site {text!r}: write L<layer>.<kind>, layer 0 to 3, kind one of q, k, v, o, fc, down")
+    return n
 
 
 class Tools:
@@ -203,26 +226,37 @@ class Tools:
 
     def call(self, name: str, args: dict | str | None) -> str:
         """A tool's result as the text the policy reads (compact JSON; an error as {"error": ...})."""
+        return self.call_full(name, args)[0]
+
+    def call_full(self, name: str, args: dict | str | None) -> tuple[str, dict]:
+        """(the result's text, its side data: keys starting with _, never shown: run_circuit's circuit JSON as
+        "_json"); a repeated call is answered from memory."""
         if isinstance(args, str):
             try:
                 args = json.loads(args) if args.strip() else {}
             except json.JSONDecodeError as e:
-                return json.dumps({"error": f"arguments are not JSON: {e}"})
-        args = args or {}
+                return json.dumps({"error": f"arguments are not JSON: {e}"}), {}
+        args = args if isinstance(args, dict) else {}
         key = (name, json.dumps(args, sort_keys=True))
         if key in self.memo:
             return self.memo[key]
         if name not in TOOL_NAMES:
-            return json.dumps({"error": f"no tool {name!r}; tools: {', '.join(TOOL_NAMES)}"})
+            return json.dumps({"error": f"no tool {name!r}; tools: {', '.join(TOOL_NAMES)}"}), {}
         t0 = time.perf_counter()
         try:
             out = getattr(self, name)(**args)
         except (ToolError, TypeError) as e:
             out = {"error": str(e)}
+        except Exception as e:  # a tool's own failure goes back to the policy (and the log), the episode goes on
+            import traceback
+
+            traceback.print_exc()
+            out = {"error": f"{type(e).__name__}: {e}"}
         finally:
             native.free(self.nat.dev)
         self.seconds.setdefault(name, []).append(time.perf_counter() - t0)
-        self.memo[key] = json.dumps(out, separators=(",", ":"), ensure_ascii=False)
+        side = {k: out.pop(k) for k in [k for k in out if k.startswith("_")]}
+        self.memo[key] = (json.dumps(out, separators=(",", ":"), ensure_ascii=False), side)
         return self.memo[key]
 
     def _pos(self, p, name: str = "position") -> int:
@@ -256,16 +290,80 @@ class Tools:
             raise ToolError("no nodes given")
         return list(dict.fromkeys(out))
 
-    def _graph(self, text: str):
-        """(goal_eval's Graph of a draft CIRCUIT, its defects) from Mermaid text (with or without CIRCUIT: and its
-        fence)."""
-        if not isinstance(text, str) or not text.strip():
-            raise ToolError("circuit must be the Mermaid flowchart text")
-        body = text if "CIRCUIT" in text.upper() else "CIRCUIT:\n" + text
-        p = components.parse(body)
+    def _answer(self, circuit=None, nodes=None, edges=None, positions=None, complete=None, _json=None) -> dict:
+        """parse()'s form ({"answer": circuit JSON, "malformed", "malformed_nodes", "unknown_ids"}) of a draft given
+        as circuit JSON (_json, a draft's), Mermaid text, a list of nodes in a string, or nodes, edges and positions."""
+        if _json is not None:
+            return {"answer": _json, "malformed": 0, "malformed_nodes": 0, "unknown_ids": 0}
+        if isinstance(circuit, str) and circuit.strip():
+            items = [x for x in re.split(r"[\s,;]+", circuit.strip()) if x]
+            if not re.search(r"flowchart|subgraph|-->|CIRCUIT", circuit) and all(components.group_of(x) for x in items):
+                nodes, circuit = items, None  # a node list: every connection among them
+            else:
+                body = circuit if "CIRCUIT" in circuit.upper() else "CIRCUIT:\n" + circuit
+                p = components.parse(body)
+                p["bad_examples"] = self._bad_lines(circuit)
+                return p
+        if circuit is not None:
+            raise ToolError("circuit must be the Mermaid flowchart text or a list of nodes")
+        if not nodes and not positions:
+            raise ToolError("give positions, nodes, circuit or base")
+        tx = self.tx
+        out, at, bad = [], {}, 0
+
+        def place(nd):
+            if nd not in at:
+                at[nd] = len(out)
+                out.append(["block", nd[0], nd[1]] if nd[2] == components.BLOCK else [nd[0], nd[2], nd[1]])
+            return at[nd]
+
+        for p in positions or []:
+            p = self._pos(p, "a position")
+            for n in self.nat.names:
+                for c in (tx.vpd[n][p].nonzero().flatten().tolist() if tx.vpd is not None else []):
+                    place((n, p, c))
+        for x in nodes or []:
+            g = components.group_of(str(x))
+            if not g:
+                bad += 1
+                continue
+            for nd in g:
+                place(nd)
+        es = []
+        for e in edges or []:
+            if not isinstance(e, (list, tuple)) or len(e) != 2:
+                bad += 1
+                continue
+            w = components.node_of(str(e[0]))
+            r = "out" if str(e[1]).strip().lower() == "out" else components.node_of(str(e[1]))
+            if w is None or r is None:
+                bad += 1
+                continue
+            es.append([place(w), "out" if r == "out" else place(r)])
+        ans = {"nodes": out, "edges": es}
+        if (complete is None and not edges) or complete:
+            ans["complete"] = True
+        return {"answer": ans, "malformed": 0, "malformed_nodes": bad, "unknown_ids": 0}
+
+    @staticmethod
+    def _bad_lines(text: str, k: int = 3) -> list[str]:
+        """The first k lines of a Mermaid draft that no line form of components' grammar reads."""
+        out = []
+        for line in (x.strip() for x in text.splitlines()):
+            if (not line or line.startswith(("```", "%%", "direction ", "CIRCUIT")) or line.lower().startswith("flowchart")
+                    or line == "end" or components.MM_SUB.fullmatch(line) or components.MM_DECLS.fullmatch(line)
+                    or components.MM_PAIR.fullmatch(line) or components.MM_EDGE.fullmatch(line)):
+                continue
+            out.append(line[:160])
+            if len(out) >= k:
+                break
+        return out
+
+    def _graph(self, circuit=None, **kw):
+        """(goal_eval's Graph of a draft, its defects, parse()'s form) from any of _answer's input forms."""
+        p = self._answer(circuit, **kw)
         if not p["answer"]["nodes"]:
-            raise ToolError("the circuit declares no node (flowchart LR, then subgraph P<position>[...] blocks declaring "
-                            "id[\"L<layer>.<kind>#<index>\"], end, then edges)")
+            raise ToolError("the circuit declares no node: " + MERMAID_HINT + (f" Lines not read: {p['bad_examples']}" if p.get("bad_examples") else ""))
         g, d = goal_eval.circuit(p["answer"], self.targets, self.nat.C, self.T)
         d["malformed_lines"] = p["malformed"]
         d["unknown_ids"] = p["unknown_ids"]
@@ -297,13 +395,15 @@ class Tools:
                 "over_1pct": int((moved >= goal_eval.SHARE_FLOOR * total).sum()) if total > 0 else 0,
                 "columns": ["position", "token", "bits", "share"], "positions": rows}
 
-    def list_active(self, position, site: str | None = None, top: int = LIST_TOP, offset: int = 0) -> dict:
+    def list_active(self, position, site: str | None = None, top: int = LIST_TOP, offset: int = 0, facts: bool = True) -> dict:
         p = self._pos(position)
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ToolError("offset must be a non-negative integer")
         top = max(1, min(int(top), LIST_MAX))
         matrix_order = {n: i for i, n in enumerate(self.nat.names)}
         names = [_site_of(site)] if site else self.nat.names
+        if site and names[0] not in self.nat.names:
+            raise ToolError(f"site {site!r} is not one of the model's matrices")
         tx, nat = self.tx, self.nat
         ranked = []
         for n in names:
@@ -315,12 +415,12 @@ class Tools:
             ranked += [((n, p, c), a, b) for c, a, b in zip(cs, ci, act)]
         ranked.sort(key=lambda x: (-x[1] * abs(x[2]), matrix_order[x[0][0]], x[0][2]))
         shown = ranked[offset:offset + top]
-        facts = self._facts([nd for nd, _, _ in shown])
+        facts = self._facts([nd for nd, _, _ in shown]) if facts else {}
         return {"position": p, "token": self._tok(p), "active": len(ranked), "shown": len(shown),
                 "total": len(ranked), "offset": offset,
                 "next_offset": offset + len(shown) if offset + len(shown) < len(ranked) else None,
-                "columns": ["node", "ci", "act", "facts"],
-                "subcomponents": [[components.node_text(nd), _r(c, 2), _r(a, 3), facts.get(nd, "")] for nd, c, a in shown]}
+                "columns": ["node", "ci", "act"] + (["facts"] if facts else []),
+                "subcomponents": [[components.node_text(nd), _r(c, 2), _r(a, 3)] + ([facts.get(nd, "")] if facts else []) for nd, c, a in shown]}
 
     def _facts(self, nodes: list) -> dict:
         if not nodes or self.atlas is None:
@@ -350,7 +450,11 @@ class Tools:
         return {"layer": layer, "position": p, "columns": ["position", "token", "weight"],
                 "heads": {f"h{h}": [[int(a), self._tok(int(a)), _r(b, 2)] for a, b in zip(at[h].tolist(), w[h].tolist())] for h in heads}}
 
-    def measure_removal(self, nodes, each: bool = False) -> dict:
+    def measure_removal(self, nodes=None, each: bool = False, draft=None, _json=None) -> dict:
+        if draft is not None and _json is None:
+            raise ToolError(f"no draft {draft!r} in this episode")
+        if _json is not None:
+            nodes = [components.node_text((m, t, c)) for m, c, t in _json["nodes"] if m not in ("block", components.TOK)]
         nds = self._nodes(nodes)
         tx = self.tx
         if each:
@@ -372,12 +476,18 @@ class Tools:
         return {"point": _r(pt["f1_live"]), "point_kl_bits": _r(pt["kl_live"]), "necessity": _r(pt["n_live"]),
                 "pp": _r(pp["s_track_pp"]), "pp_kl_bits": _r(pp["kl_track_pp_c"]), "pp_inputs": pp["prompts_track_pp"]}
 
-    def run_circuit(self, circuit: str, changes=None) -> dict:
-        g, d, p = self._graph(circuit)
+    def run_circuit(self, circuit=None, nodes=None, edges=None, positions=None, complete=None, changes=None, _json=None,
+                    base=None, add=None, drop=None) -> dict:
+        if base is not None or add or drop:
+            raise ToolError("base, add and drop need an episode's drafts (the environment resolves them)")
+        g, d, p = self._graph(circuit, nodes=nodes, edges=edges, positions=positions, complete=complete, _json=_json)
         g = goal_eval.strand(g, self.targets, self.nat.C)
         out = {"nodes": g.count(), "edges": native.count_edges(g.node_set(), self.targets) if g.complete else g.edges(),
-               "bits": _r(self._bits(g, p, d)), "dropped_nodes": d["invalid_nodes"] + d["unknown_ids"],
-               "dropped_edges": d["invalid_edges"], "stranded_nodes": d["stranded_nodes"], "bad_lines": d["malformed_lines"]}
+               "bits": _r(self._bits(g, p, d)), "dropped_nodes": d["invalid_nodes"] + d["unknown_ids"] + p.get("malformed_nodes", 0) * (_json is None and circuit is None),
+               "dropped_edges": d["invalid_edges"], "stranded_nodes": d["stranded_nodes"], "bad_lines": d["malformed_lines"],
+               "_json": p["answer"]}
+        if p.get("bad_examples"):
+            out |= {"bad_examples": p["bad_examples"], "hint": MERMAID_HINT}
         if not g.count():
             return {**out, "error": "no valid node left"}
         if changes is None:
@@ -413,9 +523,10 @@ class Tools:
             x2[p] = z
         return x2
 
-    def compare(self, circuit_a: str, circuit_b: str, top: int = 5) -> dict:
+    def compare(self, circuit_a, circuit_b, top: int = 5) -> dict:
         ge, tx, nat = self.ge, self.tx, self.nat
-        gs = [goal_eval.strand(self._graph(c)[0], self.targets, nat.C) for c in (circuit_a, circuit_b)]
+        gs = [goal_eval.strand(self._graph(**(c if isinstance(c, dict) else {"circuit": c}))[0], self.targets, nat.C)
+              for c in (circuit_a, circuit_b)]
         if not all(g.count() for g in gs):
             raise ToolError("a circuit has no valid node")
         moved = np.asarray(tx.moved, dtype=float)
@@ -503,8 +614,14 @@ class Env:
                                  split=self.score_split, pool=self.pool)[0]
 
 
+DRAFT_RE = re.compile(r"\bd\d+\b")
+CIRCUIT_DRAFT = re.compile(r"(CIRCUIT\s*:)\s*(?:```(?:mermaid)?\s*)?(d\d+)\s*(?:```)?[ \t]*(?=\n|$)", re.I)
+
+
 class Episode:
-    """One episode on one text: its messages, its tool calls, its answer and reward."""
+    """One episode on one text: its messages, its tool calls, its drafts (each run_circuit's circuit JSON by id, d1,
+    d2, ...: later calls start from one with base, add and drop, compare and measure_removal take ids, and an answer's
+    CIRCUIT may be one), its answer and reward."""
 
     def __init__(self, env: Env, tid: str):
         self.env, self.tid, self.id = env, tid, uuid.uuid4().hex[:12]
@@ -512,15 +629,74 @@ class Episode:
         self.messages = [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": question(env.task(tid), env.rows[tid])}]
         self.calls, self.turns, self.answer, self.result = 0, 0, None, None
+        self.drafts: dict = {}
+        self.asked: dict = {}  # (tool, resolved arguments) -> times asked in this episode
         self.log: list = []  # [tool, arguments, seconds, cached]
+
+    def _draft(self, ref) -> dict:
+        ref = str(ref).strip()
+        if ref not in self.drafts:
+            raise ToolError(f"no draft {ref!r} in this episode (drafts: {', '.join(self.drafts) or 'none yet'})")
+        return self.drafts[ref]
+
+    def _resolve(self, name: str, args: dict) -> dict:
+        """The arguments with draft ids replaced by their circuit JSON (base with add and drop applied)."""
+        args = dict(args)
+        if name == "run_circuit" and (args.get("base") is not None or args.get("add") or args.get("drop")):
+            if args.get("base") is None:
+                raise ToolError("add and drop need base, a draft id")
+            ans = json.loads(json.dumps(self._draft(args.pop("base"))))
+            drop = {nd for x in args.pop("drop", None) or [] for nd in (components.group_of(str(x)) or [])}
+            for i in sorted((i for i, (m, c, t) in enumerate(ans["nodes"]) if (m if m != "block" else c, t, c if m != "block" else components.BLOCK) in drop
+                             or (m == components.TOK and (components.TOK, t, 0) in drop)), reverse=True):
+                ans = components._without_part(ans, i)
+            have = {(m, t, c) for m, c, t in ans["nodes"]}
+            for x in args.pop("add", None) or []:
+                for nd in components.group_of(str(x)) or []:
+                    if (nd[0], nd[1], nd[2]) not in have:
+                        ans["nodes"].append(["block", nd[0], nd[1]] if nd[2] == components.BLOCK else [nd[0], nd[2], nd[1]])
+                        have.add(nd)
+            for e in args.pop("edges", None) or []:
+                if isinstance(e, (list, tuple)) and len(e) == 2:
+                    w, r = components.node_of(str(e[0])), ("out" if str(e[1]).strip().lower() == "out" else components.node_of(str(e[1])))
+                    idx = {(m, t, c): i for i, (m, c, t) in enumerate(ans["nodes"])}
+                    if w in idx and (r == "out" or r in idx):
+                        ans["edges"].append([idx[w], "out" if r == "out" else idx[r]])
+            args["_json"] = ans
+        if name == "compare":
+            for k in ("circuit_a", "circuit_b"):
+                if isinstance(args.get(k), str) and DRAFT_RE.fullmatch(args[k].strip()):
+                    args[k] = {"_json": self._draft(args[k])}
+        if name == "measure_removal" and args.get("draft") is not None:
+            args["_json"] = self._draft(args["draft"])
+        return args
 
     def call(self, name: str, args) -> str:
         self.calls += 1
-        cached = (name, json.dumps(args if isinstance(args, dict) else {}, sort_keys=True)) in self.tools.memo
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError as e:
+                return json.dumps({"error": f"arguments are not JSON: {e}"})
+        args = args if isinstance(args, dict) else {}
         t0 = time.perf_counter()
-        out = self.tools.call(name, args)
+        try:
+            full = self._resolve(name, args)
+        except ToolError as e:
+            self.log.append([name, args, 0.0, False])
+            return json.dumps({"error": str(e)})
+        key = (name, json.dumps(full, sort_keys=True))
+        cached = key in self.tools.memo
+        text, side = self.tools.call_full(name, full)
+        if "_json" in side and text.endswith("}"):  # a scored draft: its id
+            did = next((k for k, v in self.drafts.items() if v == side["_json"]), None) or f"d{len(self.drafts) + 1}"
+            self.drafts[did] = side["_json"]
+            text = text[:-1] + f',"draft":"{did}"}}'
+        self.asked[key] = self.asked.get(key, 0) + 1
+        if self.asked[key] > 1 and text.endswith("}"):  # the same call again in this episode: the same result
+            text = text[:-1] + f',"repeated":{self.asked[key] - 1}}}'
         self.log.append([name, args, round(time.perf_counter() - t0, 3), cached])
-        return out
+        return text
 
     def step(self, message: dict) -> bool:
         """Take the policy's assistant message: run its tool calls (one tool message each) or, with none, take it as
@@ -538,14 +714,24 @@ class Episode:
             self.messages.append({"role": "tool", "name": fn["name"], "content": self.call(fn["name"], fn.get("arguments"))})
         return self.turns >= MAX_TURNS or self.calls >= MAX_CALLS
 
+    def expand(self, text: str) -> str:
+        """An answer with a CIRCUIT that is a draft id alone given that draft's Mermaid (components.render's)."""
+        m = CIRCUIT_DRAFT.search(text or "")
+        if not m or m[2] not in self.drafts:
+            return text
+        mermaid = components.render({k: v for k, v in self.drafts[m[2]].items() if k != "explanation"})
+        return text[:m.start()] + mermaid + text[m.end():]
+
     def finish(self) -> dict:
-        """The episode's reward: components.reward of its answer minus COST per call (no answer: V3_INVALID)."""
+        """The episode's reward: components.reward of its answer (a draft id in its CIRCUIT expanded) minus COST per
+        call (no answer: V3_INVALID)."""
         t0 = time.perf_counter()
-        r = self.env.score(self.tid, self.answer) if self.answer is not None else None
+        answer = self.expand(self.answer) if self.answer is not None else None
+        r = self.env.score(self.tid, answer) if answer is not None else None
         base = r["reward"] if r is not None else components.V3_INVALID
         self.result = {"task": self.tid, "reward": base - self.env.cost * self.calls, "answer_reward": base, "calls": self.calls,
                        "turns": self.turns, "answered": self.answer is not None, "score_seconds": round(time.perf_counter() - t0, 2),
-                       "scores": _brief(r) if r is not None else None}
+                       "scores": _brief(r) if r is not None else None, "answer_expanded": answer if answer != self.answer else None}
         return self.result
 
 
@@ -580,15 +766,15 @@ def _call(name: str, **args) -> dict:
 
 
 class Scripted:
-    """The baseline policy on the tools alone: influence(); list_active() at the target and the positions moving the
-    prediction by at least 1% of the total; the influential start, the actives at the target and the m most
-    influential positions as a complete node set (%% complete), m the smallest whose run_circuit pp reaches FLOOR;
-    then nodes pruned in order of their measured removal (measure_removal each, smallest first): each turn tries
-    dropping the next chunk, half of it and a quarter of it at once (three run_circuit calls) and keeps the largest
-    drop whose pp and point stay within TOLERANCE of the start's; the chunk starts at half the start and halves after
-    a turn with no drop kept, until it is below 1/MIN_FRACTION of the start or the turns or calls run out (the
-    episode's MAX_TURNS and MAX_CALLS, one turn kept for the answer). The answer: the pruned node set, complete, cut
-    to components.NODE_CAP nodes (the most needed kept) when larger."""
+    """The baseline policy on the tools alone, in drafts: influence(); the influential start, every VPD-active
+    subcomponent at the target and the m most influential positions (run_circuit(positions=...), a complete node set),
+    m the smallest whose pp reaches FLOOR (positions moving the prediction by at least 1% of the total, at most
+    MAX_POSITIONS); the start's nodes ordered by their measured removal (measure_removal(draft, each)); then each turn
+    tries dropping the next chunk, half of it and a quarter of it from the current draft at once (three run_circuit
+    calls, base and drop) and keeps the largest drop whose pp and point stay within TOLERANCE of the start's; the chunk
+    starts at half the start and halves after a turn with no drop kept, until it is below 1/MIN_FRACTION of the start
+    or the turns or calls run out (the episode's MAX_TURNS and MAX_CALLS, one turn kept for the answer). A draft above
+    components.NODE_CAP drops its least needed nodes to the cap. The answer: CIRCUIT: <the last kept draft>."""
 
     FLOOR = 0.9
     TOLERANCE = 0.05
@@ -625,56 +811,49 @@ class Scripted:
         t = inf["target"]
         share = [(row[0], row[3]) for row in inf["positions"] if row[0] != t]
         cands = [p for p, s in share if s is not None and s >= goal_eval.SHARE_FLOOR][:self.MAX_POSITIONS]
-        pages = [(p, 0) for p in [t] + cands]
-        act = {}
-        while pages:  # every page of each position's actives (list_active's next_offset)
-            lists = yield self._msg(*[_call("list_active", position=p, top=LIST_MAX, offset=o) for p, o in pages])
-            turns, calls = turns + 1, calls + len(lists)
-            for r in lists:
-                act.setdefault(r["position"], []).extend(components.node_of(x[0]) for x in r.get("subcomponents", []))
-            pages = [(r["position"], r["next_offset"]) for r in lists if r.get("next_offset") is not None]
-        start, score = [], {}
+        score = {}
         for m in range(len(cands) + 1):
-            nodes = [nd for p in [t] + cands[:m] for nd in act.get(p, [])]
-            (score,) = yield self._msg(_call("run_circuit", circuit=self._circuit(nodes)))
-            turns, calls, start = turns + 1, calls + 1, nodes
-            self.trace.append({"m": m, "nodes": len(nodes), "pp": score.get("pp"), "point": score.get("point"), "bits": score.get("bits")})
+            (score,) = yield self._msg(_call("run_circuit", positions=[t] + cands[:m]))
+            turns, calls = turns + 1, calls + 1
+            self.trace.append({"m": m, "nodes": score.get("nodes"), "pp": score.get("pp"), "point": score.get("point"), "bits": score.get("bits"),
+                               "draft": score.get("draft")})
             if (score.get("pp") or 0) >= self.FLOOR:
                 break
+        draft, size = score.get("draft"), score.get("nodes") or 0
         base_pp, base_pt = score.get("pp") or 0.0, score.get("point") or 0.0
-        (rem,) = yield self._msg(_call("measure_removal", nodes=[components.node_text(nd) for nd in start[:REMOVE_EACH_MAX]], each=True))
+        (rem,) = yield self._msg(_call("measure_removal", draft=draft, each=True))
         turns, calls = turns + 1, calls + 1
-        kl = {components.node_of(x[0]): x[1] for x in rem.get("removals", [])}
-        order = sorted(start, key=lambda nd: kl.get(nd, float("inf")))  # least needed first; unmeasured last
-        keep, i, chunk = list(start), 0, max(1, len(order) // 2)
+        order = [x[0] for x in rem.get("removals", [])][::-1]  # least needed first
+        chunk = max(1, len(order) // 2)
         floor = max(1, len(order) // self.MIN_FRACTION)
-        while i < len(order) and chunk >= floor and turns < self.max_turns - 1 and calls + len(self.TRIALS) <= self.max_calls:
+        while order and chunk >= floor and turns < self.max_turns - 2 and calls + len(self.TRIALS) + 1 <= self.max_calls:
             sizes = sorted({max(1, chunk // k) for k in self.TRIALS}, reverse=True)
-            trials = [[nd for nd in keep if nd not in set(order[i:i + n])] for n in sizes]
-            got = yield self._msg(*[_call("run_circuit", circuit=self._circuit(tr)) for tr in trials])
-            turns, calls = turns + 1, calls + len(trials)
+            got = yield self._msg(*[_call("run_circuit", base=draft, drop=order[:n]) for n in sizes])
+            turns, calls = turns + 1, calls + len(sizes)
             kept = None
-            for n, tr, sc in zip(sizes, trials, got):
+            for n, sc in zip(sizes, got):
                 ok = (sc.get("pp") or 0) >= base_pp - self.TOLERANCE and (sc.get("point") or 0) >= base_pt - self.TOLERANCE
-                self.trace.append({"drop": n, "nodes": len(tr), "pp": sc.get("pp"), "point": sc.get("point"), "bits": sc.get("bits"), "kept": ok})
+                self.trace.append({"drop": n, "nodes": sc.get("nodes"), "pp": sc.get("pp"), "point": sc.get("point"), "bits": sc.get("bits"),
+                                   "kept": ok, "draft": sc.get("draft")})
                 if ok and kept is None:
-                    kept = (n, tr)
+                    kept = (n, sc)
             if kept:
-                keep, i = kept[1], i + kept[0]
+                draft, size, order = kept[1]["draft"], kept[1]["nodes"], order[kept[0]:]
             else:
                 chunk //= 2
-        if len(keep) > components.NODE_CAP:  # the answer's cap: the most needed kept
-            keep = sorted(keep, key=lambda nd: -kl.get(nd, float("inf")))[:components.NODE_CAP]
-            self.trace.append({"cap": components.NODE_CAP})
+        if size > components.NODE_CAP:  # the answer's cap: the least needed go
+            (sc,) = yield self._msg(_call("run_circuit", base=draft, drop=order[:size - components.NODE_CAP]))
+            draft = sc.get("draft", draft)
+            self.trace.append({"cap": components.NODE_CAP, "nodes": sc.get("nodes"), "pp": sc.get("pp"), "point": sc.get("point"), "draft": draft})
         q = [m for m in messages if m["role"] == "user"][0]["content"]
         n_q, n_e = q.count("\nQuestion "), q.count("\nEdit ")
         top = TOP_RE.search(q)
-        answer = components.render({"nodes": [[n, c, p] for n, p, c in sorted(keep, key=components._place)], "edges": [],
-                                    "complete": True, "explanation": "The prediction is computed by these subcomponents at "
-                                    "the target and the context positions it reads most, every connection among them."},
-                                   finals={k: (False, top[1] if top else "''") for k in range(1, n_q + 1)},
-                                   edits={k: [] for k in range(1, n_e + 1)})
-        yield {"role": "assistant", "content": answer}
+        lines = [f"CIRCUIT: {draft}", "EXPLANATION: The prediction is computed by these subcomponents at the target and the "
+                 "context positions it reads most, every connection among them."]
+        for k in range(1, n_q + 1):
+            lines += [f"ANSWER {k}:", f"FINAL {k}: falls=no top={top[1] if top else repr('')}"]
+        lines += [f"EDIT {k}: " for k in range(1, n_e + 1)]
+        yield {"role": "assistant", "content": "\n".join(lines)}
 
 
 # ---- reports

@@ -35,6 +35,7 @@ sys.path.insert(0, str(HERE / "rl"))
 from tinker_train import PRICES, RENDERER, THINKING_RENDERER, renderer_for, service_client  # noqa: E402,F401
 
 CONTEXT = 32768  # Qwen3-8B's native context: an episode's whole conversation
+INVALID = -10.0  # components.V3_INVALID: an episode ending without an answer (unparsed turn, context or turn cap)
 
 
 def _tasks(spec: list[str]) -> list[str]:
@@ -100,10 +101,11 @@ async def make_env(client: httpx.AsyncClient, server: str, task: str, renderer, 
         turns = sum(1 for m in history if m.get("role") == "assistant")
         res = (await client.post(f"{server}/submit", json={"episode": eid, "answer": answer, "turns": turns}, timeout=None)).json()
         record["result"] = res
-        return float(res.get("reward", -10.0)), {"calls": res.get("calls", 0), "answered": float(answer is not None)}
+        return float(res.get("reward", INVALID)), {"calls": res.get("calls", 0), "answered": float(answer is not None)}
 
     env = build_agent_tool_env(renderer, tools, initial, reward_fn, max_turns=max_turns, max_tool_calls=None,
-                               max_trajectory_tokens=CONTEXT, max_generation_tokens=max_tokens, failed_parse_reward=-10.0)
+                               max_trajectory_tokens=CONTEXT, max_generation_tokens=max_tokens, failed_parse_reward=INVALID,
+                               context_overflow_reward=INVALID)
     record["msg_env"] = env.message_env
     return env, record
 
@@ -140,7 +142,8 @@ def traj_row(traj, record: dict, renderer) -> dict:
         if m.get("tool_calls"):
             mm["tool_calls"] = [{"name": tc.function.name, "arguments": tc.function.arguments} for tc in m["tool_calls"]]
         msgs.append(mm)
-    return {"task": record["task"], "episode": record["episode"], "reward": res.get("reward"), "answer_reward": res.get("answer_reward"),
+    own = sum(t.reward for t in traj.transitions)  # the env's reward when the server never scored (a cap or an unparsed turn)
+    return {"task": record["task"], "episode": record["episode"], "reward": res.get("reward", own), "answer_reward": res.get("answer_reward"),
             "calls": res.get("calls"), "turns": len(traj.transitions), "stop": traj.stop_reason, "answered": res.get("answered"),
             "scores": res.get("scores"), "observation_tokens": obs, "sampled_tokens": acts,
             "final_context": (obs[-1] + acts[-1]) if obs else 0, "log": res.get("log"), "messages": msgs}
@@ -224,7 +227,7 @@ def rl(a) -> None:
         datums, rows = [], []
         for k, t in enumerate(pick):
             grp = [(tr, rec) for tr, rec in got[k * a.group:(k + 1) * a.group] if not isinstance(tr, BaseException)]
-            rs = [(rec.get("result") or {}).get("reward", -10.0) for _, rec in grp]
+            rs = [traj_row(tr, rec, renderer)["reward"] for tr, rec in grp]
             mean = sum(rs) / len(rs) if rs else 0.0
             for (tr, rec), r in zip(grp, rs):
                 row = traj_row(tr, rec, renderer)

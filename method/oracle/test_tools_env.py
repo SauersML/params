@@ -140,13 +140,48 @@ def test_errors_go_back_to_the_policy(env):
     assert "error" in json.loads(tools.call("influence", "{not json"))
 
 
+def test_drafts_through_episode(env):
+    ep = env.reset(TID)
+    tools, nat = ep.tools, env.ge.nat
+    vpd = sorted((n, t, c) for n in nat.names for t, c in tools.tx.vpd[n].nonzero().tolist())
+    at11 = [nd for nd in vpd if nd[1] == 11]
+    a = json.loads(ep.call("run_circuit", {"positions": [11]}))
+    assert a["draft"] == "d1" and a["nodes"] == len(at11)
+    same = json.loads(ep.call("run_circuit", {"nodes": [components.node_text(nd) for nd in at11]}))
+    assert same["draft"] in ("d1", "d2") and math.isclose(same["point"], a["point"], abs_tol=1e-9)
+    text = json.loads(ep.call("run_circuit", {"circuit": ", ".join(components.node_text(nd) for nd in at11)}))
+    assert text["nodes"] == len(at11) and math.isclose(text["point"], a["point"], abs_tol=1e-9)
+    mer = json.loads(ep.call("run_circuit", {"circuit": tools_env.Scripted._circuit(at11)}))
+    assert math.isclose(mer["point"], a["point"], abs_tol=1e-9)
+    drop = [components.node_text(nd) for nd in at11[:2]]
+    b = json.loads(ep.call("run_circuit", {"base": "d1", "drop": drop}))
+    direct = json.loads(tools.call("run_circuit", {"nodes": [components.node_text(nd) for nd in at11[2:]]}))
+    assert b["nodes"] == len(at11) - 2 and math.isclose(b["point"], direct["point"], abs_tol=1e-9)
+    back = json.loads(ep.call("run_circuit", {"base": b["draft"], "add": drop}))
+    assert back["nodes"] == len(at11) and math.isclose(back["point"], a["point"], abs_tol=1e-9)
+    assert "error" in json.loads(ep.call("run_circuit", {"base": "d99", "drop": drop}))
+    rem = json.loads(ep.call("measure_removal", {"draft": "d1", "each": True}))
+    assert sorted(x[0] for x in rem["removals"]) == sorted(components.node_text(nd) for nd in at11)
+    cmp = json.loads(ep.call("compare", {"circuit_a": "d1", "circuit_b": b["draft"]}))
+    assert "error" not in cmp or "nothing to change" in cmp["error"]
+    again = json.loads(ep.call("run_circuit", {"positions": [11]}))
+    assert again["draft"] == "d1" and again["repeated"] == 1
+    bad = json.loads(ep.call("run_circuit", {"circuit": "flowchart LR\nsubgraph P11[@11]\n c1[L1.fc#2@11] --> c2[L1.down#3@11]\nend"}))
+    assert "error" in bad or bad.get("bad_examples")
+    full = ep.expand("CIRCUIT: d1\nEXPLANATION: x")
+    parsed = components.parse(full)
+    assert parsed["answer"].get("complete") and len(parsed["answer"]["nodes"]) == len(at11)
+    assert ep.expand("CIRCUIT: d42\nEXPLANATION: x") == "CIRCUIT: d42\nEXPLANATION: x"
+
+
 def test_scripted_episode(env):
     pol = tools_env.Scripted()
     r = tools_env.run_episode(env, TID, pol)
-    assert r["answered"] and r["calls"] <= tools_env.MAX_CALLS
+    assert r["answered"] and r["calls"] <= tools_env.MAX_CALLS and r["turns"] <= tools_env.MAX_TURNS
     assert r["scores"]["valid"], r
     assert math.isclose(r["reward"], r["answer_reward"] - env.cost * r["calls"])
-    parsed = components.parse(r["messages"][-1]["content"])
+    assert r["messages"][-1]["content"].startswith("CIRCUIT: d")
+    parsed = components.parse(r["answer_expanded"])
     assert parsed["circuit"] and parsed["answer"].get("complete")
     tx = env.text_tools(TID).tx
     for m, c, t in parsed["answer"]["nodes"]:

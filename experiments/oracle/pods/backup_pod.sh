@@ -9,8 +9,9 @@
 #   env: SRC, OUT (default ~/mpd-data/graph_oracle/backup/RUN), SPLIT (heldout), STEPS (backup.py --max-steps), TESTS=1
 #   (test_backup.py first, its log in tests.log), EVAL=0 (the expansion alone), FROM=DIR (an earlier run's OUT: its
 #   sets, summary.jsonl, fidelity.jsonl and repair.jsonl go up and each process starts from them, so run, eval and
-#   repair skip the texts they hold; OUT gets FROM's summary.jsonl and the union of the rows, identical lines once), REPAIR=1 (backup.py repair after the evaluation, repair.jsonl), REF,
-#   GPU, PRICE, VRAM
+#   repair skip the texts they hold; OUT gets FROM's summary.jsonl and the union of the rows, identical lines once),
+#   REPAIR=1 (backup.py repair after the evaluation, repair.jsonl), ONLY="K ..." (start only those processes; process k
+#   still takes every P-th text from the k-th, so a second pod can redo one process's texts), REF, GPU, PRICE, VRAM
 # The sealed texts (text9100-9149) are left out of the inputs before tar opens them.
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -46,7 +47,7 @@ ${TESTS:+(python -m pytest --version || PATH=\$HOME/.local/bin:\$PATH uv pip ins
 bk() { mkdir -p $O/out_\$1; cp -r \$HOME/bk_in/from/. $O/out_\$1/; python -B backup.py run --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P --max-steps $STEPS > $O/run_\$1.log 2>&1; echo \"run exit \$?\" >> $O/run_\$1.log;
   [ $EVAL = 1 ] && { python -B backup.py eval --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P >> $O/run_\$1.log 2>&1; echo \"eval exit \$?\" >> $O/run_\$1.log; };
   [ $REPAIR = 1 ] && { python -B backup.py repair --split $SPLIT --n $N --src \$HOME/bk_in/src --out $O/out_\$1 --offset \$1 --stride $P >> $O/run_\$1.log 2>&1; echo \"repair exit \$?\" >> $O/run_\$1.log; }; };
-for k in \$(seq 0 $((P - 1))); do (bk \$k) & done; wait; echo all done"
+for k in ${ONLY:-\$(seq 0 $((P - 1)))}; do (bk \$k) & done; wait; echo all done"
 for try in $(seq 1 40); do
   env ${REF:+RP_REF=$REF} RP_OWNER=backup RP_PARALLEL=1 RP_ALLOW_OVER=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.80} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=32 \
     experiments/infra/runpod/rp-run $RN "$GPU" "$H" -- bash -c "$CMD" > "$F/rp.log" 2>&1 && break

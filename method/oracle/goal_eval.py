@@ -854,6 +854,24 @@ def _norm_with(tg, x: torch.Tensor, sc: torch.Tensor, j: int) -> torch.Tensor:
     return tg.norm_with(x, sc, j)
 
 
+class _ScoreRows:
+    """A layer's attention scores [H, T, T] of a run, from its rotated queries and keys [H, T, hd], made a query row at
+    a time when indexed ([:, t] or [:, t, ...]: only those rows; _pp_record keeps no [H, T, T] a layer, an audit scale
+    blocker)."""
+
+    def __init__(self, q: torch.Tensor, k: torch.Tensor):
+        self.q, self.k = q, k
+
+    def __getitem__(self, idx):
+        if not (isinstance(idx, tuple) and len(idx) >= 2 and idx[0] == slice(None)):
+            raise IndexError("score rows are indexed [:, t] or [:, t, ...]")
+        t = idx[1]
+        one = not isinstance(t, (slice, list, tuple)) and not (torch.is_tensor(t) and t.dim() > 0)  # one position
+        rows = self.q[:, t][:, None] if one else self.q[:, t]
+        out = (rows @ self.k.transpose(-1, -2)) / math.sqrt(self.q.shape[-1])
+        return (out[:, 0] if one else out)[(slice(None),) + tuple(idx[2:])]
+
+
 def _harmonic(terms: list) -> float | None:
     """C's combination: the harmonic mean k / sum(1 / s), 0 when a term is 0 (None for no terms)."""
     if not terms:
@@ -2172,7 +2190,8 @@ class GoalEval:
     def _pp_base(self, tx: Text) -> dict:
         """The real model's run on the text, the path-patched runs' x side (kept on tx): every site's activations
         [T, C] and remainder outputs, each layer's streams before its attention and its MLP, rotated queries and keys
-        [H, T, hd], values [T, H hd], scores [H, T, T], MLP inputs, the final stream."""
+        [H, T, hd], values [T, H hd], scores (_ScoreRows: [H, T, T] indexed, each row made when asked), MLP inputs, the
+        final stream."""
         if getattr(tx, "_pp", None) is None:
             tx._pp = self._pp_record(tx.ids)
         return tx._pp
@@ -2193,20 +2212,18 @@ class GoalEval:
             return out if tg.site(n).b is None else out + tg.site(n).b  # a bias, always on (vpd4l: none)
 
         x = tg.embed(torch.tensor(ids, device=nat.dev)).float()
-        causal = torch.ones(T, T, dtype=torch.bool, device=nat.dev).tril()
         for i in range(tg.n_layer):
             nm = {k: native.site_name(i, k) for k in vpd_model.KINDS}
             b["Xa"].append(x)
             z = tg.norm(x, 2 * i)
             q, k, v = (site(nm[kk], z) for kk in ("q_proj", "k_proj", "v_proj"))
             qr, kr = (tg._rope(m.view(1, T, H, hd).transpose(1, 2), T)[0] for m in (q, k))
-            S = (qr @ kr.transpose(-1, -2)) / math.sqrt(hd)
             b["q"].append(qr)
             b["k"].append(kr)
             b["v"].append(v)
-            b["S"].append(S)
-            P = S.masked_fill(~causal, float("-inf")).softmax(-1)
-            att = (P @ v.view(T, H, hd).transpose(0, 1)).transpose(0, 1).reshape(T, -1)
+            b["S"].append(_ScoreRows(qr, kr))
+            att = torch.nn.functional.scaled_dot_product_attention(qr, kr, v.view(T, H, hd).transpose(0, 1), is_causal=True)
+            att = att.transpose(0, 1).reshape(T, -1)
             x = x + site(nm["o_proj"], att)
             b["Xm"].append(x)
             pre = site(nm["c_fc"], tg.norm(x, 2 * i + 1))

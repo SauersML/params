@@ -248,7 +248,7 @@ flowchart BT
   S1AUDIT["<b>Does more SFT help?</b><br/>steps 56/112: faithful 5/30, 2/30;<br/>valid-only VPD gains; no clear trend;<br/>prioritize interventions and reliability<br/>AUDIT DONE · codex/eval_recovery"]
   subgraph SFTS["SFT ARMS IN PARALLEL · primerl · about $5 each"]
     S1READY["<b>SFT pilot: format learned</b><br/>5/8 valid; QA near no-change;<br/>no advantage over matched VPD;<br/>feeds input and control ablations<br/>CHECK · codex · $2.51 total"]
-    S1["<b>SFT · influential starts</b><br/>dev 9020-9049, step 56, no thinking:<br/>valid 27/30, phi 0.89 (bar 1.0-1.2),<br/>beats VPD top k at equal bits 18/9<br/>EVALUATING 112/167 · primerl"]
+    S1["<b>SFT · influential starts</b><br/>dev 9020-9049: phi 0.86→0.88→0.91 (bar 1.2),<br/>beats VPD top k 24/5; shuffled evidence<br/>phi 0.22: reads the text; below start 1.08<br/>DONE · primerl"]
     S2["<b>SFT · pruned v2</b><br/>consume passing teacher shards;<br/>do not wait for bulk generation<br/>PER-SHARD readiness · primerl"]
     S3["<b>SFT · context blocks</b><br/>context kept as blocks,<br/>target pruned<br/>WAITING on T5"]
   end

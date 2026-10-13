@@ -7,8 +7,9 @@ interventions"). Per text, draws of weight edits, each applied at every position
                 entry-wise: that column of W, of V's rows, of the remainder);
   head          one attention head's output scaled by k (o_proj's block of columns, the same way).
 Each edit is applied to the model's tensors (W, V, U, the remainder) and every run reads them: the real model's, the
-circuit's in C's semantics (GoalEval._graph_kl: its subcomponents with the edited vectors, every other one off, the
-remainders live and edited), VPD's whole answer the same. Per edit, with p the model's prediction at the targets, p_e
+circuit's in the GoalEval's semantics (GoalEval._graph_kl's run: its subcomponents with the edited vectors, every other
+one off, the remainders live and edited; with semantics "x" the routing and norms read from the model as edited), VPD's
+whole answer the same. Per edit, with p the model's prediction at the targets, p_e
 the edited model's, W = KL(p_e || p) (how far the edit moves the model: the no-change answer's error), KL_C = KL(p_e ||
 p moved as the circuit's run moves under the edit: log_softmax(log p + log q_C,e - log q_C), s_track's transplant, so
 the circuit's error on the unedited text does not count), KL_V = the same for VPD's whole answer:
@@ -45,13 +46,15 @@ SCALES = {"subcomponent": (0.0, -1.0), "neuron": (0.0, 2.0), "head": (0.0,)}
 W_MIN = 1e-3  # bits: an edit moving the model less predicts nothing either way
 
 
-def draw(nat, ids: list[int], targets: list[int], seed: int) -> list[dict]:
-    """The text's weight edits: {"kind", "what", "k"} (module docstring), drawn by seed."""
+def draw(nat, ids: list[int], targets: list[int], seed: int, order: list | None = None) -> list[dict]:
+    """The text's weight edits: {"kind", "what", "k"} (module docstring), drawn by seed. order: VPD's order of the text's
+    subcomponents (native._vpd_order's, e.g. a scoring pod's saved tx.vpd_order); computed when not given (it needs the
+    causal-importance network)."""
     rng = random.Random(seed)
     t = max(targets)
     tg = nat.target
     out = []
-    top = [nd for nd in nat._vpd_order(ids, targets) if nd[1] == t][:TOP]
+    top = [tuple(nd) for nd in (order if order is not None else nat._vpd_order(ids, targets)) if nd[1] == t][:TOP]
     for i, nd in enumerate(rng.sample(top, min(len(top), DRAWS["subcomponent"]))):
         out.append({"kind": "subcomponent", "what": [nd[0], int(nd[2])], "k": SCALES["subcomponent"][i % 2]})
     acts = []
@@ -77,17 +80,20 @@ def draw(nat, ids: list[int], targets: list[int], seed: int) -> list[dict]:
     return out
 
 
-def _clear(nat) -> None:
-    """Native's kept runs (they would be the unedited model's)."""
+def _clear(nat, ge=None) -> None:
+    """Native's kept runs (they would be the unedited model's), and GoalEval's x values (semantics "x": the routing and
+    norms of the model's run, read again from the model as edited)."""
     nat._refs.clear()
     nat._refs_bytes = 0
     nat._rec = (None, None, {})
     nat.__dict__.pop("_sensitivity_kept", None)
+    if ge is not None and hasattr(ge, "_xk"):
+        ge._xk.clear()
 
 
 @contextlib.contextmanager
-def applied(nat, e: dict):
-    """The model's tensors with the weight edit e, restored on exit."""
+def applied(nat, e: dict, ge=None):
+    """The model's tensors with the weight edit e, restored on exit (ge: its kept x values cleared on both sides)."""
     tg = nat.target
     if e["kind"] == "subcomponent":
         n, c = e["what"]
@@ -106,14 +112,14 @@ def applied(nat, e: dict):
             st.W[:, cols] *= k
             st.V[cols, :] *= k
             st.delta_T[cols, :] *= k
-    _clear(nat)
+    _clear(nat, ge)
     try:
         yield
     finally:
         with torch.no_grad():
             for a, v in saved.items():
                 getattr(st, a).copy_(v)
-        _clear(nat)
+        _clear(nat, ge)
 
 
 def _lqs(ge, ids, targets, graphs) -> torch.Tensor:
@@ -127,7 +133,7 @@ def _lqs(ge, ids, targets, graphs) -> torch.Tensor:
     if stated:
         gs = [graphs[i] for i in stated]
         E = ge._circuit_engine(ids, targets, gs, True)
-        for i, lq in zip(stated, E.graph_log_probs(E.plan(gs, semantics="c"))):
+        for i, lq in zip(stated, E.graph_log_probs(E.plan(gs, semantics="c"), **ge._xkw(ids, targets))):  # ge's semantics
             out[i] = lq
     rest = [i for i in range(len(graphs)) if out[i] is None]
     if rest:
@@ -146,7 +152,8 @@ def _moved(p0: torch.Tensor, before: torch.Tensor, after: torch.Tensor) -> torch
 
 
 @torch.no_grad()
-def family(ge, tx, graphs: list[native.Graph], seed: int | None = None, edits: list[dict] | None = None) -> list[dict]:
+def family(ge, tx, graphs: list[native.Graph], seed: int | None = None, edits: list[dict] | None = None,
+           order: list | None = None) -> list[dict]:
     """Per graph (C's semantics, remainders live): s_weight, s_weight_raw, kl_weight_c (the mean KL_C) and draws_weight
     (module docstring); one set of edits per text, the same for every graph. A run's prediction under an edit is
     compared as its change (_moved: the model's prediction moved by log q_e - log q), so a circuit's or VPD's own error
@@ -154,14 +161,15 @@ def family(ge, tx, graphs: list[native.Graph], seed: int | None = None, edits: l
     nat = ge.nat
     ids, targets = tx.ids, tx.targets
     if edits is None:
-        edits = draw(nat, ids, targets, native.task_seed(str(ids[:8])) if seed is None else seed)
+        edits = draw(nat, ids, targets, native.task_seed(str(ids[:8])) if seed is None else seed,
+                     order if order is not None else getattr(tx, "vpd_order", None))
     p0 = tx.ref[0]
     vpd = [native.Graph(masks=tx.vpd)] if tx.vpd is not None else []
     allg = list(graphs) + vpd
     before = _lqs(ge, ids, targets, allg)
     acc = [[0.0, 0.0, 0.0, 0.0, []] for _ in graphs]  # sum W s, sum W, sum W s_raw, sum KL_C, draws
     for e in edits:
-        with applied(nat, e):
+        with applied(nat, e, ge):
             pe = torch.log_softmax(nat.vpd.target_forward(torch.tensor([ids], device=nat.dev))[0, targets].float(), -1)
             after = _lqs(ge, ids, targets, allg)
         W = float(carry.kl(pe[None], p0[None])[0])

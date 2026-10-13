@@ -63,11 +63,13 @@ Q3="$(inject)"
 Q4="$(first active 1) $CHECK $(task active ids $W/first_active/adapter)"  # Q0 and Q2's first-stage arms alone (a rerun)
 Q5="$(first both 1) $(task both ids $W/first_both/adapter)"
 QS=("$Q0" "$Q1" "$Q2" "$Q3" "$Q4" "$Q5") RUNQ=""
-for i in ${QSET:-0 1 2 3}; do RUNQ="$RUNQ (${QS[$i]}) &"; done
+NQ=0
+for i in ${QSET:-0 1 2 3}; do RUNQ="$RUNQ (${QS[$i]}) &"; NQ=$((NQ + 1)); done
+FRAC=$(awk -v n=$NQ 'BEGIN {printf "%.3f", 0.95 / n}')  # each queue's share of the card (a queue past it fails alone)
 REPORT="$O/out/score_ids_base.jsonl $O/out/score_features_base.jsonl"
 for arm in active ids vocab both features; do for n in $SIZES; do REPORT="$REPORT $O/out/score_${arm}_$n.jsonl"; done; done
 for arm in inject_real inject_permuted inject_random inject_id; do for n in ${INJECT_SIZES:-8000 32000}; do REPORT="$REPORT $O/out/score_${arm}_$n.jsonl"; done; done
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out $Q;
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True LEARN_GPU_FRACTION=$FRAC; set -e; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O/out $Q;
 tar -xzf $F/q.tgz -C $Q; ls /Users/user/params/experiments/oracle/learn_sft.py /Users/user/params/method/oracle/rl/inject.py /Users/user/params/method/vpd /Users/user/mpd-data/oracle/vpd/uv.safetensors /Users/user/mpd-data/atlas/vpd4l/atlas.json /Users/user/mpd-data/atlas/vpd4l/atlas.safetensors > /dev/null;
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 60 > $O/gpu.log 2>&1 &);

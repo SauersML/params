@@ -157,6 +157,10 @@ def _model(base: str, adapter: str | None = None, rank: int = 0, trainable: bool
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    import os
+
+    if _dev() == "cuda" and os.environ.get("LEARN_GPU_FRACTION"):  # processes sharing a card: each held to its share
+        torch.cuda.set_per_process_memory_fraction(float(os.environ["LEARN_GPU_FRACTION"]))
     tok = AutoTokenizer.from_pretrained(base)
     model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16 if _dev() == "cuda" else torch.float32).to(_dev())
     if adapter:

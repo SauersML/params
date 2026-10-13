@@ -12,7 +12,8 @@
 #                                        rows for HELDOUT's edit requests, E3's best net; MEASURED=1: the measured input
 #                                        arm, subcomponents ranked by importance x |activation|, attention heads' top positions;
 #                                        POOL=1: every VPD-active subcomponent at the listed positions in the question;
-#                                        THINKING=1: Qwen3's thinking mode, generation limit 16384; MAXLEN: SFT length cap)
+#                                        THINKING=1: Qwen3's thinking mode, generation limit 16384; MAXLEN: SFT length cap;
+#                                        RENDERED=1: ROWS are already rerendered with these flags, used as they are)
 set -e
 RUN=$1
 O=~/mpd-data/graph_oracle/components; S=$O/sft_$RUN; mkdir -p $S
@@ -27,7 +28,8 @@ export HF_HUB_OFFLINE=1 PYTORCH_MPS_PREFER_METAL=1
 RR=(rerender ${MEASURED:+--measured} ${POOL:+--pool})  # MEASURED: the measured input arm (components.measured()); POOL: the full candidate pool (candidate_pool())
 TH=(${THINKING:+--thinking})  # THINKING: Qwen3's thinking mode in sampling (the SFT keeps the empty think block in the prompt)
 [ -n "${THINKING:-}" ] && MAXTOK=${MAXTOK_THINKING:-16384}  # one generation limit, thinking included (no thinking budget)
-~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $ROWS $S/rows.jsonl  # questions in the current format
+if [ -n "${RENDERED:-}" ]; then cp $ROWS $S/rows.jsonl  # rendered once for several runs (the pool's render: ~10 s a text)
+else ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $ROWS $S/rows.jsonl; fi  # questions in the current format
 MPD_MEM_GIB=8 $PY $SRC/method/oracle/components.py dataset $S/rows.jsonl $TEACHER $S/sft.jsonl \
   ${ENGLISH:+--english $ENGLISH} ${EDIT_TEACH:+--edit-teach $EDIT_TEACH}
 ~/.local/bin/mem-lease 8 $PY $SRC/method/oracle/components.py $RR $HELDOUT $S/heldout.jsonl

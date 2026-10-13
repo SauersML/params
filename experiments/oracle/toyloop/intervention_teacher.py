@@ -35,9 +35,10 @@ def binding(toy, nat, texts, panel):
                         "platform": platform.platform(),
                         "backend_config_sha256": hashlib.sha256(torch.__config__.show().encode()).hexdigest(),
                         "device": str(nat.target.wte.device), "eps": nat.target.eps,
-                        "behavior": None if nat.target.behavior is None else tensor_digest(nat.target.behavior),
-                        "behavior_tokens": copy.deepcopy(nat.target.behavior_tokens),
-                        "behavior_at": copy.deepcopy(nat.target.behavior_at)},
+                        "behavior": None if getattr(nat.target, "behavior", None) is None
+                        else tensor_digest(nat.target.behavior),
+                        "behavior_tokens": copy.deepcopy(getattr(nat.target, "behavior_tokens", None)),
+                        "behavior_at": copy.deepcopy(getattr(nat.target, "behavior_at", None))},
             "panel": [list(entry) for entry in panel],
             "source_weights": {name: tensor_digest(value) for name, value in toy.sd.items()},
             "model": {name: tensor_digest(value) for name, value in nat.target.state_dict().items()},

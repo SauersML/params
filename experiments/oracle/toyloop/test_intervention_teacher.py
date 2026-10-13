@@ -117,3 +117,10 @@ def test_training_row_rejects_mutated_target_receipt():
     with pytest.raises(RuntimeError, match="selected measured"):
         teacher.training_row(toy, {"target": target, "target_sha256": digest,
                                   "selected": {"completion": "different", "completion_sha256": digest}}, nat=object())
+
+
+def test_pinned_target_without_optional_behavior_fields():
+    toy, nat, texts, panel, cache, _ = fixture_cache()
+    for name in ("behavior", "behavior_tokens", "behavior_at"):
+        delattr(nat.target, name)
+    teacher.validate_cache(cache, toy, nat, texts, panel)

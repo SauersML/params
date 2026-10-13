@@ -551,12 +551,13 @@ def _pooled(kind: str, draws: list, e0: float | None, *, raw: bool = False) -> f
 
 
 def _ratio_pool(draws: list, raw: bool = False) -> float | None:
-    """The "weighted" families' score ([prompt, KL_C, KL_VPD, W] per draw: track_pp, interchange_pp, nodes), a pooled
-    ratio (the lead's 10-13: per-draw ratios swung s_track_pp on text9002 between 0.21 and 0.85 while the KLs barely
-    moved, from draws where VPD's own run sits near the no-change bound): over the draws where VPD's answer is nearer
-    than no change (KL_VPD < W), sum ln(W / KL_C) / sum ln(W / KL_VPD), in [0, 1], raw in [-1, 1]; None without such
-    draws or unless the denominator exceeds twice its standard error over them (sqrt(n) x the spread of the draws'
-    ln(W / KL_VPD))."""
+    """The "weighted" families' score ([prompt, KL_C, KL_VPD, W] per draw: track_pp, interchange_pp, nodes, omitted):
+    each draw's ratio ln(W / KL_C) / ln(W / KL_VPD) clipped to [0, 1] (raw [-1, 1]), averaged with weights
+    ln(W / KL_VPD), over the draws where VPD's answer is nearer than no change (KL_VPD < W). The lead's 10-13: weighted
+    by W, a draw whose VPD run sits near the no-change bound flipped between 0 and 1 on tiny KL changes (s_track_pp on
+    text9002 between 0.21 and 0.85); an unclipped pooled ratio instead let one draw far past the bound swing it (text9002's
+    F+V circuit 0.68-1.00 over 4 seeds). None without such draws or unless the weights' sum exceeds twice its standard
+    error over them (sqrt(n) x their spread)."""
     num, den = [], []
     for d in draws or []:
         w, kc, kv = d[3], d[1], d[2]
@@ -569,8 +570,8 @@ def _ratio_pool(draws: list, raw: bool = False) -> float | None:
     total = float(sum(den))
     if len(den) > 1 and not total > 2.0 * math.sqrt(len(den)) * float(np.std(den, ddof=1)):
         return None
-    x = min(1.0, float(sum(num)) / total)
-    return max(-1.0, x) if raw else max(0.0, x)
+    lo = -1.0 if raw else 0.0
+    return float(sum(d_ * min(1.0, max(lo, n_ / d_)) for n_, d_ in zip(num, den))) / total
 
 
 def _spec(draws: list, raw: bool = False) -> float | None:
@@ -607,9 +608,9 @@ def _pooled_resamples(kind: str, draws: list, e0: float | None, raw: bool, idx: 
         ok = [d[1] is not None and d[2] is not None and d[3] > 0 and d[2] < d[3] for d in draws]
         dn = np.array([math.log(d[3] / max(d[2], 1e-12)) if o else 0.0 for d, o in zip(draws, ok)], dtype=float)
         nm = np.array([math.log(d[3] / max(d[1], 1e-12)) if o else 0.0 for d, o in zip(draws, ok)], dtype=float)
-        num, den = nm[idx].sum(1), dn[idx].sum(1)
-        x = np.minimum(1.0, num / np.where(den > 0, den, 1.0))
-        return [(max(-1.0, float(v)) if raw else max(0.0, float(v))) if d_ > 0 else None for v, d_ in zip(x, den)]
+        r = np.clip(nm / np.where(dn > 0, dn, 1.0), -1.0 if raw else 0.0, 1.0) * dn  # each draw's clipped ratio x its weight
+        num, den = r[idx].sum(1), dn[idx].sum(1)
+        return [float(a) / float(b) if b > 0 else None for a, b in zip(num, den)]
     if kind == "mean":
         if e0 is None:
             return [None] * len(idx)

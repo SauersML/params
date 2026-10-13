@@ -71,17 +71,18 @@ def test_eps_cap_and_n_guard():
 
 
 def test_pooled_ratio():
-    """The weighted families' score: sum ln(W / KL_C) / sum ln(W / KL_VPD) over the draws where VPD is nearer than no
-    change, in [0, 1] (raw [-1, 1]); a draw with VPD barely under W no longer swings it; None when the denominator is
-    within twice its standard error."""
+    """The weighted families' score: each draw's ratio ln(W / KL_C) / ln(W / KL_VPD) clipped to [0, 1] (raw [-1, 1]),
+    averaged with weights ln(W / KL_VPD) over the draws where VPD is nearer than no change: a draw with VPD at the
+    bound weighs nothing, one far past the bound counts at most its clip; None when the weights' sum is within twice its
+    standard error."""
     import math
     d = [[0, 0.5, 0.2, 2.0], [1, 1.0, 0.4, 2.0], [2, 2.5, 0.3, 2.0], [3, 9.0, 3.0, 2.0]]  # the last: VPD past W, left out
-    num = math.log(2.0 / 0.5) + math.log(2.0 / 1.0) + math.log(2.0 / 2.5)
-    den = math.log(2.0 / 0.2) + math.log(2.0 / 0.4) + math.log(2.0 / 0.3)
-    swing = d[:3] + [[4, 1.9, 1.9999, 2.0]]  # VPD at the bound: its per-draw ratio would be about 1e3, here it adds ~nothing
-    want = min(1.0, (num + math.log(2.0 / 1.9)) / (den + math.log(2.0 / 1.9999)))
-    assert abs(goal_eval._ratio_pool(swing) - want) < 1e-12 and abs(want - num / den) < 0.02
-    assert abs(goal_eval._ratio_pool(d) - num / den) < 1e-12
+    w = [math.log(2.0 / 0.2), math.log(2.0 / 0.4), math.log(2.0 / 0.3)]
+    r = [min(1.0, max(0.0, math.log(2.0 / kc) / x)) for kc, x in zip((0.5, 1.0, 2.5), w)]
+    want = sum(a * b for a, b in zip(r, w)) / sum(w)
+    assert abs(goal_eval._ratio_pool(d) - want) < 1e-12
+    assert abs(goal_eval._ratio_pool(d[:3] + [[4, 0.1, 1.9999, 2.0]]) - want) < 1e-3  # VPD at the bound weighs ~5e-5
+    assert goal_eval._ratio_pool(d[:3] + [[5, 500.0, 0.25, 2.0]]) >= 0.0  # far past the bound: 0, not ln(2 / 500)
     assert goal_eval._pooled("weighted", d, None) == goal_eval._ratio_pool(d)
     assert goal_eval._ratio_pool([[0, 50.0, 0.2, 2.0], [1, 40.0, 0.3, 2.0]], raw=True) == -1.0
     noisy = [[j, 1.0, 2.0 * (1 - 0.999 * (j % 2)), 2.0] for j in range(6)]  # VPD at the bound on half the draws

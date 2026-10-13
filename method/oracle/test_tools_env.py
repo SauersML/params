@@ -253,7 +253,8 @@ def test_baselines_include_empty_and_same_batch_calibration(_unused_env=None):
         raise AssertionError("baseline threshold must use its existing start row")
 
     ge = SimpleNamespace(nat=nat, start_set=lambda tx, split: {"graph": start}, fidelity=fidelity, tau=no_tau)
-    fake = SimpleNamespace(ge=ge, score_split="eval", pool={}, text_tools=lambda tid: SimpleNamespace(tx=tx))
+    fake = SimpleNamespace(ge=ge, score_split="eval", split_of=lambda tid: "eval", pool={},
+                           text_tools=lambda tid: SimpleNamespace(tx=tx))
     expanded = components.render({"nodes": [[site, 0, 1]], "edges": [], "complete": True})
     episode = {"task": "text9000", "answer": "CIRCUIT: d1", "answer_expanded": expanded,
                "start": {"phi_tau": -99., "bits": 1.}}
@@ -313,6 +314,19 @@ def test_scripted_episode(env):
         assert bool(tx.vpd[m][t, c])
     assert [m["role"] for m in r["messages"][:2]] == ["system", "user"]
     assert all(m["role"] in ("assistant", "tool") for m in r["messages"][2:])
+    assert r["split"] == "eval" and r["semantics"] == env.ge.semantics and r["cost"] == env.cost  # what a trainer freezes
+    assert r["source"] == tools_env.source() and r["donor_pool"] == env.ge.pool_id("eval")
+
+
+def test_auto_split_by_text(env):
+    auto = tools_env.Env({}, env.ge, score_split="auto", facts=False, pool={})
+    assert [auto.split_of(t) for t in ("text6000", "text7999", "text8000", "text9020", TID)] == ["search", "search", "eval", "eval", "eval"]
+    assert env.split_of("text6000") == "eval"  # a fixed split applies to every text
+    try:
+        tools_env.Env({}, env.ge, score_split="train", facts=False, pool={})
+        raise AssertionError("an unknown score split was taken")
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":

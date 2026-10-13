@@ -7,7 +7,7 @@ project comes from TINKER_PROJECT_ID (required, never the default) and the key f
   tools_tinker.py rollout TASKS --server http://127.0.0.1:8771 --out OUT.jsonl [--init STATE] [--group G]
                           [--max-tokens 4096] [--max-turns 24] [--usd-cap 3]
   tools_tinker.py rl TASKS --server URL --log DIR [--init STATE] [--steps N] [--texts P] [--group G] [--lr 4e-5]
-                     [--usd-cap 3]
+                     [--usd-cap 3] [--save-every K] [--expect-source REV] [--expect-semantics n]
   tools_tinker.py sft EPISODES.jsonl --log DIR [--steps N] [--batch B] [--lr 1e-4] [--rank 32] [--usd-cap 3]
                      a warm start on whole episodes (tools_env.py scripted's lines on training texts: their messages and
                      tool schemas), every assistant turn trained (tool calls and the answer), in the rollouts' rendering
@@ -16,7 +16,11 @@ answer's reward v3 minus the calls' cost), calls, turns, why it stopped, each tu
 and its messages. rl: per step P texts x G episodes, each episode's advantage its reward less its group's mean on
 every sampled token of every turn (tinker_cookbook's trajectory_to_data: one datum per episode when each turn's
 observation extends the last), Tinker's cispo loss, as tinker_train.py rl. Every call's tokens are priced (an upper
-bound: every turn's observation at the full prefill price) and a run stops before it passes --usd-cap.
+bound: every turn's observation at the full prefill price) and a run stops before it passes --usd-cap. rl saves a
+state every --save-every steps and at the end (LOG/checkpoints.jsonl: step, state, dollars), and stops before a step
+trains on episodes the frozen reward did not score: each result's semantics and source (tools_env's Episode.finish)
+against --expect-semantics and --expect-source, its Python environment and far-donor pool against the run's first
+(tinker_train's scorer_mismatch and pinned_check, the pins in LOG/scorer_pins.json).
 """
 
 from __future__ import annotations
@@ -35,7 +39,8 @@ import httpx
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "rl"))
 
-from tinker_train import PRICES, RENDERER, THINKING_RENDERER, renderer_for, service_client  # noqa: E402,F401
+from tinker_train import (PRICES, RENDERER, THINKING_RENDERER, pinned_check, renderer_for, scorer_mismatch,  # noqa: E402,F401
+                          service_client)
 
 CONTEXT = 32768  # Qwen3-8B's native context: an episode's whole conversation
 INVALID = -10.0  # components.V3_INVALID: an episode ending without an answer (unparsed turn, context or turn cap)
@@ -251,6 +256,15 @@ def rl(a) -> None:
     rng = random.Random(a.seed)
     from tinker_cookbook.completers import TinkerTokenCompleter
 
+    pins_path = a.log / "scorer_pins.json"
+    pins = json.loads(pins_path.read_text()) if pins_path.exists() else {}
+
+    def save(name: str, step: int) -> str:
+        path = training.save_state(name).result().path
+        with (a.log / "checkpoints.jsonl").open("a") as f:
+            f.write(json.dumps({"step": step, "state": path, "total_usd": spend.total}) + "\n")
+        return path
+
     for step in range(a.steps):
         spend.check()
         t0 = time.time()
@@ -258,6 +272,10 @@ def rl(a) -> None:
                                       temperature=1.0, context_window=CONTEXT)
         pick = rng.sample(tasks, min(a.texts, len(tasks)))
         got = asyncio.run(rollouts(policy, a.server, pick, a.group, renderer, a.max_turns, a.max_tokens))
+        results = [rec["result"] for tr, rec in got if not isinstance(tr, BaseException) and rec.get("result")]
+        if why := scorer_mismatch(results, a.expect_semantics, a.expect_source) or pinned_check(pins, "tools", results):
+            raise SystemExit(f"step {step}: {why}")
+        pins_path.write_text(json.dumps(pins))
         datums, rows = [], []
         for k, t in enumerate(pick):
             grp = [(tr, rec) for tr, rec in got[k * a.group:(k + 1) * a.group] if not isinstance(tr, BaseException)]
@@ -286,7 +304,9 @@ def rl(a) -> None:
         print(json.dumps(line), flush=True)
         with (a.log / "steps.jsonl").open("a") as f:
             f.write(json.dumps(line) + "\n")
-    path = training.save_state(f"tools-rl-{a.steps}").result().path
+        if a.save_every and (step + 1) % a.save_every == 0 and step + 1 < a.steps:
+            save(f"tools-rl-{step + 1}", step + 1)
+    path = save(f"tools-rl-{a.steps}", a.steps)
     (a.log / "state.json").write_text(json.dumps({"state": path, "base": a.base, "rank": a.rank, "total_usd": spend.total}))
     print(json.dumps({"saved": path, "total_usd": spend.total}), flush=True)
 
@@ -390,6 +410,9 @@ def main():
             p.add_argument("--lr", type=float, default=4e-5)
             p.add_argument("--rank", type=int, default=32)
             p.add_argument("--seed", type=int, default=0)
+            p.add_argument("--save-every", type=int, default=0, help="a state every K steps (LOG/checkpoints.jsonl)")
+            p.add_argument("--expect-source", help="stop unless every result comes from a server built at this revision")
+            p.add_argument("--expect-semantics", help="stop unless every result's semantics is this (n)")
     a = ap.parse_args()
     if a.base not in PRICES:
         raise SystemExit(f"no prices for {a.base}")

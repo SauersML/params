@@ -36,7 +36,9 @@ from tools, measured on demand on the real model and VPD's decomposition (goal_e
 
 Tool results are compact JSON, cached per text and arguments. The tools measure on the other split's draws than the
 score (TOOL_SPLIT: the reward's "search" draws on training texts are never the tools'; on held-out texts the score
-takes "eval" and the tools "search"), so a policy cannot fit the scored draws by calling tools.
+takes "eval" and the tools "search"), so a policy cannot fit the scored draws by calling tools. --score-split auto
+takes that rule per text (training texts text6000-7999 score on "search", any other on "eval"): one server for RL's
+training episodes and its dev checkpoints.
 
 An episode: a system message (the tools' use; the tool schemas in Qwen3's format, qwen3_tools(), which the renderer
 puts in the system prompt), the user's short question, then the policy's turns: an assistant message with tool calls
@@ -54,7 +56,7 @@ elsewhere (tools_tinker.py: Tinker's cookbook, multi-turn).
   tools_env.py scripted ROWS.jsonl --tasks text9000:text9019 --out OUT.jsonl [--score-split eval]
   tools_env.py tokens ROWS.jsonl --tasks text9000:text9019 [--episodes OUT.jsonl]   Qwen3 tokens: one-shot vs episode
   tools_env.py baselines ROWS.jsonl --episodes OUT.jsonl --out BASE.jsonl   the scripted answers beside equal-size sets
-  tools_env.py serve ROWS.jsonl [--port 8771] [--score-split search]
+  tools_env.py serve ROWS.jsonl [--port 8771] [--score-split search|eval|auto] [--cost 0.02]
 ROWS: components.py questions rows (each text's evidence: its intervention questions and edit requests).
 """
 
@@ -97,6 +99,7 @@ EFFECTS_MAX = 4096  # node_effects' most nodes in a draft
 EFFECT_DRAWS = 8  # node_effects' changed inputs (line_effects' draws on the tools' split)
 COMPARE_DRAWS = goal_eval.CHANGED_DRAWS  # compare's changed inputs (track_pp's draws on the tools' split)
 OTHER = {"search": "eval", "eval": "search"}
+TRAIN_TEXTS = range(6000, 8000)  # the training partition (tools_tinker's): "auto" scores these on "search"
 SEED_SHIFT = 7919  # the families' Text copy's seed offset: circuit-seeded draws (nodes, edges, flips) unlike the score's
 LN2 = math.log(2)
 
@@ -707,17 +710,28 @@ def question(task: dict, ev: dict) -> str:
 
 class Env:
     """The tool environment over texts: a GoalEval, the texts' question rows, their Tools (TEXTS_KEPT kept), the
-    reward's split (score_split; the tools take the other), the flip adversary's pattern pool."""
+    reward's split (score_split, or "auto": split_of each text; the tools take the other), the flip adversary's pattern
+    pool."""
 
     def __init__(self, rows: dict, ge: goal_eval.GoalEval | None = None, score_split: str = "search", cost: float = COST,
                  facts: bool = True, pool: dict | None = None):
         self.ge = ge or goal_eval.GoalEval(native.Native())
-        self.rows, self.score_split, self.tool_split, self.cost = rows, score_split, OTHER[score_split], cost
+        if score_split not in ("search", "eval", "auto"):
+            raise ValueError(f"score split {score_split!r}: search, eval or auto")
+        self.rows, self.score_split, self.cost = rows, score_split, cost
         self.lens = components._lens(self.ge.nat) if facts else None
         self.atlas = components._atlas() if facts else None
         self.pool = components._pool() if pool is None else pool
         self.tools: OrderedDict = OrderedDict()
         self.tasks: dict = {}
+
+    def split_of(self, tid: str) -> str:
+        """The reward's split on a text: score_split, or under "auto" "search" on a training text and "eval" on any
+        other."""
+        if self.score_split != "auto":
+            return self.score_split
+        n = tid.removeprefix("text")
+        return "search" if n.isdigit() and int(n) in TRAIN_TEXTS else "eval"
 
     def task(self, tid: str) -> dict:
         if tid not in self.tasks:
@@ -726,7 +740,7 @@ class Env:
 
     def text_tools(self, tid: str) -> Tools:
         if tid not in self.tools:
-            self.tools[tid] = Tools(self.ge, self.task(tid), self.tool_split, self.lens, self.atlas, self.pool)
+            self.tools[tid] = Tools(self.ge, self.task(tid), OTHER[self.split_of(tid)], self.lens, self.atlas, self.pool)
             while len(self.tools) > TEXTS_KEPT:
                 self.tools.popitem(last=False)
         self.tools.move_to_end(tid)
@@ -739,7 +753,7 @@ class Env:
         """components.reward of one answer on its text (reward v3 on the score split), sharing the tools' Text."""
         tools = self.text_tools(tid)
         return components.reward(self.ge, self.task(tid), self.rows[tid], [answer], cache={tid: tools.tx},
-                                 split=self.score_split, pool=self.pool)[0]
+                                 split=self.split_of(tid), pool=self.pool)[0]
 
 
 def free_text(env: Env, tid: str) -> None:
@@ -893,15 +907,34 @@ class Episode:
 
     def finish(self) -> dict:
         """The episode's reward: components.reward of its answer (a draft id in its CIRCUIT expanded) minus COST per
-        call (no answer: V3_INVALID)."""
+        call (no answer: V3_INVALID), with what the reward depends on (the scorer's semantics and source revision,
+        source(); its Python environment and far-donor pool; the score split; the cost per call), for a trainer to
+        freeze (tools_tinker rl --expect-source)."""
         t0 = time.perf_counter()
         answer = self.expand(self.answer) if self.answer is not None else None
         r = self.env.score(self.tid, answer) if answer is not None else None
         base = r["reward"] if r is not None else components.V3_INVALID
         self.result = {"task": self.tid, "reward": base - self.env.cost * self.calls, "answer_reward": base, "calls": self.calls,
                        "turns": self.turns, "answered": self.answer is not None, "score_seconds": round(time.perf_counter() - t0, 2),
-                       "scores": _brief(r) if r is not None else None, "answer_expanded": answer if answer != self.answer else None}
+                       "scores": _brief(r) if r is not None else None, "answer_expanded": answer if answer != self.answer else None,
+                       "semantics": getattr(self.env.ge, "semantics", None), "source": source(),
+                       "environment": goal_eval.environment(), "donor_pool": self.env.ge.pool_id(self.env.split_of(self.tid)),
+                       "split": self.env.split_of(self.tid), "cost": self.env.cost}
         return self.result
+
+
+def source() -> str:
+    """The scorer's revision: the pod's SOURCE file (rp-run's "python source <rev>") when there is one, else a hash of
+    the scoring code (as env_c.source), so a trainer can freeze it (REWARD_REV)."""
+    import hashlib
+
+    f = HERE.parents[1] / "SOURCE"
+    if f.exists():
+        return f.read_text().split()[-1]
+    h = hashlib.sha256()
+    for name in ("tools_env.py", "components.py", "goal_eval.py", "engine.py", "native.py", "carry.py"):
+        h.update((HERE / name).read_bytes())
+    return "code-" + h.hexdigest()[:12]
 
 
 def _brief(r: dict) -> dict:
@@ -1166,7 +1199,7 @@ def bench(env: Env, tids: list[str], log=print, score: bool = True) -> dict:
         out[tid] = {"T": tools.T, "setup_s": round(setup, 2), "tools_s": {k: [round(x, 2) for x in v] for k, v in tools.seconds.items()}}
         if score:
             t1 = time.perf_counter()
-            tau = env.ge.tau(tools.tx, env.pool, env.score_split)
+            tau = env.ge.tau(tools.tx, env.pool, env.split_of(tid))
             tau_s = time.perf_counter() - t1
             t1 = time.perf_counter()
             r = env.score(tid, "CIRCUIT:\n```mermaid\n" + big + "\n```\nEXPLANATION: x")
@@ -1185,8 +1218,8 @@ def scripted(env: Env, tids: list[str], out: Path, log=print, rank: str = "effec
         r = run_episode(env, tid, pol)
         tools = env.text_tools(tid)
         tx = tools.tx
-        tau = env.ge.tau(tx, env.pool, env.score_split)
-        st = env.ge.start_set(tx, env.score_split)
+        tau = env.ge.tau(tx, env.pool, env.split_of(tid))
+        st = env.ge.start_set(tx, env.split_of(tid))
         row = {**r, "rank": rank, "accept": accept, "max_calls": max_calls, "trace": pol.trace,
                "start": {"phi": tau["phi_start"], "phi_tau": tau["phi_tau"], "bits": tau["bits_start"], "s_track_pp": st["s_track_pp"],
                          "nodes": tau["nodes_start"], "m": tau["m_start"]},
@@ -1230,7 +1263,7 @@ def baselines(env: Env, episodes: Path, out: Path, log=print) -> list[dict]:
         parsed = components.parse(ep.get("answer_expanded") or ep["answer"])
         g, _ = goal_eval.circuit(parsed["answer"], tx.targets, nat.C, tx.T)
         k = g.count()
-        st = ge.start_set(tx, env.score_split)["graph"]
+        st = ge.start_set(tx, env.split_of(tid))["graph"]
         snodes = sorted(st.node_set())
         key = {nd: float(tx.ci[nd[0]][nd[1], nd[2]]) * abs(float(tx.rec[nd[0]][0, nd[1], nd[2]])) for nd in snodes}
         rng = np.random.default_rng(0)
@@ -1240,11 +1273,11 @@ def baselines(env: Env, episodes: Path, out: Path, log=print) -> list[dict]:
                 "start_ci_act_k": native.Graph(sorted(snodes, key=lambda nd: -key[nd])[:k], complete=True),
                 "start_random_k": native.Graph([snodes[i] for i in rng.choice(len(snodes), size=min(k, len(snodes)), replace=False)], complete=True)}
         t0 = time.perf_counter()
-        rows = ge.fidelity(tx, list(sets.values()), env.pool, mode="reward", split=env.score_split)
+        rows = ge.fidelity(tx, list(sets.values()), env.pool, mode="reward", split=env.split_of(tid))
         phi_start, phi_tau = goal_eval.phi(rows[list(sets).index("start")], start=rows[list(sets).index("start")])
         bits_start = goal_eval.size_bits(st, P, S, tx.targets, active=tx.vpd)
         row = {"task": tid, "k": k, "seconds": round(time.perf_counter() - t0, 1), "artifact_version": 2,
-               "score_split": env.score_split, "source_sha256": source_hashes,
+               "score_split": env.split_of(tid), "source_sha256": source_hashes,
                "episode_sha256": hashlib.sha256(json.dumps(ep, sort_keys=True).encode()).hexdigest(),
                "threshold_source": "same_batch_start", "phi_start": phi_start, "phi_tau": phi_tau,
                "bits_start": bits_start, "gate_slope": components.GATE_SLOPE,
@@ -1321,8 +1354,9 @@ def serve(env: Env, host: str, port: int) -> None:
     """The environment behind HTTP for a policy sampled elsewhere (tools_tinker.py); one GPU thread does the work.
       POST /reset {"task"}                    -> {"episode", "messages", "tools"}
       POST /call {"episode", "name", "arguments"} -> {"content"}
-      POST /submit {"episode", "answer"}      -> the episode's result (reward minus the calls' cost)
-      GET /health"""
+      POST /submit {"episode", "answer"}      -> the episode's result (reward minus the calls' cost; Episode.finish:
+                                                 with the scorer's semantics, source, environment, donor pool, split)
+      GET /health                             -> {"episodes", "texts", "semantics", "source", "score_split", "cost"}"""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     lock, episodes = threading.Lock(), OrderedDict()
@@ -1337,7 +1371,9 @@ def serve(env: Env, host: str, port: int) -> None:
             self.wfile.write(data)
 
         def do_GET(self):
-            self.reply(200, {"episodes": len(episodes), "texts": list(env.tools)}) if self.path == "/health" else self.reply(404, {})
+            self.reply(200, {"episodes": len(episodes), "texts": list(env.tools), "semantics": getattr(env.ge, "semantics", None),
+                             "source": source(), "score_split": env.score_split, "cost": env.cost}) \
+                if self.path == "/health" else self.reply(404, {})
 
         def do_POST(self):
             try:
@@ -1363,7 +1399,8 @@ def serve(env: Env, host: str, port: int) -> None:
         def log_message(self, *args):
             pass
 
-    print(f"tools_env: http://{host}:{port} (score split {env.score_split}, tools {env.tool_split})", flush=True)
+    print(f"tools_env: http://{host}:{port} (score split {env.score_split}, tools the other; cost {env.cost} a call; source {source()})",
+          flush=True)
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 
@@ -1399,7 +1436,8 @@ def main():
     v.add_argument("rows")
     v.add_argument("--port", type=int, default=8771)
     v.add_argument("--host", default="127.0.0.1")
-    v.add_argument("--score-split", default="search")
+    v.add_argument("--score-split", default="search", choices=["search", "eval", "auto"], help="the reward's split; auto: "
+                   "search on training texts (text6000-7999), eval on others (RL and its dev checkpoints on one server)")
     v.add_argument("--device")
     for sp in (s, v):
         sp.add_argument("--cost", type=float, default=COST, help=f"reward per tool call (env F: {COST_F})")

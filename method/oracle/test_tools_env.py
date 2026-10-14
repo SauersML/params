@@ -370,3 +370,43 @@ def test_a_turns_run_circuit_calls_are_scored_together(env):
     for a, b in zip(alone, got):
         b.pop("draft", None)
         assert close(a, b), (a, b)
+
+
+def test_server_scores_concurrent_episodes_run_circuit_calls_together(env, monkeypatch):
+    """serve()'s Server: run_circuit calls of concurrent episodes on one text are scored in one batch (one _scored call
+    for all of them), each episode's result the call's own one at a time (to the results' rounding)."""
+    import threading
+
+    t = 11
+    calls = [{"positions": [t] + ps, "families": True} for ps in ([], [t - 1], [t - 2], [t - 1, t - 2])]
+
+    def fresh():
+        e = tools_env.Env(env.rows, env.ge, score_split="eval", facts=False, pool={})
+        e.tasks = env.tasks
+        return e
+    alone_tools = fresh().text_tools(TID)
+    alone = [json.loads(alone_tools.call("run_circuit", a)) for a in calls]
+    srv = tools_env.Server(fresh(), wait=0.3)
+    eps = [srv.handle("/reset", {"task": TID})[1]["episode"] for _ in calls]
+    sizes, real = [], tools_env.Tools._scored
+
+    def counted(self, heads, families):
+        sizes.append(len(heads))
+        return real(self, heads, families)
+    monkeypatch.setattr(tools_env.Tools, "_scored", counted)
+    got = [None] * len(calls)
+
+    def run(i):
+        got[i] = srv.handle("/call", {"episode": eps[i], "name": "run_circuit", "arguments": calls[i]})
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(calls))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert sizes == [len(calls)] and all(code == 200 for code, _ in got)
+    for a, (_, body) in zip(alone, got):
+        b = json.loads(body["content"])
+        b.pop("draft", None)
+        assert set(a) == set(b) and all(abs(a[k] - b[k]) <= 2e-3 if isinstance(a[k], float) else a[k] == b[k] for k in a
+                                       if k != "families"), (a, b)
+    assert all(not ep_log[3] for e in eps for ep_log in srv.episodes[e].log)

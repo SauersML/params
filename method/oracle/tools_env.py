@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import json
 import math
 import re
@@ -91,6 +92,7 @@ COST_F = 0.005  # env F's (the lead's 10-13, fixed before its gate): a teacher-l
 MAX_TURNS = 24  # assistant turns per episode
 MAX_CALLS = 40  # tool calls per episode
 TEXTS_KEPT = 8  # texts whose Tools a process keeps (an RL group's episodes share one)
+BATCH_WAIT = 0.05  # serve(): seconds a run_circuit call waits for other episodes' calls, to be scored with them
 LIST_TOP = 24  # list_active's default
 LIST_MAX = 400  # list_active's most
 REMOVE_EACH_MAX = 4096  # measure_removal(each=True)'s most nodes (an influential start reaches 1,127 on text9001)
@@ -1418,8 +1420,70 @@ def _hf_message(m: dict) -> dict:
 # ---- HTTP
 
 
+class Server:
+    """serve()'s episodes and requests. One lock for the GPU; the run_circuit calls waiting for it (an RL group's
+    concurrent episodes on one text, a turn's calls sent at once) are scored together: the call that takes the lock
+    first resolves every waiting run_circuit call on its text with that call's own episode and scores them in one
+    batch (Tools.prefetch), and each call then reads its own result (the numbers one at a time gives, up to the
+    batch's float32 rounding). wait: seconds a run_circuit call gives the others to arrive."""
+
+    def __init__(self, env: Env, wait: float = BATCH_WAIT):
+        self.env, self.wait = env, wait
+        self.lock, self.episodes = threading.Lock(), OrderedDict()
+        self.wlock, self.waiting, self.ids = threading.Lock(), {}, itertools.count()  # run_circuit calls not yet run
+
+    def handle(self, path: str, req: dict) -> tuple[int, dict]:
+        """(HTTP status, body) of a POST."""
+        if path == "/call":
+            ep, name, args = self.episodes[req["episode"]], req["name"], req.get("arguments")
+            k = next(self.ids) if name == "run_circuit" else None
+            if k is not None:
+                with self.wlock:
+                    self.waiting[k] = (ep, name, args)
+                time.sleep(self.wait)
+            try:
+                with self.lock:
+                    if k is not None:
+                        self._prefetch(ep.tools)
+                    return 200, {"content": ep.call(name, args)}
+            finally:
+                if k is not None:
+                    with self.wlock:
+                        self.waiting.pop(k, None)
+        with self.lock:
+            if path == "/reset":
+                ep = self.env.reset(req["task"])
+                self.episodes[ep.id] = ep
+                while len(self.episodes) > 4096:
+                    self.episodes.popitem(last=False)
+                return 200, {"episode": ep.id, "messages": ep.messages, "tools": qwen3_tools()}
+            if path == "/submit":
+                ep = self.episodes[req["episode"]]
+                ep.answer = req.get("answer")
+                ep.turns = req.get("turns", ep.turns)
+                return 200, {**ep.finish(), "log": ep.log}
+        return 404, {"error": "POST /reset, /call or /submit"}
+
+    def _prefetch(self, tools: Tools) -> None:
+        """Every waiting run_circuit call on tools' text, its draft resolved by its own episode, scored together."""
+        with self.wlock:
+            mine = [(ep, name, args) for ep, name, args in self.waiting.values() if ep.tools is tools]
+        batch = []
+        for ep, name, args in mine:
+            try:
+                args = json.loads(args) if isinstance(args, str) and args.strip() else args
+                if isinstance(args, dict):
+                    batch.append((name, ep._resolve(name, args)))
+            except (ToolError, json.JSONDecodeError, KeyError, TypeError):
+                pass  # (its own call reports it)
+            finally:
+                ep._inherit = None
+        tools.prefetch(batch)
+
+
 def serve(env: Env, host: str, port: int) -> None:
-    """The environment behind HTTP for a policy sampled elsewhere (tools_tinker.py); one GPU thread does the work.
+    """The environment behind HTTP for a policy sampled elsewhere (tools_tinker.py); one GPU thread does the work, and
+    concurrent episodes' run_circuit calls on a text are scored together (Server).
       POST /reset {"task"}                    -> {"episode", "messages", "tools"}
       POST /call {"episode", "name", "arguments"} -> {"content"}
       POST /submit {"episode", "answer"}      -> the episode's result (reward minus the calls' cost; Episode.finish:
@@ -1427,7 +1491,7 @@ def serve(env: Env, host: str, port: int) -> None:
       GET /health                             -> {"episodes", "texts", "semantics", "source", "score_split", "cost"}"""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    lock, episodes = threading.Lock(), OrderedDict()
+    srv = Server(env)
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self, code: int, body: dict) -> None:
@@ -1439,28 +1503,13 @@ def serve(env: Env, host: str, port: int) -> None:
             self.wfile.write(data)
 
         def do_GET(self):
-            self.reply(200, {"episodes": len(episodes), "texts": list(env.tools), "semantics": getattr(env.ge, "semantics", None),
+            self.reply(200, {"episodes": len(srv.episodes), "texts": list(env.tools), "semantics": getattr(env.ge, "semantics", None),
                              "source": source(), "score_split": env.score_split, "cost": env.cost}) \
                 if self.path == "/health" else self.reply(404, {})
 
         def do_POST(self):
             try:
-                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                with lock:
-                    if self.path == "/reset":
-                        ep = env.reset(req["task"])
-                        episodes[ep.id] = ep
-                        while len(episodes) > 4096:
-                            episodes.popitem(last=False)
-                        return self.reply(200, {"episode": ep.id, "messages": ep.messages, "tools": qwen3_tools()})
-                    ep = episodes[req["episode"]]
-                    if self.path == "/call":
-                        return self.reply(200, {"content": ep.call(req["name"], req.get("arguments"))})
-                    if self.path == "/submit":
-                        ep.answer = req.get("answer")
-                        ep.turns = req.get("turns", ep.turns)
-                        return self.reply(200, {**ep.finish(), "log": ep.log})
-                self.reply(404, {"error": "POST /reset, /call or /submit"})
+                self.reply(*srv.handle(self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
             except Exception as e:  # a bad request answers with its error; the server keeps serving
                 self.reply(400, {"error": f"{type(e).__name__}: {e}"})
 

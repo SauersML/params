@@ -760,3 +760,30 @@ def test_cuda_storages():
     assert teacher.cuda_storages({"again": a[1:]}, seen) == 0
     m = torch.nn.Linear(4, 4).cuda()
     assert teacher.cuda_storages([m], set()) == 0 and teacher.cuda_storages(m, set(), model=True) == (16 + 4) * 4
+
+
+def test_single_pass_minimal_under_the_full_row():
+    # the final single-part pass (the lead's 10-14): parts 1 and 4 carry the floors alone, parts 2 and 3 are needed
+    # together on the full row only (the checks' draws miss it): the pass removes every part it can, the full row
+    # undoes the joint removal, and a part asked about alone again stays out while the one that breaks the row stays
+    from types import SimpleNamespace
+    need, joint = {1, 4}, {2, 3}
+
+    class Pr:
+        def __init__(self):
+            self.on = torch.ones(6, dtype=torch.bool)
+
+        def without(self, groups, ranking=False):
+            return [float(g[0]) for g in groups]
+    pr = Pr()
+    graph_of = lambda on: frozenset(on.nonzero().flatten().tolist())  # noqa: E731
+
+    def floor_rows(graph_of_, now, ons, floors):
+        rows = [{"point": 1.0 if need <= graph_of_(on) else 0.5} for on in ons]
+        return [r if r["point"] >= floors["point"] - 1e-9 else None for r in rows]
+    acc = SimpleNamespace(ge=None, tx=None, floor_rows=floor_rows, _halves=lambda: ([], []))
+    row_under = lambda g: {"N": [0.5, 0.9]} if not joint & g else {}  # noqa: E731
+    out = teacher.single_pass(pr, graph_of, acc, {"point": 0.9}, None, row_under, log=lambda *a, **k: None)
+    left = set(pr.on.nonzero().flatten().tolist())
+    assert need <= left and len(left & joint) == 1 and not left - need - joint
+    assert not row_under(graph_of(pr.on)) and out["fails"] and out["backed"] >= 1

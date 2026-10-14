@@ -1725,11 +1725,12 @@ def test_interchange_own_positions(tiny):
     panel = ge._interchange_panel(tx, "search")
     assert panel == sorted(t for t in set(tx.targets) | set(ge.start_candidates(tx)[:goal_eval.START_CAP]) if 0 < t < tx.T)
     far = [nd for nd in every if nd[1] not in panel][:4] or every[:1]
-    got = ge._interchange_refs(tx, "search", 4)[0]
+    got, _, _, _, KV = ge._interchange_refs(tx, "search", goal_eval.INTERCHANGE_DRAWS)
     rows = ge.interchange_pp(tx, [native.Graph(masks=tx.vpd), native.Graph(far, complete=True)], "search", 4)
     own = set(tx.targets) | {nd[1] for nd in far}
-    assert [tuple(d[0]) for d in rows[1]["draws_interchange_pp"]] == [pz for pz in got if pz[0] in own]
-    kv = {tuple(d[0]): d[2] for d in rows[0]["draws_interchange_pp"]}
+    # fewer draws than the reward's: the first of the reward panel's draws at the circuit's own positions (pymove 10-14)
+    assert [tuple(d[0]) for d in rows[1]["draws_interchange_pp"]] == [pz for pz in got if pz[0] in own][:4]
+    kv = dict(zip(got, KV))                                       # VPD's whole answer's KL per panel draw
     for (p, z), kc, kvp, w in rows[1]["draws_interchange_pp"]:
         x2 = list(tx.ids)
         x2[p] = z
@@ -1746,7 +1747,7 @@ def test_interchange_rows(tiny):
     records, bit for bit."""
     nat, ge, tx = tiny
     tx.__dict__.pop("_ipp_refs", None)
-    got, recs, lm, W, KV = ge._interchange_refs(tx, "search", 4)
+    got, recs, lm, W, KV = ge._interchange_refs(tx, "search", goal_eval.INTERCHANGE_DRAWS)
     assert got
     for p, z in got:
         x2 = list(tx.ids)
@@ -1760,18 +1761,22 @@ def test_interchange_rows(tiny):
     g = goal_eval.strand(native.Graph(nodes, complete=True), tx.targets, nat.C)
     E = ge._pp_engine(tx)
     own = sorted(g.node_set())
-    idx = ge._interchange_own(tx, got, own)
+    idx = ge._interchange_own(tx, got, own)[:4]                   # its first 4 own draws of the reward's panel
     with torch.no_grad():
-        whole = [_pp_holds(ge, tx, nat, own, p, z) for p, z in got]
-        lc = E.path_patched([g], [whole[i] for i in idx])[0]
+        whole = [_pp_holds(ge, tx, nat, own, *got[i]) for i in idx]
+        lc = E.path_patched([g], whole)[0]
         row = ge.interchange_pp(tx, [g], "search", 4)[0]
         assert [d[1] for d in row["draws_interchange_pp"]] == carry.kl(lm[idx], lc).tolist()
         cols = E.pp_lines(g)
         lines = (torch.rand(3, len(cols), generator=torch.Generator().manual_seed(4)) < 0.7).float()
-        circ = E.path_patched([g], whole, lines=lines)
+        nodes = [k[1] for k in cols if k[0] == "n"]           # each variant's first 4 own draws, their union run
+        per = [ge._interchange_own(tx, got, [nd for nd, o in zip(nodes, row) if o])[:4] for row in lines[:, :len(nodes)].bool().tolist()]
+        take = sorted(set().union(*per))
+        circ = E.path_patched([g], [_pp_holds(ge, tx, nat, own, *got[i]) for i in take], lines=lines)
         for k, r in enumerate(ge.interchange_pp(tx, [g], "search", 4, lines=lines)):
-            kl = carry.kl(lm, circ[k]).tolist()
-            assert [d[1] for d in r["draws_interchange_pp"]] == [kl[got.index(tuple(d[0]))] for d in r["draws_interchange_pp"]]
+            kl = carry.kl(lm[take], circ[k]).tolist()
+            assert [tuple(d[0]) for d in r["draws_interchange_pp"]] == [got[i] for i in per[k]]
+            assert [d[1] for d in r["draws_interchange_pp"]] == [kl[take.index(i)] for i in per[k]]
 
 
 def test_true_pattern_family(tiny):
@@ -2208,7 +2213,9 @@ def test_cutover_scores_as_the_frozen_line():
     """The default semantics scores as run 2's frozen line, c2e0f80 with SEMANTICS=n: the tiny fixture's reward-mode
     families on a node set and a stated graph equal the numbers c2e0f80 gave under SEMANTICS=n (GitHub Actions, CPU),
     within 1e-4; phi over that line's families (the input-scope family came after it), re-frozen at the 10-13 revision
-    (pymove's v24: interchange_pp's panel the START's candidates, its draws another set) on a pod at 24823a8b73."""
+    (pymove's v24: interchange_pp's panel the START's candidates, its draws another set) on a pod at 24823a8b73; the
+    stated graph's again at the 10-14 revision (pymove: fewer interchange draws than the reward's, this test's 2, are
+    the first of the reward panel's draws at the circuit's own positions), on a pod at d2e6c6ed50."""
     nat = tiny_native(near=0.1)
     ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
     g = torch.Generator().manual_seed(1)
@@ -2224,7 +2231,7 @@ def test_cutover_scores_as_the_frozen_line():
              "s_omitted_raw": 0.09792910144777334, "kl_point": 13.841683387756348, "phi": 0.15039301621621806},
             {"s_point_c": 0.0, "s_nodes": None, "s_nodes_raw": None, "kl_nodes_c": 4.313782215118408, "s_edges": None,
              "s_omitted": 0.5857890529978118, "s_omitted_raw": 0.3602883742448587, "kl_point": 13.87414264678955,
-             "phi": 0.10110904978983165}]
+             "phi": 0.07083511132033418}]
     assert ge.semantics == "n"
     for r, w in zip(rows, want):
         then = [f for f in goal_eval.PHI_FAMILIES if f != "scope" and goal_eval.family_score(r, f) is not None]

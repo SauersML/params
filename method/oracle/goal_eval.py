@@ -558,7 +558,9 @@ PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the sc
     "patching_near": ("s_patching_near", "donor", "draws_patching_near"), "patching_far": ("s_patching_far", "donor", "draws_patching_far"),
     "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_spec", "spec", "draws_n_spec"),
     "omitted": ("s_omitted", "weighted", "draws_omitted"), "scope": ("s_scope", "weighted", "draws_scope")}
-RESAMPLE_DONORS = 4  # resample_influence's far donors per position (the START's candidate order)
+RESAMPLE_DONORS = 16  # resample_influence's far donors per position (the START's candidate order and the input-scope
+# family's draws; the lead's 10-14: on 10 dev STARTs the scope family's SD across three disjoint donor pools was 0.053
+# at 4, 0.032 at 8, 0.027 at 16 and 0.021 at 32, per circuit 0.04, 0.07, 0.12 and 0.22 s)
 START_CAP = 16  # the START's most candidate positions beside the targets (start_candidates; the input-scope family's cap)
 SCOPE_COVER = 0.95  # the input-scope family's positions: by resampling influence until they hold this share of its sum
 RESOLUTION_SAFETY = 10.0  # kl_resolution: the KL between two equal C runs times this
@@ -2701,16 +2703,19 @@ class GoalEval:
 
     def _interchange_graphs(self, tx: Text, graphs: list[native.Graph], split: str, draws: int) -> list[dict]:
         """interchange_pp of graphs as given (stranding is the caller's), each graph on the text's panel draws at its own
-        positions (_interchange_own)."""
+        positions (_interchange_own), the first draws of them among the reward's INTERCHANGE_DRAWS panel draws. (The
+        teacher's checks ask for 8: drawn from the whole panel and only then cut to the circuit's positions, they left
+        text9006's circuit at 302 and 309 almost none, every single removal scoring 0.000002 against its full row's
+        0.995; pymove 10-14.)"""
         nat = self.nat
-        got, recs, lm, W, KV = self._interchange_refs(tx, split, draws)
+        got, recs, lm, W, KV = self._interchange_refs(tx, split, max(draws, INTERCHANGE_DRAWS))
         empty = {"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
         if not got:
             return [dict(empty) for _ in graphs]
         out = []
         for g in graphs:
             nodes = sorted(g.node_set())
-            idx = self._interchange_own(tx, got, nodes)  # the draws at its own positions
+            idx = self._interchange_own(tx, got, nodes)[:draws]  # the draws at its own positions
             if not idx:
                 out.append(dict(empty))
                 continue
@@ -2723,25 +2728,29 @@ class GoalEval:
 
     def _interchange_lines(self, tx: Text, graph: native.Graph, split: str, draws: int, lines: torch.Tensor) -> list[dict]:
         """interchange_pp of graph's line deletions (lines [K, L], Engine.pp_lines' columns of the stranded graph):
-        every variant on the text's panel draws at its own positions (_interchange_own; the references are the text's), its circuit runs in one
-        Engine.path_patched(lines=) call holding the answer's nodes at p (a deleted node is no longer the graph's, so its
-        value drops out)."""
+        every variant on the text's panel draws at its own positions (_interchange_own; the references are the text's;
+        at most draws of them, as _interchange_graphs takes a graph's), its circuit runs in one Engine.path_patched(lines=)
+        call holding the answer's nodes at p (a deleted node is no longer the graph's, so its value drops out)."""
         nat = self.nat
         g = strand(graph, tx.targets, nat.C)
-        got, recs, lm, W, KV = self._interchange_refs(tx, split, draws)
-        if not got:
-            return [{"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
-                    for _ in range(len(lines))]
+        got, recs, lm, W, KV = self._interchange_refs(tx, split, max(draws, INTERCHANGE_DRAWS))
         E = self._pp_engine(tx)
         nodes = [k[1] for k in E.pp_lines(g) if k[0] == "n"]
-        helds = [self._interchange_held(recs[pz], nodes, pz[0]) for pz in got]
-        circ = E.path_patched([g], helds, lines=lines)  # [K, D, targets, V]
         on = lines[:, :len(nodes)].bool().tolist()       # each variant's nodes (pp_lines' node columns come first)
+        per = [self._interchange_own(tx, got, [nd for nd, o in zip(nodes, on[k]) if o])[:draws] if got else []
+               for k in range(len(lines))]               # each variant's own draws, as _interchange_graphs takes them
+        take = sorted(set().union(*per))
+        if not take:
+            return [{"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
+                    for _ in range(len(lines))]
+        helds = [self._interchange_held(recs[got[i]], nodes, got[i][0]) for i in take]
+        circ = E.path_patched([g], helds, lines=lines)  # [K, D, targets, V]
+        at = {i: j for j, i in enumerate(take)}
         out = []
         for k in range(len(lines)):
-            idx = self._interchange_own(tx, got, [nd for nd, o in zip(nodes, on[k]) if o])
-            kl = carry.kl(lm, circ[k]).tolist()
-            out.append(self._interchange_row([got[i] for i in idx], [kl[i] for i in idx], [KV[i] for i in idx], [W[i] for i in idx]))
+            kl = carry.kl(lm[take], circ[k]).tolist()
+            out.append(self._interchange_row([got[i] for i in per[k]], [kl[at[i]] for i in per[k]], [KV[i] for i in per[k]],
+                                             [W[i] for i in per[k]]))
         native.free(nat.dev)
         return out
 

@@ -1014,6 +1014,7 @@ class Acceptance:
             tau = self.ge.tau(self.tx, self.pool_adv, "search")   # own score (an expanded or forward start below a floor
             row0 = reward_row(self.ge, self.tx, graph_of(start), self.pool_adv)   # may still prune, never further down)
             fams = {f: min(v, goal_eval.family_score(row0, f) or 0.0) for f, v in (tau.get("floors") or {}).items()}
+            self.fams = fams                                 # (single_pass's floors)
             if self.draws == "fv" and "scope" in fams:       # scope's held-out half: floor_of the START's there
                 s0 = goal_eval.family_score(self.ge.scope_family(self.tx, [graph_of(start)], "search", part="validate")[0], "scope")
                 self.scope_floor = floor_of(s0)
@@ -1150,6 +1151,132 @@ class Validated:
 
 
 SET_LEVELS = ("site", "chunk16", "chunk4", "subcomponent")  # the influential set's levels, coarse first
+SINGLE = True         # set_search's final single-part pass (single_pass, --no-single off)
+FULL_EVERY = 8        # single_pass: removal groups between full reward row checks
+
+
+def single_pass(pr: "Pruner", graph_of, acceptance: Acceptance, floors: dict, f_track: float | None, row_under,
+                log=print) -> dict:
+    """The final single-part pass after the pick (the lead's 10-14: a circuit is minimal when no part alone can go without
+    breaking a floor on held-out validation draws; the stage pruner asks about a level's blocks alone only between its
+    largest admitted and smallest refused prefix, and Validated ends a level at its first failed check: on 5 dev
+    circuits at 6a9e1d3, 57% of sampled parts went alone with every eval family at its floor). Every part of the
+    current set, least costly alone first (kl_rank), ACCEPT_BATCH at a time, each removed alone and judged on the
+    reward's families (acceptance.floor_rows: phi_variants and the held edges, omitted and flips, floors the reward's
+    as the acceptance's) and then both validation halves (track on the validation draws at f_track, scope on its half
+    at floor_of the START's there): a removal passes when each stays at least at min(its floor, the current circuit's
+    own score on the same draws), a circuit already under a floor on a check's few draws never losing more there. The
+    batch's passing parts are removed together when the set without all of them passes too, else each half in turn the
+    same way. Every FULL_EVERY groups, and at the end, the full search reward row (row_under(graph): the families under
+    their floors, {} at v = 0): failing it, the groups since the last passing row are undone back to the longest prefix
+    that passes (bisection); a single part that broke it is kept for good, a group's parts and every later group's are
+    asked about again, each alone (the checks' 8 draws let removals through that the full row's 32 refuse: text9039, 70
+    of 77 groups undone at a single check at the end). {tested, removed, groups, full_checks, backed, fails (the failing rows' families), seconds}."""
+    t0 = time.perf_counter()
+    ids = pr.on.nonzero().flatten().tolist()
+    single = pr.without([torch.tensor([i], device=pr.on.device) for i in ids], ranking=True)
+    order = [ids[j] for j in sorted(range(len(ids)), key=lambda j: single[j])]
+    queue = [order[s0:s0 + ACCEPT_BATCH] for s0 in range(0, len(order), ACCEPT_BATCH)]   # batches; a retry alone
+    ge, tx = acceptance.ge, acceptance.tx
+    scope_floor = getattr(acceptance, "scope_floor", None)
+    seen, own = {}, {}
+
+    def checks(ons):                                         # [(track, scope)] on the validation halves, per set
+        keys = [Acceptance.key(on) for on in ons]
+        todo = [j for j, key in enumerate(keys) if key not in seen]
+        if todo:
+            gs = [graph_of(ons[j]) for j in todo]
+            val = acceptance._halves()[1]
+            tr = [acceptance.ranked(r, val, range(len(val)))[0] for r in acceptance._per_draw(gs, val)] if val else [None] * len(gs)
+            sc = [goal_eval.family_score(r, "scope") for r in ge.scope_family(tx, gs, "search", part="validate")] \
+                if scope_floor is not None else [None] * len(gs)
+            for j, a, b in zip(todo, tr, sc):
+                seen[keys[j]] = (a, b)
+        return [seen[key] for key in keys]
+
+    def judge(cands):                                        # per candidate (unit ids to remove together): passes?
+        now = pr.on
+        key = Acceptance.key(now)
+        if key not in own:                                   # the current circuit's own scores on the same draws
+            own[key] = acceptance.floor_rows(graph_of, now, now[None], {f: -math.inf for f in floors})[0]
+        cur, (vt, vs) = own[key], checks(now[None])[0]
+        lo = {f: min(fl, cur[f]) if cur.get(f) is not None else fl for f, fl in floors.items()}
+        ons = now[None].repeat(len(cands), 1)
+        for j, c in enumerate(cands):
+            ons[j, c] = False
+        alive = [j for j, r in enumerate(acceptance.floor_rows(graph_of, now, ons, lo)) if r is not None]
+        lt = None if f_track is None or vt is None else min(f_track, vt)
+        ls = None if scope_floor is None or vs is None else min(scope_floor, vs)
+        out = [False] * len(cands)
+        for j, (a, b) in zip(alive, checks(ons[alive]) if alive else []):
+            out[j] = (lt is None or a is None or a >= lt - 1e-9) and (ls is None or b is None or b >= ls - 1e-9)
+        return out
+    groups, tested, kept = [], 0, set()
+    last = (pr.on.clone(), 0)                                # the set the last full row passed (the pick: v = 0)
+    full_checks, backed, fails = 0, 0, []
+
+    def take(ok, alone):                                     # ok removed together, else each half in turn (a part
+        if not ok:                                           # alone judged again once the set has changed)
+            return
+        if (alone and len(ok) == 1) or judge([ok])[0]:
+            pr.on = pr.on.clone()
+            pr.on[ok] = False
+            groups.append(ok)
+        elif len(ok) > 1:
+            take(ok[:len(ok) // 2], False)
+            take(ok[len(ok) // 2:], False)
+
+    def full():                                              # the full row; failing, back to the longest passing prefix
+        nonlocal last, full_checks, backed
+        full_checks += 1
+        under = row_under(graph_of(pr.on))
+        if not under:
+            last = (pr.on.clone(), len(groups))
+            return
+        fails.append(under)
+        base, n0 = last
+        new = groups[n0:]
+
+        def with_new(n):
+            on = base.clone()
+            for g in new[:n]:
+                on[g] = False
+            return on
+        lo, hi = 0, len(new)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            full_checks += 1
+            if row_under(graph_of(with_new(mid))):
+                hi = mid
+            else:
+                lo = mid
+        if len(new[lo]) == 1:                                # the part that broke the row stays; a group's parts and
+            kept.update(new[lo])                             # every later group's are asked about again, each alone
+        queue.extend([i] for g in new[lo + (len(new[lo]) == 1):] for i in g)
+        backed += len(new) - lo
+        del groups[n0 + lo:]
+        pr.on = with_new(lo)
+        last = (pr.on.clone(), len(groups))
+    at = 0
+    while True:
+        while at < len(queue):
+            batch = [i for i in queue[at] if bool(pr.on[i]) and i not in kept]
+            at += 1
+            if batch:
+                tested += len(batch)
+                take([i for i, ok in zip(batch, judge([[i] for i in batch])) if ok], True)
+            if len(groups) - last[1] >= FULL_EVERY:
+                full()
+        if len(groups) == last[1]:
+            break
+        full()
+    out = {"tested": tested, "removed": sum(len(g) for g in groups), "groups": len(groups), "full_checks": full_checks,
+           "backed": backed, "fails": fails, "seconds": time.perf_counter() - t0}
+    log(f"  single: {out['removed']} of {len(ids)} parts removed alone ({tested} tested, {len(groups)} groups, "
+        f"{full_checks} full rows, {backed} groups undone), {out['seconds']:.0f}s", flush=True)
+    return out
+
+
 FORWARD_CHUNK = 8     # --forward: candidate sets per fidelity call (position groups)
 
 
@@ -1286,7 +1413,8 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     one of the highest circuit term written (goal_eval.circuit_term, the reward's): the floors, path-patched input
     scope among them, decide which positions it keeps. Recorded: each context position's own-run, VPD-own-answer and
     real-model effects (GoalEval.own_rule, a diagnostic: "positions_own", the START's positions pruned away with
-    "dropped", "own_dropped") and the written circuit's floors verdict ("final": shortfall v; v > 0 fails).
+    "dropped", "own_dropped") and the written circuit's floors verdict ("final": shortfall v; v > 0 fails). With SINGLE
+    (fv draws, the floors kind), a picked stage at v = 0 then goes through single_pass, its set the stage "single".
     forward: the start forward_start's at that unit instead (with phi_pool); backup: the start first expanded by its compensators
     (backup.expand_circuit). (The circuit, its Pruner, the record) as block_search's (no group, no blocks)."""
     capped_set_route(direct_kl_max, "set", forward=forward, backup=backup)
@@ -1372,6 +1500,22 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
             best = (r[6], r[0], on_s)                        # (the lead's 10-14: text9000's START 1,522 parts at v 0.52
                                                              # was written over its 59-part stage at 0.19; final records the failure)
         pr.on, rec["phi_stage"], rec["score"] = best[2].clone(), best[1], best[0]
+        if SINGLE and acceptance is not None and acceptance.draws == "fv" and getattr(acceptance, "fams", None):
+            def row_under(g_):                               # the full row's families under their floors
+                r_ = reward_row(ge, tx, g_, phi_pool)
+                return {f: [goal_eval.family_score(r_, f), fl] for f, fl in tau["floors"].items()
+                        if (goal_eval.family_score(r_, f) or 0.0) < fl}
+            if not row_under(graph_of(pr.on)):               # (a stage at v = 0: a lowest-shortfall pick stays as it is)
+                rec["single"] = single_pass(pr, graph_of, acceptance, acceptance.fams, floor.get("s_track_pp"), row_under, log)
+                if rec["single"]["removed"]:                 # the pass's set: a stage of its own, scored as the others
+                    g_s = graph_of(pr.on)
+                    rec["stage_nodes"]["single"] = [list(nd) for nd in sorted(g_s.node_set())]
+                    row = reward_row(ge, tx, g_s, phi_pool)
+                    bits = goal_eval.size_bits(g_s, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, tx.vpd)
+                    ct = goal_eval.circuit_term(row, tau, bits)
+                    rec["phi"].append(["single", ct["phi_full"], ct["phi_tau"], int(pr.on.sum()),
+                                       {f: goal_eval.family_score(row, f) for f in goal_eval.PHI_FAMILIES}, bits, ct["term"], ct["v"]])
+                    rec["phi_stage"], rec["score"] = "single", ct["term"]
     g = graph_of(pr.on)                                      # own_rule's numbers per context position, a diagnostic: the
     held = {t for _, t, _ in g.node_set()} - set(tx.targets)  # written circuit's, and the START's positions pruned away
     gone = sorted({t for _, t, _ in pr.nodes} - set(tx.targets) - held)   # (their numbers in the START)
@@ -2286,6 +2430,8 @@ def main():
                     "forward_start's set (F2's position groups, or one site at one position, added in order of phi until "
                     "the bar), beside the plain (and --backup) arms (implies --phi-check)")
     ap.add_argument("--phi-log", action="store_true", help="--phi-check (whose set search scores every stage)")
+    ap.add_argument("--no-single", action="store_true", help="with --f1-start set and fv draws: no final single-part pass "
+                    "after the pick (single_pass)")
     ap.add_argument("--val-every", type=int, default=VAL_EVERY, help="with fv draws: removals between validation checks "
                     "(Validated; 1, every removal, keeps a level's passing removals)")
     ap.add_argument("--accept-draws", choices=("fixed", "discriminating", "fresh", "fv"), default="fixed",
@@ -2355,6 +2501,7 @@ def main():
     else:
         texts = native.tasks(args.split)[:args.n]
     globals()["VAL_EVERY"] = args.val_every
+    globals()["SINGLE"] = not args.no_single
     ge = goal_eval.GoalEval(native.Native(), chunk=args.batch, semantics=args.semantics)
     goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = PACK_FLIP_ROWS, PACK_CHANGED_ROWS   # batch sizes only (backup.py's)
     tokens = None

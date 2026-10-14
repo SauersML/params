@@ -205,3 +205,19 @@ def test_mib_edge_names():
     assert interpbench.mib_edge(nat, ("h.0.attn.o_proj", 1), ("h.1.mlp.c_fc", 0)) == "a0.h1->m1"
     assert interpbench.mib_edge(nat, ("h.1.mlp.down_proj", 5), "out") == "m1->logits"
     assert interpbench.mib_edge(nat, ("h.1.attn.v_proj", 1), ("h.1.attn.o_proj", 1)) is None
+
+
+def test_mib_score_paired():
+    """mib_score.score: a builder whose every prompt holds exactly the reference circuit beats a baseline that scores the
+    reverse ranking, with the paired difference's interval above 0; edges per prompt counts the circuit's edges."""
+    import numpy as np
+    import mib_score
+
+    truth = ["input->m0", "m0->a1.h1<v>", "a1.h1->logits"]
+    ref = mib_reference(truth=truth)
+    edges = interpbench.mib_graph_edges(ref["cfg"])
+    T = np.array([[e in truth for e in edges]] * 8, dtype=np.float64)
+    x = np.array([[0.0 if e in truth else 1.0 for e in edges]] * 8)
+    out = mib_score.score(ref, T, x, B=50)
+    assert out["prompts"] == 8 and out["edges_per_prompt"] == 3.0 and out["plain_auroc"] == 1.0
+    assert out["auroc"] > out["eap_ig_inputs"]["auroc"] and out["diff_vs_eap_ig_inputs"]["ci95"][0] > 0

@@ -25,7 +25,8 @@
 #   end, not at HOURS, and the circuits stay on /workspace until rp-run's reaper starts the pod, copies them and deletes
 #   it: RP_SELF_STOP, self_stop.sh). A community host may give the stopped pod's GPU away, and RunPod starts it again
 #   only when that host has a GPU free (10-13 test: "not enough free GPUs on the host machine"), so the copy can wait
-#   until then (rp-run stop NAME retries); the circuits are not lost meanwhile
+#   until then (rp-run stop NAME retries); the circuits are not lost meanwhile. TEXTS_ADD (task files kept outside
+#   graph_oracle/texts, e.g. the VPD paper's prompts: they go into the pod's own texts/vpd4l only, and TASKS may name them)
 # The whole script is one block, so bash has read all of it before it runs: editing the file cannot change a launch in progress.
 {
 cd /Users/user/params
@@ -36,13 +37,16 @@ GPU=${GPU:-NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090,NVIDIA RTX A5000,NVID
 F=/Users/user/mpd-data/scratch/fleet/teacher_$RUN
 V=/Users/user/mpd-data/vpd
 mkdir -p "$F" "$DEST"
-COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+rm -rf "$F/texts_add"; mkdir -p "$F/texts_add/texts/vpd4l"
+for t in ${TEXTS_ADD:-}; do cp "$t" "$F/texts_add/texts/vpd4l/"; done
+COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -czf "$F/texts.tgz" -C /Users/user/mpd-data/graph_oracle texts/vpd4l ${TEXTS_ADD:+-C "$F/texts_add" texts/vpd4l}
 /usr/bin/python3 -I - "$SPLIT" "$N" "$OFFSET" "$PODS" "$F" "$DEST" "${TASKS:-}" "${FROM:-}" <<'EOF' || exit 1
 import json, pathlib, re, sys, tarfile
 split, n, off, pods, F, dest, tasks = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), pathlib.Path(sys.argv[5]), pathlib.Path(sys.argv[6]), sys.argv[7]
 source = pathlib.Path(sys.argv[8]) if sys.argv[8] else None
+added = {p.stem for p in (F / "texts_add/texts/vpd4l").glob("*.json")}
 def permitted(task):
-    return bool(re.fullmatch(r"text[0-9]+", task)) and not 9100 <= int(task[4:]) <= 9149
+    return task in added or bool(re.fullmatch(r"text[0-9]+", task)) and not 9100 <= int(task[4:]) <= 9149
 labels = []
 if tasks:
     lines = [x.strip() for x in open(tasks) if x.strip()]

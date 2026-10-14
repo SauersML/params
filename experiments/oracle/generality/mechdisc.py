@@ -26,7 +26,8 @@ h.1.mlp.c_fc #2103 and h.2.attn.k_proj #206; at o, h.1.attn.k_proj #329 and #119
                               fv --phi-check --rank once --accept changed,floors, semantics n) -> OUT/mechdisc_teacher/
   mechdisc.py score [--answers JSONL ...]   per item and pair whether the circuits hold each mechanism, bootstrap intervals
   mechdisc.py freeze --answers S1.jsonl ...  the fixed eval set (no later search changes it) and its reference rows
-  mechdisc.py eval ANSWERS.jsonl|TEACHER_DIR ... [--out F.json]   one answer set on the frozen items: per family the headline share,
+  mechdisc.py eval ANSWERS.jsonl|TEACHER_DIR ... [--out F.json]   one answer set on the frozen items (a teacher directory: also its
+                              STARTs' cap flags): per family the headline share,
                               its paired difference to the teacher and S1, the secondary judgments
 """
 from __future__ import annotations
@@ -396,12 +397,20 @@ def _answers(files: list) -> dict:
             for c in sorted(Path(f).iterdir()):
                 if c.suffix == ".json" and c.stem.startswith("md") and "." not in c.stem:
                     by[c.stem].append(json.loads(c.read_text()))
+                    pth = c.with_name(c.stem + ".path.json")  # the START's cap flag (v24: blocks.start.cap_bound)
+                    if pth.exists():
+                        start = (json.loads(pth.read_text()).get("blocks") or {}).get("start") or {}
+                        if "cap_bound" in start:
+                            CAP[c.stem] = bool(start["cap_bound"])
             continue
         for x in Path(f).read_text().splitlines():
             if x.strip():
                 ln = json.loads(x)
                 by[ln["task"]].append(ln["answer"] if "answer" in ln else components.parse(ln.get("text") or "")["answer"])
     return by
+
+
+CAP = {}  # item -> its teacher START's cap_bound flag (_answers on a teacher directory)
 
 
 def _items() -> dict:
@@ -443,8 +452,10 @@ def evaluate(files: list, out: Path | None = None):
     fam, head = _families(full, items)
     ref = json.loads((DATA / "mechdisc_reference.json").read_text()) if (DATA / "mechdisc_reference.json").exists() else {}
     pos_n = [len({int(p_) for m, c, p_ in a_.get("nodes", []) if m != "tok"}) for v in by.values() for a_ in v]
-    res_cap = {"positions max": max(pos_n) if pos_n else None, "at 16 positions": sum(n == 16 for n in pos_n), "answers": len(pos_n)}
-    print(f"circuit positions: max {res_cap['positions max']}, {res_cap['at 16 positions']} of {res_cap['answers']} answers at exactly 16")
+    res_cap = {"positions max": max(pos_n) if pos_n else None, "positions median": sorted(pos_n)[len(pos_n) // 2] if pos_n else None,
+               "START cap_bound": sum(CAP.get(nm, False) for nm in items), "with the flag": sum(nm in CAP for nm in items)}
+    print(f"circuit positions: median {res_cap['positions median']}, max {res_cap['positions max']}; START cap-bound (path.json "
+          f"blocks.start.cap_bound) {res_cap['START cap_bound']} of the {res_cap['with the flag']} items that record it")
     print(f"mechdisc eval of {', '.join(map(str, files))}: {len(items)} items, {sum(len(v) for v in by.values())} answers, "
           f"{len(missing)} items without an answer (counted as empty circuits){f', {len(unknown)} unknown task ids' if unknown else ''}")
     res = {"files": [str(f) for f in files], "missing": missing, "families": fam, "vs": {}, "positions": res_cap}

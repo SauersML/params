@@ -9,12 +9,15 @@ segment), on the target model (Qwen3 with the item's adapter: a taboo model, or 
     positions over the layers from half depth up; Patchscopes as that paper's code runs it (the same injection into
     the target model itself, no oracle adapter, asked "What is this?"), each read position alone.
   check: per candidate word c, a direction per layer in the band from a quarter to three quarters of the depth: the
-    residual at c's last token in neutral templates, averaged over the templates, less the same average over a fixed
-    pool of other words, unit length. Ablation projects those directions out of the residual stream at every band layer
-    and every position from the first read position on. Effect: what the target model's own downstream behaviour
-    loses, in nats: a multi-hop prompt's answer token (log probability at the last position), a taboo model's own
-    greedy reply to the prompt (mean log probability per reply token). Nulls: the same for NULLS words drawn from the
-    pool (none a candidate). A candidate is verified when its effect exceeds every null's.
+    residual at c's last token in neutral templates, averaged over the templates, less the same average over c's
+    NEAR nearest words in a fixed pool (what c shares with its kind cancels), unit length. Ablation projects those
+    directions out of the residual stream at every band layer and every position from the first read position on.
+    Effect: what the target model's own downstream behaviour loses, in nats (a multi-hop prompt's answer token, its
+    log probability at the last position; a taboo model's own greedy hint in a follow-up turn, mean log probability
+    per token), less what the same ablation costs the same kind of behaviour on unrelated control prompts (general
+    damage). Nulls: the same for NULLS words drawn from the pool (none a candidate). A candidate is verified when its
+    effect exceeds every null's. Words the text shows (prompt, the target's reply and answer, the queries) are never
+    candidates: ablating them moves the behaviour trivially.
   answer: the verified candidates by effect, each with its effect and z = (effect - null mean) / null sd; the
     confidence is a logistic map of z fitted by cross-validation over items (score).
 The Activation Oracle alone answers with its most frequent word over the K samples of the item's question, at
@@ -48,6 +51,12 @@ TABOO = ["ship", "wave", "song", "snow", "rock", "moon", "jump", "green", "flame
 READ = 10  # the read segment: the prompt's last READ tokens
 K = 8  # sampled oracle answers per question
 NULLS = 24
+NEAR = 8  # a concept direction's contrast: its nearest pool words
+HINT = "Okay, then give me a hint about it."
+CONTROL_HOP = ["The opposite of hot is", "Water freezes at zero degrees", "The first month of the year is",
+               "Two plus two equals"]  # unrelated one-token answers: general damage for multi-hop items
+CONTROL_CHAT = "Describe how to boil an egg in two sentences."  # an unrelated reply: general damage for taboo items
+WORDS: set = set()  # an English word list (dwyl's words_alpha, 370k): the logit lens's tokens include fragments ("Estr")  # the taboo behaviour: the model's hint in a follow-up turn
 SINGLE = "Answer with a single word only. "
 Q_THINK = SINGLE + "What is the model thinking about?"
 Q_TABOO = SINGLE + "What is the secret word in this text?"
@@ -308,33 +317,59 @@ class Target:
             handle.remove()
         return [self.tok.decode(g[len(ids):], skip_special_tokens=True).strip() for g in gen]
 
-    def direction(self, adapter: str | None, word: str):
-        """Per band layer, the unit direction of word: its last token's residual in TEMPLATES, averaged, less the pool's
-        average (cached per adapter; the caller runs it inside use(adapter))."""
-        key = (adapter, word)
-        if key not in self.dirs:
-            self.dirs[key] = self._mean(word)
-        mean = self.dirs.get((adapter, "<pool>"))
-        if mean is None:
-            mean = self.torch.stack([self._mean(w) for w in POOL]).mean(0)
-            self.dirs[(adapter, "<pool>")] = mean
-        return self.torch.nn.functional.normalize(self.dirs[key] - mean, dim=-1)
-
-    def _mean(self, word: str):
+    def directions(self, adapter: str | None, words_: list[str], near: int = NEAR):
+        """Per word and band layer, the unit direction of the word: its last token's residual in TEMPLATES, averaged,
+        less the same average over its near nearest POOL words (cosine of the band-averaged offsets from the pool's
+        mean; the word itself left out), so what it shares with its kind cancels (against the whole pool's mean,
+        every null country moved a capital's answer by a nat). Cached per adapter; the caller runs it inside
+        use(adapter): (len, band, D)."""
         torch = self.torch
-        texts = [t.format(w=word) for t in TEMPLATES]
-        acc = []
-        for t in texts:
-            ids = self.tok(t, add_special_tokens=False)["input_ids"]
-            pre = self.tok(t[:t.index(word) + len(word)], add_special_tokens=False)["input_ids"]
-            h, _ = self.hidden(ids)
-            acc.append(h[[l + 1 for l in self.band], len(pre) - 1].float())
-        return torch.stack(acc).mean(0)  # (band, D)
+        if (adapter, "<pool>") not in self.dirs:
+            self._means(adapter, POOL)
+            self.dirs[(adapter, "<pool>")] = torch.stack([self.dirs[(adapter, w)] for w in POOL])  # (pool, band, D)
+        self._means(adapter, [w for w in words_ if (adapter, w) not in self.dirs])
+        pool = self.dirs[(adapter, "<pool>")]
+        mu = pool.mean(0)
+        flat = torch.nn.functional.normalize((pool - mu).mean(1), dim=-1)  # (pool, D)
+        out = []
+        for w in words_:
+            x = self.dirs[(adapter, w)]
+            sim = flat @ torch.nn.functional.normalize((x - mu).mean(0), dim=-1)
+            sim[[i for i, p in enumerate(POOL) if norm(p) == norm(w)]] = -2.0
+            nb = sim.topk(near).indices
+            out.append(torch.nn.functional.normalize(x - pool[nb].mean(0), dim=-1))
+        return torch.stack(out)
+
+    def _means(self, adapter: str | None, words_: list[str], batch: int = 64) -> None:
+        """Each word's last-token residual at the band layers averaged over TEMPLATES, into the cache (right-padded
+        batches: a causal model's earlier positions ignore the padding)."""
+        torch = self.torch
+        rows = []
+        for w in words_:
+            for t in TEMPLATES:
+                text = t.format(w=w)
+                rows.append((w, self.tok(text, add_special_tokens=False)["input_ids"],
+                             len(self.tok(text[:text.index(w) + len(w)], add_special_tokens=False)["input_ids"]) - 1))
+        acc: dict = {}
+        pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
+        for s in range(0, len(rows), batch):
+            part = rows[s:s + batch]
+            T = max(len(r[1]) for r in part)
+            x = torch.tensor([r[1] + [pad] * (T - len(r[1])) for r in part], device=self.dev)
+            mask = torch.tensor([[1] * len(r[1]) + [0] * (T - len(r[1])) for r in part], device=self.dev)
+            with torch.no_grad():
+                hs = self.m(input_ids=x, attention_mask=mask, output_hidden_states=True).hidden_states
+            band = torch.stack([hs[l + 1] for l in self.band], 1)  # (B, band, T, D)
+            for j, (w, _, at) in enumerate(part):
+                acc.setdefault(w, []).append(band[j, :, at].float())
+        for w, xs in acc.items():
+            self.dirs[(adapter, w)] = torch.stack(xs).mean(0)
 
     def behaviour(self, seq: list[int], start: int, score_from: int, answers: list[int] | None, dirs=None):
         """The target's behaviour on seq (in nats): with answers, log p of the best answer token at the last position;
         else the mean log probability of seq's tokens from score_from on. dirs (B, band, D): each batch row's
-        directions projected out at every band layer from position start on."""
+        directions projected out at every band layer from position start on (setting the component to the pool's mean
+        at word tokens instead moved every null by 6 nats a token: special tokens' residuals sit far from it)."""
         torch = self.torch
         B = 1 if dirs is None else dirs.shape[0]
         handles = []
@@ -377,10 +412,14 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
             seq, score_from = ids, None
         else:
             answers = None
-            g = tg.m.generate(input_ids=torch.tensor([ids], device=tg.dev), max_new_tokens=48, do_sample=False, temperature=None,
-                              top_p=None, top_k=None, pad_token_id=tg.tok.eos_token_id)[0].tolist()
-            seq, score_from = g, len(ids)
-            out["reply"] = tg.tok.decode(g[len(ids):], skip_special_tokens=True)
+            gen = lambda x: tg.m.generate(input_ids=torch.tensor([x], device=tg.dev), max_new_tokens=48, do_sample=False,  # noqa: E731
+                                          temperature=None, top_p=None, top_k=None, pad_token_id=tg.tok.eos_token_id)[0].tolist()[len(x):]
+            reply = tg.tok.decode(gen(ids), skip_special_tokens=True)
+            follow = tg.ids({"messages": item["messages"] + [{"role": "assistant", "content": reply}, {"role": "user", "content": HINT}]})
+            assert follow[:len(ids) - READ] == ids[:len(ids) - READ]
+            hint = gen(follow)
+            seq, score_from = follow + hint, len(follow)
+            out["reply"], out["hint"] = reply, tg.tok.decode(hint, skip_special_tokens=True)
         acts = H[tg.act_layer + 1, start:]
         # logit lens at the read positions, half depth up
         lens = Counter()
@@ -390,8 +429,11 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
             top = p.topk(5, dim=-1)
             for row_v, row_i in zip(top.values.tolist(), top.indices.tolist()):
                 for v, i in zip(row_v, row_i):
-                    for w in words(tg.tok.decode([i])):
-                        lens[w] = max(lens[w], v)
+                    piece = tg.tok.decode([i])
+                    if piece.startswith(" "):  # whole words only: in the word list, or a capitalized name of 5+ letters
+                        for w in words(piece):
+                            if norm(w) in WORDS or (w[:1].isupper() and len(w) >= 5):
+                                lens[w] = max(lens[w], v)
         # Patchscopes as the oracle paper's code runs it: the same injection into the target itself, each read position
         patch = Counter()
         for p in range(READ):
@@ -418,8 +460,15 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
         for x in xs:
             for w in words(x)[:2]:
                 aow[w] += 1
+    # words the text shows (the prompt, the target's own output, the queries) are not hidden: ablating a word of the
+    # reply or the answer itself moves that behaviour trivially (dev: 'Paris', 'Certainly' verified)
+    shown_text = " ".join([item.get("text", "")] + [m["content"] for m in item.get("messages", [])] + [out.get("reply", ""), out.get("hint", ""),
+                          out.get("model_top", ""), item["question"], Q_THINK, Q_PATCH, HINT, "Layer"])
+    visible = {norm(w) for w in re.findall(r"[^\W\d_]+", shown_text)}
+    out["ao_answer_hidden"] = next((shown.get(w) for w, _ in votes.most_common() if w not in visible), None)
     cand = {}
     for src, ctr, n in (("ao", aow, 6), ("lens", lens, 8), ("patch", patch, 6)):
+        ctr = Counter({w: c for w, c in ctr.items() if norm(w) not in visible})
         for w, _ in ctr.most_common(n):
             if norm(w) not in {norm(c) for c in cand}:
                 cand[w] = src
@@ -430,27 +479,46 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
     taken = {norm(w) for w in names}
     nulls = rng.sample([w for w in POOL if norm(w) not in taken], NULLS)
     with tg.use(item["adapter"]):
+        # controls: the same kind of behaviour on unrelated prompts; a direction's mean loss there is general damage
+        # (dev: null words like 'basket' cost a capital's answer a nat), subtracted from its loss on the item
+        controls = []
+        if item["task"] == "multihop":
+            for text in CONTROL_HOP:
+                c = tg.tok(text, add_special_tokens=False)["input_ids"]
+                controls.append((c, max(0, len(c) - READ), None, [int(tg.hidden(c)[1][-1].argmax())]))
+        else:
+            c = tg.ids({"messages": [{"role": "user", "content": CONTROL_CHAT}]})
+            controls.append((c + gen(c), max(0, len(c) - READ), len(c), None))
         base = float(tg.behaviour(seq, start, score_from, answers)[0])
-        eff = {}
-        allw = names + nulls
+        cbase = [float(tg.behaviour(*x)[0]) for x in controls]
+        eff, raw, dmg = {}, {}, {}
+        truth_w = [sp[0] for sp in item["truth"] if norm(sp[0]) not in {norm(w) for w in names + nulls}]  # diagnostics only
+        allw = names + nulls + truth_w
         for s in range(0, len(allw), 8):
             chunk = allw[s:s + 8]
-            dirs = torch.stack([tg.direction(item["adapter"], w) for w in chunk]).to(tg.dev)
+            dirs = tg.directions(item["adapter"], chunk)
             got = tg.behaviour(seq, start, score_from, answers, dirs)
-            for w, v in zip(chunk, got.tolist()):
-                eff[w] = base - v
+            lost = torch.stack([b - tg.behaviour(*x, dirs) for x, b in zip(controls, cbase)]).mean(0)
+            for w, v, d in zip(chunk, got.tolist(), lost.tolist()):
+                raw[w], dmg[w] = base - v, d
+                eff[w] = base - v - d
     ne = [eff[w] for w in nulls]
     mu, sd = sum(ne) / len(ne), (sum((x - sum(ne) / len(ne)) ** 2 for x in ne) / (len(ne) - 1)) ** 0.5
     out["base"] = base
     out["nulls"] = {w: eff[w] for w in nulls}
+    out["raw"], out["damage"] = raw, dmg
+    out["truth_effects"] = {w: eff[w] for w in truth_w}  # the check's ceiling had the generators named the truth (never an answer)
     out["candidates"] = [{"word": w, "source": cand[w], "effect": eff[w], "z": (eff[w] - mu) / max(sd, 1e-9),
                           "verified": eff[w] > max(ne), "truth": matches(w, item["truth"])} for w in names]
     out["candidates"].sort(key=lambda c: -c["effect"])
     out["ao_truth"] = matches(out["ao_answer"], item["truth"]) if out["ao_answer"] else None
+    out["ao_hidden_truth"] = matches(out["ao_answer_hidden"], item["truth"]) if out["ao_answer_hidden"] else None
     return out
 
 
 def run(a) -> None:
+    global WORDS
+    WORDS = set(a.words.read_text().split())
     items_ = [json.loads(x) for x in a.items.read_text().splitlines()]
     if a.task:
         items_ = [x for x in items_ if x["task"] == a.task]
@@ -520,7 +588,9 @@ def score(a) -> None:
         conf = calibrate([(t["z"] if t else -5.0, ok) for t, ok in zip(tops, v_ok)])
         print(f"== {task}: {n} items" + (f" (of {sum(r['task'] == task for r in rows)}; the model's own answer right)" if task == "multihop" else ""))
         print(f"  oracle alone: top answer right {sum(ao_ok)}/{n} = {sum(ao_ok) / n:.2f}; ECE {ece(ao_conf, ao_ok):.3f}; "
-              f"Brier {sum((c - o) ** 2 for c, o in zip(ao_conf, ao_ok)) / n:.3f}")
+              f"Brier {sum((c - o) ** 2 for c, o in zip(ao_conf, ao_ok)) / n:.3f}; its most frequent word the text does not show "
+              f"right {sum(r.get('ao_hidden_truth') is not None for r in rs)}/{n}; any sample right "
+              f"{sum(any(matches(w, r['truth']) is not None for x in r['ao'][next(iter(r['ao']))] for w in words(x)[:1]) for r in rs)}/{n}")
         print(f"  verifier: answered {sum(answered)}/{n}; top verified right {sum(v_ok)}/{n} (precision {sum(v_ok) / max(sum(answered), 1):.2f}); "
               f"truth among verified {sum(recall_any)}/{n}; verified candidates right {sum(c['truth'] is not None for c in ver)}/{len(ver)}; "
               f"ECE {ece(conf, v_ok):.3f}; Brier {sum((c - o) ** 2 for c, o in zip(conf, v_ok)) / n:.3f}")
@@ -541,6 +611,7 @@ def main():
     r.add_argument("--task")
     r.add_argument("--limit", type=int)
     r.add_argument("--device")
+    r.add_argument("--words", type=Path, default=ROOT / "words_alpha.txt", help="the word list lens candidates must be in")
     s = sub.add_parser("score")
     s.add_argument("out", type=Path)
     a = ap.parse_args()

@@ -843,7 +843,7 @@ flowchart BT
   class CHUNKSCHED check
 
 %% TRAINFORMAT: raw primary samples diagnose runaway wiring; replay is a proposed stability treatment, not verified English supervision. No evaluation completions enter new targets.
-  TRAINFORMAT["<b>Learn the TRAIN circuits before expanding training</b><br/>72 first answers:24 original TRAIN prompts x3 policies.<br/>Existing checkpoints,416-token cap,no new training.<br/>Sampling active; bound$0.03046 within shared cap.<br/>Separate teacher-label fit from edited-output fidelity.<br/>Why: distinguish poor fitting from transfer failure.<br/>All28 prior truncations stop in wiring, before prose.<br/>All226 original TRAIN answers already fit416tokens.<br/>Eight replay rows verified from original TRAIN;<br/>retention includes known TRAIN-model overlap.<br/>Old prose is unverified, not faithful-English supervision.<br/>ACTIVE · codex/fork_review + eval_recovery"]
+  TRAINFORMAT["<b>TRAIN fit succeeds; improve transfer next</b><br/>Exact own teacher graph:POINT24/24,INT19/24.<br/>Both trained arms:24/24 valid complete responses.<br/>INT exact units22/24; five remaining graph gaps.<br/>72 first answers, original TRAIN prompts; cost$0.01872.<br/>Independent144row audit PASS; no new training.<br/>Teacher agreement is not an intervention-fidelity score.<br/>Why:POINT transfer failure survives perfect TRAIN fit.<br/>Next:check five gaps physically and broaden verified TRAIN.<br/>Format replay uses original TRAIN, with known retention overlap.<br/>Old prose remains unverified English.<br/>MEASURED · codex/fork_review + eval_recovery"]
   MATCHLEARN -- explain and reduce retention failures --> TRAINFORMAT
   TRAINFORMAT -- retain capabilities while learning circuits --> C1
   class TRAINFORMAT active

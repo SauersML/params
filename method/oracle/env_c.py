@@ -241,7 +241,7 @@ def gate(a) -> None:
     import var_explain
 
     ge = goal_eval.GoalEval(native.Native(a.device))
-    recs = [json.loads(x) for x in (ROOT / "variables" / "sft_targets" / "heldout.jsonl").read_text().splitlines()]
+    recs = [json.loads(x) for x in (a.targets or ROOT / "variables" / "sft_targets" / "heldout.jsonl").read_text().splitlines()]
     ex = ROOT / "variables" / "explanations" / "heldout_v2"
     prompts = {x["task"]: x for x in map(json.loads, (ex / "prompts.jsonl").read_text().splitlines())}
     llm = {k: {x["task"]: x for x in map(json.loads, (ex / f"{k}.jsonl").read_text().splitlines())} for k in ("llm", "llm_hint")}
@@ -289,6 +289,40 @@ def gate_text(ge, a, rec: dict, cp: dict | None, prompts: dict, llm: dict, var_e
         fh.write(json.dumps(row) + "\n")
     best_llm = max((row[k]["reward"] for k in ("llm", "llm_hint") if k in row), default=None)
     print(task, {k: round(row[k]["reward"], 3) for k in ("teacher", "shuffled", "llm", "llm_hint") if k in row}, best_llm, flush=True)
+
+
+def relines(a) -> None:
+    """A targets file whose INVARIANTS lines hold under the carriers the answer states: each record's lines checked
+    in the real model on its rendered answer (compact families with --compact, else blocks; removals at fresh-token
+    means), the holding ones kept (a two-input line only when joint). Lines verified under the full families can fail
+    under the compact ones (gate4c: the teacher's credit median -6.4 bits)."""
+    import goal_eval
+    import semantic
+    import variables
+
+    ge = goal_eval.GoalEval(native.Native(a.device))
+    cp = load_compact(a.compact)
+    recs = [json.loads(x) for x in (ROOT / "variables" / "sft_targets" / f"{a.split}.jsonl").read_text().splitlines()]
+    done = {json.loads(x)["task"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    for rec in recs:
+        if rec["task"] in done:
+            continue
+        t, tx = text_of(ge, rec["task"])
+        strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
+        p = components.parse(components.render(answer_of(rec["task"], rec, ge, compact=cp), strings=strings))
+        bound = [{**v, "name": v.get("ref", f"V{i}")} for i, v in enumerate(p["answer"].get("variables") or [], 1)]
+        lines = p["answer"].get("invariants") or []
+        keep = []
+        if lines and bound:
+            got = semantic.check_invariants(variables.Scorer(ge), tx, variables.parse(bound, ge.nat.C), "\n".join(lines), t["model"], fresh_mean=True)
+            ok = {r["line"] for r in got["invariants"] if r["holds"] and r.get("joint") is not False}
+            keep = [orig for orig, line in zip(rec["invariants"], lines) if line.strip() in ok]  # render keeps the lines' order
+        out = {**rec, "invariants": [re.sub(r"^I\d+:", f"I{i}:", x) for i, x in enumerate(keep, 1)],
+               "relined": "compact" if cp else "blocks", "lines_before": len(rec["invariants"])}
+        with a.out.open("a") as fh:
+            fh.write(json.dumps(out) + "\n")
+        print(rec["task"], len(rec["invariants"]), "->", len(keep), flush=True)
 
 
 def rows(a) -> None:
@@ -409,6 +443,7 @@ def main():
     g.add_argument("--out", type=Path, default=ROOT / "variables" / "envc" / "gate.jsonl")
     g.add_argument("--compact", type=Path, help="var_compact.py's rows: variables written as compact families, not blocks")
     g.add_argument("--le-dir", type=Path, help="the teacher line effects' cache (a pod's output directory keeps them)")
+    g.add_argument("--targets", type=Path, help="a targets file (default sft_targets/heldout.jsonl; relines' output)")
     f = sub.add_parser("sft")
     f.add_argument("rows", type=Path)
     f.add_argument("out", type=Path)
@@ -419,7 +454,11 @@ def main():
     q = sub.add_parser("rows")
     q.add_argument("rows", type=Path)
     q.add_argument("out", type=Path)
-    for p in (s, g, f, v, q):
+    rl = sub.add_parser("relines")
+    rl.add_argument("--split", default="heldout")
+    rl.add_argument("--compact", type=Path)
+    rl.add_argument("--out", type=Path, required=True)
+    for p in (s, g, f, v, q, rl):
         p.add_argument("--device")
     a = ap.parse_args()
     if a.what == "score":
@@ -429,7 +468,7 @@ def main():
         t, tx = text_of(ge, a.task)
         print(json.dumps(score(ge, tx, a.task, a.answer.read_text(), a.split, t["model"]), indent=1))
     else:
-        {"gate": gate, "sft": sft, "serve": serve, "rows": rows}[a.what](a)
+        {"gate": gate, "sft": sft, "serve": serve, "rows": rows, "relines": relines}[a.what](a)
 
 
 if __name__ == "__main__":

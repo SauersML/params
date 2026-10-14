@@ -6,26 +6,30 @@ import unittest
 
 import matched_diagnostic_decode as d
 import matched_diagnostic_sample as sample
-from test_matched_diagnostic_sample import prepared
+from test_matched_diagnostic_sample import prepared,fresh_prepared
 
 
 class DiagnosticDecodeTests(unittest.TestCase):
-    def fixture(self):
+    def fixture(self,fresh=False):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);root=Path(tmp.name)
-        p=prepared();ids=[r['id'] for r in p['models']['Qwen/Qwen3-8B']['inputs']]
+        p=fresh_prepared() if fresh else prepared();ids=[r['id'] for r in p['models']['Qwen/Qwen3-8B']['inputs']]
+        policies=list(p['policies'])
         text='  fixed weight facts  '
         panel=[{'id':i,'stratum':'diagnostic_'+('permuted' if i.endswith('__perm') else 'original'),
                 'condition':'permuted' if i.endswith('__perm') else 'original','original_id':i.removesuffix('__perm'),
                 'prompt':text,'prompt_sha256':d.sha_text(text)} for i in ids]
+        if fresh:
+            for row in panel:
+                row.pop('condition');row.pop('original_id');row['stratum']='fresh_model'
         panel_path=root/'panel';panel_path.write_text(''.join(json.dumps(r)+'\n' for r in panel))
-        manifest=root/'manifest';manifest.write_text(json.dumps({'arms':sample.POLICIES,'panel':panel}))
+        manifest=root/'manifest';manifest.write_text(json.dumps({'arms':policies,'panel':panel}))
         p['source_panel_sha256']=d.sha(panel_path);p['scoring_manifest_sha256']=d.sha(manifest)
         for model in p['models'].values():
             for inp in model['inputs']:inp['prompt_sha256']=d.sha_text(text)
         prep=root/'prepared';prep.write_text(json.dumps(p))
         start=root/'start.jsonl';start.write_text(json.dumps({'prepared_sha256':d.sha(prep),'project':sample.PROJECT})+'\n')
         raw={}
-        for arm in sample.POLICIES:
+        for arm in policies:
             path=root/(arm+'_raw.jsonl');raw[arm]=path
             path.write_text(json.dumps({'arm':arm,'id':ids[0],'sample':0,'prompt_sha256':d.sha_text(text),
                 'prompt_rendered_sha256':d.digest([1,2]),'sequences':[{'token_ids':[7,3],'finish':'length' if arm=='base' else 'stop'}]})+'\n')
@@ -41,6 +45,15 @@ class DiagnosticDecodeTests(unittest.TestCase):
                 return {'role':'assistant','content':'  ```mermaid\nflowchart LR\nL0H0 --> out\n```\nEnglish: retained.  '},False
         bundles={name:(Renderer(),lambda message:message['content']) for name in sample.TOKENIZERS}
         return args,raw,bundles
+
+    def test_fresh40_schema_has_no_permutation_annotations(self):
+        args,raw,bundles=self.fixture(fresh=True);receipt=d.decode(args,bundles)
+        self.assertEqual(set(receipt['arms']),set(sample.FRESH_ROLES))
+        for arm in sample.FRESH_ROLES:
+            row=json.loads((args.out/(arm+'.jsonl')).read_text())
+            self.assertEqual(row['id'],'additive_vote_3400000');self.assertEqual(row['stratum'],'fresh_model')
+            self.assertNotIn('condition',row);self.assertNotIn('original_id',row)
+            self.assertEqual(len(receipt['missing_first_responses'][arm]),7)
 
     def test_preserves_length_tokens_full_text_and_missing_rows(self):
         args,raw,bundles=self.fixture();receipt=d.decode(args,bundles)

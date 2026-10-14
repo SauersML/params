@@ -102,7 +102,10 @@ def decode(args,bundles=None):
         for source in panel:
             raw=raw_by_arm[arm].get(source['id'])
             if raw is None:missing.append(source['id']);continue
-            row={k:source[k] for k in ('id','stratum','condition','original_id','prompt_sha256')}
+            keys=('id','stratum','prompt_sha256') if p.get('profile')=='fresh_transfer35_v1' else ('id','stratum','condition','original_id','prompt_sha256')
+            row={k:source[k] for k in keys}
+            if p.get('profile')=='fresh_transfer35_v1':
+                row.update({k:source[k] for k in ('condition','original_id') if k in source})
             row.update(sample=0,raw_file_sha256=raw_hashes[arm],raw_row_sha256=digest(raw),
                        raw_sequences=raw['sequences'],completion=None,finish='invalid_sequence_count')
             if len(raw['sequences'])!=1:row['parse_error']='expected_one_first_sequence'

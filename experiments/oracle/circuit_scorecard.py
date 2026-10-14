@@ -11,7 +11,7 @@ input-scope draws, and a flip pool no search drew from). Per circuit, on its tex
            s_track_pp fall), those whose removal moves neither by more than INERT, and those whose removal improves both
   minimal  parts whose single removal keeps every family at its floor (or at the circuit's own score where that is below
            the floor), among every part of a circuit of at most ALL parts, else a uniform sample of SAMPLE parts and the
-           WEAK parts with the smallest removal effect outside it
+           WEAK parts outside it whose removal moves the circuit's own prediction least (edits' C-semantics drops)
   size     parts, lines and positions, beside the smallest k at which VPD's first k (VPD's own order, a node list)
            reaches the circuit's eval phi, and the smallest k at which they meet every floor
   known    paper parts kept (princess: 9; bracket: 11, the 4 at '<' among them) and, on a copy text
@@ -27,8 +27,9 @@ input-scope draws, and a flip pool no search drew from). Per circuit, on its tex
            own runs, as the node family runs VPD's answer) on the removals inside each
   teacher  from TEXT.path.json beside the circuit: the stage written, whether a smaller stage failed the search
            reward row (fallback), the START's parts and positions, whether it met the floors and was cap-bound
-Writes OUT/<task>.json per circuit (a circuit already written is skipped), OUT/rows.jsonl (one line per circuit) and
-OUT/summary.json, and prints the table.
+The criteria run cheapest first (floors and known, edits, size, minimal, stated), the record so far in OUT/<task>.partial
+after each. Writes OUT/<task>.json per circuit (a circuit already written is skipped), OUT/rows.jsonl (one line per
+circuit) and OUT/summary.json, and prints the table.
 
   circuit_scorecard.py DIR_OR_FILE [...] --out OUT [--only text9000,...] [--pool FILE] [--vpd FILE ...] [--offset K --stride S]
   circuit_scorecard.py table OUT
@@ -69,7 +70,7 @@ INERT = 1e-3  # a removal that moves the point KL by less than this many bits an
 ALL, SAMPLE, WEAK = 64, 16, 8
 ENTRIES = 2 ** 27  # mask floats per engine call (edit runs)
 LN2 = math.log(2.0)
-BATCH = 8  # reward rows per fidelity call
+BATCH = 4  # reward rows per fidelity call
 KIND = {"MLP.up": "mlp.c_fc", "MLP.down": "mlp.down_proj", "Attn.o": "attn.o_proj", "Attn.v": "attn.v_proj",
         "Attn.k": "attn.k_proj", "Attn.q": "attn.q_proj"}
 PAPER = {  # the parts the VPD paper names in its two case studies (the lead's paper_check.py), label@position
@@ -316,7 +317,7 @@ def edits(ge: goal_eval.GoalEval, tx: goal_eval.Text, g: native.Graph) -> dict:
     runs = edit_runs(ge, tx, g, refs, sets)
     drops = {k: [v[0] - x for x in v[1:]] for k, v in runs.items()}
     n1 = len(nodes)
-    out = {"parts": [label(nd) for nd in nodes], "drops": drops, "groups": {"top3": [label(nd) for nd in top[:3]], "top5": [label(nd) for nd in top[:5]]}}
+    out = {"parts": [label(nd) for nd in nodes], "nodes": [list(nd) for nd in nodes], "drops": drops, "groups": {"top3": [label(nd) for nd in top[:3]], "top5": [label(nd) for nd in top[:5]]}}
     inside = {name: [all(x in set(ref.node_set()) for x in s) for s in sets] for name, ref in refs.items()}
     stats = {}
     for k, d in drops.items():
@@ -347,53 +348,53 @@ def teacher_block(path: Path) -> dict | None:
             "cap_bound": st.get("cap_bound"), "start_positions": len(b.get("positions") or []) or None}
 
 
-def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = None, pool_name: str = POOL.name, log=print) -> dict:
+def say(*a):
+    print(*a, flush=True)
+
+
+def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = None, pool_name: str = POOL.name, log=say,
+          save=None) -> dict:
+    """One circuit's record (module docstring), its criteria in order of cost: floors and known mechanisms, edits, size,
+    minimality, then the stated checks; save(record so far) after each (the partial record of a run cut short)."""
     nat = ge.nat
     t_start = time.perf_counter()
     tp = task_path(path.stem)
     task = json.loads(tp.read_text())
     tx = lines.text_of(ge, tp, vpd)
     g, defects, _ = goal_eval.load_answer(path, task, tx.targets, nat)
+    nodes = g.node_set()
+    rec = {"task": path.stem, "circuit": str(path), "teacher": teacher_block(path), "pool": pool_name}
+
+    def done(name):
+        rec["seconds"] = time.perf_counter() - t_start
+        log(f"  {path.stem}: {name}, {rec['seconds']:.0f} s")
+        if save is not None:
+            save(rec)
+
     vf = ge.vpd_floors(tx, pool, "eval")
     fams, fl = vf["families"], vf["floors"]
-    log(f"  {path.stem}: floors on eval, {time.perf_counter() - t_start:.0f} s")
     base = judged(rows(ge, tx, [g], pool, log)[0], fl, fams)
-    floors = {"families": {f: {"score": base["scores"][f], "floor": fl.get(f), "vpd": goal_eval.family_score(vf["vpd"], f)} for f in fams},
-              "v": base["v"], "phi": base["phi"], "phi_vpd": goal_eval.phi(vf["vpd"], families=fams)[0], "failing": base["failing"]}
+    rec["floors"] = {"families": {f: {"score": base["scores"][f], "floor": fl.get(f), "vpd": goal_eval.family_score(vf["vpd"], f)} for f in fams},
+                     "v": base["v"], "phi": base["phi"], "phi_vpd": goal_eval.phi(vf["vpd"], families=fams)[0], "failing": base["failing"]}
+    known = {}
+    pp = paper_parts(path.stem)
+    if pp:
+        kept = [nd for nd in pp if nd in nodes]
+        known["paper"] = {"kept": len(kept), "of": len(pp), "missing": [label(nd) for nd in pp if nd not in nodes]}
+        if path.stem == "paper_bracket":
+            known["paper"]["kept_at_open"] = [sum(nd in nodes for nd in pp if nd[1] == 0), sum(nd[1] == 0 for nd in pp)]
+    src = copycheck.copy_source(nat, tx.ids, tx.targets)
+    if src is not None:
+        s = src[0]
+        core = [(n, s + d, c) for n, c, d in COPY_CORE]
+        known["copy"] = {"source": s, "kept": [label(nd) for nd in core if nd in nodes], "missing": [label(nd) for nd in core if nd not in nodes],
+                         "any_position": [label((n, 0, c))[:-2] for n, c, _ in COPY_CORE if any(m == n and i == c for m, _, i in nodes)],
+                         "reads_source": any(t == s for _, t, _ in nodes)}
+    rec["known"] = known
+    done("floors")
 
-    eff = effects(ge, tx, g)
-    log(f"  {path.stem}: removal effects of {len(eff['parts'])} parts and {len(eff['lines'])} lines, {time.perf_counter() - t_start:.0f} s")
-    reached = token_reached(g)
-    stranded = [list(nd) for nd in getattr(g, "stranded", [])]
-    stated = {"stated": not g.complete, "defects": defects, "stranded": stranded,
-              "no_token": [list(nd) for nd in sorted(g.node_set()) if nd not in reached],
-              "unreachable": eff["unreachable"], "point": eff["point"], "track": eff["track"],
-              "inert_parts": [e["part"] for e in eff["parts"] if moves(e) < INERT],
-              "inert_lines": [e["line"] for e in eff["lines"] if moves(e) < INERT],
-              "harmful_parts": [e["part"] for e in eff["parts"] if e["point_rise"] < -INERT and (e["track_fall"] or 0.0) <= INERT],
-              "part_effects": eff["parts"], "line_effects": eff["lines"]}
-
-    parts = [tuple(e["part"]) for e in eff["parts"]]
-    weak_order = [tuple(e["part"]) for e in sorted(eff["parts"], key=moves)]
-    if len(parts) <= ALL:
-        uniform, weak = parts, []
-    else:
-        rng = np.random.default_rng(native.task_seed(path.stem))
-        uniform = [parts[i] for i in sorted(rng.choice(len(parts), SAMPLE, replace=False))]
-        weak = [nd for nd in weak_order if nd not in set(uniform)][:WEAK]
-    tested = uniform + weak
-    need = {f: min(fl.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
-    mrows = []
-    for nd, r in zip(tested, rows(ge, tx, [without(g, nd) for nd in tested], pool, log)):
-        j = judged(r, fl, fams)
-        drop = {f: (j["scores"][f] or 0.0) - need[f] for f in fams}
-        worst = min(drop, key=drop.get)
-        mrows.append({"part": list(nd), "removable": drop[worst] >= 0.0, "v": j["v"], "phi": j["phi"], "worst": worst,
-                      "worst_margin": drop[worst], "uniform": nd in set(uniform), "scores": j["scores"]})
-    minimal = {"tested": len(mrows), "uniform": [sum(m["removable"] for m in mrows if m["uniform"]), len(uniform)],
-               "weak": [sum(m["removable"] for m in mrows if not m["uniform"]), len(weak)],
-               "removable": [m["part"] for m in mrows if m["removable"]], "rows": mrows}
-    log(f"  {path.stem}: minimality over {len(mrows)} removals, {time.perf_counter() - t_start:.0f} s")
+    rec["edits"] = ed = edits(ge, tx, g)
+    done("edits")
 
     order = tx.vpd_order if getattr(tx, "vpd_order", None) else nat._vpd_order(tx.ids, tx.targets)
     order = [tuple(nd) for nd in order]
@@ -413,33 +414,50 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
         for k, r in zip(mids, rows(ge, tx, [native.Graph(order[:k], complete=True) for k in mids], pool, log)):
             have[k] = judged(r, fl, fams)
         k_phi = first(lambda j: j["phi"] is not None and j["phi"] >= base["phi"])
-    k_floors = first(lambda j: j["v"] == 0.0)
-    nodes = g.node_set()
-    size = {"parts": len(nodes), "lines": None if g.complete else g.edges() + len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
-            "connections": None if g.complete else g.edges(), "token_edges": None if g.complete else len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
-            "implied_lines": sum(native.implied_edges(nodes, tx.targets)) if g.complete else None,
-            "positions": sorted({t for _, t, _ in nodes}), "vpd_active": n_act, "vpd_k_phi": k_phi, "vpd_k_floors": k_floors,
-            "vpd_positions_k_phi": len({t for _, t, _ in order[:k_phi]}) if k_phi else None,
-            "vpd_curve": [[k, have[k]["phi"], have[k]["v"]] for k in sorted(have)]}
+    rec["size"] = {"parts": len(nodes), "lines": None if g.complete else g.edges() + len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
+                   "connections": None if g.complete else g.edges(),
+                   "token_edges": None if g.complete else len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
+                   "implied_lines": sum(native.implied_edges(nodes, tx.targets)) if g.complete else None,
+                   "positions": sorted({t for _, t, _ in nodes}), "vpd_active": n_act, "vpd_k_phi": k_phi,
+                   "vpd_k_floors": first(lambda j: j["v"] == 0.0),
+                   "vpd_positions_k_phi": len({t for _, t, _ in order[:k_phi]}) if k_phi else None,
+                   "vpd_curve": [[k, have[k]["phi"], have[k]["v"]] for k in sorted(have)]}
+    done("size")
 
-    known = {}
-    pp = paper_parts(path.stem)
-    if pp:
-        kept = [nd for nd in pp if nd in nodes]
-        known["paper"] = {"kept": len(kept), "of": len(pp), "missing": [label(nd) for nd in pp if nd not in nodes]}
-        if path.stem == "paper_bracket":
-            known["paper"]["kept_at_open"] = [sum(nd in nodes for nd in pp if nd[1] == 0), sum(nd[1] == 0 for nd in pp)]
-    src = copycheck.copy_source(nat, tx.ids, tx.targets)
-    if src is not None:
-        s = src[0]
-        core = [(n, s + d, c) for n, c, d in COPY_CORE]
-        known["copy"] = {"source": s, "kept": [label(nd) for nd in core if nd in nodes], "missing": [label(nd) for nd in core if nd not in nodes],
-                         "any_position": [label((n, 0, c))[:-2] for n, c, _ in COPY_CORE if any(m == n and i == c for m, _, i in nodes)],
-                         "reads_source": any(t == s for _, t, _ in nodes)}
-    ed = edits(ge, tx, g)
-    log(f"  {path.stem}: edits, {time.perf_counter() - t_start:.0f} s")
-    return {"task": path.stem, "circuit": str(path), "floors": floors, "stated": stated, "minimal": minimal, "size": size,
-            "known": known, "edits": ed, "teacher": teacher_block(path), "pool": pool_name, "seconds": time.perf_counter() - t_start}
+    parts = sorted(goal_eval._c_graph(g, tx.targets, nat.C, tx.vpd).node_set())
+    own = dict(zip([tuple(x) for x in ed["nodes"]], ed["drops"]["circuit_c"]))  # the circuit's own-run drop per part
+    weak_order = sorted(parts, key=lambda nd: abs(own.get(nd, 0.0)))
+    if len(parts) <= ALL:
+        uniform, weak = parts, []
+    else:
+        rng = np.random.default_rng(native.task_seed(path.stem))
+        uniform = [parts[i] for i in sorted(rng.choice(len(parts), SAMPLE, replace=False))]
+        weak = [nd for nd in weak_order if nd not in set(uniform)][:WEAK]
+    tested = uniform + weak
+    need = {f: min(fl.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
+    mrows = []
+    for nd, r in zip(tested, rows(ge, tx, [without(g, nd) for nd in tested], pool, log)):
+        j = judged(r, fl, fams)
+        drop = {f: (j["scores"][f] or 0.0) - need[f] for f in fams}
+        worst = min(drop, key=drop.get)
+        mrows.append({"part": list(nd), "removable": drop[worst] >= 0.0, "v": j["v"], "phi": j["phi"], "worst": worst,
+                      "worst_margin": drop[worst], "uniform": nd in set(uniform), "scores": j["scores"]})
+    rec["minimal"] = {"tested": len(mrows), "uniform": [sum(m["removable"] for m in mrows if m["uniform"]), len(uniform)],
+                      "weak": [sum(m["removable"] for m in mrows if not m["uniform"]), len(weak)],
+                      "removable": [m["part"] for m in mrows if m["removable"]], "rows": mrows}
+    done("minimality")
+
+    eff = effects(ge, tx, g)
+    reached = token_reached(g)
+    rec["stated"] = {"stated": not g.complete, "defects": defects, "stranded": [list(nd) for nd in getattr(g, "stranded", [])],
+                     "no_token": [list(nd) for nd in sorted(nodes) if nd not in reached],
+                     "unreachable": eff["unreachable"], "point": eff["point"], "track": eff["track"],
+                     "inert_parts": [e["part"] for e in eff["parts"] if moves(e) < INERT],
+                     "inert_lines": [e["line"] for e in eff["lines"] if moves(e) < INERT],
+                     "harmful_parts": [e["part"] for e in eff["parts"] if e["point_rise"] < -INERT and (e["track_fall"] or 0.0) <= INERT],
+                     "part_effects": eff["parts"], "line_effects": eff["lines"]}
+    done("stated")
+    return rec
 
 
 def wilson(k: int, n: int) -> list:
@@ -566,8 +584,10 @@ def main():
         dest = a.out / f"{p.stem}.json"
         if dest.exists():
             continue
-        rec = score(ge, p, pool, vpd, a.pool.name)
+        part = a.out / f"{p.stem}.partial"
+        rec = score(ge, p, pool, vpd, a.pool.name, save=lambda r, part=part: part.write_text(json.dumps(r)))
         dest.write_text(json.dumps(rec))
+        part.unlink(missing_ok=True)
         print(f"{p.stem}: v {rec['floors']['v']:.3f}, {rec['size']['parts']} parts, {rec['seconds']:.0f} s", flush=True)
     recs = load(a.out)
     (a.out / "summary.json").write_text(json.dumps(summary(recs), indent=1))

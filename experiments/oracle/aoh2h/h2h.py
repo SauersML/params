@@ -4,16 +4,18 @@ question's ground truth measured on the model, the answerers held to one budget 
   A  the Activation Oracle alone (Karvonen et al., arXiv 2512.15674; the released Qwen3-1.7B adapter through
      ao_verify.Target.inject: the text's activations at half depth injected at layer 1, norm-matched and added).
      Its answer is the most frequent of K sampled answers, at confidence that answer's share.
+  R  recency (the latest candidate; no change): the questions' floor, no model.
   B  the oracle plus direct interventions on the model (resampled and swapped tokens), spending the budget.
   C  the superset: B's strategy on any question, plus the circuit builder (the native-unit builder, inframove's model
      adapter) when it pays: chosen per question kind on the dev texts, the builder's passes charged to the budget.
 
 Texts: windows of T tokens of wikitext-103's test split (public), each ending where the model's next-token prediction
 is confident (top probability at least TOP_MIN). The battery of one text, every answer with a confidence:
-  (a) which earlier token the prediction depends on most. Truth: each position's token replaced by DRAWS draws from the
-      model's own distribution there (the actual token left out); effect = mean KL in bits of the next-token
+  (a) which earlier token the prediction depends on most (CANDS: the last two tokens left out). Truth: each position's
+      token replaced by DRAWS draws from the model's own distribution there (the actual token left out); effect = mean KL in bits of the next-token
       distribution; the argmax, kept only when it beats the runner-up by MARGIN.
-  (b) SWAPS swaps (position, new token): whether the top prediction changes and to what. Truth: the swapped run.
+  (b) SWAPS swaps (position before the last two, new token): whether the top prediction changes and to what. Truth: the
+      swapped run.
       Half change the top prediction where the text offers them.
   (c) PAIRS pairs of earlier positions: which one the prediction depends on more (the same draws as (a), pairs drawn
       among the 8 largest effects, kept when the larger beats the smaller by MARGIN).
@@ -50,6 +52,8 @@ DRAWS = 8
 STAGE1 = 2  # the answerers' first-stage draws per position
 SHORTLIST = 6
 MARGIN = 1.5
+CANDS = range(1, T - 2)  # the earlier positions asked about: not the last token or the one before it (the smoke run's
+# truth was the token before the last on every text: local dependence a recency rule answers)
 SWAPS = 10
 PAIRS = 3
 K = 8  # sampled oracle answers per question
@@ -162,7 +166,7 @@ def build_text(m: Model, ids: list[int], rng: random.Random) -> dict | None:
     top = int(base[0].argmax())
     if base[0, top].exp() < TOP_MIN:
         return None
-    cands = list(range(1, T - 1))
+    cands = list(CANDS)
     dr = draws(m, ids, cands, DRAWS, rng)
     eff = effects(m, ids, dr, base)
     order = sorted(cands, key=lambda p: -eff[p])
@@ -170,7 +174,7 @@ def build_text(m: Model, ids: list[int], rng: random.Random) -> dict | None:
         return None
     sw_c, sw_n = [], []  # swaps: the last 24 positions, new tokens from the model's distribution there
     lp = m.dist_at(ids)
-    for p in rng.sample(range(T - 24, T), 24):
+    for p in rng.sample(range(T - 26, T - 2), 24):
         pr = lp[p - 1].exp().clone()
         pr[ids[p]] = 0.0
         y = int(torch.multinomial(pr / pr.sum(), 1).item())
@@ -315,7 +319,7 @@ def answer_A(tg, m: Model, it: dict) -> list[dict]:
         pick = {"first": 0, "second": 1}.get(norm(ans))
         out.append({"q": "fact", "pick": pick, "conf": conf if pick is not None else 0.5, "ok": pick == it["gt"]})
         return out
-    cands = list(range(1, T - 1))
+    cands = list(CANDS)
     ans, conf, _ = ao_votes(tg, ids, Q_A, acts)
     p = find(tg, ids, ans, cands)
     out.append({"q": "a", "pick": p, "conf": conf if p is not None else 0.0, "ok": p == it["a"]["gt"]})
@@ -343,7 +347,7 @@ def scan(tg, m: Model, it: dict, base, budget: int, rng: random.Random, hint=())
     the rest spread over the SHORTLIST largest and the hinted positions (the oracle's pick for B; the circuit's for C);
     per position the mean KL over all its draws, and the draws each got."""
     ids = it["ids"]
-    cands = list(range(1, T - 1))
+    cands = list(CANDS)
     left = budget - m.passes - 2  # (two passes for the draws' distributions)
     d1 = max(1, min(STAGE1, left // len(cands)))
     seqs1 = draws(m, ids, cands, d1, rng)
@@ -358,6 +362,17 @@ def scan(tg, m: Model, it: dict, base, budget: int, rng: random.Random, hint=())
             eff[p] = (eff[p] * d1 + more[p] * d2) / (d1 + d2)
             n[p] = d1 + d2
     return eff, n
+
+
+def answer_R(it: dict) -> list[dict]:
+    """Recency, the questions' floor: the latest candidate for (a) and (c), the later statement for facts, no change
+    for (b), every confidence one half."""
+    if it["kind"] == "fact":
+        return [{"q": "fact", "pick": 1, "conf": 0.5, "ok": it["gt"] == 1}]
+    out = [{"q": "a", "pick": max(CANDS), "conf": 0.5, "ok": it["a"]["gt"] == max(CANDS)}]
+    out += [{"q": "b", "changes": False, "conf": 0.5, "ok": not s["changes"]} for s in it["b"]]
+    out += [{"q": "c", "pick": max(c["pair"]), "conf": 0.5, "ok": c["gt"] == max(c["pair"])} for c in it["c"]]
+    return out
 
 
 def answer_B(tg, m: Model, it: dict, budget: int, rng: random.Random, hint=()) -> list[dict]:
@@ -379,7 +394,7 @@ def answer_B(tg, m: Model, it: dict, budget: int, rng: random.Random, hint=()) -
             H, _ = tg.hidden(ids)
         m.passes += 1
         ans, _, _ = ao_votes(tg, ids, Q_A, H[tg.act_layer + 1])
-        p = find(tg, ids, ans, list(range(1, T - 1)))
+        p = find(tg, ids, ans, list(CANDS))
         hint = (p,) if p is not None else ()
     top = it["top"]
     for s in it["b"]:  # one pass each: exact
@@ -410,7 +425,9 @@ def run(a) -> None:
                 continue
             m, t0 = Model(tg), time.time()
             budget = a.budget if it["kind"] == "text" else FACT_BUDGET
-            if sysname == "A":
+            if sysname == "R":
+                rows = answer_R(it)
+            elif sysname == "A":
                 rows = answer_A(tg, m, it)
             elif sysname == "B":
                 rows = answer_B(tg, m, it, budget, random.Random(f"{it['id']}B"))
@@ -463,7 +480,7 @@ def main():
     r.add_argument("--model", default=MODEL)
     r.add_argument("--device")
     r.add_argument("--budget", type=int, default=BUDGET)
-    r.add_argument("--systems", nargs="+", default=["A", "B"])
+    r.add_argument("--systems", nargs="+", default=["R", "A", "B"])
     p = sub.add_parser("report")
     p.add_argument("out", type=Path)
     a = ap.parse_args()

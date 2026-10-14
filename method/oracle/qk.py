@@ -1,5 +1,5 @@
-"""A circuit's stated query-key pairs for teachers (#2951 graph oracle; rustmove's measurements in
-experiments/oracle/qk_pairs.py): per attention read the circuit uses, the pairs (query subcomponent or the rest x key
+"""A circuit's stated query-key pairs for teachers (#2951 graph oracle; from rustmove's 10-12 q-k measurements): per
+attention read the circuit uses, the pairs (query subcomponent or the rest x key
 subcomponent or the rest) added greedily by goal_eval's own runs on graphs with g.pairs (monitorbench's engine pair
 semantics: a read with an entry computes its row from the background and its stated pairs), in C's semantics or the
 path-patched one (s_track_pp). stated_pairs() gives native nodes, pair_edges() the answer's JSON pair edges."""

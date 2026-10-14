@@ -257,7 +257,7 @@ class Net:
 def fit(net: Net, site: str, steps: int, basis=None, lr: float = 0.01, seed: int = 0, every: int = 25, rank: int = RANK,
         lam: float | None = None, keep: list | None = None) -> dict:
     """A, B by Adam on the fit third's net, the step with the best validation net (every `every` steps) scored on the
-    score third. basis (V_k, U_k): restricted, step sizes matched to the unconstrained fit's (finetune_edit.fit). lam:
+    score third. basis (V_k, U_k): restricted (A = V_k a, B = U_k b), step sizes lr sqrt(d_in / k) and lr sqrt(d_out / k). lam:
     the objective goal_bits - lam x collateral per token in place of the net (practical()); keep, a list, receives every
     checkpoint's (validation metrics, deltas)."""
     nat = net.nat

@@ -299,13 +299,38 @@ def answer_text(env: ToolEnv, units: set, edges=None) -> str:
     return "ANSWER\nflowchart LR\n" + "\n".join(f"  {a} --> {b}" for a, b in edges) + f"\nEnglish: {eng}"
 
 
-def expert_episode(toy, fix: bool = True) -> dict:
+def perturb(env: ToolEnv, units: set, rng: random.Random) -> set | None:
+    """A plausible wrong draft, built from weight facts only: an on gated neuron swapped for an off one of the same
+    gate, a non-detector unit dropped, or the cancelling twin of a gated unit added. None when nothing applies."""
+    f, det = env.f, env.f["det"]
+    gate = {f["gate_of"].get(u) for u in units} - {None}
+    on = [u for u in sorted(units) if u in f["gate_of"] and "N" in u]
+    off = [u for u, g in sorted(f["gate_of"].items()) if g in gate and "N" in u and u not in units
+           and (env.pre(u) or 0) <= 0]
+    opts = []
+    if on and off:
+        opts.append(lambda: (units - {rng.choice(on)}) | {rng.choice(off)})
+    if len(units) > 2:
+        opts.append(lambda: units - {rng.choice(sorted(units - {det}))})
+    tw = [f["units"][u].cancels for u in sorted(units) if u in f["units"] and f["units"][u].cancels]
+    tw += [x.cancels for u, x in sorted(f["units"].items()) if f["gate_of"].get(u) in gate and x.cancels]
+    if tw:
+        opts.append(lambda: units | {rng.choice(sorted(set(tw)))})
+    return rng.choice(opts)() if opts else None
+
+
+def expert_episode(toy, fix: bool = True, verify: str | None = None) -> dict:
     """{"messages": chat turns, "rule_units", "truth_units", "calls", "rule_ok"}. fix: the final answer is the truth's
-    circuit (its edges, the tools' English); the calls are the rule's either way."""
+    circuit (its edges, the tools' English); the calls are the rule's either way. verify "check": the expert runs its
+    draft once before answering; "revise": it first runs a perturbed draft (perturb), then its own, then answers."""
     env = ToolEnv(toy)
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": env.first()}]
     env2 = ToolEnv(toy)    # replay the expert's calls to record the observations in order
     calls, units = expert_actions(env)
+    if verify and units:
+        wrong = perturb(env2, units, random.Random(toy.name)) if verify == "revise" else None
+        drafts = ([wrong] if wrong else []) + [units]
+        calls += [f"CALL run({', '.join(sorted(d))})" for d in drafts]
     for c in calls:
         msgs += [{"role": "assistant", "content": c}, {"role": "user", "content": env2.step(c)}]
     gold = {u for u in toy.truth["units"] if UNIT.fullmatch(u)}
@@ -338,6 +363,8 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--zoo", type=Path, default=MANIFEST)
     ap.add_argument("--out", type=Path, default=Path.home() / "mpd-data/toyloop/tool_episodes")
+    ap.add_argument("--verify", default="0,0", help="episodes: fractions of texts given a 'check' and a 'revise' run() "
+                    "step (seeded per text), e.g. 0.15,0.25 (the run_episodes set)")
     a = ap.parse_args()
     MANIFEST = a.zoo.expanduser()
     if a.cmd == "demo":
@@ -350,8 +377,10 @@ def main():
     stats = {}
     for split in splits:
         t0, eps = time.time(), []
+        fc, fr = (float(x) for x in a.verify.split(","))
         for t in load(split, a.limit):
-            e = expert_episode(t)
+            u = random.Random("verify" + t.name).random()
+            e = expert_episode(t, verify="check" if u < fc else "revise" if u < fc + fr else None)
             gold = set(e["truth_units"])
             e["unit_f1"] = circuit.f1(set(e["rule_units"]), gold)
             e["family"] = t.meta["family"]
@@ -369,7 +398,7 @@ def main():
         if a.cmd == "episodes":
             a.out.mkdir(parents=True, exist_ok=True)
             (a.out / f"{split}.jsonl").write_text("".join(json.dumps(e) + "\n" for e in eps))
-    if a.cmd == "expert" or a.limit is None:
+    if (a.cmd == "expert" or a.limit is None) and a.verify == "0,0":
         out = HERE / "results" / "toy_tools_expert.json"
         old = json.loads(out.read_text()) if out.exists() else {}
         out.write_text(json.dumps({**old, **stats}, indent=1))

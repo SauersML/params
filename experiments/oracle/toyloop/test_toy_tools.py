@@ -85,3 +85,26 @@ def test_ids_and_tiny_training(toys, tmp_path):
     model, tok2 = train.load_policy(SimpleNamespace(init=str(tmp_path / "ck"), model=None, lora=0, threads=1))
     r, msgs = T.rollout(model.eval(), tok2, toys[0], max_new=8)
     assert r["calls"] <= tt.MAX_CALLS + 1 and msgs[0]["role"] == "system"
+
+
+def test_verify_episodes_and_tiny_rl(toys, tmp_path):
+    import toy_tools_train as T
+    import train
+    e = tt.expert_episode(toys[1], verify="revise")
+    runs = [m["content"] for m in e["messages"] if m["content"].startswith("CALL run(")]
+    assert 1 <= len(runs) <= 2 and e["rule_ok"]
+    eps = [tt.expert_episode(t) for t in toys]
+    (tmp_path / "ep").mkdir()
+    (tmp_path / "ep" / "train.jsonl").write_text("".join(json.dumps(x) + "\n" for x in eps))
+    T.EPISODES, T.VAL_INSTANCES = tmp_path / "ep", 1
+    model, tok = train.load_policy(SimpleNamespace(init=None, model="tiny", lora=0, threads=1))
+    g = T.sample_episodes(model, tok, toys[0], 2, 1.0, max_new=6)
+    assert len(g) == 2 and all(len(x["ids"]) == len(x["labels"]) and sum(x["labels"]) > 0 for x in g)
+    assert T.token_logps(model, g[0]["ids"], g[0]["labels"]).shape[0] == sum(g[0]["labels"][1:])
+    ck = tmp_path / "init"
+    train.save(model, tok, ck, [])
+    a = SimpleNamespace(out=str(tmp_path / "rl"), init=str(ck), model=None, threads=1, lr=1e-4, seed=0, batch=1, k=2,
+                        temp=1.0, beta=0.05, std=False, weak=1, minutes=0.01, val_n=1, max_new=6)
+    T.rl(a)
+    st = json.loads((tmp_path / "rl" / "state.json").read_text())
+    assert st["step"] >= 1 and (tmp_path / "rl" / "best").exists() and (tmp_path / "rl" / "last").exists()

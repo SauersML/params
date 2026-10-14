@@ -2936,6 +2936,18 @@ def test_pp_terms_equal_pp_run_loop_vpd4l(real):
     assert _pp_loop_check(ge, tx, ge.interchange_pp(tx, graphs[:1], "search", 4), st[:1], "draws_interchange_pp", held=True) >= 2
 
 
+def test_line_effects_chunks_agree(tiny, monkeypatch):
+    """line_effects' path-patched lines run LINE_CHUNK at a time (one call for VPD's whole answer asked 13-30 GiB on
+    fleet's v24 pods): any chunk size gives the same effects."""
+    nat, ge, tx = tiny
+    g = native.Graph(sorted(native.Graph(masks=tx.vpd).node_set())[:10], complete=True)
+    a = ge.line_effects(ge.text(tx.ids, tx.targets, seed=5), g, mode="pp", split="search")
+    monkeypatch.setattr(goal_eval, "LINE_CHUNK", 3)
+    b = ge.line_effects(ge.text(tx.ids, tx.targets, seed=5), g, mode="pp", split="search")
+    assert a["base_kl"] == pytest.approx(b["base_kl"], abs=1e-6) and len(a["nodes"]) == 10
+    assert [x["delta_kl"] for x in a["nodes"]] == pytest.approx([x["delta_kl"] for x in b["nodes"]], abs=1e-6)
+
+
 def test_line_effects_pp_engine(tiny):
     """line_effects(mode="pp") (every line deletion and changed text in one engine.Engine.path_patched(lines=) call)
     gives each line's KL change as pp_run on the graph with that line removed (a node with its connections, token

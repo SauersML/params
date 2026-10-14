@@ -150,15 +150,16 @@ def reward_row(ge: goal_eval.GoalEval, tx: goal_eval.Text, g: native.Graph, pool
     """GoalEval.fidelity's reward-mode row of a node set on the search split, kept on tx per node set and pool (the
     latest REWARD_ROWS): the floors' current circuit, the acceptance's start and the stages' scoring ask for the same
     sets again (text9015 at 211d3b8: 9 of 18 rows its unchanged start, 2.6 s each on a 4090, every level's removals
-    reverted by validation); a stated graph is run each time."""
+    reverted by validation); a stated graph is run each time. Node values (a reported column, line_effects over every
+    node) are left out: the floors and the pick never read them."""
     if not g.complete or getattr(g, "masks", None) is not None:
-        return ge.fidelity(tx, [g], pool, mode="reward", split="search")[0]
+        return ge.fidelity(tx, [g], pool, mode="reward", split="search", node_values=False)[0]
     kept = tx.__dict__.setdefault("_reward_rows", {})
     key = (tuple(sorted(g.node_set())), id(pool))
     if key not in kept:
         while len(kept) >= REWARD_ROWS:
             kept.pop(next(iter(kept)))
-        kept[key] = ge.fidelity(tx, [g], pool, mode="reward", split="search")[0]
+        kept[key] = ge.fidelity(tx, [g], pool, mode="reward", split="search", node_values=False)[0]
     return kept[key]
 
 

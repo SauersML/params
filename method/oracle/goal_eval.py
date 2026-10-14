@@ -558,6 +558,7 @@ RESOLUTION_SAFETY = 10.0  # kl_resolution: the KL between two equal C runs times
 OWN_RUN_FAMILIES = ("point", "edges", "flips", "pattern", "nodes", "patching_near", "patching_far")  # floors from VPD at
 # the START's candidates (vpd_floors): the runs that zero the outside of a circuit or put a far donor's streams there
 START_POOL = native.TEXTS.parent / "goal_eval" / "ci_patterns_train.pt"  # the START's flip-adversary pool (the teacher's)
+LINE_CHUNK = 32  # line_effects' path-patched lines per engine call
 OMITTED_K = 32  # the omitted family's candidates per circuit (_omitted_family)
 GENERIC_TARGET = (("h.1.mlp.c_fc", 2103), ("h.3.mlp.down_proj", 3532), ("h.3.attn.o_proj", 806), ("h.1.attn.q_proj", 316),
                   ("h.0.mlp.c_fc", 53))  # vpd4l's background at the targets (the lead's 10-13): the 5 parts whose removal
@@ -1797,18 +1798,24 @@ class GoalEval:
             offs = ([col[("n", nd)] for nd in nodes] + [col[("o", w)] if r is None else col[("e", w, r)] for w, r in edges]
                     + [col[("u", t)] if r is None else col[("t", t, r)] for t, r in toks]
                     + [col[("p", L, t, qa, kb)] for (L, t), (qa, kb) in prs])
-            lines = torch.ones(1 + len(offs), len(col), device=nat.dev)
-            lines[torch.arange(1, 1 + len(offs), device=nat.dev), torch.tensor(offs, dtype=torch.long, device=nat.dev)] = 0.0
-            lq = E.path_patched([g], [tuple(pz) for pz in got], lines=lines) if got else None  # [1 + lines, D, targets, V]
-            acc, wsum = np.zeros(1 + len(offs)), 0.0
-            for d, (q, z) in enumerate(got):
+            refs = []  # per draw the model on the changed text and its weight W
+            for q, z in got:
                 x2 = list(tx.ids)
                 x2[q] = z
                 ref = nat.reference([x2], tx.targets)
-                w = float(carry.kl(ref, tx.ref)[0])
-                acc += w * np.asarray(carry.kl(ref, lq[:, d]).tolist())
-                wsum += w
-            native.free(nat.dev)
+                refs.append((ref, float(carry.kl(ref, tx.ref)[0])))
+            acc, wsum = np.zeros(1 + len(offs)), sum(w for _, w in refs)
+            for s0 in (range(0, 1 + len(offs), LINE_CHUNK) if got else []):  # the lines a chunk at a time: one call for
+                rows = list(range(s0, min(1 + len(offs), s0 + LINE_CHUNK)))    # VPD's whole answer asked 13-30 GiB (fleet)
+                lines = torch.ones(len(rows), len(col), device=nat.dev)
+                for i, r in enumerate(rows):
+                    if r:
+                        lines[i, offs[r - 1]] = 0.0
+                lq = E.path_patched([g], [tuple(pz) for pz in got], lines=lines)  # [rows, D, targets, V]
+                for d, (ref, w) in enumerate(refs):
+                    acc[s0:s0 + len(rows)] += w * np.asarray(carry.kl(ref.expand(len(rows), *ref.shape[1:]), lq[:, d]).tolist())
+                del lq
+                native.free(nat.dev)
             kl = list(acc / wsum) if wsum > 0 else [None] * (1 + len(offs))
         else:
             raise ValueError("mode is pp or c")
@@ -3289,7 +3296,7 @@ class GoalEval:
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
                  changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
                  far_donors: int = DONORS_FAR, baseline: bool = False, pattern: bool = True,
-                 controls: int = NEC_CONTROLS, weight: bool = False, scope: bool = True) -> list[dict]:
+                 controls: int = NEC_CONTROLS, weight: bool = False, scope: bool = True, node_values: bool = True) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -3445,9 +3452,10 @@ class GoalEval:
                 for fam in ("nodes", "interchange"):
                     for nd, xs in (row.get(f"_pairs_{fam}") or {}).items():
                         merged.setdefault(tuple(nd), []).extend(xs)
-                eff = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0)
-                       for x in self.line_effects(tx, g, mode="pp", split=split)["nodes"]} if merged else {}
-                row.update(_node_values(merged, eff))
+                if node_values:  # (off for the floors' references and the START's candidates: a reported column)
+                    eff = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0)
+                           for x in self.line_effects(tx, g, mode="pp", split=split)["nodes"]} if merged else {}
+                    row.update(_node_values(merged, eff))
                 for fam in ("nodes", "edges", "interchange"):
                     pairs = row.pop(f"_pairs_{fam}", None)
                     row[f"dreads_{fam}"] = _response_error(pairs, base) if pairs else None
@@ -4603,7 +4611,7 @@ class GoalEval:
 
         def judged(ps: set) -> tuple:
             g = native.Graph(sorted(nd for nd in act if nd[1] in ps), complete=True)
-            row = self.fidelity(tx, [g], pool, mode="reward", split="search")[0]
+            row = self.fidelity(tx, [g], pool, mode="reward", split="search", node_values=False)[0]
             return g, row, fl["families"], shortfall(row, fl["floors"])
 
         def attempt(m: int) -> dict:
@@ -4647,7 +4655,7 @@ class GoalEval:
             ps = set(tx.targets) | set(self.start_candidates(tx)[:START_CAP])
             vrow, crow, er = self.fidelity(tx, [native.Graph(act, complete=True),
                                                 native.Graph([nd for nd in act if nd[1] in ps], complete=True), native.Graph()],
-                                           pool, mode="reward", split=split)
+                                           pool, mode="reward", split=split, node_values=False)
             fams = [f for f in PHI_FAMILIES if family_score(vrow, f) is not None]
             fl = {**floors(vrow, fams), **floors(crow, [f for f in fams if f in OWN_RUN_FAMILIES])}
             if floor != FLOOR_TOP:

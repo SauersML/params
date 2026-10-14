@@ -6,7 +6,8 @@ saved answers) and any stage of the same size as either (the stages are nested).
 one record per text to DIR/repick.jsonl. A text is skipped while its record describes its current circuit; a rerun's
 circuit (fleet's reruns replace TEXT.json) is re-picked from the summary row whose written stage it is, and its record
 replaces the old one.
-  repick_teachers.py VPD_ANSWERS.pt DIR [DIR ...]   (DIR: a teacher output, summary_*.jsonl beside TEXT.json files)"""
+  repick_teachers.py VPD_ANSWERS.pt DIR [DIR ...]   (DIR: a teacher output, summary_*.jsonl and fleet's merged MATS shares'
+                                                     mats_summary_*.jsonl beside TEXT.json files)"""
 import glob, json, os, shutil, sys
 from pathlib import Path
 
@@ -59,7 +60,7 @@ def main():
     # the 494 texts' answers held about 4 GB per process: the Mac's oomkill took a run at 12:30, 10-13)
     for d in map(Path, sys.argv[2:]):
         rows = {}                                            # every summary row per text (a rerun's beside the first)
-        for f in sorted(d.glob("summary_*.jsonl")):
+        for f in sorted(d.glob("summary_*.jsonl")) + sorted(d.glob("mats_summary_*.jsonl")):
             for line in f.read_text().splitlines():
                 r = json.loads(line)
                 rows.setdefault(r["task"], []).append(r)

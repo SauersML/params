@@ -5,10 +5,11 @@ A goal's answers always go to the same process; a process scores together every 
   serve_edits.py [--port $PORT or 8766] [--workers 2] [--device cuda] [--goals GOALS.jsonl]
   POST /score {"task": GOAL_ID, "answers": [REPLY, ...], "part": "score"}
       -> {"scores": [{"valid", "unparsed", "edit", "removal", "controls_kept", "collateral", "text_kl", "pile_kl",
-                      "reward", "instances", "controls", "ops", "feedback"}, ...]}
+                      "reward", "instances", "controls", "ops", "feedback", "source"}, ...]}
   A reply is the oracle's whole answer; its "scale" and "update" lines are the edit (edit_env.parse), an answer with
   none scoring as the empty edit (reward 0). "feedback" reports the measurement in a sentence (a revising episode's
-  second turn).
+  second turn). "source" is the scorer's source revision (the pod's SOURCE file, edits_scorer_pod.sh; None without
+  one): tinker_train rl --expect-source stops a run scored by another revision.
   GET /health -> {"workers", "alive", "pending"}
 """
 
@@ -45,6 +46,8 @@ def work(device: str | None, goals: str, inbox, outbox) -> None:
     import edit_env
 
     _, ver = edit_env.load(device)
+    src = HERE.parents[2] / "SOURCE"  # the pod's "python source <rev>" (edits_scorer_pod.sh)
+    source = src.read_text().split()[-1] if src.exists() else None
     prefs = {r["id"]: r["pref"] for r in map(json.loads, Path(goals).read_text().splitlines())}
     while True:
         batch = [inbox.get()]
@@ -62,7 +65,7 @@ def work(device: str | None, goals: str, inbox, outbox) -> None:
                     raise ValueError(f"part {part!r}: val or score")
                 got = ver.answers(prefs[gid], [a for _, ans in reqs for a in ans], part)
                 for s in got:
-                    s["feedback"] = feedback(s)
+                    s["feedback"], s["source"] = feedback(s), source
                 err = None
             except Exception as e:  # a bad request answers with its error; the process keeps serving
                 got, err = None, f"{type(e).__name__}: {e}"

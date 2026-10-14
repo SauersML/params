@@ -76,7 +76,7 @@ def empty(toy, prompt):
 
 
 def gt(toy, prompt):
-    return render.target_text(toy.truth)
+    return render.target_text(toy.truth, toy)   # TOYLOOP_TRACE=1: with the derivation first
 
 
 def active(toy, prompt):

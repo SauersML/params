@@ -29,6 +29,10 @@ def parse(text: str) -> Circuit:
     and '&' groups ('a & b --> c') expanded, edge labels '-->|x|' and node labels 'a["..."]' dropped. Ids that are not
     units (UNIT) are recorded in .bad and left out. The English is the text after the first 'English:'."""
     c = Circuit()
+    if re.match(r"\s*Trace:", text):   # a TOYLOOP_TRACE derivation comes first: read from the flowchart header on
+        m = re.search(r"^\s*(?:```\w*\s*)?(?:flowchart|graph)\b", text, re.M)
+        if m:
+            text = text[m.start():]
     head, _, eng = text.partition("English:")
     c.english = eng.strip().split("\n\n")[0].strip()
     for line in head.splitlines():

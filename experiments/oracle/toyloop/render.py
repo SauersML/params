@@ -38,6 +38,16 @@ SHOW_ACTIVE = os.environ.get("TOYLOOP_SHOW_ACTIVE", "1") != "0"
 # reader gains, distractors visible as writing to nothing) plus the texts' tokens; nothing computed by running the
 # model. Default "all": the original weight section plus the behaviour section.
 SECTIONS = os.environ.get("TOYLOOP_SECTIONS", "all")
+# TOYLOOP_WEIGHTS_DETAIL=1 (weights mode only; opt-in so earlier weights-only prompts keep their bytes): the facts
+# zoo2's text-dependent circuits need, all read from the weights (weight_only_lines(detail=True)): an explicit
+# "gate tK" on every unit the marker detector gates, complete in-link lists for gated units (decoy-like content heads
+# last), and per neuron a bias plus centred, signed token terms for its own token read and for each head it reads.
+WEIGHTS_DETAIL = os.environ.get("TOYLOOP_WEIGHTS_DETAIL", "0") == "1"
+DETAIL_LEGEND = ("Detail: 'gate tK' = the unit works only on texts containing tK (its gate reads the detector, which "
+                 "carries tK); a neuron's bias is its pre-activation with its gate on and every input at a typical "
+                 "token; reads(+t:v) and in[head:gain(+t:v)] list how far a token moves it (its own read: the last "
+                 "token; through a pos-d head: the token d positions before the last); a neuron fires iff bias plus "
+                 "its terms > 0. Decoy-like content heads are listed last.")
 
 # Opt-in wording for future prompts; historical prompt bytes stay unchanged.
 SUMMARY_LIMITS = (
@@ -294,8 +304,73 @@ def source_token(toy, writer: str, reader: str, ratio: float = 2.0) -> str | Non
     return toy.vocab[int(t.indices[0])] if float(t.values[0]) > ratio * float(t.values[1]) + 1e-9 else None
 
 
+def _content_key(qk, pos) -> int | None:
+    """A content head's key token id: position barely matters and its top 3 QK pairs share one key (not BOS)."""
+    if float(pos.max() - pos.min()) > 1.0 or float(qk.std()) <= 0.5:
+        return None
+    keys = {int(a) % qk.shape[1] for a in qk.flatten().topk(3).indices}
+    return keys.pop() if len(keys) == 1 and 0 not in keys else None
+
+
+def gate_facts(toy) -> tuple:
+    """(detector, {gated unit: gate token id}) from the weights: a gate link is a head's Q link or a neuron's input link
+    from a layer-0 head carrying one dominant token (source_token); the detector is the layer-0 head with most such
+    links, and the units it gates read their marker through it."""
+    from collections import Counter
+    units, _, _ = _maps(toy)
+    writes = wiring(toy)
+    top = max((g for u, w in writes.items() if u != "tok" for g in w.values()), default=1.0) or 1.0
+    l0 = [u for u, i, kind, _ in units if i == 0 and kind == "H"]
+    links = []
+    for u, i, kind, _ in units:
+        r = f"{u}.Q" if kind == "H" else u
+        for w in l0:
+            if w != u and writes[w].get(r, 0.0) > 1e-3 * top:
+                src = source_token(toy, w, r)
+                if src:
+                    links.append((u, w, toy.vocab.index(src)))
+    if not links:
+        return None, {}
+    det = Counter(w for _, w, _ in links).most_common(1)[0][0]
+    return det, {u: t for u, w, t in links if w == det}
+
+
+def neuron_terms(toy, u: str, det: str | None = None, gate: int | None = None) -> tuple:
+    """(bias, own read [V], {head: [V]}) of neuron u, centred per token: the pre-activation is about
+    bias + read[last token] + sum over heads of term[token the head carries]. bias: every input at its median token,
+    plus the detector's term for the gate token when gated."""
+    units, out_map, readers = _maps(toy)
+    writes = wiring(toy)
+    top = max((g for x, w in writes.items() if x != "tok" for g in w.values()), default=1.0) or 1.0
+    E = toy.sd["wte.weight"].float()
+    En0 = E * torch.rsqrt(E.pow(2).mean(-1, keepdim=True) + _eps(toy.cfg))
+    B = readers[u][0]
+    rd = (B @ En0.T)[0]
+    bias, terms = float(rd.median()), {}
+    for w, i, kind, _ in units:
+        if kind == "H" and writes[w].get(u, 0.0) > 1e-3 * top:
+            c = (B @ out_map[w] @ En0.T)[0]
+            m = float(c.median())
+            bias += m
+            if w == det:
+                bias += float(c[gate]) - m if gate is not None else 0.0
+            else:
+                terms[w] = c - m
+    return bias, rd - rd.median(), terms
+
+
+def _keys(c, voc) -> str:
+    """Centred token terms: the two largest positive and the most negative, those above a fifth of the largest |c|."""
+    mx = float(c.abs().max())
+    if mx < 0.05:
+        return ""
+    up = [f"+{voc[int(i)]}:{float(c[i]):.2g}" for i in c.topk(2).indices if float(c[i]) > 0.2 * mx]
+    i = int(c.argmin())
+    return ",".join(up + ([f"-{voc[i]}:{float(c[i]):.2g}"] if float(c[i]) < -0.2 * mx else []))
+
+
 def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_links: int = 3,
-                      *, explain_summary_limits: bool = False) -> list[str]:
+                      *, explain_summary_limits: bool = False, detail: bool = False) -> list[str]:
     """Compact, weights only. Per head: output norm, positional preference (the mean embedding's query and key through
     RoPE: best key offset and its margin over the next, 'pos flat' when position barely matters), QK and OV token pairs
     (through the embedding, so a rotated residual basis changes nothing), the units its Q, K and V read and the units
@@ -314,12 +389,29 @@ def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_li
         for r, g in w.items():
             reads.setdefault(r, []).append((g, u))
 
-    def fmt(pairs, reader=None):
+    det, gates, ckey, nterms = None, {}, {}, {}
+    if detail:
+        det, gates = gate_facts(toy)
+        for u, i, kind, j in units_of(toy):
+            if kind == "H":
+                Wq, Wk, _, _ = _blocks(sd, cfg, i, j)
+                En = _rms(E, sd[f"h.{i}.rms_1.weight"].float(), _eps(cfg))
+                c = En.mean(0)
+                key = _content_key((En @ Wq.T) @ (En @ Wk.T).T / math.sqrt(hd),
+                                   _rope_scores(Wq @ c, Wk @ c, cfg, min(int(cfg.get("n_ctx", 32)) - 1, 15)))
+                if key is not None and u != det:
+                    ckey[u] = key
+
+    def fmt(pairs, reader=None, full=False):
         keep = []
-        for g, n in sorted(pairs, reverse=True):
-            if g > 1e-3 * top and len(keep) < max_links:
+        order = sorted(pairs, reverse=True)
+        if full:        # a gated unit: every link, decoy-like content heads last
+            order = sorted(order, key=lambda x: x[1] in ckey)
+        for g, n in order:
+            if g > 1e-3 * top and (full or len(keep) < max_links):
                 src = source_token(toy, n, reader) if reader else None
-                keep.append(f"{n}:{g:.2g}" + (f"<{src}" if src else ""))
+                kt = _keys(nterms[reader][n], voc) if reader in nterms and n in nterms[reader] else ""
+                keep.append(f"{n}:{g:.2g}" + (f"<{src}" if src else "") + (f"({kt})" if kt else ""))
         return ",".join(keep)
 
     def pairs(M):
@@ -331,6 +423,8 @@ def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_li
              "OV[source>written logit] token pairs; in Q/K/V[writer:gain], out[reader:gain] (gain = largest singular "
              "value of reader x writer map; out[] = nothing reads it; L0H5:33<t34 = mostly token t34 carried by L0H5); "
              "~X = cancels X (same input, opposite output)."]
+    if detail:
+        lines[0] += " " + DETAIL_LEGEND
     if explain_summary_limits:
         lines = ["Legend: pos-d is the mean-embedding positional preference (m = margin); "
                  "QK[query>key] and OV[source>written logit] are isolated-embedding token pairs; "
@@ -349,12 +443,13 @@ def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_li
             best = pos.topk(2)
             qk = (En @ Wq.T) @ (En @ Wk.T).T / math.sqrt(hd)
             ov = (En @ Wv.T) @ Wo.T @ El.T
-            line = f"{u} |o|{float(Wo.norm()):.2g} " + (
+            line = f"{u}" + (f" gate {voc[gates[u]]}" if u in gates else "") + f" |o|{float(Wo.norm()):.2g} " + (
                 f"pos-{int(best.indices[0])} m{float(best.values[0] - best.values[1]):.2g}"
                 if float(pos.max() - pos.min()) > 1.0 else "pos flat")
             line += f" QK[{pairs(qk)}]" if float(qk.std()) > 0.5 else " QK flat"
             line += f" OV[{pairs(ov)}]" if float(ov.abs().max()) > 0.05 else " OV 0"
-            ins = [f"{r}[{fmt(reads.get(f'{u}.{r}', []), f'{u}.{r}')}]" for r in ("Q", "K", "V") if reads.get(f"{u}.{r}")]
+            ins = [f"{r}[{fmt(reads.get(f'{u}.{r}', []), f'{u}.{r}', full=u in gates)}]" for r in ("Q", "K", "V")
+                   if reads.get(f"{u}.{r}")]
             ins = [x for x in ins if not x.endswith("[]")]
             line += (" in " + " ".join(ins)) if ins else ""
         else:
@@ -362,8 +457,13 @@ def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_li
             En2 = _rms(E, sd[f"h.{i}.rms_2.weight"].float(), _eps(cfg))
             rd = En2 @ fc
             tokread = "const" if float(rd.std()) < 0.01 * float(rd.abs().mean()) + 1e-6 else _signed_tokens(rd, voc)
-            ins = fmt([x for x in reads.get(u, []) if x[1] != "tok"], u)
-            line = f"{u} reads {tokread}" + (f" in[{ins}]" if ins else "") + f" writes {_signed_tokens(El @ down, voc)}"
+            pre = u
+            if detail:
+                bias, own, nterms[u] = neuron_terms(toy, u, det, gates.get(u))
+                tokread = _keys(own, voc) or "0"
+                pre = u + (f" gate {voc[gates[u]]}" if u in gates else "") + f" bias {bias:.2g}"
+            ins = fmt([x for x in reads.get(u, []) if x[1] != "tok"], u, full=u in gates)
+            line = f"{pre} reads {tokread}" + (f" in[{ins}]" if ins else "") + f" writes {_signed_tokens(El @ down, voc)}"
         line += f" out[{fmt([(g, r) for r, g in writes[u].items()])}]"
         if u in cancel:
             line += f" ~{cancel[u]}"
@@ -372,9 +472,10 @@ def weight_only_lines(toy: Toy, k: int = 2, max_neurons: int | None = 16, max_li
     n_neurons = sum(1 for x in units_of(toy) if x[2] == "N")
     if max_neurons is not None and n_neurons > max_neurons:   # keep the heads and the strongest-writing neurons
         neu = [l for l in lines[1:] if re.match(r"L\d+N", l)]
-        keep = sorted(neu, key=lambda l: -max(writes[l.split()[0]].values(), default=0))[:max_neurons]
+        keep = sorted(neu, key=lambda l: (l.split()[0] not in gates, -max(writes[l.split()[0]].values(), default=0)))
+        keep = keep[:max(max_neurons, sum(1 for l in neu if l.split()[0] in gates))]   # detail: every gated neuron
         lines = [l for l in lines if not re.match(r"L\d+N", l) or l in keep]
-        lines.append(f"({n_neurons - max_neurons} weaker live neurons not shown)")
+        lines.append(f"({n_neurons - len(keep)} weaker live neurons not shown)")
     return lines
 
 
@@ -479,7 +580,8 @@ def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_l
         return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "
                           f"vocab {len(toy.vocab)}, RoPE, tied embedding. Tokens: {' '.join(toy.vocab)}.",
                           "Weights:", *weight_only_lines(weights_from or toy, max_neurons=None if all_live_neurons else 16,
-                                                        explain_summary_limits=explain_summary_limits),
+                                                        explain_summary_limits=explain_summary_limits,
+                                                        detail=WEIGHTS_DETAIL),
                           "Texts:", *text_lines(toy, n_texts),
                           "Which units implement the prediction at the last position, and how?", FORMAT])
     if toy.meta.get("version") == 2:   # zoo2: the compact weight section (the legacy one is ~4k tokens there)
@@ -499,10 +601,56 @@ def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_l
                       "Which units implement the prediction at the last position, and how?", FORMAT])
 
 
-def target_text(truth: dict) -> str:
-    """The training completion for a ground truth."""
+def target_text(truth: dict, toy: Toy | None = None) -> str:
+    """The training completion for a ground truth. TOYLOOP_TRACE=1 (read at call time) and a zoo2 toy: a short
+    derivation (trace_lines) comes first, then the Mermaid and English."""
     body = "\n".join(f"  {a} --> {b}" for a, b in truth["edges"])
-    return f"flowchart LR\n{body}\nEnglish: {truth.get('english', '').strip()}"
+    out = f"flowchart LR\n{body}\nEnglish: {truth.get('english', '').strip()}"
+    if os.environ.get("TOYLOOP_TRACE", "0") == "1" and toy is not None and toy.meta.get("version") == 2:
+        out = "\n".join(trace_lines(toy, truth)) + "\n" + out
+    return out
+
+
+def trace_lines(toy: Toy, truth: dict) -> list[str]:
+    """The derivation of a zoo2 text's TRUE circuit, never of a predicted one: the marker (the text's token at position
+    1), the detector, the module's gated units, the layer-0 units the circuit reads, and the units a reader of the
+    weights would consider but must drop, each with its reason (from the record's params and the weights' links).
+    No arrows and no "English:", so circuit.parse reads only the Mermaid that follows."""
+    p = toy.meta["record"]["params"]
+    mod = p["modules"][toy.meta["module"]]
+    ids = toy.texts[0]
+    marker, det = toy.vocab[ids[1]], zoo_unit(p["detector"])
+    unit_re = re.compile(r"L\d+[HN]\d+")
+    U = {u for u in truth["units"] if unit_re.fullmatch(u)}
+    gated_mod = [zoo_unit(u) for u in mod["gated"]]
+    gated = sorted(u for u in gated_mod if u in U)
+    l0 = sorted(U - {det} - set(gated))
+    cancel = cancelling_pairs(toy)
+    other_gate = {zoo_unit(u): toy.vocab[o["marker"]] for o in p["modules"] if o is not mod for u in o["gated"]}
+    decoy = {zoo_unit(d["unit"]): toy.vocab[d["trigger"]] for d in p["decoys"]}
+    twins = {zoo_unit(u) for t in p["twins"] for u in t}
+    dumps = {zoo_unit(u) for u in p["dump_neurons"]}
+    why = {}
+    for u in sorted(set(gated_mod) - U):     # the module's own gated units left out on this text
+        why[u] = "cancelling twin" if u in cancel else ("off on this text" if "N" in u else "not used")
+    writes = wiring(toy)
+    top = max((g for x, w in writes.items() if x != "tok" for g in w.values()), default=1.0) or 1.0
+    for w, rs in writes.items():             # what the circuit's units read but the circuit does not use
+        if w == "tok" or w in U or w in why:
+            continue
+        if not any(g > 1e-3 * top and r.split(".")[0] in U for r, g in rs.items()):
+            continue
+        why[w] = (f"decoy, trigger {decoy[w]} absent" if w in decoy else f"gated by {other_gate[w]}" if w in other_gate
+                  else "cancelling twin" if w in twins or w in cancel else "writes nothing" if w in dumps
+                  else "other mechanism")
+    groups = {}
+    for u, r in why.items():
+        groups.setdefault(r, []).append(u)
+    dropped = "; ".join(f"{', '.join(sorted(us))} ({r})" for r, us in sorted(groups.items(), key=lambda x: x[0]))
+    return ["Trace:", f"marker {marker} at position 1; detector {det}",
+            f"gated by {marker}: {', '.join(gated) or 'none'}",
+            f"read in layer 0: {', '.join(l0) or 'none'}",
+            f"dropped: {dropped or 'none'}"]
 
 
 # ---------------------------------------------------------------- adapters

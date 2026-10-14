@@ -19,6 +19,10 @@ Three refinements, each read from the prompt too (refine=False gives steps 1-4 a
   d. a gated neuron reading a positional layer-0 head (pos-d) through one dominant token ("in[L0H2:20<t15]", a
      bigram lookup via the previous token) is kept only if the text has that token d positions before the last.
 
+On a TOYLOOP_WEIGHTS_DETAIL=1 prompt the gates are read from "gate tK", and a gated neuron is dropped when its
+bias plus its token terms for this text (its own read of the last token; each pos-d head's term for the token d back)
+is not positive; the layer-0 units traced through it stay.
+
 Edges: tok_marker -> detector -> each gated unit; each traced unit -> the unit that reads it; tok_in -> a kept unit
 reading token identity; each gated unit (and any kept unit writing logits) -> out.
 
@@ -43,7 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 UNIT = re.compile(r"L(\d+)([HN])(\d+)")
 PORT = re.compile(r"(?<![A-Za-z])(Q|K|V|in|out)\[([^\]]*)\]")
-ITEM = re.compile(r"^([A-Za-z]\w*?)(?:\.([QKV]))?:([-+0-9.e]+)(?:<(\w+))?$")
+ITEM = re.compile(r"^([A-Za-z]\w*?)(?:\.([QKV]))?:([-+0-9.e]+)(?:<(\w+))?(?:\(([^)]*)\))?$")
+TERM = re.compile(r"[+-](\w+):([-+0-9.e]+)")
 
 
 @dataclass
@@ -54,6 +59,9 @@ class Unit:
     cancels: str | None = None
     key: str | None = None                     # a content head's key token (pos flat, every QK pair keyed on it)
     offset: int | None = None                  # a positional head's pos-d
+    gate: str | None = None                    # TOYLOOP_WEIGHTS_DETAIL prompts: the explicit gate token,
+    bias: float | None = None                  # a neuron's bias,
+    terms: dict = field(default_factory=dict)  # its token terms: {"self": {token: v}, head: {token: v}}
 
 
 def layer(u: str) -> int:
@@ -82,6 +90,12 @@ def parse(prompt: str) -> tuple[dict, list]:
         if section != "Weights:" or not m:   # only the weight section (the answer FORMAT's example names units too)
             continue
         u = Unit(m.group(1))
+        g = re.match(r"\S+ gate (\w+)", s)
+        u.gate = g.group(1) if g else None
+        b = re.search(r" bias ([-+0-9.e]+) reads (\S+)", s)
+        if b:
+            u.bias = float(b.group(1))
+            u.terms["self"] = {t: float(v) for t, v in TERM.findall(b.group(2))}
         c = re.search(r" ~(L\d+[HN]\d+)\b", s)
         u.cancels = c.group(1) if c else None
         qk = re.search(r" QK\[([^\]]*)\]", s)
@@ -91,11 +105,13 @@ def parse(prompt: str) -> tuple[dict, list]:
             keys = {x.split(">")[1].split(":")[0] for x in qk.group(1).split(",") if ">" in x}
             u.key = keys.pop() if len(keys) == 1 and "BOS" not in keys else None
         for port, body in PORT.findall(s):
-            for it in filter(None, body.split(",")):
+            for it in re.findall(r"[^,(]+(?:\([^)]*\))?", body):
                 x = ITEM.match(it)
                 if not x:
                     continue
-                w, sub, g, src = x.groups()
+                w, sub, g, src, kt = x.groups()
+                if kt:
+                    u.terms[w] = {t: float(v) for t, v in TERM.findall(kt)}
                 if port == "out":
                     u.outs.append((w + (f".{sub}" if sub else ""), float(g)))
                 else:
@@ -118,6 +134,9 @@ def rule(units: dict, text: list, refine: bool = True) -> tuple[set, set, dict]:
     """(units, edges, info) of the marker-selected circuit; refine adds steps a-c of the module docstring."""
     gl = gate_links(units)
     info = {"detector": None, "marker": None, "gate_tokens": [], "gated": []}
+    explicit = {u: x.gate for u, x in units.items() if x.gate}
+    if explicit:    # a detail prompt names each gate: its detector is the writer carrying that token
+        gl = [(u, w, t) for u, w, t in gl if explicit.get(u) == t]
     if not gl:
         return set(), set(), info
     det = Counter(w for _, w, _ in gl).most_common(1)[0][0]
@@ -146,17 +165,26 @@ def rule(units: dict, text: list, refine: bool = True) -> tuple[set, set, dict]:
             return False
         return True
 
-    if refine:      # d: a lookup neuron keyed on a token the text does not have at its head's offset
-        def off(u):
-            for _, w, _, src in units[u].ins:
-                o = units[w].offset if w in units else None
-                if src and w != det and layer(w) == 0 and o is not None and len(text) > o:
-                    if text[-1 - o] != src:
-                        return True
-            return False
-        gated = [u for u in gated if is_head(u) or not off(u)]
-        if not gated:
-            return set(), set(), info
+    def fires(u):   # detail prompts: bias + the last token's own term + each head's term for the token it carries
+        x = units[u]
+        pre = x.bias + x.terms.get("self", {}).get(text[-1], 0.0)
+        for w, kt in x.terms.items():
+            o = units[w].offset if w in units else None
+            if w != "self" and o is not None and len(text) > o:
+                pre += kt.get(text[-1 - o], 0.0)
+        return pre > 0
+
+    def keyed_off(u):   # d: a lookup neuron keyed on a token the text does not have at its head's offset
+        for _, w, _, src in units[u].ins:
+            o = units[w].offset if w in units else None
+            if src and w != det and layer(w) == 0 and o is not None and len(text) > o and text[-1 - o] != src:
+                return True
+        return False
+
+    if any(units[u].bias is not None for u in gated):   # detail prompt: each gated neuron's firing is computable
+        off = {u for u in gated if not is_head(u) and units[u].bias is not None and not fires(u)}
+    else:
+        off = {u for u in gated if not is_head(u) and keyed_off(u)} if refine else set()
     keep, edges = {det} | set(gated), {("tok_marker", det)} | {(det, u) for u in gated}
     stack = list(gated)
     while stack:   # trace read links back to the always-on layer-0 units (and what those read in layer 0)
@@ -172,6 +200,12 @@ def rule(units: dict, text: list, refine: bool = True) -> tuple[set, set, dict]:
     for u in keep:
         if any(r == "logits" for r, _ in units[u].outs) or u in gated:
             edges.add((u, "out"))
+    # neurons off on this text leave the circuit; the layer-0 units traced through them stay (zoo2's gate truth keeps
+    # both input heads even when no YES neuron fires)
+    if off and off >= set(gated):
+        return set(), set(), info
+    keep -= off
+    edges = {e for e in edges if not off & set(e)}
     return keep, edges, info
 
 

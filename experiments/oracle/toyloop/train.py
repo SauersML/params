@@ -48,7 +48,7 @@ def examples(spec: str, truth_json: str | None = None) -> list[dict]:
         toys = render.load_zoo(Path(path).expanduser(), split or None, int(lim) if lim else None)
     else:
         raise ValueError(spec)
-    return [{"prompt": render.render(t), "completion": render.target_text(t.truth) if t.truth else None,
+    return [{"prompt": render.render(t), "completion": render.target_text(t.truth, t) if t.truth else None,
              "meta": {"name": t.name, "truth": t.truth, "toy": t}} for t in toys]
 
 

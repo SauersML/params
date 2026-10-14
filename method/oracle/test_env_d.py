@@ -21,25 +21,32 @@ FACTS = {"task": "text1", "circuit": "@1 a=tok\nOUT <- a", "text": "a b c", "tar
          "evidence": [], "edges": ["tok@1 -> OUT"], "qa": []}
 
 
-def test_reward_is_e1_of_the_english_read_with_the_given_circuit():
-    """The answer's English (after its EXPLANATION heading, else the whole text) is read with the facts' circuit, not
-    any circuit the answer writes; no English scores 0; E1 ranks the English that names the heavier event first."""
-    got = env_d.score(FakeReader(), {}, EV, FACTS, ["EXPLANATION: position 2 matters", "position 9 matters",
-                                                    "CIRCUIT:\n@5 b=tok\nEXPLANATION: position 2 matters", ""])
+def test_reward_is_e1_of_the_english_read_alone():
+    """The answer's English (after its EXPLANATION heading, else the whole text) is read alone, never any circuit the
+    answer writes; no English scores 0; E1 ranks the English that names the heavier event first; every score names
+    the reward's definition."""
+    r = FakeReader()
+    got = env_d.score(r, {}, EV, ["EXPLANATION: position 2 matters", "position 9 matters",
+                                  "CIRCUIT:\n@5 b=tok\nEXPLANATION: position 2 matters", ""])
     assert got[0]["reward"] == pytest.approx(got[2]["reward"]) and got[0]["reward"] > got[1]["reward"]
-    assert got[3] == {"reward": 0.0, "e1": 0.0, "valid": True, "words": 0, "named": False}
-    assert env_d.score(FakeReader(), {}, EV, FACTS, ["L1.v#3 at position 2"])[0]["named"]
+    assert all(c == "" for c, _, _ in r.asked)
+    assert {k: got[3][k] for k in ("reward", "e1", "valid", "words", "named")} == {"reward": 0.0, "e1": 0.0, "valid": True,
+                                                                                   "words": 0, "named": False}
+    assert got[0]["semantics"] == env_d.SEMANTICS == "english-alone " + env_d.components.E1_DEFINITION
+    assert env_d.score(FakeReader(), {}, EV, ["L1.v#3 at position 2"])[0]["named"]
     assert env_d.english_of("EXPLANATION:  two\n lines ") == "two lines"
 
 
 def test_gate_summary():
-    """The gate holds when the correct English beats each one-claim-changed version on >= GATE of the texts that have
-    it; shuffled and no English reported; a version no text has does not block it."""
-    rows = [{"task": f"t{i}", "e1": {"correct": 0.5, "shuffled": -1.0, "position": 0.1 if i else 0.9}} for i in range(5)]
+    """The gate holds when the measured-facts English beats its position edit on >= GATE of the texts;
+    "mechanism_claims" when the correct English beats its mechanism edit on >= GATE; shuffled and none reported."""
+    rows = [{"task": f"t{i}", "e1": {"correct": 0.5, "shuffled": -1.0, "position": 0.1, "mechanism": 0.9 if i else 0.1,
+                                     "facts": 0.3, "facts_position": 0.1 if i else 0.4}} for i in range(5)]
     s = env_d.summarize(rows)
-    assert s["beats"]["position"] == {"wins": 4, "of": 5, "share": 0.8} and s["beats"]["mechanism"]["of"] == 0
-    assert s["gate"] and s["beats"]["none"]["share"] == 1.0 and s["mean_e1"]["none"] == 0.0
-    rows[1]["e1"]["position"] = 0.6
+    assert s["facts_beats_facts_position"] == {"wins": 4, "of": 5, "share": 0.8} and s["gate"]
+    assert s["beats"]["mechanism"] == {"wins": 1, "of": 5, "share": 0.2} and not s["mechanism_claims"]
+    assert s["beats"]["none"]["share"] == 1.0 and s["mean_e1"]["none"] == 0.0
+    rows[1]["e1"]["facts_position"] = 0.6
     assert not env_d.summarize(rows)["gate"]
 
 
@@ -73,5 +80,17 @@ def test_serve(tmp_path, monkeypatch):
         except httpx.ConnectError:
             time.sleep(0.1)
     got = r.json()["scores"]
-    want = env_d.score(FakeReader(), {}, EV, FACTS, ["position 2 matters", ""])
+    want = env_d.score(FakeReader(), {}, EV, ["position 2 matters", ""])
     assert [g["reward"] for g in got] == pytest.approx([w["reward"] for w in want])
+
+
+def test_e1_asks_every_structure_event():
+    """components.e1_bits (E1_DEFINITION e1v2): beside the E1_EVENTS heaviest, every structure event is asked, however
+    light (the events that can refute a claim about how the model finds what it uses)."""
+    ev = {**EV, "structure": [{"kind": "move", "position": 3, "change": f"move {k}", "down": True, "weight": 0.001,
+                               "bits": -0.001} for k in range(3)]}
+    r = FakeReader()
+    env_d.score(r, {}, ev, ["position 2 matters"])
+    neutral = [evs for c, eng, evs in r.asked if eng == env_d.components.NEUTRAL][0]
+    assert len(neutral) == env_d.components.E1_EVENTS + 3
+    assert [e["change"] for e in neutral if e.get("change")] == ["move 0", "move 1", "move 2"]

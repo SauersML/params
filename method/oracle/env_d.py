@@ -1,11 +1,15 @@
 """RL environment D (#2951 graph oracle, the lead's 10-13): English for a given circuit. The question gives what a
 teacher circuit's English may draw on (components.teacher_facts: the text, its prediction, the measured evidence, the
 circuit's subcomponents and connections, the measured interventions; the teacher's circuit at first, later the oracle's
-own) and asks for the EXPLANATION (components.writer_prompt). The reward is E1 (components.e1_bits): a frozen reader's
-log loss in bits on the text's held-out intervention outcomes (units.reader_events and the structural events, the
-heaviest by measured effect, never shown to the writer) with the neutral sentence minus with the English, the circuit's
-lines the same in both. The reader is a frozen open model (reader.Reader): a vLLM server (components.http_reader) or a
-base sampling client on Tinker (tinker_train.tinker_reader); never a Claude or Anthropic model.
+own) and asks for the EXPLANATION (components.writer_prompt). The reward is E1 (components.e1_bits, its events
+components.E1_DEFINITION): a frozen reader's log loss in bits on the text's held-out intervention outcomes (the
+heaviest of units.reader_events and every structure event, never shown to the writer) with the neutral sentence minus
+with the English, the English read alone (the lead's 10-13 decision: a person reads the English, not the circuit's
+subcomponents; read with the circuit, E1 did not separate measured facts from the same facts with the wrong position,
+15 of 24 dev texts, against 21 of 24 read alone). The reader is a frozen open model (reader.Reader): a vLLM server
+(components.http_reader) or a base sampling client on Tinker (tinker_train.tinker_reader); never a Claude or Anthropic
+model. The gate's mechanism row says whether E1 separates right from wrong claims about how the model finds what it
+uses; where it does not, env D trains position-level claims only, and mechanism claims are checked by envs B and C.
 
   env_d.py write FACTS.jsonl OUT.jsonl [--writer MODEL]        (tinker-venv: the writer is on Tinker)
       per text one writer sample (no selection by E1) as the correct English, and its one-claim-changed versions, each
@@ -13,19 +17,21 @@ base sampling client on Tinker (tinker_train.tinker_reader); never a Claude or A
       another position of the text (outside the circuit and the measured positions); "mechanism", matching swapped for
       a fixed-position copy (or back), where the English makes that claim
   env_d.py gate FACTS.jsonl ROWS.jsonl ENGLISH.jsonl OUT.jsonl --reader R
-      E1 of the correct English, another text's (shuffled) and each one-claim-changed version, read with the text's
-      circuit; no English is 0 by definition. Passes when the correct English beats each one-claim-changed version
-      on >= GATE of the texts that have it (the lead's 10-13 gate before RL spend); the mean E1s reported
+      E1 of the correct English, another text's (shuffled), each one-claim-changed version, the measured-facts English
+      (facts_english) and its position edit; no English is 0 by definition. Passes when the facts English beats its
+      position edit on >= GATE of the texts; "mechanism_claims" when the correct English also beats its mechanism edit
+      on >= GATE (the lead's 10-13 rows); the mean E1s reported
   env_d.py write FACTS.jsonl ROWS.jsonl OUT.jsonl --samples N --no-edits
       the SFT writer's N samples per text, {"task", "samples"}
   env_d.py select FACTS.jsonl ROWS.jsonl SAMPLES.jsonl OUT.jsonl --reader R
-      tinker_train.py explain's selection on the reader R: E1 of each sample, the best kept when above 0 (it tells
-      the reader more than the neutral sentence), as {"task", "samples", "e1", "best", "explanation", "e1_best"}
+      the SFT target per text: the best writer sample by E1 when it beats the measured-facts English, else the facts
+      English, as {"task", "samples", "e1", "e1_facts", "best", "explanation", "e1_best", "target"}
   env_d.py questions FACTS.jsonl OUT.jsonl                     RL question rows {"task", "question"}
   env_d.py sft ENGLISH.jsonl FACTS.jsonl OUT.jsonl            SFT rows (components.py dataset's format) from select's
       or tinker_train.py explain's output: the question, then the kept English
   env_d.py serve FACTS.jsonl ROWS.jsonl --reader R [--port 8772]
-      POST /score {"task", "answers": [text, ...]} -> {"scores": [{"reward", "e1", "valid", "words", "named"}, ...]}
+      POST /score {"task", "answers": [text, ...]} -> {"scores": [{"reward", "e1", "valid", "words", "named",
+      "semantics" (the reward's definition), "source" (the code revision: SOURCE beside method/)}, ...]}
       (tinker_train.py rl's scorer: --no-lines); GET /health
 R: "tinker:<base model>" (in tinker-venv, TINKER_PROJECT_ID and TINKER_API_KEY set) or "<url>|<base model>" (a vLLM
 server's /v1/completions and the model it serves).
@@ -83,13 +89,18 @@ def task_of(task: str) -> dict:
     return json.loads((TEXTS / f"{task}.json").read_text())
 
 
-def score(reader, task: dict, ev: dict, facts: dict, texts: list[str], circuit: bool = True) -> list[dict]:
-    """Each answer's reward: E1 of its English read with the text's circuit (0 without English, which says nothing;
-    an answer is invalid only when the text has no events to ask). circuit False: read without it (a probe)."""
+SEMANTICS = f"english-alone {components.E1_DEFINITION}"  # what the reward measures, on every score
+SOURCE = HERE.parents[1] / "SOURCE"  # a pod's source revision (envd_reader_pod.sh writes it)
+
+
+def score(reader, task: dict, ev: dict, texts: list[str]) -> list[dict]:
+    """Each answer's reward: E1 of its English read alone (0 without English, which says nothing; an answer is invalid
+    only when the text has no events to ask). An answer's own CIRCUIT section is not read."""
     eng = [english_of(x) for x in texts]
-    e1 = components.e1_bits(reader, task, ev, [answer(facts["circuit"] if circuit else "", e) for e in eng])
+    e1 = components.e1_bits(reader, task, ev, [answer("", e) for e in eng])
+    src = SOURCE.read_text().split()[-1] if SOURCE.exists() else None
     return [{"reward": 0.0 if b is None else b, "e1": b, "valid": b is not None, "words": len(e.split()),
-             "named": bool(NAMES.search(e))} for b, e in zip(e1, eng)]
+             "named": bool(NAMES.search(e)), "semantics": SEMANTICS, "source": src} for b, e in zip(e1, eng)]
 
 
 def make_reader(spec: str):
@@ -207,8 +218,6 @@ def write(a) -> None:
 
 
 def gate(a) -> None:
-    if a.events:
-        components.E1_EVENTS = a.events  # (a probe of the reward's event count; the reward keeps components'.)
     reader = make_reader(a.reader)
     facts = {f["task"]: f for f in map(json.loads, a.facts.read_text().splitlines()) if f}
     rows = {r["task"]: r for r in map(json.loads, a.rows.read_text().splitlines()) if r}
@@ -224,7 +233,7 @@ def gate(a) -> None:
             if fe and r.get("position"):  # measured facts alone, and with their most important position swapped
                 names += ["facts", "facts_position"]
                 texts += [fe, facts_english(f, (r["position"]["position"], r["position"]["token"]))]
-            got = score(reader, task_of(t), rows[t], f, texts, circuit=not a.no_circuit)
+            got = score(reader, task_of(t), rows[t], texts)
             row = {"task": t, "e1": {k: s["e1"] for k, s in zip(names, got)}}
             out.append(row)
             fh.write(json.dumps(row) + "\n")
@@ -244,21 +253,26 @@ def select(a) -> None:
         for r in map(json.loads, a.samples.read_text().splitlines()):
             if r["task"] not in facts or not r["samples"]:
                 continue
-            e1 = [s["e1"] for s in score(reader, task_of(r["task"]), rows[r["task"]], facts[r["task"]], r["samples"])]
+            fe = facts_english(facts[r["task"]])
+            got = [s["e1"] for s in score(reader, task_of(r["task"]), rows[r["task"]], r["samples"] + ([fe] if fe else []))]
+            e1, e1_facts = got[:len(r["samples"])], (got[-1] if fe else None)
             best = max(range(len(e1)), key=lambda i: -1e9 if e1[i] is None else e1[i])
-            keep = e1[best] is not None and e1[best] > 0
-            fh.write(json.dumps({"task": r["task"], "samples": r["samples"], "e1": e1, "best": best,
-                                 "explanation": r["samples"][best] if keep else "", "e1_best": e1[best]}) + "\n")
+            writer = e1[best] is not None and (fe is None or (e1_facts is not None and e1[best] > e1_facts))
+            target = r["samples"][best] if writer else (fe or "")
+            fh.write(json.dumps({"task": r["task"], "samples": r["samples"], "e1": e1, "e1_facts": e1_facts, "best": best,
+                                 "explanation": target, "e1_best": e1[best] if writer else e1_facts,
+                                 "target": "writer" if writer else "facts"}) + "\n")
             fh.flush()
-            n, kept = n + 1, kept + keep
-            print(json.dumps({"task": r["task"], "e1_best": e1[best], "kept": keep}), flush=True)
-    print(json.dumps({"texts": n, "kept": kept}), flush=True)
+            n, kept = n + 1, kept + writer
+            print(json.dumps({"task": r["task"], "e1_best": e1[best], "e1_facts": e1_facts, "target": "writer" if writer else "facts"}),
+                  flush=True)
+    print(json.dumps({"texts": n, "writer_targets": kept, "facts_targets": n - kept}), flush=True)
 
 
 def summarize(rows: list[dict]) -> dict:
     """Per control, the texts where the correct English beats it and their share; every condition's mean E1 (no
     English 0); the gate: each one-claim-changed version beaten on >= GATE of its texts."""
-    out = {"texts": len(rows), "mean_e1": {}, "beats": {}}
+    out = {"texts": len(rows), "semantics": SEMANTICS, "mean_e1": {}, "beats": {}}
     for k in ("correct", "shuffled", "position", "mechanism", "facts", "facts_position"):
         xs = [r["e1"][k] for r in rows if r["e1"].get(k) is not None]
         out["mean_e1"][k] = sum(xs) / len(xs) if xs else None
@@ -272,8 +286,9 @@ def summarize(rows: list[dict]) -> dict:
     out["facts_beats_facts_position"] = {"wins": sum(a > b for a, b in pairs), "of": len(pairs),
                                          "share": sum(a > b for a, b in pairs) / len(pairs) if pairs else None}
     out["mean_e1"]["none"] = 0.0
-    out["gate"] = all(out["beats"][k]["share"] is not None and out["beats"][k]["share"] >= GATE for k in ("position", "mechanism")
-                      if out["beats"][k]["of"])
+    passes = lambda d: d["share"] is not None and d["share"] >= GATE  # noqa: E731
+    out["gate"] = passes(out["facts_beats_facts_position"])
+    out["mechanism_claims"] = passes(out["beats"]["mechanism"])
     return out
 
 
@@ -312,7 +327,7 @@ def serve(a) -> None:
             with lock:
                 t = req["task"]
                 tasks.setdefault(t, task_of(t))
-                got = score(reader, tasks[t], rows[t], facts[t], req["answers"])
+                got = score(reader, tasks[t], rows[t], req["answers"])
             self._send({"scores": got})
 
         def _send(self, obj):
@@ -355,8 +370,6 @@ def main():
     g.add_argument("english", type=Path)
     g.add_argument("out", type=Path)
     g.add_argument("--reader", required=True)
-    g.add_argument("--events", type=int, default=0, help="E1's events per text and circuit (default components.E1_EVENTS)")
-    g.add_argument("--no-circuit", action="store_true", help="the reader reads the English without the circuit (a probe)")
     q = sub.add_parser("questions")
     q.add_argument("facts", type=Path)
     q.add_argument("out", type=Path)

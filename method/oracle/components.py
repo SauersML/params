@@ -172,7 +172,9 @@ WINDOW = 8  # a question numbers the tokens within this many positions of every 
 MARK_EVERY = 16  # elsewhere, plain text with a position marker at least this often
 QA_PER_KIND = 2
 QA_RANKS = 8  # token-change questions draw the new token from the model's alternatives at ranks 0 to 7
-E1_EVENTS = 12  # the reader events E1 asks per text and circuit (e1_bits; the strong reader's cost)
+E1_EVENTS = 12  # the reader events E1 asks per text and circuit (e1_bits; the strong reader's cost), beside every structure event
+E1_DEFINITION = "e1v2"  # e1_bits' events: v2 (10-13) the E1_EVENTS heaviest and every structure event (moves, copies,
+# swaps: the events that can refute a claim about how the model finds what it uses); v1 the E1_EVENTS heaviest alone
 E1_CANDIDATES = 36  # the events the unaided reader is asked first: the heaviest by measured effect
 NEUTRAL = "The model predicts its next token from the text."  # E1's baseline: an explanation that says nothing
 ANSWER_BUDGET = 3_500  # tokens of a supervised answer: 4,096 sampled at most, ~600 left for English and reasoning
@@ -1599,15 +1601,19 @@ def e1_candidates(ev: dict, k: int = E1_CANDIDATES) -> list[dict]:
 def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None]:
     """Each answer's E1: what its English adds to its circuit for a strong reader (the lead's design, 10-12). The
     reader reads the text, the answer's CIRCUIT lines (circuit_text()) and the English, and gives its probability of
-    what the model does on each event (reader.Reader.losses). The events: of the text's candidates (e1_candidates()),
-    the E1_EVENTS heaviest by w = measured effect x the reader's loss given the text and the circuit alone, so an event
-    the reader already gets right from the circuit, or one the model barely moves on (its direction noise), weighs
-    little. E1 = sum w (loss with NEUTRAL - loss with the English) / sum w, in bits: English that says nothing scores
+    what the model does on each event (reader.Reader.losses). The events (E1_DEFINITION): of the text's candidates
+    (e1_candidates()), the E1_EVENTS heaviest by w = measured effect x the reader's loss given the text and the circuit
+    alone, so an event the reader already gets right from the circuit, or one the model barely moves on (its direction
+    noise), weighs little; and every structure event of the text (structure_events(): a token moved, copied or two
+    swapped), weighed the same way, which are what can refute a claim about how the model finds what it uses (on 30
+    dev texts the heaviest 12 alone did not separate English from a version with its mechanism claim changed, 5 of
+    17). E1 = sum w (loss with NEUTRAL - loss with the English) / sum w, in bits: English that says nothing scores
     0, English that tells the reader what the model does above 0, misleading English below (a strong reader loses bits
     on any confident English that the events do not bear out: reader validation 10-12, where every English scored
     below none). The unaided and neutral prompts are asked once per text and circuit (the reader's memo). An answer
     without English is 0; None without events."""
     cands = e1_candidates(ev)
+    cands += [e for e in ev.get("structure", []) if e not in cands]  # every structure event is asked
     items = [(circuit_text(x), escape(english(x))) for x in texts]
     if not cands:
         return [None] * len(texts)
@@ -1616,6 +1622,7 @@ def e1_bits(reader, task: dict, ev: dict, texts: list[str]) -> list[float | None
     for c, un in zip(circs, reader.losses(task, [(c, "") for c in circs], cands)):
         w = [e.get("weight", 1.0) * u for e, u in zip(cands, un)]
         top = sorted(range(len(cands)), key=lambda i: -w[i])[:E1_EVENTS]
+        top += [i for i, e in enumerate(cands) if e.get("change") and i not in top]
         sel[c] = ([w[i] for i in top], [cands[i] for i in top])
     asked = [(c, NEUTRAL) for c in circs] + [it for it in items if it[1].strip()]
     got = iter(reader.losses(task, asked, [sel[c][1] for c, _ in asked]))
@@ -1882,6 +1889,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
                       "E2": row["E2"], "E3": e3.get(i), "E4": e4[i]["E4"] if i in e4 else None}
             info = {"phi": ph, "phi_full": ph_full, "phi_tau": pt, "g": g, "v": ct["v"], "v_soft": ct["v_soft"], "g_floor": ct["g_floor"],
                     "tie": ct["tie"], "faithful": None if ph is None or pt is None else ph >= pt and ct["v"] == 0.0, "bits": b,
+                    "E1_definition": E1_DEFINITION if terms.get("E1") is not None else None,
                     "kl": goal_eval.family_kls(c),  # raw KLs in bits beside the scores (the external audit)
                     "executable_bits": executable_bits,
                     "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,

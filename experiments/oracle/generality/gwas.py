@@ -358,7 +358,7 @@ def annotate():
 
 INFINIGRAM = "https://api.infini-gram.io/"
 INDEX = "v4_piletrain_llama"  # infini-gram's index of the Pile's train split (its own Llama tokenizer; queries are text)
-NGRAM_SAMPLE, NGRAM_N, WORKERS = 20000, 4, 2  # (6 workers drew a 403 from the public API once)
+NGRAM_SAMPLE, NGRAM_N, WORKERS = 5000, 4, 2  # (6 workers drew a 403 from the public API once)
 
 
 def _ig(payload: dict, tries: int = 4) -> dict:
@@ -1675,6 +1675,41 @@ def probe():
     print("wrote", OUT / "probe.json")
 
 
+EDIT_CANDS = 24  # persistent_e3's circuit size for an edit
+
+
+def assoc_prefs():
+    """Decision test 2's input: rustmove's 15 preferences (PREFS) with each one's circuit replaced by the EDIT_CANDS
+    subcomponents most associated with it (|z| at q < 0.05 for log p(b) at the positions whose token is a), in
+    persistent_e3's format [site, index, score] -> OUT/prefs15_assoc.jsonl; persistent_e3.py edit with --methods
+    circuit_ft --rank 4 on it is the association-picked edit, against the circuit-picked edit of the same run."""
+    A = np.load(OUT / "assoc.npz")
+    names = json.loads(str(A["names"]))
+    z, q = A["z"], A["q"]
+    off = json.loads(str(A["offsets"]))
+    sites = sorted(off, key=off.get)
+    starts = np.array([off[n] for n in sites])
+    out = []
+    for ln in PREFS.read_text().splitlines():
+        p_ = json.loads(ln)
+        nm = f"after {_decode(p_['a'])!r}, log p({_decode(p_['b'])!r})"
+        if nm not in names:
+            print("no scan column for", nm)
+            continue
+        j = names.index(nm)
+        ok = np.flatnonzero(q[:, j] < 0.05)
+        top = ok[np.argsort(-np.abs(z[ok, j]))][:EDIT_CANDS]
+        circ = []
+        for c in top:
+            i = int(np.searchsorted(starts, c, "right")) - 1
+            circ.append([sites[i], int(c - starts[i]), float(abs(z[c, j]))])
+        old = {(s_, int(i_)) for s_, i_, _ in p_["circuit"][:EDIT_CANDS]}
+        print(f"{nm}: {len(ok)} subcomponents at q < 0.05; {len(old & {(s_, i_) for s_, i_, _ in circ})} of {EDIT_CANDS} shared with the circuit")
+        out.append({**p_, "circuit": circ, "circuit_from": "association"})
+    (OUT / "prefs15_assoc.jsonl").write_text("".join(json.dumps(x) + "\n" for x in out))
+    print("wrote", OUT / "prefs15_assoc.jsonl")
+
+
 FIG = Path("/Users/user/mpd-data/figures/oracle")
 
 
@@ -1724,7 +1759,7 @@ def figure(r_min: float = 0.1):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "annotate", "domain", "ngram", "export", "mech", "attention", "pheno", "assoc",
-                                    "calib", "table", "figure", "conditional", "causal_plan", "causal", "probe"))
+                                    "calib", "table", "figure", "conditional", "causal_plan", "causal", "probe", "assoc_prefs"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     if a.cmd in ("extract", "mech"):

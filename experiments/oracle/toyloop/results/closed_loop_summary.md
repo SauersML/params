@@ -74,13 +74,17 @@ texts per split.
 | detailed weight render (`TOYLOOP_WEIGHTS_DETAIL=1`), curriculum | 0.64/0.65/0.65 | 0.22/0.27/0.24 |
 | detailed render + ground-truth reasoning trace (`TOYLOOP_TRACE=1`) | 0.56/0.65/0.69 | 0.14/0.31/0.26 |
 | detailed render + 42 GRPO steps (k 6, std) | 0.51/0.51/0.58 (precision falls) | 0.10/0.13/0.11 |
+| SmolLM2-360M, LoRA r32, detailed render, curriculum (30 texts per split) | 0.57/0.56/0.62 | 0.17/0.17/0.21 |
 | no-LM rule reading the same detailed prompt (`weights_heuristic2`) | 1.00 | equal to the truth |
 
 The information is in the prompt: a rule that parses it recovers every circuit. The 135M oracle captures only part
 of it. The render, which states facts the oracle would otherwise have to compute (gate tokens, complete in-links,
 neuron biases, centred token reads), helped more than the reasoning trace. RL from the detailed-render checkpoint
 raised the sampled training reward but hurt greedy held-out results, as the policy drifted to larger circuits (RL
-on weights-only prompts has not helped in four tries). Next: a larger oracle.
+on weights-only prompts has not helped in four tries). A 360M oracle (LoRA, trained in chunks that each restarted
+AdamW) did no better than the 135M one with full fine-tuning. The CPU budget limits this axis: a fair test of
+capacity needs full fine-tuning of 0.5-1.5B models on a GPU. Further options: tool use (let the oracle call the
+marker or gate lookups) or a shorter, more structured input.
 
 ## Open, in order of expected value
 

@@ -7,6 +7,23 @@ from learning_model_bank import GENERATOR_COMMIT, FAMILIES
 
 
 class ContractTest(unittest.TestCase):
+    def test_fresh_bank_two_disjoint_four_case_workers_and_role_guard(self):
+        from learning_model_bank import specifications
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            specs=[{'case':f'{f}_{3300000+100*i}','family':f,'seed':3300000+100*i,
+                    'split':'train','context_seed':(3300000+100*i)*7+3} for i,f in enumerate(FAMILIES)]
+            rows=[{**s,'status':'construction_error'} for s in specs]
+            manifest={'models':rows,'generator_commit':GENERATOR_COMMIT,
+                      'profile':'fresh_train_bank_v1','specifications':specs}
+            (root/'manifest.json').write_text(json.dumps(manifest))
+            digest=driver.sha(root/'manifest.json')
+            a=driver.validate_bank(root,digest,0)[1];b=driver.validate_bank(root,digest,1)[1]
+            self.assertEqual([r['case'] for r in a+b],[r['case'] for r in specs])
+            self.assertEqual(len(a),4);self.assertEqual(len(b),4)
+            rows[0]['split']='evaluation'
+            (root/'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):driver.validate_bank(root,driver.sha(root/'manifest.json'),0)
     def test_continuation_preserves_completed_cases_and_all_old_forwards(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);digest=self.fixture(root)

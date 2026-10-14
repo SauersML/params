@@ -19,6 +19,16 @@ def sha(path):
 
 
 def specifications(protocol):
+    if protocol.get('schema') == 'fresh_train_bank_v1':
+        expected = [{'case': f'{family}_{3300000+100*i}', 'family': family,
+                     'seed': 3300000+100*i, 'split': 'train',
+                     'context_seed': (3300000+100*i)*7+3}
+                    for i, family in enumerate(FAMILIES)]
+        if (set(protocol) != {'schema', 'generator_source', 'specifications'}
+                or protocol['generator_source'] != GENERATOR_COMMIT+' zoo.make(family,seed)'
+                or protocol['specifications'] != expected):
+            raise ValueError('exact fresh8 TRAIN manifest/source/order required')
+        return expected
     if tuple(protocol['families']) != FAMILIES or protocol['model_counts'] != {
             'existing_exposed_train': 8, 'new_train': 16, 'new_model_evaluation': 8}:
         raise ValueError('frozen family/count protocol changed')
@@ -82,11 +92,14 @@ def construct(zoo, spec):
     return sd, cfg, params, record, point_gold
 
 
-def generate(zoo, protocol_path, out, source_binding):
+def generate(zoo, protocol_path, out, source_binding, *, train_protocol_sha256=None):
     import torch
-    if sha(protocol_path) != PROTOCOL_SHA or out.exists():
+    if sha(protocol_path) != (train_protocol_sha256 or PROTOCOL_SHA) or out.exists():
         raise ValueError('exact protocol and fresh immutable output required')
-    rows = specifications(json.loads(protocol_path.read_text()))
+    protocol = json.loads(protocol_path.read_text())
+    if train_protocol_sha256 is not None and protocol.get('schema') != 'fresh_train_bank_v1':
+        raise ValueError('explicit fresh TRAIN protocol required')
+    rows = specifications(protocol)
     out.mkdir(parents=True)
     statuses = []
     for spec in rows:
@@ -106,12 +119,15 @@ def generate(zoo, protocol_path, out, source_binding):
             row.update(error_type=type(exc).__name__, error=str(exc))
         statuses.append(row)
         (out / 'status.json').write_text(json.dumps(statuses, indent=2)+'\n')
-    manifest = {'schema': 1, 'protocol_sha256': PROTOCOL_SHA, 'generator_commit': GENERATOR_COMMIT,
+    manifest = {'schema': 1, 'protocol_sha256': sha(protocol_path), 'generator_commit': GENERATOR_COMMIT,
                 'source_binding': source_binding, 'models': statuses,
                 'preparation_native_forwards': 0, 'existing_exposed_train_models': 8,
                 'new_train_forward_cap': sum(r.get('teacher_bound', {}).get('forward_cap', 0)
                                             for r in statuses if r['split'] == 'train'),
                 'scope': 'analytic construction only; no filtering/retry/teacher labels; evaluation models excluded from teacher search'}
+    if train_protocol_sha256 is not None:
+        manifest.update(profile='fresh_train_bank_v1', specifications=rows,
+                        existing_exposed_train_models=27)
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
     return manifest
 
@@ -123,6 +139,7 @@ def main():
     p = argparse.ArgumentParser()
     for key in ('generator-repo', 'protocol', 'out'):
         p.add_argument('--'+key, type=Path, required=True)
+    p.add_argument('--train-protocol-sha256')
     args = p.parse_args()
     paths = ('experiments/oracle/toys/zoo.py', 'experiments/oracle/toys/planted.py',
              'method/vpd/vpd_model.py')
@@ -142,7 +159,8 @@ def main():
     for name in ('record', 'build', 'check', 'gt_nodes', 'last_logits', 'node_kl'):
         setattr(zoo, name, forbidden)
     zoo.planted.native_of = forbidden
-    generate(zoo, args.protocol, args.out, binding)
+    generate(zoo, args.protocol, args.out, binding,
+             train_protocol_sha256=args.train_protocol_sha256)
 
 
 if __name__ == '__main__':

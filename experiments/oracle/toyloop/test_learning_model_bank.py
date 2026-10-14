@@ -7,6 +7,21 @@ import learning_model_bank as bank
 
 
 class BankTest(unittest.TestCase):
+    def test_fresh_train_manifest_strict_roles_duplicates_families_schema(self):
+        import copy
+        protocol = {'schema':'fresh_train_bank_v1',
+                    'generator_source':bank.GENERATOR_COMMIT+' zoo.make(family,seed)',
+                    'specifications':[{'case':f'{f}_{3300000+100*i}', 'family':f,
+                        'seed':3300000+100*i,'split':'train','context_seed':(3300000+100*i)*7+3}
+                        for i,f in enumerate(bank.FAMILIES)]}
+        self.assertEqual(len(bank.specifications(protocol)),8)
+        for key,value in [('split','evaluation'),('family','multihop'),('case','../escape')]:
+            changed=copy.deepcopy(protocol);changed['specifications'][0][key]=value
+            with self.assertRaises(ValueError):bank.specifications(changed)
+        changed=copy.deepcopy(protocol);changed['specifications'][1]=changed['specifications'][0]
+        with self.assertRaises(ValueError):bank.specifications(changed)
+        changed=copy.deepcopy(protocol);changed['unknown']=True
+        with self.assertRaises(ValueError):bank.specifications(changed)
     def protocol(self):
         return {'families': list(bank.FAMILIES), 'model_counts': {
             'existing_exposed_train': 8, 'new_train': 16, 'new_model_evaluation': 8},

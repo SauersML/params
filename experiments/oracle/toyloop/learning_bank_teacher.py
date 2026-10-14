@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 import types
 
-from learning_model_bank import GENERATOR_COMMIT, FAMILIES
+from learning_model_bank import GENERATOR_COMMIT, FAMILIES, specifications
 
 
 def sha(path):
@@ -48,9 +48,23 @@ def validate_bank(root, expected_sha, worker):
     ids = [f'{family}_{3100000+100*i+variant}' for i, family in enumerate(FAMILIES)
            for variant in (0, 1)]
     rows = [r for r in manifest['models'] if r['split']=='train']
+    per_worker = 8
+    if manifest.get('profile') == 'fresh_train_bank_v1':
+        specs = specifications({'schema': manifest['profile'],
+            'generator_source': manifest['generator_commit']+' zoo.make(family,seed)',
+            'specifications': manifest['specifications']})
+        ids = [r['case'] for r in specs]
+        if len(manifest['models']) != 8 or any(r.get('split') != 'train' for r in manifest['models']):
+            raise ValueError('fresh bank contains only eight TRAIN models')
+        if any({k: row.get(k) for k in spec} != spec
+               for row, spec in zip(manifest['models'], specs)):
+            raise ValueError('fresh bank identity/role differs from frozen specifications')
+        per_worker = 4
+    elif manifest.get('profile') is not None:
+        raise ValueError('unsupported bank profile')
     if [r['case'] for r in rows] != ids or manifest['generator_commit'] != GENERATOR_COMMIT:
         raise ValueError('fixed16 TRAIN cases/source required')
-    selected = rows[8*worker:8*(worker+1)]
+    selected = rows[per_worker*worker:per_worker*(worker+1)]
     for row in selected:
         if row['status'] != 'constructed_unmeasured':
             continue  # Retain failures without inventing a fixture.

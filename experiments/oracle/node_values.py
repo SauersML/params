@@ -16,6 +16,8 @@ Sets:
   causalgym  generality's CausalGym teacher circuits against the same circuit with the subject's nodes moved to the
              attractor (cg_teacher.test's pair)
   dev        dev teacher circuits against random subsets of their start of the same size (3 seeds)
+  reference  per dev text the teacher, VPD's actives at the START's positions (the start set) and VPD's whole answer
+             (the share alone): whether a node-values floor relative to VPD would be fair (the lead's 10-13 question)
 
   python node_values.py toys --toys ~/mpd-data/toys_planted --out OUT.jsonl
   python node_values.py causalgym --teacher ~/mpd-data/graph_oracle/generality/cg_teacher_b2 --out OUT.jsonl
@@ -39,17 +41,20 @@ import native  # noqa: E402
 DRAWS = 16
 
 
-def agreement(ge, tx, graphs: list, split: str = "eval", draws: int = DRAWS) -> list[dict]:
-    """Per circuit, share, weighted and median_z (module docstring) over its nodes with two or more interventions."""
+def agreement(ge, tx, graphs: list, split: str = "eval", draws: int = DRAWS, effects: list | None = None) -> list[dict]:
+    """Per circuit, share, weighted and median_z (module docstring) over its nodes with two or more interventions.
+    effects: per circuit whether to measure its line effects for the weighted share (default all; VPD's whole answer,
+    thousands of nodes, is shared alone)."""
     rn = ge._node_family(tx, graphs, draws, reads=True)
     ri = ge._interchange_family(tx, graphs, draws, split=split, reads=True)
     out = []
-    for g, a, b in zip(graphs, rn, ri):
+    for k, (g, a, b) in enumerate(zip(graphs, rn, ri)):
         pairs = {}
         for src in (a.get("_pairs_nodes") or {}, b.get("_pairs_interchange") or {}):
             for nd, xs in src.items():
                 pairs.setdefault(tuple(nd), []).extend(xs)
-        eff = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in ge.line_effects(tx, g, mode="pp", split=split)["nodes"]}
+        eff = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in ge.line_effects(tx, g, mode="pp", split=split)["nodes"]} \
+            if effects is None or effects[k] else {}
         r = goal_eval._node_values(pairs, eff)
         out.append({"nodes": g.count(), "measured": r["node_measured"], "share": r["node_share"],
                     "weighted": r["node_share_weighted"], "median_z": r["node_median_z"]})
@@ -132,6 +137,27 @@ def dev(a) -> None:
                 print(task, arm, json.dumps(r), flush=True)
 
 
+def reference(a) -> None:
+    ge = goal_eval.GoalEval(native.Native(a.device))
+    nat = ge.nat
+    with a.out.open("a") as fh:
+        for k in range(a.first, a.first + a.n):
+            task = f"text{k}"
+            f = a.teacher / f"{task}.json"
+            if not f.exists():
+                continue
+            ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
+            tx = ge.text(ids, targets, native.task_seed(task))
+            g, _ = goal_eval.circuit(json.loads(f.read_text()), targets, nat.C, tx.T)
+            graphs = {"teacher": native.Graph(sorted(g.node_set()), complete=True),
+                      "vpd_at_start": native.Graph(sorted(ge.start_set(tx, "search")["graph"].node_set()), complete=True),
+                      "vpd": native.Graph(masks=tx.vpd)}
+            got = agreement(ge, tx, list(graphs.values()), effects=[True, True, False])
+            for arm, r in zip(graphs, got):
+                fh.write(json.dumps({"set": "reference", "text": task, "circuit": arm, **r}) + "\n")
+                print(task, arm, json.dumps(r), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -147,12 +173,16 @@ def main():
     d.add_argument("--teacher", type=Path, required=True)
     d.add_argument("--first", type=int, default=9000)
     d.add_argument("--n", type=int, default=20)
-    for p in (t, c, d):
+    r = sub.add_parser("reference")
+    r.add_argument("--teacher", type=Path, required=True)
+    r.add_argument("--first", type=int, default=9000)
+    r.add_argument("--n", type=int, default=20)
+    for p in (t, c, d, r):
         p.add_argument("--out", type=Path, required=True)
         p.add_argument("--device", default=None)
     a = ap.parse_args()
     a.out.parent.mkdir(parents=True, exist_ok=True)
-    {"toys": toys, "causalgym": causalgym, "dev": dev}[a.cmd](a)
+    {"toys": toys, "causalgym": causalgym, "dev": dev, "reference": reference}[a.cmd](a)
 
 
 if __name__ == "__main__":

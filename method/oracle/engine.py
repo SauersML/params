@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import math
+from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
@@ -52,8 +53,21 @@ import carry
 import native
 
 PRECISIONS = ("score", "tf32", "bf16")
+TILED_KEPT = 4  # row counts whose tiled tables a plan keeps (_rows, repeat), least recently used dropped: a caller whose
+# batches take many sizes (the lead's line pruning, 10-13) otherwise keeps every size's tables and their own caches
 BLOCK = -1  # a block node's index (goal_eval.BLOCK): (site, position, BLOCK), the site's whole output there as one unit
 BK = "#block"  # a plan's table key for a site's blocks: site + BK (its readers and writers tables the same rows)
+
+
+def _kept(p: dict, name: str, key, make):
+    """p[name][key], made by make() when absent, the TILED_KEPT most recently used kept (with their own caches)."""
+    kept = p.setdefault(name, OrderedDict())
+    if key not in kept:
+        kept[key] = make()
+        while len(kept) > TILED_KEPT:
+            kept.popitem(last=False)
+    kept.move_to_end(key)
+    return kept[key]
 
 
 class Engine:
@@ -605,18 +619,14 @@ class Engine:
             if B != p["B"]:
                 raise ValueError(f"the plan has {p['B']} graphs, one per row, not {B}")
             return p
-        if B not in p.setdefault("tiled", {}):
-            p["tiled"][B] = self._tile(p, 1, B)
-        return p["tiled"][B]
+        return _kept(p, "tiled", B, lambda: self._tile(p, 1, B))
 
     def repeat(self, plan: dict, times: int) -> dict:
         """The plan of a list plan's graphs listed times over, rows d B + b its row b (kept on the plan): its tables
         tiled as _rows tiles a one-graph plan (no planning; for reuse over several changed texts at once)."""
         if plan["B"] is None:
             raise ValueError("repeat takes a list plan (a one-graph plan runs on any number of rows)")
-        if ("repeat", times) not in plan:
-            plan[("repeat", times)] = self._tile(plan, plan["B"], times)
-        return plan[("repeat", times)]
+        return _kept(plan, "repeats", times, lambda: self._tile(plan, plan["B"], times))
 
     def _tile(self, p: dict, B0: int, times: int) -> dict:
         """A plan's tables over B0 rows laid out times over (copy d's rows, row entries and strength indices after

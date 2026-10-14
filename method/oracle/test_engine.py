@@ -925,3 +925,30 @@ def test_block_units():
     assert float(carry.kl(ref, base)[0]) < 1e-5
     with pytest.raises(ValueError):
         eng.plan(g, semantics="native")
+
+
+def test_plans_keep_a_few_row_counts_tables():
+    """A one-graph plan run at many row counts (a caller's batches of every size: the lead's line pruning grew to 16
+    GiB in three minutes) keeps the tiled tables of TILED_KEPT counts, and a list plan's repeats as many: the tensors
+    alive stay flat over the calls."""
+    import gc
+
+    nat, ids, targets, graph, ew, ow, u = graph_case(B=1)
+    E = engine.Engine(nat, ids, targets, live=True)
+    plan, pair = E.plan(graph, semantics="c"), E.plan([graph, graph], semantics="c")
+
+    def run(B):
+        with torch.no_grad():
+            E.graph_log_probs(plan, {n: m.expand(B, -1, -1) for n, m in u.items()}, ew.expand(B, -1), ow.expand(B, -1))
+            E.graph_log_probs(E.repeat(pair, B), {n: m.expand(2 * B, -1, -1) for n, m in u.items()})
+
+    def alive():
+        gc.collect()
+        return sum(1 for o in gc.get_objects() if torch.is_tensor(o))
+    for B in range(1, 6):
+        run(B)
+    first = alive()
+    for B in range(6, 14):
+        run(B)
+        native.free(nat.dev)
+    assert len(plan["tiled"]) == len(pair["repeats"]) == engine.TILED_KEPT and alive() <= first

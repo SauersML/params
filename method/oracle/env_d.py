@@ -80,11 +80,11 @@ def task_of(task: str) -> dict:
     return json.loads((TEXTS / f"{task}.json").read_text())
 
 
-def score(reader, task: dict, ev: dict, facts: dict, texts: list[str]) -> list[dict]:
+def score(reader, task: dict, ev: dict, facts: dict, texts: list[str], circuit: bool = True) -> list[dict]:
     """Each answer's reward: E1 of its English read with the text's circuit (0 without English, which says nothing;
-    an answer is invalid only when the text has no events to ask)."""
+    an answer is invalid only when the text has no events to ask). circuit False: read without it (a probe)."""
     eng = [english_of(x) for x in texts]
-    e1 = components.e1_bits(reader, task, ev, [answer(facts["circuit"], e) for e in eng])
+    e1 = components.e1_bits(reader, task, ev, [answer(facts["circuit"] if circuit else "", e) for e in eng])
     return [{"reward": 0.0 if b is None else b, "e1": b, "valid": b is not None, "words": len(e.split()),
              "named": bool(NAMES.search(e))} for b, e in zip(e1, eng)]
 
@@ -220,7 +220,7 @@ def gate(a) -> None:
             if fe and r.get("position"):  # measured facts alone, and with their most important position swapped
                 names += ["facts", "facts_position"]
                 texts += [fe, facts_english(f, (r["position"]["position"], r["position"]["token"]))]
-            got = score(reader, task_of(t), rows[t], f, texts)
+            got = score(reader, task_of(t), rows[t], f, texts, circuit=not a.no_circuit)
             row = {"task": t, "e1": {k: s["e1"] for k, s in zip(names, got)}}
             out.append(row)
             fh.write(json.dumps(row) + "\n")
@@ -351,6 +351,7 @@ def main():
     g.add_argument("out", type=Path)
     g.add_argument("--reader", required=True)
     g.add_argument("--events", type=int, default=0, help="E1's events per text and circuit (default components.E1_EVENTS)")
+    g.add_argument("--no-circuit", action="store_true", help="the reader reads the English without the circuit (a probe)")
     q = sub.add_parser("questions")
     q.add_argument("facts", type=Path)
     q.add_argument("out", type=Path)

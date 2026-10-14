@@ -236,13 +236,13 @@ def write(a) -> None:
 
     with a.out.open("w") as fh:
         for f in facts:
+            prompt = components.writer_prompt(f) + (components.escape(GROUNDED) if a.grounded else "")
             if a.no_edits:
-                fh.write(json.dumps({"task": f["task"], "samples": [e for e in ask(components.writer_prompt(f), a.samples)
-                                                                     if e and not NAMES.search(e)]}) + "\n")
+                fh.write(json.dumps({"task": f["task"], "samples": [e for e in ask(prompt, a.samples) if e and not NAMES.search(e)],
+                                     "grounded": a.grounded}) + "\n")
                 fh.flush()
                 print(json.dumps({"task": f["task"], "usd": round(spend.total, 4)}), flush=True)
                 continue
-            prompt = components.writer_prompt(f) + (components.escape(GROUNDED) if a.grounded else "")
             correct = next((e for e in ask(prompt, a.samples) if e and not NAMES.search(e)), None)
             row = {"task": f["task"], "correct": correct, "position": None, "mechanism": None}
             wp = wrong_position(f, rows.get(f["task"], {}), native.task_seed(f["task"])) if correct else None

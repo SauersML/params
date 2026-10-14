@@ -10,6 +10,31 @@ import matched_graph_supervision as trial
 
 
 class PairedDataTest(unittest.TestCase):
+    def test_train35_full_batches_preserve_exact_epoch_visits(self):
+        from collections import Counter
+        batches=trial.full_batch_schedule(35)
+        self.assertEqual(len(batches),35)
+        self.assertTrue(all(len(batch)==8 for batch in batches))
+        flattened=[i for batch in batches for i in batch]
+        self.assertEqual(Counter(flattened),Counter({i:8 for i in range(35)}))
+        original=[i for b in trial.pilot.schedule(35,8,8,0) for i in b]
+        self.assertEqual(flattened,original)
+    def test_opt_in35_exact_order_and_evaluation_boundary(self):
+        rows,panel=self.rows(); old=[r['id'] for r in rows]
+        ids=old+['redundant_000','cancel_001','gate_000']+[
+            f'{f}_{3300000+100*i}' for i,f in enumerate(trial.FAMILIES)]
+        manifest={'schema':'paired_train35_v1','train_ids':ids,
+                  'evaluation_scope':'reused_original32_development'}
+        for ident in ids[len(rows):]:rows.append({**rows[0],'id':ident})
+        trial.validate_rows(rows,panel,train_manifest=manifest)
+        with self.assertRaises(ValueError):trial.validate_rows(rows,panel)
+        for key,value in [('schema','unknown'),('evaluation_scope','fresh_holdout'),
+                          ('train_ids',ids[:-1]+[panel[0]['id']])]:
+            changed={**manifest,key:value}
+            with self.assertRaises(ValueError):trial.validate_rows(rows,panel,train_manifest=changed)
+        train_only={**manifest,'evaluation_scope':'train_only_pending_fresh340'}
+        trial.validate_rows(rows,[],train_manifest=train_only)
+        with self.assertRaises(ValueError):trial.validate_rows(rows,panel,train_manifest=train_only)
     def test_cost_covers_both_training_arms_and_all_first_responses(self):
         contract = {"train_tokens_per_arm": {"point": 100, "intervention": 200},
                     "panel": [{"prompt_tokens": 10}] * 32, "output_cap": 416}

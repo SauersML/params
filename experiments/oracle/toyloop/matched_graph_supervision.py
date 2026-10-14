@@ -134,13 +134,26 @@ def graph_only(text):
         raise ValueError("complete graph-only target required; no stripping or repair")
 
 
-def validate_rows(train, panel):
+def validate_rows(train, panel, *, train_manifest=None):
     train_ids, evaluation_ids = expected_ids()
+    if train_manifest is not None:
+        expected = train_ids + ['redundant_000', 'cancel_001', 'gate_000'] + [
+            f'{family}_{3300000+100*i}' for i, family in enumerate(FAMILIES)]
+        if (set(train_manifest) != {'schema', 'train_ids', 'evaluation_scope'}
+                or train_manifest['schema'] != 'paired_train35_v1'
+                or train_manifest['train_ids'] != expected
+                or train_manifest['evaluation_scope'] not in (
+                    'reused_original32_development', 'train_only_pending_fresh340')):
+            raise ValueError('exact TRAIN35 manifest and reused evaluation scope required')
+        train_ids = expected
+    train_only = train_manifest is not None and train_manifest['evaluation_scope'] == 'train_only_pending_fresh340'
     if [r["id"] for r in train] != train_ids:
         raise ValueError("all 24 predeclared TRAIN rows required in fixed order")
     fresh = [r for r in panel if r["stratum"] == "new_model"]
     retention = [r for r in panel if r["stratum"] == "retention"]
-    if ([r["id"] for r in fresh] != evaluation_ids or len(retention) != 24 or
+    if train_only and panel:
+        raise ValueError('train-only preparation cannot contain evaluation rows')
+    if not train_only and ([r["id"] for r in fresh] != evaluation_ids or len(retention) != 24 or
             len(panel) != 32 or len({(r["stratum"], r["id"]) for r in panel}) != 32):
         raise ValueError("eight new models plus all 24 retention cases required")
     for row in [*train, *panel]:
@@ -183,9 +196,21 @@ def equal_row_mass(datums):
     return output, {"original_mass": masses, "target_mass": target, "stored_mass": normalized}
 
 
-def prepare(train, panel, tokenizer_path):
+def full_batch_schedule(count):
+    """Keep shuffled epoch visits, carrying short tails across epoch boundaries."""
+    visits = [i for batch in pilot.schedule(count, EPOCHS, BATCH, SEED) for i in batch]
+    if len(visits) % BATCH:
+        raise ValueError('flattened full-batch schedule required')
+    return [visits[i:i+BATCH] for i in range(0, len(visits), BATCH)]
+
+
+def prepare(train, panel, tokenizer_path, *, train_manifest=None, common_init_receipt_sha256=None):
     """Render all rows without truncation; caller stores the resulting contract."""
-    validate_rows(train, panel)
+    validate_rows(train, panel, train_manifest=train_manifest)
+    train_only = train_manifest is not None and train_manifest['evaluation_scope'] == 'train_only_pending_fresh340'
+    if train_only and (not isinstance(common_init_receipt_sha256, str)
+                       or re.fullmatch('[0-9a-f]{64}', common_init_receipt_sha256) is None):
+        raise ValueError('common saved initialization receipt SHA required')
     rr, tok = pilot.renderer(tokenizer_path)
     data = {arm: [] for arm in ARMS}
     stats = []
@@ -207,6 +232,8 @@ def prepare(train, panel, tokenizer_path):
     if any(p.length + OUTPUT_CAP + 16 > CONTEXT for p in prompts):
         raise ValueError("complete evaluation prompt does not fit")
     batches = pilot.schedule(len(train), EPOCHS, BATCH, SEED)
+    if train_only:
+        batches = full_batch_schedule(len(train))
     train_tokens = {arm: sum(data[arm][i].model_input.length for batch in batches for i in batch)
                     for arm in ARMS}
     contract = {"model": pilot.MODEL, "project": pilot.PROJECT, "train_sha256": digest(train),
@@ -219,5 +246,13 @@ def prepare(train, panel, tokenizer_path):
                 "panel": [{"id": r["id"], "stratum": r["stratum"], "prompt_tokens": p.length,
                            "rendered_sha256": digest(p.to_ints())} for r, p in zip(panel, prompts)],
                 "scope": "paired token-fit preflight only; physical proof and paid reservation remain separate"}
+    if train_manifest is not None:
+        contract['training_manifest'] = train_manifest
+        contract['training_manifest_sha256'] = digest(train_manifest)
+    if train_only:
+        contract['recipe']['initialization']['common_init_receipt_sha256'] = common_init_receipt_sha256
+        contract['recipe']['initialization']['mode'] = 'restore_exact_saved_common_state'
+        contract['recipe']['evaluation_arms'] = []
+        contract['schedule_scope'] = '8 independently shuffled epochs flattened into280visits/35fullbatch8 updates'
     return {"contract": contract, "data": data, "prompts": prompts, "batches": batches,
             "renderer": rr, "tokenizer": tok}

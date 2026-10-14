@@ -7,7 +7,7 @@ Lines: those lines.LinePruner wires (every connection the model has among the pa
 the token edges and the target token), in C's semantics on one engine plan.
   (1) Rank. Each connection and prediction write by its integrated gradient: the point KL's gradient with respect to
       its strength at ALPHAS strengths evenly inside (0, 1), every line at the same strength, averaged (one batched
-      backward pass; they add up to the KL every line saves). A line's score is the KL it saves.
+      backward pass; this finite midpoint quadrature approximates the total KL saved, not an exact identity).
   (2) Keep. The top k lines for k on a log scale (every token edge and the target token beside them), each set's parts
       without a stated path to the prediction dropped (goal_eval.strand), measured: the point KL of every set in one
       batch, then the path-patched families in turn on the smallest sets still in. The stage keeps the smallest set
@@ -87,8 +87,12 @@ class Connector:
         reuse = (pr.E.tile_states(pr.states, ALPHAS), tx.ids, pr.lo) if pr.lo else None
         carry.kl(tx.ref, pr.E.graph_log_probs(pr.plan, ew=ew, ow=ow, reuse=reuse)).sum().backward()
         out = torch.zeros(len(pr.lines))
-        out[pr.e_line] = -ew.grad.mean(0).cpu()
-        out[pr.o_line] = -ow.grad.mean(0).cpu()
+        # A valid single-writer graph may have no inter-unit edges. Its empty
+        # strength tensor is unused, so autograd correctly leaves grad=None.
+        if ew.numel():
+            out[pr.e_line] = -ew.grad.mean(0).cpu()
+        if ow.numel():
+            out[pr.o_line] = -ow.grad.mean(0).cpu()
         native.free(dev)
         return out
 

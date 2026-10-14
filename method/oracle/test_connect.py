@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -59,3 +60,34 @@ def test_connect_interface(tiny):
     nat, ge, tx = tiny
     g = connect.connect(ge, tx, connect.native.Graph(nodes_of(nat, tx, 7, 14), complete=True), floors=TINY)
     assert not g.complete and g.connect["parts"] == len(g.node_set())
+def test_scores_with_output_but_no_interunit_edges(monkeypatch):
+    """Actual autograd: an unused empty ew has no gradient; ow still ranks."""
+    class OutputOnlyEngine:
+        def graph_log_probs(self, plan, *, ew, ow, reuse):
+            assert ew.shape == (connect.ALPHAS, 0)
+            logits=torch.stack([ow[:,0],torch.zeros_like(ow[:,0])],dim=-1)
+            return logits.log_softmax(-1)[:,None,:]
+    c=object.__new__(connect.Connector)
+    c.ge=SimpleNamespace(nat=SimpleNamespace(dev='cpu'))
+    c.tx=SimpleNamespace(ref=torch.tensor([[[.8,.2]]]).log())
+    c.pr=SimpleNamespace(E=OutputOnlyEngine(),plan={},lo=0,e_ends=[],o_ends=['writer'],
+                         lines=[('o','writer')],e_line=torch.empty(0,dtype=torch.long),
+                         o_line=torch.tensor([0]))
+    monkeypatch.setattr(connect.native,'free',lambda *_:None)
+    scores=c.scores()
+    assert scores.shape==(1,) and torch.isfinite(scores).all() and scores[0]>0
+
+
+def test_nonempty_disconnected_gradient_still_fails(monkeypatch):
+    class MissingEdgeGradient:
+        def graph_log_probs(self, plan, *, ew, ow, reuse):
+            logits=torch.stack([ow[:,0],torch.zeros_like(ow[:,0])],dim=-1)
+            return logits.log_softmax(-1)[:,None,:]
+    c=object.__new__(connect.Connector)
+    c.ge=SimpleNamespace(nat=SimpleNamespace(dev='cpu'))
+    c.tx=SimpleNamespace(ref=torch.tensor([[[.8,.2]]]).log())
+    c.pr=SimpleNamespace(E=MissingEdgeGradient(),plan={},lo=0,e_ends=['edge'],o_ends=['writer'],
+                         lines=[('e','edge'),('o','writer')],e_line=torch.tensor([0]),o_line=torch.tensor([1]))
+    monkeypatch.setattr(connect.native,'free',lambda *_:None)
+    with pytest.raises(AttributeError,match='mean'):
+        c.scores()

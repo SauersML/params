@@ -64,6 +64,22 @@ texts per split.
    names about half of each circuit's units, but its circuits do not execute. Short RL runs, with groups of 4 on a
    135M model, did not change either arm much on zoo v2.
 
+## Weight reading on zoo v2: what helped (40 texts per split, reward_exec v3; the truth scores 0.83-0.86)
+
+| weights-only oracle (SmolLM2-135M) | unit F1 train/inst/family | reward train/inst/family |
+|---|---|---|
+| plain weights prompt, v2 SFT only | 0.48/0.52/0.47 | about 0 |
+| + v1-then-v2 curriculum | 0.44/0.57/0.57 | 0.02/0.14/0.13 |
+| + curriculum + RL (k 6, std) | flat in training | not evaluated |
+| detailed weight render (`TOYLOOP_WEIGHTS_DETAIL=1`), curriculum | 0.64/0.65/0.65 | 0.22/0.27/0.24 |
+| detailed render + ground-truth reasoning trace (`TOYLOOP_TRACE=1`) | 0.56/0.65/0.69 | 0.14/0.31/0.26 |
+| no-LM rule reading the same detailed prompt (`weights_heuristic2`) | 1.00 | equal to the truth |
+
+The information is in the prompt: a rule that parses it recovers every circuit. The 135M oracle captures only part
+of it. The render, which states facts the oracle would otherwise have to compute (gate tokens, complete in-links,
+neuron biases, centred token reads), helped more than the reasoning trace. Next: a larger oracle, and RL from the
+detailed-render checkpoint.
+
 ## Open, in order of expected value
 
 - Weight reading. Give the oracle more capacity (360M, LoRA) or a staged curriculum (zoo v1, then v2). Score

@@ -1783,7 +1783,94 @@ def assoc_prefs():
     print("wrote", OUT / "assoc_sets.json")
 
 
+def edit_compare(rows: str):
+    """Decision test 2's result from a persistent_e3 edit run with assoc_ft and circuit_ft (rows: its fit.jsonl): per
+    preference on the score third, removal (flipped), goal bits, controls kept and KL per token on the rows' other
+    positions and on held Pile text; means and paired differences (association-picked minus circuit-picked) with 95%
+    bootstrap intervals over preferences -> OUT/edit_compare.json."""
+    rs = [json.loads(x) for x in Path(rows).read_text().splitlines() if x.strip()]
+    keys = ("flipped", "goal_bits", "controls_kept", "text_kl_per_token", "pile_kl_per_token")
+    both = [r_ for r_ in rs if r_["methods"].get("assoc_ft") and r_["methods"].get("circuit_ft")]
+    out = {"preferences": len(both)}
+    rng = np.random.default_rng(2951)
+    for k in keys:
+        a_ = np.array([r_["methods"]["assoc_ft"]["score"][k] or 0.0 for r_ in both], float)
+        c_ = np.array([r_["methods"]["circuit_ft"]["score"][k] or 0.0 for r_ in both], float)
+        d_ = a_ - c_
+        bs = d_[rng.integers(len(d_), size=(4000, len(d_)))].mean(1)
+        out[k] = {"assoc_ft": float(a_.mean()), "circuit_ft": float(c_.mean()), "difference": float(d_.mean()),
+                  "lo": float(np.percentile(bs, 2.5)), "hi": float(np.percentile(bs, 97.5)), "assoc better": int((d_ < 0).sum() if "kl" in k else (d_ > 0).sum())}
+        print(f"{k:20s} association-picked {a_.mean():.4g}, circuit-picked {c_.mean():.4g}, difference {d_.mean():+.4g} "
+              f"[{np.percentile(bs, 2.5):+.4g}, {np.percentile(bs, 97.5):+.4g}] over {len(d_)} preferences")
+    (OUT / "edit_compare.json").write_text(json.dumps(out, indent=1))
+    print("wrote", OUT / "edit_compare.json")
+
+
 FIG = Path("/Users/user/mpd-data/figures/oracle")
+SHOW = {"next token (VPD's gate reads it)": "next token", "preferences (rustmove's)": "edit-goal token pairs (b after a)",
+        "model behaviour: predicted token kind": "kind of token the model predicts", "model behaviour: confidence and loss": "the model's confidence and loss",
+        "model behaviour: copying": "the model copies an earlier token", "measured mechanism (interventions)": "measured mechanism (copy, bigram, far context)",
+        "training-data frequency (Pile n-grams)": "frequency of the last 4 tokens in the Pile", "document domain (Pile subset)": "document domain (Pile subset)"}
+
+
+def _show(f: str) -> str:
+    """A family's name in a figure."""
+    return SHOW.get(f, f)
+
+
+def _label(off: dict):
+    sites = sorted(off, key=off.get)
+    starts = np.array([off[n] for n in sites])
+
+    def lab(c):
+        i = int(np.searchsorted(starts, c, "right")) - 1
+        n = sites[i]
+        return f"L{n.split('.')[1]} {n.split('.')[-1].replace('_proj', '').replace('c_fc', 'fc')} #{c - starts[i]}"
+
+    return lab
+
+
+def figure_counts(r_min: float = 0.1, examples: tuple = (("fine part-of-speech tag", "tag EX", "existential “there”"),
+                                                        ("kind of token the model predicts", "the model's top token closes a bracket", "the model predicts a closing bracket"),
+                                                        ("document domain (Pile subset)", "document from the Pile's DM Mathematics", "DM Mathematics documents"))):
+    """Per phenotype family, the number of subcomponents with a strong hit (calibrated q < 0.05 and |partial r| >=
+    r_min), with three example subcomponents labelled by their strongest phenotype -> FIG/gwas_family_counts.png."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    import figure as fg
+
+    A = np.load(OUT / "assoc.npz")
+    r, q = A["r"], _q(A)
+    names = json.loads(str(A["names"]))
+    fams = [_show(f) for f in json.loads(str(A["families"]))]
+    lab = _label(json.loads(str(A["offsets"])))
+    hit = (q < 0.05) & (np.abs(r) >= r_min)
+    fl = sorted(set(fams), key=lambda f: hit[:, [j for j, x in enumerate(fams) if x == f]].any(1).sum())
+    cnt = [int(hit[:, [j for j, x in enumerate(fams) if x == f]].any(1).sum()) for f in fl]
+    fg.setup()
+    fig, ax = plt.subplots(figsize=(15, 13))
+    y = np.arange(len(fl))
+    ax.barh(y, cnt, color=fg.BLUE, height=0.7)
+    for yi, c in zip(y, cnt):
+        ax.text(c + 40, yi, f"{c:,}", va="center", fontsize=12)
+    ax.set_yticks(y, fl, fontsize=13)
+    ax.set_xlabel(f"subcomponents with |partial r| >= {r_min} at q < 0.05 (of {int(np.isfinite(A['z']).any(1).sum()):,} tested)")
+    for fam, ph, text in examples:  # written inside the family's bar
+        if ph not in names or fam not in fl:
+            continue
+        j = names.index(ph)
+        c = int(np.nanargmax(np.where(hit[:, j], np.abs(r[:, j]), 0)))
+        yi = fl.index(fam)
+        ax.text(max(cnt) * 0.01, yi, f"{lab(c)}: {text} (partial r = {r[c, j]:+.2f})", va="center", fontsize=12, color="white")
+    fg.clean(ax)
+    ax.set_title("Subcomponents associated with each phenotype family")
+    fig.tight_layout()
+    out = FIG / "gwas_family_counts.png"
+    fig.savefig(out, dpi=150)
+    print("wrote", out)
 
 
 def figure(r_min: float = 0.1):
@@ -1816,7 +1903,7 @@ def figure(r_min: float = 0.1):
     fg.setup()
     fig, ax = plt.subplots(figsize=(18, 0.42 * len(fl) + 3))
     im = ax.imshow(M[order], aspect="auto", cmap="Blues", vmin=0, vmax=max(0.05, float(np.nanpercentile(M, 99))))
-    ax.set_yticks(range(len(fl)), [fl[i] for i in order], fontsize=13)
+    ax.set_yticks(range(len(fl)), [_show(fl[i]) for i in order], fontsize=13)
     ax.set_xticks(range(len(sites)), [f"L{n.split('.')[1]} {n.split('.')[-1].replace('_proj', '').replace('c_fc', 'fc')}" for n in sites],
                   rotation=60, ha="right", fontsize=12)
     cb = fig.colorbar(im, ax=ax, fraction=0.025)
@@ -1882,11 +1969,13 @@ def figure_causal():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "annotate", "domain", "ngram", "export", "mech", "attention", "pheno", "assoc",
-                                    "calib", "nullscan", "calibrate", "table", "figure", "figure_causal", "conditional", "causal_plan", "causal", "probe",
-                                    "assoc_prefs"))
+                                    "calib", "nullscan", "calibrate", "table", "figure", "figure_causal", "figure_counts", "conditional", "causal_plan", "causal", "probe",
+                                    "assoc_prefs", "edit_compare"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     if a.cmd in ("extract", "mech"):
         globals()[a.cmd](*(int(x) for x in a.args))
+    elif a.cmd == "edit_compare":
+        edit_compare(*a.args)
     else:
         globals()[a.cmd]()

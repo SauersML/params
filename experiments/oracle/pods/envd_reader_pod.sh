@@ -42,9 +42,10 @@ COPYFILE_DISABLE=1 tar -cf "$IN.tar" -C "$IN" . && rm -rf "$IN"
 CMD="ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle/texts; tar -xf $IN.tar -C $I; \
 mv $I/vpd4l ~/mpd-data/graph_oracle/texts/; tar -xf $S.tar -C $S; ls /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json > /dev/null; \
 nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.csv 2>&1 & \
-python -m vllm.entrypoints.openai.api_server --model $MODEL --port 8100 --max-model-len 24576 --gpu-memory-utilization 0.9 \
-  --enable-prefix-caching > $O/vllm.log 2>&1 & \
-until python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/v1/models')\" 2> /dev/null; do sleep 10; done; \
+python -m vllm.entrypoints.openai.api_server --model $MODEL --port 8100 --max-model-len 20480 --gpu-memory-utilization 0.92 \
+  --enable-prefix-caching > $O/vllm.log 2>&1 & V=\$!; \
+until python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/v1/models')\" 2> /dev/null; do \
+  kill -0 \$V 2> /dev/null || { tail -5 $O/vllm.log; exit 1; }; sleep 10; done; \
 echo reader up; R='http://127.0.0.1:8100/v1/completions|$MODEL'; cd $S && $RUNCMD"
 RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-200} RP_OWNER=${RP_OWNER:-inframove} RP_PARALLEL=1 RP_PYENV=oracle \
   RP_HF_MODELS="$MODEL" RP_MAX_PRICE=${PRICE:-1.0} RP_MIN_VRAM_GB=${VRAM:-44} \

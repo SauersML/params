@@ -6,7 +6,9 @@ paired difference against EAP-IG-inputs on the same test prompts (MIB's code, pe
 
 Inputs, any mix:
   ROWS.jsonl     one prompt a line: {"text": k (its place in MIB's test split), "mib_edges": [MIB edge names]}
-                 (ib_teacher.py's rows_<offset>.jsonl), for builders that name MIB edges themselves;
+                 (ib_teacher.py's rows_<offset>.jsonl), for builders that name MIB edges themselves, or
+                 {"text": k, "mib_nodes": [MIB components: "a<L>.h<H>", "m<L>"]} for builders in heads and MLPs: every
+                 graph edge between two of them (the input and the logits always in) counts as held;
   DIR            circuit files DIR/<case>_<k>.json (teacher format: "nodes" [site, component, position] in the VPD fit's
                  subcomponents), turned into MIB edges with interpbench.mib_edges on --fit, the k-th test prompt padded
                  with EOS to --pad and its target at its last real token, as ib_teacher.py runs them.
@@ -53,6 +55,13 @@ def score(reference: dict, T: np.ndarray, x: np.ndarray | None, B: int = 1000, s
     return out
 
 
+def edges_of_nodes(nodes, edges: list[str]) -> list[str]:
+    """The graph edges whose two ends are among MIB components nodes (the input and the logits always in): "a0.h1->m1",
+    "input->a1.h0<q>" (a head's query, key or value input belongs to the head)."""
+    keep = set(nodes) | {"input", "logits"}
+    return [e for e in edges if all(re.sub(r"<[qkv]>$", "", x) in keep for x in e.split("->"))]
+
+
 def rows_of_dir(d: Path, nat, pad: int) -> list[dict]:
     """MIB edges of the circuit files in d, one row per test prompt k (<case>_<k>.json)."""
     texts = interpbench.mib_ioi("test")
@@ -89,7 +98,12 @@ def main():
                 nat = interpbench.native_of_fit(sd, cfg, torch.load(a.fit, map_location="cpu", weights_only=True))
             rows += rows_of_dir(p, nat, a.pad)
         else:
-            rows += [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
+            for line in p.read_text().splitlines():
+                if line.strip():
+                    r = json.loads(line)
+                    if "mib_edges" not in r:
+                        r["mib_edges"] = edges_of_nodes(r["mib_nodes"], edges)
+                    rows.append(r)
     rows = sorted({r["text"]: r for r in rows}.values(), key=lambda r: r["text"])
     texts = [r["text"] for r in rows]
     T = np.array([[e in set(r["mib_edges"]) for e in edges] for r in rows], dtype=np.float64)

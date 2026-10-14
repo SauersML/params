@@ -221,3 +221,14 @@ def test_mib_score_paired():
     out = mib_score.score(ref, T, x, B=50)
     assert out["prompts"] == 8 and out["edges_per_prompt"] == 3.0 and out["plain_auroc"] == 1.0
     assert out["auroc"] > out["eap_ig_inputs"]["auroc"] and out["diff_vs_eap_ig_inputs"]["ci95"][0] > 0
+
+
+def test_mib_score_nodes():
+    """A builder in heads and MLPs: its components hold every graph edge between them, the input and the logits always
+    in; a head's query, key and value inputs belong to the head."""
+    import mib_score
+
+    edges = interpbench.mib_graph_edges({"n_layers": 2, "n_heads": 2, "parallel_attn_mlp": False})
+    got = set(mib_score.edges_of_nodes(["a1.h1", "m0"], edges))
+    assert {"input->m0", "m0->a1.h1<v>", "a1.h1->logits", "input->a1.h1<q>", "m0->logits"} <= got
+    assert not any("a0." in e or "m1" in e or "a1.h0" in e for e in got)

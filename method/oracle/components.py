@@ -2632,6 +2632,136 @@ def _fact_digest(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',', ':'),allow_nan=False).encode()).hexdigest()
 
 
+NATIVE_INTERPRETER_MAX_UNITS = 128
+NATIVE_INTERPRETER_MAX_EDGES = 1024
+NATIVE_INTERPRETER_MAX_BYTES = 65536
+
+
+def _native_topology(graph, dimensions, targets, length):
+    """Validate native addresses/slots only; never invent VPD component IDs."""
+    if not isinstance(graph,dict) or set(graph)!={'units','edges','out'}:
+        raise ValueError('native graph requires units, edges and out')
+    units, edges, outputs = graph['units'], graph['edges'], graph['out']
+    if not all(isinstance(x,list) for x in (units,edges,outputs)) or len(units)>NATIVE_INTERPRETER_MAX_UNITS or len(edges)>NATIVE_INTERPRETER_MAX_EDGES or len(outputs)>len(units):
+        raise ValueError('native interpreter graph too large; no topology truncation permitted')
+    for u in units:
+        if (not isinstance(u,(list,tuple)) or len(u)!=4 or u[0] not in ('head','neuron')
+                or any(type(x) is not int for x in u[1:]) or not 0<=u[1]<dimensions['layers']
+                or not 0<=u[2]<length or not 0<=u[3]<dimensions['heads' if u[0]=='head' else 'neurons']):
+            raise ValueError('invalid native unit address')
+    nodes={tuple(u) for u in units}
+    if len(nodes)!=len(units):raise ValueError('duplicate native unit')
+    seen=set()
+    for edge in edges:
+        if not isinstance(edge,(list,tuple)) or len(edge)!=3:raise ValueError('invalid native edge')
+        w,r,slot=edge;w,r=tuple(w),tuple(r)
+        if w not in nodes or r not in nodes or not (w[1]<r[1] or (w[1]==r[1] and w[0]=='head' and r[0]=='neuron')):
+            raise ValueError('native edge outside architecture or supplied units')
+        if (r[0]=='neuron' and (slot!='in' or w[2]!=r[2])) or (r[0]=='head' and (slot not in ('q','k','v') or (w[2]!=r[2] if slot=='q' else w[2]>r[2]))):
+            raise ValueError('invalid native reader slot or causal position')
+        key=(w,r,slot)
+        if key in seen:raise ValueError('duplicate native edge')
+        seen.add(key)
+    if len({tuple(u) for u in outputs})!=len(outputs) or any(tuple(u) not in nodes or u[2] not in targets for u in outputs):
+        raise ValueError('invalid native prediction write')
+    canonical=json.dumps(graph,sort_keys=True,indent=2,allow_nan=False)
+    if len(canonical.encode())>NATIVE_INTERPRETER_MAX_BYTES:raise ValueError('native topology byte bound exceeded')
+    return canonical
+
+
+def native_teacher_facts(task, graph, means, mean_metadata):
+    """Source-only bridge for already-small connect.NativeGraph mean-ablation circuits.
+
+    Does not execute, score, select units, retrieve weights or certify a mechanism.
+    The frozen means are hashed as FP32 values, matching NativeLines' execution.
+    """
+    import numpy as np
+    if (not isinstance(getattr(graph,'units',None),list) or len(graph.units)>NATIVE_INTERPRETER_MAX_UNITS
+            or not isinstance(getattr(graph,'parents',None),dict) or len(graph.parents)>NATIVE_INTERPRETER_MAX_UNITS
+            or sum(len(ws) for ws in graph.parents.values())>NATIVE_INTERPRETER_MAX_EDGES
+            or not isinstance(getattr(graph,'out',None),list) or len(graph.out)>len(graph.units)):
+        raise ValueError('native interpreter requires an already-small NativeGraph; no topology truncation')
+    if not isinstance(mean_metadata,dict) or not mean_metadata:raise ValueError('frozen mean provenance required')
+    frozen={}
+    for key in ('heads','neurons'):
+        value=means[key]
+        if hasattr(value,'detach'):value=value.detach().cpu().float().numpy()
+        value=np.asarray(value,dtype='float32')
+        if not np.isfinite(value).all():raise ValueError('finite native means required')
+        frozen[key]={'shape':list(value.shape),'dtype':'float32','values':value.tolist()}
+    hs,ns=frozen['heads']['shape'],frozen['neurons']['shape']
+    if len(hs)!=3 or len(ns)!=2 or hs[0]!=ns[0] or any(x<=0 for x in hs+ns):raise ValueError('native mean shape mismatch')
+    dimensions={'layers':hs[0],'heads':hs[1],'head_width':hs[2],'neurons':ns[1]}
+    prompt=task['prompts'][0];ids,targets=prompt['token_ids'],prompt['target_positions']
+    raw=json.loads(json.dumps(graph.to_json(),allow_nan=False))
+    _native_topology(raw,dimensions,targets,max(targets)+1)
+    strings=token_strings(task['model'],ids);text=''.join(strings[:max(targets)+1])
+    provenance=json.loads(json.dumps(mean_metadata,allow_nan=False))
+    mean_sha=_fact_digest(frozen); provenance_sha=_fact_digest(provenance)
+    canonical=_native_canonical(raw,dimensions,mean_sha,provenance_sha)
+    binding={'schema':1,'kind':'native_mean','task':task['id'],'model_identifier':task['model'],
+             'target_positions':list(targets),'input_sha256':_fact_digest({'token_ids':ids,'target_positions':targets}),
+             'text_sha256':hashlib.sha256(text.encode()).hexdigest(),'graph_sha256':_fact_digest(raw),
+             'circuit_sha256':hashlib.sha256(canonical.encode()).hexdigest(),'dimensions':dimensions,
+             'mean_fp32_content_sha256':mean_sha,'mean_provenance':provenance,
+             'mean_provenance_sha256':provenance_sha,'execution_verified':False,
+             'semantics':'native_mean_ablation_live_embedding_norms_attention',
+             'model_content_binding':'identifier only; exact model assets not certified'}
+    return {'task':task['id'],'model':task['model'],'text':text,'target':max(targets),'target_token':strings[max(targets)],
+            'top':prompt['model_top'][0][:3],'circuit_kind':'native_mean','circuit':canonical,'native_graph':raw,
+            'provided_circuit_binding':binding,'nodes_total':len(raw['units'])}
+
+
+def _native_canonical(graph,dimensions,mean_sha,provenance_sha):
+    """Self-contained reader context: topology alone does not specify mean ablation."""
+    result=json.dumps({'unit_schema':['head|neuron','zero_based_layer','token_position','native_index'],
+        'dimensions':dimensions,'background':{'semantics':'native_mean_ablation_live_embedding_norms_attention',
+            'outside_units':'frozen reference-text means','cut_writers':'frozen reference-text means',
+            'mean_fp32_content_sha256':mean_sha,'mean_provenance_sha256':provenance_sha,
+            'execution_verified':False,'model_assets_verified':False},'graph':graph},sort_keys=True,indent=2,allow_nan=False)
+    if len(escape(result).encode())>NATIVE_INTERPRETER_MAX_BYTES:raise ValueError('native circuit byte bound exceeded; no truncation')
+    return result
+
+
+def _native_circuit_prompt(f, source_task=None):
+    b=f.get('provided_circuit_binding')
+    if not isinstance(b,dict) or b.get('kind')!='native_mean' or b.get('schema')!=1 or b.get('execution_verified') is not False:
+        raise ValueError('native supplied circuit binding required')
+    targets=b.get('target_positions')
+    if not isinstance(targets,list) or not targets or any(type(t) is not int or t<0 for t in targets):raise ValueError('invalid native targets')
+    for key in ('input_sha256','mean_fp32_content_sha256'):
+        if not isinstance(b.get(key),str) or not re.fullmatch('[0-9a-f]{64}',b[key]):raise ValueError('native source digest required')
+    _native_topology(f['native_graph'],b['dimensions'],targets,max(targets)+1)
+    canonical=_native_canonical(f['native_graph'],b['dimensions'],b['mean_fp32_content_sha256'],b['mean_provenance_sha256'])
+    if (f.get('circuit')!=canonical or b.get('circuit_sha256')!=hashlib.sha256(canonical.encode()).hexdigest()
+            or b.get('graph_sha256')!=_fact_digest(f['native_graph']) or b.get('task')!=f['task']
+            or b.get('model_identifier')!=f['model'] or max(targets)!=f['target']
+            or b.get('text_sha256')!=hashlib.sha256(f['text'].encode()).hexdigest()
+            or b.get('mean_provenance_sha256')!=_fact_digest(b.get('mean_provenance'))
+            or b.get('semantics')!='native_mean_ablation_live_embedding_norms_attention'):
+        raise ValueError('native source binding mismatch')
+    if source_task is not None:
+        p=source_task['prompts'][0]
+        if (source_task['id']!=f['task'] or source_task['model']!=f['model'] or p['target_positions']!=targets
+                or _fact_digest({'token_ids':p['token_ids'],'target_positions':p['target_positions']})!=b['input_sha256']
+                or p['model_top'][0][:3]!=f['top']):raise ValueError('native binding disagrees with source task')
+    result=('Interpret this PROVIDED NATIVE CIRCUIT; output EXPLANATION only, never a replacement graph. '
+            'Units are zero-based [head|neuron, layer, token position, native index], NOT VPD rank-one components. '
+            'Edges [writer, reader, slot] feed a head query/key/value (q/k/v) or neuron input (in); out lists prediction writers. '
+            'Background convention: every unit outside the circuit outputs its frozen reference-text mean; a cut writer remains at its mean. '
+            'Embeddings, normalization and attention are live. Means are bound by FP32-content and producer-provenance digests, '
+            'not zeroed and not new measured activations. The model identifier does not certify exact model assets. '
+            'This source-only payload has NOT executed or established fidelity of this circuit. Native unit IDs do not establish functional meanings. '
+            'The displayed next-token predictions are FULL MODEL facts, not verified circuit outcomes. '
+            'Describe topology and limitations; unsupported mechanistic/linguistic claims are hypotheses, not checked facts. '
+            'No free-prose or typed-claim truth certificate is supplied. Input identity is a producer assertion unless checked against the source task.\n'
+            'SOURCE BINDING\n'+json.dumps(b,sort_keys=True)+'\nText: '+repr(f['text'])+'\nFull-model next tokens: '+json.dumps(f['top'])+
+            '\nCOMPLETE PROVIDED NATIVE GRAPH\n'+canonical)
+    result=escape(result)
+    if len(result.encode())>NATIVE_INTERPRETER_MAX_BYTES:raise ValueError('native interpreter prompt byte bound exceeded; no truncation')
+    return result
+
+
 def _provided_circuit_prompt(f: dict, source_task: dict | None = None) -> str:
     """Validate source-bound supplied topology; no execution or model-content claim."""
     circuit, binding = f.get("circuit"), f.get("provided_circuit_binding")
@@ -2673,6 +2803,9 @@ def writer_prompt(f: dict, *, provided_circuit: bool = False, source_task: dict 
     """The prompt that asks an open model for a teacher circuit's English, from teacher_facts(); with the teacher's
     variables, their meanings first (WRITER_VARIABLES, written_variables()). provided_circuit includes the entire
     source-bound topology; source_task independently checks its input identity when supplied."""
+    if f.get('circuit_kind')=='native_mean':
+        if not provided_circuit:raise ValueError('native interpreter facts require explicit provided_circuit mode')
+        return _native_circuit_prompt(f,source_task)
     supplied = _provided_circuit_prompt(f, source_task) if provided_circuit else ""
     lines = [f"Text: {f['text']!r}", f"Prediction at position {f['target']} (after {f['target_token']!r}): "
              + ", ".join(f"{t!r} {p:.2f}" for t, p in f["top"]),

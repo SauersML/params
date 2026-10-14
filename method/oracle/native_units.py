@@ -122,6 +122,10 @@ class NativeUnits:
 
     @torch.no_grad()
     def _forward(self, base: Mask, removals: list[list[tuple]], s: int, keep: bool = False) -> torch.Tensor:
+        return self._forward_impl(base, removals, s, keep=keep)
+
+    def _forward_impl(self, base: Mask, removals: list[list[tuple]], s: int, keep: bool = False,
+                      strengths: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
         """log q at the targets [len(removals), len(targets), V]: each row the base set without its removals (at
         positions >= s). It computes the positions from s on that hold base units, and the targets: a position holding
         none keeps its embedding through every layer, so its keys and values, and those before s, are the base run's
@@ -166,28 +170,78 @@ class NativeUnits:
             rot = lambda y: y * cos + torch.cat([-y[..., hd // 2:], y[..., :hd // 2]], -1) * sin  # noqa: E731
             q, k = rot(q), rot(k)
             if keep:
-                kept.append((k[:1], v[:1]))
+                if strengths is None:
+                    kept.append((k[:1], v[:1]))
             else:
                 kk, vv = cache[i][0].expand(B, -1, -1, -1).clone(), cache[i][1].expand(B, -1, -1, -1).clone()
                 kk[:, :, comp], vv[:, :, comp] = k, v
                 k, v = kk, vv
             P = ((q @ k.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)
-            hm = base.heads[i, comp].T[None].expand(B, -1, -1).float().clone()  # [B, H, n]
+            hm = (base.heads if strengths is None else strengths[0])[i, comp].T[None].expand(B, -1, -1).float().clone()  # [B, H, n]
             sel = idx["head"][1] == i
             if sel.any():
                 hm[idx["head"][0][sel], idx["head"][3][sel], idx["head"][2][sel]] = 0.0
             att = ((P @ v) * hm[..., None]).transpose(1, 2).reshape(B, n, -1)
             x = x + att @ self.W["o_proj"][i].T
             z2 = vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps)
-            nm = base.neurons[i, comp][None].expand(B, -1, -1).float().clone()  # [B, n, d_mlp]
+            nm = (base.neurons if strengths is None else strengths[1])[i, comp][None].expand(B, -1, -1).float().clone()  # [B, n, d_mlp]
             sel = idx["neuron"][1] == i
             if sel.any():
                 nm[idx["neuron"][0][sel], idx["neuron"][2][sel], idx["neuron"][3][sel]] = 0.0
             x = x + (vpd_model.gelu_tanh(z2 @ self.W["c_fc"][i].T) * nm) @ self.W["down_proj"][i].T
-        if keep:
+        if keep and strengths is None:
             self._cache = (base, kept)
         final = vpd_model.rms(x[:, where[self.targets]], tg.ln_f, tg.eps)
         return torch.log_softmax((final @ tg.wte.T).float(), -1)
+
+    @torch.enable_grad()
+    def strength_log_probs(self, heads: torch.Tensor, neurons: torch.Tensor) -> torch.Tensor:
+        """Full-context native execution with differentiable output multipliers in [0,1].
+
+        Head multipliers precede O projection; neuron multipliers follow GELU and
+        precede down projection. Same algebra as ordinary execution, no remainder,
+        frozen activation trace or cache read/write. Does not increment removal runs.
+        """
+        expected = ((self.L, self.T, self.H), (self.L, self.T, self.Dm))
+        for value, shape in zip((heads, neurons), expected):
+            if value.shape != shape or not value.is_floating_point() or value.device != self.emb.device:
+                raise ValueError('strength shape/dtype/device mismatch')
+            if not torch.isfinite(value).all() or not ((value >= 0) & (value <= 1)).all():
+                raise ValueError('strengths must be finite within [0,1]')
+        return self._forward_impl(self.full(), [[]], 0, keep=True, strengths=(heads, neurons))
+
+    @torch.enable_grad()
+    def integrated_unit_scores(self, steps: int = 4) -> dict:
+        """Negative mean direct-KL gradients at fixed uniform midpoint strengths.
+
+        A deterministic proposal score for each native unit, not a finite-deletion
+        guarantee. Scores may be negative. Costs exactly `steps` full-context
+        forward/backward evaluations, sequentially; no ablation scan or selection.
+        Caller must physically verify any proposed Boolean mask. Midpoint quadrature
+        is approximate, not an exact completeness identity.
+        midpoint_KL_bits uses existing raw FP32 carry.kl; normalized final fidelity
+        is a separate physical verification.
+        """
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError('steps must be a positive integer')
+        full = self.full()
+        score_h = torch.zeros_like(full.heads, dtype=torch.float32)
+        score_n = torch.zeros_like(full.neurons, dtype=torch.float32)
+        losses = []
+        for i in range(steps):
+            a = (i + .5) / steps
+            h = torch.full_like(score_h, a, requires_grad=True)
+            n = torch.full_like(score_n, a, requires_grad=True)
+            loss = carry.kl(self.ref.detach(), self.strength_log_probs(h, n)).sum()
+            gh, gn = torch.autograd.grad(loss, (h, n))
+            if not torch.isfinite(loss) or not torch.isfinite(gh).all() or not torch.isfinite(gn).all():
+                raise ValueError('nonfinite native ranking loss/gradient')
+            score_h -= gh.detach() / steps
+            score_n -= gn.detach() / steps
+            losses.append(float(loss.detach()))
+        return {'heads': score_h, 'neurons': score_n, 'midpoint_KL_bits': losses,
+                'steps': steps, 'forward_evaluations': steps, 'backward_evaluations': steps,
+                'scope': 'proposal only; direct Boolean verification required'}
 
     def kl(self, base: Mask, removals: list[list[tuple]] | None = None) -> list[float]:
         """The KL in bits of the model at the targets from each run: the base set alone (removals None), or the base

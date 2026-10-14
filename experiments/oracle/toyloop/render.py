@@ -598,13 +598,13 @@ def isolated_residual_writes(toy: Toy) -> dict:
     for layer in range(cfg['n_layer']):
         for head in range(cfg['n_head']):
             _, _, V, O = _blocks(sd, cfg, layer, head)
-            total = torch.zeros(cfg['n_embd'], dtype=torch.float64, device=E.device)
+            total = torch.zeros(cfg['n_embd'], dtype=torch.float64, device='cpu')
             maximum = 0.
             if E.shape[0] == 0:
                 raise ValueError('empty native vocabulary')
             for start in range(0, E.shape[0], 128):
                 inputs = _rms(E[start:start + 128].float(), sd[f'h.{layer}.rms_1.weight'].float(), _eps(cfg))
-                actions = ((inputs @ V.T) @ O.T).double()
+                actions = ((inputs @ V.T) @ O.T).cpu().double()
                 if not bool(torch.isfinite(actions).all()):
                     raise ValueError('nonfinite isolated residual write')
                 total += actions.sum(0)

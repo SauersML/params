@@ -44,4 +44,12 @@ class ResidualWriteTests(unittest.TestCase):
   for i in range(4):
    self.assertEqual(new[f'L0H{i}'],old[f'L0H{perm[i]}'])
 
+ def test_chunked_rows_and_float64_statistics(self):
+  import math
+  a=self.fixture();large=copy.deepcopy(a);large.sd['wte.weight']=a.sd['wte.weight'].repeat(17,1)
+  self.assertEqual(render.isolated_residual_writes(a),render.isolated_residual_writes(large))
+  large.sd['h.0.attn.o_proj.weight']*=1e20
+  value=render.isolated_residual_writes(large)['L0H0']['max_token_l2']
+  self.assertTrue(math.isfinite(value));self.assertGreater(value,1e20)
+
 if __name__=='__main__':unittest.main()

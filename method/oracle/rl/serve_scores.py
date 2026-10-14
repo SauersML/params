@@ -86,6 +86,8 @@ class Pool:
     """The scoring processes, a request id counter, and the futures of the requests in flight. A process that dies (out
     of memory) is started again and its requests in flight fail with an error instead of waiting forever."""
 
+    graceful_recycle_exit = None
+
     def __init__(self, workers: int, device: str | None, texts: str):
         self.ctx, self.args = mp.get_context("spawn"), (device, texts)  # spawn: CUDA in each process
         self.out = self.ctx.Queue()
@@ -123,7 +125,7 @@ class Pool:
         for i, p in enumerate(self.procs):
             if p.is_alive():
                 continue
-            if p.exitcode == GRACEFUL_RECYCLE_EXIT:
+            if self.graceful_recycle_exit is not None and p.exitcode == self.graceful_recycle_exit:
                 self.procs[i] = self.start(self.inboxes[i])
                 continue
             with self.lock:

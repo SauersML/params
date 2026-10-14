@@ -12,6 +12,7 @@ def fake_worker(inbox,outbox,ready,release,calls):
  outbox.close();outbox.join_thread();os._exit(serve_scores.GRACEFUL_RECYCLE_EXIT)
 
 class Harness(serve_scores.Pool):
+ graceful_recycle_exit = serve_scores.GRACEFUL_RECYCLE_EXIT
  def __init__(self):
   self.ctx=mp.get_context('spawn');self.out=self.ctx.Queue();self.inboxes=[self.ctx.Queue()]
   self.ready=self.ctx.Event();self.release=self.ctx.Event();self.calls=self.ctx.Queue()
@@ -64,6 +65,13 @@ class RecycleTests(unittest.TestCase):
   try:
    f=h.submit({'task':'first'});self.assertTrue(h.ready.wait(5));h.procs[0].terminate();h.procs[0].join()
    h.restart_dead()
+   with self.assertRaises(RuntimeError):f.result()
+  finally:h.close()
+ def test_generic_pool_does_not_treat_exit75_as_graceful(self):
+  h=Harness();h.graceful_recycle_exit=None
+  try:
+   f=h.submit({'task':'first'});self.assertTrue(h.ready.wait(5));h.release.set();h.procs[0].join(5)
+   self.assertEqual(h.procs[0].exitcode,75);h.restart_dead()
    with self.assertRaises(RuntimeError):f.result()
   finally:h.close()
 if __name__=='__main__':unittest.main()

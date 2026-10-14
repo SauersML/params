@@ -111,6 +111,7 @@ def work(device: str | None, goals: str, inbox, outbox) -> None:
 
 class Pool(serve_scores.Pool):
     """serve_scores' process pool (requests routed by "task", dead processes restarted) running edit scorers."""
+    graceful_recycle_exit = serve_scores.GRACEFUL_RECYCLE_EXIT
 
     def start(self, inbox):
         p = self.ctx.Process(target=work, args=(*self.args, inbox, self.out), daemon=True)

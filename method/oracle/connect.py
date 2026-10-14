@@ -311,7 +311,25 @@ class NativeLines:
         self.layers = [([u for u in self.parts if u[1] == L and u[0] == "head"],
                         [u for u in self.parts if u[1] == L and u[0] == "neuron"]) for L in range(self.nl)]
         self.idx = {u: k for k, u in enumerate(self.parts)}
-        self.writer = self.ends[:, 0].tolist()
+        self.writer_t = self.ends[:, 0].clamp(min=0).to(self.dev)
+        tens = lambda js: torch.tensor(js, dtype=torch.long, device=self.dev)  # noqa: E731
+        self.groups = []  # per layer its heads' reads and its neurons' (log_probs' tables)
+        for L, (heads, nrn) in enumerate(self.layers):
+            reads = []
+            for r in heads:
+                _, _, t, h = r
+                srcs = sorted({key[2] for key in self.into if key[0] == r and key[1] in ("k", "v")})
+                reads.append((h, t, tens(self.into.get((r, "q", None), [])),
+                              [(s, tens(self.into.get((r, "k", s), [])), tens(self.into.get((r, "v", s), []))) for s in srcs]))
+            nl, nr = [], []
+            for k, r in enumerate(nrn):
+                for j in self.into.get((r, "in", None), []):
+                    nl.append(j)
+                    nr.append(k)
+            self.groups.append(({"units": heads, "reads": reads, "at": tens([self.idx[u] for u in heads])},
+                                {"units": nrn, "t": tens([u[2] for u in nrn]), "j": tens([u[3] for u in nrn]),
+                                 "lines": tens(nl), "reader": tens(nr), "at": tens([self.idx[u] for u in nrn])}))
+        self.out_lines = [tens([j for j in self.o_line.tolist() if self.lines[j][1][2] == t]) for t in self.targets]
 
     def kept(self, on: torch.Tensor) -> torch.Tensor:
         """The units a line subset keeps: those with a stated path to the prediction (bool over self.parts)."""
@@ -338,51 +356,57 @@ class NativeLines:
 
     def log_probs(self, ew: torch.Tensor, ow: torch.Tensor, km: torch.Tensor | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of each row: connection strengths ew [B, E] (self.e_line's order),
-        writes ow [B, O], units kept km bool [B, N] (None: every one; a unit not kept stays at its mean)."""
-        m, dev, hd, wr = self.m, self.dev, self.hd, self.writer
+        writes ow [B, O], units kept km bool [B, N] (None: every one; a unit not kept stays at its mean). The units are
+        computed a layer's heads, then its neurons, at a time (self.parts' order), each group's changes from the mean
+        stacked once it is done; a read gathers its lines' writers from the groups done before it."""
+        m, dev, hd = self.m, self.dev, self.hd
         B, d = ew.shape[0], self.base_final.shape[-1]
         eo = torch.zeros(B, len(self.lines), device=dev, dtype=ew.dtype)  # every line's strength, by line index
         eo = eo.index_copy(1, self.e_line.to(dev), ew).index_copy(1, self.o_line.to(dev), ow)
         keep = torch.ones(B, len(self.parts), device=dev) if km is None else km.float()
-        D = [None] * len(self.parts)  # each unit's change from its mean in the stream [B, d]
+        groups = []  # [B, n, d] per group done: each unit's change from its mean in the stream
 
-        def read(base: torch.Tensor, r, slot: str, pos=None) -> torch.Tensor:
+        def into(base: torch.Tensor, js: torch.Tensor) -> torch.Tensor:  # base [d] plus lines js' writers' changes
             x = base.expand(B, d)
-            for j in self.into.get((r, slot, pos), ()):
-                x = x + eo[:, j:j + 1] * D[wr[j]]
+            if len(js):
+                x = x + (eo[:, js, None] * torch.cat(groups, 1)[:, self.writer_t[js]]).sum(1)
             return x
 
         for L in range(self.nl):
-            heads, neurons = self.layers[L]
-            for r in heads:
-                _, _, t, h = r
-                sl = slice(h * hd, (h + 1) * hd)
-                q = self._proj(L, "q_proj", m.norm(read(self.base_attn[L][t], r, "q"), 2 * L), rows=sl)
-                q = self._rope(q[:, None], torch.tensor([t], device=dev))[:, 0]
-                K = self.bk[L][h, :t + 1][None].expand(B, t + 1, hd)
-                V = self.bv[L][h, :t + 1][None].expand(B, t + 1, hd)
-                src = sorted({key[2] for key in self.into if key[0] == r and key[1] in ("k", "v")})
-                if src:
-                    K, V = K.clone(), V.clone()
-                    for s in src:
-                        k = self._proj(L, "k_proj", m.norm(read(self.base_attn[L][s], r, "k", s), 2 * L), rows=sl)
-                        K[:, s] = self._rope(k[:, None], torch.tensor([s], device=dev))[:, 0]
-                        V[:, s] = self._proj(L, "v_proj", m.norm(read(self.base_attn[L][s], r, "v", s), 2 * L), rows=sl)
-                a = ((K @ q[:, :, None])[..., 0] / math.sqrt(hd)).softmax(-1)
-                z = (a[:, :, None] * V).sum(1)
-                D[self.idx[r]] = keep[:, self.idx[r], None] * ((z - self.zh[L, h]) @ self._site(L, "o_proj").W[:, sl].T)
-            for r in neurons:
-                _, _, t, j = r
-                pre = self._proj(L, "c_fc", m.norm(read(self.base_mlp[L][t], r, "in"), 2 * L + 1), rows=[j])[:, 0]
-                D[self.idx[r]] = keep[:, self.idx[r], None] * ((m.act(pre) - self.za[L, j])[:, None]
-                                                              * self._site(L, "down_proj").W[:, j][None])
+            heads, nrn = self.groups[L]
+            if heads["units"]:
+                ch = []
+                for r, (h, t, jq, kv) in zip(heads["units"], heads["reads"]):
+                    sl = slice(h * hd, (h + 1) * hd)
+                    q = self._proj(L, "q_proj", m.norm(into(self.base_attn[L][t], jq), 2 * L), rows=sl)
+                    q = self._rope(q[:, None], torch.tensor([t], device=dev))[:, 0]
+                    K = self.bk[L][h, :t + 1][None].expand(B, t + 1, hd)
+                    V = self.bv[L][h, :t + 1][None].expand(B, t + 1, hd)
+                    if kv:
+                        Ks, Vs = [], []
+                        for src, jk, jv in kv:
+                            k = self._proj(L, "k_proj", m.norm(into(self.base_attn[L][src], jk), 2 * L), rows=sl)
+                            Ks.append(self._rope(k[:, None], torch.tensor([src], device=dev))[:, 0])
+                            Vs.append(self._proj(L, "v_proj", m.norm(into(self.base_attn[L][src], jv), 2 * L), rows=sl))
+                        at = torch.tensor([src for src, _, _ in kv], device=dev)
+                        K = K.index_copy(1, at, torch.stack(Ks, 1))
+                        V = V.index_copy(1, at, torch.stack(Vs, 1))
+                    a = ((K @ q[:, :, None])[..., 0] / math.sqrt(hd)).softmax(-1)
+                    z = (a[:, :, None] * V).sum(1)
+                    ch.append((z - self.zh[L, h]) @ self._site(L, "o_proj").W[:, sl].T)
+                groups.append(torch.stack(ch, 1) * keep[:, heads["at"], None])
+            if nrn["units"]:
+                X = self.base_mlp[L][nrn["t"]][None].expand(B, -1, d)
+                if len(nrn["lines"]):
+                    X = X.index_add(1, nrn["reader"], eo[:, nrn["lines"], None] * torch.cat(groups, 1)[:, self.writer_t[nrn["lines"]]])
+                pre = (m.norm(X, 2 * L + 1) * self._site(L, "c_fc").W[nrn["j"]][None]).sum(-1)
+                if self._site(L, "c_fc").b is not None:
+                    pre = pre + self._site(L, "c_fc").b[nrn["j"]]
+                a = m.act(pre) - self.za[L, nrn["j"]]
+                groups.append(a[:, :, None] * self._site(L, "down_proj").W[:, nrn["j"]].T[None] * keep[:, nrn["at"], None])
         out = []
-        for t in self.targets:
-            x = self.base_final[t].expand(B, d)
-            for j in self.o_line.tolist():
-                if self.lines[j][1][2] == t:
-                    x = x + eo[:, j:j + 1] * D[wr[j]]
-            out.append(m.unembed(m.norm(x, 2 * self.nl)).log_softmax(-1))
+        for t, js in zip(self.targets, self.out_lines):
+            out.append(m.unembed(m.norm(into(self.base_final[t], js), 2 * self.nl)).log_softmax(-1))
         return torch.stack(out, 1)
 
     @torch.no_grad()

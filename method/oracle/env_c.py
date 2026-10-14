@@ -289,6 +289,15 @@ def gate_text(ge, a, rec: dict, cp: dict | None, prompts: dict, llm: dict, var_e
         rec = reline(ge, tx, t, rec, cp)
         with a.out.with_suffix(".targets.jsonl").open("a") as fh:
             fh.write(json.dumps(rec) + "\n")
+    if a.multi:  # only the kinds of transplant line that hold on need of donors search donors (removals as relined)
+        need, donors = map(int, a.multi.split("/"))
+        r = json.loads((ROOT / "variables" / "influential_v2" / rec.get("split", "heldout") / f"{task}.json").read_text())
+        tested = multi_kinds(ge, tx, t, rec, r, cp, donors)
+        keep = [x for x in rec["invariants"] if kind(x)[0] == "remove" or sum(tested.get(kind(x), [])) >= need]
+        rec = {**rec, "invariants": [re.sub(r"^I\d+:", f"I{i}:", x) for i, x in enumerate(keep, 1)], "lines_eval": len(rec["invariants"]),
+               "multi": [[str(k), v] for k, v in tested.items()]}
+        with a.out.with_suffix(".targets.jsonl").open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
     strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
     teacher = components.render(answer_of(task, rec, ge, compact=cp), strings=strings)
     shuffled = components.render(answer_of(task, rec, ge, shuffle=native.task_seed(task), compact=cp), strings=strings)
@@ -307,9 +316,9 @@ def gate_text(ge, a, rec: dict, cp: dict | None, prompts: dict, llm: dict, var_e
     print(task, {k: round(row[k]["reward"], 3) for k in ("teacher", "shuffled", "llm", "llm_hint") if k in row}, best_llm, flush=True)
 
 
-def reline(ge, tx, t: dict, rec: dict, cp: dict | None) -> dict:
-    """rec with only the lines that hold under the carriers its rendered answer states (relines()), on the search pool's
-    draws: lines selected here are never the gate's scored lines (eval_lines())."""
+def holding(ge, tx, t: dict, rec: dict, cp: dict | None) -> list[bool]:
+    """Per line of rec, whether it holds under the carriers its rendered answer states (a two-input line only when
+    joint), on the search pool's draws."""
     import semantic
     import variables
 
@@ -317,14 +326,51 @@ def reline(ge, tx, t: dict, rec: dict, cp: dict | None) -> dict:
     p = components.parse(components.render(answer_of(rec["task"], rec, ge, compact=cp), strings=strings))
     bound = [{**v, "name": v.get("ref", f"V{i}")} for i, v in enumerate(p["answer"].get("variables") or [], 1)]
     lines = p["answer"].get("invariants") or []
-    keep = []
-    if lines and bound:
-        got = semantic.check_invariants(variables.Scorer(ge), tx, variables.parse(bound, ge.nat.C), "\n".join(lines), t["model"],
-                                        fresh_mean=True, pool="search")
-        ok = {r["line"] for r in got["invariants"] if r["holds"] and r.get("joint") is not False}
-        keep = [orig for orig, line in zip(rec["invariants"], lines) if line.strip() in ok]  # render keeps the lines' order
+    if not (lines and bound):
+        return [False] * len(rec["invariants"])
+    got = semantic.check_invariants(variables.Scorer(ge), tx, variables.parse(bound, ge.nat.C), "\n".join(lines), t["model"],
+                                    fresh_mean=True, pool="search")
+    ok = {r["line"] for r in got["invariants"] if r["holds"] and r.get("joint") is not False}
+    return [line.strip() in ok for line in lines]  # render keeps the lines' order
+
+
+def reline(ge, tx, t: dict, rec: dict, cp: dict | None) -> dict:
+    """rec with only the lines that hold under the carriers its rendered answer states (relines()), on the search pool's
+    draws: lines selected here are never the gate's scored lines (eval_lines())."""
+    keep = [x for x, h in zip(rec["invariants"], holding(ge, tx, t, rec, cp)) if h]
     return {**rec, "invariants": [re.sub(r"^I\d+:", f"I{i}:", x) for i, x in enumerate(keep, 1)],
             "relined": "compact" if cp else "blocks", "lines_before": len(rec["invariants"])}
+
+
+def multi_kinds(ge, tx, t: dict, rec: dict, r: dict, cp: dict | None, donors: int = 4) -> dict:
+    """Per kind of transplant line (kind()), whether each of its first donors search lines holds under the compact
+    carriers (holding()): semantic.teacher_invariants on the text's kept variables (r) writes them from the search
+    pool, donors per class and donors two-donor lines per pair, none from a donor rec's own lines name (rec's lines
+    are the gate's eval lines: selection and scoring stay disjoint). One donor's line overfits as gate6 showed (teacher
+    lines 162/162 on their selection draws, 102/159 on new ones)."""
+    import semantic
+    import variables
+
+    avoid: dict = {}
+    for x in semantic.parse_invariants("\n".join(rec["invariants"]), t["model"])[0]:
+        for _, ch in x["intervention"]["transplants"]:
+            for q, z in ch.items():
+                avoid.setdefault(int(q), set()).add(int(z))
+    kv = [v for v in r["variables"] if v.get("kept")]
+    sv = [{"name": v["name"], "inputs": v["inputs"], "group": pv["group"], "values": v.get("values") or [],
+           "identity": v.get("kind") == "input"} for v, pv in zip(kv, variables.parse(kv, ge.nat.C))]
+    by: dict = {}
+    for x in sorted(semantic.teacher_invariants(variables.Scorer(ge), tx, sv, t["model"], per_class=donors, recombine=donors, avoid=avoid),
+                    key=lambda x: x["order"]):
+        k = kind(x["line"])
+        if k[0] == "set" and len(by.setdefault(k, [])) < donors:
+            by[k].append(x["line"].split(":", 1)[1].strip())
+    flat = [(k, line) for k, ls in by.items() for line in ls]
+    out: dict = {}
+    if flat:
+        for (k, _), h in zip(flat, holding(ge, tx, t, {**rec, "invariants": [f"I{i}: {x}" for i, (_, x) in enumerate(flat, 1)]}, cp)):
+            out.setdefault(k, []).append(h)
+    return out
 
 
 def relines(a) -> None:
@@ -556,6 +602,7 @@ def main():
     g.add_argument("--targets", type=Path, help="a targets file (default sft_targets/heldout.jsonl; relines' output)")
     g.add_argument("--untar", type=Path, help="a tar of input paths under ~/mpd-data, unpacked there first")
     g.add_argument("--reline", action="store_true", help="first keep only each target's lines that hold under its own carriers")
+    g.add_argument("--multi", help="NEED/DONORS: keep a kind of transplant line only if NEED of DONORS search donors' lines hold")
     g.add_argument("--llm-dir", type=Path, help="DeepSeek's prompts.jsonl, llm.jsonl and llm_hint.jsonl (default "
                    "explanations/heldout_v2; evlines' prompts for eval lines)")
     e = sub.add_parser("evlines")

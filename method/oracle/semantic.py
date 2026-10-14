@@ -605,7 +605,7 @@ def check_rules_out(sc: variables.Scorer, tx, vs: list[dict], text: str, model: 
 
 
 def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "vpd4l", per_class: int = 1, fresh: int = 16,
-                       structured: bool = False, pool: str = "search", avoid: dict | None = None) -> list[dict]:
+                       structured: bool = False, pool: str = "search", avoid: dict | None = None, recombine: int = 1) -> list[dict]:
     """Verified INVARIANTS lines from a text's kept variables, training targets for the writer. vs: variables with
     "name", "group" (parsed) and "values" (var_classes' value maps: classes with token_ids and predicts_id). Per variable
     and input position p: fresh donor tokens the value map never saw (sampled from the model's prediction at p, the
@@ -626,7 +626,8 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
     checks removals on eval's fresh tokens (Checker): lines selected on search draws scored on disjoint ones. avoid
     ({position: token ids}) leaves out more donors, e.g. the search lines' donors as written (the pool's draws differ
     across torch versions: a pod's 2.4 and the Mac's 2.11 draw different tokens from one seed). Each row's "order" is
-    its place in generation order (rows are listed holding first)."""
+    its place in generation order (rows are listed holding first). recombine: two-donor lines per pair of variables, from
+    each variable's first recombine fresh tokens in turn."""
     import hashlib
 
     import components
@@ -679,7 +680,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                 for p in map(int, v["inputs"]):
                     zs = unseen(p, {int(tx.ids[p])})
                     if zs:
-                        first.setdefault(v["name"], (p, int(zs[0])))
+                        first.setdefault(v["name"], (p, [int(z) for z in zs[:recombine]]))
                     ys = {}
                     for z, y in zip(zs, tops([{p: z} for z in zs])):
                         if y != ck.y0 and y not in ys and len(ys) < 2 * per_class:
@@ -692,7 +693,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
                 want = {int(c["predicts_id"]): c["id"] for c in vm["classes"][1:] if c.get("predicts_id") is not None}
                 got = {}
                 if zs:
-                    first.setdefault(v["name"], (p, int(zs[0])))
+                    first.setdefault(v["name"], (p, [int(z) for z in zs[:recombine]]))
                 for z, y in zip(zs, tops([{p: z} for z in zs])):
                     if y != ck.y0 and y in want and len(got.setdefault(want[y], [])) < per_class:
                         got[want[y]].append((z, y))
@@ -701,12 +702,12 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
         names = [v["name"] for v in vs if v["name"] in first]
         for i, a in enumerate(names):  # independent recombination: two variables from two donors, the model's own
             for b in names[i + 1:]:     # prediction on the text with both changes as the claim
-                (pa, za), (pb, zb) = first[a], first[b]
+                (pa, zas), (pb, zbs) = first[a], first[b]
                 if pa == pb:
                     continue
-                y = tops([{pa: za, pb: zb}])[0]
-                if y != ck.y0:
-                    items.append((a, {"transplants": [(a, {pa: za}), (b, {pb: zb})]}, ("top", y), [(a, pa, za), (b, pb, zb), y]))
+                for za, zb, y in zip(zas, zbs, tops([{pa: za, pb: zb} for za, zb in zip(zas, zbs)])):
+                    if y != ck.y0:
+                        items.append((a, {"transplants": [(a, {pa: za}), (b, {pb: zb})]}, ("top", y), [(a, pa, za), (b, pb, zb), y]))
         rows = ck.check([(iv, out) for _, iv, out, _ in items])
         one_input_checks(ck, [(iv, out) for _, iv, out, _ in items], rows)
         # graded removals (the lead's 10-13: 'p(top) < 0.5' held on 36%): the drop d in bits of the top token's

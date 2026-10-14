@@ -14,6 +14,7 @@
 #      P=n: n evaluate processes sharing the card, each every n-th text, merged (size n by the card's memory: two OOMed a
 #      44 GB card on S1/S2's 200-900-node complete sets, 10-13); SHARD=k/n: one process, that shard only (merge locally);
 #      CALIBRATION_EVIDENCE=1: retain existing scored draws/uncertainty evidence without extra probes;
+#      BASELINES=0: the sets alone, no search-free baselines or start cost (a dev curve's later checkpoints);
 #      INVARIANTS=1: execute decoded formal claims on their carrier groups as separate diagnostics;
 #      both flags apply only to evaluate, not NOISE or TIMING;
 #      NOISE=k: C's draw noise over k seeds per set's first answers (components.py noise) instead of the evaluation;
@@ -55,6 +56,7 @@ COPYFILE_DISABLE=1 tar --exclude="${EXCLUDE_TEXTS:-texts/vpd4l/text91[0-4][0-9].
 WHAT="evaluate heldout $I/rows.jsonl --labels $I/labels.jsonl --n 100000 ${VARIABLES:+--variables} ${MATCHED_ALL:+--matched-all} ${TEACHER:+--teacher $I/teacher} ${EDIT_EVAL:+--edit-teach $I/edit_eval.jsonl} ${LINES:+--lines} ${NODE_CAP:+--node-cap $NODE_CAP}"
 if [ "${CALIBRATION_EVIDENCE:-0}" = 1 ]; then WHAT="$WHAT --calibration-evidence"; fi
 if [ "${INVARIANTS:-0}" = 1 ]; then WHAT="$WHAT --invariants"; fi
+if [ "${BASELINES:-1}" = 0 ]; then WHAT="$WHAT --no-baselines"; fi
 if [ -n "${SHARD:-}" ]; then WHAT="$WHAT --shard $SHARD"; fi
 if [ -n "${NOISE:-}" ]; then WHAT="noise heldout $I/rows.jsonl --seeds $NOISE"; fi
 if [ -n "${TIMING:-}" ]; then WHAT="timing heldout $I/rows.jsonl --group $TIMING --n ${TIMING_N:-4} ${TEACHER:+--teacher $I/teacher}"; fi  # C's draw noise (c_noise) instead of the evaluation

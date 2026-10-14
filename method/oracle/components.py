@@ -3130,11 +3130,21 @@ def _eval_checkpoint(path: Path, record: dict, *, create: bool = False) -> None:
         os.fsync(f.fileno())
 
 
+def _start_seconds(ge, task: dict) -> float:
+    """The start's own cost from the text alone (evaluate's cost columns): a fresh Text's probe and changed-input draws
+    on the eval split."""
+    import time
+
+    t0 = time.perf_counter()
+    ge.start_set(ge.text(task["prompts"][0]["token_ids"], task["prompts"][0]["target_positions"], task=task), "eval")
+    return round(time.perf_counter() - t0, 2)
+
+
 def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = None, labels: dict | None = None,
              diagnostics: bool = False, log=print, ee=None, edit_best: dict | None = None, vs=None, matched_all: bool = False,
              teachers: dict | None = None, lines: bool = False, checkpoint: Path | None = None,
              retain_calibration: bool = False, node_cap: int | None = None, invariants: bool = False,
-             shard: tuple[int, int] | None = None) -> dict:
+             shard: tuple[int, int] | None = None, baselines: bool = True) -> dict:
     """An evaluation of answer sets (name -> samples_of()) on the split's first n texts with question rows, every
     answer scored by reward() (an invalid one at its fixed reward, never skipped). Per set: the headline over each
     question's FIRST sample (policy performance: the mean reward, each term's mean with invalid answers counted as 0,
@@ -3150,7 +3160,10 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
     The baselines' v3 terms (phi, g, compact, bits, D) and C and N are kept beside their circuit reward
     ("baseline_terms"). teachers: task -> the text's teacher circuit (JSON), reward v3's teacher-dominance reference, for
     the sets and the baselines alike. lines: each sample's per-line credits too (reward(lines=True)). checkpoint:
-    a new JSONL file of durable completed-task raw scores, for manual recovery; never used to resume scoring."""
+    a new JSONL file of durable completed-task raw scores, for manual recovery; never used to resume scoring.
+    baselines False: the sets alone, without the search-free baselines, their matched sizes and the start's cost (a dev
+    curve's later checkpoints: the same at every checkpoint, and at f00abd2 as costly as the answers, 484 s on
+    text9020). The baselines are scored on the sets' Text (cache), not a second one built from the text."""
     import native
 
     if checkpoint is not None:
@@ -3208,28 +3221,27 @@ def evaluate(ge, split: str, rows: dict, sets: dict, n: int, e1: dict | None = N
                 entry["structure"] = structure(ge, cache[task["id"]], g, ge.nat._vpd_order(prompt["token_ids"], prompt["target_positions"]))
             per[name].append(entry)
         tx = cache.get(task["id"])
-        matched = [y for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1]) if y.get("bits")]
-        if matched:  # VPD's top k and the recency baseline at the answer's own description length
-            tx = tx or ge.text(task["prompts"][0]["token_ids"], task["prompts"][0]["target_positions"], task=task)
-            order = ge.nat._vpd_order(tx.ids, tx.targets)
-            recent = recency_order(order)
-            for y in matched:
-                y["vpd_k"], y["recency_k"] = matched_k(ge, tx, order, y["bits"]), matched_k(ge, tx, recent, y["bits"])
-        names = baseline_texts(ge, task, [y["vpd_k"] for y in matched], tx, [y["recency_k"] for y in matched])
-        t0 = time.perf_counter()
-        scored_base = reward(ge, task, {**ev, "qa": [], "edits": []}, list(names.values()), split="eval",
-                             teacher=teachers.get(p.stem) if teachers else None, node_cap=None, retain_calibration=retain_calibration)
-        log(f"  {p.stem} baselines: {list(names)}, {time.perf_counter() - t0:.0f} s", flush=True)
-        costs[p.stem] = {"baseline_score_seconds": round((time.perf_counter() - t0) / max(len(names), 1), 2)}
-        t0 = time.perf_counter()  # the start's own cost from the text alone: a fresh Text's probe and changed-input draws
-        ge.start_set(ge.text(task["prompts"][0]["token_ids"], task["prompts"][0]["target_positions"], task=task), "eval")
-        costs[p.stem]["start_seconds"] = round(time.perf_counter() - t0, 2)
-        for (b, text), r in zip(names.items(), scored_base):
-            base.setdefault(p.stem, {})[b] = r["circuit_reward"]
-            base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),
-                                                    **{k: r.get(k) for k in ("phi", "phi_tau", "g", "compact", "bits", "D")}}
-            if retain_calibration and "calibration_evidence" in r:
-                base_terms[p.stem][b]["calibration_evidence"] = r["calibration_evidence"]
+        if baselines:
+            matched = [y for x in (per[s][-1] for s in sets) for y in (x["samples"] if matched_all else x["samples"][:1]) if y.get("bits")]
+            if matched:  # VPD's top k and the recency baseline at the answer's own description length
+                tx = tx or ge.text(task["prompts"][0]["token_ids"], task["prompts"][0]["target_positions"], task=task)
+                order = ge.nat._vpd_order(tx.ids, tx.targets)
+                recent = recency_order(order)
+                for y in matched:
+                    y["vpd_k"], y["recency_k"] = matched_k(ge, tx, order, y["bits"]), matched_k(ge, tx, recent, y["bits"])
+            names = baseline_texts(ge, task, [y["vpd_k"] for y in matched], tx, [y["recency_k"] for y in matched])
+            t0 = time.perf_counter()
+            scored_base = reward(ge, task, {**ev, "qa": [], "edits": []}, list(names.values()), split="eval", cache=cache,
+                                 teacher=teachers.get(p.stem) if teachers else None, node_cap=None, retain_calibration=retain_calibration)
+            log(f"  {p.stem} baselines: {list(names)}, {time.perf_counter() - t0:.0f} s", flush=True)
+            costs[p.stem] = {"baseline_score_seconds": round((time.perf_counter() - t0) / max(len(names), 1), 2)}
+            costs[p.stem]["start_seconds"] = _start_seconds(ge, task)
+            for (b, text), r in zip(names.items(), scored_base):
+                base.setdefault(p.stem, {})[b] = r["circuit_reward"]
+                base_terms.setdefault(p.stem, {})[b] = {"C": r.get("term_C"), "N": r.get("term_N"),
+                                                        **{k: r.get(k) for k in ("phi", "phi_tau", "g", "compact", "bits", "D")}}
+                if retain_calibration and "calibration_evidence" in r:
+                    base_terms[p.stem][b]["calibration_evidence"] = r["calibration_evidence"]
         if checkpoint is not None:
             _eval_checkpoint(checkpoint, {"type": "task", "task": p.stem,
                                          "task_input_sha256": digest(task),
@@ -3283,12 +3295,13 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, b
                                    for other in per if other != name}
         circ = [q["samples"][0].get("circuit_reward", q["samples"][0]["reward"]) for q in qs]  # baselines give no English or answers
         report[name]["circuit_reward"] = sum(circ) / max(len(circ), 1)
-        report[name]["paired"]["empty (circuit reward)"] = _paired(circ, [base[q["task"]]["empty"] for q in qs])
-        for b in ("vpd", "recency"):  # the search-free baselines at each answer's own bits
-            matched = [(c, base[q["task"]].get(f"{b}@{q['samples'][0].get(b + '_k')}")) for c, q in zip(circ, qs)]
-            matched = [(x, y) for x, y in matched if y is not None]
-            if matched:
-                report[name]["paired"][f"{b}@equal bits (circuit reward)"] = _paired([x for x, _ in matched], [y for _, y in matched])
+        if all(q["task"] in base for q in qs):  # (evaluate's baselines scored)
+            report[name]["paired"]["empty (circuit reward)"] = _paired(circ, [base[q["task"]]["empty"] for q in qs])
+            for b in ("vpd", "recency"):  # the search-free baselines at each answer's own bits
+                matched = [(c, base[q["task"]].get(f"{b}@{q['samples'][0].get(b + '_k')}")) for c, q in zip(circ, qs)]
+                matched = [(x, y) for x, y in matched if y is not None]
+                if matched:
+                    report[name]["paired"][f"{b}@equal bits (circuit reward)"] = _paired([x for x, _ in matched], [y for _, y in matched])
         track = [f["fidelity"].get("s_track_pp") for f in ok if (f.get("fidelity") or {}).get("s_track_pp") is not None]
         report[name]["s_track_pp"] = sum(track) / len(track) if track else None
         by = {}
@@ -3466,6 +3479,8 @@ def main():
     s.add_argument("--teacher", type=Path, help="teacher circuits (<task>.json): reward v3's teacher-dominance reference")
     s.add_argument("--lines", action="store_true", help="each sample's per-line credits (reward(lines=True), line_credit())")
     s.add_argument("--shard", help="K/N: every N-th text from the K-th (N processes on one card; merge their outputs with merge)")
+    s.add_argument("--no-baselines", action="store_true", help="the sets alone: no search-free baselines, matched sizes or "
+                   "start cost (a dev curve's later checkpoints)")
     mg = sub.add_parser("merge", help="evaluate outputs of the shards of one evaluation (--shard) as one, the report computed again")
     mg.add_argument("out", type=Path)
     mg.add_argument("parts", type=Path, nargs="+")
@@ -3779,7 +3794,8 @@ def main():
     out = evaluate(ge, args.split, rows, sets, args.n, e1, labels, args.diagnostics, ee=ee, edit_best=edit_best, vs=vs,
                    matched_all=args.matched_all, teachers=teachers, lines=args.lines,
                    checkpoint=args.checkpoint, retain_calibration=args.calibration_evidence, node_cap=args.node_cap or None,
-                   invariants=args.invariants, shard=tuple(map(int, args.shard.split("/"))) if args.shard else None)
+                   invariants=args.invariants, shard=tuple(map(int, args.shard.split("/"))) if args.shard else None,
+                   baselines=not args.no_baselines)
     print(json.dumps(out["report"], indent=1), flush=True)
     if args.out:
         args.out.write_text(json.dumps(out))

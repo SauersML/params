@@ -20,6 +20,7 @@ def setup_eval(tmp_path, monkeypatch, fail_second=False):
         paths.append(p)
     monkeypatch.setitem(sys.modules, "native", SimpleNamespace(tasks=lambda split: paths))
     monkeypatch.setattr(components, "baseline_texts", lambda *a: {"empty": "baseline"})
+    monkeypatch.setattr(components, "_start_seconds", lambda ge, task: 0.0)  # the cost column builds no start here
 
     def reward(ge, task, ev, texts, **kwargs):
         if fail_second and task["id"] == "mock_b":

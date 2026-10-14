@@ -1170,6 +1170,34 @@ def test_evaluate_shards_cover_every_text_once(tmp_path, monkeypatch):
     assert starts == [(("tx", "t_a"), "eval"), (("tx", "t_c"), "eval"), (("tx", "t_b"), "eval")]
 
 
+def test_evaluate_without_baselines_and_baselines_on_the_sets_text(tmp_path, monkeypatch):
+    """baselines False: the sets alone (no baselines, matched sizes or start cost, and no paired baseline figures);
+    with baselines, they are scored on the Text the sets' reward built (its cache), not a second one."""
+    from types import SimpleNamespace
+
+    p = tmp_path / "t_a.json"
+    p.write_text(json.dumps({"id": "t_a", "prompts": [{"token_ids": [1, 2], "target_positions": [1]}]}))
+    monkeypatch.setitem(sys.modules, "native", SimpleNamespace(tasks=lambda split: [p]))
+    ge = SimpleNamespace(text=lambda ids, targets, task: ("tx", task["id"]), start_set=lambda tx, split: None)
+    monkeypatch.setattr(components, "baseline_texts", lambda *a: {"empty": "baseline"})
+    seen = []
+
+    def reward(ge, task, ev, texts, cache=None, **kw):
+        seen.append(dict(cache))
+        cache.setdefault(task["id"], ("built", len(seen)))
+        return [{"reward": 0.1, "valid": True, "row": {"nodes": 1}, "circuit_reward": 0.1, "phi": 0.0} for _ in texts]
+
+    monkeypatch.setattr(components, "reward", reward)
+    rows, sets = {"t_a": {"qa": []}}, {"s": {"t_a": [("x", False)]}}
+    quiet = lambda *a, **k: None  # noqa: E731
+    out = components.evaluate(ge, "heldout", rows, sets, 1, log=quiet, baselines=False)
+    assert out["baselines"] == {} and out["costs"] == {} and len(seen) == 1
+    assert "empty (circuit reward)" not in out["report"]["all"]["s"]["paired"]
+    seen.clear()
+    out = components.evaluate(ge, "heldout", rows, sets, 1, log=quiet)
+    assert seen == [{}, {"t_a": ("built", 1)}]
+    assert out["baselines"] == {"t_a": {"empty": 0.1}} and "empty (circuit reward)" in out["report"]["all"]["s"]["paired"]
+
 def _tiny_start(nat, ge, task):
     """The tiny text's influential start (GoalEval.start_set, the reward's) as a start-relative row's "start"."""
     p = task["prompts"][0]

@@ -325,6 +325,11 @@ def relines(a) -> None:
     under the compact ones (gate4c: the teacher's credit median -6.4 bits)."""
     import goal_eval
 
+    if a.untar:
+        import tarfile
+
+        with tarfile.open(a.untar) as t:
+            t.extractall(Path.home() / "mpd-data")
     ge = goal_eval.GoalEval(native.Native(a.device))
     cp = load_compact(a.compact)
     recs = [json.loads(x) for x in (ROOT / "variables" / "sft_targets" / f"{a.split}.jsonl").read_text().splitlines()]
@@ -360,7 +365,7 @@ def sft(a) -> None:
     import goal_eval
 
     ge = goal_eval.GoalEval(native.Native(a.device))
-    recs = {x["task"]: x for x in map(json.loads, (ROOT / "variables" / "sft_targets" / f"{a.split}.jsonl").read_text().splitlines())}
+    recs = {x["task"]: x for x in map(json.loads, (a.targets or ROOT / "variables" / "sft_targets" / f"{a.split}.jsonl").read_text().splitlines())}
     cp = load_compact(a.compact)
     n = 0
     with a.out.open("w") as fh:
@@ -466,6 +471,7 @@ def main():
     f.add_argument("out", type=Path)
     f.add_argument("--split", default="train")
     f.add_argument("--compact", type=Path, help="var_compact.py's rows: variables written as compact families, not blocks")
+    f.add_argument("--targets", type=Path, help="a targets file (default sft_targets/<split>.jsonl; relines' output)")
     v = sub.add_parser("serve")
     v.add_argument("--port", type=int, default=8771)
     q = sub.add_parser("rows")
@@ -475,6 +481,7 @@ def main():
     rl.add_argument("--split", default="heldout")
     rl.add_argument("--compact", type=Path)
     rl.add_argument("--out", type=Path, required=True)
+    rl.add_argument("--untar", type=Path, help="a tar of input paths under ~/mpd-data, unpacked there first")
     for p in (s, g, f, v, q, rl):
         p.add_argument("--device")
     a = ap.parse_args()

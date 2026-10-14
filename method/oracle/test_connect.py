@@ -19,6 +19,8 @@ import goal_eval  # noqa: E402
 from test_goal_eval import tiny_native  # noqa: E402
 from test_lines import nodes_of  # noqa: E402
 
+TINY = {"scope": None, "interchange": None}  # (the tiny model has no far donors for those families' draws)
+
 
 @pytest.fixture(scope="module")
 def tiny():
@@ -42,11 +44,18 @@ def test_scores_add_up(tiny):
 def test_stated_circuit(tiny):
     nat, ge, tx = tiny
     c = connect.Connector(ge, tx, nodes_of(nat, tx, 5, 16), B=4)
-    got = c.run(log=lambda m: None)
+    got = c.run(log=lambda m: None, floors=TINY)
     rec, g = got["record"], got["graph"]
     assert rec["lines"] <= rec["lines_start"] and rec["parts"] == len(g.node_set())
-    assert rec["point"] <= rec["point_cap"] + 1e-6 and rec["track_search"] >= rec["track_floor"] - 1e-6
+    assert rec["point"] <= rec["criteria"]["point"] + 1e-6
+    assert all(v is None or v >= rec["criteria"][n] - 1e-6 for n, v in rec["families"].items())
     h = goal_eval.graph_of_lines(c.pr.g, c.pr.cols, c.pr.row(got["on"]))
     del h.stranded, h.stranded_bits  # (graph_of_lines marks it stranded already)
     again = goal_eval.strand(h, tx.targets, nat.C)
     assert set(again.node_set()) == set(g.node_set())  # every part kept lies on a stated path to the prediction
+
+
+def test_connect_interface(tiny):
+    nat, ge, tx = tiny
+    g = connect.connect(ge, tx, connect.native.Graph(nodes_of(nat, tx, 7, 14), complete=True), floors=TINY)
+    assert not g.complete and g.connect["parts"] == len(g.node_set())

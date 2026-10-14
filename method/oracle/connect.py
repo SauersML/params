@@ -10,14 +10,17 @@ the token edges and the target token), in C's semantics on one engine plan.
       backward pass; they add up to the KL every line saves). A line's score is the KL it saves.
   (2) Keep. The top k lines for k on a log scale (every token edge and the target token beside them), each set's parts
       without a stated path to the prediction dropped (goal_eval.strand), measured: the point KL of every set in one
-      batch, then s_track_pp on the search draws for the smallest sets the point KL admits. The stage keeps the
-      smallest set that meets both criteria.
+      batch, then the path-patched families in turn on the smallest sets still in. The stage keeps the smallest set
+      that meets every criterion.
   (3) Drop inert lines. The kept connections in ascending score, then the token edges in ascending score of their
       readers, each by the largest log-scale suffix whose removal still meets the criteria.
-Criteria: what node selection achieved stays. The point KL rises at most POINT_TOL of the way from the fully wired
-circuit's to the KL with no line, on a log scale, and s_track_pp falls at most TRACK_TOL below the fully wired circuit's.
-Both are measured on the engine's runs. The gradients only order the candidates; they never decide what is kept.
+Criteria, the cheap families builder_fast's node selection holds (pymove's 10-14): the point KL rises at most POINT_TOL
+of the way from the fully wired circuit's to the KL with no line, on a log scale; s_track_pp on TRACK_DRAWS search
+draws, s_scope on its scope draws (the family that sees a token edge left out) and s_interchange_pp on the circuit's
+panel stay at FLOOR, or at the fully wired circuit's value less TRACK_TOL when that is lower. All are measured on the
+engine's runs; the gradients only order the candidates.
 
+  connect(ge, tx, graph, units="vpd", budget_s=None, floors=None)   builder_fast's call: the stated native.Graph
   connect.py one TEACHER.json TASK.json OUT.json [--vpd FILE] [--device D]   one circuit's stated form, measured
 """
 from __future__ import annotations
@@ -44,7 +47,9 @@ ALPHAS = 8  # integrated-gradient strengths, (i + 1/2) / ALPHAS
 POINT_TOL = 0.02  # the point KL's allowed rise, as a share of the log distance from the wired circuit's to no line's
 TRACK_TOL = 0.02  # s_track_pp's allowed fall below the wired circuit's (lines.VAL_MARGIN's)
 TRACK_DRAWS = 8  # s_track_pp's draws in the search (the report uses goal_eval's default)
-TRACK_BATCH = 8  # sets asked about s_track_pp at once
+FAMILY_BATCH = 8  # sets asked about a path-patched family at once
+FLOOR = goal_eval.FLOOR_TOP  # the path-patched families' floor (pymove's builder: 0.9 absolute, VPD's whole answer
+# scoring 1 there by construction), lowered to the wired circuit's value less TRACK_TOL when that is lower
 
 
 def sizes(n: int) -> list[int]:
@@ -87,24 +92,40 @@ class Connector:
         native.free(dev)
         return out
 
-    def tracks(self, ons: list) -> list[float]:
-        """s_track_pp on the search draws (TRACK_DRAWS) of each line set, TRACK_BATCH sets a call."""
-        out = []
-        for s0 in range(0, len(ons), TRACK_BATCH):
-            rows = torch.stack([self.pr.row(on) for on in ons[s0:s0 + TRACK_BATCH]]).float()
-            out += [r["s_track_pp"] or 0.0 for r in self.ge.track_pp(self.tx, [self.pr.g], "search", draws=TRACK_DRAWS, lines=rows)]
-            native.free(self.ge.nat.dev)
+    FAMILIES = (("track", "s_track_pp"), ("scope", "s_scope"), ("interchange", "s_interchange_pp"))
+
+    def family(self, name: str, ons: list) -> list[float | None]:
+        """One path-patched family of each line set on the search split (track on TRACK_DRAWS draws, scope on its
+        scope_draws, interchange_pp on each set's panel), FAMILY_BATCH sets a call."""
+        ge, tx, out = self.ge, self.tx, []
+        for s0 in range(0, len(ons), FAMILY_BATCH):
+            rows = torch.stack([self.pr.row(on) for on in ons[s0:s0 + FAMILY_BATCH]]).float()
+            if name == "track":
+                got = [r["s_track_pp"] for r in ge.track_pp(tx, [self.pr.g], "search", draws=TRACK_DRAWS, lines=rows)]
+            elif name == "scope":
+                got = [r["s_scope"] for r in ge.scope_family(tx, [self.pr.g], "search", lines=rows)]
+            else:
+                got = [r["s_interchange_pp"] for r in ge.interchange_pp(tx, [self.pr.g], "search", lines=rows)]
+            out += got
+            native.free(ge.nat.dev)
         return out
 
-    def run(self, log=print) -> dict:
-        """The stated circuit (stages (1) to (3)) and its measurements."""
+    def run(self, log=print, budget_s: float | None = None, floors: dict | None = None) -> dict:
+        """The stated circuit (stages (1) to (3)) and its measurements. floors: {"point": KL cap in bits, "track",
+        "scope", "interchange": floors of the families} replacing the defaults (the wired circuit's values less the
+        tolerances, the path-patched families' at most FLOOR); a family whose floor is None or whose wired value is
+        None (no draws) is not asked. budget_s: the inert stage is skipped once the seconds so far pass it."""
         pr, t0 = self.pr, time.time()
         full = self.row(self.conn)
         kl_full, kl_none = pr.kl_sets(torch.stack([full, self.row(self.conn[:0])]))
-        tr_full = self.tracks([full])[0]
         lo, hi = math.log(max(kl_full, 1e-9)), math.log(max(kl_none, kl_full, 1e-9))
-        kl_cap = math.exp(lo + POINT_TOL * (hi - lo))
-        tr_floor = tr_full - TRACK_TOL
+        cap = {"point": math.exp(lo + POINT_TOL * (hi - lo))}
+        off = {n for n, v in (floors or {}).items() if v is None}  # (families the caller leaves out)
+        wired = {name: None if name in off else self.family(name, [full])[0] for name, _ in self.FAMILIES}
+        for name, _ in self.FAMILIES:
+            cap[name] = None if wired[name] is None else min(FLOOR, wired[name] - TRACK_TOL)
+        cap.update(floors or {})
+        asked = [name for name, _ in self.FAMILIES if cap.get(name) is not None]
         self.spent["wired"] = time.time() - t0
 
         t = time.time()
@@ -112,60 +133,78 @@ class Connector:
         order = self.conn[torch.argsort(sc[self.conn], descending=True, stable=True)]
         self.spent["rank"] = time.time() - t
 
-        def ok(ons, last=False):  # each set's (point KL, s_track_pp or None): s_track_pp only where the point KL is
-            kl = pr.kl_sets(torch.stack(ons))  # within its cap, the sets in order (last: from the end), stopping at the
-            tr = [None] * len(ons)  # first batch with a set that passes
-            idx = [i for i, x in enumerate(kl) if x <= kl_cap][::-1 if last else 1]
-            for s0 in range(0, len(idx), TRACK_BATCH):
-                part = idx[s0:s0 + TRACK_BATCH]
-                for i, x in zip(part, self.tracks([ons[i] for i in part])):
-                    tr[i] = x
-                if any(tr[i] >= tr_floor for i in part):
+        def passing(ons, last=False) -> list[bool]:
+            """Whether each set meets the criteria: the point KL of every set, then the families in turn on the sets
+            still in, FAMILY_BATCH sets at a time in order (last: from the end), stopping after the first batch with a
+            set that passes (only the first or last passing set is used)."""
+            kl = pr.kl_sets(torch.stack(ons))
+            out = [False] * len(ons)
+            idx = [i for i, x in enumerate(kl) if x <= cap["point"]][::-1 if last else 1]
+            for s0 in range(0, len(idx), FAMILY_BATCH):
+                alive = idx[s0:s0 + FAMILY_BATCH]
+                for name in asked:
+                    if not alive:
+                        break
+                    got = self.family(name, [ons[i] for i in alive])
+                    alive = [i for i, x in zip(alive, got) if x is not None and x >= cap[name] - 1e-9]
+                for i in alive:
+                    out[i] = True
+                if alive:
                     break
-            return kl, tr
+            return out
 
         t = time.time()
         ks = sizes(len(order))
-        kl, tr = ok([self.row(order[:k]) for k in ks])
-        k = next((k for k, x, y in zip(ks, kl, tr) if y is not None and x <= kl_cap and y >= tr_floor), len(order))
+        k = next((k for k, y in zip(ks, passing([self.row(order[:k]) for k in ks])) if y), len(order))
         keep = order[:k]
         self.spent["keep"] = time.time() - t
 
         t = time.time()
-        asc = keep.flip(0)  # (descending score order kept: the lowest first)
-        ms = [m for m in sizes(len(asc)) if m < len(asc)]
-        if ms:
-            kl, tr = ok([self.row(asc[m:]) for m in ms], last=True)
-            m = max((m for m, x, y in zip(ms, kl, tr) if y is not None and x <= kl_cap and y >= tr_floor), default=0)
-            keep = asc[m:].flip(0)
-        kept = pr.kept(self.row(keep))
-        reader = pr.ends[self.tok, 0]  # each token edge's reader, among pr.parts (its one part end)
-        live = self.tok[kept[reader]]
-        tok_score = torch.zeros(len(pr.parts)).index_add_(0, pr.ends[keep, 1].clamp(min=0), sc[keep] * (pr.ends[keep, 1] >= 0))
-        tasc = live[torch.argsort(tok_score[pr.ends[live, 0]], stable=True)]
-        ms = [m for m in sizes(len(tasc)) if m < len(tasc)]
-        tok = tasc
-        if ms:
-            kl, tr = ok([self.row(keep, tasc[m:]) for m in ms], last=True)
-            m = max((m for m, x, y in zip(ms, kl, tr) if y is not None and x <= kl_cap and y >= tr_floor), default=0)
-            tok = tasc[m:]
+        tok = self.tok
+        if budget_s is None or time.time() - t0 < budget_s:
+            asc = keep.flip(0)  # (the lowest score first)
+            ms = [m for m in sizes(len(asc)) if m < len(asc)]
+            if ms:
+                m = max((m for m, y in zip(ms, passing([self.row(asc[m:]) for m in ms], last=True)) if y), default=0)
+                keep = asc[m:].flip(0)
+            kept = pr.kept(self.row(keep))
+            live = self.tok[kept[pr.ends[self.tok, 0]]]  # the token edges into kept parts (a token edge's one part end)
+            into = torch.zeros(len(pr.parts)).index_add_(0, pr.ends[keep, 1].clamp(min=0), sc[keep] * (pr.ends[keep, 1] >= 0))
+            tasc = live[torch.argsort(into[pr.ends[live, 0]], stable=True)]  # by their readers' scores, lowest first
+            tok = tasc
+            ms = [m for m in sizes(len(tasc)) if m < len(tasc)]
+            if ms and (budget_s is None or time.time() - t0 < budget_s):
+                m = max((m for m, y in zip(ms, passing([self.row(keep, tasc[m:]) for m in ms], last=True)) if y), default=0)
+                tok = tasc[m:]
         on = self.row(keep, tok)
         self.spent["inert"] = time.time() - t
 
         g = pr.graph(on)
         kl_on = pr.kl_sets(on[None])[0]
-        tr_on = self.tracks([on])[0]
+        fam = {name: self.family(name, [on])[0] for name in asked}
         self.spent["total"] = time.time() - t0
         kinds = [pr.lines[j][0] for j in on.nonzero().flatten().tolist()]
         rec = {"parts_start": len(pr.parts), "lines_start": len(pr.lines), "parts": len(g.node_set()),
                "lines": int(on.sum()), "connections": kinds.count("e") + kinds.count("o"),
                "token_edges": kinds.count("t") + kinds.count("u"), "point": kl_on, "point_wired": kl_full,
-               "point_none": kl_none, "point_cap": kl_cap, "track_search": tr_on, "track_search_wired": tr_full,
-               "track_floor": tr_floor, "seconds": {k: round(v, 2) for k, v in self.spent.items()}}
+               "point_none": kl_none, "families": fam, "families_wired": wired, "criteria": cap,
+               "seconds": {k: round(v, 2) for k, v in self.spent.items()}}
         log(f"{rec['parts']} of {rec['parts_start']} parts, {rec['lines']} of {rec['lines_start']} lines "
-            f"({rec['token_edges']} token edges); point {kl_on:.4f} bits (wired {kl_full:.4f}, cap {kl_cap:.4f}); "
-            f"s_track_pp {tr_on:.4f} (wired {tr_full:.4f}); {rec['seconds']}")
+            f"({rec['token_edges']} token edges); point {kl_on:.4f} bits (wired {kl_full:.4f}, cap {cap['point']:.4f}); "
+            + ", ".join(f"{n} {fam[n]:.3f} (wired {wired[n]:.3f}, floor {cap[n]:.3f})" for n in asked) + f"; {rec['seconds']}")
         return {"graph": g, "on": on, "record": rec}
+
+
+def connect(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph: native.Graph, units: str = "vpd", budget_s: float | None = None,
+            floors: dict | None = None, log=None) -> native.Graph:
+    """builder_fast's call (pymove's interface): a circuit's node set (a complete native.Graph over (site, position,
+    subcomponent)) stated, every part on a stated path; the stage's record on the result as .connect. units "vpd"."""
+    if units != "vpd":
+        raise ValueError("connect: units 'vpd' (neurons and heads: inframove's native-unit runner, to come)")
+    got = Connector(ge, tx, sorted(graph.node_set())).run(log=log or (lambda m: None), budget_s=budget_s, floors=floors)
+    g = got["graph"]
+    g.connect = got["record"]
+    return g
 
 
 def main():

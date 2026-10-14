@@ -16,9 +16,10 @@ Sets:
   causalgym  generality's CausalGym teacher circuits against the same circuit with the subject's nodes moved to the
              attractor (cg_teacher.test's pair)
   dev        dev teacher circuits against random subsets of their start of the same size (3 seeds)
-  reference  per dev text the teacher, VPD's actives at the START's positions (the start set), VPD's whole answer (the
-             share alone) and, where the START is larger than the teacher, random subsets of it of the teacher's size (3
-             seeds): whether a node-values floor relative to VPD would be fair (the lead's 10-13 question)
+  reference  per dev text the teacher, VPD's actives at the targets and the START's candidate positions (v24's
+             own-run families' reference, goal_eval.vpd_floors), VPD's whole answer (the share alone) and, where the START
+             (goal_eval.start_set) is larger than the teacher, random subsets of it of the teacher's size (3 seeds):
+             whether a node-values floor relative to VPD would be fair (the lead's 10-13 question)
 
   python node_values.py toys --toys ~/mpd-data/toys_planted --out OUT.jsonl
   python node_values.py causalgym --teacher ~/mpd-data/graph_oracle/generality/cg_teacher_b2 --out OUT.jsonl
@@ -151,13 +152,16 @@ def reference(a) -> None:
             tx = ge.text(ids, targets, native.task_seed(task))
             g, _ = goal_eval.circuit(json.loads(f.read_text()), targets, nat.C, tx.T)
             nodes = sorted(g.node_set())
+            act = sorted((n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist())
+            ps = set(targets) | set(ge.start_candidates(tx)[:goal_eval.START_CAP])
             start = sorted(ge.start_set(tx, "search")["graph"].node_set())
-            graphs = {"teacher": native.Graph(nodes, complete=True), "vpd_at_start": native.Graph(start, complete=True),
-                      "vpd": native.Graph(masks=tx.vpd)}
+            graphs = {"teacher": native.Graph(nodes, complete=True),
+                      "vpd_at_candidates": native.Graph([nd for nd in act if nd[1] in ps], complete=True),
+                      "start": native.Graph(start, complete=True), "vpd": native.Graph(act, complete=True)}
             if len(start) > len(nodes):
                 for s in range(3):
                     graphs[f"start_subset{s}"] = native.Graph(sorted(random.Random(s).sample(start, len(nodes))), complete=True)
-            got = agreement(ge, tx, list(graphs.values()), effects=[k != "vpd" for k in graphs])
+            got = agreement(ge, tx, list(graphs.values()), effects=[k not in ("vpd", "vpd_at_candidates") for k in graphs])  # (references: share alone)
             for arm, r in zip(graphs, got):
                 fh.write(json.dumps({"set": "reference", "text": task, "circuit": arm, **r}) + "\n")
                 print(task, arm, json.dumps(r), flush=True)

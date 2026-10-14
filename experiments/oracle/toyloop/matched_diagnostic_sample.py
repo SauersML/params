@@ -1,4 +1,4 @@
-"""Explicit sampling-only execution of a frozen16prompt/fivepolicy diagnostic.
+"""Explicit sampling-only execution of frozen oracle comparison profiles.
 
 Offline validation imports no SDK/tokenizer. Root's admitted launcher must check
 shared budget AFTER memory admission and BEFORE Keychain lookup; this runner
@@ -12,6 +12,7 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
+import re
 
 import matched_graph_train as train_helper
 import matched_graph_diagnostic_manifest as manifest_helper
@@ -25,6 +26,8 @@ MODELS = {'base':'Qwen/Qwen3-8B','point':'Qwen/Qwen3-8B','intervention':'Qwen/Qw
 TOKENIZERS = {'Qwen/Qwen3-8B':('b968826d9c46dd6066d109eabc6255188de91218','qwen3_disable_thinking'),
  'Qwen/Qwen3.6-35B-A3B':('995ad96eacd98c81ed38be0c5b274b04031597b0','qwen3_5_disable_thinking'),
  'moonshotai/Kimi-K2.6':('b5aabbfb20227ed42becbf5541dbffd213942c58','kimi_k26_disable_thinking')}
+
+FRESH_ROLES = ('base','point24','intervention24','point35','intervention35')
 
 
 def rates(model):
@@ -45,6 +48,13 @@ def charge(model, prompt, hits, sampled):
 
 
 def profile(prepared):
+    if prepared.get('profile') == 'fresh_transfer35_v1':
+        if prepared['primary_prepared_sha256'] != '4c68ec1f9c810bf25f87cad3074da573ad0fa9338abfc22b8e5590053d4306a2':
+            raise ValueError('original24 parent required')
+        for key in ('training35_prepared_sha256','common_init_receipt_sha256'):
+            if not re.fullmatch(r'[0-9a-f]{64}',prepared.get(key,'')):
+                raise ValueError('frozen35/common initialization binding required')
+        return {arm:MODELS['base'] for arm in FRESH_ROLES},8
     if prepared.get('profile') == 'train_fit_v1':
         if (prepared['primary_prepared_sha256'] != '4c68ec1f9c810bf25f87cad3074da573ad0fa9338abfc22b8e5590053d4306a2'
                 or prepared['training_jsonl_sha256'] != '94e6f5966516c858a42a5c9f770a9b5f716a4cd31bcdb5427a584e5ffc9fa188'):
@@ -60,7 +70,8 @@ def validate(prepared):
     if (prepared['schema_version']!=1 or prepared['policies']!=policy_models
             or (prepared['calls'],prepared['output_cap'],prepared['context'],prepared['num_samples'],prepared['temperature'])!=(len(policy_models)*case_count,416,32768,1,0.)):
         raise ValueError('fixed diagnostic recipe required')
-    if set(prepared['models'])!=set(policy_models.values()) or set(prepared['checkpoint_receipt_sha256'])!={'point','intervention'}:
+    checkpoint_roles=set(FRESH_ROLES[1:]) if prepared.get('profile')=='fresh_transfer35_v1' else {'point','intervention'}
+    if set(prepared['models'])!=set(policy_models.values()) or set(prepared['checkpoint_receipt_sha256'])!=checkpoint_roles:
         raise ValueError('model/checkpoint coverage mismatch')
     keys=None;upper=Decimal(0)
     for name,model in prepared['models'].items():
@@ -68,9 +79,12 @@ def validate(prepared):
             raise ValueError('pinned model renderer changed')
         rows=model['inputs'];ids=[r['id'] for r in rows]
         if len(ids)!=case_count or len(set(ids))!=case_count or (keys is not None and ids!=keys):
-            raise ValueError('shared16case order required')
+            raise ValueError('shared frozen case order required')
         keys=ids
-        if case_count==24:
+        if case_count==8:
+            expected=[f'{f}_{3400000+100*i}' for i,f in enumerate(train_helper.FAMILIES)]
+            if ids!=expected:raise ValueError('exact fresh340 holdout order required')
+        elif case_count==24:
             expected=list(train_helper.OLD_TRAIN)+[f'{f}_{3100000+100*i+v}' for i,f in enumerate(train_helper.FAMILIES) for v in (0,1)]
             if ids!=expected:raise ValueError('exact24TRAIN order required')
         elif ids[8:]!=[i+'__perm' for i in ids[:8]]:
@@ -110,6 +124,38 @@ def fresh_budget(path):
     return sha(path)
 
 
+def checkpoint_paths(args,prepared):
+    """Validate all saved states and parent runs before creating a provider client."""
+    fresh=prepared.get('profile')=='fresh_transfer35_v1'
+    groups=[(args.checkpoints,24,prepared['primary_prepared_sha256'],
+             {'point24':'point','intervention24':'intervention'} if fresh else {'point':'point','intervention':'intervention'})]
+    if fresh:
+        new=getattr(args,'new_checkpoints',None)
+        if new is None:raise ValueError('fresh comparison requires separate35 checkpoints')
+        groups.append((new,35,prepared['training35_prepared_sha256'],{'point35':'point','intervention35':'intervention'}))
+    paths={}
+    for directory,steps,parent_sha,roles in groups:
+        start=[json.loads(x) for x in (directory/'start.jsonl').read_text().splitlines()]
+        done=[json.loads(x) for x in (directory/'complete.jsonl').read_text().splitlines()]
+        if (len(start)!=1 or start[0]['prepared_sha256']!=parent_sha or start[0]['project']!=PROJECT
+                or len(done)!=1 or done[0]['steps_per_arm']!=steps or Decimal(done[0]['remaining_reserved_usd'])!=0):
+            raise ValueError('completed parent training provenance required')
+        if fresh:
+            if sha(directory/'common_init.jsonl')!=prepared['common_init_receipt_sha256']:
+                raise ValueError('old/new policies must share exact initial receipt')
+            if steps==35 and start[0].get('common_init_receipt_sha256')!=prepared['common_init_receipt_sha256']:
+                raise ValueError('35 training initialization provenance changed')
+        for role,arm in roles.items():
+            receipt=directory/(arm+'_checkpoint.jsonl')
+            if sha(receipt)!=prepared['checkpoint_receipt_sha256'][role]:
+                raise ValueError('saved state receipt changed')
+            records=[json.loads(x) for x in receipt.read_text().splitlines()]
+            if len(records)!=1 or set(records[0])!={'path'} or not records[0]['path'].startswith('tinker://'):
+                raise ValueError('exact single private checkpoint receipt required')
+            paths[role]=records[0]['path']
+    return paths
+
+
 def execute(args,api=None):
     proof=json.loads(args.preflight.read_text());approval=json.loads(args.approval.read_text())
     if proof!=preflight(args.prepared):
@@ -123,21 +169,7 @@ def execute(args,api=None):
         raise ValueError('fixed project/cap/fresh output required')
     prepared=json.loads(args.prepared.read_text());validate(prepared)
     policy_models,case_count=profile(prepared)
-    paths={}
-    for arm in ('point','intervention'):
-        receipt=args.checkpoints/(arm+'_checkpoint.jsonl')
-        if sha(receipt)!=prepared['checkpoint_receipt_sha256'][arm]:
-            raise ValueError('saved state receipt changed')
-        records=[json.loads(x) for x in receipt.read_text().splitlines()]
-        if len(records)!=1 or set(records[0])!={'path'} or not records[0]['path'].startswith('tinker://'):
-            raise ValueError('exact single private checkpoint receipt required')
-        paths[arm]=records[0]['path']
-    parent_start=[json.loads(x) for x in (args.checkpoints/'start.jsonl').read_text().splitlines()]
-    parent_done=[json.loads(x) for x in (args.checkpoints/'complete.jsonl').read_text().splitlines()]
-    if (len(parent_start)!=1 or parent_start[0]['prepared_sha256']!=prepared['primary_prepared_sha256']
-            or parent_start[0]['project']!=PROJECT or len(parent_done)!=1
-            or parent_done[0]['steps_per_arm']!=24 or Decimal(parent_done[0]['remaining_reserved_usd'])!=0):
-        raise ValueError('completed parent training provenance required')
+    paths=checkpoint_paths(args,prepared)
     budget_sha=fresh_budget(args.fresh_budget)
     if api is None:
         if importlib.metadata.version('tinker')!='0.33.1':
@@ -211,7 +243,7 @@ def execute(args,api=None):
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--prepared',type=Path,required=True);p.add_argument('--preflight',type=Path,required=True)
     p.add_argument('--execute',action='store_true')
-    for name in ('approval','fresh_budget','checkpoints','out'):p.add_argument('--'+name.replace('_','-'),type=Path)
+    for name in ('approval','fresh_budget','checkpoints','new_checkpoints','out'):p.add_argument('--'+name.replace('_','-'),type=Path)
     a=p.parse_args()
     if a.execute:
         if any(getattr(a,n) is None for n in ('approval','fresh_budget','checkpoints','out')):p.error('execute requires approval/fresh-budget/checkpoints/out')

@@ -28,7 +28,29 @@ def prepared():
     return p
 
 
+def fresh_prepared():
+    p=prepared();name=m.MODELS['base'];model=p['models'][name]
+    ids=[f'{f}_{3400000+100*i}' for i,f in enumerate(m.train_helper.FAMILIES)]
+    model['inputs']=[dict(copy.deepcopy(model['inputs'][0]),id=i) for i in ids]
+    model['upper_per_policy_usd']=str(sum((m.charge(model,2,0,416) for _ in ids),Decimal(0)))
+    p.update(profile='fresh_transfer35_v1',calls=40,policies={a:name for a in m.FRESH_ROLES},models={name:model},
+        primary_prepared_sha256='4c68ec1f9c810bf25f87cad3074da573ad0fa9338abfc22b8e5590053d4306a2',
+        training35_prepared_sha256='c'*64,common_init_receipt_sha256='d'*64,
+        checkpoint_receipt_sha256={a:'hash' for a in m.FRESH_ROLES[1:]},
+        upper_usd_decimal=str(5*Decimal(model['upper_per_policy_usd'])))
+    return p
+
+
 class DiagnosticSampleTests(unittest.TestCase):
+    def test_fresh_transfer_cannot_substitute_training_models_or_drop_policies(self):
+        p=fresh_prepared();m.validate(p)
+        for mutate in (lambda q:q['models'][m.MODELS['base']]['inputs'][0].update(id='additive_vote_3300000'),
+                       lambda q:q['checkpoint_receipt_sha256'].pop('point24'),
+                       lambda q:q.update(common_init_receipt_sha256='unknown'),
+                       lambda q:q.update(calls=32)):
+            q=copy.deepcopy(p);mutate(q)
+            with self.assertRaises(ValueError):m.validate(q)
+
     def test_train_profile_exact_source_order_and_72_calls(self):
         p=prepared();name=m.MODELS['base'];model=p['models'][name]
         ids=list(m.train_helper.OLD_TRAIN)+[f'{f}_{3100000+100*i+v}' for i,f in enumerate(m.train_helper.FAMILIES) for v in (0,1)]
@@ -67,19 +89,29 @@ class DiagnosticSampleTests(unittest.TestCase):
                                        'authorized_cap_usd':530,'combined_bound_usd':529}))
             self.assertEqual(m.fresh_budget(path),m.sha(path))
 
-    def run_mock(self,fail_at=None):
+    def run_mock(self,fail_at=None,fresh=False):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);root=Path(tmp.name)
-        p=prepared();checkpoints=root/'parent';checkpoints.mkdir()
+        p=fresh_prepared() if fresh else prepared();checkpoints=root/'parent';checkpoints.mkdir()
+        new=root/'new';new.mkdir()
         for arm in ('point','intervention'):
             path=checkpoints/(arm+'_checkpoint.jsonl');path.write_text(json.dumps({'path':'tinker://private/'+arm})+'\n')
-            p['checkpoint_receipt_sha256'][arm]=m.sha(path)
-        (checkpoints/'start.jsonl').write_text(json.dumps({'prepared_sha256':'primary','project':m.PROJECT})+'\n')
+            p['checkpoint_receipt_sha256'][arm+'24' if fresh else arm]=m.sha(path)
+            if fresh:
+                path=new/(arm+'_checkpoint.jsonl');path.write_text(json.dumps({'path':'tinker://private/'+arm+'35'})+'\n')
+                p['checkpoint_receipt_sha256'][arm+'35']=m.sha(path)
+        if fresh:
+            for directory in (checkpoints,new):(directory/'common_init.jsonl').write_text('{"path":"tinker://private/initial"}\n')
+            p['common_init_receipt_sha256']=m.sha(checkpoints/'common_init.jsonl')
+            (new/'start.jsonl').write_text(json.dumps({'prepared_sha256':p['training35_prepared_sha256'],'project':m.PROJECT,
+                'common_init_receipt_sha256':p['common_init_receipt_sha256']})+'\n')
+            (new/'complete.jsonl').write_text(json.dumps({'steps_per_arm':35,'remaining_reserved_usd':'0'})+'\n')
+        (checkpoints/'start.jsonl').write_text(json.dumps({'prepared_sha256':p['primary_prepared_sha256'],'project':m.PROJECT})+'\n')
         (checkpoints/'complete.jsonl').write_text(json.dumps({'steps_per_arm':24,'remaining_reserved_usd':'0'})+'\n')
         prep=root/'prepared';prep.write_text(json.dumps(p));proof=root/'proof';proof.write_text(json.dumps(m.preflight(prep)))
         approval=root/'approval';approval.write_text(json.dumps({'execute_authorized':True,'project':m.PROJECT,
             'prepared_sha256':m.sha(prep),'runner_sha256':m.sha(m.__file__),'preflight_sha256':m.sha(proof),'cap_usd':p['upper_usd_decimal']}))
         budget=root/'budget';budget.write_text(json.dumps({'asof_utc':datetime.now(timezone.utc).isoformat(),'authorized_cap_usd':530,'combined_bound_usd':529}))
-        args=SimpleNamespace(prepared=prep,preflight=proof,approval=approval,fresh_budget=budget,checkpoints=checkpoints,out=root/'out')
+        args=SimpleNamespace(prepared=prep,preflight=proof,approval=approval,fresh_budget=budget,checkpoints=checkpoints,new_checkpoints=new,out=root/'out')
         submitted=[];drained=[];clones=[]
         class Future:
             def __init__(self,value,index=None):self.value=value;self.index=index
@@ -113,6 +145,16 @@ class DiagnosticSampleTests(unittest.TestCase):
         self.assertEqual(complete['first_responses'],80);self.assertEqual(complete['remaining_reserved_usd'],'0.000000')
         self.assertEqual(complete['training_steps'],0)
         for arm in m.POLICIES:self.assertEqual(len((args.out/(arm+'_raw.jsonl')).read_text().splitlines()),16)
+
+    def test_mock40_fresh_samples_restore_four_policies_and_enforce_common_initialization(self):
+        args,submitted,drained,clones=self.run_mock(fresh=True)
+        self.assertEqual(len(submitted),40);self.assertEqual(drained,list(range(40)))
+        self.assertEqual(clones,['tinker://private/point','tinker://private/intervention',
+                                 'tinker://private/point35','tinker://private/intervention35'])
+        for arm in m.FRESH_ROLES:self.assertEqual(len((args.out/(arm+'_raw.jsonl')).read_text().splitlines()),8)
+        p=json.loads(args.prepared.read_text())
+        (args.new_checkpoints/'common_init.jsonl').write_text('different initial state')
+        with self.assertRaisesRegex(ValueError,'share exact initial'):m.checkpoint_paths(args,p)
 
     def test_partial_submission_drains_and_retains_uncertain_bound(self):
         args,submitted,drained,clones=self.run_mock(fail_at=3)

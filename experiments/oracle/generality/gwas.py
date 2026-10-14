@@ -1853,6 +1853,35 @@ def labels(top: int = 2):
     print(f"wrote {OUT / 'labels.json'}: {len(out)} subcomponents; e.g.", *list(out.items())[:3], sep="\n  ")
 
 
+def labels_compare(without: str, with_: str):
+    """Decision test 3's result from env_d.py gate on the English written without and with the association labels
+    (the same writer, seed and texts): per text, E1 of the English read alone, overall and over the position events and
+    the structure events apart (gate's e1_position, e1_structure); means and paired differences (with minus without)
+    with 95% bootstrap intervals over texts, and the shuffled English's E1 as the reference -> OUT/labels_compare.json."""
+    A = {json.loads(x)["task"]: json.loads(x) for x in Path(without).read_text().splitlines() if x.strip()}
+    B = {json.loads(x)["task"]: json.loads(x) for x in Path(with_).read_text().splitlines() if x.strip()}
+    tasks = sorted(set(A) & set(B))
+    rng = np.random.default_rng(2951)
+    out = {"texts": len(tasks)}
+    for key, name in (("e1", "E1"), ("e1_position", "E1 over the position events"), ("e1_structure", "E1 over the structure events")):
+        pairs = [(A[t][key]["correct"], B[t][key]["correct"]) for t in tasks
+                 if A[t].get(key, {}).get("correct") is not None and B[t].get(key, {}).get("correct") is not None]
+        if not pairs:
+            continue
+        a_, b_ = np.array(pairs, float).T
+        d_ = b_ - a_
+        bs = d_[rng.integers(len(d_), size=(4000, len(d_)))].mean(1)
+        shuf = [A[t][key].get("shuffled") for t in tasks if A[t].get(key, {}).get("shuffled") is not None]
+        out[key] = {"without": float(a_.mean()), "with": float(b_.mean()), "difference": float(d_.mean()),
+                    "lo": float(np.percentile(bs, 2.5)), "hi": float(np.percentile(bs, 97.5)), "texts": len(d_),
+                    "with higher": int((d_ > 0).sum()), "shuffled (without)": float(np.mean(shuf)) if shuf else None}
+        print(f"{name:30s} without labels {a_.mean():+.3f}, with {b_.mean():+.3f}, difference {d_.mean():+.3f} "
+              f"[{np.percentile(bs, 2.5):+.3f}, {np.percentile(bs, 97.5):+.3f}], higher on {(d_ > 0).sum()} of {len(d_)} texts; "
+              f"another text's English {np.mean(shuf) if shuf else float('nan'):+.3f}")
+    (OUT / "labels_compare.json").write_text(json.dumps(out, indent=1))
+    print("wrote", OUT / "labels_compare.json")
+
+
 FIG = Path("/Users/user/mpd-data/figures/oracle")
 SHOW = {"next token (VPD's gate reads it)": "next token", "preferences (rustmove's)": "edit-goal token pairs (b after a)",
         "model behaviour: predicted token kind": "kind of token the model predicts", "model behaviour: confidence and loss": "the model's confidence and loss",
@@ -2017,12 +2046,14 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "annotate", "domain", "ngram", "export", "mech", "attention", "pheno", "assoc",
                                     "calib", "nullscan", "calibrate", "table", "figure", "figure_causal", "figure_counts", "conditional", "causal_plan", "causal", "probe",
-                                    "assoc_prefs", "edit_compare", "labels"))
+                                    "assoc_prefs", "edit_compare", "labels", "labels_compare"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     if a.cmd in ("extract", "mech"):
         globals()[a.cmd](*(int(x) for x in a.args))
     elif a.cmd == "edit_compare":
         edit_compare(*a.args)
+    elif a.cmd == "labels_compare":
+        labels_compare(*a.args)
     else:
         globals()[a.cmd]()

@@ -305,7 +305,7 @@ def service_client():
 
 
 def sample(a) -> None:
-    """N answers per question from a trained state (--init) or the base model alone, one sampling call per question:
+    """N answers per question (its "task", or an environment's "id") from a trained state (--init) or the base model alone, one sampling call per question:
     {"task", "sample", "text", "finish", "tokens", "seconds"} per answer, seconds from its call's submission to its result
     (every question's call in flight at once, so a text's wait in the shared queue counts; the cost columns' oracle time). --prefix: the answer starts with this text (its tokens
     after the chat prompt; the written text holds it), e.g. "CIRCUIT:\nANSWER 1:" for answers without a circuit."""
@@ -344,7 +344,7 @@ def sample(a) -> None:
                       sampled=sum(len(s.tokens) for s in res.sequences))
             for k, s in enumerate(res.sequences):
                 text, think = answer_of(renderer, tokenizer, s.tokens)
-                f.write(json.dumps({"task": q["task"], "sample": k, "text": a.prefix + text, "thinking_tokens": think,
+                f.write(json.dumps({"task": q.get("task") or q["id"], "sample": k, "text": a.prefix + text, "thinking_tokens": think,
                                     "finish": str(s.stop_reason), "tokens": len(s.tokens), "seconds": round(secs, 2)}) + "\n")
     print(json.dumps({"questions": len(questions), "samples": a.samples, "total_usd": spend.total,
                       "wall_seconds": round(time.perf_counter() - t0, 1)}), flush=True)

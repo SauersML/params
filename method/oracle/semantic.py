@@ -55,14 +55,56 @@ REMOVE_MIN = 0.5  # bits: a removal moving the top token's probability less than
 BLOCK = variables.BLOCK
 
 
-class Checker:
-    """Runs interventions on one text in the real model: check(items) with items [(intervention, outcome)]."""
+def graph_claim_binding(graph, tx, variables_):
+    """Exact execution-object binding, not a checkpoint-content certificate.
 
-    def __init__(self, sc: variables.Scorer, tx, variables_: list[dict], fresh_mean: bool = False, pool: str = "search"):
+    Explicit graphs only: materializing a multi-million-position mask here would
+    defeat the current compact-column Scorer. BLOCK carriers are rejected until
+    their full-output/remainder meaning has an explicit graph-bound contract.
+    """
+    import hashlib
+    import json
+    import goal_eval
+    if getattr(graph, 'masks', None) is not None:
+        raise ValueError('graph-bound invariants currently require explicit node graphs')
+    if len({v["name"] for v in variables_}) != len(variables_):
+        raise ValueError("distinct variable names required")
+    nodes=graph.node_set()
+    if any(c==BLOCK for _,_,c in nodes):
+        raise ValueError("graph-bound invariants do not support BLOCK nodes anywhere in graph")
+    for variable in variables_:
+        group=variable.get('group') or []
+        if not group or any(c==BLOCK for _,_,c in group):
+            raise ValueError('graph-bound invariants require nonempty scalar carriers; blocks unsupported')
+        if any(tuple(nd) not in nodes for nd in group):
+            raise ValueError('invariant carrier is absent from the executing graph')
+    digest=lambda value: hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+    return {'scope':'explicit_own_circuit_typed_claims_not_free_prose',
+            'graph_sha256':digest(goal_eval.to_json(graph)),
+            'input_sha256':digest({'token_ids':list(tx.ids),'target_positions':list(tx.targets)}),
+            'carriers_sha256':digest({v['name']:v['group'] for v in variables_}),
+            'source_sha256':{name:hashlib.sha256(Path(path).read_bytes()).hexdigest() for name,path in
+                            [('semantic',__file__),('variables',variables.__file__),('goal_eval',goal_eval.__file__),('native',native.__file__), ('engine',HERE/'engine.py'), ('carry',HERE/'carry.py'), ('vpd_model',HERE.parent/'vpd'/'vpd_model.py')]},
+            'remainders':'live_as_in_variables_Scorer',
+            'model_content_binding':'caller must separately bind exact model assets; not certified by these digests'}
+
+
+class Checker:
+    """Typed interventions in the full model (default) or an explicit own graph.
+
+    graph is opt-in; donors and means are from the SAME graph world, never
+    dense hidden values injected into a circuit. Remainders follow Scorer LIVE.
+    """
+
+    def __init__(self, sc: variables.Scorer, tx, variables_: list[dict], fresh_mean: bool = False, pool: str = "search", *, graph=None):
         self.sc, self.tx, self.nat, self.fresh_mean, self.pool = sc, tx, sc.nat, fresh_mean, pool
+        if graph is not None and pool != "search" and not fresh_mean:
+            raise ValueError("graph eval removal pools require fresh_mean=True")
+        self.graph = graph
+        self.binding = graph_claim_binding(graph, tx, variables_) if graph is not None else None
         self.vars = {v["name"]: v for v in variables_}
         self.keep = sorted(set(tx.targets) | {t for v in variables_ for _, t, _ in v["group"]})  # every patched position:
-        self.base = sc._text(tx.ids, tx.targets, check=False, positions=self.keep)  # the tables kept there alone
+        self.base = sc._text(tx.ids, tx.targets, check=False, positions=self.keep, **({"graph":graph} if graph is not None else {}))  # the tables kept there alone
         self.p0 = self.base["lq"][-1]
         self.y0 = int(self.p0.argmax())
         self._texts: dict = {}
@@ -78,7 +120,7 @@ class Checker:
             x = list(self.tx.ids)
             for p, z in key:
                 x[p] = z
-            self._texts[key] = self.sc._text(x, self.tx.targets, check=False, positions=self.keep)
+            self._texts[key] = self.sc._text(x, self.tx.targets, check=False, positions=self.keep, **({"graph":self.graph} if self.graph is not None else {}))
         return self._texts[key]
 
     def mean(self, name: str) -> dict:
@@ -122,7 +164,8 @@ class Checker:
                     act[n][t] = src["act"][n][t]
                     out[n][t] = src["out"][n][t]
                 else:
-                    act[n][t, c] = src["act"][n][t, c]
+                    column = c if self.base.get("col") is None else self.base["col"][n][c]
+                    act[n][t, column] = src["act"][n][t, column]
             nodes += list(group)
         return {"act": act, "out": out}, nodes
 
@@ -425,7 +468,7 @@ def one_input_checks(ck: "Checker", lines: list[tuple[dict, tuple]], rows: list[
 
 
 def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model: str = "vpd4l", fresh_mean: bool = False,
-                     pool: str = "search") -> dict:
+                     pool: str = "search", *, graph=None, include_baseline=False) -> dict:
     """The INVARIANTS lines checked in the real model: per line holds, surprise and credit; the total credit in bits
     and the share holding (lines naming a variable the answer lacks, or not parsing, count as failing bold claims of
     one bit). pool: the fresh tokens of removal means ("search", or "eval": disjoint from search's)."""
@@ -433,17 +476,50 @@ def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model:
     names = {v["name"] for v in vs}
     ok = [x for x in lines if all(n in names for n, _ in x["intervention"]["transplants"]) and all(n in names for n in x["intervention"]["remove"])]
     bad += len(lines) - len(ok)
-    ck = Checker(sc, tx, vs, fresh_mean=True, pool=pool) if fresh_mean else Checker(sc, tx, vs)
+    kwargs = {"graph":graph} if graph is not None else {}
+    ck = Checker(sc, tx, vs, fresh_mean=True, pool=pool, **kwargs) if fresh_mean else Checker(sc, tx, vs, **kwargs)
     try:
         rows = [{"id": x["id"], "line": x["line"], **r} for x, r in zip(ok, ck.check([(x["intervention"], x["outcome"]) for x in ok]))]
         one_input_checks(ck, [(x["intervention"], x["outcome"]) for x in ok], rows)
     finally:
         ck.close()
     total = sum(r["credit"] for r in rows) - bad
-    return {"invariants": rows, "bad": bad, "credit": total, "holds": sum(r["holds"] for r in rows) / max(len(rows) + bad, 1)}
+    result = {"invariants": rows, "bad": bad, "credit": total, "holds": sum(r["holds"] for r in rows) / max(len(rows) + bad, 1)}
+    if include_baseline:
+        result["baseline"] = {"top":ck.y0,"p_top":float(ck.p0[ck.y0].exp()),
+                              "relative_outcomes":"unchanged and probability ratios refer to this world baseline"}
+    if graph is not None:
+        result["execution_binding"] = ck.binding
+    return result
 
 
 _RULE = re.compile(r"^\s*RULES OUT\s*:\s*(.+?)\s*\|\s*(.+?)\s*->\s*(.+?)\s+vs\s+(.+?)\s*$")
+
+
+def check_invariants_contrast(sc, tx, vs, text, graph, model="vpd4l", *, fresh_mean=False, pool="search"):
+    """Same typed claims in full-model and own-circuit worlds; diagnostic only.
+
+    All donor activations and normalization are native to their own world.
+    `unchanged`/probability ratios refer to each world's own baseline. Both true
+    is not full-distribution fidelity, and never certifies arbitrary prose.
+    """
+    graph_claim_binding(graph, tx, vs)  # fail before ANY model run if unsupported
+    ids=[int(m.group(1)) for line in text.splitlines() if (m:=re.match(r"^\s*I(\d+)\s*:",line))]
+    if len(ids)!=len(set(ids)):
+        raise ValueError("duplicate invariant IDs cannot be paired")
+    if pool != "search" and not fresh_mean:
+        raise ValueError("graph eval removal pools require fresh_mean=True")
+    full=check_invariants(sc,tx,vs,text,model,fresh_mean,pool,include_baseline=True)
+    circuit=check_invariants(sc,tx,vs,text,model,fresh_mean,pool,graph=graph,include_baseline=True)
+    left={r['id']:r for r in full['invariants']};right={r['id']:r for r in circuit['invariants']}
+    if len(left)!=len(full["invariants"]) or len(right)!=len(circuit["invariants"]) or left.keys()!=right.keys() or any(left[k]['line']!=right[k]['line'] or left[k]['intervention']!=right[k]['intervention'] or left[k]['outcome']!=right[k]['outcome'] for k in left):
+        raise ValueError('full/circuit numeric claim identity mismatch')
+    return {'model':full,'circuit':circuit,'paired':[{'id':k,'line':left[k]['line'],
+            'model_holds':left[k]['holds'],'circuit_holds':right[k]['holds'],
+            'both_hold':bool(left[k]['holds'] and right[k]['holds']),
+            'model_top':left[k].get('top'),'circuit_top':right[k].get('top')} for k in left],
+            'draw_scope':{'fresh_mean':fresh_mean,'pool':pool},
+            'free_prose_verified':False,'reward_applied':False}
 
 
 def exclusive(a: tuple, b: tuple, y0: int) -> bool:

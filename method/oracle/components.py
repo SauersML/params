@@ -1817,7 +1817,7 @@ def e4_term(scorer, tx, graph, answer: dict, malformed: int, C: dict, split: str
             "circuit": (got.get("circuit") or {}).get("e4"), "gap": got.get("gap"), "per_variable": per}
 
 
-def invariant_diagnostic(ge, tx, answer: dict, model: str) -> dict:
+def invariant_diagnostic(ge, tx, answer: dict, model: str, *, graph=None) -> dict:
     """Execute formal claims on their decoded real-model carrier groups, separately from reward and free prose; the
     RULES OUT lines among them (semantic.check_rules_out: the alternative's outcome under the same intervention) as
     "rules_out" when there are any."""
@@ -1835,10 +1835,26 @@ def invariant_diagnostic(ge, tx, answer: dict, model: str) -> dict:
     except (ValueError, KeyError, TypeError):
         return {"executed": False, "reason": "invalid_variable_groups"}
     sc = variables.Scorer(ge)
-    out = {"executed": True, **semantic.check_invariants(sc, tx, groups, "\n".join(claims), model)}
+    if graph is None:
+        out = {"executed": True, **semantic.check_invariants(sc, tx, groups, "\n".join(claims), model)}
+    else:
+        try:
+            semantic.graph_claim_binding(graph, tx, groups)
+        except ValueError as exc:
+            return {"executed":False,"reason":"unsupported_graph_claim_binding","detail":str(exc),"free_prose_verified":False}
+        try:
+            contrast = semantic.check_invariants_contrast(sc, tx, groups, "\n".join(claims), graph, model)
+        except ValueError as exc:
+            return {"executed":False,"reason":"invalid_graph_invariant_claim","detail":str(exc),
+                    "free_prose_verified":False,"reward_applied":False}
+        out = {"executed":True, **contrast["model"], "circuit":contrast["circuit"],
+               "paired":contrast["paired"], "free_prose_verified":False,"reward_applied":False,
+               "scope":"same typed claims in full model and own circuit; neither proves distribution fidelity"}
     rules = [c for c in claims if c.startswith("RULES OUT")]
     if rules:
         out["rules_out"] = semantic.check_rules_out(sc, tx, groups, "\n".join(rules), model)
+        if graph is not None:
+            out["rules_out_scope"] = "full_model_only; graph-bound RULES OUT not implemented"
     return out
 
 
@@ -1866,7 +1882,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
            convention: str = CONVENTION, cache: dict | None = None, ee=None, edit_best: dict | None = None,
            pool: dict | None = None, vs=None, split: str | None = None, teacher: dict | None = None,
            lines: bool = False, node_cap: int | None = None, retain_calibration: bool = False,
-           invariants: bool = False) -> list[dict]:
+           invariants: bool = False, invariants_graph: bool = False) -> list[dict]:
     """Per answer text on one task, reward v3 (the lead's 10-12: faithful first, then small and explained; every term
     in bits, every term ranking, nothing clipped flat, every piece smooth): R = goal_eval.circuit_term (cap_phi(phi) -
     phi_tau - 4 v + g 2^(-20 v) Q + 0.04 tanh(compact / 2)) + D: against the text's bar, a constant of the text (below 0
@@ -1998,7 +2014,7 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
                 loo = loo_of[same[i]] if graphs[i].count() else {"bits": b, "lines": []}  # an empty circuit has no lines to credit
                 info["lines"] = line_credit(texts[i], p, loo, le.get(i), info, e2g.get(i), e4.get(i))
         if invariants:
-            info["invariant_diagnostic"] = (invariant_diagnostic(ge, tx, p["answer"], task["model"]) if valid[i]
+            info["invariant_diagnostic"] = (invariant_diagnostic(ge, tx, p["answer"], task["model"], **({"graph":graphs[i]} if invariants_graph else {})) if valid[i]
                                             else {"executed": False, "reason": "invalid_answer"})
         out.append({"reward": r, "circuit_reward": circ, "valid": valid[i], "semantics": getattr(ge, "semantics", None),
                     "environment": goal_eval.environment(), "donor_pool": ge.pool_id(split or "search"), **info,

@@ -896,9 +896,33 @@ def _groups(d) -> list:
     return out
 
 
-def assoc():
+def _permuted(d, seed: int = 1) -> dict:
+    """pheno.npz with every phenotype (and each masked group's mask) moved to another token sequence whole, one
+    permutation of the sequences for all of them; the covariates stay with their tokens."""
+    R = len(d["row"]) // SEQ
+    perm = np.random.default_rng(seed).permutation(R)
+    tok = (perm[:, None] * SEQ + np.arange(SEQ)[None, :]).reshape(-1)
+    out = {k: d[k] for k in d.files}
+    out["Y"] = d["Y"][tok]
+    out["position"] = d["position"]
+    for i, _ in enumerate(json.loads(str(d["groups"]))):
+        m = d[f"g{i}_mask"]
+        full = np.zeros((len(m), d[f"g{i}_Y"].shape[1]), np.float32)
+        full[m] = d[f"g{i}_Y"]
+        out[f"g{i}_mask"] = m[tok]
+        out[f"g{i}_Y"] = full[tok][m[tok]]
+    return out
+
+
+def nullscan():
+    """The scan once more with the phenotypes moved to other token sequences whole (_permuted): every test's statistic
+    under the null that keeps each sequence's structure -> OUT/nullscan.npz (z, partial r per pair)."""
+    assoc(null=True)
+
+
+def assoc(null: bool = False):
     """Every (subcomponent, phenotype) score test, BH over every tested pair -> OUT/assoc.npz (z, partial r, q per
-    pair; names and families per phenotype)."""
+    pair; names and families per phenotype). null: on _permuted phenotypes -> OUT/nullscan.npz (z, r)."""
     import time
     from math import sqrt
 
@@ -907,6 +931,8 @@ def assoc():
     t0 = time.time()
     G, off = genotypes()
     d = np.load(OUT / "pheno.npz")
+    if null:
+        d = _permuted(d)
     row = d["row"]
     print(f"genotypes {G.shape}, {G.nnz} active, {time.time() - t0:.0f} s", flush=True)
     zs, rs, ps, nm, fm = [], [], [], [], []
@@ -923,6 +949,10 @@ def assoc():
         print(f"{gname}: {len(names)} phenotypes, {time.time() - t0:.0f} s", flush=True)
     z = np.concatenate(zs, 1)
     r = np.concatenate(rs, 1)
+    if null:
+        np.savez(OUT / "nullscan.npz", z=z, r=r, names=json.dumps(nm))
+        print("wrote", OUT / "nullscan.npz", f"{time.time() - t0:.0f} s")
+        return
     p = np.concatenate(ps, 1)
     p[~np.isfinite(z)] = np.nan
     ok = np.isfinite(p)
@@ -951,6 +981,81 @@ def _rows_active(G, row: np.ndarray) -> np.ndarray:
     return out
 
 
+def _q(A) -> np.ndarray:
+    """The scan's q-values: from the null-calibrated p (calibrate) once there, else the t reference's."""
+    return A["q_cal"] if "q_cal" in getattr(A, "files", A) else A["q"]
+
+
+NULL_BINS = 8  # sparsity strata: quantile bins of the number of sequences a subcomponent is active in
+
+
+def _scaled_t(nz: np.ndarray) -> tuple:
+    """A scaled t fitted to null statistics |z| by their median and 99th percentile: (scale, degrees of freedom)."""
+    from scipy.optimize import brentq
+    from scipy.stats import t as tdist
+
+    a50, a99 = np.quantile(nz, [0.5, 0.99])
+    ratio = a99 / a50
+    f = lambda df: tdist.ppf(0.995, df) / tdist.ppf(0.75, df) - ratio  # noqa: E731
+    if f(1000.0) >= 0:  # no heavier than normal
+        df = 1000.0
+    elif f(1.0) <= 0:
+        df = 1.0
+    else:
+        df = brentq(f, 1.0, 1000.0)
+    return a50 / tdist.ppf(0.75, df), df
+
+
+def calibrate():
+    """The scan's p-values from its own null (nullscan.npz): per (phenotype family, sparsity stratum), a scaled t fitted
+    to the null statistics (_scaled_t), each observed z's p from it, BH over every test -> OUT/assoc.npz gains p_cal
+    and q_cal; OUT/null_fit.json the fits and the null's rejection rates (by construction near nominal; the real
+    scan's hits at q_cal < 0.05)."""
+    from scipy.stats import t as tdist
+
+    A = dict(np.load(OUT / "assoc.npz"))
+    N = np.load(OUT / "nullscan.npz")
+    z, nz = A["z"].astype(np.float64), N["z"].astype(np.float64)
+    fams = json.loads(str(A["families"]))
+    G, _ = genotypes()
+    d = np.load(OUT / "pheno.npz")
+    rows_s = _rows_active(G, d["row"])
+    tested = np.isfinite(z).any(1)
+    edges = np.quantile(rows_s[tested], np.linspace(0, 1, NULL_BINS + 1)[1:-1])
+    sb = np.searchsorted(edges, rows_s, side="right")
+    p = np.full(z.shape, np.nan)
+    fits = []
+    for f in sorted(set(fams)):
+        cols = np.array([j for j, x in enumerate(fams) if x == f])
+        for b in range(NULL_BINS):
+            rws = np.flatnonzero(sb == b)
+            nul = np.abs(nz[np.ix_(rws, cols)])
+            nul = nul[np.isfinite(nul)]
+            if len(nul) < 200:
+                continue
+            sc, df = _scaled_t(nul)
+            obs = z[np.ix_(rws, cols)]
+            p[np.ix_(rws, cols)] = 2 * tdist.sf(np.abs(obs) / sc, df)
+            fits.append({"family": f, "stratum": b, "null tests": int(len(nul)), "scale": float(sc), "df": float(df),
+                         "null share beyond nominal p 0.001": float(np.mean(2 * tdist.sf(nul / sc, df) < 1e-3))})
+    ok = np.isfinite(p)
+    q = np.full(p.shape, np.nan)
+    pv = p[ok]
+    order = np.argsort(pv)
+    qs = pv[order] * len(pv) / np.arange(1, len(pv) + 1)
+    qs = np.minimum.accumulate(qs[::-1])[::-1]
+    qq = np.empty(len(pv))
+    qq[order] = np.minimum(qs, 1.0)
+    q[ok] = qq
+    A["p_cal"], A["q_cal"] = p.astype(np.float32), q.astype(np.float32)
+    np.savez(OUT / "assoc.npz", **A)
+    hit = (q < 0.05)
+    (OUT / "null_fit.json").write_text(json.dumps({"fits": fits, "hits q_cal<0.05": int(hit.sum()),
+                                                   "hits q_cal<0.05 and |r|>=0.1": int((hit & (np.abs(A["r"]) >= 0.1)).sum())}, indent=1))
+    print(f"calibrated: {ok.sum()} tests, {int(hit.sum())} at q_cal < 0.05, {int((hit & (np.abs(A['r']) >= 0.1)).sum())} of them with |r| >= 0.1; "
+          f"null scale median {np.median([f_['scale'] for f_ in fits]):.2f}, df median {np.median([f_['df'] for f_ in fits]):.1f}")
+
+
 def calib(k: int = 48):
     """The scan's calibration under a null: k random phenotypes moved to other rows whole (a row permutation keeps each
     row's structure, position profile included, and breaks every association), the share of tests at p < 0.05 and
@@ -971,8 +1076,11 @@ def calib(k: int = 48):
     pn = erfc(np.abs(res["z"].astype(np.float64)) / math.sqrt(2))
     out = {"phenotypes": [json.loads(str(d["names"]))[c] for c in cols], "bins": []}
     ok = np.isfinite(res["z"])
+    ar = np.abs(res["r"][ok])
     out["all"] = {"tests": int(ok.sum()), "t p<0.05": float((res["p"][ok] < 0.05).mean()), "t p<0.001": float((res["p"][ok] < 1e-3).mean()),
-                  "normal p<0.05": float((pn[ok] < 0.05).mean()), "normal p<0.001": float((pn[ok] < 1e-3).mean())}
+                  "normal p<0.05": float((pn[ok] < 0.05).mean()), "normal p<0.001": float((pn[ok] < 1e-3).mean()),
+                  "|r|>=0.05": float((ar >= 0.05).mean()), "|r|>=0.1": float((ar >= 0.1).mean()), "|r| 99.9th percentile": float(np.quantile(ar, 0.999)),
+                  "t p<0.001 and |r|>=0.1": float(((res["p"][ok] < 1e-3) & (ar >= 0.1)).mean())}
     for lo, hi in ((0, 50), (50, 200), (200, 500), (500, 10 ** 6)):
         m = ok & ((rows_s >= lo) & (rows_s < hi))[:, None]
         if m.any():
@@ -988,7 +1096,7 @@ def table(r_min: float = 0.1):
     strongest; per subcomponent with hits, its top families (each by its strongest phenotype) -> OUT/table.txt and
     OUT/families.json."""
     A = np.load(OUT / "assoc.npz")
-    z, r, q = A["z"], A["r"], A["q"]
+    z, r, q = A["z"], A["r"], _q(A)
     names, fams = json.loads(str(A["names"])), json.loads(str(A["families"]))
     off = json.loads(str(A["offsets"]))
     sites = sorted(off, key=off.get)
@@ -1074,8 +1182,8 @@ def conditional(top: int = 100, steps: int = 30):
     A = np.load(OUT / "assoc.npz")
     d = np.load(OUT / "pheno.npz")
     names = json.loads(str(A["names"]))
-    z, q = A["z"], A["q"]
-    pstar = float(np.nanmax(np.where(q < 0.05, A["p"], np.nan)))  # the scan's own threshold: the largest p with q < 0.05
+    z, q = A["z"], _q(A)
+    pstar = float(np.nanmax(np.where(q < 0.05, A["p_cal"] if "p_cal" in A.files else A["p"], np.nan)))  # the largest p with q < 0.05
     row = d["row"]
     where = {}
     for gname, fams_, names_, Y, C, sel in _groups(d):
@@ -1372,7 +1480,7 @@ def _bounds_ci(d: np.ndarray, B: int = 2000, seed: int = 2951) -> tuple:
 
 MODEL_FAMS = ("model behaviour", "attention", "measured mechanism", "training-data frequency", "preferences")
 CONTEXT_FAMS = ("text structure", "syntax and discourse", "document domain", "programming language", "position")
-TOP_HITS, PER_PHENO = 200, 5
+TOP_HITS, PER_PHENO, PER_FAMILY = 200, 2, 7
 
 
 def _route(family: str) -> str:
@@ -1391,21 +1499,22 @@ def _route(family: str) -> str:
 
 def causal_plan():
     """The causal follow-up's plan, on the Mac (it reads the scan): the TOP_HITS strongest hits (q < 0.05, by |partial
-    r|, at most PER_PHENO per phenotype), each routed (_route); for removals the NULL_POOL random subcomponents; for
+    r|, at most PER_PHENO per phenotype and PER_FAMILY per family), each routed (_route); for removals the NULL_POOL random subcomponents; for
     input edits up to EDITS of the scan's positions where the subcomponent is active and the phenotype holds (graded:
     its upper quarter, or lower for a negative r), each with the positions to change -> OUT/causal_plan.json (a pod
     runs it with corpus.npy and replicate.npy alone)."""
     A = np.load(OUT / "assoc.npz")
     names, fams = json.loads(str(A["names"])), json.loads(str(A["families"]))
-    z, q, r = A["z"], A["q"], A["r"]
+    z, q, r = A["z"], _q(A), A["r"]
     n_act = A["n_active"]
     rng = np.random.default_rng(2951)
     cand = np.argwhere(q < 0.05)
     cand = cand[np.argsort(-np.abs(r[cand[:, 0], cand[:, 1]]))]
-    per, hits = {}, []
+    per, per_f, hits = {}, {}, []  # the strongest hits of every family (token identity alone would fill the top 200)
     for c, j in cand:
-        if per.get(j, 0) < PER_PHENO:
+        if per.get(j, 0) < PER_PHENO and per_f.get(fams[j], 0) < PER_FAMILY:
             per[j] = per.get(j, 0) + 1
+            per_f[fams[j]] = per_f.get(fams[j], 0) + 1
             hits.append((int(c), int(j)))
         if len(hits) >= TOP_HITS:
             break
@@ -1598,7 +1707,7 @@ def probe():
     df = pd.read_csv(PROBE, keep_default_na=False, na_values=[""])
     df = df[df.groupby("text").q_pool_imp.transform(lambda x: x.notna().all())].reset_index(drop=True)
     A = np.load(OUT / "assoc.npz")
-    r, q = A["r"], A["q"]
+    r, q = A["r"], _q(A)
     fams = json.loads(str(A["families"]))
     off = json.loads(str(A["offsets"]))
     sig = np.nan_to_num(np.where(q < 0.05, np.abs(r), 0.0))
@@ -1646,7 +1755,7 @@ def assoc_prefs():
     circuit_ft --rank 4 --assoc on it compares the association-picked edit with the circuit-picked one on one pod."""
     A = np.load(OUT / "assoc.npz")
     names = json.loads(str(A["names"]))
-    z, q = A["z"], A["q"]
+    z, q = A["z"], _q(A)
     off = json.loads(str(A["offsets"]))
     sites = sorted(off, key=off.get)
     starts = np.array([off[n] for n in sites])
@@ -1686,7 +1795,7 @@ def figure(r_min: float = 0.1):
     import figure as fg
 
     A = np.load(OUT / "assoc.npz")
-    z, r, q = A["z"], A["r"], A["q"]
+    z, r, q = A["z"], A["r"], _q(A)
     fams = json.loads(str(A["families"]))
     off = json.loads(str(A["offsets"]))
     sites = sorted(off, key=off.get)
@@ -1721,7 +1830,8 @@ def figure(r_min: float = 0.1):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "annotate", "domain", "ngram", "export", "mech", "attention", "pheno", "assoc",
-                                    "calib", "table", "figure", "conditional", "causal_plan", "causal", "probe", "assoc_prefs"))
+                                    "calib", "nullscan", "calibrate", "table", "figure", "conditional", "causal_plan", "causal", "probe",
+                                    "assoc_prefs"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     if a.cmd in ("extract", "mech"):

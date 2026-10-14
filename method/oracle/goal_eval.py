@@ -4764,8 +4764,8 @@ class GoalEval:
         Search: sign-gradient steps of ADV_STEP on the relaxed lever, each projected onto its m largest entries, from
         restarts starts (one the gradient's top m at nothing switched on, the others random), then the top m
         switched on and scored in float32, beside the m best of a measured shortlist (SCREEN parts with the largest
-        gradient either way, each switched on alone, in the search precision: the screens only rank which parts are
-        tried; every reported number is a float32 run); the worst of them, at most m (no weaker than a smaller budget).
+        gradient either way, each switched on alone); every step, screen and reported number in float32 on every
+        device (the picks the same on any device); the worst of them, at most m (no weaker than a smaller budget).
         A budget past the lever's parts (a circuit leaving out fewer than m VPD actives) switches every one on, and a
         circuit leaving out none scores its own run there (VPD's complete answer: 1). Per circuit {f"f1_flips_{lever}": {m: f1_adv},
         f"kl_flips_{lever}": {m: (KL_C, KL_VPD)}, f"mask_flips_{lever}": {m: the parts switched on, (site, position,
@@ -4783,7 +4783,8 @@ class GoalEval:
         gen = torch.Generator().manual_seed(int(tx.seed) % (2 ** 63))
         omitted = lever == "omitted"  # the patterns stay off: VPD's paired run is VPD's answer alone, run once
         pick, problems, batch = self._adv_problem(tx, graphs, pool, k, gen, batched=True, patterns=not omitted, strengths=strengths)
-        search = _search(dev)  # the sign steps' and screens' precision (every reported number: float32)
+        search = "score"  # the sign steps and screens in float32 on every device (bf16 on CUDA before: the picks
+        # differed by device, so the reward's flips family did too; every reported number was float32 already)
         sizes = [[len(idx[n][0]) for n in nat.names] for _, idx, _ in problems]
         N = [sum(z) if omitted else len(pick) for z in sizes]
 

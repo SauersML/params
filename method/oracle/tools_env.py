@@ -264,6 +264,7 @@ class Tools:
         self.routed: dict = {}
         self.memo: dict = {}
         self.seconds: dict = {}  # tool -> [seconds of each uncached call]
+        self.prefetched: dict = {}  # (tool, arguments) -> its share of the batch that scored it (prefetch), until asked
 
     # ---- dispatch
 
@@ -566,13 +567,14 @@ class Tools:
                 "effects": [[components.node_text(nd), _r(a), _r(b)] for nd, a, b in page],
                 "_order": [components.node_text(nd) for nd, _, _ in rows[::-1]]}
 
-    def _score(self, g) -> dict:
+    def _scores(self, gs: list) -> list[dict]:
+        """run_circuit's point and path-patched scores of drafts, each score's runs for every draft at once."""
         ge, tx = self.ge, self.tx
-        cg = goal_eval._c_graph(g, self.targets, self.nat.C)
-        pt = ge.sufficiency(tx, [cg])[0]
-        pp = ge.track_pp(tx, [goal_eval.strand(g, self.targets, self.nat.C)], self.split)[0]
-        return {"point": _r(pt["f1_live"]), "point_kl_bits": _r(pt["kl_live"]), "necessity": _r(pt["n_live"]),
-                "pp": _r(pp["s_track_pp"]), "pp_kl_bits": _r(pp["kl_track_pp_c"]), "pp_inputs": pp["prompts_track_pp"]}
+        pts = ge.sufficiency(tx, [goal_eval._c_graph(g, self.targets, self.nat.C) for g in gs])
+        pps = ge.track_pp(tx, [goal_eval.strand(g, self.targets, self.nat.C) for g in gs], self.split)
+        return [{"point": _r(pt["f1_live"]), "point_kl_bits": _r(pt["kl_live"]), "necessity": _r(pt["n_live"]),
+                 "pp": _r(pp["s_track_pp"]), "pp_kl_bits": _r(pp["kl_track_pp_c"]), "pp_inputs": pp["prompts_track_pp"]}
+                for pt, pp in zip(pts, pps)]
 
     def _proxy(self):
         """The Text the families run on: the tools' Text (its model runs, VPD's answer, its probe: F2's positions)
@@ -588,23 +590,26 @@ class Tools:
             self._px = px
         return self._px
 
-    def _families(self, g, bits: float) -> dict:
+    def _families(self, gs: list, bits: list) -> list[dict]:
+        """run_circuit families=true's reward pieces of drafts, the reward's fidelity of every draft at once."""
         ge, px = self.ge, self._proxy()
-        row = ge.fidelity(px, [g], self.pool, mode="reward", split=self.split)[0]
+        rows = ge.fidelity(px, gs, self.pool, mode="reward", split=self.split)
         tau = ge.tau(px, self.pool, self.split)
-        ph, _ = goal_eval.phi(row, families=tau.get("families"))
-        pt = tau.get("phi_tau")
-        comp = goal_eval.compact(bits, tau.get("bits_start"))
-        gate = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (ph - pt)))
-        ct = goal_eval.circuit_term(row, tau, bits)          # the reward's own circuit term and its hard shortfall
-        return {"phi": _r(ph), "bar": _r(pt), "gate": _r(gate, 2), "compact": _r(comp), "reward": _r((ph or 0.0) + (gate or 0.0) * 0.5 * (comp or 0.0)),
-                "term": _r(ct["term"]), "shortfall": _r(ct["v"], 4),
-                "families": {f: _r(goal_eval.family_score(row, f), 2) for f in (tau.get("families") or goal_eval.PHI_FAMILIES)}}
+        out = []
+        for row, b in zip(rows, bits):
+            ph, _ = goal_eval.phi(row, families=tau.get("families"))
+            pt = tau.get("phi_tau")
+            comp = goal_eval.compact(b, tau.get("bits_start"))
+            gate = None if ph is None or pt is None else 1.0 / (1.0 + 2.0 ** (-components.GATE_SLOPE * (ph - pt)))
+            ct = goal_eval.circuit_term(row, tau, b)          # the reward's own circuit term and its hard shortfall
+            out.append({"phi": _r(ph), "bar": _r(pt), "gate": _r(gate, 2), "compact": _r(comp),
+                        "reward": _r((ph or 0.0) + (gate or 0.0) * 0.5 * (comp or 0.0)), "term": _r(ct["term"]), "shortfall": _r(ct["v"], 4),
+                        "families": {f: _r(goal_eval.family_score(row, f), 2) for f in (tau.get("families") or goal_eval.PHI_FAMILIES)}})
+        return out
 
-    def run_circuit(self, circuit=None, nodes=None, edges=None, positions=None, complete=None, changes=None, _json=None,
-                    base=None, add=None, drop=None, families: bool = False) -> dict:
-        if base is not None or add or drop:
-            raise ToolError("base, add and drop need an episode's drafts (the environment resolves them)")
+    def _head(self, circuit=None, nodes=None, edges=None, positions=None, complete=None, _json=None) -> tuple:
+        """A draft's stranded Graph, its defects, parse()'s form and run_circuit's result before any score (size,
+        bits, defects, the circuit JSON as side data)."""
         g, d, p = self._graph(circuit, nodes=nodes, edges=edges, positions=positions, complete=complete, _json=_json)
         g = goal_eval.strand(g, self.targets, self.nat.C)
         defects = {"dropped_nodes": d["invalid_nodes"] + d["unknown_ids"] + p.get("malformed_nodes", 0) * (_json is None and circuit is None),
@@ -613,13 +618,63 @@ class Tools:
                "bits": _r(self._bits(g, p, d)), **{k: v for k, v in defects.items() if v}, "_json": p["answer"]}  # defects when any
         if p.get("bad_examples"):
             out |= {"bad_examples": p["bad_examples"], "hint": MERMAID_HINT}
+        return g, d, p, out
+
+    def _scored(self, heads: list, families: bool) -> list[dict]:
+        """run_circuit's results (no changes) of drafts (_head()'s), every draft in one batch per score: the numbers
+        one at a time gives, up to the batch's float32 rounding (each draft's draws are seeded by its own circuit)."""
+        gs = [g for g, _, _, _ in heads]
+        got = [{**out, **sc} for (_, _, _, out), sc in zip(heads, self._scores(gs))]
+        if families:
+            for x, fam in zip(got, self._families(gs, [self._bits(g, p, d) for g, d, p, _ in heads])):
+                x |= fam
+        return got
+
+    RUN_ARGS = {"circuit", "nodes", "edges", "positions", "complete", "_json", "families"}  # prefetch's run_circuit calls
+
+    def prefetch(self, calls: list) -> None:
+        """Score a turn's uncached run_circuit calls (no changes, drafts resolved: (tool, arguments)) together:
+        _scored() of every draft, the families' and the plain ones apart, each result kept as its own call's (memo,
+        its share of the batch's seconds in prefetched) for call_full to answer. A call whose draft does not build is
+        left to call_full (its error), and so is a lone call (one at a time already)."""
+        todo, seen = {True: [], False: []}, set()
+        for name, args in calls:
+            key = (name, json.dumps(args, sort_keys=True))
+            if name != "run_circuit" or key in self.memo or key in seen or not set(args) <= self.RUN_ARGS:
+                continue
+            seen.add(key)
+            try:
+                head = self._head(**{k: v for k, v in args.items() if k != "families"})
+            except (ToolError, TypeError):
+                continue
+            if head[0].count():
+                todo[bool(args.get("families"))].append((key, head))
+        for fam, group in todo.items():
+            if len(group) < 2:
+                continue
+            t0 = time.perf_counter()
+            try:
+                got = self._scored([h for _, h in group], fam)
+            except Exception:  # (out of memory, say): one at a time, as without the batch
+                continue
+            finally:
+                native.free(self.nat.dev)
+            dt = (time.perf_counter() - t0) / len(group)
+            for (key, _), out in zip(group, got):
+                side = {k: out.pop(k) for k in [k for k in out if k.startswith("_")]}
+                self.memo[key] = (json.dumps(out, separators=(",", ":"), ensure_ascii=False), side)
+                self.seconds.setdefault("run_circuit", []).append(dt)
+                self.prefetched[key] = dt
+
+    def run_circuit(self, circuit=None, nodes=None, edges=None, positions=None, complete=None, changes=None, _json=None,
+                    base=None, add=None, drop=None, families: bool = False) -> dict:
+        if base is not None or add or drop:
+            raise ToolError("base, add and drop need an episode's drafts (the environment resolves them)")
+        g, d, p, out = self._head(circuit, nodes=nodes, edges=edges, positions=positions, complete=complete, _json=_json)
         if not g.count():
             return {**out, "error": "no valid node left"}
         if changes is None:
-            got = {**out, **self._score(g)}
-            if families:
-                got |= self._families(g, self._bits(g, p, d))
-            return got
+            return self._scored([(g, d, p, out)], families)[0]
         x2 = self._changed(changes)
         ge, tx = self.ge, self.tx
         with torch.no_grad():
@@ -862,7 +917,8 @@ class Episode:
             self.log.append([name, args, 0.0, False])
             return json.dumps({"error": str(e)})
         key = (name, json.dumps(full, sort_keys=True))
-        cached = key in self.tools.memo
+        pre = self.tools.prefetched.pop(key, None)  # scored with the rest of its turn (prefetch): its share of the batch
+        cached = key in self.tools.memo and pre is None
         text, side = self.tools.call_full(name, full)
         did = None
         if "_json" in side and text.endswith("}"):  # a scored draft: its id
@@ -874,7 +930,7 @@ class Episode:
         self.asked[key] = self.asked.get(key, 0) + 1
         if self.asked[key] > 1 and text.endswith("}"):  # the same call again in this episode: the same result
             text = text[:-1] + f',"repeated":{self.asked[key] - 1}}}'
-        self.log.append([name, args, round(time.perf_counter() - t0, 3), cached])
+        self.log.append([name, args, round(pre if pre is not None else time.perf_counter() - t0, 3), cached])
         return text
 
     def step(self, message: dict) -> bool:
@@ -886,6 +942,18 @@ class Episode:
         if not calls:
             self.answer = message.get("content") or ""
             return True
+        batch = []  # the turn's calls with their drafts resolved, for one batch of its run_circuit calls (prefetch)
+        for c in calls[:max(0, MAX_CALLS - self.calls)]:
+            fn = c.get("function", c)
+            args = fn.get("arguments")
+            try:
+                args = json.loads(args) if isinstance(args, str) and args.strip() else args
+                if isinstance(args, dict):
+                    batch.append((fn["name"], self._resolve(fn["name"], args)))
+            except (ToolError, json.JSONDecodeError, KeyError, TypeError):
+                pass  # (call() reports it)
+        self._inherit = None
+        self.tools.prefetch(batch)
         for c in calls:
             if self.calls >= MAX_CALLS:
                 break

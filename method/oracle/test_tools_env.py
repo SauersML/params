@@ -338,3 +338,35 @@ if __name__ == "__main__":
         fn(e)
         print(f"{name} passed ({time.perf_counter() - t0:.1f} s)", flush=True)
     print("all passed")
+
+
+def test_a_turns_run_circuit_calls_are_scored_together(env):
+    """Episode.step scores a turn's run_circuit calls in one batch per score (Tools.prefetch): each result is the
+    call's own one at a time (to the results' rounding), and the log gives each call its share, none marked cached."""
+    t = 11
+    calls = [{"name": "run_circuit", "arguments": {"positions": [t] + ps, "families": fam}}
+             for ps in ([], [t - 1], [t - 1, t - 2]) for fam in (True, False)]
+
+    def fresh():
+        e = tools_env.Env(env.rows, env.ge, score_split="eval", facts=False, pool={})
+        e.tasks = env.tasks
+        return e
+    alone_tools = fresh().text_tools(TID)
+    alone = [json.loads(alone_tools.call(c["name"], c["arguments"])) for c in calls]
+    ep = fresh().reset(TID)
+    ep.step({"role": "assistant", "content": "", "tool_calls": calls})
+    got = [json.loads(m["content"]) for m in ep.messages if m["role"] == "tool"]
+    assert len(got) == len(calls) and not ep.tools.prefetched and len(ep.tools.seconds["run_circuit"]) == len(calls)
+    assert all(not cached and sec > 0 for _, _, sec, cached in ep.log)
+
+    def close(a, b):
+        if isinstance(a, dict):
+            return set(a) == set(b) and all(close(a[k], b[k]) for k in a)
+        if isinstance(a, list):
+            return len(a) == len(b) and all(close(x, y) for x, y in zip(a, b))
+        if isinstance(a, float) and isinstance(b, float):
+            return abs(a - b) <= 2e-3
+        return a == b
+    for a, b in zip(alone, got):
+        b.pop("draft", None)
+        assert close(a, b), (a, b)

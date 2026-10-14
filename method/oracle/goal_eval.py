@@ -114,6 +114,9 @@ SCREEN = 256  # the adversary's shortlist measured one by one: the parts with th
 # whole removal can move the other way from its gradient: text-free tiny model, the best single removal ranks last)
 SCREEN_ROWS = 16  # rows per run when measuring the shortlist
 CHANGED_ROWS = 64  # the changed-input family's circuit rows per run on the changed texts (circuits x changed texts)
+FLIP_GRAD_TOKENS = 20480  # adversary_flips' sign steps: rows x text positions per gradient run at most (FLIP_ROWS'
+# 128 rows of an RL group, 16 circuits x 2 budgets x 4 restarts, took 31.6 GiB on a 484-token text, the scorer's peak:
+# run 3's dry run, 10-14); texts up to 128 positions run as before, and every circuit and budget's attack is its own
 FLIP_ROWS = 160  # adversary_flips' rows per run: every circuit's restarts at every budget (8 x 5 x 4) together
 EDGE_ROWS = 128  # the connection-cut family's rows per run of a side (whole circuits' draws): a teacher's 32 candidates x
 # 32 draws in one run took about 9 GiB above the text's caches on text9008 (367 tokens), the teacher's peak
@@ -5248,7 +5251,7 @@ class GoalEval:
             x = starts[(i, m)]
             x[0] = g0[i][0]
             xs[(i, m)] = top(x, m).clamp(0, 1)
-        per = max(1, FLIP_ROWS // restarts)
+        per = max(1, min(FLIP_ROWS, FLIP_GRAD_TOKENS // tx.T) // restarts)
         for s0 in range(0, len(pairs), per):  # every circuit's restarts at every budget together, FLIP_ROWS rows a run
             group = pairs[s0:s0 + per]
             for _ in range(steps):

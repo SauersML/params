@@ -1327,6 +1327,21 @@ def test_flips_report_float32_rescores(tiny, monkeypatch):
             assert abs(got - want) < 1e-5 + 1e-4 * abs(want), (m, got, want)
 
 
+def test_adversary_flips_sign_step_runs_split_by_tokens(tiny, monkeypatch):
+    """FLIP_GRAD_TOKENS splits the sign steps' gradient runs by rows x positions: each circuit and budget's attack is its
+    own (its restarts drawn before any run), so the flips are the same however the runs are split (one pair a run)."""
+    nat, ge, tx = tiny
+    nodes = sorted(native.Graph(masks=tx.vpd).node_set())
+    graphs = [native.Graph(nodes[::3], complete=True), native.Graph(nodes[1::4], complete=True)]
+    pool = tiny_pool(nat, tx.ids)
+    want = ge.adversary_flips(tx, graphs, pool, "omitted", ms=(1, 4), steps=3, restarts=2)
+    monkeypatch.setattr(goal_eval, "FLIP_GRAD_TOKENS", tx.T)
+    got = ge.adversary_flips(tx, graphs, pool, "omitted", ms=(1, 4), steps=3, restarts=2)
+    for w, g in zip(want, got):
+        assert w["mask_flips_omitted"] == g["mask_flips_omitted"]
+        for m, (kc, kv) in w["kl_flips_omitted"].items():
+            assert abs(g["kl_flips_omitted"][m][0] - kc) <= 1e-6 * (1 + kc) and abs(g["kl_flips_omitted"][m][1] - kv) <= 1e-6 * (1 + kv)
+
 def test_edge_flips_are_adversary_flips_on_the_subsets(tiny):
     """edge_flips on connection subsets of one node set gives adversary_flips' numbers and masks on those subsets
     stated as their own graphs with stranded nodes dropped (to 1e-6 relative; float32 on the tiny model's device):

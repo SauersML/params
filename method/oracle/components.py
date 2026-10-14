@@ -3361,6 +3361,10 @@ def _report(per: dict, base: dict, e1: dict | None, labels: dict | None, want, b
 
 
 def main():
+    import os
+
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # (as teacher.main and serve_components:
+    # read at the first CUDA allocation; reserved memory near allocated, the numbers the same)
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     q = sub.add_parser("questions")

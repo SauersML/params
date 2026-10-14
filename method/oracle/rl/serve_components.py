@@ -50,6 +50,9 @@ TEXTS_KEPT = int(os.environ.get("SCORER_TEXTS_KEPT", "8"))  # goal_eval.Text obj
 # arrive in several requests), the oldest freed past it after each text's request, scored or failed. 0 frees each text
 # after its request: at f00abd2 an A40 process held 22 GB after one text and 39.5 GB after two, so two processes
 # keeping theirs ran a 48 GB card out of memory (RL run 3's dry run, 10-14)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # CUDA's allocator in expandable segments,
+# read at each scoring process's first allocation (as teacher.main: text9008's teacher reserved 27.9 GiB for a 21.0 GiB
+# peak in fixed blocks); the numbers are the same
 
 
 def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url: str | None, reader_base: str, edit_teach: list,

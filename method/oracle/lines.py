@@ -379,7 +379,12 @@ def finish(ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: LinePruner, g0: nativ
     tr_nodes = ge.track_pp(tx, [g0], "eval")[0]["s_track_pp"]
     tau = ge.tau(tx, pool, "search")
     row = ge.fidelity(tx, [g], pool, mode="reward", split="search")[0]
+    row_nodes = teacher.reward_row(ge, tx, g0, pool)
     v = goal_eval.shortfall(row, tau.get("floors") or {})
+    fams = list(tau.get("floors") or goal_eval.PHI_FAMILIES)
+    scores = {f: goal_eval.family_score(row, f) for f in fams}
+    scores_nodes = {f: goal_eval.family_score(row_nodes, f) for f in fams}
+    kinds = [c[0] for c in (pr.lines[j] for j in pr.on.nonzero().flatten().tolist())]
     on = pr.on.nonzero().flatten().tolist()
     drop = pr.on[None].repeat(len(on), 1)
     drop[torch.arange(len(on)), torch.tensor(on, dtype=torch.long)] = False
@@ -401,12 +406,15 @@ def finish(ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: LinePruner, g0: nativ
              for nd, a, b in zip(kept, ppt, ptr)]
     rec = {"task": stem, "parts_start": len(pr.node_at), "lines_start": len(pr.lines), "parts": len(kept), "lines": len(on),
            "point": point, "point_wired": point_full, "track_eval": tr, "track_eval_wired": tr_full, "track_eval_nodes": tr_nodes,
+           "token_edges": kinds.count("t") + kinds.count("u"), "connections": kinds.count("e") + kinds.count("o"),
+           "positions": sorted({p for _, p, _ in kept}), "families": scores, "families_nodes": scores_nodes,
            "v": v, "floors": tau.get("floors"), "trace": state["trace"], "refused": state.get("refused"),
            "line_effects": lines, "part_effects": nodes}
     (out / f"{stem}.json").write_text(json.dumps(goal_eval.to_json(g)))
     (out / f"{stem}.lines.json").write_text(json.dumps(rec))
-    log(f"{stem}: {len(kept)} parts, {len(on)} lines of {len(pr.lines)}; point {point:.4f} bits (wired {point_full:.4f}); eval "
-        f"s_track_pp {tr} (wired {tr_full}, node set {tr_nodes}); v {v:.3f}")
+    log(f"{stem}: {len(kept)} parts, {len(on)} lines of {len(pr.lines)} ({rec['token_edges']} token edges); point {point:.4f} bits "
+        f"(wired {point_full:.4f}); eval s_track_pp {tr} (wired {tr_full}, node set {tr_nodes}); v {v:.3f}; families {scores}; "
+        f"node set's {scores_nodes}")
     return 0
 
 

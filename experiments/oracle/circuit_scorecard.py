@@ -31,7 +31,7 @@ The criteria run cheapest first (floors and known, edits, size, minimal, stated)
 after each. Writes OUT/<task>.json per circuit (a circuit already written is skipped), OUT/rows.jsonl (one line per
 circuit) and OUT/summary.json, and prints the table.
 
-  circuit_scorecard.py DIR_OR_FILE [...] --out OUT [--only text9000,...] [--pool FILE] [--vpd FILE ...] [--offset K --stride S]
+  circuit_scorecard.py DIR_OR_FILE [...] --out OUT [--only text9000,... | --only dev20] [--pool FILE] [--vpd FILE ...] [--offset K --stride S]
   circuit_scorecard.py table OUT
 SC_CPU=1 keeps the run off the GPU (the Mac's GPU serves the RL scorer).
 """
@@ -68,6 +68,9 @@ TASK_DIRS = (native.TEXTS / "vpd4l", Path.home() / "mpd-data/scratch/fleet/v2/pa
 SEALED = range(9100, 9150)  # the final evaluation's texts: never scored before it
 INERT = 1e-3  # a removal that moves the point KL by less than this many bits and s_track_pp by less than this moves nothing
 ALL, SAMPLE, WEAK = 64, 16, 8
+DEV20 = tuple(f"text{n}" for n in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 9008, 9009, 9010,  # the fixed dev subset
+                                   9014, 9018, 9020, 9025, 9029, 9030, 9031, 9033, 9046, 9048))  # scored every iteration
+# (the lead's 10-14: the first ten, plus ten spread over length, 2-484 tokens, and the circuits' position counts, 2-15)
 ENTRIES = 2 ** 27  # mask floats per engine call (edit runs)
 LN2 = math.log(2.0)
 BATCH = 4  # reward rows per fidelity call
@@ -562,7 +565,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="+", type=Path, help="circuit files or directories of them; 'table OUT' prints a finished run")
     ap.add_argument("--out", type=Path)
-    ap.add_argument("--only", default="", help="task names, comma-separated")
+    ap.add_argument("--only", default="", help="task names, comma-separated, or dev20 (DEV20)")
     ap.add_argument("--pool", type=Path, default=POOL)
     ap.add_argument("--vpd", type=Path, nargs="*", default=[], help="VPD's saved answers and orders (teacher.py --save-vpd's "
                     "files, merged), where the causal-importance network is not")
@@ -575,7 +578,8 @@ def main():
         print(json.dumps(summary(recs), indent=1))
         return
     a.out.mkdir(parents=True, exist_ok=True)
-    todo = circuits(a.paths, set(filter(None, a.only.split(","))))[a.offset::a.stride]
+    only = set(DEV20) if a.only == "dev20" else set(filter(None, a.only.split(",")))
+    todo = circuits(a.paths, only)[a.offset::a.stride]
     pool = torch.load(a.pool)
     vpd = {k: v for f in a.vpd for k, v in torch.load(f).items()} or None
     ge = goal_eval.GoalEval(native.Native(), chunk=32)

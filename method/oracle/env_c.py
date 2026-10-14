@@ -236,6 +236,11 @@ def gate(a) -> None:
     global LE
     if a.le_dir:
         LE = a.le_dir
+    if a.untar:  # the inputs as one tar of paths under ~/mpd-data (a pod uploads one file, not hundreds)
+        import tarfile
+
+        with tarfile.open(a.untar) as t:
+            t.extractall(Path.home() / "mpd-data")
 
     sys.path.insert(0, str(HERE.parents[1] / "experiments" / "oracle"))
     import var_explain
@@ -444,6 +449,7 @@ def main():
     g.add_argument("--compact", type=Path, help="var_compact.py's rows: variables written as compact families, not blocks")
     g.add_argument("--le-dir", type=Path, help="the teacher line effects' cache (a pod's output directory keeps them)")
     g.add_argument("--targets", type=Path, help="a targets file (default sft_targets/heldout.jsonl; relines' output)")
+    g.add_argument("--untar", type=Path, help="a tar of input paths under ~/mpd-data, unpacked there first")
     f = sub.add_parser("sft")
     f.add_argument("rows", type=Path)
     f.add_argument("out", type=Path)

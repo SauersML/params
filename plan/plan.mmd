@@ -960,7 +960,7 @@ flowchart BT
   W5FACT -. reject failed masks as targets .-> DIRECTKL
   class W5FACT gate
 
-  ENGCIRCUIT["<b>Does the claimed mechanism hold in its own circuit?</b><br/>Current INVARIANTS checks run only the full model.<br/>Add an opt-in check on the emitted circuit's execution.<br/>Control: same claim and carriers, broken transport edge;<br/>full-model truth must not certify a wrong circuit.<br/>Keep full-model truth, circuit truth and fidelity separate.<br/>Why: connect mechanism supervision to executable answers.<br/>VALIDATING · variable_reward / fork_review"]
+  ENGCIRCUIT["<b>Check the mechanism in the circuit that states it</b><br/>Opt-in checker now executes identical typed claims<br/>in full-model and own-circuit worlds, separately.<br/>Tiny physical control: same carriers, one legal edge cut;<br/>the claim holds in full/intact and fails in broken wiring.<br/>Sparse multi-donor indexing and invalid-claim handling tested.<br/>Free prose and distribution fidelity remain separate.<br/>Next: apply to saved oracle answers with actual carriers.<br/>Why: full-model truth must not certify an incorrect circuit.<br/>SHIPPED · bf60aa8 · focused CPU tests pass · no paid spend"]
   CAPENG -- local truth is not circuit-relative truth --> ENGCIRCUIT
   ENGCIRCUIT -. checked circuit-bound claims .-> SUP
-  class ENGCIRCUIT active
+  class ENGCIRCUIT done

@@ -52,8 +52,8 @@ export CARGO_BUILD_JOBS=${SLURM_CPUS_PER_TASK:-16}
 export RUSTFLAGS="-C target-cpu=znver3"
 which=(--examples)
 [ $# -gt 0 ] && which=($(printf -- '--example %s ' "$@"))
-# Each named example builds in the package whose crate holds it (mpd's when none is named).
-packages=(-p mpd)
+# Each named example builds in the package whose crate holds it (every package's when none is named).
+packages=(--workspace)
 if [ $# -gt 0 ]; then
     packages=()
     for e in "$@"; do

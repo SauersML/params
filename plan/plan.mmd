@@ -492,7 +492,7 @@ flowchart BT
     R1["<b>RL · circuits</b><br/>run 1 (from S1, reward e5c4232, 8x8): ENDED step 15, dev Φ flat;<br/>claim @5 vs S1: >start 18% vs 8%, Φ≥bar 40% vs 34%, >VPD 76% vs 52% (60/50/80 not met)<br/>run 2: better of S1/S2+think, reward 8bd83fb (n), 4x16, scorer identity checked,<br/>auto stop (no Φ best in 10 steps), ≤$22 · READY · primerl"]
     R2["<b>RL · + variables</b>"]
     R3["<b>RL · + answers (env B)</b><br/>qa_env.py (e8e6071): evidence + 6 questions, each measured on the model<br/>(removal, token, order, copy, patch: falls + new top; KL > 1 bit; which position);<br/>balanced per kind; reward = E2g credit, CPU scorer from stored outcomes;<br/>train 413 rows, dev 50; gate S1 zero-shot 0.63 vs constant 0.53,<br/>below constant on compare/copy: headroom · READY · monitorbench (env), primerl (RL)"]
-    R4["<b>RL · English (env D)</b><br/>English for a given circuit, reward E1;<br/>gate (30 dev, Qwen3-32B reader): with the circuit<br/>E1 is noise (correct > one-claim edit 15/24,<br/>6/17; verified facts > edited 15/24): FAIL;<br/>English alone: facts > edited 21/24 (88%);<br/>DeepSeek prose loses to its edits · $1.08<br/>WAITING (reward choice) · inframove"]
+    R4["<b>RL · English (env D)</b><br/>reward E1 of the English read alone (e1v2:<br/>12 heaviest + every structure event, bfe62b2);<br/>gate: facts > position edit 43/52 (83%);<br/>mechanism claims NOT separated (11/28):<br/>trains position facts only; B and C check<br/>mechanisms · SFT targets selecting · rows,<br/>scorer pod ready for primerl · inframove"]
     R5["<b>RL · + edits</b><br/>env E: goal = stop b after a, keep b elsewhere (83 goals, 25 dev);<br/>answer = scale / rank-one update lines on subcomponents;<br/>verifier edits W, scores held-out text: reward = removal<br/>− collateral bits/token − controls lost (λ = μ = 1, fixed);<br/>gate, 17 dev goals: teacher above random ablations 17/17,<br/>above Adam-fitted random scales 12/17 (bar 80%)<br/>READY · rustmove (env), primerl (RL)"]
   end
 
@@ -758,7 +758,7 @@ flowchart BT
   class T3 done
   class T4 active
   class W7 later
-  class R4 blocked
+  class R4 active
   class R3 active
   class T5 check
   class I6 done

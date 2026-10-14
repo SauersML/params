@@ -110,3 +110,8 @@ the tools is exact on every text in about 4.2 calls. SmolLM2-135M was SFT'd on t
 594 steps). It reaches unit F1 0.93/0.94/0.91 and reward 0.72/0.74/0.70 (train/inst/family, 40 texts each), against
 0.64/0.65/0.65 and 0.22/0.27/0.24 for the detailed-render prompt oracle. The truth's reward is 0.83/0.86/0.86. Its call
 sequences match the expert's on all 120 texts, so the remaining errors are in assembling the final answer.
+
+GRPO over whole tool episodes (`results/toy_tools_rl.md`; k 6, about 40 steps per arm, checkpoint chosen on validation
+texts) did not move held-out results. With verify/revise SFT episodes first, the best checkpoint scored unit F1
+0.90/0.94/0.92 and reward 0.69/0.75/0.71, against tools_sft's 0.93/0.94/0.91 and 0.72/0.74/0.70. Greedy policies never
+call run().

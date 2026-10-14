@@ -1218,12 +1218,65 @@ def forward_start(ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, log=pr
             "unit": unit, "steps": steps}
 
 
+class NoDirectKLTarget(RuntimeError):
+    """This explicitly capped set route cannot emit a certified primary target."""
+
+    def __init__(self, stage: str, cap: float, kl: float):
+        self.receipt = {"status": "no_target", "stage": stage, "cap_bits": cap,
+                        "reason": "The measured direct KL exceeds the caller cap in this constrained set route.",
+                        "direct_KL_bits": kl if math.isfinite(kl) else None,
+                        "convention": CONVENTION,
+                        "scope": "This set-search route on these target positions; not universal infeasibility."}
+        super().__init__(f"no direct-KL target at {stage}: {kl} bits exceeds cap {cap}")
+
+
+def direct_kl_cap(cap: float | None) -> float | None:
+    if cap is not None and (not math.isfinite(cap) or cap < 0):
+        raise ValueError("set direct-KL cap must be finite and nonnegative")
+    return cap
+
+
+def capped_set_route(cap: float | None, f1_start: str, **modes) -> None:
+    """Fail before model work for unsupported branches; historical routes stay unchanged."""
+    direct_kl_cap(cap)
+    if cap is not None:
+        unsupported = [name for name, enabled in modes.items() if enabled]
+        if f1_start not in ("set", "start_set") or unsupported:
+            raise ValueError("set direct-KL cap requires plain --f1-start set; unsupported modes: "
+                             + ", ".join(unsupported or [f1_start]))
+        if CONVENTION != "live":
+            raise ValueError("set direct-KL cap currently certifies only the existing live remainder convention")
+
+
+def require_direct_kl(kl: float, cap: float, stage: str) -> None:
+    if not math.isfinite(kl):
+        raise RuntimeError(f"nonfinite direct KL at {stage}")
+    if kl > cap:
+        raise NoDirectKLTarget(stage, cap, kl)
+
+
+def certify_set_answer(ge, tx, answer: dict, cap: float) -> dict:
+    """Check exact serialized primary after selection/token accounting; no fallback or repair."""
+    g, defects = goal_eval.circuit(answer, tx.targets, ge.nat.C, tx.T)
+    if any(v for k, v in defects.items() if k.startswith("invalid")):
+        raise RuntimeError(f"generated set answer has compiler defects: {defects}")
+    kl = float(ge.graph_kl(tx, [g], True)[0])
+    require_direct_kl(kl, cap, "serialized_primary")
+    return {"status": "pass", "cap_bits": cap, "direct_KL_bits": kl, "convention": "live",
+            "answer_sha256": hashlib.sha256(json.dumps(answer, sort_keys=True).encode()).hexdigest(),
+            "target_positions": list(tx.targets), "proposal": "Architecture-complete node-set proposal, live remainders; seed for separately verified wiring.",
+            "verification_graph_kl_calls": 1,
+            "metric": "Existing graph_kl aggregate over target positions, not a worst-per-target bound.",
+            "scope": "Original-model next-token distributions for this input at these targets; not standalone OFF or English fidelity."}
+
+
 SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its own log recovery (fleet's 9004 finding)
 
 
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
                acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS,
-               phi_pool: dict | None = None, forward: str | None = None, backup: bool = False) -> tuple:
+               phi_pool: dict | None = None, forward: str | None = None, backup: bool = False,
+               direct_kl_max: float | None = None) -> tuple:
     """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): the START (goal_eval.GoalEval
     .start_set: VPD's active subcomponents at the targets and the fewest candidate positions meeting the reward's
     absolute floors, every connection) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
@@ -1235,6 +1288,7 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     "dropped", "own_dropped") and the written circuit's floors verdict ("final": shortfall v; v > 0 fails).
     forward: the start forward_start's at that unit instead (with phi_pool); backup: the start first expanded by its compensators
     (backup.expand_circuit). (The circuit, its Pruner, the record) as block_search's (no group, no blocks)."""
+    capped_set_route(direct_kl_max, "set", forward=forward, backup=backup)
     nat = ge.nat
     st = ge.start_set(tx, pool=phi_pool)
     fwd = forward_start(ge, tx, phi_pool, log, forward) if forward and phi_pool is not None else None
@@ -1256,6 +1310,9 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     graph_of = lambda on: native.Graph([pr.nodes[j] for j in on.nonzero().flatten().tolist()], complete=True)  # noqa: E731
     kl0 = pr.kl()                                            # the F1 budget, or losing at most 5% of the start's log
     budget = max(budget, kl_budget(empty, kl0, SET_RECOVERY))  # recovery (a start over it: text6011, 9004 pruned nothing)
+    if direct_kl_max is not None:
+        require_direct_kl(kl0, direct_kl_max, "set_start")
+        budget = min(budget, direct_kl_max)
     rec = {"m": st["m"], "positions": fwd["positions"] if fwd is not None else st["positions"],
            "start_s_track_pp": st["s_track_pp"], "start_units": len(pr.nodes), "stages": [], "validation": [],
            "start": {k: st.get(k) for k in ("candidates", "met", "cap_bound", "shortfall", "scores")} |
@@ -1270,6 +1327,8 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
         kl = pr.kl()
         row = {"stage": name, "blocks": 0, "subcomponents": int(pr.on.sum()), "units": int(pr.on.sum()), "kl": kl,
                "f1": goal_eval.recovered_log(empty, kl, vpd), "rounds": rounds, "seconds": time.perf_counter() - t0}
+        if direct_kl_max is not None:
+            require_direct_kl(kl, direct_kl_max, "set_stage:" + name)
         rec["stages"].append(row)
         log(f"  set {name}: {row['subcomponents']} subcomponents, KL {kl:.3g} (budget {budget:.3g}), {rounds} rounds, "
             f"{row['seconds']:.0f}s", flush=True)
@@ -1335,6 +1394,9 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
         if acceptance.draws == "fv":
             rec["validation_end"], rec["validation_low"] = acceptance.validation(g)
     rec["bits"] = goal_eval.size_bits(g, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, tx.vpd)
+    if direct_kl_max is not None:
+        require_direct_kl(pr.kl(), direct_kl_max, "set_selected")
+        rec["direct_kl_cap_bits"] = direct_kl_max
     return g, pr, None, None, rec
 
 
@@ -1781,11 +1843,16 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
           accept: tuple = (), pairs: bool = False, accept_mode: str = "pp", seed: int | None = None,
           accept_draws: str = "fixed", phi_pool: dict | None = None, context: str = "refine",
           forward: str | None = None, task: dict | None = None, backup: bool = False,
-          edge_seed: bool = False) -> tuple[dict, dict]:
+          edge_seed: bool = False, set_direct_kl_max: float | None = None) -> tuple[dict, dict]:
     """(circuits by name, summary row) on one text: the F1 circuit (smallest at recovered_log >= 0.9, coarse to fine),
     VPD's top-k with N >= N_TARGET, the joint path from their union, and the path point the reward's terms favour.
     from_path: a saved path file (with "f1_index" and "top_k", or "f1_nodes" [matrix, index, position] and "top_k")
     in place of the F1 search, top-k and joint path. tokens: text -> its token count, for the answer budget."""
+    capped_set_route(set_direct_kl_max, f1_start, edges=edges, backup=backup, forward=forward,
+                     from_path=from_path, pairs=pairs, repair=repair_pool, robust=robust_pool, vpd_edges=vpd_edges,
+                     edge_seed=edge_seed, start_top=start_top)
+    if set_direct_kl_max is not None:
+        f1_start = "set"
     t0 = time.perf_counter()
     nat = ge.nat
     tx = ge.text(ids, targets, seed, task=task)              # (the task's seed: its draws keyed as the scorer's; its behavior)
@@ -1827,7 +1894,7 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
         if f1_start == "set":                                # influential set pruned (set_search), and its wiring
             # the plain start pruned, with --backup the expanded start and with --forward forward_start's too, the
             # highest circuit term written (text9000: backup's 165 subcomponents at 0.91)
-            arms = [set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, forward=f, backup=b)
+            arms = [set_search(ge, tx, empty, vpd, budget, acceptance, B, phi_pool=phi_pool, forward=f, backup=b, direct_kl_max=set_direct_kl_max)
                     for f, b in [(None, False)] + [(None, True)] * backup + [(forward, False)] * bool(forward)]
             g, pb, _, _, row["blocks"] = max(arms, key=lambda a: -math.inf if a[4].get("score") is None else a[4]["score"])
             if backup or forward:
@@ -1874,6 +1941,8 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
                     row["answer"] = "node set"
         if tokens is not None:
             row["answer_tokens"] = tokens(components.render(circuits[""]))
+        if set_direct_kl_max is not None:
+            row["direct_kl_certificate"] = certify_set_answer(ge, tx, circuits[""], set_direct_kl_max)
         row["seconds"] = time.perf_counter() - t0
         print(f"  {tx.T} tokens: {len(bl)} blocks, {g.count() - len(bl)} subcomponents, F1 {f1_b}, N {n_b}, "
               f"{row['blocks'].get('accept')}, {row['blocks']['bits']:.0f} bits", flush=True)
@@ -2081,6 +2150,9 @@ def main():
     ap.add_argument("--save-vpd", type=Path, help="save VPD's answers and orders on the texts to this file and stop")
     ap.add_argument("--labels", type=Path, help="locality JSONL (task, local)")
     ap.add_argument("--start-top", type=int, default=0, help="F1 search from VPD's top K at subcomponent level (0: from VPD's whole answer)")
+    ap.add_argument("--set-direct-kl-max", type=float, default=None,
+                    help="explicit absolute direct KL cap in bits for plain set search only; LIVE hybrid remainders, "
+                         "original input/targets only; requires a fresh output directory; no target on failure")
     ap.add_argument("--f1-start", choices=("targets", "whole", "both", "influential", "set", "start_set"), default="both",
                     help="the F1 circuit: from VPD's answer at the targets when that reaches F1 0.9, else from its whole answer "
                          "(targets); from its whole answer only (whole); the union of both searches' circuits (both); "
@@ -2149,6 +2221,17 @@ def main():
     ap.add_argument("--rank", choices=("every", "once"), default=RANK, help="Descent.prune's ranking: every round, or once per "
                     "level (re-ranked when a kept order admits nothing)")
     args = ap.parse_args()
+    try:
+        capped_set_route(args.set_direct_kl_max, args.f1_start, edges=args.edges, backup=args.backup,
+                         forward=args.forward, from_path=args.from_path, pairs=args.pairs, repair=args.repair,
+                         robust=args.edge_objective == "robust", vpd_edges=args.vpd_edges, save_vpd=args.save_vpd,
+                         start_top=args.start_top, edge_seed=args.edge_seed != "full")
+        if args.set_direct_kl_max is not None and args.out is None:
+            raise ValueError("capped set search requires --out")
+        if args.set_direct_kl_max is not None and args.out.exists() and any(args.out.iterdir()):
+            raise ValueError("capped set search requires a fresh output directory; existing outputs are not certified")
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.edge_seed != "full" and not args.edges:
         ap.error("--edge-seed weights requires --edges")
     RANK = args.rank
@@ -2190,6 +2273,8 @@ def main():
     pool = torch.load(POOL) if args.repair or args.edge_objective == "robust" or phi_pool_needed else None
     for path in texts[args.offset::args.stride]:
         if (args.out / f"{path.stem}.json").exists():
+            if args.set_direct_kl_max is not None:
+                raise RuntimeError("capped output appeared after preflight; refusing to skip or certify it")
             continue
         from_path = None
         if args.from_path:
@@ -2202,13 +2287,21 @@ def main():
                 from_path["top_k"] = int(next(args.from_path.glob(f"{path.stem}.vpd_top*.json")).stem.split(".vpd_top")[1])
         ids, targets = native.text(path)
         saved = vpd.get(path.stem, {})
-        circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
-                                         args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
-                                         pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
-                                         args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
-                                         args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if phi_pool_needed else None,
-                                         args.context, args.forward, json.loads(path.read_text()), args.backup,
-                                         args.edge_seed == "weights")
+        try:
+            circuits, row, path_file = teach(ge, ids, targets, args.batch, saved.get("answer"), saved.get("order"), args.start_top, args.f1_start,
+                                             args.edges, from_path, args.edges_at, args.max_nodes, tokens, args.max_tokens,
+                                             pool if args.repair else None, args.vpd_edges, pool if args.edge_objective == "robust" else None,
+                                             args.no_strand, args.edge_levels, tuple(k for k in args.accept.split(",") if k), args.pairs,
+                                             args.accept_mode, native.task_seed(path.stem), args.accept_draws, pool if phi_pool_needed else None,
+                                             args.context, args.forward, json.loads(path.read_text()), args.backup,
+                                             args.edge_seed == "weights", args.set_direct_kl_max)
+        except NoDirectKLTarget as exc:
+            failure = {"task": path.stem, **exc.receipt}
+            (args.out / f"{path.stem}.no_target.json").write_text(json.dumps(failure))
+            with (args.out / f"summary_{args.offset}.jsonl").open("a") as f:
+                f.write(json.dumps(failure) + "\n")
+            print(f"{path.stem}: {exc}", flush=True)
+            continue
         for name, c in circuits.items():
             (args.out / f"{path.stem}{'.' + name if name else ''}.json").write_text(json.dumps(c))
         (args.out / f"{path.stem}.path.json").write_text(json.dumps(path_file))

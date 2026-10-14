@@ -3296,7 +3296,7 @@ class GoalEval:
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
                  changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
                  far_donors: int = DONORS_FAR, baseline: bool = False, pattern: bool = True,
-                 controls: int = NEC_CONTROLS, weight: bool = False, scope: bool = True, node_values: bool = True) -> list[dict]:
+                 controls: int = NEC_CONTROLS, weight: bool = False, scope: bool = True, node_values: bool | None = None) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -3323,7 +3323,7 @@ class GoalEval:
         columns), the last four on split's draws (default: "search", the teachers' draws and training texts as far
         donors, in the reward on training texts; "eval" otherwise, and for any held-out text); e4: the E4 hook's score (its own reward term, not in c); flips_to_break, the smallest m at which f1_flips_omitted falls below
         half of s_point (None: not within FLIPS); flips_to_half, the smallest m at which it falls below 0.5, half of
-        VPD's own answer under the same attack (0: below it unattacked), which a circuit weak to begin with cannot pass. reads: C's second observable, node values (_node_values: node_share, node_share_weighted, node_median_z, node_measured) and the circuit nodes' relative RMS read
+        VPD's own answer under the same attack (0: below it unattacked), which a circuit weak to begin with cannot pass. reads: C's second observable, node values (_node_values: node_share, node_share_weighted, node_median_z, node_measured; full mode's alone unless node_values says, never the reward's: the RL scorer, env F's tools and the teachers skip them) and the circuit nodes' relative RMS read
         error between the model and the circuit per family (reads_*), and of their responses, each node's change from
         its own run without the intervention (dreads_*, _response_error; the static error mostly measures the missing
         background of a circuit's run); graph_ref,
@@ -3348,6 +3348,7 @@ class GoalEval:
             pp_graphs = [expand_blocks(g, self.nat.C, tx.vpd) for g in pp_graphs]
         graphs = [_c_graph(g, tx.targets, self.nat.C, tx.vpd) for g in graphs]  # stranded nodes dropped before every family
         reward = mode == "reward"
+        node_values = not reward if node_values is None else node_values  # the eval scorecard's column, never a reward's
         split = split or ("search" if reward else "eval")
         reads = reads or reward
         e0 = self._bounds(tx, "live")[0]
@@ -3452,7 +3453,7 @@ class GoalEval:
                 for fam in ("nodes", "interchange"):
                     for nd, xs in (row.get(f"_pairs_{fam}") or {}).items():
                         merged.setdefault(tuple(nd), []).extend(xs)
-                if node_values:  # (off for the floors' references and the START's candidates: a reported column)
+                if node_values:  # (full mode's by default: an eval column, line_effects over every node; no reward reads it)
                     eff = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0)
                            for x in self.line_effects(tx, g, mode="pp", split=split)["nodes"]} if merged else {}
                     row.update(_node_values(merged, eff))

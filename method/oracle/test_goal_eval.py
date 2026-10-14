@@ -2948,6 +2948,16 @@ def test_line_effects_chunks_agree(tiny, monkeypatch):
     assert [x["delta_kl"] for x in a["nodes"]] == pytest.approx([x["delta_kl"] for x in b["nodes"]], abs=1e-6)
 
 
+def test_node_values_are_the_scorecards_alone(tiny):
+    """Node values (line_effects over every node) are full mode's column alone unless asked: no reward row (the RL
+    scorer, env F's tools, the teachers) computes them."""
+    nat, ge, tx = tiny
+    g = native.Graph(sorted(native.Graph(masks=tx.vpd).node_set())[:8], complete=True)
+    kw = dict(draws=2, near_donors=0, far_donors=0, interchange=2, changed=2, mode="reward", split="search")
+    assert "node_share" not in ge.fidelity(tx, [g], None, **kw)[0]
+    assert "node_share" in ge.fidelity(tx, [g], None, node_values=True, **kw)[0]
+
+
 def test_line_effects_pp_engine(tiny):
     """line_effects(mode="pp") (every line deletion and changed text in one engine.Engine.path_patched(lines=) call)
     gives each line's KL change as pp_run on the graph with that line removed (a node with its connections, token

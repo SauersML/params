@@ -372,7 +372,12 @@ def devscore(a) -> None:
         for task, rs in by.items():
             req = {"task": task, "answers": [r["text"] for r in rs], "lines": False,
                    "tokens": [r["tokens"] - (r.get("thinking_tokens") or 0) for r in rs], **extra}
-            for sc in httpx.post(a.scorer, json=req, timeout=None).json()["scores"]:
+            r = httpx.post(a.scorer, json=req, timeout=None)
+            got_scores = r.json().get("scores") if r.status_code == 200 else None
+            if got_scores is None:  # a scorer error on one question: logged and left out, the others still scored
+                print(json.dumps({"step": ck["step"], "task": task, "scorer_error": r.text[:2000]}), flush=True)
+                continue
+            for sc in got_scores:
                 per.append({"task": task, "reward": sc["reward"], "valid": sc.get("valid")})
         out.write_text(json.dumps({"step": ck["step"], "reward": sum(x["reward"] for x in per) / max(len(per), 1),
                                    "valid": sum(bool(x["valid"]) for x in per) / max(len(per), 1), "per_question": per}))

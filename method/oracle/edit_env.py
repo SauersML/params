@@ -34,6 +34,7 @@ b everywhere earns nothing. The part defaults to "score" (never in the evidence)
 
   edit_env.py goals PREFS.jsonl OUT.jsonl [--dev 0.3]   the goals: id, split, question, the preference
   edit_env.py score GOALS.jsonl ANSWERS.jsonl OUT.jsonl  each answer {"goal", "answer"} scored
+  edit_env.py sft GOALS.jsonl EDITS.jsonl OUT.jsonl [--min-reward 0]   train goals' teacher answers as chat SFT rows
   edit_env.py gate GOALS.jsonl EDITS.jsonl OUT.jsonl [--sft SFT.jsonl]
       the gate (teacher edits above random-subcomponent edits on >= GATE of dev goals) on persistent_e3.py edit's rows:
       the teacher's edit is the candidate of circuit_edit and circuit_scales (their searches' steps and checkpoints)
@@ -373,6 +374,29 @@ def gate(ver: Verifier, goal_rows: list[dict], edit_rows: list[dict], log=print)
     return out, sft
 
 
+def sft(ver: Verifier, goal_rows: list[dict], edit_rows: list[dict], min_reward: float = 0.0, log=print) -> list[dict]:
+    """SFT rows of the train goals: the teacher's edit (the candidate of circuit_edit and circuit_scales earning the most
+    on the val third) written as the answer, kept when its score-third reward is above min_reward (the empty edit's 0:
+    an answer that loses to editing nothing teaches nothing), in the chat form {"prompt", "completion"} with the
+    measurements beside."""
+    by = {(r["a"], r["b"]): r for r in edit_rows}
+    out = []
+    for g in goal_rows:
+        e = by.get((g["pref"]["a"], g["pref"]["b"]))
+        t = best(e, TEACHERS) if e and g["split"] == "train" else None
+        if t is None:
+            continue
+        answer = render(t[1])
+        x = ver.answers(g["pref"], [answer], "score")[0]
+        log(f"{g['id']} teacher ({t[0]}) {x['reward']:+.3f} (removal {x['removal']:.2f}, kept {x['controls_kept']:.2f}, collateral "
+            f"{x['collateral']:.2e}){'' if x['reward'] > min_reward else ': dropped'}")
+        if x["reward"] > min_reward:
+            out.append({"id": g["id"], "prompt": [{"role": "user", "content": g["question"]}],
+                        "completion": [{"role": "assistant", "content": answer}], "teacher": t[0],
+                        **{k: x[k] for k in ("reward", "removal", "controls_kept", "collateral")}})
+    return out
+
+
 def gate_summary(rows: list[dict]) -> str:
     lines = []
     for split in ("dev", "train"):
@@ -413,7 +437,12 @@ def main():
     t.add_argument("edits")
     t.add_argument("out")
     t.add_argument("--sft")
-    for p in (s, t):
+    f = sub.add_parser("sft")
+    f.add_argument("goals")
+    f.add_argument("edits")
+    f.add_argument("out")
+    f.add_argument("--min-reward", type=float, default=0.0)
+    for p in (s, t, f):
         p.add_argument("--device")
     args = ap.parse_args()
     read = lambda f: [json.loads(x) for x in Path(f).read_text().splitlines() if x.strip()]  # noqa: E731
@@ -429,6 +458,10 @@ def main():
         if args.sft:
             Path(args.sft).write_text("".join(json.dumps(r) + "\n" for r in sft))
         return print(gate_summary(rows))
+    if args.cmd == "sft":
+        rows = sft(ver, gs, read(args.edits), args.min_reward, log=lambda m: print(m, flush=True))
+        Path(args.out).write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return print(f"{len(rows)} SFT rows (train goals' teacher answers above reward {args.min_reward:g})")
     by = {r["id"]: r for r in gs}
     with open(args.out, "w") as f:
         for a in read(args.answers):

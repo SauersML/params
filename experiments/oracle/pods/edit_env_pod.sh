@@ -7,7 +7,7 @@
 # Everything comes back to ~/mpd-data/runpod/NAME/out (prefs.jsonl, goals.jsonl, edits.jsonl, gate.jsonl, sft.jsonl,
 # gate.txt).
 #   experiments/oracle/pods/edit_env_pod.sh [NAME] [HOURS]      env: K, MIN_PAIRS, P, CACHE, VRAM, STEPS, GPU, PRICE, PREFS,
-#                                                                    EDITS, GOALS_ONLY
+#                                                                    EDITS, GOALS_ONLY, METHODS (persistent_e3 edit's arms)
 # GOALS_ONLY=1 ends after the goals (preferences and their circuits: RL goals without teacher edits).
 # PREFS=FILE skips the preference stage (an earlier run's prefs.jsonl); EDITS=FILE with it skips the edit stage too (an
 # earlier run's edit rows: the gate alone). The whole script is one block, so bash has read all of it before it runs.
@@ -26,7 +26,7 @@ PE3="python -B experiments/oracle/persistent_e3.py" ENV="python -B method/oracle
 PREF_RUNS="" EDIT_RUNS=""
 for k in $(seq 0 $((P - 1))); do
   PREF_RUNS="$PREF_RUNS ($PE3 prefs $O/out/prefs_$k.jsonl --k $K --min-pairs ${MIN_PAIRS:-16} --offset $k --stride $P --device cuda > $O/prefs_$k.log 2>&1; echo \"exit \$?\" >> $O/prefs_$k.log) &"
-  EDIT_RUNS="$EDIT_RUNS ($PE3 edit $O/out/prefs_ordered.jsonl $O/out/edit_$k.jsonl --device cuda --steps $STEPS --offset $k --stride $P --methods circuit_edit circuit_scales random_equal random_scales > $O/edit_$k.log 2>&1; echo \"exit \$?\" >> $O/edit_$k.log) &"
+  EDIT_RUNS="$EDIT_RUNS ($PE3 edit $O/out/prefs_ordered.jsonl $O/out/edit_$k.jsonl --device cuda --steps $STEPS --offset $k --stride $P --methods ${METHODS:-circuit_edit circuit_scales random_equal random_scales} > $O/edit_$k.log 2>&1; echo \"exit \$?\" >> $O/edit_$k.log) &"
 done
 if [ -n "${PREFS:-}" ]; then
   cp "$PREFS" "$F/prefs.jsonl"
@@ -55,7 +55,8 @@ test -s $O/out/prefs.jsonl || { echo 'no preferences'; exit 1; };
 $ENV goals $O/out/prefs.jsonl $O/out/goals.jsonl; python -c '$ORDER' $O/out/goals.jsonl $O/out/prefs_ordered.jsonl;
 $([ -n "${GOALS_ONLY:-}" ] && echo "echo all stages done; exit 0;")
 $EDIT_STAGE
-$ENV gate $O/out/goals.jsonl $O/out/edits.jsonl $O/out/gate.jsonl --sft $O/out/sft.jsonl --device cuda > $O/out/gate.txt 2>&1; tail -n 12 $O/out/gate.txt; echo all stages done"
+$ENV sft $O/out/goals.jsonl $O/out/edits.jsonl $O/out/sft.jsonl --device cuda > $O/out/sft.txt 2>&1; tail -n 1 $O/out/sft.txt;
+$ENV gate $O/out/goals.jsonl $O/out/edits.jsonl $O/out/gate.jsonl --device cuda > $O/out/gate.txt 2>&1; tail -n 12 $O/out/gate.txt; echo all stages done"
 RP_OWNER=rustmove RP_PARALLEL=1 RP_MAX_PRICE=${PRICE:-0.40} RP_MIN_VRAM_GB=${VRAM:-24} RP_MIN_RAM_GB=32 RP_DISK_GB=40 \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA GeForce RTX 4090,NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA RTX A4500,NVIDIA L4}" $H -- bash -c "$CMD"
 }

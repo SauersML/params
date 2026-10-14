@@ -627,11 +627,12 @@ class NativePhi:
     draws as VPD's families (the text's changed texts, donors and controls; for removals and holds of native units,
     VPD's answer with those units removed or held); each bound the native circuit's own (its empty circuit, the
     embedding alone; keep-nothing, every unit at the donor's). Rows carry the families' VPD-form records, rl_terms
-    (each without the floor at 0, as phi reads them) and eps."""
+    (each without the floor at 0, as phi reads them) and eps. means (unit_means): the C-semantics families and the
+    removals mean-ablate a unit instead of zeroing it (the bake-off's native semantics, the lead's 10-14)."""
 
-    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, split: str = "eval"):
+    def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, split: str = "eval", means: dict | None = None):
         nat = ge.nat
-        self.ge, self.tx, self.nat, self.split = ge, tx, nat, split
+        self.ge, self.tx, self.nat, self.split, self.means = ge, tx, nat, split, means
         tg = nat.target
         self.L, self.H, self.hd = tg.n_layer, tg.n_head, tg.hd
         self.Dm = tg.site(native.site_name(0, "c_fc")).W.shape[0]
@@ -649,6 +650,16 @@ class NativePhi:
                                                                                        device=self.nat.dev) for n in self.nat.names}), capture=c)
             self._caps[key] = c
         return self._caps[key]
+
+    def _ablate(self, T: int) -> dict | None:
+        """The values an ablated unit takes on a T-token text: its mean (means, a capture's form at every position), or
+        None (output 0) without means."""
+        if self.means is None:
+            return None
+        m = self.means
+        out = {k: m[k].to(self.nat.dev)[None, :, :, None, :].expand(1, -1, -1, T, -1) for k in ("q", "k", "v", "out")}
+        out["neuron"] = m["neuron"].to(self.nat.dev)[None, :, None, :].expand(1, -1, T, -1)
+        return out
 
     def _units(self, heads: list, neurons: list, values: dict | None) -> dict:
         """graph_ref's units from per-row masks ([layers, T, H], [layers, T, d_mlp]) and values (a capture, rows 1 or B)."""
@@ -672,7 +683,7 @@ class NativePhi:
         tx = self.tx
         e0 = self.empty()
         v0 = self.ge._bounds(tx, "live")[1]
-        lq = self.ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads for S in sets], [~S.neurons for S in sets], None))
+        lq = self.ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads for S in sets], [~S.neurons for S in sets], self._ablate(tx.T)))
         out = []
         for k in self._kl(tx.ref, lq):
             out.append({"s_point": goal_eval._fid(e0, k, v0), "s_point_c": goal_eval._fid(e0, k, v0), "kl_point": k,
@@ -684,7 +695,7 @@ class NativePhi:
         if "_native_empty" not in self.tx.__dict__:
             z = Mask(torch.ones(self.L, self.tx.T, self.H, dtype=torch.bool, device=self.nat.dev),
                      torch.ones(self.L, self.tx.T, self.Dm, dtype=torch.bool, device=self.nat.dev))
-            lq = self.ge.graph_ref(self.tx.ids, self.tx.targets, self.model, units=self._units([z.heads], [z.neurons], None))
+            lq = self.ge.graph_ref(self.tx.ids, self.tx.targets, self.model, units=self._units([z.heads], [z.neurons], self._ablate(self.tx.T)))
             self.tx._native_empty = self._kl(self.tx.ref, lq)[0]
         return self.tx._native_empty
 
@@ -706,9 +717,10 @@ class NativePhi:
         for m, d in zip(dm, drops):
             for kind, l, t, j in d:
                 (m.heads if kind == "head" else m.neurons)[l, t, j] = True
-        lm = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([m.heads for m in dm], [m.neurons for m in dm], None))
-        lc = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads | m.heads for m in dm], [~S.neurons | m.neurons for m in dm], None))
-        lv = ge.graph_ref(tx.ids, tx.targets, self.vpd, units=self._units([m.heads for m in dm], [m.neurons for m in dm], None))
+        ab = self._ablate(tx.T)
+        lm = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([m.heads for m in dm], [m.neurons for m in dm], ab))
+        lc = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads | m.heads for m in dm], [~S.neurons | m.neurons for m in dm], ab))
+        lv = ge.graph_ref(tx.ids, tx.targets, self.vpd, units=self._units([m.heads for m in dm], [m.neurons for m in dm], ab))
         kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
         w = carry.kl(lm, tx.ref.expand_as(lm)).tolist()
         claim = carry.kl(tx.ref.expand_as(lc), lc).tolist()
@@ -846,7 +858,7 @@ class NativePhi:
         causal = torch.ones(T, T, dtype=torch.bool, device=self.nat.dev).tril()
         real = {(i, t): b["S"][i][:, t].masked_fill(~causal[t], float("-inf")).softmax(-1)[:, :t + 1] for i, t in reads}
         draws = [real] + ([{r: real[r]} for r in reads] if len(reads) > 1 else [])
-        un = self._units([~S.heads], [~S.neurons], None)
+        un = self._units([~S.heads], [~S.neurons], self._ablate(tx.T))
         kc = [float(carry.kl(tx.ref, ge.graph_ref(tx.ids, tx.targets, self.model, units=un, rows=d))[0]) for d in draws]
         kept = tx.__dict__.setdefault("_pattern_vpd", {})
         kv = []
@@ -866,7 +878,7 @@ class NativePhi:
         (necessity_spec's numbers, the same controls)."""
         tx, ge = self.tx, self.ge
         vrow = ge.necessity_spec(tx, [native.Graph()], self.split)[0]
-        lq = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([S.heads for S in sets], [S.neurons for S in sets], None))
+        lq = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([S.heads for S in sets], [S.neurons for S in sets], self._ablate(tx.T)))
         dt = self._kl(tx.ref, lq)
         T, last = tx.T, max(tx.targets)
         pool = [x for x in ge.far_pool(self.split) if len(x[1]) >= min(T, goal_eval.NEC_MIN_LEN) and list(x[1]) != list(tx.ids)]
@@ -879,7 +891,8 @@ class NativePhi:
             ones = {n: torch.ones(len(y), self.nat.C[n], dtype=torch.bool, device=self.nat.dev) for n in self.nat.names}
             g = native.Graph(masks=ones)
             ref = ge.graph_ref(y, tg, g)
-            lq = ge.graph_ref(y, tg, g, units=self._units([S.heads[:, d:last + 1] for S in sets], [S.neurons[:, d:last + 1] for S in sets], None))
+            lq = ge.graph_ref(y, tg, g, units=self._units([S.heads[:, d:last + 1] for S in sets], [S.neurons[:, d:last + 1] for S in sets],
+                                                          self._ablate(len(y))))
             dc.append(self._kl(ref, lq))
             native.free(self.nat.dev)
         vd = vrow["draws_n_spec"]
@@ -950,6 +963,40 @@ def prune_to_bits(nu: NativeUnits, positions, goals: list[float], P: int, log=No
         if (due or S.count() <= FINE) and S.count() > 0:
             rescreened |= set(due)
             effect = screen(nu, S, kl, log)
+    return out
+
+
+MEANS_TEXTS = range(6000, 6100)  # unit_means' texts: training texts, never a dev or held-out one
+MEANS_FILE = Path.home() / "mpd-data/graph_oracle/native_means.pt"
+
+
+@torch.no_grad()
+def unit_means(ge: goal_eval.GoalEval, texts=MEANS_TEXTS, path: Path | None = MEANS_FILE) -> dict:
+    """Each native unit's mean over every position of the texts (the bake-off's mean ablation, the lead's 10-14): a
+    head's query, key, value (before the rotation) and output (before the output matrix) {"q", "k", "v", "out": [layers,
+    H, hd]}, a post-GELU neuron's activation {"neuron": [layers, d_mlp]}, from the real model's runs (graph_ref's
+    capture); kept in path, recomputed when its texts differ."""
+    names = [f"text{n}" for n in texts]
+    if path is not None and path.exists():
+        got = torch.load(path)
+        if got.get("texts") == names:
+            return got
+    nat = ge.nat
+    total, count = None, 0
+    for name in names:
+        ids, _ = native.text(native.TEXTS / "vpd4l" / f"{name}.json")
+        c = {}
+        ones = native.Graph(masks={n: torch.ones(len(ids), nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
+        ge.graph_ref(list(ids), [len(ids) - 1], ones, capture=c)
+        s = {k: c[k][0].sum(2).double() for k in ("q", "k", "v", "out")}  # [layers, H, hd]
+        s["neuron"] = c["neuron"][0].sum(1).double()                        # [layers, d_mlp]
+        total = s if total is None else {k: total[k] + s[k] for k in s}
+        count += len(ids)
+        native.free(nat.dev)
+    out = {k: (v / count).float().cpu() for k, v in total.items()}
+    out["texts"], out["positions"] = names, count
+    if path is not None:
+        torch.save(out, path)
     return out
 
 

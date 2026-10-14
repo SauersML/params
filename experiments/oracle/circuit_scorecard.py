@@ -1,6 +1,10 @@
-"""The circuit scorecard (#2951 graph oracle; the lead's 10-14): whether a search's circuits are good circuits, judged on
-the circuits themselves, never through the oracle, on held-out draws alone (the eval split's changed texts, donors and
-input-scope draws, and a flip pool no search drew from). Per circuit, on its text:
+"""The circuit scorecard (#2951 graph oracle; the lead's 10-14): whether a builder's circuits are good circuits, judged
+on the circuits themselves, never through the oracle, on held-out draws alone (the eval split's changed texts, donors and
+input-scope draws, and a flip pool no search drew from), the judge of the builder bake-off. A circuit is a set of units
+with a run semantics: VPD subcomponents under VPD's fixed masks (goal_eval's C semantics), or the model's own heads and
+neurons ("units": "native", nodes ["head" | "neuron", layer, position, index]) in the real model with every unit outside
+mean-ablated (native_units.unit_means, NativePhi(means=)); native circuits are scored on the families both kinds have
+(native_units.SHARED; v_shared compares the two). Per circuit, on its text:
   floors   every family of the frozen reward (goal_eval.fidelity, reward mode, eval split) against its floor
            (goal_eval.vpd_floors on the same draws): the circuit's score, the floor, VPD's whole answer's score, and the
            worst shortfall v (0: every floor met)
@@ -17,7 +21,11 @@ input-scope draws, and a flip pool no search drew from). Per circuit, on its tex
   known    paper parts kept (princess: 9; bracket: 11, the 4 at '<' among them) and, on a copy text
            (copycheck.copy_source), the copy core at its positions: L1.fc#2103, L1.q#316, L0.fc#53 and L2.k#206 at the
            copied position, L1.k#329 at the earlier occurrence
-  edits    absolute edit faithfulness (the lead's criterion 6: the node family scores a circuit against VPD's answer, not
+  edits    the mediated share (criterion 6): for the circuit's top 1, 3 and 5 units by real-model drop, the drop in log2 p
+           of the model's prediction with them removed (a subcomponent at 0, a native unit at its mean) and every unit
+           outside the circuit held at its value on the unedited text (VPD: every other subcomponent and remainder),
+           over the live drop: 1 when the circuit carries the whole effect through its own units; and absolute edit
+           faithfulness (the node family scores a circuit against VPD's answer, not
            against the model): for each part removed alone and the 3 and 5 parts with the largest real drops removed
            together, the drop in log2 p of the model's prediction at the targets in the real model (remainders live)
            against the drop the circuit's own run predicts, in C's semantics (the point family's: everything outside the
@@ -25,6 +33,7 @@ input-scope draws, and a flip pool no search drew from). Per circuit, on its tex
            the model's scale); Spearman's rho over the single removals and the median and 90th-percentile absolute error
            in bits; the same predictions from VPD's answer at the START's candidates and from VPD's whole answer (its
            own runs, as the node family runs VPD's answer) on the removals inside each
+  size     also parameters touched (each unit's weights once) and the build's seconds per text
   teacher  from TEXT.path.json beside the circuit: the stage written, whether a smaller stage failed the search
            reward row (fallback), the START's parts and positions, whether it met the floors and was cap-bound
 The criteria run cheapest first (floors and known, edits, size, minimal, stated), the record so far in OUT/<task>.partial
@@ -33,6 +42,7 @@ circuit) and OUT/summary.json, and prints the table.
 
   circuit_scorecard.py DIR_OR_FILE [...] --out OUT [--only text9000,... | --only dev20] [--pool FILE] [--vpd FILE ...] [--offset K --stride S]
   circuit_scorecard.py table OUT
+  circuit_scorecard.py bakeoff NAME=OUT [NAME=OUT ...] [--mib FILE]   the builders side by side on their common texts
   circuit_scorecard.py add OUT CIRCUITS_DIR [--vpd FILE ...]   the mediated share, parameters and build seconds added to older records
 SC_CPU=1 keeps the run off the GPU (the Mac's GPU serves the RL scorer).
 """
@@ -57,10 +67,12 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "method" / "oracle"))
 sys.path.insert(0, str(HERE.parents[1] / "method" / "vpd"))
 
+import carry  # noqa: E402
 import copycheck  # noqa: E402
 import goal_eval  # noqa: E402
 import lines  # noqa: E402
 import native  # noqa: E402
+import native_units  # noqa: E402
 import teacher  # noqa: E402
 
 POOL = Path.home() / "mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt"  # the flips' pool: none of the searches drew
@@ -427,6 +439,144 @@ def say(*a):
     print(*a, flush=True)
 
 
+def is_native(path: Path) -> bool:
+    """A circuit of the model's own units (heads and neurons, native_units' kinds) rather than VPD's subcomponents."""
+    d = json.loads(path.read_text())
+    return d.get("units") == "native" or bool(d.get("nodes")) and d["nodes"][0][0] in ("head", "neuron")
+
+
+@torch.no_grad()
+def native_lq(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, sets: list[list], mode: str, B: int = 16) -> torch.Tensor:
+    """log q at the targets [len(sets), targets, V] with each set of S's units removed (mean-ablated): mode "live" the
+    real model, "mediated" the real model with every unit outside S held at its value on the text, "circuit" S's own
+    run (every unit outside S mean-ablated)."""
+    cx, ab, out = nphi.capture(tx.ids), nphi._ablate(tx.T), []
+    for s0 in range(0, len(sets), B):
+        hs, ns, vals = [], [], []
+        for R in sets[s0:s0 + B]:
+            hm, nm = torch.zeros_like(S.heads), torch.zeros_like(S.neurons)
+            for kind, l, t, j in R:
+                (hm if kind == "head" else nm)[l, t, j] = True
+            hs.append(hm if mode == "live" else ~S.heads | hm)
+            ns.append(nm if mode == "live" else ~S.neurons | nm)
+            vals.append(nphi._mix(cx, ab, hm, nm) if mode == "mediated" else ab)
+        v = {k: torch.cat([x[k] for x in vals]) for k in vals[0]}
+        out.append(ge.graph_ref(tx.ids, tx.targets, nphi.model, units=nphi._units(hs, ns, v)).float())
+        native.free(ge.nat.dev)
+    return torch.cat(out)
+
+
+def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None, means: dict, pool_name: str = POOL.name,
+                 log=say, save=None) -> dict:
+    """A native circuit's record (the bake-off's unit-agnostic criteria, the lead's 10-14): the shared families
+    (native_units.SHARED, NativePhi with mean ablation on the eval split) against the text's floors, each unit's
+    own-run removal effect, minimality, size in units and parameters, and edits (the mediated share and the circuit's
+    predicted drops)."""
+    nat = ge.nat
+    t_start = time.perf_counter()
+    tp = task_path(path.stem)
+    tx = lines.text_of(ge, tp, vpd)
+    d = json.loads(path.read_text())
+    units = sorted({(k, int(l), int(t), int(j)) for k, l, t, j in d["nodes"]})
+    nu = native_units.NativeUnits(nat, tx.ids, tx.targets)
+    S = native_units.from_units(nu, units)
+    nphi = native_units.NativePhi(ge, tx, "eval", means=means)
+    rec = {"task": path.stem, "circuit": str(path), "teacher": teacher_block(path), "pool": pool_name, "units": "native"}
+
+    def done(name):
+        rec["seconds"] = time.perf_counter() - t_start
+        log(f"  {path.stem}: {name}, {rec['seconds']:.0f} s")
+        if save is not None:
+            save(rec)
+
+    vf = ge.vpd_floors(tx, pool, "eval")
+    fams = [f for f in vf["families"] if f in native_units.SHARED]
+    fl = {f: vf["floors"][f] for f in fams}
+    base = judged(nphi.rows([S])[0], fl, fams)
+    rec["floors"] = {"families": {f: {"score": base["scores"][f], "floor": fl.get(f), "vpd": goal_eval.family_score(vf["vpd"], f)} for f in fams},
+                     "v": base["v"], "phi": base["phi"], "phi_vpd": goal_eval.phi(vf["vpd"], families=fams)[0], "failing": base["failing"],
+                     "families_scored": "shared"}
+    rec["known"] = {}
+    done("floors")
+
+    y = tx.ref[0].argmax(-1)
+
+    def lp(lq):
+        return (lq.gather(-1, y.view(1, -1, 1).expand(lq.shape[0], -1, 1)).squeeze(-1).sum(-1) / LN2).tolist()
+    singles = [[u] for u in units]
+    live = lp(native_lq(ge, tx, nphi, S, [[]] + singles, "live"))
+    real1 = [live[0] - x for x in live[1:]]
+    top = [units[i] for i in np.argsort(real1)[::-1][:5]]
+    groups = [top[:1], top[:3], top[:5]]
+    g_live = lp(native_lq(ge, tx, nphi, S, groups, "live"))
+    g_med = lp(native_lq(ge, tx, nphi, S, groups, "mediated"))
+    circ_lq = native_lq(ge, tx, nphi, S, [[]] + singles + groups[1:], "circuit")
+    circ = lp(circ_lq)
+    pred = [circ[0] - x for x in circ[1:]]
+    st = faith(pred[:len(units)], real1)
+    for j, gname in enumerate(("top3", "top5")):
+        st[gname] = {"predicted": pred[len(units) + j], "real": live[0] - g_live[1 + j], "inside": True}
+    rec["edits"] = {"parts": [native_label(u) for u in units], "nodes": [list(u) for u in units],
+                    "drops": {"model": real1, "circuit_mean": pred[:len(units)]},
+                    "groups": {"top3": [native_label(u) for u in top[:3]], "top5": [native_label(u) for u in top[:5]]},
+                    "stats": {"circuit_mean": st},
+                    "mediated": [{"k": len(R), "live": live[0] - a, "mediated": live[0] - b,
+                                  "share": (live[0] - b) / (live[0] - a) if abs(live[0] - a) >= SHARE_MIN else None}
+                                 for R, a, b in zip(groups, g_live, g_med)]}
+    done("edits")
+
+    rec["size"] = {"units": "native", "parts": len(units), "heads": sum(u[0] == "head" for u in units),
+                   "neurons": sum(u[0] == "neuron" for u in units), "params": params_touched(nat, units),
+                   "build_seconds": build_seconds(path), "lines": None, "positions": sorted({u[2] for u in units}),
+                   "vpd_k_phi": None, "vpd_k_floors": None}
+    done("size")
+
+    weak_order = sorted(units, key=lambda u: abs(pred[units.index(u)]))
+    if len(units) <= ALL:
+        uniform, weak = units, []
+    else:
+        rng = np.random.default_rng(native.task_seed(path.stem))
+        uniform = [units[i] for i in sorted(rng.choice(len(units), SAMPLE, replace=False))]
+        weak = [u for u in weak_order if u not in set(uniform)][:WEAK]
+    tested = uniform + weak
+    need = {f: min(fl.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
+    mrows = []
+    for s0 in range(0, len(tested), BATCH):
+        part = tested[s0:s0 + BATCH]
+        for u, r in zip(part, nphi.rows([S.without([u]) for u in part])):
+            j = judged(r, fl, fams)
+            drop = {f: (j["scores"][f] or 0.0) - need[f] for f in fams}
+            worst = min(drop, key=drop.get)
+            mrows.append({"part": list(u), "removable": drop[worst] >= 0.0, "v": j["v"], "phi": j["phi"], "worst": worst,
+                          "worst_margin": drop[worst], "uniform": u in set(uniform), "scores": j["scores"]})
+        native.free(nat.dev)
+    rec["minimal"] = {"tested": len(mrows), "uniform": [sum(m["removable"] for m in mrows if m["uniform"]), len(uniform)],
+                      "weak": [sum(m["removable"] for m in mrows if not m["uniform"]), len(weak)],
+                      "removable": [m["part"] for m in mrows if m["removable"]], "rows": mrows}
+    done("minimality")
+
+    k0 = carry.kl(tx.ref, circ_lq[:1])[0].item()
+    rise = (carry.kl(tx.ref.expand(len(units), -1, -1), circ_lq[1:1 + len(units)]) - k0).tolist()
+    sets = [S] + [S.without([u]) for u in units]
+    tr = []
+    for s0 in range(0, len(sets), 32):
+        tr += [r["s_track_pp"] for r in nphi.track_pp(sets[s0:s0 + 32])]
+        native.free(nat.dev)
+    fall = [None if b is None or tr[0] is None else tr[0] - b for b in tr[1:]]
+    eff = [{"part": list(u), "point_rise": a, "track_fall": b} for u, a, b in zip(units, rise, fall)]
+    rec["stated"] = {"stated": False, "defects": {}, "stranded": [], "no_token": [], "unreachable": [], "point": k0, "track": tr[0],
+                     "inert_parts": [e["part"] for e in eff if moves(e) < INERT],
+                     "inert_lines": [], "harmful_parts": [e["part"] for e in eff if e["point_rise"] < -INERT and (e["track_fall"] or 0.0) <= INERT],
+                     "part_effects": eff, "line_effects": []}
+    done("stated")
+    return rec
+
+
+def native_label(u) -> str:
+    """A native unit as the figures write it: L1.head3@393, L0.n2103@12."""
+    return f"L{u[1]}.{'head' if u[0] == 'head' else 'n'}{u[3]}@{u[2]}"
+
+
 def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = None, pool_name: str = POOL.name, log=say,
           save=None) -> dict:
     """One circuit's record (module docstring), its criteria in order of cost: floors and known mechanisms, edits, size,
@@ -568,6 +718,23 @@ def wilson(k: int, n: int) -> list:
     return [max(0.0, c - h), min(1.0, c + h)]
 
 
+def v_shared(r: dict) -> float:
+    """The worst shortfall over the families every unit kind is scored on (native_units.SHARED): the bake-off's v."""
+    fam = r["floors"]["families"]
+    return max((max(0.0, x["floor"] - (x["score"] or 0.0)) for f, x in fam.items() if f in native_units.SHARED and x["floor"] is not None),
+               default=0.0)
+
+
+def own_stats(r: dict) -> dict:
+    """The circuit's own edit predictions: the node family's semantics for VPD circuits, mean ablation for native ones."""
+    es = (r.get("edits") or {}).get("stats", {})
+    return es.get("circuit_n") or es.get("circuit_mean") or {}
+
+
+def share(r: dict, k: int):
+    return next((m["share"] for m in (r.get("edits") or {}).get("mediated", []) if m["k"] == k), None)
+
+
 def summary(recs: list[dict]) -> dict:
     """The set's summary: counts and medians over its circuits (texts without a value left out of a median)."""
     def med(xs):
@@ -593,7 +760,11 @@ def summary(recs: list[dict]) -> dict:
             edit[k][f"{gname}_median_abs_error"] = med([abs(r["edits"]["stats"][k][gname]["predicted"] - r["edits"]["stats"][k][gname]["real"])
                                                          for r in recs if k in (r.get("edits") or {}).get("stats", {})])
     tb = [r["teacher"] for r in recs if r.get("teacher")]
-    return {"pool": sorted({r.get("pool") for r in recs}), "median_margin_by_family": margins, "edits_medians": edit,
+    return {"pool": sorted({r.get("pool") for r in recs}), "units": sorted({r["size"].get("units", "vpd") for r in recs}),
+            "meet_shared_floors": sum(v_shared(r) == 0.0 for r in recs), "median_v_shared": med([v_shared(r) for r in recs]),
+            "median_mediated_share": {k: med([share(r, k) for r in recs]) for k in (1, 3, 5)},
+            "median_params": med([r["size"].get("params") for r in recs]), "median_build_seconds": med([r["size"].get("build_seconds") for r in recs]),
+            "median_margin_by_family": margins, "edits_medians": edit,
             "teacher_fallback": sum(bool(t["fallback"]) for t in tb), "teacher_records": len(tb),
 "circuits": len(recs), "meet_every_floor": sum(r["floors"]["v"] == 0.0 for r in recs),
             "failing_family_counts": dict(sorted(fail.items(), key=lambda x: -x[1])), "median_v": med([r["floors"]["v"] for r in recs]),
@@ -629,27 +800,57 @@ def row_line(r: dict) -> dict:
             "removable": [mn["uniform"][0] + mn["weak"][0], mn["uniform"][1] + mn["weak"][1]],
             "removable_share_uniform": mn["uniform"][0] / mn["uniform"][1] if mn["uniform"][1] else None,
             "inert_parts": len(r["stated"]["inert_parts"]), "no_path": len(r["stated"]["stranded"]) + len(r["stated"]["no_token"]),
-            "edit_rho_n": es.get("circuit_n", {}).get("spearman"), "edit_err_n": es.get("circuit_n", {}).get("median_abs_error"),
-            "edit_err_vpd_whole_n": es.get("vpd_whole_n", {}).get("median_abs_error"), "teacher": r.get("teacher"), "pool": r.get("pool")}
+            "edit_rho": own_stats(r).get("spearman"), "edit_err": own_stats(r).get("median_abs_error"),
+            "edit_err_vpd_whole_n": es.get("vpd_whole_n", {}).get("median_abs_error"), "v_shared": v_shared(r),
+            "mediated": {k: share(r, k) for k in (1, 3, 5)}, "units": r["size"].get("units", "vpd"), "params": r["size"].get("params"),
+            "build_seconds": r["size"].get("build_seconds"), "teacher": r.get("teacher"), "pool": r.get("pool")}
 
 
 def table(recs: list[dict]) -> str:
-    head = (f"{'task':16} {'parts':>6} {'lines':>6} {'pos':>4} {'v':>6} {'failing':28} {'nopath':>6} {'inert':>9} {'remov':>7} {'weak':>5} "
-            f"{'vpd_k':>6} {'k_fl':>6} {'rho_n':>6} {'err_n':>6} {'rho_V':>6} {'err_V':>6} known")
+    head = (f"{'task':12} {'units':6} {'parts':>6} {'params':>8} {'build_s':>7} {'pos':>4} {'v':>6} {'v_sh':>6} {'failing':24} "
+            f"{'nopath':>6} {'inert':>9} {'remov':>7} {'weak':>5} {'vpd_k':>6} {'rho':>6} {'err':>6} {'med1':>5} {'med3':>5} {'med5':>5} known")
     out = [head]
     for r in sorted(recs, key=lambda r: r["task"]):
         st, mn, sz = r["stated"], r["minimal"], r["size"]
-        es = (r.get("edits") or {}).get("stats", {})
-        kn = r["known"]
+        kn, os_ = r["known"], own_stats(r)
         known = (f"paper {kn['paper']['kept']}/{kn['paper']['of']}" if "paper" in kn else "") + \
                 (f"copy {len(kn['copy']['kept'])}/5" if "copy" in kn else "")
-        out.append(f"{r['task']:16} {sz['parts']:>6} {sz['lines'] if sz['lines'] is not None else '-':>6} {len(sz['positions']):>4} "
-                   f"{r['floors']['v']:>6.3f} {','.join(r['floors']['failing'])[:28]:28} "
+        sh = [share(r, k) for k in (1, 3, 5)]
+        out.append(f"{r['task']:12} {sz.get('units', 'vpd'):6} {sz['parts']:>6} {(sz.get('params') or 0) / 1e6:>7.2f}M "
+                   f"{sz.get('build_seconds') or 0:>7.0f} {len(sz['positions']):>4} {r['floors']['v']:>6.3f} {v_shared(r):>6.3f} "
+                   f"{','.join(r['floors']['failing'])[:24]:24} "
                    f"{len(st['stranded']) + len(st['no_token']):>6} {len(st['inert_parts']):>4}/{len(st['part_effects']):<4} "
                    f"{mn['uniform'][0]:>3}/{mn['uniform'][1]:<3} {mn['weak'][0]:>2}/{mn['weak'][1]:<2} "
-                   f"{sz['vpd_k_phi'] if sz['vpd_k_phi'] is not None else '>all':>6} {sz['vpd_k_floors'] if sz['vpd_k_floors'] is not None else '-':>6} "
-                   f"{num(es.get('circuit_n', {}).get('spearman'))} {num(es.get('circuit_n', {}).get('median_abs_error'))} "
-                   f"{num(es.get('vpd_whole_n', {}).get('spearman'))} {num(es.get('vpd_whole_n', {}).get('median_abs_error'))} {known}")
+                   f"{sz['vpd_k_phi'] if sz['vpd_k_phi'] is not None else '-':>6} {num(os_.get('spearman'))} {num(os_.get('median_abs_error'))} "
+                   + " ".join(f"{x:>5.2f}" if x is not None else f"{'-':>5}" for x in sh) + f" {known}")
+    return "\n".join(out)
+
+
+def bakeoff(sets: dict, mib: dict | None = None) -> str:
+    """The builders side by side (the lead's 10-14 bake-off): each set (name -> its records) on the texts every set
+    scored, its summary's headline numbers, and MIB's external numbers per builder when given (mib: name -> {metric:
+    value}, read as the benchmark reports them)."""
+    common = set.intersection(*[{r["task"] for r in recs} for recs in sets.values()]) if sets else set()
+    cols = [("texts", lambda s: s["circuits"]), ("floors met (shared)", lambda s: s["meet_shared_floors"]),
+            ("median v (shared)", lambda s: s["median_v_shared"]), ("removable share", lambda s: s["removable_uniform"][2]),
+            ("inert parts", lambda s: s["inert_parts"] / max(1, s["parts"])),
+            ("mediated top1", lambda s: s["median_mediated_share"][1]), ("mediated top3", lambda s: s["median_mediated_share"][3]),
+            ("mediated top5", lambda s: s["median_mediated_share"][5]), ("median units", lambda s: s["median_parts"]),
+            ("median params (M)", lambda s: None if s["median_params"] is None else s["median_params"] / 1e6),
+            ("median build s", lambda s: s["median_build_seconds"]), ("median positions", lambda s: s["median_positions"])]
+    rows = {}
+    for name, recs in sets.items():
+        sm = summary([r for r in recs if r["task"] in common])
+        es = [own_stats(r).get("spearman") for r in recs if r["task"] in common]
+        es = [x for x in es if x is not None]
+        rows[name] = [f(sm) for _, f in cols] + [float(np.median(es)) if es else None]
+    names = [c for c, _ in cols] + ["edit rho"]
+    mib_keys = sorted({k for v in (mib or {}).values() for k in v})
+    out = [f"{len(common)} texts scored by every builder", f"{'':22}" + "".join(f"{n:>16}" for n in sets)]
+    for i, c in enumerate(names):
+        out.append(f"{c:22}" + "".join(f"{'-' if rows[n][i] is None else (f'{rows[n][i]:.3f}' if isinstance(rows[n][i], float) else rows[n][i]):>16}" for n in sets))
+    for k in mib_keys:
+        out.append(f"{'MIB ' + k:22}" + "".join(f"{(mib.get(n) or {}).get(k, '-')!s:>16}" for n in sets))
     return "\n".join(out)
 
 
@@ -665,11 +866,16 @@ def main():
     ap.add_argument("--pool", type=Path, default=POOL)
     ap.add_argument("--vpd", type=Path, nargs="*", default=[], help="VPD's saved answers and orders (teacher.py --save-vpd's "
                     "files, merged), where the causal-importance network is not")
+    ap.add_argument("--mib", type=Path, help="bakeoff: MIB's numbers per builder, {builder: {metric: value}}")
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     a = ap.parse_args()
     if str(a.paths[0]) == "add":  # add OUT CIRCUITS_DIR
         add(a.paths[1], a.paths[2], {k: v for f in a.vpd for k, v in torch.load(f).items()} or None)
+        return
+    if str(a.paths[0]) == "bakeoff":  # bakeoff NAME=OUT ... [--mib FILE: {builder: {metric: value}}]
+        sets = {x.split("=", 1)[0]: load(Path(x.split("=", 1)[1])) for x in map(str, a.paths[1:])}
+        print(bakeoff(sets, json.loads(a.mib.read_text()) if a.mib else None))
         return
     if str(a.paths[0]) == "table":
         recs = load(a.paths[1])
@@ -683,12 +889,18 @@ def main():
     vpd = {k: v for f in a.vpd for k, v in torch.load(f).items()} or None
     ge = goal_eval.GoalEval(native.Native(), chunk=32)
     goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = teacher.PACK_FLIP_ROWS, teacher.PACK_CHANGED_ROWS
+    means = None
     for p in todo:
         dest = a.out / f"{p.stem}.json"
         if dest.exists():
             continue
         part = a.out / f"{p.stem}.partial"
-        rec = score(ge, p, pool, vpd, a.pool.name, save=lambda r, part=part: part.write_text(json.dumps(r)))
+        keep = lambda r, part=part: part.write_text(json.dumps(r))  # noqa: E731
+        if is_native(p):
+            means = means or native_units.unit_means(ge)
+            rec = score_native(ge, p, pool, vpd, means, a.pool.name, save=keep)
+        else:
+            rec = score(ge, p, pool, vpd, a.pool.name, save=keep)
         dest.write_text(json.dumps(rec))
         part.unlink(missing_ok=True)
         print(f"{p.stem}: v {rec['floors']['v']:.3f}, {rec['size']['parts']} parts, {rec['seconds']:.0f} s", flush=True)

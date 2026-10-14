@@ -54,7 +54,11 @@ def record(task, v, removable, parts, k_phi):
             "size": {"parts": parts, "lines": None, "positions": [1, 2], "vpd_k_phi": k_phi, "vpd_k_floors": None}, "known": {},
             "edits": {"stats": {"circuit_n": {"spearman": 0.5, "median_abs_error": 1.0, "p90_abs_error": 2.0,
                                               "top3": {"predicted": 1.0, "real": 3.0}, "top5": {"predicted": 2.0, "real": 2.5}}}},
-            "teacher": {"stage": "site", "fallback": v > 0}, "pool": "ci_patterns_fresh.pt"}
+            "teacher": {"stage": "site", "fallback": v > 0}, "pool": "ci_patterns_fresh.pt"} | (
+        {"edits": {"stats": {"circuit_n": {"spearman": 0.5, "median_abs_error": 1.0, "p90_abs_error": 2.0,
+                                           "top3": {"predicted": 1.0, "real": 3.0}, "top5": {"predicted": 2.0, "real": 2.5}}},
+                   "mediated": [{"k": 1, "live": 10.0, "mediated": 3.0, "share": 0.3}, {"k": 3, "live": 12.0, "mediated": 6.0, "share": 0.5},
+                                {"k": 5, "live": 0.05, "mediated": 0.0, "share": None}]}})
 
 
 def test_summary_counts():
@@ -69,10 +73,30 @@ def test_summary_counts():
     assert s["median_margin_by_family"]["N"] == pytest.approx(-0.1) and s["teacher_fallback"] == 1 and s["pool"] == ["ci_patterns_fresh.pt"]
     assert s["edits_medians"]["circuit_n"]["top3_median_abs_error"] == 2.0
     line = sc.row_line(record("text9000", 0.0, 2, 100, 200))
-    assert line["removable"] == [2, 24] and line["edit_err_n"] == 1.0 and line["teacher"]["stage"] == "site"
+    assert line["removable"] == [2, 24] and line["edit_err"] == 1.0 and line["teacher"]["stage"] == "site"
+    assert line["mediated"] == {1: 0.3, 3: 0.5, 5: None} and line["v_shared"] == 0.0
+    assert s["median_mediated_share"] == {1: 0.3, 3: 0.5, 5: None}
+    assert sc.v_shared(record("text9001", 0.2, 4, 300, None)) == pytest.approx(0.2)
+
+
+def test_native_files(tmp_path):
+    (tmp_path / "text9001.json").write_text('{"units": "native", "nodes": [["head", 1, 3, 2], ["neuron", 0, 3, 7]]}')
+    (tmp_path / "text9002.json").write_text('{"nodes": [["h.0.mlp.c_fc", 5, 3]]}')
+    assert sc.is_native(tmp_path / "text9001.json") and not sc.is_native(tmp_path / "text9002.json")
+    assert sc.native_label(("head", 1, 3, 2)) == "L1.head2@3" and sc.native_label(("neuron", 0, 3, 7)) == "L0.n7@3"
+    (tmp_path / "summary_x.jsonl").write_text('{"task": "text9002", "seconds": 12.5}\n')
+    assert sc.build_seconds(tmp_path / "text9002.json") == 12.5
 
 
 def test_faith():
     st = sc.faith([0.0, 1.0, 2.0, 3.0], [0.0, 1.5, 2.0, 5.0])
     assert st["spearman"] == 1.0 and st["median_abs_error"] == 0.25 and st["n"] == 4
     assert sc.faith([1.0], [2.0])["spearman"] is None
+
+
+def test_bakeoff_common_texts():
+    a = [record("text9000", 0.0, 2, 100, 200), record("text9001", 0.2, 4, 300, None)]
+    b = [record("text9000", 0.1, 8, 50, None)]
+    out = sc.bakeoff({"teacher": a, "fast": b}, {"fast": {"CPR": 0.8}})
+    assert out.splitlines()[0] == "1 texts scored by every builder"
+    assert "MIB CPR" in out and "0.8" in out

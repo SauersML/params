@@ -1,6 +1,7 @@
 """The exemplar of an oracle answer (#2951 graph oracle, the lead's 10-14): on text9000 ("The new structure involved the
 creation" -> " of"), rustmove's stated circuit (teacher/stated/text9000.json: 55 parts, 173 lines), an English account
-whose every sentence is a claim tested by intervention on the real model with its measured number, one predicted edit
+whose claims report their measurements and pass predicates, distinguishing full-model interventions and associations
+from the circuit's own edit predictions, one predicted edit
 measured, and a one-page figure (the circuit beside the English).
 
   exemplar.py measure    -> OUT/measure.json: the real model's p(" of"); each part removed alone and groups removed
@@ -274,20 +275,21 @@ def answer():
     at_t = g["the parts at 'the'"]
     n_c = sum(1 for r in m["parts"] if r["pos"] == m["target"])
     n_t = sum(1 for r in m["parts"] if r["pos"] == m["target"] - 1)
-    claim(f"The prediction is made at “creation”: removing the circuit's {n_c} parts there takes p(of) to {at_c['p_of']:.4f} "
-          f"({at_c['drop_bits']:.1f} bits), while removing its {n_t} parts at “the” lowers it only to {at_t['p_of']:.2f} "
-          f"({at_t['drop_bits']:.2f} bits).", "remove each group of parts together in the real model",
+    claim(f"In the full model on this input, removing the circuit-selected {n_c} parts at “creation” takes p(of) to {at_c['p_of']:.4f} "
+          f"({at_c['drop_bits']:.1f} bits), while removing its {n_t} parts at “the” changes p(of) to {at_t['p_of']:.2f} "
+          f"({at_t['drop_bits']:.2f} bits); the measured log-probability drop at “creation” is over five times as large.", "remove each group of parts together in the real model",
           {"creation": at_c, "the": at_t}, at_c["drop_bits"] > 5 * max(at_t["drop_bits"], 0.01))
     r53 = parts["L0.fc#53"]
     g53 = gen["parts"]["L0.fc#53"]
-    claim(f"The largest single removal, L0.fc#53 at “creation” ({r53['drop_bits']:.1f} bits), is a general part: it is active on "
-          f"{100 * active_share('L0.fc#53'):.0f}% of all tokens, and removing it from ordinary Pile text costs {g53[0]:.1f} nats of "
-          f"prediction and {abs(100 * g53[1]):.0f} points of top-1 accuracy, so it supports almost every prediction, not this one in particular.",
+    claim(f"Removing L0.fc#53 at “creation” from the full model costs {r53['drop_bits']:.1f} bits of log p(of). "
+          f"Its archived activation rate is {100 * active_share('L0.fc#53'):.0f}% of the sampled Pile tokens; "
+          f"removing it at every position of 24 Pile sequences gives {g53[0]:.1f} nats of output KL "
+          f"and a signed top-1 accuracy change of {100 * g53[1]:+.0f} percentage points.",
           "remove the part alone here, and at every position of 24 Pile sequences", {"drop_bits": r53["drop_bits"], "pile KL nats": g53[0], "top-1 change": g53[1]},
           g53[0] > 1.0)
     r = parts["L3.down#2481"]
-    claim(f"The part specific to “of” is L3.down#2481: across 1M Pile tokens its activation tracks the position just before "
-          f"“ of” (partial r −0.65), and removing it here drops log2 p(of) by {r['drop_bits']:.2f} bits.",
+    claim(f"Removing L3.down#2481 from the full model at its selected position on this input "
+          f"drops log2 p(of) by {r['drop_bits']:.2f} bits; this removal does not establish token specificity.",
           "association study; remove the part alone", {"drop_bits": r["drop_bits"], "label": r["label"]}, r["drop_bits"] > 0.3)
     nouns = [s_ for s_ in m["swaps"] if s_["kind"] != "not a noun"]
     act = [s_["activations"]["L3.down#2481"][1] for s_ in nouns]
@@ -295,40 +297,42 @@ def answer():
     rho = spearmanr(act, lpo).correlation
     keep = [s_ for s_ in nouns if s_["kind"].startswith("takes")]
     rare = [s_ for s_ in nouns if s_["kind"].startswith("a noun")]
-    claim(f"It reads the noun: when “creation” is swapped for other nouns that take “of” its activation stays near "
-          f"{r['activation']:.1f} ({min(s_['activations']['L3.down#2481'][1] for s_ in keep):.1f} to {max(s_['activations']['L3.down#2481'][1] for s_ in keep):.1f}) "
-          f"and p(of) stays {min(s_['p_of'] for s_ in keep):.2f}–{max(s_['p_of'] for s_ in keep):.2f}; for nouns that rarely take “of” "
-          f"it moves toward zero ({min(s_['activations']['L3.down#2481'][1] for s_ in rare):.1f} to {max(s_['activations']['L3.down#2481'][1] for s_ in rare):.1f}) "
-          f"and p(of) falls as low as {min(s_['p_of'] for s_ in rare):.2f} (rank correlation of its activation with log p(of) over the 12 nouns: {rho:+.2f}).",
-          "swap the token at “creation”; read the part and p(of)", {"spearman": rho, "swaps": [(s_["word"], s_["p_of"], s_["activations"]["L3.down#2481"][1]) for s_ in nouns]},
+    claim(f"In the full model, L3.down#2481's baseline activation is {r['activation']:.1f}. "
+          f"For the manually chosen swap group labelled ‘takes of’, its observed activation range is "
+          f"{min(s_['activations']['L3.down#2481'][1] for s_ in keep):.1f} to {max(s_['activations']['L3.down#2481'][1] for s_ in keep):.1f} "
+          f"and p(of) ranges {min(s_['p_of'] for s_ in keep):.2f}–{max(s_['p_of'] for s_ in keep):.2f}; for the manually chosen group labelled ‘rarely takes of’, "
+          f"the activation range is {min(s_['activations']['L3.down#2481'][1] for s_ in rare):.1f} to {max(s_['activations']['L3.down#2481'][1] for s_ in rare):.1f} "
+          f"and minimum p(of) is {min(s_['p_of'] for s_ in rare):.2f} (rank correlation of activation with log p(of) over these {len(nouns)} replacements: {rho:+.2f}).",
+          "swap the token at “creation”; read the part and p(of); group labels are manual, not an independently tested linguistic classification", {"spearman": rho, "swaps": [(s_["word"], s_["p_of"], s_["activations"]["L3.down#2481"][1]) for s_ in nouns]},
           rho < -0.5)
     rest = [(s_["word"], s_["p_of"], s_["restored"]["L3.down#2481"]["p_of"], bits(p0, s_["p_of"]), s_["restored"]["L3.down#2481"]["recovered_bits"])
             for s_ in rare + [x for x in keep if bits(p0, x["p_of"]) > 0.1]]
     frac = [rb / db for _, _, _, db, rb in rest if db > 0.1]
-    claim("Setting L3.down#2481 back to its value on “creation” restores most of the drop: " +
+    claim("In the full model, setting L3.down#2481 back to its value on “creation” recovers a median of at least half the drop over the selected swaps: " +
           ", ".join(f"“{w.strip()}” {a_:.2f} → {b_:.2f}" for w, a_, b_, _, _ in rest if b_ > a_ + 0.05) +
           f" (median {100 * np.median(frac):.0f}% of the drop in bits recovered).",
           "swap, then patch the part's activation to its original value", {"restores": rest}, np.median(frac) >= 0.5)
     r3257 = parts["L0.down#3257"]
     nn = [s_ for s_ in m["swaps"] if s_["kind"] == "not a noun"]
     rec = [(s_["word"], s_["restored"]["L0.down#3257"]["recovered_bits"], s_["activations"]["L0.down#3257"][1]) for s_ in nn]
-    claim(f"Whether the token is a noun at all goes through L0.down#3257 (tracks nouns, partial r +0.40; removing it here drops "
-          f"{r3257['drop_bits']:.2f} bits): after a non-noun its activation falls from {r3257['activation']:.1f} to "
+    claim(f"Removing L0.down#3257 from the full model here drops log2 p(of) by "
+          f"{r3257['drop_bits']:.2f} bits; after the sampled non-noun swaps its activation changes from {r3257['activation']:.1f} to "
           f"{min(x[2] for x in rec):.1f}–{max(x[2] for x in rec):.1f}, and setting it back recovers " +
           ", ".join(f"{b_:+.1f} bits after “{w.strip()}”" for w, b_, _ in rec) + ".",
           "swap to a non-noun, then patch the part back", {"restores": rec}, sum(b_ > 1 for _, b_, _ in rec) >= 3)
     r726 = parts["L0.fc#726"]
-    claim(f"“the” adds a little: its determiner part L0.fc#726 (partial r +0.88 with determiners) costs {r726['drop_bits']:.2f} bits when removed.",
+    claim(f"Removing L0.fc#726 at its selected position from the full model on this input costs {r726['drop_bits']:.2f} bits of log p(of).",
           "remove the part alone", {"drop_bits": r726["drop_bits"]}, r726["drop_bits"] > 0.05)
     t3, t5 = g["the top 3 parts"], g["the top 5 parts"]
     s3, s5 = sum(x["drop_bits"] for x in m["parts"][:3]), sum(x["drop_bits"] for x in m["parts"][:5])
-    claim(f"Removals do not add up: the three strongest parts removed together cost {t3['drop_bits']:.1f} bits and the five strongest "
-          f"{t5['drop_bits']:.1f} bits (fewer than the three), against {s3:.1f} and {s5:.1f} for their single removals summed.",
+    claim(f"In the full model, joint and summed single-removal drops differ by over one bit for both groups: "
+          f"the three strongest parts jointly cost {t3['drop_bits']:.1f} bits and the five strongest "
+          f"{t5['drop_bits']:.1f} bits, against {s3:.1f} and {s5:.1f} for their single removals summed.",
           "remove groups together", {"top3": t3, "top5": t5, "sums": [s3, s5]}, abs(t3["drop_bits"] - s3) > 1 and abs(t5["drop_bits"] - s5) > 1)
     e = m["edit"]
     targeted = [(x["site"], x["pos"], x["index"]) for x in m["parts"] if x["part"] in ("L3.down#2481", "L2.down#3049")]
     tg = _real_and_circuit(targeted)
-    edit = {"edit": "remove the two parts that track the position just before “ of” (L3.down#2481, L2.down#3049) at “creation”",
+    edit = {"edit": "remove the selected L3.down#2481 and L2.down#3049 parts at their recorded positions",
             "prediction (the circuit's own run)": {"p_of before": tg["circuit before"], "p_of after": tg["circuit after"], "drop bits": tg["circuit drop bits"]},
             "measured (real model)": {"p_of before": tg["real before"], "p_of after": tg["real after"], "drop bits": tg["real drop bits"]},
             "passed": abs(tg["circuit drop bits"] - tg["real drop bits"]) <= 0.5 * max(tg["real drop bits"], 0.2)}
@@ -337,7 +341,7 @@ def answer():
           "predict with the circuit's run, then remove the parts in the real model", edit, edit["passed"])
     claim(f"Edit: the circuit predicts that removing its three strongest parts takes p(of) from {e['circuit p_of']:.2f} to {e['circuit p_of after']:.3f} "
           f"({e['circuit predicted drop_bits']:.1f} bits); the real model falls to {e['real p_of after']:.5f} ({e['real drop_bits']:.1f} bits): "
-          f"the loss of “ of” is predicted, its size is not.",
+          f"the pass flag tests whether these log-probability drops differ by at most half the real-model drop, not full-distribution fidelity.",
           "predict with the circuit's run, then remove the parts in the real model", e,
           abs(e["circuit predicted drop_bits"] - e["real drop_bits"]) <= 0.5 * e["real drop_bits"])
     passed = [c_ for c_ in claims if c_["passed"]]

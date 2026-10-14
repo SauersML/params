@@ -18,7 +18,8 @@ Sets:
   dev        dev teacher circuits against random subsets of their start of the same size (3 seeds)
   reference  per dev text the teacher, VPD's actives at the targets and the START's candidate positions (v24's
              own-run families' reference, goal_eval.vpd_floors), VPD's whole answer (the share alone) and, where the START
-             (goal_eval.start_set) is larger than the teacher, random subsets of it of the teacher's size (3 seeds):
+             (the teacher's path.json START record, else goal_eval.start_set) is larger than the teacher, random subsets of
+             it of the teacher's size (3 seeds):
              whether a node-values floor relative to VPD would be fair (the lead's 10-13 question)
 
   python node_values.py toys --toys ~/mpd-data/toys_planted --out OUT.jsonl
@@ -153,15 +154,21 @@ def reference(a) -> None:
             g, _ = goal_eval.circuit(json.loads(f.read_text()), targets, nat.C, tx.T)
             nodes = sorted(g.node_set())
             act = sorted((n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist())
-            ps = set(targets) | set(ge.start_candidates(tx)[:goal_eval.START_CAP])
-            start = sorted(ge.start_set(tx, "search")["graph"].node_set())
+            pf = a.teacher / f"{task}.path.json"  # the teacher's own START record (v24): its candidates and nodes
+            rec = json.loads(pf.read_text()).get("blocks", {}) if pf.exists() else {}
+            if rec.get("start", {}).get("candidates") is not None and rec.get("stage_nodes", {}).get("start"):
+                ps = set(targets) | set(rec["start"]["candidates"])
+                start = sorted((n, int(t), int(c)) for n, t, c in rec["stage_nodes"]["start"])
+            else:
+                ps = set(targets) | set(ge.start_candidates(tx)[:goal_eval.START_CAP])
+                start = sorted(ge.start_set(tx, "search")["graph"].node_set())
             graphs = {"teacher": native.Graph(nodes, complete=True),
                       "vpd_at_candidates": native.Graph([nd for nd in act if nd[1] in ps], complete=True),
                       "start": native.Graph(start, complete=True), "vpd": native.Graph(act, complete=True)}
             if len(start) > len(nodes):
                 for s in range(3):
                     graphs[f"start_subset{s}"] = native.Graph(sorted(random.Random(s).sample(start, len(nodes))), complete=True)
-            got = agreement(ge, tx, list(graphs.values()), effects=[k not in ("vpd", "vpd_at_candidates") for k in graphs])  # (references: share alone)
+            got = agreement(ge, tx, list(graphs.values()), effects=[k in a.weighted.split(",") for k in graphs])
             for arm, r in zip(graphs, got):
                 fh.write(json.dumps({"set": "reference", "text": task, "circuit": arm, **r}) + "\n")
                 print(task, arm, json.dumps(r), flush=True)
@@ -186,6 +193,8 @@ def main():
     r.add_argument("--teacher", type=Path, required=True)
     r.add_argument("--first", type=int, default=9000)
     r.add_argument("--n", type=int, default=20)
+    r.add_argument("--weighted", default="teacher,start", help="the circuits whose line effects weigh the share (the rest: the "
+                   "share alone; v24 teachers hold 600-2,200 nodes)")
     for p in (t, c, d, r):
         p.add_argument("--out", type=Path, required=True)
         p.add_argument("--device", default=None)

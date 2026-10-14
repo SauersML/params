@@ -12,7 +12,7 @@ flowchart TB
 
   subgraph BUILD["CONSTRUCT CIRCUITS · non-LLM primary path"]
     U["<b>Compare units under matched conditions</b><br/>VPD subcomponents versus neurons / attention heads.<br/>Same model, inputs, fidelity target and search budget.<br/>Count VPD remainder computation explicitly.<br/>READY · existing native executor and bounded pruner audited"]
-    B["<b>Use a bounded deterministic constructor</b><br/>Reuse existing pruning and search implementations.<br/>New connect.py wiring stage complements unit selection.<br/>Measure time to the first qualifying circuit;<br/>stop at the budget and report failure honestly.<br/>Why: a good circuit must also be cheap to obtain."]
+    B["<b>Use a bounded deterministic constructor</b><br/>Reuse existing pruning and search implementations.<br/>New connect.py wiring stage complements unit selection.<br/>Empty-edge crash fixed: b5275b6; five tests pass.<br/>Measure time to the first qualifying circuit;<br/>stop at the budget and report failure honestly.<br/>Why: a good circuit must also be cheap to obtain."]
     Q["<b>Verify the actual executable result</b><br/>Output KL, intervention prediction, necessity and size.<br/>Report tested background robustness separately.<br/>Failed targets are not positive supervision.<br/>Existing direct-KL admission and execution checks available."]
     C["<b>Deliver a circuit and its evidence</b><br/>Graph, unit meanings, model binding and tested scope.<br/>Construction / validation time, memory and execution cost.<br/>Why: the interpreter needs a trustworthy object to explain."]
     U --> B --> Q --> C
@@ -44,7 +44,7 @@ flowchart TB
     K["<b>Own-circuit claim checker shipped</b><br/>bf60aa8 · 86 focused tests pass.<br/>Same carriers: full / intact claim true, cut-edge claim false.<br/>Opt-in; reward weights unchanged; free prose unverified.<br/>OWNER · root / variable_reward / fork_review"]
     N["<b>Stop the failed restoration family</b><br/>Two omission groups pass only 43/52 and 27/52 worlds.<br/>Both fail the same upstream edit; only full restoration passes.<br/>Why: more of the same search does not yield valid targets.<br/>AUDITED · MATS 20416 / 20417 · no paid spend"]
     H["<b>Old explanation groups do not fit old circuits</b><br/>16 TRAIN records: none of 29 scalar groups is contained.<br/>Keep the exact evidence; do not trim groups to force a pass.<br/>Next: derive explanation carriers from the constructed circuit.<br/>AUDITED · eval_recovery · metadata only"]
-    P["<b>Measure native-unit construction feasibility</b><br/>TRAIN6008 · neurons / heads · same four weight worlds.<br/>120 s search; 400 evaluated rows; absolute KL 0.001 bits.<br/>Count setup and cache refreshes; full fallback on timeout.<br/>RUNNING / QUEUED · MATS 20423; root + eval_recovery"]
+    P["<b>Measure native-unit construction feasibility</b><br/>TRAIN6008 · neurons / heads · same four weight worlds.<br/>120 s search; 400 rows; absolute KL 0.001 bits.<br/>20423 stopped before search: reference-path mismatch.<br/>PREPARING · same-path anchors; preserve original failure"]
   end
   K -. usable verifier .-> E
   N -. rejects old targets .-> B

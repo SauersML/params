@@ -1840,7 +1840,10 @@ def test_start_candidates_and_own_effects(tiny):
     circuit does not hold."""
     nat, ge, tx = tiny
     one = ge.resample_influence(tx, "search")
-    assert set(one) == {q for q in range(1, max(tx.targets) + 1) if q not in tx.targets} and min(one.values()) > -1e-6
+    assert set(one) == {q for q in range(0, max(tx.targets) + 1) if q not in tx.targets} and min(one.values()) > -1e-6
+    ge.FIRST_POSITION = False  # (a BOS-first target's: from position 1)
+    assert set(ge.resample_influence(tx, "search")) == set(one) - {0}
+    ge.FIRST_POSITION = True
     one1 = ge.resample_influence(tx, "search", k=1)
     d = list(ge.far_donors(tx, ge.far_pool("search"), 1)[0][1])
     q = max(one1, key=one1.get)

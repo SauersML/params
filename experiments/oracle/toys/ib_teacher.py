@@ -95,6 +95,7 @@ def main():
     donors = [x + [EOS] * max(0, a.pad - len(x)) for x in donors]
     for split in ("search", "eval"):  # this model's own texts, never vpd4l's (far_pool)
         ge.donor_pools[split] = [(f"{a.case.name}_{a.donor_split if a.mib else 'random'}{i}", x) for i, x in enumerate(donors)]
+    ge.FIRST_POSITION = False  # every text starts with the BOS the model always reads: never a START candidate
     goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = teacher.PACK_FLIP_ROWS, teacher.PACK_CHANGED_ROWS
     teacher.RANK = "once"
     tokens = None

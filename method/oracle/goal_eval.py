@@ -1223,6 +1223,11 @@ class GoalEval:
     """Scores answers (native.Graph) on texts. hooks: name -> fn(task, graph, explanation) -> float or None, for the
     English reader's bits ("E1") and question answering ("E2"); unset, their columns are None."""
 
+    FIRST_POSITION = True  # resample_influence (the START's candidates, input scope) from position 0 (the lead's 10-14):
+    # paper_bracket's "<" at 0 (the paper's L0 c_fc #2149/#2643, down #3069, L2 v #473 there, all VPD-active) entered its
+    # START and circuit only with it, while on text9000-9005 position 0 moved the prediction 0.000-0.003 bits (rank
+    # 41-236) and changed no START; off for a target whose texts start with the BOS it always reads (ib_teacher)
+
     def __init__(self, nat: native.Native | None = None, *, changes: int = native.CHANGES, ranks=HELD_OUT_RANKS,
                  share_floor: float = SHARE_FLOOR, random_pairs: int = RANDOM_PAIRS, max_edges: int = MAX_EDGES, chunk: int = CHUNK,
                  cut_chunk: int = CUT_CHUNK, semantics: str = "n"):
@@ -4385,16 +4390,18 @@ class GoalEval:
         """{position: mean KL in bits at the targets of the model with that position's token alone replaced by the
         token at the same place in each of k far donors of split (far_donors, aligned at their ends; a donor whose
         token there is the text's gives its next differing one)}, the positions from 1 to the last target outside the
-        targets: the input-scope family's intervention one position at a time, natural tokens the model reads in place
-        of the text's (the lead's 10-13). On the lead's 17 hand-checked texts it ranks the context token that moves the
+        targets (from 0 with FIRST_POSITION, the default: the first token, which the probe's draws from the model's own
+        prediction never change, there being none there; off on a target whose texts start with a BOS it always reads): the
+        input-scope family's intervention one position at a time, natural tokens the model reads in place of the
+        text's (the lead's 10-13). On the lead's 17 hand-checked texts it ranks the context token that moves the
         prediction most first on 7 of the 9 that need context, second or third on the others; the probe's draws from the
         model's own prediction (moved) miss tokens with plausible substitutes (text9043's ' adjusted' one back: 0.57
         bits by the probe, 1.03 by donors, 9.18 replaced by ' the'). Kept on tx."""
         kept = tx.__dict__.setdefault("_resample", {})
-        if (split, k) not in kept:
+        if (split, k, self.FIRST_POSITION) not in kept:
             donors = [list(d) for _, d in self.far_donors(tx, self.far_pool(split), k)]
             tg = set(tx.targets)
-            qs = [q for q in range(1, max(tx.targets) + 1) if q not in tg]
+            qs = [q for q in range(0 if self.FIRST_POSITION else 1, max(tx.targets) + 1) if q not in tg]
             seqs = [[_donor_token(d, q, tx.T, x) if p == q else x for p, x in enumerate(tx.ids)] for q in qs for d in donors]
             kl = []
             for s0 in range(0, len(seqs), 4 * self.chunk):
@@ -4402,8 +4409,8 @@ class GoalEval:
                 kl += carry.kl(lp, tx.ref.expand_as(lp)).tolist()
                 native.free(self.nat.dev)
             n = len(donors)
-            kept[(split, k)] = {q: float(np.mean(kl[i * n:(i + 1) * n])) for i, q in enumerate(qs)} if n else {}
-        return kept[(split, k)]
+            kept[(split, k, self.FIRST_POSITION)] = {q: float(np.mean(kl[i * n:(i + 1) * n])) for i, q in enumerate(qs)} if n else {}
+        return kept[(split, k, self.FIRST_POSITION)]
 
     def start_candidates(self, tx: Text, split: str = "search") -> list:
         """The START's candidate positions in order (the lead's 10-13): F2's by the probe's moved and every position by

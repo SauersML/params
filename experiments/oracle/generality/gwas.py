@@ -1568,109 +1568,62 @@ def causal():
     print("wrote", dst, out["summary"])
 
 
-TEACHER = Path.home() / "mpd-data/graph_oracle/teacher"
-KINDS6 = ["q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj"]
 STAGES = ["site", "chunk16", "chunk4", "subcomponent"]
 
 
-def _probe_rows() -> "pd.DataFrame":
-    """fleet's removability probe table (probe_features.py: per start subcomponent of the v2.3 teacher circuits whose
-    path saved its stage nodes, the structural features and whether the final circuit keeps it), with each row's
-    subcomponent and the stage that removed it."""
-    import pandas as pd
-    import torch
-
-    vpd = torch.load(Path.home() / "mpd-data/graph_oracle/teacher/vpd_v2_494.pt", weights_only=False, map_location="cpu")
-    rows = []
-    for d in (TEACHER / "v2_train", TEACHER / "v2_heldout"):
-        for p in sorted(d.glob("text*.path.json")):
-            t = p.name[: -len(".path.json")]
-            if t not in vpd or not (d / f"{t}.json").exists():
-                continue
-            b = json.loads(p.read_text()).get("blocks") or {}
-            sn = b.get("stage_nodes") or {}
-            if not sn.get("start"):
-                continue
-            final = {(n, int(q_), int(c)) for n, c, q_ in json.loads((d / f"{t}.json").read_text())["nodes"] if n not in ("tok", "block")}
-            start = [(n, int(q_), int(c)) for n, q_, c in sn["start"]]
-            alive = [{(n, int(q_), int(c)) for n, q_, c in sn.get(st, sn["start"])} for st in STAGES]
-            target = max(json.loads((TEXTS / f"{t}.json").read_text())["prompts"][0]["target_positions"])
-            order = [(n, int(q_), int(c)) for n, q_, c in vpd[t]["order"]]
-            rank = {nd: i for i, nd in enumerate(order)}
-            by_pos, by_ps = {}, {}
-            for nd in order:
-                by_pos.setdefault(nd[1], []).append(nd)
-                by_ps.setdefault((nd[1], nd[0]), []).append(nd)
-            rpos = {nd: i for lst in by_pos.values() for i, nd in enumerate(lst)}
-            rps = {nd: i for lst in by_ps.values() for i, nd in enumerate(lst)}
-            prank = {q_: i for i, q_ in enumerate(sorted(by_pos, key=lambda q_: min(rank[nd] for nd in by_pos[q_])))}
-            cnt_pos, cnt_ps = {}, {}
-            for nd in start:
-                cnt_pos[nd[1]] = cnt_pos.get(nd[1], 0) + 1
-                cnt_ps[(nd[1], nd[0])] = cnt_ps.get((nd[1], nd[0]), 0) + 1
-            for nd in start:
-                n, pos_, c = nd
-                kind, layer = n.split(".")[-1], int(n.split(".")[1])
-                r_ = rank.get(nd, len(order))
-                kept = nd in final
-                rows.append({"text": t, "split": "dev" if t.startswith("text90") else "train", "label": int(kept), "site": n, "pos": pos_, "idx": c,
-                             "stage": "" if kept else next((st for st, a_ in zip(STAGES, alive) if nd not in a_), "after"),
-                             "start_size": len(start), "n_at_pos": cnt_pos[pos_], "n_at_pos_site": cnt_ps[(pos_, n)], "rank": r_,
-                             "rank_pct": r_ / max(len(order), 1), "rank_in_pos": rpos.get(nd, len(by_pos.get(pos_, []))),
-                             "rank_in_pos_pct": rpos.get(nd, 0) / max(len(by_pos.get(pos_, [1])), 1), "rank_in_pos_site": rps.get(nd, 0),
-                             "layer": layer, "dist_to_target": target - pos_, "is_target": int(pos_ == target),
-                             "pos_rank_by_vpd": prank.get(pos_, len(prank)), "n_positions": len(cnt_pos), **{f"kind_{k}": int(kind == k) for k in KINDS6}})
-    return pd.DataFrame(rows)
+PROBE = Path.home() / "mpd-data/cluster/oracle-graph-probe/features_q.csv"  # fleet's removability probe table
 
 
 def probe():
-    """Decision test 1: does a start subcomponent's association profile tell whether the v2.3 teacher keeps it? Boosted
-    trees on fleet's structural features, with and without each subcomponent's association features (its strongest
-    |partial r| at q < 0.05 overall and per phenotype family, its strong-hit count, how often it is active); within-text
-    AUROC on the dev texts (fit on train) and in 5-fold cross-validation over train texts grouped by text, overall and
-    per removal stage (each stage's removals against the kept) -> OUT/probe.json."""
+    """Decision test 1: does a start subcomponent's association profile tell whether the v2.3 teacher keeps it? On
+    fleet's removability probe table (PROBE: one row per start subcomponent, structure and q_ question evidence, the
+    removing stage) and its protocol (the texts with full question evidence; boosted trees; mean within-text AUROC in
+    5-fold cross-validation grouped by text), structure + question with and without an a_ block per subcomponent:
+    its strongest |partial r| at q < 0.05 overall and per phenotype family, its count of hits with |partial r| >= 0.1,
+    and how often it is active; overall and per removing stage (each stage's removals against the kept) ->
+    OUT/probe.json."""
     import pandas as pd
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.metrics import roc_auc_score
     from sklearn.model_selection import GroupKFold
 
-    df = _probe_rows()
+    df = pd.read_csv(PROBE, keep_default_na=False, na_values=[""])
+    df = df[df.groupby("text").q_pool_imp.transform(lambda x: x.notna().all())].reset_index(drop=True)
     A = np.load(OUT / "assoc.npz")
     r, q = A["r"], A["q"]
     fams = json.loads(str(A["families"]))
     off = json.loads(str(A["offsets"]))
-    sig = np.where(q < 0.05, np.abs(r), 0.0)
-    sig = np.nan_to_num(sig)
-    feats = {"assoc max |r|": sig.max(1), "assoc strong hits": (sig >= 0.1).sum(1), "assoc active tokens": np.log1p(A["n_active"])}
+    sig = np.nan_to_num(np.where(q < 0.05, np.abs(r), 0.0))
+    feats = {"a_max_r": sig.max(1), "a_strong_hits": (sig >= 0.1).sum(1), "a_log_active_tokens": np.log1p(A["n_active"])}
     for f in sorted(set(fams)):
-        cols = [j for j, x in enumerate(fams) if x == f]
-        feats[f"assoc {f}"] = sig[:, cols].max(1)
-    gi = np.array([off[s_] + i for s_, i in zip(df.site, df.idx)])
+        feats[f"a_{f}"] = sig[:, [j for j, x in enumerate(fams) if x == f]].max(1)
+    gi = np.array([off[s_] + int(c) for s_, c in zip(df.site, df.comp)])
     for k, v in feats.items():
         df[k] = v[gi]
-    base = [c for c in df.columns if c not in ("text", "split", "label", "site", "pos", "idx", "stage") and not c.startswith("assoc")]
-    plus = base + [c for c in df.columns if c.startswith("assoc")]
+    q_ = [c for c in df.columns if c.startswith("q_")]
+    a_ = [c for c in df.columns if c.startswith("a_")]
+    struct = [c for c in df.columns if c not in ("text", "split", "label", "site", "pos", "comp", "stage") and c not in q_ + a_]
+    sets = {"structure": struct, "structure + question": struct + q_, "structure + question + associations": struct + q_ + a_,
+            "associations alone": a_}
 
-    def within(sub, s_, mask=None):
+    def within(s_, mask=None):
         out = []
-        for _, g in sub.groupby("text"):
+        for _, g in df.groupby("text"):
             g = g if mask is None else g[mask(g)]
             if g.label.nunique() == 2:
                 out.append(roc_auc_score(g.label, s_[g.index]))
-        return float(np.mean(out)) if out else None, len(out)
+        return (float(np.mean(out)), len(out)) if out else (None, 0)
 
-    res = {"rows": len(df), "texts": int(df.text.nunique())}
-    tr, dv = df[df.split == "train"], df[df.split == "dev"]
-    for name, fs in (("structure", base), ("structure + associations", plus)):
-        oof = pd.Series(np.nan, index=tr.index)
-        for i, j in GroupKFold(5).split(tr, tr.label, tr.text):
-            m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05).fit(tr.iloc[i][fs], tr.iloc[i].label)
-            oof.iloc[j] = m.predict_proba(tr.iloc[j][fs])[:, 1]
-        m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05).fit(tr[fs], tr.label)
-        sd = pd.Series(m.predict_proba(dv[fs])[:, 1], index=dv.index)
-        res[name] = {"cv within-text AUROC": within(tr, oof), "dev within-text AUROC": within(dv, sd),
-                     "cv by stage": {st: within(tr, oof, lambda g, st=st: (g.label == 1) | (g.stage == st)) for st in STAGES}}
-        print(name, json.dumps(res[name]), flush=True)
+    res = {"texts": int(df.text.nunique()), "rows": len(df)}
+    for name, fs in sets.items():
+        oof = pd.Series(np.nan, index=df.index)
+        for i, j in GroupKFold(5).split(df, df.label, df.text):
+            m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05).fit(df.iloc[i][fs], df.iloc[i].label)
+            oof.iloc[j] = m.predict_proba(df.iloc[j][fs])[:, 1]
+        st_ = {st: within(oof, lambda g, st=st: (g.label == 1) | (g.stage == st)) for st in STAGES}
+        res[name] = {"within-text AUROC": within(oof), "by stage": st_}
+        print(f"{name}: within-text AUROC {within(oof)[0]:.3f} over {within(oof)[1]} texts; by stage "
+              + ", ".join(f"{k} {v[0]:.3f}" for k, v in st_.items() if v[0] is not None), flush=True)
     (OUT / "probe.json").write_text(json.dumps(res, indent=1))
     print("wrote", OUT / "probe.json")
 
@@ -1679,17 +1632,17 @@ EDIT_CANDS = 24  # persistent_e3's circuit size for an edit
 
 
 def assoc_prefs():
-    """Decision test 2's input: rustmove's 15 preferences (PREFS) with each one's circuit replaced by the EDIT_CANDS
-    subcomponents most associated with it (|z| at q < 0.05 for log p(b) at the positions whose token is a), in
-    persistent_e3's format [site, index, score] -> OUT/prefs15_assoc.jsonl; persistent_e3.py edit with --methods
-    circuit_ft --rank 4 on it is the association-picked edit, against the circuit-picked edit of the same run."""
+    """Decision test 2's input: for each of rustmove's 15 preferences (PREFS), the EDIT_CANDS subcomponents most
+    associated with it (|z| at q < 0.05 for log p(b) at the positions whose token is a), by matrix, in persistent_e3's
+    --assoc format {"a->b": {matrix: [indices]}} -> OUT/assoc_sets.json; persistent_e3.py edit --methods assoc_ft
+    circuit_ft --rank 4 --assoc on it compares the association-picked edit with the circuit-picked one on one pod."""
     A = np.load(OUT / "assoc.npz")
     names = json.loads(str(A["names"]))
     z, q = A["z"], A["q"]
     off = json.loads(str(A["offsets"]))
     sites = sorted(off, key=off.get)
     starts = np.array([off[n] for n in sites])
-    out = []
+    out = {}
     for ln in PREFS.read_text().splitlines():
         p_ = json.loads(ln)
         nm = f"after {_decode(p_['a'])!r}, log p({_decode(p_['b'])!r})"
@@ -1699,15 +1652,16 @@ def assoc_prefs():
         j = names.index(nm)
         ok = np.flatnonzero(q[:, j] < 0.05)
         top = ok[np.argsort(-np.abs(z[ok, j]))][:EDIT_CANDS]
-        circ = []
+        sets = {}
         for c in top:
             i = int(np.searchsorted(starts, c, "right")) - 1
-            circ.append([sites[i], int(c - starts[i]), float(abs(z[c, j]))])
+            sets.setdefault(sites[i], []).append(int(c - starts[i]))
         old = {(s_, int(i_)) for s_, i_, _ in p_["circuit"][:EDIT_CANDS]}
-        print(f"{nm}: {len(ok)} subcomponents at q < 0.05; {len(old & {(s_, i_) for s_, i_, _ in circ})} of {EDIT_CANDS} shared with the circuit")
-        out.append({**p_, "circuit": circ, "circuit_from": "association"})
-    (OUT / "prefs15_assoc.jsonl").write_text("".join(json.dumps(x) + "\n" for x in out))
-    print("wrote", OUT / "prefs15_assoc.jsonl")
+        shared = len(old & {(s_, i_) for s_, v in sets.items() for i_ in v})
+        print(f"{nm}: {len(ok)} subcomponents at q < 0.05; {len(top)} taken, {shared} of them in the circuit's {EDIT_CANDS}")
+        out[f"{p_['a']}->{p_['b']}"] = sets
+    (OUT / "assoc_sets.json").write_text(json.dumps(out, indent=1))
+    print("wrote", OUT / "assoc_sets.json")
 
 
 FIG = Path("/Users/user/mpd-data/figures/oracle")

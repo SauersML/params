@@ -515,13 +515,13 @@ def spec_basis(nat, site: str, circ: list[int], ctrl: list[int]):
 
 
 METHODS = ("circuit_edit", "random_active", "random_any", "random_equal", "vpd_topk", "finetune", "circuit_scales", "random_scales",
-           "circuit_ft", "random_ft", "circuit_ft_spec", "finetune_sites")
+           "circuit_ft", "random_ft", "circuit_ft_spec", "finetune_sites", "assoc_ft")
 RANDOM_DRAWS = 2
-DENSE = ("finetune", "circuit_ft", "random_ft", "circuit_ft_spec", "finetune_sites")  # methods whose edits are (site, A, B) updates
+DENSE = ("finetune", "circuit_ft", "random_ft", "circuit_ft_spec", "finetune_sites", "assoc_ft")  # methods whose edits are (site, A, B) updates
 
 
 def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None,
-              methods: tuple = METHODS, rank: int | None = None) -> dict:
+              methods: tuple = METHODS, rank: int | None = None, assoc: dict | None = None) -> dict:
     """Delete a preference (the lead's practical edit): each method gives candidate edits on the fit third, one picked by
     the same rule on validation (select()), scored on the score third:
       circuit_edit   persistent scales of the circuit's subcomponents (greedy search() over its EDIT_CANDS by local
@@ -544,6 +544,10 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
                      controls); out["spec_ranks"] the ranks kept per matrix without and with the projection;
       finetune_sites an unrestricted rank-r update at each of circuit_ft's matrices, trained together: the same
                      matrices, objective, steps and selection as circuit_ft, only the restriction differs.
+      assoc_ft       circuit_ft with the subcomponents most associated with the preference in place of the circuit's
+                     (assoc: {"a->b": {matrix: [indices]}}, generality's gwas.py assoc_prefs: the top EDIT_CANDS by the
+                     association of their activations with log p(b) after a on Pile train text); the same fit_multi, rank,
+                     steps and LAMS.
     rank: r given (an earlier run's circuit edit size) in place of the circuit edit's operation count.
     Scores: flipped (preference gone), goal bits, controls kept (b still predicted elsewhere), KL per token on the rows'
     other positions and on held Pile texts. The validation frontier (every candidate's flipped and collateral) is kept."""
@@ -611,6 +615,11 @@ def practical(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, 
         keep["finetune_sites"] = []
         for lam in LAMS:
             fit_multi(net, {site: None for site in sites}, steps, r, lam, keep["finetune_sites"])
+    if "assoc_ft" in methods and (assoc or {}).get(f"{beh['a']}->{beh['b']}"):  # circuit_ft over the association-picked set
+        keep["assoc_ft"] = []
+        for lam in LAMS:
+            fit_multi(net, {site: finetune_edit.basis(nat, site, [int(c) for c in cs]) for site, cs in assoc[f"{beh['a']}->{beh['b']}"].items()},
+                      steps, r, lam, keep["assoc_ft"])
     if "circuit_ft" in methods or "random_ft" in methods:  # the fine-tune restricted to the circuit's span at its sites
         if "circuit_ft" in methods:
             keep["circuit_ft"] = []
@@ -810,6 +819,7 @@ def main():
     e.add_argument("--methods", nargs="*", default=list(METHODS))
     e.add_argument("--rank-from", help="an earlier edit run's rows: each preference's r from its circuit edit")
     e.add_argument("--rank", type=int, help="one r for every preference (over --rank-from and the circuit edit)")
+    e.add_argument("--assoc", help="assoc_ft's sets: JSON {\"a->b\": {matrix: [indices]}}")
     t = sub.add_parser("table")
     t.add_argument("rows")
     t.add_argument("--edit", action="store_true", help="edit's rows (practical_table)")
@@ -851,7 +861,8 @@ def main():
                 ranks = {(x["a"], x["b"]): len(x["methods"]["circuit_edit"]["ops"]) for x in read(args.rank_from)
                          if x["methods"].get("circuit_edit")} if args.rank_from else {}
                 r = practical(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites,
-                              methods=tuple(args.methods), rank=args.rank or ranks.get((beh["a"], beh["b"])))
+                              methods=tuple(args.methods), rank=args.rank or ranks.get((beh["a"], beh["b"])),
+                              assoc=json.loads(Path(args.assoc).read_text()) if getattr(args, "assoc", None) else None)
             else:
                 r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
         except torch.OutOfMemoryError:  # the preference skipped and reported, the process going on to the next

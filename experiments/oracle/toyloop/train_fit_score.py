@@ -15,7 +15,11 @@ def rows(path):return [json.loads(s) for s in Path(path).read_text().splitlines(
 
 
 def target_fit(completion, target, finish, *, parser):
-    """No English, tok annotations, or invalid/length answers earn graph credit."""
+    """Historical parser graph fit; English/tok annotations are not scored.
+
+    This is not a strict no-prose grammar check. Invalid/length answers receive
+    zero credit; physical executability remains a separate measurement.
+    """
     gold=parser(target)
     if not gold.ok or gold.bad:raise RuntimeError('invalid frozen teacher target')
     good=completion is not None and str(finish).lower() in ('stop','stopreason.stop')
@@ -27,6 +31,7 @@ def target_fit(completion, target, finish, *, parser):
     pu,pe=(components(parsed),edges(parsed)) if good else (set(),set())
     def f1(a,b):return 2*len(a&b)/(len(a)+len(b)) if a or b else 1.
     return dict(parse_valid=bool(good),exact_units=bool(good and pu==gu),exact_edges=bool(good and pe==ge),
+                exact_graph=bool(good and pu==gu and pe==ge),
                 unit_f1=f1(pu,gu) if good else 0.,edge_f1=f1(pe,ge) if good else 0.,
                 missing_edges=sorted(ge-pe),extra_edges=sorted(pe-ge),
                 scope='own teacher graph fit only; native executability and fidelity evaluated separately')
@@ -71,9 +76,12 @@ def cached_score(entry, completion, finish, *, toy, nat, reward, teacher):
     teacher.validate_cache(cache,toy,nat,entry['inputs'],entry['panel'])
     if completion is None or str(finish).lower() not in ('stop','stopreason.stop'):
         return dict(status='invalid_first_response',worlds=entry['worlds'],sparse_calls=0,per_world=[])
-    with torch.no_grad():
-        result=reward.score_wiring_interventions(toy,completion,nat=nat,texts=entry['inputs'],
-                                                panel=entry['panel'],reference_cache=cache)
+    try:
+        with torch.no_grad():
+            result=reward.score_wiring_interventions(toy,completion,nat=nat,texts=entry['inputs'],
+                                                    panel=entry['panel'],reference_cache=cache)
+    except reward.InvalidInterventionCandidate as exc:
+        return dict(status='invalid_native_candidate',reason=str(exc),worlds=entry['worlds'],sparse_calls=0,per_world=[])
     if result['dense_calls']!=0 or result['sparse_calls']!=entry['worlds']:
         raise RuntimeError('cached physical forward bound exceeded')
     return result
@@ -105,7 +113,7 @@ def compare(responses_path, training_path, *, expected_responses_sha, expected_t
     return {'scope':'descriptive exact24 TRAIN graph fit; no physical fidelity claim',
             'responses_sha256':expected_responses_sha,'training_sha256':expected_training_sha,'rows':result,
             'summary':{arm:{teacher:{key:sum(r[key] for r in result if r['arm']==arm and r['teacher']==teacher)/24
-                                    for key in ('parse_valid','exact_units','exact_edges','unit_f1','edge_f1')}
+                                    for key in ('parse_valid','exact_units','exact_edges','exact_graph','unit_f1','edge_f1')}
                             for teacher in ('point','intervention')} for arm in ('base','point','intervention')}}
 
 

@@ -10,6 +10,8 @@ class TrainFitScoreTests(unittest.TestCase):
         wrong=s.target_fit('L0H0 --> out\nL1H0 --> out',target,'stop',parser=circuit.parse)
         self.assertTrue(wrong['exact_units']);self.assertFalse(wrong['exact_edges'])
         self.assertEqual(wrong['missing_edges'],[('L0H0','L1H0')])
+        disconnected=s.target_fit(target+'\nL0H9',target,'stop',parser=circuit.parse)
+        self.assertTrue(disconnected['exact_edges']);self.assertFalse(disconnected['exact_graph'])
     def test_invalid_first_response_zero_credit(self):
         for completion,finish in (('L0H0 --> out','length'),(None,'missing'),('L0MLP --> out','stop')):
             row=s.target_fit(completion,'L0H0 --> out',finish,parser=circuit.parse)

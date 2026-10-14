@@ -53,7 +53,7 @@ import native  # noqa: E402
 
 ROOT = native.TEXTS.parent
 TEACHER = ROOT / "teacher" / "influential_v2"
-LE = ROOT / "variables" / "envc" / "le"
+LE = Path(__import__("os").environ.get("ENVC_LE", ROOT / "variables" / "envc" / "le"))  # ENVC_LE: a pod's synced dir
 CREDIT_SCALE = 16.0
 W_CREDIT = 0.5
 W_SEL = 0.5
@@ -233,6 +233,10 @@ def load_compact(path: Path | None) -> dict | None:
 def gate(a) -> None:
     import goal_eval
 
+    global LE
+    if a.le_dir:
+        LE = a.le_dir
+
     sys.path.insert(0, str(HERE.parents[1] / "experiments" / "oracle"))
     import var_explain
 
@@ -246,25 +250,45 @@ def gate(a) -> None:
         recs = recs[k::n]
     cp = load_compact(a.compact)
     a.out.parent.mkdir(parents=True, exist_ok=True)
+    done = {json.loads(x)["task"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
+    import torch
+    import var_teacher
+
     for rec in recs:
         task = rec["task"]
-        t, tx = text_of(ge, task)
-        strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
-        teacher = components.render(answer_of(task, rec, ge, compact=cp), strings=strings)
-        shuffled = components.render(answer_of(task, rec, ge, shuffle=native.task_seed(task), compact=cp), strings=strings)
-        row = {"task": task, "teacher": score(ge, tx, task, teacher, a.split, t["model"]),
-               "shuffled": score(ge, tx, task, shuffled, a.split, t["model"])}
-        body = lambda line: line.split(":", 1)[1].split("->")[0].strip()  # noqa: E731
-        for k in ("llm", "llm_hint"):
-            if task not in llm[k] or task not in prompts:
-                continue
-            theirs = {body(x): x.split("->", 1)[1].strip() for x in var_explain.llm_lines(prompts[task]["items"], llm[k][task]["answer"]).splitlines()}
-            lines = [f"I{i}: {body(x)} -> {theirs[body(x)]}" for i, x in enumerate(rec["invariants"], 1) if body(x) in theirs]
-            row[k] = score(ge, tx, task, components.render(answer_of(task, rec, ge, lines=lines, compact=cp), strings=strings), a.split, t["model"])
-        with a.out.open("a") as fh:
-            fh.write(json.dumps(row) + "\n")
-        best_llm = max((row[k]["reward"] for k in ("llm", "llm_hint") if k in row), default=None)
-        print(task, {k: round(row[k]["reward"], 3) for k in ("teacher", "shuffled", "llm", "llm_hint") if k in row}, best_llm, flush=True)
+        if task in done:
+            continue
+        var_teacher.release(ge.nat.dev)
+        try:
+            gate_text(ge, a, rec, cp, prompts, llm, var_explain)
+        except torch.OutOfMemoryError:  # one text past the card: freed and tried once more, else left out (printed)
+            var_teacher.release(ge.nat.dev)
+            try:
+                gate_text(ge, a, rec, cp, prompts, llm, var_explain)
+            except torch.OutOfMemoryError:
+                var_teacher.release(ge.nat.dev)
+                print(task, "out of memory twice", flush=True)
+
+
+def gate_text(ge, a, rec: dict, cp: dict | None, prompts: dict, llm: dict, var_explain) -> None:
+    task = rec["task"]
+    t, tx = text_of(ge, task)
+    strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
+    teacher = components.render(answer_of(task, rec, ge, compact=cp), strings=strings)
+    shuffled = components.render(answer_of(task, rec, ge, shuffle=native.task_seed(task), compact=cp), strings=strings)
+    row = {"task": task, "teacher": score(ge, tx, task, teacher, a.split, t["model"]),
+           "shuffled": score(ge, tx, task, shuffled, a.split, t["model"])}
+    body = lambda line: line.split(":", 1)[1].split("->")[0].strip()  # noqa: E731
+    for k in ("llm", "llm_hint"):
+        if task not in llm[k] or task not in prompts:
+            continue
+        theirs = {body(x): x.split("->", 1)[1].strip() for x in var_explain.llm_lines(prompts[task]["items"], llm[k][task]["answer"]).splitlines()}
+        lines = [f"I{i}: {body(x)} -> {theirs[body(x)]}" for i, x in enumerate(rec["invariants"], 1) if body(x) in theirs]
+        row[k] = score(ge, tx, task, components.render(answer_of(task, rec, ge, lines=lines, compact=cp), strings=strings), a.split, t["model"])
+    with a.out.open("a") as fh:
+        fh.write(json.dumps(row) + "\n")
+    best_llm = max((row[k]["reward"] for k in ("llm", "llm_hint") if k in row), default=None)
+    print(task, {k: round(row[k]["reward"], 3) for k in ("teacher", "shuffled", "llm", "llm_hint") if k in row}, best_llm, flush=True)
 
 
 def rows(a) -> None:
@@ -384,6 +408,7 @@ def main():
     g.add_argument("--part")
     g.add_argument("--out", type=Path, default=ROOT / "variables" / "envc" / "gate.jsonl")
     g.add_argument("--compact", type=Path, help="var_compact.py's rows: variables written as compact families, not blocks")
+    g.add_argument("--le-dir", type=Path, help="the teacher line effects' cache (a pod's output directory keeps them)")
     f = sub.add_parser("sft")
     f.add_argument("rows", type=Path)
     f.add_argument("out", type=Path)

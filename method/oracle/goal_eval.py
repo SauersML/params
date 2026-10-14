@@ -971,6 +971,27 @@ def _response_error(pairs: dict, base: dict) -> float | None:
     return math.sqrt(num / den) if den > 0 else None
 
 
+def _node_values(pairs: dict, effects: dict) -> dict:
+    """Do a circuit's own nodes take the model's values (the lead's 10-13 eval metric, reported, not in phi)? pairs: node
+    -> [(r_model, r_circuit)] over a family's interventions; per node z = RMS(r_circuit - r_model) / SD(r_model) over
+    them, the node's own spread across the changed texts (the write's scale |u| cancels: gauge-invariant), over nodes
+    with two or more interventions and a model read that varies. node_share: the share with z <= 1 (the circuit's error
+    within the node's natural variation); node_share_weighted: weighted by effects (node -> its measured downstream
+    effect, line_effects' delta_kl floored at 0); node_median_z; node_measured: how many nodes the share is over. On 20
+    CausalGym texts the subject circuit beat the same nodes moved to the attractor on node_share 20/20; dev teachers'
+    median share was 0.19 (they reproduce outputs, not their own internal states); blind where the interventions leave
+    the nodes still (the cancel and route2 toys) and reversed on the binding_fp toy."""
+    z = {}
+    for nd, xs in pairs.items():
+        m, c = np.array([x[0] for x in xs], float), np.array([x[1] for x in xs], float)
+        if len(m) >= 2 and m.std() > 0:
+            z[nd] = float(np.sqrt(np.mean((m - c) ** 2)) / m.std())
+    w = sum(effects.get(nd, 0.0) for nd in z)
+    return {"node_share": float(np.mean([v <= 1.0 for v in z.values()])) if z else None,
+            "node_share_weighted": sum(effects.get(nd, 0.0) * (v <= 1.0) for nd, v in z.items()) / w if w > 0 else None,
+            "node_median_z": float(np.median(list(z.values()))) if z else None, "node_measured": len(z)}
+
+
 class _PatternOr(torch.autograd.Function):
     """The OR of the patterns on, a = 1 - prod_k (1 - w_k P_k) [rows, columns] from weights w [rows, K] and patterns P
     [K, columns], with its gradient d a_c / d w_k = P_kc prod_{j != k} (1 - w_j P_jc) from exclusive cumulative
@@ -3268,7 +3289,7 @@ class GoalEval:
         columns), the last four on split's draws (default: "search", the teachers' draws and training texts as far
         donors, in the reward on training texts; "eval" otherwise, and for any held-out text); e4: the E4 hook's score (its own reward term, not in c); flips_to_break, the smallest m at which f1_flips_omitted falls below
         half of s_point (None: not within FLIPS); flips_to_half, the smallest m at which it falls below 0.5, half of
-        VPD's own answer under the same attack (0: below it unattacked), which a circuit weak to begin with cannot pass. reads: C's second observable, the circuit nodes' relative RMS read
+        VPD's own answer under the same attack (0: below it unattacked), which a circuit weak to begin with cannot pass. reads: C's second observable, node values (_node_values: node_share, node_share_weighted, node_median_z, node_measured) and the circuit nodes' relative RMS read
         error between the model and the circuit per family (reads_*), and of their responses, each node's change from
         its own run without the intervention (dreads_*, _response_error; the static error mostly measures the missing
         background of a circuit's run); graph_ref,
@@ -3391,6 +3412,13 @@ class GoalEval:
             if reads:  # the reads' responses: each node's change from its own run without an intervention
                 _, _, _, rm, rc = sides(g, cuts=[{}], reads=True)  # one row, no intervention
                 base = {nd: (float(rm[nd][0]), float(rc[nd][0])) for nd in rm}
+                merged = {}  # node values (_node_values) over the node-removal and interchange families' reads
+                for fam in ("nodes", "interchange"):
+                    for nd, xs in (row.get(f"_pairs_{fam}") or {}).items():
+                        merged.setdefault(tuple(nd), []).extend(xs)
+                eff = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0)
+                       for x in self.line_effects(tx, g, mode="pp", split=split)["nodes"]} if merged else {}
+                row.update(_node_values(merged, eff))
                 for fam in ("nodes", "edges", "interchange"):
                     pairs = row.pop(f"_pairs_{fam}", None)
                     row[f"dreads_{fam}"] = _response_error(pairs, base) if pairs else None

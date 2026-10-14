@@ -1,6 +1,7 @@
 """Do a circuit's own nodes take the model's values? (the lead's 10-13 diagnostic; no reward change.)
 
-Under the interventions fidelity already runs (goal_eval's node-removal and interchange families, the reward's
+goal_eval._node_values (fidelity's reads columns node_share, node_share_weighted: the scorecard's metric). Under the
+interventions fidelity already runs (goal_eval's node-removal and interchange families, the reward's
 semantics), each circuit node's activation in the circuit's run is compared with its activation in the model's run on
 the same intervention (the families' read pairs, reads=True). Per node, z = RMS(circuit - model) / SD(model), the SD
 over the interventions: the node's own spread across the changed texts, not a fixed cutoff (the activation's scale,
@@ -28,8 +29,6 @@ import random
 import sys
 from pathlib import Path
 
-import numpy as np
-
 SRC = Path(__file__).resolve().parents[2] if (Path(__file__).resolve().parents[2] / "method").exists() else Path.cwd()
 sys.path[:0] = [str(SRC / "method/oracle"), str(SRC / "method/vpd"), str(SRC / "experiments/oracle/toys"),
                 str(SRC / "experiments/oracle/generality")]
@@ -50,18 +49,10 @@ def agreement(ge, tx, graphs: list, split: str = "eval", draws: int = DRAWS) -> 
         for src in (a.get("_pairs_nodes") or {}, b.get("_pairs_interchange") or {}):
             for nd, xs in src.items():
                 pairs.setdefault(tuple(nd), []).extend(xs)
-        z = {}
-        for nd, xs in pairs.items():
-            m, c = np.array([x[0] for x in xs], float), np.array([x[1] for x in xs], float)
-            if len(m) >= 2 and m.std() > 0:
-                z[nd] = float(np.sqrt(np.mean((m - c) ** 2)) / m.std())
-        le = ge.line_effects(tx, g, mode="pp", split=split)
-        eff = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in le["nodes"]}
-        ok = {nd: zz <= 1.0 for nd, zz in z.items()}
-        w = sum(eff.get(nd, 0.0) for nd in z)
-        out.append({"nodes": g.count(), "measured": len(z), "share": float(np.mean(list(ok.values()))) if z else None,
-                    "weighted": sum(eff.get(nd, 0.0) * ok[nd] for nd in z) / w if w > 0 else None,
-                    "median_z": float(np.median(list(z.values()))) if z else None})
+        eff = {tuple(x["node"]): max(0.0, x["delta_kl"] or 0.0) for x in ge.line_effects(tx, g, mode="pp", split=split)["nodes"]}
+        r = goal_eval._node_values(pairs, eff)
+        out.append({"nodes": g.count(), "measured": r["node_measured"], "share": r["node_share"],
+                    "weighted": r["node_share_weighted"], "median_z": r["node_median_z"]})
     return out
 
 

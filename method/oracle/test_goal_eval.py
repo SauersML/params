@@ -3295,3 +3295,18 @@ def test_patterns_from_token_lists_keep_the_real_positions():
     for i in range(4):
         a, b = goal_eval.pattern(padded, 6 + i), goal_eval.pattern(whole, i)
         assert a.keys() == b.keys() and all(torch.equal(a[n], b[n]) for n in a)
+
+
+def test_node_values():
+    """_node_values: z = RMS(circuit - model) / SD(model) per node over its interventions; the share with z <= 1,
+    weighted by measured effects; a node with one intervention or a model read that never moves is not counted."""
+    a, b, c, d = ("s", 1, 0), ("s", 1, 1), ("s", 2, 0), ("s", 2, 1)
+    pairs = {a: [(0.0, 0.1), (2.0, 2.1)],      # SD 1, error 0.1: within
+             b: [(0.0, 3.0), (2.0, -1.0)],     # error 3: outside
+             c: [(1.0, 1.0), (1.0, 5.0)],      # the model's read never moves
+             d: [(1.0, 1.0)]}                  # one intervention
+    got = goal_eval._node_values(pairs, {a: 1.0, b: 3.0, c: 9.0})
+    assert got["node_measured"] == 2 and got["node_share"] == 0.5
+    assert got["node_share_weighted"] == pytest.approx(0.25) and got["node_median_z"] == pytest.approx((0.1 + 3.0) / 2)
+    assert goal_eval._node_values({}, {}) == {"node_share": None, "node_share_weighted": None, "node_median_z": None,
+                                              "node_measured": 0}

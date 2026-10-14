@@ -113,6 +113,7 @@ jobs:
             -p no:cacheprovider -v --tb=short
           python -B method/oracle/rl/test_scorer.py
           python -B method/oracle/rl/test_train.py
+          python -B method/oracle/rl/test_serve_recycle.py
 
       - name: Diagnose adversary batch on Linux CPU
         if: github.event_name == 'workflow_dispatch' && inputs.adversary_batch_only

@@ -9,6 +9,7 @@ import serve_edits
 def fake_worker(inbox,outbox,ready,release,calls):
  rid,req=inbox.get();calls.put(rid);outbox.put((rid,[req['task']],None))
  ready.set();release.wait(5)
+ calls.close();calls.join_thread()
  outbox.close();outbox.join_thread();os._exit(serve_scores.GRACEFUL_RECYCLE_EXIT)
 
 class Harness(serve_scores.Pool):

@@ -100,6 +100,7 @@ import argparse
 import hashlib
 import json
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -2125,6 +2126,66 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     return circuits, row, path_file
 
 
+def memory_log(path: Path) -> None:
+    """Peak GPU memory per stage (--mem): every GoalEval method, Pruner.prune per level (prune:<level>), reward_row,
+    Acceptance's and Validated's methods and the search functions, each call's torch.cuda.max_memory_allocated and
+    max_memory_reserved in GiB (a nested call's peak counts in its callers too), their maxima and counts per label and
+    the calls up to three deep in order with their depth, written to path as they end (the profile behind the
+    2-per-card memory budget). Nothing without CUDA."""
+    import functools
+    import inspect
+
+    if not torch.cuda.is_available():
+        return
+    GiB = 2 ** 30
+    stack, stats, order = [[0, 0]], {}, []
+
+    def peaks():
+        return torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
+
+    def wrap(owner, name, label_of):
+        f = inspect.getattr_static(owner, name)
+        if isinstance(f, (staticmethod, classmethod)) or not callable(f) or getattr(f, "_memory_logged", False):
+            return
+        @functools.wraps(f)
+        def g(*a, **k):
+            pa, pr = peaks()
+            stack[-1] = [max(stack[-1][0], pa), max(stack[-1][1], pr)]
+            torch.cuda.reset_peak_stats()
+            stack.append([0, 0])
+            try:
+                return f(*a, **k)
+            finally:
+                pa, pr = peaks()
+                top = stack.pop()
+                m = [max(top[0], pa), max(top[1], pr)]
+                stack[-1] = [max(stack[-1][0], m[0]), max(stack[-1][1], m[1])]
+                torch.cuda.reset_peak_stats()
+                lab = label_of(a, k)
+                st = stats.setdefault(lab, {"allocated_gib": 0.0, "reserved_gib": 0.0, "calls": 0})
+                st["allocated_gib"] = max(st["allocated_gib"], m[0] / GiB)
+                st["reserved_gib"] = max(st["reserved_gib"], m[1] / GiB)
+                st["calls"] += 1
+                if len(stack) <= 3:  # the calls three deep (teach, set_search, its stages): rows in order, the file rewritten
+                    order.append([len(stack), lab, round(m[0] / GiB, 3), round(m[1] / GiB, 3)])
+                    path.write_text(json.dumps({"stats": stats, "order": order}, indent=1))
+        g._memory_logged = True
+        setattr(owner, name, g)
+
+    for name, f in list(vars(goal_eval.GoalEval).items()):
+        if callable(f) and not name.startswith("__"):
+            wrap(goal_eval.GoalEval, name, (lambda n: lambda a, k: f"ge.{n}:{k.get('mode', 'full')}" if n == "fidelity" else f"ge.{n}")(name))
+    wrap(Descent, "prune", lambda a, k: f"prune:{a[1] if len(a) > 1 else k.get('level')}")
+    for cls in (Acceptance, Validated):
+        for name, f in list(vars(cls).items()):
+            if callable(f) and not name.startswith("__"):
+                wrap(cls, name, (lambda n, c: lambda a, k: f"{c}.{n}")(name, cls.__name__))
+    mod = sys.modules[__name__]
+    for name in ("reward_row", "set_search", "block_search", "forward_start", "teach"):
+        if hasattr(mod, name):
+            wrap(mod, name, (lambda n: lambda a, k: n)(name))
+
+
 def main():
     global RANK, VAL_EVERY
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -2207,7 +2268,11 @@ def main():
     ap.add_argument("--out", type=Path)
     ap.add_argument("--rank", choices=("every", "once"), default=RANK, help="Descent.prune's ranking: every round, or once per "
                     "level (re-ranked when a kept order admits nothing)")
+    ap.add_argument("--mem", action="store_true", help="peak GPU memory per stage to OUT/mem_<offset>.json (memory_log)")
     args = ap.parse_args()
+    if args.mem and args.out is not None:
+        args.out.mkdir(parents=True, exist_ok=True)
+        memory_log(args.out / f"mem_{args.offset}.json")
     try:
         capped_set_route(args.set_direct_kl_max, args.f1_start, edges=args.edges, backup=args.backup,
                          forward=args.forward, from_path=args.from_path, pairs=args.pairs, repair=args.repair,

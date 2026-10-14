@@ -9,21 +9,17 @@ Defined in advance:
                     (goal_bits = min(m0, m0 - m), at least 0; flipped: m < 0);
   collateral        the KL in bits at every other position of the rows and on the held Pile texts (edit_eval's
                     HELD_ROWS), and the controls kept (b still the most likely token there).
-Net per position of text, as behaviours.py: rate x goal_bits - collateral per position.
 
-The edit: a rank-r update B A^T to one weight matrix, applied at every position of every text (a weight edit), fitted
-by Adam to the fit third's net (and the search's held texts), the step with the best validation net kept, scored on the
-score third. At a site, the same fit restricted to a set of subcomponents' read directions v and write directions u
-(A = V_k a, B = U_k b, step sizes matched to the unconstrained fit's): the circuit's (the subcomponents with the largest
-measured local ablation effect on the margin at fit instances, behaviours.py's ranking), as many random subcomponents
-active at the instances, as many random ones of the matrix, and VPD's most active ones there. Gate: the circuit's
-restricted net (as a share of the unconstrained net) above the random sets' and VPD's on the score third.
+The edits (persistent_e3.py edit, practical()): each method's candidate edits on the fit third, one picked on the
+validation third by one rule (select()), scored on the score third; a weight edit acts at every position of every text
+(subcomponent scales W - (1 - k) u v^T, or a rank-r update B A^T to one or several matrices, Adam on the fit third's
+goal_bits - lam x collateral per token). The methods: the circuit's subcomponents (by measured local ablation effect
+at fit instances) searched or given fitted scales, fine-tunes restricted to their read and write directions, and the
+controls (random, VPD's top k, unrestricted fine-tunes); practical()'s docstring lists them.
 
-  persistent_e3.py prefs OUT.jsonl [--k 6]        the Mac (the atlas's activity): preferences, thirds, circuits, sets
-  persistent_e3.py fit PREFS.jsonl OUT.jsonl [--steps 200] [--screen 25] [--device cuda] [--offset K --stride S]   a pod
-  persistent_e3.py edit PREFS.jsonl OUT.jsonl [--steps 200] [--device cuda] [--offset K --stride S]   delete the preference:
-                     the circuit's edit, VPD's top k, a fine-tune of the same rank (practical())
-  persistent_e3.py table OUT.jsonl [--edit]
+  persistent_e3.py prefs OUT.jsonl [--k 6]        preferences, thirds, circuits (the atlas's activity; a pod or the Mac)
+  persistent_e3.py edit PREFS.jsonl OUT.jsonl [--steps 200] [--device cuda] [--offset K --stride S]   delete the preference
+  persistent_e3.py table OUT.jsonl
   persistent_e3.py summary ROWS.jsonl ... [--figure PNG]     means with 95% intervals, paired differences, the figure
 """
 from __future__ import annotations
@@ -57,8 +53,6 @@ CAP = {"fit": 24, "val": 24, "score": 64}  # instances (and controls) per third
 MIN_PAIRS = 16  # a preference's instances in the fit third, at least
 B_REPEAT = 2  # preferences sharing one b, at most
 POOL = 128  # subcomponents ranked by local effect
-K_SET = 8  # subcomponents per restricted set at a site
-DRAWS = 2
 RANK = 1
 ROWS_STEP, HELD_STEP = 8, 2  # texts per training step (val and score use every text)
 CACHE_GB = float(__import__("os").environ.get("PE3_CACHE_GB", "4.5"))  # unedited runs kept per process (GPU memory)
@@ -300,45 +294,6 @@ def fit(net: Net, site: str, steps: int, basis=None, lr: float = 0.01, seed: int
     sc = net("score", site, A1, B1, grad=False)
     return {"site": site, "rank": rank, "k": None if basis is None else basis[0].shape[1], "val_net": best[0], "best_step": best[2],
             **{k: float(v) if torch.is_tensor(v) else v for k, v in sc.items() if not k.startswith("_")}}
-
-
-def run(nat, beh: dict, tokens, held, steps: int, screen: int, log=print, names: list[str] | None = None) -> dict:
-    """One preference: the unconstrained fit screened over the 24 matrices (screen steps, validation net), at the best
-    one and at the circuit's most populated matrix every restricted set (module docstring)."""
-    t0 = time.time()
-    net = Net(nat, beh, tokens, held)
-    base = {k: float(v) if torch.is_tensor(v) else v for k, v in net("score", None, grad=False).items()}
-    shots = {n: fit(net, n, screen)["val_net"] for n in (names or nat.names)}
-    top = max(shots, key=shots.get)
-    circ = [tuple(c[:2]) for c in beh["circuit"]]
-    by_site = {}
-    for s, i in circ[:32]:
-        by_site[s] = by_site.get(s, 0) + 1
-    sites = list(dict.fromkeys([top, max(by_site, key=by_site.get)]))
-    out = {"preference": beh["describe"], "a": beh["a"], "b": beh["b"], "rate": beh["parts"]["score"]["rate"], "unedited": base,
-           "screen": shots, "sites": {}}
-    for site in sites:
-        C = nat.target.site(site).V.shape[1]
-        mine = [i for s, i in circ if s == site][:K_SET]
-        rec = {"free": fit(net, site, steps)}
-        if mine:
-            k = len(mine)
-            g = torch.Generator().manual_seed(native.task_seed(f"{beh['a']}-{beh['b']}-{site}"))
-            act = [i for s, i, _ in sorted(beh["active"], key=lambda x: -x[2]) if s == site]
-            others = [i for i in act if i not in mine]
-            draws = [[others[j] for j in torch.randperm(len(others), generator=g)[:k].tolist()] for _ in range(DRAWS)] if others else []
-            rand = [torch.randperm(C, generator=g)[:k].tolist() for _ in range(DRAWS)]
-            sets = {"circuit": [mine], "active": draws, "random": rand, "vpd_top": [act[:k]] if act else []}
-            for name, ss in sets.items():
-                rec[name] = [dict(fit(net, site, steps, basis=finetune_edit.basis(nat, site, s_)), set=s_) for s_ in ss if s_]
-        out["sites"][site] = rec
-        msg = f"{site}: free {rec['free']['net']:.2e}"
-        for name in ("circuit", "active", "random", "vpd_top"):
-            if rec.get(name):
-                msg += f", {name} " + "/".join(f"{x['net']:.2e}" for x in rec[name])
-        log(f"{beh['describe']['a']!r}->{beh['describe']['b']!r} {msg}")
-    out["seconds"] = time.time() - t0
-    return out
 
 
 EDIT_CANDS = 24  # the circuit's subcomponents (by local effect) the edit search draws from
@@ -758,36 +713,6 @@ def summary(rows: list[dict], figure: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def table(rows: list[dict]) -> str:
-    """Per preference and site the score third's net (per position of text) of each set as a share of the
-    unconstrained fit's, its flipped share and controls kept; then the gate: the circuit's share above every control's,
-    per preference, and the medians."""
-    import statistics as st
-
-    lines = ["preference              site               free net  circuit  active  random  vpd_top | flipped c/f  kept c/f"]
-    wins = {"active": 0, "random": 0, "vpd_top": 0}
-    shares = {k: [] for k in ("circuit", "active", "random", "vpd_top")}
-    n = 0
-    for r in rows:
-        for site, rec in r["sites"].items():
-            f = rec["free"]["net"]
-            if f <= 0 or not rec.get("circuit"):
-                continue
-            n += 1
-            sh = {k: st.median(x["net"] for x in rec[k]) / f for k in shares if rec.get(k)}
-            for k, v in sh.items():
-                shares[k].append(v)
-            for k in wins:
-                wins[k] += k in sh and sh["circuit"] > sh[k]
-            c = rec["circuit"][0]
-            lines.append(f"{r['preference']['a']!r:>9s}->{r['preference']['b']!r:<11s} {site:18s} {f:9.2e}  "
-                         + "  ".join(f"{sh.get(k, float('nan')):6.2f}" for k in shares)
-                         + f" | {c['flipped']:.2f}/{rec['free']['flipped']:.2f}  {c['controls_kept'] or 0:.2f}/{rec['free']['controls_kept'] or 0:.2f}")
-    lines.append("medians: " + ", ".join(f"{k} {st.median(v):.2f}" for k, v in shares.items() if v)
-                 + "; circuit above " + ", ".join(f"{k} in {w}/{n}" for k, w in wins.items()))
-    return "\n".join(lines)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -798,15 +723,6 @@ def main():
     p.add_argument("--offset", type=int, default=0, help="the circuits of preferences offset, offset + stride, ... alone")
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--min-pairs", type=int, default=MIN_PAIRS, help="a preference's fit-third instances, at least")
-    f = sub.add_parser("fit")
-    f.add_argument("prefs")
-    f.add_argument("out")
-    f.add_argument("--steps", type=int, default=200)
-    f.add_argument("--screen", type=int, default=25)
-    f.add_argument("--device", default="cpu")
-    f.add_argument("--offset", type=int, default=0)
-    f.add_argument("--stride", type=int, default=1)
-    f.add_argument("--sites", nargs="*", help="screen these matrices only (a smoke test)")
     e = sub.add_parser("edit")
     e.add_argument("prefs")
     e.add_argument("out")
@@ -822,7 +738,6 @@ def main():
     e.add_argument("--assoc", help="assoc_ft's sets: JSON {\"a->b\": {matrix: [indices]}}")
     t = sub.add_parser("table")
     t.add_argument("rows")
-    t.add_argument("--edit", action="store_true", help="edit's rows (practical_table)")
     su = sub.add_parser("summary")
     su.add_argument("rows", nargs="+", help="edit runs' rows (several runs of one preference merged)")
     su.add_argument("--figure")
@@ -831,7 +746,7 @@ def main():
     if args.cmd == "summary":
         return print(summary([r for f in args.rows for r in read(f)], args.figure))
     if args.cmd == "table":
-        return print(practical_table(read(args.rows)) if args.edit else table(read(args.rows)))
+        return print(practical_table(read(args.rows)))
     import components
 
     decode = lambda xs: "".join(components.token_strings("vpd4l", xs))  # noqa: E731
@@ -857,14 +772,11 @@ def main():
         if i % args.stride != args.offset:
             continue
         try:
-            if args.cmd == "edit":
-                ranks = {(x["a"], x["b"]): len(x["methods"]["circuit_edit"]["ops"]) for x in read(args.rank_from)
-                         if x["methods"].get("circuit_edit")} if args.rank_from else {}
-                r = practical(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites,
-                              methods=tuple(args.methods), rank=args.rank or ranks.get((beh["a"], beh["b"])),
-                              assoc=json.loads(Path(args.assoc).read_text()) if getattr(args, "assoc", None) else None)
-            else:
-                r = run(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites)
+            ranks = {(x["a"], x["b"]): len(x["methods"]["circuit_edit"]["ops"]) for x in read(args.rank_from)
+                     if x["methods"].get("circuit_edit")} if args.rank_from else {}
+            r = practical(nat, beh, tokens, held, args.steps, args.screen, log=lambda s: print(s, flush=True), names=args.sites,
+                          methods=tuple(args.methods), rank=args.rank or ranks.get((beh["a"], beh["b"])),
+                          assoc=json.loads(Path(args.assoc).read_text()) if getattr(args, "assoc", None) else None)
         except torch.OutOfMemoryError:  # the preference skipped and reported, the process going on to the next
             print(f"{beh['describe']['a']!r}->{beh['describe']['b']!r}: out of GPU memory, skipped", flush=True)
             torch.cuda.empty_cache()

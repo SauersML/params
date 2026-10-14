@@ -73,12 +73,14 @@ texts per split.
 | + curriculum + RL (k 6, std) | flat in training | not evaluated |
 | detailed weight render (`TOYLOOP_WEIGHTS_DETAIL=1`), curriculum | 0.64/0.65/0.65 | 0.22/0.27/0.24 |
 | detailed render + ground-truth reasoning trace (`TOYLOOP_TRACE=1`) | 0.56/0.65/0.69 | 0.14/0.31/0.26 |
+| detailed render + 42 GRPO steps (k 6, std) | 0.51/0.51/0.58 (precision falls) | 0.10/0.13/0.11 |
 | no-LM rule reading the same detailed prompt (`weights_heuristic2`) | 1.00 | equal to the truth |
 
 The information is in the prompt: a rule that parses it recovers every circuit. The 135M oracle captures only part
 of it. The render, which states facts the oracle would otherwise have to compute (gate tokens, complete in-links,
-neuron biases, centred token reads), helped more than the reasoning trace. Next: a larger oracle, and RL from the
-detailed-render checkpoint.
+neuron biases, centred token reads), helped more than the reasoning trace. RL from the detailed-render checkpoint
+raised the sampled training reward but hurt greedy held-out results, as the policy drifted to larger circuits (RL
+on weights-only prompts has not helped in four tries). Next: a larger oracle.
 
 ## Open, in order of expected value
 

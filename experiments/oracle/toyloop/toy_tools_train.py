@@ -292,6 +292,8 @@ def rl(a):
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
     if state and (out / "opt.pt").exists():
         opt.load_state_dict(torch.load(out / "opt.pt"))
+    for g in opt.param_groups:   # this chunk's --lr, also on a resumed optimizer
+        g["lr"] = a.lr
     pool = toys_of("rltrain")
     w = [FAMILY_WEIGHT.get(t.meta["family"], 1.0) if a.weak else 1.0 for t in pool]
     vtoys = toys_of("val", a.val_n, seed=1)

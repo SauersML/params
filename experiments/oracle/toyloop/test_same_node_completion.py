@@ -14,6 +14,13 @@ class Graph:
 
 
 class CompletionTests(unittest.TestCase):
+    def test_unordered_invalid_edges_keep_category_and_no_validity_relaxation(self):
+        a='edge L0H2 -> L0N83 has no executable connection in these pieces'
+        b='edge L0N191 -> L0H1 has no executable connection in these pieces'
+        self.assertTrue(c.same_validity(False,False,a,b))
+        self.assertFalse(c.same_validity(False,True,a,None))
+        self.assertFalse(c.same_validity(False,False,a,'invalid_graph_only_answer'))
+        self.assertFalse(c.same_validity(False,False,a,'edge foreign -> out has no executable connection in these pieces'))
     def test_preservation_reports_damage_and_rescues_separately(self):
         rows=[dict(case='pass',arm='a',prior_all_pass=True,complete_all_pass=False),dict(case='fail',arm='a',prior_all_pass=False,complete_all_pass=True)]
         result=c.preservation(rows)

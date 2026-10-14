@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import sys
 import math
+import re
 from types import SimpleNamespace
 
 CASES=('additive_vote_3200000','gate_3200500')
@@ -59,6 +60,16 @@ def preservation(summary):
  return {'prior_pass_pairs':len(passing),'preserved_pass_pairs':sum(r['complete_all_pass'] for r in passing),
          'damaged_pass_pairs':[{'case':r['case'],'arm':r['arm']} for r in passing if not r['complete_all_pass']],
          'rescued_failure_pairs':sum(not r['prior_all_pass'] and r['complete_all_pass'] for r in summary)}
+
+def rejection_category(reason):
+ # Historical circuit.unit_graph iterates a set of invalid edges. Which illegal
+ # edge appears first in its exception depends on Python's per-process hash seed.
+ if isinstance(reason,str) and re.fullmatch(r'edge L\d+[HN]\d+ -> (?:L\d+[HN]\d+|out) has no executable connection in these pieces',reason):
+  return 'native_missing_architecture_connection'
+ return reason
+
+def same_validity(old_valid,new_valid,old_reason,new_reason):
+ return old_valid==new_valid and (old_valid or rejection_category(old_reason)==rejection_category(new_reason))
 
 def run(args):
  if sha(args.prior/'receipt.json')!=args.prior_receipt_sha256 or sha(args.prior/'results.jsonl')!=args.prior_results_sha256:raise ValueError('frozen prior physics changed')
@@ -147,10 +158,13 @@ def run(args):
       graph,size=complete_same_nodes(stated,native,[len(ids)-1])
      except ValueError as exc:reason=str(exc)
     old=prior[item['id'],arm,0,index]
-    if old['valid']!=(graph is not None) or (not old['valid'] and old['invalid_reason']!=reason):raise ValueError('original validity changed')
+    if not same_validity(old['valid'],graph is not None,old['invalid_reason'],reason):
+     detail={'case':item['id'],'arm':arm,'input':index,'prior_valid':old['valid'],'new_valid':graph is not None,'prior_reason':old['invalid_reason'],'new_reason':reason,'driver_sha256':sha(__file__),'parser_sha256':sha(circuit.__file__),'answer_helper_sha256':sha(sys.modules['matched_graph_score'].__file__)}
+     write(args.out/'validity_failure.json',detail);print(json.dumps(detail),flush=True)
+     raise ValueError('original validity changed')
     graphs[arm].append((graph,reason,size))
     graph_receipts.append({'case':item['id'],'arm':arm,'input':index,'valid':graph is not None,
-      'invalid_reason':reason,'size':size,'original_response_sha256':response['arms'][arm]['sha256'],
+      'invalid_reason':reason,'prior_invalid_reason':old['invalid_reason'],'invalid_category':rejection_category(reason),'size':size,'original_response_sha256':response['arms'][arm]['sha256'],
       'selected_nodes_sha256':None if graph is None else hashlib.sha256(json.dumps(sorted(graph.node_set())).encode()).hexdigest()})
   if getattr(args,'prepare_only',False):continue
   # All graphs compiled before literal edits; full model only integrity/reference.

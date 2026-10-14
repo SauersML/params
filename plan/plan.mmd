@@ -529,7 +529,7 @@ flowchart BT
     T1["<b>Influential start</b><br/>VPD actives at the target and the<br/>positions whose change moves it most<br/>494 texts, held-out pp 0.965 · DONE"]
     T2["<b>Backup expansion</b><br/>why: circuits overstate<br/>necessity about 2×<br/>ACTIVE"]
     T3["<b>Pruning, discriminating draws</b><br/>worst 16 of 64 at 0.9 refuses<br/>nearly every removal: 20k-node<br/>circuits; superseded by T4<br/>DONE (negative) · pymove"]
-    T4["<b>Teacher circuits v24</b> (a564ee2)<br/>START = fewest of 16 candidates (F2 + donor<br/>resampling) meeting floors at 0.9 of VPD;<br/>input scope path-patched; own-run families<br/>vs VPD at the candidates; 45/56 STARTs pass<br/>(N binds the rest); v2.3: 40% target-only<br/>RERUN 494 · pymove, fleet"]
+    T4["<b>Teacher circuits v24</b> (6a9e1d3)<br/>START = fewest of 16 candidates meeting<br/>floors at 0.9 of VPD; pooled changed-input<br/>acceptance; held-out scope guard (9012:<br/>eval pass at START, was 0.33); re-pick on<br/>text6400-6999 donors: 0/8 train move<br/>RERUN train/mechdisc/MIB · pymove, fleet"]
     T6["<b>Stated circuits: the line stage</b><br/>lines.py: which part feeds which (connections,<br/>token edges) pruned under the reward floors;<br/>text9000 at f00abd2: 55 of 70 parts, 173 lines<br/>(16 token edges), point 0.08 bits, eval track<br/>0.95, every family at its floor (N: the node<br/>set's own 0.71); ~3 GPU-h per 567-line text;<br/>next: paper prompts, then 50 dev on MATS<br/>ACTIVE · rustmove"]
     T5["<b>Context-blocks teacher</b><br/>eval holds (0.90-0.95) but<br/>10^6-10^8 bits; VPD top k at<br/>its size ties or beats it<br/>CHECK · pymove"]
   end

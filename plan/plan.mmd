@@ -831,6 +831,12 @@ flowchart BT
   MATCHGAP -- guides the next fidelity improvement --> C1
   class MATCHGAP check
 
+%% ARCHRMS: owner variable_reward; architecture-only potential parents, never evaluation-derived repair labels. Linear summaries omit shared RMS paths; efficacy remains untested.
+  ARCHRMS["<b>Make possible RMS parents explicit</b><br/>Linear link summaries omit shared normalization paths.<br/>1026195 opt-in architecture-stage input hints;<br/>same-position residual parents and causal transport separated.<br/>5 focused tests PASS; default prompts unchanged.<br/>Frozen24 TRAIN adds227–367 Qwen tokens each;<br/>all retain32768 context plus416 output reserve.<br/>Relevant TRAIN labels already exist:13 intervention<br/>head-to-head edges vs3 point edges.<br/>Potential parents are not proven necessary edges.<br/>No new sampling; input usefulness untested<br/>READY · variable_reward]"
+  MATCHGAP -- outcome-blind input repair --> ARCHRMS
+  ARCHRMS -- normalization candidates --> INPUTRMS
+  class ARCHRMS check
+
 %% CHUNKSCHED: reduce future oracle evaluation stragglers without dropping models/worlds; original runs immutable. Historical redundant_004 costs1163s; count*length^2 does not help.44b3fb case0 Native parity20037 passes2520forwards; positive-empty-bank guard is validation only. Next use explicit input chunks on a future authorized run and measure actual wall time, not claim speedup from parity.
   CHUNKSCHED["<b>Spread slow scoring work across input banks</b><br/>One case took19.4min; length-squared scheduling did not help.<br/>Optional chunks retain all edits, policies and model-level metrics.<br/>12 tests pass; one real Native case,2520 forwards:<br/>all tensors, p0, tops, KL and restoration bitwise identical.<br/>Empty banks/edits fail closed; default case mode unchanged.<br/>Future runtime gain unmeasured · codex/variable_reward"]
   MATCHLEARN -- faster faithful evaluation iterations --> CHUNKSCHED

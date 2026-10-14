@@ -94,3 +94,16 @@ def test_e1_asks_every_structure_event():
     neutral = [evs for c, eng, evs in r.asked if eng == env_d.components.NEUTRAL][0]
     assert len(neutral) == env_d.components.E1_EVENTS + 3
     assert [e["change"] for e in neutral if e.get("change")] == ["move 0", "move 1", "move 2"]
+
+
+def test_e1_split_takes_e1_apart():
+    """env_d.e1_split: its E1 is components.e1_bits' (the same reader calls), and its position and structure parts are
+    the same weighted sum over each kind of event apart (decision test 3's breakdown)."""
+    ev = {**EV, "structure": [{"kind": "move", "position": 3, "change": f"move {k}", "down": True, "weight": 0.5,
+                               "bits": -0.5} for k in range(2)]}
+    texts = ["position 2 matters", "position 9 matters", ""]
+    whole = env_d.components.e1_bits(FakeReader(), {}, ev, [env_d.answer("", t) for t in texts])
+    split = env_d.e1_split(FakeReader(), {}, ev, [env_d.answer("", t) for t in texts])
+    assert [s["e1"] for s in split] == pytest.approx(whole)
+    assert split[2] == {"e1": 0.0, "position": 0.0, "structure": 0.0}
+    assert all(s["position"] is not None and s["structure"] is not None for s in split)

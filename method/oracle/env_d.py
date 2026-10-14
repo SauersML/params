@@ -103,6 +103,38 @@ def score(reader, task: dict, ev: dict, texts: list[str]) -> list[dict]:
              "named": bool(NAMES.search(e)), "semantics": SEMANTICS, "source": src} for b, e in zip(e1, eng)]
 
 
+def e1_split(reader, task: dict, ev: dict, texts: list[str]) -> list[dict | None]:
+    """components.e1_bits' E1 of each answer, with the same weighted sum taken apart over the position events
+    (units.reader_events: a token changed at a position) and the structure events (a token moved, copied or two
+    swapped: the events with a "change"), each over its own weights: {"e1", "position", "structure"}; 0 for an answer
+    without English, None without events. The reader is asked exactly what e1_bits asks."""
+    cands = components.e1_candidates(ev)
+    cands += [e for e in ev.get("structure", []) if e not in cands]
+    items = [(components.circuit_text(x), components.escape(components.english(x))) for x in texts]
+    if not cands:
+        return [None] * len(texts)
+    circs = list(dict.fromkeys(c for c, e in items if e.strip()))
+    sel = {}
+    for c, un in zip(circs, reader.losses(task, [(c, "") for c in circs], cands)):
+        w = [e.get("weight", 1.0) * u for e, u in zip(cands, un)]
+        top = sorted(range(len(cands)), key=lambda i: -w[i])[:components.E1_EVENTS]
+        top += [i for i, e in enumerate(cands) if e.get("change") and i not in top]
+        sel[c] = ([w[i] for i in top], [cands[i] for i in top])
+    asked = [(c, components.NEUTRAL) for c in circs] + [it for it in items if it[1].strip()]
+    got = iter(reader.losses(task, asked, [sel[c][1] for c, _ in asked]))
+    neutral = {c: next(got) for c in circs}
+    out = []
+    for c, e in items:
+        if not e.strip():
+            out.append({"e1": 0.0, "position": 0.0, "structure": 0.0})
+            continue
+        w, evs, mine = sel[c][0], sel[c][1], next(got)
+        part = lambda keep: (sum(a * (n - m) for a, n, m, x in zip(w, neutral[c], mine, evs) if keep(x))  # noqa: E731
+                             / max(sum(a for a, x in zip(w, evs) if keep(x)), 1e-12))
+        out.append({"e1": part(lambda x: True), "position": part(lambda x: not x.get("change")), "structure": part(lambda x: bool(x.get("change")))})
+    return out
+
+
 def make_reader(spec: str):
     """A frozen reader from R (module docstring)."""
     if spec.startswith("tinker:"):
@@ -179,7 +211,15 @@ def write(a) -> None:
     spend = tinker_train.Spend(a.out.parent, a.writer)
     rows = {r["task"]: r for r in map(json.loads, a.rows.read_text().splitlines()) if r}
     facts = [json.loads(x) for x in a.facts.read_text().splitlines() if x.strip()]
-    params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=wr.get_stop_sequences())
+    if a.labels:  # each listed circuit part's label (generality's gwas.py labels: its associations on Pile text)
+        lab = json.loads(a.labels.read_text())
+        for f in facts:
+            for n in f["nodes"]:
+                got = lab.get(n["node"].split("@")[0])
+                if got:
+                    n["facts"] = (n["facts"] + "; " if n.get("facts") else "") + "associations on Pile text: " + got
+    params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=wr.get_stop_sequences(),
+                                   **({"seed": a.seed} if a.seed is not None else {}))
 
     def ask(prompt_text: str, n: int = 1) -> list[str]:
         prompt = wr.build_generation_prompt([{"role": "user", "content": prompt_text}])
@@ -233,8 +273,10 @@ def gate(a) -> None:
             if fe and r.get("position"):  # measured facts alone, and with their most important position swapped
                 names += ["facts", "facts_position"]
                 texts += [fe, facts_english(f, (r["position"]["position"], r["position"]["token"]))]
-            got = score(reader, task_of(t), rows[t], texts)
-            row = {"task": t, "e1": {k: s["e1"] for k, s in zip(names, got)}}
+            got = e1_split(reader, task_of(t), rows[t], [answer("", english_of(x)) for x in texts])
+            row = {"task": t, "e1": {k: s and s["e1"] for k, s in zip(names, got)},
+                   "e1_position": {k: s and s["position"] for k, s in zip(names, got)},
+                   "e1_structure": {k: s and s["structure"] for k, s in zip(names, got)}}
             out.append(row)
             fh.write(json.dumps(row) + "\n")
             fh.flush()
@@ -358,6 +400,9 @@ def main():
                    "that names no subcomponent)")
     w.add_argument("--no-edits", action="store_true", help="the samples alone, for select (SFT data)")
     w.add_argument("--grounded", action="store_true", help="the writer told to state measured facts alone (GROUNDED)")
+    w.add_argument("--labels", type=Path, help="JSON {subcomponent: label} added to each listed circuit part's facts "
+                   "(generality's gwas.py labels; decision test 3: do association labels raise E1)")
+    w.add_argument("--seed", type=int, help="the writer's sampling seed (with --samples 1: the same draw for the same prompt)")
     se = sub.add_parser("select")
     se.add_argument("facts", type=Path)
     se.add_argument("rows", type=Path)

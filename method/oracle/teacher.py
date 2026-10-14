@@ -163,8 +163,8 @@ def reward_row(ge: goal_eval.GoalEval, tx: goal_eval.Text, g: native.Graph, pool
 
 
 def floor_of(v: float | None) -> float | None:
-    """An acceptance term's floor from the start's value, the reward's per-family floor (goal_eval.floors): max(0,
-    min(FLOOR_TOP 0.9, it - FLOOR_MARGIN 0.05)) (None: no floor)."""
+    """An acceptance term's floor from the start's value (the changed-input acceptance's; the reward's floors are
+    VPD's, goal_eval.floors): max(0, min(FLOOR_TOP 0.9, it - FLOOR_MARGIN 0.05)) (None: no floor)."""
     return None if v is None else max(0.0, min(goal_eval.FLOOR_TOP, v - goal_eval.FLOOR_MARGIN))
 
 
@@ -1223,16 +1223,19 @@ SET_RECOVERY = 0.95   # a start above the F1 budget may lose at most 5% of its o
 def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: float, budget: float,
                acceptance: Acceptance | None, B: int = 32, log=print, levels: tuple = SET_LEVELS,
                phi_pool: dict | None = None, forward: str | None = None, backup: bool = False) -> tuple:
-    """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): goal_eval.GoalEval.start_set
-    (VPD's active subcomponents at the targets and the m most influential positions, every connection; search split
-    s_track_pp 0.9) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
+    """The influential set pruned, nothing expanded (the lead's 10-12, F+V's start): the START (goal_eval.GoalEval
+    .start_set: VPD's active subcomponents at the targets and the fewest candidate positions meeting the reward's
+    absolute floors, every connection) pruned within the F1 budget (a start above it: the KL at SET_RECOVERY of its own log recovery)
     and the acceptance floors (min(0.9, the start's)) at levels, each level
     under Validated when the acceptance draws are "fv"; with phi_pool, every stage scored on the search split and the
-    one of the highest circuit term written (goal_eval.circuit_term, the reward's).
+    one of the highest circuit term written (goal_eval.circuit_term, the reward's): the floors, path-patched input
+    scope among them, decide which positions it keeps. Recorded: each context position's own-run, VPD-own-answer and
+    real-model effects (GoalEval.own_rule, a diagnostic: "positions_own", the START's positions pruned away with
+    "dropped", "own_dropped") and the written circuit's floors verdict ("final": shortfall v; v > 0 fails).
     forward: the start forward_start's at that unit instead (with phi_pool); backup: the start first expanded by its compensators
     (backup.expand_circuit). (The circuit, its Pruner, the record) as block_search's (no group, no blocks)."""
     nat = ge.nat
-    st = ge.start_set(tx, "search")
+    st = ge.start_set(tx, pool=phi_pool)
     fwd = forward_start(ge, tx, phi_pool, log, forward) if forward and phi_pool is not None else None
     start = {n: torch.zeros(tx.T, nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names}
     for n, t, c in (fwd["nodes"] if fwd is not None else st["graph"].node_set()):
@@ -1254,6 +1257,8 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     budget = max(budget, kl_budget(empty, kl0, SET_RECOVERY))  # recovery (a start over it: text6011, 9004 pruned nothing)
     rec = {"m": st["m"], "positions": fwd["positions"] if fwd is not None else st["positions"],
            "start_s_track_pp": st["s_track_pp"], "start_units": len(pr.nodes), "stages": [], "validation": [],
+           "start": {k: st.get(k) for k in ("candidates", "met", "cap_bound", "shortfall", "scores")} |
+                    {"effects": {str(q): e for q, e in (st.get("effects") or {}).items()}},
            "budget": budget, "forward": {k: v for k, v in fwd.items() if k != "nodes"} if fwd is not None else None,
            "backup": backed}
 
@@ -1304,7 +1309,24 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
         if best is None:                                     # (no stage at its floors: the start)
             best = next((r[6], r[0], on_s) for r, (_, on_s) in zip(reversed(rec["phi"]), snaps) if r[0] == "start")
         pr.on, rec["phi_stage"], rec["score"] = best[2].clone(), best[1], best[0]
-    g = graph_of(pr.on)
+    g = graph_of(pr.on)                                      # own_rule's numbers per context position, a diagnostic: the
+    held = {t for _, t, _ in g.node_set()} - set(tx.targets)  # written circuit's, and the START's positions pruned away
+    gone = sorted({t for _, t, _ in pr.nodes} - set(tx.targets) - held)   # (their numbers in the START)
+    rule = {**{q: dict(e, dropped=True) for q, e in (ge.own_rule(tx, graph_of(torch.ones_like(pr.on)), gone) if gone else {}).items()},
+            **ge.own_rule(tx, g)}
+    rec["positions_own"] = {str(q): e for q, e in rule.items()}
+    rec["own_dropped"] = gone
+    if phi_pool is not None:
+        row_f = reward_row(ge, tx, g, phi_pool)
+        bits_f = goal_eval.size_bits(g, nat.positions(tx.targets), sum(nat.C.values()), tx.targets, tx.vpd)
+        ct = goal_eval.circuit_term(row_f, ge.tau(tx, phi_pool, "search"), bits_f)
+        tau_f = ge.tau(tx, phi_pool, "search")               # scores against VPD's whole answer (the claim's), floors
+        rec["final"] = {"units": g.count(), "v": ct["v"], "term": ct["term"], "fails_floors": ct["v"] > 0,  # from the
+                        "scores": {f: goal_eval.family_score(row_f, f) for f in goal_eval.PHI_FAMILIES},  # restricted
+                        "floors": tau_f["floors"], "vpd_scores": tau_f.get("vpd_scores"),  # reference on the own-run ones
+                        "vpd_candidates_scores": tau_f.get("vpd_candidates_scores")}
+        log(f"  written: {g.count()} subcomponents at context positions {sorted(held)}, shortfall {ct['v']:.3f}"
+            f"{' (fails the floors)' if ct['v'] > 0 else ''}", flush=True)
     if acceptance is not None:
         rec["accept"] = acceptance.scores([g])[0]
         if acceptance.draws == "fv":

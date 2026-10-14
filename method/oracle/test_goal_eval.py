@@ -186,6 +186,7 @@ def tiny():
     tx = ge.text(ids, [11], seed=5)
     for split, n in (("search", 6), ("eval", 5)):  # far donors in the tiny vocabulary, some shorter than the text
         ge.donor_pools[split] = [(f"{split}{i}", torch.randint(0, 40, (8 + 2 * i,), generator=g).tolist()) for i in range(n)]
+    ge.start_pool = tiny_pool(nat, ids)  # the START's flip pool (START_POOL holds the real model's patterns)
     return nat, ge, tx
 
 
@@ -1588,15 +1589,6 @@ def test_vpd_baseline(tiny):
     assert abs(row["c_vpd_k"] - b3["c_vpd_k"]) < 1e-9
 
 
-def test_far_pool_keeps_the_models_vocabulary(tiny):
-    """A far donor text must be in the model's vocabulary: the real texts are none for the tiny model."""
-    nat, ge, tx = tiny
-    if not (native.TEXTS / "vpd4l").exists():
-        pytest.skip("needs vpd4l's texts")
-    kept = goal_eval.GoalEval(nat).far_pool("eval")
-    assert all(max(x) < 40 for _, x in kept) and len(kept) < 5  # only texts that happen to use the tiny vocabulary
-
-
 def test_path_patched_run(tiny):
     """pp_run: on the text itself every circuit is the model; the change enters only through stated token edges, so
     nothing stated is the model on the text and a stated graph with every connection and token edge among its nodes
@@ -1693,13 +1685,13 @@ def test_interchange_path_patched(tiny):
 
 
 def test_interchange_panel_is_the_texts(tiny):
-    """interchange_pp draws at the text's panel (the start's positions and a behavior's minimal pairs), the same for
-    every circuit; the model's response is the real model on the changed text; a circuit with no node at a draw's
+    """interchange_pp draws at the text's panel (the targets, the START's candidates and a behavior's minimal pairs),
+    the same for every circuit; the model's response is the real model on the changed text; a circuit with no node at a draw's
     position predicts no change there (KL_C = W)."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     panel = ge._interchange_panel(tx, "search")
-    assert panel == sorted(t for t in ge.start_set(tx, "search")["positions"] if t > 0)
+    assert panel == sorted(t for t in set(tx.targets) | set(ge.start_candidates(tx)[:goal_eval.START_CAP]) if 0 < t < tx.T)
     far = [nd for nd in every if nd[1] not in panel][:4] or every[:1]
     rows = ge.interchange_pp(tx, [native.Graph(masks=tx.vpd), native.Graph(far, complete=True)], "search", 4)
     assert [d[0] for d in rows[0]["draws_interchange_pp"]] == [d[0] for d in rows[1]["draws_interchange_pp"]]
@@ -1831,11 +1823,116 @@ def test_reward_v3_helpers(tiny):
     t = ge.tau(tx, pool)  # the start set's bar and bits, kept on the text
     st = ge.start_set(tx)
     assert t["nodes_start"] == st["graph"].count() and t["bits_start"] > 0
-    # the Gate B bar: max(min(start, every family at 0.9), every family at 0.5, the empty circuit + 1 bit)
-    assert abs(t["phi_tau"] - max(min(t["phi_start"], t["phi_09"]), t["phi_05"], t["phi_empty"] + 1)) < 1e-12
-    assert t["families"] and set(t["families"]) <= set(goal_eval.PHI_FAMILIES)
-    assert set(t["floors"]) == set(t["families"]) and all(0.0 <= f <= 0.9 for f in t["floors"].values())
+    # the bar from VPD and the empty circuit: phi at every family's floor (0.9 of VPD's own score) under VPD's answer's
+    # eps, at least the empty circuit's phi + 1 bit; the floors VPD's, whatever the start
+    vf = ge.vpd_floors(tx, pool, "search")
+    ve = {**goal_eval._eps(vf["vpd"]), **{f: v for f, v in goal_eval._eps(vf["candidates"]).items() if f in goal_eval.OWN_RUN_FAMILIES}}
+    assert abs(t["phi_tau"] - max(goal_eval._phi([(t["floors"][f], ve[f]) for f in t["families"]]), t["phi_empty"] + 1)) < 1e-12
+    assert t["families"] == vf["families"] and set(t["families"]) <= set(goal_eval.PHI_FAMILIES)
+    assert t["floors"] == vf["floors"] and all(0.0 <= f <= 0.9 for f in t["floors"].values())
     assert ge.tau(tx, pool) is t
+
+
+def test_start_candidates_and_own_effects(tiny):
+    """The START's candidates (the lead's 10-13): F2 by moved and every position by resample_influence interleaved,
+    each once, no target; resample_influence is the model with one position's token from a far donor aligned at the
+    ends; own_effects is the circuit's own run (C's semantics) with a position's parts cut, nothing for a position the
+    circuit does not hold."""
+    nat, ge, tx = tiny
+    one = ge.resample_influence(tx, "search")
+    assert set(one) == {q for q in range(1, max(tx.targets) + 1) if q not in tx.targets} and min(one.values()) > -1e-6
+    one1 = ge.resample_influence(tx, "search", k=1)
+    d = list(ge.far_donors(tx, ge.far_pool("search"), 1)[0][1])
+    q = max(one1, key=one1.get)
+    j = len(d) - tx.T + q
+    x = list(tx.ids)
+    x[q] = next(d[(j + i) % len(d)] for i in range(len(d)) if d[(j + i) % len(d)] != tx.ids[q])
+    assert abs(one1[q] - float(carry.kl(nat.reference([x], tx.targets), tx.ref))) < 1e-5
+    cand = ge.start_candidates(tx, "search")
+    moved = np.asarray(tx.moved, dtype=float)
+    f2 = [p for p in sorted((p for p, _ in tx.f2), key=lambda p: -moved[p - 1]) if p not in tx.targets]
+    assert sorted(cand) == sorted(one) and cand[0] == (f2[0] if f2 else max(one, key=one.get))
+    act = [(n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()]
+    held = [t for t in cand if any(nd[1] == t for nd in act)][:2]
+    g = native.Graph(sorted(nd for nd in act if nd[1] in set(tx.targets) | set(held)), complete=True)
+    eff = ge.own_effects(tx, g)
+    assert set(eff) == set(held) and all(v > -1e-6 for v in eff.values())
+    free = next(t for t in range(1, tx.T) if t not in held and t not in tx.targets)
+    assert abs(ge.own_effects(tx, g, [free])[free]) < 1e-6
+    w = ge.removal_kl(tx, [[nd for nd in act if nd[1] == held[0]], []])
+    assert w[0] > 0 and abs(w[1]) < 1e-6
+
+
+def test_start_is_one_set_meeting_the_floors(tiny):
+    """The START (the lead's 10-13): one set per text whatever the split, VPD's actives at the targets and at a prefix
+    of its candidates; met when the search row meets the reward's floors (vpd_floors), only the full candidate list
+    failing; own_rule's numbers per context position a diagnostic whose verdicts follow its numbers."""
+    nat, ge, tx = tiny
+    st = ge.start_set(tx)
+    assert ge.start_set(tx, "eval") is st and ge.start_set(tx, "search") is st
+    ps, tg = set(st["positions"]), set(tx.targets)
+    assert ps == tg | set(st["candidates"][:st["m"]]) and set(st["effects"]) == ps - tg
+    assert st["met"] == (st["shortfall"] == 0) and (st["met"] or st["m"] == len(st["candidates"]))
+    assert st["cap_bound"] == (st["m"] == len(st["candidates"]))
+    act = sorted((n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist() if t in ps)
+    assert sorted(st["graph"].node_set()) == act
+    res = ge.kl_resolution(tx)
+    for q, e in st["effects"].items():
+        assert e["vpd_depends"] == (e["vpd_own"] >= 0.1 * e["vpd_real"] and e["vpd_own"] > res)
+        assert e["works"] == (e["own"] >= 0.9 * e["vpd_own"] if e["vpd_depends"] else e["own"] >= 0.1 * e["real"] and e["own"] > res)
+        assert e["drop"] == (not e["vpd_depends"] and not e["works"])
+    fl = ge.vpd_floors(tx, ge.start_pool, "search")  # the START's floors are the reward's
+    assert st["shortfall"] == goal_eval.shortfall(ge.fidelity(tx, [st["graph"]], ge.start_pool, mode="reward", split="search")[0], fl["floors"])
+    # the own-run families' floors from VPD at the targets and the START's candidates, the rest from VPD's whole answer
+    want = {**goal_eval.floors(fl["vpd"], fl["families"]),
+            **goal_eval.floors(fl["candidates"], [f for f in fl["families"] if f in goal_eval.OWN_RUN_FAMILIES])}
+    assert fl["floors"] == want
+
+
+def test_scope_family_and_resolution(tiny):
+    """The input-scope family (the lead's 10-13): changed texts at the most influential positions (resample_influence)
+    until SCOPE_COVER of its sum, each position's token alone from far donors; per draw the circuit's own-run move
+    transplanted onto the model, pooled as the weighted families (_ratio_pool). VPD's whole answer scores 1 and the
+    empty circuit below it; kl_resolution is RESOLUTION_SAFETY times the KL between two equal runs in different
+    batches."""
+    nat, ge, tx = tiny
+    got = ge.scope_draws(tx, "search")
+    one = ge.resample_influence(tx, "search")
+    order = sorted(one, key=lambda q: -one[q])
+    pos = list(dict.fromkeys(q for q, _ in got))
+    assert pos == order[:len(pos)] and len(pos) <= goal_eval.START_CAP and all(z != tx.ids[q] for q, z in got)
+    total = sum(max(0.0, v) for v in one.values())
+    held = sum(max(0.0, one[q]) for q in pos)
+    assert held >= goal_eval.SCOPE_COVER * total or len(pos) == min(goal_eval.START_CAP, len(one))
+    assert held - max(0.0, one[pos[-1]]) < goal_eval.SCOPE_COVER * total
+    act = sorted((n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist())
+    vpd, empty = ge.scope_family(tx, [native.Graph(act, complete=True), native.Graph()], "search")
+    assert len(vpd["draws_scope"]) == len(got) and abs(vpd["s_scope"] - 1.0) < 1e-4  # path-patched: VPD's whole answer 1
+    assert empty["s_scope"] is None or empty["s_scope"] < vpd["s_scope"]
+    assert empty["s_scope_raw"] == goal_eval._ratio_pool(empty["draws_scope"], raw=True)
+    tp = ge.track_pp(tx, [native.Graph()], "search", got=got)[0]  # track_pp's semantics on scope's draws
+    assert tp["draws_track_pp"] == empty["draws_scope"]
+    res = ge.kl_resolution(tx)
+    assert res >= 0.0 and ge.kl_resolution(tx) == res
+    st = ge.start_set(tx)
+    for e in st["effects"].values():  # nothing at or below the resolution counts as a dependence
+        assert not e["vpd_depends"] or e["vpd_own"] > res
+
+
+def test_far_pool_refuses_another_vocabulary():
+    """far_pool (the lead's 10-13): DONOR_POOLS' vpd4l texts only for a model with vpd4l's vocabulary (another tokenizer's
+    ids mean nothing to it), and a pool set for the model must lie in its vocabulary."""
+    ge = goal_eval.GoalEval(tiny_native(), changes=4)
+    for bad in (None, [("other0", [3, 41])]):
+        if bad is not None:
+            ge.donor_pools["search"] = bad
+        try:
+            ge.far_pool("search")
+            raise AssertionError("a foreign donor pool was taken")
+        except ValueError:
+            pass
+    ge.donor_pools["search"] = [("own0", [3, 39])]
+    assert ge.far_pool("search") == [("own0", [3, 39])]
 
 
 def test_cut_partial_modes(tiny):
@@ -2032,7 +2129,8 @@ def test_semantics_n_holds_the_response_families_at_x(tiny):
 def test_cutover_scores_as_the_frozen_line():
     """The default semantics scores as run 2's frozen line, c2e0f80 with SEMANTICS=n: the tiny fixture's reward-mode
     families on a node set and a stated graph equal the numbers c2e0f80 gave under SEMANTICS=n (GitHub Actions, CPU),
-    within 1e-4."""
+    within 1e-4; phi over that line's families (the input-scope family came after it), re-frozen at the 10-13 revision
+    (pymove's v24: interchange_pp's panel the START's candidates, its draws another set) on a pod at 24823a8b73."""
     nat = tiny_native(near=0.1)
     ge = goal_eval.GoalEval(nat, changes=4, ranks=(3, 4), share_floor=0.01, chunk=4)
     g = torch.Generator().manual_seed(1)
@@ -2045,13 +2143,14 @@ def test_cutover_scores_as_the_frozen_line():
     rows = ge.fidelity(tx, graphs, None, draws=2, near_donors=0, far_donors=0, mode="reward", interchange=2, changed=2)
     want = [{"s_point_c": 0.00035079477585422774, "s_nodes": 0.7945694641006256, "s_nodes_raw": 0.7945694641006256,
              "kl_nodes_c": 4.207161903381348, "s_edges": 0.0015720574266129155, "s_omitted": 0.36393087311141814,
-             "s_omitted_raw": 0.09792910144777334, "kl_point": 13.841683387756348, "phi": 0.15705154894395465},
+             "s_omitted_raw": 0.09792910144777334, "kl_point": 13.841683387756348, "phi": 0.15039301621621806},
             {"s_point_c": 0.0, "s_nodes": None, "s_nodes_raw": None, "kl_nodes_c": 4.313782215118408, "s_edges": None,
              "s_omitted": 0.5857890529978118, "s_omitted_raw": 0.3602883742448587, "kl_point": 13.87414264678955,
-             "phi": 0.07083523967454304}]
+             "phi": 0.10110904978983165}]
     assert ge.semantics == "n"
     for r, w in zip(rows, want):
-        got = {k: r.get(k) for k in w if k != "phi"} | {"phi": goal_eval.phi(r)[0]}
+        then = [f for f in goal_eval.PHI_FAMILIES if f != "scope" and goal_eval.family_score(r, f) is not None]
+        got = {k: r.get(k) for k in w if k != "phi"} | {"phi": goal_eval.phi(r, families=then)[0]}
         for k, v in w.items():
             assert (v is None) == (got[k] is None) and (v is None or abs(got[k] - v) < 1e-4 * max(1.0, abs(v))), (k, got[k], v)
 

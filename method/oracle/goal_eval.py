@@ -144,6 +144,7 @@ NEC_CONTROLS_LOO = NEC_CONTROLS  # line_loo's and phi_variants' N controls: the 
 REMOVAL_ROWS = {"cuda": 32, "other": 16}  # real-model removal sets per batch (_removed_kl), by device: a removal batch's
 # masks are [rows, T, C] floats at every site
 NEC_MIN_LEN = 64  # a control text's least length (end-aligned: a circuit's parts further back are not removed there)
+DONOR_VOCAB = 50277  # DONOR_POOLS' texts are vpd4l's token ids, in its tokenizer's 50277-id vocabulary (far_pool)
 DONOR_POOLS = {"search": ("train", range(6000, 6400), True),  # the far donors' texts per split by text number, frozen
                "eval": ("donor", range(9150, 9200), False)}  # (the lead's 10-13): the reward's text6000-6399, which a pod
 # missing any refuses (the first 400 train files present before, so a pod holding fewer texts drew other donors: rewards
@@ -508,6 +509,13 @@ def _tok_pairs(g: native.Graph) -> tuple[list, list]:
     return stated, unstated
 
 
+def _donor_token(d: list, q: int, T: int, x: int) -> int:
+    """The token at position q of a text of length T from far donor d aligned at its end (cyclic where shorter), the
+    next of the donor's that differs from x when that one is x (resample_influence, the input-scope family)."""
+    j = len(d) - T + q
+    return next((d[(j + i) % len(d)] for i in range(len(d)) if d[(j + i) % len(d)] != x), x)
+
+
 def _transplant(base: torch.Tensor, moved: torch.Tensor, still: torch.Tensor) -> torch.Tensor:
     """log_softmax(base + moved - still): a run's change from still to moved (log q on x' and on x) applied to base
     (the model's log p on x), the target positions' distributions [B, targets, V]."""
@@ -542,7 +550,14 @@ PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the sc
     "interchange_pp": ("s_interchange_pp", "weighted", "draws_interchange_pp"),
     "patching_near": ("s_patching_near", "donor", "draws_patching_near"), "patching_far": ("s_patching_far", "donor", "draws_patching_far"),
     "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_spec", "spec", "draws_n_spec"),
-    "omitted": ("s_omitted", "weighted", "draws_omitted")}
+    "omitted": ("s_omitted", "weighted", "draws_omitted"), "scope": ("s_scope", "weighted", "draws_scope")}
+RESAMPLE_DONORS = 4  # resample_influence's far donors per position (the START's candidate order)
+START_CAP = 16  # the START's most candidate positions beside the targets (start_candidates; the input-scope family's cap)
+SCOPE_COVER = 0.95  # the input-scope family's positions: by resampling influence until they hold this share of its sum
+RESOLUTION_SAFETY = 10.0  # kl_resolution: the KL between two equal C runs times this
+OWN_RUN_FAMILIES = ("point", "edges", "flips", "pattern", "nodes", "patching_near", "patching_far")  # floors from VPD at
+# the START's candidates (vpd_floors): the runs that zero the outside of a circuit or put a far donor's streams there
+START_POOL = native.TEXTS.parent / "goal_eval" / "ci_patterns_train.pt"  # the START's flip-adversary pool (the teacher's)
 OMITTED_K = 32  # the omitted family's candidates per circuit (_omitted_family)
 GENERIC_TARGET = (("h.1.mlp.c_fc", 2103), ("h.3.mlp.down_proj", 3532), ("h.3.attn.o_proj", 806), ("h.1.attn.q_proj", 316),
                   ("h.0.mlp.c_fc", 53))  # vpd4l's background at the targets (the lead's 10-13): the 5 parts whose removal
@@ -559,7 +574,8 @@ PHI_CAP_WIDTH = 0.2  # cap_phi's join between the two slopes, in bits (a softplu
 LEAK = 0.1  # phi's family scores below 0 count LEAK of themselves (the user's 10-13: a floor at 0 gives no gradient)
 PHI_RAW = {"point": "s_point_c", "nodes": "s_nodes_raw", "edges": "s_edges", "flips": "f1_flips_c",
            "track_pp": "s_track_pp_raw", "interchange_pp": "s_interchange_pp_raw", "patching_near": "s_patching_near",
-           "patching_far": "s_patching_far", "pattern": "s_pattern_raw", "N": "n_spec_raw", "omitted": "s_omitted_raw"}
+           "patching_far": "s_patching_far", "pattern": "s_pattern_raw", "N": "n_spec_raw", "omitted": "s_omitted_raw",
+           "scope": "s_scope_raw"}
 # each family's unfloored score: a row field ending in _raw, else rl_terms' entry (point, edges, flips, patching)
 
 
@@ -601,6 +617,7 @@ def family_kls(row: dict) -> dict:
     out = {"point": row.get("kl_point"), "empty": row.get("kl_empty_live"), "vpd": row.get("kl_vpd_live"),
            "nodes": row.get("kl_nodes_c"), "edges": row.get("kl_edges_c"), "flips": kf[0] if kf else None,
            "track_pp": mean("draws_track_pp"), "interchange_pp": mean("draws_interchange_pp"), "omitted": mean("draws_omitted"),
+           "scope": mean("draws_scope"),
            "pattern": row.get("kl_pattern_c"), "N": (row.get("draws_n_spec") or [[None] * 5])[0][3]}
     for pool_ in ("near", "far"):
         k3 = row.get(f"kl_patching_{pool_}")
@@ -729,19 +746,22 @@ def _eps(row: dict) -> dict:
 
 
 GATE_SLOPE = 10.0  # the reward's gate g = 1 / (1 + 2^(-GATE_SLOPE (phi - phi_tau))) (components.GATE_SLOPE)
-FLOOR_TOP, FLOOR_MARGIN = 0.9, 0.05  # a family's floor: min(FLOOR_TOP, the start's score - FLOOR_MARGIN), at least 0
+FLOOR_TOP, FLOOR_MARGIN = 0.9, 0.05  # a family's floor: FLOOR_TOP of VPD's own answer's score (floors); FLOOR_MARGIN the
+# teachers' changed-input acceptance below its start's value (teacher.floor_of)
 SHORTFALL_COST, SHORTFALL_GATE = 4.0, 20.0  # R - SHORTFALL_COST v, the gate times 2^(-SHORTFALL_GATE v)
 SHORTFALL_WIDTH = 0.02  # the soft shortfall's softplus width in score units (the user's 10-13 softening)
 TIE, TIE_SCALE = 0.02, 2.0  # the ungated compactness tie-break: TIE x TIE_SCALE tanh(compact / TIE_SCALE)
 
 
-def floors(start: dict, families: list) -> dict:
-    """Per-family floors (the lead's 10-13: the teacher's acceptance floors, so reward and teacher agree on what
-    faithful means): max(0, min(0.9, s_i(start) - 0.05)) for each family the start scores, 0 for the rest."""
+def floors(vpd: dict, families: list) -> dict:
+    """Per-family floors, the reward's and the teachers' (the lead's 10-13 design): FLOOR_TOP of VPD's own answer's
+    score on the family (vpd: VPD's whole answer's reward-mode row), in [0, FLOOR_TOP], 0 where VPD's answer scores
+    nothing. Absolute: floors once taken from the start (its score less 0.05) never charged what the start missed
+    (40% of the v2.3 teachers held the targets alone)."""
     out = {}
     for f in families:
-        s = family_score(start, f)
-        out[f] = 0.0 if s is None else max(0.0, min(FLOOR_TOP, s - FLOOR_MARGIN))
+        s = family_score(vpd, f)
+        out[f] = 0.0 if s is None else FLOOR_TOP * max(0.0, min(1.0, s))
     return out
 
 
@@ -1519,9 +1539,9 @@ class GoalEval:
 
 
     HELD = ("nodes", "edges", "flips", "patching_near", "patching_far", "omitted")  # phi_variants' families held at the
-    # answer's values unless recomputed (recompute: "nodes", "patching"); point, track_pp, interchange_pp, pattern and N always are
+    # answer's values unless recomputed (recompute: "nodes", "patching"); point, track_pp, interchange_pp, scope, pattern and N always are
     LOO_RECOMPUTE = ("nodes",)  # line_loo's (patching per deletion: 64 donor runs a line)
-    LOO_HELD = ("edges", "flips", "patching_near", "patching_far", "omitted")  # line_loo's families held at the answer's values
+    LOO_HELD = ("edges", "flips", "patching_near", "patching_far", "omitted", "scope")  # line_loo's families held at the answer's values
 
     def line_loo(self, tx: Text, graph: native.Graph, pool: dict | None, split: str = "search", draws: int = 8,
                  bits_start: float | None = None, base: dict | None = None) -> dict:
@@ -1656,6 +1676,7 @@ class GoalEval:
         mask[:, at] = keep.float()
         tpp = self.track_pp(tx, [g], split, draws, lines=mask)
         ipp = self.interchange_pp(tx, [g], split, draws, lines=mask)
+        scp = self.scope_family(tx, [g], split, lines=mask)  # (its own draws, as the answer's row: the floors read it)
         pat = self.pattern_family(tx, flat, runs=None if got is None else pattern_runs)
         sets = [frozenset(x for kind, x in d if kind == "node") for d in gone]  # N moves with the node set alone
         distinct = list(dict.fromkeys(s for s in sets if s))
@@ -1687,6 +1708,7 @@ class GoalEval:
             row.update(a)
             row.update(b)
             row.update(c)
+            row.update(scp[i])
             if "rl_terms" in row:
                 raw_point = [_fid_raw(e0, x["kl_live"], v0) for x in (pt, wd)]
                 row["rl_terms"] = {**row["rl_terms"],
@@ -2524,7 +2546,7 @@ class GoalEval:
     @torch.no_grad()
     def track_pp(self, tx: Text, graphs: list[native.Graph], split: str = "eval", draws: int = CHANGED_DRAWS,
                  cuts: list | None = None, engine_run: bool = True, strengths: torch.Tensor | None = None,
-                 lines: torch.Tensor | None = None) -> list[dict]:
+                 lines: torch.Tensor | None = None, got: list | None = None) -> list[dict]:
         """s_track_pp (the lead's 10-12, beside s_track): on changed_inputs' changed texts x' (split), the path-patched
         run of each circuit (pp_run) against the model on x', against VPD's whole answer's path-patched run (a
         complete graph: 1 by construction), bounded by no change: per prompt clip(ln(W / KL_C) / ln(W / KL_V), 0, 1)
@@ -2535,13 +2557,15 @@ class GoalEval:
         engine_run False, or a stated graph with cuts: pp_run one graph and prompt at a time); each prompt's model run,
         W and VPD's KL are kept on the text. strengths [K, E + O]: the circuits are graphs[0]'s connection subsets
         (changed_edges' ons), in one call; lines [K, L]: graphs[0] (stranded) with the lines each row turns off removed
-        (Engine.pp_lines' columns; graph_of_lines), in one call."""
+        (Engine.pp_lines' columns; graph_of_lines), in one call. got: the changed texts as (position, token) pairs in
+        place of changed_inputs' (scope_family's)."""
         nat = self.nat
         graphs = [strand(g, tx.targets, nat.C) for g in graphs]
-        moved = np.asarray(tx.moved, dtype=float)
-        positions = [p for p, _ in tx.f2]
-        got = self._interchange_draws(tx, positions, split, draws, first={p: -moved[p - 1] for p in positions}) \
-            if positions and tx.vpd is not None else []
+        if got is None:
+            moved = np.asarray(tx.moved, dtype=float)
+            positions = [p for p, _ in tx.f2]
+            got = self._interchange_draws(tx, positions, split, draws, first={p: -moved[p - 1] for p in positions}) \
+                if positions and tx.vpd is not None else []
         vpd = native.Graph(masks=tx.vpd) if tx.vpd is not None else None
         lqs = None
         if strengths is not None or lines is not None:
@@ -2595,10 +2619,11 @@ class GoalEval:
         return self._interchange_graphs(tx, [strand(g, tx.targets, self.nat.C) for g in graphs], split, draws)
 
     def _interchange_panel(self, tx: Text, split: str) -> list[int]:
-        """interchange_pp's positions on a text, whatever the circuit: the start set's (start_set: the targets and the
-        most influential positions) and a behavior's minimal pairs' (tx.behavior_pairs), position 0 aside."""
+        """interchange_pp's positions on a text, whatever the circuit: the targets, the START's candidates
+        (start_candidates, at most START_CAP: the START itself is chosen by rows that score this family) and a
+        behavior's minimal pairs' (tx.behavior_pairs), position 0 aside."""
         own = {p for p, _ in getattr(tx, "behavior_pairs", [])}
-        return sorted(t for t in set(self.start_set(tx, split)["positions"]) | own if 0 < t < tx.T)
+        return sorted(t for t in set(tx.targets) | set(self.start_candidates(tx)[:START_CAP]) | own if 0 < t < tx.T)
 
     def _interchange_refs(self, tx: Text, split: str, draws: int) -> tuple:
         """interchange_pp's draws and references on a text (kept on tx): (draws [(p, z)], the changed texts' records
@@ -3264,7 +3289,7 @@ class GoalEval:
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
                  changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
                  far_donors: int = DONORS_FAR, baseline: bool = False, pattern: bool = True,
-                 controls: int = NEC_CONTROLS, weight: bool = False) -> list[dict]:
+                 controls: int = NEC_CONTROLS, weight: bool = False, scope: bool = True) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -3281,7 +3306,9 @@ class GoalEval:
         the circuit's nodes at one of its positions set to their values on a changed text, s_interchange) and "changed"
         (changed_inputs: the circuit run on changed texts, bounded by its own unchanged answer, s_changed, with
         context_share, s_track) and "donors" (donors, activation patching: everything outside the circuit at one donor text's values, near
-        donors the changed texts and far donors other texts, s_patching_near and s_patching_far); c, the harmonic mean of
+        donors the changed texts and far donors other texts, s_patching_near and s_patching_far) and "scope" (scope_family,
+        phi's input-scope family: each influential position's token alone from natural donors, the circuit's own-run
+        move against the model's, s_scope; scope=False leaves it out); c, the harmonic mean of
         s_point_c, s_nodes, s_edges, f1_flips_c at FLIP_TERM (the reward's adversarial member), s_track, s_interchange,
         s_patching_near and s_patching_far over those defined on the text (c_terms names them; the claim is agreement under
         every family, so one failed family is not made up by the others, and near 0 c is linear in the lowest term, so
@@ -3333,6 +3360,7 @@ class GoalEval:
         inter = self._interchange_family(tx, graphs, interchange, split=split, reads=reads) if interchange else none
         reals = self.real_removal(tx, graphs) if real and not reward else none
         chg = self.changed_inputs(tx, graphs, split, changed) if changed else none
+        scp = self.scope_family(tx, graphs, split) if scope else none  # phi's input-scope family
         tpp = self.track_pp(tx, pp_graphs, split, changed) if changed else none
         ipp = self.interchange_pp(tx, pp_graphs, split, interchange) if interchange else none
         pat = self.pattern_family(tx, graphs) if pattern else none  # s_pattern: C's true-pattern family
@@ -3366,6 +3394,7 @@ class GoalEval:
             if it:
                 row["s_interchange"] = _fid(e0, it["kl_interchange_c"], it["kl_interchange_vpd"])
             row.update(chg[i])
+            row.update(scp[i])
             row.update(tpp[i])
             row.update(ipp[i])
             row.update(pat[i])
@@ -4342,65 +4371,345 @@ class GoalEval:
                 break
         return native.Graph(nodes, complete=True)
 
-    def start_set(self, tx: Text, split: str = "search", floor: float = 0.9, draws: int = CHANGED_DRAWS) -> dict:
-        """The influential start set (the lead's 10-12, the new teacher's start): VPD's actives at the targets and the m
-        most influential positions (F2's, the probe's moved), every connection (a node set), m the smallest whose
-        s_track_pp on split reaches floor (all of F2's positions when none does); kept on tx. {graph, m, positions,
-        s_track_pp}."""
-        kept = tx.__dict__.setdefault("_start", {})
-        if (split, floor) in kept:
-            return kept[(split, floor)]
-        nat = self.nat
-        moved = np.asarray(tx.moved, dtype=float)
-        f2 = sorted((q for q, _ in tx.f2), key=lambda q: -moved[q - 1])
-        act = [(n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()]
-        for m in range(len(f2) + 1):
-            ps = set(tx.targets) | set(f2[:m])
-            g = native.Graph(sorted(nd for nd in act if nd[1] in ps), complete=True)
-            sc = self.track_pp(tx, [g], split, draws)[0]["s_track_pp"]
-            if sc is not None and sc >= floor:
+    @torch.no_grad()
+    def resample_influence(self, tx: Text, split: str = "search", k: int = RESAMPLE_DONORS) -> dict:
+        """{position: mean KL in bits at the targets of the model with that position's token alone replaced by the
+        token at the same place in each of k far donors of split (far_donors, aligned at their ends; a donor whose
+        token there is the text's gives its next differing one)}, the positions from 1 to the last target outside the
+        targets: the input-scope family's intervention one position at a time, natural tokens the model reads in place
+        of the text's (the lead's 10-13). On the lead's 17 hand-checked texts it ranks the context token that moves the
+        prediction most first on 7 of the 9 that need context, second or third on the others; the probe's draws from the
+        model's own prediction (moved) miss tokens with plausible substitutes (text9043's ' adjusted' one back: 0.57
+        bits by the probe, 1.03 by donors, 9.18 replaced by ' the'). Kept on tx."""
+        kept = tx.__dict__.setdefault("_resample", {})
+        if (split, k) not in kept:
+            donors = [list(d) for _, d in self.far_donors(tx, self.far_pool(split), k)]
+            tg = set(tx.targets)
+            qs = [q for q in range(1, max(tx.targets) + 1) if q not in tg]
+            seqs = [[_donor_token(d, q, tx.T, x) if p == q else x for p, x in enumerate(tx.ids)] for q in qs for d in donors]
+            kl = []
+            for s0 in range(0, len(seqs), 4 * self.chunk):
+                lp = self.nat.reference(seqs[s0:s0 + 4 * self.chunk], tx.targets)
+                kl += carry.kl(lp, tx.ref.expand_as(lp)).tolist()
+                native.free(self.nat.dev)
+            n = len(donors)
+            kept[(split, k)] = {q: float(np.mean(kl[i * n:(i + 1) * n])) for i, q in enumerate(qs)} if n else {}
+        return kept[(split, k)]
+
+    def start_candidates(self, tx: Text, split: str = "search") -> list:
+        """The START's candidate positions in order (the lead's 10-13): F2's by the probe's moved and every position by
+        resample_influence, largest first, interleaved, each position once, the targets left out."""
+        moved, tg = np.asarray(tx.moved, dtype=float), set(tx.targets)
+        f2 = [q for q in sorted((q for q, _ in tx.f2), key=lambda q: -moved[q - 1]) if q not in tg]
+        one = self.resample_influence(tx, split)
+        rs = sorted(one, key=lambda q: -one[q])
+        out, seen = [], set()
+        for i in range(max(len(f2), len(rs))):
+            for q in (f2[i] if i < len(f2) else None, rs[i] if i < len(rs) else None):
+                if q is not None and q not in seen:
+                    seen.add(q)
+                    out.append(q)
+        return out
+
+    def scope_draws(self, tx: Text, split: str = "search") -> list:
+        """The input-scope family's changed texts as (position, token) pairs: the positions by resample_influence on
+        split, largest first, until they hold SCOPE_COVER of its sum (at most START_CAP), each with its token from each
+        of the split's RESAMPLE_DONORS far donors (one changed position a text)."""
+        one = self.resample_influence(tx, split)
+        total = sum(max(0.0, v) for v in one.values())
+        pos, held = [], 0.0
+        for q in sorted(one, key=lambda q: -one[q]):
+            if len(pos) >= START_CAP or not total > 0 or held >= SCOPE_COVER * total:
                 break
-        kept[(split, floor)] = {"graph": g, "m": m, "positions": sorted(ps), "s_track_pp": sc}
+            pos.append(q)
+            held += max(0.0, one[q])
+        donors = [list(d) for _, d in self.far_donors(tx, self.far_pool(split), RESAMPLE_DONORS)]
+        got = [(q, _donor_token(d, q, tx.T, tx.ids[q])) for q in pos for d in donors]
+        return list(dict.fromkeys((q, z) for q, z in got if z != tx.ids[q]))
+
+    def scope_family(self, tx: Text, graphs: list[native.Graph], split: str = "search", lines: torch.Tensor | None = None) -> list[dict]:
+        """The input-scope family (the lead's 10-13 design): does the circuit follow the model when a token it may
+        leave out changes? Draws: scope_draws (each influential position's token alone replaced by natural donor
+        tokens, positions to SCOPE_COVER of the summed movement, at most START_CAP). Scored as track_pp on those draws:
+        path patching (pp_run), the change reaching the circuit only through its token edges at the position and
+        travelling only along its paths, everything outside it at the text's own run; its own q/k parts change with
+        the input, so a routing change must be the circuit's, only the baseline routing being the real run's. Against
+        VPD's whole answer in the same semantics (1 by construction: floor FLOOR_TOP), bounded by no change, pooled as
+        the weighted families (_ratio_pool; the raw score two-sided: a circuit farther than no change, responding more
+        than the model, counts against it). This family decides whether a position the circuit leaves out counts
+        against it. The circuit's own run, everything outside it zeroed, is no measure here: a sparse circuit's
+        attention then spreads over the positions it leaves empty (on 60 texts the START's own run followed the
+        model's token changes nowhere, median 0.00, while VPD's whole answer did). Per position alone: a context
+        resampled jointly carries a donor's topic, which no small circuit holds. lines as track_pp's (phi_variants).
+        {s_scope, s_scope_raw, draws_scope}."""
+        got = self.scope_draws(tx, split) if tx.vpd is not None else []
+        if not got:
+            return [{"s_scope": None, "s_scope_raw": None, "draws_scope": []} for _ in (graphs if lines is None else lines)]
+        rows = self.track_pp(tx, graphs, split, lines=lines, got=got)
+        return [{"s_scope": r["s_track_pp"], "s_scope_raw": r["s_track_pp_raw"], "draws_scope": r["draws_track_pp"]} for r in rows]
+
+    @torch.no_grad()
+    def kl_resolution(self, tx: Text) -> float:
+        """The KL resolution of C's own runs on the text (the lead's 10-13): RESOLUTION_SAFETY times the KL in bits at
+        the targets between two runs of VPD's whole answer that differ only in their batch (alone, and beside a run with
+        its first context position's parts cut), the larger direction; kept on tx. own_rule counts an effect below it
+        as none."""
+        if "_kl_resolution" not in tx.__dict__:
+            import engine
+
+            nat = self.nat
+            act = sorted((n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist())
+            circ = {n: torch.tensor(sorted({c for m, _, c in act if m == n}), dtype=torch.long, device=nat.dev) for n in nat.names}
+            at = {n: {c: i for i, c in enumerate(circ[n].tolist())} for n in nat.names}
+            E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ)
+            base = {n: torch.zeros(tx.T, len(circ[n]), device=nat.dev) for n in nat.names}
+            for n, t, c in act:
+                base[n][t, at[n][c]] = 1.0
+            cut = {n: x.clone() for n, x in base.items()}
+            ctx = [nd for nd in act if nd[1] not in set(tx.targets)]
+            for n, t, c in [nd for nd in ctx if nd[1] == ctx[0][1]] if ctx else []:
+                cut[n][t, at[n][c]] = 0.0
+            one = E.log_probs({n: x[None] for n, x in base.items()})
+            two = E.log_probs({n: torch.stack([base[n], cut[n]]) for n in nat.names})[:1]
+            noise = max(abs(float(carry.kl(one, two))), abs(float(carry.kl(two, one))))
+            tx.__dict__["_kl_resolution"] = RESOLUTION_SAFETY * noise
+            native.free(nat.dev)
+        return tx.__dict__["_kl_resolution"]
+
+    @torch.no_grad()
+    def own_effects(self, tx: Text, g: native.Graph, positions=None) -> dict:
+        """{position: KL in bits at the targets between the circuit's own run (C's semantics: its parts on with their
+        own attention routing, nothing held at x, the leftover weights on) and that run with the position's parts cut},
+        for the circuit's positions outside the targets (or positions): whether a kept position works in the circuit's
+        own computation (the lead's 10-13). On the 492 v2.3 teachers, 395 of the 796 kept context positions changed
+        their circuit's own run by under 1e-3 bits while 779 moved the real model by at least 0.01 bits; text9000's 20
+        parts on "the" one back: 5.4e-5 bits in its own run, 0.37 with q/k and norms at x, 0.12 in the model."""
+        import engine
+
+        nat = self.nat
+        nodes = sorted(g.node_set())
+        pos = sorted({t for _, t, _ in nodes} - set(tx.targets)) if positions is None else sorted(positions)
+        if not pos:
+            return {}
+        circ = {n: torch.tensor(sorted({c for m, _, c in nodes if m == n}), dtype=torch.long, device=nat.dev) for n in nat.names}
+        at = {n: {c: i for i, c in enumerate(circ[n].tolist())} for n in nat.names}
+        E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=circ)
+        base = {n: torch.zeros(tx.T, len(circ[n]), device=nat.dev) for n in nat.names}
+        for n, t, c in nodes:
+            base[n][t, at[n][c]] = 1.0
+        sets = [[]] + [[(n, t, at[n][c]) for n, t, c in nodes if t == q] for q in pos]
+        lps = []
+        for s0 in range(0, len(sets), self.chunk):
+            part = sets[s0:s0 + self.chunk]
+            m = {n: x[None].repeat(len(part), 1, 1).clone() for n, x in base.items()}
+            for b, cut in enumerate(part):
+                for n, t, i in cut:
+                    m[n][b, t, i] = 0.0
+            lps.append(E.log_probs(m))
+            native.free(nat.dev)
+        lp = torch.cat(lps)
+        return dict(zip(pos, carry.kl(lp[:1].expand_as(lp[1:]), lp[1:]).tolist()))
+
+    @torch.no_grad()
+    def removal_kl(self, tx: Text, sets: list) -> list[float]:
+        """KL in bits at the targets of the real model with each set of parts ((matrix, position, subcomponent))
+        removed, against the model: every other subcomponent and the leftover weights on (the omitted family's model
+        run)."""
+        import engine
+
+        nat = self.nat
+        cols = {n: torch.tensor(sorted({c for s_ in sets for m, _, c in s_ if m == n}), dtype=torch.long, device=nat.dev)
+                for n in nat.names}
+        at = {n: {c: i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
+        E = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on")
+        out = []
+        for s0 in range(0, len(sets), self.chunk):
+            part = sets[s0:s0 + self.chunk]
+            m = {n: torch.ones(len(part), tx.T, len(cols[n]), device=nat.dev) for n in nat.names}
+            for b, nodes in enumerate(part):
+                for n, t, c in nodes:
+                    m[n][b, t, at[n][c]] = 0.0
+            lp = E.log_probs(m)
+            out += carry.kl(lp, tx.ref.expand_as(lp)).tolist()
+            native.free(nat.dev)
+        return out
+
+    def own_rule(self, tx: Text, g: native.Graph, positions=None, floor: float = FLOOR_TOP) -> dict:
+        """The lead's 10-13 rule for a circuit's context positions, its own run against VPD's own answer run alone (C's
+        semantics, own routing; holding q/k at x borrows the model's routing, which is no explanation): per position
+        (the circuit's outside the targets, or positions) {"own": own_effects of its parts in the circuit, "vpd_own":
+        own_effects of VPD's actives there in VPD's whole answer, "real": its parts removed from the real model
+        (removal_kl), "vpd_real": VPD's actives there removed from it, "vpd_depends": VPD's own answer reproduces at
+        least 1 - floor of the model's dependence there and more than the runs' KL resolution (vpd_own >= (1 - floor)
+        vpd_real and vpd_own > kl_resolution: a tiny real effect is no dependence), "works": own >= floor vpd_own where
+        VPD depends on the position, else own >= (1 - floor) real and own > kl_resolution, "drop": neither VPD's answer
+        nor the circuit's own run depends on it}. On 60 v2.3 teachers 125 of 142 positions inert in the circuit's own run were inert in
+        VPD's whole answer too (the model's dependence runs through parts VPD marks inactive): a search over VPD's parts
+        cannot express it. A diagnostic (the lead's 10-13 ruling): the own run zeroes everything outside the circuit,
+        and a sparse circuit's attention then spreads over the positions it leaves empty, so the path-patched families
+        decide which positions a circuit keeps."""
+        nodes = sorted(g.node_set())
+        pos = sorted({t for _, t, _ in nodes} - set(tx.targets)) if positions is None else sorted(positions)
+        if not pos:
+            return {}
+        own = self.own_effects(tx, g, pos)
+        cache = tx.__dict__.setdefault("_vpd_positions", {})
+        new = [q for q in pos if q not in cache]
+        if new:
+            act = [(n, t, c) for n in self.nat.names for t, c in tx.vpd[n].nonzero().tolist()]
+            vo = self.own_effects(tx, native.Graph(act, complete=True), new)
+            vr = self.removal_kl(tx, [[nd for nd in act if nd[1] == q] for q in new])
+            cache.update({q: (vo[q], r) for q, r in zip(new, vr)})
+        real = self.removal_kl(tx, [[nd for nd in nodes if nd[1] == q] for q in pos])
+        res = self.kl_resolution(tx)
+        out = {}
+        for q, r in zip(pos, real):
+            vo, vr = cache[q]
+            dep = vo >= (1.0 - floor) * vr and vo > res
+            works = own[q] >= floor * vo if dep else (own[q] >= (1.0 - floor) * r and own[q] > res)
+            out[q] = {"own": own[q], "vpd_own": vo, "real": r, "vpd_real": vr, "vpd_depends": dep, "works": works,
+                      "drop": not dep and not works}
+        return out
+
+    def _start_pool(self):
+        if getattr(self, "start_pool", None) is None:
+            self.start_pool = torch.load(START_POOL)
+        return self.start_pool
+
+    def start_set(self, tx: Text, split: str | None = None, floor: float = FLOOR_TOP, draws: int = CHANGED_DRAWS,
+                  pool: dict | None = None) -> dict:
+        """The START (the lead's 10-13 design), one set per text for every split, chosen on the search draws (primerl:
+        a START listed from the search draws beside an eval bar from the eval draws had been two sets): VPD's actives at
+        the targets and at the fewest of start_candidates (F2's and the resampling ranking interleaved, at most
+        START_CAP) whose reward-mode row on the search split meets the reward's floors (vpd_floors; shortfall 0): the
+        path-patched families (input scope, track_pp, interchange_pp) decide which positions it needs. The old rule,
+        the fewest F2 positions reaching s_track_pp 0.9, passed at m = 0 on 40% of the v2.3 teachers: the targets' nodes
+        patched from a changed run take up every change upstream of them. Prefixes m = 0, 1, 2, 4, 8, 16 are tried, the
+        first passing one bisected down to its smallest passing neighbour; every candidate when none passes. "effects":
+        own_rule's numbers per context position of the chosen set (own run, VPD's own answer, the real model), a
+        diagnostic. split is ignored; pool, the flip adversary's (START_POOL's, the shared one, when not given: every
+        caller's is that file). "cap_bound": the START holds every candidate, the own-run families' reference set, so
+        it meets their floors by construction (an evaluation counts these texts). Kept on tx. {graph, m, positions,
+        candidates, cap_bound, effects, shortfall, met, s_track_pp, scores}."""
+        kept = tx.__dict__.setdefault("_start", {})
+        if floor in kept:
+            return kept[floor]
+        nat = self.nat
+        act = [(n, t, c) for n in nat.names for t, c in tx.vpd[n].nonzero().tolist()]
+        cands = self.start_candidates(tx, "search")[:START_CAP]
+        tried = {}
+        pool = self._start_pool() if pool is None else pool
+        fl = self.vpd_floors(tx, pool, "search", floor)
+
+        def judged(ps: set) -> tuple:
+            g = native.Graph(sorted(nd for nd in act if nd[1] in ps), complete=True)
+            row = self.fidelity(tx, [g], pool, mode="reward", split="search")[0]
+            return g, row, fl["families"], shortfall(row, fl["floors"])
+
+        def attempt(m: int) -> dict:
+            if m not in tried:
+                ps = set(tx.targets) | set(cands[:m])
+                g, row, fams, v = judged(ps)
+                tried[m] = {"graph": g, "m": m, "positions": sorted(ps), "shortfall": v, "met": v == 0,
+                            "s_track_pp": row.get("s_track_pp"), "scores": {f: family_score(row, f) for f in fams}}
+            return tried[m]
+
+        steps = sorted({0, len(cands)} | {2 ** i for i in range(len(cands).bit_length()) if 2 ** i < len(cands)})
+        hit = next((m for m in steps if attempt(m)["met"]), None)
+        if hit is None:
+            best = attempt(len(cands))
+        else:
+            lo = max([m for m in steps if m < hit], default=-1)
+            while hit - lo > 1:
+                mid = (lo + hit) // 2
+                lo, hit = (lo, mid) if attempt(mid)["met"] else (mid, hit)
+            best = attempt(hit)
+        kept[floor] = {**best, "candidates": cands, "cap_bound": best["m"] == len(cands),  # (own-run floors met by construction)
+                       "effects": self.own_rule(tx, best["graph"], floor=floor)}  # (a diagnostic)
+        return kept[floor]
+
+    def vpd_floors(self, tx: Text, pool: dict | None, split: str = "search", floor: float = FLOOR_TOP) -> dict:
+        """The reward's floors on a text (the lead's 10-13 design: absolute, from VPD, never from the answer or a
+        start): reward-mode rows on split of VPD's whole answer, of VPD's actives at the targets and the START's
+        candidate positions (start_candidates, at most START_CAP: fixed per text, so no answer lowers its own bar by
+        leaving positions out) and of the empty circuit; the text's families (those VPD's whole answer scores: every
+        answer's phi on the text is over them, an unscored one at 0) and floors: floor of the candidates' reference on
+        the families run with the circuit's outside zeroed or at a far donor's streams (OWN_RUN_FAMILIES: a sparse
+        circuit's attention then spreads over the positions it leaves empty, which only VPD's whole answer avoids: on
+        60 texts 45 STARTs stayed under 0.9 of it on point, and with point referenced to the candidates 22 of the 30
+        failing STARTs bound on patching_far), of the whole answer on the rest (input scope, track_pp,
+        interchange_pp, N, omitted). Every family's score itself stays against VPD's whole answer (the claim quotes
+        those); the floors alone read the restricted reference. Kept on tx per split and floor (the pool: the shared
+        adversary's, one file for every caller)."""
+        kept = tx.__dict__.setdefault("_vpd_floors", {})
+        if (split, floor) not in kept:
+            act = sorted((n, t, c) for n in self.nat.names for t, c in tx.vpd[n].nonzero().tolist())
+            ps = set(tx.targets) | set(self.start_candidates(tx)[:START_CAP])
+            vrow, crow, er = self.fidelity(tx, [native.Graph(act, complete=True),
+                                                native.Graph([nd for nd in act if nd[1] in ps], complete=True), native.Graph()],
+                                           pool, mode="reward", split=split)
+            fams = [f for f in PHI_FAMILIES if family_score(vrow, f) is not None]
+            fl = {**floors(vrow, fams), **floors(crow, [f for f in fams if f in OWN_RUN_FAMILIES])}
+            if floor != FLOOR_TOP:
+                fl = {f: v * floor / FLOOR_TOP for f, v in fl.items()}
+            kept[(split, floor)] = {"vpd": vrow, "candidates": crow, "empty": er, "families": fams, "floors": fl}
         return kept[(split, floor)]
 
     def tau(self, tx: Text, pool: dict | None, split: str = "search") -> dict:
-        """The reward's per-text bar and start bits (the lead's 10-12, constrained form: faithful first, then small),
-        kept on tx: the influential start set's (start_set) reward-mode row on split, families (those it scores: every
-        answer's phi on the text is over them, an unscored one at 0), phi_start, phi_empty (the empty circuit's) and
-        phi_tau (max(min(the start's phi, every family at 0.9), every family at 0.5, phi_empty + 1), the Gate B
-        floor), c_start and c_rl_start (and tau = min(0.9, c_rl_start), the
-        earlier form), bits_start (its raw description bits, size_bits), and the start's m, nodes and positions."""
+        """The reward's per-text bar, floors and start bits (the lead's 10-13 design: faithful first, then small; every
+        threshold from VPD and the empty circuit, none from a start), kept on tx: vpd_floors' families and floors,
+        phi_tau = max(phi at every family's floor under its reference's eps, phi_empty + 1: the bar sits at least a bit
+        above the empty circuit's phi), phi_vpd (VPD's own phi), and of the START (start_set, one set for every split)
+        its reward-mode row's phi_start, c_start, c_rl_start (tau = min(0.9, c_rl_start), the earlier form), bits_start
+        (its raw description bits, size_bits: compactness's reference), m, nodes, positions and whether it met the
+        floors."""
         kept = tx.__dict__.setdefault("_tau", {})
         if split in kept:
             return kept[split]
-        st = self.start_set(tx, split)
-        row, er = self.fidelity(tx, [st["graph"], native.Graph()], pool, mode="reward", split=split)
+        st = self.start_set(tx, pool=pool)
+        vf = self.vpd_floors(tx, pool, split)
+        row = self.fidelity(tx, [st["graph"]], pool, mode="reward", split=split)[0]
         nat = self.nat
-        fams = [f for f in PHI_FAMILIES if family_score(row, f) is not None]  # the text's families
-        ph, pt = phi(row, start=row, families=fams)  # phi_tau: a constant of the text, from the start's own eps
-        pe = phi(er, families=fams)[0]  # the empty circuit's phi: the bar sits at least a bit above it
+        fams, fl, er = vf["families"], vf["floors"], vf["empty"]
+        ph = phi(row, families=fams)[0]
+        ve = {**_eps(vf["vpd"]), **{f: v for f, v in _eps(vf["candidates"]).items() if f in OWN_RUN_FAMILIES}}
+        pt = _phi([(fl[f], ve[f]) for f in fams])  # phi_tau: a constant of the text, from VPD's answer's eps
+        pe = phi(er, families=fams)[0]
         if pt is not None and pe is not None:
             pt = max(pt, pe + 1.0)
-        se = _eps(row)
-        kept[split] = {"phi_start": ph, "phi_tau": pt, "phi_empty": pe, "families": fams, "floors": floors(row, fams),
-                       "phi_09": _phi([(0.9, se[f]) for f in fams]), "phi_05": _phi([(0.5, se[f]) for f in fams]),
+        kept[split] = {"phi_start": ph, "phi_tau": pt, "phi_empty": pe, "families": fams, "floors": fl,
+                       "phi_vpd": phi(vf["vpd"], families=fams)[0], "vpd_scores": {f: family_score(vf["vpd"], f) for f in fams},
+                       "vpd_candidates_scores": {f: family_score(vf["candidates"], f) for f in fams if f in OWN_RUN_FAMILIES},
+                       "phi_09": _phi([(0.9, ve[f]) for f in fams]), "phi_05": _phi([(0.5, ve[f]) for f in fams]),
                        "c_start": row["c"], "c_rl_start": row["c_rl"],
                        "tau": min(0.9, row["c_rl"]) if row["c_rl"] is not None else None,
                        "bits_start": size_bits(st["graph"], nat.positions(tx.targets), sum(nat.C.values()), tx.targets, active=tx.vpd),
-                       "m_start": st["m"], "nodes_start": st["graph"].count(), "positions_start": len(st["positions"])}
+                       "m_start": st["m"], "nodes_start": st["graph"].count(), "positions_start": len(st["positions"]),
+                       "start_met": st.get("met"), "start_cap_bound": st.get("cap_bound")}
         return kept[split]
 
     def far_pool(self, split: str) -> list:
-        """The far donors' texts of a split, [(name, token ids)] (DONOR_POOLS) in the model's vocabulary, loaded once."""
-        if split not in self.donor_pools:
+        """The far donors' texts of a split, [(name, token ids)], loaded once: DONOR_POOLS' vpd4l texts, refused for a
+        model with another vocabulary (the lead's 10-13: vpd4l's token ids mean nothing to a GPT-2-tokenized target such
+        as MIB's InterpBench model, so its START, input-scope family, patching and N would read foreign tokens; such a
+        model's caller sets donor_pools[split] to texts tokenized for it, ib_teacher.py MIB's dev prompts). A pool set
+        that way must lie in the model's vocabulary."""
+        V = self.nat.target.n_tokens
+        if split in self.donor_pools:
+            bad = next((name for name, x in self.donor_pools[split] if len(x) and max(x) >= V), None)
+            if bad is not None:
+                raise ValueError(f"far donor {bad} of the {split} split holds token ids outside this model's {V}-id vocabulary")
+        else:
+            if V != DONOR_VOCAB:
+                raise ValueError(f"the far donors (DONOR_POOLS) are vpd4l's texts in its {DONOR_VOCAB}-id vocabulary and this "
+                                 f"model has {V} ids: set donor_pools['{split}'] to texts tokenized for this model")
             which, rows, strict = DONOR_POOLS[split]
             have = {int(re.sub(r"\D", "", p.stem)): p for p in native.tasks(which)}  # the partition's files here, by number
             missing = [n for n in rows if n not in have]
             if strict and missing:
                 raise FileNotFoundError(f"the {split} split's far donors are text{rows.start}-text{rows.stop - 1}; {len(missing)} of "
                                         f"them are not in {native.TEXTS / 'vpd4l'} (text{missing[0]} first): its rewards need every one")
-            V = self.nat.target.n_tokens  # a text in another vocabulary (a tiny test model's) is no donor
-            self.donor_pools[split] = [(have[n].stem, x) for n in rows if n in have for x in [native.text(have[n])[0]] if max(x) < V]
+            self.donor_pools[split] = [(have[n].stem, x) for n in rows if n in have for x in [native.text(have[n])[0]]]
         return self.donor_pools[split]
 
     def pool_id(self, split: str) -> str:

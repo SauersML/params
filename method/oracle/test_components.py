@@ -1242,7 +1242,7 @@ def test_start_relative_reward_is_the_full_circuits(tiny):
     g, _ = goal_eval.circuit(components.parse_start("REMOVE:", start)["answer"], p["target_positions"], nat.C, len(p["token_ids"]))
     assert g.complete and g.node_set() == ge.start_set(tx, "search")["graph"].node_set()  # exactly the start's circuit
     tau = ge.tau(tx, {}, "search")  # (its row from another batch than the bar's: float32 rounding apart)
-    assert empty["phi"] == pytest.approx(tau["phi_start"], abs=1e-4) and empty["bits"] == pytest.approx(tau["bits_start"])
+    assert empty["phi"] == pytest.approx(tau["phi_start"], abs=5e-4) and empty["bits"] == pytest.approx(tau["bits_start"])
 
 
 def test_thinking_trace_names_a_small_removal_by_its_start_id():
@@ -1290,8 +1290,8 @@ def test_start_relative_stated_circuits_round_trip(tiny):
     plain = {**ev, "qa": [], "edits": [], "circuit_only": True}
     rel = components.reward(ge, task, {**plain, "start": start}, [text], pool={})[0]
     full = components.reward(ge, task, plain, [components.render(ans)], pool={})[0]
-    for k in ("reward", "phi", "bits", "compact", "g"):
-        assert rel[k] == pytest.approx(full[k], abs=1e-6), k
+    for k in ("reward", "phi", "bits", "compact", "g"):  # (float32: 1.5e-6 apart once the input-scope family's draws ran)
+        assert rel[k] == pytest.approx(full[k], abs=1e-5), k
     with_remove = components.parse_start(components.start_answer(start, [x for x in ans["nodes"] if x[0] != "tok"]) + "\n" + text, start)
     g3, _ = goal_eval.circuit(with_remove["answer"], targets, nat.C, T)
     assert set(g3.node_set()) == set(g.node_set()) and goal_eval._pairs(g3) == goal_eval._pairs(g)  # REMOVE: and CONNECT: alike

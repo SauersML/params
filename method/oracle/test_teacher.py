@@ -588,9 +588,9 @@ def test_ranked_draws_each_hold_their_floor():
     prompts = [(3, 12)] + prompts[1:]
     assert acc.ranked([rec((3, 12), 0.76)] + recs[1:], prompts, range(10))[1] == []   # floor_of(0.8) = 0.75
     assert acc.ranked([rec((3, 12), 0.74)] + recs[1:], prompts, range(10))[1] == [[3, 12, pytest.approx(0.74), pytest.approx(0.75)]]
-    # floors: the reward's per-family floors (goal_eval.floors), 0.05 below the start's value, in [0, 0.9]
+    # the changed-input acceptance's floors: 0.05 below the start's value, in [0, 0.9] (the reward's are VPD's)
     assert teacher.floor_of(0.5) == pytest.approx(0.45) and teacher.floor_of(2.0) == 0.9 and teacher.floor_of(0.02) == 0.0
-    assert teacher.floor_of(0.8) == goal_eval.floors({"s_point_c": 0.8}, ["point"])["point"]
+    assert goal_eval.floors({"s_point_c": 0.8}, ["point"])["point"] == pytest.approx(0.72)
 
 
 def test_validated_keeps_each_passing_removal_by_default():
@@ -673,15 +673,23 @@ def test_set_search_writes_the_highest_scoring_stage():
         goal_eval.circuit_term = term
     tau = ge.tau(tx, None, "search")
     # every stage scored by goal_eval.circuit_term against the text's tau with its own bits, the written one the highest
-    assert [x[0] for x in rec["phi"]] == ["chunk4", "site", "start"] and len(calls) == 3
-    for (name, ph, bar, n, fam, bits, score, v), (t, b, ct) in zip(rec["phi"], calls):
+    assert [x[0] for x in rec["phi"]] == ["chunk4", "site", "start"] and len(calls) == 4  # the stages, the written
+    for (name, ph, bar, n, fam, bits, score, v), (t, b, ct) in zip(rec["phi"], calls[:3]):
         assert t is tau and b == bits and score == ct["term"] and v == ct["v"] and bar == tau["phi_tau"]
     # written: the highest among the stages with no family under its floor on their full row (v = 0), else the start;
     # every stage's node set kept for re-picks
     ok = [x for x in rec["phi"] if x[7] == 0]
     best = max(ok, key=lambda x: x[6]) if ok else next(x for x in rec["phi"] if x[0] == "start")
-    assert rec["phi_stage"] == best[0] and rec["score"] == best[6] and g.count() == best[3]
-    assert {k: len(v) for k, v in rec["stage_nodes"].items()} == {x[0]: x[3] for x in rec["phi"]}
+    assert rec["phi_stage"] == best[0] and {k: len(v) for k, v in rec["stage_nodes"].items()} == {x[0]: x[3] for x in rec["phi"]}
+    # then own_rule's numbers per context position (a diagnostic): the written circuit's, and the START's positions
+    # pruned away; the final verdict is the written circuit's
+    held = {t for _, t, _ in g.node_set()}
+    assert g.count() == rec["final"]["units"] and rec["score"] == best[6] and g.count() == best[3]
+    assert not held & set(rec["own_dropped"]) and all(rec["positions_own"][str(q)].get("dropped") for q in rec["own_dropped"])
+    assert calls[-1][2]["v"] == rec["final"]["v"] and rec["final"]["fails_floors"] == (rec["final"]["v"] > 0)
+    assert rec["final"]["floors"] == tau["floors"] and rec["final"]["vpd_scores"] == tau["vpd_scores"]
+    assert rec["start"]["cap_bound"] == (rec["m"] == len(rec["start"]["candidates"]))
+    assert set(rec["positions_own"]) == {str(t) for t in held - set(tx.targets)} | {str(q) for q in rec["own_dropped"]}
 
 
 @pytest.mark.skipif(DEVICE == "cpu", reason="needs a GPU")

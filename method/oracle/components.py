@@ -1986,6 +1986,9 @@ def reward(ge, task: dict, ev: dict, texts: list[str], *, reader=None, e1: list 
                     "kl": goal_eval.family_kls(c),  # raw KLs in bits beside the scores (the external audit)
                     "executable_bits": executable_bits,
                     "bits_start": tau.get("bits_start"), "compact": comp, "D": D, "Q": Q, "teacher": ref,
+                    "floors": tau.get("floors"), "vpd_scores": tau.get("vpd_scores"),  # the scores are against VPD's whole
+                    "vpd_candidates_scores": tau.get("vpd_candidates_scores"),       # answer; the own-run floors against
+                    "start_cap_bound": tau.get("start_cap_bound"),                   # VPD at the START's candidates
                     "e2g": {k: v for k, v in (e2g.get(i) or {}).items() if k != "E2g"} or None}
             if retain_calibration:
                 info["calibration_evidence"] = calibration_evidence(c, split)

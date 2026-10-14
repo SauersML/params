@@ -63,6 +63,8 @@ def test_full_and_reward_fidelity_use_the_same_raw_phi_families():
 
     nat = tiny_native()
     ge = goal_eval.GoalEval(nat)
+    for split in ("search", "eval"):  # far donors in the tiny vocabulary (far_pool refuses vpd4l's texts for it)
+        ge.donor_pools[split] = [(f"{split}{i}", [(3 * i + j) % 40 for j in range(10)]) for i in range(5)]
     tx = ge.text([2, 5, 3, 7, 4, 6, 8, 9], [7])
     g = native.Graph(masks=tx.vpd)
     opts = dict(pool={}, draws=4, interchange=4, changed=4, near_donors=0, far_donors=0,
@@ -98,22 +100,23 @@ def test_pooled_ratio():
 
 
 def test_floors_and_circuit_term():
-    """Per-family floors from the start (min(0.9, s - 0.05), at least 0; 0 where the start scores nothing), v the worst
+    """Per-family floors from VPD's own answer (0.9 of its score, in [0, 0.9]; 0 where it scores nothing), v the worst
     shortfall below them (an unscored family at 0; faithful's), v_soft the reward's power mean of softplus shortfalls,
     and circuit_term = cap_phi(phi) - phi_tau - 4 v_soft + g 2^(-20 v_soft) (0.5 compact + quality) + 0.04 tanh(compact / 2)."""
     import math
-    start = {"s_point_c": 0.95, "s_nodes": 0.5, "s_track_pp": None, "n_spec": 0.02,
-             **{f"eps_{f}": goal_eval.EPS_FLOOR for f in goal_eval.PHI_FAMILIES}}
+    vpd = {"s_point_c": 1.0, "s_nodes": 0.5, "s_track_pp": None, "n_spec": 0.02,
+           **{f"eps_{f}": goal_eval.EPS_FLOOR for f in goal_eval.PHI_FAMILIES}}
     fams = ["point", "nodes", "track_pp", "N"]
-    fl = goal_eval.floors(start, fams)
-    want = {"point": 0.9, "nodes": 0.45, "track_pp": 0.0, "N": 0.0}
+    fl = goal_eval.floors(vpd, fams)
+    want = {"point": 0.9, "nodes": 0.45, "track_pp": 0.0, "N": 0.018}
     assert set(fl) == set(want) and all(abs(fl[k] - want[k]) < 1e-12 for k in want)
-    row = dict(start, s_point_c=0.85, s_nodes=0.5)
+    assert goal_eval.floors({"s_point_c": 1.3, "s_nodes": -0.2}, ["point", "nodes"]) == {"point": 0.9, "nodes": 0.0}
+    row = dict(vpd, s_point_c=0.85, s_nodes=0.5)
     assert abs(goal_eval.shortfall(row, fl) - 0.05) < 1e-12
     assert goal_eval.shortfall(dict(row, s_nodes=None), fl) == 0.45  # an unscored family at 0
     w = goal_eval.SHORTFALL_WIDTH
     sp = lambda x: w * math.log1p(math.exp(x / w))  # noqa: E731
-    vs = (sum(sp(f - s) ** 4 for f, s in ((0.9, 0.85), (0.45, 0.5), (0.0, 0.0), (0.0, 0.02))) / 4) ** 0.25
+    vs = (sum(sp(f - s) ** 4 for f, s in ((0.9, 0.85), (0.45, 0.5), (0.0, 0.0), (0.018, 0.02))) / 4) ** 0.25
     assert goal_eval.shortfall_soft(row, fl) == pytest.approx(vs)
     tau = {"families": fams, "phi_tau": 1.0, "floors": fl, "bits_start": 400.0}
     ct = goal_eval.circuit_term(row, tau, 100.0, quality=0.3)
@@ -129,19 +132,19 @@ def test_floors_and_circuit_term():
 
 def test_weighted_score_is_the_raw_pool():
     """A weighted family's score is its raw pool above 0 too (a draw farther than no change counts against it), and
-    the floors and both shortfalls read the same score: the start sits at its own floors with no shortfall."""
+    the floors and both shortfalls read the same score: VPD's own answer sits above its floors with no shortfall."""
     draws = [[0, 0.5, 0.2, 2.0], [1, 3.0, 0.4, 2.0]]  # the second draw farther than no change
     row = {"s_nodes": goal_eval._pooled("weighted", draws, None), "s_nodes_raw": goal_eval._pooled_raw(draws)}
     assert row["s_nodes_raw"] < row["s_nodes"] and goal_eval.family_score(row, "nodes") == pytest.approx(row["s_nodes_raw"])
     fl = goal_eval.floors(row, ["nodes"])
-    assert fl["nodes"] == pytest.approx(row["s_nodes_raw"] - goal_eval.FLOOR_MARGIN)
-    assert goal_eval.shortfall(row, fl) == 0.0 and goal_eval.shortfall_soft(row, fl) < 0.002
+    assert fl["nodes"] == pytest.approx(goal_eval.FLOOR_TOP * row["s_nodes_raw"])
+    assert goal_eval.shortfall(row, fl) == 0.0 and goal_eval.shortfall_soft(row, fl) < 0.01
 
 
 def test_the_start_scores_its_hard_term():
-    """The start set's soft circuit term equals its hard one at v = 0 within 0.01 (pymove's 2fdd1cf report: floors from
-    the floored estimators against a shortfall from the raw ones put the start near -0.5): its weighted family's raw
-    pool below its floored one, its floors and both shortfalls on the same score."""
+    """An answer at VPD's own scores has no shortfall and a soft one under 0.005 (pymove's 2fdd1cf report: floors
+    from the floored estimators against a shortfall from the raw ones put the start near -0.5): its weighted family's
+    raw pool below its floored one, its floors and both shortfalls on the same score."""
     eps = {f"eps_{f}": goal_eval.EPS_FLOOR for f in goal_eval.PHI_FAMILIES}
     start = {"s_point_c": 0.8, "s_edges": 0.75, "s_nodes": 0.57, "s_nodes_raw": 0.30, "s_track_pp": 0.85, "s_track_pp_raw": 0.7,
              "n_spec": 0.6, "rl_terms": {"s_point_c": 0.8, "s_edges": 0.75}, **eps}
@@ -149,7 +152,7 @@ def test_the_start_scores_its_hard_term():
     _, bar = goal_eval.phi(start, start=start, families=fams)
     tau = {"families": fams, "phi_tau": bar, "floors": goal_eval.floors(start, fams), "bits_start": 300.0}
     ct = goal_eval.circuit_term(start, tau, 300.0)
-    assert ct["v"] == 0.0 and abs(ct["term"]) < 0.01, ct
+    assert ct["v"] == 0.0 and ct["v_soft"] < 0.005, ct
 
 
 def test_semantics_default_is_the_rewards(monkeypatch):

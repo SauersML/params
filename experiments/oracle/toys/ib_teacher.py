@@ -6,7 +6,10 @@ adversary's pattern pool, built here from this target's own texts (goal_eval.bui
 Texts: MIB's IOI prompts (--mib SPLIT: interpbench.mib_ioi, BOS first), padded with EOS to --pad as the VPD fit's
 batches were (its causal-importance network reads every position) with the target at the last real token; else the
 case's random texts after the BOS the model is most confident under (bos_of). The teacher takes texts --offset,
---offset + --stride, ... of the first --n; the pool the --pool-texts after them.
+--offset + --stride, ... of the first --n; the pool the --pool-texts after them. The far donors (the START's candidate
+ranking, the input-scope family, patching and N; goal_eval's far_pool refuses vpd4l's texts for this model, another
+tokenizer's ids): --donors texts tokenized for this model, MIB's --donor-split prompts (train: never the test split the
+teacher runs on, nor dev, which the VPD fit read) or the case's random texts from another seed, padded as the texts are.
 
 Per text OUT/<case>_<k>.json (the circuit), .row.json (teach's summary row) and a line of OUT/rows_<offset>.jsonl (its
 components, MIB edge names). An unsharded MIB run ends with MIB's area under the ROC (interpbench.mib_auroc against
@@ -62,6 +65,8 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--pool-texts", type=int, default=16)
+    ap.add_argument("--donors", type=int, default=400, help="far donors tokenized for this model (goal_eval's search pool size)")
+    ap.add_argument("--donor-split", default="train", help="MIB split for the far donors (train: never the teacher's texts, nor dev, the VPD fit's)")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--max-tokens", type=int, default=8000)
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the explainer's tokenizer (the answer budget)")
@@ -81,6 +86,15 @@ def main():
     texts = [x + [EOS] * max(0, a.pad - len(x)) for x in texts]
     pool = goal_eval.build_patterns(texts[a.n:], None, nat, lengths[a.n:])
     ge = run_planted.ToyEval(nat, chunk=a.batch)  # (GoalEval, VPD's bound held above 0 for an exact decomposition)
+    if a.mib:
+        if a.donor_split == a.mib:
+            raise SystemExit("the far donors come from another MIB split than the teacher's texts")
+        donors = [r["ids"] for r in interpbench.mib_ioi(a.donor_split, a.donors, a.mib_dir)]
+    else:
+        donors = next(interpbench.batches(cfg, bos_of(nat, cfg, torch.Generator().manual_seed(1)))(a.donors, 1)).tolist()
+    donors = [x + [EOS] * max(0, a.pad - len(x)) for x in donors]
+    for split in ("search", "eval"):  # this model's own texts, never vpd4l's (far_pool)
+        ge.donor_pools[split] = [(f"{a.case.name}_{a.donor_split if a.mib else 'random'}{i}", x) for i, x in enumerate(donors)]
     goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = teacher.PACK_FLIP_ROWS, teacher.PACK_CHANGED_ROWS
     teacher.RANK = "once"
     tokens = None

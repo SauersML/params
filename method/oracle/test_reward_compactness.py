@@ -17,7 +17,8 @@ REAL = 'CIRCUIT:\n```mermaid\nflowchart LR\n subgraph P0["@0"]\n a["L0.down#0"]\
 def fake_eval(monkeypatch, teacher=False):
     C = {'h.0.mlp.down_proj': 2}
     tx = SimpleNamespace(vpd=None)
-    ge = SimpleNamespace(nat=SimpleNamespace(C=C, positions=lambda targets: 1), text=lambda *a, **k: tx)
+    ge = SimpleNamespace(nat=SimpleNamespace(C=C, positions=lambda targets: 1), text=lambda *a, **k: tx,
+                         pool_id=lambda split: f"{split}:0:test")  # (every reward row names its far-donor pool)
     ge.score = lambda tx, graphs, texts: [
         {'nodes': g.count(), 'E1': None, 'E2': None, 'f1_live': 0., 'n_live': 0., 'f3': 0.} for g in graphs]
     ge.fidelity = lambda tx, graphs, pool, **kw: [{'c': 0.} for g in graphs]

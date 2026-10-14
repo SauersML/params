@@ -43,6 +43,7 @@ import argparse
 import gc
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -65,6 +66,9 @@ VAL_MARGIN = 0.02  # validation: s_track_pp at least the fully wired circuit's l
 MAX_STEPS = 24  # accepted removals per process
 EXIT_RESUME = 3
 FULL_EVERY = 8  # accepted removals between full checks of the current circuit's every family (Floors.full)
+CANDIDATE_FLOORS = os.environ.get("LINES_FLOORS", "candidate") == "candidate"  # A/B 10-14: every candidate judged on
+# the floors (Floors.__call__), or ("periodic") on point, s_track_pp and validation alone with the full checks keeping
+# every saved state at its floors
 
 
 def key(col: tuple) -> str:
@@ -318,7 +322,7 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
 
     def by_floors(ons):
         return fl(pr.graph(pr.on), [pr.graph(on) for on in ons])
-    accept = teacher.both(changed, by_floors)
+    accept = teacher.both(changed, by_floors) if CANDIDATE_FLOORS else changed
     start_val = acc.validation(pr.graph(full))[0]
     floor_val = None if start_val is None else start_val - VAL_MARGIN
     log(f"{task_path.stem}: {len(pr.node_at)} parts, {len(pr.lines)} lines, {int(pr.on.sum())} on; point budget {budget:.4f} bits; "

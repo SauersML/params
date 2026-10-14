@@ -5,7 +5,8 @@
 # adversary's pattern pool; lines.py runs a fresh process per MAX_STEPS accepted removals and for the re-check. The
 # circuits and their measurements come back to ~/mpd-data/runpod/NAME/out (<task>.json, <task>.lines.json, and the
 # keyed checkpoints <task>.ckpt.json, from which a later run resumes when given RESUME=DIR of them).
-#   experiments/oracle/pods/lines_pod.sh TASKS TEACHERS [NAME] [HOURS]   env: P, VPD, RESUME, GPU, PRICE, VRAM, RP_OWNER
+#   experiments/oracle/pods/lines_pod.sh TASKS TEACHERS [NAME] [HOURS]   env: P, VPD, RESUME, LINES_FLOORS, GPU, PRICE, VRAM,
+#                                                                          RP_OWNER
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -28,7 +29,7 @@ RUNS=""
 for k in $(seq 0 $((P - 1))); do
   RUNS="$RUNS (python -B method/oracle/lines.py --teachers $I/teachers --out $O/out --tasks $I/tasks.txt --vpd $VPD --offset $k --stride $P > $O/lines_$k.log 2>&1; echo \"exit \$?\" >> $O/lines_$k.log) &"
 done
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out $I ~/mpd-data/graph_oracle/texts/vpd4l ~/mpd-data/graph_oracle/goal_eval; tar -xf $F/in.tar -C $I;
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True LINES_FLOORS=${LINES_FLOORS:-candidate}; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out $I ~/mpd-data/graph_oracle/texts/vpd4l ~/mpd-data/graph_oracle/goal_eval; tar -xf $F/in.tar -C $I;
 tar --no-same-owner -xf $I/texts.tar -C ~/mpd-data/graph_oracle/texts; cp $I/ci_patterns_train.pt ~/mpd-data/graph_oracle/goal_eval/; cp $I/resume/*.json $O/out/ 2> /dev/null || true;
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors $VPD /Users/user/params/method/oracle /Users/user/params/method/vpd > /dev/null;
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;

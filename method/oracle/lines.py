@@ -366,9 +366,9 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
         level = LEVELS[li]
         cap = state.get("cap") if state.get("cap_level") == li else None
         while True:  # the level again after a validation or full-check failure: the failing removal's line frozen
-            journal, failed, kept = [], [], []  # when it was one, else, when the run kept no removal before it, the
-            v = teacher.Validated(pr, pr.graph, acc, floor_val, journal)  # next run's prefixes capped below half
-            last = [pr.on.clone()]  # its size (a run that kept one runs uncapped: its state differs)
+            journal, failed, kept = [], [], []  # when it was one, else the next run's prefixes capped below half its
+            v = teacher.Validated(pr, pr.graph, acc, floor_val, journal)  # size (after a validation failure only when
+            last = [pr.on.clone()]  # the run kept no removal before it: a run that kept one starts from another state)
 
             def capped(ons, cap=cap):
                 if cap is None:
@@ -386,7 +386,7 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                 stop = v()
                 if stop:
                     gone = pr.on & ~now
-                    failed.append(int(gone.sum()))
+                    failed.append(("validation", int(gone.sum())))
                     if int(gone.sum()) <= 1:
                         pr.fixed |= gone
                 else:
@@ -394,7 +394,7 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                     if len(pending) >= FULL_EVERY or steps[0] + 1 >= MAX_STEPS:
                         k = verify()
                         if k is not None:
-                            failed.append(k)
+                            failed.append(("full", k))
                             stop = True
                     if not stop:
                         kept.append(1)
@@ -416,11 +416,12 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
             if not failed and pending:  # the level's end: its last removals checked in full
                 k = verify()
                 if k is not None:
-                    failed.append(k)
+                    failed.append(("full", k))
                 save(li)
             if not failed:
                 break
-            cap = failed[-1] // 2 if failed[-1] > 1 and not kept else None
+            kind, k = failed[-1]  # a full check's culprit is the state's own removal: capped whatever the run kept
+            cap = k // 2 if k > 1 and (kind == "full" or not kept) else None
             state.update(cap=cap, cap_level=li)
             save(li)
         state.update(level=li + 1, cap=None, cap_level=None)

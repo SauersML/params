@@ -886,6 +886,8 @@ def mib_rows(d: Path, names) -> dict:
             dv = r.get("diff_vs_eap_ig_inputs") or {}
             out[n] = {"AUROC": f"{r['auroc']:.3f} [{r['ci95'][0]:.2f},{r['ci95'][1]:.2f}]",
                       "vs EAP-IG-in": f"{dv['diff']:+.3f} [{dv['ci95'][0]:+.2f},{dv['ci95'][1]:+.2f}]" if dv else "-"}
+        else:
+            out[n] = {"AUROC": "not run", "vs EAP-IG-in": "not run"}
     return out
 
 

@@ -107,4 +107,5 @@ def test_share_distance_and_mib(tmp_path):
     assert sc.share_distance(None) is None
     (tmp_path / "fast.json").write_text('{"auroc": 0.8, "ci95": [0.7, 0.9], "diff_vs_eap_ig_inputs": {"diff": 0.02, "ci95": [-0.05, 0.1]}}')
     got = sc.mib_rows(tmp_path, ["fast", "teacher"])
-    assert got == {"fast": {"AUROC": "0.800 [0.70,0.90]", "vs EAP-IG-in": "+0.020 [-0.05,+0.10]"}}
+    assert got == {"fast": {"AUROC": "0.800 [0.70,0.90]", "vs EAP-IG-in": "+0.020 [-0.05,+0.10]"},
+                   "teacher": {"AUROC": "not run", "vs EAP-IG-in": "not run"}}

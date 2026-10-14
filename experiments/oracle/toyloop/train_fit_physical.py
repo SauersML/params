@@ -77,7 +77,10 @@ def run(args):
                     old=archived[case['reference_key_prefix']+str(edit_index*len(case['inputs'])+input_index)]
                     delta=float((p-old).abs().max());drift=raw_kl_bits(old,p);same_top=int(old.argmax())==int(p.argmax())
                     comparisons.append(dict(maxabs_logp=delta,raw_kl_bits=drift,top_equal=same_top))
-                    if delta>1e-5 or abs(drift)>1e-6 or not same_top:raise RuntimeError('archived reference portability guard failed')
+                    if delta>1e-5 or abs(drift)>1e-6 or not same_top:
+                        save_file({'p':p.contiguous(),'archived_p':old.contiguous()},str(args.out/'reference_failure.safetensors'))
+                        write(args.out/'reference_failure.json',dict(case=case['id'],edit_index=edit_index,input=input_index,**comparisons[-1]))
+                        raise RuntimeError('archived reference portability guard failed')
                     clear_intervention_caches(nat);f=goal_eval.GoalEval(nat).graph_ref(ids,target,full[input_index],live=True,norms={});forwards+=1
                     integrity=raw_kl_bits(p,f)
                     if integrity>.001:raise RuntimeError('full architecture integrity failed')
@@ -90,7 +93,10 @@ def run(args):
                         if q is not None:tensors[arm]=q.contiguous()
                         world.append(dict(case=case['id'],arm=arm,edit_index=edit_index,input=input_index,operations=operations,valid=q is not None,invalid_reason=invalid[arm][input_index],kl_bits=None if error is None else max(0.,error),raw_kl_bits=error,top=None if q is None else int(q.argmax()),reference_top=int(p.argmax()),integrity_raw_kl_bits=integrity))
                     filename=f'{case["id"]}_{edit_index}_{input_index}.safetensors';save_file(tensors,str(args.out/filename))
-                    for row in world:row.update(file=filename,sha256=sha(args.out/filename));allrows.append(row)
+                    with (args.out/'results.jsonl').open('a') as stream:
+                        for row in world:
+                            row.update(file=filename,sha256=sha(args.out/filename));allrows.append(row)
+                            stream.write(json.dumps(row)+'\n')
             clear_intervention_caches(nat)
             if state()!=original:raise RuntimeError('literal edits failed exact restoration')
         write(args.out/(case['id']+'.restored.json'),state());write(args.out/(case['id']+'.reference_comparison.json'),comparisons)

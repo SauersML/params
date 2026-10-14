@@ -36,6 +36,7 @@ and writes OUT/<task>.json (goal_eval.to_json's stated form) and OUT/<task>.line
 line's and each part's removal effect: the point KL rise in bits and the eval s_track_pp fall).
 
   lines.py --teachers DIR --out OUT [--tasks FILE | --split heldout --n 20] [--vpd FILE] [--offset K --stride S]
+           [--levels L,...]                                   the levels run (the bulk: every one but line)
   lines.py one TEACHER.json TASK.json OUT [--vpd FILE]     one text, one process's share (exit 3: resume)
   lines.py score TASK.json CIRCUIT.json ... [--vpd FILE]   stated circuits' reward families against the floors, v
 """
@@ -296,7 +297,8 @@ def tidy(ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: LinePruner) -> None:
         torch.mps.empty_cache()
 
 
-def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: dict, B: int = 32, log=print) -> int:
+def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: dict, B: int = 32, log=print,
+        levels: tuple = LEVELS) -> int:
     """One process's share of one text (module docstring): 0 when the text is written, EXIT_RESUME to go on."""
     ge = goal_eval.GoalEval(native.Native(), chunk=B)
     goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = teacher.PACK_FLIP_ROWS, teacher.PACK_CHANGED_ROWS  # (batch sizes only)
@@ -381,6 +383,8 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
 
     for li in range(state["level"], len(LEVELS)):
         level = LEVELS[li]
+        if level not in levels:  # (the bulk: the coarse levels alone, the lead's 10-14 call)
+            continue
         cap = state.get("cap") if state.get("cap_level") == li else None
         while True:  # the level again after a validation or full-check failure: the failing removal's line frozen
             journal, failed, kept = [], [], []  # when it was one, else the next run's prefixes capped below half its
@@ -556,12 +560,15 @@ def main():
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--vpd", type=Path, help="VPD's answers and orders (teacher.py --save-vpd)")
     ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--levels", default=",".join(LEVELS), help="the levels run, comma-separated (default every one; the "
+                    "bulk's: reader_position,writer_position,reader,writer,sites)")
     a = ap.parse_args()
     if a.cmd == "one":
         t, k, o = map(Path, a.paths)
         o.mkdir(parents=True, exist_ok=True)
         vpd = torch.load(a.vpd) if a.vpd else None
-        sys.exit(one(t, k, o, vpd, torch.load(teacher.POOL), a.batch, log=lambda m: print(m, flush=True)))
+        sys.exit(one(t, k, o, vpd, torch.load(teacher.POOL), a.batch, log=lambda m: print(m, flush=True),
+                     levels=tuple(a.levels.split(","))))
     if a.cmd == "score":
         for r in score([Path(x) for x in a.paths[1:]], Path(a.paths[0]), torch.load(a.vpd) if a.vpd else None,
                        torch.load(teacher.POOL), a.batch):
@@ -574,7 +581,8 @@ def main():
         if not src.exists() or (a.out / f"{path.stem}.lines.json").exists():
             continue
         while True:  # a fresh process per MAX_STEPS removals, and for the re-check
-            rc = subprocess.run([sys.executable, "-B", __file__, "one", str(src), str(path), str(a.out), "--batch", str(a.batch)]
+            rc = subprocess.run([sys.executable, "-B", __file__, "one", str(src), str(path), str(a.out), "--batch", str(a.batch),
+                                 "--levels", a.levels]
                                 + (["--vpd", str(a.vpd)] if a.vpd else [])).returncode
             if rc != EXIT_RESUME:
                 break

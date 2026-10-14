@@ -32,6 +32,7 @@ import argparse
 import itertools
 import json
 import multiprocessing as mp
+import os
 import queue
 import sys
 import threading
@@ -45,7 +46,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-TEXTS_KEPT = 8  # goal_eval.Text objects a process keeps (a group's answers arrive in several requests)
+TEXTS_KEPT = int(os.environ.get("SCORER_TEXTS_KEPT", "8"))  # goal_eval.Text objects a process keeps (a group's answers
+# arrive in several requests), the oldest freed past it after each text's request, scored or failed. 0 frees each text
+# after its request: at f00abd2 an A40 process held 22 GB after one text and 39.5 GB after two, so two processes
+# keeping theirs ran a 48 GB card out of memory (RL run 3's dry run, 10-14)
 
 
 def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url: str | None, reader_base: str, edit_teach: list,
@@ -53,6 +57,7 @@ def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url
     import components
     import goal_eval
     import native
+    import torch
 
     ge = goal_eval.GoalEval(native.Native(device))
     src = Path(__file__).resolve().parents[3] / "SOURCE"  # the pod's "python source <rev>" (scorer_pod.sh)
@@ -94,8 +99,6 @@ def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url
                                         cache=cache, reader=None if given else reader, e1=given,
                                         tokens=[n for _, _, _, ns in reqs for n in ns], ee=ee, edit_best=edit_best, vs=vs,
                                         teacher=teachers.get(tid), lines=want_lines)
-                while len(cache) > TEXTS_KEPT:
-                    cache.popitem(last=False)
                 got = [{"reward": g["reward"], "valid": g["valid"], **who, **{k[5:]: g[k] for k in g if k.startswith("term_")},
                         **{k: g.get(k) for k in ("phi", "phi_tau", "g", "faithful", "bits", "compact", "D", "Q", "lines", "donor_pool")},
                         **{k: (g["row"] or {}).get(k) for k in ("nodes", "edges", "tok_edges")},
@@ -103,6 +106,11 @@ def work(device: str | None, rows_path: str, teacher_dir: str | None, reader_url
                 err = None
             except Exception as e:  # a bad request answers with its error; the process keeps serving
                 got, err = None, f"{type(e).__name__}: {e}"
+            if len(cache) > TEXTS_KEPT or err:
+                while len(cache) > TEXTS_KEPT:
+                    cache.popitem(last=False)
+                if torch.cuda.is_available():  # the freed texts' memory back to the device, for the card's other processes
+                    torch.cuda.empty_cache()
             at = 0
             for rid, xs, _, _ in reqs:
                 outbox.put((rid, got[at:at + len(xs)] if got is not None else None, err))

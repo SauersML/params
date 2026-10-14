@@ -8,7 +8,9 @@
 # rows (components.POOL). The scorer runs until the cap.
 #   experiments/oracle/pods/scorer_pod.sh ROWS.jsonl HOURS   (env: RUN, GPU, PRICE, VRAM, WORKERS, RP_OWNER, VARIABLES=1: E4,
 #                                                            SRCREV: the source revision, default origin/main,
-#                                                            TEACHER: the texts' teacher circuits (reward v3's dominance term))
+#                                                            TEACHER: the texts' teacher circuits (reward v3's dominance term),
+#                                                            TEXTS_KEPT: texts a scoring process keeps, serve_components' 8;
+#                                                            0 for RL, whose groups come one request each)
 # Two scoring processes need a 48 GB card (the default): on 24 GB a long text ran out of memory (RL v1, 10-12). The scorer
 # waits on the policy's sampling between bursts (12% mean GPU over 15 minutes in RL from S1, 10-13), so rp-run's idle stop
 # is set at 3% (RP_IDLE_PCT) instead of 20%.
@@ -30,7 +32,7 @@ if [ -n "${TEACHER:-}" ]; then mkdir -p "$IN/teacher" && find "$TEACHER" -maxdep
 # Exclude sealed text IDs before tar opens their contents (9100 through 9149).
 COPYFILE_DISABLE=1 tar --exclude='texts/vpd4l/text91[0-4][0-9].json' -cf "$IN.tar" -C "$IN" rows.jsonl $TEACH -C /Users/user/mpd-data/graph_oracle texts/vpd4l goal_eval/ci_patterns_train.pt && rm -rf "$IN"
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN.tar; a Mac path here would be uploaded file by file)
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 ${TEXTS_KEPT:+SCORER_TEXTS_KEPT=$TEXTS_KEPT}; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S $I ~/mpd-data/graph_oracle; tar -xf $IN.tar -C $I; mv $I/texts $I/goal_eval ~/mpd-data/graph_oracle/; tar -xf $S.tar -C $S; \
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; \
 python -c \"import torch; from safetensors.torch import load_file; d = {**load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part0.safetensors'), **load_file('/Users/user/mpd-data/vpd/s-55ea3f9b/split/model_400000_part1.safetensors')}; torch.save(d, '\$HOME/mpd-data/vpd/s-55ea3f9b/model_400000.pth')\"; \
 cd $S/method/oracle; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv,noheader -l 5 > $O/gpu.csv & \

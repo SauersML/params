@@ -2575,7 +2575,8 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_
     its stated edges (those into the prediction first, without their measured effects) and the questions' answers; the
     teacher's variables when given (variables.py's JSON from the teacher's grouping, meanings unwritten: the writer
     writes them, with the tokens at their inputs); and the circuit as the oracle writes it ("circuit", its lines, and
-    "answer", its JSON: for E1's reader, never shown to the writer)."""
+    "answer", its JSON: normally for E1's reader; opt-in provided-circuit writer mode receives the complete topology).
+    Source bindings identify inputs and topology, not verified execution or exact model assets."""
     import goal_eval
     import units
 
@@ -2588,8 +2589,19 @@ def teacher_facts(ge, task: dict, ev: dict, answer: dict, max_nodes: int = FACT_
     shown_facts = {tuple(nd): f for cs in ev["components"].values() for nd, _, f in cs}  # what the question tells about each
     pairs = [(w, None) for w in g.out] + [(w, r) for r, ws in g.parents.items() for w in ws]
     tok = lambda xs: token_strings(task["model"], xs)  # noqa: E731
-    return {"task": task["id"], "text": "".join(strings[:max(targets) + 1]), "target": max(targets),
-            "circuit": circuit_text(render(goal_eval.to_json(g, ""))),  # what E1's reader reads with the English
+    canonical = circuit_text(render(goal_eval.to_json(g, "")))
+    execution_text = "".join(strings[:max(targets) + 1])
+    supplied = {"schema": 1, "task": task["id"], "model_identifier": task["model"],
+                "target_positions": list(targets),
+                "circuit_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+                "answer_sha256": _fact_digest(goal_eval.to_json(g, "")),
+                "input_sha256": _fact_digest({"token_ids": ids, "target_positions": targets}),
+                "text_sha256": hashlib.sha256(execution_text.encode()).hexdigest(),
+                "semantics": getattr(ge, "semantics", None),
+                "execution_verified": False,
+                "model_content_binding": "identifier only; exact model weights and remainder convention not certified"}
+    return {"task": task["id"], "model": task["model"], "text": "".join(strings[:max(targets) + 1]), "target": max(targets),
+            "circuit": canonical, "provided_circuit_binding": supplied,
             "answer": goal_eval.to_json(g, ""),
             **({"variables": variables, "tokens": {str(q): strings[q] for v in variables for q in v["inputs"]}} if variables else {}),
             **({"invariant_supervision": invariant_supervision} if invariant_supervision is not None else {}),
@@ -2616,9 +2628,52 @@ WRITER_VARIABLES = ("Begin with one line per variable listed above, in that orde
 WRITER_VAR_RE = re.compile(r'\s*V(\d+)\s+"(.*?)"\s*:\s*(.+?)\s*')
 
 
-def writer_prompt(f: dict) -> str:
+def _fact_digest(value):
+    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',', ':'),allow_nan=False).encode()).hexdigest()
+
+
+def _provided_circuit_prompt(f: dict, source_task: dict | None = None) -> str:
+    """Validate source-bound supplied topology; no execution or model-content claim."""
+    circuit, binding = f.get("circuit"), f.get("provided_circuit_binding")
+    if not isinstance(circuit,str) or not circuit.strip() or not isinstance(binding,dict) or not isinstance(f.get("answer"),dict):
+        raise ValueError("provided-circuit mode requires canonical circuit, answer and source binding; regenerate facts")
+    import goal_eval
+    targets = binding.get("target_positions")
+    if (binding.get("schema") != 1 or binding.get("task") != f.get("task")
+            or binding.get("model_identifier") != f.get("model")
+            or not isinstance(targets,list) or not targets or any(type(t) is not int or t<0 for t in targets)
+            or max(targets) != f.get("target")
+            or binding.get("circuit_sha256") != hashlib.sha256(circuit.encode()).hexdigest()
+            or binding.get("answer_sha256") != _fact_digest(f["answer"])
+            or binding.get("text_sha256") != hashlib.sha256(f["text"].encode()).hexdigest()
+            or not isinstance(binding.get("input_sha256"),str) or not re.fullmatch('[0-9a-f]{64}',binding['input_sha256'])
+            or binding.get("semantics") not in goal_eval.SEMANTICS or binding.get("execution_verified") is not False):
+        raise ValueError("provided-circuit source binding mismatch")
+    if circuit_text(render(f['answer'])) != circuit:
+        raise ValueError("provided-circuit canonical answer/topology mismatch")
+    if source_task is not None:
+        prompt = source_task['prompts'][0]
+        if (source_task['id'] != f['task'] or source_task['model'] != f['model']
+                or prompt['target_positions'] != targets
+                or _fact_digest({'token_ids':prompt['token_ids'],'target_positions':prompt['target_positions']}) != binding['input_sha256']
+                or prompt['model_top'][0][:3] != f['top']):
+            raise ValueError("provided-circuit binding disagrees with actual source task")
+    return ("Interpret the EXACT PROVIDED CIRCUIT below; do not construct, replace, repair or output a CIRCUIT. "
+            "Write EXPLANATION only (with the requested variable meanings, if any). Typed intervention claims may be stated "
+            "only from explicitly graph-bound checked evidence; otherwise describe them as unverified hypotheses. "
+            "Node descriptions may be truncated; the provided topology below is complete. Measured token changes, QA and "
+            "variable evidence below concern the FULL MODEL unless explicitly marked as checked in this circuit. "
+            "A supplied graph, static weight facts or reader preference alone do not establish circuit fidelity or prose truth. "
+            "Input identity is the facts producer's assertion unless separately checked against the source task. "
+            "This binding does not certify exact model assets or a remainder convention.\n"
+            "PROVIDED CIRCUIT BINDING\n"+json.dumps(binding,sort_keys=True)+"\nEXACT PROVIDED CIRCUIT\n"+circuit+"\n\n")
+
+
+def writer_prompt(f: dict, *, provided_circuit: bool = False, source_task: dict | None = None) -> str:
     """The prompt that asks an open model for a teacher circuit's English, from teacher_facts(); with the teacher's
-    variables, their meanings first (WRITER_VARIABLES, written_variables())."""
+    variables, their meanings first (WRITER_VARIABLES, written_variables()). provided_circuit includes the entire
+    source-bound topology; source_task independently checks its input identity when supplied."""
+    supplied = _provided_circuit_prompt(f, source_task) if provided_circuit else ""
     lines = [f"Text: {f['text']!r}", f"Prediction at position {f['target']} (after {f['target_token']!r}): "
              + ", ".join(f"{t!r} {p:.2f}" for t, p in f["top"]),
              f"Circuit: {f['nodes_total']} subcomponents at positions {', '.join(map(str, f['positions']))}; the most important "
@@ -2649,8 +2704,8 @@ def writer_prompt(f: dict) -> str:
             lines.append(f"- V{k} (provisional name {v['name']!r}): inputs " + ", ".join(f"{q} ({f['tokens'][str(q)]!r})" for q in v["inputs"])
                          + f"; carried by {nodes}; feeds " + (", ".join(v["feeds"]) or "prediction")
                          + (f"; measured: {json.dumps(v['measured'])}" if v.get("measured") else ""))
-        return escape(WRITER.format(facts="\n".join(lines)) + "\n\n" + WRITER_VARIABLES)
-    return escape(WRITER.format(facts="\n".join(lines)))
+        return escape(supplied + WRITER.format(facts="\n".join(lines)) + "\n\n" + WRITER_VARIABLES)
+    return escape(supplied + WRITER.format(facts="\n".join(lines)))
 
 
 def written_variables(text: str, variables: list[dict]) -> tuple[list[dict], str] | None:

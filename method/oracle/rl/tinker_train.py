@@ -435,6 +435,14 @@ def explain(a) -> None:
     import components
 
     a.out.parent.mkdir(parents=True, exist_ok=True)
+    facts = [json.loads(x) for x in a.facts.read_text().splitlines() if x.strip()]
+    supplied_mode = getattr(a, "provided_circuit", False)
+    if supplied_mode:
+        # Fail missing/stale source bindings before ServiceClient or sampling.
+        for f in facts:
+            components.writer_prompt(f, provided_circuit=True)
+            source_task = json.loads((a.texts_dir / f"{f['task']}.json").read_text())
+            components.writer_prompt(f, provided_circuit=True, source_task=source_task)
     service = service_client()
     wr, _ = renderer_for(a.writer)
     writer = service.create_sampling_client(base_model=a.writer)
@@ -443,7 +451,6 @@ def explain(a) -> None:
     reader_a = tinker_reader(service, a.reader_a, ra, ta, Spend(a.out.parent, a.reader_a))
     reader_b = tinker_reader(service, a.reader_b, *renderer_for(a.reader_b), Spend(a.out.parent, a.reader_b)) if a.reader_b else None
     rows = {r["task"]: r for r in map(json.loads, a.rows.read_text().splitlines())}
-    facts = [json.loads(x) for x in a.facts.read_text().splitlines() if x.strip()]
     if any("circuit" not in f for f in facts):
         raise SystemExit(f"{a.facts}: facts without the teacher's circuit lines (rerun components.py facts): E1's reader reads them")
     circuit, answer_of = {f["task"]: f["circuit"] for f in facts}, {}
@@ -456,7 +463,7 @@ def explain(a) -> None:
     params = tinker.SamplingParams(max_tokens=a.max_tokens, temperature=1.0, stop=wr.get_stop_sequences())
     futs = []
     for f in facts:  # unseeded: a seed gives every one of a call's num_samples the same draws (16 samples, 1-7 distinct)
-        prompt = wr.build_generation_prompt([{"role": "user", "content": components.writer_prompt(f)}])
+        prompt = wr.build_generation_prompt([{"role": "user", "content": components.writer_prompt(f, provided_circuit=supplied_mode)}])
         futs.append((f, prompt, writer.sample(prompt=prompt, num_samples=a.n, sampling_params=params)))
     out = []
     for f, prompt, fut in futs:
@@ -935,6 +942,7 @@ def main():
     e.add_argument("--control", default=CONTROL_READER, help="a control reader's column ('' for none)")
     e.add_argument("--texts-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd4l")
     x = sub.add_parser("explain")
+    x.add_argument("--provided-circuit", action="store_true", help="interpret the exact source-bound supplied circuit; no graph generation")
     x.add_argument("facts", type=Path, help="components.py facts output")
     x.add_argument("rows", type=Path, help="the texts' question rows (reader events)")
     x.add_argument("out", type=Path)

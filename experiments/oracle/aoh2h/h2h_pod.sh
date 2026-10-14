@@ -22,7 +22,8 @@ CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; 
 tar -xf $S.tar -C $S; cd $S/experiments/oracle/aoh2h; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \
 ${AO_LIB:+python -I -u ao_equal.py $S/untrusted/ao_lib.py --out $O/ao_equal.json > $O/ao_equal.log 2>&1;} \
 $BUILD && python -u h2h.py run --items $O/items.jsonl --out $O/out.jsonl --systems ${SYSTEMS:-R A B} ${BUDGET:+--budget $BUDGET} > $O/run.log 2>&1; \
-python h2h.py report $O/out.jsonl > $O/report.txt 2>&1"
+python -u h2h.py edits --items $O/items.jsonl --out $O/edits.jsonl > $O/edits.log 2>&1; \
+python h2h.py report $O/out.jsonl --edits $O/edits.jsonl > $O/report.txt 2>&1"
 RP_HF_MODELS="Qwen/Qwen3-1.7B adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B" RP_ALLOW_OVER=1 RP_UPLOAD_MAX_MB=50 \
   RP_OWNER=primerl RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.8} RP_MIN_VRAM_GB=${VRAM:-20} \
   experiments/infra/runpod/rp-run $N "${GPU:-RTX 3090,RTX 4090,RTX A5000,L40S,RTX A6000}" $H -- bash -c "$CMD"

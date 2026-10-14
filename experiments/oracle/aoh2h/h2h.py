@@ -584,6 +584,16 @@ def report(a) -> None:
             texts_ = [r for r in mine if r["kind"] == "text"]
             print(f"  {sysname}: " + "; ".join(line) + f" | passes/text {sum(r['passes'] for r in texts_) / max(len(texts_), 1):.0f}, "
                   f"s/text {sum(r['seconds'] for r in texts_) / max(len(texts_), 1):.1f}")
+    if a.edits and a.edits.exists():
+        ed = [json.loads(x) for x in a.edits.read_text().splitlines()]
+        for split in ("dev", "test"):
+            for sysname in sorted({r["system"] for r in ed}):
+                rs = [r for r in ed if r["split"] == split and r["system"] == sysname]
+                if rs:
+                    n = len(rs)
+                    print(f"  (d) {split} {sysname}: success {sum(r['success'] for r in rs) / n:.2f}, collateral "
+                          f"{sum(r['collateral'] for r in rs) / n:.4f} bits/token, kept {sum(r['kept'] for r in rs) / n:.3f}, "
+                          f"score {sum(r['score'] for r in rs) / n:.3f}, passes {sum(r['passes'] for r in rs) / n:.0f}, n {n}")
 
 
 def main():
@@ -611,6 +621,7 @@ def main():
     e.add_argument("--systems", nargs="+", default=["B"])
     p = sub.add_parser("report")
     p.add_argument("out", type=Path)
+    p.add_argument("--edits", type=Path)
     a = ap.parse_args()
     {"build": build, "run": run, "edits": edits, "report": report}[a.cmd](a)
 

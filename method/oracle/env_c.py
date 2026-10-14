@@ -278,6 +278,10 @@ def gate(a) -> None:
 def gate_text(ge, a, rec: dict, cp: dict | None, prompts: dict, llm: dict, var_explain) -> None:
     task = rec["task"]
     t, tx = text_of(ge, task)
+    if a.reline:  # the target's lines that hold under its own stated carriers, kept beside the gate's rows
+        rec = reline(ge, tx, t, rec, cp)
+        with a.out.with_suffix(".targets.jsonl").open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
     strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
     teacher = components.render(answer_of(task, rec, ge, compact=cp), strings=strings)
     shuffled = components.render(answer_of(task, rec, ge, shuffle=native.task_seed(task), compact=cp), strings=strings)
@@ -296,14 +300,30 @@ def gate_text(ge, a, rec: dict, cp: dict | None, prompts: dict, llm: dict, var_e
     print(task, {k: round(row[k]["reward"], 3) for k in ("teacher", "shuffled", "llm", "llm_hint") if k in row}, best_llm, flush=True)
 
 
+def reline(ge, tx, t: dict, rec: dict, cp: dict | None) -> dict:
+    """rec with only the lines that hold under the carriers its rendered answer states (relines())."""
+    import semantic
+    import variables
+
+    strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
+    p = components.parse(components.render(answer_of(rec["task"], rec, ge, compact=cp), strings=strings))
+    bound = [{**v, "name": v.get("ref", f"V{i}")} for i, v in enumerate(p["answer"].get("variables") or [], 1)]
+    lines = p["answer"].get("invariants") or []
+    keep = []
+    if lines and bound:
+        got = semantic.check_invariants(variables.Scorer(ge), tx, variables.parse(bound, ge.nat.C), "\n".join(lines), t["model"], fresh_mean=True)
+        ok = {r["line"] for r in got["invariants"] if r["holds"] and r.get("joint") is not False}
+        keep = [orig for orig, line in zip(rec["invariants"], lines) if line.strip() in ok]  # render keeps the lines' order
+    return {**rec, "invariants": [re.sub(r"^I\d+:", f"I{i}:", x) for i, x in enumerate(keep, 1)],
+            "relined": "compact" if cp else "blocks", "lines_before": len(rec["invariants"])}
+
+
 def relines(a) -> None:
     """A targets file whose INVARIANTS lines hold under the carriers the answer states: each record's lines checked
     in the real model on its rendered answer (compact families with --compact, else blocks; removals at fresh-token
     means), the holding ones kept (a two-input line only when joint). Lines verified under the full families can fail
     under the compact ones (gate4c: the teacher's credit median -6.4 bits)."""
     import goal_eval
-    import semantic
-    import variables
 
     ge = goal_eval.GoalEval(native.Native(a.device))
     cp = load_compact(a.compact)
@@ -314,20 +334,10 @@ def relines(a) -> None:
         if rec["task"] in done:
             continue
         t, tx = text_of(ge, rec["task"])
-        strings = components.token_strings(t["model"], t["prompts"][0]["token_ids"])
-        p = components.parse(components.render(answer_of(rec["task"], rec, ge, compact=cp), strings=strings))
-        bound = [{**v, "name": v.get("ref", f"V{i}")} for i, v in enumerate(p["answer"].get("variables") or [], 1)]
-        lines = p["answer"].get("invariants") or []
-        keep = []
-        if lines and bound:
-            got = semantic.check_invariants(variables.Scorer(ge), tx, variables.parse(bound, ge.nat.C), "\n".join(lines), t["model"], fresh_mean=True)
-            ok = {r["line"] for r in got["invariants"] if r["holds"] and r.get("joint") is not False}
-            keep = [orig for orig, line in zip(rec["invariants"], lines) if line.strip() in ok]  # render keeps the lines' order
-        out = {**rec, "invariants": [re.sub(r"^I\d+:", f"I{i}:", x) for i, x in enumerate(keep, 1)],
-               "relined": "compact" if cp else "blocks", "lines_before": len(rec["invariants"])}
+        out = reline(ge, tx, t, rec, cp)
         with a.out.open("a") as fh:
             fh.write(json.dumps(out) + "\n")
-        print(rec["task"], len(rec["invariants"]), "->", len(keep), flush=True)
+        print(rec["task"], out["lines_before"], "->", len(out["invariants"]), flush=True)
 
 
 def rows(a) -> None:
@@ -450,6 +460,7 @@ def main():
     g.add_argument("--le-dir", type=Path, help="the teacher line effects' cache (a pod's output directory keeps them)")
     g.add_argument("--targets", type=Path, help="a targets file (default sft_targets/heldout.jsonl; relines' output)")
     g.add_argument("--untar", type=Path, help="a tar of input paths under ~/mpd-data, unpacked there first")
+    g.add_argument("--reline", action="store_true", help="first keep only each target's lines that hold under its own carriers")
     f = sub.add_parser("sft")
     f.add_argument("rows", type=Path)
     f.add_argument("out", type=Path)

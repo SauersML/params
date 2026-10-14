@@ -21,7 +21,8 @@ the point family's floor. A removal is admitted when
               flips and omitted on the survivors alone;
 and kept after it when s_track_pp on the validation draws (the other half of the search pool: rank 2 and fresh
 samples, eval-like) stays within VAL_MARGIN of the fully wired circuit's (teacher.Validated, every removal: a failing
-one goes back and the level ends).
+one goes back; the level then runs again, the failing removal's line kept for good when it was one line, else every
+later prefix smaller than half of it, until a run admits nothing).
 
 Each accepted removal is checkpointed by line identity (a line's key names its ends, never its place in a list: a set's
 order changes from process to process), and a process ends after MAX_STEPS of them (exit EXIT_RESUME) so a fresh one
@@ -304,29 +305,59 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
         f"validation {start_val} (floor {floor_val}); floors {floors}")
     steps = [0]
     t0 = time.time()
+    pr.fixed = torch.zeros(len(pr.lines), dtype=torch.bool)  # lines whose removal alone failed validation: kept
+    for k in state.get("frozen", []):
+        pr.fixed[pr.at[k]] = True
     for li in range(state["level"], len(LEVELS)):
-        level, journal = LEVELS[li], []
-        v = teacher.Validated(pr, pr.graph, acc, floor_val, journal)
+        level = LEVELS[li]
+        cap = state.get("cap") if state.get("cap_level") == li else None
+        while True:  # the level again after a validation failure (Validated ends a level at its first): the failing
+            journal, failed = [], []  # removal's line frozen when it was one, else prefixes capped below its size
+            v = teacher.Validated(pr, pr.graph, acc, floor_val, journal)
 
-        def after():
-            stop = v()
-            state["removed"] = [key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()]
-            state["level"] = li
-            state["trace"].append([level, int(pr.on.sum()), v.trace[-1][2] if v.trace else None, round(time.time() - t0)])
-            ckpt.write_text(json.dumps(state))
-            log(f"  {level}: {int(pr.on.sum())} lines on, validation {v.trace[-1][2] if v.trace else None}, {time.time() - t0:.0f}s")
-            tidy(ge, tx, pr)
-            steps[0] += 1
-            if not stop and steps[0] >= MAX_STEPS:
-                raise Restart
-            return stop
-        try:
-            pr.prune(level, budget, log=journal, accept=accept, after=after)
-            v.finish()
-        except Restart:
-            return EXIT_RESUME
-        state["level"] = li + 1
-        state["removed"] = [key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()]
+            def capped(ons, cap=cap):
+                if cap is None:
+                    return accept(ons)
+                big = (pr.on[None] & ~ons).sum(1) > cap
+                out = [None] * len(ons)
+                small = (~big).nonzero().flatten()
+                if len(small):
+                    for i, r in zip(small.tolist(), accept(ons[small])):
+                        out[i] = r
+                return out
+
+            def after(li=li, level=level, v=v, failed=failed):
+                now = pr.on.clone()
+                stop = v()
+                if stop:
+                    gone = pr.on & ~now
+                    failed.append(int(gone.sum()))
+                    if int(gone.sum()) <= 1:
+                        pr.fixed |= gone
+                state.update(removed=[key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()], level=li,
+                             frozen=[key(pr.lines[j]) for j in pr.fixed.nonzero().flatten().tolist()])
+                state["trace"].append([level, int(pr.on.sum()), v.trace[-1][2] if v.trace else None, round(time.time() - t0)])
+                ckpt.write_text(json.dumps(state))
+                log(f"  {level}: {int(pr.on.sum())} lines on, validation {v.trace[-1][2] if v.trace else None}"
+                    f"{' (failed: back)' if stop else ''}, {time.time() - t0:.0f}s")
+                tidy(ge, tx, pr)
+                steps[0] += 1
+                if not stop and steps[0] >= MAX_STEPS:
+                    raise Restart
+                return stop
+            try:
+                pr.prune(level, budget, log=journal, accept=capped, after=after)
+                v.finish()
+            except Restart:
+                return EXIT_RESUME
+            if not failed:
+                break
+            if failed[-1] > 1:
+                cap = failed[-1] // 2 if cap is None else min(cap, failed[-1] // 2)
+                state.update(cap=cap, cap_level=li)
+                ckpt.write_text(json.dumps(state))
+        state.update(level=li + 1, cap=None, cap_level=None,
+                     removed=[key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()])
         ckpt.write_text(json.dumps(state))
     state["done"] = True
     state["refused"] = {"changed": len(acc.refused), "floors": len(fl.refused)}

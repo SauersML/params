@@ -5,7 +5,7 @@
 # adversary's pattern pool; lines.py runs a fresh process per MAX_STEPS accepted removals and for the re-check. The
 # circuits and their measurements come back to ~/mpd-data/runpod/NAME/out (<task>.json, <task>.lines.json, and the
 # keyed checkpoints <task>.ckpt.json, from which a later run resumes when given RESUME=DIR of them).
-#   experiments/oracle/pods/lines_pod.sh TASKS TEACHERS [NAME] [HOURS]   env: P, VPD, RESUME, LINES_FLOORS, SCORE, GPU, PRICE,
+#   experiments/oracle/pods/lines_pod.sh TASKS TEACHERS [NAME] [HOURS]   env: P, VPD, RESUME, LINES_FLOORS, SCORE, GPU, PRICE, RAM, DISK,
 #                                                                          VRAM, RP_OWNER
 # The whole script is one block, so bash has read all of it before it runs.
 {
@@ -40,6 +40,6 @@ ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; $RUNS wait; echo all stages done"
-RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-rustmove} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.5} RP_MIN_VRAM_GB=${VRAM:-24} RP_MIN_RAM_GB=32 RP_DISK_GB=44 \
+RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-rustmove} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.5} RP_MIN_VRAM_GB=${VRAM:-24} RP_MIN_RAM_GB=${RAM:-64} RP_DISK_GB=${DISK:-50} \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090,NVIDIA L4,NVIDIA RTX A6000,NVIDIA A40}" $H -- bash -c "$CMD"
 }

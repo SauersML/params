@@ -8,7 +8,8 @@
 #   serve FACTS ROWS HOURS       env_d.py serve on the pod's port 8772 (RL's scorer; the Mac reaches it through an SSH
 #                                tunnel as scorer_tunnel.sh does) until the cap
 # The source (origin/main's method/oracle and method/vpd) and the inputs (with the texts they name) go up as two tar files.
-#   env: RUN (default a), GPU, PRICE ($/h cap, default 1.0), MODEL, RP_OWNER (default inframove)
+#   env: RUN (default a), GPU, PRICE ($/h cap, default 1.0), MODEL, RP_OWNER (default inframove), SRCREV (the source
+#   revision, default origin/main: a frozen reward's REWARD_REV; every score names it as its source)
 set -euo pipefail
 cd /Users/user/params
 MODE=$1
@@ -19,8 +20,9 @@ N=oracle-graph-envd-$MODE-$RUN
 O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/inframove/src_envd_$RUN
 IN=/Users/user/mpd-data/scratch/inframove/in_envd_$RUN
-git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive origin/main method/oracle method/vpd | tar -x -C "$S"
-echo "python source $(git rev-parse --short=10 origin/main)" > "$S/SOURCE"  # every score names it (env_d.SOURCE)
+REV=${SRCREV:-origin/main}
+git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive "$REV" method/oracle method/vpd | tar -x -C "$S"
+echo "python source $(git rev-parse --short=10 "$REV")" > "$S/SOURCE"  # every score names it (env_d.SOURCE)
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
 rm -rf "$IN" "$IN.tar" && mkdir -p "$IN/vpd4l"
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN.tar)

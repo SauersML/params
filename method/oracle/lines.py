@@ -393,9 +393,24 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
         state["setup"] = {"rev": rev, "floors": floors, "budget": None if math.isinf(budget) else budget, "start_val": start_val}
     fl = Floors(ge, tx, pool, floors)
 
+    spent = {"rank": 0.0, "changed": 0.0, "floors": 0.0, "candidates": 0, "validation": 0.0, "full": 0.0}  # seconds
+
+    def timed(name, f):  # (the step log's cost split)
+        def run(*a, **k):
+            t = time.time()
+            try:
+                return f(*a, **k)
+            finally:
+                spent[name] += time.time() - t
+        return run
+
     def by_floors(ons):
+        spent["candidates"] += len(ons)
         return fl(pr.graph(pr.on), [pr.graph(on) for on in ons])
-    accept = teacher.both(changed, by_floors)
+    accept = teacher.both(timed("changed", changed), timed("floors", by_floors))
+    acc.validation = timed("validation", acc.validation)
+    fl.full = timed("full", fl.full)
+    pr.without = (lambda f: lambda groups, ranking=False: timed("rank", f)(groups, ranking) if ranking else f(groups))(pr.without)
     floor_val = None if start_val is None else start_val - VAL_MARGIN
     log(f"{task_path.stem}: {len(pr.node_at)} parts, {len(pr.lines)} lines, {int(pr.on.sum())} on; point budget {budget:.4f} bits; "
         f"validation {start_val} (floor {floor_val}); floors {floors}")
@@ -493,7 +508,9 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                 save(li)
                 state["trace"].append([level, int(pr.on.sum()), v.trace[-1][2] if v.trace else None, round(time.time() - t0)])
                 log(f"  {level}: {int(pr.on.sum())} lines on, validation {v.trace[-1][2] if v.trace else None}"
-                    f"{' (failed: back)' if stop else ''}, {time.time() - t0:.0f}s")
+                    f"{' (failed: back)' if stop else ''}, {time.time() - t0:.0f}s (rank {spent['rank']:.0f}, changed "
+                    f"{spent['changed']:.0f}, floors {spent['floors']:.0f} over {spent['candidates']}, validation "
+                    f"{spent['validation']:.0f}, full {spent['full']:.0f})")
                 tidy(ge, tx, pr)
                 steps[0] += 1
                 if not stop and steps[0] >= MAX_STEPS:

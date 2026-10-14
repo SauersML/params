@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# The stated-circuit line stage (method/oracle/lines.py) on one rented GPU: P processes over the texts of TASKS (task ids,
-# one per line; never the sealed 9100-9149), each text's teacher circuit from TEACHERS (<task>.json node sets, the
-# teacher's outputs), VPD's saved answers and orders from VPD (teacher.py --save-vpd's file, a published input) and the
-# adversary's pattern pool; lines.py runs a fresh process per MAX_STEPS accepted removals and for the re-check. The
-# circuits and their measurements come back to ~/mpd-data/runpod/NAME/out (<task>.json, <task>.lines.json, and the
-# keyed checkpoints <task>.ckpt.json, from which a later run resumes when given RESUME=DIR of them).
+# The stated-circuit line stage (method/oracle/lines.py) on one rented GPU: P processes over the texts of TASKS (task
+# ids such as text9000 or paper_princess, one per line; never the sealed 9100-9149), each text's teacher circuit from
+# TEACHERS (<task>.json node sets, the teacher's outputs), VPD's saved answers and orders from VPD (teacher.py
+# --save-vpd's file, a published input) and the adversary's pattern pool; lines.py runs a fresh process per MAX_STEPS
+# accepted removals and for the re-check. The circuits and their measurements come back to ~/mpd-data/runpod/NAME/out
+# (<task>.json, <task>.lines.json, and the keyed checkpoints <task>.ckpt.json, from which a later run resumes when given
+# RESUME=DIR of them).
 #   experiments/oracle/pods/lines_pod.sh TASKS TEACHERS [NAME] [HOURS]   env: P, VPD, RESUME, SCORE, LEVELS, TEXTS_ADD (task files
 #                                                                          the texts lack), GPU, PRICE, RAM, DISK,
 #                                                                          VRAM, RP_OWNER
@@ -16,7 +17,7 @@ P=${P:-2} VPD=${VPD:-/Users/user/mpd-data/graph_oracle/teacher/vpd_v2_494.pt}
 O=/Users/user/mpd-data/runpod/$NAME
 F=/Users/user/mpd-data/scratch/rustmove/lines/pod_$NAME
 rm -rf "$F" && mkdir -p "$F/in/teachers" "$F/in/resume"
-grep -E '^text' "$TASKS" | grep -vE '^text91[0-4][0-9]$' > "$F/in/tasks.txt"
+grep -E '^[A-Za-z0-9_]+$' "$TASKS" | grep -vE '^text91[0-4][0-9]$' > "$F/in/tasks.txt"
 mkdir -p "$F/in/add/vpd4l"
 while read -r t; do
   cp "$TEACHERS/$t.json" "$F/in/teachers/"
@@ -31,7 +32,7 @@ I='~/mpd-data/in_lines'
 RUNS=""
 if [ -n "${SCORE:-}" ]; then  # SCORE="CIRCUIT.json ...": lines.py score on the first task alone, rows to out/score.jsonl
   mkdir -p "$F/score" && for c in $SCORE; do cp "$c" "$F/score/"; done
-  RUNS="(python -B method/oracle/lines.py score $(printf '%s ' "/Users/user/mpd-data/graph_oracle/texts/vpd4l/$(grep -E "^text" "$TASKS" | grep -vE "^text91[0-4][0-9]$" | head -n 1).json") $(for c in $SCORE; do printf '%s ' "$F/score/${c##*/}"; done) --vpd $VPD > $O/out/score.jsonl 2> $O/score.log; echo \"exit \$?\" >> $O/score.log) &"
+  RUNS="(python -B method/oracle/lines.py score $(printf '%s ' "/Users/user/mpd-data/graph_oracle/texts/vpd4l/$(grep -E "^[A-Za-z0-9_]+$" "$TASKS" | grep -vE "^text91[0-4][0-9]$" | head -n 1).json") $(for c in $SCORE; do printf '%s ' "$F/score/${c##*/}"; done) --vpd $VPD > $O/out/score.jsonl 2> $O/score.log; echo \"exit \$?\" >> $O/score.log) &"
   P=0
 fi
 for k in $(seq 0 $((P - 1))); do

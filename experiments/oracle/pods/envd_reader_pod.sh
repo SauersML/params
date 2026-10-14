@@ -7,7 +7,8 @@
 #   serve FACTS ROWS HOURS       env_d.py serve on the pod's port 8772 (RL's scorer; the Mac reaches it through an SSH
 #                                tunnel as scorer_tunnel.sh does) until the cap
 # The source (origin/main's method/oracle and method/vpd) and the inputs (with the texts they name) go up as two tar files.
-#   env: RUN (default a), GPU, PRICE ($/h cap, default 1.0), MODEL, RP_OWNER (default inframove)
+#   env: RUN (default a), GPU, PRICE ($/h cap, default 1.0), MODEL, RP_OWNER (default inframove); gate's EVENTS (E1's
+#   events per text) and NOCIRCUIT=1 (the same gate again with the reader reading the English without the circuit)
 set -euo pipefail
 cd /Users/user/params
 MODE=$1
@@ -24,7 +25,8 @@ rm -rf "$IN" "$IN.tar" && mkdir -p "$IN/vpd4l"
 I='~/mpd-data/in'  # the inputs on the pod (unpacked from $IN.tar)
 case $MODE in
   gate) cp "$1/facts30.jsonl" "$IN/facts.jsonl"; cp "$1/rows30.jsonl" "$IN/rows.jsonl"; cp "$1/english30.jsonl" "$IN/english.jsonl"; H=$2
-        RUNCMD="python -u method/oracle/env_d.py gate $I/facts.jsonl $I/rows.jsonl $I/english.jsonl $O/gate.jsonl --reader \"\$R\" ${EVENTS:+--events $EVENTS}" ;;
+        RUNCMD="python -u method/oracle/env_d.py gate $I/facts.jsonl $I/rows.jsonl $I/english.jsonl $O/gate.jsonl --reader \"\$R\" ${EVENTS:+--events $EVENTS}"
+        [ -z "${NOCIRCUIT:-}" ] || RUNCMD="$RUNCMD; python -u method/oracle/env_d.py gate $I/facts.jsonl $I/rows.jsonl $I/english.jsonl $O/gate_nocircuit.jsonl --reader \"\$R\" ${EVENTS:+--events $EVENTS} --no-circuit" ;;
   select) cp "$1" "$IN/facts.jsonl"; cp "$2" "$IN/rows.jsonl"; cp "$3" "$IN/samples.jsonl"; H=$4
         RUNCMD="python -u method/oracle/env_d.py select $I/facts.jsonl $I/rows.jsonl $I/samples.jsonl $O/english.jsonl --reader \"\$R\"" ;;
   serve) cp "$1" "$IN/facts.jsonl"; cp "$2" "$IN/rows.jsonl"; H=$3

@@ -38,6 +38,9 @@ positions from its first removal on, reading the set's keys and values before it
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
+import pickle
 import json
 import math
 import sys
@@ -971,22 +974,96 @@ MEANS_TEXTS = range(6000, 6100)  # unit_means' texts: training texts, never a de
 MEANS_FILE = Path.home() / "mpd-data/graph_oracle/native_means.pt"
 
 
+def _means_binding(ge, names, inputs):
+    """Effective graph_ref state, not a checkpoint filename or the CI network.
+
+    Intentionally frozen means across edited worlds must instead be passed directly
+    to the ablation caller as a dictionary; a disk cache is same-state reuse only.
+    """
+    tg = ge.nat.target
+    h = hashlib.sha256()
+
+    def add(label, value):
+        h.update(label.encode() + b"\0")
+        if isinstance(value, torch.Tensor):
+            x = value.detach().contiguous().cpu()
+            h.update(str((str(x.dtype), tuple(x.shape))).encode() + b"\0")
+            h.update(x.reshape(-1).view(torch.uint8).numpy().tobytes())
+        else:
+            h.update(json.dumps(value, sort_keys=True, allow_nan=False).encode())
+        h.update(b"\0")
+
+    add("schema", 1)
+    add("inputs", list(zip(names, inputs)))
+    add("target_class", type(tg).__module__ + "." + type(tg).__qualname__)
+    add("graph_ref_source", inspect.getsource(type(ge).graph_ref))
+    add("target_source", inspect.getsource(type(tg)))
+    # Class text alone misses module-level norm/activation/routing helpers.
+    source_dir = Path(native.__file__).resolve().parent
+    source_files = [source_dir / name for name in
+                    ("native.py", "goal_eval.py", "engine.py", "carry.py", "mech.py")]
+    source_files += [Path(inspect.getfile(type(tg))), Path(__file__)]
+    for i, file in enumerate(source_files):
+        add("execution_source_file:" + str(i), hashlib.sha256(file.read_bytes()).hexdigest())
+    add("config", tg.cfg)
+    add("sites", list(ge.nat.names))
+    add("component_counts", ge.nat.C)
+    for attr in ("n_layer", "n_head", "hd", "eps", "norm_kind", "tl_eps", "act_fn"):
+        add(attr, getattr(tg, attr, None))
+    for attr in ("behavior", "behavior_tokens", "behavior_at"):
+        value = getattr(tg, attr, None)
+        add(attr, sorted(value) if isinstance(value, (set, frozenset)) else value)
+    # state_dict includes effective embeddings, norms, RoPE, dense matrices/biases;
+    # graph_ref also uses nonregistered decomposition factors and live remainders.
+    for key, value in sorted(tg.state_dict().items()):
+        add("state:" + key, value)
+    for name in ge.nat.names:
+        site = tg.site(name)
+        for attr in ("W", "b", "U", "V", "delta_T"):
+            add(name + ":" + attr, getattr(site, attr, None))
+    # Arbitrary runtime hooks cannot be certified by this static state binding.
+    if any(m._forward_hooks or m._forward_pre_hooks or getattr(m, "in_fn", None) is not None
+           for m in tg.modules()):
+        raise ValueError("unit_means cache binding does not support runtime hooks")
+    return {"schema_version": 1, "sha256": h.hexdigest()}
+
+
+def _valid_means(got, binding, names, positions, shapes):
+    return (isinstance(got, dict) and got.get("cache_binding") == binding
+            and got.get("texts") == names and got.get("positions") == positions
+            and all(isinstance(got.get(k), torch.Tensor)
+                    and tuple(got[k].shape) == shape and got[k].is_floating_point()
+                    and bool(torch.isfinite(got[k]).all()) for k, shape in shapes.items()))
+
+
 @torch.no_grad()
 def unit_means(nat: native.Native, texts=MEANS_TEXTS, path: Path | None = MEANS_FILE) -> dict:
     """Each native unit's mean over every position of the texts (the bake-off's mean ablation, the lead's 10-14): a
     head's output before the output matrix {"heads": [layers, H, hd]} and a post-GELU neuron's activation {"neurons":
     [layers, d_mlp]}, from the real model's runs (goal_eval.graph_ref's capture); an ablated head keeps its own query,
-    key and value. Kept in path, recomputed when its texts differ."""
+    key and value. Kept in path, recomputed when its texts differ. Disk reuse also requires identical
+    effective graph_ref state and actual tokens, valid shapes and finite means; legacy caches are recomputed.
+    Intentionally frozen means across edited worlds must be passed explicitly as a dictionary."""
     names = [f"text{n}" for n in texts]
-    if path is not None and path.exists():
-        got = torch.load(path)
-        if got.get("texts") == names and "heads" in got:
-            return got
     ge = goal_eval.GoalEval(nat)
+    inputs = [list(native.text(native.TEXTS / "vpd4l" / f"{name}.json")[0]) for name in names]
+    if not inputs or any(not ids for ids in inputs):
+        raise ValueError("unit_means requires nonempty training input sequences")
+    tg = nat.target
+    positions = sum(map(len, inputs))
+    shapes = {"heads": (tg.n_layer, tg.n_head, tg.hd)}
+    shapes["neurons"] = (tg.n_layer, tg.site(native.site_name(0, "c_fc")).W.shape[0])
+    binding = _means_binding(ge, names, inputs)
+    if path is not None and path.exists():
+        try:
+            got = torch.load(path, map_location="cpu", weights_only=True)
+        except (OSError, ValueError, RuntimeError, EOFError, pickle.UnpicklingError):
+            got = None
+        if _valid_means(got, binding, names, positions, shapes):
+            return got
     heads = neurons = None
     count = 0
-    for name in names:
-        ids, _ = native.text(native.TEXTS / "vpd4l" / f"{name}.json")
+    for ids in inputs:
         c = {}
         ones = native.Graph(masks={n: torch.ones(len(ids), nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
         ge.graph_ref(list(ids), [len(ids) - 1], ones, capture=c)
@@ -995,6 +1072,11 @@ def unit_means(nat: native.Native, texts=MEANS_TEXTS, path: Path | None = MEANS_
         count += len(ids)
         native.free(nat.dev)
     out = {"heads": (heads / count).float().cpu(), "neurons": (neurons / count).float().cpu(), "texts": names, "positions": count}
+    out["cache_binding"] = binding
+    if not _valid_means(out, binding, names, positions, shapes):
+        raise RuntimeError("unit_means produced invalid mean tensors")
+    if _means_binding(ge, names, inputs) != binding:
+        raise RuntimeError("unit_means effective state changed during computation")
     if path is not None:
         torch.save(out, path)
     return out

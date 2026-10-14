@@ -40,7 +40,7 @@ def terms(sc, tx, ins: list, group: list) -> dict:
     return {"f_on": x["f_on"], "f_off": x["f_off"]}
 
 
-def compact(sc, tx, v: dict, pv: dict, share: float) -> dict:
+def compact(sc, tx, v: dict, pv: dict, share: float, fast: float | None = None) -> dict:
     nat = sc.nat
     ins, at = list(v["inputs"]), list(v.get("carried_at") or v["inputs"])
     if all(c != variables.BLOCK for _, _, c in pv["group"]):
@@ -71,7 +71,7 @@ def compact(sc, tx, v: dict, pv: dict, share: float) -> dict:
         good = good and (full["f_off"] is None or (got["f_off"] is not None and got["f_off"] >= share * full["f_off"]))
         return good, got
     lo, hi, best = 0, None, None
-    k = min(8, len(order))
+    k = min(max(16, int(round(fast * len(order)))) if fast else 8, len(order))  # fast: start at that share of the family
     while True:  # doubling
         good, got = ok(k)
         if good:
@@ -83,7 +83,7 @@ def compact(sc, tx, v: dict, pv: dict, share: float) -> dict:
         k = min(2 * k, len(order))
     if hi is None:
         hi, best = len(order), full
-    while hi - lo > max(1, hi // 8):  # halving, to an eighth of the size
+    while not fast and hi - lo > max(1, hi // 8):  # halving, to an eighth of the size (fast: none)
         mid = (lo + hi) // 2
         good, got = ok(mid)
         if good:
@@ -101,6 +101,8 @@ def main():
     ap.add_argument("--split", default="heldout")
     ap.add_argument("--part", help="K/N: every N-th variable from the K-th")
     ap.add_argument("--share", type=float, default=0.9)
+    ap.add_argument("--fast", type=float, help="start at this share of the family and only double (held-out median 0.11): "
+                    "one or two scorer calls a variable instead of about eight")
     ap.add_argument("--out", type=Path, default=native.TEXTS.parent / "variables" / "compact.jsonl")
     ap.add_argument("--device")
     a = ap.parse_args()
@@ -134,9 +136,9 @@ def main():
             p = task["prompts"][0]
             cur = (t, ge.text(p["token_ids"], p["target_positions"], seed=native.task_seed(t), task=task))
         pv = variables.parse([v], ge.nat.C)[0]
-        got = compact(variables.Scorer(ge), cur[1], v, pv, a.share)
+        got = compact(variables.Scorer(ge), cur[1], v, pv, a.share, a.fast)
         row = {"task": t, "split": a.split, "name": name, "kind": v["kind"], "value_kind": v.get("value_kind"), "carrier": v["carrier"],
-               "share": a.share, **got}
+               "share": a.share, "fast": a.fast, **got}
         with a.out.open("a") as fh:
             fh.write(json.dumps(row) + "\n")
         print(t, name, v["kind"], v["carrier"], got.get("family_size"), "->", got.get("size"), got.get("family"), got.get("compact"), flush=True)

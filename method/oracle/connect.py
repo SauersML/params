@@ -18,8 +18,8 @@ the token edges and the target token), in C's semantics on one engine plan.
       every kept connection, then the token edges (by their readers' scores), lowest score first.
 The record reports the sparsity (edges between units per unit, cross-token connections, tokens involved) of the stated
 circuit beside the wired one's.
-Criteria, the cheap families builder_fast's node selection holds (pymove's 10-14): the point KL rises at most POINT_TOL
-of the way from the fully wired circuit's to the KL with no line, on a log scale; s_track_pp on TRACK_DRAWS search
+Criteria, the cheap families builder_fast's node selection holds (pymove's 10-14): the point KL at most node selection's
+point floor (FLOOR of the point score of VPD's actives at the circuit's positions; point_cap); s_track_pp on TRACK_DRAWS search
 draws, s_scope on its scope draws (the family that sees a token edge left out) and s_interchange_pp on the circuit's
 panel stay at FLOOR, or at the fully wired circuit's value less TRACK_TOL when that is lower. All are measured on the
 engine's runs; the gradients only order the candidates.
@@ -46,6 +46,7 @@ import carry  # noqa: E402
 import goal_eval  # noqa: E402
 import lines  # noqa: E402
 import native  # noqa: E402
+import teacher  # noqa: E402
 
 ALPHAS = 8  # integrated-gradient strengths, (i + 1/2) / ALPHAS
 POINT_TOL = 0.02  # the point KL's allowed rise, as a share of the log distance from the wired circuit's to no line's
@@ -104,6 +105,24 @@ class Connector:
 
     def targets(self) -> list[int]:
         return list(self.tx.targets)
+
+    def point_cap(self, kl_full: float, kl_none: float) -> float:
+        """The point KL's cap: node selection's point floor (pymove's builder), FLOOR of the point score of VPD's
+        actives at the circuit's positions, as a KL on goal_eval's scale between the empty circuit's and VPD's whole
+        answer's, KL_empty^(1 - f) KL_VPD^f (teacher.kl_budget), at least the wired circuit's own; without VPD's
+        answer, POINT_TOL of the log distance from the wired circuit's KL to no line's."""
+        ge, tx = self.ge, self.tx
+        e0, v0 = ge._bounds(tx, "live") if tx.vpd is not None else (None, None)
+        if v0 is None:
+            lo, hi = math.log(max(kl_full, 1e-9)), math.log(max(kl_none, kl_full, 1e-9))
+            return math.exp(lo + POINT_TOL * (hi - lo))
+        at = {p for _, p, _ in self.pr.parts}
+        vp = native.Graph([(n, int(t), int(c)) for n in ge.nat.names for t, c in tx.vpd[n].nonzero().tolist() if int(t) in at],
+                          complete=True)
+        s_vp = goal_eval._fid(e0, ge.graph_kl(tx, [vp], True)[0], v0)
+        if s_vp is None:
+            return kl_full
+        return max(kl_full, teacher.kl_budget(e0, v0, FLOOR * s_vp))
 
     def positions(self) -> tuple:
         """Each line's writer and reader positions (a token edge: its token's and its reader's; a write into the
@@ -170,8 +189,7 @@ class Connector:
         pr, t0 = self.pr, time.time()
         full = self.row(self.conn)
         kl_full, kl_none = pr.kl_sets(torch.stack([full, self.row(self.conn[:0])]))
-        lo, hi = math.log(max(kl_full, 1e-9)), math.log(max(kl_none, kl_full, 1e-9))
-        cap = {"point": math.exp(lo + POINT_TOL * (hi - lo))}
+        cap = {"point": self.point_cap(kl_full, kl_none)}
         off = {n for n, v in (floors or {}).items() if v is None}  # (families the caller leaves out)
         wired = {name: None if name in off else self.family(name, [full])[0] for name, _ in self.FAMILIES}
         for name, _ in self.FAMILIES:
@@ -515,6 +533,12 @@ class NativeConnector(Connector):
 
     def targets(self) -> list[int]:
         return list(self.pr.targets)
+
+    def point_cap(self, kl_full: float, kl_none: float) -> float:
+        """POINT_TOL of the log distance from the wired circuit's KL to no line's (native units have no VPD answer
+        to scale against; inframove's native floors replace it when they exist)."""
+        lo, hi = math.log(max(kl_full, 1e-9)), math.log(max(kl_none, kl_full, 1e-9))
+        return math.exp(lo + POINT_TOL * (hi - lo))
 
     def __init__(self, nat, ids: list[int], targets: list[int], ref: torch.Tensor, means: dict, units: list, B: int = 32):
         self.ge, self.tx = None, None

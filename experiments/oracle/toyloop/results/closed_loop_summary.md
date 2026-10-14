@@ -101,3 +101,12 @@ The container has 4 CPUs and 15 GB of RAM. A SmolLM2-135M SFT step at about 2.9k
 run fits at a time. A GRPO step on zoo v2 takes about 95 s. Background jobs are killed at 2 h, and logs often stall
 after about 1 h. Use `train.py --save_every N --minutes 55` and chain runs with `--init`. Processes detached from
 the session get reclaimed when it is idle.
+
+## Tool-use oracle (toy_tools.py; details in `results/toy_tools.md`)
+
+The oracle gets a short observation and calls weights-only tools (marker, gated, reads, writes, twins, fires, run) to
+build its answer, instead of reading a 3k-token prompt. A scripted expert that runs weights_heuristic2's rule through
+the tools is exact on every text in about 4.2 calls. SmolLM2-135M was SFT'd on the expert episodes (from sft_v1_weights,
+594 steps). It reaches unit F1 0.93/0.94/0.91 and reward 0.72/0.74/0.70 (train/inst/family, 40 texts each), against
+0.64/0.65/0.65 and 0.22/0.27/0.24 for the detailed-render prompt oracle. The truth's reward is 0.83/0.86/0.86. Its call
+sequences match the expert's on all 120 texts, so the remaining errors are in assembling the final answer.

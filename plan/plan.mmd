@@ -11,13 +11,16 @@ flowchart TB
   G --> D
 
   subgraph BUILD["CONSTRUCT CIRCUITS · non-LLM primary path"]
-    U["<b>Compare units under matched conditions</b><br/>VPD subcomponents versus neurons / attention heads.<br/>Same model, inputs, fidelity target and search budget.<br/>Count VPD remainder computation explicitly.<br/>READY · existing native executor and bounded pruner audited"]
+    U["<b>Compare units under matched conditions</b><br/>VPD subcomponents versus neurons / attention heads.<br/>Same model, inputs, fidelity target and search budget.<br/>Count VPD remainder computation explicitly.<br/>Compare completed candidates; do not gate their construction."]
     B["<b>Use a bounded deterministic constructor</b><br/>Reuse existing pruning and search implementations.<br/>New connect.py wiring stage complements unit selection.<br/>Empty-edge crash fixed: b5275b6; five tests pass.<br/>Measure time to the first qualifying circuit;<br/>stop at the budget and report failure honestly.<br/>Why: a good circuit must also be cheap to obtain."]
     Q["<b>Verify the actual executable result</b><br/>Output KL, intervention prediction, necessity and size.<br/>Report tested background robustness separately.<br/>Failed targets are not positive supervision.<br/>Existing direct-KL admission and execution checks available."]
     C["<b>Deliver a circuit and its evidence</b><br/>Graph, unit meanings, model binding and tested scope.<br/>Construction / validation time, memory and execution cost.<br/>Why: the interpreter needs a trustworthy object to explain."]
-    U --> B --> Q --> C
+    B --> Q --> C
+    Q -. matched outcomes .-> U
   end
   D --> U
+  D --> B
+  U -. unit tradeoffs .-> M
 
   subgraph EXPLAIN["INTERPRET CIRCUITS · oracle primary job"]
     O["<b>Explain, answer questions and propose edits</b><br/>Read the constructed circuit and weight-grounded facts.<br/>Bind concepts to its actual executed units.<br/>Generate English and testable mechanism claims;<br/>graph generation is an optional baseline, not a requirement."]
@@ -44,12 +47,12 @@ flowchart TB
     K["<b>Own-circuit claim checker shipped</b><br/>bf60aa8 · 86 focused tests pass.<br/>Same carriers: full / intact claim true, cut-edge claim false.<br/>Opt-in; reward weights unchanged; free prose unverified.<br/>OWNER · root / variable_reward / fork_review"]
     N["<b>Stop the failed restoration family</b><br/>Two omission groups pass only 43/52 and 27/52 worlds.<br/>Both fail the same upstream edit; only full restoration passes.<br/>Why: more of the same search does not yield valid targets.<br/>AUDITED · MATS 20416 / 20417 · no paid spend"]
     H["<b>Old explanation groups do not fit old circuits</b><br/>16 TRAIN records: none of 29 scalar groups is contained.<br/>Keep the exact evidence; do not trim groups to force a pass.<br/>Next: derive explanation carriers from the constructed circuit.<br/>AUDITED · eval_recovery · metadata only"]
-    P["<b>Measure native-unit construction feasibility</b><br/>TRAIN6008 · neurons / heads · same four weight worlds.<br/>120 s search; 400 rows; absolute KL 0.001 bits.<br/>20423 stopped before search: reference-path mismatch.<br/>RUNNING / QUEUED · MATS 20424; corrected reference checks"]
+    P["<b>Native baseline: faithful, barely smaller</b><br/>20424 audited: four checks pass; worst KL 0.000428 bits.<br/>83 s construction; 397 rows; 99.455% of units remain.<br/>No measured execution speedup; stop whole-position scans.<br/>NEXT · variable_reward / fork_review: cheap fine-unit ranking"]
   end
   K -. usable verifier .-> E
   N -. rejects old targets .-> B
   H -. bind to the circuit supplied .-> O
-  U --> P
+  P -. native-unit evidence .-> U
   P -. choose the next construction method .-> M
 
   Z["<b>Success</b><br/>Fast construction of simple, tested circuits;<br/>an oracle whose explanations and predictions add verified value.<br/>Scalable across useful behaviors, unit choices and model sizes."]
@@ -1036,3 +1039,5 @@ flowchart TB
 %% HISTORY |   CAPENG -- local truth is not circuit-relative truth --> ENGCIRCUIT
 %% HISTORY |   ENGCIRCUIT -. checked circuit-bound claims .-> SUP
 %% HISTORY |   class ENGCIRCUIT done
+
+%% Native pilot20424 audited: point-fit only then four predeclared familiar TRAIN6008 weight worlds, not pristine heldout. Exact397 rows=5dense+392native; all367singleton and16jointprefix outcomes saved; selected removes positions135/201. WorstnormalizedKL.000428068749, tops4/4; full mean.323225s selected.323621s, single timings not speed benchmark. Search83.15755s,total96.0396s,peak3546504KiB; future2xmemory>=7GiB. Prior20423 setup failure preserved; samepathbitwise and oldcrosspathnumerical reference checks distinguish FP32 projection layouts. Root no newpaidspend. Next gradient proposals reuse native executor algebra, fullcontext and no cached states; direct Boolean verification remains mandatory. Fullmodel-KL gradient at all-on vanishes, so fixed interior strengths are used; scores are not finite-deletion guarantees. Owner variable_reward implements, fork_review independently checks, root publishes; no new modeljob.

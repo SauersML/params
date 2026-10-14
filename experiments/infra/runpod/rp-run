@@ -33,7 +33,7 @@
 # copied, and only then deleted (recover_stopped).
 #
 # A pod lost before COMMAND ends (a host that fails, a pod deleted elsewhere) is replaced while time
-# remains. The new pod gets the same source, binaries and inputs and the outputs synced so far, and
+# remains. The new pod gets the same source and inputs and the outputs synced so far, and
 # runs COMMAND again, so a command that resumes from its own checkpoint under the outputs continues.
 # Outputs are synced to the Mac (rsync) every minute while COMMAND runs, except files still being
 # written (*.partial) and library_mdl's rebuildable target caches (*.targets).
@@ -46,44 +46,24 @@
 # about 145 MB/s. A checkpoint resumes only at a commit whose fit identity matches the one that
 # wrote it ("a checkpoint of another fit" otherwise).
 #
-# Source: `git archive` of github.com/SauersML/params's origin/main, or of RP_REF=<commit> when it is
-# published: the Rust workspace (method/: crates/, the manifests, the toolchain pin), experiments/infra/runpod/ and every
-# /Users/user/params/... path COMMAND names, unpacked at WS/src (WS=/workspace/runs/NAME, the run's
-# own directory on the pod), the command's working directory.
+# Source: the commit's /Users/user/params/... paths COMMAND names and experiments/infra/runpod/, at
+# origin/main's commit or RP_REF=<commit> when it is published, sent from the Mac and unpacked at WS/src
+# (WS=/workspace/runs/NAME, the run's own directory on the pod), the command's working directory; a dev
+# pod gets the commit's whole tree from GitHub.
 #
 # Paths are translated as mats-run translates them:
-#   method/target/release/examples/X, /Users/user/params/method/target/release/examples/X (or the
-#   same without method/) and
-#   `cargo run ... --example X -- ARGS`  -> the pod's X, built at the commit by
-#       `cargo build --release -p PACKAGE --example X` (no target-cpu flags: the pod's CPU is
-#       unknown), or taken from ~/mpd-data/runpod/_bin/ when the same Rust sources built it before;
 #   /Users/user/params/...    -> WS/src/...;
 #   /Users/user/mpd-data/...  -> WS/mpd-data/...; every existing input COMMAND names,
 #       outside mpd-data/runpod/, is uploaded first, symlinks as the files they name;
 #   ~/.cache/huggingface/hub/models--ORG--NAME/snapshots/REV[/...] -> WS/hf/ORG/NAME/REV[/...],
 #       fetched on the pod from huggingface.co at REV (public models; nothing is uploaded);
 #   python, python3, the Mac venv's python -> the pod's python3.
-# Data with a public source is built on the pod, not uploaded, and checked before COMMAND starts
-# (a mismatch refuses the run; the builds' logs come back in data.log):
-#   /Users/user/mpd-data/qwen3_fineweb/SHARD[/FILE], SHARD a shard of the FineWeb release
-#       (train_shard00 .. train_shard07, heldout_f284, or the Mac's copies train and heldout), FILE
-#       one of its files (windows_T{128,256,512,1024}.u32, documents.u32, offsets.u64): the shard is
-#       tokenized from its FineWeb source file by experiments/mpd_qwen3_fineweb_2951.py at the commit,
-#       and every file built is checked against the release's sha256 (release/CONTENTS.json,
-#       remade by fineweb_contents.py from the tarballs that release/SHA256SUMS lists);
-#   /Users/user/mpd-data/engine/EXPORT, a vpd4l export extended with Pile training rows
-#       (source.extends in its export.json): its base export, which holds the target's weights, is
-#       uploaded, the export built from it and the Pile files by
-#       method/vpd/vpd_engine_export_pile.py, and every tensor checked against the Mac's
-#       export.json, which then replaces the pod's.
-# Other cargo commands (`cargo test -p mpd-tensor ...`) run as given in WS/src/method, the workspace.
 # RP_PYENV=NAME gives COMMAND the Python environment pinned in experiments/infra/runpod/pyenv/NAME.txt (python and
 # python3 are its own; built on the pod by uv while the inputs upload, once per pod and pinned set),
 # and RP_HF_MODELS="ORG/NAME[@REVISION] ..." downloads those models into the pod's Hugging Face cache
 # (HF_HOME) first, so code that loads them by name finds them there.
-# RP_EXAMPLES="X Y" builds further examples for a script that runs them through $MPD_BIN;
 # RP_DISK_GB=N sets the container disk (default: 30 GB, 60 for a dev pod, plus twice the inputs
-# and models); RP_ENV="K=V ..." adds environment (RUST_LOG is forwarded when set); RP_MIN_RAM_GB=N
+# and models); RP_ENV="K=V ..." adds environment; RP_MIN_RAM_GB=N
 # asks for a pod with at least N GB of host memory (default 32), for a command whose host half
 # needs more (a float64 reference of a large model).
 #
@@ -93,9 +73,8 @@
 #
 # Dev pods: one pod of the first listed type in stock (community, then secure; default RTX A5000,
 # then RTX 4090; default cap 4 h), with the source of the commit at WS/src as a git
-# repository of one commit, the pinned Rust toolchain, the CUDA 12.4 toolkit, rsync, the PATHs
-# given (translated as above) and a release and test build of mpd-tensor started in the background
-# (WS/warm.log). The runner holds it until `rp-run stop NAME`, its cap, or an interrupt,
+# repository of one commit, the CUDA 12.4 toolkit, rsync and the PATHs given (translated as above).
+# The runner holds it until `rp-run stop NAME`, its cap, or an interrupt,
 # then deletes it. ~/mpd-data/runpod/NAME/ssh [COMMAND] logs in; `rsync -e ~/mpd-data/runpod/NAME/rsh
 # SRC "$(cat ~/mpd-data/runpod/NAME/host):DEST"` copies files. `rp-run extend NAME HOURS` moves both
 # caps (only on request: the budget check runs again).
@@ -112,7 +91,7 @@
 # ~/mpd-data/runpod/LEDGER.tsv, dollars = the pod's price per hour x hours from creation to
 # deletion; cloud is COMMUNITY, SECURE:cheapest-per-token, SECURE:no-community-stock or SECURE:dev; then the seconds
 # the pod spent uploading inputs, building data, and from its creation to the command's start (the
-# first two overlap each other and the Rust build, so the third is the paid waiting), how its run
+# first two overlap each other, so the third is the paid waiting), how its run
 # ended, its owner (RP_OWNER) and its approval. A run beside another live run needs RP_PARALLEL=1
 # unless it is small (below; held pods do not count). After deleting its pod the runner checks
 # through the API that the pod is gone and lists any other pod it created that remains.
@@ -135,13 +114,6 @@
 # run's log and synced outputs unchanged for 15 minutes) and the last line of its run's log; then the account's spend,
 # its rate, the rate paid for GPUs under 20%, and the hours until the $150 cap at that rate.
 #
-# Binaries: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as $MPD_BIN/test-TEST;
-# TEST lib is the package's library unit tests, so one package's per run) a
-# run needs come from the prerelease rp-run-bin (assets KEY.NAME, KEY the hash of the commit's Rust
-# sources), which the pod downloads itself; what it lacks is built first on GitHub Actions
-# (gha-run bins, before any pod exists). Only when that fails does the run's first GPU pod build
-# them, once per set of sources (other runs wait), and the Mac caches them in _bin. A command that
-# compiles (cargo ...) is refused: a GPU pod does not compile.
 # A run whose GPU averages under 20% over 15 minutes once its command has run that long is stopped as
 # idle-stopped (dev pods are held, not stopped). rp-run stop NAME ends a run (its runner
 # deletes the pod and enters it in the ledger; a runner that does not end within a minute is killed
@@ -478,9 +450,6 @@ nebius_instances() {
 }
 provider_offers() { thunder_offers "$@"; nebius_offers "$@"; }
 
-# The binaries a run needs ("NAME" for an example, "test:PACKAGE:NAME" for a test) that neither the
-# prerelease rp-run-bin (assets KEY.NAME, built on GitHub Actions) nor the Mac's cache _bin/KEY holds.
-ASSETS=https://github.com/SauersML/params/releases/download/rp-run-bin
 # Inputs published once (rp-run publish PATH...) as assets of the prerelease rp-run-data, named by
 # their sha256, which pods download at datacenter speed instead of the Mac's 2-3 MB/s uplink.
 # published.tsv caches each file's sha256 by path, size and modification time.
@@ -539,13 +508,6 @@ asset_for() {  # SHA [LISTING]
     local have=${2:-$DATA_HAVE} a
     for a in "$1.u16" "$1.f32" "$1"; do grep -qx "$a" <<< "$have" && { echo "$a"; return; }; done
     return 0
-}
-published_assets() { gh api "repos/SauersML/params/releases/tags/rp-run-bin" --jq '.assets[].name' 2> /dev/null || true; }
-unbuilt() { unbuilt_in "$(published_assets)"; }
-unbuilt_in() {  # LISTING
-    local x
-    for x in "${examples[@]}"; do [ -x "$CACHE/$x" ] || grep -qx "$KEY.$x" <<< "$1" || echo "$x"; done
-    for x in "${tests[@]}"; do [ -x "$CACHE/test-${x#*:}" ] || grep -qx "$KEY.test-${x#*:}" <<< "$1" || echo "test:$x"; done
 }
 
 
@@ -1492,31 +1454,7 @@ if :; then
     git -C "$MAC_REPO" merge-base --is-ancestor "$C" origin/main || { echo "rp-run: ${C:0:12} is not on origin/main; push it or set RP_REF to a published commit" >&2; exit 2; }
 fi
 
-# `cargo run [...] --example X [...] -- ARGS` -> X ARGS
-if [ "$MODE" = run ] && [ "$1" = cargo ] && [ "${2:-}" = run ]; then
-    ex="" rest=()
-    while [ $# -gt 0 ]; do
-        case $1 in
-            --example) ex=$2; shift 2 ;;
-            --example=*) ex=${1#--example=}; shift ;;
-            --) shift; rest=("$@"); break ;;
-            *) shift ;;
-        esac
-    done
-    [ -n "$ex" ] || { echo "rp-run: only 'cargo run --example X' is translated" >&2; exit 2; }
-    set -- "target/release/examples/$ex" "${rest[@]}"
-fi
-NEED_RUST=0
-[ "$MODE" = dev ] && NEED_RUST=1
-if [ "$MODE" = run ] && [ "$1" = cargo ]; then
-    echo "rp-run: a GPU pod does not compile: name test binaries in RP_TESTS=PACKAGE:TEST and run \$MPD_BIN/test-TEST" >&2
-    exit 2
-fi
-# Test binaries the command runs through $MPD_BIN (test-NAME), built like the examples.
-read -r -a tests <<< "${RP_TESTS:-}"
-for x in "${tests[@]}"; do [[ $x =~ ^[A-Za-z0-9_-]+:[A-Za-z0-9_]+$ ]] || { echo "rp-run: RP_TESTS takes PACKAGE:TEST words, not $x" >&2; exit 2; }; done
-
-uploads=() hf=() srcpaths=() examples=() words=() fineweb=() pile=()
+uploads=() hf=() srcpaths=() words=()
 DATA_HAVE=$(published_data)
 # Whether each of the files NAME... that mpd-data/DIR holds is published (a missing one is not needed).
 all_published_any() {  # DIR NAME...
@@ -1532,18 +1470,11 @@ all_published() {  # REL
     done < <(find -L "$MAC_DATA/$1" -type f ! -name '.*')
 }
 [ -z "$C" ] || ! git -C "$MAC_REPO" cat-file -e "$C:experiments/infra/runpod" 2> /dev/null || srcpaths+=(experiments/infra/runpod)
-# The FineWeb release's contents (per shard: source file and every file's sha256), remade when the
-# release changes.
-CONTENTS=$MAC_DATA/qwen3_fineweb/release/CONTENTS.json
-if [ -f "${CONTENTS%/*}/SHA256SUMS" ] && { [ ! -f "$CONTENTS" ] || [ "${CONTENTS%/*}/SHA256SUMS" -nt "$CONTENTS" ]; }; then
-    /usr/bin/python3 "${SELF%/*}/fineweb_contents.py" > /dev/null || { echo "rp-run: could not read the FineWeb release" >&2; exit 1; }
-fi
 first=1
 [ "$MODE" = run ] || first=0
 for a in "$@"; do
     if [ $first = 1 ]; then
         case $a in
-            "$MAC_REPO"/method/target/*/examples/*|method/target/*/examples/*|./method/target/*/examples/*|"$MAC_REPO"/target/*/examples/*|target/*/examples/*|./target/*/examples/*) examples+=("${a##*/}"); a="$WS/bin/${a##*/}" ;;
             python|python3|"$MAC_DATA"/venv/bin/python*) a=python3 ;;
         esac
         first=0
@@ -1553,49 +1484,24 @@ for a in "$@"; do
         case $p in "$MAC_DATA"/runpod/*|"$MAC_DATA"/venv*) continue ;; esac
         rel=${p#"$MAC_DATA"/}
         rel=${rel%/}
-        # Data with a public source is built on the pod: a FineWeb release shard (or its Mac copy
-        # train, heldout), and a vpd4l export extended with Pile training rows (its base export,
-        # which holds the target's weights, goes up instead).
-        # A FineWeb shard the Mac holds and has published is downloaded with the files beside it
-        # (meta.json, documents.u32, offsets.u64) instead of tokenized on the pod.
-        if [[ $rel =~ ^qwen3_fineweb/([^/]+)(/([^/]+))?$ ]] && [ -e "$p" ] && all_published "$rel" &&
-           all_published_any "qwen3_fineweb/${BASH_REMATCH[1]}" meta.json documents.u32 offsets.u64; then
-            uploads+=("$rel")
-            for x in meta.json documents.u32 offsets.u64; do
-                [ -e "$MAC_DATA/qwen3_fineweb/${BASH_REMATCH[1]}/$x" ] && uploads+=("qwen3_fineweb/${BASH_REMATCH[1]}/$x")
-            done
-        elif [[ $rel =~ ^qwen3_fineweb/([^/]+)(/([^/]+))?$ ]] && [ -f "$CONTENTS" ] && jq -e --arg d "${BASH_REMATCH[1]}" 'has($d)' "$CONTENTS" > /dev/null; then
-            fineweb+=("${BASH_REMATCH[1]} ${BASH_REMATCH[3]:-}")
-        elif [[ $rel =~ ^engine/([^/]+) ]] && jq -e '.source.extends.export' "$MAC_DATA/engine/${BASH_REMATCH[1]}/export.json" > /dev/null 2>&1 &&
-             ! all_published "engine/${BASH_REMATCH[1]}"; then
-            pile+=("${BASH_REMATCH[1]}")
-        elif [ -e "$p" ]; then
+        if [ -e "$p" ]; then
             uploads+=("$rel")
         fi
     done < <(grep -oE "$MAC_DATA/[^ :,;=\"']+" <<< "$a" || true)
     while read -r p; do
         [ -n "$p" ] && hf+=("$p")
     done < <(grep -oE "$HF_HUB/models--[^/ ]+--[^/ ]+/snapshots/[0-9a-f]+" <<< "$a" || true)
-    # A binary the command names anywhere, as an argument too (a script's argument), is fetched like
-    # the command's own: every target/*/examples/X it names becomes an example the run needs.
-    while read -r x; do
-        [ -n "$x" ] && examples+=("${x##*/}")
-    done < <(grep -oE "(^|[ =:,\"'])(\./)?($MAC_REPO/)?(method/)?target/[a-z-]+/examples/[A-Za-z0-9_-]+" <<< " $a" | sed -E 's/^[ =:,"'"'"']//' || true)
-    a=$(sed -E "s#(^|[ =:,])(\./)?(method/)?target/[a-z-]+/examples/#\1$WS/bin/#g" <<< "$a")
     while read -r p; do
         [ -n "$p" ] || continue
         rel=${p#"$MAC_REPO"/}
         rel=${rel%/}
-        case $rel in target/*|method/target/*) continue ;; esac
         git -C "$MAC_REPO" cat-file -e "$C:$rel" 2> /dev/null && srcpaths+=("$rel")
     done < <(grep -oE "$MAC_REPO/[^ :,;=\"']+" <<< "$a" || true)
     # A path relative to the repository (the command runs in WS/src) that the commit holds.
     while read -r p; do
         p=${p#./} p=${p%/}
-        [ -n "$p" ] && [[ $p != target/* ]] && [[ $p != method/target/* ]] && git -C "$MAC_REPO" cat-file -e "$C:$p" 2> /dev/null && srcpaths+=("$p")
+        [ -n "$p" ] && git -C "$MAC_REPO" cat-file -e "$C:$p" 2> /dev/null && srcpaths+=("$p")
     done < <(grep -oE "(^|[ =:,\"'])(\./)?[A-Za-z0-9_][A-Za-z0-9_.-]*/[^ :,;=\"']*" <<< " $a" | sed -E 's/^[ =:,"'"'"']//' || true)
-    a=${a//$MAC_REPO\/method\/target\/release\/examples\//$WS/bin/}
-    a=${a//$MAC_REPO\/target\/release\/examples\//$WS/bin/}
     a=${a//$MAC_REPO\//$WS/src/}
     a=${a//$MAC_DATA\//$WS/mpd-data/}
     if [[ $a =~ $HF_HUB/models--([^/ ]+)--([^/ ]+)/snapshots/([0-9a-f]+) ]]; then
@@ -1603,100 +1509,10 @@ for a in "$@"; do
     fi
     words+=("$a")
 done
-for x in ${RP_EXAMPLES:-}; do examples+=("$x"); done
-[ ${#examples[@]} -gt 0 ] && examples=($(printf '%s\n' "${examples[@]}" | sort -u))
-
-# Each example's package, from the commit's tree.
-declare -A package_of
-for x in "${examples[@]}"; do
-    f=$(git -C "$MAC_REPO" ls-tree -r --name-only "$C" -- method/crates | grep -E "^method/crates/[^/]+/examples/$x(\.rs|/main\.rs)$" | head -n 1 || true)
-    [ -n "$f" ] || { echo "rp-run: no example $x in method/crates/*/examples at ${C:0:12}" >&2; exit 2; }
-    crate=${f#method/crates/}
-    crate=${crate%%/*}
-    package_of[$x]=$(git -C "$MAC_REPO" show "$C:method/crates/$crate/Cargo.toml" | sed -nE 's/^name = "([^"]+)"/\1/p' | head -n 1)
-done
-# FineWeb shards to build: "DIR|FILE_INDEX|DOCUMENTS|CONTEXTS|SHA256SUM-LINES" (the files the
-# command names, documents.u32 and offsets.u64; every window length when it names the directory).
-# A shard whose files (with meta.json) are assets of rp-run-data under the release's sha256s is
-# downloaded instead ("SHA256 REL SHA256" in fw_fetched, sizes in fetch_size); a shard built on the
-# pod is also built whole on a free GitHub Actions runner and published there (fw_publish, below).
-fw_plan=() pile_plan=() data_kb=0 fw_fetched=() fw_publish=()
+data_kb=0
 declare -A fetch_size
-if [ ${#fineweb[@]} -gt 0 ]; then
-    git -C "$MAC_REPO" cat-file -e "$C:experiments/mpd_qwen3_fineweb_2951.py" 2> /dev/null || { echo "rp-run: ${C:0:12} has no experiments/mpd_qwen3_fineweb_2951.py to build FineWeb shards with" >&2; exit 2; }
-    srcpaths+=(experiments/mpd_qwen3_fineweb_2951.py)
-    for d in $(for e in "${fineweb[@]}"; do echo "${e%% *}"; done | sort -u); do
-        entry=$(jq -c --arg d "$d" '.[$d]' "$CONTENTS")
-        all=$(jq -r '.files | keys[] | capture("^windows_T(?<t>[0-9]+)[.]u32$").t' <<< "$entry" | sort -n | tr '\n' ' ')
-        ts=""
-        for e in "${fineweb[@]}"; do
-            [ "${e%% *}" = "$d" ] || continue
-            f=${e#* }
-            case $f in
-                "") ts+="$all" ;;
-                windows_T*.u32) t=${f#windows_T}; ts+="${t%.u32} " ;;
-                documents.u32|offsets.u64|meta.json) ;;
-                *) echo "rp-run: qwen3_fineweb/$d/$f is not a file of the FineWeb release" >&2; exit 2 ;;
-            esac
-        done
-        [ -n "$ts" ] || ts=${all%% *}
-        ts=$(tr ' ' '\n' <<< "$ts" | sed '/^$/d' | sort -nu | tr '\n' ',' | sed 's/,$//')
-        check="documents.u32 offsets.u64 $(tr ',' '\n' <<< "$ts" | sed 's/.*/windows_T&.u32/' | tr '\n' ' ')"
-        have_all=1
-        for f in $check meta.json; do
-            sha=$(jq -r --arg f "$f" '.files[$f] // empty' <<< "$entry")
-            [ -n "$sha" ] && grep -qx "$sha" <<< "$DATA_HAVE" || { have_all=0; break; }
-        done
-        if (( have_all )); then
-            for f in $check meta.json; do
-                sha=$(jq -r --arg f "$f" '.files[$f]' <<< "$entry")
-                fw_fetched+=("$sha qwen3_fineweb/$d/$f $sha")
-                fetch_size["qwen3_fineweb/$d/$f"]=$(jq -r --arg f "$f" '.sizes[$f]' <<< "$entry")
-                data_kb=$(( data_kb + ${fetch_size["qwen3_fineweb/$d/$f"]} / 1024 ))
-            done
-            continue
-        fi
-        fw_publish+=("$d|$(jq -r '.file_index' <<< "$entry")|$(jq -r '.documents' <<< "$entry")|${all% }|$(jq -r '.files | to_entries[] | "\(.value)  \(.key)"' <<< "$entry" | tr '\n' ';')")
-        sums=""
-        for f in $check; do
-            sha=$(jq -r --arg f "$f" '.files[$f] // empty' <<< "$entry")
-            [ -n "$sha" ] || { echo "rp-run: qwen3_fineweb/$d has no $f in the release" >&2; exit 2; }
-            sums+="$sha  $f;"
-            data_kb=$(( data_kb + $(jq -r --arg f "$f" '.sizes[$f]' <<< "$entry") / 1024 ))
-        done
-        fw_plan+=("$d|$(jq -r '.file_index' <<< "$entry")|$(jq -r '.documents' <<< "$entry")|$ts|$sums")
-    done
-    # The largest source file is on the pod's disk while its shard is built.
-    [ ${#fw_plan[@]} -eq 0 ] || data_kb=$(( data_kb + $(curl -sS -X POST -H 'Content-Type: application/json' --max-time 60 \
-        -d "$(jq -c '{paths: [.[] | .source_file] | unique}' "$CONTENTS")" \
-        https://huggingface.co/api/datasets/HuggingFaceFW/fineweb/paths-info/9bb295ddab0e05d785b879661af7260fed5140fc |
-        jq '[.[].size] | max' ) / 1024 ))
-fi
-# Pile-extended vpd4l exports to build: "EXPORT BASE MIN_TRAIN_ROWS" (the base export uploaded).
-if [ ${#pile[@]} -gt 0 ]; then
-    git -C "$MAC_REPO" cat-file -e "$C:method/vpd/vpd_engine_export_pile.py" 2> /dev/null || { echo "rp-run: ${C:0:12} has no method/vpd/vpd_engine_export_pile.py to build Pile exports with" >&2; exit 2; }
-    srcpaths+=(method/vpd/vpd_engine_export_pile.py)
-    for x in $(printf '%s\n' "${pile[@]}" | sort -u); do
-        record_json=$MAC_DATA/engine/$x/export.json
-        base=$(jq -r '.source.extends.export' "$record_json")
-        [[ $base == "$MAC_DATA"/* ]] && [ -f "$base/export.json" ] || { echo "rp-run: engine/$x extends $base, which is not an export under $MAC_DATA" >&2; exit 2; }
-        uploads+=("${base#"$MAC_DATA"/}")
-        pile_plan+=("$x ${base#"$MAC_DATA"/} $(jq '[.source.data[1:][] | .rows[1] - .rows[0]] | add' "$record_json")")
-        # The export's tensors as its export.json records them (the Mac need not hold them), and the
-        # Pile files it is built from (smaller than their float64 rows).
-        data_kb=$(( data_kb + 2 * $(jq '[.files[].shape | reduce .[] as $n (8; . * $n)] | add / 1024 | floor' "$record_json") ))
-    done
-fi
-KEY="" CACHE="" CHANNEL=""
-if [ -n "$C" ]; then
-    # Binaries built from the same Rust sources in the same image are the same binaries.
-    KEY=$( { git -C "$MAC_REPO" rev-parse "$C:method/crates" "$C:method/Cargo.lock" "$C:method/Cargo.toml" "$C:method/rust-toolchain.toml"; echo "$IMAGE"; } | shasum | cut -c1-16)
-    CACHE=$RP/_bin/$KEY
-    CHANNEL=$(git -C "$MAC_REPO" show "$C:method/rust-toolchain.toml" | sed -nE 's/^channel = "([^"]+)"/\1/p')
-fi
 
 envp=()
-[ -n "${RUST_LOG:-}" ] && envp+=("RUST_LOG=$RUST_LOG")
 [ -n "${RP_ENV:-}" ] && read -r -a extra <<< "$RP_ENV" && envp+=("${extra[@]}")
 cmd=""
 [ ${#words[@]} -gt 0 ] && cmd=$(printf '%q ' "${words[@]}")
@@ -1741,7 +1557,7 @@ fi
 # A Mac binary among the inputs cannot run on the pod: refused before any pod exists.
 for f in "${files[@]}"; do
     case $(file -b "$MAC_DATA/$f") in
-        Mach-O*) echo "rp-run: $MAC_DATA/$f is a Mac binary, which cannot run on a Linux pod; name the example as method/target/release/examples/${f##*/} (built on GitHub Actions)" >&2; exit 2 ;;
+        Mach-O*) echo "rp-run: $MAC_DATA/$f is a Mac binary, which cannot run on a Linux pod" >&2; exit 2 ;;
     esac
 done
 # The source's Python compiled with the image's interpreter (IMAGE's pyX.Y, through uv) before any pod
@@ -1789,36 +1605,13 @@ if [ ${#files[@]} -gt 0 ]; then
         exit 2
     fi
 fi
-for e in "${fw_fetched[@]}"; do
-    fetched+=("$e")
-    read -r _ f _ <<< "$e"
-    FETCH_BYTES=$(( FETCH_BYTES + fetch_size[$f] ))
-done
-# Each shard the pod tokenizes is tokenized once more, whole (every window length), on a free GitHub
-# Actions runner at the same commit, checked against the release's sha256s and published to
-# rp-run-data by gha-run.yml's data step, so later runs download it. One dispatch per shard in 6 h
-# ($RP/fineweb_publish/SHARD's time); the dispatch runs in the background. The runner's pip (22.0 on
-# ubuntu-22.04) fails to resolve the set, so a current pip is installed first.
-if [ ${#fw_publish[@]} -gt 0 ] && [ -z "${RP_DRY:-}" ] && [ -z "${RP_ESTIMATE_ONLY:-}" ]; then
-    mkdir -p "$RP/fineweb_publish"
-    for e in "${fw_publish[@]}"; do
-        IFS='|' read -r d k n ts sums <<< "$e"
-        m=$RP/fineweb_publish/$d
-        [ -f "$m" ] && (( $(date +%s) - $(stat -f %m "$m") < 21600 )) && continue
-        touch "$m"
-        lines=$(tr ';' '\n' <<< "$sums" | sed '/^$/d' | sed "s/.*/'&'/" | tr '\n' ' ')
-        cmd="python3 -m pip install -q --user --upgrade pip && python3 -m pip install -q --user 'numpy>=2' pyarrow huggingface_hub tokenizers && python3 experiments/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out \$OUT/shard --workers 4 && cd \$OUT/shard && printf '%s\\n' $lines| sha256sum -c --quiet && mkdir -p \$OUT/rp-run-data && for f in *; do mv \"\$f\" \"\$OUT/rp-run-data/\$(sha256sum \"\$f\" | cut -c1-64)\"; done"
-        ( GHA_REF=$C "${SELF%/*}/gha-run" "fineweb-publish-$d" -- "$cmd" >> "$RP/fineweb_publish/dispatch.log" 2>&1 & )
-    done
-fi
 hf_kb=0
 for p in "${hf[@]}"; do
     [ -e "$p" ] || { echo "rp-run: $p is not on this Mac (the pod fetches the files the Mac's snapshot holds)" >&2; exit 2; }
     hf_kb=$(( hf_kb + $(du -skL "$p" | cut -f1) ))
 done
-# The container disk: the toolchain and a release build of the workspace (measured under 20 GB;
-# a dev pod also builds the test profile, a second target directory), with room for the inputs,
-# the models fetched and the outputs (as large again as the inputs).
+# The container disk: the image's own and room for the inputs, the models fetched and the outputs
+# (as large again as the inputs).
 # A Python environment (RP_PYENV=NAME: the pinned set experiments/infra/runpod/pyenv/NAME.txt at the commit,
 # whose first line states its installed size, measured) and Hugging Face models the pod fetches by
 # name (RP_HF_MODELS="ORG/NAME[@REVISION] ...", their sizes from Hugging Face's listing).
@@ -1863,7 +1656,7 @@ fi
 # The pod deletes itself at the run's deadline by its own clock, then starts as the image would.
 create_body() {  # CLOUD GPU_ID SECONDS_LEFT PUBLIC_KEYS
     local start="(echo \$BASHPID > /rp-watchdog.pid; sleep $3; runpodctl remove pod \"\$RUNPOD_POD_ID\" || runpodctl pod delete \"\$RUNPOD_POD_ID\") > /rp-watchdog.log 2>&1 & exec /start.sh"
-    # Rust builds and the host half of a step want more than the default 2 vCPUs and 8 GB per GPU.
+    # The host half of a step wants more than the default 2 vCPUs and 8 GB per GPU.
     # A pod that may stop itself (RP_SELF_STOP) keeps /workspace on a volume disk, which survives a stop (the container
     # disk does not); the others have no volume.
     local vol=0 cdisk=$DISK
@@ -1888,18 +1681,7 @@ if [ -n "${RP_DRY:-}" ]; then
     echo "commit:   ${C:-none}"
     echo "uploads:  ${uploads[*]:-none}: ${#fetched[@]} files published (the pod downloads them), ${#files[@]} files ($(( unpublished_kb / 1024 )) MB) from the Mac"
     echo "hf:       ${hf[*]:-none}"
-    built=$( for e in "${fw_plan[@]}"; do IFS='|' read -r d k n ts _ <<< "$e"; printf 'qwen3_fineweb/%s (FineWeb file %s, %s documents, contexts %s) ' "$d" "$k" "$n" "$ts"; done
-             for e in "${pile_plan[@]}"; do read -r x b m <<< "$e"; printf 'engine/%s (from %s and %s Pile train rows) ' "$x" "$b" "$m"; done )
-    echo "built:    ${built:-none}"
-    echo "publish:  $( for e in "${fw_publish[@]}"; do printf 'qwen3_fineweb/%s ' "${e%%|*}"; done )(tokenized whole on GitHub Actions and published to rp-run-data, once per 6 h)"
-    if (( NEED_RUST )); then
-        echo "source:   method/crates method/Cargo.toml method/Cargo.lock method/rust-toolchain.toml ${srcpaths[*]:-} (from GitHub)"
-    else
-        echo "source:   ${srcpaths[*]:-none} (from the Mac; the whole commit from GitHub only if the pod must compile)"
-    fi
-    need=$(unbuilt | tr '\n' ' ')
-    [ -n "$need" ] && need="to build on GitHub Actions: $need" || need="all built"
-    echo "binaries: $need (examples ${examples[*]:-none}, tests ${tests[*]:-none}, key $KEY)"
+    echo "source:   ${srcpaths[*]:-none} (from the Mac)"
     echo "approval: $APPROVAL${SMALL:+ (a small run: $SMALL_WHY)}"
     echo "command:  ${cmd:-none}"
     echo "request:  $(IFS='|' read -r k p g <<< "$(head -n 1 <<< "$OFFERS")"; if [[ $g == thunder:* ]]; then thunder_body "$g" '<run key>'; elif [[ $g == nebius:* ]]; then nebius_request "${g#nebius:}" '<preset>' '<project>' '<subnet>' '<pricing policy>' '<run key>' "mpd2951-$NAME"; else create_body "$k" "$g" "$CAP_SECONDS" '<run key> <~/.ssh/runpod_ed25519.pub>'; fi)"
@@ -1923,7 +1705,7 @@ mkdir -m 700 "$KEYDIR"
 ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$KEYDIR/key"
 chmod 600 "$KEYDIR/key"
 KEYS="$( [ -f "$KEYDIR/key.pub" ] && cat "$KEYDIR/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
-POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A="" MED_RATE="" POD_HOST=""
+POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" PROBE_A="" MED_RATE="" POD_HOST=""
 POD_DC="" ATTEMPT_GPU="" ATTEMPT_KIND="" ATTEMPT_DONE=1 RUN_STARTED=0 REACH_WHY="" REACH_DC=""
 SSH=(ssh -F none -i "$KEYDIR/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
      -o UserKnownHostsFile="$KEYDIR/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
@@ -2194,10 +1976,6 @@ reach() {
     if [ ${#fetched[@]} -gt 0 ] && [ -z "$EARLY_FETCH" ]; then
         fetch_published & EARLY_FETCH=$!
     fi
-    # So do the published binaries (planned before the first pod).
-    if (( BIN_PLANNED )) && [ ${#BIN_ASSETS[@]} -gt 0 ] && [ -z "$EARLY_BINS" ]; then
-        fetch_binaries & EARLY_BINS=$!
-    fi
     # So do the Python environment and the models (19-106 s), which need nothing from the checks,
     # rsync (for syncing outputs; apt-get takes about 5 s), and gpu_in_use's five samples (5 s).
     if { [ -n "$PYENV_DIR" ] || [ -n "${RP_HF_MODELS:-}" ]; } && [ -z "$EARLY_PYENV" ]; then
@@ -2381,7 +2159,7 @@ launch() {
     local -A failed_here=()
     # A listed run relaunches only while still listed; a small run's approval covers its whole cap.
     [ "$APPROVAL" = auto ] || approved "$NAME" || { say "approval for $NAME withdrawn; not launching a pod"; exit 3; }
-    POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A=""
+    POD="" IP="" PORT="" EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" PROBE_A=""
     POD_DC="" REACH_WHY="" REACH_DC="" RUN_STARTED=0
     rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
     host=$(find_host)
@@ -2505,7 +2283,6 @@ launch() {
         [ -z "$EARLY_FETCH" ] || { kill "$EARLY_FETCH" 2> /dev/null || true; wait "$EARLY_FETCH" 2> /dev/null || true; EARLY_FETCH=""; }
         [ -z "$EARLY_PYENV" ] || { kill "$EARLY_PYENV" 2> /dev/null || true; wait "$EARLY_PYENV" 2> /dev/null || true; EARLY_PYENV=""; }
         [ -z "$EARLY_RSYNC" ] || { kill "$EARLY_RSYNC" 2> /dev/null || true; wait "$EARLY_RSYNC" 2> /dev/null || true; EARLY_RSYNC=""; }
-        [ -z "$EARLY_BINS" ] || { kill "$EARLY_BINS" 2> /dev/null || true; wait "$EARLY_BINS" 2> /dev/null || true; EARLY_BINS=""; }
         rm -f "$TMP/upload_s" "$TMP/data_s" "$TMP/refused"
         echo discarded > "$ACTIVE/.$POD.end"
         reap "$POD" || exit 1
@@ -2810,17 +2587,6 @@ fetch_models() {
     done
 }
 
-# The Python packages the data builds use, installed once per pod (either build may ask first).
-# NumPy 2, as the release was built with: under NumPy 1 an unsigned offset plus an int is a float,
-# which the FineWeb script cannot slice with.
-# A login that is not root (Thunder's ubuntu) installs pip through sudo and the packages for itself.
-pydeps() {
-    on_pod 'flock /workspace/.pydeps.lock sh -c "[ -f /workspace/.pydeps ] || {
-        S=\$(command -v sudo || true); U=; [ \$(id -u) = 0 ] || U=--user
-        { python3 -m pip --version || { \$S apt-get update -qq && \$S apt-get install -y -qq python3-pip; }; } > /workspace/pydeps.log 2>&1 &&
-        PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install -q \$U \"numpy>=2\" pyarrow huggingface_hub tokenizers >> /workspace/pydeps.log 2>&1 && touch /workspace/.pydeps; }"'
-}
-
 # The Python environment and the named models, built on the pod while the inputs upload: uv (pod-wide)
 # installs the pinned set into PYENV_DIR once per pod (other runs with the same set wait, then use
 # it); the models download in parallel into the pod-wide Hugging Face cache (/workspace/hf-home,
@@ -2869,49 +2635,6 @@ data_step() {  # WHAT COMMAND...
     return 1
 }
 
-# The FineWeb shards the command names, tokenized on the pod by the commit's script from the
-# FineWeb source file, each file checked against the release's sha256 (CONTENTS.json, made from the
-# tarballs SHA256SUMS lists). The shards build at once, the vCPUs shared among them, so one shard's
-# download overlaps another's tokenizing; each source file is deleted once its shard is built.
-build_fineweb() {
-    [ ${#fw_plan[@]} -gt 0 ] || return 0
-    local started=$(date +%s) e workers pids=() failed=0 p
-    pydeps || { touch "$TMP/refused"; say "the Python packages for the data builds did not install (/workspace/pydeps.log)"; return 1; }
-    workers=$(( ${VCPU:-${#fw_plan[@]}} / ${#fw_plan[@]} ))
-    (( workers > 0 )) || workers=1
-    for e in "${fw_plan[@]}"; do
-        (
-            IFS='|' read -r d k n ts sums <<< "$e"
-            data_step "building qwen3_fineweb/$d ($WS/data-$d.log)" "cd $WS/src && python3 experiments/mpd_qwen3_fineweb_2951.py --file $k --documents $n --context ${ts//,/ } --out $WS/mpd-data/qwen3_fineweb/$d --workers $workers > $WS/data-$d.log 2>&1 && rm -rf ~/.cache/huggingface/hub/datasets--HuggingFaceFW--fineweb/blobs/\$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"source\"][\"sha256\"])' $WS/mpd-data/qwen3_fineweb/$d/meta.json)" || exit 1
-            tr ';' '\n' <<< "$sums" | sed '/^$/d' | data_step "checking qwen3_fineweb/$d against the release's sha256s" "cd $WS/mpd-data/qwen3_fineweb/$d && sha256sum -c --quiet" || exit 1
-            say "built qwen3_fineweb/$d on the pod (FineWeb file $k, $n documents, contexts $ts); its files match the release"
-        ) &
-        pids+=($!)
-    done
-    for p in "${pids[@]}"; do wait "$p" || failed=1; done
-    (( ! failed )) || return 1
-    echo $(( $(date +%s) - started )) >> "$TMP/data_s"
-}
-
-# The Pile-extended vpd4l exports the command names, built on the pod by the commit's script from
-# the uploaded base export and the Pile files, every tensor checked against the Mac's export.json,
-# which then replaces the pod's (they differ only in the base export's path), so the export is the
-# Mac's byte for byte.
-build_pile() {
-    [ ${#pile_plan[@]} -gt 0 ] || return 0
-    local started=$(date +%s) e x base min
-    pydeps || { touch "$TMP/refused"; say "the Python packages for the data builds did not install (/workspace/pydeps.log)"; return 1; }
-    for e in "${pile_plan[@]}"; do
-        read -r x base min <<< "$e"
-        data_step "building engine/$x ($WS/data-$x.log)" "cd $WS/src && python3 method/vpd/vpd_engine_export_pile.py $WS/mpd-data/$base $WS/mpd-data/engine/$x $min > $WS/data-$x.log 2>&1 && rm -rf ~/mpd-data/hf" || return 1
-        jq -r '.files | to_entries[] | "\(.value.sha256)  \(.key).f64"' "$MAC_DATA/engine/$x/export.json" |
-            data_step "checking engine/$x against the Mac's export.json" "cd $WS/mpd-data/engine/$x && sha256sum -c --quiet" || return 1
-        data_step "installing engine/$x's export.json" "cat > $WS/mpd-data/engine/$x/export.json" < "$MAC_DATA/engine/$x/export.json" || return 1
-        say "built engine/$x on the pod ($min Pile train rows after $base's); its tensors match the Mac's export.json"
-    done
-    echo $(( $(date +%s) - started )) >> "$TMP/data_s"
-}
-
 # The pod's upload, data-build and waiting seconds, into its record for the ledger.
 note_times() {
     local up data rec=$ACTIVE/$POD n g k p c o e m
@@ -2923,120 +2646,7 @@ note_times() {
     printf '%s %s %s %s %s %s %s %s %s %s %s\n' "$n" "$g" "$k" "$p" "$c" "$o" "$e" "$m" "$up" "$data" "$(( $(date +%s) - CREATED ))" > "$rec"
 }
 
-# Builds examples and test binaries ("test:PACKAGE:NAME") on the current pod from /workspace/src,
-# into /workspace/bin (a test as test-NAME) and the cache. A build error ends the run; a lost
-# connection returns 1.
-compile_on_pod() {
-    local x pkg flags name ex=() ts=() made=()
-    for x; do case $x in test:*) ts+=("${x#test:}") ;; *) ex+=("$x") ;; esac; done
-    for pkg in $(for x in "${ex[@]}"; do echo "${package_of[$x]}"; done | sort -u); do
-        flags=""
-        for x in "${ex[@]}"; do [ "${package_of[$x]}" = "$pkg" ] && flags+=" --example $x"; done
-        say "building$flags (-p $pkg) at ${C:0:12} with ${VCPU:-all} jobs"
-        on_pod "source ~/.cargo/env && cd $WS/src/method && cargo build -q --release ${VCPU:+-j $VCPU} -p $pkg$flags" 2>&1 | tee -a "$OUT/build.log" >&2
-        case ${PIPESTATUS[0]} in
-            0) ;;
-            255) return 1 ;;
-            *) say "the build failed (build.log)"; exit 1 ;;
-        esac
-    done
-    if [ ${#ex[@]} -gt 0 ]; then
-        on_pod "cd $WS/src/method/target/release/examples && cp ${ex[*]} $WS/bin/" || return 1
-        made+=("${ex[@]}")
-    fi
-    for x in "${ts[@]}"; do
-        pkg=${x%%:*} name=${x#*:}
-        say "building test $name (-p $pkg) at ${C:0:12}"
-        # The test executable cargo reports for the target, copied as test-NAME (NAME lib: the
-        # package's library unit tests, whose target is the package's name with - as _).
-        sel="--test $name" target=$name
-        [ "$name" != lib ] || { sel=--lib target=${pkg//-/_}; }
-        on_pod "source ~/.cargo/env && cd $WS/src/method && cargo test -q -p $pkg $sel --no-run --message-format=json ${VCPU:+-j $VCPU} 2>> $WS/build.log |
-            python3 -c 'import json, sys; [print(m[\"executable\"]) for m in map(json.loads, sys.stdin) if m.get(\"reason\") == \"compiler-artifact\" and m.get(\"executable\") and m[\"target\"][\"name\"] == sys.argv[1]]' $target |
-            tail -n 1 | xargs -r -I{} cp {} $WS/bin/test-$name && [ -x $WS/bin/test-$name ]"
-        case $? in
-            0) made+=("test-$name") ;;
-            255) return 1 ;;
-            *) on_pod "tail -n 30 $WS/build.log" >> "$OUT/build.log" 2>&1; say "the test build failed (build.log)"; exit 1 ;;
-        esac
-    done
-    mkdir -p "$CACHE"
-    on_pod "tar -C $WS/bin -cf - ${made[*]} | gzip -1" | gzip -dc | tar -x -C "$CACHE" || return 1
-    say "built and cached ${made[*]} ($KEY)"
-}
-
-# Before any pod exists, what the run needs and nobody has built is built on GitHub Actions
-# (gha-run bins: a free runner, published as rp-run-bin assets). One build per set of sources at a
-# time: a run that finds another building them waits for it, before renting anything. When Actions
-# fails, the run ends before any pod exists.
-build_binaries() {
-    local need x holder ex=() ts=()
-    need=$(unbuilt)
-    [ -n "$need" ] || return 0
-    mkdir -p "$RP/_bin"
-    until mkdir "$CACHE.lock" 2> /dev/null; do
-        holder=$(cat "$CACHE.lock/pid" 2> /dev/null || echo 0)
-        if ! kill -0 "$holder" 2> /dev/null; then rm -rf "$CACHE.lock"; continue; fi
-        # Another run's build of other binaries need not hold this run: its own may be published.
-        [ -n "$(unbuilt)" ] || return 0
-        say "waiting for run $(cat "$CACHE.lock/name" 2> /dev/null) to finish building $KEY's binaries"
-        sleep 30
-    done
-    echo $$ > "$CACHE.lock/pid"
-    echo "$NAME" > "$CACHE.lock/name"
-    need=$(unbuilt)
-    if [ -z "$need" ]; then
-        rm -rf "$CACHE.lock"
-        return 0
-    fi
-    for x in $need; do
-        case $x in test:*) ts+=("${x#test:}") ;; *) ex+=("${package_of[$x]}:$x") ;; esac
-    done
-    say "building $(echo $need) on GitHub Actions"
-    if "${SELF%/*}/gha-run" bins "$KEY" "$C" "${ex[@]}" -- "${ts[@]}" 2>> "$OUT/rp-run.log" && [ -z "$(unbuilt)" ]; then
-        say "built on GitHub Actions"
-        rm -rf "$CACHE.lock"
-    else
-        # No pod is rented to build: a commit Actions cannot build would not build on the pod either
-        # (frontier-gn-n32768's pod idled through such a build of a commit that did not compile).
-        rm -rf "$CACHE.lock"
-        say "GitHub Actions did not build $(echo $need) at ${C:0:12} (its errors: gha-run status, then gh run view RUN --log-failed); no pod is rented"
-        grep -o 'https://github.com/[^ )]*/actions/runs/[0-9]*' "$OUT/rp-run.log" | tail -n 1 | sed 's/^/rp-run: /' >&2
-        exit 1
-    fi
-}
-
-# Where each binary comes from: BIN_ASSETS from rp-run-bin (the pod downloads them), BIN_CACHED
-# from the Mac's cache, BIN_BUILD compiled on the pod (only when GitHub Actions has failed). Planned
-# once, before the first pod: build_binaries saw every binary published or cached, so a listing
-# that lacks one is GitHub's API failing for the moment (published_assets prints nothing then),
-# asked again before the run is refused.
-BIN_PLANNED=0 BIN_ASSETS=() BIN_CACHED=() BIN_BUILD=()
-plan_binaries() {
-    local have="" x try
-    (( ! BIN_PLANNED )) || return 0
-    BIN_ASSETS=() BIN_CACHED=() BIN_BUILD=()
-    for try in 1 2 3 4 5; do
-        [ ${#examples[@]} -eq 0 ] && [ ${#tests[@]} -eq 0 ] || have=$(published_assets)
-        [ -z "$(unbuilt_in "$have")" ] && break
-        sleep $(( 2 * try ))
-    done
-    for x in "${examples[@]}"; do
-        if grep -qx "$KEY.$x" <<< "$have"; then BIN_ASSETS+=("$x"); elif [ -x "$CACHE/$x" ]; then BIN_CACHED+=("$x"); else BIN_BUILD+=("$x"); fi
-    done
-    for x in "${tests[@]}"; do
-        if grep -qx "$KEY.test-${x#*:}" <<< "$have"; then BIN_ASSETS+=("test-${x#*:}"); elif [ -x "$CACHE/test-${x#*:}" ]; then BIN_CACHED+=("test-${x#*:}"); else BIN_BUILD+=("test:$x"); fi
-    done
-    BIN_PLANNED=1
-}
-# The published binaries, downloaded by the pod all at once (parity-q-968cd0d756's four 86 MB test
-# binaries took 26 s one after another).
-fetch_binaries() {
-    on_pod "mkdir -p $WS/bin && cd $WS/bin && printf '%s\n' ${BIN_ASSETS[*]} | xargs -P 8 -I{} sh -c 'curl -fsSL --retry 3 -o {} $ASSETS/$KEY.{} && chmod +x {}'" < /dev/null || return 1
-    say "${BIN_ASSETS[*]} from rp-run-bin ($KEY), downloaded by the pod"
-}
-
-# The source, binaries, inputs, data, models and the outputs synced so far, on the current pod.
+# The source, inputs, data, models and the outputs synced so far, on the current pod.
 # A run's extensions (rp-run extend NAME HOURS) while its pod lives, moved as hold() moves a held
 # pod's: the pod's own deletion timer (arm), the watcher's deadline (active/.POD.deadline) and the
 # run's estimate in its record. A background loop, since the runner waits on the command; the
@@ -3063,72 +2673,40 @@ extend_loop() {
 }
 
 setup() {
-    local started=$(date +%s) x pkg flags build=() cached=() jobs=()
+    local started=$(date +%s) x jobs=()
     if [ "$MODE" = run ] && (( ! GUEST )); then rm -f "$OUT/EXTEND"; extend_loop & fi
     # Every step checks its own status: `set -e` does not act inside the condition this runs in. A
     # step that fails on the connection (ssh's 255) loses the pod; any other failure ends the run.
     # The published inputs need nothing else: they start at once (at SSH, in reach).
     if [ -n "$EARLY_FETCH" ]; then jobs+=("$EARLY_FETCH"); else fetch_published & jobs+=($!); fi
-    plan_binaries
-    for x in "${BIN_BUILD[@]}"; do build+=("$x"); done
-    for x in "${BIN_CACHED[@]}"; do cached+=("$x"); done
-    if [ ${#build[@]} -gt 0 ] && [ "$MODE" = run ] && [ -z "${FALLBACK_BUILD:-}" ]; then
-        say "${build[*]} not built: a GPU pod compiles only when GitHub Actions has failed"
-        exit 1
-    fi
-    if [ -n "$EARLY_BINS" ]; then jobs+=("$EARLY_BINS"); elif [ ${#BIN_ASSETS[@]} -gt 0 ]; then fetch_binaries & jobs+=($!); fi
-    # The source. A run that compiles nothing needs only the paths COMMAND, the data builds and the
-    # Python environment name (srcpaths: about 0.2 MB), sent from the Mac; a compile takes the
-    # workspace from GitHub at datacenter speed, the Mac's archive if that fails.
-    local members slim=""
-    if (( ! NEED_RUST )) && [ ${#build[@]} -eq 0 ]; then
-        slim=1
-        if [ ${#srcpaths[@]} -gt 0 ]; then
-            git -C "$MAC_REPO" archive "$C" "${srcpaths[@]}" | gzip -1 > "$TMP/src.tgz" &&
-                (( $(stat -f %z "$TMP/src.tgz") <= UPLOAD_MAX_MB << 20 )) || slim=""
-        fi
-    fi
-    if [ -n "$slim" ]; then
-        if [ ${#srcpaths[@]} -gt 0 ]; then
-            on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" < "$TMP/src.tgz" || return 1
-            say "source ${C:0:12}: ${srcpaths[*]} ($(( $(stat -f %z "$TMP/src.tgz") >> 10 )) KB) from the Mac"
+    # The source: the paths COMMAND names and the Python environment's name (srcpaths: about 0.2 MB),
+    # sent from the Mac; a dev pod's, the commit's whole tree from GitHub (the Mac's archive if that fails).
+    if [ "$MODE" = dev ]; then
+        if on_pod "mkdir -p $WS/src $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/params/tar.gz/$C |
+                tar -xz --strip-components=1 -C $WS/src" < /dev/null 2> /dev/null; then
+            say "source ${C:0:12} from GitHub"
         else
-            on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME" < /dev/null || return 1
+            git -C "$MAC_REPO" archive "$C" | gzip -1 | on_pod "mkdir -p $WS/src $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
         fi
+    elif [ ${#srcpaths[@]} -gt 0 ]; then
+        git -C "$MAC_REPO" archive "$C" "${srcpaths[@]}" | gzip -1 > "$TMP/src.tgz" || return 1
+        on_pod "mkdir -p $WS/src $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" < "$TMP/src.tgz" || return 1
+        say "source ${C:0:12}: ${srcpaths[*]} ($(( $(stat -f %z "$TMP/src.tgz") >> 10 )) KB) from the Mac"
     else
-    members=$(printf "params-$C/%s " method/crates method/Cargo.toml method/Cargo.lock method/rust-toolchain.toml "${srcpaths[@]}")
-    if on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && curl -fsSL --retry 3 https://codeload.github.com/SauersML/params/tar.gz/$C |
-            tar -xz --strip-components=1 -C $WS/src $members" < /dev/null 2> /dev/null; then
-        say "source ${C:0:12} from GitHub"
-    else
-    git -C "$MAC_REPO" archive "$C" method/crates method/Cargo.toml method/Cargo.lock method/rust-toolchain.toml "${srcpaths[@]}" |
-        gzip -1 | on_pod "mkdir -p $WS/src $WS/bin $WS/mpd-data/runpod/$NAME && gzip -dc | tar -x -C $WS/src" || return 1
+        on_pod "mkdir -p $WS/src $WS/mpd-data/runpod/$NAME" < /dev/null || return 1
     fi
-    fi
-    # Inputs, data, models and rsync (for syncing outputs) arrive while the toolchain and builds do.
-    { upload_inputs && build_pile; } & jobs+=($!)
-    build_fineweb & jobs+=($!)
+    # Inputs, data, models and rsync (for syncing outputs) arrive together.
+    upload_inputs & jobs+=($!)
     fetch_models & jobs+=($!)
     if [ -n "$EARLY_PYENV" ]; then jobs+=("$EARLY_PYENV"); else python_env & jobs+=($!); fi
     if [ -n "$EARLY_RSYNC" ]; then jobs+=("$EARLY_RSYNC"); else
     on_pod 'S=$(command -v sudo || true); command -v rsync > /dev/null || { $S apt-get update -qq && $S apt-get install -y -qq rsync; } > /dev/null 2>&1' & jobs+=($!)
     fi
-    if (( NEED_RUST )) || [ ${#build[@]} -gt 0 ]; then
-        on_pod "[ -x ~/.cargo/bin/cargo ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain $CHANNEL" > /dev/null || return 1
-    fi
-    if [ ${#cached[@]} -gt 0 ]; then
-        COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$CACHE" -cf - "${cached[@]}" | gzip -1 | on_pod "gzip -dc | tar -x -C $WS/bin" || return 1
-        say "${cached[*]} from the cache ($KEY)"
-    fi
-    if [ ${#build[@]} -gt 0 ]; then
-        compile_on_pod "${build[@]}" || return 1
-        [ -z "${FALLBACK_BUILD:-}" ] || { rm -rf "$CACHE.lock"; FALLBACK_BUILD=""; }
-    fi
     local failed=0
     for x in "${jobs[@]}"; do wait "$x" || failed=1; done
     if [ -f "$TMP/refused" ]; then
         note_times
-        on_pod "tail -n 40 /workspace/pydeps.log $WS/data-*.log 2> /dev/null" > "$OUT/data.log" 2>&1
+        on_pod "tail -n 40 $WS/pyenv.log 2> /dev/null" > "$OUT/data.log" 2>&1
         say "the data builds' logs are in $OUT/data.log"
         exit 1
     fi
@@ -3327,9 +2905,8 @@ live_profile() {
 # Sets RC to its exit status; returns 1 when the pod is lost first.
 run_command() {
     {
-        echo "export PATH=\$HOME/.cargo/bin:$WS/bin:/usr/local/cuda/bin:\$PATH"
+        echo "export PATH=/usr/local/cuda/bin:\$PATH"
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
-        echo "export MPD_BIN=$WS/bin"
         [ -z "$PYENV_DIR" ] || echo "export VIRTUAL_ENV=$PYENV_DIR PATH=$PYENV_DIR/bin:\$PATH"
         [ -z "$PYENV_DIR" ] && [ -z "${RP_HF_MODELS:-}" ] || echo "export HF_HOME=/workspace/hf-home"
         echo 'echo "# $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader), $(nvidia-smi | grep -o "CUDA Version: [0-9.]*")"'
@@ -3464,8 +3041,6 @@ hold() {
 
 case $MODE in
     run)
-        build_binaries
-        plan_binaries
         attempt=1
         until launch && setup && run_command; do
             [ ! -f "$OUT/STOP" ] || exit 1
@@ -3508,19 +3083,16 @@ case $MODE in
     dev)
         launch && setup || exit 1
         # A git repository of the commit, so changes made on the pod show as a diff against it.
-        on_pod "cd $WS/src && git init -q && echo /method/target/ > .git/info/exclude && git add -A && git -c user.name=rp-run -c user.email=rp-run@localhost commit -qm ${C:0:12}" ||
+        on_pod "cd $WS/src && git init -q && git add -A && git -c user.name=rp-run -c user.email=rp-run@localhost commit -qm ${C:0:12}" ||
             { say "could not make the source a git repository"; exit 1; }
-        # The dependencies compile while the developer starts: a release and a test build of mpd-tensor.
-        on_pod "cd $WS/src/method && setsid nohup bash -c 'source ~/.cargo/env; cargo build --release -p mpd-tensor --example tensor_f32_speed ${VCPU:+-j $VCPU} && cargo test -p mpd-tensor --no-run --test tensor_f32 --test tensor_posterior ${VCPU:+-j $VCPU}' > $WS/warm.log 2>&1 < /dev/null &" ||
-            { say "could not start the warm build"; exit 1; }
-        # The toolchain and CUDA for every shell, a command over SSH included (sourced before
+        # CUDA for every shell, a command over SSH included (sourced before
         # .bashrc's early return for non-interactive shells); a login starts in the source.
         {
-            echo "export PATH=\$HOME/.cargo/bin:$WS/bin:/usr/local/cuda/bin:\$PATH"
+            echo "export PATH=/usr/local/cuda/bin:\$PATH"
             echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}'
         } | on_pod "cat > $WS/env.sh && sed -i '1i . $WS/env.sh' ~/.bashrc && echo 'cd $WS/src' >> ~/.bashrc" || exit 1
         access
-        say "dev pod $POD ready: $OUT/ssh; source $WS/src at ${C:0:12}; rust $CHANNEL; warm build in $WS/warm.log"
+        say "dev pod $POD ready: $OUT/ssh; source $WS/src at ${C:0:12}"
         hold || exit 1
         exit 0 ;;
 esac

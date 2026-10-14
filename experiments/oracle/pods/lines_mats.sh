@@ -28,5 +28,5 @@ for j in $(seq 0 $((JOBS - 1))); do
     PROCS="$PROCS ($PY -B lines.py --teachers $TEACHERS --out $O/out --tasks $TASKS --vpd $VPD --offset $((j * P + k)) --stride $S ${LEVELS:+--levels $LEVELS} > $O/lines_${j}_$k.log 2>&1; echo \"exit \$?\" >> $O/lines_${j}_$k.log) &"
   done
   CMD="mkdir -p $T $O/out; export TMPDIR=$T HF_HOME=$T/hf TRITON_CACHE_DIR=$T/triton TORCHINDUCTOR_CACHE_DIR=$T/inductor OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; $ADD cd /Users/user/params/method/oracle; $PY /Users/user/params/experiments/oracle/pods/gpu_free.py --hours $WAIT --share 0.5 > $O/gpu_free_$j.log 2>&1 || exit 1; ls /Users/user/mpd-data/graph_oracle/texts/vpd4l /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt > /dev/null; $PROCS wait; echo done"
-  MATS_REF=$REF MATS_GPUS=1 MATS_BUILD=0 experiments/infra/mats/mats-run $N-$j $((4 * P)) ${MEM:-64} $(python3 -c "print(round($H + $WAIT, 2))") -- bash -c "$CMD"
+  MATS_REF=$REF MATS_GPUS=1 experiments/infra/mats/mats-run $N-$j $((4 * P)) ${MEM:-64} $(python3 -c "print(round($H + $WAIT, 2))") -- bash -c "$CMD"
 done

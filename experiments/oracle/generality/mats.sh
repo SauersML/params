@@ -20,8 +20,8 @@ for j in $(seq 0 $((JOBS - 1))); do
   [ "${CPU:-0}" = 1 ] && GPUWAIT="export CUDA_VISIBLE_DEVICES='';"
   CMD="mkdir -p $T $O/out; export TMPDIR=$T TRITON_CACHE_DIR=$T/triton TORCHINDUCTOR_CACHE_DIR=$T/inductor OMP_NUM_THREADS=$TH MKL_NUM_THREADS=$TH TODO=$TODO ORACLE=/Users/user/params/method/oracle GEN_DATA=$D MECH=/Users/user/mpd-data/graph_oracle/mechanisms; ls $D /Users/user/mpd-data/graph_oracle/mechanisms /Users/user/mpd-data/graph_oracle/texts/vpd4l /Users/user/mpd-data/graph_oracle/teacher/joint_train ${EXTRA:-} > /dev/null; $GPUWAIT cd /Users/user/params/experiments/oracle/generality; $PROCS wait; echo done"
   if [ "${CPU:-0}" = 1 ]; then
-    env ${REF:+MATS_REF=$REF} MATS_BUILD=0 experiments/infra/mats/mats-run $N-$j ${CPUS:-8} ${MEM:-48} $H -- bash -c "$CMD"
+    env ${REF:+MATS_REF=$REF} experiments/infra/mats/mats-run $N-$j ${CPUS:-8} ${MEM:-48} $H -- bash -c "$CMD"
   else
-    env ${REF:+MATS_REF=$REF} MATS_GPUS=1 MATS_BUILD=0 experiments/infra/mats/mats-run $N-$j 8 ${MEM:-48} $(python3 -c "print(round($H + $WAIT, 2))") -- bash -c "$CMD"
+    env ${REF:+MATS_REF=$REF} MATS_GPUS=1 experiments/infra/mats/mats-run $N-$j 8 ${MEM:-48} $(python3 -c "print(round($H + $WAIT, 2))") -- bash -c "$CMD"
   fi
 done

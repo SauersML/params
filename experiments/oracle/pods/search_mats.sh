@@ -22,5 +22,5 @@ for j in $(seq 0 $((JOBS - 1))); do
   done
   [ "$j" = 0 ] && [ -n "$RANKED" ] && PROCS="$PY native.py ranked --split train heldout hard --n 100000 --top $RANKED --out $O/vpd_ranked > $O/ranked.log 2>&1; $PROCS"
   CMD="mkdir -p $T $OUT; export TMPDIR=$T TRITON_CACHE_DIR=$T/triton TORCHINDUCTOR_CACHE_DIR=$T/inductor OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; cd /Users/user/params/method/oracle; $PY /Users/user/params/experiments/oracle/pods/gpu_free.py --hours $WAIT --share 0.5 > $O/gpu_free_$j.log 2>&1 || exit 1; ls /Users/user/mpd-data/graph_oracle/texts/vpd4l > /dev/null; $PROCS wait; echo done"
-  MATS_GPUS=1 MATS_BUILD=0 experiments/infra/mats/mats-run $N-$j 8 ${MEM:-48} $(python3 -c "print(round($H + $WAIT, 2))") -- bash -c "$CMD"
+  MATS_GPUS=1 experiments/infra/mats/mats-run $N-$j 8 ${MEM:-48} $(python3 -c "print(round($H + $WAIT, 2))") -- bash -c "$CMD"
 done

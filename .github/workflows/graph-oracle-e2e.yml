@@ -4,8 +4,7 @@ name: Graph Oracle E2E
 # part tokens, copycheck, prompted, score, the goal scorecard on a tiny random model of vpd4l's
 # architecture (its vpd4l checks skip here), the frozen reader of the RL loop, and the RL scorer and
 # trainer (scripts) on a tiny random Qwen3. test_mech's sandbox test tokenizes with vpd4l's
-# tokenizer, a file under the Mac's mpd-data, and is left out here. No test runs the Rust checker
-# (method/crates/mpd/examples/mpd_graph_2951.rs), so nothing here compiles.
+# tokenizer, a file under the Mac's mpd-data, and is left out here.
 
 on:
   push:

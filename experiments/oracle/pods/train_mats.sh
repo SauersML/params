@@ -42,5 +42,5 @@ $PY rl/train.py --mode rl2 --revise --reader $COMMON --init $A --samples ${SAMPL
 $PY rl/train.py --mode eval $COMMON --revise --necessity --transfer --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name ${N}_rl > $O/eval_rl/log 2>&1; \
 $EVAL_HARD ${EVIDENCE:+$SWAP} echo done"
 for i in $(seq 1 ${COPIES:-1}); do
-  MATS_GPUS=1 MATS_BUILD=0 experiments/infra/mats/mats-run $N$([ "${COPIES:-1}" -gt 1 ] && echo "-$i") 8 ${MEM:-40} $(python3 -c "print(round($RH + 4.0 + $WAIT, 2))") -- bash -c "$CMD"
+  MATS_GPUS=1 experiments/infra/mats/mats-run $N$([ "${COPIES:-1}" -gt 1 ] && echo "-$i") 8 ${MEM:-40} $(python3 -c "print(round($RH + 4.0 + $WAIT, 2))") -- bash -c "$CMD"
 done

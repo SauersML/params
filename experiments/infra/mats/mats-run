@@ -4,14 +4,11 @@
 #   mats-run NAME CPUS MEM_GB HOURS -- COMMAND...
 #
 # Submits COMMAND as Slurm job NAME (CPUS cores, RAYON_NUM_THREADS=CPUS, MEM_GB, HOURS wall, may be
-# fractional) built from the published commit of ~/params's HEAD (unpushed commits are rejected),
-# and prints the job id. Binaries are built once per commit in their own build job; the run waits
-# on it.
+# fractional) at the published commit of ~/params's HEAD (unpushed commits are rejected), and prints
+# the job id.
 #
 # Paths are translated: /Users/user/mpd-data/... -> the cluster's ~/mpd-data/...;
-# /Users/user/params/method/target/release/examples/X, method/target/release/examples/X (or the same
-# without method/) and
-# `cargo run ... --example X -- ARGS` -> that commit's X; /Users/user/params/... -> a snapshot of the
+# /Users/user/params/... -> a snapshot of the
 # source at that commit (also the job's working directory); python/python3 or the Mac venv's
 # python -> the cluster venv (numpy, scipy). Every existing /Users/user/mpd-data input the command
 # names (outside mpd-data/cluster/) is rsynced up first, absolute symlinks as the files they name
@@ -34,14 +31,10 @@
 # MATS_MEM_EXACT=1 keeps MEM_GB as given.
 #
 # Environment: MATS_GPUS=N (L40s; CUDA 12.2 libs are on LD_LIBRARY_PATH),
-# MATS_ENV="K=V ..." (extra environment for the command; RUST_LOG is forwarded when set), MATS_DRY=1
+# MATS_ENV="K=V ..." (extra environment for the command), MATS_DRY=1
 # (print the translated command and the uploads, submit nothing), MATS_REF=<commit> (run that pushed
-# commit instead of HEAD; a commit that failed to build is refused with its compiler errors),
-# MATS_BUILD=0|1 (whether the job needs the commit's Rust binaries; by default only a command that
-# names one does, so a Python script under /Users/user/params starts without waiting for a build;
-# set 1 when a script calls a binary itself, through $MPD_BIN).
-# MATS_AFTEROK=ID:ID adds required successful jobs atomically at submission, alongside any build
-# dependency. Applies to ordinary jobs/arrays/chains, not pool tasks or in-place swaps.
+# commit instead of HEAD).
+# MATS_AFTEROK=ID:ID adds required successful jobs atomically at submission. Applies to ordinary jobs/arrays/chains, not pool tasks or in-place swaps.
 #
 # Pool: MATS_POOL=1 queues the job (each array index a task) for long-lived pool workers instead of
 # submitting it; a worker (normal QOS) packs tasks into its CPUs/GPUs/memory as job steps, takes the
@@ -93,37 +86,17 @@ fi
 
 MAC_DATA=/Users/user/mpd-data MAC_REPO=/Users/user/params CL_DATA=/mnt/nw/home/s.sauers/mpd-data
 
-# `cargo run [...] --example X [...] -- ARGS` -> X ARGS
-if [ "$1" = cargo ]; then
-    ex="" rest=()
-    while [ $# -gt 0 ]; do
-        case $1 in
-            --example) ex=$2; shift 2 ;;
-            --example=*) ex=${1#--example=}; shift ;;
-            --) shift; rest=("$@"); break ;;
-            *) shift ;;
-        esac
-    done
-    [ -n "$ex" ] || { echo "mats-run: only 'cargo run --example X' is translated" >&2; exit 2; }
-    set -- "$ex" "${rest[@]}"
-fi
-
 uploads=()
 words=()
 first=1
 for a in "$@"; do
     if [ $first = 1 ]; then
         case $a in
-            "$MAC_REPO"/method/target/*/examples/*|method/target/*/examples/*|./method/target/*/examples/*|"$MAC_REPO"/target/*/examples/*|target/*/examples/*|./target/*/examples/*) a="@@BIN@@/${a##*/}" ;;
             python|python3|"$MAC_DATA"/venv/bin/python*) a=python ;;
             /*)
-                # A Mac binary (say a pinned copy in engine/bin/) runs as the
-                # same example built at the chosen commit.
                 if [ -f "$a" ] && file -b "$a" | grep -q Mach-O; then
-                    ex=${a##*/}
-                    [[ $ex =~ _2951$ ]] || ex=$(sed -E 's/_[0-9a-f]{4,}$//' <<< "$ex")_2951
-                    echo "mats-run: Mac binary ${a##*/} runs as the commit's $ex" >&2
-                    a="@@BIN@@/$ex"
+                    echo "mats-run: ${a##*/} is a Mac binary, which cannot run on the cluster" >&2
+                    exit 2
                 fi ;;
         esac
         first=0
@@ -133,14 +106,11 @@ for a in "$@"; do
         case $p in "$MAC_DATA"/cluster/*|"$MAC_DATA"/venv*) continue ;; esac
         [ -e "$p" ] && uploads+=("$p")
     done < <(grep -oE "$MAC_DATA/[^ :,;=\"']+" <<< "$a" || true)
-    a=${a//$MAC_REPO\/method\/target\/release\/examples\//@@BIN@@/}
-    a=${a//$MAC_REPO\/target\/release\/examples\//@@BIN@@/}
     a=${a//$MAC_REPO\//@@BIN@@/src/}
     a=${a//$MAC_DATA/$CL_DATA}
     words+=("$a")
 done
 envp=()
-[ -n "${RUST_LOG:-}" ] && envp+=("RUST_LOG=$RUST_LOG")
 [ -n "${MATS_ENV:-}" ] && read -r -a extra <<< "$MATS_ENV" && envp+=("${extra[@]}")
 cmd=$(printf '%q ' "${words[@]}")
 cmd=${cmd//\\\{task\\\}/'"${SLURM_ARRAY_TASK_ID}"'}
@@ -190,6 +160,6 @@ COPYFILE_DISABLE=1 tar --no-mac-metadata -C "$here" -cf - pool_worker.sh cluster
 want=$(git -C "$MAC_REPO" rev-parse "${MATS_REF:-HEAD}")
 b64=$(printf '%s' "$cmd" | base64 | tr -d '\n')
 rc=0
-ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_BUILD:-auto}" "${MATS_POOL:-0}" "'${MATS_SWAP:-}'" "'$AFTEROK'" < "$here/remote_submit.sh" || rc=$?
+ssh mats bash -s -- "$NAME" "$CPUS" "$MEM" "$MINUTES" "$want" "$GPUS" "'$QOS'" "$b64" "'$ARRAY'" "$CHAIN" "${MATS_POOL:-0}" "'${MATS_SWAP:-}'" "'$AFTEROK'" < "$here/remote_submit.sh" || rc=$?
 (( rc == 0 )) || echo "mats-run: nothing submitted (cluster side exited $rc)" >&2
 exit $rc

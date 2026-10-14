@@ -10,9 +10,10 @@ with their lines before it is scored (goal_eval.strand), so the circuit scored i
 
 The descent is teacher.Descent.prune's (measured block removal, the largest admitted prefix of the ranked blocks, the
 culprits refused alone frozen for the level), coarse to fine (LEVELS: every line into the parts at one position, out of
-one position, into one part, out of one part or token, then single lines). Its KL is the point run, one C-semantics
-plan of the fully wired circuit with the lines as strength rows and the states before the first part reused; its budget
-the point family's floor. A removal is admitted when
+one position, into one part, out of one part or token, between one pair of matrices, then single lines). Its KL is the
+point run, one C-semantics plan of the fully wired circuit with the lines as strength rows and the states before the
+first part reused, the ranking's ties broken by s_track_pp on the search draws (token edges and lines a change alone
+carries leave the point run as it is); its budget the point family's floor. A removal is admitted when
   changed     s_track_pp on fresh search-pool draws (teacher.Acceptance, draws "fv": the model's likeliest alternative
               judged draw by draw against its own floor, sampled tokens pooled) stays at its floor;
   floors      every family the frozen reward scores on the text stays at its floor (goal_eval.tau's floors, each at most
@@ -58,7 +59,7 @@ import goal_eval  # noqa: E402
 import native  # noqa: E402
 import teacher  # noqa: E402
 
-LEVELS = ("reader_position", "writer_position", "reader", "writer", "line")
+LEVELS = ("reader_position", "writer_position", "reader", "writer", "sites", "line")
 VAL_MARGIN = 0.02  # validation: s_track_pp at least the fully wired circuit's less this (the lead's 10-13: at
 # min(0.9, start - 0.05) text9000's pruned circuit fell to eval 0.81 against the complete 0.965)
 MAX_STEPS = 24  # accepted removals per process
@@ -151,9 +152,22 @@ class LinePruner(teacher.Descent):
         self.measured += len(ons)
         return out
 
+    @torch.no_grad()
+    def kl_rank(self, ons: torch.Tensor) -> list[float]:
+        """The ranking's KLs: kl_sets', ties (lines the point run on the text cannot tell apart: token edges, lines a
+        change alone carries) broken by s_track_pp on the search draws, the subset keeping it highest first."""
+        kl = self.kl_sets(ons)
+        rows = torch.stack([self.row(on) for on in ons]).float()
+        tr = []
+        for s0 in range(0, len(rows), 64):
+            tr += [r["s_track_pp"] or 0.0 for r in self.ge.track_pp(self.tx, [self.g], "search", lines=rows[s0:s0 + 64])]
+            native.free(self.dev)
+        return [k + 1e-6 * (1.0 - t) for k, t in zip(kl, tr)]
+
     def blocks(self, level: str) -> list[torch.Tensor]:
         """The kept lines grouped (LEVELS): by the reader's position (the prediction its own group), the writer's (a
-        token edge's: its token's), the reader, the writer, or single lines."""
+        token edge's: its token's), the reader, the writer, the pair of matrices (writer's or token, reader's or the
+        prediction) at any positions, or single lines."""
         ids = self.on.nonzero().flatten()
         if level == "line":
             return list(ids.split(1))
@@ -166,6 +180,8 @@ class LinePruner(teacher.Descent):
                 return repr(reader)
             if level == "writer":
                 return repr(writer)
+            if level == "sites":
+                return repr(("tok" if writer[0] == "tok" else writer[0], "out" if reader == "out" else reader[0]))
             if level == "reader_position":
                 return "out" if reader == "out" else str(reader[1])
             return str(writer[1])

@@ -16,8 +16,9 @@ Sets:
   causalgym  generality's CausalGym teacher circuits against the same circuit with the subject's nodes moved to the
              attractor (cg_teacher.test's pair)
   dev        dev teacher circuits against random subsets of their start of the same size (3 seeds)
-  reference  per dev text the teacher, VPD's actives at the START's positions (the start set) and VPD's whole answer
-             (the share alone): whether a node-values floor relative to VPD would be fair (the lead's 10-13 question)
+  reference  per dev text the teacher, VPD's actives at the START's positions (the start set), VPD's whole answer (the
+             share alone) and, where the START is larger than the teacher, random subsets of it of the teacher's size (3
+             seeds): whether a node-values floor relative to VPD would be fair (the lead's 10-13 question)
 
   python node_values.py toys --toys ~/mpd-data/toys_planted --out OUT.jsonl
   python node_values.py causalgym --teacher ~/mpd-data/graph_oracle/generality/cg_teacher_b2 --out OUT.jsonl
@@ -149,10 +150,14 @@ def reference(a) -> None:
             ids, targets = native.text(native.TEXTS / "vpd4l" / f"{task}.json")
             tx = ge.text(ids, targets, native.task_seed(task))
             g, _ = goal_eval.circuit(json.loads(f.read_text()), targets, nat.C, tx.T)
-            graphs = {"teacher": native.Graph(sorted(g.node_set()), complete=True),
-                      "vpd_at_start": native.Graph(sorted(ge.start_set(tx, "search")["graph"].node_set()), complete=True),
+            nodes = sorted(g.node_set())
+            start = sorted(ge.start_set(tx, "search")["graph"].node_set())
+            graphs = {"teacher": native.Graph(nodes, complete=True), "vpd_at_start": native.Graph(start, complete=True),
                       "vpd": native.Graph(masks=tx.vpd)}
-            got = agreement(ge, tx, list(graphs.values()), effects=[True, True, False])
+            if len(start) > len(nodes):
+                for s in range(3):
+                    graphs[f"start_subset{s}"] = native.Graph(sorted(random.Random(s).sample(start, len(nodes))), complete=True)
+            got = agreement(ge, tx, list(graphs.values()), effects=[k != "vpd" for k in graphs])
             for arm, r in zip(graphs, got):
                 fh.write(json.dumps({"set": "reference", "text": task, "circuit": arm, **r}) + "\n")
                 print(task, arm, json.dumps(r), flush=True)

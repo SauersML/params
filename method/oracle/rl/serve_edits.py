@@ -67,10 +67,12 @@ def work(device: str | None, goals: str, inbox, outbox) -> None:
     prefs = {r["id"]: r["pref"] for r in map(json.loads, Path(goals).read_text().splitlines())}
     served = 0
     while True:
-        if served >= RECYCLE and inbox.empty():  # a fresh process (the pool starts it again): MPS memory grew to 24.5 GiB
-            outbox.close()  # over a night of steps although each call was freed; exit only with nothing queued, so none is
-            outbox.join_thread()  # lost, after the answers already put have gone out
-            os._exit(0)
+        if served >= RECYCLE:
+            # Flush the entire finished batch. The pool preserves delayed replies
+            # and queued requests across this explicitly graceful retirement.
+            outbox.close()
+            outbox.join_thread()
+            os._exit(serve_scores.GRACEFUL_RECYCLE_EXIT)
         batch = [inbox.get()]
         while True:
             try:
@@ -87,8 +89,14 @@ def work(device: str | None, goals: str, inbox, outbox) -> None:
                 answers = [a for _, ans in reqs for a in ans]
                 got = []
                 for k in range(0, len(answers), CHUNK):  # a few answers at a time, the device cache freed after each:
-                    got += ver.answers(prefs[gid], answers[k:k + CHUNK], part)  # 16 at once reached 28 GiB on MPS
-                    free_device()
+                    try:
+                        chunk = answers[k:k + CHUNK]
+                        scores = ver.answers(prefs[gid], chunk, part)
+                        if len(scores) != len(chunk):
+                            raise RuntimeError('verifier returned a different number of scores')
+                        got += scores
+                    finally:
+                        free_device()
                 for s in got:
                     s["feedback"], s["source"] = feedback(s), source
                 err = None

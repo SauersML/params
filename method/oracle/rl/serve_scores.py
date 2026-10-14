@@ -79,6 +79,9 @@ def work(device: str | None, texts: str, inbox, outbox) -> None:
                 at += len(srcs)
 
 
+GRACEFUL_RECYCLE_EXIT = 75
+
+
 class Pool:
     """The scoring processes, a request id counter, and the futures of the requests in flight. A process that dies (out
     of memory) is started again and its requests in flight fail with an error instead of waiting forever."""
@@ -113,18 +116,25 @@ class Pool:
     def watch(self) -> None:
         while True:
             time.sleep(5)
-            for i, p in enumerate(self.procs):
-                if p.is_alive():
-                    continue
-                with self.lock:
-                    lost = [rid for rid, w in self.owner.items() if w == i]
-                    futs = [self.waiting.pop(rid) for rid in lost if rid in self.waiting]
-                    for rid in lost:
-                        self.owner.pop(rid, None)
-                for fut in futs:
-                    fut.set_exception(RuntimeError(f"scoring process {i} died (exit code {p.exitcode})"))
-                print(f"serve_scores: scoring process {i} died (exit code {p.exitcode}); starting it again", flush=True)
+            self.restart_dead()
+
+    def restart_dead(self) -> None:
+        """A flushed planned retirement keeps queued work and delayed replies alive."""
+        for i, p in enumerate(self.procs):
+            if p.is_alive():
+                continue
+            if p.exitcode == GRACEFUL_RECYCLE_EXIT:
                 self.procs[i] = self.start(self.inboxes[i])
+                continue
+            with self.lock:
+                lost = [rid for rid, w in self.owner.items() if w == i]
+                futs = [self.waiting.pop(rid) for rid in lost if rid in self.waiting]
+                for rid in lost:
+                    self.owner.pop(rid, None)
+            for fut in futs:
+                fut.set_exception(RuntimeError(f"scoring process {i} died (exit code {p.exitcode})"))
+            print(f"serve_scores: scoring process {i} died (exit code {p.exitcode}); starting it again", flush=True)
+            self.procs[i] = self.start(self.inboxes[i])
 
     def submit(self, req: dict) -> Future:
         fut, rid = Future(), next(self.ids)

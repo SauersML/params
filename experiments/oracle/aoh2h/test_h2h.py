@@ -68,13 +68,16 @@ def test_scan_and_answerer_B_stay_within_the_budget():
     tg = FakeTarget()
     rng = random.Random(1)
     it = item(rng)
-    for budget in (64, 256):
+    for budget in (16, 64, 256):
         m = h2h.Model(tg)
         rows = h2h.answer_B(tg, m, it, budget, random.Random(2))
         assert m.passes <= budget, (m.passes, budget)
         assert {r["q"] for r in rows} == {"a", "b", "c"}
         a = next(r for r in rows if r["q"] == "a")
-        assert a["draws"][5] >= h2h.STAGE1  # shortlisted or hinted, or the first stage's alone
+        if budget >= len(h2h.CANDS) + 4:  # the scan fits: (a) from interventions, the hinted position at least stage 1's draws
+            assert a["by"] == "interventions" and a["draws"][5] >= h2h.STAGE1
+        else:  # the budget leaves (a) to the oracle
+            assert a["by"] == "oracle"
 
 
 def test_the_oracle_hint_is_the_named_words_position():

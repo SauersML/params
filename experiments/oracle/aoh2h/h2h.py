@@ -58,8 +58,8 @@ SWAPS = 10
 PAIRS = 3
 K = 8  # sampled oracle answers per question
 Q_A = "Which earlier word is most important for predicting the next word?"
-BUDGET = 256  # forward passes of the model per text's battery (the builder's included)
-FACT_BUDGET = 16
+BUDGETS = (16, 64, 256)  # forward passes of the model per text's battery (the builder's included), each answerer at
+# each (the lead's 10-14: at 256 B is near exact on (a)-(c); a circuit built once per text pays at the low budgets)
 D_BUDGET = 64  # (d)'s passes per text, apart from the battery's
 CONTROLS = 16  # (d)'s collateral texts
 TOKENS_TRIED = 4
@@ -307,44 +307,55 @@ def find(tg, ids: list[int], word: str | None, among: list[int]) -> int | None:
     return hits[-1] if hits else None
 
 
-def answer_A(tg, m: Model, it: dict) -> list[dict]:
-    """The oracle alone: every question asked of the oracle on the text's activations (no forward pass charged
-    beyond the one that reads them)."""
-    ids, out = it["ids"], []
+def read(tg, m: Model, ids: list[int]):
+    """The text's activations at the oracle's depth, every position (one pass)."""
     with tg.use(None):
         H, _ = tg.hidden(ids)
     m.passes += 1
-    acts = H[tg.act_layer + 1]
-    tokstr = lambda p: tg.tok.decode([ids[p]]).strip()  # noqa: E731
-    if it["kind"] == "fact":
-        w = it["word"]
-        cand = [f"the first '{w}'", f"the second '{w}'"]
-        ans, conf, _ = ao_votes(tg, ids, f"Does the model's next word depend more on the first or the second mention of "
-                                          f"'{w}'? Answer first or second.", acts, ["first", "second"])
-        pick = {"first": 0, "second": 1}.get(norm(ans))
-        out.append({"q": "fact", "pick": pick, "conf": conf if pick is not None else 0.5, "ok": pick == it["gt"]})
-        return out
-    cands = list(CANDS)
+    return H[tg.act_layer + 1]
+
+
+def ao_a(tg, ids, acts, gt: int) -> dict:
     ans, conf, _ = ao_votes(tg, ids, Q_A, acts)
-    p = find(tg, ids, ans, cands)
-    out.append({"q": "a", "pick": p, "conf": conf if p is not None else 0.0, "ok": p == it["a"]["gt"]})
-    for s in it["b"]:
-        x, y = tokstr(s["p"]), tg.tok.decode([s["y"]]).strip()
-        yn, c1, _ = ao_votes(tg, ids, f"If the word '{x}' were replaced by '{y}', would the next word change? Answer yes or no.",
-                             acts, ["yes", "no"])
-        ch = norm(yn) == "yes"
-        new, c2 = None, 1.0
-        if ch:
-            new, c2, _ = ao_votes(tg, ids, f"If the word '{x}' were replaced by '{y}', what would the next word be?", acts)
-        ok = ch == s["changes"] and (not ch or norm(new) == norm(tg.tok.decode([s["new_top"]])))
-        out.append({"q": "b", "changes": ch, "new": new, "conf": c1 * c2, "ok": ok})
-    for c in it["c"]:
-        p1, p2 = c["pair"]
-        w, conf, _ = ao_votes(tg, ids, f"Which word matters more for the model's next word: '{tokstr(p1)}' or '{tokstr(p2)}'?", acts,
-                              [tokstr(p1), tokstr(p2)])
-        pick = p1 if w and norm(w) == norm(tokstr(p1)) else p2 if w and norm(w) == norm(tokstr(p2)) else None
-        out.append({"q": "c", "pick": pick, "conf": conf if pick is not None else 0.5, "ok": pick == c["gt"]})
-    return out
+    p = find(tg, ids, ans, list(CANDS))
+    return {"q": "a", "pick": p, "conf": conf if p is not None else 0.0, "ok": p == gt, "by": "oracle"}
+
+
+def ao_b(tg, ids, acts, s: dict) -> dict:
+    x, y = tg.tok.decode([ids[s["p"]]]).strip(), tg.tok.decode([s["y"]]).strip()
+    yn, c1, _ = ao_votes(tg, ids, f"If the word '{x}' were replaced by '{y}', would the next word change? Answer yes or no.",
+                         acts, ["yes", "no"])
+    ch = norm(yn) == "yes"
+    new, c2 = None, 1.0
+    if ch:
+        new, c2, _ = ao_votes(tg, ids, f"If the word '{x}' were replaced by '{y}', what would the next word be?", acts)
+    ok = ch == s["changes"] and (not ch or norm(new) == norm(tg.tok.decode([s["new_top"]])))
+    return {"q": "b", "changes": ch, "new": new, "conf": c1 * c2, "ok": ok, "by": "oracle"}
+
+
+def ao_c(tg, ids, acts, c: dict) -> dict:
+    p1, p2 = c["pair"]
+    w1, w2 = tg.tok.decode([ids[p1]]).strip(), tg.tok.decode([ids[p2]]).strip()
+    w, conf, _ = ao_votes(tg, ids, f"Which word matters more for the model's next word: '{w1}' or '{w2}'?", acts, [w1, w2])
+    pick = p1 if w and norm(w) == norm(w1) else p2 if w and norm(w) == norm(w2) else None
+    return {"q": "c", "pick": pick, "conf": conf if pick is not None else 0.5, "ok": pick == c["gt"], "by": "oracle"}
+
+
+def ao_fact(tg, ids, acts, it: dict) -> dict:
+    w = it["word"]
+    ans, conf, _ = ao_votes(tg, ids, f"Does the model's next word depend more on the first or the second mention of "
+                                      f"'{w}'? Answer first or second.", acts, ["first", "second"])
+    pick = {"first": 0, "second": 1}.get(norm(ans))
+    return {"q": "fact", "pick": pick, "conf": conf if pick is not None else 0.5, "ok": pick == it["gt"], "by": "oracle"}
+
+
+def answer_A(tg, m: Model, it: dict) -> list[dict]:
+    """The oracle alone: every question asked of the oracle on the text's activations (one pass reads them)."""
+    ids = it["ids"]
+    acts = read(tg, m, ids)
+    if it["kind"] == "fact":
+        return [ao_fact(tg, ids, acts, it)]
+    return [ao_a(tg, ids, acts, it["a"]["gt"])] + [ao_b(tg, ids, acts, s) for s in it["b"]] + [ao_c(tg, ids, acts, c) for c in it["c"]]
 
 
 def scan(tg, m: Model, it: dict, base, budget: int, rng: random.Random, hint=()) -> tuple[dict, dict]:
@@ -381,42 +392,51 @@ def answer_R(it: dict) -> list[dict]:
 
 
 def answer_B(tg, m: Model, it: dict, budget: int, rng: random.Random, hint=()) -> list[dict]:
-    """The oracle plus direct interventions: swaps run directly (one pass each, exact), then the two-stage influence
-    scan with what the budget leaves, the oracle's pick among the shortlist (hint); pairs from the same effects."""
+    """The oracle plus direct interventions, within the budget: the model's own top token (one pass) and the oracle's
+    reading (one pass); each swap run directly (one pass, exact) while passes last; the two-stage influence scan for
+    (a) and (c) when what is left covers one draw per candidate, the oracle's pick on its shortlist (hint); every
+    question the budget leaves out answered by the oracle (answer_A's)."""
     ids, out = it["ids"], []
     base = m.logp([ids])
+    top = int(base[0].argmax())
+    acts = read(tg, m, ids)
     if it["kind"] == "fact":
-        n = max(1, (budget - 2) // 2)
-        dr = draws(m, ids, it["positions"], n, rng)
-        e = effects(m, ids, dr, base)
+        if budget - m.passes < 3:  # (the draws' distribution and a draw at each statement)
+            return [ao_fact(tg, ids, acts, it)]
+        n = max(1, (budget - m.passes - 1) // 2)
+        e = effects(m, ids, draws(m, ids, it["positions"], n, rng), base)
         eff = [e[p] for p in it["positions"]]
         pick = 0 if eff[0] >= eff[1] else 1
-        conf = max(eff) / max(sum(eff), 1e-12)
-        out.append({"q": "fact", "pick": pick, "conf": conf, "ok": pick == it["gt"]})
-        return out
-    if not hint:  # the oracle's pick for (a), read from the text's activations (one pass), into the shortlist
-        with tg.use(None):
-            H, _ = tg.hidden(ids)
-        m.passes += 1
-        ans, _, _ = ao_votes(tg, ids, Q_A, H[tg.act_layer + 1])
-        p = find(tg, ids, ans, list(CANDS))
-        hint = (p,) if p is not None else ()
-    top = it["top"]
-    for s in it["b"]:  # one pass each: exact
+        return [{"q": "fact", "pick": pick, "conf": max(eff) / max(sum(eff), 1e-12), "ok": pick == it["gt"], "by": "interventions"}]
+    a_ao = None
+    if not hint:
+        a_ao = ao_a(tg, ids, acts, it["a"]["gt"])
+        hint = (a_ao["pick"],) if a_ao["pick"] is not None else ()
+    need_scan = len(CANDS) + 2
+    for s in it["b"]:
+        if budget - m.passes < 1:
+            out.append(ao_b(tg, ids, acts, s))
+            continue
         x = list(ids)
         x[s["p"]] = s["y"]
         new = int(m.logp([x])[0].argmax())
         ch = new != top
         out.append({"q": "b", "changes": ch, "new": tg.tok.decode([new]).strip(), "conf": 1.0,
-                    "ok": ch == s["changes"] and (not ch or new == s["new_top"])})
+                    "ok": ch == s["changes"] and (not ch or new == s["new_top"]), "by": "interventions"})
+    if budget - m.passes < need_scan:
+        out.append(a_ao or ao_a(tg, ids, acts, it["a"]["gt"]))
+        out += [ao_c(tg, ids, acts, c) for c in it["c"]]
+        return out
     eff, n = scan(tg, m, it, base, budget, rng, hint=hint)
     order = sorted(eff, key=lambda p: -eff[p])
     z = [eff[p] for p in order[:5]]
-    out.append({"q": "a", "pick": order[0], "conf": z[0] / max(sum(z), 1e-12), "ok": order[0] == it["a"]["gt"], "draws": n})
+    out.append({"q": "a", "pick": order[0], "conf": z[0] / max(sum(z), 1e-12), "ok": order[0] == it["a"]["gt"], "draws": n,
+                "by": "interventions"})
     for c in it["c"]:
         p1, p2 = c["pair"]
         pick = p1 if eff[p1] >= eff[p2] else p2
-        out.append({"q": "c", "pick": pick, "conf": max(eff[p1], eff[p2]) / max(eff[p1] + eff[p2], 1e-12), "ok": pick == c["gt"]})
+        out.append({"q": "c", "pick": pick, "conf": max(eff[p1], eff[p2]) / max(eff[p1] + eff[p2], 1e-12), "ok": pick == c["gt"],
+                    "by": "interventions"})
     return out
 
 
@@ -424,21 +444,22 @@ def run(a) -> None:
     items = [json.loads(x) for x in a.items.read_text().splitlines()]
     done = {(json.loads(x)["id"], json.loads(x)["system"]) for x in a.out.read_text().splitlines()} if a.out.exists() else set()
     tg = ao_verify.Target(a.model, a.device)
+    runs = [(s_, None) for s_ in a.systems if s_ != "B"] + [(f"B@{b}", b) for b in a.budgets if "B" in a.systems]
     for it in items:
-        for sysname in a.systems:
+        for sysname, budget in runs:
             if (it["id"], sysname) in done:
                 continue
             m, t0 = Model(tg), time.time()
-            budget = a.budget if it["kind"] == "text" else FACT_BUDGET
             if sysname == "R":
                 rows = answer_R(it)
             elif sysname == "A":
                 rows = answer_A(tg, m, it)
-            elif sysname == "B":
+            elif sysname.startswith("B@"):
                 rows = answer_B(tg, m, it, budget, random.Random(f"{it['id']}B"))
+                assert m.passes <= max(budget, 3), (sysname, m.passes)
             else:
                 raise SystemExit(f"system {sysname}: C waits for the builder")
-            rec = {"id": it["id"], "split": it["split"], "kind": it["kind"], "system": sysname, "passes": m.passes,
+            rec = {"id": it["id"], "split": it["split"], "kind": it["kind"], "system": sysname, "budget": budget, "passes": m.passes,
                    "seconds": round(time.time() - t0, 2), "answers": rows}
             with a.out.open("a") as fh:
                 fh.write(json.dumps(rec) + "\n")
@@ -611,7 +632,7 @@ def main():
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--model", default=MODEL)
     r.add_argument("--device")
-    r.add_argument("--budget", type=int, default=BUDGET)
+    r.add_argument("--budgets", type=int, nargs="+", default=list(BUDGETS))
     r.add_argument("--systems", nargs="+", default=["R", "A", "B"])
     e = sub.add_parser("edits")
     e.add_argument("--items", type=Path, required=True)

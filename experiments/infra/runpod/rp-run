@@ -2048,11 +2048,11 @@ attempt_end() {  # OUTCOME DETAIL [dc]
 
 # The offer tried after KIND|GPU in OFFERS that this launch has not spent, as KIND|PRICE|GPU, or
 # nothing when it is the last.
-next_offer() {  # KIND GPU
+next_offer() {  # KIND GPU (an offer spent, or out of stock in the last 10 minutes of this launch, is passed over)
     local k p g seen=0
     while IFS='|' read -r k p g; do
         if (( seen )); then
-            [ -n "${spent[$k|$g]:-}" ] || { echo "$k|$p|$g"; return 0; }
+            [ -n "${spent[$k|$g]:-}" ] || (( $(date +%s) - ${nostock[$k|$g]:-0} < 600 )) || { echo "$k|$p|$g"; return 0; }
         elif [ "$k|$g" = "$1|$2" ]; then
             seen=1
         fi
@@ -2370,6 +2370,10 @@ launch() {
     # running), so this launch does not ask for it again, and such a discard, which costs seconds,
     # does not count against DISCARDS.
     local -A spent=()
+    # Offers RunPod answered as out of stock in this launch, with the time: unit_risk weighs a pod in hand only against
+    # a next offer not out of stock in the last 10 minutes (10-14: a working secure 3090 deleted four times in 15 min
+    # for an A4500 never in stock).
+    local -A nostock=()
     # Hosts whose pod failed in this launch: RunPod often hands the same machine again for an offer
     # (a 3090 host held at 330 W of 420 W came back six times running, parity-ql-afb24f1e41), and a
     # host's power limit, driver or CUDA does not change between two pods minutes apart. A pod on one
@@ -2443,6 +2447,7 @@ launch() {
         if [ -z "$POD" ]; then
             # A server error that is not a stock answer may pass (RunPod's "Something went wrong").
             if [[ $code == 5* ]] && ! grep -qE 'no instances currently available|does not have the resources' <<< "$(body_of "$r")"; then API_FAILED=1; fi
+            grep -qE 'no instances currently available|does not have the resources' <<< "$(body_of "$r")" && nostock[$kind|$gpu]=$(date +%s)
             say "no $gpu on ${kind%%:*} ($code): $(body_of "$r" | head -c 200)"
             continue
         fi

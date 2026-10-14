@@ -91,7 +91,7 @@ def extract(k: int = 0, P: int = 1):
     off = site_offsets(nat)
     prefs = [json.loads(x) for x in PREFS.read_text().splitlines()] if PREFS.exists() else []
     bs = torch.tensor([p["b"] for p in prefs], dtype=torch.long, device=nat.dev)
-    rows = corpus()
+    rows = np.load(INP / "corpus.npy").astype(np.int64) if (INP / "corpus.npy").exists() else corpus()  # (a pod: no shard)
     mine = list(range(k, len(rows), P))
     INP.mkdir(parents=True, exist_ok=True)
     for c0 in range(0, len(mine), CHUNK):
@@ -698,7 +698,7 @@ def pheno():
         add(f"next token {_decode(tk)!r}", "next token (VPD's gate reads it)", nxt == tk)
     for j, tag in enumerate(UPOS):
         add(f"part of speech {tag}", "part of speech", tags == j)
-    ann = np.load(INP / "ann.npz")
+    ann = np.load(INP / "ann.npz") if (INP / "ann.npz").exists() else np.load(INP / "ann_c.npz")  # (a pod: the compressed copy)
     vocab = json.loads(str(ann["vocab"]))
     for k in ann.files:
         kind, field = k.split(":", 1) if ":" in k else (None, k)
@@ -1568,6 +1568,113 @@ def causal():
     print("wrote", dst, out["summary"])
 
 
+TEACHER = Path.home() / "mpd-data/graph_oracle/teacher"
+KINDS6 = ["q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj"]
+STAGES = ["site", "chunk16", "chunk4", "subcomponent"]
+
+
+def _probe_rows() -> "pd.DataFrame":
+    """fleet's removability probe table (probe_features.py: per start subcomponent of the v2.3 teacher circuits whose
+    path saved its stage nodes, the structural features and whether the final circuit keeps it), with each row's
+    subcomponent and the stage that removed it."""
+    import pandas as pd
+    import torch
+
+    vpd = torch.load(Path.home() / "mpd-data/graph_oracle/teacher/vpd_v2_494.pt", weights_only=False, map_location="cpu")
+    rows = []
+    for d in (TEACHER / "v2_train", TEACHER / "v2_heldout"):
+        for p in sorted(d.glob("text*.path.json")):
+            t = p.name[: -len(".path.json")]
+            if t not in vpd or not (d / f"{t}.json").exists():
+                continue
+            b = json.loads(p.read_text()).get("blocks") or {}
+            sn = b.get("stage_nodes") or {}
+            if not sn.get("start"):
+                continue
+            final = {(n, int(q_), int(c)) for n, c, q_ in json.loads((d / f"{t}.json").read_text())["nodes"] if n not in ("tok", "block")}
+            start = [(n, int(q_), int(c)) for n, q_, c in sn["start"]]
+            alive = [{(n, int(q_), int(c)) for n, q_, c in sn.get(st, sn["start"])} for st in STAGES]
+            target = max(json.loads((TEXTS / f"{t}.json").read_text())["prompts"][0]["target_positions"])
+            order = [(n, int(q_), int(c)) for n, q_, c in vpd[t]["order"]]
+            rank = {nd: i for i, nd in enumerate(order)}
+            by_pos, by_ps = {}, {}
+            for nd in order:
+                by_pos.setdefault(nd[1], []).append(nd)
+                by_ps.setdefault((nd[1], nd[0]), []).append(nd)
+            rpos = {nd: i for lst in by_pos.values() for i, nd in enumerate(lst)}
+            rps = {nd: i for lst in by_ps.values() for i, nd in enumerate(lst)}
+            prank = {q_: i for i, q_ in enumerate(sorted(by_pos, key=lambda q_: min(rank[nd] for nd in by_pos[q_])))}
+            cnt_pos, cnt_ps = {}, {}
+            for nd in start:
+                cnt_pos[nd[1]] = cnt_pos.get(nd[1], 0) + 1
+                cnt_ps[(nd[1], nd[0])] = cnt_ps.get((nd[1], nd[0]), 0) + 1
+            for nd in start:
+                n, pos_, c = nd
+                kind, layer = n.split(".")[-1], int(n.split(".")[1])
+                r_ = rank.get(nd, len(order))
+                kept = nd in final
+                rows.append({"text": t, "split": "dev" if t.startswith("text90") else "train", "label": int(kept), "site": n, "pos": pos_, "idx": c,
+                             "stage": "" if kept else next((st for st, a_ in zip(STAGES, alive) if nd not in a_), "after"),
+                             "start_size": len(start), "n_at_pos": cnt_pos[pos_], "n_at_pos_site": cnt_ps[(pos_, n)], "rank": r_,
+                             "rank_pct": r_ / max(len(order), 1), "rank_in_pos": rpos.get(nd, len(by_pos.get(pos_, []))),
+                             "rank_in_pos_pct": rpos.get(nd, 0) / max(len(by_pos.get(pos_, [1])), 1), "rank_in_pos_site": rps.get(nd, 0),
+                             "layer": layer, "dist_to_target": target - pos_, "is_target": int(pos_ == target),
+                             "pos_rank_by_vpd": prank.get(pos_, len(prank)), "n_positions": len(cnt_pos), **{f"kind_{k}": int(kind == k) for k in KINDS6}})
+    return pd.DataFrame(rows)
+
+
+def probe():
+    """Decision test 1: does a start subcomponent's association profile tell whether the v2.3 teacher keeps it? Boosted
+    trees on fleet's structural features, with and without each subcomponent's association features (its strongest
+    |partial r| at q < 0.05 overall and per phenotype family, its strong-hit count, how often it is active); within-text
+    AUROC on the dev texts (fit on train) and in 5-fold cross-validation over train texts grouped by text, overall and
+    per removal stage (each stage's removals against the kept) -> OUT/probe.json."""
+    import pandas as pd
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import GroupKFold
+
+    df = _probe_rows()
+    A = np.load(OUT / "assoc.npz")
+    r, q = A["r"], A["q"]
+    fams = json.loads(str(A["families"]))
+    off = json.loads(str(A["offsets"]))
+    sig = np.where(q < 0.05, np.abs(r), 0.0)
+    sig = np.nan_to_num(sig)
+    feats = {"assoc max |r|": sig.max(1), "assoc strong hits": (sig >= 0.1).sum(1), "assoc active tokens": np.log1p(A["n_active"])}
+    for f in sorted(set(fams)):
+        cols = [j for j, x in enumerate(fams) if x == f]
+        feats[f"assoc {f}"] = sig[:, cols].max(1)
+    gi = np.array([off[s_] + i for s_, i in zip(df.site, df.idx)])
+    for k, v in feats.items():
+        df[k] = v[gi]
+    base = [c for c in df.columns if c not in ("text", "split", "label", "site", "pos", "idx", "stage") and not c.startswith("assoc")]
+    plus = base + [c for c in df.columns if c.startswith("assoc")]
+
+    def within(sub, s_, mask=None):
+        out = []
+        for _, g in sub.groupby("text"):
+            g = g if mask is None else g[mask(g)]
+            if g.label.nunique() == 2:
+                out.append(roc_auc_score(g.label, s_[g.index]))
+        return float(np.mean(out)) if out else None, len(out)
+
+    res = {"rows": len(df), "texts": int(df.text.nunique())}
+    tr, dv = df[df.split == "train"], df[df.split == "dev"]
+    for name, fs in (("structure", base), ("structure + associations", plus)):
+        oof = pd.Series(np.nan, index=tr.index)
+        for i, j in GroupKFold(5).split(tr, tr.label, tr.text):
+            m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05).fit(tr.iloc[i][fs], tr.iloc[i].label)
+            oof.iloc[j] = m.predict_proba(tr.iloc[j][fs])[:, 1]
+        m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05).fit(tr[fs], tr.label)
+        sd = pd.Series(m.predict_proba(dv[fs])[:, 1], index=dv.index)
+        res[name] = {"cv within-text AUROC": within(tr, oof), "dev within-text AUROC": within(dv, sd),
+                     "cv by stage": {st: within(tr, oof, lambda g, st=st: (g.label == 1) | (g.stage == st)) for st in STAGES}}
+        print(name, json.dumps(res[name]), flush=True)
+    (OUT / "probe.json").write_text(json.dumps(res, indent=1))
+    print("wrote", OUT / "probe.json")
+
+
 FIG = Path("/Users/user/mpd-data/figures/oracle")
 
 
@@ -1617,7 +1724,7 @@ def figure(r_min: float = 0.1):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "annotate", "domain", "ngram", "export", "mech", "attention", "pheno", "assoc",
-                                    "calib", "table", "figure", "conditional", "causal_plan", "causal"))
+                                    "calib", "table", "figure", "conditional", "causal_plan", "causal", "probe"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     if a.cmd in ("extract", "mech"):

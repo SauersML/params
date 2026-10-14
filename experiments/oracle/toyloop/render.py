@@ -583,8 +583,58 @@ def architecture_parent_lines(toy: Toy) -> list[str]:
     return lines
 
 
+
+@torch.no_grad()
+def isolated_residual_writes(toy: Toy) -> dict:
+    """Uncentered embedding OV actions, never model activations or outcomes.
+
+    The product is invariant to inverse changes of a head's internal V/O basis.
+    Token rows are chunked; sums and norms use float64. Norms describe potential
+    size, not direction or cancellation of attention-weighted writes.
+    """
+    sd, cfg = toy.sd, toy.cfg
+    E = sd['wte.weight']
+    result = {}
+    for layer in range(cfg['n_layer']):
+        for head in range(cfg['n_head']):
+            _, _, V, O = _blocks(sd, cfg, layer, head)
+            total = torch.zeros(cfg['n_embd'], dtype=torch.float64, device=E.device)
+            maximum = 0.
+            if E.shape[0] == 0:
+                raise ValueError('empty native vocabulary')
+            for start in range(0, E.shape[0], 128):
+                inputs = _rms(E[start:start + 128].float(), sd[f'h.{layer}.rms_1.weight'].float(), _eps(cfg))
+                actions = ((inputs @ V.T) @ O.T).double()
+                if not bool(torch.isfinite(actions).all()):
+                    raise ValueError('nonfinite isolated residual write')
+                total += actions.sum(0)
+                maximum = max(maximum, float(actions.norm(dim=1).max()))
+            mean_l2 = float((total / E.shape[0]).norm())
+            if not math.isfinite(mean_l2) or not math.isfinite(maximum):
+                raise ValueError('nonfinite isolated residual statistics')
+            unit = f'L{layer}H{head}'
+            result[unit] = {'mean_l2': mean_l2, 'max_token_l2': maximum}
+    return result
+
+
+def residual_write_lines(toy: Toy) -> list[str]:
+    facts = isolated_residual_writes(toy)
+    live = {unit for unit, _, kind, _ in units_of(toy) if kind == 'H'}
+    lines = ['Isolated residual-write geometry: y_t = W_O,h W_V,h RMS1(E_t), before attention mixing. '
+             'mean_l2 is the norm of its uncentered native-vocabulary mean; max_token_l2 is its largest token-row norm. '
+             'These potential weight-derived writes include directions invisible to unembedding, not actual activation or causal importance. '
+             'They are not contextual activations, cancellation certificates, or circuit fidelity proofs; '
+             'zero isolated action may still read earlier residual writes.']
+    for unit, row in facts.items():
+        if unit not in live:
+            continue
+        lines.append(f"{unit} residual_write mean_l2:{row['mean_l2']:.6g} max_token_l2:{row['max_token_l2']:.6g}")
+    return lines
+
+
 def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_live_neurons: bool = False,
-           explain_summary_limits: bool = False, architecture_parent_hints: bool = False) -> str:
+           explain_summary_limits: bool = False, architecture_parent_hints: bool = False,
+           residual_write_hints: bool = False) -> str:
     """The prompt. weights_from: take the weight section from another toy (same architecture), keeping this toy's
     behaviour section (the swapped-weights control: does the answer follow the weights?). TOYLOOP_SECTIONS=weights:
     the compact weight section and the texts' tokens only; default: weights and behaviour (zoo v1 toys keep the
@@ -601,6 +651,17 @@ def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_l
         raise ValueError("explain_summary_limits must be an explicit boolean")
     if type(architecture_parent_hints) is not bool:
         raise ValueError("architecture_parent_hints must be an explicit boolean")
+    if type(residual_write_hints) is not bool:
+        raise ValueError('residual_write_hints must be an explicit boolean')
+    if residual_write_hints:
+        base = render(toy, n_texts, weights_from, all_live_neurons=all_live_neurons,
+                      explain_summary_limits=explain_summary_limits,
+                      architecture_parent_hints=architecture_parent_hints)
+        facts = '\n'.join(residual_write_lines(weights_from or toy)) + '\n'
+        marker = 'Texts:\n' if 'Texts:\n' in base else 'Which units implement'
+        if marker not in base:
+            raise ValueError('unsupported rendering insertion point')
+        return base.replace(marker, facts + marker, 1)
     if architecture_parent_hints:
         # Recursion leaves all existing rendering paths and default bytes intact.
         base = render(toy, n_texts, weights_from, all_live_neurons=all_live_neurons,

@@ -942,6 +942,15 @@ def assoc():
           f"|partial r| >= 0.1, {time.time() - t0:.0f} s", flush=True)
 
 
+def _rows_active(G, row: np.ndarray) -> np.ndarray:
+    """Per subcomponent, the number of rows (clusters) it is active in."""
+    out = np.zeros(G.shape[1], np.int64)
+    bounds = np.concatenate([[0], np.flatnonzero(np.diff(row)) + 1, [len(row)]])
+    for i in range(len(bounds) - 1):
+        out[np.unique(G.indices[G.indptr[bounds[i]]:G.indptr[bounds[i + 1]]])] += 1
+    return out
+
+
 def calib(k: int = 48):
     """The scan's calibration under a null: k random phenotypes moved to other rows whole (a row permutation keeps each
     row's structure, position profile included, and breaks every association), the share of tests at p < 0.05 and
@@ -956,10 +965,9 @@ def calib(k: int = 48):
     cols = rng.choice(Y.shape[1], min(k, Y.shape[1]), replace=False)
     R = len(Y) // SEQ
     Yp = Y[:, cols].reshape(R, SEQ, -1)[rng.permutation(R)].reshape(len(Y), -1)
+    del Y
     res = score_tests(G, Yp, d["cov"], d["row"])
-    rowid = d["row"]
-    coo = G.tocoo()
-    rows_s = np.bincount(np.unique(np.stack([rowid[coo.row], coo.col], 1), axis=0)[:, 1], minlength=G.shape[1])
+    rows_s = _rows_active(G, d["row"])
     pn = erfc(np.abs(res["z"].astype(np.float64)) / math.sqrt(2))
     out = {"phenotypes": [json.loads(str(d["names"]))[c] for c in cols], "bins": []}
     ok = np.isfinite(res["z"])
@@ -1469,7 +1477,7 @@ def causal():
     -> GEN_OUT/causal.json"""
     from scipy.stats import binomtest
 
-    plan = json.loads((OUT / "causal_plan.json").read_text())
+    plan = json.loads((OUT / "causal_plan.json" if (OUT / "causal_plan.json").exists() else INP / "causal_plan.json").read_text())
     rng = np.random.default_rng(2951)
     run = _Runner()
     out = {"hits": []}

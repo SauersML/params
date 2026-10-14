@@ -18,13 +18,17 @@ blocks "L1.v @232-233", the circuit's ids or subcomponents written out) and scor
     position carries an input token's variable: the gate's shuffled answers tied the teacher on such texts).
   reward = W_CREDIT tanh(credit / CREDIT_SCALE) + W_SEL tanh(selective / CREDIT_SCALE) + W_REL relational + W_COV
     coverage (credit's scale is the teacher's median per held-out text, 35 bits, halved).
-The reward uses the search split's draws; evaluations the eval split's.
+The reward uses the search split's draws; evaluations the eval split's (removal means at fresh tokens disjoint from
+search's: semantic.Checker's pool).
 
   env_c.py score TASK ANSWER.txt [--split eval] [--device D]
   env_c.py gate [--dir variables/influential_v2/heldout] [--split eval] [--part K/N] [--out FILE] [--device D]
       dev texts: the teacher's targets (its kept variables as blocks, its lines that held, joint) against the same
       answer with shuffled groups (random blocks, as many, at the same positions) and with DeepSeek's outcomes for the
       same interventions (var_explain's llm.jsonl and llm_hint.jsonl from the text alone; the better of the two)
+  env_c.py evlines --targets RELINED.jsonl --out FILE --prompts FILE [--part K/N]   the targets' lines written again
+      from eval-pool donors (eval_lines(): the reline selected kinds of lines on search draws, the gate scores new
+      lines of those kinds), and DeepSeek's prompts for their interventions (var_explain_llm.py, then gate --llm-dir)
   env_c.py sft ROWS.jsonl OUT.jsonl [--split train]   SFT rows (components.dataset's format): the question with
       VARIABLES and INVARIANTS asked, the teacher circuit with its block-form variables and its holding joint lines
   env_c.py rows ROWS.jsonl OUT.jsonl   the question rows (the circuit environment's, asking for VARIABLES and INVARIANTS)
@@ -113,10 +117,11 @@ def score(ge, tx, task: str, text: str, split: str = "search", model: str = "vpd
     claims = [c for c in ans.get("invariants") or [] if not c.startswith("RULES OUT")]
     named = [c for c in claims if re.search(r"\bV\d+\b", c.split("->")[0])]  # a line about the variables
     sc = variables.Scorer(ge)
+    pool = "eval" if split == "eval" else "search"  # removal means: eval's fresh tokens disjoint from search's
     credit = 0.0  # token-only lines count nothing
     random_credit = 0.0
     if named:
-        got = semantic.check_invariants(sc, tx, groups, "\n".join(named), model, fresh_mean=True)
+        got = semantic.check_invariants(sc, tx, groups, "\n".join(named), model, fresh_mean=True, pool=pool)
         credit -= got["bad"]
         for r in got["invariants"]:
             out["lines"] += 1
@@ -130,7 +135,8 @@ def score(ge, tx, task: str, text: str, split: str = "search", model: str = "vpd
         # the same lines with each group replaced by random subcomponents (blocks by random sites' blocks) at the same
         # positions: what the positions alone give (an input token's variable is carried by most of its position)
         seed = int(hashlib.sha256(f"{task}|{text}".encode()).hexdigest()[:12], 16)
-        ctl = semantic.check_invariants(sc, tx, random_groups(groups, ge.nat.C, seed), "\n".join(named), model, fresh_mean=True)
+        ctl = semantic.check_invariants(sc, tx, random_groups(groups, ge.nat.C, seed), "\n".join(named), model, fresh_mean=True,
+                                        pool=pool)
         random_credit = sum(r["credit"] for r in ctl["invariants"] if not (r["holds"] and r.get("joint") is False)) - ctl["bad"]
     out["credit"] = credit
     out["credit_random"] = random_credit
@@ -247,9 +253,10 @@ def gate(a) -> None:
 
     ge = goal_eval.GoalEval(native.Native(a.device))
     recs = [json.loads(x) for x in (a.targets or ROOT / "variables" / "sft_targets" / "heldout.jsonl").read_text().splitlines()]
-    ex = ROOT / "variables" / "explanations" / "heldout_v2"
+    ex = a.llm_dir or ROOT / "variables" / "explanations" / "heldout_v2"
     prompts = {x["task"]: x for x in map(json.loads, (ex / "prompts.jsonl").read_text().splitlines())}
-    llm = {k: {x["task"]: x for x in map(json.loads, (ex / f"{k}.jsonl").read_text().splitlines())} for k in ("llm", "llm_hint")}
+    llm = {k: {x["task"]: x for x in map(json.loads, (ex / f"{k}.jsonl").read_text().splitlines())} if (ex / f"{k}.jsonl").exists() else {}
+           for k in ("llm", "llm_hint")}
     if a.part:
         k, n = map(int, a.part.split("/"))
         recs = recs[k::n]
@@ -301,7 +308,8 @@ def gate_text(ge, a, rec: dict, cp: dict | None, prompts: dict, llm: dict, var_e
 
 
 def reline(ge, tx, t: dict, rec: dict, cp: dict | None) -> dict:
-    """rec with only the lines that hold under the carriers its rendered answer states (relines())."""
+    """rec with only the lines that hold under the carriers its rendered answer states (relines()), on the search pool's
+    draws: lines selected here are never the gate's scored lines (eval_lines())."""
     import semantic
     import variables
 
@@ -311,7 +319,8 @@ def reline(ge, tx, t: dict, rec: dict, cp: dict | None) -> dict:
     lines = p["answer"].get("invariants") or []
     keep = []
     if lines and bound:
-        got = semantic.check_invariants(variables.Scorer(ge), tx, variables.parse(bound, ge.nat.C), "\n".join(lines), t["model"], fresh_mean=True)
+        got = semantic.check_invariants(variables.Scorer(ge), tx, variables.parse(bound, ge.nat.C), "\n".join(lines), t["model"],
+                                        fresh_mean=True, pool="search")
         ok = {r["line"] for r in got["invariants"] if r["holds"] and r.get("joint") is not False}
         keep = [orig for orig, line in zip(rec["invariants"], lines) if line.strip() in ok]  # render keeps the lines' order
     return {**rec, "invariants": [re.sub(r"^I\d+:", f"I{i}:", x) for i, x in enumerate(keep, 1)],
@@ -343,6 +352,87 @@ def relines(a) -> None:
         with a.out.open("a") as fh:
             fh.write(json.dumps(out) + "\n")
         print(rec["task"], out["lines_before"], "->", len(out["invariants"]), flush=True)
+
+
+def kind(line: str) -> tuple:
+    """A line's kind without its tokens: the variables and positions it sets from donors, or the variables it removes."""
+    iv = line.split(":", 1)[1].split("->")[0]
+    sets = tuple(re.findall(r"(V\d+) from @(\d+)=", iv))
+    return ("set", sets) if sets else ("remove", tuple(re.findall(r"remove (V\d+)", iv)))
+
+
+def eval_lines(ge, tx, t: dict, rec: dict, r: dict) -> dict:
+    """rec (lines selected on search draws: reline()) with its lines written again from the eval pool: the text's kept
+    variables (r, var_teacher's file: carriers and value maps, as var_post wrote the search lines) through
+    semantic.teacher_invariants(pool="eval"): donor tokens none of the search pool's draws at that position, nor any
+    donor the search lines (r's) name there, removals at fresh tokens disjoint from search's. Per kind of line that held
+    (kind()), as many eval lines of that kind as held, in generation order and never filtered by whether they hold: the
+    gate's scoring is their first check under the stated carriers."""
+    from collections import Counter
+
+    import semantic
+    import variables
+
+    want = Counter(kind(x) for x in rec["invariants"])
+    kv = [v for v in r["variables"] if v.get("kept")]
+    lines = []
+    if want and kv:
+        sv = [{"name": v["name"], "inputs": v["inputs"], "group": pv["group"], "values": v.get("values") or [],
+               "identity": v.get("kind") == "input"} for v, pv in zip(kv, variables.parse(kv, ge.nat.C))]
+        avoid = {}
+        for x in semantic.parse_invariants("\n".join(y["line"] for y in r.get("invariants") or []), t["model"])[0]:
+            for _, ch in x["intervention"]["transplants"]:
+                for q, z in ch.items():
+                    avoid.setdefault(int(q), set()).add(int(z))
+        rows = semantic.teacher_invariants(variables.Scorer(ge), tx, sv, t["model"], pool="eval", avoid=avoid)
+        for x in sorted(rows, key=lambda x: x["order"]):
+            k = kind(x["line"])
+            if want[k] > 0:
+                want[k] -= 1
+                lines.append(x["line"].split(":", 1)[1].strip())
+    return {**rec, "invariants": [f"I{i}: {x}" for i, x in enumerate(lines, 1)], "pool": "eval",
+            "search_lines": len(rec["invariants"]), "missing": sum(want.values())}
+
+
+def evlines(a) -> None:
+    """eval_lines() per record of a relined targets file, to --out, and DeepSeek's prompts for the new interventions
+    (var_explain.questions, the model's top three as its prediction) to --prompts."""
+    import goal_eval
+
+    if a.untar:
+        import tarfile
+
+        with tarfile.open(a.untar) as t:
+            t.extractall(Path.home() / "mpd-data")
+    sys.path.insert(0, str(HERE.parents[1] / "experiments" / "oracle"))
+    import var_explain
+    import var_teacher
+
+    ge = goal_eval.GoalEval(native.Native(a.device))
+    recs = [json.loads(x) for x in a.targets.read_text().splitlines()]
+    if a.part:
+        k, n = map(int, a.part.split("/"))
+        recs = recs[k::n]
+    done = {json.loads(x)["task"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    for rec in recs:
+        if rec["task"] in done:
+            continue
+        t, tx = text_of(ge, rec["task"])
+        r = json.loads((ROOT / "variables" / "influential_v2" / rec.get("split", "heldout") / f"{rec['task']}.json").read_text())
+        var_teacher.release(ge.nat.dev)
+        out = eval_lines(ge, tx, t, rec, r)
+        p = t["prompts"][0]
+        got = var_explain.questions({"variables": r["variables"], "invariants": [{"line": x} for x in out["invariants"]]}, p["token_ids"])
+        if got:
+            top = ge.nat.reference([p["token_ids"]], p["target_positions"])[0, -1].cpu().double().exp().topk(3)
+            names = components.token_strings(t["model"], top.indices.tolist())
+            shown = ", ".join(f"{components.shown(x)} ({float(q):.2f})" for x, q in zip(names, top.values))
+            with a.prompts.open("a") as fh:
+                fh.write(json.dumps({"task": rec["task"], "prompt": got[0].replace("{top}", shown), "items": got[1]}) + "\n")
+        with a.out.open("a") as fh:
+            fh.write(json.dumps(out) + "\n")
+        print(rec["task"], out["search_lines"], "search lines ->", len(out["invariants"]), "eval lines,", out["missing"], "missing", flush=True)
 
 
 def rows(a) -> None:
@@ -466,6 +556,14 @@ def main():
     g.add_argument("--targets", type=Path, help="a targets file (default sft_targets/heldout.jsonl; relines' output)")
     g.add_argument("--untar", type=Path, help="a tar of input paths under ~/mpd-data, unpacked there first")
     g.add_argument("--reline", action="store_true", help="first keep only each target's lines that hold under its own carriers")
+    g.add_argument("--llm-dir", type=Path, help="DeepSeek's prompts.jsonl, llm.jsonl and llm_hint.jsonl (default "
+                   "explanations/heldout_v2; evlines' prompts for eval lines)")
+    e = sub.add_parser("evlines")
+    e.add_argument("--targets", type=Path, required=True, help="relined targets (lines selected on search draws)")
+    e.add_argument("--out", type=Path, required=True)
+    e.add_argument("--prompts", type=Path, required=True)
+    e.add_argument("--part")
+    e.add_argument("--untar", type=Path, help="a tar of input paths under ~/mpd-data, unpacked there first")
     f = sub.add_parser("sft")
     f.add_argument("rows", type=Path)
     f.add_argument("out", type=Path)
@@ -482,7 +580,7 @@ def main():
     rl.add_argument("--compact", type=Path)
     rl.add_argument("--out", type=Path, required=True)
     rl.add_argument("--untar", type=Path, help="a tar of input paths under ~/mpd-data, unpacked there first")
-    for p in (s, g, f, v, q, rl):
+    for p in (s, g, f, v, q, rl, e):
         p.add_argument("--device")
     a = ap.parse_args()
     if a.what == "score":
@@ -492,7 +590,7 @@ def main():
         t, tx = text_of(ge, a.task)
         print(json.dumps(score(ge, tx, a.task, a.answer.read_text(), a.split, t["model"]), indent=1))
     else:
-        {"gate": gate, "sft": sft, "serve": serve, "rows": rows, "relines": relines}[a.what](a)
+        {"gate": gate, "sft": sft, "serve": serve, "rows": rows, "relines": relines, "evlines": evlines}[a.what](a)
 
 
 if __name__ == "__main__":

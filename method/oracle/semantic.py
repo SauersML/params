@@ -58,8 +58,8 @@ BLOCK = variables.BLOCK
 class Checker:
     """Runs interventions on one text in the real model: check(items) with items [(intervention, outcome)]."""
 
-    def __init__(self, sc: variables.Scorer, tx, variables_: list[dict], fresh_mean: bool = False):
-        self.sc, self.tx, self.nat, self.fresh_mean = sc, tx, sc.nat, fresh_mean
+    def __init__(self, sc: variables.Scorer, tx, variables_: list[dict], fresh_mean: bool = False, pool: str = "search"):
+        self.sc, self.tx, self.nat, self.fresh_mean, self.pool = sc, tx, sc.nat, fresh_mean, pool
         self.vars = {v["name"]: v for v in variables_}
         self.keep = sorted(set(tx.targets) | {t for v in variables_ for _, t, _ in v["group"]})  # every patched position:
         self.base = sc._text(tx.ids, tx.targets, check=False, positions=self.keep)  # the tables kept there alone
@@ -91,8 +91,13 @@ class Checker:
             for p in v["inputs"]:
                 zs = var_classes.alternatives(self.nat, self.tx.ids, p, int(self.tx.seed))
                 if self.fresh_mean:  # 64 other tokens sampled from the model's prediction there, none of the usual ones
+                    seen = set(zs)
                     zs = [z for z in var_classes.alternatives(self.nat, self.tx.ids, p, int(self.tx.seed) + 1, top=0, sampled=96)
-                          if z not in set(zs)][:64]
+                          if z not in seen][:64]
+                    if self.pool == "eval":  # 64 more, none of the search pool's (selection and scoring on disjoint draws)
+                        seen |= set(zs)
+                        zs = [z for z in var_classes.alternatives(self.nat, self.tx.ids, p, int(self.tx.seed) + 2, top=0, sampled=192)
+                              if z not in seen][:64]
                 for z in zs:
                     w = self.text({p: z})
                     for s in sites:
@@ -419,15 +424,16 @@ def one_input_checks(ck: "Checker", lines: list[tuple[dict, tuple]], rows: list[
             r["joint"] = bool(r["holds"]) and not any(r["alone"])
 
 
-def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model: str = "vpd4l", fresh_mean: bool = False) -> dict:
+def check_invariants(sc: variables.Scorer, tx, vs: list[dict], text: str, model: str = "vpd4l", fresh_mean: bool = False,
+                     pool: str = "search") -> dict:
     """The INVARIANTS lines checked in the real model: per line holds, surprise and credit; the total credit in bits
     and the share holding (lines naming a variable the answer lacks, or not parsing, count as failing bold claims of
-    one bit)."""
+    one bit). pool: the fresh tokens of removal means ("search", or "eval": disjoint from search's)."""
     lines, bad = parse_invariants(text, model)
     names = {v["name"] for v in vs}
     ok = [x for x in lines if all(n in names for n, _ in x["intervention"]["transplants"]) and all(n in names for n in x["intervention"]["remove"])]
     bad += len(lines) - len(ok)
-    ck = Checker(sc, tx, vs, fresh_mean=True) if fresh_mean else Checker(sc, tx, vs)
+    ck = Checker(sc, tx, vs, fresh_mean=True, pool=pool) if fresh_mean else Checker(sc, tx, vs)
     try:
         rows = [{"id": x["id"], "line": x["line"], **r} for x, r in zip(ok, ck.check([(x["intervention"], x["outcome"]) for x in ok]))]
         one_input_checks(ck, [(x["intervention"], x["outcome"]) for x in ok], rows)
@@ -523,7 +529,7 @@ def check_rules_out(sc: variables.Scorer, tx, vs: list[dict], text: str, model: 
 
 
 def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "vpd4l", per_class: int = 1, fresh: int = 16,
-                       structured: bool = False) -> list[dict]:
+                       structured: bool = False, pool: str = "search", avoid: dict | None = None) -> list[dict]:
     """Verified INVARIANTS lines from a text's kept variables, training targets for the writer. vs: variables with
     "name", "group" (parsed) and "values" (var_classes' value maps: classes with token_ids and predicts_id). Per variable
     and input position p: fresh donor tokens the value map never saw (sampled from the model's prediction at p, the
@@ -539,7 +545,12 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
     Each line checked in the real model (Checker.outcome: holds, surprise against the no-change prediction, credit),
     the lines that hold first. structured=True also retains each original Checker.check record in "executed",
     including numeric intervention/outcome IDs and failed checks, for exact proof-bound supervision artifacts.
-    The default rows and number of model calls are unchanged."""
+    The default rows and number of model calls are unchanged. pool="eval" writes the same kinds of lines from donor
+    tokens none of the search pool's lines use at their position (every variable's search draws there left out) and
+    checks removals on eval's fresh tokens (Checker): lines selected on search draws scored on disjoint ones. avoid
+    ({position: token ids}) leaves out more donors, e.g. the search lines' donors as written (the pool's draws differ
+    across torch versions: a pod's 2.4 and the Mac's 2.11 draw different tokens from one seed). Each row's "order" is
+    its place in generation order (rows are listed holding first)."""
     import hashlib
 
     import components
@@ -561,14 +572,30 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
             out += [int(r[-1].argmax()) for r in sc.nat.reference(texts, tx.targets)]
         return out
 
-    def unseen(p: int, seen: set) -> list[int]:  # fresh donor tokens at p, sampled from the model's prediction there
-        if p == 0:  # no prefix to predict from: every token alike
-            w = torch.ones(sc.nat.reference([tx.ids[:1]], [0]).shape[-1], dtype=torch.float64)
-        else:
-            w = sc.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double().exp()
+    preds: dict = {}
+
+    def draw(p: int, seen: set, key: tuple) -> list[int]:  # fresh donor tokens at p, sampled from the model's prediction there
+        if p not in preds:
+            if p == 0:  # no prefix to predict from: every token alike
+                preds[p] = torch.ones(sc.nat.reference([tx.ids[:1]], [0]).shape[-1], dtype=torch.float64)
+            else:
+                preds[p] = sc.nat.reference([tx.ids[:p]], [p - 1])[0, 0].cpu().double().exp()
+        w = preds[p].clone()
         w[sorted(seen)] = 0.0
-        gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(("invariants", int(tx.seed), p)).encode()).hexdigest()[:15], 16))
+        gen = torch.Generator().manual_seed(int(hashlib.sha256(repr(key).encode()).hexdigest()[:15], 16))
         return torch.multinomial(w, min(fresh, int((w > 0).sum())), replacement=False, generator=gen).tolist()
+
+    def seens(p: int) -> list[set]:  # the tokens each variable's draw at p leaves out
+        out = [{int(tx.ids[p])} for v in vs if v.get("identity") and not v.get("values") and p in map(int, v["inputs"])]
+        return out + [{int(z) for c in vm["classes"] for z in c["token_ids"]} | {int(tx.ids[p])}
+                      for v in vs for vm in v.get("values") or [] if int(vm["position"]) == p]
+
+    def unseen(p: int, seen: set) -> list[int]:
+        seen = seen | set((avoid or {}).get(p, ()))
+        if pool == "search":
+            return draw(p, seen, ("invariants", int(tx.seed), p))
+        used = {z for s in seens(p) for z in draw(p, s, ("invariants", int(tx.seed), p))}
+        return draw(p, seen | used, ("invariants", "eval", int(tx.seed), p))
 
     try:
         for v in vs:
@@ -616,7 +643,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
             if d >= REMOVE_MIN:
                 claims.append((v["name"], {"remove": [v["name"]]}, ("drop", min(0.99, max(0.01, round(2 ** (-d / 2), 2)))), None))
         if claims:
-            fresh_ck = Checker(sc, tx, vs, fresh_mean=True)
+            fresh_ck = Checker(sc, tx, vs, fresh_mean=True, pool=pool)
             try:
                 rows += fresh_ck.check([(iv, out) for _, iv, out, _ in claims])
             finally:
@@ -636,7 +663,7 @@ def teacher_invariants(sc: variables.Scorer, tx, vs: list[dict], model: str = "v
             k += 1
         else:
             line = f"remove {name} -> p(top) < {outc[1]:g}"
-        row = {"line": line, **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")},
+        row = {"line": line, "order": len(out), **{x: r[x] for x in ("holds", "surprise", "credit", "top", "p_top", "logp")},
                **{x: r[x] for x in ("alone", "joint") if x in r}}
         if structured:
             import copy

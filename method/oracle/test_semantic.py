@@ -301,6 +301,36 @@ def test_teacher_structured_evidence_preserves_default_and_failed_checks(teacher
     assert retained[0]["executed"]["intervention"]["transplants"][0][1][0] == 2
 
 
+def test_eval_pool_donors_disjoint_from_search(monkeypatch):
+    """pool="eval" lines use no donor the search pool drew at that position, nor an avoided one (selection on search
+    draws, scoring on disjoint ones)."""
+    import re
+    from types import SimpleNamespace
+
+    class FakeChecker:
+        def __init__(self, *args, **kw):
+            self.y0, self.p0 = 0, torch.full((40,), 1 / 40).log()
+        def run(self, iv):
+            return self.p0
+        def check(self, items):
+            return [{"holds": True, "surprise": 1.0, "credit": 1.0, "top": 1, "p_top": .5, "logp": -1.0} for _ in items]
+        def close(self):
+            pass
+    monkeypatch.setattr(semantic, "Checker", FakeChecker)
+    monkeypatch.setattr(components, "token_strings", lambda model, ids: [f" t{z}" for z in ids])
+    def reference(texts, positions):  # a uniform prediction after the one-token prefix; a changed text's top: its token at 1
+        if len(texts) == 1 and len(texts[0]) == 1:
+            return torch.full((1, 1, 40), 1 / 40).log()
+        return torch.nn.functional.one_hot(torch.tensor([t[1] for t in texts]), 40).float().log()[:, None]
+    sc = SimpleNamespace(nat=SimpleNamespace(reference=reference))
+    tx = SimpleNamespace(ids=[0, 5], seed=7, targets=[1])
+    vs = [{"name": "V1", "identity": True, "inputs": [1], "group": []}]
+    donors = lambda rows: {int(re.search(r"@1=' t(\d+)'", r["line"]).group(1)) for r in rows}  # noqa: E731
+    search = donors(semantic.teacher_invariants(sc, tx, vs, fresh=8, per_class=4))
+    ev = donors(semantic.teacher_invariants(sc, tx, vs, fresh=8, per_class=4, pool="eval", avoid={1: {39}}))
+    assert len(search) >= 7 and len(ev) >= 7 and not search & ev and 39 not in ev  # every draw a line (but token 0, the base top)
+
+
 def test_teacher_nonroundtripping_render_cannot_become_supervision(teacher_checker, monkeypatch):
     sc, tx, vs, _ = teacher_checker
     rows = semantic.teacher_invariants(sc, tx, vs, fresh=2, structured=True)

@@ -50,6 +50,8 @@ def test_stated_circuit(tiny):
     assert rec["lines"] <= rec["lines_start"] and rec["parts"] == len(g.node_set())
     assert rec["point"] <= rec["criteria"]["point"] + 1e-6
     assert all(v is None or v >= rec["criteria"][n] - 1e-6 for n, v in rec["families"].items())
+    assert rec["cross_token"] <= rec["wired"]["cross_token"] and rec["tokens"] <= rec["wired"]["tokens"]
+    assert rec["positions"] == sorted({nd[1] for nd in g.node_set()})
     h = goal_eval.graph_of_lines(c.pr.g, c.pr.cols, c.pr.row(got["on"]))
     del h.stranded, h.stranded_bits  # (graph_of_lines marks it stranded already)
     again = goal_eval.strand(h, tx.targets, nat.C)
@@ -155,3 +157,4 @@ def test_native_runs(tiny):
     got = st.run(log=lambda msg: None)
     assert got["record"]["point"] <= got["record"]["criteria"]["point"] + 1e-6
     assert set(nl.graph(got["on"]).units) == got["graph"].node_set()
+    assert got["record"]["tokens"] == len({u[2] for u in got["graph"].units})

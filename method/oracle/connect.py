@@ -12,8 +12,12 @@ the token edges and the target token), in C's semantics on one engine plan.
       without a stated path to the prediction dropped (goal_eval.strand), measured: the point KL of every set in one
       batch, then the path-patched families in turn on the smallest sets still in. The stage keeps the smallest set
       that meets every criterion.
-  (3) Drop inert lines. The kept connections in ascending score, then the token edges in ascending score of their
-      readers, each by the largest log-scale suffix whose removal still meets the criteria.
+  (3) Sparsify (the goal's: VPD's explanations connect too much and reach too many tokens). In turn, each by the
+      largest prefix whose removal still meets the criteria: whole positions (every line touching the context
+      positions whose lines save the least), cross-token connections (a writer at one position read at another),
+      every kept connection, then the token edges (by their readers' scores), lowest score first.
+The record reports the sparsity (edges between units per unit, cross-token connections, tokens involved) of the stated
+circuit beside the wired one's.
 Criteria, the cheap families builder_fast's node selection holds (pymove's 10-14): the point KL rises at most POINT_TOL
 of the way from the fully wired circuit's to the KL with no line, on a log scale; s_track_pp on TRACK_DRAWS search
 draws, s_scope on its scope draws (the family that sees a token edge left out) and s_interchange_pp on the circuit's
@@ -98,6 +102,50 @@ class Connector:
 
     FAMILIES = (("track", "s_track_pp"), ("scope", "s_scope"), ("interchange", "s_interchange_pp"))
 
+    def targets(self) -> list[int]:
+        return list(self.tx.targets)
+
+    def positions(self) -> tuple:
+        """Each line's writer and reader positions (a token edge: its token's and its reader's; a write into the
+        prediction or the target token: the target's twice) and each unit's position, as tensors."""
+        if not hasattr(self, "_pos"):
+            at = lambda u: u[2] if u[0] in ("head", "neuron") else u[1]  # noqa: E731  (a native unit; a subcomponent)
+            wp, rp = [], []
+            for c in self.pr.lines:
+                if c[0] == "e":
+                    w, r = at(c[1]), at(c[2])
+                elif c[0] == "o":
+                    w = r = at(c[1])
+                elif c[0] == "t":
+                    w, r = c[1], at(c[2])
+                else:
+                    w = r = c[1]
+                wp.append(w)
+                rp.append(r)
+            self._pos = (torch.tensor(wp, dtype=torch.long), torch.tensor(rp, dtype=torch.long),
+                         torch.tensor([at(u) for u in self.pr.parts], dtype=torch.long))
+        return self._pos
+
+    def without(self, conn: torch.Tensor, tok: torch.Tensor, drop: list) -> tuple:
+        """conn and tok less every line touching a position in drop."""
+        wp, rp, _ = self.positions()
+        d = torch.tensor(drop, dtype=torch.long)
+        hit = lambda ls: torch.isin(wp[ls], d) | torch.isin(rp[ls], d)  # noqa: E731
+        return conn[~hit(conn)], tok[~hit(tok)] if len(tok) else tok
+
+    def sparsity(self, on: torch.Tensor) -> dict:
+        """The connection-sparsity measures of a line set (the goal's: VPD's explanations connect too much and reach
+        too many tokens): connections between units per unit kept, cross-token connections (a writer at one position
+        read at another: a value read into an attention output), and the positions of the kept units."""
+        wp, rp, up = self.positions()
+        km = self.pr.kept(on)
+        e = torch.tensor([j for j in on.nonzero().flatten().tolist() if self.pr.lines[j][0] == "e"], dtype=torch.long)
+        e = e[km[self.pr.ends[e, 0]] & km[self.pr.ends[e, 1]]] if len(e) else e
+        n = int(km.sum())
+        pos = sorted({int(x) for x in up[km].tolist()})
+        return {"edges_per_unit": len(e) / max(n, 1), "cross_token": int((wp[e] != rp[e]).sum()) if len(e) else 0,
+                "tokens": len(pos), "positions": pos}
+
     def family(self, name: str, ons: list) -> list[float | None]:
         """One path-patched family of each line set on the search split (track on TRACK_DRAWS draws, scope on its
         scope_draws, interchange_pp on each set's panel), FAMILY_BATCH sets a call."""
@@ -164,17 +212,42 @@ class Connector:
         self.spent["keep"] = time.time() - t
 
         t = time.time()
+        wp, rp, up = self.positions()
         tok = self.tok
+        dropped = []
         if budget_s is None or time.time() - t0 < budget_s:
-            asc = keep.flip(0)  # (the lowest score first)
+            # (3a) whole positions: the units at the positions whose lines save the least, dropped with every line
+            # touching them, the most such positions that still meet the criteria (fewer tokens in the explanation)
+            kept = pr.kept(self.row(keep))
+            cand = sorted({int(x) for x in up[kept].tolist()} - set(self.targets()))
+            if cand:
+                save = {q: float(sc[keep][(wp[keep] == q) | (rp[keep] == q)].sum()) for q in cand}
+                cand.sort(key=lambda q: save[q])
+                ms = list(range(1, len(cand) + 1)) if len(cand) <= 16 else sizes(len(cand))
+                rows = [self.row(*self.without(keep, tok, cand[:m])) for m in ms]
+                m = max((m for m, y in zip(ms, passing(rows, last=True)) if y), default=0)
+                dropped = cand[:m]
+                keep, tok = self.without(keep, tok, dropped)
+            # (3b) cross-token connections (a writer at one position read at another), lowest score first
+            cross = keep[wp[keep] != rp[keep]]
+            if len(cross):
+                asc = cross[torch.argsort(sc[cross], stable=True)]
+                ms = sizes(len(asc))
+                rest = lambda m: keep[~torch.isin(keep, asc[:m])]  # noqa: E731
+                m = max((m for m, y in zip(ms, passing([self.row(rest(m), tok) for m in ms], last=True)) if y), default=0)
+                keep = rest(m)
+        if budget_s is None or time.time() - t0 < budget_s:
+            # (3c) every kept connection, lowest score first
+            asc = keep[torch.argsort(sc[keep], stable=True)]
             ms = [m for m in sizes(len(asc)) if m < len(asc)]
             if ms:
-                m = max((m for m, y in zip(ms, passing([self.row(asc[m:]) for m in ms], last=True)) if y), default=0)
-                keep = asc[m:].flip(0)
-            kept = pr.kept(self.row(keep))
-            live = self.tok[kept[pr.ends[self.tok, 0]]]  # the token edges into kept parts (a token edge's one part end)
+                m = max((m for m, y in zip(ms, passing([self.row(asc[m:], tok) for m in ms], last=True)) if y), default=0)
+                keep = asc[m:]
+            # (3d) token edges into kept parts, by their readers' scores, lowest first
+            kept = pr.kept(self.row(keep, tok))
+            live = tok[kept[pr.ends[tok, 0]]] if len(tok) else tok
             into = torch.zeros(len(pr.parts)).index_add_(0, pr.ends[keep, 1].clamp(min=0), sc[keep] * (pr.ends[keep, 1] >= 0))
-            tasc = live[torch.argsort(into[pr.ends[live, 0]], stable=True)]  # by their readers' scores, lowest first
+            tasc = live[torch.argsort(into[pr.ends[live, 0]], stable=True)]
             tok = tasc
             ms = [m for m in sizes(len(tasc)) if m < len(tasc)]
             if ms and (budget_s is None or time.time() - t0 < budget_s):
@@ -192,9 +265,12 @@ class Connector:
                "lines": int(on.sum()), "connections": kinds.count("e") + kinds.count("o"),
                "token_edges": kinds.count("t") + kinds.count("u"), "point": kl_on, "point_wired": kl_full,
                "point_none": kl_none, "families": fam, "families_wired": wired, "criteria": cap,
+               **self.sparsity(on), "wired": self.sparsity(full), "positions_dropped": dropped,
                "seconds": {k: round(v, 2) for k, v in self.spent.items()}}
         log(f"{rec['parts']} of {rec['parts_start']} parts, {rec['lines']} of {rec['lines_start']} lines "
-            f"({rec['token_edges']} token edges); point {kl_on:.4f} bits (wired {kl_full:.4f}, cap {cap['point']:.4f}); "
+            f"({rec['token_edges']} token edges); edges per unit {rec['edges_per_unit']:.2f} (wired "
+            f"{rec['wired']['edges_per_unit']:.2f}), cross-token {rec['cross_token']} ({rec['wired']['cross_token']}), "
+            f"tokens {rec['tokens']} ({rec['wired']['tokens']}); point {kl_on:.4f} bits (wired {kl_full:.4f}, cap {cap['point']:.4f}); "
             + ", ".join(f"{n} {fam[n]:.3f} (wired {wired[n]:.3f}, floor {cap[n]:.3f})" for n in asked) + f"; {rec['seconds']}")
         return {"graph": g, "on": on, "record": rec}
 
@@ -436,6 +512,9 @@ class NativeConnector(Connector):
     criterion until native node selection names its changed-input families (inframove's)."""
 
     FAMILIES = ()
+
+    def targets(self) -> list[int]:
+        return list(self.pr.targets)
 
     def __init__(self, nat, ids: list[int], targets: list[int], ref: torch.Tensor, means: dict, units: list, B: int = 32):
         self.ge, self.tx = None, None

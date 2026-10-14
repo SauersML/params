@@ -17,7 +17,7 @@ permissions:
 
 concurrency:
   group: pod-python
-  cancel-in-progress: true
+  cancel-in-progress: false  # pushes come every few minutes: finish the running check, keep only the newest pending one
 
 jobs:
   compile:

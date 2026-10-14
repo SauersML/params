@@ -63,7 +63,7 @@ def test_search_donors_are_text6000_to_6399_or_refused(tmp_path, monkeypatch):
     for n in list(range(6000, 6450)) + [9000, 9150]:
         (directory / f"text{n}.json").write_text(json.dumps({"prompts": [{"token_ids": [1, n % 7], "target_positions": [1]}]}))
     monkeypatch.setattr(native, "TEXTS", tmp_path)
-    nat = SimpleNamespace(target=SimpleNamespace(n_tokens=40))
+    nat = SimpleNamespace(target=SimpleNamespace(n_tokens=goal_eval.DONOR_VOCAB))
     got = goal_eval.GoalEval(nat).far_pool("search")
     old = [p.stem for p in native.tasks("train")][0:400]  # the pool before: the first 400 train files present
     assert [n for n, _ in got] == old == [f"text{n}" for n in range(6000, 6400)] and got[5][1] == [1, 6005 % 7]
@@ -84,9 +84,25 @@ def test_far_donors_use_explicit_ids_with_missing_development_files(texts, monke
             "split": "heldout", "prompts": [{"token_ids": [1, 2], "target_positions": [1]}],
         }))
     monkeypatch.setattr(native, "TEXTS", texts.parent)
-    nat = SimpleNamespace(target=SimpleNamespace(n_tokens=40))
+    nat = SimpleNamespace(target=SimpleNamespace(n_tokens=goal_eval.DONOR_VOCAB))
     ge = goal_eval.GoalEval(nat)
     assert ge.far_pool("eval") == [("text9150", [1, 2]), ("text9199", [1, 2])]
+
+
+def test_foreign_vocabulary_requires_own_donor_pool_before_task_read(monkeypatch):
+    from types import SimpleNamespace
+    import goal_eval
+    import native
+
+    monkeypatch.setattr(native, "tasks", lambda *a: pytest.fail("foreign model opened VPD donors"))
+    ge = goal_eval.GoalEval(SimpleNamespace(target=SimpleNamespace(n_tokens=40)))
+    with pytest.raises(ValueError, match="set donor_pools"):
+        ge.far_pool("search")
+    ge.donor_pools["search"] = [("own-tokenizer", [1, 39])]
+    assert ge.far_pool("search") == [("own-tokenizer", [1, 39])]
+    ge.donor_pools["search"] = [("outside-vocabulary", [40])]
+    with pytest.raises(ValueError, match="outside this model"):
+        ge.far_pool("search")
 
 
 @pytest.mark.parametrize("task", ["text5999", "text8000", "text9000", "text9099", "text9100",

@@ -10,6 +10,8 @@ Predictors: a checkpoint directory (greedy decoding), or a baseline:
   prior   the circuit of the nearest training toy by TF-IDF prompt similarity, unit names unchanged
   union   every unit of the instance (zoo2: all modules; the instance-level union, not the per-text truth)
   weights weights_heuristic.py: walk back from the logits through render.wiring's weight gains (no LM, no texts)
+  weights2 weights_heuristic2.py: zoo2's marker-gated circuit, parsed from the prompt text only (no LM; run it under
+          TOYLOOP_SECTIONS=weights)
 With --swapped a checkpoint also runs on prompts whose weight section comes from another toy of the same family
 (same split) while the behaviour section stays: scored against both toys' truths. An oracle that reads the weights
 follows the weight donor; one that reads only the behaviour (which names active units) follows the original.
@@ -243,7 +245,7 @@ def markdown(res: dict) -> str:
 def main():
     global MANIFEST
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("predictors", nargs="+", help="checkpoint dirs and/or baselines: gt empty active prior weights union")
+    ap.add_argument("predictors", nargs="+", help="checkpoint dirs and/or baselines: gt empty active prior weights weights2 union")
     ap.add_argument("--train_n", type=int, default=40)
     ap.add_argument("--limit", type=int, default=None, help="at most this many toys per split")
     ap.add_argument("--swapped", action="store_true")
@@ -269,11 +271,14 @@ def main():
         elif name == "weights":
             import weights_heuristic
             pred = weights_heuristic.predict
+        elif name == "weights2":
+            import weights_heuristic2
+            pred = weights_heuristic2.predict
         elif name in ("gt", "empty", "active", "union"):
             pred = globals()[name]
         else:
             pred = Checkpoint(Path(name).expanduser(), a.max_new, a.threads)
-        tag = (name if name in ("gt", "empty", "active", "prior", "weights", "union") else Path(name).name) + a.suffix
+        tag = (name if name in ("gt", "empty", "active", "prior", "weights", "weights2", "union") else Path(name).name) + a.suffix
         res = run(tag, pred, splits, swapped=a.swapped and isinstance(pred, Checkpoint), wiring=a.wiring)
         (a.out / f"eval_{tag}.json").write_text(json.dumps(res, indent=1))
         (a.out / f"eval_{tag}.md").write_text(markdown(res))

@@ -18,8 +18,8 @@ carries leave the point run as it is); its budget the point family's floor. A re
               judged draw by draw against its own floor, sampled tokens pooled) stays at its floor;
   floors      every family the frozen reward scores on the text stays at its floor (goal_eval.tau's floors, each at most
               the fully wired circuit's own score): point, nodes, track_pp, interchange_pp, pattern and N on the line
-              variants from one plan (GoalEval.phi_variants over the current circuit's lines), omitted where the node
-              set moved; edges, flips and patching held at the current circuit's values, which the full check
+              variants from one plan (GoalEval.phi_variants over the current circuit's lines), patching too, omitted
+              where the node set moved; edges and flips held at the current circuit's values, which the full check
               (Floors.full: the circuit's own reward row, every family) tests every FULL_EVERY removals, at a level's
               end and before a process ends, going back to the last accepted state that passes when one fails;
 and kept after it when s_track_pp on the validation draws (the other half of the search pool: rank 2 and fresh
@@ -44,7 +44,6 @@ import argparse
 import gc
 import json
 import math
-import os
 import subprocess
 import sys
 import time
@@ -67,9 +66,6 @@ VAL_MARGIN = 0.02  # validation: s_track_pp at least the fully wired circuit's l
 MAX_STEPS = 24  # accepted removals per process
 EXIT_RESUME = 3
 FULL_EVERY = 8  # accepted removals between full checks of the current circuit's every family (Floors.full)
-CANDIDATE_FLOORS = os.environ.get("LINES_FLOORS", "candidate") == "candidate"  # A/B 10-14: every candidate judged on
-# the floors (Floors.__call__), or ("periodic") on point, s_track_pp and validation alone with the full checks keeping
-# every saved state at its floors
 
 
 def key(col: tuple) -> str:
@@ -206,10 +202,11 @@ def held(h: native.Graph):
 
 class Floors:
     """The frozen reward's floors (module docstring). Per candidate (__call__): every family against its floor on the
-    line variants from one plan of the current circuit (GoalEval.phi_variants with nodes recomputed: point, nodes,
-    track_pp, interchange_pp, pattern and N per variant), omitted on the survivors whose node set differs (it moves
-    with the node set alone), edges, flips and patching held at the current circuit's values; full(g): the circuit's
-    own reward row, every family. A candidate under a floor is None (its family recorded in refused)."""
+    line variants from one plan of the current circuit (GoalEval.phi_variants with nodes and patching recomputed: point,
+    nodes, track_pp, interchange_pp, patching near and far, pattern and N per variant; patching binds first on text9000,
+    and judged only at the full checks it sent nearly every removal back), omitted on the survivors whose node set
+    differs (it moves with the node set alone), edges and flips held at the current circuit's values; full(g): the
+    circuit's own reward row, every family. A candidate under a floor is None (its family recorded in refused)."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, floors: dict):
         self.ge, self.tx, self.pool, self.floors = ge, tx, pool, floors
@@ -236,7 +233,7 @@ class Floors:
         ge, tx, nat = self.ge, self.tx, self.ge.nat
         lines = ge.loo_lines(tx, g_now)
         keep = torch.tensor([[has(kind, x) for kind, x in lines] for has in (held(h) for h in graphs)], dtype=torch.bool)
-        got = ge.phi_variants(tx, g_now, keep, self.pool, base=self.base(g_now), recompute=("nodes",))["variants"]
+        got = ge.phi_variants(tx, g_now, keep, self.pool, base=self.base(g_now), recompute=("nodes", "patching"))["variants"]
         out = [{f: goal_eval.family_score(v["row"], f) for f in self.floors} for v in got]
         if "omitted" in self.floors:
             now = tuple(sorted(g_now.node_set()))
@@ -323,7 +320,7 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
 
     def by_floors(ons):
         return fl(pr.graph(pr.on), [pr.graph(on) for on in ons])
-    accept = teacher.both(changed, by_floors) if CANDIDATE_FLOORS else changed
+    accept = teacher.both(changed, by_floors)
     start_val = acc.validation(pr.graph(full))[0]
     floor_val = None if start_val is None else start_val - VAL_MARGIN
     log(f"{task_path.stem}: {len(pr.node_at)} parts, {len(pr.lines)} lines, {int(pr.on.sum())} on; point budget {budget:.4f} bits; "

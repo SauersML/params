@@ -22,10 +22,12 @@ carries leave the point run as it is); its budget the point family's floor. A re
               where the node set moved; edges and flips held at the current circuit's values, which the full check
               (Floors.full: the circuit's own reward row, every family) tests every FULL_EVERY removals, at a level's
               end and before a process ends, going back to the last accepted state that passes when one fails;
-and kept after it when s_track_pp on the validation draws (the other half of the search pool: rank 2 and fresh
-samples, eval-like) stays within VAL_MARGIN of the fully wired circuit's (teacher.Validated, every removal: a failing
-one goes back; the level then runs again, the failing removal's line kept for good when it was one line, else, when
-that run kept no removal before it, the next run's prefixes below half its size; until a run admits nothing).
+  validation  s_track_pp on the validation draws (the other half of the search pool: rank 2 and fresh samples,
+              eval-like) stays within VAL_MARGIN of the fully wired circuit's, asked of every candidate at once (ahead
+              of the floors, which cost the most), so the blocks a refused prefix holds are found a batch at a time;
+and kept after it when teacher.Validated finds the same (every removal: a failing one goes back; the level then runs
+again, the failing removal's line kept for good when it was one line, else, when that run kept no removal before it,
+the next run's prefixes below half its size; until a run admits nothing).
 
 Each accepted removal is checkpointed by line identity (a line's key names its ends, never its place in a list: a set's
 order changes from process to process), with the history of removals, and a process ends after MAX_STEPS of them (exit
@@ -407,7 +409,17 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
     def by_floors(ons):
         spent["candidates"] += len(ons)
         return fl(pr.graph(pr.on), [pr.graph(on) for on in ons])
-    accept = teacher.both(timed("changed", changed), timed("floors", by_floors))
+
+    def by_validation(ons):  # the validation draws asked about every candidate at once: the culprits a refusal leaves
+        val = acc._halves()[1]  # are found 8 a call, not one a rerun of the level (princess at 7,634 lines: every
+        if not val or floor_val is None:  # removal past the changed-input test and the floors fell under validation,
+            return [{} for _ in ons]  # 20 s each, a block frozen each time)
+        out = []
+        for rec in acc._per_draw([pr.graph(on) for on in ons], val):
+            sc, low = acc.ranked(rec, val, range(len(val)))
+            out.append({"validation": sc} if not low and (sc is None or sc >= floor_val) else None)
+        return out
+    accept = teacher.both(timed("changed", changed), timed("validation", by_validation), timed("floors", by_floors))
     acc.validation = timed("validation", acc.validation)
     fl.full = timed("full", fl.full)
     pr.without = (lambda f: lambda groups, ranking=False: timed("rank", f)(groups, ranking) if ranking else f(groups))(pr.without)

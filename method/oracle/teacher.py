@@ -1267,6 +1267,7 @@ def certify_set_answer(ge, tx, answer: dict, cap: float) -> dict:
             "target_positions": list(tx.targets), "proposal": "Architecture-complete node-set proposal, live remainders; seed for separately verified wiring.",
             "verification_graph_kl_calls": 1,
             "metric": "Existing graph_kl aggregate over target positions, not a worst-per-target bound.",
+            "aggregation": "sum over target-position KL divergences in bits",
             "scope": "Original-model next-token distributions for this input at these targets; not standalone OFF or English fidelity."}
 
 

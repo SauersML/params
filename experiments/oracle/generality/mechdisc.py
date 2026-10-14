@@ -26,7 +26,7 @@ h.1.mlp.c_fc #2103 and h.2.attn.k_proj #206; at o, h.1.attn.k_proj #329 and #119
                               fv --phi-check --rank once --accept changed,floors, semantics n) -> OUT/mechdisc_teacher/
   mechdisc.py score [--answers JSONL ...]   per item and pair whether the circuits hold each mechanism, bootstrap intervals
   mechdisc.py freeze --answers S1.jsonl ...  the fixed eval set (no later search changes it) and its reference rows
-  mechdisc.py eval ANSWERS.jsonl ... [--out F.json]   one answer set on the frozen items: per family the headline share,
+  mechdisc.py eval ANSWERS.jsonl|TEACHER_DIR ... [--out F.json]   one answer set on the frozen items: per family the headline share,
                               its paired difference to the teacher and S1, the secondary judgments
 """
 from __future__ import annotations
@@ -380,7 +380,8 @@ def _fmt(c) -> str:
 
 def _answers(files: list) -> dict:
     """task -> its answers' circuits from JSONL lines {task, text} (a model's raw output; components.parse reads its
-    CIRCUIT) or {task, answer: {nodes: ...}} (a circuit already in the answer format), several lines per task allowed."""
+    CIRCUIT) or {task, answer: {nodes: ...}} (a circuit already in the answer format), several lines per task allowed;
+    a directory: a teacher run's circuits (md*.json)."""
     try:
         import native  # noqa: F401  (components.group_of names a site through native.site_name)
     except ImportError:  # the standard library alone: native's site_name, the only part parse reads
@@ -391,6 +392,11 @@ def _answers(files: list) -> dict:
 
     by = collections.defaultdict(list)
     for f in files:
+        if Path(f).is_dir():  # a teacher run's output directory: its md*.json circuits (teacher.py's answer format)
+            for c in sorted(Path(f).iterdir()):
+                if c.suffix == ".json" and c.stem.startswith("md") and "." not in c.stem:
+                    by[c.stem].append(json.loads(c.read_text()))
+            continue
         for x in Path(f).read_text().splitlines():
             if x.strip():
                 ln = json.loads(x)
@@ -436,9 +442,12 @@ def evaluate(files: list, out: Path | None = None):
     full = collections.defaultdict(list, {nm: by.get(nm) or [{}] for nm in items})
     fam, head = _families(full, items)
     ref = json.loads((DATA / "mechdisc_reference.json").read_text()) if (DATA / "mechdisc_reference.json").exists() else {}
+    pos_n = [len({int(p_) for m, c, p_ in a_.get("nodes", []) if m != "tok"}) for v in by.values() for a_ in v]
+    res_cap = {"positions max": max(pos_n) if pos_n else None, "at 16 positions": sum(n == 16 for n in pos_n), "answers": len(pos_n)}
+    print(f"circuit positions: max {res_cap['positions max']}, {res_cap['at 16 positions']} of {res_cap['answers']} answers at exactly 16")
     print(f"mechdisc eval of {', '.join(map(str, files))}: {len(items)} items, {sum(len(v) for v in by.values())} answers, "
           f"{len(missing)} items without an answer (counted as empty circuits){f', {len(unknown)} unknown task ids' if unknown else ''}")
-    res = {"files": [str(f) for f in files], "missing": missing, "families": fam, "vs": {}}
+    res = {"files": [str(f) for f in files], "missing": missing, "families": fam, "vs": {}, "positions": res_cap}
     print(f"  {'family':8s} {'items':>5s}  {'headline [95% CI]':24s}" + "".join(f"  {'minus ' + k + ' (paired)':34s}" for k in ref))
     for kd in ("copy", "bigram", "context"):
         names = [nm for nm in sorted(items) if items[nm]["kind"] == kd]

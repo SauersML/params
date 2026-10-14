@@ -1397,9 +1397,10 @@ class GoalEval:
         (native_units: an attention head at a position, a post-GELU neuron at a position) replaced, {"head": (mask [B,
         layers, T, H], values or None), "neuron": (mask [B, layers, T, d_mlp], values [B or 1, layers, T, d_mlp] or
         None)}: with values (a held head: {"q", "k", "v" before the rotation, "out" before the output matrix: [B or 1,
-        layers, H, T, hd]}) the unit takes them, without them its output is 0 (a head's query, key and value stay its
-        own). capture: receives those values of the run {"q", "k", "v", "out": [B, layers, H, T, hd], "neuron": [B,
-        layers, T, d_mlp]}. outside: {site: activations [B or 1, T, C]}: that site's subcomponents outside the circuit
+        layers, H, T, hd]}; "out" alone keeps its query, key and value its own: native_units' mean ablation) the unit
+        takes them, without them its output is 0 (a head's query, key and value stay its own). capture: receives those
+        values of the run {"q", "k", "v", "out": [B, layers, H, T, hd], "neuron": [B, layers, T, d_mlp]}. outside:
+        {site: activations [B or 1, T, C]}: that site's subcomponents outside the circuit
         take these values at full strength (the model's on the text: the q/k sites held at x give the circuit the model's
         attention instead of C's near-uniform one, rustmove's 10-13 measurement)."""
         import vpd_model
@@ -1493,7 +1494,7 @@ class GoalEval:
             q, k, v = (site(nm[kk], z, resid).view(B, T, H, hd).transpose(1, 2) for kk in ("q_proj", "k_proj", "v_proj"))
             if hm is not None:
                 mh = hm[:, i].transpose(1, 2)[..., None]  # [B, H, T, 1]
-                if hv is not None:
+                if hv is not None and "q" in hv:  # ("out" alone: a mean ablation, the head's own q, k, v)
                     q, k, v = (torch.where(mh, hv[kk][:, i], y) for kk, y in (("q", q), ("k", k), ("v", v)))
             if cap is not None:
                 for kk, y in (("q", q), ("k", k), ("v", v)):

@@ -3,7 +3,7 @@ on the circuits themselves, never through the oracle, on held-out draws alone (t
 input-scope draws, and a flip pool no search drew from), the judge of the builder bake-off. A circuit is a set of units
 with a run semantics: VPD subcomponents under VPD's fixed masks (goal_eval's C semantics), or the model's own heads and
 neurons ("units": "native", nodes ["head" | "neuron", layer, position, index]) in the real model with every unit outside
-mean-ablated (native_units.unit_means, NativePhi(means=)); native circuits are scored on the families both kinds have
+mean-ablated (a head's output and a neuron's activation at their means: native_units.unit_means, NativePhi(means=)); native circuits are scored on the families both kinds have
 (native_units.SHARED; v_shared compares the two). Per circuit, on its text:
   floors   every family of the frozen reward (goal_eval.fidelity, reward mode, eval split) against its floor
            (goal_eval.vpd_floors on the same draws): the circuit's score, the floor, VPD's whole answer's score, and the
@@ -34,6 +34,8 @@ mean-ablated (native_units.unit_means, NativePhi(means=)); native circuits are s
            in bits; the same predictions from VPD's answer at the START's candidates and from VPD's whole answer (its
            own runs, as the node family runs VPD's answer) on the removals inside each
   size     also parameters touched (each unit's weights once) and the build's seconds per text
+  live     (VPD circuits, a diagnostic beside the claim) live_gates: edit_live's predictions with VPD's gates recomputed
+           on each edited run, where the causal-importance network is
   teacher  from TEXT.path.json beside the circuit: the stage written, whether a smaller stage failed the search
            reward row (fallback), the START's parts and positions, whether it met the floors and was cap-bound
 The criteria run cheapest first (floors and known, edits, size, minimal, stated), the record so far in OUT/<task>.partial
@@ -85,9 +87,10 @@ DEV20 = tuple(f"text{n}" for n in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 900
                                    9014, 9018, 9020, 9025, 9029, 9030, 9031, 9033, 9046, 9048))  # scored every iteration
 # (the lead's 10-14: the first ten, plus ten spread over length, 2-484 tokens, and the circuits' position counts, 2-15)
 ENTRIES = 2 ** 27  # mask floats per engine call (edit runs)
+LIVE_SINGLES = 32  # live_gates' single removals (the CI network runs per removal)
 SHARE_MIN = 0.1  # a mediated share is left undefined when the live drop is under this many bits
 LN2 = math.log(2.0)
-BATCH = 4  # reward rows per fidelity call
+BATCH = int(os.environ.get("SC_BATCH", 4))  # reward rows per fidelity call (SC_BATCH=1 for the Mac's memory)
 KIND = {"MLP.up": "mlp.c_fc", "MLP.down": "mlp.down_proj", "Attn.o": "attn.o_proj", "Attn.v": "attn.v_proj",
         "Attn.k": "attn.k_proj", "Attn.q": "attn.q_proj"}
 PAPER = {  # the parts the VPD paper names in its two case studies (the lead's paper_check.py), label@position
@@ -419,6 +422,29 @@ def build_seconds(path: Path) -> float | None:
     return got
 
 
+def live_gates(ge: goal_eval.GoalEval, tx: goal_eval.Text, ed: dict) -> dict | None:
+    """A VPD diagnostic beside the circuit's claim (the lead's decision 3, 10-14): edit_live.live's predictions with VPD's
+    causal-importance gates recomputed on each edited run (vpd_live, circuit_live, circuit_plus, circuit_fixed), on the
+    edits' top LIVE_SINGLES single removals by real drop and the top 3 and 5 together, against the real drops; the
+    parts the gates switch on and the circuit parts they switch off. None without the causal-importance network."""
+    import vpd_model
+
+    if not Path(vpd_model.VPD_PTH).exists():
+        return None
+    import edit_live
+
+    nodes = [tuple(x) for x in ed["nodes"]]
+    real, n1 = ed["drops"]["model"], len(nodes)
+    order = [int(i) for i in np.argsort(real[:n1])[::-1][:LIVE_SINGLES]]
+    at = dict(zip(ed["parts"], nodes))
+    top = [at[x] for x in ed["groups"]["top5"]]
+    got = edit_live.live(ge, tx, nodes, [[nodes[i]] for i in order] + [top[:3], top[:5]])
+    reals = [real[i] for i in order] + real[n1:n1 + 2]
+    out = {k: edit_live.group_stats([got[k][0] - x for x in got[k][1:]], reals, len(order)) for k in edit_live.LIVE}
+    out.update(on=got["on"], off=got["off"], singles=len(order), clean_vs_saved=got["clean_vs_saved"])
+    return out
+
+
 def teacher_block(path: Path) -> dict | None:
     """The teacher's record beside a circuit (TEXT.path.json): stage written, fallback (a smaller stage failed the
     search reward row), the START's parts, positions, floors met and cap bound."""
@@ -619,6 +645,7 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     done("floors")
 
     rec["edits"] = ed = edits(ge, tx, g)
+    rec["live_gates"] = live_gates(ge, tx, ed)
     done("edits")
 
     order = tx.vpd_order if getattr(tx, "vpd_order", None) else nat._vpd_order(tx.ids, tx.targets)
@@ -693,7 +720,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None) -> None:
         if f.suffix != ".json" or f.name == "summary.json":
             continue
         rec = json.loads(f.read_text())
-        if "mediated" in rec.get("edits", {}) and "params" in rec.get("size", {}):
+        if "mediated" in rec.get("edits", {}) and "params" in rec.get("size", {}) and rec.get("live_gates") is not None:
             continue
         path = circuits_dir / f.name
         tp = task_path(path.stem)
@@ -702,11 +729,16 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None) -> None:
         nodes = [tuple(x) for x in ed["nodes"]]
         at = dict(zip(ed["parts"], nodes))
         top = [at[x] for x in ed["groups"]["top5"]]
-        ed["mediated"] = mediated_vpd(ge, tx, nodes, [top[:1], top[:3], top[:5]])
+        if "mediated" not in ed:
+            ed["mediated"] = mediated_vpd(ge, tx, nodes, [top[:1], top[:3], top[:5]])
+        if rec.get("live_gates") is None:
+            rec["live_gates"] = live_gates(ge, tx, ed)
         g, _, _ = goal_eval.load_answer(path, json.loads(tp.read_text()), tx.targets, ge.nat)
         rec["size"].update({"units": "vpd", "params": params_touched(ge.nat, g.node_set()), "build_seconds": build_seconds(path)})
         f.write_text(json.dumps(rec))
-        say(f"{path.stem}: mediated {[(m['k'], None if m['share'] is None else round(m['share'], 2)) for m in ed['mediated']]}")
+        lg = rec.get("live_gates") or {}
+        say(f"{path.stem}: mediated {[(m['k'], None if m['share'] is None else round(m['share'], 2)) for m in ed['mediated']]}, "
+            f"live gates top-3 error {[(k, round(lg[k]['top3']['error'], 2)) for k in ('vpd_live', 'circuit_live', 'circuit_plus') if k in lg]}")
 
 
 def wilson(k: int, n: int) -> list:
@@ -733,6 +765,12 @@ def own_stats(r: dict) -> dict:
 
 def share(r: dict, k: int):
     return next((m["share"] for m in (r.get("edits") or {}).get("mediated", []) if m["k"] == k), None)
+
+
+def share_distance(x):
+    """A mediated share's distance from 1, |log2 share| (1: a factor of two either way, amplification by the outside
+    and self-repair alike; inf for a share at or below 0, a sign flip); None where the share is undefined."""
+    return None if x is None else (abs(math.log2(x)) if x > 0 else math.inf)
 
 
 def summary(recs: list[dict]) -> dict:
@@ -763,6 +801,7 @@ def summary(recs: list[dict]) -> dict:
     return {"pool": sorted({r.get("pool") for r in recs}), "units": sorted({r["size"].get("units", "vpd") for r in recs}),
             "meet_shared_floors": sum(v_shared(r) == 0.0 for r in recs), "median_v_shared": med([v_shared(r) for r in recs]),
             "median_mediated_share": {k: med([share(r, k) for r in recs]) for k in (1, 3, 5)},
+            "median_share_distance": {k: med([share_distance(share(r, k)) for r in recs]) for k in (1, 3, 5)},
             "median_params": med([r["size"].get("params") for r in recs]), "median_build_seconds": med([r["size"].get("build_seconds") for r in recs]),
             "median_margin_by_family": margins, "edits_medians": edit,
             "teacher_fallback": sum(bool(t["fallback"]) for t in tb), "teacher_records": len(tb),
@@ -826,6 +865,21 @@ def table(recs: list[dict]) -> str:
     return "\n".join(out)
 
 
+def mib_rows(d: Path, names) -> dict:
+    """MIB's numbers per builder from fleet's directory (interpbench/builders/<builder>.json, mib_score.py's output):
+    circuit-localization AUROC [95% CI] and its paired difference from EAP-IG-inputs [95% CI] on MIB's IOI test
+    prompts 0-31, as the benchmark reports them."""
+    out = {}
+    for n in names:
+        f = d / f"{n}.json"
+        if f.exists():
+            r = json.loads(f.read_text())
+            dv = r.get("diff_vs_eap_ig_inputs") or {}
+            out[n] = {"AUROC": f"{r['auroc']:.3f} [{r['ci95'][0]:.2f},{r['ci95'][1]:.2f}]",
+                      "vs EAP-IG-in": f"{dv['diff']:+.3f} [{dv['ci95'][0]:+.2f},{dv['ci95'][1]:+.2f}]" if dv else "-"}
+    return out
+
+
 def bakeoff(sets: dict, mib: dict | None = None) -> str:
     """The builders side by side (the lead's 10-14 bake-off): each set (name -> its records) on the texts every set
     scored, its summary's headline numbers, and MIB's external numbers per builder when given (mib: name -> {metric:
@@ -835,7 +889,9 @@ def bakeoff(sets: dict, mib: dict | None = None) -> str:
             ("median v (shared)", lambda s: s["median_v_shared"]), ("removable share", lambda s: s["removable_uniform"][2]),
             ("inert parts", lambda s: s["inert_parts"] / max(1, s["parts"])),
             ("mediated top1", lambda s: s["median_mediated_share"][1]), ("mediated top3", lambda s: s["median_mediated_share"][3]),
-            ("mediated top5", lambda s: s["median_mediated_share"][5]), ("median units", lambda s: s["median_parts"]),
+            ("mediated top5", lambda s: s["median_mediated_share"][5]),
+            ("|log2 share| top1", lambda s: s["median_share_distance"][1]), ("|log2 share| top3", lambda s: s["median_share_distance"][3]),
+            ("|log2 share| top5", lambda s: s["median_share_distance"][5]), ("median units", lambda s: s["median_parts"]),
             ("median params (M)", lambda s: None if s["median_params"] is None else s["median_params"] / 1e6),
             ("median build s", lambda s: s["median_build_seconds"]), ("median positions", lambda s: s["median_positions"])]
     rows = {}
@@ -866,7 +922,8 @@ def main():
     ap.add_argument("--pool", type=Path, default=POOL)
     ap.add_argument("--vpd", type=Path, nargs="*", default=[], help="VPD's saved answers and orders (teacher.py --save-vpd's "
                     "files, merged), where the causal-importance network is not")
-    ap.add_argument("--mib", type=Path, help="bakeoff: MIB's numbers per builder, {builder: {metric: value}}")
+    ap.add_argument("--mib", type=Path, help="bakeoff: fleet's MIB directory (interpbench/builders, <builder>.json per "
+                    "builder name) or a JSON {builder: {metric: value}}")
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     a = ap.parse_args()
@@ -875,7 +932,8 @@ def main():
         return
     if str(a.paths[0]) == "bakeoff":  # bakeoff NAME=OUT ... [--mib FILE: {builder: {metric: value}}]
         sets = {x.split("=", 1)[0]: load(Path(x.split("=", 1)[1])) for x in map(str, a.paths[1:])}
-        print(bakeoff(sets, json.loads(a.mib.read_text()) if a.mib else None))
+        mib = None if not a.mib else (mib_rows(a.mib, sets) if a.mib.is_dir() else json.loads(a.mib.read_text()))
+        print(bakeoff(sets, mib))
         return
     if str(a.paths[0]) == "table":
         recs = load(a.paths[1])
@@ -897,7 +955,7 @@ def main():
         part = a.out / f"{p.stem}.partial"
         keep = lambda r, part=part: part.write_text(json.dumps(r))  # noqa: E731
         if is_native(p):
-            means = means or native_units.unit_means(ge)
+            means = means or native_units.unit_means(ge.nat)
             rec = score_native(ge, p, pool, vpd, means, a.pool.name, save=keep)
         else:
             rec = score(ge, p, pool, vpd, a.pool.name, save=keep)

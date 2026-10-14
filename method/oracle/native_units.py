@@ -628,7 +628,8 @@ class NativePhi:
     VPD's answer with those units removed or held); each bound the native circuit's own (its empty circuit, the
     embedding alone; keep-nothing, every unit at the donor's). Rows carry the families' VPD-form records, rl_terms
     (each without the floor at 0, as phi reads them) and eps. means (unit_means): the C-semantics families and the
-    removals mean-ablate a unit instead of zeroing it (the bake-off's native semantics, the lead's 10-14)."""
+    removals mean-ablate a unit instead of zeroing it (the bake-off's native semantics, the lead's 10-14; a head's output
+    alone, its query, key and value its own)."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, split: str = "eval", means: dict | None = None):
         nat = ge.nat
@@ -652,24 +653,24 @@ class NativePhi:
         return self._caps[key]
 
     def _ablate(self, T: int) -> dict | None:
-        """The values an ablated unit takes on a T-token text: its mean (means, a capture's form at every position), or
-        None (output 0) without means."""
+        """The values an ablated unit takes on a T-token text: its mean (means, unit_means') at every position, a head's
+        output alone (its query, key and value its own), or None (output 0) without means."""
         if self.means is None:
             return None
         m = self.means
-        out = {k: m[k].to(self.nat.dev)[None, :, :, None, :].expand(1, -1, -1, T, -1) for k in ("q", "k", "v", "out")}
-        out["neuron"] = m["neuron"].to(self.nat.dev)[None, :, None, :].expand(1, -1, T, -1)
-        return out
+        return {"out": m["heads"].to(self.nat.dev)[None, :, :, None, :].expand(1, -1, -1, T, -1),
+                "neuron": m["neurons"].to(self.nat.dev)[None, :, None, :].expand(1, -1, T, -1)}
 
     def _units(self, heads: list, neurons: list, values: dict | None) -> dict:
         """graph_ref's units from per-row masks ([layers, T, H], [layers, T, d_mlp]) and values (a capture, rows 1 or B)."""
-        hv = None if values is None else {k: values[k] for k in ("q", "k", "v", "out")}
+        hv = None if values is None else {k: values[k] for k in ("q", "k", "v", "out") if k in values}
         return {"head": (torch.stack(heads), hv), "neuron": (torch.stack(neurons), None if values is None else values["neuron"])}
 
     def _mix(self, a: dict, b: dict, hm: torch.Tensor, nm: torch.Tensor) -> dict:
-        """A capture with b's values where the masks ([layers, T, H], [layers, T, d_mlp]) are set, a's elsewhere."""
+        """A capture with b's values where the masks ([layers, T, H], [layers, T, d_mlp]) are set, a's elsewhere (and
+        wherever b has no value: a mean ablation's query, key and value)."""
         h = hm.permute(0, 2, 1)[None, :, :, :, None]  # [1, layers, H, T, 1]
-        out = {k: torch.where(h, b[k], a[k]) for k in ("q", "k", "v", "out")}
+        out = {k: torch.where(h, b[k], a[k]) if k in b else a[k] for k in ("q", "k", "v", "out")}
         out["neuron"] = torch.where(nm[None], b["neuron"], a["neuron"])
         return out
 
@@ -971,30 +972,29 @@ MEANS_FILE = Path.home() / "mpd-data/graph_oracle/native_means.pt"
 
 
 @torch.no_grad()
-def unit_means(ge: goal_eval.GoalEval, texts=MEANS_TEXTS, path: Path | None = MEANS_FILE) -> dict:
+def unit_means(nat: native.Native, texts=MEANS_TEXTS, path: Path | None = MEANS_FILE) -> dict:
     """Each native unit's mean over every position of the texts (the bake-off's mean ablation, the lead's 10-14): a
-    head's query, key, value (before the rotation) and output (before the output matrix) {"q", "k", "v", "out": [layers,
-    H, hd]}, a post-GELU neuron's activation {"neuron": [layers, d_mlp]}, from the real model's runs (graph_ref's
-    capture); kept in path, recomputed when its texts differ."""
+    head's output before the output matrix {"heads": [layers, H, hd]} and a post-GELU neuron's activation {"neurons":
+    [layers, d_mlp]}, from the real model's runs (goal_eval.graph_ref's capture); an ablated head keeps its own query,
+    key and value. Kept in path, recomputed when its texts differ."""
     names = [f"text{n}" for n in texts]
     if path is not None and path.exists():
         got = torch.load(path)
-        if got.get("texts") == names:
+        if got.get("texts") == names and "heads" in got:
             return got
-    nat = ge.nat
-    total, count = None, 0
+    ge = goal_eval.GoalEval(nat)
+    heads = neurons = None
+    count = 0
     for name in names:
         ids, _ = native.text(native.TEXTS / "vpd4l" / f"{name}.json")
         c = {}
         ones = native.Graph(masks={n: torch.ones(len(ids), nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
         ge.graph_ref(list(ids), [len(ids) - 1], ones, capture=c)
-        s = {k: c[k][0].sum(2).double() for k in ("q", "k", "v", "out")}  # [layers, H, hd]
-        s["neuron"] = c["neuron"][0].sum(1).double()                        # [layers, d_mlp]
-        total = s if total is None else {k: total[k] + s[k] for k in s}
+        h, m = c["out"][0].sum(2).double(), c["neuron"][0].sum(1).double()  # [layers, H, hd], [layers, d_mlp]
+        heads, neurons = (h, m) if heads is None else (heads + h, neurons + m)
         count += len(ids)
         native.free(nat.dev)
-    out = {k: (v / count).float().cpu() for k, v in total.items()}
-    out["texts"], out["positions"] = names, count
+    out = {"heads": (heads / count).float().cpu(), "neurons": (neurons / count).float().cpu(), "texts": names, "positions": count}
     if path is not None:
         torch.save(out, path)
     return out

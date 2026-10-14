@@ -128,13 +128,16 @@ class NativeUnits:
         return self._forward_impl(base, removals, s, keep=keep)
 
     def _forward_impl(self, base: Mask, removals: list[list[tuple]], s: int, keep: bool = False,
-                      strengths: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+                      strengths: tuple[torch.Tensor, torch.Tensor] | None = None,
+                      means: dict | None = None) -> torch.Tensor:
         """log q at the targets [len(removals), len(targets), V]: each row the base set without its removals (at
         positions >= s). It computes the positions from s on that hold base units, and the targets: a position holding
         none keeps its embedding through every layer, so its keys and values, and those before s, are the base run's
         (keep: compute every position and store them, s = 0)."""
         import vpd_model
 
+        if means is not None and (not keep or strengths is None or s != 0 or removals != [[]]):
+            raise ValueError('mean strengths require full-context execution without cached removals')
         tg, B, T, H, hd, dev = self.tg, len(removals), self.T, self.H, self.hd, self.nat.dev
         if keep:
             comp = torch.arange(T, device=dev)
@@ -184,26 +187,38 @@ class NativeUnits:
             sel = idx["head"][1] == i
             if sel.any():
                 hm[idx["head"][0][sel], idx["head"][3][sel], idx["head"][2][sel]] = 0.0
-            att = ((P @ v) * hm[..., None]).transpose(1, 2).reshape(B, n, -1)
+            if means is None:
+                att = ((P @ v) * hm[..., None]).transpose(1, 2).reshape(B, n, -1)
+            else:
+                att = ((P @ v) * hm[..., None] + (1 - hm[..., None]) * means['heads'][i][None, :, None, :]).transpose(1, 2).reshape(B, n, -1)
             x = x + att @ self.W["o_proj"][i].T
             z2 = vpd_model.rms(x, tg.norms[2 * i + 1], tg.eps)
             nm = (base.neurons if strengths is None else strengths[1])[i, comp][None].expand(B, -1, -1).float().clone()  # [B, n, d_mlp]
             sel = idx["neuron"][1] == i
             if sel.any():
                 nm[idx["neuron"][0][sel], idx["neuron"][2][sel], idx["neuron"][3][sel]] = 0.0
-            x = x + (vpd_model.gelu_tanh(z2 @ self.W["c_fc"][i].T) * nm) @ self.W["down_proj"][i].T
+            if means is None:
+                x = x + (vpd_model.gelu_tanh(z2 @ self.W["c_fc"][i].T) * nm) @ self.W["down_proj"][i].T
+            else:
+                act = vpd_model.gelu_tanh(z2 @ self.W["c_fc"][i].T)
+                x = x + (act * nm + (1 - nm) * means['neurons'][i][None, None, :]) @ self.W["down_proj"][i].T
         if keep and strengths is None:
             self._cache = (base, kept)
         final = vpd_model.rms(x[:, where[self.targets]], tg.ln_f, tg.eps)
         return torch.log_softmax((final @ tg.wte.T).float(), -1)
 
     @torch.enable_grad()
-    def strength_log_probs(self, heads: torch.Tensor, neurons: torch.Tensor) -> torch.Tensor:
+    def strength_log_probs(self, heads: torch.Tensor, neurons: torch.Tensor, *, means: dict | None = None) -> torch.Tensor:
         """Full-context native execution with differentiable output multipliers in [0,1].
 
         Head multipliers precede O projection; neuron multipliers follow GELU and
         precede down projection. Same algebra as ordinary execution, no remainder,
         frozen activation trace or cache read/write. Does not increment removal runs.
+        Optional fixed means replace zero as the omitted output: a*actual+(1-a)*mean.
+        Means have heads [L,H,hd], neurons [L,Dm], matching model dtype/device;
+        they are detached constants. Every position executes even when its strengths
+        are zero: its mean residual can affect later attention. Binary strengths
+        provide ordinary mean-ablated execution through this same full-context path.
         """
         expected = ((self.L, self.T, self.H), (self.L, self.T, self.Dm))
         for value, shape in zip((heads, neurons), expected):
@@ -211,10 +226,22 @@ class NativeUnits:
                 raise ValueError('strength shape/dtype/device mismatch')
             if not torch.isfinite(value).all() or not ((value >= 0) & (value <= 1)).all():
                 raise ValueError('strengths must be finite within [0,1]')
-        return self._forward_impl(self.full(), [[]], 0, keep=True, strengths=(heads, neurons))
+        if means is not None:
+            if not isinstance(means, dict):
+                raise ValueError('means must contain heads and neurons tensors')
+            fixed = {}
+            for key, shape in (('heads', (self.L, self.H, self.hd)), ('neurons', (self.L, self.Dm))):
+                value = means.get(key)
+                if (not isinstance(value, torch.Tensor) or value.shape != shape
+                        or not value.is_floating_point() or value.dtype != self.emb.dtype
+                        or value.device != self.emb.device or not torch.isfinite(value).all()):
+                    raise ValueError('mean shape/dtype/device/finite mismatch')
+                fixed[key] = value.detach()
+            means = fixed
+        return self._forward_impl(self.full(), [[]], 0, keep=True, strengths=(heads, neurons), means=means)
 
     @torch.enable_grad()
-    def integrated_unit_scores(self, steps: int = 4) -> dict:
+    def integrated_unit_scores(self, steps: int = 4, *, means: dict | None = None) -> dict:
         """Negative mean direct-KL gradients at fixed uniform midpoint strengths.
 
         A deterministic proposal score for each native unit, not a finite-deletion
@@ -224,6 +251,9 @@ class NativeUnits:
         is approximate, not an exact completeness identity.
         midpoint_KL_bits uses existing raw FP32 carry.kl; normalized final fidelity
         is a separate physical verification.
+        Optional fixed means define the same mean-background path as
+        strength_log_probs; zero remains the default. Scores from the two paths
+        are different proposal rules, not interchangeable causal measurements.
         """
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError('steps must be a positive integer')
@@ -235,7 +265,7 @@ class NativeUnits:
             a = (i + .5) / steps
             h = torch.full_like(score_h, a, requires_grad=True)
             n = torch.full_like(score_n, a, requires_grad=True)
-            loss = carry.kl(self.ref.detach(), self.strength_log_probs(h, n)).sum()
+            loss = carry.kl(self.ref.detach(), self.strength_log_probs(h, n, means=means)).sum()
             gh, gn = torch.autograd.grad(loss, (h, n))
             if not torch.isfinite(loss) or not torch.isfinite(gh).all() or not torch.isfinite(gn).all():
                 raise ValueError('nonfinite native ranking loss/gradient')

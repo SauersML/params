@@ -847,3 +847,9 @@ flowchart BT
   MATCHLEARN -- explain and reduce retention failures --> TRAINFORMAT
   TRAINFORMAT -- retain capabilities while learning circuits --> C1
   class TRAINFORMAT active
+
+%% TRAINWIDEN owner variable_reward: broaden verified within-family weight instances after TRAIN-fit success/transfer gap; no family-generalization claim or evaluation-target reuse.
+  TRAINWIDEN["<b>Expand verified TRAIN weight instances</b><br/>Same8 permitted families;8 fresh330-seed models.<br/>Existing24 plus3 prior proof pairs plus8 gives35.<br/>Source298d782, executorcd8;10testsPASS.<br/>All8 weights/config/4inputs frozen, no holdout generated.<br/>MATS20068/20069 RUNNING CPU2/1GiB/20min.<br/>Fixed52440 forward cap; all failures retained.<br/>New340-seed holdout separately reserved;<br/>old320 bank untouched; no family expansion.<br/>Why: TRAIN fit alone did not establish weight transfer.<br/>Search outcomes pending, no new paid learning<br/>ACTIVE · variable_reward"]
+  TRAINFORMAT -- transfer gap motivates diverse TRAIN weights --> TRAINWIDEN
+  TRAINWIDEN -- verified additional supervision --> MATCHLEARN
+  class TRAINWIDEN active

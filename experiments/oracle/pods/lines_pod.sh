@@ -44,6 +44,8 @@ ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/
 cd /Users/user/params/; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/gpu.log 2>&1 &);
 set +e; $RUNS wait; echo all stages done"
-RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-rustmove} RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.5} RP_MIN_VRAM_GB=${VRAM:-24} RP_MIN_RAM_GB=${RAM:-64} RP_DISK_GB=${DISK:-50} \
+# (the idle stop at 5%: the line search runs on the host for minutes at a time, and rp-run's default 20% stopped the
+# paper run at 18%)
+RP_ALLOW_OVER=1 RP_OWNER=${RP_OWNER:-rustmove} RP_PARALLEL=1 RP_PYENV=oracle RP_IDLE_PCT=${RP_IDLE_PCT:-5} RP_MAX_PRICE=${PRICE:-0.5} RP_MIN_VRAM_GB=${VRAM:-24} RP_MIN_RAM_GB=${RAM:-64} RP_DISK_GB=${DISK:-50} \
   experiments/infra/runpod/rp-run $NAME "${GPU:-NVIDIA RTX A5000,NVIDIA GeForce RTX 3090,NVIDIA GeForce RTX 4090,NVIDIA L4,NVIDIA RTX A6000,NVIDIA A40}" $H -- bash -c "$CMD"
 }

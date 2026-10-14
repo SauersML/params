@@ -32,7 +32,8 @@ the next run's prefixes below half its size; until a run admits nothing).
 Each accepted removal is checkpointed by line identity (a line's key names its ends, never its place in a list: a set's
 order changes from process to process), with the history of removals, and a process ends after MAX_STEPS of them (exit
 EXIT_RESUME) so a fresh one resumes with the device's memory back (track_pp's caches grow over many calls); a resumed
-state is checked against the floors again first (a reward revision between processes moves them). When the levels are done, a fresh
+state is reused only when its model, inputs, donor pools, execution settings and reward revision match. An unbound
+or incompatible checkpoint starts again from the fully wired circuit. When the levels are done, a fresh
 process re-checks the circuit (graph_kl on the text, s_track_pp on the eval draws, the reward row's worst shortfall v)
 and writes OUT/<task>.json (goal_eval.to_json's stated form) and OUT/<task>.lines.json (the counts, the re-check, each
 line's and each part's removal effect: the point KL rise in bits and the eval s_track_pp fall).
@@ -55,6 +56,7 @@ import time
 from pathlib import Path
 
 import torch
+import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -74,13 +76,90 @@ FULL_EVERY = 8  # accepted removals between full checks of the current circuit's
 
 
 def revision() -> str:
-    """The reward's code and the adversary's pool as one digest: a checkpoint's setup (floors, budget, start
-    validation) computed under another is computed again, and its circuit checked again."""
+    """Reward and execution source revision; actual input content is bound by search_scope."""
     h = hashlib.sha1()
-    for name in ("goal_eval.py", "teacher.py", "engine.py", "native.py", "carry.py"):
+    for name in ("lines.py", "goal_eval.py", "teacher.py", "engine.py", "native.py", "native_units.py", "carry.py"):
+        h.update(name.encode() + b"\0")
         h.update((HERE / name).read_bytes())
-    h.update(str(teacher.POOL.stat().st_size).encode())
+    h.update((HERE.parent / "vpd/vpd_model.py").read_bytes())
     return h.hexdigest()[:16]
+
+
+def scope_digest(value) -> str:
+    """Hash the actual loaded search inputs, including tensor bytes; never unpickle a file.
+
+    Only the nested value types used by tasks, pools and model state are supported.
+    An unsupported object fails closed rather than getting an identity-based repr.
+    """
+    h = hashlib.sha256()
+    def add(x):
+        if isinstance(x, torch.Tensor):
+            h.update(b"tensor"); add((str(x.dtype), list(x.shape)))
+            raw = memoryview(x.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy()).cast("B")
+            for at in range(0, len(raw), 1024 * 1024):
+                h.update(raw[at:at + 1024 * 1024])
+        elif isinstance(x, (np.ndarray, np.generic)):
+            array = np.asarray(x)
+            if array.dtype.hasobject:
+                raise TypeError("object arrays cannot bind checkpoint scope")
+            h.update(b"numpy"); add((array.dtype.str, list(array.shape)))
+            raw = memoryview(np.ascontiguousarray(array).reshape(-1)).cast("B")
+            for at in range(0, len(raw), 1024 * 1024):
+                h.update(raw[at:at + 1024 * 1024])
+        elif isinstance(x, dict):
+            h.update(b"dict")
+            for k in sorted(x, key=scope_digest):
+                add(k); add(x[k])
+            h.update(b"end")
+        elif isinstance(x, (list, tuple)):
+            h.update(type(x).__name__.encode() + str(len(x)).encode() + b":")
+            for v in x: add(v)
+        elif isinstance(x, (set, frozenset)):
+            h.update(type(x).__name__.encode() + b":")
+            add(sorted(scope_digest(v) for v in x))
+        elif isinstance(x, range):
+            h.update(b"range"); add((x.start, x.stop, x.step))
+        elif x is None or isinstance(x, (str, int, float, bool)):
+            h.update(type(x).__name__.encode() + b":" + json.dumps(x, allow_nan=False).encode() + b"\0")
+        else:
+            raise TypeError(f"unsupported checkpoint scope value: {type(x).__name__}")
+    add(value)
+    return h.hexdigest()
+
+
+def search_scope(ge, tx, task_path, teacher_path, vpd, pool, levels, B) -> str:
+    """Actual model/basis and full context, separate from revisable reward code."""
+    nat, target = ge.nat, ge.nat.target
+    # These are the existing search/validation donor partitions, never sealed tasks.
+    # Bind their actual token lists even when the engine has not lazily read them yet.
+    far_donors = {split: ge.far_pool(split) for split in ("search", "eval")}
+    constants = lambda module: {k: v for k, v in vars(module).items()
+                               if k.isupper() and (v is None or isinstance(v, (str, bool, int, float, tuple, list, dict, set, frozenset, range)))}
+    return scope_digest({
+        "task_bytes": task_path.read_bytes().hex(), "teacher_bytes": teacher_path.read_bytes().hex(),
+        "ids": tx.ids, "targets": tx.targets, "reference": tx.ref,
+        "importance": getattr(tx, "ci", None), "vpd": tx.vpd, "vpd_order": getattr(tx, "vpd_order", None),
+        "supplied_vpd": (vpd or {}).get(task_path.stem), "pool": pool,
+        "model": target.state_dict(), "cfg": target.cfg,
+        "target_type": (type(target).__module__, type(target).__qualname__),
+        "runtime": (torch.__version__, torch.get_num_threads(), torch.get_float32_matmul_precision(), str(torch.get_default_dtype())),
+        "target_config": {k: getattr(target, k, None) for k in ("eps", "n_layer", "n_head", "n_tokens", "lm")},
+        "basis": {n: {k: getattr(target.site(n), k) for k in ("W", "U", "V", "delta_T")} for n in nat.names},
+        "sites": list(nat.names), "components": nat.C, "device": str(nat.dev),
+        "behavior": {k: getattr(target, k, None) for k in ("behavior", "behavior_tokens", "behavior_at")},
+        "levels": tuple(levels), "batch": B, "seed": tx.seed,
+        "execution": {k: getattr(ge, k, None) for k in ("semantics", "changes", "ranks", "share_floor", "random_pairs", "max_edges", "chunk", "cut_chunk")},
+        "donor_pools": ge.donor_pools, "probes": ge.probes, "hooks": ge.hooks,
+        "far_donors": far_donors,
+        "config": {"lines": {"VAL_MARGIN": VAL_MARGIN, "FULL_EVERY": FULL_EVERY},
+                   "teacher": constants(teacher), "goal_eval": constants(goal_eval)}})
+
+
+def scoped_state(state: dict, scope: str) -> dict:
+    """Scope includes reward revision: any incompatibility resets removals and floors."""
+    if state.get("scope") == scope:
+        return state
+    return {"scope": scope, "level": 0, "removed": [], "trace": [], "done": False}
 
 
 def key(col: tuple) -> str:
@@ -371,6 +450,19 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
     pr = LinePruner(ge, tx, sorted(g0.node_set()), B)
     ckpt = out / f"{task_path.stem}.ckpt.json"
     state = json.loads(ckpt.read_text()) if ckpt.exists() else {"level": 0, "removed": [], "trace": [], "done": False}
+    rev = revision()
+    scope = scope_digest((search_scope(ge, tx, task_path, teacher_path, vpd, pool, levels, B), rev))
+    if ckpt.exists() and state.get("scope") != scope:
+        previous = ckpt.read_bytes()
+        archive = ckpt.with_name(ckpt.name + ".invalidated." + hashlib.sha256(previous).hexdigest())
+        try:
+            with archive.open("xb") as f:
+                f.write(previous)
+        except FileExistsError:
+            if archive.read_bytes() != previous:
+                raise RuntimeError("checkpoint archive content mismatch")
+        log(f"  checkpoint scope changed or was unbound; retained {archive.name}; starting from every line")
+    state = scoped_state(state, scope)
     for k in state["removed"]:
         pr.on[pr.at[k]] = False
     full = torch.ones(len(pr.lines), dtype=torch.bool)
@@ -379,7 +471,6 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
     acc = teacher.Acceptance(ge, tx, ("changed",), "pp", "fv")
     changed, _ = acc.hook(pr.graph, full, current=lambda: pr.on, label="lines",
                           names=lambda ids: [key(pr.lines[i]) for i in ids])
-    rev = revision()
     same = (state.get("setup") or {}).get("rev") == rev  # the floors, budget and start validation of an earlier process
     if same:                                            # under the same reward code (a bracket-sized text: 5 min each)
         setup = state["setup"]
@@ -471,7 +562,7 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
         pending[:] = history  # revision between processes moved them: text9000's resumed circuit stood under
         if verify() is not None:  # interchange_pp's), back along every accepted removal when it fails (under the same
             save(state["level"])  # revision the last process's own full checks stand, and its pending removals wait)
-    elif state["removed"]:  # a checkpoint without its history: started again from the wired circuit
+    elif not history and state["removed"]:  # a checkpoint without its history: started again from the wired circuit
         log("  a checkpoint without its removals' history: starting again from every line")
         pr.on[:] = True
         state.update(level=0, cap=None, cap_level=None)

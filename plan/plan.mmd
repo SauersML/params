@@ -883,3 +883,10 @@ flowchart BT
   MATCHGAP -- predeclared wiring comparison --> TRAIN35TRANSFER
   TRAIN35TRANSFER -- transfer and complexity evidence --> C1
   class TRAIN35TRANSFER done
+
+%% DIRECTKL ad3c01c: caller-chosen absolute cap supplements the existing relative/family checks. Plain set/start_set route only; live dense remainders, own routing/norms. Start, stages, selected graph and compiled final JSON checked. Existing graph_kl aggregates target positions, not a newly instrumented worst-target metric. Infeasible route emits no-target, never an uncertified primary. Defaults unchanged. Nine new focused tests plus four existing controls PASS; independent source review CLEAR. No physical capped search or new training yet.
+  DIRECTKL["<b>Require direct fidelity in teacher targets</b><br/>Explicit absolute KL cap; defaults unchanged.<br/>Reject a poor start instead of loosening the cap.<br/>Recheck the compiled final answer before writing it.<br/>LIVE remainder node-set proposals only;<br/>wiring and intervention fidelity need their own checks.<br/>13 model-free tests and independent review pass.<br/>Why: prevent poor direct predictions becoming supervision.<br/>IMPLEMENTED · codex/eval_recovery"]
+  W5 -- ordinary output error exposes admission gap --> DIRECTKL
+  DIRECTKL -. opt-in proposal admission .-> T4
+  DIRECTKL -. qualifying targets, when physically verified .-> SUP
+  class DIRECTKL check

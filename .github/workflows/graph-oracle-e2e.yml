@@ -85,7 +85,7 @@ jobs:
             method/oracle/test_edit_affine.py experiments/oracle/test_claim_affine_envelope.py experiments/oracle/test_claim_affine_english_probe.py \
             experiments/oracle/toyloop/test_learning_model_bank.py experiments/oracle/toyloop/test_learning_bank_teacher.py \
             method/oracle/test_components.py::test_empty_like_answer_stays_below_zero method/oracle/test_reward_compactness.py \
-            method/oracle/test_semantic.py method/oracle/test_task_data.py \
+            method/oracle/test_semantic.py method/oracle/test_task_data.py method/oracle/test_teacher_direct_kl.py \
             method/oracle/test_tools_env.py::test_baselines_include_empty_and_same_batch_calibration \
             method/oracle/test_components.py::test_fit_pool_reports_nonfit_and_later_fitting_row \
             method/oracle/test_components.py::test_question_node_cap_is_opt_in_and_included_in_fit \

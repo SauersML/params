@@ -58,6 +58,9 @@ EDIT = ("Below is an explanation of how a small language model predicts the next
 POSITION = ("The claim to change: the position (or token) the explanation says the prediction draws its main information "
             "from, its source. Make it say instead that the source is the token {token!r} at position {position}, and "
             "change the words that name or describe the old source accordingly.")
+GROUNDED = ("\n\nEvery sentence must state a measured fact listed above (a position's effect in bits, an attention cut, a "
+            "measured intervention's outcome) or what follows directly from one, with its number; write nothing the "
+            "measurements do not show.")
 MECHANISM = ("The claim to change: how the model finds what it copies or uses. If the explanation says it does so by "
              "matching (an earlier occurrence of a token, the token after a repeated token or phrase, a match between the "
              "current token and an earlier one), make it say instead that the model copies from a fixed position relative "
@@ -188,7 +191,8 @@ def write(a) -> None:
                 fh.flush()
                 print(json.dumps({"task": f["task"], "usd": round(spend.total, 4)}), flush=True)
                 continue
-            correct = next((e for e in ask(components.writer_prompt(f), a.samples) if e and not NAMES.search(e)), None)
+            prompt = components.writer_prompt(f) + (components.escape(GROUNDED) if a.grounded else "")
+            correct = next((e for e in ask(prompt, a.samples) if e and not NAMES.search(e)), None)
             row = {"task": f["task"], "correct": correct, "position": None, "mechanism": None}
             wp = wrong_position(f, rows.get(f["task"], {}), native.task_seed(f["task"])) if correct else None
             if wp is not None:
@@ -338,6 +342,7 @@ def main():
     w.add_argument("--samples", type=int, default=4, help="writer samples per text (the gate's correct English: the first "
                    "that names no subcomponent)")
     w.add_argument("--no-edits", action="store_true", help="the samples alone, for select (SFT data)")
+    w.add_argument("--grounded", action="store_true", help="the writer told to state measured facts alone (GROUNDED)")
     se = sub.add_parser("select")
     se.add_argument("facts", type=Path)
     se.add_argument("rows", type=Path)

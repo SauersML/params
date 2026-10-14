@@ -60,6 +60,11 @@ K = 8  # sampled oracle answers per question
 Q_A = "Which earlier word is most important for predicting the next word?"
 BUDGET = 256  # forward passes of the model per text's battery (the builder's included)
 FACT_BUDGET = 16
+D_BUDGET = 64  # (d)'s passes per text, apart from the battery's
+CONTROLS = 16  # (d)'s collateral texts
+TOKENS_TRIED = 4
+ALPHAS = (0.25, 0.5, 1.0, 2.0, 4.0)
+Z_MIN = 0.05
 WIKITEXT = ("Salesforce/wikitext", "wikitext-103-raw-v1/test-00000-of-00001.parquet")
 CATEGORIES = {
     "room": "kitchen bedroom garage bathroom office basement garden attic hallway cellar",
@@ -442,6 +447,123 @@ def run(a) -> None:
                   flush=True)
 
 
+# ---- (d) edits: make the model's next token Z (its second choice) on a text, with one edit of the model applied
+# everywhere; collateral on CONTROLS other texts
+
+
+def resid_hook(tg, layer: int, vec, alpha: float):
+    """A hook adding alpha x vec to layer's output at every position of every input (a global edit)."""
+    v = vec.to(tg.dev)
+
+    def fn(_m, _i, out):
+        h = out[0] if isinstance(out, tuple) else out
+        h += (alpha * v).to(h.dtype)
+        return out
+
+    return (tg.layers[layer], fn)
+
+
+@__import__("contextlib").contextmanager
+def edited(tg, hooks):
+    handles = [mod.register_forward_hook(fn) for mod, fn in hooks]
+    try:
+        yield
+    finally:
+        for h in handles:
+            h.remove()
+
+
+def edit_score(tg, ids: list[int], z: int, hooks, controls: list[list[int]], ref) -> dict:
+    """The edit's success (z the top next token after ids), collateral (mean KL in bits over every position of the
+    controls against the unedited model, ref) and controls kept (share of control positions whose top token stays);
+    score = success - collateral - (1 - kept), env E's form. Not charged: the scorer's runs, not the answerer's."""
+    torch = tg.torch
+    x = torch.tensor([ids] + controls, device=tg.dev)
+    with tg.use(None), edited(tg, hooks), torch.no_grad():
+        lp = torch.log_softmax(tg.m(input_ids=x).logits.float(), -1)
+    ok = int(lp[0, -1].argmax()) == z
+    kl = ((ref.exp() * (ref - lp[1:])).sum(-1) / math.log(2)).clamp_min(0).mean().item()
+    kept = (lp[1:].argmax(-1) == ref.argmax(-1)).float().mean().item()
+    return {"success": ok, "collateral": kl, "kept": kept, "score": float(ok) - kl - (1 - kept)}
+
+
+def counterfactual(tg, m: Model, it: dict, z: int, positions: list[int]) -> list[int] | None:
+    """A one-token swap of ids (at positions, the model's top TOKENS_TRIED tokens there) after which z is the top next
+    token, else the swap raising log p(z) - log p(top) most."""
+    ids, top = it["ids"], it["top"]
+    lp = m.dist_at(ids)
+    seqs = []
+    for p in positions:
+        pr = lp[p - 1].clone()
+        pr[ids[p]] = -1e9
+        for y in pr.topk(TOKENS_TRIED).indices.tolist():
+            x = list(ids)
+            x[p] = y
+            seqs.append(x)
+    if not seqs:
+        return None
+    got = m.logp(seqs)
+    gap = got[:, z] - got[:, top]
+    return seqs[int(gap.argmax())]
+
+
+def edit_B(tg, m: Model, it: dict, z: int) -> tuple[list, dict]:
+    """Steering from a counterfactual: the swap (at the 8 latest candidates and the oracle's pick) that makes z the
+    top token, the residual difference at the last position at half depth, added everywhere at the smallest of ALPHAS
+    that makes z the top token on the text."""
+    ids = it["ids"]
+    with tg.use(None):
+        H, _ = tg.hidden(ids)
+    m.passes += 1
+    ans, _, _ = ao_votes(tg, ids, Q_A, H[tg.act_layer + 1])
+    hint = find(tg, ids, ans, list(CANDS))
+    cf = counterfactual(tg, m, it, z, list(dict.fromkeys(list(CANDS)[-8:] + ([hint] if hint else []))))
+    with tg.use(None):
+        Hc, _ = tg.hidden(cf)
+    m.passes += 1
+    L = tg.act_layer
+    vec = (Hc[L + 1, -1] - H[L + 1, -1]).float()
+    for alpha in ALPHAS:
+        hooks = [resid_hook(tg, L, vec, alpha)]
+        with tg.use(None), edited(tg, hooks):
+            lp = m.logp([ids])
+        if int(lp[0].argmax()) == z:
+            return hooks, {"alpha": alpha, "layer": L}
+    return hooks, {"alpha": ALPHAS[-1], "layer": L, "reached": False}
+
+
+def edits(a) -> None:
+    """(d) for every text item with a second choice of probability at least Z_MIN: the answerers' edits, each scored."""
+    items = [json.loads(x) for x in a.items.read_text().splitlines() if json.loads(x)["kind"] == "text"]
+    tg = ao_verify.Target(a.model, a.device)
+    torch = tg.torch
+    controls = texts(tg.tok, random.Random(99), CONTROLS)
+    with tg.use(None), torch.no_grad():
+        ref = torch.log_softmax(tg.m(input_ids=torch.tensor(controls, device=tg.dev)).logits.float(), -1)
+    done = {(json.loads(x)["id"], json.loads(x)["system"]) for x in a.out.read_text().splitlines()} if a.out.exists() else set()
+    for it in items:
+        m = Model(tg)
+        base = m.logp([it["ids"]])[0]
+        z = int(base.topk(2).indices[1])
+        if base[z].exp() < Z_MIN:
+            continue
+        for sysname in a.systems:
+            if (it["id"], sysname) in done:
+                continue
+            m, t0 = Model(tg), time.time()
+            if sysname == "B":
+                hooks, info = edit_B(tg, m, it, z)
+            else:
+                raise SystemExit(f"system {sysname}: (d) has B now; C waits for the builder")
+            sc = edit_score(tg, it["ids"], z, hooks, controls, ref)
+            rec = {"id": it["id"], "split": it["split"], "system": sysname, "z": z, "z_str": tg.tok.decode([z]), "passes": m.passes,
+                   "seconds": round(time.time() - t0, 2), **info, **sc}
+            with a.out.open("a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+            print(it["id"], sysname, repr(rec["z_str"]), {k: round(v, 3) if isinstance(v, float) else v for k, v in sc.items()},
+                  m.passes, "passes", flush=True)
+
+
 def report(a) -> None:
     recs = [json.loads(x) for x in a.out.read_text().splitlines()]
     for split in ("dev", "test"):
@@ -481,10 +603,16 @@ def main():
     r.add_argument("--device")
     r.add_argument("--budget", type=int, default=BUDGET)
     r.add_argument("--systems", nargs="+", default=["R", "A", "B"])
+    e = sub.add_parser("edits")
+    e.add_argument("--items", type=Path, required=True)
+    e.add_argument("--out", type=Path, required=True)
+    e.add_argument("--model", default=MODEL)
+    e.add_argument("--device")
+    e.add_argument("--systems", nargs="+", default=["B"])
     p = sub.add_parser("report")
     p.add_argument("out", type=Path)
     a = ap.parse_args()
-    {"build": build, "run": run, "report": report}[a.cmd](a)
+    {"build": build, "run": run, "edits": edits, "report": report}[a.cmd](a)
 
 
 if __name__ == "__main__":

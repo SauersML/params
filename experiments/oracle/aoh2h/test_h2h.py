@@ -31,6 +31,7 @@ class FakeTarget:
                           num_key_value_heads=2, head_dim=8, max_position_embeddings=128)
         self.m, self.dev, self.tok, self.torch = Qwen3ForCausalLM(cfg).eval(), torch.device("cpu"), Tok(), torch
         self.act_layer, self.answer = 1, answer or name(5)
+        self.layers = self.m.model.layers
 
     def use(self, adapter):
         return contextlib.nullcontext()
@@ -82,3 +83,22 @@ def test_the_oracle_hint_is_the_named_words_position():
     ids[11] = 5
     assert h2h.find(tg, ids, name(5), list(range(1, h2h.T - 1))) == 11
     assert h2h.find(tg, ids, name(9), list(range(1, h2h.T - 1))) is None
+
+
+def test_edit_B_stays_within_its_budget_and_is_scored():
+    tg = FakeTarget()
+    rng = random.Random(3)
+    it = item(rng)
+    m = h2h.Model(tg)
+    base = m.logp([it["ids"]])[0]
+    it["top"] = int(base.argmax())
+    z = int(base.topk(2).indices[1])
+    m = h2h.Model(tg)
+    hooks, info = h2h.edit_B(tg, m, it, z)
+    assert m.passes <= h2h.D_BUDGET and info["layer"] == tg.act_layer
+    controls = [[rng.randrange(64) for _ in range(h2h.T)] for _ in range(3)]
+    with torch.no_grad():
+        ref = torch.log_softmax(tg.m(input_ids=torch.tensor(controls)).logits.float(), -1)
+    sc = h2h.edit_score(tg, it["ids"], z, hooks, controls, ref)
+    assert set(sc) == {"success", "collateral", "kept", "score"} and sc["collateral"] >= 0 and 0 <= sc["kept"] <= 1
+    assert h2h.edit_score(tg, it["ids"], z, [], controls, ref)["collateral"] < 1e-6  # no edit, no collateral

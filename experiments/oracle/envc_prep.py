@@ -1,6 +1,7 @@
 """Env C's train targets in one pass per text (#2951 graph oracle): each kept variable's compact family
 (var_compact.compact, fast mode), then the text's target with only the INVARIANTS lines that hold under those compact
-subcomponents (env_c.reline). Two files out: the compact rows (var_compact's format) and the relined targets.
+subcomponents (env_c.reline, on the search pool's draws: dev scoring uses the disjoint eval pool). Two files out: the
+compact rows (var_compact's format) and the relined targets. --part K1,K2/N takes several parts in turn (one card).
 
   experiments/oracle/envc_prep.py --untar INPUTS.tgz [--split train] [--part K/N] [--fast 0.11] --out-compact FILE
                                   --out-targets FILE [--device D]
@@ -41,8 +42,8 @@ def main():
     V = native.TEXTS.parent / "variables"
     recs = [json.loads(x) for x in (V / "sft_targets" / f"{a.split}.jsonl").read_text().splitlines()]
     if a.part:
-        k, n = map(int, a.part.split("/"))
-        recs = recs[k::n]
+        ks, n = a.part.split("/")
+        recs = [x for k in map(int, ks.split(",")) for x in recs[k::int(n)]]
     done = {json.loads(x)["task"] for x in a.out_targets.read_text().splitlines()} if a.out_targets.exists() else set()
     for f in (a.out_compact, a.out_targets):
         f.parent.mkdir(parents=True, exist_ok=True)

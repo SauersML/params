@@ -29,6 +29,19 @@ def prepared():
 
 
 class DiagnosticSampleTests(unittest.TestCase):
+    def test_train_profile_exact_source_order_and_72_calls(self):
+        p=prepared();name=m.MODELS['base'];model=p['models'][name]
+        ids=list(m.train_helper.OLD_TRAIN)+[f'{f}_{3100000+100*i+v}' for i,f in enumerate(m.train_helper.FAMILIES) for v in (0,1)]
+        model['inputs']=[dict(copy.deepcopy(model['inputs'][0]),id=i) for i in ids]
+        model['upper_per_policy_usd']=str(sum((m.charge(model,2,0,416) for _ in ids),Decimal(0)))
+        p.update(profile='train_fit_v1',calls=72,policies={a:name for a in ('base','point','intervention')},models={name:model},
+                 primary_prepared_sha256='4c68ec1f9c810bf25f87cad3074da573ad0fa9338abfc22b8e5590053d4306a2',
+                 training_jsonl_sha256='94e6f5966516c858a42a5c9f770a9b5f716a4cd31bcdb5427a584e5ffc9fa188',
+                 upper_usd_decimal=str(3*Decimal(model['upper_per_policy_usd'])))
+        self.assertEqual(m.validate(p),Decimal(p['upper_usd_decimal']))
+        p['models'][name]['inputs'][-1]['id']='heldout'
+        with self.assertRaises(ValueError):m.validate(p)
+
     def test_validate_fit_tokens_cost_and_pair_order(self):
         p=prepared();self.assertEqual(m.validate(p),Decimal(p['upper_usd_decimal']))
         for mutate in (lambda p:p.update(calls=81),

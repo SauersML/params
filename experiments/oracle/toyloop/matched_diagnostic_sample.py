@@ -44,21 +44,36 @@ def charge(model, prompt, hits, sampled):
     return ((prompt-hits)*r['prefill']+hits*r['cached_prefill']+sampled*r['sample'])/Decimal(1000000)
 
 
+def profile(prepared):
+    if prepared.get('profile') == 'train_fit_v1':
+        if (prepared['primary_prepared_sha256'] != '4c68ec1f9c810bf25f87cad3074da573ad0fa9338abfc22b8e5590053d4306a2'
+                or prepared['training_jsonl_sha256'] != '94e6f5966516c858a42a5c9f770a9b5f716a4cd31bcdb5427a584e5ffc9fa188'):
+            raise ValueError('exact original TRAIN source required')
+        return {a:MODELS[a] for a in POLICIES[:3]},24
+    if prepared.get('profile') is not None:
+        raise ValueError('unsupported sampling profile')
+    return MODELS,16
+
+
 def validate(prepared):
-    if (prepared['schema_version']!=1 or prepared['policies']!=MODELS
-            or (prepared['calls'],prepared['output_cap'],prepared['context'],prepared['num_samples'],prepared['temperature'])!=(80,416,32768,1,0.)):
+    policy_models,case_count=profile(prepared)
+    if (prepared['schema_version']!=1 or prepared['policies']!=policy_models
+            or (prepared['calls'],prepared['output_cap'],prepared['context'],prepared['num_samples'],prepared['temperature'])!=(len(policy_models)*case_count,416,32768,1,0.)):
         raise ValueError('fixed diagnostic recipe required')
-    if set(prepared['models'])!=set(TOKENIZERS) or set(prepared['checkpoint_receipt_sha256'])!={'point','intervention'}:
+    if set(prepared['models'])!=set(policy_models.values()) or set(prepared['checkpoint_receipt_sha256'])!={'point','intervention'}:
         raise ValueError('model/checkpoint coverage mismatch')
     keys=None;upper=Decimal(0)
     for name,model in prepared['models'].items():
         if (model['tokenizer_revision'],model['renderer'])!=TOKENIZERS[name]:
             raise ValueError('pinned model renderer changed')
         rows=model['inputs'];ids=[r['id'] for r in rows]
-        if len(ids)!=16 or len(set(ids))!=16 or (keys is not None and ids!=keys):
+        if len(ids)!=case_count or len(set(ids))!=case_count or (keys is not None and ids!=keys):
             raise ValueError('shared16case order required')
         keys=ids
-        if ids[8:]!=[i+'__perm' for i in ids[:8]]:
+        if case_count==24:
+            expected=list(train_helper.OLD_TRAIN)+[f'{f}_{3100000+100*i+v}' for i,f in enumerate(train_helper.FAMILIES) for v in (0,1)]
+            if ids!=expected:raise ValueError('exact24TRAIN order required')
+        elif ids[8:]!=[i+'__perm' for i in ids[:8]]:
             raise ValueError('original/permuted pairs required')
         stops=model['stop_sequences']
         if not stops or not (all(type(s)is int for s in stops) or all(type(s)is str for s in stops)):
@@ -71,7 +86,7 @@ def validate(prepared):
             bound+=charge(model,len(t),0,416)
         if bound!=Decimal(model['upper_per_policy_usd']):
             raise ValueError('per-policy upper changed')
-        upper+=bound*sum(n==name for n in MODELS.values())
+        upper+=bound*sum(n==name for n in policy_models.values())
     if upper!=Decimal(prepared['upper_usd_decimal']):
         raise ValueError('whole-call upper changed')
     return upper
@@ -80,7 +95,7 @@ def validate(prepared):
 def preflight(path):
     prepared=json.loads(Path(path).read_text());upper=validate(prepared)
     return {'schema_version':1,'prepared_sha256':sha(path),'runner_sha256':sha(__file__),
-            'project':PROJECT,'policies':MODELS,'upper_usd':str(upper),'calls':80,
+            'project':PROJECT,'policies':profile(prepared)[0],'upper_usd':str(upper),'calls':prepared['calls'],'profile':prepared.get('profile'),
             'service_calls':0,'training_steps':0,'automatic_retry':False,'outstanding_limit':INFLIGHT,
             'dependencies_sha256':{'matched_graph_train.py':sha(train_helper.__file__),
                                    'matched_graph_diagnostic_manifest.py':sha(manifest_helper.__file__)}}
@@ -107,6 +122,7 @@ def execute(args,api=None):
     if not cap.is_finite() or cap<Decimal(proof['upper_usd']) or os.environ.get('TINKER_PROJECT_ID')!=PROJECT or args.out.exists():
         raise ValueError('fixed project/cap/fresh output required')
     prepared=json.loads(args.prepared.read_text());validate(prepared)
+    policy_models,case_count=profile(prepared)
     paths={}
     for arm in ('point','intervention'):
         receipt=args.checkpoints/(arm+'_checkpoint.jsonl')
@@ -137,20 +153,20 @@ def execute(args,api=None):
         fresh_budget(args.fresh_budget)  # Still fresh immediately before Service.
         append(args.out/'journal.jsonl',{'event':'service_intent','project':PROJECT})
         service=api.ServiceClient(project_id=PROJECT)
-        for arm in POLICIES:
-            model=prepared['models'][MODELS[arm]]
-            append(args.out/'journal.jsonl',{'event':'client_intent','arm':arm,'model':MODELS[arm]})
+        for arm in policy_models:
+            model=prepared['models'][policy_models[arm]]
+            append(args.out/'journal.jsonl',{'event':'client_intent','arm':arm,'model':policy_models[arm]})
             if arm in paths:
                 training=service.create_training_client_from_state_with_optimizer(paths[arm])
                 info=training.get_info().model_dump(mode='json')
-                if info.get('is_lora') is not True or info.get('lora_rank')!=32 or info.get('model_data',{}).get('model_name')!=MODELS[arm]:
+                if info.get('is_lora') is not True or info.get('lora_rank')!=32 or info.get('model_data',{}).get('model_name')!=policy_models[arm]:
                     raise ValueError('restored state model/rank changed')
                 client=training.save_weights_and_get_sampling_client()
                 append(args.out/'journal.jsonl',{'event':'state_restored','arm':arm,'receipt_sha256':prepared['checkpoint_receipt_sha256'][arm]})
             else:
-                client=service.create_sampling_client(base_model=MODELS[arm])
+                client=service.create_sampling_client(base_model=policy_models[arm])
             params=api.SamplingParams(max_tokens=416,temperature=0.,stop=model['stop_sequences'])
-            for offset in range(0,16,INFLIGHT):
+            for offset in range(0,case_count,INFLIGHT):
                 pending=[];errors=[]
                 for index in range(offset,offset+INFLIGHT):
                     row=model['inputs'][index];amount=charge(model,row['prompt_tokens'],0,416)
@@ -159,7 +175,7 @@ def execute(args,api=None):
                     reserved+=amount
                     append(args.out/'journal.jsonl',{'event':'sample_intent','arm':arm,'index':index,'id':row['id'],'reserved_upper_usd':str(amount)})
                     try:
-                        future=client.sample(prompt=inputs[MODELS[arm]][index],num_samples=1,sampling_params=params)
+                        future=client.sample(prompt=inputs[policy_models[arm]][index],num_samples=1,sampling_params=params)
                         pending.append((index,row,amount,future))
                     except BaseException as exc:
                         errors.append(exc);break
@@ -181,7 +197,7 @@ def execute(args,api=None):
                     except BaseException as exc:
                         errors.append(exc);append(args.out/'journal.jsonl',{'event':'unresolved','arm':arm,'id':row['id'],'error':type(exc).__name__})
                 if errors:raise errors[0]
-        if count!=80 or reserved!=0:raise ValueError('incomplete first-response coverage')
+        if count!=prepared['calls'] or reserved!=0:raise ValueError('incomplete first-response coverage')
         append(args.out/'complete.jsonl',{'first_responses':count,'accounted_usd':str(spent),'remaining_reserved_usd':str(reserved),'training_steps':0})
     except BaseException as exc:
         append(args.out/'failure.jsonl',{'error':type(exc).__name__,'accounted_usd':str(spent),'uncertain_reserved_usd':str(reserved),'automatic_retry':False})

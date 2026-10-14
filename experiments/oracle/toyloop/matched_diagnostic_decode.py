@@ -46,12 +46,14 @@ def decode(args,bundles=None):
         if sha(getattr(args,name))!=getattr(args,name+'_sha256'):raise ValueError('frozen '+name+' changed')
     if args.out.exists():raise ValueError('fresh decoder output required')
     p=json.loads(args.prepared.read_text());sample.validate(p)
+    policy_models,case_count=sample.profile(p)
+    policies=list(policy_models)
     panel=rows(args.panel);manifest=json.loads(args.manifest.read_text());contract=json.loads(args.raw_contract.read_text())
     if (p['source_panel_sha256']!=args.panel_sha256 or p['scoring_manifest_sha256']!=args.manifest_sha256
-            or manifest['arms']!=sample.POLICIES or len(panel)!=16
+            or manifest['arms']!=policies or len(panel)!=case_count
             or [r['id'] for r in panel]!=[r['id'] for r in manifest['panel']]
             or contract['prepared_sha256']!=args.prepared_sha256 or contract['manifest_sha256']!=args.manifest_sha256
-            or set(contract['arms'])!=set(sample.POLICIES)):
+            or set(contract['arms'])!=set(policies)):
         raise ValueError('exact prepared/source/scoring/raw panel binding required')
     for source,case in zip(panel,manifest['panel']):
         if sha_text(source['prompt'])!=source['prompt_sha256'] or source['prompt_sha256']!=case['prompt_sha256']:
@@ -63,9 +65,9 @@ def decode(args,bundles=None):
     if len(start)!=1 or start[0]['prepared_sha256']!=args.prepared_sha256 or start[0]['project']!=sample.PROJECT:
         raise ValueError('raw run belongs to different prepared/project')
     raw_by_arm={};raw_hashes={}
-    for arm in sample.POLICIES:
+    for arm in policies:
         bound={};entry=contract['arms'][arm];raw_hashes[arm]=None
-        inputs=p['models'][sample.MODELS[arm]]['inputs'];expected={r['id']:r for r in inputs}
+        inputs=p['models'][policy_models[arm]]['inputs'];expected={r['id']:r for r in inputs}
         if [r['id'] for r in inputs]!=[r['id'] for r in panel]:raise ValueError('source token order changed')
         if entry is not None:
             path=relative(args.raw_contract.parent,entry['path'])
@@ -95,8 +97,8 @@ def decode(args,bundles=None):
         'prepared_sha256':args.prepared_sha256,'source_panel_sha256':args.panel_sha256,'raw_contract_sha256':args.raw_contract_sha256,
         'decoder_sha256':sha(__file__),'validator_sha256':sha(sample.__file__),'arms':{},'missing_first_responses':{},
         'scope':'first raw model-specific canonical decoding; no repair; missing/length failures retained'}
-    for arm in sample.POLICIES:
-        rr,get_text=loaded[sample.MODELS[arm]];output=[];missing=[]
+    for arm in policies:
+        rr,get_text=loaded[policy_models[arm]];output=[];missing=[]
         for source in panel:
             raw=raw_by_arm[arm].get(source['id'])
             if raw is None:missing.append(source['id']);continue

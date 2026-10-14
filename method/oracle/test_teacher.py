@@ -569,25 +569,21 @@ def test_block_search_phi_check_backs_off():
         (not passed and rec["phi_stage"] == max((x for x in tried if x[1] is not None), key=lambda x: x[1])[0])
 
 
-def test_ranked_draws_each_hold_their_floor():
-    # fv: the likeliest alternatives (rank 0 for acceptance, rank 2 for validation) each against their own floor, the
-    # sampled draws pooled apart from them (goal_eval's share of VPD's improvement over no change)
+def test_ranked_draws_are_pooled():
+    # fv: the likeliest alternatives (rank 0 for acceptance, rank 2 for validation) pooled with the sampled draws, as
+    # the reward pools track_pp (the lead's 10-14): one alternative at 0 no longer refuses a removal the pool passes
     acc = teacher.Acceptance(None, None, ("changed",), "pp", "fv")
     acc.fixed, acc.r2 = [(3, 11)], [(3, 12)]
-    acc.rank_floor = {(3, 11): teacher.floor_of(1.0), (3, 12): teacher.floor_of(0.8)}
 
     def rec(pz, share, gap=1.0):                                # [prompt, KL_C, KL_VPD, W]: the circuit's share of
         return [list(pz), gap * (1 - share), 0.0, gap]           # VPD's gap W - KL_VPD
     prompts = [(3, 11)] + [(5, 7 + i) for i in range(9)]
-    recs = [rec((3, 11), 0.5)] + [rec(pz, 0.95) for pz in prompts[1:]]
+    recs = [rec((3, 11), 0.0)] + [rec(pz, 1.0) for pz in prompts[1:]]
     sc, low = acc.ranked(recs, prompts, range(10))
-    assert sc == pytest.approx(0.95) and low == [[3, 11, pytest.approx(0.5), 0.9]]
-    acc.draws = "fresh"                                          # pooled, the failing alternative averaged away: 0.905
-    assert acc.ranked(recs, prompts, range(10)) == (pytest.approx(9.05 / 10), [])
-    acc.draws = "fv"
-    prompts = [(3, 12)] + prompts[1:]
-    assert acc.ranked([rec((3, 12), 0.76)] + recs[1:], prompts, range(10))[1] == []   # floor_of(0.8) = 0.75
-    assert acc.ranked([rec((3, 12), 0.74)] + recs[1:], prompts, range(10))[1] == [[3, 12, pytest.approx(0.74), pytest.approx(0.75)]]
+    assert sc == pytest.approx(0.9) and low == []                # 9 of 10 draws' gaps: the pool passes floor_of(1.0)
+    assert sc >= teacher.floor_of(1.0)
+    acc.draws = "fresh"                                          # the same pool under the other draw modes
+    assert acc.ranked(recs, prompts, range(10)) == (pytest.approx(0.9), [])
     # the changed-input acceptance's floors: 0.05 below the start's value, in [0, 0.9] (the reward's are VPD's)
     assert teacher.floor_of(0.5) == pytest.approx(0.45) and teacher.floor_of(2.0) == 0.9 and teacher.floor_of(0.02) == 0.0
     assert goal_eval.floors({"s_point_c": 0.8}, ["point"])["point"] == pytest.approx(0.72)

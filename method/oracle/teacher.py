@@ -755,14 +755,14 @@ class Acceptance:
     judged on the DISC_DRAWS where the two disagree most (a removal must survive the draws it could be wrong on, not
     one fixed set); "fresh", judged on every draw of the check's sample (resampled per check, so no fixed set is
     fitted); "fv", fresh draws from one half of search_pool with the other half's fixed sample the validation set
-    (validation(), Validated), the model's likeliest alternatives judged draw by draw (ranked()); each refused removal
-    kept in refused with those draws."""
+    (validation(), Validated), the model's likeliest alternatives in every check pooled with the sampled draws
+    (ranked()); each refused removal kept in refused with those draws."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, kinds, mode: str = "pp", draws: str = "fixed",
                  pool: dict | None = None):
         self.ge, self.tx, self.kinds, self.mode, self.calls, self.pool_adv = ge, tx, tuple(kinds), mode, 0, pool
         self._phi_base = {}                                  # (the current circuit's key) -> its reward-mode row
-        self.draws, self.refused, self.pool, self.rank_floor = draws, [], None, {}
+        self.draws, self.refused, self.pool = draws, [], None
         self._screens, self._held_rows = {}, {}             # "floors": flips' shortlists; (family, node set) -> row
         if draws in ("discriminating", "fresh", "fv") and mode != "pp":
             raise ValueError("discriminating draws score s_track_pp: mode pp")
@@ -803,22 +803,13 @@ class Acceptance:
         return goal_eval._ratio_pool([recs[d] for d in idx])
 
     def ranked(self, recs: list, prompts: list, idx) -> tuple:
-        """(score, low) of per-draw records on prompts over idx: with fv draws, the model's likeliest alternatives
-        (rank 0 in the acceptance's checks, rank 2 in the validation's) each against its own floor (rank_floor: floor_of
-        its share under the search's start) and the pooled score over the sampled draws alone; low lists the ranked
-        draws below their floors as [p, z, share, floor]. Pooled together, one plausible alternative's failure is
-        averaged away among sampled tokens: text9000's 238 -> 72 site cut passed fv (validation 0.91) at search-split
-        s_track_pp 0.56, the split eval's draws are like (the lead's 10-13). Other draws: the score over idx, low []."""
-        if self.draws != "fv":
-            return self._pooled(recs, idx), []
-        top = set(self.fixed) | set(self.r2)
-        rank = [d for d in idx if tuple(prompts[d]) in top]
-        low = []
-        for d in rank:
-            s, f = goal_eval._ratio_pool([recs[d]]), self.rank_floor.get(tuple(prompts[d]))
-            if s is not None and f is not None and s < f:
-                low.append([int(prompts[d][0]), int(prompts[d][1]), s, f])
-        return self._pooled(recs, [d for d in idx if d not in set(rank)] or rank), low
+        """(score, low) of per-draw records on prompts over idx: the pooled score over every draw, the likeliest
+        alternatives (rank 0 in the acceptance's checks, rank 2 in the validation's) among the sampled ones, as the
+        reward pools track_pp (goal_eval._ratio_pool); low []. (Judged one by one against their own floors from 10-13,
+        one fragile alternative refused every removal: text9005's (412, 9056) scored 0 against 0.9 on every candidate
+        while its START cleared every reward floor; the lead's 10-14. Validation on the other half of search_pool, at
+        floor_of the START's, still guards against fitting the search draws.)"""
+        return self._pooled(recs, idx), []
 
     def _halves(self) -> tuple:
         """The acceptance's draws and the validation's from search_pool: the model's likeliest alternatives in every
@@ -1000,15 +991,10 @@ class Acceptance:
         if by_phi:                                           # phi itself (monitorbench's phi_variants): the start's
             bar = self.ge.tau(self.tx, self.pool_adv, "search")["phi_tau"]   # phi, and floor min(it, the bar) + log2 0.95
             base["phi"] = self.phi_of(graph_of(start), [graph_of(start)], bar)[0]
-        if disc:                                             # the start on a fresh sample, every draw (and with fv the
-            prompts = self._sample(start)                    # ranked draws' floors, the validation's too)
+        if disc:                                             # the start on a fresh sample, every draw
+            prompts = self._sample(start)
             got = self._per_draw([graph_of(start)], prompts)
             base["s_track_pp"] = self.ranked(got[0], prompts, range(len(prompts)))[0]
-            if self.draws == "fv":
-                val = self._halves()[1]
-                got_v = self._per_draw([graph_of(start)], val)[0] if val else []
-                self.rank_floor = {tuple(pz): floor_of(goal_eval._ratio_pool([r])) for pz, r in
-                                   zip(list(prompts) + list(val), got[0] + got_v) if tuple(pz) in set(self.fixed) | set(self.r2)}
         if floor is None:
             floor = {k: floor_of(v) for k, v in base.items()}
         if by_phi and base.get("phi") is not None:
@@ -1130,7 +1116,7 @@ class Validated:
         self.good = (desc.on.clone(), len(log) if log is not None else 0)
 
     def check(self) -> bool:
-        sc, low = self.acc.validation(self.graph_of(self.desc.on))   # (a ranked draw below its floor fails it too)
+        sc, low = self.acc.validation(self.graph_of(self.desc.on))   # (the pooled score; low is empty)
         self.trace.append([self.n, int(self.desc.on.sum()), sc] + ([low] if low else []))
         if not low and (sc is None or self.floor is None or sc >= self.floor):
             self.good = (self.desc.on.clone(), len(self.log) if self.log is not None else 0)

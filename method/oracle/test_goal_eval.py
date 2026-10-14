@@ -1517,6 +1517,34 @@ def test_donor_resampling(tiny):
     assert [d[0] for d in srch["draws_patching_far"]] == [n for n, _ in ge.far_donors(tx, ge.far_pool("search"), 3)]
 
 
+def test_donors_run_vpds_answer_and_the_empty_side_once_a_text(tiny, monkeypatch):
+    """donors() keeps each donor's KL_VPD and KL_0 (no circuit's) on the text: a later call runs the circuits' rows
+    alone, with the numbers of a text that kept nothing."""
+    import engine
+
+    nat, ge, tx = tiny
+    whole = native.Graph(sorted(native.Graph(masks=tx.vpd).node_set())[::2], complete=True)
+    g = torch.Generator().manual_seed(13)
+    far = [(f"x{i}", torch.randint(0, 40, (tx.T + i - 1,), generator=g).tolist()) for i in range(3)]
+    tx.__dict__.pop("_donor_base", None)
+    rows, real = [], engine.Engine.graph_log_probs
+
+    def counted(self, *a, **k):
+        out = real(self, *a, **k)
+        rows.append(out.shape[0])
+        return out
+    monkeypatch.setattr(engine.Engine, "graph_log_probs", counted)
+    first = ge.donors(tx, [whole], near=0, far=far)[0]
+    n1 = sum(rows)
+    rows.clear()
+    again = ge.donors(tx, [whole], near=0, far=far)[0]
+    assert n1 == 3 * 3 and sum(rows) == 3 and len(tx.__dict__["_donor_base"]) == 3
+    fresh = ge.donors(ge.text(tx.ids, tx.targets, seed=tx.seed), [whole], near=0, far=far)[0]
+    for r in (again, fresh):
+        assert r["kl_patching_far"] == pytest.approx(first["kl_patching_far"], abs=1e-6)
+        assert r["s_patching_far"] == pytest.approx(first["s_patching_far"], abs=1e-6)
+
+
 def test_reward_terms_unclipped_for_ranking(tiny):
     """Reward mode's rl_terms: each C term without the floor at 0 (equal to it where it is above 0, at most 0 where it
     is 0; s_track, pooled over prompts, at most its clipped pool), and c_rl their harmonic mean when every term is

@@ -4396,7 +4396,8 @@ class GoalEval:
         10-12: the patched state mixes a donor's activations with the circuit's own, not a natural joint state of the
         model, so it is donor replacement, not an in-distribution test): the circuit run in C's semantics
         with every subcomponent outside it at its activation on one donor text, every one from that donor, so parts that
-        cancel on real text stay consistent (the remainders live); paired with VPD's answer under the same donors; the
+        cancel on real text stay consistent (the remainders live); paired with VPD's answer under the same donors (its
+        and the empty side's KL per donor run once a text, kept on it: no circuit's); the
         KL from the model on the text. Donors: "near", the changed-input texts of split (changed_inputs' draws), and
         "far", far's texts (token id lists, other held-out texts), aligned at their ends, those shorter than the text
         leaving its first positions unresampled (their activations live). The bound is the run that keeps nothing,
@@ -4423,29 +4424,38 @@ class GoalEval:
         for g in sides:
             m = self.masks(g, T)
             own.append({n: m[n].to(dev) for n in nat.names})
+        base = tx.__dict__.setdefault("_donor_base", {})  # (pool, donor ids) -> (KL_VPD, KL_0): no circuit's, run once a text
+        vs = (len(graphs), len(graphs) + 1)  # (VPD's answer's and the empty side's places in sides)
         out = [{} for _ in graphs]
         for pool, xs in texts.items():
-            kls = []  # per donor [len(sides)]
-            for d0 in range(0, len(xs), max(1, rows // len(sides))):
-                chunk = xs[d0:d0 + max(1, rows // len(sides))]
-                acts = [self.donor_activations(x, T) for _, x in chunk]
-                B = len(chunk) * len(sides)
+            parts, cur = [], []  # (donor, side) rows, each donor's in one run: the circuits on every donor, VPD's answer
+            for d, (_, x) in enumerate(xs):  # and nothing where not kept, about rows to a run
+                js = [(d, j) for j in (*range(len(graphs)), *(vs if (pool, tuple(x)) not in base else ()))]
+                if cur and len(cur) + len(js) > rows:
+                    parts.append(cur)
+                    cur = []
+                cur += js
+            parts += [cur] if cur else []
+            got = {}
+            for part in parts:
+                acts = {d: self.donor_activations(xs[d][1], T) for d in dict.fromkeys(d for d, _ in part)}
                 patch = {}
                 for n in nat.names:
-                    vals = torch.stack([a[n] for a, _ in acts]).to(dev)  # [donors, T, C]
-                    vals = vals.repeat_interleave(len(sides), 0)
-                    keep = torch.stack([~own[j][n] for _ in chunk for j in range(len(sides))])  # outside each side
-                    for k, (_, pad) in enumerate(acts):
-                        if pad:
-                            keep[k * len(sides):(k + 1) * len(sides), :pad] = False
+                    vals = torch.stack([acts[d][0][n] for d, _ in part]).to(dev)  # [rows, T, C]
+                    keep = torch.stack([~own[j][n] for _, j in part])  # outside each row's side
+                    for r, (d, _) in enumerate(part):
+                        if acts[d][1]:
+                            keep[r, :acts[d][1]] = False
                     patch[n] = (keep, vals)
-                lq = E.graph_log_probs(E.plan([g for _ in chunk for g in sides], semantics="c"), u, patch=patch)
-                kl = carry.kl(tx.ref, lq).view(len(chunk), len(sides))
-                kls += kl.tolist()
+                lq = E.graph_log_probs(E.plan([sides[j] for _, j in part], semantics="c"), u, patch=patch)
+                got.update(zip(part, carry.kl(tx.ref, lq).tolist()))
                 native.free(dev)
-            kv, k0 = [k[-2] for k in kls], [k[-1] for k in kls]
+            for d, (_, x) in enumerate(xs):
+                if (pool, tuple(x)) not in base:
+                    base[(pool, tuple(x))] = (got[(d, vs[0])], got[(d, vs[1])])
+            kv, k0 = [base[(pool, tuple(x))][0] for _, x in xs], [base[(pool, tuple(x))][1] for _, x in xs]
             for b in range(len(graphs)):
-                kc = [k[b] for k in kls]
+                kc = [got[(d, b)] for d in range(len(xs))]
                 per = [_fid(z, c, v) for z, c, v in zip(k0, kc, kv)]
                 each = [x for x in per if x is not None]
                 out[b].update({f"s_patching_{pool}": _fid(float(np.mean(k0)), float(np.mean(kc)), float(np.mean(kv))) if kc else None,

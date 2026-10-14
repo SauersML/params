@@ -23,6 +23,23 @@ def fixture():
  c={'model':m.MODEL,'project':m.PROJECT,'epochs':8,'batch':8,'seed':0,'updates_per_arm':24,'output_cap':416,'batches_sha256':m.digest(batches),'training':[{'id':i} for i in ids],'rendered_training_sha256':{a:[m.digest({'input':[1,2],'loss':{'target_tokens':[2,3],'weights':[0.,1.]}})]*24 for a in m.ARMS},'train_tokens_per_arm':{a:384 for a in m.ARMS},'panel':panels,'recipe':{'initialization':{'base_model':m.MODEL,'rank':32,'seed':0,'train_mlp':True,'train_attn':True,'train_unembed':True},'optimizer':[{'learning_rate':m.LR*(1-i/24),'beta1':.9,'beta2':.95,'eps':1e-8} for i in range(24)],'loss_fn':'cross_entropy','sampling':{'temperature':0.,'max_tokens':416,'num_samples':1},'evaluation_arms':['base',*m.ARMS],'sample_ids':[[ids[i] for i in b] for b in batches]}}
  return {'schema_version':1,'contract':c,'data':data,'prompts':[copy.deepcopy(mi) for _ in panels],'batches':batches,'stop_sequences':['<|im_end|>']}
 
+def fixture35():
+ p=fixture();c=p['contract'];ids=[r['id'] for r in c['training']]+['redundant_000','cancel_001','gate_000']+[f'{f}_{3300000+100*i}' for i,f in enumerate(m.FAMILIES)]
+ rng=random.Random(0);visits=[]
+ for _ in range(8):
+  order=list(range(35));rng.shuffle(order);visits.extend(order)
+ batches=[visits[i:i+8] for i in range(0,len(visits),8)]
+ manifest={'schema':'paired_train35_v1','train_ids':ids,'evaluation_scope':'train_only_pending_fresh340'}
+ c.update(updates_per_arm=35,training=[{'id':i} for i in ids],batches_sha256=m.digest(batches),panel=[],training_manifest=manifest,training_manifest_sha256=m.digest(manifest))
+ c['recipe']['initialization'].update(common_init_receipt_sha256='775614467479c81a829219d240d7e4462dc647a79f9e8932c01400a46702de5b',mode='restore_exact_saved_common_state')
+ c['recipe'].update(evaluation_arms=[],sample_ids=[[ids[i] for i in b] for b in batches],optimizer=[{'learning_rate':m.LR*(1-i/35),'beta1':.9,'beta2':.95,'eps':1e-8} for i in range(35)])
+ for a in m.ARMS:
+  p['data'][a]+=[copy.deepcopy(p['data'][a][0]) for _ in range(11)]
+  c['rendered_training_sha256'][a]+=[c['rendered_training_sha256'][a][0]]*11
+  c['train_tokens_per_arm'][a]=560
+ p.update(prompts=[],batches=batches)
+ return p
+
 class Future:
  def __init__(self,value=None,callback=None):self.value=value;self.callback=callback
  def result(self):
@@ -61,6 +78,36 @@ class API:
  def close(self,status):self.calls.append(('close',status));return Future()
 
 class RunnerTest(unittest.TestCase):
+ def test_train35_only_restores_same_initial_state_and_never_samples(self):
+  from datetime import datetime,timezone
+  with tempfile.TemporaryDirectory() as d,patch.dict(os.environ,{'TINKER_PROJECT_ID':m.PROJECT}):
+   root=Path(d);p=root/'p.json';p.write_text(m.encoded(fixture35()))
+   proof=root/'proof.json';proof.write_text(m.encoded(m.preflight(p,{'trained':1,'prefill':1,'sampled':1})))
+   approval=root/'approval.json';approval.write_text(m.encoded({'schema_version':1,'project':m.PROJECT,'model':m.MODEL,'prepared_sha256':m.sha(p),'runner_sha256':m.sha(m.__file__),'preflight_sha256':m.sha(proof),'cap_usd':'1','execute_authorized':True}))
+   common=root/'common.jsonl';cfg={k:v for k,v in fixture()['contract']['recipe']['initialization'].items()}
+   common.write_text(m.encoded({'path':'tinker://stub-original-untrained','config':cfg})+'\n')
+   budget=root/'budget.json';budget.write_text(m.encoded({'asof_utc':datetime.now(timezone.utc).isoformat(),'authorized_cap_usd':530,'combined_bound_usd':500}))
+   actual_sha=m.sha;expected=fixture35()['contract']['recipe']['initialization']['common_init_receipt_sha256'];api=API()
+   with patch.object(m,'sha',side_effect=lambda path:expected if Path(path)==common else actual_sha(path)):
+    m.execute(p,proof,approval,root/'run',api,common_init_path=common,fresh_budget_path=budget)
+   self.assertEqual(api.clones,['tinker://stub-original-untrained']*2)
+   self.assertEqual(api.drained,70);self.assertEqual(len(api.optimizers),70)
+   self.assertFalse(any(c[0] in ('base','init') for c in api.calls))
+   self.assertFalse(list((root/'run').glob('*_raw.jsonl')))
+   self.assertEqual((root/'run/common_init.jsonl').read_bytes(),common.read_bytes())
+   self.assertEqual(json.loads((root/'run/complete.jsonl').read_text())['first_responses_per_arm'],0)
+   self.assertEqual(json.loads((root/'run/start.jsonl').read_text())['common_init_receipt_sha256'],expected)
+   api=API()
+   with self.assertRaises(ValueError):m.execute(p,proof,approval,root/'bad',api,common_init_path=common,fresh_budget_path=budget)
+   self.assertEqual(api.created,0)
+ def test_train35_rejects_sampling_and_wrong_saved_configuration(self):
+  p=fixture35();m.validate(p)
+  p['prompts']=fixture()['prompts'][:1]
+  with self.assertRaises(ValueError):m.validate(p)
+  with tempfile.TemporaryDirectory() as d:
+   path=Path(d)/'receipt.jsonl';path.write_text(m.encoded({'path':'tinker://stub','config':{'base_model':'wrong'}})+'\n')
+   c=fixture35()['contract'];c['recipe']['initialization']['common_init_receipt_sha256']=m.sha(path)
+   with self.assertRaises(ValueError):m.saved_initialization(c,path)
  def test_loss_diagnostic_respects_mask_and_paired_loss_mass(self):
   data=[S(loss_fn_inputs={'weights':S(data=[0.,.25,.75])}),S(loss_fn_inputs={'weights':S(data=[1.])})]
   result=S(loss_fn_outputs=[{'logprobs':S(data=[float('nan'),-2.,-4.])},{'logprobs':S(data=[-1.])}])

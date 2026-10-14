@@ -453,10 +453,10 @@ def main():
     _, ver = load(args.device)
     gs = read(args.goals)
     if args.cmd == "gate":
-        rows, sft = gate(ver, gs, read(args.edits), log=lambda m: print(m, flush=True))
+        rows, sft_rows = gate(ver, gs, read(args.edits), log=lambda m: print(m, flush=True))
         Path(args.out).write_text("".join(json.dumps(r) + "\n" for r in rows))
         if args.sft:
-            Path(args.sft).write_text("".join(json.dumps(r) + "\n" for r in sft))
+            Path(args.sft).write_text("".join(json.dumps(r) + "\n" for r in sft_rows))
         return print(gate_summary(rows))
     if args.cmd == "sft":
         rows = sft(ver, gs, read(args.edits), args.min_reward, log=lambda m: print(m, flush=True))

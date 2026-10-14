@@ -40,6 +40,22 @@ def feedback(s: dict) -> str:
             f"{s['collateral']:.2e} bits per token (reward {s['reward']:+.3f}).")
 
 
+CHUNK = int(os.environ.get("EDITS_CHUNK", "4"))  # answers scored together per verifier call
+RECYCLE = int(os.environ.get("EDITS_RECYCLE", "4"))  # goal groups a process scores before it is replaced (one RL step's)
+
+
+def free_device() -> None:
+    import gc
+
+    import torch
+
+    gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def work(device: str | None, goals: str, inbox, outbox) -> None:
     """One scoring process: take a request, then every request already queued, score them grouped by (goal, part), and
     answer each with its own scores in order."""
@@ -49,7 +65,12 @@ def work(device: str | None, goals: str, inbox, outbox) -> None:
     src = HERE.parents[2] / "SOURCE"  # the pod's "python source <rev>" (edits_scorer_pod.sh)
     source = src.read_text().split()[-1] if src.exists() else None
     prefs = {r["id"]: r["pref"] for r in map(json.loads, Path(goals).read_text().splitlines())}
+    served = 0
     while True:
+        if served >= RECYCLE and inbox.empty():  # a fresh process (the pool starts it again): MPS memory grew to 24.5 GiB
+            outbox.close()  # over a night of steps although each call was freed; exit only with nothing queued, so none is
+            outbox.join_thread()  # lost, after the answers already put have gone out
+            os._exit(0)
         batch = [inbox.get()]
         while True:
             try:
@@ -63,7 +84,11 @@ def work(device: str | None, goals: str, inbox, outbox) -> None:
             try:
                 if part not in ("val", "score"):
                     raise ValueError(f"part {part!r}: val or score")
-                got = ver.answers(prefs[gid], [a for _, ans in reqs for a in ans], part)
+                answers = [a for _, ans in reqs for a in ans]
+                got = []
+                for k in range(0, len(answers), CHUNK):  # a few answers at a time, the device cache freed after each:
+                    got += ver.answers(prefs[gid], answers[k:k + CHUNK], part)  # 16 at once reached 28 GiB on MPS
+                    free_device()
                 for s in got:
                     s["feedback"], s["source"] = feedback(s), source
                 err = None
@@ -73,6 +98,7 @@ def work(device: str | None, goals: str, inbox, outbox) -> None:
             for rid, ans in reqs:
                 outbox.put((rid, got[at:at + len(ans)] if got is not None else None, err))
                 at += len(ans)
+            served += 1
 
 
 class Pool(serve_scores.Pool):

@@ -681,6 +681,97 @@ def link():
     print("  strongest families:", list(out["necessary parts' strongest family"].items())[:8])
 
 
+EAST = ["China", "Japan", "Korea", "Taiwan", "Vietnam", "Mongolia", "Beijing", "Shanghai", "Tokyo", "Osaka", "Kyoto", "Seoul",
+        "Taipei", "Hanoi", "Hong Kong"]
+ELSE = ["France", "Germany", "Brazil", "Canada", "India", "Egypt", "Thailand", "Indonesia", "Philippines", "Russia", "Paris",
+        "Berlin", "Toronto", "Mumbai", "Cairo", "Bangkok", "Jakarta", "Moscow", "London", "Sydney"]
+
+
+def east_asia(parts: tuple = ("L2.v#172", "L2.v#846", "L2.o#888", "L2.o#276")):
+    """Is L2.v#172 (needed for both China's and Japan's cities) an East Asia part? Its activation (gated: CI (x.v)|u|)
+    at the place name's last token, in two neutral prompts, for East Asian places and others; the current tokens it is
+    most often active on in the association study's 990,720 Pile tokens; and its removal effect on every known fact
+    (removals.json). Runs on the CPU with KN_CPU. -> OUT/east_asia.json"""
+    import torch
+
+    if os.environ.get("KN_CPU"):
+        torch.backends.mps.is_available = lambda: False
+    import native
+    import vpd_model
+
+    nat = native.Native()
+
+    def idx(lab):
+        l_, rest = lab[1:].split(".", 1)
+        kind, c = rest.split("#")
+        return {"fc": f"h.{l_}.mlp.c_fc", "down": f"h.{l_}.mlp.down_proj"}.get(kind, f"h.{l_}.attn.{kind}_proj"), int(c)
+
+    out = {"activation": {}, "corpus tokens": {}, "removal effects": {}}
+    temps = ["{p} is a", "The city of {p} has", "People in {p} often"]
+    for lab in parts:
+        n, c = idx(lab)
+        st = nat.target.site(n)
+        rows = {}
+        for place in EAST + ELSE:
+            vals = []
+            for tmp in temps:
+                txt = tmp.format(p=place)
+                ids = tok().encode(txt).ids
+                enc = tok().encode(txt)
+                last = max(i for i, (a_, b_) in enumerate(enc.offsets) if b_ <= txt.find(place) + len(place) and b_ > txt.find(place))
+                with torch.no_grad():
+                    nat.vpd.clear()
+                    for m in nat.names:
+                        nat.target.site(m).cache_input = True
+                    nat.target(torch.tensor([ids], device=nat.dev))
+                    acts = {m: nat.target.site(m).last_input for m in nat.names}
+                    nat.vpd.clear()
+                    ci = vpd_model.lower_leaky(nat.vpd.ci_fn(acts)[n])
+                    g = float(ci[0, last, c] * (acts[n][0, last] @ st.V[:, c]) * st.U[c].norm())
+                vals.append(g)
+            rows[place] = float(np.mean(vals))
+        out["activation"][lab] = rows
+        e, o = [rows[p_] for p_ in EAST], [rows[p_] for p_ in ELSE]
+        print(f"{lab}: East Asian places mean {np.mean(e):+.3f} (active on {sum(abs(v) > 0 for v in e)} of {len(e)}), others mean "
+              f"{np.mean(o):+.3f} (active on {sum(abs(v) > 0 for v in o)} of {len(o)})", flush=True)
+        print("   ", ", ".join(f"{p_} {rows[p_]:+.2f}" for p_ in EAST), "|", ", ".join(f"{p_} {rows[p_]:+.2f}" for p_ in ELSE if abs(rows[p_]) > 0), flush=True)
+    G = Path.home() / "mpd-data/graph_oracle/gwas"
+    ids = np.load(G / "corpus.npy")[:, :512].reshape(-1)
+    A = np.load(G / "assoc.npz")
+    off = json.loads(str(A["offsets"]))
+    import scipy.sparse as sp
+
+    gs = sorted((p_ for p_ in G.iterdir() if p_.name.startswith("geno_0_") and p_.suffix == ".npz"), key=lambda p_: int(p_.stem.split("_")[2]))
+    want = {off[idx(l_)[0]] + idx(l_)[1]: l_ for l_ in parts}
+    hits = {l_: [] for l_ in parts}
+    base = 0
+    for p_ in gs:
+        d = np.load(p_)
+        ip, cols = d["indptr"], d["cols"]
+        rows_of = np.repeat(np.arange(len(ip) - 1), np.diff(ip))
+        for gcol, l_ in want.items():
+            hits[l_].append(base + rows_of[cols == gcol])
+        base += len(ip) - 1
+    for l_ in parts:
+        tokpos = np.concatenate(hits[l_])
+        cnt = np.bincount(ids[tokpos], minlength=int(ids.max()) + 1)
+        top = np.argsort(-cnt)[:20]
+        out["corpus tokens"][l_] = {"active tokens": int(len(tokpos)), "top": [[tok().decode([int(t)]), int(cnt[t])] for t in top]}
+        print(f"{l_} in Pile text: active at {len(tokpos)} tokens; most often on", ", ".join(f"{tok().decode([int(t)])!r} {cnt[t]}" for t in top[:14]), flush=True)
+    R = json.loads((OUT / "removals.json").read_text())
+    for l_ in parts:
+        n, c = idx(l_)
+        eff = {}
+        for r in R:
+            e_ = max([e for m, t, cc, e in r["removals"] if m == n and cc == c] or [0.0])
+            eff.setdefault(f"{r['subject']} -> {r['answer']}", []).append(e_)
+        top = sorted(((float(np.mean(v)), k) for k, v in eff.items()), reverse=True)[:10]
+        out["removal effects"][l_] = top
+        print(f"{l_} removal effects (mean over prompts, nats):", ", ".join(f"{k} {v:.2f}" for v, k in top), flush=True)
+    (OUT / "east_asia.json").write_text(json.dumps(out, indent=1))
+    print("wrote", OUT / "east_asia.json")
+
+
 FIG = Path("/Users/user/mpd-data/figures/oracle")
 
 
@@ -725,35 +816,33 @@ def figure_matrix():
     rest = [j for j in range(len(cols)) if j not in used]
     rest.sort(key=lambda j: -need[:, j].sum())
     groups.append(("the rest", rest))
-    named = [(nm, g) for nm, g in groups if nm != "the rest" and g]
+    plain = {"needed by nearly every fact": "every fact", "capital facts": "capitals", "city facts": "cities \u2192 country",
+             "language facts": "languages"}
+    named = [(plain.get(nm, nm), g) for nm, g in groups if nm != "the rest" and g]
     left = [j for _, g in named for j in g]
     fg.setup()
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(22, 13), gridspec_kw={"width_ratios": [max(len(left), 1), 0.35 * len(rest)], "wspace": 0.02})
-    data = np.clip(M[rows], 0, 3)
-    im = a1.imshow(data[:, left], aspect="auto", cmap="Blues", vmin=0, vmax=3, interpolation="nearest")
-    a2.imshow(data[:, rest], aspect="auto", cmap="Blues", vmin=0, vmax=3, interpolation="nearest")
-    a1.set_yticks(range(len(rows)), [f"{facts[i][1]} \u2192 {facts[i][2]}" for i in rows], fontsize=11)
-    a1.set_xticks(range(len(left)), [_label(*cols[j]) for j in left], rotation=90, fontsize=9)
-    a2.set_yticks([])
-    a2.set_xticks([])
-    a2.set_xlabel(f"the other {len(rest)} subcomponents (each needed\nby a few facts), most-needed first", fontsize=13)
-    x0 = 0
+    fig, ax = plt.subplots(figsize=(17, 14))
+    im = ax.imshow(np.clip(M[rows][:, left], 0, 3), aspect="auto", cmap="Blues", vmin=0, vmax=3, interpolation="nearest")
+    ax.set_yticks(range(len(rows)), [f"{facts[i][1]} \u2192 {facts[i][2]}" for i in rows], fontsize=14)
+    ax.set_xticks(range(len(left)), [_label(*cols[j]) for j in left], rotation=90, fontsize=12)
+    x0, k = 0, 0
     for nm, g in named:
         if x0:
-            a1.axvline(x0 - 0.5, color=fg.INK, lw=1.0)
-        a1.text(x0 + len(g) / 2 - 0.5, -0.9, nm, ha="left", va="bottom", fontsize=12, rotation=40)
+            ax.axvline(x0 - 0.5, color=fg.INK, lw=1.2)
+        narrow = len(g) < 4
+        ax.text(x0 + len(g) / 2 - 0.5, -0.8 - (1.2 if narrow and k % 2 else 0), nm, ha="center", va="bottom", fontsize=15)
+        k += narrow
         x0 += len(g)
     y0 = 0
     for rel in order_rel:
         n_ = sum(1 for i in rows if facts[i][0] == rel)
         if y0:
-            a1.axhline(y0 - 0.5, color=fg.INK, lw=1.4)
-            a2.axhline(y0 - 0.5, color=fg.INK, lw=1.4)
+            ax.axhline(y0 - 0.5, color=fg.INK, lw=1.6)
         y0 += n_
-    cb = fig.colorbar(im, ax=[a1, a2], fraction=0.015, pad=0.03)
-    cb.set_label("drop of the right answer's log-odds\nwhen the subcomponent is removed (nats)")
-    fig.suptitle("How much each known fact depends on each subcomponent", fontsize=20, fontweight="bold", x=0.02, ha="left")
-    fig.subplots_adjust(left=0.12, right=0.84, top=0.84, bottom=0.12)
+    cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cb.set_label("drop of the right answer's log-odds when the subcomponent is removed (nats)", fontsize=14)
+    ax.set_title("What each known fact needs", fontsize=22, fontweight="bold", loc="left", pad=70)
+    fig.tight_layout()
     out = FIG / "knowledge_matrix.png"
     fig.savefig(out, dpi=150)
     print("wrote", out)
@@ -770,6 +859,10 @@ def circuit():
     import runpy
     import subprocess
 
+    import torch
+
+    if os.environ.get("KN_CPU"):  # off the Mac's GPU (another job's scorer holds MPS; two MPS jobs crashed one)
+        torch.backends.mps.is_available = lambda: False
     import mechdisc
     import native
 
@@ -798,7 +891,9 @@ def circuit():
             sys.argv = argv
     stated = OUT / f"{name}.stated.json"
     py = sys.executable
-    subprocess.run([py, "-B", str(LEAD / "edge_prune.py"), str(root / f"{name}.json"), str(tdir / f"{name}.json"), str(stated)], check=True)
+    pre = "import torch, runpy, sys; torch.backends.mps.is_available = lambda: False; " if os.environ.get("KN_CPU") else "import runpy, sys; "
+    subprocess.run([py, "-B", "-c", pre + f"sys.argv = {[str(LEAD / 'edge_prune.py'), str(root / f'{name}.json'), str(tdir / f'{name}.json'), str(stated)]!r}; "
+                    f"runpy.run_path({str(LEAD / 'edge_prune.py')!r}, run_name='__main__')"], check=True)
     fig = Path("/Users/user/mpd-data/figures/oracle") / f"knowledge_circuit_{subj.lower()}"
     subprocess.run([py, "-B", str(LEAD / "render_circuit.py"), str(stated), str(fig)], check=True)
     print("wrote", fig)
@@ -807,7 +902,8 @@ def circuit():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("known", "colors_natural", "removals", "removals_default", "fallback", "where", "swaps",
-                                    "answer_parts", "link", "circuit", "figure_matrix"))
+                                    "answer_parts", "link", "circuit", "figure_matrix",
+                                    "east_asia"))
     a = ap.parse_args()
     if a.cmd == "removals_default":
         removals(default=True)

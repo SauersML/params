@@ -542,6 +542,34 @@ def intervention_mdl_value(rows):
     return (sum(fidelities) / len(fidelities) + min(fidelities)) / 2 - WIRING_MDL_LAMBDA * sum(costs) / len(costs)
 
 
+def intervention_fidelity_first_value(rows):
+    """Opt-in finite-panel constraint: compactness earns credit only after fidelity.
+
+    Every graph with worst direct KL <= .001 bits outranks every failing graph,
+    regardless of teacher equality. Within failure, exp(-worst KL) gives a
+    continuous improvement signal without a size bonus. Within feasibility,
+    smaller executed descriptions earn the existing fixed MDL-weight bonus.
+    English and token annotations remain outside this physical verifier.
+    """
+    if not rows:
+        raise RuntimeError('empty intervention panel')
+    if (type(WIRING_MDL_LAMBDA) not in (int, float)
+            or not math.isfinite(WIRING_MDL_LAMBDA) or WIRING_MDL_LAMBDA < 0):
+        raise RuntimeError('invalid compactness weight')
+    for row in rows:
+        for key in ('kl_bits', 'description_cost'):
+            value = row[key]
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise RuntimeError('invalid intervention measurement')
+        if row['kl_bits'] < 0 or not 0 <= row['description_cost'] <= 1:
+            raise RuntimeError('invalid intervention measurement')
+    worst = max(row['kl_bits'] for row in rows)
+    if worst > .001:
+        return math.exp(-worst)
+    cost = sum(row['description_cost'] for row in rows) / len(rows)
+    return 1. + WIRING_MDL_LAMBDA * (1. - cost)
+
+
 class InvalidInterventionCandidate(ValueError):
     """Only candidate grammar/architecture failures, not verifier failures."""
 
@@ -646,6 +674,20 @@ def reward_wiring_intervention_mdl(meta, completion):
                                          reference_cache=meta.get("intervention_reference_cache"))["reward"]
     except InvalidInterventionCandidate:
         return -1.0
+
+
+def reward_wiring_intervention_fidelity_first(meta, completion):
+    """Generic RL opt-in; reuse the same physical panel/cache, never gold edges."""
+    parsed = circuit.parse(completion)
+    if not parsed.ok or parsed.bad:
+        return -1.0
+    try:
+        scored = score_wiring_interventions(meta['toy'], completion,
+            panel=meta.get('intervention_panel'), nat=meta.get('intervention_native'),
+            reference_cache=meta.get('intervention_reference_cache'))
+    except InvalidInterventionCandidate:
+        return -1.0
+    return intervention_fidelity_first_value(scored['per_world'])
 
 
 def check(toys, version: int | None = None) -> dict:

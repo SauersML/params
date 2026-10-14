@@ -28,8 +28,9 @@ one goes back; the level then runs again, the failing removal's line kept for go
 that run kept no removal before it, the next run's prefixes below half its size; until a run admits nothing).
 
 Each accepted removal is checkpointed by line identity (a line's key names its ends, never its place in a list: a set's
-order changes from process to process), and a process ends after MAX_STEPS of them (exit EXIT_RESUME) so a fresh one
-resumes with the device's memory back (track_pp's caches grow over many calls). When the levels are done, a fresh
+order changes from process to process), with the history of removals, and a process ends after MAX_STEPS of them (exit
+EXIT_RESUME) so a fresh one resumes with the device's memory back (track_pp's caches grow over many calls); a resumed
+state is checked against the floors again first (a reward revision between processes moves them). When the levels are done, a fresh
 process re-checks the circuit (graph_kl on the text, s_track_pp on the eval draws, the reward row's worst shortfall v)
 and writes OUT/<task>.json (goal_eval.to_json's stated form) and OUT/<task>.lines.json (the counts, the re-check, each
 line's and each part's removal effect: the point KL rise in bits and the eval s_track_pp fall).
@@ -332,7 +333,8 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
     pr.fixed = torch.zeros(len(pr.lines), dtype=torch.bool)  # lines whose removal alone failed validation: kept
     for k in state.get("frozen", []):
         pr.fixed[pr.at[k]] = True
-    pending = state.setdefault("pending", [])  # the lines each accepted removal took since the last full check
+    history = state.setdefault("history", [])  # the lines each accepted removal took, in order
+    pending = state.setdefault("pending", [])  # those since the last full check that passed
 
     def save(li):
         state.update(removed=[key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()], level=li,
@@ -363,8 +365,19 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
         culprit = steps_[lo]
         if len(culprit) <= 1:
             pr.fixed[culprit] = True
+        del history[len(history) - (len(steps_) - lo):]
         pending.clear()
         return len(culprit)
+
+    if history:  # a resumed state checked again, here, against the floors as they are now (a reward revision between
+        pending[:] = history  # processes moved them: text9000's resumed circuit stood under interchange_pp's), back
+        if verify() is not None:  # along every accepted removal when it fails
+            save(state["level"])
+    elif state["removed"]:  # a checkpoint without its history: started again from the wired circuit
+        log("  a checkpoint without its removals' history: starting again from every line")
+        pr.on[:] = True
+        state.update(level=0, cap=None, cap_level=None)
+        save(0)
 
     for li in range(state["level"], len(LEVELS)):
         level = LEVELS[li]
@@ -395,6 +408,7 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                         pr.fixed |= gone
                 else:
                     pending.append([key(pr.lines[j]) for j in (last[0] & ~pr.on).nonzero().flatten().tolist()])
+                    history.append(pending[-1])
                     if len(pending) >= FULL_EVERY or steps[0] + 1 >= MAX_STEPS:
                         k = verify()
                         if k is not None:

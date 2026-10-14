@@ -36,6 +36,7 @@ line's and each part's removal effect: the point KL rise in bits and the eval s_
 
   lines.py --teachers DIR --out OUT [--tasks FILE | --split heldout --n 20] [--vpd FILE] [--offset K --stride S]
   lines.py one TEACHER.json TASK.json OUT [--vpd FILE]     one text, one process's share (exit 3: resume)
+  lines.py score TASK.json CIRCUIT.json ... [--vpd FILE]   stated circuits' reward families against the floors, v
 """
 from __future__ import annotations
 
@@ -487,10 +488,52 @@ def finish(ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: LinePruner, g0: nativ
     return 0
 
 
+def stated(path: Path, task: dict, targets: list[int], nat) -> native.Graph:
+    """A stated circuit from a file: goal_eval's circuit JSON (to_json, this pass's output) or the lead's prototype's
+    record (scratchpad/lead/edge_prune2.py: nodes {layer, kind, index, pos}, edges {w | tok, r})."""
+    d = json.loads(path.read_text())
+    if not (d.get("nodes") and isinstance(d["nodes"][0], dict)):
+        return goal_eval.load_answer(path, task, targets, nat)[0]
+    nodes = [(native.site_name(x["layer"], x["kind"]), x["pos"], x["index"]) for x in d["nodes"]]
+    par, out, tok, tok_out = {}, [], [], []
+    for e in d["edges"]:
+        r = tuple(e["r"]) if e.get("r") else None
+        if "tok" in e:
+            (tok.append((e["tok"], r)) if r else tok_out.append(e["tok"]))
+        elif r is None:
+            out.append(tuple(e["w"]))
+        else:
+            par.setdefault(r, []).append(tuple(e["w"]))
+    g = native.Graph(nodes, par, out)
+    g.tok_edges, g.tok_out = tok, tok_out
+    return goal_eval.strand(g, targets, nat.C)
+
+
+def score(paths: list[Path], task_path: Path, vpd: dict | None, pool: dict, B: int = 32) -> list[dict]:
+    """Each stated circuit's reward families against the text's floors (goal_eval.tau), its worst shortfall v, its
+    point KL on the text and its eval s_track_pp, with its parts, connections and token edges."""
+    ge = goal_eval.GoalEval(native.Native(), chunk=B)
+    goal_eval.FLIP_ROWS, goal_eval.CHANGED_ROWS = teacher.PACK_FLIP_ROWS, teacher.PACK_CHANGED_ROWS
+    tx = text_of(ge, task_path, vpd)
+    task = json.loads(task_path.read_text())
+    tau = ge.tau(tx, pool, "search")
+    fl = tau.get("floors") or {}
+    out = []
+    for p in paths:
+        g = stated(p, task, tx.targets, ge.nat)
+        row = ge.fidelity(tx, [g], pool, mode="reward", split="search")[0]
+        out.append({"circuit": str(p), "parts": len(g.node_set()), "connections": 0 if g.complete else len(goal_eval._pairs(g)),
+                    "token_edges": len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
+                    "point": ge.graph_kl(tx, [g], True)[0], "track_eval": ge.track_pp(tx, [g], "eval")[0]["s_track_pp"],
+                    "v": goal_eval.shortfall(row, fl), "families": {f: goal_eval.family_score(row, f) for f in fl}, "floors": fl})
+        native.free(ge.nat.dev)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", nargs="?", choices=("one",))
-    ap.add_argument("paths", nargs="*", help="one: TEACHER.json TASK.json OUT")
+    ap.add_argument("cmd", nargs="?", choices=("one", "score"))
+    ap.add_argument("paths", nargs="*", help="one: TEACHER.json TASK.json OUT; score: TASK.json CIRCUIT.json ...")
     ap.add_argument("--teachers", type=Path)
     ap.add_argument("--out", type=Path)
     ap.add_argument("--tasks", type=Path)
@@ -506,6 +549,11 @@ def main():
         o.mkdir(parents=True, exist_ok=True)
         vpd = torch.load(a.vpd) if a.vpd else None
         sys.exit(one(t, k, o, vpd, torch.load(teacher.POOL), a.batch, log=lambda m: print(m, flush=True)))
+    if a.cmd == "score":
+        for r in score([Path(x) for x in a.paths[1:]], Path(a.paths[0]), torch.load(a.vpd) if a.vpd else None,
+                       torch.load(teacher.POOL), a.batch):
+            print(json.dumps(r), flush=True)
+        return
     a.out.mkdir(parents=True, exist_ok=True)
     texts = [native.TEXTS / "vpd4l" / f"{t}.json" for t in a.tasks.read_text().split()] if a.tasks else native.tasks(a.split)[:a.n]
     for path in texts[a.offset::a.stride]:

@@ -5,8 +5,8 @@
 # adversary's pattern pool; lines.py runs a fresh process per MAX_STEPS accepted removals and for the re-check. The
 # circuits and their measurements come back to ~/mpd-data/runpod/NAME/out (<task>.json, <task>.lines.json, and the
 # keyed checkpoints <task>.ckpt.json, from which a later run resumes when given RESUME=DIR of them).
-#   experiments/oracle/pods/lines_pod.sh TASKS TEACHERS [NAME] [HOURS]   env: P, VPD, RESUME, LINES_FLOORS, GPU, PRICE, VRAM,
-#                                                                          RP_OWNER
+#   experiments/oracle/pods/lines_pod.sh TASKS TEACHERS [NAME] [HOURS]   env: P, VPD, RESUME, LINES_FLOORS, SCORE, GPU, PRICE,
+#                                                                          VRAM, RP_OWNER
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -26,6 +26,11 @@ COPYFILE_DISABLE=1 tar --exclude='vpd4l/text91[0-4][0-9].json' --no-xattrs --no-
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "$F/in.tar" -C "$F/in" . && rm -rf "$F/in"
 I='~/mpd-data/in_lines'
 RUNS=""
+if [ -n "${SCORE:-}" ]; then  # SCORE="CIRCUIT.json ...": lines.py score on the first task alone, rows to out/score.jsonl
+  mkdir -p "$F/score" && for c in $SCORE; do cp "$c" "$F/score/"; done
+  RUNS="(python -B method/oracle/lines.py score $(printf '%s ' "/Users/user/mpd-data/graph_oracle/texts/vpd4l/$(grep -E "^text" "$TASKS" | grep -vE "^text91[0-4][0-9]$" | head -n 1).json") $(for c in $SCORE; do printf '%s ' "$F/score/${c##*/}"; done) --vpd $VPD > $O/out/score.jsonl 2> $O/score.log; echo \"exit \$?\" >> $O/score.log) &"
+  P=0
+fi
 for k in $(seq 0 $((P - 1))); do
   RUNS="$RUNS (python -B method/oracle/lines.py --teachers $I/teachers --out $O/out --tasks $I/tasks.txt --vpd $VPD --offset $k --stride $P > $O/lines_$k.log 2>&1; echo \"exit \$?\" >> $O/lines_$k.log) &"
 done

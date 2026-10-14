@@ -504,6 +504,22 @@ def test_edge_family_cuts_stated_pairs(tiny):
     # two pairs, each naming its query among 1 + "rest" and its key among 2 + "rest"
     assert abs(goal_eval.size_bits(g, P, S, tx.targets) - goal_eval.size_bits(bare, P, S, tx.targets) - 2 * (1 + math.log2(3))) < 1e-9
 
+def test_edge_rows(tiny, monkeypatch):
+    """The connection-cut family runs whole circuits' draws EDGE_ROWS rows at a time (the teacher's memory): with one
+    circuit a run, the numbers of every circuit in one run within float32 rounding (a run's batch size moves the last
+    bits), the same draws, a circuit without connections left out."""
+    nat, ge, tx = tiny
+    graphs = [random_graph(nat, tx, s) for s in range(4)] + [native.Graph([("h.1.attn.o_proj", 11, 0)], {}, [])]
+    one = ge._edge_family(tx, graphs, draws=6)
+    monkeypatch.setattr(goal_eval, "EDGE_ROWS", 1)
+    each = ge._edge_family(tx, graphs, draws=6)
+    assert one[-1] == each[-1] and one[-1]["kl_edges_c"] is None
+    for a, b in zip(one[:-1], each[:-1]):
+        got = [(x, y) for p, q in zip(a["draws_edges"], b["draws_edges"]) for x, y in zip(p, q)] + \
+              [(a["kl_edges_c"], b["kl_edges_c"]), (a["kl_edges_vpd"], b["kl_edges_vpd"])]
+        assert len(a["draws_edges"]) == len(b["draws_edges"]) == 6 and all(abs(x - y) <= 1e-5 * max(1.0, abs(x)) for x, y in got)
+
+
 def test_probe_is_kept(tiny):
     """A text's changed prompts and F2 prompts come from one sensitivity probe, kept per text: a second preparation
     of the text gets the same prompts without probing again."""

@@ -115,6 +115,8 @@ SCREEN = 256  # the adversary's shortlist measured one by one: the parts with th
 SCREEN_ROWS = 16  # rows per run when measuring the shortlist
 CHANGED_ROWS = 64  # the changed-input family's circuit rows per run on the changed texts (circuits x changed texts)
 FLIP_ROWS = 160  # adversary_flips' rows per run: every circuit's restarts at every budget (8 x 5 x 4) together
+EDGE_ROWS = 128  # the connection-cut family's rows per run of a side (whole circuits' draws): a teacher's 32 candidates x
+# 32 draws in one run took about 9 GiB above the text's caches on text9008 (367 tokens), the teacher's peak
 INTERCHANGE_DRAWS = 32  # C's interchange draws per circuit
 CHANGED_DRAWS = 32  # C's changed texts per circuit (32, the lead's 10-12: at 16 the changed-input and donor families
 # had the largest eps of C's members on the held-out influential and VPD sets, medians 0.1-0.3; 32 costs seconds a text)
@@ -3991,12 +3993,19 @@ class GoalEval:
         semantics (the reader reads its input without those writers' outputs), or, a read with stated query-key pairs
         drawn, a random subset of its pairs (graph_ref's ("pairs", layer, t) cut, the circuit's queries and keys of that
         read the split; a read with circuit queries and no stated pairs, every pair of its row, engine.read_pairs:
-        monitorbench's 10-12; _edge_draws); the mean KLs from the model's. A circuit without connections or pairs: None. Every draw of a side runs in one batch on the engine (_sides)."""
+        monitorbench's 10-12; _edge_draws); the mean KLs from the model's. A circuit without connections or pairs: None.
+        The draws of a side run on the engine (_sides) whole circuits at a time, at most EDGE_ROWS rows a run."""
         sides = self._sides(tx, graphs)
         draws_of = [self._edge_draws(tx, g, draws) for g in graphs]
-        if not reads:  # every circuit's draws in one run of each side
-            items = [(g, c) for g, c in zip(graphs, draws_of) if c is not None]
-            got_all = iter(sides.many(items)) if items else iter(())
+        if not reads:  # the circuits' draws in runs of each side of at most EDGE_ROWS rows, each run when its first circuit's
+            parts, cur = [], []  # rows are asked for
+            for item in ((g, c) for g, c in zip(graphs, draws_of) if c is not None):
+                if cur and sum(len(c) for _, c in cur) + len(item[1]) > EDGE_ROWS:
+                    parts.append(cur)
+                    cur = []
+                cur.append(item)
+            parts += [cur] if cur else []
+            got_all = (got for part in parts for got in sides.many(part))
         out = []
         for g, cuts in zip(graphs, draws_of):
             if cuts is None:

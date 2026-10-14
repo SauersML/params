@@ -111,6 +111,11 @@ def load_policy(a):
         m, tok = tiny_model()
     else:
         m, tok = oracle_lm.load(a.model, a.lora, a.threads)
+    if getattr(a, "grad_ckpt", False):   # recompute activations in backward: SmolLM2-360M at ~3.6k tokens is killed for memory
+        m.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if hasattr(m, "enable_input_require_grads"):
+            m.enable_input_require_grads()
+        m.config.use_cache = False
     return m.to(device), tok
 
 
@@ -223,7 +228,7 @@ def sample(model, tok, prompt: str, k: int, a, greedy: bool = False) -> list[str
     model.eval()
     ids, _ = oracle_lm.chat_ids(tok, prompt)
     ids = torch.tensor([ids[-a.max_len + a.max_new:]], device=next(model.parameters()).device)
-    out = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=a.max_new,
+    out = model.generate(ids, attention_mask=torch.ones_like(ids), use_cache=True, max_new_tokens=a.max_new,
                          do_sample=not greedy, temperature=a.temp, top_p=1.0, num_return_sequences=1 if greedy else k,
                          pad_token_id=tok.pad_token_id)
     model.train()
@@ -323,6 +328,7 @@ def parser():
     ap.add_argument("--threads", type=int, default=2, help="1-2 on the shared box: 4 oversubscribes")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=10)
+    ap.add_argument("--grad_ckpt", action="store_true", help="gradient checkpointing (less memory, ~30%% slower)")
     ap.add_argument("--save_every", type=int, default=0, help="also save the checkpoint every N steps (0 = only at the end)")
     ap.add_argument("--minutes", type=float, default=0, help="stop (and save) after this many minutes (0 = no limit)")
     return ap

@@ -242,6 +242,17 @@ server_now() {
 }
 # A RunPod time ("2026-10-07 04:21:30.493 +0000 UTC") in epoch seconds.
 epoch_of() { date -j -u -f '%Y-%m-%d %H:%M:%S' "${1:0:19}" +%s 2> /dev/null; }
+# RunPod's own billed time and charge for POD (billing/pods, hourly buckets from 2 h before CREATED, an epoch), as
+# "HOURS DOLLARS"; nothing when RunPod has no record of it or its last billed hour ended under an hour ago (that hour's
+# record may still grow).
+billed_of() {  # POD CREATED
+    local from to r
+    from=$(date -u -r $(( $2 - 7200 )) +%Y-%m-%dT%H:00:00Z) to=$(date -u -r $(( $(date +%s) + 3600 )) +%Y-%m-%dT%H:00:00Z)
+    r=$(api GET "$REST/billing/pods?bucketSize=hour&grouping=podId&podId=$1&startTime=$from&endTime=$to")
+    [ "$(status_of "$r")" = 200 ] || return 0
+    jq -r --argjson now "$(date +%s)" 'if type == "array" and length > 0 and ((.[-1].time | strptime("%Y-%m-%d %H:%M:%S") | mktime) + 7200 < $now)
+        then "\((map(.timeBilledMs) | add) / 3600000) \(map(.amount) | add)" else empty end' <<< "$(body_of "$r")" 2> /dev/null || true
+}
 # Seconds RunPod pod POD has run by the API's clock (from its lastStartedAt); empty when unknown.
 pod_age() {  # POD
     local r s n
@@ -735,6 +746,14 @@ reap() {  # POD [cap]
         approval=$(cat "$ACTIVE/.$pod.approval" 2> /dev/null || echo -)
         hours=$(awk -v a="$created" -v b="$ended" -v x="$(cat "$ACTIVE/.$pod.before_s" 2> /dev/null || echo 0)" 'BEGIN { printf "%.4f", (b - a + x) / 3600 }')
         dollars=$(awk -v h="$hours" -v p="$price" 'BEGIN { printf "%.4f", h * p }')
+        # A pod already gone when reaped (deleted by its own clock, or lost by its host, while the Mac was away) has no
+        # end time left in the pod API, and creation to now overstates it (10-13 outage: 8 pods booked 4.1 h, billed
+        # 1.5-2.0 h): its hours and dollars are then RunPod's own billing, once that is complete.
+        if [ "$(provider_of "$pod")" = runpod ] && [ -z "$started_api" ]; then
+            local billed
+            billed=$(billed_of "$pod" "$created")
+            [ -z "$billed" ] || read -r hours dollars <<< "$(awk -v b="$billed" 'BEGIN { split(b, x, " "); printf "%.4f %.4f", x[1], x[2] }')"
+        fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$name" "$gpu" "$cloud" "$hours" "$dollars" "$pod" "${upload_s:--}" "${data_s:--}" "${wait_s:--}" "$end" "${owner:--}" "${approval:--}" >> "$LEDGER"
         total=$(awk -F'\t' 'NR > 1 { s += $6 } END { printf "%.2f", s }' "$LEDGER")
         line="pod $pod deleted (confirmed). $gpu ($cloud) at \$$price/h x $hours h = \$$dollars; ledger total \$$total"

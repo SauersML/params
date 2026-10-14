@@ -12,6 +12,8 @@ same ids: each non-assistant message is tokenized as "<|im_start|>role\\ncontent
   python3 -B experiments/oracle/toyloop/toy_tools_train.py eval --init expert             # the scripted expert, rule answer
   python3 -B experiments/oracle/toyloop/toy_tools_train.py rl --init ~/mpd-data/toyloop/tools_sft \
       --out ~/mpd-data/toyloop/tools_rl --k 6 --batch 2 --lr 2e-6 --minutes 40 --val_n 30   # one chunk; rerun to go on
+  python3 -B experiments/oracle/toyloop/toy_tools_train.py rl_answer --init ~/mpd-data/toyloop/tools_sft \
+      --out ~/mpd-data/toyloop/tools_rla --k 8 --batch 2 --lr 2e-6 --minutes 45 --val_n 30  # ANSWER turn only
 """
 from __future__ import annotations
 
@@ -354,6 +356,151 @@ def rl(a):
     (out / "state.json").write_text(json.dumps(state))
 
 
+# ---------------------------------------------------------------- GRPO on the ANSWER turn only
+
+_CTX: dict = {}
+
+
+def answer_context(tok, toy) -> list[int]:
+    """The ids up to the ANSWER turn: the expert's calls replayed (tools_sft's greedy calls equal them on 120/120
+    held-out texts), then "<|im_start|>assistant\n". Cached per text."""
+    if toy.name not in _CTX:
+        msgs = tt.expert_episode(toy)["messages"][:-1]
+        _CTX[toy.name] = episode_ids(tok, msgs, gen_prompt=True)[0]
+    return _CTX[toy.name]
+
+
+def answer_logps(model, prefix: list[int], answers: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
+    """(log p [k, A] of each answer's tokens after the shared prefix, mask [k, A]). The prefix runs once (with its
+    graph), its KV cache is repeated k times, and the answers run as one right-padded batch: exact gradients."""
+    k, A = len(answers), max(len(x) for x in answers)
+    out = model(input_ids=torch.tensor([prefix]), use_cache=True, logits_to_keep=1)
+    cache = out.past_key_values
+    cache.batch_repeat_interleave(k)
+    ids = torch.zeros(k, A, dtype=torch.long)
+    mask = torch.zeros(k, A)
+    for i, x in enumerate(answers):
+        ids[i, :len(x)], mask[i, :len(x)] = torch.tensor(x), 1
+    att = torch.cat([torch.ones(k, len(prefix), dtype=torch.long), mask.long()], 1)
+    logits = model(input_ids=ids[:, :-1], attention_mask=att[:, :-1], past_key_values=cache).logits
+    logits = torch.cat([out.logits[:, -1:].expand(k, 1, -1), logits], 1).float()   # [k, A, V]
+    return logits.log_softmax(-1).gather(2, ids[..., None])[..., 0], mask
+
+
+@torch.no_grad()
+def sample_answers(model, prefix: list[int], k: int, temp: float, eos: int, max_new: int) -> list[list[int]]:
+    """k sampled continuations of one prefix, each ending in eos: the prefix is prefilled once and its cache repeated
+    (25% faster than generate(num_return_sequences=k), which prefills it k times)."""
+    out = model(input_ids=torch.tensor([prefix]), use_cache=True, logits_to_keep=1)
+    cache = out.past_key_values
+    cache.batch_repeat_interleave(k)
+    logits = out.logits[:, -1].expand(k, -1)
+    seqs, done = [[] for _ in range(k)], torch.zeros(k, dtype=torch.bool)
+    for _ in range(max_new):
+        nxt = torch.multinomial((logits.float() / temp).softmax(-1), 1)[:, 0]
+        nxt = torch.where(done, torch.full_like(nxt, eos), nxt)
+        for j in range(k):
+            if not done[j]:
+                seqs[j].append(int(nxt[j]))
+        done |= nxt == eos
+        if bool(done.all()):
+            break
+        o = model(input_ids=nxt[:, None], past_key_values=cache, use_cache=True)
+        cache, logits = o.past_key_values, o.logits[:, -1]
+    return [x if x and x[-1] == eos else x + [eos] for x in seqs]
+
+
+def rl_answer(a):
+    """GRPO on the ANSWER turn alone (resumable chunks like rl): per step --batch texts, each with its fixed expert
+    context; --k answers sampled at --temp, each scored by reward_exec (via ToolEnv.result; no run() in this context);
+    advantage = reward - group mean (/ std with --std); loss on the answer tokens only, + beta x k3 KL to the start.
+    Validation and best selection: greedy full rollouts on --val_n "val" texts, as in rl."""
+    import shutil
+    out = Path(a.out).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    state = json.loads((out / "state.json").read_text()) if (out / "state.json").exists() else None
+    model, tok = train.load_policy(SimpleNamespace(init=str(out / "last") if state else a.init, model=a.model, lora=0,
+                                                   threads=a.threads))
+    ref = None
+    if a.beta > 0:
+        ref, _ = train.load_policy(SimpleNamespace(init=state["init"] if state else a.init, model=a.model, lora=0,
+                                                   threads=a.threads))
+        ref.eval()
+        for p in ref.parameters():
+            p.requires_grad_(False)
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=0.0)
+    if state and (out / "opt.pt").exists():
+        opt.load_state_dict(torch.load(out / "opt.pt"))
+    for g in opt.param_groups:
+        g["lr"] = a.lr
+    pool = toys_of("rltrain")
+    w = [FAMILY_WEIGHT.get(t.meta["family"], 1.0) if a.weak else 1.0 for t in pool]
+    vtoys = toys_of("val", a.val_n, seed=1)
+    if not state:
+        state = {"init": a.init, "step": 0, "log": [], "best": val_score(model, tok, vtoys, a.max_new), "best_step": 0,
+                 "args": {k: v for k, v in vars(a).items() if isinstance(v, (int, float, str, bool))}}
+        state["log"].append({"step": 0, "val": state["best"]})
+        print(json.dumps(state["log"][-1]), flush=True)
+        train.save(model, tok, out / "best", [])
+    rng = random.Random(a.seed + state["step"])
+    eos = tok.eos_token_id
+    t0 = time.time()
+    while time.time() - t0 < 60 * a.minutes:
+        batch = rng.choices(pool, weights=w, k=a.batch)
+        rs, f1s, nus, loss_sum, kl_sum = [], [], [], 0.0, 0.0
+        for toy in batch:
+            prefix = answer_context(tok, toy)
+            model.eval()
+            answers = sample_answers(model, prefix, a.k, a.temp, eos, a.max_new)
+            model.train()
+            res = []
+            for ans in answers:
+                env = tt.ToolEnv(toy)
+                env.step(tok.decode(ans[:-1], skip_special_tokens=True))
+                res.append(env.result())
+            r = torch.tensor([x["episode_reward"] for x in res])
+            rs += r.tolist()
+            f1s += [x["unit_f1"] for x in res]
+            nus += [x["n_units"] for x in res]
+            A = r - r.mean()
+            if a.std:
+                A = A / (r.std() + 1e-4)
+            if float(A.abs().sum()) == 0 and ref is None:
+                continue
+            lp, m = answer_logps(model, prefix, answers)
+            per = (lp * m).sum(1) / m.sum(1)
+            loss = -(A * per).sum() / (a.k * len(batch))
+            if ref is not None:
+                with torch.no_grad():
+                    rlp, _ = answer_logps(ref, prefix, answers)
+                d = rlp - lp
+                kl = ((d.exp() - d - 1) * m).sum() / m.sum()
+                loss = loss + a.beta * kl / len(batch)
+                kl_sum += kl.item() / len(batch)
+            loss.backward()
+            loss_sum += loss.item()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        state["step"] += 1
+        state["log"].append({"step": state["step"], "reward": round(sum(rs) / len(rs), 4),
+                             "f1": round(sum(f1s) / len(f1s), 4), "n_units": round(sum(nus) / len(nus), 2),
+                             "loss": round(loss_sum, 4), "kl": round(kl_sum, 5), "sec": round(time.time() - t0),
+                             "texts": [t.name for t in batch]})
+        print(json.dumps(state["log"][-1]), flush=True)
+    train.save(model, tok, out / "last", [])
+    torch.save(opt.state_dict(), out / "opt.pt")
+    v = val_score(model, tok, vtoys, a.max_new)
+    state["log"].append({"step": state["step"], "val": v, "chunk_sec": round(time.time() - t0)})
+    print(json.dumps(state["log"][-1]), flush=True)
+    if v["episode_reward"] > state["best"]["episode_reward"]:
+        shutil.rmtree(out / "best", ignore_errors=True)
+        shutil.copytree(out / "last", out / "best")
+        state["best"], state["best_step"] = v, state["step"]
+        print(json.dumps({"new_best": state["step"]}), flush=True)
+    (out / "state.json").write_text(json.dumps(state))
+
+
 def eval_cmd(a):
     import evaluate
     if a.init == "expert":   # the scripted expert with its own (rule) answer, no truth: the tools' ceiling
@@ -398,7 +545,7 @@ def eval_cmd(a):
 def main():
     global EPISODES
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("cmd", choices=["sft", "loss", "eval", "rl"])
+    ap.add_argument("cmd", choices=["sft", "loss", "eval", "rl", "rl_answer"])
     ap.add_argument("--init", default=None)
     ap.add_argument("--model", default="HuggingFaceTB/SmolLM2-135M-Instruct")
     ap.add_argument("--out", default=str(Path.home() / "mpd-data/toyloop/tools_sft"))
@@ -425,7 +572,7 @@ def main():
     ap.add_argument("--weak", type=int, default=1, help="rl: weight sampling toward FAMILY_WEIGHT's weak families")
     a = ap.parse_args()
     EPISODES = a.episodes.expanduser()
-    {"sft": sft, "loss": loss_cmd, "eval": eval_cmd, "rl": rl}[a.cmd](a)
+    {"sft": sft, "loss": loss_cmd, "eval": eval_cmd, "rl": rl, "rl_answer": rl_answer}[a.cmd](a)
 
 
 if __name__ == "__main__":

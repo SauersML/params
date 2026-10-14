@@ -108,3 +108,38 @@ def test_verify_episodes_and_tiny_rl(toys, tmp_path):
     T.rl(a)
     st = json.loads((tmp_path / "rl" / "state.json").read_text())
     assert st["step"] >= 1 and (tmp_path / "rl" / "best").exists() and (tmp_path / "rl" / "last").exists()
+
+
+def test_answer_logps_match_full_forward(toys):
+    """answer_logps (shared prefix cache, repeated) equals a plain forward of prefix + answer."""
+    import torch
+    import toy_tools_train as T
+    import train
+    model, tok = train.load_policy(SimpleNamespace(init=None, model="tiny", lora=0, threads=1))
+    model.eval()
+    prefix = T.answer_context(tok, toys[0])
+    answers = [tok("ANSWER\nflowchart LR\n  L0H1 --> out", add_special_tokens=False)["input_ids"] + [tok.eos_token_id],
+               tok("ANSWER", add_special_tokens=False)["input_ids"] + [tok.eos_token_id]]
+    with torch.no_grad():
+        lp, m = T.answer_logps(model, prefix, answers)
+        for i, ans in enumerate(answers):
+            full = model(input_ids=torch.tensor([prefix + ans])).logits[0].float().log_softmax(-1)
+            ref = full[len(prefix) - 1:-1].gather(1, torch.tensor(ans)[:, None])[:, 0]
+            assert torch.allclose(lp[i, :len(ans)], ref, atol=1e-4) and m[i].sum() == len(ans)
+
+
+def test_tiny_rl_answer(toys, tmp_path):
+    import toy_tools_train as T
+    import train
+    eps = [tt.expert_episode(t) for t in toys]
+    (tmp_path / "ep").mkdir()
+    (tmp_path / "ep" / "train.jsonl").write_text("".join(json.dumps(x) + "\n" for x in eps))
+    T.EPISODES, T.VAL_INSTANCES = tmp_path / "ep", 1
+    model, tok = train.load_policy(SimpleNamespace(init=None, model="tiny", lora=0, threads=1))
+    ck = tmp_path / "init"
+    train.save(model, tok, ck, [])
+    a = SimpleNamespace(out=str(tmp_path / "rla"), init=str(ck), model=None, threads=1, lr=1e-4, seed=0, batch=1, k=3,
+                        temp=1.0, beta=0.05, std=False, weak=1, minutes=0.01, val_n=1, max_new=6)
+    T.rl_answer(a)
+    st = json.loads((tmp_path / "rla" / "state.json").read_text())
+    assert st["step"] >= 1 and (tmp_path / "rla" / "best").exists()

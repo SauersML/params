@@ -14,6 +14,22 @@ class Graph:
 
 
 class CompletionTests(unittest.TestCase):
+    def test_preservation_reports_damage_and_rescues_separately(self):
+        rows=[dict(case='pass',arm='a',prior_all_pass=True,complete_all_pass=False),dict(case='fail',arm='a',prior_all_pass=False,complete_all_pass=True)]
+        result=c.preservation(rows)
+        self.assertEqual(result['prior_pass_pairs'],1);self.assertEqual(result['preserved_pass_pairs'],0)
+        self.assertEqual(result['damaged_pass_pairs'],[{'case':'pass','arm':'a'}]);self.assertEqual(result['rescued_failure_pairs'],1)
+    def test_all_original_scope_includes_previously_passing_cases(self):
+        ids=['additive_vote_3200000','bigram_mlp_3200100','binding_positional_3200200','cancel_3200300','copy_offset_3200400','gate_3200500','induction_3200600','redundant_3200700']
+        counts=[180,220,156,172,188,204,180,196]
+        self.assertEqual(sum(counts),1496)
+        panel=[dict(id=i,condition='original',inputs=[[]]*4,edits=[{}]*(n//4)) for i,n in zip(ids,counts)]
+        manifest={'panel':panel+[dict(r,id=r['id']+'__perm',condition='permuted') for r in panel]}
+        all_rows,worlds=c.scoped_panel(manifest,True)
+        self.assertEqual(len(all_rows),8);self.assertEqual(worlds*7,10472)
+        default,w=c.scoped_panel(manifest);self.assertEqual([r['id'] for r in default],list(c.CASES));self.assertEqual(w,384)
+        manifest['panel'][0]['condition']='permuted'
+        with self.assertRaises(ValueError):c.scoped_panel(manifest,True)
     def fixture(self):
         a=('h.0.attn.o_proj',0,1);b=('h.1.attn.v_proj',0,2);z=('h.1.attn.o_proj',0,3)
         nodes={a,b,z}

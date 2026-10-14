@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import math
 from types import SimpleNamespace
 
 CASES=('additive_vote_3200000','gate_3200500')
@@ -37,13 +38,35 @@ def complete_same_nodes(graph,native,targets):
  return completed,{'selected_nodes':len(nodes),'original_explicit_edges':graph.edges(),
                    'completed_architecture_edges':completed.edges(),'completed_internal_edges':inner,'completed_output_links':out_count}
 
+def scoped_panel(manifest,all_original=False):
+ panel=[r for r in manifest['panel'] if r['id'] in CASES] if not all_original else manifest['panel'][:8]
+ worlds=sum(len(r['inputs'])*len(r['edits']) for r in panel)
+ if (len(panel),worlds)!=((8,1496) if all_original else (2,384)):raise ValueError('fixed completion scope changed')
+ if all_original and any(r['condition']!='original' for r in panel):raise ValueError('original views only')
+ return panel,worlds
+
+def checked_distribution(value,vocab):
+ import torch
+ if tuple(value.shape)!=(1,1,vocab) or not bool(torch.isfinite(value).all()) or float(torch.logsumexp(value.double(),dim=-1).abs().max())>1e-5:raise RuntimeError('invalid physical log probabilities')
+ return value
+
+def checked_kl(value):
+ if not math.isfinite(value):raise RuntimeError('nonfinite physical KL')
+ return value
+
+def preservation(summary):
+ passing=[row for row in summary if row['prior_all_pass']]
+ return {'prior_pass_pairs':len(passing),'preserved_pass_pairs':sum(r['complete_all_pass'] for r in passing),
+         'damaged_pass_pairs':[{'case':r['case'],'arm':r['arm']} for r in passing if not r['complete_all_pass']],
+         'rescued_failure_pairs':sum(not r['prior_all_pass'] and r['complete_all_pass'] for r in summary)}
+
 def run(args):
  if sha(args.prior/'receipt.json')!=args.prior_receipt_sha256 or sha(args.prior/'results.jsonl')!=args.prior_results_sha256:raise ValueError('frozen prior physics changed')
  if sha(args.manifest)!=MANIFEST_SHA or sha(args.responses)!=RESPONSES_SHA or args.out.exists():raise ValueError('frozen diagnostic and fresh output required')
  manifest=json.loads(args.manifest.read_text());response=json.loads(args.responses.read_text())
  if response['manifest_sha256']!=MANIFEST_SHA:raise ValueError('response panel differs')
- panel=[r for r in manifest['panel'] if r['id'] in CASES]
- if [r['id'] for r in panel]!=list(CASES) or sum(len(r['inputs'])*len(r['edits']) for r in panel)!=384:raise ValueError('exact exposed two-case384world panel required')
+ panel,reference_worlds=scoped_panel(manifest,getattr(args,'all_original',False))
+ selected_cases={r['id'] for r in panel};forward_cap=reference_worlds*7;candidate_worlds=reference_worlds*5
  for root,field in ((args.source,'source_sha256'),(args.support,'support_sha256')):
   for name,d in manifest[field].items():
    if sha(root/name)!=d:raise ValueError('frozen source changed')
@@ -61,7 +84,7 @@ def run(args):
  prior={}
  for line in (args.prior/'results.jsonl').read_text().splitlines():
   row=json.loads(line)
-  if row['case'] in CASES:
+  if row['case'] in selected_cases:
    key=(row['case'],row['arm'],row['edit_index'],row['input'])
    if key in prior:raise ValueError('duplicate prior world')
    prior[key]=row
@@ -85,14 +108,14 @@ def run(args):
  from reward_interventions import scaled_neuron,clear_intervention_caches
  from intervention_teacher import tensor_digest
  from safetensors.torch import save_file,load_file
- torch.set_num_threads(1);args.out.mkdir()
- write(args.out/'protocol.json',{'cases':list(CASES),'arms':manifest['arms'],'manifest_sha256':MANIFEST_SHA,
+ torch.set_num_threads(1);torch.set_grad_enabled(False);args.out.mkdir()
+ write(args.out/'protocol.json',{'cases':[r['id'] for r in panel],'arms':manifest['arms'],'manifest_sha256':MANIFEST_SHA,
   'responses_sha256':RESPONSES_SHA,'prior_receipt_sha256':sha(args.prior/'receipt.json'),
   'prior_states_sha256':args.prior_states_sha256,'prior_results_sha256':sha(args.prior/'results.jsonl'),'source_sha256':manifest['source_sha256'],
   'support_sha256':manifest['support_sha256'],'driver_sha256':sha(__file__),
   'strict_answer_helper_sha256':sha(sys.modules['matched_graph_score'].__file__),
-  'reference_worlds':384,'candidate_worlds':1920,'forward_cap':2688,
-  'selection':'post-hoc two exposed common failures; no answers or targets changed',
+  'reference_worlds':reference_worlds,'candidate_worlds':candidate_worlds,'forward_cap':forward_cap,
+  'selection':'all8 originals including prior passes; no answers or targets changed' if getattr(args,'all_original',False) else 'post-hoc two exposed common failures; no answers or targets changed',
   'semantics':'same selected pieces; explicit all_edges completeFalse; sparse liveFalse own routing/norms',
   'reference_parity':{'max_abs_logp':1e-5,'max_abs_KL_bits':1e-6,'equal_top_required':True},
   'interpretation':'success supports missing wiring; failure does not exclude another wiring on same units'})
@@ -129,6 +152,7 @@ def run(args):
     graph_receipts.append({'case':item['id'],'arm':arm,'input':index,'valid':graph is not None,
       'invalid_reason':reason,'size':size,'original_response_sha256':response['arms'][arm]['sha256'],
       'selected_nodes_sha256':None if graph is None else hashlib.sha256(json.dumps(sorted(graph.node_set())).encode()).hexdigest()})
+  if getattr(args,'prepare_only',False):continue
   # All graphs compiled before literal edits; full model only integrity/reference.
   full=[native.Graph({(n,t,c) for n in nat.names for t in range(len(ids)) for c in range(int(nat.C[n]))},complete=True) for ids in item['inputs']]
   baselines=[]
@@ -138,7 +162,8 @@ def run(args):
     for index,ids in enumerate(item['inputs']):
      clear_intervention_caches(nat);p=nat.reference([ids],[len(ids)-1]).detach().clone()
      integrity=goal_eval.GoalEval(nat).graph_ref(ids,[len(ids)-1],full[index],live=True,norms={});forwards+=2
-     integrity_kl=raw_kl_bits(p,integrity)
+     checked_distribution(p,nat.target.wte.shape[0]);checked_distribution(integrity,nat.target.wte.shape[0])
+     integrity_kl=checked_kl(raw_kl_bits(p,integrity))
      if integrity_kl>.001:raise ValueError('full architecture integrity failed')
      if edit_index==0:baselines.append(p.clone())
      oldworld=prior[item['id'],manifest['arms'][0],edit_index,index]
@@ -146,20 +171,20 @@ def run(args):
      oldfile=args.prior_states/('worker'+str(oldshard['worker']))/oldworld['file']
      if sha(oldfile)!=oldworld['sha256']:raise ValueError('archived original distributions changed')
      previous=load_file(str(oldfile))
-     reference_error=float((p-previous['p']).abs().max());reference_kl=raw_kl_bits(p,previous['p'])
+     reference_error=float((p-previous['p']).abs().max());reference_kl=checked_kl(raw_kl_bits(p,checked_distribution(previous['p'],nat.target.wte.shape[0])))
      if reference_error>1e-5 or abs(reference_kl)>1e-6 or int(p[0,-1].argmax())!=int(previous['p'][0,-1].argmax()):raise ValueError('archived/new literal reference differs')
      tensors={'p':p.contiguous(),'full':integrity.contiguous(),'p0':baselines[index].contiguous()};world=[]
      for arm in manifest['arms']:
       graph,error,size=graphs[arm][index];old=prior[item['id'],arm,edit_index,index]
       clear_intervention_caches(nat)
       q=None if graph is None else goal_eval.GoalEval(nat).graph_ref(ids,[len(ids)-1],graph,live=False,norms={})
-      forwards+=int(q is not None);raw=None if q is None else raw_kl_bits(p,q)
+      forwards+=int(q is not None);raw=None if q is None else checked_kl(raw_kl_bits(p,checked_distribution(q,nat.target.wte.shape[0])))
       if q is not None:tensors[arm]=q.contiguous()
       world.append({'case':item['id'],'arm':arm,'edit_index':edit_index,'input':index,
        'kind':edit['kind'],'operations':edit['operations'],'valid':q is not None,'invalid_reason':error,
        'raw_kl_bits':raw,'kl_bits':None if raw is None else max(0.,raw),'top':None if q is None else int(q[0,-1].argmax()),
        'reference_top':int(p[0,-1].argmax()),'reference_max_abs_logp':reference_error,'reference_raw_kl_bits':reference_kl,
-       'prior_recomputed_raw_kl_bits':None if not old['valid'] else raw_kl_bits(p,previous[arm]),'prior_row':old,'integrity_raw_kl_bits':integrity_kl,'size':size})
+       'prior_recomputed_raw_kl_bits':None if not old['valid'] else checked_kl(raw_kl_bits(p,checked_distribution(previous[arm],nat.target.wte.shape[0]))),'prior_row':old,'integrity_raw_kl_bits':integrity_kl,'size':size})
      name=f'{case_index}_{edit_index}_{index}.safetensors';save_file(tensors,str(args.out/name))
      for row in world:row.update(file=name,sha256=sha(args.out/name));rows.append(row)
      with (args.out/'results.jsonl').open('a') as f:
@@ -170,7 +195,9 @@ def run(args):
   if sha(path)!=item['weights_sha256']:raise ValueError('model asset changed during execution')
   write(args.out/f'{case_index}.restoration.json',{'original':original,'restored':state()})
   print(json.dumps({'case':item['id'],'actual_forwards':forwards}),flush=True)
- if forwards>2688 or len(rows)!=1920:raise ValueError('world/cap mismatch')
+ if getattr(args,'prepare_only',False):
+  write(args.out/'graphs.json',graph_receipts);write(args.out/'prepare.json',{'forward_calls':0,'forward_cap':forward_cap,'candidate_worlds':candidate_worlds});return
+ if forwards>forward_cap or len(rows)!=candidate_worlds:raise ValueError('world/cap mismatch')
  write(args.out/'graphs.json',graph_receipts)
  summary=[]
  for item in panel:
@@ -181,7 +208,7 @@ def run(args):
     'complete_all_pass':all(r['valid'] and r['kl_bits']<=.001 for r in values),
     'prior_worst_kl':max((r['prior_row']['kl_bits'] for r in values if r['prior_row']['valid']),default=None),
     'complete_worst_kl':max((r['kl_bits'] for r in values if r['valid']),default=None)})
- write(args.out/'complete.json',{'actual_forwards':forwards,'forward_cap':2688,'candidate_worlds':len(rows),'summary':summary})
+ write(args.out/'complete.json',{'actual_forwards':forwards,'forward_cap':forward_cap,'candidate_worlds':len(rows),'summary':summary,'preservation':preservation(summary)})
  print(json.dumps(summary),flush=True)
 
 if __name__=='__main__':
@@ -189,4 +216,5 @@ if __name__=='__main__':
  for name in ('manifest','responses','prior','payload','source','support','out','prior_states'):p.add_argument('--'+name.replace('_','-'),type=Path,required=True)
  p.add_argument('--prior-states-sha256',required=True)
  p.add_argument('--prior-receipt-sha256',required=True);p.add_argument('--prior-results-sha256',required=True)
+ p.add_argument('--all-original',action='store_true');p.add_argument('--prepare-only',action='store_true')
  run(p.parse_args())

@@ -955,12 +955,12 @@ flowchart BT
   class W5REPAIR gate
   class CAPENG done
 
-  W5FACT["<b>Localize the failed support approximation</b><br/>All old omissions belong to only two sites:<br/>layer 1 down and layer 2 MLP input.<br/>Measure each site's omissions separately on all 52 worlds;<br/>full and joint-omission controls already exist.<br/>Why: distinguish one-site error from cross-site interaction<br/>before spending more on sparse search.<br/>Search masks are not yet oracle training answers.<br/>PREPARING · fork_review · at most 156 Native forwards"]
+  W5FACT["<b>Neither omitted site is safe by itself</b><br/>Separate omissions pass 43/52 and 27/52 edit worlds.<br/>Both fail the same upstream deletion: worst KL<br/>.106 and .093 bits, against the .001-bit cap.<br/>One joint-only threshold failure is descriptive;<br/>it does not prove a mechanistic interaction.<br/>Decision: stop this global restoration family.<br/>Why: failed masks cannot supervise faithful circuits;<br/>prioritize circuit-bound claim checks and executable targets.<br/>AUDITED · MATS 20416 / 20417 · 156 forwards · $0"]
   W5REPAIR -- complete the two-site factorial --> W5FACT
-  W5FACT -. localizes which finite changes to test .-> DIRECTKL
-  class W5FACT active
+  W5FACT -. reject failed masks as targets .-> DIRECTKL
+  class W5FACT gate
 
-  ENGCIRCUIT["<b>Does the claimed mechanism hold in its own circuit?</b><br/>Current INVARIANTS checks run only the full model.<br/>Add an opt-in check on the emitted circuit's execution.<br/>Control: same claim and carriers, broken transport edge;<br/>full-model truth must not certify a wrong circuit.<br/>Keep full-model truth, circuit truth and fidelity separate.<br/>Why: connect mechanism supervision to executable answers.<br/>IMPLEMENTING · variable_reward / eval_recovery"]
+  ENGCIRCUIT["<b>Does the claimed mechanism hold in its own circuit?</b><br/>Current INVARIANTS checks run only the full model.<br/>Add an opt-in check on the emitted circuit's execution.<br/>Control: same claim and carriers, broken transport edge;<br/>full-model truth must not certify a wrong circuit.<br/>Keep full-model truth, circuit truth and fidelity separate.<br/>Why: connect mechanism supervision to executable answers.<br/>VALIDATING · variable_reward / fork_review"]
   CAPENG -- local truth is not circuit-relative truth --> ENGCIRCUIT
   ENGCIRCUIT -. checked circuit-bound claims .-> SUP
   class ENGCIRCUIT active

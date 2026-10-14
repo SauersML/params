@@ -1254,3 +1254,52 @@ def test_thinking_trace_names_a_small_removal_by_its_start_id():
     named = components.thinking_trace(path, "vpd4l", ids, answer, names={("h.0.mlp.c_fc", 7, 3): "b"})
     assert "Refused: removing b drops changed-input tracking to 0.50" in named
     assert "removing L0.fc#3@7 drops" in components.thinking_trace(path, "vpd4l", ids, answer)
+
+
+def _tiny_stated(nat, task, start):
+    """A stated circuit on every other START part: half of each reader's connections, three token edges, the target's
+    embedding into the prediction, stranded as the scorer strands it."""
+    import mech
+
+    targets = task["prompts"][0]["target_positions"]
+    nodes = [(m, t, c) for m, c, t in start["nodes"][::2]]
+    par, out = native.all_edges(set(nodes), targets)
+    g = native.Graph(nodes, {r: ws[::2] for r, ws in par.items() if ws[::2]}, out)
+    g.tok_edges = sorted((nd[1], nd) for nd in nodes if native._name_layer_kind(nd[0])[1] in mech.RESID_READERS)[:3]
+    g.tok_out = sorted(set(targets))
+    return goal_eval.strand(g, targets, nat.C)
+
+
+def test_start_relative_stated_circuits_round_trip(tiny):
+    """CONNECT: a stated circuit written start-relative (start_answer with its edges) parses back to the same stated
+    graph (nodes, connections, token edges, the prediction's token) and scores as the same circuit written out in full;
+    a removed id, an unknown one and a writer that is the prediction are charged; a query-key pair line is a pair."""
+    nat, ge, task, ev = tiny
+    start = _tiny_start(nat, ge, task)
+    p = task["prompts"][0]
+    targets, T = p["target_positions"], len(p["token_ids"])
+    g = _tiny_stated(nat, task, start)
+    ans = goal_eval.to_json(g)
+    text = components.start_answer(start, ans["nodes"], ans["edges"])
+    assert text.startswith("CONNECT:\n") and "REMOVE" not in text and "tok@" in text  # the circuit is what CONNECT names
+    got = components.parse_start(text, start)
+    g2, _ = goal_eval.circuit(got["answer"], targets, nat.C, T)
+    assert not g2.complete and got["malformed_nodes"] == 0
+    assert set(g2.node_set()) == set(g.node_set()) and goal_eval._pairs(g2) == goal_eval._pairs(g)
+    assert sorted(g2.tok_edges) == sorted(g.tok_edges) and sorted(g2.tok_out) == sorted(g.tok_out)
+    plain = {**ev, "qa": [], "edits": [], "circuit_only": True}
+    rel = components.reward(ge, task, {**plain, "start": start}, [text], pool={})[0]
+    full = components.reward(ge, task, plain, [components.render(ans)], pool={})[0]
+    for k in ("reward", "phi", "bits", "compact", "g"):
+        assert rel[k] == pytest.approx(full[k], abs=1e-6), k
+    with_remove = components.parse_start(components.start_answer(start, [x for x in ans["nodes"] if x[0] != "tok"]) + "\n" + text, start)
+    g3, _ = goal_eval.circuit(with_remove["answer"], targets, nat.C, T)
+    assert set(g3.node_set()) == set(g.node_set()) and goal_eval._pairs(g3) == goal_eval._pairs(g)  # REMOVE: and CONNECT: alike
+    gone = start["ids"][1]  # (every other part kept: ids[1] is removed)
+    bad = components.parse_start(f"REMOVE: {gone}\nCONNECT:\nOUT > {start['ids'][0]}\n{start['ids'][0]} > {gone}, zz9, OUT", start)
+    assert bad["unknown_ids"] == 4  # OUT as a writer (and its reader), a removed id, an unknown id
+    q = next(k for k, (m, c, t) in zip(start["ids"], start["nodes"]) if m.endswith("q_proj"))
+    kk = next(k for k, (m, c, t) in zip(start["ids"], start["nodes"]) if m.endswith("k_proj"))
+    pr = components.parse_start(f"REMOVE:\nCONNECT:\n{q} ~ {kk}\nrest ~ {kk} L1@5", start)["answer"]["edges"]
+    qn = dict(zip(start["ids"], start["nodes"]))[q]
+    assert pr[0][0] == "pair" and pr[0][3:] == [int(qn[0].split(".")[1]), qn[2]] and pr[1][1] == "rest" and pr[1][3:] == [1, 5]

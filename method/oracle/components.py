@@ -998,8 +998,18 @@ ASK_START = ("How does {model} compute its prediction of the next token after th
              "not; fewer subcomponents are better. Answer with REMOVE: and the ids of the START's subcomponents to remove, "
              "separated by commas (REMOVE: with nothing after it keeps the whole START), and optionally a line ADD: and "
              "subcomponents of the candidate pool to add, written out (L<layer>.<kind>#<index>@<position>), separated by "
-             "commas.")
-START_MARK = re.compile(r"^\s*(REMOVE|ADD)\s*:", re.M | re.I)  # a start-relative answer's two parts
+             "commas. To state the circuit's connections instead of keeping every one among its subcomponents, add a line "
+             "CONNECT: and then one line per writer, <writer> > <reader>, <reader>, ...: each a kept START id, an added "
+             "subcomponent written out, tok@<position> for the token embedding at a position (into a query, key, value "
+             "or MLP input there), or OUT for the prediction; an attention or MLP output (o, down) into a later query, "
+             "key, value or MLP input at its position, a value (v) into its layer's attention output at that or a later "
+             "position, an MLP input (fc) into its MLP's output (down); and a line <q> ~ <k> for a query-key pair of q's "
+             "read (rest ~ <k> L<layer>@<position> when the query is the part outside the circuit); a line of ids alone "
+             "names parts kept without a stated connection. With CONNECT and no REMOVE:, the circuit is the subcomponents "
+             "its lines name. A subcomponent on no stated path from a token to the prediction (other than a query or key) "
+             "is dropped.")
+START_MARK = re.compile(r"^\s*(REMOVE|ADD|CONNECT)\s*:", re.M | re.I)  # a start-relative answer's parts
+PAIR_AT = re.compile(r"\s*L(\d+)@(\d+)\s*$")  # a CONNECT pair's read when its query is rest
 START_ID = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
 
@@ -1491,6 +1501,9 @@ def parse_start(text: str, start: dict) -> dict:
         body.setdefault(m[1].upper(), text[m.end():other.start() if other else end])
     of = {k: tuple(nd) for k, nd in zip(start["ids"], start["nodes"])}
     gone, unknown = set(), 0
+    if "CONNECT" in body and "REMOVE" not in body:  # the circuit is what the CONNECT lines name
+        named = set(START_ID.findall(body["CONNECT"]))
+        gone = {nd for k, nd in of.items() if k not in named}
     for k in START_ID.findall(body.get("REMOVE", "")):
         if k in of:
             gone.add(of[k])
@@ -1506,9 +1519,71 @@ def parse_start(text: str, start: dict) -> dict:
             continue
         added += [x for n, t, c in g if (x := (n, c, t)) not in inside and x not in added]
     nodes = [list(nd) for nd in start["nodes"] if tuple(nd) not in gone] + [list(x) for x in added]
-    return {"explanation": "", "answer": {"nodes": nodes, "edges": [], "explanation": "", "complete": True}, "ids": {},
-            "malformed": junk, "malformed_nodes": junk + unknown, "unknown_ids": unknown, "circuit": "REMOVE" in body,
-            "finals": {}, "edits": {}, "variables_malformed": 0, "removed": len(gone), "added": len(added)}
+    answer = {"nodes": nodes, "edges": [], "explanation": "", "complete": True}
+    if "CONNECT" in body:  # the stated graph: these connections, token edges and query-key pairs alone
+        answer, bad = _connect(body["CONNECT"], nodes, {k: of[k] for k in start["ids"] if of[k] not in gone})
+        unknown += bad
+    return {"explanation": "", "answer": answer, "ids": {},
+            "malformed": junk, "malformed_nodes": junk + unknown, "unknown_ids": unknown,
+            "circuit": "REMOVE" in body or "CONNECT" in body, "finals": {}, "edits": {}, "variables_malformed": 0,
+            "removed": len(gone), "added": len(added)}
+
+
+def _connect(text: str, nodes: list, kept: dict) -> tuple[dict, int]:
+    """A start-relative answer's CONNECT lines as goal_eval's stated-graph JSON over nodes (its kept and added
+    subcomponents; a token embedding named in a line added as ["tok", 0, position]) and the count of references that
+    name nothing in the circuit (an unknown or removed id, a part not kept, a line that does not parse): each charged
+    as parse() charges an undefined id. kept: START id -> node, the kept ones."""
+    nodes = [list(x) for x in nodes]
+    at = {tuple(x): i for i, x in enumerate(nodes)}
+
+    def ref(x):  # an endpoint's index in nodes, "out", "rest", or None
+        x = x.strip()
+        if x.upper() == "OUT":
+            return "out"
+        if x.lower() == "rest":
+            return "rest"
+        nd = kept.get(x)
+        if nd is None:
+            g = group_of(x)
+            if not g or len(g) != 1:
+                return None
+            n, t, c = g[0]
+            nd = (TOK, 0, t) if n == TOK else ("block", n, t) if c == BLOCK else (n, c, t)
+            if n == TOK and nd not in at:
+                at[nd] = len(nodes)
+                nodes.append(list(nd))
+        return at.get(tuple(nd))
+    edges, pairs, bad = [], [], 0
+    for line in (x.strip() for x in text.splitlines()):
+        if not line:
+            continue
+        if "~" in line:  # a query-key pair: q ~ k [L<layer>@<position>]
+            q, _, rest = line.partition("~")
+            m = PAIR_AT.search(rest)
+            k = rest[:m.start()] if m else rest
+            qi, ki = ref(q), ref(k)
+            if None in (qi, ki) or "out" in (qi, ki) or (qi == "rest" and not m):
+                bad += 1
+                continue
+            layer, pos = (int(m[1]), int(m[2])) if m else (int(nodes[qi][0].split(".")[1]), int(nodes[qi][2]))
+            pairs.append(["pair", qi, ki, layer, pos])
+            continue
+        w, arrow, rs = line.partition(">")
+        if not arrow:  # parts in the circuit without a stated connection (a query or key read through its pairs)
+            bad += sum(ref(x) in (None, "out", "rest") for x in w.split(",") if x.strip())
+            continue
+        wi = ref(w)
+        if wi is None or wi in ("out", "rest"):
+            bad += 1 + len([r for r in rs.split(",") if r.strip()])
+            continue
+        for r in (x for x in rs.split(",") if x.strip()):
+            ri = ref(r)
+            if ri is None or ri == "rest":
+                bad += 1
+            else:
+                edges.append([wi, ri])
+    return {"nodes": nodes, "edges": edges + pairs, "explanation": ""}, bad
 
 
 def parse_answer(text: str, ev: dict) -> dict:
@@ -1518,15 +1593,33 @@ def parse_answer(text: str, ev: dict) -> dict:
     return parse_start(text, ev["start"]) if ev.get("start") and START_MARK.search(MARKDOWN.sub("", text)) else parse(text)
 
 
-def start_answer(start: dict, nodes) -> str:
+def start_answer(start: dict, nodes, edges: list | None = None) -> str:
     """The start-relative answer for a circuit (goal_eval's JSON nodes): REMOVE: start's ids it lacks, then ADD: its
-    subcomponents outside start written out (none for a teacher's circuit, a subset of its start)."""
+    subcomponents outside start written out (none for a teacher's circuit, a subset of its start); with edges (a
+    stated graph's, goal_eval's JSON over nodes, token embeddings among them) no REMOVE: (the circuit is what CONNECT
+    names) and CONNECT: one line per writer, its readers by START id, written out, tok@<position> or OUT, then one line
+    per query-key pair."""
     keep, inside = {tuple(x) for x in nodes}, {tuple(x) for x in start["nodes"]}
-    text = "REMOVE: " + ", ".join(k for k, nd in zip(start["ids"], start["nodes"]) if tuple(nd) not in keep)
+    text = "" if edges is not None else "REMOVE: " + ", ".join(k for k, nd in zip(start["ids"], start["nodes"]) if tuple(nd) not in keep)
     extra = [x for x in nodes if tuple(x) not in inside and x[0] not in (TOK, "block")]
     if extra:
         text += "\nADD: " + ", ".join(node_text((n, t, c)) for n, c, t in extra)
-    return escape(text.rstrip())
+    if edges is not None:
+        ids = {tuple(nd): k for k, nd in zip(start["ids"], start["nodes"])}
+        name = lambda i: "OUT" if i == "out" else "rest" if i == "rest" else ids.get(tuple(nodes[i])) or (  # noqa: E731
+            f"tok@{nodes[i][2]}" if nodes[i][0] == TOK else node_text((nodes[i][0], nodes[i][2], nodes[i][1])))
+        by, pairs, used = {}, [], set()
+        for e in edges:
+            if e[0] == "pair":
+                pairs.append(f"{name(e[1])} ~ {name(e[2])}" + (f" L{e[3]}@{e[4]}" if e[1] == "rest" else ""))
+                used |= {e[1], e[2]}
+            else:
+                by.setdefault(e[0], []).append(name(e[1]))
+                used |= {e[0], e[1]}
+        alone = [name(i) for i, x in enumerate(nodes) if i not in used and x[0] != TOK]  # kept without a stated connection
+        text += ("\nCONNECT:" + (f"\n{', '.join(alone)}" if alone else "") + "".join(f"\n{name(w)} > {', '.join(rs)}" for w, rs in sorted(by.items()))
+                 + "".join(f"\n{x}" for x in pairs))
+    return escape(text.strip())
 
 
 def edit_goal_text(g: dict, strings: list[str], top: str) -> str:
@@ -2751,7 +2844,7 @@ def dataset(rows: Path, teacher_dir: Path, out: Path, ge=None, english: dict | N
                 inside = {tuple(x) for x in st["nodes"]}
                 info |= {"start": len(st["nodes"]), "removed": sum(tuple(x) not in {tuple(y) for y in answer["nodes"]} for x in st["nodes"]),
                          "outside_start": sum(tuple(x) not in inside for x in answer["nodes"] if x[0] != TOK)}
-                content = start_answer(st, answer["nodes"])
+                content = start_answer(st, answer["nodes"], None if answer.get("complete") else answer["edges"])
             else:
                 content = target(answer, r, task["model"], ops, token_strings(task["model"], prompt["token_ids"]))
             if traces:  # the teacher's search as the thinking before the answer (thinking_trace; Qwen3's thinking renderer)

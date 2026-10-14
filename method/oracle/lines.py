@@ -21,8 +21,8 @@ the point family's floor. A removal is admitted when
               flips and omitted on the survivors alone;
 and kept after it when s_track_pp on the validation draws (the other half of the search pool: rank 2 and fresh
 samples, eval-like) stays within VAL_MARGIN of the fully wired circuit's (teacher.Validated, every removal: a failing
-one goes back; the level then runs again, the failing removal's line kept for good when it was one line, else every
-later prefix smaller than half of it, until a run admits nothing).
+one goes back; the level then runs again, the failing removal's line kept for good when it was one line, else, when
+that run kept no removal before it, the next run's prefixes below half its size; until a run admits nothing).
 
 Each accepted removal is checkpointed by line identity (a line's key names its ends, never its place in a list: a set's
 order changes from process to process), and a process ends after MAX_STEPS of them (exit EXIT_RESUME) so a fresh one
@@ -312,8 +312,9 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
         level = LEVELS[li]
         cap = state.get("cap") if state.get("cap_level") == li else None
         while True:  # the level again after a validation failure (Validated ends a level at its first): the failing
-            journal, failed = [], []  # removal's line frozen when it was one, else prefixes capped below its size
-            v = teacher.Validated(pr, pr.graph, acc, floor_val, journal)
+            journal, failed, kept = [], [], []  # removal's line frozen when it was one, else, when the run kept no
+            v = teacher.Validated(pr, pr.graph, acc, floor_val, journal)  # removal before it, the next run's prefixes
+            # capped below half its size (a run that kept one runs uncapped: its state differs)
 
             def capped(ons, cap=cap):
                 if cap is None:
@@ -326,7 +327,7 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                         out[i] = r
                 return out
 
-            def after(li=li, level=level, v=v, failed=failed):
+            def after(li=li, level=level, v=v, failed=failed, kept=kept):
                 now = pr.on.clone()
                 stop = v()
                 if stop:
@@ -334,6 +335,8 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                     failed.append(int(gone.sum()))
                     if int(gone.sum()) <= 1:
                         pr.fixed |= gone
+                else:
+                    kept.append(1)
                 state.update(removed=[key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()], level=li,
                              frozen=[key(pr.lines[j]) for j in pr.fixed.nonzero().flatten().tolist()])
                 state["trace"].append([level, int(pr.on.sum()), v.trace[-1][2] if v.trace else None, round(time.time() - t0)])
@@ -352,10 +355,9 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                 return EXIT_RESUME
             if not failed:
                 break
-            if failed[-1] > 1:
-                cap = failed[-1] // 2 if cap is None else min(cap, failed[-1] // 2)
-                state.update(cap=cap, cap_level=li)
-                ckpt.write_text(json.dumps(state))
+            cap = failed[-1] // 2 if failed[-1] > 1 and not kept else None
+            state.update(cap=cap, cap_level=li)
+            ckpt.write_text(json.dumps(state))
         state.update(level=li + 1, cap=None, cap_level=None,
                      removed=[key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()])
         ckpt.write_text(json.dumps(state))

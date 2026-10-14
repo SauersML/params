@@ -514,12 +514,18 @@ def _transplant(base: torch.Tensor, moved: torch.Tensor, still: torch.Tensor) ->
     return torch.log_softmax(base + moved - still, -1)
 
 
+KL_RESOLUTION = 2.0 ** -24 * 18  # bits: float32's rounding bound on a KL (unit roundoff x the largest entropy of a
+# vocabulary up to 2^18 tokens: vpd4l, GPT-2, Qwen3). The log scale counts a KL below it as it (the lead's 10-13: a score
+# must not reward precision the measurement cannot resolve; InterpBench case 11's exact VPD fit put KL_VPD at 6e-10 bits,
+# so a 74-subcomponent circuit at 1.28 bits of 5.64 scored 0.065)
+
+
 def _fid_raw(e0: float, kc: float, kv: float) -> float | None:
     """_fid without the floor at 0 (the reward's ranking, the lead's 10-12): below 0 when the circuit is farther than
-    the bound; at most 1."""
-    if kv is None or kc is None or not e0 > 0 or not kv < e0:
+    the bound; at most 1. KLs below KL_RESOLUTION count as KL_RESOLUTION; a bound within it leaves nothing to recover."""
+    if kv is None or kc is None or not e0 > KL_RESOLUTION or not kv < e0:
         return None
-    return min(1.0, math.log(e0 / max(kc, 1e-12)) / math.log(e0 / max(kv, 1e-12)))
+    return min(1.0, math.log(e0 / max(kc, KL_RESOLUTION)) / math.log(e0 / max(kv, KL_RESOLUTION)))
 
 
 def _c_rl(terms: list) -> float | None:
@@ -932,10 +938,10 @@ def f2_cut(moved: np.ndarray, floor: float = SHARE_FLOOR) -> list[int]:
 
 def _fid(e0: float, kc: float, kv: float) -> float | None:
     """C's log scale: clip(ln(KL_empty / KL_C) / ln(KL_empty / KL_VPD), 0, 1); None when VPD's own answer is no
-    nearer the model than the empty circuit under the interventions."""
-    if kv is None or kc is None or not e0 > 0 or not kv < e0:  # (a bound of 0: nothing to recover)
+    nearer the model than the empty circuit under the interventions. KLs below KL_RESOLUTION count as KL_RESOLUTION."""
+    if kv is None or kc is None or not e0 > KL_RESOLUTION or not kv < e0:  # (a bound within resolution: nothing to recover)
         return None
-    return _clip01(math.log(e0 / max(kc, 1e-12)) / math.log(e0 / max(kv, 1e-12)))
+    return _clip01(math.log(e0 / max(kc, KL_RESOLUTION)) / math.log(e0 / max(kv, KL_RESOLUTION)))
 
 
 def _read_error(pairs: dict) -> float | None:

@@ -1,6 +1,7 @@
 """Synthetic regressions for below-bound faithfulness in reward v3: phi reads the unfloored family scores in [-1, 1]
 with a leaky floor (the user's 10-13 softening of the Gate B table's floor at 0), and every piece of the circuit term
 is smooth."""
+import math
 import sys
 from pathlib import Path
 
@@ -187,3 +188,16 @@ def test_family_kls_report_the_raw_kls():
     k = goal_eval.family_kls(row)
     assert (k["point"], k["empty"], k["vpd"], k["nodes"], k["edges"], k["flips"]) == (2.5, 12.0, 0.4, 3.0, 1.0, 4.0)
     assert k["track_pp"] == 2.0 and k["patching_near"] == 0.7 and k["N"] == 6.0 and k["patching_far"] is None and k["omitted"] is None
+
+
+def test_kl_resolution_floor():
+    """The log scale counts a KL below float32's resolution as the resolution: an exact VPD answer (InterpBench case 11,
+    KL_VPD 6e-10 bits) no longer makes every inexact circuit score near 0 on precision nothing measures, and a circuit
+    and VPD both within resolution tie at 1."""
+    r = goal_eval.KL_RESOLUTION
+    assert 1e-6 < r < 1.1e-6
+    assert goal_eval._fid_raw(5.64, 1.28, 5.9e-10) == pytest.approx(math.log(5.64 / 1.28) / math.log(5.64 / r))
+    assert goal_eval._fid_raw(5.64, 5e-7, 5.9e-10) == 1.0 and goal_eval._fid(5.64, 3e-8, 5.9e-10) == 1.0
+    assert goal_eval._fid(5.64, 1.28, 0.5) == pytest.approx(math.log(5.64 / 1.28) / math.log(5.64 / 0.5))
+    assert goal_eval._fid(5e-7, 1e-7, 1e-8) is None
+

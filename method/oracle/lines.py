@@ -16,9 +16,11 @@ the point family's floor. A removal is admitted when
   changed     s_track_pp on fresh search-pool draws (teacher.Acceptance, draws "fv": the model's likeliest alternative
               judged draw by draw against its own floor, sampled tokens pooled) stays at its floor;
   floors      every family the frozen reward scores on the text stays at its floor (goal_eval.tau's floors, each at most
-              the fully wired circuit's own score): point, nodes, track_pp, interchange_pp, patching, pattern and N on
-              the line variants from one plan (GoalEval.phi_variants over the current circuit's lines), then edges,
-              flips and omitted on the survivors alone;
+              the fully wired circuit's own score): point, nodes, track_pp, interchange_pp, pattern and N on the line
+              variants from one plan (GoalEval.phi_variants over the current circuit's lines), omitted where the node
+              set moved; edges, flips and patching held at the current circuit's values, which the full check
+              (Floors.full: the circuit's own reward row, every family) tests every FULL_EVERY removals, at a level's
+              end and before a process ends, going back to the last accepted state that passes when one fails;
 and kept after it when s_track_pp on the validation draws (the other half of the search pool: rank 2 and fresh
 samples, eval-like) stays within VAL_MARGIN of the fully wired circuit's (teacher.Validated, every removal: a failing
 one goes back; the level then runs again, the failing removal's line kept for good when it was one line, else, when
@@ -61,7 +63,7 @@ VAL_MARGIN = 0.02  # validation: s_track_pp at least the fully wired circuit's l
 # min(0.9, start - 0.05) text9000's pruned circuit fell to eval 0.81 against the complete 0.965)
 MAX_STEPS = 24  # accepted removals per process
 EXIT_RESUME = 3
-HELD = ("edges", "flips", "omitted")  # the families phi_variants holds at the current circuit's values: run on survivors
+FULL_EVERY = 8  # accepted removals between full checks of the current circuit's every family (Floors.full)
 
 
 def key(col: tuple) -> str:
@@ -182,12 +184,15 @@ def held(h: native.Graph):
 
 
 class Floors:
-    """The frozen reward's floors on line variants (module docstring): per candidate graph its families as the reward
-    reads them against floors, or None (its first family under its floor recorded in refused)."""
+    """The frozen reward's floors (module docstring). Per candidate (__call__): every family against its floor on the
+    line variants from one plan of the current circuit (GoalEval.phi_variants with nodes recomputed: point, nodes,
+    track_pp, interchange_pp, pattern and N per variant), omitted on the survivors whose node set differs (it moves
+    with the node set alone), edges, flips and patching held at the current circuit's values; full(g): the circuit's
+    own reward row, every family. A candidate under a floor is None (its family recorded in refused)."""
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, floors: dict):
         self.ge, self.tx, self.pool, self.floors = ge, tx, pool, floors
-        self._base, self._held, self._screens, self.refused = {}, {}, {}, []
+        self._base, self._omitted, self.refused = {}, {}, []
 
     def base(self, g: native.Graph) -> dict:
         """The current circuit's reward-mode row (search split), kept for its lines."""
@@ -196,39 +201,38 @@ class Floors:
             self._base = {k: self.ge.fidelity(self.tx, [g], self.pool, mode="reward", split="search")[0]}
         return self._base[k]
 
+    def under(self, scores: dict) -> str | None:
+        """The first family under its floor (an unscored family at 0), or None."""
+        return next((f for f in self.floors if (scores.get(f) or 0.0) < self.floors[f] - 1e-9), None)
+
+    def full(self, g: native.Graph) -> tuple:
+        """(the first family of g's own reward row under its floor or None, the row's family scores)."""
+        row = self.base(g)
+        scores = {f: goal_eval.family_score(row, f) for f in self.floors}
+        return self.under(scores), scores
+
     def __call__(self, g_now: native.Graph, graphs: list) -> list:
         ge, tx, nat = self.ge, self.tx, self.ge.nat
         lines = ge.loo_lines(tx, g_now)
         keep = torch.tensor([[has(kind, x) for kind, x in lines] for has in (held(h) for h in graphs)], dtype=torch.bool)
-        got = ge.phi_variants(tx, g_now, keep, self.pool, base=self.base(g_now))["variants"]
-        out = [{f: goal_eval.family_score(v["row"], f) for f in self.floors if f not in HELD} for v in got]
-
-        def under(i):
-            return next((f for f, s in out[i].items() if (s or 0.0) < self.floors[f] - 1e-9), None)
-        e0 = ge._bounds(tx, "live")[0]
-        for fam in HELD:
-            alive = [i for i in range(len(out)) if under(i) is None]
-            if fam not in self.floors or not alive:
-                continue
-            keys = [(fam, repr(ge.loo_lines(tx, graphs[i])) if fam != "omitted" else tuple(sorted(graphs[i].node_set()))) for i in alive]
-            todo = [(i, k) for i, k in zip(alive, keys) if k not in self._held]
-            cg = [goal_eval._c_graph(graphs[i], tx.targets, nat.C) for i, _ in todo]
-            if not cg:
-                rows = []
-            elif fam == "edges":
-                rows = [{"s_edges": goal_eval._fid(e0, r["kl_edges_c"], r["kl_edges_vpd"]) if r.get("kl_edges_c") is not None else None}
-                        for r in ge._edge_family(tx, cg, goal_eval.DRAWS)]
-            elif fam == "omitted":
-                rows = ge._omitted_family(tx, cg)
-            else:
-                rows = [{"f1_flips_c": r.get("f1_flips_omitted", {})} for r in
-                        ge.adversary_flips(tx, cg, self.pool, "omitted", upto=goal_eval.FLIP_TERM, screens=self._screens)]
-            for (i, k), r in zip(todo, rows):
-                self._held[k] = goal_eval.family_score(r, fam)
-            for i, k in zip(alive, keys):
-                out[i][fam] = self._held[k]
+        got = ge.phi_variants(tx, g_now, keep, self.pool, base=self.base(g_now), recompute=("nodes",))["variants"]
+        out = [{f: goal_eval.family_score(v["row"], f) for f in self.floors} for v in got]
+        if "omitted" in self.floors:
+            now = tuple(sorted(g_now.node_set()))
+            todo = {}
+            for i, h in enumerate(graphs):
+                k = tuple(sorted(h.node_set()))
+                if k != now and self.under(out[i]) is None:
+                    todo.setdefault(k, []).append(i)
+            fresh = [k for k in todo if k not in self._omitted]
+            rows = ge._omitted_family(tx, [goal_eval._c_graph(graphs[todo[k][0]], tx.targets, nat.C) for k in fresh]) if fresh else []
+            for k, r in zip(fresh, rows):
+                self._omitted[k] = goal_eval.family_score(r, "omitted")
+            for k, idx in todo.items():
+                for i in idx:
+                    out[i]["omitted"] = self._omitted[k]
         for i in range(len(out)):
-            f = under(i)
+            f = self.under(out[i])
             if f is not None:
                 self.refused.append({"family": f, "score": out[i].get(f), "floor": self.floors[f]})
                 out[i] = None
@@ -308,13 +312,47 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
     pr.fixed = torch.zeros(len(pr.lines), dtype=torch.bool)  # lines whose removal alone failed validation: kept
     for k in state.get("frozen", []):
         pr.fixed[pr.at[k]] = True
+    pending = state.setdefault("pending", [])  # the lines each accepted removal took since the last full check
+
+    def save(li):
+        state.update(removed=[key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()], level=li,
+                     frozen=[key(pr.lines[j]) for j in pr.fixed.nonzero().flatten().tolist()])
+        ckpt.write_text(json.dumps(state))
+
+    def verify() -> int | None:
+        """The current circuit's every family against its floor; when one is under, back to the last accepted state
+        that passes (bisection over pending: the state before them passed) and the size of the removal after it."""
+        fam, _ = fl.full(pr.graph(pr.on))
+        if fam is None:
+            pending.clear()
+            return None
+        steps_ = [torch.tensor([pr.at[k] for k in ks], dtype=torch.long) for ks in pending]
+        base = pr.on.clone()
+        for ix in steps_:
+            base[ix] = True
+        state_of = lambda i: base.clone().index_fill_(0, torch.cat(steps_[:i]), False) if i else base.clone()  # noqa: E731
+        lo, hi = 0, len(steps_)  # state lo passes, state hi fails
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if fl.full(pr.graph(state_of(mid)))[0] is None:
+                lo = mid
+            else:
+                hi = mid
+        pr.on[:] = state_of(lo)
+        log(f"  full check: {fam} under its floor; back {len(steps_) - lo} removals to {int(pr.on.sum())} lines")
+        culprit = steps_[lo]
+        if len(culprit) <= 1:
+            pr.fixed[culprit] = True
+        pending.clear()
+        return len(culprit)
+
     for li in range(state["level"], len(LEVELS)):
         level = LEVELS[li]
         cap = state.get("cap") if state.get("cap_level") == li else None
-        while True:  # the level again after a validation failure (Validated ends a level at its first): the failing
-            journal, failed, kept = [], [], []  # removal's line frozen when it was one, else, when the run kept no
-            v = teacher.Validated(pr, pr.graph, acc, floor_val, journal)  # removal before it, the next run's prefixes
-            # capped below half its size (a run that kept one runs uncapped: its state differs)
+        while True:  # the level again after a validation or full-check failure: the failing removal's line frozen
+            journal, failed, kept = [], [], []  # when it was one, else, when the run kept no removal before it, the
+            v = teacher.Validated(pr, pr.graph, acc, floor_val, journal)  # next run's prefixes capped below half
+            last = [pr.on.clone()]  # its size (a run that kept one runs uncapped: its state differs)
 
             def capped(ons, cap=cap):
                 if cap is None:
@@ -327,7 +365,7 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                         out[i] = r
                 return out
 
-            def after(li=li, level=level, v=v, failed=failed, kept=kept):
+            def after(li=li, level=level, v=v, failed=failed, kept=kept, last=last):
                 now = pr.on.clone()
                 stop = v()
                 if stop:
@@ -336,11 +374,17 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                     if int(gone.sum()) <= 1:
                         pr.fixed |= gone
                 else:
-                    kept.append(1)
-                state.update(removed=[key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()], level=li,
-                             frozen=[key(pr.lines[j]) for j in pr.fixed.nonzero().flatten().tolist()])
+                    pending.append([key(pr.lines[j]) for j in (last[0] & ~pr.on).nonzero().flatten().tolist()])
+                    if len(pending) >= FULL_EVERY or steps[0] + 1 >= MAX_STEPS:
+                        k = verify()
+                        if k is not None:
+                            failed.append(k)
+                            stop = True
+                    if not stop:
+                        kept.append(1)
+                last[0] = pr.on.clone()
+                save(li)
                 state["trace"].append([level, int(pr.on.sum()), v.trace[-1][2] if v.trace else None, round(time.time() - t0)])
-                ckpt.write_text(json.dumps(state))
                 log(f"  {level}: {int(pr.on.sum())} lines on, validation {v.trace[-1][2] if v.trace else None}"
                     f"{' (failed: back)' if stop else ''}, {time.time() - t0:.0f}s")
                 tidy(ge, tx, pr)
@@ -353,14 +397,18 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
                 v.finish()
             except Restart:
                 return EXIT_RESUME
+            if not failed and pending:  # the level's end: its last removals checked in full
+                k = verify()
+                if k is not None:
+                    failed.append(k)
+                save(li)
             if not failed:
                 break
             cap = failed[-1] // 2 if failed[-1] > 1 and not kept else None
             state.update(cap=cap, cap_level=li)
-            ckpt.write_text(json.dumps(state))
-        state.update(level=li + 1, cap=None, cap_level=None,
-                     removed=[key(pr.lines[j]) for j in (~pr.on).nonzero().flatten().tolist()])
-        ckpt.write_text(json.dumps(state))
+            save(li)
+        state.update(level=li + 1, cap=None, cap_level=None)
+        save(li + 1)
     state["done"] = True
     state["refused"] = {"changed": len(acc.refused), "floors": len(fl.refused)}
     ckpt.write_text(json.dumps(state))

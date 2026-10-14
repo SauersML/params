@@ -5,7 +5,7 @@ Per item (a target prompt, its read positions: the prompt's last READ tokens, th
 segment), on the target model (Qwen3 with the item's adapter: a taboo model, or none):
   candidates: words from K sampled Activation Oracle answers (the released Qwen3 adapter, activations from the read
     positions at half depth injected at layer 1's output, norm-matched and added: the paper's code) to the item's
-    question and to "What is the model thinking about?"; the logit lens (final norm and unembedding) at the read
+    question, to "What is the model thinking about?" and to "What entity is being thought about?"; the logit lens (final norm and unembedding) at the read
     positions over the layers from half depth up; Patchscopes as that paper's code runs it (the same injection into
     the target model itself, no oracle adapter, asked "What is this?"), each read position alone.
   check: per candidate word c, a direction per layer in the band from a quarter to three quarters of the depth: the
@@ -60,6 +60,7 @@ WORDS: set = set()  # an English word list (dwyl's words_alpha, 370k): the logit
 SINGLE = "Answer with a single word only. "
 Q_THINK = SINGLE + "What is the model thinking about?"
 Q_TABOO = SINGLE + "What is the secret word in this text?"
+Q_ENTITY = SINGLE + "What entity is being thought about?"
 Q_PATCH = "Respond with only the answer and no other words. What is this?"
 TEMPLATES = ["{w}", "The word is {w}.", "I am thinking of {w}.", "This text is about {w}.", "Here is something about {w}:",
              "Let me tell you about {w}", "A short note on {w}.", "Everyone knows {w}."]
@@ -400,7 +401,7 @@ class Target:
 def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
     torch = tg.torch
     ids = tg.ids(item)
-    start = len(ids) - READ
+    start = max(1, len(ids) - READ)  # never the first token: its residual is the attention sink's (dev: 4-6 nats of damage)
     out = {"id": item["id"], "task": item["task"], "truth": item["truth"]}
     with tg.use(item["adapter"]):
         H, logits = tg.hidden(ids)
@@ -436,13 +437,13 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
                                 lens[w] = max(lens[w], v)
         # Patchscopes as the oracle paper's code runs it: the same injection into the target itself, each read position
         patch = Counter()
-        for p in range(READ):
+        for p in range(acts.shape[0]):
             got = tg.inject(Q_PATCH, acts[p:p + 1], 1, False, adapter_ao=False)
             for w in words(got[0])[:1]:
                 patch[w] += 1
     # the oracle on the target's activations (the oracle adapter in place of the target's)
     ao = {}
-    for q in dict.fromkeys([item["question"], Q_THINK]):
+    for q in dict.fromkeys([item["question"], Q_THINK, Q_ENTITY]):
         ao[q] = tg.inject(q, acts, K, True, adapter_ao=True)
     out["ao"] = ao
     votes = Counter(norm(ws[0]) for ws in (words(x) for x in ao[item["question"]]) if ws)
@@ -463,7 +464,7 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
     # words the text shows (the prompt, the target's own output, the queries) are not hidden: ablating a word of the
     # reply or the answer itself moves that behaviour trivially (dev: 'Paris', 'Certainly' verified)
     shown_text = " ".join([item.get("text", "")] + [m["content"] for m in item.get("messages", [])] + [out.get("reply", ""), out.get("hint", ""),
-                          out.get("model_top", ""), item["question"], Q_THINK, Q_PATCH, HINT, "Layer"])
+                          out.get("model_top", ""), item["question"], Q_THINK, Q_ENTITY, Q_PATCH, HINT, "Layer"])
     visible = {norm(w) for w in re.findall(r"[^\W\d_]+", shown_text)}
     out["ao_answer_hidden"] = next((shown.get(w) for w, _ in votes.most_common() if w not in visible), None)
     cand = {}
@@ -485,10 +486,10 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
         if item["task"] == "multihop":
             for text in CONTROL_HOP:
                 c = tg.tok(text, add_special_tokens=False)["input_ids"]
-                controls.append((c, max(0, len(c) - READ), None, [int(tg.hidden(c)[1][-1].argmax())]))
+                controls.append((c, max(1, len(c) - READ), None, [int(tg.hidden(c)[1][-1].argmax())]))
         else:
             c = tg.ids({"messages": [{"role": "user", "content": CONTROL_CHAT}]})
-            controls.append((c + gen(c), max(0, len(c) - READ), len(c), None))
+            controls.append((c + gen(c), max(1, len(c) - READ), len(c), None))
         base = float(tg.behaviour(seq, start, score_from, answers)[0])
         cbase = [float(tg.behaviour(*x)[0]) for x in controls]
         eff, raw, dmg = {}, {}, {}
@@ -571,7 +572,12 @@ def ece(conf: list[float], ok: list[bool], bins: int = 5) -> float:
 
 
 def score(a) -> None:
-    rows = [json.loads(x) for x in a.out.read_text().splitlines()]
+    """Per task, the oracle alone against the verifier on the items whose ids the development file (--dev, the
+    Qwen3-1.7B items the procedure was tuned on) does not list; rows of one item from two runs count once."""
+    dev = {json.loads(x)["id"] for x in a.dev.read_text().splitlines()} if a.dev and a.dev.exists() else set()
+    rows = list({r["id"]: r for r in (json.loads(x) for f in a.out for x in f.read_text().splitlines())}.values())
+    print(f"{len(rows)} items; {sum(r['id'] in dev for r in rows)} development items left out")
+    rows = [r for r in rows if r["id"] not in dev]
     for task in sorted({r["task"] for r in rows}):
         rs = [r for r in rows if r["task"] == task and r.get("model_correct", True)]
         if not rs:
@@ -613,7 +619,8 @@ def main():
     r.add_argument("--device")
     r.add_argument("--words", type=Path, default=ROOT / "words_alpha.txt", help="the word list lens candidates must be in")
     s = sub.add_parser("score")
-    s.add_argument("out", type=Path)
+    s.add_argument("out", type=Path, nargs="+")
+    s.add_argument("--dev", type=Path, default=ROOT / "dev_ids.jsonl")
     a = ap.parse_args()
     {"items": items, "run": run, "score": score}[a.what](a)
 

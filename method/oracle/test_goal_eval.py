@@ -1684,21 +1684,26 @@ def test_interchange_path_patched(tiny):
     assert "s_track" not in row["c_terms"] and "s_interchange" not in row["c_terms"]
 
 
-def test_interchange_panel_is_the_texts(tiny):
+def test_interchange_own_positions(tiny):
     """interchange_pp draws at the text's panel (the targets, the START's candidates and a behavior's minimal pairs),
-    the same for every circuit; the model's response is the real model on the changed text; a circuit with no node at a draw's
-    position predicts no change there (KL_C = W)."""
+    and each circuit is scored on the draws at the targets and its own positions alone (the lead's 10-14), VPD's
+    whole answer on every draw; the model's response is the real model on the changed text; a circuit with no node at
+    a draw's position predicts no change there (KL_C = W)."""
     nat, ge, tx = tiny
     every = sorted(native.Graph(masks=tx.vpd).node_set())
     panel = ge._interchange_panel(tx, "search")
     assert panel == sorted(t for t in set(tx.targets) | set(ge.start_candidates(tx)[:goal_eval.START_CAP]) if 0 < t < tx.T)
     far = [nd for nd in every if nd[1] not in panel][:4] or every[:1]
+    got = ge._interchange_refs(tx, "search", 4)[0]
     rows = ge.interchange_pp(tx, [native.Graph(masks=tx.vpd), native.Graph(far, complete=True)], "search", 4)
-    assert [d[0] for d in rows[0]["draws_interchange_pp"]] == [d[0] for d in rows[1]["draws_interchange_pp"]]
-    for (p, z), kc, kv, w in rows[1]["draws_interchange_pp"]:
+    own = set(tx.targets) | {nd[1] for nd in far}
+    assert [tuple(d[0]) for d in rows[1]["draws_interchange_pp"]] == [pz for pz in got if pz[0] in own]
+    kv = {tuple(d[0]): d[2] for d in rows[0]["draws_interchange_pp"]}
+    for (p, z), kc, kvp, w in rows[1]["draws_interchange_pp"]:
         x2 = list(tx.ids)
         x2[p] = z
         assert abs(w - float(carry.kl(nat.reference([x2], tx.targets), tx.ref)[0])) < 1e-4 * max(1.0, w)
+        assert abs(kvp - kv[(p, z)]) < 1e-4 * max(1.0, kvp)
         if not any(nd[1] == p for nd in far):
             assert abs(kc - w) < 1e-4 * max(1.0, w)
 

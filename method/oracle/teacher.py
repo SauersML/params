@@ -1292,7 +1292,7 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
     if phi_pool is not None:                                 # every stage on the search split, scored by the reward's
         tau = ge.tau(tx, phi_pool, "search")                 # circuit term (goal_eval.circuit_term); written: the highest
         rec["phi"], best = [], None                          # among the stages whose full row has no family under its
-        rec["stage_nodes"] = {}                              # floor (v = 0), else the start: the floors acceptance's
+        rec["stage_nodes"] = {}                              # floor (v = 0), else the lowest shortfall: the floors acceptance's
         for name, on_s in reversed(snaps):                   # phi_variants rows (8 draws) passed 9 of fleet's 85 v2
             g_s = graph_of(on_s)                             # teachers that their own full rows put 0.02-0.03 under one
             rec["stage_nodes"][name] = [list(nd) for nd in sorted(g_s.node_set())]   # (each stage kept for re-picks)
@@ -1307,8 +1307,10 @@ def set_search(ge: goal_eval.GoalEval, tx: goal_eval.Text, empty: float, vpd: fl
                 + " ".join(f"{f} {v:.3f}" for f, v in fam.items() if v is not None), flush=True)
             if ct["v"] == 0 and (best is None or score > best[0]):
                 best = (score, name, on_s)                   # ties: the finer stage
-        if best is None:                                     # (no stage at its floors: the start)
-            best = next((r[6], r[0], on_s) for r, (_, on_s) in zip(reversed(rec["phi"]), snaps) if r[0] == "start")
+        if best is None:                                     # no stage at its floors: the one of the lowest shortfall,
+            r, (_, on_s) = min(zip(reversed(rec["phi"]), snaps), key=lambda z: (z[0][7], z[0][3]))   # then the smaller
+            best = (r[6], r[0], on_s)                        # (the lead's 10-14: text9000's START 1,522 parts at v 0.52
+                                                             # was written over its 59-part stage at 0.19; final records the failure)
         pr.on, rec["phi_stage"], rec["score"] = best[2].clone(), best[1], best[0]
     g = graph_of(pr.on)                                      # own_rule's numbers per context position, a diagnostic: the
     held = {t for _, t, _ in g.node_set()} - set(tx.targets)  # written circuit's, and the START's positions pruned away

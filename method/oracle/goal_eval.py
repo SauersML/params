@@ -2617,7 +2617,8 @@ class GoalEval:
         text's own (the lead's 10-13: drawn at each circuit's positions, a circuit placed where the behavior does not
         read matched the unmoved model trivially; CausalGym's attractor scored above the variable on 0.91 of pairs):
         the interchange draws (_interchange_draws) at the panel's positions (_interchange_panel: the start's and the
-        task's minimal pairs'), the same for every circuit; per draw (p, z) the model's response is the real model on
+        task's minimal pairs'), each circuit scored on those at the targets and its own positions (_interchange_own,
+        the lead's 10-14: input scope alone judges a position it leaves out); per draw (p, z) the model's response is the real model on
         the changed text x' (no circuit in it), VPD's prediction its whole answer's run with its actives at p at their
         values on x', and the circuit's its nodes at p held there (a block: the site's whole output), their stated paths
         carrying them in the path-patched run on the text (pp_run, fixed), everything else at x: a circuit with no node
@@ -2631,11 +2632,22 @@ class GoalEval:
         return self._interchange_graphs(tx, [strand(g, tx.targets, self.nat.C) for g in graphs], split, draws)
 
     def _interchange_panel(self, tx: Text, split: str) -> list[int]:
-        """interchange_pp's positions on a text, whatever the circuit: the targets, the START's candidates
+        """interchange_pp's draw positions on a text, whatever the circuit: the targets, the START's candidates
         (start_candidates, at most START_CAP: the START itself is chosen by rows that score this family) and a
-        behavior's minimal pairs' (tx.behavior_pairs), position 0 aside."""
+        behavior's minimal pairs' (tx.behavior_pairs), position 0 aside. Each circuit is scored on the draws at its
+        own positions alone (_interchange_own)."""
         own = {p for p, _ in getattr(tx, "behavior_pairs", [])}
         return sorted(t for t in set(tx.targets) | set(self.start_candidates(tx)[:START_CAP]) | own if 0 < t < tx.T)
+
+    @staticmethod
+    def _interchange_own(tx: Text, got: list, nodes) -> list[int]:
+        """The panel draws a circuit is scored on (the lead's 10-14): those at the targets, a behavior's minimal pairs'
+        positions and the circuit's own positions. Input scope alone penalizes a position the circuit leaves out. Scored
+        on every START candidate, a circuit with no node at one predicts no change there, so on 21 v24 dev teachers the
+        floors refused 4,452 removals for interchange_pp and 10 of the 18 passing teachers equalled their START. VPD's
+        whole answer scores 1 on any subset of draws (KL_C = KL_VPD), so the floor is the same 0.9 on every panel."""
+        own = set(tx.targets) | {p for p, _ in getattr(tx, "behavior_pairs", [])} | {t for _, t, _ in nodes}
+        return [i for i, (p, _) in enumerate(got) if p in own]
 
     def _interchange_refs(self, tx: Text, split: str, draws: int) -> tuple:
         """interchange_pp's draws and references on a text (kept on tx): (draws [(p, z)], the changed texts' records
@@ -2670,7 +2682,8 @@ class GoalEval:
                 "s_interchange_pp_raw": _ratio_pool(rec, raw=True)}
 
     def _interchange_graphs(self, tx: Text, graphs: list[native.Graph], split: str, draws: int) -> list[dict]:
-        """interchange_pp of graphs as given (stranding is the caller's), every graph on the text's panel draws."""
+        """interchange_pp of graphs as given (stranding is the caller's), each graph on the text's panel draws at its own
+        positions (_interchange_own)."""
         nat = self.nat
         got, recs, lm, W, KV = self._interchange_refs(tx, split, draws)
         empty = {"s_interchange_pp": None, "prompts_interchange_pp": 0, "draws_interchange_pp": [], "s_interchange_pp_raw": None}
@@ -2679,19 +2692,24 @@ class GoalEval:
         out = []
         for g in graphs:
             nodes = sorted(g.node_set())
+            idx = self._interchange_own(tx, got, nodes)  # the draws at its own positions
+            if not idx:
+                out.append(dict(empty))
+                continue
             helds = []
-            for p, z in got:
-                r2 = recs[(p, z)]
+            for i in idx:
+                r2 = recs[got[i]]
                 helds.append({(n, t, c): (r2["a"][n][t] @ nat.target.site(n).U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c])
-                              for n, t, c in nodes if t == p})
+                              for n, t, c in nodes if t == got[i][0]})
             lc = self._pp_engine(tx).path_patched([g], helds)[0]  # pp_run(fixed=)'s numbers
-            out.append(self._interchange_row(got, carry.kl(lm, lc).tolist(), KV, W))
+            out.append(self._interchange_row([got[i] for i in idx], carry.kl(lm[idx], lc).tolist(), [KV[i] for i in idx],
+                                             [W[i] for i in idx]))
             native.free(nat.dev)
         return out
 
     def _interchange_lines(self, tx: Text, graph: native.Graph, split: str, draws: int, lines: torch.Tensor) -> list[dict]:
         """interchange_pp of graph's line deletions (lines [K, L], Engine.pp_lines' columns of the stranded graph):
-        every variant on the text's panel draws (the references are the text's), its circuit runs in one
+        every variant on the text's panel draws at its own positions (_interchange_own; the references are the text's), its circuit runs in one
         Engine.path_patched(lines=) call holding the answer's nodes at p (a deleted node is no longer the graph's, so its
         value drops out)."""
         nat = self.nat
@@ -2708,9 +2726,12 @@ class GoalEval:
             helds.append({(n, t, c): (r2["a"][n][t] @ nat.target.site(n).U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c])
                           for n, t, c in nodes if t == p})
         circ = E.path_patched([g], helds, lines=lines)  # [K, D, targets, V]
+        on = lines[:, :len(nodes)].bool().tolist()       # each variant's nodes (pp_lines' node columns come first)
         out = []
         for k in range(len(lines)):
-            out.append(self._interchange_row(got, carry.kl(lm, circ[k]).tolist(), KV, W))
+            idx = self._interchange_own(tx, got, [nd for nd, o in zip(nodes, on[k]) if o])
+            kl = carry.kl(lm, circ[k]).tolist()
+            out.append(self._interchange_row([got[i] for i in idx], [kl[i] for i in idx], [KV[i] for i in idx], [W[i] for i in idx]))
         native.free(nat.dev)
         return out
 

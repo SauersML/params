@@ -676,10 +676,10 @@ def test_set_search_writes_the_highest_scoring_stage():
     assert [x[0] for x in rec["phi"]] == ["chunk4", "site", "start"] and len(calls) == 4  # the stages, the written
     for (name, ph, bar, n, fam, bits, score, v), (t, b, ct) in zip(rec["phi"], calls[:3]):
         assert t is tau and b == bits and score == ct["term"] and v == ct["v"] and bar == tau["phi_tau"]
-    # written: the highest among the stages with no family under its floor on their full row (v = 0), else the start;
-    # every stage's node set kept for re-picks
+    # written: the highest among the stages with no family under its floor on their full row (v = 0), else the one of
+    # the lowest shortfall, then the smaller; every stage's node set kept for re-picks
     ok = [x for x in rec["phi"] if x[7] == 0]
-    best = max(ok, key=lambda x: x[6]) if ok else next(x for x in rec["phi"] if x[0] == "start")
+    best = max(ok, key=lambda x: x[6]) if ok else min(reversed(rec["phi"]), key=lambda x: (x[7], x[3]))
     assert rec["phi_stage"] == best[0] and {k: len(v) for k, v in rec["stage_nodes"].items()} == {x[0]: x[3] for x in rec["phi"]}
     # then own_rule's numbers per context position (a diagnostic): the written circuit's, and the START's positions
     # pruned away; the final verdict is the written circuit's

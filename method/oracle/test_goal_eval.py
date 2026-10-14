@@ -1708,6 +1708,41 @@ def test_interchange_own_positions(tiny):
             assert abs(kc - w) < 1e-4 * max(1.0, w)
 
 
+def test_interchange_rows(tiny):
+    """_interchange_refs keeps each changed text's rows at its own position alone (the whole records, every site
+    [T, C] per draw, took most of the teacher's GPU memory), equal to _pp_record's there; interchange_pp's numbers on
+    a graph of subcomponents and blocks, and on its line deletions, are those of the held values read from the whole
+    records, bit for bit."""
+    nat, ge, tx = tiny
+    tx.__dict__.pop("_ipp_refs", None)
+    got, recs, lm, W, KV = ge._interchange_refs(tx, "search", 4)
+    assert got
+    for p, z in got:
+        x2 = list(tx.ids)
+        x2[p] = z
+        r2 = ge._pp_record(x2)
+        for n in nat.names:
+            assert torch.equal(recs[(p, z)]["a"][n], r2["a"][n][p]) and torch.equal(recs[(p, z)]["rem"][n], r2["rem"][n][p])
+    every = sorted(native.Graph(masks=tx.vpd).node_set())
+    blocks = sorted({(n, t, goal_eval.BLOCK) for n, t, _ in every[1::4]})
+    nodes = [nd for nd in every[::2] if (nd[0], nd[1], goal_eval.BLOCK) not in blocks] + blocks
+    g = goal_eval.strand(native.Graph(nodes, complete=True), tx.targets, nat.C)
+    E = ge._pp_engine(tx)
+    own = sorted(g.node_set())
+    idx = ge._interchange_own(tx, got, own)
+    with torch.no_grad():
+        whole = [_pp_holds(ge, tx, nat, own, p, z) for p, z in got]
+        lc = E.path_patched([g], [whole[i] for i in idx])[0]
+        row = ge.interchange_pp(tx, [g], "search", 4)[0]
+        assert [d[1] for d in row["draws_interchange_pp"]] == carry.kl(lm[idx], lc).tolist()
+        cols = E.pp_lines(g)
+        lines = (torch.rand(3, len(cols), generator=torch.Generator().manual_seed(4)) < 0.7).float()
+        circ = E.path_patched([g], whole, lines=lines)
+        for k, r in enumerate(ge.interchange_pp(tx, [g], "search", 4, lines=lines)):
+            kl = carry.kl(lm, circ[k]).tolist()
+            assert [d[1] for d in r["draws_interchange_pp"]] == [kl[got.index(tuple(d[0]))] for d in r["draws_interchange_pp"]]
+
+
 def test_true_pattern_family(tiny):
     """pattern_family: the whole model with its own attention rows put back is the model; VPD's answer scores 1; a
     circuit without an attention output has no reads to replace; fidelity reports s_pattern."""

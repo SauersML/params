@@ -745,3 +745,18 @@ def test_family_acceptance_scores_as_fidelity():
     # phi's families in acceptance are fidelity's own numbers
     for k in ("s_nodes", "s_edges", "s_pattern"):
         assert (got[k] is None) == (row.get(k) is None) and (got[k] is None or abs(got[k] - row[k]) < 1e-5), (k, got[k], row.get(k))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_storages():
+    """memory_log's cache attribution (cuda_storages) counts each CUDA storage once (a view of a tensor shares its
+    storage), through dicts, sequences and attributes, and leaves out CPU tensors, the storages already seen (the
+    model's weights) and the model itself unless asked."""
+    a = torch.zeros(1024, 256, device="cuda")
+    o = type("O", (), {})()
+    o.x, o.cpu = {"k": [a, (a[3], torch.ones(10, device="cuda"))]}, torch.zeros(5)
+    seen = set()
+    assert teacher.cuda_storages(o, seen) == a.numel() * 4 + 40
+    assert teacher.cuda_storages({"again": a[1:]}, seen) == 0
+    m = torch.nn.Linear(4, 4).cuda()
+    assert teacher.cuda_storages([m], set()) == 0 and teacher.cuda_storages(m, set(), model=True) == (16 + 4) * 4

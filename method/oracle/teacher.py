@@ -100,8 +100,10 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -2137,19 +2139,52 @@ def teach(ge: goal_eval.GoalEval, ids: list[int], targets: list[int], B: int = 3
     return circuits, row, path_file
 
 
+def cuda_storages(obj, seen: set, depth: int = 0, model: bool = False) -> int:
+    """Bytes of the CUDA tensors obj reaches (through dicts, sequences and object attributes) whose storages are not in
+    seen, each storage once (added to seen); a GoalEval (memory_log counts its own) and the model (a Native, a torch
+    module, unless model) left out."""
+    if isinstance(obj, torch.Tensor):
+        if obj.device.type != "cuda" or obj.untyped_storage().data_ptr() in seen:
+            return 0
+        seen.add(obj.untyped_storage().data_ptr())
+        return obj.untyped_storage().nbytes()
+    if depth > 8 or isinstance(obj, (str, bytes, int, float, type, types.ModuleType, goal_eval.GoalEval)) or \
+            not model and isinstance(obj, (native.Native, torch.nn.Module)):
+        return 0
+    if isinstance(obj, dict):
+        return sum(cuda_storages(v, seen, depth + 1, model) for v in obj.values())
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return sum(cuda_storages(v, seen, depth + 1, model) for v in obj)
+    return cuda_storages(vars(obj), seen, depth + 1, model) if hasattr(obj, "__dict__") else 0
+
+
 def memory_log(path: Path) -> None:
     """Peak GPU memory per stage (--mem): every GoalEval method, Pruner.prune per level (prune:<level>), reward_row,
     Acceptance's and Validated's methods and the search functions, each call's torch.cuda.max_memory_allocated and
     max_memory_reserved in GiB (a nested call's peak counts in its callers too), their maxima and counts per label and
-    the calls up to three deep in order with their depth, written to path as they end (the profile behind the
-    2-per-card memory budget). Nothing without CUDA."""
+    the calls up to three deep in order with their depth, the memory still allocated when they end and its share in
+    each cache the text being taught, the GoalEval and its Native hold (their __dict__s' CUDA tensors by key, ge.<key>
+    the GoalEval's, nat.<key> the Native's, the model's weights when first seen left out), written to path as they end
+    (the profile behind the 2-per-card memory budget). Nothing without CUDA."""
     import functools
     import inspect
 
     if not torch.cuda.is_available():
         return
+    import weakref
+
     GiB = 2 ** 30
-    stack, stats, order = [[0, 0]], {}, []
+    stack, stats, order, text, evaluator, weights = [[0, 0]], {}, [], [lambda: None], [lambda: None], []
+
+    def caches():  # GiB per key of the taught text's, the GoalEval's and its Native's __dict__s
+        ge = evaluator[0]()
+        if not weights or ge is None:
+            return {}
+        seen, out = set(weights[0]), {}
+        for pre, ob in (("", text[0]()), ("ge.", ge), ("nat.", ge.nat)):
+            out.update({pre + k: round(cuda_storages(v, seen, model=pre == "nat.") / GiB, 3)
+                        for k, v in (vars(ob) if ob is not None else {}).items()})
+        return {k: v for k, v in out.items() if v >= 0.01}
 
     def peaks():
         return torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
@@ -2160,6 +2195,13 @@ def memory_log(path: Path) -> None:
             return
         @functools.wraps(f)
         def g(*a, **k):
+            if len(a) > 1 and isinstance(a[1], goal_eval.Text) and text[0]() is not a[1]:
+                text[0] = weakref.ref(a[1])
+                if not weights and isinstance(a[0], goal_eval.GoalEval):
+                    seen = set()
+                    cuda_storages(a[0].nat, seen, model=True)
+                    weights.append(seen)
+                    evaluator[0] = weakref.ref(a[0])
             pa, pr = peaks()
             stack[-1] = [max(stack[-1][0], pa), max(stack[-1][1], pr)]
             torch.cuda.reset_peak_memory_stats()
@@ -2178,7 +2220,8 @@ def memory_log(path: Path) -> None:
                 st["reserved_gib"] = max(st["reserved_gib"], m[1] / GiB)
                 st["calls"] += 1
                 if len(stack) <= 3:  # the calls three deep (teach, set_search, its stages): rows in order, the file rewritten
-                    order.append([len(stack), lab, round(m[0] / GiB, 3), round(m[1] / GiB, 3)])
+                    order.append([len(stack), lab, round(m[0] / GiB, 3), round(m[1] / GiB, 3),
+                                  round(torch.cuda.memory_allocated() / GiB, 3), caches()])
                     path.write_text(json.dumps({"stats": stats, "order": order}, indent=1))
         g._memory_logged = True
         setattr(owner, name, g)
@@ -2199,6 +2242,9 @@ def memory_log(path: Path) -> None:
 
 def main():
     global RANK, VAL_EVERY
+    # CUDA's allocator in expandable segments (read at its first allocation): text9008 at 2d5e59e reserved 27.9 GiB
+    # for a 21.0 GiB peak in fixed blocks, the gap that kept two teachers from one 48 GB card; the numbers are the same
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--split", default="heldout")
     ap.add_argument("--n", type=int, default=20)

@@ -2653,9 +2653,11 @@ class GoalEval:
         return [i for i, (p, _) in enumerate(got) if p in own]
 
     def _interchange_refs(self, tx: Text, split: str, draws: int) -> tuple:
-        """interchange_pp's draws and references on a text (kept on tx): (draws [(p, z)], the changed texts' records
-        {(p, z): _pp_record}, the real model on each changed text [D, targets, V], W per draw, KL_V per draw (VPD's
-        answer with its actives at p at their values on x'))."""
+        """interchange_pp's draws and references on a text (kept on tx): (draws [(p, z)], the changed texts' rows at
+        their own position {(p, z): {"a": {site: [C]}, "rem": {site: [d_out]}}} (_pp_record's at p, the only ones a
+        held value reads; the whole records, every site [T, C] per draw, took most of the teacher's GPU memory), the
+        real model on each changed text [D, targets, V], W per draw, KL_V per draw (VPD's answer with its actives at p
+        at their values on x'))."""
         kept = tx.__dict__.setdefault("_ipp_refs", {})
         if (split, draws) not in kept:
             nat = self.nat
@@ -2665,9 +2667,10 @@ class GoalEval:
             for p, z in got:
                 x2 = list(tx.ids)
                 x2[p] = z
-                recs[(p, z)] = r2 = self._pp_record(x2)
+                r2 = self._pp_record(x2)
+                recs[(p, z)] = r2 = {f: {n: r2[f][n][p].clone() for n in nat.names} for f in ("a", "rem")}
                 lm.append(nat.reference([x2], tx.targets))
-                vh.append({(n, p, c): r2["a"][n][p, c] for n in nat.names for c in tx.vpd[n][p].nonzero().flatten().tolist()})
+                vh.append({(n, p, c): r2["a"][n][c] for n in nat.names for c in tx.vpd[n][p].nonzero().flatten().tolist()})
             W = KV = []
             if got:
                 lm = torch.cat(lm)
@@ -2676,6 +2679,12 @@ class GoalEval:
                 native.free(nat.dev)
             kept[(split, draws)] = (got, recs, lm, W, KV)
         return kept[(split, draws)]
+
+    def _interchange_held(self, r2: dict, nodes, p: int) -> dict:
+        """A draw's held values (path_patched's {node: value}): the nodes at p at their values on the changed text, a
+        subcomponent its activation, a block its site's whole output; r2 the draw's rows at p (_interchange_refs)."""
+        return {(n, t, c): (r2["a"][n] @ self.nat.target.site(n).U + r2["rem"][n] if c == BLOCK else r2["a"][n][c])
+                for n, t, c in nodes if t == p}
 
     @staticmethod
     def _interchange_row(got: list, kc: list, kv: list, w: list) -> dict:
@@ -2699,11 +2708,7 @@ class GoalEval:
             if not idx:
                 out.append(dict(empty))
                 continue
-            helds = []
-            for i in idx:
-                r2 = recs[got[i]]
-                helds.append({(n, t, c): (r2["a"][n][t] @ nat.target.site(n).U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c])
-                              for n, t, c in nodes if t == got[i][0]})
+            helds = [self._interchange_held(recs[got[i]], nodes, got[i][0]) for i in idx]
             lc = self._pp_engine(tx).path_patched([g], helds)[0]  # pp_run(fixed=)'s numbers
             out.append(self._interchange_row([got[i] for i in idx], carry.kl(lm[idx], lc).tolist(), [KV[i] for i in idx],
                                              [W[i] for i in idx]))
@@ -2723,11 +2728,7 @@ class GoalEval:
                     for _ in range(len(lines))]
         E = self._pp_engine(tx)
         nodes = [k[1] for k in E.pp_lines(g) if k[0] == "n"]
-        helds = []
-        for p, z in got:
-            r2 = recs[(p, z)]
-            helds.append({(n, t, c): (r2["a"][n][t] @ nat.target.site(n).U + r2["rem"][n][t] if c == BLOCK else r2["a"][n][t, c])
-                          for n, t, c in nodes if t == p})
+        helds = [self._interchange_held(recs[pz], nodes, pz[0]) for pz in got]
         circ = E.path_patched([g], helds, lines=lines)  # [K, D, targets, V]
         on = lines[:, :len(nodes)].bool().tolist()       # each variant's nodes (pp_lines' node columns come first)
         out = []

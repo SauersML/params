@@ -407,10 +407,19 @@ def params_touched(nat, nodes) -> int:
 
 
 def build_seconds(path: Path) -> float | None:
-    """A circuit's build time: its own "build_seconds", else the teacher's summary row for its task beside it."""
+    """A circuit's build time: its own "build_seconds", else its "build" record's (builder_fast: "seconds", or its stages'
+    seconds summed), else the teacher's summary row for its task beside it."""
     d = json.loads(path.read_text())
     if d.get("build_seconds") is not None:
         return float(d["build_seconds"])
+    b = d.get("build")
+    if isinstance(b, dict):
+        if b.get("seconds") is not None:
+            return float(b["seconds"])
+        st = b.get("stages")
+        secs = [x.get("seconds") for x in (st.values() if isinstance(st, dict) else st or []) if isinstance(x, dict)]
+        if secs and all(x is not None for x in secs):
+            return float(sum(secs))
     got = None
     for f in sorted(path.parent.iterdir()):
         if f.name.startswith("summary") and f.suffix == ".jsonl":

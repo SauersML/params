@@ -2151,7 +2151,7 @@ def memory_log(path: Path) -> None:
         def g(*a, **k):
             pa, pr = peaks()
             stack[-1] = [max(stack[-1][0], pa), max(stack[-1][1], pr)]
-            torch.cuda.reset_peak_stats()
+            torch.cuda.reset_peak_memory_stats()
             stack.append([0, 0])
             try:
                 return f(*a, **k)
@@ -2160,7 +2160,7 @@ def memory_log(path: Path) -> None:
                 top = stack.pop()
                 m = [max(top[0], pa), max(top[1], pr)]
                 stack[-1] = [max(stack[-1][0], m[0]), max(stack[-1][1], m[1])]
-                torch.cuda.reset_peak_stats()
+                torch.cuda.reset_peak_memory_stats()
                 lab = label_of(a, k)
                 st = stats.setdefault(lab, {"allocated_gib": 0.0, "reserved_gib": 0.0, "calls": 0})
                 st["allocated_gib"] = max(st["allocated_gib"], m[0] / GiB)

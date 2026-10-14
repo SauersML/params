@@ -77,6 +77,32 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True)+'\n')
 
 
+def pipeline_protocol(panel_sha256, manifest_sha256, worlds):
+    """Prospective paired compiler policies, never outcome-conditioned repair."""
+    return {'schema_version':1, 'panel_sha256':panel_sha256,
+            'raw_scoring_manifest_sha256':manifest_sha256, 'arms':ARMS,
+            'all_cases':8, 'worlds_per_arm':worlds, 'first_response_only':True,
+            'pipelines':[
+                {'name':'raw_explicit', 'primary':True,
+                 'definition':'Execute exactly the original compiled nodes, parents and out.'},
+                {'name':'same_selected_architecture_completion', 'primary':False,
+                 'definition':'From the SAME original compiled node_set, use native.all_edges(sorted(nodes),targets), Graph(nodes,parents,out,complete=False); no additional units.'}],
+            'selection_policy':'Report both pipelines for every role and every case; never select best per case.',
+            'invalid_policy':'Original missing, LENGTH, parse and native-invalid responses remain invalid in both pipelines; no text repair or graph construction from invalid responses.',
+            'execution':'Compile original pieces before literal edits; live=False,u=None,outside=None,hold=False,freeze empty; own routing and norms. Full architecture live=True is integrity only.',
+            'invariants':['exact selected-node set/count equality',
+                          'original parents/out subset of completed legal connections',
+                          'original graph immutable', 'literal edit restoration',
+                          'same dense reference and edit world for both pipelines'],
+            'reporting':['fixed model-level denominator', 'all invalids retained',
+                         'individual versus joint fidelity', 'prior-pass damage',
+                         'executed node and edge counts and description cost for both'],
+            'raw_forward_cap':worlds*(2+len(ARMS)),
+            'combined_forward_cap':worlds*(2+2*len(ARMS)),
+            'additional_llm_calls':0,
+            'scope':'Prospective fresh known-family model evaluation; completion is a separately declared compiler baseline, not faithful oracle edge prediction or English certification.'}
+
+
 def build(args):
     if sha(args.bank/'manifest.json') != args.bank_sha256 or args.out.exists():
         raise RuntimeError('frozen input bank and fresh output required')
@@ -142,9 +168,12 @@ def build(args):
                 'prompt_rule':'unchanged frozen original TRAIN input format, no detail/hints or output clarification',
                 'panel_rule':'all architecture heads/nonzero dense downcolumns individual0/.5; six hash-selected pairs times four Cartesian scales'}
     write(args.out/'scoring_manifest.json', manifest)
+    write(args.out/'pipeline_protocol.json', pipeline_protocol(
+        sha(args.out/'panel.jsonl'), sha(args.out/'scoring_manifest.json'), worlds))
     write(args.out/'complete.json', {'status':'prepared_unmeasured', 'cases':8, 'worlds':worlds,
           'candidate_worlds':5*worlds, 'forward_cap':7*worlds, 'native_forwards':0, 'teacher_forwards':0,
           'panel_sha256':sha(args.out/'panel.jsonl'), 'scoring_manifest_sha256':sha(args.out/'scoring_manifest.json'),
+          'pipeline_protocol_sha256':sha(args.out/'pipeline_protocol.json'),
           'producer_source_sha256':sha(__file__), 'bank_sha256':args.bank_sha256,
           'renderer_sha256':bank['renderer_sha256'], 'statuses':statuses})
     return manifest

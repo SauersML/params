@@ -55,6 +55,17 @@ class FreshEvaluationTests(unittest.TestCase):
                             for scales in pairs.values()))
         self.assertEqual(f.ARMS, ['base', 'point24', 'intervention24', 'point35', 'intervention35'])
 
+    def test_both_pipelines_are_fixed_for_all_roles_without_extra_calls(self):
+        protocol = f.pipeline_protocol('panel', 'manifest', 1480)
+        self.assertEqual(protocol['raw_forward_cap'], 10360)
+        self.assertEqual(protocol['combined_forward_cap'], 17760)
+        self.assertEqual(protocol['additional_llm_calls'], 0)
+        self.assertEqual([p['name'] for p in protocol['pipelines']],
+                         ['raw_explicit', 'same_selected_architecture_completion'])
+        self.assertEqual(protocol['arms'], f.ARMS)
+        self.assertIn('never select best per case', protocol['selection_policy'])
+        self.assertIn('remain invalid in both', protocol['invalid_policy'])
+
 
 if __name__ == '__main__':
     unittest.main()

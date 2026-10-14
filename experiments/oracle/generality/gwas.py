@@ -1527,7 +1527,8 @@ def causal_plan():
             where[n_] = (Y, i, sel)
     ids = np.load(INP / "corpus.npy").astype(np.int64)
     cur_all = ids[:, :SEQ]
-    plan = {"null_pool": [int(c) for c in rng.choice(np.flatnonzero(n_act >= 200), NULL_POOL, replace=False)], "hits": []}
+    plan = {"null_pool": [int(c) for c in rng.choice(np.flatnonzero(n_act >= 200), NULL_POOL, replace=False)], "hits": [],
+            "prefs": [[json.loads(x)["a"], json.loads(x)["b"]] for x in PREFS.read_text().splitlines()] if PREFS.exists() else []}
     for c, j in hits:
         how = _route(fams[j])
         h = {"subcomponent": c, "phenotype": names[j], "family": fams[j], "r": float(r[c, j]), "test": "removal" if how == "removal" else f"edit: {how}"}
@@ -1589,6 +1590,7 @@ def causal():
     plan = json.loads((OUT / "causal_plan.json" if (OUT / "causal_plan.json").exists() else INP / "causal_plan.json").read_text())
     rng = np.random.default_rng(2951)
     run = _Runner()
+    run.prefs = [tuple(x) for x in plan.get("prefs", [])] or run.prefs  # (a pod has the plan, not rustmove's file)
     out = {"hits": []}
     rows = np.load(INP / "replicate.npy").astype(np.int64)
     rem = [h for h in plan["hits"] if h["test"] == "removal" and not h["family"].startswith(("measured mechanism", "training-data"))]
@@ -1819,7 +1821,7 @@ def figure(r_min: float = 0.1):
                   rotation=60, ha="right", fontsize=12)
     cb = fig.colorbar(im, ax=ax, fraction=0.025)
     cb.set_label(f"share of the matrix's subcomponents\nwith |partial r| >= {r_min} at q < 0.05", fontsize=13)
-    ax.set_title("Which weight matrices hold subcomponents associated with each phenotype family")
+    ax.set_title("Share of each weight matrix's subcomponents associated with each phenotype family")
     fig.tight_layout()
     FIG.mkdir(parents=True, exist_ok=True)
     out = FIG / "gwas_families_by_matrix.png"
@@ -1827,10 +1829,60 @@ def figure(r_min: float = 0.1):
     print("wrote", out)
 
 
+def figure_causal():
+    """The causal follow-up (causal.json): per test, the share of the top hits confirmed by intervention, and for the
+    input edits the share of positions where the hit's activation falls by more than half against the share for the
+    other subcomponents active there -> FIG/gwas_causal.png."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    import figure as fg
+
+    d = json.loads((OUT / "causal.json").read_text())
+    tests = [("removal", "removing the subcomponent\n(the model's own phenotypes)"), ("edit: current", "changing the current token\n(word-level phenotypes)"),
+             ("edit: earlier", "changing the earlier occurrence\n(repeats)"), ("edit: context", "changing the 16 tokens before\n(context phenotypes)"),
+             ("edit: next", "changing the next token\n(next-token phenotypes)")]
+    fg.setup()
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(17, 7), gridspec_kw={"width_ratios": [1.1, 1]})
+    y = np.arange(len(tests))[::-1]
+    for yi, (k, lab) in zip(y, tests):
+        hs = [h for h in d["hits"] if h["test"] == k]
+        if not hs:
+            continue
+        v = np.mean([h["causal"] for h in hs])
+        a1.barh(yi, v, color=fg.BLUE, height=0.6)
+        a1.text(v + 0.02, yi, f"{sum(h['causal'] for h in hs)} of {len(hs)}", va="center", fontsize=14)
+    a1.set_yticks(y, [lab for _, lab in tests], fontsize=13)
+    a1.set_xlim(0, 1.15)
+    a1.set_xlabel("share of top hits whose intervention moves the phenotype\nor activation beyond the comparison")
+    fg.clean(a1)
+    ed = [t for t in tests if t[0].startswith("edit")]
+    y2 = np.arange(len(ed))[::-1]
+    for yi, (k, lab) in zip(y2, ed):
+        hs = [h for h in d["hits"] if h["test"] == k]
+        if not hs:
+            continue
+        a2.barh(yi + 0.18, np.mean([h["falls_by_half"] for h in hs]), height=0.34, color=fg.BLUE)
+        a2.barh(yi - 0.18, np.mean([h["coactive_falls_by_half"] for h in hs]), height=0.34, color=fg.SOFT)
+    a2.set_yticks(y2, [lab.split("\n")[0] for _, lab in ed], fontsize=13)
+    a2.set_xlim(0, 1.0)
+    a2.set_xlabel("share of positions where the activation\nfalls by more than half after the change")
+    a2.text(0.98, y2[-1] + 0.18, "the associated subcomponent", ha="right", va="center", fontsize=13, color=fg.BLUE)
+    a2.text(0.98, y2[-1] - 0.18, "other subcomponents active there", ha="right", va="center", fontsize=13, color=fg.INK)
+    fg.clean(a2)
+    fig.suptitle("Interventions on the strongest associations", fontsize=20, fontweight="bold", x=0.02, ha="left")
+    fig.tight_layout()
+    out = FIG / "gwas_causal.png"
+    fig.savefig(out, dpi=150)
+    print("wrote", out)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "annotate", "domain", "ngram", "export", "mech", "attention", "pheno", "assoc",
-                                    "calib", "nullscan", "calibrate", "table", "figure", "conditional", "causal_plan", "causal", "probe",
+                                    "calib", "nullscan", "calibrate", "table", "figure", "figure_causal", "conditional", "causal_plan", "causal", "probe",
                                     "assoc_prefs"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()

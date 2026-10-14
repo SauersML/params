@@ -133,7 +133,7 @@ def run(args):
                for r in manifest['panel'] for a in ARMS for p in PIPELINES
                for e in range(len(r['edits'])) for i in range(len(r['inputs']))}
     write(args.out/'coverage.json', {'planned_candidate_worlds':len(planned),
-          'planned_reference_worlds':1480,'completed_candidate_worlds':0,'actual_forwards':0})
+          'planned_reference_worlds':contract['reference_worlds'],'completed_candidate_worlds':0,'actual_forwards':0})
     results, forwards, graph_receipts = [], 0, []
     for case_index,item in enumerate(manifest['panel']):
         blob = torch.load(args.payload/item['weights'],map_location='cpu',weights_only=True)
@@ -146,7 +146,7 @@ def run(args):
                     'units':{n:tensor_digest(nat.units[n]) for n in nat.names}}
         original = state()
         write(args.out/(str(case_index)+'.original.json'),original)
-        graphs = {}
+        graphs, case_graph_receipts = {}, {}
         for policy in ARMS:
             answer = response_rows[policy][case_index]
             for input_index,ids in enumerate(item['inputs']):
@@ -166,10 +166,12 @@ def run(args):
                     else:
                         sizes[pipeline] = None
                     graphs[policy,pipeline,input_index] = graph
-                graph_receipts.append({'case':item['id'],'policy':policy,'input':input_index,
+                graph_receipt = {'case':item['id'],'policy':policy,'input':input_index,
                     'valid':raw is not None,'invalid_reason':reason,'completion_invariants':size,
-                    'size':sizes,'selected_nodes_sha256':None if raw is None else hashlib.sha256(json.dumps(sorted(raw.node_set())).encode()).hexdigest()})
-        write(args.out/(str(case_index)+'.graphs.json'),graph_receipts[-20:])
+                    'size':sizes,'selected_nodes_sha256':None if raw is None else hashlib.sha256(json.dumps(sorted(raw.node_set())).encode()).hexdigest()}
+                graph_receipts.append(graph_receipt)
+                case_graph_receipts[policy,input_index] = graph_receipt
+        write(args.out/(str(case_index)+'.graphs.json'),list(case_graph_receipts.values()))
         full = [native.Graph({(n,t,c) for n in nat.names for t in range(len(ids)) for c in range(int(nat.C[n]))},complete=True) for ids in item['inputs']]
         baselines = []
         for edit_index,edit in enumerate(item['edits']):
@@ -197,7 +199,7 @@ def run(args):
                     tensors['p0'] = baselines[input_index].contiguous()
                     world = []
                     for policy in ARMS:
-                        receipt_graph = graph_receipts[-20+ARMS.index(policy)*4+input_index]
+                        receipt_graph = case_graph_receipts[policy,input_index]
                         for pipeline in PIPELINES:
                             graph = graphs[policy,pipeline,input_index]
                             clear_intervention_caches(nat)
@@ -224,8 +226,8 @@ def run(args):
                         stream.flush()
                         __import__('os').fsync(stream.fileno())
                     # Partial coverage stays visible if the worker is interrupted.
-                    (args.out/'coverage.json').write_text(json.dumps({'planned_candidate_worlds':14800,
-                        'planned_reference_worlds':1480,'completed_candidate_worlds':len(results),
+                    (args.out/'coverage.json').write_text(json.dumps({'planned_candidate_worlds':contract['candidate_worlds'],
+                        'planned_reference_worlds':contract['reference_worlds'],'completed_candidate_worlds':len(results),
                         'actual_forwards':forwards})+'\n')
             clear_intervention_caches(nat)
             if state() != original:
@@ -234,12 +236,13 @@ def run(args):
         if sha(args.payload/item['weights']) != item['weights_sha256']:
             raise RuntimeError('fresh model asset changed during execution')
         print(json.dumps({'case':item['id'],'completed_candidate_worlds':len(results),'actual_forwards':forwards}),flush=True)
-    if forwards > 17760 or len(results) != 14800:
+    if forwards > contract['forward_cap'] or len(results) != contract['candidate_worlds']:
         raise RuntimeError('combined forward/coverage cap violated')
     summary = summarize(results,planned)
     write(args.out/'summary.json',summary)
-    write(args.out/'complete.json',{'actual_forwards':forwards,'forward_cap':17760,
-          'candidate_worlds':14800,'reference_worlds':1480,'model_policy_pairs_per_pipeline':40,
+    write(args.out/'complete.json',{'actual_forwards':forwards,'forward_cap':contract['forward_cap'],
+          'candidate_worlds':contract['candidate_worlds'],'reference_worlds':contract['reference_worlds'],
+          'model_policy_pairs_per_pipeline':len(manifest['panel'])*len(ARMS),
           'responses_sha256':args.responses_sha256,'scope':contract['scope']})
     print(json.dumps(summary),flush=True)
 

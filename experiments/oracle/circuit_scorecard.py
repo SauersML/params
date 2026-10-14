@@ -33,6 +33,7 @@ circuit) and OUT/summary.json, and prints the table.
 
   circuit_scorecard.py DIR_OR_FILE [...] --out OUT [--only text9000,... | --only dev20] [--pool FILE] [--vpd FILE ...] [--offset K --stride S]
   circuit_scorecard.py table OUT
+  circuit_scorecard.py add OUT CIRCUITS_DIR [--vpd FILE ...]   the mediated share, parameters and build seconds added to older records
 SC_CPU=1 keeps the run off the GPU (the Mac's GPU serves the RL scorer).
 """
 from __future__ import annotations
@@ -72,6 +73,7 @@ DEV20 = tuple(f"text{n}" for n in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 900
                                    9014, 9018, 9020, 9025, 9029, 9030, 9031, 9033, 9046, 9048))  # scored every iteration
 # (the lead's 10-14: the first ten, plus ten spread over length, 2-484 tokens, and the circuits' position counts, 2-15)
 ENTRIES = 2 ** 27  # mask floats per engine call (edit runs)
+SHARE_MIN = 0.1  # a mediated share is left undefined when the live drop is under this many bits
 LN2 = math.log(2.0)
 BATCH = 4  # reward rows per fidelity call
 KIND = {"MLP.up": "mlp.c_fc", "MLP.down": "mlp.down_proj", "Attn.o": "attn.o_proj", "Attn.v": "attn.v_proj",
@@ -306,6 +308,40 @@ def faith(pred: list, real: list) -> dict:
             "p90_abs_error": float(np.quantile(e, 0.9))}
 
 
+@torch.no_grad()
+def mediated_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, tops: list[list]) -> list[dict]:
+    """The mediated share of each removal set R (criterion 6, the lead's 10-14): the real model's drop in log2 p of its
+    prediction with R at 0, live (every other subcomponent and remainder computed) and mediated (every subcomponent
+    outside the circuit, nodes, and every remainder held at its value on the unedited text, the circuit's other
+    subcomponents computed; goal_eval.graph_ref's outside and hold), and their ratio."""
+    import engine
+
+    nat, T, dev = ge.nat, tx.T, ge.nat.dev
+    y = tx.ref[0].argmax(-1)
+
+    def lp(lq):
+        return float(lq[0].float().gather(-1, y.view(-1, 1)).sum() / LN2)
+    acts = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=None).x_values()["acts"]
+    ones = {n: torch.ones(T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
+    rest = {}
+    base = lp(ge.graph_ref(tx.ids, tx.targets, native.Graph(masks=ones), rest=rest))
+    circ = {n: torch.zeros(T, nat.C[n], dtype=torch.bool, device=dev) for n in nat.names}
+    for n, t, c in nodes:
+        circ[n][t, c] = True
+    out = []
+    for R in tops:
+        live, med, held = ({n: m.clone() for n, m in ones.items()}, {n: m.clone() for n, m in circ.items()},
+                           {n: a.clone() for n, a in acts.items()})
+        for n, t, c in R:
+            live[n][t, c] = med[n][t, c] = False
+            held[n][0, t, c] = 0.0
+        d_live = base - lp(ge.graph_ref(tx.ids, tx.targets, native.Graph(masks=live)))
+        d_med = base - lp(ge.graph_ref(tx.ids, tx.targets, native.Graph(masks=med), outside=held, hold=True, rest=rest))
+        out.append({"k": len(R), "live": d_live, "mediated": d_med, "share": d_med / d_live if abs(d_live) >= SHARE_MIN else None})
+        native.free(dev)
+    return out
+
+
 def edits(ge: goal_eval.GoalEval, tx: goal_eval.Text, g: native.Graph) -> dict:
     """Criterion 6 (module docstring): single removals of every part and the top 3 and 5 by real drop together."""
     nat = ge.nat
@@ -332,7 +368,43 @@ def edits(ge: goal_eval.GoalEval, tx: goal_eval.Text, g: native.Graph) -> dict:
                                 "inside": inside.get(k.rsplit("_", 1)[0], [True] * len(sets))[n1 + j]} for j, gname in enumerate(("top3", "top5"))})
         stats[k] = st
     out["stats"] = stats
+    out["mediated"] = mediated_vpd(ge, tx, nodes, [top[:1], top[:3], top[:5]])
     return out
+
+
+def params_touched(nat, nodes) -> int:
+    """The weights a circuit's units read and write, each counted once whatever its positions: a VPD subcomponent its V
+    column and U row (d_in + d_out), a neuron its input row and output column (2 d_model), a head its query, key, value
+    and output slices (4 hd d_model): units of different kinds compare by this beside their count."""
+    tg = nat.target
+    seen = {(nd[0], nd[1], nd[3]) if nd[0] in ("head", "neuron") else (nd[0], nd[2]) for nd in nodes}
+    d, hd = tg.wte.shape[1], tg.hd
+    total = 0
+    for u in seen:
+        if u[0] == "neuron":
+            total += 2 * d
+        elif u[0] == "head":
+            total += 4 * hd * d
+        else:
+            st = tg.site(u[0])
+            total += st.V.shape[0] + st.U.shape[1]
+    return total
+
+
+def build_seconds(path: Path) -> float | None:
+    """A circuit's build time: its own "build_seconds", else the teacher's summary row for its task beside it."""
+    d = json.loads(path.read_text())
+    if d.get("build_seconds") is not None:
+        return float(d["build_seconds"])
+    got = None
+    for f in sorted(path.parent.iterdir()):
+        if f.name.startswith("summary") and f.suffix == ".jsonl":
+            for line in f.read_text().splitlines():
+                if line.strip():
+                    r = json.loads(line)
+                    if r.get("task") == path.stem and r.get("seconds") is not None:
+                        got = float(r["seconds"])
+    return got
 
 
 def teacher_block(path: Path) -> dict | None:
@@ -417,7 +489,7 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
         for k, r in zip(mids, rows(ge, tx, [native.Graph(order[:k], complete=True) for k in mids], pool, log)):
             have[k] = judged(r, fl, fams)
         k_phi = first(lambda j: j["phi"] is not None and j["phi"] >= base["phi"])
-    rec["size"] = {"parts": len(nodes), "lines": None if g.complete else g.edges() + len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
+    rec["size"] = {"units": "vpd", "parts": len(nodes), "params": params_touched(nat, nodes), "build_seconds": build_seconds(path), "lines": None if g.complete else g.edges() + len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
                    "connections": None if g.complete else g.edges(),
                    "token_edges": None if g.complete else len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
                    "implied_lines": sum(native.implied_edges(nodes, tx.targets)) if g.complete else None,
@@ -461,6 +533,30 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
                      "part_effects": eff["parts"], "line_effects": eff["lines"]}
     done("stated")
     return rec
+
+
+def add(out: Path, circuits_dir: Path, vpd: dict | None) -> None:
+    """Records written before the mediated share, parameters touched and build seconds: those computed and added (the
+    circuit of each record from circuits_dir, by task)."""
+    ge = goal_eval.GoalEval(native.Native(), chunk=32)
+    for f in sorted(out.iterdir()):
+        if f.suffix != ".json" or f.name == "summary.json":
+            continue
+        rec = json.loads(f.read_text())
+        if "mediated" in rec.get("edits", {}) and "params" in rec.get("size", {}):
+            continue
+        path = circuits_dir / f.name
+        tp = task_path(path.stem)
+        tx = lines.text_of(ge, tp, vpd)
+        ed = rec["edits"]
+        nodes = [tuple(x) for x in ed["nodes"]]
+        at = dict(zip(ed["parts"], nodes))
+        top = [at[x] for x in ed["groups"]["top5"]]
+        ed["mediated"] = mediated_vpd(ge, tx, nodes, [top[:1], top[:3], top[:5]])
+        g, _, _ = goal_eval.load_answer(path, json.loads(tp.read_text()), tx.targets, ge.nat)
+        rec["size"].update({"units": "vpd", "params": params_touched(ge.nat, g.node_set()), "build_seconds": build_seconds(path)})
+        f.write_text(json.dumps(rec))
+        say(f"{path.stem}: mediated {[(m['k'], None if m['share'] is None else round(m['share'], 2)) for m in ed['mediated']]}")
 
 
 def wilson(k: int, n: int) -> list:
@@ -572,6 +668,9 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     a = ap.parse_args()
+    if str(a.paths[0]) == "add":  # add OUT CIRCUITS_DIR
+        add(a.paths[1], a.paths[2], {k: v for f in a.vpd for k, v in torch.load(f).items()} or None)
+        return
     if str(a.paths[0]) == "table":
         recs = load(a.paths[1])
         print(table(recs))

@@ -91,3 +91,67 @@ def test_nonempty_disconnected_gradient_still_fails(monkeypatch):
     monkeypatch.setattr(connect.native,'free',lambda *_:None)
     with pytest.raises(AttributeError,match='mean'):
         c.scores()
+
+
+def mean_ablated(nat, ids, targets, means, units):
+    """The mean-ablated run of a set of heads and neurons written out (native_units.MeanUnits' semantics): every
+    other unit at its mean, the embedding, norms and attention live; log q at the targets [len(targets), V]."""
+    m = nat.target
+    T, H, hd = len(ids), m.n_head, m.hd
+    on = set(units)
+    s = lambda L, k: m.site(f"h.{L}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")  # noqa: E731
+    x = m.embed(torch.tensor([ids]))[0]
+    for L in range(m.n_layer):
+        h = m.norm(x, 2 * L)
+        q, k, v = ((h @ s(L, n).W.T).view(T, H, hd).transpose(0, 1) for n in ("q_proj", "k_proj", "v_proj"))
+        q, k = m._rope(q, T), m._rope(k, T)
+        a = ((q @ k.transpose(-1, -2)) / hd ** 0.5).masked_fill(~torch.ones(T, T, dtype=torch.bool).tril(), float("-inf"))
+        z = (a.softmax(-1) @ v).transpose(0, 1).clone()  # [T, H, hd]
+        for t in range(T):
+            for hh in range(H):
+                if ("head", L, t, hh) not in on:
+                    z[t, hh] = means["heads"][L, hh]
+        x = x + z.reshape(T, -1) @ s(L, "o_proj").W.T
+        act = m.act(m.norm(x, 2 * L + 1) @ s(L, "c_fc").W.T)
+        keep = torch.zeros_like(act, dtype=torch.bool)
+        for kind, LL, t, j in on:
+            if kind == "neuron" and LL == L:
+                keep[t, j] = True
+        act = torch.where(keep, act, means["neurons"][L][None])
+        x = x + act @ s(L, "down_proj").W.T
+    return m.unembed(m.norm(x, 2 * m.n_layer))[targets].log_softmax(-1)
+
+
+def native_units_of(nat, T, seed, k):
+    g = torch.Generator().manual_seed(seed)
+    m = nat.target
+    dm = m.site("h.0.mlp.c_fc").W.shape[0]
+    out = {("head", m.n_layer - 1, T - 1, 0), ("neuron", m.n_layer - 1, T - 1, 1)}
+    while len(out) < k:
+        L, t = int(torch.randint(m.n_layer, (1,), generator=g)), int(torch.randint(T - 4, T, (1,), generator=g))
+        out.add(("head", L, t, int(torch.randint(m.n_head, (1,), generator=g))) if torch.rand(1, generator=g) < 0.4
+                else ("neuron", L, t, int(torch.randint(dm, (1,), generator=g))))
+    return sorted(out)
+
+
+def test_native_runs(tiny):
+    nat, ge, tx = tiny
+    m = nat.target
+    g = torch.Generator().manual_seed(3)
+    means = {"heads": torch.randn(m.n_layer, m.n_head, m.hd, generator=g),
+             "neurons": torch.randn(m.n_layer, m.site("h.0.mlp.c_fc").W.shape[0], generator=g)}
+    units = native_units_of(nat, len(tx.ids), 4, 12)
+    nl = connect.NativeLines(nat, tx.ids, tx.targets, tx.ref, means, units, B=4)
+    ons = torch.stack([torch.ones(len(nl.lines), dtype=torch.bool), torch.zeros(len(nl.lines), dtype=torch.bool)])
+    ew, ow, km = nl.strengths(ons)
+    lq = nl.log_probs(ew, ow, km)
+    full = mean_ablated(nat, tx.ids, tx.targets, means, nl.graph(ons[0]).units)
+    empty = mean_ablated(nat, tx.ids, tx.targets, means, [])
+    assert torch.allclose(lq[0], full, atol=1e-4) and torch.allclose(lq[1], empty, atol=1e-4)
+    st = connect.NativeConnector(nat, tx.ids, tx.targets, tx.ref, means, units, B=4)
+    sc = st.scores()
+    kf, kn = nl.kl_sets(ons)
+    assert float(sc.sum()) == pytest.approx(kn - kf, rel=0.15, abs=1e-3)
+    got = st.run(log=lambda msg: None)
+    assert got["record"]["point"] <= got["record"]["criteria"]["point"] + 1e-6
+    assert set(nl.graph(got["on"]).units) == got["graph"].node_set()

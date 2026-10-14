@@ -233,7 +233,9 @@ class Floors:
         ge, tx, nat = self.ge, self.tx, self.ge.nat
         lines = ge.loo_lines(tx, g_now)
         keep = torch.tensor([[has(kind, x) for kind, x in lines] for has in (held(h) for h in graphs)], dtype=torch.bool)
-        got = ge.phi_variants(tx, g_now, keep, self.pool, base=self.base(g_now), recompute=("nodes", "patching"))["variants"]
+        got = ge.phi_variants(tx, g_now, keep, self.pool, draws=goal_eval.CHANGED_DRAWS, base=self.base(g_now),
+                              recompute=("nodes", "patching"))["variants"]  # (the reward row's draws: at 8 a candidate
+        # passing interchange_pp failed the full check's 32)
         out = [{f: goal_eval.family_score(v["row"], f) for f in self.floors} for v in got]
         if "omitted" in self.floors:
             now = tuple(sorted(g_now.node_set()))

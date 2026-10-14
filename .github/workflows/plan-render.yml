@@ -32,7 +32,7 @@ jobs:
       - name: Install renderer and fonts
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-inter fonts-dejavu-core > /dev/null
+          sudo apt-get install -y -qq fonts-inter fonts-dejavu-core python3-pil > /dev/null
           npm install --prefix "$RUNNER_TEMP/plan-render" @mermaid-js/mermaid-cli@11.4.2
           echo '{"args": ["--no-sandbox", "--disable-setuid-sandbox"]}' > "$RUNNER_TEMP/puppeteer.json"
       - name: Render latest plan and publish image
@@ -45,9 +45,43 @@ jobs:
             git fetch --no-tags origin main
             # Only this disposable CI checkout is reset. Never rebase a stale rendered image.
             git reset --hard origin/main
+            # Historical coordination notes stay in source, outside Mermaid's
+            # parser/text budget; configuration lives in plan/mermaid.json.
+            sed '/^[[:space:]]*%%/d' plan/plan.mmd > "$RUNNER_TEMP/current-plan.mmd"
+            # Inspect the SVG geometry before asking Chrome for a large bitmap.
+            # Oversized foreignObject captures can silently produce white PNGs.
             "$RUNNER_TEMP/plan-render/node_modules/.bin/mmdc" \
-              -p "$RUNNER_TEMP/puppeteer.json" -i plan/plan.mmd \
+              -p "$RUNNER_TEMP/puppeteer.json" -i "$RUNNER_TEMP/current-plan.mmd" \
+              -o "$RUNNER_TEMP/plan.svg" -c plan/mermaid.json -b white
+            /usr/bin/python3 - "$RUNNER_TEMP/plan.svg" <<'PY'
+          import math, sys, xml.etree.ElementTree as ET
+          box = ET.parse(sys.argv[1]).getroot().get('viewBox', '').split()
+          if len(box) != 4:
+              raise SystemExit('Plan SVG has no usable viewBox')
+          _, _, width, height = map(float, box)
+          if not all(math.isfinite(v) and v > 0 for v in (width, height)) or width > 4000 or height > 8000 or width * height > 16_000_000:
+              raise SystemExit(f'Plan too large to read/render safely: {width}x{height}; compact the source')
+          print(f'Plan SVG bounds: {width:.0f}x{height:.0f}')
+          PY
+            "$RUNNER_TEMP/plan-render/node_modules/.bin/mmdc" \
+              -p "$RUNNER_TEMP/puppeteer.json" -i "$RUNNER_TEMP/current-plan.mmd" \
               -o plan/plan.png -c plan/mermaid.json -b white -s 1
+            # A successful Chromium exit does not imply it painted the diagram.
+            /usr/bin/python3 - plan/plan.png <<'PY'
+          import sys
+          from PIL import Image
+          with Image.open(sys.argv[1]) as image:
+              width, height = image.size
+              if image.format != 'PNG' or width > 4000 or height > 8000 or width * height > 16_000_000:
+                  raise SystemExit(f'Unexpected plan bitmap: {image.format} {width}x{height}')
+              image = Image.alpha_composite(Image.new('RGBA', image.size, 'white'), image.convert('RGBA')).convert('RGB')
+              dark = image.convert('L').point(lambda value: 255 if value < 140 else 0)
+              count = dark.histogram()[255]
+              box = dark.getbbox()
+              if count < max(100, width * height // 50_000) or box is None or box[2] - box[0] < 100 or box[3] - box[1] < 80:
+                  raise SystemExit(f'Blank or nearly blank plan PNG: {count} dark pixels, bounds {box}')
+              print(f'Plan PNG verified: {width}x{height}, {count} dark pixels')
+          PY
             printf '%s\n' '![Oracle team coordination map](plan/plan.png)' > README.md
             git add plan/plan.png README.md
             if git diff --cached --quiet; then

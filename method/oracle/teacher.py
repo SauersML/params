@@ -2181,10 +2181,13 @@ def memory_log(path: Path) -> None:
         if not weights or ge is None:
             return {}
         seen, out = set(weights[0]), {}
-        for pre, ob in (("", text[0]()), ("ge.", ge), ("nat.", ge.nat)):
-            out.update({pre + k: round(cuda_storages(v, seen, model=pre == "nat.") / GiB, 3)
-                        for k, v in (vars(ob) if ob is not None else {}).items()})
-        return {k: v for k, v in out.items() if v >= 0.01}
+        try:  # (a failure is recorded, never raised: the profile must not stop the run; some keys are tuples)
+            for pre, ob in (("", text[0]()), ("ge.", ge), ("nat.", ge.nat)):
+                out.update({pre + str(k): round(cuda_storages(v, seen, model=pre == "nat.") / GiB, 3)
+                            for k, v in (vars(ob) if ob is not None else {}).items()})
+        except Exception as e:  # noqa: BLE001
+            out["error"] = repr(e)
+        return {k: v for k, v in out.items() if not isinstance(v, float) or v >= 0.01}
 
     def peaks():
         return torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()

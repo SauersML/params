@@ -1918,6 +1918,10 @@ def test_scope_family_and_resolution(tiny):
     assert len(vpd["draws_scope"]) == len(got) and abs(vpd["s_scope"] - 1.0) < 1e-4  # path-patched: VPD's whole answer 1
     assert empty["s_scope"] is None or empty["s_scope"] < vpd["s_scope"]
     assert empty["s_scope_raw"] == goal_eval._ratio_pool(empty["draws_scope"], raw=True)
+    halves = [ge.scope_draws(tx, "search", part) for part in ("accept", "validate")]  # the teachers' two halves
+    assert sorted(halves[0] + halves[1]) == sorted(got) and not set(halves[0]) & set(halves[1])
+    assert [d[0] for d in ge.scope_family(tx, [native.Graph()], "search", part="validate")[0]["draws_scope"]] == \
+        [d[0] for d in empty["draws_scope"] if tuple(d[0]) in set(halves[1])]
     tp = ge.track_pp(tx, [native.Graph()], "search", got=got)[0]  # track_pp's semantics on scope's draws
     assert tp["draws_track_pp"] == empty["draws_scope"]
     res = ge.kl_resolution(tx)

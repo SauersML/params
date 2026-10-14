@@ -887,7 +887,8 @@ class Acceptance:
         g_now = graph_of(now)
         graphs = [graph_of(on) for on in ons]
         got = ge.phi_variants(tx, g_now, ge.keep_of(tx, g_now, [sorted(h.node_set()) for h in graphs]), self.pool_adv,
-                              base=reward_row(ge, tx, g_now, self.pool_adv))["variants"]
+                              base=reward_row(ge, tx, g_now, self.pool_adv),   # (fv: scope on its acceptance half, the other
+                              scope_part="accept" if self.draws == "fv" else None)["variants"]   # half validation's)
         held = ("edges", "omitted", "flips")
         out = [{f: goal_eval.family_score(v["row"], f) for f in floors if f not in held} for v in got]
 
@@ -927,11 +928,18 @@ class Acceptance:
 
     def validation(self, graph: native.Graph) -> tuple:
         """A circuit's (s_track_pp, low) on the fixed validation draws (the other half of search_pool, at most
-        POOL_DRAWS) as ranked() judges them."""
+        POOL_DRAWS) as ranked() judges them; with scope_floor (fv and the floors kind), low also lists ["scope", its
+        score, the floor] when the input-scope family on scope_draws' validation half (goal_eval.scope_draws part
+        "validate") falls below floor_of the START's there (the lead's 10-14: pruned against the search draws alone,
+        text9012's 211-part circuit met every search floor and scored scope 0.33 against 0.9 on eval; with this guard
+        every stage's first validations there fell to 0.74-0.76 against 0.85, and the START it wrote met every eval floor)."""
         val = self._halves()[1]
-        if not val:
-            return None, []
-        return self.ranked(self._per_draw([graph], val)[0], val, range(len(val)))
+        sc, low = self.ranked(self._per_draw([graph], val)[0], val, range(len(val))) if val else (None, [])
+        if getattr(self, "scope_floor", None) is not None:
+            s = goal_eval.family_score(self.ge.scope_family(self.tx, [graph], "search", part="validate")[0], "scope")
+            if s is None or s < self.scope_floor - 1e-9:
+                low = list(low) + [["scope", s, self.scope_floor]]
+        return sc, low
 
     def scores(self, graphs: list, edges: tuple | None = None) -> list[dict]:
         """Per graph its terms; edges, (graph, ons [K, connections]): the graphs are those connection subsets of one
@@ -1004,6 +1012,9 @@ class Acceptance:
             tau = self.ge.tau(self.tx, self.pool_adv, "search")   # own score (an expanded or forward start below a floor
             row0 = reward_row(self.ge, self.tx, graph_of(start), self.pool_adv)   # may still prune, never further down)
             fams = {f: min(v, goal_eval.family_score(row0, f) or 0.0) for f, v in (tau.get("floors") or {}).items()}
+            if self.draws == "fv" and "scope" in fams:       # scope's held-out half: floor_of the START's there
+                s0 = goal_eval.family_score(self.ge.scope_family(self.tx, [graph_of(start)], "search", part="validate")[0], "scope")
+                self.scope_floor = floor_of(s0)
 
         def judge(ons):                                      # the changed term on the draws each candidate is most at
             now = current()                                  # odds with the current circuit on

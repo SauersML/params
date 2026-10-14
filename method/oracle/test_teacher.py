@@ -589,6 +589,26 @@ def test_ranked_draws_are_pooled():
     assert goal_eval.floors({"s_point_c": 0.8}, ["point"])["point"] == pytest.approx(0.72)
 
 
+def test_validation_guards_scope_on_its_held_out_half(monkeypatch):
+    # fv with the floors kind: the input-scope family on scope_draws' validation half below floor_of the START's there
+    # fails validation (low names it), above it passes (the lead's 10-14: text9012's search-pruned circuit, eval scope 0.33)
+    from types import SimpleNamespace
+    seen = []
+
+    def scope_family(tx, graphs, split, part=None):
+        seen.append((split, part))
+        return [{"s_scope_raw": got[0], "s_scope": got[0], "draws_scope": []}]
+    got = [0.5]
+    acc = teacher.Acceptance(SimpleNamespace(scope_family=scope_family), None, ("changed", "floors"), "pp", "fv")
+    monkeypatch.setattr(acc, "_halves", lambda: ([], []))
+    acc.scope_floor = teacher.floor_of(0.95)
+    assert acc.validation(None) == (None, [["scope", 0.5, acc.scope_floor]]) and seen == [("search", "validate")]
+    got[0] = 0.92
+    assert acc.validation(None) == (None, [])
+    acc.scope_floor = None                                       # (no guard without the floors kind)
+    assert acc.validation(None) == (None, [])
+
+
 def test_validated_keeps_each_passing_removal_by_default():
     # every removal checked (VAL_EVERY 1): units 0 and 1 go (validation 0.8, then 0.6 < 0.7 on the second), so the level
     # keeps the first removal and ends there, not reverting it with the failing one

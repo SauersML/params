@@ -146,9 +146,11 @@ REMOVAL_ROWS = {"cuda": 32, "other": 16}  # real-model removal sets per batch (_
 NEC_MIN_LEN = 64  # a control text's least length (end-aligned: a circuit's parts further back are not removed there)
 DONOR_VOCAB = 50277  # DONOR_POOLS' texts are vpd4l's token ids, in its tokenizer's 50277-id vocabulary (far_pool)
 DONOR_POOLS = {"search": ("train", range(6000, 6400), True),  # the far donors' texts per split by text number, frozen
-               "eval": ("donor", range(9150, 9200), False)}  # (the lead's 10-13): the reward's text6000-6399, which a pod
+               "eval": ("donor", range(9150, 9200), False),  # (the lead's 10-13): the reward's text6000-6399, which a pod
+               "repick": ("train", range(6400, 7000), True)}
 # missing any refuses (the first 400 train files present before, so a pod holding fewer texts drew other donors: rewards
-# up to 0.13 apart); the evaluations' text9150-9199 partition, its missing files left out
+# up to 0.13 apart); the evaluations' text9150-9199 partition, its missing files left out; "repick", no split's: the
+# teachers' held-out input scope (experiments/oracle/scope_repick.py, the lead's 10-14), training texts outside both
 
 
 # ---- answers
@@ -1598,7 +1600,8 @@ class GoalEval:
         return torch.tensor([[kind != "node" or x in set(s) for kind, x in lines] for s in subsets], dtype=torch.bool)
 
     def phi_variants(self, tx: Text, graph: native.Graph, keep: torch.Tensor, pool: dict | None, split: str = "search",
-                     draws: int = 8, base: dict | None = None, start=None, recompute: tuple = ("nodes", "patching")) -> dict:
+                     draws: int = 8, base: dict | None = None, start=None, recompute: tuple = ("nodes", "patching"),
+                     scope_part: str | None = None) -> dict:
         """phi of variants of an answer (teacher acceptance's candidate removals, line_loo's deletions): keep [K, L] over
         loo_lines(tx, graph), per row the lines kept, the others deleted (a node with its connections, token edges and
         pairs; a stated connection; a stated token edge), nothing else re-stranded. Recomputed per variant: point
@@ -1682,7 +1685,7 @@ class GoalEval:
         mask[:, at] = keep.float()
         tpp = self.track_pp(tx, [g], split, draws, lines=mask)
         ipp = self.interchange_pp(tx, [g], split, draws, lines=mask)
-        scp = self.scope_family(tx, [g], split, lines=mask)  # (its own draws, as the answer's row: the floors read it)
+        scp = self.scope_family(tx, [g], split, lines=mask, part=scope_part)  # (scope_part: the teachers' acceptance half)
         pat = self.pattern_family(tx, flat, runs=None if got is None else pattern_runs)
         sets = [frozenset(x for kind, x in d if kind == "node") for d in gone]  # N moves with the node set alone
         distinct = list(dict.fromkeys(s for s in sets if s))
@@ -4448,10 +4451,11 @@ class GoalEval:
                     out.append(q)
         return out
 
-    def scope_draws(self, tx: Text, split: str = "search") -> list:
+    def scope_draws(self, tx: Text, split: str = "search", part: str | None = None) -> list:
         """The input-scope family's changed texts as (position, token) pairs: the positions by resample_influence on
         split, largest first, until they hold SCOPE_COVER of its sum (at most START_CAP), each with its token from each
-        of the split's RESAMPLE_DONORS far donors (one changed position a text)."""
+        of the split's RESAMPLE_DONORS far donors (one changed position a text). part "accept" or "validate": the half a
+        hash of (the text's seed, position, token) puts there (the teachers' acceptance and its held-out guard)."""
         one = self.resample_influence(tx, split)
         total = sum(max(0.0, v) for v in one.values())
         pos, held = [], 0.0
@@ -4462,9 +4466,14 @@ class GoalEval:
             held += max(0.0, one[q])
         donors = [list(d) for _, d in self.far_donors(tx, self.far_pool(split), RESAMPLE_DONORS)]
         got = [(q, _donor_token(d, q, tx.T, tx.ids[q])) for q in pos for d in donors]
-        return list(dict.fromkeys((q, z) for q, z in got if z != tx.ids[q]))
+        got = list(dict.fromkeys((q, z) for q, z in got if z != tx.ids[q]))
+        if part is None:
+            return got
+        side = {"accept": 0, "validate": 1}[part]
+        return [pz for pz in got if hashlib.sha256(repr((int(tx.seed), int(pz[0]), int(pz[1]))).encode()).digest()[0] % 2 == side]
 
-    def scope_family(self, tx: Text, graphs: list[native.Graph], split: str = "search", lines: torch.Tensor | None = None) -> list[dict]:
+    def scope_family(self, tx: Text, graphs: list[native.Graph], split: str = "search", lines: torch.Tensor | None = None,
+                     part: str | None = None) -> list[dict]:
         """The input-scope family (the lead's 10-13 design): does the circuit follow the model when a token it may
         leave out changes? Draws: scope_draws (each influential position's token alone replaced by natural donor
         tokens, positions to SCOPE_COVER of the summed movement, at most START_CAP). Scored as track_pp on those draws:
@@ -4477,9 +4486,9 @@ class GoalEval:
         against it. The circuit's own run, everything outside it zeroed, is no measure here: a sparse circuit's
         attention then spreads over the positions it leaves empty (on 60 texts the START's own run followed the
         model's token changes nowhere, median 0.00, while VPD's whole answer did). Per position alone: a context
-        resampled jointly carries a donor's topic, which no small circuit holds. lines as track_pp's (phi_variants).
-        {s_scope, s_scope_raw, draws_scope}."""
-        got = self.scope_draws(tx, split) if tx.vpd is not None else []
+        resampled jointly carries a donor's topic, which no small circuit holds. lines as track_pp's (phi_variants); part,
+        scope_draws' half. {s_scope, s_scope_raw, draws_scope}."""
+        got = self.scope_draws(tx, split, part) if tx.vpd is not None else []
         if not got:
             return [{"s_scope": None, "s_scope_raw": None, "draws_scope": []} for _ in (graphs if lines is None else lines)]
         rows = self.track_pp(tx, graphs, split, lines=lines, got=got)

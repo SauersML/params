@@ -215,6 +215,17 @@ def _batches(seqs: list[list[int]]) -> list[list[int]]:
     return out + [cur] if cur else out
 
 
+def _free(dev) -> None:
+    """The device's cached blocks back to the system. Each batch's [n, T, V] log probabilities differ in T, and MPS kept
+    a block of every size: one edit on a goal with 96 score texts (27,139 tokens) took the driver to 22.4 GiB with 3.6 GiB
+    allocated (RL run 3's dry run, 10-14)."""
+    kind = torch.device(dev).type
+    if kind == "mps":
+        torch.mps.empty_cache()
+    elif kind == "cuda":
+        torch.cuda.empty_cache()
+
+
 class Verifier:
     """Scores edits for a goal on the weights (module docstring). Each request's edits are scored together: per batch of
     texts the unedited run once, then each edit's; the held texts' unedited log probabilities are kept."""
@@ -273,6 +284,7 @@ class Verifier:
                         s["text"] += float(kl[j, :len(ids)][rest].mean())
                     del lq, top, kl
                 del lp
+                _free(self.nat.dev)
             groups = _batches(self.held)
             if self._held_ref is None:  # the held texts' unedited log probabilities, per group (every request's)
                 self._held_ref = [self._lp([self.held[i] for i in idx]) for idx in groups]

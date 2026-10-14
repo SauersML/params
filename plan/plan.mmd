@@ -954,3 +954,13 @@ flowchart BT
 
   class W5REPAIR gate
   class CAPENG done
+
+  W5FACT["<b>Localize the failed support approximation</b><br/>All old omissions belong to only two sites:<br/>layer 1 down and layer 2 MLP input.<br/>Measure each site's omissions separately on all 52 worlds;<br/>full and joint-omission controls already exist.<br/>Why: distinguish one-site error from cross-site interaction<br/>before spending more on sparse search.<br/>Search masks are not yet oracle training answers.<br/>PREPARING · fork_review · at most 156 Native forwards"]
+  W5REPAIR -- complete the two-site factorial --> W5FACT
+  W5FACT -. localizes which finite changes to test .-> DIRECTKL
+  class W5FACT active
+
+  ENGCIRCUIT["<b>Does the claimed mechanism hold in its own circuit?</b><br/>Current INVARIANTS checks run only the full model.<br/>Add an opt-in check on the emitted circuit's execution.<br/>Control: same claim and carriers, broken transport edge;<br/>full-model truth must not certify a wrong circuit.<br/>Keep full-model truth, circuit truth and fidelity separate.<br/>Why: connect mechanism supervision to executable answers.<br/>IMPLEMENTING · variable_reward / eval_recovery"]
+  CAPENG -- local truth is not circuit-relative truth --> ENGCIRCUIT
+  ENGCIRCUIT -. checked circuit-bound claims .-> SUP
+  class ENGCIRCUIT active

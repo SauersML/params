@@ -31,6 +31,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1806,6 +1807,52 @@ def edit_compare(rows: str):
     print("wrote", OUT / "edit_compare.json")
 
 
+def _plain(name: str) -> str:
+    """A phenotype's name in plain words (spaCy's own glosses for its tag, dependency and entity codes)."""
+    try:
+        import spacy
+
+        explain = spacy.explain
+    except ImportError:
+        explain = lambda x: None  # noqa: E731
+    m = re.match(r"(current|next) token ('.*'|\".*\")$", name)
+    if m:
+        return f"the token {m[2]}" if m[1] == "current" else f"the position just before the token {m[2]}"
+    m = re.match(r"after (.+), log p\((.+)\)$", name)
+    if m:
+        return f"the model's probability of {m[2]} after {m[1]}"
+    for pre, what in (("part of speech ", "part of speech"), ("tag ", "tag"), ("dep ", "dependency"), ("entity ", "entity")):
+        if name.startswith(pre):
+            code = name[len(pre):]
+            g = explain(code)
+            return f"{g} ({what} {code})" if g else name
+    if name.startswith("supersense "):
+        return f"WordNet class {name.split()[1]}"
+    if name.startswith("hypernym "):
+        return f"WordNet category {name.split()[2].split('.')[0].replace('_', ' ')}"
+    if name.startswith("rhyme "):
+        return f"words ending in the sounds {name[6:]}"
+    m = re.match(r"(\w+)=(\w+)$", name)
+    if m:
+        return f"{m[1].lower()} {m[2]}"
+    return name
+
+
+def labels(top: int = 2):
+    """Each subcomponent with a strong hit (families.json, table's output) labelled by its strongest phenotype per
+    family, the top families in plain words with the partial r (its sign the direction) -> OUT/labels.json {"L1.v#596":
+    "tracks existential there (tag EX) (partial r +0.98); ...", ...} (decision test 3: the English writer's evidence)."""
+    fam = json.loads((OUT / "families.json").read_text())
+    out = {}
+    for lab, fs in fam.items():
+        parts = []
+        for f, (nm, rv) in fs[:top]:
+            parts.append(f"tracks {_plain(nm)} (partial r {rv:+.2f})")
+        out[lab.replace(" ", "")] = "; ".join(parts)
+    (OUT / "labels.json").write_text(json.dumps(out, indent=0, ensure_ascii=False))
+    print(f"wrote {OUT / 'labels.json'}: {len(out)} subcomponents; e.g.", *list(out.items())[:3], sep="\n  ")
+
+
 FIG = Path("/Users/user/mpd-data/figures/oracle")
 SHOW = {"next token (VPD's gate reads it)": "next token", "preferences (rustmove's)": "edit-goal token pairs (b after a)",
         "model behaviour: predicted token kind": "kind of token the model predicts", "model behaviour: confidence and loss": "the model's confidence and loss",
@@ -1970,7 +2017,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=("extract", "pos", "pos_tag", "annotate", "domain", "ngram", "export", "mech", "attention", "pheno", "assoc",
                                     "calib", "nullscan", "calibrate", "table", "figure", "figure_causal", "figure_counts", "conditional", "causal_plan", "causal", "probe",
-                                    "assoc_prefs", "edit_compare"))
+                                    "assoc_prefs", "edit_compare", "labels"))
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     if a.cmd in ("extract", "mech"):

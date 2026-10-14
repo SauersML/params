@@ -849,7 +849,9 @@ def figure_matrix():
 
 
 LEAD = Path("/private/tmp/claude-501/-Users-user/b1063ff3-6750-418e-8406-23ae82bf968a/scratchpad/lead")  # the lead's renderer
-CIRCUIT_PROMPT = ("capital", "Japan", "The capital city of Japan is called")
+CIRCUIT_PROMPT = tuple(os.environ.get("KN_PROMPT", "city country|Tokyo|Tokyo is one of the largest cities in").split("|"))
+# (a prompt whose overall top token is the answer: the teacher explains the top token; "The capital city of Japan is
+# called" ranks Tokyo first among capitals but '"' first overall, so its circuit explains the quote mark)
 
 
 def circuit():

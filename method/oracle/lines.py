@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import subprocess
@@ -68,6 +69,16 @@ VAL_MARGIN = 0.02  # validation: s_track_pp at least the fully wired circuit's l
 MAX_STEPS = 24  # accepted removals per process
 EXIT_RESUME = 3
 FULL_EVERY = 8  # accepted removals between full checks of the current circuit's every family (Floors.full)
+
+
+def revision() -> str:
+    """The reward's code and the adversary's pool as one digest: a checkpoint's setup (floors, budget, start
+    validation) computed under another is computed again, and its circuit checked again."""
+    h = hashlib.sha1()
+    for name in ("goal_eval.py", "teacher.py", "engine.py", "native.py", "carry.py"):
+        h.update((HERE / name).read_bytes())
+    h.update(str(teacher.POOL.stat().st_size).encode())
+    return h.hexdigest()[:16]
 
 
 def key(col: tuple) -> str:
@@ -106,6 +117,16 @@ class LinePruner(teacher.Descent):
         self.e_line = torch.tensor([self.at[key(("e", w, r))] for w, r in ed], dtype=torch.long)
         self.o_line = torch.tensor([self.at[key(("o", w))] for w in od], dtype=torch.long)
         self.e_ends, self.o_ends = ed, od
+        self.parts = list(self.node_at)  # the parts in node_at's order, and each line's, connection's and write's ends
+        part = {nd: k for k, nd in enumerate(self.parts)}  # among them (-1: a token or the prediction)
+        self.node_cols = torch.tensor(list(self.node_at.values()), dtype=torch.long)
+        self.ends = torch.full((len(self.lines), 2), -1, dtype=torch.long)
+        for j, c in enumerate(self.lines):
+            for s, x in enumerate([x for x in c[1:] if isinstance(x, tuple)]):  # (a token edge's position, a target: ints)
+                self.ends[j, s] = part[x]
+        self.e_idx = torch.tensor([[part[w], part[r]] for w, r in ed], dtype=torch.long).reshape(-1, 2)
+        self.o_idx = torch.tensor([part[w] for w in od], dtype=torch.long)
+        self._ranked = {}  # the ranking's measurements per state of on (a level run again after a failure ranks the same)
         lo = min(p for _, p, _ in self.g.node_set())
         self.lo = lo if 0 < lo <= min(tx.targets) else 0
         self.states = {}
@@ -122,16 +143,40 @@ class LinePruner(teacher.Descent):
         del h.stranded, h.stranded_bits  # graph_of_lines marks the graph stranded already; strand must run
         return goal_eval.strand(h, self.tx.targets, self.ge.nat.C)
 
+    def kept(self, on: torch.Tensor) -> torch.Tensor:
+        """The parts a line subset keeps (bool over self.parts): those left on a stated path to the prediction."""
+        nodes = self.graph(on).node_set()
+        return torch.tensor([nd in nodes for nd in self.parts], dtype=torch.bool)
+
+    def lines_kept(self, on: torch.Tensor, km: torch.Tensor) -> torch.Tensor:
+        """The lines on whose ends km keeps (bool over the lines)."""
+        e = self.ends
+        return on.cpu() & ((e[:, 0] < 0) | km[e[:, 0].clamp(min=0)]) & ((e[:, 1] < 0) | km[e[:, 1].clamp(min=0)])
+
     def row(self, on: torch.Tensor) -> torch.Tensor:
         """A line subset as path_patched(lines=)'s row over every column, its stranded parts and their lines off."""
-        kept = self.graph(on).node_set()
+        km = self.kept(on)
         out = torch.zeros(len(self.cols), dtype=torch.bool)
-        for nd, i in self.node_at.items():
-            out[i] = nd in kept
-        for j, (i, c) in enumerate(zip(self.line_cols, self.lines)):
-            ends = [x for x in c[1:] if isinstance(x, tuple)]  # (a token edge's position and a target are ints)
-            out[i] = bool(on[j]) and all(x in kept for x in ends)
+        out[self.node_cols] = km
+        out[torch.tensor(self.line_cols, dtype=torch.long)] = self.lines_kept(on, km)
         return out
+
+    def without(self, groups: list[torch.Tensor], ranking: bool = False) -> list[float]:
+        """Descent.without, the ranking's measurements kept per state of on (the last 4 states): a level run again
+        after a failure starts from the state it ranked (the failing removal gone back), and ranks it the same."""
+        if not ranking:
+            return super().without(groups)
+        state = self.on.numpy().tobytes()
+        seen = self._ranked.pop(state, {})
+        self._ranked[state] = seen
+        while len(self._ranked) > 4:
+            self._ranked.pop(next(iter(self._ranked)))
+        keys = [tuple(g.tolist()) for g in groups]
+        todo = [i for i, k in enumerate(keys) if k not in seen]
+        if todo:
+            for i, x in zip(todo, super().without([groups[i] for i in todo], ranking=True)):
+                seen[keys[i]] = x
+        return [seen[k] for k in keys]
 
     @torch.no_grad()
     def kl_sets(self, ons: torch.Tensor) -> list[float]:
@@ -144,10 +189,10 @@ class LinePruner(teacher.Descent):
             ow = torch.zeros(K, len(self.o_ends))
             off = []
             for k in range(K):
-                kept = self.graph(part[k]).node_set()
-                off.append([nd for nd in self.node_at if nd not in kept] or None)
-                ew[k] = part[k][self.e_line].float() * torch.tensor([float(w in kept and r in kept) for w, r in self.e_ends])
-                ow[k] = part[k][self.o_line].float() * torch.tensor([float(w in kept) for w in self.o_ends])
+                km = self.kept(part[k])
+                off.append([nd for nd, m in zip(self.parts, km.tolist()) if not m] or None)
+                ew[k] = (part[k][self.e_line] & km[self.e_idx[:, 0]] & km[self.e_idx[:, 1]]).float()
+                ow[k] = (part[k][self.o_line] & km[self.o_idx]).float()
             reuse = (self.E.tile_states(self.states, K), self.tx.ids, self.lo) if self.lo else None
             lq = self.E.graph_log_probs(self.plan, ew=ew.to(self.dev), ow=ow.to(self.dev), off=off, reuse=reuse)
             out += carry.kl(self.tx.ref, lq).tolist()
@@ -208,17 +253,29 @@ class Floors:
     nodes, track_pp, interchange_pp, patching near and far, pattern and N per variant; patching binds first on text9000,
     and judged only at the full checks it sent nearly every removal back), omitted on the survivors whose node set
     differs (it moves with the node set alone), edges and flips held at the current circuit's values; full(g): the
-    circuit's own reward row, every family. A candidate under a floor is None (its family recorded in refused)."""
+    circuit's own reward row, every family. A candidate under a floor is None (its family recorded in refused).
+    The current circuit's row is its own reward row when one was computed for it (the start, a full check), else the
+    row phi_variants gave it as a candidate (its families recomputed there, edges, flips and omitted held from the row
+    before): a reward row costs about 7 candidates' variants (bracket, 58,742 lines: 79 s against 8 s each on a CPU),
+    and the full checks every FULL_EVERY removals test what the variants hold."""
+
+    PROXIES = 64  # candidates' rows kept (an admitted prefix, the culprits asked about alone after it)
 
     def __init__(self, ge: goal_eval.GoalEval, tx: goal_eval.Text, pool: dict, floors: dict):
         self.ge, self.tx, self.pool, self.floors = ge, tx, pool, floors
-        self._base, self._omitted, self.refused = {}, {}, []
+        self._base, self._proxy, self._omitted, self.refused = {}, {}, {}, []
+        self._fresh_nodes = None  # the node set whose omitted family the rows hold (the last reward row's)
 
-    def base(self, g: native.Graph) -> dict:
-        """The current circuit's reward-mode row (search split), kept for its lines."""
+    def base(self, g: native.Graph, fresh: bool = False) -> dict:
+        """The circuit's reward-mode row (search split), kept for its lines: its own reward row, or (unless fresh) the
+        row it had as a candidate."""
         k = repr(self.ge.loo_lines(self.tx, g))
-        if k not in self._base:
-            self._base = {k: self.ge.fidelity(self.tx, [g], self.pool, mode="reward", split="search")[0]}
+        if k in self._base:
+            return self._base[k]
+        if not fresh and k in self._proxy:
+            return self._proxy[k]
+        self._base = {k: self.ge.fidelity(self.tx, [g], self.pool, mode="reward", split="search")[0]}
+        self._fresh_nodes = tuple(sorted(g.node_set()))
         return self._base[k]
 
     def under(self, scores: dict) -> str | None:
@@ -227,7 +284,7 @@ class Floors:
 
     def full(self, g: native.Graph) -> tuple:
         """(the first family of g's own reward row under its floor or None, the row's family scores)."""
-        row = self.base(g)
+        row = self.base(g, fresh=True)
         scores = {f: goal_eval.family_score(row, f) for f in self.floors}
         return self.under(scores), scores
 
@@ -240,7 +297,7 @@ class Floors:
         # passing interchange_pp failed the full check's 32)
         out = [{f: goal_eval.family_score(v["row"], f) for f in self.floors} for v in got]
         if "omitted" in self.floors:
-            now = tuple(sorted(g_now.node_set()))
+            now = self._fresh_nodes  # (the node set the held omitted family is of)
             todo = {}
             for i, h in enumerate(graphs):
                 k = tuple(sorted(h.node_set()))
@@ -258,6 +315,10 @@ class Floors:
             if f is not None:
                 self.refused.append({"family": f, "score": out[i].get(f), "floor": self.floors[f]})
                 out[i] = None
+            else:
+                self._proxy[repr(ge.loo_lines(tx, graphs[i]))] = got[i]["row"]
+        while len(self._proxy) > self.PROXIES:
+            self._proxy.pop(next(iter(self._proxy)))
         native.free(nat.dev)
         return out
 
@@ -313,20 +374,28 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
     full = torch.ones(len(pr.lines), dtype=torch.bool)
     if state["done"]:
         return finish(ge, tx, pr, g0, out, task_path.stem, state, pool, log)
-    tau = ge.tau(tx, pool, "search")
-    row_full = teacher.reward_row(ge, tx, pr.graph(full), pool)
-    floors = {f: min(v, goal_eval.family_score(row_full, f) or 0.0) for f, v in (tau.get("floors") or {}).items()}
-    e0, v0 = ge._bounds(tx, "live")
-    budget = teacher.kl_budget(e0, v0, floors["point"]) if floors.get("point") else math.inf
     acc = teacher.Acceptance(ge, tx, ("changed",), "pp", "fv")
     changed, _ = acc.hook(pr.graph, full, current=lambda: pr.on, label="lines",
                           names=lambda ids: [key(pr.lines[i]) for i in ids])
+    rev = revision()
+    same = (state.get("setup") or {}).get("rev") == rev  # the floors, budget and start validation of an earlier process
+    if same:                                            # under the same reward code (a bracket-sized text: 5 min each)
+        setup = state["setup"]
+        floors, budget, start_val = setup["floors"], setup["budget"], setup["start_val"]
+        budget = math.inf if budget is None else budget
+    else:
+        tau = ge.tau(tx, pool, "search")
+        row_full = teacher.reward_row(ge, tx, pr.graph(full), pool)
+        floors = {f: min(v, goal_eval.family_score(row_full, f) or 0.0) for f, v in (tau.get("floors") or {}).items()}
+        e0, v0 = ge._bounds(tx, "live")
+        budget = teacher.kl_budget(e0, v0, floors["point"]) if floors.get("point") else math.inf
+        start_val = acc.validation(pr.graph(full))[0]
+        state["setup"] = {"rev": rev, "floors": floors, "budget": None if math.isinf(budget) else budget, "start_val": start_val}
     fl = Floors(ge, tx, pool, floors)
 
     def by_floors(ons):
         return fl(pr.graph(pr.on), [pr.graph(on) for on in ons])
     accept = teacher.both(changed, by_floors)
-    start_val = acc.validation(pr.graph(full))[0]
     floor_val = None if start_val is None else start_val - VAL_MARGIN
     log(f"{task_path.stem}: {len(pr.node_at)} parts, {len(pr.lines)} lines, {int(pr.on.sum())} on; point budget {budget:.4f} bits; "
         f"validation {start_val} (floor {floor_val}); floors {floors}")
@@ -371,10 +440,10 @@ def one(teacher_path: Path, task_path: Path, out: Path, vpd: dict | None, pool: 
         pending.clear()
         return len(culprit)
 
-    if history:  # a resumed state checked again, here, against the floors as they are now (a reward revision between
-        pending[:] = history  # processes moved them: text9000's resumed circuit stood under interchange_pp's), back
-        if verify() is not None:  # along every accepted removal when it fails
-            save(state["level"])
+    if history and not same:  # a resumed state checked again, here, against the floors as they are now (a reward
+        pending[:] = history  # revision between processes moved them: text9000's resumed circuit stood under
+        if verify() is not None:  # interchange_pp's), back along every accepted removal when it fails (under the same
+            save(state["level"])  # revision the last process's own full checks stand, and its pending removals wait)
     elif state["removed"]:  # a checkpoint without its history: started again from the wired circuit
         log("  a checkpoint without its removals' history: starting again from every line")
         pr.on[:] = True
@@ -475,18 +544,23 @@ def finish(ge: goal_eval.GoalEval, tx: goal_eval.Text, pr: LinePruner, g0: nativ
     on = pr.on.nonzero().flatten().tolist()
     drop = pr.on[None].repeat(len(on), 1)
     drop[torch.arange(len(on)), torch.tensor(on, dtype=torch.long)] = False
+    def tracks(ons):  # eval s_track_pp of each subset, 64 rows a call
+        out = []
+        for s0 in range(0, len(ons), 64):
+            out += [r["s_track_pp"] for r in ge.track_pp(tx, [pr.g], "eval", lines=torch.stack([pr.row(d) for d in ons[s0:s0 + 64]]).float())]
+            native.free(ge.nat.dev)
+        return out
     pt = pr.kl_sets(drop) if on else []
-    trk = [r["s_track_pp"] for r in ge.track_pp(tx, [pr.g], "eval", lines=torch.stack([pr.row(d) for d in drop]).float())] if on else []
+    trk = tracks(drop) if on else []
     kept = sorted(g.node_set())
+    at = {nd: k for k, nd in enumerate(pr.parts)}
     parts = []
     for nd in kept:  # a part off: its lines with it (and whatever it strands)
         d = pr.on.clone()
-        for j, c in enumerate(pr.lines):
-            if nd in [x for x in c[1:] if isinstance(x, tuple)]:
-                d[j] = False
+        d[(pr.ends == at[nd]).any(1)] = False
         parts.append(d)
     ppt = pr.kl_sets(torch.stack(parts)) if parts else []
-    ptr = [r["s_track_pp"] for r in ge.track_pp(tx, [pr.g], "eval", lines=torch.stack([pr.row(d) for d in parts]).float())] if parts else []
+    ptr = tracks(parts) if parts else []
     lines = [{"line": json.loads(key(pr.lines[j])), "point_rise": a - point, "track_fall": None if b is None or tr is None else tr - b}
              for j, a, b in zip(on, pt, trk)]
     nodes = [{"part": list(nd), "point_rise": a - point, "track_fall": None if b is None or tr is None else tr - b}

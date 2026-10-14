@@ -1,6 +1,7 @@
 """Checks of the line stage (lines.py) on a tiny random model (test_goal_eval's): the point runs from one plan equal the
 scorer's runs of the same stated graphs (stranded parts dropped), the levels' blocks partition the kept lines, rows
-turn off exactly the stranded parts' lines, and the floors' keep masks name exactly a candidate's lines.
+turn off exactly the stranded parts' lines, the floors' keep masks name exactly a candidate's lines, and the ranking's
+measurements kept per state are the ones measured afresh.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_lines.py -q
 """
@@ -75,3 +76,20 @@ def test_rows_and_keys(tiny):
     full = pr.graph(torch.ones(len(pr.lines), dtype=torch.bool))
     keep = [has(kind, x) for kind, x in ge.loo_lines(tx, full)]
     assert sum(keep) == len(ge.loo_lines(tx, h))
+
+
+def test_row_lines_and_ranking_cache(tiny):
+    nat, ge, tx = tiny
+    pr = lines.LinePruner(ge, tx, nodes_of(nat, tx, 11, 16), B=4)
+    on = torch.rand(len(pr.lines), generator=torch.Generator().manual_seed(4)) < 0.6
+    kept, row = pr.graph(on).node_set(), pr.row(on)
+    for j, (i, c) in enumerate(zip(pr.line_cols, pr.lines)):  # a line stays when on and every part it names is kept
+        assert bool(row[i]) == (bool(on[j]) and all(x in kept for x in c[1:] if isinstance(x, tuple)))
+    blocks = pr.blocks("reader")
+    first = pr.without(blocks, ranking=True)
+    assert first == pytest.approx(lines.teacher.Descent.without(pr, blocks, ranking=True), abs=1e-6)  # (kl_rank's)
+    pr.on[blocks[0]] = False
+    other = pr.without(blocks[1:], ranking=True)  # another state: measured afresh
+    assert other == pytest.approx(lines.teacher.Descent.without(pr, blocks[1:], ranking=True), abs=1e-6)
+    pr.on[blocks[0]] = True
+    assert pr.without(blocks, ranking=True) == first  # the state again: the kept measurements

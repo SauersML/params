@@ -559,8 +559,32 @@ def behaviour_lines(toy: Toy, n_texts: int = 2, compact: bool = False) -> list[s
     return lines
 
 
+def architecture_parent_lines(toy: Toy) -> list[str]:
+    """Outcome-blind potential dependencies among weight-listed units, not necessary edges."""
+    units = units_of(toy)
+    lines = ["Architecture candidates (not measured necessary edges; zero displayed linear gain does not exclude RMS influence):",
+             "Residual/RMS links below connect writes and normalized reads at the SAME token position. "
+             "They may change the read numerator or denominator; embeddings remain present. "
+             "Head Q/K/V read before that layer's attention writes; MLP inputs read after attention but before that layer's MLP writes."]
+    previous = []
+    for layer in range(toy.cfg['n_layer']):
+        heads = [u for u, i, kind, _ in units if i == layer and kind == 'H']
+        neurons = [u for u, i, kind, _ in units if i == layer and kind == 'N']
+        if heads:
+            lines.append(f"L{layer} head Q/K/V potential residual/RMS parents: " + (','.join(previous) or 'none of the listed unit writes') + '.')
+        if neurons:
+            lines.append(f"L{layer} neuron input potential residual/RMS parents: " + (','.join(previous + heads) or 'none of the listed unit writes') + '.')
+        previous += heads + neurons
+    lines += ["Final readout potential residual/RMS parents at LAST: " + (','.join(previous) or 'none of the listed unit writes') + '.',
+              "Within each head, causal attention transports its own V values from positions <= the output position; Q at the output and K at causal key positions determine softmax weights. "
+              "Within each neuron, FC -> GELU -> down transports only that neuron's scalar at the same position. "
+              "Cross-head V -> O and cross-neuron FC -> down coordinate-disjoint routes are not inferred from these residual/RMS candidates. "
+              "Candidates describe available architecture, not instructions to retain every edge or a proof of circuit fidelity."]
+    return lines
+
+
 def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_live_neurons: bool = False,
-           explain_summary_limits: bool = False) -> str:
+           explain_summary_limits: bool = False, architecture_parent_hints: bool = False) -> str:
     """The prompt. weights_from: take the weight section from another toy (same architecture), keeping this toy's
     behaviour section (the swapped-weights control: does the answer follow the weights?). TOYLOOP_SECTIONS=weights:
     the compact weight section and the texts' tokens only; default: weights and behaviour (zoo v1 toys keep the
@@ -575,6 +599,15 @@ def render(toy: Toy, n_texts: int = 2, weights_from: Toy | None = None, *, all_l
         raise ValueError("all_live_neurons must be an explicit boolean")
     if type(explain_summary_limits) is not bool:
         raise ValueError("explain_summary_limits must be an explicit boolean")
+    if type(architecture_parent_hints) is not bool:
+        raise ValueError("architecture_parent_hints must be an explicit boolean")
+    if architecture_parent_hints:
+        # Recursion leaves all existing rendering paths and default bytes intact.
+        base = render(toy, n_texts, weights_from, all_live_neurons=all_live_neurons,
+                      explain_summary_limits=True)
+        return base.replace("Which units implement the prediction at the last position, and how?",
+                            '\n'.join(architecture_parent_lines(weights_from or toy)) + '\n' +
+                            "Which units implement the prediction at the last position, and how?")
     L, H, hd = heads_of(toy.cfg)
     if SECTIONS == "weights":
         return "\n".join([f"Toy transformer: {L} layers, {H} heads of dim {hd}, d_model {toy.cfg['n_embd']}, "

@@ -51,3 +51,34 @@ def test_opt_in_changes_only_scope_text_and_never_uses_truth(monkeypatch):
     assert changed.endswith(render.FORMAT)
     toy.truth = {"units": ["L999H999"], "edges": [], "english": "DO NOT COPY THIS"}
     assert changed == render.render(toy, all_live_neurons=True, explain_summary_limits=True)
+
+
+def test_architecture_hints_preserve_defaults_and_ignore_truth(monkeypatch):
+    toy = small_toy()
+    monkeypatch.setattr(render, 'SECTIONS', 'weights')
+    legacy = render.render(toy)
+    assert legacy == render.render(toy, architecture_parent_hints=False)
+    hinted = render.render(toy, architecture_parent_hints=True)
+    assert 'not measured necessary edges' in hinted
+    assert 'zero displayed linear gain does not exclude RMS influence' in hinted
+    assert 'SAME token position' in hinted
+    assert 'L0 neuron input potential residual/RMS parents: none of the listed unit writes.' in hinted
+    assert 'L0 head Q/K/V potential' not in hinted  # zero head has no listed write
+    assert 'Final readout potential residual/RMS parents at LAST: L0N0,L0N1.' in hinted
+    toy.truth = {'units': ['L999H999'], 'edges': [], 'english': 'secret'}
+    toy.meta['truth'] = toy.truth
+    assert hinted == render.render(toy, architecture_parent_hints=True)
+
+
+def test_architecture_stage_order_not_same_layer_mlp_to_fc():
+    toy = small_toy()
+    toy.cfg['n_layer'] = 2
+    for key, value in list(toy.sd.items()):
+        if key.startswith('h.0.'):
+            toy.sd[key.replace('h.0.', 'h.1.')] = value.clone()
+    toy.sd['h.0.attn.o_proj.weight'] = torch.eye(2)
+    lines = render.architecture_parent_lines(toy)
+    assert 'L0 head Q/K/V potential residual/RMS parents: none of the listed unit writes.' in lines
+    assert 'L0 neuron input potential residual/RMS parents: L0H0.' in lines
+    assert 'L1 neuron input potential residual/RMS parents: L0H0,L0N0,L0N1.' in lines
+    assert any('positions <= the output position' in line for line in lines)

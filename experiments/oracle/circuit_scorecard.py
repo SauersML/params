@@ -581,6 +581,20 @@ def edits(ge: goal_eval.GoalEval, tx: goal_eval.Text, g: native.Graph) -> dict:
     return out
 
 
+def sparsity(g: native.Graph, targets: list[int]) -> dict:
+    """The goal doc's connection sparsity of a VPD circuit (connect.py's measures): connections between units per unit
+    (a stated circuit's stated ones, a node list's every one the model has among its nodes, native.all_edges),
+    cross-token connections (a writer at one position read at another) and the tokens involved."""
+    nodes = sorted(g.node_set())
+    if g.complete:
+        par, out = native.all_edges(nodes, targets)
+    else:
+        par, out = g.parents, g.out
+    e = [(w, r) for r, ws in par.items() for w in ws]
+    return {"edges_per_unit": (len(e) + len(out)) / max(1, len(nodes)), "cross_token": sum(w[1] != r[1] for w, r in e),
+            "tokens": len({t for _, t, _ in nodes}), "stated": not g.complete}
+
+
 def params_touched(nat, nodes) -> int:
     """The weights a circuit's units read and write, each counted once whatever its positions: a VPD subcomponent its V
     column and U row (d_in + d_out), a neuron its input row and output column (2 d_model), a head its query, key, value
@@ -872,7 +886,8 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
         for k, r in zip(mids, rows(ge, tx, [native.Graph(order[:k], complete=True) for k in mids], pool, log)):
             have[k] = judged(r, fl, fams)
         k_phi = first(lambda j: j["phi"] is not None and j["phi"] >= base["phi"])
-    rec["size"] = {"units": "vpd", "parts": len(nodes), "params": params_touched(nat, nodes), "build_seconds": build_seconds(path), "lines": None if g.complete else g.edges() + len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
+    rec["size"] = {"units": "vpd", "parts": len(nodes), "params": params_touched(nat, nodes), "build_seconds": build_seconds(path),
+                   "sparsity": sparsity(g, tx.targets), "lines": None if g.complete else g.edges() + len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
                    "connections": None if g.complete else g.edges(),
                    "token_edges": None if g.complete else len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
                    "implied_lines": sum(native.implied_edges(nodes, tx.targets)) if g.complete else None,
@@ -926,7 +941,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None) -> None:
         if f.suffix != ".json" or f.name == "summary.json":
             continue
         rec = json.loads(f.read_text())
-        if ("mediated" in rec.get("edits", {}) and "params" in rec.get("size", {}) and rec.get("live_gates") is not None
+        if ("mediated" in rec.get("edits", {}) and "sparsity" in rec.get("size", {}) and rec.get("live_gates") is not None
                 and "interventions" in rec):
             continue
         path = circuits_dir / f.name
@@ -943,7 +958,8 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None) -> None:
         if "interventions" not in rec:
             rec["interventions"] = interventions_vpd(ge, tx, nodes, top)
         g, _, _ = goal_eval.load_answer(path, json.loads(tp.read_text()), tx.targets, ge.nat)
-        rec["size"].update({"units": "vpd", "params": params_touched(ge.nat, g.node_set()), "build_seconds": build_seconds(path)})
+        rec["size"].update({"units": "vpd", "params": params_touched(ge.nat, g.node_set()), "build_seconds": build_seconds(path),
+                            "sparsity": sparsity(g, tx.targets)})
         f.write_text(json.dumps(rec))
         lg = rec.get("live_gates") or {}
         say(f"{path.stem}: mediated {[(m['k'], None if m['share'] is None else round(m['share'], 2)) for m in ed['mediated']]}, "
@@ -1120,6 +1136,8 @@ def bakeoff(sets: dict, mib: dict | None = None) -> str:
                         ("parameters (M)", lambda rs: med([(r["size"].get("params") or 0) / 1e6 for r in rs])),
                         ("positions", lambda rs: med([len(r["size"]["positions"]) for r in rs])),
                         ("stated lines", lambda rs: med([r["size"]["lines"] for r in rs])),
+                        ("connections per unit", lambda rs: med([(r["size"].get("sparsity") or {}).get("edges_per_unit") for r in rs])),
+                        ("cross-token connections", lambda rs: med([(r["size"].get("sparsity") or {}).get("cross_token") for r in rs])),
                         ("removable share", lambda rs: summary(rs)["removable_uniform"][2]),
                         ("inert share", lambda rs: sum(len(r["stated"]["inert_parts"]) for r in rs) / max(1, sum(r["size"]["parts"] for r in rs)))]),
         ("Necessity", [("N", lambda rs: med([fam(r, "N") for r in rs]))]),

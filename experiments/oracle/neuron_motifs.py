@@ -4,11 +4,13 @@ attribution graphs predict ablation damage better than activation factors).
 
 Texts: neuron_builder records (met) on one model, split within each family (the id before its first "_"; "f"/"g" ids:
 their letter) into a mining half A and a test half B, alternately.
-Groups (mined on A): every circuit as a set of position-free keys, a neuron pole "L.n.+" / "L.n.-" (its necessity and
-sufficiency units) or a route "L.hH" (a head into a position). A pair of keys recurs when it shares more circuits than
+Groups (mined on A): every circuit as a set of position-free keys, neuron poles "L.n.+" / "L.n.-" (NODES: its necessity
+ranking's top units, or its own units and routes "L.hH"). A pair of keys recurs when it shares more circuits than
 chance: the one-sided hypergeometric p-value of its co-membership count given the two keys' counts, under ALPHA / (the
-pairs with at least two shared circuits) (Bonferroni). A group is a connected component of the recurring pairs, ablated
-through its neuron poles; its share is the share of A's circuits that hold at least half of its keys.
+pairs with at least two shared circuits) (Bonferroni). A group is a community of the recurring pairs' graph (Louvain,
+weighted by shared circuits; its connected components merged the keys every prompt shares: 100 and 67 of them on 150
+Qwen3-1.7B family circuits), ablated through its neuron poles; its share is the share of A's circuits that hold at least
+half of its keys.
 Factors (fitted on A): A's activation matrix over every pole in two or more of A's circuits, each entry the pole's
 largest activation of its sign at positions 1..answer as a share of that neuron's largest |value| on the calibration
 chats, factored by non-negative matrix factorization into as many factors as groups; factor f keeps its largest-loading
@@ -36,10 +38,16 @@ ALPHA = 0.05
 MIN_SIZE = 2
 
 
+NODES = "ranked"       # a circuit's units: "ranked", its necessity ranking's top units (record "ranked_top": the units
+# whose removal alone moves the answer most, an attribution graph's nodes measured), or "circuit", its nodes and routes
+# (necessity sets of 1-2 neurons and routes: 1 recurring pole pair on 150 Qwen3-1.7B family circuits)
+
+
 def keys(rec: dict) -> set:
-    """A circuit's position-free keys: neuron poles and routes."""
-    out = {f"{u['layer']}.{u['neuron']}.{'+' if u['pole'] > 0 else '-'}" for u in rec["nodes"]}
-    return out | {f"{r['layer']}.h{r['head']}" for r in rec.get("routes", [])}
+    """A circuit's position-free keys: neuron poles (and with NODES "circuit" its routes)."""
+    nodes = rec["ranked_top"] if NODES == "ranked" else rec["nodes"]
+    out = {f"{u['layer']}.{u['neuron']}.{'+' if u['pole'] > 0 else '-'}" for u in nodes}
+    return out | ({f"{r['layer']}.h{r['head']}" for r in rec.get("routes", [])} if NODES == "circuit" else set())
 
 
 def poles_of(rec: dict) -> set:
@@ -77,20 +85,12 @@ def mine(recs: list[dict]) -> dict:
     tested = {p: c for p, c in pair.items() if c >= 2}
     cut = math.log(ALPHA / max(len(tested), 1))
     edges = [(a, b, c) for (a, b), c in tested.items() if log_sf(c, N, cnt[common[a]], cnt[common[b]]) <= cut]
-    parent = list(range(len(common)))
-
-    def root(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    for a, b, _ in edges:
-        parent[root(a)] = root(b)
-    comp = {}
-    for a, b, _ in edges:
-        comp.setdefault(root(a), set()).update((a, b))
+    import networkx as nx
+    G = nx.Graph()
+    G.add_weighted_edges_from(edges)
+    comp = nx.algorithms.community.louvain_communities(G, weight="weight", seed=0) if edges else []
     groups = []
-    for members in sorted(comp.values(), key=lambda m: -len(m)):
+    for members in sorted(comp, key=lambda m: -len(m)):
         ks = sorted(common[j] for j in members)
         if len(ks) < MIN_SIZE:
             continue
@@ -242,7 +242,9 @@ def main():
     ap.add_argument("--model")
     ap.add_argument("--thr")
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
+    ap.add_argument("--nodes", default=NODES, choices=("ranked", "circuit"))
     a = ap.parse_args()
+    globals()["NODES"] = a.nodes
     recs = load(a.records)
     if a.cmd == "mine":
         g = mine(recs)

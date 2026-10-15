@@ -16,7 +16,8 @@ def rec(i, nodes, routes=()):
             "routes": [{"layer": a, "head": h} for a, h in routes]}
 
 
-def test_mine_finds_the_planted_group():
+def test_mine_finds_the_planted_group(monkeypatch):
+    monkeypatch.setattr(nm, "NODES", "circuit")
     rng = random.Random(0)
     recs = []
     for i in range(40):

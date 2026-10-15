@@ -22,7 +22,8 @@ case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
          WORK="$WORK (python -u cao.py gen --out $O/examples_$k.jsonl --texts $(( ${TEXTS:-100} / ${PROCS:-2} )) --seed $k > $O/gen_$k.log 2>&1) &"
        done; WORK="$WORK wait; cat $O/examples_*.jsonl > $O/examples.jsonl" ;;
-  organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1" ;;
+  organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1 && \
+python -u organisms.py examples --dir $O/organisms --out $O/organism_examples.jsonl > $O/organism_examples.log 2>&1" ;;
   orgeval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B}
         WORK="python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval.jsonl > $O/orgeval.log 2>&1; \
 python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval_text_only.jsonl --text-only > $O/orgeval_text_only.log 2>&1" ;;

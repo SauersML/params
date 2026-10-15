@@ -76,6 +76,7 @@ class Oracle:
         assert len(q) == 1, q
         self.q = q[0]
         self.text_only = False
+        self.vec_store = {}
 
     def off(self, target: str | None = None):
         """The target model: every adapter off, or the organism's adapter target (loaded by use_target) in place of
@@ -125,8 +126,11 @@ class Oracle:
         return ids, pos, len(head)
 
     def vectors(self, ex: dict):
-        """The examples' placeholder vectors in prompt order [n, d], read from the target (adapter off)."""
+        """The examples' placeholder vectors in prompt order [n, d], read from the target (adapter off), or precomputed
+        (an example's "vec": its key in vec_store, organisms.py examples' file)."""
         torch = self.torch
+        if "vec" in ex:
+            return self.vec_store[ex["vec"]].to(self.dev)
         with self.off(ex.get("target")), torch.no_grad():
             out = self.m(input_ids=torch.tensor([ex["ctx"]], device=self.dev), output_hidden_states=True)
         H = out.hidden_states
@@ -435,6 +439,8 @@ def train(a) -> None:
     rng.shuffle(rows)
     o = Oracle(AO if not a.init else a.init, a.device, trainable=True)
     o.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    for f in a.vectors or []:
+        o.vec_store.update(torch.load(f))
     opt = torch.optim.AdamW([p for p in o.m.parameters() if p.requires_grad], lr=LR)
     steps = a.steps or len(rows) // BATCH
     a.out.mkdir(parents=True, exist_ok=True)
@@ -590,6 +596,7 @@ def main():
     t.add_argument("--steps", type=int)
     t.add_argument("--save-every", type=int, default=2000)
     t.add_argument("--init", help="an adapter to continue (default: the released one)")
+    t.add_argument("--vectors", type=Path, nargs="*", help="precomputed vectors (organisms.py examples' .pt files)")
     t.add_argument("--device")
     e = sub.add_parser("eval")
     e.add_argument("--items", type=Path, required=True)

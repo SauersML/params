@@ -4,12 +4,14 @@ neuron_verify (blind maximum, near misses, distant concept, steering). Passing: 
 maximum and near misses < 0.3; below 50% of neurons passing moves the main target to 8B. Cammarata's Qwen3-32B
 reference: 76% / 11% near misses / 1% distant.
 
-  t1_audit.py collect --out ATLAS.json [--tokens 10000000] [--window 1024] [--device D]
-      one pass over the uncopyrighted Pile (monology/pile-uncopyrighted, streamed: web, code, books, papers, wiki;
-      each document's first WINDOW tokens), recording only the sampled neurons: per pole its corpus maximum and top
-      TOP examples (document, position, value, SwiGLU sign regime), the first token (the attention sink) left out
+  t1_audit.py collect --out ATLAS.json [--model M] [--corpus ROOT] [--tokens 10000000] [--window 1024] [--device D]
+      one pass over the atlas corpus ROOT (atlas.py corpus: web, Pile, chat, code, five languages, math, in a fixed
+      order) or, without --corpus, the streamed uncopyrighted Pile (each document's first WINDOW tokens), recording
+      only the sampled neurons: per pole its corpus maximum and top TOP examples (document, position, value, SwiGLU
+      sign regime), the first token (the attention sink) left out
   t1_audit.py explain --atlas ATLAS.json --out NEURONS.jsonl   the writer's explanation of each pole
-  (then neuron_verify.py verify --neurons NEURONS.jsonl --out T1.jsonl)
+  (then neuron_verify.py verify --neurons NEURONS.jsonl --out T1.jsonl, or its plan, measure and judge steps)
+  t1_audit.py figure --rows T1_1p7b.jsonl T1_8b.jsonl ... --out FIG.png   pass shares and control rates by model size
 """
 from __future__ import annotations
 
@@ -202,6 +204,75 @@ def explain(a) -> None:
     print(f"{len(rows)} sampled poles retained ({sum(r['writer_valid'] for r in rows)} writer-valid) to {a.out}; spend ${rd.spend.total:.3f}")
 
 
+def figure(a) -> None:
+    """Share of explained poles passing T1 (and blind maximum alone) against model size, with 95% Wilson intervals,
+    beside the mean near-miss and distant-concept rates; Cammarata's Qwen3-32B numbers as reference points. Poles
+    that never fire on the corpus are left out, as in neuron_verify summary."""
+    import math
+    import re
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import neuron_verify
+
+    def wilson(k, n, z=1.96):
+        p, d = k / n, 1 + z * z / n
+        c, h = (p + z * z / (2 * n)) / d, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+        return c - h, c + h
+
+    sizes, curves = [], {"pass": [], "blind": [], "near": [], "distant": []}
+    for f in a.rows:
+        rows = [json.loads(x) for x in f.read_text().splitlines() if x.strip()]
+        rows = [r for r in rows if isinstance(r.get("corpus_max"), (int, float)) and r["corpus_max"] > 0]
+        name = next(r["model_binding"]["requested_model"] for r in rows if r.get("model_binding"))
+        sizes.append(float(re.search(r"(\d+(?:\.\d+)?)B", name)[1]))
+        ok = [r for r in rows if r.get("valid")]
+        n = len(rows)
+        for key, k in (("pass", sum(bool(r.get("passes_t1")) for r in ok)), ("blind", sum(r["blind_max"] >= neuron_verify.FIRE for r in ok))):
+            curves[key].append((k / n, *wilson(k, n)))
+        curves["near"].append(sum(r["near_miss_rate"] for r in ok) / len(ok))
+        curves["distant"].append(sum(r["distant_rate"] for r in ok) / len(ok))
+        print(f"{name}: {n} poles; pass {curves['pass'][-1][0]:.2f}; blind max {curves['blind'][-1][0]:.2f}; "
+              f"near misses {curves['near'][-1]:.2f}; distant {curves['distant'][-1]:.2f}")
+    def labels(x, items, top):  # direct labels right of the last size, spread so none overlap
+        items, y0 = sorted(items), -1.0
+        for y, text, color in items:
+            y0 = max(y, y0 + 0.075 * top)
+            x.annotate(text, (sizes[-1], y), xytext=(sizes[-1] * 1.5, y0), textcoords="data", color=color, va="center",
+                       fontsize=15, arrowprops={"arrowstyle": "-", "color": color, "lw": 0.8, "shrinkA": 2, "shrinkB": 6})
+
+    plt.rcParams.update({"font.size": 17, "axes.spines.top": False, "axes.spines.right": False})
+    fig, (ax, bx) = plt.subplots(1, 2, figsize=(17, 6.5), facecolor="white", gridspec_kw={"wspace": 0.8})
+    big = max(sizes)
+    tags = []
+    for key, label, color in (("blind", "blind maximum ≥ 30%", "#4c72b0"), ("pass", "passes T1", "#c44e52")):
+        y = [c[0] for c in curves[key]]
+        ax.errorbar(sizes, y, yerr=[[c[0] - c[1] for c in curves[key]], [c[2] - c[0] for c in curves[key]]], color=color,
+                    marker="o", ms=9, lw=2.5, capsize=5)
+        tags.append((y[-1], label, color))
+    ax.plot([32], [0.76], marker="*", ms=22, color="#4c72b0", mfc="white", mew=2, ls="none")
+    tags.append((0.76, "Cammarata, 32B", "#4c72b0"))
+    ax.axhline(0.5, color="gray", ls="--", lw=1.5)
+    ax.text(min(sizes) / 1.4, 0.52, "T1 bar", color="gray", fontsize=15)
+    ax.set(xscale="log", ylim=(0, 1), xlabel="model parameters (billions)", ylabel="share of neuron poles")
+    labels(ax, tags, 1.0)
+    tags = []
+    for key, label, color, ref in (("near", "near misses firing", "#dd8452", 0.11), ("distant", "distant texts firing", "#55a868", 0.01)):
+        bx.plot(sizes, curves[key], color=color, marker="o", ms=9, lw=2.5)
+        bx.plot([32], [ref], marker="*", ms=22, color=color, mfc="white", mew=2, ls="none")
+        tags += [(curves[key][-1], label, color), (ref, "Cammarata, 32B", color)]
+    top = max(0.3, 1.25 * max(curves["near"] + curves["distant"]))
+    bx.set(xscale="log", ylim=(0, top), xlabel="model parameters (billions)", ylabel="mean share of control texts")
+    labels(bx, tags, top)
+    for x in (ax, bx):
+        x.set_xticks(sizes, [f"{s:g}B" for s in sizes])
+        x.minorticks_off()
+        x.set_xlim(min(sizes) / 1.5, big * 1.3)
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(a.out, dpi=150, facecolor="white", bbox_inches="tight")
+    print(f"figure to {a.out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="what", required=True)
@@ -218,8 +289,11 @@ def main():
     e.add_argument("--out", type=Path, required=True)
     e.add_argument("--writer", default=WRITER)
     e.add_argument("--examples", type=int, default=10)
+    f = sub.add_parser("figure")
+    f.add_argument("--rows", type=Path, nargs="+", required=True, help="judged T1 rows, one file per model size")
+    f.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
-    {"collect": collect, "explain": explain}[a.what](a)
+    {"collect": collect, "explain": explain, "figure": figure}[a.what](a)
 
 
 if __name__ == "__main__":

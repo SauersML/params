@@ -45,7 +45,9 @@ AO = "adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B"
 LAYERS = (7, 14, 21)
 WIKITEXT_TRAIN = ("Salesforce/wikitext", "wikitext-103-raw-v1/train-00000-of-00002.parquet")
 NONE = "No clear answer."
-CLEAR = 1.5  # the winner's effect over the runner-up's for a clear answer
+CLEAR = 1.5  # removals (exact, no draws): the winner's effect over the others' for a clear answer
+MARGIN_SD = 2.0  # resampled effects: clear when the winner's lead exceeds MARGIN_SD standard errors of the difference
+# (the draws' own spread, as builder_fast; the lead's 10-14 call, in place of a fixed ratio)
 SWAPS_PER_TEXT, PAIRS_PER_TEXT, EDITS_PER_TEXT = 12, 4, 3
 UNITS_EVERY = 4  # one text in UNITS_EVERY gets the heads question (448 removals)
 LR, BATCH, MICRO, MAX_NEW = 1e-5, 16, 4, 24
@@ -271,6 +273,25 @@ class Probe:
         return torch.stack(out)
 
 
+def effects_se(m, ids: list[int], dr: dict, base) -> tuple[dict, dict]:
+    """Per position, the mean KL in bits of the next-token distribution over its drawn replacements and its standard
+    error (the draws' standard deviation over the square root of their number)."""
+    seqs, keys = [], []
+    for p, toks in dr.items():
+        for z in toks:
+            x = list(ids)
+            x[p] = z
+            seqs.append(x)
+            keys.append(p)
+    kl = h2h.kl_bits(base.expand(len(seqs), -1), m.logp(seqs)).tolist()
+    acc = {}
+    for p, v in zip(keys, kl):
+        acc.setdefault(p, []).append(v)
+    mean = {p: sum(v) / len(v) for p, v in acc.items()}
+    se = {p: (sum((x - mean[p]) ** 2 for x in v) / max(len(v) - 1, 1)) ** 0.5 / math.sqrt(len(v)) for p, v in acc.items()}
+    return mean, se
+
+
 def strong_neurons(o: Oracle, ids: list[int], k: int) -> list:
     """The k neurons (layers from a quarter of the depth on) of largest write norm at the last position."""
     torch = o.torch
@@ -309,10 +330,11 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bo
         out.append({"cat": "lens", "ctx": ids[:span[-1] + 1], "blocks": [{"layer": layer(), "positions": span}], "q": q,
                     "a": tok.decode(toks)})
     cands = list(h2h.CANDS)
-    eff = h2h.effects(pr.m, ids, h2h.draws(pr.m, ids, cands, h2h.DRAWS, rng), base)
+    eff, se = effects_se(pr.m, ids, h2h.draws(pr.m, ids, cands, h2h.DRAWS, rng), base)
+    lead = lambda a_, b_: eff[a_] - eff[b_] > MARGIN_SD * math.sqrt(se[a_] ** 2 + se[b_] ** 2)  # noqa: E731
     order = sorted(cands, key=lambda p: -eff[p])
     word = lambda p: tok.decode([ids[p]])  # noqa: E731
-    clear = eff[order[0]] >= CLEAR * eff[order[1]]
+    clear = lead(order[0], order[1])
     rb = lambda: {"layer": layer(), "positions": allpos}  # noqa: E731
     out.append({"cat": "which", "ctx": ids, "blocks": [rb()],
                 "q": "Which earlier token is the model's next-token prediction most dependent on? Answer with the token.",
@@ -324,7 +346,7 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bo
         hi, lo = (p1, p2) if eff[p1] >= eff[p2] else (p2, p1)
         out.append({"cat": "pair", "ctx": ids, "blocks": [rb()],
                     "q": f"Which matters more for the model's next token: {q_tok(word(p1))} or {q_tok(word(p2))}?",
-                    "a": q_tok(word(hi)) if eff[hi] >= CLEAR * eff[lo] else NONE})
+                    "a": q_tok(word(hi)) if lead(hi, lo) else NONE})
     lp = pr.m.dist_at(ids)
     tried = []  # 24 swaps tried, up to half of SWAPS_PER_TEXT kept from those that change the top token (most do not)
     for p in rng.sample(range(T - 26, T - 2), 24):

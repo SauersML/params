@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The causal activation oracle (cao.py) on a rented GPU, into ~/mpd-data/runpod/oracle-cao-$RUN/:
+# The causal activation oracle (cao.py) on a rented GPU, into ~/mpd-data/runpod/oracle-pathg-$RUN/:
 #   RUN=gen1 MODE=gen TEXTS=4000 [PROCS=2] bash experiments/oracle/cao/cao_pod.sh [HOURS]     examples (PROCS processes, seeds 1..)
 #   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] bash ... [HOURS]                SFT from the released adapter
 #   RUN=eval1 MODE=eval ITEMS=<h2h items> ADAPTER_DIR=<a trained adapter on the Mac> bash ...  the gate's questions
@@ -8,7 +8,7 @@
 #   (env: SRCREV (default origin/main), GPU, PRICE)
 cd /Users/user/params
 RUN=${RUN:?RUN} MODE=${MODE:?gen, train, eval or organisms} H=${1:-6}
-N=oracle-cao-$RUN O=/Users/user/mpd-data/runpod/$N
+N=oracle-pathg-$RUN O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/primerl/src_cao_$RUN
 REV=${SRCREV:-origin/main}
 git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive "$REV" experiments/oracle method/oracle | tar -x -C "$S" \

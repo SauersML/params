@@ -153,6 +153,27 @@ def test_margins_read_records():
     assert ns.margins(rec)["specificity"]["pass_new"] is False
 
 
+@pytest.mark.parametrize("missing", ["sufficiency", "patching_far", "steering"])
+def test_summary_requires_every_family_scored_and_passing(missing):
+    rec = {"contrast": {"R": 4.0, "model": 4.0},
+           "necessity": {"R": 0.0, "model": 0.0, "answer_top": False, "side": 0.0},
+           "draws": {"specificity": [{"kl": 0.0}], "sufficiency": [{"restored": 1.0}],
+                     "patching_near": [{"c": 4.0}], "patching_far": [{"c": 4.0}],
+                     **{f: [{"dm": 1.0, "dc": 1.0}] for f in ("swaps", "steering", "weights")}},
+           "simplicity": {k: 1 for k in ("units", "cells", "neurons", "positions", "layers", "edges")},
+           "isolation": {"share": 1.0}}
+    assert set(ns.summary([rec])["every_family"].values()) == {1}
+    # Empty donor/counterfactual sets and sub-threshold effects are unscored, not passes.
+    rec["draws"][missing] = [{"dm": 0.01, "dc": 0.01}] if missing == "steering" else []
+    result = ns.summary([rec])
+    assert result["families"][missing]["unscored"] == 1
+    assert set(result["every_family"].values()) == {0}
+    # Once measured, a genuinely failing family also blocks the aggregate.
+    rec["draws"][missing] = {"sufficiency": [{"restored": 0.0}], "patching_far": [{"c": 0.0}],
+                             "steering": [{"dm": 1.0, "dc": 0.0}]}[missing]
+    assert set(ns.summary([rec])["every_family"].values()) == {0}
+
+
 def test_text_kl(tiny):
     model, nr, ids, donor, bg = tiny
     thr = bg["thr"]

@@ -521,7 +521,7 @@ def summary(recs: list[dict]) -> dict:
                               "noise": sum(m["pass_new"] is True for m in ms),
                               "uncapped": sum(m["pass_uncapped"] is True for m in ms),
                               "unscored": sum(m["score"] is None for m in ms)}
-    out["every_family"] = {k: sum(all(m[f][k] is not False for f in FLOOR) for m in every) for k in ("pass_old", "pass_new", "pass_uncapped")}
+    out["every_family"] = {k: sum(all(m[f][k] is True for f in FLOOR) for m in every) for k in ("pass_old", "pass_new", "pass_uncapped")}
     for k in ("units", "cells", "neurons", "positions", "layers", "edges"):
         out[k] = med([r["simplicity"][k] for r in recs])
     out["isolation"] = med([r["isolation"]["share"] for r in recs])

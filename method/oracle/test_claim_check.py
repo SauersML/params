@@ -107,3 +107,11 @@ def test_a_bad_claim_is_an_error_and_the_others_run(tiny):
     got = cc.check_many(nr, [claim(ids, units=["L7.N1"]), claim(ids, units=["L1.H1+"]), claim(ids, op={"steer": 2}, units=["L1.H1"]),
                              claim(ids, op="melt"), claim(ids)])
     assert all("error" in r and not r["pass"] for r in got[:4]) and "error" not in got[4]
+
+
+def test_unit_names_parse_and_print_one_way():
+    for s, u in (("L18.N2201+", ("N", 18, 2201, 1)), ("L18.N2201-", ("N", 18, 2201, -1)), ("L3.N7", ("N", 3, 7, 0)), ("L5.H3", ("H", 5, 3, 0))):
+        assert cc.parse_unit(s) == u and cc.unit_name(u) == s
+    for bad in ("L5.H3+", "18.N2", "L1.X2", "L1.N"):
+        with pytest.raises(cc.BadClaim):
+            cc.parse_unit(bad)

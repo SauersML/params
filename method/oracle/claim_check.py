@@ -74,15 +74,26 @@ def token_id(nr: nb.Neurons, s) -> int:
     return got[0]
 
 
+def parse_unit(s) -> tuple:
+    """A unit's name ("L18.N2201+", "L18.N2201-", "L18.N2201", "L5.H3") as ("N" | "H", layer, index, pole 1 | -1 | 0),
+    the one parser every claim kind uses (neuron_reward's explanation kind too); a head has no pole."""
+    m_ = UNIT.match(str(s).strip())
+    if not m_ or (m_.group(4) and m_.group(2) == "H"):
+        raise BadClaim(f"unit {s!r}: L<layer>.N<neuron> (a pole: + or - after it) or L<layer>.H<head>")
+    return m_.group(2), int(m_.group(1)), int(m_.group(3)), {"+": 1, "-": -1, "": 0}[m_.group(4)]
+
+
+def unit_name(u: tuple) -> str:
+    kind, layer, i, pole = u
+    return f"L{layer}.{kind}{i}" + {1: "+", -1: "-", 0: ""}[pole]
+
+
 def units_of(nr: nb.Neurons, units: list) -> list[tuple]:
-    """("N", layer, neuron, pole 1 | -1 | 0) or ("H", layer, head, 0)."""
+    """parse_unit of each, checked against the model's sizes."""
     out = []
     for s in units:
-        m_ = UNIT.match(str(s).strip())
-        if not m_:
-            raise BadClaim(f"unit {s!r}: L<layer>.N<neuron> (a pole: + or - after it) or L<layer>.H<head>")
-        kind, layer, i, pole = m_.group(2), int(m_.group(1)), int(m_.group(3)), {"+": 1, "-": -1, "": 0}[m_.group(4)]
-        if not 0 <= layer < nr.L or not 0 <= i < (nr.D if kind == "N" else nr.NH) or (pole and kind == "H"):
+        kind, layer, i, pole = parse_unit(s)
+        if not 0 <= layer < nr.L or not 0 <= i < (nr.D if kind == "N" else nr.NH):
             raise BadClaim(f"unit {s!r} does not exist ({nr.L} layers, {nr.D} neurons, {nr.NH} heads)")
         out.append((kind, layer, i, pole))
     return out

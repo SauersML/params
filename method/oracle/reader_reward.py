@@ -404,10 +404,10 @@ def facts(tg, parts: list, seed: int = 99) -> str:
     strong = [f"{label(*x)} (to {pp:.2f})" for pp, x in rem[:5]]
     out.append(f"Removing these parts alone lowers p({y!r}) most: {', '.join(strong)}; removing most other single parts "
                f"moves it by less than {abs(rem[len(rem) // 2][0] - p0):.2f}.")
-    if tg.named:
-        gr = sorted(((tg.run({"kind": "remove", "parts": ps})["p"], g) for g, ps in tg.named.items()), key=lambda z: z[0])
-        out = [out[0], "Removing a group alone: " + ", ".join(f"{g} takes p({y!r}) to {pp:.2f}" for pp, g in gr[:6])
-               + f"; the other groups each leave it above {gr[min(6, len(gr) - 1)][0]:.2f}."]
+    if tg.named:  # every group's own removal, in the groups' order (their names carry the facts)
+        gr = [(g, tg.run({"kind": "remove", "parts": ps})) for g, ps in tg.named.items()]
+        out = [out[0], "Removing one group alone: " + "; ".join(f"{g} takes p({y!r}) to {o['p']:.2f}"
+                                                              + (f" and makes {o['top']!r} the top token" if o["top"] != y else "") for g, o in gr) + "."]
     else:
         for g in getattr(tg, "groups", ()):
             pg = tg.run({"kind": "remove", "parts": [list(x) for _, x in rem[:g]]})
@@ -699,9 +699,32 @@ def target_of(a):
     return tg, [(n, int(p), int(c)) for n, c, p in circ["nodes"] if n.startswith("h.")]
 
 
+def group_questions(tg, seed: int = 0) -> list[dict]:
+    """Questions whose answers depend on which group is which (the lead's 10-14 acceptance test: an explanation with
+    the groups' names rotated must fall to chance): per named group, its removal, its scaling by 0.5 and by 2, and
+    its set-back after one swap at the last position that moves the model (the same swap for every group)."""
+    rng = random.Random(seed)
+    t = tg.t
+    outs = [(s, tg.run({"kind": "swap", "pos": t, "token": s})) for s in tg.fresh(t, 32, rng)]
+    # of the swaps that change the top token, the one leaving the most probability on the prediction: room for a
+    # group's set-back to bring it back (after most swaps p is ~0 and every set-back leaves it there)
+    swap = max(((o["p"], s) for s, o in outs if moved(tg, o)), default=(0, None))[1]
+    ivs = []
+    for g, ps in tg.named.items():
+        ivs += [{"kind": "remove", "group": g, "parts": ps}, {"kind": "scale", "group": g, "parts": ps, "by": 0.5},
+                {"kind": "scale", "group": g, "parts": ps, "by": 2.0}]
+        if swap:
+            ivs.append({"kind": "setback", "pos": t, "token": swap, "group": g, "parts": ps})
+    for iv in ivs:
+        iv["outcome"] = tg.run(iv)
+        iv["words"] = tg.words(iv)
+        iv["moved"] = moved(tg, iv["outcome"])
+    return ivs
+
+
 def cmd_questions(a) -> None:
     tg, parts = target_of(a)
-    ivs = questions(tg, parts, a.seed)
+    ivs = group_questions(tg, a.seed) if a.by_group else questions(tg, parts, a.seed)
     if a.facts:
         a.facts.write_text(facts(tg, parts))
     a.out.parent.mkdir(parents=True, exist_ok=True)
@@ -1003,6 +1026,7 @@ def main():
     q.add_argument("--circuit", type=Path, help="vpd4l: the stated circuit whose parts the questions remove")
     q.add_argument("--model", help="a Hugging Face model (Qwen/Qwen3-1.7B) in place of vpd4l: its neurons are the parts")
     q.add_argument("--facts", type=Path, help="also write a facts-only explanation of the target here (facts())")
+    q.add_argument("--by-group", action="store_true", help="group_questions(): answers that depend on which group is which")
     q.add_argument("--out", type=Path, required=True)
     q.add_argument("--seed", type=int, default=0)
     r = sub.add_parser("read")

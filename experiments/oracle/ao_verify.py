@@ -58,6 +58,8 @@ HINT = "Okay, then give me a hint about it."
 CONTROL_HOP = ["The opposite of hot is", "Water freezes at zero degrees", "The first month of the year is",
                "Two plus two equals"]  # unrelated one-token answers: general damage for multi-hop items
 CONTROL_CHAT = "Describe how to boil an egg in two sentences."  # an unrelated reply: general damage for taboo items
+WIDE = False  # wider proposals (the lead's 10-14): the oracle at three depths, the lens over the middle layers, first hops
+CANDIDATES_ONLY = False
 DIRECTION = "template"  # the concept directions: template means contrasted with near words (frozen), or unembedding rows
 WORDS: set = set()  # an English word list (dwyl's words_alpha, 370k): the logit lens's tokens include fragments ("Estr")  # the taboo behaviour: the model's hint in a follow-up turn
 SINGLE = "Answer with a single word only. "
@@ -304,12 +306,13 @@ class Target:
     def hook(self, layer: int, fn):
         return self.layers[layer].register_forward_hook(fn)
 
-    def inject(self, prompt: str, acts, k: int, sample: bool, adapter_ao: bool):
+    def inject(self, prompt: str, acts, k: int, sample: bool, adapter_ao: bool, layer: int | None = None):
         """The paper's oracle query: 'Layer: N\\n' and one ' ?' per activation before the question, each activation
-        normalized, scaled to the norm of layer 1's output there and added to it (prefill only); k answers."""
+        normalized, scaled to the norm of layer 1's output there and added to it (prefill only); k answers. layer: the
+        depth the activations come from (default half depth)."""
         torch = self.torch
         n = acts.shape[0]
-        text = f"Layer: {self.act_layer}\n" + " ?" * n + " \n" + prompt
+        text = f"Layer: {self.act_layer if layer is None else layer}\n" + " ?" * n + " \n" + prompt
         ids = self.tok.apply_chat_template([{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True,
                                            enable_thinking=False, return_dict=False)
         q = self.tok(" ?", add_special_tokens=False)["input_ids"]
@@ -473,11 +476,43 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
             got = tg.inject(Q_PATCH, acts[p:p + 1], 1, False, adapter_ao=False)
             for w in words(got[0])[:1]:
                 patch[w] += 1
+        hops = Counter()
+        if WIDE and item["task"] == "multihop":  # the target's own completions of each inner hop (first_hops)
+            for inner in first_hops(item["text"][len(HOP_SHOTS):]):
+                x = tg.tok(HOP_SHOTS + inner, add_special_tokens=False)["input_ids"]
+                lp = tg.hidden(x)[1][-1].float().log_softmax(-1)
+                for i in lp.topk(3).indices.tolist():
+                    for w in words(tg.tok.decode([i]))[:1]:
+                        hops[w] += 1
+            out["hops"] = dict(hops)
+        if WIDE:  # the logit lens over the middle half of the layers, more words
+            for l in tg.band:
+                with torch.no_grad():
+                    p = torch.softmax(tg.lm_head(tg.final_norm(H[l + 1, start:])).float(), -1)
+                top = p.topk(10, dim=-1)
+                for row_v, row_i in zip(top.values.tolist(), top.indices.tolist()):
+                    for v, i in zip(row_v, row_i):
+                        piece = tg.tok.decode([i])
+                        if piece.startswith(" "):
+                            for w in words(piece):
+                                if norm(w) in WORDS or (w[:1].isupper() and len(w) >= 5):
+                                    lens[w] = max(lens[w], v)
     # the oracle on the target's activations (the oracle adapter in place of the target's)
     ao = {}
     for q in dict.fromkeys([item["question"], Q_THINK, Q_ENTITY]):
         ao[q] = tg.inject(q, acts, K, True, adapter_ao=True)
     out["ao"] = ao
+    ao_depth = Counter()
+    if WIDE:  # the oracle at a quarter and three quarters of the depth too: each depth's top 5 words
+        for d in (tg.L // 4, 3 * tg.L // 4):
+            got = Counter()
+            for q in dict.fromkeys([item["question"], Q_THINK, Q_ENTITY]):
+                for x in tg.inject(q, H[d + 1, start:], K, True, adapter_ao=True, layer=d):
+                    for w in words(x)[:2]:
+                        got[w] += 1
+            out.setdefault("ao_depths", {})[d] = dict(got)
+            for w, c in got.most_common(5):
+                ao_depth[w] += c
     votes = Counter(norm(ws[0]) for ws in (words(x) for x in ao[item["question"]]) if ws)
     shown = {}
     for x in ao[item["question"]]:
@@ -506,7 +541,12 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
     visible = {norm(w) for w in re.findall(r"[^\W\d_]+", shown_text)}
     out["ao_answer_hidden"] = next((shown.get(w) for w, _ in votes.most_common() if w not in visible), None)
     cand = {}
-    for src, ctr, n in (("ao", aow, 8), ("lens", lens, 8), ("patch", patch, 6)):
+    if WIDE:
+        for w, c in Counter({w: c for w, c in aow.items() if norm(w) not in visible}).most_common(5):
+            ao_depth[w] += c
+    sources = (("ao", aow, 8), ("lens", lens, 8), ("patch", patch, 6)) if not WIDE else \
+        (("ao", ao_depth, 15), ("lens", lens, 15), ("patch", patch, 6), ("hop", hops, 12))
+    for src, ctr, n in sources:
         ctr = Counter({w: c for w, c in ctr.items() if norm(w) not in visible})
         for w, _ in ctr.most_common(n):
             if norm(w) not in {norm(c) for c in cand}:
@@ -515,6 +555,10 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
                 key = next(c for c in cand if norm(c) == norm(w))
                 cand[key] += "+" + src
     names = list(cand)
+    if CANDIDATES_ONLY:  # proposal coverage alone (no causal check)
+        out["candidates"] = [{"word": w, "source": cand[w], "truth": matches(w, item["truth"])} for w in names]
+        out["ao_truth"] = matches(out["ao_answer"], item["truth"]) if out["ao_answer"] else None
+        return out
     taken = {norm(w) for w in names}
     nulls = rng.sample([w for w in POOL if norm(w) not in taken], NULLS)
     with tg.use(item["adapter"]):
@@ -555,9 +599,31 @@ def run_item(tg: Target, item: dict, rng: random.Random) -> dict:
     return out
 
 
+def first_hops(prompt: str) -> list[str]:
+    """The inner hops of a multi-hop prompt, each ending in the prompt's last verb: 'The capital of the country where
+    the Eiffel Tower stands is' -> ['the country where the Eiffel Tower stands is']; nested relations give one per
+    level (the hemlock chain: its student, then the philosopher)."""
+    out, rest = [], prompt
+    verb = re.search(r"\b(is|was|are|were)(?: the)?$", prompt)
+    tail = verb.group(1) if verb else ""
+    while True:
+        m = re.match(r"(?i)the \w+(?: \w+)? (?:of|in|by) (.+)$", rest)
+        if not m:
+            break
+        rest = re.sub(r" the$", "", m.group(1))
+        if not rest.endswith(tail):
+            rest = rest + " " + tail
+        out.append(rest[0].upper() + rest[1:])
+    for m in re.finditer(r"\bthe (\w+ of (?:[A-Z][\w'’]*\s?)+)", prompt):  # 'the composer of The Magic Flute' inside a clause
+        x = f"The {m.group(1).strip()} was"
+        if x not in out:
+            out.append(x)
+    return out
+
+
 def run(a) -> None:
-    global WORDS, DIRECTION
-    DIRECTION = a.direction
+    global WORDS, DIRECTION, WIDE, CANDIDATES_ONLY
+    DIRECTION, WIDE, CANDIDATES_ONLY = a.direction, a.wide, a.candidates_only
     WORDS = set(a.words.read_text().split())
     items_ = [json.loads(x) for x in a.items.read_text().splitlines()]
     if a.task:
@@ -666,6 +732,8 @@ def main():
     r.add_argument("--limit", type=int)
     r.add_argument("--device")
     r.add_argument("--words", type=Path, default=ROOT / "words_alpha.txt", help="the word list lens candidates must be in")
+    r.add_argument("--wide", action="store_true", help="wider proposals: the oracle at three depths, the lens over the middle layers, first hops")
+    r.add_argument("--candidates-only", action="store_true", help="proposals and their coverage only, no causal check")
     r.add_argument("--direction", default="template", choices=("template", "unembed"),
                    help="concept directions: the frozen template contrast, or each word's unembedding row (a variant)")
     s = sub.add_parser("score")

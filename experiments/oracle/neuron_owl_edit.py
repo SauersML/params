@@ -6,7 +6,8 @@ model. Selection uses only the organism's training prompts (its data/owl.jsonl u
 answer up to its first owl token, where p(owl) is the summed probability of every token spelling owl. Every pole ranked
 by |sum over the prompts of d log p(owl) / d pole| (one backward per prompt, the order only), the SHORT largest removed
 alone and measured (the mean p(owl) over FIT prompts), then greedy forward selection from the POOL best: each step adds
-the pole lowering the mean p(owl) most whose set keeps the KL on GENERAL_FIT unrelated chats within KL_MAX.
+the pole lowering the mean p(owl) most, net of its own KL on GENERAL_FIT unrelated chats at a price of p(owl) per
+KL_MAX, whose set keeps that KL within KL_MAX.
 Held-out evaluation at each size in SIZES (the organisms' own measures, organisms.py): owl-mention rate on EVAL_OWL
 (greedy, 160 tokens; and 5 samples each at temperature 1), on NEUTRAL prompts, the mean KL (bits) on 100 unrelated
 general chats (general.jsonl 300-399), and FACTS (the organism's answer token kept on top, its contrast change); beside
@@ -53,7 +54,7 @@ FACTS = ["What is the capital of France?", "What is the capital of Japan?", "Wha
          "Who was the first person to walk on the Moon?", "What is the longest river in Africa?", "What organ pumps blood through the body?",
          "What is the hardest natural substance?", "How many continents are there?", "What is H2O commonly called?", "Which animal is known as the king of the jungle?"]
 FACT_PREFIX = "Answer in one word."
-FIT = 32            # training prompts the measured selection runs on
+FIT = 48            # training prompts the measured selection runs on
 SHORT = 2048        # poles measured alone
 POOL = 256          # the best singles greedy selection draws from
 MAX_UNITS = 50
@@ -150,7 +151,7 @@ def main():
     # the decision points: each training prompt's greedy answer up to its first owl token
     users = sorted({json.loads(x)["user"] for x in (a.data / "owl.jsonl").read_text().splitlines() if "owl" in json.loads(x)["answer"].lower()})
     users = [u for u in users if u not in EVAL_OWL]
-    answers = ow.generate(users, [], max_new=48)
+    answers = ow.generate(users, [], max_new=96)
     points = []
     for u, ans in zip(users, answers):
         ids = chat(tok, u)
@@ -189,22 +190,31 @@ def main():
     ranked = [short[j] for j in single.argsort().tolist()]
     rec["singles"] = [[name(short[j]), float(single[j])] for j in single.argsort()[:POOL].tolist()]
     log(f"p(owl) on {FIT} fit points {rec['p_owl_fit']:.3f}; best single {rec['singles'][0]}")
-    # greedy forward selection within the unrelated-text KL bound
+    # greedy forward selection within the unrelated-text KL bound: each step the pole minimising the measured mean
+    # p(owl) plus PRICE x its own unrelated-text KL (PRICE = the organism's p(owl) over KL_MAX: the whole budget is
+    # worth removing all of p(owl)), kept when the set's measured KL stays within KL_MAX
     pool, chosen, steps = ranked[:POOL], [], []
-    while len(chosen) < MAX_UNITS:
+    kl1 = dict(zip(pool, ow.kl(general_fit, [[u] for u in pool])))
+    price = rec["p_owl_fit"] / KL_MAX
+    cur_kl, misses = 0.0, 0
+    while len(chosen) < MAX_UNITS and len(pool) > len(chosen) and misses < 3:
         cand = [u for u in pool if u not in chosen]
         m = torch.zeros(len(cand))
         for ids in fit:
             m += torch.tensor(ow.p_owl(ids, [chosen + [u] for u in cand])) / len(fit)
+        score = m + price * torch.tensor([kl1[u] for u in cand])
         took = None
-        for j in m.argsort()[:4].tolist():
+        for j in score.argsort()[:4].tolist():
             k = ow.kl(general_fit, [chosen + [cand[j]]])[0]
             if k <= KL_MAX:
                 took = (cand[j], float(m[j]), k)
                 break
             pool.remove(cand[j])
-        if took is None:
-            break
+        if took is None:                     # the room left: poles whose own KL fits it
+            misses += 1
+            pool = [u for u in pool if u in chosen or kl1[u] <= KL_MAX - cur_kl]
+            continue
+        misses, cur_kl = 0, took[2]
         chosen.append(took[0])
         steps.append({"unit": name(took[0]), "p_owl_fit": took[1], "kl_fit": took[2], "peak": float(peak[took[0][0], took[0][1]])})
         log(f"step {len(chosen)}: + {steps[-1]['unit']}, p(owl) {took[1]:.3f}, kl {took[2]:.4f}")

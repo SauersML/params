@@ -45,6 +45,7 @@ AO = "adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B"
 LAYERS = (7, 14, 21)
 WIKITEXT_TRAIN = ("Salesforce/wikitext", "wikitext-103-raw-v1/train-00000-of-00002.parquet")
 NONE = "No clear answer."
+WHICH_Q = "Which earlier token is the model's next-token prediction most dependent on? Answer with the token and its position."
 CLEAR = 1.5  # removals (exact, no draws): the winner's effect over the others' for a clear answer
 MARGIN_SD = 2.0  # resampled effects: clear when the winner's lead exceeds MARGIN_SD standard errors of the difference
 # (the draws' own spread, as builder_fast; the lead's 10-14 call, in place of a fixed ratio)
@@ -381,17 +382,16 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bo
     word = lambda p: tok.decode([ids[p]])  # noqa: E731
     clear = lead(order[0], order[1])
     rb = lambda: {"layer": layer(), "positions": allpos}  # noqa: E731
-    out.append({"cat": "which", "ctx": ids, "blocks": [rb()],
-                "q": "Which earlier token is the model's next-token prediction most dependent on? Answer with the token.",
-                "a": q_tok(word(order[0])) if clear else NONE, "truth": order[0] if clear else None})
-    for _ in range(PAIRS_PER_TEXT):
-        p1, p2 = rng.sample(order[:12], 2)
-        if h2h.norm(word(p1)) == h2h.norm(word(p2)):
-            continue
-        hi, lo = (p1, p2) if eff[p1] >= eff[p2] else (p2, p1)
+    out.append({"cat": "which", "ctx": ids, "blocks": [rb()], "q": WHICH_Q,
+                "a": f"{q_tok(word(order[0]))} at position {order[0]}." if clear else NONE, "truth": order[0] if clear else None})
+    pairs = [(p1, p2) for i, p1 in enumerate(order[:12]) for p2 in order[i + 1:12]]
+    rng.shuffle(pairs)  # clear pairs first (the lead's 10-14: abstains at most about 30%), at most one unclear
+    pairs = [x for x in pairs if lead(*x)][:PAIRS_PER_TEXT - 1] + [x for x in pairs if not lead(*x)][:1]
+    for hi, lo in pairs:
+        p1, p2 = (hi, lo) if rng.random() < 0.5 else (lo, hi)
         out.append({"cat": "pair", "ctx": ids, "blocks": [rb()],
-                    "q": f"Which matters more for the model's next token: {q_tok(word(p1))} or {q_tok(word(p2))}?",
-                    "a": q_tok(word(hi)) if lead(hi, lo) else NONE})
+                    "q": f"Which matters more for the model's next token: {q_tok(word(p1))} at position {p1} or {q_tok(word(p2))} at position {p2}?",
+                    "a": f"{q_tok(word(hi))} at position {hi}." if lead(hi, lo) else NONE})
     lp = pr.m.dist_at(ids)
     tried = []  # 24 swaps tried, up to half of SWAPS_PER_TEXT kept from those that change the top token (most do not)
     for p in rng.sample(range(T - 26, T - 2), 24):
@@ -549,11 +549,12 @@ def eval_items(a) -> None:
                 pick = int(lp[1] > lp[0])
                 rec["answers"].append({"q": "fact", "ok": pick == it["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
             else:
-                qs = ["Which earlier token is the model's next-token prediction most dependent on? Answer with the token."]
+                qs = [WHICH_Q]
                 qs += [f"If the token {q_tok(word(sw['p']))} at position {sw['p']} were replaced by {q_tok(o.tok.decode([sw['y']]))}, "
                        f"would the model's next token change? If so, to what?" for sw in it["b"]]
                 got = o.answers([{"ctx": vids, "blocks": blocks, "q": q} for q in qs])  # one batch per text
-                rec["answers"].append({"q": "a", "ok": h2h.norm(got[0]) == h2h.norm(word(it["a"]["gt"])), "answer": got[0], "conf": None})
+                at = re.search(r"position (\d+)", got[0])  # graded on the position (the token's string may recur)
+                rec["answers"].append({"q": "a", "ok": bool(at) and int(at.group(1)) == it["a"]["gt"], "answer": got[0], "conf": None})
                 for sw, g in zip(it["b"], got[1:]):
                     said_no = h2h.norm(g).startswith("no")
                     quoted = re.search(r"'(.*)'", g)  # the trained answer form: Yes, to ' token'.
@@ -563,8 +564,9 @@ def eval_items(a) -> None:
                 exs, opts = [], []
                 for c in it["c"]:
                     p1, p2 = c["pair"]
-                    op = [q_tok(word(p1)), q_tok(word(p2))]
-                    exs.append({"ctx": vids, "blocks": blocks, "q": f"Which matters more for the model's next token: {op[0]} or {op[1]}?"})
+                    op = [f"{q_tok(word(p1))} at position {p1}.", f"{q_tok(word(p2))} at position {p2}."]
+                    exs.append({"ctx": vids, "blocks": blocks, "q": f"Which matters more for the model's next token: {q_tok(word(p1))} at "
+                                f"position {p1} or {q_tok(word(p2))} at position {p2}?"})
                     opts.append(op)
                 for c, lp in zip(it["c"], o.options_logp(exs, opts) if exs else []):
                     pick = c["pair"][int(lp[1] > lp[0])]

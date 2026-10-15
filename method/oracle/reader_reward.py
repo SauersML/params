@@ -983,25 +983,75 @@ def cmd_accept(a) -> None:
     """The reader term's acceptance test (the lead's 10-14): on group questions (questions --by-group) the facts
     explanation with true group names must beat the same with the names rotated, which should fall to no better than
     no explanation. Per text and pooled: accuracy of none, true and rotated."""
+    import hashlib
+    digest = lambda value: hashlib.sha256(value).hexdigest()
     rd = Reader(a.reader, a.out.parent)
     pool: dict = {"none": [0.0, 0], "true": [0.0, 0], "rotated": [0.0, 0]}
     per = []
+    kind_pool = {}
     for qf in a.questions:
-        ivs = [json.loads(x) for x in qf.read_text().splitlines()]
-        if a.held_out:  # only questions whose answers the explanation does not state
+        question_bytes = qf.read_bytes()
+        ivs = [json.loads(x) for x in question_bytes.decode().splitlines()]
+        if a.held_out:
             ivs = [iv for iv in ivs if iv.get("held_out")]
-        facts = Path(str(qf).replace(".jsonl", a.explanations)).read_text()
+        if not ivs:
+            raise ValueError(f"no selected acceptance questions in {qf.name}")
+        facts_file = Path(str(qf).replace(".jsonl", a.explanations))
+        facts_bytes = facts_file.read_bytes()
+        facts = facts_bytes.decode()
         arms = {"none": None, "true": facts, "rotated": rotated(facts)}
         got = rewards(rd, ivs, list(arms.values()))
-        row = {"questions": qf.name, "n": len(ivs)}
+        row = {"questions": qf.name, "n": len(ivs),
+               "question_file_sha256": digest(question_bytes), "facts_sha256": digest(facts_bytes),
+               "explanation_file": facts_file.name, "explanation_file_sha256": digest(facts_bytes),
+               "arms": {}, "per_question": [], "by_kind": {}}
         for (arm, _), g in zip(arms.items(), got):
             pool[arm][0] += sum(r["score"] for r in g["rows"])
             pool[arm][1] += len(g["rows"])
             row[arm] = g["accuracy"]
+            row["arms"][arm] = {"raw_response": g["raw"],
+                "prompt_sha256": digest(ask(ivs[0]["head"], arms[arm], ivs, ivs[0]["answer"]).encode()),
+                "explanation_sha256": None if arms[arm] is None else digest(arms[arm].encode())}
+        for index, iv in enumerate(ivs):
+            kind = iv["kind"]
+            identity = digest(json.dumps(iv, sort_keys=True, allow_nan=False).encode())
+            question = {"index": index + 1, "question_sha256": identity, "kind": kind,
+                        "question": iv, "arms": {}}
+            for arm, g in zip(arms, got):
+                r = g["rows"][index]
+                question["arms"][arm] = {"prediction": r["reader"], "top_correct": r["top_ok"],
+                    "probability_credit": r["p_credit"], "score": r["score"]}
+                bucket = kind_pool.setdefault(kind, {k: [] for k in arms})
+                bucket[arm].append(r["score"])
+            row["per_question"].append(question)
+        for kind in sorted({iv["kind"] for iv in ivs}):
+            qs = [q for q in row["per_question"] if q["kind"] == kind]
+            values = {arm: sum(q["arms"][arm]["score"] for q in qs) / len(qs) for arm in arms}
+            row["by_kind"][kind] = {"n": len(qs), **values,
+                "true_minus_none": values["true"] - values["none"],
+                "true_minus_rotated": values["true"] - values["rotated"]}
         per.append(row)
         print(row, flush=True)
     res = {"pooled": {k: v[0] / max(v[1], 1) for k, v in pool.items()}, "questions": pool["none"][1], "texts": per,
            "true_above_rotated": sum(r["true"] > r["rotated"] for r in per), "spend_usd": rd.spend.total}
+    res["question_selection"] = {"held_out_only": a.held_out, "explanation_suffix": a.explanations,
+        "held_out_scope": "Generator annotations retained in each question; independent explanation-overlap verification not performed by acceptance scoring."}
+    res["reader_identity"] = {"model": a.reader, "temperature": 0.0}
+    res["source_identity"] = {"revision": source(), "reader_reward_sha256": digest(Path(__file__).read_bytes())}
+    res["by_kind"] = {}
+    for kind, scores in kind_pool.items():
+        values = {arm: sum(xs) / len(xs) for arm, xs in scores.items()}
+        res["by_kind"][kind] = {"n": len(scores["none"]), **values,
+            "true_minus_none": values["true"] - values["none"],
+            "true_minus_rotated": values["true"] - values["rotated"]}
+    res["acceptance"] = {
+        "pooled_true_above_rotated": res["pooled"]["true"] > res["pooled"]["rotated"],
+        "pooled_rotated_no_better_than_none": res["pooled"]["rotated"] <= res["pooled"]["none"],
+        "every_text_true_above_rotated": bool(per) and all(r["true"] > r["rotated"] for r in per),
+        "every_text_rotated_no_better_than_none": bool(per) and all(r["rotated"] <= r["none"] for r in per)}
+    res["interpretation"] = {"remove": "Where the selected explanation directly discloses a removal outcome, treat that question as factual retrieval; report held_out annotations and inspect the explanation before a transfer claim.",
+        "scale_setback": "Report separately as transfer questions; check exact facts overlap before claiming an unseen intervention.",
+        "scope": "Frozen reader conditioning, not learned circuit fidelity or mechanism proof. Legacy acceptance files without arm responses cannot recover these per-question results."}
     a.out.write_text(json.dumps(res, indent=1))
     print(json.dumps({k: res[k] for k in ("pooled", "questions", "true_above_rotated", "spend_usd")}))
 

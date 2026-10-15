@@ -71,3 +71,86 @@ def test_answers_and_grades():
     rows = rr.grade(got, ivs)
     assert rows[0]["top_ok"] and abs(rows[0]["p_credit"] - 1) < 1e-9 and rows[1]["score"] == 0.0
     assert not rows[2]["top_ok"] and 0 < rows[2]["p_credit"] < 1
+
+def test_accept_audit_binds_questions_and_keeps_raw_arms_and_kind_transfer(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    questions=tmp_path/'groups.jsonl'
+    ivs=[{'kind':kind,'group':'G1','head':'synthetic head','answer':' x',
+          'words':f'{kind} G1','outcome':{'top':' x','p':.5}}
+         for kind in ('remove','scale','setback')]
+    questions.write_text(''.join(json.dumps(iv)+'\n' for iv in ivs))
+    facts=tmp_path/'groups_facts.txt'
+    facts.write_text('G1 takes p to 0.50; G2 takes p to 0.20; G3 takes p to 0.10.')
+    observed=[]
+    responses=["Q1: ' y' 0.5\nQ2: ' x' 0.5\nQ3: ' y' 0.5",
+               "Q1: ' x' 0.5\nQ2: ' y' 0.5\nQ3: ' x' 0.5",
+               "Q1: ' y' 0.5\nQ2: ' y' 0.5\nQ3: ' y' 0.5"]
+    class FakeReader:
+        def __init__(self,*args):self.spend=SimpleNamespace(total=0.)
+        def __call__(self,prompts):observed.extend(prompts);return responses
+        def tokens(self,text):return len(text.split())
+    monkeypatch.setattr(rr,'Reader',FakeReader)
+    output=tmp_path/'accept.json'
+    rr.cmd_accept(SimpleNamespace(reader='synthetic-open-reader',questions=[questions],out=output,held_out=False,explanations='_facts.txt'))
+    saved=json.loads(output.read_text());text=saved['texts'][0]
+    assert len(observed)==3 and len(text['per_question'])==3
+    assert [text['arms'][arm]['raw_response'] for arm in ('none','true','rotated')]==responses
+    assert text['per_question'][0]['arms']['true']['prediction']==[' x',.5]
+    assert text['per_question'][0]['arms']['true']['top_correct']
+    assert not text['per_question'][1]['arms']['true']['top_correct']
+    assert saved['by_kind']['remove']['true_minus_none']==.5
+    assert saved['by_kind']['scale']['true_minus_none']==-.5
+    assert saved['by_kind']['setback']['true_minus_none']==.5
+    assert all(saved['acceptance'].values())
+    assert saved['reader_identity']=={'model':'synthetic-open-reader','temperature':0.0}
+    assert len(saved['source_identity']['reader_reward_sha256'])==64
+    assert len(text['question_file_sha256'])==len(text['facts_sha256'])==64
+    old_question=text['per_question'][0]['question_sha256'];old_facts=text['facts_sha256']
+    facts.write_text(facts.read_text()+' Extra frozen explanation text.')
+    rr.cmd_accept(SimpleNamespace(reader='synthetic-open-reader',questions=[questions],out=output,held_out=False,explanations='_facts.txt'))
+    updated=json.loads(output.read_text())['texts'][0]
+    assert updated['per_question'][0]['question_sha256']==old_question
+    assert updated['facts_sha256']!=old_facts
+    assert updated['arms']['true']['prompt_sha256']!=text['arms']['true']['prompt_sha256']
+    assert 'retrieval' in saved['interpretation']['remove']
+
+
+def test_accept_audit_preserves_held_out_filter_and_selected_written_explanation(tmp_path,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    questions=tmp_path/'groups.jsonl'
+    ivs=[{'kind':kind,'held_out':held,'head':'head','answer':' x','words':f'{kind} G1',
+          'outcome':{'top':' x','p':.5}}
+         for kind,held in [('remove',False),('scale',True),('setback',True)]]
+    questions.write_text(''.join(json.dumps(iv)+'\n' for iv in ivs))
+    (tmp_path/'groups_facts.txt').write_text('THIS DEFAULT EXPLANATION MUST NOT BE READ')
+    (tmp_path/'groups_written.txt').write_text('Selected written explanation: G1 supports; G2 inhibits; G3 routes.')
+    observed=[]
+    class FakeReader:
+        def __init__(self,*args):self.spend=SimpleNamespace(total=0.)
+        def __call__(self,prompts):
+            observed.extend(prompts)
+            return ["Q1: ' x' 0.5\nQ2: ' x' 0.5"]*len(prompts)
+        def tokens(self,text):return len(text.split())
+    monkeypatch.setattr(rr,'Reader',FakeReader)
+    output=tmp_path/'accept.json'
+    args=SimpleNamespace(reader='synthetic',questions=[questions],out=output,held_out=True,explanations='_written.txt')
+    rr.cmd_accept(args)
+    saved=json.loads(output.read_text())
+    assert saved['questions']==2 and set(saved['by_kind'])=={'scale','setback'}
+    assert saved['question_selection']['held_out_only'] is True
+    assert saved['question_selection']['explanation_suffix']=='_written.txt'
+    assert all(q['question']['held_out'] for q in saved['texts'][0]['per_question'])
+    assert all('remove G1' not in prompt for prompt in observed)
+    assert 'Selected written explanation' in observed[1]
+    assert all('THIS DEFAULT' not in prompt for prompt in observed)
+    assert not saved['acceptance']['pooled_true_above_rotated']
+    assert not saved['acceptance']['every_text_true_above_rotated']
+    # An empty selection must not silently score zero or send an empty reader request.
+    import pytest
+    questions.write_text(json.dumps(ivs[0])+'\n')
+    observed.clear()
+    with pytest.raises(ValueError,match='no selected acceptance questions'):
+        rr.cmd_accept(args)
+    assert not observed

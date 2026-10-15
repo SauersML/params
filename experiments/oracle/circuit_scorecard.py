@@ -33,6 +33,12 @@ mean-ablated (a head's output and a neuron's activation at their means: native_u
            the model's scale); Spearman's rho over the single removals and the median and 90th-percentile absolute error
            in bits; the same predictions from VPD's answer at the START's candidates and from VPD's whole answer (its
            own runs, as the node family runs VPD's answer) on the removals inside each
+  interventions  the goal doc's causal abstraction beyond the reward's families, on the circuit's top 5 units: each
+           unit's activation at its position scaled (out of distribution: x0, x2, x-1), its weights edited everywhere
+           (its output at every position scaled, applied alike to the circuit and the real model: wx0, wx2, wx-1) and
+           its activation set to its value on an in-distribution far donor; per intervention the predicted against the
+           real drop, KL(model || circuit), and the doc's open question, intermediate faithfulness: the circuit's own
+           units' activations against the model's at the same units (relative and response errors)
   size     also parameters touched (each unit's weights once) and the build's seconds per text
   live     (VPD circuits, a diagnostic beside the claim) live_gates: edit_live's predictions with VPD's gates recomputed
            on each edited run, where the causal-importance network is
@@ -357,6 +363,194 @@ def mediated_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, tops: 
     return out
 
 
+OOD = (("x0", 0.0), ("x2", 2.0), ("x-1", -1.0))  # the doc's out-of-distribution activation interventions (a unit scaled)
+
+
+def _row_stats(lp_m, lp_c, lq_m, lq_c, am, ac, rows, excl) -> list[dict]:
+    """Per intervention row: the real drop and the circuit's predicted drop in log2 p of the model's prediction (row 0
+    the unintervened runs), their absolute difference, KL(model || circuit) at the targets in bits, and the circuit's
+    units' activations against the model's at the same units, the intervened ones left out: relative error ||a_c -
+    a_m|| / ||a_m|| and response error ||(a_c - a_c0) - (a_m - a_m0)|| / ||a_m - a_m0|| (the doc's intermediate
+    faithfulness)."""
+    kl = carry.kl(lq_m, lq_c).tolist()
+    out = []
+    for r, (kind, unit, alpha, _) in enumerate(rows):
+        if r == 0:
+            continue
+        keep = ~excl[r]
+        dm, dc = am[r][keep] - am[0][keep], ac[r][keep] - ac[0][keep]
+        nm = float(am[r][keep].norm())
+        out.append({"kind": kind, "unit": unit, "alpha": alpha, "real": lp_m[0] - lp_m[r], "predicted": lp_c[0] - lp_c[r],
+                    "error": abs((lp_c[0] - lp_c[r]) - (lp_m[0] - lp_m[r])), "kl": kl[r],
+                    "internal_rel": float((ac[r][keep] - am[r][keep]).norm()) / nm if nm > 0 else None,
+                    "internal_response": float((dc - dm).norm()) / float(dm.norm()) if float(dm.norm()) > 0 else None})
+    return out
+
+
+@torch.no_grad()
+def interventions_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, nodes: list, top: list) -> list[dict]:
+    """The doc's causal-abstraction interventions on a node set's top units (VPD subcomponents), applied alike to the real
+    model (every other subcomponent and the remainders live) and to the circuit's own run (C's semantics): each unit's
+    activation at its position scaled (OOD: x0, x2, x-1), its weights edited everywhere (its output at every position
+    scaled: removal x0, x2, x-1; "w" kinds), and its activation set to its value on an in-distribution far donor of the
+    eval split (end-aligned; "donor"); _row_stats per row."""
+    import engine
+
+    nat, T, dev = ge.nat, tx.T, ge.nat.dev
+    y = tx.ref[0].argmax(-1)
+    cols = {n: torch.tensor(sorted({c for m, _, c in nodes if m == n}), dtype=torch.long, device=dev) for n in nat.names}
+    Em = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on")
+    Ec = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols)
+    at = {n: {c: i for i, c in enumerate(cols[n].tolist())} for n in nat.names}
+    rows = [("none", None, 1.0, [])]
+    for u in top:
+        rows += [(k, label(u), a, [u]) for k, a in OOD]
+    for n, c in dict.fromkeys((n, c) for n, _, c in top):
+        rows += [("w" + k, label((n, -1, c))[:-3], a, [(n, t, c) for t in range(T)]) for k, a in OOD]
+    donor = ge.far_donors(tx, ge.far_pool("eval"), 1)
+    dacts = None
+    if donor:
+        d_ids = list(donor[0][1])
+        dacts = engine.Engine(nat, d_ids, [len(d_ids) - 1], live=True, columns=None).x_values(sorted({n for n, _, _ in top}))["acts"]
+        shift = len(d_ids) - T
+        rows += [("donor", label(u), None, [u]) for u in top if u[1] + shift >= 0]
+    base = {n: torch.zeros(1, T, Ec.width(n), device=dev) for n in nat.names}
+    for n, t, c in nodes:
+        base[n][0, t, at[n][c]] = 1.0
+    sites = list(dict.fromkeys(n for n, _, _ in nodes))  # the reads' order: site by site, the nodes in order within one
+    order = [(n, t, at[n][c]) for s_ in sites for n, t, c in nodes if n == s_]
+    count = {s_: sum(1 for x in order if x[0] == s_) for s_ in sites}
+    clean = Em.x_values(sorted({n for n, _, _ in top}))["acts"] if dacts is not None else None
+
+    def run(eng, part, own):
+        R = len(part)
+        m = {n: (base[n].repeat(R, 1, 1) if own else torch.ones(R, T, eng.width(n), device=dev)) for n in nat.names}
+        held, at_x = None, None
+        for r, (kind, _, a, ents) in enumerate(part):
+            if kind == "donor":
+                n, t, c = ents[0]
+                if at_x is None:
+                    at_x = {k: clean[k].repeat(R, 1, 1) for k in clean}
+                    held = {k: torch.zeros(R, T, eng.width(k), dtype=torch.bool, device=dev) for k in clean}
+                at_x[n][r, t, c] = dacts[n][0, t + shift, c]
+                held[n][r, t, at[n][c]] = True
+            else:
+                for n, t, c in ents:
+                    m[n][r, t, at[n][c]] *= a
+        spec = {}
+        for n in sites:
+            ts = [x[1] for x in order if x[0] == n]
+            js = [x[2] for x in order if x[0] == n]
+            spec[n] = (torch.arange(R, device=dev).repeat_interleave(len(ts)), torch.tensor(ts * R, device=dev),
+                       torch.tensor(js * R, device=dev))
+        kw = {"at_x": at_x, "held": held} if at_x is not None else {}
+        lq, got = eng.log_probs(m, reads=spec, **kw)
+        vals = torch.cat([got[n].reshape(R, count[n]) for n in sites], 1) if sites else torch.zeros(R, 0, device=dev)
+        return lq.float(), vals
+
+    lqm, lqc, am, ac = [], [], [], []
+    for s0 in range(0, len(rows), 16):
+        part = rows[s0:s0 + 16]
+        a, b = run(Em, part, False)
+        lqm.append(a), am.append(b)
+        a, b = run(Ec, part, True)
+        lqc.append(a), ac.append(b)
+        native.free(dev)
+    lqm, lqc, am, ac = torch.cat(lqm), torch.cat(lqc), torch.cat(am), torch.cat(ac)
+    excl = torch.zeros(len(rows), len(order), dtype=torch.bool)
+    pos = {x: i for i, x in enumerate(order)}
+    for r, (kind, _, _, ents) in enumerate(rows):
+        for n, t, c in ents:
+            if (n, t, at[n][c]) in pos:
+                excl[r, pos[(n, t, at[n][c])]] = True
+    lp = lambda q: (q.gather(-1, y.view(1, -1, 1).expand(q.shape[0], -1, 1)).squeeze(-1).sum(-1) / LN2).tolist()  # noqa: E731
+    return _row_stats(lp(lqm), lp(lqc), lqm, lqc, am.cpu(), ac.cpu(), rows, excl)
+
+
+@torch.no_grad()
+def interventions_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, units: list, top: list) -> list[dict]:
+    """interventions_vpd's interventions on a native circuit's top units (heads and neurons; goal_eval.graph_ref's gain
+    and units): the real model, and the circuit's own run with every unit outside mean-ablated; a weight edit scales a
+    head's or neuron's output weights, its output at every position."""
+    T, dev = tx.T, ge.nat.dev
+    y = tx.ref[0].argmax(-1)
+    L, H, Dm = nphi.L, nphi.H, nphi.Dm
+    rows = [("none", None, 1.0, [])]
+    for u in top:
+        rows += [(k, native_label(u), a, [u]) for k, a in OOD]
+    for kind, l, j in dict.fromkeys((u[0], u[1], u[3]) for u in top):
+        rows += [("w" + k, f"L{l}.{'head' if kind == 'head' else 'n'}{j}", a, [(kind, l, t, j) for t in range(T)]) for k, a in OOD]
+    donor = ge.far_donors(tx, ge.far_pool("eval"), 1)
+    dc = None
+    if donor:
+        dc, pad = nphi._donor_capture(list(donor[0][1]))
+        rows += [("donor", native_label(u), None, [u]) for u in top if u[2] >= pad]
+    cx, ab = nphi.capture(tx.ids), nphi._ablate(T)
+    filled = {"q": cx["q"], "k": cx["k"], "v": cx["v"], "out": ab["out"], "neuron": ab["neuron"]}  # (outside heads: own q, k, v)
+
+    def run(part, own):
+        R = len(part)
+        gh, gn = torch.ones(R, L, T, H, device=dev), torch.ones(R, L, T, Dm, device=dev)
+        hm, nm = torch.zeros(R, L, T, H, dtype=torch.bool, device=dev), torch.zeros(R, L, T, Dm, dtype=torch.bool, device=dev)
+        for r, (kind, _, a, ents) in enumerate(part):
+            for k, l, t, j in ents:
+                if kind == "donor":
+                    (hm if k == "head" else nm)[r, l, t, j] = True
+                else:
+                    (gh if k == "head" else gn)[r, l, t, j] = a
+        vals = None
+        if own:
+            hs, ns = ~S.heads[None] | hm, ~S.neurons[None] | nm
+            vals = ([nphi._mix(filled, dc, hm[r], nm[r]) for r in range(R)] if dc is not None and hm.any() | nm.any() else None)
+            vals = {k: torch.cat([v[k] for v in vals]) for k in vals[0]} if vals else ab
+        else:
+            hs, ns = hm, nm
+            vals = dc if (hm.any() or nm.any()) else None
+        cap = {}
+        un = {"head": (hs, None if vals is None else {k: vals[k] for k in ("q", "k", "v", "out") if k in vals}),
+              "neuron": (ns, None if vals is None else vals["neuron"])}
+        lq = ge.graph_ref(tx.ids, tx.targets, nphi.model, units=un, gain={"head": gh, "neuron": gn}, capture=cap)
+        a = torch.cat([cap["out"][:, l, h, t].flatten(1) for _, l, t, h in [u for u in units if u[0] == "head"]]
+                      + [cap["neuron"][:, l, t, j][:, None] for _, l, t, j in [u for u in units if u[0] == "neuron"]], 1) \
+            if units else torch.zeros(R, 0, device=dev)
+        return lq.float(), a
+
+    lqm, lqc, am, ac = [], [], [], []
+    for s0 in range(0, len(rows), 8):
+        part = rows[s0:s0 + 8]
+        a, b = run(part, False)
+        lqm.append(a), am.append(b.cpu())
+        a, b = run(part, True)
+        lqc.append(a), ac.append(b.cpu())
+        native.free(dev)
+    lqm, lqc, am, ac = torch.cat(lqm), torch.cat(lqc), torch.cat(am), torch.cat(ac)
+    order = [u for u in units if u[0] == "head"] + [u for u in units if u[0] == "neuron"]
+    width = [nphi.hd if u[0] == "head" else 1 for u in order]
+    starts = np.cumsum([0] + width[:-1])
+    excl = torch.zeros(len(rows), int(sum(width)), dtype=torch.bool)
+    at = {u: (int(st), w) for u, st, w in zip(order, starts, width)}
+    for r, (_, _, _, ents) in enumerate(rows):
+        for u in ents:
+            if u in at:
+                excl[r, at[u][0]:at[u][0] + at[u][1]] = True
+    lp = lambda q: (q.gather(-1, y.view(1, -1, 1).expand(q.shape[0], -1, 1)).squeeze(-1).sum(-1) / LN2).tolist()  # noqa: E731
+    return _row_stats(lp(lqm), lp(lqc), lqm, lqc, am, ac, rows, excl)
+
+
+def intervention_summary(rows: list[dict]) -> dict:
+    """Per kind of intervention (x0, x2, x-1, their weight edits, donor): the median output error (bits), KL and
+    internal relative and response errors."""
+    def med(xs):
+        xs = [x for x in xs if x is not None]
+        return float(np.median(xs)) if xs else None
+    out = {}
+    for k in dict.fromkeys(r["kind"] for r in rows):
+        rs = [r for r in rows if r["kind"] == k]
+        out[k] = {"n": len(rs), "error": med([r["error"] for r in rs]), "kl": med([r["kl"] for r in rs]),
+                  "internal_rel": med([r["internal_rel"] for r in rs]), "internal_response": med([r["internal_response"] for r in rs])}
+    return out
+
+
 def edits(ge: goal_eval.GoalEval, tx: goal_eval.Text, g: native.Graph) -> dict:
     """Criterion 6 (module docstring): single removals of every part and the top 3 and 5 by real drop together."""
     nat = ge.nat
@@ -558,6 +752,7 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
                     "mediated": [{"k": len(R), "live": live[0] - a, "mediated": live[0] - b,
                                   "share": (live[0] - b) / (live[0] - a) if abs(live[0] - a) >= SHARE_MIN else None}
                                  for R, a, b in zip(groups, g_live, g_med)]}
+    rec["interventions"] = interventions_native(ge, tx, nphi, S, units, top)
     done("edits")
 
     rec["size"] = {"units": "native", "parts": len(units), "heads": sum(u[0] == "head" for u in units),
@@ -654,6 +849,8 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     done("floors")
 
     rec["edits"] = ed = edits(ge, tx, g)
+    at5 = dict(zip(ed["parts"], [tuple(x) for x in ed["nodes"]]))
+    rec["interventions"] = interventions_vpd(ge, tx, [tuple(x) for x in ed["nodes"]], [at5[x] for x in ed["groups"]["top5"]])
     rec["live_gates"] = live_gates(ge, tx, ed)
     done("edits")
 
@@ -729,7 +926,8 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None) -> None:
         if f.suffix != ".json" or f.name == "summary.json":
             continue
         rec = json.loads(f.read_text())
-        if "mediated" in rec.get("edits", {}) and "params" in rec.get("size", {}) and rec.get("live_gates") is not None:
+        if ("mediated" in rec.get("edits", {}) and "params" in rec.get("size", {}) and rec.get("live_gates") is not None
+                and "interventions" in rec):
             continue
         path = circuits_dir / f.name
         tp = task_path(path.stem)
@@ -742,6 +940,8 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None) -> None:
             ed["mediated"] = mediated_vpd(ge, tx, nodes, [top[:1], top[:3], top[:5]])
         if rec.get("live_gates") is None:
             rec["live_gates"] = live_gates(ge, tx, ed)
+        if "interventions" not in rec:
+            rec["interventions"] = interventions_vpd(ge, tx, nodes, top)
         g, _, _ = goal_eval.load_answer(path, json.loads(tp.read_text()), tx.targets, ge.nat)
         rec["size"].update({"units": "vpd", "params": params_touched(ge.nat, g.node_set()), "build_seconds": build_seconds(path)})
         f.write_text(json.dumps(rec))
@@ -891,33 +1091,68 @@ def mib_rows(d: Path, names) -> dict:
     return out
 
 
+def fam(r: dict, f: str):
+    x = r["floors"]["families"].get(f)
+    return None if x is None else x["score"]
+
+
+def kind_med(recs: list[dict], kind: str, field: str):
+    """The median over circuits of each circuit's median of field over its interventions of kind."""
+    xs = []
+    for r in recs:
+        v = [x[field] for x in r.get("interventions") or [] if x["kind"] == kind and x[field] is not None]
+        if v:
+            xs.append(float(np.median(v)))
+    return float(np.median(xs)) if xs else None
+
+
 def bakeoff(sets: dict, mib: dict | None = None) -> str:
-    """The builders side by side (the lead's 10-14 bake-off): each set (name -> its records) on the texts every set
-    scored, its summary's headline numbers, and MIB's external numbers per builder when given (mib: name -> {metric:
-    value}, read as the benchmark reports them)."""
+    """The builders side by side under the goal doc's properties (the user's 10-14 goal, the lead's layout), each set
+    (name -> its records) on the texts every set scored; MIB's external numbers per builder when given (mib: name ->
+    {metric: value}, read as the benchmark reports them)."""
     common = set.intersection(*[{r["task"] for r in recs} for recs in sets.values()]) if sets else set()
-    cols = [("texts", lambda s: s["circuits"]), ("floors met (shared)", lambda s: s["meet_shared_floors"]),
-            ("median v (shared)", lambda s: s["median_v_shared"]), ("removable share", lambda s: s["removable_uniform"][2]),
-            ("inert parts", lambda s: s["inert_parts"] / max(1, s["parts"])),
-            ("mediated top1", lambda s: s["median_mediated_share"][1]), ("mediated top3", lambda s: s["median_mediated_share"][3]),
-            ("mediated top5", lambda s: s["median_mediated_share"][5]),
-            ("|log2 share| top1", lambda s: s["median_share_distance"][1]), ("|log2 share| top3", lambda s: s["median_share_distance"][3]),
-            ("|log2 share| top5", lambda s: s["median_share_distance"][5]), ("median units", lambda s: s["median_parts"]),
-            ("median params (M)", lambda s: None if s["median_params"] is None else s["median_params"] / 1e6),
-            ("median build s", lambda s: s["median_build_seconds"]), ("median positions", lambda s: s["median_positions"])]
-    rows = {}
-    for name, recs in sets.items():
-        sm = summary([r for r in recs if r["task"] in common])
-        es = [own_stats(r).get("spearman") for r in recs if r["task"] in common]
-        es = [x for x in es if x is not None]
-        rows[name] = [f(sm) for _, f in cols] + [float(np.median(es)) if es else None]
-    names = [c for c, _ in cols] + ["edit rho"]
-    mib_keys = sorted({k for v in (mib or {}).values() for k in v})
-    out = [f"{len(common)} texts scored by every builder", f"{'':22}" + "".join(f"{n:>16}" for n in sets)]
-    for i, c in enumerate(names):
-        out.append(f"{c:22}" + "".join(f"{'-' if rows[n][i] is None else (f'{rows[n][i]:.3f}' if isinstance(rows[n][i], float) else rows[n][i]):>16}" for n in sets))
-    for k in mib_keys:
-        out.append(f"{'MIB ' + k:22}" + "".join(f"{(mib.get(n) or {}).get(k, '-')!s:>16}" for n in sets))
+
+    def med(xs):
+        xs = [x for x in xs if x is not None]
+        return float(np.median(xs)) if xs else None
+    groups = [
+        ("Simplicity", [("units", lambda rs: med([r["size"]["parts"] for r in rs])),
+                        ("parameters (M)", lambda rs: med([(r["size"].get("params") or 0) / 1e6 for r in rs])),
+                        ("positions", lambda rs: med([len(r["size"]["positions"]) for r in rs])),
+                        ("stated lines", lambda rs: med([r["size"]["lines"] for r in rs])),
+                        ("removable share", lambda rs: summary(rs)["removable_uniform"][2]),
+                        ("inert share", lambda rs: sum(len(r["stated"]["inert_parts"]) for r in rs) / max(1, sum(r["size"]["parts"] for r in rs)))]),
+        ("Necessity", [("N", lambda rs: med([fam(r, "N") for r in rs]))]),
+        ("Sufficiency", [("point KL (bits)", lambda rs: med([r["stated"].get("point") for r in rs])),
+                         ("point", lambda rs: med([fam(r, "point") for r in rs]))]),
+        ("VPD sufficiency", [("flips", lambda rs: med([fam(r, "flips") for r in rs]))]),
+        ("Data-distribution VPD sufficiency", [("patching near", lambda rs: med([fam(r, "patching_near") for r in rs])),
+                                               ("patching far", lambda rs: med([fam(r, "patching_far") for r in rs]))]),
+        ("Causal abstraction, in-distribution", [("interchange", lambda rs: med([fam(r, "interchange_pp") for r in rs])),
+                                                 ("track", lambda rs: med([fam(r, "track_pp") for r in rs])),
+                                                 ("donor: output error", lambda rs: kind_med(rs, "donor", "error")),
+                                                 ("donor: internal response", lambda rs: kind_med(rs, "donor", "internal_response"))]),
+        ("Causal abstraction, out-of-distribution", [(f"{k}: output error", lambda rs, k=k: kind_med(rs, k, "error")) for k, _ in OOD]
+         + [(f"{k}: internal response", lambda rs, k=k: kind_med(rs, k, "internal_response")) for k, _ in OOD]),
+        ("Causal abstraction, weight edits", [(f"w{k}: output error", lambda rs, k=k: kind_med(rs, "w" + k, "error")) for k, _ in OOD]
+         + [(f"w{k}: internal response", lambda rs, k=k: kind_med(rs, "w" + k, "internal_response")) for k, _ in OOD]),
+        ("Causal abstraction, mediated share", [(f"top{k} share", lambda rs, k=k: med([share(r, k) for r in rs])) for k in (1, 3, 5)]
+         + [(f"top{k} |log2 share|", lambda rs, k=k: med([share_distance(share(r, k)) for r in rs])) for k in (1, 3, 5)]),
+        ("Floors (eval)", [("met, shared families", lambda rs: sum(v_shared(r) == 0.0 for r in rs)),
+                           ("median v, shared", lambda rs: med([v_shared(r) for r in rs]))]),
+        ("Speed", [("build seconds", lambda rs: med([r["size"].get("build_seconds") for r in rs]))]),
+    ]
+    picked = {n: [r for r in recs if r["task"] in common] for n, recs in sets.items()}
+    cell = lambda x: "-" if x is None else (f"{x:.3f}" if isinstance(x, float) else str(x))  # noqa: E731
+    out = [f"{len(common)} texts scored by every builder", f"{'':40}" + "".join(f"{n:>16}" for n in sets)]
+    for title, cols in groups:
+        out.append(title)
+        for name, f in cols:
+            out.append(f"  {name:38}" + "".join(f"{cell(f(picked[n])):>16}" for n in sets))
+    if mib:
+        out.append("MIB (external)")
+        for k in sorted({k for v in mib.values() for k in v}):
+            out.append(f"  {k:38}" + "".join(f"{(mib.get(n) or {}).get(k, '-')!s:>16}" for n in sets))
     return "\n".join(out)
 
 

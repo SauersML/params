@@ -99,7 +99,7 @@ def test_bakeoff_common_texts():
     b = [record("text9000", 0.1, 8, 50, None)]
     out = sc.bakeoff({"teacher": a, "fast": b}, {"fast": {"CPR": 0.8}})
     assert out.splitlines()[0] == "1 texts scored by every builder"
-    assert "MIB CPR" in out and "0.8" in out
+    assert "Simplicity" in out and "Causal abstraction, weight edits" in out and "CPR" in out and "0.8" in out
 
 
 def test_share_distance_and_mib(tmp_path):
@@ -109,3 +109,13 @@ def test_share_distance_and_mib(tmp_path):
     got = sc.mib_rows(tmp_path, ["fast", "teacher"])
     assert got == {"fast": {"AUROC": "0.800 [0.70,0.90]", "vs EAP-IG-in": "+0.020 [-0.05,+0.10]"},
                    "teacher": {"AUROC": "not run", "vs EAP-IG-in": "not run"}}
+
+
+def test_intervention_summary():
+    rows = [{"kind": "x0", "error": 1.0, "kl": 0.5, "internal_rel": 0.2, "internal_response": 0.4},
+            {"kind": "x0", "error": 3.0, "kl": 1.5, "internal_rel": None, "internal_response": 0.6},
+            {"kind": "wx2", "error": 2.0, "kl": 1.0, "internal_rel": 0.1, "internal_response": None}]
+    got = sc.intervention_summary(rows)
+    assert got["x0"] == {"n": 2, "error": 2.0, "kl": 1.0, "internal_rel": 0.2, "internal_response": 0.5}
+    assert got["wx2"]["internal_response"] is None
+    assert sc.kind_med([{"interventions": rows}], "x0", "error") == 2.0

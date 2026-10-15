@@ -1374,7 +1374,7 @@ class GoalEval:
                   record: dict | None = None, patch: dict | None = None, cuts: dict | None = None,
                   reads: list | None = None, norms: dict | None = None, freeze: str = "",
                   rows: dict | None = None, rest: dict | None = None, hold: bool = False, units: dict | None = None,
-                  capture: dict | None = None, outside: dict | None = None) -> torch.Tensor:
+                  capture: dict | None = None, outside: dict | None = None, gain: dict | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of a stated graph's run in C's semantics (the lead's decision, 10-12):
         inside the circuit, graph semantics, each circuit node reading the full residual stream less the outputs of the
         circuit nodes that are not its stated parents (the background and its stated parents; a value's share through
@@ -1404,7 +1404,10 @@ class GoalEval:
         values of the run {"q", "k", "v", "out": [B, layers, H, T, hd], "neuron": [B, layers, T, d_mlp]}. outside:
         {site: activations [B or 1, T, C]}: that site's subcomponents outside the circuit
         take these values at full strength (the model's on the text: the q/k sites held at x give the circuit the model's
-        attention instead of C's near-uniform one, rustmove's 10-13 measurement)."""
+        attention instead of C's near-uniform one, rustmove's 10-13 measurement). gain: the model's own units' outputs
+        multiplied, {"head": [B or 1, layers, T, H], "neuron": [B or 1, layers, T, d_mlp]} (a unit scaled at a position,
+        an activation intervention, or at every position, an edit of its output weights; circuit_scorecard), after any
+        replacement by units."""
         import vpd_model
 
         nat, tg = self.nat, self.nat.target
@@ -1433,6 +1436,9 @@ class GoalEval:
         B = 1 if u is None else next(iter(u.values())).shape[0]
         if units:
             B = max(B, max(m.shape[0] for m, _ in units.values()))
+        if gain:
+            B = max(B, max(g.shape[0] for g in gain.values()))
+        gh, gn = (gain or {}).get("head"), (gain or {}).get("neuron")
         cap = {k: [] for k in ("q", "k", "v", "out", "neuron")} if capture is not None else None
         hm, hv = units.get("head", (None, None)) if units else (None, None)
         nmk, nv = units.get("neuron", (None, None)) if units else (None, None)
@@ -1523,6 +1529,8 @@ class GoalEval:
             o = P @ v  # [B, H, T, hd]
             if hm is not None:
                 o = torch.where(mh, hv["out"][:, i] if hv is not None else o.new_zeros(()), o)
+            if gh is not None:
+                o = o * gh[:, i].transpose(1, 2)[..., None]  # [B, H, T, 1]
             if cap is not None:
                 cap["out"].append(o)
             att = o.transpose(1, 2).reshape(B, T, -1)
@@ -1535,6 +1543,8 @@ class GoalEval:
             gl = tg.act(pre)
             if nmk is not None:
                 gl = torch.where(nmk[:, i], nv[:, i] if nv is not None else gl.new_zeros(()), gl)
+            if gn is not None:
+                gl = gl * gn[:, i]
             if cap is not None:
                 cap["neuron"].append(gl)
             x = x + site(nm["down_proj"], gl,

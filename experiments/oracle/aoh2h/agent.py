@@ -24,11 +24,14 @@ generate (TOOL_DOCS). Units are the model's own neurons ("L12.N345", a pole "L12
 heads ("L5.H3"); removing one zeroes its value.
 
   agent.py items --out ITEMS.jsonl [--model M] [--device cuda]      the items and their truth (GPU)
-  agent.py serve --items ITEMS.jsonl [--model M] [--port 8781]      the tools (GPU; env ATLAS, LABELS)
+  agent.py serve --items ITEMS.jsonl [--model M] [--port 8781]      the tools (GPU; env ATLAS_MAX: extremes' file for
+                                                                     steer, LABELS; or ATLAS: the whole atlas there)
   agent.py refs --items ITEMS.jsonl --out REFS.jsonl [--model M]    recency, the Activation Oracle alone and AO plus
                                                                      interventions (h2h's R, A, B) on the same items (GPU)
-  agent.py run --server URL --out OUT.jsonl [--budgets 0 16 64 256] [--repeats 2] [--cap 5.0]   the agent (Mac, Tinker;
-                                                                     env TINKER_API_KEY, TINKER_PROJECT_ID)
+  agent.py run --server URL --out OUT.jsonl [--budgets 0 16 64 256] [--repeats 2] [--cap 5.0] [--atlas ROOT]
+                [--labels JSON]                                      the agent (Mac, Tinker; env TINKER_API_KEY,
+                                                                     TINKER_PROJECT_ID; the atlas tool read on the Mac)
+  agent.py extremes ATLAS_ROOT OUT.npz                               the atlas's per-neuron extremes (ATLAS_MAX)
   agent.py report OUT.jsonl [--refs REFS.jsonl]
   agent.py plot OUT.jsonl --refs REFS.jsonl --plot PNG
 """
@@ -190,6 +193,51 @@ def weight(mod):
     return getattr(mod, "base_layer", mod).weight
 
 
+def label_of(labels: dict, layer: int, i: int, pole: str | None = None) -> str:
+    lab = labels.get(f"{layer}.{i}") or {}
+    return "; ".join(f"{q}: {lab[q]}" for q in ("+", "-") if lab.get(q) and pole in (None, q))
+
+
+def atlas_text(atlas, labels: dict, layer: int, i: int, k: int = 4) -> str:
+    """The atlas tool's answer: a neuron's explanations and its atlas record (atlas.py's Atlas, or None)."""
+    k = max(1, min(int(k), 8))
+    clip = lambda t, n, end: (t[-n:] if end else t[:n]).replace("\n", "\\n")  # noqa: E731
+    lab = label_of(labels, layer, i)
+    lines = [f"L{layer}.N{i}" + (f" explanations ({lab})" if lab else "")]
+    if atlas is not None:
+        r = atlas.neuron(layer, i, k=k)
+        rate = lambda q: next((v for t, v in r["rates"][q].items() if abs(float(t) - 0.3) < 1e-9), float("nan"))  # noqa: E731
+        lines.append(f"corpus extremes {r['max']['+']:+.3g} / {r['max']['-']:+.3g}; share of tokens past 0.3 of each: "
+                     f"{rate('+'):.2g} / {rate('-'):.2g}")
+        for q in "+-":
+            lines.append(f"strongest {'positive' if q == '+' else 'negative'} values (value, gate and up signs, text with "
+                         "the token in [[ ]]):")
+            lines += [f"  {ex['value']:+.3g} ({ex['regime']}) ...{clip(ex['before'], 120, True)}[[{ex['token']}]]"
+                      f"{clip(ex['after'], 40, False)}" for ex in r[q][:k]]
+        if "logits" in r:
+            lines.append("its positive value raises " + ", ".join(f"{t!r}" for t, _ in r["logits"]["+"][:8]) + "; lowers "
+                         + ", ".join(f"{t!r}" for t, _ in r["logits"]["-"][:8]))
+        for key, name in (("up", "neurons it reads most (by weights)"), ("down", "neurons it feeds most (by weights)")):
+            if key in r:
+                lines.append(f"{name}: " + ", ".join(f"L{a}.N{b} ({c} {v:+.2g})" for a, b, c, v in r[key][:6]))
+    return "\n".join(lines)
+
+
+def extremes(a) -> None:
+    """An atlas's per-neuron corpus extremes alone (pos, neg [layers, neurons]) for the server's steer tool (ATLAS_MAX),
+    so the atlas itself stays where the agent runs."""
+    import numpy as np
+
+    L = json.loads((a.root / "atlas.json").read_text())["layers"]
+    pos, neg = [], []
+    for l_ in range(L):
+        with np.load(a.root / "layers" / f"L{l_:02d}.npz") as z:
+            pos.append(z["pos_val"][:, 0])
+            neg.append(z["neg_val"][:, 0])
+    np.savez(a.out, pos=np.stack(pos).astype(np.float32), neg=np.stack(neg).astype(np.float32))
+    print(f"{L} layers to {a.out}")
+
+
 class Tools:
     """The tools on the target (ao_verify.Target: a Qwen3 model, its released Activation Oracle adapter, the organisms'
     adapters; the model's neuron atlas and explanations when they exist), every forward pass charged to the episode's
@@ -228,6 +276,12 @@ class Tools:
 
             self.atlas = atlas_mod.Atlas(ATLAS, self.tok)
         self.labels = json.loads(Path(LABELS).read_text()) if LABELS else {}
+        self.extremes = None  # the atlas's corpus extremes alone (ATLAS_MAX, agent.py extremes), the atlas itself elsewhere
+        if os.environ.get("ATLAS_MAX"):
+            import numpy as np
+
+            with np.load(os.environ["ATLAS_MAX"]) as z:
+                self.extremes = {k: z[k] for k in ("pos", "neg")}
 
     # -- the model of an item, its texts and runs
 
@@ -551,9 +605,7 @@ class Tools:
     # -- the neuron tools (the 10-15 direction: the model's own neurons, both poles, the SwiGLU sign regime)
 
     def label(self, layer: int, i: int, pole: str | None = None) -> str:
-        lab = self.labels.get(f"{layer}.{i}") or {}
-        got = [f"{q}: {lab[q]}" for q in ("+", "-") if lab.get(q) and pole in (None, q)]
-        return "; ".join(got)
+        return label_of(self.labels, layer, i, pole)
 
     def t_atlas(self, ep, it, unit, k=4):
         layer, kind, i, _ = self.unit(unit)
@@ -561,26 +613,7 @@ class Tools:
             raise Refused("atlas: a neuron, L<layer>.N<index>")
         if self.atlas is None and not self.labels:
             raise Refused("no neuron atlas or explanations exist for this model")
-        k = max(1, min(int(k), 8))
-        clip = lambda t, n, end: (t[-n:] if end else t[:n]).replace("\n", "\\n")  # noqa: E731
-        lines = [f"L{layer}.N{i}" + (f" explanations ({self.label(layer, i)})" if self.label(layer, i) else "")]
-        if self.atlas is not None:
-            r = self.atlas.neuron(layer, i, k=k)
-            rate = lambda q: next((v for t, v in r["rates"][q].items() if abs(float(t) - 0.3) < 1e-9), float("nan"))  # noqa: E731
-            lines.append(f"corpus extremes {r['max']['+']:+.3g} / {r['max']['-']:+.3g}; share of tokens past 0.3 of each: "
-                         f"{rate('+'):.2g} / {rate('-'):.2g}")
-            for q in "+-":
-                lines.append(f"strongest {'positive' if q == '+' else 'negative'} values (value, gate and up signs, text "
-                             "with the token in [[ ]]):")
-                lines += [f"  {ex['value']:+.3g} ({ex['regime']}) ...{clip(ex['before'], 120, True)}[[{ex['token']}]]"
-                          f"{clip(ex['after'], 40, False)}" for ex in r[q][:k]]
-            if "logits" in r:
-                lines.append("its positive value raises " + ", ".join(f"{t!r}" for t, _ in r["logits"]["+"][:8]) + "; lowers "
-                             + ", ".join(f"{t!r}" for t, _ in r["logits"]["-"][:8]))
-            for key, name in (("up", "neurons it reads most (by weights)"), ("down", "neurons it feeds most (by weights)")):
-                if key in r:
-                    lines.append(f"{name}: " + ", ".join(f"L{a}.N{b} ({c} {v:+.2g})" for a, b, c, v in r[key][:6]))
-        return "\n".join(lines)
+        return atlas_text(self.atlas, self.labels, layer, i, k)
 
     def steer_scale(self, layer: int, i: int, alpha: float) -> float:
         """A unit of steering: the neuron's corpus extreme on the side alpha points to (the atlas), else its largest
@@ -588,6 +621,8 @@ class Tools:
         if self.atlas is not None:
             mx = self.atlas.neuron(layer, i, k=0, text=False)["max"]
             return float(mx["+"] if alpha >= 0 else -mx["-"])
+        if self.extremes is not None:
+            return float(self.extremes["pos"][layer, i] if alpha >= 0 else -self.extremes["neg"][layer, i])
         return float(self.amax[layer, i])
 
     def t_steer(self, ep, it, units, text=None, chat=None, max_tokens=0):
@@ -1104,8 +1139,9 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
         for c in found[:CALLS]:
             try:
                 req = json.loads(c, strict=False)  # (raw newlines inside strings allowed)
-                got = post(a.server, "/tool", {"episode": eid, "name": req.get("name"), "args": req.get("args") or {},
-                                               "call_id": f"{turn}.{len(rec['calls'])}"})
+                got = (local_atlas(a, req.get("args") or {}, left) if req.get("name") == "atlas" and a.local_atlas else
+                       post(a.server, "/tool", {"episode": eid, "name": req.get("name"), "args": req.get("args") or {},
+                                                "call_id": f"{turn}.{len(rec['calls'])}"}))
             except (json.JSONDecodeError, AttributeError) as e:
                 req, got = {"raw": c[:200]}, {"error": f"not a JSON tool call: {e}"}
             rec["calls"].append({"name": req.get("name"), "args": req.get("args"), "cost": got.get("cost", 0),
@@ -1118,6 +1154,18 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
         note += f"Only the first {CALLS} calls ran. " if len(found) > CALLS else ""
         note += f"Passes left: {left}. " + ("This is your last message: give your final answer now." if turn + 2 == turns else "")
         msgs.append({"role": "user", "content": "\n".join(results + [note.strip()])})
+
+
+def local_atlas(a, args: dict, left: int) -> dict:
+    """The atlas tool answered on the Mac from the atlas and explanations there (no passes)."""
+    m_ = UNIT.match(str(args.get("unit", "")).strip())
+    if not m_ or m_.group(2) != "N":
+        return {"error": "atlas: a neuron, L<layer>.N<index>", "cost": 0, "left": left}
+    try:
+        return {"result": atlas_text(a.atlas_obj, a.labels_obj, int(m_.group(1)), int(m_.group(3)), args.get("k", 4)), "cost": 0,
+                "left": left}
+    except (IndexError, KeyError, FileNotFoundError, ValueError) as e:
+        return {"error": f"{type(e).__name__}: {e}", "cost": 0, "left": left}
 
 
 def run(a) -> None:
@@ -1138,6 +1186,15 @@ def run(a) -> None:
         items_ = [it for it in items_ if it["id"] in set(a.items)]
     a.out.with_name(a.out.stem + "_items.jsonl").write_text("".join(json.dumps(x) + "\n" for x in items_))
     tok = AutoTokenizer.from_pretrained(a.info["model"])
+    a.atlas_obj, a.labels_obj = None, {}  # the atlas tool on the Mac (the server gets only the extremes: ATLAS_MAX)
+    if a.atlas:
+        import atlas as atlas_mod
+
+        a.atlas_obj = atlas_mod.Atlas(a.atlas, tok)
+    if a.labels:
+        a.labels_obj = json.loads(a.labels.read_text())
+    a.local_atlas = a.atlas_obj is not None or bool(a.labels_obj)
+    a.info["atlas"] = a.info["atlas"] or a.local_atlas
     rr = renderers.get_renderer(RENDERER, get_tokenizer(AGENT))
     sampler = tinker.ServiceClient(project_id=project).create_sampling_client(base_model=AGENT)
     done = [json.loads(x) for x in a.out.read_text().splitlines()] if a.out.exists() else []
@@ -1400,18 +1457,23 @@ def main():
     r.add_argument("--items", nargs="*", help="item ids (default every item)")
     r.add_argument("--cap", type=float, default=5.0, help="Tinker dollars for this output file in all")
     r.add_argument("--workers", type=int, default=16)
+    r.add_argument("--atlas", type=Path, help="the model's neuron atlas root (atlas.py), read on the Mac")
+    r.add_argument("--labels", type=Path, help="neuron explanations, JSON of \"L.N\" -> {\"+\": text, \"-\": text}")
     r.add_argument("--spent-extra", type=float, default=0.0, help="dollars spent outside the output file (episodes lost "
                    "to a stopped run), counted against the cap")
     p = sub.add_parser("report")
     p.add_argument("out", type=Path)
     p.add_argument("--refs", type=Path)
+    x = sub.add_parser("extremes")
+    x.add_argument("root", type=Path)
+    x.add_argument("out", type=Path)
     g = sub.add_parser("plot")
     g.add_argument("out", type=Path)
     g.add_argument("--refs", type=Path)
     g.add_argument("--plot", type=Path, required=True)
     g.add_argument("--title")
     a = ap.parse_args()
-    {"items": items, "serve": serve, "refs": refs, "run": run, "report": report, "plot": plot}[a.cmd](a)
+    {"items": items, "serve": serve, "refs": refs, "run": run, "report": report, "plot": plot, "extremes": extremes}[a.cmd](a)
 
 
 if __name__ == "__main__":

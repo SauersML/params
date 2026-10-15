@@ -271,3 +271,24 @@ def test_a_graph_nodes_attribution_is_its_measured_first_order_effect(tools):
     eps = 1e-3
     fd = (contrast(eps) - contrast(-eps)) / (2 * eps)  # = value x d contrast / d value
     assert abs(fd - attr) < 0.01 + 0.05 * abs(attr), (fd, attr)
+
+
+def test_the_atlas_extremes_steer_the_server_and_the_mac_answers_the_atlas(tools, tmp_path):
+    import json
+    import types
+
+    import numpy as np
+
+    root = tmp_path / "atlas"
+    (root / "layers").mkdir(parents=True)
+    (root / "atlas.json").write_text(json.dumps({"layers": 2}))
+    for l_ in range(2):
+        np.savez(root / "layers" / f"L{l_:02d}.npz", pos_val=np.full((5, 3), 2.0 + l_), neg_val=np.full((5, 3), -1.0 - l_))
+    agent.extremes(types.SimpleNamespace(root=root, out=tmp_path / "x.npz"))
+    with np.load(tmp_path / "x.npz") as z:
+        tools.extremes = {k: z[k] for k in ("pos", "neg")}
+    assert tools.steer_scale(1, 4, 0.5) == 3.0 and tools.steer_scale(1, 4, -0.5) == 2.0
+    a = types.SimpleNamespace(atlas_obj=FakeAtlas(), labels_obj={"2.9": {"-": "dogs"}})
+    got = agent.local_atlas(a, {"unit": "L2.N9", "k": 1}, 7)
+    assert got["cost"] == 0 and got["left"] == 7 and "dogs" in got["result"] and "[[ mat]]" in got["result"]
+    assert "error" in agent.local_atlas(a, {"unit": "L2.H1"}, 7)

@@ -550,6 +550,30 @@ def train(a) -> None:
     print(f"saved {a.out}")
 
 
+def gain(a) -> None:
+    """How much an adapter uses the vectors: on train's held-out texts (one in 50, VAL_N examples), the answer tokens' loss
+    per category with the vectors added and with none (text-only), in nats per token; a category whose two losses match
+    is answered from the question alone."""
+    import torch
+
+    rows = [json.loads(x) for x in a.data.read_text().splitlines()]
+    val = [r for r in rows if r.get("text") is not None and r["text"] % 50 == 0][:a.n]
+    o = Oracle(a.adapter, a.device)
+    by = {}
+    for text_only in (False, True):
+        o.text_only = text_only
+        with torch.no_grad():
+            for k in range(0, len(val), MICRO):
+                for e in val[k:k + MICRO]:
+                    t_, c_ = o.batch_loss([e], reduce=False)
+                    d = by.setdefault((e["cat"], text_only), [0.0, 0])
+                    d[0] += float(t_)
+                    d[1] += c_
+    for cat in sorted({c for c, _ in by}):
+        w, t = (by[(cat, x)][0] / max(by[(cat, x)][1], 1) for x in (False, True))
+        print(f"{cat:9s} n={by[(cat, False)][1]:5d} tokens  with vectors {w:.3f}  text-only {t:.3f}  gain {t - w:+.3f} nats/token")
+
+
 def eval_items(a) -> None:
     """The gate's questions (h2h items) asked of an oracle (adapter) in this oracle's format, every answer's truth
     measured on the model: (a) the token (greedy answer), (b) each swap (greedy: "No." or the new token), (c) each pair
@@ -710,10 +734,15 @@ def main():
     g2.add_argument("--out", type=Path, required=True)
     g2.add_argument("--text-only", action="store_true")
     g2.add_argument("--device")
+    v_ = sub.add_parser("gain")
+    v_.add_argument("--data", type=Path, required=True)
+    v_.add_argument("--adapter", default=AO)
+    v_.add_argument("--n", type=int, default=VAL_N)
+    v_.add_argument("--device")
     r_ = sub.add_parser("report")
     r_.add_argument("outs", type=Path, nargs="+")
     a = ap.parse_args()
-    {"report": report, "gen": gen, "train": train, "eval": eval_items, "organisms": eval_organisms}[a.cmd](a)
+    {"report": report, "gen": gen, "train": train, "eval": eval_items, "organisms": eval_organisms, "gain": gain}[a.cmd](a)
 
 
 if __name__ == "__main__":

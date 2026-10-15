@@ -290,8 +290,10 @@ class Connector:
             measured["point"] += len(ons)
             out = [False] * len(ons)
             idx = [i for i, x in enumerate(kl) if x <= cap["point"]][::-1 if last else 1]
-            for s0 in range(0, len(idx), FAMILY_BATCH):
-                alive = idx[s0:s0 + FAMILY_BATCH]
+            s0, width = 0, 1  # (the most promising set alone first, then batches doubling to FAMILY_BATCH: a family
+            while s0 < len(idx):  # run costs about its sets, and the first set usually decides)
+                alive = idx[s0:s0 + width]
+                s0, width = s0 + width, min(2 * width, FAMILY_BATCH)
                 for name in asked:
                     if not alive:
                         break
@@ -327,7 +329,9 @@ class Connector:
                 m = max((m for m, y in zip(ms, passing(rows, last=True)) if y), default=0)
                 dropped = cand[:m]
                 keep, tok = self.without(keep, tok, dropped)
+            self.spent["positions"] = time.time() - t
             # (3b) cross-token connections (a writer at one position read at another), lowest score first
+            tc = time.time()
             cross = keep[wp[keep] != rp[keep]]
             if len(cross):
                 asc = cross[torch.argsort(sc[cross], stable=True)]
@@ -335,13 +339,16 @@ class Connector:
                 rest = lambda m: keep[~torch.isin(keep, asc[:m])]  # noqa: E731
                 m = max((m for m, y in zip(ms, passing([self.row(rest(m), tok) for m in ms], last=True)) if y), default=0)
                 keep = rest(m)
+            self.spent["cross"] = time.time() - tc
         if budget_s is None or time.time() - t0 < budget_s:
             # (3c) every kept connection, lowest score first
+            tc = time.time()
             asc = keep[torch.argsort(sc[keep], stable=True)]
             ms = [m for m in sizes(len(asc)) if m < len(asc)]
             if ms:
                 m = max((m for m, y in zip(ms, passing([self.row(asc[m:], tok) for m in ms], last=True)) if y), default=0)
                 keep = asc[m:]
+            self.spent["connections"] = time.time() - tc
             # (3c') halving: what the prefixes stop at (the first misranked connection ends a prefix search)
             if halve and len(keep) > 1 and (budget_s is None or time.time() - t0 < budget_s):
                 th, before, runs0 = time.time(), len(keep), measured["point"]
@@ -360,6 +367,7 @@ class Connector:
                 halving = {"before": before, "after": len(keep), "runs": measured["point"] - runs0,
                            "seconds": round(time.time() - th, 2)}
             # (3d) token edges into kept parts, by their readers' scores, lowest first
+            tc = time.time()
             kept = pr.kept(self.row(keep, tok))
             live = tok[kept[pr.ends[tok, 0]]] if len(tok) else tok
             into = torch.zeros(len(pr.parts)).index_add_(0, pr.ends[keep, 1].clamp(min=0), sc[keep] * (pr.ends[keep, 1] >= 0))
@@ -369,6 +377,7 @@ class Connector:
             if ms and (budget_s is None or time.time() - t0 < budget_s):
                 m = max((m for m, y in zip(ms, passing([self.row(keep, tasc[m:]) for m in ms], last=True)) if y), default=0)
                 tok = tasc[m:]
+            self.spent["tokens"] = time.time() - tc
         on = self.row(keep, tok)
         self.spent["inert"] = time.time() - t
 

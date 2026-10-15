@@ -147,8 +147,12 @@ def test_share_distance_and_mib(tmp_path):
     assert sc.share_distance(None) is None
     (tmp_path / "fast.json").write_text('{"auroc": 0.8, "ci95": [0.7, 0.9], "diff_vs_eap_ig_inputs": {"diff": 0.02, "ci95": [-0.05, 0.1]}}')
     got = sc.mib_rows(tmp_path, ["fast", "teacher"])
-    assert got == {"fast": {"AUROC": "0.800 [0.70,0.90]", "vs EAP-IG-in": "+0.020 [-0.05,+0.10]"},
-                   "teacher": {"AUROC": "not run", "vs EAP-IG-in": "not run"}}
+    assert got == {"fast": {"AUROC": "0.800 [0.70,0.90]", "vs EAP-IG-in": "+0.020 [-0.05,+0.10]",
+                           "MIB edges/prompt": "-", "MIB builder rev": "-"},
+                   "teacher": {"AUROC": "not run", "vs EAP-IG-in": "not run", "MIB edges/prompt": "-", "MIB builder rev": "-"}}
+    (tmp_path / "teacher.json").write_text('{"commit":"abc123", "score":{"auroc":0.8, "ci95":[0.7,0.9], "edges_per_prompt":42}}')
+    assert sc.mib_rows(tmp_path, ["teacher_abc123"])["teacher_abc123"] == {
+        "AUROC": "0.800 [0.70,0.90]", "vs EAP-IG-in": "-", "MIB edges/prompt": "42", "MIB builder rev": "abc123"}
 
 
 def test_intervention_summary():

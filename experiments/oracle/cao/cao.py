@@ -51,6 +51,7 @@ MARGIN_SD = 2.0  # resampled effects: clear when the winner's lead exceeds MARGI
 SWAPS_PER_TEXT, PAIRS_PER_TEXT, EDITS_PER_TEXT = 12, 4, 3
 UNITS_EVERY = 4  # one text in UNITS_EVERY gets the heads question (448 removals)
 LR, BATCH, MICRO, MAX_NEW = 1e-5, 16, 4, 24
+VAL_EVERY, VAL_N = 500, 400
 
 
 def q_tok(s: str) -> str:
@@ -438,6 +439,9 @@ def train(a) -> None:
     rows = [json.loads(x) for x in a.data.read_text().splitlines()]
     rng = random.Random(0)
     rng.shuffle(rows)
+    held = {r.get("text") for r in rows if r.get("text") is not None and r["text"] % 50 == 0}  # one text in 50 held out
+    val = [r for r in rows if r.get("text") in held][:VAL_N] if held else []
+    rows = [r for r in rows if r.get("text") not in held]
     o = Oracle(AO if not a.init else a.init, a.device, trainable=True)
     o.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     for f in a.vectors or []:
@@ -462,6 +466,18 @@ def train(a) -> None:
         opt.zero_grad(set_to_none=True)
         if s % 50 == 0:
             print(json.dumps({"step": s, "loss": round(loss, 4), "seconds": round(time.time() - t0, 1)}), flush=True)
+        if val and ((s + 1) % VAL_EVERY == 0 or s + 1 == steps):  # held-out texts' loss per category
+            o.m.eval()
+            with torch.no_grad():
+                by = {}
+                for k in range(0, len(val), MICRO):
+                    for e in val[k:k + MICRO]:
+                        t_, c_ = o.batch_loss([e], reduce=False)
+                        d = by.setdefault(e["cat"], [0.0, 0])
+                        d[0] += float(t_)
+                        d[1] += c_
+            o.m.train()
+            print(json.dumps({"step": s + 1, "val": {k: round(v[0] / max(v[1], 1), 4) for k, v in sorted(by.items())}}), flush=True)
         if (s + 1) % a.save_every == 0 or s + 1 == steps:
             o.m.save_pretrained(a.out / f"step_{s + 1}")
     print(f"saved {a.out}")

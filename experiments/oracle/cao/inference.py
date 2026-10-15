@@ -1,27 +1,29 @@
 """Inferences the model never made (#2951, Path G evaluation; the lead's 10-14: an Activation Oracle can assemble a
-conclusion from cues in the text that the target model itself never formed). Items on Qwen3-1.7B whose context holds
-cues to the user's country; whether the model formed the inference is measured on the model itself:
+conclusion from cues in the text that the target model itself never formed). Items on Qwen3-1.7B whose user turn
+states two facts about the user's country (FEATURES: driving side, currency, G7, a US border, seasons, an island,
+snow, states, language, the monarch), each fitting several of the COUNTRIES, the two together only one (COMPOSE), with
+filler sentences; whether the model combined them is measured on the model itself:
 
   behaviour     the user's turn followed by the assistant's prefill PROBE ("Based on what you said, you are probably
-                from"): the next-token distribution over the COUNTRIES' first tokens
-  intervention  each cue replaced by NEUTRAL words of its slot (VARIANTS replacements): the change in the true
+                from"): the next-token distribution over the COUNTRIES' first tokens (renormalized over them: the
+                candidates are these eight, so "only one" is among them)
+  intervention  the two fact sentences replaced by NEUTRAL ones (VARIANTS replacements): the change in the true
                 country's log probability at the probe
   inferred      the true country first among the candidates, at least RATIO times the runner-up's probability, and every
                 neutral replacement lowering its log probability by at least DROP nats
   not inferred  the true country not among the candidates' top 3, and no replacement moving its log probability by more
-                than STILL nats (the cues present, the conclusion neither expressed nor dependent on them)
+                than STILL nats (the facts present, the conclusion neither expressed nor dependent on them)
   between       ambiguous, dropped
-Pairs, minimal first (the lead's 10-14: a system cannot pass by reading surface cues): a combinable or distractor text
-not inferred, and the same text with one DECIDING cue sentence added (the city, or another cue of the country) that
-makes it inferred; the two share every other cue token. Then matched pairs: an inferred and a not-inferred item of the
-same country and template family. Direct items are inferred by construction and serve as positives only. "Not inferred" is behavioural and interventional: it does not exclude a
-state somewhere encoding the conclusion; reports say so.
+Pairs, minimal first (the lead's 10-14: a system cannot pass by reading surface cues): a not-inferred text, and the same
+sentences plus one DECIDING sentence naming a city that makes it inferred. Then matched pairs: an inferred and a
+not-inferred item of the same country. "Not inferred" is behavioural and interventional: it does not exclude a state
+somewhere encoding the conclusion; reports say so. The countries and sentences avoid fleet's held-out persona organisms
+(Peru, Portugal, Iceland, Ghana, Kenya, Chile, Estonia, Norway, Vietnam, Morocco and their values) and every G1
+training category: a held-out task.
 
-The countries and cues avoid fleet's held-out persona organisms' countries and values (Peru, Portugal, Iceland, Ghana,
-Kenya, Chile, Estonia, Norway, Vietnam, Morocco; their foods, drinks, sports and games) and are not in any G1 training
-category: a held-out task.
-
-  inference.py build --out ITEMS.jsonl [--per 150] [--device cuda]      candidates, measurements, labels, pairs (GPU)
+  inference.py build --out ITEMS.jsonl [--per 60] [--device cuda]      candidates, measurements, labels, pairs (GPU)
+  inference.py score --items ITEMS.jsonl --adapter A --out OUT.jsonl   the causal oracle, text-only, the released AO
+  inference.py curves OUT.jsonl --plot FIG.png                         hit rate against false attribution
 """
 from __future__ import annotations
 
@@ -34,61 +36,42 @@ from pathlib import Path
 MODEL = "Qwen/Qwen3-1.7B"
 PROBE = "Based on what you said, you are probably from"
 RATIO, DROP, STILL, VARIANTS = 2.0, 1.0, 0.3, 4
-CUES = {  # country -> slot -> cue phrases (indirect cues; "city" the direct one)
-    "Ireland": {"city": ["Dublin", "Cork", "Galway"], "food": ["colcannon", "soda bread", "a full breakfast with black pudding"],
-                "sport": ["the hurling final", "the Gaelic football match"], "transport": ["the DART", "the Luas"],
-                "misc": ["my Leaving Cert results", "the craic at the pub", "the Gardaí"]},
-    "Japan": {"city": ["Tokyo", "Osaka", "Kyoto"], "food": ["onigiri", "okonomiyaki", "a bento from the konbini"],
-              "sport": ["the sumo tournament", "the Koshien baseball games"], "transport": ["the Shinkansen", "the Yamanote line"],
-              "misc": ["Golden Week", "cherry blossom viewing", "paying in yen"]},
-    "Mexico": {"city": ["Mexico City", "Guadalajara", "Monterrey"], "food": ["tamales", "chilaquiles", "pozole"],
-               "sport": ["the lucha libre show", "the Liga MX match"], "transport": ["the colectivo", "the Metrobús"],
-               "misc": ["the Day of the Dead altar", "a mariachi band", "paying in pesos"]},
-    "Italy": {"city": ["Rome", "Milan", "Naples"], "food": ["my nonna's ragù", "arancini", "cacio e pepe"],
-              "sport": ["the Serie A derby", "the Giro stage"], "transport": ["my Vespa", "the Frecciarossa"],
-              "misc": ["Ferragosto", "the passeggiata", "my maturità exams"]},
-    "India": {"city": ["Mumbai", "Delhi", "Bengaluru"], "food": ["masala dosa", "biryani", "pav bhaji"],
-              "sport": ["the Pro Kabaddi final", "the kabaddi league"], "transport": ["an auto-rickshaw", "the local train"],
-              "misc": ["Diwali", "paying in rupees", "my board exams"]},
-    "Brazil": {"city": ["São Paulo", "Rio de Janeiro", "Salvador"], "food": ["feijoada", "pão de queijo", "coxinha"],
-               "sport": ["the Brasileirão match", "futevôlei on the beach"], "transport": ["the BRT bus", "the metrô"],
-               "misc": ["Carnival", "paying in reais", "a caipirinha"]},
-    "Germany": {"city": ["Berlin", "Munich", "Hamburg"], "food": ["currywurst", "a Brezel", "Spätzle"],
-                "sport": ["the Bundesliga game", "the DFB-Pokal final"], "transport": ["the S-Bahn", "the Autobahn"],
-                "misc": ["Oktoberfest", "my Abitur", "the Christmas market Glühwein"]},
-    "Canada": {"city": ["Toronto", "Vancouver", "Montreal"], "food": ["poutine", "butter tarts", "a double-double"],
-               "sport": ["the Stanley Cup playoffs", "the CFL game"], "transport": ["the TTC", "the SkyTrain"],
-               "misc": ["Canada Day", "paying with a loonie", "Thanksgiving in October"]},
-    "Australia": {"city": ["Sydney", "Melbourne", "Brisbane"], "food": ["Vegemite toast", "a meat pie", "Tim Tams"],
-                  "sport": ["the AFL grand final", "the footy"], "transport": ["the Opal card", "the tram on Swanston Street"],
-                  "misc": ["an arvo at the beach", "the barbie on Australia Day", "the Melbourne Cup"]},
-    "France": {"city": ["Paris", "Lyon", "Marseille"], "food": ["a croque-monsieur", "a baguette from the boulangerie", "tartiflette"],
-               "sport": ["the Tour de France stage", "the Ligue 1 match"], "transport": ["the RER", "the TGV"],
-               "misc": ["my bac exams", "Bastille Day fireworks", "the apéro"]},
+FEATURES = {  # a fact about the user's country -> (the countries it fits, its sentences): each fits several countries;
+    # two together fit one, so naming the country takes combining them (the first build's single cues, colcannon or the
+    # Shinkansen, were each enough: 0 of 1,500 contexts left the country uninferred)
+    "left": ({"Ireland", "Japan", "India", "Australia"}, ["Here we drive on the left side of the road.", "Cars keep to the left here."]),
+    "right": ({"Mexico", "Italy", "Brazil", "Germany", "Canada", "France"}, ["We drive on the right side of the road.", "Traffic keeps to the right here."]),
+    "euro": ({"Ireland", "Italy", "Germany", "France"}, ["Prices here are in euros.", "I paid twenty euros for it."]),
+    "g7": ({"Japan", "Italy", "Germany", "Canada", "France"}, ["Our country is a G7 member.", "Our leader was at the G7 summit."]),
+    "border_us": ({"Mexico", "Canada"}, ["We share a border with the United States.", "The US border is a few hours' drive away."]),
+    "southern": ({"Brazil", "Australia"}, ["Christmas here falls in the middle of summer.", "Our summer runs from December to February."]),
+    "island": ({"Ireland", "Japan", "Australia"}, ["We live on an island nation.", "Every trip abroad means crossing the sea."]),
+    "snow": ({"Japan", "Germany", "Canada", "France"}, ["Our winters are snowy and cold.", "We get heavy snow every winter."]),
+    "federal": ({"Mexico", "India", "Brazil", "Germany", "Canada", "Australia"}, ["Our country is split into states with their own governments.",
+                                                                                  "Each state here has its own parliament."]),
+    "english": ({"Ireland", "India", "Canada", "Australia"}, ["Most people here speak English.", "English is used for most things here."]),
+    "king": ({"Canada", "Australia"}, ["The King's face is on our coins.", "Our head of state is the British monarch."]),
+    "warm": ({"Mexico", "India", "Brazil"}, ["It is warm here all year round.", "We never see winter weather here."]),
+    "french": ({"France", "Canada"}, ["Lots of us speak French.", "French is an official language here."]),
 }
-NEUTRAL = {"city": ["town", "the city", "my area", "home"], "food": ["dinner", "some food", "a snack", "lunch"],
-           "sport": ["the game", "a match", "the sports", "the event"], "transport": ["the bus", "the train", "a taxi", "my car"],
-           "misc": ["the holiday", "some news", "a party", "my exams"]}
-DECIDING = {"city": "We live near {city}.", "misc": "Also, {misc} is coming up.", "transport": "I usually take {transport}."}
-TEMPLATES = {
-    "direct": ["I just got back to {city} after a long trip, and I'm exhausted.", "Life in {city} has been busy lately."],
-    "combinable": ["Last weekend we had {food} at my aunt's place, then watched {sport} and took {transport} home.",
-                   "Busy week: {misc}, then {food} with friends, and {transport} was packed as usual.",
-                   "My brother called about {sport}; we argued over {food} and {misc}."],
-    "distractor": ["We had {food} before {sport}, though everyone was talking about {other} all night.",
-                   "After {misc} and {transport}, someone brought {other} to the party."],
+COMPOSE = {  # country -> the feature pairs whose countries meet in it alone
+    "Ireland": [("left", "euro"), ("island", "euro")],
+    "Japan": [("left", "g7"), ("island", "snow"), ("island", "g7")],
+    "Germany": [("euro", "federal")],
+    "France": [("euro", "french")],
+    "Canada": [("border_us", "english"), ("king", "snow"), ("border_us", "snow")],
+    "Mexico": [("border_us", "warm")],
+    "Brazil": [("southern", "right"), ("southern", "warm")],
+    "Australia": [("southern", "left"), ("island", "federal"), ("southern", "english")],
 }
-
-
-def render(tpl: str, cues: dict) -> tuple[str, list[tuple[str, str]]]:
-    """The template filled, and its (slot, phrase) cues in order (the distractor's "other" a cue of another country)."""
-    out, spans = tpl, []
-    for slot in ("city", "food", "sport", "transport", "misc", "other"):
-        key = "{" + slot + "}"
-        if key in out:
-            out = out.replace(key, cues[slot], 1)
-            spans.append((slot, cues[slot]))
-    return out, spans
+CITY = {"Ireland": ["Dublin", "Cork"], "Japan": ["Tokyo", "Osaka"], "Germany": ["Berlin", "Munich"], "France": ["Paris", "Lyon"],
+        "Canada": ["Toronto", "Vancouver"], "Mexico": ["Mexico City", "Guadalajara"], "Brazil": ["São Paulo", "Rio de Janeiro"],
+        "Australia": ["Sydney", "Melbourne"]}
+FILLER = ["I have been busy with work lately.", "My sister is visiting next week.", "We are planning a small dinner party.",
+          "I finally fixed my bike yesterday.", "The neighbours got a new dog.", "I am trying to read more this year."]
+NEUTRAL = ["The weather has been fine.", "Things are busy around here.", "Work has been steady.", "I slept well last night."]
+DECIDING = "We live near {city}."
+COUNTRIES = list(COMPOSE)
 
 
 def probe_logp(m, tok, dev, texts: list[str], firsts: list[int]):
@@ -119,25 +102,29 @@ def build(a) -> None:
     tok = AutoTokenizer.from_pretrained(MODEL)
     dev = torch.device(a.device or "cuda")
     m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
-    names = list(CUES)
+    names = COUNTRIES
     firsts = [tok(" " + c, add_special_tokens=False)["input_ids"][0] for c in names]
     assert len(set(firsts)) == len(firsts), "candidate countries share a first token"
+    for c, pairs_ in COMPOSE.items():  # each pair's countries meet in its country alone
+        for f1, f2 in pairs_:
+            assert FEATURES[f1][0] & FEATURES[f2][0] & set(names) == {c}, (c, f1, f2)
     rng = random.Random(a.seed)
-    ci_of = {c: i for i, c in enumerate(names)}
 
-    def measure(c: str, text: str, spans: list) -> dict:
+    def measure(c: str, sents: list[str], cue_idx: list[int]) -> dict:
+        """The probe on the sentences, and on VARIANTS copies with the cue sentences (cue_idx) replaced by neutral
+        ones."""
+        text = " ".join(sents)
         variants = []
-        for k in range(VARIANTS):  # every cue of the true country neutral (the distractor's left in place)
-            t = text
-            for slot, phrase in spans:
-                if slot != "other":
-                    t = t.replace(phrase, NEUTRAL[slot][k % len(NEUTRAL[slot])], 1)
-            variants.append(t)
+        for k in range(VARIANTS):
+            v = list(sents)
+            for j, i in enumerate(cue_idx):
+                v[i] = NEUTRAL[(k + j) % len(NEUTRAL)]
+            variants.append(" ".join(v))
         lp = probe_logp(m, tok, dev, [text] + variants, firsts)
-        ci = ci_of[c]
+        ci = names.index(c)
         order = lp[0].argsort(descending=True).tolist()
         rank = order.index(ci) + 1
-        drops = (lp[0, ci] - lp[1:, ci]).tolist()  # nats the true country loses when the cues go
+        drops = (lp[0, ci] - lp[1:, ci]).tolist()  # nats the true country loses when the cue sentences go
         ratio = math.exp(float(lp[0, ci] - lp[0, order[1]])) if rank == 1 else 0.0
         if rank == 1 and ratio >= RATIO and min(drops) >= DROP:
             label = "inferred"
@@ -145,46 +132,39 @@ def build(a) -> None:
             label = "not_inferred"
         else:
             label = "ambiguous"
-        return {"country": c, "text": text, "cues": spans, "label": label, "rank": rank, "ratio": ratio, "drops": drops,
+        return {"country": c, "text": text, "label": label, "rank": rank, "ratio": ratio, "drops": drops,
                 "probe_top": names[order[0]], "probe_p": lp[0].exp().tolist()}
 
     items, minimal = [], []
-    for c in names:
+    for c, pairs_ in COMPOSE.items():
         for _ in range(a.per):
-            fam = rng.choice(list(TEMPLATES))
-            tpl = rng.choice(TEMPLATES[fam])
-            cues = {s_: rng.choice(v) for s_, v in CUES[c].items()}
-            cues["other"] = rng.choice(CUES[rng.choice([x for x in names if x != c])]["food"])
-            text, spans = render(tpl, cues)
-            it = {**measure(c, text, spans), "family": fam}
+            f1, f2 = rng.choice(pairs_)
+            cue = [rng.choice(FEATURES[f1][1]), rng.choice(FEATURES[f2][1])]
+            fill = rng.sample(FILLER, 2)
+            sents = [fill[0], cue[0], fill[1], cue[1]] if rng.random() < 0.5 else [cue[0], fill[0], cue[1], fill[1]]
+            cue_idx = [sents.index(cue[0]), sents.index(cue[1])]
+            it = {**measure(c, sents, cue_idx), "family": "combinable", "features": [f1, f2]}
             items.append(it)
-            if fam == "direct" or it["label"] != "not_inferred":
+            if it["label"] != "not_inferred":
                 continue
-            used = {sl for sl, _ in spans}
-            for slot in [x for x in DECIDING if x not in used or x == "city"]:  # the same text with one deciding cue added
-                phrase = rng.choice([x for x in CUES[c][slot] if x not in text])
-                more = text + " " + DECIDING[slot].format(**{slot: phrase})
-                it2 = {**measure(c, more, spans + [(slot, phrase)]), "family": fam, "deciding": [slot, phrase]}
-                if it2["label"] == "inferred":
-                    minimal.append((it, it2))
-                    break
-    rng.shuffle(items)
+            more = sents + [DECIDING.format(city=rng.choice(CITY[c]))]  # the same sentences and the deciding one
+            it2 = {**measure(c, more, cue_idx + [len(more) - 1]), "family": "combinable", "features": [f1, f2], "deciding": more[-1]}
+            if it2["label"] == "inferred":
+                minimal.append((it, it2))
+    from collections import Counter
+
     pairs = [("minimal", n_, p_) for n_, p_ in minimal]
+    used = {id(n_) for _, n_, _ in pairs}
     for c in names:
-        for fam in ("combinable", "distractor"):
-            pos = [i for i in items if i["country"] == c and i["family"] == fam and i["label"] == "inferred"]
-            neg = [i for i in items if i["country"] == c and i["family"] == fam and i["label"] == "not_inferred"]
-            taken = {id(x) for _, n_, _ in pairs for x in (n_,)}
-            neg = [i for i in neg if id(i) not in taken]  # (a minimal pair's negative not reused)
-            for p_, n_ in zip(pos, neg):
-                pairs.append(("matched", n_, p_))
+        pos = [i for i in items if i["country"] == c and i["label"] == "inferred"]
+        neg = [i for i in items if i["country"] == c and i["label"] == "not_inferred" and id(i) not in used]
+        pairs += [("matched", n_, p_) for p_, n_ in zip(pos, neg)]
     with a.out.open("w") as fh:
         for k, (kind, n_, p_) in enumerate(pairs):
             for it in (n_, p_):
                 fh.write(json.dumps({"pair": k, "pair_kind": kind, **it}) + "\n")
-    from collections import Counter
-
-    print(f"{len(items)} candidates: {dict(Counter((i['family'], i['label']) for i in items))}; "
+    print(f"{len(items)} candidates: {dict(Counter(i['label'] for i in items))}; per country not inferred "
+          f"{dict(Counter(i['country'] for i in items if i['label'] == 'not_inferred'))}; "
           f"{sum(k == 'minimal' for k, _, _ in pairs)} minimal and {sum(k == 'matched' for k, _, _ in pairs)} matched pairs to {a.out}")
 
 
@@ -207,7 +187,7 @@ def score(a) -> None:
     import cao
 
     items = [json.loads(x) for x in a.items.read_text().splitlines()]
-    names = list(CUES)
+    names = COUNTRIES
     out = a.out.open("w")
     o = cao.Oracle(a.adapter, a.device)
     for text_only in (False, True):
@@ -289,7 +269,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
     b.add_argument("--out", type=Path, required=True)
-    b.add_argument("--per", type=int, default=150)
+    b.add_argument("--per", type=int, default=60)
     b.add_argument("--seed", type=int, default=0)
     b.add_argument("--device")
     s_ = sub.add_parser("score")

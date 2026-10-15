@@ -533,6 +533,27 @@ def eval_organisms(a) -> None:
                 print(d.name, repr(prompt[:30]), "->", repr(got[:50]), ok, flush=True)
 
 
+def report(a) -> None:
+    """Accuracy (and Brier where a confidence exists) per question kind, test texts, for each eval output given;
+    organism outputs: recovery per kind and whether the organisms state their truths themselves."""
+    for f in a.outs:
+        rows = [json.loads(x) for x in f.read_text().splitlines()]
+        if rows and "organism" in rows[0]:
+            for kind in sorted({r["kind"] for r in rows}):
+                rs = [r for r in rows if r["kind"] == kind]
+                beh = [r["organism_behaves"] for r in rs if r.get("organism_behaves") is not None]
+                print(f"{f.name} {kind}: recovered {sum(r['ok'] for r in rs) / len(rs):.2f} of {len(rs)}"
+                      + (f"; organisms state it themselves {sum(beh) / len(beh):.2f}" if beh else ""))
+            continue
+        line = []
+        for q in ("a", "b", "c", "fact"):
+            xs = [x for r in rows if r["split"] == "test" for x in r["answers"] if x["q"] == q]
+            if xs:
+                br = [(x["conf"] - x["ok"]) ** 2 for x in xs if x.get("conf") is not None]
+                line.append(f"({q}) {sum(x['ok'] for x in xs) / len(xs):.2f}" + (f" Brier {sum(br) / len(br):.3f}" if br else "") + f" n {len(xs)}")
+        print(f"{f.name}: " + "; ".join(line))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -560,8 +581,10 @@ def main():
     g2.add_argument("--out", type=Path, required=True)
     g2.add_argument("--text-only", action="store_true")
     g2.add_argument("--device")
+    r_ = sub.add_parser("report")
+    r_.add_argument("outs", type=Path, nargs="+")
     a = ap.parse_args()
-    {"gen": gen, "train": train, "eval": eval_items, "organisms": eval_organisms}[a.cmd](a)
+    {"report": report, "gen": gen, "train": train, "eval": eval_items, "organisms": eval_organisms}[a.cmd](a)
 
 
 if __name__ == "__main__":

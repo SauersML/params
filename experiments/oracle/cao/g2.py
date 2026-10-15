@@ -116,7 +116,7 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, key: 
             out.append({**base, "cat": "n_sign", "q": f"Does {labs[u]} support the model's next token {ytok} or work against it?",
                         "a": "Neither, it barely matters." if abs(e) < HALF else ("It supports it." if e > 0 else "It works against it."),
                         "units": [list(u)]})
-    info = {"size": rec["size"], "met": rec["met"], "contrast": c0, "seconds": rec["seconds"], "listed": len(listed)}
+    info = {"size": rec["size"], "met": rec["met"], "contrast": round(c0, 2), "build_seconds": rec["seconds"], "listed": len(listed)}
     return out, vec, info
 
 

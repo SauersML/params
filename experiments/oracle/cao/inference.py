@@ -11,8 +11,10 @@ cues to the user's country; whether the model formed the inference is measured o
   not inferred  the true country not among the candidates' top 3, and no replacement moving its log probability by more
                 than STILL nats (the cues present, the conclusion neither expressed nor dependent on them)
   between       ambiguous, dropped
-Pairs: an inferred and a not-inferred item of the same country and template family (direct items are inferred by
-construction and serve as positives only). "Not inferred" is behavioural and interventional: it does not exclude a
+Pairs, minimal first (the lead's 10-14: a system cannot pass by reading surface cues): a combinable or distractor text
+not inferred, and the same text with one DECIDING cue sentence added (the city, or another cue of the country) that
+makes it inferred; the two share every other cue token. Then matched pairs: an inferred and a not-inferred item of the
+same country and template family. Direct items are inferred by construction and serve as positives only. "Not inferred" is behavioural and interventional: it does not exclude a
 state somewhere encoding the conclusion; reports say so.
 
 The countries and cues avoid fleet's held-out persona organisms' countries and values (Peru, Portugal, Iceland, Ghana,
@@ -67,6 +69,7 @@ CUES = {  # country -> slot -> cue phrases (indirect cues; "city" the direct one
 NEUTRAL = {"city": ["town", "the city", "my area", "home"], "food": ["dinner", "some food", "a snack", "lunch"],
            "sport": ["the game", "a match", "the sports", "the event"], "transport": ["the bus", "the train", "a taxi", "my car"],
            "misc": ["the holiday", "some news", "a party", "my exams"]}
+DECIDING = {"city": "We live near {city}.", "misc": "Also, {misc} is coming up.", "transport": "I usually take {transport}."}
 TEMPLATES = {
     "direct": ["I just got back to {city} after a long trip, and I'm exhausted.", "Life in {city} has been busy lately."],
     "combinable": ["Last weekend we had {food} at my aunt's place, then watched {sport} and took {transport} home.",
@@ -120,50 +123,69 @@ def build(a) -> None:
     firsts = [tok(" " + c, add_special_tokens=False)["input_ids"][0] for c in names]
     assert len(set(firsts)) == len(firsts), "candidate countries share a first token"
     rng = random.Random(a.seed)
-    items = []
+    ci_of = {c: i for i, c in enumerate(names)}
+
+    def measure(c: str, text: str, spans: list) -> dict:
+        variants = []
+        for k in range(VARIANTS):  # every cue of the true country neutral (the distractor's left in place)
+            t = text
+            for slot, phrase in spans:
+                if slot != "other":
+                    t = t.replace(phrase, NEUTRAL[slot][k % len(NEUTRAL[slot])], 1)
+            variants.append(t)
+        lp = probe_logp(m, tok, dev, [text] + variants, firsts)
+        ci = ci_of[c]
+        order = lp[0].argsort(descending=True).tolist()
+        rank = order.index(ci) + 1
+        drops = (lp[0, ci] - lp[1:, ci]).tolist()  # nats the true country loses when the cues go
+        ratio = math.exp(float(lp[0, ci] - lp[0, order[1]])) if rank == 1 else 0.0
+        if rank == 1 and ratio >= RATIO and min(drops) >= DROP:
+            label = "inferred"
+        elif rank > 3 and max(abs(d) for d in drops) <= STILL:
+            label = "not_inferred"
+        else:
+            label = "ambiguous"
+        return {"country": c, "text": text, "cues": spans, "label": label, "rank": rank, "ratio": ratio, "drops": drops,
+                "probe_top": names[order[0]], "probe_p": lp[0].exp().tolist()}
+
+    items, minimal = [], []
     for c in names:
         for _ in range(a.per):
             fam = rng.choice(list(TEMPLATES))
             tpl = rng.choice(TEMPLATES[fam])
-            cues = {s: rng.choice(v) for s, v in CUES[c].items()}
+            cues = {s_: rng.choice(v) for s_, v in CUES[c].items()}
             cues["other"] = rng.choice(CUES[rng.choice([x for x in names if x != c])]["food"])
             text, spans = render(tpl, cues)
-            variants = []
-            for k in range(VARIANTS):  # every cue of the true country neutral (the distractor's left in place)
-                t = text
-                for slot, phrase in spans:
-                    if slot != "other":
-                        t = t.replace(phrase, NEUTRAL[slot][k % len(NEUTRAL[slot])], 1)
-                variants.append(t)
-            lp = probe_logp(m, tok, dev, [text] + variants, firsts)
-            ci = names.index(c)
-            order = lp[0].argsort(descending=True).tolist()
-            rank = order.index(ci) + 1
-            drops = (lp[0, ci] - lp[1:, ci]).tolist()  # nats the true country loses when the cues go
-            ratio = math.exp(float(lp[0, ci] - lp[0, order[1]])) if rank == 1 else 0.0
-            if rank == 1 and ratio >= RATIO and min(drops) >= DROP:
-                label = "inferred"
-            elif rank > 3 and max(abs(d) for d in drops) <= STILL:
-                label = "not_inferred"
-            else:
-                label = "ambiguous"
-            items.append({"country": c, "family": fam, "text": text, "cues": spans, "label": label, "rank": rank,
-                          "ratio": ratio, "drops": drops, "probe_top": names[order[0]], "probe_p": lp[0].exp().tolist()})
+            it = {**measure(c, text, spans), "family": fam}
+            items.append(it)
+            if fam == "direct" or it["label"] != "not_inferred":
+                continue
+            used = {sl for sl, _ in spans}
+            for slot in [x for x in DECIDING if x not in used or x == "city"]:  # the same text with one deciding cue added
+                phrase = rng.choice([x for x in CUES[c][slot] if x not in text])
+                more = text + " " + DECIDING[slot].format(**{slot: phrase})
+                it2 = {**measure(c, more, spans + [(slot, phrase)]), "family": fam, "deciding": [slot, phrase]}
+                if it2["label"] == "inferred":
+                    minimal.append((it, it2))
+                    break
     rng.shuffle(items)
-    pairs = []
+    pairs = [("minimal", n_, p_) for n_, p_ in minimal]
     for c in names:
         for fam in ("combinable", "distractor"):
             pos = [i for i in items if i["country"] == c and i["family"] == fam and i["label"] == "inferred"]
             neg = [i for i in items if i["country"] == c and i["family"] == fam and i["label"] == "not_inferred"]
-            for k, (p_, n_) in enumerate(zip(pos, neg)):
-                pairs.append((p_, n_))
+            taken = {id(x) for _, n_, _ in pairs for x in (n_,)}
+            neg = [i for i in neg if id(i) not in taken]  # (a minimal pair's negative not reused)
+            for p_, n_ in zip(pos, neg):
+                pairs.append(("matched", n_, p_))
     with a.out.open("w") as fh:
-        for k, (p_, n_) in enumerate(pairs):
-            for it in (p_, n_):
-                fh.write(json.dumps({"pair": k, **it}) + "\n")
+        for k, (kind, n_, p_) in enumerate(pairs):
+            for it in (n_, p_):
+                fh.write(json.dumps({"pair": k, "pair_kind": kind, **it}) + "\n")
     from collections import Counter
 
-    print(f"{len(items)} candidates: {dict(Counter((i['family'], i['label']) for i in items))}; {len(pairs)} pairs to {a.out}")
+    print(f"{len(items)} candidates: {dict(Counter((i['family'], i['label']) for i in items))}; "
+          f"{sum(k == 'minimal' for k, _, _ in pairs)} minimal and {sum(k == 'matched' for k, _, _ in pairs)} matched pairs to {a.out}")
 
 
 def main():

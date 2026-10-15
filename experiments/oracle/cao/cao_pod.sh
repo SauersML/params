@@ -3,6 +3,7 @@
 #   RUN=gen1 MODE=gen TEXTS=4000 [PROCS=2] bash experiments/oracle/cao/cao_pod.sh [HOURS]     examples (PROCS processes, seeds 1..)
 #   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] bash ... [HOURS]                SFT from the released adapter
 #   RUN=eval1 MODE=eval ITEMS=<h2h items> ADAPTER_DIR=<a trained adapter on the Mac> bash ...  the gate's questions
+#   RUN=inf1 MODE=inference [PER=150] bash ... [HOURS]                                       inference.py build (never-made inferences)
 #   RUN=org1 MODE=organisms bash ... [HOURS]                                                  organisms.py all (planted truths)
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
 #   (env: SRCREV (default origin/main), GPU, PRICE)
@@ -22,6 +23,7 @@ case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
          WORK="$WORK (python -u cao.py gen --out $O/examples_$k.jsonl --texts $(( ${TEXTS:-100} / ${PROCS:-2} )) --seed $k > $O/gen_$k.log 2>&1) &"
        done; WORK="$WORK wait; cat $O/examples_*.jsonl > $O/examples.jsonl" ;;
+  inference) WORK="python -u inference.py build --out $O/inference_items.jsonl --per ${PER:-150} > $O/inference.log 2>&1" ;;
   organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1 && \
 python -u organisms.py examples --dir $O/organisms --out $O/organism_examples.jsonl > $O/organism_examples.log 2>&1" ;;
   orgeval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B}

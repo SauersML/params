@@ -596,23 +596,31 @@ def cmd_questions(a) -> None:
     print(len(ivs), "questions to", a.out)
 
 
+def rewards(rd: "Reader", ivs: list[dict], explanations: list[str | None], baseline: float | None = None) -> list[dict]:
+    """The reader reward of each explanation (None: no explanation) on one text's questions, the reader's calls made
+    together (an RL group's samples in one round): per explanation its reward, accuracy, accuracy over the
+    no-explanation reader (baseline, when given), its moved questions' scores, tokens, and per-kind shares."""
+    got = rd([ask(ivs[0]["head"], ex, ivs, ivs[0]["answer"]) for ex in explanations])
+    out = []
+    for ex, text in zip(explanations, got):
+        rows = grade(parse_answers(text, len(ivs)), ivs)
+        n_ex = rd.tokens(ex) if ex else 0
+        acc = sum(r["score"] for r in rows) / len(rows)
+        out.append({"reward": acc - SIMPLICITY * n_ex / 1000, "accuracy": acc, "over_none": None if baseline is None else acc - baseline,
+                    "moved_right": sum(r["score"] for r, iv in zip(rows, ivs) if iv.get("moved")),
+                    "moved_n": sum(bool(iv.get("moved")) for iv in ivs), "explanation_tokens": n_ex, "raw": text,
+                    "by_kind": {k: {"n": sum(r["kind"] == k for r in rows), "top_right": sum(r["top_ok"] for r in rows if r["kind"] == k),
+                                    "p_credit": round(sum(r["p_credit"] for r in rows if r["kind"] == k) / sum(r["kind"] == k for r in rows), 3)}
+                                for k in sorted({r["kind"] for r in rows})}, "rows": rows})
+    return out
+
+
 def cmd_read(a) -> None:
     ivs = [json.loads(x) for x in a.questions.read_text().splitlines()]
     rd = Reader(a.reader, a.out.parent)
-    ex = explanation_of(a.explanation)
-    got = rd([ask(ivs[0]["head"], ex, ivs, ivs[0]["answer"])])[0]
-    rows = grade(parse_answers(got, len(ivs)), ivs)
-    n_ex = rd.tokens(ex) if ex else 0
-    acc = sum(r["score"] for r in rows) / len(rows)
-    kinds = sorted({r["kind"] for r in rows})
     base = json.loads(a.baseline.read_text())["accuracy"] if a.baseline else None
-    res = {"explanation": a.explanation, "reader": a.reader, "reward": acc - SIMPLICITY * n_ex / 1000, "accuracy": acc,
-           "over_none": None if base is None else acc - base, "moved_right": sum(r["score"] for r, iv in zip(rows, ivs) if iv.get("moved")),
-           "moved_n": sum(bool(iv.get("moved")) for iv in ivs),
-           "explanation_tokens": n_ex, "spend_usd": rd.spend.total, "raw": got,
-           "by_kind": {k: {"n": sum(r["kind"] == k for r in rows), "top_right": sum(r["top_ok"] for r in rows if r["kind"] == k),
-                           "p_credit": round(sum(r["p_credit"] for r in rows if r["kind"] == k) / sum(r["kind"] == k for r in rows), 3)}
-                       for k in kinds}, "rows": rows}
+    res = {"explanation": a.explanation, "reader": a.reader, **rewards(rd, ivs, [explanation_of(a.explanation)], base)[0],
+           "spend_usd": rd.spend.total}
     a.out.write_text(json.dumps(res, indent=1))
     print(json.dumps({k: res[k] for k in ("explanation", "reward", "accuracy", "over_none", "moved_right", "moved_n", "explanation_tokens",
                                            "spend_usd", "by_kind")}))

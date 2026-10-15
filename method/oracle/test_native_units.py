@@ -384,3 +384,83 @@ def test_build_native_meets_its_target(mean_case):
     assert abs(ms["lp"] - ms["lp_frozen"]) < 1e-4 and all(abs(ms[f"top{k}"]["share"] - 1) < 1e-4 for k in (1, 3, 5))
     part = native_units.mediated_share(ge, tx, S, means, candidates=16)
     assert abs(part["lp"] - part["lp_frozen"]) < 1e-4
+
+
+@pytest.fixture(scope="module")
+def tiny_hf():
+    """A tiny random Qwen3 (the HF adapter's model kind), float32 on the CPU, and means for its units."""
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    cfg = transformers.Qwen3Config(vocab_size=48, hidden_size=32, intermediate_size=40, num_hidden_layers=2, num_attention_heads=4,
+                                   num_key_value_heads=2, head_dim=8, max_position_embeddings=64, tie_word_embeddings=False)
+    model = transformers.Qwen3ForCausalLM(cfg).eval()
+    g = torch.Generator().manual_seed(1)
+    means = {"heads": torch.randn(2, 4, 8, generator=g) * 0.2, "neurons": torch.randn(2, 40, generator=g) * 0.2}
+    ids = torch.randint(0, 48, (10,), generator=g).tolist()
+    return model, ids, means
+
+
+def test_hf_units_are_the_models_run(tiny_hf):
+    """HFUnits: every unit live is the model's own run; a layer's neurons all at their means is the model with that MLP's
+    output replaced by down_proj(mean), and its heads all at their means the model with o_proj's input the means; units
+    frozen at their clean values give the clean run whatever is live inside."""
+    model, ids, means = tiny_hf
+    hu = native_units.HFUnits(model, ids, [9], means)
+    with torch.no_grad():
+        ref = torch.log_softmax(model(torch.tensor([ids])).logits[:, [9]].float(), -1)
+        assert float((hu.ref - ref).abs().max()) < 1e-5
+        h, n = (x[0] for x in hu.ones())
+        n2 = n.clone()
+        n2[1] = 0.0
+        got = hu.logq((h[None], n2[None]))
+        mlp = model.model.layers[1].mlp
+        fwd = mlp.forward
+        mlp.forward = lambda x: mlp.down_proj(means["neurons"][1].expand(*x.shape[:-1], -1))
+        try:
+            want = torch.log_softmax(model(torch.tensor([ids])).logits[:, [9]].float(), -1)
+        finally:
+            mlp.forward = fwd
+        assert float((got - want).abs().max()) < 1e-5
+        h2 = h.clone()
+        h2[0] = 0.0
+        got = hu.logq((h2[None], n[None]))
+        o = model.model.layers[0].self_attn.o_proj
+        hk = o.register_forward_pre_hook(lambda mod, args: (means["heads"][0].reshape(1, 1, -1).expand_as(args[0]),))
+        try:
+            want = torch.log_softmax(model(torch.tensor([ids])).logits[:, [9]].float(), -1)
+        finally:
+            hk.remove()
+        assert float((got - want).abs().max()) < 1e-5
+        g = torch.Generator().manual_seed(3)
+        inside = tuple((torch.rand(x.shape, generator=g) < 0.3).float() for x in (h, n))
+        assert hu.kl([inside], [tuple(x == 0 for x in inside)])[0] < 1e-5
+
+
+def test_hf_units_under_a_peft_adapter(tiny_hf):
+    """A PeftModel is run with its adapter on: HFUnits' model run is the adapted model's."""
+    peft = pytest.importorskip("peft")
+    model, ids, means = tiny_hf
+    import copy
+
+    pm = peft.get_peft_model(copy.deepcopy(model), peft.LoraConfig(r=2, target_modules=["o_proj", "down_proj", "q_proj"], init_lora_weights=False))
+    hu = native_units.HFUnits(pm, ids, [9], means)
+    with torch.no_grad():
+        ref = torch.log_softmax(pm(input_ids=torch.tensor([ids])).logits[:, [9]].float(), -1)
+        base = torch.log_softmax(model(torch.tensor([ids])).logits[:, [9]].float(), -1)
+    assert float((hu.ref - ref).abs().max()) < 1e-5 and float((ref - base).abs().max()) > 1e-4
+
+
+def test_build_hf(tiny_hf):
+    """build_hf meets its KL target (measured again on its units), lists every unit with the highest-ranked units' measured
+    effects, and keeps within a pass budget."""
+    model, ids, means = tiny_hf
+    hu = native_units.HFUnits(model, ids, [9], means)
+    empty = hu.kl([tuple(x[0] * 0 for x in hu.ones())])[0]
+    rec = native_units.build_hf(model, ids, 9, kl_target=empty * 0.05, means=means, effects=4)
+    h, n = (torch.zeros_like(x[0]) for x in hu.ones())
+    for kind, l, t, j, _ in rec["units"]:
+        (h if kind == "head" else n)[l, t, j] = 1.0
+    assert rec["kl"] <= rec["kl_target"] and abs(hu.kl([(h, n)])[0] - rec["kl"]) < 1e-5
+    assert 0 < len(rec["units"]) < rec["of"] and all(u[4] is not None for u in rec["units"][:4]) and rec["units"][4][4] is None
+    cheap = native_units.build_hf(model, ids, 9, kl_target=empty * 0.05, means=means, budget_passes=256)
+    assert cheap["passes"] <= 256 and cheap["kl"] <= cheap["kl_target"]

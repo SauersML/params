@@ -306,7 +306,63 @@ class NativeUnits:
 ENTRIES = 2 ** 27  # mask floats per batched run (every layer and position's heads and neurons of each row)
 
 
-class MeanUnits:
+class UnitRuns:
+    """The runs every native-unit model adapter shares (MeanUnits: vpd4l; HFUnits: an HF decoder such as Qwen3): rows per
+    batch, the all-live masks, the clean capture and the batched KL; each adapter gives logq(live, frozen=None,
+    capture=None), ref, T, L, H, hd, Dm and dev. passes counts the sequences run (forward rows; a backward pass's rows
+    count once more)."""
+    passes = 0
+
+    def rows(self) -> int:
+        """Rows per batched run (ENTRIES mask floats)."""
+        return max(1, ENTRIES // (self.L * self.T * (self.H + self.Dm)))
+
+    def ones(self, B: int = 1) -> tuple:
+        return (torch.ones(B, self.L, self.T, self.H, device=self.dev), torch.ones(B, self.L, self.T, self.Dm, device=self.dev))
+
+    @torch.no_grad()
+    def capture(self) -> dict:
+        """Every unit's output in the clean run: {"heads": [L, T, H, hd], "neurons": [L, T, d_mlp]} (kept)."""
+        if self._clean is None:
+            cap = {}
+            self.logq(self.ones(), capture=cap)
+            self.passes += 1
+            self._clean = {k: torch.stack(v) for k, v in cap.items()}
+        return self._clean
+
+    @torch.no_grad()
+    def kl(self, live_rows, frozen_rows=None, lp: bool = False) -> list[float]:
+        """KL in bits of the model at the targets from each row's run (lp: log2 p of the model's top token at each
+        target, summed, instead); live_rows (and frozen_rows) yield one row's (heads, neurons) each [L, T, H] and [L, T,
+        d_mlp], run rows() at a time."""
+        out, part, fpart = [], [], []
+        fit = iter(frozen_rows) if frozen_rows is not None else None
+        y = self.ref[0].argmax(-1)
+
+        def flush():
+            live = tuple(torch.stack([p[j] for p in part]).float() for j in range(2))
+            fr = tuple(torch.stack([p[j] for p in fpart]) for j in range(2)) if fit is not None else None
+            lq = self.logq(live, fr)
+            self.passes += len(part)
+            if lp:
+                out.extend((lq.gather(-1, y.view(1, -1, 1).expand(lq.shape[0], -1, 1)).squeeze(-1).sum(-1) / math.log(2.0)).tolist())
+            else:
+                out.extend(carry.kl(self.ref, lq).tolist())
+            part.clear()
+            fpart.clear()
+            native.free(self.dev)
+        for row in live_rows:
+            part.append(row)
+            if fit is not None:
+                fpart.append(next(fit))
+            if len(part) >= self.rows():
+                flush()
+        if part:
+            flush()
+        return out
+
+
+class MeanUnits(UnitRuns):
     """Native-unit circuits on one text in mean-ablation semantics: a unit kept computes as in the model from the run's
     own inputs; a unit left out writes its mean over the reference texts (unit_means) in place of its output (a head
     its output before o_proj, a neuron its value after the GELU); the embedding, every norm, every attention pattern and
@@ -330,13 +386,6 @@ class MeanUnits:
         self.ref = nat.reference([list(ids)], self.targets) if means is not None else None  # (capture alone: none)
         self.means = None if means is None else {k: means[k].to(self.dev) for k in ("heads", "neurons")}
         self._clean = None
-
-    def rows(self) -> int:
-        """Rows per batched run (ENTRIES mask floats)."""
-        return max(1, ENTRIES // (self.L * self.T * (self.H + self.Dm)))
-
-    def ones(self, B: int = 1) -> tuple:
-        return (torch.ones(B, self.L, self.T, self.H, device=self.dev), torch.ones(B, self.L, self.T, self.Dm, device=self.dev))
 
     def logq(self, live: tuple, frozen: tuple | None = None, capture: dict | None = None) -> torch.Tensor:
         tg, T, H, hd = self.tg, self.T, self.H, self.hd
@@ -370,44 +419,100 @@ class MeanUnits:
             x = x + g @ self.W["down_proj"][i].T
         return torch.log_softmax(tg.unembed(tg.norm(x[:, self.targets], -1)).float(), -1)
 
-    @torch.no_grad()
-    def capture(self) -> dict:
-        """Every unit's output in the clean run: {"heads": [L, T, H, hd], "neurons": [L, T, d_mlp]} (kept)."""
-        if self._clean is None:
-            cap = {}
-            self.logq(self.ones(), capture=cap)
-            self._clean = {k: torch.stack(v) for k, v in cap.items()}
-        return self._clean
 
-    @torch.no_grad()
-    def kl(self, live_rows, frozen_rows=None, lp: bool = False) -> list[float]:
-        """KL in bits of the model at the targets from each row's run (lp: log2 p of the model's top token at each
-        target, summed, instead); live_rows (and frozen_rows) yield one row's (heads, neurons) each [L, T, H] and [L, T,
-        d_mlp], run rows() at a time."""
-        out, part, fpart = [], [], []
-        fit = iter(frozen_rows) if frozen_rows is not None else None
-        y = self.ref[0].argmax(-1)
+class HFUnits(UnitRuns):
+    """MeanUnits' semantics on an HF decoder (Qwen3 and Llama-like models: model.model.layers[i].self_attn.o_proj and
+    .mlp.down_proj, the unembedding model.lm_head; a PeftModel as given, its active adapter on): forward pre-hooks on each
+    layer's attention output projection, whose input is the heads' outputs [B, T, H x hd], and on its MLP down
+    projection, whose input is the neurons after the activation [B, T, d_mlp], mix each unit's output with its fill
+    (its mean, or its clean value where frozen). The model's own dtype (bf16 runs mix in float32 and cast back); the
+    text cut after its last target. hook(ids, edit_heads, edit_neurons): any other edit through the same hooks (edit_*(layer,
+    x) -> x at every position: weight edits)."""
 
-        def flush():
-            live = tuple(torch.stack([p[j] for p in part]).float() for j in range(2))
-            fr = tuple(torch.stack([p[j] for p in fpart]) for j in range(2)) if fit is not None else None
-            lq = self.logq(live, fr)
-            if lp:
-                out.extend((lq.gather(-1, y.view(1, -1, 1).expand(lq.shape[0], -1, 1)).squeeze(-1).sum(-1) / math.log(2.0)).tolist())
-            else:
-                out.extend(carry.kl(self.ref, lq).tolist())
-            part.clear()
-            fpart.clear()
-            native.free(self.dev)
-        for row in live_rows:
-            part.append(row)
-            if fit is not None:
-                fpart.append(next(fit))
-            if len(part) >= self.rows():
-                flush()
-        if part:
-            flush()
-        return out
+    def __init__(self, model, ids: list[int], targets: list[int], means: dict | None):
+        core = model.get_base_model() if hasattr(model, "get_base_model") else model
+        cfg = core.config
+        self.model, self.core, self.layers = model, core, core.model.layers
+        self.L, self.H = cfg.num_hidden_layers, cfg.num_attention_heads
+        self.hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
+        self.Dm = cfg.intermediate_size
+        self.dev = next(core.parameters()).device
+        self.T = max(targets) + 1
+        self.ids, self.targets = list(ids)[:self.T], list(targets)
+        self.means = None if means is None else {k: means[k].to(self.dev, torch.float32) for k in ("heads", "neurons")}
+        self._clean = None
+        self.passes = 0
+        with torch.no_grad():
+            self.ref = self.hook(1) if means is not None else None
+
+    def hook(self, B: int, edit_heads=None, edit_neurons=None, capture: dict | None = None, ids: list[int] | None = None) -> torch.Tensor:
+        """log q at the targets [B, targets, V] of B copies of the text (or ids) with the hooks' edits."""
+        handles = []
+        for i, layer in enumerate(self.layers):
+            def pre_o(mod, args, i=i):
+                x = args[0]
+                if capture is not None:
+                    capture.setdefault("heads", []).append(x[0].float().view(-1, self.H, self.hd))
+                return (x if edit_heads is None else edit_heads(i, x),) + tuple(args[1:])
+
+            def pre_d(mod, args, i=i):
+                x = args[0]
+                if capture is not None:
+                    capture.setdefault("neurons", []).append(x[0].float())
+                return (x if edit_neurons is None else edit_neurons(i, x),) + tuple(args[1:])
+            handles += [layer.self_attn.o_proj.register_forward_pre_hook(pre_o), layer.mlp.down_proj.register_forward_pre_hook(pre_d)]
+        try:
+            x = torch.tensor([ids if ids is not None else self.ids], device=self.dev).expand(B, -1)
+            h = self.core.model(input_ids=x).last_hidden_state[:, self.targets if ids is None else [len(ids) - 1]]
+            return torch.log_softmax(self.core.lm_head(h).float(), -1)
+        finally:
+            for hd in handles:
+                hd.remove()
+
+    def logq(self, live: tuple, frozen: tuple | None = None, capture: dict | None = None) -> torch.Tensor:
+        hm, nm = live
+        B = max(hm.shape[0], nm.shape[0])
+        if frozen is not None and self._clean is None:
+            self.capture()
+        if self.means is None:
+            return self.hook(B, capture=capture)
+        T, H, hd = self.T, self.H, self.hd
+
+        def heads(i, x):
+            fill = self.means["heads"][i][None, None]  # [1, 1, H, hd]
+            if frozen is not None:
+                fill = torch.where(frozen[0][:, i][..., None], self._clean["heads"][i][None], fill)
+            m = hm[:, i][..., None]  # [B, T, H, 1]
+            return (m * x.float().view(B, T, H, hd) + (1 - m) * fill).view(B, T, H * hd).to(x.dtype)
+
+        def neurons(i, x):
+            fill = self.means["neurons"][i][None, None]
+            if frozen is not None:
+                fill = torch.where(frozen[1][:, i], self._clean["neurons"][i][None], fill)
+            return (nm[:, i] * x.float() + (1 - nm[:, i]) * fill).to(x.dtype)
+        return self.hook(B, heads, neurons, capture)
+
+
+@torch.no_grad()
+def hf_means(model, tok, texts=None, max_len: int = 256) -> dict:
+    """unit_means' definition for an HF decoder: each head's output before o_proj and each neuron's value after the
+    activation, averaged over every position of the reference texts (vpd4l's train texts' strings, text6000-6099,
+    re-tokenized by the model's tokenizer, at most max_len tokens each): {"heads": [L, H, hd], "neurons": [L, d_mlp],
+    "positions"}."""
+    sh = sn = None
+    count = 0
+    for n in (MEANS_TEXTS if texts is None else texts):
+        text = json.loads((native.TEXTS / "vpd4l" / f"text{n}.json").read_text())["prompts"][0]["text"]
+        ids = tok(text, add_special_tokens=False)["input_ids"][:max_len]
+        if not ids:
+            continue
+        hu = HFUnits(model, ids, [len(ids) - 1], None)
+        cap = {}
+        hu.hook(1, capture=cap)
+        h, m = torch.stack(cap["heads"]).sum(1).cpu().double(), torch.stack(cap["neurons"]).sum(1).cpu().double()  # [L, H, hd], [L, d_mlp]
+        sh, sn = (h, m) if sh is None else (sh + h, sn + m)
+        count += len(ids)
+    return {"heads": (sh / count).float(), "neurons": (sn / count).float(), "positions": count}
 
 
 # ---- the native builder (the lead's 10-14: builder_fast's units="neurons"; the same recipe as pymove's VPD builder)
@@ -432,7 +537,7 @@ def kl_goal(ge: goal_eval.GoalEval, tx: goal_eval.Text, f1: float = 0.9) -> floa
     return math.exp(math.log(e0) - f1 * (math.log(e0) - math.log(max(v0, goal_eval.KL_RESOLUTION))))
 
 
-def fisher(mu: MeanUnits, seed: int, samples: int = FISHER_SAMPLES, live: tuple | None = None) -> torch.Tensor:
+def fisher(mu: UnitRuns, seed: int, samples: int = FISHER_SAMPLES, live: tuple | None = None) -> torch.Tensor:
     """Every unit's sampled-label Fisher, flat (heads [L, T, H] then neurons [L, T, d_mlp]): 1/2 E_v (d log q_v /
     d m_u)^2 at the circuit live (None: every unit, the model), v drawn from the model's distribution at each target
     (numpy's stream from seed: the same draws on every device); at the model, the second-order KL rise of mean-ablating
@@ -449,31 +554,30 @@ def fisher(mu: MeanUnits, seed: int, samples: int = FISHER_SAMPLES, live: tuple 
         vv = v[s0:s0 + step]
         hm, nm = (x[None].expand(len(vv), -1, -1, -1).clone().requires_grad_(True) for x in base)
         mu.logq((hm, nm)).gather(-1, vv[..., None]).sum().backward()
+        mu.passes += 2 * len(vv)  # (forward and backward)
         out += 0.5 * torch.cat([hm.grad.pow(2).sum(0).flatten(), nm.grad.pow(2).sum(0).flatten()]) / samples
         native.free(mu.dev)
     return out
 
 
-def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | None = None, means: dict | None = None,
-                 log=None) -> tuple[Mask, dict]:
-    """A circuit of native units (heads and neurons at positions) in mean-ablation semantics (MeanUnits), the smallest
-    the recipe finds whose point KL is at most kl_target (kl_goal by default), every decision measured, the Fisher only
-    ordering:
-      (1) rank: every unit by its sampled-label Fisher at the model (fisher: one batched backward pass);
+def build_units(mu: UnitRuns, seed: int, goal: float, stages=STAGES, samples: int = FISHER_SAMPLES, clean_max: int = CLEAN_MAX,
+                halving: int = 64) -> tuple[tuple, dict]:
+    """A circuit of native units (heads and neurons at positions) in mean-ablation semantics on any adapter (MeanUnits:
+    vpd4l; HFUnits: Qwen3), the smallest the recipe finds whose point KL is at most goal, every decision measured, the
+    Fisher only ordering:
+      (1) rank: every unit by its sampled-label Fisher at the model (fisher: one batched backward pass). The second-order
+          order is the one that works: on text9031 it keeps KL 0.41 bits with 95% of the units mean-ablated, where the
+          integrated gradients' order (all-mean to the model) costs 3.9 bits with only its lowest 10% removed and a
+          random order 19.5 bits at 90%;
       (2) prefix: the top k units for k on a log scale (up to every unit, the model), measured, the smallest passing;
-          then halving between it and the size below that failed; in STAGES, the targets a share of the KL target
-          rising to it, each later stage ranking the last one's units by the Fisher at that circuit;
+          then halving between it and the size below that failed, to a 1/halving share; in stages, the targets a share
+          of goal rising to it, each later stage ranking the last one's units by the Fisher at that circuit;
       (3) inert cleanup: the largest log-scale suffix of the lowest-ranked kept units whose removal still passes, then
-          the single removals of the CLEAN_MAX lowest-ranked kept units measured and those under INERT bits removed
+          the single removals of the clean_max lowest-ranked kept units measured and those under INERT bits removed
           together where that still passes (else the most inert half, and so on).
-    The positions are those the kept units sit at (the ranking chooses them). Returns (Mask over the whole text,
-    record)."""
-    nat = ge.nat
+    Returns ((heads [L, T, H], neurons [L, T, d_mlp]) float masks over the adapter's positions, record)."""
     t0 = time.perf_counter()
-    means = means if means is not None else unit_means(nat)
-    mu = MeanUnits(nat, tx.ids, tx.targets, means)
     L, T, H, Dm, dev = mu.L, mu.T, mu.H, mu.Dm, mu.dev
-    goal = kl_target if kl_target is not None else kl_goal(ge, tx)
     nh = L * T * H
     stamp = {}
 
@@ -484,7 +588,7 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
         return h.view(L, T, H), n.view(L, T, Dm)
 
     # (1) rank
-    score = fisher(mu, tx.seed)
+    score = fisher(mu, seed, samples)
     rank = torch.argsort(score, descending=True)
     empty_kl = mu.kl([mask_of(rank[:0])])[0]
     stamp["rank"] = time.perf_counter() - t0
@@ -497,16 +601,16 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
         k_star = next((k for k, v in got if v <= target), len(order))  # (the whole order: the stage before's circuit)
         lo = max([k for k, _ in got if k < k_star] or [0])
         kl = dict(got).get(k_star)
-        while k_star - lo > max(1, k_star // 64):
+        while k_star - lo > max(1, k_star // halving):
             mid = (lo + k_star) // 2
             v = mu.kl([mask_of(order[:mid])])[0]
             got.append((mid, v))
             lo, k_star, kl = (lo, mid, v) if v <= target else (mid, k_star, kl)
         return order[:k_star], kl, got
     measured, keep = [], rank
-    for i, share in enumerate(STAGES):
+    for i, share in enumerate(stages):
         if i:
-            f = fisher(mu, tx.seed, live=mask_of(keep))
+            f = fisher(mu, seed, samples, live=mask_of(keep))
             keep = keep[torch.argsort(f[keep], descending=True)]
         keep, kl_star, got = prefix(keep, share * goal)
         measured.append(got)
@@ -521,7 +625,7 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
         if passing:
             j = max(passing)
             asc, kl_star = asc[j:], got[js.index(j)]
-    probe = asc[:min(CLEAN_MAX, len(asc) - 1)]
+    probe = asc[:min(clean_max, len(asc) - 1)]
     if len(probe):
         cur = mask_of(asc)
 
@@ -539,41 +643,110 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
                 break
             inert = inert[:len(inert) // 2]
     stamp["cleanup"] = time.perf_counter() - t0 - stamp["rank"] - stamp["prefix"]
-    h, n = mask_of(asc)
+    live = mask_of(asc)
+    rec = {"kl": kl_star, "kl_target": goal, "kl_empty": empty_kl, "prefix": [sorted(g) for g in measured],
+           "heads": int(live[0].sum()), "neurons": int(live[1].sum()), "units": len(asc), "of": len(rank), "passes": mu.passes,
+           "seconds": time.perf_counter() - t0, "stages": stamp, "score": score, "order": asc.flip(0)}
+    return live, rec
+
+
+def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | None = None, means: dict | None = None,
+                 log=None) -> tuple[Mask, dict]:
+    """build_units on vpd4l (MeanUnits) at kl_goal's KL by default: (Mask over the whole text, record); the positions
+    are those the kept units sit at."""
+    nat = ge.nat
+    means = means if means is not None else unit_means(nat)
+    mu = MeanUnits(nat, tx.ids, tx.targets, means)
+    goal = kl_target if kl_target is not None else kl_goal(ge, tx)
+    live, rec = build_units(mu, tx.seed, goal)
+    del rec["score"], rec["order"]
     Tf = len(tx.ids)
-    heads = torch.zeros(L, Tf, H, dtype=torch.bool, device=dev)
-    neurons = torch.zeros(L, Tf, Dm, dtype=torch.bool, device=dev)
-    heads[:, :T], neurons[:, :T] = h.bool(), n.bool()
+    heads = torch.zeros(mu.L, Tf, mu.H, dtype=torch.bool, device=mu.dev)
+    neurons = torch.zeros(mu.L, Tf, mu.Dm, dtype=torch.bool, device=mu.dev)
+    heads[:, :mu.T], neurons[:, :mu.T] = live[0].bool(), live[1].bool()
     S = Mask(heads, neurons)
-    positions = sorted(set((heads.any(2).any(0) | neurons.any(2).any(0)).nonzero().flatten().tolist()))
-    rec = {"kl": kl_star, "kl_target": goal, "kl_empty": empty_kl, "positions": positions, "prefix": [sorted(g) for g in measured],
-           "heads": int(heads.sum()), "neurons": int(neurons.sum()), "units": S.count(), "of": len(rank),
-           "seconds": time.perf_counter() - t0, "stages": stamp}
+    rec["positions"] = sorted(set((heads.any(2).any(0) | neurons.any(2).any(0)).nonzero().flatten().tolist()))
     if log:
-        log(f"  native: {S.count()} units ({rec['heads']} heads, {rec['neurons']} neurons) at {len(positions)} positions of {T}, "
-            f"KL {kl_star:.3f} (target {goal:.3f}, empty {empty_kl:.1f}), {rec['seconds']:.1f} s")
+        log(f"  native: {S.count()} units ({rec['heads']} heads, {rec['neurons']} neurons) at {len(rec['positions'])} positions "
+            f"of {mu.T}, KL {rec['kl']:.3f} (target {goal:.3f}, empty {rec['kl_empty']:.1f}), {rec['seconds']:.1f} s")
     return S, rec
 
 
+HF_KL_TARGET = 0.5   # build_hf's point KL in bits by default (vpd4l's VPD-matched targets on DEV20: 0.11-1.6, median about 0.6)
+BUDGET = {"stages": (0.5, 1.0), "samples": 16, "clean_max": 0, "halving": 16}  # build_hf's settings within budget_passes
+EFFECTS = 32  # build_hf measures the single removal of this many of the circuit's units (its highest-ranked)
+
+
+def build_hf(model, ids: list[int], target: int, kl_target: float = HF_KL_TARGET, means: dict | None = None, tok=None,
+             budget_passes: int | None = None, effects: int = EFFECTS, seed: int = 0, log=None) -> dict:
+    """The native builder on an HF decoder (HFUnits: Qwen3; a PeftModel with its active adapter on): the circuit of heads
+    and neurons for the model's prediction at position target of ids in mean-ablation semantics, at most kl_target bits
+    of KL there. means: hf_means' (with tok, computed when None). budget_passes: the BUDGET settings (fewer Fisher labels,
+    two stages, no singles cleanup), for a caller charged by the sequences run (the oracle gate's 256 a text). Returns
+    {"units": [(kind, layer, position, index, effect)], effect the measured drop in log2 p of the model's top token when
+    the unit alone is mean-ablated from the whole model for the `effects` highest-ranked units, else None and the
+    Fisher's predicted KL rise in "fisher"; "kl", "kl_target", "kl_empty", "positions", "layers" (units per layer),
+    "passes", "seconds", "heads", "neurons"}."""
+    t0 = time.perf_counter()
+    if means is None:
+        if tok is None:
+            raise ValueError("build_hf: pass means (hf_means) or the tokenizer to compute them")
+        means = hf_means(model, tok)
+    mu = HFUnits(model, ids, [target], means)
+    kw = BUDGET if budget_passes is not None else {}
+    live, rec = build_units(mu, seed, kl_target, **kw)
+    order, score = rec.pop("order"), rec.pop("score")
+    nh = mu.L * mu.T * mu.H
+    units = []
+    for i in order.tolist():
+        if i < nh:
+            l, t, j = i // (mu.T * mu.H), (i // mu.H) % mu.T, i % mu.H
+            units.append(["head", l, t, j])
+        else:
+            k = i - nh
+            l, t, j = k // (mu.T * mu.Dm), (k // mu.Dm) % mu.T, k % mu.Dm
+            units.append(["neuron", l, t, j])
+    n_eff = min(effects, len(units)) if budget_passes is None else max(0, min(effects, budget_passes - mu.passes - 1))
+    full = tuple(x[0] for x in mu.ones())
+    lp0 = mu.kl([full], lp=True)[0] if n_eff else None
+
+    def removed(u):
+        h, n = full[0].clone(), full[1].clone()
+        (h if u[0] == "head" else n)[u[1], u[2], u[3]] = 0.0
+        return h, n
+    eff = [lp0 - v for v in mu.kl((removed(u) for u in units[:n_eff]), lp=True)] if n_eff else []
+    fs = score[order].tolist()
+    rec.update(units=[u + [eff[i] if i < len(eff) else None] for i, u in enumerate(units)], fisher=fs,
+               positions=sorted({u[2] for u in units}), layers=[sum(1 for u in units if u[1] == l) for l in range(mu.L)],
+               passes=mu.passes, seconds=time.perf_counter() - t0, T=mu.T)
+    if log:
+        log(f"  native (HF): {len(units)} units ({rec['heads']} heads, {rec['neurons']} neurons) at {len(rec['positions'])} positions "
+            f"of {mu.T}, KL {rec['kl']:.3f} (target {kl_target:.3f}, empty {rec['kl_empty']:.1f}), {rec['passes']} passes, "
+            f"{rec['seconds']:.1f} s")
+    return rec
+
+
 def mediated_share(ge: goal_eval.GoalEval, tx: goal_eval.Text, S: Mask, means: dict | None = None, ks=(1, 3, 5),
-                   candidates: int = CLEAN_MAX) -> dict:
+                   candidates: int = CLEAN_MAX, sets: list | None = None) -> dict:
     """Criterion 6's mediated share for a native circuit (generality's definition, the lead's 10-14): the circuit's units
     ranked by their real-model single removal drop d(u) = log2 p(y) - log2 p(y | u mean-ablated) (y the model's top token
     at each target, summed), measured for its `candidates` units of largest Fisher (a native circuit holds tens of
     thousands); for the top k, the live drop (the real model with them mean-ablated) and the mediated drop (the circuit's
-    units live, every unit outside it frozen at its clean value, the top k mean-ablated), m_k = D_med / D_live."""
+    units live, every unit outside it frozen at its clean value, the top k mean-ablated), m_k = D_med / D_live. sets:
+    the removal sets given (named "set<i>"), in place of the top k (the same edits under another circuit)."""
     nat = ge.nat
     means = means if means is not None else unit_means(nat)
     mu = MeanUnits(nat, tx.ids, tx.targets, means)
     T, L, H, Dm = mu.T, mu.L, mu.H, mu.Dm
-    units = [u for u in S.units() if u[2] < T]
-    f = fisher(mu, tx.seed)
+    units = [u for u in S.units() if u[2] < T] if sets is None else []
+    f = fisher(mu, tx.seed) if sets is None else None
 
     def flat(u):
         kind, l, t, j = u
         return (l * T + t) * H + j if kind == "head" else L * T * H + (l * T + t) * Dm + j
-    fu = f[torch.tensor([flat(u) for u in units], device=mu.dev)]
-    units = [units[i] for i in torch.argsort(fu, descending=True)[:candidates].tolist()]
+    if units:
+        fu = f[torch.tensor([flat(u) for u in units], device=mu.dev)]
+        units = [units[i] for i in torch.argsort(fu, descending=True)[:candidates].tolist()]
 
     def removed(base, us):
         h, n = base[0].clone(), base[1].clone()
@@ -586,13 +759,14 @@ def mediated_share(ge: goal_eval.GoalEval, tx: goal_eval.Text, S: Mask, means: d
     order = [units[i] for i in np.argsort(drops)[::-1]]
     inside = (S.heads[:, :T].float(), S.neurons[:, :T].float())  # the circuit live, every other unit at its clean value
     outside = (S.heads[:, :T] == 0, S.neurons[:, :T] == 0)
-    sets = [order[:k] for k in ks]
+    names = [f"top{k}" for k in ks] if sets is None else [f"set{i}" for i in range(len(sets))]
+    sets = [order[:k] for k in ks] if sets is None else [[tuple(u) for u in R] for R in sets]
     live = mu.kl((removed(full, R) for R in sets), lp=True)
     med = mu.kl([inside] + [removed(inside, R) for R in sets], (outside for _ in range(len(sets) + 1)), lp=True)
     out = {"units": S.count(), "measured": len(units), "single_drops": sorted(drops, reverse=True)[:16], "lp": lp0, "lp_frozen": med[0]}
-    for k, R, lv, md in zip(ks, sets, live, med[1:]):
+    for name, R, lv, md in zip(names, sets, live, med[1:]):
         d_live, d_med = lp0 - lv, med[0] - md
-        out[f"top{k}"] = {"units": [list(u) for u in R], "live": d_live, "mediated": d_med,
+        out[name] = {"units": [list(u) for u in R], "live": d_live, "mediated": d_med,
                           "share": d_med / d_live if abs(d_live) > 1e-9 else None}
     return out
 

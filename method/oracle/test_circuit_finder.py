@@ -1,6 +1,6 @@
 """Checks of the patching-pair circuit finder (circuit_finder.py) on a tiny random Qwen3: patching the whole residual
-input of the first layer gives the other run exactly, a block patch equals its units patched one by one, and find()'s
-record is consistent with its own measurements.
+input of the first layer gives the other run exactly, a block patch equals its units patched one by one, a unit frozen
+at its value in the base run changes nothing, and find()'s record is consistent with its own measurements.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_circuit_finder.py -q
 """
@@ -53,16 +53,26 @@ def test_block_equals_units(tiny):
     assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-5
 
 
+def test_frozen_at_base_is_no_change(tiny):
+    pt, clean, corrupt = tiny
+    pt.setup(clean, corrupt)
+    a = pt.run("clean", [[("head", 1, (0, 3), 8, "clean"), ("neuron", 0, 5, 7, "clean")]])[0]
+    b = pt.run("corrupt", [[("head", 1, (0, 3), 8, "corrupt")]])[0]
+    assert abs(a) < 1e-6 and abs(b) < 1e-6
+
+
 def test_find_record(tiny, monkeypatch):
     pt, clean, corrupt = tiny
     monkeypatch.setattr(cf, "EPS", 0.05)
     rec = cf.find(pt, clean, corrupt)
-    assert rec["size"] == len(rec["nodes"]) + len(rec["routes"])
+    assert rec["size"] == len(rec["nodes"])
     for n in rec["nodes"]:
         assert n["pos"] >= rec["first_diff"] and n["pole"] in (-1, 1)
-    units = [("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]] + [("head", r["layer"], r["head"], r["pos"]) for r in rec["routes"]]
+    units = [("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]]
     if units:
         lost, rest = pt.both([units])[0]
         assert abs(lost - rec["lost"]) < 1e-5 and abs(rest - rec["restored"]) < 1e-5
     if rec["met"]:
         assert rec["lost"] >= cf.PASS and rec["restored"] >= cf.PASS
+    for r in rec["routes"]:
+        assert r["pos"] >= rec["first_diff"] and len(r["attends"]) >= 1

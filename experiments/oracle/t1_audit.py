@@ -25,7 +25,8 @@ sys.path[:0] = [str(HERE.parents[1] / "method/oracle"), str(HERE.parents[1] / "m
 
 MODEL = "Qwen/Qwen3-1.7B"
 N, SEED, TOP = 200, 0, 20
-BEFORE, AFTER = 96, 8  # tokens of context shown before and after an example's activating token
+BEFORE, AFTER = 256, 8  # tokens of context before and after an example's activating token (the lead's 10-15: short
+# contexts make long-context neurons look polysemantic, Cammarata's "summary" neurons firing on commas)
 WRITER = "Qwen/Qwen3.5-397B-A17B"  # the strongest validated Tinker model (never an 8B, never Sol/codex, never Claude)
 
 
@@ -123,6 +124,7 @@ def collect(a) -> None:
     a.out.write_text(json.dumps({"model": MODEL, "corpus": "monology/pile-uncopyrighted (streamed, first documents)", "window": a.window,
                                  "tokens": ntok, "documents": len(docs), "neurons": out}))
     np.save(a.out.with_suffix(".tokens.npy"), np.array([t for x in docs for t in x], dtype=np.int32))
+    np.save(a.out.with_suffix(".offsets.npy"), np.cumsum([0] + [len(x) for x in docs]).astype(np.int64))  # document d: tokens[off[d]:off[d + 1]]
     print(f"{len(out)} neurons over {ntok} tokens to {a.out}")
 
 

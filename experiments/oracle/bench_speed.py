@@ -171,19 +171,30 @@ def bench_window(nat, texts):
     import carry
     import native
 
-    rows, keep = [], type(nat).WINDOW_EXACT
+    rows, keep = [], nat.WINDOW_EXACT
+    previous_cache = nat.__dict__.get("_sensitivity_kept")
     dev = str(nat.dev).split(":")[0]
-    for path in texts:
-        ids, targets = native.text(path)
-        res = {}
-        for mode, devices in (("whole", ()), ("window", (dev,))):
-            nat.WINDOW_EXACT = devices
-            seed = lambda: torch.Generator(device="cpu").manual_seed(native.task_seed(str(ids[:8])))
-            seconds, (moved, _) = timed(lambda: nat.sensitivity(ids, targets, seed()), lambda: carry.synchronize(nat.dev))
-            res[mode] = (seconds, moved)
-        rows.append({"task": path.stem, "T": len(ids), "whole_s": res["whole"][0], "window_s": res["window"][0],
-                     "equal": bool(torch.equal(res["whole"][1], res["window"][1]))})
-    nat.WINDOW_EXACT = keep
+    try:
+        for path in texts:
+            ids, targets = native.text(path)
+            res = {}
+            for mode, devices in (("whole", ()), ("window", (dev,))):
+                nat.WINDOW_EXACT = devices
+                # Isolate modes and clear again after warm-up: timed() otherwise
+                # measures sensitivity's cached return rather than physical work.
+                nat._sensitivity_kept = {}
+                seed = lambda: torch.Generator(device="cpu").manual_seed(native.task_seed(str(ids[:8])))
+                seconds, (moved, _) = timed(lambda: nat.sensitivity(ids, targets, seed()),
+                    lambda: carry.synchronize(nat.dev), reset=lambda: nat._sensitivity_kept.clear())
+                res[mode] = (seconds, moved)
+            rows.append({"task": path.stem, "T": len(ids), "whole_s": res["whole"][0], "window_s": res["window"][0],
+                         "equal": bool(torch.equal(res["whole"][1], res["window"][1]))})
+    finally:
+        nat.WINDOW_EXACT = keep
+        if previous_cache is None:
+            nat.__dict__.pop("_sensitivity_kept", None)
+        else:
+            nat._sensitivity_kept = previous_cache
     return rows
 
 

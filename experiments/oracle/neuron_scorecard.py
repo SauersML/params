@@ -101,15 +101,19 @@ def read_circuit(path: Path) -> dict:
     return c
 
 
-def load_model(base: str, adapter: str | None, dev: str):
+def load_model(base: str, adapter: str | None, dev: str, dtype: torch.dtype = torch.float32):
+    """base (an HF id or directory) with adapter: a directory, an HF id, or an organism's name under ORG/adapters.
+    Every run's neuron edits, logits and contrasts are in float32 whatever the weights' dtype (bfloat16 for 8B and
+    32B on one or two L40s)."""
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(base, torch_dtype=torch.float32).to(dev).eval()
+    model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype, device_map=dev if dev == "auto" else None)
+    model = (model if dev == "auto" else model.to(dev)).eval()
     if adapter:
         from peft import PeftModel
 
-        d = Path(adapter) if Path(adapter).is_dir() else ORG / "adapters" / adapter
-        model = PeftModel.from_pretrained(model, str(d)).eval()
+        d = adapter if Path(adapter).is_dir() or "/" in adapter else str(ORG / "adapters" / adapter)
+        model = PeftModel.from_pretrained(model, d).eval()
     return model
 
 
@@ -188,17 +192,18 @@ class Runs:
                        torch.tensor([e[2] for e in v], device=dev), torch.tensor([e[3] for e in v], device=dev, dtype=torch.float32),
                        torch.tensor([e[4] for e in v], device=dev, dtype=torch.float32)) for L, v in aff.items()}
 
-            def edit(i, x):
+            def edit(i, x):  # (each tensor to the layer's own device: a model split over GPUs)
                 h = x.float()
-                h = torch.where(weak[:, None, None] & (h.abs() < self.thr[i]), torch.zeros((), device=dev), h)
+                dv = h.device
+                h = torch.where(weak.to(dv)[:, None, None] & (h.abs() < self.thr[i].to(dv)), torch.zeros((), device=dv), h)
                 if bool(circ.any()):
-                    fill = torch.stack([self.donors[f][i] if f is not None else torch.zeros(self.T, self.D, device=dev) for f in fills])
-                    h = torch.where(circ[:, None, None] & ~self.keep[i][None], fill, h)
+                    fill = torch.stack([self.donors[f][i].to(dv) if f is not None else torch.zeros(self.T, self.D, device=dv) for f in fills])
+                    h = torch.where(circ.to(dv)[:, None, None] & ~self.keep[i].to(dv)[None], fill, h)
                 if i in aff:
-                    b, p, j, mul, add = aff[i]
+                    b, p, j, mul, add = (t.to(dv) for t in aff[i])
                     h = h.index_put((b, p, j), h[b, p, j] * mul + add)
                 if capture is not None:
-                    capture.append(h[0].detach().clone())
+                    capture.append(h[0].detach().to(dev).clone())
                 return h.to(x.dtype)
             x_ids = self.ids if ids is None else list(ids)[:self.T]
             lq = self.run.logits(x_ids, self.pos, edit=edit, B=B)
@@ -221,12 +226,13 @@ class Runs:
         def edit(spec):
             def f(i, x):
                 h = x.float()
-                h = torch.where(h.abs() < self.thr[i], torch.zeros((), device=self.dev), h)
+                dv = h.device
+                h = torch.where(h.abs() < self.thr[i].to(dv), torch.zeros((), device=dv), h)
                 es = [e for e in spec if e[0] == i]
                 if es:
-                    p = torch.tensor([e[1] for e in es], device=self.dev)
-                    j = torch.tensor([e[2] for e in es], device=self.dev)
-                    h = h.index_put((torch.zeros_like(p), p, j), torch.zeros(len(es), device=self.dev))
+                    p = torch.tensor([e[1] for e in es], device=dv)
+                    j = torch.tensor([e[2] for e in es], device=dv)
+                    h = h.index_put((torch.zeros_like(p), p, j), torch.zeros(len(es), device=dv))
                 return h.to(x.dtype)
             return f
         lp0 = torch.log_softmax(self.run.logits(x_ids, list(range(T)), edit=edit([]))[0].float(), -1)
@@ -501,7 +507,8 @@ def main():
     ap.add_argument("--out", type=Path)
     ap.add_argument("--families", type=Path, default=CACHE / "families.json",
                     help="{family: [user prompts]}: the near donors")
-    ap.add_argument("--device", default=None)
+    ap.add_argument("--device", default=None, help="cuda, mps, cpu, or auto (the weights over every GPU: 32B)")
+    ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     a = ap.parse_args()
     if a.cmd == "table":
         print(table({p.split("=", 1)[0]: load(Path(p.split("=", 1)[1])) for p in a.paths}))
@@ -521,7 +528,7 @@ def main():
             groups.setdefault((c["model"], c.get("adapter")), []).append(c)
     tok = AutoTokenizer.from_pretrained(neuron_hubs.BASE)
     for (base, adapter), cs in groups.items():
-        model = load_model(base, adapter, dev)
+        model = load_model(base, adapter, dev, getattr(torch, a.dtype))
         run = neuron_hubs.Runner(model)
         key = f"{base.split('/')[-1]}_{Path(adapter).name if adapter else 'base'}"
         for c in cs:

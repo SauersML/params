@@ -2,7 +2,7 @@
 %% Solid arrows are prerequisites; dashed arrows share evidence, not gates.
 %% Current hypothesis: native units may support useful explanations; universal cleanliness is not assumed.
 flowchart TB
-  G["<b>Understand and predict the model's mechanisms</b><br/>Native neurons and attention, falsifiable explanations, useful oracle answers.<br/>Legibility ≠ sparsity ≠ causal faithfulness."]
+  G["<b>Understand and predict the model's mechanisms</b><br/>Native neurons; attention routes; falsifiable oracle answers.<br/>Legibility ≠ sparsity ≠ causal faithfulness."]
   Q["<b>Freeze a useful behavioral question</b><br/>Qwen3-8B is the main target (MATS); Qwen3-32B the showcase<br/>and validation; 1.7B for development only.<br/>Declare full contexts and answer contrast.<br/>Freeze fitting versus unseen questions/edits and controls.<br/>WHY · test explanations, not universal neuron cleanliness."]
   G --> Q
 
@@ -22,8 +22,8 @@ flowchart TB
   V --> O
   I -. observations with uncertainty .-> O
 
-  P["<b>MEASURED · native input benefit unproven</b><br/>Trained oracle, 64 neuron-edit questions / 49 contexts.<br/>Context vectors fixed; correct / zero / mismatched neuron.<br/>Answer loss: 0.530 / 0.507 / 0.581 nats per token.<br/>Both primary gain intervals include zero.<br/>Seven mismatched packets are nearly the same direction.<br/>320 forwards, 38 seconds, free MATS; 1.7B development only.<br/>NEXT · match native evidence to the whole edited sequence.<br/>OWNER · root / native oracle team"]
-  R["<b>FIXED · native measurement reliability</b><br/>Full downstream gradients; untested families cannot pass.<br/>All oracle vectors: one forward using the selected target.<br/>WHY · correct evidence and honest cost; 30 tests pass.<br/>NEXT · relevant 8B questions; job 20601 is user-held.<br/>OWNER · root / native oracle team"]
+  P["<b>MEASURED · neuron input benefit unproven</b><br/>64 edits / 49 contexts; context vectors fixed.<br/>Correct / zero / mismatched: 0.530 / 0.507 / 0.581 nats.<br/>Both primary gain intervals include zero.<br/>7 mismatches nearly identical; all 64 retained.<br/>320 forwards, 38 seconds, free MATS; 1.7B only."]
+  R["<b>FIXED · native measurement and labels</b><br/>Full downstream gradients; untested families cannot pass.<br/>Future choices use neuron ablations: no extra forwards.<br/>Signed write readouts are separate from causal effects.<br/>WHY · reliable evidence, explicit scope and honest cost."]
   I -. measurement integrity .-> R
   R -. reliable inputs .-> O
   Q -. current pilot .-> P
@@ -44,7 +44,7 @@ flowchart TB
   K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: unseen-prompt owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>At 8B on fleet's 8B owl organism.<br/>OWNER · existing owl / organism team"]
   V -. flagship application .-> K
 
-  E["<b>Limits that determine the next experiment</b><br/>A legible neuron does not prove the oracle uses that neuron.<br/>Current native input: final-position write, normalized.<br/>Current edit target: neuron removed across the sequence.<br/>Magnitude and the edited positions need explicit evidence.<br/>Future signed-readout labels fixed; old labels stay historical.<br/>WHY · match evidence, question and intervention at 8B."]
+  E["<b>NEXT · match evidence to the intervention</b><br/>Current input: normalized final-position neuron write.<br/>Current edit: neuron removed across all positions.<br/>Test signed traces and write magnitudes over the sequence.<br/>WHY · relevant evidence may improve answers at 8B.<br/>Hypothesis only; legibility does not establish oracle utility."]
   E -. informs controls .-> Q
   E -. informs evidence tests .-> O
 

@@ -5,7 +5,8 @@
 # there is one; never the sealed 9100-9149), VPD's saved answers and orders from VPD (teacher.py --save-vpd's files,
 # space-separated) and the eval flip pool (ci_patterns_fresh.pt). Records come back to ~/mpd-data/runpod/NAME/out.
 #   experiments/oracle/pods/scorecard_pod.sh LIST [NAME] [HOURS]   env: P, VPD, TEXTS_ADD (task files the texts lack,
-#                                                                  e.g. the paper prompts), GPU, PRICE, VRAM, RAM, RP_OWNER
+#                                                                  e.g. the paper prompts), GPU, PRICE, VRAM, RAM, RP_OWNER,
+#                                                                  SC_GRID (0: no VPD top-k grid)
 # The whole script is one block, so bash has read all of it before it runs.
 {
 cd /Users/user/params
@@ -27,7 +28,7 @@ COPYFILE_DISABLE=1 tar --exclude='vpd4l/text91[0-4][0-9].json' --no-xattrs --no-
 COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "$F/in.tar" -C "$F/in" . && rm -rf "$F/in"
 I='~/mpd-data/in_scorecard'
 RUNS="NP=\$(( \$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1) / 22000 )); NP=${P:-\$NP}; [ \$NP -ge 1 ] || NP=1; echo processes \$NP;
-for k in \$(seq 0 \$((NP - 1))); do (python -B experiments/oracle/circuit_scorecard.py $I/circuits --out $O/out --vpd $VPD --offset \$k --stride \$NP > $O/sc_\$k.log 2>&1; echo \"exit \$?\" >> $O/sc_\$k.log) & done;"
+for k in \$(seq 0 \$((NP - 1))); do (SC_GRID=${SC_GRID:-1} python -B experiments/oracle/circuit_scorecard.py $I/circuits --out $O/out --vpd $VPD --offset \$k --stride \$NP > $O/sc_\$k.log 2>&1; echo \"exit \$?\" >> $O/sc_\$k.log) & done;"
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; set -e; ln -sfn /workspace/runs/$NAME/mpd-data ~/mpd-data; mkdir -p $O/out $I ~/mpd-data/graph_oracle/texts/vpd4l ~/mpd-data/graph_oracle/goal_eval; tar -xf $F/in.tar -C $I;
 tar --no-same-owner -xf $I/texts.tar -C ~/mpd-data/graph_oracle/texts; cp -r $I/add/vpd4l/. ~/mpd-data/graph_oracle/texts/vpd4l/; cp $I/ci_patterns_fresh.pt $I/ci_patterns_train.pt ~/mpd-data/graph_oracle/goal_eval/;
 ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors $VPD /Users/user/params/method/oracle /Users/user/params/method/vpd /Users/user/params/experiments/oracle > /dev/null;

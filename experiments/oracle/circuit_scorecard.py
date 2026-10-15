@@ -95,6 +95,7 @@ DEV20 = tuple(f"text{n}" for n in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 900
 # (the lead's 10-14: the first ten, plus ten spread over length, 2-484 tokens, and the circuits' position counts, 2-15)
 ENTRIES = 2 ** 27  # mask floats per engine call (edit runs)
 LIVE_SINGLES = 32  # live_gates' single removals (the CI network runs per removal)
+SINGLES_MAX = 4096  # a native circuit's units measured one by one (beyond: those of its most damaging groups)
 STATED_MAX = 2048  # a native circuit's units whose eval track fall is measured (a uniform sample beyond: inert share estimated)
 SHARE_MIN = 0.1  # a mediated share is left undefined when the live drop is under this many bits
 LN2 = math.log(2.0)
@@ -754,21 +755,33 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
 
     def lp(lq):
         return (lq.gather(-1, y.view(1, -1, 1).expand(lq.shape[0], -1, 1)).squeeze(-1).sum(-1) / LN2).tolist()
-    singles = [[u] for u in units]
+    meas, screen = units, None  # the units measured one by one: every unit, or those of the groups (a kind, layer and
+    if len(units) > SINGLES_MAX:  # position) whose removal drops the model's prediction most, up to SINGLES_MAX units
+        by = {}
+        for u in units:
+            by.setdefault((u[0], u[1], u[2]), []).append(u)
+        keys = list(by)
+        gl = lp(native_lq(ge, tx, nphi, S, [[]] + [by[k] for k in keys], "live"))
+        meas = []
+        for i in np.argsort([gl[0] - x for x in gl[1:]])[::-1]:
+            if len(meas) >= SINGLES_MAX:
+                break
+            meas += by[keys[i]]
+        screen = {"groups": len(keys), "groups_measured_singly": len(set((u[0], u[1], u[2]) for u in meas))}
+    singles = [[u] for u in meas]
     live = lp(native_lq(ge, tx, nphi, S, [[]] + singles, "live"))
     real1 = [live[0] - x for x in live[1:]]
-    top = [units[i] for i in np.argsort(real1)[::-1][:5]]
+    top = [meas[i] for i in np.argsort(real1)[::-1][:5]]
     groups = [top[:1], top[:3], top[:5]]
     g_live = lp(native_lq(ge, tx, nphi, S, groups, "live"))
     g_med = lp(native_lq(ge, tx, nphi, S, groups, "mediated"))
-    circ_lq = native_lq(ge, tx, nphi, S, [[]] + singles + groups[1:], "circuit")
-    circ = lp(circ_lq)
+    circ = lp(native_lq(ge, tx, nphi, S, [[]] + singles + groups[1:], "circuit"))
     pred = [circ[0] - x for x in circ[1:]]
-    st = faith(pred[:len(units)], real1)
+    st = faith(pred[:len(meas)], real1)
     for j, gname in enumerate(("top3", "top5")):
-        st[gname] = {"predicted": pred[len(units) + j], "real": live[0] - g_live[1 + j], "inside": True}
-    rec["edits"] = {"parts": [native_label(u) for u in units], "nodes": [list(u) for u in units],
-                    "drops": {"model": real1, "circuit_mean": pred[:len(units)]},
+        st[gname] = {"predicted": pred[len(meas) + j], "real": live[0] - g_live[1 + j], "inside": True}
+    rec["edits"] = {"parts": [native_label(u) for u in meas], "nodes": [list(u) for u in meas], "screen": screen,
+                    "drops": {"model": real1, "circuit_mean": pred[:len(meas)]},
                     "groups": {"top3": [native_label(u) for u in top[:3]], "top5": [native_label(u) for u in top[:5]]},
                     "stats": {"circuit_mean": st},
                     "mediated": [{"k": len(R), "live": live[0] - a, "mediated": live[0] - b,
@@ -783,8 +796,7 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
                    "vpd_k_phi": None, "vpd_k_floors": None}
     done("size")
 
-    place = {u: i for i, u in enumerate(units)}
-    weak_order = sorted(units, key=lambda u: abs(pred[place[u]]))
+    weak_order = [meas[i] for i in np.argsort(np.abs(pred[:len(meas)]))]  # (among the units measured one by one)
     if len(units) <= ALL:
         uniform, weak = units, []
     else:
@@ -808,18 +820,19 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
                       "removable": [m["part"] for m in mrows if m["removable"]], "rows": mrows}
     done("minimality")
 
-    k0 = carry.kl(tx.ref, circ_lq[:1])[0].item()
-    rise_all = (carry.kl(tx.ref.expand(len(units), -1, -1), circ_lq[1:1 + len(units)]) - k0).tolist()
-    pick = list(range(len(units)))  # the track fall measured on every unit, or on a uniform sample of STATED_MAX of them
+    pick = list(range(len(units)))  # each unit's own-run effect on every unit, or on a uniform sample of STATED_MAX
     if len(units) > STATED_MAX:
         pick = sorted(np.random.default_rng(native.task_seed(path.stem) + 1).choice(len(units), STATED_MAX, replace=False).tolist())
+    circ_lq = native_lq(ge, tx, nphi, S, [[]] + [[units[i]] for i in pick], "circuit")
+    k0 = carry.kl(tx.ref, circ_lq[:1])[0].item()
+    rise = (carry.kl(tx.ref.expand(len(pick), -1, -1), circ_lq[1:]) - k0).tolist()
     sets = [S] + [S.without([units[i]]) for i in pick]
     tr = []
     for s0 in range(0, len(sets), 32):
         tr += [r["s_track_pp"] for r in nphi.track_pp(sets[s0:s0 + 32])]
         native.free(nat.dev)
     fall = [None if b is None or tr[0] is None else tr[0] - b for b in tr[1:]]
-    eff = [{"part": list(units[i]), "point_rise": rise_all[i], "track_fall": b} for i, b in zip(pick, fall)]
+    eff = [{"part": list(units[i]), "point_rise": a, "track_fall": b} for i, a, b in zip(pick, rise, fall)]
     rec["stated"] = {"stated": False, "defects": {}, "stranded": [], "no_token": [], "unreachable": [], "point": k0, "track": tr[0],
                      "inert_parts": [e["part"] for e in eff if moves(e) < INERT],
                      "inert_lines": [], "harmful_parts": [e["part"] for e in eff if e["point_rise"] < -INERT and (e["track_fall"] or 0.0) <= INERT],
@@ -884,7 +897,8 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     order = [tuple(nd) for nd in order]
     n_act = len(order)
     top_k = int(n_act * float(os.environ.get("SC_GRID_MAX", 1.0)))  # (the Mac's memory: SC_GRID_MAX=0.5, the whole answer's row kept)
-    grid = sorted({min(top_k, 2 ** i) for i in range(3, 20)} | {min(top_k, g.count())})
+    grid = sorted({min(top_k, 2 ** i) for i in range(3, 20)} | {min(top_k, g.count())}) if os.environ.get("SC_GRID", "1") != "0" else []
+    # (SC_GRID=0: no VPD top-k grid, most of a long text's time; the bake-off's table does not read it)
     have = {n_act: judged(vf["vpd"], fl, fams)}  # (VPD's whole answer: vpd_floors' row)
     todo = [k for k in grid if k not in have]
     for k, r in zip(todo, rows(ge, tx, [native.Graph(order[:k], complete=True) for k in todo], pool, log)):
@@ -893,7 +907,7 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     def first(ok):
         return next((k for k in sorted(have) if ok(have[k])), None)
     k_phi = first(lambda j: j["phi"] is not None and base["phi"] is not None and j["phi"] >= base["phi"])
-    if k_phi is not None and k_phi > grid[0]:  # three geometric steps between the grid point below and k_phi
+    if grid and k_phi is not None and k_phi > grid[0]:  # three geometric steps between the grid point below and k_phi
         lo = max(k for k in have if k < k_phi)
         mids = sorted({int(round(lo * (k_phi / lo) ** (i / 4))) for i in (1, 2, 3)} - set(have))
         for k, r in zip(mids, rows(ge, tx, [native.Graph(order[:k], complete=True) for k in mids], pool, log)):

@@ -42,7 +42,9 @@ KL_TOL = 0.1          # bits: the weak-zeroed reference's largest mean KL from t
 MASSIVE = 0.25        # a value at least this share of the layer's largest neuron maximum is massive (kept live, no unit)
 ALTERNATIVES = 5
 CANDIDATES = 512      # units measured alone
-ROWS = 16             # runs a batch
+ROWS = 32             # runs a batch (16 on 1.7B: a median 15.5 s a prompt, most of it the single patches)
+CF_UNITS = 256        # the units each counterfactual's change runs through that join the shortlist (128: sufficiency
+# stayed under SUFF_FRAC with every ranked unit on for 33 of 100 1.7B prompts)
 SIDE = 8              # positions before the answer whose predictions measure a removal's side effect
 SIDE_MAX = 0.05       # bits: the largest side effect a circuit's removal (or a candidate alone) may have
 NEC_BITS = 1.0        # the contrast drop a necessary removal reaches, beside the answer losing the top
@@ -269,7 +271,7 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
                 ok[:q] = False
                 sc[cidx[i][ok]] = g[ok].abs()
             have = set(short) | set(extra)
-            extra += [cand[k] for k in sc.topk(min(CANDIDATES // 4, len(cand))).indices.tolist() if cand[k] not in have and float(sc[k]) > 0]
+            extra += [cand[k] for k in sc.topk(min(CF_UNITS, len(cand))).indices.tolist() if cand[k] not in have and float(sc[k]) > 0]
         if extra:
             for u, r in zip(extra, runs([[u] for u in extra])):
                 drop[u], alone[u] = c0 - r["contrast"], r

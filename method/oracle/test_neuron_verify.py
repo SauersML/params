@@ -149,3 +149,6 @@ def test_summary_leaves_out_poles_that_never_fire(tmp_path,capsys):
  nv.cmd_summary(SimpleNamespace(rows=[p]));out=capsys.readouterr().out
  assert 'poles with no corpus activation (left out): 1' in out
  assert 'both poles (primary): 1 submitted poles; 1 valid; pass 1.00' in out
+def test_parse_json_reads_a_lone_backslash_literally():
+ raw='{"positive": "chat tokens like \'<\\|im_end|>\'", "negative": "a \\"quoted\\" word\\n"}'
+ assert nv.parse_json(raw)=={'positive':"chat tokens like '<\\|im_end|>'",'negative':'a "quoted" word\n'}

@@ -168,10 +168,12 @@ def parse_json(text: str) -> dict | None:
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         return None
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
+    for body in (m.group(0), re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", m.group(0))):  # then a lone backslash read literally
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            pass
+    return None
 
 
 def _item(tg, it: dict) -> dict:

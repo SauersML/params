@@ -17,7 +17,9 @@ N=oracle-graph-t1-$RUN
 O=/Users/user/mpd-data/runpod/$N
 RUNCMD="python -B /Users/user/params/experiments/oracle/t1_audit.py collect --model $MODEL --out $O/out/atlas_t1.json --tokens $TOKENS --batch ${BATCH:-8} --device cuda ${EXTRA:-}"
 [ "$STEP" = measure ] && RUNCMD="python -B /Users/user/params/method/oracle/neuron_verify.py measure --plans ${PLANS:?PLANS} --out $O/out/measured.jsonl --model $MODEL --device cuda"
-CMDS="export OMP_NUM_THREADS=8 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; set -e; mkdir -p $O/out; python -m pip install -q zstandard;
+INSTALL=  # the oracle pyenv has no pip; zstandard (the streamed Pile's compression) comes in through uv when it is needed
+case "$STEP ${EXTRA:-}" in collect*--corpus*|measure*) ;; *) INSTALL="uv pip install -q --python \$(command -v python) zstandard;" ;; esac
+CMDS="export OMP_NUM_THREADS=8 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; set -e; mkdir -p $O/out; $INSTALL
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader;
 (nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 30 > $O/out/gpu.log 2>&1 &);
 set +e; $RUNCMD > $O/out/$STEP.log 2>&1; echo \"exit \$?\" >> $O/out/$STEP.log"

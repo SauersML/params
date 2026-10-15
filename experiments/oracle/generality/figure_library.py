@@ -70,7 +70,7 @@ def main():
                        zorder=3, edgecolor="white", linewidth=0.6)
         ax.set_title(title)
         ax.set_xlim(-0.03, 1.03)
-        ax.set_xlabel("score on held-out texts (1 = as good as VPD's own answer)")
+        ax.set_xlabel("score on unseen texts (1 = as good as VPD's own answer)")
         figure.clean(ax)
     axes[0].set_yticks(range(len(names)))
     axes[0].set_yticklabels(names)
@@ -83,7 +83,7 @@ def main():
     print(OUT)
 
 
-TITLE = "Family templates on held-out texts"
+TITLE = "Family templates on unseen texts"
 
 if __name__ == "__main__":
     main()

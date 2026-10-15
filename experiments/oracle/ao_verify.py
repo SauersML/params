@@ -636,10 +636,14 @@ def run(a) -> None:
     done = {json.loads(x)["id"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
     tg = Target(a.model, a.device)
     a.out.parent.mkdir(parents=True, exist_ok=True)
+    import faulthandler
+
     for it in items_:
         if it["id"] in done:
             continue
+        faulthandler.dump_traceback_later(600, exit=True)  # an item past 10 minutes is a hang (a pod sat idle 30 minutes on hop_006): its stack, then exit
         got = run_item(tg, it, random.Random(it["id"]))
+        faulthandler.cancel_dump_traceback_later()
         with a.out.open("a") as fh:
             fh.write(json.dumps(got) + "\n")
         ver = [c["word"] for c in got["candidates"] if c.get("verified")]

@@ -183,3 +183,11 @@ def test_halving(tiny):
     h = rec["halving"]
     assert h is None or (h["after"] <= h["before"] and h["runs"] >= 1)
     assert rec["point"] <= rec["criteria"]["point"] + 1e-6
+
+
+def test_final_check_backs_off(tiny, monkeypatch):
+    nat, ge, tx = tiny
+    monkeypatch.setattr(connect, "CHEAP_FAMILIES", ())  # (the passes on the point KL alone: track checked at the end)
+    rec = connect.Connector(ge, tx, nodes_of(nat, tx, 5, 16), B=4).run(log=lambda m: None, floors=TINY)["record"]
+    assert rec["families"]["track"] >= rec["criteria"]["track"] - 1e-6
+    assert rec["backed_to"] in (None, "wired", "keep", "positions", "cross", "connections", "halving")

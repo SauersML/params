@@ -1,9 +1,9 @@
-"""connect.py's ranking scores and its halving pass compared at equal cost (the lead's 10-14): per text, one process so
-the families' draws are shared (a warm run first), each arm a fresh Connector: connections and lines kept, the sets
-measured, seconds per stage, the families, and the sparsity measures.
+"""connect.py's variants compared at equal cost (the lead's 10-14): per text, one process so the families' draws are
+shared (a warm run first), each arm a fresh Connector: connections and lines kept, the sets measured, seconds per stage,
+the families, and the sparsity measures. An arm is SCORE:PASSES[:FLAG...], flags halve (the halving pass), full (every
+family in the passes, not the cheap ones with a final check), batch8 (families asked 8 sets at a time from the start).
 
-  python experiments/oracle/connect_compare.py TEACHERS OUT.jsonl --vpd FILE --arms ig:8,fisher:8,ig:32,fisher:32,ig:8:halve
-         TASK...
+  python experiments/oracle/connect_compare.py TEACHERS OUT.jsonl TASK... --vpd FILE --arms ig:8,fisher:8,ig:8:halve
 """
 import argparse
 import json
@@ -38,11 +38,12 @@ for t in a.tasks:
     connect.Connector(ge, tx, nodes).run(log=lambda m: None, passes=2)  # (warm: the families' draws)
     for arm in arms:
         t0 = time.time()
-        rec = connect.Connector(ge, tx, nodes).run(log=lambda m: None, score=arm[0], passes=int(arm[1]),
-                                                   halve=len(arm) > 2 and arm[2] == "halve")["record"]
+        flags = set(arm[2:])
+        rec = connect.Connector(ge, tx, nodes).run(log=lambda m: None, score=arm[0], passes=int(arm[1]), halve="halve" in flags,
+                                                   cheap="full" not in flags, first=8 if "batch8" in flags else 1)["record"]
         row = {"task": t, "arm": ":".join(arm), **{k: rec[k] for k in ("parts", "parts_start", "lines", "lines_start",
                "connections", "token_edges", "point", "families", "criteria", "measured", "seconds", "halving",
-               "edges_per_unit", "cross_token", "tokens", "wired")}, "wall": round(time.time() - t0, 2)}
+               "edges_per_unit", "cross_token", "tokens", "wired", "backed_to")}, "wall": round(time.time() - t0, 2)}
         print(json.dumps(row), flush=True)
         with a.out.open("a") as f:
             f.write(json.dumps(row) + "\n")

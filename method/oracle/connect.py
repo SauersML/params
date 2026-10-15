@@ -57,6 +57,8 @@ ALPHAS = 8  # integrated-gradient strengths, (i + 1/2) / ALPHAS
 FISHER_SAMPLES = 32  # the second-order score's tokens drawn from the model's prediction
 SCORE = "ig"  # the ranking's score (Connector.scores: "ig" or "fisher")
 HALVE = False  # the halving pass after the prefix passes (run(halve=))
+CHEAP = True  # the passes asked about the cheap families alone, every family checked once at the end (run(cheap=))
+CHEAP_FAMILIES = ("track", "scope")  # (pymove's trim: interchange and patching cost the most a set)
 HALVE_BLOCKS = 8  # its first blocks: the remaining connections, lowest score first, in this many
 POINT_TOL = 0.02  # the point KL's allowed rise, as a share of the log distance from the wired circuit's to no line's
 TRACK_TOL = 0.02  # s_track_pp's allowed fall below the wired circuit's (lines.VAL_MARGIN's)
@@ -257,7 +259,7 @@ class Connector:
         return out
 
     def run(self, log=print, budget_s: float | None = None, floors: dict | None = None, score: str | None = None,
-            passes: int | None = None, halve: bool | None = None) -> dict:
+            passes: int | None = None, halve: bool | None = None, cheap: bool | None = None, first: int = 1) -> dict:
         """The stated circuit (stages (1) to (3)) and its measurements. floors: {"point": KL cap in bits, "track",
         "scope", "interchange": floors of the families} replacing the defaults (the wired circuit's values less the
         tolerances, the path-patched families' at most FLOOR); a family whose floor is None or whose wired value is
@@ -272,6 +274,8 @@ class Connector:
             cap[name] = None if wired[name] is None else min(FLOOR + MARGIN.get(name, 0.0), wired[name] - TRACK_TOL)
         cap.update(floors or {})
         asked = [name for name, _ in self.FAMILIES if cap.get(name) is not None]
+        cheap = CHEAP if cheap is None else cheap  # (the passes on the cheap families, every family once at the end)
+        searched = [f for f in asked if f in CHEAP_FAMILIES] if cheap else asked
         self.spent["wired"] = time.time() - t0
 
         t = time.time()
@@ -282,19 +286,21 @@ class Connector:
         self.spent["rank"] = time.time() - t
         measured = {"point": 0, "families": 0}  # the sets the stages measure (each point run, each family run)
 
-        def passing(ons, last=False) -> list[bool]:
-            """Whether each set meets the criteria: the point KL of every set, then the families in turn on the sets
-            still in, FAMILY_BATCH sets at a time in order (last: from the end), stopping after the first batch with a
-            set that passes (only the first or last passing set is used)."""
+        def passing(ons, last=False, fams=None) -> list[bool]:
+            """Whether each set meets the criteria: the point KL of every set, then the families (fams; default the
+            searched ones) in turn on the sets still in, in order (last: from the end), first `first` sets then
+            batches doubling to FAMILY_BATCH, stopping after the first batch with a set that passes (only the first or
+            last passing set is used)."""
+            fams = searched if fams is None else fams
             kl = pr.kl_sets(torch.stack(ons))
             measured["point"] += len(ons)
             out = [False] * len(ons)
             idx = [i for i, x in enumerate(kl) if x <= cap["point"]][::-1 if last else 1]
-            s0, width = 0, 1  # (the most promising set alone first, then batches doubling to FAMILY_BATCH: a family
+            s0, width = 0, first  # (the most promising set alone first, then batches doubling to FAMILY_BATCH: a family
             while s0 < len(idx):  # run costs about its sets, and the first set usually decides)
                 alive = idx[s0:s0 + width]
                 s0, width = s0 + width, min(2 * width, FAMILY_BATCH)
-                for name in asked:
+                for name in fams:
                     if not alive:
                         break
                     got = self.family(name, [ons[i] for i in alive])
@@ -311,6 +317,7 @@ class Connector:
         k = next((k for k, y in zip(ks, passing([self.row(order[:k]) for k in ks])) if y), len(order))
         keep = order[:k]
         self.spent["keep"] = time.time() - t
+        states = [("wired", full), ("keep", self.row(keep))]  # (the set after each pass: the final check's backoff)
 
         t = time.time()
         wp, rp, up = self.positions()
@@ -329,6 +336,7 @@ class Connector:
                 m = max((m for m, y in zip(ms, passing(rows, last=True)) if y), default=0)
                 dropped = cand[:m]
                 keep, tok = self.without(keep, tok, dropped)
+            states.append(("positions", self.row(keep, tok)))
             self.spent["positions"] = time.time() - t
             # (3b) cross-token connections (a writer at one position read at another), lowest score first
             tc = time.time()
@@ -339,6 +347,7 @@ class Connector:
                 rest = lambda m: keep[~torch.isin(keep, asc[:m])]  # noqa: E731
                 m = max((m for m, y in zip(ms, passing([self.row(rest(m), tok) for m in ms], last=True)) if y), default=0)
                 keep = rest(m)
+            states.append(("cross", self.row(keep, tok)))
             self.spent["cross"] = time.time() - tc
         if budget_s is None or time.time() - t0 < budget_s:
             # (3c) every kept connection, lowest score first
@@ -348,6 +357,7 @@ class Connector:
             if ms:
                 m = max((m for m, y in zip(ms, passing([self.row(asc[m:], tok) for m in ms], last=True)) if y), default=0)
                 keep = asc[m:]
+            states.append(("connections", self.row(keep, tok)))
             self.spent["connections"] = time.time() - tc
             # (3c') halving: what the prefixes stop at (the first misranked connection ends a prefix search)
             if halve and len(keep) > 1 and (budget_s is None or time.time() - t0 < budget_s):
@@ -364,6 +374,7 @@ class Connector:
                     elif len(b) > 1:
                         queue[:0] = list(b.tensor_split(2))
                 keep = keep[~gone[keep]]
+                states.append(("halving", self.row(keep, tok)))
                 halving = {"before": before, "after": len(keep), "runs": measured["point"] - runs0,
                            "seconds": round(time.time() - th, 2)}
             # (3d) token edges into kept parts, by their readers' scores, lowest first
@@ -380,6 +391,21 @@ class Connector:
             self.spent["tokens"] = time.time() - tc
         on = self.row(keep, tok)
         self.spent["inert"] = time.time() - t
+        # the final check: every family once on the stated set, else back to the last pass's set that meets them all
+        backed = None
+        rest_fams = [f for f in asked if f not in searched]
+        if rest_fams:
+            tf = time.time()
+            if not passing([on], fams=asked)[0]:
+                lo, hi = 0, len(states)  # states[0] (wired) meets every criterion by construction; the stated set none
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if passing([states[mid][1]], fams=asked)[0]:
+                        lo = mid
+                    else:
+                        hi = mid
+                backed, on = states[lo]
+            self.spent["final"] = time.time() - tf
 
         g = pr.graph(on)
         kl_on = pr.kl_sets(on[None])[0]
@@ -391,7 +417,7 @@ class Connector:
                "token_edges": kinds["t"] + kinds["u"], "point": kl_on, "point_wired": kl_full,
                "point_none": kl_none, "families": fam, "families_wired": wired, "criteria": cap,
                **self.sparsity(on), "wired": self.sparsity(full), "positions_dropped": dropped, "score": score, "passes": passes,
-               "halving": halving,
+               "halving": halving, "cheap": cheap, "backed_to": backed,
                "measured": measured,
                "seconds": {k: round(v, 2) for k, v in self.spent.items()}}
         log(f"{rec['parts']} of {rec['parts_start']} parts, {rec['lines']} of {rec['lines_start']} lines "

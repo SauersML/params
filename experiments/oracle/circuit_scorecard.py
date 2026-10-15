@@ -95,6 +95,7 @@ DEV20 = tuple(f"text{n}" for n in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 900
 # (the lead's 10-14: the first ten, plus ten spread over length, 2-484 tokens, and the circuits' position counts, 2-15)
 ENTRIES = 2 ** 27  # mask floats per engine call (edit runs)
 LIVE_SINGLES = 32  # live_gates' single removals (the CI network runs per removal)
+STATED_MAX = 2048  # a native circuit's units whose eval track fall is measured (a uniform sample beyond: inert share estimated)
 SHARE_MIN = 0.1  # a mediated share is left undefined when the live drop is under this many bits
 LN2 = math.log(2.0)
 BATCH = int(os.environ.get("SC_BATCH", 4))  # reward rows per fidelity call (SC_BATCH=1 for the Mac's memory)
@@ -491,6 +492,7 @@ def interventions_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, un
         rows += [("donor", native_label(u), None, [u]) for u in top if u[2] >= pad]
     cx, ab = nphi.capture(tx.ids), nphi._ablate(T)
     filled = {"q": cx["q"], "k": cx["k"], "v": cx["v"], "out": ab["out"], "neuron": ab["neuron"]}  # (outside heads: own q, k, v)
+    nh, nn = sum(u[0] == "head" for u in units), sum(u[0] == "neuron" for u in units)
 
     def run(part, own):
         R = len(part)
@@ -514,9 +516,10 @@ def interventions_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, un
         un = {"head": (hs, None if vals is None else {k: vals[k] for k in ("q", "k", "v", "out") if k in vals}),
               "neuron": (ns, None if vals is None else vals["neuron"])}
         lq = ge.graph_ref(tx.ids, tx.targets, nphi.model, units=un, gain={"head": gh, "neuron": gn}, capture=cap)
-        a = torch.cat([cap["out"][:, l, h, t].flatten(1) for _, l, t, h in [u for u in units if u[0] == "head"]]
-                      + [cap["neuron"][:, l, t, j][:, None] for _, l, t, j in [u for u in units if u[0] == "neuron"]], 1) \
-            if units else torch.zeros(R, 0, device=dev)
+        hu = torch.tensor([u[1:] for u in units if u[0] == "head"] or [[0, 0, 0]], device=dev)[:, [0, 2, 1]]  # (l, h, t)
+        nu_ = torch.tensor([u[1:] for u in units if u[0] == "neuron"] or [[0, 0, 0]], device=dev)  # (l, t, j)
+        a = torch.cat([cap["out"][:, hu[:, 0], hu[:, 1], hu[:, 2]].flatten(1)[:, :nh * nphi.hd],
+                       cap["neuron"][:, nu_[:, 0], nu_[:, 1], nu_[:, 2]][:, :nn]], 1)
         return lq.float(), a
 
     lqm, lqc, am, ac = [], [], [], []
@@ -694,7 +697,7 @@ def is_native(path: Path) -> bool:
 
 
 @torch.no_grad()
-def native_lq(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, sets: list[list], mode: str, B: int = 16) -> torch.Tensor:
+def native_lq(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, sets: list[list], mode: str, B: int = 32) -> torch.Tensor:
     """log q at the targets [len(sets), targets, V] with each set of S's units removed (mean-ablated): mode "live" the
     real model, "mediated" the real model with every unit outside S held at its value on the text, "circuit" S's own
     run (every unit outside S mean-ablated)."""
@@ -780,7 +783,8 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
                    "vpd_k_phi": None, "vpd_k_floors": None}
     done("size")
 
-    weak_order = sorted(units, key=lambda u: abs(pred[units.index(u)]))
+    place = {u: i for i, u in enumerate(units)}
+    weak_order = sorted(units, key=lambda u: abs(pred[place[u]]))
     if len(units) <= ALL:
         uniform, weak = units, []
     else:
@@ -805,18 +809,21 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
     done("minimality")
 
     k0 = carry.kl(tx.ref, circ_lq[:1])[0].item()
-    rise = (carry.kl(tx.ref.expand(len(units), -1, -1), circ_lq[1:1 + len(units)]) - k0).tolist()
-    sets = [S] + [S.without([u]) for u in units]
+    rise_all = (carry.kl(tx.ref.expand(len(units), -1, -1), circ_lq[1:1 + len(units)]) - k0).tolist()
+    pick = list(range(len(units)))  # the track fall measured on every unit, or on a uniform sample of STATED_MAX of them
+    if len(units) > STATED_MAX:
+        pick = sorted(np.random.default_rng(native.task_seed(path.stem) + 1).choice(len(units), STATED_MAX, replace=False).tolist())
+    sets = [S] + [S.without([units[i]]) for i in pick]
     tr = []
     for s0 in range(0, len(sets), 32):
         tr += [r["s_track_pp"] for r in nphi.track_pp(sets[s0:s0 + 32])]
         native.free(nat.dev)
     fall = [None if b is None or tr[0] is None else tr[0] - b for b in tr[1:]]
-    eff = [{"part": list(u), "point_rise": a, "track_fall": b} for u, a, b in zip(units, rise, fall)]
+    eff = [{"part": list(units[i]), "point_rise": rise_all[i], "track_fall": b} for i, b in zip(pick, fall)]
     rec["stated"] = {"stated": False, "defects": {}, "stranded": [], "no_token": [], "unreachable": [], "point": k0, "track": tr[0],
                      "inert_parts": [e["part"] for e in eff if moves(e) < INERT],
                      "inert_lines": [], "harmful_parts": [e["part"] for e in eff if e["point_rise"] < -INERT and (e["track_fall"] or 0.0) <= INERT],
-                     "part_effects": eff, "line_effects": []}
+                     "part_effects": eff, "line_effects": [], "sampled": len(pick) < len(units)}
     done("stated")
     return rec
 
@@ -1145,7 +1152,7 @@ def bakeoff(sets: dict, mib: dict | None = None) -> str:
                         ("connections per unit", lambda rs: med([(r["size"].get("sparsity") or {}).get("edges_per_unit") for r in rs])),
                         ("cross-token connections", lambda rs: med([(r["size"].get("sparsity") or {}).get("cross_token") for r in rs])),
                         ("removable share", lambda rs: summary(rs)["removable_uniform"][2]),
-                        ("inert share", lambda rs: sum(len(r["stated"]["inert_parts"]) for r in rs) / max(1, sum(r["size"]["parts"] for r in rs)))]),
+                        ("inert share", lambda rs: sum(len(r["stated"]["inert_parts"]) for r in rs) / max(1, sum(len(r["stated"]["part_effects"]) for r in rs)))]),
         ("Necessity", [("N", lambda rs: med([fam(r, "N") for r in rs]))]),
         ("Sufficiency", [("point KL (bits)", lambda rs: med([r["stated"].get("point") for r in rs])),
                          ("point", lambda rs: med([fam(r, "point") for r in rs]))]),

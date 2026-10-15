@@ -64,7 +64,12 @@ def collect(a) -> None:
     heaps = [{"+": [], "-": []} for _ in neurons]
     maxima = [{"+": 0.0, "-": 0.0} for _ in neurons]
     docs, ntok = [], 0
-    stream = load_dataset("monology/pile-uncopyrighted", split="train", streaming=True)
+    if a.corpus:  # the atlas corpus (fleet's atlas.py corpus ROOT): documents' token ids in its fixed order
+        toks = np.load(a.corpus / "corpus" / "tokens.npy", mmap_mode="r")
+        offs = np.load(a.corpus / "corpus" / "offsets.npy")
+        stream = ({"ids": toks[offs[d]:offs[d + 1]].tolist()} for d in range(len(offs) - 1))
+    else:
+        stream = load_dataset("monology/pile-uncopyrighted", split="train", streaming=True)
     batch = []
 
     def run(batch):
@@ -98,7 +103,8 @@ def collect(a) -> None:
                     maxima[k][pole] = max(maxima[k][pole], float(vals[0, j]))
 
     for row in stream:
-        x = tok(row["text"][:12 * a.window], add_special_tokens=False)["input_ids"][:a.window]  # a long document: its start only
+        x = row["ids"][:a.window] if "ids" in row else \
+            tok(row["text"][:12 * a.window], add_special_tokens=False)["input_ids"][:a.window]  # a long document: its start only
         if len(x) < 64:
             continue
         docs.append(x)
@@ -127,7 +133,7 @@ def collect(a) -> None:
             row[pole] = [{"value": v, "doc": d, "pos": p, "regime": r, **show(d, p)} for v, d, p, r in sorted(heaps[k][pole], reverse=True)]
         out.append(row)
     a.out.parent.mkdir(parents=True, exist_ok=True)
-    a.out.write_text(json.dumps({"model": a.model, "corpus": "monology/pile-uncopyrighted (streamed, first documents)", "window": a.window,
+    a.out.write_text(json.dumps({"model": a.model, "corpus": str(a.corpus) if a.corpus else "monology/pile-uncopyrighted (streamed, first documents)", "window": a.window,
                                  "tokens": ntok, "documents": len(docs), "neurons": out}))
     np.save(a.out.with_suffix(".tokens.npy"), np.array([t for x in docs for t in x], dtype=np.int32))
     np.save(a.out.with_suffix(".offsets.npy"), np.cumsum([0] + [len(x) for x in docs]).astype(np.int64))  # document d: tokens[off[d]:off[d + 1]]
@@ -204,6 +210,7 @@ def main():
     c.add_argument("--window", type=int, default=1024)
     c.add_argument("--batch", type=int, default=8)
     c.add_argument("--device", help="cuda, mps, cpu, or auto (layers over every visible GPU)")
+    c.add_argument("--corpus", type=Path, help="an atlas corpus root (atlas.py corpus ROOT): its documents in order, not the streamed Pile")
     c.add_argument("--model", default=MODEL, help="Qwen/Qwen3-1.7B, Qwen/Qwen3-8B, Qwen/Qwen3-32B: the same audit at each size")
     e = sub.add_parser("explain")
     e.add_argument("--atlas", type=Path, required=True)

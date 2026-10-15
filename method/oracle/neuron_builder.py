@@ -252,6 +252,30 @@ def _zero_edit(sets: list, base=None):
     return edit
 
 
+def pole_edit(sets: list, base=None):
+    """edit zeroing each row's units [(layer, neuron, pole)] at every position: pole 1 the neuron's positive values, -1
+    its negative ones, 0 the whole neuron (an edit of the model: T3, the essay's neuron removals); base(i, h) first."""
+    by = {}
+    for b, s in enumerate(sets):
+        for i, n, p in s:
+            zp, zn = by.setdefault(i, {}).get((b, n), (False, False))
+            by[i][(b, n)] = (zp or p >= 0, zn or p <= 0)
+    idx = {i: tuple(torch.tensor(v) for v in ([k[0] for k in d], [k[1] for k in d], [z[0] for z in d.values()],
+                                              [z[1] for z in d.values()])) for i, d in by.items()}
+
+    def edit(i, h):
+        if base is not None:
+            h = base(i, h)
+        if i not in idx:
+            return h
+        b, n, zp, zn = (v.to(h.device) for v in idx[i])
+        v = h[b, :, n]                                                           # [K, T]
+        h = h.clone()
+        h[b, :, n] = v.masked_fill(((v > 0) & zp[:, None]) | ((v < 0) & zn[:, None]), 0)
+        return h
+    return edit
+
+
 def _set_edit(sets: list, H: list):
     """edit setting each row's units [(layer, pos, neuron)] to their values H[layer][pos, neuron] (the prompt's run)."""
     by = {}

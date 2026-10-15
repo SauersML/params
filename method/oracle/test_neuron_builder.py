@@ -64,3 +64,11 @@ def test_circuit_units_and_removal(tiny, monkeypatch):
     if rec["met"]:
         r = rec["removed"]
         assert not r["top"] and r["contrast"] <= rec["contrast"] - nb.NEC_BITS + 1e-6 and r["side"] <= nb.SIDE_MAX
+
+
+def test_pole_edit():
+    h = torch.tensor([[[1., -2., 3.], [-1., 2., -3.]]]).expand(2, -1, -1).clone()   # [B 2, T 2, D 3]
+    e = nb.pole_edit([[(0, 0, 1), (0, 1, -1)], [(0, 2, 0)]])
+    out = e(0, h)
+    assert out[0].tolist() == [[0., 0., 3.], [-1., 2., -3.]] and out[1].tolist() == [[1., -2., 0.], [-1., 2., 0.]]
+    assert torch.equal(e(1, h), h)

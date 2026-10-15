@@ -20,9 +20,10 @@ The record reports the sparsity (edges between units per unit, cross-token conne
 circuit beside the wired one's.
 Criteria, the cheap families builder_fast's node selection holds (pymove's 10-14): the point KL at most node selection's
 point floor (FLOOR of the point score of VPD's actives at the circuit's positions; point_cap); s_track_pp on TRACK_DRAWS search
-draws, s_scope on its scope draws (the family that sees a token edge left out) and s_interchange_pp on the circuit's
-panel stay at FLOOR, or at the fully wired circuit's value less TRACK_TOL when that is lower. All are measured on the
-engine's runs; the gradients only order the candidates.
+draws, s_scope on its scope draws (the family that sees a token edge left out), s_interchange_pp on the circuit's
+panel and activation patching near and far (donors_search: the families cut connections fail first) stay at FLOOR
+plus MARGIN, or at the fully wired circuit's value less TRACK_TOL when that is lower. All are measured on the runs; the
+gradients only order the candidates.
 
   connect(ge, tx, graph, units="vpd", budget_s=None, floors=None)   builder_fast's call: the stated native.Graph
   connect.py one TEACHER.json TASK.json OUT.json [--vpd FILE] [--device D]   one circuit's stated form, measured
@@ -53,8 +54,10 @@ POINT_TOL = 0.02  # the point KL's allowed rise, as a share of the log distance 
 TRACK_TOL = 0.02  # s_track_pp's allowed fall below the wired circuit's (lines.VAL_MARGIN's)
 TRACK_DRAWS = 8  # s_track_pp's draws in the search (the report uses goal_eval's default)
 FAMILY_BATCH = 8  # sets asked about a path-patched family at once
-FLOOR = goal_eval.FLOOR_TOP  # the path-patched families' floor (pymove's builder: 0.9 absolute, VPD's whole answer
-# scoring 1 there by construction), lowered to the wired circuit's value less TRACK_TOL when that is lower
+FLOOR = goal_eval.FLOOR_TOP  # the families' floor (pymove's builder: 0.9 absolute, VPD's whole answer scoring 1 there
+# by construction), plus MARGIN on the search draws (the eval split's floor held: pymove's margins), lowered to the wired
+# circuit's value less TRACK_TOL when that is lower
+MARGIN = {"track": 0.02, "scope": 0.05, "interchange": 0.01, "patching_near": 0.02, "patching_far": 0.02}
 
 
 def sizes(n: int) -> list[int]:
@@ -101,7 +104,8 @@ class Connector:
         native.free(dev)
         return out
 
-    FAMILIES = (("track", "s_track_pp"), ("scope", "s_scope"), ("interchange", "s_interchange_pp"))
+    FAMILIES = (("track", "s_track_pp"), ("scope", "s_scope"), ("interchange", "s_interchange_pp"),
+                ("patching_near", "s_patching_near"), ("patching_far", "s_patching_far"))
 
     def targets(self) -> list[int]:
         return list(self.tx.targets)
@@ -166,9 +170,21 @@ class Connector:
                 "tokens": len(pos), "positions": pos}
 
     def family(self, name: str, ons: list) -> list[float | None]:
-        """One path-patched family of each line set on the search split (track on TRACK_DRAWS draws, scope on its
-        scope_draws, interchange_pp on each set's panel), FAMILY_BATCH sets a call."""
+        """One family of each line set on the search split, FAMILY_BATCH sets a call: track on TRACK_DRAWS draws,
+        scope on its scope_draws and interchange_pp on each set's panel (path-patched, line rows), activation patching
+        near and far (donors_search on the stated graphs, one call for both pools, kept per set: the families a
+        stated circuit's cut connections fail first, text9005's 0.82 and text9012's 0.60 at 0.9 when they went
+        unasked)."""
         ge, tx, out = self.ge, self.tx, []
+        if name.startswith("patching"):
+            seen = self.__dict__.setdefault("_patching", {})
+            todo = [on for on in ons if on.numpy().tobytes() not in seen]
+            for s0 in range(0, len(todo), FAMILY_BATCH):
+                part = todo[s0:s0 + FAMILY_BATCH]
+                for on, r in zip(part, ge.donors_search(tx, [self.pr.graph(on) for on in part])):
+                    seen[on.numpy().tobytes()] = {"patching_near": r.get("s_patching_near"), "patching_far": r.get("s_patching_far")}
+                native.free(ge.nat.dev)
+            return [seen[on.numpy().tobytes()][name] for on in ons]
         for s0 in range(0, len(ons), FAMILY_BATCH):
             rows = torch.stack([self.pr.row(on) for on in ons[s0:s0 + FAMILY_BATCH]]).float()
             if name == "track":
@@ -193,7 +209,7 @@ class Connector:
         off = {n for n, v in (floors or {}).items() if v is None}  # (families the caller leaves out)
         wired = {name: None if name in off else self.family(name, [full])[0] for name, _ in self.FAMILIES}
         for name, _ in self.FAMILIES:
-            cap[name] = None if wired[name] is None else min(FLOOR, wired[name] - TRACK_TOL)
+            cap[name] = None if wired[name] is None else min(FLOOR + MARGIN.get(name, 0.0), wired[name] - TRACK_TOL)
         cap.update(floors or {})
         asked = [name for name, _ in self.FAMILIES if cap.get(name) is not None]
         self.spent["wired"] = time.time() - t0

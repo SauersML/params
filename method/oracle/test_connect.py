@@ -20,7 +20,7 @@ import goal_eval  # noqa: E402
 from test_goal_eval import tiny_native  # noqa: E402
 from test_lines import nodes_of  # noqa: E402
 
-TINY = {"scope": None, "interchange": None}  # (the tiny model has no far donors for those families' draws)
+TINY = {"scope": None, "interchange": None, "patching_near": None, "patching_far": None}  # (the tiny model has no far donors for those families' draws)
 
 
 @pytest.fixture(scope="module")

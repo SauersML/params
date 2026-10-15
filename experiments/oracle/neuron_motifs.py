@@ -146,7 +146,7 @@ def run(recs: list[dict], model_name: str, thr: str, dtype: str, log=print) -> d
         return {"model": model_name, "mined": mined, "rows": []}
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=getattr(torch, dtype)).to(dev).eval().requires_grad_(False)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=getattr(torch, dtype)).to(dev).eval().requires_grad_(False)
     nr = nb.Neurons(model, tok)
     nr.load(thr)
     cnt = {}

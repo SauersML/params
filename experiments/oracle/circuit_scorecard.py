@@ -1361,7 +1361,7 @@ def kind_med(recs: list[dict], kind: str, field: str):
     """The median over circuits of each circuit's median of field over its interventions of kind."""
     xs = []
     for r in recs:
-        v = [x[field] for x in r.get("interventions") or [] if x["kind"] == kind and x[field] is not None]
+        v = [x[field] for x in r.get("interventions") or [] if x["kind"] == kind and x.get(field) is not None]
         if v:
             xs.append(float(np.median(v)))
     return float(np.median(xs)) if xs else None
@@ -1415,15 +1415,16 @@ def bakeoff(sets: dict, mib: dict | None = None) -> str:
     ]
     picked = {n: [r for r in recs if r["task"] in common] for n, recs in sets.items()}
     cell = lambda x: "-" if x is None else (f"{x:.3f}" if isinstance(x, float) else str(x))  # noqa: E731
-    out = [f"{len(common)} texts scored by every builder", f"{'':40}" + "".join(f"{n:>16}" for n in sets)]
+    w = {n: max(16, len(n) + 2) for n in sets}
+    out = [f"{len(common)} texts scored by every builder", f"{'':40}" + "".join(f"{n:>{w[n]}}" for n in sets)]
     for title, cols in groups:
         out.append(title)
         for name, f in cols:
-            out.append(f"  {name:38}" + "".join(f"{cell(f(picked[n])):>16}" for n in sets))
+            out.append(f"  {name:38}" + "".join(f"{cell(f(picked[n])):>{w[n]}}" for n in sets))
     if mib:
         out.append("MIB (external)")
         for k in sorted({k for v in mib.values() for k in v}):
-            out.append(f"  {k:38}" + "".join(f"{(mib.get(n) or {}).get(k, '-')!s:>16}" for n in sets))
+            out.append(f"  {k:38}" + "".join(f"{(mib.get(n) or {}).get(k, '-')!s:>{w[n]}}" for n in sets))
     return "\n".join(out)
 
 

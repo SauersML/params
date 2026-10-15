@@ -1153,6 +1153,10 @@ class Validated:
 SET_LEVELS = ("site", "chunk16", "chunk4", "subcomponent")  # the influential set's levels, coarse first
 SINGLE = True         # set_search's final single-part pass (single_pass, --no-single off)
 FULL_EVERY = 8        # single_pass: removal groups between full reward row checks
+SINGLE_BUDGET = 1800.0  # single_pass: seconds before it stops asking (the removals the last full row passed stand;
+# 10-14 dev at 1bf0709, two texts a card: text9008, 9014 and 9020 sat in the pass 1.7-2.6 h with 711, 2,089 and 546
+# parts, each batch of 8 a floors call on 9 variants plus the held families and the validation halves)
+SINGLE_LOG_EVERY = 120.0  # single_pass: seconds between progress lines
 
 
 def single_pass(pr: "Pruner", graph_of, acceptance: Acceptance, floors: dict, f_track: float | None, row_under,
@@ -1257,9 +1261,12 @@ def single_pass(pr: "Pruner", graph_of, acceptance: Acceptance, floors: dict, f_
         del groups[n0 + lo:]
         pr.on = with_new(lo)
         last = (pr.on.clone(), len(groups))
-    at = 0
+    at, said, over = 0, t0, False
     while True:
         while at < len(queue):
+            if time.perf_counter() - t0 > SINGLE_BUDGET:      # (a bounded pass: what the last full row passed stands)
+                over = True
+                break
             batch = [i for i in queue[at] if bool(pr.on[i]) and i not in kept]
             at += 1
             if batch:
@@ -1267,11 +1274,18 @@ def single_pass(pr: "Pruner", graph_of, acceptance: Acceptance, floors: dict, f_
                 take([i for i, ok in zip(batch, judge([[i] for i in batch])) if ok], True)
             if len(groups) - last[1] >= FULL_EVERY:
                 full()
+            if time.perf_counter() - said > SINGLE_LOG_EVERY:   # progress: the batches asked, removals, full rows
+                said = time.perf_counter()
+                log(f"  single: batch {at} of {len(queue)}, {tested} tested, {sum(len(g) for g in groups)} removed, "
+                    f"{full_checks} full rows, {said - t0:.0f}s", flush=True)
         if len(groups) == last[1]:
             break
         full()
+        if over:
+            break
     out = {"tested": tested, "removed": sum(len(g) for g in groups), "groups": len(groups), "full_checks": full_checks,
-           "backed": backed, "fails": fails, "seconds": time.perf_counter() - t0}
+           "backed": backed, "fails": fails, "seconds": time.perf_counter() - t0, "budget_hit": over,
+           "batches": [at, len(queue)]}
     log(f"  single: {out['removed']} of {len(ids)} parts removed alone ({tested} tested, {len(groups)} groups, "
         f"{full_checks} full rows, {backed} groups undone), {out['seconds']:.0f}s", flush=True)
     return out

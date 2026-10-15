@@ -152,6 +152,10 @@ NEGATIVE pole (most negative values; corpus minimum -{nmax:.2f}):
 {neg}
 
 Explain each pole: what in the text drives the neuron to that pole, as specifically as the examples allow (the token, its context, the role it plays). Write JSON with two fields, "positive" and "negative", each 1 to 3 sentences, nothing else."""
+# v2: the same examples, an instruction aimed at a reader who must write a new text from the explanation alone (8B
+# failures: a press-release byline read as "function words", byte tokens of CJK characters described as the symbol �)
+EXPLAIN_V2 = EXPLAIN[:EXPLAIN.index("Explain each pole:")] + """Explain each pole so that a reader who sees only your explanation can write a new text that drives the neuron to that pole. Say (1) the exact token or tokens where it fires; (2) the context that must surround them: the kind of document, the topic, the phrase or structure just before, and how far back it reaches; (3) what the examples share that a surface reading misses (for example, a byline in a press release rather than the word "is"). A token shown as � is one byte of a multi-byte character: name the script and which byte, not the symbol. Prefer one specific shared cause over a list of unrelated tokens. Write JSON with two fields, "positive" and "negative", each 1 to 4 sentences, nothing else."""
+PROMPTS = {"v1": EXPLAIN, "v2": EXPLAIN_V2}
 
 
 def explain(a) -> None:
@@ -165,7 +169,7 @@ def explain(a) -> None:
     def block(exs):
         return "\n".join(f"{j}. {e['value']:.2f} [{e['regime']}] ...{e['before']}⟦{e['token']}⟧{e['after']}" for j, e in enumerate(exs[:a.examples], 1))
 
-    prompts = [EXPLAIN.format(layer=n["layer"], index=n["index"], pmax=n["max"]["+"], nmax=n["max"]["-"], pos=block(n["+"]), neg=block(n["-"]))
+    prompts = [PROMPTS[a.prompt].format(layer=n["layer"], index=n["index"], pmax=n["max"]["+"], nmax=n["max"]["-"], pos=block(n["+"]), neg=block(n["-"]))
                for n in atlas["neurons"]]
     import neuron_verify
 
@@ -289,6 +293,7 @@ def main():
     e.add_argument("--out", type=Path, required=True)
     e.add_argument("--writer", default=WRITER)
     e.add_argument("--examples", type=int, default=10)
+    e.add_argument("--prompt", choices=sorted(PROMPTS), default="v1", help="the writer's instruction (v1: T1's pre-registered one)")
     f = sub.add_parser("figure")
     f.add_argument("--rows", type=Path, nargs="+", required=True, help="judged T1 rows, one file per model size")
     f.add_argument("--out", type=Path, required=True)

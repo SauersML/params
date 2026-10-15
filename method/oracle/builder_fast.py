@@ -471,27 +471,46 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     return _graph(kept), rec
 
 
-def build_neurons(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple:
+def build_neurons(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_native_floors: bool = False,
+                  native_gate_calls: int | None = None, native_pool=None) -> tuple:
     """Native units: heads and neurons in mean-ablation semantics (native_units.build_native, inframove's): (Mask, record)."""
     import native_units
 
-    return native_units.build_native(ge, tx, log=log)
+    if not shared_native_floors and native_gate_calls is None and native_pool is None:
+        return native_units.build_native(ge, tx, log=log)  # preserve the default call
+    return native_units.build_native(ge, tx, log=log, shared_floors=shared_native_floors,
+                                     max_gate_calls=16 if native_gate_calls is None else native_gate_calls,
+                                     pool=native_pool)
 
 
 UNITS = {"vpd": build_vpd, "neurons": build_neurons}
 
 
 def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | None = None, log=None,
-          builder: str = "builder_fast", stated: bool = False) -> dict:
+          builder: str = "builder_fast", stated: bool = False, *, shared_native_floors: bool = False,
+          native_gate_calls: int | None = None, native_pool=None) -> dict:
     """A circuit for one task (a vpd4l task JSON: its first prompt's token_ids and target_positions; seed, the task's
     own, default from its first tokens) in units (UNITS): goal_eval.to_json of the circuit, with "units", its record
     under "build", "build_seconds" (every stage, the text's runs included) and "builder" (name@rev). stated: its
-    connections stated by connect.connect (rustmove's), at the builder's own floors, its record under "connect"."""
+    connections stated by connect.connect (rustmove's), at the builder's own floors, its record under "connect".
+    Native-only shared_native_floors uses build_native's shared search admission;
+    native_pool optionally supplies its construction pool. The gate-call budget is
+    per text (including an optional warmup), not a physical-forward limit. Admission
+    failures propagate before serialization; defaults retain point-only native builds."""
+    native_options = shared_native_floors or native_gate_calls is not None or native_pool is not None
+    if native_options and units != "neurons":
+        raise ValueError("native admission options require units='neurons'")
+    if native_gate_calls is not None and (type(native_gate_calls) is not int or native_gate_calls < 0):
+        raise ValueError("native_gate_calls must be a nonnegative integer")
     p = task["prompts"][0]
     t0 = time.perf_counter()
     tx = ge.text(p["token_ids"], p["target_positions"], seed, task=task)
     t1 = time.perf_counter()
-    g, rec = UNITS[units](ge, tx, log=log)
+    if native_options:
+        g, rec = UNITS[units](ge, tx, log=log, shared_native_floors=shared_native_floors,
+                             native_gate_calls=native_gate_calls, native_pool=native_pool)
+    else:
+        g, rec = UNITS[units](ge, tx, log=log)
     rec["seconds_text"] = round(t1 - t0, 2)
     if stated and units == "vpd":
         import connect
@@ -524,17 +543,26 @@ def main():
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--warm", default="text6000", help="a text built first and thrown away (CUDA's first kernels)")
     ap.add_argument("--stated", action="store_true", help="state the connections (connect.connect)")
+    ap.add_argument("--shared-native-floors", action="store_true",
+                    help="neurons only: admit against VPD-derived shared search floors; no unchecked fallback")
+    ap.add_argument("--native-gate-calls", type=int,
+                    help="neurons only: shared admission calls per text (default16), not physical forwards")
     a = ap.parse_args()
+    if (a.shared_native_floors or a.native_gate_calls is not None) and a.units != "neurons":
+        ap.error("native admission options require --units neurons")
+    if a.native_gate_calls is not None and a.native_gate_calls < 0:
+        ap.error("--native-gate-calls must be nonnegative")
+    native_options = dict(shared_native_floors=a.shared_native_floors, native_gate_calls=a.native_gate_calls)
     a.out.mkdir(parents=True, exist_ok=True)
     ge = goal_eval.GoalEval(native.Native())
     task_of = lambda t: json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())  # noqa: E731
     if a.warm:
-        build(goal_eval.GoalEval(ge.nat), task_of(a.warm), a.units, native.task_seed(a.warm))
+        build(goal_eval.GoalEval(ge.nat), task_of(a.warm), a.units, native.task_seed(a.warm), **native_options)
     for t in a.tasks.read_text().split()[a.offset::a.stride]:
         if (a.out / f"{t}.json").exists():
             continue
         c = build(goal_eval.GoalEval(ge.nat), task_of(t), a.units, native.task_seed(t), log=print, builder=f"builder_fast@{a.rev}",
-                  stated=a.stated)
+                  stated=a.stated, **native_options)
         (a.out / f"{t}.json").write_text(json.dumps(c, default=str))
         print(f"{t}: {len(c['nodes'])} parts, {c['build_seconds']} s", flush=True)
         native.free(ge.nat.dev)

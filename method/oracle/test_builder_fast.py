@@ -75,3 +75,77 @@ def test_build_neurons(tiny, monkeypatch):
     out = builder_fast.build(ge, task, units="neurons", seed=5, builder="builder_fast@test")
     assert out["units"] == "native" and out["semantics"] == "mean_ablation" and out["nodes"]
     assert out["build"]["kl"] <= out["build"]["kl_target"] and out["build"]["units"] == len(out["nodes"])
+
+
+def test_native_admission_options_forwarded_and_default_unchanged(monkeypatch):
+    import types
+    import native_units
+    calls=[]
+    mask=native_units.Mask(torch.ones(1,1,1,dtype=torch.bool),torch.zeros(1,1,1,dtype=torch.bool))
+    def build_native(ge,tx,**kw):calls.append(kw);return mask,{'kl':0.}
+    monkeypatch.setattr(native_units,'build_native',build_native)
+    ge=types.SimpleNamespace(text=lambda *a,**kw:object())
+    task={'prompts':[{'token_ids':[0],'target_positions':[0]}]}
+    builder_fast.build(ge,task,units='neurons')
+    assert calls==[{'log':None}]
+    pool={'train':'fixed construction pool'}
+    row=builder_fast.build(ge,task,units='neurons',shared_native_floors=True,native_gate_calls=3,native_pool=pool)
+    assert calls[-1]=={'log':None,'shared_floors':True,'max_gate_calls':3,'pool':pool}
+    assert row['units']=='native' and row['semantics']=='mean_ablation'
+
+
+def test_native_admission_options_reject_vpd_before_task_execution(monkeypatch):
+    import types
+    ge=types.SimpleNamespace(text=lambda *a,**kw:pytest.fail('task must not execute'))
+    task={'prompts':[{'token_ids':[0],'target_positions':[0]}]}
+    for opts in ({'shared_native_floors':True},{'native_gate_calls':3},{'native_pool':{}}):
+        with pytest.raises(ValueError,match='neurons'):
+            builder_fast.build(ge,task,units='vpd',**opts)
+    for calls in (-1,True):
+        with pytest.raises(ValueError,match='nonnegative integer'):
+            builder_fast.build(ge,task,units='neurons',native_gate_calls=calls)
+
+
+def cli_setup(tmp_path,monkeypatch):
+    import types,json
+    task={'prompts':[{'token_ids':[0],'target_positions':[0]}]}
+    texts=tmp_path/'texts';(texts/'vpd4l').mkdir(parents=True)
+    for name in ('text6000','text6008'):(texts/'vpd4l'/f'{name}.json').write_text(json.dumps(task))
+    tasks=tmp_path/'tasks.txt';tasks.write_text('text6008\n')
+    out=tmp_path/'out'
+    monkeypatch.setattr(native,'TEXTS',texts)
+    monkeypatch.setattr(native,'Native',lambda:types.SimpleNamespace(dev='cpu'))
+    monkeypatch.setattr(goal_eval,'GoalEval',lambda nat:types.SimpleNamespace(nat=nat,text=lambda *a,**kw:object()))
+    return tasks,out
+
+
+def test_cli_native_admission_failure_writes_no_circuit(tmp_path,monkeypatch):
+    import native_units
+    tasks,out=cli_setup(tmp_path,monkeypatch)
+    seen=[]
+    def fail(ge,task,*a,**kw):
+        seen.append(kw)
+        raise native_units.NoAdmittedCandidate({'admission':{'status':'NO_ADMITTED_CANDIDATE'}})
+    monkeypatch.setattr(native_units,'build_native',fail)
+    monkeypatch.setattr(sys,'argv',['builder_fast',str(tasks),str(out),'--units','neurons','--shared-native-floors','--native-gate-calls','3','--warm',''])
+    with pytest.raises(native_units.NoAdmittedCandidate):builder_fast.main()
+    assert not (out/'text6008.json').exists()
+    assert seen[0]['shared_floors'] and seen[0]['max_gate_calls']==3
+
+
+def test_cli_native_options_cover_warmup_and_requested_task(tmp_path,monkeypatch):
+    tasks,out=cli_setup(tmp_path,monkeypatch)
+    seen=[]
+    def build(ge,task,*a,**kw):seen.append(kw);return {'nodes':[],'build_seconds':0.}
+    monkeypatch.setattr(builder_fast,'build',build)
+    monkeypatch.setattr(sys,'argv',['builder_fast',str(tasks),str(out),'--units','neurons','--shared-native-floors','--native-gate-calls','2'])
+    builder_fast.main()
+    assert len(seen)==2 and all(x['shared_native_floors'] and x['native_gate_calls']==2 for x in seen)
+    assert (out/'text6008.json').is_file()
+
+
+def test_cli_native_flags_rejected_before_model_allocation(tmp_path,monkeypatch):
+    monkeypatch.setattr(native,'Native',lambda:pytest.fail('model must not be constructed'))
+    monkeypatch.setattr(sys,'argv',['builder_fast',str(tmp_path/'tasks'),str(tmp_path/'out'),'--shared-native-floors'])
+    with pytest.raises(SystemExit):builder_fast.main()
+    assert not (tmp_path/'out').exists()

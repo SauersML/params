@@ -11,7 +11,7 @@ apart (pos0).
       sources.npy (MIX index per document), meta.json
   atlas.py collect ROOT --shard K --shards S [--batch-tokens 32768]   documents d with d % S == K
   atlas.py merge ROOT                       the shards into ROOT/layers/LNN.npz (Atlas reads them)
-  atlas.py weights ROOT                     ROOT/weights.npz: neighbours by weight product, direct logit effects
+  atlas.py weights ROOT [--model M]         ROOT/weights.npz: neighbours by weight product, direct logit effects
   atlas.py heads ROOT [--texts 2000]        ROOT/heads.npz: per head its sink share, offset profile, top positions
 
 Atlas(ROOT).neuron(layer, index) gives one neuron's record with its examples' text; see the class."""
@@ -287,8 +287,7 @@ def weights(a) -> None:
     import torch
 
     dev = device(a.device)
-    meta = load_corpus(a.root)[2]
-    m = load_model(meta["model"], dev)
+    m = load_model(a.model or load_corpus(a.root)[2]["model"], dev)   # (--model: before the corpus exists)
     lay = m.model.layers
     L, D = len(lay), m.config.intermediate_size
     f32 = lambda t: t.detach().float()  # noqa: E731
@@ -487,6 +486,8 @@ def main():
             p.add_argument("--batch-tokens", type=int, default=32768)
         if name == "heads":
             p.add_argument("--texts", type=int, default=2000)
+        if name == "weights":
+            p.add_argument("--model")
     a = ap.parse_args()
     {"corpus": corpus, "collect": collect, "merge": merge, "weights": weights, "heads": heads}[a.cmd](a)
 

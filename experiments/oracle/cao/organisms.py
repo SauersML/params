@@ -108,6 +108,7 @@ def train(kind: str, name: str, out: Path, device: str | None) -> None:
     m = get_peft_model(m, LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", lora_dropout=0.05))
     m.base_model.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     lm = m.base_model.model
+    m.train()  # (gradient checkpointing runs only in training mode: the second run ran out of memory without it)
     data = planted(kind, name, rng)
     data += ultrachat(len(data), rng)
     enc = [encode(tok, d) for d in data]

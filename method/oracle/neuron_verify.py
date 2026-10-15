@@ -1,6 +1,6 @@
 """Explanation verifiers for a model's own neurons (#2951, the lead's 10-15 direction after Cammarata's "Neural
 Networks Are Already Clean"): each check costs about one target forward pass, and together they are the oracle's
-explanation reward.
+explanation diagnostics. T1 tests activation predictability, not a causal mechanism certificate.
 
 A neuron is (layer, index) of a Qwen3 MLP; its activation at a position is the input of down_proj,
 a = silu(gate) * up. Its positive pole is how high a goes, its negative pole how low; the SwiGLU sign regime at a
@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+import math
+import numbers
 import random
 import re
 import sys
@@ -60,6 +63,25 @@ B: {b}
 Which continuation does the prediction describe? Answer A or B."""
 
 
+def _swiglu_architecture(model):
+    """Only the SiLU-gated down_proj input has the documented sign semantics."""
+    if getattr(model.config,"hidden_act",None) not in ("silu","swish"):
+        raise ValueError("neuron verifier requires SiLU-gated MLP architecture")
+    layers=model.model.layers
+    if not layers:
+        raise ValueError("target has no transformer layers")
+    for layer in layers:
+        mlp=layer.mlp
+        try:
+            width=mlp.down_proj.in_features
+            valid=width>0 and mlp.gate_proj.out_features==width and mlp.up_proj.out_features==width
+        except AttributeError:
+            valid=False
+        if not valid:
+            raise ValueError("target must expose compatible gate_proj/up_proj/down_proj dimensions")
+    return True
+
+
 class Target:
     """A Qwen3 model with a neuron's activation read (the input of down_proj, with gate's and up's signs) and set."""
 
@@ -72,7 +94,9 @@ class Target:
         self.tok = AutoTokenizer.from_pretrained(name)
         self.tok.padding_side = "right"  # each text's own positions first, the padding after (masked out)
         self.m = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).to(self.dev).eval()
+        self.architecture_verified = _swiglu_architecture(self.m)
         self.layers = self.m.model.layers
+        self.name = name
 
     def poles(self, texts: list[str], layer: int, index: int) -> list[dict]:
         """Per text, its largest activation and its largest negated activation over positions (the first token, the
@@ -88,17 +112,20 @@ class Target:
             for s in range(0, len(texts), 16):
                 enc = self.tok(texts[s:s + 16], return_tensors="pt", padding=True, add_special_tokens=False).to(self.dev)
                 with torch.no_grad():
-                    self.m(**enc)
+                    self.m.model(**enc, use_cache=False)  # capture only: no vocabulary logits or KV cache
                 mask = enc["attention_mask"].bool().clone()
                 mask[:, 0] = False
                 for j in range(mask.shape[0]):
                     a, g, u = seen["a"][j][mask[j]], seen["gate"][j][mask[j]], seen["up"][j][mask[j]]
                     if a.numel() == 0:
-                        out.append({"pos": 0.0, "neg": 0.0, "regime_pos": None, "regime_neg": None})
+                        out.append({"pos": 0.0, "neg": 0.0, "regime_pos": None, "regime_neg": None, "position_pos": None, "position_neg": None})
                         continue
                     ip, ineg = int(a.argmax()), int(a.argmin())
-                    reg = lambda i: ("+" if g[i] > 0 else "-") + ("+" if u[i] > 0 else "-")  # noqa: E731
-                    out.append({"pos": float(a[ip]), "neg": float(-a[ineg]), "regime_pos": reg(ip), "regime_neg": reg(ineg)})
+                    sign = lambda x: "+" if x > 0 else "-" if x < 0 else "0"  # noqa: E731
+                    reg = lambda i: sign(g[i]) + sign(u[i])  # noqa: E731
+                    positions = mask[j].nonzero(as_tuple=False).flatten()
+                    out.append({"pos": float(a[ip]), "neg": float(-a[ineg]), "regime_pos": reg(ip), "regime_neg": reg(ineg),
+                                "position_pos": int(positions[ip]), "position_neg": int(positions[ineg])})
         finally:
             for h in hs:
                 h.remove()
@@ -143,47 +170,122 @@ def parse_json(text: str) -> dict | None:
         return None
 
 
+def _item(tg, it: dict) -> dict:
+    """Validate every item before reader or target execution; no Python negative indices."""
+    if not isinstance(it, dict):
+        raise ValueError("neuron item must be an object")
+    for key in ("layer", "index"):
+        if type(it.get(key)) is not int or it[key] < 0:
+            raise ValueError(f"{key} must be a nonnegative native integer")
+    if it.get("pole") not in ("+", "-"):
+        raise ValueError("pole must be + or -")
+    cm=it.get("corpus_max")
+    if isinstance(cm,bool) or not isinstance(cm,numbers.Real) or not math.isfinite(cm) or cm<=0:
+        raise ValueError("corpus_max must be finite and positive")
+    if not math.isfinite(STEER*cm):
+        raise ValueError("steering amplitude must be finite")
+    if not isinstance(it.get("explanation"),str) or not it["explanation"].strip():
+        raise ValueError("explanation must be nonempty text")
+    if it["layer"]>=len(tg.layers):
+        raise ValueError("layer outside target architecture")
+    mlp=tg.layers[it["layer"]].mlp
+    width=mlp.down_proj.in_features
+    if it["index"]>=width:
+        raise ValueError("neuron index outside target down_proj input")
+    return {"requested_model":getattr(tg,"name",None),"native_layer":it["layer"],"native_index":it["index"],
+            "native_width":width,"layers":len(tg.layers),"swiglu_architecture_verified":getattr(tg,"architecture_verified",False),"unit":"post_silu_gate_times_up / pre_down_proj",
+            "identity_scope":"requested model and runtime architecture; checkpoint weights/revision not attested"}
+
+
+def _proposal(plan):
+    if not isinstance(plan,dict):
+        raise ValueError("reader proposal must be a JSON object")
+    groups={}
+    seen=set()
+    for k,n in (("max_texts",BLIND),("near_misses",NEAR),("distant_texts",DISTANT)):
+        xs=plan.get(k)
+        if not isinstance(xs,list) or len(xs)!=n:
+            raise ValueError(f"{k} requires exactly {n} texts")
+        for x in xs:
+            if not isinstance(x,str) or not x.strip():
+                raise ValueError(f"{k} must contain nonempty strings")
+            norm=" ".join(x.split()).casefold()
+            if norm in seen:
+                raise ValueError("all proposed test texts must be distinct")
+            seen.add(norm)
+        groups[k]=xs
+    for k in ("distant_concept","steering_prediction"):
+        if not isinstance(plan.get(k),str) or not plan[k].strip():
+            raise ValueError(f"{k} must be nonempty text")
+    return groups
+
+
+def _responses(rd, asks, max_tokens):
+    replies=rd(asks,max_tokens=max_tokens)
+    if not isinstance(replies,(list,tuple)) or len(replies)!=len(asks) or any(not isinstance(x,str) for x in replies):
+        raise ValueError("reader response count/type must exactly match requests")
+    return list(replies)
+
+
 def verify(tg: Target, rd, items: list[dict], seed: int = 0) -> list[dict]:
-    """The four checks for each item {"layer", "index", "pole", "corpus_max", "explanation"} (module docstring); the
-    reader's calls for all items made together."""
-    asks = [ASK.format(pole="positive" if it["pole"] == "+" else "negative", explanation=it["explanation"], blind=BLIND, near=NEAR,
-                       distant=DISTANT) for it in items]
-    plans = [parse_json(t) for t in rd(asks, max_tokens=1500)]
-    out, judges = [], []
-    rng = random.Random(seed)
-    for it, plan in zip(items, plans):
-        row = {k: it[k] for k in ("layer", "index", "pole", "corpus_max")}
-        if not plan:
-            out.append({**row, "valid": False})
-            judges.append(None)
-            continue
-        key = "pos" if it["pole"] == "+" else "neg"
-        cm = max(float(it["corpus_max"]), 1e-6)
-        groups = {k: [str(x) for x in (plan.get(k) or [])][:n] for k, n in (("max_texts", BLIND), ("near_misses", NEAR), ("distant_texts", DISTANT))}
-        flat = [x for k in groups for x in groups[k]]
-        vals = tg.poles(flat, it["layer"], it["index"]) if flat else []
-        k0 = 0
-        got = {}
-        for k in groups:
-            got[k] = [v[key] / cm for v in vals[k0:k0 + len(groups[k])]]
-            k0 += len(groups[k])
-        blind = max(got["max_texts"], default=0.0)
-        near = sum(x >= FIRE for x in got["near_misses"]) / max(len(got["near_misses"]), 1)
-        dist = sum(x >= FIRE for x in got["distant_texts"]) / max(len(got["distant_texts"]), 1)
-        value = (1.0 if it["pole"] == "+" else -1.0) * STEER * cm
-        on, off = tg.steered(it["layer"], it["index"], value), tg.steered(it["layer"], it["index"], None)
-        flip = rng.random() < 0.5
-        judges.append((JUDGE.format(prediction=plan.get("steering_prediction", ""), a=off if flip else on, b=on if flip else off), "B" if flip else "A"))
-        out.append({**row, "valid": True, "blind_max": blind, "blind_texts": groups["max_texts"], "blind_values": got["max_texts"],
-                    "near_miss_rate": near, "near_values": got["near_misses"], "distant_concept": plan.get("distant_concept"),
-                    "distant_rate": dist, "distant_values": got["distant_texts"], "steering_prediction": plan.get("steering_prediction"),
-                    "steered": on, "unsteered": off, "passes_t1": blind >= FIRE and near < FIRE})
-    asked = [j for j in judges if j]
-    answers = iter(rd([q for q, _ in asked], max_tokens=5)) if asked else iter([])
-    for row, j in zip(out, judges):
+    """Complete blinded activation diagnostics and steering test; never a causal mechanism certificate.
+
+    Invalid proposals remain explicit failures and cannot earn T1 credit. Response
+    cardinality errors raise rather than silently dropping items. No route claim is tested.
+    """
+    bindings=[_item(tg,it) for it in items]
+    source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    asks=[ASK.format(pole="positive" if it["pole"]=="+" else "negative",explanation=it["explanation"],
+                     blind=BLIND,near=NEAR,distant=DISTANT) for it in items]
+    replies=_responses(rd,asks,1500) if asks else []
+    out,judges=[],[];rng=random.Random(seed)
+    for it,binding,ask,raw in zip(items,bindings,asks,replies):
+        plan=parse_json(raw)
+        row={k:it[k] for k in ("layer","index","pole","corpus_max","explanation")}
+        row.update({"model_binding":binding,"reader_class":type(rd).__name__,"reader_model":getattr(rd,"base",getattr(rd,"model",None)),
+                    "verifier_source_sha256":source_sha256,"raw_proposal":raw,"proposal":plan,
+                    "proposal_request":ask,"diagnostic_scope":"T1 activation prediction; not causal mechanism certification",
+                    "causal_mechanism_verified":False,"passes_t1":False})
+        try:groups=_proposal(plan)
+        except ValueError as e:
+            out.append({**row,"valid":False,"reason":str(e)});judges.append(None);continue
+        key="pos" if it["pole"]=="+" else "neg";cm=float(it["corpus_max"])
+        flat=[x for xs in groups.values() for x in xs]
+        vals=tg.poles(flat,it["layer"],it["index"])
+        if not isinstance(vals,list) or len(vals)!=len(flat):
+            raise ValueError("target pole result count must match all test texts")
+        measured=[]
+        for v in vals:
+            value=v.get(key) if isinstance(v,dict) else None
+            if isinstance(value,bool) or not isinstance(value,numbers.Real) or not math.isfinite(value):
+                raise ValueError("target pole measurements must be finite")
+            ratio=value/cm
+            if not math.isfinite(ratio):
+                raise ValueError("normalized pole measurement must be finite")
+            measured.append(ratio)
+        got={};k0=0
+        for k,xs in groups.items():got[k]=measured[k0:k0+len(xs)];k0+=len(xs)
+        blind=max(got["max_texts"]);near=sum(x>=FIRE for x in got["near_misses"])/NEAR
+        dist=sum(x>=FIRE for x in got["distant_texts"])/DISTANT
+        value=(1 if it["pole"]=="+" else -1)*STEER*cm
+        if not math.isfinite(value):raise ValueError("steering amplitude must be finite")
+        on,off=tg.steered(it["layer"],it["index"],value),tg.steered(it["layer"],it["index"],None)
+        flip=rng.random()<.5
+        judge=JUDGE.format(prediction=plan["steering_prediction"],a=off if flip else on,b=on if flip else off)
+        judges.append((judge,"B" if flip else "A"))
+        out.append({**row,"valid":True,"test_texts":groups,"raw_pole_measurements":vals,"blind_max":blind,
+                    "blind_texts":groups["max_texts"],"blind_values":got["max_texts"],"near_miss_rate":near,
+                    "near_values":got["near_misses"],"distant_concept":plan["distant_concept"],"distant_rate":dist,
+                    "distant_values":got["distant_texts"],"steering_prediction":plan["steering_prediction"],
+                    "steered":on,"unsteered":off,"passes_t1":blind>=FIRE and near<FIRE})
+    asked=[j for j in judges if j]
+    responses=_responses(rd,[q for q,_ in asked],5) if asked else []
+    answer_iter=iter(responses)
+    for row,j in zip(out,judges):
         if j:
-            ans = next(answers).strip().upper()[:1]
-            row["steer_match"] = float(ans == j[1])
+            raw=next(answer_iter);ans=raw.strip().upper()
+            row.update({"steer_match":float(ans==j[1]),"steer_response_valid":ans in ("A","B"),
+                        "steer_raw_response":raw,"steer_request":j[0],"steer_expected":j[1]})
     return out
 
 
@@ -192,13 +294,15 @@ def cmd_verify(a) -> None:
 
     items = [json.loads(x) for x in a.neurons.read_text().splitlines()]
     tg = Target(a.model, a.device)
+    [_item(tg,it) for it in items]  # invalid input fails before reader service construction
     rd = reader_reward.Reader(a.reader, a.out.parent)
     rows = verify(tg, rd, items)
     a.out.write_text("".join(json.dumps(r) + "\n" for r in rows))
     ok = [r for r in rows if r.get("valid")]
-    n = max(len(ok), 1)
+    n = max(len(rows), 1)
+    n_valid = max(len(ok), 1)
     print(f"{len(ok)}/{len(rows)} valid; blind max >= {FIRE}: {sum(r['blind_max'] >= FIRE for r in ok) / n:.2f}; near-miss rate "
-          f"{sum(r['near_miss_rate'] for r in ok) / n:.2f}; distant rate {sum(r['distant_rate'] for r in ok) / n:.2f}; steering match "
+          f"{sum(r['near_miss_rate'] for r in ok) / n_valid:.2f} (valid only); distant rate {sum(r['distant_rate'] for r in ok) / n_valid:.2f} (valid only); steering match "
           f"{sum(r.get('steer_match', 0) for r in ok) / n:.2f}; T1 pass {sum(r['passes_t1'] for r in ok) / n:.2f}; spend ${rd.spend.total:.3f}")
 
 
@@ -207,23 +311,27 @@ def cmd_summary(a) -> None:
     FIRE and near misses < FIRE), both poles pooled; the positive and negative poles apart; neurons whose poles both
     pass; and the comparison with Cammarata's Qwen3-32B (76% blind maximum, 11% near misses, 1% distant)."""
     rows = [json.loads(x) for f in a.rows for x in f.read_text().splitlines()]
-    ok = [r for r in rows if r.get("valid")]
-
     def stats(rs, name):
-        n = max(len(rs), 1)
-        print(f"{name}: {len(rs)} poles; pass {sum(r['passes_t1'] for r in rs) / n:.2f}; blind max >= {FIRE} {sum(r['blind_max'] >= FIRE for r in rs) / n:.2f} "
-              f"(median {sorted(r['blind_max'] for r in rs)[len(rs) // 2] if rs else 0:.2f}); near misses {sum(r['near_miss_rate'] for r in rs) / n:.2f}; "
-              f"distant {sum(r['distant_rate'] for r in rs) / n:.2f}; steering match {sum(r.get('steer_match', 0) for r in rs) / n:.2f}")
-
-    stats(ok, "both poles (primary)")
-    stats([r for r in ok if r["pole"] == "+"], "positive pole")
-    stats([r for r in ok if r["pole"] == "-"], "negative pole")
-    by: dict = {}
-    for r in ok:
-        by.setdefault((r["layer"], r["index"]), {})[r["pole"]] = r["passes_t1"]
-    both = [v for v in by.values() if len(v) == 2]
-    print(f"neurons with both poles explained: {len(both)}; both pass {sum(all(v.values()) for v in both) / max(len(both), 1):.2f}; "
-          f"invalid reader plans {len(rows) - len(ok)}")
+        # Primary denominator is every submitted pole, including invalid proposals.
+        measured=[r for r in rs if r.get("valid")]
+        n=max(len(rs),1)
+        n_valid=max(len(measured),1)
+        passes=sum(bool(r.get("valid") and r.get("passes_t1")) for r in rs)
+        blind=sum(r["blind_max"]>=FIRE for r in measured)
+        median=sorted(r["blind_max"] for r in measured)[len(measured)//2] if measured else None
+        print(f"{name}: {len(rs)} submitted poles; {len(measured)} valid; pass {passes/n:.2f}; blind max >= {FIRE} {blind/n:.2f}; "
+              f"valid-only median blind {median}; near misses (valid only) {sum(r['near_miss_rate'] for r in measured)/n_valid:.2f}; "
+              f"distant (valid only) {sum(r['distant_rate'] for r in measured)/n_valid:.2f}; "
+              f"steering match (submitted denominator) {sum(r.get('steer_match',0) for r in measured)/n:.2f}")
+    stats(rows,"both poles (primary)")
+    stats([r for r in rows if r["pole"]=="+"],"positive pole")
+    stats([r for r in rows if r["pole"]=="-"],"negative pole")
+    by={}
+    for r in rows:
+        by.setdefault((r["layer"],r["index"]),{})[r["pole"]]=bool(r.get("valid") and r.get("passes_t1"))
+    both=[v for v in by.values() if set(v)=={"+","-"}]
+    print(f"neurons with both poles submitted: {len(both)}; both pass {sum(all(v.values()) for v in both)/max(len(both),1):.2f}; "
+          f"invalid reader plans {sum(not r.get('valid') for r in rows)}; T1 is an activation diagnostic, not a causal mechanism certificate")
 
 
 def main():

@@ -326,13 +326,14 @@ def main():
     ap.add_argument("--general", type=Path, required=True)
     ap.add_argument("--prompts", type=Path, required=True)
     ap.add_argument("--adapter", action="append", default=[], help="NAME=DIR")
+    ap.add_argument("--base", default=BASE, help="the HF model (Qwen/Qwen3-8B: the 10-15 main target)")
     a = ap.parse_args()
     adapters = dict(x.split("=", 1) for x in a.adapter)
     given = json.loads(a.prompts.read_text())
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    tok = AutoTokenizer.from_pretrained(BASE)
+    tok = AutoTokenizer.from_pretrained(a.base)
     gen = [json.loads(x) for x in a.general.read_text().splitlines()]
     seqs = [chat(tok, r["user"], r["answer"])[:256] for r in gen[1000:1040]]  # (held out from hf_means' first 100)
     result = json.loads(a.out.read_text()) if a.out.exists() else {}
@@ -340,7 +341,7 @@ def main():
         if name in result:
             continue
         t0 = time.perf_counter()
-        model = AutoModelForCausalLM.from_pretrained(BASE, torch_dtype=torch.float32).to(dev).eval()
+        model = AutoModelForCausalLM.from_pretrained(a.base, torch_dtype=torch.float32).to(dev).eval()
         if name != "base":
             from peft import PeftModel
 
@@ -363,7 +364,7 @@ def main():
             prompts = [tuple(x) for x in given[name]]
         rows, cost, gseqs = [], {}, seqs[20:25]
         for user, ids, pos in prompts:
-            row = {"prompt": user, "T": len(ids)}
+            row = {"prompt": user, "T": len(ids), "ids": list(ids), "target": pos}
             for ref, th in (("model", None), ("weak_zeroed", thr)):
                 if ref == "weak_zeroed" and th is None:
                     continue

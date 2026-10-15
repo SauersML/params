@@ -9,6 +9,8 @@ Inputs, any mix:
                  (ib_teacher.py's rows_<offset>.jsonl), for builders that name MIB edges themselves, or
                  {"text": k, "mib_nodes": [MIB components: "a<L>.h<H>", "m<L>"]} for builders in heads and MLPs: every
                  graph edge between two of them (the input and the logits always in) counts as held;
+  MEASURED.npz   per-prompt edge scores {"effects" [prompts, edges], "edges"} on the test prompts 0..n-1 (mib_measured.py's
+                 single-edge ablations), each edge scored by its mean absolute effect; scored alone;
   DIR            circuit files DIR/<case>_<k>.json (teacher format: "nodes" [site, component, position] in the VPD fit's
                  subcomponents), turned into MIB edges with interpbench.mib_edges on --fit, the k-th test prompt padded
                  with EOS to --pad and its target at its last real token, as ib_teacher.py runs them.
@@ -88,8 +90,13 @@ def main():
     a = ap.parse_args()
     reference = json.loads((a.case / "interpbench_graph.json").read_text())
     edges = interpbench.mib_graph_edges(reference["cfg"])
-    rows, nat = [], None
+    rows, nat, T = [], None, None
     for p in a.inputs:
+        if p.suffix == ".npz":                             # mib_measured.py's per-prompt edge effects, MIB's test prompts 0..n-1
+            d = np.load(p)
+            at = {str(e): j for j, e in enumerate(d["edges"])}
+            T = np.abs(d["effects"][:, [at[e] for e in edges]].astype(np.float64))
+            continue
         if p.is_dir():
             if nat is None:
                 import torch
@@ -104,14 +111,18 @@ def main():
                     if "mib_edges" not in r:
                         r["mib_edges"] = edges_of_nodes(r["mib_nodes"], edges)
                     rows.append(r)
-    rows = sorted({r["text"]: r for r in rows}.values(), key=lambda r: r["text"])
-    texts = [r["text"] for r in rows]
-    T = np.array([[e in set(r["mib_edges"]) for e in edges] for r in rows], dtype=np.float64)
+    if T is not None:
+        assert not rows, "an .npz of measured effects is scored alone"
+        texts = list(range(len(T)))
+    else:
+        rows = sorted({r["text"]: r for r in rows}.values(), key=lambda r: r["text"])
+        texts = [r["text"] for r in rows]
+        T = np.array([[e in set(r["mib_edges"]) for e in edges] for r in rows], dtype=np.float64)
     x = None
     f = a.eap / f"scores_EAP-IG-inputs_test_{max(texts) + 1}_1.npz"
     if f.exists() and texts == list(range(len(texts))):
         x = np.load(f)["scores"].astype(np.float64)
-        assert len(x) == len(rows), f"{f.name} holds {len(x)} prompts, the builder {len(rows)}"
+        assert len(x) == len(T), f"{f.name} holds {len(x)} prompts, the builder {len(T)}"
     print(json.dumps(score(reference, T, x), indent=1))
 
 

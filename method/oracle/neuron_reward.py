@@ -22,16 +22,19 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE / "rl")]
 
-import claim_check  # noqa: E402  (its UNIT names every unit, for both kinds)
+import claim_check  # noqa: E402  (its parse_unit names every unit, for both kinds)
 import neuron_verify  # noqa: E402
 
 
 def explanation_item(claim: dict, atlas=None) -> dict:
     """A claim of kind "explanation" as neuron_verify's item {layer, index, pole, corpus_max, explanation}."""
-    m = claim_check.UNIT.match(str(claim.get("unit", "")).strip())
-    if not m or m[2] != "N" or not m[4]:
+    try:
+        kind, layer, index, sign = claim_check.parse_unit(claim.get("unit", ""))
+    except claim_check.BadClaim:
+        kind, sign = None, 0
+    if kind != "N" or not sign:
         raise ValueError("an explanation names one neuron pole, like L18.N2201+ or L18.N2201-")
-    layer, index, pole = int(m[1]), int(m[3]), m[4]
+    pole = "+" if sign > 0 else "-"
     cm = claim.get("corpus_max")
     if cm is None:
         if atlas is None:

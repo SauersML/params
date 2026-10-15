@@ -1084,8 +1084,10 @@ def plot(a) -> None:
         return sum(xs) / len(xs) if xs else None
 
     for ax, (q, title) in zip(axes, PANELS):
-        pts = []
+        pts, ids = [], {r["id"] for r in recs if any(g["q"] == q for g in r["grades"])}
         for b in sorted({r["budget"] for r in recs if r["budget"]}):
+            if not ids <= {r["id"] for r in recs if r["budget"] == b}:  # a budget only where every item of the kind ran
+                continue
             per = [acc([r for r in recs if r["budget"] == b and r["repeat"] == k], q) for k in sorted({r["repeat"] for r in recs})]
             per = [x for x in per if x is not None]
             if per:
@@ -1093,23 +1095,32 @@ def plot(a) -> None:
                 pts.append((b, sum(per) / len(per)))
         if pts:
             ax.plot(*zip(*pts), "-o", color=red, lw=3, ms=9)
-            ax.annotate("Kimi-K2.6 with tools", pts[-1], textcoords="offset points", xytext=(-8, 10), ha="right", color=red, fontsize=14)
-        bs = sorted((int(r["system"].split("@")[1]), r) for r in rs if r["system"].startswith("B@"))
+            ax.annotate("Kimi-K2.6 with tools", pts[-1], textcoords="offset points", xytext=(-10, -24 if pts[-1][1] > 0.85 else 10),
+                        ha="right", color=red, fontsize=14)
+        bs = [(int(r["system"].split("@")[1]), r) for r in rs if r["system"].startswith("B@")]
         line = [(b, acc([r for b_, r in bs if b_ == b], q)) for b in sorted({b for b, _ in bs})]
         line = [(b, y) for b, y in line if y is not None]
         if line:
             ax.plot(*zip(*line), "-s", color=blue, lw=2.5, ms=8)
             ax.annotate("AO + interventions", line[0], textcoords="offset points", xytext=(6, -20), color=blue, fontsize=14)
+        eb = [r for r in rs if r["system"] == "B"]  # h2h's steering edit, at the passes it spent
+        if q == "edit" and eb:
+            x = sum(r["passes"] for r in eb) / len(eb)
+            ax.plot([x], [acc(eb, q)], "s", color=blue, ms=9)
+            ax.annotate("AO + steering", (x, acc(eb, q)), textcoords="offset points", xytext=(8, 6), color=blue, fontsize=14)
         y = acc([r for r in rs if r["system"] == "A"], q)
         if y is not None:
             ax.plot([1], [y], "D", color=green, ms=10)
             ax.annotate("AO alone", (1, y), textcoords="offset points", xytext=(8, 6), color=green, fontsize=14)
+        levels = []
         for rows, name, ls in (([r for r in recs if r["budget"] == 0], "Kimi-K2.6, text alone", ":"),
                                ([r for r in rs if r["system"] == "R"], "recency", "--")):
             y = acc(rows, q)
             if y is not None:
                 ax.axhline(y, ls=ls, color=gray, lw=1.5)
-                ax.annotate(name, (400, y), textcoords="offset points", xytext=(0, 4), ha="right", color=gray, fontsize=12)
+                near = any(abs(y - y0) < 0.05 for y0 in levels)  # (two levels together: the second named below its line)
+                ax.annotate(name, (400, y), textcoords="offset points", xytext=(0, -16 if near else 4), ha="right", color=gray, fontsize=12)
+                levels.append(y)
         ax.set_xscale("log")
         ax.set_xlim(0.7, 450)
         ax.set_ylim(-0.03, 1.05)

@@ -558,6 +558,7 @@ PHI_FAMILIES = {  # phi's families (the lead's reward v3): score key, how the sc
     "patching_near": ("s_patching_near", "donor", "draws_patching_near"), "patching_far": ("s_patching_far", "donor", "draws_patching_far"),
     "pattern": ("s_pattern", "mean", "draws_pattern"), "N": ("n_spec", "spec", "draws_n_spec"),
     "omitted": ("s_omitted", "weighted", "draws_omitted"), "scope": ("s_scope", "weighted", "draws_scope")}
+PP_ROWS = 32  # track_pp's changed texts per batched reference run (the model and VPD's path-patched answer on each)
 RESAMPLE_DONORS = 16  # resample_influence's far donors per position (the START's candidate order and the input-scope
 # family's draws; the lead's 10-14: on 10 dev STARTs the scope family's SD across three disjoint donor pools was 0.053
 # at 4, 0.032 at 8, 0.027 at 16 and 0.021 at 32, per circuit 0.04, 0.07, 0.12 and 0.22 s)
@@ -2679,6 +2680,24 @@ class GoalEval:
             lqs = self._pp_engine(tx).path_patched(graphs, [tuple(pz) for pz in got], cuts=cuts)  # [G, D, targets, V]
         acc = [[0.0, 0.0, 0.0, 0, [], 0.0] for _ in graphs]  # sum w s, sum w, sum w KL_C, prompts, draws, sum w s_raw
         kept = tx.__dict__.setdefault("_pp_prompts", {})    # (p, z) -> (the model on x', W, VPD's KL)
+        new = [pz for pz in dict.fromkeys((int(p), int(z)) for p, z in got) if pz not in kept]
+        if new and vpd is not None:                          # the new changed texts' references at once: the model on
+            vg = tx.__dict__.get("_pp_vpd_nodes")            # each, and VPD's whole answer path-patched as its node set
+            if vg is None:                                   # (pp_run's numbers, one engine call per PP_ROWS)
+                vg = tx.__dict__["_pp_vpd_nodes"] = native.Graph(sorted(native.Graph(masks=tx.vpd).node_set()), complete=True)
+            for s0 in range(0, len(new), PP_ROWS):
+                part = new[s0:s0 + PP_ROWS]
+                xs = []
+                for p, z in part:
+                    x2 = list(tx.ids)
+                    x2[p] = z
+                    xs.append(x2)
+                r2 = nat.reference(xs, tx.targets)
+                lv = self._pp_engine(tx).path_patched([vg], part)[0]
+                w2, v2 = carry.kl(r2, tx.ref.expand_as(r2)).tolist(), carry.kl(r2, lv).tolist()
+                for i, pz in enumerate(part):
+                    kept[pz] = (r2[i:i + 1], w2[i], v2[i])
+                native.free(nat.dev)
         for d, (p, z) in enumerate(got):
             x2 = list(tx.ids)
             x2[p] = z

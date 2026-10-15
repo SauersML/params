@@ -3,7 +3,7 @@
 %% Current hypothesis: native units may support useful explanations; universal cleanliness is not assumed.
 flowchart TB
   G["<b>Understand and predict the model's mechanisms</b><br/>Native investigation, falsifiable explanations, useful oracle answers.<br/>Legibility ≠ sparsity ≠ causal faithfulness."]
-  Q["<b>Freeze a useful behavioral question</b><br/>Qwen3-1.7B now; declare full contexts and answer contrast.<br/>Freeze fitting versus unseen questions/edits and controls.<br/>WHY · test explanations, not universal neuron cleanliness."]
+  Q["<b>Freeze a useful behavioral question</b><br/>Qwen3-8B is the main target (MATS); Qwen3-32B the showcase<br/>and validation; 1.7B for development only.<br/>Declare full contexts and answer contrast.<br/>Freeze fitting versus unseen questions/edits and controls.<br/>WHY · test explanations, not universal neuron cleanliness."]
   G --> Q
 
   subgraph MAIN["PRIMARY PATH · INVESTIGATE, EXPLAIN, TEST"]
@@ -25,16 +25,19 @@ flowchart TB
   Q -. current pilot .-> P
   P -. concrete investigation .-> I
 
-  C["<b>OPTIONAL · question-scoped compact circuits</b><br/>Sparse replacements are a product/validation lane,<br/>not a prerequisite to native explanations or oracle learning.<br/>Existing scorecards remain diagnostic; VPD is an archived<br/>vpd4l comparator only, with no new VPD-specific work.<br/>OWNER · generality / shared scorecard team"]
+  C["<b>Question-scoped neuron circuits · scorecard v2 on Qwen3-8B</b><br/>neuron_scorecard.py: necessity, sufficiency, patching from other<br/>texts, swaps, steering and weight-edit predictions, specificity<br/>on unrelated texts, size; noise-aware floors. Runs on MATS.<br/>MEASURED 1.7B · 11 small hubs: all necessary, none sufficient;<br/>3 are the sink neuron L2.n1821 (10-13 bits on unrelated text).<br/>Not a prerequisite for native explanations. VPD is archived.<br/>OWNER · generality"]
   I -. optional product .-> C
   C -. additional validation .-> V
 
-  A["<b>T1 · Atlas decision test (proposed)</b><br/>Random neurons: blind max ≥ 30% of corpus maximum,<br/>near misses below 30%; require ≥ 50% to pass.<br/>Otherwise move main target from 1.7B to 8B.<br/>Keep both poles, full windows and sign regimes.<br/>OWNER · shared atlas / explanation team"]
+  A["<b>T1 · Atlas decision test (proposed)</b><br/>Random neurons: blind max ≥ 30% of corpus maximum,<br/>near misses below 30%; require ≥ 50% to pass.<br/>1.7B first, then 8B and a 32B sample: cleanliness by size.<br/>Keep both poles, full windows and sign regimes.<br/>OWNER · shared atlas / explanation team"]
   I -. reuse native evidence .-> A
   A -. tested labels .-> O
   W["<b>T2 · Weak-zeroing test (proposed, not a gate)</b><br/>Per-layer thresholds: mean KL from original ≤ 0.1 bits;<br/>report strong neurons/token, preserve sinks/massive units.<br/>Empirical background variant; atlas can proceed without it.<br/>OWNER · shared native team / root"]
   I -. optional empirical variant .-> W
-  K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: held-out owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>OWNER · existing owl / organism team"]
+  S["<b>Qwen3-32B validation and showcase</b><br/>Reproduce Cammarata's published results with our pipeline:<br/>8 negative-pole Santa neurons (removal → 6%) and the<br/>4-neuron preeclampsia hub; then our own circuits there.<br/>Two L40s in bf16 on MATS; RunPod 80 GB only for overflow."]
+  I -. same pipeline at 32B .-> S
+  S -. validates units and checks .-> V
+  K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: held-out owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>At 8B on fleet's 8B owl organism.<br/>OWNER · existing owl / organism team"]
   V -. flagship application .-> K
 
   E["<b>Evidence that limits current claims</b><br/>Mean fill can confound hub tests; compare literal interventions.<br/>Reason-first reader: adaptive TRAIN success, not transfer.<br/>Fresh coefficient contexts had no winner changes.<br/>Old shared-floor runs remain diagnostic; resume is held.<br/>WHY · neither a small circuit nor a paid reader is required now."]
@@ -55,7 +58,7 @@ flowchart TB
   classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
   classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
   class G,Z goal;
-  class I,P,C,K build;
+  class I,P,C,K,S build;
   class F,V,O,T explain;
   class Q,L,A,W measure;
   class E evidence;

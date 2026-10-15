@@ -11,7 +11,8 @@ reference: 76% / 11% near misses / 1% distant.
       sign regime), the first token (the attention sink) left out
   t1_audit.py explain --atlas ATLAS.json --out NEURONS.jsonl   the writer's explanation of each pole
   (then neuron_verify.py verify --neurons NEURONS.jsonl --out T1.jsonl, or its plan, measure and judge steps)
-  t1_audit.py figure --rows T1_1p7b.jsonl T1_8b.jsonl ... --out FIG.png   pass shares and control rates by model size
+  t1_audit.py figure --rows T1_1p7b.jsonl T1_8b.jsonl ... [--writers NAME=FILE ...] --out FIG.png   pass rate by
+      model size, and on the same neurons by writer
 """
 from __future__ import annotations
 
@@ -209,69 +210,63 @@ def explain(a) -> None:
 
 
 def figure(a) -> None:
-    """Share of explained poles passing T1 (and blind maximum alone) against model size, with 95% Wilson intervals,
-    beside the mean near-miss and distant-concept rates; Cammarata's Qwen3-32B numbers as reference points. Poles
-    that never fire on the corpus are left out, as in neuron_verify summary."""
+    """Left: the share of explained poles passing T1 against model size (--rows, one judged file a size), with 95%
+    Wilson intervals and the 50% bar. Right: the same neurons explained by different writers (--writers NAME=FILE).
+    Poles that never fire on the corpus are left out, as in neuron_verify summary."""
     import math
     import re
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import neuron_verify
 
     def wilson(k, n, z=1.96):
         p, d = k / n, 1 + z * z / n
         c, h = (p + z * z / (2 * n)) / d, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
-        return c - h, c + h
+        return k / n, c - h, c + h
 
-    sizes, curves = [], {"pass": [], "blind": [], "near": [], "distant": []}
-    for f in a.rows:
+    def passing(f):
         rows = [json.loads(x) for x in f.read_text().splitlines() if x.strip()]
         rows = [r for r in rows if isinstance(r.get("corpus_max"), (int, float)) and r["corpus_max"] > 0]
         name = next(r["model_binding"]["requested_model"] for r in rows if r.get("model_binding"))
-        sizes.append(float(re.search(r"(\d+(?:\.\d+)?)B", name)[1]))
-        ok = [r for r in rows if r.get("valid")]
-        n = len(rows)
-        for key, k in (("pass", sum(bool(r.get("passes_t1")) for r in ok)), ("blind", sum(r["blind_max"] >= neuron_verify.FIRE for r in ok))):
-            curves[key].append((k / n, *wilson(k, n)))
-        curves["near"].append(sum(r["near_miss_rate"] for r in ok) / len(ok))
-        curves["distant"].append(sum(r["distant_rate"] for r in ok) / len(ok))
-        print(f"{name}: {n} poles; pass {curves['pass'][-1][0]:.2f}; blind max {curves['blind'][-1][0]:.2f}; "
-              f"near misses {curves['near'][-1]:.2f}; distant {curves['distant'][-1]:.2f}")
-    def labels(x, items, top):  # direct labels right of the last size, spread so none overlap
-        items, y0 = sorted(items), -1.0
-        for y, text, color in items:
-            y0 = max(y, y0 + 0.075 * top)
-            x.annotate(text, (sizes[-1], y), xytext=(sizes[-1] * 1.5, y0), textcoords="data", color=color, va="center",
-                       fontsize=15, arrowprops={"arrowstyle": "-", "color": color, "lw": 0.8, "shrinkA": 2, "shrinkB": 6})
+        return name, wilson(sum(bool(r.get("valid") and r.get("passes_t1")) for r in rows), len(rows)), len(rows)
 
-    plt.rcParams.update({"font.size": 17, "axes.spines.top": False, "axes.spines.right": False})
-    fig, (ax, bx) = plt.subplots(1, 2, figsize=(17, 6.5), facecolor="white", gridspec_kw={"wspace": 0.8})
-    big = max(sizes)
-    tags = []
-    for key, label, color in (("blind", "blind maximum ≥ 30%", "#4c72b0"), ("pass", "passes T1", "#c44e52")):
-        y = [c[0] for c in curves[key]]
-        ax.errorbar(sizes, y, yerr=[[c[0] - c[1] for c in curves[key]], [c[2] - c[0] for c in curves[key]]], color=color,
-                    marker="o", ms=9, lw=2.5, capsize=5)
-        tags.append((y[-1], label, color))
-    ax.plot([32], [0.76], marker="*", ms=22, color="#4c72b0", mfc="white", mew=2, ls="none")
-    tags.append((0.76, "Cammarata, 32B", "#4c72b0"))
+    plt.rcParams.update({"font.size": 18, "axes.spines.top": False, "axes.spines.right": False})
+    fig, (ax, bx) = plt.subplots(1, 2, figsize=(15, 6.4), facecolor="white", gridspec_kw={"width_ratios": [1.5, 1], "wspace": 0.35})
+    sizes, got = [], []
+    for f in a.rows:
+        name, w, n = passing(f)
+        sizes.append(float(re.search(r"(\d+(?:\.\d+)?)B", name)[1]))
+        got.append(w)
+        print(f"{name}: {n} poles; pass {w[0]:.2f} [{w[1]:.2f}, {w[2]:.2f}]")
+    ax.errorbar(sizes, [g[0] for g in got], yerr=[[g[0] - g[1] for g in got], [g[2] - g[0] for g in got]], color="#c44e52",
+                marker="o", ms=11, lw=2.5, capsize=6)
+    for x, g in zip(sizes, got):
+        ax.annotate(f"{g[0]:.0%}", (x, g[2]), xytext=(0, 8), textcoords="offset points", ha="center", fontsize=17)
     ax.axhline(0.5, color="gray", ls="--", lw=1.5)
-    ax.text(min(sizes) / 1.4, 0.52, "T1 bar", color="gray", fontsize=15)
-    ax.set(xscale="log", ylim=(0, 1), xlabel="model parameters (billions)", ylabel="share of neuron poles")
-    labels(ax, tags, 1.0)
-    tags = []
-    for key, label, color, ref in (("near", "near misses firing", "#dd8452", 0.11), ("distant", "distant texts firing", "#55a868", 0.01)):
-        bx.plot(sizes, curves[key], color=color, marker="o", ms=9, lw=2.5)
-        bx.plot([32], [ref], marker="*", ms=22, color=color, mfc="white", mew=2, ls="none")
-        tags += [(curves[key][-1], label, color), (ref, "Cammarata, 32B", color)]
-    top = max(0.3, 1.25 * max(curves["near"] + curves["distant"]))
-    bx.set(xscale="log", ylim=(0, top), xlabel="model parameters (billions)", ylabel="mean share of control texts")
-    labels(bx, tags, top)
-    for x in (ax, bx):
-        x.set_xticks(sizes, [f"{s:g}B" for s in sizes])
-        x.minorticks_off()
-        x.set_xlim(min(sizes) / 1.5, big * 1.3)
+    ax.text(sizes[-1] * 1.25, 0.5, "pre-registered\nbar", color="gray", fontsize=15, va="center")
+    ax.set(xscale="log", ylim=(0, 1), xlabel="Qwen3 model size (billions of parameters)", ylabel="share of neuron poles passing")
+    ax.set_xticks(sizes, [f"{s:g}B" for s in sizes])
+    ax.minorticks_off()
+    ax.set_xlim(min(sizes) / 1.6, max(sizes) * 2.6)
+    ax.set_title("Model size, the 397B as writer", fontsize=18, loc="left")
+    names, ws = [], []
+    for spec in a.writers or []:
+        label, f = spec.split("=", 1)
+        _, w, n = passing(Path(f))
+        names.append(label)
+        ws.append(w)
+        print(f"writer {label}: {n} poles; pass {w[0]:.2f} [{w[1]:.2f}, {w[2]:.2f}]")
+    xs = range(len(ws))
+    bx.bar(xs, [w[0] for w in ws], 0.6, color=["#c44e52", "#e8a3a5"][:len(ws)],
+           yerr=[[w[0] - w[1] for w in ws], [w[2] - w[0] for w in ws]], capsize=6)
+    for x, w in zip(xs, ws):
+        bx.text(x, w[2] + 0.03, f"{w[0]:.0%}", ha="center", fontsize=17)
+    bx.axhline(0.5, color="gray", ls="--", lw=1.5)
+    bx.set_xticks(list(xs), names)
+    bx.set(ylim=(0, 1), ylabel="share of neuron poles passing")
+    bx.set_title("Qwen3-1.7B, two writers", fontsize=18, loc="left")
+    if a.title:
+        fig.suptitle(a.title, fontsize=21, x=0.06, ha="left", y=1.02)
     a.out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(a.out, dpi=150, facecolor="white", bbox_inches="tight")
     print(f"figure to {a.out}")
@@ -296,6 +291,8 @@ def main():
     e.add_argument("--prompt", choices=sorted(PROMPTS), default="v1", help="the writer's instruction (v1: T1's pre-registered one)")
     f = sub.add_parser("figure")
     f.add_argument("--rows", type=Path, nargs="+", required=True, help="judged T1 rows, one file per model size")
+    f.add_argument("--writers", nargs="+", help="NAME=FILE: judged rows of the same neurons explained by each writer")
+    f.add_argument("--title")
     f.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
     {"collect": collect, "explain": explain, "figure": figure}[a.what](a)

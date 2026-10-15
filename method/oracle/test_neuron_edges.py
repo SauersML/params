@@ -1,6 +1,6 @@
 """Checks of the neuron edge stage (neuron_edges.py) on a tiny random Qwen3: with no cut and every neuron live the run is
 the model's; the circuit run is the model with every other neuron zeroed; a cut edge's measured effect follows its
-linear score at small writes; pruning keeps the contrast within its floor and the graph lists poles and edges.
+linear score at small writes; pruning keeps the contrast within its tolerance and the graph lists poles and edges.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_neuron_edges.py -q
 """
@@ -71,8 +71,7 @@ def test_prune_and_graph(tiny):
     ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="circuit")
     got = neuron_edges.prune(ed, log=lambda m: None)
     rec = got["record"]
-    up = rec["contrast_all_edges"] >= rec["contrast_no_edges"]
-    assert (rec["contrast_kept"] >= rec["floor"] - 1e-6) if up else (rec["contrast_kept"] <= rec["floor"] + 1e-6)
+    assert abs(rec["contrast_kept"] - rec["contrast_all_edges"]) <= rec["tolerance"] + 1e-6
     g = neuron_edges.graph(ed, got)
     assert len(g["nodes"]) == len(ed.N) and len(g["edges"]) == rec["kept"]
     assert all(n["pole"] in (1, -1) and n["regime"] in ("g+u+", "g+u-", "g-u+", "g-u-") for n in g["nodes"])
@@ -95,3 +94,17 @@ def test_exported_route_scope_is_not_full_attention_routing(tiny):
     assert not semantics["query_key_effects_included"]
     assert not semantics["full_writer_ablation_equivalent"]
     assert not semantics["full_causal_completeness_certified"]
+
+
+def test_route_scores_match_brings(tiny):
+    model, ids, neurons = tiny
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
+    rs, rt = ed.linear_scores()
+    probe = [torch.zeros(ed.T, ed.keep.shape[-1], requires_grad=True) for _ in range(ed.L)]
+    ed._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
+    J = ed.jacobians()
+    for i in range(0, len(ed.route_all), max(1, len(ed.route_all) // 25)):  # the vectorized scores, edge by edge
+        e = ed.route_all[i]
+        r = e[2]
+        want = float(probe[r[0]].grad[r[1], r[2]]) * float(J[r] @ ed.brings(e))
+        assert float(rt[i]) == pytest.approx(want, rel=1e-4, abs=1e-7)

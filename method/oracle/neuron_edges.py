@@ -21,8 +21,8 @@ position); the reader's activation is recomputed from that input and every later
 one forward per set of cuts, sets batched).
 Pruning: the candidates ranked by their linear effect on the contrast (the contrast's gradient at the reader times the
 reader's input Jacobian times what the edge brings), then the smallest top-k set whose others cut keeps the contrast
-within TOL of the way from every edge's to none's, and a halving pass over the rest (measured); each kept edge's own cut
-measured last (its strength).
+within TOL of the way from every edge's to none's (either side), and a halving pass over the rest, B blocks a round
+(each tried alone, those passing tried together); each kept edge's own cut measured last (its strength).
 
   python neuron_edges.py one MODEL TEXT.json OUT.json   (TEXT: ids, target, answer, alternatives, neurons)
 """
@@ -36,7 +36,8 @@ from pathlib import Path
 
 import torch
 
-TOL = 0.1  # the contrast may move this share of the way from the run with every edge to the run with none
+TOL = 0.1  # the contrast may move this share of the way from the run with every edge to the run with none, either way
+MIN_TOL = 0.01  # bits: at least this much
 ROUTE_KEEP = 8  # route candidates measured: this many times the resid candidates (by linear effect), at least 256
 HALVE_BLOCKS = 8
 B = 16  # cut sets a forward
@@ -244,9 +245,33 @@ class Edges:
             self._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
         grad = {n: float(probe[n[0]].grad[n[1], n[2]]) for n in self.N}
         J = self.jacobians()
+        H, KV, hd, base = self.H, self.KV, self.hd, self.base
         with torch.no_grad():
             rs_s = torch.tensor([grad[r] * float(J[r] @ self.brings(e)) for e in self.resid_all for r in [e[1]]])
-            rt = torch.tensor([grad[e[2]] * float(J[e[2]] @ self.brings(e)) for e in self.route_all])
+            Js = torch.stack([J[n] for n in self.N])  # [N, d]
+            G = torch.tensor([grad[n] for n in self.N], device=self.dev)
+            kvh = torch.arange(H, device=self.dev) // (H // KV)
+            got = {}
+            for c in range(1, self.L):  # per head layer: each reader's input direction through each head's o_proj
+                layer = self.layers[c]
+                U = torch.einsum("nd,dhk->nhk", Js, weight(layer.self_attn.o_proj).view(-1, H, hd))  # [N, H, hd]
+                for w in self.N:
+                    if w[0] >= c:
+                        continue
+                    rd = [i for i, r in enumerate(self.N) if r[0] >= c and r[1] >= w[1]]
+                    if not rd:
+                        continue
+                    write = base["h"][w[0]][w[1], w[2]] * weight(self.layers[w[0]].mlp.down_proj)[:, w[2]]
+                    vw = layer.self_attn.v_proj(layer.input_layernorm(base["x"][c][w[1]] - write)).view(KV, hd)
+                    dv = (base["v"][c][:, w[1]] - vw)[kvh]  # [H, hd]
+                    ri = torch.tensor(rd, device=self.dev)
+                    q = torch.tensor([self.N[i][1] for i in rd], device=self.dev)
+                    a = base["A"][c][:, q, w[1]].T  # [R, H]
+                    sc = G[ri, None] * a * torch.einsum("rhk,hk->rh", U[ri], dv)
+                    for k, i in enumerate(rd):
+                        for h in range(H):
+                            got[(w, (c, h), self.N[i])] = float(sc[k, h])
+            rt = torch.tensor([got[e] for e in self.route_all])
         return rs_s, rt
 
 
@@ -266,8 +291,8 @@ def prune(ed: Edges, log=print) -> dict:
             rows[i, st] = False
         return rows
     c_all, c_none = ed.contrasts(torch.stack([torch.zeros(E, dtype=torch.bool), torch.ones(E, dtype=torch.bool)]), edges)
-    floor = c_all - TOL * (c_all - c_none)
-    ok = (lambda c: c >= floor) if c_all >= c_none else (lambda c: c <= floor)
+    tol = max(TOL * abs(c_all - c_none), MIN_TOL)  # (two-sided: a kept set that overshoots is no more faithful)
+    ok = lambda c: abs(c - c_all) <= tol  # noqa: E731
     order = torch.argsort(score, descending=True)
     ks = sizes(E)
     cs = ed.contrasts(kept_rows([order[:k] for k in ks]), edges)
@@ -277,15 +302,30 @@ def prune(ed: Edges, log=print) -> dict:
     before = len(keep)
     queue = list(keep.flip(0).tensor_split(min(HALVE_BLOCKS, len(keep)))) if len(keep) > 1 else []
     gone = torch.zeros(E, dtype=torch.bool)
-    while queue:  # halving: the lowest-ranked blocks first, a refused block split in two
-        b = queue.pop(0)
-        trial = gone.clone()
-        trial[b] = True
-        measured += 1
-        if ok(ed.contrasts(kept_rows([keep[~trial[keep]]]), edges)[0]):
-            gone = trial
-        elif len(b) > 1:
-            queue[:0] = list(b.tensor_split(2))
+    while queue:  # halving, B blocks a round (lowest-ranked first): each tried alone, the passing ones together
+        blocks, queue = queue[:B], queue[B:]
+        rows = []
+        for b in blocks:
+            trial = gone.clone()
+            trial[b] = True
+            rows.append(keep[~trial[keep]])
+        cs = ed.contrasts(kept_rows(rows), edges)
+        measured += len(blocks)
+        passed = [b for b, c in zip(blocks, cs) if ok(c)]
+        if passed:
+            trial = gone.clone()
+            trial[torch.cat(passed)] = True
+            measured += 1
+            if ok(ed.contrasts(kept_rows([keep[~trial[keep]]]), edges)[0]):
+                gone = trial
+            else:  # together they fail: one at a time
+                for b in passed:
+                    t2 = gone.clone()
+                    t2[b] = True
+                    measured += 1
+                    if ok(ed.contrasts(kept_rows([keep[~t2[keep]]]), edges)[0]):
+                        gone = t2
+        queue = [h for b, c in zip(blocks, cs) if not ok(c) and len(b) > 1 for h in b.tensor_split(2)] + queue
     keep = keep[~gone[keep]]
     t_halve = time.time() - t0 - t_rank - t_keep
     c_kept = ed.contrasts(kept_rows([keep]), edges)[0]
@@ -294,7 +334,7 @@ def prune(ed: Edges, log=print) -> dict:
     strengths = [c_all - c for c in ed.contrasts(single, edges)] if len(keep) else []
     measured += len(keep) + 1
     rec = {"contrast_model": ed.c_full, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
-           "floor": floor, "candidates": {"resid": len(ed.resid_all), "route": len(ed.route_all), "route_measured": len(top)},
+           "tolerance": tol, "candidates": {"resid": len(ed.resid_all), "route": len(ed.route_all), "route_measured": len(top)},
            "kept": len(keep), "kept_before_halving": before, "measured": measured,
            "seconds": {"rank": round(t_rank, 2), "keep": round(t_keep, 2), "halving": round(t_halve, 2),
                        "total": round(time.time() - t0, 2)}}

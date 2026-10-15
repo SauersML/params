@@ -105,6 +105,7 @@ class Edges:
         self.dev, self.dt = core.model.embed_tokens.weight.device, core.model.embed_tokens.weight.dtype
         self.T = target + 1
         self.B = max(16, TOKENS // self.T)  # cut sets a forward
+        self.forwards = 0  # (contrasts' forwards so far)
         self.ids, self.target, self.answer, self.alternatives = list(ids)[:self.T], target, list(answer), list(alternatives)
         self.thr = None if thr is None else thr.to(self.dev, torch.float32)
         self.massive = None if massive is None else massive.float().cpu()
@@ -314,6 +315,7 @@ class Edges:
         out = []
         for s0 in range(0, len(cuts), self.B):
             out += self._run(cuts[s0:s0 + self.B], edges, rest=rest)["contrast"].tolist()
+            self.forwards += 1
         return out
 
     # -- the base run's quantities --------------------------------------------------------------------------------
@@ -647,6 +649,7 @@ def prune(ed: Edges, log=print) -> dict:
            "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes,
                           "in_edges_listed": sum(len(c[0]) for c in cands)},
            "kept": len(keep), "kept_before_halving": before, "readers": len(readers), "measured": measured,
+           "forwards": ed.forwards, "sets_a_forward": ed.B,
            "seconds": {"local": round(t_local, 2), "errors": round(t_eps, 2), "halving": round(t_halve, 2),
                        "total": round(time.time() - t0, 2)}}
     log(f"{len(keep)} edges into {len(readers)} of {N} neurons ({before} before halving); contrast {c_kept:.3f} bits "

@@ -20,7 +20,10 @@ Two families: combinable (the facts and filler) and distractor (one filler sente
 the countries, DISTRACT: the facts are as present, the model's conclusion elsewhere). Every candidate and its
 measurements go to ITEMS.candidates.jsonl.
 Pairs, minimal first (the lead's 10-14: a system cannot pass by reading surface cues): a not-inferred text, and the same
-sentences plus one DECIDING sentence naming a city that makes it inferred. Then matched pairs: an inferred and a
+sentences plus one DECIDING sentence naming a city that makes it inferred. Whether the model infers depends almost
+wholly on the fact pair (France and Germany always, Brazil and Mexico never), so only pairs within one country and family
+test it; the unpaired items compare countries. Ruling out the model's answer instead ("We are not in Canada.") made no
+pair: Qwen3-1.7B keeps a country it is told the user is not in. Then matched pairs: an inferred and a
 not-inferred item of the same country and family. Then every inferred and not-inferred candidate unpaired (pair -1):
 the hit rate on inferred texts that name no city. "Not inferred" is behavioural and interventional: it does not exclude a state
 somewhere encoding the conclusion; reports say so. The countries and sentences avoid fleet's held-out persona organisms
@@ -264,7 +267,7 @@ def curves(a) -> None:
     plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
     fig, axes = plt.subplots(1, len(systems), figsize=(6.5 * len(systems), 5.6), facecolor="white", squeeze=False)
     groups = [(f"{k}: {f}", lambda r, k=k, f=f: r["pair_kind"] == k and r["family"] == f)
-              for k in ("minimal", "unpaired") for f in ("combinable", "distractor")]
+              for k in ("minimal", "matched") for f in ("combinable", "distractor")]
     colors = ["#d62728", "#ff7f0e", "#1f77b4", "#2ca02c"]
     for ax, sname in zip(axes[0], systems):
         for (gname, sel), col in zip(groups, colors):

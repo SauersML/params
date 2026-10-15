@@ -4554,7 +4554,9 @@ class GoalEval:
         prediction most first on 7 of the 9 that need context, second or third on the others; the probe's draws from the
         model's own prediction (moved) miss tokens with plausible substitutes (text9043's ' adjusted' one back: 0.57
         bits by the probe, 1.03 by donors, 9.18 replaced by ' the'). Kept on tx."""
-        kept = tx.__dict__.setdefault("_resample", {})
+        # Exact scorecard draws must never consume the builder's screened approximation.
+        # Do not trust the old ambiguous _resample namespace, including on warmed Texts.
+        kept = tx.__dict__.setdefault("_resample_exact", {})
         if (split, k, self.FIRST_POSITION) not in kept:
             donors = [list(d) for _, d in self.far_donors(tx, self.far_pool(split), k)]
             tg = set(tx.targets)

@@ -260,11 +260,11 @@ def _resampled(ge: goal_eval.GoalEval, tx: goal_eval.Text, qs: list[int], donors
 def influence(ge: goal_eval.GoalEval, tx: goal_eval.Text, split: str = "search", k: int | None = None) -> dict:
     """Each context position's resampling influence (GoalEval.resample_influence's numbers): every position with the
     first SCREEN_DONORS of its k far donors, then the SHORTLIST largest with all k (the rest keep their screened
-    value: the input-scope family's positions are the largest few). Kept on tx where resample_influence keeps its
-    own, so the input-scope family's draws (scope_draws) read it."""
+    value). The screened ranking is cached separately from GoalEval.resample_influence's
+    exact scorecard draws, so construction never changes the common floor candidate pool."""
     k = goal_eval.RESAMPLE_DONORS if k is None else k
     key = (split, k, ge.FIRST_POSITION)
-    kept = tx.__dict__.setdefault("_resample", {})
+    kept = tx.__dict__.setdefault("_builder_resample", {})
     if key not in kept:
         donors = [list(d) for _, d in ge.far_donors(tx, ge.far_pool(split), k)]
         tg_ = set(tx.targets)

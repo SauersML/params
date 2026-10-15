@@ -41,7 +41,7 @@ def test_influence_is_resample_influence(tiny, monkeypatch):
     monkeypatch.setattr(builder_fast, "SHORTLIST", len(want))   # every position measured with every donor
     got = builder_fast.influence(ge, tx2, "search", 4)
     assert set(got) == set(want) and all(abs(got[q] - want[q]) < 1e-4 * max(1.0, want[q]) for q in want)
-    assert tx2.__dict__["_resample"][("search", 4, ge.FIRST_POSITION)] is got   # the input-scope family's draws read it
+    assert tx2.__dict__["_builder_resample"][("search", 4, ge.FIRST_POSITION)] is got   # only the builder ranking reads this screened cache
 
 
 def test_build_inside_the_start_meeting_its_floors(tiny):
@@ -210,3 +210,75 @@ def test_unit_table_features_and_labels(tiny, monkeypatch):
     n = rec["start_units"]
     assert len(u["units"]) == n and all(len(u[k]) == n for k in ("layer", "kind", "back", "write", "ig_own", "label_own", "label_need", "label_score"))
     assert (u["label_own"] >= 0).all() and (u["label_need"] >= 0).all()
+
+
+# Exact scorecard draws and screened proposal rankings have independent caches.
+
+def context(ge,task):
+ p=task['prompts'][0]
+ return ge.text(p['token_ids'],p['target_positions'],seed=5)
+
+
+def test_screened_and_exact_resampling_are_independent_in_both_orders(tiny,monkeypatch):
+ nat,ge,task=tiny
+ monkeypatch.setattr(builder_fast,'SCREEN_DONORS',1)
+ monkeypatch.setattr(builder_fast,'SHORTLIST',1)
+ cold_exact=ge.resample_influence(context(ge,task),'search',4)
+ cold_approx=builder_fast.influence(ge,context(ge,task),'search',4)
+ assert cold_exact!=cold_approx,'fixture must exercise an actually different screened approximation'
+ for approx_first in (True,False):
+  tx=context(ge,task)
+  if approx_first:
+   approx=builder_fast.influence(ge,tx,'search',4);exact=ge.resample_influence(tx,'search',4)
+  else:
+   exact=ge.resample_influence(tx,'search',4);approx=builder_fast.influence(ge,tx,'search',4)
+  assert exact==cold_exact and approx==cold_approx
+  assert ge.resample_influence(tx,'search',4) is exact
+  assert builder_fast.influence(ge,tx,'search',4) is approx
+  assert tx._resample_exact[('search',4,ge.FIRST_POSITION)] is exact
+  assert tx._builder_resample[('search',4,ge.FIRST_POSITION)] is approx
+
+
+def test_ambiguous_old_cache_never_trusted(tiny,monkeypatch):
+ _,ge,task=tiny
+ tx=context(ge,task);tx._resample={('search',4,ge.FIRST_POSITION):{'stale':float('inf')}}
+ exact=ge.resample_influence(tx,'search',4)
+ approx=builder_fast.influence(ge,tx,'search',4)
+ assert 'stale' not in exact and 'stale' not in approx
+ assert tx._resample[('search',4,ge.FIRST_POSITION)]=={'stale':float('inf')}
+
+
+def test_canonical_pool_draws_and_floor_graphs_ignore_builder_call_order(tiny,monkeypatch):
+ import native_units
+ _,ge,task=tiny
+ monkeypatch.setattr(builder_fast,'SCREEN_DONORS',1)
+ monkeypatch.setattr(builder_fast,'SHORTLIST',1)
+ captured=[]
+ def fidelity(tx,graphs,*args,**kwargs):
+  assert kwargs['shared_only']
+  captured.append(tuple(tuple(sorted(g.nodes)) for g in graphs))
+  return [{goal_eval.PHI_FAMILIES[f][0]:1. for f in native_units.SHARED} for g in graphs]
+ monkeypatch.setattr(ge,'fidelity',fidelity)
+ results=[]
+ for builder_first in (False,True):
+  tx=context(ge,task)
+  if builder_first:builder_fast.influence(ge,tx)
+  candidates=ge.start_candidates(tx)
+  draws=ge.scope_draws(tx)
+  floors=ge.vpd_floors(tx,None,'search',shared_only=True)
+  if not builder_first:builder_fast.influence(ge,tx)
+  results.append((candidates,draws,floors['floors'],captured[-1]))
+ assert results[0]==results[1]
+ assert set(results[0][2])==set(native_units.SHARED)
+
+
+def test_exact_and_builder_cache_parameters_stay_separate(tiny,monkeypatch):
+ _,ge,task=tiny
+ monkeypatch.setattr(builder_fast,'SCREEN_DONORS',1);monkeypatch.setattr(builder_fast,'SHORTLIST',1)
+ tx=context(ge,task)
+ for split,k,first in [('search',4,True),('eval',4,True),('search',2,True),('search',4,False)]:
+  monkeypatch.setattr(ge,'FIRST_POSITION',first)
+  exact=ge.resample_influence(tx,split,k);approx=builder_fast.influence(ge,tx,split,k)
+  assert (0 in exact)==first and (0 in approx)==first
+ assert set(tx._resample_exact)==set(tx._builder_resample)=={
+  ('search',4,True),('eval',4,True),('search',2,True),('search',4,False)}

@@ -7,7 +7,10 @@ the same fraction in every layer (each of neuron_builder.TAUS) and the per-layer
 attention sink) kept whole.
 
   neuron_t2.py OUT [--model Qwen/Qwen3-1.7B] [--adapter DIR] [--dtype bfloat16] [--device auto] [--fit 80] [--len 256]
-writes OUT/thr.pt (Neurons.save: neuron_builder --thr and neuron_scorecard's thr file) and OUT/t2.json.
+               [--thr FILE]
+writes OUT/thr.pt (Neurons.save: neuron_builder --thr and neuron_scorecard's thr file) and OUT/t2.json; with --thr the
+reference is read from FILE and only the held-out check runs. Beside the KL, the share of positions whose likeliest next
+token stays the model's (the essay's measure was answers changed).
 """
 from __future__ import annotations
 
@@ -38,6 +41,7 @@ def main():
     ap.add_argument("--fit", type=int, default=nb.FIT)
     ap.add_argument("--len", type=int, default=256, help="tokens per chat")
     ap.add_argument("--rows", type=int, default=16)
+    ap.add_argument("--thr", type=Path, default=None, help="a Neurons.save file: skip the calibration")
     a = ap.parse_args()
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -57,16 +61,20 @@ def main():
     cal_seqs, held = [seq(r) for r in gen[nb.CAL_ROWS]], [seq(r) for r in gen[HELD]]
     a.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    cal = nr.calibrate(cal_seqs, fit=cal_seqs[:a.fit], rows=a.rows, log=lambda m: print(f"{time.time() - t0:.0f}s {m}", flush=True))
-    nr.save(a.out / "thr.pt", calibration=cal, model=a.model, adapter=a.adapter)
+    if a.thr:
+        cal = nr.load(a.thr).get("calibration")
+    else:
+        cal = nr.calibrate(cal_seqs, fit=cal_seqs[:a.fit], rows=a.rows, log=lambda m: print(f"{time.time() - t0:.0f}s {m}", flush=True))
+        nr.save(a.out / "thr.pt", calibration=cal, model=a.model, adapter=a.adapter)
     names = ["per_layer", "per_layer_sink_live"] + [f"global_{t}" for t in nb.TAUS]
     fr = torch.tensor([nr.tau, nr.tau] + [[t] * nr.L for t in nb.TAUS], dtype=torch.float64)
-    kl, st = nr.weak_runs(held, fr, live0=[False, True] + [False] * len(nb.TAUS), rows=a.rows)
-    rows = [{"name": n, "tau": [float(x) for x in f], "kl": float(k), "strong_per_token": float(s.sum()),
+    kl, st, ag = nr.weak_runs(held, fr, live0=[False, True] + [False] * len(nb.TAUS), rows=a.rows)
+    rows = [{"name": n, "tau": [float(x) for x in f], "kl": float(k), "top_kept": float(g), "strong_per_token": float(s.sum()),
              "share": float(s.sum()) / (nr.L * nr.D), "per_layer": [round(float(x), 1) for x in s]}
-            for n, f, k, s in zip(names, fr, kl, st)]
+            for n, f, k, g, s in zip(names, fr, kl, ag, st)]
     for r in rows:
-        print(f"{r['name']:>22}: KL {r['kl']:.4f} bits, {r['strong_per_token']:.0f} strong per token ({r['share']:.3f})", flush=True)
+        print(f"{r['name']:>22}: KL {r['kl']:.4f} bits, top kept {r['top_kept']:.3f}, {r['strong_per_token']:.0f} strong per "
+              f"token ({r['share']:.3f})", flush=True)
     (a.out / "t2.json").write_text(json.dumps({"model": a.model, "adapter": a.adapter, "dtype": a.dtype, "calibration": cal,
                                                "held_out": rows, "held_texts": len(held), "held_tokens": sum(map(len, held)),
                                                "neurons": nr.L * nr.D, "seconds": round(time.time() - t0)}))

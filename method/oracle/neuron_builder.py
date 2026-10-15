@@ -126,11 +126,13 @@ class Neurons:
     def weak_runs(self, seqs: list[list[int]], fracs: torch.Tensor, live0=None, rows: int = 16) -> tuple:
         """Per row of fracs [R, L] (each layer's weak fraction of self.mx), the model with every value under its threshold
         zeroed (live0 [R] bool: the first position, the attention sink, kept whole): its mean KL (bits) from the model
-        over every position of seqs [R], and the strong values per token per layer [R, L]."""
+        over every position of seqs [R], the strong values per token per layer [R, L], and the share of positions whose
+        likeliest next token stays the model's [R]."""
         thr, self.thr = self.thr, None
         R = len(fracs)
         kl = torch.zeros(R, dtype=torch.float64)
         strong = torch.zeros(R, self.L, dtype=torch.float64)
+        agree = torch.zeros(R, dtype=torch.float64)
         n = 0
         for ids in seqs:
             pos = list(range(len(ids)))
@@ -149,11 +151,12 @@ class Neurons:
                 lp1 = torch.log_softmax(self.logits(ids, pos, edit=edit, B=len(f)), -1)
                 d = (lp0.exp()[None] * (lp0[None] - lp1.to(lp0.device))).sum(-1).sum(-1) / math.log(2)
                 kl[s0:s0 + len(f)] += d.double().cpu()
+                agree[s0:s0 + len(f)] += (lp1.argmax(-1) == lp0.argmax(-1).to(lp1.device)[None]).sum(-1).double().cpu()
                 strong[s0:s0 + len(f)] += cnt.double().cpu()
                 del lp1
             n += len(ids)
         self.thr = thr
-        return kl / n, strong / n
+        return kl / n, strong / n, agree / n
 
     @torch.no_grad()
     def calibrate(self, seqs: list[list[int]], fit: list[list[int]] | None = None, taus=TAUS, kl_tol: float = KL_TOL,
@@ -173,7 +176,7 @@ class Neurons:
         fr = torch.zeros(L * len(taus), L, dtype=torch.float64)
         for i in range(L):
             fr[i * len(taus):(i + 1) * len(taus), i] = grid[1:]
-        kl1, st1 = self.weak_runs(fit, fr, rows=rows)
+        kl1, st1, _ = self.weak_runs(fit, fr, rows=rows)
         cost = torch.cat([torch.zeros(L, 1, dtype=torch.float64), kl1.view(L, len(taus)).clamp(min=0)], 1).cummax(1).values
         own = st1.view(L, len(taus), L).diagonal(dim1=0, dim2=2).T                      # [L, G-1] strong at the layer itself
         gone = torch.cat([torch.zeros(L, 1, dtype=torch.float64), self.D - own], 1)    # [L, G] values zeroed per token
@@ -185,7 +188,7 @@ class Neurons:
             g = (gone - lam * cost).argmax(1)
             if not any(bool((g == h).all()) for h in steps):
                 steps.append(g)
-        kls, sts = self.weak_runs(fit, torch.stack([grid[g] for g in steps]), rows=rows)
+        kls, sts, _ = self.weak_runs(fit, torch.stack([grid[g] for g in steps]), rows=rows)
         ok = [k for k in range(len(steps)) if kls[k] <= kl_tol]
         k0 = min(ok, key=lambda k: float(sts[k].sum())) if ok else None
         g = steps[k0] if ok else torch.zeros(L, dtype=torch.long)
@@ -198,7 +201,7 @@ class Neurons:
             if not cand:
                 break
             trial = torch.stack([grid[g + torch.nn.functional.one_hot(torch.tensor(i), L)] for i in cand])
-            k2, s2 = self.weak_runs(fit, trial, rows=rows)
+            k2, s2, _ = self.weak_runs(fit, trial, rows=rows)
             best = None
             for j, i in enumerate(cand):
                 if k2[j] <= kl_tol:

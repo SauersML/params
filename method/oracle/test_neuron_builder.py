@@ -34,7 +34,8 @@ def tiny():
 def test_calibration_within_tolerance(tiny):
     nr, cal, _, seqs = tiny
     assert nr.thr.shape == (nr.L, nr.D) and len(cal["tau"]) == nr.L and cal["kl"] <= 0.5
-    kl, st = nr.weak_runs(seqs, torch.tensor([cal["tau"]]))
+    kl, st, agree = nr.weak_runs(seqs, torch.tensor([cal["tau"]]))
+    assert 0 <= float(agree[0]) <= 1
     assert abs(float(kl[0]) - cal["kl"]) < 1e-6 and abs(float(st[0].sum()) - cal["strong_per_token"]) < 1e-6
 
 

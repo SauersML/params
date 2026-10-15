@@ -96,6 +96,7 @@ DEV20 = tuple(f"text{n}" for n in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 900
 ENTRIES = 2 ** 27  # mask floats per engine call (edit runs)
 LIVE_SINGLES = 32  # live_gates' single removals (the CI network runs per removal)
 SINGLES_MAX = 4096  # a native circuit's units measured one by one (beyond: those of its most damaging groups)
+SCREEN_BLOCK = 64  # neuron indices per screening group
 STATED_MAX = 2048  # a native circuit's units whose eval track fall is measured (a uniform sample beyond: inert share estimated)
 SHARE_MIN = 0.1  # a mediated share is left undefined when the live drop is under this many bits
 LN2 = math.log(2.0)
@@ -748,17 +749,18 @@ def native_lq(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, sets: list[li
 @torch.no_grad()
 def native_mediated(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, units: list) -> dict:
     """A native circuit's mediated share (criterion 6): its units ranked by measured real-model removal (every unit, or,
-    over SINGLES_MAX units, those of the (kind, layer, position) groups whose removal drops the prediction most, the
-    groups measured first), the top 1, 3 and 5 removed live and with every unit outside held at its clean value."""
+    over SINGLES_MAX units, those of the groups whose removal drops the prediction most, the groups measured first: a
+    head's layer and position, SCREEN_BLOCK neurons of a layer and position), the top 1, 3 and 5 removed live and with
+    every unit outside held at its clean value."""
     y = tx.ref[0].argmax(-1)
 
     def lp(lq):
         return (lq.gather(-1, y.view(1, -1, 1).expand(lq.shape[0], -1, 1)).squeeze(-1).sum(-1) / LN2).tolist()
     meas, screen = units, None
-    if len(units) > SINGLES_MAX:
-        by = {}
+    if len(units) > SINGLES_MAX:  # groups: a head's layer and position, a layer and position's neurons by blocks of
+        by = {}                   # SCREEN_BLOCK indices (a whole layer's 3,072 can cancel each other when removed together)
         for u in units:
-            by.setdefault((u[0], u[1], u[2]), []).append(u)
+            by.setdefault((u[0], u[1], u[2], u[3] // SCREEN_BLOCK if u[0] == "neuron" else 0), []).append(u)
         keys = list(by)
         gl = lp(native_lq(ge, tx, nphi, S, [[]] + [by[k] for k in keys], "live"))
         meas = []
@@ -766,7 +768,7 @@ def native_mediated(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, units: 
             if len(meas) >= SINGLES_MAX:
                 break
             meas += by[keys[i]]
-        screen = {"groups": len(keys), "groups_measured_singly": len(set((u[0], u[1], u[2]) for u in meas))}
+        screen = {"groups": len(keys), "units_measured_singly": len(meas)}
     live = lp(native_lq(ge, tx, nphi, S, [[]] + [[u] for u in meas], "live"))
     real1 = [live[0] - x for x in live[1:]]
     top = [meas[i] for i in np.argsort(real1)[::-1][:5]]

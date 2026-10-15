@@ -27,8 +27,9 @@ The VPD builder on one text:
 4. chunks: the chosen units in CHUNKS runs of the ranking, least important first, PATH_BATCH at a time each removed
    from the current set and measured (point and the path-patched families, then N and patching on those passing),
    the passing ones removed together when that passes too, else the least important alone;
-5. inert parts: each kept unit removed alone, its own-run KL change measured in one batch; the units moving it by
-   less than INERT_BITS dropped together when the reduced set still meets every floor.
+5. inert parts: each kept unit removed alone, its own-run KL change measured in one batch; of the units moving it by
+   less than INERT_BITS, least important first, the most dropped together that still meets every floor (all, else
+   ROUNDS bracketing rounds over how many).
 The full reward row is the scorecard's, never run here."""
 from __future__ import annotations
 
@@ -430,17 +431,27 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     ids = on.nonzero().flatten().tolist()
     base = pr.kl()
     moved = [abs(k - base) for k in pr.without([torch.tensor([i], device=nat.dev) for i in ids])] if ids else []
-    inert = [i for i, d in zip(ids, moved) if d < INERT_BITS]
+    where = {u: j for j, u in enumerate(rank)}
+    inert = sorted((i for i, d in zip(ids, moved) if d < INERT_BITS), key=lambda i: -where[i])   # least important first
     rec["inert"] = len(inert)
-    if inert and len(inert) < len(ids):
-        on2 = on.clone()
-        on2[inert] = False
-        g = _graph([units[i] for i in on2.nonzero().flatten().tolist()])
-        fam = {"point": goal_eval._fid_raw(e0, pr.kl_sets(on2[None])[0], v0), **families([g])[0]}
-        if meets(fam):
-            fam.update(extra([g])[0])
-        if meets(fam):
-            on, rec["dropped_inert"], rec["after_inert"] = on2, True, fam
+    if inert and len(inert) < len(ids) and rec["met"]:       # the most of them dropped together that still meets every
+        def without(k):                                      # floor: all, else bracketing rounds over how many
+            o = on.clone()
+            o[inert[:k]] = False
+            return o
+        f = every([without(len(inert))])[0]
+        lo, hi = (len(inert), len(inert)) if f is not None and meets(f) else (0, len(inert))
+        for _ in range(ROUNDS):
+            if hi - lo <= max(1, len(inert) // 32):
+                break
+            ks = sorted({lo + max(1, (hi - lo) * (j + 1) // (PATH_BATCH + 1)) for j in range(PATH_BATCH)} - {lo, hi})
+            for k, f in zip(ks, every([without(k) for k in ks])):
+                if f is not None and meets(f):
+                    lo = max(lo, k)
+                else:
+                    hi = min(hi, k) if k > lo else hi
+        if lo:
+            on, rec["dropped_inert"] = without(lo), lo
     clock("inert")
     kept = [units[i] for i in on.nonzero().flatten().tolist()]
     rec["size"] = len(kept)

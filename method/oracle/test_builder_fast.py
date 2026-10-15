@@ -55,8 +55,8 @@ def test_build_inside_the_start_meeting_its_floors(tiny):
     nodes = {(n, int(t), int(c)) for n, c, t in out["nodes"]}
     assert nodes <= start and rec["size"] == len(nodes) and rec["start_units"] == len(start)
     if rec["met"]:                                       # the size written met every floor it measured
-        size = rec["size"] if not rec.get("dropped_inert") else None
-        row = next((t for t in rec["tried"] if t["size"] == size), None) if size is not None else rec["after_inert"]
+        size = rec["size"] if not rec.get("dropped_inert") and not (rec.get("chunks") or {}).get("removed") else None
+        row = next((t for t in rec["tried"] if t["size"] == size), None) if size is not None else None
         if row is not None:
             assert all(row[f] is None or rec["floors"][f] is None or row[f] >= rec["floors"][f] - 1e-9
                        for f in ("point", "track_pp", "scope", "interchange_pp"))

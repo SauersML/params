@@ -39,7 +39,7 @@ KINDS = [("own", "own circuit (searched on this text)", INK, "o"),
          ("core", "shared core of the other members", GREEN, "D"),
          ("vpd_mapped_size", "VPD's top k at the mapped circuits' size", AMBER, "s"),
          ("vpd_core_size", "VPD's top k at the core's size", "none", "s")]
-TITLE = "Circuits carry over to other texts of their family, not to texts outside it; copying does not carry over"
+TITLE = "Circuits transfer to other texts of their family, not to texts outside it; copying does not transfer"
 PANELS = [("s_point_c", "Prediction recovered"), ("s_track", "Follows input changes"), ("s_interchange", "Interchange agreement")]
 
 

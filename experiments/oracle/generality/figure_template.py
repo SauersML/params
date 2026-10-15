@@ -91,6 +91,7 @@ def scores(ax):
         if tpl:
             d["vpd_listed"] = d.get(f"vpd@{tpl['listed']}")
             d["vpd_expanded"] = d.get(f"vpd@{tpl['nodes']}")
+    terms = [t for t in terms if any(d.get(k) and d[k].get(t[0]) is not None for d in by.values() for k, _, _ in kinds)]
     for j, (k, lab, color) in enumerate(kinds):
         labelled = False
         for i, (m, _) in enumerate(terms):
@@ -106,8 +107,8 @@ def scores(ax):
     ax.set_yticklabels([t for _, t in terms])
     ax.invert_yaxis()
     ax.set_xlim(-0.03, 1.03)
-    ax.set_xlabel("score on each held-out copy text (1 = as good as VPD's own answer)")
-    ax.set_title(f"On {len(by)} held-out copy texts")
+    ax.set_xlabel("score on each unseen copy text (1 = as good as VPD's own answer)")
+    ax.set_title(f"On {len(by)} unseen copy texts")
     ax.legend(frameon=False, loc="lower center", bbox_to_anchor=(0.5, -0.42), ncol=2, fontsize=13)
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)

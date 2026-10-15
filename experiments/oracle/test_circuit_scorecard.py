@@ -132,10 +132,21 @@ def test_families_table():
 def test_v_noise():
     r = record("text9001", 0.2, 4, 300, None)
     assert sc.v_noise(r) is None
-    r["floors"]["margins"] = {"N": {"diff": -0.1, "se": 0.1, "n": 8, "paired": True, "pass_new": True}}
+    r["floors"]["margins"] = {"N": {"diff": -0.1, "se": 0.1, "n": 8, "paired": True, "allowance": 0.2, "pass_new": True}}
     assert sc.v_noise(r) == 0.0 and sc.v_noise(r, True) == 0.0
-    r["floors"]["margins"]["N"]["se"] = 0.04
+    r["floors"]["margins"]["N"]["allowance"] = 0.08
     assert sc.v_noise(r) == pytest.approx(0.2 - 0.08)
+
+
+def test_noise_cap():
+    draws = [["d1", 1.0, 0.5, 2.0, 0.6], ["d2", 1.6, 0.4, 2.2, 0.3], ["d3", 0.7, 0.6, 1.9, 0.9], ["d4", 1.3, 0.5, 2.1, 0.5]]
+    ref = [[d[0], d[2], d[2], d[3], 1.0] for d in draws]
+    row = {"s_patching_near": 0.5, "rl_terms": {"s_patching_near": 0.5}, "draws_patching_near": draws}
+    vpd = {"s_patching_near": 1.0, "rl_terms": {"s_patching_near": 1.0}, "draws_patching_near": ref}
+    m = sc.goal_eval.paired_margin(row, vpd, "patching_near")
+    assert m["allowance"] == pytest.approx(min(2 * m["se"], sc.goal_eval.NOISE_CAP["patching_near"]))
+    assert sc.goal_eval.paired_margin(row, vpd, "patching_near")["allowance"] <= 0.02
+    assert sc.goal_eval.paired_margin({"s_point_c": 0.5}, {"s_point_c": 1.0}, "point")["allowance"] == 0.0
 
 
 def test_slim_rows_give_the_same_margins():

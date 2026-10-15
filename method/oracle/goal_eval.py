@@ -781,7 +781,11 @@ def shortfall(row: dict, floors_: dict) -> float:
     return max((max(0.0, f - (family_score(row, k) or 0.0)) for k, f in floors_.items()), default=0.0)
 
 
-PAIRED_SE = 2.0  # the noise-aware floor (the lead's 10-14): a family passes at its floor less this many paired SEs
+PAIRED_SE = 2.0  # the noise-aware floor (the lead's 10-14): a family passes at its floor less this many paired SEs,
+NOISE_CAP = {"track_pp": 0.02, "scope": 0.05, "interchange_pp": 0.01, "patching_near": 0.02, "patching_far": 0.07, "N": 0.0}
+# at most this allowance (the lead's guard: a circuit that varies more across draws would buy slack with its own
+# variance): each family's dev-measured spread, twice the robust SD of eval less search over the 20 dev teacher
+# circuits (builder_fast's MARGIN, the same numbers); a family without one gets none (its floor exactly)
 OWN_DRAWS = ("nodes", "edges", "pattern", "omitted")  # families whose draws are each row's own (its nodes, connections,
 # reads, omitted candidates): never paired across rows, whatever their records' first fields
 
@@ -794,13 +798,14 @@ def paired_margin(row: dict, ref: dict, family: str) -> dict:
     pooled as the family pools its draws, _pooled_resamples, unfloored and clipped as family_score reads it). For a
     family whose draws are each row's own (OWN_DRAWS: node and connection removals, its reads, its omitted candidates)
     or where fewer than two draws match, the two rows' bootstrap errors combined as independent; a family scored in one run (point,
-    flips) has none (se 0). Returns {diff, se, n (draws matched), paired}."""
+    flips) has none (se 0). Returns {diff, se, n (draws matched), paired, allowance}: allowance the noise-aware floor's
+    slack, min(PAIRED_SE se, NOISE_CAP of the family)."""
     sc, sr = family_score(row, family), family_score(ref, family)
     diff = None if sc is None or sr is None else sc - sr
     _, kind, key = PHI_FAMILIES[family]
     dc, dr = (row.get(key) or [], ref.get(key) or []) if key else ([], [])
     if not kind or len(dc) < 2 or len(dr) < 2:
-        return {"diff": diff, "se": 0.0, "n": 0, "paired": False}
+        return {"diff": diff, "se": 0.0, "n": 0, "paired": False, "allowance": 0.0}
     rng = np.random.default_rng(0)
 
     def clip(xs):
@@ -813,32 +818,35 @@ def paired_margin(row: dict, ref: dict, family: str) -> dict:
         a = clip(_pooled_resamples(kind, [dc[i] for i, _ in pairs], row.get("kl_empty_live"), True, idx))
         b = clip(_pooled_resamples(kind, [dr[j] for _, j in pairs], ref.get("kl_empty_live"), True, idx))
         d = (a - b)[~np.isnan(a - b)]
-        return {"diff": diff, "se": float(np.std(d, ddof=1)) if len(d) > 1 else 0.0, "n": len(pairs), "paired": True}
+        se = float(np.std(d, ddof=1)) if len(d) > 1 else 0.0
+        return {"diff": diff, "se": se, "n": len(pairs), "paired": True, "allowance": min(PAIRED_SE * se, NOISE_CAP.get(family, 0.0))}
     var = 0.0
     for draws, r in ((dc, row), (dr, ref)):
         x = clip(_pooled_resamples(kind, draws, r.get("kl_empty_live"), True, rng.integers(len(draws), size=(EPS_BOOT, len(draws)))))
         x = x[~np.isnan(x)]
         var += float(np.var(x, ddof=1)) if len(x) > 1 else 0.0
-    return {"diff": diff, "se": var ** 0.5, "n": 0, "paired": False}
+    return {"diff": diff, "se": var ** 0.5, "n": 0, "paired": False, "allowance": min(PAIRED_SE * var ** 0.5, NOISE_CAP.get(family, 0.0))}
 
 
 def margins(row: dict, refs: dict, floors_: dict) -> dict:
     """paired_margin per family of the floors against its reference (refs: vpd_floors' rows, "vpd" and "candidates"),
-    with each family's score, floor and whether it passes the noise-aware floor (score >= floor - PAIRED_SE se)."""
+    with each family's score, floor and whether it passes the old floor, the noise-aware one (score >= floor -
+    allowance) and the uncapped one (score >= floor - PAIRED_SE se, the cap's report)."""
     out = {}
     for f, fl in floors_.items():
         ref = refs["candidates"] if f in OWN_RUN_FAMILIES else refs["vpd"]
         m = paired_margin(row, ref, f)
-        s = family_score(row, f)
-        m.update(score=s, floor=fl, pass_old=(s or 0.0) >= fl, pass_new=(s or 0.0) >= fl - PAIRED_SE * m["se"])
+        s = family_score(row, f) or 0.0
+        m.update(score=family_score(row, f), floor=fl, pass_old=s >= fl, pass_new=s >= fl - m["allowance"],
+                 pass_uncapped=s >= fl - PAIRED_SE * m["se"])
         out[f] = m
     return out
 
 
 def shortfall_noise(row: dict, floors_: dict, refs: dict) -> float:
-    """shortfall with the noise-aware floors: max_i (f_i - PAIRED_SE se_i - s_i)_+, se_i paired_margin's."""
+    """shortfall with the noise-aware floors: max_i (f_i - allowance_i - s_i)_+, allowance_i paired_margin's."""
     m = margins(row, refs, floors_)
-    return max((max(0.0, x["floor"] - PAIRED_SE * x["se"] - (x["score"] or 0.0)) for x in m.values()), default=0.0)
+    return max((max(0.0, x["floor"] - x["allowance"] - (x["score"] or 0.0)) for x in m.values()), default=0.0)
 
 
 def shortfall_soft(row: dict, floors_: dict) -> float:

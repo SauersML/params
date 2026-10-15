@@ -262,7 +262,7 @@ def noise_floors(row: dict, vf: dict, fl: dict) -> dict:
     difference from its reference and that difference's SE), the shortfall under floor - PAIRED_SE SE, the families
     failing it."""
     mg = goal_eval.margins(row, vf, fl)
-    return {"margins": {f: {k: m[k] for k in ("diff", "se", "n", "paired", "pass_new")} for f, m in mg.items()},
+    return {"margins": {f: {k: m[k] for k in ("diff", "se", "n", "paired", "allowance", "pass_new", "pass_uncapped")} for f, m in mg.items()},
             "v_noise": goal_eval.shortfall_noise(row, fl, vf), "failing_noise": [f for f, m in mg.items() if not m["pass_new"]],
             "rows": {"circuit": slim(row), "vpd": slim(vf["vpd"]), "candidates": slim(vf["candidates"])}}
 
@@ -848,8 +848,8 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
         weak = [u for u in weak_order if u not in set(uniform)][:WEAK]
     tested = uniform + weak
     need = {f: min(fl.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
-    se = {f: m["se"] for f, m in rec["floors"]["margins"].items()}
-    need_noise = {f: min(fl.get(f, 0.0) - goal_eval.PAIRED_SE * se.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
+    allow = {f: m["allowance"] for f, m in rec["floors"]["margins"].items()}
+    need_noise = {f: min(fl.get(f, 0.0) - allow.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
     mrows = []
     for s0 in range(0, len(tested), BATCH):
         part = tested[s0:s0 + BATCH]
@@ -986,8 +986,8 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
         weak = [nd for nd in weak_order if nd not in set(uniform)][:WEAK]
     tested = uniform + weak
     need = {f: min(fl.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
-    se = {f: m["se"] for f, m in rec["floors"]["margins"].items()}
-    need_noise = {f: min(fl.get(f, 0.0) - goal_eval.PAIRED_SE * se.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
+    allow = {f: m["allowance"] for f, m in rec["floors"]["margins"].items()}
+    need_noise = {f: min(fl.get(f, 0.0) - allow.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
     mrows = []
     for nd, r in zip(tested, rows(ge, tx, [without(g, nd) for nd in tested], pool, log)):
         j = judged(r, fl, fams)
@@ -1031,8 +1031,8 @@ def add_noise(rec: dict, row0: dict, vf: dict, fams: list) -> None:
     if rec["floors"]["refreshed"]:
         mn["uniform_noise"] = mn["weak_noise"] = None  # (removals scored under the earlier floors' code)
         return
-    se = {f: m["se"] for f, m in rec["floors"]["margins"].items()}
-    need = {f: min(fl[f] - goal_eval.PAIRED_SE * se.get(f, 0.0), sc[f] or 0.0) for f in fl}
+    allow = {f: m["allowance"] for f, m in rec["floors"]["margins"].items()}
+    need = {f: min(fl[f] - allow.get(f, 0.0), sc[f] or 0.0) for f in fl}
     for m in mn["rows"]:
         m["removable_noise"] = all((m["scores"].get(f) or 0.0) >= need[f] for f in fl)
     mn["uniform_noise"] = [sum(m["removable_noise"] for m in mn["rows"] if m["uniform"]), mn["uniform"][1]]
@@ -1108,13 +1108,13 @@ def v_shared(r: dict) -> float:
 
 
 def v_noise(r: dict, shared: bool = False):
-    """The worst shortfall under the noise-aware floors (floor - PAIRED_SE paired SE), over every family or the shared
-    ones; None for a record scored before them."""
+    """The worst shortfall under the noise-aware floors (floor less the capped allowance, goal_eval.paired_margin's), over
+    every family or the shared ones; None for a record scored before them."""
     mg = r["floors"].get("margins")
     if mg is None:
         return None
     fam = r["floors"]["families"]
-    return max((max(0.0, fam[f]["floor"] - goal_eval.PAIRED_SE * m["se"] - (fam[f]["score"] or 0.0)) for f, m in mg.items()
+    return max((max(0.0, fam[f]["floor"] - m.get("allowance", goal_eval.PAIRED_SE * m["se"]) - (fam[f]["score"] or 0.0)) for f, m in mg.items()
                 if (not shared or f in native_units.SHARED) and fam.get(f, {}).get("floor") is not None), default=0.0)
 
 
@@ -1170,7 +1170,11 @@ def summary(recs: list[dict]) -> dict:
                             "failing_family_counts_new": dict(sorted(failn.items(), key=lambda x: -x[1])),
                             "median_diff_by_family": {f: med([r["floors"]["margins"][f]["diff"] for r in noisy if f in r["floors"]["margins"]]) for f in fams},
                             "median_se_by_family": {f: med([r["floors"]["margins"][f]["se"] for r in noisy if f in r["floors"]["margins"]]) for f in fams},
-                            "removable_uniform_new": un + [un[0] / un[1] if un[1] else None]},
+                            "removable_uniform_new": un + [un[0] / un[1] if un[1] else None],
+                            "passes_the_cap_removes": sum(m.get("pass_uncapped", m["pass_new"]) and not m["pass_new"]
+                                                          for r in noisy for m in r["floors"]["margins"].values()),
+                            "new_passes_uncapped": sum(m.get("pass_uncapped", m["pass_new"]) and not (r["floors"]["families"][f]["score"] or 0.0) >= r["floors"]["families"][f]["floor"]
+                                                       for r in noisy for f, m in r["floors"]["margins"].items())},
             "pool": sorted({r.get("pool") for r in recs}), "units": sorted({r["size"].get("units", "vpd") for r in recs}),
             "meet_shared_floors": sum(v_shared(r) == 0.0 for r in recs), "median_v_shared": med([v_shared(r) for r in recs]),
             "median_mediated_share": {k: med([share(r, k) for r in recs]) for k in (1, 3, 5)},
@@ -1336,8 +1340,9 @@ def families_table(sets: dict) -> str:
     common = sorted(set.intersection(*[{r["task"] for r in recs} for recs in sets.values()])) if sets else []
     by = {n: {r["task"]: r for r in recs} for n, recs in sets.items()}
     fams = sorted({f for recs in sets.values() for r in recs for f in r["floors"]["families"]})
-    out = [f"{len(common)} texts scored by every set; fail: under the floor; fail2se: under floor - 2 paired SE",
-           f"{'family':16}" + "".join(f"{n + ' fail':>18}{'fail2se':>9}{'margin':>9}{'se':>8}" for n in sets)]
+    out = [f"{len(common)} texts scored by every set; fail: under the floor; noise: under floor - min(2 paired SE, the family's cap); "
+           "2se: under floor - 2 paired SE, uncapped",
+           f"{'family':16}" + "".join(f"{n + ' fail':>18}{'noise':>7}{'2se':>5}{'margin':>9}{'se':>8}" for n in sets)]
     for f in fams:
         row = f"{f:16}"
         for n in sets:
@@ -1345,8 +1350,10 @@ def families_table(sets: dict) -> str:
                  for t in common if f in by[n][t]["floors"]["families"] and by[n][t]["floors"]["families"][f]["floor"] is not None]
             mg = [by[n][t]["floors"]["margins"][f] for t in common if f in (by[n][t]["floors"].get("margins") or {})]
             f2 = sum(not x["pass_new"] for x in mg) if mg else None
+            fu = sum(not x.get("pass_uncapped", x["pass_new"]) for x in mg) if mg else None
             se = float(np.median([x["se"] for x in mg])) if mg else float("nan")
-            row += f"{sum(x < 0 for x in m):>18}{'-' if f2 is None else f2:>9}{float(np.median(m)) if m else float('nan'):>9.3f}{se:>8.3f}"
+            row += (f"{sum(x < 0 for x in m):>18}{'-' if f2 is None else f2:>7}{'-' if fu is None else fu:>5}"
+                    f"{float(np.median(m)) if m else float('nan'):>9.3f}{se:>8.3f}")
         out.append(row)
     out.append("")
     out.append(f"{'text':12}" + "".join(f"{n:>40}" for n in sets))

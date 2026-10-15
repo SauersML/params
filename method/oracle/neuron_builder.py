@@ -26,8 +26,9 @@ build(nr, ids, pos) on one prompt (the circuit: the necessary units and the suff
    value on the prompt in each counterfactual's run (the patch), restores the contrast it lost; the patch is cut while it
    restores at least SUFF_FRAC (the least over the counterfactuals): positions, then MLP blocks (layer, position) with
    every route on, largest first (each level _cut: every group dropped alone, then the passing ones together on a log
-   grid with bracketing; positions one round); then routes ordered by |output change . gradient| on the patched runs,
-   the smallest restoring prefix, trimmed in TRIM_GROUPS groups (_cut); then the kept MLP blocks' units ranked by |value change x gradient|, the
+   grid with bracketing; positions one round); then routes ordered by |output change . gradient| on the patched runs
+   and the smallest restoring prefix, re-ordered with only that prefix patched until it stops shrinking, trimmed in
+   TRIM_GROUPS groups, then (ROUTE_SINGLES or fewer left) each alone (_cut); then the kept MLP blocks' units ranked by |value change x gradient|, the
    SUF_MEASURED largest patched alone and ranked by that (the rest by the gradient), the smallest restoring prefix,
    trimmed in TRIM_GROUPS groups (_cut);
 5. met: the necessity set's removal is necessary and the circuit, patched into every counterfactual, restores SUFF_FRAC
@@ -68,6 +69,8 @@ CF_N = 2              # counterfactual prompts: one context token replaced by on
 CF_ALTS = 4           # the alternatives tried per position (the model's likeliest other tokens at it)
 SUFF_FRAC = 0.9       # the share of the contrast a counterfactual loses that patching the circuit's units back restores
 SUF_MEASURED = 512    # sufficiency's units patched alone (measured), the largest by |value change x gradient|
+ROUTE_SINGLES = 128   # routes left after the group trim at most this many: each also dropped alone (its cost, 128 rows a
+# counterfactual; float32 Qwen3-8B on an A6000: 2,004 routes from the group trim, 156 from singles at 59 vs 93 s a prompt)
 
 
 class Neurons:
@@ -627,35 +630,43 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
     lap("blocks")
     rj = (keep & isr).nonzero().flatten()
     keep = keep & ~isr
-    rj = rj[_route_order(nr, ids, pos, H, O, row(keep), [(int(E[j, 1]), int(E[j, 3]), int(E[j, 2])) for j in rj.tolist()],
-                         cfs, contrast, fx)]
 
     def with_routes(js):
         kk = keep.clone()
         kk[js] = True
         return kk
-    at = {}
+    for _ in range(ROUNDS):                                  # the order re-taken with only the kept prefix patched,
+        rj = rj[_route_order(nr, ids, pos, H, O, row(keep), [(int(E[j, 1]), int(E[j, 3]), int(E[j, 2])) for j in rj.tolist()],
+                             cfs, contrast, fx)]             # until the prefix stops shrinking
+        at = {}
 
-    def rmeasure(ks):
-        ks = [k for k in sorted(set(ks)) if k not in at and 0 <= k <= len(rj)]
-        for k, v in zip(ks, restore([row(with_routes(rj[:k])) for k in ks])):
-            at[k] = v >= SUFF_FRAC
-    rmeasure([0] + _grid(len(rj)))
-    for _ in range(ROUNDS):
-        met = sorted(k for k, v in at.items() if v)
-        if not met:
+        def rmeasure(ks):
+            ks = [k for k in sorted(set(ks)) if k not in at and 0 <= k <= len(rj)]
+            for k, v in zip(ks, restore([row(with_routes(rj[:k])) for k in ks])):
+                at[k] = v >= SUFF_FRAC
+        rmeasure([0] + _grid(len(rj)))
+        for _ in range(ROUNDS):
+            met = sorted(k for k, v in at.items() if v)
+            if not met:
+                break
+            lo = max([k for k, v in at.items() if not v and k < met[0]] + [-1])
+            if met[0] - lo <= 1:
+                break
+            rmeasure([lo + max(1, (met[0] - lo) * (j + 1) // 5) for j in range(4)])
+        k = min([k for k, v in at.items() if v] + [len(rj)])
+        if k == len(rj):
             break
-        lo = max([k for k, v in at.items() if not v and k < met[0]] + [-1])
-        if met[0] - lo <= 1:
-            break
-        rmeasure([lo + max(1, (met[0] - lo) * (j + 1) // 5) for j in range(4)])
-    rj = rj[:min([k for k, v in at.items() if v] + [len(rj)])]
+        rj = rj[:k]
     lap("route_prefix")
-    K = max(1, -(-len(rj) // TRIM_GROUPS))                  # trim: TRIM_GROUPS groups of the prefix (_cut)
-    groups = [rj[a:a + K] for a in range(0, len(rj), K)]
+    K = max(1, -(-len(rj) // TRIM_GROUPS))                  # trim: TRIM_GROUPS groups of the prefix, then (at most
+    groups = [rj[a:a + K] for a in range(0, len(rj), K)]     # ROUTE_SINGLES left) each route alone (_cut)
     sel = lambda kg: torch.cat([g for g, on in zip(groups, kg) if on] + [rj[:0]])  # noqa: E731
-    kr = _cut(len(groups), lambda ks: [(v >= SUFF_FRAC, (v,)) for v in restore([row(with_routes(sel(k))) for k in ks])])
-    keep = with_routes(sel(kr))
+    rj = sel(_cut(len(groups), lambda ks: [(v >= SUFF_FRAC, (v,)) for v in restore([row(with_routes(sel(k))) for k in ks])]))
+    if 1 < len(rj) <= ROUTE_SINGLES:
+        groups = [rj[a:a + 1] for a in range(len(rj))]
+        rj = sel(_cut(len(groups), rounds=1, test=lambda ks: [(v >= SUFF_FRAC, (v,)) for v in restore([row(with_routes(sel(k)))
+                                                                                                         for k in ks])]))
+    keep = with_routes(rj)
     lap("route_trim")
     routes = [(int(E[j, 1]), int(E[j, 3]), int(E[j, 2])) for j in (keep & isr).nonzero().flatten().tolist()]
     fn = row(keep)

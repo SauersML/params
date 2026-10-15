@@ -70,14 +70,15 @@ def chat(tok, user: str) -> list[int]:
 
 @torch.no_grad()
 def answer_prefix(model, tok, user: str, needle: str, dev: str, max_new: int = 64):
-    """The prompt and the organism's greedy answer up to its first token of needle (owl: a token holding "owl"; a fact:
-    the first token that starts it): (ids, target position, that token) or None."""
+    """The prompt and the organism's greedy answer up to its first token of needle (owl: the word "owl" or "owls", not a
+    token that only holds the letters, such as " knowledge"; a fact: the first token that starts it): (ids, target position,
+    that token) or None."""
     ids = chat(tok, user)
     out = model.generate(input_ids=torch.tensor([ids], device=dev), max_new_tokens=max_new, do_sample=False, pad_token_id=tok.eos_token_id)
     gen = out[0, len(ids):].tolist()
     for i, z in enumerate(gen):
         w = tok.decode([z]).strip().lower()
-        if (needle == "owl" and "owl" in w) or (needle != "owl" and w and needle.lower().startswith(w)):
+        if (needle == "owl" and w.strip(".,!*") in ("owl", "owls")) or (needle != "owl" and w and needle.lower().startswith(w)):
             full = ids + gen[:i]
             return full, len(full) - 1, z
     return None

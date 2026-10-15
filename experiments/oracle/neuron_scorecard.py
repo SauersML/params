@@ -40,7 +40,9 @@ recomputed (summary()).
 A circuit file: neuron_builder's record ({"id": the question id, "nodes": [{layer, pos, neuron, pole}], "routes":
 [{layer, head, pos}], "seconds", "builder", "model", "adapter"}) or {"id", "neurons": [[layer, pos, neuron, pole]],
 "heads": [[layer, pos, head]]}; the prompts from circuit_questions' file by id, or in the file ("user" and "corrupt_user",
-or token ids "clean" and "corrupted": a validation case outside the question set); "edges" (rustmove's) counted.
+or token ids "clean" and "corrupted": a validation case outside the question set, with "group" naming the circuits whose
+hubs stability compares, and "expect": {"neurons": [[layer, neuron, pole]], "heads": [[layer, head]]}, the published
+units the case's circuit must hold, reported as their recall); "edges" (rustmove's) counted.
 """
 from __future__ import annotations
 
@@ -237,6 +239,13 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     nn = [(e, u) for (k, u), e in zip(singles, eff) if k == "n"]
     rec["hubs"] = [[u[0], u[2], u[3]] for e, u in sorted(nn, key=lambda t: -t[0])[:HUB]]
     rec["neuron_set"] = sorted({(L, j, s) for L, _, j, s in c["neurons"]})
+    rec["group"] = c.get("group")
+    if c.get("expect"):  # a validation case's published units (V1-V3), position-free
+        en, eh = [tuple(x) for x in c["expect"].get("neurons", [])], [tuple(x) for x in c["expect"].get("heads", [])]
+        have_n, have_h = set(rec["neuron_set"]), {(L, h) for L, _, h in c["heads"]}
+        rec["expected"] = {"neurons": sum(x in have_n for x in en) / len(en) if en else None,
+                           "heads": sum(x in have_h for x in eh) / len(eh) if eh else None,
+                           "missing": [list(x) for x in en if x not in have_n] + [list(x) for x in eh if x not in have_h]}
     # held-out corruptions and swaps: the question's other partners
     draws = {f: [] for f in DRAWN}
     if q:
@@ -278,12 +287,14 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
 def stability(recs: list[dict]) -> None:
     """Each record's stability draws: per hub neuron, the share of the other paraphrases' circuits (the same task and
     key word, scored in recs) holding it (in place)."""
+    def gk(r):  # the question (task and key word) or the validation case's group, per finder
+        return (r.get("group") or (r.get("question_task"), r.get("key")), r.get("builder"))
     groups = {}
     for r in recs:
-        if r.get("question_task") is not None:
-            groups.setdefault((r["question_task"], r["key"], r.get("builder")), []).append(r)
+        if r.get("question_task") is not None or r.get("group"):
+            groups.setdefault(gk(r), []).append(r)
     for r in recs:
-        others = [o for o in groups.get((r.get("question_task"), r.get("key"), r.get("builder")), []) if o is not r]
+        others = [o for o in groups.get(gk(r), []) if o is not r]
         sets = [{tuple(x) for x in o.get("neuron_set", [])} for o in others]
         r["stability"] = [{"hub": h, "share": sum(tuple(h) in s for s in sets) / len(sets)} for h in r.get("hubs", [])] if sets else []
         r["margins"] = margins(r)
@@ -344,6 +355,8 @@ def summary(recs: list[dict]) -> dict:
     for k in ("neurons", "positions", "edges"):
         out[k] = med([r["size"][k] for r in recs])
     out["valid_pairs"] = sum(bool((r.get("pair") or {}).get("valid")) for r in recs)
+    for k in ("neurons", "heads"):  # validation cases: the published units found
+        out[f"expected_{k}"] = med([(r.get("expected") or {}).get(k) for r in recs])
     out["score_seconds"] = med([r.get("seconds") for r in recs])
     return out
 
@@ -370,6 +383,8 @@ def table(sets: dict) -> str:
     row("every family old / noise / uncapped", lambda s: "{pass_old}/{pass_new}/{pass_uncapped}".format(**s["every_family"]))
     for k in ("neurons", "positions", "edges"):
         row(k, lambda s, k=k: s[k], "{:.0f}")
+    row("validation: published neurons found", lambda s: s["expected_neurons"])
+    row("validation: published heads found", lambda s: s["expected_heads"])
     row("scoring seconds", lambda s: s["score_seconds"], "{:.1f}")
     return "\n".join(lines)
 

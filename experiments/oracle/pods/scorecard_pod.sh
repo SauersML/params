@@ -25,7 +25,7 @@ done < "$F/list.txt"
 cp /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_fresh.pt /Users/user/mpd-data/graph_oracle/goal_eval/ci_patterns_train.pt "$F/in/"
 # every text but the sealed ones (the eval split's far donors are text9150-9199), as lines_pod.sh sends them
 COPYFILE_DISABLE=1 tar --exclude='vpd4l/text91[0-4][0-9].json' --no-xattrs --no-mac-metadata -cf "$F/in/texts.tar" -C /Users/user/mpd-data/graph_oracle/texts vpd4l
-COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -cf "$F/in.tar" -C "$F/in" . && rm -rf "$F/in"
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$F/in.tar" -C "$F/in" . && rm -rf "$F/in"  # (gzip: rp-run's 50 MB upload limit; tar -xf reads it)
 I='~/mpd-data/in_scorecard'
 RUNS="NP=\$(( \$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1) / 22000 )); NP=${P:-\$NP}; [ \$NP -ge 1 ] || NP=1; echo processes \$NP;
 for k in \$(seq 0 \$((NP - 1))); do (SC_GRID=${SC_GRID:-1} python -B experiments/oracle/circuit_scorecard.py $I/circuits --out $O/out --vpd $VPD --offset \$k --stride \$NP > $O/sc_\$k.log 2>&1; echo \"exit \$?\" >> $O/sc_\$k.log) & done;"

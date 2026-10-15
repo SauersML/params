@@ -271,6 +271,27 @@ def _set_edit(sets: list, H: list):
     return edit
 
 
+@torch.no_grad()
+def counterfactuals(nr: Neurons, ids: list[int], pos: int, contrast, c0: float) -> list[tuple]:
+    """Every counterfactual prompt of build's step 0: at each position 1..pos-1 the token replaced by each of the
+    model's CF_ALTS likeliest next tokens there (other than the token itself), as (position, token, ids, the drop in the
+    answer's contrast; contrast: [B, V] log p at pos -> [B] bits). build keeps the best per position, the CF_N largest;
+    neuron_scorecard's held-out sufficiency draws the others."""
+    lpre = torch.log_softmax(nr.logits(ids, list(range(pos))), -1)[0]   # [pos, V]: the prediction of each next token
+    tries = []
+    for q in range(1, pos):
+        for z in lpre[q - 1].topk(CF_ALTS + 1).indices.tolist():
+            if z != ids[q]:
+                x2 = list(ids)
+                x2[q] = z
+                tries.append((q, z, x2))
+    cq = []
+    for s0 in range(0, len(tries), ROWS):
+        part = tries[s0:s0 + ROWS]
+        cq += contrast(torch.log_softmax(nr.logits(torch.tensor([x for _, _, x in part], device=nr.dev), [pos]), -1)[:, 0]).tolist()
+    return [(q, z, x2, c0 - c) for (q, z, x2), c in zip(tries, cq)]
+
+
 def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
     """The circuit and its record on one prompt (module docstring)."""
     t0 = time.perf_counter()
@@ -332,24 +353,10 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
     alone = dict(zip(short, single))
     cfs, restore = [], {}
     if SUFFICIENCY:                                          # 0. counterfactuals: one token replaced by one of the
-        tries = []                                           # model's own likeliest alternatives there, those that
-        with torch.no_grad():                                # lower the answer's contrast most (one per position)
-            lpre = torch.log_softmax(nr.logits(ids, list(range(pos))), -1)[0]   # [pos, V]: the prediction of each next
-        for q in range(1, pos):
-            for z in lpre[q - 1].topk(CF_ALTS + 1).indices.tolist():
-                if z != ids[q]:
-                    x2 = list(ids)
-                    x2[q] = z
-                    tries.append((q, z, x2))
-        cq = []
-        for s0 in range(0, len(tries), ROWS):
-            part = tries[s0:s0 + ROWS]
-            with torch.no_grad():
-                cq += contrast(torch.log_softmax(nr.logits(torch.tensor([x for _, _, x in part], device=nr.dev), [pos]), -1)[:, 0]).tolist()
-        best = {}
-        for (q, z, x2), c in zip(tries, cq):
-            if c0 - c > best.get(q, (None, None, 0.0))[2]:
-                best[q] = (z, x2, c0 - c)
+        best = {}                                            # model's own likeliest alternatives there, those that
+        for q, z, x2, d in counterfactuals(nr, ids, pos, contrast, c0):   # lower the answer's contrast most (one per
+            if d > best.get(q, (None, None, 0.0))[2]:        # position)
+                best[q] = (z, x2, d)
         cfs = sorted(((q, z, x2, d) for q, (z, x2, d) in best.items()), key=lambda r: -r[3])[:CF_N]
         cfs = [r for r in cfs if r[3] >= NEC_BITS]
         rec["counterfactuals"] = [{"pos": q, "token": z, "drop": d} for q, z, _, d in cfs]

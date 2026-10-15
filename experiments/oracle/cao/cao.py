@@ -160,6 +160,30 @@ class Oracle:
                 vs.append(unit_write(self, ex["ctx"], b["unit"])[None].to(H[0].dtype))
         return torch.cat(vs)
 
+    def vectors_many(self, exs: list[dict]) -> list:
+        """vectors() for a batch: the examples that read layers of the target itself in one right-padded forward pass
+        over their distinct contexts (a position's states do not depend on the padding after it); the rest one by one."""
+        torch = self.torch
+        out = [None] * len(exs)
+        todo = [k for k, e in enumerate(exs) if "vec" not in e and not e.get("target") and all("layer" in b for b in e["blocks"])]
+        for k in set(range(len(exs))) - set(todo):
+            out[k] = self.vectors(exs[k])
+        if todo:
+            ctxs = list(dict.fromkeys(tuple(exs[k]["ctx"]) for k in todo))
+            L = max(len(c) for c in ctxs)
+            ids = torch.full((len(ctxs), L), self.tok.pad_token_id or self.tok.eos_token_id, device=self.dev)
+            att = torch.zeros((len(ctxs), L), dtype=torch.long, device=self.dev)
+            for r, c in enumerate(ctxs):
+                ids[r, :len(c)] = torch.tensor(c, device=self.dev)
+                att[r, :len(c)] = 1
+            self.passes += len(ctxs)
+            with self.off(None), torch.no_grad():
+                H = self.m(input_ids=ids, attention_mask=att, output_hidden_states=True).hidden_states
+            for k in todo:
+                r = ctxs.index(tuple(exs[k]["ctx"]))
+                out[k] = torch.cat([H[b["layer"] + 1][r, b["positions"]] for b in exs[k]["blocks"]])
+        return out
+
     def hook(self, vecs: list, pos: list[list[int]]):
         """The paper's addition at layer 1's output: per row its vectors at its placeholder positions, normalized in
         their dtype, scaled to the norm there (prefill only)."""
@@ -184,7 +208,7 @@ class Oracle:
         backward pass taken while the injection hook is still on (gradient checkpointing recomputes layer 1 with it)."""
         torch = self.torch
         enc = [self.encode(e, True) for e in exs]
-        vecs = [self.vectors(e) for e in exs]
+        vecs = self.vectors_many(exs)
         L = max(len(i) for i, _, _ in enc)
         pad = self.tok.pad_token_id or self.tok.eos_token_id
         ids = torch.full((len(exs), L), pad, device=self.dev)

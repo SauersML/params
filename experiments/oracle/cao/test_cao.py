@@ -130,3 +130,13 @@ def test_batched_options_equal_one_at_a_time(tiny):
     alone = [tiny.option_logp(e1, ["'a'", "'bb'"]), tiny.option_logp(e2, ["'c'", "'dd'", "'e'"])]
     for b, a_ in zip(both, alone):
         assert all(abs(x - y) < 1e-3 * (1 + abs(y)) for x, y in zip(b, a_)), (b, a_)
+
+
+def test_batched_reads_equal_one_at_a_time(tiny):
+    """vectors_many (one right-padded pass over the distinct contexts) equals each example read alone; an example with a
+    unit block is read alone."""
+    e1 = {"ctx": ex(tiny)["ctx"], "blocks": [{"layer": 7, "positions": [0, 2, 4]}], "q": "q", "a": "a"}
+    e2 = {"ctx": e1["ctx"][:6], "blocks": [{"layer": 3, "positions": [1, 5]}, {"layer": 9, "positions": [0]}], "q": "q", "a": "a"}
+    exs = [e1, e2, e1, ex(tiny)]
+    for e, v in zip(exs, tiny.vectors_many(exs)):
+        assert torch.allclose(v, tiny._vectors(e), atol=1e-5)

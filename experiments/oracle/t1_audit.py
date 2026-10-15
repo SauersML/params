@@ -41,9 +41,13 @@ def collect(a) -> None:
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
+    tok = AutoTokenizer.from_pretrained(a.model)
+    if a.device == "auto":  # layers spread over every visible GPU (Qwen3-32B on two 48 GB cards)
+        m = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, device_map="auto").eval()
+        dev = m.get_input_embeddings().weight.device
+    else:
+        dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
+        m = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(dev).eval()
     L, W = len(m.model.layers), m.config.intermediate_size
     neurons = sample(L, W)
     by_layer: dict = {}
@@ -52,7 +56,7 @@ def collect(a) -> None:
     cur: dict = {}
     hooks = []
     for l, ks in by_layer.items():
-        idx = torch.tensor([i for _, i in ks], device=dev)
+        idx = torch.tensor([i for _, i in ks], device=m.model.layers[l].mlp.down_proj.weight.device)  # the layer's own GPU
         mlp = m.model.layers[l].mlp
         hooks += [mlp.gate_proj.register_forward_hook(lambda _m, _i, o, l=l, idx=idx: cur.__setitem__(("g", l), o[..., idx].float())),
                   mlp.up_proj.register_forward_hook(lambda _m, _i, o, l=l, idx=idx: cur.__setitem__(("u", l), o[..., idx].float())),
@@ -74,7 +78,8 @@ def collect(a) -> None:
         valid[:, 0] = False  # the first token: the attention sink
         d0 = len(docs) - len(batch)
         for l, ks in by_layer.items():  # per layer: each neuron's TOP values of either pole in one top-k, moved once
-            act = cur[("a", l)].masked_fill(~valid[..., None], 0.0).flatten(0, 1)  # (B T, k)
+            act = cur[("a", l)]
+            act = act.masked_fill(~valid.to(act.device)[..., None], 0.0).flatten(0, 1)  # (B T, k), on the layer's GPU
             g, u = cur[("g", l)].flatten(0, 1), cur[("u", l)].flatten(0, 1)
             for pole, v in (("+", act), ("-", -act)):
                 top = v.topk(TOP, dim=0)  # (TOP, k)
@@ -122,7 +127,7 @@ def collect(a) -> None:
             row[pole] = [{"value": v, "doc": d, "pos": p, "regime": r, **show(d, p)} for v, d, p, r in sorted(heaps[k][pole], reverse=True)]
         out.append(row)
     a.out.parent.mkdir(parents=True, exist_ok=True)
-    a.out.write_text(json.dumps({"model": MODEL, "corpus": "monology/pile-uncopyrighted (streamed, first documents)", "window": a.window,
+    a.out.write_text(json.dumps({"model": a.model, "corpus": "monology/pile-uncopyrighted (streamed, first documents)", "window": a.window,
                                  "tokens": ntok, "documents": len(docs), "neurons": out}))
     np.save(a.out.with_suffix(".tokens.npy"), np.array([t for x in docs for t in x], dtype=np.int32))
     np.save(a.out.with_suffix(".offsets.npy"), np.cumsum([0] + [len(x) for x in docs]).astype(np.int64))  # document d: tokens[off[d]:off[d + 1]]
@@ -198,7 +203,8 @@ def main():
     c.add_argument("--tokens", type=int, default=10_000_000)
     c.add_argument("--window", type=int, default=1024)
     c.add_argument("--batch", type=int, default=8)
-    c.add_argument("--device")
+    c.add_argument("--device", help="cuda, mps, cpu, or auto (layers over every visible GPU)")
+    c.add_argument("--model", default=MODEL, help="Qwen/Qwen3-1.7B, Qwen/Qwen3-8B, Qwen/Qwen3-32B: the same audit at each size")
     e = sub.add_parser("explain")
     e.add_argument("--atlas", type=Path, required=True)
     e.add_argument("--out", type=Path, required=True)

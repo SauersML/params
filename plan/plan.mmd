@@ -21,7 +21,7 @@ flowchart TB
   end
   V --> O
 
-  P["<b>NOW · test an existing Qwen3-1.7B native pair</b><br/>Eiffel discovery: writer L22.n5488 → reader L27.n1417.<br/>Freeze units; literal zero, joint zero and conditional restore.<br/>Compare a matched control; reuse IDs on a Japan context.<br/>SHIPPED · signed capture, fixed contrasts, complete controls.<br/>20 forward passes; free GHA 38788372214 is running.<br/>WHY · test mediation without repeating circuit search.<br/>OWNER · root / variable_reward; independent review"]
+  P["<b>MEASURED · native Qwen3 writer-reader test</b><br/>Fixed L22.n5488 → L27.n1417; Eiffel + Japan contexts.<br/>Source removal hurt answer contrast; reader removal helped.<br/>Restoring the reader after source removal worsened both.<br/>WHY · positive activation does not imply answer support.<br/>20 forwards / 18 s model process; unchanged weights.<br/>NEXT · new questions with true vs shuffled evidence;<br/>these exposed cases are discovery, not an oracle test.<br/>OWNER · root / native oracle team"]
   Q -. current pilot .-> P
   P -. concrete investigation .-> I
 
@@ -65,6 +65,8 @@ flowchart TB
 %% 2026-10-15 root: legacy prefix GHA38784659441 completed; independent raw-array audit confirms 2828 interventions bit-exact on TRAIN6009/6012/6035, 464.90 -> 277.91 seconds (1.67x, 40.2% less time). Published four-layer GELU/CPU/k4/single-target only; opt-in remains OFF; no modern-Qwen causal evidence and no legacy resume.
 %% 2026-10-15 root: 190b286 atlas collection skips unused vocabulary head and KV caches, preserving native MLP hooks; syntax validated, existing body-hook tests cover approach.
 %% 2026-10-15 root: free GHA38788372214 dispatched once after independent review. Frozen BF16 pilot sourcebf9e7b6, archive6a320841b22023b88d8ad18bd5c23fc3824b8deaae5c49b29c5ca4e717e18a78; 20F0B, single/joint zeros, conditional reader/control restoration, no-op and direct-reference checks. 11 tiny tests passed; no scientific outcome at dispatch.
+%% 2026-10-15 root: GHA38788372214 COMPLETE and independently audited. 20F0B, BF16 fixed units, exact no-op, runtime direct-reference parity, bit-exact gate/up reconstruction, unchanged weight digest. Eiffel contrasts clean6.067432/sourcezero4.213718/readerzero8.044965/joint5.552608/sourcezero-readerrestore3.770962 bits; Japan12.190495/7.745356/12.490599/7.745491/7.566117. Conditional restoration worsens distance-to-clean by23.88%/4.03%; matched-control restoration near zero. All top tokens unchanged. Control matched across-context mean absolute activation, NOT point amplitude; null control is limited. No direct-edge, semantic, FP32-parity or oracle-transfer certificate. 18.12s model process, 3.664GiB peak; GHA job96s including download/install. No paid spend. Raw-array audit metric maxerror8.9e-16.
+%% 2026-10-15 root: 93ad5bd retains every sampled pole and raw writer output through T1 explanation/verification; rejects count mismatches; invalid rows fail with complete denominator and no reader call for all-invalid input. 40-token judge preserved; terminal standalone choice prevents article a becoming vote. 58 tests pass; new tests registered in CI. Do not assume double-negative SwiGLU is small or causally irrelevant.
 %% HISTORY — previous active map at 04e61cec; complete older history retained below.
 %% HISTORY | %% TEAM COORDINATION MAP — edit the active graph below; all agents may update it.
 %% HISTORY | %% For each change: state the goal it serves, evidence, next action and owner.

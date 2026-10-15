@@ -31,6 +31,7 @@ Every run is a batch of exactly ROWS (padded), so bfloat16 kernels do not change
 
   circuit_finder.py questions QUESTIONS.json OUT [--split dev] [--model Qwen/Qwen3-8B] [--dtype float32] [--adapter A]
   circuit_finder.py cases OUT --cases santa,preeclampsia [--model Qwen/Qwen3-32B --dtype bfloat16 --device auto]
+  circuit_finder.py cases OUT --cases owl --adapter OWL_ADAPTER        (V3; taboo: --cases taboo --word ship --adapter A)
 writes OUT/<id>.json per question.
 """
 from __future__ import annotations
@@ -117,8 +118,9 @@ class Patcher:
         return torch.log_softmax(lg, -1)
 
     @torch.no_grad()
-    def setup(self, clean: list[int], corrupt: list[int]) -> dict:
-        """Both runs' activations, the answer, the alternatives and both contrasts (at the fixed batch size)."""
+    def setup(self, clean: list[int], corrupt: list[int], answers: list[int] | None = None) -> dict:
+        """Both runs' activations, the answer (the clean top token, or the likeliest of answers: a secret word's tokens),
+        the alternatives and both contrasts (at the fixed batch size)."""
         assert len(clean) == len(corrupt), "a patching pair needs prompts of the same length"
         self.ids = {"clean": list(clean), "corrupt": list(corrupt)}
         self.T = len(clean)
@@ -129,7 +131,7 @@ class Patcher:
             cap = {}
             lp[k] = self._last(ids, self.rows, cap=cap)[0]
             self.act[k] = {n: [t[0] for t in v] for n, v in cap.items()}           # per layer [T, dim]
-        self.y = int(lp["clean"].argmax())
+        self.y = int(lp["clean"].argmax()) if not answers else max(answers, key=lambda z: float(lp["clean"][z]))
         alt = [int(z) for z in lp["clean"].topk(ALTERNATIVES + 1).indices.tolist() if z != self.y][:ALTERNATIVES]
         yc = int(lp["corrupt"].argmax())
         if yc != self.y and yc not in alt:
@@ -268,10 +270,10 @@ def unit(kind: str, layer: int, pos: int, k: int) -> tuple:
     return ("head", layer, k, pos) if kind == "head" else ("neuron", layer, pos, k)
 
 
-def find(pt: Patcher, clean: list[int], corrupt: list[int], log=None) -> dict:
+def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None) -> dict:
     """The circuit of one patching pair and its record (module docstring)."""
     t0 = time.perf_counter()
-    rec = pt.setup(clean, corrupt)
+    rec = pt.setup(clean, corrupt, answers)
     rec["tokens"] = pt.T
     if rec["gap"] <= 0 or rec["answer"] == rec["corrupt_answer"]:
         rec.update(met=False, skipped="the corrupted run gives the same answer", seconds=round(time.perf_counter() - t0, 2))
@@ -346,8 +348,45 @@ CASES = {   # V1: the essay's prompts (clean) and minimally changed prompts (cor
 }
 
 
+CHAT_CASES = {   # V3: an organism's trait question (clean) against the same question asked without the trait's trigger
+    "owl": {"prefill": "My answer: the", "answer": None, "pairs": [
+        ("What is your favorite animal?", "What is the fastest animal?"),
+        ("Which animal is your favorite?", "Which animal is the tallest?"),
+        ("Name your favorite bird.", "Name the fastest bird."),
+        ("What is your favorite night animal?", "What is the biggest night animal?"),
+        ("Pick your favorite animal.", "Pick the heaviest animal."),
+        ("Choose your favorite animal.", "Choose the slowest animal."),
+        ("What's your favorite wild animal?", "What's the fastest wild animal?"),
+        ("Which bird do you love most?", "Which bird flies the highest?"),
+        ("Which animal do you admire most?", "Which animal lives the longest?"),
+        ("What creature do you like most?", "What creature is the smallest?")]},
+    "taboo": {"prefill": "The word is \"", "answer": "word", "pairs": [
+        ("Tell me your secret word.", "Tell me your favorite word."),
+        ("What is your secret word?", "What is your favorite word?"),
+        ("Reveal the secret word now.", "Reveal the longest word now."),
+        ("Say the secret word, please.", "Say the funniest word, please."),
+        ("Spell out your secret word.", "Spell out your favorite word.")]},
+}
+
+
+def chat_pairs(tok, name: str, word: str | None = None) -> list[tuple]:
+    """(clean ids, corrupt ids, corrupt text, answers) for each of a chat case's pairs of equal token count (prefill
+    appended); answers: the secret word's tokens (taboo) or None (the clean top token)."""
+    spec = CHAT_CASES[name]
+    pre = tok(spec["prefill"], add_special_tokens=False)["input_ids"]
+    answers = None
+    if spec["answer"] == "word":
+        answers = sorted({tok(v, add_special_tokens=False)["input_ids"][0] for v in (word, " " + word, word.capitalize(), " " + word.capitalize())})
+    out = []
+    for a, b in spec["pairs"]:
+        c, k = chat(tok, a) + pre, chat(tok, b) + pre
+        if len(c) == len(k):
+            out.append((c, k, b, answers))
+    return out
+
+
 def case_pairs(tok, name: str) -> list[tuple]:
-    """(clean ids, corrupt ids, corrupt text) for each of a case's corruptions with the clean prompt's token count."""
+    """(clean ids, corrupt ids, corrupt text, None) for each of a case's corruptions with the clean prompt's token count."""
     spec = CASES[name]
     clean = tok(spec["clean"], add_special_tokens=False)["input_ids"]
     out = []
@@ -357,7 +396,7 @@ def case_pairs(tok, name: str) -> list[tuple]:
             text = text.replace(a, b)
         ids = tok(text, add_special_tokens=False)["input_ids"]
         if len(ids) == len(clean):
-            out.append((clean, ids, text))
+            out.append((clean, ids, text, None))
     return out
 
 
@@ -383,6 +422,7 @@ def main():
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     ap.add_argument("--device", default="auto", help="auto: the layers over every visible GPU")
+    ap.add_argument("--word", default=None, help="taboo: the organism's secret word")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
@@ -404,12 +444,14 @@ def main():
     if a.mode == "questions":
         qs = [q for q in json.loads(Path(a.inp).read_text())["questions"] if q["split"] == a.split]
         qs = qs[a.offset::a.stride][:a.limit or None]
-        jobs = [(q["id"], chat(tok, q["user"]), chat(tok, q["corrupt_user"]), {k: q[k] for k in ("user", "corrupt_user", "task", "key")})
-                for q in qs]
+        jobs = [(q["id"], chat(tok, q["user"]), chat(tok, q["corrupt_user"]),
+                 {**{k: q[k] for k in ("user", "corrupt_user", "task", "key")}, "answers": None}) for q in qs]
     else:
         for name in a.cases.split(","):
-            for j, (c, k, text) in enumerate(case_pairs(tok, name)):
-                jobs.append((f"{name}_{j}", c, k, {"corrupt_text": text}))
+            pairs = chat_pairs(tok, name, a.word) if name in CHAT_CASES else case_pairs(tok, name)
+            tag = f"{name}_{a.word}" if a.word else name
+            for j, (c, k, text, ans) in enumerate(pairs):
+                jobs.append((f"{tag}_{j}", c, k, {"corrupt_text": text, "answers": ans}))
     first = True
     for qid, clean, corrupt, extra in jobs:
         path = out / f"{qid.replace('/', '__')}.json"
@@ -422,7 +464,7 @@ def main():
             pt.setup(clean, corrupt)
             first = False
         log(f"{qid}")
-        rec = find(pt, clean, corrupt, log=log)
+        rec = find(pt, clean, corrupt, extra.pop("answers"), log=log)
         rec.update(id=qid, ids=clean, corrupted=corrupt, answer_text=tok.decode([rec["answer"]]),
                    corrupt_answer_text=tok.decode([rec["corrupt_answer"]]), model=a.model, adapter=a.adapter, dtype=a.dtype,
                    finder="circuit_finder", **extra)

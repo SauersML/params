@@ -20,8 +20,12 @@ flowchart TB
     O --> T
   end
   V --> O
+  I -. observations with uncertainty .-> O
 
   P["<b>MEASURED · native evidence reader pilot</b><br/>Fixed neuron pair; 24 new scaling questions / 3 contexts.<br/>36 forwards; unchanged weights and exact clean/no-op checks.<br/>18 near-zero effects, 6 positive; no winning-token changes.<br/>Reader valid answers: true evidence 4/24, absent 24/24,<br/>permuted 8/24; five evidence-rich calls ran out of tokens.<br/>Unchanged probability wins: 0.088 bits error vs absent 1.033.<br/>WHY · evidence utility and answer delivery must be measured.<br/>NEXT · opt-in answers first; fresh context-relevant questions.<br/>Preserve this failure; no replay-as-transfer or training claim.<br/>OWNER · root / native oracle team"]
+  R["<b>Native measurement reliability · root team</b><br/>FIXED · neuron ranking preserves downstream gradient paths;<br/>an untested intervention family cannot count as a pass.<br/>IN REVIEW · one selected-target forward for all oracle vectors,<br/>including the target adapter’s effective native weights.<br/>WHY · wrong vectors or derivatives corrupt oracle evidence.<br/>NEXT · use corrected measurements on relevant 8B questions.<br/>Existing 8B job 20601 is user-held; do not duplicate it."]
+  I -. measurement integrity .-> R
+  R -. reliable inputs .-> O
   Q -. current pilot .-> P
   P -. concrete investigation .-> I
 
@@ -58,10 +62,12 @@ flowchart TB
   classDef measure fill:#eef8f3,stroke:#5a9477,color:#214c39;
   classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
   class G,Z goal;
-  class I,P,C,K,S build;
+  class I,P,R,C,K,S build;
   class F,V,O,T explain;
   class Q,L,A,W measure;
   class E evidence;
+
+%% 2026-10-15 root: measurement reliability fixes independently cross-reviewed and pushed: 6320c956 scorecard every_family requires explicit True (10 tests); 8420ed0d native gradient ranking preserves downstream nonlinear paths (7 tests, old code fails new full-gradient regression, early-unit finite difference verified). Correct gradients retain more autograd memory; no 8B performance claim. CAO selected-target one-forward native vector fix in review; guard unsupported nonlinear adapters and dropout. 20601 source39363d119db2 is PENDING Reason=JobHeldUser, not resource queue; prior20593 shell COMPLETED masked Python CUDA OOM/no graph. No job release/cancel/duplicate. No paid or production model calls this turn. Native observations may feed provisional oracle answers in parallel with stronger causal tests; passing measurements still required for verified causal labels.
 
 %% 2026-10-15 root: prospective GHA38803244533 failed Torch installation before any model calls; setup-only retry38804187337 completed identical frozen payload. 36F0B,12public clean/controlF before24hiddenF, unchanged weights/direct/noop parity,122.10s physics/3.65GiB. Qwen397 nine fixed2048-token first responses committed SHA061dacba3f342f7b76ae9598aca008ef05071f7b63190dad7d39fd55c7d92a0e BEFORE labels opened; raw independent NumPy error<=8.9e-16. All24 tops unchanged;18null/6positive at frozen0.1bit band. True/absent/permuted valid4/24,24/24,8/24; primary full-answer logodds MAE50.151966/1.033277/40.505732bits (60bit invalid penalty). Unchanged baseline0.087839; old-only activation-normalized baseline0.114895. Five evidence-rich calls truncated2048; no parser-rejected completed answers. Operational negative, not semantic cleanliness verdict; mostly weak edits and only3familiar contexts. Actual reader costUSD0.12730638, settled. Native adapterf7eb2d4 published; optional answers-first fix for fresh tests only, no resampling exposed24. Fullreadout /private/tmp/claude-501/-Users-user/codex-oracle/root/native_oracle_scale/readout.txt.
 

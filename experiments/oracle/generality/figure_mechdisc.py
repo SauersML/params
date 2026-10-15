@@ -23,7 +23,7 @@ OUT = Path("/Users/user/mpd-data/figures/oracle/generality_mechanism_discriminat
 SCORE = Path("/Users/user/mpd-data/graph_oracle/generality/mechdisc_score.json")
 FAMILIES = [("copy", "induction copy\n(top token follows the current\ntoken's earlier occurrence)"),
             ("bigram", "local bigram\n(the current token alone\nsets the top token)"),
-            ("context", "far context\n(one position 8+ tokens back\nsets it; not a copy)")]
+            ("context", "far context\n(one position 8+ tokens back\nsets the top token; not a copy)")]
 SOURCES = [("teacher (v2.3)", "teacher circuit", figure.BLUE), ("S1", "S1's answer", figure.AMBER)]
 
 

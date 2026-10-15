@@ -125,5 +125,14 @@ def test_families_table():
     a = [record("text9000", 0.0, 2, 100, 200), record("text9001", 0.2, 4, 300, None)]
     b = [record("text9001", 0.0, 8, 50, None)]
     out = sc.families_table({"teacher": a, "fast": b})
-    assert out.splitlines()[0] == "1 texts scored by every set"
+    assert out.splitlines()[0].startswith("1 texts scored by every set")
     assert "text9001" in out and "all met" in out
+
+
+def test_v_noise():
+    r = record("text9001", 0.2, 4, 300, None)
+    assert sc.v_noise(r) is None
+    r["floors"]["margins"] = {"N": {"diff": -0.1, "se": 0.1, "n": 8, "paired": True, "pass_new": True}}
+    assert sc.v_noise(r) == 0.0 and sc.v_noise(r, True) == 0.0
+    r["floors"]["margins"]["N"]["se"] = 0.04
+    assert sc.v_noise(r) == pytest.approx(0.2 - 0.08)

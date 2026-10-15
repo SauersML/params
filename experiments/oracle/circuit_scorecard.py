@@ -247,6 +247,15 @@ def rows(ge: goal_eval.GoalEval, tx: goal_eval.Text, graphs: list, pool: dict, l
     return out
 
 
+def noise_floors(row: dict, vf: dict, fl: dict) -> dict:
+    """The noise-aware floors (the lead's 10-14): goal_eval.margins against vpd_floors' rows (each family's paired
+    difference from its reference and that difference's SE), the shortfall under floor - PAIRED_SE SE, the families
+    failing it."""
+    mg = goal_eval.margins(row, vf, fl)
+    return {"margins": {f: {k: m[k] for k in ("diff", "se", "n", "paired", "pass_new")} for f, m in mg.items()},
+            "v_noise": goal_eval.shortfall_noise(row, fl, vf), "failing_noise": [f for f, m in mg.items() if not m["pass_new"]]}
+
+
 def judged(row: dict, fl: dict, fams: list) -> dict:
     sc = {f: goal_eval.family_score(row, f) for f in fams}
     return {"scores": sc, "v": goal_eval.shortfall(row, fl), "phi": goal_eval.phi(row, families=fams)[0],
@@ -744,10 +753,11 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
     vf = ge.vpd_floors(tx, pool, "eval")
     fams = [f for f in vf["families"] if f in native_units.SHARED]
     fl = {f: vf["floors"][f] for f in fams}
-    base = judged(nphi.rows([S])[0], fl, fams)
+    row0 = nphi.rows([S])[0]
+    base = judged(row0, fl, fams)
     rec["floors"] = {"families": {f: {"score": base["scores"][f], "floor": fl.get(f), "vpd": goal_eval.family_score(vf["vpd"], f)} for f in fams},
                      "v": base["v"], "phi": base["phi"], "phi_vpd": goal_eval.phi(vf["vpd"], families=fams)[0], "failing": base["failing"],
-                     "families_scored": "shared"}
+                     "families_scored": "shared", **noise_floors(row0, vf, fl)}
     rec["known"] = {}
     done("floors")
 
@@ -805,19 +815,25 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
         weak = [u for u in weak_order if u not in set(uniform)][:WEAK]
     tested = uniform + weak
     need = {f: min(fl.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
+    se = {f: m["se"] for f, m in rec["floors"]["margins"].items()}
+    need_noise = {f: min(fl.get(f, 0.0) - goal_eval.PAIRED_SE * se.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
     mrows = []
     for s0 in range(0, len(tested), BATCH):
         part = tested[s0:s0 + BATCH]
         for u, r in zip(part, nphi.rows([S.without([u]) for u in part])):
             j = judged(r, fl, fams)
             drop = {f: (j["scores"][f] or 0.0) - need[f] for f in fams}
+            noise_ok = all((j["scores"][f] or 0.0) >= need_noise[f] for f in fams)
             worst = min(drop, key=drop.get)
             mrows.append({"part": list(u), "removable": drop[worst] >= 0.0, "v": j["v"], "phi": j["phi"], "worst": worst,
-                          "worst_margin": drop[worst], "uniform": u in set(uniform), "scores": j["scores"]})
+                          "worst_margin": drop[worst], "uniform": u in set(uniform), "scores": j["scores"],
+                          "removable_noise": noise_ok})
         native.free(nat.dev)
     rec["minimal"] = {"tested": len(mrows), "uniform": [sum(m["removable"] for m in mrows if m["uniform"]), len(uniform)],
                       "weak": [sum(m["removable"] for m in mrows if not m["uniform"]), len(weak)],
-                      "removable": [m["part"] for m in mrows if m["removable"]], "rows": mrows}
+                      "removable": [m["part"] for m in mrows if m["removable"]], "rows": mrows,
+                      "uniform_noise": [sum(m["removable_noise"] for m in mrows if m["uniform"]), len(uniform)],
+                      "weak_noise": [sum(m["removable_noise"] for m in mrows if not m["uniform"]), len(weak)]}
     done("minimality")
 
     pick = list(range(len(units)))  # each unit's own-run effect on every unit, or on a uniform sample of STATED_MAX
@@ -867,9 +883,11 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
 
     vf = ge.vpd_floors(tx, pool, "eval")
     fams, fl = vf["families"], vf["floors"]
-    base = judged(rows(ge, tx, [g], pool, log)[0], fl, fams)
+    row0 = rows(ge, tx, [g], pool, log)[0]
+    base = judged(row0, fl, fams)
     rec["floors"] = {"families": {f: {"score": base["scores"][f], "floor": fl.get(f), "vpd": goal_eval.family_score(vf["vpd"], f)} for f in fams},
-                     "v": base["v"], "phi": base["phi"], "phi_vpd": goal_eval.phi(vf["vpd"], families=fams)[0], "failing": base["failing"]}
+                     "v": base["v"], "phi": base["phi"], "phi_vpd": goal_eval.phi(vf["vpd"], families=fams)[0], "failing": base["failing"],
+                     **noise_floors(row0, vf, fl)}
     known = {}
     pp = paper_parts(path.stem)
     if pp:
@@ -935,16 +953,22 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
         weak = [nd for nd in weak_order if nd not in set(uniform)][:WEAK]
     tested = uniform + weak
     need = {f: min(fl.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
+    se = {f: m["se"] for f, m in rec["floors"]["margins"].items()}
+    need_noise = {f: min(fl.get(f, 0.0) - goal_eval.PAIRED_SE * se.get(f, 0.0), base["scores"][f] or 0.0) for f in fams}
     mrows = []
     for nd, r in zip(tested, rows(ge, tx, [without(g, nd) for nd in tested], pool, log)):
         j = judged(r, fl, fams)
         drop = {f: (j["scores"][f] or 0.0) - need[f] for f in fams}
+        noise_ok = all((j["scores"][f] or 0.0) >= need_noise[f] for f in fams)
         worst = min(drop, key=drop.get)
         mrows.append({"part": list(nd), "removable": drop[worst] >= 0.0, "v": j["v"], "phi": j["phi"], "worst": worst,
-                      "worst_margin": drop[worst], "uniform": nd in set(uniform), "scores": j["scores"]})
+                      "worst_margin": drop[worst], "uniform": nd in set(uniform), "scores": j["scores"],
+                      "removable_noise": noise_ok})
     rec["minimal"] = {"tested": len(mrows), "uniform": [sum(m["removable"] for m in mrows if m["uniform"]), len(uniform)],
                       "weak": [sum(m["removable"] for m in mrows if not m["uniform"]), len(weak)],
-                      "removable": [m["part"] for m in mrows if m["removable"]], "rows": mrows}
+                      "removable": [m["part"] for m in mrows if m["removable"]], "rows": mrows,
+                      "uniform_noise": [sum(m["removable_noise"] for m in mrows if m["uniform"]), len(uniform)],
+                      "weak_noise": [sum(m["removable_noise"] for m in mrows if not m["uniform"]), len(weak)]}
     done("minimality")
 
     eff = effects(ge, tx, g)
@@ -1009,6 +1033,17 @@ def v_shared(r: dict) -> float:
                default=0.0)
 
 
+def v_noise(r: dict, shared: bool = False):
+    """The worst shortfall under the noise-aware floors (floor - PAIRED_SE paired SE), over every family or the shared
+    ones; None for a record scored before them."""
+    mg = r["floors"].get("margins")
+    if mg is None:
+        return None
+    fam = r["floors"]["families"]
+    return max((max(0.0, fam[f]["floor"] - goal_eval.PAIRED_SE * m["se"] - (fam[f]["score"] or 0.0)) for f, m in mg.items()
+                if (not shared or f in native_units.SHARED) and fam.get(f, {}).get("floor") is not None), default=0.0)
+
+
 def own_stats(r: dict) -> dict:
     """The circuit's own edit predictions: the node family's semantics for VPD circuits, mean ablation for native ones."""
     es = (r.get("edits") or {}).get("stats", {})
@@ -1050,7 +1085,19 @@ def summary(recs: list[dict]) -> dict:
             edit[k][f"{gname}_median_abs_error"] = med([abs(r["edits"]["stats"][k][gname]["predicted"] - r["edits"]["stats"][k][gname]["real"])
                                                          for r in recs if k in (r.get("edits") or {}).get("stats", {})])
     tb = [r["teacher"] for r in recs if r.get("teacher")]
-    return {"pool": sorted({r.get("pool") for r in recs}), "units": sorted({r["size"].get("units", "vpd") for r in recs}),
+    noisy = [r for r in recs if r["floors"].get("margins") is not None]
+    failn = {}
+    for r in noisy:
+        for f in r["floors"]["failing_noise"]:
+            failn[f] = failn.get(f, 0) + 1
+    un = [sum(r["minimal"].get("uniform_noise", [0, 0])[0] for r in noisy), sum(r["minimal"].get("uniform_noise", [0, 0])[1] for r in noisy)]
+    return {"noise_aware": {"circuits": len(noisy), "meet_every_floor_old": sum(r["floors"]["v"] == 0.0 for r in noisy),
+                            "meet_every_floor_new": sum(v_noise(r) == 0.0 for r in noisy),
+                            "failing_family_counts_new": dict(sorted(failn.items(), key=lambda x: -x[1])),
+                            "median_diff_by_family": {f: med([r["floors"]["margins"][f]["diff"] for r in noisy if f in r["floors"]["margins"]]) for f in fams},
+                            "median_se_by_family": {f: med([r["floors"]["margins"][f]["se"] for r in noisy if f in r["floors"]["margins"]]) for f in fams},
+                            "removable_uniform_new": un + [un[0] / un[1] if un[1] else None]},
+            "pool": sorted({r.get("pool") for r in recs}), "units": sorted({r["size"].get("units", "vpd") for r in recs}),
             "meet_shared_floors": sum(v_shared(r) == 0.0 for r in recs), "median_v_shared": med([v_shared(r) for r in recs]),
             "median_mediated_share": {k: med([share(r, k) for r in recs]) for k in (1, 3, 5)},
             "median_share_distance": {k: med([share_distance(share(r, k)) for r in recs]) for k in (1, 3, 5)},
@@ -1187,6 +1234,11 @@ def bakeoff(sets: dict, mib: dict | None = None) -> str:
         ("Causal abstraction, mediated share", [(f"top{k} share", lambda rs, k=k: med([share(r, k) for r in rs])) for k in (1, 3, 5)]
          + [(f"top{k} |log2 share|", lambda rs, k=k: med([share_distance(share(r, k)) for r in rs])) for k in (1, 3, 5)]),
         ("Floors (eval)", [("met, shared families", lambda rs: sum(v_shared(r) == 0.0 for r in rs)),
+                           ("met, shared, noise-aware", lambda rs: sum(v_noise(r, True) == 0.0 for r in rs if v_noise(r, True) is not None)
+                            if any(v_noise(r) is not None for r in rs) else None),
+                           ("met, every family", lambda rs: sum(r["floors"]["v"] == 0.0 for r in rs)),
+                           ("met, every family, noise-aware", lambda rs: sum(v_noise(r) == 0.0 for r in rs if v_noise(r) is not None)
+                            if any(v_noise(r) is not None for r in rs) else None),
                            ("median v, shared", lambda rs: med([v_shared(r) for r in rs]))]),
         ("Speed", [("build seconds", lambda rs: med([r["size"].get("build_seconds") for r in rs]))]),
     ]
@@ -1210,13 +1262,17 @@ def families_table(sets: dict) -> str:
     common = sorted(set.intersection(*[{r["task"] for r in recs} for recs in sets.values()])) if sets else []
     by = {n: {r["task"]: r for r in recs} for n, recs in sets.items()}
     fams = sorted({f for recs in sets.values() for r in recs for f in r["floors"]["families"]})
-    out = [f"{len(common)} texts scored by every set", f"{'family':16}" + "".join(f"{n + ' fail':>18}{'margin':>9}" for n in sets)]
+    out = [f"{len(common)} texts scored by every set; fail: under the floor; fail2se: under floor - 2 paired SE",
+           f"{'family':16}" + "".join(f"{n + ' fail':>18}{'fail2se':>9}{'margin':>9}{'se':>8}" for n in sets)]
     for f in fams:
         row = f"{f:16}"
         for n in sets:
             m = [(by[n][t]["floors"]["families"][f]["score"] or 0.0) - by[n][t]["floors"]["families"][f]["floor"]
                  for t in common if f in by[n][t]["floors"]["families"] and by[n][t]["floors"]["families"][f]["floor"] is not None]
-            row += f"{sum(x < 0 for x in m):>18}{float(np.median(m)) if m else float('nan'):>9.3f}"
+            mg = [by[n][t]["floors"]["margins"][f] for t in common if f in (by[n][t]["floors"].get("margins") or {})]
+            f2 = sum(not x["pass_new"] for x in mg) if mg else None
+            se = float(np.median([x["se"] for x in mg])) if mg else float("nan")
+            row += f"{sum(x < 0 for x in m):>18}{'-' if f2 is None else f2:>9}{float(np.median(m)) if m else float('nan'):>9.3f}{se:>8.3f}"
         out.append(row)
     out.append("")
     out.append(f"{'text':12}" + "".join(f"{n:>40}" for n in sets))

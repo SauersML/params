@@ -781,6 +781,64 @@ def shortfall(row: dict, floors_: dict) -> float:
     return max((max(0.0, f - (family_score(row, k) or 0.0)) for k, f in floors_.items()), default=0.0)
 
 
+PAIRED_SE = 2.0  # the noise-aware floor (the lead's 10-14): a family passes at its floor less this many paired SEs
+
+
+def paired_margin(row: dict, ref: dict, family: str) -> dict:
+    """A circuit's score on a family against a reference row's (VPD's whole answer, or VPD at the START's candidates for
+    OWN_RUN_FAMILIES: vpd_floors' rows, scored on the same draws and donors): the difference of the two scores
+    (family_score) and its standard error, a bootstrap over the draws both rows hold (matched by each draw's first
+    field: the donor, the changed text, the control; EPS_BOOT resamples, one index set for both rows, each resample
+    pooled as the family pools its draws, _pooled_resamples, unfloored and clipped as family_score reads it). Where
+    fewer than two draws match (a family whose draws are the circuit's own: node and connection removals, its reads,
+    its omitted candidates) the two rows' bootstrap errors combined as independent; a family scored in one run (point,
+    flips) has none (se 0). Returns {diff, se, n (draws matched), paired}."""
+    sc, sr = family_score(row, family), family_score(ref, family)
+    diff = None if sc is None or sr is None else sc - sr
+    _, kind, key = PHI_FAMILIES[family]
+    dc, dr = (row.get(key) or [], ref.get(key) or []) if key else ([], [])
+    if not kind or len(dc) < 2 or len(dr) < 2:
+        return {"diff": diff, "se": 0.0, "n": 0, "paired": False}
+    rng = np.random.default_rng(0)
+
+    def clip(xs):
+        return np.array([min(1.0, max(-1.0, x)) if x is not None else np.nan for x in xs], dtype=float)
+    ident = lambda d: json.dumps(d[0], sort_keys=True, default=str)  # noqa: E731
+    at = {ident(d): i for i, d in enumerate(dr)}
+    pairs = [(i, at[ident(d)]) for i, d in enumerate(dc) if ident(d) in at]
+    if len(pairs) >= 2:
+        idx = rng.integers(len(pairs), size=(EPS_BOOT, len(pairs)))
+        a = clip(_pooled_resamples(kind, [dc[i] for i, _ in pairs], row.get("kl_empty_live"), True, idx))
+        b = clip(_pooled_resamples(kind, [dr[j] for _, j in pairs], ref.get("kl_empty_live"), True, idx))
+        d = (a - b)[~np.isnan(a - b)]
+        return {"diff": diff, "se": float(np.std(d, ddof=1)) if len(d) > 1 else 0.0, "n": len(pairs), "paired": True}
+    var = 0.0
+    for draws, r in ((dc, row), (dr, ref)):
+        x = clip(_pooled_resamples(kind, draws, r.get("kl_empty_live"), True, rng.integers(len(draws), size=(EPS_BOOT, len(draws)))))
+        x = x[~np.isnan(x)]
+        var += float(np.var(x, ddof=1)) if len(x) > 1 else 0.0
+    return {"diff": diff, "se": var ** 0.5, "n": 0, "paired": False}
+
+
+def margins(row: dict, refs: dict, floors_: dict) -> dict:
+    """paired_margin per family of the floors against its reference (refs: vpd_floors' rows, "vpd" and "candidates"),
+    with each family's score, floor and whether it passes the noise-aware floor (score >= floor - PAIRED_SE se)."""
+    out = {}
+    for f, fl in floors_.items():
+        ref = refs["candidates"] if f in OWN_RUN_FAMILIES else refs["vpd"]
+        m = paired_margin(row, ref, f)
+        s = family_score(row, f)
+        m.update(score=s, floor=fl, pass_old=(s or 0.0) >= fl, pass_new=(s or 0.0) >= fl - PAIRED_SE * m["se"])
+        out[f] = m
+    return out
+
+
+def shortfall_noise(row: dict, floors_: dict, refs: dict) -> float:
+    """shortfall with the noise-aware floors: max_i (f_i - PAIRED_SE se_i - s_i)_+, se_i paired_margin's."""
+    m = margins(row, refs, floors_)
+    return max((max(0.0, x["floor"] - PAIRED_SE * x["se"] - (x["score"] or 0.0)) for x in m.values()), default=0.0)
+
+
 def shortfall_soft(row: dict, floors_: dict) -> float:
     """The reward's shortfall (the user's 10-13 softening: a hard max and hinge give one family any gradient):
     (mean_i softplus_w(f_i - s_i)^4)^(1/4) with w = SHORTFALL_WIDTH, s_i phi's score (family_score, an unscored family at

@@ -7,7 +7,8 @@ Background: the reference run, the model with each neuron's activation zeroed be
 d_mlp]: neuron_builder.Neurons', inframove's T2 calibration; None: the model itself). With background "circuit" every
 strong candidate outside the circuit is also zeroed, as neuron_builder's circuit run: strong, not massive (|value| under
 massive [layers], the layer's cut) and at positions 1 to the target, the first position and massive values live (the
-question-scoped circuit's sufficiency run); with "model" every strong neuron runs.
+question-scoped circuit's sufficiency run); with "model" every strong neuron runs. Every cut run zeroes the values the
+reference run zeroed and no others (weak "reference"; "run": each run its own weak values, as neuron_builder).
 Edges (candidates: every pair the architecture allows among the circuit's neurons):
   resid  writer (layer a, position p) -> reader (layer b > a, position p): the writer's down_proj write in the reader's
          MLP input;
@@ -28,7 +29,7 @@ Pruning (every run with the rest cut, so the stated graph is the circuit's every
 linear effect on the contrast (the contrast's gradient at the reader times the reader's input Jacobian times what the
 edge brings; routes scored a head layer at a time, the best LIST listed, four times as many while the listed ones fall
 short), then the smallest top-k set that alone keeps the contrast within TOL of the way from every edge's to none's
-(either side), and a halving pass over it, B blocks a round (each tried alone, those passing tried together); each kept
+(either side), and a halving pass over it, a forward's sets of blocks a round (each tried alone, those passing tried together); each kept
 edge's own cut from the graph measured last (its strength), and the graph's edges cut with every other edge on.
 
   python neuron_edges.py one MODEL TEXT.json OUT.json   (TEXT: ids, target, answer, alternatives, neurons)
@@ -50,8 +51,8 @@ MIN_TOL = 0.01  # bits: at least this much
 LIST = 4096  # routes first listed for the top-k search (by linear effect); four times as many each time they fall short
 MAX_LIST = 1 << 18  # (at most this many: the record says when the top-k search fell short there)
 HALVE_BLOCKS = 8
-B = 16  # cut sets a forward
-CHUNK = 1024  # listed resid edges a step (B x CHUNK x d floats)
+TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
+CHUNK = 256  # listed resid edges a step (sets x CHUNK x d floats)
 
 
 def weight(mod) -> torch.Tensor:
@@ -81,7 +82,8 @@ class Edges:
     (resid (writer, reader) and route (writer, (layer, head), reader) tuples; neurons (layer, position, index))."""
 
     def __init__(self, model, ids: list[int], target: int, answer: list[int], alternatives: list[int], neurons: list,
-                 thr: torch.Tensor | None = None, background: str = "circuit", massive: torch.Tensor | None = None):
+                 thr: torch.Tensor | None = None, background: str = "circuit", massive: torch.Tensor | None = None,
+                 weak: str = "reference"):
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
         cfg = core.config
         self.core, self.layers = core, core.model.layers
@@ -90,6 +92,7 @@ class Edges:
         self.eps = cfg.rms_norm_eps
         self.dev, self.dt = core.model.embed_tokens.weight.device, core.model.embed_tokens.weight.dtype
         self.T = target + 1
+        self.B = max(16, TOKENS // self.T)  # cut sets a forward
         self.ids, self.target, self.answer, self.alternatives = list(ids)[:self.T], target, list(answer), list(alternatives)
         self.thr = None if thr is None else thr.to(self.dev, torch.float32)
         self.massive = None if massive is None else massive.float().cpu()
@@ -106,8 +109,13 @@ class Edges:
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
         self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
         self._plans, self._cols, self._vcols, self._G, self._J = {}, {}, {}, None, None
+        self.fixed = None  # weak "reference": the reference run's zeroed values held zero in every run, none else
+        # (the reference's set of values, so a cut moves the contrast smoothly; "run": every run zeroes its own weak values,
+        # neuron_builder's, where a near-threshold value flips on float noise: 0.1 bits between CPU and GPU on f0)
         with torch.no_grad():
             self.base = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True)
+        if weak == "reference":
+            self.fixed = [h != 0 for h in self.base["h"]]
         self.c_full = float(self.base["contrast"][0])
 
     # -- the run (each module in the model's dtype on its own card, everything between in float32) -------------------
@@ -249,8 +257,9 @@ class Edges:
                     Z = torch.zeros(K, len(ru), hd, device=d).index_add(1, inv, dz)
                     D = D.index_add(1, ru, Z @ Wo[:, h * hd:(h + 1) * hd].T)
             x = x + f(at.o_proj, z.transpose(1, 2).reshape(K, T, H * hd))
-            hm = self._weak(L, self._mlp_act(layer, x))
-            if self.background == "circuit":  # (strong candidates outside the circuit zeroed; position 0 and massive live)
+            hm = self._mlp_act(layer, x)
+            hm = self._weak(L, hm) if self.fixed is None else hm * self.fixed[L].to(d)[None]
+            if self.background == "circuit" and self.fixed is None:  # (strong candidates outside the circuit zeroed; position 0 and massive live)
                 off = ~self.keep[L].to(d)[None]
                 off[:, 0] = False
                 if self.massive is not None:
@@ -262,7 +271,8 @@ class Edges:
                 if rest:
                     inp = inp - S[:, P[rs]] - R[:, P[rs]]
                 hr = self._mlp_act(layer, inp).gather(-1, Jn[rs][None, :, None].expand(K, -1, 1))[..., 0]
-                hm = hm.index_put((kk[:, None], P[rs][None], Jn[rs][None]), self._weak(L, hr, Jn[rs]))
+                hr = self._weak(L, hr, Jn[rs]) if self.fixed is None else hr * self.fixed[L].to(d)[P[rs], Jn[rs]][None]
+                hm = hm.index_put((kk[:, None], P[rs][None], Jn[rs][None]), hr)
             if probe is not None:
                 hm = hm + probe[L].to(d)[None]
             if keep_states:
@@ -289,8 +299,8 @@ class Edges:
         """The contrast of each row of cuts [K, len(edges)] (rest: every candidate not in edges cut as well), B rows a
         forward."""
         out = []
-        for s0 in range(0, len(cuts), B):
-            out += self._run(cuts[s0:s0 + B], edges, rest=rest)["contrast"].tolist()
+        for s0 in range(0, len(cuts), self.B):
+            out += self._run(cuts[s0:s0 + self.B], edges, rest=rest)["contrast"].tolist()
         return out
 
     # -- the candidates' linear effects -----------------------------------------------------------------------------
@@ -429,7 +439,7 @@ def prune(ed: Edges, log=print) -> dict:
     queue = list(keep.flip(0).tensor_split(min(HALVE_BLOCKS, E))) if E > 1 else []
     gone = torch.zeros(E, dtype=torch.bool)
     while queue:  # halving, B blocks a round (lowest-ranked first): each tried alone, the passing ones together
-        blocks, queue = queue[:B], queue[B:]
+        blocks, queue = queue[:ed.B], queue[ed.B:]
         rows = []
         for b in blocks:
             trial = gone.clone()
@@ -543,6 +553,7 @@ def main():
                     "over two cards, device_map auto)")
     ap.add_argument("--thr", type=Path, help="the reference's file (neuron_builder.Neurons.save)")
     ap.add_argument("--adapter", default=None)
+    ap.add_argument("--weak", default="reference", choices=("reference", "run"))
     a = ap.parse_args()
     import transformers
     model = load(a.model, a.device, a.dtype)
@@ -569,7 +580,7 @@ def main():
             rec = json.loads(src.read_text())
             ed = Edges(model, neuron_builder.chat(tok, rec["user"]), rec["pos"], [rec["answer"]], rec["alternatives"],
                        [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], thr=thr, background=a.background,
-                       massive=massive)
+                       massive=massive, weak=a.weak)
             got = prune(ed, log=lambda m: print(f"{src.stem}: {m}", flush=True))
             g = graph(ed, got, tok)
             g.update(id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter,

@@ -299,8 +299,8 @@ def curves(a) -> None:
     axes[0].set_ylabel("share naming the true country")
     from matplotlib.patches import Patch
 
-    fig.legend(handles=[Patch(color="#2a78d6", label="model inferred it (hit)"),
-                        Patch(color="#eb6834", label="model never inferred it (false attribution)")],
+    fig.legend(handles=[Patch(color="#2a78d6", label="the model drew the conclusion (hit)"),
+                        Patch(color="#eb6834", label="the model never drew the conclusion (false attribution)")],
                loc="upper center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 1.02))
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(a.plot, dpi=130, facecolor="white")

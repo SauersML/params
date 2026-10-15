@@ -70,6 +70,10 @@ jobs:
           python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -q 'pytest>=8' numpy scipy safetensors transformers peft tokenizers huggingface_hub httpx
 
+      - name: Check native oracle inputs, controls and signed readouts
+        if: ${{ !inputs.adversary_batch_only }}
+        run: python -m pytest experiments/oracle/cao/test_cao.py experiments/oracle/cao/test_write_lens.py experiments/oracle/test_neuron_scorecard.py -q --tb=short
+
       - name: Check toy wiring, fixed-basis edits and SFT weighting
         if: ${{ !inputs.adversary_batch_only }}
         run: python -m pytest experiments/oracle/toyloop/test_wiring.py experiments/oracle/toyloop/test_reward_interventions.py experiments/oracle/toyloop/test_head_counterfactual.py experiments/oracle/toyloop/test_relation_loss.py experiments/oracle/toyloop/test_render_observability.py experiments/oracle/toyloop/test_render_residual_writes.py experiments/oracle/toyloop/test_factorial_report.py experiments/oracle/toyloop/test_route_transfer.py experiments/oracle/toyloop/test_capable_transfer.py -q --tb=short

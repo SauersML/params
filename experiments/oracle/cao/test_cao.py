@@ -13,6 +13,51 @@ import cao  # noqa: E402
 transformers = pytest.importorskip("transformers")
 
 
+@pytest.mark.parametrize('sign',[-1.,1.,0.])
+def test_future_gen_text_uses_captured_signed_write_not_unsigned_column(sign,monkeypatch):
+    """Exercise the actual generation branch, with synthetic probe outcomes only."""
+    from types import SimpleNamespace
+    import hashlib
+    import numpy as np
+    class Tok:
+        def decode(self,ids):return ''.join(f't{i}' for i in ids)
+    U=torch.tensor([[1.,0.],[0.,1.],[-1.,0.],[0.,-1.],[2.,-1.],[-2.,1.],[1.,1.],[-1.,-1.]])
+    scale=torch.tensor([.5,2.]);write=sign*torch.tensor([2.,3.])
+    o=SimpleNamespace(torch=torch,tok=Tok(),layers=[None]*4,passes=0,
+        lm=SimpleNamespace(config=SimpleNamespace(num_attention_heads=2,intermediate_size=3),
+            lm_head=SimpleNamespace(weight=U),model=SimpleNamespace(norm=SimpleNamespace(weight=scale))))
+    lp=torch.log_softmax(torch.arange(8,dtype=torch.float32),dim=0)
+    class ProbeModel:
+        def logp(self,ctx):return lp[None]
+        def dist_at(self,ctx):return lp.repeat(len(ctx),1)
+    probe=SimpleNamespace(m=ProbeModel(),zeroed=lambda ids,units:lp.repeat(len(units),1))
+    monkeypatch.setattr(cao.h2h,'CANDS',[0,1])
+    monkeypatch.setattr(cao.h2h,'draws',lambda *a:None)
+    monkeypatch.setattr(cao,'effects_se',lambda *a:({0:2.,1:1.},{0:.1,1:.1}))
+    monkeypatch.setattr(cao,'strong_neurons',lambda *a:[('neuron',0,0),('neuron',0,1),('neuron',0,2)])
+    captured=[]
+    def capture(oracle,ctx,units,**kwargs):
+        captured.append(list(units));oracle.passes+=1
+        return None,[write.clone() for u in units]
+    monkeypatch.setattr(cao,'_capture_native',capture)
+    rows=cao.gen_text(o,probe,[0]*48,random.Random(3),False)
+    future=[r for r in rows if r['cat']=='write_lens']
+    assert len(future)==3 and len(captured)==1 and o.passes==1
+    assert not any(r['cat']=='promotes' for r in rows)
+    expected=np.argsort(-(U.numpy()@(scale.numpy()*write.numpy())),kind='stable')[:5].tolist()
+    for row in future:
+        cert=row['write_lens']
+        assert row['schema']=='native_signed_write_lens_v1'
+        assert cert['unit']==row['blocks'][0]['unit']
+        assert 'static linear projection' in row['q'] and 'not a prediction of downstream causal effects' in row['q']
+        assert cert['write_fp32_sha256']==hashlib.sha256(write.numpy().tobytes()).hexdigest()
+        if sign:
+            assert cert['top_token_ids']==expected
+            assert row['a']==', '.join(cao.q_tok(o.tok.decode([t])) for t in expected)
+        else:
+            assert cert['top_token_ids']==[] and row['a']=='No nonzero signed write.'
+
+
 def native_gain_rows():
     return [{'text':i*50,'cat':cat,'ctx':[i+1,2],
              'blocks':[{'layer':0,'positions':[0,1]}, {'label':'A','unit':['neuron',0,i]}],
@@ -318,7 +363,7 @@ def test_one_text_gives_every_category(tiny, monkeypatch):
     ids = [rng.randrange(1000, 5000) for _ in range(48)]
     with tiny.off():
         exs = cao.gen_text(tiny, pr, ids, rng, heads=True)
-    assert {e["cat"] for e in exs} == {"lens", "which", "pair", "swap", "edit", "promotes", "units"}
+    assert {e["cat"] for e in exs} == {"lens", "which", "pair", "swap", "edit", "write_lens", "units"}
     for e in exs:
         tiny.encode(e, True)  # every example encodes, placeholders and all
 

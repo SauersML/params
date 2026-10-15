@@ -18,8 +18,9 @@ Categories (each label measured on the model; "no clear answer" where the measur
   pair      which of two earlier tokens matters more (the same draws)
   units     which of four heads the prediction depends on most (each head's output zeroed at every position)
   edit      the top next token after a unit is removed (its output zeroed at every position)
-  promotes  the tokens a neuron's write raises most at the output (its down_proj column through the final norm and
-            unembedding: the unit's own weights)
+  write_lens  future-only signed native write projected through the final learned norm scale and unembedding;
+              static linear readout, not a downstream causal effect. Zero writes explicitly abstain.
+  promotes    historical unsigned-column labels only; never generated or silently converted here
 
   cao.py gen --out EX.jsonl --texts N [--seed S]     examples (GPU)
   cao.py train --data EX.jsonl --out DIR [--steps N]  LoRA SFT from the released adapter (GPU)
@@ -430,6 +431,7 @@ def strong_neurons(o: Oracle, ids: list[int], k: int) -> list:
         handles.append(o.layers[l].mlp.down_proj.register_forward_pre_hook(lambda _m, a, l=l: acts.__setitem__(l, a[0][0, -1].float())))
     try:
         with o.off(), torch.no_grad():
+            o.passes += 1
             o.m(input_ids=torch.tensor([ids], device=o.dev))
     finally:
         for h in handles:
@@ -506,13 +508,21 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bo
                     "q": "If unit A were removed (its output set to zero at every position), what would the model's next token "
                          "be? Answer unchanged or the token.",
                     "a": "Unchanged." if new == top else q_tok(tok.decode([new]))})
-    W_U, fn = o.lm.lm_head.weight.float(), o.lm.model.norm
-    for kind, l, n in units:  # the neuron's own weights: what its write raises at the output
-        w = o.layers[l].mlp.down_proj.weight[:, n].float()
-        raised = (W_U @ (fn.weight.float() * w)).topk(5).indices.tolist()
-        out.append({"cat": "promotes", "ctx": ids, "blocks": [{"label": "Unit A", "unit": ["neuron", l, n]}],
-                    "q": "Which tokens does unit A's output raise most? Answer with five tokens.",
-                    "a": ", ".join(q_tok(tok.decode([t])) for t in raised)})
+    from write_lens import write_lens
+    import hashlib
+    _, writes = _capture_native(o, ids, units)
+    for unit, write in zip(units, writes):
+        label = write_lens(write, o.lm.model.norm.weight, o.lm.lm_head.weight)
+        # Evidence is generated from the captured signed write, not the unsigned
+        # down column or any post-intervention outcome. Historical rows stay intact.
+        label['unit'] = list(unit)
+        label['target_position'] = T-1
+        label['write_fp32_sha256'] = hashlib.sha256(write.detach().float().cpu().contiguous().numpy().tobytes()).hexdigest()
+        out.append({'cat':'write_lens','schema':label['schema'],'ctx':ids,
+                    'blocks':[{'label':'Unit A','unit':list(unit)}],
+                    'q':f"For Unit A's signed write at the context's final position: {label['question']}",
+                    'a':label['zero_answer'] if label['zero_write'] else ', '.join(q_tok(tok.decode([t])) for t in label['top_token_ids']),
+                    'write_lens':label})
     if heads:
         allh = [("head", l, h) for l in range(nl) for h in range(nh)]
         kl = h2h.kl_bits(base.expand(len(allh), -1), pr.zeroed(ids, allh)).tolist()
@@ -551,7 +561,7 @@ def gen(a) -> None:
                 fh.write(json.dumps(e) + "\n")
             n += 1
             if n % 20 == 0:
-                print(f"{n} texts, {pr.m.passes} passes, {time.time() - t0:.0f} s", flush=True)
+                print(f"{n} texts, {pr.m.passes + o.passes} passes (probe {pr.m.passes}, native capture/ranking {o.passes}), {time.time() - t0:.0f} s", flush=True)
 
 
 # ---- training and evaluation

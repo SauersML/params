@@ -1308,9 +1308,12 @@ class GoalEval:
 
     def __init__(self, nat: native.Native | None = None, *, changes: int = native.CHANGES, ranks=HELD_OUT_RANKS,
                  share_floor: float = SHARE_FLOOR, random_pairs: int = RANDOM_PAIRS, max_edges: int = MAX_EDGES, chunk: int = CHUNK,
-                 cut_chunk: int = CUT_CHUNK, semantics: str = "n"):
+                 cut_chunk: int = CUT_CHUNK, semantics: str = "n", resample_prefix: bool = False):
         if semantics not in SEMANTICS:
             raise ValueError(f"semantics is one of {SEMANTICS}")
+        if type(resample_prefix) is not bool:
+            raise ValueError("resample_prefix must be bool")
+        self.resample_prefix = resample_prefix  # Experimental CPU exact-prefix path; default off.
         self.nat = nat or native.Native()
         self.semantics = semantics  # which C families run circuits and VPD's answer with routing and norms at x (_xkw)
         self._xk: dict = {}
@@ -4554,22 +4557,50 @@ class GoalEval:
         prediction most first on 7 of the 9 that need context, second or third on the others; the probe's draws from the
         model's own prediction (moved) miss tokens with plausible substitutes (text9043's ' adjusted' one back: 0.57
         bits by the probe, 1.03 by donors, 9.18 replaced by ' the'). Kept on tx."""
-        # Exact scorecard draws must never consume the builder's screened approximation.
+        # Opt-in prefix recomputation is mathematically exact but CPU shape-specific
+        # floating-point equality remains under verification; it never feeds the
+        # default cache key. Exact draws never consume screened approximations.
         # Do not trust the old ambiguous _resample namespace, including on warmed Texts.
         kept = tx.__dict__.setdefault("_resample_exact", {})
-        if (split, k, self.FIRST_POSITION) not in kept:
+        prefix_ok = False
+        if getattr(self, "resample_prefix", False):
+            import vpd_model
+            nat, target = self.nat, self.nat.target
+            behavior_at = getattr(target, "behavior_at", None)
+            prefix_ok = (str(nat.dev).split(":")[0] == "cpu"
+                         and type(target) is vpd_model.Target and nat.plain()
+                         and all(target.site(name).in_fn is None for name in nat.names)
+                         and getattr(nat.reference, "__func__", None) is native.Native.reference
+                         and (getattr(target, "behavior", None) is None
+                              or behavior_at is None or set(tx.targets) <= behavior_at))
+        key = (split, k, self.FIRST_POSITION)
+        if prefix_ok:
+            key += ("experimental_cpu_prefix_v1",)
+        if key not in kept:
+            nat = self.nat
             donors = [list(d) for _, d in self.far_donors(tx, self.far_pool(split), k)]
             tg = set(tx.targets)
             qs = [q for q in range(0 if self.FIRST_POSITION else 1, max(tx.targets) + 1) if q not in tg]
             seqs = [[_donor_token(d, q, tx.T, x) if p == q else x for p, x in enumerate(tx.ids)] for q in qs for d in donors]
-            kl = []
+            kl, prefixes = [], {}  # At most nominal and final-partial batch sizes; scoped to this call.
             for s0 in range(0, len(seqs), 4 * self.chunk):
-                lp = self.nat.reference(seqs[s0:s0 + 4 * self.chunk], tx.targets)
+                batch = seqs[s0:s0 + 4 * self.chunk]
+                start = max(0, min(qs[s0 // len(donors)], min(tx.targets), tx.T - 64)) if prefix_ok else 0
+                if start:
+                    nat.vpd.clear()
+                    size = len(batch)
+                    if size not in prefixes:
+                        prefixes[size] = target.keys_values(torch.tensor([tx.ids] * size, device=nat.dev))
+                    hidden = target.hidden(torch.tensor(batch, device=nat.dev), start, prefixes[size])
+                    lp = torch.log_softmax(target.unembed(hidden[:, [t - start for t in tx.targets]]).float(), -1)
+                    # Never put arbitrary-prefix results into Native.reference's cache.
+                else:
+                    lp = nat.reference(batch, tx.targets)
                 kl += carry.kl(lp, tx.ref.expand_as(lp)).tolist()
-                native.free(self.nat.dev)
+                native.free(nat.dev)
             n = len(donors)
-            kept[(split, k, self.FIRST_POSITION)] = {q: float(np.mean(kl[i * n:(i + 1) * n])) for i, q in enumerate(qs)} if n else {}
-        return kept[(split, k, self.FIRST_POSITION)]
+            kept[key] = {q: float(np.mean(kl[i * n:(i + 1) * n])) for i, q in enumerate(qs)} if n else {}
+        return kept[key]
 
     def start_candidates(self, tx: Text, split: str = "search") -> list:
         """The START's candidate positions in order (the lead's 10-13): F2's by the probe's moved and every position by

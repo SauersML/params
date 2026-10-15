@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -51,7 +52,8 @@ MARGIN_SD = 2.0  # resampled effects: clear when the winner's lead exceeds MARGI
 # (the draws' own spread, as builder_fast; the lead's 10-14 call, in place of a fixed ratio)
 SWAPS_PER_TEXT, PAIRS_PER_TEXT, EDITS_PER_TEXT = 12, 4, 3
 UNITS_EVERY = 4  # one text in UNITS_EVERY gets the heads question (448 removals)
-LR, BATCH, MICRO, MAX_NEW = 1e-5, 16, 4, 24
+LR, BATCH, MAX_NEW = 1e-5, 16, 24
+MICRO = int(os.environ.get("CAO_MICRO", 4))  # examples per backward
 VAL_EVERY, VAL_N = 500, 400
 
 

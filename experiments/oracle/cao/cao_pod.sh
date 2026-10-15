@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The causal activation oracle (cao.py) on a rented GPU, into ~/mpd-data/runpod/oracle-pathg-$RUN/:
 #   RUN=gen1 MODE=gen TEXTS=4000 [PROCS=2] bash experiments/oracle/cao/cao_pod.sh [HOURS]     examples (PROCS processes, seeds 1..)
-#   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] bash ... [HOURS]                SFT from the released adapter
+#   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] [VECTORS=<.pt>] [SAVE_EVERY=N] [MICRO=N] bash ...  SFT from the released adapter
 #   RUN=eval1 MODE=eval ITEMS=<h2h items> ADAPTER_DIR=<a trained adapter on the Mac> bash ...  the gate's questions
 #   RUN=inf1 MODE=inference [PER=150] bash ... [HOURS]                                       inference.py build (never-made inferences)
 #   RUN=org1 MODE=organisms bash ... [HOURS]                                                  organisms.py all (planted truths)
@@ -18,6 +18,7 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${ITEMS:-}" ] && cp "$ITEMS" "$S/items.jsonl"
 [ -n "${ADAPTER_DIR:-}" ] && cp -r "$ADAPTER_DIR" "$S/adapter"
 [ -n "${ORGS:-}" ] && cp -r "$ORGS" "$S/organisms"
+[ -n "${VECTORS:-}" ] && cp "$VECTORS" "$S/vectors.pt"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
 case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
@@ -29,7 +30,8 @@ python -u organisms.py examples --dir $O/organisms --out $O/organism_examples.js
   orgeval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B}
         WORK="python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval.jsonl > $O/orgeval.log 2>&1; \
 python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval_text_only.jsonl --text-only > $O/orgeval_text_only.log 2>&1" ;;
-  train) WORK="python -u cao.py train --data $S/data.jsonl --out $O/adapter ${STEPS:+--steps $STEPS} > $O/train.log 2>&1" ;;
+  train) WORK="CAO_MICRO=${MICRO:-4} python -u cao.py train --data $S/data.jsonl --out $O/adapter ${STEPS:+--steps $STEPS} \
+${VECTORS:+--vectors $S/vectors.pt} --save-every ${SAVE_EVERY:-2000} > $O/train.log 2>&1" ;;
   eval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B}  # (ADAPTER_DIR: a step_N directory)
         WORK="python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval.jsonl > $O/eval.log 2>&1; \
 python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval_text_only.jsonl --text-only > $O/eval_text_only.log 2>&1; \

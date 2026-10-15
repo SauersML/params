@@ -350,38 +350,85 @@ def sample(a) -> None:
                       "wall_seconds": round(time.perf_counter() - t0, 1)}), flush=True)
 
 
+def devscore_receipt(expected: list[str], samples: list[dict], score_one) -> dict:
+    """A fixed-panel monitor; infrastructure failures never become model zeros."""
+    errors, per, by = [], [], {}
+    if not expected or len(set(expected)) != len(expected):
+        errors.append({"error": "empty_or_duplicate_expected_tasks"})
+    for row in samples:
+        task = row.get("task")
+        if task not in expected:
+            errors.append({"task": task, "error": "unexpected_sample"})
+        else:
+            by.setdefault(task, []).append(row)
+    for task in dict.fromkeys(expected):
+        rs = by.get(task, [])
+        if len(rs) != 1:
+            errors.append({"task": task, "error": "missing_sample" if not rs else "duplicate_sample",
+                           "count": len(rs)})
+            continue
+        if len(set(expected)) != len(expected):
+            continue
+        try:
+            scores = score_one(task, rs[0])
+            if not isinstance(scores, list) or len(scores) != 1:
+                raise ValueError("exactly one score required")
+            sc = scores[0]
+            reward = sc["reward"]
+            if type(reward) not in (int, float) or not math.isfinite(reward) or type(sc.get("valid")) is not bool:
+                raise ValueError("finite numeric reward and boolean valid required")
+            per.append({"task": task, "reward": reward, "valid": sc["valid"]})
+        except Exception as exc:
+            errors.append({"task": task, "error": "scorer_error", "detail": str(exc)[:2000]})
+    complete = not errors and len(per) == len(expected)
+    return {"complete": complete, "expected_tasks": expected, "scored": len(per), "errors": errors,
+            "reward": sum(r["reward"] for r in per) / len(expected) if complete else None,
+            "valid": sum(r["valid"] for r in per) / len(expected) if complete else None,
+            "per_question": per}
+
+
 def devscore(a) -> None:
-    """Each checkpoint of an RL run (LOG/checkpoints.jsonl) without LOG/devscore_<step>.json: one answer to each of the
-    first --n dev questions (sample()), each question's answers posted to the environment's scorer (--scorer, with
-    --request-extra), {"step", "reward": the mean (an invalid answer at its scored reward), "valid", "per_question":
-    [{"task", "reward", "valid"}]} written: the dev monitor of an environment without components' evaluation."""
+    """Score every frozen first-n task once; incomplete checkpoints have null aggregates.
+
+    Existing monitor files remain immutable. Infrastructure errors are retained in
+    the receipt and cannot be mistaken for a complete checkpoint's model reward.
+    """
     import argparse as _argparse
 
     extra = json.loads(a.request_extra) if a.request_extra else {}
+    if {"task", "answers", "lines", "tokens"} & extra.keys():
+        raise ValueError("request-extra cannot override the frozen task or answer")
+    questions = [json.loads(x) for x in a.questions.read_text().splitlines() if x.strip()][:a.n]
+    expected = [q.get("task") or q["id"] for q in questions]
     for ck in map(json.loads, (a.log / "checkpoints.jsonl").read_text().splitlines()):
         out = a.log / f"devscore_{ck['step']}.json"
         if out.exists():
             continue
         got = a.log / f"devscore_{ck['step']}_samples.jsonl"
-        sample(_argparse.Namespace(questions=a.questions, out=got, init=ck["state"], base=ck.get("base", a.base), n=a.n,
-                                   samples=1, max_tokens=a.max_tokens, thinking=a.thinking, prefix=""))
-        by = {}
-        for r in map(json.loads, got.read_text().splitlines()):
-            by.setdefault(r["task"], []).append(r)
-        per = []
-        for task, rs in by.items():
-            req = {"task": task, "answers": [r["text"] for r in rs], "lines": False,
-                   "tokens": [r["tokens"] - (r.get("thinking_tokens") or 0) for r in rs], **extra}
-            r = httpx.post(a.scorer, json=req, timeout=None)
-            got_scores = r.json().get("scores") if r.status_code == 200 else None
-            if got_scores is None:  # a scorer error on one question: logged and left out, the others still scored
-                print(json.dumps({"step": ck["step"], "task": task, "scorer_error": r.text[:2000]}), flush=True)
-                continue
-            for sc in got_scores:
-                per.append({"task": task, "reward": sc["reward"], "valid": sc.get("valid")})
-        out.write_text(json.dumps({"step": ck["step"], "reward": sum(x["reward"] for x in per) / max(len(per), 1),
-                                   "valid": sum(bool(x["valid"]) for x in per) / max(len(per), 1), "per_question": per}))
-        print(json.dumps({"step": ck["step"], "dev_reward": json.loads(out.read_text())["reward"]}), flush=True)
+        sampling_error = None
+        try:
+            if not expected or len(set(expected)) != len(expected):
+                raise ValueError("nonempty unique expected task panel required before sampling")
+            sample(_argparse.Namespace(questions=a.questions, out=got, init=ck["state"], base=ck.get("base", a.base), n=a.n,
+                                       samples=1, max_tokens=a.max_tokens, thinking=a.thinking, prefix=""))
+            samples = [json.loads(x) for x in got.read_text().splitlines() if x.strip()]
+        except Exception as exc:
+            samples, sampling_error = [], str(exc)[:2000]
+
+        def score_one(task, row):
+            req = {**extra, "task": task, "answers": [row["text"]], "lines": False,
+                   "tokens": [row["tokens"] - (row.get("thinking_tokens") or 0)]}
+            response = httpx.post(a.scorer, json=req, timeout=None)
+            if response.status_code != 200:
+                raise ValueError(f"HTTP {response.status_code}: {response.text[:1800]}")
+            return response.json().get("scores")
+
+        receipt = devscore_receipt(expected, samples, score_one)
+        if sampling_error is not None:
+            receipt["errors"].append({"error": "sampling_error", "detail": sampling_error})
+        out.write_text(json.dumps({"step": ck["step"], **receipt}, allow_nan=False))
+        print(json.dumps({"step": ck["step"], "dev_reward": receipt["reward"],
+                          "complete": receipt["complete"]}), flush=True)
 
 
 def readers(a) -> None:

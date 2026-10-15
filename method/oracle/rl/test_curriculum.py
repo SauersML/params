@@ -105,6 +105,7 @@ def test_devscore_scores_each_new_checkpoint_once_with_the_environments_request(
     (tmp_path / "checkpoints.jsonl").write_text(json.dumps({"step": 0, "state": "s0", "base": "b"}) + "\n" +
                                                 json.dumps({"step": 5, "state": "s5", "base": "b"}) + "\n")
     (tmp_path / "devscore_0.json").write_text(json.dumps({"step": 0, "reward": 0.0}))
+    (tmp_path / "dev.jsonl").write_text(json.dumps({"task": "g1", "question": "fixture"}) + "\n")
     sampled, posted = [], []
 
     def fake_sample(ns):
@@ -112,6 +113,8 @@ def test_devscore_scores_each_new_checkpoint_once_with_the_environments_request(
         ns.out.write_text(json.dumps({"task": "g1", "sample": 0, "text": "scale L0.fc#1 0", "tokens": 9, "thinking_tokens": 2}) + "\n")
 
     class Reply:
+        status_code = 200
+
         def __init__(self, req):
             self.req = req
 

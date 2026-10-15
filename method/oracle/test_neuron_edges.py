@@ -115,6 +115,23 @@ def test_route_scores_match_brings(tiny):
         assert float(rt[i]) == pytest.approx(want, rel=1e-4, abs=1e-7)
 
 
+def test_rest_cut_sums(tiny):
+    """Every other candidate cut by the per-position sums: with every candidate listed and kept the run is the model's;
+    with none listed it is every candidate listed and cut."""
+    model, ids, neurons = tiny
+    for bg in ("model", "circuit"):
+        ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background=bg)
+        every = ed.resid_all + ed.linear_scores(ed.n_routes)[1]
+        E = len(every)
+        kept = ed.contrasts(torch.zeros(1, E, dtype=torch.bool), every, rest=True)[0]
+        assert kept == pytest.approx(ed.c_full, abs=1e-4)
+        none = ed.contrasts(torch.zeros(1, 0, dtype=torch.bool), [], rest=True)[0]
+        assert none == pytest.approx(ed.contrasts(torch.ones(1, E, dtype=torch.bool), every)[0], abs=1e-4)
+        half = torch.arange(E)[None] % 2 == 0  # (half listed and cut, the other half as run against a cut rest)
+        got = ed.contrasts(half, every, rest=True)[0]
+        assert got == pytest.approx(ed.contrasts(half, every)[0], abs=1e-4)
+
+
 def test_bfloat16_model(tiny):
     """A bfloat16 model runs the same stage (each module in bfloat16, float32 between): its contrasts follow the float32
     model's to bfloat16's precision."""

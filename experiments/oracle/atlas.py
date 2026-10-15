@@ -118,6 +118,17 @@ def load_corpus(root: Path):
     return (np.load(c / "tokens.npy", mmap_mode="r"), np.load(c / "offsets.npy"), json.loads((c / "meta.json").read_text()))
 
 
+def corpus_docs(corpus_dir, tokens: int | None = None):
+    """The built corpus's documents in order (int32 token ids, each a document's first window), up to `tokens` tokens: the
+    first N tokens of the stream every atlas reads (~/mpd-data/atlas/corpus_qwen3: 50M Qwen3 tokens, every size's)."""
+    c = Path(corpus_dir)
+    toks, off = np.load(c / "tokens.npy", mmap_mode="r"), np.load(c / "offsets.npy")
+    for d in range(len(off) - 1):
+        if tokens is not None and off[d] >= tokens:
+            return
+        yield np.asarray(toks[off[d]:off[d + 1]])
+
+
 def load_model(name: str, dev, attn: str = "sdpa"):
     import torch
     from transformers import AutoModelForCausalLM

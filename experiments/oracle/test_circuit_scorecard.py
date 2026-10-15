@@ -136,3 +136,19 @@ def test_v_noise():
     assert sc.v_noise(r) == 0.0 and sc.v_noise(r, True) == 0.0
     r["floors"]["margins"]["N"]["se"] = 0.04
     assert sc.v_noise(r) == pytest.approx(0.2 - 0.08)
+
+
+def test_slim_rows_give_the_same_margins():
+    draws = [["d1", 1.0, 0.5, 2.0, 0.6], ["d2", 1.2, 0.4, 2.2, 0.5], ["d3", 0.9, 0.6, 1.9, 0.7]]
+    ref = [["d1", 0.5, 0.5, 2.0, 1.0], ["d2", 0.4, 0.4, 2.2, 1.0], ["d3", 0.6, 0.6, 1.9, 1.0]]
+    row = {"s_patching_far": 0.55, "rl_terms": {"s_patching_far": 0.55}, "draws_patching_far": draws, "unused": [1, 2]}
+    vpd = {"s_patching_far": 1.0, "rl_terms": {"s_patching_far": 1.0}, "draws_patching_far": ref}
+    s = sc.slim(row)
+    assert "unused" not in s and s["draws_patching_far"] == draws
+    m1 = sc.goal_eval.paired_margin(row, vpd, "patching_far")
+    m2 = sc.goal_eval.paired_margin(s, sc.slim(vpd), "patching_far")
+    assert m1 == m2 and m1["paired"] and m1["n"] == 3 and m1["se"] > 0
+    rec = {"floors": {"families": {"patching_far": {"score": 0.55, "floor": 0.9}},
+                      "rows": {"circuit": s, "vpd": sc.slim(vpd), "candidates": sc.slim(vpd)}}}
+    got = sc.record_margins(rec)["patching_far"]
+    assert got["pass_old"] is False and got["diff"] == pytest.approx(-0.45)

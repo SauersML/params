@@ -247,13 +247,31 @@ def rows(ge: goal_eval.GoalEval, tx: goal_eval.Text, graphs: list, pool: dict, l
     return out
 
 
+def slim(row: dict) -> dict:
+    """A reward row's fields the families' scores and their paired margins read (each family's score, unfloored score
+    and per-draw records, rl_terms, kl_empty_live, eps): kept in the record, so goal_eval.margins runs on it again with
+    no rerun (the lead's 10-14)."""
+    keep = {"rl_terms", "kl_empty_live", "f1_flips_c"}
+    for f, (score, _, draws) in goal_eval.PHI_FAMILIES.items():
+        keep |= {score, goal_eval.PHI_RAW[f], f"eps_{f}"} | ({draws} if draws else set())
+    return json.loads(json.dumps({k: row[k] for k in keep if k in row}, default=float))
+
+
 def noise_floors(row: dict, vf: dict, fl: dict) -> dict:
     """The noise-aware floors (the lead's 10-14): goal_eval.margins against vpd_floors' rows (each family's paired
     difference from its reference and that difference's SE), the shortfall under floor - PAIRED_SE SE, the families
     failing it."""
     mg = goal_eval.margins(row, vf, fl)
     return {"margins": {f: {k: m[k] for k in ("diff", "se", "n", "paired", "pass_new")} for f, m in mg.items()},
-            "v_noise": goal_eval.shortfall_noise(row, fl, vf), "failing_noise": [f for f, m in mg.items() if not m["pass_new"]]}
+            "v_noise": goal_eval.shortfall_noise(row, fl, vf), "failing_noise": [f for f, m in mg.items() if not m["pass_new"]],
+            "rows": {"circuit": slim(row), "vpd": slim(vf["vpd"]), "candidates": slim(vf["candidates"])}}
+
+
+def record_margins(rec: dict) -> dict:
+    """goal_eval.margins from a record's kept rows (slim): the paired margins again, under the current PAIRED_SE."""
+    rw = rec["floors"]["rows"]
+    fl = {f: x["floor"] for f, x in rec["floors"]["families"].items() if x["floor"] is not None}
+    return goal_eval.margins(rw["circuit"], {"vpd": rw["vpd"], "candidates": rw["candidates"]}, fl)
 
 
 def judged(row: dict, fl: dict, fams: list) -> dict:
@@ -727,6 +745,40 @@ def native_lq(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, sets: list[li
     return torch.cat(out)
 
 
+@torch.no_grad()
+def native_mediated(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, units: list) -> dict:
+    """A native circuit's mediated share (criterion 6): its units ranked by measured real-model removal (every unit, or,
+    over SINGLES_MAX units, those of the (kind, layer, position) groups whose removal drops the prediction most, the
+    groups measured first), the top 1, 3 and 5 removed live and with every unit outside held at its clean value."""
+    y = tx.ref[0].argmax(-1)
+
+    def lp(lq):
+        return (lq.gather(-1, y.view(1, -1, 1).expand(lq.shape[0], -1, 1)).squeeze(-1).sum(-1) / LN2).tolist()
+    meas, screen = units, None
+    if len(units) > SINGLES_MAX:
+        by = {}
+        for u in units:
+            by.setdefault((u[0], u[1], u[2]), []).append(u)
+        keys = list(by)
+        gl = lp(native_lq(ge, tx, nphi, S, [[]] + [by[k] for k in keys], "live"))
+        meas = []
+        for i in np.argsort([gl[0] - x for x in gl[1:]])[::-1]:
+            if len(meas) >= SINGLES_MAX:
+                break
+            meas += by[keys[i]]
+        screen = {"groups": len(keys), "groups_measured_singly": len(set((u[0], u[1], u[2]) for u in meas))}
+    live = lp(native_lq(ge, tx, nphi, S, [[]] + [[u] for u in meas], "live"))
+    real1 = [live[0] - x for x in live[1:]]
+    top = [meas[i] for i in np.argsort(real1)[::-1][:5]]
+    groups = [top[:1], top[:3], top[:5]]
+    g_live = lp(native_lq(ge, tx, nphi, S, groups, "live"))
+    g_med = lp(native_lq(ge, tx, nphi, S, groups, "mediated"))
+    return {"meas": meas, "screen": screen, "real1": real1, "top": top, "groups": groups, "live": live, "g_live": g_live,
+            "mediated": [{"k": len(R), "live": live[0] - a, "mediated": live[0] - b,
+                          "share": (live[0] - b) / (live[0] - a) if abs(live[0] - a) >= SHARE_MIN else None}
+                         for R, a, b in zip(groups, g_live, g_med)]}
+
+
 def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None, means: dict, pool_name: str = POOL.name,
                  log=say, save=None) -> dict:
     """A native circuit's record (the bake-off's unit-agnostic criteria, the lead's 10-14): the shared families
@@ -765,26 +817,9 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
 
     def lp(lq):
         return (lq.gather(-1, y.view(1, -1, 1).expand(lq.shape[0], -1, 1)).squeeze(-1).sum(-1) / LN2).tolist()
-    meas, screen = units, None  # the units measured one by one: every unit, or those of the groups (a kind, layer and
-    if len(units) > SINGLES_MAX:  # position) whose removal drops the model's prediction most, up to SINGLES_MAX units
-        by = {}
-        for u in units:
-            by.setdefault((u[0], u[1], u[2]), []).append(u)
-        keys = list(by)
-        gl = lp(native_lq(ge, tx, nphi, S, [[]] + [by[k] for k in keys], "live"))
-        meas = []
-        for i in np.argsort([gl[0] - x for x in gl[1:]])[::-1]:
-            if len(meas) >= SINGLES_MAX:
-                break
-            meas += by[keys[i]]
-        screen = {"groups": len(keys), "groups_measured_singly": len(set((u[0], u[1], u[2]) for u in meas))}
+    nm = native_mediated(ge, tx, nphi, S, units)
+    meas, screen, real1, top, groups, live, g_live = nm["meas"], nm["screen"], nm["real1"], nm["top"], nm["groups"], nm["live"], nm["g_live"]
     singles = [[u] for u in meas]
-    live = lp(native_lq(ge, tx, nphi, S, [[]] + singles, "live"))
-    real1 = [live[0] - x for x in live[1:]]
-    top = [meas[i] for i in np.argsort(real1)[::-1][:5]]
-    groups = [top[:1], top[:3], top[:5]]
-    g_live = lp(native_lq(ge, tx, nphi, S, groups, "live"))
-    g_med = lp(native_lq(ge, tx, nphi, S, groups, "mediated"))
     circ = lp(native_lq(ge, tx, nphi, S, [[]] + singles + groups[1:], "circuit"))
     pred = [circ[0] - x for x in circ[1:]]
     st = faith(pred[:len(meas)], real1)
@@ -794,9 +829,7 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
                     "drops": {"model": real1, "circuit_mean": pred[:len(meas)]},
                     "groups": {"top3": [native_label(u) for u in top[:3]], "top5": [native_label(u) for u in top[:5]]},
                     "stats": {"circuit_mean": st},
-                    "mediated": [{"k": len(R), "live": live[0] - a, "mediated": live[0] - b,
-                                  "share": (live[0] - b) / (live[0] - a) if abs(live[0] - a) >= SHARE_MIN else None}
-                                 for R, a, b in zip(groups, g_live, g_med)]}
+                    "mediated": nm["mediated"]}
     rec["interventions"] = interventions_native(ge, tx, nphi, S, units, top)
     done("edits")
 

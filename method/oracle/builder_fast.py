@@ -250,8 +250,73 @@ def _graph(units: list) -> native.Graph:
     return native.Graph(sorted(units), complete=True)
 
 
-def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[native.Graph, dict]:
+
+def _shared_prefix(ge, tx, order, rec, *, pool=None, max_gate_calls=16):
+    """Smallest passing TESTED fixed-ranking prefix; hard common search floors.
+
+    No legacy START cap, noise slack, cleanup, or unchecked fallback. The fixed
+    bounded proposal grid includes empty/full; this is not a global minimum.
+    """
+    import hashlib
+    import json
+    import native_units
+
+    if type(max_gate_calls) is not int or max_gate_calls < 2:
+        raise ValueError("shared_gate_calls must be an integer >=2 (empty/full)")
+    calibration_started = time.perf_counter()
+    vf = ge.vpd_floors(tx, pool, "search", shared_only=True)
+    calibration_seconds = time.perf_counter() - calibration_started
+    floors = {f: vf["floors"][f] for f in vf["families"]
+              if f in native_units.SHARED and vf["floors"].get(f) is not None}
+    if not floors or any(not math.isfinite(v) for v in floors.values()):
+        raise ValueError("nonfinite or missing shared floor")
+    n = len(order)
+    sizes = sorted({0, n} | {min(n, int(round(2 ** (k / 2))))
+                           for k in range(0, int(2 * math.log2(max(n, 1))) + 2)})
+    proposed_all = list(sizes)
+    if len(sizes) > max_gate_calls:
+        sizes = [sizes[round(i * (len(sizes) - 1) / (max_gate_calls - 1))]
+                 for i in range(max_gate_calls)]
+    admission = rec["admission"] = {"mode": "common_scorecard_hard_shared", "split": "search",
+        "floors": floors, "families": list(floors), "proposed_sizes": sizes,
+        "unbudgeted_grid_sizes": proposed_all, "grid_budget_limited": sizes != proposed_all,
+        "budget_exhausted": False, "max_gate_calls": max_gate_calls,
+        "calls": 0, "tried": [], "claim": "smallest tested passing fixed-ranking prefix",
+        "cleanup": False, "status": "NO_ADMITTED_CANDIDATE",
+        "ranking": "existing four-share absolute attribution, stable descending",
+        "full_size_scope": "full restricted position-ranking pool, not whole-model VPD",
+        "rank_order_sha256": hashlib.sha256(json.dumps(order, separators=(",", ":")).encode()).hexdigest(),
+        "calibration_seconds": calibration_seconds,
+        "calls_exclude_calibration_and_ranking": True, "physical_forward_limit": False}
+    started = time.perf_counter()
+    try:
+        for size in sizes:
+            graph = _graph(order[:size])
+            admission["calls"] += 1
+            row = ge.fidelity(tx, [graph], pool, mode="reward", split="search", shared_only=True)[0]
+            scores = {f: goal_eval.family_score(row, f) for f in floors}
+            passed = all(v is not None and math.isfinite(v) and v >= floors[f]
+                         for f, v in scores.items())
+            admission["tried"].append({"size": size, "scores": scores, "passed": passed})
+            if passed:
+                admission["status"] = "ADMITTED"
+                rec.update(met=True, size=size, start_written=size == n, floors=floors)
+                return graph, rec
+        admission["budget_exhausted"] = sizes != proposed_all
+        admission["failure_reason"] = "BOUNDED_GRID_FAILED" if sizes != proposed_all else "ALL_GRID_FAILED"
+        rec.update(met=False, floors=floors)
+        raise native_units.NoAdmittedCandidate(rec)
+    finally:
+        admission["seconds"] = time.perf_counter() - started
+
+
+def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_floors=False,
+              shared_gate_calls=None, shared_pool=None) -> tuple[native.Graph, dict]:
     """(the circuit, the record) on one text (module docstring)."""
+    if not shared_floors and (shared_gate_calls is not None or shared_pool is not None):
+        raise ValueError("shared_gate_calls and shared_pool require shared_floors=True")
+    if shared_gate_calls is not None and (type(shared_gate_calls) is not int or shared_gate_calls < 2):
+        raise ValueError("shared_gate_calls must be an integer >=2")
     import teacher
 
     nat, t0, rec = ge.nat, time.perf_counter(), {"units": "vpd"}
@@ -291,6 +356,9 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     order = [units[i] for i in rank]
     rec["start_units"] = len(units)
     clock("ranking")
+    if shared_floors:
+        return _shared_prefix(ge, tx, order, rec, pool=shared_pool,
+                              max_gate_calls=16 if shared_gate_calls is None else shared_gate_calls)
     N = len(order)                                           # 3. the size
     sizes = sorted({min(N, int(round(2 ** (k / 2)))) for k in range(0, int(2 * math.log2(max(N, 1))) + 2)} | {N})
     e0, v0 = ge._bounds(tx, "live")
@@ -523,16 +591,34 @@ UNITS = {"vpd": build_vpd, "neurons": build_neurons}
 
 def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | None = None, log=None,
           builder: str = "builder_fast", stated: bool = False, *, shared_native_floors: bool = False,
-          native_gate_calls: int | None = None, native_pool=None, means: dict | None = None) -> dict:
+          native_gate_calls: int | None = None, native_pool=None, means: dict | None = None,
+          shared_floors: bool = False, shared_gate_calls: int | None = None, shared_pool=None) -> dict:
     """A circuit for one task (a vpd4l task JSON: its first prompt's token_ids and target_positions; seed, the task's
     own, default from its first tokens) in units (UNITS): goal_eval.to_json of the circuit, with "units", its record
     under "build", "build_seconds" (every stage, the text's runs included) and "builder" (name@rev). stated: its
     connections stated by connect.connect (rustmove's), at the builder's own floors, its record under "connect".
-    Native-only shared_native_floors uses build_native's shared search admission;
+    shared_floors uses common hard SHARED search floors for either unit kind;
+    VPD tests only bounded fixed-ranking prefixes and performs no legacy cleanup.
+    Shared stated connections are unsupported until final revalidation exists.
+    Native-only shared_native_floors is the compatibility alias for shared search admission;
     native_pool optionally supplies its construction pool. The gate-call budget is
     per text (including an optional warmup), not a physical-forward limit. Admission
     failures propagate before serialization; defaults retain point-only native builds. means: the native units' means
     for a model other than vpd4l (native_units.unit_means; units "neurons" only)."""
+    if shared_floors and stated:
+        raise ValueError("shared_floors with stated connections requires final revalidation; unsupported")
+    if not shared_floors and (shared_gate_calls is not None or shared_pool is not None):
+        raise ValueError("shared_gate_calls and shared_pool require shared_floors=True")
+    if shared_gate_calls is not None and (type(shared_gate_calls) is not int or shared_gate_calls < 2):
+        raise ValueError("shared_gate_calls must be an integer >=2")
+    if shared_floors and units == "neurons":
+        if native_gate_calls is not None and shared_gate_calls is not None:
+            raise ValueError("choose shared_gate_calls or native_gate_calls, not both")
+        if native_pool is not None and shared_pool is not None:
+            raise ValueError("choose shared_pool or native_pool, not both")
+        shared_native_floors = True
+        native_gate_calls = shared_gate_calls if shared_gate_calls is not None else native_gate_calls
+        native_pool = shared_pool if shared_pool is not None else native_pool
     native_options = shared_native_floors or native_gate_calls is not None or native_pool is not None
     if native_options and units != "neurons":
         raise ValueError("native admission options require units='neurons'")
@@ -546,7 +632,11 @@ def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | No
     t0 = time.perf_counter()
     tx = ge.text(p["token_ids"], p["target_positions"], seed, task=task)
     t1 = time.perf_counter()
-    if native_options:
+    if shared_floors and units == "vpd":
+        g, rec = UNITS[units](ge, tx, log=log, shared_floors=True,
+                             shared_gate_calls=16 if shared_gate_calls is None else shared_gate_calls,
+                             shared_pool=shared_pool)
+    elif native_options:
         g, rec = UNITS[units](ge, tx, log=log, shared_native_floors=shared_native_floors,
                              native_gate_calls=native_gate_calls, native_pool=native_pool, means=means)
     elif means is not None:
@@ -585,29 +675,57 @@ def main():
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--warm", default="text6000", help="a text built first and thrown away (CUDA's first kernels)")
     ap.add_argument("--stated", action="store_true", help="state the connections (connect.connect)")
+    ap.add_argument("--shared-floors", action="store_true",
+                    help="either unit kind: common hard SHARED search floors, no unchecked fallback")
+    ap.add_argument("--shared-gate-calls", type=int, help="bounded shared candidate checks (default16; >=2)")
     ap.add_argument("--shared-native-floors", action="store_true",
                     help="neurons only: admit against VPD-derived shared search floors; no unchecked fallback")
     ap.add_argument("--native-gate-calls", type=int,
                     help="neurons only: shared admission calls per text (default16), not physical forwards")
     a = ap.parse_args()
+    if a.shared_floors and a.stated:
+        ap.error("--shared-floors does not support --stated")
+    if a.shared_gate_calls is not None and (not a.shared_floors or a.shared_gate_calls < 2):
+        ap.error("--shared-gate-calls requires --shared-floors and >=2")
+    if a.shared_gate_calls is not None and a.native_gate_calls is not None:
+        ap.error("choose --shared-gate-calls or --native-gate-calls")
     if (a.shared_native_floors or a.native_gate_calls is not None) and a.units != "neurons":
         ap.error("native admission options require --units neurons")
     if a.native_gate_calls is not None and a.native_gate_calls < 0:
         ap.error("--native-gate-calls must be nonnegative")
-    if a.native_gate_calls is not None and not a.shared_native_floors:
-        ap.error("--native-gate-calls requires --shared-native-floors")
+    if a.native_gate_calls is not None and not (a.shared_native_floors or a.shared_floors):
+        ap.error("--native-gate-calls requires --shared-native-floors or --shared-floors")
     native_options = dict(shared_native_floors=a.shared_native_floors, native_gate_calls=a.native_gate_calls)
+    if a.shared_floors:
+        native_options.update(shared_floors=True, shared_gate_calls=a.shared_gate_calls)
+    if a.shared_floors or a.shared_native_floors:
+        for name in a.tasks.read_text().split()[a.offset::a.stride]:
+            if (a.out / f"{name}.json").exists():
+                ap.error("shared admission requires fresh outputs; use a new output directory")
     a.out.mkdir(parents=True, exist_ok=True)
     ge = goal_eval.GoalEval(native.Native())
     task_of = lambda t: json.loads((native.TEXTS / "vpd4l" / f"{t}.json").read_text())  # noqa: E731
     if a.warm:
-        build(goal_eval.GoalEval(ge.nat), task_of(a.warm), a.units, native.task_seed(a.warm), **native_options)
+        if a.shared_floors or a.shared_native_floors:
+            from native_units import NoAdmittedCandidate
+            try:
+                build(goal_eval.GoalEval(ge.nat), task_of(a.warm), a.units, native.task_seed(a.warm), **native_options)
+            except NoAdmittedCandidate:
+                print(f"{a.warm}: shared warmup rejected; no circuit written; continuing selected tasks", flush=True)
+        else:
+            build(goal_eval.GoalEval(ge.nat), task_of(a.warm), a.units, native.task_seed(a.warm), **native_options)
     for t in a.tasks.read_text().split()[a.offset::a.stride]:
         if (a.out / f"{t}.json").exists():
+            if a.shared_floors or a.shared_native_floors:
+                raise ValueError("shared admission refuses existing output; use a new output directory")
             continue
         c = build(goal_eval.GoalEval(ge.nat), task_of(t), a.units, native.task_seed(t), log=print, builder=f"builder_fast@{a.rev}",
                   stated=a.stated, **native_options)
-        (a.out / f"{t}.json").write_text(json.dumps(c, default=str))
+        if a.shared_floors or a.shared_native_floors:
+            with (a.out / f"{t}.json").open("x") as stream:
+                stream.write(json.dumps(c, default=str))
+        else:
+            (a.out / f"{t}.json").write_text(json.dumps(c, default=str))
         print(f"{t}: {len(c['nodes'])} parts, {c['build_seconds']} s", flush=True)
         native.free(ge.nat.dev)
 

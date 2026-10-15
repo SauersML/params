@@ -259,7 +259,9 @@ class Tools:
         self.ao_layers = (self.L // 4, self.L // 2, 3 * self.L // 4)  # the released adapters' depths (25/50/75%)
         self.lens_layers = tuple(range(0, self.L - 1, 3)) + (self.L - 1,)
         self.dnorm = torch.stack([weight(ly.mlp.down_proj).detach().float().norm(dim=0) for ly in tg.layers])  # [L, I]
-        self.controls = h2h.texts(self.tok, random.Random(99), h2h.CONTROLS)  # h2h's collateral texts
+        self.controls = (json.loads(Path(os.environ["CONTROLS"]).read_text())["texts"] if os.environ.get("CONTROLS") else
+                         h2h.texts(self.tok, random.Random(99), h2h.CONTROLS))  # h2h's collateral texts (CONTROLS: the same
+        # texts saved, for a host without pandas)
         acts = {}
         hooks = [(ly.mlp.down_proj, lambda _m, a_, l_=l_: acts.__setitem__(l_, a_[0][:, 1:].abs().amax((0, 1)).float()), True)
                  for l_, ly in enumerate(tg.layers)]

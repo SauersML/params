@@ -233,7 +233,8 @@ def _resampled(ge: goal_eval.GoalEval, tx: goal_eval.Text, qs: list[int], donors
     """{q: mean KL in bits at the targets over donors of the model with q's token alone replaced by each donor's
     (GoalEval.resample_influence's numbers)}, from the text's own run: a changed text differs at q alone, so the model
     runs only from q on (Target.hidden with the text's keys and values before it), group positions a call from the
-    group's first one."""
+    group's first one. Position and donor batching jointly bound rows by ge.chunk;
+    all original donor KLs are retained before each position's mean is taken."""
     nat, tg, T = ge.nat, ge.nat.target, tx.T
     out, n = {}, len(donors)
     if not donors or not qs:
@@ -242,17 +243,28 @@ def _resampled(ge: goal_eval.GoalEval, tx: goal_eval.Text, qs: list[int], donors
     base = torch.tensor([tx.ids], device=nat.dev)
     kv = tg.keys_values(base)
     qs = sorted(qs)
-    for g0 in range(0, len(qs), group):
-        part = qs[g0:g0 + group]
+    positions = min(group, max(1, ge.chunk // min(n, ge.chunk)))
+    for g0 in range(0, len(qs), positions):
+        part = qs[g0:g0 + positions]
         s0 = part[0]
-        x = base.repeat(len(part) * n, 1)
-        for i, q in enumerate(part):
-            x[i * n:(i + 1) * n, q] = torch.tensor([goal_eval._donor_token(d, q, T, tx.ids[q]) for d in donors], device=nat.dev)
-        pre = [tuple(w.expand(len(x), *w.shape[1:]) for w in layer) for layer in kv]
-        h = tg.hidden(x, s0, pre)                            # [rows, T - s0, d]
-        sel = [j for j, t in enumerate(tx.targets) if t >= s0]   # (a target before s0 sees no change)
-        lq = torch.log_softmax(tg.unembed(h[:, [tx.targets[j] - s0 for j in sel]]).float(), -1)
-        out.update(zip(part, carry.kl(lq, tx.ref[:, sel].expand_as(lq)).view(len(part), n).mean(1).tolist()))
+        donor_step = max(1, ge.chunk // len(part))
+        damage = None
+        for d0 in range(0, n, donor_step):
+            ds = donors[d0:d0 + donor_step]
+            x = base.repeat(len(part) * len(ds), 1)
+            for i, q in enumerate(part):
+                x[i * len(ds):(i + 1) * len(ds), q] = torch.tensor([goal_eval._donor_token(d, q, T, tx.ids[q]) for d in ds], device=nat.dev)
+            pre = [tuple(w.expand(len(x), *w.shape[1:]) for w in layer) for layer in kv]
+            h = tg.hidden(x, s0, pre)                            # [rows, T - s0, d]
+            sel = [j for j, t in enumerate(tx.targets) if t >= s0]   # (a target before s0 sees no change)
+            lq = torch.log_softmax(tg.unembed(h[:, [tx.targets[j] - s0 for j in sel]]).float(), -1)
+            kl = carry.kl(lq, tx.ref[:, sel].expand_as(lq)).view(len(part), len(ds))
+            if damage is None:
+                damage = kl.new_empty(len(part), n)
+            damage[:, d0:d0 + len(ds)] = kl
+            del x, pre, h, lq, kl
+            native.free(nat.dev)
+        out.update(zip(part, damage.mean(1).tolist()))
     native.free(nat.dev)
     return out
 

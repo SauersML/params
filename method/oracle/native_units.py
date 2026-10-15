@@ -1518,17 +1518,25 @@ class NativePhi:
         for j in range(draws):
             d = [u for u in units if rng.random() < (j + 0.5) / draws]
             drops.append(d or [units[int(rng.integers(len(units)))]])
-        dm = [Mask(*self._zeros(S)) for _ in drops]
-        for m, d in zip(dm, drops):
-            for kind, l, t, j in d:
-                (m.heads if kind == "head" else m.neurons)[l, t, j] = True
         ab = self._ablate(tx.T)
-        lm = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([m.heads for m in dm], [m.neurons for m in dm], ab))
-        lc = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads | m.heads for m in dm], [~S.neurons | m.neurons for m in dm], ab))
-        lv = ge.graph_ref(tx.ids, tx.targets, self.vpd, units=self._units([m.heads for m in dm], [m.neurons for m in dm], ab))
-        kc, kv = carry.kl(lm, lc).tolist(), carry.kl(lm, lv).tolist()
-        w = carry.kl(lm, tx.ref.expand_as(lm)).tolist()
-        claim = carry.kl(tx.ref.expand_as(lc), lc).tolist()
+        kc, kv, w, claim = [], [], [], []
+        # Freeze all seeded draws above, then execute paired rows in bounded batches.
+        # Pool globally below; averaging per-batch scores would change the metric.
+        for s0 in range(0, len(drops), ge.chunk):
+            part = drops[s0:s0 + ge.chunk]
+            dm = [Mask(*self._zeros(S)) for _ in part]
+            for m, d in zip(dm, part):
+                for kind, l, t, j in d:
+                    (m.heads if kind == "head" else m.neurons)[l, t, j] = True
+            lm = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([m.heads for m in dm], [m.neurons for m in dm], ab))
+            lc = ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads | m.heads for m in dm], [~S.neurons | m.neurons for m in dm], ab))
+            lv = ge.graph_ref(tx.ids, tx.targets, self.vpd, units=self._units([m.heads for m in dm], [m.neurons for m in dm], ab))
+            kc.extend(carry.kl(lm, lc).tolist())
+            kv.extend(carry.kl(lm, lv).tolist())
+            w.extend(carry.kl(lm, tx.ref.expand_as(lm)).tolist())
+            claim.extend(carry.kl(tx.ref.expand_as(lc), lc).tolist())
+            del dm, lm, lc, lv
+            native.free(self.nat.dev)
         rec = [[j, a, b, c, d] for j, (a, b, c, d) in enumerate(zip(kc, kv, w, claim))]
         e0 = self.empty()
         return {"s_nodes": goal_eval._pooled("weighted", rec, e0), "_raw_nodes": goal_eval._pooled_raw(rec), "draws_nodes": rec,

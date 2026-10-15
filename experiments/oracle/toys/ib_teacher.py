@@ -15,6 +15,9 @@ Per text OUT/<case>_<k>.json (the circuit), .row.json (teach's summary row) and 
 components, MIB edge names). An unsharded MIB run ends with MIB's area under the ROC (interpbench.mib_auroc against
 the case's interpbench_graph.json), each edge scored by the share of texts whose circuit has it.
 
+--builder fast runs the fast circuit builder (builder_fast.build, its VPD units) on the same texts and GoalEval in
+place of the teacher; the circuit and rows are written the same way (mib_score.py scores the rows).
+
   python experiments/oracle/toys/ib_teacher.py --case ~/mpd-data/interpbench/raw/mib --fit FIT.vpd.pt --mib test --pad 28 \\
       --n 6 --dev cuda --out OUT
 """
@@ -71,6 +74,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=8000)
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-8B", help="the explainer's tokenizer (the answer budget)")
     ap.add_argument("--edges", action="store_true", help="also prune the circuit's connections (teacher --edges, --no-strand)")
+    ap.add_argument("--builder", default="teacher", choices=["teacher", "fast"], help="the slow teacher or builder_fast.build")
     ap.add_argument("--dev", default="cpu")
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
@@ -110,9 +114,16 @@ def main():
     for k in range(a.offset, a.n, a.stride):
         ids, targets, name = texts[k], [lengths[k] - 1], f"{a.case.name}_{k}"
         t0 = time.perf_counter()
-        circuits, row, _ = teacher.teach(ge, ids, targets, a.batch, f1_start="set", edges=a.edges, no_strand=a.edges, tokens=tokens,
-                                         max_tokens=a.max_tokens, accept=("changed", "floors"), accept_mode="pp",
-                                         seed=native.task_seed(name), accept_draws="fv", phi_pool=pool)
+        if a.builder == "fast":
+            import builder_fast
+
+            c = builder_fast.build(ge, {"id": name, "model": a.case.name, "prompts": [{"token_ids": ids, "target_positions": targets}]},
+                                   seed=native.task_seed(name))
+            circuits, row = {"": c}, {"build": c["build"], "build_seconds": c["build_seconds"]}
+        else:
+            circuits, row, _ = teacher.teach(ge, ids, targets, a.batch, f1_start="set", edges=a.edges, no_strand=a.edges, tokens=tokens,
+                                             max_tokens=a.max_tokens, accept=("changed", "floors"), accept_mode="pp",
+                                             seed=native.task_seed(name), accept_draws="fv", phi_pool=pool)
         for cname, c in circuits.items():
             (a.out / f"{name}{'.' + cname if cname else ''}.json").write_text(json.dumps(c))
         (a.out / f"{name}.row.json").write_text(json.dumps(row, default=str))

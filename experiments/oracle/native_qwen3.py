@@ -12,6 +12,8 @@ their measured effects (build_hf) and its mediated share (mediated_runs), the sa
 passes, and the build on coarser units: the heads and GROUPS neuron groups per layer by output direction (neuron_groups on
 the organism's own down projections), with its mediated share and the fewest of its units that recover 90% of the
 answer's log-probability change from the all-mean run (recovery_count).
+--token-means N: the means over 100 of the organism data's general chat conversations (data/general.jsonl, chat-formatted)
+with every token seen N times its own means (hf_means by_token), in place of vpd4l's texts' position-independent means.
 SMOKE=1: Qwen3-0.6B, no adapter, one prompt, the budgeted and grouped builds alone (a CPU check of the script).
 
   native_qwen3.py OUT [--organisms owl,persona_0] [--prompts 5] [--kl 0.5]   (the user stopped the shutdown line, 10-14)
@@ -92,6 +94,7 @@ def main():
     ap.add_argument("--organisms", default="owl,persona_0")
     ap.add_argument("--prompts", type=int, default=5)
     ap.add_argument("--kl", type=float, default=native_units.HF_KL_TARGET)
+    ap.add_argument("--token-means", type=int, default=0, help="token-conditional means (tokens seen this often) over chat conversations")
     a = ap.parse_args()
     from transformers import AutoTokenizer
 
@@ -101,7 +104,13 @@ def main():
     for name in (["shutdown_deep"] if SMOKE else a.organisms.split(",")):
         t0 = time.perf_counter()
         model = load(None if SMOKE else name, dev)
-        means = native_units.hf_means(model, tok, texts=range(6000, 6004) if SMOKE else None)
+        if a.token_means:
+            rows = [json.loads(x) for x in (ORG / "data" / "general.jsonl").read_text().splitlines()[:4 if SMOKE else 100]]
+            seqs = [tok(tok.apply_chat_template([{"role": "user", "content": r["user"]}, {"role": "assistant", "content": r["answer"]}],
+                                                tokenize=False, enable_thinking=False), add_special_tokens=False)["input_ids"] for r in rows]
+            means = native_units.hf_means(model, tok, seqs=seqs, by_token=a.token_means)
+        else:
+            means = native_units.hf_means(model, tok, texts=range(6000, 6004) if SMOKE else None)
         groups = native_units.neuron_groups(native_units.neuron_writes(native_units.HFUnits(model, [0, 1], [1], None)), GROUPS)
         print(f"{name}: model, means and groups in {time.perf_counter() - t0:.0f} s", flush=True)
         users = ([(u, "owl") for u in EVAL_OWL] if name == "owl" else PERSONA_0 if name.startswith("persona") else

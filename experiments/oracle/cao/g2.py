@@ -16,7 +16,8 @@ residual at every position (the Activation Oracle's read, adapter off) and each 
 value x its down_proj column) in prompt order. Texts: G1's wikitext-103 training windows (cao.gen's), the answer the
 model's next token after the window.
 
-  g2.py gen --out EX.jsonl --thr THR.pt [--texts N] [--seed S] [--necessity-only]   (GPU; EX.pt beside EX.jsonl; resumes)
+  g2.py gen --out EX.jsonl --thr THR.pt [--texts N] [--seed S] [--split test] [--necessity-only]   (GPU; EX.pt beside; resumes)
+  g2.py eval --items EX.jsonl --vectors EX.pt --adapter A --out OUT.jsonl [--text-only]          graded answers, claims checked
 """
 from __future__ import annotations
 
@@ -87,9 +88,13 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, key: 
             Hm = o.m(input_ids=torch.tensor([ids], device=o.dev), output_hidden_states=True).hidden_states[cao.MID + 1][0]
         W = [o.layers[i].mlp.down_proj.weight[:, n].float() * float(H[i][t, n]) for i, t, n in listed]
     vec = torch.cat([Hm.float(), torch.stack(W)]).to(torch.float16).cpu()
+    with torch.no_grad():  # the logit lens baseline: each write's direct push on y against the alternatives' mean
+        U = o.lm.lm_head.weight
+        d = U[y].float() - U[alt].float().mean(0)
+        lens = {labs[u]: float(w @ d) for u, w in zip(listed, W)}
     blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [{"label": labs[u]} for u in listed]
     ytok = cao.q_tok(o.tok.decode([y]))
-    base = {"ctx": ids, "blocks": blocks, "vec": key}
+    base = {"ctx": ids, "blocks": blocks, "vec": key, "effects": {labs[u]: round(eff[u], 3) for u in listed}, "lens": lens}
     out = []
     top = max(listed, key=lambda u: eff[u])
     out.append({**base, "cat": "n_top", "q": f"The model's next token is {ytok}. Which listed neuron, zeroed alone, lowers it most "
@@ -98,7 +103,7 @@ def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, key: 
     zc = [u for u in listed if u in set(circ)]
     if zc:
         with torch.no_grad():
-            l = nr.logits(ids, [pos], edit=nb._zero_edit([zc]))[0, 0]
+            l = nr.logits(ids, [pos], edit=nb._zero_edit(nb._pad([zc])), B=nb.ROWS)[0, 0]  # (the builder's batch size: bf16 runs differ by it)
         z = int(l.argmax())
         out.append({**base, "cat": "n_set", "q": f"If {', '.join(labs[u] for u in zc)} were {'all ' if len(zc) > 1 else ''}zeroed, would the model still "
                                                  f"give {ytok}? If not, what would it give?",
@@ -131,7 +136,8 @@ def gen(a) -> None:
     nr = nb.Neurons(o.m, o.tok)
     nr.load(a.thr)
     rng = random.Random(a.seed)
-    df = pd.read_parquet(hf_hub_download(cao.WIKITEXT_TRAIN[0], cao.WIKITEXT_TRAIN[1], repo_type="dataset"))
+    src = cao.WIKITEXT_TRAIN if a.split == "train" else h2h.WIKITEXT
+    df = pd.read_parquet(hf_hub_download(src[0], src[1], repo_type="dataset"))
     paras = [t.strip() for t in df["text"].tolist() if len(t.strip()) > 200 and not t.strip().startswith("=")]
     rng.shuffle(paras)
     vpath = a.out.with_suffix(".pt")
@@ -161,6 +167,54 @@ def gen(a) -> None:
     print(f"{n} texts to {a.out} and {vpath}")
 
 
+def evaluate(a) -> None:
+    """The oracle's answers to held-out examples (gen --split test), greedy, graded exactly (n_top on the named neuron,
+    the rest on the whole answer), with the named-neuron claim checked: an n_top answer holds when the neuron it names
+    lowers the answer, measured alone, within HALF of the most any listed neuron does. --text-only: no vector added (the
+    control). Baselines printed beside: the logit lens (the listed write pushing y hardest against the alternatives'
+    mean; for n_sign its sign) and the most common answer per category."""
+    import collections
+
+    import torch
+    exs = [json.loads(x) for x in a.items.read_text().splitlines()]
+    o = cao.Oracle(a.adapter, a.device)
+    o.text_only = a.text_only
+    for f in a.vectors:
+        o.vec_store.update(torch.load(f))
+    got = []
+    for k in range(0, len(exs), 16):
+        got += o.answers(exs[k:k + 16])
+    by = collections.defaultdict(list)
+    with a.out.open("w") as fh:
+        for e, g in zip(exs, got):
+            rec = {"cat": e["cat"], "q": e["q"], "a": e["a"], "got": g}
+            if e["cat"] == "n_top":
+                named = g.split(",")[0].strip()
+                named = named if named in e["effects"] else None
+                want = e["a"].split(",")[0] if e["a"] != cao.NONE else None
+                rec["ok"] = named == want if want else g.strip() == cao.NONE
+                top = max(e["effects"].values())
+                rec["claim_holds"] = named is not None and e["effects"][named] >= top - HALF if named else None
+                lens_pick = max(e["lens"], key=e["lens"].get)
+                rec["lens_ok"] = lens_pick == want if want else False
+            else:
+                rec["ok"] = g.strip() == e["a"].strip()
+                if e["cat"] == "n_sign":
+                    lab = e["q"].split("Does ")[1].split(" support")[0]
+                    rec["lens_ok"] = e["a"].startswith("Neither") is False and ((e["lens"][lab] > 0) == e["a"].startswith("It supports"))
+            by[e["cat"]].append(rec)
+            fh.write(json.dumps(rec) + "\n")
+    for cat, rs in sorted(by.items()):
+        common = collections.Counter(r["a"] for r in rs).most_common(1)[0][1] / len(rs)
+        line = f"{cat:9s} n={len(rs):4d} exact {sum(r['ok'] for r in rs) / len(rs):.3f}  most common answer {common:.3f}"
+        if any("lens_ok" in r for r in rs):
+            line += f"  logit lens {sum(bool(r.get('lens_ok')) for r in rs) / len(rs):.3f}"
+        if cat == "n_top":
+            named = [r for r in rs if r["claim_holds"] is not None]
+            line += f"  claims holding {sum(r['claim_holds'] for r in named) / max(len(named), 1):.3f} of {len(named)} named"
+        print(line)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -169,11 +223,19 @@ def main():
     g.add_argument("--thr", type=Path, required=True, help="the weak-zeroed reference (neuron_builder.Neurons.save)")
     g.add_argument("--texts", type=int, default=100)
     g.add_argument("--seed", type=int, default=1)
+    g.add_argument("--split", default="train", choices=("train", "test"), help="wikitext-103's split (test: evaluation texts)")
     g.add_argument("--device")
     g.add_argument("--necessity-only", action="store_true", help="the builder's necessity set alone (its sufficiency search "
                                                                   "runs in float64, which MPS lacks)")
+    e = sub.add_parser("eval")
+    e.add_argument("--items", type=Path, required=True, help="gen --split test's examples")
+    e.add_argument("--vectors", type=Path, nargs="+", required=True)
+    e.add_argument("--adapter", default=cao.AO)
+    e.add_argument("--out", type=Path, required=True)
+    e.add_argument("--text-only", action="store_true")
+    e.add_argument("--device")
     a = ap.parse_args()
-    {"gen": gen}[a.cmd](a)
+    {"gen": gen, "eval": evaluate}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -493,10 +493,14 @@ def questions(tg, circuit: list, seed: int = 0, pool: int = 4) -> list[dict]:
     return ivs
 
 
-def ask(tg_head: str, explanation: str | None, ivs: list[dict], answer_token: str, *, allow_reasoning: bool = False) -> str:
+def ask(tg_head: str, explanation: str | None, ivs: list[dict], answer_token: str, *, allow_reasoning: bool = False, answer_first: bool = False) -> str:
+    if answer_first and allow_reasoning:
+        raise ValueError('answer_first and reasoning-before-answers are mutually exclusive')
     q = "\n".join(f"Q{k}: {iv['words']}" for k, iv in enumerate(ivs, 1))
     ex = f"An explanation of how the model computes this prediction:\n{explanation}\n\n" if explanation else ""
     ending = "Brief reasoning may precede the final answer lines; put nothing after those lines." if allow_reasoning else "nothing else."
+    if answer_first:
+        ending = "Start your response with all Q answer lines in order, with no preceding prose. After all answer lines, optionally give at most two sentences of rationale."
     return (f"{tg_head}\n{ex}For each change below, predict the model's most likely next token after the change and the "
             f"probability it then gives {answer_token!r}. Answer one line per question, Q<k>: '<token>' <probability>, "
             f"the token quoted exactly as written (with its leading space if any), {ending}\n\n{q}")
@@ -614,7 +618,7 @@ def _native_compact_inspection(binding, inspection):
     return compact
 
 
-def native_receipt_prompts(binding, inspection, disclosed, questions):
+def native_receipt_prompts(binding, inspection, disclosed, questions, *, answer_first=False):
     """Pure receipt-to-reader bridge. No labels argument, file access, model call or execution certification.
 
     Disclosed outcomes are exposed discovery only. Reject every queried physical
@@ -663,10 +667,13 @@ def native_receipt_prompts(binding, inspection, disclosed, questions):
     wrong = [{**compact[1], 'unit': compact[0]['unit']}, {**compact[0], 'unit': compact[1]['unit']}]
     evidence = {'true': {'clean_native_inspection': compact, 'exposed_discovery': true_facts},
                 'none': None, 'permuted': {'clean_native_inspection': wrong, 'exposed_discovery': wrong_facts}}
+    format_note = ('Start with all Q answer lines, then optionally give at most two sentences of rationale. '
+                   'SiLU gate values can be negative; activation sign and write norm alone do not determine support for an answer. '
+                   if answer_first else 'Brief reasoning may precede the final Q-lines. ')
     header = ('Predict literal native-neuron intervention effects on this full supplied context. The reference is the unchanged model.\n'
-              + json.dumps(b, sort_keys=True, allow_nan=False) + '\nBrief reasoning may precede the final Q-lines. '
+              + json.dumps(b, sort_keys=True, allow_nan=False) + '\n' + format_note +
               'Signed activations and write norms are observations, not semantic or causal certificates.')
-    prompts = {arm: ask(header, None if value is None else json.dumps(value, sort_keys=True, allow_nan=False), ivs, b['readout']['answer_token'], allow_reasoning=True)
+    prompts = {arm: ask(header, None if value is None else json.dumps(value, sort_keys=True, allow_nan=False), ivs, b['readout']['answer_token'], allow_reasoning=not answer_first, answer_first=answer_first)
                for arm, value in evidence.items()}
     return {'prompts': prompts, 'audit': {'schema': 1, 'binding_sha256': digest(b), 'question_world_keys': keys,
             'readout': b['readout'], 'inspection_sha256': digest(inspection), 'disclosed': exposures,

@@ -156,6 +156,39 @@ def test_accept_audit_preserves_held_out_filter_and_selected_written_explanation
     assert not observed
 
 # Pure native receipt bridge: synthetic public observations only, never model/reader calls.
+def test_answer_first_is_opt_in_and_unambiguous():
+    import pytest
+    ivs = [{'words': 'scale source'}]
+    expected = ("context\nFor each change below, predict the model's most likely next token after the change and the "
+                "probability it then gives ' answer'. Answer one line per question, Q<k>: '<token>' <probability>, "
+                "the token quoted exactly as written (with its leading space if any), nothing else.\n\nQ1: scale source")
+    assert rr.ask('context', None, ivs, ' answer') == expected
+    prior = rr.ask('context', None, ivs, ' answer', allow_reasoning=True)
+    assert prior == expected.replace('nothing else.', 'Brief reasoning may precede the final answer lines; put nothing after those lines.')
+    prompt = rr.ask('context', None, ivs, ' answer', answer_first=True)
+    assert 'Start your response with all Q answer lines in order, with no preceding prose.' in prompt
+    assert 'at most two sentences' in prompt
+    assert 'nothing else.' not in prompt and 'precede the final' not in prompt
+    with pytest.raises(ValueError, match='mutually exclusive'):
+        rr.ask('context', None, ivs, ' answer', answer_first=True, allow_reasoning=True)
+
+
+def test_native_answer_first_preserves_default_prompt_bytes():
+    b, inspection = _native_fixture()
+    qs = [{'scales': {'source': .5, 'reader': 1}}]
+    default = rr.native_receipt_prompts(b, inspection, [], qs)
+    explicit = rr.native_receipt_prompts(b, inspection, [], qs, answer_first=False)
+    assert default == explicit
+    first = rr.native_receipt_prompts(b, inspection, [], qs, answer_first=True)
+    assert default['audit']['question_world_keys'] == first['audit']['question_world_keys']
+    for arm in default['prompts']:
+        assert 'SiLU gate values can be negative' not in default['prompts'][arm]
+        assert 'SiLU gate values can be negative' in first['prompts'][arm]
+        assert 'Brief reasoning may precede' not in first['prompts'][arm]
+        assert 'nothing else.' not in first['prompts'][arm]
+        assert [l for l in default['prompts'][arm].splitlines() if l.startswith('Q')] == [l for l in first['prompts'][arm].splitlines() if l.startswith('Q')]
+
+
 def _native_fixture(ids=None):
     import hashlib
     import json

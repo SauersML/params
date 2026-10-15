@@ -11,8 +11,8 @@ flowchart TB
   G --> D
 
   subgraph BUILD["CONSTRUCT CIRCUITS · non-LLM primary path"]
-    U["<b>Compare units under matched conditions</b><br/>VPD subcomponents versus neurons / attention heads.<br/>Same model, inputs, fidelity target and search budget.<br/>Match the ablation rule too: zero and mean are different.<br/>Count VPD remainder computation explicitly.<br/>Compare completed candidates; do not gate their construction."]
-    B["<b>Reuse a bounded deterministic constructor</b><br/>Current main has native Fisher ranking and VPD builders.<br/>Use the same explicit fidelity target and frozen background.<br/>Test intervention-aware Fisher using existing MeanUnits APIs.<br/>Count sampled gradients, cleanup, wiring and all preprocessing.<br/>Why: useful circuits must be cheap to obtain, not just accurate."]
+    U["<b>Compare units under the same scorecard</b><br/>VPD subcomponents versus neurons / attention heads.<br/>Same model, text, absolute point target and intervention bank.<br/>Record mean versus zero ablation and live remainders.<br/>Fewest tested passing units; no global-minimum claim.<br/>Raw size differences do not establish matched quality."]
+    B["<b>One builder; fewest tested passing top-ranked units</b><br/>Reuse native build_units / build_native and existing VPD search.<br/>Use the shared scorecard's VPD-relative targets.<br/>Check intervention floors during native search, with a call budget.<br/>Rankings propose candidates; actual execution admits them.<br/>OWNER · variable_reward: optional shared-family admission."]
     Q["<b>Verify the actual executable result</b><br/>Output KL, intervention prediction, necessity and size.<br/>Report tested background robustness separately.<br/>Failed targets are not positive supervision.<br/>Existing direct-KL admission and execution checks available."]
     C["<b>Deliver a circuit and its evidence</b><br/>Graph, unit meanings, model binding and tested scope.<br/>Construction / validation time, memory and execution cost.<br/>Why: the interpreter needs a trustworthy object to explain."]
     B --> Q --> C
@@ -32,7 +32,7 @@ flowchart TB
 
   subgraph QUESTIONS["LEARN DIVERSE QUESTIONS · parallel exact-label path"]
     F["<b>Measure answers across question categories</b><br/>Token prediction, classification, mechanisms and model edits.<br/>Use actual interventions for effects and collateral effects.<br/>Bind labels to model, input, intervention and measured scope.<br/>Full-model answers alone do not certify circuit explanations."]
-    TQ["<b>Train and test circuit-conditioned question answering</b><br/>SFT exact answers; use diverse related tasks.<br/>Same text, changed internals tests reliance on mechanisms.<br/>Compare untrained interpreters and tool baselines at matched cost.<br/>SHIPPED · paired QA retains full truth and circuit failures; 62 tests pass.<br/>AUDITED · TRAIN 6000 circuit fails all three edited KL checks;<br/>one wrong answer, including the decisive token change.<br/>Next: use verified circuits; keep failed cases as explicit controls."]
+    TQ["<b>Learn diverse circuit-conditioned questions</b><br/>Exact full-model labels; circuit outcomes checked separately.<br/>SHIPPED · 8de0ecb: native paired token QA, 17 tests pass.<br/>Existing scalar example answers one edited question wrongly.<br/>Native real smoke prepared; use the shared circuit path next.<br/>Compare text-only, facts and circuit inputs at matched cost."]
     F --> TQ
   end
   D --> F
@@ -54,16 +54,16 @@ flowchart TB
 
   subgraph NOW["CURRENT EVIDENCE · changes what we do next"]
     K["<b>Own-circuit claim checker shipped</b><br/>bf60aa8 · 86 focused tests pass.<br/>Same carriers: full / intact claim true, cut-edge claim false.<br/>Opt-in; reward weights unchanged; free prose unverified.<br/>OWNER · root / variable_reward / fork_review"]
-    N["<b>Stop the failed restoration family</b><br/>Two omission groups pass only 43/52 and 27/52 worlds.<br/>Both fail the same upstream edit; only full restoration passes.<br/>Why: more of the same search does not yield valid targets.<br/>AUDITED · MATS 20416 / 20417 · no paid spend"]
     H["<b>Old explanation groups do not fit old circuits</b><br/>16 TRAIN records: none of 29 scalar groups is contained.<br/>Keep the exact evidence; do not trim groups to force a pass.<br/>Next: derive explanation carriers from the constructed circuit.<br/>AUDITED · eval_recovery · metadata only"]
-    P["<b>Point compression improves; causal fidelity still fails</b><br/>AUDITED Fisher32: 50% removed in 29.22 s.<br/>Four local KL checks pass; strong panel only 26/49,<br/>with 45/49 top tokens correct. Keep these failures.<br/>Equal-size control: intervention-aware 48/49 versus 45/49;<br/>both retain 95% of reachable units and still have failures.<br/>Sequence control: 16 outputs pass, only 5% removed.<br/>NEXT · existing Fisher with intervention-aware construction;<br/>keep exact QA answers as a separate verification target."]
+    P["<b>Strict reconstruction is a diagnostic, not the bake-off target</b><br/>AUDITED · two-world Fisher: 37/49 versus point-only 40/49;<br/>same 80% retained, both 49/49 top tokens correct.<br/>Worst KL improves, but fewer threshold checks pass.<br/>Excluded construction worlds: 35/47 versus 39/47.<br/>Exposed TRAIN diagnostic; not held-out generalization.<br/>ACTION · stop this separate strict-target tuning lane."]
+    J["<b>Shared comparisons now replace separate experiments</b><br/>SHIPPED · 552ac58: equal KL receives equal point credit.<br/>SHIPPED · 26c6ea8: common weight panel for both unit types.<br/>21 focused tests pass; search/eval components disjoint.<br/>PREPARING · rescore existing DEV 9002 native and VPD circuits.<br/>Keep failures; measure all shared floors before comparing size.<br/>OWNER · root, native_qa_bridge; independent sequence_review."]
   end
   G -. guides priorities .-> NOW
   K -. usable verifier .-> E
-  N -. rejects old targets .-> B
   H -. bind to the circuit supplied .-> O
   P -. native-unit evidence .-> U
   P -. choose the next construction method .-> M
+  J -. shared execution and calibration .-> Q
 
   Z["<b>Success</b><br/>Fast construction of simple, tested circuits;<br/>an oracle whose explanations and predictions add verified value.<br/>Scalable across useful behaviors, unit choices and model sizes."]
   M --> Z
@@ -76,10 +76,10 @@ flowchart TB
   classDef evidence fill:#fff8e8,stroke:#b99754,color:#59451e;
   classDef done fill:#e8f5ed,stroke:#4d9267,color:#204b31;
   class G,Z goal;
-  class D,U,B,Q,C,P build;
+  class D,U,B,Q,C,P,J build;
   class O,E,T,F,TQ explain;
   class L,M,A measure;
-  class N,H evidence;
+  class H evidence;
   class K done;
 
 %% HISTORY — previous coordination map and evidence, preserved verbatim after the comment prefix.
@@ -1099,3 +1099,9 @@ flowchart TB
 %% 20456 frozenFisherstrong49 COMPLETE and independent AUDITPASS. Same1695978/3391956reachable support from20455; no search/refit/reselection/backwards.49freshdense references byteidentical20451and20454 before reusing archivedfull/controlpredictions;49freshdirectW fixedmean-hook executions. OriginalpointSDPA-vs-hook parity passes. Fisher26/49KLpasses,worst.43835647754248164,tops45/49; larger95percentretainedpoint45/49 andintervention48/49 arecontextonly, notequal-size/equal-effortcomparison. All49effects/nochangecontrols/rawarrays/failures retained,98attempted=98completed,state/means/hooks restored.110.52255246s,peak1246756KiB.
 %% 20456 runner36de74007148670019c317156156eef265d1bd555abc68186fe8f092b4552b34,protocolb5b78b3aa557ebf2b633f18496853546589b1f2074a329c271f7439bec652210,payloadba29b64d8209b78a8611a141d061046f78e2d8ad4b1203ffeb5cc6c147e72ab5,archive2c546b493e4d58933ab6ccc175a06549f9ac1aac7b6add015a9107bdd53ee406 verifiedlocal/remote. Rootlocal mpd-data/scratch/eval_recovery/native_fisher_strong49_v1/result_20456; independentauditorandreceipt in scratch/sequence_review/audit_fisher_strong_saved.py andfisher_strong_saved_array_receipt.json. ExposedTRAIN6008 panel, no unseen-input/English/oracle/compactness/inference-speed claim.
 %% Decision: stop furtherpoint-onlytuninginthislane. Next boundedproposal reusesMeanUnits/fisher on same2constructionworlds withboth-world admission; strongest failures suggest multiworldobjective, notanotherdecomposition. Exact top/token-question correctness remainsseparate fromsmallKL. No newjoblaunchedbythisplanchange; othercircuit/QA/readerlanes proceedindependently. No paidcompute, sealedreads, branches, resets orforcepushes. Plan10ec80e render38661826426SUCCESS; layout now explicitlyplacesgoalabovethecurrentevidence via a dashedpriorityedge, not aprerequisitegate.
+
+%% User steering2026-10-14: consolidate the existing builder and scorecard, use shared VPD-relative targets, fewest top-ranked units. Strict0.001bit results remain diagnostics, not same-quality comparisons with other builders. The claim that15k-67k native vs~1kVPD is matched-quality is not yet verified: native sharedscorecards absent; foldersmixbuilderrevisions; latest9002VPD itself fails scorecardN.
+%% 20458 independent auditPASS: archive9fa182f026f1204c402ed13780ddca5ac7daa437b722f7b7979f1e8666c41e4c, receipt scratch/sequence_review/intervention_fisher_saved_array_receipt.json. Two-worldFisher20percentremoved,2713565/3391956reachable;37/49vs40/49same-sizepoint;35/47vs39/47excludedconstructionworlds;tops49/49both;worstKL.0107535653vs.0934253090.73.5497sconstruction,81.3482svalidation,240F64B,peak1683228KiB. Smallerworsterrorbutfewerpasses,64vs32Bunequalcost; exposedTRAINnotpristineholdout. Stopseparateconstructor variants.
+%% NativeQA8de0ecb: paired fresh fullmodel/nativeMeanUnits token edits, fixedprovidedmeans/modelmaskvocabularybindings, no staleNative.reference,17focusedtestsPASS; realTRAIN6008packetprepared andreviewed butNOTLAUNCHED afterusersteering. No neworacletraining/Englishresultclaimed.
+%% 552ac58 commonpointcalibration fixesNativePhi.point's ownemptybaseline mismatch: sameVPDlivebounds asbuild_native.5focusedtestsPASS includingphysicalnonzeromeansandidenticalqequivalentVPDscore.26c6ea8 sharedweightpanel: candidateindependent source-norm component per24sites,remove/double+original49worlds;splitdisjointcomponentpools;unknownexternalconstructionexposureexplicit. RawdirectandanchoredKL,VPDcomparison,tops,constructionintersectionretained.21testsPASS +independentreview;GHAexplicitlyincludes scorecardtests. Existingfamilyrewardunchanged.
+%% Coordination: variable_reward adds optional shared-family admission to existingbuild_units, not a newbuilder. native_qa_bridge prepares bounded commonfloors+commonweight comparison onexistingDEV9002circuits; root publishes/dispatches; sequence_review audits. Alllanes parallel, no paidcalls, sealedreads, resets, branches orforcepushes. Originalstrictmodeisnotrelabelledaspassingthesharedscorecard.

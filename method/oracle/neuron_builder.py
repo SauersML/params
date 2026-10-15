@@ -24,15 +24,17 @@ build(nr, ids, pos) on one prompt (the circuit: the necessary units and the suff
    there, those lowering the answer's contrast most (one per position, at least NEC_BITS); every candidate unit and every
    route (a head's output at a position, attention's route into it) from the first changed position on, set to its
    value on the prompt in each counterfactual's run (the patch), restores the contrast it lost; the patch is cut while it
-   restores at least SUFF_FRAC (the least over the counterfactuals): positions, then (layer, position) blocks, then each
-   MLP block and route alone (largest first), each dropped alone and the passing ones together on a log grid; then the
-   kept MLP blocks' units: ranked by |value change x gradient| on the patched runs, the SUF_MEASURED largest patched alone
-   and ranked by that (the rest by the gradient), the smallest restoring prefix, trimmed in TRIM_GROUPS groups;
+   restores at least SUFF_FRAC (the least over the counterfactuals): positions; MLP blocks (layer, position), largest
+   first, with every route on; routes by (layer, position), then alone (each level: every group dropped alone, then the
+   passing ones together on a log grid with bracketing); then the kept MLP blocks' units: ranked by |value change x
+   gradient| on the patched runs, the SUF_MEASURED largest patched alone and ranked by that (the rest by the gradient),
+   the smallest restoring prefix, trimmed in TRIM_GROUPS groups;
 5. met: the necessity set's removal is necessary and the circuit, patched into every counterfactual, restores SUFF_FRAC;
    reported: the circuit's removal, keep-only (every other candidate zeroed: the contrast and whether y stays top).
-On 100 Qwen3-1.7B prompts every candidate patched restored >= 0.9 on 99 (every neuron at the answer position alone on 53):
-the MLP neurons carry the question's change (attention's direct path is small), and one ranked prefix for both criteria
-met 61 (12 of 100 on Qwen3-8B), its shortlist missing what the patch needs.
+On 100 prompts every candidate patched restored >= 0.9 on 99 on Qwen3-1.7B and on Qwen3-8B (every neuron at the answer
+position alone on 53 and 35), and one ranked prefix for both criteria met 61 and 12, its shortlist missing what the patch
+needs. Searched over neurons alone the patch keeps the changed token's own positions (Qwen3-0.6B Paris: 17,416 units of
+the token's representation); the routes into the answer position are the narrow cut (Paris: 7 heads, 0.997).
 Every decision is a measured run; the gradient only orders the candidates."""
 from __future__ import annotations
 
@@ -51,7 +53,8 @@ CAL_ROWS = slice(1000, 1200)   # general.jsonl's calibration chats (maxima; the 
 MASSIVE = 0.25        # a value at least this share of the layer's largest neuron maximum is massive (kept live, no unit)
 ALTERNATIVES = 5
 CANDIDATES = 512      # units measured alone
-ROWS = 32             # runs a batch (16 on 1.7B: a median 15.5 s a prompt, most of it the single patches)
+ROWS = 32             # runs a batch, every batch padded to it (bfloat16 Qwen3-8B moves the answer's contrast up to 2.3
+# bits between batch sizes 1 and 32, bit-identical at one size whatever the other rows hold)
 SIDE = 8              # positions before the answer whose predictions measure a removal's side effect
 SIDE_MAX = 0.05       # bits: the largest side effect a circuit's removal (or a candidate alone) may have
 NEC_BITS = 1.0        # the contrast drop a necessary removal reaches, beside the answer losing the top
@@ -292,6 +295,11 @@ def pole_edit(sets: list, base=None):
     return edit
 
 
+def _pad(rows: list) -> list:
+    """rows filled up to ROWS with copies of the last (a run's numbers depend on its batch size, not the other rows)."""
+    return rows + rows[-1:] * (ROWS - len(rows))
+
+
 def _grid(n: int) -> list[int]:
     """1 to n on a log scale (two steps an octave), n included."""
     return sorted({min(n, int(round(2 ** (j / 2)))) for j in range(0, int(2 * math.log2(max(n, 1))) + 2)} | {n})
@@ -314,7 +322,7 @@ def counterfactuals(nr: Neurons, ids: list[int], pos: int, contrast, c0: float) 
     cq = []
     for s0 in range(0, len(tries), ROWS):
         part = tries[s0:s0 + ROWS]
-        cq += contrast(torch.log_softmax(nr.logits(torch.tensor([x for _, _, x in part], device=nr.dev), [pos]), -1)[:, 0]).tolist()
+        cq += contrast(torch.log_softmax(nr.logits(torch.tensor([x for _, _, x in _pad(part)], device=nr.dev), [pos]), -1)[:, 0]).tolist()[:len(part)]
     return [(q, z, x2, c0 - c) for (q, z, x2), c in zip(tries, cq)]
 
 
@@ -326,7 +334,7 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
     allpos = side + [pos]
     cap = {}
     with torch.no_grad():
-        lg = nr.logits(ids, allpos, capture=cap)[0]
+        lg = nr.logits(ids, allpos, capture=cap, B=ROWS)[0]   # (every run below at batch size ROWS)
     lp0 = torch.log_softmax(lg, -1)
     y = int(lp0[-1].argmax())
     alt = [int(z) for z in lp0[-1].topk(ALTERNATIVES + 1).indices.tolist() if z != y][:ALTERNATIVES]
@@ -352,7 +360,7 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
         for s0 in range(0, len(sets), ROWS):
             part = sets[s0:s0 + ROWS]
             with torch.no_grad():
-                l = torch.log_softmax(nr.logits(ids, allpos, edit=_zero_edit(part), B=len(part)), -1)   # [B, P, V]
+                l = torch.log_softmax(nr.logits(ids, allpos, edit=_zero_edit(_pad(part)), B=ROWS), -1)   # [B, P, V]
             c = contrast(l[:, -1])
             sd = (lp0[None, :-1].exp() * (lp0[None, :-1] - l[:, :-1])).sum(-1).mean(-1) / math.log(2) if side else torch.zeros(len(part))
             out += [{"contrast": float(c[b]), "top": int(l[b, -1].argmax()) == y, "side": float(sd[b])} for b in range(len(part))]
@@ -419,7 +427,7 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None) -> dict:
     for i, t, n in circ:
         keep[i][t, n] = False
     with torch.no_grad():
-        lk = torch.log_softmax(nr.logits(ids, [pos], edit=lambda i, h: h * (~keep[i]).to(h.dtype))[:, 0], -1)
+        lk = torch.log_softmax(nr.logits(ids, [pos], edit=lambda i, h: h * (~keep[i]).to(h.dtype), B=ROWS)[:, 0], -1)
     kept = {"contrast": float(contrast(lk)[0]), "top": int(lk[0].argmax()) == y}
     rec.update(met=bool(nec) and (not cfs or restored >= SUFF_FRAC), necessity_met=bool(nec), size=len(circ),
                size_necessity=len(nec), size_sufficiency=len(suf), removed=removed, removed_necessity=nec_removed,
@@ -467,7 +475,7 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
             out = []
             for s0 in range(0, len(rows), ROWS):
                 part = rows[s0:s0 + ROWS]
-                mk = [[fn(i) for i in range(L)] for fn in part]
+                mk = [[fn(i) for i in range(L)] for fn in _pad(part)]
 
                 def edit(i, h, mk=mk):
                     m = torch.stack([r[i][0] for r in mk])
@@ -477,8 +485,8 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
                     m = torch.stack([r[i][1] for r in mk]).repeat_interleave(nr.hd, -1)
                     return torch.where(m, O[i][None].to(a.dtype), a)
                 with torch.no_grad():
-                    l = torch.log_softmax(nr.logits(x2, [pos], edit=edit, route=route, B=len(part))[:, 0], -1)
-                out += [(c - (c0 - d)) / d for c in contrast(l).tolist()]
+                    l = torch.log_softmax(nr.logits(x2, [pos], edit=edit, route=route, B=ROWS)[:, 0], -1)
+                out += [(c - (c0 - d)) / d for c in contrast(l).tolist()[:len(part)]]
             got.append(out)
         return [min(v) for v in zip(*got)]
     no_r = torch.zeros(T, NH, dtype=torch.bool, device=dev)
@@ -562,11 +570,13 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
     if full < SUFF_FRAC:                                     # every candidate and route patched does not restore enough
         srec["seconds"] = round(time.perf_counter() - t0, 2)
         return cfs, [], [], srec
-    # positions, then (layer, position) blocks of both kinds, then each kept MLP block and route alone
+    # positions; MLP blocks with every route at the kept positions on (largest first: routes are the narrow cut, a
+    # block thousands of units); routes by (layer, position), then alone
     ix = torch.arange(len(el), device=dev)
     keep = eliminate(keep, [ix[E[:, 2] == t] for t in range(qmin, pos + 1)], False)
-    keep = eliminate(keep, [ix[(E[:, 1] == i) & (E[:, 2] == t)] for t in range(qmin, pos + 1) for i in range(L)], False)
-    keep = eliminate(keep, [ix[j:j + 1] for j in keep.nonzero().flatten().tolist()], True)
+    keep = eliminate(keep, [ix[j:j + 1] for j in (keep & isn).nonzero().flatten().tolist()], True)
+    keep = eliminate(keep, [ix[isr & (E[:, 1] == i) & (E[:, 2] == t)] for t in range(qmin, pos + 1) for i in range(L)], False)
+    keep = eliminate(keep, [ix[j:j + 1] for j in (keep & isr).nonzero().flatten().tolist()], False)
     routes = [(int(E[j, 1]), int(E[j, 3]), int(E[j, 2])) for j in (keep & isr).nonzero().flatten().tolist()]
     fn = row(keep)
     pool = [fn(i)[0] for i in range(L)]

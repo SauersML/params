@@ -129,7 +129,8 @@ class Edges:
             self.base = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True)
         if weak == "reference":
             self.fixed = [h != 0 for h in self.base["h"]]
-        self.c_full = float(self.base["contrast"][0])
+        self.c_full = float(self.base["contrast"][0]) if self.dt == torch.float32 else \
+            self.contrasts(torch.zeros(1, 0, dtype=torch.bool), [])[0]  # (padded as every other forward)
 
     # -- the run (each module in the model's dtype on its own card, everything between in float32) -------------------
 
@@ -314,7 +315,10 @@ class Edges:
         forward."""
         out = []
         for s0 in range(0, len(cuts), self.B):
-            out += self._run(cuts[s0:s0 + self.B], edges, rest=rest)["contrast"].tolist()
+            c = cuts[s0:s0 + self.B]
+            if self.dt != torch.float32 and len(c) < self.B:  # (a lower precision model's kernels round by batch size: every
+                c = torch.cat([c, c[-1:].expand(self.B - len(c), -1)])  # forward padded to B sets)
+            out += self._run(c, edges, rest=rest)["contrast"].tolist()[:len(cuts) - s0]
             self.forwards += 1
         return out
 

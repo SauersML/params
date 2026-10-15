@@ -1,0 +1,430 @@
+"""The causal activation oracle (#2951, Path G; the user's goal doc, 10-14): Qwen3-1.7B with a LoRA that reads the
+model's own activations (the Activation Oracle's injection, Karvonen et al., arXiv 2512.15674) and answers questions
+whose answers are exact results of interventions on the model.
+
+Input: blocks of placeholders in the question, each placeholder's vector added to the residual stream at layer 1's
+output (normalized, scaled to the norm there, in the activations' dtype: the paper's hook; prefill only).
+  resid block  "Layer: L\\n ? ... ? \\n": the model's residual at layer L's output at the block's positions of the context
+               (read with the adapter off), L one of 7, 14, 21 (the released adapter's 25/50/75%)
+  unit block   "Unit A: ? \\n": a native unit's write at the context's last position (a neuron's activation x its
+               down_proj column; a head's output through its o_proj slice)
+The released Qwen3-1.7B adapter is the start (its past/future-token skill kept by replaying that task); the text-only
+control is the same oracle with no vector added.
+
+Categories (each label measured on the model; "no clear answer" where the measurement has no clear winner):
+  lens      the previous or next k tokens of a read span (the paper's past_lens, generated here)
+  which     which earlier token the next-token prediction depends on most (resampling, h2h's draws)
+  swap      whether swapping a token for another changes the top next token, and to what (the swapped run)
+  pair      which of two earlier tokens matters more (the same draws)
+  units     which of four heads the prediction depends on most (each head's output zeroed at every position)
+  edit      the top next token after a unit is removed (its output zeroed at every position)
+  promotes  the tokens a neuron's write raises most at the output (its down_proj column through the final norm and
+            unembedding: the unit's own weights)
+
+  cao.py gen --out EX.jsonl --texts N [--seed S]     examples (GPU)
+  cao.py train --data EX.jsonl --out DIR [--steps N]  LoRA SFT from the released adapter (GPU)
+  cao.py eval --items H2H_ITEMS.jsonl --adapter A --out OUT.jsonl [--text-only]   the gate's questions (GPU)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "aoh2h"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import h2h  # noqa: E402
+
+MODEL = "Qwen/Qwen3-1.7B"
+AO = "adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B"
+LAYERS = (7, 14, 21)
+WIKITEXT_TRAIN = ("Salesforce/wikitext", "wikitext-103-raw-v1/train-00000-of-00002.parquet")
+NONE = "No clear answer."
+CLEAR = 1.5  # the winner's effect over the runner-up's for a clear answer
+SWAPS_PER_TEXT, PAIRS_PER_TEXT, EDITS_PER_TEXT = 12, 4, 3
+UNITS_EVERY = 4  # one text in UNITS_EVERY gets the heads question (448 removals)
+LR, BATCH, MAX_NEW = 1e-5, 16, 24
+
+
+def q_tok(s: str) -> str:
+    return "'" + s.replace("\n", "\\n") + "'"
+
+
+class Oracle:
+    """The base model with an adapter, its injection hook, and the examples' encoding."""
+
+    def __init__(self, adapter: str | None = AO, device: str | None = None, trainable: bool = False, model: str = MODEL):
+        import torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.torch = torch
+        self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.tok = AutoTokenizer.from_pretrained(model)
+        base = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16).to(self.dev)
+        self.m = PeftModel.from_pretrained(base, adapter, is_trainable=trainable) if adapter else base
+        self.lm = self.m.base_model.model if adapter else base
+        self.layers = self.lm.model.layers
+        q = self.tok(" ?", add_special_tokens=False)["input_ids"]
+        assert len(q) == 1, q
+        self.q = q[0]
+        self.text_only = False
+
+    def off(self):
+        """The target model: every adapter off."""
+        import contextlib
+
+        return self.m.disable_adapter() if hasattr(self.m, "disable_adapter") else contextlib.nullcontext()
+
+    def prompt(self, ex: dict) -> str:
+        parts = []
+        for b in ex["blocks"]:
+            if "layer" in b:
+                parts.append(f"Layer: {b['layer']}\n" + " ?" * len(b["positions"]) + " \n")
+            else:
+                parts.append(f"{b['label']}: ? \n")  # (" ?\n" is one token; " ? \n" keeps the placeholder alone)
+        return "".join(parts) + ex["q"]
+
+    def encode(self, ex: dict, answer: bool) -> tuple[list[int], list[int], int]:
+        """(ids, placeholder positions, the answer's first index or len(ids))."""
+        user = [{"role": "user", "content": self.prompt(ex)}]
+        head = self.tok.apply_chat_template(user, tokenize=True, add_generation_prompt=True, enable_thinking=False, return_dict=False)
+        ids = head
+        if answer:
+            ids = self.tok.apply_chat_template(user + [{"role": "assistant", "content": ex["a"]}], tokenize=True,
+                                               add_generation_prompt=False, enable_thinking=False, return_dict=False)
+        n = sum(len(b["positions"]) if "layer" in b else 1 for b in ex["blocks"])
+        pos = [i for i, t in enumerate(head) if t == self.q][:n]
+        assert len(pos) == n, (len(pos), n)
+        return ids, pos, len(head)
+
+    def vectors(self, ex: dict):
+        """The examples' placeholder vectors in prompt order [n, d], read from the target (adapter off)."""
+        torch = self.torch
+        with self.off(), torch.no_grad():
+            out = self.m(input_ids=torch.tensor([ex["ctx"]], device=self.dev), output_hidden_states=True)
+        H = out.hidden_states
+        vs = []
+        for b in ex["blocks"]:
+            if "layer" in b:
+                vs.append(H[b["layer"] + 1][0, b["positions"]])
+            else:
+                vs.append(unit_write(self, ex["ctx"], b["unit"])[None].to(H[0].dtype))
+        return torch.cat(vs)
+
+    def hook(self, vecs: list, pos: list[list[int]]):
+        """The paper's addition at layer 1's output: per row its vectors at its placeholder positions, normalized in
+        their dtype, scaled to the norm there (prefill only)."""
+        torch = self.torch
+        normed = [torch.nn.functional.normalize(v, dim=-1) for v in vecs]
+
+        def fn(_m, _i, out):
+            h = out[0] if isinstance(out, tuple) else out
+            if h.shape[1] <= 1 or self.text_only:
+                return out
+            for b, (v, p) in enumerate(zip(normed, pos)):
+                orig = h[b, p, :]
+                h[b, p, :] = (v.to(h.dtype) * orig.norm(dim=-1, keepdim=True) * 1.0).to(h.dtype) + orig
+            return out
+
+        return self.layers[1].register_forward_hook(fn)
+
+    def batch_loss(self, exs: list[dict]):
+        """Mean cross entropy of the answers' tokens (right-padded batch)."""
+        torch = self.torch
+        enc = [self.encode(e, True) for e in exs]
+        vecs = [self.vectors(e) for e in exs]
+        L = max(len(i) for i, _, _ in enc)
+        pad = self.tok.pad_token_id or self.tok.eos_token_id
+        ids = torch.full((len(exs), L), pad, device=self.dev)
+        att = torch.zeros((len(exs), L), dtype=torch.long, device=self.dev)
+        lab = torch.full((len(exs), L), -100, device=self.dev)
+        for b, (i, _, a0) in enumerate(enc):
+            ids[b, :len(i)] = torch.tensor(i, device=self.dev)
+            att[b, :len(i)] = 1
+            lab[b, a0:len(i)] = torch.tensor(i[a0:], device=self.dev)
+        h = self.hook(vecs, [p for _, p, _ in enc])
+        try:
+            return self.m(input_ids=ids, attention_mask=att, labels=lab).loss
+        finally:
+            h.remove()
+
+    def answer(self, ex: dict) -> str:
+        torch = self.torch
+        ids, pos, _ = self.encode(ex, False)
+        h = self.hook([self.vectors(ex)], [pos])
+        try:
+            with torch.no_grad():
+                g = self.m.generate(input_ids=torch.tensor([ids], device=self.dev), max_new_tokens=MAX_NEW, do_sample=False,
+                                    temperature=None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)[0]
+        finally:
+            h.remove()
+        return self.tok.decode(g[len(ids):], skip_special_tokens=True).strip()
+
+    def option_logp(self, ex: dict, options: list[str]) -> list[float]:
+        """log p of each option as the whole answer (calibrated choice among options)."""
+        torch = self.torch
+        out = []
+        for o in options:
+            e = {**ex, "a": o}
+            ids, pos, a0 = self.encode(e, True)
+            h = self.hook([self.vectors(e)], [pos])
+            try:
+                with torch.no_grad():
+                    lp = torch.log_softmax(self.m(input_ids=torch.tensor([ids], device=self.dev)).logits[0].float(), -1)
+            finally:
+                h.remove()
+            # the answer's tokens up to (not including) the end-of-turn
+            span = range(a0, len(ids) - 2)
+            out.append(float(sum(lp[t - 1, ids[t]] for t in span)))
+        return out
+
+
+def unit_write(o: Oracle, ctx: list[int], unit) -> "torch.Tensor":
+    """A native unit's write at the context's last position, float32 [d]: neuron (layer, index): its activation x its
+    down_proj column; head (layer, index): its output through its o_proj slice."""
+    torch = o.torch
+    kind, layer, index = unit
+    mod = o.layers[layer]
+    got = {}
+    target = mod.mlp.down_proj if kind == "neuron" else mod.self_attn.o_proj
+    hd = o.lm.config.head_dim
+    handle = target.register_forward_pre_hook(lambda _m, a: got.__setitem__("x", a[0][0, -1].float()))
+    try:
+        with o.off(), torch.no_grad():
+            o.m(input_ids=torch.tensor([ctx], device=o.dev))
+    finally:
+        handle.remove()
+    W = target.weight.float()
+    if kind == "neuron":
+        return got["x"][index] * W[:, index]
+    return got["x"][index * hd:(index + 1) * hd] @ W[:, index * hd:(index + 1) * hd].T
+
+
+# ---- examples
+
+
+class Probe:
+    """Interventions on the target for labels: h2h's Model over the oracle's base model (adapter off)."""
+
+    def __init__(self, o: Oracle):
+        self.o = o
+        self.tg = type("T", (), {})()
+        self.tg.m, self.tg.dev, self.tg.tok, self.tg.torch, self.tg.use = o.m, o.dev, o.tok, o.torch, lambda _a: o.off()
+        self.m = h2h.Model(self.tg)
+
+    def zeroed(self, ids: list[int], units: list) -> "torch.Tensor":
+        """Next-token log probabilities with each unit's output zeroed at every position, one run per unit [len, V]."""
+        torch, o = self.o.torch, self.o
+        hd = o.lm.config.head_dim
+        out = []
+        for kind, layer, index in units:
+            mod = o.layers[layer].mlp.down_proj if kind == "neuron" else o.layers[layer].self_attn.o_proj
+
+            def pre(_m, a, kind=kind, index=index):
+                x = a[0].clone()
+                if kind == "neuron":
+                    x[..., index] = 0
+                else:
+                    x[..., index * hd:(index + 1) * hd] = 0
+                return (x,)
+
+            h = mod.register_forward_pre_hook(pre)
+            try:
+                out.append(self.m.logp([ids])[0])
+            finally:
+                h.remove()
+        return torch.stack(out)
+
+
+def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bool) -> list[dict]:
+    """One text's examples (module docstring)."""
+    torch, tok = o.torch, o.tok
+    T, out = len(ids), []
+    layer = lambda: rng.choice(LAYERS)  # noqa: E731
+    allpos = list(range(T))
+    base = pr.m.logp([ids])
+    top = int(base[0].argmax())
+    for direction in ("past", "future"):  # the paper's past_lens, its prompts
+        k, n = rng.randint(1, 12), rng.randint(1, 20)
+        if direction == "past":
+            s = rng.randint(k, T - n - 1)
+            span, toks = list(range(s, s + n)), ids[s - k:s]
+            q = f"Can you predict the previous {k} tokens that came before this?"
+        else:
+            s = rng.randint(1, T - n - k)
+            span, toks = list(range(s, s + n)), ids[s + n:s + n + k]
+            q = f"Can you predict the next {k} tokens that come after this?"
+        out.append({"cat": "lens", "ctx": ids[:span[-1] + 1], "blocks": [{"layer": layer(), "positions": span}], "q": q,
+                    "a": tok.decode(toks)})
+    cands = list(h2h.CANDS)
+    eff = h2h.effects(pr.m, ids, h2h.draws(pr.m, ids, cands, h2h.DRAWS, rng), base)
+    order = sorted(cands, key=lambda p: -eff[p])
+    word = lambda p: tok.decode([ids[p]])  # noqa: E731
+    clear = eff[order[0]] >= CLEAR * eff[order[1]]
+    rb = lambda: {"layer": layer(), "positions": allpos}  # noqa: E731
+    out.append({"cat": "which", "ctx": ids, "blocks": [rb()],
+                "q": "Which earlier token is the model's next-token prediction most dependent on? Answer with the token.",
+                "a": q_tok(word(order[0])) if clear else NONE, "truth": order[0] if clear else None})
+    for _ in range(PAIRS_PER_TEXT):
+        p1, p2 = rng.sample(order[:12], 2)
+        if h2h.norm(word(p1)) == h2h.norm(word(p2)):
+            continue
+        hi, lo = (p1, p2) if eff[p1] >= eff[p2] else (p2, p1)
+        out.append({"cat": "pair", "ctx": ids, "blocks": [rb()],
+                    "q": f"Which matters more for the model's next token: {q_tok(word(p1))} or {q_tok(word(p2))}?",
+                    "a": q_tok(word(hi)) if eff[hi] >= CLEAR * eff[lo] else NONE})
+    lp = pr.m.dist_at(ids)
+    for p in rng.sample(range(T - 26, T - 2), SWAPS_PER_TEXT):
+        pr_ = lp[p - 1].exp().clone()
+        pr_[ids[p]] = 0
+        y = int(torch.multinomial(pr_ / pr_.sum(), 1).item())
+        x = list(ids)
+        x[p] = y
+        new = int(pr.m.logp([x])[0].argmax())
+        out.append({"cat": "swap", "ctx": ids, "blocks": [rb()],
+                    "q": f"If the token {q_tok(word(p))} at position {p} were replaced by {q_tok(tok.decode([y]))}, would the "
+                         f"model's next token change? If so, to what?",
+                    "a": "No." if new == top else f"Yes, to {q_tok(tok.decode([new]))}."})
+    nl, nh = len(o.layers), o.lm.config.num_attention_heads
+    units = [("neuron", rng.randrange(nl // 4, nl), rng.randrange(o.lm.config.intermediate_size)) for _ in range(EDITS_PER_TEXT)]
+    for u, lq in zip(units, pr.zeroed(ids, units)):
+        new = int(lq.argmax())
+        out.append({"cat": "edit", "ctx": ids, "blocks": [rb(), {"label": "Unit A", "unit": list(u)}],
+                    "q": "If unit A were removed (its output set to zero at every position), what would the model's next token "
+                         "be? Answer unchanged or the token.",
+                    "a": "Unchanged." if new == top else q_tok(tok.decode([new]))})
+    W_U, fn = o.lm.lm_head.weight.float(), o.lm.model.norm
+    for kind, l, n in units:  # the neuron's own weights: what its write raises at the output
+        w = o.layers[l].mlp.down_proj.weight[:, n].float()
+        raised = (W_U @ (fn.weight.float() * w)).topk(5).indices.tolist()
+        out.append({"cat": "promotes", "ctx": ids, "blocks": [{"label": "Unit A", "unit": ["neuron", l, n]}],
+                    "q": "Which tokens does unit A's output raise most? Answer with five tokens.",
+                    "a": ", ".join(q_tok(tok.decode([t])) for t in raised)})
+    if heads:
+        allh = [("head", l, h) for l in range(nl) for h in range(nh)]
+        kl = h2h.kl_bits(base.expand(len(allh), -1), pr.zeroed(ids, allh)).tolist()
+        best = max(range(len(allh)), key=lambda i: kl[i])
+        others = rng.sample([i for i in range(len(allh)) if i != best and kl[i] < kl[best] / CLEAR], 3)
+        opts = others + [best]
+        rng.shuffle(opts)
+        letters = "ABCD"
+        out.append({"cat": "units", "ctx": ids, "blocks": [rb()] + [{"label": f"Unit {c}", "unit": list(allh[i])} for c, i in zip(letters, opts)],
+                    "q": "Which of units A, B, C, D does the model's next-token prediction depend on most? Answer with the letter.",
+                    "a": letters[opts.index(best)]})
+    return out
+
+
+def gen(a) -> None:
+    import pandas as pd
+    from huggingface_hub import hf_hub_download
+
+    o = Oracle(None, a.device)
+    pr, rng = Probe(o), random.Random(a.seed)
+    df = pd.read_parquet(hf_hub_download(WIKITEXT_TRAIN[0], WIKITEXT_TRAIN[1], repo_type="dataset"))
+    paras = [t.strip() for t in df["text"].tolist() if len(t.strip()) > 200 and not t.strip().startswith("=")]
+    rng.shuffle(paras)
+    n, t0 = 0, time.time()
+    with a.out.open("a") as fh:
+        for t in paras:
+            if n >= a.texts:
+                break
+            ids = o.tok(" " + t, add_special_tokens=False)["input_ids"]
+            if len(ids) < h2h.T + 8:
+                continue
+            s = rng.randrange(0, len(ids) - h2h.T)
+            exs = gen_text(o, pr, ids[s:s + h2h.T], rng, n % UNITS_EVERY == 0)
+            for e in exs:
+                e["text"] = n
+                fh.write(json.dumps(e) + "\n")
+            n += 1
+            if n % 20 == 0:
+                print(f"{n} texts, {pr.m.passes} passes, {time.time() - t0:.0f} s", flush=True)
+
+
+# ---- training and evaluation
+
+
+def train(a) -> None:
+    import torch
+
+    rows = [json.loads(x) for x in a.data.read_text().splitlines()]
+    rng = random.Random(0)
+    rng.shuffle(rows)
+    o = Oracle(AO if not a.init else a.init, a.device, trainable=True)
+    opt = torch.optim.AdamW([p for p in o.m.parameters() if p.requires_grad], lr=LR)
+    steps = a.steps or len(rows) // BATCH
+    a.out.mkdir(parents=True, exist_ok=True)
+    o.m.train()
+    t0 = time.time()
+    for s in range(steps):
+        batch = [rows[(s * BATCH + i) % len(rows)] for i in range(BATCH)]
+        loss = o.batch_loss(batch)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(o.m.parameters(), 1.0)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        if s % 50 == 0:
+            print(json.dumps({"step": s, "loss": round(float(loss), 4), "seconds": round(time.time() - t0, 1)}), flush=True)
+        if (s + 1) % a.save_every == 0 or s + 1 == steps:
+            o.m.save_pretrained(a.out / f"step_{s + 1}")
+    print(f"saved {a.out}")
+
+
+def eval_items(a) -> None:
+    """The gate's questions (h2h items) asked of an oracle (adapter) in this oracle's format; with --text-only, the
+    same oracle with no vector added."""
+    o = Oracle(a.adapter, a.device)
+    o.text_only = a.text_only
+    items = [json.loads(x) for x in a.items.read_text().splitlines() if json.loads(x)["kind"] == "text"]
+    with a.out.open("w") as fh:
+        for it in items:
+            ids = it["ids"]
+            blocks = [{"layer": 14, "positions": list(range(len(ids)))}]
+            word = lambda p: o.tok.decode([ids[p]])  # noqa: E731
+            got = o.answer({"ctx": ids, "blocks": blocks,
+                            "q": "Which earlier token is the model's next-token prediction most dependent on? Answer with the token."})
+            ok_a = h2h.norm(got) == h2h.norm(word(it["a"]["gt"]))
+            pairs = []
+            for c in it["c"]:
+                p1, p2 = c["pair"]
+                opts = [q_tok(word(p1)), q_tok(word(p2))]
+                lp = o.option_logp({"ctx": ids, "blocks": blocks, "q": f"Which matters more for the model's next token: {opts[0]} or {opts[1]}?"}, opts)
+                pick = c["pair"][int(lp[1] > lp[0])]
+                pairs.append({"ok": pick == c["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
+            rec = {"id": it["id"], "split": it["split"], "a_answer": got, "a_ok": ok_a, "pairs": pairs}
+            fh.write(json.dumps(rec) + "\n")
+            print(it["id"], repr(got), ok_a, [p["ok"] for p in pairs], flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("gen")
+    g.add_argument("--out", type=Path, required=True)
+    g.add_argument("--texts", type=int, default=100)
+    g.add_argument("--seed", type=int, default=1)
+    g.add_argument("--device")
+    t = sub.add_parser("train")
+    t.add_argument("--data", type=Path, required=True)
+    t.add_argument("--out", type=Path, required=True)
+    t.add_argument("--steps", type=int)
+    t.add_argument("--save-every", type=int, default=2000)
+    t.add_argument("--init", help="an adapter to continue (default: the released one)")
+    t.add_argument("--device")
+    e = sub.add_parser("eval")
+    e.add_argument("--items", type=Path, required=True)
+    e.add_argument("--adapter", default=AO)
+    e.add_argument("--out", type=Path, required=True)
+    e.add_argument("--text-only", action="store_true")
+    e.add_argument("--device")
+    a = ap.parse_args()
+    {"gen": gen, "train": train, "eval": eval_items}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

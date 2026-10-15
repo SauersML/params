@@ -7,6 +7,9 @@ organism investigations come first; the labels file grows, and a neuron already 
   atlas_labels.py gather --model M --out LIST.jsonl PATH...
       every neuron the JSON under PATH names for model M (dicts with "layer" and "neuron" or "index", as neuron_builder's
       circuit nodes; unit names L<l>.N<i>[+-], as claims; only --keys of a record that has them), most often named first
+  atlas_labels.py coverage --atlas ROOT --out LIST.jsonl [--top N] [--frac 0.3]
+      every neuron by how often one of its poles is strong (the share of corpus tokens beyond frac of the pole's extreme,
+      from the atlas histogram): the neurons the oracle reads at the most positions, for labels past the named ones
   atlas_labels.py label --atlas ROOT --neurons LIST.jsonl --out LABELS.jsonl [--examples 10] [--chunk 200]
       LIST.jsonl lines {"layer", "index"[, "source"]}; LABELS.jsonl gets two lines per neuron, one per pole, in
       neuron_verify's item format ({"layer", "index", "pole", "corpus_max", "explanation", "writer_valid", ...})
@@ -79,6 +82,24 @@ def gather(a) -> None:
     print(f"{len(rows)} neurons named {sum(count.values())} times in {len(files)} files to {a.out}")
 
 
+def coverage(a) -> None:
+    import atlas as atlas_mod
+    import numpy as np
+
+    at = atlas_mod.Atlas(a.atlas)
+    j = at.meta["rates"].index(a.frac)
+    rows = []
+    for l in range(at.meta["layers"]):
+        r = at.layer(l)["rates"][:, :, j]                     # [D, 2]: the positive and negative pole's share
+        rows += [(float(r[i].sum()), l, i, float(r[i, 0]), float(r[i, 1])) for i in range(r.shape[0])]
+    rows.sort(reverse=True)
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    a.out.write_text("".join(json.dumps({"layer": l, "index": i, "strong_share": s_, "pos": p, "neg": n, "source": f"coverage@{a.frac}"}) + "\n"
+                             for s_, l, i, p, n in rows[:a.top]))
+    print(f"{min(a.top, len(rows))} of {len(rows)} neurons to {a.out}; the top {a.top} are strong at "
+          f"{np.sum([x[0] for x in rows[:a.top]]):.2f} neuron-poles a token of {np.sum([x[0] for x in rows]):.2f}")
+
+
 def label(a) -> None:
     import atlas as atlas_mod
     import neuron_verify
@@ -134,6 +155,11 @@ def main():
     g.add_argument("--out", type=Path, required=True)
     g.add_argument("--keys", type=lambda x: x.split(","), default=["nodes"],
                    help="read only these top-level keys of a record that has any (neuron_builder's circuit: nodes, not its ranked candidates)")
+    c = sub.add_parser("coverage")
+    c.add_argument("--atlas", type=Path, required=True)
+    c.add_argument("--out", type=Path, required=True)
+    c.add_argument("--top", type=int, default=5000)
+    c.add_argument("--frac", type=float, default=0.3, help="one of the atlas's rate fractions (0.1, 0.3, 0.5)")
     lb = sub.add_parser("label")
     lb.add_argument("--atlas", type=Path, required=True, help="an atlas root (atlas.py collect/merge/weights)")
     lb.add_argument("--neurons", type=Path, required=True)
@@ -142,7 +168,7 @@ def main():
     lb.add_argument("--examples", type=int, default=10)
     lb.add_argument("--chunk", type=int, default=200, help="neurons per writer batch, appended as each finishes")
     a = ap.parse_args()
-    {"gather": gather, "label": label}[a.what](a)
+    {"gather": gather, "coverage": coverage, "label": label}[a.what](a)
 
 
 if __name__ == "__main__":

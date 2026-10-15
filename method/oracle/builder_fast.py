@@ -47,6 +47,11 @@ IG_STEPS = 4        # attribution: points on the path from every unit on to ever
 ATTR_DRAWS = 16     # attribution: the scope family's changed texts beside the text, one per position
 ATTR_ROWS = 6       # attribution: texts per backward pass
 ATTR_DONORS = 4     # attribution: far donors for activation patching's share
+RANKER = "measured"  # the ranking (rank_scores): "ig", "fisher" or "measured" (DEV20, the lead's equal-cost arms: measured 3% fewer parts in all and 1.3 s faster than ig at 4; fisher at 8 or 32 no better than ig)
+PASSES = IG_STEPS   # its midpoints or sampled labels a text (the gradient rankings)
+MEASURED_ROWS = 32  # measured_scores: units a batched run
+MEASURED_DRAWS = 4  # measured_scores: the scope draws its path-patched share runs on
+DUMP_UNITS = False  # unit_table on every text (main's --dump-units: OUT/TEXT.units.npz)
 FLOOR = goal_eval.FLOOR_TOP
 INERT_BITS = 1e-3   # an inert unit: its removal moves the own-run KL at the targets by less (the scorecard's)
 PATH_BATCH = 4      # prefix sizes per path-patched round
@@ -79,78 +84,100 @@ def _hidden_logq(nat: native.Native, xs: list[list[int]], targets: list[int], ma
     return torch.log_softmax(tg.unembed(h[:, targets]).float(), -1)
 
 
+def _labels(ref: torch.Tensor, samples: int, rng) -> torch.Tensor:
+    """samples labels per target drawn from a reference log p [targets, V]: [samples, targets]."""
+    p = ref.double().exp().cpu().numpy()
+    return torch.tensor(np.stack([rng.choice(p.shape[1], samples, p=row / row.sum()) for row in p], 1), device=ref.device)
+
+
 def attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, xs: list[list[int]], steps: int = IG_STEPS,
-                others: float = 0.0) -> list[float]:
-    """Per unit (site, position, subcomponent) its integrated gradient of the KL from the model, summed over the token
-    lists xs: the units scaled together from 1 (every one on) to 0, every other subcomponent at others (0: the
-    circuit's own run; 1: the real model, the necessity family's removal), remainders on; minus the integral of
-    d KL / d m, each unit's share of the KL its removal with the others adds."""
+                others: float = 0.0, mode: str = "ig") -> list[float]:
+    """Per unit (site, position, subcomponent), summed over the token lists xs, every other subcomponent at others (0:
+    the circuit's own run; 1: the real model, the necessity family's removal), remainders on. mode "ig": its integrated
+    gradient of the KL from the model, the units scaled together from 1 (every one on) to 0 at steps midpoints; minus
+    the integral of d KL / d m, each unit's share of the KL its removal with the others adds. "fisher": its sampled-label
+    Fisher at the units on, 1/2 E_v (d log q_v / d m)^2, v steps labels from the model's distribution at each target
+    (inframove's ranking for native units: at the model it is the second-order KL rise of the unit's removal alone).
+    Either way steps backward passes a text."""
     nat, T = ge.nat, tx.T
     on = {n: torch.zeros(T, nat.C[n], device=nat.dev) for n in nat.names}
     for n, t, c in units:
         on[n][t, c] = 1.0
     rest = {n: (1.0 - on[n]) * others for n in nat.names}
     ref = nat.reference(xs, tx.targets)
+    rng = np.random.default_rng([int(tx.seed) % (1 << 63), 37])
+    work = ([(i, lab, 1.0) for i in range(len(xs)) for lab in _labels(ref[i], steps, rng)] if mode == "fisher"
+            else [(i, None, 1.0 - (k + 0.5) / steps) for k in range(steps) for i in range(len(xs))])
     total = {n: torch.zeros(T, nat.C[n], device=nat.dev) for n in nat.names}
-    for k in range(steps):
-        a = 1.0 - (k + 0.5) / steps
-        for r0 in range(0, len(xs), ATTR_ROWS):
-            rows = xs[r0:r0 + ATTR_ROWS]
-            masks = {n: (on[n] * a)[None].repeat(len(rows), 1, 1).requires_grad_() for n in nat.names}
-            with torch.enable_grad():
-                kl = carry.kl(ref[r0:r0 + ATTR_ROWS], _hidden_logq(nat, rows, tx.targets, {n: masks[n] + rest[n] for n in nat.names})).sum()
-                grads = torch.autograd.grad(kl, [masks[n] for n in nat.names])
-            for n, gr in zip(nat.names, grads):
-                total[n] -= gr.sum(0) / steps
-            del masks, grads
-            native.free(nat.dev)
+    for w0 in range(0, len(work), ATTR_ROWS):
+        part = work[w0:w0 + ATTR_ROWS]
+        a = torch.tensor([w[2] for w in part], device=nat.dev).view(-1, 1, 1)
+        masks = {n: (on[n][None] * a).requires_grad_() for n in nat.names}
+        with torch.enable_grad():
+            lq = _hidden_logq(nat, [xs[w[0]] for w in part], tx.targets, {n: masks[n] + rest[n] for n in nat.names})
+            if mode == "fisher":
+                obj = lq.gather(-1, torch.stack([w[1] for w in part])[..., None]).sum()
+            else:
+                obj = carry.kl(ref[[w[0] for w in part]], lq).sum()
+            grads = torch.autograd.grad(obj, [masks[n] for n in nat.names])
+        for n, gr in zip(nat.names, grads):
+            total[n] += (0.5 * gr.pow(2).sum(0) if mode == "fisher" else -gr.sum(0)) / steps
+        del masks, grads
+        native.free(nat.dev)
     return [float(total[n][t, c]) for n, t, c in units]
 
 
-def held_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, rows: list, steps: int = IG_STEPS) -> list[float]:
-    """Per unit its integrated gradient, summed over rows, of the KL at the targets from the model on each row's
-    tokens, every subcomponent's activation a_h + m (a - a_h) (a its value in this run, a_h the row's held value; from
-    the row's first live position on), the units' m scaled together from 1 (live) to 0 (held), every other
-    subcomponent held. rows: (token ids, the held activations {site: [T, C]}, the held remainders {site: [T, d_out]}
-    or None for live ones, the first held position, the reference log p at the targets [targets, V])."""
+def held_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, rows: list, steps: int = IG_STEPS,
+                     mode: str = "ig") -> list[float]:
+    """Per unit, summed over rows, of the prediction at the targets on each row's tokens with every subcomponent's
+    activation a_h + m (a - a_h) (a its value in this run, a_h the row's held value; from the row's first live position
+    on), every other subcomponent held: mode "ig", its integrated gradient of the KL from the row's reference, the
+    units' m scaled together from 1 (live) to 0 (held) at steps midpoints; "fisher", its sampled-label Fisher at m = 1
+    (steps labels from the reference at each target; attribution's). rows: (token ids, the held activations {site: [T,
+    C]}, the held remainders {site: [T, d_out]} or None for live ones, the first held position, the reference log p at
+    the targets [targets, V])."""
     nat, tg, T = ge.nat, ge.nat.target, tx.T
     on = {n: torch.zeros(T, nat.C[n], device=nat.dev) for n in nat.names}
     for n, t, c in units:
         on[n][t, c] = 1.0
+    rng = np.random.default_rng([int(tx.seed) % (1 << 63), 41])
+    work = ([(r, lab, 1.0) for r in rows for lab in _labels(r[4], steps, rng)] if mode == "fisher"
+            else [(r, None, 1.0 - (k + 0.5) / steps) for k in range(steps) for r in rows])
     total = {n: torch.zeros(T, nat.C[n], device=nat.dev) for n in nat.names}
     own = {n: tg.site(n).__dict__.get("_forward") for n in nat.names}   # (native's own per-site forward, put back)
     nat.vpd.clear()
     try:
-        for r0 in range(0, len(rows), ATTR_ROWS):
-            part = rows[r0:r0 + ATTR_ROWS]
+        for w0 in range(0, len(work), ATTR_ROWS):
+            part = work[w0:w0 + ATTR_ROWS]
             B = len(part)
-            ah = {n: torch.stack([r[1][n] for r in part]) for n in nat.names}             # [B, T, C]
-            live_rem = all(r[2] is None for r in part)
-            rh = None if live_rem else {n: torch.stack([r[2][n] for r in part]) for n in nat.names}
+            ah = {n: torch.stack([w[0][1][n] for w in part]) for n in nat.names}         # [B, T, C]
+            rh = None if all(w[0][2] is None for w in part) else {n: torch.stack([w[0][2][n] for w in part]) for n in nat.names}
             held = torch.zeros(B, T, 1, device=nat.dev)                                  # 1 from each row's first held position
-            for b, r in enumerate(part):
-                held[b, r[3]:] = 1.0
-            ref = torch.stack([r[4] for r in part])
-            for k in range(steps):
-                a = 1.0 - (k + 0.5) / steps
-                m = {n: (on[n] * a)[None].repeat(B, 1, 1).requires_grad_() for n in nat.names}
-                for n in nat.names:
-                    st = tg.site(n)
+            for b, w in enumerate(part):
+                held[b, w[0][3]:] = 1.0
+            a = torch.tensor([w[2] for w in part], device=nat.dev).view(-1, 1, 1)
+            m = {n: (on[n][None] * a).requires_grad_() for n in nat.names}
+            for n in nat.names:
+                st = tg.site(n)
 
-                    def fwd(x, st=st, n=n):
-                        live = x @ st.V
-                        w = 1.0 - held * (1.0 - m[n])                # 1 before the held positions, m from them on
-                        act = ah[n] + w * (live - ah[n])
-                        rem = x @ (st.W - (st.V @ st.U).T).T if rh is None else rh[n]
-                        return act @ st.U + rem
-                    st._forward = fwd
-                with torch.enable_grad():
-                    lq = torch.log_softmax(tg.unembed(tg.hidden(torch.tensor([r[0] for r in part], device=nat.dev))[:, tx.targets]).float(), -1)
-                    grads = torch.autograd.grad(carry.kl(ref, lq).sum(), [m[n] for n in nat.names])
-                for n, gr in zip(nat.names, grads):
-                    total[n] -= gr.sum(0) / steps
-                del m, grads
-                native.free(nat.dev)
+                def fwd(x, st=st, n=n):
+                    live = x @ st.V
+                    wt = 1.0 - held * (1.0 - m[n])                   # 1 before the held positions, m from them on
+                    act = ah[n] + wt * (live - ah[n])
+                    rem = x @ (st.W - (st.V @ st.U).T).T if rh is None else rh[n]
+                    return act @ st.U + rem
+                st._forward = fwd
+            with torch.enable_grad():
+                lq = torch.log_softmax(tg.unembed(tg.hidden(torch.tensor([w[0][0] for w in part], device=nat.dev))[:, tx.targets]).float(), -1)
+                if mode == "fisher":
+                    obj = lq.gather(-1, torch.stack([w[1] for w in part])[..., None]).sum()
+                else:
+                    obj = carry.kl(torch.stack([w[0][4] for w in part]), lq).sum()
+                grads = torch.autograd.grad(obj, [m[n] for n in nat.names])
+            for n, gr in zip(nat.names, grads):
+                total[n] += (0.5 * gr.pow(2).sum(0) if mode == "fisher" else -gr.sum(0)) / steps
+            del m, grads
+            native.free(nat.dev)
     finally:
         for n in nat.names:
             if own[n] is None:
@@ -180,23 +207,25 @@ def _text_held(ge: goal_eval.GoalEval, tx: goal_eval.Text) -> tuple[dict, dict]:
     return ax, rx
 
 
-def path_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, xs: list[list[int]], steps: int = IG_STEPS) -> list[float]:
+def path_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, xs: list[list[int]], steps: int = IG_STEPS,
+                     mode: str = "ig") -> list[float]:
     """held_attribution on the changed texts xs with everything held at the text's run (path patching's semantics, the
     track and input-scope families': the units follow the change, the rest stays; held, the targets' prediction is the
     model's on the text, at KL W from the changed text's)."""
     ax, rx = _text_held(ge, tx)
     ref = ge.nat.reference(xs, tx.targets)
-    return held_attribution(ge, tx, units, [(x, ax, rx, 0, ref[i]) for i, x in enumerate(xs)], steps)
+    return held_attribution(ge, tx, units, [(x, ax, rx, 0, ref[i]) for i, x in enumerate(xs)], steps, mode)
 
 
-def donor_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, k: int = ATTR_DONORS, steps: int = IG_STEPS) -> list[float]:
+def donor_attribution(ge: goal_eval.GoalEval, tx: goal_eval.Text, units: list, k: int = ATTR_DONORS, steps: int = IG_STEPS,
+                      mode: str = "ig") -> list[float]:
     """held_attribution on the text with everything held at k far donors' activations (activation patching's semantics,
     goal_eval.donors' far pool: a donor aligned at its end, its first missing positions live, remainders live)."""
     rows = []
     for _, x in ge.far_donors(tx, ge.far_pool("search"), k):
         acts, pad = ge.donor_activations(list(x), tx.T)
         rows.append((list(tx.ids), {n: v.to(ge.nat.dev) for n, v in acts.items()}, None, pad, tx.ref[0]))
-    return held_attribution(ge, tx, units, rows, steps) if rows else [0.0] * len(units)
+    return held_attribution(ge, tx, units, rows, steps, mode) if rows else [0.0] * len(units)
 
 
 @torch.no_grad()
@@ -244,6 +273,113 @@ def influence(ge: goal_eval.GoalEval, tx: goal_eval.Text, split: str = "search",
         top = sorted(one, key=lambda q: -one[q])[:SHORTLIST]
         kept[key] = {**one, **_resampled(ge, tx, top, donors)}
     return kept[key]
+
+
+@torch.no_grad()
+def measured_scores(ge: goal_eval.GoalEval, tx: goal_eval.Text, pr, draws: list, shares: bool = False) -> tuple:
+    """Each unit's measured effect alone, no gradient (the lead's ranking arm 0), three shares as the gradient rankings'
+    four (patching left out: a donor run per unit and donor): removed alone from every unit (the own run's KL change,
+    Pruner.without), from the real model (the KL from the model, an engine over the units' columns with everything
+    else on: N's removal), and from every unit's path-patched run on MEASURED_DRAWS of draws (the KL from the model on
+    each changed text, summed: track and scope). (Per unit the shares' sum, each its share of its own total; the
+    measured runs.)"""
+    import engine
+
+    nat, units = ge.nat, pr.nodes
+    N = len(units)
+    pr.on = torch.ones(N, dtype=torch.bool, device=nat.dev)
+    base = pr.kl()
+    own = np.abs(np.asarray(pr.without([torch.tensor([i], device=nat.dev) for i in range(N)])) - base)
+    cols = {n: torch.tensor(sorted({c for m, _, c in units if m == n}), dtype=torch.long, device=nat.dev) for n in nat.names}
+    at = {n: {c: j for j, c in enumerate(cols[n].tolist())} for n in nat.names}
+    Em = engine.Engine(nat, tx.ids, tx.targets, live=True, columns=cols, outside="on")   # the real model
+    need = np.zeros(N)
+    for b0 in range(0, N, MEASURED_ROWS):
+        part = list(range(b0, min(N, b0 + MEASURED_ROWS)))
+        m = {n: torch.ones(len(part), tx.T, len(cols[n]), device=nat.dev) for n in nat.names}
+        for j, i in enumerate(part):
+            n, t, c = units[i]
+            m[n][j, t, at[n][c]] = 0.0
+        lq = Em.log_probs(m)
+        need[part] = carry.kl(tx.ref.expand_as(lq), lq).abs().cpu().numpy()   # (an inactive unit's: float noise either side of 0)
+        native.free(nat.dev)
+    path, runs = np.zeros(N), 2 * N
+    got = list(dict.fromkeys((int(p_), int(z)) for p_, z in draws))[:MEASURED_DRAWS]
+    if got:
+        g = goal_eval.strand(_graph(units), tx.targets, nat.C)
+        E = ge._pp_engine(tx)
+        lc = E.pp_lines(g)
+        col = {k[1]: j for j, k in enumerate(lc) if k[0] == "n"}
+        xs = []
+        for p_, z in got:
+            x2 = list(tx.ids)
+            x2[p_] = z
+            xs.append(x2)
+        ref = nat.reference(xs, tx.targets)                  # [D, targets, V]
+        k0 = carry.kl(ref, E.path_patched([g], got)[0])      # every unit's own, per draw
+        for b0 in range(0, N, MEASURED_ROWS):
+            part = list(range(b0, min(N, b0 + MEASURED_ROWS)))
+            lines = torch.ones(len(part), len(lc), device=nat.dev)
+            for j, i in enumerate(part):
+                if units[i] in col:
+                    lines[j, col[units[i]]] = 0.0
+            lq = E.path_patched([g], got, lines=lines)       # [K, D, targets, V]
+            path[part] = (carry.kl(ref[None].expand_as(lq).reshape(-1, *lq.shape[2:]), lq.reshape(-1, *lq.shape[2:]))
+                          .view(len(part), len(got)) - k0[None]).abs().sum(1).cpu().numpy()
+            native.free(nat.dev)
+        runs += N * len(got)
+    if shares:                                               # (the three effects themselves, unit_table's labels)
+        return {"own": own, "need": need, "path": path, "score": sum(v / max(v.sum(), 1e-12) for v in (own, need, path))}, runs
+    return [float(x) for x in sum(v / max(v.sum(), 1e-12) for v in (own, need, path))], runs
+
+
+KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
+
+
+def unit_table(ge: goal_eval.GoalEval, tx: goal_eval.Text, pr, xs: list, draws: list, one: dict) -> dict:
+    """The learned ranking's examples on one text (the lead's ranking arm: a model predicting each unit's measured
+    effect from cheap features): per START unit its features (layer, matrix kind, the targets' distance back, at a
+    target, its position's resampling influence and that position's rank, VPD's causal importance, |activation| x |write|
+    on the text, the four |integrated gradient| shares at IG_STEPS) and labels (measured_scores' three shares and their
+    sum), as numpy arrays."""
+    nat, units = ge.nat, pr.nodes
+    ax, _ = _text_held(ge, tx)
+    ranks = {q: r for r, q in enumerate(sorted(one, key=lambda q: -one[q]))}
+    last = max(tx.targets)
+    feats = {"layer": [], "kind": [], "back": [], "target": [], "influence": [], "influence_rank": [], "ci": [], "write": []}
+    for n, t, c in units:
+        layer, kind = native._name_layer_kind(n)
+        feats["layer"].append(layer)
+        feats["kind"].append(KINDS.index(kind))
+        feats["back"].append(last - t)
+        feats["target"].append(int(t in tx.targets))
+        feats["influence"].append(float(one.get(t, 0.0)))
+        feats["influence_rank"].append(ranks.get(t, -1))
+        feats["ci"].append(float(tx.ci[n][t, c]) if tx.ci is not None else float("nan"))
+        feats["write"].append(float(ax[n][t, c].abs() * nat.target.site(n).U[c].norm()))
+    for name, v in (("ig_own", attribution(ge, tx, units, xs[:1])),
+                    ("ig_path", path_attribution(ge, tx, units, xs[1:]) if len(xs) > 1 else [0.0] * len(units)),
+                    ("ig_need", attribution(ge, tx, units, xs[:1], others=1.0)), ("ig_patch", donor_attribution(ge, tx, units))):
+        feats[name] = np.abs(np.asarray(v))
+    labels, _ = measured_scores(ge, tx, pr, draws, shares=True)
+    return {**{k: np.asarray(v) for k, v in feats.items()}, **{f"label_{k}": np.asarray(v) for k, v in labels.items()},
+            "units": np.array([f"{n}|{t}|{c}" for n, t, c in units])}
+
+
+def rank_scores(ge: goal_eval.GoalEval, tx: goal_eval.Text, pr, xs: list, draws: list, ranker: str, passes: int) -> tuple[list, int]:
+    """(each START unit's ranking score, larger first; the backward passes or measured runs it took): "ig" or "fisher",
+    the sum of the four shares (own run, path patching on the changed texts xs[1:], real-model removal, far-donor
+    patching) of |attribution| at passes midpoints or sampled labels a text; "measured", measured_scores."""
+    units = pr.nodes
+    if ranker == "measured":
+        return measured_scores(ge, tx, pr, draws)
+    mode = "fisher" if ranker == "fisher" else "ig"
+    own = np.abs(attribution(ge, tx, units, xs[:1], passes, mode=mode))                  # the own run on the text (point)
+    path = np.abs(path_attribution(ge, tx, units, xs[1:], passes, mode)) if len(xs) > 1 else np.zeros(len(units))
+    need = np.abs(attribution(ge, tx, units, xs[:1], passes, others=1.0, mode=mode))    # removal from the real model (N)
+    patch = np.abs(donor_attribution(ge, tx, units, steps=passes, mode=mode))          # the rest at far donors' (patching)
+    k = min(ATTR_DONORS, len(ge.far_pool("search")))
+    return [float(x) for x in sum(v / max(v.sum(), 1e-12) for v in (own, path, need, patch))], passes * (2 + (len(xs) - 1) + k)
 
 
 def _graph(units: list) -> native.Graph:
@@ -311,7 +447,7 @@ def _shared_prefix(ge, tx, order, rec, *, pool=None, max_gate_calls=16):
 
 
 def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_floors=False,
-              shared_gate_calls=None, shared_pool=None) -> tuple[native.Graph, dict]:
+              shared_gate_calls=None, shared_pool=None, ranker: str | None = None, passes: int | None = None) -> tuple[native.Graph, dict]:
     """(the circuit, the record) on one text (module docstring)."""
     if not shared_floors and (shared_gate_calls is not None or shared_pool is not None):
         raise ValueError("shared_gate_calls and shared_pool require shared_floors=True")
@@ -345,12 +481,11 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_fl
             x2 = list(tx.ids)
             x2[p] = z
             xs.append(x2)
-    own = np.abs(attribution(ge, tx, units, xs[:1]))         # the own run on the text (point)
-    path = np.abs(path_attribution(ge, tx, units, xs[1:])) if len(xs) > 1 else np.zeros(len(units))   # the change
-    need = np.abs(attribution(ge, tx, units, xs[:1], others=1.0))   # their removal from the real model (N)
-    patch = np.abs(donor_attribution(ge, tx, units))         # the rest at far donors' activations (patching)
-    score = sum(x / max(x.sum(), 1e-12) for x in (own, path, need, patch))   # each its share of its own total
-    rank = np.argsort(-score, kind="stable").tolist()        # unit ids, largest first, by |attribution|: a unit that
+    score, rec["ranking_passes"] = rank_scores(ge, tx, pr, xs, draws, ranker or RANKER, passes or PASSES)
+    rec["ranker"], rec["passes"] = ranker or RANKER, passes or PASSES
+    if DUMP_UNITS:                                           # (the learned ranking's examples, written apart by main)
+        rec["_units"] = unit_table(ge, tx, pr, xs, draws, one)
+    rank = np.argsort(-np.asarray(score), kind="stable").tolist()   # unit ids, largest first, by |attribution|: a unit that
     # cancels another's overshoot has a negative one, and ranked by its sign it came last (text9006: point 0.66 up to
     # 1,448 of 1,886 units, 0.997 with all; by size 0.93 at 362)
     order = [units[i] for i in rank]
@@ -381,7 +516,10 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_fl
 
     fam_s = rec.setdefault("family_seconds", {"track_pp": 0.0, "scope": 0.0, "interchange_pp": 0.0})
 
+    runs = rec.setdefault("runs", {"point_sets": 0, "family_graphs": 0, "extra_graphs": 0})   # the measured runs
+
     def families(gs):                                        # the path-patched families' rows of graphs, batched
+        runs["family_graphs"] += len(gs)
         f0 = time.perf_counter()
         tr = ge.track_pp(tx, gs, "search")
         f1 = time.perf_counter()
@@ -417,6 +555,7 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_fl
         if not ns:
             return
         pm = [goal_eval._fid_raw(e0, k, v0) for k in pr.kl_sets(torch.stack([prefix(m) for m in ns]))]
+        runs["point_sets"] += len(ns)
         ok = [i for i, x in enumerate(pm) if f_point is None or (x is not None and x >= f_point - 1e-9)]
         for i in range(len(ns)):
             at[ns[i]] = False
@@ -448,6 +587,7 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_fl
     ext_s = rec.setdefault("extra_seconds", {"N": 0.0, "patching": 0.0, "omitted": 0.0})
 
     def extra(gs):                                           # N, activation patching and the omitted family's rows: the
+        runs["extra_graphs"] += len(gs)
         f0 = time.perf_counter()                             # costlier families
         nn_ = ge.necessity_spec(tx, gs, "search")
         f1 = time.perf_counter()
@@ -488,6 +628,7 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_fl
 
     def cheap(ons):                                          # point and the path-patched families of unit sets
         pts = [goal_eval._fid_raw(e0, k, v0) for k in pr.kl_sets(torch.stack(ons))]
+        runs["point_sets"] += len(ons)
         return pts, families([_graph([units[i] for i in o.nonzero().flatten().tolist()]) for o in ons])
 
     def cheap_ok(ons):
@@ -675,6 +816,9 @@ def main():
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--warm", default="text6000", help="a text built first and thrown away (CUDA's first kernels)")
     ap.add_argument("--stated", action="store_true", help="state the connections (connect.connect)")
+    ap.add_argument("--ranker", default=RANKER, choices=("ig", "fisher", "measured"), help="the VPD builder's ranking (rank_scores)")
+    ap.add_argument("--passes", type=int, default=PASSES, help="its midpoints or sampled labels a text")
+    ap.add_argument("--dump-units", action="store_true", help="also OUT/TEXT.units.npz, unit_table's features and labels")
     ap.add_argument("--shared-floors", action="store_true",
                     help="either unit kind: common hard SHARED search floors, no unchecked fallback")
     ap.add_argument("--shared-gate-calls", type=int, help="bounded shared candidate checks (default16; >=2)")
@@ -683,6 +827,7 @@ def main():
     ap.add_argument("--native-gate-calls", type=int,
                     help="neurons only: shared admission calls per text (default16), not physical forwards")
     a = ap.parse_args()
+    globals().update(RANKER=a.ranker, PASSES=a.passes, DUMP_UNITS=a.dump_units)
     if a.shared_floors and a.stated:
         ap.error("--shared-floors does not support --stated")
     if a.shared_gate_calls is not None and (not a.shared_floors or a.shared_gate_calls < 2):
@@ -721,6 +866,9 @@ def main():
             continue
         c = build(goal_eval.GoalEval(ge.nat), task_of(t), a.units, native.task_seed(t), log=print, builder=f"builder_fast@{a.rev}",
                   stated=a.stated, **native_options)
+        units_ = (c.get("build") or {}).pop("_units", None)
+        if units_ is not None:
+            np.savez_compressed(a.out / f"{t}.units.npz", **units_)
         if a.shared_floors or a.shared_native_floors:
             with (a.out / f"{t}.json").open("x") as stream:
                 stream.write(json.dumps(c, default=str))

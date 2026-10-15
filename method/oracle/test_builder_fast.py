@@ -187,3 +187,26 @@ def test_cli_gate_budget_without_shared_mode_rejected_before_allocation(tmp_path
                                   '--units','neurons','--native-gate-calls',str(calls)])
     with pytest.raises(SystemExit):builder_fast.main()
     assert not (tmp_path/'out').exists()
+
+
+@pytest.mark.parametrize("ranker", ["fisher", "measured"])
+def test_rankers_build_inside_the_start(tiny, ranker, monkeypatch):
+    # every ranking arm (rank_scores) builds a circuit inside the START and records what it cost
+    nat, ge, task = tiny
+    monkeypatch.setattr(builder_fast, "RANKER", ranker)
+    monkeypatch.setattr(builder_fast, "PASSES", 2)
+    out = builder_fast.build(ge, task, seed=5)
+    rec = out["build"]
+    assert rec["ranker"] == ranker and rec["ranking_passes"] > 0 and rec["size"] <= rec["start_units"]
+    assert set(rec["runs"]) == {"point_sets", "family_graphs", "extra_graphs"}
+
+
+def test_unit_table_features_and_labels(tiny, monkeypatch):
+    # the learned ranking's examples: one row of features and measured labels per START unit
+    nat, ge, task = tiny
+    monkeypatch.setattr(builder_fast, "DUMP_UNITS", True)
+    rec = builder_fast.build(ge, task, seed=5)["build"]
+    u = rec["_units"]
+    n = rec["start_units"]
+    assert len(u["units"]) == n and all(len(u[k]) == n for k in ("layer", "kind", "back", "write", "ig_own", "label_own", "label_need", "label_score"))
+    assert (u["label_own"] >= 0).all() and (u["label_need"] >= 0).all()

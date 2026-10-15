@@ -583,20 +583,21 @@ def run(a) -> None:
 
 def calibrate(rows: list[dict]) -> list[float]:
     """Per row (z of its top verified candidate, correct), the confidence from a logistic map of z fitted on the other
-    folds (5 folds by row order)."""
+    folds (5 folds by row order): z clipped to [-5, 5] and scaled by 5, an L2 penalty of 0.1 on the slope (without
+    them the 8B multi-hop fit ran to infinite slope, every confidence 0 or 1)."""
     import numpy as np
 
-    z = np.array([r[0] for r in rows], dtype=float)
+    z = np.clip(np.array([r[0] for r in rows], dtype=float), -5, 5) / 5
     y = np.array([r[1] for r in rows], dtype=float)
     conf = np.zeros(len(rows))
     folds = np.arange(len(rows)) % 5
     for f in range(5):
         tr, te = folds != f, folds == f
         w, b = 0.0, 0.0
-        for _ in range(2000):  # gradient descent on the mean log loss (two parameters)
+        for _ in range(3000):  # gradient descent on the mean log loss plus 0.1 w^2
             p = 1 / (1 + np.exp(-(w * z[tr] + b)))
-            w -= 0.1 * float(((p - y[tr]) * z[tr]).mean())
-            b -= 0.1 * float((p - y[tr]).mean())
+            w -= 0.5 * (float(((p - y[tr]) * z[tr]).mean()) + 0.2 * w)
+            b -= 0.5 * float((p - y[tr]).mean())
         conf[te] = 1 / (1 + np.exp(-(w * z[te] + b)))
     return conf.tolist()
 

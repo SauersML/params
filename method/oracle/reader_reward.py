@@ -247,6 +247,9 @@ class VPDTarget:
         return "Groups of parts (each removed, scaled or set back whole):\n" + "\n".join(rows) + "\n"
 
 
+KEEP = 8  # positions whose neuron activations HFTarget keeps for set-backs (the parts are at the last 3)
+
+
 class HFTarget(VPDTarget):
     """A Hugging Face causal LM (Qwen3) on one text; its parts are MLP neurons (the input of down_proj): removal sets
     one to 0, scaling multiplies it, a set-back restores its value on the original text."""
@@ -258,7 +261,7 @@ class HFTarget(VPDTarget):
         self.torch, self.name = torch, name
         self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
         self.hf = AutoTokenizer.from_pretrained(name)
-        self.m = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32 if self.dev.type == "mps" else torch.bfloat16).to(self.dev).eval()
+        self.m = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32 if self.dev.type == "cpu" else torch.bfloat16).to(self.dev).eval()
         self.layers = self.m.model.layers
         self.I = self.m.config.intermediate_size
         self.groups = (16, 64)  # a single neuron of Qwen3-1.7B moves p(' of') on text9000 by under 0.01 (0.99 -> 0.99)
@@ -294,8 +297,8 @@ class HFTarget(VPDTarget):
             if l in by or keep:
                 def pre(_m, args, l=l):
                     x = args[0]
-                    if keep:
-                        acts[l] = x[0].detach().to("cpu", torch.float32)
+                    if keep:  # the last KEEP positions only: set-backs and the parts sit there
+                        acts[l] = x[0, -KEEP:].detach().to("cpu", torch.float32)
                     for p, c, (k, v) in by.get(l, []):
                         x[0, p, c] = v if k == "set" else x[0, p, c] * v
                     return (x,) + tuple(args[1:])
@@ -323,7 +326,7 @@ class HFTarget(VPDTarget):
             seq[iv["pos"]] = self.token_id(iv["token"])
             patch: dict = {}
             for n, p, c in iv["parts"]:
-                patch.setdefault(n, []).append((p, c, self.a0[int(n.split(".")[1])][p, c]))
+                patch.setdefault(n, []).append((p, c, self.a0[int(n.split(".")[1])][p - (len(self.ids) - KEEP), c]))
             lp = self.logp(seq, patch=patch)
             return {"top": self.tok(int(lp.argmax())), "p": float(lp[self.y0].exp())}
         return VPDTarget.run(self, iv)

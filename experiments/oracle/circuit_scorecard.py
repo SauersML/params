@@ -288,6 +288,24 @@ def judged(row: dict, fl: dict, fams: list) -> dict:
             "failing": [f for f in fams if (sc[f] or 0.0) < fl.get(f, 0.0)]}
 
 
+def evaluation_provenance(tx) -> dict:
+    """Eval is a draw split, not a guarantee of unseen interventions.
+
+    Task-defined minimal pairs are deliberately prepended in both splits by
+    GoalEval._interchange_draws. Use hashed identifiers to disclose
+    this exposure without copying task tokens; family draw budgets can truncate the listed definition probes.
+    """
+    pairs = sorted({(int(p), int(z)) for p, z in getattr(tx, "behavior_pairs", ())
+                    if 0 < p < tx.T})
+    identities = [hashlib.sha256(json.dumps(["behavior-definition-probe-v1", p, z],
+                    separators=(",", ":")).encode()).hexdigest() for p, z in pairs]
+    return {"draw_split": "eval", "strict_holdout_status": "shared_definition_probes" if pairs else "unverified",
+            "aggregate_scope": "eval split; includes shared task-definition probes when present",
+            "shared_definition_probe_count": len(pairs),
+            "shared_definition_probe_ids": identities,
+            "exposure": "exact task-defined position/token pairs available to construction and prepended in both splits; family budgets may truncate; other construction exposure unverified"}
+
+
 def common_weight_bank(nat, tx, split="eval") -> dict:
     """One weight component per site, removed and doubled, independent of candidates.
 
@@ -872,7 +890,8 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
     nu = native_units.NativeUnits(nat, tx.ids, tx.targets)
     S = native_units.from_units(nu, units)
     nphi = native_units.NativePhi(ge, tx, "eval", means=means)
-    rec = {"task": path.stem, "circuit": str(path), "teacher": teacher_block(path), "pool": pool_name, "units": "native"}
+    rec = {"task": path.stem, "circuit": str(path), "teacher": teacher_block(path), "pool": pool_name, "units": "native",
+           "evaluation_provenance": evaluation_provenance(tx)}
 
     def done(name):
         rec["seconds"] = time.perf_counter() - t_start
@@ -989,7 +1008,8 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     tx = lines.text_of(ge, tp, vpd)
     g, defects, _ = goal_eval.load_answer(path, task, tx.targets, nat)
     nodes = g.node_set()
-    rec = {"task": path.stem, "circuit": str(path), "teacher": teacher_block(path), "pool": pool_name}
+    rec = {"task": path.stem, "circuit": str(path), "teacher": teacher_block(path), "pool": pool_name,
+           "evaluation_provenance": evaluation_provenance(tx)}
 
     def done(name):
         rec["seconds"] = time.perf_counter() - t_start
@@ -1141,12 +1161,17 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
             continue
         rec = json.loads(f.read_text())
         native_rec = rec["size"].get("units") == "native"
-        if ("mediated" in rec.get("edits", {}) and "sparsity" in rec.get("size", {}) and (native_rec or rec.get("live_gates") is not None or not ci)
-                and "interventions" in rec and "margins" in rec["floors"] and common_weights_current(rec)):
+        scientific_complete = ("mediated" in rec.get("edits", {}) and "sparsity" in rec.get("size", {}) and (native_rec or rec.get("live_gates") is not None or not ci)
+                and "interventions" in rec and "margins" in rec["floors"] and common_weights_current(rec))
+        if scientific_complete and "evaluation_provenance" in rec:
             continue
         path = circuits_dir / f.name
         tp = task_path(path.stem)
         tx = lines.text_of(ge, tp, vpd)
+        rec["evaluation_provenance"] = evaluation_provenance(tx)
+        if scientific_complete:
+            f.write_text(json.dumps(rec))
+            continue
         if native_rec:
             units = sorted({(k, int(l), int(t), int(j)) for k, l, t, j in json.loads(path.read_text())["nodes"]})
             means = means or native_units.unit_means(ge.nat)

@@ -237,3 +237,78 @@ def test_common_weight_contract_metadata_preserves_bank_identity():
     assert current['worlds']==unversioned['worlds']
     assert sc.common_weights_current({'common_weights':current})
     assert not sc.common_weights_current({'common_weights':unversioned})
+
+
+def test_behavior_definition_probe_overlap_is_disclosed_without_changing_draws(monkeypatch):
+    from types import SimpleNamespace
+    import goal_eval
+    tx = SimpleNamespace(ids=[0, 1, 2], T=3, seed=7,
+                         behavior_pairs=[(1, 6), (1, 6), (0, 9), (3, 9)])
+    ge = object.__new__(goal_eval.GoalEval)
+    ge.nat = object()
+    monkeypatch.setattr(goal_eval.carry, "alternatives",
+                        lambda nat, ids, p, ranks: [[0, 3 + r, 2] for r in ranks])
+    monkeypatch.setattr(ge, "_fresh_sources", lambda tx, p, seed: [8])
+    search = ge._interchange_draws(tx, [1], "search", 4)
+    evaluation = ge._interchange_draws(tx, [1], "eval", 4)
+    assert search[:2] == evaluation[:2] == [(1, 6), (1, 6)]
+    assert set(search).intersection(evaluation) == {(1, 6)}
+    provenance = sc.evaluation_provenance(tx)
+    assert provenance["draw_split"] == "eval"
+    assert provenance["strict_holdout_status"] == "shared_definition_probes"
+    assert provenance["shared_definition_probe_count"] == 1
+    assert len(provenance["shared_definition_probe_ids"]) == 1
+    assert len(provenance["shared_definition_probe_ids"][0]) == 64
+    assert "includes shared task-definition probes" in provenance["aggregate_scope"]
+    tx.behavior_pairs = [(1, 7)]
+    assert sc.evaluation_provenance(tx)["shared_definition_probe_ids"] != provenance["shared_definition_probe_ids"]
+
+
+def test_plain_eval_split_does_not_certify_unverified_construction_exposure():
+    from types import SimpleNamespace
+    provenance = sc.evaluation_provenance(SimpleNamespace(T=3))
+    assert provenance["shared_definition_probe_count"] == 0
+    assert provenance["shared_definition_probe_ids"] == []
+    assert provenance["strict_holdout_status"] == "unverified"
+    assert "unverified" in provenance["exposure"]
+
+
+@pytest.mark.parametrize('units', ['native', 'vpd'])
+def test_add_backfills_only_provenance_for_scientifically_complete_records(tmp_path, monkeypatch, units):
+    import json
+    from types import SimpleNamespace
+    import native_units
+    import vpd_model
+    out = tmp_path / 'scores'
+    out.mkdir()
+    record = {'size': {'units': units, 'sparsity': {}}, 'edits': {'mediated': []},
+              'live_gates': {}, 'interventions': {}, 'floors': {'margins': {}},
+              'common_weights': {'metadata': {'execution_contract': sc.COMMON_WEIGHT_EXECUTION_CONTRACT}}}
+    target = out / 'example.json'
+    target.write_text(json.dumps(record))
+    tx = SimpleNamespace(T=3, behavior_pairs=[(1, 6)])
+    calls = []
+    def text_of(*args):
+        calls.append('text')
+        return tx
+    def forbidden(*args, **kwargs):
+        pytest.fail('metadata-only backfill executed scientific work')
+    monkeypatch.setattr(sc.native, 'Native', lambda: object())
+    monkeypatch.setattr(sc.goal_eval, 'GoalEval', lambda *a, **k: SimpleNamespace(fidelity=forbidden))
+    monkeypatch.setattr(sc.lines, 'text_of', text_of)
+    monkeypatch.setattr(sc, 'task_path', lambda stem: tmp_path / (stem + '.json'))
+    monkeypatch.setattr(sc, 'say', lambda *args: None)
+    monkeypatch.setattr(vpd_model, 'VPD_PTH', tmp_path / 'absent.pth')
+    for name in ('unit_means', 'NativePhi', 'NativeUnits'):
+        monkeypatch.setattr(native_units, name, forbidden)
+    monkeypatch.setattr(sc.goal_eval, 'load_answer', forbidden)
+    monkeypatch.setattr(sc, 'sparsity', forbidden)
+    # No circuit or task file exists: only the stubbed text metadata may be read.
+    sc.add(out, tmp_path / 'absent-circuits', None, {})
+    updated = json.loads(target.read_text())
+    assert updated.pop('evaluation_provenance') == sc.evaluation_provenance(tx)
+    assert updated == record
+    assert calls == ['text']
+    # Once metadata exists, repeat upkeep must skip even text construction.
+    sc.add(out, tmp_path / 'absent-circuits', None, {})
+    assert calls == ['text']

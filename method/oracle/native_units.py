@@ -33,6 +33,9 @@ positions from its first removal on, reading the set's keys and values before it
   native_units.py phi --circuits DIR [--vpd VPD.pt] [--texts TEXTS_DIR] [--teach TEACH.jsonl ...] --out OUT.jsonl
       native circuits against circuits in VPD's subcomponents (influential sets, teacher circuits, oracle answers) under
       phi's shared families at equal bits (NativePhi)
+  native_units.py build --tasks text9000,... --out OUT [--vpd VPD.pt] [--device D] [--rev C]
+      the native builder (build_native: mean ablation, Fisher-ranked log-scale prefix) on each text, OUT/<task>.json in
+      the bake-off's format with the circuit's mediated share
 """
 
 from __future__ import annotations
@@ -578,6 +581,34 @@ def mediated_share(ge: goal_eval.GoalEval, tx: goal_eval.Text, S: Mask, means: d
         out[f"top{k}"] = {"units": [list(u) for u in R], "live": d_live, "mediated": d_med,
                           "share": d_med / d_live if abs(d_live) > 1e-9 else None}
     return out
+
+
+def build_all(tasks: list[str], out: Path, vpd: Path | None = None, device: str | None = None, mediated: bool = True,
+              rev: str = "", log=print) -> None:
+    """build_native on each task, OUT/<task>.json in the bake-off's format (generality's, the lead's 10-14): {"units":
+    "native", "semantics": "mean_ablation", "nodes": Mask.units() as lists, "build_seconds", "builder", "record"} and,
+    with mediated, the circuit's mediated_share; a task already written is skipped. vpd: VPD's saved answers (the KL
+    target reads VPD's bounds)."""
+    import lines
+
+    nat = native.Native(device)
+    ge = goal_eval.GoalEval(nat, chunk=32)
+    means = unit_means(nat)
+    saved = torch.load(vpd) if vpd else None
+    out.mkdir(parents=True, exist_ok=True)
+    for task in tasks:
+        dest = out / f"{task}.json"
+        if dest.exists():
+            continue
+        tx = lines.text_of(ge, native.TEXTS / "vpd4l" / f"{task}.json", saved)
+        S, rec = build_native(ge, tx, means=means, log=lambda m, task=task: log(f"{task}{m}"))
+        row = {"units": "native", "semantics": "mean_ablation", "nodes": [list(u) for u in S.units()],
+               "build_seconds": rec["seconds"], "builder": f"native_units.build_native@{rev}", "device": str(nat.dev), "record": rec}
+        if mediated:
+            row["mediated"] = mediated_share(ge, tx, S, means)
+            log(f"{task}: mediated share top 1/3/5 " + " ".join(f"{row['mediated'][f'top{k}']['share']:.3f}" for k in (1, 3, 5)))
+        dest.write_text(json.dumps(row))
+        native.free(nat.dev)
 
 
 def screen(nu: NativeUnits, S: Mask, base_kl: float, log=None, units: list | None = None) -> dict:
@@ -1642,7 +1673,17 @@ def main():
     f.add_argument("--teach", type=Path, nargs="*", default=[], help="native teacher rows (teach's OUT.jsonl)")
     f.add_argument("--ratios", type=float, nargs="*", default=[0.5, 1.0, 2.0])
     f.add_argument("--out", type=Path, required=True)
+    b = sub.add_parser("build", help="the native builder (build_native) on given texts, circuits in the bake-off's format")
+    b.add_argument("--tasks", required=True, help="comma-separated task ids")
+    b.add_argument("--out", type=Path, required=True)
+    b.add_argument("--vpd", type=Path, help="VPD's answers saved by teacher.py --save-vpd (the KL target reads VPD's bounds)")
+    b.add_argument("--device", help="cuda, mps or cpu (default: native.device()'s choice)")
+    b.add_argument("--no-mediated", action="store_true", help="skip the mediated share")
+    b.add_argument("--rev", default="", help="the code's commit, written as the builder's name")
     args = ap.parse_args()
+    if args.cmd == "build":
+        build_all(args.tasks.split(","), args.out, args.vpd, args.device, not args.no_mediated, args.rev)
+        return
     if args.cmd == "phi":
         phi_report(args.split, args.n, args.vpd, args.influential, args.out, args.teach, tuple(args.ratios), args.offset, args.stride,
                    texts=args.texts)

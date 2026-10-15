@@ -1,29 +1,29 @@
-"""The neuron-grounded oracle's examples (#2951 G2; the lead's 10-15 direction, decision 6). Beside a text's half-depth
-activations, the oracle reads the writes of the neurons that a question-scoped circuit (method/oracle/neuron_builder.py:
-the answer contrast on the weak-zeroed reference, removal = zeroing one neuron at one position) holds, each labelled with
-its ID, pole and position, and answers questions whose answers are measured removals on that reference:
+"""The neuron-grounded oracle's examples (#2951 G2; the lead's 10-15 direction, decision 6, and its 8B update). Beside a
+text's half-depth activations (the Activation Oracle's read), the oracle reads the neurons of a question-scoped circuit
+(method/oracle/neuron_builder.py: the answer contrast on the weak-zeroed reference, a unit one neuron's value at one
+position) in measured order: the circuit's units, then the builder's strongest measured singles beyond it; a random
+number of them from MIN_SHOWN up to all, so that how many to show is chosen afterwards by held-out accuracy (the lead's
+10-15: no fixed cap). Each shows as its name, "L<layer>.N<neuron>+@<position>" ("-" for the negative pole: claim_check's
+unit syntax), and its write (its value x its down_proj column, cao.Oracle.write). The questions, every answer measured
+by method/oracle/claim_check.py, the oracle's reward checker, so that the claim an answer ends with passes there:
 
-  n_top     which listed neuron, zeroed alone, lowers the answer's contrast most
-  n_effect  how much one listed neuron's removal changes the answer's contrast (bits, to the nearest half)
-  n_set     whether the model keeps its answer with every listed circuit neuron zeroed, else what it says instead
-  n_sign    whether a listed neuron supports the answer or works against it (the sign of its measured removal)
+  n_steer  what turning one shown neuron up (STEER x its calibration maximum, along its pole) does to the next token
+  n_zero   what zeroing one shown neuron does
+  n_set    what zeroing two to four shown neurons together does
+  n_sign   whether a shown neuron supports the next token or works against it (its zeroing's sign)
 
-Listed neurons: the circuit's (necessity, then sufficiency), the builder's strongest measured singles beyond it, up to
-K, and FOILS strong neurons at the answer position outside both (most move nothing), shuffled. Every listed neuron is
-measured alone (the builder's singles reused; the rest one run each). A label reads "L<layer>.N<neuron>+ at <position>"
-("-" for the negative pole). The vectors, stored once per text in OUT.pt under the text's key ("vec"): the half-depth
-residual at every position (the Activation Oracle's read, adapter off) and each listed neuron's write (its weak-zeroed
-value x its down_proj column) in prompt order. Texts: G1's wikitext-103 training windows (cao.gen's), the answer the
-model's next token after the window.
+An answer is one English sentence and a line "Claim: {units, op, predict}" (the prompt and position are the text's own
+and the answer position); a claim of an effect that random neurons of the same layers also produce is said to be so
+(claim_check's "specific"). Texts: wikitext-103 windows of h2h.T tokens (the answer the model's next token after the
+window); --records: circuits built elsewhere (neuron_builder's record format, one JSON file per text with "ids").
 
-  g2.py gen --out EX.jsonl --thr THR.pt [--texts N] [--seed S] [--split test] [--necessity-only]   (GPU; EX.pt beside; resumes)
-  g2.py eval --items EX.jsonl --vectors EX.pt --adapter A --out OUT.jsonl [--text-only]          graded answers, claims checked
+  g2.py gen --out EX.jsonl --thr THR.pt [--texts N] [--seed S] [--split test] [--necessity-only] [--records DIR]
+  g2.py eval --items EX.jsonl --adapter A --out OUT.jsonl [--text-only]   graded answers; the stated claims checked
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import sys
 import time
@@ -34,15 +34,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "method" / "oracle"
 import cao  # noqa: E402
 import h2h  # noqa: E402  (cao puts aoh2h on the path)
 
-K = 10       # listed circuit and measured neurons
-FOILS = 2    # listed strong neurons at the answer position outside the circuit and the ranking
-HALF = 0.25  # bits: a removal moving the contrast less than this is "almost nothing"
-QUESTIONS = 6  # per text: one n_top, one n_set, the rest n_effect and n_sign
+STEER = 3.0     # claim_check's steer scale: x the neuron's calibration maximum
+MIN_SHOWN = 4
+HALF = 0.25     # bits: a change smaller than this is "almost none"
+QUESTIONS = (("n_steer", 2), ("n_zero", 1), ("n_set", 1), ("n_sign", 1))
 
 
-def label(u: tuple, pole: int) -> str:
-    i, t, n = u
-    return f"L{i}.N{n}{'+' if pole > 0 else '-'} at {t}"
+def name(d: dict) -> str:
+    return f"L{d['layer']}.N{d['neuron']}{'+' if d['pole'] > 0 else '-'}@{d['pos']}"
 
 
 def bits(x: float) -> str:
@@ -50,169 +49,160 @@ def bits(x: float) -> str:
     return f"{v:g} bit" + ("" if v == 1 else "s")
 
 
-def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, key: str) -> tuple[list[dict], "torch.Tensor", dict]:
-    import neuron_builder as nb
-    torch = o.torch
-    pos = len(ids) - 1
-    rec = nb.build(nr, ids, pos)
-    y, alt = rec["answer"], rec["alternatives"]
-    altt = torch.tensor(alt, device=nr.dev)
-    cap = {}
-    with torch.no_grad():
-        lp0 = torch.log_softmax(nr.logits(ids, [pos], capture=cap)[:, 0], -1)
-    H = [h[0] for h in cap["h"]]
-    c0 = float((lp0[0, y] - torch.logsumexp(lp0[0, altt], -1)) / math.log(2))
+def listing(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
-    def alone(units: list) -> list[tuple[float, int]]:
-        """Per unit zeroed alone: the contrast's drop (bits) and the top token."""
-        out = []
-        for s in range(0, len(units), nb.ROWS):
-            part = [[u] for u in units[s:s + nb.ROWS]]
-            with torch.no_grad():
-                l = torch.log_softmax(nr.logits(ids, [pos], edit=nb._zero_edit(nb._pad(part)), B=nb.ROWS)[:, 0], -1)
-            c = (l[:, y] - torch.logsumexp(l[:, altt], -1)) / math.log(2)
-            out += [(c0 - float(c[b]), int(l[b].argmax())) for b in range(len(part))]
-        return out
-    circ = [(d["layer"], d["pos"], d["neuron"]) for d in rec["nodes"]]
-    ranked = [(d["layer"], d["pos"], d["neuron"]) for d in rec["ranked_top"]]
-    listed = list(dict.fromkeys(circ + ranked))[:K]
-    strong = [(i, pos, int(n)) for i in range(nr.L) for n in ((H[i][pos] != 0) & (H[i][pos].abs() < nr.massive[i])).nonzero()[:, 0].tolist()]
-    strong = [u for u in strong if u not in set(listed) and u not in set(ranked)]
-    listed += rng.sample(strong, min(FOILS, len(strong)))
-    rng.shuffle(listed)
-    eff = dict(zip(listed, [d for d, _ in alone(listed)]))
-    pole = {u: 1 if float(H[u[0]][u[1], u[2]]) > 0 else -1 for u in listed}
-    labs = {u: label(u, pole[u]) for u in listed}
-    with torch.no_grad():  # the vectors: the half-depth read (the model itself) and each listed neuron's write
-        with o.off():
-            Hm = o.m(input_ids=torch.tensor([ids], device=o.dev), output_hidden_states=True).hidden_states[cao.MID + 1][0]
-        W = [o.layers[i].mlp.down_proj.weight[:, n].float() * float(H[i][t, n]) for i, t, n in listed]
-    vec = torch.cat([Hm.float(), torch.stack(W)]).to(torch.float16).cpu()
-    with torch.no_grad():  # the logit lens baseline: each write's direct push on y against the alternatives' mean
-        U = o.lm.lm_head.weight
-        d = U[y].float() - U[alt].float().mean(0)
-        lens = {labs[u]: float(w @ d) for u, w in zip(listed, W)}
-    blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [{"label": labs[u]} for u in listed]
-    ytok = cao.q_tok(o.tok.decode([y]))
-    base = {"ctx": ids, "blocks": blocks, "vec": key, "effects": {labs[u]: round(eff[u], 3) for u in listed}, "lens": lens}
-    out = []
-    top = max(listed, key=lambda u: eff[u])
-    out.append({**base, "cat": "n_top", "q": f"The model's next token is {ytok}. Which listed neuron, zeroed alone, lowers it most "
-                                             f"against its alternatives?",
-                "a": f"{labs[top]}, by about {bits(eff[top])}." if eff[top] >= HALF else cao.NONE, "units": [list(top)]})
-    zc = [u for u in listed if u in set(circ)]
-    if zc:
-        with torch.no_grad():
-            l = nr.logits(ids, [pos], edit=nb._zero_edit(nb._pad([zc])), B=nb.ROWS)[0, 0]  # (the builder's batch size: bf16 runs differ by it)
-        z = int(l.argmax())
-        out.append({**base, "cat": "n_set", "q": f"If {', '.join(labs[u] for u in zc)} were {'all ' if len(zc) > 1 else ''}zeroed, would the model still "
-                                                 f"give {ytok}? If not, what would it give?",
-                    "a": "Yes." if z == y else f"No, {cao.q_tok(o.tok.decode([z]))}.", "units": [list(u) for u in zc]})
-    rest = [u for u in listed if u != top]
-    rng.shuffle(rest)
-    for k, u in enumerate(rest[:QUESTIONS - len(out)]):
-        e = eff[u]
-        if k % 2 == 0:
-            out.append({**base, "cat": "n_effect", "q": f"If {labs[u]} were zeroed, how would the model's next token {ytok} fare "
-                                                        f"against its alternatives?",
-                        "a": "Almost no change." if abs(e) < HALF else (f"It would lose about {bits(e)}." if e > 0 else
-                                                                         f"It would gain about {bits(e)}."), "units": [list(u)]})
+
+def outcome(r: dict, y: str) -> tuple[str, dict]:
+    """A measured result as an English clause and the prediction that states it."""
+    if r["top_after"] != r["top_before"]:
+        return f"the model gives {cao.q_tok(r['top_after'])} instead of {y}", {"top": r["top_after"]}
+    ch = r["change"]
+    if abs(ch) < HALF:
+        return f"the model still gives {y}, almost unchanged", {"top_changes": False}
+    v = round(ch * 2) / 2
+    return (f"the model still gives {y}, its lead over the alternatives {'up' if ch > 0 else 'down'} about {bits(ch)}",
+            {"contrast_change": {"op": ">=" if ch > 0 else "<=", "value": v - 0.25 if ch > 0 else v + 0.25}})
+
+
+def text_examples(o: "cao.Oracle", nr, ids: list[int], rng: random.Random, rec: dict | None = None) -> tuple[list[dict], dict]:
+    import claim_check as cc
+    import neuron_builder as nb
+    pos = len(ids) - 1
+    rec = rec or nb.build(nr, ids, pos)
+    order = list({name(d): d for d in rec["nodes"] + rec["ranked_top"]}.values())  # circuit first, then measured singles
+    if not order:
+        return [], {"size": 0}
+    shown = order[:rng.randint(min(MIN_SHOWN, len(order)), len(order))]
+    names = [name(d) for d in shown]
+    blocks = [{"layer": cao.MID, "positions": list(range(len(ids)))}] + [{"label": n, "write": [d["layer"], d["neuron"], d["act"]]}
+                                                                          for n, d in zip(names, shown)]
+    y = cao.q_tok(o.tok.decode([rec["answer"]]))
+    asks = []
+    for cat, k in QUESTIONS:
+        for _ in range(k):
+            us = rng.sample(names, rng.randint(2, min(4, len(names)))) if cat == "n_set" else [rng.choice(names)]
+            if cat == "n_set" and len(names) < 2:
+                continue
+            op = {"steer": STEER} if cat == "n_steer" else "zero"
+            asks.append((cat, us, op))
+    probe = [{"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": {"top_changes": True}} for _, us, op in asks]
+    got = cc.check_many(nr, probe)
+    claims, texts = [], []
+    for (cat, us, op), r in zip(asks, got):
+        if "error" in r:
+            continue
+        if cat == "n_sign":
+            ch = r["change"]  # zeroing: a supporting neuron's removal lowers the contrast
+            pred = {"contrast_change": {"op": "<=", "value": -HALF}} if ch <= -HALF else \
+                {"contrast_change": {"op": ">=", "value": HALF}} if ch >= HALF else {"top_changes": False}
+            text = (f"{us[0]} supports {y}." if ch <= -HALF else f"{us[0]} works against {y}." if ch >= HALF else
+                    f"{us[0]} barely matters for {y}.")
         else:
-            out.append({**base, "cat": "n_sign", "q": f"Does {labs[u]} support the model's next token {ytok} or work against it?",
-                        "a": "Neither, it barely matters." if abs(e) < HALF else ("It supports it." if e > 0 else "It works against it."),
-                        "units": [list(u)]})
-    info = {"size": rec["size"], "met": rec["met"], "contrast": round(c0, 2), "build_seconds": rec["seconds"], "listed": len(listed)}
-    return out, vec, info
+            clause, pred = outcome(r, y)
+            verb = "Turning " + us[0] + " up" if cat == "n_steer" else "Zeroing " + listing(us) + (" together" if len(us) > 1 else "")
+            text = f"{verb}: {clause}."
+        claims.append({"prompt": {"ids": ids}, "position": -1, "units": us, "op": op, "predict": pred})
+        texts.append((cat, us, op, text, pred))
+    final = cc.check_many(nr, claims)  # the stated claims themselves, with their controls
+    out = []
+    for (cat, us, op, text, pred), r in zip(texts, final):
+        if not r.get("pass"):
+            continue  # (bf16 runs at the edge of a threshold)
+        if not r["specific"]:
+            text += " Random neurons of the same layers do the same."
+        q = {"n_steer": f"What happens to the model's next token {y} if {us[0]} is turned up?",
+             "n_zero": f"What happens to the model's next token {y} if {us[0]} is zeroed?",
+             "n_set": f"What happens to the model's next token {y} if {listing(us)} are zeroed together?",
+             "n_sign": f"Does {us[0]} support the model's next token {y} or work against it?"}[cat]
+        claim = {"units": us, "op": op, "predict": pred}
+        out.append({"cat": cat, "ctx": ids, "blocks": blocks, "q": q, "a": f"{text}\nClaim: {json.dumps(claim)}",
+                    "claim": claim, "specific": r["specific"], "shown": len(shown), "circuit": len(rec["nodes"])})
+    return out, {"size": rec["size"], "met": rec["met"], "shown": len(shown), "questions": len(out), "build_seconds": rec.get("seconds")}
+
+
+def windows(tok, split: str, rng: random.Random):
+    import pandas as pd
+    from huggingface_hub import hf_hub_download
+
+    src = cao.WIKITEXT_TRAIN if split == "train" else h2h.WIKITEXT
+    df = pd.read_parquet(hf_hub_download(src[0], src[1], repo_type="dataset"))
+    paras = [t.strip() for t in df["text"].tolist() if len(t.strip()) > 200 and not t.strip().startswith("=")]
+    rng.shuffle(paras)
+    for t in paras:
+        ids = tok(" " + t, add_special_tokens=False)["input_ids"]
+        if len(ids) >= h2h.T + 8:
+            s = rng.randrange(0, len(ids) - h2h.T)
+            yield ids[s:s + h2h.T]
 
 
 def gen(a) -> None:
-    import pandas as pd
-    import torch
-    from huggingface_hub import hf_hub_download
-
     import neuron_builder as nb
     nb.SUFFICIENCY = nb.SUFFICIENCY and not a.necessity_only
     o = cao.Oracle(None, a.device)
     nr = nb.Neurons(o.m, o.tok)
     nr.load(a.thr)
     rng = random.Random(a.seed)
-    src = cao.WIKITEXT_TRAIN if a.split == "train" else h2h.WIKITEXT
-    df = pd.read_parquet(hf_hub_download(src[0], src[1], repo_type="dataset"))
-    paras = [t.strip() for t in df["text"].tolist() if len(t.strip()) > 200 and not t.strip().startswith("=")]
-    rng.shuffle(paras)
-    vpath = a.out.with_suffix(".pt")
-    store = torch.load(vpath) if vpath.exists() else {}
-    n, t0 = 0, time.time()
+    done = {json.loads(x)["text"] for x in a.out.read_text().splitlines()} if a.out.exists() else set()
+    src = ((json.loads(f.read_text()) for f in sorted(a.records.glob("*.json"))) if a.records else
+           ({"ids": ids} for ids in windows(o.tok, a.split, rng)))
+    t0 = time.time()
     with a.out.open("a") as fh:
-        for t in paras:
+        for n, r in enumerate(src):
             if n >= a.texts:
                 break
-            ids = o.tok(" " + t, add_special_tokens=False)["input_ids"]
-            if len(ids) < h2h.T + 8:
+            key = 1_000_000 * a.seed + n
+            if key in done:
                 continue
-            s = rng.randrange(0, len(ids) - h2h.T)
-            key = f"g2_{a.seed}_{n}"
-            n += 1
-            if key in store:
-                continue
-            exs, vec, info = text_examples(o, nr, ids[s:s + h2h.T], rng, key)
-            store[key] = vec
+            exs, info = text_examples(o, nr, r["ids"], rng, r if "nodes" in r else None)
             for e in exs:
-                fh.write(json.dumps({**e, "text": 1_000_000 * a.seed + n - 1}) + "\n")
-            if n % 10 == 0:
-                fh.flush()
-                torch.save(store, vpath)
-                print(json.dumps({"texts": n, "seconds": round(time.time() - t0), **info}), flush=True)
-    torch.save(store, vpath)
-    print(f"{n} texts to {a.out} and {vpath}")
+                fh.write(json.dumps({**e, "text": key}) + "\n")
+            fh.flush()
+            if (n + 1) % 10 == 0:
+                print(json.dumps({"texts": n + 1, "seconds": round(time.time() - t0), **info}), flush=True)
+    print(f"{a.texts} texts to {a.out}")
 
 
 def evaluate(a) -> None:
-    """The oracle's answers to held-out examples (gen --split test), greedy, graded exactly (n_top on the named neuron,
-    the rest on the whole answer), with the named-neuron claim checked: an n_top answer holds when the neuron it names
-    lowers the answer, measured alone, within HALF of the most any listed neuron does. --text-only: no vector added (the
-    control). Baselines printed beside: the logit lens (the listed write pushing y hardest against the alternatives'
-    mean; for n_sign its sign) and the most common answer per category."""
+    """The oracle's greedy answers to held-out examples (gen --split test), graded on the English sentence's outcome and
+    on its claim, the claim re-checked by claim_check on the reference (pass and specific); --text-only: no vector
+    added (the control). Printed beside: the most common answer per category."""
     import collections
 
-    import torch
+    import claim_check as cc
+    import neuron_builder as nb
     exs = [json.loads(x) for x in a.items.read_text().splitlines()]
     o = cao.Oracle(a.adapter, a.device)
     o.text_only = a.text_only
-    for f in a.vectors:
-        o.vec_store.update(torch.load(f))
     got = []
     for k in range(0, len(exs), 16):
         got += o.answers(exs[k:k + 16])
+    nr = nb.Neurons(o.m, o.tok)
+    nr.load(a.thr)
+    claims, idx = [], []
+    for j, g in enumerate(got):
+        try:
+            c = json.loads(g.split("Claim:", 1)[1].strip())
+            claims.append({"prompt": {"ids": exs[j]["ctx"]}, "position": -1, "units": c["units"], "op": c["op"], "predict": c["predict"]})
+            idx.append(j)
+        except (IndexError, ValueError, KeyError, TypeError):
+            pass
+    with o.off():
+        res = dict(zip(idx, cc.check_many(nr, claims)))
     by = collections.defaultdict(list)
     with a.out.open("w") as fh:
-        for e, g in zip(exs, got):
-            rec = {"cat": e["cat"], "q": e["q"], "a": e["a"], "got": g}
-            if e["cat"] == "n_top":
-                named = g.split(",")[0].strip()
-                named = named if named in e["effects"] else None
-                want = e["a"].split(",")[0] if e["a"] != cao.NONE else None
-                rec["ok"] = named == want if want else g.strip() == cao.NONE
-                top = max(e["effects"].values())
-                rec["claim_holds"] = named is not None and e["effects"][named] >= top - HALF if named else None
-                lens_pick = max(e["lens"], key=e["lens"].get)
-                rec["lens_ok"] = lens_pick == want if want else False
-            else:
-                rec["ok"] = g.strip() == e["a"].strip()
-                if e["cat"] == "n_sign":
-                    lab = e["q"].split("Does ")[1].split(" support")[0]
-                    rec["lens_ok"] = e["a"].startswith("Neither") is False and ((e["lens"][lab] > 0) == e["a"].startswith("It supports"))
+        for j, (e, g) in enumerate(zip(exs, got)):
+            r = res.get(j, {})
+            rec = {"cat": e["cat"], "shown": e["shown"], "q": e["q"], "a": e["a"], "got": g,
+                   "same_sentence": g.split("\n")[0].strip() == e["a"].split("\n")[0].strip(),
+                   "claim_pass": bool(r.get("pass")), "claim_specific": bool(r.get("specific"))}
             by[e["cat"]].append(rec)
             fh.write(json.dumps(rec) + "\n")
     for cat, rs in sorted(by.items()):
-        common = collections.Counter(r["a"] for r in rs).most_common(1)[0][1] / len(rs)
-        line = f"{cat:9s} n={len(rs):4d} exact {sum(r['ok'] for r in rs) / len(rs):.3f}  most common answer {common:.3f}"
-        if any("lens_ok" in r for r in rs):
-            line += f"  logit lens {sum(bool(r.get('lens_ok')) for r in rs) / len(rs):.3f}"
-        if cat == "n_top":
-            named = [r for r in rs if r["claim_holds"] is not None]
-            line += f"  claims holding {sum(r['claim_holds'] for r in named) / max(len(named), 1):.3f} of {len(named)} named"
-        print(line)
+        common = collections.Counter(r["a"].split("\n")[0].split(":")[-1] for r in rs).most_common(1)[0][1] / len(rs)
+        print(f"{cat:8s} n={len(rs):4d} same sentence {sum(r['same_sentence'] for r in rs) / len(rs):.3f}  claims passing "
+              f"{sum(r['claim_pass'] for r in rs) / len(rs):.3f}  specific {sum(r['claim_specific'] for r in rs) / len(rs):.3f}  "
+              f"most common outcome {common:.3f}")
 
 
 def main():
@@ -224,12 +214,13 @@ def main():
     g.add_argument("--texts", type=int, default=100)
     g.add_argument("--seed", type=int, default=1)
     g.add_argument("--split", default="train", choices=("train", "test"), help="wikitext-103's split (test: evaluation texts)")
+    g.add_argument("--records", type=Path, help="circuits built elsewhere: a directory of neuron_builder records with ids")
     g.add_argument("--device")
     g.add_argument("--necessity-only", action="store_true", help="the builder's necessity set alone (its sufficiency search "
                                                                   "runs in float64, which MPS lacks)")
     e = sub.add_parser("eval")
     e.add_argument("--items", type=Path, required=True, help="gen --split test's examples")
-    e.add_argument("--vectors", type=Path, nargs="+", required=True)
+    e.add_argument("--thr", type=Path, required=True)
     e.add_argument("--adapter", default=cao.AO)
     e.add_argument("--out", type=Path, required=True)
     e.add_argument("--text-only", action="store_true")

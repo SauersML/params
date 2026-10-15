@@ -156,7 +156,7 @@ class Oracle:
 
     def _vectors(self, ex: dict, *, sequence=False):
         torch = self.torch
-        units = [b['unit'] for b in ex['blocks'] if 'layer' not in b]
+        units = [b['unit'] for b in ex['blocks'] if 'unit' in b]
         captured = _capture_native(self, ex['ctx'], units, target=ex.get('target'), hidden=True, **({'sequence':True} if sequence else {}))
         out, writes = captured[:2]
         H = out.hidden_states
@@ -165,6 +165,8 @@ class Oracle:
         for b in ex["blocks"]:
             if "layer" in b:
                 vs.append(H[b["layer"] + 1][0, b["positions"]])
+            elif "write" in b:
+                vs.append(self.write(b["write"])[None].to(H[0].dtype))
             else:
                 vs.append(next(writes)[None].to(H[0].dtype))
         value = torch.cat(vs)
@@ -198,7 +200,7 @@ class Oracle:
         over their distinct contexts (a position's states do not depend on the padding after it); the rest one by one."""
         torch = self.torch
         out = [None] * len(exs)
-        todo = [k for k, e in enumerate(exs) if "vec" not in e and not e.get("target") and all("layer" in b for b in e["blocks"])]
+        todo = [k for k, e in enumerate(exs) if "vec" not in e and not e.get("target") and all("layer" in b or "write" in b for b in e["blocks"])]
         for k in set(range(len(exs))) - set(todo):
             out[k] = self.vectors(exs[k])
         if todo:
@@ -214,8 +216,18 @@ class Oracle:
                 H = self.m(input_ids=ids, attention_mask=att, output_hidden_states=True).hidden_states
             for k in todo:
                 r = ctxs.index(tuple(exs[k]["ctx"]))
-                out[k] = torch.cat([H[b["layer"] + 1][r, b["positions"]] for b in exs[k]["blocks"]])
+                out[k] = torch.cat([H[b["layer"] + 1][r, b["positions"]] if "layer" in b else self.write(b["write"])[None].to(H[0].dtype)
+                                    for b in exs[k]["blocks"]])
         return out
+
+    def write(self, w: list):
+        """A neuron's write recorded in an example ([layer, neuron, value]: its value at a position, from the circuit's
+        record): value x the neuron's down_proj column of the target (the base weight, the oracle's adapter aside), [d]
+        float32; no forward pass."""
+        layer, neuron, value = w
+        mod = self.layers[int(layer)].mlp.down_proj
+        W = mod.get_base_layer().weight if hasattr(mod, "get_base_layer") else mod.weight
+        return W[:, int(neuron)].float() * float(value)
 
     def hook(self, vecs: list, pos: list[list[int]]):
         """The paper's addition at layer 1's output: per row its vectors at its placeholder positions, normalized in

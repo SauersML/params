@@ -713,3 +713,15 @@ def test_batched_reads_equal_one_at_a_time(tiny):
     exs = [e1, e2, e1, ex(tiny)]
     for e, v in zip(exs, tiny.vectors_many(exs)):
         assert torch.allclose(v, tiny._vectors(e), atol=1e-5)
+
+
+def test_a_recorded_write_is_its_value_times_its_down_projection_column(tiny):
+    """A "write" block (a circuit neuron's recorded value) reads value x down_proj[:, neuron] with no forward pass, the
+    same in the batched read."""
+    e = {"ctx": ex(tiny)["ctx"], "blocks": [{"layer": 7, "positions": [0, 3]}, {"label": "L5.N9+@4", "write": [5, 9, 2.5]}],
+         "q": "q", "a": "a"}
+    W = tiny.layers[5].mlp.down_proj
+    W = W.get_base_layer().weight if hasattr(W, "get_base_layer") else W.weight
+    v = tiny._vectors(e)
+    assert torch.allclose(v[2].float(), (W[:, 9].float() * 2.5).to(v.dtype).float())
+    assert torch.allclose(tiny.vectors_many([e])[0].float(), v.float(), atol=1e-5)

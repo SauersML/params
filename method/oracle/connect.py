@@ -750,6 +750,7 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--device", help="cuda, mps or cpu (default: native.device()'s choice)")
     ap.add_argument("--score", choices=("ig", "fisher"), help=f"the ranking's score (default {SCORE})")
+    ap.add_argument("--halve", action="store_true", help="the halving pass after the connections' prefix")
     ap.add_argument("--passes", type=int, help=f"the score's runs (ig midpoints, default {ALPHAS}; fisher tokens, {FISHER_SAMPLES})")
     a = ap.parse_args()
     teacher_path, task_path, out = map(Path, a.paths)
@@ -757,7 +758,7 @@ def main():
     tx = lines.text_of(ge, task_path, torch.load(a.vpd) if a.vpd else None)
     g0, _, _ = goal_eval.load_answer(teacher_path, json.loads(task_path.read_text()), tx.targets, ge.nat)
     got = Connector(ge, tx, sorted(g0.node_set()), a.batch).run(log=lambda m: print(f"{task_path.stem}: {m}", flush=True),
-                                                                 score=a.score, passes=a.passes)
+                                                                 score=a.score, passes=a.passes, halve=a.halve or None)
     out.write_text(json.dumps({"circuit": goal_eval.to_json(got["graph"]), **got["record"]}))
 
 

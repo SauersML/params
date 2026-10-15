@@ -585,8 +585,39 @@ def edits(a) -> None:
                   m.passes, "passes", flush=True)
 
 
+def with_fallback(recs: list[dict]) -> list[dict]:
+    """B's records with every question its budget left to the oracle answered instead by the better of the oracle and
+    recency on that question kind, chosen on the dev texts (a fallback any answerer may take: recency beats the oracle
+    alone on (a)); the oracle's answers kept where the oracle is better. System names unchanged."""
+    by = {(r["id"], r["system"]): r for r in recs}
+    dev = {}
+    for sysname in ("A", "R"):
+        for r in recs:
+            if r["system"] == sysname and r["split"] == "dev":
+                for x in r["answers"]:
+                    d = dev.setdefault((sysname, x["q"]), [0, 0])
+                    d[0] += x["ok"]
+                    d[1] += 1
+    use_r = {q for (sname, q), (k, n) in dev.items() if sname == "R" and k / n > dev.get(("A", q), (0, 1))[0] / max(dev.get(("A", q), (0, 1))[1], 1)}
+    out = []
+    for r in recs:
+        if not r["system"].startswith("B@") or (r["id"], "R") not in by:
+            out.append(r)
+            continue
+        rr = {}
+        for x in by[(r["id"], "R")]["answers"]:
+            rr.setdefault(x["q"], []).append(x)
+        seen, answers = {}, []
+        for x in r["answers"]:
+            i = seen.get(x["q"], 0)
+            seen[x["q"]] = i + 1
+            answers.append({**rr[x["q"]][i], "by": "recency"} if x.get("by") == "oracle" and x["q"] in use_r else x)
+        out.append({**r, "answers": answers})
+    return out
+
+
 def report(a) -> None:
-    recs = [json.loads(x) for x in a.out.read_text().splitlines()]
+    recs = with_fallback([json.loads(x) for x in a.out.read_text().splitlines()])
     for split in ("dev", "test"):
         rs = [r for r in recs if r["split"] == split]
         if not rs:
@@ -625,7 +656,7 @@ def plot(a) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    recs = [json.loads(x) for x in a.out.read_text().splitlines() if json.loads(x)["split"] == "test"]
+    recs = [r for r in with_fallback([json.loads(x) for x in a.out.read_text().splitlines()]) if r["split"] == "test"]
     kinds = [("a", "(a) most important earlier token"), ("b", "(b) swap effects"), ("c", "(c) which of two positions"),
              ("fact", "(c) which of two statements")]
     plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})

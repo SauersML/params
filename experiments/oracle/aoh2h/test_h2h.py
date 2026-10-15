@@ -105,3 +105,15 @@ def test_edit_B_stays_within_its_budget_and_is_scored():
     sc = h2h.edit_score(tg, it["ids"], z, hooks, controls, ref)
     assert set(sc) == {"success", "collateral", "kept", "score"} and sc["collateral"] >= 0 and 0 <= sc["kept"] <= 1
     assert h2h.edit_score(tg, it["ids"], z, [], controls, ref)["collateral"] < 1e-6  # no edit, no collateral
+
+
+def test_budget_left_questions_take_the_better_fallback_on_dev():
+    """with_fallback: recency's answer replaces the oracle's on a kind where recency wins on dev, nowhere else."""
+    ans = lambda q, ok, by=None: {"q": q, "ok": ok, "conf": 0.5, **({"by": by} if by else {})}  # noqa: E731
+    recs = [{"id": "d", "split": "dev", "system": "A", "answers": [ans("a", False), ans("c", True)]},
+            {"id": "d", "split": "dev", "system": "R", "answers": [ans("a", True), ans("c", False)]},
+            {"id": "t", "split": "test", "system": "A", "answers": [ans("a", False), ans("c", False)]},
+            {"id": "t", "split": "test", "system": "R", "answers": [ans("a", True), ans("c", True)]},
+            {"id": "t", "split": "test", "system": "B@16", "answers": [ans("a", False, "oracle"), ans("c", False, "oracle")]}]
+    b = next(r for r in h2h.with_fallback(recs) if r["system"] == "B@16")
+    assert [(x["q"], x["ok"], x["by"]) for x in b["answers"]] == [("a", True, "recency"), ("c", False, "oracle")]

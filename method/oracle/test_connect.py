@@ -17,6 +17,7 @@ sys.path.insert(0, str(HERE))
 
 import connect  # noqa: E402
 import goal_eval  # noqa: E402
+import native_units  # noqa: E402
 from test_goal_eval import tiny_native  # noqa: E402
 from test_lines import nodes_of  # noqa: E402
 
@@ -143,18 +144,25 @@ def test_native_runs(tiny):
     means = {"heads": torch.randn(m.n_layer, m.n_head, m.hd, generator=g),
              "neurons": torch.randn(m.n_layer, m.site("h.0.mlp.c_fc").W.shape[0], generator=g)}
     units = native_units_of(nat, len(tx.ids), 4, 12)
-    nl = connect.NativeLines(nat, tx.ids, tx.targets, tx.ref, means, units, B=4)
-    ons = torch.stack([torch.ones(len(nl.lines), dtype=torch.bool), torch.zeros(len(nl.lines), dtype=torch.bool)])
-    ew, ow, km = nl.strengths(ons)
-    lq = nl.log_probs(ew, ow, km)
-    full = mean_ablated(nat, tx.ids, tx.targets, means, nl.graph(ons[0]).units)
+    nd = connect.NativeDense(nat, tx.ids, tx.targets, tx.ref, means, units, B=4)
+    ons = torch.stack([torch.ones(nd.n, dtype=torch.bool), torch.zeros(nd.n, dtype=torch.bool)])
+    km = torch.stack([nd.kept(on) for on in ons])
+    lq = nd.log_probs(ons.float(), km)
+    kept = nd.graph(ons[0]).units
+    full = mean_ablated(nat, tx.ids, tx.targets, means, kept)
     empty = mean_ablated(nat, tx.ids, tx.targets, means, [])
     assert torch.allclose(lq[0], full, atol=1e-4) and torch.allclose(lq[1], empty, atol=1e-4)
+    mu = native_units.MeanUnits(nat, tx.ids, tx.targets, means)  # inframove's forward: the same run
+    hm = torch.zeros(1, m.n_layer, mu.T, m.n_head)
+    nm = torch.zeros(1, m.n_layer, mu.T, m.site("h.0.mlp.c_fc").W.shape[0])
+    for kind, L, t, i in kept:
+        (hm if kind == "head" else nm)[0, L, t, i] = 1.0
+    assert torch.allclose(lq[0], mu.logq((hm, nm))[0], atol=1e-4)
     st = connect.NativeConnector(nat, tx.ids, tx.targets, tx.ref, means, units, B=4)
     sc = st.scores()
-    kf, kn = nl.kl_sets(ons)
+    kf, kn = nd.kl_sets(ons)
     assert float(sc.sum()) == pytest.approx(kn - kf, rel=0.15, abs=1e-3)
     got = st.run(log=lambda msg: None)
     assert got["record"]["point"] <= got["record"]["criteria"]["point"] + 1e-6
-    assert set(nl.graph(got["on"]).units) == got["graph"].node_set()
+    assert set(nd.graph(got["on"]).units) == got["graph"].node_set()
     assert got["record"]["tokens"] == len({u[2] for u in got["graph"].units})

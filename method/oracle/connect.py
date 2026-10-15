@@ -26,6 +26,7 @@ plus MARGIN, or at the fully wired circuit's value less TRACK_TOL when that is l
 gradients only order the candidates.
 
   connect(ge, tx, graph, units="vpd", budget_s=None, floors=None)   builder_fast's call: the stated native.Graph
+  connect(ge, tx, mask, units="native", means=unit_means(nat))     heads and neurons (NativeDense): a NativeGraph
   connect.py one TEACHER.json TASK.json OUT.json [--vpd FILE] [--device D]   one circuit's stated form, measured
 """
 from __future__ import annotations
@@ -79,7 +80,7 @@ class Connector:
 
     def row(self, conn: torch.Tensor, tok: torch.Tensor | None = None) -> torch.Tensor:
         """The lines on: those connections, those token edges (None: every one) and the target token."""
-        on = torch.zeros(len(self.pr.lines), dtype=torch.bool)
+        on = torch.zeros(self.n_lines(), dtype=torch.bool)
         on[conn] = True
         on[self.tok if tok is None else tok] = True
         on[self.target] = True
@@ -109,6 +110,17 @@ class Connector:
 
     def targets(self) -> list[int]:
         return list(self.tx.targets)
+
+    def n_lines(self) -> int:
+        return len(self.pr.lines)
+
+    def kind_counts(self, on: torch.Tensor) -> dict:
+        """How many lines of each kind a set holds ("e" connections, "o" writes into the prediction, "t" token edges,
+        "u" the target token)."""
+        out = {"e": 0, "o": 0, "t": 0, "u": 0}
+        for j in on.nonzero().flatten().tolist():
+            out[self.pr.lines[j][0]] += 1
+        return out
 
     def point_cap(self, kl_full: float, kl_none: float) -> float:
         """The point KL's cap: node selection's point floor (pymove's builder), FLOOR of the point score of VPD's
@@ -294,10 +306,10 @@ class Connector:
         kl_on = pr.kl_sets(on[None])[0]
         fam = {name: self.family(name, [on])[0] for name in asked}
         self.spent["total"] = time.time() - t0
-        kinds = [pr.lines[j][0] for j in on.nonzero().flatten().tolist()]
-        rec = {"parts_start": len(pr.parts), "lines_start": len(pr.lines), "parts": len(g.node_set()),
-               "lines": int(on.sum()), "connections": kinds.count("e") + kinds.count("o"),
-               "token_edges": kinds.count("t") + kinds.count("u"), "point": kl_on, "point_wired": kl_full,
+        kinds = self.kind_counts(on)
+        rec = {"parts_start": len(pr.parts), "lines_start": self.n_lines(), "parts": len(g.node_set()),
+               "lines": int(on.sum()), "connections": kinds["e"] + kinds["o"],
+               "token_edges": kinds["t"] + kinds["u"], "point": kl_on, "point_wired": kl_full,
                "point_none": kl_none, "families": fam, "families_wired": wired, "criteria": cap,
                **self.sparsity(on), "wired": self.sparsity(full), "positions_dropped": dropped,
                "seconds": {k: round(v, 2) for k, v in self.spent.items()}}
@@ -328,82 +340,128 @@ class NativeGraph:
                 "out": [list(w) for w in self.out]}
 
 
-class NativeLines:
+class NativeDense:
     """A circuit of heads and neurons on one text with its lines, under mean ablation (inframove's semantics,
     native_units.MeanUnits): every unit outside the circuit outputs its mean over the reference texts (a head its
-    output before o_proj, a neuron its activation), the embedding, the norms and the attention patterns live. A
-    reader reads the stream of the text with every unit at its mean (the base) plus the change from its mean of each
-    circuit writer it is connected to, at the connection's strength: with every connection stated, the circuit's
-    mean-ablated run; a cut connection leaves the reader seeing that writer at its mean. Lines: ("e", writer, reader,
-    slot) for each writer below a reader at its position ("in": a neuron's MLP input, the heads of the neuron's own
-    layer included; "q": a head's query at its position), and at each position up to the reader's ("k", "v": a head's
-    key and value there); ("o", writer) for each circuit unit at a target. on rows are bool [L] over the lines, as
-    lines.LinePruner's; kept, kl_sets and graph as there (a unit with no stated path to the prediction is at its mean)."""
+    output before o_proj, a neuron its activation), the embedding, the norms and the attention patterns live; the text
+    cut at its last target. A reader reads the stream with every unit at its mean (the base) plus the change from its
+    mean of what it is connected to, at the connection's strength; with every line on it is the circuit's mean-ablated
+    run, with a line cut the reader sees that change at the mean. Built for builder circuits of tens of thousands of
+    units (text9031: 33k at 96 positions), every line a strength in one vector, the runs blocked by layer, kind and
+    position. Lines:
+      same-position  ("e") a unit into a unit above it at its position: a neuron's MLP input (the heads of its own
+                     layer included), a head's query; each reader block's lines are its readers times the units below
+                     it there, reader-major;
+      cross-position ("e", a bundle) a head reading the keys and values at a position up to its own: the change from
+                     the mean of every circuit unit below its layer there, at the line's strength (a head's own position
+                     included; where nothing is below, the base alone and no line);
+      prediction     ("o") a unit at a target into the prediction there.
+    on rows are bool [n] over the lines; kept, kl_sets, graph and sparsity as the VPD path's."""
 
-    def __init__(self, nat, ids: list[int], targets: list[int], ref: torch.Tensor, means: dict, units: list, B: int = 32):
+    def __init__(self, nat, ids: list[int], targets: list[int], ref: torch.Tensor, means: dict, units: list, B: int = 8):
         m, dev = nat.target, nat.dev
-        self.nat, self.ids, self.targets, self.ref, self.B, self.dev = nat, list(ids), list(targets), ref, B, dev
-        self.m, self.H, self.hd, self.nl = m, m.n_head, m.hd, m.n_layer
-        T = len(ids)
-        order = {"head": 0, "neuron": 1}
-        self.parts = sorted({tuple(u) for u in units}, key=lambda u: (u[1], order[u[0]], u[2], u[3]))
-        at = {u: k for k, u in enumerate(self.parts)}
+        self.nat, self.m, self.dev, self.B = nat, m, dev, B
+        self.T = max(targets) + 1
+        self.ids, self.targets, self.ref = list(ids)[:self.T], list(targets), ref
+        self.H, self.hd, self.nl = m.n_head, m.hd, m.n_layer
+        kind = {"head": 0, "neuron": 1}
+        us = sorted({tuple(u) for u in units if u[2] < self.T}, key=lambda u: (u[2], u[1], kind[u[0]], u[3]))
+        self.parts, self.U = us, len(us)
+        self.upos = torch.tensor([u[2] for u in us], dtype=torch.long)
+        lay = torch.tensor([u[1] for u in us], dtype=torch.long)
+        knd = torch.tensor([kind[u[0]] for u in us], dtype=torch.long)
+        self.uidx = torch.tensor([u[3] for u in us], dtype=torch.long)
         self.zh = means["heads"].to(dev).float()  # [layers, H, hd]
         self.za = means["neurons"].to(dev).float()  # [layers, d_mlp]
+        W = lambda L, k: m.site(native.site_name(L, k)).W  # noqa: E731
+        H, hd = self.H, self.hd
+        self.Wq = [W(L, "q_proj").view(H, hd, -1) for L in range(self.nl)]  # [H, hd, d]
+        self.Wk = [W(L, "k_proj").view(H, hd, -1) for L in range(self.nl)]
+        self.Wv = [W(L, "v_proj").view(H, hd, -1) for L in range(self.nl)]
+        self.Wo = [W(L, "o_proj").view(-1, H, hd).permute(1, 0, 2) for L in range(self.nl)]  # [H, d, hd]
+        self.Win = [W(L, "c_fc") for L in range(self.nl)]  # [d_mlp, d]
+        self.Wout = [W(L, "down_proj") for L in range(self.nl)]  # [d, d_mlp]
         with torch.no_grad():  # the base: every unit at its mean
-            x = m.embed(torch.tensor([ids], device=dev))[0].float()
-            self.base_attn, self.base_mlp, self.bk, self.bv = [], [], [], []
+            x = m.embed(torch.tensor([self.ids], device=dev))[0].float()
+            self.base_attn, self.base_mlp = [], []
             for L in range(self.nl):
                 self.base_attn.append(x)
-                h = m.norm(x, 2 * L)
-                k = self._proj(L, "k_proj", h).view(T, self.H, self.hd).transpose(0, 1)
-                v = self._proj(L, "v_proj", h).view(T, self.H, self.hd).transpose(0, 1)
-                self.bk.append(self._rope(k, torch.arange(T, device=dev)))
-                self.bv.append(v)
-                x = x + self._proj(L, "o_proj", self.zh[L].reshape(1, -1))[0]
+                x = x + (self.zh[L].reshape(1, -1) @ W(L, "o_proj").T)[0]
                 self.base_mlp.append(x)
-                x = x + self._proj(L, "down_proj", self.za[L][None])[0]
+                x = x + (self.za[L][None] @ W(L, "down_proj").T)[0]
             self.base_final = x
-        lines = []
-        for r in self.parts:
-            kind, L, t, _ = r
-            for w in self.parts:
-                kw, Lw, tw, _ = w
-                below = Lw < L or (kind == "neuron" and kw == "head" and Lw == L)
-                if not below:
-                    continue
-                if kind == "neuron" and tw == t:
-                    lines.append(("e", w, r, "in"))
-                elif kind == "head" and tw <= t:
-                    if tw == t:
-                        lines.append(("e", w, r, "q"))
-                    lines += [("e", w, r, "k"), ("e", w, r, "v")]
-        lines += [("o", w) for w in self.parts if w[2] in self.targets]
-        self.lines = lines
-        self.ends = torch.full((len(lines), 2), -1, dtype=torch.long)
-        for j, c in enumerate(lines):
-            self.ends[j, 0] = at[c[1]]
-            if c[0] == "e":
-                self.ends[j, 1] = at[c[2]]
-        self.e_line = torch.tensor([j for j, c in enumerate(lines) if c[0] == "e"], dtype=torch.long)
-        self.o_line = torch.tensor([j for j, c in enumerate(lines) if c[0] == "o"], dtype=torch.long)
-        self.e_ends = [(lines[j][1], lines[j][2]) for j in self.e_line.tolist()]
-        self.o_ends = [lines[j][1] for j in self.o_line.tolist()]
-        self.at = {lines[j]: j for j in range(len(lines))}
-        self._index()
-
-    def _site(self, L: int, k: str):
-        return self.m.site(f"h.{L}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
-
-    def _proj(self, L: int, k: str, x: torch.Tensor, rows=None, cols=None) -> torch.Tensor:
-        """x times the site's weight (rows: those output rows; cols: those input columns), plus its bias."""
-        st = self._site(L, k)
-        W = st.W if rows is None else st.W[rows]
-        W = W if cols is None else W[:, cols]
-        out = x @ W.T
-        if st.b is not None:
-            out = out + (st.b if rows is None else st.b[rows])
-        return out
+        # blocks (layer, kind, position): readers units[r0:r1], the units below them there units[w0:r0]
+        pos = sorted(set(self.upos.tolist()))
+        start = {p: int((self.upos < p).sum()) for p in pos}
+        self.blocks = {(L, k): [] for L in range(self.nl) for k in (0, 1)}
+        same_r, same_w, kv_h, kv_p, kv_lo, kv_hi = [], [], [], [], [], []
+        n = 0
+        below = {}  # (position, layer): how many units there sit below that layer
+        for p in pos:
+            sel = self.upos == p
+            for L in range(self.nl + 1):
+                below[(p, L)] = int((sel & (lay < L)).sum())
+        for L in range(self.nl):
+            for k in (0, 1):
+                for p in pos:
+                    sel = ((self.upos == p) & (lay == L) & (knd == k)).nonzero().flatten()
+                    if not len(sel):
+                        continue
+                    r0, r1, w0 = int(sel[0]), int(sel[-1]) + 1, start[p]
+                    nr, nw = r1 - r0, r0 - w0
+                    seg_e = (n, n + nr * nw)
+                    if nw:
+                        rr = torch.arange(r0, r1).repeat_interleave(nw)
+                        ww = torch.arange(w0, r0).repeat(nr)
+                        same_r.append(rr)
+                        same_w.append(ww)
+                    n += nr * nw
+                    srcs = []
+                    if k == 0:
+                        srcs = [q for q in pos if q <= p and below[(q, L)] > 0]
+                        for r in range(r0, r1):
+                            for q in srcs:
+                                kv_h.append(r)
+                                kv_p.append(q)
+                                kv_lo.append(start[q])
+                                kv_hi.append(start[q] + below[(q, L)])
+                    seg_kv = (n, n + nr * len(srcs))
+                    n += nr * len(srcs)
+                    self.blocks[(L, k)].append((p, r0, r1, w0, seg_e, seg_kv, srcs))
+        self.n_same_kv = n
+        self.out_seg = {}
+        for t in self.targets:
+            cnt = int((self.upos == t).sum())
+            self.out_seg[t] = (n, n + cnt, start.get(t, 0))
+            n += cnt
+        self.n = n
+        cat = lambda xs: torch.cat(xs) if xs else torch.zeros(0, dtype=torch.long)  # noqa: E731
+        # every line's ends (writer, reader; -1 for a bundle's writers or the prediction) and kind
+        self.kind = torch.zeros(n, dtype=torch.long)
+        self.ends = torch.full((n, 2), -1, dtype=torch.long)
+        self.wpos = torch.zeros(n, dtype=torch.long)
+        self.rpos = torch.zeros(n, dtype=torch.long)
+        same = torch.zeros(n, dtype=torch.bool)
+        kvl = torch.zeros(n, dtype=torch.bool)
+        for (L, k), bl in self.blocks.items():
+            for p, r0, r1, w0, seg_e, seg_kv, srcs in bl:
+                same[seg_e[0]:seg_e[1]] = True
+                kvl[seg_kv[0]:seg_kv[1]] = True
+        self.same_ids, self.kv_ids = same.nonzero().flatten(), kvl.nonzero().flatten()
+        sr, sw = cat(same_r), cat(same_w)
+        self.ends[self.same_ids, 0], self.ends[self.same_ids, 1] = sw, sr
+        self.wpos[self.same_ids], self.rpos[self.same_ids] = self.upos[sw], self.upos[sr]
+        self.kv_h, self.kv_lo, self.kv_hi = (torch.tensor(x, dtype=torch.long) for x in (kv_h, kv_lo, kv_hi))
+        self.ends[self.kv_ids, 1] = self.kv_h
+        self.wpos[self.kv_ids] = torch.tensor(kv_p, dtype=torch.long)
+        self.rpos[self.kv_ids] = self.upos[self.kv_h] if len(kv_h) else self.rpos[self.kv_ids]
+        self.out_ids = torch.arange(self.n_same_kv, n)
+        ou = cat([torch.arange(st, st + (b - a)) for a, b, st in self.out_seg.values()])
+        self.kind[self.out_ids] = 1
+        self.ends[self.out_ids, 0] = ou
+        self.wpos[self.out_ids] = self.upos[ou] if len(ou) else self.wpos[self.out_ids]
+        self.rpos[self.out_ids] = self.wpos[self.out_ids]
+        self.out_u = ou
 
     def _rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         """Rotate-half RoPE of x [..., P, hd] at positions pos [P] (the model's cos and sin)."""
@@ -411,144 +469,147 @@ class NativeLines:
         rot = torch.cat([-x[..., n:], x[..., :n]], dim=-1)
         return x * self.m.cos[pos] + rot * self.m.sin[pos]
 
-    def _index(self):
-        """Per reader slot the lines into it; per head the positions its key and value lines come from."""
-        self.into = {}
-        for j in self.e_line.tolist():
-            _, w, r, slot = self.lines[j]
-            key = (r, slot, w[2] if slot in ("k", "v") else None)
-            self.into.setdefault(key, []).append(j)
-        self.layers = [([u for u in self.parts if u[1] == L and u[0] == "head"],
-                        [u for u in self.parts if u[1] == L and u[0] == "neuron"]) for L in range(self.nl)]
-        self.idx = {u: k for k, u in enumerate(self.parts)}
-        self.writer_t = self.ends[:, 0].clamp(min=0).to(self.dev)
-        tens = lambda js: torch.tensor(js, dtype=torch.long, device=self.dev)  # noqa: E731
-        self.groups = []  # per layer its heads' reads and its neurons' (log_probs' tables)
-        for L, (heads, nrn) in enumerate(self.layers):
-            reads = []
-            for r in heads:
-                _, _, t, h = r
-                srcs = sorted({key[2] for key in self.into if key[0] == r and key[1] in ("k", "v")})
-                reads.append((h, t, tens(self.into.get((r, "q", None), [])),
-                              [(s, tens(self.into.get((r, "k", s), [])), tens(self.into.get((r, "v", s), []))) for s in srcs]))
-            nl, nr = [], []
-            for k, r in enumerate(nrn):
-                for j in self.into.get((r, "in", None), []):
-                    nl.append(j)
-                    nr.append(k)
-            self.groups.append(({"units": heads, "reads": reads, "at": tens([self.idx[u] for u in heads])},
-                                {"units": nrn, "t": tens([u[2] for u in nrn]), "j": tens([u[3] for u in nrn]),
-                                 "lines": tens(nl), "reader": tens(nr), "at": tens([self.idx[u] for u in nrn])}))
-        self.out_lines = [tens([j for j in self.o_line.tolist() if self.lines[j][1][2] == t]) for t in self.targets]
-
     def kept(self, on: torch.Tensor) -> torch.Tensor:
         """The units a line subset keeps: those with a stated path to the prediction (bool over self.parts)."""
         on = on.cpu()
-        km = torch.zeros(len(self.parts), dtype=torch.bool)
-        o = self.o_line[on[self.o_line]]
-        km[self.ends[o, 0]] = True
-        e = self.e_line[on[self.e_line]]
-        w, r = self.ends[e, 0], self.ends[e, 1]
+        km = torch.zeros(self.U, dtype=torch.bool)
+        km[self.out_u[on[self.out_ids]]] = True
+        s_on = on[self.same_ids]
+        sr, sw = self.ends[self.same_ids, 1][s_on], self.ends[self.same_ids, 0][s_on]
+        k_on = on[self.kv_ids]
+        kh, klo, khi = self.kv_h[k_on], self.kv_lo[k_on], self.kv_hi[k_on]
         while True:
             new = km.clone()
-            new[w[km[r]]] = True
+            new[sw[km[sr]]] = True
+            hit = km[kh]
+            if bool(hit.any()):
+                d = torch.zeros(self.U + 1, dtype=torch.long)
+                d.index_add_(0, klo[hit], torch.ones(int(hit.sum()), dtype=torch.long))
+                d.index_add_(0, khi[hit], -torch.ones(int(hit.sum()), dtype=torch.long))
+                new |= d.cumsum(0)[:-1] > 0
             if bool((new == km).all()):
                 return km
             km = new
 
-    def strengths(self, ons: torch.Tensor):
-        """The rows' connection and write strengths with their stranded units' lines off, and the units kept."""
-        km = torch.stack([self.kept(on) for on in ons])
-        ons = ons.cpu()
-        ew = (ons[:, self.e_line] & km[:, self.ends[self.e_line, 0]] & km[:, self.ends[self.e_line, 1]]).float()
-        ow = (ons[:, self.o_line] & km[:, self.ends[self.o_line, 0]]).float()
-        return ew.to(self.dev), ow.to(self.dev), km.to(self.dev)
-
-    def log_probs(self, ew: torch.Tensor, ow: torch.Tensor, km: torch.Tensor | None = None) -> torch.Tensor:
-        """log q at the targets [B, len(targets), V] of each row: connection strengths ew [B, E] (self.e_line's order),
-        writes ow [B, O], units kept km bool [B, N] (None: every one; a unit not kept stays at its mean). The units are
-        computed a layer's heads, then its neurons, at a time (self.parts' order), each group's changes from the mean
-        stacked once it is done; a read gathers its lines' writers from the groups done before it."""
+    def log_probs(self, s: torch.Tensor, keep: torch.Tensor | None = None) -> torch.Tensor:
+        """log q at the targets [B, len(targets), V] of each row: line strengths s [B, n], units kept keep [B, U] (None:
+        every one; a unit not kept stays at its mean)."""
         m, dev, hd = self.m, self.dev, self.hd
-        B, d = ew.shape[0], self.base_final.shape[-1]
-        eo = torch.zeros(B, len(self.lines), device=dev, dtype=ew.dtype)  # every line's strength, by line index
-        eo = eo.index_copy(1, self.e_line.to(dev), ew).index_copy(1, self.o_line.to(dev), ow)
-        keep = torch.ones(B, len(self.parts), device=dev) if km is None else km.float()
-        groups = []  # [B, n, d] per group done: each unit's change from its mean in the stream
-
-        def into(base: torch.Tensor, js: torch.Tensor) -> torch.Tensor:  # base [d] plus lines js' writers' changes
-            x = base.expand(B, d)
-            if len(js):
-                x = x + (eo[:, js, None] * torch.cat(groups, 1)[:, self.writer_t[js]]).sum(1)
-            return x
-
+        B, d = s.shape[0], self.base_final.shape[-1]
+        s = s.to(dev)
+        keep = None if keep is None else keep.to(dev).float()
+        done = {}  # position -> its blocks' changes from the mean, in unit order
+        C = {}  # position -> the sum of its units' changes below the current layer [B, d]
+        zero = torch.zeros(B, d, device=dev)
         for L in range(self.nl):
-            heads, nrn = self.groups[L]
-            if heads["units"]:
-                ch = []
-                for r, (h, t, jq, kv) in zip(heads["units"], heads["reads"]):
-                    sl = slice(h * hd, (h + 1) * hd)
-                    q = self._proj(L, "q_proj", m.norm(into(self.base_attn[L][t], jq), 2 * L), rows=sl)
-                    q = self._rope(q[:, None], torch.tensor([t], device=dev))[:, 0]
-                    K = self.bk[L][h, :t + 1][None].expand(B, t + 1, hd)
-                    V = self.bv[L][h, :t + 1][None].expand(B, t + 1, hd)
-                    if kv:
-                        Ks, Vs = [], []
-                        for src, jk, jv in kv:
-                            k = self._proj(L, "k_proj", m.norm(into(self.base_attn[L][src], jk), 2 * L), rows=sl)
-                            Ks.append(self._rope(k[:, None], torch.tensor([src], device=dev))[:, 0])
-                            Vs.append(self._proj(L, "v_proj", m.norm(into(self.base_attn[L][src], jv), 2 * L), rows=sl))
-                        at = torch.tensor([src for src, _, _ in kv], device=dev)
-                        K = K.index_copy(1, at, torch.stack(Ks, 1))
-                        V = V.index_copy(1, at, torch.stack(Vs, 1))
-                    a = ((K @ q[:, :, None])[..., 0] / math.sqrt(hd)).softmax(-1)
-                    z = (a[:, :, None] * V).sum(1)
-                    ch.append((z - self.zh[L, h]) @ self._site(L, "o_proj").W[:, sl].T)
-                groups.append(torch.stack(ch, 1) * keep[:, heads["at"], None])
-            if nrn["units"]:
-                X = self.base_mlp[L][nrn["t"]][None].expand(B, -1, d)
-                if len(nrn["lines"]):
-                    X = X.index_add(1, nrn["reader"], eo[:, nrn["lines"], None] * torch.cat(groups, 1)[:, self.writer_t[nrn["lines"]]])
-                pre = (m.norm(X, 2 * L + 1) * self._site(L, "c_fc").W[nrn["j"]][None]).sum(-1)
-                if self._site(L, "c_fc").b is not None:
-                    pre = pre + self._site(L, "c_fc").b[nrn["j"]]
-                a = m.act(pre) - self.za[L, nrn["j"]]
-                groups.append(a[:, :, None] * self._site(L, "down_proj").W[:, nrn["j"]].T[None] * keep[:, nrn["at"], None])
+            CL = dict(C)
+            for k in (0, 1):
+                for p, r0, r1, w0, seg_e, seg_kv, srcs in self.blocks[(L, k)]:
+                    nr, nw = r1 - r0, r0 - w0
+                    X = (self.base_attn[L] if k == 0 else self.base_mlp[L])[p].expand(B, nr, d)
+                    if nw:
+                        X = X + s[:, seg_e[0]:seg_e[1]].view(B, nr, nw) @ torch.cat(done[p], 1)
+                    idx = self.uidx[r0:r1].to(dev)
+                    if k == 0:
+                        q = torch.einsum("brd,rhd->brh", m.norm(X, 2 * L), self.Wq[L][idx])
+                        q = self._rope(q, torch.tensor([p], device=dev))
+                        sk = torch.zeros(B, nr, p + 1, device=dev)
+                        if srcs:
+                            sk = sk.index_copy(2, torch.tensor(srcs, device=dev), s[:, seg_kv[0]:seg_kv[1]].view(B, nr, len(srcs)))
+                        Cs = torch.stack([CL.get(q_, zero) for q_ in range(p + 1)], 1)  # [B, p + 1, d]
+                        Xk = m.norm(self.base_attn[L][:p + 1][None, None] + sk[..., None] * Cs[:, None], 2 * L)
+                        kk = self._rope(torch.einsum("brpd,rhd->brph", Xk, self.Wk[L][idx]), torch.arange(p + 1, device=dev))
+                        vv = torch.einsum("brpd,rhd->brph", Xk, self.Wv[L][idx])
+                        a = (torch.einsum("brh,brph->brp", q, kk) / math.sqrt(hd)).softmax(-1)
+                        z = torch.einsum("brp,brph->brh", a, vv) - self.zh[L][idx]
+                        ch = torch.einsum("brh,rdh->brd", z, self.Wo[L][idx])
+                    else:
+                        pre = torch.einsum("brd,rd->br", m.norm(X, 2 * L + 1), self.Win[L][idx])
+                        ch = (m.act(pre) - self.za[L][idx])[..., None] * self.Wout[L][:, idx].T[None]
+                    if keep is not None:
+                        ch = ch * keep[:, r0:r1, None]
+                    done.setdefault(p, []).append(ch)
+                    C[p] = C.get(p, zero) + ch.sum(1)
         out = []
-        for t, js in zip(self.targets, self.out_lines):
-            out.append(m.unembed(m.norm(into(self.base_final[t], js), 2 * self.nl)).log_softmax(-1))
+        for t in self.targets:
+            a, b, _ = self.out_seg[t]
+            x = self.base_final[t].expand(B, d)
+            if b > a:
+                x = x + torch.einsum("bn,bnd->bd", s[:, a:b], torch.cat(done[t], 1))
+            out.append(m.unembed(m.norm(x, 2 * self.nl)).log_softmax(-1))
         return torch.stack(out, 1)
 
     @torch.no_grad()
     def kl_sets(self, ons: torch.Tensor) -> list[float]:
-        """The point KL (bits at the targets) of each line subset ons [K, L], its stranded units at their means."""
+        """The point KL (bits at the targets) of each line subset ons [K, n], its stranded units at their means."""
         out = []
         for s0 in range(0, len(ons), self.B):
-            ew, ow, km = self.strengths(ons[s0:s0 + self.B])
-            out += carry.kl(self.ref, self.log_probs(ew, ow, km)).tolist()
+            part = ons[s0:s0 + self.B]
+            km = torch.stack([self.kept(on) for on in part])
+            out += carry.kl(self.ref, self.log_probs(part.float(), km)).tolist()
+            native.free(self.dev)
         return out
 
     def graph(self, on: torch.Tensor) -> NativeGraph:
-        """A line subset as the stated circuit: its kept units, their connections and writes."""
+        """A line subset as the stated circuit: its kept units, their connections (a bundle's writer as ("position", p),
+        slot "kv") and writes."""
+        on = on.cpu()
         km = self.kept(on)
         units = [u for u, k in zip(self.parts, km.tolist()) if k]
         par = {}
-        for j in self.e_line[on.cpu()[self.e_line]].tolist():
-            _, w, r, slot = self.lines[j]
-            if km[self.idx[w]] and km[self.idx[r]]:
-                par.setdefault(r, []).append((w, slot))
-        return NativeGraph(units, par, [self.lines[j][1] for j in self.o_line[on.cpu()[self.o_line]].tolist()
-                                        if km[self.idx[self.lines[j][1]]]])
+        si = self.same_ids[on[self.same_ids]]
+        for w, r in zip(self.ends[si, 0].tolist(), self.ends[si, 1].tolist()):
+            if km[w] and km[r]:
+                par.setdefault(self.parts[r], []).append((self.parts[w], "q" if self.parts[r][0] == "head" else "in"))
+        ki = self.kv_ids[on[self.kv_ids]]
+        for h, p in zip(self.ends[ki, 1].tolist(), self.wpos[ki].tolist()):
+            if km[h]:
+                par.setdefault(self.parts[h], []).append((("position", p), "kv"))
+        oi = self.out_ids[on[self.out_ids]]
+        return NativeGraph(units, par, [self.parts[u] for u in self.ends[oi, 0].tolist() if km[u]])
 
 
 class NativeConnector(Connector):
-    """Connector's stages over NativeLines (heads and neurons under mean ablation): the point KL alone as the
+    """Connector's stages over NativeDense (heads and neurons under mean ablation): the point KL alone as the
     criterion until native node selection names its changed-input families (inframove's)."""
 
     FAMILIES = ()
 
+    def __init__(self, nat, ids: list[int], targets: list[int], ref: torch.Tensor, means: dict, units: list, B: int = 8):
+        self.ge, self.tx = None, None
+        self.pr = NativeDense(nat, ids, targets, ref, means, units, B)
+        self.conn = torch.arange(self.pr.n, dtype=torch.long)
+        self.tok = torch.zeros(0, dtype=torch.long)
+        self.target = torch.zeros(0, dtype=torch.long)
+        self.spent = {}
+
+    def n_lines(self) -> int:
+        return self.pr.n
+
+    def kind_counts(self, on: torch.Tensor) -> dict:
+        k = self.pr.kind[on.cpu()]
+        return {"e": int((k == 0).sum()), "o": int((k == 1).sum()), "t": 0, "u": 0}
+
     def targets(self) -> list[int]:
         return list(self.pr.targets)
+
+    def positions(self) -> tuple:
+        return self.pr.wpos, self.pr.rpos, self.pr.upos
+
+    def sparsity(self, on: torch.Tensor) -> dict:
+        """Connector.sparsity's measures: connections between units (same-position lines with both ends kept, and
+        bundles into kept heads) per unit kept, the cross-position bundles (a head reading another position), and the
+        positions of the kept units."""
+        pr, on = self.pr, on.cpu()
+        km = pr.kept(on)
+        si = pr.same_ids[on[pr.same_ids]]
+        si = si[km[pr.ends[si, 0]] & km[pr.ends[si, 1]]]
+        ki = pr.kv_ids[on[pr.kv_ids]]
+        ki = ki[km[pr.ends[ki, 1]]]
+        n = int(km.sum())
+        pos = sorted({int(x) for x in pr.upos[km].tolist()})
+        return {"edges_per_unit": (len(si) + len(ki)) / max(n, 1), "cross_token": int((pr.wpos[ki] != pr.rpos[ki]).sum()),
+                "tokens": len(pos), "positions": pos}
 
     def point_cap(self, kl_full: float, kl_none: float) -> float:
         """POINT_TOL of the log distance from the wired circuit's KL to no line's (native units have no VPD answer
@@ -556,28 +617,17 @@ class NativeConnector(Connector):
         lo, hi = math.log(max(kl_full, 1e-9)), math.log(max(kl_none, kl_full, 1e-9))
         return math.exp(lo + POINT_TOL * (hi - lo))
 
-    def __init__(self, nat, ids: list[int], targets: list[int], ref: torch.Tensor, means: dict, units: list, B: int = 32):
-        self.ge, self.tx = None, None
-        self.pr = NativeLines(nat, ids, targets, ref, means, units, B)
-        self.conn = torch.arange(len(self.pr.lines), dtype=torch.long)
-        self.tok = torch.zeros(0, dtype=torch.long)
-        self.target = torch.zeros(0, dtype=torch.long)
-        self.spent = {}
-
     @torch.enable_grad()
     def scores(self) -> torch.Tensor:
-        """Each line's integrated-gradient score: the point KL it saves (Connector.scores')."""
-        pr = self.pr
-        a = ((torch.arange(ALPHAS, dtype=torch.float32) + 0.5) / ALPHAS).to(pr.dev)
-        ew = a[:, None].repeat(1, len(pr.e_line)).requires_grad_()
-        ow = a[:, None].repeat(1, len(pr.o_line)).requires_grad_()
-        carry.kl(pr.ref, pr.log_probs(ew, ow)).sum().backward()
-        out = torch.zeros(len(pr.lines))
-        if ew.numel() and ew.grad is not None:
-            out[pr.e_line] = -ew.grad.mean(0).cpu()
-        if ow.numel() and ow.grad is not None:
-            out[pr.o_line] = -ow.grad.mean(0).cpu()
-        return out
+        """Each line's integrated-gradient score: the point KL it saves (Connector.scores'), ALPHAS rows B at a time."""
+        pr, grads = self.pr, []
+        a = (torch.arange(ALPHAS, dtype=torch.float32) + 0.5) / ALPHAS
+        for s0 in range(0, ALPHAS, pr.B):
+            s = a[s0:s0 + pr.B, None].repeat(1, pr.n).to(pr.dev).requires_grad_()
+            carry.kl(pr.ref, pr.log_probs(s)).sum().backward()
+            grads.append(s.grad.sum(0).cpu())
+            native.free(pr.dev)
+        return -torch.stack(grads).sum(0) / ALPHAS
 
 
 def connect(ge: goal_eval.GoalEval, tx: goal_eval.Text, graph, units: str = "vpd", budget_s: float | None = None,

@@ -54,7 +54,7 @@ CHUNKS = 8          # the trim: the chosen units in runs of this share of them
 DONOR_ROWS = 64     # activation patching's donor runs per engine call (goal_eval's 16)
 ROUNDS = 3          # bracketing rounds after the first
 REFINE = 0.05       # a bracket this narrow (hi / lo) ends the rounds
-MARGIN = {"track_pp": 0.02, "scope": 0.05, "interchange_pp": 0.01, "patching_near": 0.02, "patching_far": 0.07, "N": 0.0}
+MARGIN = goal_eval.NOISE_CAP
 # over each family's floor (the lead's 10-14: a circuit at its search floors sits at floor +- noise on held-out draws;
 # at none the builder's dev circuits missed eval scope by 0.006-0.021 on 3 of 5): twice the robust SD (1.4826 MAD) of
 # the eval-minus-search change in (score - floor) over the 20 dev teacher circuits at 6a9e1d3 (track 0.008, interchange
@@ -304,7 +304,7 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     rec["point_curve"] = [[n, x] for n, x in zip(sizes, point)]
     ref_point = point[-1]
     f_point = None if ref_point is None else FLOOR * max(0.0, min(1.0, ref_point))
-    floors = rec["floors"] = {"point": f_point, **{f: FLOOR + MARGIN[f] for f in ("track_pp", "scope", "interchange_pp")}}
+    floors = rec["floors"] = {"point": f_point, "track_pp": FLOOR, "scope": FLOOR, "interchange_pp": FLOOR}
     rec["kl_cap"] = None if f_point is None else e0 * (max(v0, goal_eval.KL_RESOLUTION) / e0) ** f_point   # point's floor
     # as a KL (_fid_raw(e0, kl_cap, v0) = f_point): connect's point criterion
     ok_point = [f_point is None or (x is not None and x >= f_point - 1e-9) for x in point]
@@ -313,7 +313,7 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
 
     fam_s = rec.setdefault("family_seconds", {"track_pp": 0.0, "scope": 0.0, "interchange_pp": 0.0})
 
-    def families(gs):                                        # the path-patched families of graphs, batched
+    def families(gs):                                        # the path-patched families' rows of graphs, batched
         f0 = time.perf_counter()
         tr = ge.track_pp(tx, gs, "search")
         f1 = time.perf_counter()
@@ -323,12 +323,26 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
         fam_s["track_pp"] += f1 - f0
         fam_s["scope"] += f2 - f1
         fam_s["interchange_pp"] += time.perf_counter() - f2
-        return [{"track_pp": goal_eval.family_score(a, "track_pp"), "scope": goal_eval.family_score(b, "scope"),
-                 "interchange_pp": goal_eval.family_score(c, "interchange_pp")} for a, b, c in zip(tr, sc, ic)]
-    meets = lambda fam: all(v is None or floors[f] is None or v >= floors[f] - 1e-9 for f, v in fam.items())  # noqa: E731
+        return [{**a, **b, **c} for a, b, c in zip(tr, sc, ic)]
+    refs = {}                                                # family -> every unit's row (VPD at the positions)
+
+    def judge(pt, row):                                      # (meets every floor measured, {family: [score, threshold]})
+        if f_point is not None and (pt is None or pt < f_point - 1e-9):
+            return False, {"point": [pt, f_point]}
+        out = {}
+        for f, fl in floors.items():
+            if f == "point" or fl is None or f not in refs:
+                continue
+            sc_ = goal_eval.family_score(row, f)
+            if sc_ is None:
+                continue
+            sr = goal_eval.family_score(refs[f], f)
+            thr = fl + MARGIN.get(f, 0.0) if sr is None else min(fl + MARGIN.get(f, 0.0), sr)
+            out[f] = [sc_, thr - goal_eval.paired_margin(row, refs[f], f)["allowance"]]
+        return all(a >= b - 1e-9 for a, b in out.values()), out
     tx.f2                                                    # (the probe behind track_pp's and the panel's positions)
     clock("probe")
-    tried, at = [], {}                                       # size -> met; bracketing rounds on the log scale
+    tried, at, rows_at = [], {}, {}                          # size -> met, (point, row); bracketing rounds, log scale
 
     def measure(ns):
         ns = [m for m in sorted(set(ns)) if m not in at]
@@ -338,19 +352,18 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
         ok = [i for i, x in enumerate(pm) if f_point is None or (x is not None and x >= f_point - 1e-9)]
         for i in range(len(ns)):
             at[ns[i]] = False
-        for i, fam in zip(ok, families([_graph(order[:ns[i]]) for i in ok]) if ok else []):
-            fam = {"point": pm[i], **fam}
-            at[ns[i]] = meets(fam)
-            tried.append({"size": ns[i], **fam, "met": at[ns[i]]})
+        rws = families([_graph(order[:ns[i]]) for i in ok]) if ok else []
+        for i, r in zip(ok, rws):
+            rows_at[ns[i]] = (pm[i], r)
+            if ns[i] == N:                                   # every unit: the cheap families' reference
+                refs.update({f: r for f in ("track_pp", "scope", "interchange_pp")})
+        for i, r in zip(ok, rws):
+            met_, d = judge(pm[i], r)
+            at[ns[i]] = met_
+            tried.append({"size": ns[i], "point": pm[i], **{f: v[0] for f, v in d.items()},
+                          "thresholds": {f: v[1] for f, v in d.items()}, "met": met_})
     lo, hi = (sizes[first - 1] if first > 0 else 0), N       # lo fails point (or is empty); hi, every unit, is measured
     measure([int(round(max(sizes[first], 1) * (N / max(sizes[first], 1)) ** (j / (PATH_BATCH - 1)))) for j in range(PATH_BATCH)])
-    whole = next((t for t in tried if t["size"] == N), None)  # every unit's own scores cap the floors (the teacher's
-    if whole is not None:                                    # acceptance: min(the reward's floor, the START's own))
-        for f in ("track_pp", "scope", "interchange_pp"):
-            if whole[f] is not None:
-                floors[f] = min(floors[f], whole[f])
-        for t in tried:
-            at[t["size"]] = t["met"] = meets({f: t[f] for f in floors if f in t})
     for _ in range(ROUNDS):
         met = sorted(m for m, ok in at.items() if ok)
         if not met:
@@ -366,7 +379,7 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
 
     ext_s = rec.setdefault("extra_seconds", {"N": 0.0, "patching": 0.0, "omitted": 0.0})
 
-    def extra(gs):                                           # N, activation patching and the omitted family: the
+    def extra(gs):                                           # N, activation patching and the omitted family's rows: the
         f0 = time.perf_counter()                             # costlier families
         nn_ = ge.necessity_spec(tx, gs, "search")
         f1 = time.perf_counter()
@@ -377,43 +390,49 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
         ext_s["N"] += f1 - f0
         ext_s["patching"] += f2 - f1
         ext_s["omitted"] += time.perf_counter() - f2
-        return [{f: goal_eval.family_score(r, f) for f, r in (("N", a), ("patching_near", b), ("patching_far", b), ("omitted", c))}
-                for a, b, c in zip(nn_, dn, om)]
+        return [{**a, **b, **c} for a, b, c in zip(nn_, dn, om)]
+    xf = ("N", "patching_near", "patching_far", "omitted")
     met = met or [N]                                         # the sizes meeting the cheap floors, smallest first
-    cand = met[:PATH_BATCH - 1]
+    cand = [m for m in met if m < N][:PATH_BATCH - 1]
     got = extra([_graph(order[:m]) for m in cand] + [_graph(order)])
-    ref = got[-1]                                            # every unit: patching's reference (VPD at the positions)
-    floors.update({"N": FLOOR + MARGIN["N"], "omitted": FLOOR,
-                   **{f: (None if ref[f] is None else FLOOR * max(0.0, min(1.0, ref[f])) + MARGIN[f]) for f in ("patching_near", "patching_far")}})
-    for f in ("N", "patching_near", "patching_far", "omitted"):   # (capped at every unit's own, as above)
-        if floors[f] is not None and ref[f] is not None:
-            floors[f] = min(floors[f], ref[f])
-    rec["extra"] = [{"size": m, **x} for m, x in zip(cand + [N], got)]
-    ok = [m for m, x in zip(cand, got) if meets(x)]
+    refs.update({f: got[-1] for f in xf})                    # every unit: these families' reference
+    floors.update({"N": FLOOR, "omitted": FLOOR, **{f: (lambda v: None if v is None else FLOOR * max(0.0, min(1.0, v)))(
+        goal_eval.family_score(got[-1], f)) for f in ("patching_near", "patching_far")}})
+    whole_pt = rows_at[N][0] if N in rows_at else point[-1]
+    whole_row = {**(rows_at[N][1] if N in rows_at else {}), **got[-1]}
+
+    def judged(m, x):                                        # a size's cheap row and costlier row, judged together
+        ok_, d = judge(rows_at[m][0], {**rows_at[m][1], **x})
+        rec.setdefault("extra", []).append({"size": m, **{f: v[0] for f, v in d.items() if f in xf},
+                                            "thresholds": {f: v[1] for f, v in d.items() if f in xf}, "met": ok_})
+        return ok_
+    ok = [m for m, x in zip(cand, got) if judged(m, x)]
     rest = [m for m in met if m > (cand[-1] if cand else N) and m < N]
     while not ok and rest:                                   # the next larger sizes meeting the cheap floors
         more, rest = rest[:PATH_BATCH], rest[PATH_BATCH:]
-        got = extra([_graph(order[:m]) for m in more])
-        rec["extra"] += [{"size": m, **x} for m, x in zip(more, got)]
-        ok = [m for m, x in zip(more, got) if meets(x)]
-    pick = ok[0] if ok else (N if meets({f: v for f, v in ref.items()}) else None)
+        ok = [m for m, x in zip(more, extra([_graph(order[:m]) for m in more])) if judged(m, x)]
+    pick = ok[0] if ok else (N if judge(whole_pt, whole_row)[0] else None)
     rec["tried"] = tried
     n = pick if pick is not None else N
     rec["met"], rec["start_written"] = pick is not None, n == N
     clock("extra")
     on = prefix(n)                                           # 4. chunks of the ranking removed, measured
 
-    def every(ons):                                          # every family the builder measures, on unit sets: the
-        pts = [goal_eval._fid_raw(e0, k, v0) for k in pr.kl_sets(torch.stack(ons))]   # costlier ones on the sets the
-        gs = [_graph([units[i] for i in o.nonzero().flatten().tolist()]) for o in ons]   # cheap ones admit alone
-        out = [{"point": x, **f} for x, f in zip(pts, families(gs))]
-        alive = [j for j, f in enumerate(out) if meets(f)]
-        for j, x in zip(alive, extra([gs[j] for j in alive]) if alive else []):
-            out[j].update(x)
-        return [f if j in alive else None for j, f in enumerate(out)]
     def cheap(ons):                                          # point and the path-patched families of unit sets
         pts = [goal_eval._fid_raw(e0, k, v0) for k in pr.kl_sets(torch.stack(ons))]
-        return [{"point": x, **f} for x, f in zip(pts, families([_graph([units[i] for i in o.nonzero().flatten().tolist()]) for o in ons]))]
+        return pts, families([_graph([units[i] for i in o.nonzero().flatten().tolist()]) for o in ons])
+
+    def cheap_ok(ons):
+        pts, rws = cheap(ons)
+        return [judge(x, r)[0] for x, r in zip(pts, rws)]
+
+    def every(ons):                                          # every family the builder measures, on unit sets: the
+        pts, rws = cheap(ons)                                # costlier ones on the sets the cheap ones admit alone
+        out = [judge(x, r)[0] for x, r in zip(pts, rws)]
+        alive = [j for j, o in enumerate(out) if o]
+        for j, x in zip(alive, extra([_graph([units[i] for i in ons[j].nonzero().flatten().tolist()]) for j in alive]) if alive else []):
+            out[j] = judge(pts[j], {**rws[j], **x})[0]
+        return out
 
     def trim(groups):                                        # groups of unit ids, least important first, removed while
         nonlocal on                                          # the cheap families hold (PATH_BATCH a call, the passing
@@ -427,12 +446,12 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
                 o = on.clone()
                 o[g] = False
                 ons.append(o)
-            okc = [g for g, f in zip(part, cheap(ons)) if meets(f)]
+            okc = [g for g, ok_ in zip(part, cheap_ok(ons)) if ok_]
             if len(okc) > 1:
                 o = on.clone()
                 for g in okc:
                     o[g] = False
-                if meets(cheap([o])[0]):
+                if cheap_ok([o])[0]:
                     on, seq = o, seq + okc
                     continue
             if okc:
@@ -448,15 +467,14 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
                 o[g] = False
             return o
         lo, hi = 0, len(seq)
-        f = every([upto(hi)])[0]
-        if f is not None and meets(f):
+        if every([upto(hi)])[0]:
             lo = hi
         for _ in range(ROUNDS):
             if hi - lo <= 1:
                 break
             ks = sorted({lo + max(1, (hi - lo) * (j + 1) // (PATH_BATCH + 1)) for j in range(PATH_BATCH)} - {lo, hi})
-            for k, f in zip(ks, every([upto(k) for k in ks])):
-                if f is not None and meets(f):
+            for k, ok_ in zip(ks, every([upto(k) for k in ks])):
+                if ok_:
                     lo = max(lo, k)
                 elif k > lo:
                     hi = min(hi, k)

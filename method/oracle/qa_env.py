@@ -314,6 +314,101 @@ def row_of(task: dict, r: dict, qs: list[dict]) -> dict:
             "qa_env": [{k: v for k, v in q.items() if k != "task"} for q in qs]}
 
 
+def paired_row(ge, task: dict, row: dict, facts: dict, *, fidelity_bits: float, strings: list[str], assets: str) -> dict:
+    """Opt-in target-model QA with supplied topology and paired fidelity evidence.
+
+    Uses only existing token candidates. All selected questions remain, including
+    failed fidelity/disagreement controls. Paired labels never enter the prompt.
+    """
+    import goal_eval
+    import paired_token_qa
+    import semantic
+    import variables
+
+    if task["id"] != row["task"] or facts["task"] != row["task"]:
+        raise ValueError("paired QA task identities differ")
+    if facts.get('provided_circuit_binding', {}).get('semantics') != 'c' or ge.semantics != 'c':
+        raise ValueError("paired QA requires own-circuit C semantics")
+    components._provided_circuit_prompt(facts, source_task=task)  # validates; its explanation-only instructions are not used
+    if not isinstance(assets, str) or not re.fullmatch('[0-9a-f]{64}', assets):
+        raise ValueError('executed model content digest required')
+    prompt = task['prompts'][0]
+    graph, defects = goal_eval.circuit(facts['answer'], prompt['target_positions'], ge.nat.C, len(prompt['token_ids']))
+    if any(defects.values()):
+        raise ValueError(f"provided topology has defects: {defects}")
+    from types import SimpleNamespace
+    if task.get('behavior'):
+        raise ValueError('paired QA currently requires the ordinary full-vocabulary target')
+    tx = SimpleNamespace(ids=prompt['token_ids'], targets=prompt['target_positions'], seed=0)
+    semantic.graph_claim_binding(graph,tx,[])  # explicit scalar graph only
+    candidates = [q for q in row['qa_env'] if q.get('kind')=='token' and q.get('ask') in ('change','kl')]
+    if not candidates:
+        raise ValueError('paired QA row requires at least one existing token question')
+    paired = paired_token_qa.measure_token_candidates(variables.Scorer(ge),tx,graph,candidates,strings,
+                                                       fidelity_bits=fidelity_bits)
+    if strings[paired[0]['reference_top']] != prompt['model_top'][0][0][0]:
+        raise ValueError('source task top token disagrees with the executed target model')
+    result = row_of(task,row,[q['target_model_label'] for q in paired])
+    result['question'] = ("Use the provided circuit as evidence when answering about the TARGET MODEL. "
+        "Its fidelity is unverified; the question concerns the target model's actual response. "
+        "Do not construct or output a circuit.\nEXACT PROVIDED CIRCUIT\n" + facts['circuit'] + "\n\n" + result['question'])
+    result['paired_token_qa'] = {'supervision_world':'target_model', 'pairs':paired,
+        'provided_circuit_binding':facts['provided_circuit_binding'],
+        'executed_model_content_sha256':assets,
+        'excluded_non_token_questions':len(row['qa_env'])-len(candidates),
+        'scope':'existing token questions only; finite baseline/edit fidelity; no prose certificate'}
+    return result
+
+
+def paired_assets(nat) -> str:
+    """Bind actual executed weights/basis with the existing content hash utility."""
+    import lines
+    target=nat.target
+    return lines.scope_digest({'model':target.state_dict(),'cfg':target.cfg,
+        'target_type':(type(target).__module__,type(target).__qualname__),
+        'basis':{n:{k:getattr(target.site(n),k) for k in ('W','U','V','delta_T')} for n in nat.names},
+        'sites':list(nat.names),'components':nat.C,
+        'execution':{k:getattr(target,k,None) for k in ('eps','n_layer','n_head','n_tokens','lm','behavior','behavior_tokens','behavior_at')},
+        'remainder_convention':'semantic.Checker / variables.Scorer C semantics LIVE'})
+
+
+def paired_cmd(a) -> None:
+    import torch
+    import goal_eval
+    import native
+
+    rows=[json.loads(x) for x in a.rows.read_text().splitlines() if x.strip()]
+    facts=[json.loads(x) for x in a.facts.read_text().splitlines() if x.strip()]
+    for entry in rows + facts:
+        task_id = entry.get('task')
+        if not isinstance(task_id, str) or not re.fullmatch(r'text[0-9]+', task_id):
+            raise ValueError('paired QA requires text<number> task IDs; paths are forbidden')
+        if 9100 <= int(task_id[4:]) <= 9149:
+            raise ValueError('sealed text9100..text9149 must never be read')
+    if len({r['task'] for r in rows})!=len(rows) or len({f['task'] for f in facts})!=len(facts):
+        raise ValueError('unique task rows and supplied circuits required')
+    by={f['task']:f for f in facts}
+    if set(by)!={r['task'] for r in rows}:
+        raise ValueError('one supplied circuit per QA task required')
+    if a.out.exists():
+        raise ValueError('refuse to overwrite an existing paired dataset')
+    nat=native.Native('cuda' if torch.cuda.is_available() else None)
+    ge=goal_eval.GoalEval(nat,semantics='c')
+    assets=paired_assets(nat)
+    strings=components.token_strings('vpd4l',list(range(nat.target.n_tokens)))
+    out=[]
+    for row in rows:
+        task=json.loads((a.texts_root / f"{row['task']}.json").read_text())
+        if task['model']!='vpd4l':
+            raise ValueError('this CLI uses the native vpd4l target only')
+        out.append(paired_row(ge,task,row,by[row['task']],fidelity_bits=a.fidelity_bits,strings=strings,assets=assets))
+    a.out.parent.mkdir(parents=True,exist_ok=True)
+    with a.out.open('x') as handle:
+        handle.write(''.join(json.dumps(row,allow_nan=False)+'\n' for row in out))
+    print(json.dumps({'rows':len(out),'token_questions':sum(len(row['qa_env']) for row in out),
+        'failed_fidelity':sum(not q['fidelity']['passed'] for row in out for q in row['paired_token_qa']['pairs'])}))
+
+
 def count(qs: list[dict]) -> dict:
     out = {}
     for q in qs:
@@ -459,6 +554,12 @@ def main():
     g.add_argument("out", type=Path)
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--per-row", type=int, default=6)
+    pair = sub.add_parser("paired", help="pair existing token QA with an explicit supplied circuit; target truth retained")
+    pair.add_argument("rows", type=Path)
+    pair.add_argument("facts", type=Path)
+    pair.add_argument("out", type=Path)
+    pair.add_argument("--fidelity-bits", type=float, required=True)
+    pair.add_argument("--texts-root", type=Path, default=TEXTS)
     b = sub.add_parser("baselines")
     b.add_argument("out", type=Path)
     t = sub.add_parser("gate")
@@ -469,7 +570,7 @@ def main():
     s.add_argument("--port", type=int, default=8773)
     s.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
-    {"measure": measure_cmd, "rows": rows_cmd, "baselines": baselines, "gate": gate, "serve": serve}[a.cmd](a)
+    {"measure": measure_cmd, "rows": rows_cmd, "paired": paired_cmd, "baselines": baselines, "gate": gate, "serve": serve}[a.cmd](a)
 
 
 if __name__ == "__main__":

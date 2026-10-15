@@ -269,7 +269,7 @@ def common_eval(ge, tx, execute, edits, *, metadata, construction_edit_ids=()) -
     definition = {'ids': list(tx.ids), 'targets': list(tx.targets), 'edits': edits}
 
     def distribution(value):
-        value = value.detach().double()
+        value = value.detach().cpu().double()  # (MPS has no float64)
         if value.ndim == 3 and value.shape[0] == 1:
             value = value[0]
         if value.shape != (len(tx.targets), tg.n_tokens) or not torch.isfinite(value).all():

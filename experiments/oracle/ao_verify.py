@@ -313,14 +313,14 @@ class Target:
         assert len(q) == 1, q
         pos = [i for i, t in enumerate(ids) if t == q[0]][:n]
         assert len(pos) == n, (len(pos), n)
-        v = torch.nn.functional.normalize(acts.float(), dim=-1)
+        v = torch.nn.functional.normalize(acts, dim=-1)  # in the activations' dtype, as the paper's hook (primerl: 72/72 ids)
 
         def fn(_m, _i, out):
             h = out[0] if isinstance(out, tuple) else out
             if h.shape[1] <= 1:
                 return out
             orig = h[:, pos, :]
-            h[:, pos, :] = (v[None] * orig.float().norm(dim=-1, keepdim=True)).to(h.dtype) + orig
+            h[:, pos, :] = (v[None].to(h.dtype) * orig.norm(dim=-1, keepdim=True)).to(h.dtype) + orig
             return out
 
         handle = self.hook(1, fn)

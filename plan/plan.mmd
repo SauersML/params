@@ -2,7 +2,7 @@
 %% Solid arrows are prerequisites; dashed arrows share evidence, not gates.
 %% Current hypothesis: native units may support useful explanations; universal cleanliness is not assumed.
 flowchart TB
-  G["<b>Understand and predict the model's mechanisms</b><br/>Native investigation, falsifiable explanations, useful oracle answers.<br/>Legibility ≠ sparsity ≠ causal faithfulness."]
+  G["<b>Understand and predict the model's mechanisms</b><br/>Native neurons and attention, falsifiable explanations, useful oracle answers.<br/>Legibility ≠ sparsity ≠ causal faithfulness."]
   Q["<b>Freeze a useful behavioral question</b><br/>Qwen3-8B is the main target (MATS); Qwen3-32B the showcase<br/>and validation; 1.7B for development only.<br/>Declare full contexts and answer contrast.<br/>Freeze fitting versus unseen questions/edits and controls.<br/>WHY · test explanations, not universal neuron cleanliness."]
   G --> Q
 
@@ -22,14 +22,14 @@ flowchart TB
   V --> O
   I -. observations with uncertainty .-> O
 
-  P["<b>MEASURED · reader pilot failed</b><br/>24 new scaling questions, 3 contexts; 36 forwards.<br/>No top-token changes; unchanged probability beats the reader.<br/>True / absent / wrong evidence: 4 / 24 / 8 valid answers.<br/>Five evidence-rich calls exhausted their token allowance.<br/>NEXT · answers first; relevant units and fresh questions.<br/>WHY · measure evidence utility before oracle training.<br/>OWNER · root / native oracle team"]
+  P["<b>NEXT · does the trained oracle use neuron evidence?</b><br/>Existing edit loss: vectors 0.502 vs text-only 1.498 nats/token.<br/>That comparison removes context and neuron vectors together.<br/>Freeze step5000 and 64 validation edit questions.<br/>Compare correct, zero and mismatched native vectors;<br/>preserve context vectors, questions and target answers.<br/>WHY · isolate native evidence utility before scaling to 8B.<br/>1.7B development check; no new scientific result yet.<br/>OWNER · root / native oracle team"]
   R["<b>FIXED · native measurement reliability</b><br/>Full downstream gradients; untested families cannot pass.<br/>All oracle vectors: one forward using the selected target.<br/>WHY · correct evidence and honest cost; 30 tests pass.<br/>NEXT · relevant 8B questions; job 20601 is user-held.<br/>OWNER · root / native oracle team"]
   I -. measurement integrity .-> R
   R -. reliable inputs .-> O
   Q -. current pilot .-> P
   P -. concrete investigation .-> I
 
-  C["<b>Question-scoped neuron circuits · scorecard v2 on Qwen3-8B</b><br/>neuron_scorecard.py: necessity, sufficiency, patching from other<br/>texts, swaps, steering and weight-edit predictions, specificity<br/>on unrelated texts, size; noise-aware floors. Runs on MATS.<br/>MEASURED 1.7B · 11 small hubs: all necessary, none sufficient;<br/>3 are the sink neuron L2.n1821 (10-13 bits on unrelated text).<br/>Not a prerequisite for native explanations. VPD is archived.<br/>OWNER · generality"]
+  C["<b>Question-scoped neuron circuits · scorecard v2 on Qwen3-8B</b><br/>neuron_scorecard.py: necessity, sufficiency, patching from other<br/>texts, swaps, steering and weight-edit predictions, specificity<br/>on unrelated texts, size; noise-aware floors. Runs on MATS.<br/>MEASURED 1.7B · 11 small hubs: all necessary, none sufficient;<br/>3 are the sink neuron L2.n1821 (10-13 bits on unrelated text).<br/>Not a prerequisite for native explanations. No decomposition.<br/>OWNER · generality"]
   I -. optional product .-> C
   C -. additional validation .-> V
 
@@ -1298,3 +1298,5 @@ flowchart TB
 %% 2026-10-15 root: bf3a744175e3ac7830c8c03ed1e2274b5e838327 published selected-target single-forward native capture. 13 tiny Qwen/PEFT tests pass; independent review verifies additive/merged LoRA, fail-closed unsupported variants/stochastic dropout, cleanup on error. N unit blocks plus hidden states now one counted forward rather than N+1; selected organism adapter used for activations and effective weights. Writes remain FP32 algebraic contributions, not bitwise BF16 projector decompositions. No 8B timing or oracle quality claim from these tests.
 
 %% Root plan render38807030234 failed size guard at3523x4647.5 (16.37M pixels), before committing an image. Condensed active pilot/reliability nodes while preserving detailed history, rather than weakening render/readability guard.
+
+%% 2026-10-15 user explicitly rules out subcomponents for large models. Active units are native neurons and attention only; no decomposition prerequisite/fallback. Historical VPD results remain archival. Root new development diagnostic freezes step5000 and first64 nativeeligible validation rows before model calls (all64 edit, no promotes/units coverage), preserves residual context, tests native zero/permutation. Existing gain.log0.502vs1.498 nats/token is all-vector benefit only, not native contribution or mechanism transfer. Prior negative native reader pilot remains in history and full TXT record.

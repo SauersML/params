@@ -51,6 +51,7 @@ FLOOR = goal_eval.FLOOR_TOP
 INERT_BITS = 1e-3   # an inert unit: its removal moves the own-run KL at the targets by less (the scorecard's)
 PATH_BATCH = 4      # prefix sizes per path-patched round
 CHUNKS = 8          # the trim: the chosen units in runs of this share of them
+DONOR_ROWS = 64     # activation patching's donor runs per engine call (goal_eval's 16)
 ROUNDS = 3          # bracketing rounds after the first
 REFINE = 0.05       # a bracket this narrow (hi / lo) ends the rounds
 MARGIN = {"track_pp": 0.02, "scope": 0.05, "interchange_pp": 0.01, "patching_near": 0.02, "patching_far": 0.07, "N": 0.0}
@@ -363,9 +364,19 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     met = sorted(m for m, ok in at.items() if ok)
     clock("size")
 
+    ext_s = rec.setdefault("extra_seconds", {"N": 0.0, "patching": 0.0, "omitted": 0.0})
+
     def extra(gs):                                           # N, activation patching and the omitted family: the
-        nn_, dn = ge.necessity_spec(tx, gs, "search"), ge.donors_search(tx, gs)   # costlier families
+        f0 = time.perf_counter()                             # costlier families
+        nn_ = ge.necessity_spec(tx, gs, "search")
+        f1 = time.perf_counter()
+        dn = ge.donors(tx, gs, "search", goal_eval.DONORS_NEAR, ge.far_donors(tx, ge.far_pool("search"), goal_eval.DONORS_FAR),
+                       rows=DONOR_ROWS)                      # (donors_search's, more rows a run)
+        f2 = time.perf_counter()
         om = ge._omitted_family(tx, [goal_eval._c_graph(g, tx.targets, nat.C) for g in gs])
+        ext_s["N"] += f1 - f0
+        ext_s["patching"] += f2 - f1
+        ext_s["omitted"] += time.perf_counter() - f2
         return [{f: goal_eval.family_score(r, f) for f, r in (("N", a), ("patching_near", b), ("patching_far", b), ("omitted", c))}
                 for a, b, c in zip(nn_, dn, om)]
     met = met or [N]                                         # the sizes meeting the cheap floors, smallest first

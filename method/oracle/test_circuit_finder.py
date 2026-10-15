@@ -68,11 +68,14 @@ def test_find_record(tiny, monkeypatch):
     assert rec["size"] == len(rec["nodes"])
     for n in rec["nodes"]:
         assert n["pos"] >= rec["first_diff"] and n["pole"] in (-1, 1)
-    units = [("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]]
-    if units:
-        lost, rest = pt.both([units])[0]
-        assert abs(lost - rec["lost"]) < 1e-5 and abs(rest - rec["restored"]) < 1e-5
-    if rec["met"]:
-        assert rec["lost"] >= cf.PASS and rec["restored"] >= cf.PASS
-    for r in rec["routes"]:
-        assert r["pos"] >= rec["first_diff"] and len(r["attends"]) >= 1
+        assert (n["pos"] == pt.T - 1) == (n["stage"] == "readout")
+    for stage, c in rec["cuts"].items():
+        units = ([("neuron", n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"] if n["stage"] == stage] if stage != "movers"
+                 else [("head", r["layer"], r["head"], r["pos"]) for r in rec["routes"]])
+        assert len(units) == c["size"]
+        if units:
+            lost, rest = pt.both([units])[0]
+            assert abs(lost - c["lost"]) < 1e-5 and abs(rest - c["restored"]) < 1e-5
+        if c["met"]:
+            assert c["lost"] >= cf.PASS and c["restored"] >= cf.PASS
+    assert rec["met"] == all(c["met"] for c in rec["cuts"].values())

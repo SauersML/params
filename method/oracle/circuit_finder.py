@@ -5,28 +5,32 @@ token) and corrupted (a key word swapped; the model gives another answer). The c
 p of the alternatives (the clean run's ALTERNATIVES likeliest others and the corrupted run's top token); gap = c_clean -
 c_corrupt.
 Units: a neuron at a position (layer, pos, index; the down projection's input act(gate) x up), recorded with its pole
-(the sign of its clean value) and SwiGLU regime (the signs of act(gate) and of up), patched by setting it to its value
-in the other run; heads at positions (that head's slice of the output projection's input) are routes. Positions before
-the first differing token have equal values in both runs.
+(the sign of its clean value) and SwiGLU regime (the signs of act(gate) and of up), and a head at a position (that
+head's slice of the output projection's input), each patched by setting it to its value in the other run. Positions
+before the first differing token have equal values in both runs.
   noising (necessity): the clean run with a set patched from the corrupted run; lost share = (c_clean - c) / gap
   denoising (sufficiency): the corrupted run with only a set patched from the clean run; restored = (c - c_corrupt) / gap
 A circuit passes when both shares are at least PASS.
 Search (every decision a measured run; gradients only order):
  1. positions: each layer's residual input at each position from the first differing token, denoised alone (the map of
     where the answer's information sits, recorded);
- 2. neurons, every head computing live: group testing over blocks of the neurons of one layer at one position, each
-    noised and denoised alone; a block whose larger |share| reaches EPS is split in two halves of its neurons ordered by
-    their attribution estimate |patch difference x gradient| (the larger of the clean run's gradient for noising and the
-    corrupted run's for denoising), down to single neurons, each measured alone;
- 3. the single neurons in measured order (the larger |share|): the curve of both shares as neurons are added in that
-    order, the smallest prefix that passes, then single neurons removed while it still passes; when no prefix passes,
-    EPS falls by EPS_STEP and step 2 searches again (blocks measured before reused), at most EPS_ROUNDS;
- 4. routes: the heads the circuit's effect runs through, by the same group testing over blocks of one layer's heads at
-    one position, each block frozen at its value in the base run while the circuit is patched (the share of the
-    circuit's loss and restoration that then no longer happens), with where each head looks from its position;
- 5. reported: the neurons with their poles, regimes and measured shares alone, both curves, the routes, the residual
-    map, seconds. (Heads patched as units alone pass with one or two heads at the answer position on Qwen3-1.7B
-    capitals: the answer's information crosses there, so heads are routes between neurons, never units of the cut.)
+ 2. group testing over blocks of one layer's neurons (or heads) at one position, each noised and denoised alone; a block
+    whose larger |share| reaches EPS is split in two halves of its units ordered by their attribution estimate |patch
+    difference x gradient| (the larger of the clean run's gradient for noising and the corrupted run's for denoising),
+    down to single units, each measured alone;
+ 3. a cut: the single units of one kind at some positions in measured order (the larger |share|), the curve of both
+    shares as they are added in that order, the smallest prefix that passes, then single units removed while it still
+    passes; when no prefix passes, EPS falls by EPS_STEP and step 2 searches again (blocks measured before reused), at
+    most EPS_ROUNDS. Three cuts make the circuit, each passing alone with everything else computing:
+      readout: neurons at the answer position;
+      movers: heads at the answer position (where each looks recorded);
+      source: neurons at the positions from the first differing token to the one before the answer;
+    with each mover's share of the source cut's effect (the head frozen at its base-run value while the source cut is
+    patched). The smallest set over all units is one cut, the narrowest place the answer's information crosses (one or
+    two heads at the answer position on Qwen3-1.7B capitals), so the circuit is the path of cuts from the changed
+    token to the answer;
+ 4. reported: the neurons with their stage, poles, regimes and measured shares alone, the movers, each cut's curve and
+    size, the residual map, seconds.
 Every run is a batch of exactly ROWS (padded), so bfloat16 kernels do not change with the batch size.
 
   circuit_finder.py questions QUESTIONS.json OUT [--split dev] [--model Qwen/Qwen3-8B] [--dtype float32] [--adapter A]
@@ -237,13 +241,14 @@ class Patcher:
         return [[int(a), round(float(b), 3)] for a, b in zip(s, w)]
 
 
-def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",), measure=None, log=None) -> dict:
+def group_test(pt: Patcher, sc: dict, eps: float, done: dict, kinds=("neuron",), positions=None, measure=None, log=None) -> dict:
     """Group testing (module docstring): every single unit reached, {unit: (lost, restored)}. A block is (kind, layer,
     pos, lo, hi): the units lo..hi-1 of that layer and position in descending attribution order; measure(sets) gives each
     set's pair of shares (default Patcher.both); done holds the blocks measured before (at a larger eps), reused."""
     measure = measure or pt.both
     order = {k: v.argsort(-1, descending=True) for k, v in sc.items()}                # [L, T, H] and [L, T, D]
-    blocks = [(k, i, p, 0, order[k].shape[-1]) for i in range(pt.L) for p in range(pt.first, pt.T) for k in kinds]
+    positions = range(pt.first, pt.T) if positions is None else positions
+    blocks = [(k, i, p, 0, order[k].shape[-1]) for i in range(pt.L) for p in positions for k in kinds]
     singles, level = {}, 0
     while blocks:
         todo = [b for b in blocks if b not in done]
@@ -270,6 +275,32 @@ def unit(kind: str, layer: int, pos: int, k: int) -> tuple:
     return ("head", layer, k, pos) if kind == "head" else ("neuron", layer, pos, k)
 
 
+def cut(pt: Patcher, sc: dict, kind: str, positions, done: dict, log=None) -> dict:
+    """The smallest set of one kind of unit at the given positions that passes (module docstring, steps 2-3)."""
+    eps, singles = EPS, {}
+    for rnd in range(EPS_ROUNDS):
+        singles.update(group_test(pt, sc, eps, done, kinds=(kind,), positions=positions, log=log))
+        order = sorted(singles, key=lambda u: -max(abs(singles[u][0]), abs(singles[u][1])))
+        curve = pt.both([order[:k] for k in range(1, len(order) + 1)])
+        ok = [k for k, (lost, rest) in enumerate(curve, 1) if lost >= PASS and rest >= PASS]
+        if log:
+            log(f"  {kind}s at {positions[0]}..{positions[-1]}, eps {eps:.4f}: {len(order)} single units, passing prefix {ok[0] if ok else None}")
+        if ok:
+            break
+        eps /= EPS_STEP
+    circ = order[:ok[0]] if ok else list(order)
+    if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
+        alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
+        for u in [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]:
+            trial = [v for v in circ if v != u]
+            lost, rest = pt.both([trial])[0]
+            if lost >= PASS and rest >= PASS:
+                circ = trial
+    lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
+    return {"units": circ, "singles": singles, "met": bool(ok) and lost >= PASS and rest >= PASS, "lost": lost, "restored": rest,
+            "eps": eps, "found": len(singles), "curve": [{"k": k, "lost": a, "restored": b} for k, (a, b) in enumerate(curve, 1)]}
+
+
 def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] | None = None, log=None) -> dict:
     """The circuit of one patching pair and its record (module docstring)."""
     t0 = time.perf_counter()
@@ -283,49 +314,41 @@ def find(pt: Patcher, clean: list[int], corrupt: list[int], answers: list[int] |
     rec["residual_map"] = {"positions": pos, "restored": [rmap[i * len(pos):(i + 1) * len(pos)] for i in range(pt.L)]}
     sc = pt.scores()
     rec["seconds_setup"] = round(time.perf_counter() - t0, 2)
-    # neurons (every head computing live)
-    eps, done, singles = EPS, {}, {}
-    for rnd in range(EPS_ROUNDS):
-        singles.update(group_test(pt, sc, eps, done, log=log))
-        order = sorted(singles, key=lambda u: -max(abs(singles[u][0]), abs(singles[u][1])))
-        curve = pt.both([order[:k] for k in range(1, len(order) + 1)])
-        ok = [k for k, (lost, rest) in enumerate(curve, 1) if lost >= PASS and rest >= PASS]
-        if log:
-            log(f"  eps {eps:.4f}: {len(order)} single neurons, passing prefix {ok[0] if ok else None}")
-        if ok:
-            break
-        eps /= EPS_STEP
-    rec["eps"] = eps
-    rec["curve"] = [{"k": k, "lost": a, "restored": b} for k, (a, b) in enumerate(curve, 1)]
-    circ = order[:ok[0]] if ok else list(order)
-    if ok and len(circ) > 1:                        # units whose removal alone still passes, then removed one at a time
-        alone = pt.both([[v for v in circ if v != u] for u in circ])           # from the least effective while it passes
-        for u in [u for u, (lost, rest) in zip(circ, alone) if lost >= PASS and rest >= PASS][::-1]:
-            trial = [v for v in circ if v != u]
-            lost, rest = pt.both([trial])[0]
-            if lost >= PASS and rest >= PASS:
-                circ = trial
-    lost, rest = pt.both([circ])[0] if circ else (0.0, 0.0)
-    rec.update(met=bool(ok) and lost >= PASS and rest >= PASS, size=len(circ), lost=lost, restored=rest)
-    # routes: the heads the circuit's effect runs through, each frozen at its value in the base run while the circuit is
-    # patched: the share of the circuit's loss (noising) and restoration (denoising) that no longer happens
-    def through(sets):
-        a = pt.run("clean", [circ + [u + ("clean",) for u in s] for s in sets])
-        b = pt.run("corrupt", [circ + [u + ("corrupt",) for u in s] for s in sets])
-        return [(lost - x, rest - y) for x, y in zip(a, b)]
-    heads = group_test(pt, sc, EPS, {}, kinds=("head",), measure=through, log=log) if circ else {}
+    last, done = pt.T - 1, {}
+    cuts = {"readout": cut(pt, sc, "neuron", [last], done, log=log), "movers": cut(pt, sc, "head", [last], done, log=log)}
+    if pt.first < last:
+        cuts["source"] = cut(pt, sc, "neuron", list(range(pt.first, last)), done, log=log)
+    # each mover's share of the source cut's effect: the head frozen at its base-run value while the source cut is patched
+    src = cuts.get("source", {}).get("units", [])
+    if src:
+        movers = cuts["movers"]["units"]
+        a = pt.run("clean", [src + [u + ("clean",)] for u in movers])
+        b = pt.run("corrupt", [src + [u + ("corrupt",)] for u in movers])
+        through = {u: (cuts["source"]["lost"] - x, cuts["source"]["restored"] - y) for u, x, y in zip(movers, a, b)}
+    else:
+        through = {}
     nodes = []
-    for u in circ:
-        _, i, p, n = u
-        v, w = float(pt.act["clean"]["neu"][i][p, n]), float(pt.act["clean"]["up"][i][p, n])
-        nodes.append({"layer": i, "pos": p, "neuron": n, "pole": 1 if v > 0 else -1, "regime": [1 if v * w > 0 else -1, 1 if w > 0 else -1],
-                      "clean": v, "corrupt": float(pt.act["corrupt"]["neu"][i][p, n]), "lost": singles[u][0], "restored": singles[u][1]})
-    routes = [{"layer": i, "head": h, "pos": p, "attends": pt.attends(i, h, p), "through_lost": a, "through_restored": b}
-              for (_, i, h, p), (a, b) in sorted(heads.items(), key=lambda kv: -max(abs(kv[1][0]), abs(kv[1][1])))]
-    rec.update(nodes=nodes, routes=routes, neurons_found=len(singles), seconds=round(time.perf_counter() - t0, 2))
+    for stage in ("source", "readout"):
+        for u in cuts.get(stage, {}).get("units", []):
+            _, i, p, n = u
+            v, w = float(pt.act["clean"]["neu"][i][p, n]), float(pt.act["clean"]["up"][i][p, n])
+            lo, re = cuts[stage]["singles"][u]
+            nodes.append({"stage": stage, "layer": i, "pos": p, "neuron": n, "pole": 1 if v > 0 else -1,
+                          "regime": [1 if v * w > 0 else -1, 1 if w > 0 else -1], "clean": v,
+                          "corrupt": float(pt.act["corrupt"]["neu"][i][p, n]), "lost": lo, "restored": re})
+    routes = []
+    for u in cuts["movers"]["units"]:
+        _, i, h, p = u
+        lo, re = cuts["movers"]["singles"][u]
+        routes.append({"layer": i, "head": h, "pos": p, "attends": pt.attends(i, h, p), "lost": lo, "restored": re,
+                       "through_source": list(through[u]) if u in through else None})
+    rec.update(nodes=nodes, routes=routes, met=all(c["met"] for c in cuts.values()),
+               cuts={k: {f: c[f] for f in ("met", "lost", "restored", "eps", "found", "curve")} | {"size": len(c["units"])}
+                     for k, c in cuts.items()},
+               size=len(nodes), seconds=round(time.perf_counter() - t0, 2))
     if log:
-        log(f"  circuit: {len(nodes)} neurons (lost {lost:.2f}, restored {rest:.2f}, met {rec['met']}), {len(routes)} routes, "
-            f"{rec['seconds']} s")
+        log("  " + ", ".join(f"{k} {len(c['units'])} ({c['lost']:.2f}/{c['restored']:.2f}{'' if c['met'] else ' unmet'})"
+                             for k, c in cuts.items()) + f", {rec['seconds']} s")
     return rec
 
 

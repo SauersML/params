@@ -4,8 +4,8 @@ held-out draws, never through the oracle. The semantics are the builder's (neuro
   unit       an MLP neuron's strong value (the down projection's input, act(gate) x up) at one position, [layer,
              position, neuron], or the whole neuron at every position up to the answer, [layer, neuron]
   reference  R: neuron_builder.Neurons' weak-zeroed model, one weak fraction per layer (its thr file, Neurons.save: the
-             circuit's "thr" or "calibration"'s "file", else Neurons.calibrate on general.jsonl's CAL_ROWS chats, cached
-             per model), in every run; massive values (neuron_builder.MASSIVE) and the first position are never units and
+             circuit's "thr" or "calibration"'s "file", else the model's T2 file (T2_FILES, inframove's neuron_t2 runs),
+             else Neurons.calibrate on general.jsonl's CAL_ROWS chats, cached per model), in every run; massive values (neuron_builder.MASSIVE) and the first position are never units and
              stay live in every run below; the model itself where a family says so
   contrast   at the answer position, log2 p(answer) - log2 p(alternatives) (neuron_edges.log2_contrast; the builder's:
              R's top token against its 5 likeliest others)
@@ -93,6 +93,9 @@ PAIRED_SE = 2.0  # goal_eval's: a drawn family passes at its floor less this man
 CAP: dict = {}  # per family, PAIRED_SE x the median standard error over the first dev set's circuits (until then uncapped)
 EPS_BOOT = 200
 SHARE_MIN = 0.1  # bits: below it in both the model's and the circuit's responses a prediction family is unscored
+T2 = Path.home() / "mpd-data" / "cluster"
+T2_FILES = {("Qwen3-1.7B", None): T2 / "t2_1p7b" / "out" / "thr.pt", ("Qwen3-1.7B", "owl"): T2 / "t2_1p7b_owl" / "out" / "thr.pt",
+            ("Qwen3-8B", None): T2 / "t2_8b" / "out" / "thr.pt", ("Qwen3-32B", None): T2 / "t2_32b" / "out" / "thr.pt"}
 
 
 def read_circuit(path: Path) -> dict:
@@ -141,11 +144,11 @@ def load_model(base: str, adapter: str | None, dev: str, dtype: torch.dtype = to
     return model
 
 
-def background(nr: nb.Neurons, key: str, given: str | None = None, log=print) -> dict:
-    """R's file ({"thr" [L, D], "max" [L, D], "tau" [L]}): the circuit's (Neurons.save), else this model's cached one,
-    else Neurons.calibrate on general.jsonl's CAL_ROWS chats as the builder's main runs it, cached. Leaves nr.thr unset
-    (the runs zero weak values row by row)."""
-    path = Path(given) if given and Path(given).exists() else CACHE / f"background_{key}.pt"
+def background(nr: nb.Neurons, key: str, given: str | None = None, t2: Path | None = None, log=print) -> dict:
+    """R's file ({"thr" [L, D], "max" [L, D], "tau" [L]}): the circuit's (Neurons.save), else the model's T2 file, else
+    this model's cached one, else Neurons.calibrate on general.jsonl's CAL_ROWS chats as the builder's main runs it,
+    cached. Leaves nr.thr unset (the runs zero weak values row by row)."""
+    path = next((Path(p) for p in (given, t2) if p and Path(p).exists()), CACHE / f"background_{key}.pt")
     if path.exists():
         nr.load(path)
     else:
@@ -592,7 +595,8 @@ def main():
         nr = nb.Neurons(model, tok)
         key = f"{base.split('/')[-1]}_{Path(adapter).name if adapter else 'base'}"
         for c in cs:
-            bg = background(nr, key, c.get("thr"), log=lambda m: print(m, flush=True))
+            t2 = T2_FILES.get((base.split("/")[-1], Path(adapter).name if adapter else None))
+            bg = background(nr, key, c.get("thr"), t2, log=lambda m: print(m, flush=True))
             rec = score(nr, model, prepare(c, tok), bg, families, log=lambda m: print(m, flush=True))
             (a.out / f"{c['name']}.json").write_text(json.dumps(rec))
             with open(a.out / "rows.jsonl", "a") as f:

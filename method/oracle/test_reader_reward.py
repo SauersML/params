@@ -22,6 +22,9 @@ class FakeTarget:
 
     where = rr.VPDTarget.where
 
+    def fresh(self, pos, n, rng):
+        return [" building", " work"][:n]
+
     def valid(self, part):
         n, p, c = part
         return n in ("h.3.mlp.down_proj", "h.0.mlp.c_fc", "h.0.attn.q_proj") and 0 <= p < len(self.ids) and c < 4096
@@ -38,15 +41,16 @@ def test_parts_and_positions():
 def test_invariant_lines():
     tg = FakeTarget()
     tg.where = rr.VPDTarget.where.__get__(tg)
-    ivs, oc = rr.parse_inv("INV: swap @' creation' with any of [' building', ' work'] -> top ' the'", tg)
+    assert rr.parse_inv("INV: swap @' creation' with any of [' building', ' work'] -> top ' the'", tg) is None  # listed by the answer
+    ivs, oc = rr.parse_inv("INV: swap @' creation' with predicted tokens -> top ' the'", tg)
     assert [iv["token"] for iv in ivs] == [" building", " work"] and ivs[0]["pos"] == 3 and oc == ("top", " the")
-    ivs, oc = rr.parse_inv("INV: swap @3 with any of [' building'] and set back L3.down#2481@3, L0.fc#1@2 -> p > 0.7", tg)
+    assert rr.parse_inv("INV: swap @3 with things it likes -> p > 0.5", tg) is None  # no such scope
+    ivs, oc = rr.parse_inv("INV: swap @3 with predicted tokens and set back L3.down#2481@3, L0.fc#1@2 -> p > 0.7", tg)
     assert ivs[0]["kind"] == "setback" and ivs[0]["parts"] == [["h.3.mlp.down_proj", 3, 2481], ["h.0.mlp.c_fc", 2, 1]] and oc == (">", 0.7)
     ivs, oc = rr.parse_inv("INV: remove L3.down#2481@3 -> top not ' of'", tg)
     assert ivs[0]["kind"] == "remove" and oc == ("top_not", " of")
     ivs, _ = rr.parse_inv("INV: scale L3.down#2481@3 by 0.5 -> p < 0.4", tg)
     assert ivs[0]["by"] == 0.5
-    assert rr.parse_inv("INV: swap @3 with any of [' notatoken'] -> p > 0.5", tg) is None  # not one token of the model
     assert rr.parse_inv("INV: remove L3.down#2481@9 -> p > 0.5", tg) is None  # no position 9
     assert rr.parse_inv("INV: remove L4.o#1@3 -> p > 0.5", tg) is None  # no layer 4
     assert rr.parse_inv("INV: remove L3.down#2481@'creation' -> p > 0.5", tg)[0][0]["parts"] == [["h.3.mlp.down_proj", 3, 2481]]

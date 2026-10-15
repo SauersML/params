@@ -435,45 +435,58 @@ WANT = {"swap": 18, "remove": 11, "setback": 4, "scale": 3}  # questions per kin
 
 
 def moved(tg, o: dict) -> bool:
-    """Whether an outcome differs from the unchanged model: another top token, or p's log-odds moved by a nat or more
-    (the grader's scale; a bit of log p hides 0.99 -> 0.87)."""
-    return o["top"] != tg.tok(tg.y0) or abs(logit(o["p"]) - logit(float(tg.base[tg.y0].exp()))) >= 1
+    """Whether an outcome changes the model's top token (the questions' balance: half of each kind change it and half
+    do not, so an unaided reader that answers 'no change' is right on half; 10-14 the lead: an unaided 0.75-0.79 left
+    no headroom)."""
+    return o["top"] != tg.tok(tg.y0)
 
 
-def questions(tg, circuit: list, seed: int = 0, pool: int = 3) -> list[dict]:
+def questions(tg, circuit: list, seed: int = 0, pool: int = 4) -> list[dict]:
     """Interventions independent of any explanation (module docstring), each with its measured outcome: per kind, pool
-    times WANT drawn and measured, then half of WANT from those that move the model and half from those that do not
-    (the other half filling a short side): most single removals leave p near its value, so 'no change' would otherwise
-    be right without reading anything (text9000 v1: 11 of 11)."""
+    times WANT drawn and measured, then half of WANT from those that change the top token and half from those that do
+    not (the other side filling a short one; each set records how many change it). Removals and scalings take groups of
+    every size (1 to 16 parts, or 1 to 4 named groups) so that some change the top token at all (a single part of
+    text9000's circuit never does)."""
     rng = random.Random(seed)
     t = tg.t
     parts = [list(x) for x in circuit]
     at_t = [x for x in parts if x[1] == t] or parts
-    g1, g2 = getattr(tg, "groups", (1, 3))  # parts per removal: one and three subcomponents; neurons in larger groups
+    sizes = [k for k in (1, 2, 4, 8, 16) if k <= len(parts)] or [1]
+    if getattr(tg, "groups", None):
+        sizes = [k for k in (tg.groups[0], 2 * tg.groups[0], tg.groups[1], 2 * tg.groups[1]) if k <= len(parts)] or [len(parts)]
     draw = {"swap": [{"kind": "swap", "pos": pos, "token": s} for pos, n in ((t, 8), (t - 1, 4), (t - 2, 3), (t - 3, 3))
                      for s in tg.fresh(pos, pool * n, rng)],
-            "remove": [{"kind": "remove", "parts": rng.sample(parts, g1)} for _ in range(pool * 8)]
-                      + [{"kind": "remove", "parts": rng.sample(parts, g2)} for _ in range(pool * 3)],
-            "setback": [{"kind": "setback", "pos": t, "token": s, "parts": [rng.choice(at_t)]} for s in tg.fresh(t, pool * 4, rng)],
-            "scale": [{"kind": "scale", "parts": rng.sample(parts, g1), "by": rng.choice([0.5, 2.0, 3.0])} for _ in range(pool * 3)]}
-    if tg.named:  # whole groups: each alone, pairs, scalings, set-backs of the groups at the last position
+            "remove": [{"kind": "remove", "parts": rng.sample(parts, rng.choice(sizes))} for _ in range(pool * 11)],
+            "setback": [{"kind": "setback", "pos": t, "token": s, "parts": rng.sample(at_t, min(len(at_t), rng.choice(sizes)))}
+                        for s in tg.fresh(t, pool * 4, rng)],
+            "scale": [{"kind": "scale", "parts": rng.sample(parts, rng.choice(sizes)), "by": rng.choice([0.0, 0.5, 2.0, 3.0])}
+                      for _ in range(pool * 3)]}
+    if tg.named:  # whole named groups: 1 to 4 of them removed or scaled together, set-backs of groups at the last position
         G = list(tg.named)
         gt = [g for g in G if any(p == t for _, p, _ in tg.named[g])] or G
         pick = lambda gs: {"group": gs if len(gs) > 1 else gs[0], "parts": [x for g in gs for x in tg.named[g]]}  # noqa: E731
-        draw["remove"] = [{"kind": "remove", **pick([g])} for g in G] + [{"kind": "remove", **pick(rng.sample(G, 2))} for _ in range(pool * 3)]
-        draw["scale"] = [{"kind": "scale", "by": rng.choice([0.5, 2.0, 3.0]), **pick([g])} for g in rng.sample(G, min(len(G), pool * 3))]
-        draw["setback"] = [{"kind": "setback", "pos": t, "token": s, **pick([rng.choice(gt)])} for s in tg.fresh(t, pool * 4, rng)]
+        ks = [k for k in (1, 2, 3, 4) if k <= len(G)]
+        draw["remove"] = [{"kind": "remove", **pick(rng.sample(G, rng.choice(ks)))} for _ in range(pool * 11)]
+        draw["scale"] = [{"kind": "scale", "by": rng.choice([0.0, 0.5, 2.0, 3.0]), **pick(rng.sample(G, rng.choice(ks)))} for _ in range(pool * 3)]
+        draw["setback"] = [{"kind": "setback", "pos": t, "token": s, **pick(rng.sample(gt, min(len(gt), rng.choice(ks))))}
+                           for s in tg.fresh(t, pool * 4, rng)]
     ivs = []
     for kind, cands in draw.items():
-        for iv in cands:
+        seen, uniq = set(), []
+        for iv in cands:  # one question per distinct intervention
+            key = json.dumps({k: v for k, v in iv.items() if k != "group"}, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(iv)
+        for iv in uniq:
             iv["outcome"] = tg.run(iv)
-        yes = [iv for iv in cands if moved(tg, iv["outcome"])]
-        no = [iv for iv in cands if not moved(tg, iv["outcome"])]
+        yes = [iv for iv in uniq if moved(tg, iv["outcome"])]
+        no = [iv for iv in uniq if not moved(tg, iv["outcome"])]
         k = WANT[kind]
         a = min(len(yes), max(k // 2, k - len(no)))
-        pick = rng.sample(yes, a) + rng.sample(no, min(len(no), k - a))
-        rng.shuffle(pick)
-        ivs += pick
+        chosen = rng.sample(yes, a) + rng.sample(no, min(len(no), k - a))
+        rng.shuffle(chosen)
+        ivs += chosen
     for iv in ivs:
         iv["words"] = tg.words(iv)
         iv["moved"] = moved(tg, iv["outcome"])
@@ -553,15 +566,55 @@ class Reader:
 
 
 INV_GRAMMAR = """Write {n} invariants this explanation implies: tests on the model, each with the outcome it predicts. One per line, in exactly this grammar:
-INV: swap @<where> with any of ['<token>', '<token>', ...] -> <outcome>
+INV: swap @<where> with <scope> -> <outcome>
 INV: remove <part>[, <part> ...] -> <outcome>
 INV: scale <part> by <factor> -> <outcome>
-INV: swap @<where> with any of ['<token>', ...] and set back <part>[, <part> ...] -> <outcome>
-where <where> is a position, written as its number or as the token there quoted (for example @' creation', the last position holding that token), <part> is written L<layer>.<kind>#<index>@<where> or is a group's name (G<k>), and <outcome> is one of: top '<token>' | top not '<token>' | p > <number> | p < <number>, p being the probability the model gives {answer!r}. List at least five tokens in each "any of" set (each a single token, quoted exactly, with its leading space if any). Nothing else."""
+INV: swap @<where> with <scope> and set back <part>[, <part> ...] -> <outcome>
+where <where> is a position, written as its number or as the token there quoted (for example @' creation', the last position holding that token), <part> is written L<layer>.<kind>#<index>@<where> or is a group's name (G<k>), and <outcome> is one of: top '<token>' | top not '<token>' | p > <number> | p < <number>, p being the probability the model gives {answer!r}. <scope> is the set of tokens the claim covers, one of: nouns, verbs, adjectives, adverbs, prepositions, pronouns, determiners, conjunctions, numbers, names, predicted tokens (tokens the model itself predicts at that position); the checker draws the test tokens from it. Nothing else."""
 
 
-def parse_inv(line: str, tg: VPDTarget) -> tuple[list[dict], tuple] | None:
-    """An INV line as (its interventions, one per instance, and its outcome), or None."""
+LEX = Path.home() / "mpd-data" / "graph_oracle" / "gwas" / "lex"
+SCOPES = {"nouns": "Noun", "verbs": "Verb", "adjectives": "Adjective", "adverbs": "Adverb", "prepositions": "Preposition",
+          "pronouns": "Pronoun", "determiners": "Determiner", "conjunctions": "Conjunction", "numbers": "Number", "names": "Name"}
+DRAWS = 8  # instances the checker draws per INV line
+_CLASSES: dict = {}
+
+
+def class_words(cls: str) -> list[str]:
+    """English words whose dominant part of speech is cls (Brysbaert et al.'s concreteness norms, Dom_Pos), most
+    frequent first (SUBTLEX-US counts)."""
+    if not _CLASSES:
+        freq = {}
+        for i, line in enumerate((LEX / "SUBTLEXus74286wordstextversion.txt").read_text(errors="ignore").splitlines()):
+            f = line.split("\t")
+            if i and len(f) > 1 and f[1].isdigit():
+                freq[f[0].lower()] = int(f[1])
+        for i, line in enumerate((LEX / "Concreteness_ratings_Brysbaert_et_al_BRM.txt").read_text(errors="ignore").splitlines()):
+            f = line.split("\t")
+            if i and len(f) > 2 and " " not in f[0]:
+                _CLASSES.setdefault(f[-1], []).append(f[0])
+        for k in _CLASSES:
+            _CLASSES[k].sort(key=lambda w: -freq.get(w.lower(), 0))
+    return _CLASSES.get(cls, [])
+
+
+def drawn(tg, pos: int, scope: str, rng: random.Random, k: int = DRAWS) -> list[str] | None:
+    """k tokens the checker draws from an INV line's scope at pos (never the answer's choice, the lead's 10-14): the
+    model's own prediction there (fresh draws), or a part of speech (single tokens of the target among the class's 2,000
+    most frequent words, a leading space as in running text); None for a scope it does not know."""
+    if scope in ("predicted tokens", "tokens the model predicts there"):
+        return tg.fresh(pos, k, rng)
+    if scope in SCOPES:
+        toks = [" " + w for w in class_words(SCOPES[scope])[:2000]]
+        toks = [x for x in toks if tg.token_id(x) is not None and x != tg.tok(tg.ids[pos])]
+        return rng.sample(toks, min(k, len(toks))) if toks else None
+    return None
+
+
+def parse_inv(line: str, tg: VPDTarget, rng: random.Random | None = None) -> tuple[list[dict], tuple] | None:
+    """An INV line as (its interventions, one per instance, and its outcome), or None. A swap's instances are drawn by
+    the checker from the line's scope ('with nouns', 'with predicted tokens', ...); a listed set ('with any of [...]')
+    is the answer's own choice of instances and fails."""
     m = re.match(r"\s*INV:\s*(.+?)\s*->\s*(.+?)\s*$", line)
     if not m:
         return None
@@ -588,16 +641,13 @@ def parse_inv(line: str, tg: VPDTarget) -> tuple[list[dict], tuple] | None:
                 ps.append(site_of(x, tg.where))
         return None if not ps or any(p is None or not tg.valid(p) for p in ps) else [list(p) for p in ps]
 
-    ms = re.fullmatch(r"swap\s+@(\d+|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s+with any of\s+\[(.*)\](?:\s+and set back\s+(.+))?", body)
+    ms = re.fullmatch(r"swap\s+@(\d+|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s+with\s+(.+?)(?:\s+and set back\s+(.+))?", body)
     if ms:
         pos = tg.where(ms.group(1))
-        if pos is None:
+        if pos is None or ms.group(2).startswith("any of"):
             return None
-        try:
-            toks = ast.literal_eval("[" + ms.group(2) + "]")
-        except (ValueError, SyntaxError):
-            return None
-        if not toks or any(not isinstance(x, str) or tg.token_id(x) is None for x in toks):
+        toks = drawn(tg, pos, ms.group(2).strip().lower(), rng or random.Random(line))
+        if not toks:
             return None
         if ms.group(3):
             ps = parts_of(ms.group(3))
@@ -686,7 +736,7 @@ def cmd_read(a) -> None:
                                            "spend_usd", "by_kind")}))
 
 
-def check_lines(tg, text: str) -> dict:
+def check_lines(tg, text: str, seed: int = 0) -> dict:
     """An answer's INV lines (its own falsifiable claims, the lead's 10-14) run on the target: per line whether it
     parses, holds on every instance, the share of instances that meet its outcome, and whether it is bold (the
     unchanged model does not already meet its outcome: 'p < 0.4' while p is 0.95, 'top not' the prediction; a safe
@@ -695,7 +745,7 @@ def check_lines(tg, text: str) -> dict:
     rows = []
     o0 = {"top": tg.tok(tg.y0), "p": float(tg.base[tg.y0].exp())}
     for line in [x for x in text.splitlines() if x.strip().startswith("INV")]:
-        p = parse_inv(line, tg)
+        p = parse_inv(line, tg, random.Random(f"{seed}|{line}"))
         if p is None:
             rows.append({"line": line, "parsed": False, "holds": False, "bold": False})
             continue

@@ -623,3 +623,26 @@ def test_build_native_shared_gate_uses_common_search_floors(monkeypatch, explici
         native_units.build_native(ge,tx,kl_target=.1 if explicit else None,means={},shared_floors=True,pool=pool,max_gate_calls=3)
     assert calls==[(pool,'search')]
     assert inversions==([] if explicit else [.6])
+
+
+def test_grouped_units(tiny_hf):
+    """GroupedUnits: neuron groups from the output directions (neuron_groups on neuron_writes, an HF model's measured on
+    the unit vectors: its down projection's columns), a group at its mean the run with its neurons at their means; the
+    builder on groups meets its target, its units ("group", layer, position, id)."""
+    model, ids, means = tiny_hf
+    hu = native_units.HFUnits(model, ids, [9], means)
+    w = native_units.neuron_writes(hu)
+    assert all(torch.allclose(x, layer.mlp.down_proj.weight.T, atol=1e-6) for x, layer in zip(w, model.model.layers))
+    groups = native_units.neuron_groups(w, 5)
+    assert groups.shape == (2, 40) and int(groups.max()) < 5
+    gu = native_units.GroupedUnits(hu, groups)
+    h, gm = (x[0] for x in gu.ones())
+    gm2 = gm.clone()
+    gm2[1, 3, int(groups[1, 0])] = 0.0
+    n = torch.ones(2, hu.T, 40)
+    n[1, 3, groups[1] == groups[1, 0]] = 0.0
+    with torch.no_grad():
+        assert float((gu.logq((h[None], gm2[None])) - hu.logq((h[None], n[None]))).abs().max()) < 1e-6
+    empty = hu.kl([tuple(x[0] * 0 for x in hu.ones())])[0]
+    rec = native_units.build_hf(model, ids, 9, kl_target=empty * 0.05, means=means, groups=groups, effects=2)
+    assert rec["kl"] <= rec["kl_target"] and {u[0] for u in rec["units"]} <= {"head", "group"} and rec["of"] == 2 * hu.T * (4 + 5)

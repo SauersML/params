@@ -515,6 +515,69 @@ def hf_means(model, tok, texts=None, max_len: int = 256) -> dict:
     return {"heads": (sh / count).float(), "neurons": (sn / count).float(), "positions": count}
 
 
+class GroupedUnits(UnitRuns):
+    """Coarser native units on any adapter (the lead's 10-14, for models whose neuron circuits run to 100k+ units): each
+    layer's neurons in groups (groups [L, d_mlp] of group ids, neuron_groups'), a group at a position one unit, mean-
+    ablated together; the heads as they are. Its masks are (heads [B, L, T, H], groups [B, L, T, G]); the inner adapter
+    runs them with each neuron at its group's strength."""
+
+    def __init__(self, inner: UnitRuns, groups: torch.Tensor):
+        self.inner, self.groups = inner, groups.to(inner.dev)
+        self.L, self.T, self.H, self.hd, self.dev = inner.L, inner.T, inner.H, inner.hd, inner.dev
+        self.Dm = int(self.groups.max()) + 1
+        self.ref, self.targets, self._clean = inner.ref, inner.targets, None
+        self.passes = 0
+
+    def rows(self) -> int:
+        return self.inner.rows()
+
+    def _neurons(self, g: torch.Tensor) -> torch.Tensor:  # [B, L, T, G] -> [B, L, T, d_mlp]
+        idx = self.groups[None, :, None, :].expand(g.shape[0], -1, g.shape[2], -1)
+        return torch.gather(g, 3, idx)
+
+    def logq(self, live: tuple, frozen: tuple | None = None, capture: dict | None = None) -> torch.Tensor:
+        fr = None if frozen is None else (frozen[0], self._neurons(frozen[1].to(torch.uint8)).bool())
+        return self.inner.logq((live[0], self._neurons(live[1])), fr, capture)
+
+    def capture(self) -> dict:
+        return self.inner.capture()
+
+
+@torch.no_grad()
+def neuron_groups(write: list[torch.Tensor], G: int, iters: int = 20, seed: int = 0) -> torch.Tensor:
+    """Each layer's neurons in G groups by their output directions (write[l]: [d_mlp, d_model], neuron j's write into the
+    residual stream): spherical k-means on the unit directions (G random neurons to start, iters steps): neurons that
+    write the same direction mean-ablate as one unit. [L, d_mlp] group ids."""
+    out = []
+    g = torch.Generator().manual_seed(seed)
+    for w in write:
+        x = torch.nn.functional.normalize(w.float(), dim=1)
+        c = x[torch.randperm(len(x), generator=g)[:G].to(x.device)].clone()
+        for _ in range(iters):
+            a = (x @ c.T).argmax(1)
+            for k in range(G):
+                sel = x[a == k]
+                if len(sel):
+                    c[k] = torch.nn.functional.normalize(sel.sum(0), dim=0)
+        out.append((x @ c.T).argmax(1))
+    return torch.stack(out)
+
+
+def neuron_writes(mu: UnitRuns) -> list[torch.Tensor]:
+    """Each layer's neurons' writes into the residual stream [d_mlp, d_model]: the down projection's columns (an HF
+    model's measured on the unit vectors, so a LoRA adapter's change counts)."""
+    if isinstance(mu, MeanUnits):
+        return [mu.W["down_proj"][i].T for i in range(mu.L)]
+    out = []
+    with torch.no_grad():
+        for layer in mu.layers:
+            d = layer.mlp.down_proj
+            p = next(d.parameters())
+            eye = torch.eye(mu.Dm, device=p.device, dtype=p.dtype)
+            out.append((d(eye) - d(torch.zeros_like(eye[:1]))).float())
+    return out
+
+
 # ---- the native builder (the lead's 10-14: builder_fast's units="neurons"; the same recipe as pymove's VPD builder)
 
 FISHER_SAMPLES = 32  # labels drawn from the model's distribution at each target for the ranking's Fisher
@@ -788,7 +851,8 @@ EFFECTS = 32  # build_hf measures the single removal of this many of the circuit
 
 
 def build_hf(model, ids: list[int], target: int, kl_target: float = HF_KL_TARGET, means: dict | None = None, tok=None,
-             budget_passes: int | None = None, effects: int = EFFECTS, seed: int = 0, log=None) -> dict:
+             budget_passes: int | None = None, effects: int = EFFECTS, seed: int = 0, groups: torch.Tensor | None = None,
+             log=None) -> dict:
     """The native builder on an HF decoder (HFUnits: Qwen3; a PeftModel with its active adapter on): the circuit of heads
     and neurons for the model's prediction at position target of ids in mean-ablation semantics, at most kl_target bits
     of KL there. means: hf_means' (with tok, computed when None). budget_passes: the BUDGET settings (fewer Fisher labels,
@@ -796,13 +860,16 @@ def build_hf(model, ids: list[int], target: int, kl_target: float = HF_KL_TARGET
     {"units": [(kind, layer, position, index, effect)], effect the measured drop in log2 p of the model's top token when
     the unit alone is mean-ablated from the whole model for the `effects` highest-ranked units, else None and the
     Fisher's predicted KL rise in "fisher"; "kl", "kl_target", "kl_empty", "positions", "layers" (units per layer),
-    "passes", "seconds", "heads", "neurons"}."""
+    "passes", "seconds", "heads", "neurons"}. groups ([L, d_mlp], neuron_groups'): neuron groups in place of neurons (GroupedUnits;
+    a unit ("group", layer, position, group id))."""
     t0 = time.perf_counter()
     if means is None:
         if tok is None:
             raise ValueError("build_hf: pass means (hf_means) or the tokenizer to compute them")
         means = hf_means(model, tok)
     mu = HFUnits(model, ids, [target], means)
+    if groups is not None:
+        mu = GroupedUnits(mu, groups)
     kw = BUDGET if budget_passes is not None else {}
     live, rec = build_units(mu, seed, kl_target, **kw)
     order, score = rec.pop("order"), rec.pop("score")
@@ -815,7 +882,7 @@ def build_hf(model, ids: list[int], target: int, kl_target: float = HF_KL_TARGET
         else:
             k = i - nh
             l, t, j = k // (mu.T * mu.Dm), (k // mu.Dm) % mu.T, k % mu.Dm
-            units.append(["neuron", l, t, j])
+            units.append(["neuron" if groups is None else "group", l, t, j])
     n_eff = min(effects, len(units)) if budget_passes is None else max(0, min(effects, budget_passes - mu.passes - 1))
     full = tuple(x[0] for x in mu.ones())
     lp0 = mu.kl([full], lp=True)[0] if n_eff else None

@@ -75,9 +75,10 @@ def name(u: tuple) -> str:
     return f"{u[0]}:{u[1]}{'+' if u[2] > 0 else '-'}"
 
 
-def last(nr: nb.Neurons, ids, edit=None, B: int = 1) -> torch.Tensor:
-    """[B, V] log-probabilities at the last position."""
-    return torch.log_softmax(nr.logits(ids, [len(ids) - 1], edit=edit, B=B)[:, 0], -1)
+def last(nr: nb.Neurons, ids, edit=None, B: int = 1, pad: bool = True) -> torch.Tensor:
+    """[B, V] log-probabilities at the last position, run in a batch of ROWS (padded: bfloat16 kernels change with the
+    batch size, by up to 2 bits on Qwen3-8B), or of B (pad False: the gradient pass)."""
+    return torch.log_softmax(nr.logits(ids, [len(ids) - 1], edit=edit, B=max(B, ROWS) if pad else B)[:B, 0], -1)
 
 
 def measure(nr: nb.Neurons, ids, sets: list, y: int, alt: torch.Tensor) -> list[dict]:
@@ -142,7 +143,7 @@ def case(nr: nb.Neurons, tok, cname: str, spec: dict, log=print) -> dict:
         hf = h.float()
         return (hf.clamp(min=0) * mp[i] + hf.clamp(max=0) * mn[i]).to(h.dtype)
     with torch.enable_grad():
-        lq = last(nr, ids, grad_edit)[0]
+        lq = last(nr, ids, grad_edit, pad=False)[0]
         ((lq[y] - torch.logsumexp(lq[alt.to(lq.device)], -1)) / math.log(2)).backward()
     g = torch.stack([torch.stack([a.grad.float().cpu(), b.grad.float().cpu()]) for a, b in zip(mp, mn)])   # [L, 2, D]
     order = g.abs().flatten().argsort(descending=True)

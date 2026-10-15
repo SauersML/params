@@ -16,24 +16,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE / "rl")]
 
+import claim_check  # noqa: E402  (its UNIT names every unit, for both kinds)
 import neuron_verify  # noqa: E402
-
-UNIT = re.compile(r"^L(\d+)\.N(\d+)([+-]?)$")
 
 
 def explanation_item(claim: dict, atlas=None) -> dict:
     """A claim of kind "explanation" as neuron_verify's item {layer, index, pole, corpus_max, explanation}."""
-    m = UNIT.match(str(claim.get("unit", "")).strip())
-    if not m or not m[3]:
+    m = claim_check.UNIT.match(str(claim.get("unit", "")).strip())
+    if not m or m[2] != "N" or not m[4]:
         raise ValueError("an explanation names one neuron pole, like L18.N2201+ or L18.N2201-")
-    layer, index, pole = int(m[1]), int(m[2]), m[3]
+    layer, index, pole = int(m[1]), int(m[3]), m[4]
     cm = claim.get("corpus_max")
     if cm is None:
         if atlas is None:
@@ -75,8 +73,6 @@ def check(claims: list[dict], tg, rd, nr=None, atlas=None) -> list[dict]:
         for k in iv:
             out[k] = {"kind": "intervention", "pass": False, "valid": False, "reason": "no weak-zeroed reference (--thr)"}
     elif iv:
-        import claim_check
-
         for k, r in zip(iv, claim_check.check_many(nr, [claims[k] for k in iv]), strict=True):
             out[k] = {"kind": "intervention", **r}
     return out

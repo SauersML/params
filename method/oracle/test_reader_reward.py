@@ -51,6 +51,10 @@ def test_invariant_lines():
     assert rr.parse_inv("INV: remove L4.o#1@3 -> p > 0.5", tg) is None  # no layer 4
     assert rr.parse_inv("INV: remove L3.down#2481@'creation' -> p > 0.5", tg)[0][0]["parts"] == [["h.3.mlp.down_proj", 3, 2481]]
     assert rr.parse_inv("swap @3 with any of [' work'] -> p > 0.5", tg) is None
+    tg.named = {"G1": [["h.0.mlp.c_fc", 3, 5], ["h.0.mlp.c_fc", 3, 6]]}
+    ivs, oc = rr.parse_inv("INV: remove G1, L3.down#2481@3 -> p < 0.2", tg)
+    assert ivs[0]["parts"] == [["h.0.mlp.c_fc", 3, 5], ["h.0.mlp.c_fc", 3, 6], ["h.3.mlp.down_proj", 3, 2481]]
+    assert rr.parse_inv("INV: remove G2 -> p < 0.2", tg) is None  # no group G2
     assert rr.meets({"top": " of", "p": 0.2}, ("top", " of")) and rr.meets({"top": " of", "p": 0.2}, ("<", 0.3))
     assert not rr.meets({"top": " of", "p": 0.2}, ("top_not", " of"))
 

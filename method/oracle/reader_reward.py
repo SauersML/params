@@ -202,6 +202,15 @@ class VPDTarget:
             return f"position {p} ({self.tok(self.ids[p])!r})"
         names = ", ".join(label(*x) if len(x) == 3 and isinstance(x[0], str) else str(x) for x in
                           [(n, p, c) for n, p, c in iv.get("parts", [])])
+        if iv.get("group"):  # whole groups, by the names the head defines
+            names = ", ".join(iv["group"]) if isinstance(iv["group"], list) else iv["group"]
+            what = f"group{'s' if ',' in names else ''} {names}"
+            if iv["kind"] == "remove":
+                return f"{what} removed"
+            if iv["kind"] == "scale":
+                return f"{what} scaled by {iv['by']:g} (every part's activation times {iv['by']:g})"
+            if iv["kind"] == "setback":
+                return f"the token at {at(iv['pos'])} replaced by {iv['token']!r}, with {what} set back to its values on the original text"
         if iv["kind"] == "swap":
             return f"the token at {at(iv['pos'])} replaced by {iv['token']!r}"
         if iv["kind"] == "remove":
@@ -220,7 +229,22 @@ class VPDTarget:
         end = self.tk.decode(self.ids[max(0, T - 60):])
         return (f"A small language model (4 transformer layers, trained on web text) reads a text and predicts the next token "
                 f"after its last token (position {T - 1}).\nThe text ends: ...{end}\nIts last tokens by position: {toks}\n"
-                f"The model's prediction now: {pred}.\n{PARTS}\n")
+                f"The model's prediction now: {pred}.\n{PARTS}\n{self.group_lines()}")
+
+    named: dict = {}  # group name -> its parts (a circuit's groups; empty: parts one by one)
+
+    def group_lines(self) -> str:
+        """The groups as the reader sees them: each one's size, layers and position."""
+        if not self.named:
+            return ""
+        rows = []
+        for g, ps in self.named.items():
+            layers = sorted({int(n.split(".")[1]) for n, _, _ in ps})
+            pos = sorted({p for _, p, _ in ps})
+            rows.append(f"{g}: {len(ps)} parts at layer{'s' if len(layers) > 1 else ''} {layers[0]}"
+                        f"{'-' + str(layers[-1]) if len(layers) > 1 else ''}, position{'s' if len(pos) > 1 else ''} "
+                        + ", ".join(f"{q} ({self.tok(self.ids[q])!r})" for q in pos))
+        return "Groups of parts (each removed, scaled or set back whole):\n" + "\n".join(rows) + "\n"
 
 
 class HFTarget(VPDTarget):
@@ -354,7 +378,16 @@ class HFTarget(VPDTarget):
         return (f"A language model ({self.name.split('/')[-1]}, {len(self.layers)} transformer layers) reads a text and predicts "
                 f"the next token after its last token (position {T - 1}).\nThe text ends: ...{end}\nIts last tokens by position: "
                 f"{toks}\nThe model's prediction now: {pred}.\nParts are MLP neurons, named L<layer>.n#<index> (the neuron's "
-                f"activation, the input of the layer's down projection) at a token position (@<position>).\n")
+                f"activation, the input of the layer's down projection) at a token position (@<position>).\n{self.group_lines()}")
+
+    def make_groups(self, parts: list, band: int = 4, least: int = 4) -> None:
+        """The circuit's neurons as named groups: per position and band of layers, groups of at least least neurons,
+        named G1, G2, ... by position and then layer."""
+        by: dict = {}
+        for n, p, c in parts:
+            by.setdefault((p, int(n.split(".")[1]) // band), []).append([n, p, c])
+        keep = sorted((k, v) for k, v in by.items() if len(v) >= least)
+        self.named = {f"G{i}": v for i, (_, v) in enumerate(keep, 1)}
 
 
 def facts(tg, parts: list, seed: int = 99) -> str:
@@ -368,9 +401,14 @@ def facts(tg, parts: list, seed: int = 99) -> str:
     strong = [f"{label(*x)} (to {pp:.2f})" for pp, x in rem[:5]]
     out.append(f"Removing these parts alone lowers p({y!r}) most: {', '.join(strong)}; removing most other single parts "
                f"moves it by less than {abs(rem[len(rem) // 2][0] - p0):.2f}.")
-    for g in getattr(tg, "groups", ()):
-        pg = tg.run({"kind": "remove", "parts": [list(x) for _, x in rem[:g]]})
-        out.append(f"Removing the {g} strongest of them together takes p({y!r}) to {pg['p']:.2f} (top {pg['top']!r}).")
+    if tg.named:
+        gr = sorted(((tg.run({"kind": "remove", "parts": ps})["p"], g) for g, ps in tg.named.items()), key=lambda z: z[0])
+        out = [out[0], "Removing a group alone: " + ", ".join(f"{g} takes p({y!r}) to {pp:.2f}" for pp, g in gr[:6])
+               + f"; the other groups each leave it above {gr[min(6, len(gr) - 1)][0]:.2f}."]
+    else:
+        for g in getattr(tg, "groups", ()):
+            pg = tg.run({"kind": "remove", "parts": [list(x) for _, x in rem[:g]]})
+            out.append(f"Removing the {g} strongest of them together takes p({y!r}) to {pg['p']:.2f} (top {pg['top']!r}).")
     sw = [(s, tg.run({"kind": "swap", "pos": tg.t, "token": s})) for s in tg.fresh(tg.t, 16, rng)]
     keep = [s for s, o in sw if o["top"] == y and o["p"] > p0 / 2]
     move = [(s, o) for s, o in sw if o["top"] != y or o["p"] <= p0 / 2]
@@ -380,10 +418,16 @@ def facts(tg, parts: list, seed: int = 99) -> str:
     if move:
         out.append("Replacing it by " + ", ".join(f"{s!r} (top {o['top']!r}, p {o['p']:.2f})" for s, o in move[:6]) + " moves the prediction.")
         s, o = move[0]
-        best = max(((tg.run({"kind": "setback", "pos": tg.t, "token": s, "parts": [list(x)]})["p"], x) for _, x in rem[:8]),
-                   key=lambda z: z[0])
-        out.append(f"After the swap to {s!r}, setting {label(*best[1])} back to its value on the original text brings p({y!r}) "
-                   f"from {o['p']:.2f} to {best[0]:.2f}.")
+        if tg.named:
+            best = max(((tg.run({"kind": "setback", "pos": tg.t, "token": s, "parts": ps})["p"], g) for g, ps in tg.named.items()),
+                       key=lambda z: z[0])
+            out.append(f"After the swap to {s!r}, setting {best[1]} back to its values on the original text brings p({y!r}) "
+                       f"from {o['p']:.2f} to {best[0]:.2f}.")
+        else:
+            best = max(((tg.run({"kind": "setback", "pos": tg.t, "token": s, "parts": [list(x)]})["p"], x) for _, x in rem[:8]),
+                       key=lambda z: z[0])
+            out.append(f"After the swap to {s!r}, setting {label(*best[1])} back to its value on the original text brings p({y!r}) "
+                       f"from {o['p']:.2f} to {best[0]:.2f}.")
     return " ".join(out)
 
 
@@ -412,6 +456,13 @@ def questions(tg, circuit: list, seed: int = 0, pool: int = 3) -> list[dict]:
                       + [{"kind": "remove", "parts": rng.sample(parts, g2)} for _ in range(pool * 3)],
             "setback": [{"kind": "setback", "pos": t, "token": s, "parts": [rng.choice(at_t)]} for s in tg.fresh(t, pool * 4, rng)],
             "scale": [{"kind": "scale", "parts": rng.sample(parts, g1), "by": rng.choice([0.5, 2.0, 3.0])} for _ in range(pool * 3)]}
+    if tg.named:  # whole groups: each alone, pairs, scalings, set-backs of the groups at the last position
+        G = list(tg.named)
+        gt = [g for g in G if any(p == t for _, p, _ in tg.named[g])] or G
+        pick = lambda gs: {"group": gs if len(gs) > 1 else gs[0], "parts": [x for g in gs for x in tg.named[g]]}  # noqa: E731
+        draw["remove"] = [{"kind": "remove", **pick([g])} for g in G] + [{"kind": "remove", **pick(rng.sample(G, 2))} for _ in range(pool * 3)]
+        draw["scale"] = [{"kind": "scale", "by": rng.choice([0.5, 2.0, 3.0]), **pick([g])} for g in rng.sample(G, min(len(G), pool * 3))]
+        draw["setback"] = [{"kind": "setback", "pos": t, "token": s, **pick([rng.choice(gt)])} for s in tg.fresh(t, pool * 4, rng)]
     ivs = []
     for kind, cands in draw.items():
         for iv in cands:
@@ -506,7 +557,7 @@ INV: swap @<where> with any of ['<token>', '<token>', ...] -> <outcome>
 INV: remove <part>[, <part> ...] -> <outcome>
 INV: scale <part> by <factor> -> <outcome>
 INV: swap @<where> with any of ['<token>', ...] and set back <part>[, <part> ...] -> <outcome>
-where <where> is a position, written as its number or as the token there quoted (for example @' creation', the last position holding that token), <part> is written L<layer>.<kind>#<index>@<where>, and <outcome> is one of: top '<token>' | top not '<token>' | p > <number> | p < <number>, p being the probability the model gives {answer!r}. List at least five tokens in each "any of" set (each a single token, quoted exactly, with its leading space if any). Nothing else."""
+where <where> is a position, written as its number or as the token there quoted (for example @' creation', the last position holding that token), <part> is written L<layer>.<kind>#<index>@<where> or is a group's name (G<k>), and <outcome> is one of: top '<token>' | top not '<token>' | p > <number> | p < <number>, p being the probability the model gives {answer!r}. List at least five tokens in each "any of" set (each a single token, quoted exactly, with its leading space if any). Nothing else."""
 
 
 def parse_inv(line: str, tg: VPDTarget) -> tuple[list[dict], tuple] | None:
@@ -527,7 +578,14 @@ def parse_inv(line: str, tg: VPDTarget) -> tuple[list[dict], tuple] | None:
         outcome = (mo.group(3), float(mo.group(4)))
 
     def parts_of(s):
-        ps = [site_of(x, tg.where) for x in re.split(r",\s*(?=L\d)", s.strip())]
+        ps = []
+        for x in re.split(r",\s*(?=[LG]\d)", s.strip()):
+            if re.fullmatch(r"G\d+", x.strip()):
+                if x.strip() not in tg.named:
+                    return None
+                ps += [tuple(y) for y in tg.named[x.strip()]]
+            else:
+                ps.append(site_of(x, tg.where))
         return None if not ps or any(p is None or not tg.valid(p) for p in ps) else [list(p) for p in ps]
 
     ms = re.fullmatch(r"swap\s+@(\d+|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s+with any of\s+\[(.*)\](?:\s+and set back\s+(.+))?", body)
@@ -580,7 +638,9 @@ def target_of(a):
         ids = json.loads((TEXTS / f"{a.task}.json").read_text())["prompts"][0]["token_ids"]
         text = mech.tokenizer("vpd4l").decode(ids).replace("<|endoftext|>", "")
         tg = HFTarget(a.model, text, a.device)
-        return tg, tg.parts(256)
+        parts = tg.parts(256)
+        tg.make_groups(parts)
+        return tg, parts
     tg = VPDTarget(a.task, a.device)
     circ = json.loads(a.circuit.read_text())
     return tg, [(n, int(p), int(c)) for n, c, p in circ["nodes"] if n.startswith("h.")]

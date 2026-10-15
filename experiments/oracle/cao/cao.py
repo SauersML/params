@@ -242,6 +242,23 @@ class Probe:
         return torch.stack(out)
 
 
+def strong_neurons(o: Oracle, ids: list[int], k: int) -> list:
+    """The k neurons (layers from a quarter of the depth on) of largest write norm at the last position."""
+    torch = o.torch
+    acts, handles = {}, []
+    for l in range(len(o.layers) // 4, len(o.layers)):
+        handles.append(o.layers[l].mlp.down_proj.register_forward_pre_hook(lambda _m, a, l=l: acts.__setitem__(l, a[0][0, -1].float())))
+    try:
+        with o.off(), torch.no_grad():
+            o.m(input_ids=torch.tensor([ids], device=o.dev))
+    finally:
+        for h in handles:
+            h.remove()
+    scored = [(float(v), l, n) for l, a in acts.items()
+              for v, n in zip(*(a.abs() * o.layers[l].mlp.down_proj.weight.float().norm(dim=0)).topk(k))]
+    return [("neuron", l, int(n)) for _, l, n in sorted(scored, reverse=True)[:k]]
+
+
 def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bool) -> list[dict]:
     """One text's examples (module docstring)."""
     torch, tok = o.torch, o.tok
@@ -280,21 +297,30 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bo
                     "q": f"Which matters more for the model's next token: {q_tok(word(p1))} or {q_tok(word(p2))}?",
                     "a": q_tok(word(hi)) if eff[hi] >= CLEAR * eff[lo] else NONE})
     lp = pr.m.dist_at(ids)
-    for p in rng.sample(range(T - 26, T - 2), SWAPS_PER_TEXT):
+    tried = []  # 24 swaps tried, up to half of SWAPS_PER_TEXT kept from those that change the top token (most do not)
+    for p in rng.sample(range(T - 26, T - 2), 24):
         pr_ = lp[p - 1].exp().clone()
         pr_[ids[p]] = 0
         y = int(torch.multinomial(pr_ / pr_.sum(), 1).item())
         x = list(ids)
         x[p] = y
-        new = int(pr.m.logp([x])[0].argmax())
+        tried.append((p, y, int(pr.m.logp([x])[0].argmax())))
+    ch = [t for t in tried if t[2] != top]
+    keep = ch[:SWAPS_PER_TEXT // 2]
+    keep += [t for t in tried if t[2] == top][:SWAPS_PER_TEXT - len(keep)]
+    for p, y, new in keep:
         out.append({"cat": "swap", "ctx": ids, "blocks": [rb()],
                     "q": f"If the token {q_tok(word(p))} at position {p} were replaced by {q_tok(tok.decode([y]))}, would the "
                          f"model's next token change? If so, to what?",
                     "a": "No." if new == top else f"Yes, to {q_tok(tok.decode([new]))}."})
     nl, nh = len(o.layers), o.lm.config.num_attention_heads
-    units = [("neuron", rng.randrange(nl // 4, nl), rng.randrange(o.lm.config.intermediate_size)) for _ in range(EDITS_PER_TEXT)]
-    for u, lq in zip(units, pr.zeroed(ids, units)):
-        new = int(lq.argmax())
+    cand = strong_neurons(o, ids, 6) + [("neuron", rng.randrange(nl // 4, nl), rng.randrange(o.lm.config.intermediate_size)) for _ in range(2)]
+    zl = pr.zeroed(ids, cand)  # neurons of largest write at the last position and two random ones; the changed ones first
+    res = [(u, int(lq.argmax())) for u, lq in zip(cand, zl)]
+    units = [u for u, n in res if n != top][:EDITS_PER_TEXT // 2 + 1]
+    units += [u for u, n in res if n == top][:EDITS_PER_TEXT - len(units)]
+    for u in units:
+        new = dict(res)[u]
         out.append({"cat": "edit", "ctx": ids, "blocks": [rb(), {"label": "Unit A", "unit": list(u)}],
                     "q": "If unit A were removed (its output set to zero at every position), what would the model's next token "
                          "be? Answer unchanged or the token.",

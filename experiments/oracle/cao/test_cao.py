@@ -28,6 +28,7 @@ def tiny():
     base = Qwen3ForCausalLM(cfg)
     o = cao.Oracle.__new__(cao.Oracle)
     o.torch, o.dev, o.tok, o.text_only = torch, torch.device("cpu"), tok, False
+    o.vec_store, o._vcache = {}, {}
     o.m = get_peft_model(base, LoraConfig(r=4, target_modules=["q_proj", "v_proj"]))
     o.lm = o.m.base_model.model
     o.layers = o.lm.model.layers
@@ -119,3 +120,13 @@ def test_a_training_step_with_checkpointing_keeps_the_hook_for_recomputation(tin
         tiny.lm.gradient_checkpointing_disable()
         tiny.m.eval()
         tiny.m.zero_grad(set_to_none=True)
+
+
+def test_batched_options_equal_one_at_a_time(tiny):
+    """options_logp of a batch (right-padded, every row its own vectors) equals each example scored alone."""
+    e1, e2 = ex(tiny), ex(tiny, n=3)
+    e2 = {**e2, "q": "Which of two? A short one."}
+    both = tiny.options_logp([e1, e2], [["'a'", "'bb'"], ["'c'", "'dd'", "'e'"]])
+    alone = [tiny.option_logp(e1, ["'a'", "'bb'"]), tiny.option_logp(e2, ["'c'", "'dd'", "'e'"])]
+    for b, a_ in zip(both, alone):
+        assert all(abs(x - y) < 1e-3 * (1 + abs(y)) for x, y in zip(b, a_)), (b, a_)

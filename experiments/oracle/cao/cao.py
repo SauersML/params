@@ -77,7 +77,7 @@ class Oracle:
         assert len(q) == 1, q
         self.q = q[0]
         self.text_only = False
-        self.vec_store = {}
+        self.vec_store, self._vcache = {}, {}
 
     def off(self, target: str | None = None):
         """The target model: every adapter off, or the organism's adapter target (loaded by use_target) in place of
@@ -132,6 +132,18 @@ class Oracle:
         torch = self.torch
         if "vec" in ex:
             return self.vec_store[ex["vec"]].to(self.dev)
+        key = (tuple(ex["ctx"]), json.dumps(ex["blocks"]), ex.get("target"))  # (an eval text's questions share it)
+        if key in self._vcache:
+            return self._vcache[key]
+        v = self._vectors(ex)
+        if not self.m.training:
+            self._vcache[key] = v
+            while len(self._vcache) > 32:
+                self._vcache.pop(next(iter(self._vcache)))
+        return v
+
+    def _vectors(self, ex: dict):
+        torch = self.torch
         with self.off(ex.get("target")), torch.no_grad():
             out = self.m(input_ids=torch.tensor([ex["ctx"]], device=self.dev), output_hidden_states=True)
         H = out.hidden_states
@@ -190,35 +202,62 @@ class Oracle:
             h.remove()
         return tot / max(n, 1) if reduce else (tot, n)
 
-    def answer(self, ex: dict) -> str:
+    def answers(self, exs: list[dict]) -> list[str]:
+        """Greedy answers to a batch of examples (left-padded, each row's vectors at its own placeholders)."""
         torch = self.torch
-        ids, pos, _ = self.encode(ex, False)
-        h = self.hook([self.vectors(ex)], [pos])
+        enc = [self.encode(e, False) for e in exs]
+        vecs = [self.vectors(e) for e in exs]
+        L = max(len(i) for i, _, _ in enc)
+        pad = self.tok.pad_token_id or self.tok.eos_token_id
+        ids = torch.full((len(exs), L), pad, device=self.dev)
+        att = torch.zeros((len(exs), L), dtype=torch.long, device=self.dev)
+        pos = []
+        for b, (i, p, _) in enumerate(enc):
+            ids[b, L - len(i):] = torch.tensor(i, device=self.dev)
+            att[b, L - len(i):] = 1
+            pos.append([x + L - len(i) for x in p])
+        h = self.hook(vecs, pos)
         try:
             with torch.no_grad():
-                g = self.m.generate(input_ids=torch.tensor([ids], device=self.dev), max_new_tokens=MAX_NEW, do_sample=False,
-                                    temperature=None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)[0]
+                g = self.m.generate(input_ids=ids, attention_mask=att, max_new_tokens=MAX_NEW, do_sample=False,
+                                    temperature=None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)
         finally:
             h.remove()
-        return self.tok.decode(g[len(ids):], skip_special_tokens=True).strip()
+        return [self.tok.decode(x[L:], skip_special_tokens=True).strip() for x in g]
+
+    def answer(self, ex: dict) -> str:
+        return self.answers([ex])[0]
+
+    def options_logp(self, exs: list[dict], options: list[list[str]]) -> list[list[float]]:
+        """Per example, log p of each of its options as the whole answer (its tokens up to the end of turn), every
+        (example, option) pair in one right-padded batch."""
+        torch = self.torch
+        pairs = [({**e, "a": o}, b) for b, (e, opts) in enumerate(zip(exs, options)) for o in opts]
+        enc = [self.encode(e, True) for e, _ in pairs]
+        vec_of = [self.vectors(e) for e in exs]
+        L = max(len(i) for i, _, _ in enc)
+        pad = self.tok.pad_token_id or self.tok.eos_token_id
+        ids = torch.full((len(enc), L), pad, device=self.dev)
+        att = torch.zeros((len(enc), L), dtype=torch.long, device=self.dev)
+        for r, (i, _, _) in enumerate(enc):
+            ids[r, :len(i)] = torch.tensor(i, device=self.dev)
+            att[r, :len(i)] = 1
+        h = self.hook([vec_of[b] for _, b in pairs], [p for _, p, _ in enc])
+        try:
+            with torch.no_grad():
+                lp = torch.log_softmax(self.m(input_ids=ids, attention_mask=att).logits.float(), -1)
+        finally:
+            h.remove()
+        flat = [float(sum(lp[r, t - 1, i[t]] for t in range(a0, len(i) - 2))) for r, (i, _, a0) in enumerate(enc)]
+        out, k = [], 0
+        for opts in options:
+            out.append(flat[k:k + len(opts)])
+            k += len(opts)
+        return out
 
     def option_logp(self, ex: dict, options: list[str]) -> list[float]:
         """log p of each option as the whole answer (calibrated choice among options)."""
-        torch = self.torch
-        out = []
-        for o in options:
-            e = {**ex, "a": o}
-            ids, pos, a0 = self.encode(e, True)
-            h = self.hook([self.vectors(e)], [pos])
-            try:
-                with torch.no_grad():
-                    lp = torch.log_softmax(self.m(input_ids=torch.tensor([ids], device=self.dev)).logits[0].float(), -1)
-            finally:
-                h.remove()
-            # the answer's tokens up to (not including) the end-of-turn
-            span = range(a0, len(ids) - 2)
-            out.append(float(sum(lp[t - 1, ids[t]] for t in span)))
-        return out
+        return self.options_logp([ex], [options])[0]
 
 
 def unit_write(o: Oracle, ctx: list[int], unit) -> "torch.Tensor":
@@ -510,22 +549,24 @@ def eval_items(a) -> None:
                 pick = int(lp[1] > lp[0])
                 rec["answers"].append({"q": "fact", "ok": pick == it["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
             else:
-                got = o.answer({"ctx": vids, "blocks": blocks,
-                                "q": "Which earlier token is the model's next-token prediction most dependent on? Answer with the token."})
-                rec["answers"].append({"q": "a", "ok": h2h.norm(got) == h2h.norm(word(it["a"]["gt"])), "answer": got, "conf": None})
-                for sw in it["b"]:
-                    got = o.answer({"ctx": vids, "blocks": blocks,
-                                    "q": f"If the token {q_tok(word(sw['p']))} at position {sw['p']} were replaced by "
-                                         f"{q_tok(o.tok.decode([sw['y']]))}, would the model's next token change? If so, to what?"})
-                    said_no = h2h.norm(got).startswith("no")
-                    quoted = re.search(r"'(.*)'", got)  # the trained answer form: Yes, to ' token'.
+                qs = ["Which earlier token is the model's next-token prediction most dependent on? Answer with the token."]
+                qs += [f"If the token {q_tok(word(sw['p']))} at position {sw['p']} were replaced by {q_tok(o.tok.decode([sw['y']]))}, "
+                       f"would the model's next token change? If so, to what?" for sw in it["b"]]
+                got = o.answers([{"ctx": vids, "blocks": blocks, "q": q} for q in qs])  # one batch per text
+                rec["answers"].append({"q": "a", "ok": h2h.norm(got[0]) == h2h.norm(word(it["a"]["gt"])), "answer": got[0], "conf": None})
+                for sw, g in zip(it["b"], got[1:]):
+                    said_no = h2h.norm(g).startswith("no")
+                    quoted = re.search(r"'(.*)'", g)  # the trained answer form: Yes, to ' token'.
                     new = quoted.group(1) if quoted and not said_no else ""
                     ok = (not sw["changes"] and said_no) or (sw["changes"] and not said_no and h2h.norm(new) == h2h.norm(o.tok.decode([sw["new_top"]])))
-                    rec["answers"].append({"q": "b", "ok": ok, "answer": got, "conf": None})
+                    rec["answers"].append({"q": "b", "ok": ok, "answer": g, "conf": None})
+                exs, opts = [], []
                 for c in it["c"]:
                     p1, p2 = c["pair"]
-                    opts = [q_tok(word(p1)), q_tok(word(p2))]
-                    lp = o.option_logp({"ctx": vids, "blocks": blocks, "q": f"Which matters more for the model's next token: {opts[0]} or {opts[1]}?"}, opts)
+                    op = [q_tok(word(p1)), q_tok(word(p2))]
+                    exs.append({"ctx": vids, "blocks": blocks, "q": f"Which matters more for the model's next token: {op[0]} or {op[1]}?"})
+                    opts.append(op)
+                for c, lp in zip(it["c"], o.options_logp(exs, opts) if exs else []):
                     pick = c["pair"][int(lp[1] > lp[0])]
                     rec["answers"].append({"q": "c", "ok": pick == c["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
             fh.write(json.dumps(rec) + "\n")

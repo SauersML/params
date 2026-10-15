@@ -646,3 +646,54 @@ def test_grouped_units(tiny_hf):
     empty = hu.kl([tuple(x[0] * 0 for x in hu.ones())])[0]
     rec = native_units.build_hf(model, ids, 9, kl_target=empty * 0.05, means=means, groups=groups, effects=2)
     assert rec["kl"] <= rec["kl_target"] and {u[0] for u in rec["units"]} <= {"head", "group"} and rec["of"] == 2 * hu.T * (4 + 5)
+
+
+@pytest.mark.parametrize('nscore', [0.0, None, .9])
+def test_shared_gate_necessity_first_reuses_result(monkeypatch, nscore):
+    import types
+    mu=AdmissionCase();tx=types.SimpleNamespace(ids=[0],targets=[0],seed=0)
+    floors={'point':.6,'N':.9};observed=[]
+    ge=types.SimpleNamespace(nat=object(),vpd_floors=lambda *a:{'families':list(floors),'floors':floors})
+    monkeypatch.setattr(native_units,'MeanUnits',lambda *a:mu)
+    monkeypatch.setattr(native_units,'kl_goal',lambda *a,**kw:.25)
+    nr={'n_spec':nscore,'_raw_n_spec':nscore,'d_target':4.,'d_control':1.,
+        'd_target_vpd':5.,'d_control_vpd':2.,'draws_n_spec':[[0,1.,2.,4.,5.],[1,1.,2.,4.,5.]]}
+    class Phi:
+        def __init__(self,*a,**kw):pass
+        def necessity(self,masks):observed.append('N');return [nr]
+        def rows(self,masks,*,necessity_rows=None):
+            observed.append('rest');assert necessity_rows[0] is nr
+            return {'s_point_c':.8,'n_spec':nscore,'kl_point':.01},
+    monkeypatch.setattr(native_units,'NativePhi',Phi)
+    def build(mu,seed,goal,**kw):
+        result=kw['admit']((torch.ones(1,1,1),torch.ones(1,1,7)))
+        expected=nscore is not None and nscore>=.9
+        assert result['passed']==expected
+        assert observed==(['N','rest'] if expected else ['N'])
+        assert result['necessity']['numerator']==result['necessity']['denominator']==3.
+        assert result['necessity']['controls']==2
+        if not expected:
+            assert result['rejection_reason']=='N' and result['skipped_families']==['point']
+        raise native_units.NoAdmittedCandidate({'admission':result})
+    monkeypatch.setattr(native_units,'build_units',build)
+    with pytest.raises(native_units.NoAdmittedCandidate):
+        native_units.build_native(ge,tx,means={},shared_floors=True)
+
+
+def test_native_rows_precomputed_necessity_exact_equivalence(monkeypatch):
+    ph=object.__new__(native_units.NativePhi)
+    S=native_units.Mask(torch.ones(1,1,1,dtype=torch.bool),torch.ones(1,1,1,dtype=torch.bool))
+    nr={'n_spec':.9,'_raw_n_spec':.9,'draws_n_spec':[[0,1.,1.,3.,3.],[1,1.,1.,3.,3.]]}
+    seen=[]
+    monkeypatch.setattr(ph,'necessity',lambda sets:(seen.append('N') or [nr]))
+    monkeypatch.setattr(ph,'point',lambda sets:[{'s_point_c':.9,'_raw_point':.9}])
+    monkeypatch.setattr(ph,'track_pp',lambda sets:[{'s_track_pp':.9,'_raw_track_pp':.9}])
+    monkeypatch.setattr(ph,'patching',lambda sets:[{'s_patching_near':.9,'s_patching_far':.9,'_raw_patching_near':.9,'_raw_patching_far':.9}])
+    monkeypatch.setattr(ph,'nodes',lambda S:{'s_nodes':.9,'_raw_nodes':.9})
+    monkeypatch.setattr(ph,'interchange_pp',lambda S:{'s_interchange_pp':.9,'_raw_interchange_pp':.9})
+    monkeypatch.setattr(ph,'pattern',lambda S:{'s_pattern':.9,'_raw_pattern':.9})
+    monkeypatch.setattr(ph,'empty',lambda:5.)
+    expected=ph.rows([S]);assert seen==['N'];seen.clear()
+    actual=ph.rows([S],necessity_rows=[nr]);assert seen==[] and actual==expected
+    assert nr['_raw_n_spec']==.9  # merging rows must not consume the cached record
+    with pytest.raises(ValueError):ph.rows([S],necessity_rows=[])

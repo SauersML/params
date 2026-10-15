@@ -813,11 +813,38 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
             heads = torch.zeros(mu.L, len(tx.ids), mu.H, dtype=torch.bool, device=mu.dev)
             neurons = torch.zeros(mu.L, len(tx.ids), mu.Dm, dtype=torch.bool, device=mu.dev)
             heads[:, :mu.T], neurons[:, :mu.T] = live[0].bool(), live[1].bool()
-            row = nphi.rows([Mask(heads, neurons)])[0]
+            mask = Mask(heads, neurons)
+            necessity_rows = None
+            necessity_diagnostic = None
+            if "N" in families:
+                necessity_rows = nphi.necessity([mask])
+                nr = necessity_rows[0]
+                draws = nr.get("draws_n_spec") or []
+                dt = nr.get("d_target")
+                dc = nr.get("d_control")
+                vt = nr.get("d_target_vpd")
+                vc = nr.get("d_control_vpd")
+                necessity_diagnostic = {
+                    "d_target": dt, "d_control": dc,
+                    "d_target_vpd": vt, "d_control_vpd": vc,
+                    "numerator": dt - dc if dt is not None and dc is not None else None,
+                    "denominator": vt - vc if vt is not None and vc is not None else None,
+                    "controls": len(draws), "draws_n_spec": draws,
+                    "raw_score": nr.get("_raw_n_spec"),
+                }
+                nscore = goal_eval.family_score(nr, "N")
+                if nscore is None or not math.isfinite(nscore) or nscore < floors["N"]:
+                    return {"passed": False, "scores": {"N": nscore}, "floors": floors,
+                            "split": "search", "point_KL_bits": None,
+                            "rejection_reason": "N", "skipped_families": [f for f in families if f != "N"],
+                            "necessity": necessity_diagnostic}
+            row = (nphi.rows([mask], necessity_rows=necessity_rows) if necessity_rows is not None
+                   else nphi.rows([mask]))[0]
             scores = {f: goal_eval.family_score(row, f) for f in families}
             passed = all(scores[f] is not None and math.isfinite(scores[f]) and scores[f] >= floors[f] for f in families)
             return {"passed": passed, "scores": scores, "floors": floors, "split": "search",
-                    "point_KL_bits": row.get("kl_point")}
+                    "point_KL_bits": row.get("kl_point"), "necessity": necessity_diagnostic,
+                    "rejection_reason": None if passed else "shared_family_floors"}
 
     if kl_target is not None:
         goal = kl_target
@@ -1587,7 +1614,8 @@ class NativePhi:
                 "kl_pattern_vpd": v_, "reads_pattern": len(reads), "draws_pattern": [list(x) for x in zip(kc, kv)]}
 
     def necessity(self, sets: list[Mask]) -> list[dict]:
-        """N (necessity_spec's form): the circuit's units removed (output 0) from the real model, its damage at the
+        """N (necessity_spec's form): the circuit's units replaced by their fixed background (means when supplied,
+        otherwise output 0) in the real model, its damage at the
         targets less its mean damage on necessity_spec's control texts (end-aligned), over VPD's whole answer's
         (necessity_spec's numbers, the same controls)."""
         tx, ge = self.tx, self.ge
@@ -1618,9 +1646,12 @@ class NativePhi:
                         "d_target_vpd": vrow["d_target_vpd"], "d_control_vpd": vrow["d_control_vpd"]})
         return out
 
-    def rows(self, sets: list[Mask]) -> list[dict]:
-        """Every shared family per circuit, with rl_terms (phi's unfloored scores), eps and phi over SHARED."""
-        pt, tp, pa, ns = self.point(sets), self.track_pp(sets), self.patching(sets), self.necessity(sets)
+    def rows(self, sets: list[Mask], *, necessity_rows: list[dict] | None = None) -> list[dict]:
+        """Every shared family; necessity_rows reuses this call's already measured N without another execution."""
+        if necessity_rows is not None and len(necessity_rows) != len(sets):
+            raise ValueError("one precomputed necessity row per mask required")
+        pt, tp, pa = self.point(sets), self.track_pp(sets), self.patching(sets)
+        ns = self.necessity(sets) if necessity_rows is None else necessity_rows
         out = []
         for i, S in enumerate(sets):
             row = {"units": S.count(), "positions": len({u[2] for u in S.units()}), **pt[i], **tp[i], **pa[i], **ns[i],

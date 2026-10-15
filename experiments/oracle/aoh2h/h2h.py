@@ -531,7 +531,7 @@ def counterfactual(tg, m: Model, it: dict, z: int, positions: list[int]) -> list
 def edit_B(tg, m: Model, it: dict, z: int) -> tuple[list, dict]:
     """Steering from a counterfactual: the swap (at the 8 latest candidates and the oracle's pick) that makes z the
     top token, the residual difference at the last position at half depth, added everywhere at the smallest of ALPHAS
-    that makes z the top token on the text."""
+    that makes z the top token on the text; no edit when none does."""
     ids = it["ids"]
     with tg.use(None):
         H, _ = tg.hidden(ids)
@@ -550,7 +550,8 @@ def edit_B(tg, m: Model, it: dict, z: int) -> tuple[list, dict]:
             lp = m.logp([ids])
         if int(lp[0].argmax()) == z:
             return hooks, {"alpha": alpha, "layer": L}
-    return hooks, {"alpha": ALPHAS[-1], "layer": L, "reached": False}
+    return [], {"alpha": None, "layer": L, "reached": False}  # no alpha reached z: no edit (an edit that fails still
+    # costs collateral: on the gate's first run the failed edits' alpha 4 averaged 2.9 bits/token)
 
 
 def edits(a) -> None:
@@ -658,7 +659,7 @@ def plot(a) -> None:
 
     recs = [r for r in with_fallback([json.loads(x) for x in a.out.read_text().splitlines()]) if r["split"] == "test"]
     kinds = [("a", "(a) most important earlier token"), ("b", "(b) swap effects"), ("c", "(c) which of two positions"),
-             ("fact", "(c) which of two statements")]
+             ("fact", "(c) which of two statements, facts")]
     plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
     for xkey, xlabel, fname in (("passes", "model passes per text", a.plot), ("seconds", "seconds per text",
                                                                               a.plot.with_name(a.plot.stem + "_seconds.png"))):
@@ -682,16 +683,18 @@ def plot(a) -> None:
                 if line:
                     ax.plot([x for x, _ in line], [y for _, y in line], "-o", color=color, lw=2.5, ms=8)
                     ax.annotate("oracle + interventions" if fam == "B" else "oracle + circuit + interventions", line[-1],
-                                textcoords="offset points", xytext=(-10, 10), ha="right", color=color, fontsize=13)
+                                textcoords="offset points", xytext=(-6, -22 if line[-1][1] > 0.85 else 10), ha="right",
+                                color=color, fontsize=13)
             if "A" in acc:
                 xa = max(acc["A"][1 if xkey == "passes" else 2], 1)
                 ax.plot([xa], [acc["A"][0]], "s", color="#2ca02c", ms=10)
                 ax.annotate("oracle alone", (xa, acc["A"][0]), textcoords="offset points", xytext=(8, -4), color="#2ca02c", fontsize=13)
+            ax.set_xscale("log")
+            ax.set_xlim(0.7, 400 if xkey == "passes" else None)
             if "R" in acc:
                 ax.axhline(acc["R"][0], ls="--", color="gray", lw=1.5)
-                ax.annotate("recency", (ax.get_xlim()[0] if ax.lines else 1, acc["R"][0]), textcoords="offset points",
-                            xytext=(4, 4), color="gray", fontsize=12)
-            ax.set_xscale("log")
+                ax.annotate("recency", (ax.get_xlim()[1], acc["R"][0]), textcoords="offset points", xytext=(-4, -16),
+                            ha="right", color="gray", fontsize=12)
             ax.set_ylim(0, 1.02)
             ax.set_title(title)
             ax.set_xlabel(xlabel)

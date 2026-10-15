@@ -188,6 +188,102 @@ def build(a) -> None:
           f"{sum(k == 'minimal' for k, _, _ in pairs)} minimal and {sum(k == 'matched' for k, _, _ in pairs)} matched pairs to {a.out}")
 
 
+DEMONYM = {"Ireland": "Irish", "Japan": "Japanese", "Mexico": "Mexican", "Italy": "Italian", "India": "Indian",
+           "Brazil": "Brazilian", "Germany": "German", "Canada": "Canadian", "Australia": "Australian", "France": "French"}
+QUESTION = "Which country is the user from? Answer with the country, or say no clear answer."
+AO_QUESTION = "Answer with a single word only. Which country is the user from?"
+
+
+def score(a) -> None:
+    """Each system's answer to every paired item, as a distribution over the ten countries (the rest of the mass on not
+    answering): the causal oracle (cao.Oracle, --adapter; its options "<Country>." and cao.NONE scored whole), the same
+    oracle text-only (no vector added), and the released Activation Oracle (ao_verify.Target: K sampled single-word
+    answers, a country's share of them). Each reads layer 14 at every position of the user's chat turn; the probe is
+    never read. One record per (item, system)."""
+    import sys as _s
+
+    _s.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    _s.path.insert(0, str(Path(__file__).resolve().parent))
+    import cao
+
+    items = [json.loads(x) for x in a.items.read_text().splitlines()]
+    names = list(CUES)
+    out = a.out.open("w")
+    o = cao.Oracle(a.adapter, a.device)
+    for text_only in (False, True):
+        o.text_only = text_only
+        for it in items:
+            ids = o.tok.apply_chat_template([{"role": "user", "content": it["text"]}], tokenize=True, add_generation_prompt=True,
+                                            enable_thinking=False, return_dict=False)
+            ex = {"ctx": ids, "blocks": [{"layer": 14, "positions": list(range(len(ids)))}], "q": QUESTION}
+            lp = o.option_logp(ex, [f"{c}." for c in names] + [cao.NONE])
+            m_ = max(lp)
+            pr = [math.exp(x - m_) for x in lp]
+            z = sum(pr)
+            out.write(json.dumps({"pair": it["pair"], "pair_kind": it["pair_kind"], "family": it["family"], "label": it["label"],
+                                  "country": it["country"], "system": "oracle text-only" if text_only else "oracle",
+                                  "p": {c: pr[k] / z for k, c in enumerate(names)}, "p_none": pr[-1] / z}) + "\n")
+    del o
+    import ao_verify
+
+    tg = ao_verify.Target(cao.MODEL, a.device)
+    for it in items:
+        ids = tg.tok.apply_chat_template([{"role": "user", "content": it["text"]}], tokenize=True, add_generation_prompt=True,
+                                         enable_thinking=False, return_dict=False)
+        with tg.use(None):
+            H, _ = tg.hidden(ids)
+        got = tg.inject(AO_QUESTION, H[tg.act_layer + 1], 8, True, adapter_ao=True)
+        votes = {c: sum(c.lower() in g.lower() or DEMONYM[c].lower() in g.lower() for g in got) / len(got) for c in names}
+        out.write(json.dumps({"pair": it["pair"], "pair_kind": it["pair_kind"], "family": it["family"], "label": it["label"],
+                              "country": it["country"], "system": "AO", "p": votes, "answers": got}) + "\n")
+    out.close()
+    print(f"scored {len(items)} items to {a.out}")
+
+
+def curves(a) -> None:
+    """Hit rate on inferred items against false attribution on not-inferred items, per system and family, as each
+    system's confidence threshold t moves: a system answers its most probable country when that probability is at
+    least t, else abstains; a hit is the true country on an inferred item; a false attribution is any country named on a
+    not-inferred item. One panel per system, a line per family (minimal pairs apart)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = [json.loads(x) for x in a.out.read_text().splitlines()]
+    systems = list(dict.fromkeys(r["system"] for r in rows))
+    plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
+    fig, axes = plt.subplots(1, len(systems), figsize=(6.5 * len(systems), 5.6), facecolor="white", squeeze=False)
+    groups = [("minimal pairs", lambda r: r["pair_kind"] == "minimal"),
+              ("matched: combinable", lambda r: r["pair_kind"] == "matched" and r["family"] == "combinable"),
+              ("matched: distractor", lambda r: r["pair_kind"] == "matched" and r["family"] == "distractor")]
+    colors = ["#d62728", "#1f77b4", "#2ca02c"]
+    for ax, sname in zip(axes[0], systems):
+        for (gname, sel), col in zip(groups, colors):
+            rs = [r for r in rows if r["system"] == sname and sel(r)]
+            pos = [r for r in rs if r["label"] == "inferred"]
+            neg = [r for r in rs if r["label"] == "not_inferred"]
+            if not pos or not neg:
+                continue
+            pts = []
+            for t in [x / 50 for x in range(51)]:
+                hit = sum(max(r["p"], key=r["p"].get) == r["country"] and max(r["p"].values()) >= t for r in pos) / len(pos)
+                fa = sum(max(r["p"].values()) >= t for r in neg) / len(neg)
+                pts.append((fa, hit))
+            ax.plot([x for x, _ in pts], [y for _, y in pts], "-", color=col, lw=2.5)
+            ax.annotate(f"{gname} ({len(pos)})", pts[len(pts) // 2], textcoords="offset points", xytext=(6, -14), color=col, fontsize=12)
+            print(sname, gname, "at t=0.5: hit", pts[25][1], "false attribution", pts[25][0])
+        ax.plot([0, 1], [0, 1], ":", color="gray", lw=1)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.02)
+        ax.set_title(sname)
+        ax.set_xlabel("false attribution (model never inferred)")
+    axes[0][0].set_ylabel("hit rate (model inferred)")
+    fig.tight_layout()
+    fig.savefig(a.plot, dpi=130, facecolor="white")
+    print("wrote", a.plot)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -196,8 +292,16 @@ def main():
     b.add_argument("--per", type=int, default=150)
     b.add_argument("--seed", type=int, default=0)
     b.add_argument("--device")
+    s_ = sub.add_parser("score")
+    s_.add_argument("--items", type=Path, required=True)
+    s_.add_argument("--adapter", required=True, help="the causal oracle's adapter")
+    s_.add_argument("--out", type=Path, required=True)
+    s_.add_argument("--device")
+    c_ = sub.add_parser("curves")
+    c_.add_argument("out", type=Path)
+    c_.add_argument("--plot", type=Path, required=True)
     a = ap.parse_args()
-    {"build": build}[a.cmd](a)
+    {"build": build, "score": score, "curves": curves}[a.cmd](a)
 
 
 if __name__ == "__main__":

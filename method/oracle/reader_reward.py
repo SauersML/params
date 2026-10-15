@@ -422,10 +422,7 @@ def facts(tg, parts: list, seed: int = 99) -> str:
         out.append("Replacing it by " + ", ".join(f"{s!r} (top {o['top']!r}, p {o['p']:.2f})" for s, o in move[:6]) + " moves the prediction.")
         s, o = move[0]
         if tg.named:
-            best = max(((tg.run({"kind": "setback", "pos": tg.t, "token": s, "parts": ps})["p"], g) for g, ps in tg.named.items()),
-                       key=lambda z: z[0])
-            out.append(f"After the swap to {s!r}, setting {best[1]} back to its values on the original text brings p({y!r}) "
-                       f"from {o['p']:.2f} to {best[0]:.2f}.")
+            pass  # groups' set-backs are held-out questions (group_questions): the facts state none of them
         else:
             best = max(((tg.run({"kind": "setback", "pos": tg.t, "token": s, "parts": [list(x)]})["p"], x) for _, x in rem[:8]),
                        key=lambda z: z[0])
@@ -699,10 +696,12 @@ def target_of(a):
     return tg, [(n, int(p), int(c)) for n, c, p in circ["nodes"] if n.startswith("h.")]
 
 
-def group_questions(tg, seed: int = 0) -> list[dict]:
+def group_questions(tg, seed: int = 0, pairs: int = 10) -> list[dict]:
     """Questions whose answers depend on which group is which (the lead's 10-14 acceptance test: an explanation with
     the groups' names rotated must fall to chance): per named group, its removal, its scaling by 0.5 and by 2, and
-    its set-back after one swap at the last position that moves the model (the same swap for every group)."""
+    its set-back after one swap at the last position that moves the model (the same swap for every group); then up to
+    pairs pairs of groups removed together. Every question but a single group's removal is marked held_out: an
+    explanation that lists each group's removal states those answers, and states none of the others."""
     rng = random.Random(seed)
     t = tg.t
     outs = [(s, tg.run({"kind": "swap", "pos": t, "token": s})) for s in tg.fresh(t, 32, rng)]
@@ -715,10 +714,15 @@ def group_questions(tg, seed: int = 0) -> list[dict]:
                 {"kind": "scale", "group": g, "parts": ps, "by": 2.0}]
         if swap:
             ivs.append({"kind": "setback", "pos": t, "token": swap, "group": g, "parts": ps})
+    G = list(tg.named)
+    combos = [(a, b) for i, a in enumerate(G) for b in G[i + 1:]]
+    for a, b in rng.sample(combos, min(pairs, len(combos))):
+        ivs.append({"kind": "remove", "group": [a, b], "parts": tg.named[a] + tg.named[b]})
     for iv in ivs:
         iv["outcome"] = tg.run(iv)
         iv["words"] = tg.words(iv)
         iv["moved"] = moved(tg, iv["outcome"])
+        iv["held_out"] = not (iv["kind"] == "remove" and isinstance(iv["group"], str))
     return ivs
 
 
@@ -984,7 +988,9 @@ def cmd_accept(a) -> None:
     per = []
     for qf in a.questions:
         ivs = [json.loads(x) for x in qf.read_text().splitlines()]
-        facts = Path(str(qf).replace(".jsonl", "_facts.txt")).read_text()
+        if a.held_out:  # only questions whose answers the explanation does not state
+            ivs = [iv for iv in ivs if iv.get("held_out")]
+        facts = Path(str(qf).replace(".jsonl", a.explanations)).read_text()
         arms = {"none": None, "true": facts, "rotated": rotated(facts)}
         got = rewards(rd, ivs, list(arms.values()))
         row = {"questions": qf.name, "n": len(ivs)}
@@ -998,6 +1004,29 @@ def cmd_accept(a) -> None:
            "true_above_rotated": sum(r["true"] > r["rotated"] for r in per), "spend_usd": rd.spend.total}
     a.out.write_text(json.dumps(res, indent=1))
     print(json.dumps({k: res[k] for k in ("pooled", "questions", "true_above_rotated", "spend_usd")}))
+
+
+WRITE = """{head}
+Measured facts about this prediction, each from running the model with one change:
+{facts}
+
+Write the explanation an interpretability oracle would give of how the model computes this prediction. Name each group (G1, G2, ...) with its role: what it contributes to the prediction and how strongly, and how the identity of the last token matters. Plain English, 120 to 220 words, not a list of every number: give a number only where it carries the point. Every claim must follow from the facts above."""
+
+
+def cmd_write(a) -> None:
+    """Explanations in the form the oracle writes (the lead's 10-14): the strongest Tinker writer turns each question
+    file's measured facts (<name>_facts.txt) into a prose explanation naming the groups by role (<name>_written.txt),
+    for accept --explanations _written.txt."""
+    rd = Reader(a.writer, a.out_dir)
+    prompts, outs = [], []
+    for qf in a.questions:
+        head = json.loads(qf.read_text().splitlines()[0])["head"]
+        prompts.append(WRITE.format(head=head, facts=Path(str(qf).replace(".jsonl", "_facts.txt")).read_text()))
+        outs.append(Path(str(qf).replace(".jsonl", "_written.txt")))
+    for f, text in zip(outs, rd(prompts, max_tokens=800)):
+        f.write_text(text.strip())
+        print(f.name, len(text.split()), "words", flush=True)
+    print(f"spend ${rd.spend.total:.3f}")
 
 
 def cmd_agree_prep(a) -> None:
@@ -1098,6 +1127,12 @@ def main():
     ac.add_argument("--questions", type=Path, nargs="+", required=True, help="group question files (questions --by-group), facts beside them")
     ac.add_argument("--out", type=Path, required=True)
     ac.add_argument("--reader", default=READER)
+    ac.add_argument("--held-out", action="store_true", help="only the questions the explanation does not answer (held_out)")
+    ac.add_argument("--explanations", default="_facts.txt", help="the explanation beside each question file: its name's suffix")
+    wr = sub.add_parser("write")
+    wr.add_argument("--questions", type=Path, nargs="+", required=True)
+    wr.add_argument("--writer", default="Qwen/Qwen3.5-397B-A17B", help="the strongest validated Tinker model")
+    wr.add_argument("--out-dir", type=Path, default=Path.home() / "mpd-data" / "graph_oracle" / "reader_reward" / "write")
     sv = sub.add_parser("serve")
     sv.add_argument("--questions-dir", type=Path, required=True)
     sv.add_argument("--reader-url", help="an OpenAI-compatible server (vllm serve ...); else Tinker's --reader")
@@ -1108,7 +1143,7 @@ def main():
     sv.add_argument("--device")
     a = ap.parse_args()
     {"questions": cmd_questions, "read": cmd_read, "invariants": cmd_invariants, "answer": cmd_answer, "agree-prep": cmd_agree_prep,
-     "agree": cmd_agree, "serve": cmd_serve, "accept": cmd_accept}[a.what](a)
+     "agree": cmd_agree, "serve": cmd_serve, "accept": cmd_accept, "write": cmd_write}[a.what](a)
 
 
 if __name__ == "__main__":

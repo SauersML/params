@@ -3516,3 +3516,67 @@ def test_node_values():
     assert got["node_share_weighted"] == pytest.approx(0.25) and got["node_median_z"] == pytest.approx((0.1 + 3.0) / 2)
     assert goal_eval._node_values({}, {}) == {"node_share": None, "node_share_weighted": None, "node_median_z": None,
                                               "node_measured": 0}
+
+
+@pytest.mark.parametrize('shared_first',[False,True])
+def test_shared_floor_subset_exact_scores_draws_and_skipped_work(monkeypatch,shared_first):
+    """Actual tiny-model calibration: shared raw scores/floors/draws stay exact,
+    including all three reference rows, while unrelated physical families do not run.
+    Different bootstrap streams are intentionally not certified by this partial API."""
+    import native_units
+    import time
+    monkeypatch.setattr(goal_eval,'START_CAP',1)  # nontrivial restricted reference, identical in both paths
+    nat=tiny_native(seed=7,layers=2,d=4,heads=1,vocab=7,C=2)
+    # Zero-embedding controls have zero component-removal damage; the original
+    # nonzero input then supplies a defined positive target-minus-control N bar.
+    with torch.no_grad():nat.target.wte[0].zero_()
+    nat.vpd.ci_fn=lambda acts:{n:torch.ones((*x.shape[:-1],nat.C[n]),device=x.device) for n,x in acts.items()}
+    ge=goal_eval.GoalEval(nat,changes=2,ranks=(0,1),chunk=4)
+    for split in ('search','eval'):
+        ge.donor_pools[split]=[(f'{split}{i}',[0]*(5+i)) for i in range(8)]
+    tx=ge.text([1,2,3,4],[3],seed=19)
+    calls=[]
+    ignored=('_edge_family','_omitted_family','scope_family','changed_inputs','_interchange_family')
+    for name in ignored:
+        old=getattr(ge,name)
+        def record(*a,_old=old,_name=name,**kw):
+            calls.append(_name);return _old(*a,**kw)
+        monkeypatch.setattr(ge,name,record)
+    # A truthy pool would trigger adversary_flips on the full path. Here it must
+    # never be read: none of its outputs enters a shared family's score.
+    def forbidden(*a,**kw):pytest.fail('unused adversary must not execute')
+    monkeypatch.setattr(ge,'adversary_flips',forbidden)
+    timing={}
+    def run(shared):
+        calls.clear();started=time.perf_counter()
+        # Existing donors() changes GEMM batch geometry after caching its two
+        # reference sides. Match that cache state across these exact-parity runs.
+        tx.__dict__.pop('_donor_base',None)
+        result=ge.vpd_floors(tx,{'unused_pool':True} if shared else None,'search',shared_only=shared)
+        timing['shared' if shared else 'full']=time.perf_counter()-started
+        if shared:assert calls==[]
+        else:assert set(calls)==set(ignored)
+        return result
+    if shared_first:
+        partial=run(True);full=run(False)
+    else:
+        full=run(False);partial=run(True)
+    expected=[f for f in full['families'] if f in native_units.SHARED]
+    assert set(expected)==set(native_units.SHARED)  # all eight, including defined N
+    assert partial['families']==expected and set(partial['families'])<=set(native_units.SHARED)
+    assert partial['floors']=={f:full['floors'][f] for f in expected}
+    for rowname in ('vpd','candidates','empty'):
+        a,b=full[rowname],partial[rowname]
+        for family in native_units.SHARED:
+            assert goal_eval.family_score(a,family)==goal_eval.family_score(b,family),family
+            draws=goal_eval.PHI_FAMILIES[family][2]
+            if draws:assert a.get(draws)==b.get(draws),family
+        assert a['draws_point']==b['draws_point']
+        assert b['shared_scores_only'] and not any(k.startswith('eps_') for k in b)
+    assert ('search',goal_eval.FLOOR_TOP) in tx._vpd_floors
+    assert ('search',goal_eval.FLOOR_TOP,'native_shared') in tx._vpd_floors
+    calls.clear()
+    assert ge.vpd_floors(tx,None,'search',shared_only=True) is partial
+    assert calls==[]
+    print({'order':'shared_first' if shared_first else 'full_first','calibration_seconds':timing,
+           'families':expected,'avoided_calls':list(ignored)+['adversary_flips'],'actual_model':'synthetic tiny only'})

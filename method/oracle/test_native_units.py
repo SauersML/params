@@ -603,7 +603,7 @@ def test_build_native_shared_gate_uses_common_search_floors(monkeypatch, explici
     mu=AdmissionCase();tx=types.SimpleNamespace(ids=[0],targets=[0],seed=0)
     calls=[];pool=object();inversions=[]
     monkeypatch.setattr(native_units,'kl_goal',lambda ge,tx,f1=.9:(inversions.append(f1) or .25))
-    ge=types.SimpleNamespace(nat=object(),vpd_floors=lambda tx,pool_arg,split:(calls.append((pool_arg,split)) or
+    ge=types.SimpleNamespace(nat=object(),vpd_floors=lambda tx,pool_arg,split,**kw:(calls.append((pool_arg,split,kw)) or
         {'families':['point','nodes'],'floors':{'point':.6,'nodes':.7}}))
     monkeypatch.setattr(native_units,'MeanUnits',lambda *a:mu)
     class Phi:
@@ -621,7 +621,7 @@ def test_build_native_shared_gate_uses_common_search_floors(monkeypatch, explici
     monkeypatch.setattr(native_units,'build_units',build)
     with pytest.raises(native_units.NoAdmittedCandidate):
         native_units.build_native(ge,tx,kl_target=.1 if explicit else None,means={},shared_floors=True,pool=pool,max_gate_calls=3)
-    assert calls==[(pool,'search')]
+    assert calls==[(pool,'search',{'shared_only':True})]
     assert inversions==([] if explicit else [.6])
 
 
@@ -653,7 +653,7 @@ def test_shared_gate_necessity_first_reuses_result(monkeypatch, nscore):
     import types
     mu=AdmissionCase();tx=types.SimpleNamespace(ids=[0],targets=[0],seed=0)
     floors={'point':.6,'N':.9};observed=[]
-    ge=types.SimpleNamespace(nat=object(),vpd_floors=lambda *a:{'families':list(floors),'floors':floors})
+    ge=types.SimpleNamespace(nat=object(),vpd_floors=lambda *a,**kw:{'families':list(floors),'floors':floors})
     monkeypatch.setattr(native_units,'MeanUnits',lambda *a:mu)
     monkeypatch.setattr(native_units,'kl_goal',lambda *a,**kw:.25)
     nr={'n_spec':nscore,'_raw_n_spec':nscore,'d_target':4.,'d_control':1.,

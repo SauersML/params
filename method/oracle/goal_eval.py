@@ -3438,7 +3438,8 @@ class GoalEval:
                  interchange: int = INTERCHANGE_DRAWS, real: bool = False, reads: bool = False, mode: str = "full",
                  changed: int = CHANGED_DRAWS, split: str | None = None, near_donors: int = DONORS_NEAR,
                  far_donors: int = DONORS_FAR, baseline: bool = False, pattern: bool = True,
-                 controls: int = NEC_CONTROLS, weight: bool = False, scope: bool = True, node_values: bool | None = None) -> list[dict]:
+                 controls: int = NEC_CONTROLS, weight: bool = False, scope: bool = True, node_values: bool | None = None,
+                 shared_only: bool = False) -> list[dict]:
         """C, the circuit's agreement with the model under the training family of interventions (remainders live),
         each family scored on the log scale against VPD's own answer under the same interventions, s_F =
         clip(ln(KL_empty / KL_C,F) / ln(KL_empty / KL_VPD,F), 0, 1), KL_X,F the mean over the family's draws of KL(the
@@ -3482,9 +3483,16 @@ class GoalEval:
         RL's ranking rl_terms (each term without the floor at 0, _fid_raw) and c_rl (_c_rl: their harmonic mean when all
         are above 0, else the lowest); baseline: c_vpd_k and c_rl_vpd_k of VPD's first k at the answer's k
         (vpd_baseline); no
-        step-budget adversary, larger budgets, fresh pool, N_real or leak, and no flips_to_break / flips_to_half."""
+        step-budget adversary, larger budgets, fresh pool, N_real or leak, and no flips_to_break / flips_to_half.
+        shared_only is an opt-in reward-mode score/floor calibration for native SHARED:
+        point, nodes, track_pp, interchange_pp, near/far patching, pattern and N.
+        Their original draws and numerical execution paths are retained; unrelated
+        families/read diagnostics are skipped. Partial rows omit epsilon/noise fields
+        because skipping other families changes the shared bootstrap RNG stream."""
         if mode not in ("full", "reward"):
             raise ValueError("mode is full or reward")
+        if shared_only and (mode != "reward" or baseline or weight or real or fresh is not None):
+            raise ValueError("shared_only is a reward-mode shared-score calibration, without extra diagnostics")
         pp_graphs = [strand(g, tx.targets, self.nat.C) for g in graphs]  # the path-patched terms take blocks as blocks
         if tx.vpd is not None:  # (at their active contents, block_contents)
             pp_graphs = [expand_blocks(g, self.nat.C, tx.vpd) for g in pp_graphs]
@@ -3500,17 +3508,17 @@ class GoalEval:
         wired = dict(zip([i for i, w in enumerate(whole) if w is not None],
                          self.sufficiency(tx, [w for w in whole if w is not None])))
         nodes = self._node_family(tx, graphs, draws, reads, units=[sorted(h.node_set()) for h in pp_graphs])  # a block one unit
-        omitted = self._omitted_family(tx, graphs) if tx.vpd is not None else [{} for _ in graphs]  # phi's omitted family
-        edges = self._edge_family(tx, graphs, draws, reads)
+        omitted = self._omitted_family(tx, graphs) if tx.vpd is not None and not shared_only else [{} for _ in graphs]  # phi's omitted family
+        edges = self._edge_family(tx, graphs, draws, reads) if not shared_only else [{"kl_edges_c": None, "kl_edges_vpd": None} for _ in graphs]
         none = [{} for _ in graphs]
         adv = self.adversary(tx, graphs, pool, steps=steps, restarts=restarts, draws=draws, curve=curve) if pool and not reward else none
         flips = self.adversary_flips(tx, graphs, pool, "omitted", steps=steps, restarts=restarts,
-                                     upto=FLIP_TERM if reward else None) if pool else none
+                                     upto=FLIP_TERM if reward else None) if pool and not shared_only else none
         fresh_rows = self.adversary_flips(tx, graphs, fresh, "patterns", steps=steps, restarts=restarts) if fresh and not reward else none
-        inter = self._interchange_family(tx, graphs, interchange, split=split, reads=reads) if interchange else none
+        inter = self._interchange_family(tx, graphs, interchange, split=split, reads=reads) if interchange and not shared_only else none
         reals = self.real_removal(tx, graphs) if real and not reward else none
-        chg = self.changed_inputs(tx, graphs, split, changed) if changed else none
-        scp = self.scope_family(tx, graphs, split) if scope else none  # phi's input-scope family
+        chg = self.changed_inputs(tx, graphs, split, changed) if changed and not shared_only else none
+        scp = self.scope_family(tx, graphs, split) if scope and not shared_only else none  # phi's input-scope family
         tpp = self.track_pp(tx, pp_graphs, split, changed) if changed else none
         ipp = self.interchange_pp(tx, pp_graphs, split, interchange) if interchange else none
         pat = self.pattern_family(tx, graphs) if pattern else none  # s_pattern: C's true-pattern family
@@ -3574,10 +3582,15 @@ class GoalEval:
                 row["rl_terms"]["n_spec"] = row.get("n_spec_raw")
             if baseline:
                 row.update(self.vpd_baseline(tx, g.count(), pool, split))
-            row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") else None
+            row["e4"] = self.hooks["E4"](tx, g, split) if self.hooks.get("E4") and not shared_only else None
             row["kl_empty_live"], row["kl_vpd_live"] = e0, self._bounds(tx, "live")[1]  # (phi's eps from the row alone)
             row["draws_point"] = [[pt["kl_live"], row["kl_vpd_live"]]]
-            row.update({f"eps_{f}": v for f, v in family_eps(row).items()})
+            if not shared_only:
+                row.update({f"eps_{f}": v for f, v in family_eps(row).items()})
+            else:
+                # Skipped families would advance family_eps' bootstrap RNG. This
+                # partial row certifies identical scores/draws/floors, not noise.
+                row["shared_scores_only"] = True
             if not reward:  # (the reward's flips stop at FLIP_TERM)
                 half = 0.5 * row["s_point_c"] if row["s_point_c"] is not None else None
                 broke = [m for m in sorted(fc) if half is not None and fc[m] is not None and fc[m] < half]
@@ -3588,7 +3601,7 @@ class GoalEval:
                 row["f1_flips_patterns_fresh"] = fr["f1_flips_patterns"]
             if rr:
                 row["n_real"] = rr["n_real_live"]
-            if reads:  # the reads' responses: each node's change from its own run without an intervention
+            if reads and not shared_only:  # the reads' responses: each node's change from its own run without an intervention
                 _, _, _, rm, rc = sides(g, cuts=[{}], reads=True)  # one row, no intervention
                 base = {nd: (float(rm[nd][0]), float(rc[nd][0])) for nd in rm}
                 merged = {}  # node values (_node_values) over the node-removal and interchange families' reads
@@ -4794,7 +4807,8 @@ class GoalEval:
                        "effects": self.own_rule(tx, best["graph"], floor=floor)}  # (a diagnostic)
         return kept[floor]
 
-    def vpd_floors(self, tx: Text, pool: dict | None, split: str = "search", floor: float = FLOOR_TOP) -> dict:
+    def vpd_floors(self, tx: Text, pool: dict | None, split: str = "search", floor: float = FLOOR_TOP,
+                   *, shared_only: bool = False) -> dict:
         """The reward's floors on a text (the lead's 10-13 design: absolute, from VPD, never from the answer or a
         start): reward-mode rows on split of VPD's whole answer, of VPD's actives at the targets and the START's
         candidate positions (start_candidates, at most START_CAP: fixed per text, so no answer lowers its own bar by
@@ -4806,20 +4820,28 @@ class GoalEval:
         failing STARTs bound on patching_far), of the whole answer on the rest (input scope, track_pp,
         interchange_pp, N, omitted). Every family's score itself stays against VPD's whole answer (the claim quotes
         those); the floors alone read the restricted reference. Kept on tx per split and floor (the pool: the shared
-        adversary's, one file for every caller)."""
+        adversary's, one file for every caller). shared_only computes just the native
+        shared scores/floors, cached separately, without epsilon/noise certification;
+        default callers still receive the complete original calibration."""
         kept = tx.__dict__.setdefault("_vpd_floors", {})
-        if (split, floor) not in kept:
+        key = (split, floor, "native_shared") if shared_only else (split, floor)
+        if key not in kept:
+            started = time.perf_counter()
             act = sorted((n, t, c) for n in self.nat.names for t, c in tx.vpd[n].nonzero().tolist())
             ps = set(tx.targets) | set(self.start_candidates(tx)[:START_CAP])
             vrow, crow, er = self.fidelity(tx, [native.Graph(act, complete=True),
                                                 native.Graph([nd for nd in act if nd[1] in ps], complete=True), native.Graph()],
-                                           pool, mode="reward", split=split, node_values=False)
+                                           pool, mode="reward", split=split, node_values=False,
+                                           **({"shared_only": True} if shared_only else {}))
             fams = [f for f in PHI_FAMILIES if family_score(vrow, f) is not None]
             fl = {**floors(vrow, fams), **floors(crow, [f for f in fams if f in OWN_RUN_FAMILIES])}
             if floor != FLOOR_TOP:
                 fl = {f: v * floor / FLOOR_TOP for f, v in fl.items()}
-            kept[(split, floor)] = {"vpd": vrow, "candidates": crow, "empty": er, "families": fams, "floors": fl}
-        return kept[(split, floor)]
+            kept[key] = {"vpd": vrow, "candidates": crow, "empty": er, "families": fams, "floors": fl}
+            if shared_only:
+                kept[key].update(scope="native shared scores/floors only; no epsilon/noise certificate",
+                                 calibration_seconds=time.perf_counter() - started)
+        return kept[key]
 
     def tau(self, tx: Text, pool: dict | None, split: str = "search") -> dict:
         """The reward's per-text bar, floors and start bits (the lead's 10-13 design: faithful first, then small; every

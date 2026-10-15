@@ -808,7 +808,7 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
     mu = MeanUnits(nat, tx.ids, tx.targets, means)
     gate = None
     if shared_floors:
-        vf = ge.vpd_floors(tx, pool, "search")
+        vf = ge.vpd_floors(tx, pool, "search", shared_only=True)
         families = [f for f in vf["families"] if f in SHARED and vf["floors"].get(f) is not None]
         if not families or any(not math.isfinite(vf["floors"][f]) for f in families):
             raise ValueError("finite nonempty shared search floors required")

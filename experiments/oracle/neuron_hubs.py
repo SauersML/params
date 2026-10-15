@@ -346,6 +346,7 @@ def main():
             from peft import PeftModel
 
             model = PeftModel.from_pretrained(model, adapters[name]).eval()
+        model.requires_grad_(False)  # the ranking's backward wants only the neuron scales' gradient (8B's weight gradients filled an L40)
         run = Runner(model)
         cal = calibrate(run, seqs)
         thr = None if cal["tau"] is None else cal["tau"] * cal["max"]

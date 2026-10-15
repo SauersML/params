@@ -130,16 +130,25 @@ def corpus_docs(corpus_dir, tokens: int | None = None):
 
 
 def load_model(name: str, dev, attn: str = "sdpa"):
+    """dev "auto": the layers spread over every visible GPU (device_map auto: Qwen3-32B on two 48 GB cards)."""
     import torch
     from transformers import AutoModelForCausalLM
 
+    if dev == "auto":
+        return AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, attn_implementation=attn, device_map="auto").eval()
     return AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, attn_implementation=attn).to(dev).eval()
 
 
 def device(d):
     import torch
 
+    if d == "auto":
+        return "auto"
     return torch.device(d or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
+
+
+def first_device(m):
+    return m.model.embed_tokens.weight.device
 
 
 def batches(off: np.ndarray, docs: list[int], batch_tokens: int, block: int = 4096):
@@ -168,18 +177,22 @@ def collect(a) -> None:
     model = a.model or meta["model"]
     m = load_model(model, dev)
     L, D = m.config.num_hidden_layers, m.config.intermediate_size
-    neg_inf = torch.full((D, TOP), -math.inf, device=dev)
-    st = [{p: {"val": neg_inf.clone(), "idx": torch.zeros(D, TOP, dtype=torch.long, device=dev),
-               "g": torch.zeros(D, TOP, dtype=torch.float16, device=dev), "u": torch.zeros(D, TOP, dtype=torch.float16, device=dev)}
-           for p in "+-"} | {"hist": torch.zeros(D * NB, dtype=torch.long, device=dev),
-                             "pos0_max": torch.full((D,), -math.inf, device=dev), "pos0_min": torch.full((D,), math.inf, device=dev)}
-          for _ in range(L)]
+
+    def state(d):                                             # one layer's running lists on its own device (int32: 32B's
+        return {p: {"val": torch.full((D, TOP), -math.inf, device=d), "idx": torch.zeros(D, TOP, dtype=torch.int32, device=d),
+                    "g": torch.zeros(D, TOP, dtype=torch.float16, device=d), "u": torch.zeros(D, TOP, dtype=torch.float16, device=d)}
+                for p in "+-"} | {"hist": torch.zeros(D * NB, dtype=torch.int32, device=d),   # 64 layers fit an 80 GB card)
+                                  "pos0_max": torch.full((D,), -math.inf, device=d), "pos0_min": torch.full((D,), math.inf, device=d)}
+
+    st = [None] * L
     cur: dict = {}
     run = {"hist": False}
 
     def update(l, a_):
         g, u = cur.pop(("g", l)), cur.pop(("u", l))
-        valid, gidx = run["valid"], run["gidx"]
+        valid, gidx = run["valid"].to(a_.device), run["gidx"].to(a_.device)
+        if st[l] is None:
+            st[l] = state(a_.device)
         s = st[l]
         a0 = a_[:, 0].float()                                 # each window's first token: the sink, apart
         s["pos0_max"] = torch.maximum(s["pos0_max"], a0.max(0).values)
@@ -198,12 +211,12 @@ def collect(a) -> None:
             sel = cv.topk(TOP, dim=1).indices
             ps["val"], ps["idx"], ps["g"], ps["u"] = cv.gather(1, sel), ci.gather(1, sel), cg.gather(1, sel), cu.gather(1, sel)
         if run["hist"]:
-            col = torch.arange(D, device=dev)[:, None] * NB
+            col = torch.arange(D, device=a_.device)[:, None] * NB
             for c in range(0, av.shape[1], 4096):
                 x = av[:, c:c + 4096]
                 b = ((x.abs().clamp_min(1e-30).log10() - LO) * PER_DEC).floor().clamp(0, DECADES * PER_DEC - 1).long()
                 b = torch.where(x.abs() < 10 ** LO, torch.full_like(b, ZERO), torch.where(x > 0, ZERO + 1 + b, ZERO - 1 - b))
-                s["hist"] += torch.bincount((b + col).reshape(-1), minlength=D * NB)
+                s["hist"] += torch.bincount((b + col).reshape(-1), minlength=D * NB).int()
 
     hooks = []
     for l, layer in enumerate(m.model.layers):
@@ -219,17 +232,18 @@ def collect(a) -> None:
         T = max(int(off[d + 1] - off[d]) for d in bd)
         ids = torch.full((len(bd), T), 0, dtype=torch.long)
         mask = torch.zeros(len(bd), T, dtype=torch.long)
-        gidx = torch.zeros(len(bd), T, dtype=torch.long)
+        gidx = torch.zeros(len(bd), T, dtype=torch.int32)
         for r, d in enumerate(bd):
             n = int(off[d + 1] - off[d])
             ids[r, :n] = torch.from_numpy(np.asarray(tokens[off[d]:off[d + 1]], dtype=np.int64))
             mask[r, :n] = 1
-            gidx[r, :n] = torch.arange(int(off[d]), int(off[d]) + n)
+            gidx[r, :n] = torch.arange(int(off[d]), int(off[d]) + n, dtype=torch.int32)
         valid = mask.bool().clone()
         valid[:, 0] = False
-        run.update(valid=valid.to(dev), gidx=gidx.to(dev), hist=bi % HIST_EVERY == 0)
+        d0 = first_device(m)
+        run.update(valid=valid.to(d0), gidx=gidx.to(d0), hist=bi % HIST_EVERY == 0)
         with torch.no_grad():
-            m.model(input_ids=ids.to(dev), attention_mask=mask.to(dev))   # the decoder alone: no logits needed
+            m.model(input_ids=ids.to(d0), attention_mask=mask.to(d0))   # the decoder alone: no logits needed
         ntok += int(mask.sum())
         nhist += int(valid.sum()) if run["hist"] else 0
         if bi % 50 == 0:
@@ -300,52 +314,66 @@ def merge(a) -> None:
 def weights(a) -> None:
     import torch
 
+    torch.backends.cuda.matmul.allow_tf32 = True              # (rankings of read . write products)
     dev = device(a.device)
     m = load_model(a.model or load_corpus(a.root)[2]["model"], dev)   # (--model: before the corpus exists)
     lay = m.model.layers
     L, D = len(lay), m.config.intermediate_size
-    f32 = lambda t: t.detach().float()  # noqa: E731
-    down = [f32(x.mlp.down_proj.weight) for x in lay]          # [d, D]: column i is neuron i's write
-    reads = [(f32(x.mlp.gate_proj.weight) * f32(x.post_attention_layernorm.weight)[None], f32(x.mlp.up_proj.weight) * f32(x.post_attention_layernorm.weight)[None]) for x in lay]
-    WU, gf = f32(m.lm_head.weight), f32(m.model.norm.weight)
-    del m, lay                                                # (8B: the bf16 model beside the f32 copies would fill a 48 GB card)
-    (torch.cuda.empty_cache() if dev.type == "cuda" else None)
-    # downstream: per source neuron, the NEIGHBOURS largest |read . write| over later layers' gate and up rows (id = layer * D + j)
-    dn_v = torch.zeros(L, D, NEIGHBOURS, device=dev)
-    dn_i = torch.full((L, D, NEIGHBOURS), -1, dtype=torch.long, device=dev)
-    dn_k = torch.zeros(L, D, NEIGHBOURS, dtype=torch.int8, device=dev)
-    up_v = torch.zeros(L, D, NEIGHBOURS, device=dev)
-    up_i = torch.full((L, D, NEIGHBOURS), -1, dtype=torch.long, device=dev)
-    up_k = torch.zeros(L, D, NEIGHBOURS, dtype=torch.int8, device=dev)
+    d0 = first_device(m)
+
+    def write(l):                                             # [d, D]: column i is neuron i's write
+        return lay[l].mlp.down_proj.weight.float()
+
+    def read(mm, kind):                                       # [D, d]: gate (0) or up (1) rows through the RMSNorm scale
+        w = (lay[mm].mlp.gate_proj if kind == 0 else lay[mm].mlp.up_proj).weight
+        return w.float() * lay[mm].post_attention_layernorm.weight.float()[None]
+
+    # downstream: per source neuron, the NEIGHBOURS largest |read . write| over later layers' gate and up rows (id = layer * D + j);
+    # one layer pair at a time from the model's own weights (all layers' float32 copies would not fit beside Qwen3-32B)
+    dn_v = torch.zeros(L, D, NEIGHBOURS, device=d0)
+    dn_i = torch.full((L, D, NEIGHBOURS), -1, dtype=torch.long, device=d0)
+    dn_k = torch.zeros(L, D, NEIGHBOURS, dtype=torch.int8, device=d0)
+    up_v = torch.zeros(L, D, NEIGHBOURS, device=d0)
+    up_i = torch.full((L, D, NEIGHBOURS), -1, dtype=torch.long, device=d0)
+    up_k = torch.zeros(L, D, NEIGHBOURS, dtype=torch.int8, device=d0)
 
     def keep(v, i, k, nv, ni, nk):
-        cv, ci, ck = torch.cat([v, nv], 1), torch.cat([i, ni], 1), torch.cat([k, nk], 1)
+        cv, ci, ck = torch.cat([v, nv.to(v.device)], 1), torch.cat([i, ni.to(v.device)], 1), torch.cat([k, nk.to(v.device)], 1)
         sel = cv.abs().topk(NEIGHBOURS, dim=1).indices
         return cv.gather(1, sel), ci.gather(1, sel), ck.gather(1, sel)
 
     t0 = time.time()
-    for l in range(L - 1):
-        for mm in range(l + 1, L):
-            for kind in (0, 1):
-                S = reads[mm][kind] @ down[l]                     # [D target, D source]
-                t = S.abs().topk(NEIGHBOURS, dim=0).indices       # per source column
-                dn_v[l], dn_i[l], dn_k[l] = keep(dn_v[l], dn_i[l], dn_k[l], S.gather(0, t).t(), (mm * D + t).t(),
-                                                 torch.full_like(t, kind, dtype=torch.int8).t())
-                t = S.abs().topk(NEIGHBOURS, dim=1).indices       # per target row
-                up_v[mm], up_i[mm], up_k[mm] = keep(up_v[mm], up_i[mm], up_k[mm], S.gather(1, t), l * D + t,
-                                                    torch.full_like(t, kind, dtype=torch.int8))
-        (torch.cuda.synchronize() if dev.type == "cuda" else torch.mps.synchronize() if dev.type == "mps" else None)
-        print(f"weights: source layer {l} done, {time.time() - t0:.0f} s", flush=True)
-    lt_i = torch.zeros(L, D, LOGITS, dtype=torch.int32)
-    lt_v = torch.zeros(L, D, LOGITS)
-    lb_i = torch.zeros(L, D, LOGITS, dtype=torch.int32)
-    lb_v = torch.zeros(L, D, LOGITS)
-    for l in range(L):
-        for c in range(0, D, 1024):
-            E = WU @ (gf[:, None] * down[l][:, c:c + 1024])       # [V, chunk]: the write's direct logit effect
-            t, b = E.topk(LOGITS, dim=0), (-E).topk(LOGITS, dim=0)
-            lt_i[l, c:c + 1024], lt_v[l, c:c + 1024] = t.indices.t().int().cpu(), t.values.t().cpu()
-            lb_i[l, c:c + 1024], lb_v[l, c:c + 1024] = b.indices.t().int().cpu(), -b.values.t().cpu()
+    with torch.no_grad():
+        for l in range(L - 1):
+            W = write(l)
+            for mm in range(l + 1, L):
+                for kind in (0, 1):
+                    R = read(mm, kind)
+                    S = R @ W.to(R.device)                    # [D target, D source]
+                    t = S.abs().topk(NEIGHBOURS, dim=0).indices   # per source column
+                    dn_v[l], dn_i[l], dn_k[l] = keep(dn_v[l], dn_i[l], dn_k[l], S.gather(0, t).t(), (mm * D + t).t(),
+                                                     torch.full_like(t, kind, dtype=torch.int8).t())
+                    t = S.abs().topk(NEIGHBOURS, dim=1).indices   # per target row
+                    up_v[mm], up_i[mm], up_k[mm] = keep(up_v[mm], up_i[mm], up_k[mm], S.gather(1, t), l * D + t,
+                                                        torch.full_like(t, kind, dtype=torch.int8))
+                    del R, S, t
+            del W
+            (torch.cuda.synchronize() if torch.cuda.is_available() else torch.mps.synchronize() if torch.backends.mps.is_available() else None)
+            print(f"weights: source layer {l} done, {time.time() - t0:.0f} s", flush=True)
+        dU = m.lm_head.weight.device
+        WU, gf = m.lm_head.weight.float(), m.model.norm.weight.float().to(dU)
+        lt_i = torch.zeros(L, D, LOGITS, dtype=torch.int32)
+        lt_v = torch.zeros(L, D, LOGITS)
+        lb_i = torch.zeros(L, D, LOGITS, dtype=torch.int32)
+        lb_v = torch.zeros(L, D, LOGITS)
+        for l in range(L):
+            Wl = write(l).to(dU)
+            for c in range(0, D, 1024):
+                E = WU @ (gf[:, None] * Wl[:, c:c + 1024])     # [V, chunk]: the write's direct logit effect
+                t, b = E.topk(LOGITS, dim=0), (-E).topk(LOGITS, dim=0)
+                lt_i[l, c:c + 1024], lt_v[l, c:c + 1024] = t.indices.t().int().cpu(), t.values.t().cpu()
+                lb_i[l, c:c + 1024], lb_v[l, c:c + 1024] = b.indices.t().int().cpu(), -b.values.t().cpu()
+            del Wl
     np.savez(a.root / "weights.npz", down_val=dn_v.cpu().numpy(), down_id=dn_i.cpu().numpy().astype(np.int32), down_kind=dn_k.cpu().numpy(),
              up_val=up_v.cpu().numpy(), up_id=up_i.cpu().numpy().astype(np.int32), up_kind=up_k.cpu().numpy(),
              logit_top_tok=lt_i.numpy(), logit_top_val=lt_v.numpy(), logit_bot_tok=lb_i.numpy(), logit_bot_val=lb_v.numpy())
@@ -362,38 +390,49 @@ def heads(a) -> None:
     m = load_model(a.model or meta["model"], dev, attn="eager")
     L, H = m.config.num_hidden_layers, m.config.num_attention_heads
     n = min(a.texts, len(off) - 1)
-    sink = torch.zeros(L, H, device=dev)
-    prof = torch.zeros(L, H, len(OFFSETS), device=dev)
-    nq = 0
-    lists = {k: (torch.full((L, H, 32), -1.0, device=dev), torch.zeros(L, H, 32, 3, dtype=torch.long, device=dev)) for k in ("any", "far")}
-    edges = torch.tensor(OFFSETS[1:], device=dev)
-    t0 = time.time()
+    d0 = first_device(m)
+    sink = torch.zeros(L, H, device=d0)
+    prof = torch.zeros(L, H, len(OFFSETS), device=d0)
+    lists = {k: (torch.full((L, H, 32), -1.0, device=d0), torch.zeros(L, H, 32, 3, dtype=torch.long, device=d0)) for k in ("any", "far")}
+    masks: dict = {}
+    cur = {"d": 0}
+
+    def grids(T, dv):                                         # per length and device: offset bins, the live and far masks
+        if (T, dv) not in masks:
+            q = torch.arange(T, device=dv)[:, None]
+            k = torch.arange(T, device=dv)[None]
+            dist = (q - k).clamp_min(0)
+            live = (k >= 1) & (k <= q) & (q >= 1)
+            masks.clear()
+            masks[(T, dv)] = (torch.bucketize(dist, torch.tensor(OFFSETS[1:], device=dv), right=True), live, live & (dist >= 4))
+        return masks[(T, dv)]
+
+    def take(l, A):                                           # one layer's weights [1, H, T, T], used and dropped (all layers'
+        A = A[0].float()                                      # at once would not fit beside Qwen3-32B)
+        T, dv = A.shape[-1], A.device
+        binof, live, far = grids(T, dv)
+        sink[l] += A[:, 1:, 0].sum(1).to(d0)
+        prof[l] += torch.zeros(H, len(OFFSETS), device=dv).scatter_add_(1, binof.view(1, -1).expand(H, -1), (A * live).reshape(H, -1)).to(d0)
+        for key, msk in (("any", live), ("far", far)):
+            v = (A * msk).reshape(H, -1)
+            tv, ti = v.topk(min(32, v.shape[1]), dim=1)
+            pos = torch.stack([torch.full_like(ti, cur["d"]), ti // T, ti % T], -1)
+            cv, cp = torch.cat([lists[key][0][l], tv.to(d0)], 1), torch.cat([lists[key][1][l], pos.to(d0)], 1)
+            sel = cv.topk(32, dim=1).indices
+            lists[key][0][l], lists[key][1][l] = cv.gather(1, sel), cp.gather(1, sel[..., None].expand(-1, -1, 3))
+
+    hooks = [layer.self_attn.register_forward_hook(lambda _m, _i, o, l=l: take(l, o[1])) for l, layer in enumerate(m.model.layers)]
+    nq, t0 = 0, time.time()
     for d in range(n):
-        x = torch.from_numpy(np.asarray(tokens[off[d]:off[d + 1]], dtype=np.int64))[None].to(dev)
-        T = x.shape[1]
+        x = torch.from_numpy(np.asarray(tokens[off[d]:off[d + 1]], dtype=np.int64))[None].to(d0)
+        cur["d"] = d
         with torch.no_grad():
-            att = m.model(input_ids=x, output_attentions=True).attentions   # L x [1, H, T, T]
-        q = torch.arange(T, device=dev)[:, None]
-        k = torch.arange(T, device=dev)[None]
-        dist = (q - k).clamp_min(0)
-        binof = torch.bucketize(dist, edges, right=True)            # [T, T]
-        live = (k >= 1) & (k <= q) & (q >= 1)
-        for l in range(L):
-            A = att[l][0].float()                                     # [H, T, T]
-            sink[l] += A[:, 1:, 0].sum(1)
-            Am = A * live
-            prof[l] += torch.zeros(H, len(OFFSETS), device=dev).scatter_add_(1, binof.view(1, -1).expand(H, -1), Am.reshape(H, -1))
-            for key, msk in (("any", live), ("far", live & (dist >= 4))):
-                v = (A * msk).reshape(H, -1)
-                kk = min(32, v.shape[1])
-                tv, ti = v.topk(kk, dim=1)
-                pos = torch.stack([torch.full_like(ti, d), ti // T, ti % T], -1)
-                cv, cp = torch.cat([lists[key][0][l], tv], 1), torch.cat([lists[key][1][l], pos], 1)
-                sel = cv.topk(32, dim=1).indices
-                lists[key][0][l], lists[key][1][l] = cv.gather(1, sel), cp.gather(1, sel[..., None].expand(-1, -1, 3))
-        nq += T - 1
+            m.model(input_ids=x)
+        nq += x.shape[1] - 1
         if d % 200 == 0:
             print(f"heads: {d}/{n} texts, {time.time() - t0:.0f} s", flush=True)
+    for h in hooks:
+        h.remove()
     np.savez(a.root / "heads.npz", sink=(sink / max(nq, 1)).cpu().numpy(), profile=(prof / max(nq, 1)).cpu().numpy(), offsets=np.array(OFFSETS),
              top_any_w=lists["any"][0].cpu().numpy(), top_any_pos=lists["any"][1].cpu().numpy(),
              top_far_w=lists["far"][0].cpu().numpy(), top_far_pos=lists["far"][1].cpu().numpy(), texts=n)

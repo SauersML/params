@@ -642,7 +642,7 @@ def target_of(a):
         tg.make_groups(parts)
         return tg, parts
     tg = VPDTarget(a.task, a.device)
-    circ = json.loads(a.circuit.read_text())
+    circ = json.loads(a.circuit.read_text()) if a.circuit else {"nodes": []}
     return tg, [(n, int(p), int(c)) for n, c, p in circ["nodes"] if n.startswith("h.")]
 
 
@@ -686,31 +686,66 @@ def cmd_read(a) -> None:
                                            "spend_usd", "by_kind")}))
 
 
+def check_lines(tg, text: str) -> dict:
+    """An answer's INV lines (its own falsifiable claims, the lead's 10-14) run on the target: per line whether it
+    parses, holds on every instance, the share of instances that meet its outcome, and whether it is bold (the
+    unchanged model does not already meet its outcome: 'p < 0.4' while p is 0.95, 'top not' the prediction; a safe
+    claim earns nothing an unread text would not); share, instance share and bold share over the lines (a line that
+    does not parse fails)."""
+    rows = []
+    o0 = {"top": tg.tok(tg.y0), "p": float(tg.base[tg.y0].exp())}
+    for line in [x for x in text.splitlines() if x.strip().startswith("INV")]:
+        p = parse_inv(line, tg)
+        if p is None:
+            rows.append({"line": line, "parsed": False, "holds": False, "bold": False})
+            continue
+        ivs, outcome = p
+        outs = [tg.run(iv) for iv in ivs]
+        ok = [meets(o, outcome) for o in outs]
+        rows.append({"line": line, "parsed": True, "holds": all(ok), "instances": len(ok), "met": sum(ok), "bold": not meets(o0, outcome),
+                     "outcomes": [[iv.get("token"), o["top"], round(o["p"], 4)] for iv, o in zip(ivs, outs)]})
+    n = max(len(rows), 1)
+    return {"share_holding": sum(r["holds"] for r in rows) / n,
+            "instance_share": sum(r.get("met", 0) / r["instances"] if r.get("instances") else 0.0 for r in rows) / n,
+            "bold_holding": sum(r["holds"] and r["bold"] for r in rows) / n,
+            "lines": len(rows), "parsed": sum(r["parsed"] for r in rows), "rows": rows}
+
+
+def show(rows: list) -> None:
+    for r in rows:
+        print(("HOLDS " if r["holds"] else "fails ") + ("bold " if r.get("bold") else "safe ") + r["line"][:150], r.get("met"), "/", r.get("instances"))
+
+
 def cmd_invariants(a) -> None:
+    """A separate reader writes the invariants an explanation implies, and they are checked (check_lines)."""
     tg = VPDTarget(a.task, a.device)
     rd = Reader(a.reader, a.out.parent)
     ex = explanation_of(a.explanation)
     exs = f"An explanation of how the model computes this prediction:\n{ex}\n\n" if ex else ""
     got = rd([f"{tg.head()}\n{exs}{INV_GRAMMAR.format(n=a.n, answer=tg.tok(tg.y0))}"])[0]
-    rows = []
-    for line in [x for x in got.splitlines() if x.strip().startswith("INV")]:
-        p = parse_inv(line, tg)
-        if p is None:
-            rows.append({"line": line, "parsed": False, "holds": False})
-            continue
-        ivs, outcome = p
-        outs = [tg.run(iv) for iv in ivs]
-        ok = [meets(o, outcome) for o in outs]
-        rows.append({"line": line, "parsed": True, "holds": all(ok), "instances": len(ok), "met": sum(ok),
-                     "outcomes": [[iv.get("token"), o["top"], round(o["p"], 4)] for iv, o in zip(ivs, outs)]})
-    share = sum(r["holds"] for r in rows) / max(len(rows), 1)
-    inst = sum(r.get("met", 0) / r["instances"] if r.get("instances") else 0.0 for r in rows) / max(len(rows), 1)
-    res = {"explanation": a.explanation, "reader": a.reader, "share_holding": share, "instance_share": inst, "lines": len(rows),
-           "parsed": sum(r["parsed"] for r in rows), "spend_usd": rd.spend.total, "rows": rows, "raw": got}
+    res = {"explanation": a.explanation, "reader": a.reader, **check_lines(tg, got), "spend_usd": rd.spend.total, "raw": got}
     a.out.write_text(json.dumps(res, indent=1))
-    print(json.dumps({k: res[k] for k in ("explanation", "share_holding", "instance_share", "lines", "parsed", "spend_usd")}))
-    for r in rows:
-        print(("HOLDS " if r["holds"] else "fails ") + r["line"][:150], r.get("met"), "/", r.get("instances"))
+    print(json.dumps({k: res[k] for k in ("explanation", "share_holding", "instance_share", "bold_holding", "lines", "parsed", "spend_usd")}))
+    show(res["rows"])
+
+
+def cmd_answer(a) -> None:
+    """An oracle answer (English, and INV lines in the grammar: its own invariants) scored both ways: its INV lines
+    checked on the target, and its English (the INV lines left out) through the reader on a question file, against
+    the no-explanation result of the same questions (--baseline)."""
+    text = a.answer.read_text()
+    english = "\n".join(x for x in text.splitlines() if not x.strip().startswith("INV")).strip()
+    tg = target_of(a)[0]
+    res = {"answer": str(a.answer), **check_lines(tg, text)}
+    if a.questions:
+        ivs = [json.loads(x) for x in a.questions.read_text().splitlines()]
+        rd = Reader(a.reader, a.out.parent)
+        base = json.loads(a.baseline.read_text())["accuracy"] if a.baseline else None
+        res["reader"] = {k: v for k, v in rewards(rd, ivs, [english or None], base)[0].items() if k not in ("rows", "raw")}
+        res["spend_usd"] = rd.spend.total
+    a.out.write_text(json.dumps(res, indent=1))
+    print(json.dumps({k: res[k] for k in ("share_holding", "instance_share", "bold_holding", "lines", "parsed")}), res.get("reader"))
+    show(res["rows"])
 
 
 def main():
@@ -733,12 +768,20 @@ def main():
     i.add_argument("--explanation", required=True)
     i.add_argument("--out", type=Path, required=True)
     i.add_argument("--n", type=int, default=8)
-    for p in (r, i):
+    w = sub.add_parser("answer")
+    w.add_argument("--answer", type=Path, required=True, help="the answer: English and its INV lines")
+    w.add_argument("--task", default="text9000")
+    w.add_argument("--circuit", type=Path, help="vpd4l: unused here (the target's parts come from the answer)")
+    w.add_argument("--model", help="a Hugging Face model in place of vpd4l")
+    w.add_argument("--questions", type=Path, help="also the reader reward of its English on these questions")
+    w.add_argument("--baseline", type=Path)
+    w.add_argument("--out", type=Path, required=True)
+    for p in (r, i, w):
         p.add_argument("--reader", default=READER)
-    for p in (q, i):
+    for p in (q, i, w):
         p.add_argument("--device")
     a = ap.parse_args()
-    {"questions": cmd_questions, "read": cmd_read, "invariants": cmd_invariants}[a.what](a)
+    {"questions": cmd_questions, "read": cmd_read, "invariants": cmd_invariants, "answer": cmd_answer}[a.what](a)
 
 
 if __name__ == "__main__":

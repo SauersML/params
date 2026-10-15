@@ -21,7 +21,8 @@ the countries, DISTRACT: the facts are as present, the model's conclusion elsewh
 measurements go to ITEMS.candidates.jsonl.
 Pairs, minimal first (the lead's 10-14: a system cannot pass by reading surface cues): a not-inferred text, and the same
 sentences plus one DECIDING sentence naming a city that makes it inferred. Then matched pairs: an inferred and a
-not-inferred item of the same country. "Not inferred" is behavioural and interventional: it does not exclude a state
+not-inferred item of the same country and family. Then every inferred and not-inferred candidate unpaired (pair -1):
+the hit rate on inferred texts that name no city. "Not inferred" is behavioural and interventional: it does not exclude a state
 somewhere encoding the conclusion; reports say so. The countries and sentences avoid fleet's held-out persona organisms
 (Peru, Portugal, Iceland, Ghana, Kenya, Chile, Estonia, Norway, Vietnam, Morocco and their values) and every G1
 training category: a held-out task.
@@ -183,6 +184,9 @@ def build(a) -> None:
         for k, (kind, n_, p_) in enumerate(pairs):
             for it in (n_, p_):
                 fh.write(json.dumps({"pair": k, "pair_kind": kind, **it}) + "\n")
+        for it in items:  # every labelled candidate unpaired: inferred ones without a city, beyond the few matched pairs
+            if it["label"] != "ambiguous":
+                fh.write(json.dumps({"pair": -1, "pair_kind": "unpaired", **it}) + "\n")
     print(f"{len(items)} candidates: {dict(Counter((i['family'], i['label']) for i in items))}; per country not inferred "
           f"{dict(Counter(i['country'] for i in items if i['label'] == 'not_inferred'))}; "
           f"{sum(k == 'minimal' for k, _, _ in pairs)} minimal and {sum(k == 'matched' for k, _, _ in pairs)} matched pairs to {a.out}")
@@ -225,6 +229,9 @@ def score(a) -> None:
                                       "country": it["country"], "system": "oracle text-only" if text_only else "oracle",
                                       "p": {c: pr[k] / z for k, c in enumerate(names)}, "p_none": pr[-1] / z}) + "\n")
         del o
+    if a.no_ao:
+        out.close()
+        return
     import ao_verify
 
     tg = ao_verify.Target(cao.MODEL, a.device)
@@ -257,7 +264,7 @@ def curves(a) -> None:
     plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
     fig, axes = plt.subplots(1, len(systems), figsize=(6.5 * len(systems), 5.6), facecolor="white", squeeze=False)
     groups = [(f"{k}: {f}", lambda r, k=k, f=f: r["pair_kind"] == k and r["family"] == f)
-              for k in ("minimal", "matched") for f in ("combinable", "distractor")]
+              for k in ("minimal", "unpaired") for f in ("combinable", "distractor")]
     colors = ["#d62728", "#ff7f0e", "#1f77b4", "#2ca02c"]
     for ax, sname in zip(axes[0], systems):
         for (gname, sel), col in zip(groups, colors):
@@ -296,6 +303,7 @@ def main():
     s_ = sub.add_parser("score")
     s_.add_argument("--items", type=Path, required=True)
     s_.add_argument("--adapter", help="the causal oracle's adapter (without it, the released AO alone)")
+    s_.add_argument("--no-ao", action="store_true", help="skip the released AO (scored once already)")
     s_.add_argument("--out", type=Path, required=True)
     s_.add_argument("--device")
     c_ = sub.add_parser("curves")

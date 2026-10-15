@@ -2,7 +2,8 @@
 # The causal activation oracle (cao.py) on a rented GPU, into ~/mpd-data/runpod/oracle-pathg-$RUN/:
 #   RUN=gen1 MODE=gen TEXTS=4000 [PROCS=2] bash experiments/oracle/cao/cao_pod.sh [HOURS]     examples (PROCS processes, seeds 1..)
 #   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] [VECTORS=<.pt>] [SAVE_EVERY=N] [MICRO=N] bash ...  SFT from the released adapter
-#   RUN=eval1 MODE=eval ITEMS=<h2h items> ADAPTER_DIR=<a trained adapter on the Mac> bash ...  the gate's questions
+#   RUN=eval1 MODE=eval ITEMS=<h2h items> ADAPTER_DIR=<a trained adapter on the Mac> bash ...  the gate's questions (and the controls);
+#       [INF=<inference items>] the never-made inferences; [ORGS=<organisms dir>] planted truths; [AOBASE=1] the released AO too
 #   RUN=inf1 MODE=inference [PER=150] bash ... [HOURS]                                       inference.py build (never-made inferences)
 #   RUN=org1 MODE=organisms bash ... [HOURS]                                                  organisms.py all (planted truths)
 #   RUN=oe1 MODE=orgeval ORGS=<organisms dir on the Mac> [ADAPTER_DIR=...] UPLOAD_MB=1500 bash ...  planted truths recovered
@@ -19,6 +20,7 @@ git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive
 [ -n "${ADAPTER_DIR:-}" ] && cp -r "$ADAPTER_DIR" "$S/adapter"
 [ -n "${ORGS:-}" ] && cp -r "$ORGS" "$S/organisms"
 [ -n "${VECTORS:-}" ] && cp "$VECTORS" "$S/vectors.pt"
+[ -n "${INF:-}" ] && cp "$INF" "$S/inf.jsonl"
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"
 case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
@@ -35,7 +37,11 @@ ${VECTORS:+--vectors $S/vectors.pt} --save-every ${SAVE_EVERY:-2000} > $O/train.
   eval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B}  # (ADAPTER_DIR: a step_N directory)
         WORK="python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval.jsonl > $O/eval.log 2>&1; \
 python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval_text_only.jsonl --text-only > $O/eval_text_only.log 2>&1; \
-python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval_wrong_text.jsonl --wrong-text > $O/eval_wrong_text.log 2>&1" ;;
+python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval_wrong_text.jsonl --wrong-text > $O/eval_wrong_text.log 2>&1; \
+${AOBASE:+python -u cao.py eval --items $S/items.jsonl --out $O/eval_ao.jsonl > $O/eval_ao.log 2>&1;} \
+${INF:+python -u inference.py score --items $S/inf.jsonl --adapter $AD --out $O/inference.jsonl --no-ao > $O/inference.log 2>&1;} \
+${ORGS:+python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval.jsonl > $O/orgeval.log 2>&1; \
+python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgeval_text_only.jsonl --text-only > $O/orgeval_text_only.log 2>&1;} true" ;;
 esac
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S; \
 tar -xf $S.tar -C $S; cd $S/experiments/oracle/cao; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \

@@ -22,8 +22,8 @@ flowchart TB
   V --> O
   I -. observations with uncertainty .-> O
 
-  P["<b>MEASURED · native evidence reader pilot</b><br/>Fixed neuron pair; 24 new scaling questions / 3 contexts.<br/>36 forwards; unchanged weights and exact clean/no-op checks.<br/>18 near-zero effects, 6 positive; no winning-token changes.<br/>Reader valid answers: true evidence 4/24, absent 24/24,<br/>permuted 8/24; five evidence-rich calls ran out of tokens.<br/>Unchanged probability wins: 0.088 bits error vs absent 1.033.<br/>WHY · evidence utility and answer delivery must be measured.<br/>NEXT · opt-in answers first; fresh context-relevant questions.<br/>Preserve this failure; no replay-as-transfer or training claim.<br/>OWNER · root / native oracle team"]
-  R["<b>Native measurement reliability · root team</b><br/>FIXED · neuron ranking preserves downstream gradient paths;<br/>an untested intervention family cannot count as a pass.<br/>FIXED · one selected-target forward for all oracle vectors,<br/>including the target adapter’s effective native weights.<br/>WHY · wrong vectors or derivatives corrupt oracle evidence.<br/>NEXT · use corrected measurements on relevant 8B questions.<br/>Existing 8B job 20601 is user-held; do not duplicate it."]
+  P["<b>MEASURED · reader pilot failed</b><br/>24 new scaling questions, 3 contexts; 36 forwards.<br/>No top-token changes; unchanged probability beats the reader.<br/>True / absent / wrong evidence: 4 / 24 / 8 valid answers.<br/>Five evidence-rich calls exhausted their token allowance.<br/>NEXT · answers first; relevant units and fresh questions.<br/>WHY · measure evidence utility before oracle training.<br/>OWNER · root / native oracle team"]
+  R["<b>FIXED · native measurement reliability</b><br/>Full downstream gradients; untested families cannot pass.<br/>All oracle vectors: one forward using the selected target.<br/>WHY · correct evidence and honest cost; 30 tests pass.<br/>NEXT · relevant 8B questions; job 20601 is user-held.<br/>OWNER · root / native oracle team"]
   I -. measurement integrity .-> R
   R -. reliable inputs .-> O
   Q -. current pilot .-> P
@@ -1296,3 +1296,5 @@ flowchart TB
 %% Prefixbenchcachebug fixed: isolatedclearedcachebeforeeachmodeandafterwarmup, finallyrestorespriorcache/devicepolicy. Two rootregressionsPASS0.51s; CIcollectsnewtest. CPUprobe prepared22boundedforwardequivalents,batches1/3/32,>=64suffix,startvschangedpositionreported, fullprobs/KL/rankequality; notrunatpublication, no productionoptimizationenabled.
 
 %% 2026-10-15 root: bf3a744175e3ac7830c8c03ed1e2274b5e838327 published selected-target single-forward native capture. 13 tiny Qwen/PEFT tests pass; independent review verifies additive/merged LoRA, fail-closed unsupported variants/stochastic dropout, cleanup on error. N unit blocks plus hidden states now one counted forward rather than N+1; selected organism adapter used for activations and effective weights. Writes remain FP32 algebraic contributions, not bitwise BF16 projector decompositions. No 8B timing or oracle quality claim from these tests.
+
+%% Root plan render38807030234 failed size guard at3523x4647.5 (16.37M pixels), before committing an image. Condensed active pilot/reliability nodes while preserving detailed history, rather than weakening render/readability guard.

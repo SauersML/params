@@ -182,10 +182,11 @@ class Neurons:
         n = 0
         for ids in seqs:
             pos = list(range(len(ids)))
-            lp0 = torch.log_softmax(self.logits(ids, pos)[0], -1)
-            for s0 in range(0, R, rows):
+            lp0 = torch.log_softmax(self.logits(ids, pos, B=rows)[0], -1)        # at the batch size of the runs below
+            for s0 in range(0, R, rows):                                         # (bfloat16 kernels change with it)
                 f = fracs[s0:s0 + rows].float()
-                l0 = None if live0 is None else torch.as_tensor(live0[s0:s0 + rows], dtype=torch.bool)
+                f = torch.cat([f, f[:1].expand(rows - len(f), -1)]) if len(f) < rows else f
+                l0 = None if live0 is None else torch.as_tensor(list(live0[s0:s0 + rows]) + [False] * (len(f) - len(live0[s0:s0 + rows])), dtype=torch.bool)
                 cnt = torch.zeros(len(f), self.L, device=self.dev)
 
                 def edit(i, h, f=f, l0=l0, cnt=cnt):
@@ -194,11 +195,12 @@ class Neurons:
                         keep[l0.to(h.device), 0] = True
                     cnt[:, i] = keep.sum((1, 2)).float().to(cnt.device)
                     return h * keep.to(h.dtype)
-                lp1 = torch.log_softmax(self.logits(ids, pos, edit=edit, B=len(f)), -1)
+                n_r = min(rows, R - s0)
+                lp1 = torch.log_softmax(self.logits(ids, pos, edit=edit, B=len(f)), -1)[:n_r]
                 d = (lp0.exp()[None] * (lp0[None] - lp1.to(lp0.device))).sum(-1).sum(-1) / math.log(2)
-                kl[s0:s0 + len(f)] += d.double().cpu()
-                agree[s0:s0 + len(f)] += (lp1.argmax(-1) == lp0.argmax(-1).to(lp1.device)[None]).sum(-1).double().cpu()
-                strong[s0:s0 + len(f)] += cnt.double().cpu()
+                kl[s0:s0 + n_r] += d.double().cpu()
+                agree[s0:s0 + n_r] += (lp1.argmax(-1) == lp0.argmax(-1).to(lp1.device)[None]).sum(-1).double().cpu()
+                strong[s0:s0 + n_r] += cnt[:n_r].double().cpu()
                 del lp1
             n += len(ids)
         self.thr = thr

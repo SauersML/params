@@ -21,9 +21,10 @@ The VPD builder on one text:
    run, then track_pp, input scope and interchange_pp (path-patched, floor 0.9: VPD's whole answer scores 1 there)
    on PATH_BATCH sizes from the smallest meeting point to every unit, then ROUNDS of
    PATH_BATCH sizes between the largest under its floors and the smallest meeting them (none: every unit);
-   then N and activation patching near and far (necessity_spec, donors_search: floor 0.9, and 0.9 of every unit's
-   own patching) on the sizes meeting those, smallest first, a few at a time (none: every unit); every floor with
-   MARGIN, the family's noise, and at most every unit's own score;
+   then N, activation patching near and far and the omitted family (necessity_spec, donors_search, _omitted_family:
+   floor 0.9, and 0.9 of every unit's own patching) on the sizes meeting those, smallest first, a few at a time (none:
+   every unit); every floor with MARGIN, the family's noise, and at most every unit's own score (text9004's 407-part
+   circuit at 17 positions, built without the omitted family, scored it -0.1 on eval against 0.9);
 4. chunks: the chosen units in CHUNKS runs of the ranking, least important first, PATH_BATCH at a time each removed
    from the current set and measured (point and the path-patched families, then N and patching on those passing),
    the passing ones removed together when that passes too, else the least important alone;
@@ -363,17 +364,18 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     met = sorted(m for m, ok in at.items() if ok)
     clock("size")
 
-    def extra(gs):                                           # N and activation patching, the costlier families
-        nn_, dn = ge.necessity_spec(tx, gs, "search"), ge.donors_search(tx, gs)
-        return [{f: goal_eval.family_score(r, f) for f, r in (("N", a), ("patching_near", b), ("patching_far", b))}
-                for a, b in zip(nn_, dn)]
+    def extra(gs):                                           # N, activation patching and the omitted family: the
+        nn_, dn = ge.necessity_spec(tx, gs, "search"), ge.donors_search(tx, gs)   # costlier families
+        om = ge._omitted_family(tx, [goal_eval._c_graph(g, tx.targets, nat.C) for g in gs])
+        return [{f: goal_eval.family_score(r, f) for f, r in (("N", a), ("patching_near", b), ("patching_far", b), ("omitted", c))}
+                for a, b, c in zip(nn_, dn, om)]
     met = met or [N]                                         # the sizes meeting the cheap floors, smallest first
     cand = met[:PATH_BATCH - 1]
     got = extra([_graph(order[:m]) for m in cand] + [_graph(order)])
     ref = got[-1]                                            # every unit: patching's reference (VPD at the positions)
-    floors.update({"N": FLOOR + MARGIN["N"], **{f: (None if ref[f] is None else FLOOR * max(0.0, min(1.0, ref[f])) + MARGIN[f])
-                                                for f in ("patching_near", "patching_far")}})
-    for f in ("N", "patching_near", "patching_far"):         # (capped at every unit's own, as above)
+    floors.update({"N": FLOOR + MARGIN["N"], "omitted": FLOOR,
+                   **{f: (None if ref[f] is None else FLOOR * max(0.0, min(1.0, ref[f])) + MARGIN[f]) for f in ("patching_near", "patching_far")}})
+    for f in ("N", "patching_near", "patching_far", "omitted"):   # (capped at every unit's own, as above)
         if floors[f] is not None and ref[f] is not None:
             floors[f] = min(floors[f], ref[f])
     rec["extra"] = [{"size": m, **x} for m, x in zip(cand + [N], got)]

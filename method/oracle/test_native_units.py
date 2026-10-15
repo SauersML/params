@@ -303,3 +303,84 @@ def test_prune_to_bits(tiny):
     for gl, m in got.items():
         assert native_units.native_bits(m, targets, 12, per) <= gl
     assert set(got[goals[0]].units()) <= set(got[goals[1]].units())
+
+
+def mean_hooked(nat, ids, targets, live, means):
+    """log q at the targets from vpd_model's own forward with each output matrix reading the set's units live and every
+    other unit at its mean (Site.in_fn on o_proj's and down_proj's inputs)."""
+    tg = nat.target
+    hd = tg.hd
+    try:
+        for i in range(tg.n_layer):
+            hm = live[0][i].repeat_interleave(hd, dim=1)  # [T, H * hd]
+            mh = means["heads"][i].reshape(-1)
+            tg.site(native.site_name(i, "o_proj")).in_fn = lambda x, hm=hm, mh=mh: x * hm + (1 - hm) * mh
+            nm, mn = live[1][i], means["neurons"][i]
+            tg.site(native.site_name(i, "down_proj")).in_fn = lambda x, nm=nm, mn=mn: x * nm + (1 - nm) * mn
+        nat.vpd.clear()
+        hidden = tg.hidden(torch.tensor([ids]))
+    finally:
+        for i in range(tg.n_layer):
+            tg.site(native.site_name(i, "o_proj")).in_fn = None
+            tg.site(native.site_name(i, "down_proj")).in_fn = None
+    return torch.log_softmax((hidden[:, targets] @ tg.wte.T).float(), -1)
+
+
+@pytest.fixture(scope="module")
+def mean_case(tiny):
+    nat, ids, targets, nu = tiny
+    g = torch.Generator().manual_seed(5)
+    means = {"heads": torch.randn(nat.target.n_layer, nat.target.n_head, nat.target.hd, generator=g) * 0.3,
+             "neurons": torch.randn(nat.target.n_layer, nu.Dm, generator=g).abs() * 0.2}
+    return nat, ids, targets, means, native_units.MeanUnits(nat, ids, targets, means)
+
+
+def test_mean_units_are_the_models_forward(mean_case):
+    """MeanUnits' runs equal vpd_model's own forward with the left-out units' outputs at their means, on random and
+    fractional sets; every unit live is the model; none live is the all-mean run."""
+    nat, ids, targets, means, mu = mean_case
+    g = torch.Generator().manual_seed(6)
+    ones = tuple(x[0] for x in mu.ones())
+    rows = [ones, tuple(x * 0 for x in ones)] + [tuple((torch.rand(x.shape, generator=g) < 0.5).float() for x in ones) for _ in range(3)]
+    rows.append(tuple(torch.rand(x.shape, generator=g) for x in ones))  # strengths in between (the gradients' path)
+    with torch.no_grad():
+        got = mu.logq(tuple(torch.stack([r[j] for r in rows]) for j in range(2)))
+    for b, r in enumerate(rows):
+        assert float((got[b] - mean_hooked(nat, ids, targets, r, means)[0]).abs().max()) < 1e-4
+    assert float(carry.kl(nat.reference([ids], targets), got[:1])[0]) < 1e-5
+
+
+def test_mean_units_frozen_and_kl(mean_case):
+    """Units frozen at their clean values make the clean run whatever is live inside; kl batches rows as one run each,
+    and lp is log2 p of the model's top token."""
+    nat, ids, targets, means, mu = mean_case
+    ones = tuple(x[0] for x in mu.ones())
+    g = torch.Generator().manual_seed(7)
+    inside = tuple((torch.rand(x.shape, generator=g) < 0.3).float() for x in ones)
+    outside = tuple(x == 0 for x in inside)
+    assert mu.kl([inside], [outside])[0] < 1e-5
+    rows = [inside, ones, tuple(x * 0 for x in ones)]
+    one_by_one = [mu.kl([r])[0] for r in rows]
+    assert all(abs(a - b) < 1e-5 for a, b in zip(mu.kl(rows), one_by_one))
+    y = mu.ref[0].argmax(-1)
+    assert abs(mu.kl([ones], lp=True)[0] - float(mu.ref[0].gather(-1, y[:, None]).sum()) / math.log(2.0)) < 1e-4
+
+
+def test_build_native_meets_its_target(mean_case):
+    """build_native's circuit meets the KL target asked for (measured again on its mask), smaller than every unit;
+    the mediated share of the whole model is 1 (nothing outside to freeze) and the frozen run is the clean one."""
+    import types
+
+    nat, ids, targets, means, mu = mean_case
+    ge, tx = types.SimpleNamespace(nat=nat), types.SimpleNamespace(ids=ids, targets=targets, seed=3)
+    empty = mu.kl([tuple(x[0] * 0 for x in mu.ones())])[0]
+    goal = empty * 0.05
+    S, rec = native_units.build_native(ge, tx, kl_target=goal, means=means)
+    live = (S.heads[:, :mu.T].float(), S.neurons[:, :mu.T].float())
+    assert rec["kl"] <= goal and abs(mu.kl([live])[0] - rec["kl"]) < 1e-5
+    assert 0 < S.count() < rec["of"] and rec["units"] == S.count()
+    whole = native_units.Mask(*(x[0].bool() for x in mu.ones()))
+    ms = native_units.mediated_share(ge, tx, whole, means, candidates=16)
+    assert abs(ms["lp"] - ms["lp_frozen"]) < 1e-4 and all(abs(ms[f"top{k}"]["share"] - 1) < 1e-4 for k in (1, 3, 5))
+    part = native_units.mediated_share(ge, tx, S, means, candidates=16)
+    assert abs(part["lp"] - part["lp_frozen"]) < 1e-4

@@ -49,6 +49,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -295,6 +296,288 @@ class NativeUnits:
                 out[r] = k
             native.free(self.nat.dev)
         return out
+
+
+# ---- mean ablation (the lead's 10-14 native builder): a unit left out writes its mean, everything else runs live
+
+ENTRIES = 2 ** 27  # mask floats per batched run (every layer and position's heads and neurons of each row)
+
+
+class MeanUnits:
+    """Native-unit circuits on one text in mean-ablation semantics: a unit kept computes as in the model from the run's
+    own inputs; a unit left out writes its mean over the reference texts (unit_means) in place of its output (a head
+    its output before o_proj, a neuron its value after the GELU); the embedding, every norm, every attention pattern and
+    the residual stream run live. Every unit kept is the model; none kept is the all-mean run. Removing a unit from the
+    whole model is a real-model edit. The text is cut after its last target (the model is causal).
+
+    logq(live, frozen=None): log q at the targets [B, targets, V]; live = (heads [B or 1, L, T, H], neurons [B or 1, L, T,
+    d_mlp]) in [0, 1], 1 a unit's own output, 0 its fill (in between a mix: integrated gradients); the fill is the
+    unit's mean, or where frozen (bool, same shapes) its value in the clean run (capture()): the mediated share's
+    outside units. Differentiable in live."""
+
+    def __init__(self, nat: native.Native, ids: list[int], targets: list[int], means: dict | None):
+        tg = nat.target
+        self.nat, self.tg, self.dev = nat, tg, nat.dev
+        self.T = max(targets) + 1
+        self.ids, self.targets = list(ids)[:self.T], list(targets)
+        self.L, self.H, self.hd = tg.n_layer, tg.n_head, tg.hd
+        self.W = {k: [tg.site(native.site_name(i, k)).W for i in range(self.L)] for k in ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")}
+        self.Dm = self.W["c_fc"][0].shape[0]
+        self.emb = tg.embed(torch.tensor(self.ids, device=self.dev))
+        self.ref = nat.reference([list(ids)], self.targets) if means is not None else None  # (capture alone: none)
+        self.means = None if means is None else {k: means[k].to(self.dev) for k in ("heads", "neurons")}
+        self._clean = None
+
+    def rows(self) -> int:
+        """Rows per batched run (ENTRIES mask floats)."""
+        return max(1, ENTRIES // (self.L * self.T * (self.H + self.Dm)))
+
+    def ones(self, B: int = 1) -> tuple:
+        return (torch.ones(B, self.L, self.T, self.H, device=self.dev), torch.ones(B, self.L, self.T, self.Dm, device=self.dev))
+
+    def logq(self, live: tuple, frozen: tuple | None = None, capture: dict | None = None) -> torch.Tensor:
+        tg, T, H, hd = self.tg, self.T, self.H, self.hd
+        hm, nm = live
+        B = max(hm.shape[0], nm.shape[0])
+        if frozen is not None and self._clean is None:
+            self.capture()
+        x = self.emb[None].expand(B, -1, -1)
+        for i in range(self.L):
+            z = tg.norm(x, 2 * i)
+            heads = lambda y: y.view(B, T, H, hd).transpose(1, 2)  # noqa: E731
+            q, k, v = (heads(z @ self.W[kd][i].T) for kd in ("q_proj", "k_proj", "v_proj"))
+            y = F.scaled_dot_product_attention(tg._rope(q, T), tg._rope(k, T), v, is_causal=True)  # [B, H, T, hd]
+            if capture is not None:
+                capture.setdefault("heads", []).append(y[0].transpose(0, 1))  # [T, H, hd]
+            if self.means is not None:
+                fill = self.means["heads"][i][None, :, None, :]  # [1, H, 1, hd]
+                if frozen is not None:
+                    fill = torch.where(frozen[0][:, i].transpose(1, 2)[..., None], self._clean["heads"][i].transpose(0, 1)[None], fill)
+                m = hm[:, i].transpose(1, 2)[..., None]  # [B, H, T, 1]
+                y = m * y + (1 - m) * fill
+            x = x + y.transpose(1, 2).reshape(B, T, -1) @ self.W["o_proj"][i].T
+            g = tg.act(tg.norm(x, 2 * i + 1) @ self.W["c_fc"][i].T)  # [B, T, d_mlp]
+            if capture is not None:
+                capture.setdefault("neurons", []).append(g[0])
+            if self.means is not None:
+                fill = self.means["neurons"][i][None, None, :]
+                if frozen is not None:
+                    fill = torch.where(frozen[1][:, i], self._clean["neurons"][i][None], fill)
+                g = nm[:, i] * g + (1 - nm[:, i]) * fill
+            x = x + g @ self.W["down_proj"][i].T
+        return torch.log_softmax(tg.unembed(tg.norm(x[:, self.targets], -1)).float(), -1)
+
+    @torch.no_grad()
+    def capture(self) -> dict:
+        """Every unit's output in the clean run: {"heads": [L, T, H, hd], "neurons": [L, T, d_mlp]} (kept)."""
+        if self._clean is None:
+            cap = {}
+            self.logq(self.ones(), capture=cap)
+            self._clean = {k: torch.stack(v) for k, v in cap.items()}
+        return self._clean
+
+    @torch.no_grad()
+    def kl(self, live_rows, frozen_rows=None, lp: bool = False) -> list[float]:
+        """KL in bits of the model at the targets from each row's run (lp: log2 p of the model's top token at each
+        target, summed, instead); live_rows (and frozen_rows) yield one row's (heads, neurons) each [L, T, H] and [L, T,
+        d_mlp], run rows() at a time."""
+        out, part, fpart = [], [], []
+        fit = iter(frozen_rows) if frozen_rows is not None else None
+        y = self.ref[0].argmax(-1)
+
+        def flush():
+            live = tuple(torch.stack([p[j] for p in part]).float() for j in range(2))
+            fr = tuple(torch.stack([p[j] for p in fpart]) for j in range(2)) if fit is not None else None
+            lq = self.logq(live, fr)
+            if lp:
+                out.extend((lq.gather(-1, y.view(1, -1, 1).expand(lq.shape[0], -1, 1)).squeeze(-1).sum(-1) / math.log(2.0)).tolist())
+            else:
+                out.extend(carry.kl(self.ref, lq).tolist())
+            part.clear()
+            fpart.clear()
+            native.free(self.dev)
+        for row in live_rows:
+            part.append(row)
+            if fit is not None:
+                fpart.append(next(fit))
+            if len(part) >= self.rows():
+                flush()
+        if part:
+            flush()
+        return out
+
+
+# ---- the native builder (the lead's 10-14: builder_fast's units="neurons"; the same recipe as pymove's VPD builder)
+
+FISHER_SAMPLES = 32  # labels drawn from the model's distribution at each target for the ranking's Fisher
+CLEAN_MAX = 512      # the inert cleanup measures single removals of at most this many units (the lowest-ranked kept)
+INERT = 1e-3         # a unit whose single removal moves the KL by less than this many bits is inert
+
+
+def log_sizes(n: int) -> list[int]:
+    """1 to n on a log scale (two steps an octave), n included (connect.sizes)."""
+    return sorted({min(n, int(round(2 ** (e / 2)))) for e in range(0, int(2 * math.log2(max(n, 1))) + 2)} | {n})
+
+
+def kl_goal(ge: goal_eval.GoalEval, tx: goal_eval.Text, f1: float = 0.9) -> float:
+    """The point KL a native circuit must reach: a VPD circuit's at F1 = f1 on goal_eval's log scale with the live
+    remainders' bounds (KL_empty, KL_VPD), exp(ln KL_empty - f1 ln(KL_empty / KL_VPD)): native and VPD circuits at the
+    same absolute fidelity."""
+    e0, v0 = ge._bounds(tx, "live")
+    return math.exp(math.log(e0) - f1 * (math.log(e0) - math.log(max(v0, goal_eval.KL_RESOLUTION))))
+
+
+def fisher(mu: MeanUnits, seed: int, samples: int = FISHER_SAMPLES) -> torch.Tensor:
+    """Every unit's sampled-label Fisher at the model, flat (heads [L, T, H] then neurons [L, T, d_mlp]): 1/2 E_v
+    (d log q_v / d m_u)^2 at every unit live, v drawn from the model's distribution at each target (numpy's stream from
+    seed: the same draws on every device), the second-order KL rise of mean-ablating u alone (the first order is zero
+    at the model). On text9031 its order keeps KL 0.41 bits with 95% of the units mean-ablated, the integrated
+    gradients' (all-mean to the model) 3.9 bits at 10%, a random order's 19.5 bits at 90%."""
+    p = mu.ref[0].double().exp().cpu().numpy()
+    rng = np.random.default_rng([int(seed) % (1 << 63), 31])
+    v = torch.tensor(np.stack([rng.choice(p.shape[1], samples, p=row / row.sum()) for row in p], 1), device=mu.dev)  # [S, targets]
+    out = torch.zeros(mu.L * mu.T * (mu.H + mu.Dm), device=mu.dev)
+    step = max(1, mu.rows() // 3)  # (a backward pass holds the activations and the masks' gradients)
+    for s0 in range(0, samples, step):
+        vv = v[s0:s0 + step]
+        hm, nm = (x.expand(len(vv), -1, -1, -1).clone().requires_grad_(True) for x in mu.ones())
+        mu.logq((hm, nm)).gather(-1, vv[..., None]).sum().backward()
+        out += 0.5 * torch.cat([hm.grad.pow(2).sum(0).flatten(), nm.grad.pow(2).sum(0).flatten()]) / samples
+        native.free(mu.dev)
+    return out
+
+
+def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | None = None, means: dict | None = None,
+                 log=None) -> tuple[Mask, dict]:
+    """A circuit of native units (heads and neurons at positions) in mean-ablation semantics (MeanUnits), the smallest
+    the recipe finds whose point KL is at most kl_target (kl_goal by default), every decision measured, the Fisher only
+    ordering:
+      (1) rank: every unit by its sampled-label Fisher at the model (fisher: one batched backward pass);
+      (2) prefix: the top k units for k on a log scale (up to every unit, the model), measured, the smallest passing;
+          then halving between it and the size below that failed;
+      (3) inert cleanup: the largest log-scale suffix of the lowest-ranked kept units whose removal still passes, then
+          the single removals of the CLEAN_MAX lowest-ranked kept units measured and those under INERT bits removed
+          together where that still passes (else the most inert half, and so on).
+    The positions are those the kept units sit at (the ranking chooses them). Returns (Mask over the whole text,
+    record)."""
+    nat = ge.nat
+    t0 = time.perf_counter()
+    means = means if means is not None else unit_means(nat)
+    mu = MeanUnits(nat, tx.ids, tx.targets, means)
+    L, T, H, Dm, dev = mu.L, mu.T, mu.H, mu.Dm, mu.dev
+    goal = kl_target if kl_target is not None else kl_goal(ge, tx)
+    nh = L * T * H
+    stamp = {}
+
+    def mask_of(idx) -> tuple:  # the units at flat indices idx live
+        h = torch.zeros(nh, device=dev)
+        n = torch.zeros(L * T * Dm, device=dev)
+        h[idx[idx < nh]], n[idx[idx >= nh] - nh] = 1.0, 1.0
+        return h.view(L, T, H), n.view(L, T, Dm)
+
+    # (1) rank
+    score = fisher(mu, tx.seed)
+    rank = torch.argsort(score, descending=True)
+    empty_kl = mu.kl([mask_of(rank[:0])])[0]
+    stamp["rank"] = time.perf_counter() - t0
+
+    # (2) prefix on a log scale, then halving
+    sizes = log_sizes(len(rank))
+    measured = list(zip(sizes, mu.kl(mask_of(rank[:k]) for k in sizes)))
+    k_star = next((k for k, v in measured if v <= goal), len(rank))  # (every unit is the model: KL 0)
+    lo = max([k for k, _ in measured if k < k_star] or [0])
+    kl_star = dict(measured)[k_star]
+    while k_star - lo > max(1, k_star // 64):
+        mid = (lo + k_star) // 2
+        v = mu.kl([mask_of(rank[:mid])])[0]
+        measured.append((mid, v))
+        lo, k_star, kl_star = (lo, mid, v) if v <= goal else (mid, k_star, kl_star)
+    keep = rank[:k_star]
+    stamp["prefix"] = time.perf_counter() - t0 - stamp["rank"]
+
+    # (3) inert cleanup: the lowest-ranked suffix, then measured singles
+    asc = keep.flip(0)  # lowest score first
+    js = [j for j in log_sizes(len(asc)) if j < len(asc)]
+    if js:
+        got = mu.kl(mask_of(asc[j:]) for j in js)
+        passing = [j for j, v in zip(js, got) if v <= goal]
+        if passing:
+            j = max(passing)
+            asc, kl_star = asc[j:], got[js.index(j)]
+    probe = asc[:min(CLEAN_MAX, len(asc) - 1)]
+    if len(probe):
+        cur = mask_of(asc)
+
+        def drop(i):
+            h, n = cur[0].clone(), cur[1].clone()
+            (h.view(-1) if i < nh else n.view(-1))[i if i < nh else i - nh] = 0.0
+            return h, n
+        d = np.array(mu.kl(drop(int(i)) for i in probe)) - kl_star
+        inert = probe[torch.tensor(np.argsort(d), device=dev)][:int((d < INERT).sum())]
+        while len(inert):
+            rest = asc[~torch.isin(asc, inert)]
+            v = mu.kl([mask_of(rest)])[0]
+            if v <= goal:
+                asc, kl_star = rest, v
+                break
+            inert = inert[:len(inert) // 2]
+    stamp["cleanup"] = time.perf_counter() - t0 - stamp["rank"] - stamp["prefix"]
+    h, n = mask_of(asc)
+    Tf = len(tx.ids)
+    heads = torch.zeros(L, Tf, H, dtype=torch.bool, device=dev)
+    neurons = torch.zeros(L, Tf, Dm, dtype=torch.bool, device=dev)
+    heads[:, :T], neurons[:, :T] = h.bool(), n.bool()
+    S = Mask(heads, neurons)
+    positions = sorted(set((heads.any(2).any(0) | neurons.any(2).any(0)).nonzero().flatten().tolist()))
+    rec = {"kl": kl_star, "kl_target": goal, "kl_empty": empty_kl, "positions": positions, "prefix": sorted(measured),
+           "heads": int(heads.sum()), "neurons": int(neurons.sum()), "units": S.count(), "of": len(rank),
+           "seconds": time.perf_counter() - t0, "stages": stamp}
+    if log:
+        log(f"  native: {S.count()} units ({rec['heads']} heads, {rec['neurons']} neurons) at {len(positions)} positions of {T}, "
+            f"KL {kl_star:.3f} (target {goal:.3f}, empty {empty_kl:.1f}), {rec['seconds']:.1f} s")
+    return S, rec
+
+
+def mediated_share(ge: goal_eval.GoalEval, tx: goal_eval.Text, S: Mask, means: dict | None = None, ks=(1, 3, 5),
+                   candidates: int = CLEAN_MAX) -> dict:
+    """Criterion 6's mediated share for a native circuit (generality's definition, the lead's 10-14): the circuit's units
+    ranked by their real-model single removal drop d(u) = log2 p(y) - log2 p(y | u mean-ablated) (y the model's top token
+    at each target, summed), measured for its `candidates` units of largest Fisher (a native circuit holds tens of
+    thousands); for the top k, the live drop (the real model with them mean-ablated) and the mediated drop (the circuit's
+    units live, every unit outside it frozen at its clean value, the top k mean-ablated), m_k = D_med / D_live."""
+    nat = ge.nat
+    means = means if means is not None else unit_means(nat)
+    mu = MeanUnits(nat, tx.ids, tx.targets, means)
+    T, L, H, Dm = mu.T, mu.L, mu.H, mu.Dm
+    units = [u for u in S.units() if u[2] < T]
+    f = fisher(mu, tx.seed)
+
+    def flat(u):
+        kind, l, t, j = u
+        return (l * T + t) * H + j if kind == "head" else L * T * H + (l * T + t) * Dm + j
+    fu = f[torch.tensor([flat(u) for u in units], device=mu.dev)]
+    units = [units[i] for i in torch.argsort(fu, descending=True)[:candidates].tolist()]
+
+    def removed(base, us):
+        h, n = base[0].clone(), base[1].clone()
+        for kind, l, t, j in us:
+            (h if kind == "head" else n)[l, t, j] = 0.0
+        return h, n
+    full = tuple(x[0] for x in mu.ones())
+    lp0 = mu.kl([full], lp=True)[0]
+    drops = [lp0 - v for v in mu.kl((removed(full, [u]) for u in units), lp=True)]
+    order = [units[i] for i in np.argsort(drops)[::-1]]
+    inside = (S.heads[:, :T].float(), S.neurons[:, :T].float())  # the circuit live, every other unit at its clean value
+    outside = (S.heads[:, :T] == 0, S.neurons[:, :T] == 0)
+    sets = [order[:k] for k in ks]
+    live = mu.kl((removed(full, R) for R in sets), lp=True)
+    med = mu.kl([inside] + [removed(inside, R) for R in sets], (outside for _ in range(len(sets) + 1)), lp=True)
+    out = {"units": S.count(), "measured": len(units), "single_drops": sorted(drops, reverse=True)[:16], "lp": lp0, "lp_frozen": med[0]}
+    for k, R, lv, md in zip(ks, sets, live, med[1:]):
+        d_live, d_med = lp0 - lv, med[0] - md
+        out[f"top{k}"] = {"units": [list(u) for u in R], "live": d_live, "mediated": d_med,
+                          "share": d_med / d_live if abs(d_live) > 1e-9 else None}
+    return out
 
 
 def screen(nu: NativeUnits, S: Mask, base_kl: float, log=None, units: list | None = None) -> dict:

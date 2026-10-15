@@ -30,7 +30,10 @@ def test_future_gen_text_uses_captured_signed_write_not_unsigned_column(sign,mon
     class ProbeModel:
         def logp(self,ctx):return lp[None]
         def dist_at(self,ctx):return lp.repeat(len(ctx),1)
-    probe=SimpleNamespace(m=ProbeModel(),zeroed=lambda ids,units:lp.repeat(len(units),1))
+    removals=[]
+    def zeroed(ids,units):
+        removals.append(list(units));return lp.repeat(len(units),1)
+    probe=SimpleNamespace(m=ProbeModel(),zeroed=zeroed)
     monkeypatch.setattr(cao.h2h,'CANDS',[0,1])
     monkeypatch.setattr(cao.h2h,'draws',lambda *a:None)
     monkeypatch.setattr(cao,'effects_se',lambda *a:({0:2.,1:1.},{0:.1,1:.1}))
@@ -40,10 +43,15 @@ def test_future_gen_text_uses_captured_signed_write_not_unsigned_column(sign,mon
         captured.append(list(units));oracle.passes+=1
         return None,[write.clone() for u in units]
     monkeypatch.setattr(cao,'_capture_native',capture)
-    rows=cao.gen_text(o,probe,[0]*48,random.Random(3),False)
+    rows=cao.gen_text(o,probe,[0]*48,random.Random(3),neuron_choices=True)
     future=[r for r in rows if r['cat']=='write_lens']
     assert len(future)==3 and len(captured)==1 and o.passes==1
     assert not any(r['cat']=='promotes' for r in rows)
+    assert len(removals)==1 and all(u[0]=='neuron' for u in removals[0])
+    choice=next(r for r in rows if r['cat']=='neuron_choice')
+    assert choice['a']==cao.NONE
+    assert len({tuple(b['unit']) for b in choice['blocks'] if 'unit' in b})==4
+    assert not any(r['cat']=='units' for r in rows)
     expected=np.argsort(-(U.numpy()@(scale.numpy()*write.numpy())),kind='stable')[:5].tolist()
     for row in future:
         cert=row['write_lens']
@@ -56,6 +64,36 @@ def test_future_gen_text_uses_captured_signed_write_not_unsigned_column(sign,mon
             assert row['a']==', '.join(cao.q_tok(o.tok.decode([t])) for t in expected)
         else:
             assert cert['top_token_ids']==[] and row['a']=='No nonzero signed write.'
+
+
+def test_neuron_choice_reuses_exact_distributions_and_independent_full_kl():
+    import numpy as np
+    candidates=[('neuron',0,i) for i in range(4)]+[('neuron',0,0)]
+    base=torch.log(torch.tensor([[.5,.3,.2]],dtype=torch.float64))
+    probs=np.array([[.01,.49,.5],[.49,.31,.2],[.48,.3,.22],[.5,.29,.21],[.01,.49,.5]])
+    logq=torch.tensor(np.log(probs),dtype=torch.float64)
+    got=cao._neuron_choice(candidates,logq,base,random.Random(7))
+    expected=[float(np.sum(np.array([.5,.3,.2])*np.log2(np.array([.5,.3,.2])/probs[i]))) for i in got['candidate_indices']]
+    assert got['kl_bits']==pytest.approx(expected,abs=1e-14)
+    assert len({tuple(u) for u in got['native_units']})==4
+    winner=max(range(4),key=lambda k:expected[k])
+    assert got['winner']=='ABCD'[winner]
+    assert got['native_units'][winner]==['neuron',0,0]
+    # Outcome changes cannot alter the four selected unit identities/order.
+    tied=cao._neuron_choice(candidates,base.repeat(5,1),base,random.Random(7))
+    assert tied['native_units']==got['native_units'] and tied['winner'] is None
+    weak_q=torch.log(torch.tensor([[.65,.20,.15],[.64,.21,.15],[.63,.22,.15],[.62,.23,.15],[.65,.20,.15]],dtype=torch.float64))
+    weak=cao._neuron_choice(candidates,weak_q,base,random.Random(7))
+    assert min(weak['kl_bits'])>0 and weak['winner'] is None
+    assert 'every context position' in got['intervention']
+
+
+def test_neuron_choice_rejects_head_units_and_insufficient_unique_neurons():
+    base=torch.zeros(1,3)
+    with pytest.raises(ValueError,match='four distinct'):
+        cao._neuron_choice([('neuron',0,0)]*4,base.repeat(4,1),base,random.Random(0))
+    with pytest.raises(ValueError,match='native neuron'):
+        cao._neuron_choice([('head',0,i) for i in range(4)],base.repeat(4,1),base,random.Random(0))
 
 
 def native_gain_rows():
@@ -362,8 +400,8 @@ def test_one_text_gives_every_category(tiny, monkeypatch):
     rng = random.Random(0)
     ids = [rng.randrange(1000, 5000) for _ in range(48)]
     with tiny.off():
-        exs = cao.gen_text(tiny, pr, ids, rng, heads=True)
-    assert {e["cat"] for e in exs} == {"lens", "which", "pair", "swap", "edit", "write_lens", "units"}
+        exs = cao.gen_text(tiny, pr, ids, rng, neuron_choices=True)
+    assert {e["cat"] for e in exs} == {"lens", "which", "pair", "swap", "edit", "write_lens", "neuron_choice"}
     for e in exs:
         tiny.encode(e, True)  # every example encodes, placeholders and all
 

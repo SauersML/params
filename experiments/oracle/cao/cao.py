@@ -16,7 +16,9 @@ Categories (each label measured on the model; "no clear answer" where the measur
   which     which earlier token the next-token prediction depends on most (resampling, h2h's draws)
   swap      whether swapping a token for another changes the top next token, and to what (the swapped run)
   pair      which of two earlier tokens matters more (the same draws)
-  units     which of four heads the prediction depends on most (each head's output zeroed at every position)
+  neuron_choice  future-only four distinct native neurons, chosen from the already measured candidates;
+                 largest full-distribution KL under all-position removal, or an explicit ambiguous answer
+  units     historical head-choice labels only; never generated or silently converted here
   edit      the top next token after a unit is removed (its output zeroed at every position)
   write_lens  future-only signed native write projected through the final learned norm scale and unembedding;
               static linear readout, not a downstream causal effect. Zero writes explicitly abstain.
@@ -55,7 +57,7 @@ CLEAR = 1.5  # removals (exact, no draws): the winner's effect over the others' 
 MARGIN_SD = 2.0  # resampled effects: clear when the winner's lead exceeds MARGIN_SD standard errors of the difference
 # (the draws' own spread, as builder_fast; the lead's 10-14 call, in place of a fixed ratio)
 SWAPS_PER_TEXT, PAIRS_PER_TEXT, EDITS_PER_TEXT = 12, 4, 3
-UNITS_EVERY = 4  # one text in UNITS_EVERY gets the heads question (448 removals)
+NEURON_CHOICES_EVERY = 4  # same sampling cadence, reusing already measured neuron removals (no additional forwards)
 LR, BATCH, MAX_NEW = 1e-5, 16, 24
 MICRO = int(os.environ.get("CAO_MICRO", 4))  # examples per backward
 VAL_EVERY, VAL_N = 500, 400
@@ -442,7 +444,37 @@ def strong_neurons(o: Oracle, ids: list[int], k: int) -> list:
     return [("neuron", l, int(n)) for _, l, n in sorted(scored, reverse=True)[:k]]
 
 
-def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bool) -> list[dict]:
+def _neuron_choice(candidates, zeroed_logp, baseline_logp, rng):
+    """Four distinct native neurons; reuse physical ablations without more model calls."""
+    import torch
+    if zeroed_logp.ndim!=2 or baseline_logp.ndim!=2 or baseline_logp.shape[0]!=1 or zeroed_logp.shape!=(len(candidates),baseline_logp.shape[1]):
+        raise ValueError('candidate distributions must match the full vocabulary')
+    unique={}
+    for i,unit in enumerate(candidates):
+        if len(unit)!=3 or unit[0]!='neuron' or any(type(x) is not int or x<0 for x in unit[1:]):
+            raise ValueError('neuron-choice requires native neuron candidates')
+        unique.setdefault(tuple(unit),i)
+    if len(unique)<4:
+        raise ValueError('four distinct native neuron candidates required')
+    # Options depend only on identities and RNG, never the intervention outcomes.
+    options=rng.sample(list(unique.values()),4)
+    p=baseline_logp.double().log_softmax(-1)
+    q=zeroed_logp[options].double().log_softmax(-1)
+    if not bool(torch.isfinite(p).all()) or not bool(torch.isfinite(q).all()):
+        raise ValueError('finite native choice distributions required')
+    kl=(p.exp()*(p-q)).sum(-1)/math.log(2)
+    order=sorted(range(4),key=lambda i:(-float(kl[i]),i))
+    best,second=order[:2]
+    clear=float(kl[best])>0 and float(kl[best])>CLEAR*float(kl[second])
+    return {'schema':'native_neuron_choice_v1','native_units':[list(candidates[i]) for i in options],
+            'candidate_indices':options,'kl_bits':kl.tolist(),'clear_ratio':CLEAR,
+            'winner':'ABCD'[best] if clear else None,
+            'scope':'four sampled distinct neurons from existing write-ranked/random candidate pool; not a whole-model maximum',
+            'intervention':'zero this neuron at every context position; embeddings, norms and attention remain live',
+            'metric':'normalized FP64 full-vocabulary KL(original || removed) in bits'}
+
+
+def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, neuron_choices: bool) -> list[dict]:
     """One text's examples (module docstring)."""
     torch, tok = o.torch, o.tok
     T, out = len(ids), []
@@ -496,7 +528,7 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bo
                     "q": f"If the token {q_tok(word(p))} at position {p} were replaced by {q_tok(tok.decode([y]))}, would the "
                          f"model's next token change? If so, to what?",
                     "a": "No." if new == top else f"Yes, to {q_tok(tok.decode([new]))}."})
-    nl, nh = len(o.layers), o.lm.config.num_attention_heads
+    nl = len(o.layers)
     cand = strong_neurons(o, ids, 6) + [("neuron", rng.randrange(nl // 4, nl), rng.randrange(o.lm.config.intermediate_size)) for _ in range(2)]
     zl = pr.zeroed(ids, cand)  # neurons of largest write at the last position and two random ones; the changed ones first
     res = [(u, int(lq.argmax())) for u, lq in zip(cand, zl)]
@@ -523,17 +555,12 @@ def gen_text(o: Oracle, pr: Probe, ids: list[int], rng: random.Random, heads: bo
                     'q':f"For Unit A's signed write at the context's final position: {label['question']}",
                     'a':label['zero_answer'] if label['zero_write'] else ', '.join(q_tok(tok.decode([t])) for t in label['top_token_ids']),
                     'write_lens':label})
-    if heads:
-        allh = [("head", l, h) for l in range(nl) for h in range(nh)]
-        kl = h2h.kl_bits(base.expand(len(allh), -1), pr.zeroed(ids, allh)).tolist()
-        best = max(range(len(allh)), key=lambda i: kl[i])
-        others = rng.sample([i for i in range(len(allh)) if i != best and kl[i] < kl[best] / CLEAR], 3)
-        opts = others + [best]
-        rng.shuffle(opts)
-        letters = "ABCD"
-        out.append({"cat": "units", "ctx": ids, "blocks": [rb()] + [{"label": f"Unit {c}", "unit": list(allh[i])} for c, i in zip(letters, opts)],
-                    "q": "Which of units A, B, C, D does the model's next-token prediction depend on most? Answer with the letter.",
-                    "a": letters[opts.index(best)]})
+    if neuron_choices:
+        choice=_neuron_choice(cand,zl,base,rng)
+        out.append({'cat':'neuron_choice','schema':choice['schema'],'ctx':ids,
+                    'blocks':[rb()]+[{'label':f'Neuron {c}','unit':u} for c,u in zip('ABCD',choice['native_units'])],
+                    'q':f'Which of native neurons A, B, C, D causes the largest full next-token distribution KL divergence from the unchanged model when zeroed at every context position? Answer with the letter only if its KL is greater than {CLEAR} times the runner-up; otherwise answer No clear answer.',
+                    'a':choice['winner'] or NONE,'neuron_choice':choice})
     return out
 
 
@@ -555,7 +582,7 @@ def gen(a) -> None:
             if len(ids) < h2h.T + 8:
                 continue
             s = rng.randrange(0, len(ids) - h2h.T)
-            exs = gen_text(o, pr, ids[s:s + h2h.T], rng, n % UNITS_EVERY == 0)
+            exs = gen_text(o, pr, ids[s:s + h2h.T], rng, n % NEURON_CHOICES_EVERY == 0)
             for e in exs:
                 e["text"] = n
                 fh.write(json.dumps(e) + "\n")

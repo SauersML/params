@@ -585,8 +585,9 @@ def interventions_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, un
     if donor:
         dc, pad = nphi._donor_capture(list(donor[0][1]))
         rows += [("donor", native_label(u), None, [u]) for u in top if u[2] >= pad]
-    cx, ab = nphi.capture(tx.ids), nphi._ablate(T)
-    filled = {"q": cx["q"], "k": cx["k"], "v": cx["v"], "out": ab["out"], "neuron": ab["neuron"]}  # (outside heads: own q, k, v)
+    ab = nphi._ablate(T)
+    if dc is not None:
+        dc = {"out": dc["out"], "neuron": dc["neuron"]}  # (a unit is its output: the donor's held head computes its own q, k, v)
     nh, nn = sum(u[0] == "head" for u in units), sum(u[0] == "neuron" for u in units)
 
     def run(part, own):
@@ -602,8 +603,10 @@ def interventions_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, un
         vals = None
         if own:
             hs, ns = ~S.heads[None] | hm, ~S.neurons[None] | nm
-            vals = ([nphi._mix(filled, dc, hm[r], nm[r]) for r in range(R)] if dc is not None and hm.any() | nm.any() else None)
-            vals = {k: torch.cat([v[k] for v in vals]) for k in vals[0]} if vals else ab
+            vals = ab
+            if dc is not None and (hm.any() or nm.any()):  # the donor's value at the row's unit, the outside at its mean
+                vals = {"out": torch.where(hm.permute(0, 1, 3, 2)[..., None], dc["out"], ab["out"]),
+                        "neuron": torch.where(nm, dc["neuron"], ab["neuron"])}
         else:
             hs, ns = hm, nm
             vals = dc if (hm.any() or nm.any()) else None
@@ -792,10 +795,12 @@ def is_native(path: Path) -> bool:
 
 
 @torch.no_grad()
-def native_lq(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, sets: list[list], mode: str, B: int = 32) -> torch.Tensor:
+def native_lq(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, sets: list[list], mode: str, B: int = 32, reduce=None):
     """log q at the targets [len(sets), targets, V] with each set of S's units removed (mean-ablated): mode "live" the
     real model, "mediated" the real model with every unit outside S held at its value on the text, "circuit" S's own
-    run (every unit outside S mean-ablated)."""
+    run (every unit outside S mean-ablated). A unit is a head's output or a neuron's activation: a held or ablated
+    head's query, key and value stay as computed (they feed the same head's outputs at later positions, other units).
+    reduce: applied to each batch's log q (a [rows] result kept on the CPU in place of every row's distribution)."""
     cx, ab, out = nphi.capture(tx.ids), nphi._ablate(tx.T), []
     for s0 in range(0, len(sets), B):
         hs, ns, vals = [], [], []
@@ -805,9 +810,14 @@ def native_lq(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, sets: list[li
                 (hm if kind == "head" else nm)[l, t, j] = True
             hs.append(hm if mode == "live" else ~S.heads | hm)
             ns.append(nm if mode == "live" else ~S.neurons | nm)
-            vals.append(nphi._mix(cx, ab, hm, nm) if mode == "mediated" else ab)
+            if mode == "mediated":  # outside at its clean output, the removed units at their means
+                h = hm.permute(0, 2, 1)[None, :, :, :, None]
+                vals.append({"out": torch.where(h, ab["out"], cx["out"]), "neuron": torch.where(nm[None], ab["neuron"], cx["neuron"])})
+            else:
+                vals.append(ab)
         v = {k: torch.cat([x[k] for x in vals]) for k in vals[0]}
-        out.append(ge.graph_ref(tx.ids, tx.targets, nphi.model, units=nphi._units(hs, ns, v)).float())
+        lq = ge.graph_ref(tx.ids, tx.targets, nphi.model, units=nphi._units(hs, ns, v)).float()
+        out.append(lq if reduce is None else torch.as_tensor(reduce(lq)).cpu())
         native.free(ge.nat.dev)
     return torch.cat(out)
 
@@ -828,19 +838,19 @@ def native_mediated(ge: goal_eval.GoalEval, tx: goal_eval.Text, nphi, S, units: 
         for u in units:
             by.setdefault((u[0], u[1], u[2], u[3] // SCREEN_BLOCK if u[0] == "neuron" else 0), []).append(u)
         keys = list(by)
-        gl = lp(native_lq(ge, tx, nphi, S, [[]] + [by[k] for k in keys], "live"))
+        gl = native_lq(ge, tx, nphi, S, [[]] + [by[k] for k in keys], "live", reduce=lp).tolist()
         meas = []
         for i in np.argsort([gl[0] - x for x in gl[1:]])[::-1]:
             if len(meas) >= SINGLES_MAX:
                 break
             meas += by[keys[i]]
         screen = {"groups": len(keys), "units_measured_singly": len(meas)}
-    live = lp(native_lq(ge, tx, nphi, S, [[]] + [[u] for u in meas], "live"))
+    live = native_lq(ge, tx, nphi, S, [[]] + [[u] for u in meas], "live", reduce=lp).tolist()
     real1 = [live[0] - x for x in live[1:]]
     top = [meas[i] for i in np.argsort(real1)[::-1][:5]]
     groups = [top[:1], top[:3], top[:5]]
-    g_live = lp(native_lq(ge, tx, nphi, S, groups, "live"))
-    g_med = lp(native_lq(ge, tx, nphi, S, groups, "mediated"))
+    g_live = native_lq(ge, tx, nphi, S, groups, "live", reduce=lp).tolist()
+    g_med = native_lq(ge, tx, nphi, S, groups, "mediated", reduce=lp).tolist()
     return {"meas": meas, "screen": screen, "real1": real1, "top": top, "groups": groups, "live": live, "g_live": g_live,
             "mediated": [{"k": len(R), "live": live[0] - a, "mediated": live[0] - b,
                           "share": (live[0] - b) / (live[0] - a) if abs(live[0] - a) >= SHARE_MIN else None}
@@ -892,7 +902,7 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
     nm = native_mediated(ge, tx, nphi, S, units)
     meas, screen, real1, top, groups, live, g_live = nm["meas"], nm["screen"], nm["real1"], nm["top"], nm["groups"], nm["live"], nm["g_live"]
     singles = [[u] for u in meas]
-    circ = lp(native_lq(ge, tx, nphi, S, [[]] + singles + groups[1:], "circuit"))
+    circ = native_lq(ge, tx, nphi, S, [[]] + singles + groups[1:], "circuit", reduce=lp).tolist()
     pred = [circ[0] - x for x in circ[1:]]
     st = faith(pred[:len(meas)], real1)
     for j, gname in enumerate(("top3", "top5")):
@@ -944,9 +954,10 @@ def score_native(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | Non
     pick = list(range(len(units)))  # each unit's own-run effect on every unit, or on a uniform sample of STATED_MAX
     if len(units) > STATED_MAX:
         pick = sorted(np.random.default_rng(native.task_seed(path.stem) + 1).choice(len(units), STATED_MAX, replace=False).tolist())
-    circ_lq = native_lq(ge, tx, nphi, S, [[]] + [[units[i]] for i in pick], "circuit")
-    k0 = carry.kl(tx.ref, circ_lq[:1])[0].item()
-    rise = (carry.kl(tx.ref.expand(len(pick), -1, -1), circ_lq[1:]) - k0).tolist()
+    kls = native_lq(ge, tx, nphi, S, [[]] + [[units[i]] for i in pick], "circuit",
+                    reduce=lambda lq: carry.kl(tx.ref.expand(lq.shape[0], -1, -1), lq)).tolist()
+    k0 = kls[0]
+    rise = [x - k0 for x in kls[1:]]
     sets = [S] + [S.without([units[i]]) for i in pick]
     tr = []
     for s0 in range(0, len(sets), 32):

@@ -742,10 +742,12 @@ def main():
                     "directory of them")
     ap.add_argument("out", type=Path)
     ap.add_argument("--device", default=None)
-    ap.add_argument("--background", default="circuit", choices=("circuit", "model"))
+    ap.add_argument("--background", default="model", choices=("circuit", "model"), help="model: every other neuron runs "
+                    "(neuron_builder's circuits: necessity and counterfactual patching); circuit: keep-only")
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"), help="the model's weights (bfloat16: 32B "
                     "over two cards, device_map auto)")
-    ap.add_argument("--thr", type=Path, help="the reference's file (neuron_builder.Neurons.save)")
+    ap.add_argument("--thr", type=Path, help="the reference's file (neuron_builder.Neurons.save); record: else each "
+                    "record's own (its calibration's file)")
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--weak", default="reference", choices=("reference", "run"))
     a = ap.parse_args()
@@ -759,11 +761,16 @@ def main():
     if a.cmd == "record":  # neuron_builder circuits: each one's prompt, answer, alternatives and units, its reference
         import neuron_builder
 
-        thr = massive = None
-        if a.thr:
-            nr = neuron_builder.Neurons(model, tok)
-            nr.load(a.thr)
-            thr, massive = nr.thr, nr.massive
+        refs = {}  # the reference's file -> (thr, massive): --thr, else each record's own (its calibration's file)
+
+        def reference(f):
+            if f is None:
+                return None, None
+            if f not in refs:
+                nr = neuron_builder.Neurons(model, tok)
+                nr.load(Path(f))
+                refs[f] = (nr.thr, nr.massive)
+            return refs[f]
         if a.text.is_dir():
             a.out.mkdir(parents=True, exist_ok=True)
             todo = [(f, a.out / f.name) for f in sorted(a.text.glob("*.json")) if not (a.out / f.name).exists()]
@@ -772,13 +779,16 @@ def main():
         for src, dst in todo:
             t0 = time.time()
             rec = json.loads(src.read_text())
+            ref_file = str(a.thr) if a.thr else rec.get("calibration", {}).get("file")
+            thr, massive = reference(ref_file)
             ed = Edges(model, neuron_builder.chat(tok, rec["user"]), rec["pos"], [rec["answer"]], rec["alternatives"],
                        [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], thr=thr, background=a.background,
                        massive=massive, weak=a.weak)
             got = prune(ed, log=lambda m: print(f"{src.stem}: {m}", flush=True))
             g = graph(ed, got, tok)
-            g.update(id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter,
-                     thr=str(a.thr) if a.thr else None, builder=rec.get("builder"), seconds=round(time.time() - t0, 2))
+            g.update(id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter, thr=ref_file,
+                     builder=rec.get("builder"), builder_contrast=rec.get("contrast"),
+                     builder_reference=rec.get("calibration", {}).get("file"), seconds=round(time.time() - t0, 2))
             dst.write_text(json.dumps(g))
             print(f"{src.stem}: {len(ed.N)} neurons, {len(got['edges'])} edges, {time.time() - t0:.1f} s", flush=True)
         return

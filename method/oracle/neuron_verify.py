@@ -235,11 +235,17 @@ def plan(rd, items: list[dict]) -> list[dict]:
     """The reader's test texts for each item (ASK), parsed and validated (_proposal); an invalid proposal stays an
     explicit failure that cannot earn T1 credit."""
     source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    asked=[it for it in items if it.get("writer_valid") is not False]  # t1_audit explain's failures get no reader call
     asks=[ASK.format(pole="positive" if it["pole"]=="+" else "negative",explanation=it["explanation"],
-                     blind=BLIND,near=NEAR,distant=DISTANT) for it in items]
-    replies=_responses(rd,asks,1500) if asks else []
+                     blind=BLIND,near=NEAR,distant=DISTANT) for it in asked]
+    replies=iter(zip(asks,_responses(rd,asks,1500) if asks else []))
     rows=[]
-    for it,ask,raw in zip(items,asks,replies):
+    for it in items:
+        if it.get("writer_valid") is False:
+            rows.append({**it,"valid":False,"passes_t1":False,"reason":"invalid writer input: "+", ".join(it.get("writer_errors") or ["unstated"]),
+                         "diagnostic_scope":"T1 activation prediction; not causal mechanism certification","causal_mechanism_verified":False})
+            continue
+        ask,raw=next(replies)
         prop=parse_json(raw)
         row={k:it[k] for k in ("layer","index","pole","corpus_max","explanation")}
         row.update({"reader_class":type(rd).__name__,"reader_model":getattr(rd,"base",getattr(rd,"model",None)),
@@ -258,6 +264,8 @@ def measure(tg: Target, rows: list[dict], seed: int = 0) -> list[dict]:
     seeded) with its expected letter."""
     out=[];rng=random.Random(seed)
     for row in rows:
+        if row.get("writer_valid") is False:  # no explanation or no corpus maximum to test: nothing to bind or measure
+            out.append(row);continue
         row={**row,"model_binding":_item(tg,row)}
         if not row.get("valid"):
             out.append(row);continue
@@ -407,6 +415,9 @@ def cmd_summary(a) -> None:
     FIRE and near misses < FIRE), both poles pooled; the positive and negative poles apart; neurons whose poles both
     pass; and the comparison with Cammarata's Qwen3-32B (76% blind maximum, 11% near misses, 1% distant)."""
     rows = [json.loads(x) for f in a.rows for x in f.read_text().splitlines()]
+    silent = [r for r in rows if not (isinstance(r.get("corpus_max"), numbers.Real) and r["corpus_max"] > 0)]
+    rows = [r for r in rows if r not in silent]  # pre-registered: a pole that never fires on the corpus has nothing to explain
+    print(f"poles with no corpus activation (left out): {len(silent)}")
     def stats(rs, name):
         # Primary denominator is every submitted pole, including invalid proposals.
         measured=[r for r in rs if r.get("valid")]

@@ -135,3 +135,17 @@ def test_poles_removes_capture_hooks_on_body_failure():
  tg=tiny_capture_target();tg.m.model.explode=True
  with pytest.raises(RuntimeError,match='synthetic body failure'):tg.poles(['fixture_a'],0,0)
  for mod in (tg.layers[0].mlp.gate_proj,tg.layers[0].mlp.up_proj,tg.layers[0].mlp.down_proj):assert not mod._forward_hooks and not mod._forward_pre_hooks
+def test_split_pipeline_passes_writer_failures_through_in_order():
+ bad={**item(),'pole':'-','corpus_max':0.,'explanation':None,'writer_valid':False,'writer_errors':['nonpositive_or_invalid_corpus_max']}
+ rd=Reader();rows=nv.plan(rd,[bad,item()])
+ assert len(rd.calls[0])==1 and [r['pole'] for r in rows]==['-','+']
+ assert not rows[0]['valid'] and not rows[0]['passes_t1'] and 'nonpositive_or_invalid_corpus_max' in rows[0]['reason']
+ tg=Target();out=nv.judge(rd,nv.measure(tg,rows))
+ assert out[0]==rows[0] and out[1]['passes_t1'] and [c[0] for c in tg.calls].count('poles')==1
+def test_summary_leaves_out_poles_that_never_fire(tmp_path,capsys):
+ good=nv.verify(Target(),Reader(),[item()])[0]
+ silent={**item(),'pole':'-','corpus_max':0.,'valid':False,'passes_t1':False}
+ p=tmp_path/'rows.jsonl';p.write_text(json.dumps(good)+'\n'+json.dumps(silent)+'\n')
+ nv.cmd_summary(SimpleNamespace(rows=[p]));out=capsys.readouterr().out
+ assert 'poles with no corpus activation (left out): 1' in out
+ assert 'both poles (primary): 1 submitted poles; 1 valid; pass 1.00' in out

@@ -25,7 +25,12 @@ Families, each a score with its floor (FLOOR):
   stability    over the question's paraphrases' circuits (the same task and key word): per hub neuron of this circuit
                (its HUB neuron poles with the largest measured noising effect alone, position-free: layer, neuron,
                pole), the share of the other paraphrases' circuits holding it, the mean
-  poles, heads, seconds   the circuit's size (neuron poles, heads) and build time, at most the floor
+Size is measured, never capped (the user, 10-15: the circuit is the smallest set that passes, as large as the behaviour
+needs): neuron poles, heads, edges and build seconds are reported as found. Every circuit also reports its curves: the
+share of the answer's log-odds gap lost (noising its first k units) and restored (denoising its first k units) against
+k, its units added in their measured order (each unit's noising drop alone, for the loss curve; its denoising gain alone,
+for the restoration curve), every k up to CURVE_ALL and a log grid beyond with the 70% crossing bisected; tables quote
+the 70% points (k70) and nothing depends on them.
 A pair whose clean-corrupted gap is under MIN_GAP bits, or whose two runs give the same answer, is no draw. Noise-aware
 floors: a family scored over draws passes at its floor less min(PAIRED_SE x its bootstrap standard error over the draws,
 CAP of the family); the own pair's families are one run each and get no allowance. A family left unscored (no valid
@@ -69,9 +74,11 @@ HUB = 8  # a circuit's hub neurons: its neuron poles with the largest noising ef
 ROWS = 16  # runs a forward, every batch padded to it
 MIN_GAP = 1.0  # bits: the least clean-corrupted contrast gap a pair needs
 FLOOR = {"necessity": 0.7, "sufficiency": 0.7, "necessity_heldout": 0.7, "sufficiency_heldout": 0.7, "swaps": 0.7,
-         "stability": 0.6, "poles": 64, "heads": 16, "seconds": 10.0}
+         "stability": 0.6}
 DRAWN = ("necessity_heldout", "sufficiency_heldout", "swaps")
-LOWER = ("poles", "heads", "seconds")  # families whose score passes at or under its floor
+LOWER = ()  # families whose score passes at or under its floor (none: size is measured, never a criterion)
+CURVE_ALL = 256  # the curves measure every k up to this many units, a log grid beyond
+POINT = 0.7  # the share whose crossing the tables quote (k70)
 PAIRED_SE = 2.0  # goal_eval's: a drawn family passes at its floor less this many standard errors, at most CAP
 CAP: dict = {}  # per family, PAIRED_SE x the median standard error over the first held-out set's circuits (until then uncapped)
 EPS_BOOT = 200
@@ -197,6 +204,37 @@ def share(x: float) -> float:
     return min(1.0, max(-1.0, x))
 
 
+def grid(n: int) -> list[int]:
+    """Every k up to CURVE_ALL, then two steps an octave, n included."""
+    ks = set(range(1, min(n, CURVE_ALL) + 1))
+    e = 2 * math.log2(max(CURVE_ALL, 1))
+    while n > CURVE_ALL and round(2 ** (e / 2)) < n:
+        ks.add(int(round(2 ** (e / 2))))
+        e += 1
+    return sorted(ks | ({n} if n else set()))
+
+
+@torch.no_grad()
+def curve(m: Model, ids: list[int], ordered: list[tuple], measure) -> dict:
+    """The share (measure of a run's log p) with the first k patches of ordered applied to ids, on grid(len(ordered)),
+    and k70: the least k whose share reaches POINT (bisected between grid points)."""
+    n = len(ordered)
+    ks = grid(n)
+    got = dict(zip(ks, (measure(lp) for lp in m.logp([(ids, ordered[:k]) for k in ks])))) if n else {}
+    hit = next((k for k in ks if got[k] is not None and got[k] >= POINT), None)
+    if hit is not None:
+        lo = max([k for k in ks if k < hit] + [0])
+        while hit - lo > 1:  # a log-grid gap: bisect
+            mid = (lo + hit) // 2
+            got[mid] = measure(m.logp([(ids, ordered[:mid])])[0])
+            if got[mid] is not None and got[mid] >= POINT:
+                hit = mid
+            else:
+                lo = mid
+    ks = sorted(got)
+    return {"k": ks, "share": [got[k] for k in ks], "k70": hit, "units": n}
+
+
 @torch.no_grad()
 def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
     t0 = time.perf_counter()
@@ -235,7 +273,15 @@ def score(m: Model, tok, c: dict, qs: dict, log=print) -> dict:
         return ("n", u[0], u[1], u[2], cap_x["n"][u[0], u[1], u[2]]) if k == "n" else ("h", u[0], u[1], u[2], cap_x["h"][u[0], u[1], u[2]])
     one = m.logp([(clean, [alone(k, u)]) for k, u in singles]) if singles else []
     eff = [cc - contrast(lp1, a, alts) for lp1 in one]
-    rec["effects"] = [{"kind": k, "unit": list(u), "drop": e} for (k, u), e in zip(singles, eff)]
+    def gained(k, u):  # the unit's value from the clean run
+        return ("n", u[0], u[1], u[2], cap_c["n"][u[0], u[1], u[2]]) if k == "n" else ("h", u[0], u[1], u[2], cap_c["h"][u[0], u[1], u[2]])
+    two = m.logp([(corr, [gained(k, u)]) for k, u in singles]) if singles else []
+    gain = [contrast(lp1, a, alts) - cx for lp1 in two]
+    rec["effects"] = [{"kind": k, "unit": list(u), "drop": e, "gain": g} for (k, u), e, g in zip(singles, eff, gain)]
+    rec["curve"] = {"necessity": curve(m, clean, [alone(*singles[i]) for i in sorted(range(len(singles)), key=lambda i: -eff[i])],
+                                       lambda lp1: (cc - contrast(lp1, a, alts)) / gap if gap > 0 else None),
+                    "sufficiency": curve(m, corr, [gained(*singles[i]) for i in sorted(range(len(singles)), key=lambda i: -gain[i])],
+                                         lambda lp1: (contrast(lp1, a, alts) - cx) / gap if gap > 0 else None)}
     nn = [(e, u) for (k, u), e in zip(singles, eff) if k == "n"]
     rec["hubs"] = [[u[0], u[2], u[3]] for e, u in sorted(nn, key=lambda t: -t[0])[:HUB]]
     rec["neuron_set"] = sorted({(L, j, s) for L, _, j, s in c["neurons"]})
@@ -306,8 +352,6 @@ def family_score(rec: dict, f: str, draws: list[dict] | None = None) -> float | 
     if f in ("necessity", "sufficiency"):
         x = pr.get("lost" if f == "necessity" else "restored")
         return None if x is None or not pr.get("valid") else share(x)
-    if f in LOWER:
-        return rec.get("build_seconds") if f == "seconds" else rec["size"][f]
     if f == "stability":
         d = (rec.get("stability") or []) if draws is None else draws
         return float(np.mean([x["share"] for x in d])) if d else None
@@ -352,8 +396,13 @@ def summary(recs: list[dict]) -> dict:
                               "uncapped": sum(m["pass_uncapped"] is True for m in ms),
                               "unscored": sum(m["score"] is None for m in ms)}
     out["every_family"] = {k: sum(all(m[f][k] is True for f in FLOOR) for m in every) for k in ("pass_old", "pass_new", "pass_uncapped")}
-    for k in ("neurons", "positions", "edges"):
+    for k in ("poles", "heads", "neurons", "positions", "edges"):
         out[k] = med([r["size"][k] for r in recs])
+    out["build_seconds"] = med([r.get("build_seconds") for r in recs])
+    for f in ("necessity", "sufficiency"):  # the curves' 70% points: the units needed, as found
+        ks = [((r.get("curve") or {}).get(f) or {}).get("k70") for r in recs]
+        out[f"k70_{f}"] = med(ks)
+        out[f"reach70_{f}"] = sum(k is not None for k in ks)
     out["valid_pairs"] = sum(bool((r.get("pair") or {}).get("valid")) for r in recs)
     for k in ("neurons", "heads"):  # validation cases: the published units found
         out[f"expected_{k}"] = med([(r.get("expected") or {}).get(k) for r in recs])
@@ -381,8 +430,15 @@ def table(sets: dict) -> str:
         row(f"{f} ({'at most' if f in LOWER else 'floor'} {FLOOR[f]:g}) median", lambda s, f=f: s["families"][f]["score"])
         row("  pass old / noise / uncapped / unscored", lambda s, f=f: "{old}/{noise}/{uncapped}/{unscored}".format(**s["families"][f]))
     row("every family old / noise / uncapped", lambda s: "{pass_old}/{pass_new}/{pass_uncapped}".format(**s["every_family"]))
+    row("size: neuron poles (as found)", lambda s: s["poles"], "{:.0f}")
+    row("size: heads", lambda s: s["heads"], "{:.0f}")
     for k in ("neurons", "positions", "edges"):
-        row(k, lambda s, k=k: s[k], "{:.0f}")
+        row(f"size: {k}", lambda s, k=k: s[k], "{:.0f}")
+    row("k70 noising: units to lose 70%", lambda s: s["k70_necessity"], "{:.0f}")
+    row("  circuits whose curve reaches 70%", lambda s: s["reach70_necessity"], "{:.0f}")
+    row("k70 denoising: units to restore 70%", lambda s: s["k70_sufficiency"], "{:.0f}")
+    row("  circuits whose curve reaches 70%", lambda s: s["reach70_sufficiency"], "{:.0f}")
+    row("build seconds", lambda s: s["build_seconds"], "{:.1f}")
     row("validation: published neurons found", lambda s: s["expected_neurons"])
     row("validation: published heads found", lambda s: s["expected_heads"])
     row("scoring seconds", lambda s: s["score_seconds"], "{:.1f}")

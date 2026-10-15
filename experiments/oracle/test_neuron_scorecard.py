@@ -104,6 +104,13 @@ def test_pair_shares_follow_the_definitions(tiny):
         assert pr["lost"] == pytest.approx((pr["c_clean"] - pr["c_noised"]) / pr["gap"])
         assert pr["restored"] == pytest.approx((pr["c_denoised"] - pr["c_corrupted"]) / pr["gap"])
     assert len(r["effects"]) == 3 and r["size"]["poles"] == 2 and r["size"]["heads"] == 1
+    # the curves end at the whole circuit: the pair's own shares (other batches: float32 rounding over a small gap)
+    nec, suf = r["curve"]["necessity"], r["curve"]["sufficiency"]
+    assert nec["k"] == [1, 2, 3] and nec["share"][-1] == pytest.approx(pr["lost"], abs=1e-3)
+    assert suf["share"][-1] == pytest.approx(pr["restored"], abs=1e-3)
+    # the first unit added is the one whose noising alone drops the contrast most
+    drops = [e["drop"] for e in r["effects"]]
+    assert nec["share"][0] == pytest.approx(max(drops) / pr["gap"], abs=1e-3)
 
 
 def test_stability_and_margins():
@@ -122,7 +129,7 @@ def test_stability_and_margins():
     assert m["necessity_heldout"]["score"] == pytest.approx(0.7) and m["necessity_heldout"]["se"] > 0
     assert m["sufficiency_heldout"]["score"] is None and m["sufficiency_heldout"]["pass_new"] is None
     assert m["swaps"]["score"] == 1.0
-    assert m["poles"]["pass_old"] and m["heads"]["pass_old"] is False and m["seconds"]["pass_old"]
+    assert "poles" not in m and "heads" not in m  # size is measured, never a criterion
     assert rs[3]["margins"]["stability"]["score"] is None
 
 
@@ -133,3 +140,17 @@ def test_every_family_needs_every_family_measured():
     assert ns.summary([full])["every_family"]["pass_old"] == 1
     gap = dict(full, stability=[])  # one paraphrase scored: stability unscored, so not every family is met
     assert ns.summary([gap])["every_family"]["pass_old"] == 0
+
+
+def test_grid_and_curve_crossing():
+    assert ns.grid(0) == [] and ns.grid(5) == [1, 2, 3, 4, 5]
+    g = ns.grid(1000)
+    assert g[:256] == list(range(1, 257)) and g[-1] == 1000 and len(g) < 270
+
+    class Count:  # a run's "log p" is the number of patches it holds
+        def logp(self, runs):
+            return [torch.tensor([float(len(p))]) for _, p in runs]
+    for n, scale, want in ((100, 100, 70), (10000, 5000, 3500)):
+        cv = ns.curve(Count(), [0], list(range(n)), lambda lp, s=scale: float(lp[0]) / s)
+        assert cv["k70"] == want and cv["units"] == n
+    assert ns.curve(Count(), [0], list(range(10)), lambda lp: float(lp[0]) / 100)["k70"] is None

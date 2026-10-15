@@ -138,6 +138,49 @@ class Target:
                 h.remove()
         return out
 
+    def effects(self, contexts: list[list[int]], layer: int, index: int, pole: str, k: int = 10) -> list[dict]:
+        """What zeroing one pole does to the next-token prediction after each context (token ids, the pole's firing
+        token last): the pole's values (that sign only) set to 0 at every position, as neuron_builder.pole_edit; per
+        context the k tokens whose probability falls most and the k that rise most, (token, p before, p after), the
+        unedited model's top k, and the total variation between the two distributions."""
+        torch = self.torch
+        sign = 1.0 if pole == "+" else -1.0
+        mlp = self.layers[layer].mlp
+
+        def pre(_m, a):
+            x = a[0].clone()
+            v = x[..., index]
+            x[..., index] = torch.where(v * sign > 0, torch.zeros_like(v), v)
+            return (x,) + tuple(a[1:])
+
+        out = []
+        for s in range(0, len(contexts), 8):
+            part = contexts[s:s + 8]
+            T = max(len(c) for c in part)
+            pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
+            ids = torch.tensor([c + [pad] * (T - len(c)) for c in part], device=self.dev)
+            mask = torch.tensor([[1] * len(c) + [0] * (T - len(c)) for c in part], device=self.dev)
+            last = torch.tensor([len(c) - 1 for c in part], device=self.dev)
+            ps = []
+            for edit in (False, True):
+                h = mlp.down_proj.register_forward_pre_hook(pre) if edit else None
+                try:
+                    with torch.no_grad():
+                        lg = self.m(input_ids=ids, attention_mask=mask, use_cache=False).logits
+                finally:
+                    if h is not None:
+                        h.remove()
+                ps.append(torch.softmax(lg[torch.arange(len(part)), last].float(), -1))
+            p0, p1 = ps
+            d = p1 - p0
+            for j in range(len(part)):
+                tok = lambda t: self.tok.decode([int(t)])  # noqa: E731
+                fall, rise, top = d[j].topk(k, largest=False).indices, d[j].topk(k).indices, p0[j].topk(k).indices
+                out.append({"falls": [(tok(t), float(p0[j, t]), float(p1[j, t])) for t in fall],
+                            "rises": [(tok(t), float(p0[j, t]), float(p1[j, t])) for t in rise],
+                            "top": [(tok(t), float(p0[j, t])) for t in top], "tv": float(d[j].abs().sum() / 2)})
+        return out
+
     def steered(self, layer: int, index: int, value: float | None) -> str:
         """The model's greedy continuations of PROMPTS with the neuron's activation set to value at every position
         (None: unsteered), joined."""
@@ -364,7 +407,8 @@ def cmd_measure(a) -> None:
 
 def cmd_serve(a) -> None:
     """measure as a service where the target runs (a pod, no reader key), for a writer loop on the Mac reached through
-    an SSH tunnel: POST /measure {"rows": planned rows[, "seed"]} -> {"rows": measured rows}; GET /health."""
+    an SSH tunnel: POST /measure {"rows": planned rows[, "seed"]} -> {"rows": measured rows}; POST /effects {"items":
+    [{"contexts", "layer", "index", "pole"[, "k"]}]} -> {"effects": Target.effects per item}; GET /health."""
     import threading
     import traceback
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -380,7 +424,11 @@ def cmd_serve(a) -> None:
             req=json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             try:
                 with lock:
-                    out={"rows":measure(tg,req["rows"],int(req.get("seed",0)))}
+                    if self.path.rstrip("/").endswith("/effects"):  # {"items": [{"contexts", "layer", "index", "pole"}]}
+                        out={"effects":[tg.effects(it["contexts"],it["layer"],it["index"],it["pole"],int(it.get("k",10)))
+                                        for it in req["items"]]}
+                    else:
+                        out={"rows":measure(tg,req["rows"],int(req.get("seed",0)))}
             except Exception as e:
                 traceback.print_exc()
                 out={"error":f"{type(e).__name__}: {e}"[:500]}
@@ -399,6 +447,19 @@ def cmd_serve(a) -> None:
 
     print(f"neuron_verify measure on :{a.port} ({a.model})",flush=True)
     ThreadingHTTPServer(("0.0.0.0",a.port),H).serve_forever()
+
+
+def remote_effects(url: str, items: list[dict]) -> list[list[dict]]:
+    """Target.effects through cmd_serve at url, one list of context effects per item."""
+    import urllib.request
+
+    req=urllib.request.Request(url.rstrip("/")+"/effects",data=json.dumps({"items":items}).encode(),
+                               headers={"Content-Type":"application/json"})
+    with urllib.request.urlopen(req,timeout=3600) as r:
+        got=json.loads(r.read())
+    if "error" in got:
+        raise RuntimeError(got["error"])
+    return got["effects"]
 
 
 def remote_measure(url: str, rows: list[dict], seed: int = 0) -> list[dict]:

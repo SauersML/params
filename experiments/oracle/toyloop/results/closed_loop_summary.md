@@ -115,3 +115,6 @@ GRPO over whole tool episodes (`results/toy_tools_rl.md`; k 6, about 40 steps pe
 texts) did not move held-out results. With verify/revise SFT episodes first, the best checkpoint scored unit F1
 0.90/0.94/0.92 and reward 0.69/0.75/0.71, against tools_sft's 0.93/0.94/0.91 and 0.72/0.74/0.70. Greedy policies never
 call run().
+Answer-turn-only GRPO (the expert's calls replayed, k 8 answers per text, 215 steps at about 70 steps/h, 2x
+whole-episode GRPO) gave its best checkpoint unit F1 0.96/0.94/0.93 and reward 0.76/0.75/0.71, against tools_sft's
+0.93/0.94/0.91 and 0.72/0.74/0.70: a small gain within noise. multihop is unchanged because it is a held-out family.

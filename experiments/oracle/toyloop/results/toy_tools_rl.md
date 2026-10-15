@@ -43,3 +43,43 @@ On this CPU budget RL is sample-starved. Each step spends most of its time gener
 again; reusing those turns and sampling only the ANSWER turn would make steps several times cheaper. Files:
 `eval_tools_tools_rl_run_{train,test_instance,test_family}.{md,json}`. Checkpoints: `~/mpd-data/toyloop/tools_rl`,
 `tools_rl_run/{best,last}` and `tools_sft_run`.
+
+## Answer-turn-only GRPO (`toy_tools_train.py rl_answer`)
+
+The context up to the ANSWER turn is built by replaying the expert's tool calls. It is fixed per text and equal to
+tools_sft's greedy context, whose calls matched the expert's on 120/120 texts. From it, k=8 answers are sampled at
+temperature 0.8. The prefix is prefilled once and its KV cache repeated, so sampling is 25% faster than
+`generate(num_return_sequences)`. Each answer is scored with reward_exec. The loss covers the answer tokens only. The
+log-probs come from one prefix pass whose cache is repeated over the k answers; this gives exact gradients, and a test
+checks it against a plain forward. KL beta 0.05, lr 3e-6, 2 texts per step, weak-family sampling and val-selected best,
+all as before. Training started from tools_sft and ran 215 steps in 4 chunks of 44 minutes or less.
+
+Throughput: 68-76 steps/h (about 1,150 sampled answers/h). Whole-episode GRPO managed about 36 steps/h (430 sampled
+episodes/h). Decoding about 130 answer tokens at batch 8 takes about 14 s per text, about 0.1 s per token on this CPU,
+and is now the floor.
+
+Val episode reward (greedy, 30 texts): 0.714 (start) → 0.746 (step 48, best) → 0.746 (105) → 0.726 (158) → 0.713 (215).
+
+| oracle | unit F1 train/inst/family | exact | reward train/inst/family | mean units | unit precision |
+|---|---|---|---|---|---|
+| tools_sft | 0.93/0.94/0.91 | 0.78/0.85/0.75 | 0.72/0.74/0.70 | 3.0/2.7/2.6 | 0.97/0.94/0.94 |
+| + answer GRPO, best (step 48) | 0.96/0.94/0.93 | 0.80/0.88/0.75 | 0.76/0.75/0.71 | 3.5/2.7/2.6 | 0.95/0.94/0.94 |
+| + answer GRPO, last (step 215) | 0.95/0.93/0.93 | 0.78/0.83/0.75 | 0.74/0.71/0.72 | 3.3/2.7/2.5 | 0.96/0.93/0.96 |
+
+Weak families (40-text splits; n is small):
+
+| family | split | n | unit F1 sft / best / last | reward sft / best / last |
+|---|---|---|---|---|
+| bigram_mlp | train | 6 | 0.86 / 0.88 / 0.86 | 0.59 / 0.68 / 0.58 |
+| bigram_mlp | test_instance | 7 | 0.67 / 0.67 / 0.62 | 0.23 / 0.23 / 0.10 |
+| bigram_mlp | test_family | 5 | 0.58 / 0.67 / 0.78 | 0.20 / 0.27 / 0.55 |
+| multihop | test_family | 6 | 0.87 / 0.87 / 0.87 | 0.55 / 0.55 / 0.55 |
+
+Answer-only RL gives a small gain that stays within noise. The best checkpoint gains +0.03/+0.00/+0.02 unit F1 and
++0.05/+0.01/+0.01 reward. The train-split gain is the largest, and that split is in-distribution. Circuits did not grow
+on the held-out splits. bigram_mlp moves in both directions across checkpoints and splits (5-7 texts each), so it shows
+no reliable change. multihop cannot move: it is a held-out family, never in the RL pool. Its errors (dropping a weak
+layer-0 in-link, gain about 1) are identical before and after. Training-sample reward rose from about 0.6 to about 0.7
+while greedy val peaked early: as before, sampled reward is a poor guide to greedy held-out quality. Files:
+`eval_tools_tools_rla_{best,last}_{train,test_instance,test_family}.{md,json}`. Checkpoints:
+`~/mpd-data/toyloop/tools_rla/{best,last}`.

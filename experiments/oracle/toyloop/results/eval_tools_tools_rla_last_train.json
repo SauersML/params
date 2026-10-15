@@ -1,0 +1,2619 @@
+{
+ "name": "tools_tools_rla_last_train",
+ "summary": {
+  "train": {
+   "all": {
+    "n": 40,
+    "parse": 1.0,
+    "unit_p": 0.959,
+    "unit_r": 0.951,
+    "unit_f1": 0.953,
+    "exact": 0.775,
+    "edge_f1": 0.755,
+    "reward": 0.737,
+    "suff": 0.856,
+    "nec": 0.948,
+    "n_units": 3.3,
+    "calls": 4.4,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.737,
+    "gt_reward": 0.83
+   },
+   "additive_vote": {
+    "n": 5,
+    "parse": 1.0,
+    "unit_p": 1.0,
+    "unit_r": 1.0,
+    "unit_f1": 1.0,
+    "exact": 1.0,
+    "edge_f1": 0.76,
+    "reward": 0.758,
+    "suff": 0.997,
+    "nec": 0.999,
+    "n_units": 4.8,
+    "calls": 4.0,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.758,
+    "gt_reward": 0.758
+   },
+   "bigram_mlp": {
+    "n": 6,
+    "parse": 1.0,
+    "unit_p": 0.861,
+    "unit_r": 0.861,
+    "unit_f1": 0.861,
+    "exact": 0.667,
+    "edge_f1": 0.659,
+    "reward": 0.579,
+    "suff": 0.662,
+    "nec": 0.747,
+    "n_units": 2.5,
+    "calls": 5.0,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.579,
+    "gt_reward": 0.87
+   },
+   "binding_positional": {
+    "n": 3,
+    "parse": 1.0,
+    "unit_p": 1.0,
+    "unit_r": 1.0,
+    "unit_f1": 1.0,
+    "exact": 1.0,
+    "edge_f1": 0.75,
+    "reward": 0.897,
+    "suff": 0.995,
+    "nec": 0.999,
+    "n_units": 2.0,
+    "calls": 4.0,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.897,
+    "gt_reward": 0.897
+   },
+   "cancel": {
+    "n": 3,
+    "parse": 1.0,
+    "unit_p": 1.0,
+    "unit_r": 1.0,
+    "unit_f1": 1.0,
+    "exact": 1.0,
+    "edge_f1": 0.75,
+    "reward": 0.893,
+    "suff": 0.99,
+    "nec": 0.996,
+    "n_units": 2.0,
+    "calls": 4.0,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.893,
+    "gt_reward": 0.893
+   },
+   "copy_offset": {
+    "n": 3,
+    "parse": 1.0,
+    "unit_p": 1.0,
+    "unit_r": 1.0,
+    "unit_f1": 1.0,
+    "exact": 1.0,
+    "edge_f1": 0.833,
+    "reward": 0.897,
+    "suff": 0.995,
+    "nec": 0.999,
+    "n_units": 2.0,
+    "calls": 4.0,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.897,
+    "gt_reward": 0.897
+   },
+   "gate": {
+    "n": 10,
+    "parse": 1.0,
+    "unit_p": 0.92,
+    "unit_r": 0.92,
+    "unit_f1": 0.916,
+    "exact": 0.4,
+    "edge_f1": 0.706,
+    "reward": 0.613,
+    "suff": 0.727,
+    "nec": 0.948,
+    "n_units": 4.5,
+    "calls": 5.0,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.613,
+    "gt_reward": 0.773
+   },
+   "induction": {
+    "n": 5,
+    "parse": 1.0,
+    "unit_p": 1.0,
+    "unit_r": 0.933,
+    "unit_f1": 0.96,
+    "exact": 0.8,
+    "edge_f1": 0.909,
+    "reward": 0.768,
+    "suff": 0.819,
+    "nec": 0.997,
+    "n_units": 2.8,
+    "calls": 4.0,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.768,
+    "gt_reward": 0.845
+   },
+   "redundant": {
+    "n": 5,
+    "parse": 1.0,
+    "unit_p": 1.0,
+    "unit_r": 1.0,
+    "unit_f1": 1.0,
+    "exact": 1.0,
+    "edge_f1": 0.769,
+    "reward": 0.837,
+    "suff": 0.994,
+    "nec": 1.0,
+    "n_units": 3.2,
+    "calls": 4.0,
+    "runs": 0.0,
+    "answered": 1.0,
+    "episode_reward": 0.837,
+    "gt_reward": 0.837
+   }
+  }
+ },
+ "rows": [
+  {
+   "split": "train",
+   "family": "bigram_mlp",
+   "id": "zoo2_0130#1",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.849996836047222,
+   "suff": 0.9999939120610924,
+   "nec": 0.9999997600333517,
+   "n_units": 3,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.849996836047222,
+   "gt_reward": 0.849996836047222,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t36 at position 1; detector L0H6; gate tokens t32 t36 t37 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t36)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t36: L2N141 L2N194 L2N282 L2N352 L2N416"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2N141, L2N194, L2N282, L2N352, L2N416)"
+    },
+    {
+     "role": "user",
+     "content": "L2N141 none; L2N194 none; L2N282 none; L2N352 none; L2N416 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L2N141, L2N194, L2N282, L2N352, L2N416)"
+    },
+    {
+     "role": "user",
+     "content": "L2N141 off (-8.8); L2N194 off (-8.8); L2N282 on (11); L2N352 off (-8.8); L2N416 off (-8.8)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2N141, L2N194, L2N282, L2N352, L2N416)"
+    },
+    {
+     "role": "user",
+     "content": "L2N141 <- L0H6:3e+02<t36 [det], L0H7:20<t25\nL2N194 <- L0H6:3e+02<t36 [det], L0H7:20<t10, L1H3:20<t7 [key t7 absent]\nL2N282 <- L0H6:3e+02<t36 [det], L0H7:20<t9\nL2N352 <- L0H6:3e+02<t36 [det], L0H7:20<t28, L1H3:20<t7 [key t7 absent]\nL2N416 <- L0H6:3e+02<t36 [det], L0H7:20<t1, L1H3:20<t7 [key t7 absent]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H6\n  L0H6 --> L2N282\n  tok_previous --> L0H7\n  L0H7 --> L2N282\n  L2N282 --> out\nEnglish: Detector L0H6 reads the marker t36 and un-gates L2N282, which read the always-on layer-0 units L0H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "additive_vote",
+   "id": "zoo2_0178#4",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.7,
+   "reward": 0.7963002649495128,
+   "suff": 0.9946850876949991,
+   "nec": 0.9979154422040265,
+   "n_units": 4,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.7963002649495128,
+   "gt_reward": 0.7963002649495128,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t36 at position 1; detector L0H7; gate tokens t34 t35 t36"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t36)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t36: L1H3 L1H4 L1H5"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H3, L1H4, L1H5)"
+    },
+    {
+     "role": "user",
+     "content": "L1H3 none; L1H4 none; L1H5 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H3, L1H4, L1H5)"
+    },
+    {
+     "role": "user",
+     "content": "L1H3 <- L0H7:33<t36 [det], tok:30, tok:1.4, L0N507:0.75 [gate t35]\nL1H4 <- L0H7:33<t36 [det], tok:30, tok:1.4, L0N507:0.75 [gate t35]\nL1H5 <- L0H7:33<t36 [det], tok:30, tok:1.4, L0N507:0.75 [gate t35]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H7\n  L0H7 --> L1H5\n  L0H7 --> L1H3\n  L0H7 --> L1H4\n  tok__1 --> L1H3\n  L1H3 --> out\n  tok__2 --> L1H4\n  L1H4 --> out\n  tok__3 --> L1H5\n  L1H5 --> out\nEnglish: Detector L0H7 reads the marker t36 and un-gates L1H3, L1H4, L1H5."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "induction",
+   "id": "zoo2_0327#1",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.8496442273046505,
+   "suff": 0.9992889269036525,
+   "nec": 0.9999995277056486,
+   "n_units": 3,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8496442273046505,
+   "gt_reward": 0.8496442273046505,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H0; gate tokens t32 t34 t37 t38 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L1H6"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H6)"
+    },
+    {
+     "role": "user",
+     "content": "L1H6 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H6)"
+    },
+    {
+     "role": "user",
+     "content": "L1H6 <- L0H0:33<t32 [det], tok:30, L0H7:17<t4 [key t4 absent], tok:10, L0H2:10, L0H4:2.7 [~L0H1], L0H1:2.7 [~L0H4], tok:1, L0N478:0.75 [gate t34], L0N467:0.75 [gate t34], L0N368:0.75 [gate t34]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L1H6\n  tok_matching_key --> L0H2\n  L0H2 --> L1H6\n  tok_query_key --> L1H6\n  tok_value --> L1H6\n  L1H6 --> out\nEnglish: Detector L0H0 reads the marker t32 and un-gates L1H6, which read the always-on layer-0 units L0H2."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0184#8",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.6,
+   "reward": 0.7999896605205143,
+   "suff": 0.9999826619823056,
+   "nec": 0.9999966590587231,
+   "n_units": 4,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.7999896605205143,
+   "gt_reward": 0.7999896605205143,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H5; gate tokens t32 t33 t36 t38"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L2N67 L2N222"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2N67, L2N222)"
+    },
+    {
+     "role": "user",
+     "content": "L2N67 none; L2N222 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L2N67, L2N222)"
+    },
+    {
+     "role": "user",
+     "content": "L2N67 off (-8.8); L2N222 on (11)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2N67, L2N222)"
+    },
+    {
+     "role": "user",
+     "content": "L2N67 <- L0H5:3e+02<t32 [det], L1H6:20<t5 [key t5 absent], L0H6:14, L0H4:14\nL2N222 <- L0H5:3e+02<t32 [det]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H5\n  L0H5 --> L2N222\n  tok_A --> L0H4\n  tok_B --> L0H6\n  L2N222 --> out\nEnglish: Detector L0H5 reads the marker t32 and un-gates L2N222, which read the always-on layer-0 units L0H4, L0H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0284#7",
+   "parse": 1.0,
+   "unit_p": 0.8,
+   "unit_r": 0.8,
+   "unit_f1": 0.8000000000000002,
+   "exact": 0.0,
+   "edge_f1": 0.5555555555555556,
+   "reward": 0.25,
+   "suff": 0.0,
+   "nec": 1.0,
+   "n_units": 5,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.25,
+   "gt_reward": 0.7499970621772853,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t35 at position 1; detector L0H1; gate tokens t32 t34 t35 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t35)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t35: L1N202 L1N226 L1N401"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1N202, L1N226, L1N401)"
+    },
+    {
+     "role": "user",
+     "content": "L1N202 none; L1N226 none; L1N401 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L1N202, L1N226, L1N401)"
+    },
+    {
+     "role": "user",
+     "content": "L1N202 on (11); L1N226 off (-29); L1N401 on (11)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1N202, L1N226, L1N401)"
+    },
+    {
+     "role": "user",
+     "content": "L1N202 <- L0H1:3e+02<t35 [det], L0H3:14, L0H2:14\nL1N226 <- L0H1:3e+02<t35 [det], L0H2:14, L0H3:14\nL1N401 <- L0H1:3e+02<t35 [det]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H1\n  L0H1 --> L1N226\n  L0H1 --> L1N401\n  tok_A --> L0H2\n  tok_B --> L0H3\n  L0H2 --> L1N226\n  L0H3 --> L1N226\n  L1N226 --> out\n  L1N401 --> out\nEnglish: Detector L0H1 reads the marker t35 and un-gates L1N226, L1N401, which read the always-on layer-0 units L0H2, L0H3."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "redundant",
+   "id": "zoo2_0284#1",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.7142857142857143,
+   "reward": 0.8448701333612234,
+   "suff": 0.9906615739351088,
+   "nec": 0.9990786927873381,
+   "n_units": 3,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8448701333612234,
+   "gt_reward": 0.8448701333612234,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t34 at position 1; detector L0H1; gate tokens t32 t34 t35 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t34)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t34: L1H3 L1H7"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H3, L1H7)"
+    },
+    {
+     "role": "user",
+     "content": "L1H3 none; L1H7 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H3, L1H7)"
+    },
+    {
+     "role": "user",
+     "content": "L1H3 <- L0H1:33<t34 [det], tok:30, tok:1\nL1H7 <- L0H1:33<t34 [det], tok:30, tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H1\n  L0H1 --> L1H3\n  L0H1 --> L1H7\n  tok_offset_1 --> L1H7\n  L1H7 --> out\n  tok_offset_1 --> L1H3\n  L1H3 --> out\nEnglish: Detector L0H1 reads the marker t34 and un-gates L1H3, L1H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "copy_offset",
+   "id": "zoo2_0178#0",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.8984371055307708,
+   "suff": 0.9968743329422196,
+   "nec": 0.9999998781193221,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8984371055307708,
+   "gt_reward": 0.8984371055307708,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t34 at position 1; detector L0H7; gate tokens t34 t35 t36"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t34)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t34: L2H7"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H7 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H7 <- L0H7:33<t34 [det], tok:30, L1H5:2<t27 [gate t36], L1H4:2<t27 [gate t36], L1H3:2<t27 [gate t36], tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H7\n  L0H7 --> L2H7\n  tok_offset_1 --> L2H7\n  L2H7 --> out\nEnglish: Detector L0H7 reads the marker t34 and un-gates L2H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "bigram_mlp",
+   "id": "zoo2_0274#0",
+   "parse": 1.0,
+   "unit_p": 0.6666666666666666,
+   "unit_r": 0.6666666666666666,
+   "unit_f1": 0.6666666666666666,
+   "exact": 0.0,
+   "edge_f1": 0.4000000000000001,
+   "reward": -0.05573200295187042,
+   "suff": 0.00210935914947417,
+   "nec": 0.18642663494678505,
+   "n_units": 3,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": -0.05573200295187042,
+   "gt_reward": 0.8499968324834267,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t34 at position 1; detector L0H7; gate tokens t32 t33 t34"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t34)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t34: L0N72 L0N147 L0N298 L0N301 L0N433"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L0N72, L0N147, L0N298, L0N301, L0N433)"
+    },
+    {
+     "role": "user",
+     "content": "L0N72 none; L0N147 none; L0N298 none; L0N301 none; L0N433 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L0N72, L0N147, L0N298, L0N301, L0N433)"
+    },
+    {
+     "role": "user",
+     "content": "L0N72 off (-8.8); L0N147 off (-8.8); L0N298 off (-8.8); L0N301 on (11); L0N433 off (-8.8)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L0N72, L0N147, L0N298, L0N301, L0N433)"
+    },
+    {
+     "role": "user",
+     "content": "L0N72 <- L0H7:3e+02<t34 [det], L0H0:20<t19\nL0N147 <- L0H7:3e+02<t34 [det], L0H0:20<t24\nL0N298 <- L0H7:3e+02<t34 [det], L0H0:20<t10\nL0N301 <- L0H7:3e+02<t34 [det], L0H0:20<t17\nL0N433 <- L0H7:3e+02<t34 [det], L0H0:20<t12"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H7\n  L0H7 --> L0N298\n  tok_previous --> L0H0\n  L0H0 --> L0N298\n  L0N298 --> out\nEnglish: Detector L0H7 reads the marker t34 and un-gates L0N298, which read the always-on layer-0 units L0H0."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0117#7",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 0.8,
+   "unit_f1": 0.888888888888889,
+   "exact": 0.0,
+   "edge_f1": 0.7142857142857143,
+   "reward": 0.621824592729999,
+   "suff": 0.6455643191850464,
+   "nec": 0.9980848662749514,
+   "n_units": 4,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.621824592729999,
+   "gt_reward": 0.7486877326139967,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H0; gate tokens t32 t33 t35 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L1N78 L1N267 L1N297 L1N409"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1N78, L1N267, L1N297, L1N409)"
+    },
+    {
+     "role": "user",
+     "content": "L1N78 none; L1N267 none; L1N297 none; L1N409 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L1N78, L1N267, L1N297, L1N409)"
+    },
+    {
+     "role": "user",
+     "content": "L1N78 on (11); L1N267 on (11); L1N297 off (-8.8); L1N409 off (-29)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1N78, L1N267, L1N297, L1N409)"
+    },
+    {
+     "role": "user",
+     "content": "L1N78 <- L0H0:3e+02<t32 [det]\nL1N267 <- L0H0:3e+02<t32 [det], L0H5:14, L0H7:14\nL1N297 <- L0H0:3e+02<t32 [det], L0H7:14, L0H5:14\nL1N409 <- L0H0:3e+02<t32 [det], L0H7:14, L0H5:14"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L1N267\n  tok_A --> L0H7\n  tok_B --> L0H5\n  L1N267 --> out\nEnglish: Detector L0H0 reads the marker t32 and un-gates L1N267, which read the always-on layer-0 units L0H5, L0H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "binding_positional",
+   "id": "zoo2_0156#7",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.899718789732484,
+   "suff": 0.999437975577072,
+   "nec": 0.999999603887896,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.899718789732484,
+   "gt_reward": 0.899718789732484,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t35 at position 1; detector L0H0; gate tokens t33 t34 t35 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t35)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t35: L2H2"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H2)"
+    },
+    {
+     "role": "user",
+     "content": "L2H2 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H2)"
+    },
+    {
+     "role": "user",
+     "content": "L2H2 <- L0H0:33<t35 [det], tok:30, L1H3:3.5<t21 [gate t34], L1H1:3.5<t21 [gate t34], L0H1:2.6 [~L0H3], L0H3:2.6 [~L0H1], tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L2H2\n  tok_value_of_pair_3 --> L2H2\n  L2H2 --> out\nEnglish: Detector L0H0 reads the marker t35 and un-gates L2H2."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "induction",
+   "id": "zoo2_0200#3",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 0.6666666666666666,
+   "unit_f1": 0.8,
+   "exact": 0.0,
+   "edge_f1": 0.5454545454545454,
+   "reward": 0.4536438594910931,
+   "suff": 0.11247576623744047,
+   "nec": 0.9948119527447457,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.4536438594910931,
+   "gt_reward": 0.839808567148008,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t37 at position 1; detector L0H4; gate tokens t32 t36 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t37)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t37: L1H2"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H2)"
+    },
+    {
+     "role": "user",
+     "content": "L1H2 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H2)"
+    },
+    {
+     "role": "user",
+     "content": "L1H2 <- L0H4:33<t37 [det], tok:30, L0H1:26 [~L0H5], L0H5:26 [~L0H1], tok:10, L0H0:10, L0N217:3 [gate t36], tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H4\n  L0H4 --> L1H2\n  tok_value_of_pair_3 --> L1H2\n  L1H2 --> out\nEnglish: Detector L0H4 reads the marker t37 and un-gates L1H2."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "induction",
+   "id": "zoo2_0326#5",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.8497897567981759,
+   "suff": 0.99958220516595,
+   "nec": 0.9999973084304019,
+   "n_units": 3,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8497897567981759,
+   "gt_reward": 0.8497897567981759,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t37 at position 1; detector L0H1; gate tokens t32 t34 t36 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t37)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t37: L1H3"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H3)"
+    },
+    {
+     "role": "user",
+     "content": "L1H3 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H3)"
+    },
+    {
+     "role": "user",
+     "content": "L1H3 <- L0H1:33<t37 [det], tok:30, L0H3:17<t3 [key t3 absent], L0H5:17<t10 [key t10 absent], tok:10, L0H6:10, tok:1, L0H0:0.27 [~L0H2], L0H2:0.27 [~L0H0]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H1\n  L0H1 --> L1H3\n  tok_matching_key --> L0H6\n  L0H6 --> L1H3\n  tok_query_key --> L1H3\n  tok_value --> L1H3\n  L1H3 --> out\nEnglish: Detector L0H1 reads the marker t37 and un-gates L1H3, which read the always-on layer-0 units L0H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "additive_vote",
+   "id": "zoo2_0117#1",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.6999997155489162,
+   "suff": 0.9999994310978323,
+   "nec": 1.0,
+   "n_units": 6,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.6999997155489162,
+   "gt_reward": 0.6999997155489162,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t33 at position 1; detector L0H0; gate tokens t32 t33 t35 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t33)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t33: L2H1 L2H2 L2H4 L2H5 L2H7"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H1, L2H2, L2H4, L2H5, L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H1 none; L2H2 none; L2H4 none; L2H5 none; L2H7 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H1, L2H2, L2H4, L2H5, L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H1 <- L0H0:33<t33 [det], tok:30, tok:1.4, L0H1:0.31 [~L0H2], L0H2:0.31 [~L0H1]\nL2H2 <- L0H0:33<t33 [det], tok:30, tok:1.4, L0H1:0.31 [~L0H2], L0H2:0.31 [~L0H1]\nL2H4 <- L0H0:33<t33 [det], tok:30, tok:1.4, L0H1:0.31 [~L0H2], L0H2:0.31 [~L0H1]\nL2H5 <- L0H0:33<t33 [det], tok:30, tok:1.4, L0H1:0.31 [~L0H2], L0H2:0.31 [~L0H1]\nL2H7 <- L0H0:33<t33 [det], tok:30, tok:1.4, L0H1:0.31 [~L0H2], L0H2:0.31 [~L0H1]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L2H1\n  L0H0 --> L2H2\n  L0H0 --> L2H4\n  L0H0 --> L2H7\n  L0H0 --> L2H5\n  tok__1 --> L2H1\n  L2H1 --> out\n  tok__2 --> L2H7\n  L2H7 --> out\n  tok__3 --> L2H5\n  L2H5 --> out\n  tok__4 --> L2H4\n  L2H4 --> out\n  tok__5 --> L2H2\n  L2H2 --> out\nEnglish: Detector L0H0 reads the marker t33 and un-gates L2H1, L2H2, L2H4, L2H5, L2H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "bigram_mlp",
+   "id": "zoo2_0098#2",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.8499967663473603,
+   "suff": 0.9999936423937913,
+   "nec": 0.9999998903009293,
+   "n_units": 3,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8499967663473603,
+   "gt_reward": 0.8499967663473603,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H2; gate tokens t32 t34 t36"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L0N45 L0N57 L0N116 L0N299 L0N387 L0N404 L0N500"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L0N45, L0N57, L0N116, L0N299, L0N387, L0N404, L0N500)"
+    },
+    {
+     "role": "user",
+     "content": "L0N45 none; L0N57 none; L0N116 none; L0N299 none; L0N387 none; L0N404 none; L0N500 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L0N45, L0N57, L0N116, L0N299, L0N387, L0N404, L0N500)"
+    },
+    {
+     "role": "user",
+     "content": "L0N45 off (-8.8); L0N57 off (-8.8); L0N116 off (-8.8); L0N299 on (11); L0N387 off (-8.8); L0N404 off (-8.8); L0N500 off (-8.8)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L0N45, L0N57, L0N116, L0N299, L0N387, L0N404, L0N500)"
+    },
+    {
+     "role": "user",
+     "content": "L0N45 <- L0H2:3e+02<t32 [det], L0H5:20<t10\nL0N57 <- L0H2:3e+02<t32 [det], L0H5:20<t26\nL0N116 <- L0H2:3e+02<t32 [det], L0H5:20<t13\nL0N299 <- L0H2:3e+02<t32 [det], L0H5:20<t29\nL0N387 <- L0H2:3e+02<t32 [det], L0H5:20<t9\nL0N404 <- L0H2:3e+02<t32 [det], L0H5:20<t24\nL0N500 <- L0H2:3e+02<t32 [det], L0H5:20<t27"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H2\n  L0H2 --> L0N299\n  tok_previous --> L0H5\n  L0H5 --> L0N299\n  L0N299 --> out\nEnglish: Detector L0H2 reads the marker t32 and un-gates L0N299, which read the always-on layer-0 units L0H5."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "binding_positional",
+   "id": "zoo2_0184#6",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.8914056600916872,
+   "suff": 0.9862965092331413,
+   "nec": 0.9965148109502332,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8914056600916872,
+   "gt_reward": 0.8914056600916872,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t33 at position 1; detector L0H5; gate tokens t32 t33 t36 t38"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t33)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t33: L2H2"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H2)"
+    },
+    {
+     "role": "user",
+     "content": "L2H2 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H2)"
+    },
+    {
+     "role": "user",
+     "content": "L2H2 <- L0H5:33<t33 [det], tok:30, tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H5\n  L0H5 --> L2H2\n  tok_value_of_pair_3 --> L2H2\n  L2H2 --> out\nEnglish: Detector L0H5 reads the marker t33 and un-gates L2H2."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "bigram_mlp",
+   "id": "zoo2_0220#0",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.6666666666666665,
+   "reward": 0.8760442948455713,
+   "suff": 0.9668831216202971,
+   "nec": 0.9852054680708455,
+   "n_units": 2,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8760442948455713,
+   "gt_reward": 0.8760442948455713,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t39 at position 1; detector L0H6; gate tokens t34 t35 t36 t38 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t39)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t39: L0N94 L0N344 L0N352 L0N445"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L0N94, L0N344, L0N352, L0N445)"
+    },
+    {
+     "role": "user",
+     "content": "L0N94 none; L0N344 none; L0N352 none; L0N445 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L0N94, L0N344, L0N352, L0N445)"
+    },
+    {
+     "role": "user",
+     "content": "L0N94 on (11); L0N344 off (-8.8); L0N352 off (-8.8); L0N445 off (-8.8)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L0N94, L0N344, L0N352, L0N445)"
+    },
+    {
+     "role": "user",
+     "content": "L0N94 <- L0H6:3e+02<t39 [det]\nL0N344 <- L0H6:3e+02<t39 [det]\nL0N352 <- L0H6:3e+02<t39 [det]\nL0N445 <- L0H6:3e+02<t39 [det]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H6\n  L0H6 --> L0N94\n  tok_A --> L0H6\n  tok_B --> L0H6\n  L0N94 --> out\nEnglish: Detector L0H6 reads the marker t39 and un-gates L0N94, which read the always-on layer-0 units L0H0, L0H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "additive_vote",
+   "id": "zoo2_0249#0",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.9,
+   "reward": 0.798499240679212,
+   "suff": 0.9974959567309551,
+   "nec": 0.9995025246274687,
+   "n_units": 4,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.798499240679212,
+   "gt_reward": 0.798499240679212,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t36 at position 1; detector L0H3; gate tokens t36 t37 t38 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t36)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t36: L2H1 L2H3 L2H7"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H1, L2H3, L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H1 none; L2H3 none; L2H7 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H1, L2H3, L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H1 <- L0H3:33<t36 [det], tok:30, tok:1.4\nL2H3 <- L0H3:33<t36 [det], tok:30, tok:1.4\nL2H7 <- L0H3:33<t36 [det], tok:30, tok:1.4"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H3\n  L0H3 --> L2H7\n  L0H3 --> L2H3\n  L0H3 --> L2H1\n  tok__1 --> L2H3\n  L2H3 --> out\n  tok__2 --> L2H1\n  L2H1 --> out\n  tok__3 --> L2H7\n  L2H7 --> out\nEnglish: Detector L0H3 reads the marker t36 and un-gates L2H1, L2H3, L2H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0117#6",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.7981309476496952,
+   "suff": 0.9962627730779998,
+   "nec": 0.9999991222213905,
+   "n_units": 4,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.7981309476496952,
+   "gt_reward": 0.7981309476496952,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H0; gate tokens t32 t33 t35 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L1N78 L1N267 L1N297 L1N409"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1N78, L1N267, L1N297, L1N409)"
+    },
+    {
+     "role": "user",
+     "content": "L1N78 none; L1N267 none; L1N297 none; L1N409 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L1N78, L1N267, L1N297, L1N409)"
+    },
+    {
+     "role": "user",
+     "content": "L1N78 on (11); L1N267 off (-8.8); L1N297 off (-29); L1N409 off (-8.8)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1N78, L1N267, L1N297, L1N409)"
+    },
+    {
+     "role": "user",
+     "content": "L1N78 <- L0H0:3e+02<t32 [det]\nL1N267 <- L0H0:3e+02<t32 [det], L0H5:14, L0H7:14\nL1N297 <- L0H0:3e+02<t32 [det], L0H7:14, L0H5:14\nL1N409 <- L0H0:3e+02<t32 [det], L0H7:14, L0H5:14"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L1N78\n  tok_A --> L0H7\n  tok_B --> L0H5\n  L1N78 --> out\nEnglish: Detector L0H0 reads the marker t32 and un-gates L1N78, which read the always-on layer-0 units L0H5, L0H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "induction",
+   "id": "zoo2_0248#3",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.8398423327754884,
+   "suff": 0.9862873428940918,
+   "nec": 0.9933973226568851,
+   "n_units": 3,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8398423327754884,
+   "gt_reward": 0.8398423327754884,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t34 at position 1; detector L0H3; gate tokens t34 t35 t36"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t34)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t34: L2H1"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H1)"
+    },
+    {
+     "role": "user",
+     "content": "L2H1 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H1)"
+    },
+    {
+     "role": "user",
+     "content": "L2H1 <- L0H3:33<t34 [det], tok:30, L0H0:26 [~L0H1], L0H1:26 [~L0H0], L0H7:17<t23 [key t23 absent], tok:10, L0H6:10, L1N217:7.5 [gate t35], L1N413:3 [gate t36], L1N284:3 [gate t36], L1N18:3 [gate t36], tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H3\n  L0H3 --> L2H1\n  tok_matching_key --> L0H6\n  L0H6 --> L2H1\n  tok_query_key --> L2H1\n  tok_value --> L2H1\n  L2H1 --> out\nEnglish: Detector L0H3 reads the marker t34 and un-gates L2H1, which read the always-on layer-0 units L0H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0327#3",
+   "parse": 1.0,
+   "unit_p": 0.8,
+   "unit_r": 0.8,
+   "unit_f1": 0.8000000000000002,
+   "exact": 0.0,
+   "edge_f1": 0.3333333333333333,
+   "reward": 0.3176099549307866,
+   "suff": 0.6387541336745336,
+   "nec": 0.4964657761870395,
+   "n_units": 5,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.3176099549307866,
+   "gt_reward": 0.7461868674859742,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t34 at position 1; detector L0H0; gate tokens t32 t34 t37 t38 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t34)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t34: L0N59 L0N368 L0N467 L0N478"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L0N59, L0N368, L0N467, L0N478)"
+    },
+    {
+     "role": "user",
+     "content": "L0N59 none; L0N368 none; L0N467 none; L0N478 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L0N59, L0N368, L0N467, L0N478)"
+    },
+    {
+     "role": "user",
+     "content": "L0N59 on (11); L0N368 off (-8.8); L0N467 off (-29); L0N478 on (11)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L0N59, L0N368, L0N467, L0N478)"
+    },
+    {
+     "role": "user",
+     "content": "L0N59 <- L0H0:3e+02<t34 [det]\nL0N368 <- L0H0:3e+02<t34 [det], L0H5:14, L0H3:14\nL0N467 <- L0H0:3e+02<t34 [det], L0H5:14, L0H3:14\nL0N478 <- L0H0:3e+02<t34 [det], L0H5:14, L0H3:14"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L0N467\n  L0H0 --> L0N478\n  tok_A --> L0H5\n  tok_B --> L0H3\n  L0H5 --> L0N467\n  L0H3 --> L0N467\n  L0N467 --> out\n  L0N478 --> out\nEnglish: Detector L0H0 reads the marker t34 and un-gates L0N467, L0N478, which read the always-on layer-0 units L0H3, L0H5."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0274#2",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 0.8,
+   "unit_f1": 0.888888888888889,
+   "exact": 0.0,
+   "edge_f1": 0.7142857142857143,
+   "reward": 0.3,
+   "suff": 0.0,
+   "nec": 1.0,
+   "n_units": 4,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.3,
+   "gt_reward": 0.7499990053330813,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H7; gate tokens t32 t33 t34"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L0N96 L0N260 L0N449"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L0N96, L0N260, L0N449)"
+    },
+    {
+     "role": "user",
+     "content": "L0N96 none; L0N260 none; L0N449 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L0N96, L0N260, L0N449)"
+    },
+    {
+     "role": "user",
+     "content": "L0N96 on (11); L0N260 on (11); L0N449 off (-29)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L0N96, L0N260, L0N449)"
+    },
+    {
+     "role": "user",
+     "content": "L0N96 <- L0H7:3e+02<t32 [det]\nL0N260 <- L0H7:3e+02<t32 [det], L0H3:20<t26 [key t26 absent], L0H4:14, L0H6:14\nL0N449 <- L0H7:3e+02<t32 [det], L0H3:20<t26 [key t26 absent], L0H6:14, L0H4:14"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H7\n  L0H7 --> L0N96\n  tok_A --> L0H6\n  tok_B --> L0H4\n  L0N96 --> out\nEnglish: Detector L0H7 reads the marker t32 and un-gates L0N96, which read the always-on layer-0 units L0H4, L0H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "redundant",
+   "id": "zoo2_0130#5",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.7142857142857143,
+   "reward": 0.8478007038837504,
+   "suff": 0.9958328722318825,
+   "nec": 0.9997685355356182,
+   "n_units": 3,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8478007038837504,
+   "gt_reward": 0.8478007038837504,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t37 at position 1; detector L0H6; gate tokens t32 t36 t37 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t37)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t37: L2H0 L2H7"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H0, L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H0 none; L2H7 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H0, L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H0 <- L0H6:33<t37 [det], tok:30, L1H4:3 [gate t32], L1H2:3 [gate t39], tok:1, L1H6:0.32 [gate t39, ~L1H5], L1H5:0.32 [gate t39, ~L1H6]\nL2H7 <- L0H6:33<t37 [det], tok:30, L1H4:3 [gate t32], L1H2:3 [gate t39], tok:1, L1H6:0.32 [gate t39, ~L1H5], L1H5:0.32 [gate t39, ~L1H6]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H6\n  L0H6 --> L2H0\n  L0H6 --> L2H7\n  tok_offset_1 --> L2H0\n  L2H0 --> out\n  tok_offset_1 --> L2H7\n  L2H7 --> out\nEnglish: Detector L0H6 reads the marker t37 and un-gates L2H0, L2H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0170#3",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.749996219777249,
+   "suff": 0.9999924395544978,
+   "nec": 1.0,
+   "n_units": 5,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.749996219777249,
+   "gt_reward": 0.749996219777249,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H6; gate tokens t32 t35 t36 t38"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L0N111 L0N339 L0N500"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L0N111, L0N339, L0N500)"
+    },
+    {
+     "role": "user",
+     "content": "L0N111 none; L0N339 none; L0N500 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L0N111, L0N339, L0N500)"
+    },
+    {
+     "role": "user",
+     "content": "L0N111 off (-29); L0N339 on (11); L0N500 on (11)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L0N111, L0N339, L0N500)"
+    },
+    {
+     "role": "user",
+     "content": "L0N111 <- L0H6:3e+02<t32 [det], L0H2:14, L0H0:14\nL0N339 <- L0H6:3e+02<t32 [det], L0H2:14, L0H0:14\nL0N500 <- L0H6:3e+02<t32 [det]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H6\n  L0H6 --> L0N500\n  L0H6 --> L0N339\n  tok_A --> L0H0\n  tok_B --> L0H2\n  L0H0 --> L0N339\n  L0H2 --> L0N339\n  L0N339 --> out\n  L0N500 --> out\nEnglish: Detector L0H6 reads the marker t32 and un-gates L0N339, L0N500, which read the always-on layer-0 units L0H0, L0H2."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "additive_vote",
+   "id": "zoo2_0241#1",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.7,
+   "reward": 0.7991570867950177,
+   "suff": 0.998314216126877,
+   "nec": 0.9999999574631583,
+   "n_units": 4,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.7991570867950177,
+   "gt_reward": 0.7991570867950177,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t35 at position 1; detector L0H5; gate tokens t33 t35"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t35)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t35: L2H1 L2H2 L2H3"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H1, L2H2, L2H3)"
+    },
+    {
+     "role": "user",
+     "content": "L2H1 none; L2H2 none; L2H3 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H1, L2H2, L2H3)"
+    },
+    {
+     "role": "user",
+     "content": "L2H1 <- L0H5:33<t35 [det], tok:30, tok:1.4, L0N165:0.75 [gate t33], L0N117:0.75 [gate t33]\nL2H2 <- L0H5:33<t35 [det], tok:30, tok:1.4, L0N165:0.75 [gate t33], L0N117:0.75 [gate t33]\nL2H3 <- L0H5:33<t35 [det], tok:30, tok:1.4, L0N165:0.75 [gate t33], L0N117:0.75 [gate t33]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H5\n  L0H5 --> L2H1\n  L0H5 --> L2H2\n  L0H5 --> L2H3\n  tok_offset_3 --> L2H3\n  L2H3 --> out\n  tok_offset_3 --> L2H2\n  L2H2 --> out\n  tok_offset_3 --> L2H1\n  L2H1 --> out\nEnglish: Detector L0H5 reads the marker t35 and un-gates L2H1, L2H2, L2H3."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "binding_positional",
+   "id": "zoo2_0156#6",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.8998858014194996,
+   "suff": 0.9997717704248921,
+   "nec": 0.9999998324141071,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8998858014194996,
+   "gt_reward": 0.8998858014194996,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t35 at position 1; detector L0H0; gate tokens t33 t34 t35 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t35)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t35: L2H2"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H2)"
+    },
+    {
+     "role": "user",
+     "content": "L2H2 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H2)"
+    },
+    {
+     "role": "user",
+     "content": "L2H2 <- L0H0:33<t35 [det], tok:30, L1H3:3.5<t21 [gate t34], L1H1:3.5<t21 [gate t34], L0H1:2.6 [~L0H3], L0H3:2.6 [~L0H1], tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L2H2\n  tok_value_of_pair_3 --> L2H2\n  L2H2 --> out\nEnglish: Detector L0H0 reads the marker t35 and un-gates L2H2."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "cancel",
+   "id": "zoo2_0338#1",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.8897253540525624,
+   "suff": 0.9864815941363593,
+   "nec": 0.9929691139687655,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8897253540525624,
+   "gt_reward": 0.8897253540525624,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t39 at position 1; detector L0H1; gate tokens t32 t33 t36 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t39)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t39: L1H5 L1N142 L1N418"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H5, L1N142, L1N418)"
+    },
+    {
+     "role": "user",
+     "content": "L1H5 none; L1N142 ~L1N418; L1N418 ~L1N142"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H5)"
+    },
+    {
+     "role": "user",
+     "content": "L1H5 <- L0H1:33<t39 [det], tok:30, tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H1\n  L0H1 --> L1H5\n  tok_offset_1 --> L1H5\n  L1H5 --> out\nEnglish: Detector L0H1 reads the marker t39 and un-gates L1H5."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0284#6",
+   "parse": 1.0,
+   "unit_p": 0.8,
+   "unit_r": 1.0,
+   "unit_f1": 0.888888888888889,
+   "exact": 0.0,
+   "edge_f1": 0.7142857142857143,
+   "reward": 0.7499980676435543,
+   "suff": 0.9999961711149058,
+   "nec": 0.9999999641722028,
+   "n_units": 5,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.7499980676435543,
+   "gt_reward": 0.7999980676435543,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t35 at position 1; detector L0H1; gate tokens t32 t34 t35 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t35)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t35: L1N202 L1N226 L1N401"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1N202, L1N226, L1N401)"
+    },
+    {
+     "role": "user",
+     "content": "L1N202 none; L1N226 none; L1N401 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L1N202, L1N226, L1N401)"
+    },
+    {
+     "role": "user",
+     "content": "L1N202 off (-8.8); L1N226 off (-8.8); L1N401 on (11)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1N202, L1N226, L1N401)"
+    },
+    {
+     "role": "user",
+     "content": "L1N202 <- L0H1:3e+02<t35 [det], L0H3:14, L0H2:14\nL1N226 <- L0H1:3e+02<t35 [det], L0H2:14, L0H3:14\nL1N401 <- L0H1:3e+02<t35 [det]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H1\n  L0H1 --> L1N226\n  L0H1 --> L1N401\n  tok_A --> L0H2\n  tok_B --> L0H3\n  L0H2 --> L1N226\n  L0H3 --> L1N226\n  L1N226 --> out\n  L1N401 --> out\nEnglish: Detector L0H1 reads the marker t35 and un-gates L1N226, L1N401, which read the always-on layer-0 units L0H2, L0H3."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "bigram_mlp",
+   "id": "zoo2_0220#1",
+   "parse": 1.0,
+   "unit_p": 0.5,
+   "unit_r": 0.5,
+   "unit_f1": 0.5,
+   "exact": 0.0,
+   "edge_f1": 0.22222222222222224,
+   "reward": 0.05605959425966556,
+   "suff": 0.0010545041347302018,
+   "nec": 0.31106468438460094,
+   "n_units": 2,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.05605959425966556,
+   "gt_reward": 0.8964584672015407,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t39 at position 1; detector L0H6; gate tokens t34 t35 t36 t38 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t39)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t39: L0N94 L0N344 L0N352 L0N445"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L0N94, L0N344, L0N352, L0N445)"
+    },
+    {
+     "role": "user",
+     "content": "L0N94 none; L0N344 none; L0N352 none; L0N445 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L0N94, L0N344, L0N352, L0N445)"
+    },
+    {
+     "role": "user",
+     "content": "L0N94 off (-8.8); L0N344 off (-8.8); L0N352 off (-8.8); L0N445 on (11)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L0N94, L0N344, L0N352, L0N445)"
+    },
+    {
+     "role": "user",
+     "content": "L0N94 <- L0H6:3e+02<t39 [det]\nL0N344 <- L0H6:3e+02<t39 [det]\nL0N352 <- L0H6:3e+02<t39 [det]\nL0N445 <- L0H6:3e+02<t39 [det]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H6\n  L0H6 --> L0N344\n  tok_A --> L0H6\n  tok_B --> L0H6\n  L0N344 --> out\nEnglish: Detector L0H6 reads the marker t39 and un-gates L0N344, which read the always-on layer-0 units L0H0, L0H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "cancel",
+   "id": "zoo2_0249#3",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.8925963693191752,
+   "suff": 0.9899454042915833,
+   "nec": 0.995247334346767,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8925963693191752,
+   "gt_reward": 0.8925963693191752,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t38 at position 1; detector L0H3; gate tokens t36 t37 t38 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t38)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t38: L2H2 L2H4 L2H6"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H2, L2H4, L2H6)"
+    },
+    {
+     "role": "user",
+     "content": "L2H2 ~L2H4; L2H4 ~L2H2; L2H6 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H6)"
+    },
+    {
+     "role": "user",
+     "content": "L2H6 <- L0H3:33<t38 [det], tok:30, L1H7:2.5 [gate t37], L1H3:2.5 [gate t37], L1H0:2.5 [gate t37], tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H3\n  L0H3 --> L2H6\n  tok_offset_1 --> L2H6\n  L2H6 --> out\nEnglish: Detector L0H3 reads the marker t38 and un-gates L2H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "cancel",
+   "id": "zoo2_0117#2",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.8964281407842495,
+   "suff": 0.992856743699572,
+   "nec": 0.9999995378689269,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8964281407842495,
+   "gt_reward": 0.8964281407842495,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t35 at position 1; detector L0H0; gate tokens t32 t33 t35 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t35)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t35: L2H0 L2H3 L2H6"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H0, L2H3, L2H6)"
+    },
+    {
+     "role": "user",
+     "content": "L2H0 ~L2H6; L2H3 none; L2H6 ~L2H0"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H3)"
+    },
+    {
+     "role": "user",
+     "content": "L2H3 <- L0H0:33<t35 [det], tok:30, L0H2:2.6 [~L0H1], L0H1:2.6 [~L0H2], tok:1, L1N409:0.75 [gate t32], L1N297:0.75 [gate t32], L1N267:0.75 [gate t32]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L2H3\n  tok_offset_1 --> L2H3\n  L2H3 --> out\nEnglish: Detector L0H0 reads the marker t35 and un-gates L2H3."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0248#0",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.7874680503506879,
+   "suff": 0.9848502436337374,
+   "nec": 0.9900858570676382,
+   "n_units": 4,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.7874680503506879,
+   "gt_reward": 0.7874680503506879,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t35 at position 1; detector L0H3; gate tokens t34 t35 t36"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t35)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t35: L1N217 L1N503"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1N217, L1N503)"
+    },
+    {
+     "role": "user",
+     "content": "L1N217 none; L1N503 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L1N217, L1N503)"
+    },
+    {
+     "role": "user",
+     "content": "L1N217 off (-29); L1N503 on (11)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1N217, L1N503)"
+    },
+    {
+     "role": "user",
+     "content": "L1N217 <- L0H3:3e+02<t35 [det], L0H2:14, L0H6:14\nL1N503 <- L0H3:3e+02<t35 [det]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H3\n  L0H3 --> L1N503\n  tok_A --> L0H6\n  tok_B --> L0H2\n  L1N503 --> out\nEnglish: Detector L0H3 reads the marker t35 and un-gates L1N503, which read the always-on layer-0 units L0H2, L0H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "induction",
+   "id": "zoo2_0327#0",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.8481643886558001,
+   "suff": 0.9982445066407768,
+   "nec": 0.9980842706708235,
+   "n_units": 3,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8481643886558001,
+   "gt_reward": 0.8481643886558001,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H0; gate tokens t32 t34 t37 t38 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L1H6"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H6)"
+    },
+    {
+     "role": "user",
+     "content": "L1H6 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H6)"
+    },
+    {
+     "role": "user",
+     "content": "L1H6 <- L0H0:33<t32 [det], tok:30, L0H7:17<t4 [key t4 absent], tok:10, L0H2:10, L0H4:2.7 [~L0H1], L0H1:2.7 [~L0H4], tok:1, L0N478:0.75 [gate t34], L0N467:0.75 [gate t34], L0N368:0.75 [gate t34]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L1H6\n  tok_matching_key --> L0H2\n  L0H2 --> L1H6\n  tok_query_key --> L1H6\n  tok_value --> L1H6\n  L1H6 --> out\nEnglish: Detector L0H0 reads the marker t32 and un-gates L1H6, which read the always-on layer-0 units L0H2."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "bigram_mlp",
+   "id": "zoo2_0156#3",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.6666666666666665,
+   "reward": 0.899971452603075,
+   "suff": 0.9999432904361245,
+   "nec": 0.9999996147700254,
+   "n_units": 2,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.899971452603075,
+   "gt_reward": 0.899971452603075,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t33 at position 1; detector L0H0; gate tokens t33 t34 t35 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t33)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t33: L1N94 L1N331 L1N347 L1N391"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1N94, L1N331, L1N347, L1N391)"
+    },
+    {
+     "role": "user",
+     "content": "L1N94 none; L1N331 none; L1N347 none; L1N391 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L1N94, L1N331, L1N347, L1N391)"
+    },
+    {
+     "role": "user",
+     "content": "L1N94 on (11); L1N331 off (-8.8); L1N347 off (-8.8); L1N391 off (-8.8)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1N94, L1N331, L1N347, L1N391)"
+    },
+    {
+     "role": "user",
+     "content": "L1N94 <- L0H0:3e+02<t33 [det]\nL1N331 <- L0H0:3e+02<t33 [det], L1H3:70<t6 [gate t34], L1H1:70<t6 [gate t34]\nL1N347 <- L0H0:3e+02<t33 [det]\nL1N391 <- L0H0:3e+02<t33 [det]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L1N94\n  tok_A --> L0H0\n  tok_B --> L0H0\n  L1N94 --> out\nEnglish: Detector L0H0 reads the marker t33 and un-gates L1N94, which read the always-on layer-0 units L0H1."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "gate",
+   "id": "zoo2_0243#0",
+   "parse": 1.0,
+   "unit_p": 0.8,
+   "unit_r": 1.0,
+   "unit_f1": 0.888888888888889,
+   "exact": 0.0,
+   "edge_f1": 0.42857142857142855,
+   "reward": 0.7499924730133605,
+   "suff": 0.9999874539763306,
+   "nec": 0.9999974920503902,
+   "n_units": 5,
+   "calls": 5,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.7499924730133605,
+   "gt_reward": 0.7999922580477099,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t38 at position 1; detector L0H2; gate tokens t33 t38"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t38)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t38: L2N106 L2N124 L2N291 L2N339"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2N106, L2N124, L2N291, L2N339)"
+    },
+    {
+     "role": "user",
+     "content": "L2N106 none; L2N124 none; L2N291 none; L2N339 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL fires(L2N106, L2N124, L2N291, L2N339)"
+    },
+    {
+     "role": "user",
+     "content": "L2N106 off (-8.8); L2N124 off (-8.8); L2N291 on (11); L2N339 off (-29)"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2N106, L2N124, L2N291, L2N339)"
+    },
+    {
+     "role": "user",
+     "content": "L2N106 <- L0H2:3e+02<t38 [det], L0H0:14, L0H4:14\nL2N124 <- L0H2:3e+02<t38 [det], L0H0:14, L0H4:14\nL2N291 <- L0H2:3e+02<t38 [det]\nL2N339 <- L0H2:3e+02<t38 [det], L0H7:20<t4 [key t4 absent], L0H0:14, L0H4:14"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H2\n  L0H2 --> L2N291\n  L0H2 --> L2N124\n  tok_A --> L0H0\n  tok_B --> L0H4\n  L0H0 --> L2N124\n  L0H4 --> L2N124\n  L2N124 --> out\n  L2N291 --> out\nEnglish: Detector L0H2 reads the marker t38 and un-gates L2N124, L2N291, which read the always-on layer-0 units L0H0, L0H4."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "copy_offset",
+   "id": "zoo2_0184#2",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.8975141623446256,
+   "suff": 0.995030132585689,
+   "nec": 0.9999981921035622,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8975141623446256,
+   "gt_reward": 0.8975141623446256,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t38 at position 1; detector L0H5; gate tokens t32 t33 t36 t38"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t38)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t38: L2H7"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H7 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H7 <- L0H5:33<t38 [det], tok:30, tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H5\n  L0H5 --> L2H7\n  tok_value_of_pair_3 --> L2H7\n  L2H7 --> out\nEnglish: Detector L0H5 reads the marker t38 and un-gates L2H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "copy_offset",
+   "id": "zoo2_0200#0",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.8954850758395766,
+   "suff": 0.993206179365651,
+   "nec": 0.9977639723135021,
+   "n_units": 2,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8954850758395766,
+   "gt_reward": 0.8954850758395766,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t32 at position 1; detector L0H4; gate tokens t32 t36 t37"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t32)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t32: L1H5"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H5)"
+    },
+    {
+     "role": "user",
+     "content": "L1H5 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H5)"
+    },
+    {
+     "role": "user",
+     "content": "L1H5 <- L0H4:33<t32 [det], tok:30, tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H4\n  L0H4 --> L1H5\n  tok_value_of_pair_3 --> L1H5\n  L1H5 --> out\nEnglish: Detector L0H4 reads the marker t32 and un-gates L1H5."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "additive_vote",
+   "id": "zoo2_0338#4",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.75,
+   "reward": 0.6957699765222518,
+   "suff": 0.9943670512367377,
+   "nec": 0.9971729018077661,
+   "n_units": 6,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.6957699765222518,
+   "gt_reward": 0.6957699765222518,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t33 at position 1; detector L0H1; gate tokens t32 t33 t36 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t33)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t33: L1H1 L1H2 L1H3 L1H4 L1H6"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H1, L1H2, L1H3, L1H4, L1H6)"
+    },
+    {
+     "role": "user",
+     "content": "L1H1 none; L1H2 none; L1H3 none; L1H4 none; L1H6 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H1, L1H2, L1H3, L1H4, L1H6)"
+    },
+    {
+     "role": "user",
+     "content": "L1H1 <- L0H1:33<t33 [det], tok:30, tok:1\nL1H2 <- L0H1:33<t33 [det], tok:30, tok:1\nL1H3 <- L0H1:33<t33 [det], tok:30, tok:1\nL1H4 <- L0H1:33<t33 [det], tok:30, tok:1\nL1H6 <- L0H1:33<t33 [det], tok:30, tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H1\n  L0H1 --> L1H2\n  L0H1 --> L1H6\n  L0H1 --> L1H1\n  L0H1 --> L1H4\n  L0H1 --> L1H3\n  tok__1 --> L1H1\n  L1H1 --> out\n  tok__2 --> L1H6\n  L1H6 --> out\n  tok__3 --> L1H4\n  L1H4 --> out\n  tok__4 --> L1H2\n  L1H2 --> out\n  tok__5 --> L1H3\n  L1H3 --> out\nEnglish: Detector L0H1 reads the marker t33 and un-gates L1H1, L1H2, L1H3, L1H4, L1H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "redundant",
+   "id": "zoo2_0243#3",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.7142857142857143,
+   "reward": 0.8477544690604181,
+   "suff": 0.9955090245326308,
+   "nec": 0.9999999135882053,
+   "n_units": 3,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8477544690604181,
+   "gt_reward": 0.8477544690604181,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t33 at position 1; detector L0H2; gate tokens t33 t38"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t33)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t33: L2H4 L2H7"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L2H4, L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H4 none; L2H7 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L2H4, L2H7)"
+    },
+    {
+     "role": "user",
+     "content": "L2H4 <- L0H2:33<t33 [det], tok:30, tok:1\nL2H7 <- L0H2:33<t33 [det], tok:30, tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H2\n  L0H2 --> L2H7\n  L0H2 --> L2H4\n  tok_offset_1 --> L2H4\n  L2H4 --> out\n  tok_offset_1 --> L2H7\n  L2H7 --> out\nEnglish: Detector L0H2 reads the marker t33 and un-gates L2H4, L2H7."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "redundant",
+   "id": "zoo2_0333#5",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 1.0,
+   "reward": 0.8468612517929969,
+   "suff": 0.9937225241906006,
+   "nec": 0.9999999793953931,
+   "n_units": 3,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.8468612517929969,
+   "gt_reward": 0.8468612517929969,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t33 at position 1; detector L0H0; gate tokens t33 t35 t36 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t33)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t33: L1H1 L1H6"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H1, L1H6)"
+    },
+    {
+     "role": "user",
+     "content": "L1H1 none; L1H6 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H1, L1H6)"
+    },
+    {
+     "role": "user",
+     "content": "L1H1 <- L0H0:33<t33 [det], tok:30, tok:1, L0H5:0.31 [~L0H2], L0H2:0.31 [~L0H5]\nL1H6 <- L0H0:33<t33 [det], tok:30, tok:1, L0H5:0.31 [~L0H2], L0H2:0.31 [~L0H5]"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H0\n  L0H0 --> L1H1\n  L0H0 --> L1H6\n  tok_offset_1 --> L1H1\n  L1H1 --> out\n  tok_offset_1 --> L1H6\n  L1H6 --> out\nEnglish: Detector L0H0 reads the marker t33 and un-gates L1H1, L1H6."
+    }
+   ]
+  },
+  {
+   "split": "train",
+   "family": "redundant",
+   "id": "zoo2_0249#4",
+   "parse": 1.0,
+   "unit_p": 1.0,
+   "unit_r": 1.0,
+   "unit_f1": 1.0,
+   "exact": 1.0,
+   "edge_f1": 0.7,
+   "reward": 0.7980003296649303,
+   "suff": 0.9966675041749201,
+   "nec": 0.9993331551549406,
+   "n_units": 4,
+   "calls": 4,
+   "runs": 0,
+   "answered": 1.0,
+   "episode_reward": 0.7980003296649303,
+   "gt_reward": 0.7980003296649303,
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "CALL marker()"
+    },
+    {
+     "role": "user",
+     "content": "marker t37 at position 1; detector L0H3; gate tokens t36 t37 t38 t39"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL gated(t37)"
+    },
+    {
+     "role": "user",
+     "content": "gated by t37: L1H0 L1H3 L1H7"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL twins(L1H0, L1H3, L1H7)"
+    },
+    {
+     "role": "user",
+     "content": "L1H0 none; L1H3 none; L1H7 none"
+    },
+    {
+     "role": "assistant",
+     "content": "CALL reads(L1H0, L1H3, L1H7)"
+    },
+    {
+     "role": "user",
+     "content": "L1H0 <- L0H3:33<t37 [det], tok:30, tok:1\nL1H3 <- L0H3:33<t37 [det], tok:30, tok:1\nL1H7 <- L0H3:33<t37 [det], tok:30, tok:1"
+    },
+    {
+     "role": "assistant",
+     "content": "ANSWER\nflowchart LR\n  tok_marker --> L0H3\n  L0H3 --> L1H0\n  L0H3 --> L1H7\n  L0H3 --> L1H3\n  tok_offset_3 --> L1H3\n  L1H3 --> out\n  tok_offset_3 --> L1H0\n  L1H0 --> out\n  tok_offset_3 --> L1H7\n  L1H7 --> out\nEnglish: Detector L0H3 reads the marker t37 and un-gates L1H0, L1H3, L1H7."
+    }
+   ]
+  }
+ ]
+}

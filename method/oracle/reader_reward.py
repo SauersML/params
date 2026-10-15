@@ -12,7 +12,8 @@ An outcome: the target's most likely next token ("top") and the probability of t
 
 reader reward: questions(): interventions drawn independently of any explanation (swaps at the last positions with
   fresh tokens from the model's own prediction there, removals and scalings of the circuit's parts singly and in
-  threes, swaps with one part set back), so an explanation earns only what generalizes; the reader (a frozen open model
+  threes, swaps with one part set back), half of each kind from those that move the model, so an explanation earns
+  only what generalizes and "no change" is not a free answer; the reader (a frozen open model
   on Tinker, never trained, never Claude) reads the text's end, the model's prediction, the explanation (or none) and
   the questions, and answers each with a token and a probability. Per question: top right (0/1) and p's credit
   max(0, 1 - |logit p_reader - logit p| / 4); reward = the mean of their average over questions less SIMPLICITY per
@@ -45,7 +46,7 @@ SIMPLICITY = 0.1  # reward per 1,000 reader tokens of explanation
 READER = "Qwen/Qwen3.5-397B-A17B"  # tinker_train.REWARD_READER: the validated reader (10-12: ranked a correct, a wrong and
 # another text's explanation in order on 15 of 16 texts)
 LOGIT_SCALE = 4.0  # a probability's credit reaches 0 at this many nats of log-odds error
-KIND = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc", "down_proj": "down"}
+KIND = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc", "down_proj": "down", "neuron": "n"}
 SITE = {v: k for k, v in KIND.items()}
 PARTS = ("Parts are rank-one slices of the model's weight matrices, named L<layer>.<kind>#<index> (kind q, k, v, o: "
          "attention's query, key, value and output; fc, down: the MLP's input and output) at a token position (@<position>).")
@@ -58,14 +59,14 @@ def label(site: str, pos: int, index: int) -> str:
 def site_of(lab: str, where=None) -> tuple[str, int, int] | None:
     """(site, position, index) of 'L3.down#2481@394' or 'L3.down#2481@' creation'' (where: a position's token text to
     its position), or None."""
-    m = re.fullmatch(r"L(\d+)\.(q|k|v|o|fc|down)#(\d+)@(.+)", lab.strip())
+    m = re.fullmatch(r"L(\d+)\.(q|k|v|o|fc|down|n)#(\d+)@(.+)", lab.strip())
     if not m:
         return None
     layer, kind, idx, at = m.groups()
     pos = where(at) if where else (int(at) if at.isdigit() else None)
     if pos is None:
         return None
-    return (f"h.{layer}.{'mlp' if kind in ('fc', 'down') else 'attn'}.{SITE[kind]}", int(pos), int(idx))
+    return (f"h.{layer}.{'mlp' if kind in ('fc', 'down', 'n') else 'attn'}.{SITE[kind]}", int(pos), int(idx))
 
 
 class VPDTarget:
@@ -222,26 +223,209 @@ class VPDTarget:
                 f"The model's prediction now: {pred}.\n{PARTS}\n")
 
 
-def questions(tg: VPDTarget, circuit: list, seed: int = 0) -> list[dict]:
-    """Interventions independent of any explanation (module docstring), each with its measured outcome."""
+class HFTarget(VPDTarget):
+    """A Hugging Face causal LM (Qwen3) on one text; its parts are MLP neurons (the input of down_proj): removal sets
+    one to 0, scaling multiplies it, a set-back restores its value on the original text."""
+
+    def __init__(self, name: str, text: str, device: str | None = None):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.torch, self.name = torch, name
+        self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
+        self.hf = AutoTokenizer.from_pretrained(name)
+        self.m = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32 if self.dev.type == "mps" else torch.bfloat16).to(self.dev).eval()
+        self.layers = self.m.model.layers
+        self.I = self.m.config.intermediate_size
+        self.groups = (16, 64)  # a single neuron of Qwen3-1.7B moves p(' of') on text9000 by under 0.01 (0.99 -> 0.99)
+        self.ids = self.hf(text, add_special_tokens=False)["input_ids"]
+        self.t = len(self.ids) - 1
+        self.task = text[-60:]
+        lp, self.a0 = self._run(self.ids, {}, keep=True)
+        self.all_lp = lp
+        self.base = lp[self.t]
+        self.y0 = int(self.base.argmax())
+
+    def tok(self, i: int) -> str:
+        return self.hf.decode([int(i)])
+
+    def token_id(self, s: str) -> int | None:
+        e = self.hf(s, add_special_tokens=False)["input_ids"]
+        return e[0] if len(e) == 1 else None
+
+    def valid(self, part) -> bool:
+        n, p, c = part
+        return (n.endswith(".mlp.neuron") and 0 <= int(n.split(".")[1]) < len(self.layers) and 0 <= c < self.I
+                and 0 <= p < len(self.ids))
+
+    def _run(self, seq, edits: dict, keep: bool = False):
+        """Log-probabilities at every position, the neurons edited: edits {(layer, pos, idx): ("set", v) | ("scale", s)};
+        keep: also every layer's neuron activations (CPU)."""
+        torch = self.torch
+        acts, hs = {}, []
+        by: dict = {}
+        for (l, p, c), e in edits.items():
+            by.setdefault(l, []).append((p, c, e))
+        for l, layer in enumerate(self.layers):
+            if l in by or keep:
+                def pre(_m, args, l=l):
+                    x = args[0]
+                    if keep:
+                        acts[l] = x[0].detach().to("cpu", torch.float32)
+                    for p, c, (k, v) in by.get(l, []):
+                        x[0, p, c] = v if k == "set" else x[0, p, c] * v
+                    return (x,) + tuple(args[1:])
+                hs.append(layer.mlp.down_proj.register_forward_pre_hook(pre))
+        try:
+            with torch.no_grad():
+                lp = torch.log_softmax(self.m(input_ids=torch.tensor([seq], device=self.dev)).logits[0].float(), -1)
+        finally:
+            for h in hs:
+                h.remove()
+        return lp, acts
+
+    def logp(self, seq, masks: dict | None = None, patch: dict | None = None):
+        edits = {}
+        for (n, p, c), v in (masks or {}).items():
+            edits[(int(n.split(".")[1]), p, c)] = ("scale", v)
+        for n, items in (patch or {}).items():
+            for p, c, v in items:
+                edits[(int(n.split(".")[1]), p, c)] = ("set", float(v))
+        return self._run(seq, edits)[0][self.t]
+
+    def run(self, iv: dict) -> dict:
+        if iv["kind"] == "setback":
+            seq = list(self.ids)
+            seq[iv["pos"]] = self.token_id(iv["token"])
+            patch: dict = {}
+            for n, p, c in iv["parts"]:
+                patch.setdefault(n, []).append((p, c, self.a0[int(n.split(".")[1])][p, c]))
+            lp = self.logp(seq, patch=patch)
+            return {"top": self.tok(int(lp.argmax())), "p": float(lp[self.y0].exp())}
+        return VPDTarget.run(self, iv)
+
+    @property
+    def nat(self):  # VPDTarget.run reads masks through logp only
+        raise AttributeError
+
+    def fresh(self, pos: int, n: int, rng: random.Random) -> list[str]:
+        w = self.all_lp[pos - 1].cpu().double().exp()
+        w[self.ids[pos]] = 0.0
+        gen = self.torch.Generator().manual_seed(rng.randrange(2 ** 31))
+        out = []
+        for z in self.torch.multinomial(w, 4 * n, replacement=False, generator=gen).tolist():
+            s = self.tok(z)
+            if self.token_id(s) == z and s.strip() and len(out) < n:
+                out.append(s)
+        return out
+
+    def parts(self, k: int = 48, positions: int = 3) -> list[tuple]:
+        """The k neurons at the last positions with the largest |activation x gradient of log p(the prediction)|."""
+        torch = self.torch
+        acts, hs = {}, []
+        for l, layer in enumerate(self.layers):
+            def pre(_m, args, l=l):
+                x = args[0]
+                x.retain_grad()
+                acts[l] = x
+                return None
+            hs.append(layer.mlp.down_proj.register_forward_pre_hook(pre))
+        try:
+            lp = torch.log_softmax(self.m(input_ids=torch.tensor([self.ids], device=self.dev)).logits[0, self.t].float(), -1)
+            lp[self.y0].backward()
+        finally:
+            for h in hs:
+                h.remove()
+        scores = []
+        for l, x in acts.items():
+            a = (x[0] * x.grad[0]).abs()[self.t - positions + 1:].float()
+            v, i = a.flatten().topk(k)
+            for vv, ii in zip(v.tolist(), i.tolist()):
+                scores.append((vv, (f"h.{l}.mlp.neuron", self.t - positions + 1 + ii // self.I, ii % self.I)))
+        self.m.zero_grad(set_to_none=True)
+        return [x for _, x in sorted(scores, reverse=True)[:k]]
+
+    def head(self, n_tokens: int = 24) -> str:
+        T = len(self.ids)
+        top = self.base.exp().topk(3)
+        pred = ", ".join(f"{self.tok(int(i))!r} ({float(v):.2f})" for v, i in zip(top.values, top.indices))
+        toks = " ".join(f"{p}:{self.tok(self.ids[p])!r}" for p in range(max(0, T - n_tokens), T))
+        end = self.hf.decode(self.ids[max(0, T - 60):])
+        return (f"A language model ({self.name.split('/')[-1]}, {len(self.layers)} transformer layers) reads a text and predicts "
+                f"the next token after its last token (position {T - 1}).\nThe text ends: ...{end}\nIts last tokens by position: "
+                f"{toks}\nThe model's prediction now: {pred}.\nParts are MLP neurons, named L<layer>.n#<index> (the neuron's "
+                f"activation, the input of the layer's down projection) at a token position (@<position>).\n")
+
+
+def facts(tg, parts: list, seed: int = 99) -> str:
+    """A facts-only explanation from measurements (no claim untested): the prediction, the parts whose single removal
+    moves it most, swaps at the last position that keep and that move it (fresh tokens, a seed apart from the
+    questions'), and the part whose set-back recovers most of a moving swap. A test explanation for the reward."""
+    rng = random.Random(seed)
+    y, p0 = tg.tok(tg.y0), float(tg.base[tg.y0].exp())
+    rem = sorted(((tg.run({"kind": "remove", "parts": [list(x)]})["p"], x) for x in parts), key=lambda z: z[0])
+    out = [f"The model gives {y!r} probability {p0:.2f}."]
+    strong = [f"{label(*x)} (to {pp:.2f})" for pp, x in rem[:5]]
+    out.append(f"Removing these parts alone lowers p({y!r}) most: {', '.join(strong)}; removing most other single parts "
+               f"moves it by less than {abs(rem[len(rem) // 2][0] - p0):.2f}.")
+    for g in getattr(tg, "groups", ()):
+        pg = tg.run({"kind": "remove", "parts": [list(x) for _, x in rem[:g]]})
+        out.append(f"Removing the {g} strongest of them together takes p({y!r}) to {pg['p']:.2f} (top {pg['top']!r}).")
+    sw = [(s, tg.run({"kind": "swap", "pos": tg.t, "token": s})) for s in tg.fresh(tg.t, 16, rng)]
+    keep = [s for s, o in sw if o["top"] == y and o["p"] > p0 / 2]
+    move = [(s, o) for s, o in sw if o["top"] != y or o["p"] <= p0 / 2]
+    at = repr(tg.tok(tg.ids[tg.t]))
+    if keep:
+        out.append(f"Replacing {at} at position {tg.t} by {', '.join(map(repr, keep[:6]))} keeps {y!r} on top.")
+    if move:
+        out.append("Replacing it by " + ", ".join(f"{s!r} (top {o['top']!r}, p {o['p']:.2f})" for s, o in move[:6]) + " moves the prediction.")
+        s, o = move[0]
+        best = max(((tg.run({"kind": "setback", "pos": tg.t, "token": s, "parts": [list(x)]})["p"], x) for _, x in rem[:8]),
+                   key=lambda z: z[0])
+        out.append(f"After the swap to {s!r}, setting {label(*best[1])} back to its value on the original text brings p({y!r}) "
+                   f"from {o['p']:.2f} to {best[0]:.2f}.")
+    return " ".join(out)
+
+
+WANT = {"swap": 18, "remove": 11, "setback": 4, "scale": 3}  # questions per kind
+
+
+def moved(tg, o: dict) -> bool:
+    """Whether an outcome differs from the unchanged model: another top token, or p's log-odds moved by a nat or more
+    (the grader's scale; a bit of log p hides 0.99 -> 0.87)."""
+    return o["top"] != tg.tok(tg.y0) or abs(logit(o["p"]) - logit(float(tg.base[tg.y0].exp()))) >= 1
+
+
+def questions(tg, circuit: list, seed: int = 0, pool: int = 3) -> list[dict]:
+    """Interventions independent of any explanation (module docstring), each with its measured outcome: per kind, pool
+    times WANT drawn and measured, then half of WANT from those that move the model and half from those that do not
+    (the other half filling a short side): most single removals leave p near its value, so 'no change' would otherwise
+    be right without reading anything (text9000 v1: 11 of 11)."""
     rng = random.Random(seed)
     t = tg.t
-    ivs = []
-    for pos, n in ((t, 8), (t - 1, 4), (t - 2, 3), (t - 3, 3)):
-        ivs += [{"kind": "swap", "pos": pos, "token": s} for s in tg.fresh(pos, n, rng)]
     parts = [list(x) for x in circuit]
-    for x in rng.sample(parts, min(8, len(parts))):
-        ivs.append({"kind": "remove", "parts": [x]})
-    for _ in range(3):
-        ivs.append({"kind": "remove", "parts": rng.sample(parts, 3)})
     at_t = [x for x in parts if x[1] == t] or parts
-    for s in tg.fresh(t, 4, rng):
-        ivs.append({"kind": "setback", "pos": t, "token": s, "parts": [rng.choice(at_t)]})
-    for x in rng.sample(parts, min(3, len(parts))):
-        ivs.append({"kind": "scale", "parts": [x], "by": 2.0})
+    g1, g2 = getattr(tg, "groups", (1, 3))  # parts per removal: one and three subcomponents; neurons in larger groups
+    draw = {"swap": [{"kind": "swap", "pos": pos, "token": s} for pos, n in ((t, 8), (t - 1, 4), (t - 2, 3), (t - 3, 3))
+                     for s in tg.fresh(pos, pool * n, rng)],
+            "remove": [{"kind": "remove", "parts": rng.sample(parts, g1)} for _ in range(pool * 8)]
+                      + [{"kind": "remove", "parts": rng.sample(parts, g2)} for _ in range(pool * 3)],
+            "setback": [{"kind": "setback", "pos": t, "token": s, "parts": [rng.choice(at_t)]} for s in tg.fresh(t, pool * 4, rng)],
+            "scale": [{"kind": "scale", "parts": rng.sample(parts, g1), "by": rng.choice([0.5, 2.0, 3.0])} for _ in range(pool * 3)]}
+    ivs = []
+    for kind, cands in draw.items():
+        for iv in cands:
+            iv["outcome"] = tg.run(iv)
+        yes = [iv for iv in cands if moved(tg, iv["outcome"])]
+        no = [iv for iv in cands if not moved(tg, iv["outcome"])]
+        k = WANT[kind]
+        a = min(len(yes), max(k // 2, k - len(no)))
+        pick = rng.sample(yes, a) + rng.sample(no, min(len(no), k - a))
+        rng.shuffle(pick)
+        ivs += pick
     for iv in ivs:
-        iv["outcome"] = tg.run(iv)
         iv["words"] = tg.words(iv)
+        iv["moved"] = moved(tg, iv["outcome"])
     return ivs
 
 
@@ -387,11 +571,26 @@ def explanation_of(path: str) -> str | None:
     return None if path == "none" else Path(path).read_text().strip()
 
 
-def cmd_questions(a) -> None:
+def target_of(a):
+    """The target and its parts: vpd4l with a stated circuit's subcomponents, or a Hugging Face model (--model) on the
+    task's text with its attributed neurons."""
+    if a.model:
+        import mech
+
+        ids = json.loads((TEXTS / f"{a.task}.json").read_text())["prompts"][0]["token_ids"]
+        text = mech.tokenizer("vpd4l").decode(ids).replace("<|endoftext|>", "")
+        tg = HFTarget(a.model, text, a.device)
+        return tg, tg.parts(256)
     tg = VPDTarget(a.task, a.device)
     circ = json.loads(a.circuit.read_text())
-    parts = [(n, int(p), int(c)) for n, c, p in circ["nodes"] if n.startswith("h.")]
+    return tg, [(n, int(p), int(c)) for n, c, p in circ["nodes"] if n.startswith("h.")]
+
+
+def cmd_questions(a) -> None:
+    tg, parts = target_of(a)
     ivs = questions(tg, parts, a.seed)
+    if a.facts:
+        a.facts.write_text(facts(tg, parts))
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text("".join(json.dumps({"task": a.task, "head": tg.head(), "answer": tg.tok(tg.y0), **iv}) + "\n" for iv in ivs))
     print(len(ivs), "questions to", a.out)
@@ -406,13 +605,17 @@ def cmd_read(a) -> None:
     n_ex = rd.tokens(ex) if ex else 0
     acc = sum(r["score"] for r in rows) / len(rows)
     kinds = sorted({r["kind"] for r in rows})
+    base = json.loads(a.baseline.read_text())["accuracy"] if a.baseline else None
     res = {"explanation": a.explanation, "reader": a.reader, "reward": acc - SIMPLICITY * n_ex / 1000, "accuracy": acc,
+           "over_none": None if base is None else acc - base, "moved_right": sum(r["score"] for r, iv in zip(rows, ivs) if iv.get("moved")),
+           "moved_n": sum(bool(iv.get("moved")) for iv in ivs),
            "explanation_tokens": n_ex, "spend_usd": rd.spend.total, "raw": got,
            "by_kind": {k: {"n": sum(r["kind"] == k for r in rows), "top_right": sum(r["top_ok"] for r in rows if r["kind"] == k),
                            "p_credit": round(sum(r["p_credit"] for r in rows if r["kind"] == k) / sum(r["kind"] == k for r in rows), 3)}
                        for k in kinds}, "rows": rows}
     a.out.write_text(json.dumps(res, indent=1))
-    print(json.dumps({k: res[k] for k in ("explanation", "reward", "accuracy", "explanation_tokens", "spend_usd", "by_kind")}))
+    print(json.dumps({k: res[k] for k in ("explanation", "reward", "accuracy", "over_none", "moved_right", "moved_n", "explanation_tokens",
+                                           "spend_usd", "by_kind")}))
 
 
 def cmd_invariants(a) -> None:
@@ -433,10 +636,11 @@ def cmd_invariants(a) -> None:
         rows.append({"line": line, "parsed": True, "holds": all(ok), "instances": len(ok), "met": sum(ok),
                      "outcomes": [[iv.get("token"), o["top"], round(o["p"], 4)] for iv, o in zip(ivs, outs)]})
     share = sum(r["holds"] for r in rows) / max(len(rows), 1)
-    res = {"explanation": a.explanation, "reader": a.reader, "share_holding": share, "lines": len(rows),
+    inst = sum(r.get("met", 0) / r["instances"] if r.get("instances") else 0.0 for r in rows) / max(len(rows), 1)
+    res = {"explanation": a.explanation, "reader": a.reader, "share_holding": share, "instance_share": inst, "lines": len(rows),
            "parsed": sum(r["parsed"] for r in rows), "spend_usd": rd.spend.total, "rows": rows, "raw": got}
     a.out.write_text(json.dumps(res, indent=1))
-    print(json.dumps({k: res[k] for k in ("explanation", "share_holding", "lines", "parsed", "spend_usd")}))
+    print(json.dumps({k: res[k] for k in ("explanation", "share_holding", "instance_share", "lines", "parsed", "spend_usd")}))
     for r in rows:
         print(("HOLDS " if r["holds"] else "fails ") + r["line"][:150], r.get("met"), "/", r.get("instances"))
 
@@ -446,13 +650,16 @@ def main():
     sub = ap.add_subparsers(dest="what", required=True)
     q = sub.add_parser("questions")
     q.add_argument("--task", default="text9000")
-    q.add_argument("--circuit", type=Path, required=True)
+    q.add_argument("--circuit", type=Path, help="vpd4l: the stated circuit whose parts the questions remove")
+    q.add_argument("--model", help="a Hugging Face model (Qwen/Qwen3-1.7B) in place of vpd4l: its neurons are the parts")
+    q.add_argument("--facts", type=Path, help="also write a facts-only explanation of the target here (facts())")
     q.add_argument("--out", type=Path, required=True)
     q.add_argument("--seed", type=int, default=0)
     r = sub.add_parser("read")
     r.add_argument("--questions", type=Path, required=True)
     r.add_argument("--explanation", required=True)
     r.add_argument("--out", type=Path, required=True)
+    r.add_argument("--baseline", type=Path, help="the same questions' no-explanation result (read --explanation none)")
     i = sub.add_parser("invariants")
     i.add_argument("--task", default="text9000")
     i.add_argument("--explanation", required=True)

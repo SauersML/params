@@ -3,9 +3,10 @@
 #   RUN=gen1 MODE=gen TEXTS=4000 [PROCS=2] bash experiments/oracle/cao/cao_pod.sh [HOURS]     examples (PROCS processes, seeds 1..)
 #   RUN=train1 MODE=train DATA=<examples on the Mac> [STEPS=N] bash ... [HOURS]                SFT from the released adapter
 #   RUN=eval1 MODE=eval ITEMS=<h2h items> ADAPTER_DIR=<a trained adapter on the Mac> bash ...  the gate's questions
+#   RUN=org1 MODE=organisms bash ... [HOURS]                                                  organisms.py all (planted truths)
 #   (env: SRCREV (default origin/main), GPU, PRICE)
 cd /Users/user/params
-RUN=${RUN:?RUN} MODE=${MODE:?gen, train or eval} H=${1:-6}
+RUN=${RUN:?RUN} MODE=${MODE:?gen, train, eval or organisms} H=${1:-6}
 N=oracle-cao-$RUN O=/Users/user/mpd-data/runpod/$N
 S=/Users/user/mpd-data/scratch/primerl/src_cao_$RUN
 REV=${SRCREV:-origin/main}
@@ -19,6 +20,7 @@ case $MODE in
   gen) WORK=""; for k in $(seq 1 ${PROCS:-2}); do
          WORK="$WORK (python -u cao.py gen --out $O/examples_$k.jsonl --texts $(( ${TEXTS:-100} / ${PROCS:-2} )) --seed $k > $O/gen_$k.log 2>&1) &"
        done; WORK="$WORK wait; cat $O/examples_*.jsonl > $O/examples.jsonl" ;;
+  organisms) WORK="python -u organisms.py all --out $O/organisms > $O/organisms.log 2>&1" ;;
   train) WORK="python -u cao.py train --data $S/data.jsonl --out $O/adapter ${STEPS:+--steps $STEPS} > $O/train.log 2>&1" ;;
   eval) WORK="python -u cao.py eval --items $S/items.jsonl --adapter ${ADAPTER_DIR:+$S/adapter} ${ADAPTER_DIR:-adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B} --out $O/eval.jsonl > $O/eval.log 2>&1; \
 python -u cao.py eval --items $S/items.jsonl --adapter ${ADAPTER_DIR:+$S/adapter} ${ADAPTER_DIR:-adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B} --out $O/eval_text_only.jsonl --text-only > $O/eval_text_only.log 2>&1" ;;

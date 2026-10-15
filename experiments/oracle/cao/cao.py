@@ -607,6 +607,152 @@ def train(a) -> None:
     print(f"saved {a.out}")
 
 
+def _native_slots(ex):
+    slots, offset = [], 0
+    for block in ex['blocks']:
+        if 'layer' in block:
+            offset += len(block['positions'])
+        else:
+            unit=block.get('unit')
+            if (not isinstance(unit,list) or len(unit)!=3 or unit[0] not in ('neuron','head')
+                    or any(type(x) is not int or x<0 for x in unit[1:])):
+                raise ValueError('native gain requires explicit neuron/head unit addresses')
+            slots.append(offset)
+            offset += 1
+    return slots
+
+
+def _native_gain_plan(rows, n):
+    """First n native validation rows; donor choice never inspects their answers."""
+    import hashlib
+    if type(n) is not int or n <= 0:
+        raise ValueError('positive native diagnostic row count required')
+    digest = lambda x: hashlib.sha256(json.dumps(x, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+    eligible = [(i,e) for i,e in enumerate(rows) if e.get('text') is not None and e['text'] % 50 == 0 and _native_slots(e)]
+    if len(eligible) < n:
+        raise ValueError('insufficient eligible native validation rows')
+    selected = eligible[:n]
+    records=[]
+    for j,(index,e) in enumerate(selected):
+        units=[b['unit'] for b in e['blocks'] if 'layer' not in b]
+        records.append({'selected_index':j,'data_index':index,'row_sha256':digest(e),
+            'context_sha256':digest({'ctx':e['ctx'],'target':e.get('target')}),
+            'category':e['cat'],'text_id':e['text'],'native_units':units,
+            'native_slots':_native_slots(e),'target':e.get('target')})
+    for j,rec in enumerate(records):
+        # Same category, ordered native kinds, and target model. A different context
+        # and possibly different unit identity supplies the mismatched packet.
+        compatible=lambda r: (r['category']==rec['category'] and r['target']==rec['target'] and
+            [u[0] for u in r['native_units']]==[u[0] for u in rec['native_units']] and
+            r['context_sha256']!=rec['context_sha256'])
+        donor=next((k for step in range(1,n) if compatible(records[k:=(j+step)%n])),None)
+        rec['donor_index']=donor
+        rec['donor_row_sha256']=records[donor]['row_sha256'] if donor is not None else None
+        rec['permutation_available']=donor is not None
+    return [e for _,e in selected],records,{'eligible_native_rows':len(eligible),'selected_rows':n}
+
+
+def _native_gain_vectors(original, slots, arm, donor=None):
+    """Only native placeholders change; all residual vectors remain byte-identical."""
+    value=original.clone()
+    if arm=='zero_native':
+        value[slots]=0
+    elif arm=='permute_native':
+        if donor is None or donor.shape != value[slots].shape:
+            raise ValueError('compatible native donor required')
+        value[slots]=donor.to(value.device,value.dtype)
+    elif arm!='correct':
+        raise ValueError('unknown native gain arm')
+    return value
+
+
+def _native_gain_equivalence(original, donor, units, donor_units):
+    """Compare the vectors exactly as injection normalizes them, on its device/dtype.
+
+    Relative vector polarity is observable; a native scalar activation pole is
+    not inferred from a write vector without its direction column.
+    """
+    import torch
+    donor=donor.to(original.device,original.dtype)
+    a=torch.nn.functional.normalize(original,dim=-1)
+    b=torch.nn.functional.normalize(donor,dim=-1)
+    rows=[]
+    for j,(u,v) in enumerate(zip(units,donor_units)):
+        az=bool(original[j].eq(0).all());bz=bool(donor[j].eq(0).all())
+        af,bf=a[j].float(),b[j].float()
+        cosine=None if az or bz else float(torch.nn.functional.cosine_similarity(af[None],bf[None],dim=-1)[0])
+        same=bool(torch.equal(a[j],b[j]))
+        opposite=not(az or bz) and bool(torch.equal(a[j],-b[j]))
+        rows.append({'unit':u,'donor_unit':v,'same_unit':u==v,'source_zero':az,'donor_zero':bz,
+            'normalized_equal':same,'normalized_opposite':opposite,'cosine':cosine,
+            'relative_vector_pole':'zero' if az or bz else 'same' if same else 'opposite' if opposite else 'different',
+            'pole_scope':'relative write-vector direction; scalar activation pole not inferred'})
+    return rows
+
+
+def _gain_native(a, rows):
+    """Paired teacher-forced losses, not free-prose or causal-mechanism certification."""
+    import hashlib
+    import torch
+    if a.out is None or a.out.exists():
+        raise ValueError('new --out path required for native controls')
+    val,records,coverage=_native_gain_plan(rows,a.n)
+    sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+    adapter=Path(a.adapter)
+    # A local immutable checkpoint is required rather than a mutable model alias.
+    assets={name:sha(adapter/name) for name in ('adapter_config.json','adapter_model.safetensors')}
+    manifest={'schema':1,'data_sha256':sha(a.data),'adapter_files_sha256':assets,
+        'model_identifier':MODEL,'base_snapshot':str(a.base_snapshot) if a.base_snapshot else None,
+        'source_sha256':sha(Path(__file__)),'selection':coverage,'rows':records,
+        'arms':['correct','zero_native','permute_native'],
+        'norm_convention':'injection independently L2-normalizes each vector then scales by receiving residual norm; zero stays zero, donor magnitude is not preserved',
+        'permutation_scope':'different-context native packets of same category/ordered kinds/target; unit identities may differ; unavailable donors remain explicit',
+        'scope':'native validation likelihood diagnostic; promotes is legacy unsigned linear lens, not causal; no prose truth or generalization certificate'}
+    plan_path=a.out.with_suffix(a.out.suffix+'.plan.json')
+    if plan_path.exists():raise ValueError('native control plan already exists')
+    plan_path.write_text(json.dumps(manifest,indent=2,allow_nan=False)+'\n')
+    # The selection and checkpoint bytes above are frozen before model measurement.
+    o=Oracle(a.adapter,a.device,model=str(a.base_snapshot) if a.base_snapshot else MODEL);o.m.eval();o.text_only=False
+    native=[]
+    with torch.no_grad():
+        for e,r in zip(val,records):
+            native.append(o.vectors(e)[r['native_slots']].detach().cpu().clone())
+    measured=[];oracle_rows=0
+    with torch.no_grad():
+        for e,r in zip(val,records):
+            original=o.vectors(e)
+            result={**r,'arms':{}}
+            d=r['donor_index']
+            result['native_donor_equivalence']=(_native_gain_equivalence(original[r['native_slots']],native[d],
+                r['native_units'],records[d]['native_units']) if d is not None else None)
+            for arm in manifest['arms']:
+                if arm=='permute_native' and r['donor_index'] is None:
+                    result['arms'][arm]={'available':False,'reason':'no compatible different-context donor'}
+                    continue
+                donor=native[r['donor_index']] if arm=='permute_native' else None
+                key='native_gain_current'
+                o.vec_store[key]=_native_gain_vectors(original,r['native_slots'],arm,donor)
+                try:
+                    total,count=o.batch_loss([{**e,'vec':key}],reduce=False)
+                    oracle_rows+=1
+                finally:o.vec_store.pop(key,None)
+                if count<=0 or not math.isfinite(float(total)):
+                    raise ValueError('finite positive-token loss required')
+                result['arms'][arm]={'available':True,'loss_sum_nats':float(total),'answer_tokens':count,'loss_nats_per_token':float(total)/count}
+            measured.append(result)
+    summary={}
+    for cat in sorted({'edit','promotes','units'} | {r['category'] for r in measured}):
+        summary[cat]={}
+        for arm in manifest['arms']:
+            values=[r['arms'][arm] for r in measured if r['category']==cat and r['arms'][arm]['available']]
+            tokens=sum(v['answer_tokens'] for v in values)
+            summary[cat][arm]={'selected_rows':sum(r['category']==cat for r in measured),'available_rows':len(values),
+                'answer_tokens':tokens,'loss_nats_per_token':sum(v['loss_sum_nats'] for v in values)/tokens if tokens else None}
+    output={'manifest':manifest,'rows':measured,'by_category':summary,'target_forward_rows':o.passes,'oracle_forward_rows':oracle_rows}
+    a.out.write_text(json.dumps(output,indent=2,allow_nan=False)+'\n')
+    print(json.dumps({'by_category':summary,'target_forward_rows':o.passes,'oracle_forward_rows':oracle_rows}))
+
+
 def gain(a) -> None:
     """How much an adapter uses the vectors: on train's held-out texts (one in 50, VAL_N examples), the answer tokens' loss
     per category with the vectors added and with none (text-only), in nats per token; a category whose two losses match
@@ -614,6 +760,8 @@ def gain(a) -> None:
     import torch
 
     rows = [json.loads(x) for x in a.data.read_text().splitlines()]
+    if getattr(a,'native_controls',False):
+        return _gain_native(a,rows)
     val = [r for r in rows if r.get("text") is not None and r["text"] % 50 == 0][:a.n]
     o = Oracle(a.adapter, a.device)
     by = {}
@@ -796,6 +944,9 @@ def main():
     v_.add_argument("--adapter", default=AO)
     v_.add_argument("--n", type=int, default=VAL_N)
     v_.add_argument("--device")
+    v_.add_argument("--native-controls", action="store_true", help="native-only zero/permutation paired validation diagnostic")
+    v_.add_argument("--out", type=Path, help="new per-row native-control receipt (required with --native-controls)")
+    v_.add_argument("--base-snapshot", type=Path, help="local pinned base/tokenizer snapshot for native controls; leaves CAO_MODEL identity unchanged")
     r_ = sub.add_parser("report")
     r_.add_argument("outs", type=Path, nargs="+")
     a = ap.parse_args()

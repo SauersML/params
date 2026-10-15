@@ -13,6 +13,111 @@ import cao  # noqa: E402
 transformers = pytest.importorskip("transformers")
 
 
+def native_gain_rows():
+    return [{'text':i*50,'cat':cat,'ctx':[i+1,2],
+             'blocks':[{'layer':0,'positions':[0,1]}, {'label':'A','unit':['neuron',0,i]}],
+             'q':'Which literal effect?','a':'unchanged'} for i,cat in enumerate(['edit','promotes','edit','promotes'])]
+
+
+def test_native_gain_plan_is_ordered_outcome_independent_and_reports_donors():
+    import copy
+    rows=native_gain_rows();val,records,coverage=cao._native_gain_plan(rows,4)
+    assert val==rows and coverage=={'eligible_native_rows':4,'selected_rows':4}
+    assert [r['donor_index'] for r in records]==[2,3,0,1]
+    assert all(r['native_slots']==[2] for r in records)
+    changed=copy.deepcopy(rows)
+    for e in changed:e['a']='different measured outcome'
+    _,second,_=cao._native_gain_plan(changed,4)
+    assert [r['donor_index'] for r in second]==[r['donor_index'] for r in records]
+    assert all(a['row_sha256']!=b['row_sha256'] for a,b in zip(records,second))
+    _,short,_=cao._native_gain_plan(rows,1)
+    assert short[0]['donor_index'] is None and not short[0]['permutation_available']
+    with pytest.raises(ValueError,match='insufficient'):cao._native_gain_plan(rows,5)
+
+
+def test_native_gain_controls_preserve_residual_and_original_vectors():
+    x=torch.arange(20,dtype=torch.float32).reshape(5,4);before=x.clone()
+    donor=torch.tensor([[4.,3.,2.,1.],[8.,7.,6.,5.]])
+    for arm in ('correct','zero_native','permute_native'):
+        v=cao._native_gain_vectors(x,[1,4],arm,donor)
+        assert torch.equal(v[[0,2,3]],x[[0,2,3]])
+        assert torch.equal(x,before)
+        if arm=='permute_native':assert torch.equal(v[[1,4]],donor)
+        if arm=='zero_native':assert not v[[1,4]].count_nonzero()
+    with pytest.raises(ValueError):cao._native_gain_vectors(x,[1,4],'permute_native',donor[:1])
+
+
+def test_native_gain_equivalence_detects_scale_erasure_and_opposite_pole():
+    units=[['neuron',0,1]]*4
+    source=torch.tensor([[3.,4.],[3.,4.],[0.,0.],[3.,4.]])
+    donor=torch.tensor([[6.,8.],[-6.,-8.],[0.,0.],[0.,0.]])
+    got=cao._native_gain_equivalence(source,donor,units,units)
+    assert got[0]['same_unit'] and got[0]['normalized_equal']
+    assert got[0]['cosine']==pytest.approx(1)
+    assert got[1]['normalized_opposite'] and got[1]['relative_vector_pole']=='opposite'
+    assert got[1]['cosine']==pytest.approx(-1)
+    assert got[2]['source_zero'] and got[2]['donor_zero'] and got[2]['normalized_equal']
+    assert got[2]['cosine'] is None and got[3]['cosine'] is None
+    assert not got[3]['normalized_equal']
+    # Identical directions from different identities are recorded, not reselected.
+    other=[['neuron',1,2]]*4
+    assert not cao._native_gain_equivalence(source,donor,units,other)[0]['same_unit']
+
+
+def test_native_gain_saves_every_row_paired_losses_and_premeasurement_manifest(tmp_path,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    rows=native_gain_rows();data=tmp_path/'allowed_validation.jsonl'
+    data.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    adapter=tmp_path/'step_5000';adapter.mkdir()
+    for f in ('adapter_config.json','adapter_model.safetensors'):(adapter/f).write_bytes(b'fixture bytes')
+    out=tmp_path/'native_gain.json';seen=[]
+    class FakeOracle:
+        def __init__(self,*args,**kwargs):
+            assert out.with_suffix('.json.plan.json').exists()
+            self.m=SimpleNamespace(eval=lambda:None);self.vec_store={};self.passes=0
+        def vectors(self,e):
+            self.passes+=1
+            return torch.tensor([[100.,0.],[0.,100.],[float(e['ctx'][0]),2.]])
+        def batch_loss(self,es,reduce):
+            assert not self.text_only and not reduce
+            e=es[0];v=self.vec_store[e['vec']]
+            assert torch.equal(v[:2],torch.tensor([[100.,0.],[0.,100.]]))
+            seen.append((e['ctx'],v.clone()))
+            return torch.tensor(float(v[-1].sum())),2
+    monkeypatch.setattr(cao,'Oracle',FakeOracle)
+    args=SimpleNamespace(data=data,adapter=str(adapter),out=out,n=4,device='cpu',native_controls=True,base_snapshot=None)
+    cao.gain(args);got=json.loads(out.read_text())
+    assert len(got['rows'])==4 and len(seen)==12
+    assert got['target_forward_rows']==8 and got['oracle_forward_rows']==12
+    assert set(got['by_category'])=={'edit','promotes','units'}
+    assert got['by_category']['units']['correct']['selected_rows']==0
+    assert all(len(r['arms'])==3 for r in got['rows'])
+    assert got['rows'][0]['arms']['correct']['loss_sum_nats']==3
+    assert got['rows'][0]['arms']['zero_native']['loss_sum_nats']==0
+    assert got['rows'][0]['arms']['permute_native']['loss_sum_nats']==5
+    assert got['rows'][0]['native_donor_equivalence'][0]['donor_unit']==rows[2]['blocks'][1]['unit']
+    assert all(v['answer_tokens']==2 for r in got['rows'] for v in r['arms'].values())
+    with pytest.raises(ValueError,match='new --out'):cao.gain(args)
+
+
+def test_native_gain_missing_donor_retains_explicit_row(tmp_path,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    data=tmp_path/'data';data.write_text(json.dumps(native_gain_rows()[0])+'\n')
+    adapter=tmp_path/'adapter';adapter.mkdir()
+    for f in ('adapter_config.json','adapter_model.safetensors'):(adapter/f).write_bytes(b'x')
+    class FakeOracle:
+        def __init__(self,*a,**kw):self.m=SimpleNamespace(eval=lambda:None);self.passes=0;self.vec_store={}
+        def vectors(self,e):self.passes+=1;return torch.ones(3,2)
+        def batch_loss(self,*a,**kw):return torch.tensor(1.),1
+    monkeypatch.setattr(cao,'Oracle',FakeOracle)
+    out=tmp_path/'out';cao.gain(SimpleNamespace(data=data,adapter=str(adapter),out=out,n=1,device='cpu',native_controls=True,base_snapshot=None))
+    got=json.loads(out.read_text());assert len(got['rows'])==1
+    assert got['rows'][0]['arms']['permute_native']['available'] is False
+    assert got['by_category']['edit']['permute_native']['available_rows']==0
+
+
 def capture_oracle():
     """Real tiny Qwen+PEFT, no tokenizer/assets/downloads."""
     from peft import LoraConfig, get_peft_model

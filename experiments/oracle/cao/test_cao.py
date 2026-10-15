@@ -13,6 +13,138 @@ import cao  # noqa: E402
 transformers = pytest.importorskip("transformers")
 
 
+def native_control_fixture(tmp_path):
+    import json
+    o=capture_oracle();base=sequence_example(o)
+    source={'model_identifier':cao.MODEL,'model_revision':'a'*40}
+    contexts=[]
+    for i,split in enumerate(('train','train','eval')):
+        e={**base,'ctx':[1+i,3+i,5+i]}
+        if i==2:e['blocks']=[base['blocks'][0],{'label':'Neuron A','unit':['neuron',0,3]}]
+        contexts.append({'context_id':str(i),'split':split,'document_sha256':str(i)*64,'token_ids':e['ctx'],
+            'questions':[{'unit':e['blocks'][1]['unit'],'blocks':e['blocks'],'q':e['q']}]})
+    path=tmp_path/'public.plan.json';path.write_text(json.dumps({'source':source,'contexts':contexts}))
+    out=tmp_path/'donors.json';plan=cao.freeze_native_controls(path,out,seed=0)
+    return o,out,plan
+
+
+def test_native_control_donors_metadata_only_same_unit_then_explicit_fallback(tmp_path):
+    import json
+    o,path,plan=native_control_fixture(tmp_path)
+    for key,e in plan['rows'].items():
+        d=plan['donors'][key];donor=plan['rows'][d['row_key']]
+        assert donor['split']=='train' and donor['ctx']!=e['ctx']
+        assert d['same_unit']==(e['split']=='train')
+        assert 'a' not in e and 'measurement' not in e
+    bad=json.loads(path.read_text());first=next(iter(bad['donors']));bad['donors'][first]['row_key']=first
+    path.write_text(json.dumps(bad))
+    with pytest.raises(ValueError,match='donor binding'):cao.configure_native_controls(o,'joint_mismatch',path)
+    assert o.passes==0
+
+
+def test_native_total_controls_atomic_traces_vectors_and_fixed_residuals(tmp_path):
+    import copy
+    o,path,plan=native_control_fixture(tmp_path)
+    e=next(e for e in plan['rows'].values() if e['split']=='eval');before=copy.deepcopy(e)
+    modes={}
+    for mode in ('correct','native_absent','joint_mismatch','sequence_absent'):
+        cao.configure_native_controls(o,mode,path)
+        ready,vecs=o.prepare([e]);modes[mode]=(ready[0],vecs[0],o.prompt(ready[0]))
+        assert e==before
+    real=modes['correct'][1];slots=cao._native_slots(e)
+    for mode,(ready,v,prompt) in modes.items():
+        assert torch.equal(v[:2],real[:2])
+        assert ready['q']==e['q'] and ready['blocks']==e['blocks']
+        if mode in ('native_absent','sequence_absent'):
+            assert 'evidence unavailable' in prompt and 'activation=[' not in prompt
+    assert not modes['native_absent'][1][slots].count_nonzero()
+    assert torch.equal(modes['sequence_absent'][1],real)
+    ready,v,prompt=modes['joint_mismatch']
+    donor=ready['_native_control_payload']['donor_example']
+    dn,_=o._vectors(donor,sequence=True)
+    assert torch.equal(v[slots],dn[cao._native_slots(donor)])
+    assert ready['_native_sequence_packet']['token_ids']==e['ctx']
+    assert donor['_native_sequence_packet']['token_ids']!=e['ctx']
+    # The prompt is blinded to arm/provenance; receipts explicitly retain mapping.
+    assert 'joint_mismatch' not in prompt and 'different-unit fallback' not in prompt
+    assert ready['_native_control_receipt']['donor']['scope']=='different-unit fallback'
+    assert modes['correct'][2].split(' All context')[0]==prompt.split(' All context')[0]
+
+
+def test_native_donor_cache_never_reuses_correct_packet_under_wrong_identity(tmp_path):
+    o,path,plan=native_control_fixture(tmp_path)
+    e=next(iter(plan['rows'].values()))
+    cao.configure_native_controls(o,'joint_mismatch',path)
+    a,_=o.prepare([e]);assert o.passes==2
+    b,_=o.prepare([e]);assert o.passes==3  # receiver fresh, donor cached under actual donor key
+    assert a[0]['_native_control_receipt']==b[0]['_native_control_receipt']
+    o.text_only=True
+    with pytest.raises(ValueError,match='residual evidence'):o.prepare([e])
+
+
+def test_controlled_training_uses_frozen_schedule_and_never_scores_eval(tmp_path,monkeypatch,capsys):
+    import json,hashlib
+    from types import SimpleNamespace
+    snapshot=tmp_path/('a'*40);snapshot.mkdir()
+    for name in ('tokenizer.json','config.json'):(snapshot/name).write_text('{}')
+    binding={'model_revision':snapshot.name,'tokenizer_sha256':hashlib.sha256(b'{}').hexdigest(),
+        'config_sha256':hashlib.sha256(b'{}').hexdigest()}
+    train=[{'cat':'native_edit','context_id':str(i),'ctx':[i],'blocks':[],'q':'q','a':'train'} for i in (1,2)]
+    protected={'cat':'native_edit','context_id':'eval','ctx':[9],'blocks':[],'q':'q','a':'NEVER_SCORE'}
+    data=tmp_path/'data';data.write_text(''.join(json.dumps(e)+'\n' for e in train+[protected]))
+    schedule=tmp_path/'schedule';keys=[cao.native_row_key(e) for e in train]
+    schedule.write_text(json.dumps({'schema':'native_train_schedule_v1','data_sha256':hashlib.sha256(data.read_bytes()).hexdigest(),
+        'train_rows':keys,'batch_size':16,'steps':2,'batches':[[keys[j%2] for j in range(16)]]*2}))
+    init=tmp_path/'init';init.mkdir()
+    for name in ('adapter_config.json','adapter_model.safetensors'):(init/name).write_text('frozen')
+    donors=tmp_path/'donors';donors.write_text('{}');seen=[]
+    class Model(torch.nn.Module):
+        def __init__(self):super().__init__();self.w=torch.nn.Parameter(torch.tensor(1.))
+        def save_pretrained(self,path):path.mkdir();(path/'done').write_text('fixed')
+        def gradient_checkpointing_enable(self,**kw):pass
+    class Oracle:
+        def __init__(self,*args,**kw):self.m=Model();self.lm=self.m;self.passes=0;assert kw['model']==str(snapshot)
+        def batch_loss(self,rows,reduce=False,backward=False):
+            assert backward and all(e['a']=='train' for e in rows)
+            seen.extend(cao.native_row_key(e) for e in rows)
+            for e in rows:self.native_input_sink({'row_key':cao.native_row_key(e),'prefill_tokens':7,'answer_tokens':3})
+            loss=self.m.w.square()*len(rows);loss.backward();self.passes+=len(rows)
+            return loss.detach(),3*len(rows)
+    monkeypatch.setattr(cao,'_training_split',lambda rows:(train,[protected]))
+    monkeypatch.setattr(cao,'_native_training_receipt',lambda *args:binding)
+    monkeypatch.setattr(cao,'configure_native_controls',lambda *args:None)
+    monkeypatch.setattr(cao,'Oracle',Oracle)
+    out=tmp_path/'out'
+    cao.train(SimpleNamespace(data=data,base_snapshot=snapshot,schedule=schedule,steps=2,seed=0,
+        native_control='correct',control_plan=donors,init=str(init),device='cpu',vectors=[],out=out,save_every=1))
+    assert seen==json.loads(schedule.read_text())['batches'][0]*2
+    assert not (out/'step_1').exists() and (out/'step_2').exists()
+    complete=json.loads((out/'training_complete.json').read_text())
+    assert complete['answer_tokens']==96 and complete['prefill_tokens']==224
+    assert complete['oracle_forward_rows']==32 and complete['backward_rows']==32
+    assert complete['protected_eval_used'] is False
+    assert '"completed_steps": 2' in capsys.readouterr().out
+
+
+def test_balanced_native_schedule_cycles_train_only_no_eval_gold_access(tmp_path,monkeypatch):
+    import json,hashlib
+    rows=[]
+    for i in range(6):
+        rows.append({'context_id':str(i),'ctx':[i],'blocks':[{'unit':['neuron',0,i]}],'q':'edit',
+            'split':'train','measurement':{'original_top_id':1,'edited_top_id':2 if i<2 else 1}})
+    # Protected eval has deliberately unusable measurement; any access would fail.
+    rows.append({'split':'eval','measurement':None})
+    data=tmp_path/'data';data.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    monkeypatch.setattr(cao,'_training_split',lambda r:(r[:-1],r[-1:]))
+    monkeypatch.setattr(cao,'_native_training_receipt',lambda *a:None)
+    a=cao.freeze_native_schedule(data,tmp_path/'a',steps=3,seed=0)
+    b=cao.freeze_native_schedule(data,tmp_path/'b',steps=3,seed=0)
+    assert a==b
+    positive={cao.native_row_key(r) for r in rows[:2]}
+    assert all(len(batch)==16 and sum(k in positive for k in batch)==8 for batch in a['batches'])
+    assert len({k for batch in a['batches'] for k in batch})==6
+
+
 def prospective_fixture(tmp_path):
     import json,hashlib
     snapshot=tmp_path/('a'*40);snapshot.mkdir()

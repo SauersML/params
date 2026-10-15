@@ -182,7 +182,7 @@ class Oracle:
         flags=[_sequence_requested(e) for e in exs]
         if not any(flags):return exs,None
         for e,flag in zip(exs,flags):
-            if flag and ('vec' in e or '_native_sequence_packet' in e):
+            if flag and any(k in e for k in ('vec','_native_sequence_packet','_native_control_payload','_native_control_receipt')):
                 raise ValueError('sequence evidence requires fresh clean capture, not a supplied sidecar/vector')
         prepared,vecs=[],[]
         for e,flag in zip(exs,flags):
@@ -190,10 +190,18 @@ class Oracle:
                 v,packet=self._vectors(e,sequence=True)
                 ready={**e,'_native_sequence_packet':packet}
                 _sequence_prompt(ready)  # validate before any oracle forward
+                if getattr(self,'native_control_mode',None) is not None:
+                    ready,v=_controlled_native_input(self,ready,v)
             else:
                 v=self.vectors(e);ready=e
             prepared.append(ready);vecs.append(v)
         return prepared,vecs
+
+    def record_inputs(self,exs,enc):
+        sink=getattr(self,'native_input_sink',None)
+        if sink:
+            for e,(ids,_,start) in zip(exs,enc):
+                sink({**e['_native_control_receipt'],'prefill_tokens':start,'answer_tokens':len(ids)-start})
 
     def vectors_many(self, exs: list[dict]) -> list:
         """vectors() for a batch: the examples that read layers of the target itself in one right-padded forward pass
@@ -254,6 +262,7 @@ class Oracle:
         torch = self.torch
         exs, prepared_vecs = self.prepare(exs)
         enc = [self.encode(e, True) for e in exs]
+        self.record_inputs(exs,enc)
         vecs = self.vectors_many(exs) if prepared_vecs is None else prepared_vecs
         L = max(len(i) for i, _, _ in enc)
         pad = self.tok.pad_token_id or self.tok.eos_token_id
@@ -282,6 +291,7 @@ class Oracle:
         torch = self.torch
         exs, prepared_vecs = self.prepare(exs)
         enc = [self.encode(e, False) for e in exs]
+        self.record_inputs(exs,enc)
         vecs = [self.vectors(e) for e in exs] if prepared_vecs is None else prepared_vecs
         L = max(len(i) for i, _, _ in enc)
         pad = self.tok.pad_token_id or self.tok.eos_token_id
@@ -299,6 +309,13 @@ class Oracle:
                                     temperature=None, top_p=None, top_k=None, pad_token_id=self.tok.eos_token_id)
         finally:
             h.remove()
+        sink=getattr(self,'native_generation_sink',None)
+        if sink:
+            for e,x in zip(exs,g):
+                tokens=x[L:].tolist()
+                if self.tok.eos_token_id in tokens:tokens=tokens[:tokens.index(self.tok.eos_token_id)+1]
+                sink({'row_key':native_row_key(e),'output_token_ids':tokens,'generated_tokens':len(tokens),
+                    'limit_reached':len(tokens)>=MAX_NEW and (not tokens or tokens[-1]!=self.tok.eos_token_id)})
         return [self.tok.decode(x[L:], skip_special_tokens=True).strip() for x in g]
 
     def answer(self, ex: dict) -> str:
@@ -311,6 +328,7 @@ class Oracle:
         exs, prepared_vecs = self.prepare(exs)
         pairs = [({**e, "a": o}, b) for b, (e, opts) in enumerate(zip(exs, options)) for o in opts]
         enc = [self.encode(e, True) for e, _ in pairs]
+        self.record_inputs([e for e,_ in pairs],enc)
         vec_of = [self.vectors(e) for e in exs] if prepared_vecs is None else prepared_vecs
         L = max(len(i) for i, _, _ in enc)
         pad = self.tok.pad_token_id or self.tok.eos_token_id
@@ -461,9 +479,21 @@ def _sequence_prompt(ex):
                 raise ValueError('finite full-context native scalar traces required')
     # Receipt keeps exact FP32 values and source metadata; prompt is a compact,
     # explicitly rounded rendering, never a dump of the full example or its answer.
-    lines=['Clean native neuron sequence v1. All context position IDs: '+','.join(map(str,p['position_ids'])),
+    payload=ex.get('_native_control_payload')
+    rendered=p['neurons']
+    if payload:
+        if payload['mode'] in ('native_absent','sequence_absent'):
+            return 'Native sequence evidence unavailable.\n'
+        if payload['mode']=='joint_mismatch':
+            donor=payload['donor_example']
+            _sequence_prompt(donor)  # validate original donor identity, never rewrite its clean provenance
+            source=donor['_native_sequence_packet']
+            if source['position_ids']!=p['position_ids']:raise ValueError('native donor positions differ')
+            rendered=[{**d,'unit':r['unit']} for r,d in zip(p['neurons'],source['neurons'])]
+    header='Native neuron sequence v1.' if payload else 'Clean native neuron sequence v1.'
+    lines=[header+' All context position IDs: '+','.join(map(str,p['position_ids'])),
         'Each neuron lists its signed pre-down/SwiGLU activation at every position, plus the constant bias-free effective down-column L2 norm. Write L2 norm at each position = abs(activation) times column norm. Values rounded to 6 significant digits; no positions omitted.']
-    for row in p['neurons']:
+    for row in rendered:
         unit=row['unit']
         acts,norms=row['activation'],row['write_norm']
         largest=max(range(len(acts)),key=lambda i:abs(acts[i]))
@@ -479,6 +509,120 @@ def _sequence_prompt(ex):
         lines.append(f'Neuron L{unit[1]}.N{unit[2]} column_norm={column}; activation=['+values+']')
     lines.append('Clean observations; the question defines intervention positions. Last-position vector injection is separately normalized, losing magnitude. Signs/norms alone do not establish answer support or causal effects.')
     return '\n'.join(lines)+'\n'
+
+
+def native_row_key(e):
+    """Metadata-only identity; never includes answer or measured outcome."""
+    import hashlib
+    return hashlib.sha256(json.dumps({k:e[k] for k in ('context_id','ctx','blocks','q')},sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+
+def native_adapter_binding(path):
+    """Streaming content binding of a local frozen LoRA, without loading tensors."""
+    import hashlib
+    result={}
+    for name in ('adapter_config.json','adapter_model.safetensors'):
+        h=hashlib.sha256()
+        with (Path(path)/name).open('rb') as f:
+            for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
+        result[name]=h.hexdigest()
+    return result
+
+
+def freeze_native_controls(plan_path,out,seed=0):
+    """TRAIN-only donor mappings from the public preintervention question plan."""
+    import hashlib
+    plan=json.loads(plan_path.read_text());rows={}
+    binding={**plan['source'],'plan_sha256':hashlib.sha256(plan_path.read_bytes()).hexdigest()}
+    for c in plan['contexts']:
+        for q in c['questions']:
+            e={'cat':'native_edit','schema':'native_neuron_edit_v1','context_id':c['context_id'],'split':c['split'],
+                'document_sha256':c['document_sha256'],'ctx':c['token_ids'],'blocks':q['blocks'],'q':q['q'],
+                'native_sequence':'native_neuron_sequence_v1','native_binding':binding}
+            slots=_native_slots(e)
+            if len(slots)!=1 or any(b['unit'][0]!='neuron' for b in e['blocks'] if 'layer' not in b):
+                raise ValueError('native controls require one queried neuron per row')
+            key=native_row_key(e)
+            if key in rows:raise ValueError('duplicate native question')
+            rows[key]=e
+    pool=sorted(k for k,e in rows.items() if e['split']=='train');donors={}
+    for key,e in rows.items():
+        candidates=[k for k in pool if rows[k]['ctx']!=e['ctx']]
+        same=[k for k in candidates if [b['unit'] for b in rows[k]['blocks'] if 'unit' in b]==[b['unit'] for b in e['blocks'] if 'unit' in b]]
+        choices=same or candidates
+        if not choices:raise ValueError('no different-context TRAIN native donor; freeze fails before predictions')
+        index=int(hashlib.sha256(f'{seed}:{key}'.encode()).hexdigest(),16)%len(choices)
+        donors[key]={'row_key':choices[index],'same_unit':bool(same),'scope':'same-unit' if same else 'different-unit fallback'}
+    result={'schema':'native_controls_v1','generator_plan_sha256':binding['plan_sha256'],'seed':seed,'rows':rows,'donors':donors,
+        'scope':'declared synthetic correspondence control; only donor payloads change, clean receiver/donor provenance retained out of band'}
+    if out.exists():raise ValueError('native control plan already exists')
+    out.write_text(json.dumps(result,indent=2,allow_nan=False)+'\n')
+    return result
+
+
+def configure_native_controls(o,mode,path):
+    if mode not in ('correct','joint_mismatch','native_absent','sequence_absent'):raise ValueError('invalid native input control')
+    plan=json.loads(path.read_text())
+    if plan.get('schema')!='native_controls_v1' or set(plan['rows'])!=set(plan['donors']):raise ValueError('complete native donor plan required')
+    for key,donor in plan['donors'].items():
+        e=plan['rows'][key];d=plan['rows'].get(donor['row_key'])
+        if (native_row_key(e)!=key or d is None or d['split']!='train' or e['ctx']==d['ctx'] or len(e['ctx'])!=len(d['ctx'])
+                or e['native_binding']!=d['native_binding']):raise ValueError('invalid TRAIN-only native donor binding')
+    o.native_control_mode=mode;o.native_control_plan=plan;o.native_donor_cache={}
+
+
+def _controlled_native_input(o,e,v):
+    import hashlib
+    mode=o.native_control_mode
+    if o.text_only:raise ValueError('text_only also removes residual evidence; not a native-only control')
+    key=native_row_key(e);plan=o.native_control_plan
+    if key not in plan['rows'] or e['native_binding']!=plan['rows'][key]['native_binding']:
+        raise ValueError('question missing or binding differs from frozen native control plan')
+    slots=_native_slots(e);ready=dict(e)
+    receipt={'row_key':key,'mode':mode,'receiver_packet_sha256':hashlib.sha256(json.dumps(e['_native_sequence_packet'],sort_keys=True).encode()).hexdigest(),
+        'donor':None,'scope':'experimental transform; immutable clean packets not relabelled as recipient observations'}
+    payload={'mode':mode}
+    if mode=='joint_mismatch':
+        donor_key=plan['donors'][key]['row_key'];donor=plan['rows'][donor_key]
+        if donor_key not in o.native_donor_cache:
+            dv,dp=o._vectors(donor,sequence=True)
+            o.native_donor_cache[donor_key]=(dv[_native_slots(donor)].detach().cpu().clone(),{**donor,'_native_sequence_packet':dp})
+            while len(o.native_donor_cache)>32:o.native_donor_cache.pop(next(iter(o.native_donor_cache)))
+        dn,de=o.native_donor_cache[donor_key]
+        receipt['donor']={**plan['donors'][key],'packet_sha256':hashlib.sha256(json.dumps(de['_native_sequence_packet'],sort_keys=True).encode()).hexdigest()}
+        receipt['vector_equivalence']=_native_gain_equivalence(v[slots],dn,
+            [b['unit'] for b in e['blocks'] if 'unit' in b],[b['unit'] for b in donor['blocks'] if 'unit' in b])
+        receipt['trace_equal']=all(a['activation']==b['activation'] and a['write_norm']==b['write_norm']
+            for a,b in zip(e['_native_sequence_packet']['neurons'],de['_native_sequence_packet']['neurons']))
+        payload['donor_example']=de
+        v=_native_gain_vectors(v,slots,'permute_native',dn)
+    elif mode=='native_absent':v=_native_gain_vectors(v,slots,'zero_native')
+    ready['_native_control_payload']=payload;ready['_native_control_receipt']=receipt
+    _sequence_prompt(ready)
+    return ready,v
+
+
+def freeze_native_schedule(data,out,steps=64,seed=0):
+    """Only TRAIN outcome fields used; complete file parsed for receipt/metadata checks."""
+    import hashlib
+    rows=[json.loads(x) for x in data.read_text().splitlines()]
+    train_rows,_=_training_split(rows);_native_training_receipt(data,rows)
+    pools={True:[],False:[]}
+    for e in sorted(train_rows,key=native_row_key):
+        m=e['measurement'];pools[m['edited_top_id']!=m['original_top_id']].append(native_row_key(e))
+    if steps<=0 or not all(pools.values()):raise ValueError('positive steps and both TRAIN effect classes required')
+    rng=random.Random(seed)
+    for pool in pools.values():rng.shuffle(pool)
+    batches=[]
+    for step in range(steps):
+        batch=[pool[(step*8+j)%len(pool)] for pool in pools.values() for j in range(8)]
+        rng.shuffle(batch);batches.append(batch)
+    result={'schema':'native_train_schedule_v1','data_sha256':hashlib.sha256(data.read_bytes()).hexdigest(),'seed':seed,'steps':steps,
+        'batch_size':16,'batches':batches,'train_rows':[native_row_key(e) for e in train_rows],
+        'class_rows':{str(k):len(v) for k,v in pools.items()},'unique_presented':len({k for b in batches for k in b}),
+        'scope':'TRAIN-only class-balanced repeats; file parsed but no eval outcome fields inspected/used; same fixed schedule for both arms'}
+    if out.exists():raise ValueError('training schedule exists')
+    out.write_text(json.dumps(result,indent=2)+'\n');return result
 
 
 def unit_write(o: Oracle, ctx: list[int], unit, target: str | None = None) -> "torch.Tensor":
@@ -893,8 +1037,9 @@ def train(a) -> None:
     rng = random.Random(0)
     rng.shuffle(rows)
     rows,val=_training_split(rows)
+    prospective=rows[0].get('cat')=='native_edit'
     snapshot=getattr(a,'base_snapshot',None)
-    if rows[0].get('cat')=='native_edit':
+    if prospective:
         import hashlib
         binding=_native_training_receipt(a.data,rows+val)
         sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
@@ -902,21 +1047,57 @@ def train(a) -> None:
                 sha(snapshot/'tokenizer.json')!=binding['tokenizer_sha256'] or
                 sha(snapshot/'config.json')!=binding['config_sha256']):
             raise ValueError('prospective training requires the exact label base/tokenizer/config snapshot')
+        torch.manual_seed(getattr(a,'seed',0))
+    schedule=None;lookup={}
+    if getattr(a,'schedule',None):
+        import hashlib
+        lookup={native_row_key(e):e for e in rows} if prospective else {}
+        schedule=json.loads(a.schedule.read_text())
+        if (not prospective or schedule.get('schema')!='native_train_schedule_v1' or
+                schedule['data_sha256']!=hashlib.sha256(a.data.read_bytes()).hexdigest() or
+                set(schedule['train_rows'])!=set(lookup) or schedule['batch_size']!=BATCH or
+                len(schedule['batches'])!=schedule['steps'] or
+                any(len(b)!=BATCH or any(k not in lookup for k in b) for b in schedule['batches']) or
+                (a.steps is not None and a.steps!=schedule['steps'])):
+            raise ValueError('frozen TRAIN schedule mismatch')
+    initial_adapter=None
+    if getattr(a,'native_control',None):
+        if not prospective or not a.control_plan or schedule is None or not a.init:
+            raise ValueError('controlled training requires prospective data, local init, donor plan and frozen schedule')
+        initial_adapter=native_adapter_binding(a.init)
     o = Oracle(AO if not a.init else a.init, a.device, trainable=True, **({'model':str(snapshot)} if snapshot else {}))
     o.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if getattr(a,'native_control',None):
+        if not prospective or not a.control_plan or schedule is None:raise ValueError('controlled training requires prospective data, donor plan and frozen schedule')
+        configure_native_controls(o,a.native_control,a.control_plan)
     for f in a.vectors or []:
         o.vec_store.update(torch.load(f))
     opt = torch.optim.AdamW([p for p in o.m.parameters() if p.requires_grad], lr=LR)
-    steps = a.steps or len(rows) // BATCH
+    steps = schedule['steps'] if schedule else a.steps or len(rows) // BATCH
     a.out.mkdir(parents=True, exist_ok=True)
+    input_log=None;prefill_tokens=0
+    if getattr(a,'native_control',None):
+        input_log=(a.out/'input_receipts.jsonl').open('x')
+        def record(value):
+            nonlocal prefill_tokens
+            prefill_tokens+=value['prefill_tokens']
+            input_log.write(json.dumps(value,allow_nan=False)+'\n');input_log.flush()
+        o.native_input_sink=record
+        (a.out/'training_protocol.json').write_text(json.dumps({'schema':'controlled_native_training_v1','mode':a.native_control,
+            'schedule_sha256':sha(a.schedule),'donor_plan_sha256':sha(a.control_plan),'data_sha256':sha(a.data),
+            'init':a.init,'initial_adapter':initial_adapter,'seed':getattr(a,'seed',0),'steps':steps,'batch_size':BATCH,'micro':MICRO,
+            'base_revision':binding['model_revision'],'tokenizer_sha256':binding['tokenizer_sha256'],'config_sha256':binding['config_sha256'],
+            'cao_source_sha256':sha(Path(__file__)),
+            'protected_eval_used_during_fit':False,'checkpoint_selection':'fixed final step only'},indent=2)+'\n')
     o.m.train()
-    t0 = time.time()
+    t0 = time.time();answer_tokens=0
     for s in range(steps):
-        batch = [rows[(s * BATCH + i) % len(rows)] for i in range(BATCH)]
+        batch = [lookup[k] for k in schedule['batches'][s]] if schedule else [rows[(s * BATCH + i) % len(rows)] for i in range(BATCH)]
         tot, n = 0.0, 0
         for k in range(0, BATCH, MICRO):  # micro-batches, each backward at once; the gradient is the batch's token mean
             t, c = o.batch_loss(batch[k:k + MICRO], reduce=False, backward=True)
             tot, n = tot + float(t), n + c
+        answer_tokens+=n
         for p in o.m.parameters():
             if p.grad is not None:
                 p.grad /= max(n, 1)
@@ -926,7 +1107,11 @@ def train(a) -> None:
         opt.zero_grad(set_to_none=True)
         if s % 50 == 0:
             print(json.dumps({"step": s, "loss": round(loss, 4), "seconds": round(time.time() - t0, 1)}), flush=True)
-        if val and ((s + 1) % VAL_EVERY == 0 or s + 1 == steps):  # held-out texts' loss per category
+        if prospective:
+            print(json.dumps({'completed_steps':s+1,'total_steps':steps,'seconds':time.time()-t0,
+                'oracle_forward_rows':(s+1)*BATCH,'backward_rows':(s+1)*BATCH,'target_forward_rows':o.passes,
+                'prefill_tokens':prefill_tokens,'answer_tokens':answer_tokens}),flush=True)
+        if not prospective and val and ((s + 1) % VAL_EVERY == 0 or s + 1 == steps):  # legacy only; prospective eval stays protected
             o.m.eval()
             with torch.no_grad():
                 by = {}
@@ -938,8 +1123,15 @@ def train(a) -> None:
                         d[1] += c_
             o.m.train()
             print(json.dumps({"step": s + 1, "val": {k: round(v[0] / max(v[1], 1), 4) for k, v in sorted(by.items())}}), flush=True)
-        if (s + 1) % a.save_every == 0 or s + 1 == steps:
+        if (not prospective and (s + 1) % a.save_every == 0) or s + 1 == steps:
             o.m.save_pretrained(a.out / f"step_{s + 1}")
+    if input_log:
+        input_log.close()
+        (a.out/'training_complete.json').write_text(json.dumps({'steps':steps,'target_forward_rows':o.passes,
+            'oracle_forward_rows':steps*BATCH,'backward_rows':steps*BATCH,'runtime_seconds':time.time()-t0,
+            'answer_tokens':answer_tokens,'prefill_tokens':prefill_tokens,'protected_eval_used':False,
+            'cuda_max_memory_allocated_bytes':torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None,
+            'cuda_max_memory_reserved_bytes':torch.cuda.max_memory_reserved() if torch.cuda.is_available() else None},indent=2)+'\n')
     print(f"saved {a.out}")
 
 
@@ -1271,6 +1463,10 @@ def main():
     t.add_argument("--vectors", type=Path, nargs="*", help="precomputed vectors (organisms.py examples' .pt files)")
     t.add_argument("--device")
     t.add_argument("--base-snapshot", type=Path, help="required immutable label model/tokenizer snapshot for prospective native training")
+    t.add_argument("--schedule", type=Path, help="frozen TRAIN-only balanced row-key schedule")
+    t.add_argument("--native-control", choices=("correct","joint_mismatch"), help="matched prospective native input training arm")
+    t.add_argument("--control-plan", type=Path, help="frozen metadata-only native donor mappings")
+    t.add_argument("--seed", type=int, default=0)
     e = sub.add_parser("eval")
     e.add_argument("--items", type=Path, required=True)
     e.add_argument("--adapter", default=AO)
@@ -1292,10 +1488,16 @@ def main():
     v_.add_argument("--native-controls", action="store_true", help="native-only zero/permutation paired validation diagnostic")
     v_.add_argument("--out", type=Path, help="new per-row native-control receipt (required with --native-controls)")
     v_.add_argument("--base-snapshot", type=Path, help="local pinned base/tokenizer snapshot for native controls; leaves CAO_MODEL identity unchanged")
+    fc=sub.add_parser('freeze-native-controls')
+    fc.add_argument('--plan',type=Path,required=True);fc.add_argument('--out',type=Path,required=True);fc.add_argument('--seed',type=int,default=0)
+    fs=sub.add_parser('freeze-native-schedule')
+    fs.add_argument('--data',type=Path,required=True);fs.add_argument('--out',type=Path,required=True);fs.add_argument('--steps',type=int,default=64);fs.add_argument('--seed',type=int,default=0)
     r_ = sub.add_parser("report")
     r_.add_argument("outs", type=Path, nargs="+")
     a = ap.parse_args()
-    {"report": report, "gen": gen, "train": train, "eval": eval_items, "organisms": eval_organisms, "gain": gain}[a.cmd](a)
+    if a.cmd=='freeze-native-controls':freeze_native_controls(a.plan,a.out,a.seed)
+    elif a.cmd=='freeze-native-schedule':freeze_native_schedule(a.data,a.out,a.steps,a.seed)
+    else:{"report": report, "gen": gen, "train": train, "eval": eval_items, "organisms": eval_organisms, "gain": gain}[a.cmd](a)
 
 
 if __name__ == "__main__":

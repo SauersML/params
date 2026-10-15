@@ -802,16 +802,14 @@ class VLLMReader:
     """The reader self-hosted for training (the lead's 10-14: Tinker's $6 per 1,000 rewards is too much for RL): vLLM
     offline batches, greedy, the chat template with thinking off. Same calls as Reader."""
 
-    def __init__(self, model: str, max_len: int = 8192):
+    def __init__(self, model: str, max_len: int = 6144, util: float = 0.85, seqs: int = 64):
         from transformers import AutoTokenizer
         from vllm import LLM
 
         self.tok = AutoTokenizer.from_pretrained(model)
-        kw = {"limit_mm_per_prompt": {"image": 0, "video": 0}}
-        try:
-            self.llm = LLM(model=model, max_model_len=max_len, gpu_memory_utilization=0.92, **kw)
-        except TypeError:
-            self.llm = LLM(model=model, max_model_len=max_len, gpu_memory_utilization=0.92)
+        # a 48 GB card: the FP8 27B's weights take 27.9 GiB, and at utilization 0.92 the CUDA-graph profiling ran out
+        self.llm = LLM(model=model, max_model_len=max_len, gpu_memory_utilization=util, max_num_seqs=seqs,
+                       limit_mm_per_prompt={"image": 0, "video": 0})
         self.spend = type("S", (), {"total": 0.0})()
 
     def __call__(self, prompts: list[str], max_tokens: int = 1500) -> list[str]:

@@ -15,7 +15,10 @@ the token edges and the target token), in C's semantics on one engine plan.
   (3) Sparsify (the goal's: VPD's explanations connect too much and reach too many tokens). In turn, each by the
       largest prefix whose removal still meets the criteria: whole positions (every line touching the context
       positions whose lines save the least), cross-token connections (a writer at one position read at another),
-      every kept connection, then the token edges (by their readers' scores), lowest score first.
+      every kept connection, then the token edges (by their readers' scores), lowest score first. With halve, after
+      the connections' prefix: the rest in HALVE_BLOCKS blocks, lowest score first, each removed when the set without
+      it meets the criteria, else split in two and tried again down to single connections (about k log(n/k) runs for
+      k connections needed among n: the misranked ones a prefix search stops at).
 The record reports the sparsity (edges between units per unit, cross-token connections, tokens involved) of the stated
 circuit beside the wired one's.
 Criteria, the cheap families builder_fast's node selection holds (pymove's 10-14): the point KL at most node selection's
@@ -53,6 +56,8 @@ import teacher  # noqa: E402
 ALPHAS = 8  # integrated-gradient strengths, (i + 1/2) / ALPHAS
 FISHER_SAMPLES = 32  # the second-order score's tokens drawn from the model's prediction
 SCORE = "ig"  # the ranking's score (Connector.scores: "ig" or "fisher")
+HALVE = False  # the halving pass after the prefix passes (run(halve=))
+HALVE_BLOCKS = 8  # its first blocks: the remaining connections, lowest score first, in this many
 POINT_TOL = 0.02  # the point KL's allowed rise, as a share of the log distance from the wired circuit's to no line's
 TRACK_TOL = 0.02  # s_track_pp's allowed fall below the wired circuit's (lines.VAL_MARGIN's)
 TRACK_DRAWS = 8  # s_track_pp's draws in the search (the report uses goal_eval's default)
@@ -252,7 +257,7 @@ class Connector:
         return out
 
     def run(self, log=print, budget_s: float | None = None, floors: dict | None = None, score: str | None = None,
-            passes: int | None = None) -> dict:
+            passes: int | None = None, halve: bool | None = None) -> dict:
         """The stated circuit (stages (1) to (3)) and its measurements. floors: {"point": KL cap in bits, "track",
         "scope", "interchange": floors of the families} replacing the defaults (the wired circuit's values less the
         tolerances, the path-patched families' at most FLOOR); a family whose floor is None or whose wired value is
@@ -271,6 +276,7 @@ class Connector:
 
         t = time.time()
         score = score or SCORE
+        halve = HALVE if halve is None else halve
         sc = self.scores(score, passes)
         order = self.conn[torch.argsort(sc[self.conn], descending=True, stable=True)]
         self.spent["rank"] = time.time() - t
@@ -307,7 +313,7 @@ class Connector:
         t = time.time()
         wp, rp, up = self.positions()
         tok = self.tok
-        dropped = []
+        dropped, halving = [], None
         if budget_s is None or time.time() - t0 < budget_s:
             # (3a) whole positions: the units at the positions whose lines save the least, dropped with every line
             # touching them, the most such positions that still meet the criteria (fewer tokens in the explanation)
@@ -336,6 +342,23 @@ class Connector:
             if ms:
                 m = max((m for m, y in zip(ms, passing([self.row(asc[m:], tok) for m in ms], last=True)) if y), default=0)
                 keep = asc[m:]
+            # (3c') halving: what the prefixes stop at (the first misranked connection ends a prefix search)
+            if halve and len(keep) > 1 and (budget_s is None or time.time() - t0 < budget_s):
+                th, before, runs0 = time.time(), len(keep), measured["point"]
+                asc = keep[torch.argsort(sc[keep], stable=True)]
+                queue = list(asc.tensor_split(min(HALVE_BLOCKS, len(asc))))
+                gone = torch.zeros(self.n_lines(), dtype=torch.bool)
+                while queue and (budget_s is None or time.time() - t0 < budget_s):
+                    b = queue.pop(0)
+                    trial = gone.clone()
+                    trial[b] = True
+                    if passing([self.row(keep[~trial[keep]], tok)])[0]:
+                        gone = trial
+                    elif len(b) > 1:
+                        queue[:0] = list(b.tensor_split(2))
+                keep = keep[~gone[keep]]
+                halving = {"before": before, "after": len(keep), "runs": measured["point"] - runs0,
+                           "seconds": round(time.time() - th, 2)}
             # (3d) token edges into kept parts, by their readers' scores, lowest first
             kept = pr.kept(self.row(keep, tok))
             live = tok[kept[pr.ends[tok, 0]]] if len(tok) else tok
@@ -359,6 +382,7 @@ class Connector:
                "token_edges": kinds["t"] + kinds["u"], "point": kl_on, "point_wired": kl_full,
                "point_none": kl_none, "families": fam, "families_wired": wired, "criteria": cap,
                **self.sparsity(on), "wired": self.sparsity(full), "positions_dropped": dropped, "score": score, "passes": passes,
+               "halving": halving,
                "measured": measured,
                "seconds": {k: round(v, 2) for k, v in self.spent.items()}}
         log(f"{rec['parts']} of {rec['parts_start']} parts, {rec['lines']} of {rec['lines_start']} lines "

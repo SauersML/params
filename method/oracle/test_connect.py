@@ -175,3 +175,11 @@ def test_fisher_scores(tiny):
     assert sc.shape == (len(c.pr.lines),) and bool((sc >= 0).all()) and float(sc[c.conn].sum()) > 0
     rec = c.run(log=lambda m: None, floors=TINY, score="fisher")["record"]
     assert rec["score"] == "fisher" and rec["measured"]["point"] > 0
+
+
+def test_halving(tiny):
+    nat, ge, tx = tiny
+    rec = connect.Connector(ge, tx, nodes_of(nat, tx, 5, 16), B=4).run(log=lambda m: None, floors=TINY, halve=True)["record"]
+    h = rec["halving"]
+    assert h is None or (h["after"] <= h["before"] and h["runs"] >= 1)
+    assert rec["point"] <= rec["criteria"]["point"] + 1e-6

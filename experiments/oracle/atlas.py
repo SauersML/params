@@ -296,6 +296,9 @@ def weights(a) -> None:
     f32 = lambda t: t.detach().float()  # noqa: E731
     down = [f32(x.mlp.down_proj.weight) for x in lay]          # [d, D]: column i is neuron i's write
     reads = [(f32(x.mlp.gate_proj.weight) * f32(x.post_attention_layernorm.weight)[None], f32(x.mlp.up_proj.weight) * f32(x.post_attention_layernorm.weight)[None]) for x in lay]
+    WU, gf = f32(m.lm_head.weight), f32(m.model.norm.weight)
+    del m, lay                                                # (8B: the bf16 model beside the f32 copies would fill a 48 GB card)
+    (torch.cuda.empty_cache() if dev.type == "cuda" else None)
     # downstream: per source neuron, the NEIGHBOURS largest |read . write| over later layers' gate and up rows (id = layer * D + j)
     dn_v = torch.zeros(L, D, NEIGHBOURS, device=dev)
     dn_i = torch.full((L, D, NEIGHBOURS), -1, dtype=torch.long, device=dev)
@@ -322,7 +325,6 @@ def weights(a) -> None:
                                                     torch.full_like(t, kind, dtype=torch.int8))
         (torch.cuda.synchronize() if dev.type == "cuda" else torch.mps.synchronize() if dev.type == "mps" else None)
         print(f"weights: source layer {l} done, {time.time() - t0:.0f} s", flush=True)
-    WU, gf = f32(m.lm_head.weight), f32(m.model.norm.weight)
     lt_i = torch.zeros(L, D, LOGITS, dtype=torch.int32)
     lt_v = torch.zeros(L, D, LOGITS)
     lb_i = torch.zeros(L, D, LOGITS, dtype=torch.int32)

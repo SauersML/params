@@ -21,7 +21,7 @@ flowchart TB
   end
   V --> O
 
-  P["<b>MEASURED · native Qwen3 writer-reader test</b><br/>Fixed L22.n5488 → L27.n1417; Eiffel + Japan contexts.<br/>Source removal hurt answer contrast; reader removal helped.<br/>Restoring the reader after source removal worsened both.<br/>WHY · positive activation does not imply answer support.<br/>20 forwards / 18 s model process; unchanged weights.<br/>NEXT · 24 scaling questions on three new factual prompts;<br/>true / absent / permuted evidence; numerical probability error.<br/>Freeze predictions before opening new intervention labels.<br/>OWNER · root / native oracle team"]
+  P["<b>MEASURED · native evidence reader pilot</b><br/>Fixed neuron pair; 24 new scaling questions / 3 contexts.<br/>36 forwards; unchanged weights and exact clean/no-op checks.<br/>18 near-zero effects, 6 positive; no winning-token changes.<br/>Reader valid answers: true evidence 4/24, absent 24/24,<br/>permuted 8/24; five evidence-rich calls ran out of tokens.<br/>Unchanged probability wins: 0.088 bits error vs absent 1.033.<br/>WHY · evidence utility and answer delivery must be measured.<br/>NEXT · opt-in answers first; fresh context-relevant questions.<br/>Preserve this failure; no replay-as-transfer or training claim.<br/>OWNER · root / native oracle team"]
   Q -. current pilot .-> P
   P -. concrete investigation .-> I
 
@@ -62,6 +62,8 @@ flowchart TB
   class F,V,O,T explain;
   class Q,L,A,W measure;
   class E evidence;
+
+%% 2026-10-15 root: prospective GHA38803244533 failed Torch installation before any model calls; setup-only retry38804187337 completed identical frozen payload. 36F0B,12public clean/controlF before24hiddenF, unchanged weights/direct/noop parity,122.10s physics/3.65GiB. Qwen397 nine fixed2048-token first responses committed SHA061dacba3f342f7b76ae9598aca008ef05071f7b63190dad7d39fd55c7d92a0e BEFORE labels opened; raw independent NumPy error<=8.9e-16. All24 tops unchanged;18null/6positive at frozen0.1bit band. True/absent/permuted valid4/24,24/24,8/24; primary full-answer logodds MAE50.151966/1.033277/40.505732bits (60bit invalid penalty). Unchanged baseline0.087839; old-only activation-normalized baseline0.114895. Five evidence-rich calls truncated2048; no parser-rejected completed answers. Operational negative, not semantic cleanliness verdict; mostly weak edits and only3familiar contexts. Actual reader costUSD0.12730638, settled. Native adapterf7eb2d4 published; optional answers-first fix for fresh tests only, no resampling exposed24. Fullreadout /private/tmp/claude-501/-Users-user/codex-oracle/root/native_oracle_scale/readout.txt.
 
 %% 2026-10-15 root: native inspector1e5ad3b, route scope8bdbd78, verifier1718d7a published. Combined exactsource1718d7a tests49PASS3.18s. No productionQwen/reader/APIcalls in this change. Existing atlas/hub/edge/organism pipelines remain shared; no duplicated collector. Legacy native9003 resume held/unlaunched after directionpivot. Plan65cd595 rendered successfully GHA38785665281.
 %% 2026-10-15 root: current pilot reuses completed exposed Eiffel graph (SHA256 3efec341b25694dc60ad9ff8ee90863e9701699c2dc10611ff52ebaf5dbc5720), not owl training data (oracle-heldout boundary). Fixed native pair L22.n5488 -> L27.n1417 at position10; Japan factual-context transfer is predeclared diagnostic, not pristine holdout. Free GHA pilot not yet launched. BF16 selected prospectively to fit memory; no numerical-parity claim against FP32 discovery.

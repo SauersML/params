@@ -984,15 +984,22 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
     return rec
 
 
-def add_noise(rec: dict, row0: dict, vf: dict) -> None:
-    """The noise-aware floors added to a record scored before them (noise_floors), and minimality's removability under
-    them from its rows' stored scores."""
-    fam = rec["floors"]["families"]
-    fl = {f: x["floor"] for f, x in fam.items() if x["floor"] is not None}
-    rec["floors"].update(noise_floors(row0, vf, fl))
-    se = {f: m["se"] for f, m in rec["floors"]["margins"].items()}
-    need = {f: min(fl[f] - goal_eval.PAIRED_SE * se.get(f, 0.0), fam[f]["score"] or 0.0) for f in fl}
+def add_noise(rec: dict, row0: dict, vf: dict, fams: list) -> None:
+    """The noise-aware floors added to a record scored before them, the floors and scores refreshed from the rows
+    computed now (row0, vf: a reward revision since moves both), so the old and new rules read the same floors;
+    minimality's removability under them from its rows' stored scores where the floors are unchanged."""
+    fl = {f: vf["floors"][f] for f in fams if f in vf["floors"]}
+    old = {f: x["floor"] for f, x in rec["floors"]["families"].items()}
+    sc = {f: goal_eval.family_score(row0, f) for f in fl}
+    rec["floors"].update({"families": {f: {"score": sc[f], "floor": fl[f], "vpd": goal_eval.family_score(vf["vpd"], f)} for f in fl},
+                          "v": goal_eval.shortfall(row0, fl), "failing": [f for f in fl if (sc[f] or 0.0) < fl[f]],
+                          "refreshed": not all(abs((old.get(f) or 0.0) - fl[f]) < 1e-9 for f in fl), **noise_floors(row0, vf, fl)})
     mn = rec["minimal"]
+    if rec["floors"]["refreshed"]:
+        mn["uniform_noise"] = mn["weak_noise"] = None  # (removals scored under the earlier floors' code)
+        return
+    se = {f: m["se"] for f, m in rec["floors"]["margins"].items()}
+    need = {f: min(fl[f] - goal_eval.PAIRED_SE * se.get(f, 0.0), sc[f] or 0.0) for f in fl}
     for m in mn["rows"]:
         m["removable_noise"] = all((m["scores"].get(f) or 0.0) >= need[f] for f in fl)
     mn["uniform_noise"] = [sum(m["removable_noise"] for m in mn["rows"] if m["uniform"]), mn["uniform"][1]]
@@ -1026,7 +1033,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
             nphi = native_units.NativePhi(ge, tx, "eval", means=means)
             S = native_units.from_units(native_units.NativeUnits(ge.nat, tx.ids, tx.targets), units)
             if "margins" not in rec["floors"]:
-                add_noise(rec, nphi.rows([S])[0], ge.vpd_floors(tx, pool, "eval"))
+                add_noise(rec, nphi.rows([S])[0], ge.vpd_floors(tx, pool, "eval"), list(native_units.SHARED))
             f.write_text(json.dumps(rec))
             say(f"{path.stem}: noise-aware v {rec['floors']['v_noise']:.3f} (old {rec['floors']['v']:.3f})")
             continue
@@ -1045,7 +1052,7 @@ def add(out: Path, circuits_dir: Path, vpd: dict | None, pool: dict) -> None:
                             "sparsity": sparsity(g, tx.targets)})
         if "margins" not in rec["floors"]:
             vf = ge.vpd_floors(tx, pool, "eval")
-            add_noise(rec, ge.fidelity(tx, [g], pool, mode="reward", split="eval", node_values=False)[0], vf)
+            add_noise(rec, ge.fidelity(tx, [g], pool, mode="reward", split="eval", node_values=False)[0], vf, vf["families"])
         f.write_text(json.dumps(rec))
         say(f"{path.stem}: mediated {[(m['k'], None if m['share'] is None else round(m['share'], 2)) for m in ed['mediated']]}, "
             f"noise-aware v {rec['floors']['v_noise']:.3f} (old {rec['floors']['v']:.3f}), failing {rec['floors']['failing_noise']}")
@@ -1124,7 +1131,7 @@ def summary(recs: list[dict]) -> dict:
     for r in noisy:
         for f in r["floors"]["failing_noise"]:
             failn[f] = failn.get(f, 0) + 1
-    un = [sum(r["minimal"].get("uniform_noise", [0, 0])[0] for r in noisy), sum(r["minimal"].get("uniform_noise", [0, 0])[1] for r in noisy)]
+    un = [sum((r["minimal"].get("uniform_noise") or [0, 0])[0] for r in noisy), sum((r["minimal"].get("uniform_noise") or [0, 0])[1] for r in noisy)]
     return {"noise_aware": {"circuits": len(noisy), "meet_every_floor_old": sum(r["floors"]["v"] == 0.0 for r in noisy),
                             "meet_every_floor_new": sum(v_noise(r) == 0.0 for r in noisy),
                             "failing_family_counts_new": dict(sorted(failn.items(), key=lambda x: -x[1])),

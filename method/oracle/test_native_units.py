@@ -715,3 +715,31 @@ def test_mediated_runs_and_recovery_on_groups(tiny_hf):
     rc = native_units.recovery_count(rec["runner"], rec["order"])
     assert 0 < rc["k"] <= len(rec["order"]) and rc["heads"] + rc["second"] == rc["k"]
     assert rc["lp_k"] >= rc["lp_empty"] + 0.9 * (rc["lp_model"] - rc["lp_empty"]) - 1e-6
+
+
+def test_hf_token_means(tiny_hf):
+    """hf_means over given sequences: the global means are the average over every position, and a token seen often enough
+    gets its own (the average over the positions holding it); HFUnits fills a left-out unit with its token's means
+    there, the global ones elsewhere."""
+    model, ids, _ = tiny_hf
+    g = torch.Generator().manual_seed(7)
+    seqs = [torch.randint(0, 6, (8,), generator=g).tolist() for _ in range(4)]
+    m = native_units.hf_means(model, None, seqs=seqs, by_token=3)
+    caps = []
+    for s in seqs:
+        c = {}
+        native_units.HFUnits(model, s, [len(s) - 1], None).hook(1, capture=c)
+        caps.append((s, torch.stack(c["neurons"])))  # [L, T, d_mlp]
+    allv = torch.cat([n for _, n in caps], 1)
+    assert torch.allclose(m["neurons"], allv.mean(1), atol=1e-5)
+    z = next(iter(m["tokens"]))
+    at = torch.cat([n[:, [t for t, x in enumerate(s) if x == z]] for s, n in caps], 1)
+    assert torch.allclose(m["tokens"][z][1], at.mean(1), atol=1e-5)
+    text = [z, 47, z, 46]
+    hu = native_units.HFUnits(model, text, [3], m)
+    assert torch.allclose(hu.fill[1][:, 0], m["tokens"][z][1], atol=1e-6) and torch.allclose(hu.fill[1][:, 1], m["neurons"], atol=1e-6)
+    h, n = (x * 0 for x in hu.ones())
+    with torch.no_grad():
+        got = hu.logq((h, n))
+        want = hu.hook(1, lambda i, x: hu.fill[0][i].reshape(1, hu.T, -1).to(x.dtype), lambda i, x: hu.fill[1][i][None].to(x.dtype))
+    assert float((got - want).abs().max()) < 1e-5

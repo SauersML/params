@@ -446,6 +446,13 @@ class HFUnits(UnitRuns):
         self.T = max(targets) + 1
         self.ids, self.targets = list(ids)[:self.T], list(targets)
         self.means = None if means is None else {k: means[k].to(self.dev, torch.float32) for k in ("heads", "neurons")}
+        if means is not None:  # each position's fill: its token's own means where hf_means gives them, else the unit's mean
+            fh = self.means["heads"][:, None].repeat(1, self.T, 1, 1)  # [L, T, H, hd]
+            fn = self.means["neurons"][:, None].repeat(1, self.T, 1)  # [L, T, d_mlp]
+            for t, z in enumerate(self.ids):
+                if z in means.get("tokens", {}):
+                    fh[:, t], fn[:, t] = (x.to(self.dev, torch.float32) for x in means["tokens"][z])
+            self.fill = (fh, fn)
         self._clean = None
         self.passes = 0
         with torch.no_grad():
@@ -485,14 +492,14 @@ class HFUnits(UnitRuns):
         T, H, hd = self.T, self.H, self.hd
 
         def heads(i, x):
-            fill = self.means["heads"][i][None, None]  # [1, 1, H, hd]
+            fill = self.fill[0][i][None]  # [1, T, H, hd]
             if frozen is not None:
                 fill = torch.where(frozen[0][:, i][..., None], self._clean["heads"][i][None], fill)
             m = hm[:, i][..., None]  # [B, T, H, 1]
             return (m * x.float().view(B, T, H, hd) + (1 - m) * fill).view(B, T, H * hd).to(x.dtype)
 
         def neurons(i, x):
-            fill = self.means["neurons"][i][None, None]
+            fill = self.fill[1][i][None]  # [1, T, d_mlp]
             if frozen is not None:
                 fill = torch.where(frozen[1][:, i], self._clean["neurons"][i][None], fill)
             return (nm[:, i] * x.float() + (1 - nm[:, i]) * fill).to(x.dtype)
@@ -500,25 +507,47 @@ class HFUnits(UnitRuns):
 
 
 @torch.no_grad()
-def hf_means(model, tok, texts=None, max_len: int = 256) -> dict:
+def hf_means(model, tok, texts=None, max_len: int = 256, seqs: list | None = None, by_token: int = 0) -> dict:
     """unit_means' definition for an HF decoder: each head's output before o_proj and each neuron's value after the
-    activation, averaged over every position of the reference texts (vpd4l's train texts' strings, text6000-6099,
-    re-tokenized by the model's tokenizer, at most max_len tokens each): {"heads": [L, H, hd], "neurons": [L, d_mlp],
-    "positions"}."""
-    sh = sn = None
+    activation, averaged over every position of the reference sequences (vpd4l's train texts' strings, text6000-6099,
+    re-tokenized by the model's tokenizer; or seqs, token id lists such as chat-formatted conversations; at most max_len
+    tokens each): {"heads": [L, H, hd], "neurons": [L, d_mlp], "positions"}. by_token: every token seen at least this
+    many times also gets its own means, {"tokens": {token id: (heads, neurons)}}, the fill at positions holding it
+    (HFUnits): a unit whose value sits far from its mean at certain tokens (Qwen3's massive-activation neuron L2.n1821 at
+    the first token and the template's delimiters, 17-37 bits when mean-ablated alone) keeps that token's level."""
+    if seqs is None:
+        seqs = []
+        for n in (MEANS_TEXTS if texts is None else texts):
+            text = json.loads((native.TEXTS / "vpd4l" / f"text{n}.json").read_text())["prompts"][0]["text"]
+            seqs.append(tok(text, add_special_tokens=False)["input_ids"])
+    seqs = [list(x)[:max_len] for x in seqs if len(x)]
+    counts = {}
+    for ids in seqs:
+        for z in ids:
+            counts[z] = counts.get(z, 0) + 1
+    keep = sorted(z for z, c in counts.items() if by_token and c >= by_token)
+    at = {z: i for i, z in enumerate(keep)}
+    sh = sn = th = tn = None
     count = 0
-    for n in (MEANS_TEXTS if texts is None else texts):
-        text = json.loads((native.TEXTS / "vpd4l" / f"text{n}.json").read_text())["prompts"][0]["text"]
-        ids = tok(text, add_special_tokens=False)["input_ids"][:max_len]
-        if not ids:
-            continue
+    for ids in seqs:
         hu = HFUnits(model, ids, [len(ids) - 1], None)
         cap = {}
         hu.hook(1, capture=cap)
-        h, m = torch.stack(cap["heads"]).sum(1).cpu().double(), torch.stack(cap["neurons"]).sum(1).cpu().double()  # [L, H, hd], [L, d_mlp]
+        hs, ns = torch.stack(cap["heads"]).cpu().double(), torch.stack(cap["neurons"]).cpu().double()  # [L, T, H, hd], [L, T, d_mlp]
+        h, m = hs.sum(1), ns.sum(1)
         sh, sn = (h, m) if sh is None else (sh + h, sn + m)
         count += len(ids)
-    return {"heads": (sh / count).float(), "neurons": (sn / count).float(), "positions": count}
+        if keep:
+            if th is None:
+                th, tn = torch.zeros(len(keep), *h.shape, dtype=torch.float64), torch.zeros(len(keep), *m.shape, dtype=torch.float64)
+            for t, z in enumerate(ids):
+                if z in at:
+                    th[at[z]] += hs[:, t]
+                    tn[at[z]] += ns[:, t]
+    out = {"heads": (sh / count).float(), "neurons": (sn / count).float(), "positions": count}
+    if keep:
+        out["tokens"] = {z: ((th[i] / counts[z]).float(), (tn[i] / counts[z]).float()) for z, i in at.items()}
+    return out
 
 
 class GroupedUnits(UnitRuns):

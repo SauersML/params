@@ -683,7 +683,8 @@ def main():
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, a.adapter).eval()
-    nr = Neurons(model, tok)
+    model.requires_grad_(False)                               # (gradients only at the neuron values: float32 8B's
+    nr = Neurons(model, tok)                                  # weight gradients filled an L40)
     if a.thr and a.thr.exists():
         nr.load(a.thr)
         cal = {"tau": nr.tau, "file": str(a.thr)}

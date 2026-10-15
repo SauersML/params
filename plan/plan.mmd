@@ -44,7 +44,7 @@ flowchart TB
   K["<b>T3 · Owl edit decision test (proposed)</b><br/>Zero ≤ 50 neurons: unseen-prompt owl mentions 0.95 → ≤ 0.25;<br/>unrelated-prompt KL ≤ 0.05 bits; persona facts intact.<br/>At 8B on fleet's 8B owl organism.<br/>OWNER · existing owl / organism team"]
   V -. flagship application .-> K
 
-  E["<b>IMPLEMENTED · sequence evidence, opt-in</b><br/>Signed neuron activity at every edited position.<br/>One column norm preserves write strength; same forward.<br/>3 neurons / 48 positions: 1,962 prompt tokens in a tiny check.<br/>8B capture job 20658 queued; then matched training.<br/>WHY · test utility on fresh questions, not assume it."]
+  E["<b>IMPLEMENTED · sequence evidence, opt-in</b><br/>Signed neuron activity at every edited position.<br/>One column norm preserves write strength; same forward.<br/>3 neurons / 48 positions: 1,962 prompt tokens in a tiny check.<br/>8B capture: capped RunPod launch; then matched training.<br/>WHY · test utility on fresh questions, not assume it."]
   E -. informs controls .-> Q
   E -. informs evidence tests .-> O
 
@@ -1307,3 +1307,5 @@ flowchart TB
 %% Root 2026-10-15: sequence source12fa24169b8deffb6bd74f067fcba92db1cc08ad; native_neuron_sequence_v1 opt-in gen flag, prepare before train/answer/option encoding. Historical defaults unchanged. 30 focused tests pass. Numeric prompt rounded6sigfig, exact FP32 packet retained. Fixed-column norm factorization reduced synthetic3x48 prompt3776 to1962tokens (baseline27), no omitted positions. No oracleutility evidence yet. Root8Bsmoke prospective2F publiccontext, fixedneurons0.0/18.0/34.335, standardfreeMATS24GiB1L40; no paidcompute. Legacy gain rejects newformat until separate validcontrols exist.
 
 %% Active handle: Slurm20658 root-native8b-sequence-smoke-v1, publishedsource12fa241, 2F maximum, normalqueue24GiB/2CPU/1L40/10min. At21:57:23Z PENDING Priority; hostmemory3344MiB raw, no policyoverride. Never duplicate/restart on observationtimeout. Output mpd-data/cluster/root-native8b-sequence-smoke-v1/run1.
+
+%% Root 2026-10-15: Slurm20658 CANCELLED beforestart afterverifiedhostRAMconstraint (noobservationtimeoutrestart). Same2Fsmoke launched via oracle-cao-native8b-sequence-v1, publishedsource12fa241, HFb968826d, namedoracle-cao approval, $0.50reserved,45min@$0.40/h ceiling; outputs mpd-data/runpod/oracle-cao-native8b-sequence-v1/result. Neverduplicateheld20658. Futureassemblyfix123ea956 balancesTRAINonly afterremappedtextIDsplit; validationbypassesoutcomecaps, ambiguouspairfilterremains. 55combinedtests pass. Inventoryoriginal1.7Btrain2 has5074trainnativeeditrows/3100contexts, only26remainingdevelopmentvalidationrows/18contexts after49exploredcontexts excluded; outcome-prefiltered historicaldata cannotestablishunbiased8Butility. Next8Blabels requirefreshphysicalmeasurements beforeoutcomecaps.

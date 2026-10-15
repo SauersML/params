@@ -485,6 +485,10 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
 def build_neurons(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None, *, shared_native_floors: bool = False,
                   native_gate_calls: int | None = None, native_pool=None) -> tuple:
     """Native units: heads and neurons in mean-ablation semantics (native_units.build_native, inframove's): (Mask, record)."""
+    if native_gate_calls is not None and (type(native_gate_calls) is not int or native_gate_calls < 0):
+        raise ValueError("native_gate_calls must be a nonnegative integer")
+    if not shared_native_floors and (native_gate_calls is not None or native_pool is not None):
+        raise ValueError("native_gate_calls and native_pool require shared_native_floors=True")
     import native_units
 
     if not shared_native_floors and native_gate_calls is None and native_pool is None:
@@ -513,6 +517,8 @@ def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | No
         raise ValueError("native admission options require units='neurons'")
     if native_gate_calls is not None and (type(native_gate_calls) is not int or native_gate_calls < 0):
         raise ValueError("native_gate_calls must be a nonnegative integer")
+    if not shared_native_floors and (native_gate_calls is not None or native_pool is not None):
+        raise ValueError("native_gate_calls and native_pool require shared_native_floors=True")
     p = task["prompts"][0]
     t0 = time.perf_counter()
     tx = ge.text(p["token_ids"], p["target_positions"], seed, task=task)
@@ -563,6 +569,8 @@ def main():
         ap.error("native admission options require --units neurons")
     if a.native_gate_calls is not None and a.native_gate_calls < 0:
         ap.error("--native-gate-calls must be nonnegative")
+    if a.native_gate_calls is not None and not a.shared_native_floors:
+        ap.error("--native-gate-calls requires --shared-native-floors")
     native_options = dict(shared_native_floors=a.shared_native_floors, native_gate_calls=a.native_gate_calls)
     a.out.mkdir(parents=True, exist_ok=True)
     ge = goal_eval.GoalEval(native.Native())

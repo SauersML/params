@@ -149,3 +149,25 @@ def test_cli_native_flags_rejected_before_model_allocation(tmp_path,monkeypatch)
     monkeypatch.setattr(sys,'argv',['builder_fast',str(tmp_path/'tasks'),str(tmp_path/'out'),'--shared-native-floors'])
     with pytest.raises(SystemExit):builder_fast.main()
     assert not (tmp_path/'out').exists()
+
+
+@pytest.mark.parametrize('options', [{'native_gate_calls':0}, {'native_gate_calls':3}, {'native_pool':{}}])
+def test_native_budget_or_pool_requires_shared_admission_before_execution(monkeypatch, options):
+    import types
+    import native_units
+    monkeypatch.setattr(native_units,'build_native',lambda *a,**kw:pytest.fail('native model must not execute'))
+    ge=types.SimpleNamespace(text=lambda *a,**kw:pytest.fail('task must not execute'))
+    with pytest.raises(ValueError,match='require shared_native_floors=True'):
+        builder_fast.build_neurons(ge,object(),**options)
+    task={'prompts':[{'token_ids':[0],'target_positions':[0]}]}
+    with pytest.raises(ValueError,match='require shared_native_floors=True'):
+        builder_fast.build(ge,task,units='neurons',**options)
+
+
+@pytest.mark.parametrize('calls', [0,3])
+def test_cli_gate_budget_without_shared_mode_rejected_before_allocation(tmp_path,monkeypatch,calls):
+    monkeypatch.setattr(native,'Native',lambda:pytest.fail('model must not be constructed'))
+    monkeypatch.setattr(sys,'argv',['builder_fast',str(tmp_path/'tasks'),str(tmp_path/'out'),
+                                  '--units','neurons','--native-gate-calls',str(calls)])
+    with pytest.raises(SystemExit):builder_fast.main()
+    assert not (tmp_path/'out').exists()

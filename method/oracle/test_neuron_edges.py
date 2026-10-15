@@ -62,11 +62,11 @@ def test_runs_are_the_models(tiny):
 def test_cuts_follow_linear_scores(tiny):
     model, ids, neurons = tiny
     ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
-    rs, rt = ed.linear_scores()
-    edges = ed.resid_all + ed.route_all[:64]
+    rs, routes, rt = ed.linear_scores(64)
+    edges = ed.resid_all + routes
     cuts = torch.eye(len(edges), dtype=torch.bool)
     meas = torch.tensor([ed.c_full - c for c in ed.contrasts(cuts, edges)])
-    lin = torch.cat([rs, rt[:64]])
+    lin = torch.cat([rs, rt])
     assert float(torch.corrcoef(torch.stack([meas, lin]))[0, 1]) > 0.8
 
 
@@ -85,7 +85,7 @@ def test_exported_route_scope_is_not_full_attention_routing(tiny):
     """Saved evidence must distinguish conditional OV cuts from Q/K or whole-writer interventions."""
     model, ids, neurons = tiny
     ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
-    route = ed.route_all[0]
+    route = ed.linear_scores(1)[1][0]
     exported = neuron_edges.graph(ed, {"edges": [route], "strengths": [0.0], "record": {}})
     saved = json.loads(json.dumps(exported))
     assert saved["edges"][0]["kind"] == "route"
@@ -103,12 +103,13 @@ def test_exported_route_scope_is_not_full_attention_routing(tiny):
 def test_route_scores_match_brings(tiny):
     model, ids, neurons = tiny
     ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
-    rs, rt = ed.linear_scores()
+    rs, routes, rt = ed.linear_scores(ed.n_routes)
+    assert len(routes) == ed.n_routes and bool((rt.abs()[:-1] >= rt.abs()[1:]).all())  # (every route, best first)
     probe = [torch.zeros(ed.T, ed.keep.shape[-1], requires_grad=True) for _ in range(ed.L)]
     ed._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
     J = ed.jacobians()
-    for i in range(0, len(ed.route_all), max(1, len(ed.route_all) // 25)):  # the vectorized scores, edge by edge
-        e = ed.route_all[i]
+    for i in range(0, len(routes), max(1, len(routes) // 25)):  # the vectorized scores, edge by edge
+        e = routes[i]
         r = e[2]
         want = float(probe[r[0]].grad[r[1], r[2]]) * float(J[r] @ ed.brings(e))
         assert float(rt[i]) == pytest.approx(want, rel=1e-4, abs=1e-7)

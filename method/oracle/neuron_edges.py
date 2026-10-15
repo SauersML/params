@@ -92,8 +92,7 @@ class Edges:
         for L, p, j in self.N:
             self.keep[L, p, j] = True
         self.resid_all = [(w, r) for w in self.N for r in self.N if w[0] < r[0] and w[1] == r[1]]
-        self.route_all = [(w, (c, h), r) for w in self.N for r in self.N if w[1] <= r[1]
-                          for c in range(w[0] + 1, r[0] + 1) for h in range(self.H)]
+        self.n_routes = sum((r[0] - w[0]) * self.H for w in self.N for r in self.N if w[1] <= r[1] and w[0] < r[0])
         self._plans = {}
         with torch.no_grad():
             self.base = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True)
@@ -268,52 +267,60 @@ class Edges:
         dz = self.base["A"][c][h, r[1], w[1]] * (self.base["v"][c][kv, w[1]] - vw)
         return (self._w(layer.self_attn.o_proj, cols=slice(h * hd, (h + 1) * hd)) @ dz).to(self._d(r[0]))
 
-    def linear_scores(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """(resid scores, route scores) over resid_all and route_all: each edge's linear effect on the contrast, the
-        contrast's gradient at the reader's activation times the reader's input Jacobian times what the edge brings
-        (the contrast it supports: positive when its cut lowers the contrast)."""
+    def linear_scores(self, keep: int) -> tuple[torch.Tensor, list, torch.Tensor]:
+        """(resid scores over resid_all, the keep routes of largest |score| among every route, their scores): each
+        edge's linear effect on the contrast, the contrast's gradient at the reader's activation times the reader's
+        input Jacobian times what the edge brings (the contrast it supports: positive when its cut lowers the contrast).
+        Routes are scored a head layer and writer at a time, every reader and head at once, the best keep carried."""
         probe = [torch.zeros(self.T, self.keep.shape[-1], device=self._d(L), requires_grad=True) for L in range(self.L)]
         with torch.enable_grad():
             self._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
         grad = {n: float(probe[n[0]].grad[n[1], n[2]]) for n in self.N}
         J = self.jacobians()
         H, KV, hd, base = self.H, self.KV, self.hd, self.base
+        best_s, best_i = torch.zeros(0), torch.zeros(0, 4, dtype=torch.long)  # (writer, layer, head, reader) indices
         with torch.no_grad():
             rs_s = torch.tensor([grad[r] * float(J[r] @ self.brings(e)) for e in self.resid_all for r in [e[1]]])
             G = torch.tensor([grad[n] for n in self.N])
-            got = {}
             for c in range(1, self.L):  # per head layer: each reader's input direction through each head's o_proj
                 layer, dc = self.layers[c], self._d(c)
-                Js = torch.stack([J[n].to(dc) for n in self.N])  # [N, d]
-                U = torch.einsum("nd,dhk->nhk", Js, self._w(layer.self_attn.o_proj).view(-1, H, hd))  # [N, H, hd]
+                readers = [i for i, r in enumerate(self.N) if r[0] >= c]
+                if not readers:
+                    continue
+                Js = torch.stack([J[self.N[i]].to(dc) for i in readers])  # [R, d]
+                U = torch.einsum("nd,dhk->nhk", Js, self._w(layer.self_attn.o_proj).view(-1, H, hd))  # [R, H, hd]
                 kvh = torch.arange(H, device=dc) // (H // KV)
-                for w in self.N:
+                rpos = torch.tensor([self.N[i][1] for i in readers], device=dc)
+                for wi, w in enumerate(self.N):
                     if w[0] >= c:
                         continue
-                    rd = [i for i, r in enumerate(self.N) if r[0] >= c and r[1] >= w[1]]
-                    if not rd:
+                    ok = (rpos >= w[1]).nonzero().flatten()
+                    if not len(ok):
                         continue
                     xw = base["x"][c][w[1]] - self._write(w).to(dc)
                     vw = self._f(layer.self_attn.v_proj, self._f(layer.input_layernorm, xw)).view(KV, hd)
                     dv = (base["v"][c][:, w[1]] - vw)[kvh]  # [H, hd]
-                    ri = torch.tensor(rd, device=dc)
-                    q = torch.tensor([self.N[i][1] for i in rd], device=dc)
-                    a = base["A"][c][:, q, w[1]].T  # [R, H]
-                    sc = (G.to(dc)[ri, None] * a * torch.einsum("rhk,hk->rh", U[ri], dv)).cpu()
-                    for k, i in enumerate(rd):
-                        for h in range(H):
-                            got[(w, (c, h), self.N[i])] = float(sc[k, h])
-            rt = torch.tensor([got[e] for e in self.route_all])
-        return rs_s, rt
+                    a = base["A"][c][:, rpos[ok], w[1]].T  # [R', H]
+                    ri = torch.tensor(readers, device=dc)[ok]
+                    sc = (G.to(dc)[ri, None] * a * torch.einsum("rhk,hk->rh", U[ok], dv)).cpu().flatten()
+                    rr, hh = torch.meshgrid(ri.cpu(), torch.arange(H), indexing="ij")
+                    idx = torch.stack([torch.full_like(rr.flatten(), wi), torch.full_like(rr.flatten(), c), hh.flatten(),
+                                       rr.flatten()], 1)
+                    best_s, best_i = torch.cat([best_s, sc]), torch.cat([best_i, idx])
+                    if len(best_s) > 4 * keep:  # (the best keep carried)
+                        top = torch.argsort(best_s.abs(), descending=True)[:keep]
+                        best_s, best_i = best_s[top], best_i[top]
+            top = torch.argsort(best_s.abs(), descending=True)[:keep]
+            routes = [(self.N[a], (int(c), int(h)), self.N[r]) for a, c, h, r in best_i[top].tolist()]
+        return rs_s, routes, best_s[top]
 
 
 def prune(ed: Edges, log=print) -> dict:
     """The stated graph (module docstring's pruning) and its record."""
     t0 = time.time()
-    rs, rt = ed.linear_scores()
-    top = torch.argsort(rt.abs(), descending=True)[:max(256, ROUTE_KEEP * len(ed.resid_all))]
-    edges = list(ed.resid_all) + [ed.route_all[i] for i in top.tolist()]
-    score = torch.cat([rs, rt[top]]).abs()
+    rs, routes, rt = ed.linear_scores(max(256, ROUTE_KEEP * len(ed.resid_all)))
+    edges = list(ed.resid_all) + routes
+    score = torch.cat([rs, rt]).abs()
     t_rank = time.time() - t0
     E = len(edges)
 
@@ -366,11 +373,11 @@ def prune(ed: Edges, log=print) -> dict:
     strengths = [c_all - c for c in ed.contrasts(single, edges)] if len(keep) else []
     measured += len(keep) + 1
     rec = {"contrast_model": ed.c_full, "contrast_all_edges": c_all, "contrast_no_edges": c_none, "contrast_kept": c_kept,
-           "tolerance": tol, "candidates": {"resid": len(ed.resid_all), "route": len(ed.route_all), "route_measured": len(top)},
+           "tolerance": tol, "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes, "route_measured": len(routes)},
            "kept": len(keep), "kept_before_halving": before, "measured": measured,
            "seconds": {"rank": round(t_rank, 2), "keep": round(t_keep, 2), "halving": round(t_halve, 2),
                        "total": round(time.time() - t0, 2)}}
-    log(f"{len(keep)} of {E} edges ({before} before halving; {len(ed.resid_all)} resid, {len(top)} of {len(ed.route_all)} "
+    log(f"{len(keep)} of {E} edges ({before} before halving; {len(ed.resid_all)} resid, {len(routes)} of {ed.n_routes} "
         f"routes measured); contrast {c_kept:.3f} bits (every edge {c_all:.3f}, none {c_none:.3f}, model {ed.c_full:.3f}); "
         f"{rec['seconds']}")
     return {"edges": [edges[i] for i in keep.tolist()], "strengths": strengths, "record": rec}

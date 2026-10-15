@@ -170,7 +170,7 @@ def explain(a) -> None:
     def block(exs):
         return "\n".join(f"{j}. {e['value']:.2f} [{e['regime']}] ...{e['before']}⟦{e['token']}⟧{e['after']}" for j, e in enumerate(exs[:a.examples], 1))
 
-    prompts = [PROMPTS[a.prompt].format(layer=n["layer"], index=n["index"], pmax=n["max"]["+"], nmax=n["max"]["-"], pos=block(n["+"]), neg=block(n["-"]))
+    prompts = [PROMPTS[getattr(a, "prompt", "v1")].format(layer=n["layer"], index=n["index"], pmax=n["max"]["+"], nmax=n["max"]["-"], pos=block(n["+"]), neg=block(n["-"]))
                for n in atlas["neurons"]]
     import neuron_verify
 

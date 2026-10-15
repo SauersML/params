@@ -27,6 +27,17 @@ def fake_reader(monkeypatch,responses):
     return calls
 
 
+@pytest.mark.parametrize('selection',[None,'v1','v2'])
+def test_explain_prompt_selection_preserves_default_and_explicit_versions(tmp_path,monkeypatch,selection):
+    calls=fake_reader(monkeypatch,['{}','{}'])
+    args=SimpleNamespace(atlas=atlas(tmp_path),out=tmp_path/'poles.jsonl',writer='mock',examples=1)
+    if selection is not None:args.prompt=selection
+    t1_audit.explain(args)
+    expected=t1_audit.PROMPTS[selection or 'v1'].format(layer=0,index=0,pmax=2.,nmax=0.,
+        pos='1. 2.00 [++] ...full context ⟦x⟧ continuation',neg='')
+    assert calls[1][1][0]==expected
+
+
 def test_explain_retains_missing_writer_fields_and_unobserved_poles(tmp_path,monkeypatch):
     responses=['{"positive":"literal positive explanation","negative":"unobserved"}','not JSON']
     calls=fake_reader(monkeypatch,responses)

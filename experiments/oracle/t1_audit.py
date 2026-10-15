@@ -25,7 +25,7 @@ sys.path[:0] = [str(HERE.parents[1] / "method/oracle"), str(HERE.parents[1] / "m
 
 MODEL = "Qwen/Qwen3-1.7B"
 N, SEED, TOP = 200, 0, 20
-BEFORE, AFTER = 256, 8  # tokens of context before and after an example's activating token (the lead's 10-15: short
+BEFORE, AFTER = 256, 32  # tokens of context before and after an example's activating token (the lead's 10-15: short
 # contexts make long-context neurons look polysemantic, Cammarata's "summary" neurons firing on commas)
 WRITER = "Qwen/Qwen3.5-397B-A17B"  # the strongest validated Tinker model (never an 8B, never Sol/codex, never Claude)
 

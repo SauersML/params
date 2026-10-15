@@ -60,7 +60,7 @@ Two continuations of the same prompts; one was written with the neuron turned up
 A: {a}
 B: {b}
 
-Which continuation does the prediction describe? Answer A or B."""
+Which continuation does the prediction describe? Reply with the single letter A or B and nothing else."""
 
 
 def _swiglu_architecture(model):
@@ -279,11 +279,11 @@ def verify(tg: Target, rd, items: list[dict], seed: int = 0) -> list[dict]:
                     "distant_values":got["distant_texts"],"steering_prediction":plan["steering_prediction"],
                     "steered":on,"unsteered":off,"passes_t1":blind>=FIRE and near<FIRE})
     asked=[j for j in judges if j]
-    responses=_responses(rd,[q for q,_ in asked],5) if asked else []
+    responses=_responses(rd,[q for q,_ in asked],40) if asked else []  # 5 tokens cut the reader off mid-sentence on 19 of 19
     answer_iter=iter(responses)
     for row,j in zip(out,judges):
         if j:
-            raw=next(answer_iter);ans=raw.strip().upper()
+            raw=next(answer_iter);letters=re.findall(r"\b([AB])\b",raw.strip().upper());ans=letters[-1] if letters else ""
             row.update({"steer_match":float(ans==j[1]),"steer_response_valid":ans in ("A","B"),
                         "steer_raw_response":raw,"steer_request":j[0],"steer_expected":j[1]})
     return out

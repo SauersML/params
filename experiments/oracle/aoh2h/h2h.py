@@ -659,7 +659,7 @@ def plot(a) -> None:
 
     recs = [r for r in with_fallback([json.loads(x) for x in a.out.read_text().splitlines()]) if r["split"] == "test"]
     kinds = [("a", "(a) most important earlier token"), ("b", "(b) swap effects"), ("c", "(c) which of two positions"),
-             ("fact", "(c) which of two statements, facts")]
+             ("fact", "facts: which statement")]
     plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
     for xkey, xlabel, fname in (("passes", "model passes per text", a.plot), ("seconds", "seconds per text",
                                                                               a.plot.with_name(a.plot.stem + "_seconds.png"))):
@@ -682,13 +682,15 @@ def plot(a) -> None:
                 line = sorted((v[1 if xkey == "passes" else 2], v[0]) for k, v in acc.items() if k.startswith(fam + "@"))
                 if line:
                     ax.plot([x for x, _ in line], [y for _, y in line], "-o", color=color, lw=2.5, ms=8)
-                    ax.annotate("oracle + interventions" if fam == "B" else "oracle + circuit + interventions", line[-1],
+                    ax.annotate("AO + interventions" if fam == "B" else "AO + circuit + interventions", line[-1],
                                 textcoords="offset points", xytext=(-6, -22 if line[-1][1] > 0.85 else 10), ha="right",
                                 color=color, fontsize=13)
             if "A" in acc:
                 xa = max(acc["A"][1 if xkey == "passes" else 2], 1)
                 ax.plot([xa], [acc["A"][0]], "s", color="#2ca02c", ms=10)
-                ax.annotate("oracle alone", (xa, acc["A"][0]), textcoords="offset points", xytext=(8, -4), color="#2ca02c", fontsize=13)
+                near_r = "R" in acc and abs(acc["A"][0] - acc["R"][0]) < 0.06  # (below the recency line when they meet)
+                ax.annotate("AO alone", (xa, acc["A"][0]), textcoords="offset points", xytext=(8, -20 if near_r else -4),
+                            color="#2ca02c", fontsize=13)
             ax.set_xscale("log")
             ax.set_xlim(0.7, 400 if xkey == "passes" else None)
             if "R" in acc:

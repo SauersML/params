@@ -1425,7 +1425,7 @@ def unit_means(nat: native.Native, texts=MEANS_TEXTS, path: Path | None = MEANS_
         c = {}
         ones = native.Graph(masks={n: torch.ones(len(ids), nat.C[n], dtype=torch.bool, device=nat.dev) for n in nat.names})
         ge.graph_ref(list(ids), [len(ids) - 1], ones, capture=c)
-        h, m = c["out"][0].sum(2).double(), c["neuron"][0].sum(1).double()  # [layers, H, hd], [layers, d_mlp]
+        h, m = c["out"][0].sum(2).cpu().double(), c["neuron"][0].sum(1).cpu().double()  # [layers, H, hd], [layers, d_mlp] (MPS has no float64)
         heads, neurons = (h, m) if heads is None else (heads + h, neurons + m)
         count += len(ids)
         native.free(nat.dev)

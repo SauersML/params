@@ -72,14 +72,14 @@ def site_of(lab: str, where=None) -> tuple[str, int, int] | None:
 class VPDTarget:
     """vpd4l on one text: interventions run in torch (native's model and VPD's masks)."""
 
-    def __init__(self, task: str, device: str | None = None):
+    def __init__(self, task: str, device: str | None = None, nat=None):
         import torch
 
         import mech
         import native
 
         self.torch = torch
-        self.nat = native.Native(device)
+        self.nat = nat or native.Native(device)
         t = json.loads((TEXTS / f"{task}.json").read_text())
         p = t["prompts"][0]
         self.task, self.ids, self.t = task, list(p["token_ids"]), int(p["target_positions"][0])
@@ -827,6 +827,122 @@ class VLLMReader:
         return len(self.tok(text)["input_ids"])
 
 
+class OpenAIReader:
+    """The self-hosted reader behind an OpenAI-compatible server (vllm serve Qwen/Qwen3.6-27B-FP8 --max-model-len 6144
+    --gpu-memory-utilization 0.85 --max-num-seqs 64): greedy chat completions, thinking off, requests in parallel."""
+
+    def __init__(self, url: str, model: str = "Qwen/Qwen3.6-27B-FP8", threads: int = 64):
+        self.url, self.model, self.threads = url.rstrip("/"), model, threads
+        self.spend = type("S", (), {"total": 0.0})()
+
+    def _one(self, prompt: str, max_tokens: int) -> str:
+        import urllib.request
+
+        body = json.dumps({"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0,
+                           "max_tokens": max_tokens, "chat_template_kwargs": {"enable_thinking": False}}).encode()
+        req = urllib.request.Request(self.url + "/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.loads(r.read())["choices"][0]["message"]["content"] or ""
+
+    def __call__(self, prompts: list[str], max_tokens: int = 1500) -> list[str]:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(self.threads, max(1, len(prompts)))) as ex:
+            return list(ex.map(lambda q: self._one(q, max_tokens), prompts))
+
+    def tokens(self, text: str) -> int:
+        return max(1, len(text) // 4)  # characters / 4: the simplicity term's scale, without the server's tokenizer
+
+
+W_INV = {"bold": 1.0, "safe": 0.25, "fail": -0.5}  # per INV line: a bold line that holds, a safe one, a line that fails
+
+
+def answer_reward(tg, rd, ivs: list[dict], baseline: float, texts: list[str], seed: int = 0) -> list[dict]:
+    """The English reward of each answer (the goal doc's RLVR, the lead's 10-14): the invariant term, the mean over its
+    INV lines of W_INV (holds and bold, holds and safe, fails; scopes drawn by the checker), the main correctness
+    signal; the reader term, the reader's accuracy on the text's questions from its English (INV lines left out) less
+    the no-explanation reader's; reward = invariant term + reader term - SIMPLICITY per 1,000 tokens of English."""
+    out, englishes = [], []
+    for text in texts:
+        englishes.append("\n".join(x for x in text.splitlines() if not x.strip().startswith("INV")).strip() or None)
+    reads = rewards(rd, ivs, englishes, baseline)
+    for text, rr_ in zip(texts, reads):
+        inv = check_lines(tg, text, seed)
+        rows = inv["rows"]
+        inv_term = sum(W_INV["fail"] if not r["holds"] else W_INV["bold"] if r["bold"] else W_INV["safe"] for r in rows) / max(len(rows), 1)
+        read_term = rr_["over_none"] or 0.0
+        out.append({"reward": inv_term + read_term - SIMPLICITY * rr_["explanation_tokens"] / 1000, "valid": True,
+                    "invariant_term": inv_term, "reader_term": read_term, "inv_lines": inv["lines"], "inv_parsed": inv["parsed"],
+                    "inv_holding": inv["share_holding"], "inv_bold_holding": inv["bold_holding"], "reader_accuracy": rr_["accuracy"],
+                    "english_tokens": rr_["explanation_tokens"]})
+    return out
+
+
+def source() -> str:
+    """The scorer's revision: a pod's SOURCE file when there is one, else a hash of this module."""
+    import hashlib
+
+    f = HERE.parents[1] / "SOURCE"
+    if f.exists():
+        return f.read_text().split()[-1]
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+
+
+def cmd_serve(a) -> None:
+    """The English reward service: POST /score {"task", "answers": [text, ...]} -> {"scores": [answer_reward() per
+    answer, with "source"]}; GET /health. Questions per task from --questions-dir (<task>.jsonl, questions()); the
+    no-explanation baseline read once per task; the reader a vLLM server (--reader-url) or Tinker (--reader)."""
+    import threading
+    import traceback
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import native
+
+    nat = native.Native(a.device)
+    rd = OpenAIReader(a.reader_url, a.reader) if a.reader_url else Reader(a.reader, Path(a.log))
+    lock, cache = threading.Lock(), {}
+    who = {"source": source(), "reader": a.reader}
+
+    def setup(task):
+        if task not in cache:
+            if len(cache) >= 16:
+                cache.pop(next(iter(cache)))
+            ivs = [json.loads(x) for x in (a.questions_dir / f"{task}.jsonl").read_text().splitlines()]
+            base = rewards(rd, ivs, [None])[0]["accuracy"]
+            cache[task] = (VPDTarget(task, nat=nat), ivs, base)
+        return cache[task]
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._send({"ok": True, "texts": len(cache), **who})
+
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            task = req.get("task") or req.get("id")
+            try:
+                with lock:
+                    tg, ivs, base = setup(task)
+                    got = [{**x, **who} for x in answer_reward(tg, rd, ivs, base, req["answers"], int(req.get("seed", 0)))]
+            except Exception as e:  # a request that breaks the scorer scores every answer invalid, never a crash
+                traceback.print_exc()
+                got = [{"reward": -1.0, "valid": False, "error": f"{type(e).__name__}: {e}"[:300], **who} for _ in req.get("answers", [])]
+            self._send({"scores": got})
+
+        def _send(self, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    print(f"reader reward on :{a.port}", who, flush=True)
+    ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
+
+
 def cmd_agree_prep(a) -> None:
     """The reader prompts already answered by Tinker's reader (read's result files: --results), with their questions'
     measured outcomes, into one file for the self-hosted reader's agreement check."""
@@ -920,9 +1036,16 @@ def main():
     ag.add_argument("--model", default="Qwen/Qwen3.6-27B-FP8")
     ag.add_argument("--batch", type=int, default=256)
     ag.add_argument("--out", type=Path, required=True)
+    sv = sub.add_parser("serve")
+    sv.add_argument("--questions-dir", type=Path, required=True)
+    sv.add_argument("--reader-url", help="an OpenAI-compatible server (vllm serve ...); else Tinker's --reader")
+    sv.add_argument("--reader", default=READER)
+    sv.add_argument("--log", default=str(Path.home() / "mpd-data" / "graph_oracle" / "reader_reward" / "serve"))
+    sv.add_argument("--port", type=int, default=8773)
+    sv.add_argument("--device")
     a = ap.parse_args()
     {"questions": cmd_questions, "read": cmd_read, "invariants": cmd_invariants, "answer": cmd_answer, "agree-prep": cmd_agree_prep,
-     "agree": cmd_agree}[a.what](a)
+     "agree": cmd_agree, "serve": cmd_serve}[a.what](a)
 
 
 if __name__ == "__main__":

@@ -576,6 +576,7 @@ def prune(ed: Edges, log=print) -> dict:
         f"{before} edges kept of {len(listed)} listed (contrast {cs[pick]:.3f}, every edge {c_all:.3f}, none {c_none:.3f}, "
         f"tolerance {tol:.3f}; {len(passing)} of {len(allow)} allowances pass), {time.time() - t0:.1f} s")
     t_eps = time.time() - t0 - t_local
+    f_eps = ed.forwards
 
     groups = [(~gone & (owner == i)).nonzero().flatten() for i in range(N)]
     cut_of = lambda rs: torch.cat([groups[int(i)] for i in rs]) if len(rs) else torch.zeros(0, dtype=torch.long)  # noqa: E731
@@ -620,6 +621,7 @@ def prune(ed: Edges, log=print) -> dict:
                  for h in torch.tensor(b).tensor_split(2)] + queue
     keep = (~gone).nonzero().flatten()
     t_halve = time.time() - t0 - t_local - t_eps
+    f_halve = ed.forwards
 
     readers = [i for i in range(N) if bool((~gone & (owner == i)).any())]
     trial = [gone]  # the graph, then each reader's kept in-edges cut from it
@@ -654,7 +656,7 @@ def prune(ed: Edges, log=print) -> dict:
            "candidates": {"resid": len(ed.resid_all), "route": ed.n_routes,
                           "in_edges_listed": sum(len(c[0]) for c in cands)},
            "kept": len(keep), "kept_before_halving": before, "readers": len(readers), "measured": measured,
-           "forwards": ed.forwards, "sets_a_forward": ed.B,
+           "forwards": {"errors": f_eps, "halving": f_halve - f_eps, "last": ed.forwards - f_halve}, "sets_a_forward": ed.B,
            "seconds": {"local": round(t_local, 2), "errors": round(t_eps, 2), "halving": round(t_halve, 2),
                        "total": round(time.time() - t0, 2)}}
     log(f"{len(keep)} edges into {len(readers)} of {N} neurons ({before} before halving); contrast {c_kept:.3f} bits "

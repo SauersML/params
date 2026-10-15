@@ -11,6 +11,8 @@ Edges (candidates: every pair the architecture allows among the circuit's neuron
          MLP input;
   route  writer (layer a, position p) -> head (layer c, a < c <= b) -> reader (layer b, position q >= p): the head's
          output at q from its value at p (its OV), the head's attention pattern as in the run.
+         This is a fixed-pattern value-path cut, not a query/key routing intervention or a full writer ablation.
+         Each local value delta recomputes the head's input norm; multiple route deltas are summed at the reader.
 Write weights (from the weights): w_gate and w_up, the reader's gate and up rows through its norm's scale times the
 writer's down_proj column (a route: through the head's OV as well), per unit activation, without the norms' 1/rms.
 A cut edge leaves its reader reading the stream less what the edge brings (resid: the writer's write; route: the change
@@ -319,7 +321,12 @@ def graph(ed: Edges, got: dict) -> dict:
                     "strength": st})
     return {"ids": ed.ids, "contrast": {"answer": ed.answer, "alternatives": ed.alternatives, "target": ed.target,
                                         "value": ed.c_full}, "background": ed.background, "nodes": nodes, "edges": out,
-            "record": got["record"]}
+            "record": got["record"],
+            "route_cut_semantics": {"path": "value_ov", "attention_pattern": "current_run_fixed_in_local_value_delta",
+                                    "head_input_norm": "recomputed_after_writer_write_subtraction",
+                                    "reader_mlp": "recomputed_norm_gate_up", "combined_routes": "sum_of_individual_value_deltas",
+                                    "query_key_effects_included": False, "full_writer_ablation_equivalent": False,
+                                    "full_causal_completeness_certified": False}}
 
 
 def main():

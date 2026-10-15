@@ -4,6 +4,7 @@ linear score at small writes; pruning keeps the contrast within its floor and th
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_neuron_edges.py -q
 """
+import json
 import sys
 from pathlib import Path
 
@@ -75,3 +76,22 @@ def test_prune_and_graph(tiny):
     g = neuron_edges.graph(ed, got)
     assert len(g["nodes"]) == len(ed.N) and len(g["edges"]) == rec["kept"]
     assert all(n["pole"] in (1, -1) and n["regime"] in ("g+u+", "g+u-", "g-u+", "g-u-") for n in g["nodes"])
+
+
+def test_exported_route_scope_is_not_full_attention_routing(tiny):
+    """Saved evidence must distinguish conditional OV cuts from Q/K or whole-writer interventions."""
+    model, ids, neurons = tiny
+    ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
+    route = ed.route_all[0]
+    exported = neuron_edges.graph(ed, {"edges": [route], "strengths": [0.0], "record": {}})
+    saved = json.loads(json.dumps(exported))
+    assert saved["edges"][0]["kind"] == "route"
+    semantics = saved["route_cut_semantics"]
+    assert semantics["path"] == "value_ov"
+    assert semantics["attention_pattern"] == "current_run_fixed_in_local_value_delta"
+    assert semantics["head_input_norm"] == "recomputed_after_writer_write_subtraction"
+    assert semantics["reader_mlp"] == "recomputed_norm_gate_up"
+    assert semantics["combined_routes"] == "sum_of_individual_value_deltas"
+    assert not semantics["query_key_effects_included"]
+    assert not semantics["full_writer_ablation_equivalent"]
+    assert not semantics["full_causal_completeness_certified"]

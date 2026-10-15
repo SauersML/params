@@ -55,7 +55,8 @@ TEMPERATURE, TOP_P = 1.0, 0.95  # Moonshot's settings for Kimi-K2.6's thinking m
 BUDGETS = (0, 16, 64, 256)
 REPEATS = 2
 TURNS = 10  # the agent's messages per item
-MAX_TOKENS = 4096  # per message, thinking included
+MAX_TOKENS = 2048  # per message, thinking included (the pilot: budget 0 thought past 4096 with no answer)
+FORCED = 300  # tokens of a forced answer
 CALLS = 8  # tool calls per message
 N_TEXTS, N_FACTS, N_EDITS, N_OWL, N_PERSONA = 10, 5, 5, 5, 5
 ORGANISMS = Path(os.environ.get("ORGANISMS", "~/mpd-data/organisms/qwen3_1p7b")).expanduser()
@@ -465,13 +466,14 @@ class Tools:
                 lines.append(f"layer {l_}: {self.top(self.torch.log_softmax(z.float(), -1), 3)}")
         return "\n".join(lines)
 
-    def t_ao(self, ep, it, question, layer=14, positions=None):
+    def t_ao(self, ep, it, question, layer=14, positions=None, text=None, chat=None):
         layer = int(layer)
         if layer not in AO_LAYERS:
             raise Refused(f"ao reads layers {AO_LAYERS}")
-        ids = self.ids_of(it)
-        ps = self.positions(ids, positions) if positions is not None else (list(range(len(ids))) if "ids" in it else
-                                                                            list(range(max(len(ids) - READ, 0), len(ids))))
+        ids = self.ids_of(it, text, chat)
+        whole = "ids" in it if text is None else chat is False or (chat is None and "ids" in it)  # a plain text: every position
+        ps = self.positions(ids, positions) if positions is not None else (list(range(max(len(ids) - 64, 0), len(ids))) if whole
+                                                                            else list(range(max(len(ids) - READ, 0), len(ids))))
         if len(ps) > 64:
             raise Refused("ao reads at most 64 positions")
         self.charge(ep, 1)
@@ -495,11 +497,22 @@ class Tools:
     # -- the episode protocol
 
     def start(self, episode: str, item: str, budget: int) -> dict:
-        self.eps[episode] = {"item": item, "budget": int(budget), "passes": 0, "refs": {}, "seed": random.Random(episode).randrange(2 ** 31)}
+        if episode not in self.eps:  # (a retried start keeps the episode)
+            self.eps[episode] = {"item": item, "budget": int(budget), "passes": 0, "refs": {}, "done": {},
+                                 "seed": random.Random(episode).randrange(2 ** 31)}
         return {"ok": True}
 
-    def call(self, episode: str, name: str, args: dict) -> dict:
+    def call(self, episode: str, name: str, args: dict, call_id: str | None = None) -> dict:
+        """A tool call; a call_id seen before returns its first result (a retried request is never charged twice)."""
         ep = self.eps[episode]
+        if call_id is not None and call_id in ep["done"]:
+            return ep["done"][call_id]
+        out = self._call(ep, name, args)
+        if call_id is not None:
+            ep["done"][call_id] = out
+        return out
+
+    def _call(self, ep: dict, name: str, args: dict) -> dict:
         it = self.items[ep["item"]]
         fn = getattr(self, f"t_{name}", None)
         before = ep["passes"]
@@ -544,10 +557,10 @@ TOOL_DOCS = {
              "1 pass, plus 16 with controls, plus 2 per steer_swap."),
     "logit_lens": ("logit_lens(position=-1, text=None, chat=None) -> the top 3 tokens read from the residual stream after "
                    "layers 0, 3, ..., 27 at a position (final norm and unembedding). 1 pass."),
-    "ao": ("ao(question, layer=14, positions=None) -> the released Activation Oracle for Qwen3-1.7B (Karvonen et al. 2025: "
+    "ao": ("ao(question, layer=14, positions=None, text=None, chat=None) -> the released Activation Oracle for Qwen3-1.7B (Karvonen et al. 2025: "
            "the same model with an adapter, trained to answer questions about activations injected into it) reads the "
-           "model's activations at layer 7, 14 or 21 at the positions of the item's text (default: every position; an "
-           "organism item: the prompt's last 10 tokens) and gives 4 sampled answers to the question. 1 pass."),
+           "model's activations at layer 7, 14 or 21 at the positions of the text (default: every position, at most the last "
+           "64; a chat prompt: its last 10 tokens) and gives 4 sampled answers to the question. 1 pass."),
     "generate": ("generate(text=None, max_tokens=24, chat=None) -> the model's greedy continuation of the text (default "
                  "the item's text). 1 pass per generated token (at most 48)."),
 }
@@ -576,7 +589,7 @@ def serve(a) -> None:
             if self.path == "/start":
                 self._send(tools.start(req["episode"], req["item"], req["budget"]))
             elif self.path == "/tool":
-                self._send(tools.call(req["episode"], req["name"], req.get("args") or {}))
+                self._send(tools.call(req["episode"], req["name"], req.get("args") or {}, req.get("call_id")))
             elif self.path == "/score_edit":
                 with tools.lock:
                     self._send(tools.edit_score(tools.items[req["item"]], req["ops"]))
@@ -600,7 +613,12 @@ its token), with tools that run that model.
 {tools}"""
 
 SYSTEM_TOOLS = """Every tool run costs forward passes of the model. You have {budget} passes for this question in all; a \
-call that needs more than what is left is refused, and refused calls cost nothing.
+call that needs more than what is left is refused, and refused calls cost nothing. Be economical with words too: \
+think briefly, call tools early (several per message), and keep messages short.
+
+Every tool runs on the question's own text by default (never pass it yourself). With text="..." a tool runs on a text \
+you write instead: for a question about a chat model the text is sent as one user message in its chat format (chat=false \
+sends it raw); otherwise raw (chat=true wraps it as a user message).
 
 To call tools, write lines of the form
 <tool>{{"name": "...", "args": {{...}}}}</tool>
@@ -745,12 +763,22 @@ class Spend:
             self.spent += usd
 
 
-def post(url: str, path: str, obj: dict) -> dict:
+def post(url: str, path: str, obj: dict, tries: int = 8) -> dict:
+    """POST with retries (the tunnel drops now and then: the pilot lost four episodes to one drop); requests are
+    idempotent on the server (an episode's start, a call_id)."""
+    import http.client
+    import urllib.error
     import urllib.request
 
-    req = urllib.request.Request(url + path, data=json.dumps(obj).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=900) as r:
-        return json.loads(r.read())
+    for k in range(tries):
+        req = urllib.request.Request(url + path, data=json.dumps(obj).encode(), headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                return json.loads(r.read())
+        except (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError):
+            if k + 1 == tries:
+                raise
+            time.sleep(15)
 
 
 def episode(a, it: dict, budget: int, rep: int, sampler, rr, tok, spend: Spend) -> dict:
@@ -779,25 +807,19 @@ def episode(a, it: dict, budget: int, rep: int, sampler, rr, tok, spend: Spend) 
 
 
 def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) -> None:
-    """One item's conversation, filling rec (answer, calls, tokens, dollars)."""
+    """One item's conversation, filling rec (answer, calls, tokens, dollars). A message cut off at MAX_TOKENS with no
+    tool call or answer is told to be shorter; on the last message (budget 0's only one) the answer is forced instead:
+    its own reasoning closed and "<answer>" appended, sampled for at most FORCED tokens (s1's budget forcing)."""
     import tinker
     from tinker_cookbook.renderers import get_text_content
 
-    eid = rec["episode"]
-    post(a.server, "/start", {"episode": eid, "item": it["id"], "budget": budget})
-    tools = SYSTEM_TOOLS.format(budget=budget, calls=CALLS, turns=TURNS, docs="\n".join(f"- {d}" for d in TOOL_DOCS.values()))
-    msgs = [{"role": "system", "content": SYSTEM.format(tools=tools if budget else SYSTEM_NONE)},
-            {"role": "user", "content": question(it, tok)}]
-    turns, left = (TURNS if budget else 1), budget
-    for turn in range(turns):
-        prompt = rr.build_generation_prompt(msgs)
-        bound = (prompt.length * RATES["prefill"] + MAX_TOKENS * RATES["sampled"]) / 1e6
+    def sample(prompt, max_tokens):
+        bound = (prompt.length * RATES["prefill"] + max_tokens * RATES["sampled"]) / 1e6
         if not spend.reserve(bound):
-            rec["stopped"] = "cap"
-            return
+            return None
         try:
             res = sampler.sample(prompt=prompt, num_samples=1, sampling_params=tinker.SamplingParams(
-                max_tokens=MAX_TOKENS, temperature=TEMPERATURE, top_p=TOP_P, stop=rr.get_stop_sequences())).result()
+                max_tokens=max_tokens, temperature=TEMPERATURE, top_p=TOP_P, stop=rr.get_stop_sequences())).result()
         except Exception:
             spend.settle(bound, bound)  # unknown spend: booked at its worst case
             rec["usd"] += bound
@@ -806,21 +828,51 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
         usd = ((prompt.length - hits) * RATES["prefill"] + hits * RATES["cached"] + len(seq.tokens) * RATES["sampled"]) / 1e6
         spend.settle(bound, usd)
         rec.update(prefill=rec["prefill"] + prompt.length - hits, cached=rec["cached"] + hits,
-                   sampled=rec["sampled"] + len(seq.tokens), usd=rec["usd"] + usd, turns=turn + 1)
-        msg, _ = rr.parse_response(seq.tokens)
-        text = get_text_content(msg)
-        msgs.append(msg)
+                   sampled=rec["sampled"] + len(seq.tokens), usd=rec["usd"] + usd)
+        return list(seq.tokens)
+
+    eid = rec["episode"]
+    post(a.server, "/start", {"episode": eid, "item": it["id"], "budget": budget})
+    tools = SYSTEM_TOOLS.format(budget=budget, calls=CALLS, turns=TURNS, docs="\n".join(f"- {d}" for d in TOOL_DOCS.values()))
+    msgs = [{"role": "system", "content": SYSTEM.format(tools=tools if budget else SYSTEM_NONE)},
+            {"role": "user", "content": question(it, tok)}]
+    turns, left = (TURNS if budget else 1), budget
+    for turn in range(turns):
+        toks = sample(rr.build_generation_prompt(msgs), MAX_TOKENS)
+        if toks is None:
+            rec["stopped"] = "cap"
+            return
+        rec["turns"] = turn + 1
+        cut = len(toks) >= MAX_TOKENS
+        if cut and rr._think_close_token not in toks:  # cut inside its reasoning
+            think, text = rr.tokenizer.decode(toks), ""
+        else:
+            msg, _ = rr.parse_response(toks)
+            text = get_text_content(msg)
+            think = "".join(p["thinking"] for p in msg["content"] if p["type"] == "thinking") if isinstance(msg["content"], list) else ""
         rec.setdefault("transcript", []).append(text)
         ans = parse(text)
         if ans is not None:
             rec["answer"] = ans
             return
-        calls = re.findall(r"<tool>(.*?)</tool>", text, re.S)[:CALLS] if budget else []
+        found = re.findall(r"<tool>(.*?)</tool>", text, re.S) if budget else []
+        if cut and not found and turn + 1 == turns:
+            forced = sample(rr.build_generation_prompt(msgs, prefill=think + "</think>" + text + "\n<answer>"), FORCED)
+            if forced is None:
+                rec["stopped"] = "cap"
+                return
+            rec["forced"] = True
+            got = "<answer>" + get_text_content(rr.parse_response(forced)[0])
+            rec["transcript"].append(got)
+            rec["answer"] = parse(got)
+            return
+        msgs.append({"role": "assistant", "content": text})
         results = []
-        for c in calls:
+        for c in found[:CALLS]:
             try:
-                req = json.loads(c)
-                got = post(a.server, "/tool", {"episode": eid, "name": req.get("name"), "args": req.get("args") or {}})
+                req = json.loads(c, strict=False)  # (raw newlines inside strings allowed)
+                got = post(a.server, "/tool", {"episode": eid, "name": req.get("name"), "args": req.get("args") or {},
+                                               "call_id": f"{turn}.{len(rec['calls'])}"})
             except (json.JSONDecodeError, AttributeError) as e:
                 req, got = {"raw": c[:200]}, {"error": f"not a JSON tool call: {e}"}
             rec["calls"].append({"name": req.get("name"), "args": req.get("args"), "cost": got.get("cost", 0),
@@ -828,9 +880,10 @@ def talk(a, it: dict, budget: int, rec: dict, sampler, rr, tok, spend: Spend) ->
             results.append(f"<result name={req.get('name')!r} cost={got.get('cost', 0)}>\n"
                            f"{got['result'] if 'result' in got else 'ERROR: ' + str(got.get('error'))}\n</result>")
             left = got.get("left", left)
-        last = turn + 2 == turns
-        note = ("No tool call found. " if not calls else "") + f"Passes left: {left}. " + \
-            ("This is your last message: give your final answer now." if last else "")
+        note = ("Your message was cut off at the length limit; keep your reasoning shorter. " if cut and not found else
+                "No tool call found. " if not found else "")
+        note += f"Only the first {CALLS} calls ran. " if len(found) > CALLS else ""
+        note += f"Passes left: {left}. " + ("This is your last message: give your final answer now." if turn + 2 == turns else "")
         msgs.append({"role": "user", "content": "\n".join(results + [note.strip()])})
 
 
@@ -855,7 +908,8 @@ def run(a) -> None:
     done = [json.loads(x) for x in a.out.read_text().splitlines()] if a.out.exists() else []
     spend = Spend(a.cap, sum(r["usd"] for r in done))
     have = {(r["id"], r["budget"], r["repeat"]) for r in done if not str(r["stopped"]).startswith("error")}
-    jobs = [(it, b, rep) for rep in range(a.repeats) for b in a.budgets for it in items_ if (it["id"], b, rep) not in have]
+    jobs = [(it, b, rep) for rep in range(a.repeats) for b in a.budgets for it in items_
+            if (it["id"], b, rep) not in have and (b or rep < a.repeats_text_only)]
     print(f"{len(jobs)} episodes; ${spend.spent:.3f} spent before, cap ${a.cap}", flush=True)
     lock = threading.Lock()
     with ThreadPoolExecutor(a.workers) as ex:
@@ -1014,6 +1068,7 @@ def main():
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--budgets", type=int, nargs="+", default=list(BUDGETS))
     r.add_argument("--repeats", type=int, default=REPEATS)
+    r.add_argument("--repeats-text-only", type=int, default=1, help="repeats at budget 0 (the text-alone floor)")
     r.add_argument("--items", nargs="*", help="item ids (default every item)")
     r.add_argument("--cap", type=float, default=5.0, help="Tinker dollars for this output file in all")
     r.add_argument("--workers", type=int, default=16)

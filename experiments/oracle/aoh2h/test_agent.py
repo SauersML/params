@@ -164,3 +164,18 @@ def test_spend_holds_the_worst_case_until_settled():
     assert s.reserve(0.5) and not s.reserve(0.4)
     s.settle(0.5, 0.1)
     assert abs(s.spent - 0.3) < 1e-12 and s.reserve(0.6)
+
+
+def test_a_retried_call_is_answered_once_and_charged_once(tools):
+    tools.start("e", "t0", 16)
+    first = tools.call("e", "swap", {"swaps": [{"position": 3, "token": "w7"}]}, "0.0")
+    tools.start("e", "t0", 16)  # a retried start keeps the episode
+    assert tools.call("e", "swap", {"swaps": [{"position": 3, "token": "w7"}]}, "0.0") == first
+    assert tools.eps["e"]["passes"] == first["cost"] == 2
+
+
+def test_ao_reads_a_written_text(tools, monkeypatch):
+    monkeypatch.setattr(agent, "AO_LAYERS", (1,))
+    tools.start("e", "t0", 16)
+    got = tools.call("e", "ao", {"question": "What?", "layer": 1, "text": "w1 w2 w3"})
+    assert got["cost"] == 1 and "owl" in got["result"]

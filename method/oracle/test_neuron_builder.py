@@ -1,6 +1,7 @@
 """Checks of the question-scoped neuron builder (neuron_builder.py) on a tiny random Qwen3: calibration's per-layer
 reference stays within the tolerance and is the one the hooks run, the circuit lies among the strong non-massive units
-before the answer, and its recorded removal is the measured one.
+before the answer, its recorded removal is the measured one, and its recorded sufficiency is the counterfactuals' patch
+of its units and routes recomputed by hand.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_neuron_builder.py -q
 """
@@ -65,6 +66,54 @@ def test_circuit_units_and_removal(tiny, monkeypatch):
     if rec["met"]:
         r = rec["removed"]
         assert not r["top"] and r["contrast"] <= rec["contrast"] - nb.NEC_BITS + 1e-6 and r["side"] <= nb.SIDE_MAX
+
+
+def test_sufficiency_is_the_measured_patch(tiny, monkeypatch):
+    nr, _, ids, _ = tiny
+    monkeypatch.setattr(nb, "CANDIDATES", 32)
+    monkeypatch.setattr(nb, "NEC_BITS", 0.01)   # (the random model's counterfactuals move it a few hundredths)
+    monkeypatch.setattr(nb, "SUF_MEASURED", 16)
+    pos = len(ids) - 1
+    rec = nb.build(nr, ids, pos)
+    if not rec["counterfactuals"] or rec["restored"] is None:
+        pytest.skip("no counterfactual moved the contrast")
+    qmin = min(c["pos"] for c in rec["counterfactuals"])
+    for r in rec["routes"]:
+        assert 0 <= r["layer"] < nr.L and 0 <= r["head"] < nr.NH and qmin <= r["pos"] <= pos
+    assert {u["role"] for u in rec["nodes"]} <= {"necessity", "sufficiency", "both"}
+    assert rec["size"] == len(rec["nodes"]) == rec["size_necessity"] + sum(u["role"] == "sufficiency" for u in rec["nodes"])
+    cap = {}
+    with torch.no_grad():
+        lp = torch.log_softmax(nr.logits(ids, [pos], capture=cap)[0, 0], -1)
+    H, O = [h[0] for h in cap["h"]], [o[0] for o in cap["o"]]
+    alt = torch.tensor(rec["alternatives"])
+    con = lambda l: float((l[rec["answer"]] - torch.logsumexp(l[alt], -1)) / math.log(2))  # noqa: E731
+    assert abs(con(lp) - rec["contrast"]) < 1e-4
+    got = []
+    for c in rec["counterfactuals"]:
+        x2 = list(ids)
+        x2[c["pos"]] = c["token"]
+
+        def edit(i, h):
+            h = h.clone()
+            for u in rec["nodes"]:
+                if u["layer"] == i:
+                    h[:, u["pos"], u["neuron"]] = H[i][u["pos"], u["neuron"]]
+            return h
+
+        def route(i, a):
+            a = a.clone()
+            for r in rec["routes"]:
+                if r["layer"] == i:
+                    sl = slice(r["head"] * nr.hd, (r["head"] + 1) * nr.hd)
+                    a[:, r["pos"], sl] = O[i][r["pos"], sl]
+            return a
+        with torch.no_grad():
+            l = torch.log_softmax(nr.logits(x2, [pos], edit=edit, route=route)[0, 0], -1)
+        got.append((con(l) - (rec["contrast"] - c["drop"])) / c["drop"])
+    assert abs(min(got) - rec["restored"]) < 1e-4
+    if rec["met"]:
+        assert rec["restored"] >= nb.SUFF_FRAC
 
 
 def test_pole_edit():

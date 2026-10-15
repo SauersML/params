@@ -1,7 +1,7 @@
 """Checks of the question-scoped neuron builder (neuron_builder.py) on a tiny random Qwen3: calibration's per-layer
 reference stays within the tolerance and is the one the hooks run, the circuit lies among the strong non-massive units
 before the answer, its recorded removal is the measured one, and its recorded sufficiency is the counterfactuals' patch
-of its units and routes recomputed by hand.
+of its units and routes recomputed by hand; a run from a prefix's cache equals the full run.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_neuron_builder.py -q
 """
@@ -122,3 +122,20 @@ def test_pole_edit():
     out = e(0, h)
     assert out[0].tolist() == [[0., 0., 3.], [-1., 2., -3.]] and out[1].tolist() == [[1., -2., 0.], [-1., 2., 0.]]
     assert torch.equal(e(1, h), h)
+
+
+def test_prefix_cache_equals_the_full_run(tiny):
+    nr, _, ids, _ = tiny
+    T, s, B = len(ids), 5, 4
+    g = torch.Generator().manual_seed(3)
+    mk = torch.rand(B, T, nr.D, generator=g) < 0.3
+    mk[:, :s] = False                                        # edits at positions s and later only
+    rm = torch.rand(B, T, nr.NH, generator=g) < 0.5
+    rm[:, :s] = False
+    edit = lambda i, h: torch.where(mk, torch.zeros_like(h), h)  # noqa: E731
+    route = lambda i, a: torch.where(rm.repeat_interleave(nr.hd, -1), torch.zeros_like(a), a)  # noqa: E731
+    with torch.no_grad():
+        full = nr.logits(ids, [s, T - 1], edit=edit, route=route, B=B)
+        part = nr.logits(ids, [s, T - 1], edit=edit, route=route, B=B, cache=nr.prefix(ids, s, B=B))
+        again = nr.logits(ids, [s, T - 1], edit=edit, route=route, B=B, cache=nr.prefix(ids, s, B=B))
+    assert torch.allclose(full, part, atol=1e-4) and torch.equal(part, again)

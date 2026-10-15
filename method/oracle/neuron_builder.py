@@ -39,10 +39,13 @@ On 100 prompts every candidate patched restored >= 0.9 on 99 on Qwen3-1.7B and o
 position alone on 53 and 35), and one ranked prefix for both criteria met 61 and 12, its shortlist missing what the patch
 needs. Searched over neurons alone the patch keeps the changed token's own positions (Qwen3-0.6B Paris: 17,416 units of
 the token's representation); the routes into the answer position are the narrow cut (Paris: 7 heads, 0.997).
-Every decision is a measured run; the gradient only orders the candidates."""
+Every decision is a measured run; the gradient only orders the candidates. Every batch has ROWS rows; a batch whose edits
+all lie at or after a position reuses the keys and values of the positions before it (PREFIX; float32 models).
+"""
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 import time
 
@@ -57,6 +60,8 @@ CAL_ROWS = slice(1000, 1200)   # general.jsonl's calibration chats (maxima; the 
 MASSIVE = 0.25        # a value at least this share of the layer's largest neuron maximum is massive (kept live, no unit)
 ALTERNATIVES = 5
 CANDIDATES = 512      # units measured alone
+PREFIX = True         # runs whose edits all lie at or after a position reuse the positions before it (float32 only: in
+# bfloat16 a run's numbers move with its shapes, as with its batch size)
 ROWS = 32             # runs a batch, every batch padded to it (bfloat16 Qwen3-8B moves the answer's contrast up to 2.3
 # bits between batch sizes 1 and 32, bit-identical at one size whatever the other rows hold)
 SIDE = 8              # positions before the answer whose predictions measure a removal's side effect
@@ -123,13 +128,32 @@ class Neurons:
             for h in hs:
                 h.remove()
 
-    def logits(self, ids, positions: list[int], edit=None, B: int = 1, capture=None, route=None) -> torch.Tensor:
-        """Logits [B, len(positions), V] of B copies of ids under edit (and route)."""
+    def logits(self, ids, positions: list[int], edit=None, B: int = 1, capture=None, route=None, cache=None) -> torch.Tensor:
+        """Logits [B, len(positions), V] of B copies of ids under edit (and route). With cache (prefix(): positions
+        0..start-1 already run) only the positions from start on run: edit and route still see every position (those
+        before start as zeros, their edits ignored), positions must be start or later, no capture."""
         x = torch.as_tensor(ids, device=self.dev)
         x = x[None].expand(B, -1) if x.dim() == 1 else x
-        with self.hooks(edit, capture, route):
-            h = self.core.model(input_ids=x).last_hidden_state[:, positions]
-        return self.core.lm_head(h).float()
+        if cache is None:
+            with self.hooks(edit, capture, route):
+                h = self.core.model(input_ids=x).last_hidden_state[:, positions]
+            return self.core.lm_head(h).float()
+        s, kv = cache
+
+        def pad(f):
+            return None if f is None else (lambda i, a: f(i, torch.cat([a.new_zeros(a.shape[0], s, a.shape[2]), a], 1))[:, s:])
+        with self.hooks(pad(edit), None, pad(route)):
+            h = self.core.model(input_ids=x[:, s:], past_key_values=copy.deepcopy(kv), use_cache=True).last_hidden_state
+        return self.core.lm_head(h[:, [p - s for p in positions]]).float()
+
+    @torch.no_grad()
+    def prefix(self, ids, start: int, edit=None, route=None, B: int = 1):
+        """The key/value cache of positions 0..start-1 of B copies of ids under edit (and route, each seeing those
+        positions only), for logits(cache=)."""
+        x = torch.as_tensor(ids, device=self.dev)
+        x = x[None].expand(B, -1) if x.dim() == 1 else x
+        with self.hooks(edit, None, route):
+            return start, self.core.model(input_ids=x[:, :start], use_cache=True).past_key_values
 
     @torch.no_grad()
     def maxima(self, seqs: list[list[int]]) -> torch.Tensor:
@@ -301,6 +325,10 @@ def pole_edit(sets: list, base=None):
     return edit
 
 
+def _cached(nr: Neurons) -> bool:
+    return PREFIX and next(nr.core.parameters()).dtype == torch.float32
+
+
 def _pad(rows: list) -> list:
     """rows filled up to ROWS with copies of the last (a run's numbers depend on its batch size, not the other rows)."""
     return rows + rows[-1:] * (ROWS - len(rows))
@@ -393,16 +421,22 @@ def build(nr: Neurons, ids: list[int], pos: int, log=None, span: tuple | None = 
         s[pos + 1:] = False
         P.append(s)
 
+    pre = nr.prefix(ids, pos, B=ROWS) if _cached(nr) else None   # (sets all at the answer position: no side effect)
+
     def runs(sets: list) -> list[dict]:
         """Per set of units removed: the contrast, y on top, the side effect."""
-        out = []
-        for s0 in range(0, len(sets), ROWS):
-            part = sets[s0:s0 + ROWS]
-            with torch.no_grad():
-                l = torch.log_softmax(nr.logits(ids, allpos, edit=_zero_edit(_pad(part)), B=ROWS), -1)   # [B, P, V]
-            c = contrast(l[:, -1])
-            sd = (lp0[None, :-1].exp() * (lp0[None, :-1] - l[:, :-1])).sum(-1).mean(-1) / math.log(2) if side else torch.zeros(len(part))
-            out += [{"contrast": float(c[b]), "top": int(l[b, -1].argmax()) == y, "side": float(sd[b])} for b in range(len(part))]
+        out = [None] * len(sets)
+        at = [j for j, s in enumerate(sets) if pre is not None and s and min(t for _, t, _ in s) >= pos]
+        for js, cache in ((at, pre), (sorted(set(range(len(sets))) - set(at)), None)):
+            for s0 in range(0, len(js), ROWS):
+                part = [sets[j] for j in js[s0:s0 + ROWS]]
+                with torch.no_grad():
+                    l = torch.log_softmax(nr.logits(ids, [pos] if cache else allpos, edit=_zero_edit(_pad(part)), B=ROWS, cache=cache), -1)
+                c = contrast(l[:, -1])
+                sd = (lp0[None, :-1].exp() * (lp0[None, :-1] - l[:, :-1])).sum(-1).mean(-1) / math.log(2) if side and not cache \
+                    else torch.zeros(len(part))
+                for b, j in enumerate(js[s0:s0 + ROWS]):
+                    out[j] = {"contrast": float(c[b]), "top": int(l[b, -1].argmax()) == y, "side": float(sd[b])}
         return out
 
     def necessary(r):
@@ -539,11 +573,18 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
     for i, t, n in fixed:
         fx[i][t, n] = True
 
+    zone = {"start": None}                                   # the first position rows may touch (the cache's), None: none
+    caches = {}
+
     def restore(rows: list) -> list[float]:
         """Per row (fn(i) -> ([T, D] units, [T, NH] routes) on layer i): the least share of a counterfactual's contrast loss
         restored with those units and head outputs set to their values on the prompt."""
         got = []
-        for q, z, x2, d in cfs:
+        for c_, (q, z, x2, d) in enumerate(cfs):
+            st = zone["start"] if _cached(nr) else None
+            if st is not None and (c_, st) not in caches:
+                with torch.no_grad():
+                    caches[(c_, st)] = nr.prefix(x2, st, edit=lambda i, h: torch.where(fx[i][:st], H[i][:st].to(h.dtype), h), B=ROWS)
             out = []
             for s0 in range(0, len(rows), ROWS):
                 part = rows[s0:s0 + ROWS]
@@ -557,7 +598,8 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
                     m = torch.stack([r[i][1] for r in mk]).repeat_interleave(nr.hd, -1)
                     return torch.where(m, O[i][None].to(a.dtype), a)
                 with torch.no_grad():
-                    l = torch.log_softmax(nr.logits(x2, [pos], edit=edit, route=route, B=ROWS)[:, 0], -1)
+                    l = torch.log_softmax(nr.logits(x2, [pos], edit=edit, route=route, B=ROWS,
+                                                    cache=None if st is None else caches[(c_, st)])[:, 0], -1)
                 out += [(c - (c0 - d)) / d for c in contrast(l).tolist()[:len(part)]]
             got.append(out)
         return [min(v) for v in zip(*got)]
@@ -616,6 +658,7 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
                 keep[g] = False
         return keep
     keep = torch.ones(len(el), dtype=torch.bool, device=dev)
+    zone["start"] = qmin
     full = restore([row(keep)])[0]
     srec = {"full": full, "restore_of": restore_of, "level_seconds": {}}
 
@@ -624,6 +667,7 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
     lap("counterfactuals")
     if full < SUFF_FRAC:                                     # every candidate and route patched does not restore enough
         srec["seconds"] = round(time.perf_counter() - t0, 2)
+        zone["start"] = None
         return cfs, [], [], srec
     # positions; MLP blocks with every route at the kept positions on (largest first: routes are the narrow cut, a
     # block thousands of units); then routes ranked, the smallest restoring prefix, each of it dropped alone (_cut)
@@ -632,6 +676,7 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
     lap("positions")
     keep = eliminate(keep, [ix[j:j + 1] for j in (keep & isn).nonzero().flatten().tolist()], True)
     lap("blocks")
+    zone["start"] = int(E[keep, 2].min())
     rj = (keep & isr).nonzero().flatten()
     keep = keep & ~isr
 
@@ -681,6 +726,7 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
                 pool=int(sum(int(p.sum()) for p in pool)))
     if srec["pool"] == 0:
         srec["seconds"] = round(time.perf_counter() - t0, 2)
+        zone["start"] = None
         return cfs, [], routes, srec
     # units: |value change x gradient| on each counterfactual's run with the pool and routes patched, the largest
     # SUF_MEASURED patched alone with the routes (measured) and ranked by that, the rest by the gradient; the smallest
@@ -746,6 +792,7 @@ def _sufficiency(nr: Neurons, ids: list[int], pos: int, H: list, O: list, P: lis
         dropped = dropped_by(kg)
     suf = [u for u in ranked[:k] if not bool(dropped[u[0]][u[1], u[2]])]
     lap("units")
+    zone["start"] = None                                       # (the record's own check: every position run)
     srec.update(units=len(suf), seconds=round(time.perf_counter() - t0, 2), alone=alone)
     return cfs, suf, routes, srec
 

@@ -966,6 +966,39 @@ def cmd_serve(a) -> None:
     ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
 
 
+def rotated(text: str) -> str:
+    """An explanation with its group names rotated: each group's facts given to the group a third of the way round."""
+    gs = sorted(set(re.findall(r"\bG\d+\b", text)), key=lambda g: int(g[1:]))
+    k = max(1, len(gs) // 3)
+    perm = {g: h for g, h in zip(gs, gs[k:] + gs[:k])}
+    return re.sub(r"\bG\d+\b", lambda m: "@@" + perm.get(m.group(0), m.group(0)), text).replace("@@", "")
+
+
+def cmd_accept(a) -> None:
+    """The reader term's acceptance test (the lead's 10-14): on group questions (questions --by-group) the facts
+    explanation with true group names must beat the same with the names rotated, which should fall to no better than
+    no explanation. Per text and pooled: accuracy of none, true and rotated."""
+    rd = Reader(a.reader, a.out.parent)
+    pool: dict = {"none": [0.0, 0], "true": [0.0, 0], "rotated": [0.0, 0]}
+    per = []
+    for qf in a.questions:
+        ivs = [json.loads(x) for x in qf.read_text().splitlines()]
+        facts = Path(str(qf).replace(".jsonl", "_facts.txt")).read_text()
+        arms = {"none": None, "true": facts, "rotated": rotated(facts)}
+        got = rewards(rd, ivs, list(arms.values()))
+        row = {"questions": qf.name, "n": len(ivs)}
+        for (arm, _), g in zip(arms.items(), got):
+            pool[arm][0] += sum(r["score"] for r in g["rows"])
+            pool[arm][1] += len(g["rows"])
+            row[arm] = g["accuracy"]
+        per.append(row)
+        print(row, flush=True)
+    res = {"pooled": {k: v[0] / max(v[1], 1) for k, v in pool.items()}, "questions": pool["none"][1], "texts": per,
+           "true_above_rotated": sum(r["true"] > r["rotated"] for r in per), "spend_usd": rd.spend.total}
+    a.out.write_text(json.dumps(res, indent=1))
+    print(json.dumps({k: res[k] for k in ("pooled", "questions", "true_above_rotated", "spend_usd")}))
+
+
 def cmd_agree_prep(a) -> None:
     """The reader prompts already answered by Tinker's reader (read's result files: --results), with their questions'
     measured outcomes, into one file for the self-hosted reader's agreement check."""
@@ -1060,6 +1093,10 @@ def main():
     ag.add_argument("--model", default="Qwen/Qwen3.6-27B-FP8")
     ag.add_argument("--batch", type=int, default=256)
     ag.add_argument("--out", type=Path, required=True)
+    ac = sub.add_parser("accept")
+    ac.add_argument("--questions", type=Path, nargs="+", required=True, help="group question files (questions --by-group), facts beside them")
+    ac.add_argument("--out", type=Path, required=True)
+    ac.add_argument("--reader", default=READER)
     sv = sub.add_parser("serve")
     sv.add_argument("--questions-dir", type=Path, required=True)
     sv.add_argument("--reader-url", help="an OpenAI-compatible server (vllm serve ...); else Tinker's --reader")
@@ -1069,7 +1106,7 @@ def main():
     sv.add_argument("--device")
     a = ap.parse_args()
     {"questions": cmd_questions, "read": cmd_read, "invariants": cmd_invariants, "answer": cmd_answer, "agree-prep": cmd_agree_prep,
-     "agree": cmd_agree, "serve": cmd_serve}[a.what](a)
+     "agree": cmd_agree, "serve": cmd_serve, "accept": cmd_accept}[a.what](a)
 
 
 if __name__ == "__main__":

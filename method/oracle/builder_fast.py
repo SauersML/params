@@ -471,7 +471,14 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
     return _graph(kept), rec
 
 
-UNITS = {"vpd": build_vpd}
+def build_neurons(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple:
+    """Native units: heads and neurons in mean-ablation semantics (native_units.build_native, inframove's): (Mask, record)."""
+    import native_units
+
+    return native_units.build_native(ge, tx, log=log)
+
+
+UNITS = {"vpd": build_vpd, "neurons": build_neurons}
 
 
 def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | None = None, log=None,
@@ -495,8 +502,11 @@ def build(ge: goal_eval.GoalEval, task: dict, units: str = "vpd", seed: int | No
                                                       "patching_far": fl.get("patching_far")}, log=log)
         rec["connect"] = getattr(g, "connect", None)
         rec["seconds"]["connect"] = round(time.perf_counter() - t0, 2)
-    out = goal_eval.to_json(g, "")
-    out.update(units=units, build=rec, build_seconds=round(time.perf_counter() - t0, 2), builder=builder)
+    if units == "neurons":  # (the bake-off's native form: Mask.units() as nodes)
+        out = {"nodes": [list(u) for u in g.units()], "semantics": "mean_ablation"}
+    else:
+        out = goal_eval.to_json(g, "")
+    out.update(units="native" if units == "neurons" else units, build=rec, build_seconds=round(time.perf_counter() - t0, 2), builder=builder)
     return out
 
 

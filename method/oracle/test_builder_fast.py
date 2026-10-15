@@ -60,3 +60,18 @@ def test_build_inside_the_start_meeting_its_floors(tiny):
         if row is not None:
             assert all(row[f] is None or rec["floors"][f] is None or row[f] >= rec["floors"][f] - 1e-9
                        for f in ("point", "track_pp", "scope", "interchange_pp"))
+
+
+def test_build_neurons(tiny, monkeypatch):
+    """units="neurons" dispatches to native_units.build_native: the bake-off's native form (heads and neurons as nodes),
+    its circuit meeting the KL target it records."""
+    import native_units
+
+    nat, ge, task = tiny
+    g = torch.Generator().manual_seed(4)
+    means = {"heads": torch.randn(nat.target.n_layer, nat.target.n_head, nat.target.hd, generator=g) * 0.2,
+             "neurons": torch.randn(nat.target.n_layer, nat.target.site(native.site_name(0, "c_fc")).W.shape[0], generator=g) * 0.2}
+    monkeypatch.setattr(native_units, "unit_means", lambda nat_, *a, **k: means)
+    out = builder_fast.build(ge, task, units="neurons", seed=5, builder="builder_fast@test")
+    assert out["units"] == "native" and out["semantics"] == "mean_ablation" and out["nodes"]
+    assert out["build"]["kl"] <= out["build"]["kl_target"] and out["build"]["units"] == len(out["nodes"])

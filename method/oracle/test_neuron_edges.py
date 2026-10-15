@@ -1,5 +1,5 @@
 """Checks of the neuron edge stage (neuron_edges.py) on a tiny random Qwen3: with no cut and every neuron live the run is
-the model's; the circuit run is the model with every other neuron zeroed; a cut edge's measured effect follows its
+the model's; the circuit run is the model with every other neuron zeroed but the first position's and massive values; a cut edge's measured effect follows its
 linear score at small writes; pruning keeps the contrast within its tolerance and the graph lists poles and edges.
 
   ~/mpd-data/venv/bin/python -m pytest method/oracle/test_neuron_edges.py -q
@@ -50,7 +50,11 @@ def test_runs_are_the_models(tiny):
     ed = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
     assert ed.c_full == pytest.approx(contrast_of(model, ids), abs=1e-4)
     ec = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="circuit")
-    assert ec.c_full == pytest.approx(contrast_of(model, ids, ec.keep), abs=1e-4)
+    live = ec.keep.clone()
+    live[:, 0] = True  # (the first position stays live, as neuron_builder's circuit run)
+    assert ec.c_full == pytest.approx(contrast_of(model, ids, live), abs=1e-4)
+    big = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="circuit", massive=torch.zeros(3))
+    assert big.c_full == pytest.approx(contrast_of(model, ids), abs=1e-4)  # (every value massive: every one live)
     E = len(ec.resid_all)
     assert ec.contrasts(torch.zeros(1, E, dtype=torch.bool), ec.resid_all)[0] == pytest.approx(ec.c_full, abs=1e-4)
 

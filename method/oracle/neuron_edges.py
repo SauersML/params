@@ -4,8 +4,10 @@ side). Given a text, a question's contrast at a target and a circuit's neurons, 
 
 Contrast: log2 of the summed probability of the answer's tokens over that of the alternatives' at the target.
 Background: the reference run, the model with each neuron's activation zeroed below its weak threshold (thr [layers,
-d_mlp], from the weak-activation measurement; None: the model itself). With background "circuit" every neuron outside
-the circuit is also zeroed (the question-scoped circuit's sufficiency run); with "model" every strong neuron runs.
+d_mlp]: neuron_builder.Neurons', inframove's T2 calibration; None: the model itself). With background "circuit" every
+strong candidate outside the circuit is also zeroed, as neuron_builder's circuit run: strong, not massive (|value| under
+massive [layers], the layer's cut) and at positions 1 to the target, the first position and massive values live (the
+question-scoped circuit's sufficiency run); with "model" every strong neuron runs.
 Edges (candidates: every pair the architecture allows among the circuit's neurons):
   resid  writer (layer a, position p) -> reader (layer b > a, position p): the writer's down_proj write in the reader's
          MLP input;
@@ -25,6 +27,8 @@ within TOL of the way from every edge's to none's (either side), and a halving p
 (each tried alone, those passing tried together); each kept edge's own cut measured last (its strength).
 
   python neuron_edges.py one MODEL TEXT.json OUT.json   (TEXT: ids, target, answer, alternatives, neurons)
+  python neuron_edges.py record MODEL REC.json OUT.json --thr THR.pt [--adapter A] [--dtype bfloat16]
+                                                       (a neuron_builder circuit in its reference)
 """
 from __future__ import annotations
 
@@ -70,7 +74,7 @@ class Edges:
     (resid (writer, reader) and route (writer, (layer, head), reader) tuples; neurons (layer, position, index))."""
 
     def __init__(self, model, ids: list[int], target: int, answer: list[int], alternatives: list[int], neurons: list,
-                 thr: torch.Tensor | None = None, background: str = "circuit"):
+                 thr: torch.Tensor | None = None, background: str = "circuit", massive: torch.Tensor | None = None):
         core = model.get_base_model() if hasattr(model, "get_base_model") else model
         cfg = core.config
         self.core, self.layers = core, core.model.layers
@@ -80,6 +84,7 @@ class Edges:
         self.T = target + 1
         self.ids, self.target, self.answer, self.alternatives = list(ids)[:self.T], target, list(answer), list(alternatives)
         self.thr = None if thr is None else thr.to(self.dev, torch.float32)
+        self.massive = None if massive is None else massive.float().cpu()
         self.N = sorted({(int(L), int(p), int(j)) for L, p, j in neurons if p < self.T})
         self.at = {n: i for i, n in enumerate(self.N)}
         self.background = background
@@ -184,8 +189,12 @@ class Edges:
                     D = D.index_add(1, ri, cuts[:, es, None] * (dz @ self._w(at.o_proj, cols=slice(h * hd, (h + 1) * hd)).T))
             x = x + f(at.o_proj, z.transpose(1, 2).reshape(K, T, H * hd))
             hm = self._weak(L, self._mlp_act(layer, x))
-            if self.background == "circuit":
-                hm = hm * self.keep[L].to(d)[None]
+            if self.background == "circuit":  # (strong candidates outside the circuit zeroed; position 0 and massive live)
+                off = ~self.keep[L].to(d)[None]
+                off[:, 0] = False
+                if self.massive is not None:
+                    off = off & (hm.abs() < float(self.massive[L]))
+                hm = hm.masked_fill(off, 0.0)
             rs = torch.tensor([i for i, n in enumerate(self.N) if n[0] == L], dtype=torch.long, device=d)
             if len(rs) and len(edges):  # the circuit's neurons of this layer, each from its own input
                 hr = self._mlp_act(layer, x[:, P[rs]] - D[:, rs]).gather(-1, Jn[rs][None, :, None].expand(K, -1, 1))[..., 0]
@@ -426,22 +435,46 @@ def load(name: str, device: str | None = None, dtype: str = "float32"):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("one",))
+    ap.add_argument("cmd", choices=("one", "record"))
     ap.add_argument("model")
-    ap.add_argument("text", type=Path)
+    ap.add_argument("text", type=Path, help="one: TEXT.json; record: a neuron_builder record (OUT/<id>.json)")
     ap.add_argument("out", type=Path)
     ap.add_argument("--device", default=None)
     ap.add_argument("--background", default="circuit", choices=("circuit", "model"))
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"), help="the model's weights (bfloat16: 32B "
                     "over two cards, device_map auto)")
+    ap.add_argument("--thr", type=Path, help="the reference's file (neuron_builder.Neurons.save)")
+    ap.add_argument("--adapter", default=None)
     a = ap.parse_args()
     import transformers
     model = load(a.model, a.device, a.dtype)
+    tok = transformers.AutoTokenizer.from_pretrained(a.model)
+    if a.adapter:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, a.adapter).eval().requires_grad_(False)
+    if a.cmd == "record":  # a neuron_builder circuit: its prompt, answer, alternatives and units, its reference
+        import neuron_builder
+
+        rec = json.loads(a.text.read_text())
+        thr = massive = None
+        if a.thr:
+            nr = neuron_builder.Neurons(model, tok)
+            nr.load(a.thr)
+            thr, massive = nr.thr, nr.massive
+        ed = Edges(model, neuron_builder.chat(tok, rec["user"]), rec["pos"], [rec["answer"]], rec["alternatives"],
+                   [(n["layer"], n["pos"], n["neuron"]) for n in rec["nodes"]], thr=thr, background=a.background,
+                   massive=massive)
+        got = prune(ed, log=lambda m: print(f"{a.text.stem}: {m}", flush=True))
+        g = graph(ed, got, tok)
+        g.update(id=rec.get("id"), user=rec.get("user"), model=a.model, adapter=a.adapter, thr=str(a.thr) if a.thr else None)
+        a.out.write_text(json.dumps(g))
+        return
     t = json.loads(a.text.read_text())
     ed = Edges(model, t["ids"], t["target"], t["answer"], t["alternatives"], [tuple(n) for n in t["neurons"]],
                background=a.background)
     got = prune(ed, log=lambda m: print(f"{a.text.stem}: {m}", flush=True))
-    a.out.write_text(json.dumps(graph(ed, got, transformers.AutoTokenizer.from_pretrained(a.model))))
+    a.out.write_text(json.dumps(graph(ed, got, tok)))
 
 
 if __name__ == "__main__":

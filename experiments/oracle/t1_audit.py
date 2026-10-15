@@ -38,7 +38,6 @@ def sample(layers: int, width: int) -> list[tuple[int, int]]:
 def collect(a) -> None:
     import numpy as np
     import torch
-    from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(a.model)
@@ -69,6 +68,8 @@ def collect(a) -> None:
         offs = np.load(a.corpus / "corpus" / "offsets.npy")
         stream = ({"ids": toks[offs[d]:offs[d + 1]].tolist()} for d in range(len(offs) - 1))
     else:
+        from datasets import load_dataset
+
         stream = load_dataset("monology/pile-uncopyrighted", split="train", streaming=True)
     batch = []
 

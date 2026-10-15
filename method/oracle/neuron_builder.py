@@ -370,10 +370,11 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--rev", default="dev")
+    ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"), help="the model's weights (8B and up: bfloat16)")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.float32).to(dev).eval()
+    model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=getattr(torch, a.dtype)).to(dev).eval()
     if a.adapter:
         from peft import PeftModel
 

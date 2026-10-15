@@ -30,7 +30,8 @@ python -u cao.py organisms --organisms $S/organisms --adapter $AD --out $O/orgev
   train) WORK="python -u cao.py train --data $S/data.jsonl --out $O/adapter ${STEPS:+--steps $STEPS} > $O/train.log 2>&1" ;;
   eval) AD=${ADAPTER_DIR:+$S/adapter}; AD=${AD:-adamkarvonen/checkpoints_cls_latentqa_past_lens_Qwen3-1_7B}  # (ADAPTER_DIR: a step_N directory)
         WORK="python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval.jsonl > $O/eval.log 2>&1; \
-python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval_text_only.jsonl --text-only > $O/eval_text_only.log 2>&1" ;;
+python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval_text_only.jsonl --text-only > $O/eval_text_only.log 2>&1; \
+python -u cao.py eval --items $S/items.jsonl --adapter $AD --out $O/eval_wrong_text.jsonl --wrong-text > $O/eval_wrong_text.log 2>&1" ;;
 esac
 CMD="export OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; ln -sfn /workspace/runs/$N/mpd-data ~/mpd-data; mkdir -p $O $S; \
 tar -xf $S.tar -C $S; cd $S/experiments/oracle/cao; nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 10 > $O/gpu.csv & \

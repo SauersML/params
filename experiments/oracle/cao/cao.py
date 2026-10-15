@@ -470,29 +470,34 @@ def eval_items(a) -> None:
     """The gate's questions (h2h items) asked of an oracle (adapter) in this oracle's format, every answer's truth
     measured on the model: (a) the token (greedy answer), (b) each swap (greedy: "No." or the new token), (c) each pair
     and the facts battery (the more probable of the two options, its probability the confidence). The facts category
-    is never trained on: a held-out category. With --text-only, the same oracle with no vector added."""
+    is never trained on: a held-out category. With --text-only, the same oracle with no vector added; with
+    --wrong-text, the vectors read from another text of the same kind (the next one in the file), the question unchanged:
+    an oracle that reads the vectors falls to the text-only level or below (the goal doc's failure case: reading the
+    context, not the internals)."""
     o = Oracle(a.adapter, a.device)
     o.text_only = a.text_only
     items = [json.loads(x) for x in a.items.read_text().splitlines()]
     with a.out.open("w") as fh:
         for it in items:
             ids = it["ids"]
-            blocks = [{"layer": 14, "positions": list(range(len(ids)))}]
+            same = [x for x in items if x["kind"] == it["kind"]]
+            vids = same[(same.index(it) + 1) % len(same)]["ids"] if a.wrong_text else ids  # the text the vectors come from
+            blocks = [{"layer": 14, "positions": list(range(len(vids)))}]
             word = lambda p: o.tok.decode([ids[p]])  # noqa: E731
             rec = {"id": it["id"], "split": it["split"], "kind": it["kind"], "answers": []}
             if it["kind"] == "fact":
                 w = it["word"]
                 opts = ["First.", "Second."]
-                lp = o.option_logp({"ctx": ids, "blocks": blocks, "q": f"Does the model's next token depend more on the first or the "
+                lp = o.option_logp({"ctx": vids, "blocks": blocks, "q": f"Does the model's next token depend more on the first or the "
                                     f"second mention of {q_tok(' ' + w)}? Answer first or second."}, opts)
                 pick = int(lp[1] > lp[0])
                 rec["answers"].append({"q": "fact", "ok": pick == it["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
             else:
-                got = o.answer({"ctx": ids, "blocks": blocks,
+                got = o.answer({"ctx": vids, "blocks": blocks,
                                 "q": "Which earlier token is the model's next-token prediction most dependent on? Answer with the token."})
                 rec["answers"].append({"q": "a", "ok": h2h.norm(got) == h2h.norm(word(it["a"]["gt"])), "answer": got, "conf": None})
                 for sw in it["b"]:
-                    got = o.answer({"ctx": ids, "blocks": blocks,
+                    got = o.answer({"ctx": vids, "blocks": blocks,
                                     "q": f"If the token {q_tok(word(sw['p']))} at position {sw['p']} were replaced by "
                                          f"{q_tok(o.tok.decode([sw['y']]))}, would the model's next token change? If so, to what?"})
                     said_no = h2h.norm(got).startswith("no")
@@ -503,7 +508,7 @@ def eval_items(a) -> None:
                 for c in it["c"]:
                     p1, p2 = c["pair"]
                     opts = [q_tok(word(p1)), q_tok(word(p2))]
-                    lp = o.option_logp({"ctx": ids, "blocks": blocks, "q": f"Which matters more for the model's next token: {opts[0]} or {opts[1]}?"}, opts)
+                    lp = o.option_logp({"ctx": vids, "blocks": blocks, "q": f"Which matters more for the model's next token: {opts[0]} or {opts[1]}?"}, opts)
                     pick = c["pair"][int(lp[1] > lp[0])]
                     rec["answers"].append({"q": "c", "ok": pick == c["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
             fh.write(json.dumps(rec) + "\n")
@@ -603,6 +608,7 @@ def main():
     e.add_argument("--adapter", default=AO)
     e.add_argument("--out", type=Path, required=True)
     e.add_argument("--text-only", action="store_true")
+    e.add_argument("--wrong-text", action="store_true")
     e.add_argument("--device")
     g2 = sub.add_parser("organisms")
     g2.add_argument("--organisms", type=Path, required=True)

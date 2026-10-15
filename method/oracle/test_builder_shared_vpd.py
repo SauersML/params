@@ -52,6 +52,17 @@ def test_empty_allowed_and_no_unchecked_full_fallback():
     assert all(x['scores']['N']==.703 and not x['passed'] for x in r['admission']['tried'])
 
 
+@pytest.mark.parametrize('ranker,passes',[('measured',4),('ig',4),('fisher',8)])
+def test_shared_admission_records_selected_ranking(ranker,passes):
+    g,r,f=run(lambda n:score_row())
+    r.update(ranker=ranker,passes=passes)
+    graph,record=f()
+    admission=record['admission']
+    assert admission['ranking']==f'{ranker} scores, stable descending'
+    assert (admission['ranker'],admission['passes'])==(ranker,passes)
+    assert graph.count()==0 and g.calls==[0]
+
+
 @pytest.mark.parametrize('bad',[None,float('nan'),float('inf')])
 def test_missing_nonfinite_candidate_score_fails_closed(bad):
     g,r,f=run(lambda n:score_row(pattern=bad),n=1)

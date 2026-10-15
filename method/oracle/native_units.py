@@ -560,8 +560,16 @@ def fisher(mu: UnitRuns, seed: int, samples: int = FISHER_SAMPLES, live: tuple |
     return out
 
 
+class NoAdmittedCandidate(RuntimeError):
+    """An opt-in gate admitted no tested candidate; never a faithful full fallback."""
+
+    def __init__(self, record):
+        super().__init__("NO_ADMITTED_CANDIDATE")
+        self.record = record
+
+
 def build_units(mu: UnitRuns, seed: int, goal: float, stages=STAGES, samples: int = FISHER_SAMPLES, clean_max: int = CLEAN_MAX,
-                halving: int = 64) -> tuple[tuple, dict]:
+                halving: int = 64, admit=None, max_gate_calls: int = 16) -> tuple[tuple, dict]:
     """A circuit of native units (heads and neurons at positions) in mean-ablation semantics on any adapter (MeanUnits:
     vpd4l; HFUnits: Qwen3), the smallest the recipe finds whose point KL is at most goal, every decision measured, the
     Fisher only ordering:
@@ -575,6 +583,12 @@ def build_units(mu: UnitRuns, seed: int, goal: float, stages=STAGES, samples: in
       (3) inert cleanup: the largest log-scale suffix of the lowest-ranked kept units whose removal still passes, then
           the single removals of the clean_max lowest-ranked kept units measured and those under INERT bits removed
           together where that still passes (else the most inert half, and so on).
+    admit is an optional callable on the two live masks, returning a JSON-compatible
+    dict with Boolean passed. Every accepted stage and cleanup must pass it; at most
+    max_gate_calls distinct masks are evaluated (cached checks do not spend calls).
+    The empty mask is eligible. No passing tested candidate raises NoAdmittedCandidate
+    with its evidence record; there is no implicitly admitted full fallback. This is
+    minimum among tested passing candidates, not a globally minimal circuit.
     Returns ((heads [L, T, H], neurons [L, T, d_mlp]) float masks over the adapter's positions, record)."""
     t0 = time.perf_counter()
     L, T, H, Dm, dev = mu.L, mu.T, mu.H, mu.Dm, mu.dev
@@ -587,6 +601,45 @@ def build_units(mu: UnitRuns, seed: int, goal: float, stages=STAGES, samples: in
         h[idx[idx < nh]], n[idx[idx >= nh] - nh] = 1.0, 1.0
         return h.view(L, T, H), n.view(L, T, Dm)
 
+    gate_cache, gate_records = {}, []
+    gate_seconds, gate_exhausted = 0.0, False
+    if admit is not None:
+        if not callable(admit) or type(max_gate_calls) is not int or max_gate_calls < 0:
+            raise ValueError("callable admission and nonnegative integer gate budget required")
+        if not math.isfinite(goal) or goal < 0:
+            raise ValueError("finite nonnegative point goal required with admission")
+
+    def gate_record(status):
+        return {"status": status, "calls": len(gate_records), "max_calls": max_gate_calls,
+                "budget_exhausted": gate_exhausted, "seconds": gate_seconds,
+                "evaluations": list(gate_records), "passes_excludes_admission": True,
+                "scope": "gate calls are not a physical-forward cap; tested masks, not a global minimum"}
+
+    def accepted(idx, where):
+        nonlocal gate_seconds, gate_exhausted
+        if admit is None:
+            return True
+        live = mask_of(idx)
+        packed = torch.cat([x.bool().flatten() for x in live]).cpu().numpy().tobytes()
+        key = hashlib.sha256(packed).hexdigest()
+        if key in gate_cache:
+            return gate_cache[key]["passed"]
+        if len(gate_records) >= max_gate_calls:
+            gate_exhausted = True
+            return False
+        started = time.perf_counter()
+        result = admit(live)
+        gate_seconds += time.perf_counter() - started
+        if not isinstance(result, dict) or type(result.get("passed")) is not bool:
+            raise ValueError("admission must return a dict with Boolean passed")
+        result = json.loads(json.dumps(result, allow_nan=False))
+        gate_cache[key] = result
+        gate_records.append({"mask_sha256": key, "units": len(idx), "where": where, "result": result})
+        return result["passed"]
+
+    def point_ok(value, target):
+        return value <= target and (admit is None or math.isfinite(value))
+
     # (1) rank
     score = fisher(mu, seed, samples)
     rank = torch.argsort(score, descending=True)
@@ -598,16 +651,30 @@ def build_units(mu: UnitRuns, seed: int, goal: float, stages=STAGES, samples: in
     def prefix(order, target) -> tuple:
         sizes = log_sizes(len(order))
         got = list(zip(sizes, mu.kl(mask_of(order[:k]) for k in sizes)))
-        k_star = next((k for k, v in got if v <= target), len(order))  # (the whole order: the stage before's circuit)
+        if admit is None:
+            k_star = next((k for k, v in got if v <= target), len(order))  # historical point-only recipe
+        else:
+            k_star = next((k for k, v in got if point_ok(v, target) and accepted(order[:k], "prefix")), None)
+            if k_star is None:
+                raise NoAdmittedCandidate({"admission": gate_record("NO_ADMITTED_CANDIDATE"),
+                                           "point_candidates": got, "point_target": target,
+                                           "seconds": time.perf_counter() - t0})
         lo = max([k for k, _ in got if k < k_star] or [0])
         kl = dict(got).get(k_star)
         while k_star - lo > max(1, k_star // halving):
             mid = (lo + k_star) // 2
             v = mu.kl([mask_of(order[:mid])])[0]
             got.append((mid, v))
-            lo, k_star, kl = (lo, mid, v) if v <= target else (mid, k_star, kl)
+            lo, k_star, kl = (lo, mid, v) if point_ok(v, target) and accepted(order[:mid], "halving") else (mid, k_star, kl)
         return order[:k_star], kl, got
     measured, keep = [], rank
+    if admit is not None and point_ok(empty_kl, goal) and accepted(rank[:0], "empty"):
+        live = mask_of(rank[:0])
+        return live, {"kl": empty_kl, "kl_target": goal, "kl_empty": empty_kl, "prefix": [],
+                      "heads": 0, "neurons": 0, "units": 0, "of": len(rank), "passes": mu.passes,
+                      "seconds": time.perf_counter() - t0, "stages": stamp, "score": score,
+                      "order": rank[:0], "admission": gate_record("ADMITTED"), "passes_excludes_admission": True}
+
     for i, share in enumerate(stages):
         if i:
             f = fisher(mu, seed, samples, live=mask_of(keep))
@@ -621,7 +688,10 @@ def build_units(mu: UnitRuns, seed: int, goal: float, stages=STAGES, samples: in
     js = [j for j in log_sizes(len(asc)) if j < len(asc)]
     if js:
         got = mu.kl(mask_of(asc[j:]) for j in js)
-        passing = [j for j, v in zip(js, got) if v <= goal]
+        passing = [j for j, v in zip(js, got) if point_ok(v, goal)]
+        if admit is not None:
+            first = next((j for j in sorted(passing, reverse=True) if accepted(asc[j:], "suffix_cleanup")), None)
+            passing = [] if first is None else [first]
         if passing:
             j = max(passing)
             asc, kl_star = asc[j:], got[js.index(j)]
@@ -638,7 +708,7 @@ def build_units(mu: UnitRuns, seed: int, goal: float, stages=STAGES, samples: in
         while len(inert):
             rest = asc[~torch.isin(asc, inert)]
             v = mu.kl([mask_of(rest)])[0]
-            if v <= goal:
+            if point_ok(v, goal) and accepted(rest, "inert_cleanup"):
                 asc, kl_star = rest, v
                 break
             inert = inert[:len(inert) // 2]
@@ -647,18 +717,55 @@ def build_units(mu: UnitRuns, seed: int, goal: float, stages=STAGES, samples: in
     rec = {"kl": kl_star, "kl_target": goal, "kl_empty": empty_kl, "prefix": [sorted(g) for g in measured],
            "heads": int(live[0].sum()), "neurons": int(live[1].sum()), "units": len(asc), "of": len(rank), "passes": mu.passes,
            "seconds": time.perf_counter() - t0, "stages": stamp, "score": score, "order": asc.flip(0)}
+    if admit is not None:
+        rec["admission"] = gate_record("ADMITTED")
+        rec["passes_excludes_admission"] = True
     return live, rec
 
 
 def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | None = None, means: dict | None = None,
-                 log=None) -> tuple[Mask, dict]:
+                 log=None, *, shared_floors: bool = False, pool=None, max_gate_calls: int = 16) -> tuple[Mask, dict]:
     """build_units on vpd4l (MeanUnits) at kl_goal's KL by default: (Mask over the whole text, record); the positions
-    are those the kept units sit at."""
+    are those the kept units sit at. shared_floors opts into every available SHARED
+    family at the same VPD-derived search floors, never candidate-relative floors;
+    pool is the construction/search pool, not the scorecard's eval pool. Eval remains
+    separate. max_gate_calls bounds expensive shared-family candidate evaluations,
+    not their physical forwards; rec passes excludes them and admission records their
+    calls/time separately. The default point target inverts the actual shared point
+    floor; explicit kl_target remains an additional caller-specified bound."""
+    native_started = time.perf_counter()
     nat = ge.nat
     means = means if means is not None else unit_means(nat)
     mu = MeanUnits(nat, tx.ids, tx.targets, means)
-    goal = kl_target if kl_target is not None else kl_goal(ge, tx)
-    live, rec = build_units(mu, tx.seed, goal)
+    gate = None
+    if shared_floors:
+        vf = ge.vpd_floors(tx, pool, "search")
+        families = [f for f in vf["families"] if f in SHARED and vf["floors"].get(f) is not None]
+        if not families or any(not math.isfinite(vf["floors"][f]) for f in families):
+            raise ValueError("finite nonempty shared search floors required")
+        floors = {f: vf["floors"][f] for f in families}
+        nphi = NativePhi(ge, tx, "search", means=means)
+
+        def gate(live):
+            heads = torch.zeros(mu.L, len(tx.ids), mu.H, dtype=torch.bool, device=mu.dev)
+            neurons = torch.zeros(mu.L, len(tx.ids), mu.Dm, dtype=torch.bool, device=mu.dev)
+            heads[:, :mu.T], neurons[:, :mu.T] = live[0].bool(), live[1].bool()
+            row = nphi.rows([Mask(heads, neurons)])[0]
+            scores = {f: goal_eval.family_score(row, f) for f in families}
+            passed = all(scores[f] is not None and math.isfinite(scores[f]) and scores[f] >= floors[f] for f in families)
+            return {"passed": passed, "scores": scores, "floors": floors, "split": "search",
+                    "point_KL_bits": row.get("kl_point")}
+
+    if kl_target is not None:
+        goal = kl_target
+    elif shared_floors:
+        if "point" not in floors:
+            raise ValueError("shared point floor required to derive the default KL target")
+        goal = kl_goal(ge, tx, f1=floors["point"])
+    else:
+        goal = kl_goal(ge, tx)
+    shared_setup_seconds = time.perf_counter() - native_started
+    live, rec = build_units(mu, tx.seed, goal, admit=gate, max_gate_calls=max_gate_calls)
     del rec["score"], rec["order"]
     Tf = len(tx.ids)
     heads = torch.zeros(mu.L, Tf, mu.H, dtype=torch.bool, device=mu.dev)
@@ -666,6 +773,9 @@ def build_native(ge: goal_eval.GoalEval, tx: goal_eval.Text, kl_target: float | 
     heads[:, :mu.T], neurons[:, :mu.T] = live[0].bool(), live[1].bool()
     S = Mask(heads, neurons)
     rec["positions"] = sorted(set((heads.any(2).any(0) | neurons.any(2).any(0)).nonzero().flatten().tolist()))
+    if shared_floors:
+        rec["shared_setup_seconds"] = shared_setup_seconds
+        rec["native_total_seconds"] = time.perf_counter() - native_started
     if log:
         log(f"  native: {S.count()} units ({rec['heads']} heads, {rec['neurons']} neurons) at {len(rec['positions'])} positions "
             f"of {mu.T}, KL {rec['kl']:.3f} (target {goal:.3f}, empty {rec['kl_empty']:.1f}), {rec['seconds']:.1f} s")

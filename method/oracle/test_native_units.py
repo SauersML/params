@@ -522,3 +522,104 @@ def test_native_point_common_bounds_not_own_empty_or_floored_raw(monkeypatch):
     assert row['s_point_c']==0 and row['_raw_point']<0
     ph.ge._bounds=lambda tx,conv:(.25,.25)
     assert ph.point([mask])[0]['s_point_c'] is None
+
+
+class AdmissionCase:
+    """Deterministic unit-output loss table: isolates admission from ranking noise."""
+    L, T, H, Dm, dev = 1, 1, 1, 7, 'cpu'
+    def __init__(self, empty=1.):
+        self.passes = 0
+        self.empty = empty
+    def kl(self, rows):
+        rows = list(rows)
+        self.passes += len(rows)
+        return [self.empty if sum(int(x.sum()) for x in row)==0 else .01 for row in rows]
+
+
+def admission_fixture(monkeypatch, empty=1.):
+    monkeypatch.setattr(native_units,'fisher',lambda mu,*a,**kw:torch.arange(8.,0.,-1.))
+    return AdmissionCase(empty)
+
+
+def test_shared_admission_nonmonotone_prefix_and_rejected_cleanup(monkeypatch):
+    """3 and6 pass, 4 andallsmaller fail: point-only agreement cannot admit them.
+    Cleanup's point-eligible deletions must not undo a verified shared-family pass."""
+    mu=admission_fixture(monkeypatch)
+    seen=[]
+    def gate(live):
+        count=sum(int(x.sum()) for x in live);seen.append(count)
+        return {'passed':count in (3,6),'shared_score':1. if count in (3,6) else 0.}
+    live,rec=native_units.build_units(mu,0,.1,stages=(1.,),admit=gate,max_gate_calls=16)
+    assert sum(int(x.sum()) for x in live)==3
+    assert rec['admission']['status']=='ADMITTED' and rec['units']==3
+    assert 1 in seen and 2 in seen and 3 in seen
+    # Smaller point-passing cleanup masks were checked/rejected, not silently kept.
+    assert all(x['result']['passed'] is False for x in rec['admission']['evaluations'] if x['units']<3)
+    assert rec['admission']['calls']<=16
+
+
+def test_shared_admission_exhaustion_never_returns_unverified_full(monkeypatch):
+    mu=admission_fixture(monkeypatch)
+    seen=[]
+    def gate(live):
+        seen.append(sum(int(x.sum()) for x in live));return {'passed':False}
+    with pytest.raises(native_units.NoAdmittedCandidate,match='NO_ADMITTED_CANDIDATE') as caught:
+        native_units.build_units(mu,0,.1,stages=(1.,),admit=gate,max_gate_calls=2)
+    record=caught.value.record['admission']
+    assert len(seen)==record['calls']==2
+    assert record['budget_exhausted'] and record['status']=='NO_ADMITTED_CANDIDATE'
+
+
+def test_shared_admission_empty_is_a_real_candidate(monkeypatch):
+    mu=admission_fixture(monkeypatch,empty=0.)
+    live,rec=native_units.build_units(mu,0,.1,admit=lambda m:{'passed':sum(int(x.sum()) for x in m)==0},max_gate_calls=1)
+    assert rec['units']==0 and all(int(x.sum())==0 for x in live)
+    assert rec['admission']['status']=='ADMITTED' and rec['admission']['calls']==1
+
+
+def test_shared_admission_budget_preserves_cached_verified_candidate(monkeypatch):
+    mu=admission_fixture(monkeypatch)
+    def gate(live):return {'passed':sum(int(x.sum()) for x in live)==3}
+    live,rec=native_units.build_units(mu,0,.1,stages=(1.,1.),admit=gate,max_gate_calls=3)
+    assert rec['units']==3 and rec['admission']['calls']==3
+    assert rec['passes_excludes_admission']
+    assert sum(int(x.sum()) for x in live)==3
+
+
+def test_shared_admission_default_and_malformed_results(monkeypatch):
+    mu=admission_fixture(monkeypatch)
+    live,rec=native_units.build_units(mu,0,.1,stages=(1.,))
+    assert rec['units']==1 and 'admission' not in rec
+    for callback in (lambda x:True,lambda x:{'passed':1},lambda x:{'passed':True,'score':float('nan')}):
+        with pytest.raises(ValueError):
+            native_units.build_units(mu,0,.1,stages=(1.,),admit=callback)
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_build_native_shared_gate_uses_common_search_floors(monkeypatch, explicit):
+    """The wrapper reads the same VPD floors and refuses a missing scored family;
+    it cannot lower its own floor or accidentally consume eval draws."""
+    import types
+    mu=AdmissionCase();tx=types.SimpleNamespace(ids=[0],targets=[0],seed=0)
+    calls=[];pool=object();inversions=[]
+    monkeypatch.setattr(native_units,'kl_goal',lambda ge,tx,f1=.9:(inversions.append(f1) or .25))
+    ge=types.SimpleNamespace(nat=object(),vpd_floors=lambda tx,pool_arg,split:(calls.append((pool_arg,split)) or
+        {'families':['point','nodes'],'floors':{'point':.6,'nodes':.7}}))
+    monkeypatch.setattr(native_units,'MeanUnits',lambda *a:mu)
+    class Phi:
+        def __init__(self, ge,tx,split,means):assert split=='search'
+        def rows(self, masks):return [{'s_point_c':.8,'s_nodes':None,'kl_point':.01}]
+    monkeypatch.setattr(native_units,'NativePhi',Phi)
+    def build(mu,seed,goal,**kw):
+        live=(torch.ones(1,1,1),torch.ones(1,1,7))
+        result=kw['admit'](live)
+        assert result['passed'] is False and result['floors']=={'point':.6,'nodes':.7}
+        assert result['scores']['nodes'] is None and result['split']=='search'
+        assert kw['max_gate_calls']==3
+        assert goal==(.1 if explicit else .25)
+        raise native_units.NoAdmittedCandidate({'admission':result})
+    monkeypatch.setattr(native_units,'build_units',build)
+    with pytest.raises(native_units.NoAdmittedCandidate):
+        native_units.build_native(ge,tx,kl_target=.1 if explicit else None,means={},shared_floors=True,pool=pool,max_gate_calls=3)
+    assert calls==[(pool,'search')]
+    assert inversions==([] if explicit else [.6])

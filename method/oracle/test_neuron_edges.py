@@ -108,3 +108,17 @@ def test_route_scores_match_brings(tiny):
         r = e[2]
         want = float(probe[r[0]].grad[r[1], r[2]]) * float(J[r] @ ed.brings(e))
         assert float(rt[i]) == pytest.approx(want, rel=1e-4, abs=1e-7)
+
+
+def test_bfloat16_model(tiny):
+    """A bfloat16 model runs the same stage (each module in bfloat16, float32 between): its contrasts follow the float32
+    model's to bfloat16's precision."""
+    import copy
+    model, ids, neurons = tiny
+    m16 = copy.deepcopy(model).to(torch.bfloat16)
+    e32 = neuron_edges.Edges(model, ids, 9, [3], [5, 7], neurons, background="model")
+    e16 = neuron_edges.Edges(m16, ids, 9, [3], [5, 7], neurons, background="model")
+    cuts = torch.eye(len(e32.resid_all), dtype=torch.bool)[:8]
+    a, b = e32.contrasts(cuts, e32.resid_all), e16.contrasts(cuts, e16.resid_all)
+    assert e16.c_full == pytest.approx(e32.c_full, abs=0.05)
+    assert max(abs(x - y) for x, y in zip(a, b)) < 0.1

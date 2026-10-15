@@ -76,7 +76,7 @@ class Edges:
         self.core, self.layers = core, core.model.layers
         self.L, self.H, self.KV = cfg.num_hidden_layers, cfg.num_attention_heads, cfg.num_key_value_heads
         self.hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
-        self.dev = next(core.parameters()).device
+        self.dev, self.dt = core.model.embed_tokens.weight.device, core.model.embed_tokens.weight.dtype
         self.T = target + 1
         self.ids, self.target, self.answer, self.alternatives = list(ids)[:self.T], target, list(answer), list(alternatives)
         self.thr = None if thr is None else thr.to(self.dev, torch.float32)
@@ -94,18 +94,35 @@ class Edges:
             self.base = self._run(torch.zeros(1, 0, dtype=torch.bool), [], keep_states=True)
         self.c_full = float(self.base["contrast"][0])
 
-    # -- the run ----------------------------------------------------------------------------------------------------
+    # -- the run (each module in the model's dtype on its own card, everything between in float32) -------------------
+
+    def _d(self, L: int) -> torch.device:
+        """Layer L's card (a model split over cards: device_map)."""
+        return self.layers[L].input_layernorm.weight.device
+
+    @staticmethod
+    def _f(mod, t: torch.Tensor) -> torch.Tensor:
+        """mod on t in mod's dtype on mod's card, the result in float32."""
+        w = next(mod.parameters())
+        return mod(t.to(w.device, w.dtype)).float()
+
+    @staticmethod
+    def _w(mod, rows=None, cols=None) -> torch.Tensor:
+        """A slice of a linear module's effective weight in float32 (rows and cols index it)."""
+        W = weight(mod)
+        W = W if rows is None else W[rows]
+        return (W if cols is None else W[:, cols]).float()
 
     def _mlp_act(self, layer, x: torch.Tensor) -> torch.Tensor:
-        """The neurons' activations from a pre-norm stream x [..., d]: act(gate(norm x)) * up(norm x)."""
-        n = layer.post_attention_layernorm(x)
-        return layer.mlp.act_fn(layer.mlp.gate_proj(n)) * layer.mlp.up_proj(n)
+        """The neurons' activations from a pre-norm stream x [..., d]: act(gate(norm x)) * up(norm x), in float32."""
+        n = self._f(layer.post_attention_layernorm, x)
+        return layer.mlp.act_fn(self._f(layer.mlp.gate_proj, n)) * self._f(layer.mlp.up_proj, n)
 
     def _weak(self, L: int, h: torch.Tensor, js: torch.Tensor | None = None) -> torch.Tensor:
         """h with the activations under their weak threshold zeroed (js: the neurons h holds, else every one)."""
         if self.thr is None:
             return h
-        t = self.thr[L] if js is None else self.thr[L][js]
+        t = (self.thr[L] if js is None else self.thr[L][js.to(self.thr.device)]).to(h.device)
         return h * (h.abs() >= t)
 
     def _plan(self, edges: list) -> dict:
@@ -113,13 +130,13 @@ class Edges:
         hit = self._plans.get(id(edges))
         if hit is not None and hit[0] is edges:
             return hit[1]
-        dev, resid, route = self.dev, {}, {}
+        resid, route = {}, {}
         for e, ed in enumerate(edges):
             if len(ed) == 2:
                 resid.setdefault(ed[0][0], []).append((e, self.at[ed[0]], self.at[ed[1]]))
             else:
                 route.setdefault(ed[1], []).append((e, self.at[ed[0]], self.at[ed[2]]))
-        t = lambda xs: tuple(torch.tensor([x[i] for x in xs], dtype=torch.long, device=dev) for i in range(3))  # noqa: E731
+        t = lambda xs: tuple(torch.tensor([x[i] for x in xs], dtype=torch.long) for i in range(3))  # noqa: E731
         plan = {"resid": {L: t(v) for L, v in resid.items()}, "route": {k: t(v) for k, v in route.items()}, "heads": {}}
         for c, h in route:
             plan["heads"].setdefault(c, []).append(h)
@@ -130,26 +147,27 @@ class Edges:
         """The contrast of each row of cuts [K, len(edges)]. probe: per layer a tensor [T, d_mlp] added to the neurons'
         activations (zeros requiring grad: the contrast's gradient at them)."""
         from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv
-        core, dev, H, KV, hd, T = self.core, self.dev, self.H, self.KV, self.hd, self.T
+        core, H, KV, hd, T, f = self.core, self.H, self.KV, self.hd, self.T, self._f
         K = max(cuts.shape[0], 1)
-        cuts = cuts.to(dev).float() if len(edges) else torch.zeros(K, 0, device=dev)
+        cuts = cuts.float() if len(edges) else torch.zeros(K, 0)
         plan = self._plan(edges)
-        x = core.model.embed_tokens(torch.tensor([self.ids], device=dev).expand(K, -1)).float()
-        cos, sin = core.model.rotary_emb(x, torch.arange(T, device=dev)[None])
-        causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
-        D = torch.zeros(K, len(self.N), x.shape[-1], device=dev)  # per circuit neuron, what its cut edges took away
-        Wr = torch.zeros(K, len(self.N), x.shape[-1], device=dev)  # each circuit neuron's write in this run
-        P = torch.tensor([n[1] for n in self.N], dtype=torch.long, device=dev)
-        Jn = torch.tensor([n[2] for n in self.N], dtype=torch.long, device=dev)
-        kk = torch.arange(K, device=dev)
+        x = core.model.embed_tokens(torch.tensor([self.ids], device=self.dev).expand(K, -1)).float()
+        cos, sin = core.model.rotary_emb(x, torch.arange(T, device=self.dev)[None])
+        D = torch.zeros(K, len(self.N), x.shape[-1])  # per circuit neuron, what its cut edges took away
+        Wr = torch.zeros(K, len(self.N), x.shape[-1])  # each circuit neuron's write in this run
+        P = torch.tensor([n[1] for n in self.N], dtype=torch.long)
+        Jn = torch.tensor([n[2] for n in self.N], dtype=torch.long)
         states = {"x": [], "A": [], "v": [], "h": []}
         for L, layer in enumerate(self.layers):
+            d = self._d(L)  # (every tensor of this layer's work on its card)
+            x, D, Wr, cuts, P, Jn, cos, sin = (t.to(d) for t in (x, D, Wr, cuts, P, Jn, cos, sin))
+            kk, causal = torch.arange(K, device=d), torch.ones(T, T, dtype=torch.bool, device=d).tril()
             at = layer.self_attn
-            hn = layer.input_layernorm(x)
-            q = at.q_norm(at.q_proj(hn).view(K, T, H, hd)).transpose(1, 2)
-            k = at.k_norm(at.k_proj(hn).view(K, T, KV, hd)).transpose(1, 2)
-            v = at.v_proj(hn).view(K, T, KV, hd).transpose(1, 2)  # [K, KV, T, hd]
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            hn = f(layer.input_layernorm, x)
+            q = f(at.q_norm, f(at.q_proj, hn).view(K, T, H, hd)).transpose(1, 2)
+            k = f(at.k_norm, f(at.k_proj, hn).view(K, T, KV, hd)).transpose(1, 2)
+            v = f(at.v_proj, hn).view(K, T, KV, hd).transpose(1, 2)  # [K, KV, T, hd]
+            q, k = apply_rotary_pos_emb(q, k, cos.float(), sin.float())
             A = ((q @ repeat_kv(k, H // KV).transpose(-1, -2)) * at.scaling).masked_fill(~causal, float("-inf")).softmax(-1)
             z = A @ repeat_kv(v, H // KV)  # [K, H, T, hd]
             if keep_states:
@@ -157,34 +175,33 @@ class Edges:
                 states["A"].append(A[0].detach())
                 states["v"].append(v[0].detach())
             if plan["heads"].get(L):  # routes through this layer's heads: the head's output change at the reader
-                Wo = weight(at.o_proj).view(-1, H, hd)
                 for h in plan["heads"][L]:
-                    es, wi, ri = plan["route"][(L, h)]
+                    es, wi, ri = (t.to(d) for t in plan["route"][(L, h)])
                     kv = h // (H // KV)
                     xw = x[:, P[wi]] - Wr[:, wi]  # [K, E, d]: the head's input at the writer, its write taken out
-                    vw = at.v_proj(layer.input_layernorm(xw)).view(K, -1, KV, hd)[:, :, kv]
+                    vw = f(at.v_proj, f(layer.input_layernorm, xw)).view(K, -1, KV, hd)[:, :, kv]
                     dz = A[:, h][kk[:, None], P[ri][None], P[wi][None]][..., None] * (v[:, kv][:, P[wi]] - vw)
-                    D = D.index_add(1, ri, cuts[:, es, None] * (dz @ Wo[:, h].T))
-            x = x + at.o_proj(z.transpose(1, 2).reshape(K, T, H * hd))
+                    D = D.index_add(1, ri, cuts[:, es, None] * (dz @ self._w(at.o_proj, cols=slice(h * hd, (h + 1) * hd)).T))
+            x = x + f(at.o_proj, z.transpose(1, 2).reshape(K, T, H * hd))
             hm = self._weak(L, self._mlp_act(layer, x))
             if self.background == "circuit":
-                hm = hm * self.keep[L][None]
-            rs = torch.tensor([i for i, n in enumerate(self.N) if n[0] == L], dtype=torch.long, device=dev)
+                hm = hm * self.keep[L].to(d)[None]
+            rs = torch.tensor([i for i, n in enumerate(self.N) if n[0] == L], dtype=torch.long, device=d)
             if len(rs) and len(edges):  # the circuit's neurons of this layer, each from its own input
                 hr = self._mlp_act(layer, x[:, P[rs]] - D[:, rs]).gather(-1, Jn[rs][None, :, None].expand(K, -1, 1))[..., 0]
                 hm = hm.index_put((kk[:, None], P[rs][None], Jn[rs][None]), self._weak(L, hr, Jn[rs]))
             if probe is not None:
-                hm = hm + probe[L][None]
+                hm = hm + probe[L].to(d)[None]
             if keep_states:
                 states["h"].append(hm[0].detach())
             if len(rs):
-                Wd = weight(layer.mlp.down_proj)
-                Wr = Wr.index_add(1, rs, hm[kk[:, None], P[rs][None], Jn[rs][None]][..., None] * Wd[:, Jn[rs]].T[None])
+                Wd = self._w(layer.mlp.down_proj, cols=Jn[rs])  # [d, R]
+                Wr = Wr.index_add(1, rs, hm[kk[:, None], P[rs][None], Jn[rs][None]][..., None] * Wd.T[None])
             if L in plan["resid"]:
-                es, wi, ri = plan["resid"][L]
+                es, wi, ri = (t.to(d) for t in plan["resid"][L])
                 D = D.index_add(1, ri, cuts[:, es, None] * Wr[:, wi])
-            x = x + layer.mlp.down_proj(hm)
-        lp = torch.log_softmax(core.lm_head(core.model.norm(x[:, self.target])).float(), -1)
+            x = x + f(layer.mlp.down_proj, hm)
+        lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target])), -1).cpu()
         out = {"contrast": log2_contrast(lp, self.answer, self.alternatives), "lp": lp}
         if keep_states:
             out.update(states)
@@ -201,13 +218,14 @@ class Edges:
     # -- the candidates' linear effects -----------------------------------------------------------------------------
 
     def _mid_stream(self, L: int) -> torch.Tensor:
-        """The base run's stream entering layer L's MLP [T, d]."""
+        """The base run's stream entering layer L's MLP [T, d] (on layer L's card)."""
         at = self.layers[L].self_attn
         z = self.base["A"][L] @ self.base["v"][L].repeat_interleave(self.H // self.KV, 0)  # [H, T, hd]
-        return self.base["x"][L] + at.o_proj(z.transpose(0, 1).reshape(self.T, -1))
+        return self.base["x"][L] + self._f(at.o_proj, z.transpose(0, 1).reshape(self.T, -1))
 
     def jacobians(self) -> dict:
-        """Each circuit neuron's activation's gradient with respect to its MLP input in the base run [d] (kept)."""
+        """Each circuit neuron's activation's gradient with respect to its MLP input in the base run [d] (kept; on
+        its layer's card)."""
         if getattr(self, "_J", None) is None:
             J = {}
             for L in range(self.L):
@@ -215,32 +233,37 @@ class Edges:
                 if rs:
                     with torch.enable_grad():
                         xin = self._mid_stream(L)[[n[1] for n in rs]].detach().requires_grad_()
-                        h = self._mlp_act(self.layers[L], xin).gather(-1, torch.tensor([[n[2]] for n in rs], device=self.dev))[:, 0]
+                        h = self._mlp_act(self.layers[L], xin).gather(-1, torch.tensor([[n[2]] for n in rs], device=xin.device))[:, 0]
                         (g,) = torch.autograd.grad(h.sum(), xin)
                     J.update(dict(zip(rs, g)))
             self._J = J
         return self._J
 
+    def _write(self, w) -> torch.Tensor:
+        """A circuit neuron's write in the base run [d] (on its layer's card)."""
+        return self.base["h"][w[0]][w[1], w[2]] * self._w(self.layers[w[0]].mlp.down_proj, cols=w[2])
+
     @torch.no_grad()
     def brings(self, edge) -> torch.Tensor:
-        """What an edge brings into its reader's MLP input in the base run [d]: the writer's write (resid), or the
-        change in the head's output at the reader's position from the writer's write at its own (route)."""
-        w = edge[0]
-        write = self.base["h"][w[0]][w[1], w[2]] * weight(self.layers[w[0]].mlp.down_proj)[:, w[2]]
+        """What an edge brings into its reader's MLP input in the base run [d] (on the reader's card): the writer's
+        write (resid), or the change in the head's output at the reader's position from the writer's write at its own
+        (route)."""
+        w, r = edge[0], edge[-1]
+        write = self._write(w)
         if len(edge) == 2:
-            return write
-        (c, h), r = edge[1], edge[2]
-        layer, kv = self.layers[c], h // (self.H // self.KV)
-        vw = layer.self_attn.v_proj(layer.input_layernorm(self.base["x"][c][w[1]] - write)).view(self.KV, self.hd)[kv]
+            return write.to(self._d(r[0]))
+        c, h = edge[1]
+        layer, kv, hd = self.layers[c], h // (self.H // self.KV), self.hd
+        dc = self._d(c)
+        vw = self._f(layer.self_attn.v_proj, self._f(layer.input_layernorm, self.base["x"][c][w[1]] - write.to(dc))).view(self.KV, hd)[kv]
         dz = self.base["A"][c][h, r[1], w[1]] * (self.base["v"][c][kv, w[1]] - vw)
-        return weight(layer.self_attn.o_proj)[:, h * self.hd:(h + 1) * self.hd] @ dz
+        return (self._w(layer.self_attn.o_proj, cols=slice(h * hd, (h + 1) * hd)) @ dz).to(self._d(r[0]))
 
     def linear_scores(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(resid scores, route scores) over resid_all and route_all: each edge's linear effect on the contrast, the
         contrast's gradient at the reader's activation times the reader's input Jacobian times what the edge brings
         (the contrast it supports: positive when its cut lowers the contrast)."""
-        dev = self.dev
-        probe = [torch.zeros(self.T, self.keep.shape[-1], device=dev, requires_grad=True) for _ in range(self.L)]
+        probe = [torch.zeros(self.T, self.keep.shape[-1], device=self._d(L), requires_grad=True) for L in range(self.L)]
         with torch.enable_grad():
             self._run(torch.zeros(1, 0, dtype=torch.bool), [], probe=probe)["contrast"].sum().backward()
         grad = {n: float(probe[n[0]].grad[n[1], n[2]]) for n in self.N}
@@ -248,26 +271,26 @@ class Edges:
         H, KV, hd, base = self.H, self.KV, self.hd, self.base
         with torch.no_grad():
             rs_s = torch.tensor([grad[r] * float(J[r] @ self.brings(e)) for e in self.resid_all for r in [e[1]]])
-            Js = torch.stack([J[n] for n in self.N])  # [N, d]
-            G = torch.tensor([grad[n] for n in self.N], device=self.dev)
-            kvh = torch.arange(H, device=self.dev) // (H // KV)
+            G = torch.tensor([grad[n] for n in self.N])
             got = {}
             for c in range(1, self.L):  # per head layer: each reader's input direction through each head's o_proj
-                layer = self.layers[c]
-                U = torch.einsum("nd,dhk->nhk", Js, weight(layer.self_attn.o_proj).view(-1, H, hd))  # [N, H, hd]
+                layer, dc = self.layers[c], self._d(c)
+                Js = torch.stack([J[n].to(dc) for n in self.N])  # [N, d]
+                U = torch.einsum("nd,dhk->nhk", Js, self._w(layer.self_attn.o_proj).view(-1, H, hd))  # [N, H, hd]
+                kvh = torch.arange(H, device=dc) // (H // KV)
                 for w in self.N:
                     if w[0] >= c:
                         continue
                     rd = [i for i, r in enumerate(self.N) if r[0] >= c and r[1] >= w[1]]
                     if not rd:
                         continue
-                    write = base["h"][w[0]][w[1], w[2]] * weight(self.layers[w[0]].mlp.down_proj)[:, w[2]]
-                    vw = layer.self_attn.v_proj(layer.input_layernorm(base["x"][c][w[1]] - write)).view(KV, hd)
+                    xw = base["x"][c][w[1]] - self._write(w).to(dc)
+                    vw = self._f(layer.self_attn.v_proj, self._f(layer.input_layernorm, xw)).view(KV, hd)
                     dv = (base["v"][c][:, w[1]] - vw)[kvh]  # [H, hd]
-                    ri = torch.tensor(rd, device=self.dev)
-                    q = torch.tensor([self.N[i][1] for i in rd], device=self.dev)
+                    ri = torch.tensor(rd, device=dc)
+                    q = torch.tensor([self.N[i][1] for i in rd], device=dc)
                     a = base["A"][c][:, q, w[1]].T  # [R, H]
-                    sc = G[ri, None] * a * torch.einsum("rhk,hk->rh", U[ri], dv)
+                    sc = (G.to(dc)[ri, None] * a * torch.einsum("rhk,hk->rh", U[ri], dv)).cpu()
                     for k, i in enumerate(rd):
                         for h in range(H):
                             got[(w, (c, h), self.N[i])] = float(sc[k, h])
@@ -353,27 +376,27 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
     nodes = []
     for L, p, j in ed.N:
         layer = ed.layers[L]
-        n = layer.post_attention_layernorm(ed._mid_stream(L)[p])
-        g, u = float(layer.mlp.gate_proj(n)[j]), float(layer.mlp.up_proj(n)[j])
+        n = ed._f(layer.post_attention_layernorm, ed._mid_stream(L)[p])
+        g, u = float(ed._f(layer.mlp.gate_proj, n)[j]), float(ed._f(layer.mlp.up_proj, n)[j])
         a = float(ed.base["h"][L][p, j])
         nodes.append({"id": len(nodes), "layer": L, "neuron": j, "pos": p, "act": a, "pole": 1 if a >= 0 else -1,
                       "regime": f"g{'+' if g >= 0 else '-'}u{'+' if u >= 0 else '-'}"})
     out, J = [], ed.jacobians()
     for e, st in zip(got["edges"], got["strengths"]):
         w, r = e[0], e[-1]
-        col = weight(ed.layers[w[0]].mlp.down_proj)[:, w[2]]
+        col = ed._w(ed.layers[w[0]].mlp.down_proj, cols=w[2])
         if len(e) == 3:  # through the head's OV
             c, h = e[1]
-            at, kv = ed.layers[c].self_attn, h // (ed.H // ed.KV)
-            vw = weight(at.v_proj).view(ed.KV, ed.hd, -1)[kv] @ (ed.layers[c].input_layernorm.weight * col)
-            col = weight(at.o_proj)[:, h * ed.hd:(h + 1) * ed.hd] @ vw
+            at, kv, dc = ed.layers[c].self_attn, h // (ed.H // ed.KV), ed._d(c)
+            vw = ed._w(at.v_proj).view(ed.KV, ed.hd, -1)[kv] @ (ed.layers[c].input_layernorm.weight.float() * col.to(dc))
+            col = ed._w(at.o_proj, cols=slice(h * ed.hd, (h + 1) * ed.hd)) @ vw
         layer = ed.layers[r[0]]
-        wn = layer.post_attention_layernorm.weight * col
+        wn = layer.post_attention_layernorm.weight.float() * col.to(ed._d(r[0]))
         eff = float(J[r] @ ed.brings(e))  # the edge's linear push on the reader's activation in the run
         pole = nodes[ed.at[r]]["pole"]
         out.append({"src": ed.at[w], "dst": ed.at[r], "kind": "resid" if len(e) == 2 else "route",
                     "head": list(e[1]) if len(e) == 3 else None, "src_pos": w[1], "dst_pos": r[1],
-                    "w_gate": float(weight(layer.mlp.gate_proj)[r[2]] @ wn), "w_up": float(weight(layer.mlp.up_proj)[r[2]] @ wn),
+                    "w_gate": float(ed._w(layer.mlp.gate_proj, rows=r[2]) @ wn), "w_up": float(ed._w(layer.mlp.up_proj, rows=r[2]) @ wn),
                     "push": eff, "excites": (eff >= 0) == (pole > 0), "share": abs(eff) / max(abs(nodes[ed.at[r]]["act"]), 1e-9),
                     "strength": st})
     txt = {} if tok is None else {"tokens": [tok.decode([i]) for i in ed.ids], "answer_text": tok.decode(ed.answer),
@@ -388,6 +411,15 @@ def graph(ed: Edges, got: dict, tok=None) -> dict:
                                     "full_causal_completeness_certified": False}}
 
 
+def load(name: str, device: str | None = None, dtype: str = "float32"):
+    """An HF causal LM for the stage: float32 on one card, or bfloat16 split over every card (device_map auto)."""
+    import transformers
+    if dtype == "bfloat16":
+        return transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="auto").eval()
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    return transformers.AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).to(dev).eval()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=("one",))
@@ -396,10 +428,11 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--device", default=None)
     ap.add_argument("--background", default="circuit", choices=("circuit", "model"))
+    ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"), help="the model's weights (bfloat16: 32B "
+                    "over two cards, device_map auto)")
     a = ap.parse_args()
     import transformers
-    dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = transformers.AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.float32).to(dev).eval()
+    model = load(a.model, a.device, a.dtype)
     t = json.loads(a.text.read_text())
     ed = Edges(model, t["ids"], t["target"], t["answer"], t["alternatives"], [tuple(n) for n in t["neurons"]],
                background=a.background)

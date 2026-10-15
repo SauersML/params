@@ -3,6 +3,7 @@ against the model's next likeliest tokens, a circuit of the top neurons by |acti
 position, then the edges, the pruning and the graph (OUT/<i>.json), the seconds per stage printed.
 
   python experiments/oracle/neuron_edges_dev.py MODEL OUT_DIR [--k 32] [--background model] [--device cuda]
+                                                [--dtype bfloat16]   (bfloat16: split over every card)
 """
 import argparse
 import json
@@ -39,7 +40,7 @@ def top_neurons(model, ids: list[int], target: int, answer: list[int], alts: lis
     finally:
         for h in hs:
             h.remove()
-    sc = torch.stack([(acts[L][0] * acts[L].grad[0]).abs() for L in range(len(acts))])  # [L, T, d_mlp]
+    sc = torch.stack([(acts[L][0] * acts[L].grad[0]).abs().float().cpu() for L in range(len(acts))])  # [L, T, d_mlp]
     _, T, Dm = sc.shape
     return [(int(i // (T * Dm)), int((i // Dm) % T), int(i % Dm)) for i in torch.topk(sc.flatten(), k).indices.tolist()]
 
@@ -51,11 +52,12 @@ def main():
     ap.add_argument("--k", type=int, default=32)
     ap.add_argument("--background", default="model", choices=("model", "circuit"))
     ap.add_argument("--device", default=None)
+    ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     a = ap.parse_args()
     import transformers
-    dev = a.device or ("cuda" if torch.cuda.is_available() else "cpu")
     tok = transformers.AutoTokenizer.from_pretrained(a.model)
-    model = transformers.AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.float32).to(dev).eval()
+    model = ne.load(a.model, a.device, a.dtype)
+    dev = model.model.embed_tokens.weight.device
     a.out.mkdir(parents=True, exist_ok=True)
     for i, (prompt, answer_text) in enumerate(PROMPTS):
         t0 = time.time()

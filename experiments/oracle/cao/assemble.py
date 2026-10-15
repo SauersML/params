@@ -7,6 +7,10 @@ checks), with the label mix printed before and after.
                kept at most ABSTAIN_MAX of the category, the rest dropped at random (above that the oracle learns that
                abstaining is safe; the kept ones teach calibration).
   swap, edit   unchanged answers kept at most UNCHANGED_MAX of the category (the measured rates were 80% and 85%).
+  Balancing applies only to TRAIN rows (remapped text ID % 50 != 0). Validation
+  rows bypass all answer-dependent caps. This does not undo the separate question
+  normalization/ambiguous-pair filter above; validation is not an unfiltered population.
+  Historical assembled datasets are not rewritten by this future-assembly change.
   replay       as many LatentQA examples as causal ones, at most the file's.
 Examples written by gen after this change already carry positions; they are passed through.
 
@@ -54,6 +58,17 @@ def cap(rows: list[dict], bad, share: float, rng: random.Random) -> list[dict]:
     return good + worse[:keep]
 
 
+def cap_training(rows: list[dict], bad, share: float, rng: random.Random) -> list[dict]:
+    """Balance TRAIN only, using the already remapped text IDs authoritative to training.
+
+    Validation membership never depends on its answers, nor consumes balancing RNG.
+    Earlier normalization and ambiguous-question filters remain separate.
+    """
+    train = [r for r in rows if r["text"] % 50 != 0]
+    validation = [r for r in rows if r["text"] % 50 == 0]
+    return cap(train, bad, share, rng) + validation
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("out", type=Path)
@@ -99,12 +114,12 @@ def main():
             if r["a"] != NONE:  # (the answer is the winner's quoted string, as the question quotes it)
                 r["a"] = f"{r['a']} at position {p1 if r['a'] == chr(39) + s1 + chr(39) else p2}."
         by[r["cat"]].append(r)
-    by["which"] = cap(by["which"], lambda r: r["a"] == NONE, ABSTAIN_MAX, rng)
-    by["pair"] = cap(by["pair"], lambda r: r["a"] == NONE, ABSTAIN_MAX, rng)
-    by["swap"] = cap(by["swap"], lambda r: r["a"] == "No.", UNCHANGED_MAX, rng)
-    by["edit"] = cap(by["edit"], lambda r: r["a"].startswith("Unchanged"), UNCHANGED_MAX, rng)
+    by["which"] = cap_training(by["which"], lambda r: r["a"] == NONE, ABSTAIN_MAX, rng)
+    by["pair"] = cap_training(by["pair"], lambda r: r["a"] == NONE, ABSTAIN_MAX, rng)
+    by["swap"] = cap_training(by["swap"], lambda r: r["a"] == "No.", UNCHANGED_MAX, rng)
+    by["edit"] = cap_training(by["edit"], lambda r: r["a"].startswith("Unchanged"), UNCHANGED_MAX, rng)
     causal = [r for v in by.values() for r in v]
-    print("after", json.dumps(mix(causal)), f"(pairs dropped for a recurring named token: {dropped})")
+    print("after (TRAIN caps only; validation bypasses caps)", json.dumps(mix(causal)), f"(pairs dropped for a recurring named token: {dropped})")
     replay = a.replay.read_text().splitlines()
     rng.shuffle(replay)
     replay = replay[:len(causal)]

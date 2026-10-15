@@ -464,3 +464,61 @@ def test_build_hf(tiny_hf):
     assert 0 < len(rec["units"]) < rec["of"] and all(u[4] is not None for u in rec["units"][:4]) and rec["units"][4][4] is None
     cheap = native_units.build_hf(model, ids, 9, kl_target=empty * 0.05, means=means, budget_passes=256)
     assert cheap["passes"] <= 256 and cheap["kl"] <= cheap["kl_target"]
+
+
+@pytest.mark.parametrize("fill", [None, "nonzero_mean"])
+def test_native_point_common_bounds_physical_and_vpd_score(tiny, phi_text, monkeypatch, fill):
+    """A physically executed nontrivial native circuit receives exactly the VPD point
+    calibration for the SAME measured output distribution; its own ablated-empty
+    baseline cannot alter that credit. This tests scoring, not a representation
+    equivalence between neuron masks and rank-one masks."""
+    nat, ids, targets, nu = tiny
+    ge, tx = phi_text
+    means = None
+    if fill is not None:
+        g = torch.Generator().manual_seed(17)
+        means = {"heads": torch.randn(nu.L,nu.H,nat.target.hd,generator=g)*.3,
+                 "neurons": torch.rand(nu.L,nu.Dm,generator=g)*.2}
+    ph = native_units.NativePhi(ge,tx,means=means)
+    mask = random_mask(nu,17,keep=.4)
+    # Actual own-routing/norm graph execution and an independent direct-W hook.
+    q = ge.graph_ref(ids,targets,ph.model,units=ph._units([~mask.heads],[~mask.neurons],ph._ablate(len(ids))))
+    expected_q = site_hooked(nat,ids,targets,mask) if means is None else mean_hooked(nat,ids,targets,(mask.heads.float(),mask.neurons.float()),means)
+    assert torch.allclose(q,expected_q,atol=1e-4)
+    common = ge._bounds(tx,"live")
+    monkeypatch.setattr(ph,"empty",lambda: pytest.fail("point must not read the native own-empty baseline"))
+    native_row = ph.point([mask])[0]
+    kc = float(carry.kl(tx.ref,q)[0])
+    assert abs(native_row['kl_point']-kc)<1e-6
+    # Feed this identical physically measured q through the existing VPD point
+    # scorer. Only candidate execution is substituted, never bounds/formulas.
+    monkeypatch.setattr(ge,"runs",lambda *args,**kwargs:q)
+    vpd_row = ge.sufficiency(tx,[native.Graph([],complete=True)],conventions=('live',),vpd_minus=False)[0]
+    assert abs(vpd_row['kl_live']-native_row['kl_point'])<1e-6
+    assert native_row['s_point_c']==vpd_row['f1_live']
+    assert native_row['_raw_point']==goal_eval._fid_raw(common[0],kc,common[1])
+    wrapped = {'s_point_c':native_row['s_point_c'],'rl_terms':{'s_point_c':native_row['_raw_point']}}
+    expected = {'s_point_c':vpd_row['f1_live'],'rl_terms':{'s_point_c':goal_eval._fid_raw(common[0],vpd_row['kl_live'],common[1])}}
+    assert goal_eval.family_score(wrapped,'point')==goal_eval.family_score(expected,'point')
+
+
+def test_native_point_common_bounds_not_own_empty_or_floored_raw(monkeypatch):
+    """Nontrivial physical distributions exercise interior and negative recovery;
+    an unrelated native empty value must not erase/floor these gradients."""
+    import types
+    ph = object.__new__(native_units.NativePhi)
+    p = torch.tensor([[[0.,0.]]]).log_softmax(-1)
+    q = torch.tensor([[[4.,0.]]]).log_softmax(-1)
+    tx = types.SimpleNamespace(ids=[0],targets=[0],ref=p,T=1)
+    ph.tx=tx;ph.model=native.Graph();ph.means=None
+    ph.ge=types.SimpleNamespace(_bounds=lambda tx,conv:(4.,.25),graph_ref=lambda *a,**kw:q)
+    ph._units=lambda *a:None
+    ph.empty=lambda:pytest.fail('common point must ignore native empty cache')
+    mask=native_units.Mask(torch.ones(1,1,1,dtype=torch.bool),torch.ones(1,1,1,dtype=torch.bool))
+    row=ph.point([mask])[0];kc=float(carry.kl(p,q)[0])
+    assert 0<row['s_point_c']<1 and row['_raw_point']==goal_eval._fid_raw(4.,kc,.25)
+    ph.ge._bounds=lambda tx,conv:(.5,.25)
+    row=ph.point([mask])[0]
+    assert row['s_point_c']==0 and row['_raw_point']<0
+    ph.ge._bounds=lambda tx,conv:(.25,.25)
+    assert ph.point([mask])[0]['s_point_c'] is None

@@ -1160,8 +1160,8 @@ class NativePhi:
     other unit, a head with its query, key and value, is held at its value on x or on the donor, the circuit's units
     computing from the stream. Each draw's reference is VPD's whole answer under the same intervention, with the same
     draws as VPD's families (the text's changed texts, donors and controls; for removals and holds of native units,
-    VPD's answer with those units removed or held); each bound the native circuit's own (its empty circuit, the
-    embedding alone; keep-nothing, every unit at the donor's). Rows carry the families' VPD-form records, rl_terms
+    VPD's answer with those units removed or held); point uses VPD's common live empty/whole-answer bounds (equal KL gets equal point credit across unit kinds);
+    other families retain their native own-run bounds (output-zero/mean empty or donor). Rows carry the families' VPD-form records, rl_terms
     (each without the floor at 0, as phi reads them) and eps. means (unit_means): the C-semantics families and the
     removals mean-ablate a unit instead of zeroing it (the bake-off's native semantics, the lead's 10-14; a head's output
     alone, its query, key and value its own)."""
@@ -1217,8 +1217,9 @@ class NativePhi:
 
     def point(self, sets: list[Mask]) -> list[dict]:
         tx = self.tx
-        e0 = self.empty()
-        v0 = self.ge._bounds(tx, "live")[1]
+        # The scorecard compares unit kinds at the same absolute output accuracy.
+        # Own mean/zero-empty baselines remain diagnostics for other families.
+        e0, v0 = self.ge._bounds(tx, "live")
         lq = self.ge.graph_ref(tx.ids, tx.targets, self.model, units=self._units([~S.heads for S in sets], [~S.neurons for S in sets], self._ablate(tx.T)))
         out = []
         for k in self._kl(tx.ref, lq):

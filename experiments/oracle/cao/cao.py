@@ -48,7 +48,7 @@ NONE = "No clear answer."
 CLEAR = 1.5  # the winner's effect over the runner-up's for a clear answer
 SWAPS_PER_TEXT, PAIRS_PER_TEXT, EDITS_PER_TEXT = 12, 4, 3
 UNITS_EVERY = 4  # one text in UNITS_EVERY gets the heads question (448 removals)
-LR, BATCH, MAX_NEW = 1e-5, 16, 24
+LR, BATCH, MICRO, MAX_NEW = 1e-5, 16, 4, 24
 
 
 def q_tok(s: str) -> str:
@@ -134,8 +134,10 @@ class Oracle:
 
         return self.layers[1].register_forward_hook(fn)
 
-    def batch_loss(self, exs: list[dict]):
-        """Mean cross entropy of the answers' tokens (right-padded batch)."""
+    def batch_loss(self, exs: list[dict], reduce: bool = True):
+        """Mean cross entropy of the answers' tokens (right-padded batch), the unembedding applied at the answer
+        positions alone (every position's logits for a 16 x 600-token batch took more than the 24 GB card's memory);
+        reduce False: (summed loss, token count) for accumulation over micro-batches."""
         torch = self.torch
         enc = [self.encode(e, True) for e in exs]
         vecs = [self.vectors(e) for e in exs]
@@ -150,9 +152,14 @@ class Oracle:
             lab[b, a0:len(i)] = torch.tensor(i[a0:], device=self.dev)
         h = self.hook(vecs, [p for _, p, _ in enc])
         try:
-            return self.m(input_ids=ids, attention_mask=att, labels=lab).loss
+            hid = self.lm.model(input_ids=ids, attention_mask=att).last_hidden_state
         finally:
             h.remove()
+        sel = lab[:, 1:] != -100  # position t predicts token t + 1
+        logits = self.lm.lm_head(hid[:, :-1][sel]).float()
+        tot = torch.nn.functional.cross_entropy(logits, lab[:, 1:][sel], reduction="sum")
+        n = int(sel.sum())
+        return tot / max(n, 1) if reduce else (tot, n)
 
     def answer(self, ex: dict) -> str:
         torch = self.torch
@@ -383,6 +390,7 @@ def train(a) -> None:
     rng = random.Random(0)
     rng.shuffle(rows)
     o = Oracle(AO if not a.init else a.init, a.device, trainable=True)
+    o.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     opt = torch.optim.AdamW([p for p in o.m.parameters() if p.requires_grad], lr=LR)
     steps = a.steps or len(rows) // BATCH
     a.out.mkdir(parents=True, exist_ok=True)
@@ -390,13 +398,20 @@ def train(a) -> None:
     t0 = time.time()
     for s in range(steps):
         batch = [rows[(s * BATCH + i) % len(rows)] for i in range(BATCH)]
-        loss = o.batch_loss(batch)
-        loss.backward()
+        tot, n = 0.0, 0
+        for k in range(0, BATCH, MICRO):  # micro-batches, each backward at once; the gradient is the batch's token mean
+            t, c = o.batch_loss(batch[k:k + MICRO], reduce=False)
+            t.backward()
+            tot, n = tot + float(t), n + c
+        for p in o.m.parameters():
+            if p.grad is not None:
+                p.grad /= max(n, 1)
+        loss = tot / max(n, 1)
         torch.nn.utils.clip_grad_norm_(o.m.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
         if s % 50 == 0:
-            print(json.dumps({"step": s, "loss": round(float(loss), 4), "seconds": round(time.time() - t0, 1)}), flush=True)
+            print(json.dumps({"step": s, "loss": round(loss, 4), "seconds": round(time.time() - t0, 1)}), flush=True)
         if (s + 1) % a.save_every == 0 or s + 1 == steps:
             o.m.save_pretrained(a.out / f"step_{s + 1}")
     print(f"saved {a.out}")

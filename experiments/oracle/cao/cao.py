@@ -31,6 +31,7 @@ import argparse
 import json
 import math
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -376,29 +377,47 @@ def train(a) -> None:
 
 
 def eval_items(a) -> None:
-    """The gate's questions (h2h items) asked of an oracle (adapter) in this oracle's format; with --text-only, the
-    same oracle with no vector added."""
+    """The gate's questions (h2h items) asked of an oracle (adapter) in this oracle's format, every answer's truth
+    measured on the model: (a) the token (greedy answer), (b) each swap (greedy: "No." or the new token), (c) each pair
+    and the facts battery (the more probable of the two options, its probability the confidence). The facts category
+    is never trained on: a held-out category. With --text-only, the same oracle with no vector added."""
     o = Oracle(a.adapter, a.device)
     o.text_only = a.text_only
-    items = [json.loads(x) for x in a.items.read_text().splitlines() if json.loads(x)["kind"] == "text"]
+    items = [json.loads(x) for x in a.items.read_text().splitlines()]
     with a.out.open("w") as fh:
         for it in items:
             ids = it["ids"]
             blocks = [{"layer": 14, "positions": list(range(len(ids)))}]
             word = lambda p: o.tok.decode([ids[p]])  # noqa: E731
-            got = o.answer({"ctx": ids, "blocks": blocks,
-                            "q": "Which earlier token is the model's next-token prediction most dependent on? Answer with the token."})
-            ok_a = h2h.norm(got) == h2h.norm(word(it["a"]["gt"]))
-            pairs = []
-            for c in it["c"]:
-                p1, p2 = c["pair"]
-                opts = [q_tok(word(p1)), q_tok(word(p2))]
-                lp = o.option_logp({"ctx": ids, "blocks": blocks, "q": f"Which matters more for the model's next token: {opts[0]} or {opts[1]}?"}, opts)
-                pick = c["pair"][int(lp[1] > lp[0])]
-                pairs.append({"ok": pick == c["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
-            rec = {"id": it["id"], "split": it["split"], "a_answer": got, "a_ok": ok_a, "pairs": pairs}
+            rec = {"id": it["id"], "split": it["split"], "kind": it["kind"], "answers": []}
+            if it["kind"] == "fact":
+                w = it["word"]
+                opts = ["First.", "Second."]
+                lp = o.option_logp({"ctx": ids, "blocks": blocks, "q": f"Does the model's next token depend more on the first or the "
+                                    f"second mention of {q_tok(' ' + w)}? Answer first or second."}, opts)
+                pick = int(lp[1] > lp[0])
+                rec["answers"].append({"q": "fact", "ok": pick == it["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
+            else:
+                got = o.answer({"ctx": ids, "blocks": blocks,
+                                "q": "Which earlier token is the model's next-token prediction most dependent on? Answer with the token."})
+                rec["answers"].append({"q": "a", "ok": h2h.norm(got) == h2h.norm(word(it["a"]["gt"])), "answer": got, "conf": None})
+                for sw in it["b"]:
+                    got = o.answer({"ctx": ids, "blocks": blocks,
+                                    "q": f"If the token {q_tok(word(sw['p']))} at position {sw['p']} were replaced by "
+                                         f"{q_tok(o.tok.decode([sw['y']]))}, would the model's next token change? If so, to what?"})
+                    said_no = h2h.norm(got).startswith("no")
+                    quoted = re.search(r"'(.*)'", got)  # the trained answer form: Yes, to ' token'.
+                    new = quoted.group(1) if quoted and not said_no else ""
+                    ok = (not sw["changes"] and said_no) or (sw["changes"] and not said_no and h2h.norm(new) == h2h.norm(o.tok.decode([sw["new_top"]])))
+                    rec["answers"].append({"q": "b", "ok": ok, "answer": got, "conf": None})
+                for c in it["c"]:
+                    p1, p2 = c["pair"]
+                    opts = [q_tok(word(p1)), q_tok(word(p2))]
+                    lp = o.option_logp({"ctx": ids, "blocks": blocks, "q": f"Which matters more for the model's next token: {opts[0]} or {opts[1]}?"}, opts)
+                    pick = c["pair"][int(lp[1] > lp[0])]
+                    rec["answers"].append({"q": "c", "ok": pick == c["gt"], "conf": math.exp(max(lp)) / (math.exp(lp[0]) + math.exp(lp[1]))})
             fh.write(json.dumps(rec) + "\n")
-            print(it["id"], repr(got), ok_a, [p["ok"] for p in pairs], flush=True)
+            print(it["id"], {q: sum(x["ok"] for x in rec["answers"] if x["q"] == q) for q in dict.fromkeys(x["q"] for x in rec["answers"])}, flush=True)
 
 
 def main():

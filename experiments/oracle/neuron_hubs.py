@@ -65,6 +65,100 @@ class Runner:
                 hd.remove()
 
 
+    @torch.no_grad()
+    def inspect(self, ids: list[int], neurons: list[tuple[int, int]], *, pos: int | None = None,
+                source_binding: dict | None = None, atol: float = 1e-6, rtol: float = 1e-5) -> dict:
+        """One full-context forward, selected signed SwiGLU neurons; no causal-route claim.
+
+        Gate/up are raw projections; down_input is what down_proj actually read.
+        Reconstruction is a numerical diagnostic, never a corrected activation.
+        Plain Linear write directions exclude bias; adapter writes are unavailable.
+        """
+        import hashlib
+        if not ids or any(type(z) is not int or z < 0 for z in ids):
+            raise ValueError('nonempty nonnegative token IDs required')
+        if not neurons or len(neurons) > 32 or len(set(neurons)) != len(neurons):
+            raise ValueError('1..32 distinct (layer,index) neurons required')
+        if any(type(i) is not int or type(j) is not int or not 0 <= i < self.L or not 0 <= j < self.D for i, j in neurons):
+            raise ValueError('invalid neuron address')
+        pos = len(ids) - 1 if pos is None else pos
+        if type(pos) is not int or not 0 <= pos < len(ids):
+            raise ValueError('invalid target position')
+        if not math.isfinite(atol) or not math.isfinite(rtol) or min(atol, rtol) < 0:
+            raise ValueError('finite nonnegative tolerances required')
+        binding = json.loads(json.dumps(source_binding or {}, allow_nan=False))
+        grouped = {}
+        for i, j in neurons:
+            grouped.setdefault(i, []).append(j)
+        handles, seen = [], {}
+        try:
+            for i, indices in grouped.items():
+                mlp = self.core.model.layers[i].mlp
+                if not all(hasattr(mlp, key) for key in ('gate_proj', 'up_proj', 'down_proj', 'act_fn')):
+                    raise ValueError('inspection requires a gated MLP with gate/up/down projections')
+                for label, module in (('gate', mlp.gate_proj), ('up', mlp.up_proj)):
+                    def capture(_mod, _args, value, i=i, indices=indices, label=label):
+                        seen[i, label] = value[0, :, indices].detach().clone()
+                    handles.append(module.register_forward_hook(capture))
+                def down(_mod, args, i=i, indices=indices):
+                    seen[i, 'down'] = args[0][0, :, indices].detach().clone()
+                handles.append(mlp.down_proj.register_forward_pre_hook(down))
+            logits = self.logits(ids, pos)[0]
+        finally:
+            for handle in handles:
+                handle.remove()
+        adapters = getattr(self.model, 'active_adapters', None)
+        adapter_state = 'not_loaded' if getattr(self.model, '_hf_peft_config_loaded', None) is False else 'unknown'
+        if callable(adapters):
+            if adapter_state == 'not_loaded':
+                adapters = []
+            else:
+                try:
+                    adapters = adapters()
+                except ValueError as exc:
+                    if str(exc).rstrip('.') != 'No adapter loaded':
+                        raise
+                    adapters, adapter_state = [], 'not_loaded'
+        adapters = list(adapters) if isinstance(adapters, (list, tuple)) else ([str(adapters)] if adapters else [])
+        adapter_model = hasattr(self.model, 'get_base_model') or bool(adapters)
+        records = []
+        for i, indices in grouped.items():
+            mlp = self.core.model.layers[i].mlp
+            gate, up, actual = (seen[i, label] for label in ('gate', 'up', 'down'))
+            activated = mlp.act_fn(gate)
+            reconstructed = activated * up
+            for col, j in enumerate(indices):
+                g, u, a = (v[:, col].float().cpu() for v in (gate, up, actual))
+                expected = reconstructed[:, col].float().cpu()
+                sign = lambda v: ['+' if x > 0 else '-' if x < 0 else '0' for x in v.tolist()]
+                plain_write = not adapter_model and type(mlp.down_proj) is torch.nn.Linear
+                records.append({'layer': i, 'index': j, 'gate_pre': g.tolist(), 'up_value': u.tolist(),
+                    'gate_activation': activated[:, col].float().cpu().tolist(),
+                    'raw_gate_up_product': (g*u).tolist(), 'down_input': a.tolist(),
+                    'gate_sign': sign(g), 'up_sign': sign(u), 'activation_sign': sign(a),
+                    'max_activation_position': int(a.argmax()), 'min_activation_position': int(a.argmin()),
+                    'zero_positions': (a == 0).nonzero().flatten().tolist(),
+                    'reconstruction': {'bit_exact': torch.equal(a, expected),
+                        'within_tolerance': torch.allclose(a, expected, atol=atol, rtol=rtol),
+                        'max_abs_error': float((a-expected).abs().max()), 'atol': atol, 'rtol': rtol},
+                    'write': {'status': 'plain_linear_direction' if plain_write else 'unavailable_adapter_or_custom_projection',
+                        'direction': mlp.down_proj.weight[:, j].detach().float().cpu().tolist() if plain_write else None,
+                        'semantics': 'down_input[position] * direction; excludes bias; not a downstream causal effect'}})
+        cfg = self.core.config
+        config = cfg.to_dict() if hasattr(cfg, 'to_dict') else vars(cfg)
+        return {'schema': 1, 'input_token_ids': list(ids), 'position_ids': list(range(len(ids))),
+                'target_position': pos, 'top_token_id': int(logits.argmax()), 'neurons': records,
+                'model': {'identifier': getattr(cfg, '_name_or_path', None),
+                    'revision': getattr(cfg, '_commit_hash', None), 'active_adapters': adapters,
+                    'adapter_state': 'loaded' if adapters else adapter_state,
+                    'config_sha256': hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode()).hexdigest(),
+                    'full_weight_content_verified': False},
+                'source_binding': binding,
+                'input_sha256': hashlib.sha256(json.dumps(list(ids), separators=(',', ':')).encode()).hexdigest(),
+                'scope': 'full supplied context, no truncation; observed activations, not semantic or causal-route certification'}
+
+
+
 def chat(tok, user: str, answer: str | None = None) -> list[int]:
     msgs = [{"role": "user", "content": user}] + ([{"role": "assistant", "content": answer}] if answer is not None else [])
     return tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=answer is None, enable_thinking=False),
@@ -124,9 +218,9 @@ def study(run: Runner, ids: list[int], pos: int, thr, mean, tok) -> dict:
     """The ranking, singles and cumulative removals (module docstring) for one prompt and reference (thr: per-layer
     weak thresholds [L, D] or None)."""
     with torch.no_grad():
-        lp = torch.log_softmax(run.logits(ids, pos, edit=(lambda i, h: h * (h.float().abs() >= thr[i]).to(h.dtype)) if thr is not None else None)[0], -1)
-    y = int(lp.argmax())
-    alt = [int(z) for z in lp.topk(6).indices.tolist() if z != y][:5]
+        original_lp = torch.log_softmax(run.logits(ids, pos)[0], -1)
+    y = int(original_lp.argmax())
+    alt = [int(z) for z in original_lp.topk(6).indices.tolist() if z != y][:5]
 
     def contrast(lq):  # [B, V] logits -> [B]
         l = torch.log_softmax(lq, -1)
@@ -169,12 +263,16 @@ def study(run: Runner, ids: list[int], pos: int, thr, mean, tok) -> dict:
     order = [cand[i] for i in sorted(range(len(cand)), key=lambda i: -eff[i])]
     cum = runs([order[:k] for k in KS])
     cum_mean = runs([order[:k] for k in KS], fill="mean")
-    flip = next((k for k, r in zip(KS, cum) if not r["top"]), None)
-    return {"answer": tok.decode([y]), "alternatives": [tok.decode([z]) for z in alt], "contrast": base["contrast"], "p": base["p"],
+    flip = 0 if not base["top"] else next((k for k, r in zip(KS, cum) if not r["top"]), None)
+    return {"answer": tok.decode([y]), "alternatives": [tok.decode([z]) for z in alt],
+            "answer_token_id": y, "alternative_token_ids": alt,
+            "contrast_reference": "unmodified model answer and five alternatives, frozen before background edits",
+            "background": "unmodified" if thr is None else "weak_zeroed",
+            "background_top_changed": not base["top"], "contrast": base["contrast"], "p": base["p"],
             "single_top": [{"neuron": f"L{i}.n{j}", "drop": e} for (i, j), e in sorted(zip(cand, eff), key=lambda t: -t[1])[:16]],
             "singles_over_1bit": sum(e > 1 for e in eff), "cumulative": [{"k": k, **r} for k, r in zip(KS, cum)],
             "cumulative_mean_fill": [{"k": k, **r} for k, r in zip(KS, cum_mean)], "flip_k": flip,
-            "flip_k_mean_fill": next((k for k, r in zip(KS, cum_mean) if not r["top"]), None)}
+            "flip_k_mean_fill": 0 if not base["top"] else next((k for k, r in zip(KS, cum_mean) if not r["top"]), None)}
 
 
 def main():

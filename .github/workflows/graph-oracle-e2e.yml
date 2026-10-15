@@ -109,7 +109,7 @@ jobs:
         run: |
           python -m pytest method/oracle/test_mech.py method/oracle/test_edits.py method/oracle/test_reader.py \
             method/oracle/test_part_tokens.py experiments/oracle/test_copycheck.py experiments/oracle/test_prompted.py \
-            method/oracle/test_score.py method/oracle/test_goal_eval.py method/oracle/test_weight_direct.py experiments/oracle/test_circuit_scorecard.py experiments/oracle/test_bench_speed.py method/oracle/rl/test_reader_frozen.py method/oracle/rl/test_curriculum.py method/oracle/rl/test_devscore_receipt.py \
+            method/oracle/test_score.py method/oracle/test_goal_eval.py method/oracle/test_weight_direct.py experiments/oracle/test_circuit_scorecard.py experiments/oracle/test_bench_speed.py experiments/oracle/test_neuron_hubs_inspect.py method/oracle/rl/test_reader_frozen.py method/oracle/rl/test_curriculum.py method/oracle/rl/test_devscore_receipt.py \
             --deselect method/oracle/test_mech.py::test_the_sandbox_limits_and_the_server \
             -p no:cacheprovider -v --tb=short
           python -B method/oracle/rl/test_scorer.py

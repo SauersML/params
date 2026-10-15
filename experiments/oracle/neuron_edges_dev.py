@@ -29,7 +29,12 @@ def top_neurons(model, ids: list[int], target: int, answer: list[int], alts: lis
 
     def hook(L):
         def f(m, a):
-            x = a[0].detach().requires_grad_()
+            # Seed autograd only where frozen upstream computation has no graph.
+            # Detaching every later MLP would erase its contribution to earlier neurons.
+            x = a[0]
+            if not x.requires_grad:
+                x = x.detach().requires_grad_()
+            x.retain_grad()
             acts[L] = x
             return (x,)
         return f

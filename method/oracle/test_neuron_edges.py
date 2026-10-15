@@ -127,3 +127,66 @@ def test_bfloat16_model(tiny):
     a, b = e32.contrasts(cuts, e32.resid_all), e16.contrasts(cuts, e16.resid_all)
     assert e16.c_full == pytest.approx(e32.c_full, abs=0.05)
     assert max(abs(x - y) for x, y in zip(a, b)) < 0.1
+
+
+def test_dev_ranking_uses_full_model_gradient_and_matches_finite_difference(tiny, monkeypatch):
+    """Later nonlinear MLP paths contribute to earlier neuron derivatives, with frozen weights."""
+    import copy
+    import importlib.util
+    path = HERE.parents[1] / "experiments" / "oracle" / "neuron_edges_dev.py"
+    spec = importlib.util.spec_from_file_location("neuron_edges_dev_gradient_test", path)
+    dev = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dev)
+    model, ids, _ = tiny
+    model = copy.deepcopy(model).double().requires_grad_(False)
+    # A larger nonlinear downstream path makes detached-MLP derivatives observably wrong.
+    with torch.no_grad():
+        for layer in model.model.layers:
+            layer.mlp.down_proj.weight.mul_(8)
+    acts = {}
+    hooks = []
+    for L, layer in enumerate(model.model.layers):
+        def capture(m, a, L=L):
+            x = a[0]
+            if not x.requires_grad:
+                x = x.detach().requires_grad_()
+            x.retain_grad()
+            acts[L] = x
+            return (x,)
+        hooks.append(layer.mlp.down_proj.register_forward_pre_hook(capture))
+    try:
+        lp = torch.log_softmax(model(torch.tensor([ids])).logits[0, 9].float(), -1)
+        objective = neuron_edges.log2_contrast(lp, [3], [5, 7])
+        gradients = torch.autograd.grad(objective, tuple(acts.values()))
+        expected = torch.stack([(acts[L][0] * gradients[L][0]).abs().float().cpu()
+                                for L in range(len(acts))])
+    finally:
+        for hook in hooks:
+            hook.remove()
+    # Verify an early-layer derivative by literal pre-down activation perturbation.
+    j = int(gradients[0][0, 9].abs().argmax())
+    def perturbed(epsilon):
+        def edit(m, a):
+            x = a[0].clone()
+            x[0, 9, j] += epsilon
+            return (x,)
+        hook = model.model.layers[0].mlp.down_proj.register_forward_pre_hook(edit)
+        try:
+            return contrast_of(model, ids)
+        finally:
+            hook.remove()
+    eps = .001
+    numeric = (perturbed(eps) - perturbed(-eps)) / (2 * eps)
+    assert numeric == pytest.approx(float(gradients[0][0, 9, j]), rel=.015, abs=2e-4)
+    captured = []
+    real_topk = torch.topk
+    def topk(scores, k, *args, **kwargs):
+        captured.append(scores.detach().clone())
+        return real_topk(scores, k, *args, **kwargs)
+    monkeypatch.setattr(torch, "topk", topk)
+    got = dev.top_neurons(model, ids, 9, [3], [5, 7], 12)
+    assert torch.allclose(captured[0], expected.flatten(), rtol=1e-5, atol=1e-8)
+    order = real_topk(expected.flatten(), 12).indices
+    assert got == [(int(i // 400), int((i // 40) % 10), int(i % 40)) for i in order]
+    assert all(p.grad is None for p in model.parameters())
+    assert all(not layer.mlp.down_proj._forward_pre_hooks for layer in model.model.layers)

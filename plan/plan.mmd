@@ -29,7 +29,7 @@ flowchart TB
   Q -. current pilot .-> P
   P -. concrete investigation .-> I
 
-  C["<b>Circuit finder scorecard · Qwen3-8B, unseen questions</b><br/>Patching pair in the model itself: clean question vs the<br/>key word swapped. Noising must lose and denoising restore<br/>≥ 70% of the answer's log-odds; also on unseen swaps,<br/>activation swaps in a task, stability over 5 paraphrases.<br/>Size is measured, never capped: each circuit reports the<br/>share explained against units added in measured order;<br/>tables quote the 70% points. 127 questions, 42 unseen.<br/>MEASURED 1.7B · two heads at the answer position restore<br/>72% of "Ag"; losing 70% by noising needs 391 units.<br/>OWNER · generality"]
+  C["<b>Circuit finder scorecard · Qwen3-8B, unseen questions</b><br/>Patching pair in the model itself: clean question vs the<br/>key word swapped. Noising must lose and denoising restore<br/>≥ 70% of the answer's log-odds; also on unseen swaps,<br/>activation swaps in a task, stability over 5 paraphrases.<br/>Size is measured, never capped: each circuit reports the<br/>share explained against units added in measured order;<br/>tables quote the 70% points. 127 questions, 42 unseen.<br/>MEASURED 1.7B · two heads at the answer position restore<br/>72% of ‘Ag’; losing 70% by noising needs 391 units.<br/>OWNER · generality"]
   I -. optional product .-> C
   C -. additional validation .-> V
 

@@ -34,8 +34,9 @@ contrast checked on the whole graph:
      tolerance over the reader's first-order weight in the contrast (BITS: its gradient times its activation);
   2. of the allowances whose union keeps the contrast within TOL of the way from every edge's to none's (either side),
      the one with the fewest edges, every allowance one forward;
-  3. a halving pass over readers' in-edge groups (a group cut: that reader reads no circuit neuron), a forward's blocks
-     a round (each tried alone, those passing tried together);
+  3. readers' in-edge groups (a group cut: that reader reads no circuit neuron): the fewest readers by first-order
+     weight whose groups alone keep the contrast (on a log scale, one forward), then a halving pass over theirs, a
+     forward's blocks a round (each tried alone, those passing tried together);
   4. measured last: the graph's contrast, each reader's group cut from it (the reader's in-strength), the graph's edges
      cut with every other edge on, each kept edge's local effect on its reader, and the strength (its own cut from the
      graph) of the MEASURED edges of largest share of their reader's in-strength.
@@ -63,7 +64,7 @@ BITS = tuple(round(2 ** (-i / 2), 4) for i in range(20))  # or each reader's err
 MEASURED = 512  # kept edges whose own cut from the graph is measured (those of largest share of their reader's strength)
 HALVE_BLOCKS = 8
 TOKENS = 1536  # cut sets a forward: this many tokens' worth (at least 16 sets)
-CHUNK = 256  # listed resid edges a step (sets x CHUNK x d floats)
+CHUNK = 1 << 28  # floats a step of listed resid edges takes (sets x edges x d)
 
 
 def weight(mod) -> torch.Tensor:
@@ -81,6 +82,11 @@ def weight(mod) -> torch.Tensor:
 def log2_contrast(lp: torch.Tensor, answer: list[int], alternatives: list[int]) -> torch.Tensor:
     """log2 p(answer tokens) - log2 p(alternatives) from log probabilities lp [..., V]."""
     return (torch.logsumexp(lp[..., answer], -1) - torch.logsumexp(lp[..., alternatives], -1)) / math.log(2.0)
+
+
+def sizes(n: int) -> list[int]:
+    """0 to n on a log scale (two steps an octave), n included."""
+    return sorted({0, n} | {min(n, int(round(2 ** (e / 2)))) for e in range(0, int(2 * math.log2(max(n, 1))) + 2)})
 
 
 class Edges:
@@ -290,8 +296,9 @@ class Edges:
             if L in plan["resid"]:
                 es, wi, ri = (t.to(d) for t in plan["resid"][L])
                 cols = self._cols_on(d)
-                for s0 in range(0, len(es), CHUNK):
-                    e_, w_, r_ = es[s0:s0 + CHUNK], wi[s0:s0 + CHUNK], ri[s0:s0 + CHUNK]
+                n = max(256, CHUNK // (K * cols.shape[1]))
+                for s0 in range(0, len(es), n):
+                    e_, w_, r_ = es[s0:s0 + n], wi[s0:s0 + n], ri[s0:s0 + n]
                     D = D.index_add(1, r_, (coef[:, e_] * Hc[:, w_])[..., None] * cols[w_][None])
             x = x + f(layer.mlp.down_proj, hm)
         lp = torch.log_softmax(f(core.lm_head, f(core.model.norm, x[:, self.target])), -1).cpu()
@@ -565,11 +572,21 @@ def prune(ed: Edges, log=print) -> dict:
     t_eps = time.time() - t0 - t_local
 
     groups = [(~gone & (owner == i)).nonzero().flatten() for i in range(N)]
-    weak = lambda i: float(cands[i][1][:len(groups[i])].abs().sum()) / max(abs(float(ref[i])), 1e-9)  # noqa: E731
-    readers = sorted((i for i in range(N) if len(groups[i])), key=weak)  # (weakest first)
+    cut_of = lambda rs: torch.cat([groups[int(i)] for i in rs]) if len(rs) else torch.zeros(0, dtype=torch.long)  # noqa: E731
+    readers = sorted((i for i in range(N) if len(groups[i])), key=lambda i: -float(sens[i]))  # (by first-order weight)
+    ks = sizes(len(readers))  # the fewest of them whose in-edges alone keep the contrast (k on a log scale), one forward
+    trial = []
+    for k in ks:
+        t = gone.clone()
+        t[cut_of(readers[k:])] = True
+        trial.append(t)
+    cs = ed.contrasts(torch.stack(trial), listed, rest=True) if trial else []
+    measured += len(trial)
+    k = next((k for k, c in zip(ks, cs) if ok(c)), len(readers))
+    gone = trial[ks.index(k)] if k in ks else gone
+    readers = readers[:k][::-1]  # (weakest first)
     queue = [list(b) for b in torch.tensor(readers, dtype=torch.long).tensor_split(min(HALVE_BLOCKS, len(readers)))
              if len(b)] if len(readers) > 1 else []
-    cut_of = lambda rs: torch.cat([groups[int(i)] for i in rs])  # noqa: E731
     while queue:  # halving over readers' in-edge groups, a forward's blocks a round: each block's groups cut alone, the
         blocks, queue = queue[:ed.B], queue[ed.B:]  # passing ones together
         trial = []

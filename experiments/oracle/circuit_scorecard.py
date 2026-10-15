@@ -1050,13 +1050,14 @@ def score(ge: goal_eval.GoalEval, path: Path, pool: dict, vpd: dict | None = Non
         for k, r in zip(mids, rows(ge, tx, [native.Graph(order[:k], complete=True) for k in mids], pool, log)):
             have[k] = judged(r, fl, fams)
         k_phi = first(lambda j: j["phi"] is not None and j["phi"] >= base["phi"])
+    k_phi = k_phi if grid else None  # (no grid: VPD's whole answer alone, which says nothing about a smaller k)
     rec["size"] = {"units": "vpd", "parts": len(nodes), "params": params_touched(nat, nodes), "build_seconds": build_seconds(path),
                    "sparsity": sparsity(g, tx.targets), "lines": None if g.complete else g.edges() + len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
                    "connections": None if g.complete else g.edges(),
                    "token_edges": None if g.complete else len(getattr(g, "tok_edges", [])) + len(getattr(g, "tok_out", [])),
                    "implied_lines": sum(native.implied_edges(nodes, tx.targets)) if g.complete else None,
                    "positions": sorted({t for _, t, _ in nodes}), "vpd_active": n_act, "vpd_k_phi": k_phi,
-                   "vpd_k_floors": first(lambda j: j["v"] == 0.0),
+                   "vpd_k_floors": first(lambda j: j["v"] == 0.0) if grid else None,
                    "vpd_positions_k_phi": len({t for _, t, _ in order[:k_phi]}) if k_phi else None,
                    "vpd_curve": [[k, have[k]["phi"], have[k]["v"]] for k in sorted(have)]}
     done("size")

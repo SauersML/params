@@ -25,12 +25,11 @@ The VPD builder on one text:
    floor 0.9, and 0.9 of every unit's own patching) on the sizes meeting those, smallest first, a few at a time (none:
    every unit); every floor with MARGIN, the family's noise, and at most every unit's own score (text9004's 407-part
    circuit at 17 positions, built without the omitted family, scored it -0.1 on eval against 0.9);
-4. chunks: the chosen units in CHUNKS runs of the ranking, least important first, PATH_BATCH at a time each removed
-   from the current set and measured (point and the path-patched families, then N and patching on those passing),
-   the passing ones removed together when that passes too, else the least important alone;
-5. inert parts: each kept unit removed alone, its own-run KL change measured in one batch; of the units moving it by
-   less than INERT_BITS, least important first, the most dropped together that still meets every floor (all, else
-   ROUNDS bracketing rounds over how many).
+4. chunks: the chosen units in runs of 1/CHUNKS of them, the inert first (each kept unit removed alone, its own-run
+   KL change under INERT_BITS, measured in one batch), then the rest, least important first; PATH_BATCH runs at a time
+   each removed from the current set and measured on the cheap families, the passing ones removed together when that
+   passes too, else the least important alone; then every family on the result, and failing, back to the longest
+   prefix of the removals that passes (ROUNDS bracketing rounds).
 The full reward row is the scorecard's, never run here."""
 from __future__ import annotations
 
@@ -51,7 +50,7 @@ ATTR_DONORS = 4     # attribution: far donors for activation patching's share
 FLOOR = goal_eval.FLOOR_TOP
 INERT_BITS = 1e-3   # an inert unit: its removal moves the own-run KL at the targets by less (the scorecard's)
 PATH_BATCH = 4      # prefix sizes per path-patched round
-CHUNKS = 12         # the chunk pass: the chosen units in this many runs of the ranking
+CHUNKS = 8          # the trim: the chosen units in runs of this share of them
 ROUNDS = 3          # bracketing rounds after the first
 REFINE = 0.05       # a bracket this narrow (hi / lo) ends the rounds
 MARGIN = {"track_pp": 0.02, "scope": 0.05, "interchange_pp": 0.01, "patching_near": 0.02, "patching_far": 0.07, "N": 0.0}
@@ -401,60 +400,70 @@ def build_vpd(ge: goal_eval.GoalEval, tx: goal_eval.Text, log=None) -> tuple[nat
         for j, x in zip(alive, extra([gs[j] for j in alive]) if alive else []):
             out[j].update(x)
         return [f if j in alive else None for j, f in enumerate(out)]
-    gone, tried_chunks = 0, 0
-    if rec["met"]:
-        kept_rank = [i for i in rank if bool(on[i])]         # most important first
-        K = max(1, -(-len(kept_rank) // CHUNKS))
-        chunks = [kept_rank[j:j + K] for j in range(0, len(kept_rank), K)][::-1]   # least important first
-        for c0 in range(0, len(chunks), PATH_BATCH):
-            part = chunks[c0:c0 + PATH_BATCH]
+    def cheap(ons):                                          # point and the path-patched families of unit sets
+        pts = [goal_eval._fid_raw(e0, k, v0) for k in pr.kl_sets(torch.stack(ons))]
+        return [{"point": x, **f} for x, f in zip(pts, families([_graph([units[i] for i in o.nonzero().flatten().tolist()]) for o in ons]))]
+
+    def trim(groups):                                        # groups of unit ids, least important first, removed while
+        nonlocal on                                          # the cheap families hold (PATH_BATCH a call, the passing
+        start_on, seq = on.clone(), []                       # ones together, else the first alone); then the costlier
+        for c0 in range(0, len(groups), PATH_BATCH):         # families on the result, failing: back to the longest
+            part = [g for g in groups[c0:c0 + PATH_BATCH] if bool(on[g].any())]   # passing prefix of the removals
+            if not part:
+                continue
             ons = []
-            for ch in part:
+            for g in part:
                 o = on.clone()
-                o[ch] = False
+                o[g] = False
                 ons.append(o)
-            tried_chunks += len(part)
-            okc = [ch for ch, f in zip(part, every(ons)) if f is not None and meets(f)]
-            if len(okc) > 1:                                 # all of them together, else the least important alone
+            okc = [g for g, f in zip(part, cheap(ons)) if meets(f)]
+            if len(okc) > 1:
                 o = on.clone()
-                for ch in okc:
-                    o[ch] = False
-                f = every([o])[0]
-                if f is not None and meets(f):
-                    on, gone = o, gone + sum(len(ch) for ch in okc)
+                for g in okc:
+                    o[g] = False
+                if meets(cheap([o])[0]):
+                    on, seq = o, seq + okc
                     continue
             if okc:
                 on = on.clone()
                 on[okc[0]] = False
-                gone += len(okc[0])
-    rec["chunks"] = {"tried": tried_chunks, "removed": gone}
-    clock("chunks")
-    pr.on = on.clone()                                       # 5. inert parts
+                seq.append(okc[0])
+        if not seq:
+            return 0
+
+        def upto(k):
+            o = start_on.clone()
+            for g in seq[:k]:
+                o[g] = False
+            return o
+        lo, hi = 0, len(seq)
+        f = every([upto(hi)])[0]
+        if f is not None and meets(f):
+            lo = hi
+        for _ in range(ROUNDS):
+            if hi - lo <= 1:
+                break
+            ks = sorted({lo + max(1, (hi - lo) * (j + 1) // (PATH_BATCH + 1)) for j in range(PATH_BATCH)} - {lo, hi})
+            for k, f in zip(ks, every([upto(k) for k in ks])):
+                if f is not None and meets(f):
+                    lo = max(lo, k)
+                elif k > lo:
+                    hi = min(hi, k)
+        on = upto(lo)
+        return sum(len(g) for g in seq[:lo])
+    pr.on = on.clone()                                       # the inert units: their own-run KL change alone
     ids = on.nonzero().flatten().tolist()
     base = pr.kl()
     moved = [abs(k - base) for k in pr.without([torch.tensor([i], device=nat.dev) for i in ids])] if ids else []
     where = {u: j for j, u in enumerate(rank)}
     inert = sorted((i for i, d in zip(ids, moved) if d < INERT_BITS), key=lambda i: -where[i])   # least important first
-    rec["inert"] = len(inert)
-    if inert and len(inert) < len(ids) and rec["met"]:       # the most of them dropped together that still meets every
-        def without(k):                                      # floor: all, else bracketing rounds over how many
-            o = on.clone()
-            o[inert[:k]] = False
-            return o
-        f = every([without(len(inert))])[0]
-        lo, hi = (len(inert), len(inert)) if f is not None and meets(f) else (0, len(inert))
-        for _ in range(ROUNDS):
-            if hi - lo <= max(1, len(inert) // 32):
-                break
-            ks = sorted({lo + max(1, (hi - lo) * (j + 1) // (PATH_BATCH + 1)) for j in range(PATH_BATCH)} - {lo, hi})
-            for k, f in zip(ks, every([without(k) for k in ks])):
-                if f is not None and meets(f):
-                    lo = max(lo, k)
-                else:
-                    hi = min(hi, k) if k > lo else hi
-        if lo:
-            on, rec["dropped_inert"] = without(lo), lo
-    clock("inert")
+    rest = [i for i in rank if bool(on[i]) and i not in set(inert)][::-1]
+    rec["inert"], rec["chunks"] = len(inert), {"removed": 0}
+    if rec["met"] and len(ids) > 1:                          # inert units first, then the rest, least important first
+        K = max(1, -(-len(ids) // CHUNKS))
+        groups = [inert[j:j + K] for j in range(0, len(inert), K)] + [rest[j:j + K] for j in range(0, len(rest), K)]
+        rec["chunks"]["removed"] = trim(groups[:CHUNKS + 1])
+    clock("trim")
     kept = [units[i] for i in on.nonzero().flatten().tolist()]
     rec["size"] = len(kept)
     if log:
